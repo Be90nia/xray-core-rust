@@ -1,0 +1,12 @@
+[package]
+name = "xray-proxy-dns"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+xray-common = { path = "../xray-common" }
+xray-features = { path = "../xray-features" }
+tokio = { workspace = true }
+tracing = { workspace = true }

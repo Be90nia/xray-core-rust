@@ -1,0 +1,1 @@
+//! Authenticator trait and implementations

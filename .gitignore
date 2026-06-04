@@ -1,5 +1,36 @@
+# Build
+/target
+**/*.rs.bk
+*.pdb
 
-# Beads / Dolt files (added by bd init)
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Beads / Dolt files
 .dolt/
 *.db
 .beads-credential-key
+.beads/
+
+# Graphify
+graphify-out/
+
+# Coverage
+coverage/
+*.profraw
+*.profdata
+
+# Environment
+.env
+.env.local
+
+# OMO internal
+.omo/

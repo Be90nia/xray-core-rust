@@ -1,0 +1,14 @@
+[package]
+name = "xray-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+xray-core = { path = "../xray-core" }
+xray-conf = { path = "../xray-conf" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { version = "4", features = ["derive"] }

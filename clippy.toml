@@ -1,0 +1,17 @@
+# Clippy 配置
+# Xray-core-rust 代码质量检查
+
+# 认知复杂度上限
+cognitive-complexity-threshold = 30
+
+# 单类型最大方法数
+max-fn-params-amount = 8
+
+# 允许的类型复杂度
+type-complexity-threshold = 300
+
+# 单文件最大行数
+max-struct-bool-fields = 6
+
+# 文档要求
+# missing-docs-in-crate-items = true

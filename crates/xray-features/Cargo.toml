@@ -1,0 +1,13 @@
+[package]
+name = "xray-features"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+xray-common = { path = "../xray-common" }
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true }

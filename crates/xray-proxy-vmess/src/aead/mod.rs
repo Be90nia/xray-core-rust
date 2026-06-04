@@ -1,0 +1,1 @@
+//! VMess AEAD encryption

@@ -1,0 +1,1 @@
+//! HTTPUpgrade configuration

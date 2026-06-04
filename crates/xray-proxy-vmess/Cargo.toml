@@ -1,0 +1,14 @@
+[package]
+name = "xray-proxy-vmess"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+xray-common = { path = "../xray-common" }
+xray-features = { path = "../xray-features" }
+xray-buf = { path = "../xray-buf" }
+xray-crypto = { path = "../xray-crypto" }
+tokio = { workspace = true }
+tracing = { workspace = true }

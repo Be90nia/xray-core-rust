@@ -1,0 +1,1 @@
+//! VMess validator

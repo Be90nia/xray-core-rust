@@ -1,0 +1,32 @@
+# Rust 代码格式化配置
+# 遵循 Xray-core-rust 项目编码规范
+
+edition = "2024"
+max_width = 100
+hard_tabs = false
+tab_spaces = 4
+newline_style = "Unix"
+use_small_heuristics = "Max"
+imports_granularity = "Crate"
+group_imports = "StdExternalCrate"
+normalize_comments = true
+wrap_comments = true
+comment_width = 100
+format_code_in_doc_comments = true
+format_strings = false
+reorder_impl_items = true
+reorder_imports = true
+reorder_modules = true
+fn_single_line = false
+where_single_line = false
+force_multiline_blocks = false
+brace_style = "SameLineWhere"
+control_brace_style = "AlwaysSameLine"
+trailing_semicolon = true
+trailing_comma = "Vertical"
+match_arm_leading_pipes = "Never"
+fn_params_layout = "Tall"
+match_block_trailing_comma = true
+blank_lines_upper_bound = 1
+blank_lines_lower_bound = 0
+inline_attribute_width = 0

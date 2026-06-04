@@ -1,0 +1,13 @@
+[package]
+name = "xray-reality"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+xray-common = { path = "../xray-common" }
+xray-transport = { path = "../xray-transport" }
+xray-tls = { path = "../xray-tls" }
+tokio = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,11 @@
+[package]
+name = "xray-app-geodata"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+xray-common = { path = "../xray-common" }
+xray-features = { path = "../xray-features" }
+xray-geodata = { path = "../xray-geodata" }

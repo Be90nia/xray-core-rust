@@ -1,0 +1,47 @@
+# cargo-deny 配置
+# 许可证和安全审计
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+vulnerability = "deny"
+unmaintained = "warn"
+unsound = "deny"
+yanked = "warn"
+notice = "warn"
+
+[licenses]
+unlicensed = "deny"
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Zlib",
+    "0BSD",
+]
+default = "deny"
+copyleft = "warn"
+allow-osi-fsf-free = "neither"
+
+[[licenses.clarify]]
+name = "ring"
+expression = "ISC AND OpenSSL AND MIT"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

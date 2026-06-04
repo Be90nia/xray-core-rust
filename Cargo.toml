@@ -1,0 +1,115 @@
+[workspace]
+resolver = "2"
+members = [
+    # Protobuf 类型定义
+    "crates/xray-proto",
+
+    # Layer 0 - 基础类型
+    "crates/xray-buf",
+    "crates/xray-common",
+    "crates/xray-features",
+
+    # Layer 1 - 加密与数据引擎
+    "crates/xray-crypto",
+    "crates/xray-geodata",
+    "crates/xray-mux",
+    "crates/xray-xudp",
+
+    # Layer 2 - 传输基础设施
+    "crates/xray-transport",
+    "crates/xray-tls",
+    "crates/xray-reality",
+
+    # Layer 3 - 传输协议
+    "crates/xray-transport-kcp",
+    "crates/xray-transport-hysteria",
+    "crates/xray-transport-splithttp",
+    "crates/xray-transport-grpc",
+    "crates/xray-transport-websocket",
+    "crates/xray-transport-httpupgrade",
+
+    # Layer 4 - 应用服务
+    "crates/xray-app-dns",
+    "crates/xray-app-router",
+    "crates/xray-app-dispatcher",
+    "crates/xray-app-proxyman",
+    "crates/xray-app-stats",
+    "crates/xray-app-log",
+    "crates/xray-app-commander",
+    "crates/xray-app-observatory",
+    "crates/xray-app-policy",
+    "crates/xray-app-reverse",
+    "crates/xray-app-metrics",
+    "crates/xray-app-geodata",
+    "crates/xray-app-version",
+
+    # Layer 5 - 代理协议
+    "crates/xray-proxy-vless",
+    "crates/xray-proxy-vmess",
+    "crates/xray-proxy-ss",
+    "crates/xray-proxy-trojan",
+    "crates/xray-proxy-socks",
+    "crates/xray-proxy-http",
+    "crates/xray-proxy-dns",
+    "crates/xray-proxy-blackhole",
+    "crates/xray-proxy-freedom",
+    "crates/xray-proxy-dokodemo",
+    "crates/xray-proxy-loopback",
+    "crates/xray-proxy-tun",
+    "crates/xray-proxy-wireguard",
+
+    # Layer 6 - 配置
+    "crates/xray-conf",
+
+    # Layer 7 - 核心与 CLI
+    "crates/xray-core",
+    "crates/xray-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+repository = "https://github.com/XTLS/Xray-core-rust"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+toml = "0.8"
+
+# 错误处理
+thiserror = "2"
+anyhow = "1"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# 网络
+bytes = "1"
+socket2 = "0.5"
+
+# Protobuf
+prost = "0.14"
+prost-types = "0.14"
+prost-build = "0.14"
+
+# 加密
+ring = "0.17"
+
+# UUID
+uuid = { version = "1", features = ["v4"] }
+
+# 随机数
+rand = "0.9"
+
+# 其他
+once_cell = "1"
+parking_lot = "0.12"
+dashmap = "6"

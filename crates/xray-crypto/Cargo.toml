@@ -1,0 +1,11 @@
+[package]
+name = "xray-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+xray-buf = { path = "../xray-buf" }
+xray-common = { path = "../xray-common" }
+ring = { workspace = true }
