@@ -1,0 +1,106 @@
+syntax = "proto3";
+
+package xray.geodata;
+
+// Domain represents a domain matching rule with type and optional
+// attributes for fine-grained filtering.
+message Domain {
+  // Type of domain value.
+  enum Type {
+    // The value is used as a sub string.
+    Substr = 0;
+    // The value is used as a regular expression.
+    Regex = 1;
+    // The value is a domain.
+    Domain = 2;
+    // The value is a full domain.
+    Full = 3;
+  }
+
+  // Domain matching type.
+  Type type = 1;
+
+  // Domain value.
+  string value = 2;
+
+  // Attribute carries a key-value pair for domain filtering.
+  message Attribute {
+    string key = 1;
+
+    oneof typed_value {
+      bool bool_value = 2;
+      int64 int_value = 3;
+    }
+  }
+
+  // Attributes of this domain. May be used for filtering.
+  repeated Attribute attribute = 3;
+}
+
+// GeoSite represents a collection of domain rules for a country.
+message GeoSite {
+  string code = 1;
+  repeated Domain domain = 2;
+}
+
+// GeoSiteList is the top-level container for all GeoSite entries.
+message GeoSiteList {
+  repeated GeoSite entry = 1;
+}
+
+// GeoSiteRule specifies a GeoSite reference from a dat file.
+message GeoSiteRule {
+  string file = 1;
+  string code = 2;
+  string attrs = 3;
+}
+
+// DomainRule is a oneof wrapper for GeoSite or custom Domain.
+message DomainRule {
+  oneof value {
+    GeoSiteRule geosite = 1;
+    Domain custom = 2;
+  }
+}
+
+// CIDR represents an IP network in CIDR notation.
+message CIDR {
+  // IP address, should be either 4 or 16 bytes.
+  bytes ip = 1;
+
+  // Number of leading ones in the network mask.
+  uint32 prefix = 2;
+}
+
+// CIDRRule wraps a CIDR with an optional reverse match flag.
+message CIDRRule {
+  CIDR cidr = 1;
+  bool reverse_match = 2;
+}
+
+// GeoIP represents a collection of CIDR rules for a country.
+message GeoIP {
+  string code = 1;
+  repeated CIDR cidr = 2;
+  bool reverse_match = 3;
+}
+
+// GeoIPList is the top-level container for all GeoIP entries.
+message GeoIPList {
+  repeated GeoIP entry = 1;
+}
+
+// GeoIPRule specifies a GeoIP reference from a dat file.
+message GeoIPRule {
+  string file = 1;
+  string code = 2;
+  bool reverse_match = 3;
+}
+
+// IPRule is a oneof wrapper for GeoIP or custom CIDR.
+message IPRule {
+  oneof value {
+    GeoIPRule geoip = 1;
+    CIDRRule custom = 2;
+  }
+}

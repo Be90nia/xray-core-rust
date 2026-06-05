@@ -9,3 +9,8 @@ rust-version.workspace = true
 xray-buf = { path = "../xray-buf" }
 xray-common = { path = "../xray-common" }
 tokio = { workspace = true }
+blake3 = "1"
+rand = { workspace = true }
+base64 = "0.22"
+tracing = { workspace = true }
+thiserror = { workspace = true }

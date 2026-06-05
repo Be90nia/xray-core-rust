@@ -9,3 +9,14 @@ rust-version.workspace = true
 xray-buf = { path = "../xray-buf" }
 xray-common = { path = "../xray-common" }
 ring = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+
+# ChaCha20 流加密与 AEAD (cipher 0.5 兼容版本)
+chacha20 = "0.10"
+chacha20poly1305 = "0.11.0-rc.3"
+
+# RustCrypto AES primitives (CFB/CTR stream ciphers)
+aes = "0.9"
+cfb-mode = "0.9"
+ctr = "0.10"

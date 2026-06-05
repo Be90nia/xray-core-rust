@@ -4,8 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "GeoIP and GeoSite data types, loading and matching"
 
 [dependencies]
 xray-common = { path = "../xray-common" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+regex = "1"
+prost = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }
