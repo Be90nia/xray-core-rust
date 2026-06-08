@@ -31,6 +31,10 @@ pub enum Error {
     /// 中断（用于 BufferedReader 的中断信号）
     #[error("interrupted")]
     Interrupted,
+
+    /// EOF（流结束）
+    #[error("eof")]
+    Eof,
 }
 
 /// 判断是否为读取错误

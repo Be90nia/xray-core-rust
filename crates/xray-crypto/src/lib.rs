@@ -9,6 +9,7 @@ pub mod auth_reader;
 pub mod auth_writer;
 pub mod authenticator;
 pub mod chunk;
+pub mod cryption_io;
 pub mod key_cache;
 
 use rand::Rng;
