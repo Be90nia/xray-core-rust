@@ -17,9 +17,16 @@
 //! - [`RegexMatcher`] - 正则表达式匹配
 
 pub mod matchers;
+pub mod matcher_groups;
 
 pub use matchers::{
     DomainMatcher, FullMatcher, RegexMatcher, SubstrMatcher,
+};
+
+pub use matcher_groups::{
+    ACMatcherGroup, ACMatcherGroupError, DomainMatcherGroup,
+    FullMatcherGroup, MPHMatcherGroup, MPHMatcherGroupError,
+    SimpleMatcherGroup, SubstrMatcherGroup,
 };
 
 /// 匹配器类型枚举。

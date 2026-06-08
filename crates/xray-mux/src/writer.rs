@@ -1,0 +1,276 @@
+﻿//! Mux 帧数据写入器
+//!
+//! 实现 MuxWriter 用于写入 Mux 协议帧数据
+
+use std::pin::Pin;
+
+use xray_buf::buffer::Buffer;
+use xray_buf::multi::MultiBuffer;
+use xray_buf::writer::BufferedWriter;
+use xray_buf::io::{self as buf_io, Writer};
+use xray_common::bitmask::Bitmask;
+use xray_common::net::destination::Destination;
+use xray_common::serial;
+
+use crate::frame::{FrameMetadata, MuxError, SessionStatus, OPTION_DATA, OPTION_ERROR};
+use crate::session::TransferType;
+
+/// 流式传输分块大小 (8KB)
+const STREAM_CHUNK_SIZE: usize = 8 * 1024;
+
+/// Mux 帧写入器
+pub struct MuxWriter {
+    dest: Option<Destination>,
+    writer: BufferedWriter,
+    id: u16,
+    followup: bool,
+    has_error: bool,
+    transfer_type: TransferType,
+    global_id: [u8; 8],
+}
+
+impl MuxWriter {
+    /// 创建新的客户端写入器
+    pub fn new(
+        id: u16,
+        dest: Destination,
+        writer: Box<dyn Writer>,
+        transfer_type: TransferType,
+        global_id: [u8; 8],
+    ) -> Self {
+        Self { id, dest: Some(dest), writer: BufferedWriter::new(writer), followup: false, has_error: false, transfer_type, global_id }
+    }
+
+    /// 创建新的响应写入器
+    pub fn new_response_writer(id: u16, writer: Box<dyn Writer>, transfer_type: TransferType) -> Self {
+        Self { id, dest: None, writer: BufferedWriter::new(writer), followup: true, has_error: false, transfer_type, global_id: [0u8; 8] }
+    }
+
+    /// 获取下一帧的元数据
+    fn get_next_frame_meta(&mut self) -> FrameMetadata {
+        let status = if self.followup { SessionStatus::Keep } else { self.followup = true; SessionStatus::New };
+        let mut meta = FrameMetadata::new(self.id, status, Bitmask::default());
+        if let Some(ref dest) = self.dest { meta.set_target(dest.clone()); }
+        meta.set_global_id(self.global_id);
+        meta
+    }
+
+    /// 仅写入元数据帧
+    async fn write_meta_only(&mut self) -> Result<(), MuxError> {
+        let meta = self.get_next_frame_meta();
+        let mut vec = Vec::new();
+        meta.write_to(&mut vec).map_err(|e| MuxError::Io(format!("meta: {:?}", e)))?;
+        let mb = MultiBuffer::from_buffer(Buffer::from_vec(vec));
+        self.writer.write_multi_buffer_impl(mb).await
+            .map_err(|e| MuxError::Io(format!("write: {:?}", e)))
+    }
+
+    /// 写入元数据+数据帧
+    async fn write_data(&mut self, data: MultiBuffer) -> Result<(), MuxError> {
+        let mut meta = self.get_next_frame_meta();
+        meta.set_option(OPTION_DATA);
+        write_meta_with_frame(&mut self.writer, meta, data).await
+    }
+
+    /// 写入 MultiBuffer 数据
+    pub async fn write(&mut self, mut mb: MultiBuffer) -> Result<(), MuxError> {
+        if mb.is_empty() { return self.write_meta_only().await; }
+        while !mb.is_empty() {
+            let chunk = if self.transfer_type == TransferType::Stream {
+                mb.split_size(STREAM_CHUNK_SIZE)
+            } else {
+                match mb.split_first() {
+                    Some(b) => { let mut c = MultiBuffer::new(); c.push(b); c }
+                    None => break,
+                }
+            };
+            self.write_data(chunk).await?;
+        }
+        Ok(())
+    }
+
+    /// 关闭写入器，发送 End 帧
+    pub async fn close(&mut self) -> Result<(), MuxError> {
+        let mut option = Bitmask::default();
+        if self.has_error { option.set(OPTION_ERROR); }
+        let meta = FrameMetadata::new(self.id, SessionStatus::End, option);
+        let mut vec = Vec::new();
+        meta.write_to(&mut vec).map_err(|e| MuxError::Io(format!("close meta: {:?}", e)))?;
+        let mb = MultiBuffer::from_buffer(Buffer::from_vec(vec));
+        self.writer.write_multi_buffer_impl(mb).await
+            .map_err(|e| MuxError::Io(format!("close write: {:?}", e)))
+    }
+
+    pub fn set_error(&mut self) { self.has_error = true; }
+    pub fn id(&self) -> u16 { self.id }
+    pub fn transfer_type(&self) -> TransferType { self.transfer_type }
+    pub fn is_followup(&self) -> bool { self.followup }
+    pub fn has_error(&self) -> bool { self.has_error }
+}
+
+/// 写入元数据+数据帧到底层 Writer
+async fn write_meta_with_frame(
+    writer: &mut BufferedWriter,
+    meta: FrameMetadata,
+    data: MultiBuffer,
+) -> Result<(), MuxError> {
+    let data_len = data.len() as u16;
+    let mut vec = Vec::new();
+    meta.write_to(&mut vec).map_err(|e| MuxError::Io(format!("meta: {:?}", e)))?;
+    vec.extend_from_slice(&serial::write_uint16(data_len));
+    let frame = Buffer::from_vec(vec);
+    let mut mb = MultiBuffer::with_capacity(data.buffer_count() + 1);
+    mb.push(frame);
+    for buf in data.into_buffers() { mb.push(buf); }
+    writer.write_multi_buffer_impl(mb).await
+        .map_err(|e| MuxError::Io(format!("write: {:?}", e)))
+}
+
+impl Writer for MuxWriter {
+    fn write_multi_buffer<'a>(&'a mut self, mb: MultiBuffer) -> Pin<Box<dyn std::future::Future<Output = buf_io::Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            self.write(mb).await.map_err(|e| match e {
+                MuxError::Io(msg) => buf_io::Error::WriteError(msg),
+                other => buf_io::Error::WriteError(format!("{:?}", other)),
+            })
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use xray_buf::io::new_writer;
+    use xray_common::net::address::Address;
+    use xray_common::net::network::Network;
+    use xray_common::net::port::Port;
+
+    fn make_tcp_dest() -> Destination {
+        Destination::tcp(Address::Domain("127.0.0.1".to_string()), Port::new(80))
+    }
+
+    fn create_mux_writer(tt: TransferType) -> MuxWriter {
+        let w = new_writer(Cursor::new(Vec::<u8>::new()));
+        MuxWriter::new(1u16, make_tcp_dest(), w, tt, [0u8; 8])
+    }
+
+    fn create_response_writer(tt: TransferType) -> MuxWriter {
+        let w = new_writer(Cursor::new(Vec::<u8>::new()));
+        MuxWriter::new_response_writer(1u16, w, tt)
+    }
+
+    #[test]
+    fn test_writer_new_initial_state() {
+        let w = create_mux_writer(TransferType::Stream);
+        assert_eq!(w.id(), 1);
+        assert!(!w.is_followup());
+        assert!(!w.has_error());
+        assert_eq!(w.transfer_type(), TransferType::Stream);
+    }
+
+    #[test]
+    fn test_response_writer_initial_state() {
+        let w = create_response_writer(TransferType::Packet);
+        assert!(w.is_followup());
+        assert_eq!(w.transfer_type(), TransferType::Packet);
+    }
+
+    #[test]
+    fn test_get_next_frame_meta_first_is_new() {
+        let mut w = create_mux_writer(TransferType::Stream);
+        let meta = w.get_next_frame_meta();
+        assert_eq!(meta.session_status(), SessionStatus::New);
+        assert!(w.is_followup());
+    }
+
+    #[test]
+    fn test_get_next_frame_meta_subsequent_is_keep() {
+        let mut w = create_mux_writer(TransferType::Stream);
+        let _ = w.get_next_frame_meta();
+        let meta = w.get_next_frame_meta();
+        assert_eq!(meta.session_status(), SessionStatus::Keep);
+    }
+
+    #[test]
+    fn test_response_writer_first_meta_is_keep() {
+        let mut w = create_response_writer(TransferType::Stream);
+        let meta = w.get_next_frame_meta();
+        assert_eq!(meta.session_status(), SessionStatus::Keep);
+    }
+
+    #[test]
+    fn test_set_error() {
+        let mut w = create_mux_writer(TransferType::Stream);
+        assert!(!w.has_error());
+        w.set_error();
+        assert!(w.has_error());
+    }
+
+    #[tokio::test]
+    async fn test_write_empty_buffer() {
+        let mut w = create_mux_writer(TransferType::Stream);
+        assert!(w.write(MultiBuffer::new()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_write_stream_data() {
+        let mut w = create_mux_writer(TransferType::Stream);
+        let mut mb = MultiBuffer::new();
+        mb.push(Buffer::from_vec(b"hello".to_vec()));
+        assert!(w.write(mb).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_write_packet_data() {
+        let mut w = create_mux_writer(TransferType::Packet);
+        let mut mb = MultiBuffer::new();
+        mb.push(Buffer::from_vec(b"packet".to_vec()));
+        assert!(w.write(mb).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_close_normal() {
+        let mut w = create_mux_writer(TransferType::Stream);
+        assert!(w.close().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_close_with_error() {
+        let mut w = create_mux_writer(TransferType::Stream);
+        w.set_error();
+        assert!(w.close().await.is_ok());
+    }
+
+    #[test]
+    fn test_meta_contains_dest() {
+        let mut w = create_mux_writer(TransferType::Stream);
+        let meta = w.get_next_frame_meta();
+        assert!(meta.target().is_some());
+        assert_eq!(meta.target().unwrap().network(), Network::TCP);
+    }
+
+    #[test]
+    fn test_response_writer_no_dest() {
+        let mut w = create_response_writer(TransferType::Stream);
+        let meta = w.get_next_frame_meta();
+        assert!(meta.target().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_write_large_stream_splits() {
+        let mut w = create_mux_writer(TransferType::Stream);
+        let mut mb = MultiBuffer::new();
+        mb.push(Buffer::from_vec(vec![0u8; STREAM_CHUNK_SIZE + 100]));
+        assert!(w.write(mb).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_write_multiple_packet_buffers() {
+        let mut w = create_mux_writer(TransferType::Packet);
+        let mut mb = MultiBuffer::new();
+        mb.push(Buffer::from_vec(b"first".to_vec()));
+        mb.push(Buffer::from_vec(b"second".to_vec()));
+        assert!(w.write(mb).await.is_ok());
+    }
+}
