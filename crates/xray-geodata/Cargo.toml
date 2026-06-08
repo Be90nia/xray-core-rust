@@ -12,6 +12,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 regex = "1"
 prost = { workspace = true }
+aho-corasick = "1"
+ipnet = "2"
 
 [build-dependencies]
 prost-build = { workspace = true }

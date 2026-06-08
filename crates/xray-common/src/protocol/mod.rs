@@ -75,6 +75,88 @@ impl std::fmt::Display for SecurityType {
     }
 }
 
+// ========== 传输类型 ==========
+
+/// 数据传输类型。
+///
+/// 对应 Go 版本的 `TransferType`，区分流式和包式传输。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum TransferType {
+    /// 流式传输（TCP）
+    Stream = 0,
+    /// 包式传输（UDP）
+    Packet = 1,
+}
+
+impl TransferType {
+    /// 转换为 u8 数值。
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// 从 u8 数值转换，未知值返回 `None`。
+    #[must_use]
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Stream),
+            1 => Some(Self::Packet),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for TransferType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stream => write!(f, "stream"),
+            Self::Packet => write!(f, "packet"),
+        }
+    }
+}
+
+impl Default for TransferType {
+    fn default() -> Self {
+        Self::Stream
+    }
+}
+
+// ========== 地址类型 ==========
+
+/// 地址类型。
+///
+/// 对应 Go 版本的 `AddressType`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum AddressType {
+    /// IPv4 地址
+    IPv4 = 1,
+    /// 域名地址
+    Domain = 2,
+    /// IPv6 地址
+    IPv6 = 3,
+}
+
+impl AddressType {
+    /// 转换为 u8 数值。
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// 从 u8 数值转换，未知值返回 `None`。
+    #[must_use]
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::IPv4),
+            2 => Some(Self::Domain),
+            3 => Some(Self::IPv6),
+            _ => None,
+        }
+    }
+}
+
 // ========== 命令类型 ==========
 
 /// 协议命令类型。
@@ -313,6 +395,49 @@ mod tests {
         assert_eq!(format!("{}", SecurityType::Aes128Gcm), "aes-128-gcm");
         assert_eq!(format!("{}", SecurityType::Auto), "auto");
         assert_eq!(format!("{}", SecurityType::None), "none");
+    }
+
+    // ========== TransferType 测试 ==========
+
+    #[test]
+    fn test_transfer_type_as_u8() {
+        assert_eq!(TransferType::Stream.as_u8(), 0);
+        assert_eq!(TransferType::Packet.as_u8(), 1);
+    }
+
+    #[test]
+    fn test_transfer_type_from_u8() {
+        assert_eq!(TransferType::from_u8(0), Some(TransferType::Stream));
+        assert_eq!(TransferType::from_u8(1), Some(TransferType::Packet));
+        assert_eq!(TransferType::from_u8(2), None);
+    }
+
+    #[test]
+    fn test_transfer_type_default() {
+        assert_eq!(TransferType::default(), TransferType::Stream);
+    }
+
+    #[test]
+    fn test_transfer_type_display() {
+        assert_eq!(format!("{}", TransferType::Stream), "stream");
+        assert_eq!(format!("{}", TransferType::Packet), "packet");
+    }
+
+    // ========== AddressType 测试 ==========
+
+    #[test]
+    fn test_address_type_as_u8() {
+        assert_eq!(AddressType::IPv4.as_u8(), 1);
+        assert_eq!(AddressType::Domain.as_u8(), 2);
+        assert_eq!(AddressType::IPv6.as_u8(), 3);
+    }
+
+    #[test]
+    fn test_address_type_from_u8() {
+        assert_eq!(AddressType::from_u8(1), Some(AddressType::IPv4));
+        assert_eq!(AddressType::from_u8(2), Some(AddressType::Domain));
+        assert_eq!(AddressType::from_u8(3), Some(AddressType::IPv6));
+        assert_eq!(AddressType::from_u8(0), None);
     }
 
     // ========== Command 测试 ==========

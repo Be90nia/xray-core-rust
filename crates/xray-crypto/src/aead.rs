@@ -72,13 +72,13 @@ pub enum CryptoError {
 /// operations with associated data support.
 pub trait AeadCipher {
     /// Returns the required nonce size in bytes.
-    fn nonce_size() -> usize;
+    fn nonce_size(&self) -> usize;
 
     /// Returns the authentication tag size in bytes.
-    fn tag_size() -> usize;
+    fn tag_size(&self) -> usize;
 
     /// Returns the required key size in bytes.
-    fn key_size() -> usize;
+    fn key_size(&self) -> usize;
 
     /// Encrypts and authenticates `plaintext` with `nonce` and
     /// `aad`.
@@ -164,17 +164,17 @@ impl Aes128Gcm {
 
 impl AeadCipher for Aes128Gcm {
     #[inline]
-    fn nonce_size() -> usize {
+    fn nonce_size(&self) -> usize {
         12
     }
 
     #[inline]
-    fn tag_size() -> usize {
+    fn tag_size(&self) -> usize {
         16
     }
 
     #[inline]
-    fn key_size() -> usize {
+    fn key_size(&self) -> usize {
         16
     }
 
@@ -184,9 +184,9 @@ impl AeadCipher for Aes128Gcm {
         aad: &[u8],
         plaintext: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
-        if nonce.len() != Self::nonce_size() {
+        if nonce.len() != self.nonce_size() {
             return Err(CryptoError::InvalidNonceLength {
-                expected: Self::nonce_size(),
+                expected: self.nonce_size(),
                 actual: nonce.len(),
             });
         }
@@ -208,9 +208,9 @@ impl AeadCipher for Aes128Gcm {
         aad: &[u8],
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
-        if nonce.len() != Self::nonce_size() {
+        if nonce.len() != self.nonce_size() {
             return Err(CryptoError::InvalidNonceLength {
-                expected: Self::nonce_size(),
+                expected: self.nonce_size(),
                 actual: nonce.len(),
             });
         }
@@ -272,17 +272,17 @@ impl Aes256Gcm {
 
 impl AeadCipher for Aes256Gcm {
     #[inline]
-    fn nonce_size() -> usize {
+    fn nonce_size(&self) -> usize {
         12
     }
 
     #[inline]
-    fn tag_size() -> usize {
+    fn tag_size(&self) -> usize {
         16
     }
 
     #[inline]
-    fn key_size() -> usize {
+    fn key_size(&self) -> usize {
         32
     }
 
@@ -292,9 +292,9 @@ impl AeadCipher for Aes256Gcm {
         aad: &[u8],
         plaintext: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
-        if nonce.len() != Self::nonce_size() {
+        if nonce.len() != self.nonce_size() {
             return Err(CryptoError::InvalidNonceLength {
-                expected: Self::nonce_size(),
+                expected: self.nonce_size(),
                 actual: nonce.len(),
             });
         }
@@ -316,9 +316,9 @@ impl AeadCipher for Aes256Gcm {
         aad: &[u8],
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
-        if nonce.len() != Self::nonce_size() {
+        if nonce.len() != self.nonce_size() {
             return Err(CryptoError::InvalidNonceLength {
-                expected: Self::nonce_size(),
+                expected: self.nonce_size(),
                 actual: nonce.len(),
             });
         }
@@ -753,17 +753,17 @@ impl ChaCha20Poly1305Aead {
 
 impl AeadCipher for ChaCha20Poly1305Aead {
     #[inline]
-    fn nonce_size() -> usize {
+    fn nonce_size(&self) -> usize {
         CHACHA20POLY1305_NONCE_SIZE
     }
 
     #[inline]
-    fn tag_size() -> usize {
+    fn tag_size(&self) -> usize {
         POLY1305_TAG_SIZE
     }
 
     #[inline]
-    fn key_size() -> usize {
+    fn key_size(&self) -> usize {
         CHACHA20_KEY_SIZE
     }
 
@@ -773,16 +773,16 @@ impl AeadCipher for ChaCha20Poly1305Aead {
         aad: &[u8],
         plaintext: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
-        if nonce.len() != Self::nonce_size() {
+        if nonce.len() != self.nonce_size() {
             return Err(CryptoError::InvalidNonceLength {
-                expected: Self::nonce_size(),
+                expected: self.nonce_size(),
                 actual: nonce.len(),
             });
         }
         let nonce_arr: chacha20poly1305::Nonce = nonce
             .try_into()
             .map_err(|_| CryptoError::InvalidNonceLength {
-                expected: Self::nonce_size(),
+                expected: self.nonce_size(),
                 actual: nonce.len(),
             })?;
         self.inner
@@ -802,16 +802,16 @@ impl AeadCipher for ChaCha20Poly1305Aead {
         aad: &[u8],
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
-        if nonce.len() != Self::nonce_size() {
+        if nonce.len() != self.nonce_size() {
             return Err(CryptoError::InvalidNonceLength {
-                expected: Self::nonce_size(),
+                expected: self.nonce_size(),
                 actual: nonce.len(),
             });
         }
         let nonce_arr: chacha20poly1305::Nonce = nonce
             .try_into()
             .map_err(|_| CryptoError::InvalidNonceLength {
-                expected: Self::nonce_size(),
+                expected: self.nonce_size(),
                 actual: nonce.len(),
             })?;
         self.inner
@@ -875,17 +875,17 @@ impl XChaCha20Poly1305Aead {
 
 impl AeadCipher for XChaCha20Poly1305Aead {
     #[inline]
-    fn nonce_size() -> usize {
+    fn nonce_size(&self) -> usize {
         XCHACHA20POLY1305_NONCE_SIZE
     }
 
     #[inline]
-    fn tag_size() -> usize {
+    fn tag_size(&self) -> usize {
         POLY1305_TAG_SIZE
     }
 
     #[inline]
-    fn key_size() -> usize {
+    fn key_size(&self) -> usize {
         CHACHA20_KEY_SIZE
     }
 
@@ -895,16 +895,16 @@ impl AeadCipher for XChaCha20Poly1305Aead {
         aad: &[u8],
         plaintext: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
-        if nonce.len() != Self::nonce_size() {
+        if nonce.len() != self.nonce_size() {
             return Err(CryptoError::InvalidNonceLength {
-                expected: Self::nonce_size(),
+                expected: self.nonce_size(),
                 actual: nonce.len(),
             });
         }
         let nonce_arr: chacha20poly1305::XNonce = nonce
             .try_into()
             .map_err(|_| CryptoError::InvalidNonceLength {
-                expected: Self::nonce_size(),
+                expected: self.nonce_size(),
                 actual: nonce.len(),
             })?;
         self.inner
@@ -924,16 +924,16 @@ impl AeadCipher for XChaCha20Poly1305Aead {
         aad: &[u8],
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
-        if nonce.len() != Self::nonce_size() {
+        if nonce.len() != self.nonce_size() {
             return Err(CryptoError::InvalidNonceLength {
-                expected: Self::nonce_size(),
+                expected: self.nonce_size(),
                 actual: nonce.len(),
             });
         }
         let nonce_arr: chacha20poly1305::XNonce = nonce
             .try_into()
             .map_err(|_| CryptoError::InvalidNonceLength {
-                expected: Self::nonce_size(),
+                expected: self.nonce_size(),
                 actual: nonce.len(),
             })?;
         self.inner
