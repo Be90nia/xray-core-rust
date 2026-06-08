@@ -140,7 +140,6 @@ impl MatcherGroup for DomainMatcherGroup {
         matches.into_iter().rev().flatten().collect()
     }
 
-    #[must_use]
     fn match_any(&self, input: &str) -> bool {
         let labels: Vec<&str> = input.split('.').rev().collect();
         let mut node = &self.root;
@@ -205,7 +204,6 @@ impl Default for SimpleMatcherGroup {
 }
 
 impl MatcherGroup for SimpleMatcherGroup {
-    #[must_use]
     fn match_str(&self, input: &str) -> Vec<u16> {
         self.entries
             .iter()
@@ -214,7 +212,6 @@ impl MatcherGroup for SimpleMatcherGroup {
             .collect()
     }
 
-    #[must_use]
     fn match_any(&self, input: &str) -> bool {
         self.entries
             .iter()
@@ -269,7 +266,6 @@ impl SubstrMatcherGroup {
 }
 
 impl MatcherGroup for SubstrMatcherGroup {
-    #[must_use]
     fn match_str(&self, input: &str) -> Vec<u16> {
         // 对每个模式，找到其在输入中的最后出现位置
         let mut positioned: Vec<(usize, usize, u16)> = Vec::new();
@@ -286,7 +282,6 @@ impl MatcherGroup for SubstrMatcherGroup {
         positioned.into_iter().map(|(_, _, v)| v).collect()
     }
 
-    #[must_use]
     fn match_any(&self, input: &str) -> bool {
         self.entries
             .iter()
@@ -394,7 +389,6 @@ pub enum ACMatcherGroupError {
 }
 
 impl MatcherGroup for ACMatcherGroup {
-    #[must_use]
     fn match_str(&self, input: &str) -> Vec<u16> {
         let ac = match &self.ac {
             Some(ac) => ac,
@@ -455,7 +449,6 @@ impl MatcherGroup for ACMatcherGroup {
         all_matches.into_iter().map(|(_, _, v)| v).collect()
     }
 
-    #[must_use]
     fn match_any(&self, input: &str) -> bool {
         let ac = match &self.ac {
             Some(ac) => ac,
@@ -815,7 +808,6 @@ impl Default for MPHMatcherGroup {
 }
 
 impl MatcherGroup for MPHMatcherGroup {
-    #[must_use]
     fn match_str(&self, input: &str) -> Vec<u16> {
         if !self.is_built() {
             return Vec::new();
@@ -848,7 +840,6 @@ impl MatcherGroup for MPHMatcherGroup {
         matches.into_iter().rev().flatten().collect()
     }
 
-    #[must_use]
     fn match_any(&self, input: &str) -> bool {
         if !self.is_built() {
             return false;

@@ -38,6 +38,7 @@ pub mod geoip;
 pub mod geosite;
 pub mod loader;
 pub mod matcher;
+pub mod rule_parser;
 
 // Re-export the most commonly used types at crate root for
 // convenience.
