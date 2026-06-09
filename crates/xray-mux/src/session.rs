@@ -170,7 +170,7 @@ impl Session {
     ///
     /// 对应 Go 版本 `Session` 的初始化。
     /// 通过 `SessionManager::allocate` 调用，不应直接构造。
-    fn new(id: u16, transfer_type: TransferType) -> Self {
+    pub(crate) fn new(id: u16, transfer_type: TransferType) -> Self {
         let (done_tx, done_rx) = watch::channel(false);
         Self {
             id,
