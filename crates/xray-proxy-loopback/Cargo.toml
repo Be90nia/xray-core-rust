@@ -8,5 +8,7 @@ rust-version.workspace = true
 [dependencies]
 xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
+xray-proto = { path = "../xray-proto" }
 tokio = { workspace = true }
 tracing = { workspace = true }
+thiserror = { workspace = true }

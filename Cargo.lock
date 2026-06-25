@@ -1706,8 +1706,10 @@ dependencies = [
 name = "xray-app-version"
 version = "0.1.0"
 dependencies = [
+ "thiserror",
  "xray-common",
  "xray-features",
+ "xray-proto",
 ]
 
 [[package]]
@@ -1840,10 +1842,14 @@ dependencies = [
 name = "xray-proxy-blackhole"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "thiserror",
  "tokio",
  "tracing",
+ "xray-buf",
  "xray-common",
  "xray-features",
+ "xray-proto",
 ]
 
 [[package]]
@@ -1893,10 +1899,12 @@ dependencies = [
 name = "xray-proxy-loopback"
 version = "0.1.0"
 dependencies = [
+ "thiserror",
  "tokio",
  "tracing",
  "xray-common",
  "xray-features",
+ "xray-proto",
 ]
 
 [[package]]
