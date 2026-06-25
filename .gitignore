@@ -23,6 +23,9 @@ Thumbs.db
 # Graphify
 graphify-out/
 
+# codebase-memory (MCP 知识图谱 artifact, 本地生成不提交)
+.codebase-memory/
+
 # Coverage
 coverage/
 *.profraw

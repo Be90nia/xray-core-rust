@@ -9,7 +9,11 @@ rust-version.workspace = true
 xray-buf = { path = "../xray-buf" }
 xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
+thiserror = "1"
 tokio = { workspace = true }
 tracing = { workspace = true }
 socket2 = { workspace = true }
 parking_lot = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
