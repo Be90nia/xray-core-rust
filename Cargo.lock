@@ -1660,8 +1660,10 @@ dependencies = [
 name = "xray-app-policy"
 version = "0.1.0"
 dependencies = [
+ "thiserror",
  "xray-common",
  "xray-features",
+ "xray-proto",
 ]
 
 [[package]]
