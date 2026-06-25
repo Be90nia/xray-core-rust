@@ -7,6 +7,12 @@ rust-version.workspace = true
 
 [dependencies]
 xray-common = { path = "../xray-common" }
+xray-proto = { path = "../xray-proto" }
 xray-transport = { path = "../xray-transport" }
+thiserror = { workspace = true }
+sha2 = "0.10"
+hex = "0.4"
+subtle = "2"
+
+[dev-dependencies]
 tokio = { workspace = true }
-tracing = { workspace = true }

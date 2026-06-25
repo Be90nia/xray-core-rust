@@ -362,6 +362,14 @@ cargo clippy -p xray-app-XXX
 | `xray-proxy-blackhole` | `ResponseConfig` 用 enum 而非 `dyn Trait` | async fn in trait 不 dyn-compatible（详见 §3） |
 | `xray-proxy-blackhole` | `process(&mut dyn Writer)` 替代 `process(Link, Dialer)` | `transport::Link`/`internet::Dialer` 在 Rust 端未实现 |
 | `xray-proxy-blackhole` | `Handler::with_response` 显式构造方法 | 便于上层 adapter 与测试 |
+| `xray-app-policy` | Go `init()` 全局注册 + `manager` lookup → Rust 显式 `PolicyManager::new` 持有 HashMap | Rust 无副作用全局；显式持有更利于测试隔离（详见 b685c6d 提交） |
+| `xray-transport` | `Link { reader, writer }` 字段公开值类型 + `Connection: AsyncRead + AsyncWrite + Unpin + Send + Sync` supertrait | 走 tokio blanket impl，禁手写 `impl AsyncRead for Box<dyn Connection>`（E0119，详见 rust.md §tokio 陷阱） |
+| `xray-transport` | `CounterConnection<C>` 包装用 `Pin::get_mut + Pin::new` 安全投影 | Wrapper 字段皆 Unpin，避免 unsafe |
+| `xray-tls` | **不引入 btls/wreq-util**（任务描述的「~800 行替代 uTLS」方案被驳回） | 实际调研：btls 是 BoringSSL binding 无 ClientHello 控制；wreq 是 HTTP 客户端不能被代理握手复用；Rust 生态无 uTLS 等价品。改走 trait + TODO 等生态成熟或自研 |
+| `xray-tls` | `Fingerprint` enum 保留所有变体名（含历史版本如 `HelloChrome58`） | 1:1 翻译 Go 三张 map；Rust 端暂不用具体字节布局，但保留名路由以便上层配置层稳定 |
+| `xray-tls` | `verify_chain` 接受 `cert_hashes: &[Vec<u8>]` + `cert_is_ca: &[bool]` 分离输入 | Go 用 `[]*x509.Certificate`，Rust 端避免引入 x509 类型，让纯函数可独立测试 |
+| `xray-tls` | `ConnInterface: xray_transport::connection::Connection` supertrait（非独立 AsyncRead） | 复用 transport 层抽象，避免重复约束；对应 Go `Interface interface { net.Conn; ... }` |
+| `xray-tls` | ECH 实际 DNS 查询 (`apply_ech`/`query_record`/`dns_query`) 留 trait + TODO | 依赖 Phase 4 `xray-app-dns` 未就绪；TLV 解析+缓存数据结构已完成独立可测 |
 
 ---
 
@@ -382,6 +390,42 @@ crates/xray-proxy-blackhole/
 │   ├── response.rs      # ResponseConfig enum + get_internal_response + 10 单测
 │   └── handler.rs       # Handler + BlackholeError + 6 单测
 └── target/              # 验证产物
+```
+
+crates/xray-app-policy/
+├── Cargo.toml
+├── src/
+│   ├── lib.rs           # 模块入口
+│   ├── policy.rs        # Policy struct + policy::Level + 8 单测
+│   ├── manager.rs       # PolicyManager 持 HashMap + level 解析 + 12 单测
+│   └── buffer.rs        # BufferPolicy + 4 单测
+└── target/
+
+crates/xray-transport/
+├── Cargo.toml
+├── src/
+│   ├── lib.rs           # 顶部文档 + 9 业务模块 + 12 stub 模块声明
+│   ├── link.rs          # Link { reader, writer } + 3 单测
+│   ├── connection.rs    # Connection trait + TcpConnection + 4 单测
+│   ├── listener.rs      # Listener trait + TcpListenerConn + 3 单测
+│   ├── dialer.rs        # Dialer trait（仅声明）
+│   └── stat.rs          # CounterConnection 字节计数包装 + 3 单测
+└── target/
+
+crates/xray-tls/
+├── Cargo.toml           # sha2/hex/subtle/thiserror + xray-proto + xray-transport
+├── src/
+│   ├── lib.rs           # 顶部文档（说明 btls/wreq 驳回决策） + 9 模块声明
+│   ├── error.rs         # TlsError enum（10 变体）+ 2 单测
+│   ├── pin.rs           # generate_cert_hash/hex + 5 单测
+│   ├── fingerprint.rs   # Fingerprint enum（~60 变体）+ get_fingerprint + 三张表 + 8 单测
+│   ├── certificate.rs   # CertificateUsage enum + is_encipherment/authority_issue + 5 单测
+│   ├── config.rs        # CurveId/parse_curve_name/is_from_mitm/verify_chain/Option/RandCarrier + 17 单测
+│   ├── ech.rs           # convert_to_ech_keys TLV 解析 + EchConfigCache + ech_cache_key + ApplyEch trait + 14 单测
+│   ├── unsafe_conn.rs   # TLS_CLOSE_TIMEOUT 常量 + 1 单测
+│   ├── utls.rs          # ConnInterface trait + client/server/u_client 工厂占位 + 1 单测
+│   └── grpc.rs          # GrpcUtlsInfo + GrpcUtlsCredentials trait + new_grpc_utls 占位 + 3 单测
+└── target/              # 验证产物（49 unit + 8 doctest 全绿）
 ```
 
 ## 附录 B：依赖未实现时的处理流程
