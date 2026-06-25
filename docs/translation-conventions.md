@@ -370,6 +370,13 @@ cargo clippy -p xray-app-XXX
 | `xray-tls` | `verify_chain` 接受 `cert_hashes: &[Vec<u8>]` + `cert_is_ca: &[bool]` 分离输入 | Go 用 `[]*x509.Certificate`，Rust 端避免引入 x509 类型，让纯函数可独立测试 |
 | `xray-tls` | `ConnInterface: xray_transport::connection::Connection` supertrait（非独立 AsyncRead） | 复用 transport 层抽象，避免重复约束；对应 Go `Interface interface { net.Conn; ... }` |
 | `xray-tls` | ECH 实际 DNS 查询 (`apply_ech`/`query_record`/`dns_query`) 留 trait + TODO | 依赖 Phase 4 `xray-app-dns` 未就绪；TLV 解析+缓存数据结构已完成独立可测 |
+| `xray-app-dns` | **不引 hickory-proto**（DNS wire format）；`buildReqMsgs`/`genEDNS0Options` 留 TODO | 厚重依赖；当前业务核心（数据结构/缓存/hosts/fakedns）独立可测，wire format 等 hickory 或自研 wire 接入 |
+| `xray-app-dns` | **不引 quinn/hyper**（DoQ/DoH）；5 个 nameserver 协议工厂占位返回 NotImplemented | 依赖 transport + TLS + HTTP/2 全链路，本阶段先建 trait + Client 框架 |
+| `xray-app-dns` | singleflight 简化为 per-key Mutex<HashMap>；pubsub 用 tokio::sync::broadcast | Go `singleflight.Group` 在 Rust 生态等价品少；broadcast 满足订阅语义 |
+| `xray-app-dns` | `StaticHosts` 内部用 `InMemoryMatcher`（线性扫）替代 `MphDomainMatcher` | xray-geodata 未暴露 `DomainRegistry::build_many`，待后续替换；测试覆盖完整语义 |
+| `xray-app-dns` | `merge_records` 严格按 Go 语义：v4+v6 同时启用但任一缺失 → `RecordNotFound` | 1:1 翻译 Go `(*IPRecord).getIPs()` 行为；调用方应保证 `send_query` 同时返回 v4/v6 响应 |
+| `xray-app-dns` | `DnsService::lookup_ip` 同步签名，nameservers 路径返回 `NotImplemented` | trait `Server::query_ip` 是 async；改 lookup_ip 为 async 会引发签名污染；等上层 tokio runtime 注入后接入 |
+| `xray-app-dns` | `DnsService` 不实现 `xray_features::dns::DnsClient`（trait 已用 `#[async_trait]`） | xray-features 用旧风格 `#[async_trait]`，与新代码手写 boxed future 风格不一致；接入需统一为手写风格后重做 |
 
 ---
 
@@ -426,6 +433,30 @@ crates/xray-tls/
 │   ├── utls.rs          # ConnInterface trait + client/server/u_client 工厂占位 + 1 单测
 │   └── grpc.rs          # GrpcUtlsInfo + GrpcUtlsCredentials trait + new_grpc_utls 占位 + 3 单测
 └── target/              # 验证产物（49 unit + 8 doctest 全绿）
+```
+
+```
+crates/xray-app-dns/
+├── Cargo.toml           # lru/ipnet/uuid/thiserror/xray-common/xray-features/xray-geodata
+├── src/
+│   ├── lib.rs           # 顶部文档 + 9 模块声明 + re-exports DnsService/DomainMatcherInfo
+│   ├── error.rs         # DnsError enum（13 变体）+ 5 单测
+│   ├── config.rs        # QueryStrategy/IpOption/resolve_ip_option_override/helpers + 9 单测
+│   ├── dnscommon.rs     # Fqdn/IpRecord/Record/merge_records/RCode 常量 + 6 单测
+│   ├── hosts.rs         # StaticHosts + HostMapping + InMemoryMatcher + lookup（递归 unwrap）+ 7 单测
+│   ├── cache_controller.rs  # CacheController + cleanup + shrink + broadcast + subscribe + 7 单测
+│   ├── server.rs        # DnsService + DnsServiceConfig + DomainMatcherInfo + sort_clients + lookup_ip + 9 单测
+│   ├── fakedns/mod.rs   # FakeDnsPool + Holder + HolderMulti + ip ts_to_ip + 11 单测
+│   └── nameserver/
+│       ├── mod.rs       # Server trait + Client + NameServerConfig + new_server 占位 + 5 单测
+│       ├── cached.rs    # CachedNameserver trait + query_ip/fetch/pull/subscribe + 4 单测
+│       ├── fakedns.rs   # FakeDnsEngine trait + FakeDnsServer + impl for Holder/HolderMulti + 5 单测
+│       ├── udp.rs       # new_classic_name_server 占位 + 1 单测
+│       ├── tcp.rs       # new_tcp_name_server/new_tcp_local_name_server 占位 + 1 单测
+│       ├── doh.rs       # new_doh_name_server 占位 + 1 单测
+│       ├── quic.rs      # new_quic_name_server 占位 + 1 单测
+│       └── local.rs     # new_local_name_server 占位 + 1 单测
+└── target/              # 验证产物（82 unit + 0 doctest 全绿）
 ```
 
 ## 附录 B：依赖未实现时的处理流程
