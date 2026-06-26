@@ -429,6 +429,68 @@ cargo clippy -p xray-app-XXX
 | `xray-app-commander` | `CommanderConn = Box<dyn CommanderIo>`，`CommanderIo: AsyncRead + AsyncWrite + Send + Unpin` supertrait + blanket impl | Rust trait object 不允许 `dyn AsyncRead + AsyncWrite`（两个 non-auto trait， E0225）；用 supertrait 包装 |
 | `xray-app-commander` | `ReflectionService` 仅 const TYPE_URL + name/type_url，实际 reflection 注册由上层注入（`tonic_reflection::server::Builder`） | Go 用 grpc/reflection 包；Rust 等价包是 tonic-reflection，在本 crate 不依赖 |
 
+### P4-12 xray-app-metrics（2025-06）
+
+| crate | 决策 | 原因 |
+| --- | --- | --- |
+| `xray-app-metrics` | **不引入 hyper/reqwest/prometheus**：HTTP server + expvar.Publish 留 `MetricsHttpServer` trait | Phase 4 不绑定 HTTP 栈；上层注入 hyper/axum 实现 |
+| `xray-app-metrics` | `OutboundListener` 用 `Box<dyn Any + Send>` 类型擦除 Conn，避开具体 socket 类型 | Go 用 `net.Conn` interface；Rust 端 transport::Link → Conn 转换由上层负责 |
+| `xray-app-metrics` | `OutboundListener` 用 `VecDeque + parking_lot::Condvar` 实现 buffer + Accept 阻塞语义 | 模拟 Go `chan net.Conn + done.Instance` 的阻塞 Accept + select default 丢弃 |
+| `xray-app-metrics` | `StatsCollector` / `ObservationCollector` trait 暴露快照 | Go expvar.Publish 闭包捕获 state；Rust 用 trait 让 HTTP server 每次请求调 `collect()` |
+| `xray-app-metrics` | `parse_counter_name` 跳过 3 段格式（user>>>{email}>>>ip），Go 版会 panic | Rust 翻译更稳健：避免运行时 panic |
+| `xray-app-metrics` | `aggregate_counters` 累加同 key 多次记录 | Go 版用 map 覆盖，Rust 加 += 与多次提交语义一致 |
+
+### P4-10 xray-app-log（2025-06）
+
+| crate | 决策 | 原因 |
+| --- | --- | --- |
+| `xray-app-log` | **不引入 console/file log 库**：`LogHandler` trait + `HandlerCreator` 工厂 + `HandlerCreatorRegistry` | Go 用全局 init() 注册；Rust 用 registry 实例注入 |
+| `xray-app-log` | 重定义 `SeverityLevel` enum（与 `xray_common::log::Severity` 顺序相反） | Go proto Severity 数值大=详细，与 Rust common 端反向；本地 enum 与 proto 一致 |
+| `xray-app-log` | `LogEntry` enum 替代 Go `log.Message` interface | 类型安全：Access/Dns/General 三种消息用变体表达 |
+| `xray-app-log` | `MaskingHandler` 包装 inner handler，对 entry 各字段应用 mask_addresses | 与 Go `MaskedMsgWrapper` 行为一致；mask 逻辑下沉到 mask.rs 纯函数 |
+| `xray-app-log` | `parse_mask_address` 用 `+` 分隔（不支持 `/` 分隔） | Go 原代码 `strings.Split(c, "+")`；不支持 `/16//64` 这种双斜杠形式 |
+| `xray-app-log` | `mask_addresses` IPv4 用 `parts[mask4/8..].fill("*")`，IPv6 用 `Ipv6Addr::octets()` 按位 AND | 与 Go 版 mask 算法等价 |
+| `xray-app-log` | gRPC server 留 `LogService` trait + `DefaultLogService` 包装 LogInstance | 仅 RestartLogger 一个 RPC，编排简单 |
+
+### P4-9 xray-app-geodata（2025-06）
+
+| crate | 决策 | 原因 |
+| --- | --- | --- |
+| `xray-app-geodata` | **不引入 cron crate**：cron 表达式解析 + 调度留 `Scheduler` trait | Go 用 robfig/cron；Rust 不绑定具体调度库，上层注入实现 |
+| `xray-app-geodata` | **不引入 reqwest/hyper**：HTTP download + dispatcher dial 留 `AssetDownloader` trait | 与 metrics/log 一致的注入模式 |
+| `xray-app-geodata` | `Stage/Swap/Tx` 文件原子交换完整实现（纯 std::fs） | 业务核心可独立测试，无 IO 依赖 |
+| `xray-app-geodata` | `tempfile_in` sanitize prefix 中的 `* / \ : " < > |` 为 `_` | Windows 文件名不允许这些字符（os error 123）；Go 用 os.CreateTemp 自动处理 |
+| `xray-app-geodata` | `tempfile_in` 用 PID + nanos + counter 生成唯一名，重试 16 次 | Rust 标准库无 CreateTemp 等价；手写重试 |
+| `xray-app-geodata` | `reload_with_update` 编排 download → swap → reload → commit/rollback | 与 Go `Instance.reloadWithUpdate` 一致；失败自动 rollback |
+| `xray-app-geodata` | `GeodataInstance::start` 用 Scheduler 注入；空 cron 不调度 | 与 Go `if config.Cron == "" return empty` 一致 |
+
+### P4-11 xray-app-reverse（2025-06）
+
+| crate | 决策 | 原因 |
+| --- | --- | --- |
+| `xray-app-reverse` | **不实现 mux/pipe/signal.ActivityTimer**：bridge worker / portal worker 数据流留 trait stub | mux crate 尚未翻译；仅翻译可独立测试的纯业务 |
+| `xray-app-reverse` | `StaticMuxPicker<W: PickerWorker>` 泛型 + pick_available 算法 | 最少连接选择是纯算法，可独立测试 |
+| `xray-app-reverse` | `PickerWorker` trait 暴露 is_full/is_closed/is_draining/active_connections | 与 Go PortalWorker 接口对齐 |
+| `xray-app-reverse` | `Control::fill_in_random` 用 `rand::rng().random_range(1..=64)` | Go 用 `dice.Roll(64)+1`；rand 0.9 API |
+| `xray-app-reverse` | `Reverse<B, P>` 泛型 + `BridgeFactory` / `PortalFactory` trait | 与 dispatcher 注入模式一致；上层提供具体 factory |
+| `xray-app-reverse` | `should_create_bridge_worker(worker_count, total_conn)` 纯函数 | 对应 Go `Bridge.monitor` 的扩容判定逻辑 |
+| `xray-app-reverse` | `validate_bridge_config` / `validate_portal_config` 提前校验 tag/domain | Go 在 NewBridge/NewPortal 内 panic-style 错误；Rust 显式 Result |
+
+### P4-8 xray-app-observatory（2025-06）
+
+| crate | 决策 | 原因 |
+| --- | --- | --- |
+| `xray-app-observatory` | **不引入 reqwest/hyper**：HTTP probe + dispatcher dial 留 `ProbeExecutor` trait | 与其他 P4 crate 一致的注入模式 |
+| `xray-app-observatory` | `OutboundSelector` trait 替代 Go `outbound.HandlerSelector.Select` | 不依赖 outbound.Manager 具体实现 |
+| `xray-app-observatory` | `StatusStore` 用 `parking_lot::Mutex<Vec<OutboundStatus>>` | Go 用 sync.Mutex + slice；parking_lot 更高效 |
+| `xray-app-observatory` | `update_with_probe_result` 接 now_unix_secs 参数（不内部调 SystemTime） | 测试可注入固定时间；与 Go `time.Now().Unix()` 等价 |
+| `xray-app-observatory` | `HealthPingRtts` 环形缓冲 + statistics 完整实现 | 纯算法可独立测试：avg/deviation/min/max + 过期跳过 |
+| `xray-app-observatory` | RTT 哨兵 `RTT_FAILED/RTT_UNTESTED/RTT_UNQUALIFIED` 用 i64::MAX - 0/1/2 | 与 Go `math.MaxInt64 - iota` 一致 |
+| `xray-app-observatory` | `HealthPingSettings::from_config` 应用默认值 + 最小约束（interval < 10s → 10s） | 与 Go `NewHealthPing` 一致 |
+| `xray-app-observatory` | gRPC 留 `ObservationProvider` / `ObservatoryService` trait + `DefaultObservatoryService` | 仅 GetOutboundStatus 一个 RPC；与 commander/proxyman/stats 同模式 |
+| `xray-app-observatory` | `Observer::start` 在 subject_selector 为空时不标记 started | 与 Go `Start` 在 selector 空时不启动 background 一致 |
+
+
 ## 附录 A：样板文件位置
 
 ```

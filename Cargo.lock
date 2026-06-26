@@ -1757,37 +1757,52 @@ dependencies = [
 name = "xray-app-geodata"
 version = "0.1.0"
 dependencies = [
+ "parking_lot",
+ "thiserror 2.0.18",
+ "tracing",
  "xray-common",
  "xray-features",
  "xray-geodata",
+ "xray-proto",
 ]
 
 [[package]]
 name = "xray-app-log"
 version = "0.1.0"
 dependencies = [
+ "once_cell",
+ "parking_lot",
+ "regex",
+ "thiserror 2.0.18",
  "tracing",
- "tracing-subscriber",
  "xray-common",
  "xray-features",
+ "xray-proto",
 ]
 
 [[package]]
 name = "xray-app-metrics"
 version = "0.1.0"
 dependencies = [
+ "parking_lot",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
  "xray-common",
  "xray-features",
+ "xray-proto",
 ]
 
 [[package]]
 name = "xray-app-observatory"
 version = "0.1.0"
 dependencies = [
- "tokio",
+ "parking_lot",
+ "thiserror 2.0.18",
  "tracing",
  "xray-common",
  "xray-features",
+ "xray-proto",
 ]
 
 [[package]]
@@ -1819,9 +1834,13 @@ dependencies = [
 name = "xray-app-reverse"
 version = "0.1.0"
 dependencies = [
- "tokio",
+ "parking_lot",
+ "rand",
+ "thiserror 2.0.18",
+ "tracing",
  "xray-common",
  "xray-features",
+ "xray-proto",
 ]
 
 [[package]]

@@ -8,4 +8,8 @@ rust-version.workspace = true
 [dependencies]
 xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
+xray-proto = { path = "../xray-proto" }
 xray-geodata = { path = "../xray-geodata" }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
