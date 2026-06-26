@@ -2127,11 +2127,16 @@ dependencies = [
 name = "xray-proxy-vless"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "parking_lot",
+ "prost",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "xray-buf",
  "xray-common",
  "xray-features",
+ "xray-proto",
  "xray-transport",
 ]
 

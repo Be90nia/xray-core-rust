@@ -816,3 +816,62 @@ xray-transport 的 `Connection` trait 是 `AsyncRead + AsyncWrite + Unpin`。
 - 153 单元测试（全过）
 - 代码量：~4800 行（含测试）
 - Go 源对应：`transport/internet/hysteria/` 17 文件 ~3700 行（含 BBR ~1700 行）
+
+
+## xray-proxy-vless 决策记录（P6-1，bd 81t）
+
+**状态**：完成。80 单测全绿，workspace 零 warning。
+
+### 完整翻译范围
+- `account.rs`：`MemoryAccount` + `Reverse` + proto 转换（Go `account.go` 60 行）
+- `validator.rs`：`Validator` trait + `MemoryValidator`（ProcessUUID 清零字节 6/7）+ 本地 `MemoryUser`
+- `error.rs`：`VlessError` enum 14 变体
+- `encoding/{mod,client,server}.rs`：`VlessCommand`(含 Rvs=4) + `Addons`(XRV/None) + `encode_request_header`/`decode_request_header`(含 isfb) + `LengthPacketWriter`/`MultiLengthPacketWriter` + 地址编解码 + 响应头
+- `encryption/{mod,common,client,server,xor}.rs`：trait + stub + 纯算法（TLS record header 常量、`increase_nonce`、`MAX_NONCE`、BE 长度编解码）
+- `outbound/handler.rs`：`Handler` + `RequestParts` + `decide_command`/`build_request`
+- `inbound/handler.rs`：`FallbackPolicy`(`name→alpn→path→Destination` 三级 map + 8 级降级查找) + `extract_path_from_first_bytes`(扫描首个 '/' 而非硬编码偏移)
+
+### trait + stub 范围（依赖未就绪）
+- `encryption::EncryptionConn` trait：Handshake 返回 NotImplemented（依赖 `mlkem-768` + X25519 ECDH + utls + `unsafe.Pointer` 提取 TLS 私有字段）
+- `outbound::OutboundProcessor::process`：依赖 transport 全链路 + retry + signal + xudp + reverse.BridgeWorker
+- `inbound::InboundProcessor::process`：依赖 buf.BufferedReader + tls.Conn + reality + dispatcher
+
+### 关键决策
+1. **本地定义 `VlessCommand` enum（Tcp=1/Udp=2/Mux=3/Rvs=4）**：`xray_common::protocol::Command` 不含 Rvs（Go 端 `RequestCommandRvs=0x04` 是 VLESS 反向代理独有）。提供 `From<protocol::Command>` 单向转换（Rvs 无对应）。
+2. **本地定义 `MemoryUser`**：不复用 `xray_common::protocol::MemoryUser`（Go 端 `MemoryUser.Account` 是 interface 持 `*MemoryAccount`，Rust 端无 interface 等价物）。
+3. **`Addons` 用 prost 生成类型 + 工厂函数 `empty_addons()`**：orphan rule 禁止本地 impl Default。prost 生成 `seed: Vec<u8>`（不是 Bytes）。
+4. **`Validator::get` 接受 `&UUID`**：内部 MemoryValidator 做 `process_uuid` 后查表。`UUID::from_bytes([u8;16])` 转换。
+5. **`process_uuid` 用 `[u8;16]` 数组 + `*id.as_bytes()` 解引用**（不是 `.copied()`，E0599）。
+6. **`async fn in trait` 用 `Pin<Box<dyn Future>>` 显式签名**：`EncryptionConn::close` 必须如此才能 `dyn` 兼容。
+7. **`extract_path` 用通用扫描**：HTTP METHOD 长度变化（GET/POST/PUT），不假设 `first[3] == '/'`。
+8. **Fallback 查找 8 级降级**：精确 → 空 name → 空 alpn → 全空，按 Go 端实际行为顺序。
+
+### 模块结构
+```
+src/
+├── lib.rs                    # 模块声明 + re-exports + FLOW_NONE/FLOW_XRV 常量
+├── account.rs                # MemoryAccount + Reverse + proto 转换
+├── validator.rs              # Validator trait + MemoryValidator + 本地 MemoryUser
+├── error.rs                  # VlessError enum (14 variants)
+├── encoding/
+│   ├── mod.rs                # VlessCommand + Addons + 地址编解码 + LengthPacket + 响应头
+│   ├── client.rs             # encode_request_header（出站）
+│   └── server.rs             # decode_request_header（入站，含 isfb）
+├── encryption/
+│   ├── mod.rs                # EncryptionConn trait + ClientInstance/ServerInstance
+│   ├── common.rs             # 纯算法：TLS record header + nonce + length BE
+│   ├── client.rs             # 占位
+│   ├── server.rs             # 占位
+│   └── xor.rs                # 占位（NewCTR/XorConn 依赖 blake3+aes）
+├── outbound/
+│   ├── mod.rs
+│   └── handler.rs            # Handler + RequestParts + OutboundProcessor trait + StubProcessor
+└── inbound/
+    ├── mod.rs
+    └── handler.rs            # FallbackPolicy + extract_path + InboundProcessor trait + StubProcessor
+```
+
+### 测试覆盖
+- 80 单测全绿（account 9 + validator 13 + error 4 + encoding 26 + encryption 12 + outbound 6 + inbound 10）
+- 对照 Go `encoding_test.go` 3 场景：TCP+Domain / Invalid command / Mux
+- 新增场景：UDP IPv4、Rvs、isfb first buffer、isfb 边界（too short / missing）、unknown user rejected、Fallback 8 级降级、extract_path 多种终止符
