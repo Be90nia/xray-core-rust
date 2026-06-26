@@ -665,3 +665,75 @@ Go 源码分析
         ↓ 在 lib.rs 顶部文档说明 "当前实现范围" 与 "等 X 实现后接入"
         ↓ 不阻塞当前 crate 编译 + 测试
 ```
+
+## xray-transport-kcp 决策记录
+
+### 决策 1：不引 kcp-tokio / tokio-kcp 等通用 KCP crate
+
+**背景**：社区有现成的 `kcp`、`kcp-tokio`、`tokio-kcp` crate。
+**决策**：不引，1:1 翻译 Go 源码。
+**原因**：xray mKCP 是 skywind3000 KCP 的 xtaci Go 端口的 xray 定制版——
+- 自定义 Segment 二进制格式（DataSegment 18B overhead；AckSegment 17B + N×4B；CmdOnlySegment 16B 固定）
+- 自定义 6 态 State 状态机（标准 KCP 只有 3 态）
+- 自定义 RoundTripInfo（RFC 6298，含 minRtt 钳制 + maxRto 10000）
+- 自定义 Updater（基于 signal.Notifier 的 wakeup 机制，非 tick-only）
+
+通用 crate 使用标准 KCP 协议格式，与 xray Go 端字节级不兼容。
+若用现成 crate 等于放弃与 xray Go 互通——与 §0「源码 1:1 映射」原则冲突。
+
+### 决策 2：避免 worker→connection 循环引用，状态通过参数注入
+
+**背景**：Go worker（SendingWorker/ReceivingWorker）持有 `*Connection` 反向指针，
+调 `conn.State()` / `conn.roundTrip.Timeout()` / `conn.meta.Conversation` / `conn.output.Write()`。
+**决策**：Rust worker 不持有 Connection，而是持有必要共享状态：
+- `Arc<RoundTripInfo>`（替代 `conn.roundTrip`）
+- `Arc<Config>`（替代 `conn.Config`）
+- `conv: u16`（替代 `conn.meta.Conversation`）
+- 需要 state 的方法（如 `flush(current, state)`）通过参数接收
+- flush 末尾的 Ping 通过返回 `FlushOutcome{needs_ping: bool}` 让 Connection 决定
+
+**原因**：Rust 所有权禁止裸指针循环引用。参数注入保持 1:1 语义等价 + 测试可独立。
+
+### 决策 3：Updater 闭包用 Weak ref + clone-per-closure
+
+**背景**：Go `Updater` 用 `shouldContinue() bool` / `shouldTerminate() bool` / `updateFunc()` 三个闭包。
+Rust `TokioUpdater::new` 接收 `impl Fn() -> bool + Send + Sync + 'static`，需要捕获 `Weak<ConnectionInner>`。
+**决策**：每个闭包独立 `Arc::downgrade(&inner)` 拿到自己的 Weak，不共享。
+**原因**：Rust 闭包 `move ||` 会 move 捕获的变量，共享 Weak 会报 "use of moved value"。
+
+### 决策 4：Read/Write 简化同步版，AsyncRead 包装留给 adapter
+
+**背景**：Go `Connection` 实现 `io.ReadWriteCloser`（同步）。
+xray-transport 的 `Connection` trait 是 `AsyncRead + AsyncWrite + Unpin`。
+**决策**：`Connection::read(&self, b) -> Result<usize>` 同步简化版（不等待窗口/数据，短写或返回 0）；
+上层 adapter（dialer/listener）包装成 AsyncRead/AsyncWrite + tokio::sync::Notify 等待。
+**原因**：核心状态机（state、input、flush、ping）同步可测，避免测试依赖 tokio runtime。
+
+### 决策 5：IO 边界（UDP/TLS/Udpmask）留 trait + stub
+
+**背景**：Go `DialKCP` / `ListenKCP` 依赖 `internet.DialSystem`（实际 UDP 连接）+
+`tls.Client/Server` + `UdpmaskManager` + `udp.Hub`。
+**决策**：
+- `KcpDialerFactory` trait（dial UDP + TLS + Udpmask 注入点）
+- `KcpListenerFactory` trait（UDP Hub + TLS server + ConnHandler 注入）
+- `UdpHub` trait（替代 `udp.Hub`，receive/write_to/close/local_addr）
+- `ConnHandler` trait（替代 `internet.ConnHandler`，add_conn）
+- `dial_kcp` / `ListenKCP` 函数留 stub（返回 Err(Unsupported)）
+
+**原因**：与 §9「IO 边界」策略一致，核心会话路由逻辑可独立测试。
+
+### 决策 6：SegmentKind tagged union 替代 Box<dyn Segment>
+
+**背景**：Go `[]Segment`（接口切片）。
+**决策**：`Vec<SegmentKind>` 枚举（Data/Ack/Cmd 三变体）。
+**原因**：
+- 避免 N 次 heap alloc（每 segment 一次 Box）
+- 支持 `match` pattern matching，dispatch 比 vtable 快
+- SegmentKind 自带 Debug derive，测试断言方便（`match seg { SegmentKind::Data(s) => ... }`）
+
+### 统计
+
+- 13 个模块（lib + 12 子模块）
+- 133 单元测试（全过）
+- 代码量：~3500 行（含测试）
+- Go 源对应：`transport/internet/kcp/` 9 文件 ~2000 行

@@ -2233,10 +2233,14 @@ dependencies = [
 name = "xray-transport-kcp"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "parking_lot",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "xray-buf",
  "xray-common",
+ "xray-proto",
  "xray-transport",
 ]
 
