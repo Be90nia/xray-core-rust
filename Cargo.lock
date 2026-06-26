@@ -1714,6 +1714,10 @@ dependencies = [
 name = "xray-app-commander"
 version = "0.1.0"
 dependencies = [
+ "parking_lot",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
  "xray-common",
  "xray-features",
 ]

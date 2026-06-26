@@ -416,6 +416,19 @@ cargo clippy -p xray-app-XXX
 | `xray-app-dispatcher` | `TestCounter::add` 返回值从 `fetch_add + delta`（新值）改为 `fetch_add`（旧值），`set` 返回值从 `()` 改为 `swap` 返回旧值 | features::stats::Counter trait 签名修正后语义对齐 Go；dispatcher 现有调用 `self.counter.add(n)` 忽略返回值，兼容 |
 | `xray-app-stats` | `Manager::close` 用 `drain().map(|(_, v)| v).collect()` 收集 channels 后 `drop(channels)` 释放写锁，再调用 `c.close()` | 避免 `channels.write()` 持锁同时调用 channel 内部 `subscribers.lock()` 造成死锁 |
 
+### P4-6 xray-app-commander（2025-06）
+
+| crate | 决策 | 原因 |
+| --- | --- | --- |
+| `xray-app-commander` | **不引入 tonic**：gRPC server 实例不在 Commander 中持有，由 `GrpcServerRegistrar` trait 实现持有 | P4 阶段不引入 tonic 生态；上层 `xray-core` main 注入封装 tonic `ServerBuilder` 的实现 |
+| `xray-app-commander` | `Service` trait 仅含 `name`/`type_url` 元数据，去掉 Go `Register(*grpc.Server)` 方法 | Go grpc.Server 在 Rust 端是具体 tonic 类型，跨 crate 不耦合；上层根据 type_url 路由到具体注册逻辑 |
+| `xray-app-commander` | `TypedMessage` 不在 Commander 解码 | Go 用全局 `common.RegisterConfig` 注册表 + `rawConfig.GetInstance()`；Rust 无副作用全局，上层显式创建 Service 后 `add_service` |
+| `xray-app-commander` | `add_service` 拒绝重复 type_url（Go 不去重） | 加更严谨：防止同一 service 双注册导致 gRPC “service already registered” 错误 |
+| `xray-app-commander` | `Commander::start_with_registrar` 仅注册 service + 标记 running，不实际 listen/bind/serve | TCP/Unix socket bind + outbound handler register + serve 循环依赖 transport 全链路，由上层注入 |
+| `xray-app-commander` | `OutboundListener` / `OutboundHandler` / `OutboundRegistrar` trait stub + `StubOutboundHandler` 占位 | 依赖 `xray_transport::Link` + cnc 等价物；当前阶段仅定义接口让上层实现 |
+| `xray-app-commander` | `CommanderConn = Box<dyn CommanderIo>`，`CommanderIo: AsyncRead + AsyncWrite + Send + Unpin` supertrait + blanket impl | Rust trait object 不允许 `dyn AsyncRead + AsyncWrite`（两个 non-auto trait， E0225）；用 supertrait 包装 |
+| `xray-app-commander` | `ReflectionService` 仅 const TYPE_URL + name/type_url，实际 reflection 注册由上层注入（`tonic_reflection::server::Builder`） | Go 用 grpc/reflection 包；Rust 等价包是 tonic-reflection，在本 crate 不依赖 |
+
 ## 附录 A：样板文件位置
 
 ```
@@ -564,6 +577,18 @@ crates/xray-features/src/stats.rs
 ├── ChannelSubscriber（new + recv/recv_as + id）
 ├── ChannelError / ManagerError enums（thiserror）
 └── 16 单测（NoopManager + error display + helpers）
+```
+
+### xray-app-commander（2025-06）
+```
+crates/xray-app-commander/
+├── Cargo.toml           # xray-common/features + thiserror/parking_lot/tracing + tokio(io-util)
+├── src/
+│   ├── lib.rs           # 顶部文档（IO 边界范围） + 3 模块声明 + re-exports
+│   ├── error.rs         # CommanderError enum 7 变体 + log_warning/error + 8 单测
+│   ├── commander.rs     # Config + TypedMessageConfig + Service trait + GrpcServerRegistrar trait + NoopRegistrar + ReflectionService + Commander struct + 25 单测
+│   └── outbound.rs      # CommanderIo supertrait + CommanderConn type alias + OutboundListener/OutboundHandler/OutboundRegistrar trait + StubOutboundHandler + 10 单测
+└── target/              # 验证产物（41 unit + 0 doctest 全绿）
 ```
 
 ## 附录 B：依赖未实现时的处理流程
