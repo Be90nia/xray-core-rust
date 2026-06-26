@@ -1,1 +1,658 @@
 //! 默认分发器
+//!
+//! 对应 Go `app/dispatcher/default.go`。负责将入站连接按路由规则分发到出站处理器。
+//!
+//! ## 当前状态
+//!
+//! 业务核心（独立可测）：
+//! - [`RoutingContext`] trait + [`DispatcherContext`] owned 实现 — 承载 Go `routing.Context` 语义
+//! - [`should_override`] 函数 — sniff 域名是否覆盖原 IP 的判定逻辑
+//! - [`SniffingRequest`] — 嗅探请求配置
+//!
+//! IO 边界（trait + NotImplemented 占位）：
+//! - [`RoutingRouter`] / [`OutboundHandlerManager`] / [`DispatchHandler`] trait
+//! - [`DefaultDispatcher::dispatch`] / [`DefaultDispatcher::dispatch_link`] — 依赖 pipe/transport 全链路
+//! - [`CachedReader`] — 依赖 `pipe.Reader`，主体留 TODO
+
+use crate::error::DispatcherError;
+use crate::sniffer::SniffResult;
+use std::collections::HashMap;
+use std::fmt::Debug;
+use std::future::Future;
+use std::net::IpAddr;
+use xray_buf::multi::MultiBuffer;
+use std::pin::Pin;
+use std::sync::Arc;
+use xray_common::net::network::Network;
+use xray_common::net::port::Port;
+
+// ========== RoutingContext ==========
+
+/// 路由上下文 trait（对应 Go `routing.Context`）
+///
+/// Go 的 `routing.Context` 接口提供 14 个 getter，暴露给 Router 做规则匹配。
+/// Rust 端 [`xray_features::routing::Router`] trait API 简化为 `(dest, session) -> tag`，
+/// 不携带 source IP/user/protocol 等丰富字段；故本 crate 内部独立定义此 trait 保持语义。
+pub trait RoutingContext: Send + Sync + Debug {
+    fn get_target_ips(&self) -> &[IpAddr];
+    fn get_target_domain(&self) -> &str;
+    fn get_target_port(&self) -> Port;
+    fn get_source_ips(&self) -> &[IpAddr];
+    fn get_source_port(&self) -> Port;
+    fn get_local_ips(&self) -> &[IpAddr];
+    fn get_local_port(&self) -> Port;
+    fn get_vless_route(&self) -> &str;
+    fn get_network(&self) -> Network;
+    fn get_user(&self) -> &str;
+    fn get_attributes(&self) -> &HashMap<String, String>;
+    fn get_inbound_tag(&self) -> &str;
+    fn get_protocol(&self) -> &str;
+    fn get_skip_dns_resolve(&self) -> bool;
+}
+
+/// 拥有所有字段的 [`RoutingContext`] 实现，用 builder 模式构造。
+#[derive(Debug, Clone)]
+pub struct DispatcherContext {
+    /// 目标 IP 列表（可能多个，按 v4/v6 顺序）
+    pub target_ips: Vec<IpAddr>,
+    /// 目标域名
+    pub target_domain: String,
+    /// 目标端口
+    pub target_port: Port,
+    /// 来源 IP 列表
+    pub source_ips: Vec<IpAddr>,
+    /// 来源端口
+    pub source_port: Port,
+    /// 本地 IP 列表
+    pub local_ips: Vec<IpAddr>,
+    /// 本地端口
+    pub local_port: Port,
+    /// VLESS 路由字符串
+    pub vless_route: String,
+    /// 网络（TCP/UDP）
+    pub network: Network,
+    /// 用户标识
+    pub user: String,
+    /// 属性映射
+    pub attributes: HashMap<String, String>,
+    /// 入站 tag
+    pub inbound_tag: String,
+    /// 协议名（sniff 出来的）
+    pub protocol: String,
+    /// 是否跳过 DNS 解析
+    pub skip_dns_resolve: bool,
+}
+
+impl Default for DispatcherContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DispatcherContext {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            target_ips: Vec::new(),
+            target_domain: String::new(),
+            target_port: Port::new(0),
+            source_ips: Vec::new(),
+            source_port: Port::new(0),
+            local_ips: Vec::new(),
+            local_port: Port::new(0),
+            vless_route: String::new(),
+            network: Network::TCP,
+            user: String::new(),
+            attributes: HashMap::new(),
+            inbound_tag: String::new(),
+            protocol: String::new(),
+            skip_dns_resolve: false,
+        }
+    }
+
+    pub fn with_target_domain(mut self, d: impl Into<String>) -> Self {
+        self.target_domain = d.into();
+        self
+    }
+    pub fn with_target_port(mut self, p: Port) -> Self {
+        self.target_port = p;
+        self
+    }
+    pub fn with_network(mut self, n: Network) -> Self {
+        self.network = n;
+        self
+    }
+    pub fn with_source_ips(mut self, ips: Vec<IpAddr>) -> Self {
+        self.source_ips = ips;
+        self
+    }
+    pub fn with_inbound_tag(mut self, t: impl Into<String>) -> Self {
+        self.inbound_tag = t.into();
+        self
+    }
+    pub fn with_user(mut self, u: impl Into<String>) -> Self {
+        self.user = u.into();
+        self
+    }
+    pub fn with_protocol(mut self, p: impl Into<String>) -> Self {
+        self.protocol = p.into();
+        self
+    }
+}
+
+impl RoutingContext for DispatcherContext {
+    fn get_target_ips(&self) -> &[IpAddr] {
+        &self.target_ips
+    }
+    fn get_target_domain(&self) -> &str {
+        &self.target_domain
+    }
+    fn get_target_port(&self) -> Port {
+        self.target_port
+    }
+    fn get_source_ips(&self) -> &[IpAddr] {
+        &self.source_ips
+    }
+    fn get_source_port(&self) -> Port {
+        self.source_port
+    }
+    fn get_local_ips(&self) -> &[IpAddr] {
+        &self.local_ips
+    }
+    fn get_local_port(&self) -> Port {
+        self.local_port
+    }
+    fn get_vless_route(&self) -> &str {
+        &self.vless_route
+    }
+    fn get_network(&self) -> Network {
+        self.network
+    }
+    fn get_user(&self) -> &str {
+        &self.user
+    }
+    fn get_attributes(&self) -> &HashMap<String, String> {
+        &self.attributes
+    }
+    fn get_inbound_tag(&self) -> &str {
+        &self.inbound_tag
+    }
+    fn get_protocol(&self) -> &str {
+        &self.protocol
+    }
+    fn get_skip_dns_resolve(&self) -> bool {
+        self.skip_dns_resolve
+    }
+}
+
+// ========== Router / Outbound traits ==========
+
+/// 路由结果（对应 Go `Route{ outboundTag, ruleTag }`）
+#[derive(Debug, Clone, Default)]
+pub struct Route {
+    /// 出站 tag
+    pub outbound_tag: String,
+    /// 命中规则 tag
+    pub rule_tag: String,
+}
+
+impl Route {
+    #[must_use]
+    pub fn new(outbound_tag: impl Into<String>) -> Self {
+        Self {
+            outbound_tag: outbound_tag.into(),
+            rule_tag: String::new(),
+        }
+    }
+
+    pub fn get_outbound_tag(&self) -> &str {
+        &self.outbound_tag
+    }
+
+    pub fn get_rule_tag(&self) -> &str {
+        &self.rule_tag
+    }
+}
+
+/// 路由器 trait（对应 Go `routing.Router`，但签名返回 [`Route`]）
+///
+/// 与 `xray_features::routing::Router` 区别：本 trait 接受 [`RoutingContext`]，保持 Go 语义。
+pub trait RoutingRouter: Send + Sync + Debug {
+    /// 选路。对应 Go `PickRoute(routing.Context) (Route, error)`。
+    fn pick_route(&self, ctx: &dyn RoutingContext) -> Result<Route, DispatcherError>;
+}
+
+/// 出站 handler trait（对应 Go `outbound.Handler.Dispatch(ctx, link)`）
+///
+/// 与 `xray_features::outbound::OutboundHandler` 区别：本 trait 接受 [`xray_transport::Link`]，
+/// 保持 Go `Dispatch(ctx, link)` 语义。
+pub trait DispatchHandler: Send + Sync + Debug {
+    /// 返回 handler tag。
+    fn tag(&self) -> &str;
+
+    /// 将 link 分发到出站。对应 Go `Handler.Dispatch(ctx, link)`。
+    /// 依赖 transport 全链路，具体实现待接入。
+    fn dispatch(&self, link: xray_transport::link::Link) -> PinFuture<()>;
+}
+
+/// 出站处理器管理器（对应 Go `outbound.Manager`）
+pub trait OutboundHandlerManager: Send + Sync + Debug {
+    /// 按 tag 取 handler。
+    fn get_handler(&self, tag: &str) -> Option<Arc<dyn DispatchHandler>>;
+
+    /// 默认 handler。
+    fn get_default_handler(&self) -> Option<Arc<dyn DispatchHandler>>;
+}
+
+/// Boxed future 别名（手写风格，不依赖 `async_trait`）
+pub type PinFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+
+// ========== 嗅探请求配置 ==========
+
+/// 嗅探请求配置（对应 Go `session.SniffingRequest`）
+#[derive(Debug, Clone, Default)]
+pub struct SniffingRequest {
+    /// 是否启用嗅探
+    pub enabled: bool,
+    /// 仅嗅探元数据（不读 payload）
+    pub metadata_only: bool,
+    /// 仅对这些协议覆盖目的地
+    pub override_destination_for_protocol: Vec<String>,
+    /// 排除这些域名（不覆盖）
+    pub exclude_for_domain: Vec<String>,
+    /// 排除这些 IP（不覆盖）
+    pub exclude_for_ip: Vec<IpAddr>,
+    /// 仅路由（不改 target）
+    pub route_only: bool,
+}
+
+// ========== should_override 核心逻辑 ==========
+
+/// 判断 sniff 结果是否应覆盖原 destination
+///
+/// 对应 Go `(*DefaultDispatcher).shouldOverride`。判定流程：
+/// 1. domain 为空 → false
+/// 2. domain 命中 exclude_for_domain（前缀小写匹配）→ false
+/// 3. dest 是 IP 且命中 exclude_for_ip → false
+/// 4. protocol 命中 override_destination_for_protocol 列表（前缀匹配任一侧）→ true
+///
+/// # 参数
+/// - `result`: 嗅探结果
+/// - `request`: 嗅探请求配置
+/// - `dest_address`: 原目的地地址（用于 exclude_for_ip 判断）
+/// - `protocol_for_domain`: 若 result 是 CompositeSniffResult，传 `Some(protocol_for_domain_result)`；
+///   否则传 `None`，使用 `result.protocol()`
+pub fn should_override(
+    result: &dyn SniffResult,
+    request: &SniffingRequest,
+    dest_address: Option<IpAddr>,
+    protocol_for_domain: Option<&str>,
+) -> bool {
+    let domain = result.domain();
+    if domain.is_empty() {
+        return false;
+    }
+
+    // exclude_for_domain：小写前缀匹配（Go 用 matcher.MatchAny）
+    let domain_lower = domain.to_lowercase();
+    for excl in &request.exclude_for_domain {
+        if domain_lower.contains(excl.as_str()) {
+            return false;
+        }
+    }
+
+    // exclude_for_ip：仅当 dest 是 IP 且命中
+    if let Some(addr) = dest_address {
+        if request.exclude_for_ip.iter().any(|&ip| ip == addr) {
+            return false;
+        }
+    }
+
+    // 主协议字符串（CompositeSniffResult 用 protocol_for_domain_result）
+    let protocol_string = protocol_for_domain.unwrap_or_else(|| result.protocol());
+
+    for p in &request.override_destination_for_protocol {
+        if protocol_string.starts_with(p.as_str()) || p.starts_with(protocol_string) {
+            return true;
+        }
+    }
+
+    false
+}
+
+// ========== DefaultDispatcher ==========
+
+/// 默认分发器
+///
+/// 对应 Go `DefaultDispatcher struct { ohm, router, policy, stats, fdns }`。
+pub struct DefaultDispatcher {
+    /// 出站管理器
+    pub ohm: Option<Arc<dyn OutboundHandlerManager>>,
+    /// 路由器（可选）
+    pub router: Option<Arc<dyn RoutingRouter>>,
+    /// Policy manager 引用（暂留为 Policy 自身，避免引入 trait）
+    pub default_policy: xray_features::policy::Policy,
+    /// FakeDnsEngine 引用
+    pub fdns: Option<Arc<dyn crate::fakednssniffer::FakeDnsEngine>>,
+}
+
+impl Debug for DefaultDispatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DefaultDispatcher")
+            .field("has_ohm", &self.ohm.is_some())
+            .field("has_router", &self.router.is_some())
+            .field("has_fdns", &self.fdns.is_some())
+            .finish()
+    }
+}
+
+impl Default for DefaultDispatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DefaultDispatcher {
+    /// 创建空 dispatcher。
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            ohm: None,
+            router: None,
+            default_policy: xray_features::policy::Policy::default(),
+            fdns: None,
+        }
+    }
+
+    /// 初始化。对应 Go `(*DefaultDispatcher).Init(config, om, router, pm, sm)`。
+    pub fn init(
+        &mut self,
+        _config: &crate::Config,
+        ohm: Arc<dyn OutboundHandlerManager>,
+        router: Option<Arc<dyn RoutingRouter>>,
+        default_policy: xray_features::policy::Policy,
+        fdns: Option<Arc<dyn crate::fakednssniffer::FakeDnsEngine>>,
+    ) {
+        self.ohm = Some(ohm);
+        self.router = router;
+        self.default_policy = default_policy;
+        self.fdns = fdns;
+    }
+
+    /// Start 钩子（空操作）。对应 Go `(*DefaultDispatcher).Start()`。
+    pub fn start(&self) -> Result<(), DispatcherError> {
+        Ok(())
+    }
+
+    /// Close 钩子（空操作）。对应 Go `(*DefaultDispatcher).Close()`。
+    pub fn close(&self) -> Result<(), DispatcherError> {
+        Ok(())
+    }
+
+    /// 分发入站连接。
+    ///
+    /// 对应 Go `(*DefaultDispatcher).Dispatch(ctx, destination) (*transport.Link, error)`。
+    ///
+    /// **当前状态**：依赖 `pipe.Reader/Writer` 与 `outbound.Handler.Dispatch` 全链路，
+    /// 主体留 TODO。返回 `Err(Other)` 表示未接入。
+    pub fn dispatch(
+        &self,
+        _destination: &xray_common::net::destination::Destination,
+        _sniffing_request: &SniffingRequest,
+    ) -> Result<(), DispatcherError> {
+        // TODO: 接入 pipe 创建 inbound/outbound link + 嗅探循环 + routed_dispatch
+        Err(DispatcherError::Other(
+            "dispatch not implemented; pipe/outbound integration pending".to_string(),
+        ))
+    }
+
+    /// 分发已有 link。
+    ///
+    /// 对应 Go `(*DefaultDispatcher).DispatchLink(ctx, dest, outbound) error`。
+    ///
+    /// **当前状态**：同 [`Self::dispatch`]，主体留 TODO。
+    pub fn dispatch_link(
+        &self,
+        _destination: &xray_common::net::destination::Destination,
+        _outbound: xray_transport::link::Link,
+        _sniffing_request: &SniffingRequest,
+    ) -> Result<(), DispatcherError> {
+        // TODO: 接入 wrap_link + 嗅探循环 + routed_dispatch
+        Err(DispatcherError::Other(
+            "dispatch_link not implemented; pipe/outbound integration pending".to_string(),
+        ))
+    }
+}
+
+// ========== CachedReader ==========
+
+/// 缓存 reader：嗅探时暂存 payload，避免数据丢失
+///
+/// 对应 Go `cachedReader struct { sync.Mutex; reader buf.TimeoutReader; cache buf.MultiBuffer }`。
+///
+/// **当前状态**：依赖 `pipe.Reader`，主体留 TODO；保留类型骨架供上层接入。
+pub struct CachedReader {
+    /// 内部 reader 占位（实际是 `Box<dyn xray_buf::io::Reader>`）
+    pub inner: Option<Box<dyn xray_buf::io::Reader>>,
+    /// 已缓存的 MultiBuffer
+    pub cache: Option<MultiBuffer>,
+}
+
+impl Debug for CachedReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedReader")
+            .field("has_inner", &self.inner.is_some())
+            .field("has_cache", &self.cache.is_some())
+            .finish()
+    }
+}
+
+impl Default for CachedReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CachedReader {
+    /// 创建空 cached reader。
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: None,
+            cache: None,
+        }
+    }
+
+    /// 设置内部 reader。
+    pub fn set_inner(&mut self, r: Box<dyn xray_buf::io::Reader>) {
+        self.inner = Some(r);
+    }
+
+    /// 中断：清空 cache 并中断内部 reader。
+    pub fn interrupt(&mut self) {
+        self.cache = None;
+        // TODO: 调用 inner.interrupt() — xray_buf::io::Reader trait 暂无 interrupt 方法
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sniffer::SniffResult;
+    use xray_common::net::network::Network;
+
+    /// 测试用 SniffResult
+    #[derive(Debug)]
+    struct TestSniffResult {
+        protocol: &'static str,
+        domain: &'static str,
+    }
+    impl SniffResult for TestSniffResult {
+        fn protocol(&self) -> &str {
+            self.protocol
+        }
+        fn domain(&self) -> &str {
+            self.domain
+        }
+    }
+
+    fn make_sniff(protocol: &'static str, domain: &'static str) -> TestSniffResult {
+        TestSniffResult { protocol, domain }
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    // ---- DispatcherContext ----
+
+    #[test]
+    fn context_default_all_empty() {
+        let c = DispatcherContext::default();
+        assert!(c.get_target_ips().is_empty());
+        assert!(c.get_target_domain().is_empty());
+        assert!(c.get_user().is_empty());
+        assert!(!c.get_skip_dns_resolve());
+    }
+
+    #[test]
+    fn context_builder_sets_fields() {
+        let c = DispatcherContext::new()
+            .with_target_domain("example.com")
+            .with_network(Network::TCP)
+            .with_inbound_tag("inbound")
+            .with_user("user@mail")
+            .with_protocol("http");
+        assert_eq!(c.get_target_domain(), "example.com");
+        assert_eq!(c.get_network(), Network::TCP);
+        assert_eq!(c.get_inbound_tag(), "inbound");
+        assert_eq!(c.get_user(), "user@mail");
+        assert_eq!(c.get_protocol(), "http");
+    }
+
+    // ---- should_override ----
+
+    #[test]
+    fn override_returns_false_when_domain_empty() {
+        let r = make_sniff("http", "");
+        let req = SniffingRequest::default();
+        assert!(!should_override(&r, &req, None, None));
+    }
+
+    #[test]
+    fn override_returns_false_when_excluded_by_domain() {
+        let r = make_sniff("http", "blocked.example.com");
+        let req = SniffingRequest {
+            exclude_for_domain: vec!["blocked".to_string()],
+            ..Default::default()
+        };
+        assert!(!should_override(&r, &req, None, None));
+    }
+
+    #[test]
+    fn override_returns_false_when_excluded_by_ip() {
+        let r = make_sniff("http", "example.com");
+        let req = SniffingRequest {
+            exclude_for_ip: vec![ip("1.2.3.4")],
+            ..Default::default()
+        };
+        assert!(!should_override(&r, &req, Some(ip("1.2.3.4")), None));
+    }
+
+    #[test]
+    fn override_returns_false_when_no_protocol_match() {
+        let r = make_sniff("tls", "example.com");
+        let req = SniffingRequest {
+            override_destination_for_protocol: vec!["http".to_string()],
+            ..Default::default()
+        };
+        assert!(!should_override(&r, &req, None, None));
+    }
+
+    #[test]
+    fn override_returns_true_when_protocol_prefix_matches() {
+        let r = make_sniff("http", "example.com");
+        let req = SniffingRequest {
+            override_destination_for_protocol: vec!["http".to_string()],
+            ..Default::default()
+        };
+        assert!(should_override(&r, &req, None, None));
+    }
+
+    #[test]
+    fn override_returns_true_when_protocol_is_prefix_of_request() {
+        // 反向后缀：request="http", protocol="ht" — 用 starts_with 任一侧
+        let r = make_sniff("ht", "example.com");
+        let req = SniffingRequest {
+            override_destination_for_protocol: vec!["http".to_string()],
+            ..Default::default()
+        };
+        assert!(should_override(&r, &req, None, None));
+    }
+
+    #[test]
+    fn override_uses_protocol_for_domain_when_provided() {
+        let r = make_sniff("http", "example.com");
+        let req = SniffingRequest {
+            override_destination_for_protocol: vec!["fakedns".to_string()],
+            ..Default::default()
+        };
+        // 传入 protocol_for_domain = "fakedns" 应命中
+        assert!(should_override(&r, &req, None, Some("fakedns")));
+    }
+
+    #[test]
+    fn override_skips_ip_exclude_when_dest_is_not_ip() {
+        let r = make_sniff("http", "example.com");
+        let req = SniffingRequest {
+            exclude_for_ip: vec![ip("1.2.3.4")],
+            override_destination_for_protocol: vec!["http".to_string()],
+            ..Default::default()
+        };
+        // dest = None 不命中 exclude_for_ip → 继续 protocol 检查 → true
+        assert!(should_override(&r, &req, None, None));
+    }
+
+    // ---- DefaultDispatcher ----
+
+    #[test]
+    fn dispatcher_default_is_empty() {
+        let d = DefaultDispatcher::default();
+        assert!(d.ohm.is_none());
+        assert!(d.router.is_none());
+        assert!(d.fdns.is_none());
+    }
+
+    #[test]
+    fn dispatcher_start_close_are_noop() {
+        let d = DefaultDispatcher::new();
+        d.start().expect("start ok");
+        d.close().expect("close ok");
+    }
+
+    // ---- CachedReader ----
+
+    #[test]
+    fn cached_reader_default_is_empty() {
+        let r = CachedReader::default();
+        assert!(r.inner.is_none());
+        assert!(r.cache.is_none());
+    }
+
+    #[test]
+    fn cached_reader_interrupt_clears_cache() {
+        let mut r = CachedReader::new();
+        r.cache = Some(MultiBuffer::default());
+        r.interrupt();
+        assert!(r.cache.is_none());
+    }
+
+    // ---- Route ----
+
+    #[test]
+    fn route_new_stores_tag() {
+        let r = Route::new("proxy");
+        assert_eq!(r.get_outbound_tag(), "proxy");
+        assert_eq!(r.get_rule_tag(), "");
+    }
+}

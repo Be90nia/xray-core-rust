@@ -377,6 +377,18 @@ cargo clippy -p xray-app-XXX
 | `xray-app-dns` | `merge_records` 严格按 Go 语义：v4+v6 同时启用但任一缺失 → `RecordNotFound` | 1:1 翻译 Go `(*IPRecord).getIPs()` 行为；调用方应保证 `send_query` 同时返回 v4/v6 响应 |
 | `xray-app-dns` | `DnsService::lookup_ip` 同步签名，nameservers 路径返回 `NotImplemented` | trait `Server::query_ip` 是 async；改 lookup_ip 为 async 会引发签名污染；等上层 tokio runtime 注入后接入 |
 | `xray-app-dns` | `DnsService` 不实现 `xray_features::dns::DnsClient`（trait 已用 `#[async_trait]`） | xray-features 用旧风格 `#[async_trait]`，与新代码手写 boxed future 风格不一致；接入需统一为手写风格后重做 |
+| `xray-app-router` | **不实现 `xray_features::routing::Router`**；crate 内部定义独立 `RoutingContext` trait 保持 Go 语义 | xray-features trait API 用简化 `(dest, session) -> tag` 签名，不承载 Go `routing.Context` 丰富字段（source IP、user、protocol、attributes 等）；接入需统一为手写 boxed future 风格后重做 |
+| `xray-app-router` | proto `IpRule`/`DomainRule` 在 xray-proto (`xray.common.geodata`) 与 xray-geodata (`xray.geodata`) 中是**同名不同类型**（两个 crate 各自 build proto）；rule.rs 写字段级 converter | 两 proto 包名不同，prost 生成不同 Rust 类型；不接受转换会产生 E0308 类型不匹配。converter 仅处理 `Custom` 变体（Geoip/Geosite 文件加载留 TODO） |
+| `xray-app-router` | `BalancingRule.Build` 中 `leastping`/`leastload` 策略返回 `ObservationUnavailable`；`TypedMessage` 反序列化未接入 | 需上层提供 `ObservationProvider` 与 `OutboundHandlerSelector` 注入；TypedMessage 类型解析依赖 `prost::Message::decode` 全套注册，后续接入 |
+| `xray-app-router` | `ProcessNameMatcher` 的 `find_process` 留 TODO；配置解析（`xray/`/`self/`/`folder/` 分类）独立可测 | 依赖 OS-specific 进程查询（sysinfo 或 windows-rs），待后续接入；Go 通过 `ps` 包查询 |
+| `xray-app-router` | `WebhookNotifier::post` 留 TODO（stub log）；事件构造+去重逻辑独立可测 | 实际 HTTP POST 需 reqwest/hyper；deduplication 用 `Mutex<HashSet>` + 过期清理 |
+| `xray-app-router` | `StrategyWeight.value` 是 `float`（非 string）；`regexp: bool` 字段决定 `match` 是否为正则模式 | proto3 字段明确 `bool regexp + string match + float value`，不要在 WeightManager 中用 `number_finder` 解析字符串 |
+| `xray-app-router` | `proto_network_to_native` 拒绝 `Unknown(0)`，仅接 `TCP(2)/UDP(3)/UNIX(4)` | proto Network 枚举在 xray-proto 与 xray-common 不同；xray-common `Network` 无 `Unknown` 变体 |
+| `xray-app-dispatcher` | **不实现 `xray_features::routing::Router`**；crate 内部定义独立 `RoutingContext` trait（14 sync getter） + `RoutingRouter` trait | xray-features trait API 用简化 `(dest, session) -> tag` 签名，不承载 Go `routing.Context` 丰富字段（source IP/user/protocol/attributes 等）；与 P4-2 router 一致 |
+| `xray-app-dispatcher` | 协议唫探器（HTTP/TLS/BitTorrent/QUIC/UTP）全 trait + NotImplemented stub；`Sniffer` 编排框架独立可测 | 具体协议解析依赖 `common/protocol/*` Rust 端未实现；框架逻辑（NoClue/NeedMoreData/pending）可独立验证 |
+| `xray-app-dispatcher` | 不直接依赖 xray-app-dns / xray-app-router；在本 crate 定义 `FakeDnsEngine` / `RoutingRouter` trait | 避免循环依赖；上层接入时注入实现 |
+| `xray-app-dispatcher` | `DefaultDispatcher::dispatch` / `dispatch_link` 返回 `Err(Other)` 占位；`CachedReader` 主体留 TODO | 依赖 `pipe.Reader/Writer` + `outbound.Handler.Dispatch(Link)` 全链路；`should_override` 决策逻辑独立可测 |
+| `xray-app-dispatcher` | `SizeStatWriter::close` 返 `Ok(())`（无状态 close） | `xray_buf::io::Writer` trait 无 close 方法；Rust 端依赖 Drop 或具体 Writer 处理 |
 
 ---
 
@@ -457,6 +469,41 @@ crates/xray-app-dns/
 │       ├── quic.rs      # new_quic_name_server 占位 + 1 单测
 │       └── local.rs     # new_local_name_server 占位 + 1 单测
 └── target/              # 验证产物（82 unit + 0 doctest 全绿）
+```
+
+```
+crates/xray-app-router/
+├── Cargo.toml           # xray-common/features/geodata/proto + thiserror/tokio/tracing/parking_lot/rand + regex="1" + serde/serde_json
+├── src/
+│   ├── lib.rs           # 顶部文档（说明 IO 边界范围） + 14 模块声明 + re-exports
+│   ├── error.rs         # RouterError enum（17 变体）+ at_warning/at_error + 6 单测
+│   ├── context.rs       # RoutingContext trait（14 sync 方法）+ RoutingData（builder） + 5 单测
+│   ├── config.rs        # DomainStrategy enum + from/to_proto + needs_ip_resolution + 4 单测
+│   ├── weight.rs        # WeightManager + Literal/Regex 匹配 + number_finder + 7 单测
+│   ├── condition.rs     # Condition trait + ConditionChan + 9 matcher（Domain/IP/Port/Network/User/InboundTag/Protocol/Attribute/ProcessName）+ 17 单测
+│   ├── rule.rs          # Rule struct + build_rule + build_condition + proto converter（Domain/IP）+ 6 单测
+│   ├── balancing.rs     # OutboundHandlerSelector/ObservationProvider/BalancingStrategy trait + Override + RoundRobinStrategy + Balancer + NotImplementedSelector + 8 单测
+│   ├── strategy_random.rs     # RandomStrategy + 50/50 fallback + 3 单测
+│   ├── strategy_leastping.rs  # LeastPingStrategy + alive 过滤 + 3 单测
+│   ├── strategy_leastload.rs  # LeastLoadStrategy + baselines/maxRTT/tolerance 过滤 + WeightManager + 5 单测
+│   ├── webhook.rs       # WebhookNotifier + WebhookEvent + dedup + cleanup + 6 单测
+│   ├── router.rs        # Router + Route + Init/pick_route/AddRule/RemoveRule/ReloadRules/ListRule/OverrideBalancer + 6 单测
+│   └── command/mod.rs   # RoutingService gRPC stub（全 TODO）+ 1 单测
+└── target/              # 验证产物（77 unit + 0 doctest 全绿）
+```
+
+```
+crates/xray-app-dispatcher/
+├── Cargo.toml           # xray-common/features/buf/transport/proto + thiserror/tokio/tracing/parking_lot
+├── src/
+│   ├── lib.rs           # 顶部文档（IO 边界范围）+ 6 模块声明 + re-exports
+│   ├── error.rs         # DispatcherError enum（11 变体）+ at_warning/at_error + 6 单测
+│   ├── config.rs        # SessionConfig/Config + from/to_proto（空 schema）+ 3 单测
+│   ├── sniffer.rs       # SniffResult trait + ProtocolSniffer trait + Sniffer 编排（NoClue/NeedMoreData）+ CompositeSniffResult + 5 占位唫探器 + 16 单测
+│   ├── fakednssniffer.rs # FakeDnsEngine trait + FakeDnsSniffResult/DnsThenOthersSniffResult + FakeDnsSnifferFactory + 9 单测
+│   ├── stats.rs         # SizeStatWriter（Counter + Writer 包装）+ 3 单测
+│   └── default.rs       # RoutingContext trait（14 sync）+ DispatcherContext + RoutingRouter/DispatchHandler/OutboundHandlerManager trait + DefaultDispatcher + should_override + CachedReader + 14 单测
+└── target/              # 验证产物（51 unit + 0 doctest 全绿）
 ```
 
 ## 附录 B：依赖未实现时的处理流程
