@@ -1722,10 +1722,15 @@ dependencies = [
 name = "xray-app-dispatcher"
 version = "0.1.0"
 dependencies = [
+ "parking_lot",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "xray-buf",
  "xray-common",
  "xray-features",
+ "xray-proto",
+ "xray-transport",
 ]
 
 [[package]]
@@ -1814,11 +1819,18 @@ dependencies = [
 name = "xray-app-router"
 version = "0.1.0"
 dependencies = [
+ "parking_lot",
+ "rand",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "xray-common",
  "xray-features",
  "xray-geodata",
+ "xray-proto",
 ]
 
 [[package]]

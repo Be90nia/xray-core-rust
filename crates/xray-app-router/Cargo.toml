@@ -9,5 +9,14 @@ rust-version.workspace = true
 xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
 xray-geodata = { path = "../xray-geodata" }
-tokio.workspace = true
-tracing.workspace = true
+xray-proto = { path = "../xray-proto" }
+
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+
+regex = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
