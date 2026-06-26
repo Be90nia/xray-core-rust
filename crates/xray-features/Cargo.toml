@@ -8,6 +8,8 @@ rust-version.workspace = true
 [dependencies]
 xray-common = { path = "../xray-common" }
 async-trait = "0.1"
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

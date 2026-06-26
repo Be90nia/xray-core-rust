@@ -389,8 +389,32 @@ cargo clippy -p xray-app-XXX
 | `xray-app-dispatcher` | 不直接依赖 xray-app-dns / xray-app-router；在本 crate 定义 `FakeDnsEngine` / `RoutingRouter` trait | 避免循环依赖；上层接入时注入实现 |
 | `xray-app-dispatcher` | `DefaultDispatcher::dispatch` / `dispatch_link` 返回 `Err(Other)` 占位；`CachedReader` 主体留 TODO | 依赖 `pipe.Reader/Writer` + `outbound.Handler.Dispatch(Link)` 全链路；`should_override` 决策逻辑独立可测 |
 | `xray-app-dispatcher` | `SizeStatWriter::close` 返 `Ok(())`（无状态 close） | `xray_buf::io::Writer` trait 无 close 方法；Rust 端依赖 Drop 或具体 Writer 处理 |
-
+| `xray-app-proxyman` | **不实现 `xray_features::inbound::InboundHandler` / `outbound::OutboundHandler`**；crate 内部定义独立 `InboundHandler` / `OutboundHandler` trait 保持 Go 语义 | xray-features trait API 简化（只有 tag/start/close/port 等），不承载 Go `ReceiverSettings`/`SenderSettings`/`TypedMessage` 丰富配置；与 P4-3 dispatcher 同模式 |
+| `xray-app-proxyman` | `SniffingRequest` 用 `Vec<String>` 存域名/CIDR 排除项（不用 matcher），提供 `matches_domain_excluded` / `matches_ip_excluded` helper | xray-geodata 未暴露 `DomainReg.BuildDomainMatcher`/`IPReg.BuildIPMatcher` 等价 API；与 P4-3 dispatcher 内 `SniffingRequest` 同模式 |
+| `xray-app-proxyman` | `SniffingRequest` 在本 crate 与 dispatcher crate 内**同名独立**存在 | proxyman 与 dispatcher 同为 Layer 4 应用服务，互不依赖；不可共享结构体定义 |
+| `xray-app-proxyman` | `InboundManager::select_by_prefix` 不缓存结果（Go `*sync.Map` 缓存被去除） | Rust 端用 `parking_lot::RwLock` 互斥访问 tagged map，无需 cache；若吞吐出现瓶颈可改用 `ArcSwap<HashMap>` |
+| `xray-app-proxyman` | `Handler::dispatch` / `dial` 未实现，留 trait + TODO；`HandlerService::add_inbound` / `add_outbound` 返 `Err(Other)` 占位 | 依赖 `xray_transport::Link` + 代理 + mux + xudp + DNS 全链路；TypedMessage 解码依赖上层 factory 注入 |
+| `xray-app-proxyman` | `get_uo_t_connection` 留 TODO 占位；不引入 sing `uot` crate | sing `uot` 是 sing-box 项目内模块无独立 crate；Rust 生态无等价品。UoT 是 UDP-over-TCP 封装，自研成本可接受但当前阶段不优先 |
+| `xray-app-proxyman` | gRPC server 注册（Go `service.Register`）未实现；定义 `HandlerService` trait + `DefaultHandlerService` 编排类 | 依赖 tonic server + xray-app-commander；上层集成时注入 `InboundHandlerProvider` / `OutboundHandlerProvider` / `OperationDecoder` 实现 |
+| `xray-app-proxyman` | `MemoryUser` 只保留 `email` + `level` 字段；Account/AlterIds 解码依赖具体代理 | Go `protocol.MemoryUser` 字段丰富（Level/Email/Account/AlterIds）；RPC 命令路径仅需 email+level，完整转换上层代理 crate 负责 |
+| `xray-app-proxyman` | `OperationDecoder` trait 替代 Go `TypedMessage.GetInstance()` | prost 不生成 `GetInstance`；由上层注入按 `type_url` 解码 proto payload 为 `Box<dyn InboundOperation>` / `Box<dyn OutboundOperation>` |
 ---
+
+### P4-7 xray-app-stats（2025-06）
+
+| crate | 决策 | 原因 |
+| --- | --- | --- |
+| `xray-features/src/stats.rs` | **重写对齐 Go**：`Counter::add`/`set` 返回旧值（早期简化版不返回值），删 `async_trait`，加 `OnlineMap`/`Channel`/`Manager` 完整接口 + `NoopManager` + 5 helper | 早期 trait 签名与 Go 不一致；dispatcher/src/stats.rs 的 `Arc<dyn Counter>` 通过 `use xray_features::stats::Counter` 依赖，必须修正源头 |
+| `xray-features` | 加 `tokio` [dependencies]（features=["sync","rt"]） | `ChannelSubscriber` 含 `tokio::sync::mpsc::Receiver<ChannelMessage>`；features 原仅 dev-deps 含 tokio |
+| `xray-features` | `ChannelSubscriber` 提供 `pub fn new(receiver, id)` constructor + `pub async fn recv/recv_as`/`pub fn id` 方法；字段保持 `pub(crate)` | 跨 crate 构造需要公共 constructor；保留字段封装避免用户直改 |
+| `xray-app-stats` | **Manager 的 `Start`/`Close` 不进 trait**（独立暴露 `impl Manager { pub fn start/close }`） | Go 中通过 `features.Feature` 嵌入提供 Start/Close，Rust 端 `features::stats::Manager` trait 不含生命周期方法 |
+| `xray-app-stats` | **Channel 简化设计**：去掉 Go `publisher mpsc + goroutine broadcast` 双层，`publish` 直接同步遍历订阅者 `try_send`；`blocking` 模式 失败时 `tokio::spawn` 重试 task | 等价语义，更少抽象；Go 的 publisher mpsc 仅为解耦 publisher/subscriber 速度差，Rust 用 try_send/spawn 达同样效果 |
+| `xray-app-stats` | `ChannelMessage = Arc<dyn Any + Send + Sync>`，订阅者用 `ChannelSubscriber` 含 `mpsc::Receiver` + unique `id: u64` | Go `interface{}` 等价为 trait object；`Arc` 让多订阅者广播 clone 廉价；unique id 让 `unsubscribe` 查找（Go 用 chan 引用比较） |
+| `xray-app-stats` | **gRPC server 注册留 trait + 编排类**：`StatsService` trait 7 方法 + `DefaultStatsService`（`Arc<dyn Manager> + Arc<dyn SysStatsProvider>`） | 依赖 tonic + `xray-app-commander`；上层集成时注册到 gRPC server（与 P4-4 proxyman 同模式） |
+| `xray-app-stats` | `SysStatsProvider` trait 注入（默认 `DefaultSysStatsProvider` 仅填 uptime + num_threads=1） | Rust 无 `runtime.MemStats` 等价；上层可注入 jemalloc / tokio 统计 |
+| `xray-app-stats` | counter name 解析 helper：`parse_user_traffic_name` 解析 `user>>>{email}>>>traffic>>>{uplink\|downlink}`；`parse_user_online_map_name` 解析 `user>>>{email}>>>ip` | Go 用 `strings.Cut` + `strings.HasSuffix`；Rust 用 `strip_prefix` + `strip_suffix` 更地道 |
+| `xray-app-dispatcher` | `TestCounter::add` 返回值从 `fetch_add + delta`（新值）改为 `fetch_add`（旧值），`set` 返回值从 `()` 改为 `swap` 返回旧值 | features::stats::Counter trait 签名修正后语义对齐 Go；dispatcher 现有调用 `self.counter.add(n)` 忽略返回值，兼容 |
+| `xray-app-stats` | `Manager::close` 用 `drain().map(|(_, v)| v).collect()` 收集 channels 后 `drop(channels)` 释放写锁，再调用 `c.close()` | 避免 `channels.write()` 持锁同时调用 channel 内部 `subscribers.lock()` 造成死锁 |
 
 ## 附录 A：样板文件位置
 
@@ -503,7 +527,43 @@ crates/xray-app-dispatcher/
 │   ├── fakednssniffer.rs # FakeDnsEngine trait + FakeDnsSniffResult/DnsThenOthersSniffResult + FakeDnsSnifferFactory + 9 单测
 │   ├── stats.rs         # SizeStatWriter（Counter + Writer 包装）+ 3 单测
 │   └── default.rs       # RoutingContext trait（14 sync）+ DispatcherContext + RoutingRouter/DispatchHandler/OutboundHandlerManager trait + DefaultDispatcher + should_override + CachedReader + 14 单测
-└── target/              # 验证产物（51 unit + 0 doctest 全绿）
+```
+
+```
+crates/xray-app-proxyman/
+├── Cargo.toml           # xray-common/features/proto + thiserror/tokio/tracing/parking_lot/rand + ipnet="2"
+├── src/
+│   ├── lib.rs           # 顶部文档（IO 边界范围） + 6 模块声明 + re-exports
+│   ├── error.rs         # ProxymanError enum（23 变体） + at_warning/at_error + 12 单测
+│   ├── config.rs        # SniffingRequest + from_proto + matches_domain/ip_excluded + cidr_from_proto + 16 单测
+│   ├── stats.rs         # Counter trait + StatsProvider + NoopStatsProvider + counter_name helpers + 12 单测
+│   ├── inbound/mod.rs   # InboundHandler trait + InboundManager (HashMap+RwLock) + AlwaysOnInboundHandler stub + 14 单测
+│   ├── outbound/mod.rs  # OutboundHandler trait + OutboundManager (default+cache-less Select) + 16 单测
+│   ├── outbound/handler.rs  # OutboundHandlerEntry + MuxState + Udp443Policy + parse_random_ip + 19 单测
+│   └── command/mod.rs   # InboundOperation/OutboundOperation + UserManager + AddUser/RemoveUser ops + HandlerService trait + DefaultHandlerService + 14 单测
+└── target/              # 验证产物（103 unit + 0 doctest 全绿）
+```
+crates/xray-app-stats/
+├── Cargo.toml           # xray-common/features + thiserror/parking_lot/tokio(sync,rt,time,macros)/tracing
+├── src/
+│   ├── lib.rs           # 顶部文档（IO 边界范围） + 7 模块声明 + re-exports
+│   ├── error.rs         # StatsError enum + ManagerError/ChannelError From + log_warning/error + 7 单测
+│   ├── counter.rs       # Counter（AtomicI64，add/set 返回旧值） + 12 单测
+│   ├── online_map.rs    # OnlineMap（refcount + 跳过 localhost + lastSeen） + 17 单测
+│   ├── channel.rs       # StatsChannel + ChannelConfig + ChannelSubscriber 集成 + 20 单测
+│   ├── manager.rs       # Manager（RwLock<HashMap> + Start/Close） + 30 单测
+│   └── command.rs       # StatsService trait 7 方法 + DefaultStatsService 编排 + SysStatsProvider + 26 单测
+└── target/              # 验证产物（111 unit + 0 doctest 全绿）
+```
+
+### xray-features/src/stats.rs 重写（2025-06）
+```
+crates/xray-features/src/stats.rs
+├── Counter/OnlineMap/Channel/Manager trait（全 sync，对齐 Go 语义）
+├── NoopManager + 5 helper（get_or_register_* + subscribe_runnable/closable）
+├── ChannelSubscriber（new + recv/recv_as + id）
+├── ChannelError / ManagerError enums（thiserror）
+└── 16 单测（NoopManager + error display + helpers）
 ```
 
 ## 附录 B：依赖未实现时的处理流程

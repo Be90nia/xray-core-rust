@@ -68,10 +68,12 @@ mod tests {
             self.value.load(Ordering::SeqCst)
         }
         fn add(&self, delta: i64) -> i64 {
-            self.value.fetch_add(delta, Ordering::SeqCst) + delta
+            // 对齐 Go 语义：返回旧值（features::stats::Counter trait 修正后）
+            self.value.fetch_add(delta, Ordering::SeqCst)
         }
-        fn set(&self, value: i64) {
-            self.value.store(value, Ordering::SeqCst);
+        fn set(&self, value: i64) -> i64 {
+            // 对齐 Go 语义：返回旧值
+            self.value.swap(value, Ordering::SeqCst)
         }
     }
 
