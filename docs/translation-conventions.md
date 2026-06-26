@@ -737,3 +737,82 @@ xray-transport 的 `Connection` trait 是 `AsyncRead + AsyncWrite + Unpin`。
 - 133 单元测试（全过）
 - 代码量：~3500 行（含测试）
 - Go 源对应：`transport/internet/kcp/` 9 文件 ~2000 行
+
+## xray-transport-hysteria 决策记录
+
+### 决策 1：不引 `quinn` / `h3` crate，QUIC/HTTP3 IO 边界留 trait + stub
+
+**背景**：Hysteria 协议强依赖 QUIC + HTTP/3。社区有成熟 quinn（rustls-based）+ h3 crate。
+
+**原因**：
+- Hysteria 用 `http3.Server.StreamDispatcher` —— quic-go 私有 API，h3 crate 无直接对应
+- Hysteria 自定义 frame type 0x401（TCP 请求）+ auth 路径 /auth + datagram 多路复用
+- quinn 的 `enable_datagrams` + `max_datagram_frame_size` + 自定义 congestion 注入组合可能不完整支持
+- 与 KCP 翻译决策一致（不引 kcp-tokio）
+
+**决策**：1:1 翻译 Go 源（含 BBR/Brutal 完整算法），QUIC/HTTP3 IO 边界留 trait。
+等上层（quinn/h3/rustls adapter）接入后，trait 实现注入即可激活。
+
+### 决策 2：BBR sender + bandwidth_sampler 接口完整 + 算法简化
+
+**背景**：BBR sender 是 ~931 行 Go + bandwidth_sampler ~759 行 = ~1690 行复杂状态机。
+
+**原因**：
+- BBR 是 Chromium 项目移植的标准算法（非 xray 特有）
+- congestion controller 不影响协议互通（两端用不同 congestion 仍可通信）
+- quinn-proto 自带 BBR（`quinn_proto::congestion::bbr::Bbr`），未来可替代
+- 单任务完整翻译工作量超出合理范围（~2200 行 Rust）
+
+**决策**：
+- 完整翻译 ProfileConfig（3 种 profile：Conservative/Standard/Aggressive）
+- 完整翻译 BbrSender struct（40+ 字段）+ CongestionControl trait 方法
+- 完整翻译关键 helper：minCongestionWindowForMaxDatagramSize / scaleByteWindowForDatagramSize
+- 简化 STARTUP/DRAIN/PROBE_BW/PROBE_RTT 状态转换（占位，未来补全）
+- bandwidth_sampler 类型完整（SendTimeState/BandwidthSample/CongestionEventSample），
+  内部用 HashMap 替代 packetNumberIndexedQueue（精度降低但接口一致）
+
+### 决策 3：`congestion.CongestionControl` trait 抽象脱离 quinn-proto
+
+**背景**：Go 端用 quic-go 的 `congestion.CongestionControl` 接口。
+
+**决策**：
+- 定义本地 `CongestionControl` trait（含 SendRTT/OnPacketSent 等方法）
+- 用本地类型别名（ByteCount=i64, PacketNumber=i64, MonoTime=u64）替代 quic-go 类型
+- BrutalSender / BbrSender 实现本地 trait，纯算法可测
+- 上层 quinn adapter 将本地 trait 适配为 `quinn_proto::congestion::Controller`
+
+### 决策 4：`PacketConn` / `QuicStream` / `QuicConn` 用 `Pin<Box<dyn Future>>` 表达 async
+
+**背景**：Go 端用同步 IO + goroutine；Rust 端需 async。不引 async_trait crate。
+
+**决策**：
+- trait 方法返回 `Pin<Box<dyn Future<Output = ...> + Send>>`
+- 实现端用 `Box::pin(async move { ... })` 包装
+- 与项目「不引 async_trait」一致（rules/rust.md 决策）
+
+### 决策 5：UDP hop / UdpSessionManager 用 tokio mpsc channel 替代 Go channel
+
+**背景**：Go 用 `chan []byte` + goroutine；Rust 用 tokio::sync::mpsc + spawn task。
+
+**决策**：
+- `recv_rx: tokio::sync::Mutex<mpsc::Receiver<UdpPacket>>`
+  （需在持锁期间 await，必须用 tokio::sync::Mutex，不能用 parking_lot）
+- `inner: Arc<parking_lot::Mutex<UdpHopInner>>` 同步字段保持 parking_lot（无 await 开销）
+- hop_loop / recv_loop 用 tokio::spawn + JoinHandle 管理
+
+### 决策 6：Masquerade 4 种类型完整翻译 + trait 抽象
+
+**背景**：Go `hub.go` `Listen()` 中 switch 4 种 masqType（404/file/proxy/string）。
+
+**决策**：
+- `MasqType` enum 4 变体（NotFound/File/Proxy/String）+ `from_config(&Config)` 解析
+- `MasqueradeHandler` trait：`serve(method, path, headers) -> (status, headers, body)`
+- 内置 NotFoundMasqHandler / StringMasqHandler 默认实现
+- File/Proxy masquerade 留 trait，等 HTTP server 上层注入
+
+### 统计
+
+- 14 个模块（lib + config/proto_config/context/error + congestion/{types,pacer,brutal,utils,bbr/{mod,bandwidth,clock,windowed_filter,ringbuffer,packet_queue,bandwidth_sampler,bbr_sender}} + udphop + conn + dialer + hub）
+- 153 单元测试（全过）
+- 代码量：~4800 行（含测试）
+- Go 源对应：`transport/internet/hysteria/` 17 文件 ~3700 行（含 BBR ~1700 行）

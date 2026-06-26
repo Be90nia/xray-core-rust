@@ -2222,10 +2222,15 @@ dependencies = [
 name = "xray-transport-hysteria"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "parking_lot",
+ "rand",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "xray-buf",
  "xray-common",
+ "xray-proto",
  "xray-transport",
 ]
 
