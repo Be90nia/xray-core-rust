@@ -8,7 +8,24 @@ rust-version.workspace = true
 [dependencies]
 xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
+xray-proto = { path = "../xray-proto" }
 xray-buf = { path = "../xray-buf" }
 xray-crypto = { path = "../xray-crypto" }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+parking_lot = { workspace = true }
+bytes = { workspace = true }
+prost = { workspace = true }
+
+# 加密原语：HMAC-SHA256（KDF）、SHA256（body key 派生）、MD5（chacha key 派生）、
+# SHAKE128（chunk size padding）、CRC32-IEEE（AuthID）、FNV1a（命令认证）
+hmac = "0.12"
+sha2 = "0.10"
+md-5 = "0.10"
+sha3 = "0.10"
+crc32fast = "1"
+fnv = "1"
+# AES 单块加密（CreateAuthID 用）
+aes = "0.8"
+rand = { workspace = true }

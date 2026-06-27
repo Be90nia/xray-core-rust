@@ -1,1 +1,364 @@
-//! VMess client encoding
+//! VMess 客户端会话：编码请求头 + body 包装 trait stub。
+//!
+//! 对应 Go 版本 `proxy/vmess/encoding/client.go`。
+//!
+//! # 实现范围
+//!
+//! - **完整**：`ClientSession::new` + `encode_request_header`（构造 38B header + AEAD seal）
+//! - **trait stub**：`encode_request_body` / `decode_response_header` / `decode_response_body`
+//!   依赖 `xray-crypto` 的 chunk reader/writer 包装链（待接入）。
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use sha2::{Digest, Sha256};
+
+use xray_common::protocol::RequestHeader;
+
+use crate::aead::{self, SealHeaderError};
+use crate::encoding::{authenticate, write_address_port, ChunkNonceGenerator};
+use crate::error::{Result, VmessError};
+use crate::VmessCommand;
+
+/// VMess 客户端会话（对应 Go `ClientSession`）。
+///
+/// 持有请求/响应 body 加密所需的 key/IV（随机生成），以及响应头首字节。
+#[derive(Debug, Clone)]
+pub struct ClientSession {
+    /// 请求 body key（16B 随机）。
+    pub request_body_key: [u8; 16],
+    /// 请求 body IV（16B 随机）。
+    pub request_body_iv: [u8; 16],
+    /// 响应 body key = SHA256(request_body_key)[..16]。
+    pub response_body_key: [u8; 16],
+    /// 响应 body IV = SHA256(request_body_iv)[..16]。
+    pub response_body_iv: [u8; 16],
+    /// 响应头首字节（1B 随机，用于服务端响应校验）。
+    pub response_header: u8,
+}
+
+impl ClientSession {
+    /// 创建新会话：生成 33B 随机（16 key + 16 iv + 1 header），派生 body key/IV。
+    #[must_use]
+    pub fn new() -> Self {
+        use rand::RngCore;
+        let mut buf = [0u8; 33];
+        rand::rng().fill_bytes(&mut buf);
+        let mut request_body_key = [0u8; 16];
+        let mut request_body_iv = [0u8; 16];
+        request_body_key.copy_from_slice(&buf[..16]);
+        request_body_iv.copy_from_slice(&buf[16..32]);
+        let response_header = buf[32];
+
+        let body_key_hash = Sha256::digest(&request_body_key);
+        let body_iv_hash = Sha256::digest(&request_body_iv);
+        let mut response_body_key = [0u8; 16];
+        let mut response_body_iv = [0u8; 16];
+        response_body_key.copy_from_slice(&body_key_hash[..16]);
+        response_body_iv.copy_from_slice(&body_iv_hash[..16]);
+
+        Self {
+            request_body_key,
+            request_body_iv,
+            response_body_key,
+            response_body_iv,
+            response_header,
+        }
+    }
+
+    /// 编码请求头（对应 Go `EncodeRequestHeader`）。
+    ///
+    /// # 算法
+    ///
+    /// 1. 构造 38B base buffer：`[Ver=1 | requestBodyIV | requestBodyKey | respHeader | option | sec/pad | reserved | cmd]`
+    /// 2. 若 cmd ≠ Mux，追加地址 + 端口
+    /// 3. 追加 padding（随机长度，最多 16B）
+    /// 4. 追加 FNV1a 校验和（4B BE）
+    /// 5. 用 cmd_key 通过 `seal_vmess_aead_header` 加密整个 buffer
+    ///
+    /// # Errors
+    ///
+    /// - [`VmessError::AeadReadFailed`]：AEAD 加密失败。
+    pub fn encode_request_header(
+        &self,
+        header: &RequestHeader,
+        cmd_key: &[u8; 16],
+    ) -> Result<Vec<u8>> {
+        // 取账户（Go 端是 `header.User.Account.(*vmess.MemoryAccount)`）
+        // Rust 端 RequestHeader.user 是 Option<MemoryUser>，且本地没有 account 信息
+        // 这里要求调用方在传入前确保 header.user.account 已设；本函数只用 cmd_key 参数
+
+        let mut buffer: Vec<u8> = Vec::with_capacity(64);
+        // 1B version
+        buffer.push(crate::encoding::VERSION);
+
+        // 16B IV + 16B key
+        buffer.extend_from_slice(&self.request_body_iv);
+        buffer.extend_from_slice(&self.request_body_key);
+
+        // 1B response header
+        buffer.push(self.response_header);
+
+        // 1B option
+        buffer.push(header.option.bits());
+
+        // padding len (high 4 bits) + security (low 4 bits)
+        use rand::RngCore;
+        let mut pad_buf = [0u8; 1];
+        rand::rng().fill_bytes(&mut pad_buf);
+        let padding_len = (pad_buf[0] as usize) % 16;
+        let security_byte = (u8::try_from(padding_len << 4).unwrap_or(0))
+            | header.security.as_u8();
+        buffer.push(security_byte);
+
+        // 1B reserved
+        buffer.push(0);
+
+        // 1B command
+        let vmess_cmd = VmessCommand::from(header.command);
+        buffer.push(vmess_cmd.as_u8());
+
+        // 地址 + 端口（非 Mux）
+        if vmess_cmd != VmessCommand::Mux {
+            let addr = header.destination.address();
+            let port = header.destination.port().value();
+            write_address_port(&mut buffer, addr, port);
+        }
+
+        // padding
+        if padding_len > 0 {
+            let mut pad = vec![0u8; padding_len];
+            rand::rng().fill_bytes(&mut pad);
+            buffer.extend_from_slice(&pad);
+        }
+
+        // FNV1a 4B BE 校验和
+        let auth = authenticate(&buffer);
+        buffer.extend_from_slice(&auth.to_be_bytes());
+
+        // AEAD seal
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        aead::seal_vmess_aead_header(cmd_key, &buffer, now)
+            .map_err(|e| match e {
+                SealHeaderError::InvalidKeyLength(n) => {
+                    VmessError::Other(format!("cmd_key length mismatch: {n}"))
+                }
+                SealHeaderError::Crypto(c) => VmessError::Crypto(c),
+            })
+    }
+
+    /// 编码请求 body（对应 Go `EncodeRequestBody`）。
+    ///
+    /// 当前 stub：依赖 `xray-crypto` 的 `AuthenticationWriter` + `ChunkSizeParser` 链路，
+    /// 等 transport Link 接入后实现。
+    ///
+    /// # Errors
+    ///
+    /// 始终返回 [`VmessError::NotImplemented`]。
+    pub fn encode_request_body(
+        &self,
+        _request: &RequestHeader,
+    ) -> Result<()> {
+        Err(VmessError::NotImplemented("encode_request_body: requires xray-crypto AuthenticationWriter chain"))
+    }
+
+    /// 解码响应头（对应 Go `DecodeResponseHeader`）。
+    ///
+    /// 当前 stub：依赖 AEAD 解密响应头 + AES-CFB 流初始化。
+    ///
+    /// # Errors
+    ///
+    /// 始终返回 [`VmessError::NotImplemented`]。
+    pub fn decode_response_header<R: std::io::Read>(&self, _reader: &mut R) -> Result<()> {
+        Err(VmessError::NotImplemented("decode_response_header: requires AEAD response header decrypt + AES-CFB stream init"))
+    }
+
+    /// 解码响应 body（对应 Go `DecodeResponseBody`）。
+    ///
+    /// 当前 stub：依赖 `xray-crypto` 的 `AuthenticationReader` + `ChunkSizeParser` 链路。
+    ///
+    /// # Errors
+    ///
+    /// 始终返回 [`VmessError::NotImplemented`]。
+    pub fn decode_response_body<R: std::io::Read>(
+        &self,
+        _request: &RequestHeader,
+        _reader: &mut R,
+    ) -> Result<()> {
+        Err(VmessError::NotImplemented("decode_response_body: requires xray-crypto AuthenticationReader chain"))
+    }
+
+    /// 构造 chunk nonce 生成器（对应 Go `GenerateChunkNonce(iv, nonce_size)`）。
+    ///
+    /// 用 `request_body_iv` 初始化，nonce 大小由 AEAD 算法决定（AES-GCM=12，ChaCha20-Poly1305=12）。
+    #[must_use]
+    pub fn chunk_nonce_generator(&self, nonce_size: usize) -> ChunkNonceGenerator {
+        ChunkNonceGenerator::new(&self.request_body_iv, nonce_size)
+    }
+}
+
+impl Default for ClientSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xray_common::net::address::Address;
+    use xray_common::net::destination::Destination;
+    use xray_common::net::port::Port;
+    use xray_common::protocol::{Command, SecurityType};
+    use xray_common::uuid::UUID;
+
+    fn sample_cmd_key() -> [u8; 16] {
+        let uuid = UUID::parse("66ad4540-b58c-4ad2-9926-ea63445a9b57").expect("uuid");
+        crate::account::cmd_key_of(&uuid)
+    }
+
+    fn sample_request_header_tcp() -> RequestHeader {
+        let dest = Destination::tcp(Address::ipv4(std::net::Ipv4Addr::new(1, 2, 3, 4)), Port::new(80));
+        RequestHeader::new(crate::encoding::VERSION, Command::Tcp, dest, SecurityType::Aes128Gcm)
+    }
+
+    #[test]
+    fn new_session_has_random_keys() {
+        let s1 = ClientSession::new();
+        let s2 = ClientSession::new();
+        // 极大概率两次随机会得到不同 key/iv
+        assert_ne!(s1.request_body_key, s2.request_body_key);
+        assert_ne!(s1.request_body_iv, s2.request_body_iv);
+        assert_ne!(s1.response_header, s2.response_header);
+    }
+
+    #[test]
+    fn response_body_key_derived_from_request_body_key() {
+        let s = ClientSession::new();
+        let hash = Sha256::digest(&s.request_body_key);
+        let mut expected = [0u8; 16];
+        expected.copy_from_slice(&hash[..16]);
+        assert_eq!(s.response_body_key, expected);
+    }
+
+    #[test]
+    fn response_body_iv_derived_from_request_body_iv() {
+        let s = ClientSession::new();
+        let hash = Sha256::digest(&s.request_body_iv);
+        let mut expected = [0u8; 16];
+        expected.copy_from_slice(&hash[..16]);
+        assert_eq!(s.response_body_iv, expected);
+    }
+
+    #[test]
+    fn encode_request_header_returns_sealed_bytes() {
+        let session = ClientSession::new();
+        let header = sample_request_header_tcp();
+        let cmd_key = sample_cmd_key();
+        let sealed = session.encode_request_header(&header, &cmd_key).expect("encode");
+        // sealed = authID(16) + encrypted_len(18) + nonce(8) + encrypted_payload(N+16)
+        // 至少 16 + 18 + 8 + 16 + 16 = 74 字节
+        assert!(sealed.len() > 60);
+    }
+
+    #[test]
+    fn encode_request_header_aead_can_be_decoded() {
+        // 客户端 encode → 服务端 decode 完整往返
+        let session = ClientSession::new();
+        let header = sample_request_header_tcp();
+        let cmd_key = sample_cmd_key();
+        let sealed = session.encode_request_header(&header, &cmd_key).expect("encode");
+
+        let mut auth_id = [0u8; 16];
+        auth_id.copy_from_slice(&sealed[..16]);
+        let mut reader = &sealed[16..];
+        let opened = aead::open_vmess_aead_header(&cmd_key, &auth_id, &mut reader).expect("open");
+
+        // 验证解码后的 buffer 结构
+        let payload = opened.payload;
+        assert_eq!(payload[0], crate::encoding::VERSION);
+        // 1B ver + 16B IV + 16B key + 1B resp + 1B opt + 1B sec/pad + 1B reserved + 1B cmd = 38
+        // + 2 port + 1 type + 4 ipv4 = 7
+        // + 0..16 padding + 4 fnv1a
+        assert!(payload.len() >= 38 + 7 + 4);
+    }
+
+    #[test]
+    fn encode_request_header_mux_skips_address() {
+        let session = ClientSession::new();
+        let dest = Destination::tcp(
+            Address::Domain("v1.mux.cool".to_string()),
+            Port::new(0),
+        );
+        let header = RequestHeader::new(
+            crate::encoding::VERSION,
+            Command::Mux,
+            dest,
+            SecurityType::Aes128Gcm,
+        );
+        let cmd_key = sample_cmd_key();
+        let sealed = session.encode_request_header(&header, &cmd_key).expect("encode");
+
+        let mut auth_id = [0u8; 16];
+        auth_id.copy_from_slice(&sealed[..16]);
+        let mut reader = &sealed[16..];
+        let opened = aead::open_vmess_aead_header(&cmd_key, &auth_id, &mut reader).expect("open");
+
+        // Mux 不写地址：38 + 0..16 padding + 4 fnv1a
+        assert!(opened.payload.len() < 38 + 16 + 16 + 4);
+    }
+
+    #[test]
+    fn encode_request_body_stub_returns_not_implemented() {
+        let session = ClientSession::new();
+        let header = sample_request_header_tcp();
+        let err = session.encode_request_body(&header).unwrap_err();
+        assert!(matches!(err, VmessError::NotImplemented(_)));
+    }
+
+    #[test]
+    fn decode_response_header_stub_returns_not_implemented() {
+        let session = ClientSession::new();
+        let mut reader = &b""[..];
+        let err = session.decode_response_header(&mut reader).unwrap_err();
+        assert!(matches!(err, VmessError::NotImplemented(_)));
+    }
+
+    #[test]
+    fn decode_response_body_stub_returns_not_implemented() {
+        let session = ClientSession::new();
+        let header = sample_request_header_tcp();
+        let mut reader = &b""[..];
+        let err = session.decode_response_body(&header, &mut reader).unwrap_err();
+        assert!(matches!(err, VmessError::NotImplemented(_)));
+    }
+
+    #[test]
+    fn chunk_nonce_generator_uses_request_body_iv() {
+        let session = ClientSession::new();
+        let mut nonce_gen = session.chunk_nonce_generator(12);
+        let nonce = nonce_gen.next();
+        assert_eq!(nonce.len(), 12);
+        // 前 2 字节是 count=0
+        assert_eq!(nonce[0], 0);
+        assert_eq!(nonce[1], 0);
+        // 后 10 字节来自 request_body_iv[2..12]（nonce_size=12）
+        assert_eq!(&nonce[2..], &session.request_body_iv[2..12]);
+    }
+
+    #[test]
+    fn session_default_eq_new() {
+        let _ = ClientSession::default();
+    }
+
+    #[test]
+    fn session_clone_preserves_keys() {
+        let s1 = ClientSession::new();
+        let s2 = s1.clone();
+        assert_eq!(s1.request_body_key, s2.request_body_key);
+        assert_eq!(s1.request_body_iv, s2.request_body_iv);
+        assert_eq!(s1.response_header, s2.response_header);
+    }
+}

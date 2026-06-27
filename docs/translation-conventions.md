@@ -875,3 +875,67 @@ src/
 - 80 单测全绿（account 9 + validator 13 + error 4 + encoding 26 + encryption 12 + outbound 6 + inbound 10）
 - 对照 Go `encoding_test.go` 3 场景：TCP+Domain / Invalid command / Mux
 - 新增场景：UDP IPv4、Rvs、isfb first buffer、isfb 边界（too short / missing）、unknown user rejected、Fallback 8 级降级、extract_path 多种终止符
+
+
+## xray-proxy-vmess 决策记录（P6-2，bd o8m）
+
+**状态**：完成。103 单测全绿，workspace 零 warning。
+
+### 完整翻译范围
+- `account.rs`：`MemoryAccount` + `AsAccount` + `Equals` + proto 转换 + 本地 `cmd_key_of`（MD5(UUID.String())）
+- `validator.rs`：本地 `MemoryUser` + `Validator` trait + `TimedUserValidator`（AuthIDDecoderHolder 整合 + behaviorSeed HMAC-SHA256 累积）
+- `error.rs`：`VmessError` enum 33 变体（IO/Crypto/ProstDecode/UserNotFound/InvalidTime/Replay/DuplicateSession/InvalidAuth/AeadReadFailed/UnexpectedResponseHeader...）
+- `aead/mod.rs`：consts(10 个 KDF salt 常量) + KDF(嵌套 HMAC-SHA256) + KDF16 + CreateAuthID(AES-128-ECB 单块) + SealVMessAEADHeader + OpenVMessAEADHeader + AuthIDDecoderItem + AuthIDDecoderHolder(多用户 + 反重放) + kdf_paths(字节切片版 KDF)
+- `encoding/mod.rs`：Authenticate(FNV1a-32) + GenerateChacha20Poly1305Key(MD5×2) + ChunkNonceGenerator + ShakeSizeParser(SHAKE128) + PlainChunkSizeParser + NoOpAuthenticator + 地址+Port 编解码
+- `encoding/client.rs`：`ClientSession`（随机 key/iv + 派生 response key/iv） + `encode_request_header`（38B base + 地址 + padding + FNV1a + AEAD seal 完整） + body/response trait stub
+- `encoding/server.rs`：`ServerSession` + `decode_request_header`（authID match + AEAD open + 字段解析 + SessionHistory 反重放 + FNV1a 校验 完整） + `SessionHistory`（lazy 清理 TTL=3min） + body/response trait stub
+- `inbound/handler.rs`：`InboundHandler` + `InboundProcessor` trait + `NoopInboundProcessor` + `decode_request_header` 代理
+- `outbound/handler.rs`：`OutboundHandler` + `OutboundProcessor` trait + `NoopOutboundProcessor` + `encode_request_header` 代理
+- `lib.rs`：模块声明 + re-exports + `VERSION`/`request_option` 常量 + `VmessCommand` enum
+
+### trait + stub 范围（依赖未就绪）
+- `ClientSession::{encode_request_body, decode_response_header, decode_response_body}`：依赖 `xray-crypto` AuthenticationReader/Writer + ChunkSizeParser 链路
+- `ServerSession::{decode_request_body, encode_response_header, encode_response_body}`：同上，额外依赖 AES-CFB 流包装
+- `Inbound/Outbound Processor::process`：依赖 `transport::Link` + `dispatcher` + `retry` + `signal` + `internet::Dialer` 全链路
+
+### 关键决策
+1. **本地定义 `cmd_key_of(uuid)` 用 MD5(UUID.String())**：`xray_common::uuid::UUID::cmd_key` 当前是 XOR 折叠占位实现（TODO 注释说要换 MD5），不能用于 VMess 协议（与 Go 字节级不互通）。本 crate 独立实现避免依赖未修复的 cmd_key。
+2. **本地定义 `MemoryUser`**：与 VLESS 同理，不复用 `xray_common::protocol::MemoryUser`（后者 account 是 `Option<TypedMessage>`，无法持 `MemoryAccount`）。
+3. **KDF 嵌套 HMAC-SHA256 完整翻译**：VMess KDF 用 Go 闭包+HMAC 链式 wrap 实现。Rust 端等价：每层 `current = HMAC-SHA256(current, path[i])`，最终 `HMAC-SHA256(current, key)`。提供字符串版 `kdf` + 字节切片版 `kdf_paths`（auth_id/nonce 不是合法 UTF-8）。
+4. **HmacSha256 用 fully-qualified**：`<HmacSha256 as Mac>::new_from_slice(...)`。`hmac 0.12` + `cipher 0.4` 同时在 scope 时 `Mac::new_from_slice` 和 `KeyInit::new_from_slice` 多义，必须显式 trait 调用。Cargo.toml 不引 `cipher`（仅 aes 内部用）。
+5. **`AuthIDDecoderHolder` 反重放简化**：Go 用 LRU-120 filter，本实现用 `HashSet` + 满容量(1024)清空。回放窗口在满容量瞬间放宽，但实际攻击要在 1024 个请求内重放才受益。
+6. **`SessionHistory` lazy 清理替代 `task.Periodic`**：Go 端用 30s 周期清理过期 session。Rust 端简化为每次 `add_if_not_exists` 时 lazy 清理（`retain(|_, expire| *expire > now)`），TTL 3 分钟。
+7. **`ChunkNonceGenerator` 用 `&mut self` + `u16` 字段**（不用 `RefCell<u16>`）：调用方独占 generator 实例，不需要内部可变性。Go 端用闭包持 mutable counter，Rust 端用结构体更明确。
+8. **`ShakeSizeParser.reader: Box<dyn XofReader>`**：sha3 的 `Shake128::finalize_xof()` 返回实现 `XofReader` 的类型，但 trait 不能直接做字段，用 `Box<dyn>` 包装。
+9. **`OpenHeaderError::Crypto` 是 struct variant**（含 `should_drain`/`bytes_read` 字段）：保留 Go 端 drain 决策信号，调用方据此选择是否丢弃剩余字节。`Aes128Gcm::new().map_err()` 用闭包而非 `From`。
+10. **VMess 的 `protocol::Command` 直接用 `xray_common` 的**（3 变体 Tcp/Udp/Mux），不需要本地定义（与 VLESS 不同，VLESS 需要 Rvs 第 4 变体）。
+11. **`gen` 是 Rust 2024 保留字**：测试代码 `let gen = ...` 编译失败，改 `nonce_gen`。
+12. **`Hmac<Sha256>::finalize(self)` 消费 self**：调 `finalize` 不需要 mut，但 `update(&mut self, ...)` 需要。因此 `let m = ...`（无 mut）+ `m.finalize()`；`let mut next = ...` + `next.update(...)`。
+
+### 模块结构
+```
+src/
+├── lib.rs                    # 模块声明 + re-exports + VERSION/request_option 常量 + VmessCommand enum
+├── account.rs                # MemoryAccount + cmd_key_of(MD5) + proto 转换
+├── validator.rs              # 本地 MemoryUser + Validator trait + TimedUserValidator + behaviorSeed HMAC
+├── error.rs                  # VmessError enum 33 变体 + Result 类型别名
+├── aead/
+│   └── mod.rs                # consts + KDF + KDF16 + CreateAuthID + Seal/Open AEAD Header + AuthIDDecoderHolder
+├── encoding/
+│   ├── mod.rs                # Authenticate + GenerateChachaKey + ChunkNonceGenerator + ShakeSizeParser + 地址编解码
+│   ├── client.rs             # ClientSession + encode_request_header 完整 + body/response trait stub
+│   └── server.rs             # ServerSession + decode_request_header 完整 + SessionHistory + body/response trait stub
+├── inbound/
+│   ├── mod.rs
+│   └── handler.rs            # InboundHandler + InboundProcessor trait + NoopInboundProcessor
+└── outbound/
+    ├── mod.rs
+    └── handler.rs            # OutboundHandler + OutboundProcessor trait + NoopOutboundProcessor
+```
+
+### 测试覆盖
+- 103 单测全绿（account 12 + validator 10 + aead 24 + encoding::mod 20 + encoding::client 12 + encoding::server 11 + inbound 2 + outbound 3 + error 9）
+- 完整往返测试：客户端 `encode_request_header` → 服务端 `open_vmess_aead_header` + 字段解析验证
+- 完整往返测试：客户端 `encode_request_header` → 服务端 `decode_request_header`（authID match + SessionHistory 反重放 + FNV1a 校验）
+- 反重放测试：同 session_id 重放 → 返回 `VmessError::Replay`（AuthID 反重放）或 `DuplicateSession`（SessionHistory 反重放）
+- KDF 一致性测试：相同 key+path 输出确定；不同 key/path 输出不同
