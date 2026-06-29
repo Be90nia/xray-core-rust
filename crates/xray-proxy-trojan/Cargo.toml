@@ -9,5 +9,22 @@ rust-version.workspace = true
 xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
 xray-buf = { path = "../xray-buf" }
+xray-crypto = { path = "../xray-crypto" }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+parking_lot = { workspace = true }
+bytes = { workspace = true }
+prost = { workspace = true }
+
+xray-proto = { path = "../xray-proto" }
+# - sha2：SHA224(password) hex hash 用户验证
+sha2 = "0.10"
+# - hex：hash 转十六进制字符串（Trojan 协议头固定 hex 表示）
+hex = "0.4"
+# - hmac：HMAC-SHA256 behaviorSeed 累积（与 SS 一致）
+hmac = "0.12"
+# - crc：CRC64-ECMA behaviorSeed（与 SS 一致，drainer 用）
+crc = "2"
+# - rand：随机 nonce / session id
+rand = { workspace = true }

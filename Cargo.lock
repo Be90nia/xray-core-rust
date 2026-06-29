@@ -2094,6 +2094,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "thiserror 2.0.18",
  "toml",
  "tracing",
  "xray-common",
@@ -2285,11 +2286,22 @@ dependencies = [
 name = "xray-proxy-trojan"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "crc",
+ "hex",
+ "hmac",
+ "parking_lot",
+ "prost",
+ "rand",
+ "sha2",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "xray-buf",
  "xray-common",
+ "xray-crypto",
  "xray-features",
+ "xray-proto",
 ]
 
 [[package]]
