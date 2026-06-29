@@ -2398,9 +2398,12 @@ dependencies = [
 name = "xray-reality"
 version = "0.1.0"
 dependencies = [
+ "prost",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "xray-common",
+ "xray-proto",
  "xray-tls",
  "xray-transport",
 ]
