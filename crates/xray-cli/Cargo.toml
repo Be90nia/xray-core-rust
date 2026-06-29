@@ -8,7 +8,11 @@ rust-version.workspace = true
 [dependencies]
 xray-core = { path = "../xray-core" }
 xray-conf = { path = "../xray-conf" }
+thiserror = { workspace = true }
+clap = { version = "4", features = ["derive"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
