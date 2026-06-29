@@ -2442,10 +2442,12 @@ dependencies = [
 name = "xray-transport-grpc"
 version = "0.1.0"
 dependencies = [
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "xray-buf",
  "xray-common",
+ "xray-proto",
  "xray-transport",
 ]
 
@@ -2453,10 +2455,13 @@ dependencies = [
 name = "xray-transport-httpupgrade"
 version = "0.1.0"
 dependencies = [
+ "parking_lot",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "xray-buf",
  "xray-common",
+ "xray-proto",
  "xray-transport",
 ]
 
@@ -2506,10 +2511,14 @@ dependencies = [
 name = "xray-transport-websocket"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "sha1",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "xray-buf",
  "xray-common",
+ "xray-proto",
  "xray-transport",
 ]
 
