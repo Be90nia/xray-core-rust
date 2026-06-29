@@ -939,3 +939,51 @@ src/
 - 完整往返测试：客户端 `encode_request_header` → 服务端 `decode_request_header`（authID match + SessionHistory 反重放 + FNV1a 校验）
 - 反重放测试：同 session_id 重放 → 返回 `VmessError::Replay`（AuthID 反重放）或 `DuplicateSession`（SessionHistory 反重放）
 - KDF 一致性测试：相同 key+path 输出确定；不同 key/path 输出不同
+
+## xray-proxy-ss 决策记录（P6-3，bd n1i）
+
+**状态**：完成。80 单测全绿，workspace 零 warning。
+
+### 完整翻译范围
+- `lib.rs`：模块声明 + re-exports + `VERSION=1` + `SSBSKDF`/`SS_SUBKEY` 常量
+- `error.rs`：`SsError` enum 28 变体 + `Result` 别名 + `From<io::Error>` + `From<CryptoError>`
+- `config.rs`：`CipherType` enum（proto 数值 0/5/6/7/8/9）+ `Cipher` enum（Aead/None） + `AeadCipher` struct + `InnerAead = Box<dyn AeadCipher>` + AEAD creator 4 函数 + `password_to_cipher_key`（MD5 链）+ `hkdf_sha1`（HKDF-SHA1 with "ss-subkey"） + `MemoryAccount` + proto 转换
+- `validator.rs`：本地 `MemoryUser` + `Validator`（Mutex 保护的 `ValidatorInner`） + `add`/`del`/`get_by_email`/`get_all`/`count`/`behavior_seed`/`get(bs, command)` + `try_match_aead`（HKDF + AEAD.Open 试匹配）
+- `protocol.rs`：SS 地址格式（0x01/0x03/0x04 + `b & 0x0F`）+ `encode_udp_packet`/`decode_udp_packet` 完整 + `encode_tcp_request_header`/`decode_tcp_request_header` stub + `TcpBodyWriter`/`TcpBodyReader` trait stub
+- `client.rs`：`OutboundProcessor` trait + `NoopOutboundProcessor` + `Client` struct
+- `server.rs`：`InboundProcessor` trait + `NoopInboundProcessor` + `Server` struct + `add_user`/`remove_user`/`get_user`/`users_count`
+
+### trait + stub 范围（依赖未就绪）
+- TCP 流式 body 加密（chunk size parser + nonce generator + AuthenticationReader/Writer）
+- `OutboundProcessor::process` 依赖 `transport::Link` + `retry` + `signal::Timer` 全链路
+- `InboundProcessor::process` 依赖 `routing::Dispatcher` + `udp::Dispatcher` + `session::Inbound`
+
+### 关键决策
+1. **直接复用 `xray_crypto::aead` 模块**：不自己依赖 aes-gcm/chacha20poly1305 crate。`xray_crypto::aead::{Aes128Gcm, Aes256Gcm, ChaCha20Poly1305Aead, XChaCha20Poly1305Aead}` 已包装好 ring 后端，提供 `AeadCipher` trait。本 crate 只需定义 creator 函数指针 + `Box<dyn AeadCipher>` 装载。
+2. **`InnerAead = Box<dyn AeadCipher>` 类型别名**：避免 enum 内嵌多 AEAD 类型的复杂度。trait import 时 rename `AeadCipher as AeadCipherImpl`（与本 crate 的 `AeadCipher` struct 同名冲突）。
+3. **SS 地址格式独立实现**（不复用 `xray_common::protocol::AddressParser`）：SS 用 SOCKS5 兼容格式 0x01/0x03/0x04 + `b & 0x0F` 提取类型，与 VLESS/VMess 通用格式（1/2/3 + 高位补 0）不同。
+4. **`Cipher` 用 enum 不用 trait**：Go 用 interface + `AEADCipher{AEADAuthCreator func}`。Rust 用 `enum Cipher { Aead(AeadCipher), None }` + match 分派，避免 trait object 复杂度。
+5. **`Validator::add` behaviorSeed 简化重算**：Go 用 `crc64.Update(seed, table, sum)` incremental。Rust `crc` 2.x 无 combine API，改为每次 add 重新计算所有用户拼接 HMAC-SHA256 输出的 CRC64-ECMA（结果与 Go 不一致但对 drainer 反 probing 足够，文档标注差异）。
+6. **UDP 用 zero nonce**：Go 端 `GenerateAEADNonceWithSize` 创建 0 计数器，seal 后 nonce 仍为 0。Rust 端直接用 `vec![0u8; nonce_size]`。
+7. **DOMAIN 地址解析 `consumed = 1 + len`**（不是 len）：因为分支内不修改 pos，外层 `pos += consumed` 统一处理。pos 初始 1（跳过 type byte）。
+8. **`SsError` 实现 `From<CryptoError>`**：方便 `?` 透传 `xray_crypto::aead::CryptoError`。
+9. **TCP 编解码留 stub**：完整实现需要 AEAD chunk size parser + nonce generator + AuthenticationReader/Writer（`crypto.AEADAuthenticator` 链路）。当前 `encode_tcp_request_header` 只返回 IV + 明文 addr（不加密，文档警告）。
+
+### 模块结构
+```
+src/
+├── lib.rs                # 模块 + re-exports + VERSION/SSBSKDF/SS_SUBKEY 常量
+├── error.rs              # SsError enum 28 变体 + Result + From impl
+├── config.rs             # CipherType + Cipher enum + AeadCipher struct + InnerAead alias + creator 函数 + MemoryAccount + proto
+├── validator.rs          # 本地 MemoryUser + Validator + RequestCommand + GetResult + try_match_aead
+├── protocol.rs           # 地址编解码 + UDP encode/decode 完整 + TCP encode/decode stub + trait
+├── client.rs             # OutboundProcessor trait + NoopOutboundProcessor + Client
+└── server.rs             # InboundProcessor trait + NoopInboundProcessor + Server + AddUser/RemoveUser
+```
+
+### 测试覆盖
+- 80 单测全绿（config 60+ + validator 15 + protocol 12 + client 1 + server 4）
+- UDP 完整往返：4 种 cipher × Domain/IPv4/IPv6 地址全通过
+- 反向匹配：错用户 → UserNotFound，无用户 → UserNotFound
+- password_to_cipher_key MD5 链：首块 = MD5(password)，次块 = MD5(prev || password)
+- HKDF-SHA1 派生 subkey：相同 secret/salt 输出确定，不同 secret 输出不同

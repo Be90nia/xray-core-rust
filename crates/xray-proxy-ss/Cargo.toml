@@ -10,5 +10,30 @@ xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
 xray-buf = { path = "../xray-buf" }
 xray-crypto = { path = "../xray-crypto" }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+parking_lot = { workspace = true }
+bytes = { workspace = true }
+prost = { workspace = true }
+
+xray-proto = { path = "../xray-proto" }
+# - aes-gcm：AES-128-GCM / AES-256-GCM
+# - chacha20poly1305：ChaCha20-Poly1305 / XChaCha20-Poly1305
+# - hkdf + sha1：subkey 派生（"ss-subkey"）
+# - md-5：passwordToCipherKey MD5 链
+# - hmac + sha2：HMAC-SHA256("SSBSKDF") behaviorSeed
+# - crc：CRC64-ECMA behaviorSeed 累积
+# - crc32fast：CRC32-IEEE ReadTCPResponse behaviorSeed
+aes-gcm = "0.11.0-rc.4"  # 与 chacha20poly1305 0.11.x 对齐（都用 aead 0.6）
+# 与 xray-crypto 保持一致：chacha20poly1305 0.11.0-rc.3（cargo semver 会自动选最高版本）
+chacha20poly1305 = "0.11.0-rc.3"
+hkdf = "0.12"
+sha1 = "0.10"
+md-5 = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
+crc = "2"
+crc32fast = "1"
+rand = { workspace = true }
+generic-array = "1"
