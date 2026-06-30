@@ -389,28 +389,32 @@ impl DefaultDispatcher {
         Ok(())
     }
 
-    /// 分发入站连接。
+    /// 分发入站连接，返回 inbound Link 给 inbound handler。
     ///
     /// 对应 Go `(*DefaultDispatcher).Dispatch(ctx, destination) (*transport.Link, error)`。
     ///
-    /// **当前状态**：依赖 `pipe.Reader/Writer` 与 `outbound.Handler.Dispatch` 全链路，
-    /// 主体留 TODO。返回 `Err(Other)` 表示未接入。
-    /// 分发入站连接。
+    /// # 流程（对应 Go `getLink` + `routedDispatch`）
+    /// 1. 创建两对 pipe：`uplink`（inbound → outbound 上行）+ `downlink`（outbound → inbound 下行）
+    /// 2. 拼装 inbound Link（读 downlink/写 uplink）+ outbound Link（读 uplink/写 downlink）
+    /// 3. 调 [`Self::dispatch_link`] 在后台 spawn outbound handler
+    /// 4. 返回 inbound Link 给 inbound 端
     ///
-    /// 对应 Go `(*DefaultDispatcher).Dispatch(ctx, destination) (*transport.Link, error)`。
-    ///
-    /// **当前状态**：依赖 pipe 创建 inbound/outbound link，主体留 TODO。
-    /// dispatch 的完整实现需要：1) 创建 pipe pair  2) 桥接 client conn ↔ pipe
-    /// 3) 调用 [`Self::dispatch_link`]  4) 返回 pipe 另一端给 inbound handler。
-    /// pipe pair 创建依赖 `xray_buf::pipe` 完整翻译，留待后续。
+    /// 当前切片不含 sniffing / routing；handler 选择由 [`Self::dispatch_link`] 内部完成。
     pub fn dispatch(
         &self,
-        _destination: &xray_common::net::destination::Destination,
-        _sniffing_request: &SniffingRequest,
-    ) -> Result<(), DispatcherError> {
-        Err(DispatcherError::Other(
-            "dispatch not implemented; pipe creation pending".to_string(),
-        ))
+        destination: &xray_common::net::destination::Destination,
+        sniffing_request: &SniffingRequest,
+    ) -> Result<xray_transport::link::Link, DispatcherError> {
+        // Go getLink：两对 pipe，方向与 Go 原版完全一致
+        let (up_r, up_w) = xray_buf::pipe::new();
+        let (dn_r, dn_w) = xray_buf::pipe::new();
+        // inbound 端：读下行（outbound 写回的字节）+ 写上行（发给 outbound 的字节）
+        let inbound = xray_transport::link::Link::new(Box::new(dn_r), Box::new(up_w));
+        // outbound 端：读上行 + 写下行
+        let outbound = xray_transport::link::Link::new(Box::new(up_r), Box::new(dn_w));
+        // 启动 outbound handler；dispatch_link 内部 spawn handler.dispatch(outbound)
+        self.dispatch_link(destination, outbound, sniffing_request)?;
+        Ok(inbound)
     }
 
     /// 分发已有 link。
@@ -671,5 +675,117 @@ mod tests {
         let r = Route::new("proxy");
         assert_eq!(r.get_outbound_tag(), "proxy");
         assert_eq!(r.get_rule_tag(), "");
+    }
+
+    // ---- DefaultDispatcher::dispatch ----
+
+    #[tokio::test]
+    async fn dispatch_creates_pipe_pair_and_spawns_outbound_handler() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc as StdArc;
+        use std::time::Duration;
+        use xray_common::net::address::Address;
+        use xray_common::net::destination::Destination;
+
+        // Mock DispatchHandler：递增 counter 证明 spawn 触发
+        #[derive(Debug)]
+        struct MockHandler {
+            called: StdArc<AtomicU32>,
+        }
+        impl DispatchHandler for MockHandler {
+            fn tag(&self) -> &str {
+                "mock"
+            }
+            fn dispatch(&self, _link: xray_transport::link::Link) -> PinFuture<()> {
+                let c = self.called.clone();
+                Box::pin(async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                })
+            }
+        }
+
+        // Mock OutboundHandlerManager 返回 MockHandler
+        #[derive(Debug)]
+        struct MockOhm {
+            handler: StdArc<MockHandler>,
+        }
+        impl OutboundHandlerManager for MockOhm {
+            fn get_handler(&self, _tag: &str) -> Option<Arc<dyn DispatchHandler>> {
+                None
+            }
+            fn get_default_handler(&self) -> Option<Arc<dyn DispatchHandler>> {
+                Some(self.handler.clone())
+            }
+        }
+
+        let called = StdArc::new(AtomicU32::new(0));
+        let handler = StdArc::new(MockHandler {
+            called: called.clone(),
+        });
+        let ohm: Arc<dyn OutboundHandlerManager> = Arc::new(MockOhm { handler });
+        let mut d = DefaultDispatcher::new();
+        d.ohm = Some(ohm);
+
+        let dest = Destination::new(
+            Address::new_domain("example.com".to_string()),
+            Port::new(443),
+            Network::TCP,
+        );
+        let inbound = d
+            .dispatch(&dest, &SniffingRequest::default())
+            .expect("dispatch returns inbound Link");
+
+        // inbound Link 字段非空（trait object 无法直接比较，仅验证存在）
+        let _ = &inbound.reader;
+        let _ = &inbound.writer;
+
+        // 等 tokio::spawn 调度完成
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            called.load(Ordering::SeqCst),
+            1,
+            "dispatch_link should spawn handler.dispatch exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_errors_when_no_ohm() {
+        use xray_common::net::address::Address;
+        use xray_common::net::destination::Destination;
+        let d = DefaultDispatcher::new(); // 无 ohm
+        let dest = Destination::new(
+            Address::new_domain("example.com".to_string()),
+            Port::new(443),
+            Network::TCP,
+        );
+        let r = d.dispatch(&dest, &SniffingRequest::default());
+        assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_errors_when_no_default_handler() {
+        use xray_common::net::address::Address;
+        use xray_common::net::destination::Destination;
+
+        #[derive(Debug)]
+        struct EmptyOhm;
+        impl OutboundHandlerManager for EmptyOhm {
+            fn get_handler(&self, _tag: &str) -> Option<Arc<dyn DispatchHandler>> {
+                None
+            }
+            fn get_default_handler(&self) -> Option<Arc<dyn DispatchHandler>> {
+                None
+            }
+        }
+
+        let mut d = DefaultDispatcher::new();
+        d.ohm = Some(Arc::new(EmptyOhm));
+        let dest = Destination::new(
+            Address::new_domain("example.com".to_string()),
+            Port::new(443),
+            Network::TCP,
+        );
+        let r = d.dispatch(&dest, &SniffingRequest::default());
+        assert!(r.is_err());
     }
 }
