@@ -24,10 +24,9 @@ pub enum FeatureError {
     #[error("feature already registered: {name}")]
     AlreadyRegistered { name: &'static str },
 
-    /// 请求的 Feature 类型未注册。
+    /// 请求的 Feature 类型未注册。`name` 兼容静态类型名与 prost `type_url`。
     #[error("feature not found: {name}")]
-    NotFound { name: &'static str },
-
+    NotFound { name: String },
     /// Feature 启动失败。`source` 保留原始错误链。
     #[error("feature {name} failed to start: {message}")]
     StartFailed { name: &'static str, message: String },
@@ -144,7 +143,7 @@ mod tests {
 
     #[test]
     fn error_display_contains_type_info() {
-        let err = FeatureError::NotFound { name: "NoopFeature" };
+        let err = FeatureError::NotFound { name: String::from("NoopFeature") };
         let msg = format!("{err}");
         assert!(msg.contains("not found"));
         assert!(msg.contains("NoopFeature"));

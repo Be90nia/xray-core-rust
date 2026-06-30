@@ -10,6 +10,6 @@ xray-common = { path = "../xray-common" }
 async-trait = "0.1"
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt"] }
-
+parking_lot = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }

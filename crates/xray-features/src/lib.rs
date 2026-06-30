@@ -13,6 +13,8 @@ pub mod policy;
 pub mod stats;
 pub mod extension;
 pub mod feature;
+pub mod registry;
 
-// 顶层 re-export：Feature trait 是所有 feature 注册的入口。
+// 顶层 re-export：Feature trait + 全局工厂注册表。
 pub use feature::{Feature, FeatureError, Result};
+pub use registry::{create_feature, is_registered, register_feature, FeatureFactory};
