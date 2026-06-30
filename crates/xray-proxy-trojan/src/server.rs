@@ -34,7 +34,7 @@ pub struct TrojanServer {
     /// 用户验证器（共享）。
     validator: Arc<Validator>,
     /// 监听器（`start` 后有值）。
-    listener: Arc<Mutex<Option<TcpListener>>>,
+    listener: Arc<Mutex<Option<Arc<TcpListener>>>>,
 }
 
 impl TrojanServer {
@@ -76,7 +76,7 @@ impl InboundHandler for TrojanServer {
             .local_addr()
             .map_err(|e| InboundError::ListenError(format!("local_addr: {e}")))?;
         info!(tag = %self.tag, addr = %bound, "Trojan server started");
-        *self.listener.lock().await = Some(listener);
+        *self.listener.lock().await = Some(Arc::new(listener));
 
         // spawn accept loop
         let tag = self.tag.clone();
@@ -84,13 +84,15 @@ impl InboundHandler for TrojanServer {
         let listener_clone = self.listener.clone();
         tokio::spawn(async move {
             loop {
-                let listener_guard = listener_clone.lock().await;
-                let listener = match listener_guard.as_ref() {
-                    Some(l) => l,
-                    None => break,
+                // 修复死锁：先 clone Arc<TcpListener>，drop guard，再 accept
+                let listener = {
+                    let guard = listener_clone.lock().await;
+                    match guard.as_ref() {
+                        Some(l) => Arc::clone(l),
+                        None => break,
+                    }
                 };
                 let accept_result = listener.accept().await;
-                drop(listener_guard);
 
                 match accept_result {
                     Ok((mut stream, peer)) => {

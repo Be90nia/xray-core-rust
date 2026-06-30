@@ -31,7 +31,7 @@ use crate::protocol::{
 pub struct SocksServer {
     tag: String,
     config: ServerConfig,
-    listener: Arc<Mutex<Option<TcpListener>>>,
+    listener: Arc<Mutex<Option<Arc<TcpListener>>>>,
 }
 
 impl SocksServer {
@@ -72,7 +72,7 @@ impl InboundHandler for SocksServer {
             .local_addr()
             .map_err(|e| InboundError::ListenError(format!("local_addr: {e}")))?;
         info!(tag = %self.tag, addr = %bound, "SOCKS server started");
-        *self.listener.lock().await = Some(listener);
+        *self.listener.lock().await = Some(Arc::new(listener));
 
         // spawn accept loop
         let tag = self.tag.clone();
@@ -80,13 +80,15 @@ impl InboundHandler for SocksServer {
         let listener_clone = self.listener.clone();
         tokio::spawn(async move {
             loop {
-                let listener_guard = listener_clone.lock().await;
-                let listener = match listener_guard.as_ref() {
-                    Some(l) => l,
-                    None => break,
+                // 修复死锁：先 clone Arc<TcpListener>，drop guard，再 accept（不持锁期间 await）
+                let listener = {
+                    let guard = listener_clone.lock().await;
+                    match guard.as_ref() {
+                        Some(l) => Arc::clone(l),
+                        None => break,
+                    }
                 };
                 let accept_result = listener.accept().await;
-                drop(listener_guard);
 
                 match accept_result {
                     Ok((mut stream, peer)) => {
