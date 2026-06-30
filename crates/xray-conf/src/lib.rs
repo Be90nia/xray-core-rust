@@ -26,6 +26,7 @@
 //! assert_eq!(cfg.inbound_count(), 1);
 //! ```
 
+pub mod built;
 pub mod common;
 pub mod confloader;
 pub mod config;
@@ -37,6 +38,7 @@ pub mod yaml;
 
 // 顶层 re-export：常用类型与函数直接从 crate 根访问。
 pub use common::{Address, PortList, PortRange, StringList};
+pub use built::{BuiltConfig, BuiltEntry, BuiltInbound, BuiltOutbound};
 pub use config::{Config, InboundDetourConfig, MuxConfig, OutboundDetourConfig, SniffingConfig};
 pub use confloader::{
     load_file, load_file_with_format, load_reader, load_str, load_str_auto_detect,
