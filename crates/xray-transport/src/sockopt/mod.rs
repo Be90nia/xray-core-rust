@@ -70,6 +70,23 @@ pub fn apply_outbound_socket_options(socket: &Socket, opts: &SocketOptions) -> s
     Ok(())
 }
 
+/// 把 [`SocketOptions`] 应用到入站连接。对应 Go `applyInboundSocketOptions` 的
+/// 跨平台通用部分。
+///
+/// 与 [`apply_outbound_socket_options`] 的差异：入站连接默认禁用 keepalive
+///（Go 端 `lc.KeepAlive = -1`），仅在 [`SocketOptions`] 显式配置非零 idle 时启用。
+pub fn apply_inbound_socket_options(socket: &Socket, opts: &SocketOptions) -> std::io::Result<()> {
+    socket.set_nodelay(opts.tcp_nodelay)?;
+    if opts.tcp_keepalive_idle != Duration::ZERO {
+        socket.set_tcp_keepalive(
+            &socket2::TcpKeepalive::new()
+                .with_time(opts.tcp_keepalive_idle)
+                .with_interval(opts.tcp_keepalive_interval),
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
