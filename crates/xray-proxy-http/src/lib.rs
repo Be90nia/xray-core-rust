@@ -22,3 +22,4 @@ pub mod server;
 // 顶层 re-export。
 pub use config::{Account, ClientConfig, Header, ServerConfig};
 pub use error::{HttpProxyError, Result};
+pub use server::HttpServer;

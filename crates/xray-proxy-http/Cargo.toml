@@ -10,6 +10,11 @@ xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
 xray-buf = { path = "../xray-buf" }
 xray-proto = { path = "../xray-proto" }
+xray-transport = { path = "../xray-transport" }
+async-trait = "0.1"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
