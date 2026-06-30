@@ -395,14 +395,21 @@ impl DefaultDispatcher {
     ///
     /// **当前状态**：依赖 `pipe.Reader/Writer` 与 `outbound.Handler.Dispatch` 全链路，
     /// 主体留 TODO。返回 `Err(Other)` 表示未接入。
+    /// 分发入站连接。
+    ///
+    /// 对应 Go `(*DefaultDispatcher).Dispatch(ctx, destination) (*transport.Link, error)`。
+    ///
+    /// **当前状态**：依赖 pipe 创建 inbound/outbound link，主体留 TODO。
+    /// dispatch 的完整实现需要：1) 创建 pipe pair  2) 桥接 client conn ↔ pipe
+    /// 3) 调用 [`Self::dispatch_link`]  4) 返回 pipe 另一端给 inbound handler。
+    /// pipe pair 创建依赖 `xray_buf::pipe` 完整翻译，留待后续。
     pub fn dispatch(
         &self,
         _destination: &xray_common::net::destination::Destination,
         _sniffing_request: &SniffingRequest,
     ) -> Result<(), DispatcherError> {
-        // TODO: 接入 pipe 创建 inbound/outbound link + 嗅探循环 + routed_dispatch
         Err(DispatcherError::Other(
-            "dispatch not implemented; pipe/outbound integration pending".to_string(),
+            "dispatch not implemented; pipe creation pending".to_string(),
         ))
     }
 
@@ -410,17 +417,27 @@ impl DefaultDispatcher {
     ///
     /// 对应 Go `(*DefaultDispatcher).DispatchLink(ctx, dest, outbound) error`。
     ///
-    /// **当前状态**：同 [`Self::dispatch`]，主体留 TODO。
+    /// **实现**：获取默认 outbound handler → `handler.dispatch(link)` → spawn。
+    /// 切片1 不含 sniffing/routing，直接路由到默认 outbound。
     pub fn dispatch_link(
         &self,
         _destination: &xray_common::net::destination::Destination,
-        _outbound: xray_transport::link::Link,
+        outbound: xray_transport::link::Link,
         _sniffing_request: &SniffingRequest,
     ) -> Result<(), DispatcherError> {
-        // TODO: 接入 wrap_link + 嗅探循环 + routed_dispatch
-        Err(DispatcherError::Other(
-            "dispatch_link not implemented; pipe/outbound integration pending".to_string(),
-        ))
+        let ohm = self.ohm.as_ref().ok_or_else(|| {
+            DispatcherError::Other("no outbound handler manager registered".into())
+        })?;
+        let handler = ohm.get_default_handler().ok_or_else(|| {
+            DispatcherError::Other("no default outbound handler registered".into())
+        })?;
+        // sniffing + routing 留后续切片。
+        // DispatchHandler::dispatch 返回 PinFuture<()>（'static + Send），可直接 spawn。
+        let fut = handler.dispatch(outbound);
+        tokio::spawn(async move {
+            let _ = fut.await;
+        });
+        Ok(())
     }
 }
 
