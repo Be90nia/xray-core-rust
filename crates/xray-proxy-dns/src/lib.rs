@@ -8,7 +8,7 @@
 //! DNS 代理是 inbound 协议：接收 DNS 查询（UDP/TCP），按规则链匹配 qType + domain，
 //! 执行对应动作（Direct 转发 / Drop 丢弃 / Return 返回空 / Hijack 重写到指定上游）。
 //!
-//! ## 切片边界（P6-5 切片1）
+//! 切片边界（P6-5 切片1）
 //!
 //! 实现配置层 + [`config::DnsRule::match_q_type`] / [`config::DnsRule::apply`] 纯函数：
 //! - [`config::Config`] / [`config::DnsRuleConfig`] / [`config::RuleAction`] — 配置层 + prost 双向
@@ -18,8 +18,12 @@
 //! 上游转发（依赖 `features::dns::Client`）+ Handler::Init/Process + FakeDNS 集成。
 
 pub mod config;
+pub mod dns_message;
 pub mod error;
+pub mod handler;
 
 // 顶层 re-export。
 pub use config::{Config, DnsRule, DnsRuleConfig, RuleAction};
+pub use dns_message::{DnsHeader, DnsQuestion, build_dns_response, parse_dns_query};
 pub use error::{DnsProxyError, Result};
+pub use handler::{Handler, ProcessOutcome, decide_action};
