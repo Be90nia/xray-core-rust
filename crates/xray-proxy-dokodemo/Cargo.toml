@@ -11,5 +11,9 @@ xray-features = { path = "../xray-features" }
 xray-transport = { path = "../xray-transport" }
 xray-proto = { path = "../xray-proto" }
 thiserror = { workspace = true }
+async-trait = "0.1"
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
