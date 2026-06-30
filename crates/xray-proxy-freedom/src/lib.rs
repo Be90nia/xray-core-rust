@@ -10,6 +10,7 @@
 
 pub mod config;
 pub mod error;
+pub mod handler;
 
 pub use config::{
     Config, DestinationOverride, FinalRule, FinalRuleConfig, Fragment, Noise, Range,
@@ -17,3 +18,4 @@ pub use config::{
     get_default_rule_type,
 };
 pub use error::{FreedomError, Result};
+pub use handler::FreedomHandler;

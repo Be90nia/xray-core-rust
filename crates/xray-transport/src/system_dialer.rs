@@ -139,17 +139,20 @@ impl SystemDialer for DefaultSystemDialer {
 ///
 /// 用 [`OnceLock`] 延迟初始化（首次访问时构造 [`DefaultSystemDialer`]），
 /// [`RwLock`] 允许运行时通过 [`use_alternative_system_dialer`] 替换。
-static EFFECTIVE_SYSTEM_DIALER: OnceLock<RwLock<Box<dyn SystemDialer>>> = OnceLock::new();
+static EFFECTIVE_SYSTEM_DIALER: OnceLock<RwLock<Arc<dyn SystemDialer>>> = OnceLock::new();
 
-fn effective() -> &'static RwLock<Box<dyn SystemDialer>> {
-    EFFECTIVE_SYSTEM_DIALER.get_or_init(|| RwLock::new(Box::new(DefaultSystemDialer::new())))
+fn effective() -> &'static RwLock<Arc<dyn SystemDialer>> {
+    EFFECTIVE_SYSTEM_DIALER.get_or_init(|| RwLock::new(Arc::new(DefaultSystemDialer::new())))
 }
 
 /// 替换全局系统拨号器。对应 Go `UseAlternativeSystemDialer`。
 ///
 /// `None` 时重置为 [`DefaultSystemDialer`]。
 pub fn use_alternative_system_dialer(dialer: Option<Box<dyn SystemDialer>>) {
-    let new_dialer = dialer.unwrap_or_else(|| Box::new(DefaultSystemDialer::new()));
+    let new_dialer: Arc<dyn SystemDialer> = match dialer {
+        Some(b) => Arc::from(b),
+        None => Arc::new(DefaultSystemDialer::new()),
+    };
     *effective().write() = new_dialer;
 }
 
@@ -194,9 +197,13 @@ pub async fn dial_system(
     destination: &Destination,
     sockopt: &SocketOptions,
 ) -> io::Result<Box<dyn Connection>> {
-    let dialer_ref = effective().read();
-    // ponytail: src=None（切片2 从 session.Outbound 获取 Gateway）。
-    dialer_ref.dial(None, destination, sockopt).await
+    // ponytail: clone Arc 后 drop guard，避免 RwLockReadGuard 跨 await 点
+    // （否则 future 不是 Send，无法用于 async_trait 的 OutboundHandler::dial）。
+    let dialer = {
+        let guard = effective().read();
+        Arc::clone(&*guard)
+    };
+    dialer.dial(None, destination, sockopt).await
 }
 
 // ===== 辅助函数 =====
