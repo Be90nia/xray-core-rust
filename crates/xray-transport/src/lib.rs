@@ -20,6 +20,7 @@
 //! 参考：Go 版本位于 `E:\Projcet\Xray-core\transport\`。
 
 pub mod link;
+pub mod bridge;
 pub mod connection;
 pub mod listener;
 pub mod dialer;
@@ -40,3 +41,6 @@ pub mod happy_eyeballs;
 pub mod browser_dialer;
 pub mod tagged;
 pub mod memory_settings;
+
+// 顶层 re-export。
+pub use bridge::{bridge_connections, copy_one_way};
