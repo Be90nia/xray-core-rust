@@ -7,3 +7,4 @@ pub mod writer;
 pub mod readv;
 pub mod alloc;
 pub mod timeout;
+pub mod pipe;
