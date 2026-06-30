@@ -20,6 +20,8 @@ serde = { workspace = true }
 prost = { workspace = true }
 
 xray-proto = { path = "../xray-proto" }
+xray-transport = { path = "../xray-transport" }
+async-trait = "0.1"
 # - sha2：SHA224(password) hex hash 用户验证
 sha2 = "0.10"
 # - hex：hash 转十六进制字符串（Trojan 协议头固定 hex 表示）
@@ -30,3 +32,6 @@ hmac = "0.12"
 crc = "2"
 # - rand：随机 nonce / session id
 rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

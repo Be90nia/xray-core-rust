@@ -30,3 +30,4 @@ pub use protocol::{
     write_request_header, write_udp_packet, Network, COMMAND_TCP, COMMAND_UDP, CRLF, MAX_LENGTH,
 };
 pub use validator::{MemoryUser, Validator};
+pub use server::{TrojanServer, trojan_server_handshake};
