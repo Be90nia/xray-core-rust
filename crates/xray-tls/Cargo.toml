@@ -14,5 +14,15 @@ sha2 = "0.10"
 hex = "0.4"
 subtle = "2"
 
-[dev-dependencies]
+# 标准 rustls TLS 握手 (uTLS 指纹伪装待 REALITY 任务再评估 watfaq-rustls git 依赖)
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+webpki-roots = { workspace = true }
+rustls-pki-types = { workspace = true }
+
+# 日志 (u_client fallback log)
+tracing = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+rcgen = "0.13"

@@ -3,15 +3,13 @@
 //! 翻译自 Go `transport/internet/tls/tls.go` 中的三张指纹表与
 //! `GetFingerprint` 函数。
 //!
-//! # 现状（重要）
-//! **实际 uTLS 握手在 Rust 端尚未实现**。Rust 生态目前没有
-//! `github.com/refraction-networking/utls` 的成熟等价品（需要字节级
-//! ClientHello 控制、GREASE、扩展顺序、TLS 1.3 key_share 调整等）。
+//! # 现状
+//! **握手走标准 rustls**。`Fingerprint` enum 现在作为标记传递——`u_client` 工厂
+//! 当前 fallback 到标准 rustls 握手（fingerprint 仅作 log），真实 uTLS ClientHello 指纹
+//! 伪装待 REALITY 任务再评估 watfaq-rustls git 依赖。
 //!
-//! 本模块只翻译「配置层指纹名 → 内部枚举」的纯路由逻辑，让上层
-//! （dispatcher/dns/router/proxyman）能基于 `Fingerprint` 类型工作；
-//! 实际握手走 [`crate::utls::ConnInterface`] trait，待生态成熟或自研
-//! 后再接。
+//! 本模块翻译「配置层指纹名 → 内部枚举」的纯路由逻辑，让上层
+//! （dispatcher/dns/router/proxyman）能基于 `Fingerprint` 类型工作。
 
 use crate::error::TlsError;
 

@@ -53,11 +53,10 @@ pub enum TlsError {
     #[error("unknown uTLS fingerprint: {0}")]
     UnknownFingerprint(String),
 
-    /// uTLS Rust 端未实现——预留变体。
+    /// uTLS 指纹伪装未接真实库——预留变体。
     ///
-    /// 当前 `xray-tls` 不引入真实 uTLS 握手（Rust 生态尚无 uTLS 等价品，
-    /// 见 lib.rs 顶部文档说明）。上层走 `utls::ConnInterface` trait，
-    /// 实际握手等生态成熟或自研后再接。
+    /// `u_client` 工厂当前 fallback 到标准 rustls 握手，
+    /// 不会返回本错误。真实 uTLS 待 REALITY 任务再接 watfaq-rustls。
     #[error("uTLS handshake not yet implemented in Rust")]
     UtlsNotImplemented,
 }
