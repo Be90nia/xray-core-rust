@@ -2,20 +2,29 @@
 //!
 //! 对应 Go `main/run.go`。
 //!
-//! ## 切片边界（P7-3 切片1）
+//! ## 切片边界
 //!
-//! 实现配置文件查找 + 加载（`-c`/`-confdir`/工作目录默认/`stdin:`）+ `-test`
-//! 校验模式。实际实例启动依赖 `xray_core::Instance::new(config)` 完整路径
-//! （P7-2 切片2），切片1 在 `start_instance` 处返回 [`CliError::Unimplemented`]。
+//! - 切片1：配置查找 + `-c`/`-confdir`/工作目录默认/`stdin:` + `-test`/`-dump`
+//! - 切片2：完整启动链路（`load → build → start_from_built → wait_for_signal → close`）
+//! - 切片3：多配置合并、`stdin:` 流式读取、工具子命令（`uuid`/`x25519`/`cert`/`hash`）
 //!
-//! ## 配置查找顺序（与 Go 一致）
+//! ## 信号处理
 //!
-//! 1. `-c`/`-config` 显式指定的文件（可多个）
-//! 2. `-confdir` 目录中按扩展名过滤的配置文件
-//! 3. 工作目录下的 `config.{json,jsonc,toml,yaml,yml}`
-//! 4. 最后回退到 `stdin:`
+//! 对应 Go `main/run.go:100-104`：
+//!
+//! ```go
+//! osSignals := make(chan os.Signal, 1)
+//! signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM)
+//! <-osSignals
+//! ```
+//!
+//! Rust 端用 `tokio::signal::ctrl_c()` +（unix）`SIGTERM` handler；信号触发后调
+//! [`close_if_sole_owner`] 优雅关闭 Instance。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
 
 use clap::Args;
 
@@ -60,9 +69,8 @@ const DEFAULT_CONFIG_FILES: &[&str] = &[
 
 /// 执行 `xray run` 命令。
 ///
-/// 切片1：配置查找 + 加载 + `-test`/`-dump` 模式可用；
-/// 实际实例启动返回 [`CliError::Unimplemented`]（依赖 P7-2 切片2 的完整
-/// `Instance::new(config)`）。
+/// 切片2 完整启动链路：`load_first_config` → `Config::build` → `start_from_built`
+/// → 等待 SIGINT/SIGTERM → 优雅 `close`。
 pub fn execute(args: RunArgs) -> Result<()> {
     if args.dump {
         return dump_config(&args);
@@ -84,16 +92,85 @@ pub fn execute(args: RunArgs) -> Result<()> {
         .build()
         .map_err(|e| CliError::StartFailed(format!("config build failed: {e}")))?;
 
-    // 切片2 接入 xray_core::start_from_built 完整启动路径。
-    // 当前阶段：FeatureFactory 注册表为空，所以 apps 列表中的 log/dns/router 等
-    // 都会被跳过（warn 日志），Instance 以 0 features 启动成功。
-    // 待 c2v (proxyman) + 各 xray-app-* 切片2 任务注册真实 factory 后完整生效。
-    let _instance = xray_core::start_from_built(&built)
+    // `-test` 模式：仅验证配置可加载 + build，不启动服务。对应 Go `main/run.go:85-88`。
+    if args.test {
+        println!("Configuration OK.");
+        return Ok(());
+    }
+
+    // 切片2：start_from_built 内部完成 Instance::new_from_built + start；
+    // FeatureFactory 注册表当前为空，apps 列表中的 log/dns/router 等会被跳过（warn），
+    // Instance 以 0 features 启动成功；待各 app crate 切片2 注册真实 factory 后完整生效。
+    let instance = xray_core::start_from_built(&built)
         .map_err(|e| CliError::StartFailed(e.to_string()))?;
 
-    // 切片3: 等待 SIGINT/SIGTERM 信号优雅关闭，当前直接返回 Ok。
-    tracing::info!("xray instance started, waiting for stop signal (TODO: signal handler)");
+    // 切片2：等待 Ctrl-C / SIGTERM 信号，对应 Go `main/run.go:100-104`。
+    // main 是同步 fn，构造一次性 tokio runtime 仅用于 await 信号 Future。
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| CliError::StartFailed(format!("tokio runtime init failed: {e}")))?;
+    rt.block_on(wait_for_signal());
+    // 给未完成任务 5 秒 grace period，避免硬中断切断 in-flight IO。
+    rt.shutdown_timeout(Duration::from_secs(5));
+
+    // 优雅关闭 Instance（按注册逆序 close 所有 features）。
+    close_if_sole_owner(instance)?;
+    tracing::info!("xray instance shutdown");
     Ok(())
+}
+
+/// 等待 SIGINT (Ctrl-C) 或（unix）SIGTERM 信号。
+///
+/// 对应 Go `main/run.go:100-104` 的 `signal.Notify` + `<-osSignals`。
+/// Windows 等价于 Ctrl-C；Unix 额外监听 SIGTERM（systemd 默认 stop 信号）。
+async fn wait_for_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %e, "ctrl_c handler error");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut s) => {
+                let _ = s.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "install SIGTERM handler failed; falling back to ctrl_c only");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("received Ctrl-C, shutting down"),
+        _ = terminate => tracing::info!("received SIGTERM, shutting down"),
+    }
+}
+
+/// 优雅关闭 [`Instance`]：若 `Arc<Instance>` 是唯一持有者则调用 `Instance::close`，
+/// 否则记录 warn 并返回 Ok（多持有者场景留待后续按需扩展）。
+///
+/// 暴露为 `pub` 以便单元测试覆盖两条路径（成功 close / 多持有者跳过）。
+pub fn close_if_sole_owner(instance: Arc<xray_core::Instance>) -> Result<()> {
+    match Arc::try_unwrap(instance) {
+        Ok(mut inst) => inst
+            .close()
+            .map_err(|e| CliError::StartFailed(format!("instance close failed: {e}"))),
+        Err(arc) => {
+            tracing::warn!(
+                strong_count = Arc::strong_count(&arc),
+                "Arc<Instance> has multiple holders; skipping graceful close"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// 查找配置文件。对应 Go `getConfigFilePath`。
@@ -191,20 +268,6 @@ fn parse_format_name(name: &str) -> Option<xray_conf::Format> {
     }
 }
 
-/// 加载配置 + 构造 + 启动 Instance。
-///
-/// 切片2 接入 `xray_core::start_from_built` 完整链路。
-fn start_instance(config_files: &[PathBuf]) -> Result<()> {
-    let config = load_first_config(config_files, "auto")?;
-    let built = config
-        .build()
-        .map_err(|e| CliError::StartFailed(format!("config build failed: {e}")))?;
-    let _instance = xray_core::start_from_built(&built)
-        .map_err(|e| CliError::StartFailed(e.to_string()))?;
-    tracing::info!("xray instance started (start_instance)");
-    Ok(())
-}
-
 /// `-dump` 模式：输出合并后的配置。切片1 仅输出首个配置文件的原始内容。
 fn dump_config(args: &RunArgs) -> Result<()> {
     let files = resolve_config_files(args)?;
@@ -290,12 +353,20 @@ mod tests {
     }
 
     #[test]
-    fn start_instance_returns_unimplemented() {
-        // 切片2 后：start_instance 不再返回 Unimplemented，而是返回 StartFailed
-        // （因当前 registry 无 factory），或 Ok（空配置）。
-        // 此测试验证不 panic 即可。
-        let files = vec![PathBuf::from("/etc/config.json")];
-        let _ = start_instance(&files);
+    fn close_if_sole_owner_succeeds_with_single_holder() {
+        // 空 Instance 直接 close：Instance::close 检测 running=false 立即返回 Ok。
+        let instance = Arc::new(xray_core::Instance::new());
+        let result = close_if_sole_owner(instance);
+        assert!(result.is_ok(), "sole owner close should succeed: {result:?}");
+    }
+
+    #[test]
+    fn close_if_sole_owner_skips_with_multiple_holders() {
+        // 多持有者 → 跳过 graceful close，返回 Ok（warn 已记）。
+        let instance = Arc::new(xray_core::Instance::new());
+        let _extra_holder = Arc::clone(&instance);
+        let result = close_if_sole_owner(instance);
+        assert!(result.is_ok(), "multi-holder should skip and return Ok: {result:?}");
     }
 
     #[test]
