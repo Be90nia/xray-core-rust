@@ -9,6 +9,11 @@ rust-version.workspace = true
 xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
 xray-proto = { path = "../xray-proto" }
+xray-transport = { path = "../xray-transport" }
+xray-app-dispatcher = { path = "../xray-app-dispatcher" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+xray-buf = { path = "../xray-buf" }
