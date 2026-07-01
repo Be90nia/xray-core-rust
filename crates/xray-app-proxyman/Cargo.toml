@@ -15,3 +15,6 @@ tracing = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true }
 ipnet = "2"
+
+[dev-dependencies]
+xray-proto = { path = "../xray-proto" }
