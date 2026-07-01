@@ -14,11 +14,15 @@
 //!
 //! ## SysStats 数据来源
 //!
-//! Go 用 `runtime.ReadMemStats` + `runtime.NumGoroutine`，Rust 等价物：
+//! Go 用 `runtime.ReadMemStats` + `runtime.NumGoroutine`，Rust 等价：
 //! - **uptime**: `Instant::now() - start_time`
-//! - **thread/goroutine 数 / GC / mem**: 无直接 std 等价，留 [`SysStatsProvider`]
-//!   trait 由上层注入（如 jemalloc 统计、tokio runtime 句柄等）
-//! - 默认实现 [`DefaultSysStatsProvider`] 仅填 uptime，其余 0
+//! - **num_threads (逻辑核心)**: `std::thread::available_parallelism` 纯 std 跨平台
+//! - **mem/sys/mallocs/frees**: sysinfo/jemalloc 未接入（Windows Defender 拦截
+//!   ntapi build script，需用户加 target/ 排除路径后才可引入 sysinfo）；
+//!   需精确数据时通过 [`SysStatsProvider`] trait 注入自定义实现
+//! - **num_gc/pause_total_ns**: Rust 无 GC，恒为 0
+//! - [`DefaultSysStatsProvider`]：num_threads=1（零依赖、零 syscall、轻量级）
+//! - [`StdParallelismSysStatsProvider`]：num_threads=逻辑 CPU 数（纯 std、推荐）
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -168,6 +172,62 @@ impl SysStatsProvider for DefaultSysStatsProvider {
         SysStats {
             uptime_seconds: u32::try_from(uptime).unwrap_or(u32::MAX),
             num_threads: 1, // Rust 程序至少主线程
+            ..SysStats::default()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StdParallelismSysStatsProvider（纯 std 实现，无额外依赖）
+// ---------------------------------------------------------------------------
+
+/// 基于 [`std::thread::available_parallelism`] 的轻量级 SysStatsProvider。
+///
+/// 仅提供 uptime + 逻辑核心数（作为 num_threads 近似）。
+/// 内存/GC 字段恒为 0——这些需要 sysinfo 或 jemalloc 接入（因 Windows Defender
+/// 拦截 ntapi/rayon-core build script，sysinfo 推迟，需用户先加 Defender 排除路径）。
+///
+/// ponytail: 不引入新依赖即完成基本功能，待生产需求明确后再接入 sysinfo/jemalloc。
+pub struct StdParallelismSysStatsProvider {
+    start_time: Instant,
+    logical_cpus: u32,
+}
+
+impl StdParallelismSysStatsProvider {
+    /// 新建。`available_parallelism` 失败时 fallback 到 1。
+    #[must_use]
+    pub fn new() -> Self {
+        let logical_cpus = std::thread::available_parallelism()
+            .map(|n| u32::try_from(n.get()).unwrap_or(u32::MAX))
+            .unwrap_or(1);
+        Self {
+            start_time: Instant::now(),
+            logical_cpus,
+        }
+    }
+
+    /// 显式指定起始时刻（测试用）。
+    #[must_use]
+    pub fn with_start(start_time: Instant) -> Self {
+        let logical_cpus = std::thread::available_parallelism()
+            .map(|n| u32::try_from(n.get()).unwrap_or(u32::MAX))
+            .unwrap_or(1);
+        Self { start_time, logical_cpus }
+    }
+}
+
+impl Default for StdParallelismSysStatsProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SysStatsProvider for StdParallelismSysStatsProvider {
+    fn snapshot(&self) -> SysStats {
+        let uptime = self.start_time.elapsed().as_secs();
+        SysStats {
+            uptime_seconds: u32::try_from(uptime).unwrap_or(u32::MAX),
+            num_threads: self.logical_cpus,
             ..SysStats::default()
         }
     }
@@ -842,6 +902,43 @@ mod tests {
         let s = svc.get_sys_stats().unwrap();
         assert_eq!(s.uptime_seconds, 999);
         assert_eq!(s.num_gc, 5);
+    }
+
+    // --- StdParallelismSysStatsProvider ---
+
+    #[test]
+    fn std_parallelism_provider_default_constructible() {
+        let p = StdParallelismSysStatsProvider::default();
+        let s = p.snapshot();
+        assert!(s.num_threads >= 1);
+    }
+
+    #[test]
+    fn std_parallelism_provider_with_start_in_past() {
+        let start = Instant::now() - std::time::Duration::from_secs(10);
+        let p = StdParallelismSysStatsProvider::with_start(start);
+        let s = p.snapshot();
+        assert!(s.uptime_seconds >= 10);
+        assert!(s.num_threads >= 1);
+    }
+
+    #[test]
+    fn std_parallelism_provider_mem_fields_zero() {
+        // 纯 std 无 mem 统计能力，这些字段应恒为 0
+        let p = StdParallelismSysStatsProvider::new();
+        let s = p.snapshot();
+        assert_eq!(s.alloc_bytes, 0);
+        assert_eq!(s.sys_bytes, 0);
+        assert_eq!(s.num_gc, 0);
+        assert_eq!(s.mallocs, 0);
+    }
+
+    #[test]
+    fn std_parallelism_provider_injectable_into_service() {
+        let arc: Arc<dyn SysStatsProvider> = Arc::new(StdParallelismSysStatsProvider::new());
+        let svc = DefaultStatsService::with_sys_stats(Arc::new(Manager::new()), arc);
+        let s = svc.get_sys_stats().unwrap();
+        assert!(s.num_threads >= 1);
     }
 
     // --- Error display ---

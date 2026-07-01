@@ -13,8 +13,10 @@
 //! - **业务核心**：Counter/OnlineMap/Channel/Manager 实现，完全独立可测
 //! - **gRPC server 注册留 trait**：[`command::StatsService`] trait + [`command::DefaultStatsService`]
 //!   编排类，不引入 tonic（由 `xray-app-commander` 注册）
-//! - **SysStatsProvider 注入**：Rust 无 `runtime.MemStats` 等价，留 trait 由上层注入
-//!   jemalloc / tokio 统计实现（[`command::DefaultSysStatsProvider`] 仅填 uptime）
+//! - **SysStatsProvider 注入**：之前误判「Rust 无 runtime.MemStats 等价」，实际可用
+//!   sysinfo crate（被 Windows Defender 拦截未接入）或 jemalloc 实现。
+//!   默认提供两个实现：[`command::DefaultSysStatsProvider`] (num_threads=1) 与
+//!   [`command::StdParallelismSysStatsProvider`] (num_threads=逻辑 CPU 数，纯 std)
 //!
 //! ## 关键决策
 //!
@@ -42,8 +44,8 @@ pub use channel::{ChannelConfig, StatsChannel};
 pub use command::{
     DefaultStatsService, DefaultSysStatsProvider, GetAllOnlineUsersResponse, GetStatsRequest,
     GetStatsResponse, GetStatsOnlineIpListResponse, GetUsersStatsRequest, GetUsersStatsResponse,
-    OnlineIpEntry, QueryStatsRequest, QueryStatsResponse, Stat, StatsCommandError, StatsService,
-    SysStats, SysStatsProvider, UserStat,
+    OnlineIpEntry, QueryStatsRequest, QueryStatsResponse, Stat, StdParallelismSysStatsProvider,
+    StatsCommandError, StatsService, SysStats, SysStatsProvider, UserStat,
 };
 pub use counter::Counter;
 pub use error::StatsError;
