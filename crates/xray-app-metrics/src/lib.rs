@@ -25,9 +25,9 @@ pub mod outbound;
 pub use config::MetricsConfig;
 pub use error::{at_error, at_warning, MetricsError};
 pub use metrics::{
-    aggregate_counters, parse_counter_name, MetricsHandler, MetricsHttpServer,
-    NoopHttpServer, ObservationCollector, ObservationEntry, ObservationSnapshot,
-    OutboundRegistrar, RecordingOutboundRegistrar, StatsCollector, StatsSnapshot,
-    TrafficCount,
+    aggregate_counters, format_prometheus, parse_counter_name, MetricsHandler,
+    MetricsHttpServer, NoopHttpServer, ObservationCollector, ObservationEntry,
+    ObservationSnapshot, OutboundRegistrar, RecordingOutboundRegistrar, StatsCollector,
+    StatsSnapshot, TokioHttpServer, TrafficCount,
 };
 pub use outbound::{BoxedConn, Outbound, OutboundListener};

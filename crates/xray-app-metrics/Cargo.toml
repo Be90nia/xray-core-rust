@@ -11,5 +11,5 @@ xray-features = { path = "../xray-features" }
 xray-proto = { path = "../xray-proto" }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
-tokio = { workspace = true, features = ["sync", "rt"] }
+tokio = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "net", "io-util", "macros", "time"] }
 tracing = { workspace = true }

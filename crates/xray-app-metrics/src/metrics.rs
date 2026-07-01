@@ -277,6 +277,227 @@ impl MetricsHandler {
     }
 }
 
+/// Prometheus 指标暴露格式（exposition format）。
+///
+/// 把 [`StatsSnapshot`] 与可选的 [`ObservationSnapshot`] 序列化为
+/// Prometheus 文本格式（每个指标带 HELP/TYPE 头 + 标签行）。
+///
+/// 仅暴露 counter 类型指标，对应 Go 版 `expvar.Publish("stats", ...)` 的
+/// 流量统计；observation 数据用 gauge 类型（与 Prometheus 习惯一致）。
+///
+/// 标签设计：`type`（inbound/outbound/user）+ `tag`（具体 handler 标签）。
+pub fn format_prometheus(stats: &StatsSnapshot, obs: Option<&ObservationSnapshot>) -> String {
+    let mut out = String::with_capacity(256);
+    out.push_str("# HELP xray_traffic_bytes Total traffic in bytes by direction\n");
+    out.push_str("# TYPE xray_traffic_bytes counter\n");
+    emit_traffic(&mut out, "inbound", &stats.inbound);
+    emit_traffic(&mut out, "outbound", &stats.outbound);
+    emit_traffic(&mut out, "user", &stats.user);
+    if let Some(obs) = obs {
+        out.push_str("\n# HELP xray_observation_extra Per-outbound observation key/value pairs\n");
+        out.push_str("# TYPE xray_observation_extra gauge\n");
+        for entry in &obs.entries {
+            for (k, v) in &entry.extra {
+                out.push_str(&format!(
+                    "xray_observation_extra{{outbound=\"{}\",key=\"{}\"}} {}\n",
+                    escape_label(entry.outbound_tag.as_str()),
+                    escape_label(k.as_str()),
+                    escape_value(v.as_str()),
+                ));
+            }
+        }
+    }
+    out
+}
+
+fn emit_traffic<'a, I>(out: &mut String, type_name: &str, iter: I)
+where
+    I: IntoIterator<Item = (&'a String, &'a TrafficCount)>,
+{
+    for (tag, count) in iter {
+        if count.uplink > 0 {
+            out.push_str(&format!(
+                "xray_traffic_bytes{{type=\"{}\",tag=\"{}\",direction=\"uplink\"}} {}\n",
+                type_name,
+                escape_label(tag.as_str()),
+                count.uplink
+            ));
+        }
+        if count.downlink > 0 {
+            out.push_str(&format!(
+                "xray_traffic_bytes{{type=\"{}\",tag=\"{}\",direction=\"downlink\"}} {}\n",
+                type_name,
+                escape_label(tag.as_str()),
+                count.downlink
+            ));
+        }
+    }
+}
+
+/// 转义 Prometheus label 值：`\`、`\"`、`\n` 按 Prometheus 规范转义。
+fn escape_label(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// 转义 Prometheus 指标值（非引号/反斜杠/换行字符直接保留）。
+fn escape_value(s: &str) -> String {
+    escape_label(s)
+}
+
+/// 基于 tokio 的最小 Prometheus HTTP server 实现 [`MetricsHttpServer`]。
+///
+/// 设计目标：验收 `curl /metrics` 拿到 Prometheus exposition format 文本响应。
+/// 不使用 hyper/axum 以避免额外依赖（ponytail ladder rung 4：tokio 已提供所需原语）。
+///
+/// ## 行为
+/// - `start_http_listen`: 绑定 `listen` 地址，spawn accept loop，
+///   每个 conn task 解析请求行后返回 `200 OK` + Prometheus 文本。
+///   仅处理 `GET /metrics`；其他路径返回 `404 Not Found`。
+/// - `serve_outbound`: 当前 stub（仅 log），真实实现需等 dispatcher 切片3
+///   把 OutboundListener.accept 桥接到 tokio task。
+///
+/// ## 优雅关闭
+/// `TokioHttpServer::shutdown()` 通过 Notify 唤醒所有 task，等待 5s 超时。
+/// 未显式 shutdown 时随 tokio runtime drop 自动释放。
+pub struct TokioHttpServer {
+    inner: Arc<TokioHttpServerInner>,
+}
+
+struct TokioHttpServerInner {
+    shutdown: Arc<tokio::sync::Notify>,
+    join_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl TokioHttpServer {
+    /// 创建一个新的 TokioHttpServer，未启动任何 listener。
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(TokioHttpServerInner {
+                shutdown: Arc::new(tokio::sync::Notify::new()),
+                join_handles: Mutex::new(Vec::new()),
+            }),
+        }
+    }
+
+    /// 优雅关闭：notify + 等待所有 task 退出（超时 5s/task）。
+    pub async fn shutdown(&self) {
+        self.inner.shutdown.notify_waiters();
+        let handles: Vec<_> = self.inner.join_handles.lock().drain(..).collect();
+        let timeout = std::time::Duration::from_secs(5);
+        for h in handles {
+            let _ = tokio::time::timeout(timeout, h).await;
+        }
+    }
+}
+
+impl Default for TokioHttpServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MetricsHttpServer for TokioHttpServer {
+    fn start_http_listen(
+        &self,
+        listen: &str,
+        stats: Arc<dyn StatsCollector>,
+        obs: Option<Arc<dyn ObservationCollector>>,
+    ) -> Result<(), MetricsError> {
+        // trait 是 sync，但 tokio::TcpListener::bind 是 async。
+        // 用 std::net::TcpListener::bind (sync) + set_nonblocking + tokio::net::TcpListener::from_std 转换。
+        let std_listener = std::net::TcpListener::bind(listen)
+            .map_err(|e| MetricsError::ListenInvalid(format!("bind {listen}: {e}")))?;
+        std_listener
+            .set_nonblocking(true)
+            .map_err(|e| MetricsError::ListenInvalid(format!("set_nonblocking: {e}")))?;
+        let listener = tokio::net::TcpListener::from_std(std_listener)
+            .map_err(|e| MetricsError::ListenInvalid(format!("from_std: {e}")))?;
+        let shutdown = self.inner.shutdown.clone();
+        let inner = self.inner.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.notified() => break,
+                    accept = listener.accept() => {
+                        let Ok((stream, _)) = accept else { continue; };
+                        let stats = stats.clone();
+                        let obs = obs.clone();
+                        let shutdown = shutdown.clone();
+                        let h = tokio::spawn(serve_one(stream, stats, obs, shutdown));
+                        inner.join_handles.lock().push(h);
+                    }
+                }
+            }
+        });
+        self.inner.join_handles.lock().push(handle);
+        Ok(())
+    }
+
+    fn serve_outbound(
+        &self,
+        _outbound: Arc<Outbound>,
+        _stats: Arc<dyn StatsCollector>,
+        _obs: Option<Arc<dyn ObservationCollector>>,
+    ) -> Result<(), MetricsError> {
+        // 切片2 stub：完整实现需要桥接 OutboundListener.accept（同步 Condvar）到 tokio，
+        // 推迟到 dispatcher 切片3 outbound 路径完成后再做。
+        tracing::info!(
+            target: "xray_app_metrics",
+            "TokioHttpServer::serve_outbound: stub (postponed to dispatcher slice3)"
+        );
+        Ok(())
+    }
+}
+
+/// 处理单个 HTTP/1.1 连接：解析请求行，返回 `/metrics` 响应或 404。
+async fn serve_one(
+    mut stream: tokio::net::TcpStream,
+    stats: Arc<dyn StatsCollector>,
+    obs: Option<Arc<dyn ObservationCollector>>,
+    shutdown: Arc<tokio::sync::Notify>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = [0u8; 1024];
+    let body: &[u8] = tokio::select! {
+        biased;
+        _ = shutdown.notified() => return,
+        r = stream.read(&mut buf) => match r {
+            Ok(0) | Err(_) => return,
+            Ok(n) => &buf[..n],
+        },
+    };
+    let request_line = body
+        .split(|&b| b == b'\n')
+        .next()
+        .unwrap_or(&[]);
+    let is_metrics = request_line.starts_with(b"GET /metrics ");
+    let response = if is_metrics {
+        let snapshot = stats.collect();
+        let obs_snapshot = obs.as_ref().and_then(|o| o.collect());
+        let body = format_prometheus(&snapshot, obs_snapshot.as_ref());
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body,
+        )
+    } else {
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+    };
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,5 +763,67 @@ mod tests {
         _assert_send_sync::<Arc<dyn StatsCollector>>();
         _assert_send_sync::<Arc<dyn ObservationCollector>>();
         _assert_send_sync::<Arc<Outbound>>();
+    }
+
+    // ===== format_prometheus 测试 =====
+
+    #[test]
+    fn format_prometheus_empty_stats_returns_only_headers() {
+        let stats = StatsSnapshot::default();
+        let out = format_prometheus(&stats, None);
+        assert!(out.contains("# HELP xray_traffic_bytes"));
+        assert!(out.contains("# TYPE xray_traffic_bytes counter"));
+        assert!(!out.contains("xray_traffic_bytes{"));
+    }
+
+    #[test]
+    fn format_prometheus_includes_nonzero_entries() {
+        let mut stats = StatsSnapshot::default();
+        stats.inbound.insert(
+            "tag_a".into(),
+            TrafficCount { uplink: 100, downlink: 0 },
+        );
+        stats.outbound.insert(
+            "out_x".into(),
+            TrafficCount { uplink: 0, downlink: 200 },
+        );
+        let out = format_prometheus(&stats, None);
+        assert!(out.contains("xray_traffic_bytes{type=\"inbound\",tag=\"tag_a\",direction=\"uplink\"} 100"));
+        assert!(out.contains("xray_traffic_bytes{type=\"outbound\",tag=\"out_x\",direction=\"downlink\"} 200"));
+        // uplink=0 / downlink=0 不输出
+        assert!(!out.contains("direction=\"downlink\"} 0\n"));
+    }
+
+    #[test]
+    fn format_prometheus_escapes_special_chars_in_tag() {
+        let mut stats = StatsSnapshot::default();
+        stats.user.insert(
+            "a\"b\\c\n".into(),
+            TrafficCount { uplink: 1, downlink: 0 },
+        );
+        let out = format_prometheus(&stats, None);
+        // 转义后应为 a\\\"b\\\\c\\n（前后会包双引号）
+        assert!(out.contains("tag=\"a\\\"b\\\\c\\n\""));
+    }
+
+    #[test]
+    fn format_prometheus_emits_observation_when_provided() {
+        let stats = StatsSnapshot::default();
+        let mut obs = ObservationSnapshot::default();
+        obs.entries.push(ObservationEntry {
+            outbound_tag: "out1".into(),
+            extra: vec![("alive".into(), "true".into()), ("delay".into(), "42".into())],
+        });
+        let out = format_prometheus(&stats, Some(&obs));
+        assert!(out.contains("# TYPE xray_observation_extra gauge"));
+        assert!(out.contains("xray_observation_extra{outbound=\"out1\",key=\"alive\"} true"));
+        assert!(out.contains("xray_observation_extra{outbound=\"out1\",key=\"delay\"} 42"));
+    }
+
+    #[test]
+    fn format_prometheus_skips_observation_section_when_none() {
+        let stats = StatsSnapshot::default();
+        let out = format_prometheus(&stats, None);
+        assert!(!out.contains("xray_observation_extra"));
     }
 }
