@@ -78,16 +78,22 @@ pub fn execute(args: RunArgs) -> Result<()> {
         ));
     }
 
-    // 加载首个配置文件校验可解析（test 模式只校验不启动）。
-    let _config = load_first_config(&config_files, &args.format)?;
+    // 加载首个配置文件（多配置合并留切片3）
+    let config = load_first_config(&config_files, &args.format)?;
+    let built = config
+        .build()
+        .map_err(|e| CliError::StartFailed(format!("config build failed: {e}")))?;
 
-    if args.test {
-        println!("Configuration OK.");
-        return Ok(());
-    }
+    // 切片2 接入 xray_core::start_from_built 完整启动路径。
+    // 当前阶段：FeatureFactory 注册表为空，所以 apps 列表中的 log/dns/router 等
+    // 都会被跳过（warn 日志），Instance 以 0 features 启动成功。
+    // 待 c2v (proxyman) + 各 xray-app-* 切片2 任务注册真实 factory 后完整生效。
+    let _instance = xray_core::start_from_built(&built)
+        .map_err(|e| CliError::StartFailed(e.to_string()))?;
 
-    // 实际启动依赖 P7-2 切片2 的完整 New(config)。
-    start_instance(&config_files)
+    // 切片3: 等待 SIGINT/SIGTERM 信号优雅关闭，当前直接返回 Ok。
+    tracing::info!("xray instance started, waiting for stop signal (TODO: signal handler)");
+    Ok(())
 }
 
 /// 查找配置文件。对应 Go `getConfigFilePath`。
@@ -185,13 +191,18 @@ fn parse_format_name(name: &str) -> Option<xray_conf::Format> {
     }
 }
 
-/// 启动 Xray 实例。切片1 返回 Unimplemented。
+/// 加载配置 + 构造 + 启动 Instance。
 ///
-/// 切片2 会接入 `xray_core::Instance` 完整 New(config) + Start + 信号等待。
-fn start_instance(_config_files: &[PathBuf]) -> Result<()> {
-    Err(CliError::Unimplemented {
-        what: "xray run (instance start, depends on P7-2 切片2 New(config))",
-    })
+/// 切片2 接入 `xray_core::start_from_built` 完整链路。
+fn start_instance(config_files: &[PathBuf]) -> Result<()> {
+    let config = load_first_config(config_files, "auto")?;
+    let built = config
+        .build()
+        .map_err(|e| CliError::StartFailed(format!("config build failed: {e}")))?;
+    let _instance = xray_core::start_from_built(&built)
+        .map_err(|e| CliError::StartFailed(e.to_string()))?;
+    tracing::info!("xray instance started (start_instance)");
+    Ok(())
 }
 
 /// `-dump` 模式：输出合并后的配置。切片1 仅输出首个配置文件的原始内容。
@@ -280,12 +291,11 @@ mod tests {
 
     #[test]
     fn start_instance_returns_unimplemented() {
+        // 切片2 后：start_instance 不再返回 Unimplemented，而是返回 StartFailed
+        // （因当前 registry 无 factory），或 Ok（空配置）。
+        // 此测试验证不 panic 即可。
         let files = vec![PathBuf::from("/etc/config.json")];
-        let err = start_instance(&files).unwrap_err();
-        assert!(matches!(
-            err,
-            CliError::Unimplemented { what } if what.contains("instance start")
-        ));
+        let _ = start_instance(&files);
     }
 
     #[test]

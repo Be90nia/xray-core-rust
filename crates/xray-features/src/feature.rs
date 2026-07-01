@@ -13,7 +13,7 @@
 //! [`TypeId`](std::any::TypeId)，每个具体类型自动获得全局唯一标识，无需手写
 //! `XxxType()` 工厂函数。
 
-use std::any::TypeId;
+use std::any::{Any, TypeId};
 use thiserror::Error;
 
 /// Feature 注册/生命周期错误。
@@ -55,7 +55,7 @@ pub type Result<T> = std::result::Result<T, FeatureError>;
 ///
 /// `Send + Sync` 是硬约束：Xray 是多线程运行时，feature 必须可跨线程共享。
 /// 内部状态请用 `parking_lot::RwLock` / `dashmap` / `Arc` 等并发原语保护。
-pub trait Feature: Send + Sync + 'static {
+pub trait Feature: Any + Send + Sync + 'static {
     /// Feature 的类型标识。同一 [`TypeId`] 在 Instance 中只能注册一个实例。
     ///
     /// 默认实现返回 `TypeId::of::<Self>()`。绝大多数情况无需覆盖；仅在需要把

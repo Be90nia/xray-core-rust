@@ -44,6 +44,81 @@ impl Instance {
         }
     }
 
+    /// 运行时 type-erased 注册入口（不要求编译时知道具体类型）。
+    ///
+    /// 对应 Go `Instance.AddFeature(feature features.Feature)`。
+    /// 与 [`Self::add_feature`] 区别：本方法接收 `Arc<dyn Feature>`，
+    /// 适合配置驱动的运行时 dispatch（如 [`Self::new_from_built`]）。
+    ///
+    /// 行为与 `add_feature` 完全一致：登记 `feature_typed`（用 `feature_type()` 取 TypeId）
+    /// + 追加 `features` slice。若已 `start`，立即启动新 feature。
+    pub fn add_feature_dyn(&mut self, feature: Arc<dyn Feature>) -> Result<()> {
+        let _guard = self.state_lock.lock();
+        let tid = feature.feature_type();
+        if self.running {
+            if let Err(e) = feature.start() {
+                tracing::warn!(
+                    name = feature.feature_name(),
+                    error = %e,
+                    "failed to start feature on late registration"
+                );
+            }
+        }
+        self.feature_typed.entry(tid).or_insert_with(|| {
+            let erased: Arc<dyn Any + Send + Sync> = feature.clone();
+            erased
+        });
+        self.features.push(feature);
+        Ok(())
+    }
+
+    /// 从 [`BuiltConfig`] 构造 Instance（核心启动路径第一步）。
+    ///
+    /// 对应 Go `core.New(config)` → `initInstanceWithConfig` 的 App 循环部分：
+    /// 遍历 `built.apps`，按 `kind` 查全局 [`FeatureFactory`](xray_features::registry) 表，
+    /// factory 返回 `Arc<dyn Feature>` → [`Self::add_feature_dyn`]。
+    ///
+    /// **不在此方法实现**（留给后续任务）：
+    /// - essentialFeatures 兜底（dns/policy/router/stats 默认实现，待各 crate 切片2）
+    /// - InitSystemDialer（依赖 outbound Manager）
+    /// - addInboundHandlers/addOutboundHandlers（依赖 proxyman 切片2 + 各 proxy crate 切片2）
+    ///
+    /// 返回**未启动**的 Instance，由调用方按需 `start()`。
+    ///
+    /// # 容错策略
+    ///
+    /// - 未注册的 `kind`：记 warn 跳过（对应 Go essentialFeatures 默认实现路径）
+    /// - factory 内部错误：立即返回（如 prost decode 失败、配置非法）
+    pub fn new_from_built(built: &xray_conf::BuiltConfig) -> Result<Self> {
+        let mut inst = Self::new();
+        for entry in &built.apps {
+            match xray_features::registry::create_feature(&entry.kind, &entry.data) {
+                Ok(feat) => {
+                    tracing::debug!(
+                        kind = %entry.kind,
+                        name = feat.feature_name(),
+                        "feature created from built config"
+                    );
+                    inst.add_feature_dyn(feat)?;
+                }
+                Err(FeatureError::NotFound { ref name }) => {
+                    tracing::warn!(
+                        kind = %name,
+                        "no FeatureFactory registered for kind, skipping"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        tracing::info!(
+            app_count = inst.feature_count(),
+            inbound_count = built.inbound_count(),
+            outbound_count = built.outbound_count(),
+            "Instance constructed from BuiltConfig (inbound/outbound handler registration pending c2v)"
+        );
+        Ok(inst)
+    }
+
     /// 注册一个 Feature 到实例。同一 [`TypeId`] 可多次注册（与 Go 一致：
     /// `features` slice 追加，[`Self::get_feature`] 返回首份）。
     ///

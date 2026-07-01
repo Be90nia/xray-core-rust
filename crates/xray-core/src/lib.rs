@@ -47,3 +47,5 @@ pub use version::{version, version_statement, VERSION_X, VERSION_Y, VERSION_Z};
 // 从 xray-features re-export Feature trait，让下游无需直接依赖 xray-features
 // 即可定义自己的 Feature 实现。
 pub use xray_features::{Feature, FeatureError};
+
+pub use functions::{start_from_built, start_instance, CoreFunctionError};
