@@ -13,3 +13,7 @@ xray-geodata = { path = "../xray-geodata" }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+xray-geodata = { path = "../xray-geodata" }
+prost = { workspace = true }
