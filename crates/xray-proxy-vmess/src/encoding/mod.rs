@@ -3,6 +3,7 @@
 //! 对应 Go 版本 `proxy/vmess/encoding/auth.go`。
 //! `ClientSession`/`ServerSession` 在子模块 [`client`] / [`server`] 中。
 
+pub mod body_chunk;
 pub mod client;
 pub mod server;
 

@@ -1,4 +1,4 @@
-//! VMess 服务端会话：解码请求头 + 反重放 SessionHistory + body 包装 trait stub。
+//! VMess 服务端会话：解码请求头 + 反重放 SessionHistory + body chunk 编解码 + 响应头 AEAD 加密。
 //!
 //! 对应 Go 版本 `proxy/vmess/encoding/server.go`。
 //!
@@ -6,8 +6,9 @@
 //!
 //! - **完整**：`ServerSession::decode_request_header`（AEAD 解密 + 字段解析 + FNV1a 校验）
 //!   + `SessionHistory`（防重放，session_id=16B user + 16B key + 16B nonce）
-//! - **trait stub**：`decode_request_body` / `encode_response_header` / `encode_response_body`
-//!   依赖 `xray-crypto` 的 chunk reader/writer + AES-CFB 流包装链（待接入）。
+//! - **完整**：`decode_request_body` / `encode_response_header` / `encode_response_body`
+//!   （AES-128-GCM + PlainChunkSizeParser 路径，对应 Go 默认 security）
+//! - **留 follow-up**：ChaCha20-Poly1305 + AuthenticatedLength + ShakeSizeParser + async 化
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -17,9 +18,11 @@ use xray_common::bitmask::Bitmask;
 use xray_common::net::address::Address;
 use xray_common::net::destination::Destination;
 use xray_common::net::port::Port;
-use xray_common::protocol::{Command, RequestHeader, SecurityType};
+use xray_common::protocol::{Command, RequestHeader, ResponseHeader, SecurityType};
+use xray_crypto::aead::{AeadCipher, Aes128Gcm};
 
-use crate::aead::{self, OpenHeaderError};
+use crate::aead::{self, consts, OpenHeaderError};
+use crate::encoding::body_chunk::{self, ChunkNonceAdapter, PlainSizeParser};
 use crate::encoding::{authenticate, read_address_port};
 use crate::error::{Result, VmessError};
 use crate::validator::{MemoryUser, TimedUserValidator, Validator};
@@ -249,49 +252,138 @@ impl<'v> ServerSession<'v> {
         Ok((header, user))
     }
 
-    /// 解码请求 body（对应 Go `DecodeRequestBody`）。
+    /// 解码请求 body：从 reader 读取 chunk 流解密，返回所有明文。
     ///
-    /// 当前 stub：依赖 `xray-crypto` 的 chunk reader + AES-CFB/CTR 流包装链。
+    /// 对应 Go `DecodeRequestBody`。
+    ///
+    /// # 算法
+    ///
+    /// 1. 构造 AES-128-GCM cipher（key = `request_body_key`）
+    /// 2. 构造 ChunkNonce 生成器（IV = `request_body_iv`，nonce_size = 12）
+    /// 3. 选 SizeParser（默认 Plain，ChunkMasking 留 follow-up）
+    /// 4. 调用 `body_chunk::decode_chunk_stream`
     ///
     /// # Errors
     ///
-    /// 始终返回 [`VmessError::NotImplemented`]。
+    /// - [`VmessError::Other`]：security ≠ AES-128-GCM
+    /// - [`VmessError::Io`]：reader IO 错误
+    /// - [`VmessError::Crypto`]：AEAD 解密失败
     pub fn decode_request_body<R: std::io::Read>(
         &self,
-        _request: &RequestHeader,
-        _reader: &mut R,
-    ) -> Result<()> {
-        Err(VmessError::NotImplemented("decode_request_body: requires xray-crypto AuthenticationReader chain"))
+        request: &RequestHeader,
+        reader: &mut R,
+    ) -> Result<Vec<u8>> {
+        // ponytail: 当前只支持 AES-128-GCM
+        if !matches!(request.security, SecurityType::Aes128Gcm) {
+            return Err(VmessError::Other(format!(
+                "decode_request_body: only Aes128Gcm supported, got {:?}",
+                request.security
+            )));
+        }
+        let cipher = Aes128Gcm::new(&self.request_body_key)?;
+        let mut nonce_gen = ChunkNonceAdapter::new(&self.request_body_iv, 12);
+        let mut size_parser = PlainSizeParser;
+        let plaintext = body_chunk::decode_chunk_stream(reader, &cipher, &mut nonce_gen, &mut size_parser)?;
+        Ok(plaintext)
     }
 
-    /// 编码响应头（对应 Go `EncodeResponseHeader`）。
+    /// 编码响应头：派生 response body key/iv + AEAD 加密响应头写入 writer。
     ///
-    /// 当前 stub：依赖 AES-CFB 流写入 + AEAD 加密响应头。
+    /// 对应 Go `EncodeResponseHeader`。需要 `&mut self` 因为要填充 `response_body_key/iv`。
+    ///
+    /// # 算法
+    ///
+    /// 1. 派生 response_body_key = SHA256(request_body_key)[..16]
+    /// 2. 派生 response_body_iv = SHA256(request_body_iv)[..16]
+    /// 3. 构造明文 payload = `[1B response_header][1B option][1B cmd_id=0][1B data_len=0]`
+    ///    （ ponytail: 当前不处理 command 序列化，留 follow-up）
+    /// 4. KDF16 派生 len key，KDF 派生 len IV[:12]
+    /// 5. Seal length(2B BE u16) + tag → 写入 writer
+    /// 6. KDF16 派生 payload key，KDF 派生 payload IV[:12]
+    /// 7. Seal payload + tag → 写入 writer
     ///
     /// # Errors
     ///
-    /// 始终返回 [`VmessError::NotImplemented`]。
+    /// - [`VmessError::Crypto`]：AES key 长度错误或 AEAD seal 失败
+    /// - [`VmessError::Io`]：writer IO 错误
     pub fn encode_response_header<W: std::io::Write>(
-        &self,
-        _option: u8,
-        _writer: &mut W,
+        &mut self,
+        header: &ResponseHeader,
+        writer: &mut W,
     ) -> Result<()> {
-        Err(VmessError::NotImplemented("encode_response_header: requires AES-CFB writer + AEAD response header encrypt"))
+        use sha2::{Digest, Sha256};
+        // 1-2. 派生 response_body_key/iv
+        let body_key_hash = Sha256::digest(&self.request_body_key);
+        let body_iv_hash = Sha256::digest(&self.request_body_iv);
+        self.response_body_key.copy_from_slice(&body_key_hash[..16]);
+        self.response_body_iv.copy_from_slice(&body_iv_hash[..16]);
+
+        // 3. 构造明文 payload（4B 固定头 + 0B command data）
+        let mut plaintext = Vec::with_capacity(4);
+        plaintext.push(self.response_header);
+        plaintext.push(header.option.bits());
+        plaintext.push(0); // cmd_id = 0（无 command）
+        plaintext.push(0); // data_len = 0
+
+        // 4. 派生 len key/IV
+        let len_key = aead::kdf16(&self.response_body_key, &[consts::AEAD_RESP_HEADER_LEN_KEY]);
+        let len_iv_full = aead::kdf(&self.response_body_iv, &[consts::AEAD_RESP_HEADER_LEN_IV]);
+        let len_nonce = &len_iv_full[..12];
+        let len_cipher = Aes128Gcm::new(&len_key)?;
+
+        // 5. Seal length (BE u16) + tag
+        let len_plain = (plaintext.len() as u16).to_be_bytes();
+        let encrypted_len = len_cipher.seal(len_nonce, &[], &len_plain)?;
+        writer.write_all(&encrypted_len)?;
+
+        // 6. 派生 payload key/IV
+        let payload_key = aead::kdf16(&self.response_body_key, &[consts::AEAD_RESP_HEADER_PAYLOAD_KEY]);
+        let payload_iv_full = aead::kdf(&self.response_body_iv, &[consts::AEAD_RESP_HEADER_PAYLOAD_IV]);
+        let payload_nonce = &payload_iv_full[..12];
+        let payload_cipher = Aes128Gcm::new(&payload_key)?;
+
+        // 7. Seal payload + tag
+        let encrypted_payload = payload_cipher.seal(payload_nonce, &[], &plaintext)?;
+        writer.write_all(&encrypted_payload)?;
+        writer.flush()?;
+        Ok(())
     }
 
-    /// 编码响应 body（对应 Go `EncodeResponseBody`）。
+    /// 编码响应 body：把明文 data 加密为 chunk 流写入 writer。
     ///
-    /// 当前 stub：依赖 `xray-crypto` 的 AuthenticationWriter + ChunkSizeParser 链。
+    /// 对应 Go `EncodeResponseBody`。要求先调用 `encode_response_header` 派生
+    /// `response_body_key/iv`（或手动填充）。
+    ///
+    /// # 算法
+    ///
+    /// 1. 构造 AES-128-GCM cipher（key = `response_body_key`）
+    /// 2. 构造 ChunkNonce 生成器（IV = `response_body_iv`，nonce_size = 12）
+    /// 3. 选 SizeParser（默认 Plain）
+    /// 4. 调用 `body_chunk::encode_chunk_stream`
     ///
     /// # Errors
     ///
-    /// 始终返回 [`VmessError::NotImplemented`]。
+    /// - [`VmessError::Other`]：security ≠ AES-128-GCM
+    /// - [`VmessError::Crypto`]：AES key 长度错误
+    /// - [`VmessError::Io`]：writer IO 错误
     pub fn encode_response_body<W: std::io::Write>(
         &self,
-        _request: &RequestHeader,
-        _writer: &mut W,
+        request: &RequestHeader,
+        data: &[u8],
+        writer: &mut W,
     ) -> Result<()> {
-        Err(VmessError::NotImplemented("encode_response_body: requires xray-crypto AuthenticationWriter chain"))
+        // ponytail: 当前只支持 AES-128-GCM
+        if !matches!(request.security, SecurityType::Aes128Gcm) {
+            return Err(VmessError::Other(format!(
+                "encode_response_body: only Aes128Gcm supported, got {:?}",
+                request.security
+            )));
+        }
+        let cipher = Aes128Gcm::new(&self.response_body_key)?;
+        let mut nonce_gen = ChunkNonceAdapter::new(&self.response_body_iv, 12);
+        let mut size_parser = PlainSizeParser;
+        body_chunk::encode_chunk_stream(writer, data, &cipher, &mut nonce_gen, &mut size_parser)?;
+        Ok(())
     }
 }
 
@@ -478,36 +570,65 @@ mod tests {
     }
 
     #[test]
-    fn decode_request_body_stub_returns_not_implemented() {
+    fn decode_request_body_roundtrip_with_client_encode() {
+        // 服务端 decode_request_body ↔ 客户端 encode_request_body 往返
+        use crate::encoding::client::ClientSession;
         let (validator, _) = sample_validator_with_user();
         let history = SessionHistory::new();
-        let server = ServerSession::new(&validator, &history);
+        let client = ClientSession::new();
+        let mut server = ServerSession::new(&validator, &history);
+        server.request_body_key = client.request_body_key;
+        server.request_body_iv = client.request_body_iv;
+
         let header = RequestHeader::new(
             crate::encoding::VERSION,
             Command::Tcp,
             Destination::tcp(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(80)),
             SecurityType::Aes128Gcm,
         );
-        let mut reader = &b""[..];
-        let err = server.decode_request_body(&header, &mut reader).unwrap_err();
-        assert!(matches!(err, VmessError::NotImplemented(_)));
+        let payload = b"request body payload from client";
+        let mut buf: Vec<u8> = Vec::new();
+        client.encode_request_body(&header, payload, &mut buf).expect("client encode");
+
+        let mut reader = &buf[..];
+        let decoded = server.decode_request_body(&header, &mut reader).expect("server decode");
+        assert_eq!(decoded, payload);
     }
 
     #[test]
-    fn encode_response_header_stub_returns_not_implemented() {
+    fn encode_response_header_writes_aead_payload() {
+        // 服务端 encode_response_header 生成 AEAD 加密的响应头字节
         let (validator, _) = sample_validator_with_user();
         let history = SessionHistory::new();
-        let server = ServerSession::new(&validator, &history);
+        let mut server = ServerSession::new(&validator, &history);
+        // 手动填充 request_body_key/iv 以跳过 decode_request_header
+        server.request_body_key = [0x42u8; 16];
+        server.request_body_iv = [0x33u8; 16];
+        server.response_header = 0xAB;
+
+        let resp_header = ResponseHeader { command: Command::Tcp, option: Bitmask::new(0) };
         let mut writer: Vec<u8> = Vec::new();
-        let err = server.encode_response_header(0, &mut writer).unwrap_err();
-        assert!(matches!(err, VmessError::NotImplemented(_)));
+        server.encode_response_header(&resp_header, &mut writer).expect("server encode");
+        // 输出 = 18B encrypted_len + (4B plaintext + 16B tag) encrypted_payload = 38B
+        assert_eq!(writer.len(), 18 + 4 + 16);
+        // response_body_key/iv 应被填充
+        assert!(server.response_body_key.iter().any(|&b| b != 0));
     }
 
     #[test]
-    fn encode_response_body_stub_returns_not_implemented() {
+    fn encode_response_body_writes_chunk_stream() {
         let (validator, _) = sample_validator_with_user();
         let history = SessionHistory::new();
-        let server = ServerSession::new(&validator, &history);
+        let mut server = ServerSession::new(&validator, &history);
+        server.request_body_key = [0x42u8; 16];
+        server.request_body_iv = [0x33u8; 16];
+        // encode_response_body 依赖 response_body_key/iv，手动填充跳过 encode_response_header
+        use sha2::{Digest, Sha256};
+        let body_key_hash = Sha256::digest(&server.request_body_key);
+        let body_iv_hash = Sha256::digest(&server.request_body_iv);
+        server.response_body_key.copy_from_slice(&body_key_hash[..16]);
+        server.response_body_iv.copy_from_slice(&body_iv_hash[..16]);
+
         let header = RequestHeader::new(
             crate::encoding::VERSION,
             Command::Tcp,
@@ -515,7 +636,7 @@ mod tests {
             SecurityType::Aes128Gcm,
         );
         let mut writer: Vec<u8> = Vec::new();
-        let err = server.encode_response_body(&header, &mut writer).unwrap_err();
-        assert!(matches!(err, VmessError::NotImplemented(_)));
+        server.encode_response_body(&header, b"server response", &mut writer).expect("server encode");
+        assert!(writer.len() > 2 + 16);
     }
 }
