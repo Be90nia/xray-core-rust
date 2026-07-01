@@ -149,6 +149,14 @@
 
 ### 4.2 TLS 指纹伪装（uTLS 等价）
 
+> **🔒 LOCKED (2026-06-30，n9e)** — 本节为 TLS 指纹伪装方案的**项目权威来源**，与 `docs/rust-rewrite-dev-plan.md` §3.2 联动。
+>
+> - **首选方案（2026-06 再次调研确认）**：[`watfaq-rustls`](https://github.com/Rigby-Foundation/rustls) `utls-0.23` 分支 — rustls 0.23 drop-in fork，REALITY 作为原生 `ClientConfig::builder().with_reality()` API。已被 clash-rs v0.10.7+ / dae-rs / NuggetVPN / Isolate 等生产采用（2026-03-31 仍活跃修复）。
+> - **btls 仍列为备选**：cloudflare/boring 硬分叉作为 fallback；watfaq-rustls 因生产验证更广而优选。
+> - **已废弃判断（禁止回掏）**：早期某次会话曾得出「btls 无字节级 ClientHello 控制 / Rust 生态无 uTLS 等价品」的结论，被写入 `xray-tls/src/lib.rs` 25-34 行注释。**该判断与本节矛盾，已在 7ir 任务（commit `2907123`）修订。禁止再次回掏此错误结论。**
+> - **解锁条件**：需出现比 6 个生产采用项目更强的反证（如协议层不兼容、关键 CVE 未修、上游维护停止 > 6 月）。
+
+
 | 方案 | 推荐度 | 说明 | 预计工作量 |
 |------|--------|------|-----------|
 | **🏆 btls + fingerprint 模块** | ⭐⭐⭐⭐⭐ | cloudflare/boring 硬分叉，增加指纹控制 API | ~500-800 行 |
@@ -167,6 +175,14 @@
 5. **无需 FFI-to-Go**，btls 已完全等价于 Go uTLS
 
 ### 4.3 REALITY
+
+> **🔒 LOCKED (2026-06-30，n9e)** — 本节为 REALITY 实现方案的**项目权威来源**，与 `docs/rust-rewrite-dev-plan.md` §3.3 联动。
+>
+> - **首选实现**：watfaq-rustls REALITY 模块（X25519 + HKDF-SHA256 + AES-256-GCM session_id + Ed25519 REALITY 证书），与 Go 原版逐字节对齐。
+> - **shoes 仍为协议层参考**：如 watfaq-rustls 在某场景缺失实现，参考 shoes（cfal/1112⭐）补齐。
+> - **patched rustls 维护风险已解除**：早期「clash-rs patched rustls fork 有长期维护风险」的判断正确，但 watfaq-rustls 是 Rigby-Foundation 官方维护的 stable fork（非临时 patch），维护风险已消除。
+> - **解锁条件**：watfaq-rustls 在生产环境出现重大缺陷时，再评估 shoes 重构路径。
+
 
 | 方案 | 推荐度 | 说明 |
 |------|--------|------|
