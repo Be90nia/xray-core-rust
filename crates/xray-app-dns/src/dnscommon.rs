@@ -202,8 +202,176 @@ pub fn merge_records(
     Ok((all_ips, r_ttl))
 }
 
-// TODO(ponytail): `genEDNS0Options` / `buildReqMsgs` —— 依赖 DNS 协议层（hickory-proto 或
-// 自研 wire format）。引入后实现 `ReqIdGen::Default`、`DnsMessage` 默认实现。
+// ---- DNS wire format helpers（hickory-proto 后端）----
+//
+// 提供 build_dns_query / parse_dns_response / AtomicReqIdGen，供 udp/tcp nameserver
+// 直接调用。避免在多个 nameserver 文件里重复实现。
+
+use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_proto::rr::{Name, RData, RecordType};
+use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsOption};
+use std::sync::atomic::{AtomicU16, Ordering};
+
+/// 将 ResponseCode 转为项目 RCode (u16)。
+///
+/// hickory ResponseCode 是 enum，high/low 分别是 8-bit。
+#[must_use]
+pub fn response_code_to_u16(rc: ResponseCode) -> RCode {
+    let low = u16::from(rc.low());
+    let high = u16::from(rc.high());
+    (high << 8) | low
+}
+
+/// 构造 DNS 查询 wire bytes。
+///
+/// 参数：
+/// - `fqdn`: 已规范化的全限定域名（不以 `.` 结尾会被自动补上）
+/// - `record_type`: A / AAAA / MX / TXT 等
+/// - `req_id`: 16-bit 请求 ID（响应需匹配）
+/// - `client_ip`: EDNS0 client subnet。空 Vec 表示不加 EDNS0；
+///   长度 4 表示 IPv4 (/24)，长度 16 表示 IPv6 (/56)。
+///
+/// 返回序列化后的 DNS wire bytes。
+pub fn build_dns_query(
+    fqdn: &str,
+    record_type: RecordType,
+    req_id: u16,
+    client_ip: &[u8],
+) -> Result<Vec<u8>, DnsError> {
+    let name = Name::parse(fqdn, None).map_err(|e| DnsError::WireFormat(e.to_string()))?;
+    let mut msg = Message::new(req_id, MessageType::Query, OpCode::Query);
+    msg.metadata.recursion_desired = true;
+    msg.add_query(Query::query(name, record_type));
+
+    // EDNS0 client subnet（可选）。
+    if matches!(client_ip.len(), 4 | 16) {
+        let mut edns = Edns::new();
+        edns.set_max_payload(1232);
+        let addr = if client_ip.len() == 4 {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(client_ip);
+            std::net::IpAddr::V4(std::net::Ipv4Addr::from(b))
+        } else {
+            let mut b = [0u8; 16];
+            b.copy_from_slice(client_ip);
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(b))
+        };
+        let source_prefix: u8 = if client_ip.len() == 4 { 24 } else { 56 };
+        edns.options_mut().insert(EdnsOption::Subnet(ClientSubnet::new(
+            addr,
+            source_prefix,
+            0,
+        )));
+        msg.set_edns(edns);
+    }
+
+    msg.to_vec().map_err(|e| DnsError::WireFormat(e.to_string()))
+}
+
+/// DNS 响应解析结果。
+#[derive(Debug, Clone)]
+pub struct ParsedResponse {
+    /// 请求 ID（与查询时的 req_id 匹配）。
+    pub req_id: u16,
+    /// 解析得到的 IP 列表（A 查询返回 IPv4，AAAA 查询返回 IPv6）。
+    pub ips: Vec<IpAddr>,
+    /// 最小 TTL（秒）。
+    pub ttl_secs: u32,
+    /// DNS RCode。
+    pub rcode: RCode,
+    /// Truncated 标志（UDP 包过大需重试 TCP）。
+    pub truncated: bool,
+}
+
+/// 解析 DNS 响应。
+///
+/// 参数：
+/// - `payload`: wire bytes
+/// - `expected_req_id`: 预期请求 ID（不匹配返错）
+/// - `expected_type`: A 或 AAAA（仅提取该类型记录）
+/// - `now`: 当前时间（计算过期时间）
+pub fn parse_dns_response(
+    payload: &[u8],
+    expected_req_id: u16,
+    expected_type: RecordType,
+    _now: Instant,
+) -> Result<ParsedResponse, DnsError> {
+    let msg = Message::from_vec(payload).map_err(|e| DnsError::WireFormat(e.to_string()))?;
+
+    if msg.metadata.id != expected_req_id {
+        return Err(DnsError::WireFormat(format!(
+            "req_id mismatch: expected {}, got {}",
+            expected_req_id, msg.metadata.id
+        )));
+    }
+
+    let rcode = response_code_to_u16(msg.metadata.response_code);
+    let truncated = msg.metadata.truncation;
+
+    // 仅提取预期类型的 A/AAAA 记录（其他类型如 MX/TXT 不进 IP cache）。
+    let mut ips: Vec<IpAddr> = Vec::new();
+    let mut min_ttl: Option<u32> = None;
+    for rec in &msg.answers {
+        if rec.record_type() != expected_type {
+            continue;
+        }
+        match &rec.data {
+            RData::A(a) => {
+                ips.push(IpAddr::V4(a.0));
+            }
+            RData::AAAA(aaaa) => {
+                ips.push(IpAddr::V6(aaaa.0));
+            }
+            _ => continue,
+        }
+        let ttl = rec.ttl;
+        min_ttl = Some(min_ttl.map_or(ttl, |m| m.min(ttl)));
+    }
+
+    let ttl_secs = min_ttl.unwrap_or(0);
+
+    Ok(ParsedResponse {
+        req_id: expected_req_id,
+        ips,
+        ttl_secs,
+        rcode,
+        truncated,
+    })
+}
+
+/// 将 ParsedResponse 转为 IpRecord。
+///
+/// TTL 0 + RCode 0 + 空 ips 仍会生成记录（调用方用 IpRecord::get_ips 判断有效性）。
+#[must_use]
+pub fn parsed_to_ip_record(parsed: &ParsedResponse, now: Instant) -> IpRecord {
+    let ttl = if parsed.ttl_secs > 0 {
+        Duration::from_secs(u64::from(parsed.ttl_secs))
+    } else {
+        // 默认 60 秒，避免 RCode 错误响应被缓存为永久过期。
+        Duration::from_secs(60)
+    };
+    ip_record(parsed.req_id, parsed.ips.clone(), ttl, parsed.rcode, now)
+}
+
+/// 原子计数请求 ID 生成器。对应 Go `reqIDGen`（基于 atomic counter）。
+#[derive(Debug, Default)]
+pub struct AtomicReqIdGen {
+    counter: AtomicU16,
+}
+
+impl AtomicReqIdGen {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { counter: AtomicU16::new(0) }
+    }
+}
+
+impl ReqIdGen for AtomicReqIdGen {
+    fn next_id(&self) -> u16 {
+        // wrapping_add 避免 u16 溢出 panic；DNS ID 仅需唯一性不需递增。
+        self.counter.fetch_add(1, Ordering::Relaxed)
+    }
+}
 
 #[cfg(test)]
 mod tests {

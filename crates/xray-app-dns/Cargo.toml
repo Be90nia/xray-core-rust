@@ -15,4 +15,5 @@ tracing.workspace = true
 parking_lot.workspace = true
 uuid.workspace = true
 lru = "0.12"
+hickory-proto.workspace = true
 ipnet = "2"

@@ -65,6 +65,10 @@ pub enum DnsError {
     /// 当前路径尚未实现（IO 边界 / 待生态成熟）。
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
+
+    /// DNS wire format 编解码错误（来自 hickory-proto）。
+    #[error("dns wire format error: {0}")]
+    WireFormat(String),
 }
 
 impl DnsError {

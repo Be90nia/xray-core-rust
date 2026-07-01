@@ -187,12 +187,14 @@ impl Client {
 
 /// `new_server` 工厂占位。对应 Go `NewServer`。
 ///
-/// 真正实现需根据 URL scheme 选择 UDP/TCP/DoH/QUIC/Local/FakeDNS，并依赖 transport
-/// / DoH 客户端 / QUIC 客户端等 IO 边界。当前永远返回 `NotImplemented`。
+/// **本切片未实现 URL scheme 解析**。DoH/DoT/DoQ 留 follow-up bd 任务。
+/// 调用方应直接使用具体子模块：
+/// - UDP：`crate::nameserver::udp::new_classic_name_server(&ns)`
+/// - TCP：`crate::nameserver::tcp::new_tcp_name_server(&ns)`
 ///
-/// TODO: 等 transport + hickory-proto / quinn / doh 客户端就位后实现。
+/// TODO: follow-up 任务解析 `tcp://` / `https://` / `quic://` URL scheme 后再实现。
 pub fn new_server(_dest: Address) -> Result<Box<dyn Server>, DnsError> {
-    Err(DnsError::NotImplemented("new_server factory"))
+    Err(DnsError::NotImplemented("new_server factory; use udp/tcp submodule directly"))
 }
 
 #[cfg(test)]

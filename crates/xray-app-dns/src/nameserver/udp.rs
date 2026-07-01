@@ -1,30 +1,333 @@
 //! UDP (Classic) DNS nameserver。对应 Go `app/dns/nameserver_udp.go`。
 //!
-//! **状态**：占位。等 `tokio::net::UdpSocket` + DNS wire format（hickory-proto 或自研）
-//! 就位后实现 `ClassicNameServer` 与工厂函数。
+//! ## 实现
+//!
+//! - `tokio::net::UdpSocket` 直连远端 DNS 服务器（不走 Xray dispatcher，
+//!   dispatcher 接入留 follow-up）。
+//! - DNS wire format 由 `hickory-proto` 处理（覆盖 A/AAAA/MX/TXT/EDNS0）。
+//! - 自动接入 cache（实现 `CachedNameserver`，由 `cached::query_ip` 统一调度）。
+//! - truncated 响应不自动 TCP 重试（ponytail：调用方决定，本任务范围）。
+//!
+//! ## 跳过范围
+//!
+//! - 走 Xray routing/dispatcher 出口（直接用 tokio socket）
+//! - 请求去重 singleflight（CacheController 层面已部分缓解）
 
+use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use hickory_proto::rr::RecordType;
+use tokio::net::UdpSocket;
+use tokio::time::timeout;
+
+use xray_common::net::address::Address;
+
+use crate::cache_controller::CacheController;
+use crate::config::IpOption;
+use crate::dnscommon::{
+    build_dns_query, parse_dns_response, parsed_to_ip_record, AtomicReqIdGen, IpRecord, ReqIdGen,
+};
 use crate::error::DnsError;
-use crate::nameserver::Server;
+use crate::nameserver::cached::{query_ip, CachedNameserver, QueryOutcome};
+use crate::nameserver::{NameServerConfig, Server};
+
+/// UDP DNS 查询缓冲区大小（Go 默认 4096；hickory 推荐 1232 + EDNS0）。
+const UDP_RECV_BUF: usize = 4096;
+
+/// UDP DNS nameserver。对应 Go `ClassicNameServer`。
+pub struct UdpNameServer {
+    /// 服务名（含地址，用于日志）。
+    name: String,
+    /// 远端 DNS 服务器地址（已规范化为 SocketAddr）。
+    addr: SocketAddr,
+    /// 缓存控制器。
+    cache: Arc<CacheController>,
+    /// EDNS0 client subnet（空 Vec 表示不加）。
+    client_ip: Vec<u8>,
+    /// 单次查询超时。
+    query_timeout: Duration,
+    /// 请求 ID 生成器。
+    id_gen: AtomicReqIdGen,
+}
+
+impl UdpNameServer {
+    /// 构造 UDP nameserver。
+    ///
+    /// `client_ip` 长度须为 0/4/16（EDNS0 subnet 规范）。
+    #[must_use]
+    pub fn new(
+        addr: SocketAddr,
+        cache: Arc<CacheController>,
+        client_ip: Vec<u8>,
+        query_timeout: Duration,
+    ) -> Self {
+        let name = format!("UDP:{}", addr);
+        Self {
+            name,
+            addr,
+            cache,
+            client_ip,
+            query_timeout,
+            id_gen: AtomicReqIdGen::new(),
+        }
+    }
+
+    /// 从 `NameServerConfig` 构造。
+    ///
+    /// `ns.address` 必须能解析为 IP（域名地址会失败，调用方先做 DNS 查询）。
+    pub fn from_config(ns: &NameServerConfig) -> Result<Box<dyn Server>, DnsError> {
+        let socket_addr = match &ns.address {
+            Address::IPv4(v) => SocketAddr::new(IpAddr::V4(*v), ns.port),
+            Address::IPv6(v) => SocketAddr::new(IpAddr::V6(*v), ns.port),
+            other => {
+                return Err(DnsError::WireFormat(format!(
+                    "udp nameserver requires IP address, got: {other:?}"
+                )));
+            }
+        };
+        let timeout = if ns.timeout_ms > 0 {
+            Duration::from_millis(u64::from(ns.timeout_ms))
+        } else {
+            Duration::from_millis(4000)
+        };
+        let cache = Arc::new(CacheController::new(
+            format!("UDP:{}", socket_addr),
+            ns.disable_cache.unwrap_or(false),
+            ns.serve_stale.unwrap_or(false),
+            ns.serve_expired_ttl.unwrap_or(0),
+        ));
+        Ok(Box::new(Self::new(
+            socket_addr,
+            cache,
+            ns.client_ip.clone(),
+            timeout,
+        )))
+    }
+
+    /// 发送单次 DNS 查询并等待响应。
+    async fn query_once(
+        &self,
+        fqdn: &str,
+        record_type: RecordType,
+    ) -> Result<IpRecord, DnsError> {
+        let req_id = self.id_gen.next_id();
+        let wire = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
+
+        // 绑定任意本地端口。失败多为系统 fd 限制。
+        let sock = UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|e| DnsError::WireFormat(format!("udp bind: {e}")))?;
+        sock.send_to(&wire, self.addr)
+            .await
+            .map_err(|e| DnsError::WireFormat(format!("udp send: {e}")))?;
+
+        let mut buf = vec![0u8; UDP_RECV_BUF];
+        let n = timeout(self.query_timeout, sock.recv(&mut buf))
+            .await
+            .map_err(|_| {
+                DnsError::WireFormat(format!(
+                    "udp recv timeout after {:?}",
+                    self.query_timeout
+                ))
+            })?
+            .map_err(|e| DnsError::WireFormat(format!("udp recv: {e}")))?;
+
+        let now = Instant::now();
+        let parsed = parse_dns_response(&buf[..n], req_id, record_type, now)?;
+        if parsed.truncated {
+            // 不自动 TCP fallback；调用方决定。返回错误，调用方记录到 outcome.errors。
+            return Err(DnsError::WireFormat(
+                "udp response truncated (TC=1), retry over TCP needed".to_string(),
+            ));
+        }
+        Ok(parsed_to_ip_record(&parsed, now))
+    }
+}
+
+impl CachedNameserver for UdpNameServer {
+    fn cache_controller(&self) -> &CacheController {
+        &self.cache
+    }
+
+    async fn send_query(&self, fqdn: &str, option: IpOption) -> QueryOutcome {
+        let mut outcome = QueryOutcome::default();
+
+        // 顺序发起 A/AAAA。
+        // ponytail: 串行 await。真正并行需 tokio::join! 或 JoinSet，业务上串行也能完成
+        // （多 1 个 RTT 的延迟换简化代码）。高并发场景可在 query_once 外层 spawn。
+        if option.ipv4_enable {
+            match self.query_once(fqdn, RecordType::A).await {
+                Ok(rec) => outcome.rec_v4 = Some(rec),
+                Err(e) => outcome.errors.push(e),
+            }
+        }
+        if option.ipv6_enable {
+            match self.query_once(fqdn, RecordType::AAAA).await {
+                Ok(rec) => outcome.rec_v6 = Some(rec),
+                Err(e) => outcome.errors.push(e),
+            }
+        }
+
+        outcome
+    }
+}
+
+impl Server for UdpNameServer {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn is_disable_cache(&self) -> bool {
+        self.cache.disable_cache
+    }
+
+    fn query_ip<'a>(
+        &'a self,
+        domain: &'a str,
+        option: IpOption,
+    ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>> {
+        Box::pin(query_ip(self, domain, option))
+    }
+}
 
 /// 构造 UDP nameserver。对应 Go `NewClassicNameServer`。
 ///
-/// 入参：服务端地址、缓存控制策略、客户端 IP（EDNS0 subnet）。
-///
-/// TODO: 实现 `ClassicNameServer` struct + `Server` impl + UDP socket dial。
-pub fn new_classic_name_server() -> Result<Box<dyn Server>, DnsError> {
-    Err(DnsError::NotImplemented("udp::new_classic_name_server"))
+/// 入参：服务端地址（IP + 端口）+ 缓存配置 + EDNS0 client IP。
+pub fn new_classic_name_server(
+    ns: &NameServerConfig,
+) -> Result<Box<dyn Server>, DnsError> {
+    UdpNameServer::from_config(ns)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::IpOption;
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
+    use hickory_proto::rr::{Name, RData, Record, RecordType};
+    use std::net::Ipv4Addr;
+    use std::str::FromStr;
+
+    /// 用 hickory 构造一个 DNS 响应 wire bytes（含 A 记录）。
+    fn make_a_response(req_id: u16, fqdn: &str, ips: Vec<Ipv4Addr>, ttl: u32) -> Vec<u8> {
+        let name = Name::parse(fqdn, None).unwrap();
+        let mut msg = Message::new(req_id, MessageType::Response, OpCode::Query);
+        msg.add_query(Query::query(name.clone(), RecordType::A));
+        for ip in ips {
+            let rec = Record::from_rdata(name.clone(), ttl, RData::A(hickory_proto::rr::rdata::A(ip)));
+            msg.add_answer(rec);
+        }
+        msg.to_vec().unwrap()
+    }
+
+    /// 启动 mock UDP DNS server：收到查询后 echo 请求 ID 回复 A 记录。
+    async fn spawn_mock_udp_server(
+        fqdn: &str,
+        ips: Vec<Ipv4Addr>,
+        ttl: u32,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let fqdn_owned = fqdn.to_string();
+        let handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let (n, peer) = sock.recv_from(&mut buf).await.unwrap();
+            // 解析 query 取 ID。
+            let query_msg = Message::from_vec(&buf[..n]).unwrap();
+            let resp = make_a_response(query_msg.metadata.id, &fqdn_owned, ips.clone(), ttl);
+            sock.send_to(&resp, peer).await.unwrap();
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn query_once_returns_parsed_a_record() {
+        let (addr, _h) = spawn_mock_udp_server("example.com.", vec![Ipv4Addr::new(1, 2, 3, 4)], 60).await;
+
+        let ns = UdpNameServer::new(
+            addr,
+            Arc::new(CacheController::new("test", true, false, 0)),
+            Vec::new(),
+            Duration::from_secs(2),
+        );
+        let rec = ns.query_once("example.com.", RecordType::A).await.unwrap();
+        assert_eq!(rec.ips.len(), 1);
+        assert_eq!(rec.ips[0], IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+        assert_eq!(rec.rcode, 0);
+    }
+
+    #[tokio::test]
+    async fn send_query_populates_rec_v4_only() {
+        let (addr, _h) = spawn_mock_udp_server("x.com.", vec![Ipv4Addr::new(9, 9, 9, 9)], 30).await;
+
+        let ns = UdpNameServer::new(
+            addr,
+            Arc::new(CacheController::new("test", true, false, 0)),
+            Vec::new(),
+            Duration::from_secs(2),
+        );
+        let outcome = ns
+            .send_query("x.com.", IpOption {
+                ipv4_enable: true,
+                ipv6_enable: false,
+                fake_enable: false,
+            })
+            .await;
+        assert!(outcome.rec_v4.is_some());
+        assert!(outcome.rec_v6.is_none());
+        assert!(outcome.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_query_records_error_when_server_silent() {
+        // 启 server 但不响应。
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        // _sock drop 后端口仍由 OS 保留 TIME_WAIT，超时测试不依赖 server。
+        drop(sock);
+
+        let ns = UdpNameServer::new(
+            addr,
+            Arc::new(CacheController::new("test", true, false, 0)),
+            Vec::new(),
+            Duration::from_millis(100),
+        );
+        let outcome = ns
+            .send_query("y.com.", IpOption {
+                ipv4_enable: true,
+                ipv6_enable: false,
+                fake_enable: false,
+            })
+            .await;
+        assert!(outcome.rec_v4.is_none());
+        assert_eq!(outcome.errors.len(), 1);
+    }
 
     #[test]
-    fn factory_returns_not_implemented() {
-        match new_classic_name_server() {
-            Err(DnsError::NotImplemented(_)) => {}
-            Err(e) => panic!("expected NotImplemented, got error: {e:?}"),
-            Ok(_) => panic!("expected error, got Ok"),
-        }
+    fn from_config_rejects_domain_address() {
+        let ns = NameServerConfig {
+            address: Address::Domain("dns.example.com".to_string()),
+            port: 53,
+            ..Default::default()
+        };
+        assert!(matches!(
+            UdpNameServer::from_config(&ns),
+            Err(DnsError::WireFormat(_))
+        ));
+    }
+
+    #[test]
+    fn from_config_accepts_ipv4_address() {
+        let ns = NameServerConfig {
+            address: Address::IPv4(Ipv4Addr::from_str("8.8.8.8").unwrap()),
+            port: 53,
+            timeout_ms: 1000,
+            ..Default::default()
+        };
+        let server = UdpNameServer::from_config(&ns).unwrap();
+        assert_eq!(server.name(), "UDP:8.8.8.8:53");
     }
 }
