@@ -19,15 +19,19 @@
 //! - [`hub::build_upgrade_response`] — 构造服务端 101 响应
 //! - [`config::Config`] — 配置层 + 与 prost proto 双向转换
 //!
-//! 切片2 待办：实际 TCP/TLS 拨号（依赖 `xray-transport::Dialer` impl +
-//! `xray-tls` uTLS）+ Listener `keepAccepting` 循环 + PROXY protocol 解析 +
-//! `TcpmaskManager` 包装。
+//! 切片2（929）已交付：[`client::HttpUpgradeClient::dial_over_io`] +
+//!   [`server::HttpUpgradeServer::handshake_io`]——在调用方注入的
+//!   `AsyncRead + AsyncWrite` 上跑握手，与 TLS/TCP 拨号解耦。
+//!   实际 TCP/TLS 监听 + `keepAccepting` 循环 + PROXY protocol 解析留 follow-up
+//!   （依赖 `xray-transport::Dialer` impl + `k9t reality-s2` 的 uTLS 决策）。
 
 pub mod config;
 pub mod connection;
+pub mod client;
 pub mod dialer;
 pub mod error;
 pub mod hub;
+pub mod server;
 
 // 顶层 re-export。
 pub use config::Config;
