@@ -32,7 +32,7 @@ use xray_common::serial;
 // ========== 协议常量 ==========
 
 /// 帧元数据最大长度（字节）。
-const MAX_METADATA_LEN: usize = 512;
+pub(crate) const MAX_METADATA_LEN: usize = 512;
 
 /// Option 位掩码：数据帧。
 pub const OPTION_DATA: u8 = 0x01;

@@ -15,9 +15,11 @@ use xray_common::net::destination::Destination;
 use xray_common::net::network::Network;
 
 use crate::client::{Link, MUX_COOL_ADDRESS};
-use crate::frame::FrameMetadata;
+use crate::frame::{FrameMetadata, SessionStatus, MAX_METADATA_LEN};
 use crate::session::{Session, SessionManager, TransferType, XUDP, XUDPManager, XudpStatus};
 use crate::writer::MuxWriter;
+use xray_buf::buffer::Buffer;
+use xray_buf::multi::MultiBuffer;
 
 /// Server keepalive interval (60 seconds).
 pub const SERVER_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
@@ -109,6 +111,7 @@ impl ServerWorker {
     /// Handle normal New frame (non-XUDP).
     pub async fn handle_normal_new(
         &self, meta: &FrameMetadata,
+        data: Vec<u8>,
         link_writer: &Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>>,
     ) -> Result<(), ServerError> {
         let target = meta.target().cloned().ok_or_else(|| {
@@ -124,6 +127,15 @@ impl ServerWorker {
         if !self.session_manager.add(session.clone()).await {
             session.close().await;
             return Err(ServerError::SessionAddFailed(meta.session_id()));
+        }
+        // 写入 New frame 的 data 到 session.output（在 spawn 反向 task 前同步完成，
+        // 对齐 Go handleStatusNew 中 `buf.Copy(rr, s.output)` 的语义）
+        if !data.is_empty() {
+            let mut guard = session.output().await;
+            if let Some(ref mut writer) = *guard {
+                let mb = MultiBuffer::from_buffer(Buffer::from_vec(data));
+                let _ = writer.write_multi_buffer_impl(mb).await;
+            }
         }
         let os = session.clone();
         let ow = link_writer.clone();
@@ -206,6 +218,110 @@ impl ServerWorker {
         }
         let _ = rw.close().await;
         session.close().await;
+    }
+
+    /// 处理主连接的下一帧（frame dispatcher 主循环单步）。
+    ///
+    /// 从 `reader` 读取一个完整的 Mux 帧（metadata + optional data），
+    /// 按 session_status 分发到对应 handler。
+    /// 返回 `Ok(true)` 表示成功处理可继续，`Ok(false)` 表示干净 EOF。
+    ///
+    /// 对应 Go 版本 `ServerWorker.handleFrame`，单次调用不 spawn 长任务，
+    /// 适合测试与可控制并发的场景。
+    pub async fn process_frame(
+        &self,
+        reader: &mut BufferedReader,
+        link_writer: &Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>>,
+    ) -> Result<bool, ServerError> {
+        // 1. 读 2B length（EOF 返 Ok(false) 表示干净关闭）
+        let len_buf = match Self::read_exact_async(reader, 2).await {
+            Ok(b) => b,
+            Err(ServerError::InvalidFrame(msg)) if msg.starts_with("EOF") => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let meta_len = u16::from_be_bytes([len_buf[0], len_buf[1]]) as usize;
+        if meta_len > MAX_METADATA_LEN {
+            return Err(ServerError::InvalidFrame(format!("meta_len too large: {}", meta_len)));
+        }
+        // 2. 读 body
+        let body = Self::read_exact_async(reader, meta_len).await?;
+        // 3. 解析 metadata（拼回完整 bytes 调 read_from_bytes，因为它需 length 前缀）
+        let mut full = Vec::with_capacity(2 + meta_len);
+        full.extend_from_slice(&len_buf);
+        full.extend_from_slice(&body);
+        let (meta, _) = FrameMetadata::read_from_bytes(&full)
+            .map_err(|e| ServerError::InvalidFrame(format!("parse meta: {:?}", e)))?;
+        // 4. 如有 data，读 data（2B size + payload）
+        let data = if meta.has_data() {
+            let size_buf = Self::read_exact_async(reader, 2).await?;
+            let size = u16::from_be_bytes([size_buf[0], size_buf[1]]) as usize;
+            Self::read_exact_async(reader, size).await?
+        } else {
+            Vec::new()
+        };
+        // 5. 按 status 分发
+        match meta.session_status() {
+            SessionStatus::New => {
+                if meta.is_udp_target() && meta.global_id().is_some() {
+                    let gid = *meta.global_id().unwrap();
+                    self.handle_xudp_new(&meta, link_writer, gid).await?;
+                } else {
+                    self.handle_normal_new(&meta, data, link_writer).await?;
+                }
+            }
+            SessionStatus::Keep => self.handle_status_keep(&meta, data).await?,
+            SessionStatus::End => self.handle_status_end(&meta).await?,
+            SessionStatus::KeepAlive => {}, // data 已读出丢弃
+        }
+        Ok(true)
+    }
+
+    /// 处理 Keep 帧：把 data 写到对应 session.output（转发到上游 dispatcher 目标）。
+    ///
+    /// 未知 session_id 静默丢弃（对端可能已 End）。
+    pub async fn handle_status_keep(
+        &self,
+        meta: &FrameMetadata,
+        data: Vec<u8>,
+    ) -> Result<(), ServerError> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let session = match self.session_manager.get(meta.session_id()).await {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        let mut guard = session.output().await;
+        if let Some(ref mut writer) = *guard {
+            let mb = MultiBuffer::from_buffer(Buffer::from_vec(data));
+            let _ = writer.write_multi_buffer_impl(mb).await;
+        }
+        Ok(())
+    }
+
+    /// 处理 End 帧：关闭并移除对应 session。
+    pub async fn handle_status_end(&self, meta: &FrameMetadata) -> Result<(), ServerError> {
+        if let Some(session) = self.session_manager.get(meta.session_id()).await {
+            session.close().await;
+        }
+        Ok(())
+    }
+
+    /// 异步精确读取 n 字节，EOF 时返回带 "EOF" 前缀的 InvalidFrame 错误。
+    async fn read_exact_async(reader: &mut BufferedReader, n: usize) -> Result<Vec<u8>, ServerError> {
+        let mut buf = vec![0u8; n];
+        let mut read = 0;
+        while read < n {
+            let r = reader.read(&mut buf[read..]).await;
+            if r == 0 {
+                return Err(ServerError::InvalidFrame(format!(
+                    "EOF reading {} bytes at offset {}",
+                    n, read
+                )));
+            }
+            read += r;
+        }
+        Ok(buf)
     }
 }
 

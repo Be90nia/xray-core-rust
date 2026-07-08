@@ -163,7 +163,7 @@ async fn test_server_worker_dispatch_fails_with_mock() {
     );
     let link_writer = Arc::new(tokio::sync::Mutex::new(None::<Box<dyn Writer>>));
     let meta = FrameMetadata::new_session(1, dest);
-    let result = worker.handle_normal_new(&meta, &link_writer).await;
+    let result = worker.handle_normal_new(&meta, Vec::new(), &link_writer).await;
     assert!(result.is_err());
 }
 
@@ -295,4 +295,143 @@ async fn test_incremental_picker_empty_initially() {
     let factory = Arc::new(DialingWorkerFactory::new(ClientStrategy::default()));
     let picker = IncrementalWorkerPicker::new(factory);
     assert_eq!(picker.worker_count().await, 0);
+}
+
+// ========== process_frame E2E 多路复用 ==========
+
+/// 成功 Dispatcher：返回空 Cursor 包装的 Link，记录所有 dispatch 的 dest。
+struct SuccessDispatcher {
+    dests: Arc<tokio::sync::Mutex<Vec<Destination>>>,
+}
+
+#[async_trait::async_trait]
+impl Dispatcher for SuccessDispatcher {
+    async fn dispatch(&self, dest: Destination) -> Result<Link, DispatchError> {
+        self.dests.lock().await.push(dest);
+        // ponytail: 返回空 Cursor，反向 task 立即 EOF 退出（多 session 反向回写另见 follow-up）
+        let reader: Box<dyn xray_buf::io::Reader> =
+            xray_buf::io::new_reader(std::io::Cursor::new(Vec::<u8>::new()));
+        let writer: Box<dyn Writer> =
+            xray_buf::io::new_writer(std::io::Cursor::new(Vec::<u8>::new()));
+        Ok(Link { reader, writer })
+    }
+}
+
+/// 端到端验证：单 TCP 字节流上多 session frame 复用 → process_frame 分发。
+///
+/// 构造 2 个 session 的 New + data + End 序列，调 process_frame 循环，验证：
+/// - 4 个 metadata 帧全部正确解析
+/// - dispatcher 收到 2 个不同 dest（顺序保留）
+/// - EOF 干净退出（Ok(false)）
+#[tokio::test]
+async fn test_e2e_multi_session_dispatch_via_process_frame() {
+    use xray_buf::io::new_reader;
+    use xray_buf::reader::BufferedReader;
+    use xray_common::serial;
+
+    let dests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let dispatcher = Arc::new(SuccessDispatcher { dests: dests.clone() });
+    let worker = ServerWorker::new(dispatcher);
+
+    let dest1 = Destination::new(
+        Address::new_domain("a.com".to_string()),
+        Port::new(80),
+        Network::TCP,
+    );
+    let dest2 = Destination::new(
+        Address::new_domain("b.com".to_string()),
+        Port::new(80),
+        Network::TCP,
+    );
+
+    // 构造字节流：session 1 New + data + End, session 2 New + data + End
+    let mut bytes = Vec::new();
+    FrameMetadata::new_session(1, dest1.clone()).write_to(&mut bytes).unwrap();
+    bytes.extend_from_slice(&serial::write_uint16(5));
+    bytes.extend_from_slice(b"hello");
+    FrameMetadata::end_session(1).write_to(&mut bytes).unwrap();
+    FrameMetadata::new_session(2, dest2.clone()).write_to(&mut bytes).unwrap();
+    bytes.extend_from_slice(&serial::write_uint16(5));
+    bytes.extend_from_slice(b"world");
+    FrameMetadata::end_session(2).write_to(&mut bytes).unwrap();
+
+    let reader = new_reader(std::io::Cursor::new(bytes));
+    let mut br = BufferedReader::new(reader);
+    let link_writer: Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+
+    let mut frame_count = 0;
+    loop {
+        match worker.process_frame(&mut br, &link_writer).await {
+            Ok(true) => frame_count += 1,
+            Ok(false) => break,
+            Err(e) => panic!("process_frame error: {:?}", e),
+        }
+    }
+
+    // 4 个 metadata 帧：New(s1) + End(s1) + New(s2) + End(s2)
+    // data 是 New frame 的伴随 payload（OPTION_DATA），不是独立 metadata 帧
+    assert_eq!(frame_count, 4);
+
+    let dests_guard = dests.lock().await;
+    assert_eq!(dests_guard.len(), 2);
+    assert_eq!(dests_guard[0].address().to_string(), "a.com");
+    assert_eq!(dests_guard[1].address().to_string(), "b.com");
+}
+
+/// 验证 process_frame 处理 Keep 帧：data 路由到已注册 session.output 不 panic。
+#[tokio::test]
+async fn test_e2e_keep_frame_routes_to_existing_session() {
+    use xray_buf::io::new_reader;
+    use xray_buf::reader::BufferedReader;
+    use xray_common::bitmask::Bitmask;
+    use xray_mux::frame::OPTION_DATA;
+
+    let dests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let dispatcher = Arc::new(SuccessDispatcher { dests });
+    let worker = ServerWorker::new(dispatcher);
+
+    // 通过 SessionManager.allocate 创建 session（Session::new 为 pub(crate)）
+    let strategy = ClientStrategy::default();
+    let session = worker.session_manager().allocate(&strategy).await.unwrap();
+    let sid = session.id();
+
+    // 构造 Keep + data 帧（session.output 为 None，写入是 no-op，但不 panic）
+    let mut bytes = Vec::new();
+    let mut option = Bitmask::default();
+    option.set(OPTION_DATA);
+    let keep_meta = FrameMetadata::new(sid, SessionStatus::Keep, option);
+    keep_meta.write_to(&mut bytes).unwrap();
+    bytes.extend_from_slice(&xray_common::serial::write_uint16(5));
+    bytes.extend_from_slice(b"keep!");
+
+    let reader = new_reader(std::io::Cursor::new(bytes));
+    let mut br = BufferedReader::new(reader);
+    let link_writer: Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+
+    let result = worker.process_frame(&mut br, &link_writer).await;
+    assert!(result.is_ok());
+    assert!(result.unwrap());
+    assert!(!session.is_closed());
+}
+
+/// 验证空输入时 process_frame 干净返 Ok(false)。
+#[tokio::test]
+async fn test_e2e_process_frame_clean_eof() {
+    use xray_buf::io::new_reader;
+    use xray_buf::reader::BufferedReader;
+
+    let dests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let dispatcher = Arc::new(SuccessDispatcher { dests });
+    let worker = ServerWorker::new(dispatcher);
+
+    let reader = new_reader(std::io::Cursor::new(Vec::<u8>::new()));
+    let mut br = BufferedReader::new(reader);
+    let link_writer: Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+
+    let result = worker.process_frame(&mut br, &link_writer).await;
+    assert!(result.is_ok());
+    assert!(!result.unwrap()); // Ok(false) = EOF
 }
