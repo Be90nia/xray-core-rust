@@ -60,6 +60,7 @@ pub mod segment;
 pub mod sending;
 pub mod state;
 pub mod updater;
+pub mod udp_hub;
 
 /// 协议名（对应 Go `ProtocolName = "mkcp"`）。
 pub const PROTOCOL_NAME: &str = "mkcp";
@@ -78,3 +79,4 @@ pub use segment::{
 };
 pub use state::{State, STATE_ACTIVE};
 pub use updater::{NoopUpdater, TokioUpdater, Updater};
+pub use udp_hub::{StdPacketInput, StdUdpHub};
