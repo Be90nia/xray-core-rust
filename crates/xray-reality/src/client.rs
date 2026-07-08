@@ -3,15 +3,17 @@
 //! 翻译自 Go `transport/internet/reality/reality.go` 的 `UClient`/`UConn` 部分。
 //!
 //! # 现状（重要）
-//! **实际 uTLS 握手未实现**。Rust 生态目前没有
-//! `github.com/refraction-networking/utls` 的成熟等价品（需要字节级
-//! ClientHello 控制：SessionId 注入、key_share ECDH、AEAD 加密 sessionId[:16]
-//! 等）。本模块只翻译**配置数据结构与签名**，让上层能基于 [`UConnState`] 类型工作。
+//! **实际 uTLS 握手 BLOCKED on watfaq-rustls**。REALITY 核心需要 uTLS 内部 API
+//! （`BuildHandshakeState`、`HandshakeState.State13.KeyShareKeys.Ecdhe`、
+//! `hello.Raw` 固定位置写入），标准 rustls 不暴露这些。n9e ADR 4.2/4.3
+//! 🔒 LOCKED 选定 watfaq-rustls（utls-0.23 分支）为首选实现。
 //!
-//! 切片2 留待：
-//! - 接入 `rustls` + 自研 uTLS 等价品（或上游 fork）
-//! - `VerifyPeerCertificate` 回调（Go 端通过 reflect+unsafe hack 读 utls 内部字段，
-//!   Rust 端需要 TLS 库暴露同等 API）
+//! **纯密码学算法已提取到 [`crate::crypto`] 模块**（session_id 编码、ECDH
+//! auth_key 派生、AES-GCM 加密、HMAC-SHA512 证书验证），独立可测。
+//!
+//! 切片2 留待（依赖 watfaq-rustls 决策）：
+//! - 接入 watfaq-rustls `.with_reality()` API 完成字节级 ClientHello 注入
+//! - `VerifyPeerCertificate` 回调（Go 端通过 reflect+unsafe hack 读 utls 内部字段）
 //! - http2 spider crawler（fallback 模式：路径收集 + RandBetween delays）
 
 use crate::config::RealityConfig;

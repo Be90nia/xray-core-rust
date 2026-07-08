@@ -3,12 +3,14 @@
 //! 翻译自 Go `transport/internet/reality/reality.go` 的 `Server`/`Conn` 部分。
 //!
 //! # 现状（重要）
-//! **实际握手未实现**。`Server` 函数依赖 `github.com/xtls/reality` 库
-//! （服务端 REALITY 状态机），Rust 端无等价品。本模块只翻译**配置数据结构
-//! 与签名**。
+//! **实际握手 BLOCKED on watfaq-rustls**。服务端 REALITY 状态机（解析 ClientHello
+//! session_id、校验 short_id/timestamp、fallback 处理）依赖 `xtls/reality` Rust
+//! 等价品。n9e ADR 4.3 🔒 LOCKED 选定 watfaq-rustls 为首选实现。
 //!
-//! 切片2 留待：
-//! - 接入 xtls/reality Rust 等价品（服务端状态机）
+//! **纯密码学算法已提取到 [`crate::crypto`] 模块**，独立可测。
+//!
+//! 切片2 留待（依赖 watfaq-rustls 决策）：
+//! - 接入 watfaq-rustls 服务端 REALITY 状态机
 //! - 解析 ClientHello.SessionId[:16] 还原 [version, timestamp, short_id]
 //! - 校验 short_id ∈ short_ids map
 //! - 校验 `|now - sessionId.timestamp| ≤ max_time_diff`

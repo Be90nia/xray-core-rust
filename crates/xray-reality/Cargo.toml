@@ -14,3 +14,10 @@ prost = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# REALITY 纯密码学组件（与 xray-proxy-ss 版本对齐，aead 0.6 生态）
+aes-gcm = "0.11.0-rc.4"
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+# X25519 ECDH 派生 auth_key（纯 Rust，无 C 依赖）
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }

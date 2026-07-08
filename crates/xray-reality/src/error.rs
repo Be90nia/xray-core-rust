@@ -20,6 +20,14 @@ pub enum RealityError {
     #[error("REALITY: SharedKey (ECDH) is nil")]
     EmptySharedKey,
 
+    /// ECDH 或 HKDF-SHA256 派生 auth_key 失败（密钥长度错或 HKDF expand 失败）。
+    #[error("REALITY: auth_key derivation failed (ECDH or HKDF)")]
+    AuthKeyDeriveFailed,
+
+    /// AES-256-GCM 加密 session_id[:16] 失败（auth_key 长度非 32 字节）。
+    #[error("REALITY: session_id AES-GCM encryption failed")]
+    SessionIdEncryptFailed,
+
     /// 当前 uTLS 指纹不支持 TLS 1.3，无法完成 REALITY 握手。
     #[error("REALITY: current fingerprint does not support TLS 1.3, handshake cannot establish")]
     FingerprintNoTls13,

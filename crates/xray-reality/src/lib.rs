@@ -15,7 +15,9 @@
 //! 以下部分依赖 uTLS 字节级 ClientHello 控制、`xtls/reality` 库等，**本会话不翻译**：
 //! - 实际 uTLS 握手（[`client::u_client`] / [`server::server`] 返回
 //!   [`RealityError::UtlsRequired`]）
-//! - 字节级 ClientHello 伪装（SessionId 注入、key_share ECDH、AEAD 加密）
+//! - 字节级 ClientHello 伪装（SessionId 注入到 `hello.Raw`、HandshakeState 访问）
+//!   — **协议算法**（session_id 编码、ECDH auth_key 派生、AES-GCM 加密、HMAC-SHA512 证书验证）
+//!   已提取到 [`crypto`] 模块独立实现。握手层注入等接入 watfaq-rustls（见 n9e ADR 4.2/4.3）。
 //! - `VerifyPeerCertificate` 回调（Go 端通过 reflect+unsafe hack 读 utls 内部字段，
 //!   Rust 端需要 TLS 库暴露同等 API）
 //! - mldsa65 后量子签名验证（依赖 `circl/sign/mldsa65`）
@@ -34,9 +36,15 @@ pub mod config;
 pub mod error;
 pub mod server;
 pub mod util;
+pub mod crypto;
 
 pub use config::{
     LimitFallback, RealityConfig, ShortId, SHORT_ID_LEN, X25519_KEY_LEN,
 };
 pub use error::{RealityError, Result};
 pub use util::{get_path_locked, open_key_log_writer};
+
+pub use crypto::{
+    AEAD_NONCE_LEN, AUTH_KEY_LEN, HKDF_INFO, HKDF_SALT_LEN, SESSION_ID_LEN,
+    derive_auth_key, encode_session_id, encrypt_session_id, verify_reality_certificate,
+};
