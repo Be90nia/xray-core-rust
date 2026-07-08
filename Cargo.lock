@@ -2610,6 +2610,7 @@ name = "xray-app-router"
 version = "0.1.0"
 dependencies = [
  "parking_lot",
+ "prost",
  "rand 0.9.4",
  "regex",
  "serde",

@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+use xray_geodata::loader::GeoDataLoader;
 use xray_proto::xray::app::router::{BalancingRule, Config, RoutingRule};
 
 use crate::balancing::{Balancer, BalancingStrategy, OutboundHandlerSelector};
@@ -42,6 +43,7 @@ pub struct Router {
     rules: RwLock<Vec<Arc<Rule>>>,
     balancers: RwLock<HashMap<String, Arc<Balancer>>>,
     ohm: Arc<dyn OutboundHandlerSelector>,
+    geo_loader: Option<Arc<GeoDataLoader>>,
 }
 
 impl Router {
@@ -51,6 +53,7 @@ impl Router {
     pub fn init(
         config: &Config,
         ohm: Arc<dyn OutboundHandlerSelector>,
+        geo_loader: Option<Arc<GeoDataLoader>>,
     ) -> Result<Arc<Self>, RouterError> {
         // 1. 构建平衡器映射
         let mut balancers: HashMap<String, Arc<Balancer>> = HashMap::new();
@@ -65,7 +68,7 @@ impl Router {
         let mut rules: Vec<Arc<Rule>> = Vec::with_capacity(config.rule.len());
         let mut seen_rule_tags = std::collections::HashSet::new();
         for rr in &config.rule {
-            let r = build_rule(rr, &balancers)?;
+            let r = build_rule(rr, &balancers, geo_loader.as_deref())?;
             if !r.rule_tag.is_empty() && !seen_rule_tags.insert(r.rule_tag.clone()) {
                 return Err(RouterError::DuplicateRuleTag(r.rule_tag.clone()));
             }
@@ -77,6 +80,7 @@ impl Router {
             rules: RwLock::new(rules),
             balancers: RwLock::new(balancers),
             ohm,
+            geo_loader,
         }))
     }
 
@@ -88,6 +92,7 @@ impl Router {
             rules: RwLock::new(Vec::new()),
             balancers: RwLock::new(HashMap::new()),
             ohm,
+            geo_loader: None,
         })
     }
 
@@ -135,7 +140,7 @@ impl Router {
         let balancers = self.balancers.read();
         let mut proto = proto;
         proto.rule_tag = rule_tag.clone();
-        let r = build_rule(&proto, &balancers)?;
+        let r = build_rule(&proto, &balancers, self.geo_loader.as_deref())?;
         rules.push(Arc::new(r));
         Ok(())
     }
@@ -164,7 +169,7 @@ impl Router {
         let mut new_rules = Vec::with_capacity(protos.len());
         let mut seen = std::collections::HashSet::new();
         for p in protos {
-            let r = build_rule(p, &balancers)?;
+            let r = build_rule(p, &balancers, self.geo_loader.as_deref())?;
             if !r.rule_tag.is_empty() && !seen.insert(r.rule_tag.clone()) {
                 return Err(RouterError::DuplicateRuleTag(r.rule_tag.clone()));
             }
@@ -256,6 +261,7 @@ mod tests {
     use super::*;
     use crate::context::RoutingData;
     use crate::balancing::NotImplementedSelector;
+    use std::net::{IpAddr, Ipv4Addr};
 
     fn simple_tag_rule(tag: &str, domain: &str) -> RoutingRule {
         use xray_proto::xray::app::router::routing_rule::TargetTag;
@@ -299,7 +305,7 @@ mod tests {
     fn test_simple_router_picks_matching_rule() {
         let mut cfg = Config::default();
         cfg.rule = vec![simple_tag_rule("direct", "example.com")];
-        let r = Router::init(&cfg, Arc::new(NotImplementedSelector)).unwrap();
+        let r = Router::init(&cfg, Arc::new(NotImplementedSelector), None).unwrap();
         let hit = RoutingData::new().with_target_domain("example.com");
         let miss = RoutingData::new().with_target_domain("other.io");
         assert_eq!(
@@ -353,7 +359,151 @@ mod tests {
     fn test_domain_strategy_from_config() {
         let mut cfg = Config::default();
         cfg.domain_strategy = 3; // IpOnDemand
-        let r = Router::init(&cfg, Arc::new(NotImplementedSelector)).unwrap();
+        let r = Router::init(&cfg, Arc::new(NotImplementedSelector), None).unwrap();
         assert_eq!(r.domain_strategy(), DomainStrategy::IpOnDemand);
+    }
+
+
+
+    // ── GeoIP / GeoSite rule E2E ──
+    //
+    // 构造临时 dat 文件 → GeoDataLoader → Router 路由命中。
+    // 验收要求：复杂规则集能正确路由（domain suffix、IP CIDR、geoip 等）。
+    fn unique_dir(label: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "xray-router-e2e-{}-{label}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn make_geoip_dat() -> Vec<u8> {
+        use prost::Message;
+        use xray_proto::xray::common::geodata::{Cidr, GeoIpList, GeoIp};
+        let cn = GeoIp {
+            code: "CN".into(),
+            cidr: vec![
+                Cidr { ip: vec![192, 168, 0, 0], prefix: 16 },
+                Cidr { ip: vec![10, 0, 0, 0], prefix: 8 },
+            ],
+            reverse_match: false,
+        };
+        let list = GeoIpList { entry: vec![cn] };
+        list.encode_to_vec()
+    }
+
+    fn make_geosite_dat() -> Vec<u8> {
+        use prost::Message;
+        use xray_proto::xray::common::geodata::{Domain, GeoSite, GeoSiteList};
+        let cn = GeoSite {
+            code: "CN".into(),
+            domain: vec![
+                Domain { r#type: 3 /*Full*/ as i32, value: "baidu.com".into(), attribute: vec![] },
+                Domain { r#type: 2 /*Domain*/ as i32, value: "qq.com".into(), attribute: vec![] },
+            ],
+        };
+        let list = GeoSiteList { entry: vec![cn] };
+        list.encode_to_vec()
+    }
+
+    fn geoip_rule() -> RoutingRule {
+        use xray_proto::xray::app::router::routing_rule::TargetTag;
+        use xray_proto::xray::common::geodata::{GeoIpRule, IpRule};
+        use xray_proto::xray::common::geodata::ip_rule::Value as IV;
+        RoutingRule {
+            target_tag: Some(TargetTag::Tag("cn_direct".into())),
+            rule_tag: String::new(),
+            ip: vec![IpRule {
+                value: Some(IV::Geoip(GeoIpRule {
+                    file: "geoip.dat".into(),
+                    code: "cn".into(),
+                    reverse_match: false,
+                })),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn geosite_rule() -> RoutingRule {
+        use xray_proto::xray::app::router::routing_rule::TargetTag;
+        use xray_proto::xray::common::geodata::{DomainRule, GeoSiteRule};
+        use xray_proto::xray::common::geodata::domain_rule::Value as DV;
+        RoutingRule {
+            target_tag: Some(TargetTag::Tag("cn_site".into())),
+            rule_tag: String::new(),
+            domain: vec![DomainRule {
+                value: Some(DV::Geosite(GeoSiteRule {
+                    file: "geosite.dat".into(),
+                    code: "cn".into(),
+                    attrs: String::new(),
+                })),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_e2e_geoip_rule_routes_by_cidr() {
+        use xray_geodata::loader::GeoDataLoader;
+        let dir = unique_dir("geoip");
+        std::fs::write(dir.join("geoip.dat"), make_geoip_dat()).unwrap();
+        let loader = Arc::new(GeoDataLoader::new(dir.clone()));
+
+        let mut cfg = Config::default();
+        cfg.rule = vec![geoip_rule()];
+        let r = Router::init(&cfg, Arc::new(NotImplementedSelector), Some(loader)).unwrap();
+
+        // 命中 CN CIDR 192.168.0.0/16
+        let hit = RoutingData::new().with_target_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
+        let route = r.pick_route(&hit).unwrap();
+        assert_eq!(route.outbound_tag, "cn_direct");
+
+        // 不命中
+        let miss = RoutingData::new().with_target_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(matches!(r.pick_route(&miss), Err(RouterError::NoClue)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_e2e_geosite_rule_routes_by_domain() {
+        use xray_geodata::loader::GeoDataLoader;
+        let dir = unique_dir("geosite");
+        std::fs::write(dir.join("geosite.dat"), make_geosite_dat()).unwrap();
+        let loader = Arc::new(GeoDataLoader::new(dir.clone()));
+
+        let mut cfg = Config::default();
+        cfg.rule = vec![geosite_rule()];
+        let r = Router::init(&cfg, Arc::new(NotImplementedSelector), Some(loader)).unwrap();
+
+        // baidu.com 是 Full 类型，应命中
+        let hit_full = RoutingData::new().with_target_domain("baidu.com");
+        assert_eq!(r.pick_route(&hit_full).unwrap().outbound_tag, "cn_site");
+
+        // qq.com 是 Domain 类型，应命中本身与子域名
+        let hit_sub = RoutingData::new().with_target_domain("www.qq.com");
+        assert_eq!(r.pick_route(&hit_sub).unwrap().outbound_tag, "cn_site");
+
+        // 不在 CN geosite
+        let miss = RoutingData::new().with_target_domain("google.com");
+        assert!(matches!(r.pick_route(&miss), Err(RouterError::NoClue)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_geo_rule_without_loader_skips_gracefully() {
+        // loader = None 时 GeoIP/GeoSite 变体 warn 并 skip，不 panic
+        let mut cfg = Config::default();
+        cfg.rule = vec![geoip_rule()];
+        // loader = None 时 GeoIP 变体被 skip，IPMatcher 收到空 vec 返回错（GeodataBuild）
+        let result = Router::init(&cfg, Arc::new(NotImplementedSelector), None);
+        assert!(result.is_err(), "expected error when geoip rule present but no loader");
     }
 }

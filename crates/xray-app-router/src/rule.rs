@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use xray_common::net::network::Network;
 use xray_common::net::port::{MemoryPortList, Port, PortRange};
+use xray_geodata::loader::GeoDataLoader;
 use xray_geodata::matcher::domain::{DomainRule as MatcherDomainRule, DomainType};
 use xray_proto::xray::app::router::RoutingRule;
 use xray_proto::xray::common::net::PortList;
@@ -74,8 +75,9 @@ impl Rule {
 pub fn build_rule(
     proto: &RoutingRule,
     balancers: &std::collections::HashMap<String, Arc<Balancer>>,
+    geo_loader: Option<&GeoDataLoader>,
 ) -> Result<Rule, RouterError> {
-    let cond = build_condition(proto)?;
+    let cond = build_condition(proto, geo_loader)?;
 
     // 解析 target_tag oneof
     let (mut tag, mut balancer) = (String::new(), None);
@@ -109,12 +111,15 @@ pub fn build_rule(
 /// 从 proto `RoutingRule` 构造匹配器链。
 ///
 /// 对应 Go `RoutingRule.BuildCondition`。
-pub fn build_condition(proto: &RoutingRule) -> Result<Box<dyn Condition>, RouterError> {
+pub fn build_condition(
+    proto: &RoutingRule,
+    geo_loader: Option<&GeoDataLoader>,
+) -> Result<Box<dyn Condition>, RouterError> {
     let mut chan = ConditionChan::new();
 
     // Domain
     if !proto.domain.is_empty() {
-        let rules = parse_proto_domain_rules(&proto.domain);
+        let rules = parse_proto_domain_rules(&proto.domain, geo_loader);
         if !rules.is_empty() {
             chan.add(Box::new(DomainMatcherCondition::new(rules)?));
         }
@@ -122,18 +127,22 @@ pub fn build_condition(proto: &RoutingRule) -> Result<Box<dyn Condition>, Router
 
     // Target IP
     if !proto.ip.is_empty() {
-        chan.add(Box::new(IPMatcherCondition::new(convert_proto_ip_rules(&proto.ip), IpMatchAsType::Target)?));
+        let rules = convert_proto_ip_rules(&proto.ip, geo_loader)?;
+        chan.add(Box::new(IPMatcherCondition::new(rules, IpMatchAsType::Target)?));
     }
 
     // Source IP
     if !proto.source_ip.is_empty() {
-        chan.add(Box::new(IPMatcherCondition::new(convert_proto_ip_rules(&proto.source_ip), IpMatchAsType::Source)?));
+        let rules = convert_proto_ip_rules(&proto.source_ip, geo_loader)?;
+        chan.add(Box::new(IPMatcherCondition::new(rules, IpMatchAsType::Source)?));
     }
 
     // Local IP
     if !proto.local_ip.is_empty() {
-        chan.add(Box::new(IPMatcherCondition::new(convert_proto_ip_rules(&proto.local_ip), IpMatchAsType::Local)?));
+        let rules = convert_proto_ip_rules(&proto.local_ip, geo_loader)?;
+        chan.add(Box::new(IPMatcherCondition::new(rules, IpMatchAsType::Local)?));
     }
+
 
     // Ports
     if let Some(pl) = proto.port_list.as_ref() {
@@ -230,37 +239,97 @@ fn proto_domain_type_to_matcher(v: i32) -> Option<DomainType> {
     }
 }
 
-/// 将 proto DomainRule 列表解析为 matcher DomainRule 列表。
-///
-/// 仅处理 `custom` 变体；`geosite` 变体（文件加载）留 TODO。
+/**
+ * 将 proto DomainRule 列表解析为 matcher DomainRule 列表。
+ *
+ * - `custom` 变体：直接转换。
+ * - `geosite` 变体：调用 geo_loader.load_site 加载文件中的 GeoSite 条目；
+ *   loader 缺失时 warn 并 skip。
+ */
 fn parse_proto_domain_rules(
     proto_rules: &[xray_proto::xray::common::geodata::DomainRule],
+    geo_loader: Option<&GeoDataLoader>,
 ) -> Vec<MatcherDomainRule> {
     use xray_proto::xray::common::geodata::domain_rule::Value as ProtoDV;
-    let mut out = Vec::with_capacity(proto_rules.len());
-    for (i, r) in proto_rules.iter().enumerate() {
+    let mut out: Vec<MatcherDomainRule> = Vec::new();
+    for r in proto_rules {
         let Some(value) = r.value.as_ref() else { continue };
         match value {
             ProtoDV::Custom(d) => {
                 let Some(dt) = proto_domain_type_to_matcher(d.r#type) else { continue };
-                out.push(MatcherDomainRule::new(dt, d.value.clone(), (i + 1) as u32));
+                let idx = (out.len() + 1) as u32;
+                out.push(MatcherDomainRule::new(dt, d.value.clone(), idx));
             }
-            ProtoDV::Geosite(_) => {
-                // TODO: 接入 geosite loader（文件加载）
-                tracing::warn!(target: "xray_router::rule", "geosite domain rule not yet supported, skipping");
+            ProtoDV::Geosite(geosite_rule) => {
+                let Some(loader) = geo_loader else {
+                    tracing::warn!(
+                        target: "xray_router::rule",
+                        file = geosite_rule.file,
+                        code = geosite_rule.code,
+                        "geosite domain rule present but no geo_loader configured, skipping",
+                    );
+                    continue;
+                };
+                match load_geosite_to_matcher_rules(geosite_rule, loader) {
+                    Ok(rules) => out.extend(rules),
+                    Err(e) => tracing::warn!(
+                        target: "xray_router::rule",
+                        error = %e,
+                        "failed to load geosite rule, skipping",
+                    ),
+                }
             }
         }
     }
     out
 }
 
+/// 从 dat 文件加载 GeoSite 条目并转换为 matcher DomainRule 列表。
+///
+/// - `file` 为空时默认 `geosite.dat`。
+/// - `code` 转大写（与 dat 文件中存储格式一致）。
+/// - `attrs` 非空时按 `@` 分隔的属性 key 过滤 domain。
+fn load_geosite_to_matcher_rules(
+    geosite_rule: &xray_proto::xray::common::geodata::GeoSiteRule,
+    loader: &GeoDataLoader,
+) -> Result<Vec<MatcherDomainRule>, RouterError> {
+    let file = if geosite_rule.file.is_empty() {
+        "geosite.dat"
+    } else {
+        geosite_rule.file.as_str()
+    };
+    let code = geosite_rule.code.to_uppercase();
+    let site = if geosite_rule.attrs.is_empty() {
+        loader
+            .load_site(file, &code)
+            .map_err(|e| RouterError::GeodataBuild(format!("load geosite {file}:{code}: {e}")))?
+    } else {
+        loader
+            .load_site_with_attrs(file, &code, &geosite_rule.attrs)
+            .map_err(|e| RouterError::GeodataBuild(format!("load geosite {file}:{code}: {e}")))?
+    };
+
+    Ok(site
+        .domain
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let dt = proto_domain_type_to_matcher(d.r#type).unwrap_or(DomainType::Full);
+            MatcherDomainRule::new(dt, d.value.clone(), (i + 1) as u32)
+        })
+        .collect())
+}
+
 /// 将 proto `IpRule` 列表（`xray.common.geodata`）转换为 xray-geodata 的 `IpRule`（`xray.geodata`）。
 ///
 /// 两个 crate 各自构建 proto，生成同名不同类型。此函数字段级复制。
-/// 仅转换 `Custom(CidrRule)` 变体；`Geoip` 变体需文件加载（TODO）。
+/// - `Custom(CidrRule)` 变体：直接转换。
+/// - `Geoip(GeoIPRule)` 变体：调用 geo_loader.load_ip 加载文件中的 GeoIP 条目，
+///   展开 CIDR 列表为多个 Custom 变体；loader 缺失时 warn 并 skip。
 fn convert_proto_ip_rules(
     proto_rules: &[xray_proto::xray::common::geodata::IpRule],
-) -> Vec<xray_geodata::pb::IpRule> {
+    geo_loader: Option<&GeoDataLoader>,
+) -> Result<Vec<xray_geodata::pb::IpRule>, RouterError> {
     use xray_proto::xray::common::geodata::ip_rule::Value as ProtoIV;
     let mut out = Vec::with_capacity(proto_rules.len());
     for r in proto_rules {
@@ -280,13 +349,65 @@ fn convert_proto_ip_rules(
                     )),
                 });
             }
-            ProtoIV::Geoip(_) => {
-                // TODO: 接入 geoip loader
-                tracing::warn!(target: "xray_router::rule", "geoip rule not yet supported, skipping");
+            ProtoIV::Geoip(geoip_rule) => {
+                let Some(loader) = geo_loader else {
+                    tracing::warn!(
+                        target: "xray_router::rule",
+                        file = geoip_rule.file,
+                        code = geoip_rule.code,
+                        "geoip rule present but no geo_loader configured, skipping",
+                    );
+                    continue;
+                };
+                match load_geoip_to_matcher_rules(geoip_rule, loader) {
+                    Ok(rules) => out.extend(rules),
+                    Err(e) => tracing::warn!(
+                        target: "xray_router::rule",
+                        error = %e,
+                        "failed to load geoip rule, skipping",
+                    ),
+                }
             }
         }
     }
-    out
+    Ok(out)
+}
+
+/// 从 dat 文件加载 GeoIP 条目并展开为多个 Custom IpRule。
+///
+/// - `file` 为空时默认 `geoip.dat`。
+/// - `code` 转大写。
+/// - 反向匹配 = rule.reverse_match XOR geoip.reverse_match（与 Go 行为一致）。
+fn load_geoip_to_matcher_rules(
+    geoip_rule: &xray_proto::xray::common::geodata::GeoIpRule,
+    loader: &GeoDataLoader,
+) -> Result<Vec<xray_geodata::pb::IpRule>, RouterError> {
+    let file = if geoip_rule.file.is_empty() {
+        "geoip.dat"
+    } else {
+        geoip_rule.file.as_str()
+    };
+    let code = geoip_rule.code.to_uppercase();
+    let geoip = loader
+        .load_ip(file, &code)
+        .map_err(|e| RouterError::GeodataBuild(format!("load geoip {file}:{code}: {e}")))?;
+
+    let reverse = geoip_rule.reverse_match ^ geoip.reverse_match;
+    Ok(geoip
+        .cidr
+        .into_iter()
+        .map(|cidr| xray_geodata::pb::IpRule {
+            value: Some(xray_geodata::pb::ip_rule::Value::Custom(
+                xray_geodata::pb::CidrRule {
+                    cidr: Some(xray_geodata::pb::Cidr {
+                        ip: cidr.ip,
+                        prefix: cidr.prefix,
+                    }),
+                    reverse_match: reverse,
+                },
+            )),
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -310,7 +431,7 @@ mod tests {
     #[test]
     fn test_build_condition_empty_rule_errors() {
         let proto = RoutingRule::default();
-        let r = build_condition(&proto);
+        let r = build_condition(&proto, None);
         assert!(matches!(r, Err(RouterError::EmptyRule)));
     }
 
@@ -318,8 +439,8 @@ mod tests {
     fn test_build_condition_domain_matcher() {
         let mut proto = RoutingRule::default();
         proto.domain = vec![full_domain("example.com")];
-        let _ = build_condition(&proto).unwrap();
-        let cond = build_condition(&proto).unwrap();
+        let _ = build_condition(&proto, None).unwrap();
+        let cond = build_condition(&proto, None).unwrap();
         let hit = RoutingData::new().with_target_domain("example.com");
         let miss = RoutingData::new().with_target_domain("other.io");
         assert!(cond.apply(&hit));
@@ -330,7 +451,7 @@ mod tests {
     fn test_build_condition_inbound_tag() {
         let mut proto = RoutingRule::default();
         proto.inbound_tag = vec!["in1".into()];
-        let cond = build_condition(&proto).unwrap();
+        let cond = build_condition(&proto, None).unwrap();
         let hit = RoutingData::new().with_inbound_tag("in1");
         let miss = RoutingData::new().with_inbound_tag("in2");
         assert!(cond.apply(&hit));

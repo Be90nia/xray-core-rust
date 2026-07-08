@@ -20,3 +20,4 @@ rand = { workspace = true }
 regex = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
+prost = { workspace = true }

@@ -6,12 +6,13 @@
 //! ## 当前实现范围
 //!
 //! **业务核心（独立可测）**：
-//! - `Router` 路由器主体（规则匹配 + 负载均衡 + 域名策略）
+//! - `Router` 路由器主体（规则匹配 + 负载均衡 + 域名策略 + GeoData 文件加载）
 //! - 9 种 `Condition` 匹配器（Domain/IP/Port/Network/User/InboundTag/Protocol/Attribute/ProcessName）
 //! - 4 种 `BalancingStrategy`（Random/RoundRobin/LeastPing/LeastLoad）
 //! - `WeightManager` 权重管理
 //! - `WebhookNotifier` 事件通知（含去重）
 //! - `Override` 平衡器目标覆盖
+//! - `Rule::build_rule(proto, balancers, geo_loader)`：`GeoDataLoader` 接入后 `geosite`/`geoip` rule 变体从 dat 文件加载
 //!
 //! **IO 边界（trait + 占位）**：
 //! - `OutboundHandlerSelector`（Go `outbound.HandlerSelector`）：`select_outbounds` 返回 `NotImplemented`
@@ -23,7 +24,6 @@
 //! **等接入**：等 xray-features 统一为手写 boxed future 风格后，再实现
 //! `xray_features::routing::Router` trait（当前 trait 用 `#[async_trait]`，
 //! 与新 crate 风格不一致）。
-//!
 //! 对应 Go 源：`app/router/{router,condition,config,balancing,balancing_override,
 //! strategy_leastload,strategy_leastping,strategy_random,weight,webhook}.go`
 
