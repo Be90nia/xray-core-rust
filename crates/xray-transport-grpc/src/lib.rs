@@ -12,16 +12,22 @@
 //!
 //! ## 切片边界（P5-4 切片1）
 //!
-//! 仅实现配置层 + 服务名解析逻辑（纯字符串处理，独立可测）：
-//! - [`config::Config`] — 8 字段配置 + `service_name`/`tun_stream_name`/
-//!   `tun_multi_stream_name` 解析 + prost proto 双向转换
-//! - [`config::path_escape`] — URL path percent-escape（对应 Go `url.PathEscape`）
+//! 切片1 已交付配置层：[`config::Config`] 8 字段 + `service_name`/
+//! `tun_stream_name`/`tun_multi_stream_name` 解析 + prost proto 双向转换。
 //!
-//! 切片2 待办：`dial`（依赖 tonic/h2 替代 google.golang.org/grpc）+
-//! `hub`（grpc.Server）+ `encoding`（HunkConn/MultiHunkConn 适配 net.Conn）+
-//! User-Agent 反射 hack（Rust 端改用 tonic interceptor）。
-
+//! ## 切片2（dcs）
+//!
+//! 实现协议核心层（不引入 tonic/h2 重依赖）：
+//! - [`encoding`] — gRPC wire framing + [`encoding::Hunk`] proto 手动编解码 +
+//!   [`encoding::HunkStream`] trait 抽象（由调用方注入 h2/hyper 传输）+
+//!   [`encoding::HunkReaderWriter`] 适配 [`xray_buf::io::Reader`]/[`xray_buf::io::Writer`]
+//! - [`client`] — [`client::GrpcClient`] 把已建立的 HunkStream 包成 `transport::Link`
+//! - [`server`] — [`server::GrpcServer`] 处理 inbound HunkStream + 路由匹配
+//!
+//! 实际 HTTP/2 + TLS 拨号/监听留 follow-up（依赖 tonic/h2 决策，由
+//! `k9t reality-s2` 等 TLS 切片解锁后统一接入）。
 pub mod config;
+pub mod encoding;
 pub mod error;
 pub mod client;
 pub mod server;

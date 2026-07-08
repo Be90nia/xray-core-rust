@@ -13,3 +13,4 @@ xray-proto = { path = "../xray-proto" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+prost = { workspace = true }
