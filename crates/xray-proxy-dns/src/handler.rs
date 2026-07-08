@@ -16,11 +16,12 @@
 
 use std::time::Duration;
 
+use tokio::io::{AsyncRead, AsyncReadExt};
 use xray_common::net::destination::Destination;
 
 use crate::config::{Config, DnsRule, RuleAction};
-use crate::dns_message::DnsQuestion;
-
+use crate::dns_message::{build_dns_response, parse_dns_query, DnsQuestion};
+use crate::error::{DnsProxyError, Result};
 /// DNS 代理 Handler。对应 Go `proxy/dns/dns.go::Handler` struct。
 #[derive(Debug)]
 pub struct Handler {
@@ -80,25 +81,73 @@ impl Handler {
         self.rules.len()
     }
 
-    /// Process stub——处理 DNS 连接。切片3 实现。
+    /// 处理一条 DNS 查询，返回决策结果。对应 Go `Handler.Process` 的纯决策部分。
     ///
-    /// Go 端 `Process(ctx, link, dispatcher)` 流程：
-    /// 1. 从 link.reader 读取 DNS 消息
-    /// 2. `parse_dns_query` 提取 qType + domain
-    /// 3. `match_rules` 查找规则
-    /// 4. 按规则执行：Direct（转发到上游）/ Drop（不响应）/ Return（返回 REFUSED）/ Hijack（重写到 rewrite_server）
-    /// 5. 写响应到 link.writer
+    /// 本函数不做 IO（dispatcher 模式）：
+    /// - 解析 DNS query（`parse_dns_query`）
+    /// - `match_rules` 查找首个命中规则
+    /// - 按 action 构造 [`ProcessOutcome`] 交由调用方（dispatcher）执行
     ///
-    /// 切片3 待办：接入 dispatcher + dns::Client + transport::Link + FakeDNS。
-    pub async fn process(
-        &self,
-        _query: &[u8],
-    ) -> Result<ProcessOutcome, crate::error::DnsProxyError> {
-        // 切片2: 返回 Unimplemented，让调用方知道需要切片3。
-        Err(crate::error::DnsProxyError::InvalidConfig(
-            "Handler::process not implemented (切片3)".into(),
-        ))
+    /// action → outcome 映射：
+    /// - `Direct` → [`ProcessOutcome::Forward`]（query 原样转给调用方）
+    /// - `Drop` → [`ProcessOutcome::Drop`]（不响应）
+    /// - `Return` → [`ProcessOutcome::Respond`]（构造 REFUSED 空响应）
+    /// - `Hijack` → [`ProcessOutcome::Hijack`]（转给 `rewrite_server`，调用方执行）
+    ///
+    /// # Errors
+    /// - [`DnsProxyError::QueryParseFailed`]：`query` 不是合法 DNS 消息。
+    pub async fn process(&self, query: &[u8]) -> Result<ProcessOutcome> {
+        let (header, question) = parse_dns_query(query)
+            .map_err(|e| DnsProxyError::QueryParseFailed(e.to_string()))?;
+        let action = self.match_rules(question.q_type, &question.name);
+        let outcome = match action {
+            RuleAction::Drop => ProcessOutcome::Drop,
+            RuleAction::Return => {
+                // Return 动作：REFUSED(5) 空响应
+                let response = build_dns_response(&header, &question, 5);
+                ProcessOutcome::Respond { response }
+            }
+            RuleAction::Direct => ProcessOutcome::Forward {
+                query: query.to_vec(),
+            },
+            RuleAction::Hijack => ProcessOutcome::Hijack {
+                query: query.to_vec(),
+            },
+        };
+        Ok(outcome)
     }
+}
+
+// ---------------------------------------------------------------------------
+// DNS over TCP 长度前缀帧（RFC 1035 §4.2.2）
+// ---------------------------------------------------------------------------
+
+/// 给 DNS 消息加 TCP 长度前缀（2B BE）。
+///
+/// TCP DNS 流每条 message 前有 2 字节 big-endian 长度前缀；UDP DNS 无此前缀。
+///
+/// # Errors
+/// - [`DnsProxyError::ResponseBuildFailed`]：`msg.len() > u16::MAX`。
+pub fn encode_tcp_dns_message(msg: &[u8]) -> Result<Vec<u8>> {
+    let len = u16::try_from(msg.len())
+        .map_err(|_| DnsProxyError::ResponseBuildFailed("msg too long for u16".into()))?;
+    let mut out = Vec::with_capacity(2 + msg.len());
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(msg);
+    Ok(out)
+}
+
+/// 从 TCP 流读取 DNS 消息（去除 2B BE 长度前缀）。
+///
+/// # Errors
+/// - 透传底层 IO 错误（包含 EOF）。
+pub async fn decode_tcp_dns_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
+    let mut len_buf = [0u8; 2];
+    reader.read_exact(&mut len_buf).await?;
+    let len = u16::from_be_bytes(len_buf) as usize;
+    let mut msg = vec![0u8; len];
+    reader.read_exact(&mut msg).await?;
+    Ok(msg)
 }
 
 /// Process 结果。切片3 会细化。
@@ -235,22 +284,138 @@ mod tests {
         assert_eq!(decide_action(&h, &q), RuleAction::Drop);
     }
 
-    #[test]
-    fn process_stub_returns_error() {
-        let h = Handler::init(&Config::default());
-        let result = futures_lite_or_block_on(h.process(&[]));
-        assert!(result.is_err());
+    // ---- Handler::process E2E ----
+
+    /// 构造最小 DNS A 查询消息。
+    fn make_query_bytes(domain: &str, q_type: u16) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0xABCDu16.to_be_bytes()); // ID
+        buf.extend_from_slice(&0x0100u16.to_be_bytes()); // flags: RD=1
+        buf.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+        buf.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+        buf.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+        buf.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+        for label in domain.split('.') {
+            buf.push(label.len() as u8);
+            buf.extend_from_slice(label.as_bytes());
+        }
+        buf.push(0); // QNAME 终止
+        buf.extend_from_slice(&q_type.to_be_bytes());
+        buf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS=IN
+        buf
     }
 
     /// 辅助：同步阻塞运行 future（避免引入 futures 执行器依赖）。
-    fn futures_lite_or_block_on<F>(f: F) -> std::result::Result<ProcessOutcome, crate::error::DnsProxyError>
+    fn futures_lite_or_block_on<F>(f: F) -> std::result::Result<ProcessOutcome, DnsProxyError>
     where
-        F: std::future::Future<Output = std::result::Result<ProcessOutcome, crate::error::DnsProxyError>>,
+        F: std::future::Future<Output = std::result::Result<ProcessOutcome, DnsProxyError>>,
     {
         // ponytail: 用 tokio runtime 阻塞执行（dev-dep 已有 tokio）。
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(f)
     }
+
+    #[test]
+    fn process_drop_when_rule_matches() {
+        let cfg = Config {
+            rule: vec![DnsRuleConfig {
+                action: RuleAction::Drop,
+                q_type: vec![1], // A
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let h = Handler::init(&cfg);
+        let query = make_query_bytes("example.com", 1);
+        let outcome = futures_lite_or_block_on(h.process(&query)).expect("process");
+        assert!(matches!(outcome, ProcessOutcome::Drop));
+    }
+
+    #[test]
+    fn process_respond_refused_when_action_return() {
+        let cfg = Config {
+            rule: vec![DnsRuleConfig {
+                action: RuleAction::Return,
+                q_type: vec![1],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let h = Handler::init(&cfg);
+        let query = make_query_bytes("example.com", 1);
+        let outcome = futures_lite_or_block_on(h.process(&query)).expect("process");
+        match outcome {
+            ProcessOutcome::Respond { response } => {
+                // 解析响应验证 RCODE=5(REFUSED) + QR=1
+                let (header, _) = crate::dns_message::parse_dns_query(&response).expect("parse resp");
+                assert!(header.is_response());
+                assert_eq!(header.rcode(), 5);
+            }
+            _ => panic!("expected Respond, got {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn process_forward_when_action_direct() {
+        // 默认配置无规则 → Direct
+        let h = Handler::init(&Config::default());
+        let query = make_query_bytes("x.com", 28);
+        let outcome = futures_lite_or_block_on(h.process(&query)).expect("process");
+        match outcome {
+            ProcessOutcome::Forward { query: q } => assert_eq!(q, query),
+            _ => panic!("expected Forward, got {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn process_hijack_when_action_hijack() {
+        let cfg = Config {
+            rule: vec![DnsRuleConfig {
+                action: RuleAction::Hijack,
+                q_type: vec![], // 匹配所有
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let h = Handler::init(&cfg);
+        let query = make_query_bytes("hijack.example.com", 1);
+        let outcome = futures_lite_or_block_on(h.process(&query)).expect("process");
+        match outcome {
+            ProcessOutcome::Hijack { query: q } => assert_eq!(q, query),
+            _ => panic!("expected Hijack, got {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn process_invalid_query_returns_parse_error() {
+        let h = Handler::init(&Config::default());
+        // 空字节不是合法 DNS 消息
+        let err = futures_lite_or_block_on(h.process(&[])).unwrap_err();
+        assert!(matches!(err, DnsProxyError::QueryParseFailed(_)));
+    }
+
+    // ---- TCP DNS frame helper ----
+
+    #[tokio::test]
+    async fn encode_decode_tcp_dns_frame_roundtrip() {
+        let msg = b"hello dns over tcp payload";
+        let framed = encode_tcp_dns_message(msg).expect("encode");
+        // 2B BE len + msg
+        assert_eq!(framed.len(), 2 + msg.len());
+        assert_eq!(&framed[0..2], &(msg.len() as u16).to_be_bytes());
+
+        let mut cursor = std::io::Cursor::new(framed);
+        let got = decode_tcp_dns_message(&mut cursor).await.expect("decode");
+        assert_eq!(got, msg);
+    }
+
+    #[test]
+    fn encode_tcp_dns_message_too_long_errors() {
+        let huge = vec![0u8; (u16::MAX as usize) + 1];
+        let err = encode_tcp_dns_message(&huge).unwrap_err();
+        assert!(matches!(err, DnsProxyError::ResponseBuildFailed(_)));
+    }
+
 
     #[test]
     fn rewrite_server_none_by_default() {
