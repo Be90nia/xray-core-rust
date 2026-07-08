@@ -16,17 +16,25 @@
 //! - [`handshake::compute_accept_key`] — RFC 6455 Sec-WebSocket-Accept 计算 (SHA-1+base64)
 //! - [`handshake::Opcode`] — 帧 opcode 枚举 + 控制帧判定
 //!
-//! 切片2 待办：实际 TCP/TLS 拨号 + 帧编解码 (依赖 `tokio-tungstenite` 替代
-//! `gorilla/websocket`) + Listener keepAccepting 循环 + heartbeat ping 后台任务 +
-//! PROXY protocol 解析 + TcpmaskManager 包装。
+//! ## 切片2 （P1-639）
+//!
+//! 接入 [`tokio-tungstenite`] 0.26 + rustls，实现真实拨号/监听 + early data (0-RTT)：
+//! - [`client::dial`] — TCP→TLS→WS 握手，构造自定义 request (host/path/Sec-WebSocket-Protocol)
+//! - [`server::WsListener`] — TCP listener + accept_hdr_async 拦截 host/path 校验 + early data 提取
+//! - [`ws_bridge::WsConnection`] — WebSocketStream → AsyncRead/AsyncWrite + Connection 包装
+//!
+//! 不在本切片：TcpmaskManager / PROXY protocol 解析 / X-Forwarded-For / 多 path 路由。
 
 pub mod config;
 pub mod error;
 pub mod handshake;
 pub mod client;
 pub mod server;
+pub mod ws_bridge;
 
 // 顶层 re-export。
 pub use config::Config;
 pub use error::{Result, WsError};
 pub use handshake::{Opcode, WS_GUID, compute_accept_key, generate_client_key_for_testing};
+pub use ws_bridge::WsConnection;
+pub use server::{AcceptedConn, WsListener};

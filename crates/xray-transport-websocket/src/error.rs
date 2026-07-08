@@ -24,6 +24,10 @@ pub enum WsError {
     /// IO 错误。
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// tokio-tungstenite / tungstenite 协议错误（握手 / 帧 / 协议违规）。
+    #[error("tungstenite error: {0}")]
+    Tungstenite(#[from] tokio_tungstenite::tungstenite::Error),
 }
 
 /// WebSocket 操作 Result 别名。
