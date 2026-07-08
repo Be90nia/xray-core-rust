@@ -28,6 +28,14 @@ pub enum SplitHttpError {
     /// IO 错误。
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// upload_queue: 队列已关闭（push 在 close 后调用）。
+    #[error("upload queue closed")]
+    QueueClosed,
+
+    /// upload_queue: reorder 堆超过 max_packets 上限，连接被强制拆除。
+    #[error("packet queue too large: max={max}, current={current}")]
+    PacketQueueTooLarge { max: usize, current: usize },
 }
 
 /// SplitHTTP 操作 Result 别名。

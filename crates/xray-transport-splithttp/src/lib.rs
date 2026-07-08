@@ -39,6 +39,7 @@ pub mod xpadding;
 // 顶层 re-export。
 pub use config::{Config, RangeConfig, XmuxConfig};
 pub use error::{Result, SplitHttpError};
+pub use upload_queue::{Packet, UploadQueue};
 // Placement 常量顶层 re-export，方便下游直接 `use xray_transport_splithttp::PLACEMENT_PATH`。
 pub use config::{
     PLACEMENT_AUTO, PLACEMENT_BODY, PLACEMENT_COOKIE, PLACEMENT_HEADER,
