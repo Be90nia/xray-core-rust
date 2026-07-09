@@ -311,3 +311,65 @@ fn full_roundtrip_chacha20poly1305() {
         .expect("decode_response_body");
     assert_eq!(decoded_resp_body, response_payload);
 }
+
+#[test]
+fn full_roundtrip_chunk_masking() {
+    // 验证 ChunkMasking option（ShakeSizeParser）完整 client↔server round-trip
+    let validator = make_validator_with_user();
+    let history = SessionHistory::new();
+
+    let client = ClientSession::new();
+    let cmd_key = xray_proxy_vmess::account::cmd_key_of(&sample_uuid());
+
+    let mut request_header = sample_request_header();
+    request_header
+        .option
+        .set(xray_proxy_vmess::request_option::CHUNK_MASKING);
+    let request_payload = b"chunk masking enabled shake size parser payload";
+
+    let mut client_to_server: Vec<u8> = Vec::new();
+    let sealed_header = client
+        .encode_request_header(&request_header, &cmd_key)
+        .expect("encode_request_header");
+    client_to_server.extend_from_slice(&sealed_header);
+    client
+        .encode_request_body(&request_header, request_payload, &mut client_to_server)
+        .expect("encode_request_body");
+
+    let mut server = ServerSession::new(&validator, &history);
+    let mut reader = &client_to_server[..];
+
+    let (decoded_req_header, _user) = server
+        .decode_request_header(&mut reader)
+        .expect("decode_request_header");
+    assert!(decoded_req_header
+        .option
+        .has(xray_proxy_vmess::request_option::CHUNK_MASKING));
+    let decoded_req_body = server
+        .decode_request_body(&decoded_req_header, &mut reader)
+        .expect("decode_request_body");
+    assert_eq!(decoded_req_body, request_payload);
+
+    // 响应同样走 ChunkMasking（encode_response_body 检查 request.option）
+    let response_header = ResponseHeader {
+        command: Command::Tcp,
+        option: Bitmask::new(0),
+    };
+    let response_payload = b"chunk masking server response";
+    let mut server_to_client: Vec<u8> = Vec::new();
+    server
+        .encode_response_header(&response_header, &mut server_to_client)
+        .expect("encode_response_header");
+    server
+        .encode_response_body(&decoded_req_header, response_payload, &mut server_to_client)
+        .expect("encode_response_body");
+
+    let mut client_reader = &server_to_client[..];
+    let _ = client
+        .decode_response_header(&mut client_reader)
+        .expect("decode_response_header");
+    let decoded_resp_body = client
+        .decode_response_body(&request_header, &mut client_reader)
+        .expect("decode_response_body");
+    assert_eq!(decoded_resp_body, response_payload);
+}

@@ -22,7 +22,8 @@ use xray_common::protocol::{Command, RequestHeader, ResponseHeader, SecurityType
 use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead};
 
 use crate::aead::{self, consts, OpenHeaderError};
-use crate::encoding::body_chunk::{self, ChunkNonceAdapter, PlainSizeParser};
+use crate::request_option;
+use crate::encoding::body_chunk::{self, ChunkNonceAdapter, PlainSizeParser, ShakeSizeParserAdapter, SizeParser};
 use crate::encoding::{authenticate, generate_chacha20poly1305_key, read_address_port};
 use crate::error::{Result, VmessError};
 use crate::validator::{MemoryUser, TimedUserValidator, Validator};
@@ -288,8 +289,12 @@ impl<'v> ServerSession<'v> {
             }
         };
         let mut nonce_gen = ChunkNonceAdapter::new(&self.request_body_iv, 12);
-        let mut size_parser = PlainSizeParser;
-        let plaintext = body_chunk::decode_chunk_stream(reader, cipher.as_ref(), &mut nonce_gen, &mut size_parser)?;
+        let mut size_parser: Box<dyn SizeParser> = if request.option.has(request_option::CHUNK_MASKING) {
+            Box::new(ShakeSizeParserAdapter::new(&self.request_body_iv))
+        } else {
+            Box::new(PlainSizeParser)
+        };
+        let plaintext = body_chunk::decode_chunk_stream(reader, cipher.as_ref(), &mut nonce_gen, size_parser.as_mut())?;
         Ok(plaintext)
     }
 
@@ -393,8 +398,12 @@ impl<'v> ServerSession<'v> {
             }
         };
         let mut nonce_gen = ChunkNonceAdapter::new(&self.response_body_iv, 12);
-        let mut size_parser = PlainSizeParser;
-        body_chunk::encode_chunk_stream(writer, data, cipher.as_ref(), &mut nonce_gen, &mut size_parser)?;
+        let mut size_parser: Box<dyn SizeParser> = if request.option.has(request_option::CHUNK_MASKING) {
+            Box::new(ShakeSizeParserAdapter::new(&self.response_body_iv))
+        } else {
+            Box::new(PlainSizeParser)
+        };
+        body_chunk::encode_chunk_stream(writer, data, cipher.as_ref(), &mut nonce_gen, size_parser.as_mut())?;
         Ok(())
     }
 }
