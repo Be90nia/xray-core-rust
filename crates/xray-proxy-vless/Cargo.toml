@@ -15,6 +15,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
+rand = { workspace = true }
+rand_core = "0.9"
 bytes = { workspace = true }
 prost = { workspace = true }
 # VLESS encryption（对齐 xray-reality + xray-crypto 的 RustCrypto 生态版本）
@@ -23,3 +25,6 @@ blake3 = "1.8"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 aes-gcm = "0.11.0-rc.4"
 chacha20poly1305 = "0.11.0-rc.3"
+# CTR stream (relay chain hash32 + XorConn) — 与 xray-crypto 对齐
+aes = "0.9"
+ctr = "0.10"

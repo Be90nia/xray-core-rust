@@ -3122,13 +3122,17 @@ dependencies = [
 name = "xray-proxy-vless"
 version = "0.1.0"
 dependencies = [
+ "aes 0.9.1",
  "aes-gcm",
  "blake3",
  "bytes",
  "chacha20poly1305",
+ "ctr",
  "ml-kem",
  "parking_lot",
  "prost",
+ "rand 0.9.4",
+ "rand_core 0.9.5",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
