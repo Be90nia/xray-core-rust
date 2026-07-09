@@ -37,6 +37,7 @@ pub mod common;
 pub mod server;
 pub mod xor;
 pub mod vision;
+pub mod vision_conn;
 
 /// XTLS Vision 加密会话包装的连接 trait。
 ///
