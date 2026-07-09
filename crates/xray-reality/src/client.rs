@@ -2,19 +2,30 @@
 //!
 //! 翻译自 Go `transport/internet/reality/reality.go` 的 `UClient`/`UConn` 部分。
 //!
-//! # 现状（重要）
-//! **实际 uTLS 握手 BLOCKED on watfaq-rustls**。REALITY 核心需要 uTLS 内部 API
-//! （`BuildHandshakeState`、`HandshakeState.State13.KeyShareKeys.Ecdhe`、
-//! `hello.Raw` 固定位置写入），标准 rustls 不暴露这些。n9e ADR 4.2/4.3
-//! 🔒 LOCKED 选定 watfaq-rustls（utls-0.23 分支）为首选实现。
+//! # 实现（watfaq-rustls）
 //!
-//! **纯密码学算法已提取到 [`crate::crypto`] 模块**（session_id 编码、ECDH
-//! auth_key 派生、AES-GCM 加密、HMAC-SHA512 证书验证），独立可测。
+//! REALITY 握手通过 [watfaq-rustls](https://github.com/Watfaq/rustls)（Watfaq
+//! fork，branch `watfaq/0.23.40`）的 `ClientConfig::builder().with_reality()`
+//! API 实现：watfaq rustls 在 TLS 1.3 握手内部自动完成 REALITY session_id
+//! 编码（ECDH + HKDF + AES-256-GCM）与 `RealityServerCertVerifier`（HMAC-SHA512
+//! cert 校验）。auth_key/session_id 算法逐字节对齐 Go 原版 `reality.go`。
 //!
-//! 切片2 留待（依赖 watfaq-rustls 决策）：
-//! - 接入 watfaq-rustls `.with_reality()` API 完成字节级 ClientHello 注入
-//! - `VerifyPeerCertificate` 回调（Go 端通过 reflect+unsafe hack 读 utls 内部字段）
-//! - http2 spider crawler（fallback 模式：路径收集 + RandBetween delays）
+//! 纯密码学算法仍保留在 [`crate::crypto`] 模块（session_id 编码、auth_key
+//! 派生、证书验证），独立可测；客户端握手路径直接复用 watfaq 内部实现。
+//!
+//! # XTLS-Vision splice
+//!
+//! `u_client` 返回裸 `TlsStream<S>`；上层可包装为 `SplicableTlsStream`（待实现）
+//! 以支持 XTLS-Vision 的 splice 模式（clash-rs PR#1057 方案）。
+
+use std::sync::Arc;
+
+use rustls::client::RealityConfig as WatfaqRealityConfig;
+use rustls::{ClientConfig, RootCertStore};
+use rustls_pki_types::ServerName;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_rustls::TlsConnector;
+use webpki_roots::TLS_SERVER_ROOTS;
 
 use crate::config::RealityConfig;
 use crate::error::RealityError;
@@ -52,26 +63,45 @@ impl UConnState {
     }
 }
 
-/// 创建 REALITY 客户端连接。
+/// 创建 REALITY 客户端连接（watfaq-rustls `with_reality` 握手）。
 ///
 /// 对应 Go `UClient(c net.Conn, config *Config, ctx, dest) (net.Conn, error)`。
 ///
-/// **未实现**——等接入 uTLS 等价品后实现。当前返回 [`RealityError::UtlsRequired`]。
+/// 使用 watfaq-rustls 的 REALITY 扩展：`ClientConfig::builder().with_reality()`
+/// 注入 REALITY session_id 计算（ECDH + HKDF-SHA256 + AES-256-GCM，auth_key
+/// 内部派生）+ `RealityServerCertVerifier`（HMAC-SHA512 证书校验）。
 ///
-/// # 切片2 待办
-/// 1. 字节级 ClientHello 构造：
-///    - SessionId[0..3] = core version（Version_x/y/z）
-///    - SessionId[4..8] = unix timestamp（big-endian u32）
-///    - SessionId[8..]  = config.short_id（最多 24 字节）
-/// 2. ECDH(X25519) 派生 auth_key：`ecdhe.ECDH(publicKey)`
-/// 3. HKDF-SHA256 收紧 auth_key 到 32 字节：
-///    `hkdf.New(sha256, authKey, hello.Random[:20], "REALITY")`
-/// 4. AES-GCM 加密 SessionId[:16]：
-///    `aead.Seal(sessionId[:0], hello.Random[20:], sessionId[:16], hello.Raw)`
-/// 5. 调用底层 uTLS 等价品完成握手
-/// 6. 失败 fallback：spider crawler（http2 + RandBetween delays，见 [`crate::util::get_path_locked`]）
-pub fn u_client<C>(_inner: C, _state: UConnState) -> Result<(), RealityError> {
-    Err(RealityError::UtlsRequired)
+/// 返回已握手的 `TlsStream<S>`；上层可包装为 `SplicableTlsStream`（XTLS-Vision）。
+///
+/// # Errors
+///
+/// - [`RealityError::WatfaqConfig`]：`public_key`/`short_id` 构建失败
+/// - [`RealityError::InvalidServerName`]：SNI 非法 DNS 名
+/// - [`RealityError::TlsHandshake`]：TLS 握手 IO 错误
+pub async fn u_client<S>(
+    inner: S,
+    state: UConnState,
+) -> Result<tokio_rustls::client::TlsStream<S>, RealityError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let cfg = &state.config;
+    let mut pk = [0u8; 32];
+    pk.copy_from_slice(&cfg.public_key);
+    let reality = WatfaqRealityConfig::new(pk, cfg.short_id.clone())
+        .map_err(|e| RealityError::WatfaqConfig(e.to_string()))?;
+    let roots = RootCertStore::from_iter(TLS_SERVER_ROOTS.iter().cloned());
+    let tls_config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_reality(reality)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(tls_config));
+    let server_name = ServerName::try_from(state.server_name.clone())
+        .map_err(|e| RealityError::InvalidServerName(e.to_string()))?;
+    connector
+        .connect(server_name, inner)
+        .await
+        .map_err(|e| RealityError::TlsHandshake(e.to_string()))
 }
 
 #[cfg(test)]
@@ -118,10 +148,26 @@ mod tests {
         assert!(matches!(err, RealityError::FingerprintNotFound));
     }
 
+    /// watfaq RealityConfig 能从 UConnState 字段构建（public_key [u8;32] + short_id Vec<u8>）。
+    /// auth_key/session_id 由 watfaq 内部派生，此处仅验证配置构造不 panic。
     #[test]
-    fn u_client_stub_returns_utls_required() {
+    fn watfaq_reality_config_builds_from_uconn_state() {
         let state = UConnState::new(make_valid_config()).unwrap();
-        let err = u_client::<()>((), state).unwrap_err();
-        assert!(matches!(err, RealityError::UtlsRequired));
+        let cfg = &state.config;
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(&cfg.public_key);
+        let reality = WatfaqRealityConfig::new(pk, cfg.short_id.clone());
+        assert!(reality.is_ok(), "watfaq RealityConfig 构建应成功");
+    }
+
+    /// short_id 超过 8 字节时 watfaq RealityConfig::new 返回错误。
+    #[test]
+    fn watfaq_reality_config_rejects_oversized_short_id() {
+        let mut cfg = make_valid_config();
+        cfg.short_id = vec![0u8; 9]; // 超过 8 字节上限
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(&cfg.public_key);
+        let err = WatfaqRealityConfig::new(pk, cfg.short_id.clone());
+        assert!(err.is_err(), "short_id 9 字节应被拒绝");
     }
 }

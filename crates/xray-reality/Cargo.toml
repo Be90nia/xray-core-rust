@@ -21,3 +21,8 @@ hmac = "0.12"
 sha2 = "0.10"
 # X25519 ECDH 派生 auth_key（纯 Rust，无 C 依赖）
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+# REALITY 握手（watfaq-rustls patch 后 rustls 即 watfaq fork）
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+webpki-roots = { workspace = true }
+rustls-pki-types = { workspace = true }

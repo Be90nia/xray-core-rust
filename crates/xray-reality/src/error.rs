@@ -62,6 +62,18 @@ pub enum RealityError {
     /// 见 [`crate`] 顶部文档说明）。实际握手等生态成熟或自研后再接。
     #[error("uTLS-based REALITY handshake not yet implemented in Rust")]
     UtlsRequired,
+
+    /// watfaq-rustls `RealityConfig` 构建失败（short_id 过长或内部加密错误）。
+    #[error("REALITY: watfaq RealityConfig build failed: {0}")]
+    WatfaqConfig(String),
+
+    /// SNI（ServerName）解析失败（非法 DNS 名）。
+    #[error("REALITY: invalid server name: {0}")]
+    InvalidServerName(String),
+
+    /// TLS 握手 IO 错误（连接拒绝、超时、TLS 协议错误等）。
+    #[error("REALITY: TLS handshake IO error: {0}")]
+    TlsHandshake(String),
 }
 
 /// REALITY crate 统一 Result 别名。
