@@ -74,6 +74,18 @@ pub enum RealityError {
     /// TLS 握手 IO 错误（连接拒绝、超时、TLS 协议错误等）。
     #[error("REALITY: TLS handshake IO error: {0}")]
     TlsHandshake(String),
+
+    /// AES-256-GCM 解密 session_id 失败（auth_key 错误、AAD 不匹配、或密文被篡改）。
+    #[error("REALITY: session_id AES-GCM decryption failed")]
+    SessionIdDecryptFailed,
+
+    /// session_id 内 timestamp 超出允许窗口（对应 Go `time.Since/Until` 校验）。
+    #[error("REALITY: timestamp {actual} out of window (now {expected}, max_diff {max_diff}s)")]
+    TimestampOutOfWindow { actual: u32, expected: u32, max_diff: u32 },
+
+    /// session_id 内 short_id 不在服务端白名单。
+    #[error("REALITY: short_id not in whitelist")]
+    ShortIdNotAllowed,
 }
 
 /// REALITY crate 统一 Result 别名。

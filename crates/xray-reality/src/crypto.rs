@@ -189,6 +189,115 @@ pub fn encrypt_session_id(
     Ok(())
 }
 
+/// 解密 session_id（[`encrypt_session_id`] 的逆操作）。
+///
+/// 服务端 REALITY 验证用：用 ECDH 派生的 auth_key 解密客户端发来的 32 字节
+/// session_id（= ciphertext(16) + tag(16)），还原 16 字节明文 payload。
+///
+/// # 参数
+/// - `auth_key`：ECDH+HKDF 派生的 32 字节 key
+/// - `nonce_12`：AES-GCM nonce（watfaq 协议固定为 `ClientHello.Random[20..32]`）
+/// - `sealed_session_id`：客户端发来的 32 字节 session_id（密文+tag）
+/// - `hello_raw`：完整 ClientHello handshake message 字节（AAD，须与加密时一致）
+///
+/// # 返回
+/// 16 字节明文（`[version(3) | reserved(1) | timestamp(4 BE) | short_id(8 零填充)]`）.
+pub fn decrypt_session_id(
+    auth_key: &[u8],
+    nonce_12: &[u8],
+    sealed_session_id: &[u8],
+    hello_raw: &[u8],
+) -> Result<[u8; 16], RealityError> {
+    if auth_key.len() != AUTH_KEY_LEN
+        || nonce_12.len() != AEAD_NONCE_LEN
+        || sealed_session_id.len() != SESSION_ID_LEN
+    {
+        return Err(RealityError::SessionIdDecryptFailed);
+    }
+    let cipher = Aes256Gcm::new_from_slice(auth_key)
+        .map_err(|_| RealityError::SessionIdDecryptFailed)?;
+    let mut nonce_arr = [0u8; AEAD_NONCE_LEN];
+    nonce_arr.copy_from_slice(nonce_12);
+    let plaintext = cipher
+        .decrypt(
+            &Nonce::from(nonce_arr),
+            Payload {
+                msg: sealed_session_id,
+                aad: hello_raw,
+            },
+        )
+        .map_err(|_| RealityError::SessionIdDecryptFailed)?;
+    if plaintext.len() != 16 {
+        return Err(RealityError::SessionIdDecryptFailed);
+    }
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&plaintext);
+    Ok(out)
+}
+
+/// 解析后的 session_id 明文负载。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPayload {
+    /// 协议版本（3 字节，watfaq 默认 `[1, 8, 1]`）。
+    pub version: [u8; 3],
+    /// session_id 内嵌的 Unix timestamp（秒，big-endian u32）。
+    pub timestamp: u32,
+    /// 客户端 short_id（固定 8 字节，不足零填充）。
+    pub short_id: [u8; 8],
+}
+
+/// 校验解密后的 session_id 明文负载。
+///
+/// 服务端 REALITY 验证用：检查 timestamp 在窗口内、short_id 在白名单。
+///
+/// # 参数
+/// - `plaintext_16`：[`decrypt_session_id`] 返回的 16 字节明文
+/// - `now_unix`：当前 Unix 时间戳（秒）
+/// - `max_diff`：允许的时间偏差（秒）
+/// - `short_ids`：服务端 short_id 白名单（每个 8 字节）
+pub fn verify_session_payload(
+    plaintext_16: &[u8; 16],
+    now_unix: u32,
+    max_diff: u32,
+    short_ids: &[[u8; 8]],
+) -> Result<SessionPayload, RealityError> {
+    let mut version = [0u8; 3];
+    version.copy_from_slice(&plaintext_16[0..3]);
+    let timestamp = u32::from_be_bytes([
+        plaintext_16[4],
+        plaintext_16[5],
+        plaintext_16[6],
+        plaintext_16[7],
+    ]);
+    let mut short_id = [0u8; 8];
+    short_id.copy_from_slice(&plaintext_16[8..16]);
+
+    // timestamp 窗口校验（双向：防重放 + 防过期）
+    let diff = if now_unix >= timestamp {
+        now_unix - timestamp
+    } else {
+        timestamp - now_unix
+    };
+    if diff > max_diff {
+        return Err(RealityError::TimestampOutOfWindow {
+            actual: timestamp,
+            expected: now_unix,
+            max_diff,
+        });
+    }
+
+    // short_id 白名单校验
+    if !short_ids.contains(&short_id) {
+        return Err(RealityError::ShortIdNotAllowed);
+    }
+
+    Ok(SessionPayload {
+        version,
+        timestamp,
+        short_id,
+    })
+}
+
 /// HMAC-SHA512 证书验证（REALITY 服务端自签证书的快速验证路径）。
 ///
 /// 对应 Go `VerifyPeerCertificate`：
@@ -531,5 +640,116 @@ mod tests {
         )
         .unwrap();
         assert!(verified, "客户端应能验证服务端的 REALITY 证书");
+    }
+
+    // ===== decrypt_session_id 测试 =====
+
+    #[test]
+    fn decrypt_session_id_roundtrip() {
+        let auth_key = [0x42u8; 32];
+        let nonce_12 = [0x11u8; 12];
+        let hello_raw = b"mock ClientHello AAD";
+        let short_id = [0xaa; 8];
+        let mut session_id = encode_session_id([1, 8, 16], 1_700_000_000, &short_id).unwrap();
+        encrypt_session_id(&auth_key, &nonce_12, &mut session_id, hello_raw).unwrap();
+
+        let plaintext = decrypt_session_id(&auth_key, &nonce_12, &session_id, hello_raw).unwrap();
+        let expected = encode_session_id([1, 8, 16], 1_700_000_000, &short_id).unwrap();
+        assert_eq!(&plaintext[..], &expected[..16]);
+    }
+
+    #[test]
+    fn decrypt_session_id_wrong_key_fails() {
+        let auth_key = [0x42u8; 32];
+        let wrong_key = [0x99u8; 32];
+        let nonce_12 = [0x11u8; 12];
+        let mut session_id = [0u8; 32];
+        encrypt_session_id(&auth_key, &nonce_12, &mut session_id, b"AAD").unwrap();
+
+        let err = decrypt_session_id(&wrong_key, &nonce_12, &session_id, b"AAD").unwrap_err();
+        assert!(matches!(err, RealityError::SessionIdDecryptFailed));
+    }
+
+    #[test]
+    fn decrypt_session_id_wrong_aad_fails() {
+        let auth_key = [0x42u8; 32];
+        let nonce_12 = [0x11u8; 12];
+        let mut session_id = [0u8; 32];
+        encrypt_session_id(&auth_key, &nonce_12, &mut session_id, b"AAD1").unwrap();
+
+        let err = decrypt_session_id(&auth_key, &nonce_12, &session_id, b"AAD2").unwrap_err();
+        assert!(matches!(err, RealityError::SessionIdDecryptFailed));
+    }
+
+    #[test]
+    fn decrypt_session_id_wrong_length_fails() {
+        let auth_key = [0x42u8; 32];
+        let nonce_12 = [0x11u8; 12];
+        assert!(matches!(
+            decrypt_session_id(&auth_key, &nonce_12, &[0u8; 16], b"AAD").unwrap_err(),
+            RealityError::SessionIdDecryptFailed
+        ));
+    }
+
+    // ===== verify_session_payload 测试 =====
+
+    #[test]
+    fn verify_session_payload_ok() {
+        let mut plaintext = [0u8; 16];
+        plaintext[0..3].copy_from_slice(&[1, 8, 1]);
+        plaintext[4..8].copy_from_slice(&1_700_000_000u32.to_be_bytes());
+        plaintext[8..16].copy_from_slice(&[0xaa; 8]);
+        let short_ids = vec![[0xaa; 8], [0xbb; 8]];
+        let payload = verify_session_payload(&plaintext, 1_700_000_010, 120, &short_ids).unwrap();
+        assert_eq!(payload.version, [1, 8, 1]);
+        assert_eq!(payload.timestamp, 1_700_000_000);
+        assert_eq!(payload.short_id, [0xaa; 8]);
+    }
+
+    #[test]
+    fn verify_session_payload_timestamp_out_of_window() {
+        let mut plaintext = [0u8; 16];
+        plaintext[4..8].copy_from_slice(&1_700_000_000u32.to_be_bytes());
+        plaintext[8..16].copy_from_slice(&[0xaa; 8]);
+        let short_ids = vec![[0xaa; 8]];
+        let err = verify_session_payload(&plaintext, 1_700_000_300, 120, &short_ids).unwrap_err();
+        assert!(matches!(err, RealityError::TimestampOutOfWindow { .. }));
+    }
+
+    #[test]
+    fn verify_session_payload_short_id_not_allowed() {
+        let mut plaintext = [0u8; 16];
+        plaintext[8..16].copy_from_slice(&[0xaa; 8]);
+        let short_ids = vec![[0xbb; 8]];
+        let err = verify_session_payload(&plaintext, 0, 120, &short_ids).unwrap_err();
+        assert!(matches!(err, RealityError::ShortIdNotAllowed));
+    }
+
+    #[test]
+    fn verify_session_payload_e2e_with_decrypt() {
+        // 完整链路：encode → encrypt → decrypt → verify
+        let (client_priv, client_pub) = make_keypair([0x42; 32]);
+        let (server_priv, server_pub) = make_keypair([0x99; 32]);
+        let hello_random = [0x55u8; 32];
+        let hello_raw = b"mock ClientHello";
+        let short_id = [0xaa; 8];
+        let timestamp = 1_700_000_000u32;
+
+        let mut session_id = encode_session_id([1, 8, 1], timestamp, &short_id).unwrap();
+        let client_auth_key =
+            derive_auth_key(&client_priv, &server_pub, &hello_random[..20]).unwrap();
+        encrypt_session_id(&client_auth_key, &hello_random[20..32], &mut session_id, hello_raw)
+            .unwrap();
+
+        // 服务端视角
+        let server_auth_key =
+            derive_auth_key(&server_priv, &client_pub, &hello_random[..20]).unwrap();
+        let plaintext =
+            decrypt_session_id(&server_auth_key, &hello_random[20..32], &session_id, hello_raw)
+                .unwrap();
+        let short_ids = vec![[0xaa; 8]];
+        let payload =
+            verify_session_payload(&plaintext, timestamp, 120, &short_ids).unwrap();
+        assert_eq!(payload.short_id, short_id);
     }
 }
