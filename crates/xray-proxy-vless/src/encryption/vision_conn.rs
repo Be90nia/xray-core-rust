@@ -4,14 +4,15 @@
 //! - [`VisionConn::poll_write`]：明文 padding 包装 → CommonConn AEAD 加密 → 底层
 //! - [`VisionConn::poll_read`]：CommonConn AEAD 解密 → unpadding → 返回明文
 //!
-//! 切片 2a：padding 模式完整（Continue/End），Direct(splice) 返回 Unsupported。
-//! 切片 2b（待办）：splice 切换底层 rawConn 绕过 AEAD。
+//! 切片 2a：padding 模式完整（Continue/End）。
+//! 切片 2b：splice（command=Direct 触发，绕过 Vision padding，仍走 CommonConn AEAD）。
 
 use crate::encryption::aead::Aead;
 use crate::encryption::common_conn::CommonConn;
 use crate::encryption::vision::{
-    xtls_padding, xtls_unpadding, DirectionState, COMMAND_PADDING_CONTINUE,
-    COMMAND_PADDING_DIRECT, COMMAND_PADDING_END, DEFAULT_PADDING_SEED,
+    is_complete_record, xtls_filter_tls, xtls_padding, xtls_unpadding, DirectionState,
+    TrafficState, COMMAND_PADDING_CONTINUE, COMMAND_PADDING_DIRECT, COMMAND_PADDING_END,
+    DEFAULT_PADDING_SEED,
 };
 use rand::rngs::ThreadRng;
 use rand::Rng;
@@ -45,6 +46,8 @@ pub struct VisionConn<C> {
     uplink_padding: bool,
     downlink_padding: bool,
     rng: ThreadRng,
+    /// uplink TLS 过滤状态（检测 TLS 1.3 → enable_xtls → splice）。
+    uplink_traffic: TrafficState,
 }
 
 impl<C> VisionConn<C>
@@ -64,7 +67,7 @@ where
         let uplink_uuid_pending = Some(user_uuid.clone());
         Self {
             inner: CommonConn::new(conn, aead, peer_aead, use_aes, united_key),
-            user_uuid,
+            user_uuid: user_uuid.clone(),
             uplink_uuid_pending,
             uplink_state: DirectionState::default(),
             downlink_state: DirectionState::default(),
@@ -74,6 +77,7 @@ where
             uplink_padding: true,
             downlink_padding: true,
             rng: rand::rng(),
+            uplink_traffic: TrafficState::new(user_uuid.clone()),
         }
     }
 }
@@ -122,10 +126,8 @@ where
                     if cmd == COMMAND_PADDING_END as i32 {
                         this.downlink_padding = false;
                     } else if cmd == COMMAND_PADDING_DIRECT as i32 {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            "Vision splice (Direct) not implemented in this slice",
-                        )));
+                        // splice：绕过 Vision padding，后续直接 CommonConn read（AEAD 仍生效）
+                        this.downlink_padding = false;
                     }
                     if !content.is_empty() {
                         this.downlink_pending = content;
@@ -182,19 +184,25 @@ where
                 return Pin::new(&mut this.inner).poll_write(cx, buf);
             }
 
-            // 3. padding 模式 → padding 包装
-            if buf.is_empty() {
-                return Poll::Ready(Ok(0));
-            }
-            // 3. padding 模式 → 分段 padding（每段 content ≤ MAX_PADDING_CONTENT，
-            //    确保一个 padding 块 = 一个 CommonConn record）
+            // 3. padding 模式 → TLS 检测 + 分段 padding
             if buf.is_empty() {
                 return Poll::Ready(Ok(0));
             }
             let n = buf.len().min(MAX_PADDING_CONTENT);
+            // TLS filter：检测 TLS 1.3 ServerHello → enable_xtls（仅过滤窗口内）
+            if this.uplink_traffic.number_of_packet_to_filter > 0 {
+                xtls_filter_tls(&[&buf[..n]], &mut this.uplink_traffic);
+            }
+            // splice 触发：enable_xtls + 完整 TLS ApplicationData record
+            let command = if this.uplink_traffic.enable_xtls && is_complete_record(&buf[..n]) {
+                this.uplink_padding = false;
+                COMMAND_PADDING_DIRECT
+            } else {
+                COMMAND_PADDING_CONTINUE
+            };
             let padded = xtls_padding(
                 Some(&buf[..n]),
-                COMMAND_PADDING_CONTINUE,
+                command,
                 &mut this.uplink_uuid_pending,
                 false,
                 &DEFAULT_PADDING_SEED,
@@ -318,5 +326,92 @@ mod tests {
                 assert_eq!(buf, payload_clone);
             }
         );
+    }
+
+    /// 构造 TLS 1.3 ServerHello record（触发 xtls_filter_tls enable_xtls）。
+    fn build_tls13_server_hello_record() -> Vec<u8> {
+        let mut buf = Vec::new();
+        // record header placeholder (len 填后补)
+        buf.extend_from_slice(&[0x16, 0x03, 0x03, 0x00, 0x00]);
+        let hs_start = buf.len();
+        buf.push(0x02); // ServerHello
+        buf.extend_from_slice(&[0x00, 0x00, 0x00]); // handshake len placeholder
+        let hs_body_start = buf.len();
+        buf.extend_from_slice(&[0x03, 0x03]); // legacy_version TLS 1.2
+        buf.extend_from_slice(&[0xAB; 32]); // random
+        buf.push(32); // session_id_len
+        buf.extend_from_slice(&[0xCD; 32]); // session_id
+        buf.extend_from_slice(&[0x13, 0x01]); // cipher TLS_AES_128_GCM_SHA256
+        buf.push(0x00); // compression null
+        let ext_start = buf.len();
+        buf.extend_from_slice(&[0x00, 0x00]); // ext len placeholder
+        // supported_versions: type=0x002b + len=2 + 0x0304 (TLS 1.3)
+        buf.extend_from_slice(&[0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]);
+        let ext_len = buf.len() - ext_start - 2;
+        buf[ext_start..ext_start + 2].copy_from_slice(&(ext_len as u16).to_be_bytes());
+        let hs_len = buf.len() - hs_body_start;
+        buf[hs_start + 1..hs_start + 4].copy_from_slice(&(hs_len as u32).to_be_bytes()[1..]);
+        let rec_len = buf.len() - 5;
+        buf[3..5].copy_from_slice(&(rec_len as u16).to_be_bytes());
+        buf
+    }
+
+    /// 构造 TLS ApplicationData record。
+    fn build_tls_app_data(payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x17, 0x03, 0x03]);
+        buf.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    #[tokio::test]
+    async fn splice_uplink_on_tls13() {
+        let (mut a, mut b) = make_pair();
+        // 1. TLS 1.3 ServerHello → xtls_filter_tls enable_xtls
+        let sh = build_tls13_server_hello_record();
+        a.write_all(&sh).await.unwrap();
+        a.flush().await.unwrap();
+        // 2. TLS ApplicationData → enable_xtls + is_complete_record → Direct + splice
+        let app = build_tls_app_data(b"GET / HTTP/1.1\r\n\r\n");
+        a.write_all(&app).await.unwrap();
+        a.flush().await.unwrap();
+        // 3. splice 后明文直写（绕过 padding）
+        a.write_all(b"post-splice").await.unwrap();
+        a.flush().await.unwrap();
+        // reader b: sh（Continue padding）+ app（Direct padding content）+ post-splice（splice 后直读）
+        let mut buf = vec![0u8; sh.len() + app.len() + 11];
+        b.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf[..sh.len()], &sh);
+        assert_eq!(&buf[sh.len()..sh.len() + app.len()], &app);
+        assert_eq!(&buf[sh.len() + app.len()..], b"post-splice");
+    }
+
+    #[tokio::test]
+    async fn splice_bidirectional() {
+        // 双向独立 splice：a uplink + b uplink 各自触发
+        let (mut a, mut b) = make_pair();
+        let sh = build_tls13_server_hello_record();
+        let app = build_tls_app_data(b"data");
+        // a → b: sh + app（触发 a uplink splice）
+        a.write_all(&sh).await.unwrap();
+        a.write_all(&app).await.unwrap();
+        a.flush().await.unwrap();
+        // b → a: sh + app（触发 b uplink splice）
+        b.write_all(&sh).await.unwrap();
+        b.write_all(&app).await.unwrap();
+        b.flush().await.unwrap();
+        // 并发读验证双向
+        let total = sh.len() + app.len();
+        let mut buf_a = vec![0u8; total];
+        let mut buf_b = vec![0u8; total];
+        tokio::join!(
+            async { a.read_exact(&mut buf_a).await.unwrap(); },
+            async { b.read_exact(&mut buf_b).await.unwrap(); }
+        );
+        let mut expected = sh.clone();
+        expected.extend_from_slice(&app);
+        assert_eq!(buf_a, expected);
+        assert_eq!(buf_b, expected);
     }
 }
