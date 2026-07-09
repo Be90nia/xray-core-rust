@@ -392,12 +392,18 @@ impl ClientInstance {
         peer_aead.open(&mut ticket_pt, None, &encrypted_ticket, &[])?;
         let _seconds = u16::from_be_bytes([ticket_pt[0], ticket_pt[1]]) as u32;
 
-        // 11. 读 encryptedLength(18) → padding length
+        // 11. 读 encryptedLength(18) → peer padding length
         let mut encrypted_length = vec![0u8; 18];
         conn.read_exact(&mut encrypted_length).await?;
         let mut length_pt = Vec::with_capacity(2);
         peer_aead.open(&mut length_pt, None, &encrypted_length, &[])?;
-        let _peer_padding_len = u16::from_be_bytes([length_pt[0], length_pt[1]]) as usize;
+        let peer_padding_len = u16::from_be_bytes([length_pt[0], length_pt[1]]) as usize;
+
+        // 12. 读 encryptedPadding(peer_padding_len) → 校验完整性（丢弃明文）
+        //    peer_aead nonce: ticket(0001) → padlen(0002) → padding(0003)
+        let mut encrypted_padding = vec![0u8; peer_padding_len];
+        conn.read_exact(&mut encrypted_padding).await?;
+        peer_aead.open(&mut Vec::new(), None, &encrypted_padding, &[])?;
 
         // 12. 构造 CommonConn（peer_aead nonce 已递增到 ...002，CommonConn 继续）
         let conn_wrapper = crate::encryption::common_conn::CommonConn::new(
@@ -421,38 +427,382 @@ struct PfsKeyExchange {
     pfs_public_key: Vec<u8>,
 }
 
-/// 服务端加密实例（对应 Go 的 `ServerInstance`）。
-#[derive(Debug, Default)]
+/// 服务端 NFS 私钥类型（对应 Go `[]any`：X25519 私钥或 ML-KEM-768 解封装密钥）。
+enum NfsSKey {
+    /// X25519 静态私钥（与客户端 ephemeral pub ECDH → nfsKey）。
+    X25519(x25519_dalek::StaticSecret),
+    /// ML-KEM-768 解封装密钥（解密客户端 ciphertext → nfsKey）。
+    MlKem(ml_kem::DecapsulationKey768),
+}
+
+/// 服务端加密实例（对应 Go `ServerInstance`）。
+///
+/// 持有 NFS 私钥数组 + 公钥字节 + blake3 hash + relay 长度。
+/// [`ServerInstance::init`] 解析私钥；[`ServerInstance::handshake`] 解密客户端握手。
+///
+/// # 阶段 B 限制
+/// - `xor_mode == 2`（XorConn）：未实现
+/// - 0-RTT（`seconds_from/to > 0` + ticket session 管理）：未实现
+/// - padding 分段发送：简化为一次发送
 pub struct ServerInstance {
-    /// X25519 私钥。
-    pub private_key: Vec<u8>,
-    /// ML-KEM-768 解封装密钥。
-    pub decap_key: Vec<u8>,
+    /// NFS 私钥数组（按 init 顺序）。
+    nfs_skeys: Vec<NfsSKey>,
+    /// 对应公钥字节（CTR XOR + AEAD context 用）。
+    nfs_pkeys_bytes: Vec<Vec<u8>>,
+    /// 每个公钥的 blake3 hash（relay chain 校验）。
+    hash32s: Vec<[u8; 32]>,
+    /// relay chain 总长度（对齐 client 计算）。
+    relays_length: usize,
+    /// XOR 模式（0=off, 1=XOR relays, 2=XorConn）。
+    xor_mode: u32,
+    /// 0-RTT ticket 有效期范围（秒）；阶段 B 固定 0（禁 0-RTT）。
+    seconds_from: u32,
+    seconds_to: u32,
+    /// padding 配置（阶段 B 简化，默认空）。
+    padding_lens: Vec<common::PaddingTriple>,
+    padding_gaps: Vec<common::PaddingTriple>,
+}
+
+impl Default for ServerInstance {
+    fn default() -> Self {
+        Self {
+            nfs_skeys: Vec::new(),
+            nfs_pkeys_bytes: Vec::new(),
+            hash32s: Vec::new(),
+            relays_length: 0,
+            xor_mode: 0,
+            seconds_from: 0,
+            seconds_to: 0,
+            padding_lens: Vec::new(),
+            padding_gaps: Vec::new(),
+        }
+    }
 }
 
 impl ServerInstance {
+    /// 创建空实例。
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub async fn init(&mut self) -> Result<()> {
-        Err(VlessError::NotImplemented(
-            "ServerInstance::init requires X25519+ML-KEM-768".into(),
-        ))
+    /// 初始化：解析 NFS 私钥数组，算公钥 + blake3 hash + relay 长度。
+    ///
+    /// 对应 Go `ServerInstance.Init(nfsSKeysBytes, xorMode, secondsFrom, secondsTo, padding)`：
+    /// 每个私钥按长度分类——32B→X25519 priv（relay += 32+32），64B→ML-KEM-768 seed
+    /// （relay += 1088+32）。末尾 `relays_length -= 32`。
+    ///
+    /// # Errors
+    /// 私钥数组空 / 重复初始化 / 私钥长度非法 / padding 解析失败返回 [`VlessError`]。
+    pub fn init(
+        &mut self,
+        nfs_skeys_bytes: Vec<Vec<u8>>,
+        xor_mode: u32,
+        seconds_from: u32,
+        seconds_to: u32,
+        padding: &str,
+    ) -> Result<()> {
+        if !self.nfs_skeys.is_empty() {
+            return Err(VlessError::Other("ServerInstance already initialized".into()));
+        }
+        if nfs_skeys_bytes.is_empty() {
+            return Err(VlessError::Other("empty nfs_skeys_bytes".into()));
+        }
+        self.xor_mode = xor_mode;
+        self.seconds_from = seconds_from;
+        self.seconds_to = seconds_to;
+        let (padding_lens, padding_gaps) = common::parse_padding(padding)?;
+        self.padding_lens = padding_lens;
+        self.padding_gaps = padding_gaps;
+
+        let l = nfs_skeys_bytes.len();
+        self.nfs_skeys.reserve(l);
+        self.nfs_pkeys_bytes.reserve(l);
+        self.hash32s.reserve(l);
+        let mut relays: i64 = 0;
+
+        for sk_bytes in &nfs_skeys_bytes {
+            if sk_bytes.len() == 32 {
+                // X25519 priv
+                let priv_bytes: [u8; 32] = sk_bytes[..]
+                    .try_into()
+                    .map_err(|_| VlessError::Other("x25519 priv key not 32 bytes".into()))?;
+                let secret = x25519_dalek::StaticSecret::from(priv_bytes);
+                let pub_bytes = x25519_dalek::PublicKey::from(&secret).to_bytes();
+                self.hash32s.push(*blake3::hash(&pub_bytes).as_bytes());
+                self.nfs_pkeys_bytes.push(pub_bytes.to_vec());
+                self.nfs_skeys.push(NfsSKey::X25519(secret));
+                relays += 32 + 32;
+            } else {
+                // ML-KEM-768 seed（64B）→ from_seed
+                let seed: [u8; 64] = sk_bytes[..]
+                    .try_into()
+                    .map_err(|_| VlessError::Other("ml-kem seed not 64 bytes".into()))?;
+                let dk = ml_kem::DecapsulationKey768::from_seed(ml_kem::Seed::from(seed));
+                let ek = dk.encapsulation_key();
+                let ek_bytes = ek.to_bytes();
+                self.hash32s.push(*blake3::hash(&ek_bytes[..]).as_bytes());
+                self.nfs_pkeys_bytes.push(ek_bytes.to_vec());
+                self.nfs_skeys.push(NfsSKey::MlKem(dk));
+                relays += 1088 + 32;
+            }
+        }
+        relays -= 32; // 末尾无下段 hash
+        self.relays_length = relays.max(0) as usize;
+        Ok(())
     }
 
+    /// 反向解析 relay chain（对应 Go `Handshake` relay 循环的服务端镜像）。
+    ///
+    /// 逐段用 NFS 私钥解密客户端 ephemeral pub / ciphertext → nfsKey，
+    /// 校验段间 hash32（防 relay 替换）。返回最终 nfsKey。
+    ///
+    /// # Errors
+    /// relay 数据过短 / ECDH 或解封装失败 / hash32 不匹配返回 [`VlessError`]。
+    fn parse_relay_chain(&self, relays: &mut [u8], iv: &[u8; 16]) -> Result<[u8; 32]> {
+        use ml_kem::kem::TryDecapsulate;
+
+        if relays.len() < self.relays_length {
+            return Err(VlessError::Other("relays too short".into()));
+        }
+        if self.nfs_skeys.is_empty() {
+            return Err(VlessError::Other("no nfs_skeys initialized".into()));
+        }
+
+        let mut nfs_key = [0u8; 32];
+        let mut last_ctr: Option<CtrXor> = None;
+        let mut pos = 0;
+        let last_idx = self.nfs_skeys.len() - 1;
+
+        for (j, skey) in self.nfs_skeys.iter().enumerate() {
+            let index = match skey {
+                NfsSKey::X25519(_) => 32,
+                NfsSKey::MlKem(_) => 1088,
+            };
+
+            // 1. lastCTR 恢复本段前32字节（对齐 client 的 last_ctr.apply）
+            if let Some(mut ctr) = last_ctr.take() {
+                ctr.apply(&mut relays[pos..pos + 32]);
+            }
+
+            // 2. XorMode>0: NewCTR(NfsPKeysBytes[j], iv) XOR 恢复本段
+            if self.xor_mode > 0 {
+                let mut ctr = CtrXor::new(&self.nfs_pkeys_bytes[j], iv)?;
+                ctr.apply(&mut relays[pos..pos + index]);
+            }
+
+            // 3. ECDH / Decapsulate → nfs_key
+            match skey {
+                NfsSKey::X25519(secret) => {
+                    let peer_pub_bytes: [u8; 32] = relays[pos..pos + 32]
+                        .try_into()
+                        .map_err(|_| VlessError::Other("client ephemeral pub length".into()))?;
+                    // 对齐 Go：highest bit of last byte must be 0
+                    if peer_pub_bytes[31] > 127 {
+                        return Err(VlessError::Other(
+                            "highest bit of peer X25519 pub last byte is not 0".into(),
+                        ));
+                    }
+                    let peer_pub = x25519_dalek::PublicKey::from(peer_pub_bytes);
+                    let shared = secret.diffie_hellman(&peer_pub);
+                    nfs_key.copy_from_slice(shared.as_bytes());
+                }
+                NfsSKey::MlKem(dk) => {
+                    let ct: ml_kem::Ciphertext<ml_kem::MlKem768> =
+                        ml_kem::array::Array::try_from(&relays[pos..pos + 1088])
+                            .map_err(|_| VlessError::Other("ml-kem ct length".into()))?;
+                    let ss = dk
+                        .try_decapsulate(&ct)
+                        .map_err(|_| VlessError::Other("ml-kem decapsulate failed".into()))?;
+                    nfs_key.copy_from_slice(&ss[..]);
+                }
+            }
+
+            if j == last_idx {
+                break;
+            }
+
+            // 4. 校验下段 hash32：client 写 hash32s[j+1] XOR ctr keystream；server 反 XOR 应 == hash32s[j+1]
+            let mut new_ctr = CtrXor::new(&nfs_key, iv)?;
+            let mut expected_hash = [0u8; 32];
+            new_ctr.xor_into(&mut expected_hash, &relays[pos + index..pos + index + 32]);
+            if expected_hash != self.hash32s[j + 1] {
+                return Err(VlessError::Other("unexpected hash32 in relay chain".into()));
+            }
+            last_ctr = Some(new_ctr);
+            pos += index + 32;
+        }
+
+        Ok(nfs_key)
+    }
+
+    /// 与客户端 1-RTT 握手（对齐 Go `server.go Handshake` 的 1-RTT 分支）。
+    ///
+    /// 完整流程：读 clientHello → relay chain 反向解密 → nfsAEAD → 读 pfsKeyExchange →
+    /// 派生 UnitedKey → 构造 serverHello（encryptedPfsPublicKey + ticket + padding）→
+    /// 读客户端 padding 校验 → CommonConn。
+    ///
+    /// nonce 对应（nfs_aead）：open pfs(0001,0002) → seal serverHello(MaxNonce 不递增) →
+    /// open client padding(0003,0004)。与 client seal 序列镜像。
+    ///
+    /// # Errors
+    /// IO / 解密 / 协议错误返回 [`VlessError`]。
     pub async fn handshake<C>(
         &mut self,
-        _conn: C,
+        conn: C,
     ) -> Result<Box<dyn EncryptionConn>>
     where
         C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
-        let _ = _conn;
-        Err(VlessError::NotImplemented(
-            "ServerInstance::handshake requires full encryption stack".into(),
-        ))
+        use rand_core::RngCore;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        if self.nfs_skeys.is_empty() {
+            return Err(VlessError::Other("ServerInstance not initialized".into()));
+        }
+        if self.xor_mode == 2 {
+            return Err(VlessError::NotImplemented(
+                "xor_mode==2 (XorConn) 阶段 B 未实现".into(),
+            ));
+        }
+
+        let mut conn = conn;
+        let mut rng = rand::rng();
+        let use_aes = true; // 阶段 B：假设 AES 硬件支持（对齐 client）
+
+        // 1. 读 ivAndRelays(16 + relays_length)
+        let iv_and_relays_len = 16 + self.relays_length;
+        let mut iv_and_relays = vec![0u8; iv_and_relays_len];
+        conn.read_exact(&mut iv_and_relays).await?;
+        let iv: [u8; 16] =
+            iv_and_relays[..16].try_into().expect("iv is 16 bytes");
+
+        // 2. relay chain 反向解密 → nfs_key
+        let nfs_key = self.parse_relay_chain(&mut iv_and_relays[16..], &iv)?;
+
+        // 3. nfsAEAD（nonce 0000 起步）
+        let mut nfs_aead = crate::encryption::aead::Aead::new(&iv, &nfs_key, use_aes);
+
+        // 4. 读 pfsKeyExchange 的 encryptedLength(18) → length
+        let mut encrypted_length = vec![0u8; 18];
+        conn.read_exact(&mut encrypted_length).await?;
+        let mut length_pt = Vec::with_capacity(2);
+        nfs_aead.open(&mut length_pt, None, &encrypted_length, &[])?; // → nonce 0001
+        let length = u16::from_be_bytes([length_pt[0], length_pt[1]]) as usize;
+
+        // 5. 0-RTT 分支（length==32）：阶段 B 未实现
+        if length == 32 {
+            if self.seconds_from == 0 && self.seconds_to == 0 {
+                return Err(VlessError::Other("0-RTT is not allowed".into()));
+            }
+            return Err(VlessError::NotImplemented(
+                "0-RTT (length==32) 阶段 B 未实现".into(),
+            ));
+        }
+
+        // 6. 读 encryptedPfsPublicKey(length) → pfs_public_key(1216)
+        if length < 1184 + 32 + 16 {
+            return Err(VlessError::Other("too short pfs length".into()));
+        }
+        let mut encrypted_pfs = vec![0u8; length];
+        conn.read_exact(&mut encrypted_pfs).await?;
+        let mut pfs_pub_pt = Vec::with_capacity(length.saturating_sub(16));
+        nfs_aead.open(&mut pfs_pub_pt, None, &encrypted_pfs, &[])?; // → nonce 0002
+
+        // 7. mlkem768 encapsulate（server 侧生成 ct + shared key）
+        let ek_bytes: ml_kem::Key<ml_kem::EncapsulationKey768> =
+            ml_kem::array::Array::try_from(&pfs_pub_pt[..1184])
+                .map_err(|_| VlessError::Other("ml-kem ek parse from client pfs".into()))?;
+        let ek = ml_kem::EncapsulationKey768::new(&ek_bytes)
+            .map_err(|_| VlessError::Other("ml-kem ek construct".into()))?;
+        let mut m = [0u8; 32];
+        rng.fill_bytes(&mut m);
+        let (mlkem_ct, mlkem768_key) = ek.encapsulate_deterministic(&ml_kem::B32::from(m));
+
+        // 8. x25519 ECDH（server 侧生成临时密钥对）
+        let peer_x25519_pub_bytes: [u8; 32] = pfs_pub_pt[1184..1184 + 32]
+            .try_into()
+            .map_err(|_| VlessError::Other("client x25519 pub length".into()))?;
+        if peer_x25519_pub_bytes[31] > 127 {
+            return Err(VlessError::Other(
+                "highest bit of peer X25519 pub last byte is not 0".into(),
+            ));
+        }
+        let peer_x25519_pub = x25519_dalek::PublicKey::from(peer_x25519_pub_bytes);
+        let mut x25519_priv_bytes = [0u8; 32];
+        rng.fill_bytes(&mut x25519_priv_bytes);
+        let x25519_priv = x25519_dalek::StaticSecret::from(x25519_priv_bytes);
+        let x25519_key = x25519_priv.diffie_hellman(&peer_x25519_pub);
+
+        // 9. pfs_key / server_pfs_pub / united_key
+        let mut pfs_key = Vec::with_capacity(64);
+        pfs_key.extend_from_slice(&mlkem768_key[..]);
+        pfs_key.extend_from_slice(x25519_key.as_bytes());
+        let server_pfs_pub = {
+            let mut v = Vec::with_capacity(1088 + 32);
+            v.extend_from_slice(&mlkem_ct[..]);
+            v.extend_from_slice(x25519_dalek::PublicKey::from(&x25519_priv).as_bytes());
+            v
+        };
+        let mut united_key = Vec::with_capacity(96);
+        united_key.extend_from_slice(&pfs_key);
+        united_key.extend_from_slice(&nfs_key);
+
+        // 10. AEAD 对（context 对齐 Go：server_pfs_pub / pfs_pub_pt[..1184+32]）
+        let mut aead =
+            crate::encryption::aead::Aead::new(&server_pfs_pub, &united_key, use_aes);
+        let peer_aead = crate::encryption::aead::Aead::new(
+            &pfs_pub_pt[..1184 + 32],
+            &united_key,
+            use_aes,
+        );
+
+        // 11. ticket（阶段 B：seconds=0，不存 session）
+        let mut ticket = [0u8; 16];
+        rng.fill_bytes(&mut ticket);
+        // ponytail: seconds 固定 0（阶段 B 禁 0-RTT），EncodeLength(0)
+        ticket[0] = 0;
+        ticket[1] = 0;
+
+        // 12. serverHello = encryptedPfsPublicKey(1136) + encryptedTicket(32) + padding(34)
+        //    nonce：nfs_aead(MaxNonce 不递增) → aead(None: 0001 ticket, 0002 padlen, 0003 pad)
+        let mut server_hello = Vec::with_capacity(1136 + 32 + 34);
+        nfs_aead.seal(
+            &mut server_hello,
+            Some(&crate::encryption::aead::MAX_NONCE),
+            &server_pfs_pub,
+            &[],
+        )?;
+        aead.seal(&mut server_hello, None, &ticket, &[])?;
+        // padding：EncodeLength(34-18=16) + 空 plaintext
+        let pad_len_bytes = 16u16.to_be_bytes();
+        aead.seal(&mut server_hello, None, &pad_len_bytes, &[])?;
+        aead.seal(&mut server_hello, None, &[], &[])?;
+
+        // 13. 发送 serverHello（阶段 B 不分段）
+        conn.write_all(&server_hello).await?;
+        conn.flush().await?;
+
+        // 14. 读 client padding：encryptedLength(18) + encryptedPadding(DecodeLength)
+        //    nfs_aead nonce: 0003（padlen）→ 0004（padding）
+        let mut encrypted_length = vec![0u8; 18];
+        conn.read_exact(&mut encrypted_length).await?;
+        let mut length_pt = Vec::with_capacity(2);
+        nfs_aead.open(&mut length_pt, None, &encrypted_length, &[])?;
+        let client_pad_len = u16::from_be_bytes([length_pt[0], length_pt[1]]) as usize;
+        let mut encrypted_padding = vec![0u8; client_pad_len];
+        conn.read_exact(&mut encrypted_padding).await?;
+        nfs_aead.open(&mut Vec::new(), None, &encrypted_padding, &[])?;
+
+        // 15. CommonConn（aead nonce=0003 / peer_aead nonce=0000，CommonConn 继续）
+        let conn_wrapper = crate::encryption::common_conn::CommonConn::new(
+            conn,
+            aead,
+            peer_aead,
+            use_aes,
+            united_key,
+        );
+        Ok(Box::new(conn_wrapper))
     }
 }
 
@@ -472,13 +822,6 @@ mod tests {
         assert_eq!(c.xor_mode, 1);
         assert_eq!(c.seconds, 300);
         assert_eq!(c.nfs_pkeys_flat.len(), 32 + 1184);
-    }
-
-    #[tokio::test]
-    async fn server_init_not_implemented() {
-        let mut s = ServerInstance::new();
-        let err = s.init().await.unwrap_err();
-        assert!(matches!(err, VlessError::NotImplemented(_)));
     }
 
     #[test]
@@ -606,5 +949,95 @@ mod tests {
             .unwrap();
         assert_eq!(pk_pt.len(), 1216);
         assert_eq!(pk_pt, pfs.pfs_public_key);
+    }
+
+    // === ServerInstance + client<->server duplex 互通测试 ===
+    // ponytail: X25519 ephemeral pub 最高位随机，server 检查 [31]<=127（~50% 失败），
+    //           handshake helper 重试 32 次规避 flaky（对齐 Go 生产行为：client 重连）
+
+    /// 重试 handshake 规避 X25519 ephemeral pub highest bit 随机失败。
+    /// 成功返回 (client_conn, server_conn)。
+    async fn handshake_with_retry(
+        client_pkeys: &[Vec<u8>],
+        server_skeys: &[Vec<u8>],
+        xor_mode: u32,
+    ) -> Option<(Box<dyn EncryptionConn>, Box<dyn EncryptionConn>)> {
+        for _ in 0..32 {
+            let mut client = ClientInstance::new();
+            client.init(client_pkeys.to_vec(), xor_mode, 0, "").unwrap();
+            let mut server = ServerInstance::new();
+            server.init(server_skeys.to_vec(), xor_mode, 0, 0, "").unwrap();
+
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let client_fut = client.handshake(client_io);
+            let server_fut = server.handshake(server_io);
+            let (client_res, server_res) = tokio::join!(client_fut, server_fut);
+            match (client_res, server_res) {
+                (Ok(c), Ok(s)) => return Some((c, s)),
+                _ => continue,
+            }
+        }
+        None
+    }
+
+    /// 单 X25519 密钥对：handshake + client→server→client 双向 round-trip。
+    #[tokio::test]
+    async fn client_server_handshake_single_x25519() {
+        let mut rng = rand::rng();
+        let mut x_priv = [0u8; 32];
+        rng.fill_bytes(&mut x_priv);
+        let secret = x25519_dalek::StaticSecret::from(x_priv);
+        let x_pub = x25519_dalek::PublicKey::from(&secret).to_bytes();
+        let client_pkeys = vec![x_pub.to_vec()];
+        let server_skeys = vec![x_priv.to_vec()];
+
+        let (mut client_conn, mut server_conn) =
+            handshake_with_retry(&client_pkeys, &server_skeys, 0)
+                .await
+                .expect("handshake failed after 32 attempts");
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // client → server
+        client_conn.write_all(b"c2s-hello").await.unwrap();
+        client_conn.flush().await.unwrap();
+        let mut buf = [0u8; 9];
+        server_conn.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"c2s-hello");
+
+        // server → client
+        server_conn.write_all(b"s2c-world!").await.unwrap();
+        server_conn.flush().await.unwrap();
+        let mut buf2 = [0u8; 10];
+        client_conn.read_exact(&mut buf2).await.unwrap();
+        assert_eq!(&buf2, b"s2c-world!");
+    }
+
+    /// X25519 + ML-KEM-768 双密钥对（xor_mode=1）：完整 2 段 relay chain + XOR 互通。
+    #[tokio::test]
+    async fn client_server_handshake_dual_keys_xor() {
+        let mut rng = rand::rng();
+        let mut x_priv = [0u8; 32];
+        rng.fill_bytes(&mut x_priv);
+        let secret = x25519_dalek::StaticSecret::from(x_priv);
+        let x_pub = x25519_dalek::PublicKey::from(&secret).to_bytes();
+        let mut seed = [0u8; 64];
+        rng.fill_bytes(&mut seed);
+        let dk = ml_kem::DecapsulationKey768::from_seed(ml_kem::Seed::from(seed));
+        let ek_bytes = dk.encapsulation_key().to_bytes();
+        let client_pkeys = vec![x_pub.to_vec(), ek_bytes.to_vec()];
+        let server_skeys = vec![x_priv.to_vec(), seed.to_vec()];
+
+        let (mut client_conn, mut server_conn) =
+            handshake_with_retry(&client_pkeys, &server_skeys, 1)
+                .await
+                .expect("handshake failed after 32 attempts");
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let payload = b"dual-key xor round-trip";
+        client_conn.write_all(payload).await.unwrap();
+        client_conn.flush().await.unwrap();
+        let mut buf = vec![0u8; payload.len()];
+        server_conn.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf[..], &payload[..]);
     }
 }

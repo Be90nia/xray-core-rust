@@ -9,11 +9,20 @@
 #[cfg(test)]
 mod tests {
     use crate::encryption::ServerInstance;
+    use crate::error::VlessError;
 
     #[test]
-    fn server_instance_can_construct() {
-        let s = ServerInstance::new();
-        assert!(s.private_key.is_empty());
-        assert!(s.decap_key.is_empty());
+    fn server_init_empty_keys_rejected() {
+        let mut s = ServerInstance::new();
+        let err = s.init(Vec::new(), 0, 0, 0, "").unwrap_err();
+        assert!(matches!(err, VlessError::Other(ref msg) if msg.contains("empty")));
+    }
+
+    #[test]
+    fn server_init_duplicate_rejected() {
+        let mut s = ServerInstance::new();
+        s.init(vec![vec![0xABu8; 32]], 0, 0, 0, "").unwrap();
+        let err = s.init(vec![vec![0xCDu8; 32]], 0, 0, 0, "").unwrap_err();
+        assert!(matches!(err, VlessError::Other(ref msg) if msg.contains("already initialized")));
     }
 }
