@@ -225,6 +225,10 @@ pub fn decode_chunk_stream<R: Read>(
 ) -> std::io::Result<Vec<u8>> {
     let mut output = Vec::new();
     loop {
+        // mask 流顺序对齐 Go auth.go:127-131 readSize：先 NextPaddingLen 再 Decode。
+        // ShakeSizeParser 的 SHAKE128 流必须 encoder/decoder 同序消费，否则流错位。
+        let padding_size = usize::from(size_parser.next_padding_len());
+
         let mut size_field = [0u8; 2];
         reader.read_exact(&mut size_field)?;
         let total_size = size_parser.decode(&size_field);
@@ -235,7 +239,6 @@ pub fn decode_chunk_stream<R: Read>(
             return Ok(output);
         }
 
-        let padding_size = usize::from(size_parser.next_padding_len());
         let ciphertext_size = usize::from(total_size).saturating_sub(padding_size);
 
         let mut ciphertext = vec![0u8; usize::from(total_size)];
@@ -339,9 +342,7 @@ mod tests {
         assert_eq!(decoded, data);
     }
 
-    // ponytail: ShakeSizeParser mask 流与 encoder/decoder 调用顺序对齐问题待查（follow-up）
     #[test]
-    #[ignore]
     fn shake_roundtrip_with_padding() {
         let cipher_w = make_cipher();
         let cipher_r = Aes128Gcm::new(&[0x42u8; 16]).expect("aes");
