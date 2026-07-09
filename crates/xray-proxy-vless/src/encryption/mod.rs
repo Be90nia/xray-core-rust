@@ -22,6 +22,10 @@
 
 use crate::error::{Result, VlessError};
 
+pub mod aead;
+
+pub mod common_conn;
+
 pub mod client;
 pub mod common;
 pub mod server;
@@ -42,19 +46,28 @@ pub trait EncryptionConn: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
 }
 
-/// 客户端加密实例（对应 Go 的 `ClientInstance`）。
+/// 客户端加密实例（对应 Go `ClientInstance`）。
 ///
-/// 持有 X25519 静态公钥 + ML-KEM-768 封装密钥 + 0-RTT 票据缓存。
-/// `init()` 完成密钥派生；`handshake()` 与服务端协商出会话密钥并返回
-/// `Box<dyn EncryptionConn>`。
+/// 持有 X25519 静态公钥 + ML-KEM-768 封装密钥数组。
+/// [`ClientInstance::init`] 解析公钥并算 blake3 hash + relay 长度；
+/// [`ClientInstance::handshake`] 与服务端协商会话密钥（阶段 A stub）。
 #[derive(Debug, Default)]
 pub struct ClientInstance {
-    /// 远端公钥（X25519，32 字节），未配置时为空。
-    pub remote_pub: Vec<u8>,
-    /// 自身静态公钥（X25519）。
-    pub local_pub: Vec<u8>,
-    /// 是否启用 XOR 模式（XorMode=2，Go 端旧版兼容）。
-    pub xor_mode: bool,
+    /// 远端公钥数组（每个元素：32B=X25519 pub，1184B=ML-KEM-768 encap key）。
+    pub nfs_pkeys: Vec<Vec<u8>>,
+    /// 扁平化公钥字节（CTR XOR 用，对应 Go `NfsPKeysBytes`）。
+    pub nfs_pkeys_flat: Vec<u8>,
+    /// 每个公钥的 blake3 hash（对应 Go `Hash32s`）。
+    pub hash32s: Vec<[u8; 32]>,
+    /// relay chain 总长度（对应 Go `RelaysLength`）。
+    pub relays_length: usize,
+    /// XOR 模式（0=off, 1=XOR relays, 2=XorConn）。
+    pub xor_mode: u32,
+    /// 0-RTT ticket 有效秒数。
+    pub seconds: u32,
+    /// padding 配置（阶段 A 简化，默认空）。
+    pub padding_lens: Vec<common::PaddingTriple>,
+    pub padding_gaps: Vec<common::PaddingTriple>,
 }
 
 impl ClientInstance {
@@ -64,16 +77,50 @@ impl ClientInstance {
         Self::default()
     }
 
-    /// 初始化密钥（占位）。
+    /// 初始化：解析公钥数组，算 blake3 hash，计算 relay 长度。
     ///
-    /// 实际实现需要 X25519 + ML-KEM-768；当前返回 `NotImplemented`。
-    pub async fn init(&mut self) -> Result<()> {
-        Err(VlessError::NotImplemented(
-            "ClientInstance::init requires X25519+ML-KEM-768".into(),
-        ))
+    /// 对应 Go `ClientInstance.Init(nfsPKeysBytes, xorMode, seconds, padding)`：
+    /// 每个公钥按长度分类——32B→X25519 pub（relay += 32+32），
+    /// 其他→ML-KEM-768 encap key（relay += 1088+32）。末尾 `RelaysLength -= 32`。
+    ///
+    /// # Errors
+    /// padding 配置解析失败（阶段 A 不会，`parse_padding` 始终返回空）返回 [`VlessError`]。
+    pub fn init(
+        &mut self,
+        nfs_pkeys: Vec<Vec<u8>>,
+        xor_mode: u32,
+        seconds: u32,
+        padding: &str,
+    ) -> Result<()> {
+        self.xor_mode = xor_mode;
+        self.seconds = seconds;
+        let (padding_lens, padding_gaps) = common::parse_padding(padding)?;
+        self.padding_lens = padding_lens;
+        self.padding_gaps = padding_gaps;
+
+        self.nfs_pkeys_flat.clear();
+        self.hash32s.clear();
+        let mut relays: i64 = 0;
+        for pk in &nfs_pkeys {
+            let hash = blake3::hash(pk);
+            self.hash32s.push(*hash.as_bytes());
+            self.nfs_pkeys_flat.extend_from_slice(pk);
+            if pk.len() == 32 {
+                relays += 32 + 32; // X25519 pub(32) + hash32 slot
+            } else {
+                relays += 1088 + 32; // ML-KEM-768 ct(1088) + hash32 slot
+            }
+        }
+        relays -= 32; // Go: 末尾减（最后一段无下段 hash）
+        self.relays_length = relays.max(0) as usize;
+        self.nfs_pkeys = nfs_pkeys;
+        Ok(())
     }
 
-    /// 与服务端握手（占位）。
+    /// 与服务端握手（阶段 A stub：relay chain 加密 + pfsKeyExchange 待实现）。
+    ///
+    /// # Errors
+    /// 当前返回 [`VlessError::NotImplemented`]。
     pub async fn handshake<C>(
         &mut self,
         _conn: C,
@@ -83,7 +130,7 @@ impl ClientInstance {
     {
         let _ = _conn;
         Err(VlessError::NotImplemented(
-            "ClientInstance::handshake requires full encryption stack".into(),
+            "ClientInstance::handshake: relay chain + pfsKeyExchange 待实现".into(),
         ))
     }
 }
@@ -127,11 +174,18 @@ impl ServerInstance {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn client_init_not_implemented() {
+    #[test]
+    fn client_init_parses_keys_and_relay_length() {
         let mut c = ClientInstance::new();
-        let err = c.init().await.unwrap_err();
-        assert!(matches!(err, VlessError::NotImplemented(_)));
+        // 一个 X25519 pub (32B) + 一个 ML-KEM-768 encap key (1184B)
+        let pkeys = vec![vec![0xABu8; 32], vec![0xCDu8; 1184]];
+        c.init(pkeys, 1, 300, "").unwrap();
+        assert_eq!(c.hash32s.len(), 2);
+        // (32+32) + (1088+32) - 32 = 1152
+        assert_eq!(c.relays_length, 1152);
+        assert_eq!(c.xor_mode, 1);
+        assert_eq!(c.seconds, 300);
+        assert_eq!(c.nfs_pkeys_flat.len(), 32 + 1184);
     }
 
     #[tokio::test]
@@ -144,6 +198,6 @@ mod tests {
     #[test]
     fn client_default_xor_mode_off() {
         let c = ClientInstance::default();
-        assert!(!c.xor_mode);
+        assert_eq!(c.xor_mode, 0);
     }
 }

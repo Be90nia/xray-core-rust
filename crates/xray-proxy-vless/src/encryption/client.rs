@@ -14,8 +14,8 @@ mod tests {
     #[test]
     fn client_instance_can_construct() {
         let c = ClientInstance::new();
-        assert!(c.remote_pub.is_empty());
-        assert!(c.local_pub.is_empty());
-        assert!(!c.xor_mode);
+        assert!(c.nfs_pkeys.is_empty());
+        assert_eq!(c.xor_mode, 0);
+        assert_eq!(c.relays_length, 0);
     }
 }
