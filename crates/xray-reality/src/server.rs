@@ -6,8 +6,8 @@
 //! - **切片1**（已完成）：client.rs 接入 watfaq-rustls RealityConfig。
 //! - **切片2**（本切片）：纯逻辑验证层——[`parse_client_hello`] 字节解析 +
 //!   [`crate::crypto::decrypt_session_id`] + [`crate::crypto::verify_session_payload`]。
-//! - **切片3**（待办）：`verify_reality_client_hello` 组合（需确认 watfaq AAD 协议细节）+
-//!   IO 层（peek record + fallback pipe + rustls 服务端伪造证书）。
+//! - **切片3a**（本切片）：[`verify_reality_client_hello`] 组合（ECDH+HKDF+AES-GCM 解密+校验）。
+//! - **切片3b**（待办）：IO 层（peek record + fallback pipe + rustls 服务端伪造证书）。
 //!
 //! # 为什么 ClientHello 手动解析
 //! Go 借助 `tls.Server` 读 ClientHello。Rust rustls 的 `server::Acceptor` 不直接暴露
@@ -184,6 +184,78 @@ fn parse_key_share_x25519(edata: &[u8]) -> Option<[u8; 32]> {
     None
 }
 
+/// `session_id` 在 handshake_message 中的字节偏移。
+///
+/// handshake_message 布局：
+/// `[type(1)][length(3)][legacy_version(2)][random(32)][sid_len(1)=32][session_id(32)][...]`
+/// session_id 起始 = 1 + 3 + 2 + 32 + 1 = 39。
+const SESSION_ID_OFFSET_IN_HANDSHAKE: usize = 39;
+
+/// 服务端 REALITY 验证：组合 ECDH + HKDF + AES-GCM 解密 + timestamp/short_id 校验。
+///
+/// 对应 Go `transport/internet/reality/reality.go::Server` 的 session_id 校验。
+/// watfaq-rustls 仅暴露 client 端 REALITY（`compute_session_id`），服务端验证需自行实现。
+///
+/// # AAD 协议（关键，来自 watfaq `hs.rs` line 770-779）
+///
+/// client 端 `compute_session_id` 编码时先把 session_id 置全 0，再编码整个 handshake message，
+/// 用此 zero-session-id 版本作为 AES-GCM AAD。因此服务端验证时必须取 handshake_message，
+/// 把 session_id 字段（偏移 [`SESSION_ID_OFFSET_IN_HANDSHAKE`]，32 字节）替换为全 0 再解密。
+///
+/// # 参数
+///
+/// - `parsed`: [`parse_client_hello`] 的输出。
+/// - `server_static_private`: 服务端静态 X25519 私钥（对应 client 配置的 `public_key`）。
+/// - `now_unix`: 当前 Unix 时间戳（秒）。
+/// - `max_diff`: 允许的 timestamp 偏差秒数（Go 默认 ±12h = 43200）。
+/// - `allowed_short_ids`: 允许的 short_id 白名单（每个 8 字节）。
+pub fn verify_reality_client_hello(
+    parsed: &ParsedClientHello<'_>,
+    server_static_private: &[u8; 32],
+    now_unix: u32,
+    max_diff: u32,
+    allowed_short_ids: &[[u8; 8]],
+) -> Result<crate::crypto::SessionPayload, RealityError> {
+    // 1. 提取 client X25519 公钥（来自 key_share extension）
+    let client_pub = parsed
+        .key_share_x25519
+        .ok_or(RealityError::NoKeyShareX25519)?;
+
+    // 2. 构造 zero-session-id handshake message（AES-GCM AAD）
+    //    复用 parsed.handshake_message（record payload，含 handshake type+length header），
+    //    把 session_id 字段替换为全 0，对齐 watfaq client 端编码行为。
+    let mut aad = parsed.handshake_message.to_vec();
+    let sid_end = SESSION_ID_OFFSET_IN_HANDSHAKE + crate::crypto::SESSION_ID_LEN;
+    if aad.len() < sid_end {
+        return Err(RealityError::InvalidConnection);
+    }
+    // 防御性校验：sid_len 字段（偏移 38）必须 == 32
+    if aad[SESSION_ID_OFFSET_IN_HANDSHAKE - 1] != crate::crypto::SESSION_ID_LEN as u8 {
+        return Err(RealityError::InvalidConnection);
+    }
+    aad[SESSION_ID_OFFSET_IN_HANDSHAKE..sid_end].fill(0);
+
+    // 3. ECDH(server_priv, client_pub) → auth_key
+    //    X25519 ECDH 对称：ECDH(server_priv, client_pub) == ECDH(client_priv, server_pub)，
+    //    与 client 端 derive_auth_key(client_priv, server_pub, ...) 产出相同 auth_key。
+    let auth_key = crate::crypto::derive_auth_key(
+        server_static_private,
+        &client_pub,
+        &parsed.random[..crate::crypto::HKDF_SALT_LEN],
+    )?;
+
+    // 4. AES-256-GCM 解密 session_id（nonce = random[20..32]）
+    let plaintext = crate::crypto::decrypt_session_id(
+        &auth_key,
+        &parsed.random[crate::crypto::HKDF_SALT_LEN..],
+        &parsed.session_id,
+        &aad,
+    )?;
+
+    // 5. 校验 timestamp 窗口 + short_id 白名单
+    crate::crypto::verify_session_payload(&plaintext, now_unix, max_diff, allowed_short_ids)
+}
+
 /// 创建 REALITY 服务端连接（IO 层，切片3 待实现）。
 ///
 /// 当前返回 [`RealityError::UtlsRequired`]。完整实现需：peek ClientHello record →
@@ -343,5 +415,175 @@ mod tests {
         let cfg = RealityConfig::default();
         let err = server::<()>((), cfg).unwrap_err();
         assert!(matches!(err, RealityError::UtlsRequired));
+    }
+
+    /// 构造完整 REALITY ClientHello record（含真实加密 session_id），测试 verify 用。
+    ///
+    /// 流程对齐 watfaq client `compute_session_id`：session_id=0 编码拿 AAD →
+    /// derive_auth_key → encrypt_session_id → 用密文 session_id 重新编码。
+    fn build_reality_client_hello(
+        random: &[u8; 32],
+        server_static_private: &[u8; 32],
+        client_private: &[u8; 32],
+        timestamp: u32,
+        short_id: &[u8; 8],
+        sni: Option<&str>,
+    ) -> Vec<u8> {
+        use crate::crypto::{derive_auth_key, encrypt_session_id};
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let client_secret = StaticSecret::from(*client_private);
+        let client_pub = PublicKey::from(&client_secret);
+        let server_pub = PublicKey::from(&StaticSecret::from(*server_static_private));
+
+        // 1. 构造 session_id=0 的 ClientHello（拿 AAD = handshake_message）
+        let zero_sid = [0u8; 32];
+        let record_zero = build_test_client_hello(random, &zero_sid, client_pub.as_bytes(), sni);
+        let parsed_zero = parse_client_hello(&record_zero).unwrap();
+
+        // 2. derive auth_key（client 视角：client_priv + server_pub）
+        let auth_key =
+            derive_auth_key(client_private, server_pub.as_bytes(), &random[..20]).unwrap();
+
+        // 3. 构造 plaintext[16] = [version(3)|reserved(1)|timestamp(4 BE)|short_id(8)]
+        let mut plaintext = [0u8; 16];
+        plaintext[0..3].copy_from_slice(&[1, 8, 1]); // version（对齐 watfaq 默认）
+        plaintext[3] = 0; // reserved
+        plaintext[4..8].copy_from_slice(&timestamp.to_be_bytes());
+        plaintext[8..16].copy_from_slice(short_id);
+
+        // 4. encrypt session_id[:16] → 密文 32 字节
+        let mut sid = [0u8; 32];
+        sid[..16].copy_from_slice(&plaintext);
+        encrypt_session_id(&auth_key, &random[20..32], &mut sid, parsed_zero.handshake_message)
+            .unwrap();
+
+        // 5. 构造最终 ClientHello（session_id = 密文）
+        build_test_client_hello(random, &sid, client_pub.as_bytes(), sni)
+    }
+
+    #[test]
+    fn verify_reality_client_hello_ok() {
+        let random = [0x55u8; 32];
+        let server_priv = [0x11u8; 32];
+        let client_priv = [0x22u8; 32];
+        let now = 1_700_000_000u32;
+        let short_id = [0xaa; 8];
+
+        let record = build_reality_client_hello(
+            &random,
+            &server_priv,
+            &client_priv,
+            now,
+            &short_id,
+            Some("example.com"),
+        );
+        let parsed = parse_client_hello(&record).unwrap();
+        let payload =
+            verify_reality_client_hello(&parsed, &server_priv, now, 43200, &[short_id]).unwrap();
+        assert_eq!(payload.timestamp, now);
+        assert_eq!(payload.short_id, short_id);
+        assert_eq!(payload.version, [1, 8, 1]);
+    }
+
+    #[test]
+    fn verify_reality_client_hello_no_key_share() {
+        // 构造无 key_share 的 ClientHello（extensions_len=0）
+        let random = [0x55u8; 32];
+        let session_id = [0x77u8; 32];
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&random);
+        body.push(32);
+        body.extend_from_slice(&session_id);
+        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]);
+        body.extend_from_slice(&[1, 0]);
+        body.extend_from_slice(&[0x00, 0x00]);
+
+        let mut hs = vec![0x01];
+        let blen = body.len();
+        hs.push((blen >> 16) as u8);
+        hs.push((blen >> 8) as u8);
+        hs.push(blen as u8);
+        hs.extend_from_slice(&body);
+
+        let mut record = vec![0x16, 0x03, 0x01];
+        let hl = hs.len();
+        record.push((hl >> 8) as u8);
+        record.push(hl as u8);
+        record.extend_from_slice(&hs);
+
+        let parsed = parse_client_hello(&record).unwrap();
+        assert!(parsed.key_share_x25519.is_none());
+        let err = verify_reality_client_hello(&parsed, &[0u8; 32], 0, 0, &[]).unwrap_err();
+        assert!(matches!(err, RealityError::NoKeyShareX25519));
+    }
+
+    #[test]
+    fn verify_reality_client_hello_wrong_server_key() {
+        let random = [0x55u8; 32];
+        let server_priv = [0x11u8; 32];
+        let client_priv = [0x22u8; 32];
+        let now = 1_700_000_000u32;
+        let short_id = [0xaa; 8];
+
+        let record =
+            build_reality_client_hello(&random, &server_priv, &client_priv, now, &short_id, None);
+        let parsed = parse_client_hello(&record).unwrap();
+        // 用错误的 server key 验证 → AES-GCM 解密失败
+        let wrong_priv = [0x99u8; 32];
+        let err =
+            verify_reality_client_hello(&parsed, &wrong_priv, now, 43200, &[short_id]).unwrap_err();
+        assert!(matches!(err, RealityError::SessionIdDecryptFailed));
+    }
+
+    #[test]
+    fn verify_reality_client_hello_timestamp_out_of_window() {
+        let random = [0x55u8; 32];
+        let server_priv = [0x11u8; 32];
+        let client_priv = [0x22u8; 32];
+        let client_time = 1_700_000_000u32;
+        let short_id = [0xaa; 8];
+
+        let record = build_reality_client_hello(
+            &random,
+            &server_priv,
+            &client_priv,
+            client_time,
+            &short_id,
+            None,
+        );
+        let parsed = parse_client_hello(&record).unwrap();
+        // server 时间偏离 100000s，max_diff=43200 → 超窗
+        let server_now = client_time + 100_000;
+        let err = verify_reality_client_hello(&parsed, &server_priv, server_now, 43200, &[
+            short_id,
+        ])
+        .unwrap_err();
+        assert!(matches!(err, RealityError::TimestampOutOfWindow { .. }));
+    }
+
+    #[test]
+    fn verify_reality_client_hello_short_id_not_allowed() {
+        let random = [0x55u8; 32];
+        let server_priv = [0x11u8; 32];
+        let client_priv = [0x22u8; 32];
+        let now = 1_700_000_000u32;
+        let client_short_id = [0xaa; 8];
+        let server_allowed = [[0xbb; 8]]; // 不含 client_short_id
+
+        let record = build_reality_client_hello(
+            &random,
+            &server_priv,
+            &client_priv,
+            now,
+            &client_short_id,
+            None,
+        );
+        let parsed = parse_client_hello(&record).unwrap();
+        let err =
+            verify_reality_client_hello(&parsed, &server_priv, now, 43200, &server_allowed)
+                .unwrap_err();
+        assert!(matches!(err, RealityError::ShortIdNotAllowed));
     }
 }

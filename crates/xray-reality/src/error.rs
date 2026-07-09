@@ -86,6 +86,10 @@ pub enum RealityError {
     /// session_id 内 short_id 不在服务端白名单。
     #[error("REALITY: short_id not in whitelist")]
     ShortIdNotAllowed,
+
+    /// key_share extension 缺失或不含 X25519 (group 0x001d) 条目——无法完成 REALITY 验证。
+    #[error("REALITY: key_share extension missing or no X25519 entry")]
+    NoKeyShareX25519,
 }
 
 /// REALITY crate 统一 Result 别名。
