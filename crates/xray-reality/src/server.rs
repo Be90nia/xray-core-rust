@@ -7,7 +7,8 @@
 //! - **切片2**（本切片）：纯逻辑验证层——[`parse_client_hello`] 字节解析 +
 //!   [`crate::crypto::decrypt_session_id`] + [`crate::crypto::verify_session_payload`]。
 //! - **切片3a**（本切片）：[`verify_reality_client_hello`] 组合（ECDH+HKDF+AES-GCM 解密+校验）。
-//! - **切片3b**（待办）：IO 层（peek record + fallback pipe + rustls 服务端伪造证书）。
+//! - **切片3b-i**（已完成）：[`read_tls_record`] + [`PrefixedReader`] IO 基础设施。
+//! - **切片3b-ii**（待办）：rustls 服务端伪造证书 + MITM + fallback（PROXY protocol）。
 //!
 //! # 为什么 ClientHello 手动解析
 //! Go 借助 `tls.Server` 读 ClientHello。Rust rustls 的 `server::Acceptor` 不直接暴露
@@ -16,6 +17,7 @@
 
 use crate::config::RealityConfig;
 use crate::error::RealityError;
+use tokio::io::AsyncRead;
 
 /// 解析后的 TLS 1.3 ClientHello（仅提取 REALITY 验证需要的字段）。
 #[derive(Debug, Clone)]
@@ -264,10 +266,138 @@ pub fn server<C>(_inner: C, _config: RealityConfig) -> Result<(), RealityError> 
     Err(RealityError::UtlsRequired)
 }
 
+/// TLS record 最大长度（RFC 5246: 2^14 bytes，防止恶意 OOM）。
+const MAX_TLS_RECORD_LEN: usize = 16384;
+
+/// 从流读取一个完整 TLS record（5 字节 header + payload），返回完整 record 字节。
+///
+/// 翻译自 Go `common/protocol/tls/sniff.go::ReadClientHello` 的 record 读取部分。
+/// 用于 REALITY 服务端：先读到完整 ClientHello record，再 [`parse_client_hello`] + verify。
+pub async fn read_tls_record<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut header = [0u8; 5];
+    reader.read_exact(&mut header).await?;
+    let length = u16::from_be_bytes([header[3], header[4]]) as usize;
+    if length > MAX_TLS_RECORD_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("TLS record length {length} exceeds max {MAX_TLS_RECORD_LEN}"),
+        ));
+    }
+    let mut record = Vec::with_capacity(5 + length);
+    record.extend_from_slice(&header);
+    record.resize(5 + length, 0);
+    reader.read_exact(&mut record[5..]).await?;
+    Ok(record)
+}
+
+/// 先返回 `prefix` 字节，耗尽后转发到 `inner` 的 [`AsyncRead`]。
+///
+/// REALITY 服务端读出 ClientHello record 后，rustls 服务端需要完整 TLS 字节流
+/// （不能跳过已读的 ClientHello）。[`PrefixedReader`] 把已读 record 重新注入流头，
+/// 让 rustls 像读新连接一样处理。
+pub struct PrefixedReader<R> {
+    prefix: Vec<u8>,
+    prefix_pos: usize,
+    inner: R,
+}
+
+impl<R> PrefixedReader<R> {
+    /// 创建：`prefix` 是已读字节（如 ClientHello record），`inner` 是原连接。
+    pub fn new(prefix: Vec<u8>, inner: R) -> Self {
+        Self { prefix, prefix_pos: 0, inner }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for PrefixedReader<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.prefix_pos < self.prefix.len() {
+            let remaining = self.prefix.len() - self.prefix_pos;
+            let n = std::cmp::min(remaining, buf.remaining());
+            let filled = buf.initialize_unfilled();
+            filled[..n].copy_from_slice(&self.prefix[self.prefix_pos..self.prefix_pos + n]);
+            self.prefix_pos += n;
+            buf.advance(n);
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn read_tls_record_roundtrip() {
+        let mut record = vec![0x16, 0x03, 0x01, 0x00, 0x0a];
+        record.extend_from_slice(&[0u8; 10]);
+        let mut reader = &record[..];
+        let got = read_tls_record(&mut reader).await.unwrap();
+        assert_eq!(got, record);
+    }
+
+    #[tokio::test]
+    async fn read_tls_record_rejects_too_long() {
+        let record = [0x16, 0x03, 0x01, 0x4e, 0x20]; // length=20000
+        let mut reader = &record[..];
+        let err = read_tls_record(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn read_tls_record_eof_on_truncated_header() {
+        let record = [0x16, 0x03];
+        let mut reader = &record[..];
+        let err = read_tls_record(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn prefixed_reader_drains_prefix_then_inner() {
+        use tokio::io::AsyncReadExt;
+        let prefix = b"hello".to_vec();
+        let inner = b" world";
+        let mut reader = PrefixedReader::new(prefix, &inner[..]);
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn prefixed_reader_empty_prefix_forwards_inner() {
+        use tokio::io::AsyncReadExt;
+        let mut reader = PrefixedReader::new(Vec::new(), &b"data"[..]);
+        let mut buf = [0u8; 4];
+        reader.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"data");
+    }
+
+    #[tokio::test]
+    async fn prefixed_reader_partial_reads() {
+        use tokio::io::AsyncReadExt;
+        let prefix = b"abcdef".to_vec();
+        let inner = b"XYZ";
+        let mut reader = PrefixedReader::new(prefix, &inner[..]);
+        let mut buf = [0u8; 2];
+        reader.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ab");
+        reader.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"cd");
+        reader.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ef");
+        reader.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"XY");
+        let mut one = [0u8; 1];
+        reader.read_exact(&mut one).await.unwrap();
+        assert_eq!(&one, b"Z");
+    }
     /// 构造最小 TLS 1.3 ClientHello record（测试用，含 session_id + key_share + 可选 SNI）。
     fn build_test_client_hello(
         random: &[u8; 32],
