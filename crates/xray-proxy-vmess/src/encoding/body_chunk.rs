@@ -16,23 +16,19 @@
 //!
 //! # 实现范围
 //!
-//! 同步 IO（`std::io::Read/Write`），复用 `xray_crypto::aead::Aes128Gcm`。
+//! 同步 IO（`std::io::Read/Write`），复用 `xray_crypto::aead::AeadCipher` trait。
 //! 支持 PlainChunkSizeParser + NoPadding（默认）+ ShakeSizeParser + ShakePadding（chunk masking）
-//! 两条路径。ChaCha20-Poly1305 / AuthenticatedLength 留 follow-up。
+//! 两条路径。AuthenticatedLength 留 follow-up。
 
 use std::io::{Read, Write};
 
-use xray_crypto::aead::{AeadCipher, Aes128Gcm};
+use xray_crypto::aead::AeadCipher;
 
-use crate::encoding::{
-    ChunkNonceGenerator, NoOpAuthenticator, PlainChunkSizeParser, ShakeSizeParser,
-};
+use crate::encoding::{ChunkNonceGenerator, PlainChunkSizeParser, ShakeSizeParser};
 
 /// 默认 chunk payload 上限（VMess 用 0x3FFF = 16383，对应 2B length 字段最高位 0）。
 const DEFAULT_PAYLOAD_SIZE: usize = 8192;
 
-/// AEAD tag 长度（AES-128-GCM）。
-const TAG_SIZE: usize = 16;
 
 /// size 字段字节数（Plain / Shake 都是 2B）。
 const SIZE_FIELD_BYTES: usize = 2;
@@ -136,13 +132,13 @@ impl ChunkNonce for ChunkNonceAdapter {
 pub fn encode_chunk_stream<W: Write>(
     writer: &mut W,
     data: &[u8],
-    cipher: &Aes128Gcm,
+    cipher: &dyn AeadCipher,
     nonce_gen: &mut dyn ChunkNonce,
     size_parser: &mut dyn SizeParser,
 ) -> std::io::Result<()> {
     let max_padding = usize::from(size_parser_max_padding_hint(size_parser));
     let payload_chunk_size = DEFAULT_PAYLOAD_SIZE
-        .saturating_sub(TAG_SIZE)
+        .saturating_sub(cipher.tag_size())
         .saturating_sub(SIZE_FIELD_BYTES)
         .saturating_sub(max_padding);
 
@@ -172,7 +168,7 @@ pub fn encode_chunk_stream<W: Write>(
 fn write_one_chunk<W: Write>(
     writer: &mut W,
     data: &[u8],
-    cipher: &Aes128Gcm,
+    cipher: &dyn AeadCipher,
     nonce_gen: &mut dyn ChunkNonce,
     size_parser: &mut dyn SizeParser,
 ) -> std::io::Result<()> {
@@ -219,7 +215,7 @@ fn write_one_chunk<W: Write>(
 /// - AEAD 解密失败
 pub fn decode_chunk_stream<R: Read>(
     reader: &mut R,
-    cipher: &Aes128Gcm,
+    cipher: &dyn AeadCipher,
     nonce_gen: &mut dyn ChunkNonce,
     size_parser: &mut dyn SizeParser,
 ) -> std::io::Result<Vec<u8>> {
@@ -281,6 +277,8 @@ fn size_parser_max_padding_hint(_p: &dyn SizeParser) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xray_crypto::aead::{Aes128Gcm, ChaCha20Poly1305Aead};
+    use crate::encoding::NoOpAuthenticator;
 
     fn make_cipher() -> Aes128Gcm {
         Aes128Gcm::new(&[0x42u8; 16]).expect("aes")
@@ -391,8 +389,55 @@ mod tests {
         let c = Aes128Gcm::new(&[1u8; 16]).expect("aes");
         let nonce = vec![0u8; 12];
         let sealed = c.seal(&nonce, &[], b"test").expect("seal");
-        assert_eq!(sealed.len(), 4 + TAG_SIZE);
+        assert_eq!(sealed.len(), 4 + c.tag_size());
         let opened = c.open(&nonce, &[], &sealed).expect("open");
         assert_eq!(opened, b"test");
+    }
+
+    #[test]
+    fn chacha20poly1305_roundtrip() {
+        // 验证 ChaCha20-Poly1305 通过 &dyn AeadCipher 泛化路径 round-trip
+        let cipher_w = ChaCha20Poly1305Aead::new(&[0x42u8; 32]).expect("chacha");
+        let cipher_r = ChaCha20Poly1305Aead::new(&[0x42u8; 32]).expect("chacha");
+        let mut nw = ChunkNonceAdapter::new(&[0xAAu8; 16], 12);
+        let mut nr = ChunkNonceAdapter::new(&[0xAAu8; 16], 12);
+        let mut sp_w = PlainSizeParser;
+        let mut sp_r = PlainSizeParser;
+
+        let data = b"chacha20 poly1305 vmess body";
+        let mut buf: Vec<u8> = Vec::new();
+        encode_chunk_stream(&mut buf, data, &cipher_w, &mut nw, &mut sp_w).expect("encode");
+
+        let decoded =
+            decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r).expect("decode");
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn chacha20poly1305_multi_cipher_dispatch() {
+        // 验证同一 encode/decode 函数可 dispatch 不同 cipher（Aes128Gcm vs ChaCha20）
+        let aes_w = Aes128Gcm::new(&[0x42u8; 16]).expect("aes");
+        let aes_r = Aes128Gcm::new(&[0x42u8; 16]).expect("aes");
+        let data = b"dispatch test";
+        let mut buf: Vec<u8> = Vec::new();
+        let mut nw = ChunkNonceAdapter::new(&[0xAAu8; 16], 12);
+        let mut nr = ChunkNonceAdapter::new(&[0xAAu8; 16], 12);
+        let mut sp_w = PlainSizeParser;
+        let mut sp_r = PlainSizeParser;
+        encode_chunk_stream(&mut buf, data, &aes_w, &mut nw, &mut sp_w).expect("aes encode");
+        let decoded =
+            decode_chunk_stream(&mut &buf[..], &aes_r, &mut nr, &mut sp_r).expect("aes decode");
+        assert_eq!(decoded, data);
+
+        // ChaCha20 独立流
+        let chacha_w = ChaCha20Poly1305Aead::new(&[0x99u8; 32]).expect("chacha");
+        let chacha_r = ChaCha20Poly1305Aead::new(&[0x99u8; 32]).expect("chacha");
+        let mut buf2: Vec<u8> = Vec::new();
+        let mut nw2 = ChunkNonceAdapter::new(&[0xBBu8; 16], 12);
+        let mut nr2 = ChunkNonceAdapter::new(&[0xBBu8; 16], 12);
+        encode_chunk_stream(&mut buf2, data, &chacha_w, &mut nw2, &mut sp_w).expect("chacha encode");
+        let decoded2 =
+            decode_chunk_stream(&mut &buf2[..], &chacha_r, &mut nr2, &mut sp_r).expect("chacha decode");
+        assert_eq!(decoded2, data);
     }
 }

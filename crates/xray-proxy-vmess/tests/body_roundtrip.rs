@@ -247,3 +247,67 @@ fn decode_request_body_wrong_key_fails() {
         "expected IO error (auth failed), got {err:?}"
     );
 }
+
+#[test]
+fn full_roundtrip_chacha20poly1305() {
+    // 验证 ChaCha20-Poly1305 security 完整 client↔server round-trip
+    // （不同于默认 Aes128Gcm，ChaCha20 用 generate_chacha20poly1305_key 派生 32B key）
+    let validator = make_validator_with_user();
+    let history = SessionHistory::new();
+
+    let client = ClientSession::new();
+    let cmd_key = xray_proxy_vmess::account::cmd_key_of(&sample_uuid());
+
+    let request_header = RequestHeader::new(
+        xray_proxy_vmess::encoding::VERSION,
+        Command::Tcp,
+        sample_destination(),
+        SecurityType::Chacha20Poly1305,
+    );
+    let request_payload = b"chacha20poly1305 security round-trip payload";
+
+    let mut client_to_server: Vec<u8> = Vec::new();
+    let sealed_header = client
+        .encode_request_header(&request_header, &cmd_key)
+        .expect("encode_request_header");
+    client_to_server.extend_from_slice(&sealed_header);
+    client
+        .encode_request_body(&request_header, request_payload, &mut client_to_server)
+        .expect("encode_request_body");
+
+    let mut server = ServerSession::new(&validator, &history);
+    let mut reader = &client_to_server[..];
+
+    let (decoded_req_header, _user) = server
+        .decode_request_header(&mut reader)
+        .expect("decode_request_header");
+    assert_eq!(decoded_req_header.security, SecurityType::Chacha20Poly1305);
+
+    let decoded_req_body = server
+        .decode_request_body(&decoded_req_header, &mut reader)
+        .expect("decode_request_body");
+    assert_eq!(decoded_req_body, request_payload);
+
+    // 响应同样走 ChaCha20
+    let response_header = ResponseHeader {
+        command: Command::Tcp,
+        option: Bitmask::new(0),
+    };
+    let response_payload = b"chacha20 server response";
+    let mut server_to_client: Vec<u8> = Vec::new();
+    server
+        .encode_response_header(&response_header, &mut server_to_client)
+        .expect("encode_response_header");
+    server
+        .encode_response_body(&decoded_req_header, response_payload, &mut server_to_client)
+        .expect("encode_response_body");
+
+    let mut client_reader = &server_to_client[..];
+    let _ = client
+        .decode_response_header(&mut client_reader)
+        .expect("decode_response_header");
+    let decoded_resp_body = client
+        .decode_response_body(&request_header, &mut client_reader)
+        .expect("decode_response_body");
+    assert_eq!(decoded_resp_body, response_payload);
+}

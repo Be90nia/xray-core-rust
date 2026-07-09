@@ -7,8 +7,8 @@
 //! - **完整**：`ServerSession::decode_request_header`（AEAD 解密 + 字段解析 + FNV1a 校验）
 //!   + `SessionHistory`（防重放，session_id=16B user + 16B key + 16B nonce）
 //! - **完整**：`decode_request_body` / `encode_response_header` / `encode_response_body`
-//!   （AES-128-GCM + PlainChunkSizeParser 路径，对应 Go 默认 security）
-//! - **留 follow-up**：ChaCha20-Poly1305 + AuthenticatedLength + ShakeSizeParser + async 化
+//!   （AES-128-GCM + ChaCha20-Poly1305 + PlainChunkSizeParser 路径）
+//! - **留 follow-up**：AuthenticatedLength + ShakeSizeParser + async 化
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -19,11 +19,11 @@ use xray_common::net::address::Address;
 use xray_common::net::destination::Destination;
 use xray_common::net::port::Port;
 use xray_common::protocol::{Command, RequestHeader, ResponseHeader, SecurityType};
-use xray_crypto::aead::{AeadCipher, Aes128Gcm};
+use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead};
 
 use crate::aead::{self, consts, OpenHeaderError};
 use crate::encoding::body_chunk::{self, ChunkNonceAdapter, PlainSizeParser};
-use crate::encoding::{authenticate, read_address_port};
+use crate::encoding::{authenticate, generate_chacha20poly1305_key, read_address_port};
 use crate::error::{Result, VmessError};
 use crate::validator::{MemoryUser, TimedUserValidator, Validator};
 
@@ -273,17 +273,23 @@ impl<'v> ServerSession<'v> {
         request: &RequestHeader,
         reader: &mut R,
     ) -> Result<Vec<u8>> {
-        // ponytail: 当前只支持 AES-128-GCM
-        if !matches!(request.security, SecurityType::Aes128Gcm) {
-            return Err(VmessError::Other(format!(
-                "decode_request_body: only Aes128Gcm supported, got {:?}",
-                request.security
-            )));
-        }
-        let cipher = Aes128Gcm::new(&self.request_body_key)?;
+        // ponytail: 支持 AES-128-GCM（默认）+ ChaCha20-Poly1305
+        let cipher: Box<dyn AeadCipher> = match request.security {
+            SecurityType::Aes128Gcm => Box::new(Aes128Gcm::new(&self.request_body_key)?),
+            SecurityType::Chacha20Poly1305 => {
+                let key = generate_chacha20poly1305_key(&self.request_body_key);
+                Box::new(ChaCha20Poly1305Aead::new(&key)?)
+            }
+            other => {
+                return Err(VmessError::Other(format!(
+                    "decode_request_body: unsupported security {:?}",
+                    other
+                )))
+            }
+        };
         let mut nonce_gen = ChunkNonceAdapter::new(&self.request_body_iv, 12);
         let mut size_parser = PlainSizeParser;
-        let plaintext = body_chunk::decode_chunk_stream(reader, &cipher, &mut nonce_gen, &mut size_parser)?;
+        let plaintext = body_chunk::decode_chunk_stream(reader, cipher.as_ref(), &mut nonce_gen, &mut size_parser)?;
         Ok(plaintext)
     }
 
@@ -372,17 +378,23 @@ impl<'v> ServerSession<'v> {
         data: &[u8],
         writer: &mut W,
     ) -> Result<()> {
-        // ponytail: 当前只支持 AES-128-GCM
-        if !matches!(request.security, SecurityType::Aes128Gcm) {
-            return Err(VmessError::Other(format!(
-                "encode_response_body: only Aes128Gcm supported, got {:?}",
-                request.security
-            )));
-        }
-        let cipher = Aes128Gcm::new(&self.response_body_key)?;
+        // ponytail: 支持 AES-128-GCM（默认）+ ChaCha20-Poly1305
+        let cipher: Box<dyn AeadCipher> = match request.security {
+            SecurityType::Aes128Gcm => Box::new(Aes128Gcm::new(&self.response_body_key)?),
+            SecurityType::Chacha20Poly1305 => {
+                let key = generate_chacha20poly1305_key(&self.response_body_key);
+                Box::new(ChaCha20Poly1305Aead::new(&key)?)
+            }
+            other => {
+                return Err(VmessError::Other(format!(
+                    "encode_response_body: unsupported security {:?}",
+                    other
+                )))
+            }
+        };
         let mut nonce_gen = ChunkNonceAdapter::new(&self.response_body_iv, 12);
         let mut size_parser = PlainSizeParser;
-        body_chunk::encode_chunk_stream(writer, data, &cipher, &mut nonce_gen, &mut size_parser)?;
+        body_chunk::encode_chunk_stream(writer, data, cipher.as_ref(), &mut nonce_gen, &mut size_parser)?;
         Ok(())
     }
 }

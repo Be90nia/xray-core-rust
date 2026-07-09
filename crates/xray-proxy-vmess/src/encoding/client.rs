@@ -6,20 +6,19 @@
 //!
 //! - **完整**：`ClientSession::new` + `encode_request_header`
 //! - **完整**：`encode_request_body` / `decode_response_header` / `decode_response_body`
-//!   （AES-128-GCM + PlainChunkSizeParser 路径，对应 Go 默认 security）
-//! - **留 follow-up**：ChaCha20-Poly1305 security + AuthenticatedLength option +
-//!   ShakeSizeParser（ChunkMasking）+ async 化（接入 xray-crypto AuthenticationReader/Writer）
+//!   （AES-128-GCM + ChaCha20-Poly1305 + PlainChunkSizeParser 路径）
+//! - **留 follow-up**：AuthenticatedLength option + ShakeSizeParser（ChunkMasking）+ async 化
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
 use xray_common::bitmask::Bitmask;
 use xray_common::protocol::{Command, RequestHeader, ResponseHeader, SecurityType};
-use xray_crypto::aead::{AeadCipher, Aes128Gcm};
+use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead};
 
 use crate::aead::{self, consts, SealHeaderError};
 use crate::encoding::body_chunk::{self, ChunkNonceAdapter, PlainSizeParser};
-use crate::encoding::{authenticate, write_address_port, ChunkNonceGenerator};
+use crate::encoding::{authenticate, generate_chacha20poly1305_key, write_address_port, ChunkNonceGenerator};
 use crate::error::{Result, VmessError};
 use crate::VmessCommand;
 
@@ -166,7 +165,7 @@ impl ClientSession {
     ///
     /// # Errors
     ///
-    /// - [`VmessError::Other`]：security ≠ AES-128-GCM（当前路径限制）
+    /// - [`VmessError::Other`]：security 不支持（当前仅 AES-128-GCM / ChaCha20-Poly1305）
     /// - [`VmessError::Crypto`]：AES key 长度错误
     /// - [`VmessError::Io`]：writer IO 错误
     pub fn encode_request_body<W: std::io::Write>(
@@ -175,19 +174,24 @@ impl ClientSession {
         data: &[u8],
         writer: &mut W,
     ) -> Result<()> {
-        // ponytail: 当前只支持 AES-128-GCM（默认 security）
-        if !matches!(request.security, SecurityType::Aes128Gcm) {
-            return Err(VmessError::Other(format!(
-                "encode_request_body: only Aes128Gcm supported, got {:?}",
-                request.security
-            )));
-        }
-
-        let cipher = Aes128Gcm::new(&self.request_body_key)?;
+        // ponytail: 支持 AES-128-GCM（默认）+ ChaCha20-Poly1305
+        let cipher: Box<dyn AeadCipher> = match request.security {
+            SecurityType::Aes128Gcm => Box::new(Aes128Gcm::new(&self.request_body_key)?),
+            SecurityType::Chacha20Poly1305 => {
+                let key = generate_chacha20poly1305_key(&self.request_body_key);
+                Box::new(ChaCha20Poly1305Aead::new(&key)?)
+            }
+            other => {
+                return Err(VmessError::Other(format!(
+                    "encode_request_body: unsupported security {:?}",
+                    other
+                )))
+            }
+        };
         let mut nonce_gen = ChunkNonceAdapter::new(&self.request_body_iv, 12);
         // ponytail: ChunkMasking (ShakeSizeParser) + GlobalPadding 留 follow-up
         let mut size_parser = PlainSizeParser;
-        body_chunk::encode_chunk_stream(writer, data, &cipher, &mut nonce_gen, &mut size_parser)?;
+        body_chunk::encode_chunk_stream(writer, data, cipher.as_ref(), &mut nonce_gen, &mut size_parser)?;
         Ok(())
     }
 
@@ -275,7 +279,7 @@ impl ClientSession {
     ///
     /// # Errors
     ///
-    /// - [`VmessError::Other`]：security ≠ AES-128-GCM
+    /// - [`VmessError::Other`]：security 不支持（当前仅 AES-128-GCM / ChaCha20-Poly1305）
     /// - [`VmessError::Io`]：reader IO 错误（含 EOF）
     /// - [`VmessError::Crypto`]：AEAD 解密失败
     pub fn decode_response_body<R: std::io::Read>(
@@ -283,17 +287,23 @@ impl ClientSession {
         request: &RequestHeader,
         reader: &mut R,
     ) -> Result<Vec<u8>> {
-        // ponytail: 当前只支持 AES-128-GCM
-        if !matches!(request.security, SecurityType::Aes128Gcm) {
-            return Err(VmessError::Other(format!(
-                "decode_response_body: only Aes128Gcm supported, got {:?}",
-                request.security
-            )));
-        }
-        let cipher = Aes128Gcm::new(&self.response_body_key)?;
+        // ponytail: 支持 AES-128-GCM（默认）+ ChaCha20-Poly1305
+        let cipher: Box<dyn AeadCipher> = match request.security {
+            SecurityType::Aes128Gcm => Box::new(Aes128Gcm::new(&self.response_body_key)?),
+            SecurityType::Chacha20Poly1305 => {
+                let key = generate_chacha20poly1305_key(&self.response_body_key);
+                Box::new(ChaCha20Poly1305Aead::new(&key)?)
+            }
+            other => {
+                return Err(VmessError::Other(format!(
+                    "decode_response_body: unsupported security {:?}",
+                    other
+                )))
+            }
+        };
         let mut nonce_gen = ChunkNonceAdapter::new(&self.response_body_iv, 12);
         let mut size_parser = PlainSizeParser;
-        let plaintext = body_chunk::decode_chunk_stream(reader, &cipher, &mut nonce_gen, &mut size_parser)?;
+        let plaintext = body_chunk::decode_chunk_stream(reader, cipher.as_ref(), &mut nonce_gen, &mut size_parser)?;
         Ok(plaintext)
     }
 
