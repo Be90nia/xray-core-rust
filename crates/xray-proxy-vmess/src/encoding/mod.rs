@@ -8,12 +8,10 @@ pub mod client;
 pub mod server;
 
 
-use fnv::FnvHasher;
 use md5::Md5;
 use sha3::digest::{ExtendableOutput, Update, XofReader};
 use sha3::Shake128;
 
-use std::hash::Hasher;
 
 // ============================================================================
 // 常量
@@ -40,9 +38,13 @@ pub const AUTHENTICATED_LENGTH_PATH: &str = "auth_len";
 /// 用于命令 marshalling 的 auth field（4 字节，BE）。
 #[must_use]
 pub fn authenticate(b: &[u8]) -> u32 {
-    let mut h = FnvHasher::with_key(0x811C9DC5);
-    h.write(b);
-    h.finish() as u32
+    // ponytail: 手写 FNV1a-32，不用 fnv crate（它是 64-bit prime，结果不同）
+    let mut hash: u32 = 0x811C_9DC5; // FNV1a 32-bit offset basis
+    for byte in b {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(0x0100_0193); // FNV1a 32-bit prime
+    }
+    hash
 }
 
 // ============================================================================

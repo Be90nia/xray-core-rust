@@ -101,32 +101,41 @@ async fn vmess_ws_tls_vps_interop() {
         .await
         .expect("send VMess data");
 
-    // 5. Read response
+    // 5. Read response (循环读多帧，跳过 Ping/Pong)
     eprintln!("[5/5] Read response...");
-    match tokio::time::timeout(std::time::Duration::from_secs(10), ws.next()).await {
-        Ok(Some(Ok(msg))) => {
-            eprintln!("  WS message type: {}", msg);
-            let data = msg.into_data();
-            eprintln!("  Received {} bytes", data.len());
-            if data.is_empty() {
-                eprintln!("⚠️ Empty response — server may have sent Close/Ping frame");
-                eprintln!("   Possible causes:");
-                eprintln!("   - VMess AEAD header decryption failed (timestamp drift / key mismatch)");
-                eprintln!("   - Body chunk format mismatch");
-                eprintln!("   - Need decode_response_body for response decryption");
-            } else {
-                eprintln!("  First bytes: {:02x?}", &data[..data.len().min(32)]);
-                eprintln!("✅ VMess VPS interop: received response from Go server");
+    let deadline = std::time::Duration::from_secs(10);
+    loop {
+        match tokio::time::timeout(deadline, ws.next()).await {
+            Ok(Some(Ok(msg))) => {
+                eprintln!("  WS msg: {:?}", msg);
+                match msg {
+                    Message::Binary(data) => {
+                        eprintln!("  Binary: {} bytes, first: {:02x?}", data.len(), &data[..data.len().min(32)]);
+                        if !data.is_empty() {
+                            eprintln!("✅ VMess VPS interop: received binary response from Go server");
+                            break;
+                        }
+                    }
+                    Message::Ping(_) | Message::Pong(_) => continue,
+                    Message::Close(reason) => {
+                        eprintln!("⚠️ Server closed: {:?}", reason);
+                        break;
+                    }
+                    _ => continue,
+                }
             }
-        },
-        Ok(Some(Err(e))) => {
-            eprintln!("⚠️ WS error: {e}");
-        }
-        Ok(None) => {
-            eprintln!("⚠️ WS stream closed (None)");
-        }
-        Err(_) => {
-            eprintln!("⚠️ Read timed out (10s)");
+            Ok(Some(Err(e))) => {
+                eprintln!("⚠️ WS error: {e}");
+                break;
+            }
+            Ok(None) => {
+                eprintln!("⚠️ WS stream closed (None)");
+                break;
+            }
+            Err(_) => {
+                eprintln!("⚠️ Read timed out ({:?})", deadline);
+                break;
+            }
         }
     }
 }

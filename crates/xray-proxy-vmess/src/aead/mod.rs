@@ -55,36 +55,123 @@ pub mod consts {
 
 /// VMess KDF：基于 HMAC-SHA256 的嵌套密钥派生。
 ///
-/// 对应 Go `KDF(key, path...)`。Go 端用闭包+HMAC 链式 wrap 实现。
-/// 实现等价：对每个 path[i]，current = HMAC-SHA256(prev_finalize_output, path[i])，
-/// 最终对 key 做 HMAC-SHA256 后输出。
+/// 对应 Go `KDF(key, path...)`。Go 端通过 `hash2` 包装 HMAC 实例，
+/// 使内层 HMAC 成为外层 HMAC 的哈希函数（而非 key）。
+///
+/// 正确的嵌套结构：
+/// ```text
+/// L0(data) = HMAC-SHA256("VMess AEAD KDF", data)
+/// L1(salt, data) = L0(salt⊕opad || L0(salt⊕ipad || data))
+/// L2(s1,s2,data) = L1(s1, s2⊕opad || L1(s1, s2⊕ipad || data))
+/// L3(s1,s2,s3,data) = L2(s1,s2, s3⊕opad || L2(s1,s2, s3⊕ipad || data))
+/// ```
+
+const HMAC_BLOCK_LEN: usize = 64;
+
+/// L0: 基础哈希 = HMAC-SHA256(key="VMess AEAD KDF")
+fn l0(data: &[u8]) -> [u8; 32] {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(consts::VMESS_AEAD_KDF.as_bytes())
+        .expect("HMAC key length");
+    mac.update(data);
+    let result = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
+}
+
+/// 计算 HMAC ipad/opad（key 零填充到 64 字节后 XOR）
+fn compute_pads(key: &[u8]) -> ([u8; HMAC_BLOCK_LEN], [u8; HMAC_BLOCK_LEN]) {
+    let mut ikey = [0u8; HMAC_BLOCK_LEN];
+    let mut okey = [0u8; HMAC_BLOCK_LEN];
+    let k = if key.len() > HMAC_BLOCK_LEN {
+        // 超长 key 先用 l0 哈希（VMess 实际不会触发）
+        let h = l0(key);
+        ikey[..32].copy_from_slice(&h);
+        okey[..32].copy_from_slice(&h);
+        return {
+            for i in 0..HMAC_BLOCK_LEN { ikey[i] ^= 0x36; okey[i] ^= 0x5c; }
+            (ikey, okey)
+        };
+    } else {
+        key
+    };
+    ikey[..k.len()].copy_from_slice(k);
+    okey[..k.len()].copy_from_slice(k);
+    for i in 0..HMAC_BLOCK_LEN { ikey[i] ^= 0x36; okey[i] ^= 0x5c; }
+    (ikey, okey)
+}
+
+/// L1: HMAC(hash=L0, key=salt)(data) = L0(okey || L0(ikey || data))
+fn l1(salt: &[u8], data: &[u8]) -> [u8; 32] {
+    let (ikey, okey) = compute_pads(salt);
+    let mut inner = Vec::with_capacity(HMAC_BLOCK_LEN + data.len());
+    inner.extend_from_slice(&ikey);
+    inner.extend_from_slice(data);
+    let inner_hash = l0(&inner);
+    let mut outer = Vec::with_capacity(HMAC_BLOCK_LEN + 32);
+    outer.extend_from_slice(&okey);
+    outer.extend_from_slice(&inner_hash);
+    l0(&outer)
+}
+
+/// L2: HMAC(hash=L1(s1), key=s2)(data)
+fn l2(s1: &[u8], s2: &[u8], data: &[u8]) -> [u8; 32] {
+    let (ikey, okey) = compute_pads(s2);
+    let mut inner = Vec::with_capacity(HMAC_BLOCK_LEN + data.len());
+    inner.extend_from_slice(&ikey);
+    inner.extend_from_slice(data);
+    let inner_hash = l1(s1, &inner);
+    let mut outer = Vec::with_capacity(HMAC_BLOCK_LEN + 32);
+    outer.extend_from_slice(&okey);
+    outer.extend_from_slice(&inner_hash);
+    l1(s1, &outer)
+}
+
+/// L3: HMAC(hash=L2(s1,s2), key=s3)(data)
+fn l3(s1: &[u8], s2: &[u8], s3: &[u8], data: &[u8]) -> [u8; 32] {
+    let (ikey, okey) = compute_pads(s3);
+    let mut inner = Vec::with_capacity(HMAC_BLOCK_LEN + data.len());
+    inner.extend_from_slice(&ikey);
+    inner.extend_from_slice(data);
+    let inner_hash = l2(s1, s2, &inner);
+    let mut outer = Vec::with_capacity(HMAC_BLOCK_LEN + 32);
+    outer.extend_from_slice(&okey);
+    outer.extend_from_slice(&inner_hash);
+    l2(s1, s2, &outer)
+}
+
+/// KDF：Go `KDF(key, path...)` 的正确实现。
 ///
 /// # Panics
 ///
-/// 不会 panic。HMAC-SHA256 接受任意长度 key，这里输入都是定长。
+/// 超过 3 个路径段时 panic（VMess 协议不需要）。
 pub fn kdf(key: &[u8], path: &[&str]) -> Vec<u8> {
-    // ponytail: 完整翻译 Go 嵌套 HMAC 而非自己手撸 KDF
-    // 第 0 层 HMAC key = VMESS_AEAD_KDF
-    let mut current: Vec<u8> = {
-        let m = <HmacSha256 as Mac>::new_from_slice(consts::VMESS_AEAD_KDF.as_bytes())
-            .expect("VMESS_AEAD_KDF is short enough");
-        m.finalize().into_bytes().to_vec()
-    };
-    for p in path {
-        let mut next = <HmacSha256 as Mac>::new_from_slice(&current)
-            .expect("HMAC-SHA256 accepts any key length");
-        next.update(p.as_bytes());
-        current = next.finalize().into_bytes().to_vec();
+    let path_bytes: Vec<&[u8]> = path.iter().map(|s| s.as_bytes()).collect();
+    kdf_paths(key, &path_bytes)
+}
+
+/// KDF 的字节切片版本（用于 AuthID/nonce 等非 UTF-8 路径段）。
+pub fn kdf_paths(key: &[u8], paths: &[&[u8]]) -> Vec<u8> {
+    match paths.len() {
+        0 => l0(key).to_vec(),
+        1 => l1(paths[0], key).to_vec(),
+        2 => l2(paths[0], paths[1], key).to_vec(),
+        3 => l3(paths[0], paths[1], paths[2], key).to_vec(),
+        n => panic!("VMess KDF supports at most 3 path segments, got {n}"),
     }
-    let mut final_mac =
-        <HmacSha256 as Mac>::new_from_slice(&current).expect("HMAC-SHA256 accepts any key length");
-    final_mac.update(key);
-    final_mac.finalize().into_bytes().to_vec()
 }
 
 /// 取 KDF 前 16 字节（对应 Go `KDF16`）。
 pub fn kdf16(key: &[u8], path: &[&str]) -> [u8; 16] {
     let full = kdf(key, path);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&full[..16]);
+    out
+}
+
+/// KDF16 字节切片版本。
+pub fn kdf16_paths(key: &[u8], paths: &[&[u8]]) -> [u8; 16] {
+    let full = kdf_paths(key, paths);
     let mut out = [0u8; 16];
     out.copy_from_slice(&full[..16]);
     out
@@ -380,38 +467,6 @@ pub fn open_vmess_aead_header<R: std::io::Read>(
 }
 
 // ============================================================================
-// 字节切片版 KDF（path 元素是任意字节，不要求 UTF-8）
-// ============================================================================
-
-/// 与 [`kdf`] 等价，但 path 元素是字节切片而非字符串。
-///
-/// 用于 auth_id + nonce 拼接到 path 时（这两者不是合法 UTF-8）。
-/// Go 端通过 `string(byte_slice)` 把字节切片转字符串（不要求 UTF-8）。
-fn kdf_paths(key: &[u8], path: &[&[u8]]) -> Vec<u8> {
-    let mut current: Vec<u8> = {
-        let m = <HmacSha256 as Mac>::new_from_slice(consts::VMESS_AEAD_KDF.as_bytes())
-            .expect("VMESS_AEAD_KDF is short enough");
-        m.finalize().into_bytes().to_vec()
-    };
-    for p in path {
-        let mut next = <HmacSha256 as Mac>::new_from_slice(&current)
-            .expect("HMAC-SHA256 accepts any key length");
-        next.update(p);
-        current = next.finalize().into_bytes().to_vec();
-    }
-    let mut final_mac =
-        <HmacSha256 as Mac>::new_from_slice(&current).expect("HMAC-SHA256 accepts any key length");
-    final_mac.update(key);
-    final_mac.finalize().into_bytes().to_vec()
-}
-
-/// `kdf_paths` 的前 16 字节版本。
-fn kdf16_paths(key: &[u8], path: &[&[u8]]) -> [u8; 16] {
-    let full = kdf_paths(key, path);
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&full[..16]);
-    out
-}
 
 // ============================================================================
 // AuthIDDecoderHolder（对应 Go `aead/authid.go::AuthIDDecoderHolder`）
@@ -621,6 +676,41 @@ mod tests {
         assert_eq!(out.len(), 32);
     }
 
+
+    fn hex_to_bytes(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i+2], 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn kdf_go_compat_known_vectors() {
+        // Go 参考值: KDF16("Demo Key for Auth ID Test", "Demo Path for Auth ID Test")
+        let go_vec1 = kdf16(b"Demo Key for Auth ID Test", &["Demo Path for Auth ID Test"]);
+        assert_eq!(&go_vec1[..], hex_to_bytes("66e41ad47fa745fbfd1e97325e93dbf4"),
+            "KDF16 mismatch with Go reference (simple path)");
+
+        // Go 参考值: KDF16(0x00*16, "AES Auth ID Encryption")
+        let go_vec2 = kdf16(&[0u8; 16], &["AES Auth ID Encryption"]);
+        assert_eq!(&go_vec2[..], hex_to_bytes("2114985832a5bad7b65a0f72c3c73329"),
+            "KDF16 mismatch with Go reference (zero key)");
+
+        // Go L3 参考值: KDF16(key, "VMess Header AEAD Key_Length", authID_0*16, nonce_0*8)
+        let l3_key = kdf16_paths(
+            b"Demo Key for Auth ID Test",
+            &[b"VMess Header AEAD Key_Length", &[0u8; 16][..], &[0u8; 8][..]],
+        );
+        assert_eq!(&l3_key[..], hex_to_bytes("4f78a9bb23d8386f79ca39db0dccf0db"),
+            "L3 KDF16 mismatch: {:02x?}", l3_key);
+
+        // Go L3 with non-zero authID/nonce
+        let l3_key2 = kdf16_paths(
+            b"Demo Key for Auth ID Test",
+            &[b"VMess Header AEAD Key_Length", &[0x01u8,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10][..], &[0xAAu8,0xBB,0xCC,0xDD,0xEE,0xFF,0x00,0x11][..]],
+        );
+        assert_eq!(&l3_key2[..], hex_to_bytes("b31ccb5a152bcc9759e76d0ced86fe4d"),
+            "L3 KDF16 mismatch (nonzero): {:02x?}", l3_key2);
+    }
+
+    // === CreateAuthID 测试 ===
     // === CreateAuthID 测试 ===
 
     #[test]
