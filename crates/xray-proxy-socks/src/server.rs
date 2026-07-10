@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use xray_features::inbound::{InboundError, InboundHandler};
@@ -31,7 +32,8 @@ use crate::protocol::{
 pub struct SocksServer {
     tag: String,
     config: ServerConfig,
-    listener: Arc<Mutex<Option<Arc<TcpListener>>>>,
+    /// 监听器 + accept loop 任务句柄。close 时 abort 任务取消阻塞中的 accept().
+    slot: Mutex<Option<(Arc<TcpListener>, JoinHandle<()>)>>,
 }
 
 impl SocksServer {
@@ -40,15 +42,15 @@ impl SocksServer {
         Self {
             tag: tag.into(),
             config,
-            listener: Arc::new(Mutex::new(None)),
+            slot: Mutex::new(None),
         }
     }
 
     /// 获取监听端口（start 后有效，否则返回 0）。
     pub async fn bound_port(&self) -> u16 {
-        self.listener.lock().await
+        self.slot.lock().await
             .as_ref()
-            .and_then(|l| l.local_addr().ok())
+            .and_then(|(l, _)| l.local_addr().ok())
             .map(|a| a.port())
             .unwrap_or(0)
     }
@@ -65,32 +67,23 @@ impl InboundHandler for SocksServer {
         let addr: SocketAddr = "127.0.0.1:0"
             .parse()
             .map_err(|e| InboundError::ListenError(format!("invalid addr: {e}")))?;
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(|e| InboundError::ListenError(format!("bind failed: {e}")))?;
+        let listener = Arc::new(
+            TcpListener::bind(addr)
+                .await
+                .map_err(|e| InboundError::ListenError(format!("bind failed: {e}")))?,
+        );
         let bound = listener
             .local_addr()
             .map_err(|e| InboundError::ListenError(format!("local_addr: {e}")))?;
         info!(tag = %self.tag, addr = %bound, "SOCKS server started");
-        *self.listener.lock().await = Some(Arc::new(listener));
 
-        // spawn accept loop
+        // spawn accept loop — 持有 Arc<TcpListener> clone，无需访问 Mutex
         let tag = self.tag.clone();
         let config = self.config.clone();
-        let listener_clone = self.listener.clone();
-        tokio::spawn(async move {
+        let listener_clone = Arc::clone(&listener);
+        let handle = tokio::spawn(async move {
             loop {
-                // 修复死锁：先 clone Arc<TcpListener>，drop guard，再 accept（不持锁期间 await）
-                let listener = {
-                    let guard = listener_clone.lock().await;
-                    match guard.as_ref() {
-                        Some(l) => Arc::clone(l),
-                        None => break,
-                    }
-                };
-                let accept_result = listener.accept().await;
-
-                match accept_result {
+                match listener_clone.accept().await {
                     Ok((mut stream, peer)) => {
                         let tag = tag.clone();
                         let config = config.clone();
@@ -118,14 +111,16 @@ impl InboundHandler for SocksServer {
                 }
             }
         });
+
+        *self.slot.lock().await = Some((listener, handle));
         Ok(())
     }
 
     async fn close(&self) -> std::result::Result<(), InboundError> {
-        let mut guard = self.listener.lock().await;
-        if let Some(listener) = guard.take() {
-            // TcpListener drop 自动关闭
-            drop(listener);
+        if let Some((_listener, handle)) = self.slot.lock().await.take() {
+            // abort 取消阻塞中的 accept()，task 内 Arc<TcpListener> 随 task 结束 drop
+            handle.abort();
+            // _listener（我们的 Arc clone）在此 drop
             info!(tag = %self.tag, "SOCKS server closed");
         }
         Ok(())
@@ -495,5 +490,34 @@ mod tests {
         let (method, needs_auth) = select_method(&[AUTH_NOT_REQUIRED, AUTH_PASSWORD], &config);
         assert_eq!(method, AUTH_PASSWORD);
         assert!(needs_auth);
+    }
+
+    #[tokio::test]
+    async fn start_close_releases_listener_port() {
+        // 回归测试 68n: close 后 accept loop 必须 abort，端口必须释放
+        // 旧代码: accept loop 持有 Arc<TcpListener> clone → close 后 listener 仍开 → connect 成功
+        // 新代码: close abort 任务 → 端口关闭 → connect 失败
+        use std::time::Duration;
+        let server = SocksServer::new("test-close", ServerConfig::default());
+        server.start().await.unwrap();
+        let port = server.bound_port().await;
+        assert!(port > 0, "server should bind to a port");
+
+        server.close().await.unwrap();
+
+        // abort() 是异步取消，给 executor 一个轮次清理
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let addr = format!("127.0.0.1:{port}");
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            TcpStream::connect(&addr),
+        )
+        .await;
+        // 连接应失败（connection refused）——listener 已关闭
+        match result {
+            Ok(Ok(_)) => panic!("listener should be closed after close()"),
+            Ok(Err(_)) | Err(_) => {}
+        }
     }
 }

@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use xray_common::net::address::Address;
@@ -32,7 +33,8 @@ use crate::error::{HttpProxyError, Result};
 pub struct HttpServer {
     tag: String,
     config: ServerConfig,
-    listener: Arc<Mutex<Option<Arc<TcpListener>>>>,
+    /// 监听器 + accept loop 任务句柄。close 时 abort 任务取消 accept().
+    slot: Mutex<Option<(Arc<TcpListener>, JoinHandle<()>)>>,
 }
 
 impl HttpServer {
@@ -42,7 +44,7 @@ impl HttpServer {
         Self {
             tag: tag.into(),
             config,
-            listener: Arc::new(Mutex::new(None)),
+            slot: Mutex::new(None),
         }
     }
 }
@@ -57,32 +59,22 @@ impl InboundHandler for HttpServer {
         let addr: SocketAddr = "127.0.0.1:0"
             .parse()
             .map_err(|e| InboundError::ListenError(format!("invalid addr: {e}")))?;
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(|e| InboundError::ListenError(format!("bind failed: {e}")))?;
+        let listener = Arc::new(
+            TcpListener::bind(addr)
+                .await
+                .map_err(|e| InboundError::ListenError(format!("bind failed: {e}")))?,
+        );
         let bound = listener
             .local_addr()
             .map_err(|e| InboundError::ListenError(format!("local_addr: {e}")))?;
         info!(tag = %self.tag, addr = %bound, "HTTP proxy server started");
-        *self.listener.lock().await = Some(Arc::new(listener));
 
-        // spawn accept loop
         let tag = self.tag.clone();
         let config = self.config.clone();
-        let listener_clone = self.listener.clone();
-        tokio::spawn(async move {
+        let listener_clone = Arc::clone(&listener);
+        let handle = tokio::spawn(async move {
             loop {
-                // 修复死锁：先 clone Arc<TcpListener>，drop guard，再 accept
-                let listener = {
-                    let guard = listener_clone.lock().await;
-                    match guard.as_ref() {
-                        Some(l) => Arc::clone(l),
-                        None => break,
-                    }
-                };
-                let accept_result = listener.accept().await;
-
-                match accept_result {
+                match listener_clone.accept().await {
                     Ok((mut stream, peer)) => {
                         let tag = tag.clone();
                         let config = config.clone();
@@ -116,13 +108,14 @@ impl InboundHandler for HttpServer {
                 }
             }
         });
+
+        *self.slot.lock().await = Some((listener, handle));
         Ok(())
     }
 
     async fn close(&self) -> std::result::Result<(), InboundError> {
-        let mut guard = self.listener.lock().await;
-        if let Some(listener) = guard.take() {
-            drop(listener);
+        if let Some((_listener, handle)) = self.slot.lock().await.take() {
+            handle.abort();
             info!(tag = %self.tag, "HTTP proxy server closed");
         }
         Ok(())
@@ -479,5 +472,35 @@ mod tests {
         assert_eq!(method, "GET");
         assert!(matches!(dest.address(), Address::Domain(_)));
         assert_eq!(dest.port().value(), 80);
+    }
+
+    #[tokio::test]
+    async fn start_close_releases_listener_port() {
+        // 回归测试 68n: close 后 accept loop abort，端口释放
+        let server = HttpServer::new("test-close", ServerConfig::default());
+        server.start().await.unwrap();
+        let port = server
+            .slot
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|(l, _)| l.local_addr().ok())
+            .map(|a| a.port())
+            .unwrap_or(0);
+        assert!(port > 0, "server should bind to a port");
+
+        server.close().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let addr = format!("127.0.0.1:{port}");
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            TcpStream::connect(&addr),
+        )
+        .await;
+        match result {
+            Ok(Ok(_)) => panic!("listener should be closed after close()"),
+            Ok(Err(_)) | Err(_) => {}
+        }
     }
 }

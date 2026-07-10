@@ -18,6 +18,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use xray_common::net::address::Address;
 use xray_features::inbound::{InboundError, InboundHandler};
@@ -33,8 +34,8 @@ pub struct TrojanServer {
     tag: String,
     /// 用户验证器（共享）。
     validator: Arc<Validator>,
-    /// 监听器（`start` 后有值）。
-    listener: Arc<Mutex<Option<Arc<TcpListener>>>>,
+    /// 监听器 + accept loop 任务句柄。close 时 abort 任务取消 accept().
+    slot: Mutex<Option<(Arc<TcpListener>, JoinHandle<()>)>>,
 }
 
 impl TrojanServer {
@@ -44,7 +45,7 @@ impl TrojanServer {
         Self {
             tag: tag.into(),
             validator,
-            listener: Arc::new(Mutex::new(None)),
+            slot: Mutex::new(None),
         }
     }
 
@@ -68,33 +69,22 @@ impl InboundHandler for TrojanServer {
     }
 
     async fn start(&self) -> std::result::Result<(), InboundError> {
-        // ponytail: 切片2 直接用 tokio TcpListener; 切片3 切换到 listen_system
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .map_err(|e| InboundError::ListenError(format!("bind failed: {e}")))?;
+        let listener = Arc::new(
+            TcpListener::bind("127.0.0.1:0")
+                .await
+                .map_err(|e| InboundError::ListenError(format!("bind failed: {e}")))?,
+        );
         let bound = listener
             .local_addr()
             .map_err(|e| InboundError::ListenError(format!("local_addr: {e}")))?;
         info!(tag = %self.tag, addr = %bound, "Trojan server started");
-        *self.listener.lock().await = Some(Arc::new(listener));
 
-        // spawn accept loop
         let tag = self.tag.clone();
         let validator = self.validator.clone();
-        let listener_clone = self.listener.clone();
-        tokio::spawn(async move {
+        let listener_clone = Arc::clone(&listener);
+        let handle = tokio::spawn(async move {
             loop {
-                // 修复死锁：先 clone Arc<TcpListener>，drop guard，再 accept
-                let listener = {
-                    let guard = listener_clone.lock().await;
-                    match guard.as_ref() {
-                        Some(l) => Arc::clone(l),
-                        None => break,
-                    }
-                };
-                let accept_result = listener.accept().await;
-
-                match accept_result {
+                match listener_clone.accept().await {
                     Ok((mut stream, peer)) => {
                         let tag = tag.clone();
                         let validator = validator.clone();
@@ -110,12 +100,9 @@ impl InboundHandler for TrojanServer {
                                         user = %user.email,
                                         "Trojan handshake succeeded"
                                     );
-                                    // 切片3: dispatch to outbound handler
-                                    // Trojan 协议无握手响应，验证通过后直接转发
                                 }
                                 Err(e) => {
                                     warn!(tag = %tag, peer = %peer, error = %e, "Trojan handshake failed");
-                                    // 切片3: fallback 路径
                                 }
                             }
                         });
@@ -127,13 +114,14 @@ impl InboundHandler for TrojanServer {
                 }
             }
         });
+
+        *self.slot.lock().await = Some((listener, handle));
         Ok(())
     }
 
     async fn close(&self) -> std::result::Result<(), InboundError> {
-        let mut guard = self.listener.lock().await;
-        if let Some(listener) = guard.take() {
-            drop(listener);
+        if let Some((_listener, handle)) = self.slot.lock().await.take() {
+            handle.abort();
             info!(tag = %self.tag, "Trojan server closed");
         }
         Ok(())
@@ -440,5 +428,36 @@ mod tests {
         let mut cursor = std::io::Cursor::new(header);
         let result = trojan_server_handshake(&mut cursor, &validator).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn start_close_releases_listener_port() {
+        // 回归测试 68n: close 后 accept loop abort，端口释放
+        let validator = make_validator_with_user("password");
+        let server = TrojanServer::new("test-close", validator);
+        server.start().await.unwrap();
+        let port = server
+            .slot
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|(l, _)| l.local_addr().ok())
+            .map(|a| a.port())
+            .unwrap_or(0);
+        assert!(port > 0, "server should bind to a port");
+
+        server.close().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let addr = format!("127.0.0.1:{port}");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            TcpStream::connect(&addr),
+        )
+        .await;
+        match result {
+            Ok(Ok(_)) => panic!("listener should be closed after close()"),
+            Ok(Err(_)) | Err(_) => {}
+        }
     }
 }
