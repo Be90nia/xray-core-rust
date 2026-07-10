@@ -14,6 +14,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use xray_common::net::address::Address;
+use xray_tls::utls;
 
 use crate::config::{IpOption, QueryStrategy, resolve_ip_option_override};
 use crate::error::DnsError;
@@ -186,16 +187,62 @@ impl Client {
     }
 }
 
-/// `new_server` 工厂占位。对应 Go `NewServer`。
+/// DNS URL scheme 工厂。解析 URL scheme 并构造对应 nameserver。
 ///
-/// **本切片未实现 URL scheme 解析**。DoH/DoT/DoQ 留 follow-up bd 任务。
-/// 调用方应直接使用具体子模块：
-/// - UDP：`crate::nameserver::udp::new_classic_name_server(&ns)`
-/// - TCP：`crate::nameserver::tcp::new_tcp_name_server(&ns)`
+/// 支持的 URL scheme：
+/// - `IP[:port]` → UDP (默认 53)
+/// - `tcp://IP[:port]` → TCP (默认 53)
+/// - `tls://IP[:port]` → DoT (默认 853)
+/// - `https://IP[:port][/path]` → DoH (默认 443, path 默认 /dns-query)
+/// - `quic://IP[:port]` → DoQ (默认 854，未实现)
 ///
-/// TODO: follow-up 任务解析 `tcp://` / `https://` / `quic://` URL scheme 后再实现。
-pub fn new_server(_dest: Address) -> Result<Box<dyn Server>, DnsError> {
-    Err(DnsError::NotImplemented("new_server factory; use udp/tcp submodule directly"))
+/// 仅接受 IP 地址（不含域名解析，避免 DNS 循环依赖）。
+/// server_name (TLS SNI) 取自 IP 字符串。
+pub fn new_server(url: &str) -> Result<Box<dyn Server>, DnsError> {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+
+    let default_port = match scheme {
+        "" | "tcp" => 53u16,
+        "tls" => 853,
+        "https" => 443,
+        "quic" => 854,
+        other => return Err(DnsError::WireFormat(format!("unknown DNS scheme: {other}"))),
+    };
+
+    // Strip path for DoH (https://IP/dns-query → IP:port)
+    let host_port = rest.split('/').next().unwrap_or(rest);
+
+    let (address, port, server_name) = parse_dns_url_host(host_port, default_port)?;
+    let ns = NameServerConfig { address, port, ..Default::default() };
+
+    match scheme {
+        "" => udp::new_classic_name_server(&ns),
+        "tcp" => tcp::new_tcp_name_server(&ns),
+        "tls" => dot::new_dot_name_server(&ns, server_name, utls::default_client_config()),
+        "https" => doh::new_doh_name_server(&ns, server_name, utls::default_client_config()),
+        "quic" => Err(DnsError::NotImplemented("DoQ (quic://) not yet implemented")),
+        _ => unreachable!(),
+    }
+}
+
+/// 解析 DNS URL 的 host:port 部分。仅接受 IP（IPv4/IPv6），拒绝域名。
+fn parse_dns_url_host(input: &str, default_port: u16) -> Result<(Address, u16, String), DnsError> {
+    if let Ok(sa) = input.parse::<std::net::SocketAddr>() {
+        let addr = match sa.ip() {
+            IpAddr::V4(v4) => Address::IPv4(v4),
+            IpAddr::V6(v6) => Address::IPv6(v6),
+        };
+        return Ok((addr, sa.port(), sa.ip().to_string()));
+    }
+    if let Ok(v4) = input.parse::<std::net::Ipv4Addr>() {
+        return Ok((Address::IPv4(v4), default_port, v4.to_string()));
+    }
+    if let Ok(v6) = input.parse::<std::net::Ipv6Addr>() {
+        return Ok((Address::IPv6(v6), default_port, v6.to_string()));
+    }
+    Err(DnsError::WireFormat(format!(
+        "new_server requires IP address, got: {input}"
+    )))
 }
 
 #[cfg(test)]
@@ -293,12 +340,52 @@ mod tests {
     }
 
     #[test]
-    fn new_server_factory_returns_not_implemented() {
-        match new_server(Address::Domain("8.8.8.8".to_string())) {
+    fn new_server_udp_for_plain_ip() {
+        let server = new_server("8.8.8.8").unwrap();
+        assert!(server.name().starts_with("UDP"));
+    }
+
+    #[test]
+    fn new_server_tcp_for_tcp_scheme() {
+        let server = new_server("tcp://8.8.8.8").unwrap();
+        assert!(server.name().starts_with("TCP"));
+    }
+
+    #[test]
+    fn new_server_dot_for_tls_scheme() {
+        let server = new_server("tls://8.8.8.8").unwrap();
+        assert!(server.name().starts_with("DoT"));
+    }
+
+    #[test]
+    fn new_server_doh_for_https_scheme() {
+        let server = new_server("https://8.8.8.8").unwrap();
+        assert!(server.name().starts_with("DoH"));
+    }
+
+    #[test]
+    fn new_server_quic_returns_not_implemented() {
+        match new_server("quic://8.8.8.8") {
             Err(DnsError::NotImplemented(_)) => {}
             Err(e) => panic!("expected NotImplemented, got error: {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
+    }
+
+    #[test]
+    fn new_server_rejects_unknown_scheme() {
+        assert!(new_server("foo://8.8.8.8").is_err());
+    }
+
+    #[test]
+    fn new_server_rejects_domain_name() {
+        assert!(new_server("dns.google").is_err());
+    }
+
+    #[test]
+    fn new_server_parses_custom_port() {
+        let server = new_server("tcp://8.8.8.8:5353").unwrap();
+        assert!(server.name().contains("5353"));
     }
 
     #[test]
