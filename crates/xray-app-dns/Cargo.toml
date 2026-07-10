@@ -20,6 +20,9 @@ ipnet = "2"
 xray-tls = { path = "../xray-tls" }
 xray-transport = { path = "../xray-transport" }
 tokio-rustls.workspace = true
+h2.workspace = true
+http.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 rcgen = "0.13"
