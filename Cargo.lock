@@ -3292,6 +3292,7 @@ dependencies = [
  "bytes",
  "crc32fast",
  "fnv",
+ "futures-util",
  "hmac",
  "md-5",
  "parking_lot",
@@ -3301,12 +3302,15 @@ dependencies = [
  "sha3 0.10.9",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "xray-buf",
  "xray-common",
  "xray-crypto",
  "xray-features",
  "xray-proto",
+ "xray-tls",
+ "xray-transport",
 ]
 
 [[package]]

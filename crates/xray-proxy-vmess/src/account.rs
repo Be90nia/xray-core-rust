@@ -144,22 +144,22 @@ impl MemoryAccount {
 
     /// 命令密钥（对应 Go `account.ID.CmdKey()`）。
     ///
-    /// 本 crate 内部使用 MD5(UUID.String()) 计算（不依赖 `protocol::ID::cmd_key()`，
-    /// 后者是 XOR 折叠占位实现）。
+    /// 使用 `cmd_key_of` = MD5(UUID.Bytes() + magic) 与 Go 字节级对齐。
     #[must_use]
     pub fn cmd_key(&self) -> [u8; 16] {
         cmd_key_of(self.id.uuid())
     }
 }
 
-/// 计算 VMess cmd_key = MD5(UUID.String())。
+/// 计算 VMess cmd_key = MD5(UUID.Bytes() || magic_uuid)。
 ///
-/// 与 Go 端字节级对齐，不能与 `xray_common::uuid::UUID::cmd_key`（XOR 占位）混用。
+/// 与 Go 端 `NewID` 字节级对齐：Go 用 `md5(uuid.Bytes() + "c48619fe-8f02-49e0-b9e9-edf763e17e21")`。
 #[must_use]
 pub fn cmd_key_of(uuid: &UUID) -> [u8; 16] {
     use md5::{Digest, Md5};
     let mut hasher = Md5::new();
-    hasher.update(uuid.to_string().as_bytes());
+    hasher.update(uuid.as_bytes());
+    hasher.update(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
     let result = hasher.finalize();
     let mut out = [0u8; 16];
     out.copy_from_slice(&result);
