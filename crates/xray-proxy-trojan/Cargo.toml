@@ -36,3 +36,5 @@ rand = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 xray-tls = { path = "../xray-tls" }
+tokio-tungstenite = { workspace = true }
+futures-util = "0.3"

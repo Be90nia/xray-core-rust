@@ -148,3 +148,89 @@ async fn trojan_vps_dns_through_tunnel() {
     assert!(answer_count > 0, "expected at least 1 DNS answer, got {answer_count}");
     eprintln!("✅ DNS through Trojan tunnel: {answer_count} answers received");
 }
+
+
+// ============================================================================
+// Trojan + WS + TLS — CDN 配置
+// ============================================================================
+
+/// Trojan client over WebSocket → VPS Go 服务端 → HTTP GET 1.1.1.1
+///
+/// 配置: home.begonia92.top:2096 / WS path=/3dba3e56aa3a6ca5-tw / SNI=cdn_sg.yzswgroup.top
+#[tokio::test]
+#[ignore]
+async fn trojan_ws_tls_vps_interop() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let tcp_addr = "home.begonia92.top:2096";
+    let ws_host = "cdn_sg.yzswgroup.top";
+    let ws_path = "/3dba3e56aa3a6ca5-tw";
+    let password = "a0832f31-62c1-4197-ac85-2634e38ab700";
+
+    // 1. TCP connect
+    eprintln!("[1/5] TCP connect → {tcp_addr}");
+    let tcp = TcpStream::connect(tcp_addr).await.expect("TCP connect");
+    tcp.set_nodelay(true).ok();
+    let conn = TcpConnection::new(tcp);
+
+    // 2. TLS handshake
+    eprintln!("[2/5] TLS handshake (SNI={ws_host})");
+    let tls_config = utls::default_client_config();
+    let tls = utls::client(conn, ws_host, tls_config).await.expect("TLS handshake");
+
+    // 3. WebSocket upgrade
+    eprintln!("[3/5] WebSocket upgrade (path={ws_path})");
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let ws_url = format!("wss://{ws_host}{ws_path}");
+    let ws_request = ws_url.into_client_request().expect("build WS request");
+    let (mut ws, response) = tokio_tungstenite::client_async(ws_request, tls).await.expect("WS upgrade");
+    eprintln!("  WS upgrade: {}", response.status());
+
+    // 4. Trojan header + HTTP request
+    eprintln!("[4/5] Trojan header + HTTP GET (target=1.1.1.1:80)");
+    let key_hex = hex_sha224(password);
+    let mut payload = Vec::with_capacity(80);
+    payload.extend_from_slice(&key_hex); // 56 bytes hex
+    payload.extend_from_slice(b"\r\n");
+    payload.push(0x01); // CMD = TCP
+    payload.push(0x01); // ATYP = IPv4
+    payload.extend_from_slice(&[1, 1, 1, 1]); // 1.1.1.1
+    payload.extend_from_slice(&80u16.to_be_bytes()); // port 80
+    payload.extend_from_slice(b"\r\n");
+    // Append HTTP GET
+    payload.extend_from_slice(b"GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
+
+    let plen = payload.len();
+    ws.send(Message::Binary(payload.into())).await.expect("send Trojan+HTTP");
+    eprintln!("  Sent Trojan header + HTTP {} bytes", plen);
+
+    // 5. Read response
+    eprintln!("[5/5] Read response...");
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), ws.next()).await {
+            Ok(Some(Ok(msg))) => {
+                eprintln!("  WS msg: {:?}", msg);
+                match msg {
+                    Message::Binary(data) => {
+                        let resp = String::from_utf8_lossy(&data);
+                        eprintln!("  Binary: {} bytes", data.len());
+                        if resp.starts_with("HTTP/") {
+                            eprintln!("✅ Trojan+WS+TLS VPS interop PASS!");
+                            eprintln!("  Response: {}", &resp[..resp.len().min(200)]);
+                            break;
+                        }
+                        eprintln!("  First bytes: {:02x?}", &data[..data.len().min(32)]);
+                        // 继续读直到 HTTP response
+                    }
+                    Message::Ping(_) | Message::Pong(_) => continue,
+                    Message::Close(r) => { eprintln!("⚠️ Server closed: {:?}", r); break; }
+                    _ => continue,
+                }
+            }
+            Ok(Some(Err(e))) => { eprintln!("⚠️ WS error: {e}"); break; }
+            Ok(None) => { eprintln!("⚠️ Stream closed"); break; }
+            Err(_) => { eprintln!("⚠️ Timeout 10s"); break; }
+        }
+    }
+}
