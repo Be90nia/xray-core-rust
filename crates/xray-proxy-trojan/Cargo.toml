@@ -35,3 +35,4 @@ rand = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+xray-tls = { path = "../xray-tls" }

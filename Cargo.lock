@@ -3241,6 +3241,7 @@ dependencies = [
  "xray-crypto",
  "xray-features",
  "xray-proto",
+ "xray-tls",
  "xray-transport",
 ]
 
