@@ -23,6 +23,16 @@ use tokio::net::TcpListener as TokioTcpListener;
 use crate::connection::{Connection, TcpConnection};
 use crate::sockopt::{SocketOptions, apply_inbound_socket_options};
 use crate::listener::Listener;
+#[cfg(unix)]
+use std::path::PathBuf;
+#[cfg(unix)]
+use std::task::{Context, Poll};
+#[cfg(unix)]
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+#[cfg(unix)]
+use tokio::net::{UnixListener as TokioUnixListener, UnixStream};
+#[cfg(unix)]
+use crate::filelocker::FileLocker;
 
 /// fd 级监听控制器。对应 Go `func(network, address string, c syscall.RawConn) error`。
 ///
@@ -154,6 +164,191 @@ pub fn register_listener_controller(ctl: ListenerController) -> io::Result<()> {
 pub async fn listen_system(addr: SocketAddr, sockopt: SocketOptions) -> io::Result<DefaultListener> {
     let mut listener = DefaultListener::bind(addr, sockopt).await?;
     // 注入全局控制器（克隆 Arc 引用）。
+    for ctl in global_controllers().read().iter() {
+        listener.add_controller(Arc::clone(ctl));
+    }
+    Ok(listener)
+}
+
+// ===== Unix domain socket 监听（#[cfg(unix)]）=====
+
+/// Unix domain socket 连接。对应 Go `UnixConnWrapper`。
+///
+/// `remote_addr` / `local_addr` 返回 `0.0.0.0:0`（模仿 Go UnixConnWrapper.RemoteAddr）——
+/// Unix socket 没有真正的 SocketAddr，但上层假设连接有 TCPAddr。
+#[cfg(unix)]
+pub struct UnixConnection {
+    inner: UnixStream,
+}
+
+#[cfg(unix)]
+impl UnixConnection {
+    /// 用已建立的 `UnixStream` 构造。
+    #[must_use]
+    pub fn new(stream: UnixStream) -> Self {
+        Self { inner: stream }
+    }
+
+    /// 拆出底层 `UnixStream`。
+    #[must_use]
+    pub fn into_inner(self) -> UnixStream {
+        self.inner
+    }
+}
+
+#[cfg(unix)]
+impl AsyncRead for UnixConnection {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+#[cfg(unix)]
+impl AsyncWrite for UnixConnection {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(unix)]
+impl Connection for UnixConnection {
+    fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+        Ok(Some(SocketAddr::from(([0, 0, 0, 0], 0))))
+    }
+    fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+        Ok(Some(SocketAddr::from(([0, 0, 0, 0], 0))))
+    }
+}
+
+/// Unix domain socket 监听器。对应 Go `UnixListenerWrapper`。
+///
+/// 持有 tokio `UnixListener` + FileLocker（绑定期间防多实例）+ sockopt + controllers。
+#[cfg(unix)]
+pub struct UnixListener {
+    inner: TokioUnixListener,
+    sockopt: SocketOptions,
+    controllers: Vec<ListenerController>,
+    _locker: Option<FileLocker>,
+}
+
+#[cfg(unix)]
+impl UnixListener {
+    /// 绑定 Unix domain socket。对应 Go `DefaultListener.Listen` 的 Unix 分支。
+    ///
+    /// 地址格式：
+    /// - `/path/to/socket` — 普通路径
+    /// - `/path/to/socket,0755` — 路径 + 八进制权限（bind 后 chmod）
+    /// - `@name` — Linux abstract socket（尚不支持，返回 `InvalidInput`）
+    ///
+    /// # Errors
+    /// FileLocker 获取失败 / bind 失败 / 权限设置失败时返回 `io::Error`。
+    pub async fn bind(addr: &str, sockopt: SocketOptions) -> io::Result<Self> {
+        let (socket_path, perm) = parse_unix_addr(addr)?;
+
+        // FileLocker（abstract socket 不需要）
+        let locker = if socket_path.starts_with('\u{0}') {
+            None
+        } else {
+            let mut lk = FileLocker::new(format!("{}.lock", socket_path.display()));
+            lk.acquire()?;
+            Some(lk)
+        };
+
+        // 删除可能残留的旧 socket 文件（Go 标准库 net.ListenUnix 也这样做）
+        let _ = std::fs::remove_file(&socket_path);
+        let inner = TokioUnixListener::bind(&socket_path)?;
+
+        // bind 后设置权限
+        if let Some(mode) = perm {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(mode))
+                .map_err(|e| io::Error::other(format!("failed to set permission: {e}")))?;
+        }
+
+        Ok(Self {
+            inner,
+            sockopt,
+            controllers: Vec::new(),
+            _locker: locker,
+        })
+    }
+
+    /// 添加 fd 控制器。
+    pub fn add_controller(&mut self, ctl: ListenerController) {
+        self.controllers.push(ctl);
+    }
+}
+
+#[cfg(unix)]
+impl SystemListener for UnixListener {
+    fn accept<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Connection>>> + Send + 'a>> {
+        Box::pin(async move {
+            let (stream, _) = self.inner.accept().await?;
+            Ok(Box::new(UnixConnection::new(stream)) as Box<dyn Connection>)
+        })
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        // Unix socket 没有 SocketAddr，返回 unspecified（模仿 Go）
+        Ok(SocketAddr::from(([0, 0, 0, 0], 0)))
+    }
+}
+
+/// 解析 Unix 地址（path 或 path,perm）。
+///
+/// 返回 (socket_path, optional_permission)。
+/// `@` 前缀（abstract socket）暂不支持。
+#[cfg(unix)]
+fn parse_unix_addr(addr: &str) -> io::Result<(PathBuf, Option<u32>)> {
+    // ponytail: abstract socket (@) 延后实现，需要 socket2 手动创建。
+    if addr.starts_with('@') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "abstract socket (@) not yet supported, use normal path",
+        ));
+    }
+    if let Some(comma) = addr.rfind(',') {
+        let (path, perm_str) = addr.split_at(comma);
+        let perm_str = &perm_str[1..]; // skip comma
+        let perm = u32::from_str_radix(perm_str, 8).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid permission '{perm_str}': {e}"),
+            )
+        })?;
+        Ok((PathBuf::from(path), Some(perm)))
+    } else {
+        Ok((PathBuf::from(addr), None))
+    }
+}
+
+/// 系统级 Unix domain socket 监听。对应 Go `DefaultListener.Listen` 的 Unix 分支。
+///
+/// 绑定 `addr`（格式见 [`UnixListener::bind`]），注入全局 fd 控制器。
+///
+/// # Errors
+/// 绑定或 FileLocker 失败时返回 `io::Error`。
+#[cfg(unix)]
+pub async fn listen_unix_system(addr: &str, sockopt: SocketOptions) -> io::Result<UnixListener> {
+    let mut listener = UnixListener::bind(addr, sockopt).await?;
     for ctl in global_controllers().read().iter() {
         listener.add_controller(Arc::clone(ctl));
     }
@@ -331,5 +526,77 @@ mod tests {
         }
 
         server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_listener_bind_and_accept_roundtrip() {
+        use tokio::net::UnixStream;
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("xray_test_uds_{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let listener = UnixListener::bind(path.to_str().unwrap(), SocketOptions::default())
+            .await
+            .expect("bind 失败");
+
+        let server = tokio::spawn(async move {
+            let mut conn = listener.accept().await.expect("accept 失败");
+            conn.write_all(b"hello").await.expect("write 失败");
+        });
+
+        let mut client = UnixStream::connect(&path).await.expect("connect 失败");
+        let mut buf = [0u8; 5];
+        client.read_exact(&mut buf).await.expect("read 失败");
+        assert_eq!(&buf, b"hello");
+
+        server.await.unwrap();
+        // 清理
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_unix_addr_plain_path() {
+        let (path, perm) = parse_unix_addr("/tmp/test.sock").unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/test.sock"));
+        assert!(perm.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_unix_addr_with_permission() {
+        let (path, perm) = parse_unix_addr("/tmp/test.sock,0755").unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/test.sock"));
+        assert_eq!(perm, Some(0o755));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_unix_addr_abstract_rejected() {
+        let err = parse_unix_addr("@abstract").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_listener_file_locker_creates_lock_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("xray_test_flock_uds_{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let lock_path = format!("{}.lock", path.display());
+        let _ = std::fs::remove_file(&lock_path);
+
+        let listener = UnixListener::bind(path.to_str().unwrap(), SocketOptions::default())
+            .await
+            .expect("bind 失败");
+        // lock 文件应存在
+        assert!(std::path::Path::new(&lock_path).exists(), "lock 文件应存在");
+
+        drop(listener);
+        // drop 后 lock 文件应被删除
+        assert!(!std::path::Path::new(&lock_path).exists(), "lock 文件应被删除");
+        let _ = std::fs::remove_file(&path);
     }
 }

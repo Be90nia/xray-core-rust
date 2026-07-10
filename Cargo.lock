@@ -3272,6 +3272,7 @@ dependencies = [
 name = "xray-transport"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "parking_lot",
  "socket2 0.5.10",
  "thiserror 1.0.69",
