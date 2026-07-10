@@ -17,3 +17,9 @@ uuid.workspace = true
 lru = "0.12"
 hickory-proto.workspace = true
 ipnet = "2"
+xray-tls = { path = "../xray-tls" }
+xray-transport = { path = "../xray-transport" }
+tokio-rustls.workspace = true
+
+[dev-dependencies]
+rcgen = "0.13"

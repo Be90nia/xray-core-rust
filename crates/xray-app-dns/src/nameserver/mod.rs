@@ -20,6 +20,7 @@ use crate::error::DnsError;
 
 pub mod udp;
 pub mod tcp;
+pub mod dot;
 pub mod doh;
 pub mod quic;
 pub mod local;
