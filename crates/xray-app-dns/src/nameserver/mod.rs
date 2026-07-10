@@ -220,7 +220,7 @@ pub fn new_server(url: &str) -> Result<Box<dyn Server>, DnsError> {
         "tcp" => tcp::new_tcp_name_server(&ns),
         "tls" => dot::new_dot_name_server(&ns, server_name, utls::default_client_config()),
         "https" => doh::new_doh_name_server(&ns, server_name, utls::default_client_config()),
-        "quic" => Err(DnsError::NotImplemented("DoQ (quic://) not yet implemented")),
+        "quic" => quic::new_quic_name_server(&ns, server_name, utls::default_client_config()),
         _ => unreachable!(),
     }
 }
@@ -364,12 +364,9 @@ mod tests {
     }
 
     #[test]
-    fn new_server_quic_returns_not_implemented() {
-        match new_server("quic://8.8.8.8") {
-            Err(DnsError::NotImplemented(_)) => {}
-            Err(e) => panic!("expected NotImplemented, got error: {e:?}"),
-            Ok(_) => panic!("expected error, got Ok"),
-        }
+    fn new_server_quic_for_quic_scheme() {
+        let server = new_server("quic://8.8.8.8").unwrap();
+        assert!(server.name().starts_with("DoQ"));
     }
 
     #[test]

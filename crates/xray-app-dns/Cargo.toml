@@ -23,6 +23,7 @@ tokio-rustls.workspace = true
 h2.workspace = true
 http.workspace = true
 bytes.workspace = true
+quinn.workspace = true
 
 [dev-dependencies]
 rcgen = "0.13"

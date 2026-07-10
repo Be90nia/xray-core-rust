@@ -99,6 +99,8 @@ hickory-proto = { version = "0.26", default-features = false }
 # HTTP/2 (DoH)
 h2 = "0.4"
 http = "1"
+# QUIC (DoQ)
+quinn = { version = "0.11", default-features = false, features = ["rustls", "ring", "runtime-tokio"] }
 
 # Protobuf
 prost = "0.14"
