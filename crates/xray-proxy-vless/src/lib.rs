@@ -5,17 +5,15 @@
 //!
 //! # 当前实现范围
 //!
-//! - **完整可测**：
+//! - **完整实现**：
 //!   - `account`：`MemoryAccount` + `Reverse` + proto 转换
 //!   - `validator`：`Validator` trait + `MemoryValidator`（UUID 索引）
 //!   - `encoding`：请求/响应头编解码 + `Addons` + 长度前缀包读写
+//!   - `encryption`：XTLS Vision 加密（ml-kem + x25519-dalek + blake3 AEAD + VisionConn splice）
 //! - **trait + stub**（IO 边界）：
-//!   - `encryption`：XTLS Vision 加密依赖 Rust 生态尚无的 `mlkem`/`utls`，
-//!     以及 `unsafe.Pointer` 提取 TLS conn 内部字段（Rust 无法做到）
-//!   - `inbound`/`outbound`：Handler `Process` 主入口依赖 `transport::Link`
-//!     + `internet::Dialer` + `retry` + `signal` + `xudp` + `reverse` 全链路
+//!   - `inbound`/`outbound`：Handler `Process` 主入口依赖 dispatcher 全链路集成
 //!
-//! 等上层 transport 链路 + 加密 crate 接入后，注入 trait 实现即可激活。
+//! 加密层 + encoding 已完整实现（127 tests），inbound/outbound 集成待 dispatcher 接入。
 
 pub mod account;
 pub mod encoding;
