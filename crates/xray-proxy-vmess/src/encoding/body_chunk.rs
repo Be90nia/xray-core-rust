@@ -18,32 +18,41 @@
 //!
 //! 同步 IO（`std::io::Read/Write`），复用 `xray_crypto::aead::AeadCipher` trait。
 //! 支持 PlainChunkSizeParser + NoPadding（默认）+ ShakeSizeParser + ShakePadding（chunk masking）
-//! 两条路径。AuthenticatedLength 留 follow-up。
+//! 支持 Plain + Shake + AEAD（AuthenticatedLength）三条路径。
 
 use std::io::{Read, Write};
 
 use xray_crypto::aead::AeadCipher;
+use xray_crypto::authenticator::Authenticator;
+use xray_crypto::chunk::{AEADChunkSizeParser, ChunkSizeDecoder, ChunkSizeEncoder};
 
-use crate::encoding::{ChunkNonceGenerator, PlainChunkSizeParser, ShakeSizeParser};
+use crate::encoding::{ChunkNonceGenerator, ShakeSizeParser};
 
 /// 默认 chunk payload 上限（VMess 用 0x3FFF = 16383，对应 2B length 字段最高位 0）。
 const DEFAULT_PAYLOAD_SIZE: usize = 8192;
 
 
-/// size 字段字节数（Plain / Shake 都是 2B）。
-const SIZE_FIELD_BYTES: usize = 2;
 
 // ============================================================================
 // SizeParser trait（同步、可状态化）
 // ============================================================================
 
 /// chunk size 编解码器（同步、可能持状态，如 ShakeSizeParser）。
+///
+/// `size_bytes()` 返回 wire 上 size 字段的长度：
+/// - Plain / Shake = 2
+/// - AEAD（AuthenticatedLength）= 2 + overhead（如 AES-GCM = 18）
 pub trait SizeParser {
-    /// 编码 size 到 2B out。
-    fn encode(&mut self, size: u16, out: &mut [u8; 2]);
+    /// 返回编码后 size 字段的字节数。
+    fn size_bytes(&self) -> usize {
+        2
+    }
 
-    /// 从 2B input 解码 size。
-    fn decode(&mut self, input: &[u8; 2]) -> u16;
+    /// 编码 size 到 out（长度 ≥ `size_bytes()`）。
+    fn encode(&mut self, size: u16, out: &mut [u8]);
+
+    /// 从 input 解码 size（长度 ≥ `size_bytes()`）。
+    fn decode(&mut self, input: &[u8]) -> u16;
 
     /// 下一个 padding 长度（0 表示无 padding）。
     fn next_padding_len(&mut self) -> u16 {
@@ -54,11 +63,17 @@ pub trait SizeParser {
 /// 明文 BE u16 size parser，无 padding。
 pub struct PlainSizeParser;
 impl SizeParser for PlainSizeParser {
-    fn encode(&mut self, size: u16, out: &mut [u8; 2]) {
-        PlainChunkSizeParser::encode(size, out);
+    fn encode(&mut self, size: u16, out: &mut [u8]) {
+        let bytes = size.to_be_bytes();
+        if out.len() >= 2 {
+            out[0] = bytes[0];
+            out[1] = bytes[1];
+        }
     }
-    fn decode(&mut self, input: &[u8; 2]) -> u16 {
-        PlainChunkSizeParser::decode(input)
+    fn decode(&mut self, input: &[u8]) -> u16 {
+        if input.len() >= 2 {
+            u16::from_be_bytes([input[0], input[1]])
+        } else { 0 }
     }
 }
 
@@ -75,14 +90,59 @@ impl ShakeSizeParserAdapter {
     }
 }
 impl SizeParser for ShakeSizeParserAdapter {
-    fn encode(&mut self, size: u16, out: &mut [u8; 2]) {
-        self.inner.encode_mut(size, out);
+    fn encode(&mut self, size: u16, out: &mut [u8]) {
+        let mut buf = [0u8; 2];
+        self.inner.encode_mut(size, &mut buf);
+        if out.len() >= 2 {
+            out[0] = buf[0];
+            out[1] = buf[1];
+        }
     }
-    fn decode(&mut self, input: &[u8; 2]) -> u16 {
-        self.inner.decode_mut(input)
+    fn decode(&mut self, input: &[u8]) -> u16 {
+        if input.len() >= 2 {
+            let buf = [input[0], input[1]];
+            self.inner.decode_mut(&buf)
+        } else { 0 }
     }
     fn next_padding_len(&mut self) -> u16 {
         self.inner.next_padding_len_mut()
+    }
+}
+
+/// AEAD 加密的 size parser（VMess `RequestOptionAuthenticatedLength`）。
+///
+/// 对应 Go `AEADSizeParser` = `crypto.AEADChunkSizeParser` wrapper。
+/// size 字段用 AEAD 加密：wire = seal(2B plaintext) → 2 + tag 字节。
+/// size 值含 overhead（与 xray-crypto `AEADChunkSizeParser` 语义一致）。
+pub struct AEADSizeParserAdapter {
+    inner: AEADChunkSizeParser,
+}
+
+impl AEADSizeParserAdapter {
+    /// 从 `Box<dyn Authenticator>` 创建 AEAD size parser。
+    ///
+    /// 调用方负责构造 Authenticator：
+    /// - key = `KDF16(bodyKey, "auth_len")`
+    /// - nonce = `GenerateChunkNonce(bodyIV, nonceSize)`
+    #[must_use]
+    pub fn new(auth: Box<dyn Authenticator>) -> Self {
+        Self {
+            inner: AEADChunkSizeParser::new(auth),
+        }
+    }
+}
+
+impl SizeParser for AEADSizeParserAdapter {
+    fn size_bytes(&self) -> usize {
+        ChunkSizeEncoder::size_bytes(&self.inner) as usize
+    }
+
+    fn encode(&mut self, size: u16, out: &mut [u8]) {
+        ChunkSizeEncoder::encode(&self.inner, size, out);
+    }
+
+    fn decode(&mut self, input: &[u8]) -> u16 {
+        ChunkSizeDecoder::decode(&self.inner, input).unwrap_or(0)
     }
 }
 
@@ -139,7 +199,7 @@ pub fn encode_chunk_stream<W: Write>(
     let max_padding = usize::from(size_parser_max_padding_hint(size_parser));
     let payload_chunk_size = DEFAULT_PAYLOAD_SIZE
         .saturating_sub(cipher.tag_size())
-        .saturating_sub(SIZE_FIELD_BYTES)
+        .saturating_sub(size_parser.size_bytes())
         .saturating_sub(max_padding);
 
     if payload_chunk_size == 0 {
@@ -164,7 +224,7 @@ pub fn encode_chunk_stream<W: Write>(
     Ok(())
 }
 
-/// 写单个 chunk：[2B size][encrypted][padding]。
+/// 写单个 chunk：[size_field][encrypted][padding]。
 fn write_one_chunk<W: Write>(
     writer: &mut W,
     data: &[u8],
@@ -181,7 +241,8 @@ fn write_one_chunk<W: Write>(
     let encrypted_size = sealed.len(); // = data.len() + TAG_SIZE
     let size_value = u16::try_from(encrypted_size + padding_size).unwrap_or(u16::MAX);
 
-    let mut size_field = [0u8; 2];
+    let sb = size_parser.size_bytes();
+    let mut size_field = vec![0u8; sb];
     size_parser.encode(size_value, &mut size_field);
     writer.write_all(&size_field)?;
     writer.write_all(&sealed)?;
@@ -202,7 +263,7 @@ fn write_one_chunk<W: Write>(
 /// 从 reader 读取 chunk 流并解码，返回拼接后的所有明文。
 ///
 /// 算法（对应 Go `AuthenticationReader.ReadMultiBuffer`）：
-/// 1. 读 2B size_field
+/// 1. 读 size_field（长度 = `size_parser.size_bytes()`）
 /// 2. 解码 size = encrypted_payload_size + padding_size
 /// 3. 读 size 字节
 /// 4. padding_size 由 size_parser.next_padding_len() 给出（与 encoder 同步）
@@ -225,7 +286,8 @@ pub fn decode_chunk_stream<R: Read>(
         // ShakeSizeParser 的 SHAKE128 流必须 encoder/decoder 同序消费，否则流错位。
         let padding_size = usize::from(size_parser.next_padding_len());
 
-        let mut size_field = [0u8; 2];
+        let sb = size_parser.size_bytes();
+        let mut size_field = vec![0u8; sb];
         reader.read_exact(&mut size_field)?;
         let total_size = size_parser.decode(&size_field);
 
@@ -439,5 +501,63 @@ mod tests {
         let decoded2 =
             decode_chunk_stream(&mut &buf2[..], &chacha_r, &mut nr2, &mut sp_r).expect("chacha decode");
         assert_eq!(decoded2, data);
+    }
+
+    #[test]
+    fn aead_size_parser_roundtrip() {
+    // 验证 AEADSizeParserAdapter（AuthenticatedLength）完整 encode→decode round-trip
+    // size 字段从 2B 变为 2+16=18B（AEAD 加密）
+    use xray_crypto::aead::Aes128Gcm as CryptoAes128Gcm;
+    use xray_crypto::authenticator::{generate_static_bytes, AEADAuthenticator};
+
+    fn make_aead_sp() -> AEADSizeParserAdapter {
+        let cipher = CryptoAes128Gcm::new(&[0u8; 16]).expect("aes");
+        let auth: Box<dyn Authenticator> = Box::new(AEADAuthenticator::new(
+            cipher,
+            generate_static_bytes(vec![0u8; 12]),
+            None,
+        ));
+        AEADSizeParserAdapter::new(auth)
+    }
+
+    let cipher_w = make_cipher();
+    let cipher_r = Aes128Gcm::new(&[0x42u8; 16]).expect("aes");
+    let mut nw = make_nonce_gen();
+    let mut nr = make_nonce_gen();
+    let mut sp_w = make_aead_sp();
+    let mut sp_r = make_aead_sp();
+
+    // 验证 size_bytes = 2 + 16 = 18
+    assert_eq!(sp_w.size_bytes(), 18);
+
+    let data = b"aead authenticated length payload for vmess";
+    let mut buf: Vec<u8> = Vec::new();
+    encode_chunk_stream(&mut buf, data, &cipher_w, &mut nw, &mut sp_w).expect("encode");
+
+    let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r).expect("decode");
+    assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn aead_size_parser_size_field_is_18_bytes() {
+    // 验证 AEAD size 字段编码后是 18 字节（2 plaintext + 16 tag）
+    use xray_crypto::aead::Aes128Gcm as CryptoAes128Gcm;
+    use xray_crypto::authenticator::{generate_static_bytes, AEADAuthenticator};
+
+    let cipher = CryptoAes128Gcm::new(&[0u8; 16]).expect("aes");
+    let auth: Box<dyn Authenticator> = Box::new(AEADAuthenticator::new(
+        cipher,
+        generate_static_bytes(vec![0u8; 12]),
+        None,
+    ));
+    let mut sp = AEADSizeParserAdapter::new(auth);
+
+    let mut out = vec![0u8; 18];
+    sp.encode(100 + 16, &mut out); // size 含 overhead（100 payload + 16 tag）
+
+    // 解码验证 round-trip
+    let decoded = sp.decode(&out);
+    assert_eq!(decoded, 100 + 16);
+    assert_eq!(sp.size_bytes(), 18);
     }
 }
