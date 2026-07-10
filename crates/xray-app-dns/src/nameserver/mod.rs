@@ -194,7 +194,7 @@ impl Client {
 /// - `tcp://IP[:port]` → TCP (默认 53)
 /// - `tls://IP[:port]` → DoT (默认 853)
 /// - `https://IP[:port][/path]` → DoH (默认 443, path 默认 /dns-query)
-/// - `quic://IP[:port]` → DoQ (默认 854，未实现)
+/// - `quic://IP[:port]` → DoQ (默认 854)
 ///
 /// 仅接受 IP 地址（不含域名解析，避免 DNS 循环依赖）。
 /// server_name (TLS SNI) 取自 IP 字符串。

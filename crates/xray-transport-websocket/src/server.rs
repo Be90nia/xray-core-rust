@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use base64::Engine;
 use tokio::net::TcpListener as TokioTcpListener;
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::http::{HeaderMap, StatusCode};
@@ -70,33 +70,58 @@ impl WsListener {
             .map_err(WsError::Io)
     }
 
-    /// 接受一条新连接，完成 WS 握手 + 校验 host/path + 提取 early data。
+/// 接受一条新连接，完成 WS 握手 + 校验 host/path + 提取 early data。
     ///
-    /// **不支持 TLS**：明文 ws:// only。TLS 包装应由调用方在传入 `TcpStream`
-    /// 之前先 accept TLS（典型场景：外层 nginx/Caddy 终止 TLS，内部明文 WS）。
-    /// 切片2 follow-up 可加 `accept_tls(Arc<ServerConfig>)` 变体。
+    /// **不支持 TLS**：明文 ws:// only。TLS 场景请用 [`accept_tls`](Self::accept_tls)。
     pub async fn accept(&self) -> Result<AcceptedConn> {
         let (mut tcp, remote) = self.listener.accept().await.map_err(WsError::Io)?;
-        let local = tcp
-            .local_addr()
-            .ok();
+        let local = tcp.local_addr().ok();
+        let remote = self.parse_proxy_protocol(&mut tcp, remote).await?;
+        Self::ws_handshake(tcp, remote, local, &self.config).await
+    }
 
-        // PROXY protocol 解析（如果启用）：在 WS 握手前读 PROXY header，
-        // 拿真实客户端地址覆盖 TCP remote（对齐 Go acceptProxyProtocol）。
-        let remote = if self.config.accept_proxy_protocol {
-            read_proxy_protocol(&mut tcp)
-                .await
-                .map_err(WsError::Io)?
-                .unwrap_or(remote)
+    /// 接受一条新连接，先做 TLS 握手再 WS 握手。
+    ///
+    /// 流程：TCP accept → PROXY protocol（可选）→ TLS accept → WS handshake。
+    /// 对应 Go `tls.NewListener(l, tlsConfig)` 包装 TCP listener。
+    pub async fn accept_tls(
+        &self,
+        tls_config: Arc<tokio_rustls::rustls::ServerConfig>,
+    ) -> Result<AcceptedConn> {
+        let (mut tcp, remote) = self.listener.accept().await.map_err(WsError::Io)?;
+        let local = tcp.local_addr().ok();
+        let remote = self.parse_proxy_protocol(&mut tcp, remote).await?;
+        // TLS 握手。
+        let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+        let tls_stream = acceptor
+            .accept(tcp)
+            .await
+            .map_err(|e| WsError::HandshakeFailed(format!("tls accept: {e}")))?;
+        Self::ws_handshake(tls_stream, remote, local, &self.config).await
+    }
+
+    /// 解析 PROXY protocol（如果启用），返回真实客户端地址。
+    async fn parse_proxy_protocol(
+        &self,
+        tcp: &mut tokio::net::TcpStream,
+        original: SocketAddr,
+    ) -> Result<SocketAddr> {
+        if self.config.accept_proxy_protocol {
+            Ok(read_proxy_protocol(tcp).await?.unwrap_or(original))
         } else {
-            remote
-        };
+            Ok(original)
+        }
+    }
 
-        // 用 callback 在握手过程中拿 Request 头，做 host/path 校验 + early data 提取。
-        // ponytail: callback 通过 Mutex<Vec<u8>> 收集 early data（多线程 callback 不会并发，
-        // 但 Mutex 满足 callback FnMut 的 Send + Sync 要求）。
-        let expected_host = self.config.host.clone();
-        let expected_path = self.config.normalized_path();
+    /// 在已建立的流上做 WS 握手 + host/path 校验 + early data 提取。
+    async fn ws_handshake<S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static>(
+        stream: S,
+        remote: SocketAddr,
+        local: Option<SocketAddr>,
+        config: &Config,
+) -> Result<AcceptedConn> {
+        let expected_host = config.host.clone();
+        let expected_path = config.normalized_path();
         let early_data_slot: Arc<std::sync::Mutex<Vec<u8>>> = Arc::default();
         let slot_clone = Arc::clone(&early_data_slot);
 
@@ -128,13 +153,11 @@ impl WsListener {
             // 3. Early data 提取：Sec-WebSocket-Protocol (base64 RawURL no pad)。
             let mut response = resp;
             if let Some(ed_header) = extract_early_data(headers) {
-                // 必须把原 header 回写响应（对齐 Go responseHeader.Set）。
                 if let Ok(val) = tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&ed_header.raw) {
                     response
                         .headers_mut()
                         .insert("Sec-WebSocket-Protocol", val);
                 }
-                // 把解码后的字节塞进 slot，握手后由调用方消费。
                 if let Ok(mut guard) = slot_clone.lock() {
                     *guard = ed_header.bytes;
                 }
@@ -142,7 +165,7 @@ impl WsListener {
             Ok(response)
         };
 
-        let ws_stream = accept_hdr_async(tcp, callback)
+        let ws_stream = accept_hdr_async(stream, callback)
             .await
             .map_err(|e| WsError::HandshakeFailed(format!("accept_hdr_async: {e}")))?;
 
@@ -152,8 +175,6 @@ impl WsListener {
             .unwrap_or_default();
 
         let mut conn = WsConnection::from_stream(ws_stream, Some(remote), local);
-        // 若有 early data：让 conn 的 read_buf 先吐这些字节，调用方先读到。
-        // ponytail: 直接塞 read_buf，poll_read 优先消费。
         if !early_data.is_empty() {
             conn.read_buf.extend(&early_data);
         }
@@ -164,7 +185,6 @@ impl WsListener {
         })
     }
 }
-
 /// 解析出的 early data（原始 header 字符串 + 解码后字节）。
 struct EarlyDataHeader {
     raw: String,
@@ -423,5 +443,77 @@ mod tests {
         let mut reader = &header[..];
         let result = read_proxy_protocol(&mut reader).await;
         assert!(result.is_err());
+    }
+    #[tokio::test]
+    async fn accept_tls_completes_ws_handshake() {
+        // 1. 自签证书
+        let cert_params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = cert_params.self_signed(&key_pair).unwrap();
+        let cert_der = cert.der().to_vec();
+        let key_der = key_pair.serialize_der();
+
+        // 2. rustls ServerConfig
+        let key = rustls::pki_types::PrivateKeyDer::try_from(key_der).unwrap();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls::pki_types::CertificateDer::from(cert_der.clone())],
+                key,
+            )
+            .unwrap();
+        let tls_config = std::sync::Arc::new(server_config);
+
+        // 3. 启动 WsListener + accept_tls
+        let ws_config = std::sync::Arc::new(crate::config::Config::default());
+        let listener = WsListener::bind("127.0.0.1:0".parse().unwrap(), ws_config)
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            // accept_tls 应成功完成 TLS + WS 握手
+            listener.accept_tls(tls_config).await
+        });
+
+        // 4. 客户端：TCP + TLS + WS connect
+        // 构造信任自签证书的 client config
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store
+            .add(rustls::pki_types::CertificateDer::from(cert_der))
+            .unwrap();
+        let client_config = std::sync::Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        );
+
+        // tokio-tungstenite connect_async wss:// 需要原生 TLS connector
+        // ponytail: 直接用 tokio-rustls 手动 TLS 后 tungstenite client_handshake
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let connector = tokio_rustls::TlsConnector::from(client_config);
+        let tls_stream = connector
+            .connect("localhost".try_into().unwrap(), tcp)
+            .await
+            .unwrap();
+
+        // WS 客户端握手
+        use tokio_tungstenite::client_async;
+        let ws_request = http::Request::builder()
+            .method("GET")
+            .uri(format!("ws://localhost:{}/", addr.port()))
+            .header("Host", format!("localhost:{}", addr.port()))
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .body(())
+            .unwrap();
+        let (_ws_client, _resp) = client_async(ws_request, tls_stream).await.unwrap();
+
+        // 5. 服务端 accept_tls 完成
+        let accepted = server_handle.await.unwrap().unwrap();
+        assert_eq!(accepted.remote.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
     }
 }

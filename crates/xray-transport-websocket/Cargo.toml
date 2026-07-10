@@ -16,7 +16,11 @@ tracing = { workspace = true }
 sha1 = "0.10"
 base64 = "0.22"
 tokio-tungstenite.workspace = true
+tokio-rustls = { workspace = true }
 rustls-pki-types.workspace = true
 rustls.workspace = true
 futures-util = "0.3"
 http = "1"
+
+[dev-dependencies]
+rcgen = "0.13"
