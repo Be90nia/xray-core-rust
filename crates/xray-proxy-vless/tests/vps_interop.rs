@@ -24,37 +24,40 @@ const VLESS_VERSION: u8 = 0;
 
 /// VLESS client (encryption=none) → VPS Go 服务端 (flow=xtls-rprx-vision)
 ///
-/// 测试发现：VLESS 请求头编码正确（服务端接受），
-/// 但 flow=xtls-rprx-vision 要求客户端在请求头之后立即发送 Vision padding，
-/// 否则服务端关闭连接。需要 VisionConn 集成才能完整互通。
+/// 集成 VisionConn padding exchange：encode VLESS header 后用 VisionConn
+/// 包装 TLS conn，发 HTTP GET（自动 Vision padding，首块带 uuid）。
 #[tokio::test]
 #[ignore]
 async fn vless_tcp_tls_vps_interop() {
+    use xray_proxy_vless::encryption::vision_conn::VisionConn;
+
     let host = "sg.yzswgroup.top";
     let port: u16 = 39627;
     let uuid_str = "a0832f31-62c1-4197-ac85-2634e38ab700";
     let sni = "sg.yzswgroup.top";
-
     let uuid = UUID::parse(uuid_str).expect("parse UUID");
 
     // 1. TCP connect
     let addr = format!("{host}:{port}");
-    eprintln!("[1/4] TCP connect → {addr}");
+    eprintln!("[1/5] TCP connect → {addr}");
     let tcp = TcpStream::connect(&addr).await.expect("TCP connect");
     tcp.set_nodelay(true).ok();
     let conn = TcpConnection::new(tcp);
 
     // 2. TLS handshake
-    eprintln!("[2/4] TLS handshake (SNI={sni})");
+    eprintln!("[2/5] TLS handshake (SNI={sni})");
     let tls_config = utls::default_client_config();
     let mut tls = utls::client(conn, sni, tls_config)
         .await
         .expect("TLS handshake");
 
-    // 3. VLESS request header (encryption=none, TCP, target=1.1.1.1:80)
-    eprintln!("[3/4] VLESS header (target=1.1.1.1:80)");
+    // 3. VLESS request header (encryption=none, flow=xtls-rprx-vision, target=1.1.1.1:80)
+    eprintln!("[3/5] VLESS header (flow=xtls-rprx-vision, target=1.1.1.1:80)");
     let target_addr = Address::IPv4(std::net::Ipv4Addr::new(1, 1, 1, 1));
-    let addons = Addons::default();
+    let addons = Addons {
+        flow: "xtls-rprx-vision".to_string(),
+        ..Default::default()
+    };
     encode_request_header(
         &mut tls,
         VLESS_VERSION,
@@ -66,27 +69,42 @@ async fn vless_tcp_tls_vps_interop() {
     )
     .await
     .expect("encode VLESS header");
+    tls.flush().await.expect("flush VLESS header");
 
-    // 4. 尝试读响应（带超时）
-    eprintln!("[4/4] Attempting to read response...");
-    let mut buf = vec![0u8; 256];
-    let result = timeout(Duration::from_secs(5), tls.read(&mut buf)).await;
+    // 4. VisionConn 包装 tls，发 HTTP GET（自动 Vision padding，首块带 uuid）
+    eprintln!("[4/5] Vision padding + HTTP GET");
+    let uuid_bytes = uuid.as_bytes().to_vec();
+    let mut vision = VisionConn::new(tls, uuid_bytes);
+    let http_req = b"GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n";
+    vision
+        .write_all(http_req)
+        .await
+        .expect("write HTTP via Vision");
+    vision.flush().await.expect("flush Vision");
+
+    // 5. 读 response（VisionConn 自动 unpadding；若服务端 raw 则 passthrough）
+    eprintln!("[5/5] Read response (10s timeout)...");
+    let mut buf = vec![0u8; 4096];
+    let result = timeout(Duration::from_secs(10), vision.read(&mut buf)).await;
 
     match result {
-        Ok(Ok(n)) if n > 0 => {
-            eprintln!("Received {n} bytes: {:02x?}", &buf[..n]);
-            eprintln!("✅ VLESS response received");
+        Ok(Ok(n)) => {
+            if n == 0 {
+                eprintln!("⚠️ EOF (server closed after padding — padding may be rejected)");
+            } else {
+                let preview = String::from_utf8_lossy(&buf[..n]);
+                eprintln!("Received {n} bytes");
+                eprintln!("First bytes: {:02x?}", &buf[..n.min(32)]);
+                eprintln!("Preview: {}", &preview[..preview.len().min(500)]);
+                if preview.contains("HTTP/") {
+                    eprintln!("✅ VLESS+Vision+TLS VPS interop PASS!");
+                } else {
+                    eprintln!("⚠️ Non-HTTP response (Vision unpadding may need adjustment)");
+                }
+            }
         }
-        _ => {
-            eprintln!("⚠️ Server closed connection (early EOF)");
-            eprintln!("   VLESS header encoding: CORRECT (server accepted bytes)");
-            eprintln!("   flow=xtls-rprx-vision requires VisionConn padding exchange");
-            eprintln!("   → Need VisionConn integration for full Vision interop");
-            // 这不是编码错误 — 服务端期望 Vision padding 而我们没发
-        }
-        Err(_) => {
-            eprintln!("⚠️ Read timed out (5s)");
-        }
+        Ok(Err(e)) => eprintln!("⚠️ Read error: {e}"),
+        Err(_) => eprintln!("⚠️ Timeout 10s (server may be waiting for more data)"),
     }
 }
 

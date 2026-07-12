@@ -1,11 +1,11 @@
 //! XTLS-Vision 连接包装（对应 Go `proxy/proxy.go` 的 VisionReader/VisionWriter）。
 //!
 //! 在 [`CommonConn`]（AEAD 加密层）之上提供 Vision padding：
-//! - [`VisionConn::poll_write`]：明文 padding 包装 → CommonConn AEAD 加密 → 底层
-//! - [`VisionConn::poll_read`]：CommonConn AEAD 解密 → unpadding → 返回明文
+//! - [`VisionConn::poll_write`]: 明文 padding 包装 → 底层 conn（CommonConn AEAD 或 TLS 直传）
+//! - [`VisionConn::poll_read`]: 底层 conn 读取 → unpadding → 返回明文
 //!
 //! 切片 2a：padding 模式完整（Continue/End）。
-//! 切片 2b：splice（command=Direct 触发，绕过 Vision padding，仍走 CommonConn AEAD）。
+//! 切片 2b：splice（command=Direct 触发，绕过 Vision padding，仍走底层 conn）。
 
 use crate::encryption::aead::Aead;
 use crate::encryption::common_conn::CommonConn;
@@ -28,7 +28,7 @@ const MAX_PADDING_CONTENT: usize = 8171;
 /// 对应 Go 的 VisionReader/VisionWriter。padding 模式下每个读写都包装/解包
 /// Vision padding 块，直到 command=End（关闭 padding）或 command=Direct（splice，待办）。
 pub struct VisionConn<C> {
-    inner: CommonConn<C>,
+    inner: C,
     /// user_uuid（始终保留，downlink unpadding 匹配首块用）。
     user_uuid: Vec<u8>,
     /// uplink 首次 padding 附带的 uuid（take 后 None）。
@@ -54,19 +54,16 @@ impl<C> VisionConn<C>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    /// 创建 Vision 连接（handshake 后调用，AEAD 对已协商完成）。
+    /// 创建 Vision 连接，包装一个已建立的底层连接。
+    ///
+    /// `conn` 可以是 `CommonConn`（encryption=mlkem768 场景）或 TLS conn
+    /// （encryption=none + flow=xtls-rprx-vision 场景）。
+    /// `user_uuid` 为首块 padding 附带的 UUID（Vision 协议要求）。
     #[must_use]
-    pub fn new(
-        conn: C,
-        aead: Aead,
-        peer_aead: Aead,
-        use_aes: bool,
-        united_key: Vec<u8>,
-        user_uuid: Vec<u8>,
-    ) -> Self {
+    pub fn new(conn: C, user_uuid: Vec<u8>) -> Self {
         let uplink_uuid_pending = Some(user_uuid.clone());
         Self {
-            inner: CommonConn::new(conn, aead, peer_aead, use_aes, united_key),
+            inner: conn,
             user_uuid: user_uuid.clone(),
             uplink_uuid_pending,
             uplink_state: DirectionState::default(),
@@ -229,30 +226,30 @@ mod tests {
 
     /// 构造一对互连的 VisionConn（共享相同 AEAD key，模拟 handshake 后状态）。
     fn make_pair() -> (
-        VisionConn<tokio::io::DuplexStream>,
-        VisionConn<tokio::io::DuplexStream>,
+        VisionConn<CommonConn<tokio::io::DuplexStream>>,
+        VisionConn<CommonConn<tokio::io::DuplexStream>>,
     ) {
         let (a, b) = tokio::io::duplex(64 * 1024);
         let uuid = vec![0xABu8; 16];
         let key = b"united-key".to_vec();
         let ctx = b"ctx";
+        let common_a = CommonConn::new(
+            a,
+            Aead::new(ctx, &key, true),
+            Aead::new(ctx, &key, true),
+            true,
+            key.clone(),
+        );
+        let common_b = CommonConn::new(
+            b,
+            Aead::new(ctx, &key, true),
+            Aead::new(ctx, &key, true),
+            true,
+            key.clone(),
+        );
         (
-            VisionConn::new(
-                a,
-                Aead::new(ctx, &key, true),
-                Aead::new(ctx, &key, true),
-                true,
-                key.clone(),
-                uuid.clone(),
-            ),
-            VisionConn::new(
-                b,
-                Aead::new(ctx, &key, true),
-                Aead::new(ctx, &key, true),
-                true,
-                key.clone(),
-                uuid.clone(),
-            ),
+            VisionConn::new(common_a, uuid.clone()),
+            VisionConn::new(common_b, uuid.clone()),
         )
     }
 
