@@ -51,9 +51,9 @@ async fn vless_tcp_tls_vps_interop() {
         .await
         .expect("TLS handshake");
 
-    // 3. VLESS request header (encryption=none, flow=xtls-rprx-vision, target=1.1.1.1:80)
-    eprintln!("[3/5] VLESS header (flow=xtls-rprx-vision, target=1.1.1.1:80)");
-    let target_addr = Address::IPv4(std::net::Ipv4Addr::new(1, 1, 1, 1));
+    // 3. VLESS request header (encryption=none, flow=xtls-rprx-vision, target=www.google.com:80)
+    eprintln!("[3/5] VLESS header (flow=xtls-rprx-vision, target=www.google.com:80)");
+    let target_addr = Address::Domain("www.google.com".to_string());
     let addons = Addons {
         flow: "xtls-rprx-vision".to_string(),
         ..Default::default()
@@ -75,7 +75,7 @@ async fn vless_tcp_tls_vps_interop() {
     eprintln!("[4/5] Vision padding + HTTP GET");
     let uuid_bytes = uuid.as_bytes().to_vec();
     let mut vision = VisionConn::new(tls, uuid_bytes);
-    let http_req = b"GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n";
+    let http_req = b"GET / HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\n\r\n";
     vision
         .write_all(http_req)
         .await
