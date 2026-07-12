@@ -26,3 +26,8 @@ rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
 rustls-pki-types = { workspace = true }
+
+[dev-dependencies]
+xray-proxy-vless = { path = "../xray-proxy-vless" }
+base64 = "0.22"
+hex = "0.4"

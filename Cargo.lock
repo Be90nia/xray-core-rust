@@ -3334,6 +3334,8 @@ name = "xray-reality"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "base64",
+ "hex",
  "hkdf",
  "hmac",
  "prost",
@@ -3348,6 +3350,7 @@ dependencies = [
  "x25519-dalek",
  "xray-common",
  "xray-proto",
+ "xray-proxy-vless",
  "xray-tls",
  "xray-transport",
 ]
