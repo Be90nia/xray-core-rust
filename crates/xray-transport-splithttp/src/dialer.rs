@@ -9,10 +9,11 @@ use futures_util::TryStreamExt;
 use tokio::io::{AsyncRead as AsyncReadTrait, AsyncReadExt, DuplexStream};
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::debug;
-
+use uuid::Uuid;
 use crate::client::DefaultDialerClient;
+use crate::config::Config;
 use crate::connection::SplitConn;
-use crate::error::Result;
+use crate::error::{Result, SplitHttpError};
 
 /// 统一上传连接类型（packet-up / stream-up / stream-one mode 共用）。
 ///
@@ -189,6 +190,267 @@ pub async fn dial_stream_one(
 
     Ok(SplitConn::new(download_reader, pipe_client, remote, local))
 }
+// ===== 切片 F: dial() 统一入口 + dispatch 辅助函数 =====
+
+/// HTTP 版本选择（`\"1.1\"` / `\"2\"` / `\"3\"`）。
+///
+/// 对应 Go `transport/internet/splithttp/dialer.go::decideHTTPVersion`：
+/// - REALITY → 强制 `\"2\"`（H2 多路复用对 REALITY 流量伪装最友好）
+/// - 无 TLS → `\"1.1\"`（明文 HTTP/1.1）
+/// - TLS ALPN 单值：`\"http/1.1\"` / `\"h3\"` / 其他 → `\"1.1\"` / `\"3\"` / `\"2\"`
+/// - TLS ALPN 多值或空 → 默认 `\"2\"`
+#[must_use]
+pub fn decide_http_version(
+    has_tls: bool,
+    has_reality: bool,
+    next_protocol: &[String],
+) -> &'static str {
+    if has_reality {
+        return "2";
+    }
+    if !has_tls {
+        return "1.1";
+    }
+    if next_protocol.len() != 1 {
+        return "2";
+    }
+    match next_protocol[0].as_str() {
+        "http/1.1" => "1.1",
+        "h3" => "3",
+        _ => "2",
+    }
+}
+
+/// 模式推断（`packet-up` / `stream-up` / `stream-one`）。
+///
+/// 对应 Go `Dial` 函数中 `mode` 默认值推断逻辑：
+/// - 显式配置 → 直接返回
+/// - `auto` 或空 + REALITY → `stream-one`（有 DownloadSettings 则 `stream-up`）
+/// - `auto` 或空 + 无 REALITY → `packet-up`（默认）
+#[must_use]
+pub fn resolve_mode(
+    configured_mode: &str,
+    has_reality: bool,
+    has_download_settings: bool,
+) -> String {
+    if configured_mode.is_empty() || configured_mode == "auto" {
+        if has_reality {
+            if has_download_settings {
+                "stream-up".to_string()
+            } else {
+                "stream-one".to_string()
+            }
+        } else {
+            "packet-up".to_string()
+        }
+    } else {
+        configured_mode.to_string()
+    }
+}
+
+/// 拼 base URL：`{scheme}://{host}{path}`（query 非空附加 `?{query}`）。
+///
+/// 对应 Go `Dial` 中 `requestURL` 的拼接逻辑（不含 `browser_dialer` 特殊端口逻辑，
+/// 那是 `globalDialerMap` 接入点的事，切片 F 不涉及）。
+#[must_use]
+pub fn build_request_url(scheme: &str, host: &str, path: &str, query: &str) -> String {
+    if query.is_empty() {
+        format!("{scheme}://{host}{path}")
+    } else {
+        format!("{scheme}://{host}{path}?{query}")
+    }
+}
+
+/// 统一拨号入口。
+///
+/// 对应 Go `transport/internet/splithttp/dialer.go::Dial`。根据 `mode` 分发到
+/// [`dial_packet_up`] / [`dial_stream_up`] / [`dial_stream_one`]。
+///
+/// # 简化点（vs Go 原版）
+///
+/// - **REALITY 注入**：通过 `DefaultDialerClient::new(config, tls_config)` 构造时
+///   注入 `tls_config`（REALITY 用 watfaq-rustls `with_reality()` patch 注入）。Go
+///   在 `dialContext` 闭包里 `reality.UClient(conn, ...)` 包装 TCP conn；Rust 因
+///   hyper-rustls 自管 TLS 握手，REALITY 注入点移到 `RustlsClientConfig` 构造阶段。
+///   留 VPS REALITY 切片 F2 实际接入验证。
+/// - **DownloadSettings**：当前 `has_download_settings=false` 固定（stream-up via
+///   DownloadSettings 是 splithttp 高级特性，留切片 F2 接入）。
+/// - **浏览器拨号器**：Go `browser_dialer.HasBrowserDialer()` 分支未实现
+///   （ponytail: YAGNI，浏览器 JS dialer 与 Rust 客户端场景不匹配）。
+/// - **H3**：当前 dispatch 仅支持 H1/H2（`enable_http1` + `enable_http2`）。
+///   HTTP/3 需要 quinn + h3 crate 链（~400 行），YAGNI；留待 VPS H3 用例出现时再做。
+///
+/// # 参数
+///
+/// - `client`: 已配置的 [`DefaultDialerClient`]（含 TLS 配置，REALITY 也通过此处注入）
+/// - `config`: splithttp 主配置（取 `mode` / `host` / `path` 等）
+/// - `scheme`: URL scheme（`\"http\"` / `\"https\"`，由调用方根据 tls/reality 决定）
+/// - `host`: URL host（含端口，由调用方决定）
+/// - `has_reality`: 是否启用 REALITY（影响默认 mode 推断）
+///
+/// # Errors
+///
+/// - [`SplitHttpError::InvalidUrl`]：未知 `mode`
+/// - 子函数错误透传（[`dial_packet_up`] / [`dial_stream_up`] / [`dial_stream_one`]）
+pub async fn dial(
+    client: Arc<DefaultDialerClient>,
+    config: Arc<Config>,
+    scheme: &str,
+    host: &str,
+    has_reality: bool,
+) -> Result<PacketUpConn> {
+    // ponytail: has_download_settings=false 固定，DownloadSettings 接入留切片 F2
+    let mode = resolve_mode(&config.mode, has_reality, false);
+    let session_id = if mode == "stream-one" {
+        String::new()
+    } else {
+        Uuid::new_v4().to_string()
+    };
+    let base_uri = build_request_url(
+        scheme,
+        host,
+        &config.normalized_path(),
+        &config.normalized_query(),
+    );
+
+    debug!(target: "splithttp", %mode, %base_uri, "dial dispatch");
+
+    match mode.as_str() {
+        "packet-up" => {
+            let sc_max = config.normalized_sc_max_each_post_bytes();
+            let sc_min = config.normalized_sc_min_posts_interval_ms();
+            dial_packet_up(
+                client,
+                base_uri,
+                session_id,
+                sc_max.from.max(1) as usize,
+                sc_min.from as u64,
+            )
+            .await
+        }
+        "stream-up" => dial_stream_up(client, base_uri, session_id).await,
+        "stream-one" => dial_stream_one(client, base_uri, session_id).await,
+        other => Err(SplitHttpError::InvalidUrl(format!(
+            "unknown splithttp mode: {other}"
+        ))),
+    }
+}
+
+#[cfg(test)]
 mod tests {
-    // dialer 的端到端测试在 tests/mock_server.rs 集成测试覆盖。
+    use super::*;
+
+    // ===== decide_http_version =====
+
+    #[test]
+    fn decide_http_version_reality_forces_h2() {
+        assert_eq!(decide_http_version(true, true, &[]), "2");
+        // REALITY 优先于一切，即使配置了 h3 ALPN 也强制 h2
+        assert_eq!(
+            decide_http_version(true, true, &["h3".to_string()]),
+            "2"
+        );
+    }
+
+    #[test]
+    fn decide_http_version_no_tls_returns_h1_1() {
+        assert_eq!(decide_http_version(false, false, &[]), "1.1");
+    }
+
+    #[test]
+    fn decide_http_version_alpn_http_1_1() {
+        assert_eq!(
+            decide_http_version(true, false, &["http/1.1".to_string()]),
+            "1.1"
+        );
+    }
+
+    #[test]
+    fn decide_http_version_alpn_h3() {
+        assert_eq!(
+            decide_http_version(true, false, &["h3".to_string()]),
+            "3"
+        );
+    }
+
+    #[test]
+    fn decide_http_version_alpn_unknown_falls_back_to_h2() {
+        assert_eq!(
+            decide_http_version(true, false, &["h2".to_string()]),
+            "2"
+        );
+    }
+
+    #[test]
+    fn decide_http_version_multiple_alpn_falls_back_to_h2() {
+        assert_eq!(
+            decide_http_version(true, false, &["h2".to_string(), "http/1.1".to_string()]),
+            "2"
+        );
+    }
+
+    // ===== resolve_mode =====
+
+    #[test]
+    fn resolve_mode_auto_packet_up_default_no_reality() {
+        assert_eq!(resolve_mode("", false, false), "packet-up");
+        assert_eq!(resolve_mode("auto", false, false), "packet-up");
+    }
+
+    #[test]
+    fn resolve_mode_auto_stream_one_with_reality() {
+        assert_eq!(resolve_mode("", true, false), "stream-one");
+        assert_eq!(resolve_mode("auto", true, false), "stream-one");
+    }
+
+    #[test]
+    fn resolve_mode_auto_stream_up_with_reality_and_download_settings() {
+        assert_eq!(resolve_mode("", true, true), "stream-up");
+        assert_eq!(resolve_mode("auto", true, true), "stream-up");
+    }
+
+    #[test]
+    fn resolve_mode_explicit_passthrough() {
+        assert_eq!(resolve_mode("packet-up", true, true), "packet-up");
+        assert_eq!(resolve_mode("stream-one", false, false), "stream-one");
+        assert_eq!(resolve_mode("stream-up", false, false), "stream-up");
+    }
+
+    // ===== build_request_url =====
+
+    #[test]
+    fn build_request_url_without_query() {
+        assert_eq!(
+            build_request_url("https", "example.com:443", "/", ""),
+            "https://example.com:443/"
+        );
+    }
+
+    #[test]
+    fn build_request_url_with_query() {
+        assert_eq!(
+            build_request_url("http", "h", "/p/", "k=v"),
+            "http://h/p/?k=v"
+        );
+    }
+
+    // ===== dial() 未知 mode 错误路径（不发起网络） =====
+
+    #[tokio::test]
+    async fn dial_unknown_mode_returns_error() {
+        let config = Arc::new(Config {
+            mode: "unknown-mode".into(),
+            ..Default::default()
+        });
+        let tls = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let client = Arc::new(DefaultDialerClient::new(config.clone(), tls.into()));
+        let result = dial(client, config, "http", "h", false).await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("unknown mode should fail, got Ok"),
+        };
+        assert!(matches!(err, SplitHttpError::InvalidUrl(m) if m.contains("unknown splithttp mode")));
+    }
 }
