@@ -77,6 +77,25 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         Self::new(inner, account, iv, initial)
     }
 
+    /// SS-2022 通用构造：传入已派生的 AEAD + nonce_size。
+    ///
+    /// nonce 从 `[0xFF;n]` 开始，第一次 increment → `[0;n]`（与 SS-2022 规范一致）。
+    /// 用于 SS-2022（blake3 subkey）等非 MemoryAccount 构造场景。
+    #[must_use]
+    pub fn new_with_aead(
+        inner: C,
+        aead: Box<dyn xray_crypto::aead::AeadCipher + Send + Sync>,
+        nonce_size: usize,
+    ) -> Self {
+        let tag_size = aead.tag_size();
+        Self {
+            inner,
+            aead,
+            nonce: vec![0xFFu8; nonce_size],
+            tag_size,
+        }
+    }
+
     /// LE increment（byte[0]++，进位），对应 Go `GenerateIncreasingNonce`。
     fn increment_nonce(&mut self) {
         for b in &mut self.nonce {
@@ -99,7 +118,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
     pub async fn write_chunk(&mut self, plaintext: &[u8]) -> Result<()> {
         // seal size chunk
         self.increment_nonce();
-        let plain_size = u16::try_from(plaintext.len() + self.tag_size)
+        let plain_size = u16::try_from(plaintext.len())
             .map_err(|_| SsError::InsufficientData(plaintext.len()))?;
         let sealed_size = self
             .aead
@@ -118,6 +137,22 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         Ok(())
     }
 
+    /// 写一个 raw chunk（直接 seal，无 size prefix）。
+    ///
+    /// 用于 SS-2022 header chunk（fixed-header + variable-header），
+    /// 对应 Go `shadowaead.Writer.WriteChunk`。
+    ///
+    /// 与 `write_chunk` 的区别：只 seal 一次（不分 size/payload），nonce 只 increment 一次。
+    pub async fn write_raw_chunk(&mut self, plaintext: &[u8]) -> Result<()> {
+        self.increment_nonce();
+        let sealed = self
+            .aead
+            .seal(&self.nonce, &[], plaintext)
+            .map_err(|e| SsError::AeadSeal(e.to_string()))?;
+        self.inner.write_all(&sealed).await?;
+        Ok(())
+    }
+
     /// flush 底层连接。
     /// # Errors
     /// - 透传 IO 错误。
@@ -132,6 +167,19 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
     pub async fn shutdown(&mut self) -> Result<()> {
         self.inner.shutdown().await?;
         Ok(())
+    }
+
+    /// SS-2022 通用构造：传入已派生的 AEAD + 初始 nonce。
+    ///
+    /// 用于手动 seal header 后，body 阶段接管 SSStream 的场景。
+    #[must_use]
+    pub fn new_with_aead_and_nonce(
+        inner: C,
+        aead: Box<dyn xray_crypto::aead::AeadCipher + Send + Sync>,
+        initial_nonce: Vec<u8>,
+    ) -> Self {
+        let tag_size = aead.tag_size();
+        Self { inner, aead, nonce: initial_nonce, tag_size }
     }
 
     /// 读一个 SS chunk，返回 plaintext。
@@ -167,8 +215,9 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             return Ok(None);
         }
 
-        // 读 payload chunk
-        let mut payload_buf = vec![0u8; payload_len];
+        // 读 payload chunk：wire = payload_len (ciphertext) + tag_size
+        let wire_len = payload_len + self.tag_size;
+        let mut payload_buf = vec![0u8; wire_len];
         self.inner.read_exact(&mut payload_buf).await?;
 
         // open payload
@@ -179,6 +228,21 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             .map_err(|e| SsError::AeadOpen(e.to_string()))?;
 
         Ok(Some(plaintext))
+    }
+
+    /// 读一个 raw chunk（直接 open，无 size prefix），指定 wire 长度。
+    ///
+    /// 用于 SS-2022 响应的 header chunk（fixed + variable），
+    /// 对应 Go `shadowaead.Reader.ReadWithLength`。
+    pub async fn read_raw_chunk(&mut self, wire_len: usize) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; wire_len];
+        self.inner.read_exact(&mut buf).await?;
+        self.increment_nonce();
+        let plaintext = self
+            .aead
+            .open(&self.nonce, &[], &buf)
+            .map_err(|e| SsError::AeadOpen(e.to_string()))?;
+        Ok(plaintext)
     }
 
     /// 获取底层连接的不可变引用。

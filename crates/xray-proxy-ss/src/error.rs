@@ -14,6 +14,12 @@ pub enum SsError {
     #[error("unsupported cipher type value: {0}")]
     InvalidCipherType(i32),
 
+    #[error("invalid cipher name: {0}")]
+    InvalidCipherName(String),
+
+    #[error("invalid password/PSK: {0}")]
+    InvalidPassword(String),
+
     #[error("failed to read 50 bytes: {0}")]
     ReadInitial(String),
 

@@ -15,6 +15,7 @@ pub mod protocol;
 pub mod server;
 pub mod stream;
 pub mod validator;
+pub mod ss2022;
 
 pub use config::{AeadCipher, Cipher, CipherType, InnerAead, MemoryAccount};
 pub use error::{Result, SsError};

@@ -37,3 +37,9 @@ crc = "2"
 crc32fast = "1"
 rand = { workspace = true }
 generic-array = "1"
+blake3 = "1"
+base64 = "0.22"
+
+[dev-dependencies]
+hex = "0.4"
+
