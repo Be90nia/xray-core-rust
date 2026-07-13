@@ -14,6 +14,7 @@ use crate::client::DefaultDialerClient;
 use crate::config::Config;
 use crate::connection::SplitConn;
 use crate::error::{Result, SplitHttpError};
+use crate::h3_client::H3Conn;
 
 /// 统一上传连接类型（packet-up / stream-up / stream-one mode 共用）。
 ///
@@ -332,6 +333,173 @@ pub async fn dial(
         "stream-one" => dial_stream_one(client, base_uri, session_id).await,
         other => Err(SplitHttpError::InvalidUrl(format!(
             "unknown splithttp mode: {other}"
+        ))),
+    }
+}
+
+// ===== 切片 G: H3 dispatch =====
+
+/// H3 packet-up mode 端到端拨号。
+///
+/// 与 [`dial_packet_up`] 对应，但走 H3 over QUIC。
+///
+/// 1. `H3Conn::open_stream` GET 下载
+/// 2. `tokio::io::duplex` 创建上传 pipe
+/// 3. spawn 后台任务：循环读 pipe → `H3Conn::post_packet`
+/// 4. 返回 [`PacketUpConn`]
+pub async fn dial_h3_packet_up(
+    client: Arc<H3Conn>,
+    base_uri: String,
+    session_id: String,
+    sc_max_each_post_bytes: usize,
+    sc_min_posts_interval_ms: u64,
+) -> Result<PacketUpConn> {
+    // 1. GET 下载流
+    let (download_reader, remote, local) = client.open_stream(&base_uri, &session_id, None).await?;
+
+    // 2. 创建上传 pipe
+    let pipe_buf = sc_max_each_post_bytes.saturating_mul(2).max(8192);
+    let (pipe_client, mut pipe_server) = tokio::io::duplex(pipe_buf);
+
+    // 3. spawn 后台 POST 任务
+    let base_uri_for_task = base_uri.clone();
+    let session_id_for_task = session_id.clone();
+    tokio::spawn(async move {
+        let mut seq: u64 = 0;
+        let mut read_buf = vec![0u8; sc_max_each_post_bytes];
+        loop {
+            let n = match pipe_server.read(&mut read_buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    debug!(target: "splithttp-h3", error = %e, "upload pipe read failed");
+                    break;
+                }
+            };
+            let payload = read_buf[..n].to_vec();
+            let seq_str = seq.to_string();
+            seq += 1;
+
+            if let Err(e) = client
+                .post_packet(&base_uri_for_task, &session_id_for_task, &seq_str, payload)
+                .await
+            {
+                debug!(target: "splithttp-h3", error = %e, seq = seq, "h3 post_packet failed, terminating upload");
+                break;
+            }
+
+            if sc_min_posts_interval_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(sc_min_posts_interval_ms)).await;
+            }
+        }
+    });
+
+    Ok(SplitConn::new(download_reader, pipe_client, remote, local))
+}
+
+/// H3 stream-up mode 拨号：POST streaming body 上传 + 独立 GET 下载。
+///
+/// 与 [`dial_stream_up`] 对应，但走 H3 over QUIC。
+pub async fn dial_h3_stream_up(
+    client: Arc<H3Conn>,
+    base_uri: String,
+    session_id: String,
+) -> Result<PacketUpConn> {
+    // 1. 创建上传 pipe
+    let (pipe_client, pipe_server) = tokio::io::duplex(8192);
+    let upload_stream = ReaderStream::new(pipe_server);
+
+    // 2. POST upload（upload_only=true）
+    let (_, remote, local) = client
+        .open_stream_uploading(&base_uri, &session_id, upload_stream, true)
+        .await?;
+
+    // 3. 独立 GET 下载
+    let (download_reader, _, _) = client.open_stream(&base_uri, &session_id, None).await?;
+
+    Ok(SplitConn::new(download_reader, pipe_client, remote, local))
+}
+
+/// H3 stream-one mode 拨号：POST streaming body + GET 下载（双 stream）。
+///
+/// 与 [`dial_stream_one`] 对应，但走 H3 over QUIC。
+///
+/// # 简化（vs Go stream-one）
+///
+/// Go 版 stream-one 用单 HTTP/2 stream 全双工（REALITY 流量伪装需求）。
+/// H3 无 REALITY 流量伪装需求（REALITY 强制 H2），用双 stream 实现：
+/// POST streaming body 上传 + GET 下载，与 stream-up 等价。
+pub async fn dial_h3_stream_one(
+    client: Arc<H3Conn>,
+    base_uri: String,
+    session_id: String,
+) -> Result<PacketUpConn> {
+    // 1. 创建上传 pipe
+    let (pipe_client, pipe_server) = tokio::io::duplex(8192);
+    let upload_stream = ReaderStream::new(pipe_server);
+
+    // 2. POST upload + GET download（upload_only=false）
+    let (dl_opt, remote, local) = client
+        .open_stream_uploading(&base_uri, &session_id, upload_stream, false)
+        .await?;
+    let download_reader = dl_opt.ok_or_else(|| {
+        SplitHttpError::Hyper("h3 stream-one upload_only=false must return download stream".into())
+    })?;
+
+    Ok(SplitConn::new(download_reader, pipe_client, remote, local))
+}
+
+/// H3 统一拨号入口。
+///
+/// 对应 [`dial`]，但走 H3 over QUIC。根据 `mode` 分发到
+/// [`dial_h3_packet_up`] / [`dial_h3_stream_up`] / [`dial_h3_stream_one`]。
+///
+/// # 参数
+///
+/// - `client`: 已连接的 [`H3Conn`]（`H3Conn::connect` 完成）
+/// - `config`: splithttp 主配置
+/// - `scheme`: URL scheme（H3 通常 `\"https\"`，因 QUIC + TLS）
+/// - `host`: URL host
+/// - `has_reality`: 是否启用 REALITY（影响默认 mode 推断）
+pub async fn dial_h3(
+    client: Arc<H3Conn>,
+    config: Arc<Config>,
+    scheme: &str,
+    host: &str,
+    has_reality: bool,
+) -> Result<PacketUpConn> {
+    let mode = resolve_mode(&config.mode, has_reality, false);
+    let session_id = if mode == "stream-one" {
+        String::new()
+    } else {
+        Uuid::new_v4().to_string()
+    };
+    let base_uri = build_request_url(
+        scheme,
+        host,
+        &config.normalized_path(),
+        &config.normalized_query(),
+    );
+
+    debug!(target: "splithttp-h3", %mode, %base_uri, "dial_h3 dispatch");
+
+    match mode.as_str() {
+        "packet-up" => {
+            let sc_max = config.normalized_sc_max_each_post_bytes();
+            let sc_min = config.normalized_sc_min_posts_interval_ms();
+            dial_h3_packet_up(
+                client,
+                base_uri,
+                session_id,
+                sc_max.from.max(1) as usize,
+                sc_min.from as u64,
+            )
+            .await
+        }
+        "stream-up" => dial_h3_stream_up(client, base_uri, session_id).await,
+        "stream-one" => dial_h3_stream_one(client, base_uri, session_id).await,
+        other => Err(SplitHttpError::InvalidUrl(format!(
+            "unknown splithttp mode (h3): {other}"
         ))),
     }
 }

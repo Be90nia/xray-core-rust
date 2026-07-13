@@ -31,6 +31,7 @@ pub mod client;
 pub mod connection;
 pub mod dialer;
 pub mod h1_conn;
+pub mod h3_client;
 pub mod hub;
 pub mod mux;
 pub mod upload_queue;

@@ -27,5 +27,13 @@ tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
 rustls-pki-types = { workspace = true }
 uuid = { workspace = true }
+# H3 (splithttp packet-up/stream-up/stream-one over HTTP/3)
+h3.workspace = true
+h3-quinn.workspace = true
+quinn.workspace = true
 rand = { workspace = true }
 tokio-util = "0.7"
+tokio-stream = "0.1"
+
+[dev-dependencies]
+rcgen = "0.13"
