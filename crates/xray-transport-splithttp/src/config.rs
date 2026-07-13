@@ -19,6 +19,9 @@ use std::collections::HashMap;
 
 use crate::error::Result;
 
+use rand::Rng;
+use crate::xpadding::{apply_xpadding_to_request_meta, PADDING_METHOD_REPEAT_X, XPaddingConfig, XPaddingPlacement};
+
 // ===== Placement 常量（对应 Go `common.go`）=====
 
 /// Placement 策略：参数放在 query 的特殊 header。
@@ -445,6 +448,241 @@ impl Config {
     }
 }
 
+// ===== Request 元数据（client.rs 用于构造 hyper::Request） =====
+
+/// 构造好的 HTTP 请求元数据：method + uri + headers + cookies + body。
+///
+/// 由 [`Config::build_packet_request_meta`] / [`Config::build_stream_request_meta`] 输出，
+/// `client.rs` 转换为 `hyper::Request<B>` 发送。与 Go 直接操作 `*http.Request` 不同，
+/// Rust 端以值传递 + 值聚合，避免生命周期耦合。
+#[derive(Debug, Clone)]
+pub struct RequestMeta {
+    /// HTTP method（`POST` / `GET` / `PUT` 等）。
+    pub method: String,
+    /// 完整请求 URL（`scheme://host/path[?query]`，已含 session/seq 注入）。
+    pub uri: String,
+    /// 请求 header 列表（name, value）。含默认 User-Agent + 自定义 + session/seq/padding。
+    pub headers: Vec<(String, String)>,
+    /// Cookie 列表（name, value）。调用方需合并为单个 `Cookie:` header。
+    pub cookies: Vec<(String, String)>,
+    /// 请求 body（packet-up / stream-up 有；GET stream-down 为 None）。
+    pub body: Option<Vec<u8>>,
+}
+
+impl Config {
+    /// 默认请求 header 列表：复制 `c.headers` + `User-Agent: fetch`（未配置时）。
+    ///
+    /// 对应 Go `GetRequestHeader`。`utils.TryDefaultHeadersWith(header, "fetch")`
+    /// 简化为仅设 User-Agent（其余默认 header 由浏览器拨号器路径补充，切片 A 不用）。
+    #[must_use]
+    pub fn get_request_header(&self) -> Vec<(String, String)> {
+        let mut headers: Vec<(String, String)> =
+            self.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent")) {
+            headers.push(("User-Agent".to_string(), "fetch".to_string()));
+        }
+        headers
+    }
+
+    /// XPadding 字节范围。None 或 `to=0` 返回默认 `100..=1000`。
+    ///
+    /// 对应 Go `GetNormalizedXPaddingBytes`。
+    #[must_use]
+    pub fn get_normalized_x_padding_bytes(&self) -> RangeConfig {
+        match self.x_padding_bytes {
+            Some(r) if r.to != 0 => r,
+            _ => RangeConfig { from: 100, to: 1000 },
+        }
+    }
+
+    /// 构造 XPaddingConfig。采样 padding 长度 + 根据 `x_padding_obfs_mode` 选择 placement。
+    ///
+    /// `obfs_mode = false`（默认）：placement=queryInHeader, header=Referer, key=x_padding（与切片 A 行为对齐，但 length 由硬编码 0 改为随机）。
+    /// `obfs_mode = true`：placement/key/header 来自 config 字段，空时用默认。
+    #[must_use]
+    pub(crate) fn build_xpadding_config(&self, base_uri: &str) -> XPaddingConfig {
+        let range = self.get_normalized_x_padding_bytes();
+        let length = if range.from >= range.to {
+            range.from
+        } else {
+            rand::rng().random_range(range.from..=range.to)
+        };
+        if self.x_padding_obfs_mode {
+            XPaddingConfig {
+                length,
+                placement: XPaddingPlacement {
+                    placement: if self.x_padding_placement.is_empty() {
+                        PLACEMENT_QUERY_IN_HEADER.to_string()
+                    } else {
+                        self.x_padding_placement.clone()
+                    },
+                    key: if self.x_padding_key.is_empty() {
+                        "x_padding".to_string()
+                    } else {
+                        self.x_padding_key.clone()
+                    },
+                    header: if self.x_padding_header.is_empty() {
+                        "Referer".to_string()
+                    } else {
+                        self.x_padding_header.clone()
+                    },
+                    raw_url: base_uri.to_string(),
+                },
+                method: if self.x_padding_method.is_empty() {
+                    PADDING_METHOD_REPEAT_X.to_string()
+                } else {
+                    self.x_padding_method.clone()
+                },
+            }
+        } else {
+            XPaddingConfig {
+                length,
+                placement: XPaddingPlacement {
+                    placement: PLACEMENT_QUERY_IN_HEADER.into(),
+                    key: "x_padding".into(),
+                    header: "Referer".into(),
+                    raw_url: base_uri.into(),
+                },
+                method: PADDING_METHOD_REPEAT_X.into(),
+            }
+        }
+    }
+
+    /// 根据 placement 策略注入 `session_id` / `seq_str` 到 `uri` / `headers` / `cookies`。
+    ///
+    /// 返回 `(final_uri, extra_headers, extra_cookies)`。
+    /// 对应 Go `ApplyMetaToRequest`（session_id / seq_str 为空表示跳过对应字段）。
+    ///
+    /// 默认 placement：session_id 与 seq_str 都在 URL path（`/ws/{session}/{seq}`）,
+    /// 与 Go `Xray-core` 默认一致。
+    pub fn apply_meta_to_uri(
+        &self,
+        mut uri: String,
+        session_id: &str,
+        seq_str: &str,
+    ) -> (String, Vec<(String, String)>, Vec<(String, String)>) {
+        let session_placement = self.normalized_session_placement();
+        let seq_placement = self.normalized_seq_placement();
+        let session_key = self.normalized_session_key();
+        let seq_key = self.normalized_seq_key();
+        let mut extra_headers: Vec<(String, String)> = Vec::new();
+        let mut extra_cookies: Vec<(String, String)> = Vec::new();
+
+        if !session_id.is_empty() {
+            match session_placement {
+                PLACEMENT_PATH => uri = Self::append_to_path(&uri, session_id),
+                PLACEMENT_QUERY => uri = uri_append_query(&uri, session_key, session_id),
+                PLACEMENT_HEADER => {
+                    extra_headers.push((session_key.to_string(), session_id.to_string()));
+                }
+                PLACEMENT_COOKIE => {
+                    extra_cookies.push((session_key.to_string(), session_id.to_string()));
+                }
+                _ => {}
+            }
+        }
+        if !seq_str.is_empty() {
+            match seq_placement {
+                PLACEMENT_PATH => uri = Self::append_to_path(&uri, seq_str),
+                PLACEMENT_QUERY => uri = uri_append_query(&uri, seq_key, seq_str),
+                PLACEMENT_HEADER => {
+                    extra_headers.push((seq_key.to_string(), seq_str.to_string()));
+                }
+                PLACEMENT_COOKIE => {
+                    extra_cookies.push((seq_key.to_string(), seq_str.to_string()));
+                }
+                _ => {}
+            }
+        }
+        (uri, extra_headers, extra_cookies)
+    }
+
+    /// 构造 packet-up mode 的 POST 请求元数据。
+    ///
+    /// `base_uri` 应为完整 URL（`scheme://host/path`，不含 session/seq）。
+    /// 切片 A padding 简化：硬编码 `x_padding=0` 写入 Referer header
+    /// （对齐 minidialer 默认行为）。切片 B 接入完整 XPadding 后由 padding 模块注入。
+    ///
+    /// # Errors
+    /// - [`SplitHttpError::InvalidPlacement`]: session/seq/uplink_data placement 值非合法常量
+    pub fn build_packet_request_meta(
+        &self,
+        base_uri: &str,
+        session_id: &str,
+        seq_str: &str,
+        payload: Vec<u8>,
+    ) -> Result<RequestMeta> {
+        let mut headers = self.get_request_header();
+
+        let (uri, meta_headers, meta_cookies) =
+            self.apply_meta_to_uri(base_uri.to_string(), session_id, seq_str);
+        headers.extend(meta_headers);
+
+        let mut meta = RequestMeta {
+            method: self.normalized_uplink_http_method().to_string(),
+            uri,
+            headers,
+            cookies: meta_cookies,
+            body: Some(payload),
+        };
+        let xpad = self.build_xpadding_config(base_uri);
+        apply_xpadding_to_request_meta(&mut meta, &xpad);
+        Ok(meta)
+    }
+
+    /// 构造 stream-up / stream-one / stream-down mode 的请求元数据。
+    ///
+    /// - `body = None` → GET（stream-down，下载流）
+    /// - `body = Some` → method = `normalized_uplink_http_method`（stream-up/one，上传流）
+    ///
+    /// stream-up/one 时设 `Content-Type: application/grpc`（除非 `no_grpc_header=true`）。
+    ///
+    /// # Errors
+    /// - [`SplitHttpError::InvalidPlacement`]: session placement 值非合法常量
+    pub fn build_stream_request_meta(
+        &self,
+        base_uri: &str,
+        session_id: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<RequestMeta> {
+        let mut headers = self.get_request_header();
+
+        let (uri, meta_headers, meta_cookies) =
+            self.apply_meta_to_uri(base_uri.to_string(), session_id, "");
+        headers.extend(meta_headers);
+
+        let has_body = body.is_some();
+        if has_body && !self.no_grpc_header {
+            headers.push(("Content-Type".to_string(), "application/grpc".to_string()));
+        }
+
+        let method = if has_body {
+            self.normalized_uplink_http_method().to_string()
+        } else {
+            "GET".to_string()
+        };
+        let mut meta = RequestMeta {
+            method,
+            uri,
+            headers,
+            cookies: meta_cookies,
+            body,
+        };
+        let xpad = self.build_xpadding_config(base_uri);
+        apply_xpadding_to_request_meta(&mut meta, &xpad);
+        Ok(meta)
+    }
+}
+
+/// URL query 追加 helper：`uri` 已含 `?` 用 `&` 连接，否则补 `?`。
+pub(crate) fn uri_append_query(uri: &str, key: &str, value: &str) -> String {
+    if uri.contains('?') {
+        format!("{uri}&{key}={value}")
+    } else {
+        format!("{uri}?{key}={value}")
+    }
+}
+
 // ===== proto 转换辅助 =====
 
 fn range_from_proto(r: xray_proto::xray::transport::internet::splithttp::RangeConfig) -> RangeConfig {
@@ -793,5 +1031,146 @@ mod tests {
         let proto = cfg.to_proto();
         let cfg2 = Config::from_proto(proto).unwrap();
         assert_eq!(cfg, cfg2);
+    }
+
+    // ===== RequestMeta / fill_* =====
+
+    #[test]
+    fn get_request_header_default_user_agent_when_empty() {
+        let cfg = Config::default();
+        let headers = cfg.get_request_header();
+        let has_ua = headers.iter().any(|(k, v)| k == "User-Agent" && v == "fetch");
+        assert!(has_ua, "default User-Agent 'fetch' should be set when headers empty");
+    }
+
+    #[test]
+    fn get_request_header_preserves_custom_user_agent() {
+        let cfg = Config {
+            headers: [("User-Agent".to_string(), "Chrome/123".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let headers = cfg.get_request_header();
+        let ua = headers.iter().find(|(k, _)| k == "User-Agent");
+        assert_eq!(ua, Some(&("User-Agent".to_string(), "Chrome/123".to_string())));
+    }
+
+    #[test]
+    fn apply_meta_to_uri_default_path_path() {
+        let cfg = Config::default();
+        let (uri, h, c) = cfg.apply_meta_to_uri("https://h/ws".into(), "sess123", "5");
+        assert_eq!(uri, "https://h/ws/sess123/5");
+        assert!(h.is_empty());
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn apply_meta_to_uri_query_query() {
+        let cfg = Config {
+            session_placement: "query".into(),
+            seq_placement: "query".into(),
+            ..Default::default()
+        };
+        let (uri, h, c) = cfg.apply_meta_to_uri("https://h/ws?x=1".into(), "sess123", "5");
+        assert_eq!(uri, "https://h/ws?x=1&x_session=sess123&x_seq=5");
+        assert!(h.is_empty());
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn apply_meta_to_uri_header_header() {
+        let cfg = Config {
+            session_placement: "header".into(),
+            seq_placement: "header".into(),
+            ..Default::default()
+        };
+        let (uri, h, c) = cfg.apply_meta_to_uri("https://h/ws".into(), "sess123", "5");
+        assert_eq!(uri, "https://h/ws");
+        assert!(h.iter().any(|(k, v)| k == "X-Session" && v == "sess123"));
+        assert!(h.iter().any(|(k, v)| k == "X-Seq" && v == "5"));
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn apply_meta_to_uri_cookie_cookie() {
+        let cfg = Config {
+            session_placement: "cookie".into(),
+            seq_placement: "cookie".into(),
+            ..Default::default()
+        };
+        let (uri, h, c) = cfg.apply_meta_to_uri("https://h/ws".into(), "sess123", "5");
+        assert_eq!(uri, "https://h/ws");
+        assert!(h.is_empty());
+        assert!(c.iter().any(|(k, v)| k == "x_session" && v == "sess123"));
+        assert!(c.iter().any(|(k, v)| k == "x_seq" && v == "5"));
+    }
+
+    #[test]
+    fn apply_meta_to_uri_skip_empty() {
+        let cfg = Config::default();
+        let (uri, h, c) = cfg.apply_meta_to_uri("https://h/ws".into(), "", "");
+        assert_eq!(uri, "https://h/ws");
+        assert!(h.is_empty());
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn build_packet_request_meta_body_filled() {
+        let cfg = Config {
+            host: "example.com".into(),
+            path: "/ws".into(),
+            ..Default::default()
+        };
+        let meta = cfg
+            .build_packet_request_meta("https://example.com/ws", "sess", "3", b"payload".to_vec())
+            .unwrap();
+        assert_eq!(meta.method, "POST");
+        assert_eq!(meta.uri, "https://example.com/ws/sess/3");
+        assert_eq!(meta.body.as_deref(), Some(&b"payload"[..]));
+        // padding length 默认范围 [100, 1000]，采样后注入 Referer 的 x_padding query。
+        // 由于长度随机，这里只验证 Referer 存在、url 前缀正确、x_padding 值非空。
+        let referer = meta.headers.iter().find_map(|(k, v)| {
+            if k == "Referer" { Some(v.clone()) } else { None }
+        }).expect("Referer header must exist");
+        assert!(referer.starts_with("https://example.com/ws?x_padding="), "referer={referer}");
+        let pad_value = referer.strip_prefix("https://example.com/ws?x_padding=").unwrap();
+        assert!(!pad_value.is_empty(), "padding value must be non-empty, got empty");
+        assert!(pad_value.chars().all(|c| c == 'X'), "default repeat-x padding should be all X, got {pad_value}");
+        assert!(meta.headers.iter().any(|(k, v)| k == "User-Agent" && v == "fetch"));
+    }
+
+    #[test]
+    fn build_stream_request_meta_get_when_no_body() {
+        let cfg = Config::default();
+        let meta = cfg
+            .build_stream_request_meta("https://example.com/ws", "sess", None)
+            .unwrap();
+        assert_eq!(meta.method, "GET");
+        assert!(meta.body.is_none());
+        assert!(!meta.headers.iter().any(|(k, _)| k == "Content-Type"));
+    }
+
+    #[test]
+    fn build_stream_request_meta_post_when_body() {
+        let cfg = Config::default();
+        let meta = cfg
+            .build_stream_request_meta("https://example.com/ws", "sess", Some(b"hello".to_vec()))
+            .unwrap();
+        assert_eq!(meta.method, "POST");
+        assert_eq!(meta.body.as_deref(), Some(&b"hello"[..]));
+        assert!(meta
+            .headers
+            .iter()
+            .any(|(k, v)| k == "Content-Type" && v == "application/grpc"));
+    }
+
+    #[test]
+    fn build_stream_request_meta_no_grpc_header_skips_content_type() {
+        let cfg = Config { no_grpc_header: true, ..Default::default() };
+        let meta = cfg
+            .build_stream_request_meta("https://example.com/ws", "sess", Some(b"hello".to_vec()))
+            .unwrap();
+        assert!(!meta.headers.iter().any(|(k, _)| k == "Content-Type"));
     }
 }

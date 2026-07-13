@@ -11,5 +11,21 @@ xray-common = { path = "../xray-common" }
 xray-transport = { path = "../xray-transport" }
 xray-proto = { path = "../xray-proto" }
 thiserror = { workspace = true }
+bytes = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+# HTTP client (splithttp)
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+hyper-rustls = { workspace = true }
+http = { workspace = true }
+futures-util = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+webpki-roots = { workspace = true }
+rustls-pki-types = { workspace = true }
+uuid = { workspace = true }
+rand = { workspace = true }
+tokio-util = "0.7"

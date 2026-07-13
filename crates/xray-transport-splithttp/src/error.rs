@@ -36,6 +36,22 @@ pub enum SplitHttpError {
     /// upload_queue: reorder 堆超过 max_packets 上限，连接被强制拆除。
     #[error("packet queue too large: max={max}, current={current}")]
     PacketQueueTooLarge { max: usize, current: usize },
+
+    /// hyper HTTP 错误（连接、协议、IO）。
+    #[error("splithttp hyper error: {0}")]
+    Hyper(String),
+
+    /// HTTP 状态码非 200（包上传/下载流收到错误响应）。
+    #[error("splithttp bad status: {0}")]
+    BadStatus(u16),
+
+    /// 无效 URL 构造。
+    #[error("invalid url: {0}")]
+    InvalidUrl(String),
+
+    /// 无效 HTTP header value/name（来自 [`http::header::InvalidName`] / [`http::header::InvalidHeaderValue`]）。
+    #[error("invalid http header: {0}")]
+    InvalidHeader(String),
 }
 
 /// SplitHTTP 操作 Result 别名。
