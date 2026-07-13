@@ -90,6 +90,10 @@ pub enum RealityError {
     /// key_share extension 缺失或不含 X25519 (group 0x001d) 条目——无法完成 REALITY 验证。
     #[error("REALITY: key_share extension missing or no X25519 entry")]
     NoKeyShareX25519,
+
+    /// rcgen 证书生成或 rustls ServerConfig 构建失败。
+    #[error("REALITY: certificate generation failed: {0}")]
+    CertGenerate(String),
 }
 
 /// REALITY crate 统一 Result 别名。

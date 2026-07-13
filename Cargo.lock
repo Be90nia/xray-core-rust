@@ -3342,6 +3342,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "prost",
+ "rcgen",
  "rustls",
  "rustls-pki-types",
  "sha2",

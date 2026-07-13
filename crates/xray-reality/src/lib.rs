@@ -37,6 +37,7 @@ pub mod error;
 pub mod server;
 pub mod util;
 pub mod crypto;
+pub mod mitm;
 
 pub use config::{
     LimitFallback, RealityConfig, ShortId, SHORT_ID_LEN, X25519_KEY_LEN,

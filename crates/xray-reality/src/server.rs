@@ -18,8 +18,13 @@
 
 use crate::config::RealityConfig;
 use crate::error::RealityError;
+use crate::mitm::{build_server_config, generate_self_signed_cert};
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_rustls::server::TlsStream;
+use tokio_rustls::TlsAcceptor;
 
 /// 解析后的 TLS 1.3 ClientHello（仅提取 REALITY 验证需要的字段）。
 #[derive(Debug, Clone)]
@@ -268,6 +273,93 @@ pub fn server<C>(_inner: C, _config: RealityConfig) -> Result<(), RealityError> 
     Err(RealityError::UtlsRequired)
 }
 
+/// [`server_tls`] 的返回：REALITY 验证成功返回 TLS 连接，失败返回原连接 + 已读 record 供 fallback。
+pub enum RealityServerOutcome<C> {
+    /// REALITY 验证通过，返回 rustls TLS 连接（可传给 VLESS 入站）。
+    Verified(TlsStream<PrefixedReader<C>>),
+    /// REALITY 验证失败。调用方可拿回 `conn` + `record` 做 [`fallback_to_dest`]。
+    Invalid {
+        conn: C,
+        record: Vec<u8>,
+        reason: RealityError,
+    },
+}
+
+/// REALITY 服务端握手（切片3b-ii）。
+///
+/// 流程：
+/// 1. [`read_tls_record`] 读 ClientHello record
+/// 2. [`parse_client_hello`] + [`verify_reality_client_hello`] 验证
+/// 3. 成功：[`generate_self_signed_cert`] + [`build_server_config`] + rustls TLS 握手
+/// 4. 失败：返回 [`RealityServerOutcome::Invalid`]，调用方决定 fallback
+///
+/// # 参数
+///
+/// - `conn`：客户端 TCP 连接
+/// - `server_private_key`：服务端 X25519 静态私钥（对应 client 配置的 `public_key`）
+/// - `allowed_short_ids`：允许的 short_id 白名单
+/// - `max_diff`：允许的 timestamp 偏差秒数（Go 默认 ±12h = 43200）
+///
+/// # Errors
+///
+/// - [`read_tls_record`] IO 错误 → [`RealityError::TlsHandshake`]
+/// - 证书生成 / ServerConfig 构建失败 → [`RealityError::CertGenerate`]
+/// - TLS 握手失败 → [`RealityError::TlsHandshake`]
+///
+/// 验证失败（parse/verify）**不返回 Err**，而是返回 [`RealityServerOutcome::Invalid`]，
+/// 让调用方决定是否 [`fallback_to_dest`]。
+pub async fn server_tls<C>(
+    mut conn: C,
+    server_private_key: &[u8; 32],
+    allowed_short_ids: &[[u8; 8]],
+    max_diff: u32,
+) -> std::result::Result<RealityServerOutcome<C>, RealityError>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+
+    // 1. 读 ClientHello record
+    let record = read_tls_record(&mut conn).await.map_err(|e| {
+        RealityError::TlsHandshake(format!("read ClientHello: {e}"))
+    })?;
+
+    // 2. 解析 + 验证
+    let outcome = (|| {
+        let parsed = parse_client_hello(&record)?;
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0);
+        verify_reality_client_hello(
+            &parsed,
+            server_private_key,
+            now_unix,
+            max_diff,
+            allowed_short_ids,
+        )?;
+        Ok::<String, RealityError>(
+            parsed.server_name.unwrap_or_else(|| "localhost".to_string()),
+        )
+    })();
+
+    let sni = match outcome {
+        Ok(sni) => sni,
+        Err(reason) => {
+            return Ok(RealityServerOutcome::Invalid { conn, record, reason });
+        }
+    };
+
+    // 3. 成功分支：生成证书 + TLS 握手
+    let (cert_der, key_der) = generate_self_signed_cert(&sni)?;
+    let server_config = build_server_config(cert_der, key_der)?;
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let prefixed = PrefixedReader::new(record, conn);
+    match acceptor.accept(prefixed).await {
+        Ok(tls) => Ok(RealityServerOutcome::Verified(tls)),
+        Err(e) => Err(RealityError::TlsHandshake(e.to_string())),
+    }
+}
+
 /// TLS record 最大长度（RFC 5246: 2^14 bytes，防止恶意 OOM）。
 const MAX_TLS_RECORD_LEN: usize = 16384;
 
@@ -295,7 +387,11 @@ pub async fn read_tls_record<R: AsyncRead + Unpin>(
     Ok(record)
 }
 
-/// 先返回 `prefix` 字节，耗尽后转发到 `inner` 的 [`AsyncRead`]。
+/// 先返回 `prefix` 字节，耗尽后转发到 `inner` 的 [`AsyncRead`]；写操作直接转发到 `inner`。
+///
+/// REALITY 服务端读出 ClientHello record 后，rustls 服务端需要完整 TLS 字节流
+/// （不能跳过已读的 ClientHello）。[`PrefixedReader`] 把已读 record 重新注入流头，
+/// 让 rustls 像读新连接一样处理。写方向不需 prefix（直接写原连接）。
 ///
 /// REALITY 服务端读出 ClientHello record 后，rustls 服务端需要完整 TLS 字节流
 /// （不能跳过已读的 ClientHello）。[`PrefixedReader`] 把已读 record 重新注入流头，
@@ -329,8 +425,32 @@ impl<R: AsyncRead + Unpin> AsyncRead for PrefixedReader<R> {
             return std::task::Poll::Ready(Ok(()));
         }
         std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }}
+
+impl<R: AsyncWrite + Unpin> AsyncWrite for PrefixedReader<R> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
+
 
 /// PROXY protocol 版本（对应 Go `fb.Xver`）。
 ///
@@ -903,5 +1023,104 @@ mod tests {
         let got_str = String::from_utf8_lossy(&got);
         assert!(got_str.starts_with("PROXY TCP4 1.2.3.4 9.10.11.12 5678 80\r\n"));
         assert!(got_str.contains("CLIENTHELLO"));
+    }
+
+    #[tokio::test]
+    async fn server_tls_invalid_returns_invalid_outcome() {
+        use tokio::io::{AsyncWriteExt, duplex};
+
+        // 构造合法 TLS record 但 session_id 不含 REALITY 加密载荷（verify 失败）
+        let random = [0x55u8; 32];
+        let session_id = [0x77u8; 32]; // 非加密载荷
+        let key_share = [0x88u8; 32];
+        let record =
+            build_test_client_hello(&random, &session_id, &key_share, Some("example.com"));
+
+        let (mut client, server) = duplex(4096);
+        let server_priv = [0x11u8; 32];
+        let short_id = [0xaa; 8];
+
+        let server_task = tokio::spawn(async move {
+            server_tls(server, &server_priv, &[short_id], 43200).await
+        });
+
+        // client 发送 ClientHello record 后保持连接（让 server_tls 完成 verify）
+        client.write_all(&record).await.unwrap();
+
+        let outcome = server_task.await.unwrap().unwrap();
+        match outcome {
+            RealityServerOutcome::Invalid { record: rec, reason, .. } => {
+                assert_eq!(rec, record, "Invalid outcome 应保留原 record 供 fallback");
+                assert!(
+                    matches!(reason, RealityError::SessionIdDecryptFailed),
+                    "expected SessionIdDecryptFailed, got {reason:?}"
+                );
+            }
+            RealityServerOutcome::Verified(_) => panic!("expected Invalid, got Verified"),
+        }
+    }
+
+    #[tokio::test]
+    async fn server_tls_eof_returns_tls_handshake_err() {
+        use tokio::io::duplex;
+
+        let (client, server) = duplex(4096);
+        drop(client); // 立即关闭 client → server 读 EOF
+
+        let server_priv = [0x11u8; 32];
+        let result = server_tls(server, &server_priv, &[], 43200).await;
+
+        assert!(
+            matches!(result, Err(RealityError::TlsHandshake(_))),
+            "expected Err(TlsHandshake) on EOF"
+        );
+    }
+
+    /// verify 通过后进入 acceptor.accept 阶段（成功分支标志）。
+    ///
+    /// server_tls 在 verify 失败时返回 `Ok(Invalid)`，不会进入 Err 路径。
+    /// 此测试发送合法 REALITY ClientHello，verify 通过 → 进入 accept → 因 client
+    /// 端不响应 TLS 1.3 ServerHello，accept 失败 → `Err(TlsHandshake)`。
+    /// `Err` + 已发送 record = verify 通过 + accept 阶段失败 = 成功分支进入标志。
+    /// 完整 TLS 握手由 VPS #13 + 单元测试覆盖。
+    #[tokio::test]
+    async fn server_tls_verified_branch_enters_tls_accept() {
+        use tokio::io::{AsyncWriteExt, duplex};
+
+        let random = [0x55u8; 32];
+        let server_priv = [0x11u8; 32];
+        let client_priv = [0x22u8; 32];
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(1_700_000_000);
+        let short_id = [0xaa; 8];
+        let record = build_reality_client_hello(
+            &random,
+            &server_priv,
+            &client_priv,
+            now,
+            &short_id,
+            Some("example.com"),
+        );
+
+        let (mut client, server) = duplex(8192);
+        let server_task = tokio::spawn(async move {
+            server_tls(server, &server_priv, &[short_id], 43200).await
+        });
+
+        // client 发送合法 REALITY ClientHello（verify 会通过）
+        client.write_all(&record).await.unwrap();
+
+        let result = server_task.await.unwrap();
+        match result {
+            // verify 通过 + accept 阶段失败（client 没继续 TLS）
+            Err(RealityError::TlsHandshake(_)) => { /* 成功分支进入标志 */ }
+            Ok(RealityServerOutcome::Invalid { reason, .. }) => {
+                panic!("expected verify pass + TLS accept, got Invalid: {reason:?}");
+            }
+            Ok(RealityServerOutcome::Verified(_)) => { /* 不可能：client 未完成 TLS */ }
+            Err(e) => panic!("unexpected error: {e:?}"),
+        }
     }
 }
