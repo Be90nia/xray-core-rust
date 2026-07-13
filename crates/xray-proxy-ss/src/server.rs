@@ -1,11 +1,18 @@
-//! Shadowsocks 入站服务器处理器（stub），对应 Go `proxy/shadowsocks/server.go`。
+//! Shadowsocks 入站服务器处理器，对应 Go `proxy/shadowsocks/server.go`。
 //!
 //! Process 流程依赖 `routing::Dispatcher` + `udp::Dispatcher` + `session::Inbound`
 //! 等基础设施，当前留 trait 接口 + Noop 实现。
+//!
+//! [`read_request`] 提供单用户场景的 TCP 首帧读取 + SSStream 构造。
 
+use crate::config::MemoryAccount;
 use crate::error::Result;
-use crate::protocol::RequestHeader;
-use crate::validator::{MemoryUser, Validator};
+use crate::protocol::{read_address_port_ss, RequestHeader};
+use crate::stream::SSStream;
+use crate::validator::{MemoryUser, RequestCommand, Validator};
+
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpStream;
 
 /// 入站处理器接口。
 pub trait InboundProcessor: Send + Sync {
@@ -118,6 +125,58 @@ impl Server {
     }
 }
 
+// ============================================================================
+// TCP 首帧读取（单用户场景）
+// ============================================================================
+
+/// server 端：从 TCP 连接读取首帧（addr+port）+ 构造 SSStream。
+///
+/// 流程：
+/// 1. 读 IV（长度 = `account.cipher.iv_size()`）
+/// 2. 构造 `SSStream::new_client`（nonce 从 `[0xFF;n]` 开始）
+/// 3. `read_chunk` 读首帧（addr+port，SS 地址格式）
+///
+/// 返回的 `SSStream` 可继续 `read_chunk` 读 body。
+///
+/// 单用户场景（已知 account）。多用户场景需先用 validator 匹配。
+///
+/// # Errors
+/// - [`crate::error::SsError::Io`]：TCP 读 IV/首帧失败。
+/// - [`crate::error::SsError::ReadInitial`]：首帧 EOF。
+/// - 透传 `SSStream` AEAD 初始化错误。
+/// - 透传 `read_address_port_ss` 解析错误。
+pub async fn read_request(
+    mut conn: TcpStream,
+    account: &MemoryAccount,
+    user_email: &str,
+) -> Result<(RequestHeader, SSStream<TcpStream>)> {
+    // 读 IV
+    let iv_size = account.cipher.iv_size() as usize;
+    let mut iv = vec![0u8; iv_size];
+    conn.read_exact(&mut iv).await?;
+
+    // 构造 SSStream（nonce 从 [0xFF;n] 开始，第一次 read_chunk → [0;n]）
+    let mut stream = SSStream::new_client(conn, account, &iv)?;
+
+    // 读首帧（addr+port）
+    let first_frame = stream
+        .read_chunk()
+        .await?
+        .ok_or_else(|| crate::error::SsError::ReadInitial("EOF reading first frame".to_string()))?;
+
+    let (address, port, _) = read_address_port_ss(&first_frame)?;
+
+    let header = RequestHeader {
+        version: crate::VERSION,
+        user: MemoryUser::new(user_email.to_string(), account.clone()),
+        command: RequestCommand::Tcp,
+        address,
+        port,
+    };
+
+    Ok((header, stream))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,5 +248,91 @@ mod tests {
         let header = server.handle_udp(&encoded).expect("handle");
         assert_eq!(header.address, addr);
         assert_eq!(header.port, 443);
+    }
+
+    // ---- loopback 互通测试（client ↔ server in-process）----
+
+    #[tokio::test]
+    async fn client_server_loopback_aes_128() {
+        use crate::client::Client;
+        use tokio::net::TcpListener;
+        use xray_common::net::address::Address;
+
+        let account = make_account(CipherType::Aes128Gcm, "loopback-pw");
+
+        // server: bind + accept
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let server_account = account.clone();
+        let server_handle = tokio::spawn(async move {
+            let (conn, _) = listener.accept().await.expect("accept");
+            let (header, mut stream) = read_request(conn, &server_account, "u@x.com")
+                .await
+                .expect("read_request");
+
+            // 读 body chunk
+            let body = stream.read_chunk().await.expect("read body").expect("body");
+
+            // 写响应
+            let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+            stream.write_chunk(resp).await.expect("write resp");
+            stream.flush().await.expect("flush resp");
+
+            (header, body)
+        });
+
+        // client: dial_target + send body + read response
+        let client = Client::new(account, "127.0.0.1".to_string(), port);
+        let target_addr = Address::Domain("example.com".to_string());
+        let mut stream = client.dial_target(&target_addr, 80).await.expect("dial");
+
+        // 发 body
+        let http_req = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        stream.write_chunk(http_req).await.expect("write body");
+        stream.flush().await.expect("flush body");
+
+        // 读响应
+        let resp = stream.read_chunk().await.expect("read resp").expect("resp");
+        assert_eq!(resp, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
+
+        // 验证 server 侧
+        let (header, body) = server_handle.await.expect("join");
+        assert_eq!(header.address, target_addr);
+        assert_eq!(header.port, 80);
+        assert_eq!(body, http_req);
+    }
+
+    #[tokio::test]
+    async fn client_server_loopback_aes_256() {
+        use crate::client::Client;
+        use tokio::net::TcpListener;
+        use xray_common::net::address::Address;
+
+        let account = make_account(CipherType::Aes256Gcm, "aes256-loopback");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let server_account = account.clone();
+        let server_handle = tokio::spawn(async move {
+            let (conn, _) = listener.accept().await.expect("accept");
+            let (_h, mut stream) = read_request(conn, &server_account, "u@x.com")
+                .await
+                .expect("read_request");
+            let body = stream.read_chunk().await.expect("read").expect("body");
+            stream.write_chunk(b"resp").await.expect("write");
+            stream.flush().await.expect("flush");
+            body
+        });
+
+        let client = Client::new(account, "127.0.0.1".to_string(), port);
+        let target = Address::Domain("test.com".to_string());
+        let mut stream = client.dial_target(&target, 443).await.expect("dial");
+        stream.write_chunk(b"ping").await.expect("write");
+        stream.flush().await.expect("flush");
+
+        let resp = stream.read_chunk().await.expect("read").expect("resp");
+        assert_eq!(resp, b"resp");
+
+        let body = server_handle.await.expect("join");
+        assert_eq!(body, b"ping");
     }
 }

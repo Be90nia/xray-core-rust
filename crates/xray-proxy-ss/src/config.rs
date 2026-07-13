@@ -72,7 +72,8 @@ impl CipherType {
 // ============================================================================
 
 /// AEAD 实例的统一类型。复用 `xray_crypto::aead::AeadCipher` trait。
-pub type InnerAead = Box<dyn AeadCipherImpl>;
+/// `+ Send + Sync` 保证 SSStream 可跨线程（tokio::spawn 要求 Future: Send）。
+pub type InnerAead = Box<dyn AeadCipherImpl + Send + Sync>;
 
 /// AEAD creator 函数签名：key → Box<dyn AeadCipherImpl>。
 pub type AeadCreator = fn(&[u8]) -> std::result::Result<InnerAead, CryptoError>;

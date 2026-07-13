@@ -13,6 +13,7 @@ pub mod config;
 pub mod error;
 pub mod protocol;
 pub mod server;
+pub mod stream;
 pub mod validator;
 
 pub use config::{AeadCipher, Cipher, CipherType, InnerAead, MemoryAccount};
