@@ -2,15 +2,19 @@
 //!
 //! 翻译自 Go `transport/internet/splithttp/dialer.go` 的 `Dial` 函数。
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::TryStreamExt;
-use tokio::io::{AsyncRead as AsyncReadTrait, AsyncReadExt, DuplexStream};
+use http::StatusCode;
+use hyper::client::conn::http2;
+use hyper_util::rt::TokioExecutor;
+use tokio::io::{AsyncRead as AsyncReadTrait, AsyncReadExt, AsyncWrite as AsyncWriteTrait, DuplexStream};
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::debug;
 use uuid::Uuid;
-use crate::client::DefaultDialerClient;
+use crate::client::{DefaultDialerClient, ReqBody, make_stream_body};
 use crate::config::Config;
 use crate::connection::SplitConn;
 use crate::error::{Result, SplitHttpError};
@@ -502,6 +506,88 @@ pub async fn dial_h3(
             "unknown splithttp mode (h3): {other}"
         ))),
     }
+}
+
+// ===== 切片 F2: REALITY stream-one 直连路径 =====
+
+/// REALITY stream-one 直连拨号（跳过 hyper-rustls connector）。
+///
+/// 调用方负责完成 TCP + REALITY TLS 握手（例如 `reality::client::u_client`），
+/// 把已握手的 TLS 流传入。本函数负责：
+///
+/// 1. `TokioIo::new(tls_stream)` 适配 AsyncRead/AsyncWrite → hyper IO
+/// 2. `hyper::client::conn::http2::handshake(TokioExecutor, io)` 拿 `SendRequest`
+/// 3. spawn conn driver（后台驱动 h2 连接）
+/// 4. 构造 POST streaming body（upload pipe）+ `send_request`
+/// 5. 返回 [`PacketUpConn`]（reader=响应流，writer=pipe 写端）
+///
+/// # 简化（vs Go）
+///
+/// Go 在 `dialContext` 闭包里 `reality.UClient(conn, ...)` 包装 TCP conn，由 HTTP
+/// client 触发握手。Rust 因 hyper-rustls 自管 TLS，改为调用方先完成 REALITY 握手,
+/// 再传 TLS 流给本函数。架构等价，语义不变。
+///
+/// # 参数
+///
+/// - `tls_stream`: 已握手好的 TLS 流（REALITY 或普通 TLS）
+/// - `remote_addr`: 远端地址（用于 SplitConn.remote_addr）
+/// - `local_addr`: 本地地址（用于 SplitConn.local_addr）
+/// - `base_uri`: 完整 URL
+/// - `session_id`: uuid 字符串（stream-one 时为空）
+/// - `config`: splithttp 配置（构造 RequestMeta）
+///
+/// # Errors
+///
+/// - [`SplitHttpError::Hyper`]：h2 handshake / send_request 失败
+/// - [`SplitHttpError::BadStatus`]：非 200 响应
+pub async fn dial_reality_stream_one<S>(
+    tls_stream: S,
+    remote_addr: SocketAddr,
+    local_addr: SocketAddr,
+    base_uri: String,
+    session_id: String,
+    config: Arc<Config>,
+) -> Result<PacketUpConn>
+where
+    S: AsyncReadTrait + AsyncWriteTrait + Unpin + Send + 'static,
+{
+    let io = hyper_util::rt::TokioIo::new(tls_stream);
+    let (mut sender, conn) = http2::handshake::<_, _, ReqBody>(TokioExecutor::new(), io)
+        .await
+        .map_err(|e| SplitHttpError::Hyper(format!("h2 handshake: {e}")))?;
+
+    // spawn conn driver（必须，否则 h2 连接不动）
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            debug!(target: "splithttp", error = %e, "h2 connection driver ended");
+        }
+    });
+
+    // 创建上传 pipe
+    let (pipe_client, pipe_server) = tokio::io::duplex(8192);
+    let upload_stream = ReaderStream::new(pipe_server);
+
+    // 构造 RequestMeta + hyper Request（stream-one body 通过 streaming body 发送）
+    let meta = config.build_stream_request_meta(&base_uri, &session_id, Some(Vec::new()))?;
+    let body = make_stream_body(upload_stream);
+    let req = DefaultDialerClient::build_request_with_body(meta, body)?;
+
+    let resp = sender
+        .send_request(req)
+        .await
+        .map_err(|e| SplitHttpError::Hyper(format!("send_request: {e}")))?;
+    if resp.status() != StatusCode::OK {
+        return Err(SplitHttpError::BadStatus(resp.status().as_u16()));
+    }
+
+    let resp_body = resp.into_body();
+    let download_stream = http_body_util::BodyDataStream::new(resp_body).map_err(map_hyper_err_to_io);
+    let download_reader: Box<dyn AsyncReadTrait + Send + Unpin> =
+        Box::new(StreamReader::new(download_stream));
+
+    debug!(target: "splithttp", %base_uri, "REALITY stream-one established via direct h2 handshake");
+
+    Ok(SplitConn::new(download_reader, pipe_client, remote_addr, local_addr))
 }
 
 #[cfg(test)]

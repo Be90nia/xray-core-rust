@@ -73,7 +73,7 @@ fn empty_body() -> ReqBody {
 /// 构造流式 body（`Stream<Item=io::Result<Bytes>>` → `StreamBody` boxed）。
 ///
 /// 用于 stream-up / stream-one 的 POST 请求 body。
-fn make_stream_body<S>(s: S) -> ReqBody
+pub(crate) fn make_stream_body<S>(s: S) -> ReqBody
 where
     S: Stream<Item = std::io::Result<Bytes>> + Send + Sync + 'static,
 {
@@ -138,7 +138,7 @@ impl DefaultDialerClient {
     ///
     /// [`Self::build_request`] 用 `Full<Bytes>` body 调用此函数；
     /// [`Self::open_stream_uploading`] 用 `StreamBody` body 调用此函数。
-    fn build_request_with_body(meta: RequestMeta, body: ReqBody) -> Result<Request<ReqBody>> {
+    pub(crate) fn build_request_with_body(meta: RequestMeta, body: ReqBody) -> Result<Request<ReqBody>> {
         let method = Method::from_bytes(meta.method.as_bytes())
             .map_err(|e| SplitHttpError::InvalidUrl(format!("method {e}")))?;
         let uri: Uri = meta
