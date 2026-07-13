@@ -18,7 +18,7 @@
 
 use crate::config::RealityConfig;
 use crate::error::RealityError;
-use crate::mitm::{build_server_config, generate_self_signed_cert};
+use crate::mitm::{build_server_config, generate_reality_ed25519_cert};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -224,7 +224,7 @@ pub fn verify_reality_client_hello(
     now_unix: u32,
     max_diff: u32,
     allowed_short_ids: &[[u8; 8]],
-) -> Result<crate::crypto::SessionPayload, RealityError> {
+) -> Result<(crate::crypto::SessionPayload, [u8; 32]), RealityError> {
     // 1. 提取 client X25519 公钥（来自 key_share extension）
     let client_pub = parsed
         .key_share_x25519
@@ -262,7 +262,9 @@ pub fn verify_reality_client_hello(
     )?;
 
     // 5. 校验 timestamp 窗口 + short_id 白名单
-    crate::crypto::verify_session_payload(&plaintext, now_unix, max_diff, allowed_short_ids)
+    let payload =
+        crate::crypto::verify_session_payload(&plaintext, now_unix, max_diff, allowed_short_ids)?;
+    Ok((payload, auth_key))
 }
 
 /// 创建 REALITY 服务端连接（IO 层，切片3 待实现）。
@@ -330,27 +332,26 @@ where
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as u32)
             .unwrap_or(0);
-        verify_reality_client_hello(
+        let (_payload, auth_key) = verify_reality_client_hello(
             &parsed,
             server_private_key,
             now_unix,
             max_diff,
             allowed_short_ids,
         )?;
-        Ok::<String, RealityError>(
-            parsed.server_name.unwrap_or_else(|| "localhost".to_string()),
-        )
+        Ok::<_, RealityError>((parsed.server_name.clone().unwrap_or_else(|| "localhost".to_string()), auth_key))
     })();
 
-    let sni = match outcome {
-        Ok(sni) => sni,
+    let (sni, auth_key) = match outcome {
+        Ok(v) => v,
         Err(reason) => {
             return Ok(RealityServerOutcome::Invalid { conn, record, reason });
         }
     };
 
-    // 3. 成功分支：生成证书 + TLS 握手
-    let (cert_der, key_der) = generate_self_signed_cert(&sni)?;
+    // 3. 成功分支：生成 REALITY HMAC 证书 + TLS 握手
+    let _ = &sni; // ponytail: sni 暂不用 (REALITY cert 用固定 SAN=reality.local)
+    let (cert_der, key_der) = generate_reality_ed25519_cert(&auth_key)?;
     let server_config = build_server_config(cert_der, key_der)?;
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
     let prefixed = PrefixedReader::new(record, conn);
@@ -830,7 +831,7 @@ mod tests {
             Some("example.com"),
         );
         let parsed = parse_client_hello(&record).unwrap();
-        let payload =
+        let (payload, _auth_key) =
             verify_reality_client_hello(&parsed, &server_priv, now, 43200, &[short_id]).unwrap();
         assert_eq!(payload.timestamp, now);
         assert_eq!(payload.short_id, short_id);
@@ -1121,6 +1122,63 @@ mod tests {
             }
             Ok(RealityServerOutcome::Verified(_)) => { /* 不可能：client 未完成 TLS */ }
             Err(e) => panic!("unexpected error: {e:?}"),
+        }
+    }
+
+    /// 真 REALITY loopback：reality u_client (watfaq-rustls with_reality) + server_tls
+    /// (HMAC 签名 cert)。验证完整 REALITY 握手成功。
+    #[tokio::test]
+    async fn reality_loopback_u_client_with_server_tls() {
+        use std::time::Duration;
+        use tokio::io::duplex;
+        use x25519_dalek::{PublicKey, StaticSecret};
+        use crate::client::{u_client, UConnState};
+        use crate::config::RealityConfig;
+        use xray_proto::transport::internet::reality::Config as ProtoConfig;
+
+        let server_priv_array = [0x11u8; 32];
+        let short_id = [0xaa; 8];
+
+        // server X25519 公钥（client RealityConfig.public_key）
+        let server_secret = StaticSecret::from(server_priv_array);
+        let server_pub = PublicKey::from(&server_secret);
+
+        // client RealityConfig（fingerprint/server_name/public_key/short_id）
+        let proto = ProtoConfig {
+            fingerprint: "chrome".into(),
+            public_key: server_pub.as_bytes().to_vec(),
+            server_name: "example.com".into(),
+            short_id: short_id.to_vec(),
+            ..Default::default()
+        };
+        let reality_config = RealityConfig::from_proto(&proto).unwrap();
+        let state = UConnState::new(reality_config).unwrap();
+
+        // 双向管道（足够大 buffer 避免 TCP 反压）
+        let (client, server) = duplex(65536);
+
+        // spawn server_tls
+        let server_task = tokio::spawn(async move {
+            server_tls(server, &server_priv_array, &[short_id], 43200).await
+        });
+
+        // client 端：reality u_client 握手
+        let client_result = tokio::time::timeout(
+            Duration::from_secs(10),
+            u_client(client, state),
+        )
+        .await;
+
+        let server_result = server_task.await.unwrap();
+
+        match (client_result, server_result) {
+            (Ok(Ok(_tls_stream)), Ok(RealityServerOutcome::Verified(_))) => {
+                // 完整 REALITY 握手成功！
+            }
+            (Ok(Ok(_)), Ok(_)) => panic!("server unexpected outcome"),
+            (Ok(Ok(_)), Err(e)) => panic!("server error: {e:?}"),
+            (Ok(Err(e)), _) => panic!("client u_client failed: {e:?}"),
+            (Err(_timeout), _) => panic!("client u_client timeout"),
         }
     }
 }

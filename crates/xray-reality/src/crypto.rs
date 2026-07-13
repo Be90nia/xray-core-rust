@@ -337,6 +337,39 @@ pub fn verify_reality_certificate(
     Ok(mac.verify_slice(cert_signature).is_ok())
 }
 
+/// 服务端签名 REALITY 证书（HMAC-SHA512）。
+///
+/// [`verify_reality_certificate`] 的逆运算：
+/// HMAC-SHA512(auth_key, ed25519_pub_key) → 64 字节签名。
+///
+/// 服务端用此签名覆盖 cert 末尾 64 字节（rcgen Ed25519 self-signed cert 的
+/// signature 字段）。客户端校验时同样计算 HMAC 比对。
+///
+/// # 参数
+///
+/// - `auth_key`：HKDF-SHA256 派生的认证密钥（ECDH 输出）
+/// - `cert_pub_key_ed25519`：Ed25519 公钥原始字节（32 字节）
+///
+/// # 返回
+///
+/// 64 字节 HMAC-SHA512 签名。
+///
+/// # Errors
+///
+/// - [`RealityError::EmptySharedKey`]：auth_key 为空
+pub fn sign_reality_certificate(
+    auth_key: &[u8],
+    cert_pub_key_ed25519: &[u8],
+) -> Result<[u8; 64], RealityError> {
+    let mut mac = HmacSha512::new_from_slice(auth_key)
+        .map_err(|_| RealityError::EmptySharedKey)?;
+    mac.update(cert_pub_key_ed25519);
+    let result = mac.finalize().into_bytes();
+    let mut sig = [0u8; 64];
+    sig.copy_from_slice(&result);
+    Ok(sig)
+}
+
 /// 将 32 字节切片转为数组（失败返 [`RealityError::InvalidPrivateKeyLen`]）。
 fn try_array32(b: &[u8]) -> [u8; 32] {
     let mut arr = [0u8; 32];
