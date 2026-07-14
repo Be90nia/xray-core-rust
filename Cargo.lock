@@ -4387,6 +4387,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "xray-proxy-hysteria"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "quinn",
+ "rcgen 0.13.2",
+ "rustls",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "xray-common",
+ "xray-features",
+ "xray-proto",
+ "xray-transport-hysteria",
+]
+
+[[package]]
 name = "xray-proxy-loopback"
 version = "0.1.0"
 dependencies = [

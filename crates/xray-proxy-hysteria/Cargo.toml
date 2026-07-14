@@ -1,0 +1,22 @@
+[package]
+name = "xray-proxy-hysteria"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+xray-common = { path = "../xray-common" }
+xray-features = { path = "../xray-features" }
+xray-proto = { path = "../xray-proto" }
+xray-transport-hysteria = { path = "../xray-transport-hysteria" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+quinn = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+rcgen = "0.13"
+rustls = { workspace = true, default-features = false, features = ["ring"] }
