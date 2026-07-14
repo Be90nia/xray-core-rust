@@ -30,13 +30,12 @@
 //!   `http3.Server.ServeQUICConn` + `quic.Transport.Listen` + masquerade HTTP handler
 //!   （404/file/proxy/string 四种伪装）。当前仅定义 trait + 编排框架。
 //!
-//! # 不引入 `quinn` / `h3` crate
+//! # quinn 适配（5lb 切片1a）
 //!
-//! Hysteria 协议强依赖 QUIC + HTTP/3（自定义 frame type 0x401 + auth 路径 /auth +
-//! datagram 多路复用 + 自定义 congestion controller 注入）。引入 quinn/h3 等于
-//! 绑定特定 QUIC 实现，且 hysteria 用了 `http3.Server.StreamDispatcher` 这种
-//! quic-go 私有 API，h3 crate 没有直接对应。因此 1:1 翻译 Go 源码（含 BBR/Brutal
-//! 完整算法），QUIC/HTTP3 IO 边界留 trait，与 KCP 处理一致。
+//! [`quinn_adapter`] 模块提供 quinn 0.11 → hysteria trait 的包装：
+//! [`quinn_adapter::QuinnQuicConn`] / [`quinn_adapter::QuinnQuicStream`] 实现
+//! [`conn::QuicConn`] / [`conn::QuicStream`]，让 hysteria interConn / UdpSessionManager
+//! 直接复用 quinn QUIC 栈。不含 transport（dial+auth）和 congestion controller 适配。
 
 pub mod congestion;
 pub mod config;
@@ -47,6 +46,7 @@ pub mod error;
 pub mod hub;
 pub mod proto_config;
 pub mod udphop;
+pub mod quinn_adapter;
 
 pub use config::{
     AuthRequestPadding, AuthResponsePadding, CommonHeaderCCRX, CommonHeaderPadding,

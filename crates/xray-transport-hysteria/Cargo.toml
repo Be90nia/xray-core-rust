@@ -16,6 +16,9 @@ tracing = { workspace = true }
 parking_lot = { workspace = true }
 bytes = { workspace = true }
 rand = { workspace = true }
+quinn = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+rcgen = "0.13"
+rustls = { workspace = true, default-features = false, features = ["ring"] }

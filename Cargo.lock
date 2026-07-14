@@ -4673,7 +4673,10 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "parking_lot",
+ "quinn",
  "rand 0.9.4",
+ "rcgen 0.13.2",
+ "rustls",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
