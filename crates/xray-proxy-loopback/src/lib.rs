@@ -186,7 +186,11 @@ impl DispatchHandler for LoopbackHandler {
     ///
     /// 切片2 简化：session/ctx 改造留切片3，本方法直接调 sink.dispatch_loopback。
     /// sink 为 None 时仅 log + drop link（测试桩）。
-    fn dispatch(&self, link: xray_transport::link::Link) -> LoopbackFuture<()> {
+    fn dispatch(
+        &self,
+        _dest: &xray_common::net::destination::Destination,
+        link: xray_transport::link::Link,
+    ) -> LoopbackFuture<()> {
         let sink = self.sink.clone();
         let inbound_tag = self.inbound_tag.clone();
         Box::pin(async move {
@@ -212,6 +216,15 @@ impl DispatchHandler for LoopbackHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xray_common::net::address::Address as XrayAddress;
+    use xray_common::net::destination::Destination;
+    use xray_common::net::network::Network;
+    use xray_common::net::port::Port;
+
+    /// 测试用占位 Destination（loopback 不依赖 dest 内容）。
+    fn dummy_dest() -> Destination {
+        Destination::new(XrayAddress::from_ipv4_bytes([127, 0, 0, 1]), Port::new(0), Network::TCP)
+    }
 
     fn cfg(tag: &str) -> Config {
         Config {
@@ -321,7 +334,7 @@ mod tests {
         let h = LoopbackHandler::with_inbound_tag("lb", "target-in");
         let link = pipe_link();
         // dispatch 返回 future，await 不应 panic。
-        h.dispatch(link).await;
+        h.dispatch(&dummy_dest(), link).await;
         // 到达这里即视为测试桩语义正常。
     }
 
@@ -333,7 +346,7 @@ mod tests {
         });
         let h = LoopbackHandler::with_inbound_tag("lb", "target-in").with_sink(sink);
         let link = pipe_link();
-        h.dispatch(link).await;
+        h.dispatch(&dummy_dest(), link).await;
         let recorded = calls.lock().unwrap().clone();
         assert_eq!(recorded, vec!["target-in".to_string()]);
     }
@@ -346,7 +359,7 @@ mod tests {
         });
         let h = LoopbackHandler::with_inbound_tag("lb", "in").with_sink(sink);
         for _ in 0..3 {
-            h.dispatch(pipe_link()).await;
+            h.dispatch(&dummy_dest(), pipe_link()).await;
         }
         assert_eq!(calls.lock().unwrap().len(), 3);
     }
