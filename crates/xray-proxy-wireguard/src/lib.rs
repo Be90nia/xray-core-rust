@@ -17,14 +17,17 @@
 //! - [`wireguard::parse_endpoints`] — endpoint 字符串解析（纯 IP / CIDR + 双栈检测）
 //! - [`wireguard::create_ipc_request`] — DeviceConfig → WireGuard IPC 请求字符串
 //!
-//! 切片2 待办：boringtun 设备创建 + TUN 设备（kernel TUN / gVisor userspace）+
-//! UDP bind + WireGuard 协议握手 + 客户端/服务端 Process 实现。
+//! 切片2 待办：UDP socket driver loop（tokio task 路由 socket↔Tunnel）+
+//! smoltcp netstack + InboundHandler/OutboundHandler 适配。
+//! 切片1 已实现：[`tunnel::Tunnel`]——boringtun Tunn 包装，同步 encapsulate/decapsulate/update_timers。
 
 pub mod config;
 pub mod error;
+pub mod tunnel;
 pub mod wireguard;
 
 // 顶层 re-export。
 pub use config::{DeviceConfig, DomainStrategy, PeerConfig};
 pub use error::{Result, WgError};
+pub use tunnel::{Output as TunnelOutput, Tunnel};
 pub use wireguard::{ParsedEndpoints, create_ipc_request, parse_endpoints, SERVER_LISTEN_PORT_PLACEHOLDER};

@@ -12,3 +12,5 @@ xray-proto = { path = "../xray-proto" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+boringtun = { workspace = true }
+hex = "0.4"
