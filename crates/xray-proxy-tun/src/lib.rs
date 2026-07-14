@@ -21,8 +21,10 @@
 //! TCP/UDP/ICMP 包处理 + UDP fullcone NAT。
 
 pub mod config;
+pub mod device;
 pub mod error;
 
 // 顶层 re-export。
 pub use config::{Stack, StackOptions, Tun, score};
+pub use device::TunDevice;
 pub use error::{Result, TunError};

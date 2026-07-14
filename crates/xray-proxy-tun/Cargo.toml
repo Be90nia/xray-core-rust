@@ -12,3 +12,4 @@ thiserror = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+tun-rs = { workspace = true }
