@@ -405,6 +405,11 @@ impl BufWriter for Writer {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move { Writer::write_multi_buffer(self, mb).await })
     }
+
+    fn shutdown(&self) {
+        // 调用 pipe.Writer 的 inherent close 方法
+        let _ = Writer::close(self);
+    }
 }
 
 #[cfg(test)]

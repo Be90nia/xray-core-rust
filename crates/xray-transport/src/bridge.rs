@@ -17,6 +17,7 @@ use std::io;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::connection::Connection;
+use crate::link::Link;
 
 /// 双向桥接两个 [`Connection`]。
 ///
@@ -68,6 +69,71 @@ where
     W: AsyncWrite + Unpin,
 {
     tokio::io::copy(&mut reader, &mut writer).await
+}
+
+/// 双向桥接 dispatcher [`Link`]（xray-buf Reader/Writer）与 AsyncRead+AsyncWrite stream。
+///
+/// 上行：`link.reader` 读到的 MultiBuffer → 转 bytes → `stream` 写出。
+/// 下行：`stream` 读到的数据 → 转 MultiBuffer → `link.writer` 写出。
+///
+/// 任一方向 EOF 或出错时整体返回（与 [`bridge_connections`] 相同的 select 语义）。
+/// 调用方无需手动关闭——stream 在桥接结束后被 drop。
+pub async fn bridge_link_with_stream<S>(link: Link, stream: S) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use xray_buf::io::{Reader, Writer};
+    use xray_buf::multi::MultiBuffer;
+
+    let Link { mut reader, mut writer } = link;
+    let (mut s_read, mut s_write) = tokio::io::split(stream);
+
+    // 上行：link.reader → stream
+    let up = async move {
+        loop {
+            let mb = match reader.read_multi_buffer().await {
+                Ok(mb) => mb,
+                Err(_) => break,
+            };
+            if mb.is_empty() {
+                break;
+            }
+            let data = mb.to_vec();
+            if data.is_empty() {
+                break;
+            }
+            s_write.write_all(&data).await?;
+        }
+        let _ = s_write.shutdown().await;
+        io::Result::Ok(())
+    };
+
+    // 下行：stream → link.writer
+    let down = async move {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            let n = s_read.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            let mut mb = MultiBuffer::new();
+            mb.merge_bytes(&buf[..n]);
+            if writer.write_multi_buffer(mb).await.is_err() {
+                break;
+            }
+        }
+        // bridge 结束前通知读端 EOF（pipe.Writer.close）
+        writer.shutdown();
+        io::Result::Ok(())
+    };
+
+    tokio::pin!(up, down);
+    let result = tokio::select! {
+        res = &mut up => res,
+        res = &mut down => res,
+    };
+    result
 }
 
 #[cfg(test)]
@@ -192,6 +258,61 @@ mod tests {
         let mut buf = Vec::new();
         copy_one_way(&mut read, &mut buf).await.unwrap();
         assert_eq!(&buf, b"one-way data");
+    }
+
+    #[tokio::test]
+    async fn bridge_link_uplink_only() {
+        // 最小上行测试：pipe.Writer 写 → bridge up reader 读 → duplex server 端收
+        use crate::link::Link;
+        use tokio::io::AsyncReadExt;
+        use xray_buf::io::{Reader, Writer};
+        use xray_buf::multi::MultiBuffer;
+
+        let (mut server, client) = tokio::io::duplex(8192);
+        let (up_r, up_w) = xray_buf::pipe::new();
+        let (_dn_r, dn_w) = xray_buf::pipe::new();
+        let link = Link::new(Box::new(up_r), Box::new(dn_w));
+
+        let (recv, _) = tokio::join!(
+            async {
+                let mut w = up_w;
+                let mut mb = MultiBuffer::new();
+                mb.merge_bytes(b"uplink ok");
+                w.write_multi_buffer(mb).await.unwrap();
+                w.shutdown(); // pipe.Writer.close → bridge up reader EOF
+                let mut buf = vec![0u8; 64];
+                let n = server.read(&mut buf).await.unwrap();
+                buf[..n].to_vec()
+            },
+            bridge_link_with_stream(link, client),
+        );
+        assert_eq!(&recv, b"uplink ok");
+    }
+
+    #[tokio::test]
+    async fn bridge_link_downlink_only() {
+        // 最小下行测试：duplex server 端写 → bridge down reader 读 → pipe.Reader 收
+        use crate::link::Link;
+        use tokio::io::AsyncWriteExt;
+        use xray_buf::io::{Reader, Writer};
+
+        let (mut server, client) = tokio::io::duplex(8192);
+        // dn pipe：bridge 写下行数据到这里，主线程从 dn_r 读
+        let (dn_r, dn_w) = xray_buf::pipe::new();
+        // up pipe 占位：bridge 的上行 reader 在这里读，但本测试不写上行数据
+        let (dummy_r, _dummy_w) = xray_buf::pipe::new();
+        let link = Link::new(Box::new(dummy_r), Box::new(dn_w));
+
+        let (recv, _) = tokio::join!(
+            async {
+                server.write_all(b"downlink ok").await.unwrap();
+                drop(server); // 关闭触发 bridge down reader EOF
+                let mut r = dn_r;
+                r.read_multi_buffer().await.unwrap().to_vec()
+            },
+            bridge_link_with_stream(link, client),
+        );
+        assert_eq!(&recv, b"downlink ok");
     }
 
 }

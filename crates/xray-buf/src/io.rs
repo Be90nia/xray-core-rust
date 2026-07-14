@@ -94,6 +94,11 @@ pub trait Writer: Send {
         &mut self,
         mb: MultiBuffer,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+
+    /// 通知读端 EOF（对应 Go pipe.Close）。
+    /// 默认空操作；pipe.Writer override 为实际 close。
+    /// bridge 结束时调用，确保下游 reader 收到 EOF。
+    fn shutdown(&self) {}
 }
 
 // ========== Box<dyn> 实现 ==========
@@ -112,6 +117,10 @@ impl Writer for Box<dyn Writer> {
         mb: MultiBuffer,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         (**self).write_multi_buffer(mb)
+    }
+
+    fn shutdown(&self) {
+        (**self).shutdown();
     }
 }
 

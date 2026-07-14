@@ -230,9 +230,13 @@ pub trait DispatchHandler: Send + Sync + Debug {
     /// 返回 handler tag。
     fn tag(&self) -> &str;
 
-    /// 将 link 分发到出站。对应 Go `Handler.Dispatch(ctx, link)`。
-    /// 依赖 transport 全链路，具体实现待接入。
-    fn dispatch(&self, link: xray_transport::link::Link) -> PinFuture<()>;
+    /// 将 link 分发到出站，拨号到 dest 后双向桥接。
+    /// 对应 Go `Handler.Dispatch(ctx, link)`——dest 从 ctx/session 获取。
+    fn dispatch(
+        &self,
+        dest: &xray_common::net::destination::Destination,
+        link: xray_transport::link::Link,
+    ) -> PinFuture<()>;
 }
 
 /// 出站处理器管理器（对应 Go `outbound.Manager`）
@@ -425,7 +429,7 @@ impl DefaultDispatcher {
     /// 切片1 不含 sniffing/routing，直接路由到默认 outbound。
     pub fn dispatch_link(
         &self,
-        _destination: &xray_common::net::destination::Destination,
+        destination: &xray_common::net::destination::Destination,
         outbound: xray_transport::link::Link,
         _sniffing_request: &SniffingRequest,
     ) -> Result<(), DispatcherError> {
@@ -437,7 +441,7 @@ impl DefaultDispatcher {
         })?;
         // sniffing + routing 留后续切片。
         // DispatchHandler::dispatch 返回 PinFuture<()>（'static + Send），可直接 spawn。
-        let fut = handler.dispatch(outbound);
+        let fut = handler.dispatch(destination, outbound);
         tokio::spawn(async move {
             let _ = fut.await;
         });
@@ -493,6 +497,119 @@ impl CachedReader {
     pub fn interrupt(&mut self) {
         self.cache = None;
         // TODO: 调用 inner.interrupt() — xray_buf::io::Reader trait 暂无 interrupt 方法
+    }
+}
+
+// ========== DialBridge：通用 Dial→Bridge adapter ==========
+
+use xray_transport::bridge::bridge_link_with_stream;
+use xray_transport::connection::Connection;
+
+/// 拨号闭包类型：dest → Box<dyn Connection>
+pub type DialFn = Arc<
+    dyn Fn(&xray_common::net::destination::Destination) -> PinFuture<Result<Box<dyn Connection>, String>>
+        + Send
+        + Sync,
+>;
+
+/// 通用 dial→bridge adapter。
+///
+/// 接收一个拨号闭包（dest → Connection），impl [`DispatchHandler`]。
+/// `dispatch(dest, link)` 内部：`dial(dest)` → [`bridge_link_with_stream`](link, remote)。
+pub struct DialBridge {
+    tag: String,
+    dial: DialFn,
+}
+
+impl DialBridge {
+    #[must_use]
+    pub fn new(tag: impl Into<String>, dial: DialFn) -> Self {
+        Self { tag: tag.into(), dial }
+    }
+}
+
+impl std::fmt::Debug for DialBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DialBridge").field("tag", &self.tag).finish()
+    }
+}
+
+impl DispatchHandler for DialBridge {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    fn dispatch(
+        &self,
+        dest: &xray_common::net::destination::Destination,
+        link: xray_transport::link::Link,
+    ) -> PinFuture<()> {
+        let dial = Arc::clone(&self.dial);
+        let tag = self.tag.clone();
+        let dest = dest.clone();
+        Box::pin(async move {
+            match dial(&dest).await {
+                Ok(remote) => {
+                    if let Err(e) = bridge_link_with_stream(link, remote).await {
+                        tracing::warn!(tag = %tag, "bridge ended: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(tag = %tag, "dial failed: {e}");
+                }
+            }
+        })
+    }
+}
+
+// ========== SimpleOhm：简单 OutboundHandlerManager ==========
+
+/// 简单的 [`OutboundHandlerManager`]：RwLock<HashMap> + default。
+///
+/// 用于测试和简单场景。生产环境用 `proxyman::OutboundManager`。
+pub struct SimpleOhm {
+    default: std::sync::RwLock<Option<Arc<dyn DispatchHandler>>>,
+    tagged: std::sync::RwLock<std::collections::HashMap<String, Arc<dyn DispatchHandler>>>,
+}
+
+impl SimpleOhm {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            default: std::sync::RwLock::new(None),
+            tagged: std::sync::RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+
+    pub fn set_default(&self, handler: Arc<dyn DispatchHandler>) {
+        *self.default.write().unwrap() = Some(handler);
+    }
+
+    #[allow(dead_code)]
+    pub fn add(&self, tag: &str, handler: Arc<dyn DispatchHandler>) {
+        self.tagged.write().unwrap().insert(tag.to_string(), handler);
+    }
+}
+
+impl std::fmt::Debug for SimpleOhm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimpleOhm").finish()
+    }
+}
+
+impl Default for SimpleOhm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OutboundHandlerManager for SimpleOhm {
+    fn get_handler(&self, tag: &str) -> Option<Arc<dyn DispatchHandler>> {
+        self.tagged.read().unwrap().get(tag).cloned()
+    }
+
+    fn get_default_handler(&self) -> Option<Arc<dyn DispatchHandler>> {
+        self.default.read().unwrap().clone()
     }
 }
 
@@ -696,14 +813,13 @@ mod tests {
             fn tag(&self) -> &str {
                 "mock"
             }
-            fn dispatch(&self, _link: xray_transport::link::Link) -> PinFuture<()> {
+            fn dispatch(&self, _dest: &xray_common::net::destination::Destination, _link: xray_transport::link::Link) -> PinFuture<()> {
                 let c = self.called.clone();
                 Box::pin(async move {
                     c.fetch_add(1, Ordering::SeqCst);
                 })
             }
         }
-
         // Mock OutboundHandlerManager 返回 MockHandler
         #[derive(Debug)]
         struct MockOhm {
@@ -787,5 +903,79 @@ mod tests {
         );
         let r = d.dispatch(&dest, &SniffingRequest::default());
         assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_e2e_dial_bridge_to_echo_server() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+        use xray_buf::io::{Reader, Writer};
+        use xray_buf::multi::MultiBuffer;
+        use xray_common::net::address::Address;
+        use xray_common::net::destination::Destination;
+        use xray_common::net::network::Network;
+        use xray_common::net::port::Port;
+        use xray_transport::connection::TcpConnection;
+
+        // 1. echo server
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let _ = sock.write_all(&buf[..n]).await;
+                    }
+                }
+            }
+        });
+
+        // 2. DialBridge with TCP connect
+        let dial: DialFn = Arc::new(move |_dest: &Destination| {
+            Box::pin(async move {
+                let stream = TcpStream::connect(("127.0.0.1", echo_port))
+                    .await
+                    .map_err(|e| format!("connect: {e}"))?;
+                Ok(Box::new(TcpConnection::new(stream)) as Box<dyn Connection>)
+            })
+        });
+
+        // 3. dispatcher + SimpleOhm
+        let ohm = SimpleOhm::new();
+        ohm.set_default(Arc::new(DialBridge::new("test-freedom", dial)));
+        let mut d = DefaultDispatcher::new();
+        d.ohm = Some(Arc::new(ohm));
+
+        // 4. dispatch → inbound Link
+        let dest = Destination::new(
+            Address::from_ipv4_bytes([127, 0, 0, 1]),
+            Port::new(echo_port),
+            Network::TCP,
+        );
+        let inbound = d
+            .dispatch(&dest, &SniffingRequest::default())
+            .expect("dispatch returns inbound Link");
+
+        // 5. 写上行 → dispatcher spawn bridge → dial → echo → 读下行
+        let mut w = inbound.writer;
+        let mut r = inbound.reader;
+
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(b"e2e dispatch bridge");
+        w.write_multi_buffer(mb).await.unwrap();
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            r.read_multi_buffer(),
+        )
+        .await
+        .expect("timeout waiting for echo response")
+        .unwrap();
+
+        assert_eq!(resp.to_vec(), b"e2e dispatch bridge");
+        w.shutdown(); // 关闭触发 bridge 结束
     }
 }
