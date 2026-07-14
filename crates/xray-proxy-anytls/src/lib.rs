@@ -19,15 +19,16 @@
 //! - [`socks::SocksAddr`]——SOCKS5 ATYP+ADDR+PORT 编解码
 //!
 //! 未实现（留 dispatcher 接入后）：
-//! - 接入 `xray-features::OutboundHandler` trait（现有 trait dial 返回 `()`，桥接层待切片3）
 //! - server 端 inbound（待 dispatcher 接入后做）
 
 pub mod client;
+pub mod dispatcher;
 pub mod error;
 pub mod server;
 pub mod socks;
 
 pub use client::{AnytlsClient, AnytlsConn, ClientConfig};
+pub use dispatcher::{make_dial_fn as make_anytls_dial_fn, AnytlsConnection};
 pub use error::{AnytlsError, Result};
 pub use server::AnytlsMockServer;
 pub use socks::SocksAddr;

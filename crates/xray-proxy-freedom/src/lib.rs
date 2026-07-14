@@ -9,6 +9,7 @@
 //! Handler/Process/dial/retry + IP CIDR 匹配留切片2。
 
 pub mod config;
+pub mod dispatcher;
 pub mod error;
 pub mod handler;
 
@@ -19,3 +20,4 @@ pub use config::{
 };
 pub use error::{FreedomError, Result};
 pub use handler::FreedomHandler;
+pub use dispatcher::make_dial_fn as make_freedom_dial_fn;

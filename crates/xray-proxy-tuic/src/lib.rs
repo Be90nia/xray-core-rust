@@ -16,11 +16,13 @@
 //! - 自定义 congestion controller（BBR/Brutal）
 
 pub mod client;
+pub mod dispatcher;
 pub mod error;
 pub mod protocol;
 pub mod server;
 
 pub use client::{TuicClient, TuicConn};
+pub use dispatcher::{make_dial_fn as make_tuic_dial_fn, TuicConnection};
 pub use error::{Result, TuicError};
 pub use protocol::{Address, Command, TOKEN_LEN, VERSION};
 pub use server::TuicMockServer;

@@ -18,6 +18,7 @@
 
 pub mod client;
 pub mod config;
+pub mod dispatcher;
 pub mod error;
 pub mod protocol;
 pub mod server;
@@ -31,3 +32,4 @@ pub use protocol::{
 };
 pub use validator::{MemoryUser, Validator};
 pub use server::{TrojanServer, trojan_server_handshake};
+pub use dispatcher::{make_dial_fn as make_trojan_dial_fn, TrojanOutboundConfig};

@@ -21,6 +21,7 @@ prost = { workspace = true }
 
 xray-proto = { path = "../xray-proto" }
 xray-transport = { path = "../xray-transport" }
+xray-app-dispatcher = { path = "../xray-app-dispatcher" }
 async-trait = "0.1"
 # - sha2：SHA224(password) hex hash 用户验证
 sha2 = "0.10"

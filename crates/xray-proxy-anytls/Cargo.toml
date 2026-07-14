@@ -7,6 +7,8 @@ rust-version.workspace = true
 
 [dependencies]
 xray-common = { path = "../xray-common" }
+xray-transport = { path = "../xray-transport" }
+xray-app-dispatcher = { path = "../xray-app-dispatcher" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
@@ -17,3 +19,5 @@ tracing = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 rcgen = "0.13"
+xray-buf = { path = "../xray-buf" }
+xray-app-dispatcher = { path = "../xray-app-dispatcher" }
