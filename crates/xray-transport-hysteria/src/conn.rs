@@ -71,6 +71,14 @@ pub trait QuicConn: Send + Sync {
 
     /// 远端地址。
     fn remote_addr(&self) -> SocketAddr;
+
+    /// 尝试取内部 quinn::Connection 引用（用于 quinn adapter 实现 open_stream）。
+    ///
+    /// 默认 `None`；quinn adapter 实现返回 `Some`。
+    /// ponytail: 不用 Any downcast——避免 trait 增加静态要求。adapter 接口扩展点。
+    fn as_quinn_connection(&self) -> Option<&quinn::Connection> {
+        None
+    }
 }
 
 /// QUIC stream 包装的 TCP-style 连接（对应 Go `interConn`）。

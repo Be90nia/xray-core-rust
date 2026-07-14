@@ -198,6 +198,10 @@ impl QuicConn for QuinnQuicConn {
     fn remote_addr(&self) -> SocketAddr {
         self.conn.remote_address()
     }
+
+    fn as_quinn_connection(&self) -> Option<&quinn::Connection> {
+        Some(&self.conn)
+    }
 }
 
 #[cfg(test)]

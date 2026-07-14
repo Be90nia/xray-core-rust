@@ -47,7 +47,7 @@ pub mod hub;
 pub mod proto_config;
 pub mod udphop;
 pub mod quinn_adapter;
-
+pub mod hysteria_transport;
 pub use config::{
     AuthRequestPadding, AuthResponsePadding, CommonHeaderCCRX, CommonHeaderPadding,
     FrameTypeTCPRequest, MaxDatagramFrameSize, RequestHeaderAuth, ResponseHeaderUDPEnabled,

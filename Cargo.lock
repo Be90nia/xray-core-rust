@@ -4689,6 +4689,10 @@ name = "xray-transport-hysteria"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "h3",
+ "h3-quinn",
+ "hex",
+ "http",
  "parking_lot",
  "quinn",
  "rand 0.9.4",
