@@ -1,0 +1,21 @@
+[package]
+name = "xray-proxy-tuic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+xray-common = { path = "../xray-common" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+quinn = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+rcgen = "0.13"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

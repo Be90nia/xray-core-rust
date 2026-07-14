@@ -4355,6 +4355,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "xray-proxy-tuic"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "quinn",
+ "rcgen 0.13.2",
+ "rustls",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "uuid",
+ "xray-common",
+]
+
+[[package]]
 name = "xray-proxy-tun"
 version = "0.1.0"
 dependencies = [

@@ -58,6 +58,7 @@ members = [
     "crates/xray-proxy-tun",
     "crates/xray-proxy-wireguard",
     "crates/xray-proxy-anytls",
+    "crates/xray-proxy-tuic",
 
     # Layer 6 - 配置
     "crates/xray-conf",
