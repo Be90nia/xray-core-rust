@@ -32,6 +32,9 @@ use xray_proxy_trojan::{serve_trojan, MemoryAccount as TrojanMemoryAccount, Memo
 use xray_proxy_vless::{serve_vless, MemoryAccount as VlessMemoryAccount, MemoryUser as VlessMemoryUser, MemoryValidator as VlessMemoryValidator, Validator as VlessValidator};
 use xray_proxy_vmess::{serve_vmess, MemoryAccount as VmessMemoryAccount, MemoryUser as VmessMemoryUser, TimedUserValidator as VmessTimedUserValidator, Validator as VmessValidator};
 use xray_common::uuid::UUID;
+// tdy: http + dokodemo inbound 集成
+use xray_proxy_http::ServerConfig as HttpServerConfig;
+use xray_proxy_http::server::http_server_handshake;
 
 /// SOCKS5 inbound 服务入口。
 ///
@@ -120,6 +123,81 @@ fn socks_addr_to_destination(addr: &SocksAddr) -> std::io::Result<Destination> {
     Ok(Destination::new(address, Port::new(addr.port), Network::TCP))
 }
 
+/// HTTP proxy inbound 服务入口（tdy）。
+///
+/// 接受连接 → http_server_handshake → 拆 stream → dispatch。
+/// 当前只 dispatch CONNECT 隧道；普通 HTTP 代理（GET/POST 等）暂不支持，留切片3。
+pub async fn serve_http(
+    listener: TcpListener,
+    ohm: Arc<SimpleOhm>,
+    config: Arc<HttpServerConfig>,
+) -> std::io::Result<()> {
+    let handler = ohm
+        .get_default_handler()
+        .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
+    tracing::info!(addr = %listener.local_addr()?, "http proxy inbound listening");
+    loop {
+        let (mut stream, _peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "http accept failed");
+                continue;
+            }
+        };
+        let handler = Arc::clone(&handler);
+        let config = Arc::clone(&config);
+        tokio::spawn(async move {
+            // 1. handshake → (dest, method)
+            let (dest, method) = match http_server_handshake(&mut stream, &config).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(error = %e, "http handshake failed");
+                    return;
+                }
+            };
+            // 2. 只 dispatch CONNECT（plain HTTP 留切片3）
+            if method != "CONNECT" {
+                tracing::debug!(method = %method, "plain HTTP proxy not yet supported, skipping");
+                return;
+            }
+            // 3. 拆 stream → Link → dispatch
+            let (read_half, write_half) = tokio::io::split(stream);
+            let link = Link::new(new_reader(read_half), new_writer(write_half));
+            let _ = handler.dispatch(&dest, link).await;
+        });
+    }
+}
+
+/// Dokodemo-door inbound 服务入口（tdy）。
+///
+/// 接受连接 → 直接用预定义 `dest` 拼装 Link → dispatch（dokodemo 无握手协议）。
+pub async fn serve_dokodemo(
+    listener: TcpListener,
+    ohm: Arc<SimpleOhm>,
+    dest: Destination,
+) -> std::io::Result<()> {
+    let handler = ohm
+        .get_default_handler()
+        .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
+    tracing::info!(addr = %listener.local_addr()?, dest = ?dest, "dokodemo inbound listening");
+    loop {
+        let (stream, _peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "dokodemo accept failed");
+                continue;
+            }
+        };
+        let handler = Arc::clone(&handler);
+        let dest = dest.clone();
+        tokio::spawn(async move {
+            let (read_half, write_half) = tokio::io::split(stream);
+            let link = Link::new(new_reader(read_half), new_writer(write_half));
+            let _ = handler.dispatch(&dest, link).await;
+        });
+    }
+}
+
 /// 遍历 BuiltConfig 的 inbounds，按协议 spawn listener tasks。
 ///
 /// 返回每个 inbound 的 JoinHandle（用于优雅关闭）。不支持的协议 warn 跳过。
@@ -205,6 +283,28 @@ async fn spawn_one_inbound(
             });
             Ok(Some(handle))
         }
+        "http" => {
+            let config = parse_http_config(&ib.entry.data)?;
+            let listener = TcpListener::bind(&addr).await?;
+            tracing::info!(tag = %ib.tag, addr = %addr, "http inbound listening");
+            let handle = tokio::spawn(async move {
+                if let Err(e) = serve_http(listener, ohm, Arc::new(config)).await {
+                    tracing::error!(error = %e, "http inbound stopped");
+                }
+            });
+            Ok(Some(handle))
+        }
+        "dokodemo" => {
+            let dest = parse_dokodemo_dest(&ib.entry.data)?;
+            let listener = TcpListener::bind(&addr).await?;
+            tracing::info!(tag = %ib.tag, addr = %addr, dest = ?dest, "dokodemo inbound listening");
+            let handle = tokio::spawn(async move {
+                if let Err(e) = serve_dokodemo(listener, ohm, dest).await {
+                    tracing::error!(error = %e, "dokodemo inbound stopped");
+                }
+            });
+            Ok(Some(handle))
+        }
         other => {
             tracing::warn!(
                 tag = %ib.tag,
@@ -268,6 +368,47 @@ fn build_trojan_users(data: &[u8]) -> std::io::Result<HashMap<String, TrojanMemo
     Ok(users)
 }
 
+
+/// 从 inbound entry.data（JSON）解析 http accounts → HttpServerConfig。
+///
+/// JSON 格式：`{"accounts":[{"user":"u","pass":"p"}]}`（用户可选）
+fn parse_http_config(data: &[u8]) -> std::io::Result<HttpServerConfig> {
+    let v: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| std::io::Error::other(format!("http inbound settings JSON: {e}")))?;
+    let mut config = HttpServerConfig::default();
+    if let Some(accounts) = v.get("accounts").and_then(|c| c.as_array()) {
+        for a in accounts {
+            let user = a.get("user").and_then(|x| x.as_str()).unwrap_or("");
+            let pass = a.get("pass").and_then(|x| x.as_str()).unwrap_or("");
+            if !user.is_empty() {
+                config.accounts.insert(user.to_string(), pass.to_string());
+            }
+        }
+    }
+    Ok(config)
+}
+
+/// 从 inbound entry.data（JSON）解析 dokodemo 配置 → Destination（预定义目标）。
+///
+/// JSON 格式：`{"address":"1.2.3.4","port":80,"network":"tcp"}`（address+port 必填）
+fn parse_dokodemo_dest(data: &[u8]) -> std::io::Result<Destination> {
+    let v: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| std::io::Error::other(format!("dokodemo inbound settings JSON: {e}")))?;
+    let address_str = v.get("address").and_then(|x| x.as_str())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "dokodemo: missing address"))?;
+    let port = v.get("port").and_then(|x| x.as_u64())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "dokodemo: missing port"))?
+        as u16;
+    // address 是 IPv4/IPv6/Domain 之一
+    let address = if let Ok(v4) = address_str.parse::<std::net::Ipv4Addr>() {
+        Address::IPv4(v4)
+    } else if let Ok(v6) = address_str.parse::<std::net::Ipv6Addr>() {
+        Address::IPv6(v6)
+    } else {
+        Address::Domain(address_str.to_string())
+    };
+    Ok(Destination::new(address, Port::new(port), Network::TCP))
+}
 
 /// 从 inbound entry.data（JSON）解析 vmess clients → TimedUserValidator。
 ///
@@ -484,6 +625,56 @@ mod tests {
         let settings = serde_json::json!({ "clients": [{ "id": "not-a-uuid" }] });
         let data = serde_json::to_vec(&settings).unwrap();
         assert!(super::build_vmess_validator(&data).is_err());
+    }
+
+    #[test]
+    fn parse_http_config_extracts_accounts() {
+        let settings = serde_json::json!({
+            "accounts": [{ "user": "u1", "pass": "p1" }, { "user": "u2", "pass": "p2" }]
+        });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let cfg = super::parse_http_config(&data).unwrap();
+        assert_eq!(cfg.accounts.get("u1").unwrap(), "p1");
+        assert_eq!(cfg.accounts.get("u2").unwrap(), "p2");
+    }
+
+    #[test]
+    fn parse_http_config_empty_returns_default() {
+        let data = b"{}";
+        let cfg = super::parse_http_config(data).unwrap();
+        assert!(cfg.accounts.is_empty());
+    }
+
+    #[test]
+    fn parse_dokodemo_dest_ipv4() {
+        let settings = serde_json::json!({ "address": "192.168.1.1", "port": 8080 });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let dest = super::parse_dokodemo_dest(&data).unwrap();
+        assert!(matches!(dest.address(), Address::IPv4(_)));
+        assert_eq!(dest.port().value(), 8080);
+    }
+
+    #[test]
+    fn parse_dokodemo_dest_domain() {
+        let settings = serde_json::json!({ "address": "example.com", "port": 443 });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let dest = super::parse_dokodemo_dest(&data).unwrap();
+        assert!(matches!(dest.address(), Address::Domain(_)));
+        assert_eq!(dest.port().value(), 443);
+    }
+
+    #[test]
+    fn parse_dokodemo_dest_missing_address_returns_err() {
+        let settings = serde_json::json!({ "port": 80 });
+        let data = serde_json::to_vec(&settings).unwrap();
+        assert!(super::parse_dokodemo_dest(&data).is_err());
+    }
+
+    #[test]
+    fn parse_dokodemo_dest_missing_port_returns_err() {
+        let settings = serde_json::json!({ "address": "1.2.3.4" });
+        let data = serde_json::to_vec(&settings).unwrap();
+        assert!(super::parse_dokodemo_dest(&data).is_err());
     }
 
     #[test]
