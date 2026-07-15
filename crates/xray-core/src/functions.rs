@@ -84,7 +84,30 @@ pub fn start_from_built(built: &xray_conf::BuiltConfig) -> Result<Arc<Instance>,
 /// 返回 `(Arc<Instance>, Arc<SimpleOhm>, inbound JoinHandles)`。
 ///
 /// 调用方需在 tokio runtime 中调用，并持有 JoinHandles 以管理 inbound listener 生命周期。
+///
+/// # Routing 自动接入
+///
+/// 如果 `built.apps` 含 `kind="routing"` 项，自动解析为 [`PatternRouter`](crate::router::PatternRouter)
+/// 并包装为 [`RoutingHandler`]。否则走纯 default outbound 路径。
 pub async fn start_full(
+    built: &xray_conf::BuiltConfig,
+) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
+    // 检查是否有 routing app
+    let router_opt: Option<Arc<dyn DispatchRouter>> = built
+        .apps
+        .iter()
+        .find(|a| a.kind == "routing")
+        .and_then(|a| crate::router::PatternRouter::from_json(&a.data).ok())
+        .map(|r| Arc::new(r) as Arc<dyn DispatchRouter>);
+
+    match router_opt {
+        Some(router) => start_full_with_router(built, router).await,
+        None => start_full_no_router(built).await,
+    }
+}
+
+/// 无 routing 的启动路径（内部辅助）。
+async fn start_full_no_router(
     built: &xray_conf::BuiltConfig,
 ) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
     let mut instance = Instance::new_from_built(built)?;
