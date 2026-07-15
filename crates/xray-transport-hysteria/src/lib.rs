@@ -60,6 +60,7 @@ pub use error::{HysteriaError, Result};
 pub use hub::{HysteriaListenerFactory, MasqType};
 pub use proto_config::{Config, default_config};
 pub use udphop::UdpHopPacketConn;
+pub mod register;
 
 /// 协议名（对应 Go `const protocolName = "hysteria"`）。
 pub const PROTOCOL_NAME: &str = "hysteria";

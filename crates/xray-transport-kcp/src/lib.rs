@@ -61,6 +61,7 @@ pub mod sending;
 pub mod state;
 pub mod updater;
 pub mod udp_hub;
+pub mod register;
 
 /// 协议名（对应 Go `ProtocolName = "mkcp"`）。
 pub const PROTOCOL_NAME: &str = "mkcp";

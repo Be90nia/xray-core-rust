@@ -26,6 +26,10 @@ rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
 rustls-pki-types = { workspace = true }
+# REALITY 配置从 JSON 解析需要 base64（publicKey）+ hex（shortId）
+base64 = "0.22"
+hex = "0.4"
+serde_json = { workspace = true }
 rcgen = "0.13"
 
 
