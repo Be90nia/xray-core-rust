@@ -8,6 +8,8 @@
 //! - **freedom**：完整支持（无 settings）
 //! - **vless**：JSON 解析 `vnext` → [`VlessOutboundConfig`] → `make_dial_fn`（raw TCP，不含 streamSettings）
 //! - **trojan**：JSON 解析 `servers` → [`TrojanOutboundConfig`] → `make_dial_fn`（raw TCP，不含 streamSettings）
+//! - **blackhole**：JSON 解析 `response.type` → [`BlackholeHandler`]（DispatchHandler，不拨号）
+//! - **socks**：JSON 解析 `servers[0]` → [`SocksClient`] + `make_socks_dial_fn`（SOCKS5 outbound）
 //! - 其他协议（anytls/tuic/vmess/...）：warn 跳过（需 TLS transport 层，待后续切片）
 //!
 //! ## streamSettings
@@ -91,6 +93,27 @@ fn try_build_handler(
             let dial_fn = xray_proxy_trojan::make_trojan_dial_fn(Arc::new(config));
             Ok(Arc::new(DialBridge::new(ob.tag.clone(), dial_fn)))
         }
+        "blackhole" => {
+            // blackhole 是 DispatchHandler（不是拨号型），直接 Arc<dyn DispatchHandler>
+            let response = parse_blackhole_response(&ob.entry.data);
+            Ok(Arc::new(xray_proxy_blackhole::BlackholeHandler::with_response(
+                ob.tag.clone(),
+                response,
+            )))
+        }
+        "socks" => {
+            let (server_addr, auth) = parse_socks_outbound_config(&ob.entry.data)?;
+            let client = Arc::new(match auth {
+                Some((u, p)) => xray_proxy_socks::SocksClient::new(
+                    xray_proxy_socks::ClientConfig::new_with_auth(server_addr, u, p),
+                ),
+                None => xray_proxy_socks::SocksClient::new(
+                    xray_proxy_socks::ClientConfig::new_noauth(server_addr),
+                ),
+            });
+            let dial_fn = xray_proxy_socks::make_socks_dial_fn(client);
+            Ok(Arc::new(DialBridge::new(ob.tag.clone(), dial_fn)))
+        }
         other => Err(BuildError::Unsupported(other.to_string())),
     }
 }
@@ -159,6 +182,63 @@ fn parse_trojan_config(data: &[u8]) -> std::result::Result<TrojanOutboundConfig,
         Address::Domain(address.to_string()),
         Port::new(u16::try_from(port).map_err(|_| "port out of range")?),
     ))
+}
+
+/// 解析 blackhole outbound settings JSON → ResponseConfig。
+///
+/// JSON 格式（Go `proxy/blackhole/config.go`）：
+/// - `{}` 或无 `response` → None
+/// - `{ "response": { "type": "none" } }` → None
+/// - `{ "response": { "type": "http" } }` → Http403
+fn parse_blackhole_response(data: &[u8]) -> xray_proxy_blackhole::ResponseConfig {
+    use xray_proxy_blackhole::ResponseConfig;
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(data) else {
+        return ResponseConfig::None;
+    };
+    let Some(resp) = v.get("response") else {
+        return ResponseConfig::None;
+    };
+    match resp.get("type").and_then(|t| t.as_str()) {
+        Some("http") => ResponseConfig::Http403,
+        _ => ResponseConfig::None,
+    }
+}
+
+/// 解析 socks outbound settings JSON → (server_addr, optional (user, pass)).
+///
+/// JSON 格式（Go `proxy/socks/config.go`）：
+/// `{ "servers": [{ "address": "...", "port": 1080, "users": [{ "user": "u", "pass": "p" }] }] }`
+fn parse_socks_outbound_config(
+    data: &[u8],
+) -> std::result::Result<(String, Option<(String, String)>), String> {
+    let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
+    let servers = v
+        .get("servers")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "missing servers array".to_string())?;
+    let first = servers
+        .first()
+        .ok_or_else(|| "servers array is empty".to_string())?;
+    let address = first
+        .get("address")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing servers[0].address".to_string())?;
+    let port = first
+        .get("port")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "missing servers[0].port".to_string())?;
+    let server_addr = format!("{address}:{}", u16::try_from(port).map_err(|_| "port out of range")?);
+    // users[0] 可选
+    let auth = first
+        .get("users")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|u| {
+            let user = u.get("user")?.as_str()?.to_string();
+            let pass = u.get("pass")?.as_str()?.to_string();
+            Some((user, pass))
+        });
+    Ok((server_addr, auth))
 }
 
 /// 从 outbound 的 stream_settings_json 构造 StreamSettings。
@@ -366,5 +446,55 @@ mod tests {
         let s = parse_stream_settings(&Some(v)).unwrap();
         assert_eq!(s.protocol, "ws");
         assert!(s.is_tls());
+    }
+
+    #[test]
+    fn register_blackhole_parses_response() {
+        // 默认 response（空 settings）→ None
+        let mut built = BuiltConfig::default();
+        built.outbounds.push(make_outbound("blackhole", "bh", "{}"));
+        let ohm = SimpleOhm::new();
+        register_outbounds(&built, &ohm).unwrap();
+        assert!(ohm.get_handler("bh").is_some(), "blackhole should register");
+    }
+
+    #[test]
+    fn register_blackhole_http_response_type() {
+        // ponytail: blackhole response.type=http 注册不报错即可（dispatch 行为已在 blackhole crate 测过）
+        let settings = r#"{"response":{"type":"http"}}"#;
+        let mut built = BuiltConfig::default();
+        built.outbounds.push(make_outbound("blackhole", "bh-http", settings));
+        let ohm = SimpleOhm::new();
+        register_outbounds(&built, &ohm).unwrap();
+        assert!(ohm.get_handler("bh-http").is_some());
+    }
+
+    #[test]
+    fn register_socks_outbound_parses_noauth() {
+        let settings = r#"{"servers":[{"address":"1.2.3.4","port":1080}]}"#;
+        let mut built = BuiltConfig::default();
+        built.outbounds.push(make_outbound("socks", "socks-out", settings));
+        let ohm = SimpleOhm::new();
+        register_outbounds(&built, &ohm).unwrap();
+        assert!(ohm.get_handler("socks-out").is_some(), "socks outbound should register");
+    }
+
+    #[test]
+    fn register_socks_outbound_parses_auth() {
+        let settings = r#"{"servers":[{"address":"1.2.3.4","port":1080,"users":[{"user":"u","pass":"p"}]}]}"#;
+        let mut built = BuiltConfig::default();
+        built.outbounds.push(make_outbound("socks", "socks-auth", settings));
+        let ohm = SimpleOhm::new();
+        register_outbounds(&built, &ohm).unwrap();
+        assert!(ohm.get_handler("socks-auth").is_some());
+    }
+
+    #[test]
+    fn register_socks_missing_servers_skipped() {
+        let mut built = BuiltConfig::default();
+        built.outbounds.push(make_outbound("socks", "bad-socks", "{}"));
+        let ohm = SimpleOhm::new();
+        register_outbounds(&built, &ohm).unwrap();
+        assert!(ohm.get_handler("bad-socks").is_none());
     }
 }

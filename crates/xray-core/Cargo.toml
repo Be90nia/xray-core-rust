@@ -15,6 +15,7 @@ xray-proxy-vless = { path = "../xray-proxy-vless" }
 xray-proxy-trojan = { path = "../xray-proxy-trojan" }
 xray-proxy-vmess = { path = "../xray-proxy-vmess" }
 xray-proxy-socks = { path = "../xray-proxy-socks" }
+xray-proxy-blackhole = { path = "../xray-proxy-blackhole" }
 xray-buf = { path = "../xray-buf" }
 xray-transport = { path = "../xray-transport" }
 xray-proto = { path = "../xray-proto" }

@@ -4241,6 +4241,7 @@ dependencies = [
  "xray-conf",
  "xray-features",
  "xray-proto",
+ "xray-proxy-blackhole",
  "xray-proxy-freedom",
  "xray-proxy-socks",
  "xray-proxy-trojan",
@@ -4337,10 +4338,12 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "xray-app-dispatcher",
  "xray-buf",
  "xray-common",
  "xray-features",
  "xray-proto",
+ "xray-transport",
 ]
 
 [[package]]
@@ -4440,6 +4443,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "xray-app-dispatcher",
  "xray-buf",
  "xray-common",
  "xray-features",
