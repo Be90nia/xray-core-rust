@@ -73,11 +73,93 @@ use crate::sockopt::SocketOptions;
 /// Transport 协议拨号函数签名。对应 Go `dialFunc`。
 ///
 /// 每个协议注册一个此类型函数，接收目标地址 + socket 选项，返回包装后的 Connection。
+/// Transport 协议拨号函数签名。对应 Go `dialFunc`。
+///
+/// 每个协议注册一个此类型函数，接收目标地址 + socket 选项 + streamSettings（含 transport/security 配置），
+/// 返回包装后的 Connection。
 pub type TransportDialFn = Arc<
-    dyn Fn(&Destination, &SocketOptions) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Connection>>> + Send>>
+    dyn Fn(&Destination, &SocketOptions, &StreamSettings) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Connection>>> + Send>>
         + Send
         + Sync,
 >;
+
+/// 传输层流设置。对应 Go `transport/internet/config.go::MemoryStreamConfig`（精简版）。
+///
+/// 承载拨号所需的全部上下文：协议名（tcp/websocket/grpc/...）、协议特定配置 JSON、
+/// 安全设置（tls/reality/none）及其配置 JSON、socket 选项已由参数级 `SocketOptions` 承载。
+///
+/// `transport_json` / `security_json` 为原始 `serde_json::Value`，由各 transport crate 自行解析
+/// 成自己的强类型 `Config`（与 Go 端 `ProtocolSettings proto.Message` 弱类型对应）。
+#[derive(Debug, Clone, Default)]
+pub struct StreamSettings {
+    /// 传输协议名（`"tcp"` / `"websocket"` / `"grpc"` / `"httpupgrade"` / `"splithttp"` / ...）。
+    /// 空字符串视为 `"tcp"`。
+    pub protocol: String,
+    /// 安全层名（`"none"` / `"tls"` / `"reality"`）。空或 `"none"` 表示无 TLS。
+    pub security: String,
+    /// 传输层配置 JSON（对应 Go `ProtocolSettings`）。各协议 crate 自行 `serde_json::from_value`。
+    pub transport_json: Option<serde_json::Value>,
+    /// 安全层配置 JSON（对应 Go TLS/Reality Config）。
+    pub security_json: Option<serde_json::Value>,
+}
+
+impl StreamSettings {
+    /// 构造默认 TCP + 无 TLS 的 stream settings（等价 Go `ToMemoryStreamConfig(nil)`）。
+    #[must_use]
+    pub fn tcp() -> Self {
+        Self {
+            protocol: "tcp".to_string(),
+            security: String::new(),
+            transport_json: None,
+            security_json: None,
+        }
+    }
+
+    /// 从 outbound/inbound 的 `streamSettings` JSON 对象解析。
+    ///
+    /// JSON 格式（Go `StreamConfig` JSON）：
+    /// `{ "network": "ws", "security": "tls", "tlsSettings": {...}, "wsSettings": {...} }`
+    ///
+    /// # 参数
+    /// - `json`：`Some(v)` 取 `network` / `security` / `<proto>Settings` / `tlsSettings` / `realitySettings`；
+    ///   `None` 返回默认 TCP。
+    pub fn from_json(json: Option<&serde_json::Value>) -> Self {
+        let Some(v) = json else { return Self::tcp(); };
+        let protocol = v.get("network").and_then(|n| n.as_str()).unwrap_or("tcp").to_string();
+        let security = v.get("security").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        // 协议特定配置：尝试 `<protocol>Settings`（如 `wsSettings`/`grpcSettings`/`tcpSettings`）。
+        // Go JSON 解析器约定 `network` 值与 settings 字段名对应（`tcp`→`tcpSettings`, `ws`→`wsSettings`, ...）。
+        let transport_json = protocol_settings_key(&protocol)
+            .and_then(|k| v.get(k).cloned());
+        // 安全配置：`tlsSettings` 或 `realitySettings`。
+        let security_json = v.get("tlsSettings").cloned().or_else(|| v.get("realitySettings").cloned());
+        Self { protocol, security, transport_json, security_json }
+    }
+
+    /// 是否启用 TLS（`security == "tls"` 或 `security == "reality"`）。
+    #[must_use]
+    pub fn is_tls(&self) -> bool {
+        matches!(self.security.as_str(), "tls" | "reality")
+    }
+}
+
+/// 把 `network` 值映射到对应 JSON settings 字段名。
+///
+/// Go `infra/conf/transport_internet.go::transportConfigCreator` 按字符串名注册 creator，
+/// JSON 字段名约定为 `<proto>Settings`。Rust 端镜像该映射。
+fn protocol_settings_key(protocol: &str) -> Option<&'static str> {
+    match protocol {
+        "tcp" | "raw" => Some("tcpSettings"),
+        "kcp" | "mkcp" => Some("kcpSettings"),
+        "ws" | "websocket" => Some("wsSettings"),
+        "http" | "h2" | "grpc" => Some("grpcSettings"),
+        "httpupgrade" => Some("httpupgradeSettings"),
+        "splithttp" | "xhttp" => Some("splithttpSettings"),
+        "quic" => Some("quicSettings"),
+        "domainsocket" => Some("dsSettings"),
+        _ => None,
+    }
+}
 
 /// Transport dialer 全局注册表。对应 Go `transportDialerCache`。
 static TRANSPORT_DIALER_CACHE: OnceLock<RwLock<HashMap<String, TransportDialFn>>> = OnceLock::new();
@@ -118,23 +200,54 @@ pub fn get_transport_dialer(protocol: &str) -> Option<TransportDialFn> {
 ///
 /// - `NotFound`：protocol 未注册
 /// - dialer 内部错误透传
+/// 上层 transport 拨号（旧入口，等价于 `dial_with_settings(dest, &StreamSettings::tcp(), sockopt)`）。
+///
+/// **新代码应优先使用 [`dial_with_settings`] / [`dial`]。** 本函数保留向后兼容。
 pub async fn dial_transport(
     protocol: &str,
     destination: &Destination,
     sockopt: &SocketOptions,
 ) -> io::Result<Box<dyn Connection>> {
-    // TCP 协议走 system dialer（含 sockopt）。
+    let settings = StreamSettings { protocol: protocol.to_string(), ..StreamSettings::tcp() };
+    dial_with_settings(protocol, destination, sockopt, &settings).await
+}
+
+/// 按 protocol 名查 transport dialer 并传入完整 streamSettings 拨号。
+///
+/// 对应 Go `transportDialerCache[protocol](ctx, dest, streamSettings)`。
+/// TCP 协议（`"tcp"` / `"raw"`）走 [`system_dialer::dial_system`]。
+pub async fn dial_with_settings(
+    protocol: &str,
+    destination: &Destination,
+    sockopt: &SocketOptions,
+    settings: &StreamSettings,
+) -> io::Result<Box<dyn Connection>> {
     if protocol == "tcp" || protocol == "raw" {
         return crate::system_dialer::dial_system(destination, sockopt).await;
     }
-    // 其他协议查注册表。
     match get_transport_dialer(protocol) {
-        Some(dialer_fn) => dialer_fn(destination, sockopt).await,
+        Some(dialer_fn) => dialer_fn(destination, sockopt, settings).await,
         None => Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!("{protocol} dialer not registered"),
         )),
     }
+}
+
+/// 顶层 transport 入口。对应 Go `transport/internet/dialer.go::Dial`。
+///
+/// 按 `settings.protocol` 查 transport dialer。`settings = None` 等价 TCP 裸连。
+///
+/// # 错误
+///
+/// - `NotFound`：protocol 未注册
+/// - dialer 内部错误透传
+pub async fn dial(
+    destination: &Destination,
+    settings: &StreamSettings,
+    sockopt: &SocketOptions,
+) -> io::Result<Box<dyn Connection>> {
+    dial_with_settings(&settings.protocol, destination, sockopt, settings).await
 }
 
 #[cfg(test)]
@@ -146,7 +259,7 @@ mod transport_cache_tests {
 
     #[test]
     fn register_and_get_transport_dialer() {
-        let dialer: TransportDialFn = Arc::new(|_dest: &Destination, _sockopt: &SocketOptions| {
+        let dialer: TransportDialFn = Arc::new(|_dest: &Destination, _sockopt: &SocketOptions, _s: &StreamSettings| {
             Box::pin(async { Err(io::Error::new(io::ErrorKind::Other, "test")) })
         });
         // 注册（如果之前已注册同名，忽略 AlreadyExists）。
@@ -156,7 +269,7 @@ mod transport_cache_tests {
 
     #[test]
     fn duplicate_registration_returns_error() {
-        let dialer: TransportDialFn = Arc::new(|_, _| Box::pin(async { unreachable!() }));
+        let dialer: TransportDialFn = Arc::new(|_, _, _| Box::pin(async { unreachable!() }));
         let _ = register_transport_dialer("test-dup-protocol", dialer.clone());
         let result = register_transport_dialer("test-dup-protocol", dialer);
         assert!(result.is_err());
@@ -195,5 +308,54 @@ mod transport_cache_tests {
             Err(err) => assert_eq!(err.kind(), io::ErrorKind::NotFound),
             other => { let _ = other; panic!("expected err"); }
         }
+    }
+
+    #[test]
+    fn stream_settings_tcp_default() {
+        let s = StreamSettings::from_json(None);
+        assert_eq!(s.protocol, "tcp");
+        assert!(!s.is_tls());
+        assert!(s.transport_json.is_none());
+    }
+
+    #[test]
+    fn stream_settings_parses_ws_tls() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"network":"ws","security":"tls","wsSettings":{"path":"/ray"},"tlsSettings":{"serverName":"x.com"}}"#
+        ).unwrap();
+        let s = StreamSettings::from_json(Some(&v));
+        assert_eq!(s.protocol, "ws");
+        assert!(s.is_tls());
+        assert_eq!(s.transport_json.as_ref().unwrap().get("path").and_then(|p| p.as_str()), Some("/ray"));
+        assert_eq!(s.security_json.as_ref().unwrap().get("serverName").and_then(|n| n.as_str()), Some("x.com"));
+    }
+
+    #[test]
+    fn stream_settings_grpc_settings_key() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"network":"grpc","grpcSettings":{"serviceName":"gun"}}"#
+        ).unwrap();
+        let s = StreamSettings::from_json(Some(&v));
+        assert_eq!(s.protocol, "grpc");
+        assert_eq!(s.transport_json.as_ref().unwrap().get("serviceName").and_then(|n| n.as_str()), Some("gun"));
+    }
+
+    #[test]
+    fn dial_with_settings_tcp_routes_to_system() {
+        // 验证新 dial_with_settings 入口 TCP 路径与旧 dial_transport 等价。
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let accept_task = tokio::spawn(async move {
+                let _ = listener.accept().await;
+            });
+            let dest = Destination::tcp(Address::IPv4(Ipv4Addr::LOCALHOST), Port::new(addr.port()));
+            let sockopt = SocketOptions::default();
+            let settings = StreamSettings::tcp();
+            let result = dial_with_settings("tcp", &dest, &sockopt, &settings).await;
+            assert!(result.is_ok());
+            accept_task.await.unwrap();
+        });
     }
 }

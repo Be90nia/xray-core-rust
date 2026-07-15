@@ -24,8 +24,8 @@ use xray_common::net::port::Port;
 use xray_common::uuid::UUID;
 use xray_proto::xray::proxy::vless::encoding::Addons;
 use xray_transport::connection::Connection;
+use xray_transport::dialer::{dial, StreamSettings};
 use xray_transport::sockopt::SocketOptions;
-use xray_transport::system_dialer::dial_system;
 
 use crate::encoding::{client::encode_request_header, empty_addons, VlessCommand, VERSION};
 
@@ -38,17 +38,30 @@ pub struct VlessOutboundConfig {
     pub server_address: Address,
     /// VLESS 服务器端口。
     pub server_port: Port,
+    /// 可选 streamSettings（TLS/WS/gRPC/...）。None 走 raw TCP。
+    pub stream_settings: Option<StreamSettings>,
 }
 
 impl VlessOutboundConfig {
-    /// 构造。
+
+    /// 构造（raw TCP，无 streamSettings）。
     #[must_use]
     pub fn new(user_uuid: UUID, server_address: Address, server_port: Port) -> Self {
         Self {
             user_uuid,
             server_address,
             server_port,
+            stream_settings: None,
         }
+    }
+
+    /// 指定 streamSettings（builder 风格）。
+    ///
+    /// `Some(ws_settings)` 后拨号走 ws transport；`None` 回退 raw TCP。
+    #[must_use]
+    pub fn with_stream_settings(mut self, settings: Option<StreamSettings>) -> Self {
+        self.stream_settings = settings;
+        self
     }
 
     /// 服务器 Destination（TCP）。
@@ -60,6 +73,7 @@ impl VlessOutboundConfig {
         )
     }
 }
+
 
 /// 构造 VLESS 的 DialFn 闭包。
 ///
@@ -77,12 +91,17 @@ pub fn make_dial_fn(config: Arc<VlessOutboundConfig>) -> DialFn {
         let target_addr = dest.address().clone();
         let target_port = dest.port();
         Box::pin(async move {
-            // 1. dial VLESS server（raw TCP；生产需在上层注入 TLS 拨号）
+            // 1. dial VLESS server：有 streamSettings 走 transport dialer（ws/grpc/...），否则裸 TCP。
             let server_dest = config.server_destination();
             let sockopt = SocketOptions::default();
-            let mut conn: Box<dyn Connection> = dial_system(&server_dest, &sockopt)
-                .await
-                .map_err(|e| format!("vless dial server: {e}"))?;
+            let mut conn: Box<dyn Connection> = match &config.stream_settings {
+                Some(s) => dial(&server_dest, s, &sockopt)
+                    .await
+                    .map_err(|e| format!("vless dial server ({}): {e}", s.protocol))?,
+                None => xray_transport::system_dialer::dial_system(&server_dest, &sockopt)
+                    .await
+                    .map_err(|e| format!("vless dial server (tcp): {e}"))?,
+            };
 
             // 2. 写 VLESS 请求头（version + uuid + addons + command + target addr/port）
             let addons = empty_addons();
@@ -115,9 +134,14 @@ pub fn make_dial_fn_with_addons(config: Arc<VlessOutboundConfig>, addons: Addons
         Box::pin(async move {
             let server_dest = config.server_destination();
             let sockopt = SocketOptions::default();
-            let mut conn: Box<dyn Connection> = dial_system(&server_dest, &sockopt)
-                .await
-                .map_err(|e| format!("vless dial server: {e}"))?;
+            let mut conn: Box<dyn Connection> = match &config.stream_settings {
+                Some(s) => dial(&server_dest, s, &sockopt)
+                    .await
+                    .map_err(|e| format!("vless dial server ({}): {e}", s.protocol))?,
+                None => xray_transport::system_dialer::dial_system(&server_dest, &sockopt)
+                    .await
+                    .map_err(|e| format!("vless dial server (tcp): {e}"))?,
+            };
             encode_request_header(
                 &mut conn,
                 VERSION,

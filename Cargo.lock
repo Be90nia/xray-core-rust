@@ -4236,12 +4236,15 @@ dependencies = [
  "tokio",
  "tracing",
  "xray-app-dispatcher",
+ "xray-buf",
  "xray-common",
  "xray-conf",
  "xray-features",
  "xray-proxy-freedom",
+ "xray-proxy-socks",
  "xray-proxy-trojan",
  "xray-proxy-vless",
+ "xray-transport",
 ]
 
 [[package]]
@@ -4643,6 +4646,7 @@ dependencies = [
  "rcgen 0.13.2",
  "rustls",
  "rustls-pki-types",
+ "serde_json",
  "sha2 0.10.9",
  "subtle",
  "thiserror 2.0.18",
@@ -4663,6 +4667,7 @@ dependencies = [
  "futures-util",
  "libc",
  "parking_lot",
+ "rustls",
  "serde",
  "serde_json",
  "socket2 0.5.10",
@@ -4681,12 +4686,14 @@ name = "xray-transport-grpc"
 version = "0.1.0"
 dependencies = [
  "prost",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "xray-buf",
  "xray-common",
  "xray-proto",
+ "xray-tls",
  "xray-transport",
 ]
 
@@ -4695,12 +4702,14 @@ name = "xray-transport-httpupgrade"
 version = "0.1.0"
 dependencies = [
  "parking_lot",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "xray-buf",
  "xray-common",
  "xray-proto",
+ "xray-tls",
  "xray-transport",
 ]
 
@@ -4784,6 +4793,7 @@ dependencies = [
  "rcgen 0.13.2",
  "rustls",
  "rustls-pki-types",
+ "serde_json",
  "sha1",
  "thiserror 2.0.18",
  "tokio",
@@ -4793,6 +4803,7 @@ dependencies = [
  "xray-buf",
  "xray-common",
  "xray-proto",
+ "xray-tls",
  "xray-transport",
 ]
 

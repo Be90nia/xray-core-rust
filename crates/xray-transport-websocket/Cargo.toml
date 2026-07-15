@@ -10,6 +10,8 @@ xray-buf = { path = "../xray-buf" }
 xray-common = { path = "../xray-common" }
 xray-transport = { path = "../xray-transport" }
 xray-proto = { path = "../xray-proto" }
+xray-tls = { path = "../xray-tls" }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

@@ -28,6 +28,7 @@
 //! 参考：Go 版本位于 `E:\Projcet\Xray-core\transport\internet\tls\`。
 
 pub mod error;
+pub mod client_config;
 pub mod pin;
 pub mod fingerprint;
 pub mod certificate;

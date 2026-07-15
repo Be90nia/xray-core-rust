@@ -13,6 +13,9 @@ xray-app-dispatcher = { path = "../xray-app-dispatcher" }
 xray-proxy-freedom = { path = "../xray-proxy-freedom" }
 xray-proxy-vless = { path = "../xray-proxy-vless" }
 xray-proxy-trojan = { path = "../xray-proxy-trojan" }
+xray-proxy-socks = { path = "../xray-proxy-socks" }
+xray-buf = { path = "../xray-buf" }
+xray-transport = { path = "../xray-transport" }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

@@ -27,6 +27,7 @@ use xray_conf::{BuiltConfig, BuiltOutbound};
 use xray_features::Result;
 use xray_proxy_trojan::{MemoryAccount, TrojanOutboundConfig};
 use xray_proxy_vless::VlessOutboundConfig;
+use xray_transport::dialer::StreamSettings;
 
 /// 从 BuiltConfig 注册 outbound handlers 到 SimpleOhm。
 ///
@@ -80,11 +81,13 @@ fn try_build_handler(
         }
         "vless" => {
             let config = parse_vless_config(&ob.entry.data)?;
+            let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_vless::make_vless_dial_fn(Arc::new(config));
             Ok(Arc::new(DialBridge::new(ob.tag.clone(), dial_fn)))
         }
         "trojan" => {
             let config = parse_trojan_config(&ob.entry.data)?;
+            let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_trojan::make_trojan_dial_fn(Arc::new(config));
             Ok(Arc::new(DialBridge::new(ob.tag.clone(), dial_fn)))
         }
@@ -156,6 +159,19 @@ fn parse_trojan_config(data: &[u8]) -> std::result::Result<TrojanOutboundConfig,
         Address::Domain(address.to_string()),
         Port::new(u16::try_from(port).map_err(|_| "port out of range")?),
     ))
+}
+
+/// 从 outbound 的 stream_settings_json 构造 StreamSettings。
+///
+/// None 或非 object 返回 None（走 raw TCP）。
+fn parse_stream_settings(json: &Option<serde_json::Value>) -> Option<StreamSettings> {
+    let s = StreamSettings::from_json(json.as_ref());
+    // TCP + 无 security 等于没 streamSettings，返回 None 保持 raw TCP 路径。
+    if s.protocol == "tcp" && !s.is_tls() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 #[derive(Debug)]
@@ -328,5 +344,27 @@ mod tests {
             Address::Domain(d) => assert_eq!(d, "trojan.example.com"),
             other => panic!("expected Domain, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_stream_settings_none_returns_none() {
+        assert!(parse_stream_settings(&None).is_none());
+        assert!(parse_stream_settings(&Some(serde_json::Value::Null)).is_none());
+    }
+
+    #[test]
+    fn parse_stream_settings_tcp_no_security_returns_none() {
+        let v: serde_json::Value = serde_json::from_str(r#"{"network":"tcp"}"#).unwrap();
+        assert!(parse_stream_settings(&Some(v)).is_none());
+    }
+
+    #[test]
+    fn parse_stream_settings_ws_tls_returns_some() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"network":"ws","security":"tls","wsSettings":{"path":"/ray"}}"#
+        ).unwrap();
+        let s = parse_stream_settings(&Some(v)).unwrap();
+        assert_eq!(s.protocol, "ws");
+        assert!(s.is_tls());
     }
 }

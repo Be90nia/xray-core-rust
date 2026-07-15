@@ -23,6 +23,7 @@ rustls-pki-types = { workspace = true }
 # 日志 (u_client fallback log)
 tracing = { workspace = true }
 tokio = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 rcgen = "0.13"

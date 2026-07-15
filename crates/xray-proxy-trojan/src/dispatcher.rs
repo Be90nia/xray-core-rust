@@ -20,8 +20,8 @@ use xray_common::net::destination::Destination;
 use xray_common::net::network::Network as XrayNetwork;
 use xray_common::net::port::Port;
 use xray_transport::connection::Connection;
+use xray_transport::dialer::{dial, StreamSettings};
 use xray_transport::sockopt::SocketOptions;
-use xray_transport::system_dialer::dial_system;
 
 use crate::config::MemoryAccount;
 use crate::protocol::{write_request_header, Network as TrojanNetwork};
@@ -35,17 +35,27 @@ pub struct TrojanOutboundConfig {
     pub server_address: Address,
     /// Trojan 服务器端口。
     pub server_port: Port,
+    /// 可选 streamSettings（TLS/WS/gRPC/...）。None 走 raw TCP。
+    pub stream_settings: Option<StreamSettings>,
 }
 
 impl TrojanOutboundConfig {
-    /// 构造。
+    /// 构造（raw TCP，无 streamSettings）。
     #[must_use]
     pub fn new(account: MemoryAccount, server_address: Address, server_port: Port) -> Self {
         Self {
             account,
             server_address,
             server_port,
+            stream_settings: None,
         }
+    }
+
+    /// 指定 streamSettings（builder 风格）。
+    #[must_use]
+    pub fn with_stream_settings(mut self, settings: Option<StreamSettings>) -> Self {
+        self.stream_settings = settings;
+        self
     }
 
     /// 服务器 Destination（TCP）。
@@ -75,12 +85,17 @@ pub fn make_dial_fn(config: Arc<TrojanOutboundConfig>) -> DialFn {
         let target_addr = dest.address().clone();
         let target_port = dest.port().value();
         Box::pin(async move {
-            // 1. dial Trojan server（raw TCP；生产需 TLS stacking）
+            // 1. dial Trojan server：有 streamSettings 走 transport dialer（ws/grpc/...），否则裸 TCP。
             let server_dest = config.server_destination();
             let sockopt = SocketOptions::default();
-            let mut conn: Box<dyn Connection> = dial_system(&server_dest, &sockopt)
-                .await
-                .map_err(|e| format!("trojan dial server: {e}"))?;
+            let mut conn: Box<dyn Connection> = match &config.stream_settings {
+                Some(s) => dial(&server_dest, s, &sockopt)
+                    .await
+                    .map_err(|e| format!("trojan dial server ({}): {e}", s.protocol))?,
+                None => xray_transport::system_dialer::dial_system(&server_dest, &sockopt)
+                    .await
+                    .map_err(|e| format!("trojan dial server (tcp): {e}"))?,
+            };
 
             // 2. 构造 Trojan 请求头
             let mut header = Vec::with_capacity(128);

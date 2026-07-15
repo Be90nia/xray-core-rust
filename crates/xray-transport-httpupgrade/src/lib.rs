@@ -32,6 +32,7 @@ pub mod dialer;
 pub mod error;
 pub mod hub;
 pub mod server;
+pub mod register;
 
 // 顶层 re-export。
 pub use config::Config;
@@ -39,3 +40,5 @@ pub use connection::HttpUpgradeConnection;
 pub use dialer::{build_upgrade_request, parse_upgrade_response};
 pub use error::{HttpUpgradeError, Result};
 pub use hub::{UpgradeRequest, build_upgrade_response, parse_upgrade_request, parse_x_forwarded_for};
+
+pub use register::register_dialer;

@@ -31,7 +31,9 @@ pub mod encoding;
 pub mod error;
 pub mod client;
 pub mod server;
+pub mod register;
 
 // 顶层 re-export。
 pub use config::Config;
 pub use error::{GrpcError, Result};
+pub use register::register_dialer;
