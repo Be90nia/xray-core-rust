@@ -11,6 +11,8 @@ xray-features = { path = "../xray-features" }
 xray-proto = { path = "../xray-proto" }
 xray-buf = { path = "../xray-buf" }
 xray-crypto = { path = "../xray-crypto" }
+xray-app-dispatcher = { path = "../xray-app-dispatcher" }
+xray-transport = { path = "../xray-transport" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -33,6 +35,6 @@ rand = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 xray-tls = { path = "../xray-tls" }
-xray-transport = { path = "../xray-transport" }
 tokio-tungstenite = { workspace = true }
 futures-util = "0.3"
+xray-proxy-freedom = { path = "../xray-proxy-freedom" }

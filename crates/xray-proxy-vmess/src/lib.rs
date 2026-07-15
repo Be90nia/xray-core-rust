@@ -33,7 +33,8 @@ pub mod validator;
 
 pub use account::MemoryAccount;
 pub use error::{Result, VmessError};
-pub use validator::{TimedUserValidator, Validator};
+pub use validator::{MemoryUser, TimedUserValidator, Validator};
+pub use inbound::serve_vmess;
 
 /// VMess 协议版本号（对应 Go 的 `encoding.Version` 常量）。
 pub const VERSION: u8 = 1;

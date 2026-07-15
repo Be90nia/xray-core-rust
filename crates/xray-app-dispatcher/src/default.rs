@@ -502,7 +502,7 @@ impl CachedReader {
 
 // ========== DialBridge：通用 Dial→Bridge adapter ==========
 
-use xray_transport::bridge::bridge_link_with_stream;
+use xray_transport::bridge::bridge_link_with_stream_full;
 use xray_transport::connection::Connection;
 
 /// 拨号闭包类型：dest → Box<dyn Connection>
@@ -550,7 +550,7 @@ impl DispatchHandler for DialBridge {
         Box::pin(async move {
             match dial(&dest).await {
                 Ok(remote) => {
-                    if let Err(e) = bridge_link_with_stream(link, remote).await {
+                    if let Err(e) = bridge_link_with_stream_full(link, remote).await {
                         tracing::warn!(tag = %tag, "bridge ended: {e}");
                     }
                 }

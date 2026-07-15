@@ -30,6 +30,8 @@ use std::collections::HashMap;
 use xray_proto::xray::proxy::vless::Account as VlessProtoAccount;
 use xray_proxy_trojan::{serve_trojan, MemoryAccount as TrojanMemoryAccount, MemoryUser as TrojanMemoryUser};
 use xray_proxy_vless::{serve_vless, MemoryAccount as VlessMemoryAccount, MemoryUser as VlessMemoryUser, MemoryValidator as VlessMemoryValidator, Validator as VlessValidator};
+use xray_proxy_vmess::{serve_vmess, MemoryAccount as VmessMemoryAccount, MemoryUser as VmessMemoryUser, TimedUserValidator as VmessTimedUserValidator, Validator as VmessValidator};
+use xray_common::uuid::UUID;
 
 /// SOCKS5 inbound 服务入口。
 ///
@@ -192,6 +194,17 @@ async fn spawn_one_inbound(
             });
             Ok(Some(handle))
         }
+        "vmess" => {
+            let validator = build_vmess_validator(&ib.entry.data)?;
+            let listener = TcpListener::bind(&addr).await?;
+            tracing::info!(tag = %ib.tag, addr = %addr, "vmess inbound listening");
+            let handle = tokio::spawn(async move {
+                if let Err(e) = serve_vmess(listener, ohm, validator).await {
+                    tracing::error!(error = %e, "vmess inbound stopped");
+                }
+            });
+            Ok(Some(handle))
+        }
         other => {
             tracing::warn!(
                 tag = %ib.tag,
@@ -253,6 +266,32 @@ fn build_trojan_users(data: &[u8]) -> std::io::Result<HashMap<String, TrojanMemo
         }
     }
     Ok(users)
+}
+
+
+/// 从 inbound entry.data（JSON）解析 vmess clients → TimedUserValidator。
+///
+/// JSON 格式：`{"clients":[{"id":"uuid","level":0,"alterId":0,"email":""}]}`。
+/// 现代 VMess (AEAD) 不用 alterId，忽略该字段。`id` 解析为 `UUID` → `MemoryAccount::new(uuid)`。
+fn build_vmess_validator(data: &[u8]) -> std::io::Result<std::sync::Arc<VmessTimedUserValidator>> {
+    let v: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| std::io::Error::other(format!("vmess inbound settings JSON: {e}")))?;
+    let validator = VmessTimedUserValidator::new();
+    if let Some(clients) = v.get("clients").and_then(|c| c.as_array()) {
+        for c in clients {
+            let id = c.get("id").and_then(|x| x.as_str()).unwrap_or("");
+            let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let level = c.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            let uuid = UUID::parse(id)
+                .ok_or_else(|| std::io::Error::other(format!("vmess invalid uuid: {id}")))?;
+            let account = VmessMemoryAccount::new(uuid);
+            let user = VmessMemoryUser::new(email, account).with_level(level);
+            if let Err(e) = VmessValidator::add(&validator, user) {
+                tracing::warn!(error = %e, "skip vmess user during validator build");
+            }
+        }
+    }
+    Ok(std::sync::Arc::new(validator))
 }
 
 #[cfg(test)]
@@ -425,5 +464,34 @@ mod tests {
         let data = serde_json::to_vec(&settings).unwrap();
         let users = super::build_trojan_users(&data).unwrap();
         assert!(users.is_empty());
+    }
+
+    #[test]
+    fn build_vmess_validator_parses_clients_json() {
+        let uuid = "66ad4540-b58c-4ad2-9926-ea63445a9b57";
+        let settings = serde_json::json!({
+            "clients": [{ "id": uuid, "email": "alice", "level": 0 },
+                          { "id": "11111111-2222-3333-4444-555555555555", "email": "bob" }],
+        });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let validator = super::build_vmess_validator(&data).unwrap();
+        use xray_proxy_vmess::Validator as VmessValidatorTrait;
+        assert_eq!(VmessValidatorTrait::count(&*validator), 2);
+    }
+
+    #[test]
+    fn build_vmess_validator_invalid_uuid() {
+        let settings = serde_json::json!({ "clients": [{ "id": "not-a-uuid" }] });
+        let data = serde_json::to_vec(&settings).unwrap();
+        assert!(super::build_vmess_validator(&data).is_err());
+    }
+
+    #[test]
+    fn build_vmess_validator_empty_clients() {
+        let settings = serde_json::json!({});
+        let data = serde_json::to_vec(&settings).unwrap();
+        let validator = super::build_vmess_validator(&data).unwrap();
+        use xray_proxy_vmess::Validator as VmessValidatorTrait;
+        assert_eq!(VmessValidatorTrait::count(&*validator), 0);
     }
 }

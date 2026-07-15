@@ -76,7 +76,8 @@ where
 /// 上行：`link.reader` 读到的 MultiBuffer → 转 bytes → `stream` 写出。
 /// 下行：`stream` 读到的数据 → 转 MultiBuffer → `link.writer` 写出。
 ///
-/// 任一方向 EOF 或出错时整体返回（与 [`bridge_connections`] 相同的 select 语义）。
+/// 两个方向独立运行到都完成（`join!` 语义）——任一方向 EOF/出错不会取消另一方向。
+/// 适配 VMess 这种请求方向提前 EOF（body chunk 终止符）但响应方向仍需续传的场景。
 /// 调用方无需手动关闭——stream 在桥接结束后被 drop。
 pub async fn bridge_link_with_stream<S>(link: Link, stream: S) -> io::Result<()>
 where
@@ -127,13 +128,67 @@ where
         writer.shutdown();
         io::Result::Ok(())
     };
-
     tokio::pin!(up, down);
     let result = tokio::select! {
         res = &mut up => res,
         res = &mut down => res,
     };
     result
+}
+
+/// 双向桥接 dispatcher [`Link`] 与 AsyncRead+AsyncWrite stream（`join!` 语义）。
+///
+/// 与 [`bridge_link_with_stream`] 区别：两个方向独立运行到都完成，任一方向 EOF/出错不会取消另一方向。
+/// 适配 VMess 这种请求方向提前 EOF（body chunk 终止符）但响应方向仍需续传的场景。
+pub async fn bridge_link_with_stream_full<S>(link: Link, stream: S) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use xray_buf::io::{Reader, Writer};
+    use xray_buf::multi::MultiBuffer;
+
+    let Link { mut reader, mut writer } = link;
+    let (mut s_read, mut s_write) = tokio::io::split(stream);
+
+    let up = async move {
+        loop {
+            let mb = match reader.read_multi_buffer().await {
+                Ok(mb) => mb,
+                Err(_) => break,
+            };
+            if mb.is_empty() {
+                break;
+            }
+            let data = mb.to_vec();
+            if data.is_empty() {
+                break;
+            }
+            s_write.write_all(&data).await?;
+        }
+        let _ = s_write.shutdown().await;
+        io::Result::Ok(())
+    };
+
+    let down = async move {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            let n = s_read.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            let mut mb = MultiBuffer::new();
+            mb.merge_bytes(&buf[..n]);
+            if writer.write_multi_buffer(mb).await.is_err() {
+                break;
+            }
+        }
+        writer.shutdown();
+        io::Result::Ok(())
+    };
+
+    let (up_res, down_res) = tokio::join!(up, down);
+    up_res.and(down_res)
 }
 
 #[cfg(test)]

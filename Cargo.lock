@@ -4245,6 +4245,7 @@ dependencies = [
  "xray-proxy-socks",
  "xray-proxy-trojan",
  "xray-proxy-vless",
+ "xray-proxy-vmess",
  "xray-transport",
 ]
 
@@ -4591,11 +4592,13 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "xray-app-dispatcher",
  "xray-buf",
  "xray-common",
  "xray-crypto",
  "xray-features",
  "xray-proto",
+ "xray-proxy-freedom",
  "xray-tls",
  "xray-transport",
 ]
