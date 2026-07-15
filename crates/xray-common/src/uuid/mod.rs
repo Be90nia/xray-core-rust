@@ -65,22 +65,14 @@ impl UUID {
 
     /// 派生命令密钥。
     ///
-    /// 当前使用 XOR 折叠作为占位实现。
-    /// TODO: 替换为 MD5(UUID.String()) 以匹配 Go 版本行为。
+    /// 对应 Go `(*UUID).CmdKey() []byte`：`md5(UUID.String())` 返回 16 字节。
+    /// 与 VMess/VLESS protocol cmd_key 保持 1:1 与 Go 版互通。
     #[must_use]
     pub fn cmd_key(&self) -> [u8; 16] {
-        let mut key = [0u8; 16];
-        // XOR 折叠：每 4 字节块异或到前 4 字节位置，然后循环
-        for i in 0..16 {
-            key[i % 4] ^= self.0[i];
-        }
-        // 用 UUID 的后半部分再次混合
-        for i in 0..16 {
-            key[4 + (i % 4)] ^= self.0[i];
-            key[8 + (i % 4)] ^= self.0[i].wrapping_mul(17);
-            key[12 + (i % 4)] ^= self.0[i].wrapping_mul(31);
-        }
-        key
+        use md5::{Digest, Md5};
+        let uuid_str = self.to_string();
+        let digest = Md5::digest(uuid_str.as_bytes());
+        digest.into()
     }
 }
 
@@ -205,6 +197,20 @@ mod tests {
         let a = UUID::new();
         let b = UUID::new();
         assert_ne!(a.cmd_key(), b.cmd_key());
+    }
+
+    #[test]
+    fn test_cmd_key_matches_go_md5_semantics() {
+        // Go (*UUID).CmdKey() = md5(UUID.String())
+        // 用 VLESS 项目常用的 UUID 验证：b831381d-6324-4d53-ad4f-8cda48b30811
+        // MD5("b831381d-6324-4d53-ad4f-8cda48b30811") = 9df864028743e438755a322953475266
+        let uuid = UUID::parse("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap();
+        let key = uuid.cmd_key();
+        let expected: [u8; 16] = [
+            0x9d, 0xf8, 0x64, 0x02, 0x87, 0x43, 0xe4, 0x38,
+            0x75, 0x5a, 0x32, 0x29, 0x53, 0x47, 0x52, 0x66,
+        ];
+        assert_eq!(key, expected, "cmd_key must match md5(uuid_string) for Go interop");
     }
 
     #[test]

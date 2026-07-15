@@ -3,7 +3,7 @@
 //! 对应 Go `proxy/vless/encryption/common.go` 中可独立测试的部分：
 //! - TLS 1.3 record header 编解码（5B：`[23,3,3,len_hi,len_lo]`，长度 17~16640）
 //! - 2B BE 长度字段编解码（对应 Go `EncodeLength`/`DecodeLength`）
-//! - padding 配置解析（阶段 A 简化，完整版 TODO）
+//! - padding 配置解析（完整实现 Go `ParsePadding`：`a-b-c.d-e-f` 三元组 + 约束校验）
 //!
 //! nonce 递增逻辑（小端，对齐 Go `IncreaseNonce`）见 [`super::aead`]。
 
@@ -85,13 +85,61 @@ pub type PaddingTriple = [u32; 3];
 
 /// 解析 padding 配置字符串（对应 Go `ParsePadding`）。
 ///
-/// **阶段 A 简化**：空字符串 → 无 padding（返回空配置）；非空 → 暂用空配置。
-/// padding 是流量模式优化（制造可变长度分片，非互通必需），完整三元组解析延后。
+/// 格式：`"a-b-c.d-e-f"`，以 `.` 分隔多个三元组，每个三元组用 `-` 分隔 3 个非负整数。
+/// - 偶数 index（0,2,...）→ paddingLens
+/// - 奇数 index（1,3,...）→ paddingGaps
 ///
-/// TODO: 完整实现 Go `ParsePadding` 的 `"a-b-c;d-e-f"` 三元组列表 + gap 解析。
-pub fn parse_padding(_config: &str) -> Result<(Vec<PaddingTriple>, Vec<PaddingTriple>)> {
-    // ponytail: 阶段 A 简化，padding 为流量优化非互通必需，延后完整解析
-    Ok((Vec::new(), Vec::new()))
+/// 约束：
+/// - 每个三元组必须有 3 个非空数字
+/// - 第一个三元组必须 `base>=100 && min>=35 && max>=35`（Go 写作 `18+17`）
+/// - 所有 lens 的 `max(min, max)` 之和 ≤ `18+65535 = 65553`
+///
+/// # Errors
+/// 格式错误、数字解析失败、约束未满足 → [`VlessError::Other`]（消息对齐 Go）。
+pub fn parse_padding(padding: &str) -> Result<(Vec<PaddingTriple>, Vec<PaddingTriple>)> {
+    if padding.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut lens = Vec::new();
+    let mut gaps = Vec::new();
+    let mut max_len_total = 0u32;
+
+    for (i, segment) in padding.split('.').enumerate() {
+        let parts: Vec<&str> = segment.split('-').collect();
+        if parts.len() < 3 || parts.iter().any(|p| p.is_empty()) {
+            return Err(VlessError::Other(format!(
+                "invalid padding lenth/gap parameter: {segment}"
+            )));
+        }
+        let parse_part = |s: &str| -> Result<u32> {
+            s.parse::<u32>().map_err(|_| {
+                VlessError::Other(format!("invalid padding number: {s}"))
+            })
+        };
+        let y: PaddingTriple = [parse_part(parts[0])?, parse_part(parts[1])?, parse_part(parts[2])?];
+
+        // 第一个三元组最小值约束（Go: y[0]<100 || y[1]<18+17 || y[2]<18+17）
+        if i == 0 && (y[0] < 100 || y[1] < 35 || y[2] < 35) {
+            return Err(VlessError::Other(
+                "first padding length must not be smaller than 35".into(),
+            ));
+        }
+
+        if i % 2 == 0 {
+            max_len_total += y[1].max(y[2]);
+            lens.push(y);
+        } else {
+            gaps.push(y);
+        }
+    }
+
+    if max_len_total > 18 + 65535 {
+        return Err(VlessError::Other(
+            "total padding length must not be larger than 65553".into(),
+        ));
+    }
+
+    Ok((lens, gaps))
 }
 
 #[cfg(test)]
@@ -177,10 +225,74 @@ mod tests {
     }
 
     #[test]
-    fn parse_padding_non_empty_returns_default_in_phase_a() {
+    fn parse_padding_single_triplet_to_lens() {
+        // 单个三元组（i=0，偶数）→ lens[0]，gaps 为空
         let (lens, gaps) = parse_padding("100-200-300").unwrap();
-        // 阶段 A 简化：非空也返回空配置（延后完整解析）
-        assert!(lens.is_empty());
+        assert_eq!(lens, vec![[100, 200, 300]]);
         assert!(gaps.is_empty());
+    }
+
+
+    #[test]
+    fn parse_padding_segment_extra_parts_ignored() {
+        // Go 只取 parts[0..3]，多余 part 忽略（对应 Go `len(x) < 3` 检查只跳过不足，不限上限）
+        let (lens, gaps) = parse_padding("100-200-300-150-250-350").unwrap();
+        assert_eq!(lens, vec![[100, 200, 300]]);
+        assert!(gaps.is_empty());
+    }
+
+    #[test]
+    fn parse_padding_multi_segments_split_by_dot() {
+        // 正确多 segment 格式："a-b-c.d-e-f"
+        // i=0（偶）→ lens，i=1（奇）→ gaps
+        let (lens, gaps) = parse_padding("100-200-300.400-500-600").unwrap();
+        assert_eq!(lens, vec![[100, 200, 300]]);
+        assert_eq!(gaps, vec![[400, 500, 600]]);
+    }
+
+    #[test]
+    fn parse_padding_first_triplet_min_35_enforced() {
+        // 第一个三元组必须 base>=100 && min>=35 && max>=35
+        assert!(parse_padding("99-200-300").is_err(), "base < 100 应拒绝");
+        assert!(parse_padding("100-34-300").is_err(), "min < 35 应拒绝");
+        assert!(parse_padding("100-200-34").is_err(), "max < 35 应拒绝");
+    }
+
+    #[test]
+    fn parse_padding_too_few_parts_rejected() {
+        assert!(parse_padding("100-200").is_err());
+        assert!(parse_padding("100").is_err());
+    }
+
+    #[test]
+    fn parse_padding_empty_part_rejected() {
+        // "100--300" 中间空 part 应拒绝
+        assert!(parse_padding("100--300").is_err());
+        assert!(parse_padding("-200-300").is_err());
+    }
+
+    #[test]
+    fn parse_padding_non_numeric_rejected() {
+        assert!(parse_padding("abc-200-300").is_err());
+        assert!(parse_padding("100-2xx-300").is_err());
+    }
+
+    #[test]
+    fn parse_padding_total_length_overflow_rejected() {
+        // 单 segment 的 max(y[1], y[2]) 不能超过 65553
+        // 设 lens[0] = 100-65534-65534 → max_len_total=65534 ≤ 65553 通过
+        let (lens, _) = parse_padding("100-65534-65534").unwrap();
+        assert_eq!(lens[0], [100, 65534, 65534]);
+        // 65555 > 65553 应拒绝
+        assert!(parse_padding("100-65555-65555").is_err());
+    }
+
+    #[test]
+    fn parse_padding_invalid_segment_rejected_with_message() {
+        let err = parse_padding("100-200").unwrap_err();
+        match err {
+            VlessError::Other(msg) => assert!(msg.contains("invalid padding")),
+            _ => panic!("unexpected error: {err:?}"),
+        }
     }
 }

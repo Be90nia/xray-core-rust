@@ -4201,6 +4201,7 @@ name = "xray-common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "md-5",
  "prost",
  "rand 0.9.4",
  "serde",
