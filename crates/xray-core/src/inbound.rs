@@ -23,6 +23,13 @@ use xray_proxy_socks::protocol::{Host, SocksAddr};
 use xray_proxy_socks::server::socks5_server_handshake;
 use xray_proxy_socks::ServerConfig;
 use xray_transport::link::Link;
+use tokio::task::JoinHandle;
+use xray_conf::{BuiltConfig, BuiltInbound};
+// P1-B: vless/trojan inbound 集成
+use std::collections::HashMap;
+use xray_proto::xray::proxy::vless::Account as VlessProtoAccount;
+use xray_proxy_trojan::{serve_trojan, MemoryAccount as TrojanMemoryAccount, MemoryUser as TrojanMemoryUser};
+use xray_proxy_vless::{serve_vless, MemoryAccount as VlessMemoryAccount, MemoryUser as VlessMemoryUser, MemoryValidator as VlessMemoryValidator, Validator as VlessValidator};
 
 /// SOCKS5 inbound 服务入口。
 ///
@@ -109,6 +116,143 @@ fn socks_addr_to_destination(addr: &SocksAddr) -> std::io::Result<Destination> {
         Host::Domain(d) => Address::Domain(d.clone()),
     };
     Ok(Destination::new(address, Port::new(addr.port), Network::TCP))
+}
+
+/// 遍历 BuiltConfig 的 inbounds，按协议 spawn listener tasks。
+///
+/// 返回每个 inbound 的 JoinHandle（用于优雅关闭）。不支持的协议 warn 跳过。
+///
+/// # 当前支持
+///
+/// - `socks`：SOCKS5 inbound（TCP accept → handshake → dispatch）
+/// - 其他协议（vless/trojan/vmess/http）：warn 跳过（待后续切片）
+pub async fn spawn_inbounds(
+    built: &BuiltConfig,
+    ohm: Arc<SimpleOhm>,
+) -> std::io::Result<Vec<JoinHandle<()>>> {
+    let mut handles = Vec::new();
+    for ib in &built.inbounds {
+        if let Some(handle) = spawn_one_inbound(ib, Arc::clone(&ohm)).await? {
+            handles.push(handle);
+        }
+    }
+    Ok(handles)
+}
+
+/// 按协议种类启动单个 inbound listener。
+async fn spawn_one_inbound(
+    ib: &BuiltInbound,
+    ohm: Arc<SimpleOhm>,
+) -> std::io::Result<Option<JoinHandle<()>>> {
+    let listen = ib.listen.as_deref().unwrap_or("0.0.0.0");
+    let port = match ib.port {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                tag = %ib.tag,
+                protocol = %ib.entry.kind,
+                "inbound has no port, skipping"
+            );
+            return Ok(None);
+        }
+    };
+    let addr = format!("{listen}:{port}");
+
+    match ib.entry.kind.as_str() {
+        "socks" => {
+            let listener = TcpListener::bind(&addr).await?;
+            tracing::info!(tag = %ib.tag, addr = %addr, "socks5 inbound listening");
+            let config = Arc::new(ServerConfig::default());
+            let handle = tokio::spawn(async move {
+                if let Err(e) = serve_socks5(listener, ohm, config).await {
+                    tracing::error!(error = %e, "socks5 inbound stopped");
+                }
+            });
+            Ok(Some(handle))
+        }
+        "vless" => {
+            let validator: Arc<dyn VlessValidator> = build_vless_validator(&ib.entry.data)?;
+            let listener = TcpListener::bind(&addr).await?;
+            tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_count(), "vless inbound listening");
+            let handle = tokio::spawn(async move {
+                if let Err(e) = serve_vless(listener, ohm, validator).await {
+                    tracing::error!(error = %e, "vless inbound stopped");
+                }
+            });
+            Ok(Some(handle))
+        }
+        "trojan" => {
+            let users = build_trojan_users(&ib.entry.data)?;
+            let listener = TcpListener::bind(&addr).await?;
+            tracing::info!(tag = %ib.tag, addr = %addr, users = users.len(), "trojan inbound listening");
+            let handle = tokio::spawn(async move {
+                if let Err(e) = serve_trojan(listener, ohm, users).await {
+                    tracing::error!(error = %e, "trojan inbound stopped");
+                }
+            });
+            Ok(Some(handle))
+        }
+        other => {
+            tracing::warn!(
+                tag = %ib.tag,
+                protocol = %other,
+                "inbound protocol not yet supported, skipping"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// 从 inbound entry.data（JSON）解析 vless clients → MemoryValidator。
+///
+/// JSON 格式：`{"clients":[{"id":"uuid","flow":"","email":""}],"decryption":"none"}`。
+/// 对每个 client 构造最小 `ProtoAccount`（id+flow+encryption=none）→ `MemoryAccount::from_proto_account`。
+fn build_vless_validator(data: &[u8]) -> std::io::Result<std::sync::Arc<dyn VlessValidator>> {
+    let v: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| std::io::Error::other(format!("vless inbound settings JSON: {e}")))?;
+    let validator = VlessMemoryValidator::new();
+    if let Some(clients) = v.get("clients").and_then(|c| c.as_array()) {
+        for c in clients {
+            let id = c.get("id").and_then(|x| x.as_str()).unwrap_or("");
+            let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let level = c.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            let flow = c.get("flow").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let proto = VlessProtoAccount {
+                id: id.to_string(),
+                flow,
+                encryption: "none".to_string(),
+                ..Default::default()
+            };
+            let account = VlessMemoryAccount::from_proto_account(&proto)
+                .map_err(|e| std::io::Error::other(format!("vless account parse: {e}")))?;
+            let user = VlessMemoryUser::new(email, level, account);
+            if let Err(e) = validator.add(user) {
+                tracing::warn!(error = %e, "skip duplicate vless user during validator build");
+            }
+        }
+    }
+    Ok(std::sync::Arc::new(validator))
+}
+
+/// 从 inbound entry.data（JSON）解析 trojan clients → HashMap<key_hash, MemoryUser>。
+///
+/// JSON 格式：`{"clients":[{"password":"...","email":""}]}`。
+/// 对每个 client：`MemoryAccount::new(password)`（内部计算 hex(sha224)）→ MemoryUser → key_hash 入表。
+fn build_trojan_users(data: &[u8]) -> std::io::Result<HashMap<String, TrojanMemoryUser>> {
+    let v: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| std::io::Error::other(format!("trojan inbound settings JSON: {e}")))?;
+    let mut users = HashMap::new();
+    if let Some(clients) = v.get("clients").and_then(|c| c.as_array()) {
+        for c in clients {
+            let password = c.get("password").and_then(|x| x.as_str()).unwrap_or("");
+            let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let level = c.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            let account = TrojanMemoryAccount::new(password);
+            let user = TrojanMemoryUser::new(email, level, account);
+            users.insert(user.key_hash(), user);
+        }
+    }
+    Ok(users)
 }
 
 #[cfg(test)]
@@ -223,5 +367,63 @@ mod tests {
             other => panic!("expected Domain, got {other:?}"),
         }
         let _ = ATYP_DOMAIN; // 确认 import 路径
+    }
+
+    #[test]
+    fn build_vless_validator_parses_clients_json() {
+        let uuid = "66ad4540-b58c-4ad2-9926-ea63445a9b57";
+        let settings = serde_json::json!({
+            "clients": [{ "id": uuid, "email": "alice@example.com", "level": 0 },
+                          { "id": "11111111-2222-3333-4444-555555555555", "email": "bob" }],
+            "decryption": "none",
+        });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let validator = super::build_vless_validator(&data).unwrap();
+        // get_count from Validator trait
+        use xray_proxy_vless::Validator as VlessValidatorTrait;
+        assert_eq!(VlessValidatorTrait::get_count(&*validator), 2);
+        // 用户可被取出（按 UUID lookup）
+        let parsed_uuid = xray_common::uuid::UUID::parse(uuid).expect("uuid");
+        let user = VlessValidatorTrait::get(&*validator, &parsed_uuid).expect("user should be registered");
+        assert_eq!(user.email, "alice@example.com");
+    }
+
+    #[test]
+    fn build_vless_validator_empty_clients() {
+        let settings = serde_json::json!({ "decryption": "none" });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let validator = super::build_vless_validator(&data).unwrap();
+        use xray_proxy_vless::Validator as VlessValidatorTrait;
+        assert_eq!(VlessValidatorTrait::get_count(&*validator), 0);
+    }
+
+    #[test]
+    fn build_vless_validator_invalid_json() {
+        let bad = b"not a json";
+        let err = super::build_vless_validator(bad);
+        assert!(err.is_err(), "invalid JSON should error");
+    }
+
+    #[test]
+    fn build_trojan_users_parses_clients_json() {
+        let settings = serde_json::json!({
+            "clients": [{ "password": "secret", "email": "alice" },
+                          { "password": "another", "email": "bob" }],
+        });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let users = super::build_trojan_users(&data).unwrap();
+        assert_eq!(users.len(), 2, "should parse 2 trojan users");
+        // 手动构造同样的 account 验证 key_hash 一致
+        let expected_account = TrojanMemoryAccount::new("secret");
+        let expected_user = TrojanMemoryUser::new("alice", 0, expected_account);
+        assert!(users.contains_key(&expected_user.key_hash()));
+    }
+
+    #[test]
+    fn build_trojan_users_empty_clients() {
+        let settings = serde_json::json!({});
+        let data = serde_json::to_vec(&settings).unwrap();
+        let users = super::build_trojan_users(&data).unwrap();
+        assert!(users.is_empty());
     }
 }

@@ -44,10 +44,10 @@ pub struct BuiltInbound {
     pub entry: BuiltEntry,
     /// 入站 tag，路由匹配与日志关联。
     pub tag: String,
-    /// 监听端口列表（来自 `port` 字段，未解析则空）。
-    pub port_json: Option<Value>,
-    /// 监听地址（来自 `listen` 字段）。
-    pub listen_json: Option<Value>,
+    /// 监听端口（取 PortList 第一个 range 的起始端口）。
+    pub port: Option<u16>,
+    /// 监听地址（IP / Domain 字符串）。
+    pub listen: Option<String>,
     /// streamSettings 子对象（TLS/WS/gRPC 等），原样透传给传输层。
     pub stream_settings_json: Option<Value>,
     /// sniffing 子对象，原样透传。
@@ -163,8 +163,8 @@ impl Config {
                     data,
                 },
                 tag: ib.tag.clone(),
-                port_json: ib.port.as_ref().map(|_| Value::Null), // port 已强类型，不重新序列化
-                listen_json: None,
+                port: ib.port.as_ref().and_then(|pl| pl.0.first().map(|r| r.start)),
+                listen: ib.listen.as_ref().map(|a| a.0.clone()),
                 stream_settings_json: ib.stream_settings.clone(),
                 sniffing_json: ib.sniffing.as_ref().map(|s| {
                     serde_json::to_value(s).unwrap_or(Value::Null)

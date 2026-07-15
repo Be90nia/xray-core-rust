@@ -26,8 +26,9 @@ pub mod validator;
 
 pub use account::{MemoryAccount, Reverse};
 pub use error::VlessError;
-pub use validator::{MemoryValidator, Validator};
+pub use validator::{MemoryUser, MemoryValidator, Validator};
 pub use dispatcher::{make_dial_fn as make_vless_dial_fn, VlessOutboundConfig};
+pub use inbound::server::serve_vless;
 
 /// Flow 常量（对应 Go 的 `vless.None` / `vless.XRV`）。
 pub const FLOW_NONE: &str = "none";

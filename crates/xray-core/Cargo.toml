@@ -16,6 +16,7 @@ xray-proxy-trojan = { path = "../xray-proxy-trojan" }
 xray-proxy-socks = { path = "../xray-proxy-socks" }
 xray-buf = { path = "../xray-buf" }
 xray-transport = { path = "../xray-transport" }
+xray-proto = { path = "../xray-proto" }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

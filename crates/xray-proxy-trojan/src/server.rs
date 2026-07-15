@@ -13,6 +13,7 @@
 //! - UDP ASSOCIATE
 //! - TLS 包装层
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -20,11 +21,18 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
+use xray_app_dispatcher::default::SimpleOhm;
+use xray_app_dispatcher::OutboundHandlerManager;
+use xray_buf::io::{new_reader, new_writer};
 use xray_common::net::address::Address;
+use xray_common::net::destination::Destination;
+use xray_common::net::network::Network as CommonNetwork;
+use xray_common::net::port::Port;
 use xray_features::inbound::{InboundError, InboundHandler};
 
 use crate::protocol::{addr_type, Network, COMMAND_TCP, CRLF};
 use crate::validator::{MemoryUser, Validator};
+use xray_transport::link::Link;
 
 /// Trojan 入站服务器。
 ///
@@ -262,12 +270,102 @@ where
     Ok((network, addr, port, user))
 }
 
+// ============================================================================
+// serve_trojan：对齐 serve_socks5 的入站服务入口（accept → handshake → dispatch）
+// ============================================================================
+
+/// Trojan 入站服务入口（与 `xray_core::inbound::serve_socks5` 对齐）。
+///
+/// 绑定已建立的 TCP listener，每个连接 spawn 独立 task：
+/// 1. `trojan_server_handshake` 读 56 字节 hex key → 查 validator → 解析 cmd/addr/port
+/// 2. TCP CONNECT（`Network::Tcp`）转 `Destination`，构造 `Link`
+/// 3. `ohm` 的 default handler `dispatch(dest, link)` 拨号并桥接
+///
+/// UDP 命令（`Network::Udp`）当前只 warn 跳过（切片3 待实现）。
+///
+/// # 参数
+/// - `listener`：已绑定的 TCP listener
+/// - `ohm`：出站管理器（至少有 default handler）
+/// - `users`：用户表，key 应等于 `MemoryUser::key_hash()`（即 `hex_string(hex_sha224(password))`）
+///
+/// # 错误
+/// 仅 `listener.local_addr()` 失败时返回错误；accept/handshake/dispatch 错误只 log 不中断循环。
+pub async fn serve_trojan(
+    listener: TcpListener,
+    ohm: Arc<SimpleOhm>,
+    users: HashMap<String, MemoryUser>,
+) -> std::io::Result<()> {
+    let handler = ohm
+        .get_default_handler()
+        .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
+
+    // 复用 Validator 的 key 索引——把 HashMap 转成 Validator，避免重写 header 解析。
+    // email 冲突时 skip 并 warn（不影响其他用户）。
+    let validator = Arc::new(Validator::new());
+    for (_, user) in users {
+        if let Err(e) = validator.add(user) {
+            warn!(error = %e, "skip duplicate user during serve_trojan init");
+        }
+    }
+
+    info!(
+        addr = %listener.local_addr()?,
+        users = validator.get_count(),
+        "trojan inbound listening"
+    );
+
+    loop {
+        let (mut stream, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "trojan accept failed");
+                continue;
+            }
+        };
+
+        let handler = Arc::clone(&handler);
+        let validator = Arc::clone(&validator);
+        tokio::spawn(async move {
+            match trojan_server_handshake(&mut stream, &validator).await {
+                Ok((network, addr, port, user)) => {
+                    if matches!(network, Network::Udp) {
+                        warn!(
+                            peer = %peer,
+                            "trojan UDP command not yet supported, closing connection"
+                        );
+                        return;
+                    }
+                    let dest = Destination::new(addr, Port::new(port), CommonNetwork::TCP);
+                    // ponytail: tokio::io::split 返回 ReadHalf/WriteHalf 是 'static + Send，
+                    // new_reader/new_writer 接受 AsyncRead/AsyncWrite + Unpin + Send + 'static。
+                    let (read_half, write_half) = tokio::io::split(stream);
+                    let link = Link::new(new_reader(read_half), new_writer(write_half));
+                    info!(
+                        peer = %peer,
+                        user = %user.email,
+                        dest = %dest,
+                        "trojan dispatching"
+                    );
+                    let _ = handler.dispatch(&dest, link).await;
+                }
+                Err(e) => {
+                    warn!(peer = %peer, error = %e, "trojan handshake failed");
+                }
+            }
+        });
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{hex_sha224, MemoryAccount};
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
+    use xray_app_dispatcher::default::{DialBridge, SimpleOhm};
+    use xray_app_dispatcher::DispatchHandler;
+    use xray_common::net::address::Address;
+    use xray_proxy_freedom::make_freedom_dial_fn;
+    use crate::protocol::{write_request_header, Network as TrojanNetwork};
 
     fn make_validator_with_user(password: &str) -> Arc<Validator> {
         let validator = Arc::new(Validator::new());
@@ -459,5 +557,70 @@ mod tests {
             Ok(Ok(_)) => panic!("listener should be closed after close()"),
             Ok(Err(_)) | Err(_) => {}
         }
+    }
+
+    /// 端到端：trojan client → trojan inbound (serve_trojan) → freedom outbound → echo server。
+    ///
+    /// 与 socks5 e2e 同模式：验证 accept → handshake → dispatch → echo 回环。
+    #[tokio::test]
+    async fn serve_trojan_dispatches_to_echo_via_freedom() {
+        // 1. 起 echo server
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = echo_listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        // 2. 配置 dispatcher：freedom outbound → SimpleOhm default
+        let ohm = Arc::new(SimpleOhm::new());
+        let dial_fn = make_freedom_dial_fn();
+        let bridge = Arc::new(DialBridge::new("freedom", dial_fn))
+            as Arc<dyn DispatchHandler>;
+        ohm.set_default(bridge);
+
+        // 3. 构造用户表：password → MemoryUser，HashMap key = user.key_hash()
+        let account = MemoryAccount::new("password");
+        let user = MemoryUser::new("echo-test@example.com", 0, account.clone());
+        let mut users = HashMap::new();
+        users.insert(user.key_hash(), user);
+
+        // 4. 起 trojan inbound
+        let trojan_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let trojan_addr = trojan_listener.local_addr().unwrap();
+        let ohm_clone = Arc::clone(&ohm);
+        tokio::spawn(async move {
+            let _ = serve_trojan(trojan_listener, ohm_clone, users).await;
+        });
+
+        // 5. trojan client：构造 header + payload
+        let mut client = TcpStream::connect(trojan_addr).await.unwrap();
+        let dest_addr = Address::IPv4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+        let mut header = Vec::new();
+        write_request_header(
+            &mut header,
+            &account,
+            TrojanNetwork::Tcp,
+            &dest_addr,
+            echo_addr.port(),
+        );
+        let payload = b"hello trojan proxy!";
+        header.extend_from_slice(payload);
+        client.write_all(&header).await.unwrap();
+
+        // 6. 读 echo（跳过可能的 0 字节，读到 payload 长度）
+        let mut got = vec![0u8; payload.len()];
+        client.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, payload, "should receive echo through trojan proxy");
     }
 }

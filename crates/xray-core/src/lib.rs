@@ -39,6 +39,7 @@ pub mod context;
 pub mod functions;
 pub mod instance;
 pub mod outbound;
+pub mod router;
 pub mod inbound;
 pub mod version;
 

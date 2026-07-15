@@ -21,6 +21,12 @@ use thiserror::Error;
 use crate::Instance;
 use xray_features::FeatureError;
 
+use crate::inbound::spawn_inbounds;
+use crate::outbound::register_outbounds;
+use crate::router::{DispatchRouter, RoutingHandler};
+use xray_app_dispatcher::default::SimpleOhm;
+use xray_app_dispatcher::{DispatchHandler, OutboundHandlerManager};
+
 /// 外部 API 调用错误。
 #[derive(Debug, Error)]
 pub enum CoreFunctionError {
@@ -72,6 +78,63 @@ pub fn start_from_built(built: &xray_conf::BuiltConfig) -> Result<Arc<Instance>,
     Ok(Arc::new(instance))
 }
 
+/// 完整启动路径：Instance + SimpleOhm + outbounds + inbounds。
+///
+/// 对应 Go `core.New(config)` + `instance.Start()` + `addInboundHandlers` + `addOutboundHandlers`。
+/// 返回 `(Arc<Instance>, Arc<SimpleOhm>, inbound JoinHandles)`。
+///
+/// 调用方需在 tokio runtime 中调用，并持有 JoinHandles 以管理 inbound listener 生命周期。
+pub async fn start_full(
+    built: &xray_conf::BuiltConfig,
+) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
+    let mut instance = Instance::new_from_built(built)?;
+    let ohm = Arc::new(SimpleOhm::new());
+    register_outbounds(built, &ohm)?;
+    let handles = spawn_inbounds(built, Arc::clone(&ohm))
+        .await
+        .map_err(|e| CoreFunctionError::InstanceStart(e.to_string()))?;
+    instance.start()?;
+    tracing::info!(
+        inbounds = handles.len(),
+        "Xray instance started with full inbound/outbound stack"
+    );
+    Ok((Arc::new(instance), ohm, handles))
+}
+
+/// 带路由的完整启动路径：Instance + SimpleOhm + outbounds + router + inbounds。
+///
+/// 与 [`start_full`] 区别：在注册 outbounds 后，把 [`RoutingHandler`] 包装为新的 default
+/// handler，使 dispatch 时先查 router 规则。router 命中 → tagged outbound；miss → 原 default。
+pub async fn start_full_with_router(
+    built: &xray_conf::BuiltConfig,
+    router: Arc<dyn DispatchRouter>,
+) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
+    let mut instance = Instance::new_from_built(built)?;
+    let ohm = Arc::new(SimpleOhm::new());
+    register_outbounds(built, &ohm)?;
+
+    // 注入 router：把 default handler 包装为 RoutingHandler
+    if let Some(inner_default) = ohm.get_default_handler() {
+        let routing = Arc::new(RoutingHandler::new(
+            Arc::clone(&ohm),
+            inner_default,
+            router,
+        )) as Arc<dyn DispatchHandler>;
+        ohm.set_default(routing);
+    }
+
+    let handles = spawn_inbounds(built, Arc::clone(&ohm))
+        .await
+        .map_err(|e| CoreFunctionError::InstanceStart(e.to_string()))?;
+    instance.start()?;
+    tracing::info!(
+        inbounds = handles.len(),
+        routed = true,
+        "Xray instance started with router + full stack"
+    );
+    Ok((Arc::new(instance), ohm, handles))
+}
+
 /// 从序列化配置字节启动新实例（仅支持 JSON 格式）。
 ///
 /// 对应 Go `core.StartInstance(configFormat, configBytes)`：
@@ -108,6 +171,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc as StdArc;
     use xray_features::{Feature, FeatureError, FeatureFactory, registry};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use xray_conf::{BuiltConfig, BuiltEntry, BuiltInbound, BuiltOutbound};
+    use xray_app_dispatcher::OutboundHandlerManager;
 
     /// 测试用 Feature：记录 start 次数。
     struct SharedCounterFeature {
@@ -258,5 +326,106 @@ mod tests {
         assert_eq!(inst.feature_count(), 2);
         let recorded = order.lock().clone();
         assert_eq!(recorded, vec!["first".to_string(), "second".to_string()]);
+    }
+
+    /// 端到端验证：BuiltConfig → start_full → socks5 inbound → freedom outbound → echo server。
+    /// 这是 P1 集成的核心测试：证明代理能从配置启动并工作。
+    #[tokio::test]
+    async fn start_full_socks_inbound_to_freedom_outbound_e2e() {
+        // 1. 起 echo server
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = echo_listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        // 2. 找空闲端口给 socks inbound
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        // 3. 构建 BuiltConfig: socks inbound + freedom outbound
+        let mut built = BuiltConfig::default();
+        built.inbounds.push(BuiltInbound {
+            entry: BuiltEntry {
+                kind: "socks".into(),
+                data: vec![],
+            },
+            tag: "socks-in".into(),
+            port: Some(socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        built.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry {
+                kind: "freedom".into(),
+                data: b"{}".to_vec(),
+            },
+            tag: "direct".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+        });
+
+        // 4. start_full
+        let (inst, ohm, handles) =
+            start_full(&built).await.expect("start_full should succeed");
+        assert!(inst.is_running(), "instance should be running");
+        assert!(
+            ohm.get_default_handler().is_some(),
+            "freedom should be default handler"
+        );
+
+        // 5. 等 listener 就绪
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // 6. SOCKS5 client: 连 inbound → handshake → CONNECT echo → echo
+        let mut client =
+            TcpStream::connect(format!("127.0.0.1:{socks_port}")).await.expect("connect socks");
+
+        // SOCKS5 握手
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [0x05, 0x00], "server should select no-auth");
+
+        // CONNECT echo_addr
+        let ipv4 = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
+        let mut req = vec![0x05, 0x01, 0x00, 0x01];
+        req.extend_from_slice(&ipv4);
+        req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        client.write_all(&req).await.unwrap();
+
+        let mut connect_resp = [0u8; 10];
+        client.read_exact(&mut connect_resp).await.unwrap();
+        assert_eq!(connect_resp[1], 0x00, "CONNECT should succeed");
+
+        // 7. echo
+        let payload = b"hello full proxy chain!";
+        client.write_all(payload).await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        client.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, payload, "should receive echo through full proxy chain");
+
+        // cleanup
+        for h in handles {
+            h.abort();
+        }
     }
 }

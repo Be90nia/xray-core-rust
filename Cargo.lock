@@ -4240,6 +4240,7 @@ dependencies = [
  "xray-common",
  "xray-conf",
  "xray-features",
+ "xray-proto",
  "xray-proxy-freedom",
  "xray-proxy-socks",
  "xray-proxy-trojan",
@@ -4502,6 +4503,7 @@ dependencies = [
  "xray-crypto",
  "xray-features",
  "xray-proto",
+ "xray-proxy-freedom",
  "xray-tls",
  "xray-transport",
 ]
@@ -4564,6 +4566,7 @@ dependencies = [
  "xray-common",
  "xray-features",
  "xray-proto",
+ "xray-proxy-freedom",
  "xray-tls",
  "xray-transport",
 ]
