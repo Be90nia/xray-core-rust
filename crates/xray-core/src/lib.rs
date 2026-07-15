@@ -38,6 +38,7 @@ pub mod config;
 pub mod context;
 pub mod functions;
 pub mod instance;
+pub mod outbound;
 pub mod version;
 
 // 顶层 re-export：常用类型直接从 crate 根访问。

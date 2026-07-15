@@ -9,10 +9,15 @@ rust-version.workspace = true
 xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
 xray-conf = { path = "../xray-conf" }
+xray-app-dispatcher = { path = "../xray-app-dispatcher" }
+xray-proxy-freedom = { path = "../xray-proxy-freedom" }
+xray-proxy-vless = { path = "../xray-proxy-vless" }
+xray-proxy-trojan = { path = "../xray-proxy-trojan" }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
