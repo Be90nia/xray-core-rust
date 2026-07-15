@@ -23,10 +23,13 @@ use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use tokio::sync::Mutex;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::task::JoinHandle;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -40,14 +43,17 @@ use xray_transport::connection::Connection;
 pub struct WsConnection<S> {
     /// 读半部：从 WS 拿消息。
     pub(crate) read: SplitStreamOwned<S>,
-    /// 写半部：发消息到 WS。
-    pub(crate) write: SplitSinkOwned<S>,
+    /// 写半部：发消息到 WS。`Arc<Mutex<..>>` 包装让心跳任务共享写权限
+    /// （对应 Go `conn.WriteControl(PingMessage,...)` 共享底层 `*websocket.Conn`）。
+    pub(crate) write: Arc<Mutex<SplitSinkOwned<S>>>,
     /// 当前未消费完的消息字节（一条 Binary 消息可能跨多次 poll_read）。
     pub(crate) read_buf: VecDeque<u8>,
     /// 对端地址（可由 PROXY protocol / X-Forwarded-For 覆盖，对应 Go `remoteAddr`）。
     pub(crate) remote: Option<SocketAddr>,
     /// 本端地址。
     pub(crate) local: Option<SocketAddr>,
+    /// 心跳 ping 任务句柄；`Drop` 时 abort 防泄漏（对应 Go heartbeat goroutine 生命周期）。
+    pub(crate) heartbeat_handle: Option<JoinHandle<()>>,
 }
 
 // 类型别名：让签名可读。tokio-tungstenite::WebSocketStream::split 返回：
@@ -73,10 +79,11 @@ impl<S> WsConnection<S> {
     ) -> Self {
         Self {
             read,
-            write,
+            write: Arc::new(Mutex::new(write)),
             read_buf: VecDeque::new(),
             remote,
             local,
+            heartbeat_handle: None,
         }
     }
 
@@ -172,39 +179,61 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        // 每次写一条 Binary 消息（对齐 Go WriteMessage 语义）。
-        match self.write.poll_ready_unpin(cx) {
-            Poll::Ready(Ok(())) => {
-                let msg = Message::binary(buf.to_vec());
-                match self.write.start_send_unpin(msg) {
-                    Ok(()) => {
-                        // ponytail: 立即 poll_flush 让数据发到 TCP，避免调用方必须显式 flush。
-                        // WS 代理语义：每条消息对应一个独立帧，应即时发送（对齐 Go WriteMessage）。
-                        match self.write.poll_flush_unpin(cx) {
-                            Poll::Ready(Ok(())) | Poll::Pending => Poll::Ready(Ok(buf.len())),
-                            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e))),
-                        }
-                    }
-                    Err(e) => Poll::Ready(Err(io::Error::other(e))),
-                }
+        let this = self.get_mut();
+        // 1. 获取写锁（心跳任务可能短暂持有）。try_lock 失败则 reschedule 重试。
+        // ponytail: 心跳仅持有写锁一次 send（微秒级），wake_by_ref 重试开销极低。
+        let mut guard = match this.write.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
             }
+        };
+        // 2. poll_ready → start_send → poll_flush（SinkExt _unpin 方法通过 DerefMut 调用到 SplitKit）。
+        match guard.poll_ready_unpin(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(io::Error::other(e))),
+            Poll::Pending => return Poll::Pending,
+        }
+        if let Err(e) = guard.start_send_unpin(Message::binary(buf.to_vec())) {
+            return Poll::Ready(Err(io::Error::other(e)));
+        }
+        // ponytail: 立即 poll_flush 让数据发到 TCP，避免调用方必须显式 flush。
+        // WS 代理语义：每条消息对应独立帧，应即时发送（对齐 Go WriteMessage）。
+        match guard.poll_flush_unpin(cx) {
+            Poll::Ready(Ok(())) | Poll::Pending => Poll::Ready(Ok(buf.len())),
             Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e))),
-            Poll::Pending => Poll::Pending,
         }
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.write.poll_flush_unpin(cx).map_err(io::Error::other)
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let mut guard = match this.write.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+        };
+        guard.poll_flush_unpin(cx).map_err(io::Error::other)
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let mut guard = match this.write.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+        };
         // 发 Close 帧再关 sink（对齐 Go connection.Close 行为）。
         // ponytail: tungstenite Sink::close 自动发 Close frame。
-        self.write.poll_close_unpin(cx).map_err(io::Error::other)
+        guard.poll_close_unpin(cx).map_err(io::Error::other)
     }
 }
 
@@ -217,10 +246,51 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> Connection for WsConnectio
     }
 }
 
+impl<S> WsConnection<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    /// 启动心跳 ping 任务（对应 Go `NewConnection` 的 `heartbeatPeriod` goroutine）。
+    ///
+    /// `period` 为 0 不启动；重复调用先 abort 旧任务再启新的。
+    /// 对应 Go `conn.WriteControl(websocket.PingMessage, []byte{}, time.Time{})` 循环。
+    pub fn start_heartbeat(&mut self, period: std::time::Duration) {
+        if period.is_zero() {
+            return;
+        }
+        let write = Arc::clone(&self.write);
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(period);
+            // 跳过首次立即 tick（对齐 Go time.Sleep 先睡后 ping）。
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let mut guard = write.lock().await;
+                // 发空 Ping 并 flush（对齐 Go WriteControl(PingMessage, []byte{})）。
+                // send 失败（连接关闭/出错）即停止心跳（对齐 Go break）。
+                if guard.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
+        });
+        if let Some(old) = self.heartbeat_handle.take() {
+            old.abort();
+        }
+        self.heartbeat_handle = Some(handle);
+    }
+}
+
+impl<S> Drop for WsConnection<S> {
+    fn drop(&mut self) {
+        if let Some(h) = self.heartbeat_handle.take() {
+            h.abort();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    //! 真正的 roundtrip 测试需要起真实 server/client，见 tests/ws_e2e.rs。
-    //! 本模块仅做编译期 trait bound 验证（WsConnection 实现 Connection）。
+    //! 编译期 trait bound 验证 + 心跳 ping 运行时验证。
     use super::*;
 
     #[test]
@@ -228,5 +298,47 @@ mod tests {
         // 编译期断言：WsConnection<TcpStream> 满足 Connection supertrait。
         fn _assert_connection<T: Connection>() {}
         _assert_connection::<WsConnection<tokio::net::TcpStream>>();
+    }
+
+    #[tokio::test]
+    async fn start_heartbeat_sends_ping_frames_to_peer() {
+        use std::time::Duration;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        // 1. TCP pair。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut conn: WsConnection<tokio::net::TcpStream> =
+                WsConnection::from_stream(ws, None, None);
+            conn.start_heartbeat(Duration::from_millis(20));
+            // 保活 200ms 让心跳发出几个 Ping。
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            // conn drop → Drop::drop abort heartbeat task。
+        });
+
+        // 2. Client: 连接并读 Ping 帧。
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = "ws://localhost/".into_client_request().unwrap();
+        let (ws_stream, _resp) = tokio_tungstenite::client_async(req, tcp).await.unwrap();
+        let (_write, mut read) = ws_stream.split();
+
+        let mut pings = 0u32;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(150);
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Some(Ok(msg))) =
+                tokio::time::timeout(Duration::from_millis(50), read.next()).await
+            {
+                if matches!(msg, Message::Ping(_)) {
+                    pings += 1;
+                }
+            }
+        }
+
+        server.await.unwrap();
+        assert!(pings >= 1, "expected at least one ping frame, got {pings}");
     }
 }

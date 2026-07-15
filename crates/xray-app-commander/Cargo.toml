@@ -11,4 +11,7 @@ xray-features = { path = "../xray-features" }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
-tokio = { workspace = true, features = ["io-util"] }
+tokio = { workspace = true, features = ["io-util", "sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }

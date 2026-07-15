@@ -22,11 +22,20 @@
 
 use std::io::{Read, Write};
 
-use xray_crypto::aead::AeadCipher;
-use xray_crypto::authenticator::Authenticator;
+use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead};
+use xray_crypto::authenticator::{Authenticator, BytesGenerator, DynamicAEADAuthenticator};
 use xray_crypto::chunk::{AEADChunkSizeParser, ChunkSizeDecoder, ChunkSizeEncoder};
 
-use crate::encoding::{ChunkNonceGenerator, ShakeSizeParser};
+use crate::encoding::{AUTHENTICATED_LENGTH_PATH, ChunkNonceGenerator, ShakeSizeParser, generate_chacha20poly1305_key};
+
+use std::sync::Mutex;
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use xray_common::protocol::SecurityType;
+
+use crate::aead;
+use crate::error::{Result, VmessError};
 
 /// 默认 chunk payload 上限（VMess 用 0x3FFF = 16383，对应 2B length 字段最高位 0）。
 const DEFAULT_PAYLOAD_SIZE: usize = 8192;
@@ -146,6 +155,39 @@ impl SizeParser for AEADSizeParserAdapter {
     }
 }
 
+/// 构造 AuthenticatedLength 的 AEAD size parser（对应 Go `NewAEADSizeParser(NewAEADAuthenticator(...))`）。
+///
+/// key 始终用 request_body_key 派生（KDF16 "auth_len"），iv 始终用 request_body_iv。
+/// 这两个参数在 encode/decode 双向都相同（Go 端也是这样）。
+///
+/// # Errors
+///
+/// - [`VmessError::Crypto`]：AEAD cipher 创建失败
+/// - [`VmessError::Other`]：security 类型不支持
+pub fn make_authenticated_length_size_parser(
+    key: &[u8; 16],
+    iv: &[u8; 16],
+    security: SecurityType,
+) -> Result<AEADSizeParserAdapter> {
+    let auth_key = aead::kdf16(key, &[AUTHENTICATED_LENGTH_PATH]);
+    let nonce_gen = generate_chunk_nonce_bytes(iv, 12);
+    let cipher: Box<dyn AeadCipher + Send + Sync> = match security {
+        SecurityType::Aes128Gcm => Box::new(Aes128Gcm::new(&auth_key)?),
+        SecurityType::Chacha20Poly1305 => {
+            let k32 = generate_chacha20poly1305_key(&auth_key);
+            Box::new(ChaCha20Poly1305Aead::new(&k32)?)
+        }
+        other => {
+            return Err(VmessError::Other(format!(
+                "authenticated_length: unsupported security {:?}",
+                other
+            )))
+        }
+    };
+    let auth = DynamicAEADAuthenticator::new(cipher, nonce_gen, None);
+    Ok(AEADSizeParserAdapter::new(Box::new(auth)))
+}
+
 // ============================================================================
 // NonceGenerator trait（同步、可状态化）
 // ============================================================================
@@ -172,6 +214,14 @@ impl ChunkNonce for ChunkNonceAdapter {
     fn next(&mut self) -> Vec<u8> {
         self.inner.next()
     }
+}
+
+/// 构造 chunk nonce 的 `BytesGenerator`（对应 Go `GenerateChunkNonce(iv, size)`）。
+///
+/// 包装 `ChunkNonceGenerator` 为 `Fn() -> Vec<u8>` 闭包，用 `Mutex` 提供内部可变性。
+pub fn generate_chunk_nonce_bytes(iv: &[u8], nonce_size: usize) -> BytesGenerator {
+    let nonce_gen = Mutex::new(ChunkNonceGenerator::new(iv, nonce_size));
+    Box::new(move || nonce_gen.lock().expect("nonce gen poisoned").next())
 }
 
 // ============================================================================
@@ -313,6 +363,129 @@ pub fn decode_chunk_stream<R: Read>(
 
         // 终止 chunk：解密后 plaintext 为空 → 流结束
         // （Go 端 AuthenticationWriter::write_multi_buffer 对空输入 seal([]) 写终止）
+        if plaintext.is_empty() {
+            return Ok(output);
+        }
+        output.extend_from_slice(&plaintext);
+    }
+}
+
+// ============================================================================
+// async 版本（tokio::io::AsyncRead/AsyncWrite）
+// ============================================================================
+
+/// 把明文 data 编码为 chunk 流异步写入 writer。
+///
+/// 逻辑与 [`encode_chunk_stream`] 相同，IO 用 `tokio::io::AsyncWrite`。
+/// AEAD seal/open 是 CPU 密集型操作，不涉及 IO，直接调用同步 API。
+///
+/// # Errors
+///
+/// - IO 错误
+/// - AEAD 加密失败
+pub async fn encode_chunk_stream_async<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    data: &[u8],
+    cipher: &dyn AeadCipher,
+    nonce_gen: &mut dyn ChunkNonce,
+    size_parser: &mut dyn SizeParser,
+) -> std::io::Result<()> {
+    let max_padding = usize::from(size_parser_max_padding_hint(size_parser));
+    let payload_chunk_size = DEFAULT_PAYLOAD_SIZE
+        .saturating_sub(cipher.tag_size())
+        .saturating_sub(size_parser.size_bytes())
+        .saturating_sub(max_padding);
+
+    if payload_chunk_size == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "payload_chunk_size underflow",
+        ));
+    }
+
+    let mut start = 0usize;
+    while start < data.len() {
+        let end = (start + payload_chunk_size).min(data.len());
+        let chunk = &data[start..end];
+        write_one_chunk_async(writer, chunk, cipher, nonce_gen, size_parser).await?;
+        start = end;
+    }
+
+    write_one_chunk_async(writer, &[], cipher, nonce_gen, size_parser).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+/// 写单个 chunk（async 版）：[size_field][encrypted][padding]。
+async fn write_one_chunk_async<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    data: &[u8],
+    cipher: &dyn AeadCipher,
+    nonce_gen: &mut dyn ChunkNonce,
+    size_parser: &mut dyn SizeParser,
+) -> std::io::Result<()> {
+    let nonce = nonce_gen.next();
+    let sealed = cipher
+        .seal(&nonce, &[], data)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+
+    let padding_size = usize::from(size_parser.next_padding_len());
+    let encrypted_size = sealed.len();
+    let size_value = u16::try_from(encrypted_size + padding_size).unwrap_or(u16::MAX);
+
+    let sb = size_parser.size_bytes();
+    let mut size_field = vec![0u8; sb];
+    size_parser.encode(size_value, &mut size_field);
+    writer.write_all(&size_field).await?;
+    writer.write_all(&sealed).await?;
+    if padding_size > 0 {
+        let mut pad = vec![0u8; padding_size];
+        use rand::RngCore;
+        rand::rng().fill_bytes(&mut pad);
+        writer.write_all(&pad).await?;
+    }
+    Ok(())
+}
+
+/// 从 reader 异步读取 chunk 流并解码，返回拼接后的所有明文。
+///
+/// 逻辑与 [`decode_chunk_stream`] 相同，IO 用 `tokio::io::AsyncRead`。
+///
+/// # Errors
+///
+/// - IO 错误（含 EOF）
+/// - AEAD 解密失败
+pub async fn decode_chunk_stream_async<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    cipher: &dyn AeadCipher,
+    nonce_gen: &mut dyn ChunkNonce,
+    size_parser: &mut dyn SizeParser,
+) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    loop {
+        let padding_size = usize::from(size_parser.next_padding_len());
+
+        let sb = size_parser.size_bytes();
+        let mut size_field = vec![0u8; sb];
+        reader.read_exact(&mut size_field).await?;
+        let total_size = size_parser.decode(&size_field);
+
+        if total_size == 0 {
+            return Ok(output);
+        }
+
+        let ciphertext_size = usize::from(total_size).saturating_sub(padding_size);
+
+        let mut ciphertext = vec![0u8; usize::from(total_size)];
+        reader.read_exact(&mut ciphertext).await?;
+
+        let ciphertext_only = &ciphertext[..ciphertext_size];
+
+        let nonce = nonce_gen.next();
+        let plaintext = cipher
+            .open(&nonce, &[], ciphertext_only)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+
         if plaintext.is_empty() {
             return Ok(output);
         }
@@ -559,5 +732,67 @@ mod tests {
     let decoded = sp.decode(&out);
     assert_eq!(decoded, 100 + 16);
     assert_eq!(sp.size_bytes(), 18);
+    }
+
+    #[test]
+    fn authenticated_length_dynamic_nonce_roundtrip() {
+        // 验证 make_authenticated_length_size_parser（KDF16 + DynamicAEADAuthenticator + ChunkNonceGenerator via Mutex）
+        let cipher_w = make_cipher();
+        let cipher_r = Aes128Gcm::new(&[0x42u8; 16]).expect("aes");
+        let mut nw = make_nonce_gen();
+        let mut nr = make_nonce_gen();
+        let mut sp_w = make_authenticated_length_size_parser(&[0x42u8; 16], &[0xAAu8; 16], SecurityType::Aes128Gcm).expect("make sp");
+        let mut sp_r = make_authenticated_length_size_parser(&[0x42u8; 16], &[0xAAu8; 16], SecurityType::Aes128Gcm).expect("make sp");
+
+        assert_eq!(sp_w.size_bytes(), 18);
+
+        let data = b"authenticated length dynamic nonce payload";
+        let mut buf: Vec<u8> = Vec::new();
+        encode_chunk_stream(&mut buf, data, &cipher_w, &mut nw, &mut sp_w).expect("encode");
+
+        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r).expect("decode");
+        assert_eq!(decoded, data);
+    }
+
+    #[tokio::test]
+    async fn async_plain_roundtrip() {
+        let cipher_w = make_cipher();
+        let cipher_r = Aes128Gcm::new(&[0x42u8; 16]).expect("aes");
+        let mut nw = make_nonce_gen();
+        let mut nr = make_nonce_gen();
+        let mut sp_w = PlainSizeParser;
+        let mut sp_r = PlainSizeParser;
+
+        let data = b"async chunk stream test payload";
+        let mut buf: Vec<u8> = Vec::new();
+        encode_chunk_stream_async(&mut buf, data, &cipher_w, &mut nw, &mut sp_w)
+            .await
+            .expect("encode");
+
+        let decoded = decode_chunk_stream_async(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r)
+            .await
+            .expect("decode");
+        assert_eq!(decoded, data);
+    }
+
+    #[tokio::test]
+    async fn async_authenticated_length_roundtrip() {
+        let cipher_w = make_cipher();
+        let cipher_r = Aes128Gcm::new(&[0x42u8; 16]).expect("aes");
+        let mut nw = make_nonce_gen();
+        let mut nr = make_nonce_gen();
+        let mut sp_w = make_authenticated_length_size_parser(&[0x42u8; 16], &[0xAAu8; 16], SecurityType::Aes128Gcm).expect("make sp");
+        let mut sp_r = make_authenticated_length_size_parser(&[0x42u8; 16], &[0xAAu8; 16], SecurityType::Aes128Gcm).expect("make sp");
+
+        let data = b"async authenticated length payload";
+        let mut buf: Vec<u8> = Vec::new();
+        encode_chunk_stream_async(&mut buf, data, &cipher_w, &mut nw, &mut sp_w)
+            .await
+            .expect("encode");
+
+        let decoded = decode_chunk_stream_async(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r)
+            .await
+            .expect("decode");
+        assert_eq!(decoded, data);
     }
 }

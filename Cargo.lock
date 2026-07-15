@@ -4235,9 +4235,13 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "xray-app-dispatcher",
  "xray-common",
  "xray-conf",
  "xray-features",
+ "xray-proxy-freedom",
+ "xray-proxy-trojan",
+ "xray-proxy-vless",
 ]
 
 [[package]]
@@ -4655,12 +4659,18 @@ dependencies = [
 name = "xray-transport"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "futures-util",
  "libc",
  "parking_lot",
+ "serde",
+ "serde_json",
  "socket2 0.5.10",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
+ "uuid",
  "xray-buf",
  "xray-common",
  "xray-features",

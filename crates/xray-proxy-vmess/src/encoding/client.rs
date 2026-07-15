@@ -16,9 +16,11 @@ use xray_common::bitmask::Bitmask;
 use xray_common::protocol::{Command, RequestHeader, ResponseHeader, SecurityType};
 use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead};
 
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+
 use crate::aead::{self, consts, SealHeaderError};
 use crate::request_option;
-use crate::encoding::body_chunk::{self, ChunkNonceAdapter, PlainSizeParser, ShakeSizeParserAdapter, SizeParser};
+use crate::encoding::body_chunk::{self, ChunkNonceAdapter, PlainSizeParser, ShakeSizeParserAdapter, SizeParser, make_authenticated_length_size_parser};
 use crate::encoding::{authenticate, generate_chacha20poly1305_key, write_address_port, ChunkNonceGenerator};
 use crate::error::{Result, VmessError};
 use crate::VmessCommand;
@@ -190,8 +192,9 @@ impl ClientSession {
             }
         };
         let mut nonce_gen = ChunkNonceAdapter::new(&self.request_body_iv, 12);
-        // ponytail: ChunkMasking (ShakeSizeParser) 已实现；AuthenticatedLength 留 follow-up
-        let mut size_parser: Box<dyn SizeParser> = if request.option.has(request_option::CHUNK_MASKING) {
+        let mut size_parser: Box<dyn SizeParser> = if request.option.has(request_option::AUTHENTICATED_LENGTH) {
+            Box::new(make_authenticated_length_size_parser(&self.request_body_key, &self.request_body_iv, request.security)?)
+        } else if request.option.has(request_option::CHUNK_MASKING) {
             Box::new(ShakeSizeParserAdapter::new(&self.request_body_iv))
         } else {
             Box::new(PlainSizeParser)
@@ -307,7 +310,10 @@ impl ClientSession {
             }
         };
         let mut nonce_gen = ChunkNonceAdapter::new(&self.response_body_iv, 12);
-        let mut size_parser: Box<dyn SizeParser> = if request.option.has(request_option::CHUNK_MASKING) {
+        let mut size_parser: Box<dyn SizeParser> = if request.option.has(request_option::AUTHENTICATED_LENGTH) {
+            // AuthenticatedLength 始终用 request_body_key/iv（Go 端双向一致）
+            Box::new(make_authenticated_length_size_parser(&self.request_body_key, &self.request_body_iv, request.security)?)
+        } else if request.option.has(request_option::CHUNK_MASKING) {
             Box::new(ShakeSizeParserAdapter::new(&self.response_body_iv))
         } else {
             Box::new(PlainSizeParser)
@@ -322,6 +328,141 @@ impl ClientSession {
     #[must_use]
     pub fn chunk_nonce_generator(&self, nonce_size: usize) -> ChunkNonceGenerator {
         ChunkNonceGenerator::new(&self.request_body_iv, nonce_size)
+    }
+
+    // ========================================================================
+    // async 版本（tokio::io::AsyncRead/AsyncWrite）
+    // ========================================================================
+
+    /// 编码请求 body（async 版）。
+    ///
+    /// 逻辑与 [`encode_request_body`](Self::encode_request_body) 相同，
+    /// IO 用 `tokio::io::AsyncWrite`。AEAD seal 是 CPU 密集型，直接调同步 API。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`encode_request_body`](Self::encode_request_body)。
+    pub async fn encode_request_body_async<W: AsyncWrite + Unpin>(
+        &self,
+        request: &RequestHeader,
+        data: &[u8],
+        writer: &mut W,
+    ) -> Result<()> {
+        let cipher: Box<dyn AeadCipher> = match request.security {
+            SecurityType::Aes128Gcm => Box::new(Aes128Gcm::new(&self.request_body_key)?),
+            SecurityType::Chacha20Poly1305 => {
+                let key = generate_chacha20poly1305_key(&self.request_body_key);
+                Box::new(ChaCha20Poly1305Aead::new(&key)?)
+            }
+            other => {
+                return Err(VmessError::Other(format!(
+                    "encode_request_body_async: unsupported security {:?}",
+                    other
+                )))
+            }
+        };
+        let mut nonce_gen = ChunkNonceAdapter::new(&self.request_body_iv, 12);
+        let mut size_parser: Box<dyn SizeParser> = if request.option.has(request_option::AUTHENTICATED_LENGTH) {
+            Box::new(make_authenticated_length_size_parser(&self.request_body_key, &self.request_body_iv, request.security)?)
+        } else if request.option.has(request_option::CHUNK_MASKING) {
+            Box::new(ShakeSizeParserAdapter::new(&self.request_body_iv))
+        } else {
+            Box::new(PlainSizeParser)
+        };
+        body_chunk::encode_chunk_stream_async(writer, data, cipher.as_ref(), &mut nonce_gen, size_parser.as_mut()).await?;
+        Ok(())
+    }
+
+    /// 解码响应头（async 版）。
+    ///
+    /// 逻辑与 [`decode_response_header`](Self::decode_response_header) 相同，
+    /// IO 用 `tokio::io::AsyncRead`。AEAD open 是 CPU 密集型，直接调同步 API。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`decode_response_header`](Self::decode_response_header)。
+    pub async fn decode_response_header_async<R: AsyncRead + Unpin>(
+        &self,
+        reader: &mut R,
+    ) -> Result<ResponseHeader> {
+        let len_key = aead::kdf16(&self.response_body_key, &[consts::AEAD_RESP_HEADER_LEN_KEY]);
+        let len_iv_full = aead::kdf(&self.response_body_iv, &[consts::AEAD_RESP_HEADER_LEN_IV]);
+        let len_nonce = &len_iv_full[..12];
+        let len_cipher = Aes128Gcm::new(&len_key)?;
+
+        let mut encrypted_len = [0u8; 18];
+        reader.read_exact(&mut encrypted_len).await?;
+        let decrypted_len_bytes = len_cipher
+            .open(len_nonce, &[], &encrypted_len)
+            .map_err(|_| VmessError::DecryptResponseHeaderLengthFailed)?;
+        if decrypted_len_bytes.len() < 2 {
+            return Err(VmessError::ReadResponseHeaderFailed);
+        }
+        let payload_len = u16::from_be_bytes([decrypted_len_bytes[0], decrypted_len_bytes[1]]);
+
+        let payload_key = aead::kdf16(&self.response_body_key, &[consts::AEAD_RESP_HEADER_PAYLOAD_KEY]);
+        let payload_iv_full = aead::kdf(&self.response_body_iv, &[consts::AEAD_RESP_HEADER_PAYLOAD_IV]);
+        let payload_nonce = &payload_iv_full[..12];
+        let payload_cipher = Aes128Gcm::new(&payload_key)?;
+
+        let mut encrypted_payload = vec![0u8; usize::from(payload_len) + 16];
+        reader.read_exact(&mut encrypted_payload).await?;
+        let payload = payload_cipher
+            .open(payload_nonce, &[], &encrypted_payload)
+            .map_err(|_| VmessError::DecryptResponseHeaderPayloadFailed)?;
+
+        if payload.len() < 4 {
+            return Err(VmessError::ReadResponseHeaderFailed);
+        }
+        if payload[0] != self.response_header {
+            return Err(VmessError::UnexpectedResponseHeader {
+                expected: self.response_header,
+                actual: payload[0],
+            });
+        }
+        let option = Bitmask::new(payload[1]);
+        Ok(ResponseHeader {
+            command: Command::Tcp,
+            option,
+        })
+    }
+
+    /// 解码响应 body（async 版）。
+    ///
+    /// 逻辑与 [`decode_response_body`](Self::decode_response_body) 相同，
+    /// IO 用 `tokio::io::AsyncRead`。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`decode_response_body`](Self::decode_response_body)。
+    pub async fn decode_response_body_async<R: AsyncRead + Unpin>(
+        &self,
+        request: &RequestHeader,
+        reader: &mut R,
+    ) -> Result<Vec<u8>> {
+        let cipher: Box<dyn AeadCipher> = match request.security {
+            SecurityType::Aes128Gcm => Box::new(Aes128Gcm::new(&self.response_body_key)?),
+            SecurityType::Chacha20Poly1305 => {
+                let key = generate_chacha20poly1305_key(&self.response_body_key);
+                Box::new(ChaCha20Poly1305Aead::new(&key)?)
+            }
+            other => {
+                return Err(VmessError::Other(format!(
+                    "decode_response_body_async: unsupported security {:?}",
+                    other
+                )))
+            }
+        };
+        let mut nonce_gen = ChunkNonceAdapter::new(&self.response_body_iv, 12);
+        let mut size_parser: Box<dyn SizeParser> = if request.option.has(request_option::AUTHENTICATED_LENGTH) {
+            Box::new(make_authenticated_length_size_parser(&self.request_body_key, &self.request_body_iv, request.security)?)
+        } else if request.option.has(request_option::CHUNK_MASKING) {
+            Box::new(ShakeSizeParserAdapter::new(&self.response_body_iv))
+        } else {
+            Box::new(PlainSizeParser)
+        };
+        let plaintext = body_chunk::decode_chunk_stream_async(reader, cipher.as_ref(), &mut nonce_gen, size_parser.as_mut()).await?;
+        Ok(plaintext)
     }
 }
 

@@ -14,6 +14,12 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 socket2 = { workspace = true }
 parking_lot = { workspace = true }
+tokio-tungstenite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+base64 = "0.22"
+futures-util = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
