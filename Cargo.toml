@@ -146,6 +146,9 @@ uuid = { version = "1", features = ["v4"] }
 # 随机数
 rand = "0.9"
 
+# CLI
+clap = { version = "4", features = ["derive"] }
+
 # 其他
 once_cell = "1"
 parking_lot = "0.12"

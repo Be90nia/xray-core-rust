@@ -27,7 +27,16 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
+clap = { workspace = true }
+uuid = { workspace = true }
+anyhow = "1"
+tracing-subscriber = { workspace = true }
+
+[[bin]]
+name = "xray"
+path = "src/bin/xray.rs"
 
 [dev-dependencies]
+uuid = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 serde_json = { workspace = true }
