@@ -20,10 +20,11 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 pub mod custom;
 pub mod fragment;
-pub mod mkcp_disguise;
+pub mod mkcp;
 pub mod noise;
 pub mod realm;
 pub mod salamander;
+pub mod salamander_gecko;
 pub mod sudoku;
 pub mod xdns;
 pub mod xicmp;

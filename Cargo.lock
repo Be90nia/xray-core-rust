@@ -4689,6 +4689,7 @@ dependencies = [
  "libc",
  "parking_lot",
  "rand 0.9.4",
+ "ring",
  "rustls",
  "serde",
  "serde_json",
@@ -4700,6 +4701,7 @@ dependencies = [
  "uuid",
  "xray-buf",
  "xray-common",
+ "xray-crypto",
  "xray-features",
 ]
 

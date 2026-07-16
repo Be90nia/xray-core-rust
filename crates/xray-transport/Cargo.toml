@@ -9,6 +9,7 @@ rust-version.workspace = true
 xray-buf = { path = "../xray-buf" }
 xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
+xray-crypto = { path = "../xray-crypto" }
 thiserror = "1"
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -24,6 +25,7 @@ rand = { workspace = true }
 async-trait = { workspace = true }
 futures-util = "0.3"
 rustls = { workspace = true }
+ring = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
