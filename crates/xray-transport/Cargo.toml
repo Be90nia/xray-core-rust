@@ -19,6 +19,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 base64 = "0.22"
+blake2 = { workspace = true }
+rand = { workspace = true }
+async-trait = { workspace = true }
 futures-util = "0.3"
 rustls = { workspace = true }
 

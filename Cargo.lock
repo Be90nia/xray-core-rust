@@ -4682,10 +4682,13 @@ dependencies = [
 name = "xray-transport"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64",
+ "blake2",
  "futures-util",
  "libc",
  "parking_lot",
+ "rand 0.9.4",
  "rustls",
  "serde",
  "serde_json",

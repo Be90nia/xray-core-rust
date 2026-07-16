@@ -145,6 +145,10 @@ uuid = { version = "1", features = ["v4"] }
 
 # 随机数
 rand = "0.9"
+# 哈希（finalmask salamander BLAKE2b-256）
+blake2 = "0.10"
+# 异步 trait 宏（finalmask UDP 伪装链）
+async-trait = "0.1"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
