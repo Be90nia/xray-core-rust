@@ -4241,6 +4241,7 @@ dependencies = [
  "xray-common",
  "xray-conf",
  "xray-features",
+ "xray-mux",
  "xray-proto",
  "xray-proxy-blackhole",
  "xray-proxy-dokodemo",

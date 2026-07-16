@@ -20,9 +20,10 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use xray_app_dispatcher::default::{DialBridge, SimpleOhm};
+use xray_app_dispatcher::default::{DialBridge, PinFuture, SimpleOhm};
 use xray_app_dispatcher::DispatchHandler;
 use xray_common::net::address::Address;
+use xray_common::net::destination::Destination;
 use xray_common::net::port::Port;
 use xray_common::uuid::UUID;
 use xray_conf::{BuiltConfig, BuiltOutbound};
@@ -30,6 +31,10 @@ use xray_features::Result;
 use xray_proxy_trojan::{MemoryAccount, TrojanOutboundConfig};
 use xray_proxy_vless::VlessOutboundConfig;
 use xray_transport::dialer::StreamSettings;
+use xray_transport::link::Link;
+// zx7: mux outbound 骨架接入
+use xray_mux::client::{ClientManager, DialingWorkerFactory, IncrementalWorkerPicker};
+use xray_mux::session::ClientStrategy;
 
 /// 从 BuiltConfig 注册 outbound handlers 到 SimpleOhm。
 ///
@@ -114,10 +119,88 @@ fn try_build_handler(
             let dial_fn = xray_proxy_socks::make_socks_dial_fn(client);
             Ok(Arc::new(DialBridge::new(ob.tag.clone(), dial_fn)))
         }
+        "mux" => {
+            let concurrency = parse_mux_config(&ob.entry.data)?;
+            Ok(Arc::new(MuxBridge::new(ob.tag.clone(), concurrency)))
+        }
         other => Err(BuildError::Unsupported(other.to_string())),
     }
 }
 
+/// Mux outbound handler 骨架（zx7）。
+///
+/// 持有 mux [`ClientManager`]。dispatch 时调 `client_manager.dispatch()` 拿 worker。
+/// 当前骨架：session IO 桥接到 link 的部分待实现（需要 dialer 注入 + frame reader/writer loop）。
+/// TODO zx7-future: 把 `DialingWorkerFactory` 换成接底层 outbound 的真实 factory。
+pub struct MuxBridge {
+    tag: String,
+    #[allow(dead_code)]
+    client_manager: ClientManager,
+}
+
+impl MuxBridge {
+    /// 构造 Mux outbound handler。`concurrency` 为最大并发会话数（0 = 不限制）。
+    #[must_use]
+    pub fn new(tag: impl Into<String>, concurrency: u32) -> Self {
+        let strategy = ClientStrategy {
+            max_concurrency: concurrency,
+            max_connection: 0,
+        };
+        let factory = Arc::new(DialingWorkerFactory::new(strategy));
+        let picker = Box::new(IncrementalWorkerPicker::new(factory));
+        let client_manager = ClientManager::new(true, picker);
+        Self {
+            tag: tag.into(),
+            client_manager,
+        }
+    }
+
+    /// 是否启用 mux。
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.client_manager.enabled
+    }
+}
+
+impl std::fmt::Debug for MuxBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MuxBridge")
+            .field("tag", &self.tag)
+            .field("enabled", &self.is_enabled())
+            .finish()
+    }
+}
+
+impl DispatchHandler for MuxBridge {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    fn dispatch(&self, dest: &Destination, link: Link) -> PinFuture<()> {
+        let tag = self.tag.clone();
+        let dest = dest.clone();
+        Box::pin(async move {
+            // TODO zx7-future: 调 client_manager.dispatch() 拿 worker → allocate_session
+            // → 桥接 session input/output 到 link。
+            // 当前骨架：DialingWorkerFactory 没注入真实 dialer，只能 log + drop。
+            tracing::warn!(
+                tag = %tag,
+                dest = ?dest,
+                "mux outbound dispatch: session IO bridge not yet implemented, dropping link"
+            );
+            drop(link);
+        })
+    }
+}
+
+/// 解析 mux outbound settings JSON → concurrency。
+///
+/// JSON 格式：`{"concurrency": 8}`（缺省 8）。
+fn parse_mux_config(data: &[u8]) -> std::result::Result<u32, String> {
+    let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
+    let concurrency = v.get("concurrency").and_then(|x| x.as_u64()).unwrap_or(8) as u32;
+    Ok(concurrency)
+}
 /// 解析 vless outbound settings JSON → VlessOutboundConfig。
 ///
 /// JSON 格式：`{ "vnext": [{ "address": "...", "port": 443, "users": [{ "id": "uuid" }] }] }`
@@ -487,6 +570,35 @@ mod tests {
         let ohm = SimpleOhm::new();
         register_outbounds(&built, &ohm).unwrap();
         assert!(ohm.get_handler("socks-auth").is_some());
+    }
+
+    #[test]
+    fn register_mux_outbound_parses_concurrency() {
+        let settings = r#"{"concurrency":16}"#;
+        let mut built = BuiltConfig::default();
+        built.outbounds.push(make_outbound("mux", "mux-out", settings));
+        let ohm = SimpleOhm::new();
+        register_outbounds(&built, &ohm).unwrap();
+        assert!(ohm.get_handler("mux-out").is_some(), "mux outbound should register");
+    }
+
+    #[test]
+    fn register_mux_outbound_default_concurrency() {
+        let mut built = BuiltConfig::default();
+        built.outbounds.push(make_outbound("mux", "mux-default", "{}"));
+        let ohm = SimpleOhm::new();
+        register_outbounds(&built, &ohm).unwrap();
+        assert!(ohm.get_handler("mux-default").is_some());
+    }
+
+    #[test]
+    fn parse_mux_config_extracts_concurrency() {
+        assert_eq!(super::parse_mux_config(br#"{"concurrency":32}"#).unwrap(), 32);
+    }
+
+    #[test]
+    fn parse_mux_config_defaults_to_8() {
+        assert_eq!(super::parse_mux_config(b"{}").unwrap(), 8);
     }
 
     #[test]

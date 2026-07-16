@@ -35,6 +35,8 @@ use xray_common::uuid::UUID;
 // tdy: http + dokodemo inbound 集成
 use xray_proxy_http::ServerConfig as HttpServerConfig;
 use xray_proxy_http::server::http_server_handshake;
+// zx7: mux inbound 检测
+use xray_mux::client::{MUX_COOL_ADDRESS, MUX_COOL_PORT};
 
 /// SOCKS5 inbound 服务入口。
 ///
@@ -106,9 +108,34 @@ async fn handle_connection(
     let link = Link::new(new_reader(read_half), new_writer(write_half));
 
     // 4. dispatch（dispatch 内部拨号 + bridge，消耗 link）
+    // zx7: mux.cool dest 转给 mux ServerWorker（当前 stub）
+    if is_mux_destination(&dest) {
+        tracing::info!("socks5: mux.cool destination detected, spawning mux inbound handler");
+        tokio::spawn(handle_mux_inbound_link(link));
+        return Ok(());
+    }
     let _ = handler.dispatch(&dest, link).await;
 
     Ok(())
+}
+
+/// 检测 dest 是否为 mux.cool 多路复用信令目的地（zx7）。
+///
+/// 当客户端配置了 mux，会把目标设为 `v1.mux.cool:9527`，
+/// inbound 收到后应转给 mux [`ServerWorker`] 解帧。
+pub fn is_mux_destination(dest: &Destination) -> bool {
+    matches!(dest.address(), Address::Domain(d) if d == MUX_COOL_ADDRESS)
+        && dest.port().value() == MUX_COOL_PORT
+}
+
+/// 处理 mux.cool 入站连接的骨架（zx7）。
+///
+/// TODO zx7-future: 接入 `xray_mux::worker::ServerWorker`——
+/// 启动 frame reader loop，为每个 session 调底层 dispatcher.dispatch(session_dest)。
+/// 当前骨架：log + drop link。
+async fn handle_mux_inbound_link(link: Link) {
+    tracing::warn!("mux inbound link received: ServerWorker integration pending, dropping");
+    drop(link);
 }
 
 /// `SocksAddr` → `Destination`（TCP）。
@@ -163,6 +190,12 @@ pub async fn serve_http(
             // 3. 拆 stream → Link → dispatch
             let (read_half, write_half) = tokio::io::split(stream);
             let link = Link::new(new_reader(read_half), new_writer(write_half));
+            // zx7: mux.cool dest 转给 mux ServerWorker（stub）
+            if is_mux_destination(&dest) {
+                tracing::info!("http: mux.cool destination detected, spawning mux inbound handler");
+                tokio::spawn(handle_mux_inbound_link(link));
+                return;
+            }
             let _ = handler.dispatch(&dest, link).await;
         });
     }
@@ -675,6 +708,46 @@ mod tests {
         let settings = serde_json::json!({ "address": "1.2.3.4" });
         let data = serde_json::to_vec(&settings).unwrap();
         assert!(super::parse_dokodemo_dest(&data).is_err());
+    }
+
+    #[test]
+    fn is_mux_destination_detects_mux_cool() {
+        let dest = Destination::new(
+            Address::Domain("v1.mux.cool".to_string()),
+            Port::new(9527),
+            Network::TCP,
+        );
+        assert!(super::is_mux_destination(&dest));
+    }
+
+    #[test]
+    fn is_mux_destination_rejects_normal_domain() {
+        let dest = Destination::new(
+            Address::Domain("example.com".to_string()),
+            Port::new(443),
+            Network::TCP,
+        );
+        assert!(!super::is_mux_destination(&dest));
+    }
+
+    #[test]
+    fn is_mux_destination_rejects_wrong_port() {
+        let dest = Destination::new(
+            Address::Domain("v1.mux.cool".to_string()),
+            Port::new(80),  // 不是 9527
+            Network::TCP,
+        );
+        assert!(!super::is_mux_destination(&dest));
+    }
+
+    #[test]
+    fn is_mux_destination_rejects_ipv4() {
+        let dest = Destination::new(
+            Address::IPv4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
+            Port::new(9527),
+            Network::TCP,
+        );
+        assert!(!super::is_mux_destination(&dest));
     }
 
     #[test]
