@@ -28,6 +28,7 @@ pub mod salamander_gecko;
 pub mod sudoku;
 pub mod xdns;
 pub mod xicmp;
+pub mod xmc;
 
 /// UDP 读缓冲区大小（对应 Go `finalmask.UDPSize = 4096`）。
 pub const UDP_SIZE: usize = 4096;
@@ -86,7 +87,9 @@ pub trait Tcpmask: Send + Sync {
 }
 
 /// UDP 伪装管理器（对应 Go `UdpmaskManager`）。
-// TODO(rpn-D): header 类型聚合（headerManagerConn）待 header/custom 实现时加入。
+///
+/// header/custom 等具体伪装模块通过实现 [`Udpmask`] trait 直接加入 `udpmasks` 数组，
+/// 不需要专门的 header 聚合类型（与 Go `headerManagerConn` 不同）。
 pub struct UdpmaskManager {
     udpmasks: Vec<Box<dyn Udpmask>>,
 }

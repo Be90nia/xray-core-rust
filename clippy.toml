@@ -4,14 +4,14 @@
 # 认知复杂度上限
 cognitive-complexity-threshold = 30
 
-# 单类型最大方法数
-max-fn-params-amount = 8
+# 单函数最大参数数（lint too_many_arguments 阈值，无法配置，仅文档）
+# max-fn-params-amount = 8  # clippy 不支持此字段
 
 # 允许的类型复杂度
 type-complexity-threshold = 300
 
-# 单文件最大行数
-max-struct-bool-fields = 6
+# 单结构体最大 bool 字段（lint struct_excessive_bools 阈值，无法配置，仅文档）
+# max-struct-bool-fields = 6  # clippy 不支持此字段
 
 # 文档要求
 # missing-docs-in-crate-items = true

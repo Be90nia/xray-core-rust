@@ -26,6 +26,12 @@ async-trait = { workspace = true }
 futures-util = "0.3"
 rustls = { workspace = true }
 ring = { workspace = true }
+# xmc (finalmask Minecraft 伪装)：AES-CFB8 + RSA-1024 PKCS1v15 + 确定性素数派生
+aes = "0.9"
+rsa = "0.9"
+num-bigint = "0.4"
+num-traits = "0.2"
+num-integer = "0.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
