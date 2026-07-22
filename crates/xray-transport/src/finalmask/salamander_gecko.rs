@@ -259,7 +259,7 @@ impl GeckoConn {
         let mut out = vec![0u8; p.len() + SM_SALT_LEN];
         let n = self.obfs.obfuscate(p, &mut out);
         if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::Other, "gecko: obfuscate produced 0"));
+            return Err(io::Error::other("gecko: obfuscate produced 0"));
         }
         self.inner.send_to(&out[..n], addr).await
     }
@@ -353,10 +353,8 @@ impl GeckoConn {
 
         // 全部分片到齐 → 重组
         let mut out = Vec::new();
-        for c in entry.chunks.drain(..) {
-            if let Some(c) = c {
-                out.extend(c);
-            }
+        for c in entry.chunks.drain(..).flatten() {
+            out.extend(c);
         }
         drop_entry(&mut state, key);
         Some(out)

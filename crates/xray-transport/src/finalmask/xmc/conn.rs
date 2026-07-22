@@ -156,13 +156,13 @@ where
     let mut rng = rsa::rand_core::OsRng;
     let enc_shared = rsa_public_key
         .encrypt(&mut rng, scheme, &shared_secret)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("rsa encrypt shared: {e}")))?;
+        .map_err(|e| io::Error::other( format!("rsa encrypt shared: {e}")))?;
 
     let mut verify_with_pw = verify_token.clone();
     verify_with_pw.extend_from_slice(password.as_bytes());
     let enc_verify = rsa_public_key
         .encrypt(&mut rng, Pkcs1v15Encrypt, &verify_with_pw)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("rsa encrypt verify: {e}")))?;
+        .map_err(|e| io::Error::other( format!("rsa encrypt verify: {e}")))?;
 
     // 5. 写 Encryption Response (0x01)
     let mut p = Vec::new();
@@ -244,10 +244,10 @@ where
     // 5. RSA 解密
     let shared_secret = rsa_private_key
         .decrypt(Pkcs1v15Encrypt, &enc_shared)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("rsa decrypt shared: {e}")))?;
+        .map_err(|e| io::Error::other( format!("rsa decrypt shared: {e}")))?;
     let decrypted_verify = rsa_private_key
         .decrypt(Pkcs1v15Encrypt, &enc_verify)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("rsa decrypt verify: {e}")))?;
+        .map_err(|e| io::Error::other( format!("rsa decrypt verify: {e}")))?;
 
     // 6. 校验 verifyToken 前 4 字节
     if decrypted_verify.len() < 4 || decrypted_verify[..4] != verify_token {

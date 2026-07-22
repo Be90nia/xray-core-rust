@@ -26,6 +26,10 @@ async-trait = { workspace = true }
 futures-util = "0.3"
 rustls = { workspace = true }
 ring = { workspace = true }
+# realm (finalmask NAT 穿透伪装)：HTTP REST + SSE + SHA-256 + hex 编码
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "blocking"] }
+sha2 = "0.10"
+hex = "0.4"
 # xmc (finalmask Minecraft 伪装)：AES-CFB8 + RSA-1024 PKCS1v15 + 确定性素数派生
 aes = "0.9"
 rsa = "0.9"

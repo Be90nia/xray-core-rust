@@ -118,7 +118,7 @@ fn derive_prime(stream: &mut Sha256Stream) -> BigUint {
     loop {
         if is_probable_prime(&p) {
             let p_minus_1 = &p - BigUint::one();
-            if (&p_minus_1).gcd(&e_big).is_one() {
+            if p_minus_1.gcd(&e_big).is_one() {
                 return p;
             }
         }

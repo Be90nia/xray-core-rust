@@ -85,6 +85,7 @@ impl EvalContext {
 }
 
 /// 对单个 item 求值（按 rand/packet/var/expr 优先级），返回字节；写 save 到 ctx.vars。
+#[allow(clippy::too_many_arguments)] // 参数对应 TCPItem/UDPItem 字段，无法进一步聚合
 pub(crate) fn evaluate_item_fields(
     rand_len: i32,
     rand_min: u8,

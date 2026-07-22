@@ -124,7 +124,7 @@ impl UdpIo for SalamanderConn {
         let mut out = vec![0u8; buf.len() + SM_SALT_LEN];
         let n = self.obfs.obfuscate(buf, &mut out);
         if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::Other, "salamander obfuscate produced 0 bytes"));
+            return Err(io::Error::other("salamander obfuscate produced 0 bytes"));
         }
         self.inner.send_to(&out[..n], addr).await
     }

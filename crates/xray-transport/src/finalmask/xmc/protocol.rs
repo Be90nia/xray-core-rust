@@ -74,7 +74,7 @@ pub fn varint_size(mut value: i32) -> usize {
 /// 读 MC String（VarInt 长度前缀 + UTF-8 字节）。
 pub fn read_string<R: Read>(r: &mut R) -> io::Result<String> {
     let len = read_varint(r)?;
-    if len < 0 || len > STRING_MAX {
+    if !(0..=STRING_MAX).contains(&len) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("xmc string bad length: {len}"),
@@ -95,7 +95,7 @@ pub fn write_string<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
 /// 读 MC Bytes（VarInt 长度前缀）。
 pub fn read_bytes<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
     let len = read_varint(r)?;
-    if len < 0 || len > BYTES_MAX {
+    if !(0..=BYTES_MAX).contains(&len) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("xmc bytes bad length: {len}"),
@@ -156,7 +156,7 @@ pub fn read_packet<R: Read>(r: &mut R) -> io::Result<(i32, Vec<u8>)> {
     let packet_id = read_varint(r)?;
     let id_size = varint_size(packet_id) as i32;
     let data_length = packet_length - id_size;
-    if data_length < 0 || data_length > PACKET_DATA_MAX {
+    if !(0..=PACKET_DATA_MAX).contains(&data_length) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("xmc packet bad data length: {data_length}"),
