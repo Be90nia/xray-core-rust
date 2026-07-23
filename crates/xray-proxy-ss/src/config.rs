@@ -305,7 +305,7 @@ impl MemoryAccount {
     pub fn from_proto(p: &ProtoAccount) -> Result<Self> {
         let ct = CipherType::from_i32(p.cipher_type)
             .filter(|c| *c != CipherType::Unknown)
-            .ok_or_else(|| SsError::InvalidCipherType(p.cipher_type))?;
+            .ok_or(SsError::InvalidCipherType(p.cipher_type))?;
         let cipher = Cipher::from_type(ct)?;
         let key = password_to_cipher_key(p.password.as_bytes(), cipher.key_size() as usize);
         Ok(Self {

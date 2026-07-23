@@ -96,11 +96,10 @@ impl From<std::io::Error> for SsError {
     }
 }
 
-/// Shadowsocks Result 别名。
-
 impl From<xray_crypto::aead::CryptoError> for SsError {
     fn from(e: xray_crypto::aead::CryptoError) -> Self {
         Self::AesGcmInit(e.to_string())
     }
 }
+/// Shadowsocks Result 别名。
 pub type Result<T> = std::result::Result<T, SsError>;

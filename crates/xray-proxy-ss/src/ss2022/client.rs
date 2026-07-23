@@ -16,7 +16,7 @@
 //! 10. read_chunk 循环读响应
 
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use xray_crypto::aead::{AeadCipher, Aes128Gcm, Aes256Gcm};
 

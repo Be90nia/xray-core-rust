@@ -9,6 +9,8 @@
 //! 协议常量与 Go 端一致。
 
 pub mod client;
+pub mod inbound;
+pub mod outbound;
 pub mod config;
 pub mod error;
 pub mod protocol;
@@ -20,6 +22,8 @@ pub mod ss2022;
 pub use config::{AeadCipher, Cipher, CipherType, InnerAead, MemoryAccount};
 pub use error::{Result, SsError};
 pub use validator::Validator;
+pub use inbound::SsInbound;
+pub use outbound::SsOutbound;
 
 /// Shadowsocks 协议版本，对应 Go `protocol.Version`。
 pub const VERSION: u8 = 1;

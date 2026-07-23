@@ -15,8 +15,8 @@
 //!   wire format：`[IV][sealed_size_chunk(18B)][sealed_payload_chunk]`
 //!   - `sealed_size_chunk` = `aead.seal(nonce=[0;n], [], BE(plain_size))`
 //!   - `sealed_payload_chunk` = `aead.seal(nonce=[1,0,...], [], addr+port)`
-//!   nonce 序列与 Go `GenerateAEADNonceWithSize(n)` 行为一致（首帧 increment → [0;n]）
-//!   后续 body chunk 由真实流式 client/server 处理（需共享 nonce 状态）
+//!     nonce 序列与 Go `GenerateAEADNonceWithSize(n)` 行为一致（首帧 increment → [0;n]）
+//!     后续 body chunk 由真实流式 client/server 处理（需共享 nonce 状态）
 //! - **UDP**：每个包自包含 IV + 加密(addr + payload)，一次性 nonce 全 0
 
 use xray_common::net::address::Address;
