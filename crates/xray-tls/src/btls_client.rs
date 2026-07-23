@@ -3,14 +3,18 @@
 //! 使用 [`btls`]（BoringSSL Rust 绑定）构造真实浏览器 ClientHello 指纹，
 //! 替代标准 rustls 的默认指纹（易被 DPI 识别）。
 //!
-//! # 支持的指纹
-//!
+//! - Chrome 131（无 ApplicationSettingsNew，有 ECH）
+//! - Chrome 120（类似 Chrome 131，有 ECH）
 //! - Chrome 133（含 ALPS / delegated_credentials / record_size_limit）
+//! - Firefox 120（双 key share: X25519 + P-256）
 //! - Firefox 148
 //! - Safari 26.3 (macOS)
-//! - iOS 18.4（与 Safari 相同但双 key share）
+//! - iOS 13（Safari-like，单 key share）
+//! - iOS 14 / 18.4（Safari-like，双 key share）
+//! - Edge 106（Chrome 106 时代 cipher/sigalgs）
 //! - Edge 133（复用 Chrome 133 配置）
-//!
+//! - 360 11.0（Chrome-like，无 ALPS/ECH/delegated_credentials）
+//! - QQ 11.1（Chrome-like，有 ALPS，无 ECH/delegated_credentials）
 //! 其他指纹将 fallback 到标准 rustls。
 
 use std::future::Future;
@@ -158,6 +162,118 @@ fn chrome_133_connector() -> io::Result<SslConnector> {
 }
 
 // ============================================================
+// Chrome 131 指纹配置
+// ============================================================
+
+/// Chrome 131 cipher suites（与 Chrome 133 相同）。
+const CHROME_131_CIPHER_LIST: &str = CHROME_133_CIPHER_LIST;
+
+/// Chrome 131 signature algorithms（与 Chrome 133 相同）。
+const CHROME_131_SIGALGS: &str = CHROME_133_SIGALGS;
+
+/// Chrome 131 supported groups（与 Chrome 133 相同，无 PQ）。
+const CHROME_131_CURVES: &str = CHROME_133_CURVES;
+
+/// Chrome 131 ALPN（与 Chrome 133 相同）。
+const CHROME_131_ALPN: &[u8] = CHROME_133_ALPN;
+
+/// Chrome 131 key shares（仅 X25519，无 PQ）。
+const CHROME_131_KEY_SHARES: &[KeyShare] = &[KeyShare::X25519];
+
+/// Chrome 131 ALPS 数据（h2，与 Chrome 133 相同）。
+const CHROME_131_ALPS: &[u8] = CHROME_133_ALPS;
+
+/// Chrome 131 extension permutation 顺序。
+/// 与 Chrome 133 的差异：无 delegated_credentials (0x0044)，无 record_size_limit (0x001b)。
+/// Chrome 131 有 ECH (0x003a) 和 ApplicationSettings (0xfe0d)。
+fn chrome_131_ext_perm() -> Vec<btls::ssl::ExtensionType> {
+    vec![
+        btls::ssl::ExtensionType::from(0x0000), // supported_versions
+        btls::ssl::ExtensionType::from(0x0033), // key_share
+        btls::ssl::ExtensionType::from(0x0010), // alpn
+        btls::ssl::ExtensionType::from(0x000d), // signature_algorithms
+        btls::ssl::ExtensionType::from(0x0038), // supported_groups
+        btls::ssl::ExtensionType::from(0x0005), // status_request
+        btls::ssl::ExtensionType::from(0x0012), // signed_cert_timestamp
+        btls::ssl::ExtensionType::from(0x002b), // compress_certificate
+        btls::ssl::ExtensionType::from(0x0039), // pre_shared_key
+        btls::ssl::ExtensionType::from(0x002d), // psk_key_exchange_modes
+        btls::ssl::ExtensionType::from(0x0017), // extended_master_secret
+        btls::ssl::ExtensionType::from(0x0023), // session_ticket
+        btls::ssl::ExtensionType::from(0x000b), // ec_point_formats
+        btls::ssl::ExtensionType::from(0xff01), // renegotiation_info
+        btls::ssl::ExtensionType::from(0x0015), // padding
+        btls::ssl::ExtensionType::from(0xfe0d), // application_settings
+        btls::ssl::ExtensionType::from(0x003a), // encrypted_client_hello
+    ]
+}
+
+/// 构建带 Chrome 131 指纹的 SslConnector。
+/// 与 Chrome 133 的差异：无 record_size_limit，无 delegated_credentials。
+fn chrome_131_connector() -> io::Result<SslConnector> {
+    let mut builder =
+        SslConnector::builder(SslMethod::tls()).map_err(|e| io::Error::other(e.to_string()))?;
+
+    builder
+        .set_cipher_list(CHROME_131_CIPHER_LIST)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder
+        .set_sigalgs_list(CHROME_131_SIGALGS)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder
+        .set_curves_list(CHROME_131_CURVES)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder
+        .set_alpn_protos(CHROME_131_ALPN)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_grease_enabled(true);
+    builder.set_permute_extensions(true);
+    builder.set_extension_permutation(&chrome_131_ext_perm())
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    // Chrome 131 无 record_size_limit / delegated_credentials
+
+    // 禁用内置 root 验证（xray 自行管理证书验证）
+    builder.set_verify(btls::ssl::SslVerifyMode::NONE);
+
+    Ok(builder.build())
+}
+
+// ============================================================
+// Chrome 120 指纹配置
+// ============================================================
+
+/// Chrome 120 cipher suites（与 Chrome 133 相同）。
+const CHROME_120_CIPHER_LIST: &str = CHROME_133_CIPHER_LIST;
+
+/// Chrome 120 signature algorithms（与 Chrome 133 相同）。
+const CHROME_120_SIGALGS: &str = CHROME_133_SIGALGS;
+
+/// Chrome 120 supported groups（与 Chrome 133 相同，无 PQ）。
+const CHROME_120_CURVES: &str = CHROME_133_CURVES;
+
+/// Chrome 120 ALPN（与 Chrome 133 相同）。
+const CHROME_120_ALPN: &[u8] = CHROME_133_ALPN;
+
+/// Chrome 120 key shares（仅 X25519，无 PQ）。
+const CHROME_120_KEY_SHARES: &[KeyShare] = &[KeyShare::X25519];
+
+/// Chrome 120 ALPS 数据（h2，与 Chrome 133 相同）。
+const CHROME_120_ALPS: &[u8] = CHROME_133_ALPS;
+
+/// Chrome 120 extension permutation 顺序。
+/// 与 Chrome 131 相同：无 record_size_limit，无 delegated_credentials。
+/// 有 ECH (0x003a) 和 ApplicationSettings (0xfe0d)。
+fn chrome_120_ext_perm() -> Vec<btls::ssl::ExtensionType> {
+    chrome_131_ext_perm()
+}
+
+/// 构建带 Chrome 120 指纹的 SslConnector。
+/// 与 Chrome 131 相同（cipher/sigalgs/ext_perm 一致）。
+fn chrome_120_connector() -> io::Result<SslConnector> {
+    chrome_131_connector()
+}
+
+// ============================================================
 // Firefox 148 指纹配置
 // ============================================================
 
@@ -254,6 +370,64 @@ fn firefox_148_connector() -> io::Result<SslConnector> {
     builder.set_grease_enabled(true);
     builder.set_permute_extensions(true);
     builder.set_extension_permutation(&firefox_148_ext_perm())
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    // Firefox 不使用 record_size_limit / delegated_credentials
+
+    // 禁用内置 root 验证（xray 自行管理证书验证）
+    builder.set_verify(btls::ssl::SslVerifyMode::NONE);
+
+    Ok(builder.build())
+}
+
+// ============================================================
+// Firefox 120 指纹配置
+// ============================================================
+
+/// Firefox 120 cipher suites（与 Firefox 148 相同）。
+const FIREFOX_120_CIPHER_LIST: &str = FIREFOX_148_CIPHER_LIST;
+
+/// Firefox 120 signature algorithms（与 Firefox 148 相同）。
+const FIREFOX_120_SIGALGS: &str = FIREFOX_148_SIGALGS;
+
+/// Firefox 120 supported groups（与 Firefox 148 相同）。
+const FIREFOX_120_CURVES: &str = FIREFOX_148_CURVES;
+
+/// Firefox 120 ALPN（与 Firefox 148 相同）。
+const FIREFOX_120_ALPN: &[u8] = FIREFOX_148_ALPN;
+
+/// Firefox 120 key shares（X25519 + P-256 双 key share，Firefox 120+ 特性）。
+const FIREFOX_120_KEY_SHARES: &[KeyShare] = &[KeyShare::X25519, KeyShare::P256];
+
+/// Firefox 120 不使用 ALPS。
+const FIREFOX_120_ALPS: &[u8] = &[];
+
+/// Firefox 120 extension permutation 顺序（与 Firefox 148 相同）。
+fn firefox_120_ext_perm() -> Vec<btls::ssl::ExtensionType> {
+    firefox_148_ext_perm()
+}
+
+/// 构建带 Firefox 120 指纹的 SslConnector。
+/// 与 Firefox 148 的差异：双 key share (X25519 + P-256)。
+/// cipher/sigalgs/curves/ext_perm 相同。
+fn firefox_120_connector() -> io::Result<SslConnector> {
+    let mut builder =
+        SslConnector::builder(SslMethod::tls()).map_err(|e| io::Error::other(e.to_string()))?;
+
+    builder
+        .set_cipher_list(FIREFOX_120_CIPHER_LIST)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder
+        .set_sigalgs_list(FIREFOX_120_SIGALGS)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder
+        .set_curves_list(FIREFOX_120_CURVES)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder
+        .set_alpn_protos(FIREFOX_120_ALPN)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_grease_enabled(true);
+    builder.set_permute_extensions(true);
+    builder.set_extension_permutation(&firefox_120_ext_perm())
         .map_err(|e| io::Error::other(e.to_string()))?;
     // Firefox 不使用 record_size_limit / delegated_credentials
 
@@ -372,14 +546,304 @@ const IOS_18_4_ALPS: &[u8] = &[];
 // iOS 18.4 复用 Safari 26.3 的 connector（cipher/sigalgs/curves/ALPN/ext_perm 相同），
 // 仅 key shares 不同（双 key share: X25519 + P-256）。
 
+// ============================================================
+// iOS 13 指纹配置
+// ============================================================
+
+/// iOS 13 key shares（仅 X25519，与 Safari 相同）。
+const IOS_13_KEY_SHARES: &[KeyShare] = &[KeyShare::X25519];
+
+/// iOS 13 不使用 ALPS。
+const IOS_13_ALPS: &[u8] = &[];
+
+// iOS 13 复用 Safari 26.3 的 connector（cipher/sigalgs/curves/ALPN/ext_perm 相同），
+// 仅 key shares 不同（单 key share: X25519）。
+
+// ============================================================
+// iOS 14 指纹配置
+// ============================================================
+
+/// iOS 14 key shares（X25519 + P-256，与 iOS 18.4 相同）。
+const IOS_14_KEY_SHARES: &[KeyShare] = &[KeyShare::X25519, KeyShare::P256];
+
+/// iOS 14 不使用 ALPS。
+const IOS_14_ALPS: &[u8] = &[];
+
+// iOS 14 复用 Safari 26.3 的 connector（与 iOS 18.4 相同），
+// 双 key share: X25519 + P-256。
+
+// ============================================================
+// Edge 106 指纹配置
+// ============================================================
+
+/// Edge 106 cipher suites（Chrome 106 时代，与 Chrome 133 相同）。
+const EDGE_106_CIPHER_LIST: &str = CHROME_133_CIPHER_LIST;
+
+/// Edge 106 signature algorithms（Chrome 106 时代，与 Chrome 133 相同）。
+const EDGE_106_SIGALGS: &str = CHROME_133_SIGALGS;
+
+/// Edge 106 supported groups（与 Chrome 133 相同，无 PQ）。
+const EDGE_106_CURVES: &str = CHROME_133_CURVES;
+
+/// Edge 106 ALPN（与 Chrome 133 相同）。
+const EDGE_106_ALPN: &[u8] = CHROME_133_ALPN;
+
+/// Edge 106 key shares（仅 X25519，无 PQ）。
+const EDGE_106_KEY_SHARES: &[KeyShare] = &[KeyShare::X25519];
+
+/// Edge 106 ALPS 数据（h2，与 Chrome 133 相同）。
+const EDGE_106_ALPS: &[u8] = CHROME_133_ALPS;
+
+/// Edge 106 extension permutation 顺序。
+/// Chrome 106 时代：无 record_size_limit，无 delegated_credentials，无 ECH。
+/// 有 ApplicationSettings (0xfe0d)。
+fn edge_106_ext_perm() -> Vec<btls::ssl::ExtensionType> {
+    vec![
+        btls::ssl::ExtensionType::from(0x0000), // supported_versions
+        btls::ssl::ExtensionType::from(0x0033), // key_share
+        btls::ssl::ExtensionType::from(0x0010), // alpn
+        btls::ssl::ExtensionType::from(0x000d), // signature_algorithms
+        btls::ssl::ExtensionType::from(0x0038), // supported_groups
+        btls::ssl::ExtensionType::from(0x0005), // status_request
+        btls::ssl::ExtensionType::from(0x0012), // signed_cert_timestamp
+        btls::ssl::ExtensionType::from(0x002b), // compress_certificate
+        btls::ssl::ExtensionType::from(0x0039), // pre_shared_key
+        btls::ssl::ExtensionType::from(0x002d), // psk_key_exchange_modes
+        btls::ssl::ExtensionType::from(0x0017), // extended_master_secret
+        btls::ssl::ExtensionType::from(0x0023), // session_ticket
+        btls::ssl::ExtensionType::from(0x000b), // ec_point_formats
+        btls::ssl::ExtensionType::from(0xff01), // renegotiation_info
+        btls::ssl::ExtensionType::from(0x0015), // padding
+        btls::ssl::ExtensionType::from(0xfe0d), // application_settings
+    ]
+}
+
+/// 构建带 Edge 106 指纹的 SslConnector。
+/// Chrome 106 时代：无 record_size_limit，无 delegated_credentials，无 ECH。
+fn edge_106_connector() -> io::Result<SslConnector> {
+    let mut builder =
+        SslConnector::builder(SslMethod::tls()).map_err(|e| io::Error::other(e.to_string()))?;
+
+    builder
+        .set_cipher_list(EDGE_106_CIPHER_LIST)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder
+        .set_sigalgs_list(EDGE_106_SIGALGS)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder
+        .set_curves_list(EDGE_106_CURVES)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder
+        .set_alpn_protos(EDGE_106_ALPN)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_grease_enabled(true);
+    builder.set_permute_extensions(true);
+    builder.set_extension_permutation(&edge_106_ext_perm())
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    // Edge 106 无 record_size_limit / delegated_credentials / ECH
+
+    // 禁用内置 root 验证（xray 自行管理证书验证）
+    builder.set_verify(btls::ssl::SslVerifyMode::NONE);
+
+    Ok(builder.build())
+}
+
+// ============================================================
+// 360 11.0 指纹配置
+// ============================================================
+
+/// 360 11.0 cipher suites（与 Chrome 133 相同，含 3DES）。
+const QIHOO_360_11_0_CIPHER_LIST: &str = CHROME_133_CIPHER_LIST;
+
+/// 360 11.0 signature algorithms（与 Chrome 133 相同，含 SHA1）。
+const QIHOO_360_11_0_SIGALGS: &str = CHROME_133_SIGALGS;
+
+/// 360 11.0 supported groups（X25519, P-256, P-384，无 PQ）。
+const QIHOO_360_11_0_CURVES: &str = "X25519:P-256:P-384";
+
+/// 360 11.0 ALPN（h2, http/1.1）。
+const QIHOO_360_11_0_ALPN: &[u8] = b"\x02h2\x08http/1.1";
+
+/// 360 11.0 key shares（仅 X25519）。
+const QIHOO_360_11_0_KEY_SHARES: &[KeyShare] = &[KeyShare::X25519];
+
+/// 360 11.0 不使用 ALPS。
+const QIHOO_360_11_0_ALPS: &[u8] = &[];
+
+/// 360 11.0 extension permutation 顺序。
+/// Chrome-like 但无 ALPS/ECH/delegated_credentials/record_size_limit。
+/// 有 ChannelID (0x754f) 和 CompressCert (Brotli only)。
+fn qihoo_360_11_0_ext_perm() -> Vec<btls::ssl::ExtensionType> {
+    vec![
+        btls::ssl::ExtensionType::from(0x0000), // supported_versions
+        btls::ssl::ExtensionType::from(0x0033), // key_share
+        btls::ssl::ExtensionType::from(0x0010), // alpn
+        btls::ssl::ExtensionType::from(0x000d), // signature_algorithms
+        btls::ssl::ExtensionType::from(0x0038), // supported_groups
+        btls::ssl::ExtensionType::from(0x0005), // status_request
+        btls::ssl::ExtensionType::from(0x0012), // signed_cert_timestamp
+        btls::ssl::ExtensionType::from(0x002b), // compress_certificate
+        btls::ssl::ExtensionType::from(0x0039), // pre_shared_key
+        btls::ssl::ExtensionType::from(0x002d), // psk_key_exchange_modes
+        btls::ssl::ExtensionType::from(0x0017), // extended_master_secret
+        btls::ssl::ExtensionType::from(0x0023), // session_ticket
+        btls::ssl::ExtensionType::from(0x000b), // ec_point_formats
+        btls::ssl::ExtensionType::from(0xff01), // renegotiation_info
+        btls::ssl::ExtensionType::from(0x0015), // padding
+    ]
+}
+
+/// 构建带 360 11.0 指纹的 SslConnector。
+/// Chrome-like 但无 ALPS/ECH/delegated_credentials/record_size_limit。
+fn qihoo_360_11_0_connector() -> io::Result<SslConnector> {
+    let mut builder =
+        SslConnector::builder(SslMethod::tls()).map_err(|e| io::Error::other(e.to_string()))?;
+
+    builder
+        .set_cipher_list(QIHOO_360_11_0_CIPHER_LIST)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder
+        .set_sigalgs_list(QIHOO_360_11_0_SIGALGS)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder
+        .set_curves_list(QIHOO_360_11_0_CURVES)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder
+        .set_alpn_protos(QIHOO_360_11_0_ALPN)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_grease_enabled(true);
+    builder.set_permute_extensions(true);
+    builder.set_extension_permutation(&qihoo_360_11_0_ext_perm())
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    // 360 无 record_size_limit / delegated_credentials / ECH / ALPS
+
+    // 禁用内置 root 验证（xray 自行管理证书验证）
+    builder.set_verify(btls::ssl::SslVerifyMode::NONE);
+
+    Ok(builder.build())
+}
+
+// ============================================================
+// QQ 11.1 指纹配置
+// ============================================================
+
+/// QQ 11.1 cipher suites（与 Chrome 133 相同但无 3DES）。
+const QQ_11_1_CIPHER_LIST: &str = concat!(
+    "TLS_AES_128_GCM_SHA256:",
+    "TLS_AES_256_GCM_SHA384:",
+    "TLS_CHACHA20_POLY1305_SHA256:",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:",
+    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:",
+    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:",
+    "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA:",
+    "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA:",
+    "TLS_RSA_WITH_AES_128_GCM_SHA256:",
+    "TLS_RSA_WITH_AES_256_GCM_SHA384:",
+    "TLS_RSA_WITH_AES_128_CBC_SHA:",
+    "TLS_RSA_WITH_AES_256_CBC_SHA"
+);
+
+/// QQ 11.1 signature algorithms（与 Chrome 133 相同但无 SHA1）。
+const QQ_11_1_SIGALGS: &str = concat!(
+    "ecdsa_secp256r1_sha256:",
+    "rsa_pss_rsae_sha256:",
+    "rsa_pkcs1_sha256:",
+    "ecdsa_secp384r1_sha384:",
+    "rsa_pss_rsae_sha384:",
+    "rsa_pkcs1_sha384:",
+    "rsa_pss_rsae_sha512:",
+    "rsa_pkcs1_sha512"
+);
+
+/// QQ 11.1 supported groups（X25519, P-256, P-384）。
+const QQ_11_1_CURVES: &str = "X25519:P-256:P-384";
+
+/// QQ 11.1 ALPN（h2, http/1.1）。
+const QQ_11_1_ALPN: &[u8] = b"\x02h2\x08http/1.1";
+
+/// QQ 11.1 key shares（仅 X25519）。
+const QQ_11_1_KEY_SHARES: &[KeyShare] = &[KeyShare::X25519];
+
+/// QQ 11.1 ALPS 数据（h2）。
+const QQ_11_1_ALPS: &[u8] = b"\x02h2";
+
+/// QQ 11.1 extension permutation 顺序。
+/// Chrome-like，有 ApplicationSettings (0xfe0d)，无 ECH/delegated_credentials/record_size_limit。
+fn qq_11_1_ext_perm() -> Vec<btls::ssl::ExtensionType> {
+    vec![
+        btls::ssl::ExtensionType::from(0x0000), // supported_versions
+        btls::ssl::ExtensionType::from(0x0033), // key_share
+        btls::ssl::ExtensionType::from(0x0010), // alpn
+        btls::ssl::ExtensionType::from(0x000d), // signature_algorithms
+        btls::ssl::ExtensionType::from(0x0038), // supported_groups
+        btls::ssl::ExtensionType::from(0x0005), // status_request
+        btls::ssl::ExtensionType::from(0x0012), // signed_cert_timestamp
+        btls::ssl::ExtensionType::from(0x002b), // compress_certificate
+        btls::ssl::ExtensionType::from(0x0039), // pre_shared_key
+        btls::ssl::ExtensionType::from(0x002d), // psk_key_exchange_modes
+        btls::ssl::ExtensionType::from(0x0017), // extended_master_secret
+        btls::ssl::ExtensionType::from(0x0023), // session_ticket
+        btls::ssl::ExtensionType::from(0x000b), // ec_point_formats
+        btls::ssl::ExtensionType::from(0xff01), // renegotiation_info
+        btls::ssl::ExtensionType::from(0x0015), // padding
+        btls::ssl::ExtensionType::from(0xfe0d), // application_settings
+    ]
+}
+
+/// 构建带 QQ 11.1 指纹的 SslConnector。
+/// Chrome-like，有 ALPS，无 ECH/delegated_credentials/record_size_limit。
+fn qq_11_1_connector() -> io::Result<SslConnector> {
+    let mut builder =
+        SslConnector::builder(SslMethod::tls()).map_err(|e| io::Error::other(e.to_string()))?;
+
+    builder
+        .set_cipher_list(QQ_11_1_CIPHER_LIST)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder
+        .set_sigalgs_list(QQ_11_1_SIGALGS)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder
+        .set_curves_list(QQ_11_1_CURVES)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder
+        .set_alpn_protos(QQ_11_1_ALPN)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_grease_enabled(true);
+    builder.set_permute_extensions(true);
+    builder.set_extension_permutation(&qq_11_1_ext_perm())
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    // QQ 无 record_size_limit / delegated_credentials / ECH
+
+    // 禁用内置 root 验证（xray 自行管理证书验证）
+    builder.set_verify(btls::ssl::SslVerifyMode::NONE);
+
+    Ok(builder.build())
+}
 /// 根据指纹选择 btls 连接器。返回 `None` 表示该指纹不支持 btls（fallback rustls）。
 pub(crate) fn connector_for_fingerprint(fp: &Fingerprint) -> Option<io::Result<FingerprintConfig>> {
     match fp {
-        Fingerprint::Chrome | Fingerprint::HelloChrome120 | Fingerprint::HelloChrome131 | Fingerprint::HelloChrome133 => {
+        Fingerprint::Chrome | Fingerprint::HelloChrome133 => {
             Some(chrome_133_connector().map(|c| FingerprintConfig {
                 connector: c,
                 key_shares: CHROME_133_KEY_SHARES,
                 alps: CHROME_133_ALPS,
+            }))
+        }
+        Fingerprint::HelloChrome131 => {
+            Some(chrome_131_connector().map(|c| FingerprintConfig {
+                connector: c,
+                key_shares: CHROME_131_KEY_SHARES,
+                alps: CHROME_131_ALPS,
+            }))
+        }
+        Fingerprint::HelloChrome120 => {
+            Some(chrome_120_connector().map(|c| FingerprintConfig {
+                connector: c,
+                key_shares: CHROME_120_KEY_SHARES,
+                alps: CHROME_120_ALPS,
             }))
         }
         Fingerprint::Firefox | Fingerprint::HelloFirefox148 => {
@@ -389,6 +853,13 @@ pub(crate) fn connector_for_fingerprint(fp: &Fingerprint) -> Option<io::Result<F
                 alps: FIREFOX_148_ALPS,
             }))
         }
+        Fingerprint::HelloFirefox120 => {
+            Some(firefox_120_connector().map(|c| FingerprintConfig {
+                connector: c,
+                key_shares: FIREFOX_120_KEY_SHARES,
+                alps: FIREFOX_120_ALPS,
+            }))
+        }
         Fingerprint::Safari | Fingerprint::HelloSafari26_3 => {
             Some(safari_26_3_connector().map(|c| FingerprintConfig {
                 connector: c,
@@ -396,18 +867,39 @@ pub(crate) fn connector_for_fingerprint(fp: &Fingerprint) -> Option<io::Result<F
                 alps: SAFARI_26_3_ALPS,
             }))
         }
+        Fingerprint::HelloIos13 => {
+            Some(safari_26_3_connector().map(|c| FingerprintConfig {
+                connector: c,
+                key_shares: IOS_13_KEY_SHARES,
+                alps: IOS_13_ALPS,
+            }))
+        }
         Fingerprint::Ios | Fingerprint::HelloIos14 => {
             Some(safari_26_3_connector().map(|c| FingerprintConfig {
                 connector: c,
-                key_shares: IOS_18_4_KEY_SHARES,
-                alps: IOS_18_4_ALPS,
+                key_shares: IOS_14_KEY_SHARES,
+                alps: IOS_14_ALPS,
             }))
         }
         Fingerprint::Edge | Fingerprint::HelloEdge106 => {
-            Some(chrome_133_connector().map(|c| FingerprintConfig {
+            Some(edge_106_connector().map(|c| FingerprintConfig {
                 connector: c,
-                key_shares: CHROME_133_KEY_SHARES,
-                alps: CHROME_133_ALPS,
+                key_shares: EDGE_106_KEY_SHARES,
+                alps: EDGE_106_ALPS,
+            }))
+        }
+        Fingerprint::Hello360_11_0 => {
+            Some(qihoo_360_11_0_connector().map(|c| FingerprintConfig {
+                connector: c,
+                key_shares: QIHOO_360_11_0_KEY_SHARES,
+                alps: QIHOO_360_11_0_ALPS,
+            }))
+        }
+        Fingerprint::HelloQq_11_1 => {
+            Some(qq_11_1_connector().map(|c| FingerprintConfig {
+                connector: c,
+                key_shares: QQ_11_1_KEY_SHARES,
+                alps: QQ_11_1_ALPS,
             }))
         }
         _ => None,
