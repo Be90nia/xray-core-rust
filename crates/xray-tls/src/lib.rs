@@ -35,5 +35,8 @@ pub mod certificate;
 pub mod config;
 pub mod ech;
 pub mod unsafe_conn;
+pub use utls::ConnInterface;
+
+pub mod btls_client;
 pub mod utls;
 pub mod grpc;

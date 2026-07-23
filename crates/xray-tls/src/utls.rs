@@ -239,15 +239,22 @@ impl<S: Connection + Unpin> Connection for ServerConn<S> {
 }
 
 // ============================================================
-// uTLS UConn（Fingerprint 标记 + 标准 rustls fallback）
+// uTLS UConn（btls 指纹伪装 + rustls fallback）
 // ============================================================
+
+/// UConn 内部连接（btls 或 rustls）。
+enum UConnInner<S> {
+    /// 标准 rustls 连接（指纹不支持 btls 时的 fallback）。
+    Rustls(Conn<S>),
+    /// btls (BoringSSL) 连接（真实浏览器指纹）。
+    Btls(crate::btls_client::BtlsConn<S>),
+}
 
 /// uTLS 客户端连接包装。
 ///
-/// 对应 Go `utls.UConn`。当前 fallback 到标准 rustls 握手，`fingerprint` 仅作 log
-/// 标记；真实 uTLS ClientHello 指纹伪装待 REALITY 任务再评估 watfaq-rustls git 依赖。
+/// 对应 Go `utls.UConn`。根据 `Fingerprint` 选择 btls（真实指纹）或 rustls（fallback）。
 pub struct UConn<S> {
-    inner: Conn<S>,
+    inner: UConnInner<S>,
     /// 用户期望的 uTLS 指纹。
     pub fingerprint: Fingerprint,
 }
@@ -256,13 +263,19 @@ impl<S> UConn<S> {
     /// 返回协商出的 ALPN 协议。未协商返回 `None`。
     #[must_use]
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
-        self.inner.alpn_protocol()
+        match &self.inner {
+            UConnInner::Rustls(c) => c.alpn_protocol(),
+            UConnInner::Btls(_) => None, // btls 通过 negotiated_protocol() 获取
+        }
     }
 
     /// 返回 ServerName（SNI）。
     #[must_use]
     pub fn server_name(&self) -> &str {
-        self.inner.server_name()
+        match &self.inner {
+            UConnInner::Rustls(c) => c.server_name(),
+            UConnInner::Btls(_) => "", // btls 通过 handshake_server_name() 获取
+        }
     }
 }
 
@@ -272,7 +285,10 @@ impl<S: Connection + Unpin> AsyncRead for UConn<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        match &mut self.inner {
+            UConnInner::Rustls(c) => Pin::new(c).poll_read(cx, buf),
+            UConnInner::Btls(c) => Pin::new(c).poll_read(cx, buf),
+        }
     }
 }
 
@@ -282,48 +298,76 @@ impl<S: Connection + Unpin> AsyncWrite for UConn<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        match &mut self.inner {
+            UConnInner::Rustls(c) => Pin::new(c).poll_write(cx, buf),
+            UConnInner::Btls(c) => Pin::new(c).poll_write(cx, buf),
+        }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        match &mut self.inner {
+            UConnInner::Rustls(c) => Pin::new(c).poll_flush(cx),
+            UConnInner::Btls(c) => Pin::new(c).poll_flush(cx),
+        }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        match &mut self.inner {
+            UConnInner::Rustls(c) => Pin::new(c).poll_shutdown(cx),
+            UConnInner::Btls(c) => Pin::new(c).poll_shutdown(cx),
+        }
     }
 }
 
 impl<S: Connection + Unpin> Connection for UConn<S> {
     fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
-        self.inner.remote_addr()
+        match &self.inner {
+            UConnInner::Rustls(c) => c.remote_addr(),
+            UConnInner::Btls(c) => c.remote_addr(),
+        }
     }
 
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
-        self.inner.local_addr()
+        match &self.inner {
+            UConnInner::Rustls(c) => c.local_addr(),
+            UConnInner::Btls(c) => c.local_addr(),
+        }
     }
 }
 
+
 impl<S: Connection + Unpin> ConnInterface for UConn<S> {
     fn handshake<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>> {
-        self.inner.handshake()
+        match &mut self.inner {
+            UConnInner::Rustls(c) => c.handshake(),
+            UConnInner::Btls(c) => c.handshake(),
+        }
     }
 
     fn verify_hostname<'a>(
         &'a self,
         host: &'a str,
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>> {
-        self.inner.verify_hostname(host)
+        match &self.inner {
+            UConnInner::Rustls(c) => c.verify_hostname(host),
+            UConnInner::Btls(c) => c.verify_hostname(host),
+        }
     }
 
     fn handshake_server_name<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
-        self.inner.handshake_server_name()
+        match &mut self.inner {
+            UConnInner::Rustls(c) => c.handshake_server_name(),
+            UConnInner::Btls(c) => c.handshake_server_name(),
+        }
     }
 
     fn negotiated_protocol<'a>(&'a self) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
-        self.inner.negotiated_protocol()
+        match &self.inner {
+            UConnInner::Rustls(c) => c.negotiated_protocol(),
+            UConnInner::Btls(c) => c.negotiated_protocol(),
+        }
     }
 }
 
@@ -383,17 +427,32 @@ pub async fn u_client<S>(
 where
     S: Connection + Unpin,
 {
-    debug!(
-        target: "xray_tls::utls",
-        fingerprint = ?fingerprint,
-        server_name,
-        "u_client: 标准 rustls fallback (真实 uTLS 指纹伪装待 REALITY 任务接入 watfaq-rustls)"
-    );
+    // 尝试 btls（真实指纹）
+    if let Some(result) = crate::btls_client::connector_for_fingerprint(&fingerprint) {
+        match result {
+            Ok(_) => {
+                debug!(target: "xray_tls::utls", ?fingerprint, server_name, "u_client: 尝试 btls 指纹伪装");
+                match crate::btls_client::BtlsConn::connect(stream, server_name, fingerprint).await {
+                    Ok(btls_conn) => {
+                        return Ok(UConn { inner: UConnInner::Btls(btls_conn), fingerprint });
+                    }
+                    Err(e) => {
+                        debug!(target: "xray_tls::utls", ?fingerprint, error = %e, "btls 握手失败, fallback 到 rustls");
+                        // fallback: 重新建立 TCP 连接已不可能（stream 被 consume），返回错误
+                        return Err(e);
+                    }
+                }
+            }
+            Err(e) => {
+                debug!(target: "xray_tls::utls", ?fingerprint, error = %e, "btls connector 构建失败, fallback 到 rustls");
+            }
+        }
+    }
+
+    // rustls fallback
+    debug!(target: "xray_tls::utls", ?fingerprint, server_name, "u_client: rustls fallback");
     let inner = client(stream, server_name, config).await?;
-    Ok(UConn {
-        inner,
-        fingerprint,
-    })
+    Ok(UConn { inner: UConnInner::Rustls(inner), fingerprint })
 }
 
 /// 默认 `ClientConfig`：使用 webpki-roots 系统 root + ring provider。
@@ -488,16 +547,18 @@ mod tests {
         assert_eq!(buf, b"hello-from-tls\n");
     }
 
+    /// 测试 u_client rustls fallback 路径（非 btls 指纹）。
     #[tokio::test]
     async fn u_client_falls_back_to_standard_rustls() {
         let (addr, cert_der) = spawn_test_server(b"u-fallback-ok\n").await;
         let config = trusted_config(cert_der);
 
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut u = u_client(TcpConnection::new(tcp), "localhost", config, Fingerprint::Chrome)
+        // Random 指纹不在 btls 支持列表，走 rustls fallback
+        let mut u = u_client(TcpConnection::new(tcp), "localhost", config, Fingerprint::Random)
             .await
             .expect("fallback ok");
-        assert_eq!(u.fingerprint, Fingerprint::Chrome);
+        assert_eq!(u.fingerprint, Fingerprint::Random);
 
         let mut buf = Vec::new();
         u.read_to_end(&mut buf).await.expect("read ok");

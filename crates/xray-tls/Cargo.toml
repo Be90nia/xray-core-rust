@@ -20,6 +20,10 @@ tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
 rustls-pki-types = { workspace = true }
 
+# uTLS 指纹伪造 (btls BoringSSL 绑定)
+btls = { workspace = true }
+tokio-btls = { workspace = true }
+
 # 日志 (u_client fallback log)
 tracing = { workspace = true }
 tokio = { workspace = true }
