@@ -15,6 +15,7 @@
 //! - Edge 133（复用 Chrome 133 配置）
 //! - 360 11.0（Chrome-like，无 ALPS/ECH/delegated_credentials）
 //! - QQ 11.1（Chrome-like，有 ALPS，无 ECH/delegated_credentials）
+//!
 //! 其他指纹将 fallback 到标准 rustls。
 
 use std::future::Future;
@@ -243,15 +244,19 @@ fn chrome_131_connector() -> io::Result<SslConnector> {
 // ============================================================
 
 /// Chrome 120 cipher suites（与 Chrome 133 相同）。
+#[cfg(test)]
 const CHROME_120_CIPHER_LIST: &str = CHROME_133_CIPHER_LIST;
 
 /// Chrome 120 signature algorithms（与 Chrome 133 相同）。
+#[cfg(test)]
 const CHROME_120_SIGALGS: &str = CHROME_133_SIGALGS;
 
 /// Chrome 120 supported groups（与 Chrome 133 相同，无 PQ）。
+#[cfg(test)]
 const CHROME_120_CURVES: &str = CHROME_133_CURVES;
 
 /// Chrome 120 ALPN（与 Chrome 133 相同）。
+#[cfg(test)]
 const CHROME_120_ALPN: &[u8] = CHROME_133_ALPN;
 
 /// Chrome 120 key shares（仅 X25519，无 PQ）。
@@ -263,6 +268,7 @@ const CHROME_120_ALPS: &[u8] = CHROME_133_ALPS;
 /// Chrome 120 extension permutation 顺序。
 /// 与 Chrome 131 相同：无 record_size_limit，无 delegated_credentials。
 /// 有 ECH (0x003a) 和 ApplicationSettings (0xfe0d)。
+#[cfg(test)]
 fn chrome_120_ext_perm() -> Vec<btls::ssl::ExtensionType> {
     chrome_131_ext_perm()
 }
@@ -478,13 +484,8 @@ const SAFARI_26_3_SIGALGS: &str = concat!(
     "rsa_pkcs1_sha384:",
     "ecdsa_secp521r1_sha512:",
     "rsa_pkcs1_sha512:",
-    "rsa_pkcs1_sha1:",
-    "ecdsa_sha1:",
-    "ed25519:",
-    "rsa_pss_pss_sha256:",
-    "rsa_pss_pss_sha384:",
-    "rsa_pss_pss_sha512:",
-    "ed448"
+    "ed25519"
+    // BoringSSL 不支持: rsa_pkcs1_sha1, ecdsa_sha1, ed448, rsa_pss_pss_*
 );
 
 /// Safari 26.3 supported groups：X25519, P-256, P-384, P-521。
@@ -538,9 +539,11 @@ fn safari_26_3_connector() -> io::Result<SslConnector> {
 // ============================================================
 
 /// iOS 18.4 key shares（X25519 + P-256，与 Safari 不同）。
+#[cfg(test)]
 const IOS_18_4_KEY_SHARES: &[KeyShare] = &[KeyShare::X25519, KeyShare::P256];
 
 /// iOS 18.4 不使用 ALPS。
+#[cfg(test)]
 const IOS_18_4_ALPS: &[u8] = &[];
 
 // iOS 18.4 复用 Safari 26.3 的 connector（cipher/sigalgs/curves/ALPN/ext_perm 相同），
@@ -888,14 +891,14 @@ pub(crate) fn connector_for_fingerprint(fp: &Fingerprint) -> Option<io::Result<F
                 alps: EDGE_106_ALPS,
             }))
         }
-        Fingerprint::Hello360_11_0 => {
+        Fingerprint::Qihoo360 | Fingerprint::Hello360_11_0 => {
             Some(qihoo_360_11_0_connector().map(|c| FingerprintConfig {
                 connector: c,
                 key_shares: QIHOO_360_11_0_KEY_SHARES,
                 alps: QIHOO_360_11_0_ALPS,
             }))
         }
-        Fingerprint::HelloQq_11_1 => {
+        Fingerprint::Qq | Fingerprint::HelloQq_11_1 => {
             Some(qq_11_1_connector().map(|c| FingerprintConfig {
                 connector: c,
                 key_shares: QQ_11_1_KEY_SHARES,

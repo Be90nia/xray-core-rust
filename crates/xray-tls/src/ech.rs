@@ -162,7 +162,7 @@ impl EchConfigCache {
         f: impl FnOnce(&EchConfigRecord) -> (EchConfigRecord, R),
     ) -> R {
         let mut guard = self.inner.lock().expect("ECH cache mutex poisoned");
-        let (new_record, result) = f(&*guard);
+        let (new_record, result) = f(&guard);
         *guard = new_record;
         result
     }

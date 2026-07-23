@@ -654,4 +654,85 @@ mod tests {
             }
         }
     }
+
+    /// 全指纹端到端测试：所有 Modern 指纹 × 3 真实 TLS 服务器。
+    /// 标 #[ignore] 因需要网络——CI 默认跳过，手动跑 `cargo test -- --ignored`。
+    ///
+    /// 验证每个指纹都能成功握手 + ALPN 协商为 h2 或 http/1.1。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn btls_all_modern_fingerprints_handshake() {
+        let fingerprints: Vec<(Fingerprint, &str)> = vec![
+            (Fingerprint::Chrome, "Chrome(preset)"),
+            (Fingerprint::HelloChrome133, "Chrome133"),
+            (Fingerprint::HelloChrome131, "Chrome131"),
+            (Fingerprint::HelloChrome120, "Chrome120"),
+            (Fingerprint::Firefox, "Firefox(preset)"),
+            (Fingerprint::HelloFirefox148, "Firefox148"),
+            (Fingerprint::HelloFirefox120, "Firefox120"),
+            (Fingerprint::Safari, "Safari(preset)"),
+            (Fingerprint::HelloSafari26_3, "Safari26.3"),
+            (Fingerprint::Ios, "iOS(preset)"),
+            (Fingerprint::HelloIos14, "iOS14"),
+            (Fingerprint::HelloIos13, "iOS13"),
+            (Fingerprint::Edge, "Edge(preset)"),
+            (Fingerprint::HelloEdge106, "Edge106"),
+            (Fingerprint::Qihoo360, "360(preset)"),
+            (Fingerprint::Hello360_11_0, "360_11.0"),
+            (Fingerprint::Qq, "QQ(preset)"),
+            (Fingerprint::HelloQq_11_1, "QQ_11.1"),
+        ];
+
+        let servers = ["cloudflare.com:443", "google.com:443", "github.com:443"];
+
+        let mut ok = 0usize;
+        let mut fail = 0usize;
+        let mut errors = Vec::new();
+
+        for (fp, fp_name) in &fingerprints {
+            for server in &servers {
+                let tcp = match tokio::net::TcpStream::connect(server).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        errors.push(format!("{fp_name} → {server}: TCP 失败: {e}"));
+                        fail += 1;
+                        continue;
+                    }
+                };
+
+                match crate::btls_client::BtlsConn::connect(
+                    TcpConnection::new(tcp),
+                    server.trim_end_matches(":443"),
+                    *fp,
+                )
+                .await
+                {
+                    Ok(conn) => {
+                        let alpn = conn.negotiated_protocol().await;
+                        if alpn == "h2" || alpn == "http/1.1" || alpn.is_empty() {
+                            ok += 1;
+                        } else {
+                            errors.push(format!("{fp_name} → {server}: ALPN 异常: {alpn}"));
+                            fail += 1;
+                        }
+                    }
+                    Err(e) => {
+                        errors.push(format!("{fp_name} → {server}: 握手失败: {e}"));
+                        fail += 1;
+                    }
+                }
+            }
+        }
+
+        if !errors.is_empty() {
+            eprintln!("\n=== btls 全指纹测试失败详情 ===");
+            for e in &errors {
+                eprintln!("  {e}");
+            }
+        }
+        assert_eq!(
+            fail, 0,
+            "{fail} 个指纹握手失败（{ok} 成功），见上方详情"
+        );
+    }
 }
