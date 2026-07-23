@@ -41,7 +41,7 @@ impl Handler {
         let rules: Vec<DnsRule> = config.rule.iter().map(DnsRule::from_config).collect();
         Self {
             rules,
-            rewrite_server: config.rewrite_server.clone().map(|ep| {
+            rewrite_server: config.rewrite_server.clone().map(|_ep| {
                 // ponytail: IPOrDomain → Destination 转换留切片3 强类型化。
                 // 当前从 prost Endpoint 提取 address/port。
                 Destination::tcp(

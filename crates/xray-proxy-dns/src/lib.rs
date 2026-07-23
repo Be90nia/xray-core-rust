@@ -21,9 +21,13 @@ pub mod config;
 pub mod dns_message;
 pub mod error;
 pub mod handler;
+pub mod inbound;
+pub mod outbound;
 
 // 顶层 re-export。
 pub use config::{Config, DnsRule, DnsRuleConfig, RuleAction};
 pub use dns_message::{DnsHeader, DnsQuestion, build_dns_response, parse_dns_query};
 pub use error::{DnsProxyError, Result};
 pub use handler::{Handler, ProcessOutcome, decide_action};
+pub use inbound::DnsInbound;
+pub use outbound::DnsOutbound;
