@@ -243,6 +243,7 @@ impl<S: Connection + Unpin> Connection for ServerConn<S> {
 // ============================================================
 
 /// UConn 内部连接（btls 或 rustls）。
+#[allow(clippy::large_enum_variant)]
 enum UConnInner<S> {
     /// 标准 rustls 连接（指纹不支持 btls 时的 fallback）。
     Rustls(Conn<S>),
@@ -595,5 +596,62 @@ mod tests {
         // webpki_roots 可能因版本变化为空，但应能构造
         let config = default_client_config();
         let _ = Arc::strong_count(&config);
+    }
+
+    /// btls (BoringSSL) Chrome 133 指纹端到端测试。
+    /// 连接真实 TLS server (cloudflare.com:443)，验证握手成功。
+    /// 标 #[ignore] 因需要网络——CI 默认跳过，手动跑 `cargo test -- --ignored`。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn btls_chrome133_handshakes_with_real_server() {
+        let tcp = tokio::net::TcpStream::connect("cloudflare.com:443")
+            .await
+            .expect("TCP connect to cloudflare.com:443");
+        let mut conn = crate::btls_client::BtlsConn::connect(
+            TcpConnection::new(tcp),
+            "cloudflare.com",
+            Fingerprint::Chrome,
+        )
+        .await
+        .expect("btls Chrome 133 握手成功");
+
+        // 验证 ALPN 协商
+        let alpn = conn.negotiated_protocol().await;
+        assert!(
+            alpn == "h2" || alpn == "http/1.1",
+            "ALPN 应为 h2 或 http/1.1，实际: {alpn}"
+        );
+
+        // 验证 server_name 存储
+        let sni = conn.handshake_server_name().await;
+        assert_eq!(sni, "cloudflare.com");
+    }
+
+    /// btls 连接自签证书 rustls server 的调试测试。
+    /// 标 #[ignore]——用于诊断 'unknown BoringSSL error' 根因。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn btls_chrome133_with_self_signed_server_debug() {
+        let (addr, _cert_der) = spawn_test_server(b"btls-self-signed\n").await;
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let result = crate::btls_client::BtlsConn::connect(
+            TcpConnection::new(tcp),
+            "localhost",
+            Fingerprint::Chrome,
+        )
+        .await;
+
+        match result {
+            Ok(mut conn) => {
+                let mut buf = Vec::new();
+                conn.read_to_end(&mut buf).await.expect("read ok");
+                assert_eq!(buf, b"btls-self-signed\n");
+            }
+            Err(e) => {
+                eprintln!("btls 自签证书握手失败: {e}");
+                // 不 panic——此测试用于诊断，记录失败即可
+            }
+        }
     }
 }

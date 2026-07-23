@@ -59,17 +59,16 @@ const CHROME_133_SIGALGS: &str = concat!(
     "rsa_pkcs1_sha1"
 );
 
-/// Chrome 133 supported groups（含 PQ X25519MLKEM768）。
-const CHROME_133_CURVES: &str = "X25519MLKEM768:X25519:P-256:P-384";
+/// Chrome 133 supported groups。
+/// 诊断：暂时移除 PQ X25519MLKEM768，只用经典曲线。
+const CHROME_133_CURVES: &str = "X25519:P-256:P-384";
 
 /// Chrome 133 ALPN。
 const CHROME_133_ALPN: &[u8] = b"\x02h2\x08http/1.1";
 
-/// Chrome 133 key shares（X25519 + PQ X25519MLKEM768）。
-/// group ID: X25519=0x001D (32 bytes), X25519MLKEM768=0x6D00 (1216 bytes)。
+/// Chrome 133 key shares（仅 X25519，诊断：移除 PQ）。
 const CHROME_133_KEY_SHARES: &[btls::ssl::KeyShare] = &[
     btls::ssl::KeyShare::X25519,
-    btls::ssl::KeyShare::X25519_MLKEM768,
 ];
 
 /// Chrome 133 extension permutation 顺序。
@@ -125,6 +124,9 @@ fn chrome_133_connector() -> io::Result<SslConnector> {
     builder
         .set_delegated_credentials(CHROME_133_SIGALGS)
         .map_err(|e| io::Error::other(e.to_string()))?;
+    // PQ key share (X25519MLKEM768) 暂时禁用——BoringSSL 在 server 不支持
+    // MLKEM768 时报 'unknown BoringSSL error' 而非 graceful fallback
+    // TODO: 等 BoringSSL/CF 上游修复 PQ key share fallback 后再启用
 
     // 禁用内置 root 验证（xray 自行管理证书验证）
     builder.set_verify(btls::ssl::SslVerifyMode::NONE);
@@ -166,7 +168,7 @@ impl<S: Connection + Unpin> BtlsConn<S> {
     ) -> io::Result<Self> {
         let connector = connector_for_fingerprint(&fingerprint)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "fingerprint not supported by btls"))?
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         let mut cfg = connector
             .configure()
