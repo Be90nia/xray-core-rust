@@ -5,7 +5,12 @@
 //!
 //! # 支持的指纹
 //!
-//! 当前仅移植 Chrome 133 指纹（含 PQ X25519MLKEM768 key share）。
+//! - Chrome 133（含 ALPS / delegated_credentials / record_size_limit）
+//! - Firefox 148
+//! - Safari 26.3 (macOS)
+//! - iOS 18.4（与 Safari 相同但双 key share）
+//! - Edge 133（复用 Chrome 133 配置）
+//!
 //! 其他指纹将 fallback 到标准 rustls。
 
 use std::future::Future;
@@ -14,13 +19,30 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use btls::ssl::{SslConnector, SslMethod};
+use btls::ssl::{KeyShare, SslConnector, SslMethod};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_btls::SslStream as TokioSslStream;
 use tracing::debug;
 use xray_transport::connection::Connection;
 
 use crate::fingerprint::Fingerprint;
+
+// ============================================================
+// 指纹配置输出：connector + per-connection 参数
+// ============================================================
+
+/// 指纹配置：SslConnector + 握手时 per-connection 参数。
+///
+/// `connector_for_fingerprint()` 返回此结构体，`connect()` 据此配置
+/// key shares 和 ALPS 等只能在 `Ssl`（per-connection）上设置的选项。
+pub(crate) struct FingerprintConfig {
+    pub(crate) connector: SslConnector,
+    /// 握手时发送的 key shares。
+    pub(crate) key_shares: &'static [KeyShare],
+    /// ALPS (Application-Layer Protocol Settings, 0xfe0d) 数据。
+    /// Chrome 使用，Firefox/Safari 不使用（传空切片跳过）。
+    pub(crate) alps: &'static [u8],
+}
 
 // ============================================================
 // Chrome 133 指纹配置
@@ -67,12 +89,13 @@ const CHROME_133_CURVES: &str = "X25519:P-256:P-384";
 const CHROME_133_ALPN: &[u8] = b"\x02h2\x08http/1.1";
 
 /// Chrome 133 key shares（仅 X25519，诊断：移除 PQ）。
-const CHROME_133_KEY_SHARES: &[btls::ssl::KeyShare] = &[
-    btls::ssl::KeyShare::X25519,
+const CHROME_133_KEY_SHARES: &[KeyShare] = &[
+    KeyShare::X25519,
 ];
 
-/// Chrome 133 extension permutation 顺序。
-/// 参考 Go uTLS HelloChrome_120 + BoringSSL extension IDs。
+/// Chrome 133 ALPS 数据（h2）。
+const CHROME_133_ALPS: &[u8] = b"\x02h2";
+
 /// Chrome 133 extension permutation 顺序。
 /// 参考 Go uTLS HelloChrome_120 + BoringSSL extension IDs。
 fn chrome_133_ext_perm() -> Vec<btls::ssl::ExtensionType> {
@@ -134,10 +157,259 @@ fn chrome_133_connector() -> io::Result<SslConnector> {
     Ok(builder.build())
 }
 
+// ============================================================
+// Firefox 148 指纹配置
+// ============================================================
+
+/// Firefox 148 cipher suites（仅 BoringSSL 支持的，按原始顺序）。
+/// 原始 u16 列表含 Camellia/SEED 等旧 cipher，BoringSSL 不支持，已剔除。
+const FIREFOX_148_CIPHER_LIST: &str = concat!(
+    "TLS_AES_128_GCM_SHA256:",
+    "TLS_AES_256_GCM_SHA384:",
+    "TLS_CHACHA20_POLY1305_SHA256:",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:",
+    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:",
+    "TLS_RSA_WITH_AES_256_GCM_SHA384:",
+    "TLS_RSA_WITH_AES_128_GCM_SHA256:",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA:",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA:",
+    "TLS_DHE_RSA_WITH_AES_256_GCM_SHA384:",
+    "TLS_DHE_RSA_WITH_AES_128_GCM_SHA256:",
+    "TLS_DHE_RSA_WITH_AES_256_CBC_SHA:",
+    "TLS_DHE_RSA_WITH_AES_128_CBC_SHA:",
+    "TLS_RSA_WITH_AES_256_CBC_SHA:",
+    "TLS_RSA_WITH_AES_128_CBC_SHA:",
+    "TLS_RSA_WITH_3DES_EDE_CBC_SHA"
+);
+
+/// Firefox 148 signature algorithms。
+const FIREFOX_148_SIGALGS: &str = concat!(
+    "ecdsa_secp256r1_sha256:",
+    "rsa_pss_rsae_sha256:",
+    "rsa_pkcs1_sha256:",
+    "rsa_pss_rsae_sha384:",
+    "rsa_pss_rsae_sha512:",
+    "ecdsa_secp384r1_sha384:",
+    "rsa_pkcs1_sha384:",
+    "ecdsa_secp521r1_sha512:",
+    "rsa_pkcs1_sha512:",
+    "rsa_pkcs1_sha1:",
+    "ecdsa_sha1"
+);
+
+/// Firefox 148 supported groups：X25519, P-256, P-384, P-521。
+const FIREFOX_148_CURVES: &str = "X25519:P-256:P-384:P-521";
+
+/// Firefox 148 ALPN。
+const FIREFOX_148_ALPN: &[u8] = b"\x02h2\x08http/1.1";
+
+/// Firefox 148 key shares（仅 X25519，无 PQ）。
+const FIREFOX_148_KEY_SHARES: &[KeyShare] = &[KeyShare::X25519];
+
+/// Firefox 148 不使用 ALPS。
+const FIREFOX_148_ALPS: &[u8] = &[];
+
+/// Firefox 148 extension permutation 顺序。
+fn firefox_148_ext_perm() -> Vec<btls::ssl::ExtensionType> {
+    vec![
+        btls::ssl::ExtensionType::from(0x0000), // supported_versions
+        btls::ssl::ExtensionType::from(0x001b), // record_size_limit
+        btls::ssl::ExtensionType::from(0x0033), // key_share
+        btls::ssl::ExtensionType::from(0x002b), // compress_certificate
+        btls::ssl::ExtensionType::from(0x000d), // signature_algorithms
+        btls::ssl::ExtensionType::from(0x0012), // signed_cert_timestamp
+        btls::ssl::ExtensionType::from(0x000b), // ec_point_formats
+        btls::ssl::ExtensionType::from(0x0015), // padding
+        btls::ssl::ExtensionType::from(0x0017), // extended_master_secret
+        btls::ssl::ExtensionType::from(0x0023), // session_ticket
+        btls::ssl::ExtensionType::from(0x002d), // psk_key_exchange_modes
+        btls::ssl::ExtensionType::from(0x001c), // ALPS (Firefox 也发)
+        btls::ssl::ExtensionType::from(0x001d), // ? (0x001d)
+        btls::ssl::ExtensionType::from(0x0029), // ? (0x0029)
+        btls::ssl::ExtensionType::from(0x002a), // ? (0x002a)
+        btls::ssl::ExtensionType::from(0xfe0d), // application_settings
+    ]
+}
+
+/// 构建带 Firefox 148 指纹的 SslConnector。
+fn firefox_148_connector() -> io::Result<SslConnector> {
+    let mut builder =
+        SslConnector::builder(SslMethod::tls()).map_err(|e| io::Error::other(e.to_string()))?;
+
+    builder
+        .set_cipher_list(FIREFOX_148_CIPHER_LIST)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder
+        .set_sigalgs_list(FIREFOX_148_SIGALGS)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder
+        .set_curves_list(FIREFOX_148_CURVES)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder
+        .set_alpn_protos(FIREFOX_148_ALPN)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_grease_enabled(true);
+    builder.set_permute_extensions(true);
+    builder.set_extension_permutation(&firefox_148_ext_perm())
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    // Firefox 不使用 record_size_limit / delegated_credentials
+
+    // 禁用内置 root 验证（xray 自行管理证书验证）
+    builder.set_verify(btls::ssl::SslVerifyMode::NONE);
+
+    Ok(builder.build())
+}
+
+// ============================================================
+// Safari 26.3 指纹配置
+// ============================================================
+
+/// Safari 26.3 cipher suites（仅 BoringSSL 支持的，按原始顺序）。
+const SAFARI_26_3_CIPHER_LIST: &str = concat!(
+    "TLS_AES_128_GCM_SHA256:",
+    "TLS_AES_256_GCM_SHA384:",
+    "TLS_CHACHA20_POLY1305_SHA256:",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:",
+    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:",
+    "TLS_RSA_WITH_AES_256_GCM_SHA384:",
+    "TLS_RSA_WITH_AES_128_GCM_SHA256:",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA:",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA:",
+    "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA:",
+    "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA:",
+    "TLS_DHE_RSA_WITH_AES_256_GCM_SHA384:",
+    "TLS_DHE_RSA_WITH_AES_128_GCM_SHA256:",
+    "TLS_DHE_RSA_WITH_AES_256_CBC_SHA:",
+    "TLS_DHE_RSA_WITH_AES_128_CBC_SHA:",
+    "TLS_RSA_WITH_AES_256_CBC_SHA:",
+    "TLS_RSA_WITH_AES_128_CBC_SHA:",
+    "TLS_RSA_WITH_3DES_EDE_CBC_SHA"
+);
+
+/// Safari 26.3 signature algorithms。
+/// 与 Firefox 148 相同，额外包含 ed25519/ed448 系列。
+const SAFARI_26_3_SIGALGS: &str = concat!(
+    "ecdsa_secp256r1_sha256:",
+    "rsa_pss_rsae_sha256:",
+    "rsa_pkcs1_sha256:",
+    "rsa_pss_rsae_sha384:",
+    "rsa_pss_rsae_sha512:",
+    "ecdsa_secp384r1_sha384:",
+    "rsa_pkcs1_sha384:",
+    "ecdsa_secp521r1_sha512:",
+    "rsa_pkcs1_sha512:",
+    "rsa_pkcs1_sha1:",
+    "ecdsa_sha1:",
+    "ed25519:",
+    "rsa_pss_pss_sha256:",
+    "rsa_pss_pss_sha384:",
+    "rsa_pss_pss_sha512:",
+    "ed448"
+);
+
+/// Safari 26.3 supported groups：X25519, P-256, P-384, P-521。
+const SAFARI_26_3_CURVES: &str = "X25519:P-256:P-384:P-521";
+
+/// Safari 26.3 ALPN。
+const SAFARI_26_3_ALPN: &[u8] = b"\x02h2\x08http/1.1";
+
+/// Safari 26.3 key shares（仅 X25519）。
+const SAFARI_26_3_KEY_SHARES: &[KeyShare] = &[KeyShare::X25519];
+
+/// Safari 26.3 不使用 ALPS。
+const SAFARI_26_3_ALPS: &[u8] = &[];
+
+/// Safari 26.3 extension permutation 顺序（与 Firefox 148 相同）。
+fn safari_26_3_ext_perm() -> Vec<btls::ssl::ExtensionType> {
+    firefox_148_ext_perm()
+}
+
+/// 构建带 Safari 26.3 指纹的 SslConnector。
+fn safari_26_3_connector() -> io::Result<SslConnector> {
+    let mut builder =
+        SslConnector::builder(SslMethod::tls()).map_err(|e| io::Error::other(e.to_string()))?;
+
+    builder
+        .set_cipher_list(SAFARI_26_3_CIPHER_LIST)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder
+        .set_sigalgs_list(SAFARI_26_3_SIGALGS)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder
+        .set_curves_list(SAFARI_26_3_CURVES)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder
+        .set_alpn_protos(SAFARI_26_3_ALPN)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_grease_enabled(true);
+    builder.set_permute_extensions(true);
+    builder.set_extension_permutation(&safari_26_3_ext_perm())
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    // Safari 不使用 record_size_limit / delegated_credentials
+
+    // 禁用内置 root 验证（xray 自行管理证书验证）
+    builder.set_verify(btls::ssl::SslVerifyMode::NONE);
+
+    Ok(builder.build())
+}
+
+// ============================================================
+// iOS 18.4 指纹配置
+// ============================================================
+
+/// iOS 18.4 key shares（X25519 + P-256，与 Safari 不同）。
+const IOS_18_4_KEY_SHARES: &[KeyShare] = &[KeyShare::X25519, KeyShare::P256];
+
+/// iOS 18.4 不使用 ALPS。
+const IOS_18_4_ALPS: &[u8] = &[];
+
+// iOS 18.4 复用 Safari 26.3 的 connector（cipher/sigalgs/curves/ALPN/ext_perm 相同），
+// 仅 key shares 不同（双 key share: X25519 + P-256）。
+
 /// 根据指纹选择 btls 连接器。返回 `None` 表示该指纹不支持 btls（fallback rustls）。
-pub fn connector_for_fingerprint(fp: &Fingerprint) -> Option<io::Result<SslConnector>> {
+pub(crate) fn connector_for_fingerprint(fp: &Fingerprint) -> Option<io::Result<FingerprintConfig>> {
     match fp {
-        Fingerprint::Chrome => Some(chrome_133_connector()),
+        Fingerprint::Chrome | Fingerprint::HelloChrome120 | Fingerprint::HelloChrome131 | Fingerprint::HelloChrome133 => {
+            Some(chrome_133_connector().map(|c| FingerprintConfig {
+                connector: c,
+                key_shares: CHROME_133_KEY_SHARES,
+                alps: CHROME_133_ALPS,
+            }))
+        }
+        Fingerprint::Firefox | Fingerprint::HelloFirefox148 => {
+            Some(firefox_148_connector().map(|c| FingerprintConfig {
+                connector: c,
+                key_shares: FIREFOX_148_KEY_SHARES,
+                alps: FIREFOX_148_ALPS,
+            }))
+        }
+        Fingerprint::Safari | Fingerprint::HelloSafari26_3 => {
+            Some(safari_26_3_connector().map(|c| FingerprintConfig {
+                connector: c,
+                key_shares: SAFARI_26_3_KEY_SHARES,
+                alps: SAFARI_26_3_ALPS,
+            }))
+        }
+        Fingerprint::Ios | Fingerprint::HelloIos14 => {
+            Some(safari_26_3_connector().map(|c| FingerprintConfig {
+                connector: c,
+                key_shares: IOS_18_4_KEY_SHARES,
+                alps: IOS_18_4_ALPS,
+            }))
+        }
+        Fingerprint::Edge | Fingerprint::HelloEdge106 => {
+            Some(chrome_133_connector().map(|c| FingerprintConfig {
+                connector: c,
+                key_shares: CHROME_133_KEY_SHARES,
+                alps: CHROME_133_ALPS,
+            }))
+        }
         _ => None,
     }
 }
@@ -166,11 +438,11 @@ impl<S: Connection + Unpin> BtlsConn<S> {
         server_name: &str,
         fingerprint: Fingerprint,
     ) -> io::Result<Self> {
-        let connector = connector_for_fingerprint(&fingerprint)
+        let fp_config = connector_for_fingerprint(&fingerprint)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "fingerprint not supported by btls"))?
             .map_err(|e| io::Error::other(e.to_string()))?;
 
-        let mut cfg = connector
+        let mut cfg = fp_config.connector
             .configure()
             .map_err(|e| io::Error::other(e.to_string()))?;
         cfg.set_verify_hostname(false);
@@ -179,12 +451,13 @@ impl<S: Connection + Unpin> BtlsConn<S> {
             .into_ssl(server_name)
             .map_err(|e| io::Error::other(e.to_string()))?;
 
-        // per-connection 配置
-        ssl.set_client_key_shares(CHROME_133_KEY_SHARES)
+        // per-connection 配置：key shares 和 ALPS 按指纹不同
+        ssl.set_client_key_shares(fp_config.key_shares)
             .map_err(|e| io::Error::other(e.to_string()))?;
-        ssl.add_application_settings(b"\x02h2")
-            .map_err(|e| io::Error::other(e.to_string()))?;
-
+        if !fp_config.alps.is_empty() {
+            ssl.add_application_settings(fp_config.alps)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+        }
         debug!(
             target: "xray_tls::btls",
             fingerprint = ?fingerprint,
