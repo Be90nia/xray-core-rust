@@ -445,16 +445,34 @@ impl MetricsHttpServer for TokioHttpServer {
 
     fn serve_outbound(
         &self,
-        _outbound: Arc<Outbound>,
-        _stats: Arc<dyn StatsCollector>,
-        _obs: Option<Arc<dyn ObservationCollector>>,
+        outbound: Arc<Outbound>,
+        stats: Arc<dyn StatsCollector>,
+        obs: Option<Arc<dyn ObservationCollector>>,
     ) -> Result<(), MetricsError> {
-        // 切片2 stub：完整实现需要桥接 OutboundListener.accept（同步 Condvar）到 tokio，
-        // 推迟到 dispatcher 切片3 outbound 路径完成后再做。
-        tracing::info!(
-            target: "xray_app_metrics",
-            "TokioHttpServer::serve_outbound: stub (postponed to dispatcher slice3)"
-        );
+        let shutdown = self.inner.shutdown.clone();
+        let inner = self.inner.clone();
+        let listener = outbound.listener_clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.notified() => break,
+                    conn = tokio::task::spawn_blocking({
+                        let l = listener.clone();
+                        move || l.accept()
+                    }) => {
+                        let Ok(boxed) = conn else { continue; };
+                        let Ok(conn) = boxed else { break; };
+                        let stats = stats.clone();
+                        let obs = obs.clone();
+                        let shutdown = shutdown.clone();
+                        let h = tokio::spawn(serve_boxed_conn(conn, stats, obs, shutdown));
+                        inner.join_handles.lock().push(h);
+                    }
+                }
+            }
+        });
+        self.inner.join_handles.lock().push(handle);
         Ok(())
     }
 }
@@ -495,6 +513,26 @@ async fn serve_one(
     };
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.shutdown().await;
+}
+
+/// 处理从 OutboundListener 接受的 BoxedConn。
+///
+/// 期望 conn 内部是 `tokio::net::TcpStream`（或任何可 AsyncRead+AsyncWrite 的类型），
+/// 目前仅支持 TcpStream。若类型不匹配则静默丢弃（与 Go 版一致）。
+async fn serve_boxed_conn(
+    conn: crate::outbound::BoxedConn,
+    stats: Arc<dyn StatsCollector>,
+    obs: Option<Arc<dyn ObservationCollector>>,
+    shutdown: Arc<tokio::sync::Notify>,
+) {
+    let stream = match conn.downcast::<tokio::net::TcpStream>() {
+        Ok(s) => *s,
+        Err(_) => {
+            tracing::warn!(target: "xray_app_metrics", "serve_boxed_conn: unsupported conn type, expected TcpStream");
+            return;
+        }
+    };
+    serve_one(stream, stats, obs, shutdown).await;
 }
 
 

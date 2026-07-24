@@ -9,8 +9,12 @@
 
 use std::any::Any;
 use std::collections::VecDeque;
-
+use std::sync::Arc;
+use async_trait::async_trait;
 use parking_lot::{Condvar, Mutex};
+use xray_common::net::destination::Destination;
+use xray_common::session::Session;
+use xray_features::outbound::{OutboundError, OutboundHandler};
 
 use crate::error::{at_warning, MetricsError};
 
@@ -35,19 +39,28 @@ struct ListenerInner {
 /// - `accept`：阻塞等待连接，关闭后返回 `ListenerClosed`。
 /// - `close`：标记关闭，丢弃所有缓冲中的连接（调用方负责 close 内部 conn）。
 pub struct OutboundListener {
-    inner: Mutex<ListenerInner>,
-    cv: Condvar,
+    inner: Arc<Mutex<ListenerInner>>,
+    cv: Arc<Condvar>,
+}
+
+impl Clone for OutboundListener {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            cv: self.cv.clone(),
+        }
+    }
 }
 
 impl OutboundListener {
     /// 创建空的 listener。
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(ListenerInner {
+            inner: Arc::new(Mutex::new(ListenerInner {
                 queue: VecDeque::with_capacity(BUFFER_CAPACITY),
                 closed: false,
-            }),
-            cv: Condvar::new(),
+            })),
+            cv: Arc::new(Condvar::new()),
         }
     }
 
@@ -150,6 +163,14 @@ impl Outbound {
         &self.listener
     }
 
+    /// 克隆 listener（Arc 语义，用于跨 task 共享）。
+    pub fn listener_clone(&self) -> OutboundListener {
+        OutboundListener {
+            inner: self.listener.inner.clone(),
+            cv: self.listener.cv.clone(),
+        }
+    }
+
     /// 把一个 conn 投递到 listener；关闭后丢弃并记录 warning。
     pub fn dispatch(&self, conn: BoxedConn) {
         if *self.closed.lock() {
@@ -183,6 +204,38 @@ impl Outbound {
     /// 是否已关闭。
     pub fn is_closed(&self) -> bool {
         *self.closed.lock()
+    }
+}
+
+#[async_trait]
+impl OutboundHandler for Outbound {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    /// Metrics outbound 的 dial：把连接投递到内部 listener。
+    ///
+    /// 对应 Go 版 `Outbound.Dispatch`：上层 dispatcher 通过 dial 把 Link 包装为
+    /// BoxedConn 后投递到 listener，再由 HTTP server 接走。
+    async fn dial(
+        &self,
+        _destination: &Destination,
+        _session: &Session,
+    ) -> Result<(), OutboundError> {
+        // metrics outbound 不真正代理流量，而是把连接路由到内部 HTTP 接口。
+        // 调用方需先把 Link 包装为 BoxedConn，再调 dispatch()。
+        // 此处仅检查关闭状态，实际 dispatch 由调用方显式完成（与 Go 版一致）。
+        if *self.closed.lock() {
+            return Err(OutboundError::ConnectionFailed(
+                "metrics outbound closed".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn can_handle(&self, _destination: &Destination) -> bool {
+        // metrics outbound 只处理 metrics 流量，不区分 destination。
+        true
     }
 }
 
