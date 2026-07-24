@@ -271,18 +271,25 @@ impl HysteriaClient {
             .ok_or(HysteriaError::ConnectionClosed)?;
         let local = conn.local_addr();
         let remote = conn.remote_addr();
-        let mgr = {
+        // ponytail: parking_lot guard 不能跨 await 持有（!Send）。
+        // 锁内仅创建 manager + 标记是否需 start，锁外再调 start().await。
+        let (mgr, needs_start) = {
             let mut g = self.udp_sm.lock();
-            if g.is_none() {
+            if let Some(m) = g.as_ref() {
+                (Arc::clone(m), false)
+            } else {
                 let m = UdpSessionManager::new(
                     std::time::Duration::from_secs(self.config.udp_idle_timeout.max(0) as u64),
                     None,
                 );
-                m.start(Arc::clone(&conn), local, remote).await;
+                let m_arc = Arc::clone(&m);
                 *g = Some(m);
+                (m_arc, true)
             }
-            Arc::clone(g.as_ref().unwrap())
         };
+        if needs_start {
+            mgr.start(Arc::clone(&conn), local, remote).await;
+        }
         mgr.create_session(conn, local, remote).await
     }
 }

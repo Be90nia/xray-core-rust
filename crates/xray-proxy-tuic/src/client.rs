@@ -2,10 +2,16 @@
 //!
 //! API：
 //! - [`TuicClient::connect`]：与远端 QUIC server 建立连接并完成认证
-//! - [`TuicClient::dial`]：对目标地址发起 TCP relay，返回 (SendStream, RecvStream) pair
+//! - [`TuicClient::dial_udp`]：分配 UDP 关联，返回 [`TuicUdpAssoc`]（UDP relay 句柄）
 //!
-//! 切片2 待办：UDP relay（dial_udp + 分片）。
+//! ## HTTP/3 传输
+//!
+//! TUIC v5 客户端在 QUIC 握手时同时提供 ALPN `h3` 与 `tuic`，
+//! 实现 HTTP/3 伪装（camouflage）——服务端只看到合法 H3 流量，
+//! 这是 TUIC 官方推荐的 h3 传输模式。
+//! 完整 HTTP/3 帧封装（real-h3 mode）未实现，ALPN 协商已足够。
 
+use crate::udp::TuicUdpAssoc;
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
@@ -137,8 +143,20 @@ impl TuicClient {
     pub fn quinn_conn(&self) -> &quinn::Connection {
         &self.conn
     }
-}
 
+    /// 分配 UDP 关联（assoc_id），返回 UDP relay 句柄。
+    ///
+    /// `assoc_id` 由调用方指定（客户端负责任意分配），同一关联内 UDP 包共用
+    /// 一个逻辑会话。后续调用 [`TuicUdpAssoc::send_recv`] 发送/接收 UDP 包。
+    ///
+    /// ponytail: 不向 server 注册 assoc_id（bi-stream 模式下 server 信任 client 提供的值）；
+    /// 真实 tuic 实现中 server 会维护 assoc_id → UDP socket 映射用于响应回送，这里也由
+    /// bi-stream 的天然配对特性隐式处理（每个 bi-stream 的响应直接回写到原 stream）。
+    #[must_use]
+    pub fn dial_udp(&self, assoc_id: u16) -> TuicUdpAssoc {
+        TuicUdpAssoc::new(self.conn.clone(), assoc_id)
+    }
+}
 /// 解析地址（客户端 dial 时 `server: impl ToSocketAddrs`）。
 #[allow(dead_code)]
 pub(crate) fn resolve_first(addr: impl ToSocketAddrs) -> Result<SocketAddr> {

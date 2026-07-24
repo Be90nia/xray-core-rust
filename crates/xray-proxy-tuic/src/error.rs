@@ -43,6 +43,18 @@ pub enum TuicError {
     #[error("tls keying material export failed")]
     KeyingMaterialExport,
 
+    /// UDP 包分片（切片2 未实现重组）。
+    #[error("packet fragmentation unsupported: frag_total={frag_total}, frag_id={frag_id}")]
+    UnsupportedFragment { frag_total: u8, frag_id: u8 },
+
+    /// UDP 包负载超过 [`crate::protocol::packet::MAX_PACKET_PAYLOAD`]。
+    #[error("packet payload too large: {0} bytes")]
+    PacketTooLarge(usize),
+
+    /// UDP relay 超时（mock server 等待 UDP 响应）。
+    #[error("udp relay timeout after {0:?}")]
+    UdpTimeout(std::time::Duration),
+
     /// io 错误。
     #[error("io error: {0}")]
     Io(#[from] io::Error),

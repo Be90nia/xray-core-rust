@@ -23,8 +23,12 @@
 pub mod config;
 pub mod device;
 pub mod error;
+pub mod netstack;
+pub mod inbound;
 
 // 顶层 re-export。
 pub use config::{Stack, StackOptions, Tun, score};
 pub use device::TunDevice;
+pub use inbound::TunInboundHandler;
+pub use netstack::TunNetStack;
 pub use error::{Result, TunError};

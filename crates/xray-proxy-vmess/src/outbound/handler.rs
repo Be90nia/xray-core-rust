@@ -2,9 +2,12 @@
 //!
 //! 对应 Go 版本 `proxy/vmess/outbound/outbound.go`。`Process` 主入口依赖
 //! `transport::Link` + `retry` + `signal` + `internet::Dialer` 全链路，留 trait stub。
+//!
+//! 全异步：连接建立与数据传输均通过 tokio 异步 API。
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use xray_common::protocol::RequestHeader;
 
 use crate::account::MemoryAccount;
@@ -14,13 +17,15 @@ use crate::error::{Result, VmessError};
 /// Outbound 处理器主入口 trait（对应 Go `outbound.Handler.Process`）。
 ///
 /// 上层 transport 注入实际 IO 实现，本 crate 不直接依赖 transport。
+/// 全异步：拨号 + body 转发全走 tokio 异步路径。
+#[async_trait]
 pub trait OutboundProcessor: Send + Sync {
     /// 处理一个出站请求：拨号 + 编码请求头 + 转发 body。
     ///
     /// # Errors
     ///
     /// 实现相关。当前所有内置实现返回 [`VmessError::NotImplemented`]。
-    fn process(
+    async fn process(
         &self,
         session: &ClientSession,
         header: &RequestHeader,
@@ -31,8 +36,9 @@ pub trait OutboundProcessor: Send + Sync {
 /// Noop 处理器：始终返回 `NotImplemented`。
 pub struct NoopOutboundProcessor;
 
+#[async_trait]
 impl OutboundProcessor for NoopOutboundProcessor {
-    fn process(
+    async fn process(
         &self,
         _session: &ClientSession,
         _header: &RequestHeader,
@@ -44,7 +50,7 @@ impl OutboundProcessor for NoopOutboundProcessor {
 
 /// VMess outbound Handler（对应 Go `outbound.Handler`）。
 ///
-/// 持有当前账户（reciver） + processor 注入点。
+/// 持有当前账户（receiver） + processor 注入点。
 pub struct OutboundHandler {
     /// 当前 receiver 账户（VMess outbound 必须绑定一个账户）。
     pub account: MemoryAccount,
@@ -54,6 +60,7 @@ pub struct OutboundHandler {
 
 impl OutboundHandler {
     /// 创建新 handler。
+    #[must_use]
     pub fn new(account: MemoryAccount) -> Self {
         Self {
             account,
@@ -62,6 +69,7 @@ impl OutboundHandler {
     }
 
     /// 用自定义 processor 创建。
+    #[must_use]
     pub fn with_processor(
         account: MemoryAccount,
         processor: Arc<dyn OutboundProcessor>,
@@ -69,16 +77,16 @@ impl OutboundHandler {
         Self { account, processor }
     }
 
-    /// 处理出站请求。
+    /// 处理出站请求（异步）。
     ///
     /// # Errors
     ///
     /// 委托给 processor。
-    pub fn process(&self, session: &ClientSession, header: &RequestHeader) -> Result<()> {
-        self.processor.process(session, header, &self.account)
+    pub async fn process(&self, session: &ClientSession, header: &RequestHeader) -> Result<()> {
+        self.processor.process(session, header, &self.account).await
     }
 
-    /// 编码请求头（不涉及 IO，直接调用 `ClientSession::encode_request_header`）。
+    /// 编码请求头（不涉及 IO，纯计算）。
     ///
     /// # Errors
     ///
@@ -106,8 +114,8 @@ mod tests {
         MemoryAccount::new(UUID::parse("66ad4540-b58c-4ad2-9926-ea63445a9b57").expect("uuid"))
     }
 
-    #[test]
-    fn noop_processor_returns_not_implemented() {
+    #[tokio::test]
+    async fn noop_processor_returns_not_implemented() {
         let p = NoopOutboundProcessor;
         let session = ClientSession::new();
         let header = RequestHeader::new(
@@ -117,12 +125,12 @@ mod tests {
             SecurityType::Aes128Gcm,
         );
         let account = sample_account();
-        let err = p.process(&session, &header, &account).unwrap_err();
+        let err = p.process(&session, &header, &account).await.unwrap_err();
         assert!(matches!(err, VmessError::NotImplemented(_)));
     }
 
-    #[test]
-    fn handler_new_creates_with_noop() {
+    #[tokio::test]
+    async fn handler_new_creates_with_noop() {
         let handler = OutboundHandler::new(sample_account());
         let session = ClientSession::new();
         let header = RequestHeader::new(
@@ -131,7 +139,7 @@ mod tests {
             Destination::tcp(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(80)),
             SecurityType::Aes128Gcm,
         );
-        let err = handler.process(&session, &header).unwrap_err();
+        let err = handler.process(&session, &header).await.unwrap_err();
         assert!(matches!(err, VmessError::NotImplemented(_)));
     }
 

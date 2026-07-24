@@ -28,6 +28,14 @@ pub enum WgError {
     /// IO 错误。
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// smoltcp 网络栈错误。
+    #[error("netstack error: {0}")]
+    NetStack(String),
+
+    /// driver task 内部错误（如 socket 未就绪）。
+    #[error("driver error: {0}")]
+    Driver(String),
 }
 
 /// WireGuard 操作 Result 别名。

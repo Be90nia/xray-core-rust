@@ -13,12 +13,16 @@ pub struct HysteriaConfig {
     pub server_addr: String,
     /// TLS SNI（默认等于 server_addr 的 host 部分）。
     pub server_name: String,
-    /// 鉴权 token。
+    /// 鉴权 token（明文或 base64 编码，由 [`auth_header_value`] 统一处理）。
     pub auth: String,
     /// QUIC ALPN 协议列表（hysteria 默认 `hysteria`/`h3`）。
     pub alpn: Vec<String>,
     /// Brutal 拥塞控制上行带宽（bps，0=禁用 Brutal）。
     pub brutal_up_bps: u64,
+    /// Brutal 拥塞控制下行带宽（bps，0=禁用 Brutal，服务端 auth 响应回传）。
+    pub brutal_down_bps: u64,
+    /// Salamander 混淆密码（None=不启用 obfs）。
+    pub obfs: Option<String>,
     /// UDP session 空闲超时（秒）。
     pub udp_idle_timeout_secs: u64,
 }
@@ -41,6 +45,8 @@ impl HysteriaConfig {
             auth: auth.into(),
             alpn: Self::DEFAULT_ALPN.iter().map(|s| (*s).to_string()).collect(),
             brutal_up_bps: 0,
+            brutal_down_bps: 0,
+            obfs: None,
             udp_idle_timeout_secs: Self::DEFAULT_UDP_IDLE_TIMEOUT,
         }
     }
@@ -64,6 +70,30 @@ impl HysteriaConfig {
     pub fn with_brutal_up(mut self, bps: u64) -> Self {
         self.brutal_up_bps = bps;
         self
+    }
+
+    /// 设置 Brutal 下行带宽。
+    #[must_use]
+    pub fn with_brutal_down(mut self, bps: u64) -> Self {
+        self.brutal_down_bps = bps;
+        self
+    }
+
+    /// 设置 Salamander 混淆密码（启用 obfs）。
+    #[must_use]
+    pub fn with_obfs(mut self, password: impl Into<String>) -> Self {
+        self.obfs = Some(password.into());
+        self
+    }
+
+    /// 返回 auth 的 HTTP 头值。
+    ///
+    /// Hysteria 协议支持两种 auth 格式：
+    /// - 明文 password：直接作为 `Hysteria-Auth` 头值
+    /// - base64 编码：以 `base64:` 前缀标识，本方法去掉前缀后返回原始 base64
+    #[must_use]
+    pub fn auth_header_value(&self) -> &str {
+        self.auth.strip_prefix("base64:").unwrap_or(&self.auth)
     }
 
     /// 验证配置完整。
@@ -95,6 +125,8 @@ impl HysteriaConfig {
             auth: transport.auth.clone(),
             alpn: Self::DEFAULT_ALPN.iter().map(|s| (*s).to_string()).collect(),
             brutal_up_bps: 0,
+            brutal_down_bps: 0,
+            obfs: None,
             udp_idle_timeout_secs: transport.udp_idle_timeout.max(0) as u64,
         }
     }
@@ -176,5 +208,26 @@ mod tests {
         assert_eq!(cfg.auth, "transport-auth");
         assert_eq!(cfg.udp_idle_timeout_secs, 120);
         assert_eq!(cfg.server_name, "server.com");
+    }
+
+    #[test]
+    fn auth_header_value_strips_base64_prefix() {
+        let cfg = HysteriaConfig::new("a.com:443", "base64:dGVzdA==");
+        assert_eq!(cfg.auth_header_value(), "dGVzdA==");
+    }
+
+    #[test]
+    fn auth_header_value_passthrough_plaintext() {
+        let cfg = HysteriaConfig::new("a.com:443", "plain-password");
+        assert_eq!(cfg.auth_header_value(), "plain-password");
+    }
+
+    #[test]
+    fn with_brutal_down_and_obfs_chain() {
+        let cfg = HysteriaConfig::new("a.com:443", "x")
+            .with_brutal_down(5_000_000)
+            .with_obfs("salamander-key");
+        assert_eq!(cfg.brutal_down_bps, 5_000_000);
+        assert_eq!(cfg.obfs.as_deref(), Some("salamander-key"));
     }
 }

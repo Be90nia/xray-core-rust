@@ -11,9 +11,11 @@ xray-features = { path = "../xray-features" }
 xray-proto = { path = "../xray-proto" }
 xray-transport = { path = "../xray-transport" }
 xray-app-dispatcher = { path = "../xray-app-dispatcher" }
+xray-buf = { path = "../xray-buf" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 xray-buf = { path = "../xray-buf" }

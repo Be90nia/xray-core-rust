@@ -1,20 +1,24 @@
-//! TUIC v5 mock server（切片1：用于 loopback 测试，不是生产 server）。
+//! TUIC v5 mock server（切片1：TCP relay + 切片2：UDP relay）。
 //!
 //! Mock 行为：
 //! 1. 自签 TLS 证书（rcgen）
-//! 2. quinn Endpoint::server 监听
+//! 2. quinn Endpoint::server 监听，ALPN 协商 h3 + tuic
 //! 3. accept_uni → Authenticate 校验 token（export_keying_material）
 //! 4. accept_bi → Connect → tokio TCP dial 目标 → 双向 copy（true relay）
+//! 5. accept_bi → Packet → tokio UDP dial 目标 → 单次 recv_from 响应 → Packet 帧回写
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
+use bytes::BufMut;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::error::{Result, TuicError};
-use crate::protocol::command::TOKEN_LEN;
+use crate::protocol::command::{type_code, TOKEN_LEN};
+use crate::protocol::{Address, Command, Packet};
 
 /// 自签证书产物（仅 mock 用）。
 struct TlsCert {
@@ -38,7 +42,7 @@ fn gen_self_signed(server_name: &str) -> std::result::Result<TlsCert, rcgen::Err
 
 /// TUIC mock server。用于 loopback 测试，**不是生产 server**。
 ///
-/// 切片1 仅支持 TCP relay。UDP relay 留切片2。
+/// 支持切片1（TCP relay）与切片2（UDP relay，bi-stream 模式）。
 pub struct TuicMockServer {
     endpoint: quinn::Endpoint,
     expected_uuid: Uuid,
@@ -109,7 +113,7 @@ impl TuicMockServer {
         self.endpoint.close(0u32.into(), b"");
     }
 
-    /// 运行 accept loop（TCP relay）。
+    /// 运行 accept loop（TCP + UDP relay）。
     pub async fn run(self) -> Result<()> {
         let password = self.password.clone();
         let uuid = self.expected_uuid;
@@ -171,9 +175,9 @@ async fn handle_connection(
         };
 
         // 读 Connect header（仅消费必要字节，剩余字节留给 relay）
-        match read_command_from_recv(recv_bi, 256).await {
-            Ok((cmd, recv_bi, initial_bytes)) => match cmd {
-                crate::protocol::Command::Connect(addr) => {
+        match read_frame_from_recv(recv_bi, 256).await {
+            Ok((frame, recv_bi, initial_bytes)) => match frame {
+                BiFrame::Command(Command::Connect(addr)) => {
                     let Some(target) = addr_to_socket_addr(&addr) else {
                         tracing::warn!("tuic server: addr not ip literal: {addr:?}");
                         continue;
@@ -186,8 +190,16 @@ async fn handle_connection(
                         }
                     });
                 }
-                crate::protocol::Command::Heartbeat => {}
-                _ => {} // Packet/Dissociate 切片2
+                BiFrame::Command(Command::Heartbeat) => {}
+                BiFrame::Command(_) => {} // Dissociate/Authenticate 在 bi-stream 不期望
+                BiFrame::Packet(pkt) => {
+                    // UDP relay（quic 模式）：每包独占 bi-stream
+                    tokio::spawn(async move {
+                        if let Err(e) = relay_udp(pkt, send_bi, recv_bi, initial_bytes).await {
+                            tracing::debug!("tuic udp relay: {e:?}");
+                        }
+                    });
+                }
             },
             Err(e) => {
                 tracing::warn!("tuic server: failed to read connect: {e:?}");
@@ -216,27 +228,6 @@ where
     crate::protocol::Command::read_payload(type_byte, &mut cursor)
 }
 
-/// 从 quinn RecvStream 读出 Command，返回 (Command, 已消费的 RecvStream, header 之后的剩余字节)。
-///
-/// 剩余字节留给 relay，避免 quinn 一次 read 把 Connect header 和后续 payload 都读出。
-async fn read_command_from_recv(
-    mut stream: quinn::RecvStream,
-    max_len: usize,
-) -> Result<(crate::protocol::Command, quinn::RecvStream, Vec<u8>)> {
-    let mut buf = vec![0u8; max_len];
-    let n = stream.read(&mut buf).await?.ok_or_else(|| {
-        TuicError::Io(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "stream closed before command",
-        ))
-    })?;
-    let mut cursor = &buf[..n];
-    let type_byte = crate::protocol::parse_header(&mut cursor)?;
-    let cmd = crate::protocol::Command::read_payload(type_byte, &mut cursor)?;
-    // header 之后的所有字节，留给后续 relay
-    let remaining = cursor.to_vec();
-    Ok((cmd, stream, remaining))
-}
 
 /// 真正的双向 relay：client ↔ (quinn bi) ↔ server ↔ (tcp) ↔ 目标。
 ///
@@ -266,6 +257,89 @@ async fn relay_to_tcp(
     };
 
     let _ = tokio::try_join!(c2s, s2c)?;
+    Ok(())
+}
+
+/// bi-stream 中收到的帧：Command 或 Packet。
+///
+/// Packet 的 TYPE 码（0x02）不在 [`Command::read_payload`] 支持范围内，
+/// 需要先检测 type_byte 分流。
+enum BiFrame {
+    Command(Command),
+    Packet(Packet),
+}
+
+/// 从 quinn RecvStream 读出 bi-stream 帧（Command 或 Packet），
+/// 返回 (帧, 已消费的 RecvStream, header 之后的剩余字节)。
+///
+/// 剩余字节留给 relay，避免 quinn 一次 read 把 header 和后续 payload 都读出。
+async fn read_frame_from_recv(
+    mut stream: quinn::RecvStream,
+    max_len: usize,
+) -> Result<(BiFrame, quinn::RecvStream, Vec<u8>)> {
+    let mut buf = vec![0u8; max_len];
+    let n = stream.read(&mut buf).await?.ok_or_else(|| {
+        TuicError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "stream closed before command",
+        ))
+    })?;
+    let mut cursor = &buf[..n];
+    let type_byte = crate::protocol::parse_header(&mut cursor)?;
+    let (frame, remaining) = if type_byte == type_code::PACKET {
+        let pkt = Packet::read_payload(&mut cursor)?;
+        (BiFrame::Packet(pkt), cursor.to_vec())
+    } else {
+        let cmd = Command::read_payload(type_byte, &mut cursor)?;
+        (BiFrame::Command(cmd), cursor.to_vec())
+    };
+    Ok((frame, stream, remaining))
+}
+
+/// UDP relay（quic 模式）：解析 Packet 帧 → dial UDP 目标 → send 数据 →
+/// recv_from 响应 → 以 Packet 帧格式回写到同 bi-stream → finish()。
+///
+/// `initial_bytes` 是客户端随 Packet 帧一并发的多余字节（bi-stream 模式下应为空，
+/// 但兼容 read 一次拿全的场景）。
+///
+/// ponytail: 单次 recv_from（8KB 上限），不支持关联多个响应包；
+/// 真实实现需要 assoc_id → UDP socket 映射、持续 recv、按 pkt_id 回写。
+async fn relay_udp(
+    pkt: Packet,
+    mut send_bi: quinn::SendStream,
+    _recv_bi: quinn::RecvStream,
+    _initial_bytes: Vec<u8>,
+) -> Result<()> {
+    if pkt.frag_total > 1 {
+        // 分片不支持，直接拒绝（客户端切片2 不发分片包）
+        return Err(TuicError::UnsupportedFragment {
+            frag_total: pkt.frag_total,
+            frag_id: pkt.frag_id,
+        });
+    }
+    let Some(target) = addr_to_socket_addr(&pkt.addr) else {
+        tracing::warn!("tuic udp relay: addr not ip literal: {:?}", pkt.addr);
+        return Ok(());
+    };
+
+    let udp = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+    udp.send_to(&pkt.data, target).await?;
+
+    // 等响应（单次 recv，带超时避免阻塞）
+    let mut resp_buf = vec![0u8; 8 * 1024];
+    let (n, _peer) = tokio::time::timeout(Duration::from_secs(10), udp.recv_from(&mut resp_buf))
+        .await
+        .map_err(|_| TuicError::UdpTimeout(Duration::from_secs(10)))??;
+    resp_buf.truncate(n);
+
+    // 回写 Packet 帧（VER + TYPE + ASSOC + PKT + FRAG + SIZE + ADDR + DATA）
+    let resp_pkt = Packet::new(pkt.assoc_id, pkt.pkt_id, Address::None, resp_buf);
+    let mut out = bytes::BytesMut::with_capacity(resp_pkt.encoded_len());
+    out.put_u8(crate::protocol::VERSION);
+    out.put_u8(type_code::PACKET);
+    resp_pkt.write_payload(&mut out);
+    send_bi.write_all(&out).await?;
+    let _ = send_bi.finish();
     Ok(())
 }
 

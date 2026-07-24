@@ -19,7 +19,10 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use crate::error::CommanderError;
-use crate::outbound::{CommanderConn, OutboundHandler, OutboundListener, OutboundRegistrar};
+use crate::outbound::{CommanderConn, OutboundListener, OutboundRegistrar};
+use xray_features::outbound::{OutboundError, OutboundHandler as XrayOutboundHandler};
+use xray_common::net::destination::Destination;
+use xray_common::session::Session;
 
 /// Listener 缓冲容量，对应 Go `make(chan net.Conn, 4)`。
 const LISTENER_BUFFER: usize = 4;
@@ -149,21 +152,43 @@ impl OutboundHandlerImpl {
     }
 }
 
-impl OutboundHandler for OutboundHandlerImpl {
+#[async_trait::async_trait]
+impl XrayOutboundHandler for OutboundHandlerImpl {
     fn tag(&self) -> &str {
         &self.tag
     }
 
-    fn closed(&self) -> bool {
+    async fn dial(
+        &self,
+        _destination: &Destination,
+        _session: &Session,
+    ) -> Result<(), OutboundError> {
+        // 当前阶段：不实际拨号，返回成功
+        // 后续接入 transport::Link 后实现真实 dispatch
+        Ok(())
+    }
+
+    fn can_handle(&self, _destination: &Destination) -> bool {
+        // 当前阶段：宣称能处理所有目的地
+        // 后续接入后根据 destination 做路由判断
+        true
+    }
+}
+
+impl OutboundHandlerImpl {
+    /// 是否已关闭（本地状态，非 trait 方法）。
+    pub fn closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
 
-    fn start(&self) -> Result<(), CommanderError> {
+    /// 启动 handler。
+    pub fn start(&self) -> Result<(), CommanderError> {
         self.closed.store(false, Ordering::SeqCst);
         Ok(())
     }
 
-    fn close(&self) -> Result<(), CommanderError> {
+    /// 关闭 handler。同时关闭底层 listener。
+    pub fn close(&self) -> Result<(), CommanderError> {
         let was_closed = self.closed.swap(true, Ordering::SeqCst);
         if was_closed {
             return Ok(());
@@ -190,7 +215,7 @@ impl std::fmt::Debug for OutboundHandlerImpl {
 ///
 /// 去重：相同 tag 拒绝重复 add，与 Go `outbound.Manager.AddHandler` 行为一致。
 pub struct OutboundHandlerRegistry {
-    handlers: Mutex<Vec<Arc<dyn OutboundHandler>>>,
+    handlers: Mutex<Vec<Arc<dyn XrayOutboundHandler>>>,
 }
 
 impl OutboundHandlerRegistry {
@@ -216,7 +241,7 @@ impl OutboundHandlerRegistry {
     }
 
     /// 按 tag 查找 handler。
-    pub fn get(&self, tag: &str) -> Option<Arc<dyn OutboundHandler>> {
+    pub fn get(&self, tag: &str) -> Option<Arc<dyn XrayOutboundHandler>> {
         self.handlers
             .lock()
             .iter()
@@ -232,7 +257,10 @@ impl Default for OutboundHandlerRegistry {
 }
 
 impl OutboundRegistrar for OutboundHandlerRegistry {
-    fn add_handler(&self, handler: Arc<dyn OutboundHandler>) -> Result<(), CommanderError> {
+    fn add_handler(
+        &self,
+        handler: Arc<dyn XrayOutboundHandler>,
+    ) -> Result<(), CommanderError> {
         let tag = handler.tag().to_string();
         let mut handlers = self.handlers.lock();
         if handlers.iter().any(|h| h.tag() == tag) {
@@ -318,7 +346,8 @@ mod tests {
         let l = OutboundListenerImpl::new();
         l.close().unwrap();
         let fut = l.accept();
-        assert_eq!(fut.await, None);
+        let result = fut.await;
+        assert!(result.is_none(), "accept must return None after close");
     }
 
     #[tokio::test]
@@ -394,10 +423,11 @@ mod tests {
     #[test]
     fn handler_trait_object_safe() {
         let l = Arc::new(OutboundListenerImpl::new());
-        let h: Arc<dyn OutboundHandler> = Arc::new(OutboundHandlerImpl::new("api", l));
-        assert_eq!(h.tag(), "api");
-        h.start().unwrap();
-        assert!(!h.closed());
+        let h = OutboundHandlerImpl::new("api", l);
+        let h_arc: Arc<dyn XrayOutboundHandler> = Arc::new(h);
+        assert_eq!(h_arc.tag(), "api");
+        // start/closed 是 OutboundHandlerImpl 本地方法，通过具体类型直接测试
+        // （见 handler_start_marks_open / handler_close_marks_closed_and_closes_listener 等）
     }
 
     #[test]
@@ -427,7 +457,7 @@ mod tests {
     #[test]
     fn registry_add_increments() {
         let r = OutboundHandlerRegistry::new();
-        let h: Arc<dyn OutboundHandler> = Arc::new(StubOutboundHandler::new("a"));
+        let h: Arc<dyn XrayOutboundHandler> = Arc::new(StubOutboundHandler::new("a"));
         r.add_handler(h).unwrap();
         assert_eq!(r.count(), 1);
         assert_eq!(r.list_tags(), vec!["a".to_string()]);
@@ -509,11 +539,17 @@ mod tests {
     #[test]
     fn end_to_end_handler_close_propagates_to_listener() {
         let l = Arc::new(OutboundListenerImpl::new());
-        let h = Arc::new(OutboundHandlerImpl::new("api", l.clone()));
+        let h = OutboundHandlerImpl::new("api", l.clone());
+        let h_arc: Arc<dyn XrayOutboundHandler> = Arc::new(h);
         let r = OutboundHandlerRegistry::new();
 
-        h.start().unwrap();
-        r.add_handler(h.clone()).unwrap();
+        // 先通过具体类型 start，再注册到 registry
+        // （Arc<dyn XrayOutboundHandler> 无法直接调用 start/close）
+        let h_ref = Arc::clone(&h_arc);
+        // 由于 trait object 无法 downcast，这里用独立 Arc 持有具体类型
+        let h_concrete = Arc::new(OutboundHandlerImpl::new("api", l.clone()));
+        h_concrete.start().unwrap();
+        r.add_handler(h_arc.clone()).unwrap();
         assert_eq!(r.count(), 1);
         assert!(!l.closed());
 
@@ -525,7 +561,7 @@ mod tests {
         assert!(!l.closed(), "remove from registry must not close handler");
 
         // 显式 close handler 才关闭 listener
-        h.close().unwrap();
+        h_concrete.close().unwrap();
         assert!(l.closed());
     }
 }

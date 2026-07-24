@@ -28,6 +28,7 @@ use crate::socks::SocksAddr;
 const DUPLEX_BUF_SIZE: usize = 64 * 1024;
 
 /// AnyTLS 客户端配置。
+#[derive(Clone)]
 pub struct ClientConfig {
     /// 服务端地址（`host:port`）。
     pub server_addr: String,

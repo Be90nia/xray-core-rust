@@ -12,6 +12,8 @@
 //!   因为 Go 的 net.Listener.Accept 也是阻塞 sync；Rust 端实际异步化由 trait
 //!   实现决定（可包 `tokio::sync::mpsc::Receiver` + block_on）
 //! - **Conn 类型留 type parameter stub**：避免引入 transport::Link，用 `Box<dyn AsyncRead + AsyncWrite + Send + Unpin>` 作为最简抽象；trait 不依赖具体 crate
+//! - **OutboundHandler 统一为 xray-features 版本**：不再本地定义，直接 re-export
+//!   `xray_features::outbound::OutboundHandler`，保持与全项目一致。
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -34,7 +36,7 @@ pub type CommanderConn = Box<dyn CommanderIo>;
 
 /// Outbound listener 接口。对应 Go `OutboundListener struct`（实现 net.Listener）。
 ///
-/// 接受来自 [`OutboundHandler::dispatch`] 投递的连接。Commander 的 gRPC server
+/// 接受来自 OutboundHandler dispatch 投递的连接。Commander 的 gRPC server
 /// 在 outbound 模式下从此 listener accept 连接而非 TCP 监听。
 ///
 /// **当前为 trait stub**：实际实现需要 transport::Link 全链路支持。
@@ -52,40 +54,19 @@ pub trait OutboundListener: Send + Sync {
     /// 是否已关闭。
     fn closed(&self) -> bool;
 }
-
-/// Outbound handler 接口。对应 Go `Outbound struct`（实现 outbound.Handler）。
-///
-/// dispatch 接受 Link（reader + writer），包装为 cnc.Connection 后投递到
-/// [`OutboundListener`]。
-///
-/// **当前为 trait stub**：实际实现依赖 `xray_transport::link::Link` + cnc 等价物。
-pub trait OutboundHandler: Send + Sync {
-    /// handler 标识（与 Commander.tag 对应）。
-    /// 对应 Go `Outbound.Tag() string`。
-    fn tag(&self) -> &str;
-
-    /// 是否已关闭。对应 Go `Outbound.closed` 字段。
-    fn closed(&self) -> bool;
-
-    /// 启动 handler。对应 Go `Outbound.Start() error`。
-    fn start(&self) -> Result<(), CommanderError>;
-
-    /// 关闭 handler。对应 Go `Outbound.Close() error`。
-    fn close(&self) -> Result<(), CommanderError>;
-
-    // 注：Go 的 Dispatch(ctx, *transport.Link) 接口方法依赖 transport::Link，
-    // 当前阶段（P4-6）transport 全链路未就绪，留待后续接入。
-    // 上层 xray-core main 应实现此 trait 并提供 dispatch 实现。
-}
-
 /// Outbound handler 注册 trait。对应 Go `outbound.Manager.AddHandler`。
 ///
-/// Commander 在 outbound 模式下需要把 [`OutboundHandler`] 注册到 outbound
+/// Commander 在 outbound 模式下需要把 OutboundHandler 注册到 outbound
 /// manager，由 dispatcher 路由 API 流量到 commander。当前阶段 outbound
 /// manager 由 P4-4 proxyman 实现，但跨 crate 调用依赖待定。
+///
+/// 使用 xray-features 的 OutboundHandler trait。
 pub trait OutboundRegistrar: Send + Sync {
     /// 注册 handler。
-    fn add_handler(&self, handler: Arc<dyn OutboundHandler>) -> Result<(), CommanderError>;
+    fn add_handler(
+        &self,
+        handler: Arc<dyn xray_features::outbound::OutboundHandler>,
+    ) -> Result<(), CommanderError>;
 
     /// 移除 handler。
     fn remove_handler(&self, tag: &str) -> Result<(), CommanderError>;
@@ -94,6 +75,7 @@ pub trait OutboundRegistrar: Send + Sync {
 /// 默认 handler 占位（无 listener，仅记录状态）。
 ///
 /// 实际场景由上层注入实现。此 struct 用于测试编排流程。
+/// 实现 xray-features::outbound::OutboundHandler trait。
 pub struct StubOutboundHandler {
     tag: String,
     closed: AtomicBool,
@@ -109,23 +91,28 @@ impl StubOutboundHandler {
     }
 }
 
-impl OutboundHandler for StubOutboundHandler {
+use xray_features::outbound::OutboundError;
+use xray_common::net::destination::Destination;
+use xray_common::session::Session;
+
+#[async_trait::async_trait]
+impl xray_features::outbound::OutboundHandler for StubOutboundHandler {
     fn tag(&self) -> &str {
         &self.tag
     }
 
-    fn closed(&self) -> bool {
-        self.closed.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    fn start(&self) -> Result<(), CommanderError> {
-        self.closed.store(false, std::sync::atomic::Ordering::SeqCst);
+    async fn dial(
+        &self,
+        _destination: &Destination,
+        _session: &Session,
+    ) -> Result<(), OutboundError> {
+        // stub：不实际拨号，直接返回成功
         Ok(())
     }
 
-    fn close(&self) -> Result<(), CommanderError> {
-        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
-        Ok(())
+    fn can_handle(&self, _destination: &Destination) -> bool {
+        // stub：宣称能处理所有目的地
+        true
     }
 }
 
@@ -138,9 +125,29 @@ impl std::fmt::Debug for StubOutboundHandler {
     }
 }
 
+impl StubOutboundHandler {
+    /// 是否已关闭（本地状态，非 trait 方法）。
+    pub fn closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 启动 handler。
+    pub fn start(&self) -> Result<(), CommanderError> {
+        self.closed.store(false, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// 关闭 handler。
+    pub fn close(&self) -> Result<(), CommanderError> {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xray_features::outbound::OutboundHandler as _;
 
     #[test]
     fn stub_handler_tag() {
@@ -188,16 +195,17 @@ mod tests {
 
     #[test]
     fn outbound_handler_trait_object_safe() {
-        let h: Arc<dyn OutboundHandler> = Arc::new(StubOutboundHandler::new("api"));
+        let h: Arc<dyn xray_features::outbound::OutboundHandler> =
+            Arc::new(StubOutboundHandler::new("api"));
         assert_eq!(h.tag(), "api");
-        h.start().unwrap();
-        assert!(!h.closed());
+        // xray-features trait 无 start/close，测试只验证 trait 方法可用
+        // 本地方法通过具体类型直接测试（见 stub_handler_start_open 等）
     }
 
     // --- OutboundRegistrar mock ---
 
     struct MockRegistrar {
-        handlers: parking_lot::Mutex<Vec<Arc<dyn OutboundHandler>>>,
+        handlers: parking_lot::Mutex<Vec<Arc<dyn xray_features::outbound::OutboundHandler>>>,
     }
     impl MockRegistrar {
         fn new() -> Self {
@@ -210,7 +218,10 @@ mod tests {
         }
     }
     impl OutboundRegistrar for MockRegistrar {
-        fn add_handler(&self, handler: Arc<dyn OutboundHandler>) -> Result<(), CommanderError> {
+        fn add_handler(
+            &self,
+            handler: Arc<dyn xray_features::outbound::OutboundHandler>,
+        ) -> Result<(), CommanderError> {
             self.handlers.lock().push(handler);
             Ok(())
         }
@@ -228,7 +239,8 @@ mod tests {
     #[test]
     fn mock_registrar_add_remove() {
         let reg = MockRegistrar::new();
-        let h: Arc<dyn OutboundHandler> = Arc::new(StubOutboundHandler::new("api"));
+        let h: Arc<dyn xray_features::outbound::OutboundHandler> =
+            Arc::new(StubOutboundHandler::new("api"));
         reg.add_handler(h).unwrap();
         assert_eq!(reg.count(), 1);
         reg.remove_handler("api").unwrap();

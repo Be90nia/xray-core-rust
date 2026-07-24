@@ -11,6 +11,7 @@ xray-features = { path = "../xray-features" }
 xray-proto = { path = "../xray-proto" }
 xray-transport-hysteria = { path = "../xray-transport-hysteria" }
 thiserror = { workspace = true }
+async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }

@@ -19,6 +19,7 @@ tracing = { workspace = true }
 parking_lot = { workspace = true }
 bytes = { workspace = true }
 prost = { workspace = true }
+async-trait = { workspace = true }
 
 # 加密原语：HMAC-SHA256（KDF）、SHA256（body key 派生）、MD5（chacha key 派生）、
 # SHAKE128（chunk size padding）、CRC32-IEEE（AuthID）、FNV1a（命令认证）

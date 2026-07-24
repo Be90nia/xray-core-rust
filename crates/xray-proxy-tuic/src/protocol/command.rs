@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn unknown_type_rejected() {
-        let mut buf = vec![VERSION, 0x99];
+        let buf = vec![VERSION, 0x99];
         let mut cursor = &buf[..];
         let type_byte = parse_header(&mut cursor).unwrap();
         let err = Command::read_payload(type_byte, &mut cursor).unwrap_err();

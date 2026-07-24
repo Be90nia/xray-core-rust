@@ -31,6 +31,10 @@
 
 pub mod config;
 pub mod error;
+pub mod inbound;
+pub mod outbound;
 
 pub use config::HysteriaConfig;
 pub use error::{HysteriaProxyError, Result};
+pub use inbound::{HysteriaInboundHandler, StaticAuthValidator};
+pub use outbound::HysteriaOutboundHandler;

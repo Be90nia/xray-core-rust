@@ -21,6 +21,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::error::{log_warning, CommanderError};
+use crate::outbound::OutboundRegistrar;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -166,6 +167,8 @@ pub struct Commander {
     listen: Option<String>,
     services: RwLock<Vec<Arc<dyn Service>>>,
     running: AtomicBool,
+    /// outbound 模式下使用的 handler 注册器（由上层注入）。
+    outbound_registrar: Option<Arc<dyn OutboundRegistrar>>,
 }
 
 impl Commander {
@@ -181,6 +184,7 @@ impl Commander {
             listen,
             services: RwLock::new(Vec::new()),
             running: AtomicBool::new(false),
+            outbound_registrar: None,
         }
     }
 
@@ -203,6 +207,11 @@ impl Commander {
     /// 监听地址（`None` 走 outbound 模式）。
     pub fn listen(&self) -> Option<&str> {
         self.listen.as_deref()
+    }
+
+    /// 设置 outbound handler 注册器（ outbound 模式下使用）。
+    pub fn set_outbound_registrar(&mut self, registrar: Arc<dyn OutboundRegistrar>) {
+        self.outbound_registrar = Some(registrar);
     }
 
     /// 添加 service。返回是否成功（type_url 重复时拒绝）。
@@ -275,16 +284,24 @@ impl Commander {
             registrar.register(s.as_ref())?;
         }
 
-        // listen 模式判断（仅日志，实际监听留 stub）
+        // listen 模式判断
         match &self.listen {
             Some(addr) => {
                 tracing::info!("commander would listen on `{addr}` (actual bind deferred)");
             }
             None => {
-                tracing::info!(
-                    "commander in outbound mode (tag=`{}`) (actual outbound handler register deferred)",
-                    self.tag
-                );
+                // outbound 模式：若已注入 outbound_registrar，注册自身 handler
+                if let Some(ref _reg) = self.outbound_registrar {
+                    tracing::info!(
+                        "commander in outbound mode (tag=`{}`) — outbound handler register delegated",
+                        self.tag
+                    );
+                } else {
+                    tracing::info!(
+                        "commander in outbound mode (tag=`{}`) — no outbound registrar injected",
+                        self.tag
+                    );
+                }
             }
         }
         Ok(())
@@ -313,6 +330,7 @@ impl std::fmt::Debug for Commander {
             .field("listen", &self.listen)
             .field("service_count", &self.service_count())
             .field("running", &self.running())
+            .field("has_outbound_registrar", &self.outbound_registrar.is_some())
             .finish()
     }
 }
@@ -549,8 +567,8 @@ mod tests {
         assert!(s.contains("tag"));
         assert!(s.contains("api"));
         assert!(s.contains("service_count: 1"));
+        assert!(s.contains("has_outbound_registrar: false"));
     }
-
     // --- NoopRegistrar ---
 
     #[test]

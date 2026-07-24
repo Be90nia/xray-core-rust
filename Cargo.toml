@@ -97,8 +97,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # 网络
 bytes = "1"
 socket2 = "0.5"
-# 用户态 TCP/IP 协议栈（TUN inbound 用：解析 TUN 设备 IP 包为 TCP/UDP 流）
-smoltcp = { version = "0.12", default-features = false, features = ["medium-ip", "socket-tcp", "socket-udp", "socket-icmp", "proto-ipv4", "proto-ipv6"] }
+# 用户态 TCP/IP 协议栈（TUN inbound + WireGuard userspace netstack 用）
+smoltcp = { version = "0.12", default-features = false, features = ["std", "alloc", "medium-ip", "socket-tcp", "socket-udp", "socket-icmp", "proto-ipv4", "proto-ipv6"] }
 # DNS wire format (仅 proto，覆盖 A/AAAA/MX/TXT/EDNS0 编解码)
 hickory-proto = { version = "0.26", default-features = false }
 # DNS 异步解析器（DoH/DoT/UDP，对应 Go miekg/dns resolver）
@@ -170,6 +170,9 @@ sysinfo = "0.39"
 httparse = "1.10"
 # OCSP 装订客户端（对应 Go crypto/x509 + ocsp；xray-tls OCSP stapling）
 ocsp-stapler = { version = "0.4", default-features = false, features = ["ring"] }
+# uTLS 指纹伪造（btls = 0x676e67/btls BoringSSL 绑定；提供 GREASE/extension permutation/ECH GREASE/key shares 等 BoringSSL 原生指纹 API；替代 Go uTLS）
+btls = { git = "https://github.com/0x676e67/btls", branch = "main" }
+tokio-btls = { git = "https://github.com/0x676e67/btls", branch = "main" }
 
 [patch.crates-io]
 rustls = { git = "https://github.com/Watfaq/rustls.git", branch = "watfaq/0.23.40" }

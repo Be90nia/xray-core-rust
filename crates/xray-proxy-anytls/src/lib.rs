@@ -26,9 +26,13 @@ pub mod dispatcher;
 pub mod error;
 pub mod server;
 pub mod socks;
+pub mod inbound;
+pub mod outbound;
 
 pub use client::{AnytlsClient, AnytlsConn, ClientConfig};
 pub use dispatcher::{make_dial_fn as make_anytls_dial_fn, AnytlsConnection};
 pub use error::{AnytlsError, Result};
 pub use server::AnytlsMockServer;
 pub use socks::SocksAddr;
+pub use inbound::AnytlsInboundHandler;
+pub use outbound::AnytlsOutboundHandler;

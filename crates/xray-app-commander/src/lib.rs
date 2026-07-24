@@ -32,6 +32,7 @@
 pub mod commander;
 pub mod error;
 pub mod outbound;
+pub mod server;
 
 // Re-export 主要公共类型
 pub use commander::{
@@ -40,5 +41,9 @@ pub use commander::{
 };
 pub use error::CommanderError;
 pub use outbound::{
-    CommanderConn, OutboundHandler, OutboundListener, OutboundRegistrar, StubOutboundHandler,
+    CommanderConn, OutboundListener, OutboundRegistrar, StubOutboundHandler,
 };
+pub use server::{OutboundHandlerImpl, OutboundHandlerRegistry, OutboundListenerImpl};
+
+// Re-export xray-features 的 OutboundHandler（统一 trait 入口）
+pub use xray_features::outbound::OutboundHandler;

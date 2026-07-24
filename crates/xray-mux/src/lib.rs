@@ -4,3 +4,4 @@ pub mod worker;
 pub mod client;
 pub mod reader;
 pub mod writer;
+pub mod handler;

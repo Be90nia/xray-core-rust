@@ -15,8 +15,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use thiserror::Error;
 use xray_app_dispatcher::default::DispatchHandler;
+use xray_common::net::destination::Destination;
+use xray_common::session::Session;
+use xray_features::inbound::{InboundError, InboundHandler};
+use xray_features::outbound::{OutboundError, OutboundHandler};
 use xray_proto::xray::proxy::loopback::Config;
 
 /// Loopback 错误。
@@ -213,6 +218,80 @@ impl DispatchHandler for LoopbackHandler {
     }
 }
 
+// ========== OutboundHandler 实现 ==========
+
+/// Loopback 作为出站处理器：把连接回环到指定的本机入站 tag。
+///
+/// 对应 Go `proxy/loopback.Loopback` 实现 `proxy.Outbound` 接口。
+/// `dial` 内部调 [`LoopbackSink::dispatch_loopback`] 完成回环。
+#[async_trait]
+impl OutboundHandler for LoopbackHandler {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    /// 把出站连接回环到指定的本机入站 tag。
+    ///
+    /// 对应 Go `(*Loopback).Process(ctx, link, dispatcher)`。
+    /// 当前简化：不构造新 session/ctx，直接调 sink.dispatch_loopback。
+    /// sink 为 None 时返回 `OutboundError::ConnectionFailed`。
+    async fn dial(
+        &self,
+        _destination: &Destination,
+        _session: &Session,
+    ) -> Result<(), OutboundError> {
+        match &self.sink {
+            Some(s) => {
+                // ponytail: dial 签名无 link 参数，用 pipe 构造空 link；
+                // 真正的 link 由 dispatcher 在上层注入时提供。
+                let (r, _w) = xray_buf::pipe::new();
+                let (_r2, w2) = xray_buf::pipe::new();
+                let link = xray_transport::link::Link::new(Box::new(r), Box::new(w2));
+                s.dispatch_loopback(self.inbound_tag.clone(), link)
+                    .await
+                    .map_err(|e| OutboundError::ConnectionFailed(e.to_string()))
+            }
+            None => Err(OutboundError::ConnectionFailed(
+                "loopback sink not injected".to_string(),
+            )),
+        }
+    }
+
+    /// Loopback 不关心目标地址，总返回 true。
+    ///
+    /// 回环由 inbound_tag 决定路由，与 destination 无关。
+    fn can_handle(&self, _destination: &Destination) -> bool {
+        true
+    }
+}
+
+// ========== InboundHandler 实现（占位）==========
+
+/// Loopback 是 outbound-only 协议（Go 版没有 inbound），
+/// 但 InboundHandler trait 仍需实现以满足注册要求。
+/// start/close 为 no-op，port 返回 0。
+#[async_trait]
+impl InboundHandler for LoopbackHandler {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    /// Loopback 不监听端口，start 为 no-op。
+    async fn start(&self) -> Result<(), InboundError> {
+        Ok(())
+    }
+
+    /// Loopback 不监听端口，close 为 no-op。
+    async fn close(&self) -> Result<(), InboundError> {
+        Ok(())
+    }
+
+    /// Loopback 不监听端口，返回 0。
+    fn port(&self) -> u16 {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,5 +451,68 @@ mod tests {
         assert!(s.contains("tag1"));
         assert!(s.contains("tag2"));
         assert!(s.contains("has_sink: false"));
+    }
+
+    // ========== OutboundHandler / InboundHandler 测试 ==========
+
+    #[tokio::test]
+    async fn outbound_dial_with_sink_succeeds() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = std::sync::Arc::new(MockSink {
+            calls: calls.clone(),
+        });
+        let h = LoopbackHandler::with_inbound_tag("lb", "target-in").with_sink(sink);
+        let dest = dummy_dest();
+        let session = Session::new();
+        assert!(h.dial(&dest, &session).await.is_ok());
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(recorded, vec!["target-in".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn outbound_dial_without_sink_fails() {
+        let h = LoopbackHandler::with_inbound_tag("lb", "target-in");
+        let dest = dummy_dest();
+        let session = Session::new();
+        let result = h.dial(&dest, &session).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("loopback sink not injected"));
+    }
+
+    #[test]
+    fn outbound_can_handle_always_true() {
+        let h = LoopbackHandler::with_inbound_tag("lb", "in");
+        assert!(h.can_handle(&dummy_dest()));
+    }
+
+    #[test]
+    fn outbound_tag_matches_handler_tag() {
+        let h = LoopbackHandler::with_inbound_tag("my-tag", "in");
+        assert_eq!(h.tag(), "my-tag");
+    }
+
+    #[tokio::test]
+    async fn inbound_start_is_noop() {
+        let h = LoopbackHandler::with_inbound_tag("lb", "in");
+        assert!(h.start().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn inbound_close_is_noop() {
+        let h = LoopbackHandler::with_inbound_tag("lb", "in");
+        assert!(h.close().await.is_ok());
+    }
+
+    #[test]
+    fn inbound_port_is_zero() {
+        let h = LoopbackHandler::with_inbound_tag("lb", "in");
+        assert_eq!(h.port(), 0);
+    }
+
+    #[test]
+    fn inbound_tag_matches_handler_tag() {
+        let h = LoopbackHandler::with_inbound_tag("my-tag", "in");
+        assert_eq!(h.tag(), "my-tag");
     }
 }

@@ -14,3 +14,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 boringtun = { workspace = true }
 hex = "0.4"
+smoltcp = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+bytes = { workspace = true }
