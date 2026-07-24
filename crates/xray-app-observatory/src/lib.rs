@@ -40,7 +40,7 @@ pub use config::{
 pub use error::{at_error, at_warning, ObservatoryError};
 pub use error_collector::ErrorCollector;
 pub use observer::{
-    FixedProbeExecutor, NoopOutboundSelector, Observer, OutboundSelector, ProbeExecutor,
-    now_unix_secs,
+    FixedProbeExecutor, HttpProbeExecutor, NoopOutboundSelector, Observer,
+    OutboundSelector, ProbeExecutor, RealOutboundSelector, now_unix_secs,
 };
 pub use status::StatusStore;

@@ -4,7 +4,7 @@
 //! 所有时间值是 i64 纳秒（与 Go time.Duration 兼容）。
 //! 时间戳 now_unix_nanos 用 i64 表示（足够 ~292 年）。
 
-use crate::burst::{is_valid_rtt, RTT_FAILED, RTT_UNTESTED};
+use crate::burst::{RTT_FAILED, RTT_UNTESTED};
 
 /// 单次 ping 记录。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,9 +357,9 @@ mod tests {
 
     #[test]
     fn is_valid_rtt_helper() {
-        assert!(is_valid_rtt(50));
-        assert!(!is_valid_rtt(RTT_UNTESTED));
-        assert!(!is_valid_rtt(RTT_FAILED));
+        assert!(crate::is_valid_rtt(50));
+        assert!(!crate::is_valid_rtt(RTT_UNTESTED));
+        assert!(!crate::is_valid_rtt(RTT_FAILED));
     }
 
     #[test]
