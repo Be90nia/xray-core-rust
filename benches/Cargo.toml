@@ -1,0 +1,34 @@
+[package]
+name = "xray-benchmarks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+xray-crypto = { path = "../crates/xray-crypto" }
+xray-buf = { path = "../crates/xray-buf" }
+xray-app-router = { path = "../crates/xray-app-router" }
+xray-common = { path = "../crates/xray-common" }
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = { workspace = true }
+
+[[bench]]
+name = "crypto_bench"
+path = "crypto_bench.rs"
+harness = false
+
+[[bench]]
+name = "buf_bench"
+path = "buf_bench.rs"
+harness = false
+
+[[bench]]
+name = "router_bench"
+path = "router_bench.rs"
+harness = false
+
+[[bench]]
+name = "transport_bench"
+path = "transport_bench.rs"
+harness = false

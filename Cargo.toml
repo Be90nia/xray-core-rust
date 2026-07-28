@@ -70,6 +70,10 @@ members = [
 
     # 集成测试
     "tests",
+
+    # 性能基准测试
+    "benches",
+    "tests",
 ]
 
 [workspace.package]
