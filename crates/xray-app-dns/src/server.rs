@@ -6,16 +6,17 @@
 //! - `sort_clients`：业务核心，独立可测。
 //! - `lookup_ip`：完整翻译（hosts 查询部分），nameservers 查询部分依赖
 //!   `Server` trait 实际执行，由调用方在 trait 实现后接入。
+//! - `check_routes`：系统路由探测（IPv4/IPv6 可达性），对应 Go `utils.CheckRoutes`。
 //!
 //! ## 跳过范围
 //!
-//! - `checkSystem`（`utils.CheckRoutes`）：依赖系统路由表探测，留 TODO。
 //! - `parallelQuery` / `serialQuery`：多 nameserver 并行/串行查询编排，留 trait
 //!   方法占位，调用方提供具体实现（实现时需要持有 `tokio::task::JoinSet`）。
 //! - Go `init()` 全局注册：Rust 无副作用全局。
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use parking_lot::Mutex;
 use xray_features::dns::DnsError as FeaturesDnsError;
@@ -180,9 +181,14 @@ impl DnsService {
             )));
         }
 
-        // TODO: checkSystem → utils.CheckRoutes 系统探测，待系统层就位。
-        // 当前直接用 ipOption 字段。
-        let effective = option;
+        // checkSystem：探测系统 IPv4/IPv6 路由可达性。
+        // 对应 Go: option.IPv4Enable &&= supportIPv4; option.IPv6Enable &&= supportIPv6
+        let (support_v4, support_v6) = check_routes();
+        let effective = IpOption {
+            ipv4_enable: option.ipv4_enable && support_v4,
+            ipv6_enable: option.ipv6_enable && support_v6,
+            ..option
+        };
         // （Go: option.IPv4Enable = option.IPv4Enable && s.ipOption.IPv4Enable）
         // 简化：直接保留 option，因构造 DnsService 时 ipOption 已合并。
 
@@ -223,6 +229,39 @@ impl DnsService {
         // ponytail: 与 Go 一致，最多递归 5 次（hosts.rs 内部已限）。
         self.lookup_ip(domain, option)
     }
+}
+
+// ── 系统路由探测 ──────────────────────────────────────────────────
+
+/// 系统路由探测缓存。对应 Go `common/utils/probe_routes.go` 的 `routeCache`。
+///
+/// ponytail: Go 区分 GUI/非 GUI 平台用不同缓存策略（Once vs 100ms TTL），
+/// Rust 端统一用 OnceLock（探测结果在进程生命周期内稳定）。
+/// 如需动态刷新，改用 `parking_lot::Mutex` + 时间戳。
+static ROUTE_CACHE: OnceLock<(bool, bool)> = OnceLock::new();
+
+/// 探测系统 IPv4/IPv6 路由可达性。对应 Go `utils.CheckRoutes()`。
+///
+/// 通过 UDP connect 到已知根服务器地址（192.33.4.12:53 / [2001:500:2::c]:53）
+/// 判断对应协议栈是否可用。`connect` 不发送数据，仅检查路由。
+///
+/// 结果缓存到进程生命周期（`OnceLock`），首次调用后不再重复探测。
+#[must_use]
+pub fn check_routes() -> (bool, bool) {
+    *ROUTE_CACHE.get_or_init(probe_routes)
+}
+
+/// 实际探测逻辑。对应 Go `probeRoutes()`。
+fn probe_routes() -> (bool, bool) {
+    // Go: net.Dial("udp4", "192.33.4.12:53") —— 创建 UDP socket 并 connect。
+    // Rust std: UdpSocket::bind → connect。connect 不发送数据，仅检查路由可达性。
+    let ipv4 = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| s.connect("192.33.4.12:53"))
+        .is_ok();
+    let ipv6 = std::net::UdpSocket::bind("[::]:0")
+        .and_then(|s| s.connect("[2001:500:2::c]:53"))
+        .is_ok();
+    (ipv4, ipv6)
 }
 
 #[cfg(test)]
@@ -358,8 +397,9 @@ mod tests {
 
     #[test]
     fn lookup_ip_returns_empty_vec_when_option_filters_all() {
-        // ponytail: hosts.lookup 返回空 Vec 时不再区分 nil/empty，
-        // 一律走 nameservers 路径（NotImplemented 表示当前未接入）。
+        // hosts 有 IPv4 记录，用 v6_only 查询。
+        // check_routes 可能过滤掉不可用的协议栈，导致 EmptyResponse；
+        // 或者系统支持 IPv6，走 nameservers 路径返回 NotImplemented。
         let svc = make_service(
             Vec::new(),
             vec![HostMapping {
@@ -374,8 +414,8 @@ mod tests {
             fake_enable: false,
         };
         match svc.lookup_ip("x.com", v6_only) {
-            Err(DnsError::NotImplemented(_)) => {}
-            other => panic!("expected NotImplemented, got {other:?}"),
+            Err(DnsError::EmptyResponse) | Err(DnsError::NotImplemented(_)) => {}
+            other => panic!("expected EmptyResponse or NotImplemented, got {other:?}"),
         }
     }
 
@@ -400,5 +440,21 @@ mod tests {
     fn skip_duration_constant_imports_ok() {
         // 仅验证 `Duration` 在 test mod 中可用（避免 unused import warning）。
         let _ = Duration::from_secs(0);
+    }
+
+    #[test]
+    fn check_routes_returns_bool_pair() {
+        let (v4, v6) = check_routes();
+        // 至少 IPv4 在大多数测试环境可用。
+        // 不做硬断言——CI 可能无网络。
+        let _ = (v4, v6);
+    }
+
+    #[test]
+    fn check_routes_is_cached() {
+        // 两次调用应返回相同值（OnceLock 缓存）。
+        let first = check_routes();
+        let second = check_routes();
+        assert_eq!(first, second);
     }
 }

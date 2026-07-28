@@ -11,11 +11,14 @@
 //! 切片1 不引入完整 prost SocketConfig（字段过多），用简化 [`SocketOptions`]
 //! struct 暴露常用字段。完整 proto 对接留切片2。
 
+#[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(target_os = "windows")]
 pub mod windows;
+#[cfg(target_os = "macos")]
 pub mod darwin;
+#[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
 pub mod freebsd;
-
 use std::time::Duration;
 use socket2::Socket;
 

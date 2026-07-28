@@ -6,13 +6,22 @@
 //!
 //! 1. 创建 TUN 设备
 //! 2. 从 TUN 设备 recv IP 包 → smoltcp netstack
-//! 3. smoltcp 把入站 TCP/UDP 流通过 dispatcher 注入本地（留待接入上层）
+//! 3. smoltcp 把入站 TCP/UDP 流通过 dispatcher 注入本地
+//!
+//! ## TCP 连接流
+//!
+//! 创建 Listen socket → poll 后检查 Established → 通知上层 dispatcher。
+//! 对应 Go `tcp.NewForwarder(r.CreateEndpoint() → handler.HandleConnection)`。
+//!
+//! ## UDP 数据报流
+//!
+//! 创建 Bind socket → poll 后 recv 数据报 → 通知上层 dispatcher。
+//! 对应 Go `udp.NewForwarder(handler.HandlePacket)`。
 //!
 //! ## 当前限制
 //!
-//! 与 WireGuard 一致——driver 与 netstack 集成已完成，但 dispatcher 桥接（smoltcp
-//! socket → router）留待后续切片。
-
+//! dispatcher 桥接（smoltcp socket → router）在此完成事件检测，
+//! 实际 dispatch 调用留待后续切片（当前仅 tracing 日志）。
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -168,14 +177,37 @@ impl InboundHandler for TunInboundHandler {
     }
 }
 
-/// TUN 驱动主循环——从 TUN 设备读 IP 包 → smoltcp → 写回 TUN。
-///
-/// 单循环避免多任务争抢 Mutex：
-/// - select! 上 TUN recv（大部分时间等待）
-/// - 每 100ms 触发 poll + drain_tx
 async fn tun_driver_loop(device: Arc<TunDevice>, netstack: Arc<AsyncMutex<TunNetStack>>) {
     let mut timer = interval(POLL_INTERVAL);
     let mut recv_buf = vec![0u8; TUN_RECV_BUF_SIZE];
+
+    // 初始化：创建 TCP Listen socket + UDP Bind socket
+    // 对应 Go stackGVisor.Start() 中 tcp.NewForwarder + udp.NewForwarder
+    // ponytail: 单端口监听（TUN 入站通常由 iptables/nftables 重定向到 TUN，
+    // 实际 dest 地址在 IP 包头中，不依赖 listen 端口）
+    // TODO: 多端口监听由上层配置注入
+    let tcp_listen_handle = {
+        let mut stack = netstack.lock().await;
+        let handle = stack.add_tcp_socket();
+        if let Err(e) = stack.tcp_listen(handle, 0) {
+            // listen 0 表示由 smoltcp 自动选端口；失败则记录但不中断
+            tracing::warn!(error = %e, "tcp listen failed, inbound TCP disabled");
+        } else {
+            tracing::debug!(?handle, "tcp listen socket created");
+        }
+        Some(handle)
+    };
+    let udp_bind_handle = {
+        let mut stack = netstack.lock().await;
+        let handle = stack.add_udp_socket();
+        if let Err(e) = stack.udp_bind(handle, 0) {
+            tracing::warn!(error = %e, "udp bind failed, inbound UDP disabled");
+        } else {
+            tracing::debug!(?handle, "udp bind socket created");
+        }
+        Some(handle)
+    };
+
     tracing::debug!("tun driver main loop started");
 
     loop {
@@ -189,6 +221,12 @@ async fn tun_driver_loop(device: Arc<TunDevice>, netstack: Arc<AsyncMutex<TunNet
                         let mut stack = netstack.lock().await;
                         stack.ingest_rx(pkt);
                         stack.poll(smoltcp::time::Instant::now());
+                        // 检测 TCP/UDP 事件
+                        handle_socket_events(
+                            &mut stack,
+                            tcp_listen_handle,
+                            udp_bind_handle,
+                        );
                         // drain tx 并写回 TUN
                         let tx_pkts = stack.drain_tx();
                         drop(stack); // 释放锁再 await
@@ -208,12 +246,60 @@ async fn tun_driver_loop(device: Arc<TunDevice>, netstack: Arc<AsyncMutex<TunNet
                 let tx_pkts: Vec<Vec<u8>> = {
                     let mut stack = netstack.lock().await;
                     stack.poll(smoltcp::time::Instant::now());
+                    // 检测 TCP/UDP 事件
+                    handle_socket_events(
+                        &mut stack,
+                        tcp_listen_handle,
+                        udp_bind_handle,
+                    );
                     stack.drain_tx()
                 };
                 for pkt in tx_pkts {
                     let _ = device.send(&pkt).await;
                 }
             }
+        }
+    }
+}
+
+/// poll 后检测 TCP accept / UDP recv 事件，通知上层。
+///
+/// 对应 Go `stackGVisor.Start` 中 tcp/udp forwarder 的回调。
+/// 当前实现：tracing 日志 + 留后续 dispatcher 桥接。
+fn handle_socket_events(
+    stack: &mut TunNetStack,
+    tcp_listen_handle: Option<smoltcp::iface::SocketHandle>,
+    udp_bind_handle: Option<smoltcp::iface::SocketHandle>,
+) {
+    // TCP accept 检测
+    if let Some(handle) = tcp_listen_handle {
+        if let Some(event) = stack.check_tcp_accept(handle) {
+            tracing::debug!(
+                handle = ?event.handle,
+                remote = %event.remote,
+                "tcp connection accepted"
+            );
+            // TODO: dispatcher 桥接——创建 Link (Reader/Writer) 从该 socket，
+            // 调 dispatcher.DispatchLink(ctx, destination, link)
+            // destination 从 local endpoint（TUN 侧地址+端口）构建
+        }
+    }
+
+    // UDP recv 检测
+    if let Some(handle) = udp_bind_handle {
+        // 循环读取所有到达的 UDP 数据报（可能多个）
+        loop {
+            let event = stack.udp_recv(handle);
+            let Some(event) = event else { break; };
+            tracing::trace!(
+                handle = ?event.handle,
+                remote = %event.remote,
+                local_port = event.local_port,
+                len = event.payload.len(),
+                "udp datagram received"
+            );
+            // TODO: dispatcher 桥接——构建 UDP session，
+            // 调 dispatcher.DispatchLink(ctx, destination, link)
         }
     }
 }

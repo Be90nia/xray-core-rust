@@ -38,6 +38,7 @@ pub mod pipe;
 pub mod config;
 pub mod filelocker;
 pub mod happy_eyeballs;
+#[cfg(feature = "browser-dialer")]
 pub mod browser_dialer;
 pub mod tagged;
 pub mod memory_settings;

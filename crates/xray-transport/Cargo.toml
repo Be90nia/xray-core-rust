@@ -42,3 +42,6 @@ libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+[features]
+default = []
+browser-dialer = []

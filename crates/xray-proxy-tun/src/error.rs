@@ -17,9 +17,21 @@ pub enum TunError {
     #[error("interface update failed: {0}")]
     InterfaceUpdateFailed(String),
 
-    /// gVisor netstack 初始化失败。
+    /// 网络栈初始化失败。
     #[error("netstack init failed: {0}")]
     StackInitFailed(String),
+
+    /// TCP socket 监听失败（端口被占用 / 状态非法）。
+    #[error("tcp listen failed: {0}")]
+    TcpListenFailed(String),
+
+    /// UDP socket 绑定失败。
+    #[error("udp bind failed: {0}")]
+    UdpBindFailed(String),
+
+    /// ICMP socket 绑定失败。
+    #[error("icmp bind failed: {0}")]
+    IcmpBindFailed(String),
 
     /// 配置无效。
     #[error("invalid tun config: {0}")]

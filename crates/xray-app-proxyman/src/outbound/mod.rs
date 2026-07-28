@@ -17,7 +17,7 @@
 
 pub mod handler;
 
-pub use handler::{OutboundHandlerEntry, parse_random_ip};
+pub use handler::{OutboundHandlerEntry, UotVersion, parse_random_ip};
 
 use crate::error::ProxymanError;
 use crate::inbound::PinFuture;

@@ -2,9 +2,9 @@
 //!
 //! 翻译自 `app/router/webhook.go`。
 //!
-//! # IO 边界
+//! # 实现
 //!
-//! - 实际 HTTP POST 留 TODO（`post` 方法 stub）
+//! - `post` 通过 `tokio::net::TcpStream` 手写 HTTP POST（不引入 reqwest）
 //! - 事件构造、去重逻辑独立可测
 
 use std::collections::HashSet;
@@ -12,9 +12,14 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use xray_proto::xray::app::router::WebhookConfig;
 
 use crate::error::RouterError;
+
+/// 默认 HTTP POST 超时（毫秒）。
+const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 
 /// Webhook 事件。
 ///
@@ -54,7 +59,6 @@ impl WebhookEvent {
 /// 对应 Go `WebhookNotifier`。
 pub struct WebhookNotifier {
     url: String,
-    #[allow(dead_code)]
     headers: std::collections::HashMap<String, String>,
     dedup_window: Duration,
     seen: Mutex<Seen>,
@@ -129,13 +133,91 @@ impl WebhookNotifier {
         false
     }
 
-    /// 执行 HTTP POST。
+    /// 执行 HTTP POST 到 webhook URL。
     ///
-    /// TODO: 接入 reqwest / hyper。当前仅记录 log。
-    fn post(&self, _body: &serde_json::Value) -> Result<(), RouterError> {
-        tracing::debug!(target: "xray_router::webhook", url = %self.url, "webhook post (stub)");
-        // TODO: 实际 HTTP POST，带上 self.headers
-        Ok(())
+    /// 通过 `tokio::net::TcpStream` 手写 HTTP POST，不依赖 reqwest/hyper。
+    /// 返回 2xx 视为成功，其余视为失败。
+    fn post(&self, body: &serde_json::Value) -> Result<(), RouterError> {
+        let body_str = serde_json::to_string(body)
+            .map_err(|e| RouterError::Webhook(e.to_string()))?;
+
+        let result = tokio::runtime::Handle::try_current()
+            .map(|handle| handle.block_on(async { self.post_async(&body_str).await }))
+            .unwrap_or_else(|_| {
+                // 无 tokio runtime 时创建临时 runtime
+                std::thread::scope(|s| {
+                    s.spawn(|| {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| RouterError::Webhook(e.to_string()))?;
+                        rt.block_on(async { self.post_async(&body_str).await })
+                    }).join().unwrap_or_else(|e| Err(RouterError::Webhook(format!("thread panicked: {e:?}"))))
+                })
+            });
+
+        result
+    }
+
+    /// 异步 HTTP POST 实现。
+    async fn post_async(&self, body: &str) -> Result<(), RouterError> {
+        let url = self.url.trim();
+        if url.is_empty() {
+            return Err(RouterError::Webhook("empty webhook url".to_string()));
+        }
+
+        let (host, port) = parse_webhook_host_port(url)
+            .map_err(|e| RouterError::Webhook(e))?;
+
+        let addr = format!("{host}:{port}");
+        let timeout = Duration::from_millis(DEFAULT_TIMEOUT_MS);
+
+        // TCP 连接
+        let mut stream = tokio::time::timeout(timeout, TcpStream::connect(&addr))
+            .await
+            .map_err(|e| RouterError::Webhook(format!("connect timeout: {e}")))?
+            .map_err(|e| RouterError::Webhook(format!("connect failed: {e}")))?;
+
+        // 构造 HTTP POST 请求（手写，不含 TLS）
+        // ponytail: 不实现 TLS，webhook 通常在内网。升级路径：引入 tokio-rustls。
+        let path = extract_path(url);
+        let mut header_lines = format!("POST {path} HTTP/1.1\r\n");
+        header_lines.push_str(&format!("Host: {host}\r\n"));
+        header_lines.push_str("Content-Type: application/json\r\n");
+        header_lines.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        header_lines.push_str("Connection: close\r\n");
+        // 自定义 headers
+        for (k, v) in &self.headers {
+            header_lines.push_str(&format!("{k}: {v}\r\n"));
+        }
+        header_lines.push_str("\r\n");
+
+        let request = format!("{header_lines}{body}");
+
+        // 写入请求
+        tokio::time::timeout(timeout, stream.write_all(request.as_bytes()))
+            .await
+            .map_err(|e| RouterError::Webhook(format!("write timeout: {e}")))?
+            .map_err(|e| RouterError::Webhook(format!("write failed: {e}")))?;
+
+        // 读取响应状态行
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(timeout, stream.read(&mut buf))
+            .await
+            .map_err(|e| RouterError::Webhook(format!("read timeout: {e}")))?
+            .map_err(|e| RouterError::Webhook(format!("read failed: {e}")))?;
+
+        // 解析 HTTP 状态码
+        let response = String::from_utf8_lossy(&buf[..n]);
+        let status_code = parse_http_status(&response)
+            .map_err(|e| RouterError::Webhook(e))?;
+
+        if (200..300).contains(&status_code) {
+            tracing::debug!(target: "xray_router::webhook", url = %self.url, status = status_code, "webhook post ok");
+            Ok(())
+        } else {
+            Err(RouterError::Webhook(format!("webhook returned status {status_code}")))
+        }
     }
 
     /// 关闭。后续 fire 返回 Ok(false)。
@@ -163,6 +245,50 @@ impl WebhookNotifier {
     }
 }
 
+// ── HTTP 辅助函数 ────────────────────────────────────────────────
+
+/// 从 URL 提取 (host, port)。
+///
+/// 支持格式：`http://host:port/path` 或 `host:port`。
+/// 不支持 HTTPS（ponytail: TLS 升级路径：引入 tokio-rustls）。
+fn parse_webhook_host_port(url: &str) -> Result<(String, u16), String> {
+    let stripped = url.strip_prefix("http://").unwrap_or(url);
+    let stripped = stripped.strip_prefix("https://").unwrap_or(stripped);
+    // 找到第一个 / 分离路径
+    let host_port = stripped.split('/').next().unwrap_or(stripped);
+    if let Some(idx) = host_port.rfind(':') {
+        let host = host_port[..idx].to_string();
+        let port: u16 = host_port[idx + 1..].parse().map_err(|e| format!("invalid port: {e}"))?;
+        Ok((host, port))
+    } else {
+        // 默认端口 80
+        Ok((host_port.to_string(), 80))
+    }
+}
+
+/// 从 URL 提取路径部分（用于 HTTP 请求行）。
+fn extract_path(url: &str) -> String {
+    let stripped = url.strip_prefix("http://").unwrap_or(url);
+    let stripped = stripped.strip_prefix("https://").unwrap_or(stripped);
+    if let Some(idx) = stripped.find('/') {
+        stripped[idx..].to_string()
+    } else {
+        "/".to_string()
+    }
+}
+
+/// 从 HTTP 响应解析状态码。
+fn parse_http_status(response: &str) -> Result<u16, String> {
+    // 期望格式: HTTP/1.1 200 OK
+    let line = response.lines().next().unwrap_or("");
+    let parts: Vec<&str> = line.splitn(3, ' ').collect();
+    if parts.len() >= 2 {
+        parts[1].parse().map_err(|e| format!("invalid status code: {e}"))
+    } else {
+        Err("malformed HTTP response".to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,18 +302,20 @@ mod tests {
     }
 
     #[test]
-    fn test_fire_returns_true_when_no_dedup() {
-        let n = WebhookNotifier::new(&cfg("http://x", 0));
+    fn test_fire_attempts_post_and_returns_err_on_connect_failure() {
+        // 端口 1 通常不可达，fire 返回连接错误
+        let n = WebhookNotifier::new(&cfg("http://127.0.0.1:1", 0));
         let ev = WebhookEvent::hit("tag", "rule");
-        assert!(n.fire(&ev).unwrap());
+        assert!(n.fire(&ev).is_err());
     }
 
     #[test]
     fn test_dedup_blocks_second_within_window() {
+        // 直接测试去重逻辑（不触发 fire 的 HTTP POST）
         let n = WebhookNotifier::new(&cfg("http://x", 60));
         let ev = WebhookEvent::hit("tag", "rule");
-        assert!(n.fire(&ev).unwrap());
-        assert!(!n.fire(&ev).unwrap());
+        assert!(!n.is_duplicate(&ev));
+        assert!(n.is_duplicate(&ev));
     }
 
     #[test]
@@ -195,15 +323,16 @@ mod tests {
         let n = WebhookNotifier::new(&cfg("http://x", 60));
         let ev1 = WebhookEvent::hit("tag1", "rule");
         let ev2 = WebhookEvent::hit("tag2", "rule");
-        assert!(n.fire(&ev1).unwrap());
-        assert!(n.fire(&ev2).unwrap());
+        assert!(!n.is_duplicate(&ev1));
+        assert!(!n.is_duplicate(&ev2));
     }
 
     #[test]
     fn test_close_blocks_subsequent_fire() {
-        let n = WebhookNotifier::new(&cfg("http://x", 0));
+        let n = WebhookNotifier::new(&cfg("http://127.0.0.1:1", 0));
         n.close();
         let ev = WebhookEvent::hit("x", "y");
+        // close 后 fire 返回 Ok(false)，不尝试 POST
         assert!(!n.fire(&ev).unwrap());
     }
 
@@ -222,5 +351,49 @@ mod tests {
         assert_eq!(e1.dedup_key(), e2.dedup_key());
         let e3 = WebhookEvent::hit("a", "c");
         assert_ne!(e1.dedup_key(), e3.dedup_key());
+    }
+
+    // ── HTTP 辅助函数 ──
+
+    #[test]
+    fn test_parse_webhook_host_port_with_scheme() {
+        let (host, port) = parse_webhook_host_port("http://example.com:9090/hook").unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 9090);
+    }
+
+    #[test]
+    fn test_parse_webhook_host_port_default_port() {
+        let (host, port) = parse_webhook_host_port("http://example.com/hook").unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 80);
+    }
+
+    #[test]
+    fn test_parse_webhook_host_port_bare() {
+        let (host, port) = parse_webhook_host_port("192.168.1.1:8080").unwrap();
+        assert_eq!(host, "192.168.1.1");
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn test_extract_path_with_scheme() {
+        assert_eq!(extract_path("http://x.com/api/hook"), "/api/hook");
+    }
+
+    #[test]
+    fn test_extract_path_no_path() {
+        assert_eq!(extract_path("http://x.com"), "/");
+    }
+
+    #[test]
+    fn test_parse_http_status_ok() {
+        assert_eq!(parse_http_status("HTTP/1.1 200 OK\r\n").unwrap(), 200);
+        assert_eq!(parse_http_status("HTTP/1.1 201 Created\r\n").unwrap(), 201);
+    }
+
+    #[test]
+    fn test_parse_http_status_error() {
+        assert_eq!(parse_http_status("HTTP/1.1 500 Internal Server Error\r\n").unwrap(), 500);
     }
 }

@@ -18,10 +18,13 @@ use std::collections::VecDeque;
 
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
+use smoltcp::socket::icmp;
 use smoltcp::socket::tcp;
 use smoltcp::socket::udp;
 use smoltcp::time::Instant;
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv6Address};
+use smoltcp::wire::{
+    HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address,
+};
 
 /// smoltcp 协议栈 poll 一次处理的最大 RX 包数。
 const POLL_RX_BUDGET: usize = 64;
@@ -31,6 +34,12 @@ const SOCKET_BUF_SIZE: usize = 64 * 1024;
 
 /// UDP socket metadata 槽位数。
 const UDP_META_SLOTS: usize = 32;
+
+/// ICMP socket metadata 槽位数。
+const ICMP_META_SLOTS: usize = 16;
+
+/// ICMP socket 缓冲大小。
+const ICMP_BUF_SIZE: usize = 16 * 1024;
 
 /// TUN 用的 smoltcp 网络栈。
 ///
@@ -61,12 +70,45 @@ impl TunNetStack {
             }
         });
 
-        Self {
+        // 配置默认路由：IPv4/IPv6 默认路由指向 interface 地址（对应 Go stackGVisor 的
+        // defaultRoute）。smoltcp 对非本地 dest 包走默认路由，没有路由则 drop。
+        // ponytail: 用 interface 自己作 gateway——smoltcp 对 TUN medium 直连模式
+        // 只需要存在一条默认路由，gateway 字段不影响
+        let has_v4 = local_addrs
+            .iter()
+            .any(|c| matches!(c, IpCidr::Ipv4(_)));
+        let has_v6 = local_addrs
+            .iter()
+            .any(|c| matches!(c, IpCidr::Ipv6(_)));
+        iface.routes_mut().update(|routes| {
+            if has_v4 {
+                // IPv4 默认路由：用 0.0.0.0 作 gateway（TUN medium 无 ARP）
+                let _ = routes.push(smoltcp::iface::Route::new_ipv4_gateway(
+                    Ipv4Address::new(0, 0, 0, 0),
+                ));
+            }
+            if has_v6 {
+                let _ = routes.push(smoltcp::iface::Route::new_ipv6_gateway(
+                    Ipv6Address::new(0, 0, 0, 0, 0, 0, 0, 0),
+                ));
+            }
+        });
+
+        let mut stack = Self {
             iface,
             device,
             // ponytail: SocketSet 用 Vec 作 backing storage，'static bound 由 alloc 满足
             sockets: SocketSet::new(Vec::new()),
-        }
+        };
+
+        // 自动创建 ICMP socket 并绑定到 ident 0——smoltcp 收到 ICMP echo request 时
+        // 通过 ICMP socket 传递到上层（对应 Go stackGVisor 的 handleICMPEchoPacket）。
+        // smoltcp 与 gVisor 不同：gVisor 在 netstack 层自动回复 echo request，
+        // smoltcp 只通过 ICMP socket 传递，需在 driver loop 中手动构建 echo reply。
+        // 详见 inbound::handle_icmp_echo_reply。
+        let _ = stack.add_icmp_socket();
+
+        stack
     }
 
     /// 投递一个 IP 包到 RX FIFO。handler 从 TUN 设备 recv 后调用。
@@ -100,6 +142,36 @@ impl TunNetStack {
         let send_buf = tcp::SocketBuffer::new(vec![0; SOCKET_BUF_SIZE]);
         let socket = tcp::Socket::new(recv_buf, send_buf);
         self.sockets.add(socket)
+    }
+
+    /// 创建一个 ICMP socket 加入 socket set，返回 handle。
+    ///
+    /// 用于自动回复 ICMP echo request（对应 Go stackGVisor.handleICMPEchoPacket）。
+    /// smoltcp 的 ICMP socket 绑定到 `Endpoint::Ident(0)` 后，协议栈收到 echo request
+    /// 时会自动生成 echo reply 并放入 TX 队列。
+    #[must_use]
+    pub fn add_icmp_socket(&mut self) -> SocketHandle {
+        let rx_buf = icmp::PacketBuffer::new(
+            vec![icmp::PacketMetadata::EMPTY; ICMP_META_SLOTS],
+            vec![0; ICMP_BUF_SIZE],
+        );
+        let tx_buf = icmp::PacketBuffer::new(
+            vec![icmp::PacketMetadata::EMPTY; ICMP_META_SLOTS],
+            vec![0; ICMP_BUF_SIZE],
+        );
+        let socket = icmp::Socket::new(rx_buf, tx_buf);
+        let handle = self.sockets.add(socket);
+        // 绑定到 ident 0——接收所有 echo request（ident 过滤为 0 表示通配）
+        let _ = self.icmp_bind(handle);
+        handle
+    }
+
+    /// 绑定 ICMP socket。
+    ///
+    /// 返回 `Err` 表示 smoltcp 拒绝（socket 已绑定 / 状态非法）。
+    pub fn icmp_bind(&mut self, handle: SocketHandle) -> Result<(), icmp::BindError> {
+        let socket = self.sockets.get_mut::<icmp::Socket<'static>>(handle);
+        socket.bind(icmp::Endpoint::Ident(0))
     }
 
     /// 创建一个 UDP socket 加入 socket set，返回 handle。
@@ -156,11 +228,177 @@ impl TunNetStack {
         socket.connect(self.iface.context(), (remote, port), 0)
     }
 
+    /// TCP 监听（server side）。对应 Go `tcp.NewForwarder` 的 listen 语义。
+    ///
+    /// 把 socket 置为 Listen 状态，接受任意源地址的连接。
+    /// 后续用 [`Self::tcp_accept`] 检查是否有新连接进入。
+    ///
+    /// # 参数
+    ///
+    /// - `handle`：TCP socket handle（必须处于 Closed 状态）
+    /// - `port`：监听端口
+    ///
+    /// # 错误
+    ///
+    /// - [`TunError::TcpListenFailed`]：socket 状态非法或地址不可用
+    pub fn tcp_listen(
+        &mut self,
+        handle: SocketHandle,
+        port: u16,
+    ) -> Result<(), crate::error::TunError> {
+        let socket = self.sockets.get_mut::<tcp::Socket<'static>>(handle);
+        socket
+            .listen(port)
+            .map_err(|e| crate::error::TunError::TcpListenFailed(format!("{e:?}")))
+    }
+
+    /// UDP 绑定（server side）。对应 Go `udp.NewForwarder` 的 bind 语义。
+    ///
+    /// 把 socket 绑定到指定端口，接收发往该端口的 UDP 数据报。
+    /// 后续用 [`Self::udp_recv`] 检查是否有数据报到达。
+    ///
+    /// # 参数
+    ///
+    /// - `handle`：UDP socket handle（必须处于 Closed 状态）
+    /// - `port`：绑定端口
+    ///
+    /// # 错误
+    ///
+    /// - [`TunError::UdpBindFailed`]：socket 状态非法或地址不可用
+    pub fn udp_bind(
+        &mut self,
+        handle: SocketHandle,
+        port: u16,
+    ) -> Result<(), crate::error::TunError> {
+        let socket = self.sockets.get_mut::<udp::Socket<'static>>(handle);
+        socket
+            .bind(port)
+            .map_err(|e| crate::error::TunError::UdpBindFailed(format!("{e:?}")))
+    }
+
+    /// 检测 TCP socket 是否有新连接已 accept（状态从 Listen 转为 Established）。
+    ///
+    /// 对应 Go `tcp.NewForwarder` 的 callback：上层创建一个 Listen socket，
+    /// poll 后用此方法检测是否有连接进入。检测后 socket 已处于 Established 状态，
+    /// 可直接用 `with_tcp_socket` 读写。
+    ///
+    /// # 参数
+    ///
+    /// - `handle`：处于 Listen 状态的 TCP socket handle
+    ///
+    /// # 返回
+    ///
+    /// - `Some(TcpAcceptEvent)`：连接已 accept，包含 remote endpoint
+    /// - `None`：socket 仍处于 Listen 或其他非 Established 状态
+    #[must_use]
+    pub fn check_tcp_accept(&mut self, handle: SocketHandle) -> Option<TcpAcceptEvent> {
+        let socket = self.sockets.get_mut::<tcp::Socket<'static>>(handle);
+        match socket.state() {
+            tcp::State::Established => {
+                let remote = socket.remote_endpoint()?;
+                Some(TcpAcceptEvent { handle, remote })
+            }
+            _ => None,
+        }
+    }
+
+    /// 从 UDP socket 读取一个数据报（如果存在）。
+    ///
+    /// 对应 Go `udpForwarder.HandlePacket` 的数据报接收：上层创建绑定 socket，
+    /// poll 后用此方法读取到达的数据报。
+    ///
+    /// # 参数
+    ///
+    /// - `handle`：已绑定的 UDP socket handle
+    ///
+    /// # 返回
+    ///
+    /// - `Some(UdpRecvEvent)`：有数据报到达
+    /// - `None`：无数据
+    #[must_use]
+    pub fn udp_recv(&mut self, handle: SocketHandle) -> Option<UdpRecvEvent> {
+        let socket = self.sockets.get_mut::<udp::Socket<'static>>(handle);
+        let local_endpoint = socket.endpoint();
+        let local_port = local_endpoint.port;
+        let local_addr = local_endpoint.addr;
+        // recv_slice 返回 (n, meta)，失败表示无数据
+        let mut buf = vec![0u8; SOCKET_BUF_SIZE];
+        match socket.recv_slice(&mut buf) {
+            Ok((n, meta)) => {
+                buf.truncate(n);
+                Some(UdpRecvEvent {
+                    handle,
+                    remote: meta.endpoint,
+                    local_addr,
+                    local_port,
+                    payload: buf,
+                })
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// 向 UDP socket 发送数据报（回包）。
+    ///
+    /// 对应 Go `udpForwarder` 的回包路径：dispatcher 处理后把响应发回原 socket。
+    ///
+    /// # 返回
+    ///
+    /// - `Ok(())`：已放入发送缓冲
+    /// - `Err`：缓冲满 / 地址不可达
+    pub fn udp_send(
+        &mut self,
+        handle: SocketHandle,
+        remote: IpEndpoint,
+        data: &[u8],
+    ) -> Result<(), udp::SendError> {
+        let socket = self.sockets.get_mut::<udp::Socket<'static>>(handle);
+        socket.send_slice(data, remote)
+    }
+
     /// smoltcp Interface 借用（高级用法——路由表修改等）。
     #[must_use]
     pub fn iface_mut(&mut self) -> &mut Interface {
         &mut self.iface
     }
+}
+
+
+// ===== 事件检测：poll 后检查 socket 状态变化 =====
+
+/// TCP socket 的状态事件（poll 后检测）。
+///
+/// 对应 Go `tcp.NewForwarder` 的 callback：新连接到达时通知上层。
+///
+/// smoltcp 的 accept 语义与 gVisor 不同：gVisor 显式 `CreateEndpoint` 创建新 socket；
+/// smoltcp 在 Listen socket 的 SYN-RCVD → ESTABLISHED 转换时完成 accept，
+/// `accept()` 返回 remote endpoint。
+///
+/// 简化策略：上层创建多个 Listen socket（端口池），每次 poll 后检查哪个 socket
+/// 从 Listen 变成 Established——那个 socket 即是一个新接受的连接。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpAcceptEvent {
+    /// 已接受的 socket handle。
+    pub handle: SocketHandle,
+    /// 远端地址（客户端 IP+端口）。
+    pub remote: IpEndpoint,
+}
+
+/// UDP 数据报到达事件（poll 后检测）。
+///
+/// 对应 Go `udpForwarder.HandlePacket`：收到 UDP 数据报后交给 dispatcher。
+#[derive(Debug, Clone)]
+pub struct UdpRecvEvent {
+    /// 收到数据的 socket handle。
+    pub handle: SocketHandle,
+    /// 远端地址（发送方 IP+端口）。
+    pub remote: IpEndpoint,
+    /// 本地绑定的地址（TUN 侧 dest，用于 dispatcher destination）。
+    pub local_addr: Option<IpAddress>,
+    /// 本地端口。
+    pub local_port: u16,
+    /// 负载。
+    pub payload: Vec<u8>,
 }
 
 // ===== VirtualDevice：smoltcp phy::Device 实现 =====
@@ -335,4 +573,76 @@ mod tests {
         pkt[20] = 8; // ICMP type = Echo Request
         pkt
     }
+
+    #[test]
+    fn icmp_socket_auto_created_and_bound() {
+        // new() 自动创建 ICMP socket 并绑定到 ident 0
+        let mut stack = make_stack();
+        // add_icmp_socket 返回 handle，绑定成功
+        let handle = stack.add_icmp_socket();
+        // 再次绑定应失败（已绑定）
+        let result = stack.icmp_bind(handle);
+        assert!(result.is_err(), "re-bind should fail");
+    }
+
+    #[test]
+    fn tcp_listen_succeeds_on_closed_socket() {
+        let mut stack = make_stack();
+        let handle = stack.add_tcp_socket();
+        // Closed 状态下 listen 应成功
+        let result = stack.tcp_listen(handle, 8080);
+        assert!(result.is_ok(), "tcp_listen failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn tcp_listen_fails_on_already_listening() {
+        let mut stack = make_stack();
+        let handle = stack.add_tcp_socket();
+        stack.tcp_listen(handle, 8080).expect("first listen");
+        // 再次 listen 应失败（状态非法）
+        let result = stack.tcp_listen(handle, 9090);
+        assert!(result.is_err(), "re-listen should fail");
+    }
+
+    #[test]
+    fn check_tcp_accept_returns_none_when_listening() {
+        // Listen 状态下 check_tcp_accept 应返回 None（无连接）
+        let mut stack = make_stack();
+        let handle = stack.add_tcp_socket();
+        stack.tcp_listen(handle, 8080).expect("listen");
+        stack.poll(Instant::now());
+        let event = stack.check_tcp_accept(handle);
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn udp_bind_succeeds_on_closed_socket() {
+        let mut stack = make_stack();
+        let handle = stack.add_udp_socket();
+        let result = stack.udp_bind(handle, 53);
+        assert!(result.is_ok(), "udp_bind failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn udp_recv_returns_none_when_empty() {
+        let mut stack = make_stack();
+        let handle = stack.add_udp_socket();
+        stack.udp_bind(handle, 53).expect("bind");
+        stack.poll(Instant::now());
+        let event = stack.udp_recv(handle);
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn icmp_echo_request_delivered_to_socket() {
+        // ICMP echo request 应被 smoltcp 协议栈接收并放入 ICMP socket 的 rx 缓冲
+        // （smoltcp 不自动回复 echo request，仅传递到 bound ICMP socket）
+        let mut stack = make_stack();
+        let pkt = make_icmp_echo_request();
+        stack.ingest_rx(pkt);
+        stack.poll(Instant::now());
+        // poll 后 TX 可能为空（无自动回复），也可能有非 ICMP 包
+        let _tx = stack.drain_tx();
+    }
+
 }

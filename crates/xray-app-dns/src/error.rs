@@ -69,6 +69,10 @@ pub enum DnsError {
     /// DNS wire format 编解码错误（来自 hickory-proto）。
     #[error("dns wire format error: {0}")]
     WireFormat(String),
+
+    /// 系统 DNS 解析失败（hickory-resolver 错误）。
+    #[error("system dns resolution failed: {0}")]
+    SystemResolve(String),
 }
 
 impl DnsError {

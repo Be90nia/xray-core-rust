@@ -102,6 +102,14 @@ pub enum ProxymanError {
     /// 无法监听 socket
     #[error("unable to listen socket: {0}")]
     ListenSocketFailed(String),
+    /// 不是有效的 UoT 地址
+    #[error("not a UoT destination")]
+    NotUoTDestination,
+
+    /// UoT 版本不匹配
+    #[error("unsupported UoT version")]
+    UnsupportedUoTVersion,
+
 
     /// 其他错误（用于 trait/IO 边界占位）
     #[error("other: {0}")]

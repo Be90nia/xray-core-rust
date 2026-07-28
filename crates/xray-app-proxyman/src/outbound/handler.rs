@@ -8,11 +8,11 @@
 //! - [`OutboundHandlerEntry`] — Go `Handler struct`：配置载体（tag / sender / proxy_type_url /
 //!   mux 启用 / xudp 启用 / UDP 443 策略 / 流量计数器）
 //! - [`parse_random_ip`] — Go `ParseRandomIP`：CIDR 子网内随机 IP（纯函数）
+//! - [`get_uo_t_connection`] — Go `getUoTConnection`：UoT (UDP over TCP) 连接
 //!
 //! IO 边界（trait + TODO 占位）：
 //! - `dispatch` — 依赖 `transport.Link` + 代理 + mux + xudp + DNS LookupForIP
 //! - `dial` — 依赖 transport Dialer + TLS Client + UoT
-//! - `get_uo_t_connection` — 依赖 `sing::common::uot`（Rust 端无等价 crate，TODO）
 
 use crate::error::ProxymanError;
 use crate::inbound::PinFuture;
@@ -22,7 +22,25 @@ use ipnet::IpNet;
 use rand::Rng;
 use std::net::IpAddr;
 use std::sync::Arc;
+use tokio::net::UdpSocket;
 use xray_proto::xray::app::proxyman::{MultiplexingConfig, SenderConfig};
+
+// ── UoT 常量 ──────────────────────────────────────────────────
+
+/// UoT v1 魔术域名（对应 Go `uot.MagicAddress`）。
+const UOT_MAGIC_ADDRESS: &str = "UoT";
+
+/// UoT Legacy 魔术域名（对应 Go `uot.LegacyMagicAddress`）。
+const UOT_LEGACY_MAGIC_ADDRESS: &str = "UoTL";
+
+/// UoT 版本。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UotVersion {
+    /// 当前版本（MagicAddress）。
+    Current,
+    /// 旧版（LegacyMagicAddress）。
+    Legacy,
+}
 
 /// XUDP 对 UDP 443 流量的处理策略（对应 Go `string` 字面量 `"reject" / "allow" / "skip"`）
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -220,6 +238,44 @@ impl OutboundHandlerEntry {
     #[must_use]
     pub fn downlink_counter(&self) -> Option<&Arc<dyn Counter>> {
         self.downlink_counter.as_ref()
+    }
+
+    /// 获取 UoT (UDP over TCP) 连接。
+    ///
+    /// 对应 Go `Handler.getUoTConnection(ctx, dest)`。
+    /// 当目标地址是 UoT 魔术域名时，创建 UDP socket 并包装为 UoT 连接。
+    ///
+    /// # Errors
+    /// - [`ProxymanError::NilDestination`]：目标地址为空
+    /// - [`ProxymanError::NotUoTDestination`]：目标地址不是 UoT 魔术域名
+    /// - [`ProxymanError::ListenSocketFailed`]：UDP socket 绑定失败
+    pub async fn get_uo_t_connection(
+        &self,
+        dest_domain: Option<&str>,
+    ) -> Result<(UdpSocket, UotVersion), ProxymanError> {
+        let domain = dest_domain.ok_or(ProxymanError::NilDestination)?;
+        if domain.is_empty() {
+            return Err(ProxymanError::NilDestination);
+        }
+
+        // 判断 UoT 版本
+        let version = if domain == UOT_MAGIC_ADDRESS {
+            UotVersion::Current
+        } else if domain == UOT_LEGACY_MAGIC_ADDRESS {
+            UotVersion::Legacy
+        } else {
+            return Err(ProxymanError::NotUoTDestination);
+        };
+
+        // 绑定 UDP socket（对应 Go internet.ListenSystemPacket）
+        let socket = UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|e| ProxymanError::ListenSocketFailed(e.to_string()))?;
+
+        // ponytail: Go 用 uot.NewServerConn(packetConn, uotVersion) 包装。
+        // Rust 端无 sing uot crate，直接返回 (socket, version)，由上层桥接。
+        // 升级路径：实现 UoT ServerConn 包装层。
+        Ok((socket, version))
     }
 }
 

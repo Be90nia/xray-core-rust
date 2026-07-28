@@ -15,3 +15,5 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
+httparse.workspace = true
+ring.workspace = true

@@ -13,4 +13,4 @@ pub mod nameserver;
 pub mod server;
 
 // 重导出顶层 API，便于上层直接 `use xray_app_dns::DnsService`。
-pub use server::{DnsService, DomainMatcherInfo};
+pub use server::{DnsService, DomainMatcherInfo, check_routes};

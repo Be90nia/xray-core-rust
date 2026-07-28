@@ -11,8 +11,8 @@
 //! 实际实例启动（`Instance::new(config) + Start`）依赖 P7-2 切片2 的完整
 //! `New(config)` 实现，当前返回 [`error::CliError::Unimplemented`]。
 //!
-//! 切片2 待办：完整 `run` 启动路径 + 工具子命令（`uuid`/`x25519`/`cert`/`hash`/
-//! `ping`/`run -format`/`commands`/`distro` 共 50+ 个）+ 信号处理（SIGINT/SIGTERM）。
+//! 切片2 待办：完整 `run` 启动路径 + gRPC client 接入（API 命令真实调用）
+//! + 信号处理（SIGINT/SIGTERM）。
 
 pub mod commands;
 pub mod distro;

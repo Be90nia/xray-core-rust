@@ -16,7 +16,7 @@
 //! IO 边界（trait + NotImplemented 占位）：
 //! - worker 创建（TCP/UDP/Unix listener）— 依赖 `xray_transport::Listener` + xray-mux
 //! - `outbound::OutboundHandlerEntry` 的 `dispatch`/`dial` — 依赖 `transport.Link` + 代理 + mux + xudp + DNS
-//! - UoT (`get_uo_t_connection`) — 依赖 sing `uot` crate（Rust 生态无等价品）
+//! - UoT ([`outbound::OutboundHandlerEntry::get_uo_t_connection`]) — UDP over TCP 桥接
 //! - gRPC server 注册 — 依赖 tonic + xray-app-commander
 //! - TypedMessage 操作解码 — 由上层注入 [`command::OperationDecoder`] 实现
 
@@ -30,5 +30,5 @@ pub mod stats;
 pub use config::{SniffingRequest, build_sniffing_request};
 pub use error::ProxymanError;
 pub use inbound::{AlwaysOnInboundHandler, InboundHandler, InboundManager, PinFuture};
-pub use outbound::{OutboundHandler, OutboundManager, OutboundHandlerEntry, parse_random_ip};
+pub use outbound::{OutboundHandler, OutboundManager, OutboundHandlerEntry, UotVersion, parse_random_ip};
 pub use stats::{Counter, HandlerKind, NoopStatsProvider, StatsProvider, TrafficDirection};

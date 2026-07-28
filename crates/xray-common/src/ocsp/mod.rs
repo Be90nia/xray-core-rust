@@ -135,10 +135,12 @@ pub fn get_ocsp_for_file(_path: &Path) -> Result<Option<OcspResponse>, OcspError
 /// 对应 Go 版本 `ocsp.GetOCSPStapling`。
 ///
 /// # 注意
-/// 当前为占位实现。
+/// 实际 OCSP stapling 实现在 `xray_tls::ocsp_stapling` 模块中，
+/// 使用 `ocsp-stapler` crate 自动获取并装订 OCSP 响应。
+/// 本函数为兼容性保留，建议直接使用 `xray_tls::ocsp_stapling`。
 pub fn get_ocsp_stapling(_cert_der: &[u8]) -> Result<Option<OcspResponse>, OcspError> {
     Err(OcspError::NotSupported(
-        "OCSP stapling is not yet implemented".into(),
+        "use xray_tls::ocsp_stapling instead".into(),
     ))
 }
 

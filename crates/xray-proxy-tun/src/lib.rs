@@ -30,5 +30,5 @@ pub mod inbound;
 pub use config::{Stack, StackOptions, Tun, score};
 pub use device::TunDevice;
 pub use inbound::TunInboundHandler;
-pub use netstack::TunNetStack;
+pub use netstack::{TcpAcceptEvent, TunNetStack, UdpRecvEvent};
 pub use error::{Result, TunError};

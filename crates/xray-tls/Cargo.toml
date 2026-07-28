@@ -20,6 +20,10 @@ tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
 rustls-pki-types = { workspace = true }
 
+# OCSP stapling（对应 Go crypto/x509 + ocsp；自动获取并装订 OCSP 响应到 TLS 握手）
+ocsp-stapler = { workspace = true }
+rustls-pemfile = "2"
+
 # uTLS 指纹伪造 (btls BoringSSL 绑定)
 btls = { workspace = true }
 tokio-btls = { workspace = true }
@@ -31,3 +35,7 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 rcgen = "0.13"
+
+[features]
+default = []
+ocsp-stapling = []

@@ -59,6 +59,18 @@ pub enum TlsError {
     /// 不会返回本错误。真实 uTLS 待 REALITY 任务再接 watfaq-rustls。
     #[error("uTLS handshake not yet implemented in Rust")]
     UtlsNotImplemented,
+
+    /// OCSP stapling 初始化失败（证书链不足、解析错误等）。
+    #[error("OCSP stapling init failed: {0}")]
+    OcspStaplingInit(String),
+
+    /// OCSP 响应获取失败（网络/解析错误等）。
+    #[error("OCSP response fetch failed: {0}")]
+    OcspResponseFetch(String),
+
+    /// PEM 证书/密钥加载失败。
+    #[error("failed to load PEM: {0}")]
+    PemLoad(String),
 }
 
 #[cfg(test)]

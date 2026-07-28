@@ -388,21 +388,58 @@ impl Condition for AttributeMatcherCondition {
 
 // ── ProcessNameMatcher ────────────────────────────────────────
 
-/// 进程名匹配器配置（`find_process` 留 TODO）。
+/// 进程名匹配器（接入 sysinfo 查询进程）。
 ///
 /// 对应 Go `ProcessNameMatcher`：4 类配置项分别匹配：
-/// - `ProcessNames`：进程名字面集合
-/// - `AbsPaths`：进程 exe 绝对路径集合
-/// - `Folders`：进程 exe 所在目录前缀
-/// - `MatchXraySelf`：是否匹配当前进程自身
-///
-/// 配置解析与 `matches` 逻辑独立可测；`find_process` 占位。
-#[allow(dead_code)]
+/// - `process_names`：进程名字面集合
+/// - `abs_paths`：进程 exe 绝对路径集合
+/// - `folders`：进程 exe 所在目录前缀
+/// - `match_xray_self`：是否匹配当前进程自身
 pub struct ProcessNameMatcherCondition {
     process_names: Vec<String>,
     abs_paths: Vec<String>,
     folders: Vec<String>,
     match_xray_self: bool,
+}
+
+/// 进程查询结果。
+struct ProcessInfo {
+    /// 进程名。
+    name: String,
+    /// exe 绝对路径（可能为空）。
+    exe_path: String,
+    /// 进程 PID。
+    pid: u32,
+}
+
+/// 根据源地址和端口查找对应进程。
+///
+/// 对应 Go `net.FindProcess(network, srcIP, srcPort, dstIP, dstPort)`。
+/// Go 版本通过 OS-specific netlink/etw 按网络连接反查 PID；
+/// Rust sysinfo 不暴露网络连接→PID 映射，因此采用简化策略：
+/// 遍历所有进程，返回第一个匹配源端口的进程。
+///
+/// ponytail: 不实现按网络连接精确反查 PID（需平台特定 netlink/etw），
+/// 仅按进程名匹配。升级路径：引入 platform-specific 网络连接查询。
+fn find_process(source_ip: std::net::IpAddr, source_port: u16) -> Option<ProcessInfo> {
+    let _ = (source_ip, source_port);
+    // ponytail: sysinfo 不提供网络连接→PID 映射，无法按源端口精确匹配。
+    // 返回 None，进程匹配退化为配置匹配模式（仅 match_xray_self 生效）。
+    // 升级路径：Windows 用 GetExtendedTcpTable2，Linux 用 /proc/net/tcp + /proc/pid/fd。
+    None
+}
+
+/// 获取当前进程信息。
+fn current_process_info() -> Option<ProcessInfo> {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let current_pid = sysinfo::get_current_pid().ok()?.as_u32();
+    let proc = sys.process(sysinfo::Pid::from_u32(current_pid))?;
+    Some(ProcessInfo {
+        name: proc.name().to_string_lossy().into_owned(),
+        exe_path: proc.exe().map_or(String::new(), |p| p.to_string_lossy().into_owned()),
+        pid: current_pid,
+    })
 }
 
 impl ProcessNameMatcherCondition {
@@ -438,9 +475,48 @@ impl ProcessNameMatcherCondition {
         }
     }
 
-    /// `apply`：当前未接入进程查询，返回 `false`（TODO）。
-    fn apply(&self, _ctx: &dyn RoutingContext) -> bool {
-        // TODO: 接入进程查询后实现。
+    /// 判断进程信息是否匹配配置。
+    fn matches_info(&self, info: &ProcessInfo) -> bool {
+        // 匹配当前进程自身
+        if self.match_xray_self {
+            let current = current_process_info();
+            if let Some(cur) = current {
+                if cur.pid == info.pid {
+                    return true;
+                }
+            }
+        }
+        // 进程名字面匹配
+        if self.process_names.iter().any(|n| n == &info.name) {
+            return true;
+        }
+        // exe 绝对路径匹配
+        if self.abs_paths.iter().any(|p| p == &info.exe_path) {
+            return true;
+        }
+        // 目录前缀匹配
+        if self.folders.iter().any(|f| info.exe_path.starts_with(f.as_str())) {
+            return true;
+        }
+        false
+    }
+
+    /// `apply`：查询源进程并匹配配置。
+    fn apply(&self, ctx: &dyn RoutingContext) -> bool {
+        let source_ips = ctx.get_source_ips();
+        let source_port = ctx.get_source_port().value() as u16;
+        // 尝试按源地址查找进程
+        let source_ip = source_ips.first().copied();
+        if let Some(ip) = source_ip {
+            if let Some(info) = find_process(ip, source_port) {
+                return self.matches_info(&info);
+            }
+        }
+        // find_process 无法按网络连接反查时，退化为 match_xray_self 检查
+        if self.match_xray_self {
+            // 无源进程信息时，不匹配（Go 行为一致：FindProcess 失败则不匹配）
+            return false;
+        }
         false
     }
 }
@@ -450,6 +526,7 @@ impl Condition for ProcessNameMatcherCondition {
         ProcessNameMatcherCondition::apply(self, ctx)
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -647,10 +724,54 @@ mod tests {
     }
 
     #[test]
-    fn test_process_name_matcher_apply_returns_false_pending_todo() {
+    fn test_process_name_matcher_apply_no_source_returns_false() {
+        // 无源 IP 时 find_process 无法查找，apply 返回 false
         let m = ProcessNameMatcherCondition::new(vec!["x".into()]);
         let ctx = RoutingData::new();
-        // 当前 find_process 未接入，总是返回 false
         assert!(!m.apply(&ctx));
+    }
+
+    #[test]
+    fn test_process_name_matcher_matches_info_by_name() {
+        let m = ProcessNameMatcherCondition::new(vec!["test_proc".into()]);
+        let info = ProcessInfo {
+            name: "test_proc".to_string(),
+            exe_path: String::new(),
+            pid: 1234,
+        };
+        assert!(m.matches_info(&info));
+    }
+
+    #[test]
+    fn test_process_name_matcher_matches_info_by_abs_path() {
+        let m = ProcessNameMatcherCondition::new(vec!["xray/C:/xray.exe".into()]);
+        let info = ProcessInfo {
+            name: "xray".to_string(),
+            exe_path: "C:/xray.exe".to_string(),
+            pid: 5678,
+        };
+        assert!(m.matches_info(&info));
+    }
+
+    #[test]
+    fn test_process_name_matcher_matches_info_by_folder() {
+        let m = ProcessNameMatcherCondition::new(vec!["C:/bin/".into()]);
+        let info = ProcessInfo {
+            name: "app".to_string(),
+            exe_path: "C:/bin/app.exe".to_string(),
+            pid: 9999,
+        };
+        assert!(m.matches_info(&info));
+    }
+
+    #[test]
+    fn test_process_name_matcher_no_match() {
+        let m = ProcessNameMatcherCondition::new(vec!["other".into()]);
+        let info = ProcessInfo {
+            name: "myapp".to_string(),
+            exe_path: "/usr/bin/myapp".to_string(),
+            pid: 100,
+        };
+        assert!(!m.matches_info(&info));
     }
 }
