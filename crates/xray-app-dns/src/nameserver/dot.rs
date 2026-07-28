@@ -268,6 +268,12 @@ mod tests {
     use tokio_rustls::TlsAcceptor;
     use xray_transport::connection::TcpConnection;
 
+    /// 确保 rustls CryptoProvider 在并行测试中只初始化一次
+    fn ensure_crypto_provider() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| { let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default(); });
+    }
+
     fn make_a_response(req_id: u16, fqdn: &str, ips: Vec<Ipv4Addr>, ttl: u32) -> Vec<u8> {
         let name = Name::parse(fqdn, None).unwrap();
         let mut msg = Message::new(req_id, MessageType::Response, OpCode::Query);
@@ -289,6 +295,7 @@ mod tests {
         Arc<ClientConfig>,
         tokio::task::JoinHandle<()>,
     ) {
+        ensure_crypto_provider();
         // rcgen 自签证书（SAN: localhost）。
         let cert_params =
             rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
@@ -407,7 +414,7 @@ mod tests {
 
     #[tokio::test]
     async fn dot_query_tls_handshake_failure() {
-        // 连一个不开 TLS 的 TCP 端口（mock TCP DNS，无 TLS），TLS 握手应失败。
+        ensure_crypto_provider();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         // 不 spawn accept，connect 成功但 TLS 握手必失败。

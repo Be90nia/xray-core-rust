@@ -310,6 +310,12 @@ mod tests {
     use tokio_rustls::TlsAcceptor;
     use xray_transport::connection::TcpConnection;
 
+    /// 确保 rustls CryptoProvider 在并行测试中只初始化一次
+    fn ensure_crypto_provider() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| { let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default(); });
+    }
+
     fn make_a_response(req_id: u16, fqdn: &str, ips: Vec<Ipv4Addr>, ttl: u32) -> Vec<u8> {
         let name = Name::parse(fqdn, None).unwrap();
         let mut msg = Message::new(req_id, MessageType::Response, OpCode::Query);
@@ -331,6 +337,7 @@ mod tests {
         Arc<ClientConfig>,
         tokio::task::JoinHandle<()>,
     ) {
+        ensure_crypto_provider();
         // rcgen 自签证书（SAN: localhost）。
         let cert_params =
             rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
@@ -463,7 +470,7 @@ mod tests {
 
     #[tokio::test]
     async fn doh_query_http_status_error() {
-        // 启动一个 mock TLS+h2 server，但回 500。
+        ensure_crypto_provider();
         let cert_params =
             rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         let key_pair = rcgen::KeyPair::generate().unwrap();

@@ -250,6 +250,12 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    /// 确保 rustls CryptoProvider 在并行测试中只初始化一次
+    fn ensure_crypto_provider() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| { let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default(); });
+    }
+
     /// 测试用 Server：固定返回指定 IP + TTL。
     struct StaticServer {
         name: String,
@@ -353,18 +359,21 @@ mod tests {
 
     #[test]
     fn new_server_dot_for_tls_scheme() {
+        ensure_crypto_provider();
         let server = new_server("tls://8.8.8.8").unwrap();
         assert!(server.name().starts_with("DoT"));
     }
 
     #[test]
     fn new_server_doh_for_https_scheme() {
+        ensure_crypto_provider();
         let server = new_server("https://8.8.8.8").unwrap();
         assert!(server.name().starts_with("DoH"));
     }
 
     #[test]
     fn new_server_quic_for_quic_scheme() {
+        ensure_crypto_provider();
         let server = new_server("quic://8.8.8.8").unwrap();
         assert!(server.name().starts_with("DoQ"));
     }
