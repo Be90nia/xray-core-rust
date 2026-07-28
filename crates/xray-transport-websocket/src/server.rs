@@ -381,6 +381,12 @@ async fn read_proxy_protocol<R: AsyncRead + Unpin>(
 mod tests {
     use super::*;
 
+    /// 确保 rustls CryptoProvider 在并行测试中只初始化一次
+    fn ensure_crypto_provider() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| { let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default(); });
+    }
+
     #[test]
     fn extract_early_data_decodes_url_safe_no_pad() {
         // 客户端编码：URL_SAFE_NO_PAD("hello") = "aGVsbG8"
@@ -502,6 +508,7 @@ mod tests {
     }
     #[tokio::test]
     async fn accept_tls_completes_ws_handshake() {
+        ensure_crypto_provider();
         // 1. 自签证书
         let cert_params =
             rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
