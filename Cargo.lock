@@ -4997,6 +4997,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "xray-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "xray-app-dispatcher",
+ "xray-buf",
+ "xray-common",
+ "xray-proto",
+ "xray-proxy-freedom",
+ "xray-proxy-ss",
+ "xray-proxy-trojan",
+ "xray-proxy-vless",
+ "xray-proxy-vmess",
+ "xray-transport",
+]
+
+[[package]]
 name = "xray-mux"
 version = "0.1.0"
 dependencies = [

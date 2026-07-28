@@ -67,6 +67,9 @@ members = [
     # Layer 7 - 核心与 CLI
     "crates/xray-core",
     "crates/xray-cli",
+
+    # 集成测试
+    "tests",
 ]
 
 [workspace.package]
