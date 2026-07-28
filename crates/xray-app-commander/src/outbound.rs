@@ -61,6 +61,30 @@ pub trait OutboundListener: Send + Sync {
 /// manager 由 P4-4 proxyman 实现，但跨 crate 调用依赖待定。
 ///
 /// 使用 xray-features 的 OutboundHandler trait。
+/// 动态 handler 管理 trait（内部使用，不暴露给 gRPC 层）。
+///
+/// 提供运行时增删 outbound handler 的能力，由 [`OutboundHandlerRegistry`] 实现。
+pub trait HandlerManager: Send + Sync {
+    /// 添加 handler。若 tag 已存在则返回错误。
+    fn add_handler(
+        &self,
+        handler: Arc<dyn xray_features::outbound::OutboundHandler>,
+    ) -> Result<(), CommanderError>;
+
+    /// 移除 handler。若 tag 不存在则返回错误。
+    fn remove_handler(&self, tag: &str) -> Result<(), CommanderError>;
+
+    /// 列出所有已注册 handler 的 tag。
+    fn list_handlers(&self) -> Vec<String>;
+}
+
+/// Outbound handler 注册 trait。对应 Go `outbound.Manager.AddHandler`。
+///
+/// Commander 在 outbound 模式下需要把 OutboundHandler 注册到 outbound
+/// manager，由 dispatcher 路由 API 流量到 commander。当前阶段 outbound
+/// manager 由 P4-4 proxyman 实现，但跨 crate 调用依赖待定。
+///
+/// 使用 xray-features 的 OutboundHandler trait。
 pub trait OutboundRegistrar: Send + Sync {
     /// 注册 handler。
     fn add_handler(
@@ -217,7 +241,7 @@ mod tests {
             self.handlers.lock().len()
         }
     }
-    impl OutboundRegistrar for MockRegistrar {
+    impl HandlerManager for MockRegistrar {
         fn add_handler(
             &self,
             handler: Arc<dyn xray_features::outbound::OutboundHandler>,
@@ -233,6 +257,10 @@ mod tests {
                 return Err(CommanderError::OutboundRegisterFailed(tag.into()));
             }
             Ok(())
+        }
+
+        fn list_handlers(&self) -> Vec<String> {
+            self.handlers.lock().iter().map(|h| h.tag().to_string()).collect()
         }
     }
 

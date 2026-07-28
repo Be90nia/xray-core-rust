@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use crate::error::CommanderError;
-use crate::outbound::{CommanderConn, OutboundListener, OutboundRegistrar};
+use crate::outbound::{CommanderConn, HandlerManager, OutboundListener, OutboundRegistrar};
 use xray_features::outbound::{OutboundError, OutboundHandler as XrayOutboundHandler};
 use xray_common::net::destination::Destination;
 use xray_common::session::Session;
@@ -256,7 +256,7 @@ impl Default for OutboundHandlerRegistry {
     }
 }
 
-impl OutboundRegistrar for OutboundHandlerRegistry {
+impl crate::outbound::HandlerManager for OutboundHandlerRegistry {
     fn add_handler(
         &self,
         handler: Arc<dyn XrayOutboundHandler>,
@@ -278,6 +278,10 @@ impl OutboundRegistrar for OutboundHandlerRegistry {
             return Err(CommanderError::OutboundRegisterFailed(tag.to_string()));
         }
         Ok(())
+    }
+
+    fn list_handlers(&self) -> Vec<String> {
+        self.handlers.lock().iter().map(|h| h.tag().to_string()).collect()
     }
 }
 

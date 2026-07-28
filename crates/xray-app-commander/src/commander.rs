@@ -168,7 +168,7 @@ pub struct Commander {
     services: RwLock<Vec<Arc<dyn Service>>>,
     running: AtomicBool,
     /// outbound 模式下使用的 handler 注册器（由上层注入）。
-    outbound_registrar: Option<Arc<dyn OutboundRegistrar>>,
+    outbound_registrar: Option<Arc<dyn crate::outbound::HandlerManager>>,
 }
 
 impl Commander {
@@ -210,7 +210,11 @@ impl Commander {
     }
 
     /// 设置 outbound handler 注册器（ outbound 模式下使用）。
-    pub fn set_outbound_registrar(&mut self, registrar: Arc<dyn OutboundRegistrar>) {
+    /// 要求对象同时实现 [`OutboundRegistrar`] 与 [`crate::outbound::HandlerManager`]。
+    pub fn set_outbound_registrar(
+        &mut self,
+        registrar: Arc<dyn crate::outbound::HandlerManager>,
+    ) {
         self.outbound_registrar = Some(registrar);
     }
 
@@ -320,6 +324,36 @@ impl Commander {
         }
         tracing::info!("commander closed (tag=`{}`)", self.tag);
         Ok(())
+    }
+}
+
+impl crate::outbound::HandlerManager for Commander {
+    fn add_handler(
+        &self,
+        handler: Arc<dyn xray_features::outbound::OutboundHandler>,
+    ) -> Result<(), CommanderError> {
+        match self.outbound_registrar.as_ref() {
+            Some(reg) => reg.add_handler(handler),
+            None => Err(CommanderError::OutboundRegisterFailed(
+                "no outbound registrar injected".into(),
+            )),
+        }
+    }
+
+    fn remove_handler(&self, tag: &str) -> Result<(), CommanderError> {
+        match self.outbound_registrar.as_ref() {
+            Some(reg) => reg.remove_handler(tag),
+            None => Err(CommanderError::OutboundRegisterFailed(
+                "no outbound registrar injected".into(),
+            )),
+        }
+    }
+
+    fn list_handlers(&self) -> Vec<String> {
+        match self.outbound_registrar.as_ref() {
+            Some(reg) => reg.list_handlers(),
+            None => Vec::new(),
+        }
     }
 }
 
