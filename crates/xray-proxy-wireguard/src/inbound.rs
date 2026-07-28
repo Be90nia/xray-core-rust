@@ -67,7 +67,7 @@ impl WireguardInboundHandler {
         let peer_cfg = &config.peers[0];
 
         // peer session（server 模式不预先设置 endpoint——从首包学习）
-        let peer: SharedPeer = shared_peer(config, peer_cfg)?;
+        let peer: SharedPeer = shared_peer(config, peer_cfg, 0)?;
 
         // 绑定监听 UDP
         let bind_addr = format!("0.0.0.0:{listen_port}");

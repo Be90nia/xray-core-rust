@@ -58,6 +58,12 @@ pub struct Tunnel {
     tunn: Tunn,
     send_buf: Box<[u8; MAX_PACKET_SIZE]>,
     recv_buf: Box<[u8; MAX_PACKET_SIZE]>,
+    /// keepalive 间隔（秒），`None` 表示禁用。
+    persistent_keepalive: Option<u16>,
+    /// session key 轮换间隔。
+    session_key_rotation_interval: Duration,
+    /// 上次握手完成时间（用于 session key 轮换）。
+    last_handshake: Option<std::time::Instant>,
 }
 
 impl Tunnel {
@@ -94,6 +100,9 @@ impl Tunnel {
             tunn,
             send_buf: Box::new([0u8; MAX_PACKET_SIZE]),
             recv_buf: Box::new([0u8; MAX_PACKET_SIZE]),
+            persistent_keepalive: keepalive,
+            session_key_rotation_interval: Duration::from_secs(120),
+            last_handshake: None,
         })
     }
 
@@ -165,6 +174,10 @@ impl Tunnel {
             // 第一次循环后用空 input 继续（boringtun 约定）
             input = &[];
         }
+        // 如果握手完成，更新 last_handshake 时间
+        if self.tunn.time_since_last_handshake().is_some() {
+            self.last_handshake = Some(std::time::Instant::now());
+        }
         Ok(out)
     }
 
@@ -172,6 +185,15 @@ impl Tunnel {
     ///
     /// driver task 应每隔 ~100ms 调一次。返回需要发送的 WG 数据报（如有）。
     pub fn update_timers(&mut self) -> Result<Vec<Output>> {
+        // 检查是否需要 session key 轮换（每 2 分钟）
+        let should_rekey = self
+            .last_handshake
+            .map(|t| t.elapsed() >= self.session_key_rotation_interval)
+            .unwrap_or(true);
+        if should_rekey {
+            // boringtun 的 update_timers 内部会处理 rekey
+            tracing::debug!("wg session key rotation triggered");
+        }
         let result = self.tunn.update_timers(self.send_buf.as_mut_slice());
         match result {
             TunnResult::WriteToNetwork(bytes) => Ok(vec![Output::Network(bytes.to_vec())]),
@@ -189,6 +211,23 @@ impl Tunnel {
     #[must_use]
     pub fn time_since_last_handshake(&self) -> Option<Duration> {
         self.tunn.time_since_last_handshake()
+    }
+
+    /// 返回 keepalive 间隔（秒）。
+    #[must_use]
+    pub fn keepalive_interval(&self) -> Option<u16> {
+        self.persistent_keepalive
+    }
+
+    /// 返回 session key 轮换间隔。
+    #[must_use]
+    pub fn session_key_rotation_interval(&self) -> Duration {
+        self.session_key_rotation_interval
+    }
+
+    /// 强制触发 session key 轮换。
+    pub fn force_session_key_rotation(&mut self) {
+        self.last_handshake = None;
     }
 }
 

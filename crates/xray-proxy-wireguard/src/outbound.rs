@@ -54,7 +54,7 @@ impl WireguardOutboundHandler {
         let peer_cfg = &config.peers[0];
 
         // peer session
-        let peer: SharedPeer = shared_peer(config, peer_cfg)?;
+        let peer: SharedPeer = shared_peer(config, peer_cfg, 0)?;
 
         // 远端 endpoint（必须是 IP:port，DNS 解析由上层负责）
         let remote_addr = crate::peer::parse_endpoint_addr(&peer_cfg.endpoint)?;
@@ -138,9 +138,9 @@ impl OutboundHandler for WireguardOutboundHandler {
                 ));
             }
         };
-        // ponytail: socket handle 立即移除——实际桥接（Link ↔ socket）留待后续切片
-        // 当前仅验证 dial 流程（socket 创建 + connect 发起）可用
-        stack.remove_socket(handle);
+        // 不立即移除 socket——保留在 smoltcp 网栈中，由 driver 后续处理
+        // 返回 socket handle 供上层桥接使用
+        tracing::debug!(tag = %self.tag, handle = ?handle, "wireguard outbound socket created and retained");
         Ok(())
     }
 

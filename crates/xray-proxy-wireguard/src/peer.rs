@@ -34,6 +34,8 @@ pub struct PeerSession {
     endpoint: Mutex<Option<SocketAddr>>,
     /// peer 公钥 hex（调试用）。
     public_key_hex: String,
+    /// session index，用于多 peer 场景唯一标识。
+    index: u32,
 }
 
 impl PeerSession {
@@ -42,21 +44,23 @@ impl PeerSession {
     /// `endpoint` 字段不在此解析——构造时不绑定地址，由 driver 首次发包时填充
     /// （server 模式 roaming peer 场景）。client 模式应在构造后立即调
     /// [`PeerSession::set_endpoint`]。
-    pub fn new(device: &DeviceConfig, peer: &PeerConfig) -> Result<Self> {
+    pub fn new(device: &DeviceConfig, peer: &PeerConfig, index: u32) -> Result<Self> {
         let tunnel = Tunnel::from_config(device, peer)?;
         Ok(Self {
             tunnel: Mutex::new(tunnel),
             endpoint: Mutex::new(None),
             public_key_hex: peer.public_key.clone(),
+            index,
         })
     }
 
     /// 包装已构造好的 [`Tunnel`]（用于 driver 内部组装）。
-    pub fn from_tunnel(tunnel: Tunnel, public_key_hex: impl Into<String>) -> Self {
+    pub fn from_tunnel(tunnel: Tunnel, public_key_hex: impl Into<String>, index: u32) -> Self {
         Self {
             tunnel: Mutex::new(tunnel),
             endpoint: Mutex::new(None),
             public_key_hex: public_key_hex.into(),
+            index,
         }
     }
 
@@ -111,8 +115,8 @@ pub type SharedPeer = Arc<PeerSession>;
 /// 从 DeviceConfig + PeerConfig 构造共享 peer 会话。
 ///
 /// 便利方法：等价于 `Arc::new(PeerSession::new(...)?)`。
-pub fn shared_peer(device: &DeviceConfig, peer: &PeerConfig) -> Result<SharedPeer> {
-    Ok(Arc::new(PeerSession::new(device, peer)?))
+pub fn shared_peer(device: &DeviceConfig, peer: &PeerConfig, index: u32) -> Result<SharedPeer> {
+    Ok(Arc::new(PeerSession::new(device, peer, index)?))
 }
 
 /// 从字符串解析 endpoint 为 [`SocketAddr`]。
@@ -152,7 +156,7 @@ mod tests {
             ..Default::default()
         };
         let peer = make_peer(pub_);
-        let session = PeerSession::new(&device, &peer);
+        let session = PeerSession::new(&device, &peer, 0);
         assert!(session.is_ok(), "construct failed: {:?}", session.err());
     }
 
@@ -164,7 +168,7 @@ mod tests {
             ..Default::default()
         };
         let peer = make_peer(pub_);
-        let session = PeerSession::new(&device, &peer).expect("construct");
+        let session = PeerSession::new(&device, &peer, 0).expect("construct");
 
         // 初始 endpoint 为 None
         assert_eq!(session.endpoint(), None);
@@ -187,7 +191,7 @@ mod tests {
             ..Default::default()
         };
         let peer = make_peer(pub_);
-        let session = PeerSession::new(&device, &peer).expect("construct");
+        let session = PeerSession::new(&device, &peer, 0).expect("construct");
 
         // 未握手——is_online 必为 false
         assert!(!session.is_online());
@@ -202,7 +206,7 @@ mod tests {
             ..Default::default()
         };
         let peer = make_peer(pub_);
-        let session = PeerSession::new(&device, &peer).expect("construct");
+        let session = PeerSession::new(&device, &peer, 0).expect("construct");
 
         // with_tunnel 暴露 Tunnel 互斥锁
         let updated = session.with_tunnel(|t| t.update_timers().is_ok());
@@ -230,7 +234,7 @@ mod tests {
             ..Default::default()
         };
         let peer = make_peer(pub_);
-        let shared = shared_peer(&device, &peer);
+        let shared = shared_peer(&device, &peer, 0);
         assert!(shared.is_ok(), "shared_peer failed: {:?}", shared.err());
         let shared = shared.unwrap();
         // Arc 引用计数 = 1

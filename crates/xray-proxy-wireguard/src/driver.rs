@@ -105,6 +105,8 @@ impl WgDriver {
     async fn main_loop(&self) {
         let mut timer = interval(TIMER_INTERVAL);
         let mut recv_buf = vec![0u8; UDP_RECV_BUF_SIZE];
+        let mut last_keepalive = std::time::Instant::now();
+        let keepalive_interval = self.peer.with_tunnel(|t| t.keepalive_interval());
         tracing::debug!(key = %self.peer.public_key_hex(), "wg driver main loop started");
 
         loop {
@@ -157,7 +159,7 @@ impl WgDriver {
                 }
                 // 每 100ms 触发：timer + drain_tx
                 _ = timer.tick() => {
-                    // 1. update_timers（keepalive/rekey）
+                    // 1. update_timers（keepalive / session key 轮换）
                     let timer_outputs = self.peer.with_tunnel(|t| t.update_timers());
                     match timer_outputs {
                         Ok(outs) => {
@@ -172,6 +174,31 @@ impl WgDriver {
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "wg timer failed");
+                        }
+                    }
+
+                    // 2. 检查 keepalive 间隔——如果配置了 keepalive 且超时，触发握手
+                    if let Some(interval_secs) = keepalive_interval {
+                        if last_keepalive.elapsed().as_secs() >= u64::from(interval_secs) {
+                            last_keepalive = std::time::Instant::now();
+                            // 发送一个空的 keepalive 包（encapsulate 空 IP 包）
+                            let keepalive_pkt = vec![0u8; 0];
+                            let ka_outputs = self.peer.with_tunnel(|t| t.encapsulate(&keepalive_pkt));
+                            match ka_outputs {
+                                Ok(outs) => {
+                                    let remote = *self.remote.lock();
+                                    if let Some(r) = remote {
+                                        for out in outs {
+                                            if let Output::Network(wg) = out {
+                                                let _ = self.sock.send_to(&wg, r).await;
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "wg keepalive encapsulate failed");
+                                }
+                            }
                         }
                     }
 
