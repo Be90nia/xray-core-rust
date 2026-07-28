@@ -23,6 +23,8 @@ pub mod error;
 pub mod protocol;
 pub mod server;
 pub mod udp;
+pub mod h3;
+pub mod pool;
 
 pub use client::{TuicClient, TuicConn};
 pub use dispatcher::{make_dial_fn as make_tuic_dial_fn, TuicConnection};
@@ -30,3 +32,5 @@ pub use error::{Result, TuicError};
 pub use protocol::{Address, Command, Packet, TOKEN_LEN, VERSION};
 pub use server::TuicMockServer;
 pub use udp::TuicUdpAssoc;
+pub use h3::H3TuicTransport;
+pub use pool::{MultiplexedConnection, PoolKey, QuinnConnectionPool, ReconnectingConnection};

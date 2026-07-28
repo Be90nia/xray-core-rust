@@ -44,6 +44,17 @@ impl Address {
             Self::Domain(_, p) | Self::Ipv4(_, p) | Self::Ipv6(_, p) => *p,
         }
     }
+    #[must_use]
+    pub fn host(&self) -> String {
+        match self {
+            Self::None => String::new(),
+            Self::Domain(d, _) => d.clone(),
+            Self::Ipv4(ip, _) => ip.to_string(),
+            Self::Ipv6(ip, _) => ip.to_string(),
+        }
+    }
+
+    /// 主机地址字符串（None 返空串）。
 
     /// 序列化到 [`BufMut`]（对应 tuic-core marshal）。
     ///

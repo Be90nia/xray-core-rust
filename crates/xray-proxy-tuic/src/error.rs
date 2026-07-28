@@ -34,6 +34,14 @@ pub enum TuicError {
     /// quinn 读错误。
     #[error("quinn read error: {0}")]
     QuinnRead(#[from] quinn::ReadError),
+    #[error("quinn send datagram error: {0}")]
+    QuinnSendDatagram(#[from] quinn::SendDatagramError),
+
+    /// quinn 发送 datagram 错误。
+    #[error("quinn read exact error: {0}")]
+    QuinnReadExact(#[from] quinn::ReadExactError),
+
+    /// quinn 读 exact 错误（ReadExactError 包装）。
 
     /// rustls 错误。
     #[error("rustls error: {0}")]

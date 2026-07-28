@@ -31,6 +31,7 @@ use xray_common::net::port::Port;
 use xray_proxy_tuic::client::TuicClient;
 use xray_proxy_tuic::dispatcher::make_dial_fn;
 use xray_proxy_tuic::server::TuicMockServer;
+use xray_proxy_tuic::pool::QuinnConnectionPool;
 
 async fn start_echo_server() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -95,7 +96,7 @@ async fn dispatcher_e2e_tuic_loopback_echo() {
     let client_cfg = make_client_config(&cert_der);
     let client_inner = tokio::time::timeout(
         Duration::from_secs(15),
-        TuicClient::connect(server_addr, "localhost", uuid, password, client_cfg),
+        TuicClient::connect(server_addr, "localhost", uuid, password, client_cfg, QuinnConnectionPool::new()),
     )
     .await
     .expect("connect timed out")

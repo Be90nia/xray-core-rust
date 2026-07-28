@@ -21,6 +21,7 @@ use uuid::Uuid;
 use xray_proxy_tuic::client::TuicClient;
 use xray_proxy_tuic::protocol::Address;
 use xray_proxy_tuic::server::TuicMockServer;
+use xray_proxy_tuic::pool::QuinnConnectionPool;
 
 /// 启动简单 UDP echo server：收到什么就回什么。
 async fn start_udp_echo_server() -> SocketAddr {
@@ -80,7 +81,7 @@ async fn udp_loopback_echo_works() {
     let client_cfg = make_client_config(&cert_der);
     let client = tokio::time::timeout(
         Duration::from_secs(10),
-        TuicClient::connect(server_addr, "localhost", uuid, password, client_cfg),
+        TuicClient::connect(server_addr, "localhost", uuid, password, client_cfg, QuinnConnectionPool::new()),
     )
     .await
     .expect("connect timed out")
@@ -129,7 +130,7 @@ async fn udp_loopback_multiple_packets() {
     let client_cfg = make_client_config(&cert_der);
     let client = tokio::time::timeout(
         Duration::from_secs(10),
-        TuicClient::connect(server_addr, "localhost", uuid, password, client_cfg),
+        TuicClient::connect(server_addr, "localhost", uuid, password, client_cfg, QuinnConnectionPool::new()),
     )
     .await
     .expect("connect timed out")

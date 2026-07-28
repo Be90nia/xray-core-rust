@@ -22,6 +22,7 @@ use uuid::Uuid;
 use xray_proxy_tuic::client::TuicClient;
 use xray_proxy_tuic::protocol::Address;
 use xray_proxy_tuic::server::TuicMockServer;
+use xray_proxy_tuic::pool::QuinnConnectionPool;
 
 /// 启动简单 echo TCP server。
 async fn start_echo_server() -> SocketAddr {
@@ -88,7 +89,7 @@ async fn loopback_echo_works() {
     let client_cfg = make_client_config(&cert_der);
     let client = tokio::time::timeout(
         Duration::from_secs(10),
-        TuicClient::connect(server_addr, "localhost", uuid, password, client_cfg),
+        TuicClient::connect(server_addr, "localhost", uuid, password, client_cfg, QuinnConnectionPool::new()),
     )
     .await
     .expect("connect timed out")
@@ -135,7 +136,7 @@ async fn loopback_large_payload() {
     let client_cfg = make_client_config(&cert_der);
     let client = tokio::time::timeout(
         Duration::from_secs(10),
-        TuicClient::connect(server_addr, "localhost", uuid, password, client_cfg),
+        TuicClient::connect(server_addr, "localhost", uuid, password, client_cfg, QuinnConnectionPool::new()),
     )
     .await
     .expect("connect timed out")
@@ -183,7 +184,7 @@ async fn auth_wrong_password_rejected() {
     let client_cfg = make_client_config(&cert_der);
     let result = tokio::time::timeout(
         Duration::from_secs(5),
-        TuicClient::connect(server_addr, "localhost", uuid, "wrong-password", client_cfg),
+        TuicClient::connect(server_addr, "localhost", uuid, "wrong-password", client_cfg, QuinnConnectionPool::new()),
     )
     .await;
 
