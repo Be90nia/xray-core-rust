@@ -46,7 +46,6 @@ use xray_transport::link::Link;
 use xray_mux::client::{ClientManager, DialingWorkerFactory, IncrementalWorkerPicker};
 use xray_mux::session::ClientStrategy;
 // 补全协议注册
-use xray_proxy_loopback::LoopbackHandler;
 use xray_proxy_hysteria::HysteriaConfig;
 use xray_proxy_wireguard::DeviceConfig;
 
@@ -504,7 +503,7 @@ impl DispatchHandler for DnsDispatchBridge {
     fn dispatch(&self, dest: &Destination, link: Link) -> PinFuture<()> {
         let tag = self.tag.clone();
         let dns = Arc::clone(&self.dns);
-        let dest = dest.clone();
+        let _dest = dest.clone();
         Box::pin(async move {
             // 从 link.reader 读取 DNS 查询字节（用 xray_buf Reader API）
             let mut reader = link.reader;

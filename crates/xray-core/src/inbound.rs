@@ -6,10 +6,8 @@
 //!
 //! 不含：sniffing（协议嗅探）、UDP associate、多 inbound 注册管理（由 proxyman::InboundManager 负责）。
 
-use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use xray_app_dispatcher::default::SimpleOhm;
@@ -38,10 +36,11 @@ use xray_proxy_http::server::http_server_handshake;
 // zx7: mux inbound 检测
 use xray_mux::client::{MUX_COOL_ADDRESS, MUX_COOL_PORT};
 // 补全协议 inbound 注册
-use xray_proxy_ss::{SsInbound, MemoryAccount as SsMemoryAccount, CipherType as SsCipherType};
+use xray_proxy_ss::{SsInbound, CipherType as SsCipherType};
 use xray_proxy_ss::config::MemoryAccount as SsConfigMemoryAccount;
 use xray_proxy_dns::{DnsInbound, DnsOutbound, Handler as DnsHandler, Config as DnsConfig};
 use xray_proxy_loopback::LoopbackHandler;
+use xray_proxy_tun::{TunInboundHandler, StackOptions, Tun};
 use xray_proxy_wireguard::DeviceConfig;
 use xray_transport_hysteria::hub::StubListenerFactory;
 use xray_features::inbound::InboundHandler;
@@ -393,6 +392,21 @@ async fn spawn_one_inbound(
     ib: &BuiltInbound,
     ohm: Arc<SimpleOhm>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
+    // TUN inbound 不需要 port/addr，提前处理
+    if ib.entry.kind.as_str() == "tun" {
+        let options = parse_tun_inbound_config(&ib.entry.data)?;
+        let handler = TunInboundHandler::new(&ib.tag, options)
+            .await
+            .map_err(|e| std::io::Error::other(format!("tun inbound: {e}")))?;
+        tracing::info!(tag = %ib.tag, "tun inbound listening");
+        let handle = tokio::spawn(async move {
+            if let Err(e) = handler.start().await {
+                tracing::error!(error = ?e, "tun inbound stopped");
+            }
+        });
+        return Ok(Some(handle));
+    }
+
     let listen = ib.listen.as_deref().unwrap_or("0.0.0.0");
     let port = match ib.port {
         Some(p) => p,
@@ -521,10 +535,14 @@ async fn spawn_one_inbound(
         }
         // tuic inbound：QUIC listener，当前 no-op（需要 quinn server adapter）
         "tuic" => {
-            // ponytail: TUIC inbound 需要 QUIC server（quinn server adapter 待实现）
-            // 当前注册为 no-op，与 loopback 同模式
-            tracing::info!(tag = %ib.tag, "tuic inbound registered (no-op, requires QUIC server)");
-            Ok(None)
+            let handler = parse_tuic_inbound_config(&ib.entry.data, &addr)?;
+            tracing::info!(tag = %ib.tag, addr = %addr, "tuic inbound listening");
+            let handle = tokio::spawn(async move {
+                if let Err(e) = handler.start().await {
+                    tracing::error!(error = ?e, "tuic inbound stopped");
+                }
+            });
+            Ok(Some(handle))
         }
         // wireguard inbound：WireguardInboundHandler impl InboundHandler
         "wireguard" => {
@@ -563,16 +581,6 @@ async fn spawn_one_inbound(
             tracing::info!(tag = %ib.tag, "loopback inbound registered (outbound-only)");
             // LoopbackHandler 的 InboundHandler::start 是 no-op，不 spawn task
             Ok(None)
-        }
-        // tun inbound：TunInboundHandler impl InboundHandler
-        "tun" => {
-            // TUN 需要 TUN 设备，当前 stub
-            tracing::info!(tag = %ib.tag, "tun inbound registered (stub, requires TUN device)");
-            let handle = tokio::spawn(async move {
-                // ponytail: TUN 设备创建需要平台支持，当前无限等待
-                tokio::time::sleep(std::time::Duration::MAX).await;
-            });
-            Ok(Some(handle))
         }
         other => {
             tracing::warn!(
@@ -809,7 +817,7 @@ fn parse_anytls_tls_acceptor(data: &[u8]) -> std::io::Result<tokio_rustls::TlsAc
         let _ = rustls::crypto::ring::default_provider().install_default();
         let key_pair = rcgen::KeyPair::generate()
             .map_err(|e| std::io::Error::other(format!("rcgen keypair: {e}")))?;
-        let mut params = rcgen::CertificateParams::new(vec!["localhost".into()])
+        let params = rcgen::CertificateParams::new(vec!["localhost".into()])
             .map_err(|e| std::io::Error::other(format!("rcgen params: {e}")))?;
         let cert = params.self_signed(&key_pair)
             .map_err(|e| std::io::Error::other(format!("rcgen self_signed: {e}")))?;
@@ -907,9 +915,138 @@ fn parse_loopback_config(data: &[u8]) -> std::io::Result<String> {
     Ok(inbound_tag)
 }
 
+/// 从 inbound entry.data（JSON）解析 tuic inbound 配置。
+///
+/// JSON 格式：`{"uuid":"...","password":"...","serverName":"..."}`。
+/// uuid 必填，password 必填，serverName 默认 "tuic"。
+fn parse_tuic_inbound_config(
+    data: &[u8],
+    addr: &str,
+) -> std::io::Result<xray_proxy_tuic::TuicInboundHandler> {
+    let v: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| std::io::Error::other(format!("tuic inbound settings JSON: {e}")))?;
+    let uuid_str = v.get("uuid").and_then(|x| x.as_str())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "tuic: missing uuid"))?;
+    let uuid = uuid::Uuid::parse_str(uuid_str)
+        .map_err(|e| std::io::Error::other(format!("tuic invalid uuid: {e}")))?;
+    let password = v.get("password").and_then(|x| x.as_str())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "tuic: missing password"))?;
+    let server_name = v.get("serverName").and_then(|x| x.as_str()).unwrap_or("tuic").to_string();
+    let bind_addr: std::net::SocketAddr = addr.parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("tuic parse addr: {e}")))?;
+    let config = xray_proxy_tuic::TuicInboundConfig {
+        listen: bind_addr,
+        server_name,
+        uuid,
+        password: password.to_string(),
+        cert_der: None,
+        key_der: None,
+    };
+    xray_proxy_tuic::TuicInboundHandler::new("", config)
+        .map_err(|e| std::io::Error::other(format!("tuic inbound: {e}")))
+}
+
+/// TUN 配置占位设备——满足 StackOptions.tun 存在性校验。
+///
+/// TunInboundHandler::new 校验 options.tun.is_some()，但 start() 内部
+/// 直接 TunDevice::create 硬编码参数，不使用 options.tun 的设备。
+/// 因此配置解析阶段只需提供占位。
+struct TunPlaceholder;
+
+impl Tun for TunPlaceholder {
+    fn start(&self) -> xray_proxy_tun::Result<()> { Ok(()) }
+    fn close(&self) -> xray_proxy_tun::Result<()> { Ok(()) }
+    fn name(&self) -> xray_proxy_tun::Result<String> { Ok("placeholder".into()) }
+    fn index(&self) -> xray_proxy_tun::Result<i32> { Ok(0) }
+}
+
+/// 从 inbound entry.data（JSON）解析 TUN inbound 配置 → StackOptions。
+///
+/// JSON 格式：`{"idleTimeout":"30s"}`（idleTimeout 可选，默认 30s）。
+/// 设备参数（name/address/mtu）当前硬编码在 TunInboundHandler::start，
+/// 后续切片从 JSON 读取。
+fn parse_tun_inbound_config(data: &[u8]) -> std::io::Result<StackOptions> {
+    let mut opts = StackOptions::default();
+    opts.tun = Some(Box::new(TunPlaceholder));
+    if data.is_empty() {
+        return Ok(opts);
+    }
+    let v: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("tun config: {e}")))?;
+    // idleTimeout：数字（秒）或字符串（如 "30s"/"5m"）
+    if let Some(val) = v.get("idleTimeout") {
+        opts.idle_timeout = parse_duration_value(val)?;
+    }
+    Ok(opts)
+}
+
+/// 解析 duration 值：数字=秒，字符串="30s"/"5m"/"1h"。
+fn parse_duration_value(val: &serde_json::Value) -> std::io::Result<std::time::Duration> {
+    match val {
+        serde_json::Value::Number(n) => {
+            let secs = n.as_u64().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "idleTimeout: not a positive integer")
+            })?;
+            Ok(std::time::Duration::from_secs(secs))
+        }
+        serde_json::Value::String(s) => parse_duration_suffix(s),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "idleTimeout: expected number or string",
+        )),
+    }
+}
+
+/// 解析带后缀的 duration 字符串（"30s"/"5m"/"1h"/"2h30m"）。
+fn parse_duration_suffix(s: &str) -> std::io::Result<std::time::Duration> {
+    let mut total_secs: u64 = 0;
+    let mut num_buf = String::new();
+    for ch in s.chars() {
+        match ch {
+            '0'..='9' => num_buf.push(ch),
+            's' => {
+                let n: u64 = num_buf.parse().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("idleTimeout: bad number in '{s}'"))
+                })?;
+                total_secs += n;
+                num_buf.clear();
+            }
+            'm' => {
+                let n: u64 = num_buf.parse().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("idleTimeout: bad number in '{s}'"))
+                })?;
+                total_secs += n * 60;
+                num_buf.clear();
+            }
+            'h' => {
+                let n: u64 = num_buf.parse().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("idleTimeout: bad number in '{s}'"))
+                })?;
+                total_secs += n * 3600;
+                num_buf.clear();
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("idleTimeout: unknown suffix '{ch}' in '{s}'"),
+                ));
+            }
+        }
+    }
+    // 无后缀的尾部数字视为秒
+    if !num_buf.is_empty() {
+        let n: u64 = num_buf.parse().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("idleTimeout: trailing number in '{s}'"))
+        })?;
+        total_secs += n;
+    }
+    Ok(std::time::Duration::from_secs(total_secs))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use xray_app_dispatcher::default::SimpleOhm;
     use xray_proxy_freedom::make_freedom_dial_fn;
     use xray_proxy_socks::protocol::{ATYP_DOMAIN, ATYP_IPV4};

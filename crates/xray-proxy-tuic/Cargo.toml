@@ -19,6 +19,9 @@ uuid = { workspace = true }
 tracing = { workspace = true }
 rcgen = "0.13"
 
+xray-features = { path = "../xray-features" }
+async-trait = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 rcgen = "0.13"

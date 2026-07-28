@@ -20,6 +20,7 @@
 pub mod client;
 pub mod dispatcher;
 pub mod error;
+pub mod inbound;
 pub mod protocol;
 pub mod server;
 pub mod udp;
@@ -34,3 +35,4 @@ pub use server::TuicMockServer;
 pub use udp::TuicUdpAssoc;
 pub use h3::H3TuicTransport;
 pub use pool::{MultiplexedConnection, PoolKey, QuinnConnectionPool, ReconnectingConnection};
+pub use inbound::{TuicInboundConfig, TuicInboundHandler};

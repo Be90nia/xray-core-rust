@@ -232,7 +232,7 @@ where
 /// 真正的双向 relay：client ↔ (quinn bi) ↔ server ↔ (tcp) ↔ 目标。
 ///
 /// `initial_bytes` 是客户端随 Connect header 一并发的 TCP payload 前缀。
-async fn relay_to_tcp(
+pub(crate) async fn relay_to_tcp(
     target: SocketAddr,
     mut send_bi: quinn::SendStream,
     mut recv_bi: quinn::RecvStream,
@@ -264,7 +264,7 @@ async fn relay_to_tcp(
 ///
 /// Packet 的 TYPE 码（0x02）不在 [`Command::read_payload`] 支持范围内，
 /// 需要先检测 type_byte 分流。
-enum BiFrame {
+pub(crate) enum BiFrame {
     Command(Command),
     Packet(Packet),
 }
@@ -273,7 +273,7 @@ enum BiFrame {
 /// 返回 (帧, 已消费的 RecvStream, header 之后的剩余字节)。
 ///
 /// 剩余字节留给 relay，避免 quinn 一次 read 把 header 和后续 payload 都读出。
-async fn read_frame_from_recv(
+pub(crate) async fn read_frame_from_recv(
     mut stream: quinn::RecvStream,
     max_len: usize,
 ) -> Result<(BiFrame, quinn::RecvStream, Vec<u8>)> {
@@ -304,7 +304,7 @@ async fn read_frame_from_recv(
 ///
 /// ponytail: 单次 recv_from（8KB 上限），不支持关联多个响应包；
 /// 真实实现需要 assoc_id → UDP socket 映射、持续 recv、按 pkt_id 回写。
-async fn relay_udp(
+pub(crate) async fn relay_udp(
     pkt: Packet,
     mut send_bi: quinn::SendStream,
     _recv_bi: quinn::RecvStream,
@@ -343,7 +343,7 @@ async fn relay_udp(
     Ok(())
 }
 
-fn addr_to_socket_addr(addr: &crate::protocol::Address) -> Option<SocketAddr> {
+pub(crate) fn addr_to_socket_addr(addr: &crate::protocol::Address) -> Option<SocketAddr> {
     match addr {
         crate::protocol::Address::Ipv4(ip, port) => Some(SocketAddr::new(IpAddr::V4(*ip), *port)),
         crate::protocol::Address::Ipv6(ip, port) => Some(SocketAddr::new(IpAddr::V6(*ip), *port)),
