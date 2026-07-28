@@ -1,0 +1,38 @@
+[package]
+name = "xray-integration-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[test]]
+name = "integration"
+path = "integration/vmess_test.rs"
+
+[[test]]
+name = "integration_vless"
+path = "integration/vless_test.rs"
+
+[[test]]
+name = "integration_trojan"
+path = "integration/trojan_test.rs"
+
+[[test]]
+name = "integration_ss"
+path = "integration/ss_test.rs"
+
+[[test]]
+name = "integration_compatibility"
+path = "integration/compatibility_test.rs"
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+xray-common = { path = "../crates/xray-common" }
+xray-proxy-vmess = { path = "../crates/xray-proxy-vmess" }
+xray-proxy-vless = { path = "../crates/xray-proxy-vless" }
+xray-proxy-trojan = { path = "../crates/xray-proxy-trojan" }
+xray-proxy-ss = { path = "../crates/xray-proxy-ss" }
+xray-proxy-freedom = { path = "../crates/xray-proxy-freedom" }
+xray-app-dispatcher = { path = "../crates/xray-app-dispatcher" }
+xray-transport = { path = "../crates/xray-transport" }
+xray-buf = { path = "../crates/xray-buf" }
+xray-proto = { path = "../crates/xray-proto" }
