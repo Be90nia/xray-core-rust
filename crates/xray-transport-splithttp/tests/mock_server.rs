@@ -20,6 +20,13 @@ use xray_transport_splithttp::config::Config;
 use xray_transport_splithttp::dialer::dial_packet_up;
 use xray_transport_splithttp::error::SplitHttpError;
 
+
+/// 确保 rustls CryptoProvider 在并行测试中只初始化一次
+static CRYPTO_ONCE: std::sync::Once = std::sync::Once::new();
+fn ensure_crypto_provider() {
+    CRYPTO_ONCE.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
+}
+
 fn make_tls_config() -> rustls::ClientConfig {
     let roots = rustls::RootCertStore::from_iter(TLS_SERVER_ROOTS.iter().cloned());
     rustls::ClientConfig::builder()
@@ -84,6 +91,7 @@ async fn mock_splithttp_server(
 
 #[tokio::test]
 async fn dial_packet_up_end_to_end_via_mock_http1_server() {
+    ensure_crypto_provider();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_addr = listener.local_addr().unwrap();
     let stats = Arc::new(ServerStats::default());
@@ -131,6 +139,7 @@ async fn dial_packet_up_end_to_end_via_mock_http1_server() {
 
 #[tokio::test]
 async fn post_packet_returns_bad_status_on_500() {
+    ensure_crypto_provider();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -170,6 +179,7 @@ async fn post_packet_returns_bad_status_on_500() {
 
 #[tokio::test]
 async fn open_stream_returns_bad_status_on_non_200() {
+    ensure_crypto_provider();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 

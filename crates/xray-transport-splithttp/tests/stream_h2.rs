@@ -135,6 +135,10 @@ async fn mock_h2_splithttp_server(
 
 #[tokio::test]
 async fn dial_stream_up_via_h2_mock_server() {
+    // 确保 rustls CryptoProvider 在并行测试中只初始化一次
+    static CRYPTO_ONCE: std::sync::Once = std::sync::Once::new();
+    CRYPTO_ONCE.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
+
     // 1. 自签证书 + H2 server
     let (cert_der, key_der) = make_self_signed_cert();
     let server_tls = make_server_tls(cert_der.clone(), key_der);
@@ -208,6 +212,10 @@ async fn dial_stream_up_via_h2_mock_server() {
 
 #[tokio::test]
 async fn dial_stream_one_via_h2_mock_server() {
+    // 确保 rustls CryptoProvider 在并行测试中只初始化一次
+    static CRYPTO_ONCE2: std::sync::Once = std::sync::Once::new();
+    CRYPTO_ONCE2.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
+
     // 1. 自签证书 + H2 server（POST 返 download_payload）
     let (cert_der, key_der) = make_self_signed_cert();
     let mut server_tls = rustls::ServerConfig::builder()

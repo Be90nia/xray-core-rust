@@ -128,7 +128,9 @@ async fn mock_h3_server(
 
 #[tokio::test]
 async fn dial_h3_packet_up_end_to_end() {
-    // 1. 自签证书 + quinn server
+    // 确保 rustls CryptoProvider 在并行测试中只初始化一次
+    static CRYPTO_ONCE: std::sync::Once = std::sync::Once::new();
+    CRYPTO_ONCE.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
 
     // 1. 自签证书 + quinn server
     let (cert_der, key_der) = make_self_signed_cert();

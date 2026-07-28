@@ -594,6 +594,12 @@ where
 mod tests {
     use super::*;
 
+    /// 确保 rustls CryptoProvider 在并行测试中只初始化一次
+    fn ensure_crypto_provider() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
+    }
+
     // ===== decide_http_version =====
 
     #[test]
@@ -692,6 +698,7 @@ mod tests {
 
     #[tokio::test]
     async fn dial_unknown_mode_returns_error() {
+        ensure_crypto_provider();
         let config = Arc::new(Config {
             mode: "unknown-mode".into(),
             ..Default::default()

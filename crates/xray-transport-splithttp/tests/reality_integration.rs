@@ -97,6 +97,10 @@ async fn echo_h2_server(
 
 #[tokio::test]
 async fn dial_reality_stream_one_via_direct_h2_handshake() {
+    // 确保 rustls CryptoProvider 在并行测试中只初始化一次
+    static CRYPTO_ONCE: std::sync::Once = std::sync::Once::new();
+    CRYPTO_ONCE.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
+
     // 1. 自签证书 + h2 server
     let (cert_der, key_der) = make_self_signed_cert();
     let server_tls = make_server_tls(cert_der.clone(), key_der);
