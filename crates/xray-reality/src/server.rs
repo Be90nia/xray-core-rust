@@ -556,6 +556,12 @@ where
 mod tests {
     use super::*;
 
+    /// 确保 rustls CryptoProvider 在并行测试中只初始化一次
+    fn ensure_crypto_provider() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
+    }
+
     #[tokio::test]
     async fn read_tls_record_roundtrip() {
         let mut record = vec![0x16, 0x03, 0x01, 0x00, 0x0a];
@@ -1086,6 +1092,7 @@ mod tests {
     /// 完整 TLS 握手由 VPS #13 + 单元测试覆盖。
     #[tokio::test]
     async fn server_tls_verified_branch_enters_tls_accept() {
+        ensure_crypto_provider();
         use tokio::io::{AsyncWriteExt, duplex};
 
         let random = [0x55u8; 32];
@@ -1129,6 +1136,7 @@ mod tests {
     /// (HMAC 签名 cert)。验证完整 REALITY 握手成功。
     #[tokio::test]
     async fn reality_loopback_u_client_with_server_tls() {
+        ensure_crypto_provider();
         use std::time::Duration;
         use tokio::io::duplex;
         use x25519_dalek::{PublicKey, StaticSecret};

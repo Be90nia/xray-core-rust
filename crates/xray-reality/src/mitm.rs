@@ -117,6 +117,12 @@ pub fn generate_reality_ed25519_cert(auth_key: &[u8]) -> Result<(Vec<u8>, Vec<u8
 mod tests {
     use super::*;
 
+    /// 确保 rustls CryptoProvider 在并行测试中只初始化一次
+    fn ensure_crypto_provider() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
+    }
+
     #[test]
     fn generate_self_signed_cert_returns_nonempty_ders() {
         let (cert_der, key_der) = generate_self_signed_cert("www.mozilla.org").unwrap();
@@ -128,6 +134,7 @@ mod tests {
 
     #[test]
     fn build_server_config_from_generated_cert() {
+        ensure_crypto_provider();
         let (cert_der, key_der) = generate_self_signed_cert("localhost").unwrap();
         let config = build_server_config(cert_der, key_der);
         assert!(config.is_ok(), "ServerConfig build should succeed");
