@@ -24,6 +24,23 @@ path = "integration/ss_test.rs"
 [[test]]
 name = "integration_compatibility"
 path = "integration/compatibility_test.rs"
+
+[[test]]
+name = "integration_interop_vmess"
+path = "integration/interop_vmess_test.rs"
+
+[[test]]
+name = "integration_interop_vless"
+path = "integration/interop_vless_test.rs"
+
+[[test]]
+name = "integration_interop_trojan"
+path = "integration/interop_trojan_test.rs"
+
+[[test]]
+name = "integration_interop_ss"
+path = "integration/interop_ss_test.rs"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 xray-common = { path = "../crates/xray-common" }
@@ -36,3 +53,6 @@ xray-app-dispatcher = { path = "../crates/xray-app-dispatcher" }
 xray-transport = { path = "../crates/xray-transport" }
 xray-buf = { path = "../crates/xray-buf" }
 xray-proto = { path = "../crates/xray-proto" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
