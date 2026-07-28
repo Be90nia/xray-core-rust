@@ -119,6 +119,58 @@ pub fn make_dial_fn(client: Arc<TuicClient>) -> DialFn {
     })
 }
 
+/// 构造 DialBridge 用的 DialFn 闭包（lazy init 模式）。
+///
+/// 闭包捕获连接参数。首次 dial 时通过 `OnceCell` lazy init
+/// `TuicClient`（含 QUIC 连接 + 认证），后续复用。
+///
+/// # Panics
+/// 不会 panic；任何错误以 `Err(String)` 返回。
+pub fn make_dial_fn_lazy(
+    server_addr: SocketAddr,
+    server_name: String,
+    uuid: uuid::Uuid,
+    password: String,
+    rustls_config: Arc<rustls::ClientConfig>,
+) -> DialFn {
+    use tokio::sync::OnceCell;
+    let client: Arc<OnceCell<Arc<TuicClient>>> = Arc::new(OnceCell::new());
+    let pool = crate::pool::QuinnConnectionPool::new();
+
+    Arc::new(move |dest: &Destination| {
+        let client_cell = Arc::clone(&client);
+        let server_addr = server_addr;
+        let server_name = server_name.clone();
+        let uuid = uuid;
+        let password = password.clone();
+        let rustls_config = Arc::clone(&rustls_config);
+        let pool = pool.clone();
+        let addr = match dest_to_tuic_address(dest) {
+            Ok(a) => a,
+            Err(e) => {
+                return Box::pin(async move { Err(e) });
+            }
+        };
+        Box::pin(async move {
+            // lazy init TuicClient
+            let c = client_cell
+                .get_or_try_init(|| async {
+                    TuicClient::connect(server_addr, &server_name, uuid, &password, rustls_config, pool)
+                        .await
+                        .map(Arc::new)
+                        .map_err(|e| format!("tuic connect: {e}"))
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            let conn = tokio::time::timeout(Duration::from_secs(30), c.dial(addr))
+                .await
+                .map_err(|_| "tuic dial: timed out".to_string())?
+                .map_err(|e| format!("tuic dial: {e}"))?;
+            Ok(Box::new(TuicConnection::from_conn(conn)) as Box<dyn Connection>)
+        })
+    })
+}
+
 impl TuicConnection {
     /// 从 TuicConn 构造：拆 send/recv，spawn pump，返回 duplex 客户端包装。
     fn from_conn(conn: TuicConn) -> Self {

@@ -37,6 +37,15 @@ use xray_proxy_http::ServerConfig as HttpServerConfig;
 use xray_proxy_http::server::http_server_handshake;
 // zx7: mux inbound 检测
 use xray_mux::client::{MUX_COOL_ADDRESS, MUX_COOL_PORT};
+// 补全协议 inbound 注册
+use xray_proxy_ss::{SsInbound, MemoryAccount as SsMemoryAccount, CipherType as SsCipherType};
+use xray_proxy_ss::config::MemoryAccount as SsConfigMemoryAccount;
+use xray_proxy_dns::{DnsInbound, DnsOutbound, Handler as DnsHandler, Config as DnsConfig};
+use xray_proxy_loopback::LoopbackHandler;
+use xray_proxy_wireguard::DeviceConfig;
+use xray_transport_hysteria::hub::StubListenerFactory;
+use xray_features::inbound::InboundHandler;
+use tokio::net::UdpSocket;
 
 /// SOCKS5 inbound 服务入口。
 ///
@@ -231,6 +240,133 @@ pub async fn serve_dokodemo(
     }
 }
 
+/// Shadowsocks inbound 服务入口。
+///
+/// 接受连接 → SsInbound::handle_conn → parse dest → dispatch。
+pub async fn serve_ss(
+    listener: TcpListener,
+    ohm: Arc<SimpleOhm>,
+    inbound: Arc<SsInbound>,
+) -> std::io::Result<()> {
+    let handler = ohm
+        .get_default_handler()
+        .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
+    tracing::info!(addr = %listener.local_addr()?, "ss inbound listening");
+    loop {
+        let (stream, _peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "ss accept failed");
+                continue;
+            }
+        };
+        let handler = Arc::clone(&handler);
+        let inbound = Arc::clone(&inbound);
+        tokio::spawn(async move {
+            match inbound.handle_conn(stream).await {
+                Ok((header, mut ss_stream)) => {
+                    let network = match header.command {
+                        xray_proxy_ss::validator::RequestCommand::Tcp => Network::TCP,
+                        xray_proxy_ss::validator::RequestCommand::Udp => Network::UDP,
+                    };
+                    let dest = Destination::new(header.address, Port::new(header.port), network);
+                    // SSStream 不 impl AsyncRead/AsyncWrite，用 duplex pump 桥接
+                    let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+                    tokio::spawn(async move {
+                        // up: ss_stream.read_chunk → server_io.write_all
+                        loop {
+                            match ss_stream.read_chunk().await {
+                                Ok(Some(chunk)) => {
+                                    if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut server_io, &chunk).await {
+                                        tracing::debug!("ss pump up write: {e}"); break;
+                                    }
+                                    if let Err(e) = tokio::io::AsyncWriteExt::flush(&mut server_io).await {
+                                        tracing::debug!("ss pump up flush: {e}"); break;
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(e) => { tracing::debug!("ss pump up read: {e}"); break; }
+                            }
+                        }
+                        let _ = tokio::io::AsyncWriteExt::shutdown(&mut server_io).await;
+                    });
+                    let (client_rd, client_wr) = tokio::io::split(client_io);
+                    let link = Link::new(new_reader(client_rd), new_writer(client_wr));
+                    let _ = handler.dispatch(&dest, link).await;
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "ss inbound handshake failed");
+                }
+            }
+        });
+    }
+}
+
+/// DNS inbound 服务入口。
+///
+/// 同时监听 UDP 和 TCP：
+/// - UDP：recv_from → handle_packet → send_to 响应
+/// - TCP：accept → handle_conn（2B 长度前缀帧循环）
+pub async fn serve_dns(
+    udp: UdpSocket,
+    tcp: TcpListener,
+    inbound: Arc<DnsInbound>,
+) -> std::io::Result<()> {
+    // UDP task
+    let udp_inbound = Arc::clone(&inbound);
+    let udp_handle = tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        loop {
+            match udp.recv_from(&mut buf).await {
+                Ok((len, peer)) => {
+                    match udp_inbound.handle_packet(&buf[..len]).await {
+                        Ok(Some(resp)) => {
+                            if let Err(e) = udp.send_to(&resp, peer).await {
+                                tracing::debug!(error = %e, "dns udp send failed");
+                            }
+                        }
+                        Ok(None) => {} // Drop: 不响应
+                        Err(e) => {
+                            tracing::debug!(error = %e, "dns udp handle_packet failed");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "dns udp recv failed");
+                }
+            }
+        }
+    });
+    // TCP accept loop
+    let tcp_inbound = Arc::clone(&inbound);
+    let tcp_handle = tokio::spawn(async move {
+        loop {
+            match tcp.accept().await {
+                Ok((conn, _peer)) => {
+                    let inbound = Arc::clone(&tcp_inbound);
+                    tokio::spawn(async move {
+                        if let Err(e) = inbound.handle_conn(conn).await {
+                            tracing::debug!(error = %e, "dns tcp conn failed");
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "dns tcp accept failed");
+                }
+            }
+        }
+    });
+    // 等待任一 task 结束（正常情况不会结束）
+    tokio::select! {
+        r = udp_handle => {
+            r.map_err(|e| std::io::Error::other(format!("dns udp task: {e}")))
+        }
+        r = tcp_handle => {
+            r.map_err(|e| std::io::Error::other(format!("dns tcp task: {e}")))
+        }
+    }
+}
+
 /// 遍历 BuiltConfig 的 inbounds，按协议 spawn listener tasks。
 ///
 /// 返回每个 inbound 的 JoinHandle（用于优雅关闭）。不支持的协议 warn 跳过。
@@ -338,131 +474,94 @@ async fn spawn_one_inbound(
             });
             Ok(Some(handle))
         }
-        // shadowsocks inbound：SsInbound 需要用户配置 + TCP listener
+        // shadowsocks inbound：SsInbound + serve_ss accept loop
         "shadowsocks" => {
             let listener = TcpListener::bind(&addr).await?;
-            tracing::info!(tag = %ib.tag, addr = %addr, "shadowsocks inbound listening (stub)");
-            let tag = ib.tag.clone();
+            let inbound = parse_ss_inbound_config(&ib.entry.data)?;
+            tracing::info!(tag = %ib.tag, addr = %addr, "shadowsocks inbound listening");
             let handle = tokio::spawn(async move {
-                // ponytail: SsInbound 需要 validator + handle_conn，当前 stub accept loop
-                loop {
-                    match listener.accept().await {
-                        Ok((stream, _peer)) => {
-                            tracing::debug!(tag = %tag, "ss inbound: accepted connection (handler stub)");
-                            drop(stream);
-                        }
-                        Err(e) => {
-                            tracing::warn!(tag = %tag, error = %e, "ss inbound accept failed");
-                        }
-                    }
+                if let Err(e) = serve_ss(listener, ohm, inbound).await {
+                    tracing::error!(error = %e, "shadowsocks inbound stopped");
                 }
             });
             Ok(Some(handle))
         }
-        // hysteria inbound：QUIC listener，当前 stub
+        // hysteria inbound：HysteriaInboundHandler impl InboundHandler
         "hysteria" => {
-            let listener = TcpListener::bind(&addr).await?;
-            tracing::info!(tag = %ib.tag, addr = %addr, "hysteria inbound listening (stub, requires QUIC)");
-            let tag = ib.tag.clone();
+            let bind_addr: std::net::SocketAddr = addr.parse()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("parse addr: {e}")))?;
+            let (config, factory) = parse_hysteria_inbound_config(&ib.entry.data, bind_addr)?;
+            let handler = xray_proxy_hysteria::HysteriaInboundHandler::new(
+                &ib.tag, config, bind_addr, factory,
+            )
+            .map_err(|e| std::io::Error::other(format!("hysteria inbound: {e}")))?;
+            tracing::info!(tag = %ib.tag, addr = %addr, "hysteria inbound listening");
             let handle = tokio::spawn(async move {
-                loop {
-                    match listener.accept().await {
-                        Ok((stream, _peer)) => {
-                            tracing::debug!(tag = %tag, "hysteria inbound: accepted connection (handler stub)");
-                            drop(stream);
-                        }
-                        Err(e) => {
-                            tracing::warn!(tag = %tag, error = %e, "hysteria inbound accept failed");
-                        }
-                    }
+                if let Err(e) = handler.start().await {
+                    tracing::error!(error = ?e, "hysteria inbound stopped");
                 }
             });
             Ok(Some(handle))
         }
         // anytls inbound：AnytlsInboundHandler impl InboundHandler
         "anytls" => {
-            let listener = TcpListener::bind(&addr).await?;
-            tracing::info!(tag = %ib.tag, addr = %addr, "anytls inbound listening (stub)");
-            let tag = ib.tag.clone();
+            let bind_addr: std::net::SocketAddr = addr.parse()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("parse addr: {e}")))?;
+            let tls_acceptor = parse_anytls_tls_acceptor(&ib.entry.data)?;
+            let handler = xray_proxy_anytls::AnytlsInboundHandler::new(
+                &ib.tag, bind_addr, tls_acceptor,
+            );
+            tracing::info!(tag = %ib.tag, addr = %addr, "anytls inbound listening");
             let handle = tokio::spawn(async move {
-                loop {
-                    match listener.accept().await {
-                        Ok((stream, _peer)) => {
-                            tracing::debug!(tag = %tag, "anytls inbound: accepted connection (handler stub)");
-                            drop(stream);
-                        }
-                        Err(e) => {
-                            tracing::warn!(tag = %tag, error = %e, "anytls inbound accept failed");
-                        }
-                    }
+                if let Err(e) = handler.start().await {
+                    tracing::error!(error = ?e, "anytls inbound stopped");
                 }
             });
             Ok(Some(handle))
         }
-        // tuic inbound：QUIC listener，当前 stub
+        // tuic inbound：QUIC listener，当前 no-op（需要 quinn server adapter）
         "tuic" => {
-            let listener = TcpListener::bind(&addr).await?;
-            tracing::info!(tag = %ib.tag, addr = %addr, "tuic inbound listening (stub, requires QUIC)");
-            let tag = ib.tag.clone();
-            let handle = tokio::spawn(async move {
-                loop {
-                    match listener.accept().await {
-                        Ok((stream, _peer)) => {
-                            tracing::debug!(tag = %tag, "tuic inbound: accepted connection (handler stub)");
-                            drop(stream);
-                        }
-                        Err(e) => {
-                            tracing::warn!(tag = %tag, error = %e, "tuic inbound accept failed");
-                        }
-                    }
-                }
-            });
-            Ok(Some(handle))
+            // ponytail: TUIC inbound 需要 QUIC server（quinn server adapter 待实现）
+            // 当前注册为 no-op，与 loopback 同模式
+            tracing::info!(tag = %ib.tag, "tuic inbound registered (no-op, requires QUIC server)");
+            Ok(None)
         }
         // wireguard inbound：WireguardInboundHandler impl InboundHandler
         "wireguard" => {
-            let listener = TcpListener::bind(&addr).await?;
-            tracing::info!(tag = %ib.tag, addr = %addr, "wireguard inbound listening (stub)");
-            let tag = ib.tag.clone();
+            let (config, listen_port) = parse_wireguard_inbound_config(&ib.entry.data)?;
+            let handler = xray_proxy_wireguard::WireguardInboundHandler::new(
+                &ib.tag, &config, listen_port,
+            )
+            .await
+            .map_err(|e| std::io::Error::other(format!("wireguard inbound: {e}")))?;
+            tracing::info!(tag = %ib.tag, port = listen_port, "wireguard inbound listening");
             let handle = tokio::spawn(async move {
-                loop {
-                    match listener.accept().await {
-                        Ok((stream, _peer)) => {
-                            tracing::debug!(tag = %tag, "wireguard inbound: accepted connection (handler stub)");
-                            drop(stream);
-                        }
-                        Err(e) => {
-                            tracing::warn!(tag = %tag, error = %e, "wireguard inbound accept failed");
-                        }
-                    }
+                if let Err(e) = handler.start().await {
+                    tracing::error!(error = ?e, "wireguard inbound stopped");
                 }
             });
             Ok(Some(handle))
         }
-        // dns inbound：DnsInbound impl InboundHandler
+        // dns inbound：UDP+TCP listener → handle_packet/handle_conn
         "dns" => {
-            let listener = TcpListener::bind(&addr).await?;
-            tracing::info!(tag = %ib.tag, addr = %addr, "dns inbound listening (stub)");
-            let tag = ib.tag.clone();
+            let (handler, outbound) = parse_dns_inbound_config(&ib.entry.data, &ib.tag)?;
+            let inbound = Arc::new(DnsInbound::new(&ib.tag, handler, outbound));
+            let udp = UdpSocket::bind(&addr).await?;
+            let tcp = TcpListener::bind(&addr).await?;
+            tracing::info!(tag = %ib.tag, addr = %addr, "dns inbound listening (UDP+TCP)");
             let handle = tokio::spawn(async move {
-                loop {
-                    match listener.accept().await {
-                        Ok((stream, _peer)) => {
-                            tracing::debug!(tag = %tag, "dns inbound: accepted connection (handler stub)");
-                            drop(stream);
-                        }
-                        Err(e) => {
-                            tracing::warn!(tag = %tag, error = %e, "dns inbound accept failed");
-                        }
-                    }
+                if let Err(e) = serve_dns(udp, tcp, inbound).await {
+                    tracing::error!(error = %e, "dns inbound stopped");
                 }
             });
             Ok(Some(handle))
         }
-        // loopback inbound：LoopbackHandler impl InboundHandler（no-op start/close）
+        // loopback inbound：LoopbackHandler 注册（outbound-only，start/close no-op）
         "loopback" => {
-            // loopback 是 outbound-only，inbound 注册为 no-op
-            tracing::info!(tag = %ib.tag, "loopback inbound registered (no-op, outbound-only protocol)");
+            let inbound_tag = parse_loopback_config(&ib.entry.data)?;
+            let _handler = LoopbackHandler::new(&ib.tag, xray_proto::xray::proxy::loopback::Config { inbound_tag });
+            tracing::info!(tag = %ib.tag, "loopback inbound registered (outbound-only)");
+            // LoopbackHandler 的 InboundHandler::start 是 no-op，不 spawn task
             Ok(None)
         }
         // tun inbound：TunInboundHandler impl InboundHandler
@@ -603,6 +702,209 @@ fn build_vmess_validator(data: &[u8]) -> std::io::Result<std::sync::Arc<VmessTim
         }
     }
     Ok(std::sync::Arc::new(validator))
+}
+
+/// 从 inbound entry.data（JSON）解析 SS 客户端 → SsInbound。
+///
+/// JSON 格式：`{"method":"aes-128-gcm","password":"..."}` 或
+/// `{"clients":[{"method":"aes-128-gcm","password":"...","email":""}]}`。
+fn parse_ss_inbound_config(data: &[u8]) -> std::io::Result<Arc<SsInbound>> {
+    use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
+    let v: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| std::io::Error::other(format!("ss inbound settings JSON: {e}")))?;
+    // 多用户模式：clients 数组
+    if let Some(clients) = v.get("clients").and_then(|c| c.as_array()) {
+        let mut users = Vec::new();
+        for c in clients {
+            let password = c.get("password").and_then(|x| x.as_str()).unwrap_or("");
+            let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let method = c.get("method").and_then(|x| x.as_str()).unwrap_or("aes-128-gcm");
+            let cipher = ss_cipher_from_str(method)
+                .ok_or_else(|| std::io::Error::other(format!("unsupported ss cipher: {method}")))?;
+            let proto = ProtoAccount {
+                password: password.to_string(),
+                cipher_type: cipher.as_i32(),
+                iv_check: false,
+            };
+            let account = SsConfigMemoryAccount::from_proto(&proto)
+                .map_err(|e| std::io::Error::other(format!("ss account parse: {e}")))?;
+            users.push(xray_proxy_ss::validator::MemoryUser::new(email, account));
+        }
+        if users.is_empty() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "ss inbound: no users"));
+        }
+        return Ok(Arc::new(SsInbound::with_users(users)));
+    }
+    // 单用户模式：method + password
+    let password = v.get("password").and_then(|x| x.as_str())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "ss inbound: missing password"))?;
+    let method = v.get("method").and_then(|x| x.as_str()).unwrap_or("aes-128-gcm");
+    let cipher = ss_cipher_from_str(method)
+        .ok_or_else(|| std::io::Error::other(format!("unsupported ss cipher: {method}")))?;
+    let proto = ProtoAccount {
+        password: password.to_string(),
+        cipher_type: cipher.as_i32(),
+        iv_check: false,
+    };
+    let account = SsConfigMemoryAccount::from_proto(&proto)
+        .map_err(|e| std::io::Error::other(format!("ss account parse: {e}")))?;
+    Ok(Arc::new(SsInbound::new(account, "u@ss.local")))
+}
+
+/// SS cipher 字符串 → CipherType。
+fn ss_cipher_from_str(s: &str) -> Option<SsCipherType> {
+    match s {
+        "aes-128-gcm" => Some(SsCipherType::Aes128Gcm),
+        "aes-256-gcm" => Some(SsCipherType::Aes256Gcm),
+        "chacha20-ietf-poly1305" => Some(SsCipherType::ChaCha20Poly1305),
+        _ => None,
+    }
+}
+
+/// 从 inbound entry.data（JSON）解析 hysteria inbound 配置。
+///
+/// 返回 (HysteriaConfig, HysteriaListenerFactory)。
+/// JSON 格式：`{"auth":"...","server_name":"..."}`。
+fn parse_hysteria_inbound_config(
+    data: &[u8],
+    bind_addr: std::net::SocketAddr,
+) -> std::io::Result<(xray_proxy_hysteria::HysteriaConfig, Arc<dyn xray_transport_hysteria::hub::HysteriaListenerFactory>)> {
+    let v: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| std::io::Error::other(format!("hysteria inbound settings JSON: {e}")))?;
+    let auth = v.get("auth").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let server_name = v.get("server_name").and_then(|x| x.as_str()).unwrap_or("hysteria").to_string();
+    let config = xray_proxy_hysteria::HysteriaConfig::new(bind_addr.to_string(), auth)
+        .with_server_name(server_name);
+    // ponytail: 真实 QUIC listener factory 需要 quinn server adapter
+    // 当前用 StubListenerFactory，quinn server adapter 待后续切片实现
+    let factory: Arc<dyn xray_transport_hysteria::hub::HysteriaListenerFactory> = Arc::new(StubListenerFactory);
+    Ok((config, factory))
+}
+
+/// 从 inbound entry.data（JSON）解析 anytls TLS acceptor。
+///
+/// JSON 格式：`{"cert":"...","key":"..."}`（PEM 格式）。
+/// 缺省时用自签名证书（仅测试场景）。
+fn parse_anytls_tls_acceptor(data: &[u8]) -> std::io::Result<tokio_rustls::TlsAcceptor> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let v: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| std::io::Error::other(format!("anytls inbound settings JSON: {e}")))?;
+    // 尝试从配置读证书
+    let (cert_der, key_der) = if let (Some(cert_str), Some(key_str)) = (
+        v.get("cert").and_then(|x| x.as_str()),
+        v.get("key").and_then(|x| x.as_str()),
+    ) {
+        let mut cert_reader = std::io::BufReader::new(cert_str.as_bytes());
+        let cert_pem = rustls_pemfile::certs(&mut cert_reader)
+            .into_iter().next()
+            .ok_or_else(|| std::io::Error::other("no cert in PEM"))?
+            .map_err(|e| std::io::Error::other(format!("parse cert PEM: {e}")))?;
+        let mut key_reader = std::io::BufReader::new(key_str.as_bytes());
+        let key_pem = rustls_pemfile::private_key(&mut key_reader)
+            .map_err(|e| std::io::Error::other(format!("parse key PEM: {e}")))?
+            .ok_or_else(|| std::io::Error::other("no key in PEM"))?;
+        (cert_pem, key_pem)
+    } else {
+        // ponytail: 无证书配置时用自签名证书（仅测试场景）
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let key_pair = rcgen::KeyPair::generate()
+            .map_err(|e| std::io::Error::other(format!("rcgen keypair: {e}")))?;
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .map_err(|e| std::io::Error::other(format!("rcgen params: {e}")))?;
+        let cert = params.self_signed(&key_pair)
+            .map_err(|e| std::io::Error::other(format!("rcgen self_signed: {e}")))?;
+        (
+            CertificateDer::from(cert.der().clone()),
+            PrivateKeyDer::try_from(key_pair.serialize_der())
+                .map_err(|e| std::io::Error::other(format!("rcgen key der: {e}")))?,
+        )
+    };
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der.into()], key_der)
+        .map_err(|e| std::io::Error::other(format!("rustls server config: {e}")))?;
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
+}
+
+/// 从 inbound entry.data（JSON）解析 wireguard inbound 配置。
+///
+/// JSON 格式：`{"secretKey":"...","peers":[{"publicKey":"...","endpoint":"..."}]}`。
+fn parse_wireguard_inbound_config(data: &[u8]) -> std::io::Result<(DeviceConfig, u16)> {
+    let v: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| std::io::Error::other(format!("wireguard inbound settings JSON: {e}")))?;
+    let secret_key = v.get("secretKey").and_then(|x| x.as_str())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "wireguard: missing secretKey"))?
+        .to_string();
+    let mut peers = Vec::new();
+    if let Some(arr) = v.get("peers").and_then(|x| x.as_array()) {
+        for p in arr {
+            let public_key = p.get("publicKey").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let endpoint = p.get("endpoint").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            peers.push(xray_proxy_wireguard::PeerConfig {
+                public_key,
+                endpoint,
+                ..Default::default()
+            });
+        }
+    }
+    let endpoint = v.get("address").and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_else(|| vec!["10.0.0.2/32".to_string()]);
+    let port = v.get("port").and_then(|x| x.as_u64()).unwrap_or(51820) as u16;
+    let config = DeviceConfig {
+        secret_key,
+        peers,
+        endpoint,
+        ..Default::default()
+    };
+    Ok((config, port))
+}
+
+/// 从 inbound entry.data（JSON）解析 dns inbound 配置。
+///
+/// JSON 格式：`{"servers":["8.8.8.8:53"]}` 或空对象。
+/// 返回 (Handler, DnsOutbound)。
+fn parse_dns_inbound_config(
+    data: &[u8],
+    tag: &str,
+) -> std::io::Result<(DnsHandler, DnsOutbound)> {
+    let v: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| std::io::Error::other(format!("dns inbound settings JSON: {e}")))?;
+    let handler = DnsHandler::init(&DnsConfig::default());
+    // 解析上游 DNS 服务器列表
+    let servers: Vec<(std::net::IpAddr, u16)> = v.get("servers")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter().filter_map(|s| {
+                s.as_str().and_then(|addr| {
+                    let (ip, port) = addr.rsplit_once(':')?;
+                    let ip: std::net::IpAddr = ip.parse().ok()?;
+                    let port: u16 = port.parse().ok()?;
+                    Some((ip, port))
+                })
+            }).collect()
+        })
+        .unwrap_or_default();
+    let outbound = if servers.is_empty() {
+        DnsOutbound::new_system(tag)
+            .map_err(|e| std::io::Error::other(format!("dns outbound init: {e}")))?
+    } else {
+        DnsOutbound::new_with_servers(tag, &servers)
+            .map_err(|e| std::io::Error::other(format!("dns outbound init: {e}")))?
+    };
+    Ok((handler, outbound))
+}
+
+/// 从 inbound entry.data（JSON）解析 loopback 配置 → inbound_tag。
+///
+/// JSON 格式：`{"inboundTag":"..."}`。
+fn parse_loopback_config(data: &[u8]) -> std::io::Result<String> {
+    let v: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| std::io::Error::other(format!("loopback inbound settings JSON: {e}")))?;
+    let inbound_tag = v.get("inboundTag").and_then(|x| x.as_str())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "loopback: missing inboundTag"))?
+        .to_string();
+    Ok(inbound_tag)
 }
 
 #[cfg(test)]

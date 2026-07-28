@@ -10,6 +10,8 @@ xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
 xray-proto = { path = "../xray-proto" }
 xray-transport-hysteria = { path = "../xray-transport-hysteria" }
+xray-app-dispatcher = { path = "../xray-app-dispatcher" }
+xray-transport = { path = "../xray-transport" }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }

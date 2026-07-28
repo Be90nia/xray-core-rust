@@ -67,6 +67,22 @@ impl CipherType {
     }
 }
 
+impl CipherType {
+    /// 从 method 名称字符串解析 CipherType。
+    /// 对应 Go 端 JSON 配置 `method` 字段。
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "aes-128-gcm" => Some(Self::Aes128Gcm),
+            "aes-256-gcm" => Some(Self::Aes256Gcm),
+            "chacha20-poly1305" | "chacha20-ietf-poly1305" => Some(Self::ChaCha20Poly1305),
+            "xchacha20-poly1305" | "xchacha20-ietf-poly1305" => Some(Self::XChaCha20Poly1305),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
 // ============================================================================
 // InnerAead：Box<dyn AeadCipherImpl> 简化包装
 // ============================================================================

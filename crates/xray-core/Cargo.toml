@@ -30,6 +30,10 @@ xray-mux = { path = "../xray-mux" }
 xray-buf = { path = "../xray-buf" }
 xray-transport = { path = "../xray-transport" }
 xray-proto = { path = "../xray-proto" }
+xray-transport-hysteria = { path = "../xray-transport-hysteria" }
+tokio-rustls = { workspace = true }
+rcgen = "0.13"
+rustls-pemfile = "2"
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
@@ -38,6 +42,8 @@ serde_json = { workspace = true }
 clap = { workspace = true }
 uuid = { workspace = true }
 anyhow = "1"
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [[bin]]

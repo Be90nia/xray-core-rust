@@ -23,3 +23,4 @@ pub mod server;
 pub use config::{Account, ClientConfig, Header, ServerConfig};
 pub use error::{HttpProxyError, Result};
 pub use server::HttpServer;
+pub use client::{HttpOutboundConfig, make_http_dial_fn, parse_http_config};

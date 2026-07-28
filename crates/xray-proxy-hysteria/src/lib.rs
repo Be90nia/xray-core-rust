@@ -34,9 +34,11 @@ pub mod error;
 pub mod inbound;
 pub mod outbound;
 pub mod protocol;
+pub mod dispatcher;
 
 pub use config::{HysteriaConfig, HysteriaInboundConfig, HysteriaUser, MultiUserValidator};
 pub use error::{HysteriaProxyError, Result};
 pub use inbound::{HysteriaInboundHandler, StaticAuthValidator, TcpDispatcher};
 pub use outbound::HysteriaOutboundHandler;
 pub use protocol::{Defragger, UdpMessage};
+pub use dispatcher::make_hysteria_dial_fn;

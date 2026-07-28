@@ -32,6 +32,7 @@ fnv = "1"
 # AES 单块加密（CreateAuthID 用）
 aes = "0.8"
 rand = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

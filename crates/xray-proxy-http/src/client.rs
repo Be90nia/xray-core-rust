@@ -1,1 +1,315 @@
-//! HTTP proxy client
+//! HTTP CONNECT 代理客户端 → DialBridge 适配器。
+//!
+//! HTTP CONNECT 代理：TCP connect 到上游代理 → 发 CONNECT 请求 →
+//! 读 200 OK 响应 → 返回连接（代理隧道已建立，双向透传）。
+//!
+//! [`DialBridge`]: xray_app_dispatcher::default::DialBridge
+//! [`DialFn`]: xray_app_dispatcher::default::DialFn
+
+use std::sync::Arc;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use xray_app_dispatcher::default::DialFn;
+use xray_common::net::address::Address;
+use xray_common::net::destination::Destination;
+use xray_common::net::network::Network;
+use xray_common::net::port::Port;
+use xray_transport::connection::Connection;
+use xray_transport::dialer::{dial, StreamSettings};
+use xray_transport::sockopt::SocketOptions;
+
+use crate::config::Account;
+
+/// HTTP outbound 配置。
+#[derive(Debug, Clone)]
+pub struct HttpOutboundConfig {
+    /// 上游 HTTP 代理服务器地址。
+    pub server_address: Address,
+    /// 上游 HTTP 代理服务器端口。
+    pub server_port: Port,
+    /// 可选认证（username + password）。
+    pub auth: Option<Account>,
+    /// 可选 streamSettings（TLS/WS/...）。None 走 raw TCP。
+    pub stream_settings: Option<StreamSettings>,
+}
+
+impl HttpOutboundConfig {
+    /// 构造配置（无认证，raw TCP）。
+    #[must_use]
+    pub fn new(server_address: Address, server_port: Port) -> Self {
+        Self {
+            server_address,
+            server_port,
+            auth: None,
+            stream_settings: None,
+        }
+    }
+
+    /// 设置认证（builder 风格）。
+    #[must_use]
+    pub fn with_auth(mut self, auth: Account) -> Self {
+        self.auth = Some(auth);
+        self
+    }
+
+    /// 设置 streamSettings（builder 风格）。
+    #[must_use]
+    pub fn with_stream_settings(mut self, settings: Option<StreamSettings>) -> Self {
+        self.stream_settings = settings;
+        self
+    }
+
+    /// 服务器 Destination（TCP）。
+    fn server_destination(&self) -> Destination {
+        Destination::new(
+            self.server_address.clone(),
+            self.server_port,
+            Network::TCP,
+        )
+    }
+}
+
+/// 解析 HTTP outbound settings JSON → HttpOutboundConfig。
+///
+/// JSON 格式：`{ "servers": [{ "address": "...", "port": 8080, "users": [{ "user": "u", "pass": "p" }] }] }`
+pub fn parse_http_config(data: &[u8]) -> Result<HttpOutboundConfig, String> {
+    let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
+    let servers = v
+        .get("servers")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "missing servers array".to_string())?;
+    let first = servers
+        .first()
+        .ok_or_else(|| "servers array is empty".to_string())?;
+    let address = first
+        .get("address")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing servers[0].address".to_string())?;
+    let port = first
+        .get("port")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "missing servers[0].port".to_string())?;
+    let port = u16::try_from(port).map_err(|_| "port out of range")?;
+    // users[0] 可选
+    let auth = first
+        .get("users")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|u| {
+            let user = u.get("user")?.as_str()?.to_string();
+            let pass = u.get("pass")?.as_str()?.to_string();
+            Some(Account::new(user, pass))
+        });
+    let mut config = HttpOutboundConfig::new(
+        Address::Domain(address.to_string()),
+        Port::new(port),
+    );
+    if let Some(a) = auth {
+        config = config.with_auth(a);
+    }
+    Ok(config)
+}
+
+/// 构造 HTTP CONNECT 的 DialFn 闭包。
+///
+/// 闭包捕获 `Arc<HttpOutboundConfig>`，每次调用：
+/// 1. dial 到 HTTP 代理服务器
+/// 2. 发送 CONNECT 请求（含可选 Proxy-Authorization）
+/// 3. 读响应直到找到空行（`\r\n\r\n`），检查 200 OK
+/// 4. 返回连接（隧道已建立，双向透传）
+///
+/// # Panics
+///
+/// 不会 panic；任何错误以 `Err(String)` 返回。
+pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
+    Arc::new(move |dest: &Destination| {
+        let config = Arc::clone(&config);
+        let target_host = dest.address().to_string();
+        let target_port = dest.port().value();
+        Box::pin(async move {
+            // 1. 拨号到 HTTP 代理服务器
+            let server_dest = config.server_destination();
+            let sockopt = SocketOptions::default();
+            let mut conn: Box<dyn Connection> = match &config.stream_settings {
+                Some(s) => dial(&server_dest, s, &sockopt)
+                    .await
+                    .map_err(|e| format!("http dial proxy ({}): {e}", s.protocol))?,
+                None => xray_transport::system_dialer::dial_system(&server_dest, &sockopt)
+                    .await
+                    .map_err(|e| format!("http dial proxy (tcp): {e}"))?,
+            };
+
+            // 2. 构造 CONNECT 请求
+            let host_port = format!("{target_host}:{target_port}");
+            let mut request = format!("CONNECT {host_port} HTTP/1.1\r\nHost: {host_port}\r\n");
+            if let Some(auth) = &config.auth {
+                // ponytail: base64 编码认证，用标准库（RFC 7617 Basic auth）
+                let credentials = format!("{}:{}", auth.username, auth.password);
+                let encoded = base64_encode(&credentials);
+                request.push_str(&format!("Proxy-Authorization: Basic {encoded}\r\n"));
+            }
+            request.push_str("\r\n");
+
+            // 3. 发送请求
+            conn.write_all(request.as_bytes())
+                .await
+                .map_err(|e| format!("http write CONNECT: {e}"))?;
+            conn.flush()
+                .await
+                .map_err(|e| format!("http flush CONNECT: {e}"))?;
+
+            // 4. 读响应头（直到空行 `\r\n\r\n`）
+            let mut buf = vec![0u8; 4096];
+            let mut total = 0usize;
+            let mut found_end = false;
+            while !found_end && total < buf.len() {
+                let n = conn.read(&mut buf[total..])
+                    .await
+                    .map_err(|e| format!("http read response: {e}"))?;
+                if n == 0 {
+                    return Err("http proxy closed connection before response".to_string());
+                }
+                total += n;
+                // 检查是否收到完整响应头（`\r\n\r\n`）
+                for i in 0..total.saturating_sub(3) {
+                    if buf[i] == b'\r' && buf[i + 1] == b'\n' && buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
+                        found_end = true;
+                        break;
+                    }
+                }
+            }
+            if !found_end {
+                return Err("http proxy response header too long or incomplete".to_string());
+            }
+
+            // 5. 解析响应行（第一行：`HTTP/1.x STATUS_CODE ...`）
+            let header_end = buf[..total]
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map(|p| p + 4)
+                .unwrap_or(total);
+            let first_line_end = buf[..header_end]
+                .iter()
+                .position(|&b| b == b'\r')
+                .unwrap_or(header_end);
+            let first_line = std::str::from_utf8(&buf[..first_line_end])
+                .map_err(|e| format!("http response not UTF-8: {e}"))?;
+            // 检查状态码（200 = OK）
+            if !first_line.contains("200") {
+                return Err(format!("http CONNECT proxy returned: {first_line}"));
+            }
+
+            // ponytail: 响应头剩余数据（如有）丢弃。
+            // HTTP CONNECT 隧道建立后，conn 双向透传——proxy 不再注入数据。
+
+            // 6. 返回连接（隧道已建立）
+            Ok(conn)
+        })
+    })
+}
+
+/// Base64 编码（RFC 4648）——不依赖 base64 crate，最小实现。
+fn base64_encode(input: &str) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_construction() {
+        let cfg = HttpOutboundConfig::new(
+            Address::new_domain("proxy.example.com"),
+            Port::new(8080),
+        );
+        assert_eq!(cfg.server_port.value(), 8080);
+        assert!(cfg.auth.is_none());
+    }
+
+    #[test]
+    fn config_with_auth() {
+        let cfg = HttpOutboundConfig::new(
+            Address::new_domain("proxy.example.com"),
+            Port::new(8080),
+        ).with_auth(Account::new("user", "pass"));
+        assert!(cfg.auth.is_some());
+        assert_eq!(cfg.auth.as_ref().map(|a| &a.username), Some(&"user".to_string()));
+    }
+
+    #[test]
+    fn make_dial_fn_returns_arc_closure() {
+        let cfg = Arc::new(HttpOutboundConfig::new(
+            Address::new_domain("proxy.example.com"),
+            Port::new(8080),
+        ));
+        let _dial = make_http_dial_fn(Arc::clone(&cfg));
+        assert_eq!(Arc::strong_count(&cfg), 2);
+    }
+
+    #[test]
+    fn base64_encode_basic() {
+        assert_eq!(base64_encode(""), "");
+        assert_eq!(base64_encode("f"), "Zg==");
+        assert_eq!(base64_encode("fo"), "Zm8=");
+        assert_eq!(base64_encode("foo"), "Zm9v");
+        assert_eq!(base64_encode("foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn parse_http_config_extracts_fields() {
+        let data = r#"{
+            "servers": [{
+                "address": "proxy.example.com",
+                "port": 8080,
+                "users": [{ "user": "alice", "pass": "secret" }]
+            }]
+        }"#;
+        let config = parse_http_config(data.as_bytes()).unwrap();
+        assert_eq!(config.server_port.value(), 8080);
+        assert!(config.auth.is_some());
+        match &config.server_address {
+            Address::Domain(d) => assert_eq!(d, "proxy.example.com"),
+            other => panic!("expected Domain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_http_config_no_auth() {
+        let data = r#"{
+            "servers": [{
+                "address": "proxy.example.com",
+                "port": 3128
+            }]
+        }"#;
+        let config = parse_http_config(data.as_bytes()).unwrap();
+        assert!(config.auth.is_none());
+    }
+
+    #[test]
+    fn parse_http_config_missing_servers_fails() {
+        let result = parse_http_config(b"{}");
+        assert!(result.is_err());
+    }
+}

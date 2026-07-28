@@ -5727,12 +5727,17 @@ dependencies = [
  "anyhow",
  "clap",
  "parking_lot",
+ "rcgen 0.13.2",
+ "rustls",
+ "rustls-pemfile",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "webpki-roots 1.0.8",
  "xray-app-dispatcher",
  "xray-buf",
  "xray-common",
@@ -5757,6 +5762,7 @@ dependencies = [
  "xray-proxy-vmess",
  "xray-proxy-wireguard",
  "xray-transport",
+ "xray-transport-hysteria",
 ]
 
 [[package]]
@@ -5932,9 +5938,11 @@ name = "xray-proxy-http"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "xray-app-dispatcher",
  "xray-buf",
  "xray-common",
  "xray-features",
@@ -5954,9 +5962,11 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "xray-app-dispatcher",
  "xray-common",
  "xray-features",
  "xray-proto",
+ "xray-transport",
  "xray-transport-hysteria",
 ]
 
@@ -6011,16 +6021,19 @@ dependencies = [
  "parking_lot",
  "prost",
  "rand 0.9.4",
+ "serde_json",
  "sha1",
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "xray-app-dispatcher",
  "xray-buf",
  "xray-common",
  "xray-crypto",
  "xray-features",
  "xray-proto",
+ "xray-transport",
 ]
 
 [[package]]
@@ -6134,6 +6147,7 @@ dependencies = [
  "parking_lot",
  "prost",
  "rand 0.9.4",
+ "serde_json",
  "sha2 0.10.9",
  "sha3 0.10.9",
  "thiserror 2.0.18",
@@ -6164,9 +6178,11 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "xray-app-dispatcher",
  "xray-common",
  "xray-features",
  "xray-proto",
+ "xray-transport",
 ]
 
 [[package]]

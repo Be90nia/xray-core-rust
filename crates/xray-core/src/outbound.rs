@@ -10,15 +10,16 @@
 //! - **trojan**：JSON 解析 `servers` → [`TrojanOutboundConfig`] → `make_dial_fn`（raw TCP，不含 streamSettings）
 //! - **blackhole**：JSON 解析 `response.type` → [`BlackholeHandler`]（DispatchHandler，不拨号）
 //! - **socks**：JSON 解析 `servers[0]` → [`SocksClient`] + `make_socks_dial_fn`（SOCKS5 outbound）
-//! - **vmess**：JSON 解析 `vnext[0]` → VmessOutboundConfig → OutboundHandlerBridge（stub dial）
+//! - **vmess**：JSON 解析 `vnext[0]` → `VmessOutboundConfig` → `make_vmess_dial_fn`
+//! - **shadowsocks**：JSON 解析 `servers[0]` → `SsOutboundConfig` → `make_ss_dial_fn`
 //! - **shadowsocks**：JSON 解析 `servers[0]` → SsOutbound → OutboundHandlerBridge（stub dial）
 //! - **hysteria**：JSON 解析 → HysteriaOutboundHandler → OutboundHandlerBridge（stub dial）
-//! - **anytls**：JSON 解析 → AnytlsClient → `make_anytls_dial_fn`
+//! - **anytls**：JSON 解析 → `AnytlsClient` → `make_anytls_dial_fn`
 //! - **tuic**：JSON 解析 → TuicClient → `make_tuic_dial_fn`
 //! - **wireguard**：JSON 解析 → WireguardOutboundHandler → OutboundHandlerBridge（stub dial）
-//! - **dns**：JSON 解析 → DnsOutbound → OutboundHandlerBridge（stub dial）
+//! - **dns**：JSON 解析 → `DnsDispatchBridge`（拦截 DNS 查询并转发）
 //! - **loopback**：JSON 解析 → LoopbackHandler（直接 impl DispatchHandler）
-//! - **http**：JSON 解析 → HttpOutboundConfig → OutboundHandlerBridge（stub dial）
+//! - **http**：JSON 解析 `servers[0]` → `HttpOutboundConfig` → `make_http_dial_fn`
 //! - **dokodemo**：dokodemo 是 inbound-only，outbound 为 NoopBridge
 //!
 //! ## streamSettings
@@ -46,6 +47,8 @@ use xray_mux::client::{ClientManager, DialingWorkerFactory, IncrementalWorkerPic
 use xray_mux::session::ClientStrategy;
 // 补全协议注册
 use xray_proxy_loopback::LoopbackHandler;
+use xray_proxy_hysteria::HysteriaConfig;
+use xray_proxy_wireguard::DeviceConfig;
 
 /// 从 BuiltConfig 注册 outbound handlers 到 SimpleOhm。
 ///
@@ -134,33 +137,62 @@ fn try_build_handler(
             let concurrency = parse_mux_config(&ob.entry.data)?;
             Ok(Arc::new(MuxBridge::new(ob.tag.clone(), concurrency)))
         }
-        // vmess outbound：当前 stub（transport chain 未接通）
+        // vmess outbound：解析 vnext → VmessOutboundConfig → make_vmess_dial_fn
         "vmess" => {
-            Ok(Arc::new(StubDispatchBridge::new(ob.tag.clone(), "vmess")))
+            let config = xray_proxy_vmess::parse_vmess_config(&ob.entry.data)?;
+            let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
+            let dial_fn = xray_proxy_vmess::make_vmess_dial_fn(Arc::new(config));
+            Ok(Arc::new(DialBridge::new(ob.tag.clone(), dial_fn)))
         }
-        // shadowsocks outbound：当前 stub（dial chain 未接通）
+        // shadowsocks outbound：解析 servers → SsOutboundConfig → make_ss_dial_fn
         "shadowsocks" => {
-            Ok(Arc::new(StubDispatchBridge::new(ob.tag.clone(), "shadowsocks")))
+            let config = xray_proxy_ss::parse_ss_config(&ob.entry.data)?;
+            let dial_fn = xray_proxy_ss::make_ss_dial_fn(Arc::new(config));
+            Ok(Arc::new(DialBridge::new(ob.tag.clone(), dial_fn)))
         }
-        // hysteria outbound：当前 stub（需要 HysteriaTransport）
+        // hysteria outbound：HysteriaConfig + make_hysteria_dial_fn
         "hysteria" => {
-            Ok(Arc::new(StubDispatchBridge::new(ob.tag.clone(), "hysteria")))
+            let (server_addr, auth, server_name) = parse_hysteria_config(&ob.entry.data)?;
+            let config = HysteriaConfig::new(&server_addr, &auth).with_server_name(&server_name);
+            // 构造 QuinnHysteriaTransport（默认 rustls + ring provider）
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let tls_config = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
+            let transport = xray_transport_hysteria::hysteria_transport::QuinnHysteriaTransport::new(
+                tls_config, "0.0.0.0:0".parse().map_err(|e| format!("bind addr: {e}"))?,
+            ).map_err(|e| format!("hysteria transport: {e}"))?;
+            let dial_fn = xray_proxy_hysteria::make_hysteria_dial_fn(config, Arc::new(transport));
+            Ok(Arc::new(DialBridge::new(ob.tag.clone(), dial_fn)))
         }
-        // anytls outbound：当前 stub（需要 TLS 配置）
+        // anytls outbound：解析配置 → AnytlsClient → make_anytls_dial_fn
         "anytls" => {
-            Ok(Arc::new(StubDispatchBridge::new(ob.tag.clone(), "anytls")))
+            let config = parse_anytls_config(&ob.entry.data)?;
+            let client = Arc::new(xray_proxy_anytls::AnytlsClient::new(config));
+            let dial_fn = xray_proxy_anytls::make_anytls_dial_fn(client);
+            Ok(Arc::new(DialBridge::new(ob.tag.clone(), dial_fn)))
         }
-        // tuic outbound：当前 stub（需要 QUIC 连接）
+        // tuic outbound：lazy init TuicClient + make_tuic_dial_fn_lazy
         "tuic" => {
-            Ok(Arc::new(StubDispatchBridge::new(ob.tag.clone(), "tuic")))
+            let (server_addr, server_name, uuid, password) = parse_tuic_config(&ob.entry.data)?;
+            let rustls_config = build_tuic_rustls_config();
+            let dial_fn = xray_proxy_tuic::make_tuic_dial_fn_lazy(
+                server_addr, server_name, uuid, password, rustls_config,
+            );
+            Ok(Arc::new(DialBridge::new(ob.tag.clone(), dial_fn)))
         }
-        // wireguard outbound：当前 stub（需要 async DeviceConfig）
+        // wireguard outbound：lazy init WireguardOutboundHandler + make_wireguard_dial_fn
         "wireguard" => {
-            Ok(Arc::new(StubDispatchBridge::new(ob.tag.clone(), "wireguard")))
+            let config = parse_wireguard_config(&ob.entry.data)?;
+            let dial_fn = xray_proxy_wireguard::make_wireguard_dial_fn(config);
+            Ok(Arc::new(DialBridge::new(ob.tag.clone(), dial_fn)))
         }
-        // dns outbound：当前 stub（DNS 不走 dial 路径）
+        // dns outbound：DnsDispatchHandler（拦截 DNS 查询并转发）
         "dns" => {
-            Ok(Arc::new(StubDispatchBridge::new(ob.tag.clone(), "dns")))
+            let dns = xray_proxy_dns::DnsOutbound::new_system(ob.tag.clone())
+                .map_err(|e| format!("dns outbound init: {e}"))?;
+            Ok(Arc::new(DnsDispatchBridge::new(ob.tag.clone(), dns)) as Arc<dyn DispatchHandler>)
         }
         // loopback outbound：LoopbackHandler impl DispatchHandler
         "loopback" => {
@@ -170,9 +202,12 @@ fn try_build_handler(
             );
             Ok(Arc::new(handler) as Arc<dyn DispatchHandler>)
         }
-        // http outbound：当前 stub（HTTP CONNECT 客户端未接通）
+        // http outbound：解析 servers → HttpOutboundConfig → make_http_dial_fn
         "http" => {
-            Ok(Arc::new(StubDispatchBridge::new(ob.tag.clone(), "http")))
+            let config = xray_proxy_http::parse_http_config(&ob.entry.data)?;
+            let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
+            let dial_fn = xray_proxy_http::make_http_dial_fn(Arc::new(config));
+            Ok(Arc::new(DialBridge::new(ob.tag.clone(), dial_fn)))
         }
         // dokodemo 是 inbound-only 协议，outbound 注册为 stub
         "dokodemo" => {
@@ -396,7 +431,7 @@ fn parse_stream_settings(json: &Option<serde_json::Value>) -> Option<StreamSetti
 
 /// 通用 stub outbound handler：dispatch 仅 log + drop link。
 ///
-/// 用于尚未完整实现拨号链路的协议（vmess/ss/hysteria/anytls/tuic/wireguard/dns/http）。
+/// 用于尚未完整实现拨号链路的协议（hysteria/tuic/wireguard/dokodemo）。
 /// 注册到 SimpleOhm 后，配置中引用该 tag 不会报错，但流量会被丢弃。
 pub struct StubDispatchBridge {
     tag: String,
@@ -436,6 +471,270 @@ impl DispatchHandler for StubDispatchBridge {
             drop(link);
         })
     }
+}
+
+// ========== DnsDispatchBridge：DNS 查询拦截 + 转发 ==========
+
+/// DNS outbound handler：拦截 dispatcher 转发的 DNS 查询 → 调用 DnsOutbound::process →@ → 写回响应。
+///
+/// DNS 不走标准 DialBridge（无 dial 语义），而是直接实现 DispatchHandler。
+struct DnsDispatchBridge {
+    tag: String,
+    dns: Arc<xray_proxy_dns::DnsOutbound>,
+}
+
+impl DnsDispatchBridge {
+    fn new(tag: impl Into<String>, dns: xray_proxy_dns::DnsOutbound) -> Self {
+        Self { tag: tag.into(), dns: Arc::new(dns) }
+    }
+}
+impl std::fmt::Debug for DnsDispatchBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DnsDispatchBridge")
+            .field("tag", &self.tag)
+            .finish()
+    }
+}
+
+impl DispatchHandler for DnsDispatchBridge {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    fn dispatch(&self, dest: &Destination, link: Link) -> PinFuture<()> {
+        let tag = self.tag.clone();
+        let dns = Arc::clone(&self.dns);
+        let dest = dest.clone();
+        Box::pin(async move {
+            // 从 link.reader 读取 DNS 查询字节（用 xray_buf Reader API）
+            let mut reader = link.reader;
+            let mut query_buf = Vec::new();
+            loop {
+                match reader.read_multi_buffer().await {
+                    Ok(mb) => {
+                        if mb.is_empty() { break; }
+                        for buf in mb.iter() {
+                            query_buf.extend_from_slice(buf.bytes());
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(tag = %tag, "dns dispatch read end: {e}");
+                        break;
+                    }
+                }
+            }
+            if query_buf.is_empty() {
+                tracing::debug!(tag = %tag, "dns dispatch: empty query");
+            } else {
+                // 转发到 DNS 上游
+                match dns.process(&query_buf).await {
+                    Ok(response) => {
+                        // 写回响应到 link.writer（用 xray_buf Writer API）
+                        let mut writer = link.writer;
+                        let resp_buf = xray_buf::buffer::Buffer::from_vec(response);
+                        let resp_mb = xray_buf::multi::MultiBuffer::from_buffer(resp_buf);
+                        if let Err(e) = writer.write_multi_buffer(resp_mb).await {
+                            tracing::warn!(tag = %tag, "dns dispatch write response: {e}");
+                        }
+                        writer.shutdown();
+                    }
+                    Err(e) => {
+                        tracing::warn!(tag = %tag, "dns dispatch process: {e}");
+                    }
+                }
+            }
+        })
+    }
+}
+
+// ========== AnyTLS 配置解析 ==========
+
+/// 解析 anytls outbound settings JSON → ClientConfig。
+///
+/// JSON 格式：`{ "server": "...", "server_port": 443, "sni": "...", "insecure": false }`
+fn parse_anytls_config(data: &[u8]) -> std::result::Result<xray_proxy_anytls::ClientConfig, String> {
+    let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
+    let address = v
+        .get("server")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing server".to_string())?;
+    let port = v
+        .get("server_port")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "missing server_port".to_string())?;
+    let port = u16::try_from(port).map_err(|_| "port out of range")?;
+    let sni = v
+        .get("sni")
+        .and_then(|v| v.as_str())
+        .unwrap_or(address);
+    let insecure = v
+        .get("insecure")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // 构造 rustls ClientConfig
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let tls_config = if insecure {
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth()
+    } else {
+        let root_store = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect(),
+        };
+        rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+    };
+    Ok(xray_proxy_anytls::ClientConfig::new(
+        &format!("{address}:{port}"),
+        sni,
+        Arc::new(tls_config),
+    ))
+}
+
+/// 跳过证书验证（insecure=true 场景）。
+struct NoVerifier;
+
+impl std::fmt::Debug for NoVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NoVerifier").finish()
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for NoVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}
+
+/// 解析 hysteria outbound settings JSON → (server_addr, auth, server_name)。
+///
+/// JSON 格式：`{"servers":[{"address":"...","port":443,"auth":"..."}]}`。
+fn parse_hysteria_config(data: &[u8]) -> std::result::Result<(String, String, String), String> {
+    let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
+    let servers = v.get("servers").and_then(|v| v.as_array())
+        .ok_or_else(|| "missing servers array".to_string())?;
+    let first = servers.first().ok_or_else(|| "servers array is empty".to_string())?;
+    let address = first.get("address").and_then(|v| v.as_str())
+        .ok_or_else(|| "missing servers[0].address".to_string())?;
+    let port = first.get("port").and_then(|v| v.as_u64())
+        .ok_or_else(|| "missing servers[0].port".to_string())?;
+    let auth = first.get("auth").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let server_addr = format!("{address}:{port}");
+    let server_name = first.get("server_name").and_then(|v| v.as_str())
+        .unwrap_or(address).to_string();
+    Ok((server_addr, auth, server_name))
+}
+
+/// 解析 tuic outbound settings JSON → (server_addr, server_name, uuid, password)。
+///
+/// JSON 格式：`{"servers":[{"address":"...","port":443,"uuid":"...","password":"..."}]}`。
+fn parse_tuic_config(data: &[u8]) -> std::result::Result<(std::net::SocketAddr, String, uuid::Uuid, String), String> {
+    let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
+    let servers = v.get("servers").and_then(|v| v.as_array())
+        .ok_or_else(|| "missing servers array".to_string())?;
+    let first = servers.first().ok_or_else(|| "servers array is empty".to_string())?;
+    let address = first.get("address").and_then(|v| v.as_str())
+        .ok_or_else(|| "missing servers[0].address".to_string())?;
+    let port = first.get("port").and_then(|v| v.as_u64())
+        .ok_or_else(|| "missing servers[0].port".to_string())?;
+    let uuid_str = first.get("uuid").and_then(|v| v.as_str())
+        .ok_or_else(|| "missing servers[0].uuid".to_string())?;
+    let password = first.get("password").and_then(|v| v.as_str())
+        .ok_or_else(|| "missing servers[0].password".to_string())?;
+    let server_name = first.get("server_name").and_then(|v| v.as_str())
+        .unwrap_or(address).to_string();
+    let server_addr: std::net::SocketAddr = format!("{address}:{port}").parse()
+        .map_err(|e| format!("invalid tuic server addr: {e}"))?;
+    let uuid = uuid::Uuid::parse_str(uuid_str)
+        .map_err(|e| format!("invalid tuic uuid: {e}"))?;
+    Ok((server_addr, server_name, uuid, password.to_string()))
+}
+
+/// 构造 TUIC 用的 rustls ClientConfig（默认配置 + ring provider）。
+fn build_tuic_rustls_config() -> Arc<rustls::ClientConfig> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerifier))
+        .with_no_client_auth();
+    // TUIC v5 要求 ALPN
+    config.alpn_protocols = vec![b"h3".to_vec(), b"tuic".to_vec()];
+    Arc::new(config)
+}
+
+
+/// 解析 wireguard outbound settings JSON → DeviceConfig。
+///
+/// JSON 格式：`{"secretKey":"...","peers":[{"publicKey":"...","endpoint":"..."}]}`。
+fn parse_wireguard_config(data: &[u8]) -> std::result::Result<DeviceConfig, String> {
+    let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
+    let secret_key = v.get("secretKey").and_then(|x| x.as_str())
+        .ok_or_else(|| "missing secretKey".to_string())?;
+    let mut peers = Vec::new();
+    if let Some(arr) = v.get("peers").and_then(|x| x.as_array()) {
+        for p in arr {
+            let public_key = p.get("publicKey").and_then(|x| x.as_str())
+                .ok_or_else(|| "missing peer publicKey".to_string())?;
+            let endpoint = p.get("endpoint").and_then(|x| x.as_str())
+                .ok_or_else(|| "missing peer endpoint".to_string())?;
+            peers.push(xray_proxy_wireguard::PeerConfig {
+                public_key: public_key.to_string(),
+                endpoint: endpoint.to_string(),
+                ..Default::default()
+            });
+        }
+    }
+    let endpoint = v.get("address").and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_else(|| vec!["10.0.0.2/32".to_string()]);
+    Ok(DeviceConfig {
+        secret_key: secret_key.to_string(),
+        peers,
+        endpoint,
+        ..Default::default()
+    })
 }
 
 /// 解析 loopback outbound settings JSON → inbound_tag。
@@ -548,13 +847,13 @@ mod tests {
     #[test]
     fn register_stub_protocol_registered() {
         let mut built = BuiltConfig::default();
-        built.outbounds.push(make_outbound("vmess", "vmess-out", "{}"));
+        built.outbounds.push(make_outbound("dokodemo", "dokodemo-out", "{}"));
 
         let ohm = SimpleOhm::new();
         register_outbounds(&built, &ohm).unwrap();
 
-        // vmess is now registered as StubDispatchBridge
-        assert!(ohm.get_handler("vmess-out").is_some(), "vmess should be registered as stub");
+        // dokodemo is inbound-only, registered as StubDispatchBridge
+        assert!(ohm.get_handler("dokodemo-out").is_some(), "dokodemo should be registered as stub");
     }
 
     #[test]

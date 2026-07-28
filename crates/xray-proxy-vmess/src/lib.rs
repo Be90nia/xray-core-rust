@@ -30,8 +30,11 @@ pub mod error;
 pub mod inbound;
 pub mod outbound;
 pub mod validator;
+pub mod dispatcher;
+
 
 pub use account::MemoryAccount;
+pub use dispatcher::{make_vmess_dial_fn, parse_vmess_config, VmessOutboundConfig};
 pub use error::{Result, VmessError};
 pub use validator::{MemoryUser, TimedUserValidator, Validator};
 pub use inbound::serve_vmess;
