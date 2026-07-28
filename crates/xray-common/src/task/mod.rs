@@ -28,12 +28,16 @@ impl Periodic {
     ///
     /// 任务会在独立 tokio 任务中按间隔重复执行，直到调用 `stop()`。
     /// 如果回调返回错误，任务会停止运行。
+    ///
+    /// # Errors
+    ///
+    /// 任务已在运行时返回错误。
     pub async fn start<F>(&self, task: F) -> Result<(), Error>
     where
         F: Fn() -> Result<(), Error> + Send + Sync + 'static,
     {
         {
-            let mut running = self.running.lock().expect("running lock should not be poisoned");
+            let mut running = self.running.lock().map_err(|_| Error::new("running lock poisoned"))?;
             if *running {
                 return Err(Error::new("periodic task is already running"));
             }
@@ -46,7 +50,10 @@ impl Periodic {
         tokio::spawn(async move {
             loop {
                 {
-                    let r = running.lock().expect("running lock should not be poisoned");
+                    let r = match running.lock() {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    };
                     if !*r {
                         break;
                     }
@@ -55,9 +62,9 @@ impl Periodic {
                 match task() {
                     Ok(()) => {}
                     Err(_) => {
-                        // 任务返回错误，停止运行
-                        let mut r = running.lock().expect("running lock should not be poisoned");
-                        *r = false;
+                        if let Ok(mut r) = running.lock() {
+                            *r = false;
+                        }
                         break;
                     }
                 }
@@ -69,15 +76,16 @@ impl Periodic {
         Ok(())
     }
 
-    /// 停止周期性任务。
+    /// 停止周期性任务。锁中毒时静默忽略。
     pub fn stop(&self) {
-        let mut running = self.running.lock().expect("running lock should not be poisoned");
-        *running = false;
+        if let Ok(mut running) = self.running.lock() {
+            *running = false;
+        }
     }
 
-    /// 检查任务是否正在运行。
+    /// 检查任务是否正在运行。锁中毒时返回 `false`。
     pub fn is_running(&self) -> bool {
-        *self.running.lock().expect("running lock should not be poisoned")
+        self.running.lock().map_or(false, |r| *r)
     }
 }
 

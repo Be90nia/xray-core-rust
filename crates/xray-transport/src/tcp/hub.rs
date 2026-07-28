@@ -14,10 +14,16 @@ fn tcp_hub() -> &'static Mutex<HashMap<SocketAddr, TcpListener>> {
     TCP_HUB.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// 注册 TCP listener。锁中毒时静默忽略。
 pub fn register_tcp_listener(addr: SocketAddr, listener: TcpListener) {
-    tcp_hub().lock().unwrap().insert(addr, listener);
+    if let Ok(mut hub) = tcp_hub().lock() {
+        hub.insert(addr, listener);
+    }
 }
 
-pub fn get_tcp_listener(addr: SocketAddr) -> Option<TcpListener> {
-    None
+/// 取出已注册的 TCP listener（从注册表中移除）。
+///
+/// `TcpListener` 不可 `Clone`，因此取出操作会从 hub 中移除。
+pub fn take_tcp_listener(addr: SocketAddr) -> Option<TcpListener> {
+    tcp_hub().lock().ok().and_then(|mut hub| hub.remove(&addr))
 }

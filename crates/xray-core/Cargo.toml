@@ -18,6 +18,14 @@ xray-proxy-socks = { path = "../xray-proxy-socks" }
 xray-proxy-blackhole = { path = "../xray-proxy-blackhole" }
 xray-proxy-http = { path = "../xray-proxy-http" }
 xray-proxy-dokodemo = { path = "../xray-proxy-dokodemo" }
+xray-proxy-ss = { path = "../xray-proxy-ss" }
+xray-proxy-hysteria = { path = "../xray-proxy-hysteria" }
+xray-proxy-anytls = { path = "../xray-proxy-anytls" }
+xray-proxy-tuic = { path = "../xray-proxy-tuic" }
+xray-proxy-wireguard = { path = "../xray-proxy-wireguard" }
+xray-proxy-dns = { path = "../xray-proxy-dns" }
+xray-proxy-loopback = { path = "../xray-proxy-loopback" }
+xray-proxy-tun = { path = "../xray-proxy-tun" }
 xray-mux = { path = "../xray-mux" }
 xray-buf = { path = "../xray-buf" }
 xray-transport = { path = "../xray-transport" }

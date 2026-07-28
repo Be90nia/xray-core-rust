@@ -338,6 +338,143 @@ async fn spawn_one_inbound(
             });
             Ok(Some(handle))
         }
+        // shadowsocks inbound：SsInbound 需要用户配置 + TCP listener
+        "shadowsocks" => {
+            let listener = TcpListener::bind(&addr).await?;
+            tracing::info!(tag = %ib.tag, addr = %addr, "shadowsocks inbound listening (stub)");
+            let tag = ib.tag.clone();
+            let handle = tokio::spawn(async move {
+                // ponytail: SsInbound 需要 validator + handle_conn，当前 stub accept loop
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, _peer)) => {
+                            tracing::debug!(tag = %tag, "ss inbound: accepted connection (handler stub)");
+                            drop(stream);
+                        }
+                        Err(e) => {
+                            tracing::warn!(tag = %tag, error = %e, "ss inbound accept failed");
+                        }
+                    }
+                }
+            });
+            Ok(Some(handle))
+        }
+        // hysteria inbound：QUIC listener，当前 stub
+        "hysteria" => {
+            let listener = TcpListener::bind(&addr).await?;
+            tracing::info!(tag = %ib.tag, addr = %addr, "hysteria inbound listening (stub, requires QUIC)");
+            let tag = ib.tag.clone();
+            let handle = tokio::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, _peer)) => {
+                            tracing::debug!(tag = %tag, "hysteria inbound: accepted connection (handler stub)");
+                            drop(stream);
+                        }
+                        Err(e) => {
+                            tracing::warn!(tag = %tag, error = %e, "hysteria inbound accept failed");
+                        }
+                    }
+                }
+            });
+            Ok(Some(handle))
+        }
+        // anytls inbound：AnytlsInboundHandler impl InboundHandler
+        "anytls" => {
+            let listener = TcpListener::bind(&addr).await?;
+            tracing::info!(tag = %ib.tag, addr = %addr, "anytls inbound listening (stub)");
+            let tag = ib.tag.clone();
+            let handle = tokio::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, _peer)) => {
+                            tracing::debug!(tag = %tag, "anytls inbound: accepted connection (handler stub)");
+                            drop(stream);
+                        }
+                        Err(e) => {
+                            tracing::warn!(tag = %tag, error = %e, "anytls inbound accept failed");
+                        }
+                    }
+                }
+            });
+            Ok(Some(handle))
+        }
+        // tuic inbound：QUIC listener，当前 stub
+        "tuic" => {
+            let listener = TcpListener::bind(&addr).await?;
+            tracing::info!(tag = %ib.tag, addr = %addr, "tuic inbound listening (stub, requires QUIC)");
+            let tag = ib.tag.clone();
+            let handle = tokio::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, _peer)) => {
+                            tracing::debug!(tag = %tag, "tuic inbound: accepted connection (handler stub)");
+                            drop(stream);
+                        }
+                        Err(e) => {
+                            tracing::warn!(tag = %tag, error = %e, "tuic inbound accept failed");
+                        }
+                    }
+                }
+            });
+            Ok(Some(handle))
+        }
+        // wireguard inbound：WireguardInboundHandler impl InboundHandler
+        "wireguard" => {
+            let listener = TcpListener::bind(&addr).await?;
+            tracing::info!(tag = %ib.tag, addr = %addr, "wireguard inbound listening (stub)");
+            let tag = ib.tag.clone();
+            let handle = tokio::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, _peer)) => {
+                            tracing::debug!(tag = %tag, "wireguard inbound: accepted connection (handler stub)");
+                            drop(stream);
+                        }
+                        Err(e) => {
+                            tracing::warn!(tag = %tag, error = %e, "wireguard inbound accept failed");
+                        }
+                    }
+                }
+            });
+            Ok(Some(handle))
+        }
+        // dns inbound：DnsInbound impl InboundHandler
+        "dns" => {
+            let listener = TcpListener::bind(&addr).await?;
+            tracing::info!(tag = %ib.tag, addr = %addr, "dns inbound listening (stub)");
+            let tag = ib.tag.clone();
+            let handle = tokio::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, _peer)) => {
+                            tracing::debug!(tag = %tag, "dns inbound: accepted connection (handler stub)");
+                            drop(stream);
+                        }
+                        Err(e) => {
+                            tracing::warn!(tag = %tag, error = %e, "dns inbound accept failed");
+                        }
+                    }
+                }
+            });
+            Ok(Some(handle))
+        }
+        // loopback inbound：LoopbackHandler impl InboundHandler（no-op start/close）
+        "loopback" => {
+            // loopback 是 outbound-only，inbound 注册为 no-op
+            tracing::info!(tag = %ib.tag, "loopback inbound registered (no-op, outbound-only protocol)");
+            Ok(None)
+        }
+        // tun inbound：TunInboundHandler impl InboundHandler
+        "tun" => {
+            // TUN 需要 TUN 设备，当前 stub
+            tracing::info!(tag = %ib.tag, "tun inbound registered (stub, requires TUN device)");
+            let handle = tokio::spawn(async move {
+                // ponytail: TUN 设备创建需要平台支持，当前无限等待
+                tokio::time::sleep(std::time::Duration::MAX).await;
+            });
+            Ok(Some(handle))
+        }
         other => {
             tracing::warn!(
                 tag = %ib.tag,

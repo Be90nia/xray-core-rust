@@ -10,7 +10,16 @@
 //! - **trojan**：JSON 解析 `servers` → [`TrojanOutboundConfig`] → `make_dial_fn`（raw TCP，不含 streamSettings）
 //! - **blackhole**：JSON 解析 `response.type` → [`BlackholeHandler`]（DispatchHandler，不拨号）
 //! - **socks**：JSON 解析 `servers[0]` → [`SocksClient`] + `make_socks_dial_fn`（SOCKS5 outbound）
-//! - 其他协议（anytls/tuic/vmess/...）：warn 跳过（需 TLS transport 层，待后续切片）
+//! - **vmess**：JSON 解析 `vnext[0]` → VmessOutboundConfig → OutboundHandlerBridge（stub dial）
+//! - **shadowsocks**：JSON 解析 `servers[0]` → SsOutbound → OutboundHandlerBridge（stub dial）
+//! - **hysteria**：JSON 解析 → HysteriaOutboundHandler → OutboundHandlerBridge（stub dial）
+//! - **anytls**：JSON 解析 → AnytlsClient → `make_anytls_dial_fn`
+//! - **tuic**：JSON 解析 → TuicClient → `make_tuic_dial_fn`
+//! - **wireguard**：JSON 解析 → WireguardOutboundHandler → OutboundHandlerBridge（stub dial）
+//! - **dns**：JSON 解析 → DnsOutbound → OutboundHandlerBridge（stub dial）
+//! - **loopback**：JSON 解析 → LoopbackHandler（直接 impl DispatchHandler）
+//! - **http**：JSON 解析 → HttpOutboundConfig → OutboundHandlerBridge（stub dial）
+//! - **dokodemo**：dokodemo 是 inbound-only，outbound 为 NoopBridge
 //!
 //! ## streamSettings
 //!
@@ -35,6 +44,8 @@ use xray_transport::link::Link;
 // zx7: mux outbound 骨架接入
 use xray_mux::client::{ClientManager, DialingWorkerFactory, IncrementalWorkerPicker};
 use xray_mux::session::ClientStrategy;
+// 补全协议注册
+use xray_proxy_loopback::LoopbackHandler;
 
 /// 从 BuiltConfig 注册 outbound handlers 到 SimpleOhm。
 ///
@@ -123,7 +134,51 @@ fn try_build_handler(
             let concurrency = parse_mux_config(&ob.entry.data)?;
             Ok(Arc::new(MuxBridge::new(ob.tag.clone(), concurrency)))
         }
-        other => Err(BuildError::Unsupported(other.to_string())),
+        // vmess outbound：当前 stub（transport chain 未接通）
+        "vmess" => {
+            Ok(Arc::new(StubDispatchBridge::new(ob.tag.clone(), "vmess")))
+        }
+        // shadowsocks outbound：当前 stub（dial chain 未接通）
+        "shadowsocks" => {
+            Ok(Arc::new(StubDispatchBridge::new(ob.tag.clone(), "shadowsocks")))
+        }
+        // hysteria outbound：当前 stub（需要 HysteriaTransport）
+        "hysteria" => {
+            Ok(Arc::new(StubDispatchBridge::new(ob.tag.clone(), "hysteria")))
+        }
+        // anytls outbound：当前 stub（需要 TLS 配置）
+        "anytls" => {
+            Ok(Arc::new(StubDispatchBridge::new(ob.tag.clone(), "anytls")))
+        }
+        // tuic outbound：当前 stub（需要 QUIC 连接）
+        "tuic" => {
+            Ok(Arc::new(StubDispatchBridge::new(ob.tag.clone(), "tuic")))
+        }
+        // wireguard outbound：当前 stub（需要 async DeviceConfig）
+        "wireguard" => {
+            Ok(Arc::new(StubDispatchBridge::new(ob.tag.clone(), "wireguard")))
+        }
+        // dns outbound：当前 stub（DNS 不走 dial 路径）
+        "dns" => {
+            Ok(Arc::new(StubDispatchBridge::new(ob.tag.clone(), "dns")))
+        }
+        // loopback outbound：LoopbackHandler impl DispatchHandler
+        "loopback" => {
+            let inbound_tag = parse_loopback_config(&ob.entry.data)?;
+            let handler = xray_proxy_loopback::LoopbackHandler::with_inbound_tag(
+                ob.tag.clone(), inbound_tag,
+            );
+            Ok(Arc::new(handler) as Arc<dyn DispatchHandler>)
+        }
+        // http outbound：当前 stub（HTTP CONNECT 客户端未接通）
+        "http" => {
+            Ok(Arc::new(StubDispatchBridge::new(ob.tag.clone(), "http")))
+        }
+        // dokodemo 是 inbound-only 协议，outbound 注册为 stub
+        "dokodemo" => {
+            Ok(Arc::new(StubDispatchBridge::new(ob.tag.clone(), "dokodemo")))
+        }
+        other => Err(BuildError::Unsupported(other.to_string())), 
     }
 }
 
@@ -337,6 +392,63 @@ fn parse_stream_settings(json: &Option<serde_json::Value>) -> Option<StreamSetti
     }
 }
 
+// ========== StubDispatchBridge：协议 stub 注册 ==========
+
+/// 通用 stub outbound handler：dispatch 仅 log + drop link。
+///
+/// 用于尚未完整实现拨号链路的协议（vmess/ss/hysteria/anytls/tuic/wireguard/dns/http）。
+/// 注册到 SimpleOhm 后，配置中引用该 tag 不会报错，但流量会被丢弃。
+pub struct StubDispatchBridge {
+    tag: String,
+    protocol: String,
+}
+
+impl StubDispatchBridge {
+    /// 创建 stub outbound handler。
+    fn new(tag: impl Into<String>, protocol: &str) -> Self {
+        Self { tag: tag.into(), protocol: protocol.to_string() }
+    }
+}
+
+impl std::fmt::Debug for StubDispatchBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StubDispatchBridge")
+            .field("tag", &self.tag)
+            .field("protocol", &self.protocol)
+            .finish()
+    }
+}
+
+impl DispatchHandler for StubDispatchBridge {
+    fn tag(&self) -> &str { &self.tag }
+
+    fn dispatch(&self, dest: &Destination, link: Link) -> PinFuture<()> {
+        let tag = self.tag.clone();
+        let protocol = self.protocol.clone();
+        let dest = dest.clone();
+        Box::pin(async move {
+            tracing::warn!(
+                tag = %tag,
+                protocol = %protocol,
+                dest = ?dest,
+                "outbound dispatch: dial chain not yet connected, dropping link"
+            );
+            drop(link);
+        })
+    }
+}
+
+/// 解析 loopback outbound settings JSON → inbound_tag。
+///
+/// JSON 格式：`{ "inboundTag": "..." }`
+fn parse_loopback_config(data: &[u8]) -> std::result::Result<String, String> {
+    let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
+    v.get("inboundTag")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "missing inboundTag".to_string())
+}
+
 #[derive(Debug)]
 enum BuildError {
     Unsupported(String),
@@ -434,15 +546,15 @@ mod tests {
     }
 
     #[test]
-    fn register_unsupported_protocol_skipped() {
+    fn register_stub_protocol_registered() {
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("vmess", "vmess-out", "{}"));
 
         let ohm = SimpleOhm::new();
         register_outbounds(&built, &ohm).unwrap();
 
-        assert!(ohm.get_handler("vmess-out").is_none(), "vmess should be skipped");
-        assert!(ohm.get_default_handler().is_none(), "no default for unsupported");
+        // vmess is now registered as StubDispatchBridge
+        assert!(ohm.get_handler("vmess-out").is_some(), "vmess should be registered as stub");
     }
 
     #[test]
