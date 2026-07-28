@@ -164,11 +164,12 @@ enum Command {
     },
 }
 
-fn main() -> std::process::ExitCode {
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     // v4 兼容：无子命令时默认 run
     let command = cli.command.unwrap_or(Command::Run(RunArgs::default()));
-    match execute(command) {
+    match execute(command).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -178,36 +179,36 @@ fn main() -> std::process::ExitCode {
 }
 
 /// API 子命令 dispatch。
-fn execute_api(cmd: &ApiCommand) -> Result<(), CliError> {
+async fn execute_api(cmd: &ApiCommand) -> Result<(), CliError> {
     match cmd {
-        ApiCommand::AddInbound(args) => api_exec::execute_add_inbound(args),
-        ApiCommand::RemoveInbound(args) => api_exec::execute_remove_inbound(args),
-        ApiCommand::AddOutbound(args) => api_exec::execute_add_outbound(args),
-        ApiCommand::RemoveOutbound(args) => api_exec::execute_remove_outbound(args),
-        ApiCommand::AddRule(args) => api_exec::execute_add_rule(args),
-        ApiCommand::RemoveRule(args) => api_exec::execute_remove_rule(args),
-        ApiCommand::ListInbounds(args) => api_exec::execute_list_inbounds(args),
-        ApiCommand::ListOutbounds(args) => api_exec::execute_list_outbounds(args),
-        ApiCommand::ListRules(args) => api_exec::execute_list_rules(args),
-        ApiCommand::Stats(args) => api_exec::execute_stats(args),
-        ApiCommand::StatsQuery(args) => api_exec::execute_stats_query(args),
-        ApiCommand::SysStats(args) => api_exec::execute_sys_stats(args),
-        ApiCommand::RestartLogger(args) => api_exec::execute_restart_logger(args),
-        ApiCommand::AddUser(args) => api_exec::execute_add_user(args),
-        ApiCommand::RemoveUser(args) => api_exec::execute_remove_user(args),
-        ApiCommand::InboundUser(args) => api_exec::execute_inbound_user(args),
-        ApiCommand::InboundUserCount(args) => api_exec::execute_inbound_user_count(args),
-        ApiCommand::BalancerInfo(args) => api_exec::execute_balancer_info(args),
-        ApiCommand::BalancerOverride(args) => api_exec::execute_balancer_override(args),
-        ApiCommand::SourceIpBlock(args) => api_exec::execute_source_ip_block(args),
-        ApiCommand::StatsOnline(args) => api_exec::execute_stats_online(args),
-        ApiCommand::OnlineIpList(args) => api_exec::execute_online_ip_list(args),
-        ApiCommand::OnlineUsers(args) => api_exec::execute_online_users(args),
+        ApiCommand::AddInbound(args) => api_exec::execute_add_inbound(args).await,
+        ApiCommand::RemoveInbound(args) => api_exec::execute_remove_inbound(args).await,
+        ApiCommand::AddOutbound(args) => api_exec::execute_add_outbound(args).await,
+        ApiCommand::RemoveOutbound(args) => api_exec::execute_remove_outbound(args).await,
+        ApiCommand::AddRule(args) => api_exec::execute_add_rule(args).await,
+        ApiCommand::RemoveRule(args) => api_exec::execute_remove_rule(args).await,
+        ApiCommand::ListInbounds(args) => api_exec::execute_list_inbounds(args).await,
+        ApiCommand::ListOutbounds(args) => api_exec::execute_list_outbounds(args).await,
+        ApiCommand::ListRules(args) => api_exec::execute_list_rules(args).await,
+        ApiCommand::Stats(args) => api_exec::execute_stats(args).await,
+        ApiCommand::StatsQuery(args) => api_exec::execute_stats_query(args).await,
+        ApiCommand::SysStats(args) => api_exec::execute_sys_stats(args).await,
+        ApiCommand::RestartLogger(args) => api_exec::execute_restart_logger(args).await,
+        ApiCommand::AddUser(args) => api_exec::execute_add_user(args).await,
+        ApiCommand::RemoveUser(args) => api_exec::execute_remove_user(args).await,
+        ApiCommand::InboundUser(args) => api_exec::execute_inbound_user(args).await,
+        ApiCommand::InboundUserCount(args) => api_exec::execute_inbound_user_count(args).await,
+        ApiCommand::BalancerInfo(args) => api_exec::execute_balancer_info(args).await,
+        ApiCommand::BalancerOverride(args) => api_exec::execute_balancer_override(args).await,
+        ApiCommand::SourceIpBlock(args) => api_exec::execute_source_ip_block(args).await,
+        ApiCommand::StatsOnline(args) => api_exec::execute_stats_online(args).await,
+        ApiCommand::OnlineIpList(args) => api_exec::execute_online_ip_list(args).await,
+        ApiCommand::OnlineUsers(args) => api_exec::execute_online_users(args).await,
     }
 }
 
 /// 子命令 dispatch。
-fn execute(command: Command) -> Result<(), CliError> {
+async fn execute(command: Command) -> Result<(), CliError> {
     match command {
         Command::Run(args) => run::execute(args),
         Command::Version => {
@@ -215,7 +216,7 @@ fn execute(command: Command) -> Result<(), CliError> {
             Ok(())
         }
         Command::Uuid(args) => tool::execute_uuid(&args),
-        Command::Api { command } => execute_api(&command),
+        Command::Api { command } => execute_api(&command).await,
         Command::Tls { command } => tool::execute_tls(&command),
         Command::Convert { command } => tool::execute_convert(&command),
     }

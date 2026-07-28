@@ -3,6 +3,7 @@
 //! 包含 API 子命令和工具子命令。
 
 pub mod api_args;
+pub mod api_client;
 pub mod api_exec;
 pub mod tool;
 

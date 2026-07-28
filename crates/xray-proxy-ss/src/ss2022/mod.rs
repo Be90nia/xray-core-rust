@@ -4,7 +4,14 @@
 //! Rust 端手写协议层（blake3 key 派生 + TCP header + chunk），复用 `SSStream`。
 
 pub mod client;
+pub mod inbound;
 pub mod key;
+pub mod outbound;
 
 pub use client::Client2022;
+pub use inbound::{
+    InboundResult, MultiUserInbound, RelayDestination, RelayInbound, Ss2022Inbound,
+    Ss2022User,
+};
 pub use key::{psk_from_base64, CipherKind2022, derive_session_subkey};
+pub use outbound::{Ss2022Outbound, Ss2022OutboundConfig, UdpOverTcpConfig};

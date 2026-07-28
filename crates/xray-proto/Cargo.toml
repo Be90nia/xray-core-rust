@@ -6,9 +6,16 @@ license.workspace = true
 rust-version.workspace = true
 description = "Xray-core protobuf type definitions (generated via prost)"
 
+[features]
+# 启用 gRPC client stub 生成（CLI 侧需要，commander server 侧不需要）
+grpc-client = ["dep:tonic", "dep:tonic-prost"]
+
 [dependencies]
 prost = { workspace = true }
 prost-types = { workspace = true }
+tonic = { workspace = true, optional = true }
+tonic-prost = { workspace = true, optional = true }
 
 [build-dependencies]
 prost-build = { workspace = true }
+tonic-prost-build = { workspace = true }

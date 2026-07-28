@@ -88,6 +88,30 @@ pub enum SsError {
 
     #[error("io: {0}")]
     Io(String),
+
+    #[error("ss-2022 missing server key")]
+    Ss2022MissingKey,
+
+    #[error("ss-2022 unsupported method: {0}")]
+    Ss2022UnsupportedMethod(String),
+
+    #[error("ss-2022 header type invalid: {0}")]
+    Ss2022InvalidHeaderType(u8),
+
+    #[error("ss-2022 timestamp check failed: {0}")]
+    Ss2022TimestampCheck(String),
+
+    #[error("ss-2022 user key not found: {0}")]
+    Ss2022UserKeyNotFound(String),
+
+    #[error("ss-2022 no user matched")]
+    Ss2022NoUserMatched,
+
+    #[error("ss-2022 relay destination not found: {0}")]
+    Ss2022RelayDestNotFound(usize),
+
+    #[error("ss-2022 padding too large: {0}")]
+    Ss2022PaddingTooLarge(usize),
 }
 
 impl From<std::io::Error> for SsError {

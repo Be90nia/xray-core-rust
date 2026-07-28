@@ -25,6 +25,7 @@ use crate::ss2022::key::{derive_session_subkey, psk_from_base64, CipherKind2022}
 use crate::stream::SSStream;
 
 /// SS-2022 TCP client。
+#[derive(Debug)]
 pub struct Client2022 {
     psk: Vec<u8>,
     kind: CipherKind2022,

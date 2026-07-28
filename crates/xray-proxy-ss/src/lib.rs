@@ -24,6 +24,11 @@ pub use error::{Result, SsError};
 pub use validator::Validator;
 pub use inbound::SsInbound;
 pub use outbound::SsOutbound;
+pub use ss2022::{
+    Client2022, CipherKind2022, InboundResult, MultiUserInbound, RelayDestination,
+    RelayInbound, Ss2022Inbound, Ss2022Outbound, Ss2022OutboundConfig, Ss2022User,
+    UdpOverTcpConfig, derive_session_subkey, psk_from_base64,
+};
 
 /// Shadowsocks 协议版本，对应 Go `protocol.Version`。
 pub const VERSION: u8 = 1;

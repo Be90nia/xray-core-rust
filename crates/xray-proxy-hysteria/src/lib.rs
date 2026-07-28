@@ -33,8 +33,10 @@ pub mod config;
 pub mod error;
 pub mod inbound;
 pub mod outbound;
+pub mod protocol;
 
-pub use config::HysteriaConfig;
+pub use config::{HysteriaConfig, HysteriaInboundConfig, HysteriaUser, MultiUserValidator};
 pub use error::{HysteriaProxyError, Result};
-pub use inbound::{HysteriaInboundHandler, StaticAuthValidator};
+pub use inbound::{HysteriaInboundHandler, StaticAuthValidator, TcpDispatcher};
 pub use outbound::HysteriaOutboundHandler;
+pub use protocol::{Defragger, UdpMessage};

@@ -8,12 +8,18 @@ rust-version.workspace = true
 [dependencies]
 xray-core = { path = "../xray-core" }
 xray-conf = { path = "../xray-conf" }
+xray-proto = { path = "../xray-proto", features = ["grpc-client"] }
 thiserror = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

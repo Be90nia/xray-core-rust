@@ -24,6 +24,10 @@ pub enum HysteriaProxyError {
     /// IO 错误。
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// 协议帧解析错误（TCP 请求/响应、UDP 消息格式错误）。
+    #[error("protocol parse error: {0}")]
+    ProtocolParse(String),
 }
 
 /// Hysteria 代理 Result 别名。
