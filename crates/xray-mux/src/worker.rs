@@ -1,6 +1,6 @@
-//! Mux server
+//! Mux 服务端
 //!
-//! Corresponds to Go version `common/mux/server.go`.
+//! 对应 Go 版本 `common/mux/server.go`，实现 Mux 服务端帧处理、KeepAlive 和空闲超时。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,7 +21,7 @@ use crate::writer::MuxWriter;
 use xray_buf::buffer::Buffer;
 use xray_buf::multi::MultiBuffer;
 
-/// Server keepalive interval (60 seconds).
+/// 服务端 KeepAlive 间隔（60 秒）。
 pub const SERVER_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[async_trait::async_trait]
@@ -106,6 +106,71 @@ impl ServerWorker {
 
     pub fn done_rx(&self) -> watch::Receiver<bool> {
         self.done_rx.clone()
+    }
+
+    /// 启动 KeepAlive 定时发送和空闲超时检查任务。
+    ///
+    /// 返回两个 JoinHandle：keepalive 任务和 idle_timeout 任务。
+    /// 调用方负责在适当时机 abort。
+    pub fn spawn_keepalive_and_idle_timeout(
+        &self,
+        link_writer: Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>>,
+    ) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+        let session_manager = Arc::clone(&self.session_manager);
+        let done_rx = self.done_rx.clone();
+        let lw_keepalive = link_writer.clone();
+
+        // KeepAlive 定时发送
+        let keepalive_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(SERVER_KEEPALIVE_INTERVAL);
+            let mut done = done_rx;
+            loop {
+                tokio::select! {
+                    _ = done.changed() => break,
+                    _ = interval.tick() => {
+                        // 向所有活跃 session 发送 KeepAlive 帧
+                        let sessions = session_manager.active_sessions().await;
+                        for session in sessions {
+                            if session.is_closed() { continue; }
+                            let meta = FrameMetadata::keep_alive(session.id());
+                            let mut vec = Vec::new();
+                            if meta.write_to(&mut vec).is_err() { continue; }
+                            let mb = MultiBuffer::from_buffer(Buffer::from_vec(vec));
+                            let mut wg = lw_keepalive.lock().await;
+                            if let Some(ref mut writer) = *wg {
+                                let _ = writer.write_multi_buffer(mb).await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let session_manager2 = Arc::clone(&self.session_manager);
+        let done_rx2 = self.done_rx.clone();
+
+        // 空闲超时检查
+        let idle_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            let mut done = done_rx2;
+            loop {
+                tokio::select! {
+                    _ = done.changed() => break,
+                    _ = interval.tick() => {
+                        let sessions = session_manager2.active_sessions().await;
+                        for session in sessions {
+                            if session.is_closed() { continue; }
+                            if session.is_idle_timeout(crate::session::SESSION_IDLE_TIMEOUT).await {
+                                warn!("session {} idle timeout, closing", session.id());
+                                session.close().await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        (keepalive_handle, idle_handle)
     }
 
     /// Handle normal New frame (non-XUDP).
@@ -209,6 +274,9 @@ impl ServerWorker {
                 Some(reader) => match reader.read_multi_buffer().await {
                     Ok(mb) => {
                         if mb.is_empty() { break; }
+                        let byte_count = mb.len() as u64;
+                        session.add_downlink_bytes(byte_count);
+                        session.touch_active().await;
                         if rw.write(mb).await.is_err() { rw.set_error(); break; }
                     }
                     Err(_) => { rw.set_error(); break; }
@@ -287,10 +355,14 @@ impl ServerWorker {
         if data.is_empty() {
             return Ok(());
         }
+        let data_len = data.len() as u64;
         let session = match self.session_manager.get(meta.session_id()).await {
             Some(s) => s,
             None => return Ok(()),
         };
+        // 更新流量统计和活跃时间
+        session.add_uplink_bytes(data_len);
+        session.touch_active().await;
         let mut guard = session.output().await;
         if let Some(ref mut writer) = *guard {
             let mb = MultiBuffer::from_buffer(Buffer::from_vec(data));
@@ -403,5 +475,20 @@ mod tests {
     fn test_server_error_is_std_error() {
         let err = ServerError::InvalidFrame("test".to_string());
         let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn test_server_keepalive_interval_60s() {
+        assert_eq!(SERVER_KEEPALIVE_INTERVAL, Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn test_session_manager_active_sessions() {
+        let worker = ServerWorker::new(Arc::new(MockDispatcher));
+        let sm = worker.session_manager();
+        assert_eq!(sm.active_sessions().await.len(), 0);
+        let strategy = crate::session::ClientStrategy::default();
+        let _s = sm.allocate(&strategy).await;
+        assert_eq!(sm.active_sessions().await.len(), 1);
     }
 }

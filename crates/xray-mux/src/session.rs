@@ -11,9 +11,12 @@
 //! - [`XUDPManager`]: UDP 会话管理器
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
+
+/// 默认会话空闲超时时间（300 秒）。
+pub const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 use tokio::sync::{watch, Mutex, RwLock};
 use tracing::debug;
@@ -163,6 +166,12 @@ pub struct Session {
     parent: Weak<SessionManagerShared>,
     /// XUDP 扩展（可选）。
     xudp: Mutex<Option<XUDP>>,
+    /// 上行字节数（客户端→服务端方向）。
+    uplink_bytes: AtomicU64,
+    /// 下行字节数（服务端→客户端方向）。
+    downlink_bytes: AtomicU64,
+    /// 最后活跃时间（收到数据或发送数据时更新）。
+    last_active: Mutex<Instant>,
 }
 
 impl Session {
@@ -182,6 +191,9 @@ impl Session {
             output: Mutex::new(None),
             parent: Weak::new(),
             xudp: Mutex::new(None),
+            uplink_bytes: AtomicU64::new(0),
+            downlink_bytes: AtomicU64::new(0),
+            last_active: Mutex::new(Instant::now()),
         }
     }
 
@@ -316,6 +328,46 @@ impl Session {
     pub async fn xudp(&self) -> Option<XUDP> {
         let guard = self.xudp.lock().await;
         guard.clone()
+    }
+
+    // ========== 流量统计 ==========
+
+    /// 增加上行字节数。
+    pub fn add_uplink_bytes(&self, n: u64) {
+        self.uplink_bytes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// 增加下行字节数。
+    pub fn add_downlink_bytes(&self, n: u64) {
+        self.downlink_bytes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// 获取上行字节数。
+    #[must_use]
+    pub fn uplink_bytes(&self) -> u64 {
+        self.uplink_bytes.load(Ordering::Relaxed)
+    }
+
+    /// 获取下行字节数。
+    #[must_use]
+    pub fn downlink_bytes(&self) -> u64 {
+        self.downlink_bytes.load(Ordering::Relaxed)
+    }
+
+    // ========== 空闲超时 ==========
+
+    /// 更新最后活跃时间为当前时刻。
+    pub async fn touch_active(&self) {
+        let mut guard = self.last_active.lock().await;
+        *guard = Instant::now();
+    }
+
+    /// 检查会话是否已空闲超时。
+    ///
+    /// 返回 `true` 表示自上次活跃以来已超过 `timeout` 时长。
+    pub async fn is_idle_timeout(&self, timeout: Duration) -> bool {
+        let guard = self.last_active.lock().await;
+        guard.elapsed() > timeout
     }
 }
 
@@ -572,6 +624,14 @@ impl SessionManager {
         // 清理映射表
         let mut inner = self.shared.inner.write().await;
         inner.sessions.clear();
+    }
+
+    /// 获取所有活跃会话的克隆列表。
+    ///
+    /// 用于 KeepAlive 广播和空闲超时检查。
+    pub async fn active_sessions(&self) -> Vec<Arc<Session>> {
+        let inner = self.shared.inner.read().await;
+        inner.sessions.values().cloned().collect()
     }
 }
 
@@ -1097,5 +1157,50 @@ mod tests {
             format!("{}", SessionError::SessionNotFound(42)),
             "session not found: 42"
         );
+    }
+
+    // ========== 流量统计测试 ==========
+
+    #[test]
+    fn test_session_traffic_stats_initial() {
+        let session = Session::new(1, TransferType::Stream);
+        assert_eq!(session.uplink_bytes(), 0);
+        assert_eq!(session.downlink_bytes(), 0);
+    }
+
+    #[test]
+    fn test_session_traffic_stats_increment() {
+        let session = Session::new(1, TransferType::Stream);
+        session.add_uplink_bytes(100);
+        session.add_downlink_bytes(200);
+        assert_eq!(session.uplink_bytes(), 100);
+        assert_eq!(session.downlink_bytes(), 200);
+        session.add_uplink_bytes(50);
+        session.add_downlink_bytes(150);
+        assert_eq!(session.uplink_bytes(), 150);
+        assert_eq!(session.downlink_bytes(), 350);
+    }
+
+    // ========== 空闲超时测试 ==========
+
+    #[tokio::test]
+    async fn test_session_not_idle_initially() {
+        let session = Session::new(1, TransferType::Stream);
+        assert!(!session.is_idle_timeout(SESSION_IDLE_TIMEOUT).await);
+    }
+
+    #[tokio::test]
+    async fn test_session_touch_active_updates_time() {
+        let session = Session::new(1, TransferType::Stream);
+        // 先等一小段时间
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // touch_active 应重置活跃时间
+        session.touch_active().await;
+        assert!(!session.is_idle_timeout(Duration::from_millis(1)).await);
+    }
+
+    #[tokio::test]
+    async fn test_session_idle_timeout_constant() {
+        assert_eq!(SESSION_IDLE_TIMEOUT, Duration::from_secs(300));
     }
 }

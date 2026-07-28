@@ -304,6 +304,58 @@ impl ClientWorker {
             Network::TCP,
         )
     }
+
+    /// 启动 KeepAlive 定时发送任务。
+    ///
+    /// 对应 Go 版本 `ClientWorker.monitor` 中的 timer 逻辑。
+    /// 客户端每 16 秒向所有活跃 session 发送 KeepAlive 帧。
+    /// 同时检查空闲超时，关闭空闲超过 300 秒的 session。
+    pub fn spawn_keepalive(
+        &self,
+        link_writer: Arc<tokio::sync::Mutex<Option<Box<dyn xray_buf::io::Writer>>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        use crate::frame::FrameMetadata;
+        use crate::session::SESSION_IDLE_TIMEOUT;
+        use xray_buf::buffer::Buffer;
+        use xray_buf::multi::MultiBuffer;
+        use tracing::warn;
+
+        let session_manager = Arc::clone(&self.session_manager);
+        let mut done_rx = self.done_rx.clone();
+        let lw = link_writer;
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(CLIENT_KEEPALIVE_INTERVAL);
+            loop {
+                tokio::select! {
+                    _ = done_rx.changed() => break,
+                    _ = interval.tick() => {
+                        // 向所有活跃 session 发送 KeepAlive 帧
+                        let sessions = session_manager.active_sessions().await;
+                        for session in &sessions {
+                            if session.is_closed() { continue; }
+                            let meta = FrameMetadata::keep_alive(session.id());
+                            let mut vec = Vec::new();
+                            if meta.write_to(&mut vec).is_err() { continue; }
+                            let mb = MultiBuffer::from_buffer(Buffer::from_vec(vec));
+                            let mut wg = lw.lock().await;
+                            if let Some(ref mut writer) = *wg {
+                                let _ = writer.write_multi_buffer(mb).await;
+                            }
+                        }
+                        // 检查空闲超时
+                        for session in sessions {
+                            if session.is_closed() { continue; }
+                            if session.is_idle_timeout(SESSION_IDLE_TIMEOUT).await {
+                                warn!("client session {} idle timeout, closing", session.id());
+                                session.close().await;
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
 }
 
 // ========== DialingWorkerFactory ==========
