@@ -175,6 +175,12 @@ fn random_auth_padding() -> String {
 mod tests {
     use super::*;
 
+    /// 确保 rustls CryptoProvider 在并行测试中只初始化一次
+    fn ensure_crypto_provider() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
+    }
+
     #[test]
     fn random_auth_padding_length_in_range() {
         for _ in 0..20 {
@@ -190,6 +196,7 @@ mod tests {
 
     #[test]
     fn new_sets_alpn_h3_and_constructs() {
+        ensure_crypto_provider();
         let tls = rustls::ClientConfig::builder()
             .with_root_certificates(rustls::RootCertStore::empty())
             .with_no_client_auth();

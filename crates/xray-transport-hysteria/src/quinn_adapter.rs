@@ -208,10 +208,17 @@ impl QuicConn for QuinnQuicConn {
 mod tests {
     use super::*;
 
+    /// 确保 rustls CryptoProvider 在并行测试中只初始化一次
+    fn ensure_crypto_provider() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
+    }
+
     /// 辅助：构造一对 QuinnQuicConn 对接（loopback）。
     /// 返回 (client_conn, server_conn, server_endpoint)——endpoint 必须由调用方持有，
     /// 否则 drop 后连接进入 idle 关闭流程（30s 后 accept_bi 超时）。
     async fn make_loopback_conn_pair() -> (QuinnQuicConn, QuinnQuicConn, std::sync::Arc<quinn::Endpoint>) {
+        ensure_crypto_provider();
         // 生成自签证书
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert_der = cert.cert.der().clone();
