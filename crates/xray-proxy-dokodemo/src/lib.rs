@@ -14,8 +14,10 @@
 pub mod config;
 pub mod error;
 pub mod server;
+pub mod outbound;
 
 // 顶层 re-export。
 pub use config::{Config, Network, PredefinedAddress};
 pub use error::{DokodemoError, Result};
 pub use server::DokodemoServer;
+pub use outbound::{DokodemoOutboundConfig, make_dokodemo_dial_fn};

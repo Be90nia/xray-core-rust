@@ -45,6 +45,8 @@ use xray_proxy_wireguard::DeviceConfig;
 use xray_transport_hysteria::hub::StubListenerFactory;
 use xray_features::inbound::InboundHandler;
 use tokio::net::UdpSocket;
+use xray_proxy_blackhole::{BlackholeInboundHandler, ResponseConfig as BlackholeResponseConfig};
+use xray_proxy_freedom::FreedomInboundHandler;
 
 /// SOCKS5 inbound 服务入口。
 ///
@@ -582,6 +584,30 @@ async fn spawn_one_inbound(
             // LoopbackHandler 的 InboundHandler::start 是 no-op，不 spawn task
             Ok(None)
         }
+        // blackhole inbound：accept 连接后静默关闭/写 403 后关闭
+        "blackhole" => {
+            let response = parse_blackhole_inbound_response(&ib.entry.data);
+            let handler = BlackholeInboundHandler::new(&ib.tag, response, &addr);
+            handler.start().await
+                .map_err(|e| std::io::Error::other(format!("blackhole inbound: {e}")))?;
+            let handle = tokio::spawn(async move {
+                // accept 循环在 start() 内部 spawn，此 task 保持 handler 存活
+                std::future::pending::<()>().await
+            });
+            Ok(Some(handle))
+        }
+        // freedom inbound：accept 连接后 dial 预定义目标并双向转发
+        "freedom" => {
+            let dest = parse_freedom_inbound_dest(&ib.entry.data)?;
+            let handler = FreedomInboundHandler::new(&ib.tag, &addr, dest, Arc::clone(&ohm));
+            handler.start().await
+                .map_err(|e| std::io::Error::other(format!("freedom inbound: {e}")))?;
+            let handle = tokio::spawn(async move {
+                // accept 循环在 start() 内部 spawn，此 task 保持 handler 存活
+                std::future::pending::<()>().await
+            });
+            Ok(Some(handle))
+        }
         other => {
             tracing::warn!(
                 tag = %ib.tag,
@@ -1041,6 +1067,47 @@ fn parse_duration_suffix(s: &str) -> std::io::Result<std::time::Duration> {
         total_secs += n;
     }
     Ok(std::time::Duration::from_secs(total_secs))
+}
+
+/// 从 inbound entry.data（JSON）解析 blackhole inbound 响应配置。
+///
+/// JSON 格式：`{"response":{"type":"none"}}` 或 `{"response":{"type":"http"}}`。
+/// 缺省时默认 None。
+fn parse_blackhole_inbound_response(data: &[u8]) -> BlackholeResponseConfig {
+    if data.is_empty() {
+        return BlackholeResponseConfig::None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(data).unwrap_or_default();
+    let response_type = v.get("response")
+        .and_then(|r| r.get("type"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("none");
+    match response_type {
+        "http" => BlackholeResponseConfig::Http403,
+        _ => BlackholeResponseConfig::None,
+    }
+}
+
+/// 从 inbound entry.data（JSON）解析 freedom inbound 预定义目标地址。
+///
+/// JSON 格式：`{"address":"1.2.3.4","port":80}`（address+port 必填）。
+/// 类似 dokodemo 的配置格式。
+fn parse_freedom_inbound_dest(data: &[u8]) -> std::io::Result<Destination> {
+    let v: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| std::io::Error::other(format!("freedom inbound settings JSON: {e}")))?;
+    let address_str = v.get("address").and_then(|x| x.as_str())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "freedom inbound: missing address"))?;
+    let port = v.get("port").and_then(|x| x.as_u64())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "freedom inbound: missing port"))?
+        as u16;
+    let address = if let Ok(v4) = address_str.parse::<std::net::Ipv4Addr>() {
+        Address::IPv4(v4)
+    } else if let Ok(v6) = address_str.parse::<std::net::Ipv6Addr>() {
+        Address::IPv6(v6)
+    } else {
+        Address::Domain(address_str.to_string())
+    };
+    Ok(Destination::new(address, Port::new(port), Network::TCP))
 }
 #[cfg(test)]
 mod tests {

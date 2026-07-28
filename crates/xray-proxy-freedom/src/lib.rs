@@ -12,6 +12,7 @@ pub mod config;
 pub mod dispatcher;
 pub mod error;
 pub mod handler;
+pub mod inbound;
 
 pub use config::{
     Config, DestinationOverride, FinalRule, FinalRuleConfig, Fragment, Noise, Range,
@@ -21,3 +22,4 @@ pub use config::{
 pub use error::{FreedomError, Result};
 pub use handler::FreedomHandler;
 pub use dispatcher::make_dial_fn as make_freedom_dial_fn;
+pub use inbound::FreedomInboundHandler;

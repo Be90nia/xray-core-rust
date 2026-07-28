@@ -15,8 +15,10 @@
 pub mod response;
 pub mod handler;
 pub mod dispatcher;
+pub mod inbound;
 
 pub use handler::{BlackholeError, Handler};
 pub use response::{get_internal_response, ResponseConfig};
 pub use dispatcher::{make_blackhole_handler, BlackholeHandler};
+pub use inbound::BlackholeInboundHandler;
 pub use xray_proto::xray::proxy::blackhole::Config;

@@ -20,8 +20,8 @@
 //! - **dns**：JSON 解析 → `DnsDispatchBridge`（拦截 DNS 查询并转发）
 //! - **loopback**：JSON 解析 → LoopbackHandler（直接 impl DispatchHandler）
 //! - **http**：JSON 解析 `servers[0]` → `HttpOutboundConfig` → `make_http_dial_fn`
-//! - **dokodemo**：dokodemo 是 inbound-only，outbound 为 NoopBridge
-//!
+//! - **dokodemo**：JSON 解析 → `DokodemoOutboundConfig` → `make_dokodemo_dial_fn`（拨号到配置的 rewrite_address:rewrite_port）
+//! - **tun**：`make_tun_dial_fn`（系统拨号，TUN 路由由 OS 处理）
 //! ## streamSettings
 //!
 //! 当前不处理 streamSettings（TLS/WS/Reality）—— vless/trojan 走裸 TCP `dial_system`。
@@ -208,9 +208,16 @@ fn try_build_handler(
             let dial_fn = xray_proxy_http::make_http_dial_fn(Arc::new(config));
             Ok(Arc::new(DialBridge::new(ob.tag.clone(), dial_fn)))
         }
-        // dokodemo 是 inbound-only 协议，outbound 注册为 stub
+        // dokodemo outbound：解析配置 → DokodemoOutboundConfig → make_dokodemo_dial_fn
         "dokodemo" => {
-            Ok(Arc::new(StubDispatchBridge::new(ob.tag.clone(), "dokodemo")))
+            let config = parse_dokodemo_config(&ob.entry.data)?;
+            let dial_fn = xray_proxy_dokodemo::make_dokodemo_dial_fn(config);
+            Ok(Arc::new(DialBridge::new(ob.tag.clone(), dial_fn)))
+        }
+        // tun outbound：系统拨号（TUN 路由由 OS 处理）
+        "tun" => {
+            let dial_fn = xray_proxy_tun::make_tun_dial_fn();
+            Ok(Arc::new(DialBridge::new(ob.tag.clone(), dial_fn)))
         }
         other => Err(BuildError::Unsupported(other.to_string())), 
     }
@@ -429,9 +436,8 @@ fn parse_stream_settings(json: &Option<serde_json::Value>) -> Option<StreamSetti
 // ========== StubDispatchBridge：协议 stub 注册 ==========
 
 /// 通用 stub outbound handler：dispatch 仅 log + drop link。
-///
-/// 用于尚未完整实现拨号链路的协议（hysteria/tuic/wireguard/dokodemo）。
-/// 注册到 SimpleOhm 后，配置中引用该 tag 不会报错，但流量会被丢弃。
+/// 用于尚未完整实现拨号链路的协议。注册到 SimpleOhm 后，配置中引用该 tag 不会报错，
+/// 但流量会被丢弃。
 pub struct StubDispatchBridge {
     tag: String,
     protocol: String,
@@ -747,6 +753,36 @@ fn parse_loopback_config(data: &[u8]) -> std::result::Result<String, String> {
         .ok_or_else(|| "missing inboundTag".to_string())
 }
 
+/// 解析 dokodemo outbound settings JSON → DokodemoOutboundConfig。
+///
+/// JSON 格式：`{ "address": "1.2.3.4", "port": 443 }`。
+/// address 支持域名和 IP；port 必须 0-65535。
+fn parse_dokodemo_config(data: &[u8]) -> std::result::Result<xray_proxy_dokodemo::DokodemoOutboundConfig, String> {
+    let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
+    let address_str = v
+        .get("address")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing address".to_string())?;
+    let port = v
+        .get("port")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "missing port".to_string())?;
+    let port = u16::try_from(port).map_err(|_| "port out of range")?;
+    let address = if let Ok(ip) = address_str.parse::<std::net::IpAddr>() {
+        match ip {
+            std::net::IpAddr::V4(v4) => Address::IPv4(v4),
+            std::net::IpAddr::V6(v6) => Address::IPv6(v6),
+        }
+    } else {
+        Address::Domain(address_str.to_string())
+    };
+    Ok(xray_proxy_dokodemo::DokodemoOutboundConfig::new(
+        address,
+        Port::new(port),
+        xray_common::net::network::Network::TCP,
+    ))
+}
+
 #[derive(Debug)]
 enum BuildError {
     Unsupported(String),
@@ -844,15 +880,26 @@ mod tests {
     }
 
     #[test]
-    fn register_stub_protocol_registered() {
+    fn register_dokodemo_parses_config() {
+        let settings = r#"{ "address": "192.168.1.1", "port": 8080 }"#;
         let mut built = BuiltConfig::default();
-        built.outbounds.push(make_outbound("dokodemo", "dokodemo-out", "{}"));
+        built.outbounds.push(make_outbound("dokodemo", "dokodemo-out", settings));
 
         let ohm = SimpleOhm::new();
         register_outbounds(&built, &ohm).unwrap();
 
-        // dokodemo is inbound-only, registered as StubDispatchBridge
-        assert!(ohm.get_handler("dokodemo-out").is_some(), "dokodemo should be registered as stub");
+        assert!(ohm.get_handler("dokodemo-out").is_some(), "dokodemo should be registered");
+    }
+
+    #[test]
+    fn register_tun_outbound() {
+        let mut built = BuiltConfig::default();
+        built.outbounds.push(make_outbound("tun", "tun-out", "{}"));
+
+        let ohm = SimpleOhm::new();
+        register_outbounds(&built, &ohm).unwrap();
+
+        assert!(ohm.get_handler("tun-out").is_some(), "tun should be registered");
     }
 
     #[test]
