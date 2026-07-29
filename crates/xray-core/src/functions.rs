@@ -24,6 +24,7 @@ use xray_features::FeatureError;
 use crate::inbound::spawn_inbounds;
 use crate::outbound::register_outbounds;
 use crate::router::{DispatchRouter, RoutingHandler};
+use crate::register::register_all_features;
 use xray_app_dispatcher::default::SimpleOhm;
 use xray_app_dispatcher::{DispatchHandler, OutboundHandlerManager};
 
@@ -73,6 +74,7 @@ impl From<xray_conf::ConfError> for CoreFunctionError {
 /// 对应 Go `core.New(config)` + `instance.Start()` 组合。**不阻塞**：调用方需自行管理
 /// instance 生命周期（如等待信号、监听关闭事件）。
 pub fn start_from_built(built: &xray_conf::BuiltConfig) -> Result<Arc<Instance>, CoreFunctionError> {
+    register_all_features();
     let mut instance = Instance::new_from_built(built)?;
     instance.start()?;
     Ok(Arc::new(instance))
@@ -110,6 +112,7 @@ pub async fn start_full(
 async fn start_full_no_router(
     built: &xray_conf::BuiltConfig,
 ) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
+    register_all_features();
     let mut instance = Instance::new_from_built(built)?;
     let ohm = Arc::new(SimpleOhm::new());
     register_outbounds(built, &ohm)?;
@@ -132,6 +135,7 @@ pub async fn start_full_with_router(
     built: &xray_conf::BuiltConfig,
     router: Arc<dyn DispatchRouter>,
 ) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
+    register_all_features();
     let mut instance = Instance::new_from_built(built)?;
     let ohm = Arc::new(SimpleOhm::new());
     register_outbounds(built, &ohm)?;
@@ -184,6 +188,7 @@ pub fn start_instance(
         .map_err(|e| CoreFunctionError::ConfigLoad(format!("config is not valid UTF-8: {e}")))?;
     let config = xray_conf::Config::from_json_str(json_str)
         .map_err(|e| CoreFunctionError::ConfigLoad(e.to_string()))?;
+    register_all_features();
     let built = config.build()?;
     start_from_built(&built)
 }

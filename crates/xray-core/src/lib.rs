@@ -39,6 +39,7 @@ pub mod context;
 pub mod functions;
 pub mod instance;
 pub mod outbound;
+pub mod register;
 pub mod router;
 pub mod inbound;
 pub mod version;
@@ -52,3 +53,4 @@ pub use version::{version, version_statement, VERSION_X, VERSION_Y, VERSION_Z};
 pub use xray_features::{Feature, FeatureError};
 
 pub use functions::{start_from_built, start_instance, CoreFunctionError};
+pub use register::register_all_features;
