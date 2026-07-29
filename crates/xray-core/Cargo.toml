@@ -31,6 +31,28 @@ xray-buf = { path = "../xray-buf" }
 xray-transport = { path = "../xray-transport" }
 xray-proto = { path = "../xray-proto" }
 xray-transport-hysteria = { path = "../xray-transport-hysteria" }
+xray-transport-grpc = { path = "../xray-transport-grpc" }
+xray-transport-httpupgrade = { path = "../xray-transport-httpupgrade" }
+xray-transport-kcp = { path = "../xray-transport-kcp" }
+xray-transport-splithttp = { path = "../xray-transport-splithttp" }
+xray-transport-websocket = { path = "../xray-transport-websocket" }
+xray-app-commander = { path = "../xray-app-commander" }
+xray-app-dns = { path = "../xray-app-dns" }
+xray-app-geodata = { path = "../xray-app-geodata" }
+xray-app-log = { path = "../xray-app-log" }
+xray-app-metrics = { path = "../xray-app-metrics" }
+xray-app-observatory = { path = "../xray-app-observatory" }
+xray-app-policy = { path = "../xray-app-policy" }
+xray-app-proxyman = { path = "../xray-app-proxyman" }
+xray-app-reverse = { path = "../xray-app-reverse" }
+xray-app-router = { path = "../xray-app-router" }
+xray-app-stats = { path = "../xray-app-stats" }
+xray-app-version = { path = "../xray-app-version" }
+xray-crypto = { path = "../xray-crypto" }
+xray-geodata = { path = "../xray-geodata" }
+xray-reality = { path = "../xray-reality" }
+xray-tls = { path = "../xray-tls" }
+xray-xudp = { path = "../xray-xudp" }
 tokio-rustls = { workspace = true }
 rcgen = "0.13"
 rustls-pemfile = "2"
