@@ -10,11 +10,13 @@
 //! - [`InboundManager`] — Go `Manager struct`：tagged + untyped 双 map + 启停状态
 //! - [`AlwaysOnInboundHandler`] — Go `AlwaysOnInboundHandler`：配置载体 + counter 引用
 //!
-//! IO 边界（trait + TODO 占位）：
-//! - worker 创建（tcpWorker/udpWorker/dsWorker）— 依赖 `xray_transport::Listener` +
-//!   `xray_mux::Server` + `xray_internet::ListenTCP/ListenUDP/ListenUnix`
-//! - `AlwaysOnInboundHandler::start` / `close` — 当前迭代空 workers，等 worker 注入后激活
+//!
+//! IO 边界：
+//! - worker 创建（tcpWorker/udpWorker/dsWorker）— 已在 [`worker`] 模块实现
+//! - `AlwaysOnInboundHandler::start` / `close` — 迭代 workers 启停
 //! - proxy.Process — 依赖具体代理 crate + Dispatcher
+
+pub mod worker;
 
 use crate::config::SniffingRequest;
 use crate::error::ProxymanError;
@@ -90,18 +92,23 @@ impl InboundManager {
     ///
     /// # Errors
     /// - [`ProxymanError::ExistingTag`]：tag 已存在
-    pub fn add_handler(&self, handler: Arc<dyn InboundHandler>) -> Result<(), ProxymanError> {
-        let mut state = self.state.write();
+    pub async fn add_handler(&self, handler: Arc<dyn InboundHandler>) -> Result<(), ProxymanError> {
         let tag = handler.tag().to_string();
-        if !tag.is_empty() {
-            if state.tagged.contains_key(&tag) {
-                return Err(ProxymanError::ExistingTag(tag));
+        {
+            let mut state = self.state.write();
+            if !tag.is_empty() {
+                if state.tagged.contains_key(&tag) {
+                    return Err(ProxymanError::ExistingTag(tag));
+                }
+                state.tagged.insert(tag, handler.clone());
+            } else {
+                state.untagged.push(handler.clone());
             }
-            state.tagged.insert(tag, handler);
-        } else {
-            state.untagged.push(handler);
         }
-        // ponytail: 运行时启动新 handler 的语义留到 start/close 全套接入后实现
+        // Go 行为：如果 manager 已在运行，立即启动新 handler
+        if self.running.load(Ordering::SeqCst) {
+            handler.start().await?;
+        }
         Ok(())
     }
 
@@ -120,17 +127,25 @@ impl InboundManager {
 
     /// 移除 handler（对应 Go `RemoveHandler(ctx, tag) error`）
     ///
+    /// Go 行为：先关闭 handler，再从 map 移除。
+    ///
     /// # Errors
     /// - [`ProxymanError::NoClue`]：tag 为空 或 不存在（Go `common.ErrNoClue`）
-    pub fn remove_handler(&self, tag: &str) -> Result<(), ProxymanError> {
+    pub async fn remove_handler(&self, tag: &str) -> Result<(), ProxymanError> {
         if tag.is_empty() {
             return Err(ProxymanError::NoClue);
         }
-        let mut state = self.state.write();
-        if state.tagged.remove(tag).is_some() {
-            Ok(())
-        } else {
-            Err(ProxymanError::NoClue)
+        let handler = {
+            let mut state = self.state.write();
+            state.tagged.remove(tag)
+        };
+        match handler {
+            Some(h) => {
+                // Go 行为：关闭 handler 再移除
+                let _ = h.close().await;
+                Ok(())
+            }
+            None => Err(ProxymanError::NoClue),
         }
     }
 
@@ -212,6 +227,10 @@ pub struct AlwaysOnInboundHandler {
     sniffing_request: SniffingRequest,
     uplink_counter: Option<Arc<dyn Counter>>,
     downlink_counter: Option<Arc<dyn Counter>>,
+    /// 入站 workers（对应 Go `workers []worker`）。
+    workers: Vec<Arc<dyn worker::Worker>>,
+    /// 入站代理实例（对应 Go `proxy proxy.Inbound`）。
+    proxy: Option<Arc<dyn worker::ProxyInbound>>,
 }
 
 impl std::fmt::Debug for AlwaysOnInboundHandler {
@@ -219,6 +238,8 @@ impl std::fmt::Debug for AlwaysOnInboundHandler {
         f.debug_struct("AlwaysOnInboundHandler")
             .field("tag", &self.tag)
             .field("proxy_type_url", &self.proxy_type_url)
+            .field("worker_count", &self.workers.len())
+            .field("has_proxy", &self.proxy.is_some())
             .field("has_uplink_counter", &self.uplink_counter.is_some())
             .field("has_downlink_counter", &self.downlink_counter.is_some())
             .finish()
@@ -254,8 +275,12 @@ impl AlwaysOnInboundHandler {
             sniffing_request,
             uplink_counter: up,
             downlink_counter: down,
+            workers: Vec::new(),
+            proxy: None,
         }
     }
+
+    /// 引用 sniffing_request
 
     /// 引用 sniffing_request
     #[must_use]
@@ -274,6 +299,22 @@ impl AlwaysOnInboundHandler {
     pub fn downlink_counter(&self) -> Option<&Arc<dyn Counter>> {
         self.downlink_counter.as_ref()
     }
+
+    /// 添加 worker（对应 Go `h.workers = append(h.workers, worker)`）。
+    pub fn add_worker(&mut self, worker: Arc<dyn worker::Worker>) {
+        self.workers.push(worker);
+    }
+
+    /// 设置代理实例（对应 Go `h.proxy = p`）。
+    pub fn set_proxy(&mut self, proxy: Arc<dyn worker::ProxyInbound>) {
+        self.proxy = Some(proxy);
+    }
+
+    /// worker 数量。
+    #[must_use]
+    pub fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
 }
 
 impl InboundHandler for AlwaysOnInboundHandler {
@@ -282,13 +323,30 @@ impl InboundHandler for AlwaysOnInboundHandler {
     }
 
     fn start(&self) -> PinFuture<Result<(), ProxymanError>> {
-        // ponytail: workers 列表为空（依赖 xray_transport::Listener），TODO 接入后迭代启动
-        Box::pin(async { Ok(()) })
+        let workers: Vec<Arc<dyn worker::Worker>> = self.workers.clone();
+        Box::pin(async move {
+            for w in &workers {
+                w.start().await?;
+            }
+            Ok(())
+        })
     }
 
     fn close(&self) -> PinFuture<Result<(), ProxymanError>> {
-        // ponytail: 同上，无 worker 可关
-        Box::pin(async { Ok(()) })
+        let workers: Vec<Arc<dyn worker::Worker>> = self.workers.clone();
+        Box::pin(async move {
+            let mut errs = Vec::new();
+            for w in &workers {
+                if let Err(e) = w.close().await {
+                    errs.push(e.to_string());
+                }
+            }
+            if errs.is_empty() {
+                Ok(())
+            } else {
+                Err(ProxymanError::CloseAllFailed(errs.join("; ")))
+            }
+        })
     }
 
     fn receiver_settings(&self) -> Option<&ReceiverConfig> {
@@ -362,30 +420,30 @@ mod tests {
         assert!(!m.is_running());
     }
 
-    #[test]
-    fn manager_add_tagged_handler() {
+    #[tokio::test]
+    async fn manager_add_tagged_handler() {
         let m = InboundManager::new();
-        m.add_handler(make_handler("http")).unwrap();
+        m.add_handler(make_handler("http")).await.unwrap();
         assert_eq!(m.handler_count(), 1);
         assert!(m.get_handler("http").is_ok());
     }
 
-    #[test]
-    fn manager_add_duplicate_tag_returns_existing_tag_error() {
+    #[tokio::test]
+    async fn manager_add_duplicate_tag_returns_existing_tag_error() {
         let m = InboundManager::new();
-        m.add_handler(make_handler("http")).unwrap();
-        match m.add_handler(make_handler("http")) {
+        m.add_handler(make_handler("http")).await.unwrap();
+        match m.add_handler(make_handler("http")).await {
             Err(ProxymanError::ExistingTag(t)) => assert_eq!(t, "http"),
             Err(e) => panic!("expected ExistingTag, got: {e}"),
-    Ok(_) => panic!("expected error, got Ok"),
+            Ok(_) => panic!("expected error, got Ok"),
         }
     }
 
-    #[test]
-    fn manager_add_untagged_handler() {
+    #[tokio::test]
+    async fn manager_add_untagged_handler() {
         let m = InboundManager::new();
-        m.add_handler(make_handler("")).unwrap();
-        m.add_handler(make_handler("")).unwrap();
+        m.add_handler(make_handler("")).await.unwrap();
+        m.add_handler(make_handler("")).await.unwrap();
         assert_eq!(m.handler_count(), 2);
     }
 
@@ -395,44 +453,44 @@ mod tests {
         match m.get_handler("missing") {
             Err(ProxymanError::HandlerNotFound(t)) => assert_eq!(t, "missing"),
             Err(e) => panic!("expected HandlerNotFound, got: {e}"),
-    Ok(_) => panic!("expected error, got Ok"),
+            Ok(_) => panic!("expected error, got Ok"),
         }
     }
 
-    #[test]
-    fn manager_remove_handler() {
+    #[tokio::test]
+    async fn manager_remove_handler() {
         let m = InboundManager::new();
-        m.add_handler(make_handler("socks")).unwrap();
-        assert!(m.remove_handler("socks").is_ok());
+        m.add_handler(make_handler("socks")).await.unwrap();
+        assert!(m.remove_handler("socks").await.is_ok());
         assert_eq!(m.handler_count(), 0);
     }
 
-    #[test]
-    fn manager_remove_unknown_returns_no_clue() {
+    #[tokio::test]
+    async fn manager_remove_unknown_returns_no_clue() {
         let m = InboundManager::new();
-        match m.remove_handler("ghost") {
+        match m.remove_handler("ghost").await {
             Err(ProxymanError::NoClue) => (),
             Err(e) => panic!("expected NoClue, got: {e}"),
-    Ok(_) => panic!("expected error, got Ok"),
+            Ok(_) => panic!("expected error, got Ok"),
         }
     }
 
-    #[test]
-    fn manager_remove_empty_tag_returns_no_clue() {
+    #[tokio::test]
+    async fn manager_remove_empty_tag_returns_no_clue() {
         let m = InboundManager::new();
-        match m.remove_handler("") {
+        match m.remove_handler("").await {
             Err(ProxymanError::NoClue) => (),
             Err(e) => panic!("expected NoClue, got: {e}"),
-    Ok(_) => panic!("expected error, got Ok"),
+            Ok(_) => panic!("expected error, got Ok"),
         }
     }
 
-    #[test]
-    fn manager_list_handlers_includes_tagged_and_untagged() {
+    #[tokio::test]
+    async fn manager_list_handlers_includes_tagged_and_untagged() {
         let m = InboundManager::new();
-        m.add_handler(make_handler("a")).unwrap();
-        m.add_handler(make_handler("")).unwrap();
-        m.add_handler(make_handler("b")).unwrap();
+        m.add_handler(make_handler("a")).await.unwrap();
+        m.add_handler(make_handler("")).await.unwrap();
+        m.add_handler(make_handler("b")).await.unwrap();
         let list = m.list_handlers();
         assert_eq!(list.len(), 3);
         let tags: Vec<&str> = list.iter().map(|h| h.tag()).collect();
@@ -445,7 +503,7 @@ mod tests {
     async fn manager_start_marks_running_and_starts_handlers() {
         let m = InboundManager::new();
         let h = Arc::new(StubHandler::new("x"));
-        m.add_handler(h.clone()).unwrap();
+        m.add_handler(h.clone()).await.unwrap();
         assert!(!h.is_started());
         m.start().await.unwrap();
         assert!(m.is_running());
@@ -456,7 +514,7 @@ mod tests {
     async fn manager_close_marks_not_running_and_closes_handlers() {
         let m = InboundManager::new();
         let h = Arc::new(StubHandler::new("y"));
-        m.add_handler(h.clone()).unwrap();
+        m.add_handler(h.clone()).await.unwrap();
         m.start().await.unwrap();
         m.close().await.unwrap();
         assert!(!m.is_running());

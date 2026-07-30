@@ -9,12 +9,16 @@ rust-version.workspace = true
 xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
 xray-proto = { path = "../xray-proto" }
+xray-transport = { path = "../xray-transport" }
+xray-mux = { path = "../xray-mux" }
+xray-buf = { path = "../xray-buf" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true }
 ipnet = "2"
+async-trait = { workspace = true }
 
 [dev-dependencies]
 xray-proto = { path = "../xray-proto" }

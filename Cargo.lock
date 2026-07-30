@@ -5577,15 +5577,19 @@ dependencies = [
 name = "xray-app-proxyman"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "ipnet",
  "parking_lot",
  "rand 0.9.4",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "xray-buf",
  "xray-common",
  "xray-features",
+ "xray-mux",
  "xray-proto",
+ "xray-transport",
 ]
 
 [[package]]
