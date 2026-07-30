@@ -22,6 +22,56 @@
 //! IP CIDR 匹配依赖 `geodata::IPMatcher`，留切片2（当前 match_ip 返回 true）。
 //! Handler/Process/dial/retry 留切片2。
 
+/// DNS 解析策略。对应 Go `proxy/freedom/config.proto` DomainStrategy。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(i32)]
+pub enum DomainStrategy {
+    /// AS_IS: 直接拨号，让 OS 解析域名（默认）
+    #[default]
+    AsIs = 0,
+    /// USE_IP: 解析域名到 IP（IPv4 或 IPv6）
+    UseIP = 1,
+    /// USE_IP4: 解析域名到 IPv4
+    UseIPv4 = 2,
+    /// USE_IP6: 解析域名到 IPv6
+    UseIPv6 = 3,
+    /// USE_IP46: 优先 IPv4，回退 IPv6
+    UseIPv4v6 = 4,
+    /// USE_IP64: 优先 IPv6，回退 IPv4
+    UseIPv6v4 = 5,
+}
+
+impl DomainStrategy {
+    #[must_use]
+    pub fn from_i32(v: i32) -> Self {
+        match v {
+            1 => Self::UseIP,
+            2 => Self::UseIPv4,
+            3 => Self::UseIPv6,
+            4 => Self::UseIPv4v6,
+            5 => Self::UseIPv6v4,
+            _ => Self::AsIs,
+        }
+    }
+
+    /// 是否需要 DNS 解析
+    #[must_use]
+    pub fn needs_resolution(self) -> bool {
+        !matches!(self, Self::AsIs)
+    }
+
+    /// 解析后是否只接受 IPv4
+    #[must_use]
+    pub fn ipv4_only(self) -> bool {
+        matches!(self, Self::UseIPv4 | Self::UseIPv4v6)
+    }
+
+    /// 解析后是否只接受 IPv6
+    #[must_use]
+    pub fn ipv6_only(self) -> bool {
+        matches!(self, Self::UseIPv6 | Self::UseIPv6v4)
+    }
+}
 use crate::error::Result;
 
 /// RuleAction 枚举。对应 proto `RuleAction`。

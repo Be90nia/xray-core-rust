@@ -15,7 +15,7 @@ pub mod handler;
 pub mod inbound;
 
 pub use config::{
-    Config, DestinationOverride, FinalRule, FinalRuleConfig, Fragment, Noise, Range,
+    Config, DestinationOverride, DomainStrategy, FinalRule, FinalRuleConfig, Fragment, Noise, Range,
     RuleAction, ALL_NETWORKS, DEFAULT_BLOCK_PRIVATE_CIDRS, DefaultRuleType,
     get_default_rule_type,
 };

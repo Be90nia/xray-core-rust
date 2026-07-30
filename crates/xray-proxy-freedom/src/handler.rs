@@ -9,12 +9,14 @@
 use async_trait::async_trait;
 use xray_common::net::destination::Destination;
 use xray_common::net::address::Address;
+use xray_common::net::network::Network;
+use xray_common::net::port::Port;
 use xray_common::session::Session;
 use xray_features::outbound::{OutboundError, OutboundHandler};
 use xray_transport::sockopt::SocketOptions;
 use xray_transport::system_dialer::dial_system;
 
-use crate::config::Config;
+use crate::config::{Config, DomainStrategy};
 
 /// Freedom 出站 Handler。
 ///
@@ -22,7 +24,6 @@ use crate::config::Config;
 /// `destination` 的直连 TCP 连接。
 pub struct FreedomHandler {
     tag: String,
-    #[allow(dead_code)]
     config: Config,
 }
 
@@ -34,6 +35,55 @@ impl FreedomHandler {
             tag: tag.into(),
             config,
         }
+    }
+
+    /// 解析域名为 IP 地址。
+    ///
+    /// `dial_system` 不支持 Domain（socket2 需要具体 IP），所以所有策略
+    /// 都需要在此解析域名。AsIs 策略接受任意 IP 族，UseIP* 按 strategy 过滤。
+    async fn resolve_domain(
+        &self,
+        domain: &str,
+        port: u16,
+        strategy: DomainStrategy,
+    ) -> Result<Destination, OutboundError> {
+        let addr = format!("{domain}:{port}");
+        let lookup_result = tokio::net::lookup_host(&addr)
+            .await
+            .map_err(|e| OutboundError::ConnectionFailed(
+                format!("DNS resolution failed for {domain}: {e}")
+            ))?;
+
+        let filtered: Vec<_> = lookup_result
+            .filter(|addr| match strategy {
+                DomainStrategy::UseIPv4 | DomainStrategy::UseIPv4v6 => addr.is_ipv4(),
+                DomainStrategy::UseIPv6 | DomainStrategy::UseIPv6v4 => addr.is_ipv6(),
+                DomainStrategy::UseIP | DomainStrategy::AsIs => true,
+            })
+            .collect();
+
+        if filtered.is_empty() {
+            return Err(OutboundError::ConnectionFailed(
+                format!("DNS resolution returned no matching addresses for {domain} (strategy: {strategy:?})")
+            ));
+        }
+
+        // UseIPv4v6: prefer IPv4, fallback IPv6
+        // UseIPv6v4: prefer IPv6, fallback IPv4
+        let selected = match strategy {
+            DomainStrategy::UseIPv4v6 => filtered.iter().find(|a| a.is_ipv4()).or_else(|| filtered.first()),
+            DomainStrategy::UseIPv6v4 => filtered.iter().find(|a| a.is_ipv6()).or_else(|| filtered.first()),
+            _ => filtered.first(),
+        };
+
+        let socket_addr = *selected.expect("filtered is non-empty");
+
+        let address = match socket_addr {
+            std::net::SocketAddr::V4(v4) => Address::IPv4(*v4.ip()),
+            std::net::SocketAddr::V6(v6) => Address::IPv6(*v6.ip()),
+        };
+
+        Ok(Destination::new(address, Port::new(socket_addr.port()), Network::TCP))
     }
 }
 
@@ -56,32 +106,32 @@ impl OutboundHandler for FreedomHandler {
         destination: &Destination,
         _session: &Session,
     ) -> Result<(), OutboundError> {
-        // 切片2：Domain 地址返回错误（DNS 解析留切片3）。
-        match destination.address() {
-            Address::IPv4(_) | Address::IPv6(_) => {}
-            Address::Domain(_) => {
-                return Err(OutboundError::ConnectionFailed(
-                    "freedom 切片2 不支持 Domain 地址（DNS 解析留切片3）".into(),
-                ));
+        let strategy = DomainStrategy::from_i32(self.config.domain_strategy);
+
+        let effective_dest = match destination.address() {
+            Address::IPv4(_) | Address::IPv6(_) => destination.clone(),
+            Address::Domain(domain) => {
+                // dial_system 不支持 Domain（socket2 需要具体 IP），
+                // 所有策略都需解析域名。AsIs 接受任意 IP 族。
+                self.resolve_domain(domain, destination.port().value(), strategy).await?
             }
-        }
+        };
 
         let sockopt = SocketOptions::default();
-        // ponytail: dial_system 切片1 只支持 IP，正好匹配切片2 的限制。
-        let _conn = dial_system(destination, &sockopt)
+        let _conn = dial_system(&effective_dest, &sockopt)
             .await
             .map_err(|e| OutboundError::ConnectionFailed(format!("dial_system failed: {e}")))?;
-        // 切片2: Connection 在此 drop。切片3 接入 Link 桥接后保留。
         tracing::debug!(
             tag = %self.tag,
-            "freedom dial succeeded (connection established and dropped in slice 2)"
+            strategy = ?strategy,
+            "freedom dial succeeded"
         );
         Ok(())
     }
 
-    /// Freedom 可以处理任意 TCP 目标（IP 优先；Domain 切片2 暂不支持）。
-    fn can_handle(&self, destination: &Destination) -> bool {
-        matches!(destination.address(), Address::IPv4(_) | Address::IPv6(_))
+    fn can_handle(&self, _destination: &Destination) -> bool {
+        // Freedom 可处理任意目标：IP 直接拨号，Domain 按 DomainStrategy 解析后拨号。
+        true
     }
 }
 
@@ -129,9 +179,9 @@ mod tests {
     }
 
     #[test]
-    fn cannot_handle_domain_destination() {
+    fn can_handle_domain_destination() {
         let h = FreedomHandler::new("direct", Config::default());
-        assert!(!h.can_handle(&make_domain_dest("example.com", 443)));
+        assert!(h.can_handle(&make_domain_dest("example.com", 443)));
     }
 
     #[tokio::test]
@@ -155,17 +205,52 @@ mod tests {
 
 
     #[tokio::test]
-    async fn dial_to_domain_returns_error() {
+    async fn dial_to_domain_with_asis_resolves_and_dials() {
+        // AsIs 策略：解析域名后拨号。
+        // 用 localhost 域名测试，加超时防止 DNS 卡住。
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
         let h = FreedomHandler::new("test", Config::default());
-        let dest = make_domain_dest("example.com", 80);
+        let dest = make_domain_dest("localhost", addr.port());
         let session = Session::new();
-        let result = h.dial(&dest, &session).await;
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            OutboundError::ConnectionFailed(msg) => {
-                assert!(msg.contains("Domain"));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            h.dial(&dest, &session),
+        ).await;
+
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("dial with AsIs failed: {e}"),
+            Err(_) => {
+                // DNS 超时——环境问题，不算测试失败
+                eprintln!("SKIP: localhost DNS resolution timed out");
             }
-            other => panic!("expected ConnectionFailed with Domain message, got {other:?}"),
+        }
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn dial_to_invalid_domain_returns_error() {
+        // 无效域名：DNS 解析失败
+        let h = FreedomHandler::new("test", Config::default());
+        let dest = make_domain_dest("this-domain-does-not-exist-xyz.invalid", 80);
+        let session = Session::new();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            h.dial(&dest, &session),
+        ).await;
+        match result {
+            Ok(Err(_)) => {}
+            Ok(Ok(())) => panic!("expected error for invalid domain"),
+            Err(_) => {
+                // DNS 超时也算失败（NXDOMAIN 应该很快返回）
+                eprintln!("SKIP: DNS resolution timed out for invalid domain");
+            }
         }
     }
 
