@@ -16,9 +16,10 @@
 //!   若并发吞吐出现瓶颈，可改用 `ArcSwap<HashMap>` 优化。
 
 pub mod handler;
+pub mod proxy_outbound;
 
 pub use handler::{OutboundHandlerEntry, UotVersion, parse_random_ip};
-
+pub use proxy_outbound::{OutboundDialer, ProxyOutbound};
 use crate::error::ProxymanError;
 use crate::inbound::PinFuture;
 use parking_lot::RwLock;
@@ -46,6 +47,17 @@ pub trait OutboundHandler: Send + Sync {
 
     /// ProxySettings 类型 URL
     fn proxy_type_url(&self) -> &str;
+
+    /// 分发出站流量（对应 Go `Handler.Dispatch(ctx, link)`）。
+    ///
+    /// 将 `link` 中的出站数据通过此 handler 的代理处理器发送。
+    /// 如果未配置代理处理器，返回 [`ProxymanError::Other`]。
+    fn dispatch(&self, session: xray_common::session::Session, link: xray_transport::link::Link) -> PinFuture<Result<(), ProxymanError>>;
+
+    /// 向目标地址拨号（对应 Go `Handler.Dial(ctx, dest)`）。
+    ///
+    /// 如果配置了代理链 tag，通过 chained handler 拨号；否则直接拨号。
+    fn dial(&self, dest: &xray_common::net::destination::Destination) -> PinFuture<std::io::Result<Box<dyn xray_transport::connection::Connection>>>;
 }
 
 /// 出站管理器（对应 Go `app/proxyman/outbound.Manager`）
@@ -262,6 +274,14 @@ mod tests {
         }
         fn proxy_type_url(&self) -> &str {
             &self.type_url
+        }
+        fn dispatch(&self, _session: xray_common::session::Session, _link: xray_transport::link::Link) -> PinFuture<Result<(), ProxymanError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn dial(&self, _dest: &xray_common::net::destination::Destination) -> PinFuture<std::io::Result<Box<dyn xray_transport::connection::Connection>>> {
+            Box::pin(async {
+                Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "stub dial"))
+            })
         }
     }
 

@@ -31,5 +31,5 @@ pub use config::{SniffingRequest, build_sniffing_request};
 pub use error::ProxymanError;
 pub use inbound::{AlwaysOnInboundHandler, InboundHandler, InboundManager, PinFuture};
 pub use inbound::worker::{ProxyInbound, InboundConn, Worker, TcpWorker, UdpWorker, DsWorker, UdpSession};
-pub use outbound::{OutboundHandler, OutboundManager, OutboundHandlerEntry, UotVersion, parse_random_ip};
+pub use outbound::{OutboundHandler, OutboundManager, OutboundHandlerEntry, OutboundDialer, ProxyOutbound, UotVersion, parse_random_ip};
 pub use stats::{Counter, HandlerKind, NoopStatsProvider, StatsProvider, TrafficDirection};
