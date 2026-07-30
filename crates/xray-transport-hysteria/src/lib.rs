@@ -64,3 +64,5 @@ pub mod register;
 
 /// 协议名（对应 Go `const protocolName = "hysteria"`）。
 pub const PROTOCOL_NAME: &str = "hysteria";
+
+pub use register::register_listener;

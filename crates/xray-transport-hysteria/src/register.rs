@@ -1,15 +1,22 @@
-//! Hysteria transport dialer 注册（骨架）。
+//! Hysteria transport dialer + listener 注册（骨架）。
 //!
-//! 当前 [`crate::dialer::HysteriaDialerFactory`] 是 trait stub，等待 quinn/h3
-//! adapter 注入。此 [`register_dialer`] 注册一个返回 `Unsupported` 错误的占位
-//! dialer，让 `streamSettings.network = "hysteria"` 能命中本 crate 的代码路径。
+//! dialer: [`crate::dialer::HysteriaDialerFactory`] 是 trait stub，等待 quinn/h3 adapter。
+//! listener: [`crate::hub::HysteriaListenerFactory`] 是 trait stub，等待 quinn/h3 adapter。
+//! 两者均返回 `Unsupported`，让 `streamSettings.network = "hysteria"` 命中本 crate。
 //!
-//! 待切片2 补全 `HysteriaDialerFactory` 注入后，替换占位为真实拨号。
+//! 待切片2 补全 factory 注入后，替换占位为真实拨号/监听。
 
+use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use xray_transport::dialer::{TransportDialFn, register_transport_dialer};
+use xray_transport::listener_registry::{
+    TransportListenFn, TransportListener,
+    register_transport_listener,
+};
 
 use crate::PROTOCOL_NAME;
 
@@ -26,6 +33,22 @@ pub fn register_dialer() -> io::Result<()> {
         })
     });
     let _ = register_transport_dialer(PROTOCOL_NAME, stub);
+    Ok(())
+}
+
+/// 注册 Hysteria transport listener 占位。
+///
+/// 幂等：重复注册的 `AlreadyExists` 被忽略。
+pub fn register_listener() -> io::Result<()> {
+    let stub: TransportListenFn = Arc::new(|_addr, _settings, _sockopt, _handler| {
+        Box::pin(async {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "hysteria transport listening not yet implemented (waiting HysteriaListenerFactory + quinn adapter, slice 2)",
+            ))
+        })
+    });
+    let _ = register_transport_listener(PROTOCOL_NAME, stub);
     Ok(())
 }
 

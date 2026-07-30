@@ -1,4 +1,13 @@
-//! gRPC transport dialer 注册：把 grpc dial 闭包挂到全局 `TRANSPORT_DIALER_CACHE`。
+//! gRPC transport dialer + listener 注册。
+//!
+//! 对应 Go `transport/internet/grpc/dialer.go::init()` 中的
+//! `internet.RegisterTransportDialer(protocolName, Dial(...))` 和
+//! `transport/internet/grpc/hub.go::init()` 中的
+//! `internet.RegisterTransportListener(protocolName, Listen(...))`。
+//!
+//! ## 调用
+//!
+//! 进程启动时调用一次 [`register_dialer`] 和 [`register_listener`]；幂等——重复注册的 `AlreadyExists` 被忽略。
 //!
 //! 对应 Go `transport/internet/grpc/dialer.go::dialgRPC` + `init()` 中的
 //! `internet.RegisterTransportDialer(protocolName, Dial(...))`。
@@ -13,7 +22,22 @@
 //! h2/tonic 集成（见 crate `lib.rs` 切片边界文档）。dialer 闭包在解析配置
 //! 后返回 `Unsupported` 错误，确保注册结构正确但不假装能建立连接。
 
+use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use xray_common::net::destination::Destination;
+use xray_transport::connection::Connection;
+use xray_transport::dialer::{
+    StreamSettings, TransportDialFn, register_transport_dialer,
+};
+use xray_transport::listener_registry::{
+    ConnHandler, TransportListenFn, TransportListener,
+    register_transport_listener,
+};
+use xray_transport::sockopt::SocketOptions;
 use std::sync::Arc;
 
 use xray_common::net::destination::Destination;
@@ -42,6 +66,39 @@ pub fn register_dialer() -> io::Result<()> {
     let _ = register_transport_dialer("h2", dialer.clone());
     let _ = register_transport_dialer("http", dialer);
     Ok(())
+}
+
+/// 注册 gRPC transport listener。
+///
+/// 协议名同时注册 `"grpc"` / `"h2"` / `"http"`，与 [`register_dialer`] 一致。
+///
+/// 当前返回 `Unsupported`：HTTP/2 server 监听依赖 h2/tonic 集成。
+/// 配置解析已执行，确保错误前的路径可测。
+///
+/// 幂等：重复调用忽略 `AlreadyExists`。
+pub fn register_listener() -> io::Result<()> {
+    let listen_fn: TransportListenFn = Arc::new(move |addr, settings, _sockopt, _handler| {
+        let settings = settings.clone();
+        Box::pin(async move { listen_grpc(addr, &settings).await })
+    });
+    let _ = register_transport_listener("grpc", listen_fn.clone());
+    let _ = register_transport_listener("h2", listen_fn.clone());
+    let _ = register_transport_listener("http", listen_fn);
+    Ok(())
+}
+
+/// 实际监听：解析 grpcSettings → 返回 Unsupported。
+///
+/// 当前返回 `Unsupported`：HTTP/2 server 监听依赖 h2/tonic 集成。
+/// 配置解析已执行，确保错误前的路径可测。
+async fn listen_grpc(_addr: SocketAddr, settings: &StreamSettings) -> io::Result<Box<dyn TransportListener>> {
+    let _config = parse_grpc_config(settings.transport_json.as_ref())?;
+
+    // ponytail: HTTP/2 server 监听待 h2/tonic 集成。
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "gRPC HTTP/2 transport listening not yet integrated (depends on h2/tonic, see crate docs)",
+    ))
 }
 
 /// 实际拨号：解析 grpcSettings → tls config → 调用 client 建立连接。

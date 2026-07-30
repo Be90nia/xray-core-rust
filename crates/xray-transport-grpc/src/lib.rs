@@ -36,4 +36,4 @@ pub mod register;
 // 顶层 re-export。
 pub use config::Config;
 pub use error::{GrpcError, Result};
-pub use register::register_dialer;
+pub use register::{register_dialer, register_listener};

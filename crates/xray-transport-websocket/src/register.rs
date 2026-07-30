@@ -1,4 +1,13 @@
-//! WebSocket transport dialer 注册：把 ws dial 闭包挂到全局 `TRANSPORT_DIALER_CACHE`。
+//! WebSocket transport dialer + listener 注册：
+//!
+//! 对应 Go `transport/internet/websocket/dialer.go::init()` 中的
+//! `internet.RegisterTransportDialer(protocolName, Dial(...))` 和
+//! `transport/internet/websocket/hub.go::init()` 中的
+//! `internet.RegisterTransportListener(protocolName, ListenWS)`。
+//!
+//! ## 调用
+//!
+//! 进程启动时调用一次 [`register_dialer`] 和 [`register_listener`]；
 //!
 //! 对应 Go `transport/internet/websocket/dialer.go::init()` 中的
 //! `internet.RegisterTransportDialer(protocolName, Dial(...))`。
@@ -7,7 +16,22 @@
 //!
 //! 进程启动时调用一次 [`register_dialer`]；幂等——重复注册的 `AlreadyExists` 被忽略。
 
+use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use xray_common::net::destination::Destination;
+use xray_transport::connection::Connection;
+use xray_transport::dialer::{
+    StreamSettings, TransportDialFn, register_transport_dialer,
+};
+use xray_transport::listener_registry::{
+    ConnHandler, TransportListenFn, TransportListener,
+    register_transport_listener,
+};
+use xray_transport::sockopt::SocketOptions;
 use std::sync::Arc;
 
 use xray_common::net::destination::Destination;
@@ -36,6 +60,114 @@ pub fn register_dialer() -> io::Result<()> {
     let _ = register_transport_dialer("ws", dialer.clone());
     let _ = register_transport_dialer("websocket", dialer);
     Ok(())
+}
+
+/// 注册 WebSocket transport listener。
+///
+/// 协议名同时注册 `"ws"` 和 `"websocket"`，与 [`register_dialer`] 一致。
+///
+/// 当前实现：绑定 TCP + spawn accept loop（每个新连接做 WS 握手后调用 ConnHandler）。
+/// TLS 包装由 stream settings 的 security 字段决定——`"tls"` 时自动包装 TLS accept。
+///
+/// 幂等：重复调用忽略 `AlreadyExists`。
+pub fn register_listener() -> io::Result<()> {
+    let listen_fn: TransportListenFn = Arc::new(move |addr, settings, _sockopt, handler| {
+        let settings = settings.clone();
+        let handler = handler.clone();
+        Box::pin(async move { listen_ws(addr, &settings, &handler).await })
+    });
+    // ponytail: 重复注册忽略——主代理与测试可能并发触发注册。
+    let _ = register_transport_listener("ws", listen_fn.clone());
+    let _ = register_transport_listener("websocket", listen_fn);
+    Ok(())
+}
+
+/// 实际监听：解析 wsSettings → bind WsListener → spawn accept loop。
+async fn listen_ws(
+    addr: SocketAddr,
+    settings: &StreamSettings,
+    handler: &ConnHandler,
+) -> io::Result<Box<dyn TransportListener>> {
+    let config = parse_ws_config(settings.transport_json.as_ref())?;
+    let ws_config = Arc::new(config);
+
+    let mut ws_listener = crate::server::WsListener::bind(addr, ws_config.clone())
+        .await
+        .map_err(|e| io::Error::other(e))?;
+
+    let local_addr = ws_listener.local_addr()
+        .map_err(|e| io::Error::other(e))?;
+
+    let close_notify = Arc::new(tokio::sync::Notify::new());
+    let close_notify_clone = close_notify.clone();
+
+    // 根据 security 决定是否包装 TLS。
+    let use_tls = settings.security != "none" && !settings.security.is_empty();
+
+    // spawn accept loop。
+    let handler = handler.clone();
+    let tls_config = if use_tls {
+        Some(build_tls_server_config(settings)?)
+    } else {
+        None
+    };
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                result = async {
+                    if let Some(ref tls_cfg) = tls_config {
+                        ws_listener.accept_tls(tls_cfg.clone()).await
+                    } else {
+                        ws_listener.accept().await
+                    }
+                } => {
+                    match result {
+                        Ok(accepted) => {
+                            handler(accepted.conn);
+                        }
+                        Err(e) => {
+                            let msg = e.to_string();
+                            if msg.contains("closed") { break; }
+                            // ponytail: too many open files 时 sleep 重试，其他错误继续
+                            if msg.contains("too many") {
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            }
+                            continue;
+                        }
+                    }
+                }
+                _ = close_notify_clone.notified() => break,
+            }
+        }
+    });
+
+    Ok(Box::new(WsTransportListener { local_addr, close_notify }))
+}
+
+/// 构建 TLS server config（用于 wss:// 监听）。
+fn build_tls_server_config(settings: &StreamSettings) -> io::Result<Arc<tokio_rustls::rustls::ServerConfig>> {
+    xray_tls::server_config::build_server_config(
+        &settings.security,
+        settings.security_json.as_ref(),
+    )
+}
+
+/// WebSocket `TransportListener` wrapper。只持有 local_addr + close 通知。
+struct WsTransportListener {
+    local_addr: SocketAddr,
+    close_notify: Arc<tokio::sync::Notify>,
+}
+
+impl TransportListener for WsTransportListener {
+    fn close(&self) -> io::Result<()> {
+        // 通知 accept loop 退出。底层 TcpListener 在 WsListener drop 时关闭。
+        self.close_notify.notify_waiters();
+        Ok(())
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.local_addr)
+    }
 }
 
 /// 实际拨号：解析 wsSettings → tls config → 调用 client::dial → 包装为 Connection。
