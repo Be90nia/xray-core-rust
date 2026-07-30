@@ -67,7 +67,7 @@ pub mod register;
 pub const PROTOCOL_NAME: &str = "mkcp";
 
 pub use config::{Config, ConfigExt, default_config};
-pub use connection::{Connection, ConnectionCloser, ConnMetadata, NoopCloser};
+pub use connection::{Connection, ConnectionCloser, ConnMetadata, KcpConn, NoopCloser};
 pub use dialer::{KcpDialerFactory, PacketInput, fetch_input, init_global_conv, next_conv};
 pub use error::{KcpError, Result};
 pub use io::{KCPPacketReader, PacketReader};

@@ -10,11 +10,13 @@ xray-buf = { path = "../xray-buf" }
 xray-common = { path = "../xray-common" }
 xray-proto = { path = "../xray-proto" }
 xray-transport = { path = "../xray-transport" }
+xray-tls = { path = "../xray-tls" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
 bytes = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

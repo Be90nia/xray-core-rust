@@ -22,10 +22,8 @@
 //! h2/tonic 集成（见 crate `lib.rs` 切片边界文档）。dialer 闭包在解析配置
 //! 后返回 `Unsupported` 错误，确保注册结构正确但不假装能建立连接。
 
-use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use xray_common::net::destination::Destination;
@@ -36,14 +34,6 @@ use xray_transport::dialer::{
 use xray_transport::listener_registry::{
     ConnHandler, TransportListenFn, TransportListener,
     register_transport_listener,
-};
-use xray_transport::sockopt::SocketOptions;
-use std::sync::Arc;
-
-use xray_common::net::destination::Destination;
-use xray_transport::connection::Connection;
-use xray_transport::dialer::{
-    StreamSettings, TransportDialFn, register_transport_dialer,
 };
 
 use crate::config::Config;

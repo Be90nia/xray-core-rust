@@ -12,6 +12,7 @@
 //! Read/Write 提供**同步**简化版（不等待窗口/数据，短写或返回 0），上层 adapter
 //! 包装成 AsyncRead/AsyncWrite。
 
+use std::pin::Pin;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -612,6 +613,160 @@ impl Connection {
         }
         *self.inner.write_deadline.lock() = t;
         Ok(())
+    }
+}
+
+/// KCP `Connection` → `xray_transport::connection::Connection` 异步适配器。
+///
+/// KCP `Connection` 的 read/write 是同步非阻塞（返回 0 表示暂无数据），
+/// 通过 `Notify`（`data_input`/`data_output`）通知数据就绪。
+/// 本适配器用 `notified().await` 等待 + 同步 read/write 实现异步 IO。
+pub struct KcpConn {
+    inner: Arc<Connection>,
+    read_state: parking_lot::Mutex<Option<Pin<Box<dyn std::future::Future<Output = std::io::Result<(Vec<u8>, usize)>> + Send>>>>,
+    write_state: parking_lot::Mutex<Option<Pin<Box<dyn std::future::Future<Output = std::io::Result<usize>> + Send>>>>,
+}
+
+impl KcpConn {
+    /// 构造。
+    #[must_use]
+    pub fn new(inner: Arc<Connection>) -> Self {
+        Self { inner, read_state: parking_lot::Mutex::new(None), write_state: parking_lot::Mutex::new(None) }
+    }
+
+    /// 内部引用。
+    #[must_use]
+    pub fn inner(&self) -> &Arc<Connection> {
+        &self.inner
+    }
+}
+
+impl std::fmt::Debug for KcpConn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KcpConn").finish_non_exhaustive()
+    }
+}
+
+impl tokio::io::AsyncRead for KcpConn {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let remaining = buf.remaining();
+        if remaining == 0 {
+            return std::task::Poll::Ready(Ok(()));
+        }
+
+        // 先尝试同步读
+        let mut tmp = vec![0u8; remaining];
+        match self.inner.read(&mut tmp) {
+            Ok(0) => {}
+            Ok(n) => {
+                buf.put_slice(&tmp[..n]);
+                return std::task::Poll::Ready(Ok(()));
+            }
+            Err(e) => return std::task::Poll::Ready(Err(std::io::Error::other(e.to_string()))),
+        }
+
+        // 无数据：缓存 read future，等待 data_input 通知
+        let mut state = self.read_state.lock();
+        if state.is_none() {
+            let inner = Arc::clone(&self.inner);
+            *state = Some(Box::pin(async move {
+                loop {
+                    inner.inner.data_input.notified().await;
+                    let mut tmp = vec![0u8; remaining];
+                    match inner.read(&mut tmp) {
+                        Ok(0) => continue,
+                        Ok(n) => return std::io::Result::Ok((tmp, n)),
+                        Err(e) => return Err(std::io::Error::other(e.to_string())),
+                    }
+                }
+            }));
+        }
+
+        let fut = state.as_mut().unwrap();
+        match fut.as_mut().poll(cx) {
+            std::task::Poll::Ready(result) => {
+                *state = None;
+                match result {
+                    Ok((data, n)) => {
+                        buf.put_slice(&data[..n]);
+                        std::task::Poll::Ready(Ok(()))
+                    }
+                    Err(e) => std::task::Poll::Ready(Err(e)),
+                }
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for KcpConn {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        // 先尝试同步写
+        match self.inner.write(buf) {
+            Ok(0) => {}
+            Ok(n) => return std::task::Poll::Ready(Ok(n)),
+            Err(e) => return std::task::Poll::Ready(Err(std::io::Error::other(e.to_string()))),
+        }
+
+        // 发送窗口满：缓存 write future，等待 data_output 通知
+        let mut state = self.write_state.lock();
+        if state.is_none() {
+            let inner = Arc::clone(&self.inner);
+            let data = buf.to_vec();
+            *state = Some(Box::pin(async move {
+                loop {
+                    inner.inner.data_output.notified().await;
+                    match inner.write(&data) {
+                        Ok(0) => continue,
+                        Ok(n) => return std::io::Result::Ok(n),
+                        Err(e) => return Err(std::io::Error::other(e.to_string())),
+                    }
+                }
+            }));
+        }
+
+        let fut = state.as_mut().unwrap();
+        match fut.as_mut().poll(cx) {
+            std::task::Poll::Ready(result) => {
+                *state = None;
+                std::task::Poll::Ready(result)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.inner.flush();
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let _ = self.inner.close();
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl xray_transport::connection::Connection for KcpConn {
+    fn remote_addr(&self) -> std::io::Result<Option<std::net::SocketAddr>> {
+        Ok(self.inner.remote_addr())
+    }
+
+    fn local_addr(&self) -> std::io::Result<Option<std::net::SocketAddr>> {
+        Ok(self.inner.local_addr())
     }
 }
 

@@ -53,7 +53,7 @@ pub use config::{
     FrameTypeTCPRequest, MaxDatagramFrameSize, RequestHeaderAuth, ResponseHeaderUDPEnabled,
     Status, StatusAuthOK, URLHost, URLPath,
 };
-pub use conn::{InterConn, UdpSessionManager};
+pub use conn::{HysteriaConn, InterConn, UdpSessionManager};
 pub use context::{ContextWithDatagram, ContextWithValidator, DatagramFromContext};
 pub use dialer::HysteriaDialerFactory;
 pub use error::{HysteriaError, Result};

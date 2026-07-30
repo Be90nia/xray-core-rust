@@ -10,6 +10,7 @@ xray-buf = { path = "../xray-buf" }
 xray-common = { path = "../xray-common" }
 xray-proto = { path = "../xray-proto" }
 xray-transport = { path = "../xray-transport" }
+xray-tls = { path = "../xray-tls" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -22,6 +23,7 @@ h3-quinn = { workspace = true }
 http = { workspace = true }
 hex = "0.4"
 rustls = { workspace = true, default-features = false, features = ["ring"] }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

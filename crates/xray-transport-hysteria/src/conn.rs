@@ -12,6 +12,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::pin::Pin;
 
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, Mutex as TokioMutex};
@@ -146,6 +147,165 @@ impl InterStreamConn {
     #[must_use]
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote
+    }
+}
+
+/// `InterStreamConn` → `xray_transport::connection::Connection` 适配器。
+///
+/// `InterStreamConn` 的 async read/write 是 `&self`（内部用 `Arc<dyn QuicStream>`），
+/// 但 `Connection` 要求 `AsyncRead + AsyncWrite`（`&mut self` via Pin）。
+/// 本适配器持有 `Arc<InterStreamConn>` 并通过 `Mutex<Option<Pin<Box<...>>>>` 缓存
+/// 进行中的 read/write/close future，确保 `poll_read`/`poll_write` 在 `Pending` 后
+/// 能重入同一 future。
+pub struct HysteriaConn {
+    inner: Arc<InterStreamConn>,
+    /// 缓存进行中的 read future。
+    read_state: parking_lot::Mutex<Option<Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<u8>>> + Send>>>>,
+    /// 缓存进行中的 write future。
+    write_state: parking_lot::Mutex<Option<Pin<Box<dyn std::future::Future<Output = std::io::Result<usize>> + Send>>>>,
+    /// 缓存进行中的 close future。
+    close_state: parking_lot::Mutex<Option<Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>>>,
+}
+
+impl HysteriaConn {
+    /// 构造。
+    #[must_use]
+    pub fn new(inner: Arc<InterStreamConn>) -> Self {
+        Self {
+            inner,
+            read_state: parking_lot::Mutex::new(None),
+            write_state: parking_lot::Mutex::new(None),
+            close_state: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// 内部引用。
+    #[must_use]
+    pub fn inner(&self) -> &Arc<InterStreamConn> {
+        &self.inner
+    }
+}
+
+impl std::fmt::Debug for HysteriaConn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HysteriaConn").finish_non_exhaustive()
+    }
+}
+
+impl tokio::io::AsyncRead for HysteriaConn {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let remaining = buf.remaining();
+        if remaining == 0 {
+            return std::task::Poll::Ready(Ok(()));
+        }
+
+        let mut state = self.read_state.lock();
+        if state.is_none() {
+            // 创建新 read future（读入临时 buffer，不借用 caller 的 buf）
+            let inner = Arc::clone(&self.inner);
+            *state = Some(Box::pin(async move {
+                let mut tmp = vec![0u8; remaining];
+                let n = inner.read(&mut tmp).await?;
+                tmp.truncate(n);
+                Ok(tmp)
+            }));
+        }
+
+        // SAFETY: state 一定有值了
+        let fut = state.as_mut().unwrap();
+        match fut.as_mut().poll(cx) {
+            std::task::Poll::Ready(result) => {
+                // 清除缓存
+                *state = None;
+                match result {
+                    Ok(data) => {
+                        if data.is_empty() {
+                            // EOF
+                            std::task::Poll::Ready(Ok(()))
+                        } else {
+                            buf.put_slice(&data);
+                            std::task::Poll::Ready(Ok(()))
+                        }
+                    }
+                    Err(e) => std::task::Poll::Ready(Err(e)),
+                }
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for HysteriaConn {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let mut state = self.write_state.lock();
+        if state.is_none() {
+            let inner = Arc::clone(&self.inner);
+            let data = buf.to_vec();
+            let buf_len = buf.len();
+            *state = Some(Box::pin(async move {
+                inner.write(&data).await
+            }));
+            // ponytail: 记录原始 buf 长度，因为 write 可能返回不同长度
+            // 但我们无法在 future 完成前知道实际写了多少，所以用 buf_len 作为回退
+            let _ = buf_len;
+        }
+
+        let fut = state.as_mut().unwrap();
+        match fut.as_mut().poll(cx) {
+            std::task::Poll::Ready(result) => {
+                *state = None;
+                std::task::Poll::Ready(result)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        // QUIC stream 无显式 flush
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let mut state = self.close_state.lock();
+        if state.is_none() {
+            let inner = Arc::clone(&self.inner);
+            *state = Some(Box::pin(async move {
+                inner.close().await
+            }));
+        }
+
+        let fut = state.as_mut().unwrap();
+        match fut.as_mut().poll(cx) {
+            std::task::Poll::Ready(result) => {
+                *state = None;
+                std::task::Poll::Ready(result)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl xray_transport::connection::Connection for HysteriaConn {
+    fn remote_addr(&self) -> std::io::Result<Option<SocketAddr>> {
+        Ok(Some(self.inner.remote_addr()))
+    }
+
+    fn local_addr(&self) -> std::io::Result<Option<SocketAddr>> {
+        Ok(Some(self.inner.local_addr()))
     }
 }
 

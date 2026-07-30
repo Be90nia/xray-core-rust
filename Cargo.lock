@@ -6350,12 +6350,14 @@ dependencies = [
  "rand 0.9.4",
  "rcgen 0.13.2",
  "rustls",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "xray-buf",
  "xray-common",
  "xray-proto",
+ "xray-tls",
  "xray-transport",
 ]
 
@@ -6365,12 +6367,14 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "parking_lot",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "xray-buf",
  "xray-common",
  "xray-proto",
+ "xray-tls",
  "xray-transport",
 ]
 
