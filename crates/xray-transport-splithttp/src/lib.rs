@@ -48,4 +48,5 @@ pub use config::{
     PLACEMENT_PATH, PLACEMENT_QUERY, PLACEMENT_QUERY_IN_HEADER,
 };
 
+pub use register::register_dialer;
 pub use register::register_listener;

@@ -1,45 +1,34 @@
-//! SplitHTTP transport dialer + listener 注册（骨架）。
+//! SplitHTTP transport dialer + listener 注册。
 //!
-//! dialer: [`crate::dialer::PacketUpConn`] 不满足 `Sync` bound，当前返回 `Unsupported`。
+//! dialer: 已集成——通过 [`MutexReader`] 包装 `!Sync` reader 使 `SplitConn` 满足
+//! [`Connection`](xray_transport::connection::Connection) 的 `Sync` bound。
 //! listener: HTTP/2 server 监听待集成，当前返回 `Unsupported`。
 //!
 //! 协议名同时注册 `"splithttp"`（Go 标准）和 `"xhttp"`（用户配置简写）。
-//!
-//! 当前 [`crate::dialer::PacketUpConn`] (`SplitConn<Box<dyn AsyncRead + Send +
-//! Unpin>, DuplexStream>`) 不满足 `Sync` bound——`Box<dyn AsyncRead + Send +
-//! Unpin>` 不是 `Sync`，无法 impl [`Connection`]（要求 `Send + Sync + Unpin`）。
-//!
-//! 此 [`register_dialer`] 注册返回 `Unsupported` 的占位 dialer，让
-//! `streamSettings.network = "splithttp"` 能命中本 crate 的代码路径，
-//! 而不是 fallback 到裸 TCP。待切片 co1（splithttp client 补全）将
-//! `PacketUpConn` 的 reader 改为 `Sync` 类型后，替换占位为真实拨号。
-//!
-//! 协议名同时注册 `"splithttp"`（Go 标准）和 `"xhttp"`（用户配置简写）。
 
-use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 
-use xray_transport::dialer::{TransportDialFn, register_transport_dialer};
-use xray_transport::listener_registry::{
-    TransportListenFn, TransportListener,
-    register_transport_listener,
-};
+use xray_common::net::destination::Destination;
+use xray_transport::connection::Connection;
+use xray_transport::dialer::{StreamSettings, TransportDialFn, register_transport_dialer};
+use xray_transport::listener_registry::{TransportListenFn, register_transport_listener};
+use xray_transport::sockopt::SocketOptions;
 
-/// 注册 SplitHTTP transport dialer 占位。幂等。
+use crate::client::DefaultDialerClient;
+use crate::config::Config;
+use crate::dialer;
+
+/// 注册 SplitHTTP transport dialer。幂等。
 pub fn register_dialer() -> io::Result<()> {
-    let stub: TransportDialFn = Arc::new(|_dest, _sockopt, _settings| {
-        Box::pin(async {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "splithttp transport dialer not yet wired (waiting PacketUpConn Sync bound fix in slice co1)",
-            ))
-        })
+    let dial_fn: TransportDialFn = Arc::new(move |dest, sockopt, settings| {
+        let dest = dest.clone();
+        let sockopt = sockopt.clone();
+        let settings = settings.clone();
+        Box::pin(async move { dial_splithttp(&dest, &sockopt, &settings).await })
     });
-    let _ = register_transport_dialer("splithttp", stub.clone());
-    let _ = register_transport_dialer("xhttp", stub);
+    let _ = register_transport_dialer("splithttp", dial_fn.clone());
+    let _ = register_transport_dialer("xhttp", dial_fn);
     Ok(())
 }
 
@@ -58,6 +47,128 @@ pub fn register_listener() -> io::Result<()> {
     Ok(())
 }
 
+/// 实际拨号：解析配置 → 构建 TLS client → 调用 [`dialer::dial`] → 包装为 `Box<dyn Connection>`。
+async fn dial_splithttp(
+    dest: &Destination,
+    _sockopt: &SocketOptions,
+    settings: &StreamSettings,
+) -> io::Result<Box<dyn Connection>> {
+    let config = parse_splithttp_config(settings.transport_json.as_ref())?;
+    let config = Arc::new(config);
+
+    // Host: 配置优先，缺失用 dest 地址。
+    let default_sni = dest.address().to_string();
+    let host = if config.host.is_empty() {
+        format!("{}:{}", dest.address(), dest.port())
+    } else {
+        format!("{}:{}", config.host, dest.port())
+    };
+
+    // Scheme: TLS/REALITY → https，否则 http。
+    let has_tls = matches!(settings.security.as_str(), "tls" | "reality");
+    let scheme = if has_tls { "https" } else { "http" };
+
+    // Build rustls ClientConfig.
+    let tls_config = xray_tls::client_config::build_client_config(
+        &settings.security,
+        settings.security_json.as_ref(),
+        &default_sni,
+    )?;
+
+    // DefaultDialerClient needs a rustls ClientConfig. If no TLS, use a default.
+    let rustls_config = match tls_config {
+        Some(arc_cfg) => (*arc_cfg).clone(),
+        None => {
+            // No TLS → build a minimal rustls config (won't be used for actual TLS,
+            // but DefaultDialerClient::new requires one).
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth()
+        }
+    };
+
+    let client = Arc::new(DefaultDialerClient::new(config.clone(), rustls_config));
+
+    // Dispatch to dialer::dial.
+    let packet_conn = dialer::dial(client, config, scheme, &host, has_tls)
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("splithttp dial failed: {e}")))?;
+
+    // Wrap !Sync reader in MutexReader → SplitConn that impl Connection.
+    let sync_conn = packet_conn.into_sync_reader();
+    Ok(Box::new(sync_conn) as Box<dyn Connection>)
+}
+
+/// 从 `splithttpSettings` JSON 解析为强类型 [`Config`]。
+///
+/// `None` 或非 object 返回 [`Config::default`]。
+fn parse_splithttp_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
+    let Some(v) = json else { return Ok(Config::default()); };
+    let Some(obj) = v.as_object() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "splithttpSettings must be a JSON object",
+        ));
+    };
+
+    let host = obj.get("host").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let path = obj.get("path").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let mode = obj.get("mode").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let no_grpc_header = obj.get("noGRPCHeader").or_else(|| obj.get("no_grpc_header")).and_then(|x| x.as_bool()).unwrap_or(false);
+    let no_sse_header = obj.get("noSSEHeader").or_else(|| obj.get("no_sse_header")).and_then(|x| x.as_bool()).unwrap_or(false);
+    let sc_max_each_post_bytes = obj.get("scMaxEachPostBytes").or_else(|| obj.get("sc_max_each_post_bytes")).and_then(parse_range);
+    let sc_min_posts_interval_ms = obj.get("scMinPostsIntervalMs").or_else(|| obj.get("sc_min_posts_interval_ms")).and_then(parse_range);
+    let sc_max_buffered_posts = obj.get("scMaxBufferedPosts").or_else(|| obj.get("sc_max_buffered_posts")).and_then(|x| x.as_i64()).unwrap_or(0);
+    let x_padding_bytes = obj.get("xPaddingBytes").or_else(|| obj.get("x_padding_bytes")).and_then(parse_range);
+    let uplink_http_method = obj.get("uplinkHTTPMethod").or_else(|| obj.get("uplink_http_method")).and_then(|x| x.as_str()).unwrap_or("").to_string();
+
+    let headers = parse_headers(obj.get("header"))
+        .or_else(|| parse_headers(obj.get("headers")))
+        .unwrap_or_default();
+
+    Ok(Config {
+        host,
+        path,
+        mode,
+        headers,
+        x_padding_bytes,
+        no_grpc_header,
+        no_sse_header,
+        sc_max_each_post_bytes,
+        sc_min_posts_interval_ms,
+        sc_max_buffered_posts,
+        uplink_http_method,
+        ..Config::default()
+    })
+}
+
+/// Parse a RangeConfig from JSON: either `{"from":N,"to":N}` or a single integer.
+fn parse_range(v: &serde_json::Value) -> Option<crate::config::RangeConfig> {
+    if let Some(obj) = v.as_object() {
+        let from = obj.get("from").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+        let to = obj.get("to").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+        Some(crate::config::RangeConfig::new(from, to))
+    } else if let Some(n) = v.as_i64() {
+        let n = n as i32;
+        Some(crate::config::RangeConfig::new(n, n))
+    } else {
+        None
+    }
+}
+
+/// 把 JSON 子对象解析为 `HashMap<String, String>`。非 object 或缺失返回 `None`。
+fn parse_headers(v: Option<&serde_json::Value>) -> Option<std::collections::HashMap<String, String>> {
+    let obj = v?.as_object()?;
+    let mut map = std::collections::HashMap::with_capacity(obj.len());
+    for (k, val) in obj {
+        if let Some(s) = val.as_str() {
+            map.insert(k.clone(), s.to_string());
+        }
+    }
+    Some(map)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,5 +177,56 @@ mod tests {
     fn register_dialer_is_idempotent() {
         register_dialer().expect("first register ok");
         register_dialer().expect("second register ok (idempotent)");
+    }
+
+    #[test]
+    fn parse_splithttp_config_none_returns_default() {
+        let cfg = parse_splithttp_config(None).unwrap();
+        assert!(cfg.host.is_empty());
+        assert!(cfg.path.is_empty());
+        assert!(cfg.mode.is_empty());
+    }
+
+    #[test]
+    fn parse_splithttp_config_basic_fields() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"host":"h.example.com","path":"/ws","mode":"packet-up","noGRPCHeader":true}"#,
+        )
+        .unwrap();
+        let cfg = parse_splithttp_config(Some(&v)).unwrap();
+        assert_eq!(cfg.host, "h.example.com");
+        assert_eq!(cfg.path, "/ws");
+        assert_eq!(cfg.mode, "packet-up");
+        assert!(cfg.no_grpc_header);
+    }
+
+    #[test]
+    fn parse_splithttp_config_accepts_headers_plural() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"headers":{"X-Forwarded-For":"10.0.0.1"}}"#).unwrap();
+        let cfg = parse_splithttp_config(Some(&v)).unwrap();
+        assert_eq!(cfg.headers.get("X-Forwarded-For").unwrap(), "10.0.0.1");
+    }
+
+    #[test]
+    fn parse_splithttp_config_non_object_returns_err() {
+        let v: serde_json::Value = serde_json::from_str(r#""not-an-object""#).unwrap();
+        let r = parse_splithttp_config(Some(&v));
+        assert!(r.is_err());
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn parse_range_from_object() {
+        let v: serde_json::Value = serde_json::from_str(r#"{"from":100,"to":200}"#).unwrap();
+        let r = parse_range(&v).unwrap();
+        assert_eq!((r.from, r.to), (100, 200));
+    }
+
+    #[test]
+    fn parse_range_from_integer() {
+        let v: serde_json::Value = serde_json::from_str(r#"500"#).unwrap();
+        let r = parse_range(&v).unwrap();
+        assert_eq!((r.from, r.to), (500, 500));
     }
 }

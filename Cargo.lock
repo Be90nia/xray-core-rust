@@ -6392,6 +6392,7 @@ dependencies = [
  "rcgen 0.13.2",
  "rustls",
  "rustls-pki-types",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
@@ -6403,6 +6404,7 @@ dependencies = [
  "xray-buf",
  "xray-common",
  "xray-proto",
+ "xray-tls",
  "xray-transport",
 ]
 
