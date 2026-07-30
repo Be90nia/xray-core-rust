@@ -20,6 +20,15 @@ pub struct HttpUpgradeConnection<C> {
     pub remote_addr_override: Option<SocketAddr>,
 }
 
+impl<C: std::fmt::Debug> std::fmt::Debug for HttpUpgradeConnection<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpUpgradeConnection")
+            .field("inner", &self.inner)
+            .field("remote_addr_override", &self.remote_addr_override)
+            .finish()
+    }
+}
+
 impl<C> HttpUpgradeConnection<C> {
     /// 构造 wrapper。
     #[must_use]
@@ -37,11 +46,46 @@ impl<C> HttpUpgradeConnection<C> {
     }
 }
 
-impl<C> std::fmt::Debug for HttpUpgradeConnection<C> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HttpUpgradeConnection")
-            .field("remote_addr_override", &self.remote_addr_override)
-            .finish_non_exhaustive()
+
+impl<C: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for HttpUpgradeConnection<C> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<C: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for HttpUpgradeConnection<C> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl<C: xray_transport::connection::Connection + Unpin> xray_transport::connection::Connection for HttpUpgradeConnection<C> {
+    fn remote_addr(&self) -> std::io::Result<Option<SocketAddr>> {
+        if let Some(addr) = self.remote_addr_override {
+            Ok(Some(addr))
+        } else {
+            self.inner.remote_addr()
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Option<SocketAddr>> {
+        self.inner.local_addr()
     }
 }
 

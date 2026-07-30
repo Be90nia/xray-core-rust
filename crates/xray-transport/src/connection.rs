@@ -99,6 +99,16 @@ impl Connection for TcpConnection {
     }
 }
 
+impl Connection for Box<dyn Connection> {
+    fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+        (**self).remote_addr()
+    }
+
+    fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+        (**self).local_addr()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -9,23 +9,13 @@
 //!
 //! 进程启动时调用一次 [`register_dialer`] 和 [`register_listener`]；幂等——重复注册的 `AlreadyExists` 被忽略。
 //!
-//! 对应 Go `transport/internet/httpupgrade/dialer.go::dialhttpUpgrade` + `init()` 中的
-//! `internet.RegisterTransportDialer(protocolName, Dial(...))`。
+//! ## 已集成
 //!
-//! ## 调用
-//!
-//! 进程启动时调用一次 [`register_dialer`]；幂等——重复注册的 `AlreadyExists` 被忽略。
-//!
-//! ## 切片边界
-//!
-//! 配置解析 + TLS config 构建 + 协议注册已就绪。实际 TCP + TLS 拨号 + HTTP/1.1
-//! 握手集成待 `tokio-rustls` 决策（见 crate `lib.rs` 切片边界文档）。dialer 闭包
-//! 在解析配置后返回 `Unsupported` 错误，确保注册结构正确但不假装能建立连接。
+//! 拨号器已完整集成：TCP 拨号 + TLS 包装 + HTTP/1.1 upgrade 握手。
+//! 监听器仍返回 `Unsupported`（TCP+TLS 监听 + HTTP/1.1 握手待完成）。
 
-use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use xray_common::net::destination::Destination;
@@ -34,18 +24,12 @@ use xray_transport::dialer::{
     StreamSettings, TransportDialFn, register_transport_dialer,
 };
 use xray_transport::listener_registry::{
-    ConnHandler, TransportListenFn, TransportListener,
+    TransportListenFn, TransportListener,
     register_transport_listener,
 };
 use xray_transport::sockopt::SocketOptions;
-use std::sync::Arc;
 
-use xray_common::net::destination::Destination;
-use xray_transport::connection::Connection;
-use xray_transport::dialer::{
-    StreamSettings, TransportDialFn, register_transport_dialer,
-};
-
+use crate::client::HttpUpgradeClient;
 use crate::config::Config;
 
 /// 注册 HTTPUpgrade transport dialer。
@@ -54,11 +38,11 @@ use crate::config::Config;
 ///
 /// 幂等：重复调用忽略 `AlreadyExists`（对齐 Go `init()` 在测试中多次执行的容错）。
 pub fn register_dialer() -> io::Result<()> {
-    let dialer: TransportDialFn = Arc::new(move |dest, _sockopt, settings| {
-        // TransportDialFn 返回 'static future，必须在进入 async block 前拥有数据。
+    let dialer: TransportDialFn = Arc::new(move |dest, sockopt, settings| {
         let dest = dest.clone();
+        let sockopt = sockopt.clone();
         let settings = settings.clone();
-        Box::pin(async move { dial_httpupgrade(&dest, &settings).await })
+        Box::pin(async move { dial_httpupgrade(&dest, &sockopt, &settings).await })
     });
     // ponytail: 重复注册忽略——主代理与测试可能并发触发注册。
     let _ = register_transport_dialer("httpupgrade", dialer);
@@ -93,32 +77,55 @@ async fn listen_httpupgrade(_addr: SocketAddr, settings: &StreamSettings) -> io:
     ))
 }
 
-/// 实际拨号：解析 httpupgradeSettings → tls config → 调用 client 建立连接。
+/// 实际拨号：解析配置 → TCP 拨号 → TLS 包装（可选）→ HTTP upgrade 握手。
 ///
-/// 当前返回 `Unsupported`：TCP + TLS 拨号依赖 `tokio-rustls` 集成（见 crate 文档）。
-/// `HttpUpgradeClient::dial_over_io` 需要调用方注入已建立的 IO，且 `HttpUpgradeConnection`
-/// 尚未 impl `Connection` trait。配置解析与 TLS 构建已执行，确保错误前的路径可测。
+/// 对应 Go `dialer.go::dialhttpUpgrade` 完整流程：
+/// 1. 解析 httpupgrade 配置
+/// 2. TCP 拨号 (`internet.DialSystem`)
+/// 3. TLS 包装（`security == "tls"` 或 `"reality"` 时）
+/// 4. HTTP/1.1 upgrade 握手 (`HttpUpgradeClient::dial_over_io`)
 async fn dial_httpupgrade(
     dest: &Destination,
+    sockopt: &SocketOptions,
     settings: &StreamSettings,
 ) -> io::Result<Box<dyn Connection>> {
-    let _config = parse_httpupgrade_config(settings.transport_json.as_ref())?;
+    let config = parse_httpupgrade_config(settings.transport_json.as_ref())?;
 
-    // 默认 SNI 用 dest 地址（与 Go `serverName = dest address` 一致）。
+    // Host: 配置优先，缺失用 dest 地址（与 Go `serverName = dest address` 一致）。
     let default_sni = dest.address().to_string();
-    let _tls_config = xray_tls::client_config::build_client_config(
+    let host = if config.host.is_empty() {
+        default_sni.clone()
+    } else {
+        config.host.clone()
+    };
+
+    // 1. TCP 拨号
+    let tcp_conn = xray_transport::system_dialer::dial_system(dest, sockopt).await?;
+
+    // 2. 可选 TLS 包装
+    let tls_config = xray_tls::client_config::build_client_config(
         &settings.security,
         settings.security_json.as_ref(),
         &default_sni,
     )?;
 
-    // ponytail: TCP + TLS 拨号 + Connection impl 待集成（见 crate lib.rs 切片边界）。
-    // HttpUpgradeClient::dial_over_io 需要已建立的 AsyncRead+AsyncWrite IO，
-    // 当前 crate 无 TCP 拨号逻辑，HttpUpgradeConnection<C> 未 impl Connection trait。
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "HTTPUpgrade TCP+TLS dialing not yet integrated (depends on tokio-rustls + Connection impl, see crate docs)",
-    ))
+    let upgraded_conn: Box<dyn Connection> = if let Some(cfg) = tls_config {
+        let tls_conn = xray_tls::utls::client(tcp_conn, &default_sni, cfg)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("TLS handshake failed: {e}")))?;
+        Box::new(tls_conn)
+    } else {
+        tcp_conn
+    };
+
+    // 3. HTTP upgrade 握手
+    let client = HttpUpgradeClient::new(host, config);
+    let (httpupgrade_conn, _leftover) = client
+        .dial_over_io(upgraded_conn)
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("HTTPUpgrade handshake failed: {e}")))?;
+
+    Ok(Box::new(httpupgrade_conn) as Box<dyn Connection>)
 }
 
 /// 从 `httpupgradeSettings` JSON 解析为强类型 [`Config`]。
@@ -268,26 +275,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dial_httpupgrade_returns_unsupported_after_parsing() {
+    async fn dial_httpupgrade_connects_to_local_server() {
         use xray_common::net::address::Address;
-        use xray_common::net::destination::Destination;
         use xray_common::net::network::Network;
         use xray_common::net::port::Port;
         use std::net::Ipv4Addr;
 
+        // 启动本地 TCP listener 模拟 HTTPUpgrade 服务端。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // 读客户端请求
+            let mut buf = vec![0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            let req = std::str::from_utf8(&buf[..n]).unwrap();
+            assert!(req.starts_with("GET /ws HTTP/1.1"));
+            // 回 101 响应
+            let resp = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+            stream.write_all(resp).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
         let dest = Destination::new(
             Address::IPv4(Ipv4Addr::LOCALHOST),
-            Port::new(443),
+            Port::new(addr.port()),
             Network::TCP,
         );
         let settings = StreamSettings {
             protocol: "httpupgrade".to_string(),
             security: String::new(),
-            transport_json: Some(serde_json::json!({"path":"/upgrade"})),
+            transport_json: Some(serde_json::json!({"path":"/ws"})),
             security_json: None,
         };
-        let result = dial_httpupgrade(&dest, &settings).await;
-        let err = result.err().unwrap();
-        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        let sockopt = SocketOptions::default();
+        let result = dial_httpupgrade(&dest, &sockopt, &settings).await;
+        assert!(result.is_ok(), "dial should succeed: {:?}", result.err());
+        let conn = result.unwrap();
+        // 验证 Connection 可用
+        assert!(conn.remote_addr().is_ok());
+        server.await.unwrap();
     }
 }
