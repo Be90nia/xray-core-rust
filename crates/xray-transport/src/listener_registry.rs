@@ -69,6 +69,9 @@ fn cache() -> &'static RwLock<std::collections::HashMap<String, TransportListenF
     TRANSPORT_LISTENER_CACHE.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
 }
 
+/// Transport listener 注册表最大条目数。
+const MAX_LISTENER_ENTRIES: usize = 256;
+
 /// 注册 transport 协议监听函数。对应 Go `RegisterTransportListener`。
 ///
 /// 同名协议重复注册返回 `AlreadyExists` 错误。
@@ -82,6 +85,12 @@ pub fn register_transport_listener(
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!("{protocol} listener already registered"),
+        ));
+    }
+    if cache.len() >= MAX_LISTENER_ENTRIES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("transport listener registry full ({MAX_LISTENER_ENTRIES})"),
         ));
     }
     cache.insert(protocol.to_string(), listen_fn);

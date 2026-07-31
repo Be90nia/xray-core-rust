@@ -27,6 +27,9 @@ pub struct Manager {
     running: AtomicBool,
 }
 
+/// 每种注册表最大条目数。
+const MAX_REGISTRY_ENTRIES: usize = 1024;
+
 impl Manager {
     /// 新建空 Manager。对应 Go `NewManager(ctx, config) (*Manager, error)`。
     ///
@@ -59,12 +62,18 @@ impl Default for Manager {
 impl ManagerTrait for Manager {
     // --- Counter ---
 
-    fn register_counter(&self, name: &str) -> Result<Arc<dyn Counter>, ManagerError> {
+fn register_counter(&self, name: &str) -> Result<Arc<dyn Counter>, ManagerError> {
         let mut counters = self.counters.write();
         if counters.contains_key(name) {
             return Err(ManagerError::AlreadyRegistered {
                 kind: "Counter",
                 name: name.to_string(),
+            });
+        }
+        if counters.len() >= MAX_REGISTRY_ENTRIES {
+            return Err(ManagerError::AlreadyRegistered {
+                kind: "Counter",
+                name: format!("__capacity_exceeded_{MAX_REGISTRY_ENTRIES}"),
             });
         }
         tracing::debug!("create new counter {name}");
@@ -96,12 +105,18 @@ impl ManagerTrait for Manager {
 
     // --- OnlineMap ---
 
-    fn register_online_map(&self, name: &str) -> Result<Arc<dyn OnlineMap>, ManagerError> {
+fn register_online_map(&self, name: &str) -> Result<Arc<dyn OnlineMap>, ManagerError> {
         let mut maps = self.online_maps.write();
         if maps.contains_key(name) {
             return Err(ManagerError::AlreadyRegistered {
                 kind: "OnlineMap",
                 name: name.to_string(),
+            });
+        }
+        if maps.len() >= MAX_REGISTRY_ENTRIES {
+            return Err(ManagerError::AlreadyRegistered {
+                kind: "OnlineMap",
+                name: format!("__capacity_exceeded_{MAX_REGISTRY_ENTRIES}"),
             });
         }
         tracing::debug!("create new OnlineMap {name}");
@@ -133,7 +148,7 @@ impl ManagerTrait for Manager {
 
     // --- Channel ---
 
-    fn register_channel(&self, name: &str) -> Result<Arc<dyn Channel>, ManagerError> {
+fn register_channel(&self, name: &str) -> Result<Arc<dyn Channel>, ManagerError> {
         let mut channels = self.channels.write();
         if channels.contains_key(name) {
             return Err(ManagerError::AlreadyRegistered {
@@ -141,11 +156,15 @@ impl ManagerTrait for Manager {
                 name: name.to_string(),
             });
         }
+        if channels.len() >= MAX_REGISTRY_ENTRIES {
+            return Err(ManagerError::AlreadyRegistered {
+                kind: "Channel",
+                name: format!("__capacity_exceeded_{MAX_REGISTRY_ENTRIES}"),
+            });
+        }
         tracing::debug!("create new channel {name}");
         let c: Arc<dyn Channel> = Arc::new(StatsChannel::new(ChannelConfig::default()));
-        // Go: 若 manager.running，注册后立即 c.Start()
         if self.running.load(Ordering::SeqCst) {
-            // start 失败时返回错误，等价于 Go `if m.running { return c, c.Start() }`
             c.start().map_err(|_| ManagerError::NotImplemented)?;
         }
         channels.insert(name.to_string(), Arc::clone(&c));

@@ -44,6 +44,9 @@ fn registry() -> &'static RwLock<HashMap<&'static str, FeatureFactory>> {
     REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+/// Feature 注册表最大条目数。
+const MAX_FEATURE_ENTRIES: usize = 1024;
+
 /// 注册一个 Feature 工厂到全局表。
 ///
 /// 对应 Go `common.RegisterConfig(configType, creator)`。同 `type_url`
@@ -56,8 +59,15 @@ fn registry() -> &'static RwLock<HashMap<&'static str, FeatureFactory>> {
 /// - `type_url`：prost `Any::type_url`，如 `"type.googleapis.com/xray.app.dns.Config"`。
 ///   必须是 `'static str`（保证注册表生命周期无界）。
 /// - `factory`：闭包，输入 `&[u8]`（prost Any value），输出 `Arc<dyn Feature>`。
-pub fn register_feature(type_url: &'static str, factory: FeatureFactory) {
-    registry().write().insert(type_url, factory);
+pub fn register_feature(type_url: &'static str, factory: FeatureFactory) -> Result<()> {
+    let mut reg = registry().write();
+    if reg.len() >= MAX_FEATURE_ENTRIES && !reg.contains_key(type_url) {
+        return Err(FeatureError::NotFound {
+            name: format!("registry full ({MAX_FEATURE_ENTRIES})"),
+        });
+    }
+    reg.insert(type_url, factory);
+    Ok(())
 }
 
 /// 查询 `type_url` 是否已注册。

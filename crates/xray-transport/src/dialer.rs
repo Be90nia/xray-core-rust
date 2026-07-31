@@ -168,6 +168,9 @@ fn cache() -> &'static RwLock<HashMap<String, TransportDialFn>> {
     TRANSPORT_DIALER_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+/// Transport dialer 注册表最大条目数。
+const MAX_DIALER_ENTRIES: usize = 256;
+
 /// 注册 transport 协议拨号函数。对应 Go `RegisterTransportDialer`。
 ///
 /// 同名协议重复注册返回错误。协议名大小写敏感（Go 端用 lowercase）。
@@ -177,6 +180,12 @@ pub fn register_transport_dialer(protocol: &str, dialer: TransportDialFn) -> io:
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!("{protocol} dialer already registered"),
+        ));
+    }
+    if cache.len() >= MAX_DIALER_ENTRIES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("transport dialer registry full ({MAX_DIALER_ENTRIES})"),
         ));
     }
     cache.insert(protocol.to_string(), dialer);

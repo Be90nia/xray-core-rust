@@ -237,12 +237,20 @@ fn udp_hub() -> &'static Mutex<HashMap<SocketAddr, ()>> {
     UDP_HUB.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// UDP hub 注册表最大条目数。
+const MAX_UDP_HUB_ENTRIES: usize = 4096;
+
 /// 注册 UDP listener。锁中毒时静默忽略。
 #[deprecated(note = "use UdpHub::listen() instead")]
-pub fn register_udp_listener(addr: SocketAddr) {
+pub fn register_udp_listener(addr: SocketAddr) -> io::Result<()> {
     if let Ok(mut hub) = udp_hub().lock() {
+        if hub.len() >= MAX_UDP_HUB_ENTRIES {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                format!("UDP hub registry full ({MAX_UDP_HUB_ENTRIES})")));
+        }
         hub.insert(addr, ());
     }
+    Ok(())
 }
 
 /// 注销 UDP listener。锁中毒时静默忽略。

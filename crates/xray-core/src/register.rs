@@ -28,17 +28,17 @@ use xray_features::{Feature, FeatureError, FeatureFactory, registry};
 pub fn register_all_features() {
     // --- App kinds ---
     for &kind in APP_KINDS {
-        registry::register_feature(kind, stub_factory(kind));
+        let _ = registry::register_feature(kind, stub_factory(kind));
     }
 
     // --- Proxy inbound kinds ---
     for &kind in PROXY_INBOUND_KINDS {
-        registry::register_feature(kind, stub_factory(kind));
+        let _ = registry::register_feature(kind, stub_factory(kind));
     }
 
     // --- Proxy outbound kinds ---
     for &kind in PROXY_OUTBOUND_KINDS {
-        registry::register_feature(kind, stub_factory(kind));
+        let _ = registry::register_feature(kind, stub_factory(kind));
     }
 }
 

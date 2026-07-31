@@ -185,12 +185,20 @@ fn tcp_hub() -> &'static Mutex<HashMap<SocketAddr, TokioTcpListener>> {
     TCP_HUB.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// TCP hub 注册表最大条目数。
+const MAX_TCP_HUB_ENTRIES: usize = 4096;
+
 /// 注册 TCP listener。锁中毒时静默忽略。
 #[deprecated(note = "use listener_registry::register_transport_listener instead")]
-pub fn register_tcp_listener(addr: SocketAddr, listener: TokioTcpListener) {
+pub fn register_tcp_listener(addr: SocketAddr, listener: TokioTcpListener) -> io::Result<()> {
     if let Ok(mut hub) = tcp_hub().lock() {
+        if hub.len() >= MAX_TCP_HUB_ENTRIES {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                format!("TCP hub registry full ({MAX_TCP_HUB_ENTRIES})")));
+        }
         hub.insert(addr, listener);
     }
+    Ok(())
 }
 
 /// 取出已注册的 TCP listener（从注册表中移除）。

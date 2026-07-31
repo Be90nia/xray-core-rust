@@ -267,7 +267,7 @@ mod tests {
                 counter: counter_for_factory.clone(),
             }) as Arc<dyn Feature>)
         });
-        registry::register_feature("xray.test.shared_counter", factory);
+        let _ = registry::register_feature("xray.test.shared_counter", factory);
 
         let mut built = xray_conf::BuiltConfig::default();
         built.apps.push(xray_conf::BuiltEntry {
@@ -291,7 +291,7 @@ mod tests {
                 message: "injected failure".into(),
             })
         });
-        registry::register_feature("xray.test.bad_factory", factory);
+        let _ = registry::register_feature("xray.test.bad_factory", factory);
 
         let mut built = xray_conf::BuiltConfig::default();
         built.apps.push(xray_conf::BuiltEntry {
@@ -322,7 +322,7 @@ mod tests {
         }
         let order1 = order.clone();
         let order2 = order.clone();
-        registry::register_feature(
+        let _ = registry::register_feature(
             "xray.test.ordered.first",
             Arc::new(move |_data| {
                 Ok(Arc::new(OrderedFeature {
@@ -331,7 +331,7 @@ mod tests {
                 }) as Arc<dyn Feature>)
             }),
         );
-        registry::register_feature(
+        let _ = registry::register_feature(
             "xray.test.ordered.second",
             Arc::new(move |_data| {
                 Ok(Arc::new(OrderedFeature {
