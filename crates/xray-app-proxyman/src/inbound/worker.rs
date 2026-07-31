@@ -27,6 +27,8 @@ use xray_transport::dialer::StreamSettings;
 use xray_transport::listener_registry::{ConnHandler, TransportListener, listen_tcp};
 use xray_transport::sockopt::SocketOptions;
 use xray_transport::udp::hub::{Capacity, HubOption, UdpHub, UdpPacket};
+use xray_common::signal::ActivityTimer;
+use xray_features::policy::DEFAULT_CONN_IDLE_TIMEOUT;
 
 use crate::config::SniffingRequest;
 use crate::error::ProxymanError;
@@ -238,7 +240,6 @@ impl TcpWorker {
         }
     }
 
-    /// 新连接回调。构造 Session 并 spawn proxy.process()。
     fn on_conn(self: &Arc<Self>, conn: Box<dyn Connection>) {
         if self.closed.load(Ordering::SeqCst) {
             return;
@@ -266,10 +267,30 @@ impl TcpWorker {
                 Outbound::new().with_destination_override(gateway),
             );
 
+        // 创建不活动超时计时器（对应 Go CancelAfterInactivity）
+        // ActivityTimer::run 消费 &mut self，需 spawn 到独立 task，
+        // 主 task 通过 Done 信号检测超时。
+        let mut activity_timer = ActivityTimer::new(DEFAULT_CONN_IDLE_TIMEOUT);
+        let mut done_signal = activity_timer.done();
+
+        // spawn 计时器循环，超时后自动 cancel Done 信号
+        tokio::spawn(async move {
+            activity_timer.run().await;
+        });
+
         tokio::spawn(async move {
             let inbound_conn = InboundConn::Tcp(conn);
-            if let Err(e) = proxy.process(Network::TCP, inbound_conn, session, dispatcher).await {
-                warn!(tag = %tag, error = %e, "proxy process failed");
+            tokio::select! {
+                result = proxy.process(Network::TCP, inbound_conn, session, dispatcher) => {
+                    if let Err(e) = result {
+                        warn!(tag = %tag, error = %e, "proxy process failed");
+                    }
+                    // 正常结束，无需额外操作
+                }
+                _ = done_signal.wait() => {
+                    // 不活动超时，连接被半关闭
+                    warn!(tag = %tag, timeout = ?DEFAULT_CONN_IDLE_TIMEOUT, "connection cancelled after inactivity");
+                }
             }
         });
     }
@@ -481,7 +502,7 @@ impl UdpWorker {
         });
     }
 
-    /// 清理空闲超过 120 秒的 UDP session。
+    /// 清理空闲超过 policy timeout 的 UDP session。
     fn cleanup_inactive(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -490,9 +511,10 @@ impl UdpWorker {
 
         let mut sessions = self.active_sessions.write();
         let before = sessions.len();
+        let timeout_secs = DEFAULT_CONN_IDLE_TIMEOUT.as_secs() as i64;
         sessions.retain(|s| {
             let idle_secs = now - s.last_activity_secs();
-            if idle_secs > 120 {
+            if idle_secs > timeout_secs {
                 s.set_inactive();
                 false
             } else {

@@ -160,6 +160,11 @@ impl ActivityTimer {
     pub fn is_cancelled(&self) -> bool {
         self.done.is_cancelled()
     }
+
+    /// 获取 Done 信号的克隆，用于外部等待超时。
+    pub fn done(&self) -> Done {
+        self.done.clone()
+    }
 }
 
 // ========== PubSub (Go: signal/pubsub) ==========
@@ -374,6 +379,21 @@ mod tests {
         // timer 不应立即取消
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!timer.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_activity_timer_done_signal() {
+        let mut timer = ActivityTimer::new(Duration::from_millis(100));
+        let mut done = timer.done();
+
+        // spawn timer run，超时后 done 信号应触发
+        tokio::spawn(async move {
+            timer.run().await;
+        });
+
+        // 等待 done 信号
+        let cancelled = done.wait().await;
+        assert!(cancelled);
     }
 
     // ---- PubSub 测试 ----
