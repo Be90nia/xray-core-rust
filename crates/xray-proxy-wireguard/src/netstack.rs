@@ -212,7 +212,7 @@ impl phy::TxToken for VirtTxToken {
         // ponytail: 直接用 Vec<u8> 作缓冲，避免额外的 buf pool 抽象
         let mut buf = vec![0u8; len];
         let result = f(&mut buf);
-        // 安全：tx_queue_ptr 指向 VirtualDevice 内部 VecDeque，借用期间 driver 不并发访问
+        // SAFETY: tx_queue_ptr 指向 VirtualDevice 内部 VecDeque，借用期间 driver 不并发访问
         // （smoltcp Device 的 contract：transmit/receive 调用是同步的，token 消费完才返回）
         unsafe {
             (*self.tx_queue_ptr).push_back(buf);
@@ -221,7 +221,7 @@ impl phy::TxToken for VirtTxToken {
     }
 }
 
-// Safety: VirtualDevice 只在 driver task 单线程驱动，不跨线程共享。
+// SAFETY: VirtualDevice 只在 driver task 单线程驱动，不跨线程共享。
 // smoltcp 的 Device trait 期望单线程使用，但 driver task 的 future 需要 Send bound。
 unsafe impl Send for VirtualDevice {}
 unsafe impl Sync for VirtualDevice {}
