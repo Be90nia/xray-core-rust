@@ -22,9 +22,28 @@ use crate::config::{AuthType, ServerConfig};
 use crate::error::{Result, SocksError};
 use crate::protocol::{
     ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, AUTH_NOT_REQUIRED, AUTH_NO_MATCHING_METHOD,
-    AUTH_PASSWORD, CMD_TCP_CONNECT, SOCKS5_VERSION, STATUS_SUCCESS,
+    AUTH_PASSWORD, CMD_TCP_CONNECT, CMD_UDP_ASSOCIATE, SOCKS5_VERSION,
+    STATUS_CMD_NOT_SUPPORT, STATUS_SUCCESS,
     SocksAddr, parse_address_port,
 };
+
+/// SOCKS5 请求结果。区分 TCP CONNECT 和 UDP ASSOCIATE。
+pub enum SocksRequest {
+    /// TCP CONNECT 请求。包含目标地址。
+    TcpConnect(SocksAddr),
+    /// UDP ASSOCIATE 请求。包含 relay 地址和绑定的 UDP socket。
+    UdpAssociate(SocksAddr, tokio::net::UdpSocket),
+}
+
+impl std::fmt::Debug for SocksRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SocksRequest::TcpConnect(addr) => f.debug_tuple("TcpConnect").field(addr).finish(),
+            SocksRequest::UdpAssociate(addr, _) => f.debug_tuple("UdpAssociate").field(addr).field(&"<UdpSocket>").finish(),
+        }
+    }
+}
+
 
 /// SOCKS 服务端。切片2：listen + accept + handshake + 日志。
 ///
@@ -140,7 +159,7 @@ impl InboundHandler for SocksServer {
 /// 3. 如需密码认证: 读 [VER=1, ULEN, UNAME, PLEN, PASSWD] + 校验 + 回 [VER=1, STATUS]
 /// 4. 读请求 [VER=5, CMD, RSV=0, ATYP, DST.ADDR, DST.PORT]
 /// 5. 回复 [VER=5, REP=0(success), RSV=0, ATYP=1, 0.0.0.0, 0]
-pub async fn socks5_server_handshake<RW>(stream: &mut RW, config: &ServerConfig) -> Result<SocksAddr>
+pub async fn socks5_server_handshake<RW>(stream: &mut RW, config: &ServerConfig) -> Result<SocksRequest>
 where
     RW: AsyncReadExt + AsyncWriteExt + Unpin,
 {
@@ -184,11 +203,13 @@ where
             req_header[0]
         )));
     }
-    if req_header[1] != CMD_TCP_CONNECT {
-        // 切片2 只支持 CONNECT; BIND/UDP_ASSOCIATE 留切片3
+    let cmd = req_header[1];
+    if cmd != CMD_TCP_CONNECT && cmd != CMD_UDP_ASSOCIATE {
+        // 不支持的 CMD
+        let reply = [SOCKS5_VERSION, STATUS_CMD_NOT_SUPPORT, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0];
+        let _ = stream.write_all(&reply).await;
         return Err(SocksError::HandshakeFailed(format!(
-            "unsupported CMD: {} (only CONNECT=1 supported)",
-            req_header[1]
+            "unsupported CMD: {cmd} (only CONNECT=1 and UDP_ASSOCIATE=3 supported)"
         )));
     }
 
@@ -196,13 +217,42 @@ where
     let atyp = req_header[3];
     let (addr, _consumed) = parse_address_port_from_stream(stream, atyp).await?;
 
-    // 步骤 5: 回复成功
+    if cmd == CMD_UDP_ASSOCIATE {
+        // UDP ASSOCIATE: bind 一个 UDP relay socket，回复 relay 地址给客户端
+        let relay_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await
+            .map_err(|e| SocksError::Io(e))?;
+        let relay_addr = relay_socket.local_addr()
+            .map_err(|e| SocksError::Io(e))?;
+
+        // 回复 [VER=5, REP=0, RSV=0, ATYP=1, BND.ADDR, BND.PORT]
+        let octets = match relay_addr {
+            SocketAddr::V4(v4) => v4.ip().octets(),
+            SocketAddr::V6(v6) => {
+                // IPv6: ATYP=4 + 16 bytes + port
+                let mut reply = vec![SOCKS5_VERSION, STATUS_SUCCESS, 0x00, ATYP_IPV6];
+                reply.extend_from_slice(&v6.ip().octets());
+                reply.extend_from_slice(&v6.port().to_be_bytes());
+                stream.write_all(&reply).await?;
+                return Ok(SocksRequest::UdpAssociate(SocksAddr::from_socket_addr(relay_addr), relay_socket));
+            }
+        };
+        let port_bytes = relay_addr.port().to_be_bytes();
+        stream.write_all(&[
+            SOCKS5_VERSION, STATUS_SUCCESS, 0x00, ATYP_IPV4,
+            octets[0], octets[1], octets[2], octets[3],
+            port_bytes[0], port_bytes[1],
+        ]).await?;
+
+        return Ok(SocksRequest::UdpAssociate(SocksAddr::from_socket_addr(relay_addr), relay_socket));
+    }
+
+    // TCP CONNECT: 回复成功
     // [VER=5, REP=0, RSV=0, ATYP=1(IPv4), BND.ADDR=0.0.0.0, BND.PORT=0]
     stream
         .write_all(&[SOCKS5_VERSION, STATUS_SUCCESS, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0])
         .await?;
 
-    Ok(addr)
+    Ok(SocksRequest::TcpConnect(addr))
 }
 
 /// 根据客户端提供的方法列表 + 服务端配置选 method。
@@ -375,7 +425,10 @@ mod tests {
 
         let result = server.await.unwrap();
         assert!(result.is_ok());
-        let socks_addr = result.unwrap();
+        let socks_addr = match result.unwrap() {
+            SocksRequest::TcpConnect(addr) => addr,
+            other => panic!("expected TcpConnect, got {other:?}"),
+        };
         match &socks_addr.host {
             crate::protocol::Host::Ipv4(ip) => {
                 assert_eq!(ip.octets(), [1, 2, 3, 4]);
@@ -403,7 +456,10 @@ mod tests {
 
         let result = server.await.unwrap();
         assert!(result.is_ok());
-        let socks_addr = result.unwrap();
+        let socks_addr = match result.unwrap() {
+            SocksRequest::TcpConnect(addr) => addr,
+            other => panic!("expected TcpConnect, got {other:?}"),
+        };
         match &socks_addr.host {
             crate::protocol::Host::Domain(d) => {
                 assert_eq!(d, "example.com");
@@ -518,6 +574,57 @@ mod tests {
         match result {
             Ok(Ok(_)) => panic!("listener should be closed after close()"),
             Ok(Err(_)) | Err(_) => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_udp_associate_returns_relay_addr() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = ServerConfig::default();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            socks5_server_handshake(&mut sock, &config).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        // NoAuth negotiation
+        client.write_all(&[SOCKS5_VERSION, 1, AUTH_NOT_REQUIRED]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp[0], SOCKS5_VERSION);
+        assert_eq!(resp[1], AUTH_NOT_REQUIRED);
+        // Send UDP ASSOCIATE request (CMD=0x03, DST=0.0.0.0:0)
+        client
+            .write_all(&[
+                SOCKS5_VERSION, CMD_UDP_ASSOCIATE, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0,
+            ])
+            .await
+            .unwrap();
+        // Read reply: [VER=5, REP, RSV, ATYP, BND.ADDR, BND.PORT]
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[0], SOCKS5_VERSION);
+        assert_eq!(reply[1], STATUS_SUCCESS, "UDP ASSOCIATE should succeed");
+        // BND.ADDR should be 127.0.0.1 (the relay socket address)
+        assert_eq!(reply[3], ATYP_IPV4);
+        assert_eq!(&reply[4..8], &[127, 0, 0, 1]);
+        // BND.PORT should be non-zero (the relay socket port)
+        let relay_port = u16::from_be_bytes([reply[8], reply[9]]);
+        assert!(relay_port > 0, "relay port should be non-zero");
+
+        // Verify server side returned UdpAssociate variant
+        let result = server.await.unwrap();
+        assert!(result.is_ok());
+        match result.unwrap() {
+            SocksRequest::UdpAssociate(relay_addr, socket) => {
+                assert_eq!(relay_addr.host, crate::protocol::Host::Ipv4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+                assert_eq!(relay_addr.port, relay_port);
+                // Socket should be bound and usable
+                assert!(socket.local_addr().is_ok());
+            }
+            other => panic!("expected UdpAssociate, got {other:?}"),
         }
     }
 }
