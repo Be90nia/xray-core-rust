@@ -20,6 +20,10 @@ pub struct Buffer {
     inner: BytesMut,
     start: usize,
     end: usize,
+    /// UDP 目的地覆盖，对应 Go `buf.Buffer.UDP`。
+    /// 当 Buffer 承载 UDP 数据时，此字段记录目标地址，
+    /// 用于 UDP NAT 和 endpoint override 场景。
+    udp: Option<std::net::SocketAddr>,
 }
 
 impl Buffer {
@@ -34,6 +38,7 @@ impl Buffer {
             inner,
             start: 0,
             end: 0,
+            udp: None,
         }
     }
 
@@ -47,6 +52,7 @@ impl Buffer {
             inner,
             start: 0,
             end: 0,
+            udp: None,
         }
     }
 
@@ -61,6 +67,7 @@ impl Buffer {
             inner,
             start: 0,
             end,
+            udp: None,
         }
     }
 
@@ -73,6 +80,7 @@ impl Buffer {
             inner,
             start: 0,
             end: len,
+            udp: None,
         }
     }
 
@@ -265,6 +273,7 @@ impl Buffer {
     pub fn clear(&mut self) {
         self.start = 0;
         self.end = 0;
+        self.udp = None;
     }
 
     /// 截断缓冲区，仅保留前 n 字节未读数据。
@@ -274,6 +283,24 @@ impl Buffer {
         if n < self.len() {
             self.end = self.start + n;
         }
+    }
+
+    /// 获取 UDP 目的地覆盖。
+    ///
+    /// 对应 Go 的 `buf.Buffer.UDP`。
+    /// 当 Buffer 承载 UDP 数据时，此字段记录目标地址。
+    #[inline]
+    pub fn udp(&self) -> Option<std::net::SocketAddr> {
+        self.udp
+    }
+
+    /// 设置 UDP 目的地覆盖。
+    ///
+    /// 对应 Go 的 `buf.Buffer.UDP = dest`。
+    /// 用于 UDP NAT 和 endpoint override 场景。
+    #[inline]
+    pub fn set_udp(&mut self, dest: Option<std::net::SocketAddr>) {
+        self.udp = dest;
     }
 
     /// 从缓冲区前端分割出 n 字节，返回新的 Buffer。
@@ -297,6 +324,7 @@ impl Buffer {
             inner: new_inner,
             start: 0,
             end: n,
+            udp: None,
         }
     }
 
@@ -317,6 +345,7 @@ impl Buffer {
             inner: new_inner,
             start: 0,
             end: n,
+            udp: None,
         }
     }
 
@@ -362,6 +391,7 @@ impl Buffer {
     pub fn release(&mut self) {
         self.start = 0;
         self.end = 0;
+        self.udp = None;
         // 将 inner 替换为空，把旧的归还池中
         let old = std::mem::replace(&mut self.inner, BytesMut::new());
         alloc::release(old);
@@ -394,6 +424,7 @@ impl std::fmt::Debug for Buffer {
             .field("capacity", &self.capacity())
             .field("start", &self.start)
             .field("end", &self.end)
+            .field("udp", &self.udp)
             .finish()
     }
 }
@@ -716,5 +747,45 @@ mod tests {
         let n = buf.read_to(&mut dst);
         assert_eq!(n, 2);
         assert_eq!(&dst[..2], b"hi");
+    }
+
+    #[test]
+    fn test_udp_field_default_none() {
+        let buf = Buffer::new();
+        assert!(buf.udp().is_none());
+    }
+
+    #[test]
+    fn test_udp_set_and_get() {
+        let mut buf = Buffer::new();
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8080));
+        buf.set_udp(Some(addr));
+        assert_eq!(buf.udp(), Some(addr));
+    }
+
+    #[test]
+    fn test_udp_cleared_on_clear() {
+        let mut buf = Buffer::new();
+        buf.set_udp(Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9090))));
+        buf.clear();
+        assert!(buf.udp().is_none());
+    }
+
+    #[test]
+    fn test_udp_cleared_on_release() {
+        init();
+        let mut buf = Buffer::new();
+        buf.set_udp(Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9090))));
+        buf.release();
+        assert!(buf.udp().is_none());
+    }
+
+    #[test]
+    fn test_udp_not_carried_to_split() {
+        let mut buf = Buffer::from_bytes(BytesMut::from("hello world"));
+        buf.set_udp(Some(std::net::SocketAddr::from(([192, 168, 1, 1], 53))));
+        let front = buf.split_to(5);
+        // Split buffer 不继承 udp（新 Buffer 从 split 产生，语义上属于不同的数据包）
+        assert!(front.udp().is_none());
     }
 }
