@@ -6,6 +6,11 @@
 //! 验证 TCP 拨号端到端可用。桥接 `transport::Link`（link.reader/writer ↔ Connection）
 //! 与 Domain DNS 解析留切片3。
 
+use xray_app_proxyman::outbound::proxy_outbound::{OutboundDialer, ProxyOutbound};
+use xray_app_proxyman::error::ProxymanError;
+use xray_transport::bridge::bridge_link_with_stream_full;
+use xray_transport::link::Link;
+use std::sync::Arc;
 use async_trait::async_trait;
 use xray_common::net::destination::Destination;
 use xray_common::net::address::Address;
@@ -132,6 +137,38 @@ impl OutboundHandler for FreedomHandler {
     fn can_handle(&self, _destination: &Destination) -> bool {
         // Freedom 可处理任意目标：IP 直接拨号，Domain 按 DomainStrategy 解析后拨号。
         true
+    }
+}
+
+#[async_trait]
+impl ProxyOutbound for FreedomHandler {
+    /// Freedom 出站处理：拨号到目标地址，桥接 Link ↔ Connection。
+    ///
+    /// 对应 Go `freedom.(*Handler).Process(ctx, link, dialer)`。
+    async fn process(
+        &self,
+        session: &Session,
+        link: Link,
+        dialer: Arc<dyn OutboundDialer>,
+    ) -> Result<(), ProxymanError> {
+        let dest = session.destination()
+            .ok_or_else(|| ProxymanError::Other("freedom: no destination in session".to_string()))?;
+
+        let strategy = DomainStrategy::from_i32(self.config.domain_strategy);
+
+        let effective_dest = match dest.address() {
+            Address::IPv4(_) | Address::IPv6(_) => dest.clone(),
+            Address::Domain(domain) => {
+                self.resolve_domain(domain, dest.port().value(), strategy).await
+                    .map_err(|e| ProxymanError::OutboundProcessFailed(e.to_string()))?
+            }
+        };
+
+        let conn = dialer.dial(&effective_dest).await
+            .map_err(|e| ProxymanError::OutboundProcessFailed(format!("freedom dial failed: {e}")))?;
+
+        bridge_link_with_stream_full(link, conn).await
+            .map_err(|e| ProxymanError::OutboundProcessFailed(format!("bridge failed: {e}")))
     }
 }
 

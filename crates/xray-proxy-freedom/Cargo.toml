@@ -11,6 +11,7 @@ xray-features = { path = "../xray-features" }
 xray-transport = { path = "../xray-transport" }
 xray-buf = { path = "../xray-buf" }
 xray-app-dispatcher = { path = "../xray-app-dispatcher" }
+xray-app-proxyman = { path = "../xray-app-proxyman" }
 xray-proto = { path = "../xray-proto" }
 async-trait = "0.1"
 thiserror = { workspace = true }
