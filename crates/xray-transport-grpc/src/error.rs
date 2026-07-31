@@ -20,6 +20,10 @@ pub enum GrpcError {
     /// IO 错误。
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// 解压失败（如 gzip 解压错误或不支持的压缩算法）。
+    #[error("grpc decompression failed: {0}")]
+    Decompression(String),
 }
 
 /// gRPC 操作 Result 别名。

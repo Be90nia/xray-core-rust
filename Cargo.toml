@@ -135,6 +135,7 @@ tonic-prost-build = "0.14"
 ring = "0.17"
 # Shadowsocks 加密原语（对应 Go shadowsocks/go-shadowsocks2；shadowsocks 是 lib crate，shadowsocks-rust 是 binary）
 shadowsocks = { version = "1.24", default-features = false, features = ["aead-cipher"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 # 代理协议库（批次 A：AnyTLS）
 anytls = { version = "0.3.5", default-features = false, features = ["client", "server"] }

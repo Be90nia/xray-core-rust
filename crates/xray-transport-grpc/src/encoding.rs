@@ -31,6 +31,7 @@
 //! - 编码：`tag(0x0a) + varint_len(data) + data`
 
 use std::future::Future;
+use std::io::Read as _;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -39,10 +40,56 @@ use xray_buf::io::{Reader, Writer};
 use xray_buf::multi::MultiBuffer;
 
 use crate::error::{GrpcError, Result};
+use flate2::read::GzDecoder;
 
 // ============================================================================
-// Hunk proto 手动编解码（不依赖 prost codegen，避开 proto 文件维护负担）
+// gRPC 压缩算法（对应 Go grpc-go encoding.Compressor 注册表）
 // ============================================================================
+
+/// gRPC 压缩算法标识，由 HTTP/2 `grpc-encoding` header 决定。
+///
+/// 对应 Go `grpc-go/encoding` 包的 `Compressor` 注册机制。
+/// 当前仅支持 gzip（与 Go grpc-go 内置一致）；deflate/snappy/zstd 需第三方注册。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressionEncoding {
+    /// gzip 压缩（gRPC 默认内置，Go grpc-go `encoding/gzip` 包 `init()` 自动注册）。
+    Gzip,
+}
+
+impl CompressionEncoding {
+    /// 从 `grpc-encoding` header 值解析。
+    ///
+    /// 返回 `None` 表示不识别或不支持（如 "identity"、"snappy"、"deflate"）。
+    pub fn from_header(value: &str) -> Option<Self> {
+        match value {
+            "gzip" => Some(Self::Gzip),
+            _ => None,
+        }
+    }
+
+    /// 返回对应的 `grpc-encoding` header 值。
+    pub fn as_header(self) -> &'static str {
+        match self {
+            Self::Gzip => "gzip",
+        }
+    }
+}
+
+/// 解压 gRPC frame payload。
+///
+/// `compressed=1` 时 payload 是压缩后的 protobuf，需先解压再解码 Hunk。
+fn decompress_payload(payload: &[u8], encoding: CompressionEncoding) -> Result<Vec<u8>> {
+    match encoding {
+        CompressionEncoding::Gzip => {
+            let mut decoder = GzDecoder::new(payload);
+            let mut buf = Vec::with_capacity(payload.len());
+            decoder
+                .read_to_end(&mut buf)
+                .map_err(|e| GrpcError::Decompression(format!("gzip: {e}")))?;
+            Ok(buf)
+        }
+    }
+}
 
 /// Hunk proto field tag：field_number=1, wire_type=2(length-delimited)。
 const HUNK_TAG: u8 = 0x0a;
@@ -214,20 +261,18 @@ pub fn encode_hunk_frame(data: &[u8]) -> Vec<u8> {
 
 /// 解析一个完整的 gRPC frame。
 ///
+/// `encoding` 指定对端声明的压缩算法（来自 HTTP/2 `grpc-encoding` header）。
+/// `compressed=1` 时必须提供 `Some(encoding)`，否则返回 `Decompression` 错误。
+///
 /// # 返回
 /// - `Ok(None)`：缓冲区不足一个完整 frame，需要继续读
 /// - `Ok(Some((consumed, data)))`：成功解析，consumed 是本 frame 在 buf 中占用的字节数
-/// - `Err`：协议错误（截断、长度超限、压缩标志非 0、Hunk 解码失败）
-pub fn decode_hunk_frame(buf: &[u8]) -> Result<Option<(usize, Vec<u8>)>> {
+/// - `Err`：协议错误（截断、长度超限、压缩算法不支持、解压失败、Hunk 解码失败）
+pub fn decode_hunk_frame(buf: &[u8], encoding: Option<CompressionEncoding>) -> Result<Option<(usize, Vec<u8>)>> {
     if buf.len() < FRAME_HEADER_LEN {
         return Ok(None);
     }
     let compressed = buf[0];
-    if compressed != 0 {
-        return Err(GrpcError::InvalidConfig(format!(
-            "grpc frame: compressed flag {compressed} not supported"
-        )));
-    }
     let payload_len = u32::from_be_bytes([
         buf[1], buf[2], buf[3], buf[4],
     ]) as usize;
@@ -242,7 +287,18 @@ pub fn decode_hunk_frame(buf: &[u8]) -> Result<Option<(usize, Vec<u8>)>> {
     if buf.len() < frame_end {
         return Ok(None);
     }
-    let hunk = Hunk::decode(&buf[FRAME_HEADER_LEN..frame_end])?;
+    let raw_payload = &buf[FRAME_HEADER_LEN..frame_end];
+    let payload = if compressed != 0 {
+        let enc = encoding.ok_or_else(|| {
+            GrpcError::Decompression(
+                "grpc frame: compressed flag set but no grpc-encoding header".into(),
+            )
+        })?;
+        decompress_payload(raw_payload, enc)?
+    } else {
+        raw_payload.to_vec()
+    };
+    let hunk = Hunk::decode(&payload)?;
     Ok(Some((frame_end, hunk.data)))
 }
 
@@ -263,20 +319,17 @@ pub fn encode_multi_hunk_frame(chunks: &[&[u8]]) -> Vec<u8> {
 
 /// 解析一个完整的 gRPC frame（MultiHunk 版本）。
 ///
+/// `encoding` 语义同 [`decode_hunk_frame`]。
+///
 /// # 返回
 /// - `Ok(None)`：缓冲区不足一个完整 frame
 /// - `Ok(Some((consumed, data_vec)))`：成功解析，data_vec 是 repeated bytes 的列表
 /// - `Err`：协议错误
-pub fn decode_multi_hunk_frame(buf: &[u8]) -> Result<Option<(usize, Vec<Vec<u8>>)>> {
+pub fn decode_multi_hunk_frame(buf: &[u8], encoding: Option<CompressionEncoding>) -> Result<Option<(usize, Vec<Vec<u8>>)>> {
     if buf.len() < FRAME_HEADER_LEN {
         return Ok(None);
     }
     let compressed = buf[0];
-    if compressed != 0 {
-        return Err(GrpcError::InvalidConfig(format!(
-            "grpc frame: compressed flag {compressed} not supported"
-        )));
-    }
     let payload_len = u32::from_be_bytes([
         buf[1], buf[2], buf[3], buf[4],
     ]) as usize;
@@ -291,7 +344,18 @@ pub fn decode_multi_hunk_frame(buf: &[u8]) -> Result<Option<(usize, Vec<Vec<u8>>
     if buf.len() < frame_end {
         return Ok(None);
     }
-    let mh = MultiHunk::decode(&buf[FRAME_HEADER_LEN..frame_end])?;
+    let raw_payload = &buf[FRAME_HEADER_LEN..frame_end];
+    let payload = if compressed != 0 {
+        let enc = encoding.ok_or_else(|| {
+            GrpcError::Decompression(
+                "grpc frame: compressed flag set but no grpc-encoding header".into(),
+            )
+        })?;
+        decompress_payload(raw_payload, enc)?
+    } else {
+        raw_payload.to_vec()
+    };
+    let mh = MultiHunk::decode(&payload)?;
     Ok(Some((frame_end, mh.data)))
 }
 
@@ -680,7 +744,7 @@ mod tests {
     fn frame_decode_complete() {
         let original = b"some test data".to_vec();
         let frame = encode_hunk_frame(&original);
-        let (consumed, data) = decode_hunk_frame(&frame).unwrap().unwrap();
+        let (consumed, data) = decode_hunk_frame(&frame, None).unwrap().unwrap();
         assert_eq!(consumed, frame.len());
         assert_eq!(data, original);
     }
@@ -689,11 +753,11 @@ mod tests {
     fn frame_decode_partial_returns_none() {
         let frame = encode_hunk_frame(b"hello");
         // 只给前 3 字节（不足 frame header）
-        assert!(matches!(decode_hunk_frame(&frame[..3]), Ok(None)));
+        assert!(matches!(decode_hunk_frame(&frame[..3], None), Ok(None)));
         // 只给 header 但缺 payload
-        assert!(matches!(decode_hunk_frame(&frame[..5]), Ok(None)));
+        assert!(matches!(decode_hunk_frame(&frame[..5], None), Ok(None)));
         // 给 header + 部分 payload
-        assert!(matches!(decode_hunk_frame(&frame[..6]), Ok(None)));
+        assert!(matches!(decode_hunk_frame(&frame[..6], None), Ok(None)));
     }
 
     #[test]
@@ -704,12 +768,12 @@ mod tests {
         combined.extend_from_slice(&f2);
 
         // 解析第一帧
-        let (consumed1, data1) = decode_hunk_frame(&combined).unwrap().unwrap();
+        let (consumed1, data1) = decode_hunk_frame(&combined, None).unwrap().unwrap();
         assert_eq!(consumed1, f1.len());
         assert_eq!(data1, b"first");
 
         // 解析第二帧
-        let (consumed2, data2) = decode_hunk_frame(&combined[consumed1..])
+        let (consumed2, data2) = decode_hunk_frame(&combined[consumed1..], None)
             .unwrap()
             .unwrap();
         assert_eq!(consumed2, f2.len());
@@ -717,11 +781,11 @@ mod tests {
     }
 
     #[test]
-    fn frame_decode_compressed_flag_rejected() {
-        // 手工构造 compressed=1 的 frame
+    fn frame_decode_compressed_without_encoding_errors() {
+        // compressed=1 但未提供 encoding → Decompression 错误
         let bad = vec![0x01, 0x00, 0x00, 0x00, 0x00];
-        let err = decode_hunk_frame(&bad).unwrap_err();
-        assert!(format!("{err}").contains("compressed"));
+        let err = decode_hunk_frame(&bad, None).unwrap_err();
+        assert!(format!("{err}").contains("decompression"));
     }
 
     #[test]
@@ -735,8 +799,33 @@ mod tests {
             oversize[2],
             oversize[3],
         ];
-        let err = decode_hunk_frame(&bad).unwrap_err();
+        let err = decode_hunk_frame(&bad, None).unwrap_err();
         assert!(format!("{err}").contains("exceeds max"));
+    }
+
+    #[test]
+    fn frame_decode_gzip_compressed_roundtrip() {
+        use flate2::write::GzEncoder;
+        use std::io::Write as _;
+
+        let original = b"gzip compressed payload".to_vec();
+        let hunk_payload = Hunk::new(original.clone()).encode_to_vec();
+
+        // gzip 压缩 hunk payload
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&hunk_payload).unwrap();
+        let compressed_payload = encoder.finish().unwrap();
+
+        // 构造 compressed=1 的 gRPC frame
+        let mut frame = vec![0x01]; // compressed = true
+        frame.extend_from_slice(&(compressed_payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&compressed_payload);
+
+        let (consumed, data) = decode_hunk_frame(&frame, Some(CompressionEncoding::Gzip))
+            .unwrap()
+            .unwrap();
+        assert_eq!(consumed, frame.len());
+        assert_eq!(data, original);
     }
 
     // ---- Mock HunkStream ----
@@ -837,7 +926,7 @@ mod tests {
         let frame = encode_hunk_frame(&original);
 
         // 模拟 stream：先 decode frame 拿 data 入队，再让 writer 写出后验证
-        let (_consumed, decoded_data) = decode_hunk_frame(&frame).unwrap().unwrap();
+        let (_consumed, decoded_data) = decode_hunk_frame(&frame, None).unwrap().unwrap();
         assert_eq!(decoded_data, original);
     }
 
