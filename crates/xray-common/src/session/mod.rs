@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use crate::net::destination::Destination;
 use crate::net::network::Network;
+use crate::protocol::user::User;
 use crate::uuid::UUID;
 
 // ========== Session ID ==========
@@ -60,6 +61,10 @@ pub struct Inbound {
     pub network: Option<Network>,
     /// 入站目标地址（对应 Go session.Destination）。
     pub destination: Option<Destination>,
+    /// 连接来源地址（对应 Go session.Source）。
+    pub source: Option<Destination>,
+    /// 认证用户（对应 Go session.User）。
+    pub user: Option<User>,
 }
 
 impl Inbound {
@@ -69,6 +74,8 @@ impl Inbound {
             tag: None,
             network: None,
             destination: None,
+            source: None,
+            user: None,
         }
     }
 
@@ -89,6 +96,18 @@ impl Inbound {
         self.destination = Some(dest);
         self
     }
+
+    /// 设置来源地址（builder 模式）。
+    pub fn with_source(mut self, source: Destination) -> Self {
+        self.source = Some(source);
+        self
+    }
+
+    /// 设置认证用户（builder 模式）。
+    pub fn with_user(mut self, user: User) -> Self {
+        self.user = Some(user);
+        self
+    }
 }
 
 impl Default for Inbound {
@@ -106,6 +125,12 @@ pub struct Outbound {
     pub tag: Option<String>,
     /// 目的地覆盖（可选）。
     pub destination_override: Option<Destination>,
+    /// 网关地址（对应 Go session.Gateway）。
+    pub gateway: Option<Destination>,
+    /// 最终目标地址（对应 Go session.Target）。
+    pub target: Option<Destination>,
+    /// 原始目标地址（透明代理用，对应 Go session.OriginalTarget）。
+    pub original_target: Option<Destination>,
 }
 
 impl Outbound {
@@ -114,6 +139,9 @@ impl Outbound {
         Self {
             tag: None,
             destination_override: None,
+            gateway: None,
+            target: None,
+            original_target: None,
         }
     }
 
@@ -126,6 +154,24 @@ impl Outbound {
     /// 设置目的地覆盖（builder 模式）。
     pub fn with_destination_override(mut self, dest: Destination) -> Self {
         self.destination_override = Some(dest);
+        self
+    }
+
+    /// 设置网关地址（builder 模式）。
+    pub fn with_gateway(mut self, gateway: Destination) -> Self {
+        self.gateway = Some(gateway);
+        self
+    }
+
+    /// 设置最终目标地址（builder 模式）。
+    pub fn with_target(mut self, target: Destination) -> Self {
+        self.target = Some(target);
+        self
+    }
+
+    /// 设置原始目标地址（builder 模式）。
+    pub fn with_original_target(mut self, target: Destination) -> Self {
+        self.original_target = Some(target);
         self
     }
 }
@@ -297,6 +343,33 @@ impl Session {
             .as_ref()
             .or(self.inbound.destination.as_ref())
     }
+
+    /// 获取连接来源地址（对应 Go session.Source）。
+    pub fn source(&self) -> Option<&Destination> {
+        self.inbound.source.as_ref()
+    }
+
+    /// 获取认证用户（对应 Go session.User）。
+    pub fn user(&self) -> Option<&User> {
+        self.inbound.user.as_ref()
+    }
+
+    /// 获取网关地址（对应 Go session.Gateway）。
+    pub fn gateway(&self) -> Option<&Destination> {
+        self.outbound.gateway.as_ref()
+    }
+
+    /// 获取最终目标地址（对应 Go session.Target）。
+    /// 优先返回 `outbound.target`，否则回退到 `destination()`。
+    pub fn target(&self) -> Option<&Destination> {
+        self.outbound.target.as_ref().or(self.destination())
+    }
+
+    /// 获取原始目标地址（透明代理用，对应 Go session.OriginalTarget）。
+    pub fn original_target(&self) -> Option<&Destination> {
+        self.outbound.original_target.as_ref()
+    }
+
 }
 
 impl Default for Session {
