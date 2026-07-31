@@ -58,6 +58,8 @@ pub struct Inbound {
     pub tag: Option<String>,
     /// 入站网络类型。
     pub network: Option<Network>,
+    /// 入站目标地址（对应 Go session.Destination）。
+    pub destination: Option<Destination>,
 }
 
 impl Inbound {
@@ -66,6 +68,7 @@ impl Inbound {
         Self {
             tag: None,
             network: None,
+            destination: None,
         }
     }
 
@@ -78,6 +81,12 @@ impl Inbound {
     /// 设置网络类型（builder 模式）。
     pub fn with_network(mut self, network: Network) -> Self {
         self.network = Some(network);
+        self
+    }
+
+    /// 设置目标地址（builder 模式）。
+    pub fn with_destination(mut self, dest: Destination) -> Self {
+        self.destination = Some(dest);
         self
     }
 }
@@ -276,6 +285,17 @@ impl Session {
     /// 获取属性。
     pub fn get_attribute(&self, key: &str) -> Option<&str> {
         self.attributes.get(key).map(|s| s.as_str())
+    }
+
+    /// 获取入站目标地址（对应 Go session.Destination）。
+    ///
+    /// 优先返回 `outbound.destination_override`（如果设置了），
+    /// 否则返回 `inbound.destination`。
+    pub fn destination(&self) -> Option<&Destination> {
+        self.outbound
+            .destination_override
+            .as_ref()
+            .or(self.inbound.destination.as_ref())
     }
 }
 
