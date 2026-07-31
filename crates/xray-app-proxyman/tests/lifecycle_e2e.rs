@@ -88,6 +88,19 @@ impl OutboundHandler for CountingOutHandler {
     fn proxy_type_url(&self) -> &str {
         "xray.test.counting_out"
     }
+    fn dispatch(
+        &self,
+        _session: xray_common::session::Session,
+        _link: xray_transport::link::Link,
+    ) -> PinFuture<Result<(), ProxymanError>> {
+        Box::pin(async { Err(ProxymanError::Other("test stub: no dispatch".into())) })
+    }
+    fn dial(
+        &self,
+        _dest: &xray_common::net::destination::Destination,
+    ) -> PinFuture<std::io::Result<Box<dyn xray_transport::connection::Connection>>> {
+        Box::pin(async { Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "test stub: no dial")) })
+    }
 }
 
 // ===== E2E tests =====
@@ -110,6 +123,7 @@ async fn multi_inbound_outbound_lifecycle_e2e() {
             in_start.clone(),
             in_close.clone(),
         )))
+        .await
         .unwrap();
         om.add_handler(Arc::new(CountingOutHandler::new(
             format!("out-{i}"),
@@ -158,6 +172,7 @@ async fn dynamic_add_after_start_e2e() {
         Arc::new(AtomicU32::new(0)),
         Arc::new(AtomicU32::new(0)),
     )))
+    .await
     .unwrap();
     om.add_handler(Arc::new(CountingOutHandler::new(
         "initial-out",
@@ -175,6 +190,7 @@ async fn dynamic_add_after_start_e2e() {
         Arc::new(AtomicU32::new(0)),
         Arc::new(AtomicU32::new(0)),
     )))
+    .await
     .unwrap();
     om.add_handler(Arc::new(CountingOutHandler::new(
         "post-start-out",
@@ -202,12 +218,14 @@ async fn remove_handler_decrements_count_e2e() {
         Arc::new(AtomicU32::new(0)),
         Arc::new(AtomicU32::new(0)),
     )))
+    .await
     .unwrap();
     im.add_handler(Arc::new(CountingInHandler::new(
         "in-b",
         Arc::new(AtomicU32::new(0)),
         Arc::new(AtomicU32::new(0)),
     )))
+    .await
     .unwrap();
     om.add_handler(Arc::new(CountingOutHandler::new(
         "out-a",
@@ -220,7 +238,7 @@ async fn remove_handler_decrements_count_e2e() {
     assert_eq!(om.handler_count(), 1);
 
     // remove inbound
-    im.remove_handler("in-a").unwrap();
+    im.remove_handler("in-a").await.unwrap();
     assert_eq!(im.handler_count(), 1);
     assert!(im.get_handler("in-a").is_err());
 
