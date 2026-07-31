@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use xray_features::{Feature, FeatureError, Result};
+use tokio_util::sync::CancellationToken;
 
 /// Xray 实例。一个实例承载一整套 Feature（dns/router/policy/stats/inbound/outbound 等），
 /// 注册顺序决定 `start` 顺序，`close` 顺序为 `start` 的逆序。
@@ -30,6 +31,8 @@ pub struct Instance {
     running: bool,
     /// 生命周期状态锁，保证 `start`/`close`/`add_feature` 互斥。
     state_lock: parking_lot::Mutex<()>,
+    /// 关闭时取消此 token，所有监听此 token 的连接/任务应主动终止。
+    shutdown_token: CancellationToken,
 }
 
 impl Instance {
@@ -41,6 +44,7 @@ impl Instance {
             feature_typed: HashMap::new(),
             running: false,
             state_lock: parking_lot::Mutex::new(()),
+            shutdown_token: CancellationToken::new(),
         }
     }
 
@@ -127,9 +131,6 @@ impl Instance {
         // 对应 Go xray-core InitSystemDialer。
         xray_transport::system_dialer::init_system_dialer();
 
-        // 初始化系统拨号器：安装 DNS 解析能力，使 Domain 目标地址可拨号。
-        // 对应 Go xray-core InitSystemDialer。
-        xray_transport::system_dialer::init_system_dialer();
 
         tracing::info!(
             app_count = inst.feature_count(),
@@ -230,6 +231,11 @@ impl Instance {
         Ok(())
     }
 
+    /// 返回 shutdown token 的引用，供 worker/连接监听关闭信号。
+    pub fn shutdown_token(&self) -> &CancellationToken {
+        &self.shutdown_token
+    }
+
     /// 关闭实例：按注册**逆序**调用所有 feature 的 `close`，聚合所有错误。
     ///
     /// 关闭后实例不可重启（与 Go 一致）。即使部分 feature close 失败，
@@ -240,6 +246,8 @@ impl Instance {
             return Ok(());
         }
         self.running = false;
+        // 取消 shutdown token，通知所有监听此 token 的连接/任务主动终止。
+        self.shutdown_token.cancel();
         let mut errors: Vec<FeatureError> = Vec::new();
         // 逆序关闭：后注册的先关闭，模拟栈式生命周期。
         for feat in self.features.iter().rev() {
