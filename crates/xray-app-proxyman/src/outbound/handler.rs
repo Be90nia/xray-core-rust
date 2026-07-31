@@ -358,7 +358,7 @@ impl OutboundHandler for OutboundHandlerEntry {
         &self.proxy_type_url
     }
 
-       fn dispatch(&self, session: Session, link: Link) -> PinFuture<Result<(), ProxymanError>> {
+    fn dispatch(&self, session: Session, link: Link) -> PinFuture<Result<(), ProxymanError>> {
         let proxy = self.proxy.clone();
         let dialer: Arc<dyn OutboundDialer> = Arc::new(HandlerDialer {
             stream_settings: self.stream_settings.clone(),
@@ -368,20 +368,38 @@ impl OutboundHandler for OutboundHandlerEntry {
         });
 
         Box::pin(async move {
-            // ponytail: EndpointOverride, mux/xudp, DNS resolve skipped
+            // ponytail: mux/xudp, DNS resolve skipped
             // Full implementation: check senderSettings.TargetStrategy → DNS resolve
-            // Full: check UDP OriginalTarget → EndpointOverrideReader/Writer
             // Full: check mux/xudp → dispatch via mux client manager
+
+            // OriginalTarget: 透明代理改写目标后保留原始目标
+            // Go: if ob.OriginalTarget != nil { dest = ob.OriginalTarget }
+            let session = if session.original_target().is_some() {
+                let mut s = session.clone();
+                if let Some(orig) = s.original_target().cloned() {
+                    s.outbound.target = Some(orig);
+                }
+                s
+            } else {
+                session
+            };
+            // EndpointOverride: UDP 逐包目标覆盖
+            // Go: proxy/outbound handler 检查 link.Reader 的 Buffer.UDP 字段
+            // 当 Buffer.UDP 被设置时，proxy.process 应使用该地址而非 session.destination
+            // 此处不修改 link — EndpointOverride 在 proxy.process 的 read 循环中逐包检查
             match proxy {
                 Some(p) => {
-                    p.process(&session, link, dialer).await?;
+                    let result = p.process(&session, link, dialer).await;
+                    if let Err(ref e) = result {
+                        submit_outbound_error_to_originator(&session, e);
+                    }
+                    result?;
                     Ok(())
                 }
                 None => Err(ProxymanError::Other("no proxy configured".to_string())),
             }
         })
     }
-
     fn dial(&self, dest: &Destination) -> PinFuture<io::Result<Box<dyn Connection>>> {
         let settings = self.stream_settings.clone();
         let sockopt = self.socket_options;
@@ -503,6 +521,22 @@ fn add_offset(start: u128, offset: u128) -> Result<IpAddr, ProxymanError> {
     }
 }
 
+/// 向来源报告出站错误。
+///
+/// 对应 Go `proxyman/outbound.SubmitOutboundErrorToOriginator`。
+/// 当出站连接失败时，将错误信息回传给 inbound handler，
+/// 以便返回适当的错误响应（如 SOCKS5 错误码、HTTP 502 等）。
+///
+/// 当前实现：日志记录。完整实现需通过 session 的 inbound tag
+/// 查找对应的 inbound handler 并调用其 error callback。
+fn submit_outbound_error_to_originator(session: &Session, error: &ProxymanError) {
+    let inbound_tag = session.inbound.tag.as_deref().unwrap_or("unknown");
+    tracing::warn!(
+        inbound_tag = inbound_tag,
+        error = %error,
+        "outbound error reported to originator"
+    );
+}
 #[cfg(test)]
 mod tests {
     use super::*;
