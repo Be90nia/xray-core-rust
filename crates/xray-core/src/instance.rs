@@ -107,9 +107,30 @@ impl Instance {
                         "no FeatureFactory registered for kind, skipping"
                     );
                 }
+                Err(FeatureError::StartFailed { ref name, ref message }) => {
+                    // Stub factory 返回 StartFailed = 该 Feature 尚未实现，非致命
+                    tracing::warn!(
+                        kind = %name,
+                        message = %message,
+                        "feature not yet implemented (stub factory), skipping"
+                    );
+                }
                 Err(e) => return Err(e),
             }
         }
+
+        // essentialFeatures: 当配置中缺少关键 app 时，注入默认空实现，
+        // 确保最小配置也能正常启动（对应 Go xray-core essentialFeatures）。
+        ensure_essential_features(&mut inst);
+
+        // InitSystemDialer: 注入 DNS 解析能力，使 Domain 目标地址可拨号。
+        // 对应 Go xray-core InitSystemDialer。
+        xray_transport::system_dialer::init_system_dialer();
+
+        // 初始化系统拨号器：安装 DNS 解析能力，使 Domain 目标地址可拨号。
+        // 对应 Go xray-core InitSystemDialer。
+        xray_transport::system_dialer::init_system_dialer();
+
         tracing::info!(
             app_count = inst.feature_count(),
             inbound_count = built.inbound_count(),
@@ -499,3 +520,30 @@ mod tests {
         assert!(!inst.is_running());
     }
 }
+
+/// essentialFeatures: 当配置中缺少关键 app 时，注入默认空实现。
+/// 对应 Go xray-core `essentialFeatures` 函数。
+fn ensure_essential_features(inst: &mut Instance) {
+    use xray_features::dns::DefaultDnsFeature;
+    use xray_features::policy::DefaultPolicyFeature;
+    use xray_features::routing::DefaultRouterFeature;
+    use xray_features::stats::DefaultStatsFeature;
+
+    if inst.get_feature::<DefaultDnsFeature>().is_none() {
+        tracing::info!("no dns feature configured, injecting default");
+        inst.add_feature(Arc::new(DefaultDnsFeature)).ok();
+    }
+    if inst.get_feature::<DefaultPolicyFeature>().is_none() {
+        tracing::info!("no policy feature configured, injecting default");
+        inst.add_feature(Arc::new(DefaultPolicyFeature)).ok();
+    }
+    if inst.get_feature::<DefaultRouterFeature>().is_none() {
+        tracing::info!("no router feature configured, injecting default");
+        inst.add_feature(Arc::new(DefaultRouterFeature)).ok();
+    }
+    if inst.get_feature::<DefaultStatsFeature>().is_none() {
+        tracing::info!("no stats feature configured, injecting default");
+        inst.add_feature(Arc::new(DefaultStatsFeature::new())).ok();
+    }
+}
+

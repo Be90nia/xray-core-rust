@@ -5,6 +5,7 @@
 use async_trait::async_trait;
 use xray_common::net::destination::Destination;
 use xray_common::session::Session;
+use crate::Feature;
 
 /// Feature type identifier for Router.
 pub const FEATURE_ROUTER: &str = "router";
@@ -47,6 +48,17 @@ impl std::fmt::Display for RoutingError {
 }
 
 impl std::error::Error for RoutingError {}
+
+/// 默认 Router Feature 实现（essentialFeatures fallback）。
+///
+/// 当配置中没有指定 routing app 时，Instance 使用此空实现占位。
+pub struct DefaultRouterFeature;
+
+impl Feature for DefaultRouterFeature {
+    fn feature_name(&self) -> &'static str {
+        "default_router"
+    }
+}
 
 #[cfg(test)]
 mod tests {

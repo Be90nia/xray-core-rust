@@ -355,3 +355,72 @@ mod tests {
         assert!(destination_to_socket_addr(&dest).is_err());
     }
 }
+
+/// DNS 解析系统拨号器——在 DefaultSystemDialer 前增加 DNS 解析能力。
+///
+/// 当目标地址为 Domain 时，使用 `tokio::net::lookup_host` 解析为 IP，
+/// 再委托给 DefaultSystemDialer 拨号。对应 Go `InitSystemDialer` 的 DNS 解析部分。
+pub struct DnsResolvingDialer {
+    inner: DefaultSystemDialer,
+}
+
+impl DnsResolvingDialer {
+    /// 构造 DNS 解析拨号器。
+    #[must_use]
+    pub fn new() -> Self {
+        Self { inner: DefaultSystemDialer::new() }
+    }
+}
+
+impl SystemDialer for DnsResolvingDialer {
+    fn dial<'a>(
+        &'a self,
+        src: Option<SocketAddr>,
+        destination: &'a Destination,
+        sockopt: &'a SocketOptions,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Connection>>> + Send + 'a>> {
+        Box::pin(async move {
+            match destination.address() {
+                xray_common::net::address::Address::Domain(domain) => {
+                    let port = destination.port().value();
+                    let lookup = format!("{domain}:{port}");
+                    tracing::debug!(target = %lookup, "resolving domain via system DNS");
+                    match tokio::net::lookup_host(&lookup).await {
+                        Ok(mut addrs) => {
+                            if let Some(resolved) = addrs.next() {
+                                tracing::debug!(target = %lookup, resolved = %resolved, "domain resolved");
+                                let ip_dest = Destination::tcp(
+                                    xray_common::net::address::Address::from(resolved.ip()),
+                                    destination.port(),
+                                );
+                                self.inner.dial(src, &ip_dest, sockopt).await
+                            } else {
+                                Err(io::Error::new(
+                                    io::ErrorKind::AddrNotAvailable,
+                                    format!("DNS lookup returned no addresses for {domain}"),
+                                ))
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(target = %domain, error = %e, "DNS lookup failed");
+                            Err(io::Error::new(
+                                io::ErrorKind::AddrNotAvailable,
+                                format!("DNS lookup failed for {domain}: {e}"),
+                            ))
+                        }
+                    }
+                }
+                _ => self.inner.dial(src, destination, sockopt).await,
+            }
+        })
+    }
+}
+
+/// 初始化系统拨号器：安装 DNS 解析能力。对应 Go `InitSystemDialer`。
+///
+/// 首次调用时将全局 effective dialer 替换为 [`DnsResolvingDialer`]。
+/// 后续调用幂等（不会重复包装）。
+pub fn init_system_dialer() {
+    use_alternative_system_dialer(Some(Box::new(DnsResolvingDialer::new())));
+    tracing::info!("system dialer initialized with DNS resolution");
+}

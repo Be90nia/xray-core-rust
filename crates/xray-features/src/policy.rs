@@ -4,6 +4,7 @@
 
 use async_trait::async_trait;
 use std::time::Duration;
+use crate::Feature;
 
 /// Feature type identifier for Policy.
 pub const FEATURE_POLICY: &str = "policy";
@@ -122,6 +123,17 @@ impl Default for BufferPolicy {
 pub trait PolicyManager: Send + Sync {
     /// Get the policy for the given user level.
     fn policy_for_level(&self, level: u32) -> Policy;
+}
+
+/// 默认 Policy Feature 实现（essentialFeatures fallback）。
+///
+/// 当配置中没有指定 policy app 时，Instance 使用此空实现占位。
+pub struct DefaultPolicyFeature;
+
+impl Feature for DefaultPolicyFeature {
+    fn feature_name(&self) -> &'static str {
+        "default_policy"
+    }
 }
 
 #[cfg(test)]

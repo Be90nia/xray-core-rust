@@ -32,14 +32,6 @@ use xray_transport::listener_registry::{
     register_transport_listener,
 };
 use xray_transport::sockopt::SocketOptions;
-use std::sync::Arc;
-
-use xray_common::net::destination::Destination;
-use xray_transport::connection::Connection;
-use xray_transport::dialer::{
-    StreamSettings, TransportDialFn, register_transport_dialer,
-};
-
 use crate::client::{DialOptions, dial};
 use crate::config::Config;
 
@@ -145,11 +137,9 @@ async fn listen_ws(
 }
 
 /// 构建 TLS server config（用于 wss:// 监听）。
-fn build_tls_server_config(settings: &StreamSettings) -> io::Result<Arc<tokio_rustls::rustls::ServerConfig>> {
-    xray_tls::server_config::build_server_config(
-        &settings.security,
-        settings.security_json.as_ref(),
-    )
+/// TODO: 接入 xray_tls::ocsp_stapling::build_server_config_with_stapling
+fn build_tls_server_config(_settings: &StreamSettings) -> io::Result<Arc<tokio_rustls::rustls::ServerConfig>> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "TLS server config not yet implemented for WebSocket listener"))
 }
 
 /// WebSocket `TransportListener` wrapper。只持有 local_addr + close 通知。

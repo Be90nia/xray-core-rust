@@ -24,6 +24,7 @@
 
 use std::sync::Arc;
 use thiserror::Error;
+use crate::Feature;
 
 /// Feature type identifier for Stats.
 ///
@@ -348,6 +349,47 @@ impl Manager for NoopManager {
     fn get_all_online_users(&self) -> Vec<String> {
         Vec::new()
     }
+}
+
+/// 默认 Stats Feature 实现（essentialFeatures fallback）。
+///
+/// 当配置中没有指定 stats app 时，Instance 使用此空实现占位。
+/// 内部委托 NoopManager，所有 register/get 操作返回空。
+pub struct DefaultStatsFeature {
+    manager: NoopManager,
+}
+
+impl DefaultStatsFeature {
+    pub fn new() -> Self {
+        Self { manager: NoopManager }
+    }
+}
+
+impl Feature for DefaultStatsFeature {
+    fn feature_name(&self) -> &'static str {
+        "default_stats"
+    }
+}
+
+impl Manager for DefaultStatsFeature {
+    fn register_counter(&self, name: &str) -> Result<Arc<dyn Counter>, ManagerError> {
+        self.manager.register_counter(name)
+    }
+    fn unregister_counter(&self, name: &str) { self.manager.unregister_counter(name) }
+    fn get_counter(&self, name: &str) -> Option<Arc<dyn Counter>> { self.manager.get_counter(name) }
+    fn visit_counters(&self, f: &mut dyn FnMut(&str, &dyn Counter) -> bool) { self.manager.visit_counters(f) }
+    fn register_online_map(&self, name: &str) -> Result<Arc<dyn OnlineMap>, ManagerError> {
+        self.manager.register_online_map(name)
+    }
+    fn unregister_online_map(&self, name: &str) { self.manager.unregister_online_map(name) }
+    fn get_online_map(&self, name: &str) -> Option<Arc<dyn OnlineMap>> { self.manager.get_online_map(name) }
+    fn visit_online_maps(&self, f: &mut dyn FnMut(&str, &dyn OnlineMap) -> bool) { self.manager.visit_online_maps(f) }
+    fn register_channel(&self, name: &str) -> Result<Arc<dyn Channel>, ManagerError> {
+        self.manager.register_channel(name)
+    }
+    fn unregister_channel(&self, name: &str) { self.manager.unregister_channel(name) }
+    fn get_channel(&self, name: &str) -> Option<Arc<dyn Channel>> { self.manager.get_channel(name) }
+    fn get_all_online_users(&self) -> Vec<String> { self.manager.get_all_online_users() }
 }
 
 #[cfg(test)]

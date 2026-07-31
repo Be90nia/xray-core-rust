@@ -4,6 +4,7 @@
 
 use async_trait::async_trait;
 use xray_common::net::address::Address;
+use crate::Feature;
 
 /// Feature type identifier for DNS.
 pub const FEATURE_DNS: &str = "dns";
@@ -50,6 +51,19 @@ impl std::fmt::Display for DnsError {
 }
 
 impl std::error::Error for DnsError {}
+
+/// 默认 DNS Feature 实现（essentialFeatures fallback）。
+///
+/// 当配置中没有指定 dns app 时，Instance 使用此空实现占位，
+/// 使 `has_feature::<DefaultDnsFeature>()` 返回 true，避免启动失败。
+/// 实际 DNS 解析由 `InitSystemDialer` 中的 `tokio::net::lookup_host` 兜底。
+pub struct DefaultDnsFeature;
+
+impl Feature for DefaultDnsFeature {
+    fn feature_name(&self) -> &'static str {
+        "default_dns"
+    }
+}
 
 #[cfg(test)]
 mod tests {
