@@ -25,7 +25,9 @@ pub struct LinuxSockOpt {
     pub tcp_congestion: Option<String>,
     /// 是否为入端连接（决定 TFO 使用 TCP_FASTOPEN 还是 TCP_FASTOPEN_CONNECT）。
     pub inbound: bool,
-}
+    /// SO_MARK 包标记值，用于 iptables/fwmark 策略路由。`0`=不设置。
+    /// 对应 Go `SocketConfig.Mark`。需要 root 或 CAP_NET_ADMIN。
+    pub mark: u32,
 
 impl LinuxSockOpt {
     /// 将 Linux 特定 socket 选项应用到给定 fd。
@@ -53,6 +55,11 @@ impl LinuxSockOpt {
         // TCP_CONGESTION
         if let Some(ref algo) = self.tcp_congestion {
             self.set_tcp_congestion(fd, algo)?;
+        }
+
+        // SO_MARK
+        if self.mark > 0 {
+            self.set_so_mark(fd)?;
         }
 
         Ok(())
@@ -168,6 +175,31 @@ impl LinuxSockOpt {
         Ok(())
     }
 }
+
+    /// 设置 SO_MARK（包标记，用于 iptables/fwmark 策略路由）。
+    /// 对应 Go `unix.SetsockoptInt(fd, SOL_SOCKET, SO_MARK, mark)`。
+    ///
+    /// 需要 root 权限或 CAP_NET_ADMIN capability。
+    /// 设置后，此 socket 发出的所有数据包都会携带指定的 fwmark，
+    /// 可被 iptables / ip rule / ip route 用于策略路由。
+    fn set_so_mark(&self, fd: i32) -> io::Result<()> {
+        // SAFETY: setsockopt 对已验证的 fd 设置整数选项。
+        // SO_MARK = 36，内核验证参数合法性。需要 CAP_NET_ADMIN。
+        unsafe {
+            let val: u32 = self.mark;
+            let ret = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_MARK,
+                &val as *const u32 as *const libc::c_void,
+                std::mem::size_of::<u32>() as libc::socklen_t,
+            );
+            if ret < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
 
 /// Linux SO_ORIGINAL_DST 常量。libc crate 未导出此值。
 /// 对应 Go `syscall.SO_ORIGINAL_DST = 80`。

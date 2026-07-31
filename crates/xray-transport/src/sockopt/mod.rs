@@ -36,9 +36,9 @@ pub struct SocketOptions {
     pub tcp_keepalive_idle: Duration,
     /// TCP keepalive 探测间隔。`0` 表示用 OS 默认值。
     pub tcp_keepalive_interval: Duration,
-    // 本地源地址绑定（可选）。对应 Go `SocketConfig.Dialer.LocalAddr`。
-    // 切片1 不实现，留切片2。
-    // pub local_addr: Option<SocketAddr>,
+    /// SO_MARK 包标记值（Linux fwmark），用于 iptables/fwmark 策略路由。`0`=不设置。
+    /// 对应 Go `SocketConfig.Mark`。仅 Linux 有效，其他平台忽略。
+    pub mark: u32,
 }
 
 impl Default for SocketOptions {
@@ -48,6 +48,7 @@ impl Default for SocketOptions {
             tcp_nodelay: true,
             tcp_keepalive_idle: Duration::from_secs(45),
             tcp_keepalive_interval: Duration::from_secs(45),
+            mark: 0,
         }
     }
 }
@@ -69,6 +70,15 @@ pub fn apply_outbound_socket_options(socket: &Socket, opts: &SocketOptions) -> s
                 .with_time(opts.tcp_keepalive_idle)
                 .with_interval(opts.tcp_keepalive_interval),
         )?;
+    }
+    // SO_MARK：仅 Linux 有效。
+    #[cfg(target_os = "linux")]
+    {
+        if opts.mark > 0 {
+            let fd = socket.as_raw_socket() as i32;
+            let linux_opt = linux::LinuxSockOpt { mark: opts.mark, ..Default::default() };
+            linux_opt.set_so_mark(fd)?;
+        }
     }
     Ok(())
 }
