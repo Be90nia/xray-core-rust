@@ -142,9 +142,9 @@ fn l3(s1: &[u8], s2: &[u8], s3: &[u8], data: &[u8]) -> [u8; 32] {
 
 /// KDF：Go `KDF(key, path...)` 的正确实现。
 ///
-/// # Panics
+/// # Errors
 ///
-/// 超过 3 个路径段时 panic（VMess 协议不需要）。
+/// 超过 3 个路径段时记录警告并截断到前 3 段（不 panic）。
 pub fn kdf(key: &[u8], path: &[&str]) -> Vec<u8> {
     let path_bytes: Vec<&[u8]> = path.iter().map(|s| s.as_bytes()).collect();
     kdf_paths(key, &path_bytes)
@@ -157,7 +157,12 @@ pub fn kdf_paths(key: &[u8], paths: &[&[u8]]) -> Vec<u8> {
         1 => l1(paths[0], key).to_vec(),
         2 => l2(paths[0], paths[1], key).to_vec(),
         3 => l3(paths[0], paths[1], paths[2], key).to_vec(),
-        n => panic!("VMess KDF supports at most 3 path segments, got {n}"),
+        // VMess 协议最多使用 3 个 KDF 路径段。超过时截断到前 3 段并记录警告，
+        // 而非 panic 导致整个进程崩溃。
+        n => {
+            tracing::warn!("VMess KDF: truncating {n} path segments to 3");
+            l3(paths[0], paths[1], paths[2], key).to_vec()
+        }
     }
 }
 
