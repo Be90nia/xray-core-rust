@@ -99,6 +99,58 @@ impl Connection for TcpConnection {
     }
 }
 
+impl AsyncRead for DuplexConnection {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for DuplexConnection {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl Connection for DuplexConnection {
+    fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+        Ok(None)
+    }
+    fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+        Ok(None)
+    }
+}
+
+/// Pipe/Duplex 连接。
+///
+/// 包装 `tokio::io::DuplexStream`，用于代理链（DialerProxy）场景：
+/// 创建 pipe pair，一端交给 chained handler dispatch，另一端返回给调用者。
+pub struct DuplexConnection {
+    inner: tokio::io::DuplexStream,
+}
+
+impl DuplexConnection {
+    /// 从 DuplexStream 创建连接。
+    pub fn new(stream: tokio::io::DuplexStream) -> Self {
+        Self { inner: stream }
+    }
+}
+
 impl Connection for Box<dyn Connection> {
     fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
         (**self).remote_addr()

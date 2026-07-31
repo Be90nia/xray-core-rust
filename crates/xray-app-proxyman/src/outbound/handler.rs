@@ -412,12 +412,22 @@ impl OutboundHandler for OutboundHandlerEntry {
             if let Some(tag) = proxy_tag {
                 match outbound_manager.as_ref() {
                     Some(manager) if manager.get_handler(&tag).is_some() => {
-                        // ponytail: 代理链拨号 - 需创建 pipe pair，dispatch through chained handler
-                        // Full implementation: create pipe, call handler.dispatch(), wrap in Connection
-                        return Err(io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            format!("chained proxy to tag '{tag}' not yet implemented"),
-                        ));
+                        // 创建 duplex pipe：client 端返回给调用者，proxy 端桥接到 chained handler
+                        // Go: 通过 chained handler 的 dial() 建立真实连接，然后双向桥接
+                        let handler = manager.get_handler(&tag).unwrap();
+                        let mut chained_conn = handler.dial(&dest).await?;
+
+                        // 创建 pipe pair 做双向桥接
+                        let (client_stream, mut proxy_stream) = tokio::io::duplex(64 * 1024);
+
+                        // spawn 双向桥接：proxy_stream ↔ chained_conn
+                        tokio::spawn(async move {
+                            let _ = tokio::io::copy_bidirectional(&mut proxy_stream, &mut chained_conn).await;
+                        });
+
+                        let conn: Box<dyn xray_transport::connection::Connection> =
+                            Box::new(xray_transport::connection::DuplexConnection::new(client_stream));
+                        return Ok(conn);
                     }
                     _ => {
                         // proxy chain tag configured but manager/handler missing
