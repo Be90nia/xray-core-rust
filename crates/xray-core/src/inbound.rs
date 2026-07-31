@@ -121,7 +121,7 @@ async fn handle_connection(
     // zx7: mux.cool dest 转给 mux ServerWorker（当前 stub）
     if is_mux_destination(&dest) {
         tracing::info!("socks5: mux.cool destination detected, spawning mux inbound handler");
-        tokio::spawn(handle_mux_inbound_link(link));
+        tokio::spawn(handle_mux_inbound_link(link, Arc::clone(handler)));
         return Ok(());
     }
     let _ = handler.dispatch(&dest, link).await;
@@ -138,14 +138,40 @@ pub fn is_mux_destination(dest: &Destination) -> bool {
         && dest.port().value() == MUX_COOL_PORT
 }
 
-/// 处理 mux.cool 入站连接的骨架（zx7）。
+/// 处理 mux.cool 入站连接：创建 ServerWorker，循环读帧，为每个子 session dispatch。
 ///
-/// TODO zx7-future: 接入 `xray_mux::worker::ServerWorker`——
-/// 启动 frame reader loop，为每个 session 调底层 dispatcher.dispatch(session_dest)。
-/// 当前骨架：log + drop link。
-async fn handle_mux_inbound_link(link: Link) {
-    tracing::warn!("mux inbound link received: ServerWorker integration pending, dropping");
-    drop(link);
+/// 对应 Go `mux.Server.OnTransport(link.Reader, link.Writer)`。
+async fn handle_mux_inbound_link(link: Link, handler: Arc<dyn xray_app_dispatcher::DispatchHandler>) {
+    use xray_buf::reader::BufferedReader;
+    use xray_buf::writer::BufferedWriter;
+    use xray_mux::worker::{DispatchHandlerAdapter, ServerWorker};
+
+    let adapter = Arc::new(DispatchHandlerAdapter::new(handler));
+    let worker = ServerWorker::new(adapter);
+
+    // 包装 link reader/writer 为 BufferedReader/BufferedWriter
+    let mut reader = BufferedReader::new(link.reader);
+    let link_writer: Arc<tokio::sync::Mutex<Option<Box<dyn xray_buf::io::Writer>>>> =
+        Arc::new(tokio::sync::Mutex::new(Some(link.writer)));
+
+    // 启动 keepalive + idle timeout
+    let (keepalive_h, idle_h) = worker.spawn_keepalive_and_idle_timeout(link_writer.clone());
+
+    // 主帧处理循环
+    loop {
+        match worker.process_frame(&mut reader, &link_writer).await {
+            Ok(true) => continue,
+            Ok(false) => break, // 干净 EOF
+            Err(e) => {
+                tracing::warn!(error = %e, "mux frame processing error");
+                break;
+            }
+        }
+    }
+
+    worker.close();
+    keepalive_h.abort();
+    idle_h.abort();
 }
 
 /// `SocksAddr` → `Destination`（TCP）。
@@ -203,7 +229,7 @@ pub async fn serve_http(
             // zx7: mux.cool dest 转给 mux ServerWorker（stub）
             if is_mux_destination(&dest) {
                 tracing::info!("http: mux.cool destination detected, spawning mux inbound handler");
-                tokio::spawn(handle_mux_inbound_link(link));
+                tokio::spawn(handle_mux_inbound_link(link, handler));
                 return;
             }
             let _ = handler.dispatch(&dest, link).await;

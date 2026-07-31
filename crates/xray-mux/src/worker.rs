@@ -39,6 +39,51 @@ pub enum DispatchError {
     Timeout(String),
 }
 
+/// 将 `DispatchHandler`（消费 link）适配为 `Dispatcher`（返回 link）。
+///
+/// 实现：创建 pipe pair → 一端包装为 transport::Link 传给 DispatchHandler →
+/// 另一端包装为 mux::Link 返回。
+/// 对应 Go `mux.Server.Dispatch` 内部调用 `proxy.Dispatch` 的桥接逻辑。
+pub struct DispatchHandlerAdapter {
+    handler: Arc<dyn xray_app_dispatcher::DispatchHandler>,
+}
+
+impl DispatchHandlerAdapter {
+    pub fn new(handler: Arc<dyn xray_app_dispatcher::DispatchHandler>) -> Self {
+        Self { handler }
+    }
+}
+
+#[async_trait::async_trait]
+impl Dispatcher for DispatchHandlerAdapter {
+    async fn dispatch(&self, dest: Destination) -> Result<Link, DispatchError> {
+        // 两个 pipe：pipe_a + pipe_b
+        // DispatchHandler 写到 write_a → 我们从 read_a 读
+        // 我们写到 write_b → DispatchHandler 从 read_b 读
+        let (read_a, write_a) = xray_buf::pipe::new();
+        let (read_b, write_b) = xray_buf::pipe::new();
+
+        // DispatchHandler 接收 transport::Link
+        let dispatch_link = xray_transport::link::Link::new(
+            Box::new(read_b),
+            Box::new(write_a),
+        );
+        // 返回 mux::Link
+        let return_link = Link {
+            reader: Box::new(read_a),
+            writer: Box::new(write_b),
+        };
+
+        let handler = Arc::clone(&self.handler);
+        let dest_clone = dest.clone();
+        tokio::spawn(async move {
+            handler.dispatch(&dest_clone, dispatch_link).await;
+        });
+
+        Ok(return_link)
+    }
+}
+
 pub struct Server {
     dispatcher: Arc<dyn Dispatcher>,
 }
@@ -490,5 +535,30 @@ mod tests {
         let strategy = crate::session::ClientStrategy::default();
         let _s = sm.allocate(&strategy).await;
         assert_eq!(sm.active_sessions().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_handler_adapter_creates_link() {
+        use xray_app_dispatcher::default::DispatchHandler;
+        use xray_common::net::address::Address;
+        use xray_common::net::port::Port;
+
+        #[derive(Debug)]
+        struct NopHandler;
+        impl DispatchHandler for NopHandler {
+            fn tag(&self) -> &str { "nop" }
+            fn dispatch(
+                &self,
+                _dest: &xray_common::net::destination::Destination,
+                _link: xray_transport::link::Link,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+                Box::pin(async {})
+            }
+        }
+
+        let adapter = DispatchHandlerAdapter::new(Arc::new(NopHandler));
+        let dest = Destination::new(Address::new_domain("example.com".to_string()), Port::new(443), Network::TCP);
+        let result = adapter.dispatch(dest).await;
+        assert!(result.is_ok(), "adapter should return a link");
     }
 }
