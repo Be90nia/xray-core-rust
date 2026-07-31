@@ -215,9 +215,14 @@ fn try_build_handler(
             Ok(Arc::new(DialBridge::new(ob.tag.clone(), dial_fn)))
         }
         // tun outbound：系统拨号（TUN 路由由 OS 处理）
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
         "tun" => {
             let dial_fn = xray_proxy_tun::make_tun_dial_fn();
             Ok(Arc::new(DialBridge::new(ob.tag.clone(), dial_fn)))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+        "tun" => {
+            Err(BuildError::Unsupported("TUN outbound is only supported on Linux/Android/FreeBSD".to_string()))
         }
         other => Err(BuildError::Unsupported(other.to_string())), 
     }
@@ -891,6 +896,7 @@ mod tests {
         assert!(ohm.get_handler("dokodemo-out").is_some(), "dokodemo should be registered");
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
     #[test]
     fn register_tun_outbound() {
         let mut built = BuiltConfig::default();

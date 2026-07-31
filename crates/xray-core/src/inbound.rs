@@ -40,6 +40,7 @@ use xray_proxy_ss::{SsInbound, CipherType as SsCipherType};
 use xray_proxy_ss::config::MemoryAccount as SsConfigMemoryAccount;
 use xray_proxy_dns::{DnsInbound, DnsOutbound, Handler as DnsHandler, Config as DnsConfig};
 use xray_proxy_loopback::LoopbackHandler;
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
 use xray_proxy_tun::{TunInboundHandler, StackOptions, Tun};
 use xray_proxy_wireguard::DeviceConfig;
 use xray_transport_hysteria::hub::StubListenerFactory;
@@ -421,6 +422,7 @@ async fn spawn_one_inbound(
     ohm: Arc<SimpleOhm>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     // TUN inbound 不需要 port/addr，提前处理
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
     if ib.entry.kind.as_str() == "tun" {
         let options = parse_tun_inbound_config(&ib.entry.data)?;
         let handler = TunInboundHandler::new(&ib.tag, options)
@@ -433,6 +435,13 @@ async fn spawn_one_inbound(
             }
         });
         return Ok(Some(handle));
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+    if ib.entry.kind.as_str() == "tun" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "TUN inbound is only supported on Linux/Android/FreeBSD",
+        ));
     }
 
     let listen = ib.listen.as_deref().unwrap_or("0.0.0.0");
@@ -1003,8 +1012,10 @@ fn parse_tuic_inbound_config(
 /// TunInboundHandler::new 校验 options.tun.is_some()，但 start() 内部
 /// 直接 TunDevice::create 硬编码参数，不使用 options.tun 的设备。
 /// 因此配置解析阶段只需提供占位。
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
 struct TunPlaceholder;
 
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
 impl Tun for TunPlaceholder {
     fn start(&self) -> xray_proxy_tun::Result<()> { Ok(()) }
     fn close(&self) -> xray_proxy_tun::Result<()> { Ok(()) }
@@ -1017,6 +1028,7 @@ impl Tun for TunPlaceholder {
 /// JSON 格式：`{"idleTimeout":"30s"}`（idleTimeout 可选，默认 30s）。
 /// 设备参数（name/address/mtu）当前硬编码在 TunInboundHandler::start，
 /// 后续切片从 JSON 读取。
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
 fn parse_tun_inbound_config(data: &[u8]) -> std::io::Result<StackOptions> {
     let mut opts = StackOptions::default();
     opts.tun = Some(Box::new(TunPlaceholder));

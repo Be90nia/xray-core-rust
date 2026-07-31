@@ -21,10 +21,12 @@ use xray_features::{Feature, FeatureError, FeatureFactory, registry};
 ///      observatory, burstObservatory, version, geodata
 ///
 /// Proxy inbound: socks, http, shadowsocks, vmess, vless, trojan,
-///                dokodemo, blackhole, dns, hysteria2, tuic, wireguard, anytls, tun, loopback
+///                dokodemo, blackhole, dns, hysteria2, tuic, wireguard, anytls, tun*, loopback
 ///
 /// Proxy outbound: freedom, blackhole, dns, socks, http, shadowsocks,
 ///                 vmess, vless, trojan, hysteria2, tuic, wireguard, loopback
+///
+/// *tun 仅在 Linux/Android/FreeBSD 上注册。
 pub fn register_all_features() {
     // --- App kinds ---
     for &kind in APP_KINDS {
@@ -35,9 +37,17 @@ pub fn register_all_features() {
     for &kind in PROXY_INBOUND_KINDS {
         let _ = registry::register_feature(kind, stub_factory(kind));
     }
+    // TUN inbound——仅 Linux/Android/FreeBSD
+    for &kind in TUN_INBOUND_KIND {
+        let _ = registry::register_feature(kind, stub_factory(kind));
+    }
 
     // --- Proxy outbound kinds ---
     for &kind in PROXY_OUTBOUND_KINDS {
+        let _ = registry::register_feature(kind, stub_factory(kind));
+    }
+    // TUN outbound——仅 Linux/Android/FreeBSD
+    for &kind in TUN_OUTBOUND_KIND {
         let _ = registry::register_feature(kind, stub_factory(kind));
     }
 }
@@ -59,6 +69,7 @@ const APP_KINDS: &[&str] = &[
 ];
 
 /// 代理入站 kind 列表（与 `xray-conf` 解析的 protocol 值一致）。
+/// TUN 单独注册（平台门控）。
 const PROXY_INBOUND_KINDS: &[&str] = &[
     "socks",
     "http",
@@ -73,11 +84,18 @@ const PROXY_INBOUND_KINDS: &[&str] = &[
     "tuic",
     "wireguard",
     "anytls",
-    "tun",
     "loopback",
 ];
 
-/// 代理出站 kind 列表。
+/// TUN 入站 kind——仅 Linux/Android/FreeBSD 可用。
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+const TUN_INBOUND_KIND: &[&str] = &["tun"];
+
+/// TUN 入站 kind——非 Linux/Android/FreeBSD 不注册。
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+const TUN_INBOUND_KIND: &[&str] = &[];
+
+/// 代理出站 kind 列表。TUN 单独注册（平台门控）。
 const PROXY_OUTBOUND_KINDS: &[&str] = &[
     "freedom",
     "blackhole",
@@ -93,6 +111,14 @@ const PROXY_OUTBOUND_KINDS: &[&str] = &[
     "wireguard",
     "loopback",
 ];
+
+/// TUN 出站 kind——仅 Linux/Android/FreeBSD 可用。
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+const TUN_OUTBOUND_KIND: &[&str] = &["tun"];
+
+/// TUN 出站 kind——非 Linux/Android/FreeBSD 不注册。
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+const TUN_OUTBOUND_KIND: &[&str] = &[];
 
 /// 创建 stub factory：返回 `StartFailed` 错误提示 "not yet implemented"。
 fn stub_factory(kind: &'static str) -> FeatureFactory {
@@ -112,7 +138,13 @@ mod tests {
     fn register_all_features_makes_all_kinds_findable() {
         register_all_features();
 
-        for &kind in APP_KINDS.iter().chain(PROXY_INBOUND_KINDS).chain(PROXY_OUTBOUND_KINDS) {
+        for &kind in APP_KINDS
+            .iter()
+            .chain(PROXY_INBOUND_KINDS)
+            .chain(TUN_INBOUND_KIND)
+            .chain(PROXY_OUTBOUND_KINDS)
+            .chain(TUN_OUTBOUND_KIND)
+        {
             // stub factory 应能被找到（不再返回 NotFound）
             let result = registry::create_feature(kind, b"{}");
             assert!(
@@ -131,7 +163,9 @@ mod tests {
         let mut all: Vec<&str> = Vec::new();
         all.extend(APP_KINDS);
         all.extend(PROXY_INBOUND_KINDS);
+        all.extend(TUN_INBOUND_KIND);
         all.extend(PROXY_OUTBOUND_KINDS);
+        all.extend(TUN_OUTBOUND_KIND);
         let mut sorted = all.clone();
         sorted.sort();
         sorted.dedup();

@@ -25,7 +25,6 @@ xray-proxy-tuic = { path = "../xray-proxy-tuic" }
 xray-proxy-wireguard = { path = "../xray-proxy-wireguard" }
 xray-proxy-dns = { path = "../xray-proxy-dns" }
 xray-proxy-loopback = { path = "../xray-proxy-loopback" }
-xray-proxy-tun = { path = "../xray-proxy-tun" }
 xray-mux = { path = "../xray-mux" }
 xray-buf = { path = "../xray-buf" }
 xray-transport = { path = "../xray-transport" }
@@ -77,3 +76,7 @@ path = "src/bin/xray.rs"
 uuid = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 serde_json = { workspace = true }
+# TUN 设备代理——仅 Linux/Android/FreeBSD 自动编译
+# macOS/Windows 不编译（需 wintun.dll/utun 权限，用户可手动加回）
+[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))'.dependencies]
+xray-proxy-tun = { path = "../xray-proxy-tun" }
