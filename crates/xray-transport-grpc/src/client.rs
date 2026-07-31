@@ -12,7 +12,7 @@
 //! 已建立的 `HunkStream`（典型由 hyper/h2 dialer 实现）。本模块只做协议层
 //! 构造，把 HunkStream 适配为 `transport::Link` 给 proxy handler。
 
-use crate::encoding::{HunkReader, HunkReaderWriter, HunkStream};
+use crate::encoding::{HunkReader, HunkReaderWriter, HunkStream, MultiHunkReaderWriter};
 use xray_transport::link::Link;
 
 /// gRPC 客户端配置（用于生成 service/stream 名）。
@@ -52,9 +52,15 @@ impl GrpcClient {
     /// send/recv hunk）。本函数不发起 HTTP/2 请求——这部分由上层 transport
     /// 层完成（如 hyper/h2 dialer）。
     pub fn dial_target<S: HunkStream + 'static>(&self, stream: S) -> Link {
-        let rw = HunkReaderWriter::new(stream);
-        let (reader, writer) = rw.into_parts();
-        Link::new(Box::new(reader), Box::new(writer))
+        if self.multi_mode {
+            let rw = MultiHunkReaderWriter::new(stream);
+            let (reader, writer) = rw.into_parts();
+            Link::new(Box::new(reader), Box::new(writer))
+        } else {
+            let rw = HunkReaderWriter::new(stream);
+            let (reader, writer) = rw.into_parts();
+            Link::new(Box::new(reader), Box::new(writer))
+        }
     }
 
     /// 返回当前选择的 stream 名（multi_mode ? multi : tun）。

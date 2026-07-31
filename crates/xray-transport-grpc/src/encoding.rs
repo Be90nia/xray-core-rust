@@ -116,6 +116,80 @@ impl Hunk {
 }
 
 // ============================================================================
+// MultiHunk proto 编解码（repeated bytes data = 1）
+// ============================================================================
+
+/// MultiHunk proto：`{ repeated bytes data = 1; }` 的纯数据载体。
+///
+/// 对应 Go 的 `encoding.MultiHunk{Data: ...}`。
+/// `repeated bytes` 在 protobuf 中的编码是：每个 bytes 元素依次用
+/// field 1 wire type 2 编码（tag=0x0a），即多个 Hunk 编码拼接。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MultiHunk {
+    /// 字节载荷列表。
+    pub data: Vec<Vec<u8>>,
+}
+
+impl MultiHunk {
+    /// 构造新 MultiHunk。
+    #[must_use]
+    pub fn new(data: Vec<Vec<u8>>) -> Self {
+        Self { data }
+    }
+
+    /// 编码为 protobuf 字节流。
+    ///
+    /// wire format：每个 bytes 元素编码为 `tag(0x0a) + varint_len + data`，依次拼接。
+    #[must_use]
+    pub fn encode_to_vec(&self) -> Vec<u8> {
+        let total_len: usize = self.data.iter().map(|d| 1 + varint_len(d.len()) + d.len()).sum();
+        let mut out = Vec::with_capacity(total_len);
+        for chunk in &self.data {
+            out.push(HUNK_TAG);
+            encode_varint(&mut out, chunk.len() as u64);
+            out.extend_from_slice(chunk);
+        }
+        out
+    }
+
+    /// 从 protobuf 字节流解码。
+    ///
+    /// 输入应是从 frame payload 中提取的 MultiHunk 编码（不含 frame 头）。
+    ///
+    /// # Errors
+    /// - 空缓冲区返回空 MultiHunk（合法）
+    /// - tag 不匹配
+    /// - 截断数据
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        let mut data = Vec::new();
+        let mut pos = 0;
+        while pos < buf.len() {
+            if buf[pos] != HUNK_TAG {
+                return Err(GrpcError::InvalidConfig(format!(
+                    "multi_hunk proto: tag mismatch at offset {pos} (expected 0x{:02x}, got 0x{:02x})",
+                    HUNK_TAG, buf[pos]
+                )));
+            }
+            let (len, consumed) = decode_varint(&buf[pos + 1..])
+                .ok_or_else(|| GrpcError::InvalidConfig("multi_hunk proto: truncated varint".into()))?;
+            let data_start = pos + 1 + consumed;
+            let data_end = data_start
+                .checked_add(len as usize)
+                .ok_or_else(|| GrpcError::InvalidConfig("multi_hunk proto: length overflow".into()))?;
+            if data_end > buf.len() {
+                return Err(GrpcError::InvalidConfig(format!(
+                    "multi_hunk proto: data truncated at offset {pos} (need {len} bytes, have {})",
+                    buf.len() - data_start
+                )));
+            }
+            data.push(buf[data_start..data_end].to_vec());
+            pos = data_end;
+        }
+        Ok(Self { data })
+    }
+}
+
+// ============================================================================
 // gRPC frame 编解码
 // ============================================================================
 
@@ -170,6 +244,55 @@ pub fn decode_hunk_frame(buf: &[u8]) -> Result<Option<(usize, Vec<u8>)>> {
     }
     let hunk = Hunk::decode(&buf[FRAME_HEADER_LEN..frame_end])?;
     Ok(Some((frame_end, hunk.data)))
+}
+
+/// 编码一个完整的 gRPC frame：header + MultiHunk payload。
+///
+/// 返回 `compressed(0) + BE u32 length + MultiHunk proto`。
+/// 对应 TunMulti RPC 的发送端。
+#[must_use]
+pub fn encode_multi_hunk_frame(chunks: &[&[u8]]) -> Vec<u8> {
+    let mh = MultiHunk::new(chunks.iter().map(|c| c.to_vec()).collect());
+    let payload = mh.encode_to_vec();
+    let mut out = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
+    out.push(0u8); // compressed = false
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(&payload);
+    out
+}
+
+/// 解析一个完整的 gRPC frame（MultiHunk 版本）。
+///
+/// # 返回
+/// - `Ok(None)`：缓冲区不足一个完整 frame
+/// - `Ok(Some((consumed, data_vec)))`：成功解析，data_vec 是 repeated bytes 的列表
+/// - `Err`：协议错误
+pub fn decode_multi_hunk_frame(buf: &[u8]) -> Result<Option<(usize, Vec<Vec<u8>>)>> {
+    if buf.len() < FRAME_HEADER_LEN {
+        return Ok(None);
+    }
+    let compressed = buf[0];
+    if compressed != 0 {
+        return Err(GrpcError::InvalidConfig(format!(
+            "grpc frame: compressed flag {compressed} not supported"
+        )));
+    }
+    let payload_len = u32::from_be_bytes([
+        buf[1], buf[2], buf[3], buf[4],
+    ]) as usize;
+    if payload_len > MAX_FRAME_PAYLOAD {
+        return Err(GrpcError::InvalidConfig(format!(
+            "grpc frame: payload {payload_len} exceeds max {MAX_FRAME_PAYLOAD}"
+        )));
+    }
+    let frame_end = FRAME_HEADER_LEN
+        .checked_add(payload_len)
+        .ok_or_else(|| GrpcError::InvalidConfig("grpc frame: length overflow".into()))?;
+    if buf.len() < frame_end {
+        return Ok(None);
+    }
+    let mh = MultiHunk::decode(&buf[FRAME_HEADER_LEN..frame_end])?;
+    Ok(Some((frame_end, mh.data)))
 }
 
 // ============================================================================
@@ -326,6 +449,125 @@ impl<S: HunkStream + 'static> Writer for HunkWriter<S> {
             }
             let mut stream = self.stream.lock().await;
             stream.send_hunk(payload).await.map_err(|e| xray_buf::io::Error::WriteError(format!("{e}")))?;
+            Ok(())
+        })
+    }
+}
+
+
+// ============================================================================
+// MultiHunkReaderWriter：把 HunkStream 适配为 Reader/Writer（TunMulti 模式）
+// ============================================================================
+
+/// TunMulti 模式的 Reader/Writer 适配器。
+///
+/// 与 `HunkReaderWriter` 的区别：
+/// - **Writer**：把 MultiBuffer 的每个 Buffer 作为 MultiHunk 的一个 repeated bytes
+///   元素发送（而非拼成单个 Vec 发单个 Hunk）。Go 端 TunMulti 期望收到 MultiHunk。
+/// - **Reader**：从 stream recv 一个 hunk（内含 MultiHunk 编码），解码出多个 bytes
+///   片段，每个片段构造为独立的 Buffer 放入 MultiBuffer。
+pub struct MultiHunkReaderWriter<S: HunkStream> {
+    stream: Arc<Mutex<S>>,
+}
+
+impl<S: HunkStream + 'static> MultiHunkReaderWriter<S> {
+    /// 构造。
+    #[must_use]
+    pub fn new(stream: S) -> Self {
+        Self {
+            stream: Arc::new(Mutex::new(stream)),
+        }
+    }
+
+    /// 拆出 reader/writer 两个独立句柄。
+    #[must_use]
+    pub fn into_parts(self) -> (MultiHunkReader<S>, MultiHunkWriter<S>) {
+        (
+            MultiHunkReader {
+                stream: Arc::clone(&self.stream),
+                pending: Vec::new(),
+                pos: 0,
+            },
+            MultiHunkWriter {
+                stream: self.stream,
+            },
+        )
+    }
+}
+
+/// MultiHunk 适配的 Reader 端。
+pub struct MultiHunkReader<S: HunkStream> {
+    stream: Arc<Mutex<S>>,
+    /// 待消费的 decoded chunks（每个是 MultiHunk 中的一个 bytes 元素）。
+    pending: Vec<Vec<u8>>,
+    /// 当前 pending 中的消费位置。
+    pos: usize,
+}
+
+/// MultiHunk 适配的 Writer 端。
+pub struct MultiHunkWriter<S: HunkStream> {
+    stream: Arc<Mutex<S>>,
+}
+
+impl<S: HunkStream + 'static> Reader for MultiHunkReader<S> {
+    fn read_multi_buffer(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = xray_buf::io::Result<MultiBuffer>> + Send + '_>> {
+        Box::pin(async move {
+            // 如果 pending 有未消费的 chunks，先返回它们
+            if self.pos < self.pending.len() {
+                let chunks: Vec<Vec<u8>> = self.pending.drain(self.pos..).collect();
+                self.pos = 0;
+                self.pending.clear();
+                let buffers: Vec<xray_buf::buffer::Buffer> = chunks
+                    .into_iter()
+                    .map(xray_buf::buffer::Buffer::from_vec)
+                    .collect();
+                return Ok(MultiBuffer::from_buffers(buffers));
+            }
+            // pending 空，从 stream recv 一个 hunk 并 decode 为 MultiHunk
+            self.pending.clear();
+            self.pos = 0;
+            let raw = {
+                let mut stream = self.stream.lock().await;
+                stream.recv_hunk().await.map_err(|e| {
+                    xray_buf::io::Error::ReadError(format!("{e}"))
+                })?
+            };
+            // HunkStream.recv_hunk 返回已解 frame + Hunk proto 的 data 字段
+            // 在 TunMulti 模式下，这个 data 实际上是 MultiHunk 的 repeated bytes 编码
+            let mh = MultiHunk::decode(&raw).map_err(|e| {
+                xray_buf::io::Error::ReadError(format!("multi_hunk decode: {e}"))
+            })?;
+            if mh.data.is_empty() {
+                return Ok(MultiBuffer::new());
+            }
+            let buffers: Vec<xray_buf::buffer::Buffer> = mh
+                .data
+                .into_iter()
+                .map(xray_buf::buffer::Buffer::from_vec)
+                .collect();
+            Ok(MultiBuffer::from_buffers(buffers))
+        })
+    }
+}
+
+impl<S: HunkStream + 'static> Writer for MultiHunkWriter<S> {
+    fn write_multi_buffer(
+        &mut self,
+        mb: MultiBuffer,
+    ) -> Pin<Box<dyn Future<Output = xray_buf::io::Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            // 把 MultiBuffer 的每个 Buffer 作为 MultiHunk 的一个 repeated bytes 元素
+            // send_hunk 发送的是 proto payload（不含 frame 头），HunkStream 实现者加 frame 头
+            let mh = MultiHunk::new(
+                mb.into_buffers().into_iter().map(|b| b.into_bytes().to_vec()).collect(),
+            );
+            let payload = mh.encode_to_vec();
+            let mut stream = self.stream.lock().await;
+            stream.send_hunk(payload).await.map_err(|e| {
+                xray_buf::io::Error::WriteError(format!("{e}"))
+            })?;
             Ok(())
         })
     }

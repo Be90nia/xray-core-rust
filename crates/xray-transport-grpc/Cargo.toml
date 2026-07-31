@@ -9,10 +9,14 @@ rust-version.workspace = true
 xray-buf = { path = "../xray-buf" }
 xray-common = { path = "../xray-common" }
 xray-transport = { path = "../xray-transport" }
-xray-tls = { path = "../xray-tls" }
 xray-proto = { path = "../xray-proto" }
+xray-tls = { path = "../xray-tls", optional = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 prost = { workspace = true }
+
+[features]
+default = ["register"]
+register = ["dep:xray-tls"]

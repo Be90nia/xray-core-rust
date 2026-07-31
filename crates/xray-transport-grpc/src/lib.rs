@@ -31,9 +31,11 @@ pub mod encoding;
 pub mod error;
 pub mod client;
 pub mod server;
+#[cfg(feature = "register")]
 pub mod register;
 
 // 顶层 re-export。
 pub use config::Config;
 pub use error::{GrpcError, Result};
+#[cfg(feature = "register")]
 pub use register::{register_dialer, register_listener};

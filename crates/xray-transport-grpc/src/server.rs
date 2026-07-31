@@ -9,7 +9,7 @@
 //! 转而暴露 `handle_incoming_stream(stream)` 让 dispatcher 在 transport 层
 //! 完成 HTTP/2 解码后注入已建立的 `HunkStream`。
 
-use crate::encoding::{HunkReaderWriter, HunkStream};
+use crate::encoding::{HunkReaderWriter, HunkStream, MultiHunkReaderWriter};
 use xray_transport::link::Link;
 
 /// gRPC 服务端配置（用于注册 Tun/TunMulti 服务名）。
@@ -36,14 +36,23 @@ impl GrpcServer {
 
     /// 处理一条 inbound `HunkStream`：包成 `transport::Link` 给 dispatcher。
     ///
-    /// 对应 Go `Listener.Tun(server encoding.GRPCService_TunServer)`：
+    /// 对应 Go `Listener.Tun/TunMulti(server)`：
     /// 服务端 gRPC handler 收到一个双向 stream，包装为 `net.Conn` 调
     /// `l.handler(conn)`。本函数把 stream 适配为 Link 后返回，由调用方
     /// （transport server / dispatcher）进一步处理。
-    pub fn handle_incoming_stream<S: HunkStream + 'static>(&self, stream: S) -> Link {
-        let rw = HunkReaderWriter::new(stream);
-        let (reader, writer) = rw.into_parts();
-        Link::new(Box::new(reader), Box::new(writer))
+    ///
+    /// `multi` 为 true 时使用 MultiHunkReaderWriter（TunMulti 协议），
+    /// 否则使用 HunkReaderWriter（Tun 协议）。
+    pub fn handle_incoming_stream<S: HunkStream + 'static>(&self, stream: S, multi: bool) -> Link {
+        if multi {
+            let rw = MultiHunkReaderWriter::new(stream);
+            let (reader, writer) = rw.into_parts();
+            Link::new(Box::new(reader), Box::new(writer))
+        } else {
+            let rw = HunkReaderWriter::new(stream);
+            let (reader, writer) = rw.into_parts();
+            Link::new(Box::new(reader), Box::new(writer))
+        }
     }
 
     /// 判断 HTTP path 是否匹配本服务（用于服务端路由分发）。
@@ -119,7 +128,17 @@ mod tests {
             service_name: "GunService".into(),
             ..Default::default()
         });
-        let link = server.handle_incoming_stream(DummyStream);
+        let link = server.handle_incoming_stream(DummyStream, false);
+        let (_r, _w) = link.into_parts();
+    }
+
+    #[tokio::test]
+    async fn handle_incoming_stream_multi_returns_link() {
+        let server = GrpcServer::from_config(&Config {
+            service_name: "GunService".into(),
+            ..Default::default()
+        });
+        let link = server.handle_incoming_stream(DummyStream, true);
         let (_r, _w) = link.into_parts();
     }
 }
