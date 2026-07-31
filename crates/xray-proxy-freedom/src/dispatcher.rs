@@ -84,7 +84,7 @@ mod tests {
             Network::TCP,
         );
         let inbound = dispatcher
-            .dispatch(&dest, &SniffingRequest::default())
+            .dispatch(&dest, &SniffingRequest::default(), None, None)
             .expect("dispatch returns inbound Link");
 
         let mut w = inbound.writer;

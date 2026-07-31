@@ -1,10 +1,9 @@
-//! 字节计数包装 Writer
+//! 字节计数包装 Writer/Reader
 //!
 //! 对应 Go `app/dispatcher/stats.go`。`SizeStatWriter` 在每次写入时累加计数，
-//! 用于统计用户上下行流量。
-
+//! `SizeStatReader` 在每次读取时累加计数，用于统计用户上下行流量。
 use std::sync::Arc;
-use xray_buf::io::{Result as IoResult, Writer};
+use xray_buf::io::{Reader, Result as IoResult, Writer};
 use xray_buf::multi::MultiBuffer;
 use xray_features::stats::Counter;
 
@@ -43,10 +42,63 @@ impl Writer for SizeStatWriter {
 impl SizeStatWriter {
     /// 关闭包装的 writer。对应 Go `(*SizeStatWriter).Close()`。
     ///
-    /// 由于 Rust 端 Writer trait 无 close 方法，这里仅作为 marker（实际 close 由
-    /// Drop 或具体 Writer 实现处理）。
+    /// Rust 端 Writer trait 无 close 方法，marker — 实际 close 由 Drop 或具体 Writer 处理。
     pub fn close(&mut self) -> IoResult<()> {
         Ok(())
+    }
+}
+
+/// 字节计数 Reader 包装
+///
+/// 对称于 SizeStatWriter。在每次 `read_multi_buffer` 时累加字节数到 Counter。
+/// 用于 downlink 方向：从 outbound reader 读取的字节 = 下行流量。
+pub struct SizeStatReader {
+    /// 流量计数器
+    pub counter: Arc<dyn Counter>,
+    /// 被包装的 Reader
+    pub reader: Box<dyn Reader>,
+}
+
+impl SizeStatReader {
+    /// 用 counter 和 reader 构造。
+    #[must_use]
+    pub fn new(counter: Arc<dyn Counter>, reader: Box<dyn Reader>) -> Self {
+        Self { counter, reader }
+    }
+}
+
+impl Reader for SizeStatReader {
+    fn read_multi_buffer(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = IoResult<MultiBuffer>> + Send + '_>> {
+        Box::pin(async move {
+            let mb = self.reader.read_multi_buffer().await?;
+            let n = i64::try_from(mb.len()).unwrap_or(i64::MAX);
+            self.counter.add(n);
+            Ok(mb)
+        })
+    }
+}
+
+/// 如果 counter 存在，用 SizeStatWriter 包装 writer；否则原样返回。
+pub fn maybe_wrap_writer(
+    counter: Option<Arc<dyn Counter>>,
+    writer: Box<dyn Writer>,
+) -> Box<dyn Writer> {
+    match counter {
+        Some(c) => Box::new(SizeStatWriter::new(c, writer)),
+        None => writer,
+    }
+}
+
+/// 如果 counter 存在，用 SizeStatReader 包装 reader；否则原样返回。
+pub fn maybe_wrap_reader(
+    counter: Option<Arc<dyn Counter>>,
+    reader: Box<dyn Reader>,
+) -> Box<dyn Reader> {
+    match counter {
+        Some(c) => Box::new(SizeStatReader::new(c, reader)),
+        None => reader,
     }
 }
 
@@ -136,5 +188,82 @@ mod tests {
         let writer = Box::new(CollectingWriter::default());
         let sw = SizeStatWriter::new(counter.clone(), writer);
         assert_eq!(sw.counter.value(), 0);
+    }
+
+    // --- SizeStatReader ---
+
+    /// 测试用 Reader，返回固定大小的 MultiBuffer
+    struct FixedReader {
+        data: Vec<Vec<u8>>,
+        idx: usize,
+    }
+
+    impl FixedReader {
+        fn new(data: Vec<Vec<u8>>) -> Self {
+            Self { data, idx: 0 }
+        }
+    }
+
+    impl Reader for FixedReader {
+        fn read_multi_buffer(
+            &mut self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = IoResult<MultiBuffer>> + Send + '_>> {
+            let mb = if self.idx < self.data.len() {
+                let mut buf = MultiBuffer::new();
+                buf.merge_bytes(&self.data[self.idx]);
+                self.idx += 1;
+                buf
+            } else {
+                MultiBuffer::default()
+            };
+            Box::pin(async move { Ok(mb) })
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_counts_bytes() {
+        let counter: Arc<dyn Counter> = Arc::new(TestCounter::default());
+        let reader = Box::new(FixedReader::new(vec![
+            b"hello".to_vec(),
+            b"world".to_vec(),
+        ]));
+        let mut sr = SizeStatReader::new(counter.clone(), reader);
+
+        let mb1 = sr.read_multi_buffer().await.unwrap();
+        assert_eq!(mb1.len(), 5);
+        let mb2 = sr.read_multi_buffer().await.unwrap();
+        assert_eq!(mb2.len(), 5);
+        assert_eq!(counter.value(), 10);
+    }
+
+    #[test]
+    fn maybe_wrap_writer_with_counter() {
+        let counter: Arc<dyn Counter> = Arc::new(TestCounter::default());
+        let writer = Box::new(CollectingWriter::default());
+        let wrapped = maybe_wrap_writer(Some(counter), writer);
+        // 验证包装后可正常使用（类型正确）
+        let _ = wrapped;
+    }
+
+    #[test]
+    fn maybe_wrap_writer_without_counter() {
+        let writer = Box::new(CollectingWriter::default());
+        let wrapped = maybe_wrap_writer(None::<Arc<dyn Counter>>, writer);
+        let _ = wrapped;
+    }
+
+    #[test]
+    fn maybe_wrap_reader_with_counter() {
+        let counter: Arc<dyn Counter> = Arc::new(TestCounter::default());
+        let reader = Box::new(FixedReader::new(vec![]));
+        let wrapped = maybe_wrap_reader(Some(counter), reader);
+        let _ = wrapped;
+    }
+
+    #[test]
+    fn maybe_wrap_reader_without_counter() {
+        let reader = Box::new(FixedReader::new(vec![]));
+        let wrapped = maybe_wrap_reader(None::<Arc<dyn Counter>>, reader);
+        let _ = wrapped;
     }
 }

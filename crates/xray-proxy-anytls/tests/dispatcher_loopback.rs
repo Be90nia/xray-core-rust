@@ -132,7 +132,7 @@ async fn dispatcher_e2e_anytls_loopback_echo() {
         Network::TCP,
     );
     let inbound = dispatcher
-        .dispatch(&dest, &SniffingRequest::default())
+        .dispatch(&dest, &SniffingRequest::default(), None, None)
         .expect("dispatch returns inbound Link");
 
     let mut w = inbound.writer;
@@ -194,7 +194,7 @@ async fn dispatcher_e2e_anytls_loopback_large_payload() {
         Network::TCP,
     );
     let inbound = dispatcher
-        .dispatch(&dest, &SniffingRequest::default())
+        .dispatch(&dest, &SniffingRequest::default(), None, None)
         .expect("dispatch returns inbound Link");
 
     let mut w = inbound.writer;

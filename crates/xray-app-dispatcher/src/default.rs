@@ -336,6 +336,8 @@ pub struct DefaultDispatcher {
     pub router: Option<Arc<dyn RoutingRouter>>,
     /// Policy manager 引用（暂留为 Policy 自身，避免引入 trait）
     pub default_policy: xray_features::policy::Policy,
+    /// Stats manager（对应 Go `stats.Manager`），用于按 tag 查 counter
+    pub stats: Option<Arc<dyn xray_features::stats::Manager>>,
     /// FakeDnsEngine 引用
     pub fdns: Option<Arc<dyn crate::fakednssniffer::FakeDnsEngine>>,
 }
@@ -345,6 +347,7 @@ impl Debug for DefaultDispatcher {
         f.debug_struct("DefaultDispatcher")
             .field("has_ohm", &self.ohm.is_some())
             .field("has_router", &self.router.is_some())
+            .field("has_stats", &self.stats.is_some())
             .field("has_fdns", &self.fdns.is_some())
             .finish()
     }
@@ -364,6 +367,7 @@ impl DefaultDispatcher {
             ohm: None,
             router: None,
             default_policy: xray_features::policy::Policy::default(),
+            stats: None,
             fdns: None,
         }
     }
@@ -408,14 +412,50 @@ impl DefaultDispatcher {
         &self,
         destination: &xray_common::net::destination::Destination,
         sniffing_request: &SniffingRequest,
+        inbound_tag: Option<&str>,
+        outbound_tag: Option<&str>,
     ) -> Result<xray_transport::link::Link, DispatcherError> {
         // Go getLink：两对 pipe，方向与 Go 原版完全一致
         let (up_r, up_w) = xray_buf::pipe::new();
         let (dn_r, dn_w) = xray_buf::pipe::new();
-        // inbound 端：读下行（outbound 写回的字节）+ 写上行（发给 outbound 的字节）
-        let inbound = xray_transport::link::Link::new(Box::new(dn_r), Box::new(up_w));
-        // outbound 端：读上行 + 写下行
-        let outbound = xray_transport::link::Link::new(Box::new(up_r), Box::new(dn_w));
+
+        // 查 inbound/outbound counter（对应 Go routedDispatch 中 getStatCounter）
+        // counter_name 规则："{kind}>>>{tag}>>>traffic>>>{direction}"
+        // Go: inbound uplink = inbound 写上行 = up_w
+        // Go: inbound downlink = inbound 读下行 = dn_r
+        // Go: outbound uplink = outbound 读上行 = up_r
+        // Go: outbound downlink = outbound 写下行 = dn_w
+        let inbound_uplink = inbound_tag.and_then(|tag| {
+            self.stats.as_ref().and_then(|m| {
+                m.get_counter(&format!("inbound>>>{tag}>>>traffic>>>uplink"))
+            })
+        });
+        let inbound_downlink = inbound_tag.and_then(|tag| {
+            self.stats.as_ref().and_then(|m| {
+                m.get_counter(&format!("inbound>>>{tag}>>>traffic>>>downlink"))
+            })
+        });
+        let outbound_uplink = outbound_tag.and_then(|tag| {
+            self.stats.as_ref().and_then(|m| {
+                m.get_counter(&format!("outbound>>>{tag}>>>traffic>>>uplink"))
+            })
+        });
+        let outbound_downlink = outbound_tag.and_then(|tag| {
+            self.stats.as_ref().and_then(|m| {
+                m.get_counter(&format!("outbound>>>{tag}>>>traffic>>>downlink"))
+            })
+        });
+
+        // 包装 link 端的 writer/reader
+        // inbound 端：写上行（uplink）+ 读下行（downlink）
+        let inbound_writer = crate::stats::maybe_wrap_writer(inbound_uplink, Box::new(up_w));
+        let inbound_reader = crate::stats::maybe_wrap_reader(inbound_downlink, Box::new(dn_r));
+        // outbound 端：读上行（uplink）+ 写下行（downlink）
+        let outbound_reader = crate::stats::maybe_wrap_reader(outbound_uplink, Box::new(up_r));
+        let outbound_writer = crate::stats::maybe_wrap_writer(outbound_downlink, Box::new(dn_w));
+
+        let inbound = xray_transport::link::Link::new(inbound_reader, inbound_writer);
+        let outbound = xray_transport::link::Link::new(outbound_reader, outbound_writer);
         // 启动 outbound handler；dispatch_link 内部 spawn handler.dispatch(outbound)
         self.dispatch_link(destination, outbound, sniffing_request)?;
         Ok(inbound)
@@ -758,6 +798,7 @@ mod tests {
         let d = DefaultDispatcher::default();
         assert!(d.ohm.is_none());
         assert!(d.router.is_none());
+        assert!(d.stats.is_none());
         assert!(d.fdns.is_none());
     }
 
@@ -848,7 +889,7 @@ mod tests {
             Network::TCP,
         );
         let inbound = d
-            .dispatch(&dest, &SniffingRequest::default())
+            .dispatch(&dest, &SniffingRequest::default(), None, None)
             .expect("dispatch returns inbound Link");
 
         // inbound Link 字段非空（trait object 无法直接比较，仅验证存在）
@@ -874,7 +915,7 @@ mod tests {
             Port::new(443),
             Network::TCP,
         );
-        let r = d.dispatch(&dest, &SniffingRequest::default());
+        let r = d.dispatch(&dest, &SniffingRequest::default(), None, None);
         assert!(r.is_err());
     }
 
@@ -901,7 +942,7 @@ mod tests {
             Port::new(443),
             Network::TCP,
         );
-        let r = d.dispatch(&dest, &SniffingRequest::default());
+        let r = d.dispatch(&dest, &SniffingRequest::default(), None, None);
         assert!(r.is_err());
     }
 
@@ -956,7 +997,7 @@ mod tests {
             Network::TCP,
         );
         let inbound = d
-            .dispatch(&dest, &SniffingRequest::default())
+            .dispatch(&dest, &SniffingRequest::default(), None, None)
             .expect("dispatch returns inbound Link");
 
         // 5. 写上行 → dispatcher spawn bridge → dial → echo → 读下行

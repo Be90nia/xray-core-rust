@@ -8,7 +8,7 @@
 //! 业务核心（独立可测）：
 //! - [`sniffer`] — `SniffResult` trait、`Sniffer` 编排框架、`CompositeSniffResult` 组合结果、
 //!   `ProtocolSniffer` trait（具体协议解析器留 TODO）
-//! - [`stats`] — `SizeStatWriter` 字节计数包装
+//! - [`stats`] — `SizeStatWriter` / `SizeStatReader` 字节计数包装
 //! - [`error`] — `DispatcherError` 错误类型
 //!
 //! IO 边界（trait + NotImplemented 占位）：
@@ -44,4 +44,4 @@ pub use sniffer::{
     CompositeSniffResult, ProtocolSniffer, SniffError, SniffResult, Sniffer,
     SnifferResultComposite, SnifferIsProtoSubsetOf,
 };
-pub use stats::SizeStatWriter;
+pub use stats::{SizeStatReader, SizeStatWriter, maybe_wrap_reader, maybe_wrap_writer};
