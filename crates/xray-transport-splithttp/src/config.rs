@@ -59,15 +59,15 @@ impl RangeConfig {
 
     /// 返回随机值（含端点）。对应 Go `RangeConfig.rand()`。
     ///
-    /// 切片1 用确定性中点 `(from + to) / 2` 作为占位（避免依赖 `xray_crypto`
-    /// 的 `rand_between`）。切片2 接入真随机后，此方法保持签名不变。
+    /// 使用 `rand` crate 的 `thread_rng().gen_range(from..=to)` 生成
+    /// 密码学安全的随机值，与 Go `crypto/rand` 行为一致。
     #[must_use]
     pub fn rand(&self) -> i32 {
         if self.from >= self.to {
             return self.from;
         }
-        // ponytail: 确定性中点 fallback。真随机等切片2 接入 xray_crypto::rand_between。
-        (self.from + self.to) / 2
+        use rand::Rng;
+        rand::rng().random_range(self.from..=self.to)
     }
 }
 
@@ -150,8 +150,8 @@ pub struct Config {
     pub sc_stream_up_server_secs: Option<RangeConfig>,
     /// xmux 多路复用配置。
     pub xmux: Option<XmuxConfig>,
-    /// 下载流配置（嵌套 StreamConfig，切片1 不解析）。
-    pub download_settings: Option<Vec<u8>>, // ponytail: proto StreamConfig 留切片2 强类型化
+    /// 下载流配置（嵌套 Config，用于独立配置下行连接）。
+    pub download_settings: Option<Box<Config>>,
     /// 是否启用 X-Padding 混淆模式。
     pub x_padding_obfs_mode: bool,
     /// X-Padding key（混淆模式用）。
@@ -735,9 +735,12 @@ mod tests {
     // ===== RangeConfig =====
 
     #[test]
-    fn range_rand_deterministic_midpoint() {
+    fn range_rand_returns_value_in_range() {
         let r = RangeConfig::new(0, 100);
-        assert_eq!(r.rand(), 50); // 切片1 用中点
+        for _ in 0..50 {
+            let v = r.rand();
+            assert!((0..=100).contains(&v), "rand() returned {v}, outside [0, 100]");
+        }
     }
 
     #[test]

@@ -304,8 +304,8 @@ pub async fn dial(
     host: &str,
     has_reality: bool,
 ) -> Result<PacketUpConn> {
-    // ponytail: has_download_settings=false 固定，DownloadSettings 接入留切片 F2
-    let mode = resolve_mode(&config.mode, has_reality, false);
+    let has_download_settings = config.download_settings.is_some();
+    let mode = resolve_mode(&config.mode, has_reality, has_download_settings);
     let session_id = if mode == "stream-one" {
         String::new()
     } else {

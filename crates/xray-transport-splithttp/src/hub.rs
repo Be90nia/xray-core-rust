@@ -158,7 +158,6 @@ impl HubListener {
             let ctx = Arc::clone(&ctx);
             tokio::spawn(async move {
                 use hyper::service::service_fn;
-                use hyper::server::conn::http1;
                 let svc = service_fn(move |req| {
                     let ctx = Arc::clone(&ctx);
                     async move {
@@ -167,7 +166,9 @@ impl HubListener {
                         )
                     }
                 });
-                let _ = http1::Builder::new().serve_connection(io, svc).await;
+                // 自动协商 H1/H2：H2 preface 检测，回退到 H1
+                let builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+                let _ = builder.serve_connection(io, svc).await;
             });
         }
     }
