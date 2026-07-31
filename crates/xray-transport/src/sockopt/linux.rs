@@ -32,12 +32,8 @@ impl LinuxSockOpt {
     ///
     /// 根据 `self.inbound` 决定使用 TCP_FASTOPEN_CONNECT（出站）或 TCP_FASTOPEN（入站）。
     pub fn apply(&self, fd: i32) -> io::Result<()> {
-        // TCP Fast Open
         if self.tcp_fast_open > 0 {
             if self.inbound {
-        // TCP Fast Open
-        if self.tcp_fast_open > 0 {
-            if inbound {
                 self.set_tcp_fast_open_inbound(fd)?;
             } else {
                 self.set_tcp_fast_open_connect(fd)?;
@@ -171,4 +167,69 @@ impl LinuxSockOpt {
         }
         Ok(())
     }
+}
+
+/// Linux SO_ORIGINAL_DST 常量。libc crate 未导出此值。
+/// 对应 Go `syscall.SO_ORIGINAL_DST = 80`。
+const SO_ORIGINAL_DST: i32 = 80;
+
+/// Linux IP_RECVORIGDSTADDR 常量。libc crate 未导出此值。
+/// 对应 Go `syscall.IP_RECVORIGDSTADDR = 20`。
+const IP_RECVORIGDSTADDR: i32 = 20;
+
+/// 通过 SO_ORIGINAL_DST 获取被 iptables REDIRECT 的 TCP 连接的原始目标地址。
+/// 对应 Go `transport/internet/sockopt_linux.go::GetOriginalDest`。
+///
+/// 仅在 Linux 上有效，需要 root 或 CAP_NET_ADMIN。
+/// 返回原始目标 `SocketAddr`（被 iptables REDIRECT 前的地址）。
+pub fn get_original_dst(fd: i32) -> io::Result<std::net::SocketAddr> {
+    // SAFETY: getsockopt 读取内核存储的原始目标地址，不修改 fd 状态。
+    // SO_ORIGINAL_DST 是只读选项，内核填充 sockaddr 结构后返回。
+    let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut addr_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    unsafe {
+        let ret = libc::getsockopt(
+            fd,
+            libc::SOL_IP,
+            SO_ORIGINAL_DST,
+            &mut addr as *mut libc::sockaddr_in as *mut libc::c_void,
+            &mut addr_len,
+        );
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    if addr.sin_family != libc::AF_INET as u16 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SO_ORIGINAL_DST returned non-IPv4 address",
+        ));
+    }
+    let port = u16::from_be(addr.sin_port);
+    let ip = std::net::Ipv4Addr::from(addr.sin_addr.s_addr.to_ne_bytes());
+    Ok(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)))
+}
+
+/// 启用 IP_RECVORIGDSTADDR，用于 UDP TProxy 获取原始目标地址。
+/// 对应 Go `transport/internet/sockopt_linux.go` 中 UDP socket 的设置。
+///
+/// 启用后，recvmsg 辅助消息（cmsg）中携带原始目标地址。
+/// 需要 root 或 CAP_NET_ADMIN。
+pub fn set_ip_recvorigdstaddr(fd: i32) -> io::Result<()> {
+    // SAFETY: setsockopt 对已验证的 fd 设置整数选项。
+    // IP_RECVORIGDSTADDR = 20，内核验证参数合法性。
+    unsafe {
+        let val: i32 = 1;
+        let ret = libc::setsockopt(
+            fd,
+            libc::SOL_IP,
+            IP_RECVORIGDSTADDR,
+            &val as *const i32 as *const libc::c_void,
+            std::mem::size_of::<i32>() as libc::socklen_t,
+        );
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }

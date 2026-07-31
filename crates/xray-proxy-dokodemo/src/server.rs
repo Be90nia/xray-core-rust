@@ -51,11 +51,27 @@ impl DokodemoServer {
 
     /// 构造目标 Destination。对应 Go `Process` 中 dest 构造逻辑。
     ///
-    /// 用 [`Config::predefined_address`] + `rewrite_port` 构造。
-    /// `follow_redirect=true` 时本应从 SO_ORIGINAL_DST 获取，切片2 暂不支持。
+    /// 优先级：
+    /// 1. `follow_redirect=true` + fd 有效 → 从 SO_ORIGINAL_DST 获取原始目的地
+    /// 2. `predefined_address` + `rewrite_port` 构造
     ///
-    /// 返回 `None` 表示配置不完整（无 predefined_address 且非 follow_redirect）。
-    fn build_destination(&self) -> Option<Destination> {
+    /// 返回 `None` 表示无法确定目标。
+    fn build_destination(&self, fd: Option<i32>) -> Option<Destination> {
+        // follow_redirect 优先：从 SO_ORIGINAL_DST 获取被 iptables REDIRECT 前的地址
+        if self.config.follow_redirect {
+            if let Some(fd) = fd {
+                if let Ok(addr) = xray_transport::sockopt::get_original_dst(fd) {
+                    let address = match addr.ip() {
+                        std::net::IpAddr::V4(v4) => Address::IPv4(v4),
+                        std::net::IpAddr::V6(v6) => Address::IPv6(v6),
+                    };
+                    let port = Port::new(addr.port());
+                    return Some(Destination::tcp(address, port));
+                }
+            }
+        }
+
+        // 降级到 predefined_address
         let addr = self.config.predefined_address()?;
         let port = Port::new(u16::try_from(self.config.rewrite_port).ok()?);
         let address = match addr {
@@ -65,7 +81,6 @@ impl DokodemoServer {
             },
             PredefinedAddress::Domain(s) => Address::Domain(s),
         };
-        // dokodemo 默认 TCP 网络；UDP 由 config.allowed_networks 决定，切片2 仅 TCP。
         Some(Destination::tcp(address, port))
     }
 
@@ -149,7 +164,7 @@ mod tests {
     #[test]
     fn build_destination_ipv4() {
         let server = DokodemoServer::new("test", make_ipv4_config([192, 168, 1, 1], 8080));
-        let dest = server.build_destination().expect("dest should exist");
+        let dest = server.build_destination(None).expect("dest should exist");
         assert_eq!(dest.port().value(), 8080);
         match dest.address() {
             Address::IPv4(v4) => assert_eq!(v4.octets(), [192, 168, 1, 1]),
@@ -168,7 +183,7 @@ mod tests {
             ..Default::default()
         };
         let server = DokodemoServer::new("test", cfg);
-        let dest = server.build_destination().expect("dest should exist");
+        let dest = server.build_destination(None).expect("dest should exist");
         assert_eq!(dest.port().value(), 443);
         match dest.address() {
             Address::Domain(s) => assert_eq!(s, "example.com"),
@@ -179,7 +194,7 @@ mod tests {
     #[test]
     fn build_destination_none_when_no_address() {
         let server = DokodemoServer::new("test", Config::default());
-        assert!(server.build_destination().is_none());
+        assert!(server.build_destination(None).is_none());
     }
 
     #[test]
@@ -194,7 +209,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(server.build_destination().is_none());
+        assert!(server.build_destination(None).is_none());
     }
 
     #[test]
@@ -236,11 +251,55 @@ mod tests {
                 ..Default::default()
             },
         );
-        let dest = server.build_destination().unwrap();
+        let dest = server.build_destination(None).unwrap();
         assert_eq!(dest.port().value(), 443);
         match dest.address() {
             Address::IPv6(v6) => assert_eq!(v6.octets(), [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
             other => panic!("expected IPv6, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn follow_redirect_without_fd_falls_back_to_predefined() {
+        let server = DokodemoServer::new(
+            "test",
+            Config {
+                follow_redirect: true,
+                rewrite_address: Some(ProtoIpOrDomain {
+                    address: Some(ProtoAddress::Ip(vec![10, 0, 0, 1])),
+                }),
+                rewrite_port: 443,
+                allowed_networks: vec![Network::Tcp],
+                ..Default::default()
+            },
+        );
+        // 无 fd 时降级到 predefined_address
+        let dest = server.build_destination(None).expect("should fall back to predefined");
+        match dest.address() {
+            Address::IPv4(v4) => assert_eq!(v4.octets(), [10, 0, 0, 1]),
+            other => panic!("expected IPv4, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn follow_redirect_with_invalid_fd_falls_back_to_predefined() {
+        let server = DokodemoServer::new(
+            "test",
+            Config {
+                follow_redirect: true,
+                rewrite_address: Some(ProtoIpOrDomain {
+                    address: Some(ProtoAddress::Ip(vec![10, 0, 0, 1])),
+                }),
+                rewrite_port: 443,
+                allowed_networks: vec![Network::Tcp],
+                ..Default::default()
+            },
+        );
+        // 无效 fd 时 get_original_dst 会失败，降级到 predefined_address
+        let dest = server.build_destination(Some(-1)).expect("should fall back to predefined");
+        match dest.address() {
+            Address::IPv4(v4) => assert_eq!(v4.octets(), [10, 0, 0, 1]),
+            other => panic!("expected IPv4, got {other:?}"),
         }
     }
 }

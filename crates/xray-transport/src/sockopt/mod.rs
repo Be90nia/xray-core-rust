@@ -90,6 +90,42 @@ pub fn apply_inbound_socket_options(socket: &Socket, opts: &SocketOptions) -> st
     Ok(())
 }
 
+/// 获取被 iptables REDIRECT 的 TCP 连接的原始目标地址。
+/// 对应 Go `transport/internet/sockopt_linux.go::GetOriginalDest`。
+///
+/// 仅在 Linux 上有效。其他平台返回 `Unsupported` 错误。
+/// 需要 root 或 CAP_NET_ADMIN。
+pub fn get_original_dst(_fd: i32) -> std::io::Result<std::net::SocketAddr> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::get_original_dst(_fd)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "SO_ORIGINAL_DST is Linux-only",
+        ))
+    }
+}
+
+/// 启用 IP_RECVORIGDSTADDR，用于 UDP TProxy 获取原始目标地址。
+///
+/// 仅在 Linux 上有效。其他平台返回 `Unsupported` 错误。
+pub fn set_ip_recvorigdstaddr(_fd: i32) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::set_ip_recvorigdstaddr(_fd)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "IP_RECVORIGDSTADDR is Linux-only",
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
