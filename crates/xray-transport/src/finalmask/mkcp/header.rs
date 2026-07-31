@@ -339,6 +339,17 @@ pub struct HeaderConfig {
     pub domain: String,
 }
 
+impl HeaderConfig {
+    /// 从 HeaderId 创建配置（无 domain，仅 DNS 模式需要 domain）。
+    #[must_use]
+    pub fn from_id(id: HeaderId) -> Self {
+        Self {
+            id,
+            domain: String::new(),
+        }
+    }
+}
+
 impl Default for HeaderConfig {
     fn default() -> Self {
         Self {
