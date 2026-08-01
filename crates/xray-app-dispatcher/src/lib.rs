@@ -33,8 +33,8 @@ pub mod stats;
 
 pub use config::{Config, SessionConfig};
 pub use default::{
-    CachedReader, DefaultDispatcher, DispatchHandler, DispatcherContext, OutboundHandlerManager,
-    RoutingContext, RoutingRouter,
+    CachedReader, DefaultDispatcher, DialBridge, DispatchHandler, DispatcherContext,
+    OutboundHandlerManager, RoutingContext, RoutingRouter, SimpleOhm,
 };
 pub use error::DispatcherError;
 pub use fakednssniffer::{

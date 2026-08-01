@@ -191,6 +191,60 @@ where
     up_res.and(down_res)
 }
 
+/// 双向桥接两个 dispatcher [`Link`]（xray-buf Reader/Writer）。
+///
+/// 上行：`link_a.reader` → `link_b.writer`。
+/// 下行：`link_b.reader` → `link_a.writer`。
+///
+/// 两个方向独立运行到都完成（`join!` 语义）——任一方向 EOF/出错不会取消另一方向。
+/// 用于代理链场景：原始 link ↔ client link ↔ chained handler。
+pub async fn bridge_link_with_link(link_a: Link, link_b: Link) -> io::Result<()> {
+    use xray_buf::io::{Reader, Writer};
+    use xray_buf::multi::MultiBuffer;
+
+    let Link { reader: mut a_reader, writer: mut a_writer } = link_a;
+    let Link { reader: mut b_reader, writer: mut b_writer } = link_b;
+
+    // 上行：a → b
+    let up = async move {
+        loop {
+            let mb = match a_reader.read_multi_buffer().await {
+                Ok(mb) => mb,
+                Err(_) => break,
+            };
+            if mb.is_empty() {
+                break;
+            }
+            if b_writer.write_multi_buffer(mb).await.is_err() {
+                break;
+            }
+        }
+        b_writer.shutdown();
+        io::Result::Ok(())
+    };
+
+    // 下行：b → a
+    let down = async move {
+        loop {
+            let mb = match b_reader.read_multi_buffer().await {
+                Ok(mb) => mb,
+                Err(_) => break,
+            };
+            if mb.is_empty() {
+                break;
+            }
+            if a_writer.write_multi_buffer(mb).await.is_err() {
+                break;
+            }
+        }
+        a_writer.shutdown();
+        io::Result::Ok(())
+    };
+
+    let (up_res, down_res) = tokio::join!(up, down);
+    up_res.and(down_res)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

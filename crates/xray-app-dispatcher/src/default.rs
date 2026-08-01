@@ -796,7 +796,7 @@ impl xray_buf::io::Reader for CachedReader {
 
 // ========== DialBridge：通用 Dial→Bridge adapter ==========
 
-use xray_transport::bridge::bridge_link_with_stream_full;
+use xray_transport::bridge::{bridge_link_with_link, bridge_link_with_stream_full};
 use xray_transport::connection::Connection;
 
 /// 拨号闭包类型：dest → Box<dyn Connection>
@@ -810,21 +810,81 @@ pub type DialFn = Arc<
 ///
 /// 接收一个拨号闭包（dest → Connection），impl [`DispatchHandler`]。
 /// `dispatch(dest, link)` 内部：`dial(dest)` → [`bridge_link_with_stream`](link, remote)。
+///
+/// ## 代理链（Proxy Chain）
+///
+/// 对应 Go `OutboundHandlerEntry.dial()` 中 `senderSettings.ProxySettings.HasTag()` 逻辑。
+/// 当 `proxy_chain_tag` 存在时，dispatch 不直接拨号，而是：
+/// 1. 通过 `outbound_manager` 按 tag 查找 chained handler
+/// 2. 创建 duplex pipe（client 端返回给调用者，proxy 端桥接到 chained handler）
+/// 3. 将 link 桥接到 client 端，chained handler 处理真实拨号
 pub struct DialBridge {
     tag: String,
     dial: DialFn,
+    /// 代理链配置（对应 Go `senderSettings.ProxySettings`）。
+    ///
+    /// 用 `RwLock` 包裹以支持注册后设置（Phase 1 注册 handler，Phase 2 设置代理链）。
+    proxy_chain: std::sync::RwLock<ProxyChainConfig>,
+}
+
+/// 代理链配置。
+struct ProxyChainConfig {
+    /// 代理链目标 tag（对应 Go `senderSettings.ProxySettings.Tag`）。
+    chain_tag: Option<String>,
+    /// 出站管理器引用（代理链拨号时查找 chained handler）。
+    outbound_manager: Option<Arc<dyn OutboundHandlerManager>>,
 }
 
 impl DialBridge {
     #[must_use]
     pub fn new(tag: impl Into<String>, dial: DialFn) -> Self {
-        Self { tag: tag.into(), dial }
+        Self {
+            tag: tag.into(),
+            dial,
+            proxy_chain: std::sync::RwLock::new(ProxyChainConfig {
+                chain_tag: None,
+                outbound_manager: None,
+            }),
+        }
+    }
+
+    /// 设置代理链 tag 和出站管理器。
+    ///
+    /// 对应 Go `senderSettings.ProxySettings.Tag`。
+    /// 必须同时设置 `outbound_manager`，否则代理链无法查找 chained handler。
+    ///
+    /// 因为 `DialBridge` 在注册为 `DispatchHandler` 后仍需设置代理链，
+    /// 此方法接受 `&self`（内部用 `RwLock` 保护）。
+    pub fn set_proxy_chain(
+        &self,
+        chain_tag: impl Into<String>,
+        manager: Arc<dyn OutboundHandlerManager>,
+    ) {
+        let mut guard = self.proxy_chain.write().expect("DialBridge proxy_chain lock poisoned");
+        guard.chain_tag = Some(chain_tag.into());
+        guard.outbound_manager = Some(manager);
+    }
+
+    /// 代理链 tag 是否已设置。
+    #[must_use]
+    pub fn has_proxy_chain(&self) -> bool {
+        self.proxy_chain.read().expect("DialBridge proxy_chain lock poisoned").chain_tag.is_some()
+    }
+
+    /// 获取代理链配置的快照（chain_tag, outbound_manager clone）。
+    fn get_proxy_chain(&self) -> (Option<String>, Option<Arc<dyn OutboundHandlerManager>>) {
+        let guard = self.proxy_chain.read().expect("DialBridge proxy_chain lock poisoned");
+        (guard.chain_tag.clone(), guard.outbound_manager.clone())
     }
 }
 
 impl std::fmt::Debug for DialBridge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DialBridge").field("tag", &self.tag).finish()
+        let chain_tag = self.proxy_chain.read().ok().and_then(|g| g.chain_tag.clone());
+        f.debug_struct("DialBridge")
+            .field("tag", &self.tag)
+            .field("proxy_chain_tag", &chain_tag)
+            .finish()
     }
 }
 
@@ -838,6 +898,13 @@ impl DispatchHandler for DialBridge {
         dest: &xray_common::net::destination::Destination,
         link: xray_transport::link::Link,
     ) -> PinFuture<()> {
+        // 代理链：如果 proxy_chain_tag 存在，通过 chained handler 拨号
+        let (chain_tag, ohm) = self.get_proxy_chain();
+        if let Some(chain_tag) = chain_tag {
+            return self.dispatch_via_chain(dest, link, chain_tag, ohm);
+        }
+
+        // 直接拨号
         let dial = Arc::clone(&self.dial);
         let tag = self.tag.clone();
         let dest = dest.clone();
@@ -851,6 +918,72 @@ impl DispatchHandler for DialBridge {
                 Err(e) => {
                     tracing::error!(tag = %tag, "dial failed: {e}");
                 }
+            }
+        })
+    }
+}
+
+impl DialBridge {
+    /// 代理链 dispatch：通过 chained handler 拨号。
+    ///
+    /// 对应 Go `OutboundHandlerEntry.dial()` 中 `senderSettings.ProxySettings.HasTag()` 分支。
+    /// 流程：
+    /// 1. 通过 outbound_manager 按 chain_tag 查找 chained handler
+    /// 2. 创建 duplex pipe（client 端桥接到 link，proxy 端交给 chained handler）
+    /// 3. spawn 双向桥接：link ↔ client_stream ↔ proxy_stream ↔ chained handler
+    fn dispatch_via_chain(
+        &self,
+        dest: &xray_common::net::destination::Destination,
+        link: xray_transport::link::Link,
+        chain_tag: String,
+        ohm: Option<Arc<dyn OutboundHandlerManager>>,
+    ) -> PinFuture<()> {
+        let tag = self.tag.clone();
+        let dest = dest.clone();
+
+        Box::pin(async move {
+            let Some(ohm) = ohm else {
+                tracing::error!(tag = %tag, "proxy chain tag '{chain_tag}' set but no outbound manager");
+                return;
+            };
+            let Some(chained_handler) = ohm.get_handler(&chain_tag) else {
+                tracing::error!(
+                    tag = %tag,
+                    chain_tag = %chain_tag,
+                    "proxy chain handler not found"
+                );
+                return;
+            };
+
+            // 用两对 pipe 代替 duplex，与 DefaultDispatcher::dispatch 一致
+            let pipe_opt = xray_buf::pipe::PipeOption::default();
+            let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
+            let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
+
+            // client 端 link：读下行（dn_r）+ 写上行（up_w）
+            // chained handler 端 link：读上行（up_r）+ 写下行（dn_w）
+            let client_link = xray_transport::link::Link::new(
+                Box::new(dn_r) as Box<dyn xray_buf::io::Reader>,
+                Box::new(up_w) as Box<dyn xray_buf::io::Writer>,
+            );
+            let chained_link = xray_transport::link::Link::new(
+                Box::new(up_r) as Box<dyn xray_buf::io::Reader>,
+                Box::new(dn_w) as Box<dyn xray_buf::io::Writer>,
+            );
+
+            // spawn chained handler dispatch
+            let chained_tag = chained_handler.tag().to_string();
+            let chained_fut = chained_handler.dispatch(&dest, chained_link);
+            tokio::spawn(async move {
+                let _ = chained_fut.await;
+                tracing::trace!(tag = %chained_tag, "chained handler dispatch done");
+            });
+
+            // 桥接原始 link ↔ client_link
+            // link.reader → client_link.writer（上行）
+            // client_link.reader → link.writer（下行）
+            if let Err(e) = bridge_link_with_link(link, client_link).await {
+                tracing::warn!(tag = %tag, "proxy chain bridge ended: {e}");
             }
         })
     }
