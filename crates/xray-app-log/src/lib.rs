@@ -17,6 +17,7 @@
 pub mod command;
 pub mod config;
 pub mod error;
+pub mod feature;
 pub mod instance;
 pub mod mask;
 
@@ -27,8 +28,10 @@ pub use command::{
 pub use config::{LogConfig, LogType, SeverityLevel};
 pub use error::{at_error, at_warning, LogError};
 pub use instance::{
-    AccessMessage, AccessStatus, DnsLog, GeneralMessage, HandlerCreator,
+    AccessMessage, AccessStatus, ConsoleHandler, ConsoleHandlerCreator, DnsLog,
+    FileHandler, FileHandlerCreator, GeneralMessage, HandlerCreator,
     HandlerCreatorOptions, HandlerCreatorRegistry, LogEntry, LogHandler, LogInstance,
-    MaskingHandler, NoneHandlerCreator,
+    MaskingHandler, NoneHandlerCreator, register_default_creators,
 };
 pub use mask::{mask_addresses, parse_mask_address};
+pub use feature::LogFeature;

@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::Write;
 
 use crate::config::{LogConfig, LogType, SeverityLevel};
 use crate::error::{at_error, at_warning, LogError};
@@ -178,6 +180,94 @@ impl HandlerCreator for NoneHandlerCreator {
     ) -> Result<Option<Arc<dyn LogHandler>>, LogError> {
         Ok(None)
     }
+}
+
+/// Console handler：通过 tracing 宏输出日志到 stdout/stderr。
+///
+/// 对应 Go `log.ConsoleHandler`。使用项目已有的 tracing 依赖，
+/// 无需额外日志后端。
+pub struct ConsoleHandler;
+
+impl LogHandler for ConsoleHandler {
+    fn handle(&self, entry: &LogEntry) {
+        match entry {
+            LogEntry::General(m) => match m.severity {
+                SeverityLevel::Error => tracing::error!(target: "xray", "{}", m.content),
+                SeverityLevel::Warning => tracing::warn!(target: "xray", "{}", m.content),
+                SeverityLevel::Info => tracing::info!(target: "xray", "{}", m.content),
+                SeverityLevel::Debug => tracing::debug!(target: "xray", "{}", m.content),
+                _ => tracing::info!(target: "xray", "{}", m.content),
+            },
+            LogEntry::Access(m) => tracing::info!(target: "xray.access", "{}", m.format()),
+            LogEntry::Dns(m) => tracing::info!(target: "xray.dns", "{}", m.format()),
+        }
+    }
+}
+
+/// Console handler creator。
+pub struct ConsoleHandlerCreator;
+
+impl HandlerCreator for ConsoleHandlerCreator {
+    fn create(
+        &self,
+        _log_type: LogType,
+        _options: &HandlerCreatorOptions,
+    ) -> Result<Option<Arc<dyn LogHandler>>, LogError> {
+        Ok(Some(Arc::new(ConsoleHandler)))
+    }
+}
+
+/// File handler：追加写入文件。
+///
+/// 对应 Go `log.FileHandler`。每次 handle() 打开文件追加写入一行，
+/// 避免持有文件句柄导致无法 rotate。
+/// ponytail: per-write open — 如果性能不够，改用 RwLock<File> 持有句柄。
+pub struct FileHandler {
+    path: String,
+}
+
+impl FileHandler {
+    pub fn new(path: String) -> Self {
+        Self { path }
+    }
+}
+
+impl LogHandler for FileHandler {
+    fn handle(&self, entry: &LogEntry) {
+        let line = entry.format();
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&self.path) {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+}
+
+/// File handler creator。
+pub struct FileHandlerCreator;
+
+impl HandlerCreator for FileHandlerCreator {
+    fn create(
+        &self,
+        _log_type: LogType,
+        options: &HandlerCreatorOptions,
+    ) -> Result<Option<Arc<dyn LogHandler>>, LogError> {
+        if options.path.is_empty() {
+            return Err(LogError::HandlerCreate(
+                "file log handler requires a non-empty path".into(),
+            ));
+        }
+        Ok(Some(Arc::new(FileHandler::new(options.path.clone()))))
+    }
+}
+
+/// 注册默认 handler creators（None/Console/File）到 registry。
+///
+/// 对应 Go `init()` 中注册 `handlerCreatorMap` 的行为。
+/// 在 LogFeature.start() 中调用。
+pub fn register_default_creators(registry: &HandlerCreatorRegistry) -> Result<(), LogError> {
+    registry.register(LogType::None, Arc::new(NoneHandlerCreator))?;
+    registry.register(LogType::Console, Arc::new(ConsoleHandlerCreator))?;
+    registry.register(LogType::File, Arc::new(FileHandlerCreator))?;
+    Ok(())
 }
 
 /// 把 handler 包装一层，对 entry 内容做 mask 处理后再转发。

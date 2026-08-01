@@ -32,6 +32,8 @@ pub fn register_all_features() {
     for &kind in APP_KINDS {
         let _ = registry::register_feature(kind, stub_factory(kind));
     }
+    // Override log with real factory
+    let _ = registry::register_feature("log", log_factory());
 
     // --- Proxy inbound kinds ---
     for &kind in PROXY_INBOUND_KINDS {
@@ -127,6 +129,17 @@ fn stub_factory(kind: &'static str) -> FeatureFactory {
             name: kind,
             message: format!("{kind}: not yet implemented (stub factory registered)"),
         })
+    })
+}
+
+/// Log app 真实 factory：从 proto 编码的配置字节创建 LogFeature。
+fn log_factory() -> FeatureFactory {
+    Arc::new(|data: &[u8]| {
+        let proto: xray_proto::xray::app::log::Config =
+            prost::Message::decode(data).unwrap_or_default();
+        let config = xray_app_log::LogConfig::from_proto(&proto);
+        let feature = xray_app_log::LogFeature::new(config)?;
+        Ok(Arc::new(feature) as Arc<dyn Feature>)
     })
 }
 

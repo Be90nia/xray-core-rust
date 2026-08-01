@@ -5763,6 +5763,7 @@ dependencies = [
  "anyhow",
  "clap",
  "parking_lot",
+ "prost",
  "rcgen 0.13.2",
  "rustls",
  "rustls-pemfile",
