@@ -66,13 +66,16 @@ pub struct PipeOption {
     pub limit: i64,
     /// 缓冲满时是否丢弃新数据（`true` = 丢弃并返回 Ok，`false` = 阻塞等待读端腾出空间）。
     pub discard_overflow: bool,
+    /// 读端空闲超时。如果 reader 超过此时间没读到数据，返回 EOF。
+    /// 对应 Go `pipe.Option.Timeout`。
+    pub idle_timeout: Option<std::time::Duration>,
 }
-
 impl Default for PipeOption {
     fn default() -> Self {
         Self {
             limit: -1,
             discard_overflow: false,
+            idle_timeout: None,
         }
     }
 }
@@ -175,13 +178,14 @@ impl Reader {
     pub async fn read_multi_buffer(&mut self) -> Result<MultiBuffer> {
         loop {
             // 取 buffered 数据
-            let data = {
+            let (data, idle_timeout) = {
                 let mut inner = self.0.inner.lock().unwrap();
-                if !inner.data.is_empty() {
+                let data = if !inner.data.is_empty() {
                     std::mem::take(&mut inner.data)
                 } else {
                     MultiBuffer::new()
-                }
+                };
+                (data, inner.option.idle_timeout)
             };
 
             if !data.is_empty() {
@@ -209,13 +213,21 @@ impl Reader {
                 }
             }
 
-            // 等待任一信号
+            // 等待任一信号（可选 idle timeout）
             let shared = self.0.clone();
-            tokio::select! {
-                _ = self.0.read_signal.wait() => continue,
-                _ = PipeShared::wait_close(shared) => {
-                    // close 后可能有 buffered data，下一轮 loop 会先取出
-                    continue;
+            if let Some(timeout) = idle_timeout {
+                tokio::select! {
+                    _ = self.0.read_signal.wait() => continue,
+                    _ = PipeShared::wait_close(shared) => continue,
+                    _ = tokio::time::sleep(timeout) => {
+                        // idle timeout：读端超时无数据，返回 EOF
+                        return Err(Error::Eof);
+                    }
+                }
+            } else {
+                tokio::select! {
+                    _ = self.0.read_signal.wait() => continue,
+                    _ = PipeShared::wait_close(shared) => continue,
                 }
             }
         }
@@ -655,6 +667,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.to_vec(), b"hello");
+    }
+
+    // ========== idle_timeout ==========
+
+    #[tokio::test]
+    async fn test_idle_timeout_returns_eof() {
+        let opt = PipeOption {
+            idle_timeout: Some(Duration::from_millis(50)),
+            ..PipeOption::default()
+        };
+        let (mut r, _w) = new_with_option(opt);
+        // 不写任何数据，reader 应在 idle_timeout 后返回 EOF
+        let result = r.read_multi_buffer().await;
+        assert!(matches!(result, Err(Error::Eof)));
+    }
+
+    #[tokio::test]
+    async fn test_idle_timeout_resets_on_data() {
+        let opt = PipeOption {
+            idle_timeout: Some(Duration::from_millis(100)),
+            ..PipeOption::default()
+        };
+        let (mut r, mut w) = new_with_option(opt);
+        // 写入数据，reader 应立即返回数据（不触发 idle timeout）
+        w.write_multi_buffer(mb(b"hello")).await.unwrap();
+        let out = r.read_multi_buffer().await.unwrap();
+        assert_eq!(out.to_vec(), b"hello");
+        // 数据读完后再读，应触发 idle timeout 返回 EOF
+        let result = r.read_multi_buffer().await;
+        assert!(matches!(result, Err(Error::Eof)));
     }
 
     // ========== len / is_empty ==========

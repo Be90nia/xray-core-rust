@@ -338,10 +338,11 @@ async fn sniff_connection(
     dest: &xray_common::net::destination::Destination,
     req: &SniffingRequest,
     fdns: Option<&dyn crate::fakednssniffer::FakeDnsEngine>,
+    handshake_timeout: std::time::Duration,
 ) -> Result<(xray_common::net::destination::Destination, Option<String>), DispatcherError> {
     // 读首包（带超时）
     let read_result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        handshake_timeout,
         cr.read_first(),
     ).await;
 
@@ -553,8 +554,13 @@ impl DefaultDispatcher {
         outbound_tag: Option<&str>,
     ) -> Result<xray_transport::link::Link, DispatcherError> {
         // Go getLink：两对 pipe，方向与 Go 原版完全一致
-        let (up_r, up_w) = xray_buf::pipe::new();
-        let (dn_r, dn_w) = xray_buf::pipe::new();
+        // idle_timeout 对应 Go pipe.Option.Timeout — 读端空闲超时返回 EOF
+        let pipe_opt = xray_buf::pipe::PipeOption {
+            idle_timeout: Some(self.default_policy.timeout.connection_idle),
+            ..xray_buf::pipe::PipeOption::default()
+        };
+        let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
+        let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
 
         // 查 inbound/outbound counter（对应 Go routedDispatch 中 getStatCounter）
         // counter_name 规则："{kind}>>>{tag}>>>traffic>>>{direction}"
@@ -629,6 +635,7 @@ impl DefaultDispatcher {
         let router = self.router.clone();
         let fdns = self.fdns.clone();
         let ohm = Arc::clone(ohm);
+        let handshake_timeout = self.default_policy.timeout.handshake;
 
         let outbound_reader = outbound.reader;
         let outbound_writer = outbound.writer;
@@ -638,7 +645,7 @@ impl DefaultDispatcher {
             let mut cr = CachedReader::with_inner(outbound_reader);
             let (final_dest, sniffed_protocol) = if sniff_req.enabled {
                 match sniff_connection(
-                    &mut cr, &dest, &sniff_req, fdns.as_deref(),
+                    &mut cr, &dest, &sniff_req, fdns.as_deref(), handshake_timeout,
                 ).await {
                     Ok((d, proto)) => (d, proto),
                     Err(e) => {
