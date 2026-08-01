@@ -16,7 +16,7 @@ use xray_app_dispatcher::default::SimpleOhm;
 use xray_app_dispatcher::{DispatchHandler, OutboundHandlerManager};
 use xray_buf::io::{new_reader, new_writer};
 use xray_common::protocol::{Command, ResponseHeader, SecurityType};
-use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead};
+use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead, NoOpAeadCipher};
 use xray_transport::link::Link;
 
 use crate::encoding::server::{ServerSession, SessionHistory};
@@ -31,6 +31,7 @@ const DUPLEX_BUF: usize = 16_384;
 enum BodyCipher {
     Aes(Aes128Gcm),
     Chacha(ChaCha20Poly1305Aead),
+    NoOp(NoOpAeadCipher),
 }
 
 impl AeadCipher for BodyCipher {
@@ -38,6 +39,7 @@ impl AeadCipher for BodyCipher {
         match self {
             BodyCipher::Aes(c) => c.nonce_size(),
             BodyCipher::Chacha(c) => c.nonce_size(),
+            BodyCipher::NoOp(c) => c.nonce_size(),
         }
     }
 
@@ -45,6 +47,7 @@ impl AeadCipher for BodyCipher {
         match self {
             BodyCipher::Aes(c) => c.tag_size(),
             BodyCipher::Chacha(c) => c.tag_size(),
+            BodyCipher::NoOp(c) => c.tag_size(),
         }
     }
 
@@ -52,6 +55,7 @@ impl AeadCipher for BodyCipher {
         match self {
             BodyCipher::Aes(c) => c.key_size(),
             BodyCipher::Chacha(c) => c.key_size(),
+            BodyCipher::NoOp(c) => c.key_size(),
         }
     }
 
@@ -64,6 +68,7 @@ impl AeadCipher for BodyCipher {
         match self {
             BodyCipher::Aes(c) => c.seal(nonce, aad, plaintext),
             BodyCipher::Chacha(c) => c.seal(nonce, aad, plaintext),
+            BodyCipher::NoOp(c) => c.seal(nonce, aad, plaintext),
         }
     }
 
@@ -76,6 +81,7 @@ impl AeadCipher for BodyCipher {
         match self {
             BodyCipher::Aes(c) => c.open(nonce, aad, ciphertext),
             BodyCipher::Chacha(c) => c.open(nonce, aad, ciphertext),
+            BodyCipher::NoOp(c) => c.open(nonce, aad, ciphertext),
         }
     }
 }
@@ -210,6 +216,9 @@ async fn handle_connection(
             let s = ChaCha20Poly1305Aead::new(&sk)
                 .map_err(|e| std::io::Error::other(format!("vmess chacha resp key: {e}")))?;
             (BodyCipher::Chacha(r), BodyCipher::Chacha(s))
+        }
+        SecurityType::None | SecurityType::Zero => {
+            (BodyCipher::NoOp(NoOpAeadCipher), BodyCipher::NoOp(NoOpAeadCipher))
         }
         other => {
             return Err(std::io::Error::other(format!(

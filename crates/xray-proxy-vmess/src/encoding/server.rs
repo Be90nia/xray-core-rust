@@ -19,7 +19,7 @@ use xray_common::net::address::Address;
 use xray_common::net::destination::Destination;
 use xray_common::net::port::Port;
 use xray_common::protocol::{Command, RequestHeader, ResponseHeader, SecurityType};
-use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead};
+use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead, NoOpAeadCipher};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -247,9 +247,14 @@ impl<'v> ServerSession<'v> {
             return Err(VmessError::InvalidAuth);
         }
 
-        if matches!(security, SecurityType::Unknown | SecurityType::Auto) {
-            return Err(VmessError::UnknownSecurityType(security.as_u8() as i32));
-        }
+        // Auto: 服务端默认选择 AES-128-GCM（与 Go 一致）
+        let security = match security {
+            SecurityType::Auto => SecurityType::Aes128Gcm,
+            SecurityType::Unknown => {
+                return Err(VmessError::UnknownSecurityType(security.as_u8() as i32));
+            }
+            other => other,
+        };
 
         let dest = Destination::tcp(address, Port::new(port));
         let mut header = RequestHeader::new(version, command, dest, security);
@@ -286,6 +291,7 @@ impl<'v> ServerSession<'v> {
                 let key = generate_chacha20poly1305_key(&self.request_body_key);
                 Box::new(ChaCha20Poly1305Aead::new(&key)?)
             }
+            SecurityType::None | SecurityType::Zero => Box::new(NoOpAeadCipher),
             other => {
                 return Err(VmessError::Other(format!(
                     "decode_request_body: unsupported security {:?}",
@@ -397,6 +403,7 @@ impl<'v> ServerSession<'v> {
                 let key = generate_chacha20poly1305_key(&self.response_body_key);
                 Box::new(ChaCha20Poly1305Aead::new(&key)?)
             }
+            SecurityType::None | SecurityType::Zero => Box::new(NoOpAeadCipher),
             other => {
                 return Err(VmessError::Other(format!(
                     "encode_response_body: unsupported security {:?}",

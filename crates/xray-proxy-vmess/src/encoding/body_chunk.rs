@@ -22,7 +22,7 @@
 
 use std::io::{Read, Write};
 
-use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead};
+use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead, NoOpAeadCipher};
 use xray_crypto::authenticator::{Authenticator, BytesGenerator, DynamicAEADAuthenticator};
 use xray_crypto::chunk::{AEADChunkSizeParser, ChunkSizeDecoder, ChunkSizeEncoder};
 
@@ -176,6 +176,12 @@ pub fn make_authenticated_length_size_parser(
         SecurityType::Chacha20Poly1305 => {
             let k32 = generate_chacha20poly1305_key(&auth_key);
             Box::new(ChaCha20Poly1305Aead::new(&k32)?)
+        }
+        // None/Zero 不支持 authenticated_length（需要加密），回退到 PlainSizeParser
+        SecurityType::None | SecurityType::Zero => {
+            return Ok(AEADSizeParserAdapter::new(Box::new(
+                DynamicAEADAuthenticator::new(Box::new(NoOpAeadCipher), nonce_gen, None),
+            )));
         }
         other => {
             return Err(VmessError::Other(format!(
