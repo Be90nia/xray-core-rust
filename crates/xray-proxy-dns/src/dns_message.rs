@@ -209,6 +209,79 @@ pub fn build_dns_response(query_header: &DnsHeader, question: &DnsQuestion, rcod
     buf
 }
 
+/// 构造包含 IP 记录的 DNS 响应消息（Header + Question + Answer records）。
+///
+/// 用于 Hijack 动作：调用 DnsService::lookup_ip() 获取 IP 后构造响应。
+/// `ips` 为解析结果，`ttl` 为缓存有效期（秒）。
+///
+/// # DNS 记录格式（RFC 1035 §4.1.3）
+///
+/// ```text
+/// NAME    (QNAME 回显)
+/// TYPE    (1=A, 28=AAAA)
+/// CLASS   (1=IN)
+/// TTL     (4 bytes, big-endian)
+/// RDLENGTH(2 bytes)
+/// RDATA   (4 bytes for A, 16 bytes for AAAA)
+/// ```
+#[must_use]
+pub fn build_ip_response(
+    query_header: &DnsHeader,
+    question: &DnsQuestion,
+    ips: &[std::net::IpAddr],
+    ttl: u32,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(512);
+    // Header（12B）
+    let flags = 0x8000 // QR=1 (response)
+        | (query_header.flags & 0x0100) // 回显 RD
+        | 0x0080 // RA=1 (recursion available)
+        | 0; // RCODE=0 (NOERROR)
+    buf.extend_from_slice(&query_header.id.to_be_bytes());
+    buf.extend_from_slice(&flags.to_be_bytes());
+    buf.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
+    buf.extend_from_slice(&(ips.len() as u16).to_be_bytes()); // ANCOUNT
+    buf.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT=0
+    buf.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT=0
+    // Question 回显
+    for label in question.name.split('.') {
+        buf.push(label.len() as u8);
+        buf.extend_from_slice(label.as_bytes());
+    }
+    buf.push(0); // QNAME 终止
+    buf.extend_from_slice(&question.q_type.to_be_bytes());
+    buf.extend_from_slice(&question.q_class.to_be_bytes());
+    // Answer records
+    for ip in ips {
+        // NAME：与 Question 相同的 QNAME（使用压缩指针指向 Question section）
+        // 压缩指针格式：0xC0 | offset（offset = 12，即 Question section 起始）
+        buf.push(0xC0);
+        buf.push(12); // 指向 Header 后的 Question QNAME
+        // TYPE
+        let rtype: u16 = match ip {
+            std::net::IpAddr::V4(_) => 1,  // A
+            std::net::IpAddr::V6(_) => 28, // AAAA
+        };
+        buf.extend_from_slice(&rtype.to_be_bytes());
+        // CLASS = IN(1)
+        buf.extend_from_slice(&1u16.to_be_bytes());
+        // TTL
+        buf.extend_from_slice(&ttl.to_be_bytes());
+        // RDLENGTH + RDATA
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                buf.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH=4
+                buf.extend_from_slice(&v4.octets());
+            }
+            std::net::IpAddr::V6(v6) => {
+                buf.extend_from_slice(&16u16.to_be_bytes()); // RDLENGTH=16
+                buf.extend_from_slice(&v6.octets());
+            }
+        }
+    }
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,5 +487,66 @@ mod tests {
         let (_, question) = parse_dns_query(&bytes).unwrap();
         assert_eq!(question.name, "");
         assert_eq!(question.q_type, 255);
+    }
+
+    #[test]
+    fn build_ip_response_with_a_records() {
+        let query = make_dns_a_query("example.com");
+        let (header, question) = parse_dns_query(&query).unwrap();
+        let ips: Vec<std::net::IpAddr> = vec![
+            "1.2.3.4".parse().unwrap(),
+            "5.6.7.8".parse().unwrap(),
+        ];
+        let resp = build_ip_response(&header, &question, &ips, 300);
+        // 验证响应可解析
+        let (resp_header, resp_question) = parse_dns_query(&resp).unwrap();
+        assert!(resp_header.is_response());
+        assert_eq!(resp_header.rcode(), 0); // NOERROR
+        assert_eq!(resp_header.an_count, 2);
+        assert_eq!(resp_question.name, "example.com");
+        // 验证 A 记录数据（手动检查 RDATA）
+        // Answer section 在 Question section 之后
+        let qname_end = 12 + "example.com".len() + 2 + 4; // header + qname + qtype + qclass
+        // 第一个 A 记录：压缩指针(2B) + TYPE(2B) + CLASS(2B) + TTL(4B) + RDLENGTH(2B) + RDATA(4B) = 16B
+        let rec1_start = qname_end;
+        assert_eq!(resp[rec1_start], 0xC0); // 压缩指针
+        assert_eq!(resp[rec1_start + 2..rec1_start + 4], [0, 1]); // TYPE=A
+        assert_eq!(resp[rec1_start + 4..rec1_start + 6], [0, 1]); // CLASS=IN
+        let ttl_bytes = &resp[rec1_start + 6..rec1_start + 10];
+        assert_eq!(u32::from_be_bytes(ttl_bytes.try_into().unwrap()), 300);
+        assert_eq!(resp[rec1_start + 10..rec1_start + 12], [0, 4]); // RDLENGTH=4
+        assert_eq!(&resp[rec1_start + 12..rec1_start + 16], &[1, 2, 3, 4]); // 1.2.3.4
+    }
+
+    #[test]
+    fn build_ip_response_with_aaaa_record() {
+        let mut query = make_dns_a_query("test.com");
+        // 改 QTYPE 为 AAAA(28)
+        let qtype_offset = query.len() - 4;
+        query[qtype_offset..qtype_offset + 2].copy_from_slice(&28u16.to_be_bytes());
+        let (header, question) = parse_dns_query(&query).unwrap();
+        let ips: Vec<std::net::IpAddr> = vec![
+            "::1".parse().unwrap(),
+        ];
+        let resp = build_ip_response(&header, &question, &ips, 60);
+        let (resp_header, _) = parse_dns_query(&resp).unwrap();
+        assert_eq!(resp_header.an_count, 1);
+        // 验证 AAAA 记录 RDLENGTH=16
+        let qname_end = 12 + "test.com".len() + 2 + 4;
+        let rec_start = qname_end;
+        assert_eq!(resp[rec_start + 2..rec_start + 4], [0, 28]); // TYPE=AAAA
+        assert_eq!(resp[rec_start + 10..rec_start + 12], [0, 16]); // RDLENGTH=16
+    }
+
+    #[test]
+    fn build_ip_response_empty_ips_returns_noerror_with_zero_answers() {
+        let query = make_dns_a_query("empty.com");
+        let (header, question) = parse_dns_query(&query).unwrap();
+        let ips: Vec<std::net::IpAddr> = vec![];
+        let resp = build_ip_response(&header, &question, &ips, 0);
+        let (resp_header, _) = parse_dns_query(&resp).unwrap();
+        assert!(resp_header.is_response());
+        assert_eq!(resp_header.rcode(), 0);
+        assert_eq!(resp_header.an_count, 0);
     }
 }

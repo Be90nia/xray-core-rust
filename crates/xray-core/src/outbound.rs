@@ -187,11 +187,12 @@ fn try_build_handler(
             let dial_fn = xray_proxy_wireguard::make_wireguard_dial_fn(config);
             Ok(Arc::new(DialBridge::new(ob.tag.clone(), dial_fn)))
         }
-        // dns outbound：DnsDispatchHandler（拦截 DNS 查询并转发）
+        // dns outbound：DnsDispatchBridge（拦截 DNS 查询，规则匹配 + 转发/劫持）
         "dns" => {
-            let dns = xray_proxy_dns::DnsOutbound::new_system(ob.tag.clone())
-                .map_err(|e| format!("dns outbound init: {e}"))?;
-            Ok(Arc::new(DnsDispatchBridge::new(ob.tag.clone(), dns)) as Arc<dyn DispatchHandler>)
+            let (handler, dns) = parse_dns_outbound_config(&ob.entry.data, &ob.tag)?;
+            // ponytail: DnsService 暂不注入——等 xray-core Instance 提供 DNS feature 查询接口
+            let bridge = DnsDispatchBridge::new(ob.tag.clone(), handler, dns, None);
+            Ok(Arc::new(bridge) as Arc<dyn DispatchHandler>)
         }
         // loopback outbound：LoopbackHandler impl DispatchHandler
         "loopback" => {
@@ -483,19 +484,30 @@ impl DispatchHandler for StubDispatchBridge {
     }
 }
 
-// ========== DnsDispatchBridge：DNS 查询拦截 + 转发 ==========
+// ========== DnsDispatchBridge：DNS 查询拦截 + 规则匹配 + 转发 ==========
 
-/// DNS outbound handler：拦截 dispatcher 转发的 DNS 查询 → 调用 DnsOutbound::process →@ → 写回响应。
+/// DNS outbound handler：拦截 dispatcher 转发的 DNS 查询 → 规则匹配 → 转发/丢弃/返回/劫持。
 ///
+/// 对应 Go `proxy/dns/dns.go::Handler.Process`。
 /// DNS 不走标准 DialBridge（无 dial 语义），而是直接实现 DispatchHandler。
 struct DnsDispatchBridge {
     tag: String,
+    /// 规则匹配 Handler（qType + domain → action）。
+    handler: xray_proxy_dns::Handler,
+    /// hickory-resolver 转发（Direct 动作）。
     dns: Arc<xray_proxy_dns::DnsOutbound>,
+    /// xray-app-dns 服务（Hijack 动作调用 lookup_ip）。None 时 Hijack 退化为 Direct。
+    dns_service: Option<Arc<xray_app_dns::server::DnsService>>,
 }
 
 impl DnsDispatchBridge {
-    fn new(tag: impl Into<String>, dns: xray_proxy_dns::DnsOutbound) -> Self {
-        Self { tag: tag.into(), dns: Arc::new(dns) }
+    fn new(
+        tag: impl Into<String>,
+        handler: xray_proxy_dns::Handler,
+        dns: xray_proxy_dns::DnsOutbound,
+        dns_service: Option<Arc<xray_app_dns::server::DnsService>>,
+    ) -> Self {
+        Self { tag: tag.into(), handler, dns: Arc::new(dns), dns_service }
     }
 }
 impl std::fmt::Debug for DnsDispatchBridge {
@@ -511,12 +523,13 @@ impl DispatchHandler for DnsDispatchBridge {
         &self.tag
     }
 
-    fn dispatch(&self, dest: &Destination, link: Link) -> PinFuture<()> {
+    fn dispatch(&self, _dest: &Destination, link: Link) -> PinFuture<()> {
         let tag = self.tag.clone();
+        let handler = self.handler.clone();
         let dns = Arc::clone(&self.dns);
-        let _dest = dest.clone();
+        let dns_service = self.dns_service.clone();
         Box::pin(async move {
-            // 从 link.reader 读取 DNS 查询字节（用 xray_buf Reader API）
+            // 从 link.reader 读取 DNS 查询字节
             let mut reader = link.reader;
             let mut query_buf = Vec::new();
             loop {
@@ -535,27 +548,153 @@ impl DispatchHandler for DnsDispatchBridge {
             }
             if query_buf.is_empty() {
                 tracing::debug!(tag = %tag, "dns dispatch: empty query");
-            } else {
-                // 转发到 DNS 上游
-                match dns.process(&query_buf).await {
-                    Ok(response) => {
-                        // 写回响应到 link.writer（用 xray_buf Writer API）
-                        let mut writer = link.writer;
-                        let resp_buf = xray_buf::buffer::Buffer::from_vec(response);
-                        let resp_mb = xray_buf::multi::MultiBuffer::from_buffer(resp_buf);
-                        if let Err(e) = writer.write_multi_buffer(resp_mb).await {
-                            tracing::warn!(tag = %tag, "dns dispatch write response: {e}");
+                return;
+            }
+
+            // 规则匹配
+            let outcome = match handler.process(&query_buf).await {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::warn!(tag = %tag, "dns handler process: {e}");
+                    return;
+                }
+            };
+
+            let response = match outcome {
+                xray_proxy_dns::ProcessOutcome::Drop => {
+                    tracing::debug!(tag = %tag, "dns dispatch: dropped by rule");
+                    return;
+                }
+                xray_proxy_dns::ProcessOutcome::Respond { response } => Some(response),
+                xray_proxy_dns::ProcessOutcome::Forward { query } => {
+                    // Direct：转发到上游 DNS
+                    match dns.process(&query).await {
+                        Ok(resp) => Some(resp),
+                        Err(e) => {
+                            tracing::warn!(tag = %tag, "dns forward: {e}");
+                            None
                         }
-                        writer.shutdown();
-                    }
-                    Err(e) => {
-                        tracing::warn!(tag = %tag, "dns dispatch process: {e}");
                     }
                 }
+                xray_proxy_dns::ProcessOutcome::Hijack { query } => {
+                    // Hijack：调用 DnsService::lookup_ip() 解析，构造 DNS 响应
+                    match handle_hijack(&query, dns_service.as_ref()).await {
+                        Ok(resp) => Some(resp),
+                        Err(e) => {
+                            tracing::warn!(tag = %tag, "dns hijack: {e}, falling back to forward");
+                            // Hijack 失败退化为 Direct 转发
+                            match dns.process(&query).await {
+                                Ok(resp) => Some(resp),
+                                Err(e2) => {
+                                    tracing::warn!(tag = %tag, "dns hijack fallback forward: {e2}");
+                                    None
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+
+            // 写回响应
+            if let Some(response) = response {
+                let mut writer = link.writer;
+                let resp_buf = xray_buf::buffer::Buffer::from_vec(response);
+                let resp_mb = xray_buf::multi::MultiBuffer::from_buffer(resp_buf);
+                if let Err(e) = writer.write_multi_buffer(resp_mb).await {
+                    tracing::warn!(tag = %tag, "dns dispatch write response: {e}");
+                }
+                writer.shutdown();
             }
         })
     }
 }
+
+/// Hijack 动作：解析 DNS 查询 → 调用 DnsService::lookup_ip() → 构造 DNS 响应。
+///
+/// 对应 Go `proxy/dns/dns.go::Handler.handleIPQuery`。
+async fn handle_hijack(
+    query: &[u8],
+    dns_service: Option<&Arc<xray_app_dns::server::DnsService>>,
+) -> std::result::Result<Vec<u8>, String> {
+    let Some(svc) = dns_service else {
+        return Err("no DnsService available for Hijack".into());
+    };
+
+    // 解析 DNS 查询获取 id/qType/domain
+    let (header, question) = xray_proxy_dns::parse_dns_query(query)
+        .map_err(|e| format!("parse query: {e}"))?;
+
+    // 只有 A(1) 和 AAAA(28) 走 lookup_ip，其他类型返回 REFUSED
+    let (ips, ttl) = match question.q_type {
+        1 => {
+            // A 记录：IPv4 only
+            let option = xray_app_dns::config::IpOption {
+                ipv4_enable: true,
+                ipv6_enable: false,
+                fake_enable: true,
+            };
+            svc.lookup_ip(&question.name, option).await
+                .map_err(|e| format!("lookup_ip v4: {e}"))?
+        }
+        28 => {
+            // AAAA 记录：IPv6 only
+            let option = xray_app_dns::config::IpOption {
+                ipv4_enable: false,
+                ipv6_enable: true,
+                fake_enable: true,
+            };
+            svc.lookup_ip(&question.name, option).await
+                .map_err(|e| format!("lookup_ip v6: {e}"))?
+        }
+        _ => {
+            // 非 IP 查询类型：返回 REFUSED
+            let resp = xray_proxy_dns::build_dns_response(&header, &question, 5);
+            return Ok(resp);
+        }
+    };
+
+    // 用手写 DNS 构造器生成带 A/AAAA 记录的响应
+    Ok(xray_proxy_dns::build_ip_response(&header, &question, &ips, ttl))
+}
+
+// ========== DNS Outbound 配置解析 ==========
+
+/// 从 outbound entry.data（JSON）解析 dns outbound 配置。
+///
+/// JSON 格式：`{"servers":["8.8.8.8:53"], "rule":[...]}` 或空对象。
+/// 返回 (Handler, DnsOutbound)。
+fn parse_dns_outbound_config(
+    data: &[u8],
+    tag: &str,
+) -> std::result::Result<(xray_proxy_dns::Handler, xray_proxy_dns::DnsOutbound), String> {
+    let v: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| format!("dns outbound settings JSON: {e}"))?;
+    let config = xray_proxy_dns::Config::default();
+    let handler = xray_proxy_dns::Handler::init(&config);
+    // 解析上游 DNS 服务器列表
+    let servers: Vec<(std::net::IpAddr, u16)> = v.get("servers")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter().filter_map(|s| {
+                s.as_str().and_then(|addr| {
+                    let (ip, port) = addr.rsplit_once(':')?;
+                    let ip: std::net::IpAddr = ip.parse().ok()?;
+                    let port: u16 = port.parse().ok()?;
+                    Some((ip, port))
+                })
+            }).collect()
+        })
+        .unwrap_or_default();
+    let dns = if servers.is_empty() {
+        xray_proxy_dns::DnsOutbound::new_system(tag)
+            .map_err(|e| format!("dns outbound init: {e}"))?
+    } else {
+        xray_proxy_dns::DnsOutbound::new_with_servers(tag, &servers)
+            .map_err(|e| format!("dns outbound init: {e}"))?
+    };
+    Ok((handler, dns))
+}
+
 
 // ========== AnyTLS 配置解析 ==========
 

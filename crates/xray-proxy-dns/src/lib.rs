@@ -26,7 +26,7 @@ pub mod outbound;
 
 // 顶层 re-export。
 pub use config::{Config, DnsRule, DnsRuleConfig, RuleAction};
-pub use dns_message::{DnsHeader, DnsQuestion, build_dns_response, parse_dns_query};
+pub use dns_message::{DnsHeader, DnsQuestion, build_dns_response, build_ip_response, parse_dns_query};
 pub use error::{DnsProxyError, Result};
 pub use handler::{Handler, ProcessOutcome, decide_action};
 pub use inbound::DnsInbound;

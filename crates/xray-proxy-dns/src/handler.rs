@@ -23,7 +23,7 @@ use crate::config::{Config, DnsRule, RuleAction};
 use crate::dns_message::{build_dns_response, parse_dns_query, DnsQuestion};
 use crate::error::{DnsProxyError, Result};
 /// DNS 代理 Handler。对应 Go `proxy/dns/dns.go::Handler` struct。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Handler {
     /// 编译后的规则列表（按配置顺序）。
     rules: Vec<DnsRule>,
