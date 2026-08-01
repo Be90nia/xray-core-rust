@@ -15,7 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 use xray_app_dispatcher::default::SimpleOhm;
 use xray_app_dispatcher::{DispatchHandler, OutboundHandlerManager};
 use xray_buf::io::{new_reader, new_writer};
-use xray_common::protocol::{Command, ResponseHeader, SecurityType};
+use xray_common::protocol::{Command, ResponseCommand, ResponseHeader, SecurityType};
 use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead, NoOpAeadCipher};
 use xray_transport::link::Link;
 
@@ -187,6 +187,7 @@ async fn handle_connection(
     let resp_header = ResponseHeader {
         command: header.command,
         option: header.option,
+        response_command: ResponseCommand::None,
     };
     session
         .encode_response_header_async(&resp_header, &mut stream_w)

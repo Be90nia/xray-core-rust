@@ -18,7 +18,7 @@ use xray_common::bitmask::Bitmask;
 use xray_common::net::address::Address;
 use xray_common::net::destination::Destination;
 use xray_common::net::port::Port;
-use xray_common::protocol::{Command, RequestHeader, ResponseHeader, SecurityType};
+use xray_common::protocol::{Command, RequestHeader, ResponseCommand, ResponseHeader, SecurityType, SwitchAccountCommand};
 use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead, NoOpAeadCipher};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -342,12 +342,22 @@ impl<'v> ServerSession<'v> {
         self.response_body_key.copy_from_slice(&body_key_hash[..16]);
         self.response_body_iv.copy_from_slice(&body_iv_hash[..16]);
 
-        // 3. 构造明文 payload（4B 固定头 + 0B command data）
-        let mut plaintext = Vec::with_capacity(4);
+        // 3. 构造明文 payload（4B 固定头 + command data）
+        let mut plaintext = Vec::with_capacity(4 + 256);
         plaintext.push(self.response_header);
         plaintext.push(header.option.bits());
-        plaintext.push(0); // cmd_id = 0（无 command）
-        plaintext.push(0); // data_len = 0
+        match &header.response_command {
+            ResponseCommand::None => {
+                plaintext.push(0); // cmd_id = 0
+                plaintext.push(0); // data_len = 0
+            }
+            ResponseCommand::SwitchAccount(cmd) => {
+                plaintext.push(0x01); // cmd_id = 1 (SwitchAccount)
+                let cmd_data = Self::serialize_switch_account(cmd);
+                plaintext.push(cmd_data.len() as u8); // data_len
+                plaintext.extend_from_slice(&cmd_data);
+            }
+        }
 
         // 4. 派生 len key/IV
         let len_key = aead::kdf16(&self.response_body_key, &[consts::AEAD_RESP_HEADER_LEN_KEY]);
@@ -371,6 +381,36 @@ impl<'v> ServerSession<'v> {
         writer.write_all(&encrypted_payload)?;
         writer.flush()?;
         Ok(())
+    }
+
+    /// 序列化 SwitchAccount 命令。
+    ///
+    /// 格式：`[1B addr_type][addr][2B port BE]`
+    /// alterID/security 字段已废弃，不序列化。
+    fn serialize_switch_account(cmd: &SwitchAccountCommand) -> Vec<u8> {
+        use xray_common::net::address::Address;
+        let mut buf = Vec::with_capacity(64);
+        match &cmd.host {
+            Some(Address::IPv4(ip)) => {
+                buf.push(0x01);
+                buf.extend_from_slice(&ip.octets());
+            }
+            Some(Address::IPv6(ip)) => {
+                buf.push(0x04);
+                buf.extend_from_slice(&ip.octets());
+            }
+            Some(Address::Domain(domain)) => {
+                buf.push(0x03);
+                buf.push(domain.len() as u8);
+                buf.extend_from_slice(domain.as_bytes());
+            }
+            None => {
+                buf.push(0x01);
+                buf.extend_from_slice(&[0, 0, 0, 0]);
+            }
+        }
+        buf.extend_from_slice(&cmd.port.to_be_bytes());
+        buf
     }
 
     /// 编码响应 body：把明文 data 加密为 chunk 流写入 writer。
@@ -842,7 +882,7 @@ mod tests {
         server.request_body_iv = [0x33u8; 16];
         server.response_header = 0xAB;
 
-        let resp_header = ResponseHeader { command: Command::Tcp, option: Bitmask::new(0) };
+        let resp_header = ResponseHeader { command: Command::Tcp, option: Bitmask::new(0), response_command: ResponseCommand::None };
         let mut writer: Vec<u8> = Vec::new();
         server.encode_response_header(&resp_header, &mut writer).expect("server encode");
         // 输出 = 18B encrypted_len + (4B plaintext + 16B tag) encrypted_payload = 38B

@@ -12,7 +12,7 @@ use xray_common::bitmask::Bitmask;
 use xray_common::net::address::Address;
 use xray_common::net::destination::Destination;
 use xray_common::net::port::Port;
-use xray_common::protocol::{Command, RequestHeader, ResponseHeader, SecurityType};
+use xray_common::protocol::{Command, RequestHeader, ResponseCommand, ResponseHeader, SecurityType};
 use xray_common::uuid::UUID;
 
 use xray_proxy_vmess::account::MemoryAccount;
@@ -90,6 +90,7 @@ fn full_roundtrip_request_response_cycle() {
     let response_header = ResponseHeader {
         command: Command::Tcp,
         option: Bitmask::new(0),
+        response_command: ResponseCommand::None,
     };
     let response_payload = b"hello client, this is server response body payload";
 
@@ -292,6 +293,7 @@ fn full_roundtrip_chacha20poly1305() {
     let response_header = ResponseHeader {
         command: Command::Tcp,
         option: Bitmask::new(0),
+        response_command: ResponseCommand::None,
     };
     let response_payload = b"chacha20 server response";
     let mut server_to_client: Vec<u8> = Vec::new();
@@ -354,6 +356,7 @@ fn full_roundtrip_chunk_masking() {
     let response_header = ResponseHeader {
         command: Command::Tcp,
         option: Bitmask::new(0),
+        response_command: ResponseCommand::None,
     };
     let response_payload = b"chunk masking server response";
     let mut server_to_client: Vec<u8> = Vec::new();

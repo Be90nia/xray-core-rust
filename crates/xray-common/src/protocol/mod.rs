@@ -9,6 +9,8 @@ pub mod address_parser;
 use serde::{Deserialize, Serialize};
 
 use crate::bitmask::Bitmask;
+
+use crate::net::address::Address;
 use crate::net::destination::Destination;
 use crate::uuid::UUID;
 
@@ -173,6 +175,32 @@ pub enum Command {
     Mux = 3,
 }
 
+/// VMess 响应命令。
+///
+/// 对应 Go `protocol.ResponseCommand`。
+/// 响应头可携带命令，用于动态控制客户端行为。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResponseCommand {
+    /// 无命令
+    None,
+    /// 切换账户：指示客户端切换到另一个入站处理器
+    SwitchAccount(SwitchAccountCommand),
+}
+
+/// SwitchAccount 命令参数。
+///
+/// 携带目标入站的 host/port/security/alterID 等信息，
+/// 客户端收到后应切换到指定入站。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchAccountCommand {
+    /// 目标地址
+    pub host: Option<Address>,
+    /// 目标端口
+    pub port: u16,
+    /// detour tag（指向另一个入站处理器）
+    pub detour_tag: Option<String>,
+}
+
 impl Command {
     /// 转换为 u8 数值。
     #[must_use]
@@ -334,6 +362,8 @@ pub struct ResponseHeader {
     pub command: Command,
     /// 选项位掩码
     pub option: Bitmask,
+    /// 响应命令（SwitchAccount 等）
+    pub response_command: ResponseCommand,
 }
 
 impl ResponseHeader {
@@ -343,6 +373,7 @@ impl ResponseHeader {
         Self {
             command,
             option: Bitmask::default(),
+            response_command: ResponseCommand::None,
         }
     }
 
@@ -350,6 +381,13 @@ impl ResponseHeader {
     #[must_use]
     pub fn with_option(mut self, option: Bitmask) -> Self {
         self.option = option;
+        self
+    }
+
+    /// 设置响应命令，返回新的 ResponseHeader。
+    #[must_use]
+    pub fn with_response_command(mut self, cmd: ResponseCommand) -> Self {
+        self.response_command = cmd;
         self
     }
 }

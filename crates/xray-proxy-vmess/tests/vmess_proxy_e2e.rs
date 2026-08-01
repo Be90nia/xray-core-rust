@@ -22,7 +22,7 @@ use xray_common::net::address::Address;
 use xray_common::net::destination::Destination;
 use xray_common::net::network::Network;
 use xray_common::net::port::Port;
-use xray_common::protocol::{Command, RequestHeader, ResponseHeader, SecurityType};
+use xray_common::protocol::{Command, RequestHeader, ResponseCommand, ResponseHeader, SecurityType};
 use xray_common::uuid::UUID;
 
 use xray_proxy_vmess::account::{cmd_key_of, MemoryAccount};
@@ -104,6 +104,7 @@ async fn vmess_proxy_to_echo_target_e2e() {
         let resp_header = ResponseHeader {
             command: Command::Tcp,
             option: Bitmask::new(0),
+            response_command: ResponseCommand::None,
         };
         server
             .encode_response_header_async(&resp_header, &mut client_stream)

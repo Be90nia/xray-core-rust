@@ -8,12 +8,14 @@
 //! - **完整**：`encode_request_body` / `decode_response_header` / `decode_response_body`
 //!   （AES-128-GCM + ChaCha20-Poly1305 + PlainChunkSizeParser 路径）
 //! - **留 follow-up**：AuthenticatedLength option + ShakeSizeParser（ChunkMasking）+ async 化
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
 use xray_common::bitmask::Bitmask;
-use xray_common::protocol::{Command, RequestHeader, ResponseHeader, SecurityType};
+use xray_common::net::address::Address;
+use xray_common::protocol::{Command, RequestHeader, ResponseCommand, ResponseHeader, SecurityType, SwitchAccountCommand};
 use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead, NoOpAeadCipher};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
@@ -266,13 +268,77 @@ impl ClientSession {
             });
         }
         let option = Bitmask::new(payload[1]);
-        // payload[2] = cmd_id (0 表示无 command)
-        // payload[3] = data_len
-        // ponytail: 当前不解析 command（留 follow-up，VMess 响应 command 用于动态转发控制）
+        // payload[2] = cmd_id, payload[3] = data_len
+        let response_command = Self::parse_response_command(&payload[2..])?;
         Ok(ResponseHeader {
             command: Command::Tcp,
             option,
+            response_command,
         })
+    }
+
+    /// 解析 VMess 响应命令。
+    ///
+    /// 格式：`[1B cmd_id][1B data_len][data_len B data]`
+    /// cmd_id=0 → None, cmd_id=1 → SwitchAccount
+    fn parse_response_command(payload: &[u8]) -> Result<ResponseCommand> {
+        if payload.len() < 2 {
+            return Ok(ResponseCommand::None);
+        }
+        let cmd_id = payload[0];
+        let data_len = payload[1] as usize;
+        if cmd_id == 0 || data_len == 0 {
+            return Ok(ResponseCommand::None);
+        }
+        let data = payload.get(2..2 + data_len).ok_or(VmessError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "response command data truncated",
+        )))?;
+        match cmd_id {
+            0x01 => {
+                // SwitchAccount: [1B addr_type][addr][2B port][1B alterID_count][1B security][N*4B alterIDs]
+                // ponytail: 仅解析 detour_tag（host+port），alterID 机制已废弃
+                if data.is_empty() {
+                    return Ok(ResponseCommand::None);
+                }
+                let addr_type = data[0];
+                let (host, consumed) = match addr_type {
+                    0x01 => {
+                        // IPv4: 4B
+                        if data.len() < 5 { return Ok(ResponseCommand::None); }
+                        let ip = <[u8; 4]>::try_from(&data[1..5]).unwrap();
+                        (Some(Address::IPv4(Ipv4Addr::from(ip))), 5)
+                    }
+                    0x03 => {
+                        // Domain: 1B len + domain
+                        if data.len() < 2 { return Ok(ResponseCommand::None); }
+                        let domain_len = data[1] as usize;
+                        if data.len() < 2 + domain_len { return Ok(ResponseCommand::None); }
+                        let domain = String::from_utf8_lossy(&data[2..2 + domain_len]).to_string();
+                        (Some(Address::Domain(domain)), 2 + domain_len)
+                    }
+                    0x04 => {
+                        // IPv6: 16B
+                        if data.len() < 17 { return Ok(ResponseCommand::None); }
+                        let ip = <[u8; 16]>::try_from(&data[1..17]).unwrap();
+                        (Some(Address::IPv6(Ipv6Addr::from(ip))), 17)
+                    }
+                    _ => (None, 1),
+                };
+                let port = if data.len() >= consumed + 2 {
+                    u16::from_be_bytes([data[consumed], data[consumed + 1]])
+                } else { 0 };
+                // detour_tag: 在 Go 中由 DetourConfig 提供，不在 wire 格式中
+                // wire 格式的 host:port 用于直接连接，detour_tag 由服务端配置注入
+                let detour_tag = None;
+                Ok(ResponseCommand::SwitchAccount(SwitchAccountCommand {
+                    host,
+                    port,
+                    detour_tag,
+                }))
+            }
+            _ => Ok(ResponseCommand::None),
+        }
     }
 
     /// 解码响应 body：从 reader 读取 chunk 流解密，返回所有明文。
@@ -424,9 +490,11 @@ impl ClientSession {
             });
         }
         let option = Bitmask::new(payload[1]);
+        let response_command = Self::parse_response_command(&payload[2..])?;
         Ok(ResponseHeader {
             command: Command::Tcp,
             option,
+            response_command,
         })
     }
 
@@ -614,7 +682,7 @@ mod tests {
         // 手动同步 server.response_header（否则 encode 写的字节 ≠ client 期望）
         server.response_header = client_session.response_header;
 
-        let resp_header = ResponseHeader { command: Command::Tcp, option: Bitmask::new(0) };
+        let resp_header = ResponseHeader { command: Command::Tcp, option: Bitmask::new(0), response_command: ResponseCommand::None };
         let mut buf: Vec<u8> = Vec::new();
         server.encode_response_header(&resp_header, &mut buf).expect("server encode");
 
