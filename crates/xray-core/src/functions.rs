@@ -115,7 +115,7 @@ async fn start_full_no_router(
     register_all_features();
     let mut instance = Instance::new_from_built(built)?;
     let ohm = Arc::new(SimpleOhm::new());
-    register_outbounds(built, &ohm)?;
+    register_outbounds(built, &ohm, None)?;
     let handles = spawn_inbounds(built, Arc::clone(&ohm))
         .await
         .map_err(|e| CoreFunctionError::InstanceStart(e.to_string()))?;
@@ -138,7 +138,7 @@ pub async fn start_full_with_router(
     register_all_features();
     let mut instance = Instance::new_from_built(built)?;
     let ohm = Arc::new(SimpleOhm::new());
-    register_outbounds(built, &ohm)?;
+    register_outbounds(built, &ohm, None)?;
 
     // 注入 router：把 default handler 包装为 RoutingHandler
     if let Some(inner_default) = ohm.get_default_handler() {

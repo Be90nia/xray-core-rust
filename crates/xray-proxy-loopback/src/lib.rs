@@ -33,6 +33,9 @@ pub enum LoopbackError {
     /// Loopback sink 未注入（dispatcher 尚未接入）。
     #[error("loopback sink not injected (dispatcher hookup pending 切片3)")]
     SinkNotInjected,
+    /// Dispatcher 分发失败。
+    #[error("dispatch failed: {0}")]
+    DispatchFailed(String),
 }
 
 /// Loopback 出站处理器：把出站连接回环到指定的本机入站 tag。
@@ -103,6 +106,7 @@ pub trait LoopbackSink: Send + Sync + Debug {
     fn dispatch_loopback(
         &self,
         inbound_tag: String,
+        destination: xray_common::net::destination::Destination,
         link: xray_transport::link::Link,
     ) -> LoopbackFuture<Result<(), LoopbackError>>;
 }
@@ -198,10 +202,11 @@ impl DispatchHandler for LoopbackHandler {
     ) -> LoopbackFuture<()> {
         let sink = self.sink.clone();
         let inbound_tag = self.inbound_tag.clone();
+        let dest = _dest.clone();
         Box::pin(async move {
             match sink {
                 Some(s) => {
-                    if let Err(e) = s.dispatch_loopback(inbound_tag.clone(), link).await {
+                    if let Err(e) = s.dispatch_loopback(inbound_tag.clone(), dest, link).await {
                         tracing::warn!(inbound_tag = %inbound_tag, error = %e, "loopback dispatch failed");
                     }
                 }
@@ -247,7 +252,7 @@ impl OutboundHandler for LoopbackHandler {
                 let (r, _w) = xray_buf::pipe::new();
                 let (_r2, w2) = xray_buf::pipe::new();
                 let link = xray_transport::link::Link::new(Box::new(r), Box::new(w2));
-                s.dispatch_loopback(self.inbound_tag.clone(), link)
+                s.dispatch_loopback(self.inbound_tag.clone(), _destination.clone(), link)
                     .await
                     .map_err(|e| OutboundError::ConnectionFailed(e.to_string()))
             }
@@ -370,8 +375,9 @@ mod tests {
         fn dispatch_loopback(
             &self,
             inbound_tag: String,
+            _destination: xray_common::net::destination::Destination,
             _link: xray_transport::link::Link,
-        ) -> LoopbackFuture<Result<(), LoopbackError>> {
+        ) -> LoopbackFuture<std::result::Result<(), LoopbackError>> {
             let calls = self.calls.clone();
             Box::pin(async move {
                 calls.lock().unwrap().push(inbound_tag);

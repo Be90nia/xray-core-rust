@@ -18,7 +18,7 @@ use xray_common::net::destination::Destination;
 use xray_common::net::network::Network;
 use xray_common::net::port::Port;
 use xray_proxy_socks::protocol::{Host, SocksAddr};
-use xray_proxy_socks::server::socks5_server_handshake;
+use xray_proxy_socks::server::{socks5_server_handshake, SocksRequest};
 use xray_proxy_socks::ServerConfig;
 use xray_transport::link::Link;
 use tokio::task::JoinHandle;
@@ -175,10 +175,17 @@ async fn handle_mux_inbound_link(link: Link, handler: Arc<dyn xray_app_dispatche
     idle_h.abort();
 }
 
-/// `SocksAddr` → `Destination`（TCP）。
+/// `SocksRequest` → `Destination`（TCP）。
 ///
 /// `Host::Ipv4` → `Address::IPv4`，`Ipv6` → `Address::IPv6`，`Domain` → `Address::Domain`。
-fn socks_addr_to_destination(addr: &SocksAddr) -> std::io::Result<Destination> {
+/// UDP ASSOCIATE 请求返回 Unsupported 错误。
+fn socks_addr_to_destination(req: &SocksRequest) -> std::io::Result<Destination> {
+    let addr = match req {
+        SocksRequest::TcpConnect(addr) => addr,
+        SocksRequest::UdpAssociate(_, _) => {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "UDP ASSOCIATE not supported"))
+        }
+    };
     let address = match &addr.host {
         Host::Ipv4(ip) => Address::IPv4(*ip),
         Host::Ipv6(ip) => Address::IPv6(*ip),
@@ -1239,7 +1246,8 @@ mod tests {
             host: Host::Ipv4(Ipv4Addr::new(1, 2, 3, 4)),
             port: 8080,
         };
-        let dest = socks_addr_to_destination(&addr).unwrap();
+        let req = SocksRequest::TcpConnect(addr);
+        let dest = socks_addr_to_destination(&req).unwrap();
         assert!(dest.is_tcp());
         assert_eq!(dest.port(), Port::new(8080));
         match dest.address() {
@@ -1254,7 +1262,8 @@ mod tests {
             host: Host::Domain("example.com".to_string()),
             port: 443,
         };
-        let dest = socks_addr_to_destination(&addr).unwrap();
+        let req = SocksRequest::TcpConnect(addr);
+        let dest = socks_addr_to_destination(&req).unwrap();
         assert_eq!(dest.port(), Port::new(443));
         match dest.address() {
             Address::Domain(d) => assert_eq!(d, "example.com"),

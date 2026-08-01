@@ -30,8 +30,9 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use xray_app_dispatcher::default::{DialBridge, PinFuture, SimpleOhm};
+use xray_app_dispatcher::default::{DefaultDispatcher, DialBridge, PinFuture, SimpleOhm};
 use xray_app_dispatcher::DispatchHandler;
+use xray_proxy_loopback::{LoopbackError, LoopbackFuture, LoopbackSink};
 use xray_common::net::address::Address;
 use xray_common::net::destination::Destination;
 use xray_common::net::port::Port;
@@ -49,14 +50,41 @@ use xray_mux::session::ClientStrategy;
 use xray_proxy_hysteria::HysteriaConfig;
 use xray_proxy_wireguard::DeviceConfig;
 
+
+/// Dispatcher → LoopbackSink 桥接。
+///
+/// `DefaultDispatcher` 定义在 `xray-app-dispatcher`，`LoopbackSink` trait 在 `xray-proxy-loopback`，
+/// 两者有循环依赖不能直接 impl。此 wrapper 在 `xray-core` 层桥接。
+#[derive(Debug)]
+struct DispatcherLoopbackSink {
+    inner: Arc<DefaultDispatcher>,
+}
+
+impl LoopbackSink for DispatcherLoopbackSink {
+    fn dispatch_loopback(
+        &self,
+        inbound_tag: String,
+        destination: xray_common::net::destination::Destination,
+        link: xray_transport::link::Link,
+    ) -> LoopbackFuture<std::result::Result<(), LoopbackError>> {
+        use xray_app_dispatcher::default::SniffingRequest;
+        let sniffing = SniffingRequest::default();
+        match self.inner.dispatch_link(&destination, link, &sniffing) {
+            Ok(()) => Box::pin(async { Ok(()) }),
+            Err(e) => Box::pin(async move {
+                Err(LoopbackError::DispatchFailed(e.to_string()))
+            }),
+        }
+    }
+}
 /// 从 BuiltConfig 注册 outbound handlers 到 SimpleOhm。
 ///
 /// 遍历 `built.outbounds`，按协议名创建 DialBridge 注册到 `ohm`。
 /// 第一个 outbound 或 tag 为 `"direct"` 的设为 default（与 Go `SetDefaultHandler` 语义一致）。
 /// 不支持的协议或配置解析失败均 warn 跳过（不返回错误，不阻止其他 outbound 注册）。
-pub fn register_outbounds(built: &BuiltConfig, ohm: &SimpleOhm) -> Result<()> {
+pub fn register_outbounds(built: &BuiltConfig, ohm: &SimpleOhm, loopback_sink: Option<Arc<dyn LoopbackSink>>) -> Result<()> {
     for (i, ob) in built.outbounds.iter().enumerate() {
-        match try_build_handler(ob) {
+        match try_build_handler(ob, loopback_sink.clone()) {
             Ok(handler) => {
                 let is_default = i == 0 || ob.tag == "direct";
                 if is_default {
@@ -93,6 +121,7 @@ pub fn register_outbounds(built: &BuiltConfig, ohm: &SimpleOhm) -> Result<()> {
 /// 构建单个 outbound 的 DispatchHandler（DialBridge）。
 fn try_build_handler(
     ob: &BuiltOutbound,
+    loopback_sink: Option<Arc<dyn LoopbackSink>>,
 ) -> std::result::Result<Arc<dyn DispatchHandler>, BuildError> {
     match ob.entry.kind.as_str() {
         "freedom" => {
@@ -200,6 +229,10 @@ fn try_build_handler(
             let handler = xray_proxy_loopback::LoopbackHandler::with_inbound_tag(
                 ob.tag.clone(), inbound_tag,
             );
+            let handler = match loopback_sink {
+                Some(sink) => handler.with_sink(sink),
+                None => handler,
+            };
             Ok(Arc::new(handler) as Arc<dyn DispatchHandler>)
         }
         // http outbound：解析 servers → HttpOutboundConfig → make_http_dial_fn
