@@ -6,7 +6,7 @@
 //!   dispatcher 接入留 follow-up）。
 //! - DNS wire format 由 `hickory-proto` 处理（覆盖 A/AAAA/MX/TXT/EDNS0）。
 //! - 自动接入 cache（实现 `CachedNameserver`，由 `cached::query_ip` 统一调度）。
-//! - truncated 响应不自动 TCP 重试（ponytail：调用方决定，本任务范围）。
+//! - truncated 响应自动 TCP 重试（RFC 7766 §5）。
 //!
 //! ## 跳过范围
 //!
@@ -51,6 +51,8 @@ pub struct UdpNameServer {
     query_timeout: Duration,
     /// 请求 ID 生成器。
     id_gen: AtomicReqIdGen,
+    /// TCP fallback 缓冲区大小。
+    tcp_recv_max: usize,
 }
 
 impl UdpNameServer {
@@ -72,8 +74,10 @@ impl UdpNameServer {
             client_ip,
             query_timeout,
             id_gen: AtomicReqIdGen::new(),
+            tcp_recv_max: 65535,
         }
     }
+
 
     /// 从 `NameServerConfig` 构造。
     ///
@@ -138,11 +142,70 @@ impl UdpNameServer {
         let now = Instant::now();
         let parsed = parse_dns_response(&buf[..n], req_id, record_type, now)?;
         if parsed.truncated {
-            // 不自动 TCP fallback；调用方决定。返回错误，调用方记录到 outcome.errors。
-            return Err(DnsError::WireFormat(
-                "udp response truncated (TC=1), retry over TCP needed".to_string(),
-            ));
+            return self.tcp_fallback_query(fqdn, record_type).await;
         }
+        Ok(parsed_to_ip_record(&parsed, now))
+    }
+
+    /// UDP truncated (TC=1) 后自动 TCP 重试。
+    ///
+    /// 对应 Go `(*ClassicNameServer).query` TCP fallback 路径。
+    /// RFC 7766 §5: 客户端必须支持 TCP 重试。
+    async fn tcp_fallback_query(
+        &self,
+        fqdn: &str,
+        record_type: RecordType,
+    ) -> Result<IpRecord, DnsError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let req_id = self.id_gen.next_id();
+        let payload = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
+
+        // TCP: 2B big-endian 长度前缀。
+        let len_be = u16::try_from(payload.len())
+            .map_err(|_| DnsError::WireFormat("query too large for TCP".into()))?
+            .to_be_bytes();
+
+        let mut stream = timeout(self.query_timeout, TcpStream::connect(self.addr))
+            .await
+            .map_err(|_| DnsError::WireFormat(format!(
+                "tcp fallback connect timeout after {:?}",
+                self.query_timeout
+            )))?
+            .map_err(|e| DnsError::WireFormat(format!("tcp fallback connect: {e}")))?;
+
+        timeout(self.query_timeout, stream.write_all(&len_be))
+            .await
+            .map_err(|_| DnsError::WireFormat("tcp fallback write len timeout".into()))?
+            .map_err(|e| DnsError::WireFormat(format!("tcp fallback write len: {e}")))?;
+        timeout(self.query_timeout, stream.write_all(&payload))
+            .await
+            .map_err(|_| DnsError::WireFormat("tcp fallback write payload timeout".into()))?
+            .map_err(|e| DnsError::WireFormat(format!("tcp fallback write payload: {e}")))?;
+
+        // 读 2B 长度前缀。
+        let mut len_buf = [0u8; 2];
+        timeout(self.query_timeout, stream.read_exact(&mut len_buf))
+            .await
+            .map_err(|_| DnsError::WireFormat("tcp fallback read len timeout".into()))?
+            .map_err(|e| DnsError::WireFormat(format!("tcp fallback read len: {e}")))?;
+        let resp_len = u16::from_be_bytes(len_buf) as usize;
+        if resp_len == 0 || resp_len > self.tcp_recv_max {
+            return Err(DnsError::WireFormat(format!(
+                "tcp fallback invalid response length: {resp_len}"
+            )));
+        }
+
+        let mut resp_buf = vec![0u8; resp_len];
+        timeout(self.query_timeout, stream.read_exact(&mut resp_buf))
+            .await
+            .map_err(|_| DnsError::WireFormat("tcp fallback read response timeout".into()))?
+            .map_err(|e| DnsError::WireFormat(format!("tcp fallback read response: {e}")))?;
+
+        let now = Instant::now();
+        let parsed = parse_dns_response(&resp_buf, req_id, record_type, now)?;
+        // TCP 响应不应有 truncated（如果仍有，说明服务端异常，忽略 TC 标志）。
         Ok(parsed_to_ip_record(&parsed, now))
     }
 }
