@@ -324,6 +324,143 @@ pub fn should_override(
     false
 }
 
+// ========== Sniffing 辅助函数 ==========
+
+/// 嗅探连接首包，返回可能被覆盖的 destination。
+///
+/// 对应 Go `(*DefaultDispatcher).sniffing` 方法。流程：
+/// 1. 从 CachedReader 读首包
+/// 2. 构造 Sniffer 集合并嗅探
+/// 3. 若有 FakeDnsEngine，先做 metadata sniff
+/// 4. 若 should_override → 用 sniffed domain 覆盖 dest 的 IP 为域名
+async fn sniff_connection(
+    cr: &mut CachedReader,
+    dest: &xray_common::net::destination::Destination,
+    req: &SniffingRequest,
+    fdns: Option<&dyn crate::fakednssniffer::FakeDnsEngine>,
+) -> Result<(xray_common::net::destination::Destination, Option<String>), DispatcherError> {
+    // 读首包（带超时）
+    let read_result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        cr.read_first(),
+    ).await;
+
+    match read_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err(DispatcherError::SniffingTimeout),
+    }
+
+    let payload = cr.cached_bytes();
+    if payload.is_empty() {
+        return Ok((dest.clone(), None));
+    }
+    let network = dest.network();
+
+    // 构造嗅探器集合
+    let mut sniffer = crate::sniffer::new_default_sniffer_set();
+
+    // FakeDns metadata sniff
+    let mut metadata_domain = String::new();
+    let mut metadata_protocol = String::new();
+    if let Some(engine) = fdns {
+        if let Some(ip) = dest.address().ip() {
+            let domain = engine.get_domain_from_fake_dns(&ip);
+            if !domain.is_empty() {
+                metadata_domain = domain;
+                metadata_protocol = "fakedns".to_string();
+            }
+        }
+    }
+
+    // Content sniff
+    let content_result = sniffer.sniff(&payload, network);
+
+    // 组合结果并判断是否覆盖
+    let dest_ip = dest.address().ip();
+
+    match content_result {
+        Ok(content) => {
+            // 有 content 结果
+            if !metadata_domain.is_empty() {
+                // 两者都有 → CompositeSniffResult 语义
+                // protocol_for_domain 用 metadata 侧的 protocol
+                let composite = crate::sniffer::CompositeSniffResult::new(
+                    Box::new(crate::fakednssniffer::FakeDnsSniffResult::new(&metadata_domain)) as Box<dyn SniffResult>,
+                    content,
+                );
+                if should_override(&composite, req, dest_ip, Some(&metadata_protocol)) {
+                    let new_dest = override_dest(dest, &metadata_domain, req)?;
+                    return Ok((new_dest, Some(metadata_protocol)));
+                }
+            } else {
+                // 仅 content 结果
+                if should_override(content.as_ref(), req, dest_ip, None) {
+                    let proto = content.protocol().to_string();
+                    let domain = content.domain().to_string();
+                    let new_dest = override_dest(dest, &domain, req)?;
+                    return Ok((new_dest, Some(proto)));
+                }
+            }
+        }
+        Err(_) => {
+            // content sniff 失败，仅用 metadata
+            if !metadata_domain.is_empty() {
+                let meta_result = crate::fakednssniffer::FakeDnsSniffResult::new(&metadata_domain);
+                if should_override(&meta_result, req, dest_ip, Some(&metadata_protocol)) {
+                    let new_dest = override_dest(dest, &metadata_domain, req)?;
+                    return Ok((new_dest, Some(metadata_protocol.clone())));
+                }
+            }
+        }
+    }
+
+    Ok((dest.clone(), None))
+}
+
+/// 根据 sniffing 结果覆盖 destination。
+fn override_dest(
+    dest: &xray_common::net::destination::Destination,
+    domain: &str,
+    req: &SniffingRequest,
+) -> Result<xray_common::net::destination::Destination, DispatcherError> {
+    if req.route_only {
+        tracing::debug!(domain = %domain, "sniffed (route_only, dest unchanged)");
+        return Ok(dest.clone());
+    }
+    let new_addr = xray_common::net::address::Address::new_domain(domain.to_string());
+    let new_dest = xray_common::net::destination::Destination::new(
+        new_addr, dest.port(), dest.network(),
+    );
+    tracing::debug!(domain = %domain, "sniffed, overriding dest");
+    Ok(new_dest)
+}
+
+/// 从 destination + sniffing 结果构造 RoutingContext。
+///
+/// 对应 Go `routing_context` 构造。
+fn build_routing_context(
+    dest: &xray_common::net::destination::Destination,
+    sniffed_protocol: Option<&str>,
+) -> DispatcherContext {
+    let mut ctx = DispatcherContext::new()
+        .with_target_port(dest.port())
+        .with_network(dest.network());
+
+    // 地址
+    match dest.address().ip() {
+        Some(ip) => ctx.target_ips = vec![ip],
+        None => ctx = ctx.with_target_domain(dest.address().as_domain().unwrap_or("")),
+    }
+
+    // protocol（从 sniffing 结果设置）
+    if let Some(proto) = sniffed_protocol {
+        ctx = ctx.with_protocol(proto);
+    }
+
+    ctx
+}
+
 // ========== DefaultDispatcher ==========
 
 /// 默认分发器
@@ -465,26 +602,84 @@ impl DefaultDispatcher {
     ///
     /// 对应 Go `(*DefaultDispatcher).DispatchLink(ctx, dest, outbound) error`。
     ///
-    /// **实现**：获取默认 outbound handler → `handler.dispatch(link)` → spawn。
-    /// 切片1 不含 sniffing/routing，直接路由到默认 outbound。
+    /// 流程（对应 Go `routedDispatch`）：
+    /// 1. 若 sniffing 启用：用 CachedReader 包装 outbound reader，读首包 → sniff → 可能覆盖 dest
+    /// 2. 若有 router：用 RoutingContext 调 router.pick_route() 选出站 handler
+    /// 3. 无 router 或路由失败：用默认 handler
+    /// 4. spawn handler.dispatch(link)
     pub fn dispatch_link(
         &self,
         destination: &xray_common::net::destination::Destination,
         outbound: xray_transport::link::Link,
-        _sniffing_request: &SniffingRequest,
+        sniffing_request: &SniffingRequest,
     ) -> Result<(), DispatcherError> {
         let ohm = self.ohm.as_ref().ok_or_else(|| {
             DispatcherError::Other("no outbound handler manager registered".into())
         })?;
-        let handler = ohm.get_default_handler().ok_or_else(|| {
-            DispatcherError::Other("no default outbound handler registered".into())
-        })?;
-        // sniffing + routing 留后续切片。
-        // DispatchHandler::dispatch 返回 PinFuture<()>（'static + Send），可直接 spawn。
-        let fut = handler.dispatch(destination, outbound);
-        tokio::spawn(async move {
+
+        // 预检查：如果没有 router 也没有 default handler，直接报错
+        // （sniffing 后路由可能找到非 default handler，但无 router 无 default = 必定失败）
+        if self.router.is_none() && ohm.get_default_handler().is_none() {
+            return Err(DispatcherError::HandlerNotFound("default".into()));
+        }
+
+        // 克隆必要数据进入 spawn
+        let dest = destination.clone();
+        let sniff_req = sniffing_request.clone();
+        let router = self.router.clone();
+        let fdns = self.fdns.clone();
+        let ohm = Arc::clone(ohm);
+
+        let outbound_reader = outbound.reader;
+        let outbound_writer = outbound.writer;
+
+        let fut = async move {
+            // ---- Phase 1: Sniffing ----
+            let mut cr = CachedReader::with_inner(outbound_reader);
+            let (final_dest, sniffed_protocol) = if sniff_req.enabled {
+                match sniff_connection(
+                    &mut cr, &dest, &sniff_req, fdns.as_deref(),
+                ).await {
+                    Ok((d, proto)) => (d, proto),
+                    Err(e) => {
+                        tracing::debug!(dest = %dest, error = %e, "sniffing failed, using original dest");
+                        (dest.clone(), None)
+                    }
+                }
+            } else {
+                (dest.clone(), None)
+            };
+
+            // ---- Phase 2: Routing ----
+            let handler = if let Some(ref r) = router {
+                let ctx = build_routing_context(&final_dest, sniffed_protocol.as_deref());
+                match r.pick_route(&ctx) {
+                    Ok(route) => {
+                        ohm.get_handler(&route.outbound_tag).or_else(|| {
+                            tracing::warn!(tag = %route.outbound_tag, "routed handler not found, falling back to default");
+                            ohm.get_default_handler()
+                        })
+                    }
+                    Err(_) => ohm.get_default_handler(),
+                }
+            } else {
+                ohm.get_default_handler()
+            };
+
+            let Some(handler) = handler else {
+                tracing::error!("no outbound handler available");
+                return;
+            };
+
+            // CachedReader 始终包装 outbound_reader，sniffing 时回放缓存首包
+            let reader: Box<dyn xray_buf::io::Reader> = Box::new(cr);
+            let final_link = xray_transport::link::Link::new(reader, outbound_writer);
+
+            let fut = handler.dispatch(&final_dest, final_link);
             let _ = fut.await;
-        });
+        };
+
+        tokio::spawn(fut);
         Ok(())
     }
 }
@@ -495,12 +690,12 @@ impl DefaultDispatcher {
 ///
 /// 对应 Go `cachedReader struct { sync.Mutex; reader buf.TimeoutReader; cache buf.MultiBuffer }`。
 ///
-/// **当前状态**：依赖 `pipe.Reader`，主体留 TODO；保留类型骨架供上层接入。
+/// 读首包时缓存到 `cache`，后续正常读取时先回放缓存再读 inner，确保数据不丢。
 pub struct CachedReader {
-    /// 内部 reader 占位（实际是 `Box<dyn xray_buf::io::Reader>`）
-    pub inner: Option<Box<dyn xray_buf::io::Reader>>,
-    /// 已缓存的 MultiBuffer
-    pub cache: Option<MultiBuffer>,
+    /// 内部 reader
+    inner: Option<Box<dyn xray_buf::io::Reader>>,
+    /// 已缓存的 MultiBuffer（sniffing 时暂存的首包）
+    cache: Option<MultiBuffer>,
 }
 
 impl Debug for CachedReader {
@@ -528,6 +723,15 @@ impl CachedReader {
         }
     }
 
+    /// 用 inner reader 构造。
+    #[must_use]
+    pub fn with_inner(r: Box<dyn xray_buf::io::Reader>) -> Self {
+        Self {
+            inner: Some(r),
+            cache: None,
+        }
+    }
+
     /// 设置内部 reader。
     pub fn set_inner(&mut self, r: Box<dyn xray_buf::io::Reader>) {
         self.inner = Some(r);
@@ -536,7 +740,50 @@ impl CachedReader {
     /// 中断：清空 cache 并中断内部 reader。
     pub fn interrupt(&mut self) {
         self.cache = None;
-        // TODO: 调用 inner.interrupt() — xray_buf::io::Reader trait 暂无 interrupt 方法
+    }
+
+    /// 读首包并缓存。返回首包字节的引用（通过 cache）。
+    ///
+    /// 对应 Go `cachedReader.ReadFirst` — 读 MultiBuffer 存入 cache。
+    pub async fn read_first(&mut self) -> Result<(), DispatcherError> {
+        if self.cache.is_some() {
+            return Ok(());
+        }
+        let inner = self.inner.as_mut().ok_or_else(|| {
+            DispatcherError::Io("cached reader: no inner reader".into())
+        })?;
+        let mb = inner.read_multi_buffer().await.map_err(|e| {
+            DispatcherError::Io(format!("cached reader read_first: {e}"))
+        })?;
+        if !mb.is_empty() {
+            self.cache = Some(mb);
+        }
+        Ok(())
+    }
+
+    /// 取缓存的首包字节切片（用于 sniffing）。
+    pub fn cached_bytes(&self) -> Vec<u8> {
+        self.cache.as_ref().map_or(Vec::new(), |mb| mb.to_vec())
+    }
+}
+
+impl xray_buf::io::Reader for CachedReader {
+    fn read_multi_buffer(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<MultiBuffer, xray_buf::io::Error>> + Send + '_>> {
+        Box::pin(async move {
+            // 先回放缓存
+            if let Some(cached) = self.cache.take() {
+                if !cached.is_empty() {
+                    return Ok(cached);
+                }
+            }
+            // 缓存空，读 inner
+            let inner = self.inner.as_mut().ok_or_else(|| {
+                xray_buf::io::Error::ReadError("cached reader: no inner reader".into())
+            })?;
+            inner.read_multi_buffer().await
+        })
     }
 }
 
