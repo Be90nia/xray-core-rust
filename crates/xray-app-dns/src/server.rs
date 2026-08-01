@@ -14,7 +14,9 @@
 //!   方法占位，调用方提供具体实现（实现时需要持有 `tokio::task::JoinSet`）。
 //! - Go `init()` 全局注册：Rust 无副作用全局。
 
+use std::future::Future;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -165,11 +167,9 @@ impl DnsService {
 
     /// 顶层查询入口。对应 Go `(*DNS).LookupIP`。
     ///
-    /// 当前实现：
-    /// - 域名规范化 + `checkSystem` 留 TODO。
-    /// - 静态 hosts 查询：完整翻译。
-    /// - nameservers 查询：留 TODO（依赖具体 Server 实现的 query_ip）。
-    pub fn lookup_ip(
+    /// 流程：域名规范化 → check_routes → hosts 查询 → nameservers 查询。
+    /// nameservers 查询支持串行/并行（由 `enable_parallel_query` 配置决定）。
+    pub async fn lookup_ip(
         &self,
         domain: &str,
         option: IpOption,
@@ -189,8 +189,6 @@ impl DnsService {
             ipv6_enable: option.ipv6_enable && support_v6,
             ..option
         };
-        // （Go: option.IPv4Enable = option.IPv4Enable && s.ipOption.IPv4Enable）
-        // 简化：直接保留 option，因构造 DnsService 时 ipOption 已合并。
 
         if !effective.ipv4_enable && !effective.ipv6_enable {
             return Err(DnsError::EmptyResponse);
@@ -199,36 +197,98 @@ impl DnsService {
         // 静态 hosts 查询。
         let addrs = self.cfg.hosts.lookup(domain, effective)?;
         if !addrs.is_empty() {
-            // 单个域名响应：递归 unwrap（Go 行为）。
             if addrs.len() == 1 {
                 if let xray_common::net::address::Address::Domain(d) = &addrs[0] {
                     let new_domain = d.clone();
-                    return self.recursive_lookup_domain(&new_domain, effective);
+                    return self.recursive_lookup_domain(&new_domain, effective).await;
                 }
             }
             let ips = to_net_ip(&addrs)?;
-            return Ok((ips, 10)); // Hosts ttl 是 10
+            return Ok((ips, 10));
         }
-        // 空 Vec → 未记录或被 IPOption 过滤，走 nameservers 路径。
 
-        // Nameservers 查询。当前留 TODO：实际需要 async + tokio runtime 调用
-        // `Server::query_ip`，本方法签名是同步。等上层改为 async 或封装 runtime
-        // 后再接入。ponytail: 至少返回 EmptyResponse 以便测试覆盖。
-        let _ = self.sort_clients(domain);
-        Err(DnsError::NotImplemented(
-            "DnsService::lookup_ip nameservers path",
-        ))
+        // Nameservers 查询。
+        let clients = self.sort_clients(domain);
+        if clients.is_empty() {
+            return Err(DnsError::EmptyResponse);
+        }
+
+        if self.cfg.enable_parallel_query {
+            parallel_query(&clients, domain).await
+        } else {
+            serial_query(&clients, domain).await
+        }
     }
 
     /// 内部递归：域名被 hosts 重定向到另一个域名时再次查询。
-    fn recursive_lookup_domain(
-        &self,
-        domain: &str,
+    fn recursive_lookup_domain<'a>(
+        &'a self,
+        domain: &'a str,
         option: IpOption,
-    ) -> Result<(Vec<IpAddr>, u32), DnsError> {
-        // ponytail: 与 Go 一致，最多递归 5 次（hosts.rs 内部已限）。
-        self.lookup_ip(domain, option)
+    ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>> {
+        Box::pin(self.lookup_ip(domain, option))
     }
+}
+
+// ── Nameserver 查询编排 ──────────────────────────────────────────
+
+/// 串行查询：按优先级顺序遍历 clients，返回第一个成功结果。
+///
+/// 对应 Go `(*DNS).queryIP` 串行路径。
+async fn serial_query(
+    clients: &[Arc<Client>],
+    domain: &str,
+) -> Result<(Vec<IpAddr>, u32), DnsError> {
+    let mut last_err = DnsError::EmptyResponse;
+    for client in clients {
+        match client.query_ip(domain).await {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                if client.final_query {
+                    return Err(e);
+                }
+                last_err = e;
+            }
+        }
+    }
+    Err(last_err)
+}
+
+/// 并行查询：同时向所有 clients 发起查询，返回第一个成功结果。
+///
+/// 对应 Go `(*DNS).queryIP` 并行路径（`parallelQuery`）。
+/// ponytail: 用 tokio::JoinSet 并发执行，任一成功即取消其余。
+async fn parallel_query(
+    clients: &[Arc<Client>],
+    domain: &str,
+) -> Result<(Vec<IpAddr>, u32), DnsError> {
+    use tokio::task::JoinSet;
+
+    let domain_owned = domain.to_string();
+    let mut set = JoinSet::new();
+
+    for client in clients {
+        let c = Arc::clone(client);
+        let d = domain_owned.clone();
+        set.spawn(async move { c.query_ip(&d).await });
+    }
+
+    let mut last_err = DnsError::EmptyResponse;
+    while let Some(res) = set.join_next().await {
+        match res {
+            Ok(Ok(result)) => {
+                set.abort_all();
+                return Ok(result);
+            }
+            Ok(Err(e)) => {
+                last_err = e;
+            }
+            Err(_) => {
+                // JoinError (task panicked/cancelled)
+            }
+        }
+    }
+    Err(last_err)
 }
 
 // ── 系统路由探测 ──────────────────────────────────────────────────
@@ -277,6 +337,7 @@ mod tests {
     /// 测试用 Server：固定返回指定 IP + TTL。
     struct StaticServer {
         name: String,
+        ips: Vec<IpAddr>,
     }
 
     impl Server for StaticServer {
@@ -291,11 +352,16 @@ mod tests {
             _domain: &'a str,
             _option: IpOption,
         ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>> {
-            Box::pin(async { Ok((Vec::new(), 0)) })
+            let ips = self.ips.clone();
+            Box::pin(async move { Ok((ips, 60)) })
         }
     }
 
     fn make_client(tag: &str, skip_fallback: bool, final_query: bool) -> Arc<Client> {
+        make_client_with_ips(tag, skip_fallback, final_query, Vec::new())
+    }
+
+    fn make_client_with_ips(tag: &str, skip_fallback: bool, final_query: bool, ips: Vec<IpAddr>) -> Arc<Client> {
         let ns = NameServerConfig {
             tag: tag.to_string(),
             skip_fallback,
@@ -304,6 +370,7 @@ mod tests {
         };
         let server: Box<dyn Server> = Box::new(StaticServer {
             name: tag.to_string(),
+            ips,
         });
         Arc::new(Client::new(ns, IpOption::all(), server).unwrap())
     }
@@ -357,14 +424,14 @@ mod tests {
         assert_eq!(sorted.len(), 1);
     }
 
-    #[test]
-    fn lookup_ip_returns_error_for_empty_domain() {
+    #[tokio::test]
+    async fn lookup_ip_returns_error_for_empty_domain() {
         let svc = make_service(Vec::new(), Vec::new());
-        assert!(svc.lookup_ip("", IpOption::all()).is_err());
+        assert!(svc.lookup_ip("", IpOption::all()).await.is_err());
     }
 
-    #[test]
-    fn lookup_ip_strips_trailing_dot_before_hosts_lookup() {
+    #[tokio::test]
+    async fn lookup_ip_strips_trailing_dot_before_hosts_lookup() {
         use std::net::Ipv4Addr;
         let svc = make_service(
             Vec::new(),
@@ -374,13 +441,13 @@ mod tests {
                 proxied_domain: String::new(),
             }],
         );
-        let (ips, ttl) = svc.lookup_ip("example.com.", IpOption::all()).unwrap();
+        let (ips, ttl) = svc.lookup_ip("example.com.", IpOption::all()).await.unwrap();
         assert_eq!(ips.len(), 1);
         assert_eq!(ttl, 10);
     }
 
-    #[test]
-    fn lookup_ip_returns_hosts_ip_with_ttl_ten() {
+    #[tokio::test]
+    async fn lookup_ip_returns_hosts_ip_with_ttl_ten() {
         use std::net::Ipv4Addr;
         let svc = make_service(
             Vec::new(),
@@ -390,16 +457,13 @@ mod tests {
                 proxied_domain: String::new(),
             }],
         );
-        let (ips, ttl) = svc.lookup_ip("x.com", IpOption::all()).unwrap();
+        let (ips, ttl) = svc.lookup_ip("x.com", IpOption::all()).await.unwrap();
         assert_eq!(ips.len(), 1);
         assert_eq!(ttl, 10);
     }
 
-    #[test]
-    fn lookup_ip_returns_empty_vec_when_option_filters_all() {
-        // hosts 有 IPv4 记录，用 v6_only 查询。
-        // check_routes 可能过滤掉不可用的协议栈，导致 EmptyResponse；
-        // 或者系统支持 IPv6，走 nameservers 路径返回 NotImplemented。
+    #[tokio::test]
+    async fn lookup_ip_returns_empty_response_when_option_filters_all() {
         let svc = make_service(
             Vec::new(),
             vec![HostMapping {
@@ -413,20 +477,24 @@ mod tests {
             ipv6_enable: true,
             fake_enable: false,
         };
-        match svc.lookup_ip("x.com", v6_only) {
-            Err(DnsError::EmptyResponse) | Err(DnsError::NotImplemented(_)) => {}
-            other => panic!("expected EmptyResponse or NotImplemented, got {other:?}"),
+        match svc.lookup_ip("x.com", v6_only).await {
+            Err(DnsError::EmptyResponse) => {}
+            other => panic!("expected EmptyResponse, got {other:?}"),
         }
     }
 
-    #[test]
-    fn lookup_ip_returns_not_implemented_for_nameservers_path() {
-        // 域名不在 hosts 表 → 走 nameservers（NotImplemented）。
-        let svc = make_service(vec![make_client("a", false, false)], Vec::new());
-        match svc.lookup_ip("unknown.com", IpOption::all()) {
-            Err(DnsError::NotImplemented(_)) => {}
-            other => panic!("expected NotImplemented, got {other:?}"),
-        }
+    #[tokio::test]
+    async fn lookup_ip_queries_nameservers_when_not_in_hosts() {
+        use std::net::Ipv4Addr;
+        let client = make_client_with_ips(
+            "a", false, false,
+            vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))],
+        );
+        let svc = make_service(vec![client], Vec::new());
+        let (ips, ttl) = svc.lookup_ip("unknown.com", IpOption::all()).await.unwrap();
+        assert_eq!(ips.len(), 1);
+        assert_eq!(ips[0], IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+        assert_eq!(ttl, 60);
     }
 
     #[test]
