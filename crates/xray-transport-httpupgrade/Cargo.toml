@@ -16,3 +16,4 @@ parking_lot = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+tokio-rustls = { workspace = true }

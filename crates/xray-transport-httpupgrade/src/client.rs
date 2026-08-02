@@ -13,6 +13,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::config::Config;
 use crate::connection::HttpUpgradeConnection;
+use crate::deferred::DeferredResponseReader;
 use crate::dialer::{build_upgrade_request, parse_upgrade_response};
 use crate::error::Result;
 
@@ -67,7 +68,14 @@ impl HttpUpgradeClient {
         io.write_all(&req_bytes).await?;
         io.flush().await?;
 
-        // 2. 读响应直到 \r\n\r\n（用 1KB chunk 读，能正确捕获后续 payload）
+        if self.config.ed > 0 {
+            // ed > 0：0-RTT 模式，不立即读 101 响应，让上层先写 early data。
+            // 调用方需使用 dial_over_io_deferred 获取 DeferredResponseReader 包装。
+            // 此处仍立即读 101（与 ed==0 一致），因为泛型返回类型不同。
+            // 实际 0-RTT 由 dial_over_io_deferred 处理。
+        }
+
+        // 2. 读响应直到 \r\n\r\n
         let mut buf: Vec<u8> = Vec::with_capacity(READ_INITIAL_CAPACITY);
         let mut chunk = [0u8; 1024];
         loop {
@@ -100,6 +108,25 @@ impl HttpUpgradeClient {
         };
 
         Ok((HttpUpgradeConnection::new(io, None), leftover))
+    }
+
+    /// 在已建立的 IO 上执行客户端握手，ed > 0 时延迟读 101 响应（0-RTT）。
+    ///
+    /// 与 [`dial_over_io`] 相同，但返回 `DeferredResponseReader` 包装，
+    /// 首次 `AsyncRead::poll_read` 时才解析 101 响应。
+    /// 调用方根据 `config.ed > 0` 选择此方法。
+    pub async fn dial_over_io_deferred<IO>(&self, mut io: IO) -> Result<HttpUpgradeConnection<DeferredResponseReader<IO>>>
+    where
+        IO: AsyncRead + AsyncWrite + Unpin,
+    {
+        // 1. 写请求
+        let req_bytes = build_upgrade_request(&self.host, &self.config);
+        io.write_all(&req_bytes).await?;
+        io.flush().await?;
+
+        // ed > 0：不读 101，让上层先写 early data
+        let deferred = DeferredResponseReader::new(io);
+        Ok(HttpUpgradeConnection::new(deferred, None))
     }
 }
 

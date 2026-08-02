@@ -43,6 +43,8 @@ pub mod happy_eyeballs;
 pub mod browser_dialer;
 pub mod tagged;
 pub mod memory_settings;
+pub mod proxy_protocol;
 
 // 顶层 re-export。
 pub use bridge::{bridge_connections, copy_one_way};
+pub use proxy_protocol::read_proxy_protocol;

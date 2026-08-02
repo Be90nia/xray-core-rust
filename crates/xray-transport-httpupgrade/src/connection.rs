@@ -44,6 +44,14 @@ impl<C> HttpUpgradeConnection<C> {
     pub fn into_inner(self) -> C {
         self.inner
     }
+    /// 构造 wrapper，指定 remote_addr。
+    #[must_use]
+    pub fn with_remote_addr(inner: C, remote_addr: SocketAddr) -> Self {
+        Self {
+            inner,
+            remote_addr_override: Some(remote_addr),
+        }
+    }
 }
 
 
