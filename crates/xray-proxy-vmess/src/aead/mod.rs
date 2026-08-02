@@ -515,11 +515,11 @@ impl AuthIDDecoderItem {
 
 /// AuthID 反重放 + 多用户解码器（对应 Go `AuthIDDecoderHolder`）。
 ///
-/// ponytail: Go 端是 LRU-120 反重放 filter，本实现用容量满后整体清空（1024 阈值）。
-/// 回放窗口在满容量瞬间放宽到 0，但实际攻击者要在 1024 个不同用户请求内重放才受益。
+/// 对齐 Go LRU-120 反重放 filter：`lru::LruCache<[u8;16], i64>` 存
+/// authID → createTime，容量 120，命中时检查时间戳防止重放。
 pub struct AuthIDDecoderHolder {
     items: Mutex<HashMap<[u8; 16], AuthIDDecoderItem>>,
-    replay_filter: Mutex<std::collections::HashSet<[u8; 16]>>,
+    replay_filter: Mutex<lru::LruCache<[u8; 16], i64>>,
 }
 
 /// AuthID 匹配结果。
@@ -541,7 +541,9 @@ impl AuthIDDecoderHolder {
     pub fn new() -> Self {
         Self {
             items: Mutex::new(HashMap::new()),
-            replay_filter: Mutex::new(std::collections::HashSet::new()),
+            replay_filter: Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(120).expect("nonzero"),
+            )),
         }
     }
 
@@ -596,12 +598,12 @@ impl AuthIDDecoderHolder {
             }
 
             let mut filter = self.replay_filter.lock().expect("replay poisoned");
-            if filter.len() > 1024 {
-                filter.clear();
+            if let Some(&cached_time) = filter.peek(auth_id) {
+                if cached_time >= t {
+                    return Err(AuthIDMatchError::Replay);
+                }
             }
-            if !filter.insert(*auth_id) {
-                return Err(AuthIDMatchError::Replay);
-            }
+            filter.put(*auth_id, t);
 
             return Ok(*key);
         }
@@ -816,6 +818,29 @@ mod tests {
         assert_eq!(holder.user_count(), 1);
         holder.remove_user(&cmd_key);
         assert_eq!(holder.user_count(), 0);
+    }
+
+    #[test]
+    fn holder_lru_evicts_beyond_120() {
+        // Go 行为：LRU(120) 超过 120 自动淘汰最旧 entry
+        let cmd_key = sample_cmd_key();
+        let holder = AuthIDDecoderHolder::new();
+        holder.add_user(cmd_key);
+
+        // 插入 121 个不同时间的 auth_id
+        let base = now_unix() - 60;
+        let mut first_auth = [0u8; 16];
+        for i in 0..121 {
+            let auth_id = create_auth_id(&cmd_key, base + i).expect("create");
+            if i == 0 { first_auth = auth_id; }
+            let _ = holder.match_auth_id(&auth_id);
+        }
+
+        // 第 0 个 auth_id 应已被 LRU 淘汰——重新提交应成功（非重放）
+        let result = holder.match_auth_id(&first_auth);
+        // auth_id 是加密的，同一个 auth_id 重提交时间戳不变，因 LRU 淘汰后无缓存记录
+        // 应该匹配成功（Ok）而不是 Replay 错误
+        assert!(result.is_ok(), "first auth_id should be evicted by LRU(120), got {:?}", result.err());
     }
 
     // === Seal/Open Header 完整往返测试 ===
