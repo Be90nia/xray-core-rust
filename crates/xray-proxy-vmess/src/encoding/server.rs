@@ -247,9 +247,16 @@ impl<'v> ServerSession<'v> {
             return Err(VmessError::InvalidAuth);
         }
 
-        // Auto: 服务端默认选择 AES-128-GCM（与 Go 一致）
+        // Auto: 服务端检测 CPU AES-NI 硬件加速，有则 AES-128-GCM，无则 ChaCha20-Poly1305
+        // （对应 Go HasAESGCMHardwareSupport）
         let security = match security {
-            SecurityType::Auto => SecurityType::Aes128Gcm,
+            SecurityType::Auto => {
+                if has_aes_gcm_hardware_support() {
+                    SecurityType::Aes128Gcm
+                } else {
+                    SecurityType::Chacha20Poly1305
+                }
+            }
             SecurityType::Unknown => {
                 return Err(VmessError::UnknownSecurityType(security.as_u8() as i32));
             }
@@ -663,9 +670,33 @@ impl<'v> ServerSession<'v> {
     }
 }
 
+/// 检测 CPU 是否有 AES-GCM 硬件加速（对应 Go `HasAESGCMHardwareSupport`）。
+///
+/// AES-NI + PCLMULQDQ 指令同时存在才返回 true（Go 用 `cpu.X86.HasAES && cpu.X86.HasPCLMULQDQ`）。
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn has_aes_gcm_hardware_support() -> bool {
+    std::is_x86_feature_detected!("aes") && std::is_x86_feature_detected!("pclmulqdq")
+}
+
+#[cfg(target_arch = "aarch64")]
+fn has_aes_gcm_hardware_support() -> bool {
+    std::arch::is_aarch64_feature_detected!("aes") && std::arch::is_aarch64_feature_detected!("neon")
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+fn has_aes_gcm_hardware_support() -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aes_gcm_hardware_detection_is_callable() {
+        // 对应 Go HasAESGCMHardwareSupport — 运行时 AES-NI+PCLMULQDQ 检测
+        let _supported: bool = has_aes_gcm_hardware_support();
+    }
     use crate::encoding::client::ClientSession;
     use xray_common::uuid::UUID;
 
