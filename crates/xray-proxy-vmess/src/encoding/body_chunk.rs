@@ -251,6 +251,8 @@ pub fn encode_chunk_stream<W: Write>(
     cipher: &dyn AeadCipher,
     nonce_gen: &mut dyn ChunkNonce,
     size_parser: &mut dyn SizeParser,
+    global_padding: bool,
+    no_termination: bool,
 ) -> std::io::Result<()> {
     let max_padding = usize::from(size_parser_max_padding_hint(size_parser));
     let payload_chunk_size = DEFAULT_PAYLOAD_SIZE
@@ -270,13 +272,15 @@ pub fn encode_chunk_stream<W: Write>(
     while start < data.len() {
         let end = (start + payload_chunk_size).min(data.len());
         let chunk = &data[start..end];
-        write_one_chunk(writer, chunk, cipher, nonce_gen, size_parser)?;
+        write_one_chunk(writer, chunk, cipher, nonce_gen, size_parser, global_padding)?;
         start = end;
     }
 
-    // 写入终止 chunk：seal 空数据（带 tag）
-    write_one_chunk(writer, &[], cipher, nonce_gen, size_parser)?;
-    writer.flush()?;
+    // 写入终止 chunk：seal 空数据（带 tag）。NoTerminationSignal 时跳过。
+    if !no_termination {
+        write_one_chunk(writer, &[], cipher, nonce_gen, size_parser, global_padding)?;
+        writer.flush()?;
+    }
     Ok(())
 }
 
@@ -287,13 +291,14 @@ fn write_one_chunk<W: Write>(
     cipher: &dyn AeadCipher,
     nonce_gen: &mut dyn ChunkNonce,
     size_parser: &mut dyn SizeParser,
+    global_padding: bool,
 ) -> std::io::Result<()> {
     let nonce = nonce_gen.next();
     let sealed = cipher
         .seal(&nonce, &[], data)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
-    let padding_size = usize::from(size_parser.next_padding_len());
+    let padding_size = if global_padding { usize::from(size_parser.next_padding_len()) } else { 0 };
     let encrypted_size = sealed.len(); // = data.len() + TAG_SIZE
     let size_value = u16::try_from(encrypted_size + padding_size).unwrap_or(u16::MAX);
 
@@ -335,16 +340,26 @@ pub fn decode_chunk_stream<R: Read>(
     cipher: &dyn AeadCipher,
     nonce_gen: &mut dyn ChunkNonce,
     size_parser: &mut dyn SizeParser,
+    global_padding: bool,
+    no_termination: bool,
 ) -> std::io::Result<Vec<u8>> {
     let mut output = Vec::new();
     loop {
-        // mask 流顺序对齐 Go auth.go:127-131 readSize：先 NextPaddingLen 再 Decode。
+        // SHAKE128 流顺序对齐 Go auth.go:127-131 readSize：先 NextPaddingLen 再 Decode。
         // ShakeSizeParser 的 SHAKE128 流必须 encoder/decoder 同序消费，否则流错位。
-        let padding_size = usize::from(size_parser.next_padding_len());
+        // global_padding=false 时两端都不调 NextPaddingLen，流仍同步（只靠 encode/decode 推进）。
+        let padding_size = if global_padding { usize::from(size_parser.next_padding_len()) } else { 0 };
 
         let sb = size_parser.size_bytes();
         let mut size_field = vec![0u8; sb];
-        reader.read_exact(&mut size_field)?;
+        match reader.read_exact(&mut size_field) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && no_termination => {
+                // NoTerminationSignal：靠 EOF 判断流结束
+                return Ok(output);
+            }
+            Err(e) => return Err(e),
+        }
         let total_size = size_parser.decode(&size_field);
 
         // ponytail: PlainChunkSizeParser 不会输出 size==0，但 Go 端 AuthenticationReader
@@ -395,6 +410,8 @@ pub async fn encode_chunk_stream_async<W: AsyncWrite + Unpin>(
     cipher: &dyn AeadCipher,
     nonce_gen: &mut dyn ChunkNonce,
     size_parser: &mut dyn SizeParser,
+    global_padding: bool,
+    no_termination: bool,
 ) -> std::io::Result<()> {
     let max_padding = usize::from(size_parser_max_padding_hint(size_parser));
     let payload_chunk_size = DEFAULT_PAYLOAD_SIZE
@@ -413,12 +430,14 @@ pub async fn encode_chunk_stream_async<W: AsyncWrite + Unpin>(
     while start < data.len() {
         let end = (start + payload_chunk_size).min(data.len());
         let chunk = &data[start..end];
-        write_one_chunk_async(writer, chunk, cipher, nonce_gen, size_parser).await?;
+        write_one_chunk_async(writer, chunk, cipher, nonce_gen, size_parser, global_padding).await?;
         start = end;
     }
 
-    write_one_chunk_async(writer, &[], cipher, nonce_gen, size_parser).await?;
-    writer.flush().await?;
+    if !no_termination {
+        write_one_chunk_async(writer, &[], cipher, nonce_gen, size_parser, global_padding).await?;
+        writer.flush().await?;
+    }
     Ok(())
 }
 
@@ -429,13 +448,14 @@ async fn write_one_chunk_async<W: AsyncWrite + Unpin>(
     cipher: &dyn AeadCipher,
     nonce_gen: &mut dyn ChunkNonce,
     size_parser: &mut dyn SizeParser,
+    global_padding: bool,
 ) -> std::io::Result<()> {
     let nonce = nonce_gen.next();
     let sealed = cipher
         .seal(&nonce, &[], data)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
-    let padding_size = usize::from(size_parser.next_padding_len());
+    let padding_size = if global_padding { usize::from(size_parser.next_padding_len()) } else { 0 };
     let encrypted_size = sealed.len();
     let size_value = u16::try_from(encrypted_size + padding_size).unwrap_or(u16::MAX);
 
@@ -466,14 +486,23 @@ pub async fn decode_chunk_stream_async<R: AsyncRead + Unpin>(
     cipher: &dyn AeadCipher,
     nonce_gen: &mut dyn ChunkNonce,
     size_parser: &mut dyn SizeParser,
+    global_padding: bool,
+    no_termination: bool,
 ) -> std::io::Result<Vec<u8>> {
     let mut output = Vec::new();
     loop {
-        let padding_size = usize::from(size_parser.next_padding_len());
+        let padding_size = if global_padding { usize::from(size_parser.next_padding_len()) } else { 0 };
 
         let sb = size_parser.size_bytes();
         let mut size_field = vec![0u8; sb];
-        reader.read_exact(&mut size_field).await?;
+        match reader.read_exact(&mut size_field).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && no_termination => {
+                // NoTerminationSignal：靠 EOF 判断流结束
+                return Ok(output);
+            }
+            Err(e) => return Err(e),
+        }
         let total_size = size_parser.decode(&size_field);
 
         if total_size == 0 {
@@ -539,10 +568,10 @@ mod tests {
         let mut sp_r = PlainSizeParser;
 
         let mut buf: Vec<u8> = Vec::new();
-        encode_chunk_stream(&mut buf, b"", &cipher_w, &mut nw, &mut sp_w).expect("encode");
+        encode_chunk_stream(&mut buf, b"", &cipher_w, &mut nw, &mut sp_w, false, false).expect("encode");
         assert!(!buf.is_empty()); // 至少有终止 chunk
 
-        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r).expect("decode");
+        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false, false).expect("decode");
         assert!(decoded.is_empty());
     }
 
@@ -557,9 +586,9 @@ mod tests {
 
         let data = b"hello vmess body chunk";
         let mut buf: Vec<u8> = Vec::new();
-        encode_chunk_stream(&mut buf, data, &cipher_w, &mut nw, &mut sp_w).expect("encode");
+        encode_chunk_stream(&mut buf, data, &cipher_w, &mut nw, &mut sp_w, false, false).expect("encode");
 
-        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r).expect("decode");
+        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false, false).expect("decode");
         assert_eq!(decoded, data);
     }
 
@@ -575,9 +604,9 @@ mod tests {
         // payload_chunk_size ≈ 8192 - 16 - 2 - 64 = 8110；写 20000 字节 → 3 个 chunk
         let data: Vec<u8> = (0..20000).map(|i| (i % 251) as u8).collect();
         let mut buf: Vec<u8> = Vec::new();
-        encode_chunk_stream(&mut buf, &data, &cipher_w, &mut nw, &mut sp_w).expect("encode");
+        encode_chunk_stream(&mut buf, &data, &cipher_w, &mut nw, &mut sp_w, false, false).expect("encode");
 
-        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r).expect("decode");
+        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false, false).expect("decode");
         assert_eq!(decoded, data);
     }
 
@@ -592,9 +621,9 @@ mod tests {
 
         let data = b"shake padded payload for vmess chunk masking";
         let mut buf: Vec<u8> = Vec::new();
-        encode_chunk_stream(&mut buf, data, &cipher_w, &mut nw, &mut sp_w).expect("encode");
+        encode_chunk_stream(&mut buf, data, &cipher_w, &mut nw, &mut sp_w, false, false).expect("encode");
 
-        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r).expect("decode");
+        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false, false).expect("decode");
         assert_eq!(decoded, data);
     }
 
@@ -608,9 +637,9 @@ mod tests {
         let mut sp_r = PlainSizeParser;
 
         let mut buf: Vec<u8> = Vec::new();
-        encode_chunk_stream(&mut buf, b"secret", &cipher_w, &mut nw, &mut sp_w).expect("encode");
+        encode_chunk_stream(&mut buf, b"secret", &cipher_w, &mut nw, &mut sp_w, false, false).expect("encode");
 
-        let err = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r).unwrap_err();
+        let err = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false, false).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
@@ -647,10 +676,10 @@ mod tests {
 
         let data = b"chacha20 poly1305 vmess body";
         let mut buf: Vec<u8> = Vec::new();
-        encode_chunk_stream(&mut buf, data, &cipher_w, &mut nw, &mut sp_w).expect("encode");
+        encode_chunk_stream(&mut buf, data, &cipher_w, &mut nw, &mut sp_w, false, false).expect("encode");
 
         let decoded =
-            decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r).expect("decode");
+            decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false, false).expect("decode");
         assert_eq!(decoded, data);
     }
 
@@ -665,9 +694,9 @@ mod tests {
         let mut nr = ChunkNonceAdapter::new(&[0xAAu8; 16], 12);
         let mut sp_w = PlainSizeParser;
         let mut sp_r = PlainSizeParser;
-        encode_chunk_stream(&mut buf, data, &aes_w, &mut nw, &mut sp_w).expect("aes encode");
+        encode_chunk_stream(&mut buf, data, &aes_w, &mut nw, &mut sp_w, false, false).expect("aes encode");
         let decoded =
-            decode_chunk_stream(&mut &buf[..], &aes_r, &mut nr, &mut sp_r).expect("aes decode");
+            decode_chunk_stream(&mut &buf[..], &aes_r, &mut nr, &mut sp_r, false, false).expect("aes decode");
         assert_eq!(decoded, data);
 
         // ChaCha20 独立流
@@ -676,9 +705,9 @@ mod tests {
         let mut buf2: Vec<u8> = Vec::new();
         let mut nw2 = ChunkNonceAdapter::new(&[0xBBu8; 16], 12);
         let mut nr2 = ChunkNonceAdapter::new(&[0xBBu8; 16], 12);
-        encode_chunk_stream(&mut buf2, data, &chacha_w, &mut nw2, &mut sp_w).expect("chacha encode");
+        encode_chunk_stream(&mut buf2, data, &chacha_w, &mut nw2, &mut sp_w, false, false).expect("chacha encode");
         let decoded2 =
-            decode_chunk_stream(&mut &buf2[..], &chacha_r, &mut nr2, &mut sp_r).expect("chacha decode");
+            decode_chunk_stream(&mut &buf2[..], &chacha_r, &mut nr2, &mut sp_r, false, false).expect("chacha decode");
         assert_eq!(decoded2, data);
     }
 
@@ -711,9 +740,9 @@ mod tests {
 
     let data = b"aead authenticated length payload for vmess";
     let mut buf: Vec<u8> = Vec::new();
-    encode_chunk_stream(&mut buf, data, &cipher_w, &mut nw, &mut sp_w).expect("encode");
+    encode_chunk_stream(&mut buf, data, &cipher_w, &mut nw, &mut sp_w, false, false).expect("encode");
 
-    let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r).expect("decode");
+    let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false, false).expect("decode");
     assert_eq!(decoded, data);
     }
 
@@ -754,9 +783,9 @@ mod tests {
 
         let data = b"authenticated length dynamic nonce payload";
         let mut buf: Vec<u8> = Vec::new();
-        encode_chunk_stream(&mut buf, data, &cipher_w, &mut nw, &mut sp_w).expect("encode");
+        encode_chunk_stream(&mut buf, data, &cipher_w, &mut nw, &mut sp_w, false, false).expect("encode");
 
-        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r).expect("decode");
+        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false, false).expect("decode");
         assert_eq!(decoded, data);
     }
 
@@ -771,11 +800,11 @@ mod tests {
 
         let data = b"async chunk stream test payload";
         let mut buf: Vec<u8> = Vec::new();
-        encode_chunk_stream_async(&mut buf, data, &cipher_w, &mut nw, &mut sp_w)
+        encode_chunk_stream_async(&mut buf, data, &cipher_w, &mut nw, &mut sp_w, false, false)
             .await
             .expect("encode");
 
-        let decoded = decode_chunk_stream_async(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r)
+        let decoded = decode_chunk_stream_async(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false, false)
             .await
             .expect("decode");
         assert_eq!(decoded, data);
@@ -792,13 +821,73 @@ mod tests {
 
         let data = b"async authenticated length payload";
         let mut buf: Vec<u8> = Vec::new();
-        encode_chunk_stream_async(&mut buf, data, &cipher_w, &mut nw, &mut sp_w)
+        encode_chunk_stream_async(&mut buf, data, &cipher_w, &mut nw, &mut sp_w, false, false)
             .await
             .expect("encode");
 
-        let decoded = decode_chunk_stream_async(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r)
+        let decoded = decode_chunk_stream_async(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false, false)
             .await
             .expect("decode");
+        assert_eq!(decoded, data);
+    }
+
+    #[tokio::test]
+    async fn async_no_termination_signal_skips_termination_chunk() {
+        // NoTerminationSignal=true：encode 不写终止 chunk，decode 靠 EOF 结束
+        let cipher_w = make_cipher();
+        let cipher_r = Aes128Gcm::new(&[0x42u8; 16]).expect("aes");
+        let mut nw = make_nonce_gen();
+        let mut nr = make_nonce_gen();
+        let mut sp_w = PlainSizeParser;
+        let mut sp_r = PlainSizeParser;
+
+        let data = b"no term signal payload";
+        let mut buf: Vec<u8> = Vec::new();
+        encode_chunk_stream_async(&mut buf, data, &cipher_w, &mut nw, &mut sp_w, false, true)
+            .await
+            .expect("encode");
+        // 没有终止 chunk：buf 只有数据 chunk
+
+        let decoded = decode_chunk_stream_async(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false, true)
+            .await
+            .expect("decode via EOF");
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn global_padding_disabled_skips_padding_with_shake_parser() {
+        // global_padding=false + ShakeSizeParser：不写 padding，SHAKE128 流仍同步
+        let cipher_w = make_cipher();
+        let cipher_r = Aes128Gcm::new(&[0x42u8; 16]).expect("aes");
+        let mut nw = ChunkNonceAdapter::new(&[0xAAu8; 16], 12);
+        let mut nr = ChunkNonceAdapter::new(&[0xAAu8; 16], 12);
+        let mut sp_w = ShakeSizeParserAdapter::new(&[0x11u8; 16]);
+        let mut sp_r = ShakeSizeParserAdapter::new(&[0x11u8; 16]);
+
+        let data = b"shake without global padding";
+        let mut buf: Vec<u8> = Vec::new();
+        encode_chunk_stream(&mut buf, data, &cipher_w, &mut nw, &mut sp_w, false, false).expect("encode");
+
+        // 验证 encode+decode round-trip 正确（无 padding，SHAKE128 流同步）
+        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false, false).expect("decode");
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn global_padding_enabled_with_shake_parser_roundtrip() {
+        // global_padding=true + ShakeSizeParser：写 padding，decode 消费 padding
+        let cipher_w = make_cipher();
+        let cipher_r = Aes128Gcm::new(&[0x42u8; 16]).expect("aes");
+        let mut nw = ChunkNonceAdapter::new(&[0xAAu8; 16], 12);
+        let mut nr = ChunkNonceAdapter::new(&[0xAAu8; 16], 12);
+        let mut sp_w = ShakeSizeParserAdapter::new(&[0x11u8; 16]);
+        let mut sp_r = ShakeSizeParserAdapter::new(&[0x11u8; 16]);
+
+        let data = b"shake with global padding enabled";
+        let mut buf: Vec<u8> = Vec::new();
+        encode_chunk_stream(&mut buf, data, &cipher_w, &mut nw, &mut sp_w, true, false).expect("encode");
+
+        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, true, false).expect("decode");
         assert_eq!(decoded, data);
     }
 }

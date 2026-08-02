@@ -52,6 +52,8 @@ pub mod request_option {
     pub const GLOBAL_PADDING: u8 = 0x08;
     /// Authenticated length：length 字段单独 AEAD 加密。
     pub const AUTHENTICATED_LENGTH: u8 = 0x10;
+    /// NoTerminationSignal：不写终止 chunk，靠连接关闭判断流结束。
+    pub const NO_TERMINATION_SIGNAL: u8 = 0x80;
 }
 
 /// 请求命令（与 `xray_common::protocol::Command` 同值，但 VMess 协议层用本枚举
