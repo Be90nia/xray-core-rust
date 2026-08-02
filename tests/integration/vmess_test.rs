@@ -89,7 +89,7 @@ async fn run_vmess_e2e(security: SecurityType) {
     let ohm_clone = Arc::clone(&ohm);
     let validator_clone = Arc::clone(&validator);
     tokio::spawn(async move {
-        let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone).await;
+        let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None).await;
     });
 
     // 4. VMess client：connect → encode header → decode response header → echo round-trip
@@ -153,7 +153,7 @@ async fn vmess_rejects_unknown_user() {
     let ohm_clone = Arc::clone(&ohm);
     let validator_clone = Arc::clone(&validator);
     tokio::spawn(async move {
-        let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone).await;
+        let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None).await;
     });
 
     // client 用未注册的随机 UUID
@@ -199,7 +199,7 @@ async fn vmess_e2e_aes128gcm_large_payload() {
     let ohm_clone = Arc::clone(&ohm);
     let validator_clone = Arc::clone(&validator);
     tokio::spawn(async move {
-        let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone).await;
+        let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None).await;
     });
 
     let mut client = tokio::net::TcpStream::connect(vmess_addr)

@@ -501,10 +501,19 @@ async fn spawn_one_inbound(
         }
         "vmess" => {
             let validator = build_vmess_validator(&ib.entry.data)?;
+            // VMess detour：Go DetourConfig.to 重定向到指定 outbound tag（可选）
+            let detour_to = serde_json::from_slice::<serde_json::Value>(&ib.entry.data)
+                .ok()
+                .and_then(|v| {
+                    v.get("detour")
+                        .and_then(|d| d.get("to"))
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string())
+                });
             let listener = TcpListener::bind(&addr).await?;
             tracing::info!(tag = %ib.tag, addr = %addr, "vmess inbound listening");
             let handle = tokio::spawn(async move {
-                if let Err(e) = serve_vmess(listener, ohm, validator).await {
+                if let Err(e) = serve_vmess(listener, ohm, validator, detour_to).await {
                     tracing::error!(error = %e, "vmess inbound stopped");
                 }
             });
