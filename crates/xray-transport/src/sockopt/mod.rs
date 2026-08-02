@@ -39,6 +39,9 @@ pub struct SocketOptions {
     /// SO_MARK 包标记值（Linux fwmark），用于 iptables/fwmark 策略路由。`0`=不设置。
     /// 对应 Go `SocketConfig.Mark`。仅 Linux 有效，其他平台忽略。
     pub mark: u32,
+    /// TCP Fast Open。对应 Go `SocketConfig.Tfo`。
+    /// Windows 不支持 per-socket TFO（需系统级注册表设置），FreeBSD 12.1+/Linux 支持。
+    pub tcp_fast_open: bool,
 }
 
 impl Default for SocketOptions {
@@ -49,6 +52,7 @@ impl Default for SocketOptions {
             tcp_keepalive_idle: Duration::from_secs(45),
             tcp_keepalive_interval: Duration::from_secs(45),
             mark: 0,
+            tcp_fast_open: false,
         }
     }
 }
@@ -78,6 +82,14 @@ pub fn apply_outbound_socket_options(socket: &Socket, opts: &SocketOptions) -> s
             let fd = socket.as_raw_socket() as i32;
             let linux_opt = linux::LinuxSockOpt { mark: opts.mark, ..Default::default() };
             linux_opt.set_so_mark(fd)?;
+        }
+    }
+    // TCP_FASTOPEN：Windows 不支持 per-socket（系统级注册表），FreeBSD/Linux 支持。
+    // Go 在 Windows 也是 no-op（参见 sockopt_windows.go）。
+    #[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
+    {
+        if opts.tcp_fast_open {
+            let _ = opts; // FreeBSD TFO 需 libc::TCP_FASTOPEN，留 follow-up
         }
     }
     Ok(())
@@ -169,6 +181,7 @@ mod tests {
         assert!(opts.tcp_nodelay);
         assert_eq!(opts.tcp_keepalive_idle, Duration::from_secs(45));
         assert_eq!(opts.tcp_keepalive_interval, Duration::from_secs(45));
+        assert!(!opts.tcp_fast_open, "TFO default should be false");
     }
 
     #[test]
