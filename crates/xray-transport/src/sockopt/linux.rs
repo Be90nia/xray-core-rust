@@ -28,6 +28,10 @@ pub struct LinuxSockOpt {
     /// SO_MARK 包标记值，用于 iptables/fwmark 策略路由。`0`=不设置。
     /// 对应 Go `SocketConfig.Mark`。需要 root 或 CAP_NET_ADMIN。
     pub mark: u32,
+    /// 绑定到指定网络接口索引。`0`=不绑定。
+    /// 对应 Go `SO_BINDTODEVICE`。通过 `if_indextoname` 转为接口名后 setsockopt。
+    pub bind_if_index: u32,
+}
 
 impl LinuxSockOpt {
     /// 将 Linux 特定 socket 选项应用到给定 fd。
@@ -60,6 +64,11 @@ impl LinuxSockOpt {
         // SO_MARK
         if self.mark > 0 {
             self.set_so_mark(fd)?;
+        }
+
+        // SO_BINDTODEVICE
+        if self.bind_if_index > 0 {
+            self.set_so_bindtodevice(fd)?;
         }
 
         Ok(())
@@ -193,6 +202,37 @@ impl LinuxSockOpt {
                 libc::SO_MARK,
                 &val as *const u32 as *const libc::c_void,
                 std::mem::size_of::<u32>() as libc::socklen_t,
+            );
+            if ret < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// 设置 SO_BINDTODEVICE（绑定到指定网络接口）。
+    /// 对应 Go `unix.SetsockoptString(fd, SOL_SOCKET, SO_BINDTODEVICE, ifaceName)`。
+    ///
+    /// 通过 `if_indextoname` 将接口索引转为接口名（如 "eth0"）。
+    /// 需要 root 或 CAP_NET_RAW。
+    fn set_so_bindtodevice(&self, fd: i32) -> io::Result<()> {
+        // SAFETY: if_indextoname 将接口索引转为接口名，写入调用方提供的缓冲区。
+        // 缓冲区大小 IFNAMSIZ=16 足够存放任何接口名。
+        let mut buf = [0u8; libc::IFNAMSIZ];
+        let ptr = unsafe { libc::if_indextoname(self.bind_if_index, buf.as_mut_ptr() as *mut libc::c_char) };
+        if ptr.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let name_len = unsafe { libc::strlen(ptr as *const libc::c_char) };
+        // SAFETY: setsockopt 对已验证的 fd 设置字符串选项。
+        // SO_BINDTODEVICE = 25，内核验证接口名是否存在。
+        unsafe {
+            let ret = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                buf.as_ptr() as *const libc::c_void,
+                (name_len + 1) as libc::socklen_t,
             );
             if ret < 0 {
                 return Err(io::Error::last_os_error());

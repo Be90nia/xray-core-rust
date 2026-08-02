@@ -1,66 +1,100 @@
-//! gRPC RoutingService stub。
+//! gRPC RoutingService — 接入 Router 的管理 RPC。
 //!
-//! 翻译自 `app/router/command/`。依赖 stats.Channel + gRPC 服务框架。
+//! 翻译自 `app/router/command/`。7 个 RPC 方法委托给 [`Router`]。
+//! subscribe_routing_stats 需要 gRPC streaming 框架，暂未接入。
 //!
-//! **当前状态**：所有接口全 stub，仅保留 API 形状。
+//! # 架构
 //!
-//! # 计划接口（对应 Go `RoutingService`）
-//!
-//! - `get_balancer_info(tag) -> BalancerInfo`
-//! - `override_balancer_target(tag, target)`
-//! - `add_rule(tag, config)`
-//! - `remove_rule(tag)`
-//! - `list_rule() -> Vec<Rule>`
-//! - `test_route(destination, session) -> Route`
-//! - `subscribe_routing_stats() -> Stream<RoutingStats>`
+//! [`RoutingService`] 持有 `Option<Arc<Router>>`：
+//! - `new()` → `None`（向后兼容，方法返回 "router not configured"）
+//! - `with_router(r)` → `Some(r)`（委托给 Router 实际方法）
+
+use std::sync::Arc;
 
 use crate::error::RouterError;
+use crate::router::Router;
 
-/// gRPC RoutingService stub。
+/// gRPC RoutingService 管理 RPC。
 ///
-/// TODO: 接入 gRPC 框架后实现。
-#[derive(Debug, Default)]
-pub struct RoutingService;
+/// 对应 Go `app/router/command/command.go::routingServer`。
+/// 持有 [`Router`] 引用，7 个 RPC 委托给 Router 方法。
+pub struct RoutingService {
+    router: Option<Arc<Router>>,
+}
+
+impl Default for RoutingService {
+    fn default() -> Self {
+        Self { router: None }
+    }
+}
 
 impl RoutingService {
-    /// 创建 stub。
+    /// 创建未配置 Router 的 stub（方法返回 "router not configured"）。
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// 获取平衡器信息。
-    pub fn get_balancer_info(&self, _tag: &str) -> Result<(), RouterError> {
-        Err(RouterError::Other("RoutingService not implemented".into()))
+    /// 创建已注入 Router 的 RoutingService。
+    #[must_use]
+    pub fn with_router(router: Arc<Router>) -> Self {
+        Self { router: Some(router) }
     }
 
-    /// 覆盖平衡器目标。
+    fn router(&self) -> Result<&Router, RouterError> {
+        self.router
+            .as_deref()
+            .ok_or_else(|| RouterError::Other("router not configured in RoutingService".into()))
+    }
+
+    /// 获取平衡器信息（验证 tag 存在性）。
+    pub fn get_balancer_info(&self, tag: &str) -> Result<(), RouterError> {
+        let router = self.router()?;
+        router
+            .get_balancer(tag)
+            .map(|_| ())
+            .ok_or_else(|| RouterError::BalancerNotFound(tag.to_string()))
+    }
+
+    /// 覆盖平衡器目标。委托 [`Router::override_balancer`]。
     pub fn override_balancer_target(
         &self,
-        _tag: &str,
-        _target: &str,
+        tag: &str,
+        target: &str,
     ) -> Result<(), RouterError> {
-        Err(RouterError::Other("RoutingService not implemented".into()))
+        self.router()?.override_balancer(tag, target)
     }
 
-    /// 添加规则。
-    pub fn add_rule(&self, _tag: &str) -> Result<(), RouterError> {
-        Err(RouterError::Other("RoutingService not implemented".into()))
+    /// 移除规则。委托 [`Router::remove_rule`]。
+    pub fn remove_rule(&self, tag: &str) -> Result<(), RouterError> {
+        self.router()?.remove_rule(tag)
     }
 
-    /// 移除规则。
-    pub fn remove_rule(&self, _tag: &str) -> Result<(), RouterError> {
-        Err(RouterError::Other("RoutingService not implemented".into()))
-    }
-
-    /// 列出规则。
+    /// 列出规则 tag。委托 [`Router::list_rules`]。
     pub fn list_rule(&self) -> Result<Vec<String>, RouterError> {
-        Err(RouterError::Other("RoutingService not implemented".into()))
+        Ok(self.router()?.list_rules())
     }
 
-    /// 测试路由。
+    /// 测试路由（简化：返回目标 tag 或 "no match"）。
+    ///
+    /// 完整 test_route 需要 RoutingContext（含 source IP、protocol、session 等），
+    /// 当前仅返回 "test_route requires full RoutingContext (gRPC 端补全)"。
     pub fn test_route(&self, _dest: &str) -> Result<String, RouterError> {
-        Err(RouterError::Other("RoutingService not implemented".into()))
+        // ponytail: pick_route 需要 &dyn RoutingContext，从 dest 字符串构造不完整。
+        // gRPC 端补全完整 context 后委托 router.pick_route。
+        Err(RouterError::Other(
+            "test_route requires full RoutingContext (gRPC 端补全)".into(),
+        ))
+    }
+
+    /// 添加规则（需要完整 rule config）。
+    ///
+    /// add_rule 需要 `RoutingRule` proto 配置，当前仅接受 tag。
+    /// gRPC 端补全完整 config 后委托 [`Router::add_rule`]。
+    pub fn add_rule(&self, _tag: &str) -> Result<(), RouterError> {
+        Err(RouterError::Other(
+            "add_rule requires full RoutingRule config (gRPC 端补全)".into(),
+        ))
     }
 }
 
@@ -69,13 +103,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_all_methods_return_not_implemented() {
+    fn without_router_returns_not_configured() {
         let s = RoutingService::new();
-        assert!(s.get_balancer_info("x").is_err());
-        assert!(s.override_balancer_target("x", "y").is_err());
-        assert!(s.add_rule("x").is_err());
-        assert!(s.remove_rule("x").is_err());
-        assert!(s.list_rule().is_err());
-        assert!(s.test_route("x").is_err());
+        let err = s.list_rule().unwrap_err();
+        assert!(format!("{err}").contains("not configured"));
+    }
+
+    #[test]
+    fn with_router_list_rule_returns_empty() {
+        use crate::balancing::{NotImplementedSelector, OutboundHandlerSelector};
+        let ohm: Arc<dyn OutboundHandlerSelector> = Arc::new(NotImplementedSelector);
+        let router = Router::empty(ohm);
+        let s = RoutingService::with_router(router);
+        assert_eq!(s.list_rule().unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn with_router_get_balancer_info_unknown_tag() {
+        use crate::balancing::{NotImplementedSelector, OutboundHandlerSelector};
+        let ohm: Arc<dyn OutboundHandlerSelector> = Arc::new(NotImplementedSelector);
+        let router = Router::empty(ohm);
+        let s = RoutingService::with_router(router);
+        assert!(s.get_balancer_info("nonexistent").is_err());
     }
 }

@@ -42,6 +42,13 @@ pub struct SocketOptions {
     /// TCP Fast Open。对应 Go `SocketConfig.Tfo`。
     /// Windows 不支持 per-socket TFO（需系统级注册表设置），FreeBSD 12.1+/Linux 支持。
     pub tcp_fast_open: bool,
+    /// 绑定到指定网络接口索引。`0`=不绑定。
+    /// 对应 Go `SocketConfig.Interface`（Go 用接口名字符串，Rust 用索引）。
+    /// Linux: SO_BINDTODEVICE；Darwin: IP_BOUND_IF / IPV6_BOUND_IF。
+    pub bind_if_index: u32,
+    /// 是否限制 socket 仅使用 IPv6（不允许 IPv4-mapped 地址）。默认 `false`。
+    /// 对应 Go `sockopt_ipv6_only` / `IPV6_V6ONLY`。socket2 跨平台 `set_only_v6()`。
+    pub ipv6_only: bool,
 }
 
 impl Default for SocketOptions {
@@ -53,6 +60,8 @@ impl Default for SocketOptions {
             tcp_keepalive_interval: Duration::from_secs(45),
             mark: 0,
             tcp_fast_open: false,
+            bind_if_index: 0,
+            ipv6_only: false,
         }
     }
 }
@@ -67,6 +76,9 @@ impl Default for SocketOptions {
 pub fn apply_outbound_socket_options(socket: &Socket, opts: &SocketOptions) -> std::io::Result<()> {
     // TCP_NODELAY：跨平台通用。
     socket.set_nodelay(opts.tcp_nodelay)?;
+    if opts.ipv6_only {
+        socket.set_only_v6(true)?;
+    }
     // SO_KEEPALIVE + TCP_KEEPIDLE/TCP_KEEPINTVL：socket2 跨平台封装。
     if opts.tcp_keepalive_idle != Duration::ZERO {
         socket.set_tcp_keepalive(
@@ -78,10 +90,11 @@ pub fn apply_outbound_socket_options(socket: &Socket, opts: &SocketOptions) -> s
     // SO_MARK：仅 Linux 有效。
     #[cfg(target_os = "linux")]
     {
-        if opts.mark > 0 {
+        if opts.mark > 0 || opts.bind_if_index > 0 {
             let fd = socket.as_raw_socket() as i32;
-            let linux_opt = linux::LinuxSockOpt { mark: opts.mark, ..Default::default() };
-            linux_opt.set_so_mark(fd)?;
+            let linux_opt = linux::LinuxSockOpt { mark: opts.mark, bind_if_index: opts.bind_if_index, ..Default::default() };
+            if opts.mark > 0 { linux_opt.set_so_mark(fd)?; }
+            if opts.bind_if_index > 0 { linux_opt.set_so_bindtodevice(fd)?; }
         }
     }
     // TCP_FASTOPEN：Windows 不支持 per-socket（系统级注册表），FreeBSD/Linux 支持。
@@ -102,6 +115,9 @@ pub fn apply_outbound_socket_options(socket: &Socket, opts: &SocketOptions) -> s
 ///（Go 端 `lc.KeepAlive = -1`），仅在 [`SocketOptions`] 显式配置非零 idle 时启用。
 pub fn apply_inbound_socket_options(socket: &Socket, opts: &SocketOptions) -> std::io::Result<()> {
     socket.set_nodelay(opts.tcp_nodelay)?;
+    if opts.ipv6_only {
+        socket.set_only_v6(true)?;
+    }
     if opts.tcp_keepalive_idle != Duration::ZERO {
         socket.set_tcp_keepalive(
             &socket2::TcpKeepalive::new()

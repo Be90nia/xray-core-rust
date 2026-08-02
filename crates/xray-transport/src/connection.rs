@@ -36,6 +36,18 @@ pub trait Connection: AsyncRead + AsyncWrite + Send + Sync + Unpin {
 
     /// 本端地址（local addr）。底层未提供时返回 `Ok(None)`。
     fn local_addr(&self) -> io::Result<Option<SocketAddr>>;
+
+    /// 半关闭读方向（SHUT_RD）。告诉内核丢弃后续入站数据。
+    /// 默认 no-op（非 TCP 连接或不支持的平台）。
+    fn close_read(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// 半关闭写方向（SHUT_WR）。通知对端本地已写完。
+    /// 默认 no-op。TCP 连接可通过 [`tokio::io::AsyncWriteExt::shutdown`] 实现等价效果。
+    fn close_write(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 
@@ -96,6 +108,30 @@ impl Connection for TcpConnection {
     }
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(Some(self.inner.local_addr()?))
+    }
+    fn close_read(&mut self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: shutdown 对已验证的 fd 设置 SHUT_RD，内核丢弃后续入站数据。
+            let ret = unsafe { libc::shutdown(self.inner.as_raw_fd(), libc::SHUT_RD) };
+            if ret < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+    fn close_write(&mut self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: shutdown 对已验证的 fd 设置 SHUT_WR，通知对端本地已写完。
+            let ret = unsafe { libc::shutdown(self.inner.as_raw_fd(), libc::SHUT_WR) };
+            if ret < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -158,6 +194,51 @@ impl Connection for Box<dyn Connection> {
 
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         (**self).local_addr()
+    }
+
+    fn close_read(&mut self) -> io::Result<()> {
+        (**self).close_read()
+    }
+
+    fn close_write(&mut self) -> io::Result<()> {
+        (**self).close_write()
+    }
+}
+
+/// 带前缀缓冲的读取器（sniffing 缓存回放）。
+///
+/// sniffer 读取前 N 字节分析协议后，用 [`PrefixedReader`] 包装原始连接，
+/// 让后续协议处理器先读取缓存的字节再读取新数据。
+/// 对应 Go dispatcher 的 `buf.MultiBuffer` 前缀回放模式。
+pub struct PrefixedReader<R> {
+    inner: R,
+    prefix: Vec<u8>,
+    pos: usize,
+}
+
+impl<R> PrefixedReader<R> {
+    /// 用前缀缓冲 + 内部读取器构造。
+    #[must_use]
+    pub fn new(inner: R, prefix: Vec<u8>) -> Self {
+        Self { inner, prefix, pos: 0 }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for PrefixedReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        // 先消费前缀缓冲。
+        if self.pos < self.prefix.len() {
+            let n = std::cmp::min(buf.remaining(), self.prefix.len() - self.pos);
+            buf.put_slice(&self.prefix[self.pos..self.pos + n]);
+            self.pos += n;
+            return Poll::Ready(Ok(()));
+        }
+        // 前缀耗尽后透传到内部读取器。
+        Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 
@@ -224,5 +305,23 @@ mod tests {
         let conn = TcpConnection::new(stream);
         let _ = conn.into_inner();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn prefixed_reader_replays_prefix_then_passthrough() {
+        use tokio::io::AsyncReadExt;
+        // inner reader: 20 bytes (0..20)
+        let inner = std::io::Cursor::new((0u8..20).collect::<Vec<_>>());
+        // sniffer 缓存了前 5 字节，用 PrefixedReader 包装
+        let prefix = vec![100, 101, 102];
+        let mut reader = PrefixedReader::new(inner, prefix);
+        let mut buf = [0u8; 25];
+        let n = reader.read(&mut buf).await.unwrap();
+        assert_eq!(n, 3); // 只返回 prefix
+        assert_eq!(&buf[..3], &[100, 101, 102]);
+        // 后续读从 inner 开始
+        let n2 = reader.read(&mut buf).await.unwrap();
+        assert_eq!(n2, 20); // inner 的 20 字节
+        assert_eq!(&buf[..20], &(0u8..20).collect::<Vec<_>>());
     }
 }

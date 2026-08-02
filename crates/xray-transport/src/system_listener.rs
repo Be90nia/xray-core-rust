@@ -25,9 +25,7 @@ use crate::sockopt::{SocketOptions, apply_inbound_socket_options};
 use crate::listener::Listener;
 #[cfg(unix)]
 use std::path::PathBuf;
-#[cfg(unix)]
 use std::task::{Context, Poll};
-#[cfg(unix)]
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[cfg(unix)]
 use tokio::net::{UnixListener as TokioUnixListener, UnixStream};
@@ -62,6 +60,8 @@ pub struct DefaultListener {
     inner: TokioTcpListener,
     sockopt: SocketOptions,
     controllers: Vec<ListenerController>,
+    /// 是否在 accept 后读取 PROXY protocol header（对应 Go `AcceptProxyProtocol`）。
+    accept_proxy_protocol: bool,
 }
 
 impl DefaultListener {
@@ -75,6 +75,7 @@ impl DefaultListener {
             inner,
             sockopt,
             controllers: Vec::new(),
+            accept_proxy_protocol: false,
         })
     }
 
@@ -84,7 +85,16 @@ impl DefaultListener {
             inner,
             sockopt,
             controllers: Vec::new(),
+            accept_proxy_protocol: false,
         }
+    }
+
+    /// 启用/禁用 PROXY protocol 支持。对应 Go `ListenConfig.AcceptProxyProtocol`。
+    /// 启用后，accept 时先读取 PROXY protocol header 提取真实源地址。
+    #[must_use]
+    pub fn with_accept_proxy_protocol(mut self, enabled: bool) -> Self {
+        self.accept_proxy_protocol = enabled;
+        self
     }
 
     /// 添加 fd 控制器。对应 Go `effectiveListener.controllers = append(...)`。
@@ -128,9 +138,26 @@ impl SystemListener for DefaultListener {
 
             // 转回 tokio TcpStream 用于异步 IO。
             let tcp_stream = tokio::net::TcpStream::from_std(socket.into())?;
-            // ponytail: peer 地址通过 TcpConnection::remote_addr 暴露。
-            let _ = peer;
-            Ok(Box::new(TcpConnection::new(tcp_stream)) as Box<dyn Connection>)
+            // PROXY protocol：启用时先读取 PROXY header 提取真实源地址。
+            let conn: Box<dyn Connection> = if self.accept_proxy_protocol {
+                use tokio::io::AsyncReadExt;
+                let mut stream = tcp_stream;
+                match crate::proxy_protocol::read_proxy_protocol(&mut stream).await {
+                    Ok(Some(real_peer)) => {
+                        tracing::debug!(proxy_peer = %real_peer, tcp_peer = %peer, "PROXY protocol resolved");
+                        Box::new(ProxiedConnection::new(TcpConnection::new(stream), real_peer))
+                    }
+                    Ok(None) => {
+                        tracing::debug!(tcp_peer = %peer, "PROXY protocol UNKNOWN");
+                        Box::new(TcpConnection::new(stream))
+                    }
+                    Err(e) => return Err(e),
+                }
+            } else {
+                let _ = peer;
+                Box::new(TcpConnection::new(tcp_stream))
+            };
+            Ok(conn)
         })
     }
 
@@ -139,6 +166,60 @@ impl SystemListener for DefaultListener {
     }
 }
 
+
+/// PROXY protocol 连接包装器。
+///
+/// 包装 `TcpConnection`，覆盖 `remote_addr` 返回 PROXY protocol 提取的真实源地址。
+/// 对应 Go `proxyproto.Addr` 包装 `net.Conn` 的模式。
+pub struct ProxiedConnection {
+    inner: TcpConnection,
+    remote: Option<SocketAddr>,
+}
+
+impl ProxiedConnection {
+    #[must_use]
+    pub fn new(inner: TcpConnection, remote: SocketAddr) -> Self {
+        Self { inner, remote: Some(remote) }
+    }
+}
+
+impl AsyncRead for ProxiedConnection {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ProxiedConnection {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl Connection for ProxiedConnection {
+    fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+        Ok(self.remote)
+    }
+
+    fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+        self.inner.local_addr()
+    }
+}
 
 // ===== 全局 effective listener + listen_system =====
 
