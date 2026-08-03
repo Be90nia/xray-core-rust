@@ -14,9 +14,11 @@
 //! - TLS 包装层
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -30,9 +32,41 @@ use xray_common::net::network::Network as CommonNetwork;
 use xray_common::net::port::Port;
 use xray_features::inbound::{InboundError, InboundHandler};
 
+use crate::fallback::FallbackPolicy;
 use crate::protocol::{addr_type, Network, COMMAND_TCP, CRLF};
 use crate::validator::{MemoryUser, Validator};
 use xray_transport::link::Link;
+
+/// 包装流，记录所有读取字节用于 fallback 回放。
+struct RecordingStream<S> {
+    inner: S,
+    buf: Vec<u8>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for RecordingStream<S> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, dst: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = dst.filled().len();
+        let r = Pin::new(&mut this.inner).poll_read(cx, dst);
+        let after = dst.filled().len();
+        if after > before {
+            this.buf.extend_from_slice(&dst.filled()[before..after]);
+        }
+        r
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for RecordingStream<S> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
 
 /// Trojan 入站服务器。
 ///
@@ -42,6 +76,8 @@ pub struct TrojanServer {
     tag: String,
     /// 用户验证器（共享）。
     validator: Arc<Validator>,
+    /// Fallback 决策树（可选）。
+    fallbacks: Option<Arc<FallbackPolicy>>,
     /// 监听器 + accept loop 任务句柄。close 时 abort 任务取消 accept().
     slot: Mutex<Option<(Arc<TcpListener>, JoinHandle<()>)>>,
 }
@@ -53,8 +89,16 @@ impl TrojanServer {
         Self {
             tag: tag.into(),
             validator,
+            fallbacks: None,
             slot: Mutex::new(None),
         }
+    }
+
+    /// 设置 fallback 决策树。
+    #[must_use]
+    pub fn with_fallbacks(mut self, fallbacks: Arc<FallbackPolicy>) -> Self {
+        self.fallbacks = Some(fallbacks);
+        self
     }
 
     /// Handler 标签。
@@ -89,15 +133,21 @@ impl InboundHandler for TrojanServer {
 
         let tag = self.tag.clone();
         let validator = self.validator.clone();
+        let fallbacks = self.fallbacks.clone();
         let listener_clone = Arc::clone(&listener);
         let handle = tokio::spawn(async move {
             loop {
                 match listener_clone.accept().await {
-                    Ok((mut stream, peer)) => {
+                    Ok((stream, peer)) => {
                         let tag = tag.clone();
                         let validator = validator.clone();
+                        let fallbacks = fallbacks.clone();
                         tokio::spawn(async move {
-                            match trojan_server_handshake(&mut stream, &validator).await {
+                            let mut recorder = RecordingStream {
+                                inner: stream,
+                                buf: Vec::with_capacity(256),
+                            };
+                            match trojan_server_handshake(&mut recorder, &validator).await {
                                 Ok((network, addr, port, user)) => {
                                     info!(
                                         tag = %tag,
@@ -111,6 +161,14 @@ impl InboundHandler for TrojanServer {
                                 }
                                 Err(e) => {
                                     warn!(tag = %tag, peer = %peer, error = %e, "Trojan handshake failed");
+                                    if let Some(fb_policy) = &fallbacks {
+                                        // ponytail: SNI/ALPN/path 来自 TLS 层，当前未接线，用空字符串通配匹配
+                                        if let Some(fb) = fb_policy.decide("", "", "") {
+                                            if let Err(e) = do_fallback(recorder, &fb.dest).await {
+                                                warn!(tag = %tag, peer = %peer, error = %e, "fallback failed");
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         });
@@ -271,36 +329,53 @@ where
 }
 
 // ============================================================================
-// serve_trojan：对齐 serve_socks5 的入站服务入口（accept → handshake → dispatch）
+// do_fallback: handshake failure redirect
 // ============================================================================
 
-/// Trojan 入站服务入口（与 `xray_core::inbound::serve_socks5` 对齐）。
+/// Replay recorded bytes + pipe remaining stream to fallback destination.
 ///
-/// 绑定已建立的 TCP listener，每个连接 spawn 独立 task：
-/// 1. `trojan_server_handshake` 读 56 字节 hex key → 查 validator → 解析 cmd/addr/port
-/// 2. TCP CONNECT（`Network::Tcp`）转 `Destination`，构造 `Link`
-/// 3. `ohm` 的 default handler `dispatch(dest, link)` 拨号并桥接
+/// Corresponds to Go `proxy/trojan/server.go` fallback dial + `io.Copy` bridge.
+async fn do_fallback<S>(recorder: RecordingStream<S>, dest: &str) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let mut fallback = tokio::net::TcpStream::connect(dest).await?;
+    if !recorder.buf.is_empty() {
+        fallback.write_all(&recorder.buf).await?;
+    }
+    let (mut ori_r, mut ori_w) = tokio::io::split(recorder.inner);
+    let (mut fb_r, mut fb_w) = tokio::io::split(fallback);
+    tokio::try_join!(
+        async { tokio::io::copy(&mut ori_r, &mut fb_w).await },
+        async { tokio::io::copy(&mut fb_r, &mut ori_w).await },
+    )?;
+    Ok(())
+}
+
+// ============================================================================
+// serve_trojan
+// ============================================================================
+
+/// Trojan inbound entry point (aligns with `xray_core::inbound::serve_socks5`).
 ///
-/// UDP 命令（`Network::Udp`）当前只 warn 跳过（切片3 待实现）。
+/// # Parameters
+/// - `listener`: bound TCP listener
+/// - `ohm`: outbound handler manager (must have default handler)
+/// - `users`: user map, key = `MemoryUser::key_hash()`
+/// - `fallbacks`: optional fallback policy for handshake-failure redirect
 ///
-/// # 参数
-/// - `listener`：已绑定的 TCP listener
-/// - `ohm`：出站管理器（至少有 default handler）
-/// - `users`：用户表，key 应等于 `MemoryUser::key_hash()`（即 `hex_string(hex_sha224(password))`）
-///
-/// # 错误
-/// 仅 `listener.local_addr()` 失败时返回错误；accept/handshake/dispatch 错误只 log 不中断循环。
+/// # Errors
+/// Only `listener.local_addr()` failure returns error; accept/handshake/dispatch errors log and continue.
 pub async fn serve_trojan(
     listener: TcpListener,
     ohm: Arc<SimpleOhm>,
     users: HashMap<String, MemoryUser>,
+    fallbacks: Option<Arc<FallbackPolicy>>,
 ) -> std::io::Result<()> {
     let handler = ohm
         .get_default_handler()
         .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
 
-    // 复用 Validator 的 key 索引——把 HashMap 转成 Validator，避免重写 header 解析。
-    // email 冲突时 skip 并 warn（不影响其他用户）。
     let validator = Arc::new(Validator::new());
     for (_, user) in users {
         if let Err(e) = validator.add(user) {
@@ -315,7 +390,7 @@ pub async fn serve_trojan(
     );
 
     loop {
-        let (mut stream, peer) = match listener.accept().await {
+        let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, "trojan accept failed");
@@ -325,31 +400,34 @@ pub async fn serve_trojan(
 
         let handler = Arc::clone(&handler);
         let validator = Arc::clone(&validator);
+        let fb_policy = fallbacks.clone();
         tokio::spawn(async move {
-            match trojan_server_handshake(&mut stream, &validator).await {
+            let mut recorder = RecordingStream {
+                inner: stream,
+                buf: Vec::with_capacity(256),
+            };
+            match trojan_server_handshake(&mut recorder, &validator).await {
                 Ok((network, addr, port, user)) => {
                     if matches!(network, Network::Udp) {
-                        warn!(
-                            peer = %peer,
-                            "trojan UDP command not yet supported, closing connection"
-                        );
+                        warn!(peer = %peer, "trojan UDP not yet supported");
                         return;
                     }
                     let dest = Destination::new(addr, Port::new(port), CommonNetwork::TCP);
-                    // ponytail: tokio::io::split 返回 ReadHalf/WriteHalf 是 'static + Send，
-                    // new_reader/new_writer 接受 AsyncRead/AsyncWrite + Unpin + Send + 'static。
-                    let (read_half, write_half) = tokio::io::split(stream);
+                    let (read_half, write_half) = tokio::io::split(recorder.inner);
                     let link = Link::new(new_reader(read_half), new_writer(write_half));
-                    info!(
-                        peer = %peer,
-                        user = %user.email,
-                        dest = %dest,
-                        "trojan dispatching"
-                    );
+                    info!(peer = %peer, user = %user.email, dest = %dest, "trojan dispatching");
                     let _ = handler.dispatch(&dest, link).await;
                 }
                 Err(e) => {
                     warn!(peer = %peer, error = %e, "trojan handshake failed");
+                    if let Some(fb_policy) = &fb_policy {
+                        // ponytail: SNI/ALPN/path from TLS layer not wired yet; use wildcard
+                        if let Some(fb) = fb_policy.decide("", "", "") {
+                            if let Err(e) = do_fallback(recorder, &fb.dest).await {
+                                warn!(peer = %peer, error = %e, "fallback failed");
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -600,7 +678,7 @@ mod tests {
         let trojan_addr = trojan_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         tokio::spawn(async move {
-            let _ = serve_trojan(trojan_listener, ohm_clone, users).await;
+            let _ = serve_trojan(trojan_listener, ohm_clone, users, None).await;
         });
 
         // 5. trojan client：构造 header + payload

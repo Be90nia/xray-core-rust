@@ -42,19 +42,10 @@ pub use inbound::serve_vmess;
 /// VMess 协议版本号（对应 Go 的 `encoding.Version` 常量）。
 pub const VERSION: u8 = 1;
 
-/// 请求选项位（对应 Go `protocol.RequestOption*`，VMess 复用同一组位定义）。
-pub mod request_option {
-    /// Chunk stream：body 以 length-prefixed chunk 传输。
-    pub const CHUNK_STREAM: u8 = 0x01;
-    /// Chunk masking：chunk length 字段用 ShakeSizeParser 异或掩码。
-    pub const CHUNK_MASKING: u8 = 0x04;
-    /// Global padding：chunk 间插入 padding。
-    pub const GLOBAL_PADDING: u8 = 0x08;
-    /// Authenticated length：length 字段单独 AEAD 加密。
-    pub const AUTHENTICATED_LENGTH: u8 = 0x10;
-    /// NoTerminationSignal：不写终止 chunk，靠连接关闭判断流结束。
-    pub const NO_TERMINATION_SIGNAL: u8 = 0x80;
-}
+/// 请求选项位——从 `xray_common::protocol` 重新导出以保持向后兼容。
+///
+/// 新代码应直接使用 `xray_common::protocol::request_option::*`。
+pub use xray_common::protocol::request_option;
 
 /// 请求命令（与 `xray_common::protocol::Command` 同值，但 VMess 协议层用本枚举
 /// 显式表达，避免 Go 端 `RequestCommand` 在 `protocol` 和 `vmess` 包间重复定义）。

@@ -296,6 +296,26 @@ impl std::hash::Hash for ID {
     }
 }
 
+// ========== 请求选项位 ==========
+
+/// 请求选项位常量（对应 Go `protocol.RequestOption*`）。
+///
+/// 这些位定义了 `RequestHeader.option` 字段中各位的含义。
+/// 虽然主要用于 VMess，但定义在 `common/protocol` 包以保持与 Go 版本一致。
+pub mod request_option {
+    /// Chunk stream：body 以 length-prefixed chunk 传输。
+    pub const CHUNK_STREAM: u8 = 0x01;
+    /// Chunk masking：chunk length 字段用 ShakeSizeParser 异或掩码。
+    pub const CHUNK_MASKING: u8 = 0x04;
+    /// Global padding：chunk 间插入 padding。
+    pub const GLOBAL_PADDING: u8 = 0x08;
+    /// Authenticated length：length 字段单独 AEAD 加密。
+    pub const AUTHENTICATED_LENGTH: u8 = 0x10;
+    /// NoTerminationSignal：不写终止 chunk，靠连接关闭判断流结束。
+    pub const NO_TERMINATION_SIGNAL: u8 = 0x80;
+}
+
+
 // ========== 请求头 ==========
 
 /// 协议请求头。

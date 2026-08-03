@@ -249,6 +249,17 @@ pub trait OutboundRegistrar: Send + Sync {
     fn add_outbound_handler(&self, handler: Arc<dyn OutboundHandler>) -> Result<(), ProxymanError>;
 }
 
+/// Inbound 移除器（让 HandlerService 能实际移除 handler）
+pub trait InboundRemover: Send + Sync {
+    /// 按 tag 移除 inbound handler（Go `ihm.RemoveHandler`）
+    fn remove_inbound_handler(&self, tag: &str) -> Result<(), ProxymanError>;
+}
+
+/// Outbound 移除器
+pub trait OutboundRemover: Send + Sync {
+    fn remove_outbound_handler(&self, tag: &str) -> Result<(), ProxymanError>;
+}
+
 /// 默认 HandlerService 实现（对应 Go `handlerServer struct`）
 pub struct DefaultHandlerService {
     /// 入站 handler 提供方（对应 Go `ihm inbound.Manager`）
@@ -259,6 +270,10 @@ pub struct DefaultHandlerService {
     pub inbound_registrar: Option<Arc<dyn InboundRegistrar>>,
     /// 出站注册器
     pub outbound_registrar: Option<Arc<dyn OutboundRegistrar>>,
+    /// 入站移除器（对应 Go `ihm.RemoveHandler`）
+    pub inbound_remover: Option<Arc<dyn InboundRemover>>,
+    /// 出站移除器
+    pub outbound_remover: Option<Arc<dyn OutboundRemover>>,
     /// TypedMessage 操作解码器
     pub op_decoder: Option<Arc<dyn OperationDecoder>>,
 }
@@ -270,6 +285,8 @@ impl Default for DefaultHandlerService {
             outbound_provider: None,
             inbound_registrar: None,
             outbound_registrar: None,
+            inbound_remover: None,
+            outbound_remover: None,
             op_decoder: None,
         }
     }
@@ -282,6 +299,8 @@ impl std::fmt::Debug for DefaultHandlerService {
             .field("has_outbound_provider", &self.outbound_provider.is_some())
             .field("has_inbound_registrar", &self.inbound_registrar.is_some())
             .field("has_outbound_registrar", &self.outbound_registrar.is_some())
+            .field("has_inbound_remover", &self.inbound_remover.is_some())
+            .field("has_outbound_remover", &self.outbound_remover.is_some())
             .field("has_op_decoder", &self.op_decoder.is_some())
             .finish()
     }
@@ -333,11 +352,14 @@ impl HandlerService for DefaultHandlerService {
             .inbound_provider
             .as_ref()
             .ok_or_else(|| ProxymanError::Other("inbound provider not set".into()))?;
-        // 检查存在性（Go 通过 ihm.RemoveHandler 的返回值）
+        // 检查存在性
         if provider.get_inbound(&req.tag).is_none() {
             return Err(ProxymanError::HandlerNotFound(req.tag.clone()));
         }
-        // ponytail: 实际 manager.remove_handler 调用待 InboundRemover trait 注入；目前只校验存在
+        // 实际移除：委托 InboundRemover
+        if let Some(remover) = &self.inbound_remover {
+            remover.remove_inbound_handler(&req.tag)?;
+        }
         Ok(RemoveInboundResponse {})
     }
 
@@ -361,14 +383,24 @@ impl HandlerService for DefaultHandlerService {
             .as_ref()
             .ok_or_else(|| ProxymanError::Other("inbound provider not set".into()))?;
         let mut resp = ListInboundsResponse::default();
-        for (tag, _recv_url, _proxy_url) in provider.list_inbound_tags() {
+        for (tag, recv_url, proxy_url) in provider.list_inbound_tags() {
             let mut cfg = xray_proto::xray::core::InboundHandlerConfig::default();
             cfg.tag = tag;
-            // ponytail: 完整 ReceiverSettings/ProxySettings 序列化为 TypedMessage 留 TODO
-            // if req.is_only_tags=false 时应填充，当前只填 tag
+            if !req.is_only_tags {
+                // 填充 receiver/proxy type_url（完整 TypedMessage 序列化需上层注入，当前填 type_url）
+                if let Some(url) = &recv_url {
+                    cfg.receiver_settings = Some(xray_proto::xray::common::serial::TypedMessage {
+                        r#type: url.clone(),
+                        value: Vec::new(),
+                    });
+                }
+                cfg.proxy_settings = Some(xray_proto::xray::common::serial::TypedMessage {
+                    r#type: proxy_url,
+                    value: Vec::new(),
+                });
+            }
             resp.inbounds.push(cfg);
         }
-        let _ = req.is_only_tags; // 标记使用避免 unused 警告；当前实现总是只返回 tag
         Ok(resp)
     }
 
@@ -436,6 +468,10 @@ impl HandlerService for DefaultHandlerService {
         if provider.get_outbound(&req.tag).is_none() {
             return Err(ProxymanError::HandlerNotFound(req.tag.clone()));
         }
+        // 实际移除：委托 OutboundRemover
+        if let Some(remover) = &self.outbound_remover {
+            remover.remove_outbound_handler(&req.tag)?;
+        }
         Ok(RemoveOutboundResponse {})
     }
 
@@ -465,9 +501,20 @@ impl HandlerService for DefaultHandlerService {
             .as_ref()
             .ok_or_else(|| ProxymanError::Other("outbound provider not set".into()))?;
         let mut resp = ListOutboundsResponse::default();
-        for (tag, _send_url, _proxy_url) in provider.list_outbound_tags() {
+        for (tag, send_url, proxy_url) in provider.list_outbound_tags() {
             let mut cfg = xray_proto::xray::core::OutboundHandlerConfig::default();
             cfg.tag = tag;
+            // ListOutboundsRequest 无 is_only_tags 字段，总是返回完整配置
+            if let Some(url) = &send_url {
+                cfg.sender_settings = Some(xray_proto::xray::common::serial::TypedMessage {
+                    r#type: url.clone(),
+                    value: Vec::new(),
+                });
+            }
+            cfg.proxy_settings = Some(xray_proto::xray::common::serial::TypedMessage {
+                r#type: proxy_url,
+                value: Vec::new(),
+            });
             resp.outbounds.push(cfg);
         }
         Ok(resp)
@@ -848,5 +895,150 @@ mod tests {
             Err(e) => panic!("expected Other, got: {e}"),
     Ok(_) => panic!("expected error, got Ok"),
         }
+    }
+
+    // ========== remove/list 完整测试 ==========
+
+    struct StubInboundRemover {
+        removed: Mutex<Vec<String>>,
+    }
+    impl InboundRemover for StubInboundRemover {
+        fn remove_inbound_handler(&self, tag: &str) -> Result<(), ProxymanError> {
+            self.removed.lock().push(tag.to_string());
+            Ok(())
+        }
+    }
+
+    struct StubOutboundRemover {
+        removed: Mutex<Vec<String>>,
+    }
+    impl OutboundRemover for StubOutboundRemover {
+        fn remove_outbound_handler(&self, tag: &str) -> Result<(), ProxymanError> {
+            self.removed.lock().push(tag.to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn remove_inbound_calls_remover_when_set() {
+        let h = make_stub_inbound("in1");
+        let remover = Arc::new(StubInboundRemover { removed: Mutex::new(vec![]) });
+        let svc = DefaultHandlerService {
+            inbound_provider: Some(Arc::new(StubInboundProvider {
+                handlers: Mutex::new(vec![h.clone()]),
+            })),
+            inbound_remover: Some(remover.clone()),
+            ..Default::default()
+        };
+        svc.remove_inbound(RemoveInboundRequest { tag: "in1".into() }).unwrap();
+        assert_eq!(remover.removed.lock().len(), 1);
+        assert_eq!(remover.removed.lock()[0], "in1");
+    }
+
+    #[test]
+    fn remove_inbound_succeeds_without_remover() {
+        // 无 remover 时仍返回 Ok（兼容只校验存在的场景）
+        let h = make_stub_inbound("in2");
+        let svc = make_service_with_inbound(h);
+        svc.remove_inbound(RemoveInboundRequest { tag: "in2".into() }).unwrap();
+    }
+
+    #[test]
+    fn list_inbounds_full_config_when_not_only_tags() {
+        let h = make_stub_inbound("full");
+        let svc = DefaultHandlerService {
+            inbound_provider: Some(Arc::new(StubInboundProvider {
+                handlers: Mutex::new(vec![h.clone()]),
+            })),
+            ..Default::default()
+        };
+        let resp = svc.list_inbounds(ListInboundsRequest { is_only_tags: false }).unwrap();
+        assert_eq!(resp.inbounds.len(), 1);
+        let cfg = &resp.inbounds[0];
+        assert_eq!(cfg.tag, "full");
+        // proxy_settings 应被填充
+        assert!(cfg.proxy_settings.is_some());
+        assert_eq!(cfg.proxy_settings.as_ref().unwrap().r#type, "xray.test");
+    }
+
+    #[test]
+    fn list_inbounds_only_tags_when_requested() {
+        let h = make_stub_inbound("tagonly");
+        let svc = DefaultHandlerService {
+            inbound_provider: Some(Arc::new(StubInboundProvider {
+                handlers: Mutex::new(vec![h.clone()]),
+            })),
+            ..Default::default()
+        };
+        let resp = svc.list_inbounds(ListInboundsRequest { is_only_tags: true }).unwrap();
+        assert_eq!(resp.inbounds.len(), 1);
+        assert!(resp.inbounds[0].proxy_settings.is_none());
+        assert!(resp.inbounds[0].receiver_settings.is_none());
+    }
+
+    // ========== Outbound 测试 ==========
+
+    struct StubOutboundHandler {
+        tag: String,
+    }
+    impl crate::outbound::OutboundHandler for StubOutboundHandler {
+        fn tag(&self) -> &str { &self.tag }
+        fn start(&self) -> crate::inbound::PinFuture<Result<(), ProxymanError>> { Box::pin(async { Ok(()) }) }
+        fn close(&self) -> crate::inbound::PinFuture<Result<(), ProxymanError>> { Box::pin(async { Ok(()) }) }
+        fn sender_type_url(&self) -> Option<&str> { Some("sender_url") }
+        fn proxy_type_url(&self) -> &str { "xray.test.outbound" }
+        fn dispatch(&self, _session: xray_common::session::Session, _link: xray_transport::link::Link) -> crate::inbound::PinFuture<Result<(), ProxymanError>> { Box::pin(async { Ok(()) }) }
+        fn dial(&self, _dest: &xray_common::net::destination::Destination) -> crate::inbound::PinFuture<std::io::Result<Box<dyn xray_transport::connection::Connection>>> { Box::pin(async { Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "stub")) }) }
+    }
+
+    struct StubOutboundProvider {
+        handlers: Mutex<Vec<Arc<StubOutboundHandler>>>,
+    }
+    impl OutboundHandlerProvider for StubOutboundProvider {
+        fn get_outbound_with_um(&self, tag: &str) -> Option<Arc<dyn OutboundHandlerWithUserManager>> { None }
+        fn get_outbound(&self, tag: &str) -> Option<Arc<dyn crate::outbound::OutboundHandler>> {
+            self.handlers.lock().iter().find(|h| h.tag() == tag).cloned()
+                .map(|h| h as Arc<dyn crate::outbound::OutboundHandler>)
+        }
+        fn list_outbound_tags(&self) -> Vec<(String, Option<String>, String)> {
+            self.handlers.lock().iter()
+                .map(|h| (h.tag().to_string(), Some("sender_url".into()), h.proxy_type_url().to_string()))
+                .collect()
+        }
+    }
+
+    #[test]
+    fn remove_outbound_calls_remover_when_set() {
+        let provider = Arc::new(StubOutboundProvider {
+            handlers: Mutex::new(vec![Arc::new(StubOutboundHandler { tag: "out1".into() })]),
+        });
+        let remover = Arc::new(StubOutboundRemover { removed: Mutex::new(vec![]) });
+        let svc = DefaultHandlerService {
+            outbound_provider: Some(provider),
+            outbound_remover: Some(remover.clone()),
+            ..Default::default()
+        };
+        svc.remove_outbound(RemoveOutboundRequest { tag: "out1".into() }).unwrap();
+        assert_eq!(remover.removed.lock().len(), 1);
+        assert_eq!(remover.removed.lock()[0], "out1");
+    }
+
+    #[test]
+    fn list_outbounds_returns_full_config() {
+        let provider = Arc::new(StubOutboundProvider {
+            handlers: Mutex::new(vec![Arc::new(StubOutboundHandler { tag: "out_full".into() })]),
+        });
+        let svc = DefaultHandlerService {
+            outbound_provider: Some(provider),
+            ..Default::default()
+        };
+        let resp = svc.list_outbounds(ListOutboundsRequest::default()).unwrap();
+        assert_eq!(resp.outbounds.len(), 1);
+        let cfg = &resp.outbounds[0];
+        assert_eq!(cfg.tag, "out_full");
+        assert!(cfg.sender_settings.is_some());
+        assert_eq!(cfg.sender_settings.as_ref().unwrap().r#type, "sender_url");
+        assert!(cfg.proxy_settings.is_some());
+        assert_eq!(cfg.proxy_settings.as_ref().unwrap().r#type, "xray.test.outbound");
     }
 }

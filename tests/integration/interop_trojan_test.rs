@@ -166,7 +166,7 @@ async fn rust_trojan_server_go_client() {
     let rust_trojan_port = trojan_listener.local_addr().expect("local addr").port();
     let ohm_clone = Arc::clone(&ohm);
     tokio::spawn(async move {
-        let _ = serve_trojan(trojan_listener, ohm_clone, users).await;
+        let _ = serve_trojan(trojan_listener, ohm_clone, users, None).await;
     });
 
     // Configure Go xray: SOCKS5 inbound -> Trojan outbound -> Rust server

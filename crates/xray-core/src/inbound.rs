@@ -26,7 +26,7 @@ use xray_conf::{BuiltConfig, BuiltInbound};
 // P1-B: vless/trojan inbound 集成
 use std::collections::HashMap;
 use xray_proto::xray::proxy::vless::Account as VlessProtoAccount;
-use xray_proxy_trojan::{serve_trojan, MemoryAccount as TrojanMemoryAccount, MemoryUser as TrojanMemoryUser};
+use xray_proxy_trojan::{serve_trojan, MemoryAccount as TrojanMemoryAccount, MemoryUser as TrojanMemoryUser, fallback::{Fallback, FallbackPolicy}};
 use xray_proxy_vless::{serve_vless, MemoryAccount as VlessMemoryAccount, MemoryUser as VlessMemoryUser, MemoryValidator as VlessMemoryValidator, Validator as VlessValidator};
 use xray_proxy_vmess::{serve_vmess, MemoryAccount as VmessMemoryAccount, MemoryUser as VmessMemoryUser, TimedUserValidator as VmessTimedUserValidator, Validator as VmessValidator};
 use xray_common::uuid::UUID;
@@ -490,10 +490,28 @@ async fn spawn_one_inbound(
         }
         "trojan" => {
             let users = build_trojan_users(&ib.entry.data)?;
+            // Trojan fallback：解析 JSON fallbacks 数组构建决策树
+            let fallbacks = serde_json::from_slice::<serde_json::Value>(&ib.entry.data)
+                .ok()
+                .and_then(|v| v.get("fallbacks").cloned())
+                .and_then(|fbs| serde_json::from_value::<Vec<serde_json::Value>>(fbs).ok())
+                .map(|fbs| {
+                    let list: Vec<Fallback> = fbs.into_iter().filter_map(|fb| {
+                        Some(Fallback {
+                            name: fb.get("name").and_then(|v| v.as_str()).unwrap_or("").into(),
+                            alpn: fb.get("alpn").and_then(|v| v.as_str()).unwrap_or("").into(),
+                            path: fb.get("path").and_then(|v| v.as_str()).unwrap_or("").into(),
+                            dest: fb.get("dest").and_then(|v| v.as_str()).unwrap_or("127.0.0.1:80").into(),
+                            xver: fb.get("xver").and_then(|v| v.as_u64()).unwrap_or(0),
+                        })
+                    }).collect();
+                    if list.is_empty() { None } else { Some(FallbackPolicy::from_list(&list)) }
+                })
+                .flatten();
             let listener = TcpListener::bind(&addr).await?;
             tracing::info!(tag = %ib.tag, addr = %addr, users = users.len(), "trojan inbound listening");
             let handle = tokio::spawn(async move {
-                if let Err(e) = serve_trojan(listener, ohm, users).await {
+                if let Err(e) = serve_trojan(listener, ohm, users, fallbacks).await {
                     tracing::error!(error = %e, "trojan inbound stopped");
                 }
             });
