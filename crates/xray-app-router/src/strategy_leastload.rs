@@ -17,7 +17,14 @@ use crate::error::RouterError;
 use crate::weight::WeightManager;
 #[cfg(test)]
 use xray_proto::xray::core::app::observatory::ObservationResult;
+use xray_proto::xray::core::app::observatory::OutboundStatus;
 use xray_proto::xray::app::router::StrategyLeastLoadConfig;
+
+
+/// 有效 RTT：优先 health_ping.average，回退 delay。
+fn effective_rtt(s: &OutboundStatus) -> i64 {
+    s.health_ping.as_ref().filter(|h| h.average > 0).map(|h| h.average).unwrap_or(s.delay)
+}
 
 /// 最小负载负载均衡策略。
 pub struct LeastLoadStrategy {
@@ -75,23 +82,24 @@ impl LeastLoadStrategy {
             if !selected.iter().any(|t| t == &status.outbound_tag) {
                 continue;
             }
-            if status.delay <= 0 {
+            let rtt = effective_rtt(status);
+            if rtt <= 0 {
                 continue;
             }
-            if self.max_rtt > 0 && status.delay > self.max_rtt {
+            if self.max_rtt > 0 && rtt > self.max_rtt {
                 continue;
             }
-            // baselines 过滤：delay 必须在任一 baseline + tolerance 范围内
+            // baselines 过滤：RTT 必须在任一 baseline + tolerance 范围内
             if !self.baselines.is_empty() {
-                let tol_ns = (f64::from(self.tolerance) * status.delay as f64) as i64;
+                let tol_ns = (f64::from(self.tolerance) * rtt as f64) as i64;
                 let acceptable = self.baselines.iter().any(|b| {
-                    (status.delay - b).abs() <= tol_ns
+                    (rtt - b).abs() <= tol_ns
                 });
                 if !acceptable {
                     continue;
                 }
             }
-            nodes.push((status.outbound_tag.clone(), status.delay));
+            nodes.push((status.outbound_tag.clone(), rtt));
         }
         nodes.sort_by_key(|&(_, d)| d);
         Ok(nodes)
