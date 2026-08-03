@@ -9,6 +9,7 @@ description = "Xray-core protobuf type definitions (generated via prost)"
 [features]
 # 启用 gRPC client stub 生成（CLI 侧需要，commander server 侧不需要）
 grpc-client = ["dep:tonic", "dep:tonic-prost"]
+grpc-server = ["dep:tonic", "dep:tonic-prost"]
 
 [dependencies]
 prost = { workspace = true }

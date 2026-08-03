@@ -136,6 +136,13 @@ impl Feature for DefaultPolicyFeature {
     }
 }
 
+impl PolicyManager for DefaultPolicyFeature {
+    fn policy_for_level(&self, _level: u32) -> Policy {
+        Policy::default()
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

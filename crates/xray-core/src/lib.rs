@@ -35,6 +35,7 @@
 //! ```
 
 pub mod config;
+pub mod grpc_server;
 pub mod context;
 pub mod functions;
 pub mod instance;

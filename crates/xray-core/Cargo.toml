@@ -28,7 +28,7 @@ xray-proxy-loopback = { path = "../xray-proxy-loopback" }
 xray-mux = { path = "../xray-mux" }
 xray-buf = { path = "../xray-buf" }
 xray-transport = { path = "../xray-transport" }
-xray-proto = { path = "../xray-proto" }
+xray-proto = { path = "../xray-proto", features = ["grpc-server"] }
 xray-transport-hysteria = { path = "../xray-transport-hysteria" }
 xray-transport-grpc = { path = "../xray-transport-grpc" }
 xray-transport-httpupgrade = { path = "../xray-transport-httpupgrade" }
@@ -66,6 +66,7 @@ clap = { workspace = true }
 uuid = { workspace = true }
 anyhow = "1"
 rustls = { workspace = true }
+tonic = { workspace = true }
 webpki-roots = { workspace = true }
 tracing-subscriber = { workspace = true }
 

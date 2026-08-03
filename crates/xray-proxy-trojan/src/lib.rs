@@ -17,6 +17,7 @@
 //! 留给切片2。
 
 pub mod client;
+pub mod fallback;
 pub mod config;
 pub mod dispatcher;
 pub mod error;

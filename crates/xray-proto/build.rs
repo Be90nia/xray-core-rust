@@ -21,10 +21,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_paths: Vec<_> = proto_files.iter().map(|p| p.as_path()).collect();
 
     // 启用 grpc-client feature 时用 tonic-prost-build 生成消息类型 + gRPC client stub
-    if std::env::var("CARGO_FEATURE_GRPC_CLIENT").is_ok() {
+    let is_grpc_client = std::env::var("CARGO_FEATURE_GRPC_CLIENT").is_ok();
+    let is_grpc_server = std::env::var("CARGO_FEATURE_GRPC_SERVER").is_ok();
+
+    if is_grpc_client || is_grpc_server {
         tonic_prost_build::configure()
-            .build_server(false)
-            .build_client(true)
+            .build_server(is_grpc_server)
+            .build_client(is_grpc_client)
             .compile_protos(&proto_paths, &[&proto_dir])?;
     } else {
         prost_build::Config::new()

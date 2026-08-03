@@ -472,7 +472,8 @@ pub struct DefaultDispatcher {
     pub ohm: Option<Arc<dyn OutboundHandlerManager>>,
     /// 路由器（可选）
     pub router: Option<Arc<dyn RoutingRouter>>,
-    /// Policy manager 引用（暂留为 Policy 自身，避免引入 trait）
+    /// Policy manager（per-user 策略查询，对应 Go `policy.Manager`）。
+    pub policy_manager: Option<Arc<dyn xray_features::policy::PolicyManager>>,
     pub default_policy: xray_features::policy::Policy,
     /// Stats manager（对应 Go `stats.Manager`），用于按 tag 查 counter
     pub stats: Option<Arc<dyn xray_features::stats::Manager>>,
@@ -486,6 +487,7 @@ impl Debug for DefaultDispatcher {
             .field("has_ohm", &self.ohm.is_some())
             .field("has_router", &self.router.is_some())
             .field("has_stats", &self.stats.is_some())
+            .field("has_policy_manager", &self.policy_manager.is_some())
             .field("has_fdns", &self.fdns.is_some())
             .finish()
     }
@@ -507,6 +509,7 @@ impl DefaultDispatcher {
             default_policy: xray_features::policy::Policy::default(),
             stats: None,
             fdns: None,
+            policy_manager: None,
         }
     }
 
@@ -523,6 +526,14 @@ impl DefaultDispatcher {
         self.router = router;
         self.default_policy = default_policy;
         self.fdns = fdns;
+    }
+
+    /// 设置 Policy Manager。对应 Go `(*DefaultDispatcher).Init` 传入 `pm policy.Manager`。
+    ///
+    /// 设置后，dispatch 用 `policy_for_level(user_level)` 动态查询策略，
+    /// 而非使用硬编码 `default_policy`。当前 user_level 固定 0（dispatch 签名未携带用户信息）。
+    pub fn set_policy_manager(&mut self, pm: Arc<dyn xray_features::policy::PolicyManager>) {
+        self.policy_manager = Some(pm);
     }
 
     /// Start 钩子（空操作）。对应 Go `(*DefaultDispatcher).Start()`。
@@ -553,10 +564,14 @@ impl DefaultDispatcher {
         inbound_tag: Option<&str>,
         outbound_tag: Option<&str>,
     ) -> Result<xray_transport::link::Link, DispatcherError> {
-        // Go getLink：两对 pipe，方向与 Go 原版完全一致
-        // idle_timeout 对应 Go pipe.Option.Timeout — 读端空闲超时返回 EOF
+        // ponytail: policy_manager 存在时用 policy_for_level(0) 动态查询策略，
+        // 否则回退到 default_policy。per-user level 需 dispatch 签名变更（deferred）。
+        let policy = self
+            .policy_manager
+            .as_ref()
+            .map_or(self.default_policy.clone(), |pm| pm.policy_for_level(0));
         let pipe_opt = xray_buf::pipe::PipeOption {
-            idle_timeout: Some(self.default_policy.timeout.connection_idle),
+            idle_timeout: Some(policy.timeout.connection_idle),
             ..xray_buf::pipe::PipeOption::default()
         };
         let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
@@ -635,7 +650,11 @@ impl DefaultDispatcher {
         let router = self.router.clone();
         let fdns = self.fdns.clone();
         let ohm = Arc::clone(ohm);
-        let handshake_timeout = self.default_policy.timeout.handshake;
+        let policy = self
+            .policy_manager
+            .as_ref()
+            .map_or(self.default_policy.clone(), |pm| pm.policy_for_level(0));
+        let handshake_timeout = policy.timeout.handshake;
 
         let outbound_reader = outbound.reader;
         let outbound_writer = outbound.writer;
