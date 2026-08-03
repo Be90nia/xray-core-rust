@@ -235,6 +235,85 @@ impl OutboundHandlerSelector for NotImplementedSelector {
     }
 }
 
+// ── SimpleSelector / MemoryObservationProvider ──────────────
+
+/// 简单出站选择器：根据已知 tag 集过滤。
+///
+/// 对应 Go `outbound.HandlerSelector` 的基础实现。
+/// 持有 `RwLock<HashSet<String>>` 存储可用 tag，`select_outbounds` 返回交集。
+/// OHM 接入后用真实 handler 列表初始化。
+#[derive(Debug, Default)]
+pub struct SimpleSelector {
+    tags: RwLock<std::collections::HashSet<String>>,
+}
+
+impl SimpleSelector {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 从迭代器构造。
+    #[must_use]
+    pub fn from_tags<I, S>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            tags: RwLock::new(iter.into_iter().map(Into::into).collect()),
+        }
+    }
+
+    /// 运行时添加 tag。
+    pub fn add_tag(&self, tag: impl Into<String>) {
+        self.tags.write().insert(tag.into());
+    }
+
+    /// 运行时移除 tag。
+    pub fn remove_tag(&self, tag: &str) {
+        self.tags.write().remove(tag);
+    }
+}
+
+impl OutboundHandlerSelector for SimpleSelector {
+    fn select_outbounds(&self, selectors: &[String]) -> Result<Vec<String>, RouterError> {
+        let tags = self.tags.read();
+        Ok(selectors.iter().filter(|s| tags.contains(*s)).cloned().collect())
+    }
+}
+
+/// 内存观测提供器：外部 feed 观测结果，策略读取。
+///
+/// 对应 Go `extension.Observatory` 的内存实现。
+/// Observatory 扩展 ping 出站后将 `ObservationResult` 写入，
+/// LeastPing/LeastLoad 策略从此读取。
+#[derive(Debug, Default)]
+pub struct MemoryObservationProvider {
+    result: RwLock<Option<ObservationResult>>,
+}
+
+impl MemoryObservationProvider {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 更新观测结果（Observatory 扩展调用）。
+    pub fn update(&self, result: ObservationResult) {
+        *self.result.write() = Some(result);
+    }
+}
+
+impl ObservationProvider for MemoryObservationProvider {
+    fn get_observation(&self) -> Result<ObservationResult, RouterError> {
+        self.result
+            .read()
+            .clone()
+            .ok_or(RouterError::Other("no observation available".into()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,6 +342,41 @@ mod tests {
         let s = NotImplementedSelector;
         let r = s.select_outbounds(&["x".into()]);
         assert!(matches!(r, Err(RouterError::NotHandlerSelector)));
+    }
+
+    // ── SimpleSelector ──
+
+    #[test]
+    fn test_simple_selector_filters_known_tags() {
+        let s = SimpleSelector::from_tags(["a", "b", "c"]);
+        let r = s.select_outbounds(&["a".into(), "x".into(), "c".into()]).unwrap();
+        assert_eq!(r, vec!["a".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn test_simple_selector_add_remove() {
+        let s = SimpleSelector::new();
+        s.add_tag("out1");
+        s.add_tag("out2");
+        assert_eq!(s.select_outbounds(&["out1".into()]).unwrap().len(), 1);
+        s.remove_tag("out1");
+        assert!(s.select_outbounds(&["out1".into()]).unwrap().is_empty());
+    }
+
+    // ── MemoryObservationProvider ──
+
+    #[test]
+    fn test_memory_observation_no_data_returns_err() {
+        let p = MemoryObservationProvider::new();
+        assert!(p.get_observation().is_err());
+    }
+
+    #[test]
+    fn test_memory_observation_update_then_read() {
+        use xray_proto::xray::core::app::observatory::ObservationResult;
+        let p = MemoryObservationProvider::new();
+        p.update(ObservationResult::default());
+        assert!(p.get_observation().is_ok());
     }
 
     // ── Balancer override + fallback ──
