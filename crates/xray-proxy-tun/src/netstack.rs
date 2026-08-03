@@ -49,6 +49,8 @@ pub struct TunNetStack {
     iface: Interface,
     device: VirtualDevice,
     sockets: SocketSet<'static>,
+    /// ICMP socket handle（用于自动回复 echo request）。
+    icmp_handle: SocketHandle,
 }
 
 impl TunNetStack {
@@ -94,19 +96,21 @@ impl TunNetStack {
             }
         });
 
-        let mut stack = Self {
-            iface,
-            device,
-            // ponytail: SocketSet 用 Vec 作 backing storage，'static bound 由 alloc 满足
+let mut stack = Self {
+iface,
+device,
+// ponytail: SocketSet 用 Vec 作 backing storage，'static bound 由 alloc 满足
             sockets: SocketSet::new(Vec::new()),
-        };
+            icmp_handle: SocketHandle::default(),
+};
 
         // 自动创建 ICMP socket 并绑定到 ident 0——smoltcp 收到 ICMP echo request 时
         // 通过 ICMP socket 传递到上层（对应 Go stackGVisor 的 handleICMPEchoPacket）。
         // smoltcp 与 gVisor 不同：gVisor 在 netstack 层自动回复 echo request，
         // smoltcp 只通过 ICMP socket 传递，需在 driver loop 中手动构建 echo reply。
         // 详见 inbound::handle_icmp_echo_reply。
-        let _ = stack.add_icmp_socket();
+        let icmp_handle = stack.add_icmp_socket();
+        stack.icmp_handle = icmp_handle;
 
         stack
     }
@@ -131,6 +135,40 @@ impl TunNetStack {
                 break;
             }
         }
+    }
+
+    /// 处理 ICMP echo request 并自动回复 echo reply。
+    ///
+    /// smoltcp 与 gVisor 不同：gVisor netstack 层自动回复 echo request，
+    /// smoltcp 只通过 ICMP socket 传递 echo request 到上层。
+    /// 此方法在 poll() 后调用，读取所有待处理的 echo request 并构建 echo reply。
+    pub fn process_icmp_echo(&mut self) {
+        let mut buf = [0u8; ICMP_BUF_SIZE];
+        loop {
+            let socket = self.sockets.get_mut::<icmp::Socket<'static>>(self.icmp_handle);
+            let (n, remote) = match socket.recv_slice(&mut buf) {
+                Ok(result) => result,
+                Err(_) => break, // 无更多数据
+            };
+            let pkt = &buf[..n];
+            if pkt.len() < 8 {
+                continue;
+            }
+            // ICMP type 8 = Echo Request → 回复 type 0 = Echo Reply
+            if pkt[0] != 8 {
+                continue;
+            }
+            let mut reply = pkt.to_vec();
+            reply[0] = 0; // Echo Reply
+            reply[2] = 0;
+            reply[3] = 0;
+            let cksum = icmp_checksum(&reply);
+            reply[2..4].copy_from_slice(&cksum.to_be_bytes());
+            let socket = self.sockets.get_mut::<icmp::Socket<'static>>(self.icmp_handle);
+            let _ = socket.send_slice(&reply, remote);
+        }
+        // poll 一次让 smoltcp 把发送队列的包写进 tx_queue
+        self.iface.poll(Instant::now(), &mut self.device, &mut self.sockets);
     }
 
     /// 创建一个 TCP socket 加入 socket set，返回 handle。
@@ -516,6 +554,23 @@ pub fn to_smoltcp_v6(addr: std::net::Ipv6Addr) -> Ipv6Address {
     Ipv6Address::from_octets(addr.octets())
 }
 
+/// ICMP 校验和计算（RFC 792，与 IP 校验和算法相同）。
+fn icmp_checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < data.len() {
+        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < data.len() {
+        sum += (data[i] as u32) << 8;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,8 +623,8 @@ mod tests {
         pkt[2..4].copy_from_slice(&28u16.to_be_bytes()); // total length
         pkt[8] = 64; // TTL
         pkt[9] = 1; // protocol = ICMP
-        pkt[12..16].copy_from_slice(&[10, 0, 0, 1]); // src
-        pkt[16..20].copy_from_slice(&[10, 0, 0, 2]); // dst
+        pkt[12..16].copy_from_slice(&[10, 0, 0, 2]); // src = 外部主机
+        pkt[16..20].copy_from_slice(&[10, 0, 0, 1]); // dst = 本地接口地址
         pkt[20] = 8; // ICMP type = Echo Request
         pkt
     }
@@ -643,6 +698,25 @@ mod tests {
         stack.poll(Instant::now());
         // poll 后 TX 可能为空（无自动回复），也可能有非 ICMP 包
         let _tx = stack.drain_tx();
+    }
+
+    #[test]
+    fn icmp_echo_reply_generated() {
+        // ICMP echo request → process_icmp_echo → TX 应含 echo reply
+        let mut stack = make_stack();
+        let pkt = make_icmp_echo_request();
+        stack.ingest_rx(pkt);
+        stack.poll(Instant::now());
+        stack.process_icmp_echo();
+        let tx = stack.drain_tx();
+        // 至少有一个 TX 包（echo reply IP 包）
+        assert!(!tx.is_empty(), "no echo reply generated");
+        // 检查第一个 TX 包是 IPv4 ICMP echo reply
+        let reply = &tx[0];
+        assert!(reply.len() >= 28, "reply too short: {}", reply.len());
+        assert_eq!(reply[0] >> 4, 4, "not IPv4");
+        assert_eq!(reply[9], 1, "protocol not ICMP");
+        assert_eq!(reply[20], 0, "ICMP type not Echo Reply (0)");
     }
 
 }

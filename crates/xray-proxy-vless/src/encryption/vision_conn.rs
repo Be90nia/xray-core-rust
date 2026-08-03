@@ -48,6 +48,8 @@ pub struct VisionConn<C> {
     rng: ThreadRng,
     /// uplink TLS 过滤状态（检测 TLS 1.3 → enable_xtls → splice）。
     uplink_traffic: TrafficState,
+    /// downlink TLS 过滤状态（检测服务器 TLS 1.3 → enable_xtls → splice）。
+    downlink_traffic: TrafficState,
 }
 
 impl<C> VisionConn<C>
@@ -75,6 +77,7 @@ where
             downlink_padding: true,
             rng: rand::rng(),
             uplink_traffic: TrafficState::new(user_uuid.clone()),
+            downlink_traffic: TrafficState::new(user_uuid.clone()),
         }
     }
 }
@@ -127,6 +130,17 @@ where
                         this.downlink_padding = false;
                     }
                     if !content.is_empty() {
+                        // downlink TLS 过滤：检测下行 TLS 1.3 → enable_xtls
+                        // 对齐 Go VisionReader 的 xtls_filter_tls 调用
+                        if this.downlink_traffic.number_of_packet_to_filter > 0 {
+                            xtls_filter_tls(&[&content], &mut this.downlink_traffic);
+                        }
+                        // splice 触发：enable_xtls + 完整 TLS ApplicationData record
+                        if this.downlink_traffic.enable_xtls
+                            && is_complete_record(&content)
+                        {
+                            this.downlink_padding = false;
+                        }
                         this.downlink_pending = content;
                         this.downlink_pending_pos = 0;
                     }

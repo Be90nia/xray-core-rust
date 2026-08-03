@@ -100,12 +100,15 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
         .await
         .map_err(|e| std::io::Error::other(format!("vless decode: {e}")))?;
 
-    // 2. 只处理 TCP；UDP/Mux/Rvs 先 warn 跳过
+    // 2. 只处理 TCP；UDP/Mux/Rvs 先发 response header 再 warn 跳过
+    //    （不发 response header 会让客户端挂住等待，而非快速失败）
     if decoded.command != VlessCommand::Tcp {
         tracing::warn!(
             command = ?decoded.command,
-            "vless non-TCP command not yet supported, closing connection"
+            "vless non-TCP command not yet supported, sending empty response and closing"
         );
+        // 发送 response header 让客户端收到版本号，然后关闭连接。
+        let _ = encode_response_header(&mut stream, VERSION, &empty_addons()).await;
         return Ok(());
     }
 

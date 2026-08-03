@@ -221,6 +221,8 @@ async fn tun_driver_loop(device: Arc<TunDevice>, netstack: Arc<AsyncMutex<TunNet
                         let mut stack = netstack.lock().await;
                         stack.ingest_rx(pkt);
                         stack.poll(smoltcp::time::Instant::now());
+                        // 处理 ICMP echo request 并自动回复
+                        stack.process_icmp_echo();
                         // 检测 TCP/UDP 事件
                         handle_socket_events(
                             &mut stack,
@@ -246,6 +248,8 @@ async fn tun_driver_loop(device: Arc<TunDevice>, netstack: Arc<AsyncMutex<TunNet
                 let tx_pkts: Vec<Vec<u8>> = {
                     let mut stack = netstack.lock().await;
                     stack.poll(smoltcp::time::Instant::now());
+                    // 处理 ICMP echo request 并自动回复
+                    stack.process_icmp_echo();
                     // 检测 TCP/UDP 事件
                     handle_socket_events(
                         &mut stack,
