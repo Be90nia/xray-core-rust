@@ -482,7 +482,7 @@ async fn spawn_one_inbound(
             let listener = TcpListener::bind(&addr).await?;
             tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_count(), "vless inbound listening");
             let handle = tokio::spawn(async move {
-                if let Err(e) = serve_vless(listener, ohm, validator).await {
+                if let Err(e) = serve_vless(listener, ohm, validator, None).await {
                     tracing::error!(error = %e, "vless inbound stopped");
                 }
             });
@@ -511,7 +511,7 @@ async fn spawn_one_inbound(
             let listener = TcpListener::bind(&addr).await?;
             tracing::info!(tag = %ib.tag, addr = %addr, users = users.len(), "trojan inbound listening");
             let handle = tokio::spawn(async move {
-                if let Err(e) = serve_trojan(listener, ohm, users, fallbacks).await {
+                if let Err(e) = serve_trojan(listener, ohm, users, fallbacks, None).await {
                     tracing::error!(error = %e, "trojan inbound stopped");
                 }
             });
@@ -531,7 +531,7 @@ async fn spawn_one_inbound(
             let listener = TcpListener::bind(&addr).await?;
             tracing::info!(tag = %ib.tag, addr = %addr, "vmess inbound listening");
             let handle = tokio::spawn(async move {
-                if let Err(e) = serve_vmess(listener, ohm, validator, detour_to).await {
+                if let Err(e) = serve_vmess(listener, ohm, validator, detour_to, None).await {
                     tracing::error!(error = %e, "vmess inbound stopped");
                 }
             });

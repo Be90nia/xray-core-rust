@@ -25,6 +25,7 @@ rand = { workspace = true }
 async-trait = { workspace = true }
 futures-util = "0.3"
 rustls = { workspace = true }
+tokio-rustls = { workspace = true }
 ring = { workspace = true }
 # realm (finalmask NAT 穿透伪装)：HTTP REST + SSE + SHA-256 + hex 编码
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "blocking"] }

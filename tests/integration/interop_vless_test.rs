@@ -177,7 +177,7 @@ async fn rust_vless_server_go_client() {
     let ohm_clone = Arc::clone(&ohm);
     let validator_clone = Arc::clone(&validator);
     tokio::spawn(async move {
-        let _ = serve_vless(vless_listener, ohm_clone, validator_clone).await;
+        let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None).await;
     });
 
     // Configure Go xray: SOCKS5 inbound -> VLESS outbound -> Rust server

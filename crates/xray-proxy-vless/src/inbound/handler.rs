@@ -13,10 +13,12 @@
 //!   + `tls.Conn` + `reality.ConnConnectionState` + retry + dispatcher 全链路）。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use xray_common::net::destination::Destination;
 
 use crate::error::{Result, VlessError};
+use crate::validator::Validator;
 
 /// Fallback 路由策略：`name → alpn → path → Destination` 三级 map。
 ///
@@ -175,6 +177,31 @@ impl InboundProcessor for StubProcessor {
         })
     }
 }
+
+/// 真实入站处理器：委托给 `handle_connection` 执行 VLESS 握手 + dispatch。
+/// 
+/// ponytail: fallback IO replay 未实现——需要 RecordingConnection 包装。
+/// 当前握手失败时直接返回错误。
+pub struct VlessInboundProcessor {
+    pub validator: Arc<dyn Validator>,
+    pub handler: Arc<dyn xray_app_dispatcher::DispatchHandler>,
+}
+
+impl InboundProcessor for VlessInboundProcessor {
+    fn process(
+        &self,
+        conn: Box<dyn xray_transport::connection::Connection>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        let validator = Arc::clone(&self.validator);
+        let handler = Arc::clone(&self.handler);
+        Box::pin(async move {
+            crate::inbound::server::handle_connection(conn, &handler, &validator)
+                .await
+                .map_err(crate::error::VlessError::Io)
+        })
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

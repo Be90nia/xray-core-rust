@@ -96,7 +96,7 @@ async fn run_vless_e2e() {
     let ohm_clone = Arc::clone(&ohm);
     let validator_clone = Arc::clone(&validator);
     tokio::spawn(async move {
-        let _ = serve_vless(vless_listener, ohm_clone, validator_clone).await;
+        let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None).await;
     });
 
     // 4. VLESS client：connect → encode header → decode response → echo round-trip
@@ -151,7 +151,7 @@ async fn vless_rejects_unknown_user() {
     let ohm_clone = Arc::clone(&ohm);
     let validator_clone = Arc::clone(&validator);
     tokio::spawn(async move {
-        let _ = serve_vless(vless_listener, ohm_clone, validator_clone).await;
+        let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None).await;
     });
 
     // client 用未注册的随机 UUID

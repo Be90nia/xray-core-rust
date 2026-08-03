@@ -371,6 +371,7 @@ pub async fn serve_trojan(
     ohm: Arc<SimpleOhm>,
     users: HashMap<String, MemoryUser>,
     fallbacks: Option<Arc<FallbackPolicy>>,
+    tls: Option<Arc<xray_transport::TlsAcceptor>>,
 ) -> std::io::Result<()> {
     let handler = ohm
         .get_default_handler()
@@ -401,38 +402,64 @@ pub async fn serve_trojan(
         let handler = Arc::clone(&handler);
         let validator = Arc::clone(&validator);
         let fb_policy = fallbacks.clone();
+        let tls = tls.clone();
         tokio::spawn(async move {
-            let mut recorder = RecordingStream {
-                inner: stream,
-                buf: Vec::with_capacity(256),
-            };
-            match trojan_server_handshake(&mut recorder, &validator).await {
-                Ok((network, addr, port, user)) => {
-                    if matches!(network, Network::Udp) {
-                        warn!(peer = %peer, "trojan UDP not yet supported");
-                        return;
+            if let Some(acc) = tls {
+                match acc.accept(stream).await {
+                    Ok(tls_stream) => {
+                        let recorder = RecordingStream {
+                            inner: tls_stream,
+                            buf: Vec::with_capacity(256),
+                        };
+                        handle_trojan_connection(recorder, validator, handler, fb_policy, peer).await;
                     }
-                    let dest = Destination::new(addr, Port::new(port), CommonNetwork::TCP);
-                    let (read_half, write_half) = tokio::io::split(recorder.inner);
-                    let link = Link::new(new_reader(read_half), new_writer(write_half));
-                    info!(peer = %peer, user = %user.email, dest = %dest, "trojan dispatching");
-                    let _ = handler.dispatch(&dest, link).await;
+                    Err(e) => warn!(error = %e, "trojan TLS accept failed"),
                 }
-                Err(e) => {
-                    warn!(peer = %peer, error = %e, "trojan handshake failed");
-                    if let Some(fb_policy) = &fb_policy {
-                        // ponytail: SNI/ALPN/path from TLS layer not wired yet; use wildcard
-                        if let Some(fb) = fb_policy.decide("", "", "") {
-                            if let Err(e) = do_fallback(recorder, &fb.dest).await {
-                                warn!(peer = %peer, error = %e, "fallback failed");
-                            }
-                        }
-                    }
-                }
+            } else {
+                let recorder = RecordingStream {
+                    inner: stream,
+                    buf: Vec::with_capacity(256),
+                };
+                handle_trojan_connection(recorder, validator, handler, fb_policy, peer).await;
             }
         });
     }
 }
+
+/// 处理单个 Trojan 连接：handshake → dispatch / fallback。
+async fn handle_trojan_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    mut recorder: RecordingStream<S>,
+    validator: Arc<Validator>,
+    handler: Arc<dyn xray_app_dispatcher::DispatchHandler>,
+    fb_policy: Option<Arc<FallbackPolicy>>,
+    peer: std::net::SocketAddr,
+) {
+    match trojan_server_handshake(&mut recorder, &validator).await {
+        Ok((network, addr, port, user)) => {
+            if matches!(network, Network::Udp) {
+                warn!(peer = %peer, "trojan UDP not yet supported");
+                return;
+            }
+            let dest = Destination::new(addr, Port::new(port), CommonNetwork::TCP);
+            let (read_half, write_half) = tokio::io::split(recorder.inner);
+            let link = Link::new(new_reader(read_half), new_writer(write_half));
+            info!(peer = %peer, user = %user.email, dest = %dest, "trojan dispatching");
+            let _ = handler.dispatch(&dest, link).await;
+        }
+        Err(e) => {
+            warn!(peer = %peer, error = %e, "trojan handshake failed");
+            if let Some(fb_policy) = &fb_policy {
+                // ponytail: SNI/ALPN/path from TLS layer not wired yet; use wildcard
+                if let Some(fb) = fb_policy.decide("", "", "") {
+                    if let Err(e) = do_fallback(recorder, &fb.dest).await {
+                        warn!(peer = %peer, error = %e, "fallback failed");
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,7 +705,7 @@ mod tests {
         let trojan_addr = trojan_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         tokio::spawn(async move {
-            let _ = serve_trojan(trojan_listener, ohm_clone, users, None).await;
+            let _ = serve_trojan(trojan_listener, ohm_clone, users, None, None).await;
         });
 
         // 5. trojan client：构造 header + payload

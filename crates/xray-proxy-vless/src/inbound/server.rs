@@ -9,7 +9,8 @@
 
 use std::sync::Arc;
 
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
 use xray_app_dispatcher::default::SimpleOhm;
 use xray_app_dispatcher::OutboundHandlerManager;
 use xray_buf::io::{new_reader, new_writer};
@@ -41,6 +42,7 @@ pub async fn serve_vless(
     listener: TcpListener,
     ohm: Arc<SimpleOhm>,
     validator: Arc<dyn Validator>,
+    tls: Option<Arc<xray_transport::TlsAcceptor>>,
 ) -> std::io::Result<()> {
     let handler = ohm
         .get_default_handler()
@@ -62,8 +64,20 @@ pub async fn serve_vless(
 
         let handler = Arc::clone(&handler);
         let validator = Arc::clone(&validator);
+        let tls = tls.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, &handler, &validator).await {
+            let result = if let Some(acc) = tls {
+                match acc.accept(stream).await {
+                    Ok(tls_stream) => handle_connection(tls_stream, &handler, &validator).await,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "vless TLS accept failed");
+                        return;
+                    }
+                }
+            } else {
+                handle_connection(stream, &handler, &validator).await
+            };
+            if let Err(e) = result {
                 tracing::debug!(error = %e, "vless connection ended with error");
             }
         });
@@ -73,8 +87,8 @@ pub async fn serve_vless(
 }
 
 /// 处理单个 VLESS 连接：decode → dispatch。
-async fn handle_connection(
-    stream: TcpStream,
+pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    stream: S,
     handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,
     validator: &Arc<dyn Validator>,
 ) -> std::io::Result<()> {
@@ -189,7 +203,7 @@ mod tests {
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
         tokio::spawn(async move {
-            let _ = serve_vless(vless_listener, ohm_clone, validator_clone).await;
+            let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None).await;
         });
 
         // 4. VLESS client：connect → encode request → decode response → echo round-trip
@@ -238,7 +252,7 @@ mod tests {
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
         tokio::spawn(async move {
-            let _ = serve_vless(vless_listener, ohm_clone, validator_clone).await;
+            let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None).await;
         });
 
         // client 用一个随机的（未注册的）UUID

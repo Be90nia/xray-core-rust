@@ -188,7 +188,7 @@ async fn run_rust_server_go_client(security: SecurityType) {
     let ohm_clone = Arc::clone(&ohm);
     let validator_clone = Arc::clone(&validator);
     tokio::spawn(async move {
-        let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None).await;
+        let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None, None).await;
     });
 
     // Configure Go xray: SOCKS5 inbound -> VMess outbound -> Rust server

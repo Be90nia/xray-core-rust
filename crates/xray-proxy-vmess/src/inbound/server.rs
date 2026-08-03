@@ -10,8 +10,8 @@
 
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
+use tokio::net::TcpListener;
 use xray_app_dispatcher::default::SimpleOhm;
 use xray_app_dispatcher::{DispatchHandler, OutboundHandlerManager};
 use xray_buf::io::{new_reader, new_writer};
@@ -114,6 +114,7 @@ pub async fn serve_vmess(
     ohm: Arc<SimpleOhm>,
     validator: Arc<TimedUserValidator>,
     detour_to: Option<String>,
+    tls: Option<Arc<xray_transport::TlsAcceptor>>,
 ) -> std::io::Result<()> {
     let handler = match detour_to.as_deref() {
         Some(tag) => ohm.get_handler(tag).ok_or_else(|| {
@@ -143,8 +144,17 @@ pub async fn serve_vmess(
         let handler = Arc::clone(&handler);
         let validator = Arc::clone(&validator);
         let history = Arc::clone(&history);
+        let tls = tls.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, &handler, &validator, &history).await {
+            let result = if let Some(acc) = tls {
+                match acc.accept(stream).await {
+                    Ok(tls_stream) => handle_connection(tls_stream, &handler, &validator, &history).await,
+                    Err(e) => { tracing::warn!(error = %e, "vmess TLS accept failed"); return; }
+                }
+            } else {
+                handle_connection(stream, &handler, &validator, &history).await
+            };
+            if let Err(e) = result {
                 tracing::debug!(error = %e, "vmess connection ended with error");
             }
         });
@@ -152,8 +162,8 @@ pub async fn serve_vmess(
 }
 
 /// 处理单个 VMess 连接：decode header → encode response header → body chunk pump → dispatch。
-async fn handle_connection(
-    stream: TcpStream,
+async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    stream: S,
     handler: &Arc<dyn DispatchHandler>,
     validator: &Arc<TimedUserValidator>,
     history: &Arc<SessionHistory>,
@@ -253,13 +263,14 @@ async fn handle_connection(
 ///
 /// chunk 格式：`[2B BE size][AEAD ciphertext]`。终止 chunk = `seal([])` → ciphertext=tag，
 /// 解密后 plaintext 为空即终止信号。EOF 或解密失败时 break 并 shutdown sink。
-async fn pump_request_body<C>(
-    mut stream_r: ReadHalf<TcpStream>,
+async fn pump_request_body<C, R>(
+    mut stream_r: R,
     mut server_w: WriteHalf<DuplexStream>,
     cipher: C,
     iv: [u8; 16],
 ) where
     C: AeadCipher + Send,
+    R: AsyncRead + Unpin,
 {
     let mut nonce_gen = ChunkNonceGenerator::new(&iv, 12);
     let mut size_buf = [0u8; 2];
@@ -300,13 +311,14 @@ async fn pump_request_body<C>(
 /// 读取明文 sink 字节，按 VMess response body chunk 格式加密写入 stream。
 ///
 /// 流结束（EOF 或错误）时写终止 chunk：`seal([])` → 仅 tag 字节，size = tag_size。
-async fn pump_response_body<C>(
+async fn pump_response_body<C, W>(
     mut server_r: ReadHalf<DuplexStream>,
-    mut stream_w: WriteHalf<TcpStream>,
+    mut stream_w: W,
     cipher: C,
     iv: [u8; 16],
 ) where
     C: AeadCipher + Send,
+    W: AsyncWrite + Unpin,
 {
     let mut nonce_gen = ChunkNonceGenerator::new(&iv, 12);
     let mut buf = [0u8; PUMP_BUF];
@@ -432,7 +444,7 @@ mod tests {
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
         tokio::spawn(async move {
-            let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None).await;
+            let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None, None).await;
         });
 
         // 4. VMess client：connect → encode header → decode response header → echo round-trip
@@ -497,7 +509,7 @@ mod tests {
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
         tokio::spawn(async move {
-            let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None).await;
+            let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None, None).await;
         });
 
         // client 用未注册的随机 UUID

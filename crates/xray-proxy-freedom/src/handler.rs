@@ -21,7 +21,7 @@ use xray_features::outbound::{OutboundError, OutboundHandler};
 use xray_transport::sockopt::SocketOptions;
 use xray_transport::system_dialer::dial_system;
 
-use crate::config::{Config, DomainStrategy};
+use crate::config::{Config, DomainStrategy, Fragment};
 
 /// Freedom 出站 Handler。
 ///
@@ -164,11 +164,88 @@ impl ProxyOutbound for FreedomHandler {
             }
         };
 
-        let conn = dialer.dial(&effective_dest).await
+        let mut conn = dialer.dial(&effective_dest).await
             .map_err(|e| ProxymanError::OutboundProcessFailed(format!("freedom dial failed: {e}")))?;
 
+        if !self.config.noises.is_empty() {
+            use tokio::io::AsyncWriteExt;
+            for noise in &self.config.noises {
+                let size = if noise.length_max > noise.length_min {
+                    rand::random_range(noise.length_min..=noise.length_max)
+                } else {
+                    noise.length_min
+                } as usize;
+                if size > 0 {
+                    let buf = vec![0u8; size];
+                    let _ = conn.as_mut().write_all(&buf).await;
+                }
+                if noise.delay_max > 0 {
+                    let delay = if noise.delay_max > noise.delay_min {
+                        rand::random_range(noise.delay_min..=noise.delay_max)
+                    } else {
+                        noise.delay_min
+                    };
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+            }
+        }
+
+        // Fragment: 首个 upstream chunk 分片写入（绕过 SNI 审查）。
+        if let Some(fragment) = &self.config.fragment {
+            self.bridge_with_fragment(link, conn, fragment).await
+                .map_err(|e| ProxymanError::OutboundProcessFailed(format!("fragment bridge failed: {e}")))
+        } else {
+            bridge_link_with_stream_full(link, conn).await
+                .map_err(|e| ProxymanError::OutboundProcessFailed(format!("bridge failed: {e}")))
+        }
+    }
+}
+
+impl FreedomHandler {
+    /// 分片桥接：首个 upstream chunk 按 fragment 配置分片写入，后续正常桥接。
+    async fn bridge_with_fragment(
+        &self,
+        link: Link,
+        mut conn: Box<dyn xray_transport::connection::Connection>,
+        fragment: &Fragment,
+    ) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        use xray_buf::multi::MultiBuffer;
+
+        let Link { reader, writer } = link;
+        let mut reader = reader;
+
+        // 1. 读取首个 upstream chunk，分片写入 conn。
+        let mb = reader.read_multi_buffer().await.ok();
+        if let Some(mb) = &mb {
+            let data = mb.to_vec();
+            if !data.is_empty() {
+                let mut offset = 0usize;
+                while offset < data.len() {
+                    let frag_size = if fragment.length_max > fragment.length_min {
+                        rand::random_range(fragment.length_min..=fragment.length_max)
+                    } else {
+                        fragment.length_min
+                    } as usize;
+                    let end = (offset + frag_size.max(1)).min(data.len());
+                    conn.as_mut().write_all(&data[offset..end]).await?;
+                    conn.as_mut().flush().await?;
+                    if fragment.interval_max > 0 {
+                        let gap = if fragment.interval_max > fragment.interval_min {
+                            rand::random_range(fragment.interval_min..=fragment.interval_max)
+                        } else {
+                            fragment.interval_min
+                        };
+                        tokio::time::sleep(std::time::Duration::from_micros(gap)).await;
+                    }
+                    offset = end;
+                }
+            }
+        }
+
+        // 2. 后续数据用正常桥接。
+        let link = Link { reader, writer };
         bridge_link_with_stream_full(link, conn).await
-            .map_err(|e| ProxymanError::OutboundProcessFailed(format!("bridge failed: {e}")))
     }
 }
 
