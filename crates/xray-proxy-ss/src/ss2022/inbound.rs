@@ -196,7 +196,7 @@ impl MultiUserInbound {
     /// - [`SsError::Ss2022NoUserMatched`]：无用户匹配。
     /// - 透传其他错误。
     pub async fn handle_conn(&self, conn: TcpStream) -> io::Result<InboundResult> {
-        let users = self.users.lock();
+        let users = self.users.lock().clone();
         read_ss2022_request_multi(conn, &self.psk, self.kind, &users, self.timestamp_tolerance)
             .await
             .map_err(|e| io::Error::other(e.to_string()))

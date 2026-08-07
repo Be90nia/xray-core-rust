@@ -275,13 +275,26 @@ pub async fn serve_dokodemo(
     }
 }
 
+/// SS 入站模式（legacy AEAD 或 SS-2022）。
+#[derive(Clone)]
+pub enum SsInboundMode {
+    /// Legacy AEAD 单/多用户。
+    Legacy(Arc<SsInbound>),
+    /// SS-2022 单用户。
+    Ss2022(Arc<xray_proxy_ss::ss2022::Ss2022Inbound>),
+    /// SS-2022 多用户。
+    Ss2022Multi(Arc<xray_proxy_ss::ss2022::MultiUserInbound>),
+    /// SS-2022 中继。
+    Ss2022Relay(Arc<xray_proxy_ss::ss2022::RelayInbound>),
+}
+
 /// Shadowsocks inbound 服务入口。
 ///
-/// 接受连接 → SsInbound::handle_conn → parse dest → dispatch。
+/// 接受连接 → handle_conn → parse dest → dispatch。
 pub async fn serve_ss(
     listener: TcpListener,
     ohm: Arc<SimpleOhm>,
-    inbound: Arc<SsInbound>,
+    inbound: SsInboundMode,
 ) -> std::io::Result<()> {
     let handler = ohm
         .get_default_handler()
@@ -296,19 +309,35 @@ pub async fn serve_ss(
             }
         };
         let handler = Arc::clone(&handler);
-        let inbound = Arc::clone(&inbound);
+        let mode = inbound.clone();
         tokio::spawn(async move {
-            match inbound.handle_conn(stream).await {
-                Ok((header, mut ss_stream)) => {
-                    let network = match header.command {
-                        xray_proxy_ss::validator::RequestCommand::Tcp => Network::TCP,
-                        xray_proxy_ss::validator::RequestCommand::Udp => Network::UDP,
-                    };
-                    let dest = Destination::new(header.address, Port::new(header.port), network);
-                    // SSStream 不 impl AsyncRead/AsyncWrite，用 duplex pump 桥接
+            let handshake = match &mode {
+                SsInboundMode::Legacy(ib) => {
+                    ib.handle_conn(stream).await.map(|(header, ss_stream)| {
+                        (header.address, header.port, ss_stream)
+                    }).map_err(|e| std::io::Error::other(e.to_string()))
+                }
+                SsInboundMode::Ss2022(ib) => {
+                    ib.handle_conn(stream).await
+                        .map(|r| (r.address, r.port, r.stream))
+                        .map_err(|e| std::io::Error::other(e.to_string()))
+                }
+                SsInboundMode::Ss2022Multi(ib) => {
+                    ib.handle_conn(stream).await
+                        .map(|r| (r.address, r.port, r.stream))
+                        .map_err(|e| std::io::Error::other(e.to_string()))
+                }
+                SsInboundMode::Ss2022Relay(ib) => {
+                    ib.handle_conn(stream).await
+                        .map(|r| (r.address, r.port, r.stream))
+                        .map_err(|e| std::io::Error::other(e.to_string()))
+                }
+            };
+            match handshake {
+                Ok((address, port, mut ss_stream)) => {
+                    let dest = Destination::new(address, Port::new(port), Network::TCP);
                     let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
                     tokio::spawn(async move {
-                        // up: ss_stream.read_chunk → server_io.write_all
                         loop {
                             match ss_stream.read_chunk().await {
                                 Ok(Some(chunk)) => {
@@ -811,24 +840,27 @@ fn build_vmess_validator(data: &[u8]) -> std::io::Result<std::sync::Arc<VmessTim
 ///
 /// JSON 格式：`{"method":"aes-128-gcm","password":"..."}` 或
 /// `{"clients":[{"method":"aes-128-gcm","password":"...","email":""}]}`。
-fn parse_ss_inbound_config(data: &[u8]) -> std::io::Result<Arc<SsInbound>> {
-    use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
+fn parse_ss_inbound_config(data: &[u8]) -> std::io::Result<SsInboundMode> {
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("ss inbound settings JSON: {e}")))?;
-    // 多用户模式：clients 数组
+
+    // SS-2022 检测：method 以 "2022-blake3-" 开头
+    let method = v.get("method").and_then(|x| x.as_str()).unwrap_or("aes-128-gcm");
+    if method.starts_with("2022-blake3-") {
+        return parse_ss2022_inbound_config(method, &v);
+    }
+
+    // Legacy SS AEAD
+    use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
     if let Some(clients) = v.get("clients").and_then(|c| c.as_array()) {
         let mut users = Vec::new();
         for c in clients {
             let password = c.get("password").and_then(|x| x.as_str()).unwrap_or("");
             let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let method = c.get("method").and_then(|x| x.as_str()).unwrap_or("aes-128-gcm");
-            let cipher = ss_cipher_from_str(method)
-                .ok_or_else(|| std::io::Error::other(format!("unsupported ss cipher: {method}")))?;
-            let proto = ProtoAccount {
-                password: password.to_string(),
-                cipher_type: cipher.as_i32(),
-                iv_check: false,
-            };
+            let c_method = c.get("method").and_then(|x| x.as_str()).unwrap_or("aes-128-gcm");
+            let cipher = ss_cipher_from_str(c_method)
+                .ok_or_else(|| std::io::Error::other(format!("unsupported ss cipher: {c_method}")))?;
+            let proto = ProtoAccount { password: password.to_string(), cipher_type: cipher.as_i32(), iv_check: false };
             let account = SsConfigMemoryAccount::from_proto(&proto)
                 .map_err(|e| std::io::Error::other(format!("ss account parse: {e}")))?;
             users.push(xray_proxy_ss::validator::MemoryUser::new(email, account));
@@ -836,22 +868,78 @@ fn parse_ss_inbound_config(data: &[u8]) -> std::io::Result<Arc<SsInbound>> {
         if users.is_empty() {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "ss inbound: no users"));
         }
-        return Ok(Arc::new(SsInbound::with_users(users)));
+        return Ok(SsInboundMode::Legacy(Arc::new(SsInbound::with_users(users))));
     }
-    // 单用户模式：method + password
+
+    // Legacy 单用户
     let password = v.get("password").and_then(|x| x.as_str())
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "ss inbound: missing password"))?;
-    let method = v.get("method").and_then(|x| x.as_str()).unwrap_or("aes-128-gcm");
     let cipher = ss_cipher_from_str(method)
         .ok_or_else(|| std::io::Error::other(format!("unsupported ss cipher: {method}")))?;
-    let proto = ProtoAccount {
-        password: password.to_string(),
-        cipher_type: cipher.as_i32(),
-        iv_check: false,
-    };
+    let proto = ProtoAccount { password: password.to_string(), cipher_type: cipher.as_i32(), iv_check: false };
     let account = SsConfigMemoryAccount::from_proto(&proto)
         .map_err(|e| std::io::Error::other(format!("ss account parse: {e}")))?;
-    Ok(Arc::new(SsInbound::new(account, "u@ss.local")))
+    Ok(SsInboundMode::Legacy(Arc::new(SsInbound::new(account, "u@ss.local"))))
+}
+
+/// SS-2022 入站配置解析。
+fn parse_ss2022_inbound_config(method: &str, v: &serde_json::Value) -> std::io::Result<SsInboundMode> {
+    use xray_proxy_ss::ss2022::{MultiUserInbound, RelayDestination, RelayInbound, Ss2022Inbound, Ss2022User};
+    use xray_proxy_ss::ss2022::key::psk_from_base64;
+
+    let server_psk = v.get("password").and_then(|x| x.as_str())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "ss2022 inbound: missing server PSK"))?;
+
+    // 中继模式：destinations 数组
+    if let Some(dests) = v.get("destinations").and_then(|d| d.as_array()) {
+        let mut destinations = Vec::new();
+        for d in dests {
+            let key_b64 = d.get("password").and_then(|x| x.as_str()).unwrap_or("");
+            let email = d.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let level = d.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            let addr_str = d.get("server").and_then(|x| x.as_str()).unwrap_or("127.0.0.1");
+            let port = d.get("server_port").and_then(|x| x.as_u64()).unwrap_or(0) as u16;
+            let psk = psk_from_base64(key_b64)
+                .map_err(|e| std::io::Error::other(format!("ss2022 relay PSK: {e}")))?;
+            destinations.push(RelayDestination {
+                key: psk,
+                address: xray_common::net::address::Address::Domain(addr_str.to_string()),
+                port,
+                email,
+                level,
+            });
+        }
+        if destinations.is_empty() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "ss2022 relay: no destinations"));
+        }
+        let relay = RelayInbound::new(method, server_psk, destinations)
+            .map_err(|e| std::io::Error::other(format!("ss2022 relay: {e}")))?;
+        return Ok(SsInboundMode::Ss2022Relay(Arc::new(relay)));
+    }
+
+    // 多用户模式：clients 数组
+    if let Some(clients) = v.get("clients").and_then(|c| c.as_array()) {
+        let mut users = Vec::new();
+        for c in clients {
+            let psk_b64 = c.get("password").and_then(|x| x.as_str()).unwrap_or("");
+            let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let level = c.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            let psk = psk_from_base64(psk_b64)
+                .map_err(|e| std::io::Error::other(format!("ss2022 user PSK: {e}")))?;
+            users.push(Ss2022User { email, level, psk });
+        }
+        if users.is_empty() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "ss2022 multi: no users"));
+        }
+        let multi = MultiUserInbound::new(method, server_psk, users)
+            .map_err(|e| std::io::Error::other(format!("ss2022 multi: {e}")))?;
+        return Ok(SsInboundMode::Ss2022Multi(Arc::new(multi)));
+    }
+
+    // 单用户模式
+    let single = Ss2022Inbound::new(method, server_psk, "u@ss2022.local")
+        .map_err(|e| std::io::Error::other(format!("ss2022 single: {e}")))?;
+    Ok(SsInboundMode::Ss2022(Arc::new(single)))
 }
 
 /// SS cipher 字符串 → CipherType。
