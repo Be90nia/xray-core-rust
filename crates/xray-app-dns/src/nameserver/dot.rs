@@ -58,10 +58,11 @@ pub struct DotNameServer {
     cache: Arc<CacheController>,
     /// EDNS0 client subnet。
     client_ip: Vec<u8>,
-    /// 单次查询超时。
     query_timeout: Duration,
     /// 请求 ID 生成器。
     id_gen: AtomicReqIdGen,
+    /// 连接池：复用 TLS 连接。
+    conn: tokio::sync::Mutex<Option<xray_tls::utls::Conn<TcpConnection>>>,
 }
 
 impl DotNameServer {
@@ -86,6 +87,7 @@ impl DotNameServer {
             client_ip,
             query_timeout,
             id_gen: AtomicReqIdGen::new(),
+            conn: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -126,33 +128,13 @@ impl DotNameServer {
         )))
     }
 
-    /// 发送单次 DNS 查询（DoT），等待响应。
-    async fn query_once(
-        &self,
-        fqdn: &str,
-        record_type: RecordType,
-    ) -> Result<IpRecord, DnsError> {
-        let req_id = self.id_gen.next_id();
-        let payload = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
-
-        // TCP wire format: 2B big-endian 长度前缀。
-        let len_be = u16::try_from(payload.len())
-            .map_err(|_| DnsError::WireFormat("query too large for DoT".to_string()))?
-            .to_be_bytes();
-
-        // TCP connect。
+    /// 建立 DoT TLS 连接。
+    async fn connect_tls(&self) -> Result<xray_tls::utls::Conn<TcpConnection>, DnsError> {
         let tcp = timeout(self.query_timeout, TcpStream::connect(self.addr))
             .await
-            .map_err(|_| {
-                DnsError::WireFormat(format!(
-                    "dot connect timeout after {:?}",
-                    self.query_timeout
-                ))
-            })?
+            .map_err(|_| DnsError::WireFormat(format!("dot connect timeout after {:?}", self.query_timeout)))?
             .map_err(|e| DnsError::WireFormat(format!("dot connect: {e}")))?;
-
-        // TLS 握手。
-        let mut stream = timeout(
+        let tls = timeout(
             self.query_timeout,
             tls_client(
                 TcpConnection::new(tcp),
@@ -163,41 +145,74 @@ impl DotNameServer {
         .await
         .map_err(|_| DnsError::WireFormat("dot tls handshake timeout".to_string()))?
         .map_err(|e| DnsError::WireFormat(format!("dot tls handshake: {e}")))?;
+        Ok(tls)
+    }
 
+    /// 在已有连接上执行单次 DoT 查询。
+    async fn try_query(
+        &self,
+        stream: &mut xray_tls::utls::Conn<TcpConnection>,
+        len_be: &[u8; 2],
+        payload: &[u8],
+        req_id: u16,
+        record_type: RecordType,
+    ) -> Result<IpRecord, DnsError> {
         // 写长度前缀 + payload。
-        timeout(self.query_timeout, stream.write_all(&len_be))
-            .await
-            .map_err(|_| DnsError::WireFormat("dot write len timeout".to_string()))?
+        timeout(self.query_timeout, stream.write_all(len_be))
+            .await.map_err(|_| DnsError::WireFormat("dot write len timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("dot write len: {e}")))?;
-        timeout(self.query_timeout, stream.write_all(&payload))
-            .await
-            .map_err(|_| DnsError::WireFormat("dot write payload timeout".to_string()))?
+        timeout(self.query_timeout, stream.write_all(payload))
+            .await.map_err(|_| DnsError::WireFormat("dot write payload timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("dot write payload: {e}")))?;
         stream.flush().await.map_err(io_to_dns)?;
 
         // 读 2 字节长度前缀。
         let mut len_buf = [0u8; 2];
         timeout(self.query_timeout, stream.read_exact(&mut len_buf))
-            .await
-            .map_err(|_| DnsError::WireFormat("dot read len timeout".to_string()))?
+            .await.map_err(|_| DnsError::WireFormat("dot read len timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("dot read len: {e}")))?;
         let resp_len = usize::from(u16::from_be_bytes(len_buf));
         if resp_len == 0 || resp_len > DOT_RECV_MAX {
-            return Err(DnsError::WireFormat(format!(
-                "invalid dot response length: {resp_len}"
-            )));
+            return Err(DnsError::WireFormat(format!("invalid dot response length: {resp_len}")));
         }
 
         // 读响应 payload。
         let mut buf = vec![0u8; resp_len];
         timeout(self.query_timeout, stream.read_exact(&mut buf))
-            .await
-            .map_err(|_| DnsError::WireFormat("dot read payload timeout".to_string()))?
+            .await.map_err(|_| DnsError::WireFormat("dot read payload timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("dot read payload: {e}")))?;
 
         let now = Instant::now();
         let parsed = parse_dns_response(&buf, req_id, record_type, now)?;
         Ok(parsed_to_ip_record(&parsed, now))
+    }
+
+    /// 发送单次 DNS 查询（DoT），等待响应。连接池复用 TLS 连接，失败时重试一次。
+    async fn query_once(
+        &self,
+        fqdn: &str,
+        record_type: RecordType,
+    ) -> Result<IpRecord, DnsError> {
+        let req_id = self.id_gen.next_id();
+        let payload = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
+        let len_be = u16::try_from(payload.len())
+            .map_err(|_| DnsError::WireFormat("query too large for DoT".to_string()))?
+            .to_be_bytes();
+
+        let mut conn_guard = self.conn.lock().await;
+        if conn_guard.is_none() {
+            *conn_guard = Some(self.connect_tls().await?);
+        }
+
+        // 尝试在已有连接上查询，失败则丢弃重连。
+        match self.try_query(conn_guard.as_mut().unwrap(), &len_be, &payload, req_id, record_type).await {
+            Ok(result) => Ok(result),
+            Err(_) => {
+                *conn_guard = None;
+                *conn_guard = Some(self.connect_tls().await?);
+                self.try_query(conn_guard.as_mut().unwrap(), &len_be, &payload, req_id, record_type).await
+            }
+        }
     }
 }
 

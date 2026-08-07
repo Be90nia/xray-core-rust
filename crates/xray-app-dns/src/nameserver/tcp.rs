@@ -53,6 +53,8 @@ pub struct TcpNameServer {
     query_timeout: Duration,
     /// 请求 ID 生成器。
     id_gen: AtomicReqIdGen,
+    /// 连接池：复用 TCP 连接。
+    conn: tokio::sync::Mutex<Option<TcpStream>>,
 }
 
 impl TcpNameServer {
@@ -72,6 +74,7 @@ impl TcpNameServer {
             client_ip,
             query_timeout,
             id_gen: AtomicReqIdGen::new(),
+            conn: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -106,7 +109,51 @@ impl TcpNameServer {
         )))
     }
 
-    /// 发送单次 DNS 查询（TCP），等待响应。
+    /// 建立 TCP 连接。
+    async fn connect(&self) -> Result<TcpStream, DnsError> {
+        timeout(self.query_timeout, TcpStream::connect(self.addr))
+            .await
+            .map_err(|_| DnsError::WireFormat(format!("tcp connect timeout after {:?}", self.query_timeout)))?
+            .map_err(|e| DnsError::WireFormat(format!("tcp connect: {e}")))
+    }
+
+    /// 在已有连接上执行单次 TCP 查询。
+    async fn try_query(
+        &self,
+        stream: &mut TcpStream,
+        len_be: &[u8; 2],
+        payload: &[u8],
+        req_id: u16,
+        record_type: RecordType,
+    ) -> Result<IpRecord, DnsError> {
+        timeout(self.query_timeout, stream.write_all(len_be))
+            .await.map_err(|_| DnsError::WireFormat("tcp write len timeout".to_string()))?
+            .map_err(|e| DnsError::WireFormat(format!("tcp write len: {e}")))?;
+        timeout(self.query_timeout, stream.write_all(payload))
+            .await.map_err(|_| DnsError::WireFormat("tcp write payload timeout".to_string()))?
+            .map_err(|e| DnsError::WireFormat(format!("tcp write payload: {e}")))?;
+        stream.flush().await.map_err(io_to_dns)?;
+
+        let mut len_buf = [0u8; 2];
+        timeout(self.query_timeout, stream.read_exact(&mut len_buf))
+            .await.map_err(|_| DnsError::WireFormat("tcp read len timeout".to_string()))?
+            .map_err(|e| DnsError::WireFormat(format!("tcp read len: {e}")))?;
+        let resp_len = usize::from(u16::from_be_bytes(len_buf));
+        if resp_len == 0 || resp_len > TCP_RECV_MAX {
+            return Err(DnsError::WireFormat(format!("invalid tcp response length: {resp_len}")));
+        }
+
+        let mut buf = vec![0u8; resp_len];
+        timeout(self.query_timeout, stream.read_exact(&mut buf))
+            .await.map_err(|_| DnsError::WireFormat("tcp read payload timeout".to_string()))?
+            .map_err(|e| DnsError::WireFormat(format!("tcp read payload: {e}")))?;
+
+        let now = Instant::now();
+        let parsed = parse_dns_response(&buf, req_id, record_type, now)?;
+        Ok(parsed_to_ip_record(&parsed, now))
+    }
+
+    /// 发送单次 DNS 查询（TCP），等待响应。连接池复用连接，失败时重试一次。
     async fn query_once(
         &self,
         fqdn: &str,
@@ -114,58 +161,23 @@ impl TcpNameServer {
     ) -> Result<IpRecord, DnsError> {
         let req_id = self.id_gen.next_id();
         let payload = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
-
-        // TCP: 2 字节 big-endian 长度前缀。
         let len_be = u16::try_from(payload.len())
             .map_err(|_| DnsError::WireFormat("query too large for TCP".to_string()))?
             .to_be_bytes();
 
-        // 每次查询新建连接（连接池 follow-up）。
-        let mut stream = timeout(self.query_timeout, TcpStream::connect(self.addr))
-            .await
-            .map_err(|_| {
-                DnsError::WireFormat(format!(
-                    "tcp connect timeout after {:?}",
-                    self.query_timeout
-                ))
-            })?
-            .map_err(|e| DnsError::WireFormat(format!("tcp connect: {e}")))?;
-
-        // 写长度前缀 + payload。
-        timeout(self.query_timeout, stream.write_all(&len_be))
-            .await
-            .map_err(|_| DnsError::WireFormat("tcp write len timeout".to_string()))?
-            .map_err(|e| DnsError::WireFormat(format!("tcp write len: {e}")))?;
-        timeout(self.query_timeout, stream.write_all(&payload))
-            .await
-            .map_err(|_| DnsError::WireFormat("tcp write payload timeout".to_string()))?
-            .map_err(|e| DnsError::WireFormat(format!("tcp write payload: {e}")))?;
-        stream.flush().await.map_err(io_to_dns)?;
-
-        // 读 2 字节长度前缀。
-        let mut len_buf = [0u8; 2];
-        timeout(self.query_timeout, stream.read_exact(&mut len_buf))
-            .await
-            .map_err(|_| DnsError::WireFormat("tcp read len timeout".to_string()))?
-            .map_err(|e| DnsError::WireFormat(format!("tcp read len: {e}")))?;
-        let resp_len = usize::from(u16::from_be_bytes(len_buf));
-        if resp_len == 0 || resp_len > TCP_RECV_MAX {
-            return Err(DnsError::WireFormat(format!(
-                "invalid tcp response length: {resp_len}"
-            )));
+        let mut conn_guard = self.conn.lock().await;
+        if conn_guard.is_none() {
+            *conn_guard = Some(self.connect().await?);
         }
 
-        // 读响应 payload。
-        let mut buf = vec![0u8; resp_len];
-        timeout(self.query_timeout, stream.read_exact(&mut buf))
-            .await
-            .map_err(|_| DnsError::WireFormat("tcp read payload timeout".to_string()))?
-            .map_err(|e| DnsError::WireFormat(format!("tcp read payload: {e}")))?;
-
-        let now = Instant::now();
-        let parsed = parse_dns_response(&buf, req_id, record_type, now)?;
-        // TCP 不会有 truncated（如果 server 仍 set TC 标志，说明它建议客户端 UDP retry，TCP 已是 fallback 故忽略）。
-        Ok(parsed_to_ip_record(&parsed, now))
+        match self.try_query(conn_guard.as_mut().unwrap(), &len_be, &payload, req_id, record_type).await {
+            Ok(result) => Ok(result),
+            Err(_) => {
+                *conn_guard = None;
+                *conn_guard = Some(self.connect().await?);
+                self.try_query(conn_guard.as_mut().unwrap(), &len_be, &payload, req_id, record_type).await
+            }
+        }
     }
 }
 
