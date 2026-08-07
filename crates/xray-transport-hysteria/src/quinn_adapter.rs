@@ -413,6 +413,207 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
     }
 }
 
+// ===== 切片1c: QuinnHttp3Server + DefaultRequestHandler + Salamander =====
+
+use crate::hub::{AuthRequest, AuthResponse, HysteriaHttp3Server, HysteriaRequestHandler, MasqueradeHandler};
+use std::collections::HashMap;
+
+/// Salamander XOR 混淆（对应 Go `salamander.Salamander`）。
+///
+/// 将响应 body 与 key 循环 XOR。key 为空时不混淆。
+pub fn salamander_obfuscate(data: &mut [u8], key: &[u8]) {
+    if key.is_empty() {
+        return;
+    }
+    for (i, b) in data.iter_mut().enumerate() {
+        *b ^= key[i % key.len()];
+    }
+}
+
+/// h3 server 实现的 [`HysteriaHttp3Server`]。
+pub struct QuinnHttp3Server;
+
+impl HysteriaHttp3Server for QuinnHttp3Server {
+    fn serve_quic_conn(
+        &self,
+        conn: Arc<dyn QuicConn>,
+        handler: Arc<dyn HysteriaRequestHandler>,
+    ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(async move {
+            let quinn_conn = match conn.as_quinn_connection() {
+                Some(c) => c.clone(),
+                None => return,
+            };
+            let mut h3_conn = match h3::server::Connection::new(h3_quinn::Connection::new(quinn_conn)).await {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            loop {
+                match h3_conn.accept().await {
+                    Ok(Some(resolver)) => {
+                        let h = handler.clone();
+                        tokio::spawn(async move {
+                        let (req, mut stream) = match resolver.resolve_request().await {
+                            Ok(v) => v,
+                            Err(_) => return,
+                        };
+                            let method = req.method().to_string();
+                            let path = req.uri().path().to_string();
+                            let host = req.uri().host().unwrap_or(config::URLHost).to_string();
+                            let auth_header = req
+                                .headers()
+                                .get(config::RequestHeaderAuth)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+                            let brutal_down = req
+                                .headers()
+                                .get(config::CommonHeaderCCRX)
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .unwrap_or(0);
+                            drop(req);
+
+                            let auth_req = AuthRequest {
+                                method: method.clone(),
+                                host: host.clone(),
+                                path: path.clone(),
+                                auth_header: auth_header.clone(),
+                                brutal_down_bps: brutal_down,
+                            };
+
+                            // 尝试 auth
+                            if let Some(auth_resp) = h.try_auth(&auth_req).await {
+                                let resp = http::Response::builder()
+                                    .status(auth_resp.status_code)
+                                    .header("Hysteria-UDP", if auth_resp.udp_enabled { "rl" } else { "" })
+                                    .header(config::CommonHeaderPadding, &auth_resp.padding)
+                                    .body(())
+                                    .unwrap();
+                                let _ = stream.send_response(resp).await;
+                            } else {
+                                // Masquerade
+                                let masq = h.masquerade();
+                                let hdrs: HashMap<String, String> = HashMap::new();
+                                let (status, headers, body) = masq.serve(&method, &path, &hdrs).await;
+                                let mut builder = http::Response::builder().status(status);
+                                for (k, v) in &headers {
+                                    builder = builder.header(k.as_str(), v.as_str());
+                                }
+                                let resp = builder.body(()).unwrap();
+                                let _ = stream.send_response(resp).await;
+                                let _ = stream.send_data(bytes::Bytes::from(body)).await;
+                            }
+                            let _ = stream.finish().await;
+                        });
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+        })
+    }
+}
+
+/// 默认请求处理器（对应 Go `httpHandler`）。
+///
+/// 路由：POST /auth → 验证 → 233/拒绝；其他 → masquerade handler。
+pub struct DefaultRequestHandler {
+    validator: Option<Arc<dyn crate::hub::AuthValidator>>,
+    masq: Arc<dyn MasqueradeHandler>,
+    on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync>,
+    salamander_key: Vec<u8>,
+}
+
+impl DefaultRequestHandler {
+    #[must_use]
+    pub fn new(
+        validator: Option<Arc<dyn crate::hub::AuthValidator>>,
+        masq: Arc<dyn MasqueradeHandler>,
+        on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync>,
+        salamander_key: Vec<u8>,
+    ) -> Self {
+        Self { validator, masq, on_new_conn, salamander_key }
+    }
+}
+
+impl HysteriaRequestHandler for DefaultRequestHandler {
+    fn try_auth(
+        &self,
+        req: &AuthRequest,
+    ) -> Pin<Box<dyn std::future::Future<Output = Option<AuthResponse>> + Send>> {
+        let validator = self.validator.clone();
+        let req = req.clone();
+        Box::pin(async move {
+            if req.method != "POST" || req.path != config::URLPath {
+                return None;
+            }
+            let validator = validator?;
+            let user = validator.validate(&req.auth_header)?;
+            // Auth OK → respond 233
+            Some(AuthResponse {
+                status_code: config::StatusAuthOK,
+                udp_enabled: true,
+                brutal_down_bps: req.brutal_down_bps,
+                padding: "0".into(),
+            })
+        })
+    }
+
+    fn dispatch_tcp_stream(
+        &self,
+        stream: Arc<dyn QuicStream>,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        let on_new = self.on_new_conn.clone();
+        Box::pin(async move {
+            let conn = Arc::new(InterStreamConn::new(stream, local, remote, false));
+            on_new(conn);
+        })
+    }
+
+    fn masquerade(&self) -> Arc<dyn MasqueradeHandler> {
+        self.masq.clone()
+    }
+}
+
+#[cfg(test)]
+mod masq_tests {
+    use super::*;
+
+    #[test]
+    fn salamander_empty_key_noop() {
+        let mut data = b"hello".to_vec();
+        salamander_obfuscate(&mut data, b"");
+        assert_eq!(&data, b"hello");
+    }
+
+    #[test]
+    fn salamander_xor_roundtrip() {
+        let original = b"test data 123".to_vec();
+        let key = b"secret";
+        let mut data = original.clone();
+        salamander_obfuscate(&mut data, key);
+        assert_ne!(&data, &original, "XOR should change data");
+        salamander_obfuscate(&mut data, key);
+        assert_eq!(&data, &original, "double XOR should restore");
+    }
+
+    #[test]
+    fn salamander_key_shorter_than_data() {
+        let key = b"ab";
+        let data = b"abcdef".to_vec();
+        let mut encrypted = data.clone();
+        salamander_obfuscate(&mut encrypted, key);
+        // verify each byte: data[i] ^ key[i % 2]
+        assert_eq!(encrypted[0], b'a' ^ b'a');
+        assert_eq!(encrypted[1], b'b' ^ b'b');
+        assert_eq!(encrypted[2], b'c' ^ b'a');
+        assert_eq!(encrypted[3], b'd' ^ b'b');
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
