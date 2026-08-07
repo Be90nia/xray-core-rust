@@ -204,6 +204,129 @@ impl QuicConn for QuinnQuicConn {
     }
 }
 
+// ===== 切片1b: QuinnHysteriaTransport — QUIC dial + h3 auth 握手 =====
+
+use std::time::Duration;
+use crate::config;
+use crate::dialer::{DialDestination, HysteriaTransport, QuicConfig};
+
+/// quinn + h3 实现的 [`HysteriaTransport`]。
+///
+/// 持有 rustls ClientConfig，用于建立 QUIC 连接 + HTTP/3 auth 握手。
+/// 创建后注入 [`crate::dialer::HysteriaClient`] 即可激活数据拨号。
+pub struct QuinnHysteriaTransport {
+    rustls_config: Arc<rustls::ClientConfig>,
+}
+
+impl QuinnHysteriaTransport {
+    #[must_use]
+    pub fn new(rustls_config: Arc<rustls::ClientConfig>) -> Self {
+        Self { rustls_config }
+    }
+
+    /// 将 [`QuicConfig`] 转为 quinn [`quinn::TransportConfig`]。
+    fn build_transport_config(qc: &QuicConfig) -> quinn::TransportConfig {
+        let mut t = quinn::TransportConfig::default();
+        if qc.max_idle_timeout_ms > 0 {
+            if let Ok(v) = quinn::VarInt::try_from(qc.max_idle_timeout_ms) {
+                t.max_idle_timeout(Some(quinn::IdleTimeout::from(v)));
+            }
+        }
+        if qc.keep_alive_period_ms > 0 {
+            t.keep_alive_interval(Some(Duration::from_millis(qc.keep_alive_period_ms)));
+        }
+        if qc.enable_datagrams {
+            t.datagram_receive_buffer_size(Some(8192));
+        }
+        if qc.max_incoming_streams >= 0 {
+            t.max_concurrent_bidi_streams(quinn::VarInt::try_from(qc.max_incoming_streams as u64).unwrap_or(quinn::VarInt::MAX));
+        }
+        t
+    }
+}
+
+impl HysteriaTransport for QuinnHysteriaTransport {
+    fn dial_and_authenticate(
+        &self,
+        dest: &DialDestination,
+        quic_config: &QuicConfig,
+        auth_token: &str,
+        brutal_up_bps: u64,
+    ) -> Pin<Box<dyn std::future::Future<Output = io::Result<Arc<dyn QuicConn>>> + Send>> {
+        let rustls_config = self.rustls_config.clone();
+        let dest = dest.clone();
+        let quic_config = quic_config.clone();
+        let auth_token = auth_token.to_string();
+
+        Box::pin(async move {
+            // 1. quinn ClientConfig
+            let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from((*rustls_config).clone())
+                .map_err(|e| io::Error::other(format!("rustls→quic: {e}")))?;
+            let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client));
+            client_config.transport_config(Arc::new(Self::build_transport_config(&quic_config)));
+
+            // 2. bind + connect
+            let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
+                .map_err(|e| io::Error::other(format!("bind: {e}")))?;
+            let conn = endpoint.connect_with(client_config, dest.udp_addr, &dest.host)
+                .map_err(|e| io::Error::other(format!("quinn connect: {e}")))?
+                .await
+                .map_err(|e| io::Error::other(format!("quinn handshake: {e}")))?;
+
+            // 3. h3 POST /auth
+            let (mut h3_conn, mut send_req) = h3::client::new(h3_quinn::Connection::new(conn.clone())).await
+                .map_err(|e| io::Error::other(format!("h3 connect: {e}")))?;
+
+            let req = http::Request::builder()
+                .method("POST")
+                .uri(config::URLPath)
+                .header("Host", config::URLHost)
+                .header(config::RequestHeaderAuth, &auth_token)
+                .header(config::CommonHeaderCCRX, brutal_up_bps.to_string())
+                .header(config::CommonHeaderPadding, "0")
+                .body(())
+                .map_err(|e| io::Error::other(format!("build req: {e}")))?;
+
+            let mut req_stream = send_req.send_request(req).await
+                .map_err(|e| io::Error::other(format!("h3 send_request: {e}")))?;
+            let _ = req_stream.finish().await;
+            let resp = req_stream.recv_response().await
+                .map_err(|e| io::Error::other(format!("h3 recv_response: {e}")))?;
+
+            if resp.status().as_u16() != config::StatusAuthOK {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("hysteria auth failed: HTTP {}", resp.status()),
+                ));
+            }
+
+            drop(h3_conn);
+
+            // 4. 返回已认证的 QUIC 连接
+            let result: Arc<dyn QuicConn> = Arc::new(QuinnQuicConn::new(conn));
+            Ok(result)
+        })
+    }
+
+    fn open_stream(
+        &self,
+        conn: &Arc<dyn QuicConn>,
+    ) -> Pin<Box<dyn std::future::Future<Output = io::Result<Arc<dyn QuicStream>>> + Send>> {
+        let conn = conn.clone();
+        Box::pin(async move {
+            let quinn_conn = conn.as_quinn_connection()
+                .ok_or_else(|| io::Error::other("not a quinn connection"))?;
+            let (send, recv) = quinn_conn.open_bi().await
+                .map_err(|e| io::Error::other(format!("quinn open_bi: {e}")))?;
+            let result: Arc<dyn QuicStream> = Arc::new(QuinnQuicStream::new(
+                send, recv,
+                conn.local_addr(), conn.remote_addr(),
+            ));
+            Ok(result)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

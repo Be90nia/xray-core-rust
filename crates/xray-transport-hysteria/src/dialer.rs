@@ -20,6 +20,7 @@ use parking_lot::Mutex;
 use xray_proto::xray::transport::internet::{QuicParams, UdpHop as ProtoUdpHop};
 
 use crate::config::Status;
+use crate::quinn_adapter::QuinnHysteriaTransport;
 use crate::conn::{InterStreamConn, QuicConn, QuicStream, UdpSessionManager};
 use crate::context::DatagramFromContext;
 use crate::error::{HysteriaError, Result};
@@ -382,6 +383,54 @@ impl HysteriaDialerFactory for StubDialerFactory {
         _quic_params: &QuicParams,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Arc<crate::conn::InterConn>>> + Send>> {
         Box::pin(async { Err(HysteriaError::ConnectionClosed) })
+    }
+}
+
+/// quinn 实现的 [`HysteriaDialerFactory`]（切片1b）。
+///
+/// 持有 rustls ClientConfig，每次拨号创建 [`QuinnHysteriaTransport`] + [`HysteriaClient`]。
+pub struct QuinnDialerFactory {
+    rustls_config: Arc<rustls::ClientConfig>,
+}
+
+impl QuinnDialerFactory {
+    #[must_use]
+    pub fn new(rustls_config: Arc<rustls::ClientConfig>) -> Self {
+        Self { rustls_config }
+    }
+}
+
+impl HysteriaDialerFactory for QuinnDialerFactory {
+    fn dial_tcp(
+        &self,
+        dest: &DialDestination,
+        config: &Config,
+        quic_params: &QuicParams,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Arc<InterStreamConn>>> + Send>> {
+        let transport: Arc<dyn HysteriaTransport> = Arc::new(QuinnHysteriaTransport::new(self.rustls_config.clone()));
+        let client = HysteriaClient::new(
+            dest.clone(),
+            Arc::new(config.clone()),
+            Arc::new(quic_params.clone()),
+            transport,
+        );
+        Box::pin(async move { client.tcp().await })
+    }
+
+    fn dial_udp(
+        &self,
+        dest: &DialDestination,
+        config: &Config,
+        quic_params: &QuicParams,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Arc<crate::conn::InterConn>>> + Send>> {
+        let transport: Arc<dyn HysteriaTransport> = Arc::new(QuinnHysteriaTransport::new(self.rustls_config.clone()));
+        let client = HysteriaClient::new(
+            dest.clone(),
+            Arc::new(config.clone()),
+            Arc::new(quic_params.clone()),
+            transport,
+        );
+        Box::pin(async move { client.udp().await })
     }
 }
 
