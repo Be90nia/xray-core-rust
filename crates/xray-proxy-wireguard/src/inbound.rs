@@ -64,10 +64,18 @@ impl WireguardInboundHandler {
                 "wireguard inbound requires at least one peer".into(),
             ));
         }
-        let peer_cfg = &config.peers[0];
-
-        // peer session（server 模式不预先设置 endpoint——从首包学习）
-        let peer: SharedPeer = shared_peer(config, peer_cfg, 0)?;
+        // 创建所有配置的 peer session（multi-peer server 模式）
+        let mut peers = Vec::with_capacity(config.peers.len());
+        let mut allowed_cidrs = Vec::with_capacity(config.peers.len());
+        for (i, peer_cfg) in config.peers.iter().enumerate() {
+            peers.push(shared_peer(config, peer_cfg, i as u32)?);
+            let cidrs: Vec<smoltcp::wire::IpCidr> = peer_cfg
+                .allowed_ips
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            allowed_cidrs.push(cidrs);
+        }
 
         // 绑定监听 UDP
         let bind_addr = format!("0.0.0.0:{listen_port}");
@@ -77,9 +85,7 @@ impl WireguardInboundHandler {
         let local_cidrs = parse_local_cidrs(config)?;
         let mtu = config.effective_mtu() as usize;
         let netstack = Arc::new(AsyncMutex::new(WgNetStack::new(&local_cidrs, mtu)));
-
-        // driver（server 模式不设 remote——从首包学习）
-        let driver = Arc::new(WgDriver::new(peer, sock, Arc::clone(&netstack)));
+        let driver = Arc::new(WgDriver::new_multi(peers, allowed_cidrs, sock, Arc::clone(&netstack)));
 
         Ok(Self {
             tag,
