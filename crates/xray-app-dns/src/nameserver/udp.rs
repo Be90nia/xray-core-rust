@@ -102,6 +102,7 @@ impl UdpNameServer {
             ns.disable_cache.unwrap_or(false),
             ns.serve_stale.unwrap_or(false),
             ns.serve_expired_ttl.unwrap_or(0),
+            ns.negative_ttl_secs.unwrap_or(0),
         ));
         Ok(Box::new(Self::new(
             socket_addr,
@@ -312,7 +313,7 @@ mod tests {
 
         let ns = UdpNameServer::new(
             addr,
-            Arc::new(CacheController::new("test", true, false, 0)),
+            Arc::new(CacheController::new("test", true, false, 0, 0)),
             Vec::new(),
             Duration::from_secs(2),
         );
@@ -328,7 +329,7 @@ mod tests {
 
         let ns = UdpNameServer::new(
             addr,
-            Arc::new(CacheController::new("test", true, false, 0)),
+            Arc::new(CacheController::new("test", true, false, 0, 0)),
             Vec::new(),
             Duration::from_secs(2),
         );
@@ -354,7 +355,7 @@ mod tests {
 
         let ns = UdpNameServer::new(
             addr,
-            Arc::new(CacheController::new("test", true, false, 0)),
+            Arc::new(CacheController::new("test", true, false, 0, 0)),
             Vec::new(),
             Duration::from_millis(100),
         );

@@ -36,11 +36,14 @@ pub struct CacheController {
     pub serve_stale: bool,
     /// 过期数据可服务的负 TTL（Go `serveExpiredTTL` 存为 `-int32(原值)`）。
     pub serve_expired_ttl_secs: i32,
+    /// 负缓存 TTL（秒）。0 = 禁用。对应 Go cache 无显式字段，由 caller 用空 IpRecord + TTL 实现。
+    pub negative_ttl_secs: u32,
     ips: RwLock<HashMap<String, Arc<Record>>>,
     /// 缓存生命周期峰值，用于收缩阈值计算。
     high_watermark: RwLock<usize>,
     /// 广播通道发送端（响应到达时发 `CacheEvent`）。
     pub tx: broadcast::Sender<CacheEvent>,
+    pub single_flight: tokio::sync::Mutex<HashMap<(String, bool, bool), broadcast::Sender<crate::nameserver::cached::QueryOutcome>>>,
 }
 
 /// 广播事件。对应 Go `pubsub` 中的 `*IPRecord` 消息。
@@ -65,6 +68,7 @@ impl CacheController {
         disable_cache: bool,
         serve_stale: bool,
         serve_expired_ttl: u32,
+        negative_ttl_secs: u32,
     ) -> Self {
         let (tx, _) = broadcast::channel(256);
         Self {
@@ -72,9 +76,11 @@ impl CacheController {
             disable_cache,
             serve_stale,
             serve_expired_ttl_secs: -(serve_expired_ttl as i32),
+            negative_ttl_secs,
             ips: RwLock::new(HashMap::new()),
             high_watermark: RwLock::new(0),
             tx,
+            single_flight: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -277,7 +283,22 @@ impl CacheController {
     pub const fn option_enables(option: IpOption) -> (bool, bool) {
         (option.ipv4_enable, option.ipv6_enable)
     }
+
+    /// 写入负缓存条目（空 IP + short TTL）。
+    pub fn upsert_negative(&self, fqdn: &str, is_v4: bool, now: Instant) {
+        if self.negative_ttl_secs == 0 {
+            return;
+        }
+        let rec = IpRecord {
+            req_id: 0,
+            ips: Vec::new(),
+            expire: now + Duration::from_secs(self.negative_ttl_secs as u64),
+            rcode: 3, // NXDOMAIN
+        };
+        self.upsert(fqdn, is_v4, rec);
+    }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -286,7 +307,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     fn make_ctrl() -> CacheController {
-        CacheController::new("test", false, false, 0)
+        CacheController::new("test", false, false, 0, 0)
     }
 
     #[test]
@@ -375,7 +396,7 @@ mod tests {
 
     #[test]
     fn serve_stale_shifts_effective_now() {
-        let c = CacheController::new("test", false, true, 30);
+        let c = CacheController::new("test", false, true, 30, 0);
         assert_eq!(c.serve_expired_ttl_secs, -30);
         // effective_now 应当 now + 30s（Go: now.Add(-30s) 后与 expire 比较）。
         let now = Instant::now();

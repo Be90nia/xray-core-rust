@@ -21,6 +21,8 @@ tokio-tungstenite.workspace = true
 tokio-rustls = { workspace = true }
 rustls-pki-types.workspace = true
 rustls.workspace = true
+rustls-pemfile = "2"
+
 futures-util = "0.3"
 http = "1"
 

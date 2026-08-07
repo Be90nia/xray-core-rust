@@ -86,7 +86,11 @@ impl StaticHosts {
         // ponytail: 在内存里构造 `FullMatcher` 的聚合，单规则查表。
         // TODO: 等 xray-geodata 暴露 `DomainRegistry::build_many` 或类似 API 后替换。
         let matcher: Box<dyn DomainMatcher> = Box::new(InMemoryMatcher {
-            rules: mappings.into_iter().map(|m| m.domain.to_lowercase()).collect(),
+            rules: mappings
+                .into_iter()
+                .enumerate()
+                .map(|(i, m)| (m.domain.to_lowercase(), i as u32))
+                .collect(),
         });
 
         Ok(Self {
@@ -177,28 +181,21 @@ fn filter_ip_entries(entries: &[&ResponseEntry], option: IpOption) -> Vec<Addres
     out
 }
 
-/// 简易内存域名 matcher（Full 匹配 + 大小写不敏感）。
+/// Hash 域名 matcher（O(1) exact match + 大小写不敏感）。
 ///
-/// ponytail: xray-geodata 的 `MphDomainMatcher` 需通过工厂构建，
-/// 此处先用最简单的 `Vec<String>` 线性查找，rule_id 为下标。
-/// 待 geodata 暴露 `build_many` API 后替换。
+/// 对齐 Go 的 `MphDomainMatcher` 语义但简化为 exact match only
+///（hosts 表不支持 wildcard，对齐 Go `StaticHosts` 行为）。
 struct InMemoryMatcher {
-    rules: Vec<String>,
+    rules: std::collections::HashMap<String, u32>,
 }
 
 impl DomainMatcher for InMemoryMatcher {
     fn match_domain(&self, input: &str) -> Vec<u32> {
-        let mut out = Vec::new();
-        for (i, r) in self.rules.iter().enumerate() {
-            if r == input {
-                out.push(i as u32);
-            }
-        }
-        out
+        self.rules.get(input).copied().into_iter().collect()
     }
 
     fn match_any(&self, input: &str) -> bool {
-        self.rules.iter().any(|r| r == input)
+        self.rules.contains_key(input)
     }
 }
 

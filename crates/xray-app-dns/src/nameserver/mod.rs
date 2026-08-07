@@ -108,6 +108,8 @@ pub struct NameServerConfig {
     pub serve_stale: Option<bool>,
     /// 过期 TTL。
     pub serve_expired_ttl: Option<u32>,
+    /// 负缓存 TTL（秒）。None = 禁用。
+    pub negative_ttl_secs: Option<u32>,
     /// 查询策略覆写（None 表示跟随全局）。
     pub query_strategy: Option<QueryStrategy>,
     /// 策略 ID。
@@ -129,6 +131,7 @@ impl Default for NameServerConfig {
             disable_cache: None,
             serve_stale: None,
             serve_expired_ttl: None,
+            negative_ttl_secs: None,
             query_strategy: None,
             policy_id: 0,
         }

@@ -123,6 +123,7 @@ impl DohNameServer {
             ns.disable_cache.unwrap_or(false),
             ns.serve_stale.unwrap_or(false),
             ns.serve_expired_ttl.unwrap_or(0),
+            ns.negative_ttl_secs.unwrap_or(0),
         ));
         Ok(Box::new(Self::new(
             socket_addr,
@@ -430,7 +431,7 @@ mod tests {
             addr,
             "localhost".to_string(),
             tls_config,
-            Arc::new(CacheController::new("test", true, false, 0)),
+            Arc::new(CacheController::new("test", true, false, 0, 0)),
             Vec::new(),
             Duration::from_secs(5),
         );
@@ -449,7 +450,7 @@ mod tests {
             addr,
             "localhost".to_string(),
             tls_config,
-            Arc::new(CacheController::new("test", true, false, 0)),
+            Arc::new(CacheController::new("test", true, false, 0, 0)),
             Vec::new(),
             Duration::from_secs(5),
         );
@@ -529,7 +530,7 @@ mod tests {
             addr,
             "localhost".to_string(),
             tls_config,
-            Arc::new(CacheController::new("test", true, false, 0)),
+            Arc::new(CacheController::new("test", true, false, 0, 0)),
             Vec::new(),
             Duration::from_secs(5),
         );

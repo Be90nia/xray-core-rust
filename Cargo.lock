@@ -6465,6 +6465,7 @@ dependencies = [
  "http",
  "rcgen 0.13.2",
  "rustls",
+ "rustls-pemfile",
  "rustls-pki-types",
  "serde_json",
  "sha1",

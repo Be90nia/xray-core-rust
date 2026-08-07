@@ -85,7 +85,7 @@ async fn udp_query_returns_correct_a_record() {
 
     let ns = UdpNameServer::new(
         addr,
-        Arc::new(CacheController::new("test", true, false, 0)), // disable_cache=true 强制走网络
+        Arc::new(CacheController::new("test", true, false, 0, 0)), // disable_cache=true 强制走网络
         Vec::new(),
         Duration::from_secs(2),
     );
@@ -121,7 +121,7 @@ async fn udp_query_cache_hit_on_second_call() {
 
     let ns = UdpNameServer::new(
         addr,
-        Arc::new(CacheController::new("test", false, false, 0)), // cache ENABLED
+        Arc::new(CacheController::new("test", false, false, 0, 0)), // cache ENABLED
         Vec::new(),
         Duration::from_secs(2),
     );
@@ -181,7 +181,7 @@ async fn udp_query_with_edns0_client_ip_attaches_subnet() {
     // client_ip = 4 字节 IPv4 → 应被附加为 EDNS0 client subnet /24。
     let ns = UdpNameServer::new(
         addr,
-        Arc::new(CacheController::new("test", true, false, 0)),
+        Arc::new(CacheController::new("test", true, false, 0, 0)),
         vec![192, 168, 1, 100],
         Duration::from_secs(2),
     );
@@ -239,7 +239,7 @@ async fn tcp_query_returns_a_record() {
 
     let ns = TcpNameServer::new(
         addr,
-        Arc::new(CacheController::new("test", true, false, 0)),
+        Arc::new(CacheController::new("test", true, false, 0, 0)),
         Vec::new(),
         Duration::from_secs(2),
     );
@@ -273,7 +273,7 @@ async fn udp_query_aaaa_record() {
 
     let ns = UdpNameServer::new(
         addr,
-        Arc::new(CacheController::new("test", true, false, 0)),
+        Arc::new(CacheController::new("test", true, false, 0, 0)),
         Vec::new(),
         Duration::from_secs(2),
     );
@@ -306,7 +306,7 @@ async fn server_trait_object_dispatch() {
     .await;
     let ns = UdpNameServer::new(
         addr,
-        Arc::new(CacheController::new("test", true, false, 0)),
+        Arc::new(CacheController::new("test", true, false, 0, 0)),
         Vec::new(),
         Duration::from_secs(2),
     );

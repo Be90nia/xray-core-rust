@@ -48,6 +48,17 @@ pub struct QueryOutcome {
     pub errors: Vec<DnsError>,
 }
 
+/// singleflight 仅 clone rec_v4/rec_v6，errors 不复制（诊断用途）。
+impl Clone for QueryOutcome {
+    fn clone(&self) -> Self {
+        Self {
+            rec_v4: self.rec_v4.clone(),
+            rec_v6: self.rec_v6.clone(),
+            errors: Vec::new(),
+        }
+    }
+}
+
 /// 缓存入口查询。对应 Go `queryIP(ctx, s, domain, option)`。
 ///
 /// 1. 若缓存启用且命中：返回 `(ips, ttl, Ok)` 或 stale 优化路径。
@@ -88,11 +99,40 @@ pub async fn fetch<S: CachedNameserver>(
     fqdn: &str,
     option: IpOption,
 ) -> Result<(Vec<IpAddr>, u32), DnsError> {
-    let outcome = server.send_query(fqdn, option).await;
+    let cache = server.cache_controller();
+    let sf_key = (fqdn.to_string(), option.ipv4_enable, option.ipv6_enable);
+
+    // singleflight：如果已有同名查询在进行，等待其结果。
+    let outcome = {
+        let mut sf = cache.single_flight.lock().await;
+        if let Some(tx) = sf.get(&sf_key) {
+            let mut rx = tx.subscribe();
+            drop(sf);
+            match rx.recv().await {
+                Ok(o) => o,
+                Err(_) => {
+                    // 发送方已 drop（超时/错误），回退到直查
+                    server.send_query(fqdn, option).await
+                }
+            }
+        } else {
+            let (tx, _) = broadcast::channel(1);
+            sf.insert(sf_key.clone(), tx);
+            drop(sf);
+
+            let outcome = server.send_query(fqdn, option).await;
+
+            // 广播给等待者。
+            let mut sf = cache.single_flight.lock().await;
+            if let Some(tx) = sf.remove(&sf_key) {
+                let _ = tx.send(outcome.clone());
+            }
+            outcome
+        }
+    };
     let now = Instant::now();
 
-    // 广播结果到 cache。
-    let cache = server.cache_controller();
+    // 缓存结果。
     if let Some(rec) = outcome.rec_v4.clone() {
         let _ = cache.tx.send(crate::cache_controller::CacheEvent::Record {
             domain: fqdn.to_string(),
@@ -100,6 +140,8 @@ pub async fn fetch<S: CachedNameserver>(
             record: rec.clone(),
         });
         cache.upsert(fqdn, true, rec);
+    } else if option.ipv4_enable {
+        cache.upsert_negative(fqdn, true, now);
     }
     if let Some(rec) = outcome.rec_v6.clone() {
         let _ = cache.tx.send(crate::cache_controller::CacheEvent::Record {
@@ -108,6 +150,8 @@ pub async fn fetch<S: CachedNameserver>(
             record: rec.clone(),
         });
         cache.upsert(fqdn, false, rec);
+    } else if option.ipv6_enable {
+        cache.upsert_negative(fqdn, false, now);
     }
 
     let (ips, ttl) = merge_records(
@@ -117,12 +161,7 @@ pub async fn fetch<S: CachedNameserver>(
         now,
     )?;
 
-    // Go 行为：ttl == 0 && err == RecordNotFound → 返回 ttl=0；其他负 ttl 返回 1。
-    let r_ttl: u32 = if ttl > 0 {
-        ttl as u32
-    } else {
-        1
-    };
+    let r_ttl: u32 = if ttl > 0 { ttl as u32 } else { 1 };
     Ok((ips, r_ttl))
 }
 
@@ -198,7 +237,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_ip_falls_through_to_send_query_on_cache_miss() {
-        let cache = Arc::new(CacheController::new("test", false, false, 0));
+        let cache = Arc::new(CacheController::new("test", false, false, 0, 0));
         let server = StubServer {
             cache,
             rec_v4: Some(v4_record(60)),
@@ -211,7 +250,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_ip_returns_cached_when_enabled_and_fresh() {
-        let cache = Arc::new(CacheController::new("test", false, false, 0));
+        let cache = Arc::new(CacheController::new("test", false, false, 0, 0));
         // 预填缓存。
         cache.upsert("example.com.", true, v4_record(60));
 
@@ -228,7 +267,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_ip_skips_cache_when_disabled() {
-        let cache = Arc::new(CacheController::new("test", true, false, 0));
+        let cache = Arc::new(CacheController::new("test", true, false, 0, 0));
         cache.upsert("example.com.", true, v4_record(60));
 
         let server = StubServer {
@@ -242,7 +281,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_broadcasts_event_to_cache_subscribers() {
-        let cache = Arc::new(CacheController::new("test", false, false, 0));
+        let cache = Arc::new(CacheController::new("test", false, false, 0, 0));
         let mut rx = cache.subscribe();
         let server = StubServer {
             cache: cache.clone(),

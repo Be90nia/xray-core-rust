@@ -136,10 +136,47 @@ async fn listen_ws(
     Ok(Box::new(WsTransportListener { local_addr, close_notify }))
 }
 
-/// 构建 TLS server config（用于 wss:// 监听）。
-/// TODO: 接入 xray_tls::ocsp_stapling::build_server_config_with_stapling
-fn build_tls_server_config(_settings: &StreamSettings) -> io::Result<Arc<tokio_rustls::rustls::ServerConfig>> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "TLS server config not yet implemented for WebSocket listener"))
+/// 从 `StreamSettings.security_json` 构建 TLS server config。
+///
+/// 解析 Go 格式 TLS JSON：`certificates[].certificateFile` + `keyFile`。
+/// 仅使用第一对证书（ponytail：多证书 SNI 场景后续扩展）。
+fn build_tls_server_config(settings: &StreamSettings) -> io::Result<Arc<tokio_rustls::rustls::ServerConfig>> {
+    let json = settings.security_json.as_ref().ok_or_else(|| {
+        io::Error::other("security=tls but no security_json provided")
+    })?;
+
+    // 提取第一对 certificateFile + keyFile
+    let certs_json = json.get("certificates").and_then(|v| v.as_array())
+        .ok_or_else(|| io::Error::other("TLS config missing 'certificates' array"))?;
+    let first_cert = certs_json.first()
+        .ok_or_else(|| io::Error::other("TLS config 'certificates' array is empty"))?;
+
+    let cert_file = first_cert.get("certificateFile").and_then(|v| v.as_str())
+        .ok_or_else(|| io::Error::other("TLS certificate missing 'certificateFile'"))?;
+    let key_file = first_cert.get("keyFile").and_then(|v| v.as_str())
+        .ok_or_else(|| io::Error::other("TLS certificate missing 'keyFile'"))?;
+
+    // 加载 PEM 证书链 + 私钥
+    let cert_pem = std::fs::read(cert_file)
+        .map_err(|e| io::Error::other(format!("read cert file {cert_file}: {e}")))?;
+    let key_pem = std::fs::read(key_file)
+        .map_err(|e| io::Error::other(format!("read key file {key_file}: {e}")))?;
+
+    let certs: Vec<rustls::pki_types::CertificateDer> =
+        rustls_pemfile::certs(&mut cert_pem.as_slice())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| io::Error::other(format!("parse cert PEM: {e}")))?;
+
+    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+        .map_err(|e| io::Error::other(format!("parse key PEM: {e}")))?
+        .ok_or_else(|| io::Error::other("no private key found in key file"))?
+;
+
+    let config = tokio_rustls::rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| io::Error::other(format!("build TLS server config: {e}")))?;
+    Ok(Arc::new(config))
 }
 
 /// WebSocket `TransportListener` wrapper。只持有 local_addr + close 通知。
