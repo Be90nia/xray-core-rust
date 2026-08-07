@@ -29,6 +29,7 @@
 
 pub mod error;
 pub mod client_config;
+pub mod server_config;
 pub mod pin;
 pub mod fingerprint;
 pub mod certificate;
