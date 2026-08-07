@@ -36,6 +36,7 @@ pub mod client;
 pub mod common;
 pub mod server;
 pub mod xor;
+pub mod xor_conn;
 pub mod vision;
 pub mod vision_conn;
 
