@@ -59,6 +59,35 @@ impl CertificateUsage {
     }
 }
 
+use std::io;
+
+// ============================================================
+// 证书生成（对应 Go Generate + GenerateCertFunc）
+// ============================================================
+
+/// 生成自签名证书（用于测试或无外部证书配置时）。
+///
+/// 对应 Go `transport/internet/tls/tls.go::Generate`。
+///
+/// 返回 `(cert_pem, key_pem)`。
+///
+/// # 示例
+/// ```
+/// use xray_tls::certificate::generate_self_signed_cert;
+/// let (cert, key) = generate_self_signed_cert(&["localhost", "127.0.0.1"]).unwrap();
+/// assert!(cert.contains("BEGIN CERTIFICATE"));
+/// assert!(key.contains("BEGIN PRIVATE KEY"));
+/// ```
+pub fn generate_self_signed_cert(common_names: &[&str]) -> io::Result<(String, String)> {
+    let params = rcgen::CertificateParams::new(
+        common_names.iter().map(|s| s.to_string()).collect::<Vec<String>>(),
+    ).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    let key_pair = rcgen::KeyPair::generate()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    let cert = params.self_signed(&key_pair)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    Ok((cert.pem(), key_pair.serialize_pem()))
+}
 /// `Certificate.usage == ENCIPHERMENT`？
 ///
 /// 对应 Go `BuildCertificates` 中 `if entry.Usage != Certificate_ENCIPHERMENT { continue }`。
