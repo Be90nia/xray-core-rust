@@ -86,15 +86,18 @@ const CHROME_133_SIGALGS: &str = concat!(
     "rsa_pkcs1_sha1"
 );
 
-/// Chrome 133 supported groups。
-/// 诊断：暂时移除 PQ X25519MLKEM768，只用经典曲线。
-const CHROME_133_CURVES: &str = "X25519:P-256:P-384";
+/// Chrome 133 supported groups（PQ X25519MLKEM768 优先）。
+/// Chrome 133+ 默认发送 PQ key share，组顺序：PQ → classic。
+const CHROME_133_CURVES: &str = "X25519MLKEM768:X25519:P-256:P-384";
 
 /// Chrome 133 ALPN。
 const CHROME_133_ALPN: &[u8] = b"\x02h2\x08http/1.1";
 
-/// Chrome 133 key shares（仅 X25519，诊断：移除 PQ）。
+/// Chrome 133 key shares（PQ X25519MLKEM768 + X25519）。
+/// 对应 Chrome 133 ClientHello 的 key_share 扩展。
+/// 注意: btls/BoringSSL 自动从 set_curves_list 的前 N 组生成 key share。
 const CHROME_133_KEY_SHARES: &[KeyShare] = &[
+    KeyShare::X25519_MLKEM768,
     KeyShare::X25519,
 ];
 
@@ -152,9 +155,8 @@ fn chrome_133_connector() -> io::Result<SslConnector> {
     builder
         .set_delegated_credentials(CHROME_133_SIGALGS)
         .map_err(|e| io::Error::other(e.to_string()))?;
-    // PQ key share (X25519MLKEM768) 暂时禁用——BoringSSL 在 server 不支持
-    // MLKEM768 时报 'unknown BoringSSL error' 而非 graceful fallback
-    // TODO: 等 BoringSSL/CF 上游修复 PQ key share fallback 后再启用
+    // PQ key share (X25519MLKEM768) 通过 set_curves_list 中的组顺序自动生成。
+    // Chrome 133+ 将 PQ 组排在首位以启用 post-quantum TLS.
 
     // 禁用内置 root 验证（xray 自行管理证书验证）
     builder.set_verify(btls::ssl::SslVerifyMode::NONE);
