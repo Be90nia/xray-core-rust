@@ -47,13 +47,17 @@ async fn socks5_proxy_to_echo_target_e2e() {
         let dest = socks5_server_handshake(&mut client_stream, &config)
             .await
             .expect("handshake");
-        // SocksAddr → Destination
-        let address = match dest.host {
+        // SocksRequest::TcpConnect(SocksAddr) → Destination
+        let dest_addr = match dest {
+            xray_proxy_socks::server::SocksRequest::TcpConnect(addr) => addr,
+            _ => panic!("expected TcpConnect"),
+        };
+        let address = match dest_addr.host {
             Host::Ipv4(ip) => Address::IPv4(ip),
             Host::Ipv6(ip) => Address::IPv6(ip),
             Host::Domain(_) => panic!("expected IP address from handshake"),
         };
-        let destination = Destination::new(address, Port::new(dest.port), Network::TCP);
+        let destination = Destination::new(address, Port::new(dest_addr.port), Network::TCP);
         // dial target
         let target_conn = dial_system(&destination, &SocketOptions::default())
             .await
