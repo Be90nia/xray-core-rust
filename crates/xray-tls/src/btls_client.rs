@@ -905,6 +905,79 @@ pub(crate) fn connector_for_fingerprint(fp: &Fingerprint) -> Option<io::Result<F
                 alps: QQ_11_1_ALPS,
             }))
         }
+        // Old Chrome variants → Chrome 120 (oldest implemented)
+        Fingerprint::HelloChromeAuto | Fingerprint::HelloChrome58 | Fingerprint::HelloChrome62
+        | Fingerprint::HelloChrome70 | Fingerprint::HelloChrome72 | Fingerprint::HelloChrome83
+        | Fingerprint::HelloChrome87 | Fingerprint::HelloChrome96 | Fingerprint::HelloChrome100
+        | Fingerprint::HelloChrome102 | Fingerprint::HelloChrome106Shuffle
+        | Fingerprint::HelloChrome100Psk | Fingerprint::HelloChrome112PskShuf
+        | Fingerprint::HelloChrome114PaddingPskShuf | Fingerprint::HelloChrome115Pq
+        | Fingerprint::HelloChrome115PqPsk | Fingerprint::HelloChrome120Pq => {
+            tracing::warn!(target: "xray_tls::fingerprint", "old Chrome fingerprint {:?} falling back to Chrome 120", fp);
+            Some(chrome_120_connector().map(|c| FingerprintConfig {
+                connector: c, key_shares: CHROME_120_KEY_SHARES, alps: CHROME_120_ALPS,
+            }))
+        }
+        // Old Firefox variants → Firefox 120
+        Fingerprint::HelloFirefoxAuto | Fingerprint::HelloFirefox55 | Fingerprint::HelloFirefox56
+        | Fingerprint::HelloFirefox63 | Fingerprint::HelloFirefox65 | Fingerprint::HelloFirefox99
+        | Fingerprint::HelloFirefox102 | Fingerprint::HelloFirefox105 => {
+            tracing::warn!(target: "xray_tls::fingerprint", "old Firefox fingerprint {:?} falling back to Firefox 120", fp);
+            Some(firefox_120_connector().map(|c| FingerprintConfig {
+                connector: c, key_shares: FIREFOX_120_KEY_SHARES, alps: FIREFOX_120_ALPS,
+            }))
+        }
+        // Old iOS/Safari variants → iOS 13
+        Fingerprint::HelloIosAuto | Fingerprint::HelloIos11_1 | Fingerprint::HelloIos12_1
+        | Fingerprint::HelloSafari16_0 | Fingerprint::HelloSafariAuto => {
+            tracing::warn!(target: "xray_tls::fingerprint", "old iOS/Safari fingerprint {:?} falling back to Safari 26.3", fp);
+            Some(safari_26_3_connector().map(|c| FingerprintConfig {
+                connector: c, key_shares: IOS_13_KEY_SHARES, alps: IOS_13_ALPS,
+            }))
+        }
+        // Old Edge variants → Edge 106
+        Fingerprint::HelloEdge85 | Fingerprint::HelloEdgeAuto => {
+            tracing::warn!(target: "xray_tls::fingerprint", "old Edge fingerprint {:?} falling back to Edge 106", fp);
+            Some(edge_106_connector().map(|c| FingerprintConfig {
+                connector: c, key_shares: EDGE_106_KEY_SHARES, alps: EDGE_106_ALPS,
+            }))
+        }
+        // Old 360/QQ variants → existing
+        Fingerprint::Hello360Auto | Fingerprint::Hello360_7_5 => {
+            tracing::warn!(target: "xray_tls::fingerprint", "old 360 fingerprint {:?} falling back to 360 11.0", fp);
+            Some(qihoo_360_11_0_connector().map(|c| FingerprintConfig {
+                connector: c, key_shares: QIHOO_360_11_0_KEY_SHARES, alps: QIHOO_360_11_0_ALPS,
+            }))
+        }
+        Fingerprint::HelloQqAuto => {
+            tracing::warn!(target: "xray_tls::fingerprint", "old QQ fingerprint {:?} falling back to QQ 11.1", fp);
+            Some(qq_11_1_connector().map(|c| FingerprintConfig {
+                connector: c, key_shares: QQ_11_1_KEY_SHARES, alps: QQ_11_1_ALPS,
+            }))
+        }
+        // Android → Chrome (Android WebView ≈ Chrome)
+        Fingerprint::Android | Fingerprint::HelloAndroid11OkHttp => {
+            tracing::warn!(target: "xray_tls::fingerprint", "Android fingerprint {:?} falling back to Chrome 133", fp);
+            Some(chrome_133_connector().map(|c| FingerprintConfig {
+                connector: c, key_shares: CHROME_133_KEY_SHARES, alps: CHROME_133_ALPS,
+            }))
+        }
+        // Golang → Chrome 120 (Go stdlib has no uTLS fingerprint)
+        Fingerprint::HelloGolang => {
+            tracing::warn!(target: "xray_tls::fingerprint", "Golang fingerprint falling back to Chrome 120");
+            Some(chrome_120_connector().map(|c| FingerprintConfig {
+                connector: c, key_shares: CHROME_120_KEY_SHARES, alps: CHROME_120_ALPS,
+            }))
+        }
+        // Random → Chrome 133 (most common modern browser)
+        Fingerprint::Random | Fingerprint::Randomized | Fingerprint::HelloRandomized
+        | Fingerprint::HelloRandomizedAlpn => {
+            tracing::debug!(target: "xray_tls::fingerprint", "Random fingerprint → Chrome 133");
+            Some(chrome_133_connector().map(|c| FingerprintConfig {
+                connector: c, key_shares: CHROME_133_KEY_SHARES, alps: CHROME_133_ALPS,
+            }))
+        }
+        // No-ALPN variants → still None (no ALPN fingerprint not implemented)
         _ => None,
     }
 }
