@@ -327,6 +327,92 @@ impl HysteriaTransport for QuinnHysteriaTransport {
     }
 }
 
+// ===== 切片1b (续): QuinnQuicListener + QuinnListenerFactory =====
+
+use crate::hub::{HysteriaListenerFactory, HysteriaQuicListener};
+use xray_proto::xray::transport::internet::QuicParams;
+use crate::conn::InterStreamConn;
+
+/// quinn Endpoint 包装为 [`HysteriaQuicListener`]。
+pub struct QuinnQuicListener {
+    endpoint: quinn::Endpoint,
+    local_addr: SocketAddr,
+}
+
+impl QuinnQuicListener {
+    #[must_use]
+    pub fn new(endpoint: quinn::Endpoint) -> Option<Self> {
+        let local_addr = endpoint.local_addr().ok()?;
+        Some(Self { endpoint, local_addr })
+    }
+}
+
+impl HysteriaQuicListener for QuinnQuicListener {
+    fn accept(
+        &self,
+    ) -> Pin<Box<dyn std::future::Future<Output = io::Result<Arc<dyn QuicConn>>> + Send>> {
+        let ep = self.endpoint.clone();
+        Box::pin(async move {
+            let conn = ep.accept().await
+                .ok_or_else(|| io::Error::other("listener closed"))?
+                .await
+                .map_err(|e| io::Error::other(format!("quinn accept: {e}")))?;
+            let result: Arc<dyn QuicConn> = Arc::new(QuinnQuicConn::new(conn));
+            Ok(result)
+        })
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    fn close(&self) -> Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send>> {
+        let ep = self.endpoint.clone();
+        Box::pin(async move {
+            ep.close(VarInt::from_u32(0), b"");
+            Ok(())
+        })
+    }
+}
+
+/// quinn 实现的 [`HysteriaListenerFactory`]。
+pub struct QuinnListenerFactory {
+    rustls_server_config: Arc<rustls::ServerConfig>,
+}
+
+impl QuinnListenerFactory {
+    #[must_use]
+    pub fn new(rustls_server_config: Arc<rustls::ServerConfig>) -> Self {
+        Self { rustls_server_config }
+    }
+}
+
+impl HysteriaListenerFactory for QuinnListenerFactory {
+    fn listen(
+        &self,
+        bind_addr: SocketAddr,
+        _config: Arc<crate::proto_config::Config>,
+        quic_params: Arc<QuicParams>,
+        _masq: crate::hub::MasqType,
+        _validator: Option<Arc<dyn crate::hub::AuthValidator>>,
+        _on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync>,
+    ) -> Pin<Box<dyn std::future::Future<Output = crate::error::Result<Arc<dyn HysteriaQuicListener>>> + Send>> {
+        let rustls_config = self.rustls_server_config.clone();
+        Box::pin(async move {
+            let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from((*rustls_config).clone())
+                .map_err(|e| crate::error::HysteriaError::Io(io::Error::other(format!("rustls→quic server: {e}"))))?;
+            let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+            let qc = QuicConfig::from_params(&quic_params);
+            server_config.transport_config(Arc::new(QuinnHysteriaTransport::build_transport_config(&qc)));
+            let endpoint = quinn::Endpoint::server(server_config, bind_addr)
+                .map_err(|e| crate::error::HysteriaError::Io(io::Error::other(format!("bind: {e}"))))?;
+            let listener = QuinnQuicListener::new(endpoint)
+                .ok_or_else(|| crate::error::HysteriaError::Io(io::Error::other("local_addr failed")))?;
+            Ok(Arc::new(listener) as Arc<dyn HysteriaQuicListener>)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
