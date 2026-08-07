@@ -260,6 +260,18 @@ pub trait OutboundRemover: Send + Sync {
     fn remove_outbound_handler(&self, tag: &str) -> Result<(), ProxymanError>;
 }
 
+/// Handler 工厂（从 proto config 创建 handler）
+pub trait HandlerFactory: Send + Sync {
+    fn create_inbound(
+        &self,
+        config: &xray_proto::xray::core::InboundHandlerConfig,
+    ) -> Result<Arc<dyn InboundHandler>, ProxymanError>;
+    fn create_outbound(
+        &self,
+        config: &xray_proto::xray::core::OutboundHandlerConfig,
+    ) -> Result<Arc<dyn OutboundHandler>, ProxymanError>;
+}
+
 /// 默认 HandlerService 实现（对应 Go `handlerServer struct`）
 pub struct DefaultHandlerService {
     /// 入站 handler 提供方（对应 Go `ihm inbound.Manager`）
@@ -276,6 +288,8 @@ pub struct DefaultHandlerService {
     pub outbound_remover: Option<Arc<dyn OutboundRemover>>,
     /// TypedMessage 操作解码器
     pub op_decoder: Option<Arc<dyn OperationDecoder>>,
+    /// Handler 工厂（从 proto config 创建 handler）
+    pub factory: Option<Arc<dyn HandlerFactory>>,
 }
 
 impl Default for DefaultHandlerService {
@@ -288,6 +302,7 @@ impl Default for DefaultHandlerService {
             inbound_remover: None,
             outbound_remover: None,
             op_decoder: None,
+            factory: None,
         }
     }
 }
@@ -302,6 +317,7 @@ impl std::fmt::Debug for DefaultHandlerService {
             .field("has_inbound_remover", &self.inbound_remover.is_some())
             .field("has_outbound_remover", &self.outbound_remover.is_some())
             .field("has_op_decoder", &self.op_decoder.is_some())
+            .field("has_factory", &self.factory.is_some())
             .finish()
     }
 }
@@ -340,11 +356,15 @@ impl DefaultHandlerService {
 }
 
 impl HandlerService for DefaultHandlerService {
-    fn add_inbound(&self, _req: AddInboundRequest) -> Result<AddInboundResponse, ProxymanError> {
-        // ponytail: 解码 ReceiverConfig/ProxyConfig from TypedMessage → 依赖上层 factory 注入
-        Err(ProxymanError::Other(
-            "AddInbound requires TypedMessage decode + factory injection (TODO)".into(),
-        ))
+    fn add_inbound(&self, req: AddInboundRequest) -> Result<AddInboundResponse, ProxymanError> {
+        let registrar = self.inbound_registrar.as_ref()
+            .ok_or_else(|| ProxymanError::Other("inbound registrar not set".into()))?;
+        let factory = self.factory.as_ref()
+            .ok_or_else(|| ProxymanError::Other("handler factory not set".into()))?;
+        let config = req.inbound.ok_or_else(|| ProxymanError::Other("missing inbound config".into()))?;
+        let handler = factory.create_inbound(&config)?;
+        registrar.add_inbound_handler(handler)?;
+        Ok(AddInboundResponse {})
     }
 
     fn remove_inbound(&self, req: RemoveInboundRequest) -> Result<RemoveInboundResponse, ProxymanError> {
@@ -451,10 +471,15 @@ impl HandlerService for DefaultHandlerService {
         })
     }
 
-    fn add_outbound(&self, _req: AddOutboundRequest) -> Result<AddOutboundResponse, ProxymanError> {
-        Err(ProxymanError::Other(
-            "AddOutbound requires TypedMessage decode + factory injection (TODO)".into(),
-        ))
+    fn add_outbound(&self, req: AddOutboundRequest) -> Result<AddOutboundResponse, ProxymanError> {
+        let registrar = self.outbound_registrar.as_ref()
+            .ok_or_else(|| ProxymanError::Other("outbound registrar not set".into()))?;
+        let factory = self.factory.as_ref()
+            .ok_or_else(|| ProxymanError::Other("handler factory not set".into()))?;
+        let config = req.outbound.ok_or_else(|| ProxymanError::Other("missing outbound config".into()))?;
+        let handler = factory.create_outbound(&config)?;
+        registrar.add_outbound_handler(handler)?;
+        Ok(AddOutboundResponse {})
     }
 
     fn remove_outbound(
