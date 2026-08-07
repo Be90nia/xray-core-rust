@@ -23,9 +23,9 @@ use crate::common::{Address, PortList, StringList};
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// 日志配置（占位，待 `xray-app-log` 强类型化）。
+    /// 日志配置。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub log: Option<Value>,
+    pub log: Option<crate::app_config::LogConfig>,
 
     /// 路由配置（占位，待 `xray-app-router` 强类型化）。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -35,45 +35,45 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dns: Option<Value>,
 
-    /// 策略配置（占位）。
+    /// 策略配置。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub policy: Option<Value>,
+    pub policy: Option<crate::app_config::PolicyConfig>,
 
-    /// API 配置（占位）。
+    /// API 配置。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub api: Option<Value>,
+    pub api: Option<crate::app_config::ApiConfig>,
 
-    /// Metrics 配置（占位）。
+    /// Metrics 配置。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub metrics: Option<Value>,
+    pub metrics: Option<crate::app_config::MetricsConfig>,
 
-    /// 统计配置（占位）。
+    /// 统计配置。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stats: Option<Value>,
+    pub stats: Option<crate::app_config::StatsConfig>,
 
     /// 反向代理配置（占位）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reverse: Option<Value>,
 
-    /// FakeDNS 配置（占位）。JSON tag 是 camelCase `fakeDns`。
+    /// FakeDNS 配置。JSON tag 是 camelCase `fakeDns`。
     #[serde(rename = "fakeDns", skip_serializing_if = "Option::is_none")]
-    pub fake_dns: Option<Value>,
+    pub fake_dns: Option<crate::app_config::FakeDnsConfig>,
 
-    /// 观测器配置（占位）。
+    /// 观测器配置。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub observatory: Option<Value>,
+    pub observatory: Option<crate::app_config::ObservatoryConfig>,
 
-    /// 突发观测器配置（占位）。JSON tag 是 camelCase `burstObservatory`。
+    /// 突发观测器配置。JSON tag 是 camelCase `burstObservatory`。
     #[serde(rename = "burstObservatory", skip_serializing_if = "Option::is_none")]
-    pub burst_observatory: Option<Value>,
+    pub burst_observatory: Option<crate::app_config::BurstObservatoryConfig>,
 
-    /// 版本声明配置（占位）。
+    /// 版本声明配置。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<Value>,
+    pub version: Option<crate::app_config::VersionConfig>,
 
-    /// Geodata 配置（占位）。
+    /// Geodata 配置。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub geodata: Option<Value>,
+    pub geodata: Option<crate::app_config::GeodataConfig>,
 
     /// 旧式全局 transport 配置（Go 中已废弃，Build 时报错指引迁移到 streamSettings）。
     /// 保留字段以便给出精确错误而非静默吞掉。

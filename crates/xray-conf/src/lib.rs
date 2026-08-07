@@ -27,6 +27,7 @@
 //! ```
 
 pub mod built;
+pub mod app_config;
 pub mod common;
 pub mod confloader;
 pub mod config;
