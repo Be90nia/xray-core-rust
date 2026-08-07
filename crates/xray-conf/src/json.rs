@@ -13,9 +13,13 @@ use std::io::Read;
 use crate::config::Config;
 use crate::error::{ConfError, Result};
 
-/// 从 reader 解析 JSON 配置（容忍扩展，当前等价于 strict）。
+/// 从 reader 解析 JSON 配置（容忍 // 和 /* */ 注释）。
 pub fn decode_json(reader: impl Read) -> Result<Config> {
-    serde_json::from_reader(reader).map_err(|e| ConfError::from_json("json", e))
+    let mut buf = String::new();
+    reader.take(64 * 1024 * 1024).read_to_string(&mut buf)
+        .map_err(|e| ConfError::Read(format!("read JSON: {e}")))?;
+    let stripped = strip_json_comments(&buf);
+    serde_json::from_str(&stripped).map_err(|e| ConfError::from_json("json", e))
 }
 
 /// 从 reader 解析严格 RFC 8259 JSON 配置。
@@ -26,16 +30,68 @@ pub fn decode_json_strict(reader: impl Read) -> Result<Config> {
     decode_json(reader)
 }
 
-/// 从字符串切片解析 JSON 配置。
+/// 从字符串切片解析 JSON 配置（容忍注释）。
 pub fn decode_json_from_str(s: &str) -> Result<Config> {
-    serde_json::from_str(s).map_err(|e| ConfError::from_json("json", e))
+    let stripped = strip_json_comments(s);
+    serde_json::from_str(&stripped).map_err(|e| ConfError::from_json("json", e))
 }
 
-/// 从字节切片解析 JSON 配置。
+/// 从字节切片解析 JSON 配置（容忍注释）。
 pub fn decode_json_from_slice(s: &[u8]) -> Result<Config> {
-    serde_json::from_slice(s).map_err(|e| ConfError::from_json("json", e))
+    let s = std::str::from_utf8(s).map_err(|e| ConfError::ParseSimple { format: "json", message: format!("UTF-8: {e}") })?;
+    let stripped = strip_json_comments(s);
+    serde_json::from_str(&stripped).map_err(|e| ConfError::from_json("json", e))
 }
 
+/// 剥离 JSON 配置中的 `//` 行注释和 `/* */` 块注释。
+///
+/// 字符串字面量内的注释标记被保留（对应 Go `infra/conf/json_reader.go`）。
+fn strip_json_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+    let mut in_string = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_string {
+            out.push(c);
+            if c == '\\' && i + 1 < chars.len() {
+                // 转义字符：保留下一字符
+                out.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == '"' { in_string = false; }
+            i += 1;
+            continue;
+        }
+        // 不在字符串中
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        // 行注释 //
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
+            // 跳到行尾
+            i += 2;
+            while i < chars.len() && chars[i] != '\n' { i += 1; }
+            continue;
+        }
+        // 块注释 /* */
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            i += 2;
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') { i += 1; }
+            i += 2; // skip */
+            if i > chars.len() { i = chars.len(); }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +142,26 @@ mod tests {
         let json = b"{ \"outbounds\": [{ \"protocol\": \"freedom\", \"tag\": \"direct\" }] }";
         let cfg = decode_json(json.as_ref()).unwrap();
         assert_eq!(cfg.outbound_count(), 1);
+    }
+    #[test]
+    fn strip_line_comment_basic() {
+        let json = "{ \"inbounds\": [] } // comment\n";
+        let cfg = decode_json_from_str(json).unwrap();
+        assert_eq!(cfg.inbound_count(), 0);
+    }
+
+    #[test]
+    fn strip_block_comment() {
+        let json = "/* config */ { \"inbounds\": [] }";
+        let cfg = decode_json_from_str(json).unwrap();
+        assert_eq!(cfg.inbound_count(), 0);
+    }
+
+    #[test]
+    fn preserve_url_in_string() {
+        // https:// in string literal must NOT be stripped
+        let json = r#"{"inbounds":[],"routing":{"rules":[]}}"#;
+        let cfg = decode_json_from_str(json).unwrap();
+        assert_eq!(cfg.inbound_count(), 0);
     }
 }

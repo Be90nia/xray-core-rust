@@ -150,11 +150,11 @@ async fn do_handshake(
 /// ponytail: TLS server config 待 xray_tls::ocsp_stapling 集成后实现（见 hjo3）。
 /// 当前 security=tls 时返回 Unsupported，非 TLS 返回 None。
 fn build_tls_acceptor(settings: &StreamSettings) -> io::Result<Option<tokio_rustls::TlsAcceptor>> {
-    if settings.security != "tls" { return Ok(None); }
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "TLS server config not yet implemented for HTTPUpgrade listener (see hjo3)",
-    ))
+    let config = xray_tls::server_config::build_server_config(
+        &settings.security,
+        settings.security_json.as_ref(),
+    )?;
+    Ok(config.map(|c| tokio_rustls::TlsAcceptor::from(c)))
 }
 
 /// HTTPUpgrade transport listener 句柄。
