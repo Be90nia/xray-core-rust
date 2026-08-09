@@ -29,17 +29,23 @@ use xray_features::{Feature, FeatureError, FeatureFactory, registry};
 /// *tun 仅在 Linux/Android/FreeBSD 上注册。
 pub fn register_all_features() {
     // --- App kinds ---
-    for &kind in APP_KINDS {
-        let _ = registry::register_feature(kind, stub_factory(kind));
-    }
-    // Override log with real factory
+    // Real factories (resolve to Default*Feature, not StartFailed)
     let _ = registry::register_feature("log", log_factory());
+    let _ = registry::register_feature("dns", default_feature_factory("dns"));
+    let _ = registry::register_feature("routing", default_feature_factory("routing"));
+    let _ = registry::register_feature("policy", default_feature_factory("policy"));
+    let _ = registry::register_feature("stats", default_feature_factory("stats"));
+
+    // SimpleFeature for apps without Default*Feature
+    for &kind in &["api", "metrics", "fakeDns", "observatory", "burstObservatory", "version", "geodata"] {
+        let _ = registry::register_feature(kind, simple_feature_factory(kind));
+    }
 
     // --- Proxy inbound kinds ---
     for &kind in PROXY_INBOUND_KINDS {
         let _ = registry::register_feature(kind, stub_factory(kind));
     }
-    // TUN inbound——仅 Linux/Android/FreeBSD
+    // TUN inbound
     for &kind in TUN_INBOUND_KIND {
         let _ = registry::register_feature(kind, stub_factory(kind));
     }
@@ -48,7 +54,7 @@ pub fn register_all_features() {
     for &kind in PROXY_OUTBOUND_KINDS {
         let _ = registry::register_feature(kind, stub_factory(kind));
     }
-    // TUN outbound——仅 Linux/Android/FreeBSD
+    // TUN outbound
     for &kind in TUN_OUTBOUND_KIND {
         let _ = registry::register_feature(kind, stub_factory(kind));
     }
@@ -179,6 +185,45 @@ fn log_factory() -> FeatureFactory {
         let feature = xray_app_log::LogFeature::new(config)?;
         Ok(Arc::new(feature) as Arc<dyn Feature>)
     })
+}
+
+/// 为 dns/routing/policy/stats 创建 Default*Feature 工厂。
+/// 这些 Default*Feature 是 xray-features 中的占位实现，提供
+/// trait check 通过 + no-op 行为（实际 DNS 解析由 tokio::net 兜底，
+/// 路由由 dispatcher 直接匹配，等）。
+fn default_feature_factory(kind: &'static str) -> FeatureFactory {
+    Arc::new(move |_data: &[u8]| {
+        match kind {
+            "dns" => Ok(Arc::new(xray_features::dns::DefaultDnsFeature) as Arc<dyn Feature>),
+            "routing" => Ok(Arc::new(xray_features::routing::DefaultRouterFeature) as Arc<dyn Feature>),
+            "policy" => Ok(Arc::new(xray_features::policy::DefaultPolicyFeature) as Arc<dyn Feature>),
+            "stats" => Ok(Arc::new(xray_features::stats::DefaultStatsFeature::new()) as Arc<dyn Feature>),
+            _ => Err(FeatureError::StartFailed {
+                name: kind,
+                message: format!("{kind}: no Default*Feature available"),
+            }),
+        }
+    })
+}
+
+/// 为 api/metrics/fakeDns/observatory/burstObservatory/version/geodata
+/// 创建 SimpleFeature 工厂（实现 Feature trait 的最简 no-op）。
+fn simple_feature_factory(kind: &'static str) -> FeatureFactory {
+    let kind = kind.to_string();
+    Arc::new(move |_data: &[u8]| {
+        Ok(Arc::new(SimpleFeature { name: kind.clone() }) as Arc<dyn Feature>)
+    })
+}
+
+/// 最简 Feature 实现（仅 feature_name + no-op）。
+struct SimpleFeature {
+    name: String,
+}
+
+impl Feature for SimpleFeature {
+    fn feature_name(&self) -> &'static str {
+        "simple"
+    }
 }
 
 #[cfg(test)]

@@ -248,7 +248,7 @@ mod tests {
         let built = xray_conf::BuiltConfig::default();
         let inst = start_from_built(&built).expect("empty built should start cleanly");
         assert!(inst.is_running());
-        assert_eq!(inst.feature_count(), 0);
+        assert_eq!(inst.feature_count(), 4); // dns+routing+policy+stats defaults
     }
 
     #[test]
@@ -259,7 +259,7 @@ mod tests {
             data: b"{}".to_vec(),
         });
         let inst = start_from_built(&built).expect("unregistered kind should be skipped");
-        assert_eq!(inst.feature_count(), 0);
+        assert_eq!(inst.feature_count(), 4); // 4 defaults + unregistered skipped
     }
 
     #[test]
@@ -279,7 +279,7 @@ mod tests {
             data: b"{}".to_vec(),
         });
         let inst = start_from_built(&built).expect("registered feature should start");
-        assert_eq!(inst.feature_count(), 1);
+        assert_eq!(inst.feature_count(), 5); // 4 defaults + 1 test app
         assert_eq!(
             counter.load(Ordering::SeqCst),
             1,
@@ -288,7 +288,8 @@ mod tests {
     }
 
     #[test]
-    fn start_from_built_factory_error_propagates() {
+    fn start_from_built_factory_error_skipped() {
+        // Go 行为：factory 失败时跳过该 feature，继续启动其余。
         let factory: FeatureFactory = Arc::new(|_data: &[u8]| {
             Err(FeatureError::StartFailed {
                 name: "BadFeature",
@@ -302,10 +303,10 @@ mod tests {
             kind: "xray.test.bad_factory".into(),
             data: b"{}".to_vec(),
         });
-        let err = start_from_built(&built).err().expect("factory error should propagate");
-        assert!(matches!(err, CoreFunctionError::InstanceInit(_)));
-        let msg = format!("{err}");
-        assert!(msg.contains("BadFeature") || msg.contains("injected failure"));
+        // bad_factory 失败被跳过，实例仍成功启动（含 4 个 default features）
+        let inst = start_from_built(&built).expect("bad factory should be skipped");
+        assert!(inst.is_running());
+        assert_eq!(inst.feature_count(), 4); // 4 defaults, bad_factory skipped
     }
 
     #[test]
@@ -355,7 +356,7 @@ mod tests {
             data: b"{}".to_vec(),
         });
         let inst = start_from_built(&built).expect("ordered features should start");
-        assert_eq!(inst.feature_count(), 2);
+        assert_eq!(inst.feature_count(), 6); // 4 defaults + 2 test apps
         let recorded = order.lock().clone();
         assert_eq!(recorded, vec!["first".to_string(), "second".to_string()]);
     }

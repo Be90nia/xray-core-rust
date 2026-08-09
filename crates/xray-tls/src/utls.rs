@@ -104,17 +104,13 @@ impl<S> Conn<S> {
         self.inner.get_ref()
     }
 
-    /// 启用 REALITY Spider 流量填充（动态控制 TLS record 大小）。
+    /// 启用 REALITY Spider 流量填充。
     ///
-    /// 通过 rustls `set_plaintext_buffer_limit` 限制每条 TLS 记录的明文上限，
-    /// 使流量分段模式更接近真实浏览器行为。
-    ///
-    /// # 参数
-    ///
-    /// - `limit`：每条 TLS 记录的明文最大字节数。`None` 恢复默认（16KB）。
-    pub fn enable_spider_padding(&mut self, limit: Option<usize>) {
-        let (_, conn) = self.inner.get_mut();
-        conn.set_plaintext_buffer_limit(limit);
+    /// 当前为 no-op：rustls 不提供 per-record 大小控制 API。
+    /// 未来可通过 TLS record layer 手动分段实现。
+    pub fn enable_spider_padding(&mut self, _limit: Option<usize>) {
+        // TODO: rustls 无 set_plaintext_buffer_limit API。
+        // 需自定义 TLS record wrapper 或等待 rustls PR #2382 合入。
     }
 }
 
@@ -212,10 +208,11 @@ impl<S> ServerConn<S> {
         self.inner.get_ref()
     }
 
-    /// 启用 Spider 流量填充（服务端，限制 TLS record 明文大小）。
-    pub fn enable_spider_padding(&mut self, limit: Option<usize>) {
-        let (_, conn) = self.inner.get_mut();
-        conn.set_plaintext_buffer_limit(limit);
+    /// 启用 Spider 流量填充（服务端）。
+    ///
+    /// 当前为 no-op：rustls 不提供 per-record 大小控制 API。
+    pub fn enable_spider_padding(&mut self, _limit: Option<usize>) {
+        // TODO: 同 Conn::enable_spider_padding
     }
 }
 

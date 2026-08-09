@@ -17,14 +17,12 @@ use soketto::extension::deflate::Deflate;
 /// permessage-deflate 协商 header 值。
 pub const DEFLATE_HEADER_VALUE: &str = "permessage-deflate; client_no_context_takeover; server_no_context_takeover";
 
-/// 创建默认 Deflate 扩展实例。
+/// 创建客户端 Deflate 扩展实例。
 ///
-/// 配置 `client_no_context_takeover` + `server_no_context_takeover` 以减少内存。
+/// Soketto `Deflate::new(Client)` 已默认启用 `client_no_context_takeover`
+/// + `server_no_context_takeover` 以减少内存。
 pub fn create_deflate_extension() -> Deflate {
-    let mut d = Deflate::default();
-    d.set_client_no_context_takeover(true);
-    d.set_server_no_context_takeover(true);
-    d
+    Deflate::new(soketto::Mode::Client)
 }
 
 /// 检查服务端响应是否接受了 permessage-deflate。
