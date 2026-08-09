@@ -98,23 +98,23 @@ pub fn execute(args: RunArgs) -> Result<()> {
         return Ok(());
     }
 
-    // 切片2：start_from_built 内部完成 Instance::new_from_built + start；
-    // FeatureFactory 注册表当前为空，apps 列表中的 log/dns/router 等会被跳过（warn），
-    // Instance 以 0 features 启动成功；待各 app crate 切片2 注册真实 factory 后完整生效。
-    let instance = xray_core::start_from_built(&built)
-        .map_err(|e| CliError::StartFailed(e.to_string()))?;
-
-    // 切片2：等待 Ctrl-C / SIGTERM 信号，对应 Go `main/run.go:100-104`。
-    // main 是同步 fn，构造一次性 tokio runtime 仅用于 await 信号 Future。
+    // 创建 tokio runtime 用于 async 启动 + 信号等待
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| CliError::StartFailed(format!("tokio runtime init failed: {e}")))?;
+
+    // start_full 注册传输 + outbound + spawn inbound，返回 (instance, ohm, handles)
+    let (instance, _ohm, _handles) = rt.block_on(async {
+        xray_core::start_full(&built)
+            .await
+            .map_err(|e| CliError::StartFailed(e.to_string()))
+    })?;
+
+    // 等待 Ctrl-C / SIGTERM 信号
     rt.block_on(wait_for_signal());
-    // 给未完成任务 5 秒 grace period，避免硬中断切断 in-flight IO。
     rt.shutdown_timeout(Duration::from_secs(5));
 
-    // 优雅关闭 Instance（按注册逆序 close 所有 features）。
     close_if_sole_owner(instance)?;
     tracing::info!("xray instance shutdown");
     Ok(())

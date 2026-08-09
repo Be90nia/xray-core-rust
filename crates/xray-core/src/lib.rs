@@ -53,5 +53,6 @@ pub use version::{version, version_statement, VERSION_X, VERSION_Y, VERSION_Z};
 // 即可定义自己的 Feature 实现。
 pub use xray_features::{Feature, FeatureError};
 
-pub use functions::{start_from_built, start_instance, CoreFunctionError};
+pub use functions::{start_from_built, start_full, start_instance, CoreFunctionError};
 pub use register::register_all_features;
+pub use register::register_all_transports;

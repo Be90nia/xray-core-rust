@@ -24,7 +24,7 @@ use xray_features::FeatureError;
 use crate::inbound::spawn_inbounds;
 use crate::outbound::register_outbounds;
 use crate::router::{DispatchRouter, RoutingHandler};
-use crate::register::register_all_features;
+use crate::register::{register_all_features, register_all_transports};
 use xray_app_dispatcher::default::SimpleOhm;
 use xray_app_dispatcher::{DispatchHandler, OutboundHandlerManager};
 
@@ -75,6 +75,7 @@ impl From<xray_conf::ConfError> for CoreFunctionError {
 /// instance 生命周期（如等待信号、监听关闭事件）。
 pub fn start_from_built(built: &xray_conf::BuiltConfig) -> Result<Arc<Instance>, CoreFunctionError> {
     register_all_features();
+    register_all_transports();
     let mut instance = Instance::new_from_built(built)?;
     instance.start()?;
     Ok(Arc::new(instance))
@@ -113,6 +114,7 @@ async fn start_full_no_router(
     built: &xray_conf::BuiltConfig,
 ) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
     register_all_features();
+    register_all_transports();
     let mut instance = Instance::new_from_built(built)?;
     let ohm = Arc::new(SimpleOhm::new());
     register_outbounds(built, &ohm, None)?;
@@ -136,6 +138,7 @@ pub async fn start_full_with_router(
     router: Arc<dyn DispatchRouter>,
 ) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
     register_all_features();
+    register_all_transports();
     let mut instance = Instance::new_from_built(built)?;
     let ohm = Arc::new(SimpleOhm::new());
     register_outbounds(built, &ohm, None)?;
@@ -189,6 +192,7 @@ pub fn start_instance(
     let config = xray_conf::Config::from_json_str(json_str)
         .map_err(|e| CoreFunctionError::ConfigLoad(e.to_string()))?;
     register_all_features();
+    register_all_transports();
     let built = config.build()?;
     start_from_built(&built)
 }

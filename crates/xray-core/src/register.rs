@@ -54,6 +54,44 @@ pub fn register_all_features() {
     }
 }
 
+/// 注册所有传输层 dialer + listener。
+///
+/// 必须在 `register_outbounds` / `spawn_inbounds` 之前调用，
+/// 否则传输注册表为空——除裸 TCP 外所有 dial/listen 返回 NotFound。
+pub fn register_all_transports() {
+    // TCP（系统传输）
+    let _ = xray_transport::tcp::register_tcp_transport();
+
+    // WebSocket
+    let _ = xray_transport_websocket::register::register_dialer();
+    let _ = xray_transport_websocket::register::register_listener();
+
+    // HTTPUpgrade
+    let _ = xray_transport_httpupgrade::register::register_dialer();
+    let _ = xray_transport_httpupgrade::register::register_listener();
+
+    // gRPC
+    let _ = xray_transport_grpc::register::register_dialer();
+    let _ = xray_transport_grpc::register::register_listener();
+
+    // SplitHTTP / XHTTP
+    let _ = xray_transport_splithttp::register::register_dialer();
+    let _ = xray_transport_splithttp::register::register_listener();
+
+    // mKCP
+    let _ = xray_transport_kcp::register::register_dialer();
+    let _ = xray_transport_kcp::register::register_listener();
+
+    // Hysteria transport
+    let _ = xray_transport_hysteria::register::register_dialer();
+    let _ = xray_transport_hysteria::register::register_listener();
+
+    // REALITY
+    let _ = xray_reality::register::register_dialer();
+
+    tracing::info!("all transport dialers + listeners registered");
+}
+
 /// App kind 列表（与 `xray-conf/src/built.rs` push_app! 宏的 kind 一致）。
 const APP_KINDS: &[&str] = &[
     "log",
