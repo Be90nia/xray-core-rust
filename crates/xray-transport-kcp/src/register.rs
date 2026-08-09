@@ -1,17 +1,19 @@
 //! mKCP transport dialer + listener 注册。
 //!
 //! dialer: 完整拨号流程——解析配置 → UDP socket → KcpDialerFactory → Connection → KcpConn。
-//! listener: 返回 `Unsupported`，待 KcpListenerFactory 接入后替换。
+//! listener: 完整监听流程——StdUdpHub bind → Listener → spawn UDP recv loop → bridge → upstream ConnHandler.
 
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use xray_transport::dialer::{StreamSettings, TransportDialFn, register_transport_dialer};
-use xray_transport::listener_registry::TransportListenFn;
-use xray_transport::listener_registry::register_transport_listener;
+use xray_transport::listener_registry::{
+    ConnHandler, TransportListener, TransportListenFn, register_transport_listener,
+};
 
 use crate::config::{Config, default_config};
+use crate::listener::{ConnHandler as KcpConnHandler, Listener, UdpHub};
 use crate::connection::{ConnMetadata, Connection, ConnectionCloser, KcpConn};
 use crate::dialer::{KcpDialerFactory, PacketInput, fetch_input, next_conv};
 use crate::io::KCPPacketReader;
@@ -42,22 +44,85 @@ pub fn register_dialer() -> io::Result<()> {
     Ok(())
 }
 
-/// 注册 mKCP transport listener 占位。
+/// 注册 mKCP transport listener。
+///
+/// 完整监听流程：
+/// 1. 解析 `kcpSettings` JSON → KCP `Config`
+/// 2. `StdUdpHub::bind(addr)` 绑定 UDP socket
+/// 3. `Listener::new(hub, reader, config, bridge)` 创建 KCP listener
+/// 4. `spawn_blocking` 跑 UDP 接收循环（`handle_one_packet`）
+/// 5. 新 conv 首包到达时，bridge 把 `Arc<Connection>` 包装为 `KcpConn` 调 upstream handler
 ///
 /// 幂等：重复注册的 `AlreadyExists` 被忽略。
 /// 协议名同时注册 `"mkcp"`（Go 标准）和 `"kcp"`（部分客户端配置简写）。
 pub fn register_listener() -> io::Result<()> {
-    let stub: TransportListenFn = Arc::new(|_addr, _settings, _sockopt, _handler| {
-        Box::pin(async {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "kcp transport listening not yet implemented (waiting KcpListenerFactory + UDP hub integration)",
-            ))
-        })
+    let listen_fn: TransportListenFn = Arc::new(|addr, settings, _sockopt, handler| {
+        Box::pin(async move { listen_kcp(addr, settings, handler).await })
     });
-    let _ = register_transport_listener(PROTOCOL_NAME, stub.clone());
-    let _ = register_transport_listener("kcp", stub);
+    // ponytail: 重复注册忽略——主代理与测试可能并发触发注册
+    let _ = register_transport_listener(PROTOCOL_NAME, listen_fn.clone());
+    let _ = register_transport_listener("kcp", listen_fn);
     Ok(())
+}
+
+/// 实际监听：解析配置 → bind UDP → Listener → spawn recv loop。
+async fn listen_kcp(
+    addr: SocketAddr,
+    settings: StreamSettings,
+    handler: ConnHandler,
+) -> io::Result<Box<dyn TransportListener>> {
+    // 1. 解析 kcpSettings JSON
+    let config = parse_kcp_config(settings.transport_json.as_ref())?;
+
+    // 2. 绑定 UDP socket
+    let hub = StdUdpHub::bind(addr)?;
+    let local = hub
+        .local_addr()
+        .ok_or_else(|| io::Error::other("kcp listener: local_addr unavailable after bind"))?;
+
+    // 3. packet reader + bridge handler（KCP ConnHandler → upstream xray_transport::ConnHandler）
+    let reader = Arc::new(KCPPacketReader::new());
+    let bridge: Arc<dyn KcpConnHandler> = Arc::new(UpstreamConnBridge(handler));
+
+    // 4. 创建 KCP Listener
+    let listener = Arc::new(Listener::new(Arc::new(hub), reader, Arc::new(config), bridge));
+
+    // 5. spawn UDP recv loop（阻塞读 hub，分发到 KCP sessions）
+    let listener_clone = Arc::clone(&listener);
+    tokio::task::spawn_blocking(move || {
+        while listener_clone.handle_one_packet() {}
+    });
+
+    Ok(Box::new(KcpTransportListener { listener, local }))
+}
+
+/// bridge：KCP `ConnHandler` trait → upstream `xray_transport::ConnHandler` 回调。
+///
+/// 把每个新 `Arc<Connection>` 包装为 `KcpConn`（impl `xray_transport::Connection`）后调 upstream。
+struct UpstreamConnBridge(ConnHandler);
+
+impl KcpConnHandler for UpstreamConnBridge {
+    fn add_conn(&self, conn: Arc<Connection>) {
+        (self.0)(Box::new(KcpConn::new(conn)));
+    }
+}
+
+/// mKCP `TransportListener` 实现：持有 `Arc<Listener>` 用于 close。
+struct KcpTransportListener {
+    listener: Arc<Listener>,
+    local: SocketAddr,
+}
+
+impl TransportListener for KcpTransportListener {
+    fn close(&self) -> io::Result<()> {
+        self.listener
+            .close()
+            .map_err(|e| io::Error::other(e.to_string()))
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.local)
+    }
 }
 
 /// 实际拨号：解析配置 → UDP → KcpDialerFactory → Connection → KcpConn。

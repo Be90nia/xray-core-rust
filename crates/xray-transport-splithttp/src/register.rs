@@ -18,6 +18,7 @@ use xray_transport::sockopt::SocketOptions;
 use crate::client::DefaultDialerClient;
 use crate::config::Config;
 use crate::dialer;
+use crate::transport::listen_splithttp;
 
 /// 注册 SplitHTTP transport dialer。幂等。
 pub fn register_dialer() -> io::Result<()> {
@@ -32,18 +33,16 @@ pub fn register_dialer() -> io::Result<()> {
     Ok(())
 }
 
-/// 注册 SplitHTTP transport listener 占位。幂等。
+/// 注册 SplitHTTP transport listener。幂等。
 pub fn register_listener() -> io::Result<()> {
-    let stub: TransportListenFn = Arc::new(|_addr, _settings, _sockopt, _handler| {
-        Box::pin(async {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "splithttp transport listening not yet integrated (depends on h2/HTTP2 server)",
-            ))
-        })
+    let listen_fn: TransportListenFn = Arc::new(move |addr, settings, sockopt, handler| {
+        let settings = settings.clone();
+        let sockopt = sockopt.clone();
+        let handler = handler.clone();
+        Box::pin(async move { listen_splithttp(addr, &settings, &sockopt, handler).await })
     });
-    let _ = register_transport_listener("splithttp", stub.clone());
-    let _ = register_transport_listener("xhttp", stub);
+    let _ = register_transport_listener("splithttp", listen_fn.clone());
+    let _ = register_transport_listener("xhttp", listen_fn);
     Ok(())
 }
 

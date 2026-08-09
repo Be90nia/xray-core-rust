@@ -36,6 +36,7 @@ pub mod hub;
 pub mod mux;
 pub mod upload_queue;
 pub mod xpadding;
+pub mod transport;
 pub mod register;
 
 // 顶层 re-export。

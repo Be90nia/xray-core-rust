@@ -1,7 +1,7 @@
 //! Hysteria transport dialer + listener 注册。
 //!
 //! dialer: 完整拨号流程——解析配置 → TLS → QuinnHysteriaTransport → HysteriaClient → HysteriaConn。
-//! listener: 返回 `Unsupported`，待 HysteriaListenerFactory 接入后替换。
+//! listener: TLS ServerConfig → QuinnListenerFactory → accept loop → HysteriaConn。
 
 use std::future::Future;
 use std::io;
@@ -11,14 +11,19 @@ use std::sync::Arc;
 
 use xray_transport::connection::Connection;
 use xray_transport::dialer::{StreamSettings, TransportDialFn, register_transport_dialer};
-use xray_transport::listener_registry::TransportListenFn;
-use xray_transport::listener_registry::register_transport_listener;
+use xray_transport::listener_registry::{
+    ConnHandler, TransportListener, TransportListenFn, register_transport_listener,
+};
+use xray_transport::sockopt::SocketOptions;
 
-use crate::conn::HysteriaConn;
+use crate::conn::{HysteriaConn, InterStreamConn, QuicConn, QuicStream};
 use crate::dialer::{DialDestination, HysteriaClient};
 use crate::hysteria_transport::QuinnHysteriaTransport;
 use crate::proto_config::Config;
 use crate::PROTOCOL_NAME;
+use crate::hub::{HysteriaListenerFactory, HysteriaQuicListener, MasqType};
+use crate::quinn_adapter::{QuinnListenerFactory, QuinnQuicStream};
+use xray_proto::xray::transport::internet::QuicParams;
 
 /// 注册 Hysteria transport dialer。
 ///
@@ -39,20 +44,121 @@ pub fn register_dialer() -> io::Result<()> {
     Ok(())
 }
 
-/// 注册 Hysteria transport listener 占位。
+/// 注册 Hysteria transport listener。
+///
+/// 监听流程：
+/// 1. 从 `streamSettings.security` 构建 TLS `ServerConfig`
+/// 2. 创建 `QuinnListenerFactory` → `factory.listen()` 得到 `HysteriaQuicListener`
+/// 3. spawn accept 循环：每条 QUIC conn → `accept_bi` 取 client-initiated bi-stream
+///    → `QuinnQuicStream` → `InterStreamConn`（server 模式）→ `HysteriaConn` → handler
 ///
 /// 幂等：重复注册的 `AlreadyExists` 被忽略。
 pub fn register_listener() -> io::Result<()> {
-    let stub: TransportListenFn = Arc::new(|_addr, _settings, _sockopt, _handler| {
-        Box::pin(async {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "hysteria transport listening not yet implemented (waiting HysteriaListenerFactory + quinn adapter)",
-            ))
-        })
+    let listen_fn: TransportListenFn = Arc::new(move |addr, settings, _sockopt, handler| {
+        Box::pin(async move { listen_hysteria(addr, settings, handler).await })
     });
-    let _ = register_transport_listener(PROTOCOL_NAME, stub);
+    let _ = register_transport_listener(PROTOCOL_NAME, listen_fn);
     Ok(())
+}
+
+/// 监听 + spawn accept 循环。
+///
+/// 同 gRPC 模式：返回的 `TransportListener` 仅记录 `local_addr`，
+/// 实际 QUIC endpoint 由 spawned accept task 持有；task 退出（accept 失败）时 endpoint drop 即关闭。
+async fn listen_hysteria(
+    addr: SocketAddr,
+    settings: StreamSettings,
+    handler: ConnHandler,
+) -> io::Result<Box<dyn TransportListener>> {
+    // 1. TLS server config（hysteria 强制 TLS）
+    let tls_cfg = xray_tls::server_config::build_server_config(
+        &settings.security,
+        settings.security_json.as_ref(),
+    )?
+    .ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "hysteria listener requires TLS (streamSettings.security must be \"tls\" or \"reality\")",
+        )
+    })?;
+
+    // 2. QuinnListenerFactory → listen
+    let factory = QuinnListenerFactory::new(tls_cfg);
+    let config = Arc::new(parse_hysteria_config(settings.transport_json.as_ref())?);
+    let quic_params = Arc::new(QuicParams::default());
+    // ponytail: factory 当前忽略 masq/validator/on_new_conn；后续接 HTTP/3 auth/masquerade 时再注入
+    let on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync> = Arc::new(|_| {});
+    let listener = factory
+        .listen(
+            addr,
+            config,
+            quic_params,
+            MasqType::NotFound,
+            None,
+            on_new_conn,
+        )
+        .await
+        .map_err(|e| io::Error::other(format!("hysteria listen bind failed: {e}")))?;
+
+    let local = listener.local_addr();
+
+    // 3. spawn accept loop
+    tokio::spawn(async move {
+        loop {
+            let conn = match listener.accept().await {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+            let h = handler.clone();
+            tokio::spawn(async move {
+                accept_hysteria_conn(conn, h).await;
+            });
+        }
+    });
+
+    Ok(Box::new(HysteriaTransportListener { local }))
+}
+
+/// 单条 QUIC conn 内的 accept_bi 循环：把 client-initiated bi-stream 桥到 handler。
+///
+/// server 端不主动 open_bi——等客户端开 stream 后 accept_bi 取回。
+async fn accept_hysteria_conn(conn: Arc<dyn QuicConn>, handler: ConnHandler) {
+    let quinn_conn = match conn.as_quinn_connection() {
+        Some(c) => c.clone(),
+        None => return,
+    };
+    let local = conn.local_addr();
+    let remote = conn.remote_addr();
+
+    loop {
+        let (send, recv) = match quinn_conn.accept_bi().await {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+        let stream: Arc<dyn QuicStream> =
+            Arc::new(QuinnQuicStream::new(send, recv, local, remote));
+        let inter = Arc::new(InterStreamConn::new(stream, local, remote, false));
+        handler(Box::new(HysteriaConn::new(inter)));
+    }
+}
+
+/// Hysteria transport listener 句柄。
+///
+/// 仅记录 `local_addr`；QUIC endpoint 由 spawned accept task 持有，
+/// `close()` 不做实际关闭（task 退出时 endpoint drop 即关闭）。
+struct HysteriaTransportListener {
+    local: SocketAddr,
+}
+
+impl TransportListener for HysteriaTransportListener {
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.local)
+    }
+
+    fn close(&self) -> io::Result<()> {
+        tracing::info!("hysteria listener close addr={}", self.local);
+        Ok(())
+    }
 }
 
 /// 实际拨号：解析配置 → TLS → QuinnHysteriaTransport → HysteriaClient → HysteriaConn。
