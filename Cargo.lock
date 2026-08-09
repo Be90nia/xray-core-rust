@@ -6386,11 +6386,16 @@ dependencies = [
 name = "xray-transport-grpc"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "flate2",
+ "h2",
+ "http",
  "prost",
+ "rustls",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "xray-buf",
  "xray-common",

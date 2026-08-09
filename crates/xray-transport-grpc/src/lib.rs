@@ -31,6 +31,8 @@ pub mod encoding;
 pub mod error;
 pub mod client;
 pub mod server;
+pub mod transport;
+
 #[cfg(feature = "register")]
 pub mod register;
 

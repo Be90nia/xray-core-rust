@@ -17,6 +17,11 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 prost = { workspace = true }
 flate2 = { workspace = true }
+h2 = "0.4"
+http = "1"
+bytes = "1"
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
 
 [features]
 default = ["register"]

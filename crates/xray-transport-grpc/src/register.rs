@@ -67,9 +67,10 @@ pub fn register_dialer() -> io::Result<()> {
 ///
 /// 幂等：重复调用忽略 `AlreadyExists`。
 pub fn register_listener() -> io::Result<()> {
-    let listen_fn: TransportListenFn = Arc::new(move |addr, settings, _sockopt, _handler| {
+    let listen_fn: TransportListenFn = Arc::new(move |addr, settings, _sockopt, handler| {
         let settings = settings.clone();
-        Box::pin(async move { listen_grpc(addr, &settings).await })
+        let handler = handler.clone();
+        Box::pin(async move { listen_grpc(addr, &settings, handler).await })
     });
     let _ = register_transport_listener("grpc", listen_fn.clone());
     let _ = register_transport_listener("h2", listen_fn.clone());
@@ -81,14 +82,8 @@ pub fn register_listener() -> io::Result<()> {
 ///
 /// 当前返回 `Unsupported`：HTTP/2 server 监听依赖 h2/tonic 集成。
 /// 配置解析已执行，确保错误前的路径可测。
-async fn listen_grpc(_addr: SocketAddr, settings: &StreamSettings) -> io::Result<Box<dyn TransportListener>> {
-    let _config = parse_grpc_config(settings.transport_json.as_ref())?;
-
-    // ponytail: HTTP/2 server 监听待 h2/tonic 集成。
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "gRPC HTTP/2 transport listening not yet integrated (depends on h2/tonic, see crate docs)",
-    ))
+async fn listen_grpc(addr: SocketAddr, settings: &StreamSettings, handler: ConnHandler) -> io::Result<Box<dyn TransportListener>> {
+    crate::transport::listen(addr, settings, handler).await
 }
 
 /// 实际拨号：解析 grpcSettings → tls config → 调用 client 建立连接。
@@ -96,22 +91,7 @@ async fn listen_grpc(_addr: SocketAddr, settings: &StreamSettings) -> io::Result
 /// 当前返回 `Unsupported`：HTTP/2 + TLS 拨号依赖 h2/tonic 集成（见 crate 文档）。
 /// 配置解析与 TLS 构建已执行，确保错误前的路径可测。
 async fn dial_grpc(dest: &Destination, settings: &StreamSettings) -> io::Result<Box<dyn Connection>> {
-    let _config = parse_grpc_config(settings.transport_json.as_ref())?;
-
-    // 默认 SNI 用 dest 地址（与 Go `serverName = dest address` 一致）。
-    let default_sni = dest.address().to_string();
-    let _tls_config = xray_tls::client_config::build_client_config(
-        &settings.security,
-        settings.security_json.as_ref(),
-        &default_sni,
-    )?;
-
-    // ponytail: HTTP/2 + TLS 拨号待 h2/tonic 集成（见 crate lib.rs 切片边界）。
-    // GrpcClient::dial_target 需要调用方注入已建立的 HunkStream，当前无 HTTP/2 transport。
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "gRPC HTTP/2 transport dialing not yet integrated (depends on h2/tonic, see crate docs)",
-    ))
+    crate::transport::dial(dest, settings).await
 }
 
 /// 从 `grpcSettings` JSON 解析为强类型 [`Config`]。
@@ -278,7 +258,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dial_grpc_returns_unsupported_after_parsing() {
+    async fn dial_grpc_attempts_connection() {
+        // gRPC dialer 现在尝试 h2 连接（不再返回 Unsupported）。
+        // 连接 localhost:443 应失败（无监听）但不返回 Unsupported。
         use xray_common::net::address::Address;
         use xray_common::net::destination::Destination;
         use xray_common::net::network::Network;
@@ -287,7 +269,7 @@ mod tests {
 
         let dest = Destination::new(
             Address::IPv4(Ipv4Addr::LOCALHOST),
-            Port::new(443),
+            Port::new(1), // port 1 = 无服务
             Network::TCP,
         );
         let settings = StreamSettings {
@@ -297,7 +279,11 @@ mod tests {
             security_json: None,
         };
         let result = dial_grpc(&dest, &settings).await;
+        assert!(result.is_err(), "should fail (no h2 server at localhost:1)");
         let err = result.err().unwrap();
-        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(
+            err.kind() != io::ErrorKind::Unsupported,
+            "should not be Unsupported anymore"
+        );
     }
 }
