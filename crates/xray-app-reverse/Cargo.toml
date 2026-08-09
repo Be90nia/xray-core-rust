@@ -13,3 +13,7 @@ thiserror = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "time", "macros", "sync"] }
+yamux = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }

@@ -104,6 +104,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # 网络
 bytes = "1"
 socket2 = "0.5"
+
+# yamux 多路复用（反向代理 bridge/portal 用）
+yamux = "0.14"
+# tokio 工具（futures→tokio trait compat 适配）
+tokio-util = { version = "0.7", features = ["io"] }
 # 用户态 TCP/IP 协议栈（TUN inbound + WireGuard userspace netstack 用）
 smoltcp = { version = "0.12", default-features = false, features = ["std", "alloc", "medium-ip", "socket-tcp", "socket-udp", "socket-icmp", "proto-ipv4", "proto-ipv6"] }
 # DNS wire format (仅 proto，覆盖 A/AAAA/MX/TXT/EDNS0 编解码)

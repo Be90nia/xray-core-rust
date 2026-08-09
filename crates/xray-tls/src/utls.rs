@@ -103,6 +103,19 @@ impl<S> Conn<S> {
     pub fn get_ref(&self) -> (&S, &tokio_rustls::rustls::ClientConnection) {
         self.inner.get_ref()
     }
+
+    /// 启用 REALITY Spider 流量填充（动态控制 TLS record 大小）。
+    ///
+    /// 通过 rustls `set_plaintext_buffer_limit` 限制每条 TLS 记录的明文上限，
+    /// 使流量分段模式更接近真实浏览器行为。
+    ///
+    /// # 参数
+    ///
+    /// - `limit`：每条 TLS 记录的明文最大字节数。`None` 恢复默认（16KB）。
+    pub fn enable_spider_padding(&mut self, limit: Option<usize>) {
+        let (_, conn) = self.inner.get_mut();
+        conn.set_plaintext_buffer_limit(limit);
+    }
 }
 
 impl<S: Connection + Unpin> AsyncRead for Conn<S> {
@@ -197,6 +210,12 @@ impl<S> ServerConn<S> {
     #[must_use]
     pub fn get_ref(&self) -> (&S, &tokio_rustls::rustls::ServerConnection) {
         self.inner.get_ref()
+    }
+
+    /// 启用 Spider 流量填充（服务端，限制 TLS record 明文大小）。
+    pub fn enable_spider_padding(&mut self, limit: Option<usize>) {
+        let (_, conn) = self.inner.get_mut();
+        conn.set_plaintext_buffer_limit(limit);
     }
 }
 
