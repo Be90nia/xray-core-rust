@@ -18,6 +18,7 @@ tracing = { workspace = true }
 sha1 = "0.10"
 base64 = "0.22"
 tokio-tungstenite.workspace = true
+soketto = { version = "0.8", features = ["deflate"] }
 tokio-rustls = { workspace = true }
 rustls-pki-types.workspace = true
 rustls.workspace = true

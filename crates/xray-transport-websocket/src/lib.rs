@@ -32,6 +32,7 @@ pub mod client;
 pub mod server;
 pub mod ws_bridge;
 pub mod register;
+pub mod deflate;
 
 // 顶层 re-export。
 pub use config::Config;
