@@ -121,6 +121,7 @@ hyper = { version = "1", features = ["http1", "http2", "client", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "client", "client-legacy", "http1", "http2", "server"] }
 http-body-util = "0.1"
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "webpki-roots", "logging", "tls12"] }
+futures = "0.3"
 futures-util = "0.3"
 h2 = "0.4"
 http = "1"
