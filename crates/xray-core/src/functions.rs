@@ -95,13 +95,23 @@ pub fn start_from_built(built: &xray_conf::BuiltConfig) -> Result<Arc<Instance>,
 pub async fn start_full(
     built: &xray_conf::BuiltConfig,
 ) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
-    // 检查是否有 routing app
+    // 检查是否有 routing app：优先用 xray-app-router 的完整 Router（含 GeoIP/GeoSite/
+    // balancer/observation 匹配能力），失败时回退到 PatternRouter（与历史行为一致）。
     let router_opt: Option<Arc<dyn DispatchRouter>> = built
         .apps
         .iter()
         .find(|a| a.kind == "routing")
-        .and_then(|a| crate::router::PatternRouter::from_json(&a.data).ok())
-        .map(|r| Arc::new(r) as Arc<dyn DispatchRouter>);
+        .and_then(|a| {
+            match crate::wiring::build_router_adapter_from_json(&a.data) {
+                Ok(adapter) => Some(adapter as Arc<dyn DispatchRouter>),
+                Err(e) => {
+                    tracing::warn!(error = %e, "full Router init failed, falling back to PatternRouter");
+                    crate::router::PatternRouter::from_json(&a.data)
+                        .ok()
+                        .map(|r| Arc::new(r) as Arc<dyn DispatchRouter>)
+                }
+            }
+        });
 
     match router_opt {
         Some(router) => start_full_with_router(built, router).await,
