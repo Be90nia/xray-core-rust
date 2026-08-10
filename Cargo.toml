@@ -27,6 +27,7 @@ members = [
     "crates/xray-transport-grpc",
     "crates/xray-transport-websocket",
     "crates/xray-transport-httpupgrade",
+    "crates/xray-transport-quic",
 
     # Layer 4 - 应用服务
     "crates/xray-app-dns",

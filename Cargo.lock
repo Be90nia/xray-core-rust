@@ -5857,6 +5857,7 @@ dependencies = [
  "xray-transport-httpupgrade",
  "xray-transport-hysteria",
  "xray-transport-kcp",
+ "xray-transport-quic",
  "xray-transport-splithttp",
  "xray-transport-websocket",
  "xray-xudp",
@@ -6459,6 +6460,22 @@ dependencies = [
  "xray-buf",
  "xray-common",
  "xray-proto",
+ "xray-tls",
+ "xray-transport",
+]
+
+[[package]]
+name = "xray-transport-quic"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "quinn",
+ "rustls",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "xray-buf",
+ "xray-common",
  "xray-tls",
  "xray-transport",
 ]

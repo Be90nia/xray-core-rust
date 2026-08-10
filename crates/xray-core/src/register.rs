@@ -92,6 +92,10 @@ pub fn register_all_transports() {
     let _ = xray_transport_hysteria::register::register_dialer();
     let _ = xray_transport_hysteria::register::register_listener();
 
+    // QUIC
+    let _ = xray_transport_quic::register::register_dialer();
+    let _ = xray_transport_quic::register::register_listener();
+
     // REALITY
     let _ = xray_reality::register::register_dialer();
 

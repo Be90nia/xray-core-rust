@@ -31,6 +31,7 @@ xray-transport = { path = "../xray-transport" }
 xray-proto = { path = "../xray-proto", features = ["grpc-server"] }
 xray-transport-hysteria = { path = "../xray-transport-hysteria" }
 xray-transport-grpc = { path = "../xray-transport-grpc" }
+xray-transport-quic = { path = "../xray-transport-quic" }
 xray-transport-httpupgrade = { path = "../xray-transport-httpupgrade" }
 xray-transport-kcp = { path = "../xray-transport-kcp" }
 xray-transport-splithttp = { path = "../xray-transport-splithttp" }
