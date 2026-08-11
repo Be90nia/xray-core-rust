@@ -117,7 +117,12 @@ pub fn make_dial_fn(config: Arc<VlessOutboundConfig>) -> DialFn {
             .await
             .map_err(|e| format!("vless encode header: {e}"))?;
 
-            // 3. conn 现在是 "已写头的 TCP"，bridge_link_with_stream 直接用
+            // 2b. 读取服务端响应头（version + addon_len = 2 bytes），防止泄漏到数据流
+            crate::encoding::client::decode_response_header(&mut conn, VERSION)
+                .await
+                .map_err(|e| format!("vless decode response header: {e}"))?;
+
+            // 3. conn 现在是 "已握手完成的 TCP"，bridge_link_with_stream 直接用
             Ok(conn)
         })
     })
@@ -153,6 +158,10 @@ pub fn make_dial_fn_with_addons(config: Arc<VlessOutboundConfig>, addons: Addons
             )
             .await
             .map_err(|e| format!("vless encode header: {e}"))?;
+
+            crate::encoding::client::decode_response_header(&mut conn, VERSION)
+                .await
+                .map_err(|e| format!("vless decode response header: {e}"))?;
             Ok(conn)
         })
     })
