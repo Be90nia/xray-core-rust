@@ -333,8 +333,13 @@ device,
         let socket = self.sockets.get_mut::<tcp::Socket<'static>>(handle);
         match socket.state() {
             tcp::State::Established => {
+                let local = socket.local_endpoint();
                 let remote = socket.remote_endpoint()?;
-                Some(TcpAcceptEvent { handle, remote })
+                Some(TcpAcceptEvent {
+                    handle,
+                    local,
+                    remote,
+                })
             }
             _ => None,
         }
@@ -418,6 +423,8 @@ device,
 pub struct TcpAcceptEvent {
     /// 已接受的 socket handle。
     pub handle: SocketHandle,
+    /// 本地端点（TUN 侧地址+端口，用于构建 dispatcher destination）。
+    pub local: Option<IpEndpoint>,
     /// 远端地址（客户端 IP+端口）。
     pub remote: IpEndpoint,
 }

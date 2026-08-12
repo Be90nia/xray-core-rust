@@ -11,6 +11,8 @@ pub mod cache_controller;
 pub mod fakedns;
 pub mod nameserver;
 pub mod server;
+pub mod jsonconf;
 
 // 重导出顶层 API，便于上层直接 `use xray_app_dns::DnsService`。
+pub use jsonconf::DnsAppConfig;
 pub use server::{DnsService, DomainMatcherInfo, check_routes};

@@ -336,23 +336,40 @@ pub async fn serve_ss(
             match handshake {
                 Ok((address, port, mut ss_stream)) => {
                     let dest = Destination::new(address, Port::new(port), Network::TCP);
-                    let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+                    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+                    // 双向 pump（与 outbound SsConnection 对称）：单个 task select! 串行推进，
+                    // 因 SSStream 共享 nonce 计数器不可并发持有 read/write &mut。
+                    // up: ss_stream.read_chunk → server_io (密文→明文, 供 dispatch reader)
+                    // down: server_io 读 → ss_stream.write_chunk (明文→密文, 回包给客户端)
                     tokio::spawn(async move {
+                        let (mut srv_rd, mut srv_wr) = tokio::io::split(server_io);
+                        let mut down_buf = vec![0u8; 8 * 1024];
                         loop {
-                            match ss_stream.read_chunk().await {
-                                Ok(Some(chunk)) => {
-                                    if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut server_io, &chunk).await {
-                                        tracing::debug!("ss pump up write: {e}"); break;
-                                    }
-                                    if let Err(e) = tokio::io::AsyncWriteExt::flush(&mut server_io).await {
-                                        tracing::debug!("ss pump up flush: {e}"); break;
+                            tokio::select! {
+                                // up: 客户端密文 chunk → 解密 → server_io 写端（流向 dispatch）
+                                chunk = ss_stream.read_chunk() => {
+                                    match chunk {
+                                        Ok(Some(plaintext)) => {
+                                            if tokio::io::AsyncWriteExt::write_all(&mut srv_wr, &plaintext).await.is_err() { break; }
+                                            if tokio::io::AsyncWriteExt::flush(&mut srv_wr).await.is_err() { break; }
+                                        }
+                                        Ok(None) => { let _ = tokio::io::AsyncWriteExt::shutdown(&mut srv_wr).await; break; }
+                                        Err(e) => { tracing::debug!("ss pump up read: {e}"); break; }
                                     }
                                 }
-                                Ok(None) => break,
-                                Err(e) => { tracing::debug!("ss pump up read: {e}"); break; }
+                                // down: dispatch 回包（server_io 读端）→ 加密 chunk → 写回客户端
+                                n = tokio::io::AsyncReadExt::read(&mut srv_rd, &mut down_buf) => {
+                                    match n {
+                                        Ok(0) => { let _ = ss_stream.shutdown().await; break; }
+                                        Ok(n) => {
+                                            if ss_stream.write_chunk(&down_buf[..n]).await.is_err() { break; }
+                                            if ss_stream.flush().await.is_err() { break; }
+                                        }
+                                        Err(e) => { tracing::debug!("ss pump down read: {e}"); break; }
+                                    }
+                                }
                             }
                         }
-                        let _ = tokio::io::AsyncWriteExt::shutdown(&mut server_io).await;
                     });
                     let (client_rd, client_wr) = tokio::io::split(client_io);
                     let link = Link::new(new_reader(client_rd), new_writer(client_wr));
@@ -461,7 +478,10 @@ async fn spawn_one_inbound(
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
     if ib.entry.kind.as_str() == "tun" {
         let options = parse_tun_inbound_config(&ib.entry.data)?;
-        let handler = TunInboundHandler::new(&ib.tag, options)
+        let dispatch = ohm.get_default_handler().ok_or_else(|| {
+            std::io::Error::other("tun inbound requires a default outbound handler")
+        })?;
+        let handler = TunInboundHandler::new(&ib.tag, options, dispatch)
             .await
             .map_err(|e| std::io::Error::other(format!("tun inbound: {e}")))?;
         tracing::info!(tag = %ib.tag, "tun inbound listening");

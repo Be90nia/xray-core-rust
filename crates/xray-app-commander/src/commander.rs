@@ -18,11 +18,15 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
+use tokio::task::JoinHandle;
+
+use xray_features::{Feature, FeatureError};
 
 use crate::error::{log_warning, CommanderError};
+use crate::grpc;
 use crate::outbound::OutboundRegistrar;
-
+use crate::server::OutboundHandlerRegistry;
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -153,6 +157,33 @@ impl Service for ReflectionService {
     }
 }
 
+/// HandlerService 占位 Service（编排/诊断用）。
+///
+/// 对应 Go `xray.app.proxyman.command.Config`。实际 gRPC HandlerService 由
+/// [`crate::grpc`] 在 `Feature::start` 时注册（`build_router`），此 marker 仅用于
+/// Commander 的 service 容器记录，使 `service_count` / `services()` 反映配置声明。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HandlerServiceMarker;
+
+impl HandlerServiceMarker {
+    /// Service type URL（对应 Go `(*proxymancommand.Config)(nil)` 注册名）。
+    pub const TYPE_URL: &'static str = "xray.app.proxyman.command.Config";
+
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Service for HandlerServiceMarker {
+    fn name(&self) -> &str {
+        "handler_service"
+    }
+    fn type_url(&self) -> &str {
+        Self::TYPE_URL
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Commander
 // ---------------------------------------------------------------------------
@@ -169,6 +200,10 @@ pub struct Commander {
     running: AtomicBool,
     /// outbound 模式下使用的 handler 注册器（由上层注入）。
     outbound_registrar: Option<Arc<dyn crate::outbound::HandlerManager>>,
+    /// HandlerService gRPC 操作的共享 handler 注册中心。
+    handler_registry: Arc<OutboundHandlerRegistry>,
+    /// gRPC server 后台 task 的 JoinHandle（listen 模式启动后持有，close 时 abort）。
+    grpc_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Commander {
@@ -185,9 +220,10 @@ impl Commander {
             services: RwLock::new(Vec::new()),
             running: AtomicBool::new(false),
             outbound_registrar: None,
+            handler_registry: Arc::new(OutboundHandlerRegistry::new()),
+            grpc_task: Mutex::new(None),
         }
     }
-
     /// 从 [`Config`] 构造（不解码 TypedMessage，仅复制 tag/listen/service_configs 元数据）。
     ///
     /// Service 实例创建由上层负责（依赖具体 factory），通过 [`Self::add_service`] 注册。
@@ -255,6 +291,14 @@ impl Commander {
         self.running.load(Ordering::SeqCst)
     }
 
+    /// HandlerService gRPC 操作的共享 handler 注册中心引用。
+    ///
+    /// 上层（如 dispatcher）可获取此 registry，使 gRPC add/remove outbound 影响
+    /// 实际路由。当前 Commander 内部独占使用。
+    pub fn handler_registry(&self) -> Arc<OutboundHandlerRegistry> {
+        Arc::clone(&self.handler_registry)
+    }
+
     /// 启动 Commander：把所有 service 注册到 registrar，标记 running=true。
     ///
     /// 对应 Go `Commander.Start()`：
@@ -311,9 +355,43 @@ impl Commander {
         Ok(())
     }
 
+    /// 启动 gRPC server（listen 模式）。
+    ///
+    /// 解析 [`Self::listen`]，构建 tonic `Router`（注册 HandlerService），
+    /// `tokio::spawn` 后台 serve。JoinHandle 存入 `grpc_task`，供 [`Self::close`] abort。
+    ///
+    /// **必须在 tokio runtime 上下文中调用**（`Feature::start` 已保证）。
+    /// outbound 模式（listen=None）不启动 server，仅记日志（transport 全链路待接入）。
+    fn serve_grpc(&self) -> Result<(), CommanderError> {
+        let Some(addr_str) = &self.listen else {
+            tracing::info!(
+                "commander (tag=`{}`) in outbound mode — gRPC serve skipped (no listen addr)",
+                self.tag
+            );
+            return Ok(());
+        };
+        let addr = grpc::parse_listen_addr(addr_str)
+            .map_err(|e| CommanderError::InvalidListenAddr {
+                addr: addr_str.clone(),
+                reason: e,
+            })?;
+
+        let router = grpc::build_router(Arc::clone(&self.handler_registry));
+        tracing::info!("commander gRPC server listening on {addr} (tag=`{}`)", self.tag);
+
+        let handle = tokio::spawn(async move {
+            if let Err(e) = router.serve(addr).await {
+                tracing::error!("commander gRPC server exited with error: {e}");
+            }
+        });
+
+        *self.grpc_task.lock() = Some(handle);
+        Ok(())
+    }
+
     /// 关闭 Commander。对应 Go `Commander.Close()`。
     ///
-    /// 标记 running=false。实际 grpc.Server.Stop() 由 registrar 实现的 close 处理。
+    /// 标记 running=false 并 abort 后台 gRPC serve task。
     pub fn close(&self) -> Result<(), CommanderError> {
         let was_running = self
             .running
@@ -321,6 +399,11 @@ impl Commander {
         if was_running.is_err() {
             log_warning("commander not running, close is no-op");
             return Ok(());
+        }
+        // abort 后台 gRPC serve task（listen 模式下存在）。
+        if let Some(handle) = self.grpc_task.lock().take() {
+            handle.abort();
+            tracing::info!("commander gRPC server stopped (tag=`{}`)", self.tag);
         }
         tracing::info!("commander closed (tag=`{}`)", self.tag);
         Ok(())
@@ -366,6 +449,46 @@ impl std::fmt::Debug for Commander {
             .field("running", &self.running())
             .field("has_outbound_registrar", &self.outbound_registrar.is_some())
             .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Feature trait impl（生产路径：start 启动 gRPC server）
+// ---------------------------------------------------------------------------
+
+/// Commander 作为 Feature：`start` 在配置的 listen 地址启动 gRPC server，
+/// `close` abort 后台 serve task。
+///
+/// 这是 commander 接入 `Instance` 生命周期的生产路径（对应 Go `Commander.Start()`）。
+/// `start_with_registrar` / `GrpcServerRegistrar` 仅用于测试 / 编排验证。
+impl Feature for Commander {
+    fn feature_name(&self) -> &'static str {
+        "commander"
+    }
+
+    fn start(&self) -> xray_features::Result<()> {
+        // 幂等：已运行直接返回。
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            log_warning("commander already running, start is no-op");
+            return Ok(());
+        }
+        self.serve_grpc()
+            .map_err(|e| FeatureError::StartFailed {
+                name: "commander",
+                message: e.to_string(),
+            })?;
+        Ok(())
+    }
+
+    fn close(&self) -> xray_features::Result<()> {
+        Commander::close(self).map_err(|e| FeatureError::CloseFailed {
+            name: "commander",
+            message: e.to_string(),
+        })
     }
 }
 

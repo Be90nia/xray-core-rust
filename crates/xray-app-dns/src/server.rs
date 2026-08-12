@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use parking_lot::Mutex;
+use xray_features::Feature;
 use xray_features::dns::DnsError as FeaturesDnsError;
 
 use crate::config::{to_net_ip, IpOption};
@@ -227,6 +228,16 @@ impl DnsService {
         option: IpOption,
     ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>> {
         Box::pin(self.lookup_ip(domain, option))
+    }
+}
+
+/// `DnsService` 即 Go 的 `DNS` struct，本身即为 Feature（Go 中以 `dns.ClientType()` 注册）。
+///
+/// 直接实现 [`Feature`]（不另建 wrapper），与 LogFeature 的分层相反——此处服务本身
+/// 就是 Feature 的唯一承载者，wrapper 是多余的一层。
+impl Feature for DnsService {
+    fn feature_name(&self) -> &'static str {
+        "dns"
     }
 }
 

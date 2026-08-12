@@ -8,11 +8,14 @@ rust-version.workspace = true
 [dependencies]
 xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
+xray-proto = { path = "../xray-proto", features = ["grpc-server"] }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "sync"] }
+tokio = { workspace = true, features = ["io-util", "sync", "rt", "net"] }
 async-trait = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

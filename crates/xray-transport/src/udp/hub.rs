@@ -8,8 +8,9 @@
 //! - `UdpPacket` — 收到的 UDP 包（payload + source + optional origDest）
 //! - `ListenUDP` — bind + spawn recv loop + return `UdpHub`
 //!
-//! origDest（TPROXY 原始目标地址）当前为 stub——需要平台特定 syscall（Linux `IP_RECVORIGDSTADDR`）。
-//! udpmask wrapping 当前为 stub——等 finalmask 集成。
+//! origDest（TPROXY 原始目标地址）：Linux 下通过 `recvmsg` 读取 `IP_RECVORIGDSTADDR`/
+//! `IPV6_RECVORIGDSTADDR` ancillary data 提取；非 Linux 平台不可用（`target = None`）。
+//! udpmask wrapping：尚未接入 `crate::finalmask::Udpmask`/`UdpmaskManager`（见 listen() 内 TODO）。
 
 use std::io;
 use std::net::SocketAddr;
@@ -32,9 +33,10 @@ pub struct UdpPacket {
     pub payload: Vec<u8>,
     /// 来源地址。
     pub source: SocketAddr,
-    /// 原始目标地址（TPROXY/redirect 场景，Linux `IP_RECVORIGDSTADDR`）。
+    /// 原始目标地址（TPROXY/redirect 场景）。
     ///
-    /// 当前为 stub——需要平台特定 syscall 实现。
+    /// Linux 下通过 `recvmsg` ancillary data（`IP_RECVORIGDSTADDR`/`IPV6_RECVORIGDSTADDR`）
+    /// 提取；非 Linux 平台或未启用 `ReceiveOriginalDestination` 时为 `None`。
     pub target: Option<SocketAddr>,
 }
 
@@ -114,7 +116,7 @@ impl UdpHub {
             opt.apply(&mut builder);
         }
 
-        let socket = UdpSocket::bind(addr).await?;
+        let socket = bind_udp(addr, builder.recv_orig_dest).await?;
         let (tx, rx) = mpsc::channel(builder.capacity);
         let close_notify = Arc::new(Notify::new());
 
@@ -129,6 +131,9 @@ impl UdpHub {
         let socket = Arc::clone(&hub.socket);
         let recv_orig_dest = hub.recv_orig_dest;
         tokio::spawn(async move {
+            // TODO(udpmask): 在此用 `crate::finalmask::Udpmask`/`UdpmaskManager` 链式包装
+            // send/recv，把真实 UDP 流量伪装成常见协议特征。需把 dispatcher 的 NAT 会话
+            // 与 finalmask 配置解析串联，非 trivial；待 finalmask 配置接入后实现。
             start_recv_loop(&socket, tx, close_notify, recv_orig_dest).await;
         });
 
@@ -173,17 +178,24 @@ impl UdpHub {
 
 /// UDP 收包循环。对应 Go `Hub.start()`。
 ///
-/// 循环 `recv_from` → 构造 `UdpPacket` → 发送到 channel。
-/// channel 满时丢弃包（与 Go `select { case c <- payload: default: }` 一致）。
+/// 普通 UDP 走 `recv_from`；Linux + `recv_orig_dest`（TPROXY）走 `recvmsg`，
+/// 一次读取 payload + 发送方 + 原始目标地址（IP_RECVORIGDSTADDR ancillary data）。
+/// channel 满时丢弃包（与 Go `select { case c <- payload: default: }` 一致）；
 /// 收到 close 信号或 recv 错误时退出。
 async fn start_recv_loop(
     socket: &UdpSocket,
     tx: mpsc::Sender<UdpPacket>,
     close_notify: Arc<Notify>,
-    _recv_orig_dest: bool,
+    recv_orig_dest: bool,
 ) {
-    let mut buf = [0u8; UDP_BUFFER_SIZE];
+    #[cfg(target_os = "linux")]
+    if recv_orig_dest {
+        start_recv_loop_tproxy_linux(socket, tx, close_notify).await;
+        return;
+    }
+    let _ = recv_orig_dest;
 
+    let mut buf = [0u8; UDP_BUFFER_SIZE];
     loop {
         tokio::select! {
             result = socket.recv_from(&mut buf) => {
@@ -192,18 +204,12 @@ async fn start_recv_loop(
                         if n == 0 {
                             continue;
                         }
-
-                        // ponytail: origDest 需要平台特定 syscall
-                        // （Linux IP_RECVORIGDSTADDR / IPv6 IPV6_RECVORIGDSTADDR）。
-                        // 当前为 stub，target = None。
-                        let target = None;
-
+                        // 普通 UDP 路径：无原始目标地址（非 TPROXY 场景）。
                         let packet = UdpPacket {
                             payload: buf[..n].to_vec(),
                             source,
-                            target,
+                            target: None,
                         };
-
                         // channel 满时丢弃（与 Go default 分支一致）。
                         if tx.try_send(packet).is_err() {
                             tracing::debug!("UDP hub cache full, dropping packet");
@@ -221,6 +227,237 @@ async fn start_recv_loop(
                 break;
             }
         }
+    }
+}
+
+// ===== TPROXY 原始目标地址（Linux only） =====
+
+/// 创建 UDP socket。
+///
+/// TPROXY 模式（Linux + `recv_orig_dest`）下用 `socket2` 在 bind 前设置
+/// `IP_TRANSPARENT`/`IP_RECVORIGDSTADDR`（IPv6 对应）socket option，使其能接收透明
+/// 代理流量并附带原始目标地址；其余情况走普通 `UdpSocket::bind`。
+async fn bind_udp(addr: SocketAddr, recv_orig_dest: bool) -> io::Result<UdpSocket> {
+    #[cfg(target_os = "linux")]
+    if recv_orig_dest {
+        return bind_udp_tproxy_linux(addr);
+    }
+    let _ = recv_orig_dest;
+    UdpSocket::bind(addr).await
+}
+
+#[cfg(target_os = "linux")]
+fn bind_udp_tproxy_linux(addr: SocketAddr) -> io::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::os::fd::AsRawFd;
+
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+
+    // TPROXY 常与 iptables PREROUTING 在同主机共存，SO_REUSEADDR 避免冲突。
+    sock.set_reuse_address(true)?;
+
+    let fd = sock.as_raw_fd();
+    // 透明绑定（可绑非本地地址）+ 请求原始目标地址 ancillary data。
+    setsockopt_int(fd, libc::IPPROTO_IP, libc::IP_TRANSPARENT, 1)?;
+    setsockopt_int(fd, libc::IPPROTO_IP, libc::IP_RECVORIGDSTADDR, 1)?;
+    if addr.is_ipv6() {
+        // IPv6 对应常量在 uclibc 缺失；该环境下 IPv6 TPROXY 退化为无 origDest。
+        #[cfg(not(target_env = "uclibc"))]
+        {
+            setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_TRANSPARENT, 1)?;
+            setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_RECVORIGDSTADDR, 1)?;
+        }
+    }
+
+    sock.bind(&socket2::SockAddr::from(addr))?;
+    sock.set_nonblocking(true)?;
+    let std_sock: std::net::UdpSocket = sock.into();
+    UdpSocket::from_std(std_sock)
+}
+
+#[cfg(target_os = "linux")]
+fn setsockopt_int(
+    fd: std::os::fd::RawFd,
+    level: libc::c_int,
+    name: libc::c_int,
+    val: libc::c_int,
+) -> io::Result<()> {
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            name,
+            &val as *const _ as *const _,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Linux + `ReceiveOriginalDestination` 时的收包循环：用 `recvmsg` 一次性读取
+/// payload + 发送方地址 + 原始目标地址（IP_RECVORIGDSTADDR ancillary data）。
+#[cfg(target_os = "linux")]
+async fn start_recv_loop_tproxy_linux(
+    socket: &UdpSocket,
+    tx: mpsc::Sender<UdpPacket>,
+    close_notify: Arc<Notify>,
+) {
+    use std::mem::MaybeUninit;
+    use socket2::{MsgHdrMut, MaybeUninitSlice, SockRef};
+
+    // ancillary 缓冲区：容纳一条 IP_RECVORIGDSTADDR/IPV6_RECVORIGDSTADDR cmsg
+    // （sockaddr_in6 最大，CMSG_SPACE 后远小于 64 字节）。
+    const CMSG_BUF_LEN: usize = 64;
+
+    let mut data_buf = [MaybeUninit::<u8>::zeroed(); UDP_BUFFER_SIZE];
+    let mut cmsg_buf = [MaybeUninit::<u8>::zeroed(); CMSG_BUF_LEN];
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = close_notify.notified() => break,
+            res = socket.readable() => {
+                if let Err(e) = res {
+                    tracing::warn!(error = %e, "udp hub readable failed");
+                    break;
+                }
+                let mut iov = [MaybeUninitSlice::new(&mut data_buf)];
+                let mut name = empty_sockaddr();
+                let mut msg = MsgHdrMut::new()
+                    .with_addr(&mut name)
+                    .with_buffers(&mut iov)
+                    .with_control(&mut cmsg_buf);
+                // tokio UdpSocket: AsFd → SockRef 借用底层 fd（不取所有权）。
+                let sock_ref = SockRef::from(socket);
+                match sock_ref.recvmsg(&mut msg, 0) {
+                    Ok(n) => {
+                        if n == 0 {
+                            continue;
+                        }
+                        let source = name.as_socket();
+                        let target = parse_orig_dst_from_cmsg(&cmsg_buf, msg.control_len());
+                        let payload = unsafe {
+                            std::slice::from_raw_parts(data_buf.as_ptr() as *const u8, n).to_vec()
+                        };
+                        let packet = UdpPacket {
+                            payload,
+                            source: source.unwrap_or_else(|| {
+                                SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0)
+                            }),
+                            target,
+                        };
+                        // channel 满时丢弃。
+                        if tx.try_send(packet).is_err() {
+                            tracing::debug!("UDP hub cache full, dropping packet");
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // 伪唤醒，重新等 readable。
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to recvmsg UDP");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 构造全零 `SockAddr`（len 取最大），供 `recvmsg` 的 `msg_name` 写入发送方地址。
+///
+/// `as_socket()` 按 family 解析 sockaddr_in/sockaddr_in6，不依赖 len。
+#[cfg(target_os = "linux")]
+fn empty_sockaddr() -> socket2::SockAddr {
+    // SAFETY: 全零 sockaddr_storage 合法；recvmsg 写回 storage。
+    unsafe {
+        let storage: libc::sockaddr_storage = std::mem::zeroed();
+        socket2::SockAddr::new(
+            storage,
+            std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
+        )
+    }
+}
+
+/// 判断一条 cmsg 是否为 IPv6 原始目标地址（IPV6_RECVORIGDSTADDR）。
+/// uclibc 缺该常量，该环境下恒为 false（IPv6 TPROXY origDest 不支持）。
+#[cfg(target_os = "linux")]
+#[cfg(not(target_env = "uclibc"))]
+fn is_ipv6_origdst_cmsg(chdr: &libc::cmsghdr) -> bool {
+    chdr.cmsg_level == libc::IPPROTO_IPV6 && chdr.cmsg_type == libc::IPV6_RECVORIGDSTADDR
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(target_env = "uclibc")]
+fn is_ipv6_origdst_cmsg(_chdr: &libc::cmsghdr) -> bool {
+    false
+}
+
+/// 从 `recvmsg` 的 ancillary buffer 解析原始目标地址。
+///
+/// 内核为每个请求了 `IP_RECVORIGDSTADDR`/`IPV6_RECVORIGDSTADDR` 的数据包附加恰好
+/// 一条 cmsg，故只需检查首条（`CMSG_FIRSTHDR`）。无法解析时返回 `None`。
+#[cfg(target_os = "linux")]
+fn parse_orig_dst_from_cmsg(
+    cmsg_buf: &[std::mem::MaybeUninit<u8>],
+    len: usize,
+) -> Option<SocketAddr> {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+
+
+    let hdr_size = std::mem::size_of::<libc::cmsghdr>();
+    if len < hdr_size {
+        return None;
+    }
+    // 构造临时 msghdr 让 CMSG_FIRSTHDR 工作。
+    let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+    hdr.msg_control = cmsg_buf.as_ptr() as *mut _;
+    hdr.msg_controllen = len as _;
+    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&hdr) };
+    if cmsg.is_null() {
+        return None;
+    }
+    let chdr = unsafe { &*cmsg };
+    let data = unsafe { libc::CMSG_DATA(cmsg) };
+    let data_len = chdr.cmsg_len as usize - hdr_size;
+
+    if chdr.cmsg_level == libc::IPPROTO_IP && chdr.cmsg_type == libc::IP_RECVORIGDSTADDR {
+        if data_len < std::mem::size_of::<libc::sockaddr_in>() {
+            return None;
+        }
+        // SAFETY: cmsg data 长度已校验；按 sockaddr_in 读取（网络字节序）。
+        let sin = unsafe { &*(data as *const libc::sockaddr_in) };
+        // s_addr 按本机序存储，to_ne_bytes 直接得到 [a,b,c,d]。
+        let ip = Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
+        Some(SocketAddr::V4(SocketAddrV4::new(
+            ip,
+            u16::from_be(sin.sin_port),
+        )))
+    } else if is_ipv6_origdst_cmsg(chdr) {
+        if data_len < std::mem::size_of::<libc::sockaddr_in6>() {
+            return None;
+        }
+        // SAFETY: cmsg data 长度已校验；按 sockaddr_in6 读取。
+        let sin6 = unsafe { &*(data as *const libc::sockaddr_in6) };
+        let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+        Some(SocketAddr::V6(SocketAddrV6::new(
+            ip,
+            u16::from_be(sin6.sin6_port),
+            sin6.sin6_flowinfo,
+            sin6.sin6_scope_id,
+        )))
+    } else {
+        None
     }
 }
 

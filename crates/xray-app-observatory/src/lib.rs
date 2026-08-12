@@ -21,6 +21,7 @@ pub mod command;
 pub mod config;
 pub mod error;
 pub mod error_collector;
+pub mod feature;
 pub mod observer;
 pub mod status;
 
@@ -43,4 +44,4 @@ pub use observer::{
     FixedProbeExecutor, HttpProbeExecutor, NoopOutboundSelector, Observer,
     OutboundSelector, ProbeExecutor, RealOutboundSelector, now_unix_secs,
 };
-pub use status::StatusStore;
+pub use feature::ObservatoryFeature;

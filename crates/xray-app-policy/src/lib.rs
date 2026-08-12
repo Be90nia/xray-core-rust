@@ -13,8 +13,10 @@
 //! 故本 crate 定义本地 [`SystemStats`] 表达同一概念。
 
 pub mod convert;
+pub mod feature;
 pub mod manager;
 
 pub use convert::{policy_from_proto, system_stats_from_proto, SystemStats};
+pub use feature::PolicyFeature;
 pub use manager::{Manager, ManagerError};
 pub use xray_proto::xray::app::policy::{Config, Policy as ProtoPolicy, Second, SystemPolicy as ProtoSystemPolicy};

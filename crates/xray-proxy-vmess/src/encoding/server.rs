@@ -674,17 +674,17 @@ impl<'v> ServerSession<'v> {
 ///
 /// AES-NI + PCLMULQDQ 指令同时存在才返回 true（Go 用 `cpu.X86.HasAES && cpu.X86.HasPCLMULQDQ`）。
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn has_aes_gcm_hardware_support() -> bool {
+pub(crate) fn has_aes_gcm_hardware_support() -> bool {
     std::is_x86_feature_detected!("aes") && std::is_x86_feature_detected!("pclmulqdq")
 }
 
 #[cfg(target_arch = "aarch64")]
-fn has_aes_gcm_hardware_support() -> bool {
+pub(crate) fn has_aes_gcm_hardware_support() -> bool {
     std::arch::is_aarch64_feature_detected!("aes") && std::arch::is_aarch64_feature_detected!("neon")
 }
 
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
-fn has_aes_gcm_hardware_support() -> bool {
+pub(crate) fn has_aes_gcm_hardware_support() -> bool {
     false
 }
 

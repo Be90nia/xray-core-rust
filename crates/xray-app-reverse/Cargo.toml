@@ -13,4 +13,8 @@ thiserror = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
-tokio = { workspace = true, features = ["net", "io-util", "time", "macros", "sync"] }
+tokio = { workspace = true, features = ["net", "io-util", "time", "macros", "sync", "rt"] }
+# yamux 多路复用：bridge↔portal 单 TCP 承载多个并发子流（与 Go hashicorp/yamux 线格式互通）
+yamux = { workspace = true }
+# futures↔tokio AsyncRead/Write 适配（yamux 用 futures traits）
+tokio-util = { workspace = true, features = ["compat"] }

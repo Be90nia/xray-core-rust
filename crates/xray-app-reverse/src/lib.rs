@@ -24,7 +24,7 @@ pub mod picker;
 pub mod reverse;
 pub mod worker;
 pub mod relay;
-pub use relay::{YamuxBridge, serve_portal};
+pub use relay::{serve_portal, MuxStream, YamuxBridge};
 
 pub use bridge::{
     is_domain, is_internal_domain, pick_portal_worker, should_create_bridge_worker,

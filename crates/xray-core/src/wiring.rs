@@ -153,33 +153,48 @@ pub fn build_router_adapter_from_json(
     Ok(Arc::new(RouterAdapter::new(router)))
 }
 
-/// JSON → proto `Config` 的最小转换：覆盖与 `PatternRouter` 相同的字段集合。
+/// JSON → proto `Config` 转换：覆盖 `RoutingRule` 全部标量字段——
+/// domain(ip/Suffix/Keyword/Regex)、ip、source、port、sourcePort、network、protocol、
+/// user、inboundTag、attributes、process，以及顶层 `domainStrategy`、`balancers`。
+/// 引擎 `xray_app_router::rule::build_condition` 已支持全集，瓶颈纯在此解析器。
+///
+/// `rule_set` 依赖 proto 更新（当前 `RoutingRule` 无该字段，见
+/// `xray-app-router/src/rule_set.rs`），暂以 TODO 标记，待 proto 升级后接入。
 fn parse_routing_json_to_proto(
     json: &[u8],
 ) -> Result<xray_proto::xray::app::router::Config, WiringError> {
     use prost::Message;
     use xray_proto::xray::app::router::routing_rule::TargetTag;
-    use xray_proto::xray::app::router::RoutingRule;
-    use xray_proto::xray::common::geodata::{
-        Cidr, CidrRule, Domain, DomainRule, IpRule,
-    };
+    use xray_proto::xray::app::router::{BalancingRule, RoutingRule};
+    use xray_proto::xray::common::geodata::{Domain, DomainRule, IpRule};
     use xray_proto::xray::common::geodata::domain::Type as DT;
-    use xray_proto::xray::common::geodata::ip_rule::Value as IV;
     use xray_proto::xray::common::geodata::domain_rule::Value as DV;
+    use xray_proto::xray::common::geodata::ip_rule::Value as IV;
 
-    let v: serde_json::Value = serde_json::from_slice(json)
-        .map_err(|e| WiringError::JsonParse(e.to_string()))?;
+    let v: serde_json::Value =
+        serde_json::from_slice(json).map_err(|e| WiringError::JsonParse(e.to_string()))?;
 
     let mut cfg = xray_proto::xray::app::router::Config::default();
+
+    // 顶层 domainStrategy
+    if let Some(s) = v.get("domainStrategy").and_then(|x| x.as_str()) {
+        cfg.domain_strategy = parse_domain_strategy(s);
+    }
+
     if let Some(arr) = v.get("rules").and_then(|r| r.as_array()) {
         for r in arr {
-            let outbound_tag = r
-                .get("outboundTag")
-                .and_then(|x| x.as_str())
-                .unwrap_or("");
-            if outbound_tag.is_empty() {
+            let outbound_tag = r.get("outboundTag").and_then(|x| x.as_str()).unwrap_or("");
+            let balancer_tag = r.get("balancerTag").and_then(|x| x.as_str()).unwrap_or("");
+            let target_tag = if !balancer_tag.is_empty() {
+                Some(TargetTag::BalancingTag(balancer_tag.to_string()))
+            } else if !outbound_tag.is_empty() {
+                Some(TargetTag::Tag(outbound_tag.to_string()))
+            } else {
+                // 既无 outboundTag 也无 balancerTag：无法路由，跳过（与 Go 一致）
                 continue;
-            }
+            };
+
+            // Domain 规则：Full / Domain(suffix) / Substr(keyword) / Regex
             let mut domains = Vec::new();
             for d in json_str_iter(r.get("domain")) {
                 domains.push(DomainRule {
@@ -208,25 +223,177 @@ fn parse_routing_json_to_proto(
                     })),
                 });
             }
+            for d in json_str_iter(r.get("domainRegex")) {
+                domains.push(DomainRule {
+                    value: Some(DV::Custom(Domain {
+                        r#type: DT::Regex as i32,
+                        value: d.to_string(),
+                        attribute: vec![],
+                    })),
+                });
+            }
+
+            // 目标 IP（CIDR）
             let mut ips = Vec::new();
             for ip_str in json_str_iter(r.get("ip")) {
                 if let Some(custom) = parse_cidr_to_ip_rule(ip_str) {
                     ips.push(IpRule { value: Some(IV::Custom(custom)) });
                 }
             }
+
+            // 源 IP（CIDR）
+            let mut source_ips = Vec::new();
+            for ip_str in json_str_iter(r.get("source")) {
+                if let Some(custom) = parse_cidr_to_ip_rule(ip_str) {
+                    source_ips.push(IpRule { value: Some(IV::Custom(custom)) });
+                }
+            }
+
             cfg.rule.push(RoutingRule {
-                target_tag: Some(TargetTag::Tag(outbound_tag.to_string())),
+                target_tag,
                 rule_tag: String::new(),
                 domain: domains,
                 ip: ips,
+                source_ip: source_ips,
+                port_list: parse_port_list(r.get("port")),
+                source_port_list: parse_port_list(r.get("sourcePort")),
+                networks: parse_networks(r.get("network")),
+                user_email: json_string_list(r.get("user")),
+                inbound_tag: json_string_list(r.get("inboundTag")),
+                protocol: json_string_list(r.get("protocol")),
+                process: json_string_list(r.get("process")),
+                attributes: parse_attributes(r.get("attributes")),
                 ..Default::default()
             });
         }
     }
 
-    // 编码再解码一次以验证 Config 结构合法（同 prost 语义）
+    // 顶层 balancers → BalancingRule。strategy 取 `{"type":"..."}` 或裸字符串。
+    if let Some(arr) = v.get("balancers").and_then(|b| b.as_array()) {
+        for b in arr {
+            let tag = b.get("tag").and_then(|x| x.as_str()).unwrap_or("");
+            if tag.is_empty() {
+                continue;
+            }
+            let strategy = match b.get("strategy") {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(serde_json::Value::Object(o)) => {
+                    o.get("type").and_then(|x| x.as_str()).unwrap_or("").to_string()
+                }
+                _ => String::new(),
+            };
+            cfg.balancing_rule.push(BalancingRule {
+                tag: tag.to_string(),
+                outbound_selector: json_string_list(b.get("selector")),
+                strategy,
+                strategy_settings: None,
+                fallback_tag: b
+                    .get("fallbackTag")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            });
+        }
+    }
+
+    // TODO(rule_set): proto `RoutingRule` 无 rule_set 字段（proto 版本较早，
+    // 见 xray-app-router/src/rule_set.rs）。本地/远程 rule_set 需 proto 升级后接入。
+
+    // 编码一次以验证 Config 结构合法（同 prost 语义）
     let _ = cfg.encode_to_vec();
     Ok(cfg)
+}
+
+/// JSON 端口字段（number / `"80,443,1000-2000"` / 混合数组）→ proto `PortList`。
+///
+/// 复用 `xray_conf::PortList` 的多态反序列化（与 Go `infra/conf.PortList` 等价）。
+fn parse_port_list(
+    v: Option<&serde_json::Value>,
+) -> Option<xray_proto::xray::common::net::PortList> {
+    use xray_proto::xray::common::net::{PortList as ProtoPortList, PortRange as ProtoPortRange};
+    let v = v?;
+    let conf: xray_conf::PortList = serde_json::from_value(v.clone()).ok()?;
+    if conf.is_empty() {
+        return None;
+    }
+    Some(ProtoPortList {
+        range: conf
+            .0
+            .iter()
+            .map(|r| ProtoPortRange {
+                from: u32::from(r.start),
+                to: u32::from(r.end),
+            })
+            .collect(),
+    })
+}
+
+/// network 字段（`"tcp,udp"` 或字符串数组）→ proto `Network` i32 列表。
+fn parse_networks(v: Option<&serde_json::Value>) -> Vec<i32> {
+    use xray_proto::xray::common::net::Network;
+    json_str_tokens(v).into_iter()
+        .filter_map(|s| match s.to_ascii_lowercase().as_str() {
+            "tcp" => Some(Network::Tcp as i32),
+            "udp" => Some(Network::Udp as i32),
+            "unix" => Some(Network::Unix as i32),
+            _ => None,
+        })
+        .collect()
+}
+
+/// JSON 字符串数组 → `Vec<String>`。
+fn json_string_list(v: Option<&serde_json::Value>) -> Vec<String> {
+    json_str_iter(v).map(|s| s.to_string()).collect()
+}
+
+/// attributes 对象 → `map<string,string>`；非字符串值以 JSON 文本表示。
+fn parse_attributes(
+    v: Option<&serde_json::Value>,
+) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let Some(obj) = v.and_then(|x| x.as_object()) else {
+        return map;
+    };
+    for (k, val) in obj {
+        let s = match val {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        map.insert(k.clone(), s);
+    }
+    map
+}
+
+/// domainStrategy 字符串 → proto `DomainStrategy` i32（大小写不敏感）。
+fn parse_domain_strategy(s: &str) -> i32 {
+    use xray_proto::xray::app::router::config::DomainStrategy;
+    match s.to_ascii_lowercase().as_str() {
+        "ipifnonmatch" => DomainStrategy::IpIfNonMatch as i32,
+        "ipondemand" => DomainStrategy::IpOnDemand as i32,
+        _ => DomainStrategy::AsIs as i32,
+    }
+}
+
+/// 把 `Value::String`（逗号分隔）或 `Value::Array<String>` 展平为 token 列表。
+fn json_str_tokens(v: Option<&serde_json::Value>) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(v) = v else {
+        return out;
+    };
+    let strs: Vec<&str> = match v {
+        serde_json::Value::String(s) => vec![s.as_str()],
+        serde_json::Value::Array(arr) => arr.iter().filter_map(|x| x.as_str()).collect(),
+        _ => vec![],
+    };
+    for s in strs {
+        for part in s.split(',') {
+            let t = part.trim();
+            if !t.is_empty() {
+                out.push(t.to_string());
+            }
+        }
+    }
+    out
 }
 
 fn json_str_iter<'a>(v: Option<&'a serde_json::Value>) -> Box<dyn Iterator<Item = &'a str> + 'a> {
@@ -331,5 +498,129 @@ mod tests {
     fn build_adapter_invalid_json_errors() {
         let err = build_router_adapter_from_json(b"not json").unwrap_err();
         assert!(matches!(err, WiringError::JsonParse(_)));
+    }
+
+    #[test]
+    fn parse_routing_json_covers_all_rule_fields() {
+        use xray_proto::xray::app::router::config::DomainStrategy;
+        use xray_proto::xray::app::router::routing_rule::TargetTag;
+        use xray_proto::xray::common::geodata::domain::Type as DT;
+        use xray_proto::xray::common::geodata::domain_rule::Value as DV;
+
+        let json = br#"{
+            "domainStrategy": "IpOnDemand",
+            "rules": [{
+                "outboundTag": "proxy",
+                "domainRegex": ["^.*\\.example\\.com$"],
+                "ip": ["10.0.0.0/8"],
+                "source": ["192.168.1.0/24"],
+                "port": "80,443,1000-2000",
+                "sourcePort": "53",
+                "network": "tcp,udp",
+                "protocol": ["http", "tls"],
+                "user": ["alice@example.com"],
+                "inboundTag": ["in0"],
+                "process": ["xray.exe"],
+                "attributes": {"sinkhole": "true"}
+            }],
+            "balancers": [{
+                "tag": "bal",
+                "selector": ["a", "b"],
+                "strategy": {"type": "random"},
+                "fallbackTag": "direct"
+            }]
+        }"#;
+        let cfg = parse_routing_json_to_proto(json).expect("parse");
+
+        // 顶层 domainStrategy（大小写不敏感）
+        assert_eq!(cfg.domain_strategy, DomainStrategy::IpOnDemand as i32);
+
+        // balancers → BalancingRule
+        assert_eq!(cfg.balancing_rule.len(), 1);
+        let br = &cfg.balancing_rule[0];
+        assert_eq!(br.tag, "bal");
+        assert_eq!(br.outbound_selector, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(br.strategy, "random");
+        assert_eq!(br.fallback_tag, "direct");
+
+        assert_eq!(cfg.rule.len(), 1);
+        let rule = &cfg.rule[0];
+        let tag = match rule.target_tag.as_ref() {
+            Some(TargetTag::Tag(t)) => t.as_str(),
+            _ => panic!("expected Tag target"),
+        };
+        assert_eq!(tag, "proxy");
+
+        // domainRegex → Regex 类型
+        assert_eq!(rule.domain.len(), 1);
+        let custom = match rule.domain[0].value.as_ref() {
+            Some(DV::Custom(c)) => c,
+            _ => panic!("expected custom domain rule"),
+        };
+        assert_eq!(custom.r#type, DT::Regex as i32);
+
+        // ip / source（CIDR）
+        assert_eq!(rule.ip.len(), 1);
+        assert_eq!(rule.source_ip.len(), 1);
+
+        // port / sourcePort（"80,443,1000-2000" 展开）
+        let pl = rule.port_list.as_ref().expect("port_list");
+        assert!(pl.range.iter().any(|r| r.from == 80 && r.to == 80));
+        assert!(pl.range.iter().any(|r| r.from == 443 && r.to == 443));
+        assert!(pl.range.iter().any(|r| r.from == 1000 && r.to == 2000));
+        let spl = rule.source_port_list.as_ref().expect("source_port_list");
+        assert!(spl.range.iter().any(|r| r.from == 53 && r.to == 53));
+
+        // networks（tcp=2, udp=3）
+        assert!(rule.networks.contains(&2));
+        assert!(rule.networks.contains(&3));
+
+        // 标量列表字段
+        assert_eq!(rule.protocol, vec!["http".to_string(), "tls".to_string()]);
+        assert_eq!(rule.user_email, vec!["alice@example.com".to_string()]);
+        assert_eq!(rule.inbound_tag, vec!["in0".to_string()]);
+        assert_eq!(rule.process, vec!["xray.exe".to_string()]);
+
+        // attributes map
+        assert_eq!(rule.attributes.get("sinkhole").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn build_adapter_from_json_port_rule_routes() {
+        use xray_common::net::network::Network;
+        let json = br#"{"rules":[{"outboundTag":"proxy","port":"443"}]}"#;
+        let adapter = build_router_adapter_from_json(json).expect("build adapter");
+        let hit = Destination::new(
+            Address::Domain("anywhere.com".into()),
+            Port::new(443),
+            Network::TCP,
+        );
+        assert_eq!(adapter.pick_outbound_tag(&hit).as_deref(), Some("proxy"));
+        // 不命中端口 → 不路由
+        let miss = Destination::new(
+            Address::Domain("anywhere.com".into()),
+            Port::new(8080),
+            Network::TCP,
+        );
+        assert!(adapter.pick_outbound_tag(&miss).is_none());
+    }
+
+    #[test]
+    fn build_adapter_from_json_network_rule_routes() {
+        use xray_common::net::network::Network;
+        let json = br#"{"rules":[{"outboundTag":"udp-out","network":"udp"}]}"#;
+        let adapter = build_router_adapter_from_json(json).expect("build adapter");
+        let udp_dest = Destination::new(
+            Address::Domain("anywhere.com".into()),
+            Port::new(53),
+            Network::UDP,
+        );
+        assert_eq!(adapter.pick_outbound_tag(&udp_dest).as_deref(), Some("udp-out"));
+        let tcp_dest = Destination::new(
+            Address::Domain("anywhere.com".into()),
+            Port::new(53),
+            Network::TCP,
+        );
+        assert!(adapter.pick_outbound_tag(&tcp_dest).is_none());
     }
 }

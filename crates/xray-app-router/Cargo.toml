@@ -22,3 +22,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 prost = { workspace = true }
 sysinfo = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_System_Threading",
+    "Win32_Foundation",
+] }

@@ -10,7 +10,7 @@
 //!
 //! # IO 边界
 //!
-//! - ProcessNameMatcher 的 `find_process` 留 TODO（依赖 OS-specific sysinfo）
+//! - ProcessNameMatcher 的 `find_process`：跨平台进程反查（Linux /proc、Windows iphelper）
 //! - GeoSite 文件加载（domain rule 的 GeoSiteRule 变体）走 rule.rs 调用 geodata loader
 
 use std::collections::HashMap;
@@ -415,18 +415,278 @@ struct ProcessInfo {
 /// 根据源地址和端口查找对应进程。
 ///
 /// 对应 Go `net.FindProcess(network, srcIP, srcPort, dstIP, dstPort)`。
-/// Go 版本通过 OS-specific netlink/etw 按网络连接反查 PID；
-/// Rust sysinfo 不暴露网络连接→PID 映射，因此采用简化策略：
-/// 遍历所有进程，返回第一个匹配源端口的进程。
+/// 通过 OS-specific 网络连接表反查 PID：
+/// - Linux：`/proc/net/tcp`(+`tcp6`) 取 socket inode，再扫描 `/proc/*/fd/*` 匹配 inode → PID
+/// - Windows：`GetExtendedTcpTable(TCP_TABLE_OWNER_PID_ALL)` 直接取 owning PID
+/// - 其他平台（macOS 等）：返回 `None`（进程匹配不生效，不影响路由）
 ///
-/// ponytail: 不实现按网络连接精确反查 PID（需平台特定 netlink/etw），
-/// 仅按进程名匹配。升级路径：引入 platform-specific 网络连接查询。
+/// 匹配语义：`(source_ip, source_port)` 对应连接表中的 **local** endpoint
+/// （发起方 socket 的本地端，即 xray 看到的对端地址）。任一步失败返回 `None`
+/// （权限不足/不可达），仅令进程匹配不生效，不阻断路由决策。
 fn find_process(source_ip: std::net::IpAddr, source_port: u16) -> Option<ProcessInfo> {
-    let _ = (source_ip, source_port);
-    // ponytail: sysinfo 不提供网络连接→PID 映射，无法按源端口精确匹配。
-    // 返回 None，进程匹配退化为配置匹配模式（仅 match_xray_self 生效）。
-    // 升级路径：Windows 用 GetExtendedTcpTable2，Linux 用 /proc/net/tcp + /proc/pid/fd。
-    None
+    #[cfg(target_os = "linux")]
+    {
+        proc_linux::find_process(source_ip, source_port)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        proc_windows::find_process(source_ip, source_port)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        let _ = (source_ip, source_port);
+        None
+    }
+}
+
+/// `/proc/net/tcp`(+`tcp6`) 行格式纯解析（无 cfg 依赖，便于跨平台单测）。
+#[cfg(any(target_os = "linux", test))]
+mod proc_parse {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    /// 解析 hex 编码的 IP 地址。
+    ///
+    /// - IPv4：8 个 hex 字符，单个 `u32` 按**小端序**（kernel 写入格式）。
+    /// - IPv6：32 个 hex 字符，4 个 `u32` 字，每个按小端序。
+    pub(super) fn parse_hex_ip(hex: &str) -> Option<IpAddr> {
+        if hex.len() == 8 {
+            // IPv4：kernel 以 host-byte-order（x86/ARM LE 即小端）u32 写入
+            let n = u32::from_str_radix(hex, 16).ok()?;
+            let b = n.to_le_bytes();
+            Some(IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3])))
+        } else if hex.len() == 32 {
+            // IPv6：4 个小端 u32 字
+            let mut octets = [0u8; 16];
+            for i in 0..4 {
+                let word = u32::from_str_radix(&hex[i * 8..i * 8 + 8], 16).ok()?;
+                octets[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+            }
+            Some(IpAddr::V6(Ipv6Addr::from(octets)))
+        } else {
+            None
+        }
+    }
+
+    /// 解析 `/proc/net/tcp`(或 `tcp6`) 的单行 → (local_ip, local_port, inode)。
+    ///
+    /// 行格式（跳过表头）：`sl local:port remote:port st tx:rx tr retr uid timeout inode ...`
+    /// `inode == 0` 表示该 socket 无属主（TIME_WAIT 等），跳过。
+    pub(super) fn parse_tcp_line(line: &str) -> Option<(IpAddr, u16, u64)> {
+        let mut f = line.split_whitespace();
+        let _sl = f.next()?;
+        let local = f.next()?;
+        let _remote = f.next()?;
+        let _st = f.next()?;
+        let _tx_rx = f.next()?;
+        let _tr = f.next()?;
+        let _retr = f.next()?;
+        let _uid = f.next()?;
+        let _timeout = f.next()?;
+        let inode: u64 = f.next()?.parse().ok()?;
+        if inode == 0 {
+            return None;
+        }
+        let (ip_hex, port_hex) = local.split_once(':')?;
+        let port = u16::from_str_radix(port_hex, 16).ok()?;
+        let ip = parse_hex_ip(ip_hex)?;
+        Some((ip, port, inode))
+    }
+}
+
+/// Linux `/proc` 实现。
+#[cfg(target_os = "linux")]
+mod proc_linux {
+    use super::ProcessInfo;
+    use super::proc_parse::parse_tcp_line;
+    use std::fs;
+    use std::net::IpAddr;
+
+    pub(super) fn find_process(source_ip: IpAddr, source_port: u16) -> Option<ProcessInfo> {
+        let inode = find_socket_inode(source_ip, source_port)?;
+        let pid = find_pid_by_inode(inode)?;
+        read_process_info(pid)
+    }
+
+    /// 在 `/proc/net/tcp`(+`tcp6`) 中查找 local endpoint 匹配的 socket inode。
+    fn find_socket_inode(source_ip: IpAddr, source_port: u16) -> Option<u64> {
+        let file = match source_ip {
+            IpAddr::V4(_) => "/proc/net/tcp",
+            IpAddr::V6(_) => "/proc/net/tcp6",
+        };
+        let content = fs::read_to_string(file).ok()?;
+        content.lines().skip(1).find_map(|line| {
+            let (ip, port, inode) = parse_tcp_line(line)?;
+            (ip == source_ip && port == source_port).then_some(inode)
+        })
+    }
+
+    /// 扫描 `/proc/*/fd/*`，找到拥有该 socket inode 的 PID。
+    fn find_pid_by_inode(inode: u64) -> Option<u32> {
+        let target = format!("socket:[{inode}]");
+        let entries = fs::read_dir("/proc").ok()?;
+        for entry in entries.flatten() {
+            let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                continue;
+            };
+            let Ok(fds) = fs::read_dir(entry.path().join("fd")) else {
+                continue;
+            };
+            for fd in fds.flatten() {
+                if let Ok(link) = fs::read_link(fd.path()) {
+                    if link.to_string_lossy() == target {
+                        return Some(pid);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// 读 `/proc/<pid>/comm`（进程名）+ `/proc/<pid>/exe`（exe 路径）。
+    fn read_process_info(pid: u32) -> Option<ProcessInfo> {
+        let name = fs::read_to_string(format!("/proc/{pid}/comm"))
+            .ok()
+            .map(|s| s.trim_end_matches('\n').to_string())
+            .unwrap_or_default();
+        let exe_path = fs::read_link(format!("/proc/{pid}/exe"))
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if name.is_empty() && exe_path.is_empty() {
+            return None;
+        }
+        Some(ProcessInfo { name, exe_path, pid })
+    }
+}
+
+/// Windows iphelper 实现。
+#[cfg(target_os = "windows")]
+mod proc_windows {
+    use super::ProcessInfo;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, MIB_TCP6TABLE_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
+        TCP_TABLE_OWNER_PID_ALL,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    const AF_INET: u32 = 2;
+    const AF_INET6: u32 = 23;
+    const NO_ERROR: u32 = 0;
+
+    pub(super) fn find_process(source_ip: IpAddr, source_port: u16) -> Option<ProcessInfo> {
+        let pid = match source_ip {
+            IpAddr::V4(ip) => find_pid_v4(ip, source_port),
+            IpAddr::V6(ip) => find_pid_v6(ip, source_port),
+        }?;
+        read_process_info(pid)
+    }
+
+    fn find_pid_v4(ip: Ipv4Addr, port: u16) -> Option<u32> {
+        let buf = tcp_table(AF_INET)?;
+        unsafe {
+            let table = &*(buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID);
+            let rows = std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
+            // dwLocalAddr 为网络字节序；from_be 还原后与 octets 比较。
+            let want_addr = u32::from_be_bytes(ip.octets());
+            for row in rows {
+                if u32::from_be(row.dwLocalAddr) == want_addr
+                    && ntohs(row.dwLocalPort) == port
+                {
+                    return Some(row.dwOwningPid);
+                }
+            }
+        }
+        None
+    }
+
+    fn find_pid_v6(ip: Ipv6Addr, port: u16) -> Option<u32> {
+        let buf = tcp_table(AF_INET6)?;
+        unsafe {
+            let table = &*(buf.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID);
+            let rows = std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
+            let octets = ip.octets();
+            for row in rows {
+                // ucLocalAddr 已是网络序原始 16 字节，直接比较。
+                // SAFETY: row 指向 table 内有效内存，ucLocalAddr 是 [u8;16] 内联字段。
+                if row.ucLocalAddr == octets && ntohs(row.dwLocalPort) == port {
+                    return Some(row.dwOwningPid);
+                }
+            }
+        }
+        None
+    }
+
+    /// 取低 16 位端口（网络字节序）转主机序。
+    #[inline]
+    fn ntohs(port_field: u32) -> u16 {
+        u16::from_be((port_field & 0xFFFF) as u16)
+    }
+
+    /// 调 `GetExtendedTcpTable(TCP_TABLE_OWNER_PID_ALL)` 取整张表字节。
+    fn tcp_table(af: u32) -> Option<Vec<u8>> {
+        unsafe {
+            let mut size: u32 = 0;
+            // 第一次取所需大小（返回 ERROR_INSUFFICIENT_BUFFER，size 被填入）。
+            GetExtendedTcpTable(
+                std::ptr::null_mut(),
+                &mut size,
+                0,
+                af,
+                TCP_TABLE_OWNER_PID_ALL,
+                0,
+            );
+            if size == 0 {
+                return None;
+            }
+            let mut buf = vec![0u8; size as usize];
+            let rc = GetExtendedTcpTable(
+                buf.as_mut_ptr() as *mut _,
+                &mut size,
+                0,
+                af,
+                TCP_TABLE_OWNER_PID_ALL,
+                0,
+            );
+            (rc == NO_ERROR).then_some(buf)
+        }
+    }
+
+    fn read_process_info(pid: u32) -> Option<ProcessInfo> {
+        let exe_path = query_image_name(pid)?;
+        let name = exe_path
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(&exe_path)
+            .to_string();
+        Some(ProcessInfo { name, exe_path, pid })
+    }
+
+    /// `QueryFullProcessImageNameW` → 完整 exe 路径。权限不足/系统进程返回 None。
+    fn query_image_name(pid: u32) -> Option<String> {
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return None;
+            }
+            let mut buf = [0u16; 1024];
+            let mut len = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len);
+            CloseHandle(h);
+            if ok == 0 {
+                return None;
+            }
+            Some(
+                std::ffi::OsString::from_wide(&buf[..len as usize])
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        }
+    }
 }
 
 /// 获取当前进程信息。
@@ -773,5 +1033,95 @@ mod tests {
             pid: 100,
         };
         assert!(!m.matches_info(&info));
+    }
+
+    // ── find_process / proc_parse ──
+
+    #[test]
+    fn test_parse_hex_ip_v4_loopback() {
+        // /proc/net/tcp 中 127.0.0.1 的 hex（小端 u32）= "0100007F"
+        assert_eq!(
+            proc_parse::parse_hex_ip("0100007F"),
+            Some(std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
+        );
+    }
+
+    #[test]
+    fn test_parse_hex_ip_v4_any() {
+        // 192.168.1.100 → 小端 u32 hex
+        assert_eq!(
+            proc_parse::parse_hex_ip("6401A8C0"),
+            Some(std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)))
+        );
+    }
+
+    #[test]
+    fn test_parse_hex_ip_v6_loopback() {
+        // ::1 在 /proc/net/tcp6 = 4 个小端 u32 字，末字 = htonl(1) = "01000000"
+        assert_eq!(
+            proc_parse::parse_hex_ip("00000000000000000000000001000000"),
+            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+        );
+    }
+
+    #[test]
+    fn test_parse_hex_ip_invalid() {
+        assert_eq!(proc_parse::parse_hex_ip("XYZ"), None);
+        assert_eq!(proc_parse::parse_hex_ip("123"), None); // 长度非 8/32
+    }
+
+    #[test]
+    fn test_parse_tcp_line_established() {
+        // local=127.0.0.1:8080(0x1F90)，inode=12345
+        let line = "   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 \
+                    00:00000000 00000000     0        0 12345 1 0000000000000000";
+        let (ip, port, inode) = proc_parse::parse_tcp_line(line).expect("应解析成功");
+        assert_eq!(ip, std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        assert_eq!(port, 8080);
+        assert_eq!(inode, 12345);
+    }
+
+    #[test]
+    fn test_parse_tcp_line_zero_inode_skipped() {
+        // inode=0（TIME_WAIT 等无属主 socket）应返回 None
+        let line = "   1: 0100007F:0050 00000000:0000 06 00000000:00000000 \
+                    00:00000000 00000000     0        0 0 1 0000000000000000";
+        assert!(proc_parse::parse_tcp_line(line).is_none());
+    }
+
+    #[test]
+    fn test_find_process_resolves_self_connection() {
+        // 建立一条本进程的 loopback 连接，验证 find_process 能反查到本进程 PID。
+        // 仅在已实现平台（linux/windows）强校验；其他平台恒返回 None。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let local = client.local_addr().unwrap();
+        // accept 完成 3 次握手，确保连接进入 ESTABLISHED
+        let server = listener.accept().ok();
+
+        // 连接表更新可能有微小延迟，重试若干次。
+        let mut info = None;
+        for _ in 0..20 {
+            info = find_process(local.ip(), local.port());
+            if info.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            let info = info.expect("find_process 应能解析本进程 loopback 连接");
+            assert_eq!(info.pid, std::process::id(), "应解析到本测试进程");
+            assert!(!info.name.is_empty(), "进程名不应为空");
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            assert!(info.is_none(), "未支持平台应返回 None");
+        }
+
+        drop(server);
+        drop(client);
     }
 }

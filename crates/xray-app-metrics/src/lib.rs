@@ -19,6 +19,7 @@
 
 pub mod config;
 pub mod error;
+pub mod feature;
 pub mod metrics;
 pub mod outbound;
 
@@ -30,4 +31,4 @@ pub use metrics::{
     ObservationSnapshot, OutboundRegistrar, RecordingOutboundRegistrar, StatsCollector,
     StatsSnapshot, TokioHttpServer, TrafficCount,
 };
-pub use outbound::{BoxedConn, Outbound, OutboundListener};
+pub use feature::MetricsFeature;

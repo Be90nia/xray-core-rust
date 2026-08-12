@@ -31,13 +31,13 @@
 
 pub mod commander;
 pub mod error;
+pub mod grpc;
 pub mod outbound;
 pub mod server;
-
 // Re-export 主要公共类型
 pub use commander::{
-    Commander, Config, GrpcServerRegistrar, NoopRegistrar, ReflectionService, Service,
-    TypedMessageConfig,
+    Commander, Config, GrpcServerRegistrar, HandlerServiceMarker, NoopRegistrar,
+    ReflectionService, Service, TypedMessageConfig,
 };
 pub use error::CommanderError;
 pub use outbound::{

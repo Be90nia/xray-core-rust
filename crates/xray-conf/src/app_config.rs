@@ -155,6 +155,12 @@ pub struct ApiConfig {
     /// API handler tag。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
+    /// gRPC 监听地址（如 `"127.0.0.1:8080"` / `":8080"`）。
+    ///
+    /// 对应 Go proto `xray.app.commander.Config.Listen`。为空时走 outbound 模式
+    ///（通过 OutboundHandler 接收 API 连接，需 transport 全链路）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub listen: Option<String>,
     /// 启用的 API 服务列表。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub services: Option<Vec<String>>,
