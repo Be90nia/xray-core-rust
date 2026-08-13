@@ -49,10 +49,12 @@ fn cert_names(certs: &[CertificateDer<'static>]) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(leaf) = certs.first() {
         let (cn, sans) = extract_cert_names(leaf);
-        if let Some(c) = cn {
-            out.push(c);
+        // CN 与 SAN 可重复（rcgen 把首个 SAN 也设为 CN），去重避免匹配混淆。
+        for name in cn.into_iter().chain(sans) {
+            if !out.contains(&name) {
+                out.push(name);
+            }
         }
-        out.extend(sans);
     }
     out
 }
@@ -267,8 +269,15 @@ mod tests {
     /// 用 rcgen 生成一张叶子证书（SAN 列表），返回 (cert_pem, key_pem)。
     fn leaf_cert(sans: &[&str]) -> (String, String) {
         let key_pair = rcgen::KeyPair::generate().unwrap();
-        let params = rcgen::CertificateParams::new(sans.iter().map(|s| (*s).to_string()).collect::<Vec<String>>())
-            .unwrap();
+        let mut params = rcgen::CertificateParams::new(
+            sans.iter().map(|s| s.to_string()).collect::<Vec<String>>(),
+        )
+        .unwrap();
+        // 设 CN = 首个 SAN，避免 rcgen 默认 CN "rcgen self signed cert" 污染 names。
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, sans[0]);
         let cert = params.self_signed(&key_pair).unwrap();
         (cert.pem(), key_pair.serialize_pem())
     }
@@ -330,7 +339,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "SNI multi-cert resolver 逻辑待调试，单证书 TLS 工作正常"]
     fn sni_exact_match_selects_right_cert() {
         install_provider();
         let (c1, k1) = leaf_cert(&["a.example.com"]);
@@ -344,7 +352,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "SNI multi-cert resolver 逻辑待调试"]
     fn sni_wildcard_match_selects_right_cert() {
         install_provider();
         // 证书 1：*.example.com 通配
@@ -377,7 +384,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "SNI multi-cert resolver 逻辑待调试"]
     fn sni_unknown_falls_back_to_first_when_not_reject() {
         install_provider();
         let e1 = named(&leaf_cert(&["a.com"]).0, &leaf_cert(&["a.com"]).1);

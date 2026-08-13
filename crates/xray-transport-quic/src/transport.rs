@@ -59,10 +59,13 @@ pub async fn dial(dest: &Destination, settings: &StreamSettings) -> io::Result<B
         .next()
         .ok_or_else(|| io::Error::other(format!("DNS resolution returned no addr for {addr_str}")))?;
 
-    // 3. rustls ClientConfig → quinn ClientConfig。
+    // 3. QUIC 特有配置（congestion 等）。
+    let qc = crate::config::QuicConfig::from_json(settings.transport_json.as_ref())?;
+    // 4. rustls ClientConfig → quinn ClientConfig（+ congestion control TransportConfig）。
     let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from((*tls_cfg).clone())
         .map_err(|e| io::Error::other(format!("rustls→quic client: {e}")))?;
-    let client_config = quinn::ClientConfig::new(Arc::new(quic_client));
+    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client));
+    client_config.transport_config(Arc::new(qc.build_transport_config()));
 
     // 4. Endpoint + connect。
     let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
@@ -100,9 +103,12 @@ pub async fn listen(
         )
     })?;
 
+    // QUIC 特有配置（congestion 等）。
+    let qc = crate::config::QuicConfig::from_json(settings.transport_json.as_ref())?;
     let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from((*tls_cfg).clone())
         .map_err(|e| io::Error::other(format!("rustls→quic server: {e}")))?;
-    let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+    server_config.transport_config(Arc::new(qc.build_transport_config()));
 
     let endpoint = quinn::Endpoint::server(server_config, addr)
         .map_err(|e| io::Error::other(format!("quinn bind: {e}")))?;

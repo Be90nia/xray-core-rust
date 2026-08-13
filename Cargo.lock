@@ -6525,6 +6525,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "quinn",
+ "quinn-proto",
  "rustls",
  "serde_json",
  "tokio",
