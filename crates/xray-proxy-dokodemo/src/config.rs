@@ -118,6 +118,33 @@ impl Config {
         self.allowed_networks.contains(&net)
     }
 
+    /// 应用端口映射。对应 Go `Process()` 第 101-109 行 `portMap` 逻辑。
+    ///
+    /// 当 `local_port`（监听端口的字符串形式）匹配 `port_map` 中的 key 时，
+    /// 解析 value（`"host:port"` 格式）并返回覆盖值。
+    ///
+    /// - value 格式 `"host:port"`：同时覆盖地址和端口
+    /// - value 格式 `":port"`：仅覆盖端口
+    /// - value 格式 `"host:"`：仅覆盖地址
+    /// - 无冒号或不匹配：返回 `None`（与 Go `SplitHostPort` 忽略错误一致）
+    #[must_use]
+    pub fn apply_port_map(&self, local_port: &str) -> Option<(Option<String>, Option<u16>)> {
+        let mapping = self.port_map.get(local_port)?;
+        let (host, port_str) = mapping.rsplit_once(':')?;
+        let host = if host.is_empty() {
+            None
+        } else {
+            // 去除 IPv6 方括号："[::1]" → "::1"
+            let h = host.trim_start_matches('[').trim_end_matches(']');
+            if h.is_empty() { None } else { Some(h.to_string()) }
+        };
+        let port = port_str.parse::<u16>().ok();
+        if host.is_none() && port.is_none() {
+            return None;
+        }
+        Some((host, port))
+    }
+
     /// 从 prost Config 构造。
     pub fn from_proto(p: ProtoConfig) -> Result<Self> {
         Ok(Self {
@@ -292,5 +319,68 @@ mod tests {
         let proto = cfg.to_proto();
         let cfg2 = Config::from_proto(proto).unwrap();
         assert_eq!(cfg, cfg2);
+    }
+
+    // ===== apply_port_map =====
+
+    fn make_port_map_cfg(entries: &[(&str, &str)]) -> Config {
+        Config {
+            port_map: entries
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn port_map_host_port() {
+        let cfg = make_port_map_cfg(&[("80", "192.168.1.1:8080")]);
+        let (host, port) = cfg.apply_port_map("80").expect("should map");
+        assert_eq!(host.as_deref(), Some("192.168.1.1"));
+        assert_eq!(port, Some(8080));
+    }
+
+    #[test]
+    fn port_map_port_only() {
+        let cfg = make_port_map_cfg(&[("80", ":8080")]);
+        let (host, port) = cfg.apply_port_map("80").expect("should map");
+        assert_eq!(host, None);
+        assert_eq!(port, Some(8080));
+    }
+
+    #[test]
+    fn port_map_host_only() {
+        let cfg = make_port_map_cfg(&[("80", "example.com:")]);
+        let (host, port) = cfg.apply_port_map("80").expect("should map");
+        assert_eq!(host.as_deref(), Some("example.com"));
+        assert_eq!(port, None);
+    }
+
+    #[test]
+    fn port_map_ipv6() {
+        let cfg = make_port_map_cfg(&[("80", "[::1]:9090")]);
+        let (host, port) = cfg.apply_port_map("80").expect("should map");
+        assert_eq!(host.as_deref(), Some("::1"));
+        assert_eq!(port, Some(9090));
+    }
+
+    #[test]
+    fn port_map_no_match_returns_none() {
+        let cfg = make_port_map_cfg(&[("80", "192.168.1.1:8080")]);
+        assert!(cfg.apply_port_map("443").is_none());
+    }
+
+    #[test]
+    fn port_map_no_colon_returns_none() {
+        // Go SplitHostPort silently fails on bare port; we match.
+        let cfg = make_port_map_cfg(&[("80", "8080")]);
+        assert!(cfg.apply_port_map("80").is_none());
+    }
+
+    #[test]
+    fn port_map_empty_map_returns_none() {
+        let cfg = Config::default();
+        assert!(cfg.apply_port_map("80").is_none());
     }
 }

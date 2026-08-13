@@ -34,7 +34,10 @@ use xray_proxy_vmess::{serve_vmess, MemoryAccount as VmessMemoryAccount, MemoryU
 use xray_common::uuid::UUID;
 // tdy: http + dokodemo inbound 集成
 use xray_proxy_http::ServerConfig as HttpServerConfig;
-use xray_proxy_http::server::http_server_handshake;
+use xray_proxy_http::server::{
+    http_server_handshake, extract_request_path, build_forwarded_request, HandshakeResult,
+};
+use xray_app_dispatcher::DispatchHandler;
 // zx7: mux inbound 检测
 use xray_mux::client::{MUX_COOL_ADDRESS, MUX_COOL_PORT};
 // 补全协议 inbound 注册
@@ -288,10 +291,9 @@ async fn resolve_udp_dest(addr: &SocksAddr) -> Option<SocketAddr> {
     }
 }
 
-/// HTTP proxy inbound 服务入口（tdy）。
+/// HTTP proxy inbound 服务入口。
 ///
-/// 接受连接 → http_server_handshake → 拆 stream → dispatch。
-/// 当前只 dispatch CONNECT 隧道；普通 HTTP 代理（GET/POST 等）暂不支持，留切片3。
+/// 接受连接 → http_server_handshake → CONNECT 隧道 dispatch 或 plain HTTP 代理转发。
 pub async fn serve_http(
     listener: TcpListener,
     ohm: Arc<SimpleOhm>,
@@ -312,20 +314,21 @@ pub async fn serve_http(
         let handler = Arc::clone(&handler);
         let config = Arc::clone(&config);
         tokio::spawn(async move {
-            // 1. handshake → (dest, method)
-            let (dest, method) = match http_server_handshake(&mut stream, &config).await {
+            // 1. handshake
+            let hs = match http_server_handshake(&mut stream, &config).await {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::debug!(error = %e, "http handshake failed");
                     return;
                 }
             };
-            // 2. 只 dispatch CONNECT（plain HTTP 留切片3）
-            if method != "CONNECT" {
-                tracing::debug!(method = %method, "plain HTTP proxy not yet supported, skipping");
+            // 2. Plain HTTP proxy（GET/POST 等）
+            if hs.method != "CONNECT" {
+                handle_plain_http(stream, hs, Arc::clone(&handler)).await;
                 return;
             }
-            // 3. 拆 stream → Link → dispatch
+            // 3. CONNECT：拆 stream → Link → dispatch
+            let dest = hs.dest;
             let (read_half, write_half) = tokio::io::split(stream);
             let link = Link::new(new_reader(read_half), new_writer(write_half));
             // zx7: mux.cool dest 转给 mux ServerWorker（stub）
@@ -337,6 +340,88 @@ pub async fn serve_http(
             let _ = handler.dispatch(&dest, link).await;
         });
     }
+}
+
+/// 处理 plain HTTP 代理请求（GET/POST 等）。
+///
+/// 对应 Go `proxy/http/server.go::handlePlainHTTP`。通过 dispatch 拨号到目标，
+/// 并发转发请求（head + body → 目标）和响应（目标 → 客户端）。
+async fn handle_plain_http(
+    client: TcpStream,
+    hs: HandshakeResult,
+    handler: Arc<dyn DispatchHandler>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use xray_buf::io::{Reader as BufReader, Writer as BufWriter};
+    use xray_buf::multi::MultiBuffer;
+
+    // 1. 构建转发请求（绝对 URL → 相对 path，移除 hop-by-hop headers）
+    let path = extract_request_path(&hs.target);
+    let request_head = build_forwarded_request(&hs.method, &path, &hs.headers);
+
+    // 2. 创建 pipe 对，构造 dispatch link
+    let (up_r, up_w) = xray_buf::pipe::new();
+    let (dn_r, dn_w) = xray_buf::pipe::new();
+    let dn_w_cleanup = dn_w.clone();
+    let link = Link::new(
+        Box::new(up_r) as Box<dyn BufReader>,
+        Box::new(dn_w) as Box<dyn BufWriter>,
+    );
+
+    // 3. dispatch：拨号目标 + bridge（up_r → 目标写，目标读 → dn_w）
+    let dest = hs.dest.clone();
+    let h = Arc::clone(&handler);
+    let dispatch_and_cleanup = async move {
+        h.dispatch(&dest, link).await;
+        // dispatch 结束（bridge EOF 或拨号失败）→ 关闭 dn_w 解除 read 阻塞
+        dn_w_cleanup.shutdown();
+    };
+
+    // 4. 拆 client stream：read(body) + write(response) 并发
+    let (mut client_read, mut client_write) = tokio::io::split(client);
+    let mut up_w = up_w;
+    let mut dn_r = dn_r;
+
+    // 上行：写 request head + copy body → 目标
+    let write_req = async {
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(&request_head);
+        let _ = up_w.write_multi_buffer(mb).await;
+        let mut buf = vec![0u8; 8192];
+        loop {
+            match client_read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let mut mb = MultiBuffer::new();
+                    mb.merge_bytes(&buf[..n]);
+                    if up_w.write_multi_buffer(mb).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        up_w.shutdown(); // EOF → dispatch bridge 关闭目标写半部
+    };
+
+    // 下行：读响应 → 客户端
+    let read_resp = async {
+        loop {
+            match dn_r.read_multi_buffer().await {
+                Ok(mb) => {
+                    if mb.is_empty() {
+                        break;
+                    }
+                    let data = mb.to_vec();
+                    if client_write.write_all(&data).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    };
+
+    tokio::join!(dispatch_and_cleanup, write_req, read_resp);
 }
 
 /// Dokodemo-door inbound 服务入口（tdy）。
@@ -366,6 +451,81 @@ pub async fn serve_dokodemo(
             let link = Link::new(new_reader(read_half), new_writer(write_half));
             let _ = handler.dispatch(&dest, link).await;
         });
+    }
+}
+
+/// Dokodemo-door UDP inbound 服务入口。
+///
+/// 对应 Go `Process()` 中 `network == UDP` 分支：recv_from → 转发到预定义 dest →
+/// recv 响应 → send_to 回客户端。
+///
+/// 当前使用 per-packet ephemeral socket 模式（与 SOCKS UDP associate 一致）。
+/// Go 生产环境用 FakeUDP（Linux TPROXY 伪造源地址），此处简化。
+pub async fn serve_dokodemo_udp(
+    udp: UdpSocket,
+    dest: Destination,
+) -> std::io::Result<()> {
+    let udp = Arc::new(udp);
+    tracing::info!(addr = %udp.local_addr()?, dest = ?dest, "dokodemo UDP inbound listening");
+    let mut buf = [0u8; 65535];
+    loop {
+        let (n, peer) = match udp.recv_from(&mut buf).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "dokodemo udp recv failed");
+                continue;
+            }
+        };
+        // 解析目标 SocketAddr（域名走 DNS 解析）
+        let dest_addr = match resolve_dest_socketaddr(&dest).await {
+            Some(a) => a,
+            None => {
+                tracing::debug!(dest = ?dest, "dokodemo udp dest resolve failed");
+                continue;
+            }
+        };
+        let payload = buf[..n].to_vec();
+        let udp_sock = Arc::clone(&udp);
+        // ponytail: per-packet ephemeral forward; upgrade to session-based if QPS matters.
+        tokio::spawn(async move {
+            let fwd = match UdpSocket::bind("0.0.0.0:0").await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!(error = %e, "dokodemo udp fwd bind failed");
+                    return;
+                }
+            };
+            if fwd.connect(dest_addr).await.is_err() {
+                return;
+            }
+            if fwd.send(&payload).await.is_err() {
+                return;
+            }
+            let mut rbuf = [0u8; 65535];
+            let rn = match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                fwd.recv(&mut rbuf),
+            ).await {
+                Ok(Ok(n)) => n,
+                _ => return,
+            };
+            if udp_sock.send_to(&rbuf[..rn], peer).await.is_err() {
+                tracing::debug!("dokodemo udp send_to client failed");
+            }
+        });
+    }
+}
+
+/// 将 [`Destination`] 解析为 [`SocketAddr`]（域名走 `tokio::net::lookup_host`）。
+async fn resolve_dest_socketaddr(dest: &Destination) -> Option<SocketAddr> {
+    let port = dest.port().value();
+    match dest.address() {
+        Address::IPv4(v4) => Some(SocketAddr::new((*v4).into(), port)),
+        Address::IPv6(v6) => Some(SocketAddr::new((*v6).into(), port)),
+        Address::Domain(d) => tokio::net::lookup_host((d.as_str(), port))
+            .await
+            .ok()?
+            .next(),
     }
 }
 
@@ -692,15 +852,45 @@ async fn spawn_one_inbound(
             Ok(Some(handle))
         }
         "dokodemo" => {
-            let dest = parse_dokodemo_dest(&ib.entry.data)?;
-            let listener = TcpListener::bind(&addr).await?;
-            tracing::info!(tag = %ib.tag, addr = %addr, dest = ?dest, "dokodemo inbound listening");
-            let handle = tokio::spawn(async move {
-                if let Err(e) = serve_dokodemo(listener, ohm, dest).await {
-                    tracing::error!(error = %e, "dokodemo inbound stopped");
+            let settings = parse_dokodemo_settings(&ib.entry.data)?;
+            let dest = settings.dest.clone();
+            // followRedirect 留 TODO: 需要从 listener fd 调 SO_ORIGINAL_DST（Linux-only）。
+            // 当前 TCP/UDP 走 predefined dest。
+            let mut handles = Vec::new();
+            if settings.allow_tcp {
+                let listener = TcpListener::bind(&addr).await?;
+                tracing::info!(tag = %ib.tag, addr = %addr, dest = ?dest, "dokodemo TCP inbound listening");
+                let ohm_tcp = Arc::clone(&ohm);
+                let dest_tcp = dest.clone();
+                handles.push(tokio::spawn(async move {
+                    if let Err(e) = serve_dokodemo(listener, ohm_tcp, dest_tcp).await {
+                        tracing::error!(error = %e, "dokodemo TCP inbound stopped");
+                    }
+                }));
+            }
+            if settings.allow_udp {
+                let udp = UdpSocket::bind(&addr).await?;
+                tracing::info!(tag = %ib.tag, addr = %addr, dest = ?dest, "dokodemo UDP inbound listening");
+                let dest_udp = dest.clone();
+                handles.push(tokio::spawn(async move {
+                    if let Err(e) = serve_dokodemo_udp(udp, dest_udp).await {
+                        tracing::error!(error = %e, "dokodemo UDP inbound stopped");
+                    }
+                }));
+            }
+            if handles.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "dokodemo: no valid network specified (need tcp and/or udp)",
+                ));
+            }
+            // 合并所有 listener handle 为一个JoinHandle
+            let combined = tokio::spawn(async move {
+                for h in handles {
+                    let _ = h.await;
                 }
             });
-            Ok(Some(handle))
+            Ok(Some(combined))
         }
         // shadowsocks inbound：SsInbound + serve_ss accept loop
         "shadowsocks" => {
@@ -908,8 +1098,31 @@ fn parse_http_config(data: &[u8]) -> std::io::Result<HttpServerConfig> {
 
 /// 从 inbound entry.data（JSON）解析 dokodemo 配置 → Destination（预定义目标）。
 ///
-/// JSON 格式：`{"address":"1.2.3.4","port":80,"network":"tcp"}`（address+port 必填）
+/// JSON 格式：`{"address":"1.2.3.4","port":80,"network":"tcp"}`（address+port 必填）。
+/// 委托给 [`parse_dokodemo_settings`]，返回其 `dest` 字段。
 fn parse_dokodemo_dest(data: &[u8]) -> std::io::Result<Destination> {
+    Ok(parse_dokodemo_settings(data)?.dest)
+}
+
+/// Dokodemo inbound 解析后的完整设置。
+///
+/// 对应 Go `proxy/dokodemo/config.go::Config`。
+struct DokodemoInboundSettings {
+    /// 预定义目标（TCP 和 UDP 各一份，网络类型不同）。
+    dest: Destination,
+    /// 是否允许 TCP。
+    allow_tcp: bool,
+    /// 是否允许 UDP。
+    allow_udp: bool,
+    /// 是否跟随 iptables REDIRECT 原始目标（透明代理）。
+    follow_redirect: bool,
+}
+
+/// 从 inbound entry.data（JSON）解析完整 dokodemo 设置。
+///
+/// JSON 格式：`{"address":"1.2.3.4","port":80,"network":"tcp,udp","followRedirect":true}`。
+/// `network` 可选（默认 `"tcp"`）；`followRedirect` 可选（默认 `false`）。
+fn parse_dokodemo_settings(data: &[u8]) -> std::io::Result<DokodemoInboundSettings> {
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("dokodemo inbound settings JSON: {e}")))?;
     let address_str = v.get("address").and_then(|x| x.as_str())
@@ -917,7 +1130,6 @@ fn parse_dokodemo_dest(data: &[u8]) -> std::io::Result<Destination> {
     let port = v.get("port").and_then(|x| x.as_u64())
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "dokodemo: missing port"))?
         as u16;
-    // address 是 IPv4/IPv6/Domain 之一
     let address = if let Ok(v4) = address_str.parse::<std::net::Ipv4Addr>() {
         Address::IPv4(v4)
     } else if let Ok(v6) = address_str.parse::<std::net::Ipv6Addr>() {
@@ -925,7 +1137,18 @@ fn parse_dokodemo_dest(data: &[u8]) -> std::io::Result<Destination> {
     } else {
         Address::Domain(address_str.to_string())
     };
-    Ok(Destination::new(address, Port::new(port), Network::TCP))
+    // network：逗号分隔，默认 tcp。对应 Go allowed_networks。
+    let network_str = v.get("network").and_then(|x| x.as_str()).unwrap_or("tcp");
+    let allow_tcp = network_str.contains("tcp");
+    let allow_udp = network_str.contains("udp");
+    let follow_redirect = v.get("followRedirect").and_then(|x| x.as_bool()).unwrap_or(false);
+
+    let dest = if allow_udp && !allow_tcp {
+        Destination::new(address, Port::new(port), Network::UDP)
+    } else {
+        Destination::new(address, Port::new(port), Network::TCP)
+    };
+    Ok(DokodemoInboundSettings { dest, allow_tcp, allow_udp, follow_redirect })
 }
 
 /// 从 inbound entry.data（JSON）解析 vmess clients → TimedUserValidator。
@@ -1672,6 +1895,53 @@ mod tests {
         let settings = serde_json::json!({ "address": "1.2.3.4" });
         let data = serde_json::to_vec(&settings).unwrap();
         assert!(super::parse_dokodemo_dest(&data).is_err());
+    }
+
+    #[test]
+    fn parse_dokodemo_settings_tcp_only() {
+        let settings = serde_json::json!({ "address": "1.2.3.4", "port": 80, "network": "tcp" });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let s = super::parse_dokodemo_settings(&data).unwrap();
+        assert!(s.allow_tcp);
+        assert!(!s.allow_udp);
+        assert!(!s.follow_redirect);
+        assert!(s.dest.is_tcp());
+    }
+
+    #[test]
+    fn parse_dokodemo_settings_udp_only() {
+        let settings = serde_json::json!({ "address": "1.2.3.4", "port": 53, "network": "udp" });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let s = super::parse_dokodemo_settings(&data).unwrap();
+        assert!(!s.allow_tcp);
+        assert!(s.allow_udp);
+        assert!(s.dest.is_udp());
+    }
+
+    #[test]
+    fn parse_dokodemo_settings_tcp_udp() {
+        let settings = serde_json::json!({ "address": "1.2.3.4", "port": 53, "network": "tcp,udp" });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let s = super::parse_dokodemo_settings(&data).unwrap();
+        assert!(s.allow_tcp);
+        assert!(s.allow_udp);
+    }
+
+    #[test]
+    fn parse_dokodemo_settings_follow_redirect() {
+        let settings = serde_json::json!({ "address": "1.2.3.4", "port": 80, "followRedirect": true });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let s = super::parse_dokodemo_settings(&data).unwrap();
+        assert!(s.follow_redirect);
+    }
+
+    #[test]
+    fn parse_dokodemo_settings_default_network_is_tcp() {
+        let settings = serde_json::json!({ "address": "1.2.3.4", "port": 80 });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let s = super::parse_dokodemo_settings(&data).unwrap();
+        assert!(s.allow_tcp);
+        assert!(!s.allow_udp);
     }
 
     #[test]

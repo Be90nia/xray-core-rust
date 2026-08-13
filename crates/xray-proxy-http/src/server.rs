@@ -27,6 +27,79 @@ use xray_features::inbound::{InboundError, InboundHandler};
 use crate::config::ServerConfig;
 use crate::error::{HttpProxyError, Result};
 
+/// HTTP 握手结果——包含解析出的目标、方法、请求行 target 和 headers。
+///
+/// CONNECT 隧道只需 `dest` + `method`；plain HTTP 代理需要 `target` + `headers`
+/// 重建转发请求（对应 Go `handlePlainHTTP`）。
+#[derive(Debug, Clone)]
+pub struct HandshakeResult {
+    /// 解析出的目标地址（CONNECT 从 authority，plain HTTP 从 Host header）。
+    pub dest: Destination,
+    /// HTTP 方法（大写）。
+    pub method: String,
+    /// 请求行 target 字段（CONNECT = `host:port`，plain HTTP = 绝对 URL 或路径）。
+    pub target: String,
+    /// 解析出的 headers（key 全小写）。
+    pub headers: HashMap<String, String>,
+}
+
+/// Hop-by-hop headers（RFC 7230 §6.1）+ 代理专有 header——转发时移除。
+const HOP_BY_HOP_HEADERS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// 从请求行 target 提取 path（含 query）。
+///
+/// `http://example.com/path?q=1` → `/path?q=1`
+/// `/path` → `/path`（透明代理）
+/// `example.com:8080/path` → `/path`（无 scheme）
+/// `example.com` → `/`（无 path）
+pub fn extract_request_path(target: &str) -> String {
+    let after_scheme = target
+        .strip_prefix("http://")
+        .or_else(|| target.strip_prefix("https://"))
+        .unwrap_or(target);
+    match after_scheme.find('/') {
+        Some(slash) => after_scheme[slash..].to_string(),
+        None => "/".to_string(),
+    }
+}
+
+/// 构建转发给目标服务器的 HTTP 请求（request line + headers）。
+///
+/// 移除 hop-by-hop headers，强制 `Connection: close`。
+/// 对应 Go `handlePlainHTTP` 中 `request.Header.Set("Connection", "close")` + `request.Write`。
+pub fn build_forwarded_request(
+    method: &str,
+    path: &str,
+    headers: &HashMap<String, String>,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(512);
+    buf.extend_from_slice(method.as_bytes());
+    buf.push(b' ');
+    buf.extend_from_slice(path.as_bytes());
+    buf.extend_from_slice(b" HTTP/1.1\r\n");
+    for (key, value) in headers {
+        if HOP_BY_HOP_HEADERS.contains(&key.as_str()) {
+            continue;
+        }
+        buf.extend_from_slice(key.as_bytes());
+        buf.extend_from_slice(b": ");
+        buf.extend_from_slice(value.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    }
+    buf.extend_from_slice(b"connection: close\r\n\r\n");
+    buf
+}
+
 /// HTTP proxy inbound 服务器。
 ///
 /// 切片2：listen + accept + HTTP CONNECT handshake + 认证。
@@ -80,12 +153,12 @@ impl InboundHandler for HttpServer {
                         let config = config.clone();
                         tokio::spawn(async move {
                             match http_server_handshake(&mut stream, &config).await {
-                                Ok((dest, method)) => {
+                                Ok(hs) => {
                                     info!(
                                         tag = %tag,
                                         peer = %peer,
-                                        method = %method,
-                                        dest = ?dest,
+                                        method = %hs.method,
+                                        dest = ?hs.dest,
                                         "HTTP proxy handshake succeeded"
                                     );
                                     // 切片3: dispatch to outbound handler
@@ -127,9 +200,10 @@ impl InboundHandler for HttpServer {
     }
 }
 
-/// HTTP proxy 服务端握手。解析 CONNECT 请求 + 认证 + 回 200/407。
+/// HTTP proxy 服务端握手。解析请求行 + 认证 + 解析目标。
 ///
-/// 返回 `(Destination, method)`。method 是 `"CONNECT"` 或其他 HTTP method。
+/// 返回 [`HandshakeResult`]（含 dest、method、target、headers）。
+/// CONNECT → 回 `200 Connection established`；非 CONNECT → 不回响应（由调用方处理 plain HTTP 转发）。
 ///
 /// ## 流程
 ///
@@ -138,11 +212,10 @@ impl InboundHandler for HttpServer {
 /// 3. 如配置了 accounts：校验 `Proxy-Authorization: Basic <base64>`
 /// 4. 解析 dest：CONNECT 的 target（`host:port`）或 Host header
 /// 5. CONNECT → 回 `HTTP/1.1 200 Connection established\r\n\r\n`
-///    非 CONNECT → 不回响应（切片3 处理 plain HTTP 转发）
 pub async fn http_server_handshake<RW>(
     stream: &mut RW,
     config: &ServerConfig,
-) -> Result<(Destination, String)>
+) -> Result<HandshakeResult>
 where
     RW: AsyncReadExt + AsyncWriteExt + Unpin,
 {
@@ -155,7 +228,7 @@ where
         )));
     }
     let method = parts[0].to_ascii_uppercase();
-    let target = parts[1];
+    let target = parts[1].to_string();
 
     // 2. 读 headers
     let mut headers: HashMap<String, String> = HashMap::new();
@@ -188,9 +261,9 @@ where
 
     // 4. 解析 dest
     let dest = if method == "CONNECT" {
-        parse_host_port(target, 443)?
+        parse_host_port(&target, 443)?
     } else {
-        // 切片3: 普通 HTTP 代理从 Host header 提取 dest
+        // 普通 HTTP 代理从 Host header 提取 dest
         let host = headers
             .get("host")
             .ok_or_else(|| HttpProxyError::InvalidRequest("missing Host header".into()))?;
@@ -204,7 +277,12 @@ where
             .await?;
     }
 
-    Ok((dest, method))
+    Ok(HandshakeResult {
+        dest,
+        method,
+        target,
+        headers,
+    })
 }
 
 /// 读一行 HTTP header（到 `\r\n`，返回不含 `\r\n` 的内容）。
@@ -372,7 +450,7 @@ mod tests {
     async fn tcp_handshake(
         request: &[u8],
         config: ServerConfig,
-    ) -> (String, std::result::Result<(Destination, String), HttpProxyError>) {
+    ) -> (String, std::result::Result<HandshakeResult, HttpProxyError>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -401,9 +479,9 @@ mod tests {
     async fn handshake_connect_no_auth_200() {
         let req = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
         let (resp, result) = tcp_handshake(req, ServerConfig::default()).await;
-        let (dest, method) = result.unwrap();
-        assert_eq!(method, "CONNECT");
-        assert_eq!(dest.port().value(), 443);
+        let hs = result.unwrap();
+        assert_eq!(hs.method, "CONNECT");
+        assert_eq!(hs.dest.port().value(), 443);
         assert!(resp.contains("200"), "got: {resp}");
     }
 
@@ -442,36 +520,101 @@ mod tests {
     async fn handshake_connect_ipv4_dest() {
         let req = b"CONNECT 1.2.3.4:8080 HTTP/1.1\r\n\r\n";
         let (_, result) = tcp_handshake(req, ServerConfig::default()).await;
-        let (dest, _) = result.unwrap();
-        assert!(matches!(dest.address(), Address::IPv4(_)));
-        assert_eq!(dest.port().value(), 8080);
+        let hs = result.unwrap();
+        assert!(matches!(hs.dest.address(), Address::IPv4(_)));
+        assert_eq!(hs.dest.port().value(), 8080);
     }
 
     #[tokio::test]
     async fn handshake_connect_ipv6_dest() {
         let req = b"CONNECT [::1]:443 HTTP/1.1\r\n\r\n";
         let (_, result) = tcp_handshake(req, ServerConfig::default()).await;
-        let (dest, _) = result.unwrap();
-        assert!(matches!(dest.address(), Address::IPv6(_)));
-        assert_eq!(dest.port().value(), 443);
+        let hs = result.unwrap();
+        assert!(matches!(hs.dest.address(), Address::IPv6(_)));
+        assert_eq!(hs.dest.port().value(), 443);
     }
 
     #[tokio::test]
     async fn handshake_connect_default_port_443() {
         let req = b"CONNECT example.com HTTP/1.1\r\n\r\n";
         let (_, result) = tcp_handshake(req, ServerConfig::default()).await;
-        let (dest, _) = result.unwrap();
-        assert_eq!(dest.port().value(), 443);
+        let hs = result.unwrap();
+        assert_eq!(hs.dest.port().value(), 443);
     }
 
     #[tokio::test]
     async fn handshake_get_extracts_host_port_80() {
         let req = b"GET http://example.com/path HTTP/1.1\r\nHost: example.com\r\n\r\n";
         let (_, result) = tcp_handshake(req, ServerConfig::default()).await;
-        let (dest, method) = result.unwrap();
-        assert_eq!(method, "GET");
-        assert!(matches!(dest.address(), Address::Domain(_)));
-        assert_eq!(dest.port().value(), 80);
+        let hs = result.unwrap();
+        assert_eq!(hs.method, "GET");
+        assert!(matches!(hs.dest.address(), Address::Domain(_)));
+        assert_eq!(hs.dest.port().value(), 80);
+    }
+
+    // ===== plain HTTP proxy 辅助函数测试 =====
+
+    #[test]
+    fn extract_request_path_absolute_url() {
+        assert_eq!(extract_request_path("http://example.com/path?q=1"), "/path?q=1");
+        assert_eq!(extract_request_path("https://example.com/"), "/");
+        assert_eq!(extract_request_path("http://example.com:8080/deep/path"), "/deep/path");
+    }
+
+    #[test]
+    fn extract_request_path_no_path() {
+        assert_eq!(extract_request_path("http://example.com"), "/");
+        assert_eq!(extract_request_path("example.com:8080"), "/");
+    }
+
+    #[test]
+    fn extract_request_path_transparent() {
+        assert_eq!(extract_request_path("/index.html"), "/index.html");
+        assert_eq!(extract_request_path("/"), "/");
+    }
+
+    #[test]
+    fn build_forwarded_request_strips_hop_by_hop() {
+        let mut headers = HashMap::new();
+        headers.insert("host".into(), "example.com".into());
+        headers.insert("proxy-connection".into(), "keep-alive".into());
+        headers.insert("connection".into(), "keep-alive".into());
+        headers.insert("user-agent".into(), "curl/8.0".into());
+        headers.insert("proxy-authorization".into(), "Basic abc".into());
+
+        let req = build_forwarded_request("GET", "/path", &headers);
+        let req_str = String::from_utf8(req).unwrap();
+
+        assert!(req_str.starts_with("GET /path HTTP/1.1\r\n"));
+        assert!(req_str.contains("host: example.com"));
+        assert!(req_str.contains("user-agent: curl/8.0"));
+        assert!(!req_str.contains("proxy-connection"));
+        assert!(!req_str.contains("proxy-authorization"));
+        assert!(req_str.contains("connection: close\r\n\r\n"));
+    }
+
+    #[test]
+    fn build_forwarded_request_post() {
+        let mut headers = HashMap::new();
+        headers.insert("host".into(), "api.example.com".into());
+        headers.insert("content-length".into(), "42".into());
+
+        let req = build_forwarded_request("POST", "/submit", &headers);
+        let req_str = String::from_utf8(req).unwrap();
+
+        assert!(req_str.starts_with("POST /submit HTTP/1.1\r\n"));
+        assert!(req_str.contains("content-length: 42"));
+    }
+
+    #[tokio::test]
+    async fn handshake_get_returns_target_and_headers() {
+        let req = b"GET http://example.com/page?q=1 HTTP/1.1\r\nHost: example.com\r\nUser-Agent: test\r\n\r\n";
+        let (_, result) = tcp_handshake(req, ServerConfig::default()).await;
+        let hs = result.unwrap();
+        assert_eq!(hs.method, "GET");
+        assert_eq!(hs.target, "http://example.com/page?q=1");
+        assert_eq!(hs.headers.get("host").unwrap(), "example.com");
+        assert_eq!(hs.headers.get("user-agent").unwrap(), "test");
     }
 
     #[tokio::test]

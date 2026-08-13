@@ -204,6 +204,12 @@ pub struct Commander {
     handler_registry: Arc<OutboundHandlerRegistry>,
     /// gRPC server 后台 task 的 JoinHandle（listen 模式启动后持有，close 时 abort）。
     grpc_task: Mutex<Option<JoinHandle<()>>>,
+    /// 可选的 StatsService gRPC 后端（注入后注册到 tonic server）。
+    stats_service: Option<Arc<dyn xray_app_stats::command::StatsService>>,
+    /// 可选的 RoutingService gRPC 后端（注入后注册到 tonic server）。
+    routing_service: Option<Arc<xray_app_router::command::RoutingService>>,
+    /// 可选的 ObservatoryService gRPC 后端（注入后注册到 tonic server）。
+    observatory_service: Option<Arc<dyn xray_app_observatory::command::ObservatoryService>>,
 }
 
 impl Commander {
@@ -222,6 +228,9 @@ impl Commander {
             outbound_registrar: None,
             handler_registry: Arc::new(OutboundHandlerRegistry::new()),
             grpc_task: Mutex::new(None),
+            stats_service: None,
+            routing_service: None,
+            observatory_service: None,
         }
     }
     /// 从 [`Config`] 构造（不解码 TypedMessage，仅复制 tag/listen/service_configs 元数据）。
@@ -252,6 +261,30 @@ impl Commander {
         registrar: Arc<dyn crate::outbound::HandlerManager>,
     ) {
         self.outbound_registrar = Some(registrar);
+    }
+
+    /// 注入 StatsService gRPC 后端（`start` 时注册到 tonic server）。
+    pub fn set_stats_service(
+        &mut self,
+        service: Arc<dyn xray_app_stats::command::StatsService>,
+    ) {
+        self.stats_service = Some(service);
+    }
+
+    /// 注入 RoutingService gRPC 后端（`start` 时注册到 tonic server）。
+    pub fn set_routing_service(
+        &mut self,
+        service: Arc<xray_app_router::command::RoutingService>,
+    ) {
+        self.routing_service = Some(service);
+    }
+
+    /// 注入 ObservatoryService gRPC 后端（`start` 时注册到 tonic server）。
+    pub fn set_observatory_service(
+        &mut self,
+        service: Arc<dyn xray_app_observatory::command::ObservatoryService>,
+    ) {
+        self.observatory_service = Some(service);
     }
 
     /// 添加 service。返回是否成功（type_url 重复时拒绝）。
@@ -376,7 +409,12 @@ impl Commander {
                 reason: e,
             })?;
 
-        let router = grpc::build_router(Arc::clone(&self.handler_registry));
+        let router = grpc::build_router(
+            Arc::clone(&self.handler_registry),
+            self.stats_service.clone(),
+            self.routing_service.clone(),
+            self.observatory_service.clone(),
+        );
         tracing::info!("commander gRPC server listening on {addr} (tag=`{}`)", self.tag);
 
         let handle = tokio::spawn(async move {

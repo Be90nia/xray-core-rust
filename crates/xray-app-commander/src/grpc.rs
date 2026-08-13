@@ -1,16 +1,21 @@
 //! Commander gRPC 服务（tonic 实现）。
 //!
 //! 对应 Go `app/commander` 中各 command service 的 `Register(*grpc.Server)`：
-//! 把 [`HandlerServiceImpl`] 注册到 tonic server，暴露 `HandlerService`
-//!（add/remove/list outbound）等 gRPC 方法。
+//! 把 [`HandlerServiceImpl`] / [`StatsServiceImpl`] / [`RoutingServiceImpl`] /
+//! [`ObservatoryServiceImpl`] 注册到 tonic server，暴露各 command 的 gRPC 方法。
 //!
 //! ## 范围
 //!
-//! - `add_outbound` / `remove_outbound` / `list_outbounds`：操作 Commander 内部
+//! - **HandlerService**：add/remove/list outbound 操作 Commander 内部
 //!   [`OutboundHandlerRegistry`](crate::server::OutboundHandlerRegistry)（注册 stub handler）。
 //!   接入 dispatcher 的真实 outbound manager 需 transport 全链路，留作后续。
-//! - 其余方法（inbound / alter / users）返回 `UNIMPLEMENTED`。
+//!   其余方法（inbound / alter / users）返回 `UNIMPLEMENTED`。
+//! - **StatsService**：委托领域 `xray_app_stats::command::StatsService`，proto ↔ domain 翻译。
+//! - **RoutingService**：委托领域 `xray_app_router::command::RoutingService`；
+//!   `SubscribeRoutingStats`/`TestRoute`/`AddRule` 需完整 context/config，返回 `UNIMPLEMENTED`。
+//! - **ObservatoryService**：委托领域 `xray_app_observatory::command::ObservatoryService`。
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -29,8 +34,31 @@ use xray_proto::xray::app::proxyman::command::{
     RemoveInboundRequest, RemoveInboundResponse, RemoveOutboundRequest, RemoveOutboundResponse,
 };
 use xray_proto::xray::core::OutboundHandlerConfig;
+
+// --- stats command gRPC ---
+use xray_proto::xray::app::stats::command as pstats;
+use xray_proto::xray::app::stats::command::stats_service_server::{
+    StatsService as ProtoStatsService, StatsServiceServer,
+};
+
+// --- router command gRPC ---
+use xray_proto::xray::app::router::command as prouter;
+use xray_proto::xray::app::router::command::routing_service_server::{
+    RoutingService as ProtoRoutingService, RoutingServiceServer,
+};
+
+// --- observatory command gRPC ---
+use xray_proto::xray::core::app::observatory::command as pobs;
+use xray_proto::xray::core::app::observatory::command::observatory_service_server::{
+    ObservatoryService as ProtoObservatoryService, ObservatoryServiceServer,
+};
+
 use crate::outbound::HandlerManager;
 use crate::server::OutboundHandlerRegistry;
+
+// ===========================================================================
+// HandlerService（proxyman command）
+// ===========================================================================
 
 /// HandlerService gRPC 实现。
 ///
@@ -158,6 +186,347 @@ impl HandlerService for HandlerServiceImpl {
     }
 }
 
+// ===========================================================================
+// StatsService（stats command）
+// ===========================================================================
+
+/// StatsService gRPC 实现。
+///
+/// 持有领域 [`xray_app_stats::command::StatsService`]，把 proto 请求翻译为领域
+/// 请求、调用编排类、再把领域响应翻译回 proto。对应 Go `statsServer`。
+#[derive(Clone)]
+pub struct StatsServiceImpl {
+    service: Arc<dyn xray_app_stats::command::StatsService>,
+}
+
+impl StatsServiceImpl {
+    #[must_use]
+    pub fn new(service: Arc<dyn xray_app_stats::command::StatsService>) -> Self {
+        Self { service }
+    }
+}
+
+/// 领域 [`StatsCommandError`](xray_app_stats::command::StatsCommandError) → tonic `Status`。
+fn stats_status(e: xray_app_stats::command::StatsCommandError) -> Status {
+    use xray_app_stats::command::StatsCommandError;
+    match e {
+        StatsCommandError::NotFound(n) => Status::not_found(n),
+        StatsCommandError::Internal(m) => Status::internal(m),
+    }
+}
+
+#[async_trait]
+impl ProtoStatsService for StatsServiceImpl {
+    async fn get_stats(
+        &self,
+        request: Request<pstats::GetStatsRequest>,
+    ) -> Result<Response<pstats::GetStatsResponse>, Status> {
+        let req = request.into_inner();
+        let dreq = xray_app_stats::command::GetStatsRequest {
+            name: req.name.to_string(),
+            reset: req.reset,
+        };
+        let resp = self.service.get_stats(&dreq).map_err(stats_status)?;
+        Ok(Response::new(pstats::GetStatsResponse {
+            stat: resp
+                .stat
+                .map(|s| pstats::Stat { name: s.name, value: s.value }),
+        }))
+    }
+
+    async fn get_stats_online(
+        &self,
+        request: Request<pstats::GetStatsRequest>,
+    ) -> Result<Response<pstats::GetStatsResponse>, Status> {
+        let req = request.into_inner();
+        let dreq = xray_app_stats::command::GetStatsRequest {
+            name: req.name.to_string(),
+            reset: req.reset,
+        };
+        let resp = self.service.get_stats_online(&dreq).map_err(stats_status)?;
+        Ok(Response::new(pstats::GetStatsResponse {
+            stat: resp
+                .stat
+                .map(|s| pstats::Stat { name: s.name, value: s.value }),
+        }))
+    }
+
+    async fn query_stats(
+        &self,
+        request: Request<pstats::QueryStatsRequest>,
+    ) -> Result<Response<pstats::QueryStatsResponse>, Status> {
+        let req = request.into_inner();
+        let dreq = xray_app_stats::command::QueryStatsRequest {
+            pattern: req.pattern.to_string(),
+            reset: req.reset,
+        };
+        let resp = self.service.query_stats(&dreq).map_err(stats_status)?;
+        Ok(Response::new(pstats::QueryStatsResponse {
+            stat: resp
+                .stats
+                .into_iter()
+                .map(|s| pstats::Stat { name: s.name, value: s.value })
+                .collect(),
+        }))
+    }
+
+    async fn get_sys_stats(
+        &self,
+        _request: Request<pstats::SysStatsRequest>,
+    ) -> Result<Response<pstats::SysStatsResponse>, Status> {
+        let s = self.service.get_sys_stats().map_err(stats_status)?;
+        Ok(Response::new(pstats::SysStatsResponse {
+            num_goroutine: s.num_threads,
+            num_gc: s.num_gc,
+            alloc: s.alloc_bytes,
+            total_alloc: s.total_alloc_bytes,
+            sys: s.sys_bytes,
+            mallocs: s.mallocs,
+            frees: s.frees,
+            live_objects: s.live_objects,
+            pause_total_ns: s.pause_total_ns,
+            uptime: s.uptime_seconds,
+        }))
+    }
+
+    async fn get_stats_online_ip_list(
+        &self,
+        request: Request<pstats::GetStatsRequest>,
+    ) -> Result<Response<pstats::GetStatsOnlineIpListResponse>, Status> {
+        let req = request.into_inner();
+        let dreq = xray_app_stats::command::GetStatsRequest {
+            name: req.name.to_string(),
+            reset: req.reset,
+        };
+        let resp = self
+            .service
+            .get_stats_online_ip_list(&dreq)
+            .map_err(stats_status)?;
+        let mut ips = HashMap::new();
+        for e in resp.ips {
+            ips.insert(e.ip, e.last_seen);
+        }
+        Ok(Response::new(pstats::GetStatsOnlineIpListResponse {
+            name: resp.name,
+            ips,
+        }))
+    }
+
+    async fn get_all_online_users(
+        &self,
+        _request: Request<pstats::GetAllOnlineUsersRequest>,
+    ) -> Result<Response<pstats::GetAllOnlineUsersResponse>, Status> {
+        let resp = self
+            .service
+            .get_all_online_users()
+            .map_err(stats_status)?;
+        Ok(Response::new(pstats::GetAllOnlineUsersResponse {
+            users: resp.users,
+        }))
+    }
+
+    async fn get_users_stats(
+        &self,
+        request: Request<pstats::GetUsersStatsRequest>,
+    ) -> Result<Response<pstats::GetUsersStatsResponse>, Status> {
+        let req = request.into_inner();
+        let dreq = xray_app_stats::command::GetUsersStatsRequest {
+            include_traffic: req.include_traffic,
+            reset: req.reset,
+        };
+        let resp = self
+            .service
+            .get_users_stats(&dreq)
+            .map_err(stats_status)?;
+        let users = resp
+            .users
+            .into_iter()
+            .map(|u| pstats::UserStat {
+                email: u.email,
+                ips: u
+                    .ips
+                    .into_iter()
+                    .map(|e| pstats::OnlineIpEntry { ip: e.ip, last_seen: e.last_seen })
+                    .collect(),
+                traffic: Some(pstats::TrafficUserStat {
+                    uplink: u.uplink,
+                    downlink: u.downlink,
+                }),
+            })
+            .collect();
+        Ok(Response::new(pstats::GetUsersStatsResponse { users }))
+    }
+}
+
+// ===========================================================================
+// RoutingService（router command）
+// ===========================================================================
+
+/// RoutingService gRPC 实现。
+///
+/// 持有领域 [`xray_app_router::command::RoutingService`]，translate proto ↔ domain。
+/// 对应 Go `routingServer`。`SubscribeRoutingStats`（server streaming）、`TestRoute`
+/// （需完整 `RoutingContext`）、`AddRule`（需完整 rule config）返回 `UNIMPLEMENTED`。
+#[derive(Clone)]
+pub struct RoutingServiceImpl {
+    service: Arc<xray_app_router::command::RoutingService>,
+}
+
+impl RoutingServiceImpl {
+    #[must_use]
+    pub fn new(service: Arc<xray_app_router::command::RoutingService>) -> Self {
+        Self { service }
+    }
+}
+
+/// 领域 [`RouterError`](xray_app_router::error::RouterError) → tonic `Status`。
+fn router_status(e: xray_app_router::error::RouterError) -> Status {
+    use xray_app_router::error::RouterError;
+    match e {
+        RouterError::BalancerNotFound(_)
+        | RouterError::TagNotFound
+        | RouterError::EmptyTagName => Status::not_found(e.to_string()),
+        _ => Status::internal(e.to_string()),
+    }
+}
+
+#[async_trait]
+impl ProtoRoutingService for RoutingServiceImpl {
+    // SubscribeRoutingStats 是 server-streaming RPC。返回 UNIMPLEMENTED 时此类型
+    // 实例不会被构造，仅需满足 `Stream + Send + 'static` 约束。
+    type SubscribeRoutingStatsStream =
+        tonic::codegen::tokio_stream::wrappers::ReceiverStream<
+            std::result::Result<prouter::RoutingContext, Status>,
+        >;
+
+    async fn subscribe_routing_stats(
+        &self,
+        _request: Request<prouter::SubscribeRoutingStatsRequest>,
+    ) -> Result<Response<Self::SubscribeRoutingStatsStream>, Status> {
+        Err(Status::unimplemented(
+            "SubscribeRoutingStats requires gRPC streaming framework",
+        ))
+    }
+
+    async fn test_route(
+        &self,
+        _request: Request<prouter::TestRouteRequest>,
+    ) -> Result<Response<prouter::RoutingContext>, Status> {
+        Err(Status::unimplemented(
+            "TestRoute requires full RoutingContext (not yet wired)",
+        ))
+    }
+
+    async fn get_balancer_info(
+        &self,
+        request: Request<prouter::GetBalancerInfoRequest>,
+    ) -> Result<Response<prouter::GetBalancerInfoResponse>, Status> {
+        let tag = request.into_inner().tag.to_string();
+        self.service.get_balancer_info(&tag).map_err(router_status)?;
+        // ponytail: 领域 get_balancer_info 仅验证 tag 存在性，不返回 override/principle 数据；
+        // 待 Router 暴露 balancer 详情后补全。
+        Ok(Response::new(prouter::GetBalancerInfoResponse {
+            balancer: Some(prouter::BalancerMsg {
+                r#override: None,
+                principle_target: None,
+            }),
+        }))
+    }
+
+    async fn override_balancer_target(
+        &self,
+        request: Request<prouter::OverrideBalancerTargetRequest>,
+    ) -> Result<Response<prouter::OverrideBalancerTargetResponse>, Status> {
+        let req = request.into_inner();
+        self.service
+            .override_balancer_target(&req.balancer_tag.to_string(), &req.target.to_string())
+            .map_err(router_status)?;
+        Ok(Response::new(prouter::OverrideBalancerTargetResponse {}))
+    }
+
+    async fn add_rule(
+        &self,
+        _request: Request<prouter::AddRuleRequest>,
+    ) -> Result<Response<prouter::AddRuleResponse>, Status> {
+        Err(Status::unimplemented("AddRule requires full RoutingRule config"))
+    }
+
+    async fn remove_rule(
+        &self,
+        request: Request<prouter::RemoveRuleRequest>,
+    ) -> Result<Response<prouter::RemoveRuleResponse>, Status> {
+        let tag = request.into_inner().rule_tag.to_string();
+        self.service.remove_rule(&tag).map_err(router_status)?;
+        Ok(Response::new(prouter::RemoveRuleResponse {}))
+    }
+
+    async fn list_rule(
+        &self,
+        _request: Request<prouter::ListRuleRequest>,
+    ) -> Result<Response<prouter::ListRuleResponse>, Status> {
+        let rules = self.service.list_rule().map_err(router_status)?;
+        let rules = rules
+            .into_iter()
+            .map(|t| prouter::ListRuleItem {
+                tag: String::new(),
+                rule_tag: t,
+            })
+            .collect();
+        Ok(Response::new(prouter::ListRuleResponse { rules }))
+    }
+}
+
+// ===========================================================================
+// ObservatoryService（observatory command）
+// ===========================================================================
+
+/// ObservatoryService gRPC 实现。
+///
+/// 持有领域 [`xray_app_observatory::command::ObservatoryService`]，调用
+/// `get_outbound_status` 并把领域 `ObservationResult` 翻译为 proto。
+#[derive(Clone)]
+pub struct ObservatoryServiceImpl {
+    service: Arc<dyn xray_app_observatory::command::ObservatoryService>,
+}
+
+impl ObservatoryServiceImpl {
+    #[must_use]
+    pub fn new(
+        service: Arc<dyn xray_app_observatory::command::ObservatoryService>,
+    ) -> Self {
+        Self { service }
+    }
+}
+
+/// 领域 [`ObservatoryError`](xray_app_observatory::error::ObservatoryError) → tonic `Status`。
+fn observatory_status(e: xray_app_observatory::error::ObservatoryError) -> Status {
+    use xray_app_observatory::error::ObservatoryError;
+    match e {
+        ObservatoryError::NoObservation => Status::not_found(e.to_string()),
+        _ => Status::internal(e.to_string()),
+    }
+}
+
+#[async_trait]
+impl ProtoObservatoryService for ObservatoryServiceImpl {
+    async fn get_outbound_status(
+        &self,
+        _request: Request<pobs::GetOutboundStatusRequest>,
+    ) -> Result<Response<pobs::GetOutboundStatusResponse>, Status> {
+        let result = self
+            .service
+            .get_outbound_status()
+            .map_err(observatory_status)?;
+        Ok(Response::new(pobs::GetOutboundStatusResponse {
+            status: Some(result.to_proto()),
+        }))
+    }
+}
+
+// ===========================================================================
+// 辅助函数 + build_router
+// ===========================================================================
+
 /// 解析监听地址为 `SocketAddr`。
 ///
 /// 支持 `"127.0.0.1:8080"`、`"0.0.0.0:8080"`、以及 `":8080"`（补 `0.0.0.0`）简写。
@@ -173,15 +542,29 @@ pub(crate) fn parse_listen_addr(addr: &str) -> Result<SocketAddr, String> {
     })
 }
 
-/// 构建已注册 HandlerService 的 tonic `Router`。
+/// 构建已注册 command service 的 tonic `Router`。
 ///
-/// 返回的 `Router` 可 `.serve(addr)` 启动。当前固定注册 HandlerService；
-/// 接入更多 command service 时在此追加 `add_service`。
+/// 返回的 `Router` 可 `.serve(addr)` 启动。始终注册 HandlerService；
+/// stats / routing / observatory 仅在注入（`Some`）时注册。
 pub(crate) fn build_router(
     registry: Arc<OutboundHandlerRegistry>,
+    stats: Option<Arc<dyn xray_app_stats::command::StatsService>>,
+    routing: Option<Arc<xray_app_router::command::RoutingService>>,
+    observatory: Option<Arc<dyn xray_app_observatory::command::ObservatoryService>>,
 ) -> tonic::transport::server::Router {
-    let svc = HandlerServiceServer::new(HandlerServiceImpl::new(registry));
-    Server::builder().add_service(svc)
+    let mut server = Server::builder()
+        .add_service(HandlerServiceServer::new(HandlerServiceImpl::new(registry)));
+    if let Some(svc) = stats {
+        server = server.add_service(StatsServiceServer::new(StatsServiceImpl::new(svc)));
+    }
+    if let Some(svc) = routing {
+        server = server.add_service(RoutingServiceServer::new(RoutingServiceImpl::new(svc)));
+    }
+    if let Some(svc) = observatory {
+        server =
+            server.add_service(ObservatoryServiceServer::new(ObservatoryServiceImpl::new(svc)));
+    }
+    server
 }
 
 #[cfg(test)]
@@ -205,5 +588,98 @@ mod tests {
     fn parse_listen_addr_invalid() {
         assert!(parse_listen_addr("not-an-addr").is_err());
         assert!(parse_listen_addr("999.999.999.999:80").is_err());
+    }
+
+    // --- 端到端翻译正确性：用领域 DefaultStatsService 作为后端，验证 proto 请求
+    //     经 StatsServiceImpl 翻译后得到正确的 proto 响应。---
+
+    /// 最小 StatsService 后端：基于内存 Manager。
+    fn stats_backend() -> Arc<dyn xray_app_stats::command::StatsService> {
+        use xray_app_stats::command::DefaultStatsService;
+        let mgr = Arc::new(xray_app_stats::Manager::new());
+        Arc::new(DefaultStatsService::new(mgr))
+    }
+
+    #[tokio::test]
+    async fn stats_get_stats_not_found() {
+        let svc = StatsServiceImpl::new(stats_backend());
+        let resp = svc
+            .get_stats(Request::new(pstats::GetStatsRequest {
+                name: "nope".into(),
+                reset: false,
+            }))
+            .await;
+        assert!(resp.is_err());
+        let err = resp.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn stats_query_stats_empty() {
+        let svc = StatsServiceImpl::new(stats_backend());
+        let resp = svc
+            .query_stats(Request::new(pstats::QueryStatsRequest {
+                pattern: "".into(),
+                reset: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.stat.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stats_get_sys_stats_maps_fields() {
+        let svc = StatsServiceImpl::new(stats_backend());
+        let resp = svc
+            .get_sys_stats(Request::new(pstats::SysStatsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.num_gc, 0);
+        assert_eq!(resp.pause_total_ns, 0);
+        // uptime 非零（DefaultSysStatsProvider 填启动后秒数）。
+        assert!(resp.uptime == 0 || resp.uptime >= 1);
+    }
+
+    #[tokio::test]
+    async fn routing_without_router_returns_internal() {
+        let svc = RoutingServiceImpl::new(Arc::new(
+            xray_app_router::command::RoutingService::new(),
+        ));
+        let resp = svc
+            .list_rule(Request::new(prouter::ListRuleRequest {}))
+            .await;
+        assert!(resp.is_err());
+        assert_eq!(resp.unwrap_err().code(), tonic::Code::Internal);
+    }
+
+    #[tokio::test]
+    async fn routing_remove_rule_empty_tag() {
+        let svc = RoutingServiceImpl::new(Arc::new(
+            xray_app_router::command::RoutingService::new(),
+        ));
+        let resp = svc
+            .remove_rule(Request::new(prouter::RemoveRuleRequest {
+                rule_tag: "".into(),
+            }))
+            .await;
+        assert!(resp.is_err());
+    }
+
+    #[tokio::test]
+    async fn routing_subscribe_unimplemented() {
+        let svc = RoutingServiceImpl::new(Arc::new(
+            xray_app_router::command::RoutingService::new(),
+        ));
+        let resp = svc
+            .subscribe_routing_stats(Request::new(
+                prouter::SubscribeRoutingStatsRequest {
+                    field_selectors: vec![],
+                },
+            ))
+            .await;
+        assert!(resp.is_err());
+        assert_eq!(resp.unwrap_err().code(), tonic::Code::Unimplemented);
     }
 }

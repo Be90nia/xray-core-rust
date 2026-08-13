@@ -9,7 +9,9 @@
 use xray_app_proxyman::outbound::proxy_outbound::{OutboundDialer, ProxyOutbound};
 use xray_app_proxyman::error::ProxymanError;
 use xray_transport::bridge::bridge_link_with_stream_full;
+use xray_transport::build_proxy_header;
 use xray_transport::link::Link;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use async_trait::async_trait;
 use xray_common::net::destination::Destination;
@@ -21,7 +23,10 @@ use xray_features::outbound::{OutboundError, OutboundHandler};
 use xray_transport::sockopt::SocketOptions;
 use xray_transport::system_dialer::dial_system;
 
-use crate::config::{Config, DomainStrategy, Fragment};
+use crate::config::{
+    Config, DomainStrategy, Fragment, FinalRule, DefaultRuleType, RuleAction,
+    get_default_rule_type,
+};
 
 /// Freedom 出站 Handler。
 ///
@@ -30,16 +35,35 @@ use crate::config::{Config, DomainStrategy, Fragment};
 pub struct FreedomHandler {
     tag: String,
     config: Config,
+    /// 从 `config.final_rules` 预构建的运行时规则。对应 Go `Handler.finalRules`。
+    final_rules: Vec<FinalRule>,
+    /// 默认规则类型（None=不应用默认规则；可由 session.inbound 推导）。
+    default_rule_type: Option<DefaultRuleType>,
 }
 
 impl FreedomHandler {
-    /// 构造 Freedom Handler。
+    /// 构造 Freedom Handler，并预构建 final rules。
     #[must_use]
     pub fn new(tag: impl Into<String>, config: Config) -> Self {
+        let final_rules = config
+            .final_rules
+            .iter()
+            .filter_map(|rc| FinalRule::build(rc).ok())
+            .collect();
         Self {
             tag: tag.into(),
+            final_rules,
+            default_rule_type: None,
             config,
         }
+    }
+
+    /// 显式设置默认规则类型（覆盖 session 推导）。对应 Go `getDefaultFinalRule`
+    /// 的入站选择——当 Rust `Session` 不携带入站协议名时由此注入。
+    #[must_use]
+    pub fn with_default_rule_type(mut self, kind: DefaultRuleType) -> Self {
+        self.default_rule_type = Some(kind);
+        self
     }
 
     /// 解析域名为 IP 地址。
@@ -90,6 +114,96 @@ impl FreedomHandler {
 
         Ok(Destination::new(address, Port::new(socket_addr.port()), Network::TCP))
     }
+
+    /// 决定当前连接的默认规则。
+    ///
+    /// 优先用显式 `default_rule_type`，否则从 `session.inbound.tag` 推导
+    /// （对应 Go `getDefaultFinalRule(inbound)`）。
+    fn resolve_default_rule(&self, session: &Session) -> Option<FinalRule> {
+        let kind = self
+            .default_rule_type
+            .or_else(|| session.inbound.tag.as_deref().and_then(get_default_rule_type))?;
+        Some(FinalRule::build_default_rule(kind))
+    }
+
+    /// 匹配 final rules → default rule。返回首个命中的规则（对应 Go `matchFinalRule`）。
+    fn match_final_rule(
+        &self,
+        dest: &Destination,
+        default_rule: Option<&FinalRule>,
+    ) -> Option<FinalRule> {
+        let net_idx = network_index(dest.network());
+        let port = dest.port().value();
+        let ip = dest.address().ip();
+        for rule in &self.final_rules {
+            if rule.apply(net_idx, port, ip) {
+                return Some(rule.clone());
+            }
+        }
+        if let Some(dr) = default_rule {
+            if dr.apply(net_idx, port, ip) {
+                return Some(dr.clone());
+            }
+        }
+        None
+    }
+
+    /// 若目标被 Block 规则命中，返回该规则（dial 前调用）。
+    fn check_blocked(&self, dest: &Destination, session: &Session) -> Option<FinalRule> {
+        let default_rule = self.resolve_default_rule(session);
+        let rule = self.match_final_rule(dest, default_rule.as_ref())?;
+        if rule.action == RuleAction::Block {
+            Some(rule)
+        } else {
+            None
+        }
+    }
+
+    /// 黑洞处理：阻塞读取上游数据并丢弃，最多等待 `block_delay`，然后关闭下游。
+    ///
+    /// 对应 Go `Process` 中 `blockedDest != nil` 分支——不拨号，drain input→Discard，
+    /// 超时后 Interrupt + Close，防探测。
+    async fn blackhole(&self, link: Link, rule: &FinalRule) -> Result<(), ProxymanError> {
+        let delay = block_delay(rule);
+        tracing::info!(
+            tag = %self.tag,
+            ?delay,
+            "freedom: target blocked by final rule, blackholing connection"
+        );
+        let Link { reader, writer } = link;
+        let drain = async {
+            let mut r = reader;
+            while r.read_multi_buffer().await.is_ok() {}
+        };
+        tokio::select! {
+            _ = drain => {}
+            _ = tokio::time::sleep(delay) => {}
+        }
+        writer.shutdown();
+        Ok(())
+    }
+}
+
+/// Network → `[bool; 8]` 索引（TCP=0, UDP=1, Unix=2）。对应 Go `int(network)`。
+fn network_index(network: Network) -> usize {
+    match network {
+        Network::TCP => 0,
+        Network::UDP => 1,
+        Network::Unix => 2,
+    }
+}
+
+/// 计算阻断延时。对应 Go `Handler.blockDelay`。
+///
+/// 默认 [30, 90] 秒；`rule.block_delay` 可覆盖。`dice.Roll(span+1)` → [0, span]。
+fn block_delay(rule: &FinalRule) -> std::time::Duration {
+    let (min, max) = match rule.block_delay {
+        Some(r) => (r.min, r.max),
+        None => (30, 90),
+    };
+    let span = if max >= min { max - min } else { min - max };
+    let roll = rand::random_range(0..=span);
+    std::time::Duration::from_secs(min + roll)
 }
 
 #[async_trait]
@@ -121,6 +235,18 @@ impl OutboundHandler for FreedomHandler {
                 self.resolve_domain(domain, destination.port().value(), strategy).await?
             }
         };
+
+        // FinalRule：dial 前检查私有 IP 阻断（对应 Go matchFinalRule Block 分支）。
+        if let Some(_rule) = self.check_blocked(&effective_dest, _session) {
+            tracing::info!(
+                tag = %self.tag,
+                dest = ?effective_dest,
+                "freedom: connection blocked by final rule"
+            );
+            return Err(OutboundError::ConnectionFailed(
+                "freedom: destination blocked by final rule".to_string(),
+            ));
+        }
 
         let sockopt = SocketOptions::default();
         let _conn = dial_system(&effective_dest, &sockopt)
@@ -164,9 +290,49 @@ impl ProxyOutbound for FreedomHandler {
             }
         };
 
+        // FinalRule：dial 前检查阻断规则。命中 Block → 黑洞（blockDelay + drain），
+        // 不拨号（对应 Go matchFinalRule Block 分支）。
+        if let Some(rule) = self.check_blocked(&effective_dest, session) {
+            return self.blackhole(link, &rule).await;
+        }
+
         let mut conn = dialer.dial(&effective_dest).await
             .map_err(|e| ProxymanError::OutboundProcessFailed(format!("freedom dial failed: {e}")))?;
 
+        // PROXY protocol：在拨号连接上写入 PROXY header（v1/v2）。
+        // 对应 Go `proxyproto.HeaderProxyFromAddrs(version, srcAddr, dstAddr)`。
+        if self.config.proxy_protocol == 1 || self.config.proxy_protocol == 2 {
+            let src = session
+                .source()
+                .and_then(|d| d.address().ip())
+                .map(|ip| SocketAddr::new(ip, 0));
+            let dst = conn
+                .remote_addr()
+                .ok()
+                .flatten();
+            if let (Some(src), Some(dst)) = (src, dst) {
+                let header = build_proxy_header(self.config.proxy_protocol as u8, src, dst);
+                if !header.is_empty() {
+                    use tokio::io::AsyncWriteExt;
+                    if let Err(e) = conn.as_mut().write_all(&header).await {
+                        tracing::warn!(tag = %self.tag, error = %e, "freedom: PROXY protocol write failed");
+                        return Err(ProxymanError::OutboundProcessFailed(
+                            format!("PROXY protocol write failed: {e}"),
+                        ));
+                    }
+                    tracing::debug!(
+                        tag = %self.tag,
+                        version = self.config.proxy_protocol,
+                        "freedom: PROXY protocol header written"
+                    );
+                }
+            } else {
+                tracing::debug!(
+                    tag = %self.tag,
+                    "freedom: PROXY protocol enabled but src/dst addr unavailable, skipping"
+                );
+            }
+        }
         if !self.config.noises.is_empty() {
             use tokio::io::AsyncWriteExt;
             for noise in &self.config.noises {

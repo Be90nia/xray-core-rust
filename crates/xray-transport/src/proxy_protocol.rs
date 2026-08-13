@@ -103,6 +103,72 @@ pub async fn read_proxy_protocol<R: AsyncReadExt + Unpin>(reader: &mut R) -> io:
     }
 }
 
+/// 构造 PROXY protocol v1/v2 header 字节，供 outbound（如 freedom）写入拨号连接。
+///
+/// 对应 Go `proxyproto.HeaderProxyFromAddrs(version, src, dst)`。
+/// `version` 仅接受 1 或 2；其他值返回空 `Vec`（调用方应先校验）。
+#[must_use]
+pub fn build_proxy_header(version: u8, src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
+    match version {
+        1 => build_proxy_header_v1(src, dst),
+        2 => build_proxy_header_v2(src, dst),
+        _ => Vec::new(),
+    }
+}
+
+/// v1：`PROXY TCP4 <src_ip> <dst_ip> <src_port> <dst_port>\r\n`。
+fn build_proxy_header_v1(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
+    let (proto, src_ip, dst_ip, src_port, dst_port) = match (src, dst) {
+        (SocketAddr::V4(a), SocketAddr::V4(b)) => {
+            ("TCP4", a.ip().to_string(), b.ip().to_string(), a.port(), b.port())
+        }
+        (SocketAddr::V6(a), SocketAddr::V6(b)) => {
+            ("TCP6", a.ip().to_string(), b.ip().to_string(), a.port(), b.port())
+        }
+        // 地址族不一致：降级为 UNKNOWN（与 go-proxyproto 一致）。
+        _ => return b"PROXY UNKNOWN\r\n".to_vec(),
+    };
+    format!("PROXY {proto} {src_ip} {dst_ip} {src_port} {dst_port}\r\n").into_bytes()
+}
+
+/// v2：12 字节 signature + ver/cmd + family/proto + length + 地址负载。
+fn build_proxy_header_v2(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
+    const SIG: [u8; 12] = [
+        0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+    ];
+    // version=2 (高 4 bit) | command=PROXY (低 4 bit, 值 1) → 0x21。
+    const VER_CMD_PROXY: u8 = 0x21;
+    let (fam_proto, addr_bytes) = match (src, dst) {
+        (SocketAddr::V4(a), SocketAddr::V4(b)) => {
+            // address family=INET(1) | transport=STREAM(1) → 0x11。
+            let mut v = Vec::with_capacity(12);
+            v.extend_from_slice(&a.ip().octets());
+            v.extend_from_slice(&b.ip().octets());
+            v.extend_from_slice(&a.port().to_be_bytes());
+            v.extend_from_slice(&b.port().to_be_bytes());
+            (0x11u8, v)
+        }
+        (SocketAddr::V6(a), SocketAddr::V6(b)) => {
+            // address family=INET6(2) | transport=STREAM(1) → 0x21。
+            let mut v = Vec::with_capacity(36);
+            v.extend_from_slice(&a.ip().octets());
+            v.extend_from_slice(&b.ip().octets());
+            v.extend_from_slice(&a.port().to_be_bytes());
+            v.extend_from_slice(&b.port().to_be_bytes());
+            (0x21u8, v)
+        }
+        // 地址族不一致：AF_UNSPEC | UNSPEC(0) → 0x00，无地址负载。
+        _ => (0x00u8, Vec::new()),
+    };
+    let mut out = Vec::with_capacity(SIG.len() + 4 + addr_bytes.len());
+    out.extend_from_slice(&SIG);
+    out.push(VER_CMD_PROXY);
+    out.push(fam_proto);
+    out.extend_from_slice(&(addr_bytes.len() as u16).to_be_bytes());
+    out.extend_from_slice(&addr_bytes);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +239,40 @@ mod tests {
         let mut reader = &header[..];
         let result = read_proxy_protocol(&mut reader).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn build_proxy_header_v1_tcp4_roundtrip() {
+        let src: SocketAddr = "1.2.3.4:1234".parse().unwrap();
+        let dst: SocketAddr = "5.6.7.8:80".parse().unwrap();
+        let header = build_proxy_header(1, src, dst);
+        assert_eq!(header, b"PROXY TCP4 1.2.3.4 5.6.7.8 1234 80\r\n");
+    }
+
+    #[test]
+    fn build_proxy_header_v1_family_mismatch_unknown() {
+        let src: SocketAddr = "1.2.3.4:1234".parse().unwrap();
+        let dst: SocketAddr = "[2001:db8::1]:80".parse().unwrap();
+        let header = build_proxy_header(1, src, dst);
+        assert_eq!(header, b"PROXY UNKNOWN\r\n");
+    }
+
+    #[test]
+    fn build_proxy_header_v2_tcp4_parses_back() {
+        let src: SocketAddr = "1.2.3.4:1234".parse().unwrap();
+        let dst: SocketAddr = "5.6.7.8:80".parse().unwrap();
+        let header = build_proxy_header(2, src, dst);
+        let mut reader = &header[..];
+        // 同步上下文用 tokio runtime 驱动 read_proxy_protocol。
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let addr = rt.block_on(read_proxy_protocol(&mut reader)).unwrap();
+        assert_eq!(addr, Some(src));
+    }
+
+    #[test]
+    fn build_proxy_header_unknown_version_empty() {
+        let src: SocketAddr = "1.2.3.4:1234".parse().unwrap();
+        let dst: SocketAddr = "5.6.7.8:80".parse().unwrap();
+        assert!(build_proxy_header(3, src, dst).is_empty());
     }
 }

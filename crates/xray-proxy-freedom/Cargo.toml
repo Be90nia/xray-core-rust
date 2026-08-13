@@ -18,6 +18,7 @@ async-trait = "0.1"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 xray-xudp = { path = "../xray-xudp" }
+xray-geodata = { path = "../xray-geodata" }
 tracing = { workspace = true }
 
 [dev-dependencies]

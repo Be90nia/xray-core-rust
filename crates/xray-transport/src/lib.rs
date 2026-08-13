@@ -47,7 +47,7 @@ pub mod proxy_protocol;
 
 // 顶层 re-export。
 pub use bridge::{bridge_connections, copy_one_way};
-pub use proxy_protocol::read_proxy_protocol;
+pub use proxy_protocol::{build_proxy_header, read_proxy_protocol};
 
 /// TLS acceptor for inbound connections.
 /// Re-exported so proxy crates don't need a direct `tokio-rustls` dependency.

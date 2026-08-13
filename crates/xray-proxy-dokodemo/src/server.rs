@@ -38,6 +38,17 @@ pub struct DokodemoServer {
     listener: Arc<Mutex<Option<TcpListener>>>,
 }
 
+/// 将 [`PredefinedAddress`] 转为 [`Address`]。
+fn predefined_to_address(addr: PredefinedAddress) -> Address {
+    match addr {
+        PredefinedAddress::Ip(ip) => match ip {
+            std::net::IpAddr::V4(v4) => Address::IPv4(v4),
+            std::net::IpAddr::V6(v6) => Address::IPv6(v6),
+        },
+        PredefinedAddress::Domain(s) => Address::Domain(s),
+    }
+}
+
 impl DokodemoServer {
     /// 构造服务端实例。不立即监听——监听在 [`InboundHandler::start`] 时触发。
     #[must_use]
@@ -53,10 +64,18 @@ impl DokodemoServer {
     ///
     /// 优先级：
     /// 1. `follow_redirect=true` + fd 有效 → 从 SO_ORIGINAL_DST 获取原始目的地
-    /// 2. `predefined_address` + `rewrite_port` 构造
+    /// 2. `predefined_address` + `rewrite_port` + `port_map` 构造
+    ///
+    /// `local_port` 用于 `port_map` 查找（监听端口字符串），`None` 跳过映射。
+    /// `is_udp` 为 true 时返回 UDP 目标，否则 TCP。
     ///
     /// 返回 `None` 表示无法确定目标。
-    fn build_destination(&self, fd: Option<i32>) -> Option<Destination> {
+    fn build_destination_ex(
+        &self,
+        fd: Option<i32>,
+        local_port: Option<u16>,
+        is_udp: bool,
+    ) -> Option<Destination> {
         // follow_redirect 优先：从 SO_ORIGINAL_DST 获取被 iptables REDIRECT 前的地址
         if self.config.follow_redirect {
             if let Some(fd) = fd {
@@ -66,22 +85,50 @@ impl DokodemoServer {
                         std::net::IpAddr::V6(v6) => Address::IPv6(v6),
                     };
                     let port = Port::new(addr.port());
-                    return Some(Destination::tcp(address, port));
+                    return Some(if is_udp {
+                        Destination::udp(address, port)
+                    } else {
+                        Destination::tcp(address, port)
+                    });
                 }
             }
         }
 
-        // 降级到 predefined_address
+        // 降级到 predefined_address + port_map
         let addr = self.config.predefined_address()?;
-        let port = Port::new(u16::try_from(self.config.rewrite_port).ok()?);
-        let address = match addr {
-            PredefinedAddress::Ip(ip) => match ip {
-                std::net::IpAddr::V4(v4) => Address::IPv4(v4),
-                std::net::IpAddr::V6(v6) => Address::IPv6(v6),
-            },
-            PredefinedAddress::Domain(s) => Address::Domain(s),
-        };
-        Some(Destination::tcp(address, port))
+        let mut address = predefined_to_address(addr);
+        let mut port_val = u16::try_from(self.config.rewrite_port).ok()?;
+
+        // port_map：当监听端口匹配时覆盖地址/端口（对应 Go Process() 第 101-109 行）
+        if let Some(lp) = local_port {
+            if let Some((host_override, port_override)) =
+                self.config.apply_port_map(&lp.to_string())
+            {
+                if let Some(h) = host_override {
+                    address = h.parse::<Address>().unwrap_or(address);
+                }
+                if let Some(p) = port_override {
+                    port_val = p;
+                }
+            }
+        }
+
+        let port = Port::new(port_val);
+        Some(if is_udp {
+            Destination::udp(address, port)
+        } else {
+            Destination::tcp(address, port)
+        })
+    }
+
+    /// 构造 TCP 目标（兼容旧调用方）。等价于 `build_destination_ex(fd, None, false)`。
+    fn build_destination(&self, fd: Option<i32>) -> Option<Destination> {
+        self.build_destination_ex(fd, None, false)
+    }
+
+    /// 构造 UDP 目标。用于 dokodemo UDP relay。
+    fn build_udp_destination(&self, local_port: Option<u16>) -> Option<Destination> {
+        self.build_destination_ex(None, local_port, true)
     }
 
     /// 网络类型是否被配置允许。
@@ -301,5 +348,76 @@ mod tests {
             Address::IPv4(v4) => assert_eq!(v4.octets(), [10, 0, 0, 1]),
             other => panic!("expected IPv4, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_udp_destination_returns_udp_network() {
+        let server = DokodemoServer::new("test", make_ipv4_config([1, 2, 3, 4], 53));
+        let dest = server.build_udp_destination(None).expect("dest should exist");
+        assert!(dest.is_udp());
+        assert_eq!(dest.port().value(), 53);
+    }
+
+    #[test]
+    fn build_destination_ex_applies_port_map() {
+        let cfg = Config {
+            rewrite_address: Some(ProtoIpOrDomain {
+                address: Some(ProtoAddress::Ip(vec![10, 0, 0, 1])),
+            }),
+            rewrite_port: 80,
+            port_map: [("80".to_string(), "192.168.99.1:9090".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let server = DokodemoServer::new("test", cfg);
+        let dest = server
+            .build_destination_ex(None, Some(80), false)
+            .expect("dest should exist");
+        assert_eq!(dest.port().value(), 9090);
+        match dest.address() {
+            Address::IPv4(v4) => assert_eq!(v4.octets(), [192, 168, 99, 1]),
+            other => panic!("expected mapped IPv4, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_destination_ex_port_map_no_match_uses_predefined() {
+        let cfg = Config {
+            rewrite_address: Some(ProtoIpOrDomain {
+                address: Some(ProtoAddress::Ip(vec![10, 0, 0, 1])),
+            }),
+            rewrite_port: 80,
+            port_map: [("443".to_string(), "192.168.99.1:9090".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let server = DokodemoServer::new("test", cfg);
+        let dest = server
+            .build_destination_ex(None, Some(80), false)
+            .expect("dest should exist");
+        // port 80 not in port_map → use predefined
+        assert_eq!(dest.port().value(), 80);
+    }
+
+    #[test]
+    fn build_udp_destination_with_port_map() {
+        let cfg = Config {
+            rewrite_address: Some(ProtoIpOrDomain {
+                address: Some(ProtoAddress::Ip(vec![10, 0, 0, 1])),
+            }),
+            rewrite_port: 53,
+            port_map: [("53".to_string(), ":5353".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let server = DokodemoServer::new("test", cfg);
+        let dest = server
+            .build_udp_destination(Some(53))
+            .expect("dest should exist");
+        assert!(dest.is_udp());
+        assert_eq!(dest.port().value(), 5353);
     }
 }

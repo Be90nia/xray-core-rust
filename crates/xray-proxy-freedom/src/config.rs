@@ -18,9 +18,10 @@
 //!
 //! ## 切片边界（P6-5 切片1）
 //!
-//! 实现配置层 + FinalRule 纯逻辑匹配（network + port）+ 默认 CIDR 常量。
-//! IP CIDR 匹配依赖 `geodata::IPMatcher`，留切片2（当前 match_ip 返回 true）。
-//! Handler/Process/dial/retry 留切片2。
+//! 实现配置层 + FinalRule 逻辑匹配（network + port + IP CIDR）+ 默认 CIDR 常量。
+//! IP CIDR 匹配通过 `xray_geodata::matcher::ip::HeuristicIPMatcher` 实现。
+//! 默认 `defaultBlockPrivateRule` 使用 [`DEFAULT_BLOCK_PRIVATE_CIDRS`] 构建的
+//! 缓存 matcher（[`private_ip_matcher`]）。Handler/Process/dial 见 `handler.rs`。
 
 /// DNS 解析策略。对应 Go `proxy/freedom/config.proto` DomainStrategy。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -73,6 +74,12 @@ impl DomainStrategy {
     }
 }
 use crate::error::Result;
+
+use std::net::IpAddr;
+use std::sync::{Arc, LazyLock};
+use xray_common::net::port::{MemoryPortList, Port, PortRange};
+use xray_geodata::matcher::ip::{HeuristicIPMatcher, IPMatcher};
+use xray_proto::xray::common::geodata::ip_rule;
 
 /// RuleAction 枚举。对应 proto `RuleAction`。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -266,16 +273,39 @@ impl Config {
 }
 
 /// 运行时最终规则（从 FinalRuleConfig 构建）。对应 Go `FinalRule` struct。
-#[derive(Debug, Clone)]
+impl std::fmt::Debug for FinalRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FinalRule")
+            .field("action", &self.action)
+            .field("network", &self.network)
+            .field("port", &self.port.is_some())
+            .field("has_ip_matcher", &self.ip.is_some())
+            .field("block_delay", &self.block_delay)
+            .finish()
+    }
+}
+
 pub struct FinalRule {
     pub action: RuleAction,
     /// 允许的网络类型（bool 数组索引 0=TCP 1=UDP 等，与 Go [8]bool 一致）。
     pub network: [bool; 8],
-    /// 端口列表（None 表示匹配所有）。
-    pub port: Option<xray_proto::xray::common::net::PortList>,
-    /// IP CIDR 匹配器（切片2 接入 geodata::IPMatcher，当前 None 表示匹配所有）。
-    pub _ip_matcher: Option<()>,
+    /// 端口列表（None 表示匹配所有端口）。对应 Go `matchPort` 的 `len==0` 语义。
+    pub port: Option<MemoryPortList>,
+    /// IP CIDR 匹配器（None 表示无 IP 限制 → 匹配所有地址）。
+    pub ip: Option<Arc<dyn IPMatcher>>,
     pub block_delay: Option<Range>,
+}
+
+impl Clone for FinalRule {
+    fn clone(&self) -> Self {
+        Self {
+            action: self.action,
+            network: self.network,
+            port: self.port.clone(),
+            ip: self.ip.clone(),
+            block_delay: self.block_delay,
+        }
+    }
 }
 
 /// 默认允许所有网络（与 Go `allNetworks` 一致）。
@@ -321,13 +351,40 @@ impl FinalRule {
             net
         };
 
+        let port = config.port_list.as_ref().map(to_mem_port_list);
+
         Ok(Self {
             action: config.action,
             network,
-            port: config.port_list.clone(),
-            _ip_matcher: None, // 切片2: geodata::IPMatcher
+            port,
+            ip: build_ip_matcher_from_rules(&config.ip),
             block_delay: config.block_delay,
         })
+    }
+
+    /// 构造默认规则。对应 Go `init()` 中的 `defaultBlockPrivateRule` /
+    /// `defaultBlockAllRule`，以及 `getDefaultFinalRule` 的选择结果。
+    ///
+    /// - [`DefaultRuleType::BlockPrivate`]：action=Block，network=all，ip=私有 CIDR matcher。
+    /// - [`DefaultRuleType::BlockAll`]：action=Block，network=all，ip=None（匹配所有）。
+    #[must_use]
+    pub fn build_default_rule(kind: DefaultRuleType) -> Self {
+        match kind {
+            DefaultRuleType::BlockPrivate => Self {
+                action: RuleAction::Block,
+                network: ALL_NETWORKS,
+                port: None,
+                ip: Some(private_ip_matcher()),
+                block_delay: None,
+            },
+            DefaultRuleType::BlockAll => Self {
+                action: RuleAction::Block,
+                network: ALL_NETWORKS,
+                port: None,
+                ip: None,
+                block_delay: None,
+            },
+        }
     }
 
     /// 网络类型是否匹配。对应 Go `matchNetwork`。
@@ -339,34 +396,87 @@ impl FinalRule {
         self.network[network_index]
     }
 
-    /// 端口是否匹配。None port_list 表示匹配所有。对应 Go `matchPort`。
-    ///
-    /// 切片1: port_list 匹配逻辑依赖 `xray_common::net::PortList::contains`，
-    /// 当前简化为 None=匹配所有，Some=匹配所有非零（精确匹配留切片2）。
+    /// 端口是否匹配。None 表示匹配所有端口。对应 Go `matchPort`。
     #[must_use]
-    pub fn match_port(&self, _port: u16) -> bool {
-        self.port.is_none()
+    pub fn match_port(&self, port: u16) -> bool {
+        match &self.port {
+            None => true,
+            Some(list) => list.contains(Port::new(port)),
+        }
     }
 
-    /// IP 是否匹配。None ip_matcher 表示匹配所有。对应 Go `matchIP`。
+    /// IP 是否匹配。None ip matcher 表示匹配所有。对应 Go `matchIP`。
     ///
-    /// 切片1: 总返回 true（ip_matcher 留切片2 接入 geodata）。
+    /// `ip` 为 `None`（域名目标，但规则有 IP 限制）时返回 `false`——
+    /// 与 Go `addr != nil && addr.Family().IsIP()` 一致。
     #[must_use]
-    pub fn match_ip(&self) -> bool {
-        self._ip_matcher.is_none()
+    pub fn match_ip(&self, ip: Option<IpAddr>) -> bool {
+        match (&self.ip, ip) {
+            (None, _) => true,
+            (Some(m), Some(addr)) => m.match_ip(addr),
+            (Some(_), None) => false,
+        }
     }
 
     /// 完整匹配。对应 Go `Apply`。
     #[must_use]
-    pub fn apply(&self, network_index: usize, port: u16) -> bool {
+    pub fn apply(&self, network_index: usize, port: u16, ip: Option<IpAddr>) -> bool {
         if !self.match_network(network_index) {
             return false;
         }
         if !self.match_port(port) {
             return false;
         }
-        self.match_ip()
+        self.match_ip(ip)
     }
+}
+
+/// 把 proto `PortList` 转为 `MemoryPortList`。对应 Go `net.PortListFromProto`。
+fn to_mem_port_list(pl: &xray_proto::xray::common::net::PortList) -> MemoryPortList {
+    let ranges: Vec<PortRange> = pl
+        .range
+        .iter()
+        .map(|r| PortRange::new(Port::new(r.from as u16), Port::new(r.to as u16)))
+        .collect();
+    MemoryPortList::new(ranges)
+}
+
+/// 从 proto `IpRule` 列表构建 IP matcher（仅消费 Custom CIDR 变体）。
+///
+/// ponytail: Geoip 变体需要 geodata loader，freedom 直连出口通常用 Custom CIDR；
+/// geoip 规则被忽略（None=不限制）。需要 geoip 时升级为 build_optimized_ip_matcher。
+fn build_ip_matcher_from_rules(
+    rules: &[xray_proto::xray::common::geodata::IpRule],
+) -> Option<Arc<dyn IPMatcher>> {
+    let cidrs: Vec<xray_geodata::pb::Cidr> = rules
+        .iter()
+        .filter_map(|r| match &r.value {
+            Some(ip_rule::Value::Custom(c)) => {
+                c.cidr.as_ref().map(|cidr| xray_geodata::pb::Cidr::new(cidr.ip.clone(), cidr.prefix))
+            }
+            _ => None,
+        })
+        .collect();
+    if cidrs.is_empty() {
+        None
+    } else {
+        Some(Arc::new(HeuristicIPMatcher::from_cidrs(&cidrs)))
+    }
+}
+
+/// 缓存的私有 IP matcher（从 [`DEFAULT_BLOCK_PRIVATE_CIDRS`] 构建）。
+///
+/// 对应 Go `geodata.GetPrivateIPMatcher()`——进程级单例，惰性构建一次。
+#[must_use]
+pub fn private_ip_matcher() -> Arc<dyn IPMatcher> {
+    static MATCHER: LazyLock<Arc<dyn IPMatcher>> = LazyLock::new(|| {
+        let cidrs: Vec<xray_geodata::pb::Cidr> = DEFAULT_BLOCK_PRIVATE_CIDRS
+            .iter()
+            .filter_map(|s| xray_geodata::rule_parser::parse_cidr(s).ok())
+            .collect();
+        Arc::new(HeuristicIPMatcher::from_cidrs(&cidrs))
+    });
+    MATCHER.clone()
 }
 
 /// 根据入站协议名返回默认 final rule 类型。
@@ -444,7 +554,7 @@ mod tests {
             action: RuleAction::Allow,
             network: [true, false, false, false, false, false, false, false],
             port: None,
-            _ip_matcher: None,
+            ip: None,
             block_delay: None,
         };
         assert!(rule.match_network(0)); // TCP
@@ -460,27 +570,139 @@ mod tests {
             action: RuleAction::Allow,
             network: ALL_NETWORKS,
             port: None,
-            _ip_matcher: None,
+            ip: None,
             block_delay: None,
         };
         assert!(rule.match_port(80));
         assert!(rule.match_port(443));
     }
 
-    // ===== FinalRule::apply =====
+    #[test]
+    fn match_port_list_restricts() {
+        let rule = FinalRule {
+            action: RuleAction::Allow,
+            network: ALL_NETWORKS,
+            port: Some(MemoryPortList::new(vec![
+                PortRange::new(Port::new(80), Port::new(80)),
+            ])),
+            ip: None,
+            block_delay: None,
+        };
+        assert!(rule.match_port(80));
+        assert!(!rule.match_port(443));
+    }
+
+    // ===== FinalRule::match_ip / apply =====
 
     #[test]
-    fn apply_full_match() {
+    fn match_ip_none_matches_all_addresses() {
+        let rule = FinalRule {
+            action: RuleAction::Allow,
+            network: ALL_NETWORKS,
+            port: None,
+            ip: None,
+            block_delay: None,
+        };
+        assert!(rule.match_ip(Some("8.8.8.8".parse().unwrap())));
+        assert!(rule.match_ip(Some("::1".parse().unwrap())));
+        assert!(rule.match_ip(None)); // 无 IP 限制时域名也匹配
+    }
+
+    #[test]
+    fn apply_full_match_no_ip_restriction() {
         let rule = FinalRule {
             action: RuleAction::Allow,
             network: [true, true, false, false, false, false, false, false],
             port: None,
-            _ip_matcher: None,
+            ip: None,
             block_delay: None,
         };
-        assert!(rule.apply(0, 80)); // TCP:80
-        assert!(rule.apply(1, 443)); // UDP:443
-        assert!(!rule.apply(2, 80)); // 网络 2 不允许
+        assert!(rule.apply(0, 80, Some("1.2.3.4".parse().unwrap()))); // TCP:80
+        assert!(rule.apply(1, 443, Some("1.2.3.4".parse().unwrap()))); // UDP:443
+        assert!(!rule.apply(2, 80, Some("1.2.3.4".parse().unwrap()))); // 网络 2 不允许
+    }
+
+    // ===== build_default_rule / private IP blocking =====
+
+    #[test]
+    fn build_default_rule_block_private_blocks_rfc1918() {
+        let rule = FinalRule::build_default_rule(DefaultRuleType::BlockPrivate);
+        assert_eq!(rule.action, RuleAction::Block);
+        assert!(rule.network.iter().all(|&v| v));
+        // TCP:80
+        let priv4: Option<IpAddr> = Some("10.0.0.1".parse().unwrap());
+        assert!(rule.apply(0, 80, priv4), "10.0.0.1 should be blocked");
+        assert!(
+            rule.apply(0, 80, Some("192.168.1.1".parse().unwrap())),
+            "192.168.1.1 should be blocked"
+        );
+        assert!(
+            rule.apply(0, 80, Some("172.16.5.4".parse().unwrap())),
+            "172.16.5.4 should be blocked"
+        );
+        assert!(
+            rule.apply(0, 80, Some("127.0.0.1".parse().unwrap())),
+            "127.0.0.1 should be blocked"
+        );
+        assert!(
+            rule.apply(0, 80, Some("169.254.1.1".parse().unwrap())),
+            "169.254.1.1 link-local should be blocked"
+        );
+        assert!(
+            rule.apply(0, 80, Some("::1".parse().unwrap())),
+            "::1 should be blocked"
+        );
+    }
+
+    #[test]
+    fn build_default_rule_block_private_allows_public() {
+        let rule = FinalRule::build_default_rule(DefaultRuleType::BlockPrivate);
+        assert!(
+            !rule.apply(0, 80, Some("8.8.8.8".parse().unwrap())),
+            "8.8.8.8 should NOT be blocked"
+        );
+        assert!(
+            !rule.apply(0, 443, Some("1.1.1.1".parse().unwrap())),
+            "1.1.1.1 should NOT be blocked"
+        );
+        assert!(
+            !rule.apply(0, 80, Some("2001:4860:4860::8888".parse().unwrap())),
+            "public IPv6 should NOT be blocked"
+        );
+    }
+
+    #[test]
+    fn build_default_rule_block_all_blocks_everything() {
+        let rule = FinalRule::build_default_rule(DefaultRuleType::BlockAll);
+        assert_eq!(rule.action, RuleAction::Block);
+        assert!(rule.ip.is_none(), "BlockAll has no IP matcher → matches all");
+        assert!(rule.apply(0, 80, Some("8.8.8.8".parse().unwrap())));
+        assert!(rule.apply(0, 80, Some("10.0.0.1".parse().unwrap())));
+        assert!(rule.apply(0, 80, None), "BlockAll matches even non-IP");
+    }
+
+    #[test]
+    fn config_rule_with_custom_cidr_blocks_matching_ip() {
+        // 用户配置：Allow 除 8.8.8.0/24 外的所有 → 用 Block 规则覆盖。
+        use xray_proto::xray::common::geodata::{Cidr, CidrRule, IpRule};
+        let cfg = FinalRuleConfig {
+            action: RuleAction::Block,
+            networks: vec![],
+            ip: vec![IpRule {
+                value: Some(ip_rule::Value::Custom(CidrRule {
+                    cidr: Some(Cidr {
+                        ip: vec![8, 8, 8, 0],
+                        prefix: 24,
+                    }),
+                    reverse_match: false,
+                })),
+            }],
+            ..Default::default()
+        };
+        let rule = FinalRule::build(&cfg).unwrap();
+        assert!(rule.ip.is_some(), "custom CIDR rule builds a matcher");
+        assert!(rule.apply(0, 80, Some("8.8.8.8".parse().unwrap())), "8.8.8.8 matches");
+        assert!(!rule.apply(0, 80, Some("1.2.3.4".parse().unwrap())), "1.2.3.4 no match");
     }
 
     // ===== get_default_rule_type =====
