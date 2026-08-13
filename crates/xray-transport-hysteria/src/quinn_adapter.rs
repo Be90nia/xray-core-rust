@@ -126,6 +126,17 @@ impl QuicStream for QuinnQuicStream {
 /// quinn `Connection` 包装为 [`QuicConn`]。
 pub struct QuinnQuicConn {
     conn: Connection,
+    /// quinn endpoint（client 端必须持有，否则 endpoint drop 会关闭 QUIC 连接；
+    /// server 端 endpoint 由 QuinnQuicListener 管理，此处为 None）。
+    #[allow(dead_code)]
+    endpoint: Option<quinn::Endpoint>,
+    /// h3 客户端 driver + SendRequest 持有项（仅 client 认证后注入）。
+    ///
+    /// h3 的 `Connection`（driver）持有 control/QPACK stream 状态；`SendRequest::drop` 在
+    /// 成为最后一个 sender 时会发起 `H3_NO_ERROR` 关闭整条 QUIC 连接。hysteria 认证后要用
+    /// 同一条 QUIC 连接开 raw bidi stream，因此把 driver 和一份不 drop 的 `SendRequest`
+    /// 挂在 conn 上保活，直到 conn 本身 drop。
+    h3_keepalive: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl std::fmt::Debug for QuinnQuicConn {
@@ -140,7 +151,19 @@ impl std::fmt::Debug for QuinnQuicConn {
 impl QuinnQuicConn {
     #[must_use]
     pub fn new(conn: Connection) -> Self {
-        Self { conn }
+        Self { conn, endpoint: None, h3_keepalive: None }
+    }
+
+    /// 注入 endpoint（client 拨号后调用，保活 endpoint）。
+    pub(crate) fn with_endpoint(mut self, endpoint: quinn::Endpoint) -> Self {
+        self.endpoint = Some(endpoint);
+        self
+    }
+
+    /// 注入 h3 保活项（client 认证成功后调用）。
+    pub(crate) fn with_h3_keepalive(mut self, keepalive: Box<dyn std::any::Any + Send + Sync>) -> Self {
+        self.h3_keepalive = Some(keepalive);
+        self
     }
 
     /// 暴露内部 quinn::Connection 引用（供上层 transport adapter 用）。
@@ -149,6 +172,10 @@ impl QuinnQuicConn {
         &self.conn
     }
 }
+
+
+
+
 
 impl QuicConn for QuinnQuicConn {
     fn send_datagram<'a>(
@@ -225,6 +252,10 @@ impl QuinnHysteriaTransport {
     }
 
     /// 将 [`QuicConfig`] 转为 quinn [`quinn::TransportConfig`]。
+    ///
+    /// 拥塞控制（对应 Go `quic.Config.CongestionControl`）：`congestion == "bbr"` →
+    /// quinn-proto BBR；其他（`""`、`"cubic"`、`"new_reno"`）→ 默认 CUBIC。
+    /// hysteria 协议默认 BBR（见 `QuicConfig::default_for_hysteria`）。
     fn build_transport_config(qc: &QuicConfig) -> quinn::TransportConfig {
         let mut t = quinn::TransportConfig::default();
         if qc.max_idle_timeout_ms > 0 {
@@ -240,6 +271,25 @@ impl QuinnHysteriaTransport {
         }
         if qc.max_incoming_streams >= 0 {
             t.max_concurrent_bidi_streams(quinn::VarInt::try_from(qc.max_incoming_streams as u64).unwrap_or(quinn::VarInt::MAX));
+        }
+        // 拥塞控制选择
+        match qc.congestion.to_ascii_lowercase().as_str() {
+            "bbr" => {
+                t.congestion_controller_factory(std::sync::Arc::new(
+                    quinn_proto::congestion::BbrConfig::default(),
+                ));
+            }
+            "cubic" | "" | "new_reno" => {
+                t.congestion_controller_factory(std::sync::Arc::new(
+                    quinn_proto::congestion::CubicConfig::default(),
+                ));
+            }
+            _ => {
+                // 未知类型回退默认（CUBIC），与 Go quic-go 未知回退一致。
+                t.congestion_controller_factory(std::sync::Arc::new(
+                    quinn_proto::congestion::CubicConfig::default(),
+                ));
+            }
         }
         t
     }
@@ -1019,5 +1069,7 @@ mod tests {
                 rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
             ]
         }
-    }
+}
+
+
 }

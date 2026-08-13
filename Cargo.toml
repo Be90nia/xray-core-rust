@@ -128,6 +128,7 @@ h2 = "0.4"
 http = "1"
 # QUIC (DoQ + splithttp H3)
 quinn = { version = "0.11", default-features = false, features = ["rustls", "ring", "runtime-tokio"] }
+quinn-proto = "0.11"
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 

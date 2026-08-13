@@ -83,12 +83,15 @@ impl HysteriaTransport for QuinnHysteriaTransport {
                 .await
                 .map_err(|e| io::Error::other(format!("quinn connect: {e}")))?;
 
-            // 3. h3 client 发 POST /auth
-            authenticate_via_h3(&conn, &auth_token, brutal_up_bps).await?;
+            // 3. h3 client 发 POST /auth，返回保活项（driver + SendRequest）防止 h3 关闭 QUIC 连接。
+            let h3_keepalive = authenticate_via_h3(&conn, &auth_token, brutal_up_bps).await?;
 
-            // 4. 包装返回（conn 用于后续 open_stream；endpoint drop 不会立刻断连接）
+            // 4. 包装返回：endpoint 必须保活（drop 会关闭 QUIC 连接），h3 保活项挂在 conn 上。
             // ponytail: Arc<QuinnQuicConn> → Arc<dyn QuicConn> 需 explicit cast
-            Ok(Arc::new(QuinnQuicConn::new(conn)) as Arc<dyn QuicConn>)
+            let quic_conn = QuinnQuicConn::new(conn)
+                .with_endpoint(endpoint)
+                .with_h3_keepalive(h3_keepalive);
+            Ok(Arc::new(quic_conn) as Arc<dyn QuicConn>)
         })
     }
 
@@ -113,18 +116,27 @@ impl HysteriaTransport for QuinnHysteriaTransport {
 }
 
 /// 用 h3 + h3-quinn 发 POST /auth 验证服务端。
+///
+/// 返回一个 `Box<dyn Any + Send>` 保活项，调用方必须持有到 QUIC 连接生命周期结束。
+///
+/// # h3 保活机制
+///
+/// h3 0.0.8 的客户端 `Connection`（driver）必须持续 `poll_close` 才能推进 HTTP/3
+/// control / QPACK stream。`SendRequest::drop` 在成为最后一个 sender 时会发起
+/// `H3_NO_ERROR` 关闭整条 QUIC 连接。hysteria 认证后要用同一条 QUIC 连接开 raw bidi
+/// stream，因此这里：
+/// 1. spawn 后台 task 持续 `poll_close` 驱动 h3 连接；
+/// 2. 额外 clone 一份 `SendRequest`（sender_count 由 2 减到 1，不触发关闭），与
+///    driver task 的 JoinHandle 一同返回给调用方保活，直到 conn drop。
 async fn authenticate_via_h3(
     conn: &QuinnConnection,
     auth_token: &str,
     brutal_up_bps: u64,
-) -> io::Result<()> {
+) -> io::Result<Box<dyn std::any::Any + Send + Sync>> {
     let h3_conn = h3_quinn::Connection::new(conn.clone());
-    let (_driver, mut send_req) = h3::client::new(h3_conn)
+    let (mut driver, mut send_req) = h3::client::new(h3_conn)
         .await
         .map_err(|e| io::Error::other(format!("h3 client new: {e}")))?;
-
-    // ponytail: h3 0.0.8 Connection 不是 Future；_driver 持有状态，drop 时自动清理。
-    // 对于一次性 auth 请求，不需要后台 poll control stream。
 
     let padding = random_auth_padding();
     let req = http::Request::builder()
@@ -157,9 +169,20 @@ async fn authenticate_via_h3(
             STATUS_AUTH_OK
         )));
     }
+    // drop request stream（sender_count 仍由 send_req 维持）
+    drop(stream);
+
+    // 持续 poll h3 driver：推进 control/QPACK stream（读取服务端 SETTINGS、QPACK encoder 流）。
+    // h3 官方测试在 client_fut 中 tokio::join! 同等 driver future；hysteria 用独立 task
+    // 保活+推进，直到连接关闭（poll_close 返回）。
+    let driver_task = tokio::spawn(async move {
+        use std::future::poll_fn;
+        let _ = poll_fn(|cx| driver.poll_close(cx)).await;
+    });
+    let send_req_keepalive = send_req.clone();
 
     // ponytail: 不解析 Hysteria-UDP/Hysteria-CC-RX 响应头——切片1b 仅校验 auth 成功
-    Ok(())
+    Ok(Box::new((driver_task, send_req_keepalive)))
 }
 
 /// 生成随机 auth padding（256~2048 字节，hex 编码）。

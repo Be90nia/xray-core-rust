@@ -304,12 +304,16 @@ pub fn hkdf_sha1(secret: &[u8], salt: &[u8], out: &mut [u8]) {
 // ============================================================================
 
 /// SS 运行时账户，对应 Go `MemoryAccount{Cipher, CipherType, Key, Password}`。
+///
+/// `iv_check`：是否启用 IV 唯一性检查（反重放）。Go proto 字段 `Account.iv_check`。
 #[derive(Debug, Clone)]
 pub struct MemoryAccount {
     pub cipher: Cipher,
     pub cipher_type: CipherType,
     pub key: Vec<u8>,
     pub password: String,
+    /// IV 唯一性检查（反重放）。true 时 Validator 会跟踪已见 IV 并拒绝重复。
+    pub iv_check: bool,
 }
 
 impl MemoryAccount {
@@ -329,6 +333,7 @@ impl MemoryAccount {
             cipher_type: ct,
             key,
             password: p.password.clone(),
+            iv_check: p.iv_check,
         })
     }
 
@@ -338,7 +343,7 @@ impl MemoryAccount {
         ProtoAccount {
             password: self.password.clone(),
             cipher_type: self.cipher_type.as_i32(),
-            iv_check: false,
+            iv_check: self.iv_check,
         }
     }
 

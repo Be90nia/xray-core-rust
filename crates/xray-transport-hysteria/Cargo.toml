@@ -18,6 +18,7 @@ parking_lot = { workspace = true }
 bytes = { workspace = true }
 rand = { workspace = true }
 quinn = { workspace = true }
+quinn-proto = { workspace = true }
 h3 = { workspace = true }
 h3-quinn = { workspace = true }
 http = { workspace = true }

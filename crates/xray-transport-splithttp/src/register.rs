@@ -7,6 +7,7 @@
 //! 协议名同时注册 `"splithttp"`（Go 标准）和 `"xhttp"`（用户配置简写）。
 
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use xray_common::net::destination::Destination;
@@ -18,6 +19,7 @@ use xray_transport::sockopt::SocketOptions;
 use crate::client::DefaultDialerClient;
 use crate::config::Config;
 use crate::dialer;
+use crate::h3_client::H3Conn;
 use crate::transport::listen_splithttp;
 
 /// 注册 SplitHTTP transport dialer。幂等。
@@ -65,6 +67,7 @@ async fn dial_splithttp(
 
     // Scheme: TLS/REALITY → https，否则 http。
     let has_tls = matches!(settings.security.as_str(), "tls" | "reality");
+    let has_reality = settings.security == "reality";
     let scheme = if has_tls { "https" } else { "http" };
 
     // Build rustls ClientConfig.
@@ -87,16 +90,79 @@ async fn dial_splithttp(
         }
     };
 
-    let client = Arc::new(DefaultDialerClient::new(config.clone(), rustls_config));
+    // Determine HTTP version from ALPN (对应 Go `decideHTTPVersion`)。
+    // ALPN 来自 rustls_config.alpn_protocols（`build_client_config` 从 tlsSettings 解析）。
+    let next_protocol: Vec<String> = rustls_config
+        .alpn_protocols
+        .iter()
+        .map(|v| String::from_utf8_lossy(v).into_owned())
+        .collect();
+    let http_version = dialer::decide_http_version(has_tls, has_reality, &next_protocol);
 
-    // Dispatch to dialer::dial.
-    let packet_conn = dialer::dial(client, config, scheme, &host, has_tls)
-        .await
-        .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("splithttp dial failed: {e}")))?;
+    let packet_conn = if http_version == "3" {
+        // HTTP/3 over QUIC path（对应 Go `createHTTPClient` 中 `httpVersion=="3"` 分支）。
+        // quinn 需要 `SocketAddr`（不做 DNS），域名走 `tokio::net::lookup_host` 解析。
+        let socket_addr = resolve_dest_socket_addr(dest)
+            .await
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("H3 dial: DNS resolve failed for {}", dest.address()),
+                )
+            })?;
+        // SNI: config.host 优先，缺失用 dest 地址（对齐 Go `requestURL.Host` fallback）。
+        let server_name = if !config.host.is_empty() {
+            config.host.as_str()
+        } else {
+            &default_sni
+        };
+        let h3_conn = H3Conn::connect(config.clone(), socket_addr, server_name, rustls_config)
+            .await
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    format!("splithttp H3 connect failed: {e}"),
+                )
+            })?;
+        dialer::dial_h3(h3_conn, config, scheme, &host, has_reality)
+            .await
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    format!("splithttp H3 dial failed: {e}"),
+                )
+            })?
+    } else {
+        // HTTP/1.1 / HTTP/2 path（hyper + hyper-rustls）。
+        let client = Arc::new(DefaultDialerClient::new(config.clone(), rustls_config));
+        dialer::dial(client, config, scheme, &host, has_tls)
+            .await
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    format!("splithttp dial failed: {e}"),
+                )
+            })?
+    };
 
     // Wrap !Sync reader in MutexReader → SplitConn that impl Connection.
     let sync_conn = packet_conn.into_sync_reader();
     Ok(Box::new(sync_conn) as Box<dyn Connection>)
+}
+
+/// 将 [`Destination`] 解析为 [`SocketAddr`]（quinn/H3 需要；域名走系统 DNS）。
+///
+/// 对应 Go `internet.DialSystem` 中 `dest.Network == UDP` 的域名解析。
+/// IP 地址直接转换；Domain 通过 `tokio::net::lookup_host`。
+async fn resolve_dest_socket_addr(dest: &Destination) -> Option<SocketAddr> {
+    let port = dest.port().value();
+    match dest.address() {
+        xray_common::net::address::Address::IPv4(v4) => Some(SocketAddr::new((*v4).into(), port)),
+        xray_common::net::address::Address::IPv6(v6) => Some(SocketAddr::new((*v6).into(), port)),
+        xray_common::net::address::Address::Domain(d) => {
+            tokio::net::lookup_host((d.as_str(), port)).await.ok()?.next()
+        }
+    }
 }
 
 /// 从 `splithttpSettings` JSON 解析为强类型 [`Config`]。

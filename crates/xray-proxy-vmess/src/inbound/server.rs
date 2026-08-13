@@ -5,8 +5,7 @@
 //! TCP accept → decode_request_header_async → RequestHeader → Destination →
 //! body chunk pump（duplex + 双向 AEAD 加解密）→ `DispatchHandler::dispatch(dest, link)`。
 //!
-//! 不含：TLS 包装（raw TCP）、UDP/Mux 命令（warn 跳过）、AUTHENTICATED_LENGTH /
-//! CHUNK_MASKING（仅支持 PlainSizeParser，warn 跳过）、XUDP。
+//! 不含：TLS 包装（raw TCP）、UDP/Mux 命令（warn 跳过）、XUDP。
 
 use std::sync::Arc;
 
@@ -21,8 +20,12 @@ use xray_transport::link::Link;
 
 use crate::encoding::server::{ServerSession, SessionHistory};
 use crate::encoding::{generate_chacha20poly1305_key, ChunkNonceGenerator};
+use crate::encoding::body_chunk::{
+    ChunkNonce, ChunkNonceAdapter, PlainSizeParser, ShakeSizeParserAdapter, SizeParser,
+    make_authenticated_length_size_parser,
+};
+use crate::request_option;
 use crate::validator::TimedUserValidator;
-
 /// Duplex 缓冲大小（与 chunk payload 上限 8 KiB 对齐，留足一个 chunk 余量）。
 const DUPLEX_BUF: usize = 16_384;
 
@@ -186,20 +189,38 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         return Ok(());
     }
 
-    // 3. 仅支持 PlainSizeParser（默认）：AUTHENTICATED_LENGTH / CHUNK_MASKING warn 跳过
-    if header
+    // 3. 构造 SizeParser（支持 AUTHENTICATED_LENGTH / CHUNK_MASKING / Plain 三条路径）
+    let req_key = session.request_body_key;
+    let req_size_parser: Box<dyn SizeParser + Send> = if header
         .option
-        .has(crate::request_option::AUTHENTICATED_LENGTH)
-        || header.option.has(crate::request_option::CHUNK_MASKING)
+        .has(request_option::AUTHENTICATED_LENGTH)
     {
-        tracing::warn!(
-            option = ?header.option,
-            "vmess body option (AUTHENTICATED_LENGTH/CHUNK_MASKING) not supported, closing"
-        );
-        return Ok(());
-    }
+        match make_authenticated_length_size_parser(&req_key, &session.request_body_iv, header.security) {
+            Ok(sp) => Box::new(sp),
+            Err(e) => return Err(std::io::Error::other(format!("vmess auth_len size parser: {e}"))),
+        }
+    } else if header.option.has(request_option::CHUNK_MASKING) {
+        Box::new(ShakeSizeParserAdapter::new(&session.request_body_iv))
+    } else {
+        Box::new(PlainSizeParser)
+    };
+    let resp_size_parser: Box<dyn SizeParser + Send> = if header
+        .option
+        .has(request_option::AUTHENTICATED_LENGTH)
+    {
+        match make_authenticated_length_size_parser(&req_key, &session.request_body_iv, header.security) {
+            Ok(sp) => Box::new(sp),
+            Err(e) => return Err(std::io::Error::other(format!("vmess auth_len size parser: {e}"))),
+        }
+    } else if header.option.has(request_option::CHUNK_MASKING) {
+        Box::new(ShakeSizeParserAdapter::new(&session.response_body_iv))
+    } else {
+        Box::new(PlainSizeParser)
+    };
+    let global_padding = header.option.has(request_option::GLOBAL_PADDING);
+    let no_termination = header.option.has(request_option::NO_TERMINATION_SIGNAL);
 
-    // 4. 发送响应头（客户端收到后开始 body 流）
+    // 5. 发送响应头（客户端收到后开始 body 流）
     let resp_header = ResponseHeader {
         command: header.command,
         option: header.option,
@@ -210,7 +231,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         .await
         .map_err(|e| std::io::Error::other(format!("vmess encode response header: {e}")))?;
 
-    // 5. 取 dest + body 加密状态（已由 parse_decoded_header_payload 填充）
+    // 4. 取 dest + body 加密状态（已由 parse_decoded_header_payload 填充）
     let dest = header.destination.clone();
     let req_iv = session.request_body_iv;
     let resp_iv = session.response_body_iv;
@@ -250,8 +271,8 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let (client_r, client_w) = tokio::io::split(client_io);
     let link = Link::new(new_reader(client_r), new_writer(client_w));
 
-    let pump_a = pump_request_body(stream_r, server_w, req_cipher, req_iv);
-    let pump_b = pump_response_body(server_r, stream_w, resp_cipher, resp_iv);
+    let pump_a = pump_request_body(stream_r, server_w, req_cipher, req_iv, req_size_parser, global_padding);
+    let pump_b = pump_response_body(server_r, stream_w, resp_cipher, resp_iv, resp_size_parser, global_padding, no_termination);
     let dispatch_fut = handler.dispatch(&dest, link);
 
     // 三路并发：pump_a / pump_b / dispatch，全部完成后返回
@@ -259,36 +280,47 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     Ok(())
 }
 
-/// 读取 VMess 请求 body 的 chunk 流（PlainSizeParser 格式），解密后写入明文 sink。
+/// 读取 VMess 请求 body 的 chunk 流（SizeParser 格式），解密后写入明文 sink。
 ///
-/// chunk 格式：`[2B BE size][AEAD ciphertext]`。终止 chunk = `seal([])` → ciphertext=tag，
-/// 解密后 plaintext 为空即终止信号。EOF 或解密失败时 break 并 shutdown sink。
+/// chunk 格式：`[size_field][AEAD ciphertext][padding]`。
+/// size_field 长度由 `size_parser.size_bytes()` 决定（Plain/Shake=2, AEAD=18）。
+/// 终止 chunk = `seal([])` → 解密后 plaintext 为空即终止信号。
+/// EOF 或解密失败时 break 并 shutdown sink。
 async fn pump_request_body<C, R>(
     mut stream_r: R,
     mut server_w: WriteHalf<DuplexStream>,
     cipher: C,
     iv: [u8; 16],
+    mut size_parser: Box<dyn SizeParser + Send>,
+    global_padding: bool,
 ) where
     C: AeadCipher + Send,
     R: AsyncRead + Unpin,
 {
-    let mut nonce_gen = ChunkNonceGenerator::new(&iv, 12);
-    let mut size_buf = [0u8; 2];
+    let mut nonce_gen = ChunkNonceAdapter::new(&iv, 12);
     loop {
-        if stream_r.read_exact(&mut size_buf).await.is_err() {
+        // SHAKE128 流同步：先 next_padding_len 再 decode（与 body_chunk decode 一致）。
+        let padding_size = if global_padding {
+            usize::from(size_parser.next_padding_len())
+        } else {
+            0
+        };
+        let sb = size_parser.size_bytes();
+        let mut size_field = vec![0u8; sb];
+        if stream_r.read_exact(&mut size_field).await.is_err() {
             break;
         }
-        let total_size = u16::from_be_bytes(size_buf);
+        let total_size = usize::from(size_parser.decode(&size_field));
         if total_size == 0 {
-            // PlainSizeParser 不写 0 size，但兼容 Go AuthenticationReader 的 size==0 → EOF 语义
             break;
         }
-        let mut ciphertext = vec![0u8; usize::from(total_size)];
+        let ciphertext_size = total_size.saturating_sub(padding_size);
+        let mut ciphertext = vec![0u8; total_size];
         if stream_r.read_exact(&mut ciphertext).await.is_err() {
             break;
         }
         let nonce = nonce_gen.next();
-        match cipher.open(&nonce, &[], &ciphertext) {
+        match cipher.open(&nonce, &[], &ciphertext[..ciphertext_size]) {
             Ok(pt) if pt.is_empty() => break, // 终止 chunk：seal([]) → 解密为空
             Ok(pt) => {
                 if server_w.write_all(&pt).await.is_err() {
@@ -310,17 +342,21 @@ async fn pump_request_body<C, R>(
 
 /// 读取明文 sink 字节，按 VMess response body chunk 格式加密写入 stream。
 ///
-/// 流结束（EOF 或错误）时写终止 chunk：`seal([])` → 仅 tag 字节，size = tag_size。
+/// chunk 格式：`[size_field][encrypted][padding]`，size_field 由 SizeParser 编码。
+/// 流结束（EOF 或错误）时写终止 chunk：`seal([])`（no_termination=true 时跳过）。
 async fn pump_response_body<C, W>(
     mut server_r: ReadHalf<DuplexStream>,
     mut stream_w: W,
     cipher: C,
     iv: [u8; 16],
+    mut size_parser: Box<dyn SizeParser + Send>,
+    global_padding: bool,
+    no_termination: bool,
 ) where
     C: AeadCipher + Send,
     W: AsyncWrite + Unpin,
 {
-    let mut nonce_gen = ChunkNonceGenerator::new(&iv, 12);
+    let mut nonce_gen = ChunkNonceAdapter::new(&iv, 12);
     let mut buf = [0u8; PUMP_BUF];
     loop {
         match server_r.read(&mut buf).await {
@@ -337,12 +373,30 @@ async fn pump_response_body<C, W>(
                         break;
                     }
                 };
-                let size = u16::try_from(sealed.len()).unwrap_or(u16::MAX);
-                if stream_w.write_all(&size.to_be_bytes()).await.is_err() {
+                let padding_size = if global_padding {
+                    usize::from(size_parser.next_padding_len())
+                } else {
+                    0
+                };
+                let encrypted_size = sealed.len();
+                let size_value =
+                    u16::try_from(encrypted_size + padding_size).unwrap_or(u16::MAX);
+                let sb = size_parser.size_bytes();
+                let mut size_field = vec![0u8; sb];
+                size_parser.encode(size_value, &mut size_field);
+                if stream_w.write_all(&size_field).await.is_err() {
                     break;
                 }
                 if stream_w.write_all(&sealed).await.is_err() {
                     break;
+                }
+                if padding_size > 0 {
+                    let mut pad = vec![0u8; padding_size];
+                    use rand::RngCore;
+                    rand::rng().fill_bytes(&mut pad);
+                    if stream_w.write_all(&pad).await.is_err() {
+                        break;
+                    }
                 }
             }
             Err(e) => {
@@ -355,11 +409,18 @@ async fn pump_response_body<C, W>(
         }
     }
     // 写终止 chunk：seal([]) → 仅 tag 字节，客户端 decode 看到 plaintext 为空即返回
-    let nonce = nonce_gen.next();
-    if let Ok(sealed) = cipher.seal(&nonce, &[], &[]) {
-        let size = u16::try_from(sealed.len()).unwrap_or(u16::MAX);
-        let _ = stream_w.write_all(&size.to_be_bytes()).await;
-        let _ = stream_w.write_all(&sealed).await;
+    if !no_termination {
+        let nonce = nonce_gen.next();
+        if let Ok(sealed) = cipher.seal(&nonce, &[], &[]) {
+            let sb = size_parser.size_bytes();
+            let mut size_field = vec![0u8; sb];
+            size_parser.encode(
+                u16::try_from(sealed.len()).unwrap_or(u16::MAX),
+                &mut size_field,
+            );
+            let _ = stream_w.write_all(&size_field).await;
+            let _ = stream_w.write_all(&sealed).await;
+        }
     }
     let _ = stream_w.flush().await;
     let _ = stream_w.shutdown().await;

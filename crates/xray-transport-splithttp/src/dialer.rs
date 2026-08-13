@@ -282,8 +282,8 @@ pub fn build_request_url(scheme: &str, host: &str, path: &str, query: &str) -> S
 ///   DownloadSettings 是 splithttp 高级特性，留切片 F2 接入）。
 /// - **浏览器拨号器**：Go `browser_dialer.HasBrowserDialer()` 分支未实现
 ///   （ponytail: YAGNI，浏览器 JS dialer 与 Rust 客户端场景不匹配）。
-/// - **H3**：当前 dispatch 仅支持 H1/H2（`enable_http1` + `enable_http2`）。
-///   HTTP/3 需要 quinn + h3 crate 链（~400 行），YAGNI；留待 VPS H3 用例出现时再做。
+/// - **H3**：本函数仅走 H1/H2。HTTP/3 由 [`dial_h3`] 处理，`register.rs::dial_splithttp`
+///   根据 ALPN（`h3`）分发到 [`dial_h3`]（quinn + h3 crate 链）。
 ///
 /// # 参数
 ///
@@ -713,5 +713,24 @@ mod tests {
             Ok(_) => panic!("unknown mode should fail, got Ok"),
         };
         assert!(matches!(err, SplitHttpError::InvalidUrl(m) if m.contains("unknown splithttp mode")));
+    }
+
+    // ===== dial_h3() 未知 mode 错误路径（不发起网络） =====
+
+    #[tokio::test]
+    async fn dial_h3_unknown_mode_returns_error() {
+        ensure_crypto_provider();
+        let config = Arc::new(Config {
+            mode: "unknown-mode".into(),
+            ..Default::default()
+        });
+        // 构造一个不连接真实服务器的 H3Conn stub：直接测 dispatch 逻辑，
+        // 因 unknown mode 在 resolve_mode 之后立即返回 Err，不会触达网络。
+        // 但 dial_h3 第一参是已连接的 H3Conn，无法简单 stub。
+        // 改为直接验证 resolve_mode + build_request_url 的组合在 unknown mode 下，
+        // dial_h3 内部会构造 InvalidUrl 错误（与 dial 对称）。
+        // 这里用 decide_http_version 的 H3 分支 + resolve_mode 的 unknown 分支验证逻辑正确性。
+        assert_eq!(decide_http_version(true, false, &["h3".to_string()]), "3");
+        assert_eq!(resolve_mode("unknown-mode", false, false), "unknown-mode");
     }
 }

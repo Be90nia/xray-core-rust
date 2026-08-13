@@ -100,6 +100,9 @@ struct ValidatorInner {
     users: Vec<MemoryUser>,
     behavior_seed: u64,
     behavior_fused: bool,
+    // ponytail: unbounded IV replay set; for high-traffic servers add TTL-based
+    // eviction. Keyed by user email so different users' IVs don't collide.
+    seen_ivs: std::collections::HashMap<String, std::collections::HashSet<Vec<u8>>>,
 }
 
 impl Default for Validator {
@@ -117,6 +120,7 @@ impl Validator {
                 users: Vec::new(),
                 behavior_seed: 0,
                 behavior_fused: false,
+                seen_ivs: std::collections::HashMap::new(),
             }),
         }
     }
@@ -212,38 +216,62 @@ impl Validator {
     /// - TCP：尝试解密首 18 字节（4 + nonce_size）；nonce 长度 = 12/24
     /// - UDP：尝试解密全部 payload
     ///
+    /// 若匹配用户的 `iv_check` 为 true，还会检查 IV 唯一性（反重放）。
+    ///
     /// # Errors
     /// - [`SsError::UserNotFound`]：无用户匹配。
+    /// - [`SsError::IvNotUnique`]：IV 已见过（仅 `iv_check` 为 true 时）。
     pub fn get(&self, bs: &[u8], command: RequestCommand) -> Result<GetResult> {
-        let inner = self.inner.lock().expect("validator mutex poisoned");
-        for user in &inner.users {
-            let account = &user.account;
-            if account.cipher.is_aead() {
-                // AEAD payload 至少 32 字节
-                if bs.len() < 32 {
-                    continue;
+        let mut inner = self.inner.lock().expect("validator mutex poisoned");
+
+        // Phase 1: match user (shared borrow of inner.users).
+        let matched: Option<(MemoryUser, u32, Option<crate::config::InnerAead>, Vec<u8>)> = {
+            let mut found = None;
+            for user in &inner.users {
+                let account = &user.account;
+                if account.cipher.is_aead() {
+                    if bs.len() < 32 {
+                        continue;
+                    }
+                    match try_match_aead(account, bs, command) {
+                        Ok((iv_len, aead, ret)) => {
+                            found = Some((user.clone(), iv_len, Some(aead), ret));
+                            break;
+                        }
+                        Err(_) => continue,
+                    }
+                } else {
+                    // None cipher：直接返回（iv_len=0）
+                    found = Some((user.clone(), 0, None, Vec::new()));
+                    break;
                 }
-                let (iv_len, aead, ret) = match try_match_aead(account, bs, command) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                return Ok(GetResult {
-                    user: user.clone(),
-                    aead: Some(aead),
-                    ret,
-                    iv_len,
-                });
-            } else {
-                // None cipher：直接返回（iv_len=0）
-                return Ok(GetResult {
-                    user: user.clone(),
-                    aead: None,
-                    ret: Vec::new(),
-                    iv_len: 0,
-                });
+            }
+            found
+        };
+
+        let Some((user, iv_len, aead, ret)) = matched else {
+            return Err(SsError::UserNotFound);
+        };
+
+        // Phase 2: IV uniqueness check (mutable borrow of inner.seen_ivs — safe,
+        // Phase 1 borrow of inner.users has ended).
+        if user.account.iv_check && iv_len > 0 {
+            let iv_len_us = iv_len as usize;
+            if iv_len_us <= bs.len() {
+                let iv = bs[..iv_len_us].to_vec();
+                let seen = inner.seen_ivs.entry(user.email.clone()).or_default();
+                if !seen.insert(iv) {
+                    return Err(SsError::IvNotUnique);
+                }
             }
         }
-        Err(SsError::UserNotFound)
+
+        Ok(GetResult {
+            user,
+            aead,
+            ret,
+            iv_len,
+        })
     }
 
     /// 获取 behavior seed，对应 Go `GetBehaviorSeed`。
@@ -461,6 +489,97 @@ mod tests {
     // 注：当前 add 实现 behaviorSeed 累积算法有缺陷（见 unreachable!），
     // 上面两个测试会 panic。先 mark ignore，TODO 修复算法。
     // 实际上正确做法见 fixed_validator_add。
+
+    // ---- IV uniqueness check ----
+
+    /// 构造能通过 `try_match_aead` 的有效 `bs`（IV + AEAD-sealed 2B plaintext）。
+    fn make_valid_bs(account: &MemoryAccount) -> Vec<u8> {
+        use crate::config::{hkdf_sha1, Cipher};
+        let Cipher::Aead(ac) = &account.cipher else {
+            panic!("need AEAD cipher");
+        };
+        let iv_len = ac.iv_bytes as usize;
+        let iv = vec![0xAAu8; iv_len];
+        let mut subkey = vec![0u8; ac.key_bytes as usize];
+        hkdf_sha1(&account.key, &iv, &mut subkey);
+        let aead = (ac.creator)(&subkey).expect("create aead");
+        let zero_nonce = vec![0u8; aead.nonce_size()];
+        // Seal 2 bytes → 18 bytes ciphertext (2 + 16 tag) for AES-128-GCM.
+        let sealed = aead.seal(&zero_nonce, &[], &[0x01, 0x02]).expect("seal");
+        let mut bs = iv;
+        bs.extend_from_slice(&sealed);
+        // Ensure ≥ 32 bytes.
+        while bs.len() < 32 {
+            bs.push(0);
+        }
+        bs
+    }
+
+    fn make_user_iv_check(email: &str, ct: CipherType, password: &str) -> MemoryUser {
+        let p = ProtoAccount {
+            password: password.to_string(),
+            cipher_type: ct.as_i32(),
+            iv_check: true,
+        };
+        MemoryUser::new(email, MemoryAccount::from_proto(&p).expect("account"))
+    }
+
+    #[test]
+    fn iv_check_rejects_duplicate_iv() {
+        let v = Validator::new();
+        v.add(make_user_iv_check("u@x.com", CipherType::Aes128Gcm, "pass"))
+            .expect("add");
+        let account = v.get_all()[0].account.clone();
+        let bs = make_valid_bs(&account);
+
+        // First call: OK (IV recorded).
+        v.get(&bs, RequestCommand::Tcp).expect("first get ok");
+        // Second call: same IV → IvNotUnique.
+        let err = v.get(&bs, RequestCommand::Tcp).unwrap_err();
+        assert!(matches!(err, SsError::IvNotUnique));
+    }
+
+    #[test]
+    fn iv_check_disabled_allows_duplicate() {
+        let v = Validator::new();
+        v.add(make_user("u@x.com", CipherType::Aes128Gcm, "pass"))
+            .expect("add");
+        let account = v.get_all()[0].account.clone();
+        let bs = make_valid_bs(&account);
+
+        v.get(&bs, RequestCommand::Tcp).expect("first get ok");
+        // iv_check=false → duplicate IV allowed.
+        v.get(&bs, RequestCommand::Tcp).expect("second get ok");
+    }
+
+    #[test]
+    fn iv_check_allows_different_iv() {
+        use crate::config::{hkdf_sha1, Cipher};
+        let v = Validator::new();
+        v.add(make_user_iv_check("u@x.com", CipherType::Aes128Gcm, "pass"))
+            .expect("add");
+        let account = v.get_all()[0].account.clone();
+
+        // First IV.
+        let bs1 = make_valid_bs(&account);
+        v.get(&bs1, RequestCommand::Tcp).expect("first iv ok");
+
+        // Second IV: different prefix → different subkey → different ciphertext.
+        let Cipher::Aead(ac) = &account.cipher else { panic!() };
+        let iv2 = vec![0xBBu8; ac.iv_bytes as usize];
+        let mut subkey2 = vec![0u8; ac.key_bytes as usize];
+        hkdf_sha1(&account.key, &iv2, &mut subkey2);
+        let aead2 = (ac.creator)(&subkey2).expect("aead2");
+        let sealed2 = aead2
+            .seal(&vec![0u8; aead2.nonce_size()], &[], &[0x03, 0x04])
+            .expect("seal2");
+        let mut bs2 = iv2;
+        bs2.extend_from_slice(&sealed2);
+        while bs2.len() < 32 {
+            bs2.push(0);
+        }
+        v.get(&bs2, RequestCommand::Tcp).expect("second iv ok");
+    }
 }
 
 #[cfg(test)]

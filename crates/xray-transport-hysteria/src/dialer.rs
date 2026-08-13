@@ -50,6 +50,9 @@ pub struct QuicConfig {
     pub enable_datagrams: bool,
     pub max_datagram_frame_size: u64,
     pub max_incoming_streams: i64,
+    /// 拥塞控制算法（对应 Go `quic.Config.CongestionControl` / QuicParams.congestion）。
+    /// "bbr" → BBR；"cubic"/"new_reno"/空 → 默认（CUBIC）。hysteria 默认 BBR。
+    pub congestion: String,
 }
 
 impl QuicConfig {
@@ -86,6 +89,7 @@ impl QuicConfig {
             } else {
                 p.max_incoming_streams
             },
+            congestion: p.congestion.clone(),
         }
     }
 

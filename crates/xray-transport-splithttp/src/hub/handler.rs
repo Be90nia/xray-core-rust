@@ -39,7 +39,37 @@ pub struct HandlerContext {
 const DUPLEX_BUF: usize = 64 * 1024;
 
 /// 主请求入口。对应 Go `requestHandler.ServeHTTP`。
+///
+/// 提取 CORS header（对应 Go `WriteResponseHeader`，在每个响应上调用），
+/// 再委托 [`dispatch_request`]，最后把 CORS header 追加到最终响应。
 pub async fn handle_request(
+    req: Request<Incoming>,
+    peer_addr: SocketAddr,
+    ctx: &HandlerContext,
+) -> Response<BoxBody<Bytes, io::Error>> {
+    let cors = ctx
+        .config
+        .write_response_header(req.method().as_str(), req.headers());
+    let resp = dispatch_request(req, peer_addr, ctx).await;
+    apply_cors_headers(resp, &cors)
+}
+
+/// 把 `(name, value)` header 对追加到响应（对应 Go `writer.Header().Set`）。
+fn apply_cors_headers(
+    mut resp: Response<BoxBody<Bytes, io::Error>>,
+    headers: &[(String, String)],
+) -> Response<BoxBody<Bytes, io::Error>> {
+    let h = resp.headers_mut();
+    for (name, value) in headers {
+        if let (Ok(n), Ok(v)) = (name.parse::<http::HeaderName>(), value.parse()) {
+            h.insert(n, v);
+        }
+    }
+    resp
+}
+
+/// 请求分发：Host/Path 校验 → OPTIONS → 提取 meta → padding 校验 → 模式分发。
+async fn dispatch_request(
     req: Request<Incoming>,
     peer_addr: SocketAddr,
     ctx: &HandlerContext,
@@ -62,9 +92,9 @@ pub async fn handle_request(
         return status_response(StatusCode::NOT_FOUND);
     }
 
-    // 3. OPTIONS → CORS preflight
+    // 3. OPTIONS → CORS preflight（CORS header 由 handle_request 统一追加）
     if req.method() == Method::OPTIONS {
-        return cors_response(StatusCode::OK);
+        return status_response(StatusCode::OK);
     }
 
     // 4. 提取 session + seq
@@ -423,16 +453,6 @@ fn status_response(status: StatusCode) -> Response<BoxBody<Bytes, io::Error>> {
         .unwrap()
 }
 
-/// CORS 响应（OPTIONS preflight）。
-fn cors_response(status: StatusCode) -> Response<BoxBody<Bytes, io::Error>> {
-    Response::builder()
-        .status(status)
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Access-Control-Allow-Methods", "*")
-        .header("Access-Control-Allow-Headers", "*")
-        .body(empty_body())
-        .unwrap()
-}
 
 fn empty_body() -> BoxBody<Bytes, io::Error> {
     Full::new(Bytes::new())
@@ -527,5 +547,33 @@ mod tests {
     fn extract_header_payload_empty_key_returns_empty() {
         let headers = HeaderMap::new();
         assert_eq!(extract_header_payload(&headers, "nonexistent"), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn apply_cors_headers_merges_into_response() {
+        let resp = status_response(StatusCode::OK);
+        let cors = vec![
+            ("Access-Control-Allow-Origin".to_string(), "*".to_string()),
+            ("Access-Control-Allow-Methods".to_string(), "POST".to_string()),
+        ];
+        let merged = apply_cors_headers(resp, &cors);
+        assert_eq!(merged.status(), StatusCode::OK);
+        assert_eq!(
+            merged.headers().get("Access-Control-Allow-Origin").unwrap(),
+            "*"
+        );
+        assert_eq!(
+            merged.headers().get("Access-Control-Allow-Methods").unwrap(),
+            "POST"
+        );
+    }
+
+    #[test]
+    fn apply_cors_headers_skips_invalid_header_name() {
+        let resp = status_response(StatusCode::OK);
+        let cors = vec![("invalid header with space".to_string(), "v".to_string())];
+        let merged = apply_cors_headers(resp, &cors);
+        // 无效 header name 被跳过，不影响响应
+        assert_eq!(merged.status(), StatusCode::OK);
     }
 }

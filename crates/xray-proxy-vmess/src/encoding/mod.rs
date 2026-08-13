@@ -131,7 +131,7 @@ impl ChunkNonceGenerator {
 /// 用于 VMess 的 chunk masking：把 2 字节 length 异或 SHAKE128 派生的 mask。
 /// padding 长度由 SHAKE128 派生的 2 字节 mod 64 决定。
 pub struct ShakeSizeParser {
-    reader: Box<dyn XofReader>,
+    reader: Box<dyn XofReader + Send>,
 }
 
 impl ShakeSizeParser {

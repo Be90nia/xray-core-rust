@@ -484,6 +484,52 @@ impl Config {
         headers
     }
 
+    /// 计算 CORS 响应 header。对应 Go `Config.WriteResponseHeader`。
+    ///
+    /// 在 hub 侧对**每个**响应调用，把返回的 `(name, value)` 对追加到响应 header。
+    ///
+    /// 逻辑：
+    /// - 请求无 `Origin` header → `Access-Control-Allow-Origin: *`
+    /// - 有 `Origin` → 回显该 origin（浏览器 dialer credentials 模式要求）
+    /// - session/seq/xpadding/uplink_data 任一 placement 为 cookie →
+    ///   `Access-Control-Allow-Credentials: true`
+    /// - `OPTIONS` preflight → 追加 `Access-Control-Allow-Methods` /
+    ///   `Access-Control-Allow-Headers`（从请求的对应 header 取，缺失用 `*`）
+    #[must_use]
+    pub fn write_response_header(
+        &self,
+        request_method: &str,
+        request_headers: &http::HeaderMap,
+    ) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let origin = header_get(request_headers, "origin");
+        if origin.is_empty() {
+            out.push(("Access-Control-Allow-Origin".into(), "*".into()));
+        } else {
+            out.push(("Access-Control-Allow-Origin".into(), origin));
+        }
+        if self.normalized_session_placement() == PLACEMENT_COOKIE
+            || self.normalized_seq_placement() == PLACEMENT_COOKIE
+            || self.x_padding_placement == PLACEMENT_COOKIE
+            || self.normalized_uplink_data_placement() == PLACEMENT_COOKIE
+        {
+            out.push(("Access-Control-Allow-Credentials".into(), "true".into()));
+        }
+        if request_method == "OPTIONS" {
+            let req_method = header_get(request_headers, "access-control-request-method");
+            out.push((
+                "Access-Control-Allow-Methods".into(),
+                if req_method.is_empty() { "*".into() } else { req_method },
+            ));
+            let req_headers = header_get(request_headers, "access-control-request-headers");
+            out.push((
+                "Access-Control-Allow-Headers".into(),
+                if req_headers.is_empty() { "*".into() } else { req_headers },
+            ));
+        }
+        out
+    }
+
     /// XPadding 字节范围。None 或 `to=0` 返回默认 `100..=1000`。
     ///
     /// 对应 Go `GetNormalizedXPaddingBytes`。
@@ -681,6 +727,15 @@ pub(crate) fn uri_append_query(uri: &str, key: &str, value: &str) -> String {
     } else {
         format!("{uri}?{key}={value}")
     }
+}
+
+/// 从 `http::HeaderMap` 按名称取值（不区分大小写），缺失返回空串。
+fn header_get(headers: &http::HeaderMap, name: &str) -> String {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
 }
 
 // ===== proto 转换辅助 =====
@@ -1175,5 +1230,69 @@ mod tests {
             .build_stream_request_meta("https://example.com/ws", "sess", Some(b"hello".to_vec()))
             .unwrap();
         assert!(!meta.headers.iter().any(|(k, _)| k == "Content-Type"));
+    }
+
+    // ===== write_response_header (对应 Go WriteResponseHeader) =====
+
+    fn assert_header(h: &[(String, String)], name: &str, value: &str) {
+        let found = h.iter().find(|(k, _)| k == name);
+        assert!(
+            found.is_some(),
+            "expected header {name} in {h:?}"
+        );
+        assert_eq!(found.unwrap().1, value, "header {name} value mismatch");
+    }
+
+    #[test]
+    fn write_response_header_no_origin_returns_wildcard() {
+        let cfg = Config::default();
+        let headers = http::HeaderMap::new();
+        let out = cfg.write_response_header("GET", &headers);
+        assert_header(&out, "Access-Control-Allow-Origin", "*");
+        // 无 cookie placement → 无 credentials
+        assert!(!out.iter().any(|(k, _)| k == "Access-Control-Allow-Credentials"));
+    }
+
+    #[test]
+    fn write_response_header_with_origin_echoes_origin() {
+        let cfg = Config::default();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("Origin", "https://evil.example".parse().unwrap());
+        let out = cfg.write_response_header("GET", &headers);
+        assert_header(&out, "Access-Control-Allow-Origin", "https://evil.example");
+    }
+
+    #[test]
+    fn write_response_header_cookie_placement_adds_credentials() {
+        let cfg = Config {
+            session_placement: PLACEMENT_COOKIE.into(),
+            ..Default::default()
+        };
+        let headers = http::HeaderMap::new();
+        let out = cfg.write_response_header("GET", &headers);
+        assert_header(&out, "Access-Control-Allow-Credentials", "true");
+    }
+
+    #[test]
+    fn write_response_header_options_preflow_adds_methods_and_headers() {
+        let cfg = Config::default();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("Access-Control-Request-Method", "POST".parse().unwrap());
+        headers.insert(
+            "Access-Control-Request-Headers",
+            "Content-Type".parse().unwrap(),
+        );
+        let out = cfg.write_response_header("OPTIONS", &headers);
+        assert_header(&out, "Access-Control-Allow-Methods", "POST");
+        assert_header(&out, "Access-Control-Allow-Headers", "Content-Type");
+    }
+
+    #[test]
+    fn write_response_header_options_no_request_defaults_to_wildcard() {
+        let cfg = Config::default();
+        let headers = http::HeaderMap::new();
+        let out = cfg.write_response_header("OPTIONS", &headers);
+        assert_header(&out, "Access-Control-Allow-Methods", "*");
+        assert_header(&out, "Access-Control-Allow-Headers", "*");
     }
 }

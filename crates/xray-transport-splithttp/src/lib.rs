@@ -19,10 +19,13 @@
 //! - `normalized_path`/`query`/`uplink_http_method`/`sc_*`/`uplink_chunk_size`/
 //!   `session_*`/`seq_*`/`server_max_header_bytes` 等纯函数方法
 //!
-//! 切片2 待办（依赖 `http::Request` / `XPadding` / 实际网络栈）：
-//! `WriteResponseHeader` / `GetRequestHeaderWithPayload` / `ApplyMetaToRequest` /
-//! `FillStreamRequest` / `FillPacketRequest` / `ExtractMetaFromRequest` +
-//! 实际 HTTP 拨号 + SSE 流 + upload_queue + xmux 连接池。
+//! 切片2（已实现，依赖 `http::Request` / `XPadding` / 实际网络栈）：
+//! `WriteResponseHeader`（`Config::write_response_header`）/
+//! `ApplyMetaToRequest`（`Config::apply_meta_to_uri`）/
+//! `FillStreamRequest`（`Config::build_stream_request_meta`）/
+//! `FillPacketRequest`（`Config::build_packet_request_meta`）/
+//! `ExtractMetaFromRequest`（`hub::meta::extract_meta`）+
+//! 实际 HTTP 拨号（H1/H2 + H3）+ SSE 流 + upload_queue + xmux 连接池骨架。
 
 pub mod config;
 pub mod error;
