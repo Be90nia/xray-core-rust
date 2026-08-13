@@ -27,8 +27,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
+use xray_crypto::aead::{AeadCipher, Aes128Gcm, Aes256Gcm, ChaCha20Poly1305Aead};
 use xray_common::net::address::Address;
-use xray_crypto::aead::{AeadCipher, Aes128Gcm, Aes256Gcm};
 
 use crate::error::{Result, SsError};
 use crate::protocol::addr_type;
@@ -357,10 +357,9 @@ fn build_aead(kind: CipherKind2022, subkey: &[u8]) -> Result<Box<dyn AeadCipher 
     match kind {
         CipherKind2022::Aes128Gcm => Ok(Box::new(Aes128Gcm::new(subkey)?)),
         CipherKind2022::Aes256Gcm => Ok(Box::new(Aes256Gcm::new(subkey)?)),
-        // ponytail: ChaCha20 SS-2022 入站留后续
-        CipherKind2022::ChaCha20Poly1305 => Err(SsError::InvalidCipherName(
-            "2022-blake3-chacha20-poly1305 not yet implemented".into(),
-        )),
+        CipherKind2022::ChaCha20Poly1305 => {
+            Ok(Box::new(ChaCha20Poly1305Aead::new(subkey)?))
+        }
     }
 }
 
@@ -613,4 +612,38 @@ fn parse_variable_header(buf: &[u8]) -> Result<(Address, u16)> {
     let port = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
 
     Ok((address, port))
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inbound_build_aead_chacha20_roundtrip() {
+        // 入站 build_aead 与 client.rs 对称：chacha20 用 blake3 派生的 32B subkey 直接构造。
+        let psk = [0x11u8; 32];
+        let salt = [0x22u8; 32];
+        let subkey =
+            derive_session_subkey(&psk, &salt, CipherKind2022::ChaCha20Poly1305);
+        assert_eq!(subkey.len(), 32);
+
+        let aead =
+            build_aead(CipherKind2022::ChaCha20Poly1305, &subkey).expect("build_aead chacha20");
+        let nonce = vec![0u8; aead.nonce_size()];
+        let plaintext = b"inbound chacha20 round trip";
+        let sealed = aead.seal(&nonce, b"", plaintext).expect("seal");
+        let opened = aead.open(&nonce, b"", &sealed).expect("open");
+        assert_eq!(opened.as_slice(), &plaintext[..]);
+    }
+
+    #[test]
+    fn inbound_build_aead_all_methods() {
+        // 三种 cipher kind 都能成功构造 AEAD（回归：chacha20 不再 not-implemented）。
+        let sub32 = [0x55u8; 32];
+        let sub16 = [0x55u8; 16];
+        assert!(build_aead(CipherKind2022::Aes128Gcm, &sub16).is_ok());
+        assert!(build_aead(CipherKind2022::Aes256Gcm, &sub32).is_ok());
+        assert!(build_aead(CipherKind2022::ChaCha20Poly1305, &sub32).is_ok());
+    }
 }

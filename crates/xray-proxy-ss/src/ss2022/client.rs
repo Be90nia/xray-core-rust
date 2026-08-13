@@ -18,7 +18,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use xray_crypto::aead::{AeadCipher, Aes128Gcm, Aes256Gcm};
+use xray_crypto::aead::{AeadCipher, Aes128Gcm, Aes256Gcm, ChaCha20Poly1305Aead};
 
 use crate::error::{Result, SsError};
 use crate::ss2022::key::{derive_session_subkey, psk_from_base64, CipherKind2022};
@@ -63,10 +63,9 @@ impl Client2022 {
         match self.kind {
             CipherKind2022::Aes128Gcm => Ok(Box::new(Aes128Gcm::new(subkey)?)),
             CipherKind2022::Aes256Gcm => Ok(Box::new(Aes256Gcm::new(subkey)?)),
-            // ponytail: ChaCha20 SS-2022 留后续（VPS 用 aes-256-gcm）
-            CipherKind2022::ChaCha20Poly1305 => Err(SsError::InvalidCipherName(
-                "2022-blake3-chacha20-poly1305 not yet implemented".into(),
-            )),
+            CipherKind2022::ChaCha20Poly1305 => {
+                Ok(Box::new(ChaCha20Poly1305Aead::new(subkey)?))
+            }
         }
     }
 
@@ -198,15 +197,35 @@ mod tests {
     }
 
     #[test]
-    fn client_new_chacha_not_yet() {
-        // chacha20 SS-2022 暂未实现
+    fn client_build_aead_chacha20_roundtrip() {
+        // 2022-blake3-chacha20-poly1305：TCP 直接用 ChaCha20-Poly1305 替换 AES-GCM（SIP022 §4），
+        // KDF 与 AES-256-GCM 完全一致（blake3 derive_key 32B subkey）。
+        // 验证 build_aead 不再返回 not-implemented，且 seal/open 往返一致。
         let c = Client2022::new(
             "2022-blake3-chacha20-poly1305",
             "swzPBNUUnCN6/Ply/V90cKtGbQdNf/UK6v1UjIRAsdQ=",
             "example.com",
             8388,
-        );
-        // new() 成功（只是 cipher kind），但 build_aead 会失败
-        assert!(c.is_ok());
+        )
+        .expect("Client2022::new chacha20");
+        assert_eq!(c.psk.len(), 32);
+        assert_eq!(c.kind, CipherKind2022::ChaCha20Poly1305);
+
+        let salt = vec![0xABu8; c.kind.salt_size()];
+        let subkey = derive_session_subkey(&c.psk, &salt, c.kind);
+        assert_eq!(subkey.len(), 32);
+
+        let aead = c.build_aead(&subkey).expect("build_aead chacha20");
+        let nonce = vec![0u8; aead.nonce_size()];
+        let plaintext = b"hello ss2022 chacha20-ietf-poly1305";
+        let sealed = aead.seal(&nonce, b"", plaintext).expect("seal");
+        assert_eq!(sealed.len(), plaintext.len() + aead.tag_size());
+        let opened = aead.open(&nonce, b"", &sealed).expect("open");
+        assert_eq!(opened.as_slice(), &plaintext[..]);
+
+        // nonce 参与认证：错 nonce 必须解密失败
+        let mut bad_nonce = nonce.clone();
+        bad_nonce[0] = 1;
+        assert!(aead.open(&bad_nonce, b"", &sealed).is_err());
     }
 }

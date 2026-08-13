@@ -21,7 +21,7 @@ use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp;
 use smoltcp::socket::udp;
 use smoltcp::time::Instant;
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv6Address};
+use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address};
 
 /// smoltcp 协议栈 poll 一次处理的最大 RX 包数。
 const POLL_RX_BUDGET: usize = 64;
@@ -58,6 +58,23 @@ impl WgNetStack {
         iface.update_ip_addrs(|addrs| {
             for addr in local_addrs {
                 let _ = addrs.push(*addr);
+            }
+        });
+
+        // 配置默认路由（inbound accept 必需——SYN-ACK 需路由到远端 peer）。
+        // 与 TunNetStack::new 对称：TUN medium 直连模式只需存在默认路由。
+        let has_v4 = local_addrs.iter().any(|c| matches!(c, IpCidr::Ipv4(_)));
+        let has_v6 = local_addrs.iter().any(|c| matches!(c, IpCidr::Ipv6(_)));
+        iface.routes_mut().update(|routes| {
+            if has_v4 {
+                let _ = routes.push(smoltcp::iface::Route::new_ipv4_gateway(
+                    Ipv4Address::new(0, 0, 0, 0),
+                ));
+            }
+            if has_v6 {
+                let _ = routes.push(smoltcp::iface::Route::new_ipv6_gateway(
+                    Ipv6Address::new(0, 0, 0, 0, 0, 0, 0, 0),
+                ));
             }
         });
 
@@ -150,11 +167,59 @@ impl WgNetStack {
         socket.connect(self.iface.context(), (remote, port), 0)
     }
 
+    /// TCP 监听（server side）。对应 Go `tcp.NewForwarder` 的 listen 语义。
+    ///
+    /// 把 socket 置为 Listen 状态，接受任意源地址的连接。
+    /// 后续用 [`Self::check_tcp_accept`] 检查是否有新连接进入。
+    pub fn tcp_listen(&mut self, handle: SocketHandle, port: u16) -> Result<(), crate::error::WgError> {
+        let socket = self.sockets.get_mut::<tcp::Socket<'static>>(handle);
+        socket
+            .listen(port)
+            .map_err(|e| crate::error::WgError::NetStack(format!("tcp listen: {e:?}")))
+    }
+
+    /// 检测 TCP socket 是否有新连接已 accept（状态从 Listen 转为 Established）。
+    ///
+    /// 与 [`TunNetStack::check_tcp_accept`](xray_proxy_tun::netstack::TunNetStack::check_tcp_accept)
+    /// 语义相同：上层创建 Listen socket，poll 后检测 Established。
+    #[must_use]
+    pub fn check_tcp_accept(&mut self, handle: SocketHandle) -> Option<TcpAcceptEvent> {
+        let socket = self.sockets.get_mut::<tcp::Socket<'static>>(handle);
+        match socket.state() {
+            tcp::State::Established => {
+                let local = socket.local_endpoint();
+                let remote = socket.remote_endpoint()?;
+                Some(TcpAcceptEvent {
+                    handle,
+                    local,
+                    remote,
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// smoltcp Interface 借用（高级用法——路由表修改等）。
     #[must_use]
     pub fn iface_mut(&mut self) -> &mut Interface {
         &mut self.iface
     }
+}
+
+// ===== 事件检测：poll 后检查 socket 状态变化 =====
+
+/// TCP socket 的状态事件（poll 后检测）。
+///
+/// 与 `xray_proxy_tun::netstack::TcpAcceptEvent` 语义相同——
+/// smoltcp 在 Listen socket 的 SYN-RCVD → ESTABLISHED 转换时完成 accept。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpAcceptEvent {
+    /// 已接受的 socket handle。
+    pub handle: SocketHandle,
+    /// 本地端点（WG 侧地址+端口，用于构建 dispatcher destination）。
+    pub local: Option<IpEndpoint>,
+    /// 远端地址（客户端 IP+端口）。
+    pub remote: IpEndpoint,
 }
 
 // ===== VirtualDevice：smoltcp phy::Device 实现 =====

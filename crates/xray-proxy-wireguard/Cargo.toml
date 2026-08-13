@@ -11,6 +11,7 @@ xray-features = { path = "../xray-features" }
 xray-proto = { path = "../xray-proto" }
 xray-app-dispatcher = { path = "../xray-app-dispatcher" }
 xray-transport = { path = "../xray-transport" }
+xray-buf = { path = "../xray-buf" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

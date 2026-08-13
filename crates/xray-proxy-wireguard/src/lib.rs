@@ -39,7 +39,7 @@ pub use config::{DeviceConfig, DomainStrategy, PeerConfig};
 pub use driver::WgDriver;
 pub use error::{Result, WgError};
 pub use inbound::WireguardInboundHandler;
-pub use netstack::{VirtualDevice, WgNetStack};
+pub use netstack::{TcpAcceptEvent, VirtualDevice, WgNetStack};
 pub use outbound::WireguardOutboundHandler;
 pub use peer::{PeerSession, SharedPeer};
 pub use tunnel::{Output as TunnelOutput, Tunnel};

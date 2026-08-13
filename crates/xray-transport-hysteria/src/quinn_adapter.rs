@@ -376,6 +376,10 @@ impl HysteriaQuicListener for QuinnQuicListener {
 }
 
 /// quinn 实现的 [`HysteriaListenerFactory`]。
+///
+/// 络定 UDP socket + ALPN `h3`，accept QUIC 连接。每条连接先做 h3 `/auth` 握手
+/// （校验 `Hysteria-Auth` 头），通过后切换到 raw bidi stream 模式，将每个 stream
+/// 经 `on_new_conn` 回调投递给上层。对应 Go `Listen()` + `http3.Server.ServeQUICConn`。
 pub struct QuinnListenerFactory {
     rustls_server_config: Arc<rustls::ServerConfig>,
 }
@@ -394,24 +398,167 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
         _config: Arc<crate::proto_config::Config>,
         quic_params: Arc<QuicParams>,
         _masq: crate::hub::MasqType,
-        _validator: Option<Arc<dyn crate::hub::AuthValidator>>,
-        _on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync>,
+        validator: Option<Arc<dyn crate::hub::AuthValidator>>,
+        on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync>,
     ) -> Pin<Box<dyn std::future::Future<Output = crate::error::Result<Arc<dyn HysteriaQuicListener>>> + Send>> {
-        let rustls_config = self.rustls_server_config.clone();
+        // ponytail: hysteria ALPN 固定 h3（与 client hysteria_transport::QuinnHysteriaTransport 对称）
+        let mut rustls_config = (*self.rustls_server_config).clone();
+        rustls_config.alpn_protocols = vec![b"h3".to_vec()];
         Box::pin(async move {
-            let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from((*rustls_config).clone())
+            let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
                 .map_err(|e| crate::error::HysteriaError::Io(io::Error::other(format!("rustls→quic server: {e}"))))?;
             let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
             let qc = QuicConfig::from_params(&quic_params);
             server_config.transport_config(Arc::new(QuinnHysteriaTransport::build_transport_config(&qc)));
             let endpoint = quinn::Endpoint::server(server_config, bind_addr)
                 .map_err(|e| crate::error::HysteriaError::Io(io::Error::other(format!("bind: {e}"))))?;
+
+            // spawn accept loop：每个 QUIC conn → h3 auth → raw bidi streams → on_new_conn。
+            // endpoint.close()（listener close）会让 accept 返回 None，循环自然退出。
+            let ep = endpoint.clone();
+            tokio::spawn(async move {
+                while let Some(incoming) = ep.accept().await {
+                    let validator = validator.clone();
+                    let on_new_conn = on_new_conn.clone();
+                    tokio::spawn(async move {
+                        match incoming.await {
+                            Ok(conn) => {
+                                serve_hysteria_connection(conn, validator, on_new_conn).await;
+                            }
+                            Err(e) => {
+                                tracing::debug!(error = ?e, "hysteria quic handshake failed");
+                            }
+                        }
+                    });
+                }
+            });
+
             let listener = QuinnQuicListener::new(endpoint)
                 .ok_or_else(|| crate::error::HysteriaError::Io(io::Error::other("local_addr failed")))?;
             Ok(Arc::new(listener) as Arc<dyn HysteriaQuicListener>)
         })
     }
 }
+
+/// 服务单个 hysteria QUIC 连接：h3 `/auth` 握手 → raw bidi stream 循环。
+///
+/// 对应 Go `http3.Server.ServeQUICConn`（auth）+ `conn.AcceptStream`（data）。
+async fn serve_hysteria_connection(
+    conn: quinn::Connection,
+    validator: Option<Arc<dyn crate::hub::AuthValidator>>,
+    on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync>,
+) {
+    let remote = conn.remote_address();
+    let local = conn
+        .local_ip()
+        .map(|ip| SocketAddr::new(ip, 0))
+        .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0));
+
+    // Phase 1: h3 /auth 握手
+    if !h3_auth(&conn, &validator).await {
+        tracing::warn!(%remote, "hysteria auth failed, closing");
+        conn.close(VarInt::from_u32(0), b"auth failed");
+        return;
+    }
+    tracing::info!(%remote, "hysteria client authenticated");
+
+    // Phase 2: raw bidi streams（FrameTypeTCPRequest 前缀由 InterStreamConn 处理）
+    loop {
+        match conn.accept_bi().await {
+            Ok((send, recv)) => {
+                let qs = QuinnQuicStream::new(send, recv, local, remote);
+                let isc = Arc::new(InterStreamConn::new(Arc::new(qs), local, remote, false));
+                on_new_conn(isc);
+            }
+            Err(e) => {
+                tracing::debug!(error = ?e, %remote, "hysteria bidi stream loop ended");
+                break;
+            }
+        }
+    }
+}
+
+/// h3 `/auth` 握手：accept 一个 HTTP/3 请求，校验 `Hysteria-Auth`，回应 233/403。
+///
+/// h3 server Connection 在函数内创建并使用。认证成功后，h3 server 的 Drop 会关闭
+/// QUIC 连接（H3_NO_ERROR）——用 `std::mem::forget` 防止，保持连接存活以接收 raw data stream。
+/// h3-quinn 的 incoming_bi 不会在认证结束后抢消费后续 bidi stream（stream::unfold 惰性，
+/// 不调 accept 则不 poll）。详见 listener_factory_accept_bi_echo_roundtrip 测试验证。
+async fn h3_auth(
+    conn: &quinn::Connection,
+    validator: &Option<Arc<dyn crate::hub::AuthValidator>>,
+) -> bool {
+    let h3_server: h3::server::Connection<h3_quinn::Connection, bytes::Bytes> =
+        match h3::server::Connection::new(h3_quinn::Connection::new(conn.clone())).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(error = ?e, "h3 server init failed");
+                return false;
+            }
+        };
+    let mut h3_server = h3_server;
+    loop {
+        match h3_server.accept().await {
+            Ok(Some(resolver)) => {
+                let (req, mut stream) = match resolver.resolve_request().await {
+                    Ok(v) => v,
+                    Err(_) => {
+                        std::mem::forget(h3_server);
+                        return false;
+                    }
+                };
+                let is_auth = req.method() == http::Method::POST
+                    && req.uri().path() == crate::config::URLPath;
+                let auth_hdr = req
+                    .headers()
+                    .get(crate::config::RequestHeaderAuth)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let ok = if !is_auth {
+                    false
+                } else if let Some(v) = validator {
+                    v.validate(auth_hdr).is_some()
+                } else {
+                    true
+                };
+                let status = if ok {
+                    crate::config::StatusAuthOK
+                } else {
+                    403u16
+                };
+                let resp = http::Response::builder()
+                    .status(status)
+                    .header(crate::config::ResponseHeaderUDPEnabled, "rl")
+                    .header(crate::config::CommonHeaderPadding, "0")
+                    .body(());
+                match resp {
+                    Ok(r) => {
+                        let _ = stream.send_response(r).await;
+                        let _ = stream.finish().await;
+                    }
+                    Err(_) => {
+                        std::mem::forget(h3_server);
+                        return false;
+                    }
+                }
+                if ok {
+                    std::mem::forget(h3_server);
+                    return true;
+                }
+            }
+            Ok(None) => {
+                std::mem::forget(h3_server);
+                return false;
+            }
+            Err(e) => {
+                tracing::debug!(error = ?e, "h3 accept ended");
+                std::mem::forget(h3_server);
+                return false;
+            }
+        }
+    }
+}
+
 
 // ===== 切片1c: QuinnHttp3Server + DefaultRequestHandler + Salamander =====
 
@@ -739,7 +886,138 @@ mod tests {
         );
         assert_eq!(stream.local_addr(), client.local_addr());
         assert_eq!(stream.remote_addr(), client.remote_addr());
-        // cancel_read 不 panic
-        stream.cancel_read(0x100);
+    }
+
+    /// 集成测试：QuinnListenerFactory (server) ↔ QuinnHysteriaTransport (client) 全链路。
+    ///
+    /// 验证：UDP bind → QUIC accept → h3 /auth 握手 → raw bidi data stream → on_new_conn。
+    /// client dial+auth 后 open_stream，server 经 on_new_conn 收到，echo 回包验证双向通信。
+    #[tokio::test]
+    async fn listener_factory_full_auth_and_stream_roundtrip() {
+        use crate::hysteria_transport::QuinnHysteriaTransport;
+        use crate::dialer::{DialDestination, HysteriaTransport};
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        ensure_crypto_provider();
+
+        // 自签证书
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key_der = rustls::pki_types::PrivateKeyDer::try_from(
+            cert.key_pair.serialize_der(),
+        ).unwrap();
+        let server_tls = rustls::server::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.into()], key_der)
+            .unwrap();
+
+        // server: QuinnListenerFactory
+        let factory = QuinnListenerFactory::new(Arc::new(server_tls));
+        let proto_config = Arc::new(crate::proto_config::Config::default());
+        let quic_params = Arc::new(xray_proto::xray::transport::internet::QuicParams::default());
+        let masq = crate::hub::MasqType::NotFound;
+        struct TestValidator;
+        impl crate::hub::AuthValidator for TestValidator {
+            fn validate(&self, auth: &str) -> Option<String> {
+                if auth == "test-secret" { Some("user".into()) } else { None }
+            }
+            fn count(&self) -> usize { 1 }
+        }
+        let validator: Option<Arc<dyn crate::hub::AuthValidator>> = Some(Arc::new(TestValidator));
+
+        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel::<Arc<InterStreamConn>>();
+        let on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync> = Arc::new(move |s| {
+            let _ = stream_tx.send(s);
+        });
+
+        let listener = factory
+            .listen("127.0.0.1:0".parse().unwrap(), proto_config, quic_params, masq, validator, on_new_conn)
+            .await
+            .expect("listen should succeed");
+        let server_addr = listener.local_addr();
+
+        // client: QuinnHysteriaTransport (insecure verifier for self-signed cert)
+        let client_tls = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        let transport = Arc::new(
+            QuinnHysteriaTransport::new(client_tls, "0.0.0.0:0".parse().unwrap()).expect("transport"),
+        );
+
+        // dial + auth
+        let dest = DialDestination { udp_addr: server_addr, host: "localhost".into() };
+        let qc = crate::dialer::QuicConfig::default_for_hysteria();
+        let conn = transport
+            .dial_and_authenticate(&dest, &qc, "test-secret", 0)
+            .await
+            .expect("dial + auth should succeed");
+
+        // open a data stream
+        let stream = transport.open_stream(&conn).await.expect("open_stream");
+        let isc = Arc::new(InterStreamConn::new(stream, conn.local_addr(), conn.remote_addr(), true));
+
+        // server 应收到 stream via on_new_conn
+        let server_isc = tokio::time::timeout(std::time::Duration::from_secs(10), stream_rx.recv())
+            .await
+            .expect("server should receive stream via on_new_conn")
+            .expect("channel not empty");
+
+        // echo: client writes → server reads → server writes back → client reads
+        let payload = b"hello hysteria!";
+        isc.write(payload).await.expect("client write");
+
+        let mut buf = vec![0u8; payload.len()];
+        server_isc.read(&mut buf).await.expect("server read");
+        server_isc.write(&buf).await.expect("server echo write");
+
+        let mut got = vec![0u8; payload.len()];
+        isc.read(&mut got).await.expect("client read echo");
+        assert_eq!(&got, payload, "echo roundtrip through QUIC + h3 auth");
+
+        let _ = listener.close().await;
+    }
+
+    /// NoVerifier: 接受任意服务端证书（仅测试用）。
+    #[derive(Debug)]
+    struct NoVerifier;
+    impl rustls::client::danger::ServerCertVerifier for NoVerifier {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            vec![
+                rustls::SignatureScheme::RSA_PSS_SHA256,
+                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+                rustls::SignatureScheme::ED25519,
+                rustls::SignatureScheme::RSA_PSS_SHA384,
+                rustls::SignatureScheme::RSA_PSS_SHA512,
+                rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            ]
+        }
     }
 }

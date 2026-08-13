@@ -192,7 +192,7 @@ impl WgDriver {
     /// 合并为单循环避免多任务争抢 Mutex：
     /// - select! 上 UDP recv（80% 时间等待）
     /// - 每 100ms 触发 timer + drain_tx
-    async fn main_loop(&self) {
+    pub async fn main_loop(&self) {
         let mut timer = interval(TIMER_INTERVAL);
         let mut recv_buf = vec![0u8; UDP_RECV_BUF_SIZE];
         let multi = self.peers.len() > 1;

@@ -43,7 +43,7 @@ use xray_proxy_loopback::LoopbackHandler;
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
 use xray_proxy_tun::{TunInboundHandler, StackOptions, Tun};
 use xray_proxy_wireguard::DeviceConfig;
-use xray_transport_hysteria::hub::StubListenerFactory;
+use xray_transport_hysteria::quinn_adapter::QuinnListenerFactory;
 use xray_features::inbound::InboundHandler;
 use tokio::net::UdpSocket;
 use xray_proxy_blackhole::{BlackholeInboundHandler, ResponseConfig as BlackholeResponseConfig};
@@ -667,8 +667,11 @@ async fn spawn_one_inbound(
         // wireguard inbound：WireguardInboundHandler impl InboundHandler
         "wireguard" => {
             let (config, listen_port) = parse_wireguard_inbound_config(&ib.entry.data)?;
+            let dispatch = ohm.get_default_handler().ok_or_else(|| {
+                std::io::Error::other("wireguard inbound requires a default outbound handler")
+            })?;
             let handler = xray_proxy_wireguard::WireguardInboundHandler::new(
-                &ib.tag, &config, listen_port,
+                &ib.tag, &config, listen_port, dispatch,
             )
             .await
             .map_err(|e| std::io::Error::other(format!("wireguard inbound: {e}")))?;
@@ -986,10 +989,54 @@ fn parse_hysteria_inbound_config(
     let server_name = v.get("server_name").and_then(|x| x.as_str()).unwrap_or("hysteria").to_string();
     let config = xray_proxy_hysteria::HysteriaConfig::new(bind_addr.to_string(), auth)
         .with_server_name(server_name);
-    // ponytail: 真实 QUIC listener factory 需要 quinn server adapter
-    // 当前用 StubListenerFactory，quinn server adapter 待后续切片实现
-    let factory: Arc<dyn xray_transport_hysteria::hub::HysteriaListenerFactory> = Arc::new(StubListenerFactory);
+    // 真实 quinn server adapter：自签证书（或配置 cert/key PEM），ALPN h3 由 listen() 设置
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let server_config = build_hysteria_tls_server_config(&v)?;
+    let factory: Arc<dyn xray_transport_hysteria::hub::HysteriaListenerFactory> =
+        Arc::new(QuinnListenerFactory::new(Arc::new(server_config)));
     Ok((config, factory))
+}
+
+/// 构造 hysteria QUIC server 用的 rustls `ServerConfig`。
+///
+/// JSON 可选 `cert`/`key`（PEM）；缺省时用自签证书（测试场景）。ALPN h3 由
+/// [`QuinnListenerFactory::listen`] 设置，这里不重复。
+fn build_hysteria_tls_server_config(
+    v: &serde_json::Value,
+) -> std::io::Result<rustls::ServerConfig> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let (cert_der, key_der) = if let (Some(cert_str), Some(key_str)) = (
+        v.get("cert").and_then(|x| x.as_str()),
+        v.get("key").and_then(|x| x.as_str()),
+    ) {
+        let mut cert_reader = std::io::BufReader::new(cert_str.as_bytes());
+        let cert_pem = rustls_pemfile::certs(&mut cert_reader)
+            .into_iter().next()
+            .ok_or_else(|| std::io::Error::other("no cert in PEM"))?
+            .map_err(|e| std::io::Error::other(format!("parse cert PEM: {e}")))?;
+        let mut key_reader = std::io::BufReader::new(key_str.as_bytes());
+        let key_pem = rustls_pemfile::private_key(&mut key_reader)
+            .map_err(|e| std::io::Error::other(format!("parse key PEM: {e}")))?
+            .ok_or_else(|| std::io::Error::other("no key in PEM"))?;
+        (cert_pem, key_pem)
+    } else {
+        // ponytail: 无证书配置时用自签证书（仅测试场景，client 用 NoVerifier）
+        let key_pair = rcgen::KeyPair::generate()
+            .map_err(|e| std::io::Error::other(format!("rcgen keypair: {e}")))?;
+        let params = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .map_err(|e| std::io::Error::other(format!("rcgen params: {e}")))?;
+        let cert = params.self_signed(&key_pair)
+            .map_err(|e| std::io::Error::other(format!("rcgen self_signed: {e}")))?;
+        (
+            CertificateDer::from(cert.der().clone()),
+            PrivateKeyDer::try_from(key_pair.serialize_der())
+                .map_err(|e| std::io::Error::other(format!("rcgen key der: {e}")))?,
+        )
+    };
+    Ok(rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der.into()], key_der)
+        .map_err(|e| std::io::Error::other(format!("rustls server config: {e}")))?)
 }
 
 /// 从 inbound entry.data（JSON）解析 anytls TLS acceptor。

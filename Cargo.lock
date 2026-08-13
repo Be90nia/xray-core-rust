@@ -6309,6 +6309,7 @@ dependencies = [
  "tokio",
  "tracing",
  "xray-app-dispatcher",
+ "xray-buf",
  "xray-common",
  "xray-features",
  "xray-proto",
