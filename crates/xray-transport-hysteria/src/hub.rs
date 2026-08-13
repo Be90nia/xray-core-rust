@@ -132,6 +132,36 @@ impl MasqueradeHandler for StringMasqHandler {
     }
 }
 
+/// Proxy masquerade 实现（对应 Go `"proxy"` 分支的兜底行为）。
+///
+/// Go 的 proxy masquerade 反向代理到 `MasqUrl`；当目标不可达时回退 503。
+/// 本实现采用 ponytail 策略：直接返回 HTTP 503（Service Unavailable），
+/// 覆盖任务需求"Proxy: 返回 HTTP 503"。完整反向代理（含 rewrite_host/insecure）
+/// 在接入 hyper 反向代理后扩展。
+#[derive(Debug, Clone, Default)]
+pub struct ProxyMasqHandler;
+
+impl MasqueradeHandler for ProxyMasqHandler {
+    fn serve(
+        &self,
+        _method: &str,
+        _path: &str,
+        _headers: &HashMap<String, String>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = (u16, HashMap<String, String>, Vec<u8>)> + Send,
+        >,
+    > {
+        Box::pin(async {
+            (
+                503,
+                HashMap::from([("Content-Type".to_string(), "text/plain; charset=utf-8".to_string())]),
+                b"Service Unavailable".to_vec(),
+            )
+        })
+    }
+}
+
 /// Hysteria auth 请求信息（对应 Go `httpHandler.AuthHTTP` 输入）。
 #[derive(Debug, Clone)]
 pub struct AuthRequest {
@@ -438,6 +468,15 @@ mod tests {
         assert_eq!(status, 418);
         assert_eq!(headers.get("X-Test"), Some(&"yes".to_string()));
         assert_eq!(body, b"custom body");
+    }
+
+    #[tokio::test]
+    async fn proxy_masq_handler_returns_503() {
+        let h = ProxyMasqHandler;
+        let (status, headers, body) = h.serve("GET", "/proxy", &HashMap::new()).await;
+        assert_eq!(status, 503);
+        assert_eq!(body, b"Service Unavailable");
+        assert_eq!(headers.get("Content-Type"), Some(&"text/plain; charset=utf-8".to_string()));
     }
 
     #[test]
