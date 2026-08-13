@@ -231,150 +231,53 @@ impl QuicConn for QuinnQuicConn {
     }
 }
 
-// ===== 切片1b: QuinnHysteriaTransport — QUIC dial + h3 auth 握手 =====
+// ===== quinn TransportConfig 构建（拥塞控制 + QUIC 参数；client dialer + server listener 共用） =====
 
 use std::time::Duration;
 use crate::config;
-use crate::dialer::{DialDestination, HysteriaTransport, QuicConfig};
+use crate::dialer::QuicConfig;
 
-/// quinn + h3 实现的 [`HysteriaTransport`]。
+/// 将 [`QuicConfig`] 转为 quinn [`quinn::TransportConfig`]。
 ///
-/// 持有 rustls ClientConfig，用于建立 QUIC 连接 + HTTP/3 auth 握手。
-/// 创建后注入 [`crate::dialer::HysteriaClient`] 即可激活数据拨号。
-pub struct QuinnHysteriaTransport {
-    rustls_config: Arc<rustls::ClientConfig>,
-}
-
-impl QuinnHysteriaTransport {
-    #[must_use]
-    pub fn new(rustls_config: Arc<rustls::ClientConfig>) -> Self {
-        Self { rustls_config }
+/// 拥塞控制（对应 Go `quic.Config.CongestionControl`）：`congestion == "bbr"` →
+/// quinn-proto BBR；其他（`""`、`"cubic"`、`"new_reno"`）→ 默认 CUBIC。
+/// hysteria 协议默认 BBR（见 `QuicConfig::default_for_hysteria`）。
+pub(crate) fn build_hysteria_transport_config(qc: &QuicConfig) -> quinn::TransportConfig {
+    let mut t = quinn::TransportConfig::default();
+    if qc.max_idle_timeout_ms > 0 {
+        if let Ok(v) = quinn::VarInt::try_from(qc.max_idle_timeout_ms) {
+            t.max_idle_timeout(Some(quinn::IdleTimeout::from(v)));
+        }
     }
-
-    /// 将 [`QuicConfig`] 转为 quinn [`quinn::TransportConfig`]。
-    ///
-    /// 拥塞控制（对应 Go `quic.Config.CongestionControl`）：`congestion == "bbr"` →
-    /// quinn-proto BBR；其他（`""`、`"cubic"`、`"new_reno"`）→ 默认 CUBIC。
-    /// hysteria 协议默认 BBR（见 `QuicConfig::default_for_hysteria`）。
-    fn build_transport_config(qc: &QuicConfig) -> quinn::TransportConfig {
-        let mut t = quinn::TransportConfig::default();
-        if qc.max_idle_timeout_ms > 0 {
-            if let Ok(v) = quinn::VarInt::try_from(qc.max_idle_timeout_ms) {
-                t.max_idle_timeout(Some(quinn::IdleTimeout::from(v)));
-            }
-        }
-        if qc.keep_alive_period_ms > 0 {
-            t.keep_alive_interval(Some(Duration::from_millis(qc.keep_alive_period_ms)));
-        }
-        if qc.enable_datagrams {
-            t.datagram_receive_buffer_size(Some(8192));
-        }
-        if qc.max_incoming_streams >= 0 {
-            t.max_concurrent_bidi_streams(quinn::VarInt::try_from(qc.max_incoming_streams as u64).unwrap_or(quinn::VarInt::MAX));
-        }
-        // 拥塞控制选择
-        match qc.congestion.to_ascii_lowercase().as_str() {
-            "bbr" => {
-                t.congestion_controller_factory(std::sync::Arc::new(
-                    quinn_proto::congestion::BbrConfig::default(),
-                ));
-            }
-            "cubic" | "" | "new_reno" => {
-                t.congestion_controller_factory(std::sync::Arc::new(
-                    quinn_proto::congestion::CubicConfig::default(),
-                ));
-            }
-            _ => {
-                // 未知类型回退默认（CUBIC），与 Go quic-go 未知回退一致。
-                t.congestion_controller_factory(std::sync::Arc::new(
-                    quinn_proto::congestion::CubicConfig::default(),
-                ));
-            }
-        }
-        t
+    if qc.keep_alive_period_ms > 0 {
+        t.keep_alive_interval(Some(Duration::from_millis(qc.keep_alive_period_ms)));
     }
-}
-
-impl HysteriaTransport for QuinnHysteriaTransport {
-    fn dial_and_authenticate(
-        &self,
-        dest: &DialDestination,
-        quic_config: &QuicConfig,
-        auth_token: &str,
-        brutal_up_bps: u64,
-    ) -> Pin<Box<dyn std::future::Future<Output = io::Result<Arc<dyn QuicConn>>> + Send>> {
-        let rustls_config = self.rustls_config.clone();
-        let dest = dest.clone();
-        let quic_config = quic_config.clone();
-        let auth_token = auth_token.to_string();
-
-        Box::pin(async move {
-            // 1. quinn ClientConfig
-            let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from((*rustls_config).clone())
-                .map_err(|e| io::Error::other(format!("rustls→quic: {e}")))?;
-            let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client));
-            client_config.transport_config(Arc::new(Self::build_transport_config(&quic_config)));
-
-            // 2. bind + connect
-            let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
-                .map_err(|e| io::Error::other(format!("bind: {e}")))?;
-            let conn = endpoint.connect_with(client_config, dest.udp_addr, &dest.host)
-                .map_err(|e| io::Error::other(format!("quinn connect: {e}")))?
-                .await
-                .map_err(|e| io::Error::other(format!("quinn handshake: {e}")))?;
-
-            // 3. h3 POST /auth
-            let (mut h3_conn, mut send_req) = h3::client::new(h3_quinn::Connection::new(conn.clone())).await
-                .map_err(|e| io::Error::other(format!("h3 connect: {e}")))?;
-
-            let req = http::Request::builder()
-                .method("POST")
-                .uri(config::URLPath)
-                .header("Host", config::URLHost)
-                .header(config::RequestHeaderAuth, &auth_token)
-                .header(config::CommonHeaderCCRX, brutal_up_bps.to_string())
-                .header(config::CommonHeaderPadding, "0")
-                .body(())
-                .map_err(|e| io::Error::other(format!("build req: {e}")))?;
-
-            let mut req_stream = send_req.send_request(req).await
-                .map_err(|e| io::Error::other(format!("h3 send_request: {e}")))?;
-            let _ = req_stream.finish().await;
-            let resp = req_stream.recv_response().await
-                .map_err(|e| io::Error::other(format!("h3 recv_response: {e}")))?;
-
-            if resp.status().as_u16() != config::StatusAuthOK {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("hysteria auth failed: HTTP {}", resp.status()),
-                ));
-            }
-
-            drop(h3_conn);
-
-            // 4. 返回已认证的 QUIC 连接
-            let result: Arc<dyn QuicConn> = Arc::new(QuinnQuicConn::new(conn));
-            Ok(result)
-        })
+    if qc.enable_datagrams {
+        t.datagram_receive_buffer_size(Some(8192));
     }
-
-    fn open_stream(
-        &self,
-        conn: &Arc<dyn QuicConn>,
-    ) -> Pin<Box<dyn std::future::Future<Output = io::Result<Arc<dyn QuicStream>>> + Send>> {
-        let conn = conn.clone();
-        Box::pin(async move {
-            let quinn_conn = conn.as_quinn_connection()
-                .ok_or_else(|| io::Error::other("not a quinn connection"))?;
-            let (send, recv) = quinn_conn.open_bi().await
-                .map_err(|e| io::Error::other(format!("quinn open_bi: {e}")))?;
-            let result: Arc<dyn QuicStream> = Arc::new(QuinnQuicStream::new(
-                send, recv,
-                conn.local_addr(), conn.remote_addr(),
+    if qc.max_incoming_streams >= 0 {
+        t.max_concurrent_bidi_streams(quinn::VarInt::try_from(qc.max_incoming_streams as u64).unwrap_or(quinn::VarInt::MAX));
+    }
+    // 拥塞控制选择
+    match qc.congestion.to_ascii_lowercase().as_str() {
+        "bbr" => {
+            t.congestion_controller_factory(std::sync::Arc::new(
+                quinn_proto::congestion::BbrConfig::default(),
             ));
-            Ok(result)
-        })
+        }
+        "cubic" | "" | "new_reno" => {
+            t.congestion_controller_factory(std::sync::Arc::new(
+                quinn_proto::congestion::CubicConfig::default(),
+            ));
+        }
+        _ => {
+            // 未知类型回退默认（CUBIC），与 Go quic-go 未知回退一致。
+            t.congestion_controller_factory(std::sync::Arc::new(
+                quinn_proto::congestion::CubicConfig::default(),
+            ));
+        }
     }
+    t
 }
 
 // ===== 切片1b (续): QuinnQuicListener + QuinnListenerFactory =====
@@ -459,7 +362,7 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
                 .map_err(|e| crate::error::HysteriaError::Io(io::Error::other(format!("rustls→quic server: {e}"))))?;
             let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
             let qc = QuicConfig::from_params(&quic_params);
-            server_config.transport_config(Arc::new(QuinnHysteriaTransport::build_transport_config(&qc)));
+            server_config.transport_config(Arc::new(build_hysteria_transport_config(&qc)));
             let endpoint = quinn::Endpoint::server(server_config, bind_addr)
                 .map_err(|e| crate::error::HysteriaError::Io(io::Error::other(format!("bind: {e}"))))?;
 
@@ -1006,20 +909,25 @@ mod tests {
 
         // open a data stream
         let stream = transport.open_stream(&conn).await.expect("open_stream");
-        let isc = Arc::new(InterStreamConn::new(stream, conn.local_addr(), conn.remote_addr(), true));
+        // client=false：纯 echo 验证 QUIC stream 双向通（FrameTypeTCPRequest 前缀由 conn.rs 单测覆盖）
+        let isc = Arc::new(InterStreamConn::new(stream, conn.local_addr(), conn.remote_addr(), false));
 
-        // server 应收到 stream via on_new_conn
+        // quinn 0.11 的 open_bi 是 lazy 的——STREAM frame 延迟到首次 write 才发出。
+        // 故 client 必须先 write 再等 on_new_conn，否则 server accept_bi 永不返回。
+        // 真实 hysteria client 同样在 open 后立即写 FrameTypeTCPRequest+dest。
+        let payload = b"hello hysteria!";
+        isc.write(payload).await.expect("client write");
+
+        // server 经 accept_bi 收到 stream → on_new_conn
         let server_isc = tokio::time::timeout(std::time::Duration::from_secs(10), stream_rx.recv())
             .await
             .expect("server should receive stream via on_new_conn")
             .expect("channel not empty");
 
-        // echo: client writes → server reads → server writes back → client reads
-        let payload = b"hello hysteria!";
-        isc.write(payload).await.expect("client write");
-
+        // echo: server reads → server writes back → client reads
         let mut buf = vec![0u8; payload.len()];
         server_isc.read(&mut buf).await.expect("server read");
+        assert_eq!(&buf, payload, "server received client payload");
         server_isc.write(&buf).await.expect("server echo write");
 
         let mut got = vec![0u8; payload.len()];
