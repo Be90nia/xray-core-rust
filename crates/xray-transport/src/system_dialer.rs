@@ -119,9 +119,27 @@ impl SystemDialer for DefaultSystemDialer {
         sockopt: &'a SocketOptions,
     ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Connection>>> + Send + 'a>> {
         Box::pin(async move {
-            // ponytail: 切片1 仅处理 IP 地址（Domain 解析留切片2 的 LookupForIP）。
-            // 调用方应在调用前把 Domain 解析为 IP。
-            let dest_addr = destination_to_socket_addr(destination)?;
+            // 域名解析：Domain → IP（tokio lookup_host，使用系统 DNS）
+            let dest_addr = match destination_to_socket_addr(destination) {
+                Ok(addr) => addr,
+                Err(_) => {
+                    // Domain 地址：tokio DNS 解析
+                    let port = destination.port().value();
+                    let host = match destination.address() {
+                        xray_common::net::address::Address::Domain(d) => d.as_str(),
+                        other => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("unsupported address type for dial: {other:?}"),
+                            ));
+                        }
+                    };
+                    let mut socket_addrs = tokio::net::lookup_host((host, port)).await?;
+                    socket_addrs.next().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, format!("DNS resolve failed: {host}"))
+                    })?
+                }
+            };
             let stream = Self::dial_tcp_raw(src, dest_addr, DEFAULT_DIAL_TIMEOUT).await?;
             // 应用 sockopt（TCP_NODELAY + SO_KEEPALIVE）。
             let std_stream = stream.into_std()?;
@@ -291,17 +309,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_dialer_rejects_domain_address() {
-        let dest = Destination::tcp(Address::new_domain("example.com"), Port::new(80));
+    async fn default_dialer_resolves_domain_address() {
+        // 域名不再被拒绝——dialer 会尝试 tokio DNS 解析。
+        // 在无网环境中解析可能失败（NotFound），但不应该是 InvalidInput "domain not supported"。
+        let dest = Destination::tcp(Address::new_domain("nonexistent.invalid"), Port::new(80));
         let sockopt = SocketOptions::default();
         let dialer = DefaultSystemDialer::new();
         let result = dialer.dial(None, &dest, &sockopt).await;
         match result {
             Err(err) => {
-                assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-                assert!(err.to_string().contains("domain"));
+                // .invalid 域名 DNS 解析必失败，但错误不应是 InvalidInput（domain rejected）
+                assert_ne!(err.kind(), io::ErrorKind::InvalidInput, "domain should not be rejected");
             }
-            other => { let _ = other; panic!("expected err"); }
+            Ok(conn) => { drop(conn); }
         }
     }
 
