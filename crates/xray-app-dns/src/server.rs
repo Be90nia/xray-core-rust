@@ -56,6 +56,14 @@ pub struct DnsServiceConfig {
     pub disable_fallback_if_match: bool,
     /// 启用并行查询。
     pub enable_parallel_query: bool,
+    /// 禁用 DNS 缓存。对应 Go `disableCache`。
+    pub disable_cache: bool,
+    /// 缓存过期后继续提供过期数据。对应 Go `serveStale`。
+    pub serve_stale: bool,
+    /// 过期数据的 TTL（秒）。对应 Go `serveExpiredTTL`。
+    pub serve_expired_ttl: u32,
+    /// 使用系统 hosts 文件。对应 Go `useSystemHosts`。
+    pub use_system_hosts: bool,
 }
 
 /// 顶层 DNS 服务。对应 Go `DNS` struct。
@@ -396,6 +404,10 @@ mod tests {
             disable_fallback: false,
             disable_fallback_if_match: false,
             enable_parallel_query: false,
+            disable_cache: false,
+            serve_stale: false,
+            serve_expired_ttl: 0,
+            use_system_hosts: false,
         })
     }
 

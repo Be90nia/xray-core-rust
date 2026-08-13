@@ -299,6 +299,8 @@ impl ProtocolSniffer for TlsSniffer {
 }
 
 /// 从 TLS ClientHello 中提取 SNI 域名
+///
+/// `payload` 须包含完整 TLS record layer（content_type + version + length）。
 fn parse_tls_client_hello(payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffError> {
     // TLS record layer: content_type(1) + version(2) + length(2)
     if payload.len() < 5 {
@@ -318,19 +320,29 @@ fn parse_tls_client_hello(payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>
         return Err(SniffError::NeedMoreData);
     };
 
+    parse_client_hello_from_handshake(record_body)
+}
+
+/// 从 TLS handshake 消息（type(1) + length(3) + body，**不含** record layer）解析 ClientHello SNI。
+///
+/// TLS-over-TCP 的 record layer 由 [`parse_tls_client_hello`] 剥离；
+/// QUIC 的 CRYPTO 帧直接承载 handshake 消息（无 record layer），故 QUIC 嗅探器直接调用本函数。
+fn parse_client_hello_from_handshake(
+    handshake: &[u8],
+) -> Result<Option<Box<dyn SniffResult>>, SniffError> {
     // Handshake: type(1) + length(3) + body
-    if record_body.len() < 4 {
+    if handshake.len() < 4 {
         return Ok(None);
     }
-    if record_body[0] != 0x01 {
+    if handshake[0] != 0x01 {
         return Ok(None);
     }
 
-    let handshake_len = (u32::from(record_body[1]) << 16
-        | u32::from(record_body[2]) << 8
-        | u32::from(record_body[3])) as usize;
-    let hello_body = if record_body.len() >= 4 + handshake_len {
-        &record_body[4..4 + handshake_len]
+    let handshake_len = (u32::from(handshake[1]) << 16
+        | u32::from(handshake[2]) << 8
+        | u32::from(handshake[3])) as usize;
+    let hello_body = if handshake.len() >= 4 + handshake_len {
+        &handshake[4..4 + handshake_len]
     } else {
         return Err(SniffError::NeedMoreData);
     };
@@ -507,6 +519,14 @@ fn read_quic_varint(buf: &[u8]) -> Option<(u64, usize)> {
     Some((val, len))
 }
 
+/// HKDF-Expand 输出长度标记（实现 ring::hkdf::KeyType，支持 16/12/32 等任意长度）
+struct HkdfLen(usize);
+
+impl ring::hkdf::KeyType for HkdfLen {
+    fn len(&self) -> usize {
+        self.0
+    }
+}
 /// HKDF-Expand-Label (RFC 8446 Section 7.1)
 ///
 /// 从 secret 字节派生指定长度的密钥材料。
@@ -530,7 +550,7 @@ fn hkdf_expand_label(
     let info_slices: &[&[u8]] = &[&info_buf];
     // 从 secret 字节构造 Prk
     let prk = ring::hkdf::Prk::new_less_safe(ring::hkdf::HKDF_SHA256, secret);
-    prk.expand(info_slices, ring::hkdf::HKDF_SHA256)
+    prk.expand(info_slices, HkdfLen(out.len()))
         .map_err(|_| SniffError::UnknownContent)?
         .fill(out)
         .map_err(|_| SniffError::UnknownContent)
@@ -619,17 +639,11 @@ fn sniff_quic(mut payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffE
             QUIC_SALT_DRAFT29
         };
 
-        // HKDF-Extract: initial_secret = HKDF-Extract(salt, dest_conn_id)
-        let initial_secret = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, salt)
-            .extract(dest_conn_id);
-
-        // 提取 initial_secret 字节用于 HKDF-Expand-Label
+        // HKDF-Extract: initial_secret = HMAC-SHA256(salt, dest_conn_id)
+        // (RFC 9001 §5.2；ring 不暴露 PRK 原始字节，故用 hmac 手算 extract 得到原始 32 字节 PRK)
+        let salt_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, salt);
         let mut initial_secret_bytes = [0u8; 32];
-        initial_secret
-            .expand(&[], ring::hkdf::HKDF_SHA256)
-            .map_err(|_| SniffError::UnknownContent)?
-            .fill(&mut initial_secret_bytes)
-            .map_err(|_| SniffError::UnknownContent)?;
+        initial_secret_bytes.copy_from_slice(ring::hmac::sign(&salt_key, dest_conn_id).as_ref());
 
         // client_in secret
         let mut client_in_secret = [0u8; 32];
@@ -661,7 +675,7 @@ fn sniff_quic(mut payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffE
         // 第一个字节低 4 位
         packet_buf[0] ^= mask[0] & 0x0f;
         // packet number 字节（1-4 字节）
-        let pn_length = (packet_buf[0] & 0x03 + 1) as usize;
+        let pn_length = ((packet_buf[0] & 0x03) + 1) as usize;
         for i in 0..pn_length {
             if hdr_len + i < packet_buf.len() {
                 packet_buf[hdr_len + i] ^= mask[i + 1];
@@ -682,10 +696,10 @@ fn sniff_quic(mut payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffE
         // 构造 nonce：IV XOR packet_number
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes.copy_from_slice(&iv_bytes);
-        // packet number 在 hdr_len..hdr_len+pn_length，小端写入 nonce 末尾
+        // packet number 在 hdr_len..hdr_len+pn_length，大端序写入 nonce 末尾（RFC 9001 §5.3）
         let pn_start = hdr_len;
         for i in 0..pn_length {
-            nonce_bytes[12 - pn_length + i] ^= packet_buf[pn_start + pn_length - 1 - i];
+            nonce_bytes[12 - pn_length + i] ^= packet_buf[pn_start + i];
         }
         let nonce = ring::aead::Nonce::assume_unique_for_key(nonce_bytes);
 
@@ -712,13 +726,8 @@ fn sniff_quic(mut payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffE
             let frame_type = decrypted[frame_offset];
             frame_offset += 1;
 
-            // 跳过 PADDING (0x00)
-            while frame_type == 0x00 && frame_offset < decrypted.len() {
-                frame_offset += 1;
-                continue;
-            }
-
             match frame_type {
+                0x00 => continue, // PADDING: 单字节帧，已通过上面的 frame_offset += 1 消耗
                 0x01 => {} // PING
                 0x02 | 0x03 => {
                     // ACK frame
@@ -784,7 +793,7 @@ fn sniff_quic(mut payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffE
 
         // 尝试从 crypto_data 解析 TLS ClientHello
         if !crypto_data.is_empty() {
-            if let Ok(Some(result)) = parse_tls_client_hello(&crypto_data) {
+            if let Ok(Some(result)) = parse_client_hello_from_handshake(&crypto_data) {
                 return Ok(Some(Box::new(ProtoSniffResult {
                     protocol: "quic",
                     domain: result.domain().to_string(),
@@ -1347,5 +1356,122 @@ mod tests {
         // Short header (bit 7=0) 不是 QUIC Long Header
         let result = QuicSniffer.sniff(&[0x40, 0x01, 0x00, 0x00, 0x01]).expect("ok");
         assert!(result.is_none());
+    }
+    /// 编码 QUIC varint（与 read_quic_varint 对称，仅用于测试构造数据包）
+    fn encode_quic_varint(v: u64) -> Vec<u8> {
+        if v < 64 {
+            vec![v as u8]
+        } else if v < 16384 {
+            let mut b = (v as u16).to_be_bytes();
+            b[0] |= 0x40;
+            b.to_vec()
+        } else if v < 1_073_741_824 {
+            let mut b = (v as u32).to_be_bytes();
+            b[0] |= 0x80;
+            b.to_vec()
+        } else {
+            let mut b = v.to_be_bytes();
+            b[0] |= 0xC0;
+            b.to_vec()
+        }
+    }
+
+    /// 构造一个真实可解密的 QUIC v1 Initial 包（含给定 SNI 的 ClientHello）。
+    ///
+    /// 完整复刻 RFC 9001 §5 的 Initial 密钥派生 + AES-128-GCM 加密 + header protection，
+    /// 用于验证 `sniff_quic` 的解密、帧解析与 ClientHello 提取是否与标准客户端互通。
+    fn build_quic_initial_packet(sni: &[u8]) -> Vec<u8> {
+        use ring::aead;
+        use ring::hmac;
+
+        let dcid: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+        let scid: [u8; 4] = [0xA, 0xB, 0xC, 0xD];
+        let pn: u32 = 2; // packet number
+        let pn_length: usize = 4;
+
+        // 1. 初始密钥派生（与 sniff_quic 内部对称：PRK = HMAC-SHA256(salt, dcid)）
+        let salt_key = hmac::Key::new(hmac::HMAC_SHA256, QUIC_SALT_V1);
+        let prk = hmac::sign(&salt_key, &dcid);
+        let mut client_in = [0u8; 32];
+        hkdf_expand_label(prk.as_ref(), b"client in", &[], &mut client_in).unwrap();
+        let mut key_bytes = [0u8; 16];
+        hkdf_expand_label(&client_in, b"quic key", &[], &mut key_bytes).unwrap();
+        let mut iv_bytes = [0u8; 12];
+        hkdf_expand_label(&client_in, b"quic iv", &[], &mut iv_bytes).unwrap();
+        let mut hp_bytes = [0u8; 16];
+        hkdf_expand_label(&client_in, b"quic hp", &[], &mut hp_bytes).unwrap();
+
+        // 2. ClientHello -> CRYPTO 帧 -> 明文（末尾补 PADDING 至 128 字节）
+        let crypto = build_minimal_client_hello(sni);
+        let mut crypto_frame = vec![0x06]; // CRYPTO
+        crypto_frame.extend_from_slice(&encode_quic_varint(0)); // offset = 0
+        crypto_frame.extend_from_slice(&encode_quic_varint(crypto.len() as u64));
+        crypto_frame.extend_from_slice(&crypto);
+        let mut plaintext = crypto_frame;
+        while plaintext.len() < 128 {
+            plaintext.push(0x00); // PADDING
+        }
+
+        // 3. 构造未加掩 header（含 packet number）
+        let ciphertext_len = plaintext.len() + 16; // + AEAD tag
+        let length_val = (pn_length + ciphertext_len) as u64;
+        let mut header = Vec::new();
+        header.push(0xC0 | ((pn_length - 1) as u8 & 0x03)); // Long | Initial | (pn_len-1)
+        header.extend_from_slice(&QUIC_VERSION_V1.to_be_bytes());
+        header.push(dcid.len() as u8);
+        header.extend_from_slice(&dcid);
+        header.push(scid.len() as u8);
+        header.extend_from_slice(&scid);
+        header.extend_from_slice(&encode_quic_varint(0)); // token length = 0
+        header.extend_from_slice(&encode_quic_varint(length_val));
+        header.extend_from_slice(&pn.to_be_bytes()); // packet number (big-endian)
+        let hdr_len = header.len();
+
+        // 4. AEAD 加密（AAD = 未加掩 header）
+        let key =
+            aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_128_GCM, &key_bytes).unwrap());
+        let mut nonce_bytes = iv_bytes;
+        let pn_be = pn.to_be_bytes();
+        for i in 0..pn_length {
+            nonce_bytes[12 - pn_length + i] ^= pn_be[i];
+        }
+        let nonce = aead::Nonce::assume_unique_for_key(nonce_bytes);
+
+        let mut packet = header.clone();
+        packet.extend_from_slice(&plaintext);
+        let tag = key
+            .seal_in_place_separate_tag(
+                nonce,
+                aead::Aad::from(&header[..]),
+                &mut packet[hdr_len..],
+            )
+            .unwrap();
+        packet.extend_from_slice(tag.as_ref());
+
+        // 5. Header protection
+        let hp_key =
+            aead::quic::HeaderProtectionKey::new(&aead::quic::AES_128, &hp_bytes).unwrap();
+        // PN 字段位于 header 末尾（helper 的 hdr_len 含 PN）；
+        // HP sample 从 PN 偏移 +4 起取（RFC 9001 §5.4.2），与 sniff_quic 内部偏移一致。
+        let pn_offset = hdr_len - pn_length;
+        let sample_offset = pn_offset + 4;
+        let sample = &packet[sample_offset..sample_offset + hp_key.algorithm().sample_len()];
+        let mask = hp_key.new_mask(sample).unwrap();
+        packet[0] ^= mask[0] & 0x0f;
+        for i in 0..pn_length {
+            packet[pn_offset + i] ^= mask[1 + i];
+        }
+        packet
+    }
+
+    #[test]
+    fn quic_sniff_initial_packet_extracts_sni() {
+        let packet = build_quic_initial_packet(b"www.example.com");
+        let result = QuicSniffer
+            .sniff(&packet)
+            .expect("sniff should succeed")
+            .expect("should extract a result");
+        assert_eq!(result.protocol(), "quic");
+        assert_eq!(result.domain(), "www.example.com");
     }
 }

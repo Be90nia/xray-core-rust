@@ -3,7 +3,7 @@
 //! 对应 Go `app/policy/policy.go` 中 `Manager` 作为 `features.Feature`。
 //! Go 版 `Start`/`Close` 为 no-op（Manager 在 `New` 时已构建完毕）。
 
-use xray_features::policy::{Policy, PolicyManager};
+use xray_features::policy::{Policy, PolicyManager, SystemStats};
 use xray_features::{Feature, FeatureError, Result};
 use xray_proto::xray::app::policy::Config;
 
@@ -40,5 +40,9 @@ impl Feature for PolicyFeature {
 impl PolicyManager for PolicyFeature {
     fn policy_for_level(&self, level: u32) -> Policy {
         self.manager.policy_for_level(level)
+    }
+
+    fn for_system(&self) -> SystemStats {
+        self.manager.for_system()
     }
 }

@@ -38,7 +38,7 @@ pub mod vformat;
 pub mod yaml;
 
 // 顶层 re-export：常用类型与函数直接从 crate 根访问。
-pub use common::{Address, PortList, PortRange, StringList};
+pub use common::{Address, Network, NetworkList, PortList, PortRange, StringList};
 pub use built::{BuiltConfig, BuiltEntry, BuiltInbound, BuiltOutbound};
 pub use config::{Config, InboundDetourConfig, MuxConfig, OutboundDetourConfig, SniffingConfig};
 pub use confloader::{

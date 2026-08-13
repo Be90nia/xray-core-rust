@@ -14,13 +14,14 @@
 //! - TLS 包装层
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use xray_app_dispatcher::default::SimpleOhm;
@@ -33,9 +34,12 @@ use xray_common::net::port::Port;
 use xray_features::inbound::{InboundError, InboundHandler};
 
 use crate::fallback::FallbackPolicy;
-use crate::protocol::{addr_type, Network, COMMAND_TCP, CRLF};
+use crate::protocol::{
+    addr_type, parse_udp_packet_stream, write_udp_packet, Network, COMMAND_TCP, CRLF,
+};
 use crate::validator::{MemoryUser, Validator};
 use xray_transport::link::Link;
+use xray_transport::udp::relay::UdpRelay;
 
 /// 包装流，记录所有读取字节用于 fallback 回放。
 struct RecordingStream<S> {
@@ -437,7 +441,8 @@ async fn handle_trojan_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     match trojan_server_handshake(&mut recorder, &validator).await {
         Ok((network, addr, port, user)) => {
             if matches!(network, Network::Udp) {
-                warn!(peer = %peer, "trojan UDP not yet supported");
+                info!(peer = %peer, user = %user.email, "trojan UDP relay start");
+                handle_trojan_udp_relay(recorder.inner).await;
                 return;
             }
             let dest = Destination::new(addr, Port::new(port), CommonNetwork::TCP);
@@ -457,6 +462,110 @@ async fn handle_trojan_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 }
             }
         }
+    }
+}
+
+// ============================================================================
+// UDP relay（UDP-over-TCP）
+// ============================================================================
+
+/// 解析 `(Address, port)` 为 `SocketAddr`：IP 直接构造，域名走 DNS 解析。
+///
+/// # Errors
+/// 域名解析失败返回 `io::Error`。
+async fn resolve_udp_dest(addr: &Address, port: u16) -> std::io::Result<SocketAddr> {
+    match addr.ip() {
+        Some(ip) => Ok(SocketAddr::new(ip, port)),
+        None => {
+            let host = addr.as_domain().unwrap_or_default();
+            tokio::net::lookup_host((host, port))
+                .await?
+                .next()
+                .ok_or_else(|| std::io::Error::other(format!("dns resolve failed: {host}")))
+        }
+    }
+}
+
+/// Trojan 入站 UDP relay（UDP-over-TCP），对应 Go `proxy/trojan/server.go::handleUDPPayload`。
+///
+/// 客户端握手后 TCP 流承载连续的 UDP 帧 `[addr+port][2B len][CRLF][payload]`：
+/// - 读循环：`parse_udp_packet_stream` 拆帧 → 解析目标 → `UdpRelay::send_to` 转发
+/// - 写循环：回包 channel → `write_udp_packet` 编码 → 回写客户端流
+///
+/// ponytail: 暂不做 per-dest 空闲淘汰 / 完整 NAT session 管理（连接级生命周期即可）。
+async fn handle_trojan_udp_relay<S>(stream: S)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (read_half, write_half) = tokio::io::split(stream);
+    let writer = Arc::new(Mutex::new(write_half));
+    let relay = UdpRelay::new();
+    let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<(SocketAddr, Vec<u8>)>();
+
+    // 回包写循环：编码为 trojan UDP 帧后回写客户端
+    let writer_clone = Arc::clone(&writer);
+    let resp_task: JoinHandle<()> = tokio::spawn(async move {
+        while let Some((src, payload)) = resp_rx.recv().await {
+            let (addr, port) = address_port_from_socket(src);
+            let mut packet = Vec::with_capacity(payload.len() + 32);
+            write_udp_packet(&mut packet, &addr, port, &payload);
+            let mut w = writer_clone.lock().await;
+            if w.write_all(&packet).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // 读循环：拆帧 → 转发
+    let mut read_half = read_half;
+    let mut buf: Vec<u8> = Vec::with_capacity(16_384);
+    let mut chunk = [0u8; 8192];
+    loop {
+        match read_half.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+        let mut consumed = 0usize;
+        loop {
+            match parse_udp_packet_stream(&buf[consumed..]) {
+                Ok(Some((addr, port, payload, used))) => {
+                    consumed += used;
+                    match resolve_udp_dest(&addr, port).await {
+                        Ok(dest) => {
+                            if let Err(e) = relay.send_to(dest, payload, resp_tx.clone()).await {
+                                warn!(error = %e, dest = %dest, "trojan udp relay send_to failed");
+                            }
+                        }
+                        Err(e) => warn!(error = %e, "trojan udp dest resolve failed"),
+                    }
+                }
+                Ok(None) => break, // 数据不足，继续读
+                Err(e) => {
+                    warn!(error = %e, "trojan udp parse fatal, aborting relay");
+                    // 丢弃已解析部分，终止 relay
+                    let _ = consumed; // keep partial buf
+                    relay.close().await;
+                    drop(resp_tx);
+                    let _ = resp_task.await;
+                    return;
+                }
+            }
+        }
+        if consumed > 0 {
+            buf.drain(..consumed);
+        }
+    }
+
+    drop(resp_tx);
+    relay.close().await;
+    let _ = resp_task.await;
+}
+
+/// `SocketAddr` → `(Address, port)`（回包源地址编码用）。
+fn address_port_from_socket(src: SocketAddr) -> (Address, u16) {
+    match src {
+        SocketAddr::V4(v4) => (Address::IPv4(*v4.ip()), v4.port()),
+        SocketAddr::V6(v6) => (Address::IPv6(*v6.ip()), v6.port()),
     }
 }
 

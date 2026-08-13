@@ -26,7 +26,7 @@ use xray_transport::sockopt::SocketOptions;
 use crate::config::MemoryAccount;
 use crate::protocol::{write_request_header, Network as TrojanNetwork};
 
-/// Trojan outbound 配置（最小集）。
+/// Trojan outbound 配置。
 #[derive(Debug, Clone)]
 pub struct TrojanOutboundConfig {
     /// Trojan 账户（含 hex(sha224(password))）。
@@ -37,6 +37,10 @@ pub struct TrojanOutboundConfig {
     pub server_port: Port,
     /// 可选 streamSettings（TLS/WS/gRPC/...）。None 走 raw TCP。
     pub stream_settings: Option<StreamSettings>,
+    /// 用户 level（policy/stats 系统用）。
+    pub level: u32,
+    /// 用户 email（stats 系统标识用）。
+    pub email: String,
 }
 
 impl TrojanOutboundConfig {
@@ -48,6 +52,8 @@ impl TrojanOutboundConfig {
             server_address,
             server_port,
             stream_settings: None,
+            level: 0,
+            email: String::new(),
         }
     }
 
@@ -58,13 +64,24 @@ impl TrojanOutboundConfig {
         self
     }
 
-    /// 服务器 Destination（TCP）。
-    fn server_destination(&self) -> Destination {
-        Destination::new(
-            self.server_address.clone(),
-            self.server_port,
-            XrayNetwork::TCP,
-        )
+    /// 设置用户 level（builder 风格）。
+    #[must_use]
+    pub fn with_level(mut self, level: u32) -> Self {
+        self.level = level;
+        self
+    }
+
+    /// 设置用户 email（builder 风格）。
+    #[must_use]
+    pub fn with_email(mut self, email: impl Into<String>) -> Self {
+        self.email = email.into();
+        self
+    }
+
+    /// 构造 Trojan 服务器 Destination（拨号用）。
+    #[must_use]
+    pub fn server_destination(&self) -> Destination {
+        Destination::tcp(self.server_address.clone(), self.server_port)
     }
 }
 

@@ -28,6 +28,6 @@ pub use protocol::{
     SOCKS4_VERSION, SOCKS5_VERSION, STATUS_CMD_NOT_SUPPORT, STATUS_SUCCESS,
     decode_udp_packet, encode_udp_packet, parse_address_port, write_address_port,
 };
-pub use server::{SocksServer, socks5_server_handshake};
+pub use server::{SocksServer, socks4_handshake, socks5_server_handshake, socks_handshake};
 pub use client::{ClientConfig, SocksClient};
 pub use dispatcher::make_dial_fn as make_socks_dial_fn;

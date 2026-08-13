@@ -415,9 +415,8 @@ mod tests {
         );
         let settings = StreamSettings {
             protocol: "httpupgrade".to_string(),
-            security: String::new(),
             transport_json: Some(serde_json::json!({"path":"/ws"})),
-            security_json: None,
+            ..StreamSettings::tcp()
         };
         let sockopt = SocketOptions::default();
         let result = dial_httpupgrade(&dest, &sockopt, &settings).await;

@@ -12,6 +12,7 @@ pub mod config;
 pub mod dispatcher;
 pub mod error;
 pub mod handler;
+pub mod udp;
 pub mod inbound;
 
 pub use config::{
@@ -21,5 +22,7 @@ pub use config::{
 };
 pub use error::{FreedomError, Result};
 pub use handler::FreedomHandler;
+pub use dispatcher::FreedomDispatchBridge;
 pub use dispatcher::make_dial_fn as make_freedom_dial_fn;
+pub use dispatcher::make_dial_fn_with_config as make_freedom_dial_fn_with_config;
 pub use inbound::FreedomInboundHandler;

@@ -42,6 +42,21 @@ pub struct DnsAppConfig {
     pub disable_fallback: Option<bool>,
     /// 命中匹配后禁用 fallback。
     pub disable_fallback_if_match: Option<bool>,
+    /// 禁用 DNS 缓存。对应 Go `disableCache`。
+    #[serde(rename = "disableCache")]
+    pub disable_cache: Option<bool>,
+    /// 缓存过期后继续提供过期数据。对应 Go `serveStale`。
+    #[serde(rename = "serveStale")]
+    pub serve_stale: Option<bool>,
+    /// 过期数据的 TTL（秒）。对应 Go `serveExpiredTTL`。
+    #[serde(rename = "serveExpiredTTL")]
+    pub serve_expired_ttl: Option<u32>,
+    /// 启用并行查询。对应 Go `enableParallelQuery`。
+    #[serde(rename = "enableParallelQuery")]
+    pub enable_parallel_query: Option<bool>,
+    /// 使用系统 hosts 文件。对应 Go `useSystemHosts`。
+    #[serde(rename = "useSystemHosts")]
+    pub use_system_hosts: Option<bool>,
 }
 
 /// 单个 nameserver JSON 配置。对应 Go `infra/conf.NameServerConfig`。
@@ -62,6 +77,22 @@ pub struct NameServerJson {
     /// 本 server 的查询策略覆写。
     #[serde(rename = "queryStrategy")]
     pub query_strategy: Option<String>,
+    /// 仅解析这些域名时使用本 server。对应 Go `domains`。
+    pub domains: Option<Vec<String>>,
+    /// 期望返回的 IP 列表（CIDR）。对应 Go `expectedIPs`。
+    #[serde(rename = "expectedIPs")]
+    pub expected_ips: Option<Vec<String>>,
+    /// 不期望返回的 IP 列表（CIDR）。对应 Go `unexpectedIPs`。
+    #[serde(rename = "unexpectedIPs")]
+    pub unexpected_ips: Option<Vec<String>>,
+    /// 本 server 的 tag（路由引用用）。对应 Go `tag`。
+    pub tag: Option<String>,
+    /// 是否最终查询。对应 Go `finalQuery`。
+    #[serde(rename = "finalQuery")]
+    pub final_query: Option<bool>,
+    /// 本 server 禁用缓存。对应 Go `disableCache`。
+    #[serde(rename = "disableCache")]
+    pub disable_cache: Option<bool>,
 }
 
 impl DnsAppConfig {
@@ -105,7 +136,11 @@ impl DnsAppConfig {
             clients,
             disable_fallback: self.disable_fallback.unwrap_or(false),
             disable_fallback_if_match: self.disable_fallback_if_match.unwrap_or(false),
-            enable_parallel_query: false,
+            enable_parallel_query: self.enable_parallel_query.unwrap_or(false),
+            disable_cache: self.disable_cache.unwrap_or(false),
+            serve_stale: self.serve_stale.unwrap_or(false),
+            serve_expired_ttl: self.serve_expired_ttl.unwrap_or(0),
+            use_system_hosts: self.use_system_hosts.unwrap_or(false),
         })
     }
 }
@@ -182,6 +217,13 @@ fn build_client(
         skip_fallback: ns.skip_fallback,
         timeout_ms: ns.timeout.unwrap_or(0),
         query_strategy: ns.query_strategy.as_deref().map(|s| parse_query_strategy(Some(s))),
+        tag: ns.tag.clone().unwrap_or_default(),
+        final_query: ns.final_query.unwrap_or(false),
+        disable_cache: ns.disable_cache,
+        serve_stale: None,
+        serve_expired_ttl: None,
+        // ponytail: domains/expected_ips/unexpected_ips 解析到结构体即满足要求，
+        // 路由层已有；NameServerConfig 暂无对应字段承载，留待 IPMatcher/domains 接入。
         ..Default::default()
     };
 

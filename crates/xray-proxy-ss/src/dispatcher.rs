@@ -167,6 +167,10 @@ pub struct SsOutboundConfig {
     pub server_address: Address,
     /// SS 服务器端口。
     pub server_port: u16,
+    /// 用户 level（policy/stats 系统用）。
+    pub level: u32,
+    /// 用户 email（stats 系统标识用）。
+    pub email: String,
 }
 
 impl SsOutboundConfig {
@@ -177,7 +181,23 @@ impl SsOutboundConfig {
             account,
             server_address,
             server_port,
+            level: 0,
+            email: String::new(),
         }
+    }
+
+    /// 设置用户 level（builder 风格）。
+    #[must_use]
+    pub fn with_level(mut self, level: u32) -> Self {
+        self.level = level;
+        self
+    }
+
+    /// 设置用户 email（builder 风格）。
+    #[must_use]
+    pub fn with_email(mut self, email: impl Into<String>) -> Self {
+        self.email = email.into();
+        self
     }
 }
 
@@ -219,11 +239,12 @@ pub fn parse_ss_config(data: &[u8]) -> Result<SsOutboundConfig, String> {
     };
     let account = MemoryAccount::from_proto(&proto_account)
         .map_err(|e| format!("ss account: {e}"))?;
-    Ok(SsOutboundConfig::new(
-        account,
-        Address::Domain(address.to_string()),
-        port,
-    ))
+    // 可选字段：level / email（对应 Go infra/conf outbound server）。
+    let level = first.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let email = first.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    Ok(SsOutboundConfig::new(account, Address::Domain(address.to_string()), port)
+        .with_level(level)
+        .with_email(email))
 }
 
 /// 构造 SS 的 DialFn 闭包。

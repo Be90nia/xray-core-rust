@@ -7,20 +7,7 @@ use std::time::Duration;
 use xray_features::policy::{BufferPolicy, Policy, StatsPolicy, TimeoutPolicy};
 use xray_proto::xray::app::policy::{Policy as ProtoPolicy, Second, SystemPolicy as ProtoSystemPolicy};
 
-/// 系统级统计策略，对应 Go `features/policy.System`。
-///
-/// 字段语义与 Go 一致：四个布尔开关分别控制上下行流量统计是否启用。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SystemStats {
-    /// 是否统计入站上行流量。
-    pub inbound_uplink: bool,
-    /// 是否统计入站下行流量。
-    pub inbound_downlink: bool,
-    /// 是否统计出站上行流量。
-    pub outbound_uplink: bool,
-    /// 是否统计出站下行流量。
-    pub outbound_downlink: bool,
-}
+pub use xray_features::policy::SystemStats;
 
 /// 把 proto `Second` 转换为 `Duration`，None 视作 0 秒。
 ///

@@ -9,8 +9,8 @@
 //! 故不需要 proto Policy ↔ features.Session 的转换层——这里直接把 proto 字段
 //! 合并到默认 `features::Policy` 上（对应 Go `overrideWith`）。
 //!
-//! Go 的 `ForSystem()` 返回 `features/policy.System`，Rust 端未提供该类型，
-//! 故本 crate 定义本地 [`SystemStats`] 表达同一概念。
+//! `SystemStats` 定义在 `xray-features::policy`，对应 Go `features/policy.SystemStats`，
+//! `PolicyManager` trait 的 `for_system()` 返回该类型。
 
 pub mod convert;
 pub mod feature;

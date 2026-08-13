@@ -859,8 +859,7 @@ mod tests {
         entry.set_stream_settings(StreamSettings {
             protocol: "ws".to_string(),
             security: "tls".to_string(),
-            transport_json: None,
-            security_json: None,
+            ..StreamSettings::tcp()
         });
         assert_eq!(entry.stream_settings.protocol, "ws");
         assert_eq!(entry.stream_settings.security, "tls");

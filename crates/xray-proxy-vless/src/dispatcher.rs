@@ -29,7 +29,7 @@ use xray_transport::sockopt::SocketOptions;
 
 use crate::encoding::{client::encode_request_header, empty_addons, VlessCommand, VERSION};
 
-/// VLESS outbound 配置（最小集）。
+/// VLESS outbound 配置。
 #[derive(Debug, Clone)]
 pub struct VlessOutboundConfig {
     /// 用户 UUID（远端 VLESS 服务端已注册）。
@@ -40,18 +40,30 @@ pub struct VlessOutboundConfig {
     pub server_port: Port,
     /// 可选 streamSettings（TLS/WS/gRPC/...）。None 走 raw TCP。
     pub stream_settings: Option<StreamSettings>,
+    /// Flow 标识（如 `xtls-rprx-vision`）。空串表示无 flow。
+    /// 对应 Go `infra/conf` outbound user 的 `flow` 字段。
+    pub flow: String,
+    /// 加密方式（默认 `none`，对应 VLESS 无加密；其他值交给 encryption 层）。
+    pub encryption: String,
+    /// 用户 level（policy/stats 系统用）。
+    pub level: u32,
+    /// 用户 email（stats 系统标识用）。
+    pub email: String,
 }
 
 impl VlessOutboundConfig {
 
     /// 构造（raw TCP，无 streamSettings）。
-    #[must_use]
     pub fn new(user_uuid: UUID, server_address: Address, server_port: Port) -> Self {
         Self {
             user_uuid,
             server_address,
             server_port,
             stream_settings: None,
+            flow: String::new(),
+            encryption: "none".to_string(),
+            level: 0,
+            email: String::new(),
         }
     }
 
@@ -61,6 +73,34 @@ impl VlessOutboundConfig {
     #[must_use]
     pub fn with_stream_settings(mut self, settings: Option<StreamSettings>) -> Self {
         self.stream_settings = settings;
+        self
+    }
+
+    /// 设置 flow（builder 风格）。
+    #[must_use]
+    pub fn with_flow(mut self, flow: impl Into<String>) -> Self {
+        self.flow = flow.into();
+        self
+    }
+
+    /// 设置 encryption（builder 风格）。
+    #[must_use]
+    pub fn with_encryption(mut self, encryption: impl Into<String>) -> Self {
+        self.encryption = encryption.into();
+        self
+    }
+
+    /// 设置用户 level（builder 风格）。
+    #[must_use]
+    pub fn with_level(mut self, level: u32) -> Self {
+        self.level = level;
+        self
+    }
+
+    /// 设置用户 email（builder 风格）。
+    #[must_use]
+    pub fn with_email(mut self, email: impl Into<String>) -> Self {
+        self.email = email.into();
         self
     }
 

@@ -158,12 +158,11 @@ mod tests {
     async fn double_start_returns_error() {
         let ohm = Arc::new(SimpleOhm::new());
         let handler = FreedomInboundHandler::new("fr-dbl", "127.0.0.1:0", dummy_dest(), ohm);
-        // 第一次 start 因无 default handler 失败，但 started 标志已被 swap 为 true
-        // ponytail: 调整——start 中 swap(true) 成功后才检查 handler
-        // 当前实现：swap 成功→bind→get_default_handler，若失败 started 仍为 true
+        // 两次 start 均因无 default handler 失败，started 被重置为 false
         let _ = handler.start().await;
         let result = handler.start().await;
         assert!(result.is_err(), "double start should fail");
-        handler.close().await.unwrap();
+        // started 已被 start 失败路径重置为 false，close 也返回错误
+        assert!(handler.close().await.is_err(), "close after failed start should error");
     }
 }

@@ -308,6 +308,44 @@ pub fn parse_udp_packet(buf: &[u8]) -> Result<(Address, u16, &[u8], usize)> {
 
     Ok((addr, port, payload, pos))
 }
+/// 流式解析 UDP 单包：区分「数据不足」与「致命错误」。
+///
+/// 与 [`parse_udp_packet`] 的区别：数据不足时返回 `Ok(None)`（调用方应继续读），
+/// 而非返回 `TrojanError`。仅在地址类型非法 / payload 超限等致命错误时返回 `Err`。
+/// 供 inbound 的 UDP-over-TCP 读取循环使用。
+///
+/// # Errors
+/// - [`TrojanError::InvalidRemoteAddress`]：未知地址类型或域名 UTF-8 无效。
+/// - [`TrojanError::OversizePayload`]：payload 长度声明超过 `MAX_LENGTH`。
+pub fn parse_udp_packet_stream(buf: &[u8]) -> Result<Option<(Address, u16, &[u8], usize)>> {
+    // 1. addr + port（保留 InsufficientData / InvalidRemoteAddress 区分）
+    let (addr, port, mut pos) = match read_address_port(buf) {
+        Ok(v) => v,
+        Err(TrojanError::InsufficientData(_, _)) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    // 2. length（不足 → None）
+    if buf.len() < pos + 2 {
+        return Ok(None);
+    }
+    let length = u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
+    pos += 2;
+    if length > MAX_LENGTH {
+        return Err(TrojanError::OversizePayload(length, MAX_LENGTH));
+    }
+    // 3. CRLF（不足 → None）
+    if buf.len() < pos + 2 {
+        return Ok(None);
+    }
+    pos += 2;
+    // 4. payload（不足 → None）
+    if buf.len() < pos + length {
+        return Ok(None);
+    }
+    let payload = &buf[pos..pos + length];
+    pos += length;
+    Ok(Some((addr, port, payload, pos)))
+}
 
 #[cfg(test)]
 mod tests {

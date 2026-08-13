@@ -101,6 +101,11 @@ pub struct StreamSettings {
     pub transport_json: Option<serde_json::Value>,
     /// 安全层配置 JSON（对应 Go TLS/Reality Config）。
     pub security_json: Option<serde_json::Value>,
+    /// Socket 选项配置 JSON（对应 Go `StreamConfig.SocketConfig` / `sockopt`）。
+    /// 由 sockopt 模块自行解析为 `SocketOptions`。
+    pub sockopt_json: Option<serde_json::Value>,
+    /// Finalmask 流量伪装配置 JSON（对应 Go `finalmask` 字段，本仓库 finalmask 模块）。
+    pub finalmask_json: Option<serde_json::Value>,
 }
 
 impl StreamSettings {
@@ -112,6 +117,8 @@ impl StreamSettings {
             security: String::new(),
             transport_json: None,
             security_json: None,
+            sockopt_json: None,
+            finalmask_json: None,
         }
     }
 
@@ -133,7 +140,10 @@ impl StreamSettings {
             .and_then(|k| v.get(k).cloned());
         // 安全配置：`tlsSettings` 或 `realitySettings`。
         let security_json = v.get("tlsSettings").cloned().or_else(|| v.get("realitySettings").cloned());
-        Self { protocol, security, transport_json, security_json }
+        // Socket 选项（`sockopt`）与 finalmask 流量伪装配置。
+        let sockopt_json = v.get("sockopt").cloned();
+        let finalmask_json = v.get("finalmask").cloned();
+        Self { protocol, security, transport_json, security_json, sockopt_json, finalmask_json }
     }
 
     /// 是否启用 TLS（`security == "tls"` 或 `security == "reality"`）。

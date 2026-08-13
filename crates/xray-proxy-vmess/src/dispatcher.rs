@@ -54,6 +54,10 @@ pub struct VmessOutboundConfig {
     pub security: SecurityType,
     /// 可选 streamSettings（TLS/WS/gRPC/...）。None 走 raw TCP。
     pub stream_settings: Option<xray_transport::dialer::StreamSettings>,
+    /// 用户 level（policy/stats 系统用）。
+    pub level: u32,
+    /// 用户 email（stats 系统标识用）。
+    pub email: String,
 }
 
 
@@ -67,6 +71,8 @@ impl VmessOutboundConfig {
             server_port,
             security: SecurityType::Auto,
             stream_settings: None,
+            level: 0,
+            email: String::new(),
         }
     }
     /// 设置安全类型（builder 风格）。
@@ -80,6 +86,20 @@ impl VmessOutboundConfig {
     #[must_use]
     pub fn with_stream_settings(mut self, settings: Option<xray_transport::dialer::StreamSettings>) -> Self {
         self.stream_settings = settings;
+        self
+    }
+
+    /// 设置用户 level（builder 风格）。
+    #[must_use]
+    pub fn with_level(mut self, level: u32) -> Self {
+        self.level = level;
+        self
+    }
+
+    /// 设置用户 email（builder 风格）。
+    #[must_use]
+    pub fn with_email(mut self, email: impl Into<String>) -> Self {
+        self.email = email.into();
         self
     }
 
@@ -141,12 +161,16 @@ pub fn parse_vmess_config(data: &[u8]) -> Result<VmessOutboundConfig, String> {
         .get("security")
         .and_then(|v| v.as_str())
         .unwrap_or("auto");
+    let level = user.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let email = user.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
     Ok(VmessOutboundConfig::new(
         uuid,
         Address::Domain(address.to_string()),
         Port::new(u16::try_from(port).map_err(|_| "port out of range")?),
     )
-    .with_security(parse_security(security_str)))
+    .with_security(parse_security(security_str))
+    .with_level(level)
+    .with_email(email))
 }
 
 use std::str::FromStr;

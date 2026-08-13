@@ -17,9 +17,11 @@ use xray_common::net::address::Address;
 use xray_common::net::destination::Destination;
 use xray_common::net::network::Network;
 use xray_common::net::port::Port;
-use xray_proxy_socks::protocol::{Host, SocksAddr};
-use xray_proxy_socks::server::{socks5_server_handshake, SocksRequest};
+use std::net::SocketAddr;
+use xray_proxy_socks::protocol::{Host, SocksAddr, decode_udp_packet, encode_udp_packet};
+use xray_proxy_socks::server::{socks_handshake, SocksRequest};
 use xray_proxy_socks::ServerConfig;
+use tokio::io::AsyncReadExt;
 use xray_transport::link::Link;
 use tokio::task::JoinHandle;
 use xray_conf::{BuiltConfig, BuiltInbound};
@@ -98,36 +100,50 @@ pub async fn serve_socks5(
     }
 }
 
-/// 处理单个 SOCKS5 连接：handshake → dispatch。
+/// 处理单个 SOCKS 连接：handshake → dispatch（TCP CONNECT）或 UDP relay。
+///
+/// 兼容 SOCKS4/4a/5。UDP ASSOCIATE 时 spawn relay pump 并保持 TCP 控制连接。
 async fn handle_connection(
     mut stream: TcpStream,
     config: &ServerConfig,
     handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,
 ) -> std::io::Result<()> {
-    // 1. SOCKS5 握手
-    let socks_addr = socks5_server_handshake(&mut stream, config)
+    // 1. SOCKS 握手（兼容 4/4a/5）
+    let socks_req = socks_handshake(&mut stream, config)
         .await
-        .map_err(|e| std::io::Error::other(format!("socks5 handshake: {e}")))?;
+        .map_err(|e| std::io::Error::other(format!("socks handshake: {e}")))?;
 
-    // 2. SocksAddr → Destination
-    let dest = socks_addr_to_destination(&socks_addr)?;
-
-    // 3. 拆 TcpStream → (read, write) → Link
-    // ponytail: tokio::io::split 返回的 ReadHalf/WriteHalf 是 'static + Send，
-    // new_reader/new_writer 接受 AsyncRead/AsyncWrite + Unpin + Send + 'static。
-    let (read_half, write_half) = tokio::io::split(stream);
-    let link = Link::new(new_reader(read_half), new_writer(write_half));
-
-    // 4. dispatch（dispatch 内部拨号 + bridge，消耗 link）
-    // zx7: mux.cool dest 转给 mux ServerWorker（当前 stub）
-    if is_mux_destination(&dest) {
-        tracing::info!("socks5: mux.cool destination detected, spawning mux inbound handler");
-        tokio::spawn(handle_mux_inbound_link(link, Arc::clone(handler)));
-        return Ok(());
+    match socks_req {
+        SocksRequest::UdpAssociate(_, relay_socket) => {
+            // UDP relay：spawn pump，保持 TCP 控制连接直到客户端断开
+            let relay = tokio::spawn(async move {
+                let _ = handle_udp_associate(relay_socket).await;
+            });
+            // SOCKS5 UDP ASSOCIATE 语义：TCP 控制连接存在期间 relay 有效。
+            // 读到 EOF/错误（客户端关闭控制连接）即终止 relay。
+            let mut drop_buf = [0u8; 64];
+            let _ = stream.read(&mut drop_buf).await;
+            relay.abort();
+            Ok(())
+        }
+        SocksRequest::TcpConnect(addr) => {
+            // 2. SocksAddr → Destination
+            let dest = socks_addr_to_destination(&addr)?;
+            // 3. 拆 TcpStream → (read, write) → Link
+            // ponytail: tokio::io::split 返回的 ReadHalf/WriteHalf 是 'static + Send，
+            // new_reader/new_writer 接受 AsyncRead/AsyncWrite + Unpin + Send + 'static。
+            let (read_half, write_half) = tokio::io::split(stream);
+            let link = Link::new(new_reader(read_half), new_writer(write_half));
+            // 4. dispatch（zx7: mux.cool dest 转给 mux ServerWorker）
+            if is_mux_destination(&dest) {
+                tracing::info!("socks: mux.cool destination detected, spawning mux inbound handler");
+                tokio::spawn(handle_mux_inbound_link(link, Arc::clone(handler)));
+                return Ok(());
+            }
+            let _ = handler.dispatch(&dest, link).await;
+            Ok(())
+        }
     }
-    let _ = handler.dispatch(&dest, link).await;
-
-    Ok(())
 }
 
 /// 检测 dest 是否为 mux.cool 多路复用信令目的地（zx7）。
@@ -175,23 +191,101 @@ async fn handle_mux_inbound_link(link: Link, handler: Arc<dyn xray_app_dispatche
     idle_h.abort();
 }
 
-/// `SocksRequest` → `Destination`（TCP）。
+/// `SocksAddr` → TCP `Destination`。
 ///
 /// `Host::Ipv4` → `Address::IPv4`，`Ipv6` → `Address::IPv6`，`Domain` → `Address::Domain`。
-/// UDP ASSOCIATE 请求返回 Unsupported 错误。
-fn socks_addr_to_destination(req: &SocksRequest) -> std::io::Result<Destination> {
-    let addr = match req {
-        SocksRequest::TcpConnect(addr) => addr,
-        SocksRequest::UdpAssociate(_, _) => {
-            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "UDP ASSOCIATE not supported"))
-        }
-    };
+fn socks_addr_to_destination(addr: &SocksAddr) -> std::io::Result<Destination> {
     let address = match &addr.host {
         Host::Ipv4(ip) => Address::IPv4(*ip),
         Host::Ipv6(ip) => Address::IPv6(*ip),
         Host::Domain(d) => Address::Domain(d.clone()),
     };
     Ok(Destination::new(address, Port::new(addr.port), Network::TCP))
+}
+
+/// SOCKS5 UDP ASSOCIATE relay pump。
+///
+/// 对应 Go `proxy/socks/server.go::handleUDPPayload`。
+/// 从 relay socket 读客户端 UDP 请求帧（SOCKS5 UDP encapsulation:
+/// `[RSV(2)][FRAG(1)][ATYP][DST.ADDR][DST.PORT][DATA]`），解码出目标地址 +
+/// payload，转发到目标并回传响应。当客户端 TCP 控制连接关闭时，
+/// 调用方 abort 本 task 终止 relay。
+///
+/// ponytail: 无 UDP dispatcher 路径，每个数据报独立开 ephemeral UDP socket
+/// 转发（匹配当前 codebase 的 TCP-only dispatch 架构）。升级路径：接入
+/// dispatcher 的 UDP session，复用 per-dest 长连接 socket。
+async fn handle_udp_associate(relay_socket: UdpSocket) -> std::io::Result<()> {
+    let mut buf = [0u8; 65535];
+    loop {
+        let (n, client_addr) = match relay_socket.recv_from(&mut buf).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "socks udp relay recv failed");
+                continue;
+            }
+        };
+
+        // 解码 SOCKS5 UDP 请求帧 → (目标地址, payload)
+        let (dest_addr, payload) = match decode_udp_packet(&buf[..n]) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "socks udp decode failed; dropping");
+                continue;
+            }
+        };
+
+        // 域名走 tokio lookup；IP 直接构造
+        let dest = match resolve_udp_dest(&dest_addr).await {
+            Some(d) => d,
+            None => {
+                tracing::debug!(dest = ?dest_addr, "socks udp dest resolve failed");
+                continue;
+            }
+        };
+
+        // 转发：ephemeral UDP socket → connect → send → recv (5s timeout)
+        let fwd = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(error = %e, "socks udp fwd bind failed");
+                continue;
+            }
+        };
+        if fwd.connect(dest).await.is_err() {
+            continue;
+        }
+        if fwd.send(payload).await.is_err() {
+            continue;
+        }
+        let mut rbuf = [0u8; 65535];
+        let rn = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fwd.recv(&mut rbuf),
+        )
+        .await
+        {
+            Ok(Ok(n)) => n,
+            _ => continue, // 超时或错误：丢弃，不发响应
+        };
+
+        // 编码响应帧（BND.ADDR = 目标地址），发回客户端
+        let resp = encode_udp_packet(&dest_addr, &rbuf[..rn]);
+        if relay_socket.send_to(&resp, client_addr).await.is_err() {
+            continue;
+        }
+    }
+}
+
+/// `SocksAddr` → `SocketAddr`（域名走 `tokio::net::lookup_host` 解析）。
+async fn resolve_udp_dest(addr: &SocksAddr) -> Option<SocketAddr> {
+    match &addr.host {
+        Host::Ipv4(ip) => Some(SocketAddr::new((*ip).into(), addr.port)),
+        Host::Ipv6(ip) => Some(SocketAddr::new((*ip).into(), addr.port)),
+        Host::Domain(d) => tokio::net::lookup_host((d.as_str(), addr.port))
+            .await
+            .ok()?
+            .next(),
+    }
 }
 
 /// HTTP proxy inbound 服务入口（tdy）。
@@ -1428,8 +1522,7 @@ mod tests {
             host: Host::Ipv4(Ipv4Addr::new(1, 2, 3, 4)),
             port: 8080,
         };
-        let req = SocksRequest::TcpConnect(addr);
-        let dest = socks_addr_to_destination(&req).unwrap();
+        let dest = socks_addr_to_destination(&addr).unwrap();
         assert!(dest.is_tcp());
         assert_eq!(dest.port(), Port::new(8080));
         match dest.address() {
@@ -1444,8 +1537,7 @@ mod tests {
             host: Host::Domain("example.com".to_string()),
             port: 443,
         };
-        let req = SocksRequest::TcpConnect(addr);
-        let dest = socks_addr_to_destination(&req).unwrap();
+        let dest = socks_addr_to_destination(&addr).unwrap();
         assert_eq!(dest.port(), Port::new(443));
         match dest.address() {
             Address::Domain(d) => assert_eq!(d, "example.com"),

@@ -6,7 +6,7 @@
 //!
 //! 对应 Go `proxy/socks/server.go` 的 `Server.handshake5` + `Server.Process`（连接处理部分）。
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -22,9 +22,10 @@ use crate::config::{AuthType, ServerConfig};
 use crate::error::{Result, SocksError};
 use crate::protocol::{
     ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, AUTH_NOT_REQUIRED, AUTH_NO_MATCHING_METHOD,
-    AUTH_PASSWORD, CMD_TCP_CONNECT, CMD_UDP_ASSOCIATE, SOCKS5_VERSION,
+    AUTH_PASSWORD, CMD_TCP_CONNECT, CMD_UDP_ASSOCIATE, SOCKS4_REQUEST_GRANTED,
+    SOCKS4_REQUEST_REJECTED, SOCKS4_VERSION, SOCKS5_VERSION,
     STATUS_CMD_NOT_SUPPORT, STATUS_SUCCESS,
-    SocksAddr, parse_address_port,
+    Host, SocksAddr, parse_address_port,
 };
 
 /// SOCKS5 请求结果。区分 TCP CONNECT 和 UDP ASSOCIATE。
@@ -107,7 +108,7 @@ impl InboundHandler for SocksServer {
                         let tag = tag.clone();
                         let config = config.clone();
                         tokio::spawn(async move {
-                            match socks5_server_handshake(&mut stream, &config).await {
+                            match socks_handshake(&mut stream, &config).await {
                                 Ok(addr) => {
                                     info!(
                                         tag = %tag,
@@ -151,19 +152,12 @@ impl InboundHandler for SocksServer {
     }
 }
 
-/// SOCKS5 服务端握手。返回客户端请求的目标地址。
-///
-/// 流程（RFC 1928 + RFC 1929）:
-/// 1. 读 [VER=5, NMETHODS, METHODS(NMETHODS bytes)]
-/// 2. 选 method: NoAuth(0x00) / Password(0x02) / NoMatch(0xFF)
-/// 3. 如需密码认证: 读 [VER=1, ULEN, UNAME, PLEN, PASSWD] + 校验 + 回 [VER=1, STATUS]
-/// 4. 读请求 [VER=5, CMD, RSV=0, ATYP, DST.ADDR, DST.PORT]
-/// 5. 回复 [VER=5, REP=0(success), RSV=0, ATYP=1, 0.0.0.0, 0]
+/// SOCKS5 服务端握手（读 VER+NMETHODS 起始）。保留为独立可用入口，
+/// 兼容既有调用方与单测；内部委托 [`socks5_handshake_from_methods`]。
 pub async fn socks5_server_handshake<RW>(stream: &mut RW, config: &ServerConfig) -> Result<SocksRequest>
 where
     RW: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-    // 步骤 1: 读版本 + 方法数
     let mut header = [0u8; 2];
     stream.read_exact(&mut header).await?;
     if header[0] != SOCKS5_VERSION {
@@ -172,7 +166,41 @@ where
             header[0]
         )));
     }
-    let nmethods = header[1] as usize;
+    socks5_handshake_from_methods(stream, header[1] as usize, config).await
+}
+
+/// SOCKS 版本路由：读首字节区分 SOCKS4/4a 与 SOCKS5，转交对应握手。
+///
+/// 这是 inbound 生产入口——服务端需同时兼容 SOCKS4/4a/5 客户端。
+/// 对应 Go `ServerSession.handshake4` / `handshake5` 的版本分发。
+pub async fn socks_handshake<RW>(stream: &mut RW, config: &ServerConfig) -> Result<SocksRequest>
+where
+    RW: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    let mut ver = [0u8; 1];
+    stream.read_exact(&mut ver).await?;
+    match ver[0] {
+        SOCKS5_VERSION => {
+            let mut nm = [0u8; 1];
+            stream.read_exact(&mut nm).await?;
+            socks5_handshake_from_methods(stream, nm[0] as usize, config).await
+        }
+        SOCKS4_VERSION => socks4_handshake(stream, config).await,
+        v => Err(SocksError::HandshakeFailed(format!(
+            "unsupported SOCKS version: {v}"
+        ))),
+    }
+}
+
+/// SOCKS5 握手后半段：VER 已读，从 method 列表开始（method negotiation → auth → request）。
+async fn socks5_handshake_from_methods<RW>(
+    stream: &mut RW,
+    nmethods: usize,
+    config: &ServerConfig,
+) -> Result<SocksRequest>
+where
+    RW: AsyncReadExt + AsyncWriteExt + Unpin,
+{
     if nmethods == 0 {
         return Err(SocksError::HandshakeFailed("no auth methods offered".into()));
     }
@@ -181,7 +209,7 @@ where
     let mut methods = vec![0u8; nmethods];
     stream.read_exact(&mut methods).await?;
 
-    // 步骤 2: 选 method
+    // 选 method
     let (selected_method, needs_auth) = select_method(&methods, config);
     stream.write_all(&[SOCKS5_VERSION, selected_method]).await?;
 
@@ -189,12 +217,12 @@ where
         return Err(SocksError::AuthFailed("no matching auth method".into()));
     }
 
-    // 步骤 3: 密码认证（如需）
+    // 密码认证（如需）
     if needs_auth {
         authenticate_password(stream, config).await?;
     }
 
-    // 步骤 4: 读请求帧
+    // 读请求帧
     let mut req_header = [0u8; 4]; // VER, CMD, RSV, ATYP
     stream.read_exact(&mut req_header).await?;
     if req_header[0] != SOCKS5_VERSION {
@@ -205,7 +233,6 @@ where
     }
     let cmd = req_header[1];
     if cmd != CMD_TCP_CONNECT && cmd != CMD_UDP_ASSOCIATE {
-        // 不支持的 CMD
         let reply = [SOCKS5_VERSION, STATUS_CMD_NOT_SUPPORT, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0];
         let _ = stream.write_all(&reply).await;
         return Err(SocksError::HandshakeFailed(format!(
@@ -220,15 +247,13 @@ where
     if cmd == CMD_UDP_ASSOCIATE {
         // UDP ASSOCIATE: bind 一个 UDP relay socket，回复 relay 地址给客户端
         let relay_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await
-            .map_err(|e| SocksError::Io(e))?;
-        let relay_addr = relay_socket.local_addr()
-            .map_err(|e| SocksError::Io(e))?;
+            .map_err(SocksError::Io)?;
+        let relay_addr = relay_socket.local_addr().map_err(SocksError::Io)?;
 
-        // 回复 [VER=5, REP=0, RSV=0, ATYP=1, BND.ADDR, BND.PORT]
+        // 回复 [VER=5, REP=0, RSV=0, ATYP, BND.ADDR, BND.PORT]
         let octets = match relay_addr {
             SocketAddr::V4(v4) => v4.ip().octets(),
             SocketAddr::V6(v6) => {
-                // IPv6: ATYP=4 + 16 bytes + port
                 let mut reply = vec![SOCKS5_VERSION, STATUS_SUCCESS, 0x00, ATYP_IPV6];
                 reply.extend_from_slice(&v6.ip().octets());
                 reply.extend_from_slice(&v6.port().to_be_bytes());
@@ -246,13 +271,81 @@ where
         return Ok(SocksRequest::UdpAssociate(SocksAddr::from_socket_addr(relay_addr), relay_socket));
     }
 
-    // TCP CONNECT: 回复成功
-    // [VER=5, REP=0, RSV=0, ATYP=1(IPv4), BND.ADDR=0.0.0.0, BND.PORT=0]
+    // TCP CONNECT: 回复成功 [VER=5, REP=0, RSV=0, ATYP=1, 0.0.0.0, 0]
     stream
         .write_all(&[SOCKS5_VERSION, STATUS_SUCCESS, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0])
         .await?;
 
     Ok(SocksRequest::TcpConnect(addr))
+}
+
+/// SOCKS4/4a 服务端握手。VER(=0x04) 已由 [`socks_handshake`] 读取，本函数从 CMD 起始。
+///
+/// 协议（SOCKS4）:
+/// ```text
+/// +----+----+----------+--------+----------+----+
+/// | VN | CD | DSTPORT  | DSTIP  | USERID   |NULL|
+/// | 1  | 1  |    2     |   4    | variable | 1  |
+/// +----+----+----------+--------+----------+----+
+/// ```
+///
+/// SOCKS4a：当 DSTIP = `0.0.0.x`（x≠0）时，USERID NULL 之后跟一个 null 结尾域名。
+///
+/// 仅支持 CONNECT（CD=1）。回复 `[VN=0, CD=90/91, DSTPORT=0, DSTIP=0]`。
+/// 对应 Go `ServerSession.handshake4`。
+pub async fn socks4_handshake<RW>(stream: &mut RW, _config: &ServerConfig) -> Result<SocksRequest>
+where
+    RW: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    // VER(0x04) 已读；读 CMD(1) + DSTPORT(2 BE) + DSTIP(4)
+    let mut buf = [0u8; 7];
+    stream.read_exact(&mut buf).await?;
+    let cmd = buf[0];
+    let port = u16::from_be_bytes([buf[1], buf[2]]);
+    let ip = Ipv4Addr::new(buf[3], buf[4], buf[5], buf[6]);
+
+    // 读 USERID，直到 NULL
+    let _userid = read_until_null(stream).await?;
+
+    // SOCKS4a：IP = 0.0.0.x（x≠0）→ 跟一个 null 结尾域名
+    let octets = ip.octets();
+    let host = if octets[0] == 0 && octets[1] == 0 && octets[2] == 0 && octets[3] != 0 {
+        let domain = read_until_null(stream).await?;
+        Host::Domain(domain)
+    } else {
+        Host::Ipv4(ip)
+    };
+
+    // 仅支持 CONNECT（CD=0x01）
+    if cmd != CMD_TCP_CONNECT {
+        // VN=0, CD=91(rejected), port=0, ip=0
+        let _ = stream.write_all(&[0x00, SOCKS4_REQUEST_REJECTED, 0, 0, 0, 0, 0, 0]).await;
+        return Err(SocksError::HandshakeFailed(format!(
+            "SOCKS4 unsupported CMD: {cmd} (only CONNECT=1 supported)"
+        )));
+    }
+
+    // 回复 granted：VN=0, CD=90(granted), DSTPORT=0, DSTIP=0.0.0.0
+    stream.write_all(&[0x00, SOCKS4_REQUEST_GRANTED, 0, 0, 0, 0, 0, 0]).await?;
+
+    Ok(SocksRequest::TcpConnect(SocksAddr { host, port }))
+}
+
+/// 读 null 结尾的字节串，返回 UTF-8 lossy 字符串（丢弃结尾 NULL）。
+async fn read_until_null<RW>(stream: &mut RW) -> Result<String>
+where
+    RW: AsyncReadExt + Unpin,
+{
+    let mut bytes = Vec::new();
+    loop {
+        let mut one = [0u8; 1];
+        stream.read_exact(&mut one).await?;
+        if one[0] == 0 {
+            break;
+        }
+        bytes.push(one[0]);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// 根据客户端提供的方法列表 + 服务端配置选 method。
@@ -625,6 +718,127 @@ mod tests {
                 assert!(socket.local_addr().is_ok());
             }
             other => panic!("expected UdpAssociate, got {other:?}"),
+        }
+    }
+
+    /// 构造一个最小 SOCKS4 CONNECT 请求（无 USERID）发送到 stream。
+    async fn socks4_client_connect(
+        stream: &mut TcpStream,
+        ip: [u8; 4],
+        port: u16,
+        userid: &str,
+    ) {
+        let mut req = vec![SOCKS4_VERSION, CMD_TCP_CONNECT];
+        req.extend_from_slice(&port.to_be_bytes());
+        req.extend_from_slice(&ip);
+        req.extend_from_slice(userid.as_bytes());
+        req.push(0x00); // NULL terminator for USERID
+        stream.write_all(&req).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn socks4_handshake_ipv4_connect_succeeds() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = ServerConfig::default();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            socks_handshake(&mut sock, &config).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        socks4_client_connect(&mut client, [1, 2, 3, 4], 8080, "").await;
+
+        // 读 SOCKS4 回复：[VN=0, CD, DSTPORT(2), DSTIP(4)] = 8 字节
+        let mut reply = [0u8; 8];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[0], 0x00, "reply VN must be 0");
+        assert_eq!(reply[1], SOCKS4_REQUEST_GRANTED, "should be granted (90)");
+
+        let result = server.await.unwrap();
+        assert!(result.is_ok());
+        let socks_addr = match result.unwrap() {
+            SocksRequest::TcpConnect(a) => a,
+            other => panic!("expected TcpConnect, got {other:?}"),
+        };
+        match socks_addr.host {
+            Host::Ipv4(ip) => assert_eq!(ip.octets(), [1, 2, 3, 4]),
+            other => panic!("expected IPv4, got {other:?}"),
+        }
+        assert_eq!(socks_addr.port, 8080);
+    }
+
+    #[tokio::test]
+    async fn socks4a_handshake_domain_connect_succeeds() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = ServerConfig::default();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            socks_handshake(&mut sock, &config).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        // SOCKS4a: DSTIP = 0.0.0.1 标记域名模式
+        let mut req = vec![SOCKS4_VERSION, CMD_TCP_CONNECT];
+        req.extend_from_slice(&443u16.to_be_bytes());
+        req.extend_from_slice(&[0, 0, 0, 1]); // 0.0.0.x (x≠0) → 4a
+        req.push(0x00); // empty USERID NULL
+        req.extend_from_slice(b"example.com");
+        req.push(0x00); // hostname NULL terminator
+        client.write_all(&req).await.unwrap();
+
+        let mut reply = [0u8; 8];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], SOCKS4_REQUEST_GRANTED);
+
+        let result = server.await.unwrap();
+        assert!(result.is_ok());
+        let socks_addr = match result.unwrap() {
+            SocksRequest::TcpConnect(a) => a,
+            other => panic!("expected TcpConnect, got {other:?}"),
+        };
+        match socks_addr.host {
+            Host::Domain(d) => assert_eq!(d, "example.com"),
+            other => panic!("expected Domain, got {other:?}"),
+        }
+        assert_eq!(socks_addr.port, 443);
+    }
+
+    #[tokio::test]
+    async fn socks_handshake_routes_socks5_and_socks4() {
+        // SOCKS5 走 socks5 路径（含 method negotiation），返回 TcpConnect
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let config = ServerConfig::default();
+            let server = tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                socks_handshake(&mut sock, &config).await
+            });
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            socks5_client_noauth_connect(&mut client, "5.6.7.8:9999").await.unwrap();
+            let r = server.await.unwrap().unwrap();
+            assert!(matches!(r, SocksRequest::TcpConnect(_)));
+        }
+        // SOCKS4 走 socks4 路径
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let config = ServerConfig::default();
+            let server = tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                socks_handshake(&mut sock, &config).await
+            });
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            socks4_client_connect(&mut client, [9, 9, 9, 9], 53, "user").await;
+            let mut reply = [0u8; 8];
+            client.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply[1], SOCKS4_REQUEST_GRANTED);
+            let r = server.await.unwrap().unwrap();
+            assert!(matches!(r, SocksRequest::TcpConnect(_)));
         }
     }
 }

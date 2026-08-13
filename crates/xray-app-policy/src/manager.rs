@@ -46,12 +46,6 @@ impl Manager {
         Ok(Self { levels, system })
     }
 
-    /// 查询系统级统计策略。
-    ///
-    /// 对应 Go `(*Instance).ForSystem()`。
-    pub fn for_system(&self) -> SystemStats {
-        self.system
-    }
 }
 
 impl PolicyManager for Manager {
@@ -60,6 +54,13 @@ impl PolicyManager for Manager {
     /// 对应 Go `(*Instance).ForLevel(level)`。
     fn policy_for_level(&self, level: u32) -> Policy {
         self.levels.get(&level).cloned().unwrap_or_default()
+    }
+
+    /// 查询系统级统计策略。
+    ///
+    /// 对应 Go `(*Instance).ForSystem()`。
+    fn for_system(&self) -> SystemStats {
+        self.system
     }
 }
 
@@ -197,5 +198,8 @@ mod tests {
         let pm: &dyn PolicyManager = &m;
         let p = pm.policy_for_level(0);
         assert_eq!(p.timeout.handshake, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT);
+        // ForSystem 也通过 trait object 可用
+        let s = pm.for_system();
+        assert_eq!(s, SystemStats::default());
     }
 }

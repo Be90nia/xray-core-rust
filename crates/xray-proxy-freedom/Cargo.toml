@@ -17,6 +17,7 @@ xray-proto = { path = "../xray-proto" }
 async-trait = "0.1"
 thiserror = { workspace = true }
 tokio = { workspace = true }
+xray-xudp = { path = "../xray-xudp" }
 tracing = { workspace = true }
 
 [dev-dependencies]

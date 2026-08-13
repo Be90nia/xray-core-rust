@@ -220,6 +220,100 @@ impl From<StringList> for Vec<String> {
 }
 
 // =========================================================================
+// Network / NetworkList —— 网络类型（tcp/udp/unix/raw）
+// =========================================================================
+
+/// 配置层网络类型。对应 Go `infra/conf.Network`。
+///
+/// 取值：`"tcp"` / `"udp"` / `"unix"` / `"raw"`。路由规则用此区分流量类型。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Network {
+    #[default]
+    Tcp,
+    Udp,
+    Unix,
+    Raw,
+}
+
+impl Network {
+    /// 返回 Go 端小写字符串表示（`"tcp"` / `"udp"` / `"unix"` / `"raw"`）。
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+            Self::Unix => "unix",
+            Self::Raw => "raw",
+        }
+    }
+}
+
+impl fmt::Display for Network {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// 网络列表，兼容 `string`（逗号分隔）与 `string[]` 两种 JSON 表示。
+///
+/// 对应 Go `infra/conf.NetworkList`。当配置写 `"tcp,udp"` 时解析为两元素列表。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct NetworkList(pub Vec<Network>);
+
+impl NetworkList {
+    pub fn new(items: Vec<Network>) -> Self {
+        Self(items)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, Network> {
+        self.0.iter()
+    }
+}
+
+impl<'de> Deserialize<'de> for NetworkList {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Single(String),
+            Multi(Vec<String>),
+        }
+
+        let parse_one = |s: &str| -> Option<Network> {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "tcp" => Some(Network::Tcp),
+                "udp" => Some(Network::Udp),
+                "unix" => Some(Network::Unix),
+                "raw" => Some(Network::Raw),
+                _ => None,
+            }
+        };
+
+        match Raw::deserialize(d)? {
+            Raw::Single(s) => {
+                let items = s.split(',').filter_map(|p| parse_one(p)).collect();
+                Ok(NetworkList(items))
+            }
+            Raw::Multi(v) => {
+                let items = v.iter().filter_map(|s| parse_one(s)).collect();
+                Ok(NetworkList(items))
+            }
+        }
+    }
+}
+
+impl From<NetworkList> for Vec<String> {
+    fn from(n: NetworkList) -> Vec<String> {
+        n.0.iter().map(Network::as_str).map(str::to_string).collect()
+    }
+}
+
+// =========================================================================
 // 测试
 // =========================================================================
 
@@ -323,5 +417,35 @@ mod tests {
     fn stringlist_multi() {
         let s: StringList = serde_json::from_str(r#"["http", "tls"]"#).unwrap();
         assert_eq!(s.0, vec!["http".to_owned(), "tls".to_owned()]);
+    }
+
+    // ----- Network / NetworkList -----
+
+    #[test]
+    fn network_serde_lowercase() {
+        let n: Network = serde_json::from_str(r#""udp""#).unwrap();
+        assert_eq!(n, Network::Udp);
+        assert_eq!(n.as_str(), "udp");
+        let back = serde_json::to_string(&n).unwrap();
+        assert_eq!(back, r#""udp""#);
+    }
+
+    #[test]
+    fn networklist_comma_separated_string() {
+        let n: NetworkList = serde_json::from_str(r#""tcp,udp""#).unwrap();
+        assert_eq!(n.0, vec![Network::Tcp, Network::Udp]);
+    }
+
+    #[test]
+    fn networklist_array() {
+        let n: NetworkList = serde_json::from_str(r#"["tcp", "udp"]"#).unwrap();
+        assert_eq!(n.0, vec![Network::Tcp, Network::Udp]);
+    }
+
+    #[test]
+    fn networklist_into_vec_string() {
+        let n: NetworkList = serde_json::from_str(r#""unix""#).unwrap();
+        let v: Vec<String> = n.into();
+        assert_eq!(v, vec!["unix".to_string()]);
     }
 }

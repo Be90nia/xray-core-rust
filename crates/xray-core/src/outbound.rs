@@ -48,6 +48,7 @@ use xray_mux::client::{ClientManager, DialingWorkerFactory, IncrementalWorkerPic
 use xray_mux::session::ClientStrategy;
 // 补全协议注册
 use xray_proxy_hysteria::HysteriaConfig;
+use xray_proxy_freedom::{Config as FreedomConfig, DomainStrategy, Fragment, Noise};
 use xray_proxy_wireguard::DeviceConfig;
 
 
@@ -215,8 +216,15 @@ fn try_build_handler(
 
     match ob.entry.kind.as_str() {
         "freedom" => {
-            let dial_fn = xray_proxy_freedom::make_freedom_dial_fn();
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag)
+            let config = parse_freedom_config(&ob.entry.data);
+            let dial_fn = xray_proxy_freedom::make_freedom_dial_fn_with_config(config);
+            // TCP 走 DialBridge（保留代理链 / fragment / noise），UDP 走 FreedomDispatchBridge
+            let tcp_bridge = Arc::new(DialBridge::new(ob.tag.clone(), dial_fn));
+            let handler = Arc::new(xray_proxy_freedom::FreedomDispatchBridge::from_bridge(
+                Arc::clone(&tcp_bridge),
+            )) as Arc<dyn DispatchHandler>;
+            let bridge_ref = if proxy_chain_tag.is_some() { Some(tcp_bridge) } else { None };
+            Ok((handler, bridge_ref, proxy_chain_tag))
         }
         "vless" => {
             let config = parse_vless_config(&ob.entry.data)?;
@@ -434,19 +442,34 @@ fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutboundConfig, S
         .get("port")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| "missing vnext[0].port".to_string())?;
-    let user_id = first
+    let user = first
         .get("users")
         .and_then(|v| v.as_array())
         .and_then(|arr| arr.first())
-        .and_then(|u| u.get("id"))
+        .ok_or_else(|| "missing vnext[0].users[0]".to_string())?;
+    let user_id = user
+        .get("id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "missing vnext[0].users[0].id".to_string())?;
     let uuid = UUID::from_str(user_id)?;
+    // 可选 user 字段：flow / encryption / level / email（对应 Go infra/conf outbound user）。
+    let flow = user.get("flow").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let encryption = user
+        .get("encryption")
+        .and_then(|v| v.as_str())
+        .unwrap_or("none")
+        .to_string();
+    let level = user.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let email = user.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
     Ok(VlessOutboundConfig::new(
         uuid,
         Address::Domain(address.to_string()),
         Port::new(u16::try_from(port).map_err(|_| "port out of range")?),
-    ))
+    )
+    .with_flow(flow)
+    .with_encryption(encryption)
+    .with_level(level)
+    .with_email(email))
 }
 
 /// 解析 trojan outbound settings JSON → TrojanOutboundConfig。
@@ -473,11 +496,89 @@ fn parse_trojan_config(data: &[u8]) -> std::result::Result<TrojanOutboundConfig,
         .get("password")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "missing servers[0].password".to_string())?;
+    // 可选字段：level / email（对应 Go infra/conf outbound server）。
+    let level = first.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let email = first.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
     Ok(TrojanOutboundConfig::new(
         MemoryAccount::new(password),
         Address::Domain(address.to_string()),
         Port::new(u16::try_from(port).map_err(|_| "port out of range")?),
-    ))
+    )
+    .with_level(level)
+    .with_email(email))
+}
+
+/// 解析 freedom outbound settings JSON → FreedomConfig。
+///
+/// 对应 Go `proxy/freedom/freedom.go` Config 字段。JSON 格式：
+/// `{ "domainStrategy": "AsIs", "fragment": {...}, "noises": [...] }`
+///
+/// 解析失败或缺省返回 `Config::default()`（不阻断 freedom 注册）。
+fn parse_freedom_config(data: &[u8]) -> FreedomConfig {
+    use xray_proxy_freedom::{DomainStrategy, Fragment, Noise};
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(data) else {
+        return FreedomConfig::default();
+    };
+    let domain_strategy = v
+        .get("domainStrategy")
+        .and_then(|s| s.as_str())
+        .map(parse_freedom_domain_strategy)
+        .unwrap_or_default();
+    let fragment = v.get("fragment").and_then(parse_freedom_fragment);
+    let noises = v
+        .get("noises")
+        .and_then(|n| n.as_array())
+        .map(|arr| arr.iter().filter_map(parse_freedom_noise).collect())
+        .unwrap_or_default();
+    FreedomConfig {
+        domain_strategy: domain_strategy as i32,
+        fragment,
+        noises,
+        ..Default::default()
+    }
+}
+
+/// 把 domainStrategy 字符串映射为枚举值。
+fn parse_freedom_domain_strategy(s: &str) -> DomainStrategy {
+    match s {
+        "UseIP" => DomainStrategy::UseIP,
+        "UseIPv4" => DomainStrategy::UseIPv4,
+        "UseIPv6" => DomainStrategy::UseIPv6,
+        "UseIPv4v6" => DomainStrategy::UseIPv4v6,
+        "UseIPv6v4" => DomainStrategy::UseIPv6v4,
+        _ => DomainStrategy::AsIs,
+    }
+}
+
+/// 解析 fragment 子对象。
+fn parse_freedom_fragment(v: &serde_json::Value) -> Option<Fragment> {
+    let g = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    Some(Fragment {
+        packets_from: g("packets"),
+        packets_to: g("packets"),
+        length_min: g("lengthMin"),
+        length_max: g("lengthMax"),
+        interval_min: g("intervalMin"),
+        interval_max: g("intervalMax"),
+        max_split_min: g("maxSplitMin"),
+        max_split_max: g("maxSplitMax"),
+    })
+}
+
+/// 解析单个 noise 子对象。
+fn parse_freedom_noise(v: &serde_json::Value) -> Option<Noise> {
+    let g = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    Some(Noise {
+        length_min: g("lengthMin"),
+        length_max: g("lengthMax"),
+        delay_min: g("delayMin"),
+        delay_max: g("delayMax"),
+        packet: match v.get("packet").and_then(|x| x.as_str()) {
+            Some("rand") | None => Vec::new(),
+            Some(s) => s.as_bytes().to_vec(),
+        },
+        apply_to: String::new(),
+    })
 }
 
 /// 解析 blackhole outbound settings JSON → ResponseConfig。

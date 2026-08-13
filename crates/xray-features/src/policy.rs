@@ -116,6 +116,21 @@ impl Default for BufferPolicy {
     }
 }
 
+/// System-level statistics policy.
+///
+/// Corresponds to Go's `features/policy.SystemStats`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SystemStats {
+    /// Whether to enable stat counter for uplink traffic in inbound handlers.
+    pub inbound_uplink: bool,
+    /// Whether to enable stat counter for downlink traffic in inbound handlers.
+    pub inbound_downlink: bool,
+    /// Whether to enable stat counter for uplink traffic in outbound handlers.
+    pub outbound_uplink: bool,
+    /// Whether to enable stat counter for downlink traffic in outbound handlers.
+    pub outbound_downlink: bool,
+}
+
 /// Policy manager trait.
 ///
 /// Corresponds to Go's `features/policy.Manager`.
@@ -123,6 +138,11 @@ impl Default for BufferPolicy {
 pub trait PolicyManager: Send + Sync {
     /// Get the policy for the given user level.
     fn policy_for_level(&self, level: u32) -> Policy;
+
+    /// Get the system-level statistics policy.
+    ///
+    /// Corresponds to Go's `(*Manager).ForSystem()`.
+    fn for_system(&self) -> SystemStats;
 }
 
 /// 默认 Policy Feature 实现（essentialFeatures fallback）。
@@ -139,6 +159,10 @@ impl Feature for DefaultPolicyFeature {
 impl PolicyManager for DefaultPolicyFeature {
     fn policy_for_level(&self, _level: u32) -> Policy {
         Policy::default()
+    }
+
+    fn for_system(&self) -> SystemStats {
+        SystemStats::default()
     }
 }
 
@@ -205,6 +229,10 @@ mod tests {
     impl PolicyManager for MockPolicyManager {
         fn policy_for_level(&self, _level: u32) -> Policy {
             Policy::default()
+        }
+
+        fn for_system(&self) -> SystemStats {
+            SystemStats::default()
         }
     }
 

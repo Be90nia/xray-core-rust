@@ -274,9 +274,8 @@ mod tests {
         );
         let settings = StreamSettings {
             protocol: "grpc".to_string(),
-            security: String::new(),
             transport_json: Some(serde_json::json!({"serviceName":"GunService"})),
-            security_json: None,
+            ..StreamSettings::tcp()
         };
         let result = dial_grpc(&dest, &settings).await;
         assert!(result.is_err(), "should fail (no h2 server at localhost:1)");
