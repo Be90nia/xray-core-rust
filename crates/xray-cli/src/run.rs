@@ -99,7 +99,7 @@ pub fn execute(args: RunArgs) -> Result<()> {
     }
 
     // 创建 tokio runtime 用于 async 启动 + 信号等待
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| CliError::StartFailed(format!("tokio runtime init failed: {e}")))?;
