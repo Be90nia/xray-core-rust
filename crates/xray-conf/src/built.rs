@@ -157,19 +157,32 @@ impl Config {
                 })?,
                 None => Vec::new(),
             };
-            out.inbounds.push(BuiltInbound {
-                entry: BuiltEntry {
-                    kind: ib.protocol.clone(),
-                    data,
-                },
-                tag: ib.tag.clone(),
-                port: ib.port.as_ref().and_then(|pl| pl.0.first().map(|r| r.start)),
-                listen: ib.listen.as_ref().map(|a| a.0.clone()),
-                stream_settings_json: ib.stream_settings.clone(),
-                sniffing_json: ib.sniffing.as_ref().map(|s| {
-                    serde_json::to_value(s).unwrap_or(Value::Null)
-                }),
-            });
+            // 展开 PortList 所有 range 为多个 BuiltInbound（对齐 Go 多端口监听）。
+            let ports: Vec<u16> = match &ib.port {
+                Some(pl) => pl.0.iter().flat_map(|r| r.start..=r.end).collect(),
+                None => vec![],
+            };
+            if ports.is_empty() {
+                return Err(ConfError::Build {
+                    what: "inbound.port",
+                    message: format!("inbound '{}' has no port", ib.tag),
+                });
+            }
+            for port in ports {
+                out.inbounds.push(BuiltInbound {
+                    entry: BuiltEntry {
+                        kind: ib.protocol.clone(),
+                        data: data.clone(),
+                    },
+                    tag: ib.tag.clone(),
+                    port: Some(port),
+                    listen: ib.listen.as_ref().map(|a| a.0.clone()),
+                    stream_settings_json: ib.stream_settings.clone(),
+                    sniffing_json: ib.sniffing.as_ref().map(|s| {
+                        serde_json::to_value(s).unwrap_or(Value::Null)
+                    }),
+                });
+            }
         }
 
         // Outbounds
