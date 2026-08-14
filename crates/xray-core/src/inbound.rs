@@ -748,6 +748,24 @@ fn spawn_inbound_serve(
     })
 }
 
+/// 从 inbound streamSettings 构建 TLS acceptor（security=tls 时）。
+///
+/// 对应 Go inbound listener 的 `tls.ConfigFromStreamSettings` → `tls.NewListener`。
+/// serve 函数 accept 后先做 TLS handshake 再处理协议数据。
+fn build_tls_acceptor(
+    stream_settings_json: Option<&serde_json::Value>,
+) -> std::io::Result<Option<Arc<xray_transport::TlsAcceptor>>> {
+    let settings = xray_transport::dialer::StreamSettings::from_json(stream_settings_json);
+    if !settings.is_tls() {
+        return Ok(None);
+    }
+    let cfg = xray_tls::server_config::build_server_config(
+        &settings.security,
+        settings.security_json.as_ref(),
+    )?;
+    Ok(cfg.map(|c| Arc::new(xray_transport::TlsAcceptor::from(c))))
+}
+
 /// 按协议种类启动单个 inbound listener。
 async fn spawn_one_inbound(
     ib: &BuiltInbound,
@@ -806,9 +824,10 @@ async fn spawn_one_inbound(
         "vless" => {
             let validator: Arc<dyn VlessValidator> = build_vless_validator(&ib.entry.data)?;
             let listener = TcpListener::bind(&addr).await?;
-            tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_count(), "vless inbound listening");
+            let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
+            tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_count(), tls = tls.is_some(), "vless inbound listening");
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                serve_vless(listener, ohm, validator, None).await
+                serve_vless(listener, ohm, validator, tls).await
             })))
         }
         "trojan" => {
