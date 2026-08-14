@@ -65,6 +65,30 @@ async fn dial_reality(dest: &Destination, settings: &StreamSettings) -> io::Resu
     Ok(Box::new(conn))
 }
 
+/// 对已建立的底层连接做 REALITY 握手，返回包装后的 Connection。
+///
+/// 供 tcp dialer（`xray-transport-tcp`）在 `security=reality` 时调用：
+/// tcp dialer 先 `dial_system` 建 TCP，再委托本函数完成 REALITY TLS 握手。
+/// 对应 Go `reality.UClient(conn, config, ctx, dest)`。
+///
+/// `conn` 通常是 `dial_system` 返回的底层 TCP 连接。
+pub async fn handshake_over(
+    conn: Box<dyn Connection>,
+    settings: &StreamSettings,
+) -> io::Result<Box<dyn Connection>> {
+    let config = parse_reality_config(settings.security_json.as_ref())?;
+    let state = UConnState::new(config).map_err(|e| io::Error::other(e.to_string()))?;
+    let remote_addr = conn.remote_addr()?;
+    let local_addr = conn.local_addr()?;
+    let tls_stream = u_client(conn, state)
+        .await
+        .map_err(|e| io::Error::other(format!("reality handshake: {e}")))?;
+    let mut rc = RealityConnection::new(tls_stream);
+    rc.remote_addr = remote_addr;
+    rc.local_addr = local_addr;
+    Ok(Box::new(rc))
+}
+
 /// 从 `realitySettings` JSON 构造 [`RealityConfig`]。
 ///
 /// 接受字段（Go `infra/conf/transport_internet.go::RealityConfig` JSON tag）：

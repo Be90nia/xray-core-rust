@@ -6576,13 +6576,17 @@ dependencies = [
 name = "xray-transport-tcp"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "hex",
  "rcgen 0.13.2",
  "rustls",
  "serde_json",
  "tokio",
  "tokio-rustls",
  "tracing",
+ "x25519-dalek",
  "xray-common",
+ "xray-reality",
  "xray-tls",
  "xray-transport",
 ]

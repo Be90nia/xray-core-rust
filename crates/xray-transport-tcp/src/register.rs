@@ -53,15 +53,15 @@ async fn wrap_security(
     settings: &StreamSettings,
     dest: &Destination,
 ) -> io::Result<Box<dyn Connection>> {
+    // security=none（或空）原样返回。
     if !settings.is_tls() {
         return Ok(conn);
     }
+    // security=reality：委托 xray_reality 做 REALITY TLS 握手（session_id/auth_key/cert HMAC）。
     if settings.security == "reality" {
-        tracing::warn!(
-            target: "xray_transport_tcp",
-            "security=reality 暂未接入完整 uTLS 握手，fallback 到标准 TLS（P0 #2iu）"
-        );
+        return xray_reality::register::handshake_over(conn, settings).await;
     }
+    // security=tls：标准 rustls 包装。
     let default_sni = dest.address().to_string();
     let sni = resolve_sni(settings, &default_sni);
     let config = build_client_config(&settings.security, settings.security_json.as_ref(), &default_sni)?;
