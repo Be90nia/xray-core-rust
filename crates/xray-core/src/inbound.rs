@@ -24,6 +24,7 @@ use xray_proxy_socks::ServerConfig;
 use tokio::io::AsyncReadExt;
 use xray_transport::link::Link;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use xray_conf::{BuiltConfig, BuiltInbound};
 // P1-B: vless/trojan inbound 集成
 use std::collections::HashMap;
@@ -133,8 +134,8 @@ async fn handle_connection(
             // 2. SocksAddr → Destination
             let dest = socks_addr_to_destination(&addr)?;
             // 3. 拆 TcpStream → (read, write) → Link
-            // ponytail: tokio::io::split 返回的 ReadHalf/WriteHalf 是 'static + Send，
-            // new_reader/new_writer 接受 AsyncRead/AsyncWrite + Unpin + Send + 'static。
+            // ponytail: tokio::io::split 返回的 ReadHalf/WriteHalf 是 'static + Send,
+            // new_reader/new_writer 接受 AsyncRead/AsyncWrite + Unpin + Send + 'static.
             let (read_half, write_half) = tokio::io::split(stream);
             let link = Link::new(new_reader(read_half), new_writer(write_half));
             // 4. dispatch（zx7: mux.cool dest 转给 mux ServerWorker）
@@ -713,20 +714,45 @@ pub async fn serve_dns(
 pub async fn spawn_inbounds(
     built: &BuiltConfig,
     ohm: Arc<SimpleOhm>,
+    shutdown_token: CancellationToken,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let mut handles = Vec::new();
     for ib in &built.inbounds {
-        if let Some(handle) = spawn_one_inbound(ib, Arc::clone(&ohm)).await? {
+        if let Some(handle) = spawn_one_inbound(ib, Arc::clone(&ohm), shutdown_token.clone()).await? {
             handles.push(handle);
         }
     }
     Ok(handles)
 }
 
+/// spawn 一个 inbound serve task，监听 shutdown_token 实现优雅关闭。
+///
+/// token cancel 时取消 serve future（drop listener，accept 循环终止）。
+/// 对应 Go 有序关闭的"先停 accept"阶段。connection drain 留后续。
+fn spawn_inbound_serve(
+    tag: String,
+    shutdown_token: CancellationToken,
+    fut: impl Future<Output = std::io::Result<()>> + Send + 'static,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        tokio::select! {
+            r = fut => {
+                if let Err(e) = r {
+                    tracing::error!(tag = %tag, error = %e, "inbound stopped");
+                }
+            }
+            _ = shutdown_token.cancelled() => {
+                tracing::info!(tag = %tag, "inbound shutting down (graceful)");
+            }
+        }
+    })
+}
+
 /// 按协议种类启动单个 inbound listener。
 async fn spawn_one_inbound(
     ib: &BuiltInbound,
     ohm: Arc<SimpleOhm>,
+    shutdown_token: CancellationToken,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     // TUN inbound 不需要 port/addr，提前处理
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
@@ -773,23 +799,17 @@ async fn spawn_one_inbound(
             let listener = TcpListener::bind(&addr).await?;
             tracing::info!(tag = %ib.tag, addr = %addr, "socks5 inbound listening");
             let config = Arc::new(ServerConfig::default());
-            let handle = tokio::spawn(async move {
-                if let Err(e) = serve_socks5(listener, ohm, config).await {
-                    tracing::error!(error = %e, "socks5 inbound stopped");
-                }
-            });
-            Ok(Some(handle))
+            Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+                serve_socks5(listener, ohm, config).await
+            })))
         }
         "vless" => {
             let validator: Arc<dyn VlessValidator> = build_vless_validator(&ib.entry.data)?;
             let listener = TcpListener::bind(&addr).await?;
             tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_count(), "vless inbound listening");
-            let handle = tokio::spawn(async move {
-                if let Err(e) = serve_vless(listener, ohm, validator, None).await {
-                    tracing::error!(error = %e, "vless inbound stopped");
-                }
-            });
-            Ok(Some(handle))
+            Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+                serve_vless(listener, ohm, validator, None).await
+            })))
         }
         "trojan" => {
             let users = build_trojan_users(&ib.entry.data)?;
@@ -813,12 +833,9 @@ async fn spawn_one_inbound(
                 .flatten();
             let listener = TcpListener::bind(&addr).await?;
             tracing::info!(tag = %ib.tag, addr = %addr, users = users.len(), "trojan inbound listening");
-            let handle = tokio::spawn(async move {
-                if let Err(e) = serve_trojan(listener, ohm, users, fallbacks, None).await {
-                    tracing::error!(error = %e, "trojan inbound stopped");
-                }
-            });
-            Ok(Some(handle))
+            Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+                serve_trojan(listener, ohm, users, fallbacks, None).await
+            })))
         }
         "vmess" => {
             let validator = build_vmess_validator(&ib.entry.data)?;
@@ -833,23 +850,17 @@ async fn spawn_one_inbound(
                 });
             let listener = TcpListener::bind(&addr).await?;
             tracing::info!(tag = %ib.tag, addr = %addr, "vmess inbound listening");
-            let handle = tokio::spawn(async move {
-                if let Err(e) = serve_vmess(listener, ohm, validator, detour_to, None).await {
-                    tracing::error!(error = %e, "vmess inbound stopped");
-                }
-            });
-            Ok(Some(handle))
+            Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+                serve_vmess(listener, ohm, validator, detour_to, None).await
+            })))
         }
         "http" => {
             let config = parse_http_config(&ib.entry.data)?;
             let listener = TcpListener::bind(&addr).await?;
             tracing::info!(tag = %ib.tag, addr = %addr, "http inbound listening");
-            let handle = tokio::spawn(async move {
-                if let Err(e) = serve_http(listener, ohm, Arc::new(config)).await {
-                    tracing::error!(error = %e, "http inbound stopped");
-                }
-            });
-            Ok(Some(handle))
+            Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+                serve_http(listener, ohm, Arc::new(config)).await
+            })))
         }
         "dokodemo" => {
             let settings = parse_dokodemo_settings(&ib.entry.data)?;
@@ -884,25 +895,22 @@ async fn spawn_one_inbound(
                     "dokodemo: no valid network specified (need tcp and/or udp)",
                 ));
             }
-            // 合并所有 listener handle 为一个JoinHandle
-            let combined = tokio::spawn(async move {
+            // 合并所有 listener handle；token cancel 时 combined 被取消（子 handle 被 drop/abort）。
+            Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                 for h in handles {
                     let _ = h.await;
                 }
-            });
-            Ok(Some(combined))
+                Ok(())
+            })))
         }
         // shadowsocks inbound：SsInbound + serve_ss accept loop
         "shadowsocks" => {
             let listener = TcpListener::bind(&addr).await?;
             let inbound = parse_ss_inbound_config(&ib.entry.data)?;
             tracing::info!(tag = %ib.tag, addr = %addr, "shadowsocks inbound listening");
-            let handle = tokio::spawn(async move {
-                if let Err(e) = serve_ss(listener, ohm, inbound).await {
-                    tracing::error!(error = %e, "shadowsocks inbound stopped");
-                }
-            });
-            Ok(Some(handle))
+            Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+                serve_ss(listener, ohm, inbound).await
+            })))
         }
         // hysteria inbound：HysteriaInboundHandler impl InboundHandler
         "hysteria" => {
@@ -914,12 +922,9 @@ async fn spawn_one_inbound(
             )
             .map_err(|e| std::io::Error::other(format!("hysteria inbound: {e}")))?;
             tracing::info!(tag = %ib.tag, addr = %addr, "hysteria inbound listening");
-            let handle = tokio::spawn(async move {
-                if let Err(e) = handler.start().await {
-                    tracing::error!(error = ?e, "hysteria inbound stopped");
-                }
-            });
-            Ok(Some(handle))
+            Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+                handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))
+            })))
         }
         // anytls inbound：AnytlsInboundHandler impl InboundHandler
         "anytls" => {
@@ -929,24 +934,16 @@ async fn spawn_one_inbound(
             let handler = xray_proxy_anytls::AnytlsInboundHandler::new(
                 &ib.tag, bind_addr, tls_acceptor,
             );
-            tracing::info!(tag = %ib.tag, addr = %addr, "anytls inbound listening");
-            let handle = tokio::spawn(async move {
-                if let Err(e) = handler.start().await {
-                    tracing::error!(error = ?e, "anytls inbound stopped");
-                }
-            });
-            Ok(Some(handle))
+            Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+                handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))
+            })))
         }
         // tuic inbound：QUIC listener，当前 no-op（需要 quinn server adapter）
         "tuic" => {
             let handler = parse_tuic_inbound_config(&ib.entry.data, &addr)?;
-            tracing::info!(tag = %ib.tag, addr = %addr, "tuic inbound listening");
-            let handle = tokio::spawn(async move {
-                if let Err(e) = handler.start().await {
-                    tracing::error!(error = ?e, "tuic inbound stopped");
-                }
-            });
-            Ok(Some(handle))
+            Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+                handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))
+            })))
         }
         // wireguard inbound：WireguardInboundHandler impl InboundHandler
         "wireguard" => {
@@ -959,13 +956,9 @@ async fn spawn_one_inbound(
             )
             .await
             .map_err(|e| std::io::Error::other(format!("wireguard inbound: {e}")))?;
-            tracing::info!(tag = %ib.tag, port = listen_port, "wireguard inbound listening");
-            let handle = tokio::spawn(async move {
-                if let Err(e) = handler.start().await {
-                    tracing::error!(error = ?e, "wireguard inbound stopped");
-                }
-            });
-            Ok(Some(handle))
+            Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+                handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))
+            })))
         }
         // dns inbound：UDP+TCP listener → handle_packet/handle_conn
         "dns" => {
@@ -974,12 +967,9 @@ async fn spawn_one_inbound(
             let udp = UdpSocket::bind(&addr).await?;
             let tcp = TcpListener::bind(&addr).await?;
             tracing::info!(tag = %ib.tag, addr = %addr, "dns inbound listening (UDP+TCP)");
-            let handle = tokio::spawn(async move {
-                if let Err(e) = serve_dns(udp, tcp, inbound).await {
-                    tracing::error!(error = %e, "dns inbound stopped");
-                }
-            });
-            Ok(Some(handle))
+            Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+                serve_dns(udp, tcp, inbound).await
+            })))
         }
         // loopback inbound：LoopbackHandler 注册（outbound-only，start/close no-op）
         "loopback" => {
@@ -995,11 +985,11 @@ async fn spawn_one_inbound(
             let handler = BlackholeInboundHandler::new(&ib.tag, response, &addr);
             handler.start().await
                 .map_err(|e| std::io::Error::other(format!("blackhole inbound: {e}")))?;
-            let handle = tokio::spawn(async move {
-                // accept 循环在 start() 内部 spawn，此 task 保持 handler 存活
-                std::future::pending::<()>().await
-            });
-            Ok(Some(handle))
+            // accept 循环在 start() 内部 spawn，此 task 保持 handler 存活并监听 shutdown。
+            Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+                std::future::pending::<()>().await;
+                Ok(())
+            })))
         }
         // freedom inbound：accept 连接后 dial 预定义目标并双向转发
         "freedom" => {
@@ -1007,11 +997,11 @@ async fn spawn_one_inbound(
             let handler = FreedomInboundHandler::new(&ib.tag, &addr, dest, Arc::clone(&ohm));
             handler.start().await
                 .map_err(|e| std::io::Error::other(format!("freedom inbound: {e}")))?;
-            let handle = tokio::spawn(async move {
-                // accept 循环在 start() 内部 spawn，此 task 保持 handler 存活
-                std::future::pending::<()>().await
-            });
-            Ok(Some(handle))
+            // accept 循环在 start() 内部 spawn，此 task 保持 handler 存活并监听 shutdown。
+            Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+                std::future::pending::<()>().await;
+                Ok(())
+            })))
         }
         other => {
             tracing::warn!(
@@ -1024,7 +1014,6 @@ async fn spawn_one_inbound(
     }
 }
 
-/// 从 inbound entry.data（JSON）解析 vless clients → MemoryValidator。
 ///
 /// JSON 格式：`{"clients":[{"id":"uuid","flow":"","email":""}],"decryption":"none"}`。
 /// 对每个 client 构造最小 `ProtoAccount`（id+flow+encryption=none）→ `MemoryAccount::from_proto_account`。

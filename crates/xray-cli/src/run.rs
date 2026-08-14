@@ -105,7 +105,7 @@ pub fn execute(args: RunArgs) -> Result<()> {
         .map_err(|e| CliError::StartFailed(format!("tokio runtime init failed: {e}")))?;
 
     // start_full 注册传输 + outbound + spawn inbound，返回 (instance, ohm, handles)
-    let (instance, _ohm, _handles) = rt.block_on(async {
+    let (instance, _ohm, handles) = rt.block_on(async {
         xray_core::start_full(&built)
             .await
             .map_err(|e| CliError::StartFailed(e.to_string()))
@@ -113,9 +113,15 @@ pub fn execute(args: RunArgs) -> Result<()> {
 
     // 等待 Ctrl-C / SIGTERM 信号
     rt.block_on(wait_for_signal());
-    rt.shutdown_timeout(Duration::from_secs(5));
 
+    // 优雅关闭：close() 取消 shutdown_token → 所有 inbound serve task 收到 cancel 通知。
+    // join handles 让 listener 停止 accept（drain 连接留后续），再 drop runtime。
     close_if_sole_owner(instance)?;
+    rt.block_on(async {
+        for h in handles {
+            let _ = h.await;
+        }
+    });
     tracing::info!("xray instance shutdown");
     Ok(())
 }

@@ -97,13 +97,14 @@ async fn run(config: PathBuf) -> anyhow::Result<()> {
         "config built, starting instance"
     );
 
-    let (_instance, _ohm, handles) = xray_core::functions::start_full(&built).await?;
+    let (instance, _ohm, handles) = xray_core::functions::start_full(&built).await?;
 
     tracing::info!("Xray started, waiting for Ctrl+C");
     // 等待所有 inbound 任务（永久阻塞直到 Ctrl+C 或所有 inbound 退出）
     for h in handles {
         let _ = h.await;
     }
+    drop(instance);
     tracing::info!("all inbound tasks exited, shutting down");
     Ok(())
 }

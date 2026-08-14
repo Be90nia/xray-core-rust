@@ -128,7 +128,7 @@ async fn start_full_no_router(
     let mut instance = Instance::new_from_built(built)?;
     let ohm = Arc::new(SimpleOhm::new());
     register_outbounds(built, &ohm, None)?;
-    let handles = spawn_inbounds(built, Arc::clone(&ohm))
+    let handles = spawn_inbounds(built, Arc::clone(&ohm), instance.shutdown_token().clone())
         .await
         .map_err(|e| CoreFunctionError::InstanceStart(e.to_string()))?;
     instance.start()?;
@@ -163,7 +163,7 @@ pub async fn start_full_with_router(
         ohm.set_default(routing);
     }
 
-    let handles = spawn_inbounds(built, Arc::clone(&ohm))
+    let handles = spawn_inbounds(built, Arc::clone(&ohm), instance.shutdown_token().clone())
         .await
         .map_err(|e| CoreFunctionError::InstanceStart(e.to_string()))?;
     instance.start()?;
@@ -470,6 +470,49 @@ mod tests {
         for h in handles {
             h.abort();
         }
+    }
+
+    /// Graceful shutdown：cancel shutdown_token 后 inbound task 应退出。
+    #[tokio::test]
+    async fn graceful_shutdown_cancels_inbound_tasks() {
+        // 找空闲端口给 socks inbound
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let mut built = BuiltConfig::default();
+        built.inbounds.push(BuiltInbound {
+            entry: BuiltEntry { kind: "socks".into(), data: vec![] },
+            tag: "socks-in".into(),
+            port: Some(socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        built.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            tag: "direct".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+        });
+
+        let (mut inst, _ohm, handles) = start_full(&built).await.unwrap();
+        assert!(inst.is_running());
+        // 等 listener 就绪
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // cancel token 触发 graceful shutdown
+        inst.shutdown_token().cancel();
+
+        // 所有 inbound handle 应在合理时间内退出（token cancel → select! 命中 → task 结束）
+        let drain = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            for h in handles {
+                let _ = h.await;
+            }
+        });
+        drain.await.expect("inbound tasks should exit within 2s after token cancel");
     }
 
     /// SOCKS5 → VMess → Freedom → echo 全链路
