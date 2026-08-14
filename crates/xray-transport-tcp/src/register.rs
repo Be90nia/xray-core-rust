@@ -61,14 +61,29 @@ async fn wrap_security(
     if settings.security == "reality" {
         return xray_reality::register::handshake_over(conn, settings).await;
     }
-    // security=tls：标准 rustls 包装。
+    // security=tls：有 fingerprint 用 u_client（btls 真实指纹），否则标准 rustls。
     let default_sni = dest.address().to_string();
     let sni = resolve_sni(settings, &default_sni);
     let config = build_client_config(&settings.security, settings.security_json.as_ref(), &default_sni)?;
     match config {
         Some(cfg) => {
-            let tls_conn = xray_tls::utls::client(conn, &sni, cfg).await?;
-            Ok(Box::new(tls_conn))
+            // 解析 fingerprint 字段（对齐 Go tls.ConfigFromStreamSettings → GetFingerprint）。
+            let fp_name = settings
+                .security_json
+                .as_ref()
+                .and_then(|v| v.as_object())
+                .and_then(|m| m.get("fingerprint"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !fp_name.is_empty() {
+                let fp = xray_tls::fingerprint::get_fingerprint(fp_name)
+                    .map_err(|e| io::Error::other(format!("invalid fingerprint: {e}")))?;
+                let tls_conn = xray_tls::utls::u_client(conn, &sni, cfg, fp).await?;
+                Ok(Box::new(tls_conn))
+            } else {
+                let tls_conn = xray_tls::utls::client(conn, &sni, cfg).await?;
+                Ok(Box::new(tls_conn))
+            }
         }
         None => Ok(conn),
     }
