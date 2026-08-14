@@ -104,7 +104,7 @@ pub fn make_dial_fn(config: Arc<TrojanOutboundConfig>) -> DialFn {
         Box::pin(async move {
             // 1. dial Trojan server：有 streamSettings 走 transport dialer（ws/grpc/...），否则裸 TCP。
             let server_dest = config.server_destination();
-            let sockopt = SocketOptions::default();
+            let sockopt = config.stream_settings.as_ref().map(|s| s.socket_options()).unwrap_or_default();
             let mut conn: Box<dyn Connection> = match &config.stream_settings {
                 Some(s) => dial(&server_dest, s, &sockopt)
                     .await

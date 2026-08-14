@@ -151,6 +151,38 @@ impl StreamSettings {
     pub fn is_tls(&self) -> bool {
         matches!(self.security.as_str(), "tls" | "reality")
     }
+
+    /// 从 `sockopt_json` 解析 SocketOptions（对应 Go `SocketConfig`）。
+    ///
+    /// 支持字段：`mark` / `tcpFastOpen` / `tcpKeepAliveInterval`（秒）/
+    /// `tcpKeepAliveIdle`（秒）/ `v6only`。缺省字段用 [`SocketOptions::default`]。
+    /// Go 的 congestion/windowClamp/maxSeg/userTimeout/mptcp/interface 在
+    /// [`SocketOptions`](crate::sockopt::SocketOptions) 尚无对应字段，暂不解析。
+    #[must_use]
+    pub fn socket_options(&self) -> SocketOptions {
+        let mut opts = SocketOptions::default();
+        let Some(obj) = self.sockopt_json.as_ref().and_then(|v| v.as_object()) else {
+            return opts;
+        };
+        if let Some(v) = obj.get("mark").and_then(|v| v.as_u64()) {
+            opts.mark = v as u32;
+        }
+        // Go TFO 是 interface{}：JSON 常写 true/false 或 0/1。
+        if let Some(v) = obj.get("tcpFastOpen") {
+            let on = v.as_bool().unwrap_or_else(|| v.as_i64() == Some(1));
+            opts.tcp_fast_open = on;
+        }
+        if let Some(v) = obj.get("tcpKeepAliveInterval").and_then(|v| v.as_u64()) {
+            opts.tcp_keepalive_interval = std::time::Duration::from_secs(v);
+        }
+        if let Some(v) = obj.get("tcpKeepAliveIdle").and_then(|v| v.as_u64()) {
+            opts.tcp_keepalive_idle = std::time::Duration::from_secs(v);
+        }
+        if let Some(v) = obj.get("v6only").and_then(|v| v.as_bool()) {
+            opts.ipv6_only = v;
+        }
+        opts
+    }
 }
 
 /// 把 `network` 值映射到对应 JSON settings 字段名。
@@ -280,6 +312,37 @@ mod transport_cache_tests {
     use xray_common::net::address::Address;
     use xray_common::net::port::Port;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn socket_options_parses_sockopt_json() {
+        let mut s = StreamSettings::tcp();
+        s.sockopt_json = Some(serde_json::json!({
+            "mark": 255,
+            "tcpFastOpen": true,
+            "tcpKeepAliveInterval": 30,
+            "tcpKeepAliveIdle": 60,
+            "v6only": true
+        }));
+        let o = s.socket_options();
+        assert_eq!(o.mark, 255);
+        assert!(o.tcp_fast_open);
+        assert_eq!(o.tcp_keepalive_interval, std::time::Duration::from_secs(30));
+        assert_eq!(o.tcp_keepalive_idle, std::time::Duration::from_secs(60));
+        assert!(o.ipv6_only);
+    }
+
+    #[test]
+    fn socket_options_defaults_without_json() {
+        let s = StreamSettings::tcp();
+        assert_eq!(s.socket_options(), SocketOptions::default());
+    }
+
+    #[test]
+    fn socket_options_tfo_accepts_numeric_one() {
+        let mut s = StreamSettings::tcp();
+        s.sockopt_json = Some(serde_json::json!({ "tcpFastOpen": 1 }));
+        assert!(s.socket_options().tcp_fast_open);
+    }
 
     #[test]
     fn register_and_get_transport_dialer() {

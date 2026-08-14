@@ -129,7 +129,7 @@ pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
         Box::pin(async move {
             // 1. 拨号到 HTTP 代理服务器
             let server_dest = config.server_destination();
-            let sockopt = SocketOptions::default();
+            let sockopt = config.stream_settings.as_ref().map(|s| s.socket_options()).unwrap_or_default();
             let mut conn: Box<dyn Connection> = match &config.stream_settings {
                 Some(s) => dial(&server_dest, s, &sockopt)
                     .await

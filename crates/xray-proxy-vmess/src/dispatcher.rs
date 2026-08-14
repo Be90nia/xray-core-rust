@@ -195,7 +195,7 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>) -> DialFn {
         let target_port = dest.port();
         Box::pin(async move {
             let server_dest = config.server_destination();
-            let sockopt = SocketOptions::default();
+            let sockopt = config.stream_settings.as_ref().map(|s| s.socket_options()).unwrap_or_default();
             let mut conn: Box<dyn Connection> = match &config.stream_settings {
                 Some(s) => xray_transport::dialer::dial(&server_dest, s, &sockopt)
                     .await

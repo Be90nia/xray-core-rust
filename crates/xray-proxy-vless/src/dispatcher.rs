@@ -133,7 +133,7 @@ pub fn make_dial_fn(config: Arc<VlessOutboundConfig>) -> DialFn {
         Box::pin(async move {
             // 1. dial VLESS server：有 streamSettings 走 transport dialer（ws/grpc/...），否则裸 TCP。
             let server_dest = config.server_destination();
-            let sockopt = SocketOptions::default();
+            let sockopt = config.stream_settings.as_ref().map(|s| s.socket_options()).unwrap_or_default();
             let mut conn: Box<dyn Connection> = match &config.stream_settings {
                 Some(s) => dial(&server_dest, s, &sockopt)
                     .await
@@ -178,7 +178,7 @@ pub fn make_dial_fn_with_addons(config: Arc<VlessOutboundConfig>, addons: Addons
         let target_port = dest.port();
         Box::pin(async move {
             let server_dest = config.server_destination();
-            let sockopt = SocketOptions::default();
+            let sockopt = config.stream_settings.as_ref().map(|s| s.socket_options()).unwrap_or_default();
             let mut conn: Box<dyn Connection> = match &config.stream_settings {
                 Some(s) => dial(&server_dest, s, &sockopt)
                     .await
