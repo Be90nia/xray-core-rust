@@ -71,6 +71,10 @@ pub fn register_all_transports() {
     // TCP（系统传输）
     let _ = xray_transport::tcp::register_tcp_transport();
 
+    // TCP dialer（出站 + security 包装：tls/reality）——独立 crate，
+    // 因 xray-transport 核心不能依赖 xray-tls（循环依赖）。
+    let _ = xray_transport_tcp::register::register_dialer();
+
     // WebSocket
     let _ = xray_transport_websocket::register::register_dialer();
     let _ = xray_transport_websocket::register::register_listener();

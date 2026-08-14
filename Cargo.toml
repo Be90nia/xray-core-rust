@@ -21,6 +21,7 @@ members = [
     "crates/xray-reality",
 
     # Layer 3 - 传输协议
+    "crates/xray-transport-tcp",
     "crates/xray-transport-kcp",
     "crates/xray-transport-hysteria",
     "crates/xray-transport-splithttp",

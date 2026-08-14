@@ -5908,6 +5908,7 @@ dependencies = [
  "xray-transport-kcp",
  "xray-transport-quic",
  "xray-transport-splithttp",
+ "xray-transport-tcp",
  "xray-transport-websocket",
  "xray-xudp",
 ]
@@ -6567,6 +6568,21 @@ dependencies = [
  "xray-buf",
  "xray-common",
  "xray-proto",
+ "xray-tls",
+ "xray-transport",
+]
+
+[[package]]
+name = "xray-transport-tcp"
+version = "0.1.0"
+dependencies = [
+ "rcgen 0.13.2",
+ "rustls",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "xray-common",
  "xray-tls",
  "xray-transport",
 ]

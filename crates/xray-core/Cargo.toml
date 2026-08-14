@@ -28,6 +28,7 @@ xray-proxy-loopback = { path = "../xray-proxy-loopback" }
 xray-mux = { path = "../xray-mux" }
 xray-buf = { path = "../xray-buf" }
 xray-transport = { path = "../xray-transport" }
+xray-transport-tcp = { path = "../xray-transport-tcp" }
 xray-proto = { path = "../xray-proto", features = ["grpc-server"] }
 xray-transport-hysteria = { path = "../xray-transport-hysteria" }
 xray-transport-grpc = { path = "../xray-transport-grpc" }

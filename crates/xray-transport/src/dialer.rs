@@ -234,23 +234,28 @@ pub async fn dial_transport(
 /// 按 protocol 名查 transport dialer 并传入完整 streamSettings 拨号。
 ///
 /// 对应 Go `transportDialerCache[protocol](ctx, dest, streamSettings)`。
-/// TCP 协议（`"tcp"` / `"raw"`）走 [`system_dialer::dial_system`]。
+/// tcp/raw 默认注册了含 security 包装的 dialer（`xray-transport-tcp`），
+/// 故 `network:"tcp", security:"tls"` 等配置会正确包装 TLS。未注册时
+/// tcp/raw fallback 到 [`system_dialer::dial_system`]（裸 TCP，向后兼容）。
 pub async fn dial_with_settings(
     protocol: &str,
     destination: &Destination,
     sockopt: &SocketOptions,
     settings: &StreamSettings,
 ) -> io::Result<Box<dyn Connection>> {
+    // 先查注册的 transport dialer（tcp/ws/grpc/... 注册到全局表）。
+    if let Some(dialer_fn) = get_transport_dialer(protocol) {
+        return dialer_fn(destination, sockopt, settings).await;
+    }
+    // fallback：未注册协议（如未调用 register_dialer 的测试环境），
+    // tcp/raw 走裸系统拨号，保持向后兼容。
     if protocol == "tcp" || protocol == "raw" {
         return crate::system_dialer::dial_system(destination, sockopt).await;
     }
-    match get_transport_dialer(protocol) {
-        Some(dialer_fn) => dialer_fn(destination, sockopt, settings).await,
-        None => Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("{protocol} dialer not registered"),
-        )),
-    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("{protocol} dialer not registered"),
+    ))
 }
 
 /// 顶层 transport 入口。对应 Go `transport/internet/dialer.go::Dial`。
