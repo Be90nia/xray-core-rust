@@ -148,7 +148,10 @@ pub fn build_router_adapter_from_json(
     let config = parse_routing_json_to_proto(routing_json)?;
     let ohm: Arc<dyn xray_app_router::balancing::OutboundHandlerSelector> =
         Arc::new(NotImplementedSelector);
-    let router = Router::init(&config, ohm, None)
+    let geo_loader = Some(Arc::new(xray_geodata::loader::GeoDataLoader::new(
+        resolve_asset_dir(),
+    )));
+    let router = Router::init(&config, ohm, geo_loader)
         .map_err(|e| WiringError::RouterInit(e.to_string()))?;
     Ok(Arc::new(RouterAdapter::new(router)))
 }
@@ -431,6 +434,22 @@ pub enum WiringError {
     /// Router 初始化失败（重复 tag / geoip 规则缺 loader 等）。
     #[error("router init: {0}")]
     RouterInit(String),
+}
+
+/// 查找 GeoIP/GeoSite .dat 文件目录（对齐 Go `GetOBJPath`）。
+///
+/// 查找顺序：`XRAY_LOCATION_ASSET` 环境变量 → 可执行文件同目录 → 当前工作目录。
+/// 找不到 .dat 文件不影响 loader 创建（load 时 warn skip），仅影响 geoip/geosite 规则匹配。
+fn resolve_asset_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("XRAY_LOCATION_ASSET") {
+        return std::path::PathBuf::from(dir);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            return parent.to_path_buf();
+        }
+    }
+    std::path::PathBuf::from(".")
 }
 
 #[cfg(test)]
