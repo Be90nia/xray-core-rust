@@ -143,14 +143,29 @@ mod tests {
 
     #[test]
     fn from_proto_account_invalid_uuid() {
+        // Go uuid.ParseString 语义：1-30 字节非 UUID 文本派生 v5（合法）；
+        // >30 字节非标准格式才是 InvalidUuid。
+        let p = ProtoAccount {
+            id: "this-id-is-longer-than-thirty-bytes!!".into(),
+            ..sample_proto_account("")
+        };
+        match MemoryAccount::from_proto_account(&p) {
+            Err(VlessError::InvalidUuid(s)) => {
+                assert_eq!(s, "this-id-is-longer-than-thirty-bytes!!")
+            }
+            other => panic!("expected InvalidUuid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_proto_account_short_text_derives_v5() {
+        // 对拍 Go：VLESS 自定义短 id（非 UUID 文本）派生 UUIDv5 账户。
         let p = ProtoAccount {
             id: "not-a-uuid".into(),
             ..sample_proto_account("")
         };
-        match MemoryAccount::from_proto_account(&p) {
-            Err(VlessError::InvalidUuid(s)) => assert_eq!(s, "not-a-uuid"),
-            other => panic!("expected InvalidUuid, got {other:?}"),
-        }
+        let m = MemoryAccount::from_proto_account(&p).expect("short id derives v5");
+        assert_eq!(m.id.uuid().as_bytes()[6] >> 4, 5);
     }
 
     #[test]

@@ -40,8 +40,12 @@ enum Commands {
     },
     /// 打印版本信息
     Version,
-    /// 生成随机 UUID（v4）
-    Uuid,
+    /// 生成 UUID（无 -i 随机 v4；-i "text" 从文本派生 v5）
+    Uuid {
+        /// 输入文本（≤30 字节派生 UUIDv5；省略则随机 v4）
+        #[arg(short = 'i', long = "input")]
+        input: Option<String>,
+    },
     /// 转换配置格式（基础占位，b5w-future 实现 proto 输出）
     Convert {
         /// 输入文件路径
@@ -65,8 +69,21 @@ async fn main() -> anyhow::Result<()> {
             print_version();
             Ok(())
         }
-        Commands::Uuid => {
-            println!("{}", uuid::Uuid::new_v4());
+        Commands::Uuid { input } => {
+            match input {
+                None => println!("{}", uuid::Uuid::new_v4()),
+                Some(text) => {
+                    // 对齐 Go uuid.go：≤30 字节 ParseString（标准格式规范化 / 短文本 v5 派生）
+                    if text.len() > 30 {
+                        println!("Input must be within 30 bytes.");
+                    } else {
+                        match xray_common::uuid::UUID::parse(&text) {
+                            Some(u) => println!("{u}"),
+                            None => println!("Input must be within 30 bytes."),
+                        }
+                    }
+                }
+            }
             Ok(())
         }
         Commands::Convert { input, output } => convert(input, output).await,

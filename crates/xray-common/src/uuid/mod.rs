@@ -46,21 +46,36 @@ impl UUID {
         self.0
     }
 
-    /// 解析标准 UUID 字符串（xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx）。
+    /// 解析 UUID 字符串（Go `ParseString` 完整语义）。
     ///
-    /// 支持带连字符和不带连字符的格式。
+    /// - 标准格式（32-36 字符，带/不带连字符）：直接解析。
+    /// - 1-30 字节非 UUID 文本：SHA1(零UUID || text)[:16] 派生 UUIDv5
+    ///   （VLESS/VMess 自定义用户 ID 路径，`uuid -i` 同源）。
+    /// - 空或 >30 字节且非标准格式：`None`。
     pub fn parse(input: &str) -> Option<Self> {
         let s = input.trim();
         let hex: String = s.chars().filter(|c| *c != '-').collect();
-        if hex.len() != 32 {
+        if s.len() >= 32 && s.len() <= 36 && hex.len() == 32 {
+            let mut bytes = [0u8; 16];
+            for i in 0..16 {
+                bytes[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+            }
+            return Some(Self(bytes));
+        }
+        // Go uuid.go:71-82：短文本 → SHA1(zero_uuid || text)[:16]，设 v5 version + RFC4122 variant。
+        let text = s.as_bytes();
+        if text.is_empty() || text.len() > 30 {
             return None;
         }
-        let mut bytes = [0u8; 16];
-        for i in 0..16 {
-            let byte_str = &hex[i * 2..i * 2 + 2];
-            bytes[i] = u8::from_str_radix(byte_str, 16).ok()?;
-        }
-        Some(Self(bytes))
+        use sha1::{Digest, Sha1};
+        let mut h = Sha1::new();
+        h.update([0u8; 16]);
+        h.update(text);
+        let sum = h.finalize();
+        let mut u: [u8; 16] = sum[..16].try_into().expect("sha1 sum >= 16");
+        u[6] = (u[6] & 0x0f) | (5 << 4);
+        u[8] = (u[8] & (0xff >> 2)) | (0x02 << 6);
+        Some(Self(u))
     }
 
     /// 派生命令密钥。
@@ -153,8 +168,19 @@ mod tests {
 
     #[test]
     fn test_parse_invalid_length() {
-        assert!(UUID::parse("01234567").is_none());
+        // Go ParseString 语义：空串/31 字节非法；1-30 字节短文本派生 v5。
         assert!(UUID::parse("").is_none());
+        assert!(UUID::parse("0123456789012345678901234567890").is_none()); // 31 字节
+    }
+
+    #[test]
+    fn test_parse_short_text_derives_v5() {
+        // 对拍 Go：uuid.ParseString("example") = feb54431-301b-52bb-a6dd-e1e93e81bb9e
+        let u = UUID::parse("example").expect("short text derives v5");
+        assert_eq!(u.to_string(), "feb54431-301b-52bb-a6dd-e1e93e81bb9e");
+        // version = 5, variant = RFC4122
+        assert_eq!(u.as_bytes()[6] >> 4, 5);
+        assert_eq!(u.as_bytes()[8] >> 6, 0b10);
     }
 
     #[test]
@@ -180,7 +206,9 @@ mod tests {
 
     #[test]
     fn test_from_str_invalid() {
-        let result: Result<UUID, _> = "invalid".parse();
+        // "invalid" 是 7 字节短文本——Go 语义下派生 v5，不再是 Err。
+        // 真正非法：>30 字节非标准格式。
+        let result: Result<UUID, _> = "this-string-is-longer-than-30bytes!!".parse();
         assert!(result.is_err());
     }
 

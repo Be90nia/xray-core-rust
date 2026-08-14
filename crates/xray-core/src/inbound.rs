@@ -1850,7 +1850,10 @@ mod tests {
 
     #[test]
     fn build_vmess_validator_invalid_uuid() {
-        let settings = serde_json::json!({ "clients": [{ "id": "not-a-uuid" }] });
+        // "not-a-uuid"（10 字节）在 Go ParseString 语义下派生 v5，合法。
+        // >30 字节非标准格式才是非法。
+        let settings =
+            serde_json::json!({ "clients": [{ "id": "this-id-is-longer-than-thirty-bytes!!" }] });
         let data = serde_json::to_vec(&settings).unwrap();
         assert!(super::build_vmess_validator(&data).is_err());
     }

@@ -1265,7 +1265,7 @@ mod tests {
             "vnext": [{
                 "address": "example.com",
                 "port": 443,
-                "users": [{ "id": "not-a-uuid" }]
+                "users": [{ "id": "this-id-is-longer-than-thirty-bytes!!" }]
             }]
         }"#;
         let mut built = BuiltConfig::default();

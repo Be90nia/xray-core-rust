@@ -256,13 +256,27 @@ mod tests {
 
     #[test]
     fn from_proto_invalid_uuid() {
+        // Go uuid.ParseString 语义：1-30 字节非 UUID 文本派生 v5（合法）；
+        // >30 字节非标准格式才是 InvalidUuid。
         let p = ProtoAccount {
-            id: "not-a-uuid".into(),
+            id: "this-id-is-longer-than-thirty-bytes!!".into(),
             tests_enabled: String::new(),
             security_settings: None,
         };
         let err = MemoryAccount::from_proto(&p).unwrap_err();
         assert!(matches!(err, VmessError::InvalidUuid(_)));
+    }
+
+    #[test]
+    fn from_proto_short_text_derives_v5() {
+        // Go 语义：短 id 文本派生 UUIDv5（VMess 自定义用户路径）。
+        let p = ProtoAccount {
+            id: "not-a-uuid".into(),
+            tests_enabled: String::new(),
+            security_settings: None,
+        };
+        let acc = MemoryAccount::from_proto(&p).expect("short id derives v5");
+        assert_eq!(acc.id.uuid().as_bytes()[6] >> 4, 5);
     }
 
     #[test]
