@@ -36,7 +36,7 @@ use xray_transport::listener_registry::{
     register_transport_listener,
 };
 
-use crate::config::Config;
+
 
 /// 注册 gRPC transport dialer。
 ///
@@ -94,79 +94,11 @@ async fn dial_grpc(dest: &Destination, settings: &StreamSettings) -> io::Result<
     crate::transport::dial(dest, settings).await
 }
 
-/// 从 `grpcSettings` JSON 解析为强类型 [`Config`]。
-///
-/// 接受的 JSON 字段（对齐 proto3 JSON camelCase）：
-/// - `serviceName`：gRPC 服务名（传统格式或自定义路径 `/A/B/Tun|TunMulti`）
-/// - `multiMode`：是否启用 multi-stream 模式
-/// - `authority`：HTTP/2 `:authority` 伪 header
-/// - `idleTimeout`：空闲超时（秒）
-/// - `healthCheckTimeout`：健康检查超时（秒）
-/// - `permitWithoutStream`：无活动 stream 时是否发送 keepalive
-/// - `initialWindowSize`：HTTP/2 初始窗口大小（字节）
-/// - `userAgent`：User-Agent（支持预设别名 chrome/firefox/edge/golang）
-///
-/// `None` 或非 object 返回 [`Config::default`]。
-fn parse_grpc_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
-    let Some(v) = json else { return Ok(Config::default()); };
-    let Some(obj) = v.as_object() else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "grpcSettings must be a JSON object",
-        ));
-    };
-
-    let authority = obj
-        .get("authority")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    let service_name = obj
-        .get("serviceName")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    let multi_mode = obj
-        .get("multiMode")
-        .and_then(|x| x.as_bool())
-        .unwrap_or(false);
-    let idle_timeout = obj
-        .get("idleTimeout")
-        .and_then(|x| x.as_i64())
-        .unwrap_or(0) as i32;
-    let health_check_timeout = obj
-        .get("healthCheckTimeout")
-        .and_then(|x| x.as_i64())
-        .unwrap_or(0) as i32;
-    let permit_without_stream = obj
-        .get("permitWithoutStream")
-        .and_then(|x| x.as_bool())
-        .unwrap_or(false);
-    let initial_windows_size = obj
-        .get("initialWindowSize")
-        .and_then(|x| x.as_i64())
-        .unwrap_or(0) as i32;
-    let user_agent = obj
-        .get("userAgent")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    Ok(Config {
-        authority,
-        service_name,
-        multi_mode,
-        idle_timeout,
-        health_check_timeout,
-        permit_without_stream,
-        initial_windows_size,
-        user_agent,
-    })
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::parse_grpc_config;
     use xray_transport::dialer::get_transport_dialer;
 
     #[test]
@@ -284,5 +216,26 @@ mod tests {
             err.kind() != io::ErrorKind::Unsupported,
             "should not be Unsupported anymore"
         );
+    }
+
+    #[test]
+    fn parse_grpc_config_snake_case_fields() {
+        // Go infra/conf/grpc.go 用 snake_case——全部字段必须等价解析。
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"service_name":"GunService","multi_mode":true,"idle_timeout":60,
+               "health_check_timeout":20,"permit_without_stream":true,
+               "initial_windows_size":65535,"user_agent":"chrome",
+               "authority":"example.com"}"#,
+        )
+        .unwrap();
+        let cfg = parse_grpc_config(Some(&v)).unwrap();
+        assert_eq!(cfg.service_name, "GunService");
+        assert!(cfg.multi_mode);
+        assert_eq!(cfg.idle_timeout, 60);
+        assert_eq!(cfg.health_check_timeout, 20);
+        assert!(cfg.permit_without_stream);
+        assert_eq!(cfg.initial_windows_size, 65535);
+        assert_eq!(cfg.user_agent, "chrome");
+        assert_eq!(cfg.authority, "example.com");
     }
 }

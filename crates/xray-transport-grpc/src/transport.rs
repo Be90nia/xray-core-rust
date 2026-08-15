@@ -112,9 +112,7 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(conn: T, 
 }
 
 fn parse_config(s:&StreamSettings)->io::Result<Config>{
-    let Some(v)=s.transport_json.as_ref() else {return Ok(Config::default())};
-    let Some(o)=v.as_object() else {return Err(io::Error::new(io::ErrorKind::InvalidData,"grpcSettings not object"))};
-    Ok(Config{authority:o.get("authority").and_then(|x|x.as_str()).unwrap_or("").into(),service_name:o.get("serviceName").and_then(|x|x.as_str()).unwrap_or("").into(),multi_mode:o.get("multiMode").and_then(|x|x.as_bool()).unwrap_or(false),idle_timeout:o.get("idleTimeout").and_then(|x|x.as_i64()).unwrap_or(0) as i32,health_check_timeout:o.get("healthCheckTimeout").and_then(|x|x.as_i64()).unwrap_or(0) as i32,permit_without_stream:o.get("permitWithoutStream").and_then(|x|x.as_bool()).unwrap_or(false),initial_windows_size:o.get("initialWindowSize").and_then(|x|x.as_i64()).unwrap_or(0) as i32,user_agent:o.get("userAgent").and_then(|x|x.as_str()).unwrap_or("").into()})
+    crate::config::parse_grpc_config(s.transport_json.as_ref())
 }
 fn io_err<E:std::fmt::Display>(e:E)->io::Error{io::Error::new(io::ErrorKind::Other,e.to_string())}
 

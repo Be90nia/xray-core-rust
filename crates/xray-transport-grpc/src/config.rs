@@ -23,6 +23,8 @@
 //!   - 客户端 `|` 分割前段，服务端 `|` 分割后段（multi 用第二段）
 
 use crate::error::Result;
+use std::io;
+
 
 /// gRPC 配置。对应 proto `xray.transport.internet.grpc.encoding.Config`。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -45,6 +47,62 @@ pub struct Config {
     /// User-Agent。支持预设别名：`"chrome"` / `"firefox"` / `"edge"` / `"golang"`。
     /// 空串等同 `"chrome"`。
     pub user_agent: String,
+}
+
+/// 从 `grpcSettings` JSON 解析为强类型 [`Config`]。
+/// 接受的 JSON 字段（camelCase 与 snake_case 双写法均接受；
+/// Go infra/conf/grpc.go 用 snake_case：`idle_timeout` 等）：
+/// - `serviceName` / `service_name`：gRPC 服务名（传统格式或自定义路径 `/A/B/Tun|TunMulti`）
+/// - `multiMode` / `multi_mode`：是否启用 multi-stream 模式
+/// - `authority`：HTTP/2 `:authority` 伪 header
+/// - `idleTimeout` / `idle_timeout`：空闲超时（秒）
+/// - `healthCheckTimeout` / `health_check_timeout`：健康检查超时（秒）
+/// - `permitWithoutStream` / `permit_without_stream`：无活动 stream 时是否发送 keepalive
+/// - `initialWindowSize` / `initial_windows_size`：HTTP/2 初始窗口大小（字节）
+/// - `userAgent` / `user_agent`：User-Agent（支持预设别名 chrome/firefox/edge/golang）
+///
+/// `None` 或非 object 返回 [`Config::default`]。
+pub(crate) fn parse_grpc_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
+    let Some(v) = json else { return Ok(Config::default()); };
+    let Some(obj) = v.as_object() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "grpcSettings must be a JSON object",
+        ));
+    };
+
+    // 字段名双写法：Go infra/conf/grpc.go 用 snake_case（idle_timeout 等 5 个），
+    // proto3 JSON / 客户端配置常用 camelCase。两种都接受。
+    let get_str = |camel: &str, snake: &str| {
+        obj.get(camel)
+            .or_else(|| obj.get(snake))
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let get_bool = |camel: &str, snake: &str| {
+        obj.get(camel)
+            .or_else(|| obj.get(snake))
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false)
+    };
+    let get_i32 = |camel: &str, snake: &str| {
+        obj.get(camel)
+            .or_else(|| obj.get(snake))
+            .and_then(|x| x.as_i64())
+            .unwrap_or(0) as i32
+    };
+
+    Ok(Config {
+        authority: get_str("authority", "authority"),
+        service_name: get_str("serviceName", "service_name"),
+        multi_mode: get_bool("multiMode", "multi_mode"),
+        idle_timeout: get_i32("idleTimeout", "idle_timeout"),
+        health_check_timeout: get_i32("healthCheckTimeout", "health_check_timeout"),
+        permit_without_stream: get_bool("permitWithoutStream", "permit_without_stream"),
+        initial_windows_size: get_i32("initialWindowSize", "initial_windows_size"),
+        user_agent: get_str("userAgent", "user_agent"),
+    })
 }
 
 impl Config {
