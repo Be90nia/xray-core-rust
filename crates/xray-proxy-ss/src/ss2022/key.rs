@@ -57,6 +57,80 @@ pub fn derive_session_subkey(psk: &[u8], salt: &[u8], kind: CipherKind2022) -> V
     hash[..kind.key_size()].to_vec()
 }
 
+/// SIP023 identity subkey context。
+const IDENTITY_CTX: &str = "shadowsocks 2022 identity subkey";
+
+/// EIH 固定长度（16 字节 AES block）。
+pub const IDENTITY_HEADER_LEN: usize = 16;
+
+/// SIP023 EIH：identity subkey = blake3::derive_key("shadowsocks 2022 identity subkey", iPSK||salt)[..key_size]。
+pub fn derive_identity_subkey(ipsk: &[u8], salt: &[u8], kind: CipherKind2022) -> Vec<u8> {
+    let mut material = Vec::with_capacity(ipsk.len() + salt.len());
+    material.extend_from_slice(ipsk);
+    material.extend_from_slice(salt);
+    let hash = blake3::derive_key(IDENTITY_CTX, &material);
+    hash[..kind.key_size()].to_vec()
+}
+
+/// PSK 的 identity：`blake3::hash(psk)[0..16]`（SIP023 identity header 明文）。
+pub fn psk_identity(psk: &[u8]) -> [u8; IDENTITY_HEADER_LEN] {
+    let h = blake3::hash(psk);
+    h.as_bytes()[..IDENTITY_HEADER_LEN].try_into().unwrap()
+}
+
+/// 加密 EIH：AES-ECB 单块（SIP023 TCP identity_header）。
+pub fn encrypt_identity_header(ipsk: &[u8], next_psk: &[u8], salt: &[u8], kind: CipherKind2022) -> Result<[u8; IDENTITY_HEADER_LEN]> {
+    let plaintext = psk_identity(next_psk);
+    ecb_block(kind, &derive_identity_subkey(ipsk, salt, kind), &plaintext, true)
+}
+
+/// 解密 EIH：AES-ECB 单块。返回 16B 明文（下一层 PSK 的 hash 前 16 字节）。
+pub fn decrypt_identity_header(ipsk: &[u8], header: &[u8], salt: &[u8], kind: CipherKind2022) -> Result<[u8; IDENTITY_HEADER_LEN]> {
+    let block: [u8; IDENTITY_HEADER_LEN] = header.try_into().map_err(|_| SsError::InsufficientData(header.len()))?;
+    ecb_block(kind, &derive_identity_subkey(ipsk, salt, kind), &block, false)
+}
+
+/// AES-ECB 单块加/解密。128 cipher 用 AES-128，256/chacha 用 AES-256。
+fn ecb_block(kind: CipherKind2022, key: &[u8], block: &[u8; 16], encrypt: bool) -> Result<[u8; 16]> {
+    use aes::cipher::{Array, BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
+    let mut buf = *block;
+    let enc = |buf: &mut [u8; 16]| -> Result<()> {
+        match (kind, encrypt) {
+            (CipherKind2022::Aes128Gcm, true) => {
+                let k: [u8; 16] = key[..16].try_into().unwrap();
+                let arr: Array<u8, _> = k.into();
+                let mut b: Array<u8, _> = (*buf).into();
+                aes::Aes128::new(&arr).encrypt_block(&mut b);
+                *buf = b.into();
+            }
+            (CipherKind2022::Aes128Gcm, false) => {
+                let k: [u8; 16] = key[..16].try_into().unwrap();
+                let arr: Array<u8, _> = k.into();
+                let mut b: Array<u8, _> = (*buf).into();
+                aes::Aes128::new(&arr).decrypt_block(&mut b);
+                *buf = b.into();
+            }
+            (_, true) => {
+                let k: [u8; 32] = key[..32].try_into().unwrap();
+                let arr: Array<u8, _> = k.into();
+                let mut b: Array<u8, _> = (*buf).into();
+                aes::Aes256::new(&arr).encrypt_block(&mut b);
+                *buf = b.into();
+            }
+            (_, false) => {
+                let k: [u8; 32] = key[..32].try_into().unwrap();
+                let arr: Array<u8, _> = k.into();
+                let mut b: Array<u8, _> = (*buf).into();
+                aes::Aes256::new(&arr).decrypt_block(&mut b);
+                *buf = b.into();
+            }
+        }
+        Ok(())
+    };
+    enc(&mut buf)?;
+    Ok(buf)
+}
+
 /// PSK 从 base64 解码（SIP022 要求 PSK 密码学安全随机 + base64 编码）。
 pub fn psk_from_base64(s: &str) -> Result<Vec<u8>> {
     use base64::Engine;

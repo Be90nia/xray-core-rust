@@ -465,80 +465,84 @@ async fn read_ss2022_request_multi(
     let mut salt = vec![0u8; salt_size];
     conn.read_exact(&mut salt).await?;
 
-    // 2. 读 fixed-header-chunk wire bytes（先读到 buffer，后续逐用户尝试）
+    // 2. SIP023 EIH：wire 顺序 salt || EIH || AEAD chunks（先读 16B identity header）
     let tag_size: usize = match kind {
         CipherKind2022::Aes128Gcm | CipherKind2022::Aes256Gcm => 16,
         CipherKind2022::ChaCha20Poly1305 => 16,
     };
     let fixed_plain_len = 11;
     let fixed_wire_len = fixed_plain_len + tag_size;
+
+    use crate::ss2022::key::{decrypt_identity_header, psk_identity};
+
+    let mut identity_wire = vec![0u8; crate::ss2022::key::IDENTITY_HEADER_LEN];
+    conn.read_exact(&mut identity_wire).await?;
+
+    let plaintext = match decrypt_identity_header(server_psk, &identity_wire, &salt, kind) {
+        Ok(p) => p,
+        Err(_) => return Err(SsError::Ss2022NoUserMatched),
+    };
+
+    let matched = users
+        .iter()
+        .find(|u| psk_identity(&u.psk) == plaintext);
+
+    let Some(user) = matched else {
+        return Err(SsError::Ss2022NoUserMatched);
+    };
+
+    // 3. 读 fixed-header-chunk wire bytes（EIH 之后）
     let mut fixed_wire = vec![0u8; fixed_wire_len];
     conn.read_exact(&mut fixed_wire).await?;
 
-    // 3. 逐用户尝试 open fixed-header
-    // 多用户场景：subkey = blake3(psk=server_psk||user_psk, material=server_psk||user_psk||salt)
-    // 简化实现：用 server_psk + user_psk 拼接后与 salt 一起派生
-    for user in users {
-        // 多用户 subkey 派生：PSK = server_psk XOR user_psk（SIP022 规范）
-        let combined_psk: Vec<u8> = server_psk
-            .iter()
-            .zip(user.psk.iter())
-            .map(|(s, u)| s ^ u)
-            .collect();
-        let subkey = derive_session_subkey(&combined_psk, &salt, kind);
 
-        if let Ok(aead) = build_aead(kind, &subkey) {
-            let nonce = vec![0u8; aead.nonce_size()];
-            if let Ok(fixed_plain) = aead.open(&nonce, &[], &fixed_wire) {
-                if fixed_plain.len() >= fixed_plain_len && fixed_plain[0] == 0 {
-                    let timestamp = u64::from_be_bytes([
-                        fixed_plain[1], fixed_plain[2], fixed_plain[3], fixed_plain[4],
-                        fixed_plain[5], fixed_plain[6], fixed_plain[7], fixed_plain[8],
-                    ]);
+    // 4. 命中用户：uPSK 派生 session subkey，解 fixed/variable header
+    let subkey = derive_session_subkey(&user.psk, &salt, kind);
+    let aead = build_aead(kind, &subkey)?;
+    let nonce = vec![0u8; aead.nonce_size()];
 
-                    if check_timestamp(timestamp, timestamp_tolerance).is_err() {
-                        continue;
-                    }
+    let fixed_plain = aead
+        .open(&nonce, &[], &fixed_wire)
+        .map_err(|e| SsError::AeadOpen(e.to_string()))?;
+    if fixed_plain.len() < fixed_plain_len {
+        return Err(SsError::InsufficientData(fixed_plain.len()));
+    }
+    if fixed_plain[0] != 0 {
+        return Err(SsError::Ss2022InvalidHeaderType(fixed_plain[0]));
+    }
+    let timestamp = u64::from_be_bytes([
+        fixed_plain[1], fixed_plain[2], fixed_plain[3], fixed_plain[4],
+        fixed_plain[5], fixed_plain[6], fixed_plain[7], fixed_plain[8],
+    ]);
+    check_timestamp(timestamp, timestamp_tolerance)?;
 
-                    let variable_len =
-                        u16::from_be_bytes([fixed_plain[9], fixed_plain[10]]) as usize;
-                    if variable_len > 900 + 260 {
-                        continue;
-                    }
-
-                    // 匹配成功：继续读 variable-header
-                    let mut nonce = nonce;
-                    increment_nonce(&mut nonce);
-                    let variable_wire_len = variable_len + tag_size;
-                    let mut variable_wire = vec![0u8; variable_wire_len];
-                    conn.read_exact(&mut variable_wire).await?;
-
-                    let variable_plain = match aead.open(&nonce, &[], &variable_wire) {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    };
-                    increment_nonce(&mut nonce);
-
-                    let (address, port) = match parse_variable_header(&variable_plain) {
-                        Ok(r) => r,
-                        Err(_) => continue,
-                    };
-
-                    nonce[0] = 1;
-                    let stream = SSStream::new_with_aead_and_nonce(conn, aead, nonce);
-
-                    return Ok(InboundResult {
-                        address,
-                        port,
-                        stream,
-                        user_email: user.email.clone(),
-                    });
-                }
-            }
-        }
+    let variable_len = u16::from_be_bytes([fixed_plain[9], fixed_plain[10]]) as usize;
+    if variable_len > 900 + 260 {
+        return Err(SsError::Ss2022PaddingTooLarge(variable_len));
     }
 
-    Err(SsError::Ss2022NoUserMatched)
+    let mut nonce = nonce;
+    increment_nonce(&mut nonce);
+    let variable_wire_len = variable_len + tag_size;
+    let mut variable_wire = vec![0u8; variable_wire_len];
+    conn.read_exact(&mut variable_wire).await?;
+
+    let variable_plain = aead
+        .open(&nonce, &[], &variable_wire)
+        .map_err(|e| SsError::AeadOpen(e.to_string()))?;
+    increment_nonce(&mut nonce);
+
+    let (address, port) = parse_variable_header(&variable_plain)?;
+
+    nonce[0] = 1;
+    let stream = SSStream::new_with_aead_and_nonce(conn, aead, nonce);
+
+    Ok(InboundResult {
+        address,
+        port,
+        stream,
+        user_email: user.email.clone(),
+    })
 }
 
 /// 验证时间戳：与当前时间差在 tolerance 内。
@@ -618,6 +622,96 @@ fn parse_variable_header(buf: &[u8]) -> Result<(Address, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SIP023 EIH 端到端：Client2022(with_identity) 写 EIH → MultiUserInbound 匹配对应用户。
+    #[tokio::test]
+    async fn multi_user_eih_roundtrip() {
+        use crate::ss2022::client::Client2022;
+        use base64::Engine as _;
+
+        let server_psk = [0x11u8; 32];
+        let user_psk = [0x22u8; 32];
+        let server_psk_b64 = base64::engine::general_purpose::STANDARD.encode(server_psk);
+        let user_psk_b64 = base64::engine::general_purpose::STANDARD.encode(user_psk);
+
+        let inbound = MultiUserInbound::new(
+            "2022-blake3-aes-256-gcm",
+            &server_psk_b64,
+            vec![Ss2022User {
+                email: "alice".into(),
+                level: 0,
+                psk: user_psk.to_vec(),
+            }],
+        )
+        .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (conn, _) = listener.accept().await.unwrap();
+            inbound.handle_conn(conn).await
+        });
+
+        let client = Client2022::new(
+            "2022-blake3-aes-256-gcm",
+            &user_psk_b64,
+            "127.0.0.1",
+            addr.port(),
+        )
+        .unwrap()
+        .with_identity(&server_psk_b64)
+        .unwrap();
+        let mut stream = client.dial_target("example.com", 443).await.unwrap();
+
+        let result = server.await.unwrap().unwrap();
+        assert_eq!(result.address, Address::Domain("example.com".to_string()));
+        assert_eq!(result.port, 443);
+        assert_eq!(result.user_email, "alice");
+    }
+
+    /// EIH 错误用户：user PSK 不在白名单 → NoUserMatched。
+    #[tokio::test]
+    async fn multi_user_eih_rejects_unknown_user() {
+        use crate::ss2022::client::Client2022;
+        use base64::Engine as _;
+
+        let server_psk = [0x11u8; 32];
+        let other_psk = [0x33u8; 32];
+        let server_psk_b64 = base64::engine::general_purpose::STANDARD.encode(server_psk);
+        let other_psk_b64 = base64::engine::general_purpose::STANDARD.encode(other_psk);
+
+        let inbound = MultiUserInbound::new(
+            "2022-blake3-aes-256-gcm",
+            &server_psk_b64,
+            vec![Ss2022User {
+                email: "alice".into(),
+                level: 0,
+                psk: [0x22u8; 32].to_vec(),
+            }],
+        )
+        .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (conn, _) = listener.accept().await.unwrap();
+            inbound.handle_conn(conn).await
+        });
+
+        let client = Client2022::new(
+            "2022-blake3-aes-256-gcm",
+            &other_psk_b64,
+            "127.0.0.1",
+            addr.port(),
+        )
+        .unwrap()
+        .with_identity(&server_psk_b64)
+        .unwrap();
+        let _ = client.dial_target("example.com", 443).await;
+
+        let result = server.await.unwrap();
+        assert!(result.is_err(), "unknown user PSK must be rejected");
+    }
 
     #[test]
     fn inbound_build_aead_chacha20_roundtrip() {

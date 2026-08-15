@@ -28,11 +28,12 @@ use crate::stream::SSStream;
 #[derive(Debug)]
 pub struct Client2022 {
     psk: Vec<u8>,
+    /// 多用户模式：server 主 PSK（iPSK）。Some 时在 salt 后写 1 层 EIH（SIP023）。
+    identity_psk: Option<Vec<u8>>,
     kind: CipherKind2022,
     server_host: String,
     server_port: u16,
 }
-
 impl Client2022 {
     /// 构造 client。
     ///
@@ -52,10 +53,26 @@ impl Client2022 {
         }
         Ok(Self {
             psk,
+            identity_psk: None,
             kind,
             server_host: host.to_string(),
             server_port: port,
         })
+    }
+
+    /// 设置 server 主 PSK（iPSK）启用多用户 EIH（SIP023）。
+    /// 单端口多用户服务器配置 "server_psk:user_psk" 时：psk=user_psk，此处传 server_psk。
+    pub fn with_identity(mut self, server_psk_b64: &str) -> Result<Self> {
+        let ipsk = psk_from_base64(server_psk_b64)?;
+        if ipsk.len() != self.kind.key_size() {
+            return Err(SsError::InvalidPassword(format!(
+                "identity PSK length {} != key_size {}",
+                ipsk.len(),
+                self.kind.key_size()
+            )));
+        }
+        self.identity_psk = Some(ipsk);
+        Ok(self)
     }
 
     /// 从 subkey 构造 AEAD。
@@ -140,9 +157,16 @@ impl Client2022 {
             .map_err(|e| SsError::AeadSeal(e.to_string()))?;
         increment_nonce(&mut nonce); // [1,0,...] → [2,0,...]
 
-        // 7. 合并发送 salt + sealed_fixed + sealed_var（一次性，避免分次 TCP 包导致 server 超时）
-        let mut header_buf = Vec::with_capacity(salt.len() + sealed_fixed.len() + sealed_var.len());
+        // 7. 合并发送 salt [+ EIH] + sealed_fixed + sealed_var（一次性，避免分次写导致 DPI 识别）
+        let mut header_buf =
+            Vec::with_capacity(salt.len() + sealed_fixed.len() + sealed_var.len() + 16);
         header_buf.extend_from_slice(&salt);
+        // SIP023：identity PSK 存在时写 1 层 EIH（server iPSK 派生 subkey 加密 uPSK hash）
+        if let Some(ipsk) = &self.identity_psk {
+            let eih =
+                crate::ss2022::key::encrypt_identity_header(ipsk, &self.psk, &salt, self.kind)?;
+            header_buf.extend_from_slice(&eih);
+        }
         header_buf.extend_from_slice(&sealed_fixed);
         header_buf.extend_from_slice(&sealed_var);
         conn.write_all(&header_buf).await?;
