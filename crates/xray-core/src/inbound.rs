@@ -766,6 +766,153 @@ fn build_tls_acceptor(
     Ok(cfg.map(|c| Arc::new(xray_transport::TlsAcceptor::from(c))))
 }
 
+/// REALITY inbound 配置（从 `realitySettings` 解析）。
+///
+/// 字段对齐 Go `infra/conf REALITYConfig`：privateKey（base64 RawURL，32B）、
+/// shortIds（hex 白名单）、dest/target（fallback 目标）、xver（PROXY protocol）、
+/// maxTimeDiff（timestamp 容差秒，Go 默认 43200=±12h）。
+struct RealityInboundConfig {
+    server_private_key: [u8; 32],
+    short_ids: Vec<[u8; 8]>,
+    max_diff: u32,
+    fallback_dest: String,
+    xver: u8,
+}
+
+fn parse_reality_config(
+    settings: &xray_transport::dialer::StreamSettings,
+) -> std::io::Result<RealityInboundConfig> {
+    let json = settings.security_json.as_ref().ok_or_else(|| {
+        std::io::Error::other("reality inbound requires realitySettings")
+    })?;
+    let key_str = json
+        .get("privateKey")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| std::io::Error::other("reality: empty privateKey"))?;
+    let key = base64_url_decode(key_str)
+        .and_then(|k| <[u8; 32]>::try_from(k).ok())
+        .ok_or_else(|| std::io::Error::other("reality: invalid privateKey (need base64 32B)"))?;
+
+    let mut short_ids = Vec::new();
+    if let Some(arr) = json.get("shortIds").and_then(|x| x.as_array()) {
+        for sid in arr {
+            let Some(hex) = sid.as_str() else { continue };
+            if let Some(bytes) = hex_decode_8(hex) {
+                short_ids.push(bytes);
+            }
+        }
+    }
+    // 无 shortIds：默认允许全零（Go REALITY 空配置兼容）
+    if short_ids.is_empty() {
+        short_ids.push([0u8; 8]);
+    }
+
+    // dest/target：int（端口→localhost:port）或字符串 host:port
+    let dest_raw = json
+        .get("target")
+        .or_else(|| json.get("dest"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let fallback_dest = match dest_raw.as_u64() {
+        Some(port) => format!("localhost:{port}"),
+        None => dest_raw
+            .as_str()
+            .unwrap_or("localhost:443")
+            .to_string(),
+    };
+
+    let xver = json.get("xver").and_then(|x| x.as_u64()).unwrap_or(0).min(2) as u8;
+    let max_diff = json
+        .get("maxTimeDiff")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(43200) as u32;
+
+    Ok(RealityInboundConfig {
+        server_private_key: key,
+        short_ids,
+        max_diff,
+        fallback_dest,
+        xver,
+    })
+}
+
+/// base64 RawURL 解码（无 padding，兼容 std 变体）。
+fn base64_url_decode(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    let normalized = s.replace('+', "-").replace('/', "_");
+    let normalized = normalized.trim_end_matches('=');
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(normalized)
+        .ok()
+        .or_else(|| base64::engine::general_purpose::STANDARD.decode(s).ok())
+}
+
+/// hex 字符串 → 8 字节 short_id。
+fn hex_decode_8(s: &str) -> Option<[u8; 8]> {
+    if s.len() > 16 {
+        return None;
+    }
+    let padded = format!("{s:0<16}");
+    let bytes = hex::decode(padded).ok()?;
+    bytes.try_into().ok()
+}
+
+/// VLESS + REALITY inbound：accept → server_tls 验证。
+///
+/// - Verified：TLS 流走 VLESS 协议处理
+/// - Invalid：原连接 + ClientHello record fallback 到 dest（PROXY protocol xver）
+async fn serve_reality_vless(
+    listener: TcpListener,
+    ohm: Arc<SimpleOhm>,
+    validator: Arc<dyn VlessValidator>,
+    cfg: RealityInboundConfig,
+) -> std::io::Result<()> {
+    use xray_reality::server::{RealityServerOutcome, fallback_to_dest, server_tls};
+
+    let handler = ohm
+        .get_default_handler()
+        .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
+    let local = listener.local_addr()?;
+    tracing::info!(addr = %local, "vless+reality inbound listening");
+
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "reality inbound accept failed");
+                continue;
+            }
+        };
+        let handler = Arc::clone(&handler);
+        let validator = Arc::clone(&validator);
+        let key = cfg.server_private_key;
+        let ids = cfg.short_ids.clone();
+        let max_diff = cfg.max_diff;
+        let dest = cfg.fallback_dest.clone();
+        let xver = cfg.xver;
+        tokio::spawn(async move {
+            match server_tls(stream, &key, &ids, max_diff).await {
+                Ok(RealityServerOutcome::Verified(tls)) => {
+                    if let Err(e) =
+                        xray_proxy_vless::handle_vless_connection(tls, &handler, &validator).await
+                    {
+                        tracing::debug!(error = %e, "reality vless connection ended with error");
+                    }
+                }
+                Ok(RealityServerOutcome::Invalid { conn, record, reason }) => {
+                    // 非 REALITY 客户端（如浏览器/探测器）→ 透明转发到 fallback dest
+                    tracing::debug!(error = ?reason, dest = %dest, "reality verify failed, fallback");
+                    let _ = fallback_to_dest(conn, &record, &dest, peer, local, xver).await;
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "reality tls handshake error");
+                }
+            }
+        });
+    }
+}
+
 /// 按协议种类启动单个 inbound listener。
 async fn spawn_one_inbound(
     ib: &BuiltInbound,
@@ -824,11 +971,23 @@ async fn spawn_one_inbound(
         "vless" => {
             let validator: Arc<dyn VlessValidator> = build_vless_validator(&ib.entry.data)?;
             let listener = TcpListener::bind(&addr).await?;
-            let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
-            tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_count(), tls = tls.is_some(), "vless inbound listening");
-            Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                serve_vless(listener, ohm, validator, tls).await
-            })))
+            let settings = xray_transport::dialer::StreamSettings::from_json(
+                ib.stream_settings_json.as_ref(),
+            );
+            if settings.security == "reality" {
+                // REALITY：server_tls 验证 → Verified 走 VLESS；Invalid fallback 到 dest
+                let reality = parse_reality_config(&settings)?;
+                tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_count(), fallback = %reality.fallback_dest, "vless+reality inbound listening");
+                Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+                    serve_reality_vless(listener, ohm, validator, reality).await
+                })))
+            } else {
+                let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
+                tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_count(), tls = tls.is_some(), "vless inbound listening");
+                Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+                    serve_vless(listener, ohm, validator, tls).await
+                })))
+            }
         }
         "trojan" => {
             let users = build_trojan_users(&ib.entry.data)?;
@@ -1666,6 +1825,66 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// parse_reality_config：privateKey/shortIds/dest 双形态/默认值。
+    #[test]
+    fn parse_reality_config_full_fields() {
+        use base64::Engine as _;
+        let key = [7u8; 32];
+        let key_b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
+        let json = serde_json::json!({
+            "privateKey": key_b64,
+            "shortIds": ["", "0123456789abcdef"],
+            "target": "example.com:443",
+            "xver": 1,
+            "maxTimeDiff": 300
+        });
+        let settings = xray_transport::dialer::StreamSettings {
+            security: "reality".to_string(),
+            security_json: Some(json),
+            ..xray_transport::dialer::StreamSettings::tcp()
+        };
+        let cfg = parse_reality_config(&settings).unwrap();
+        assert_eq!(cfg.server_private_key, key);
+        assert_eq!(cfg.short_ids.len(), 2);
+        assert_eq!(cfg.short_ids[0], [0u8; 8]);
+        assert_eq!(cfg.short_ids[1][0], 0x01);
+        assert_eq!(cfg.fallback_dest, "example.com:443");
+        assert_eq!(cfg.xver, 1);
+        assert_eq!(cfg.max_diff, 300);
+    }
+
+    #[test]
+    fn parse_reality_config_port_dest_and_defaults() {
+        use base64::Engine as _;
+        let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
+        // dest 为 int 端口 → localhost:port；缺省 xver=0/maxTimeDiff=43200/shortIds=[0u8;8]
+        let json = serde_json::json!({
+            "privateKey": key_b64,
+            "dest": 8443
+        });
+        let settings = xray_transport::dialer::StreamSettings {
+            security: "reality".to_string(),
+            security_json: Some(json),
+            ..xray_transport::dialer::StreamSettings::tcp()
+        };
+        let cfg = parse_reality_config(&settings).unwrap();
+        assert_eq!(cfg.fallback_dest, "localhost:8443");
+        assert_eq!(cfg.xver, 0);
+        assert_eq!(cfg.max_diff, 43200);
+        assert_eq!(cfg.short_ids, vec![[0u8; 8]]);
+    }
+
+    #[test]
+    fn parse_reality_config_rejects_missing_key() {
+        let settings = xray_transport::dialer::StreamSettings {
+            security: "reality".to_string(),
+            security_json: Some(serde_json::json!({})),
+            ..xray_transport::dialer::StreamSettings::tcp()
+        };
+        assert!(parse_reality_config(&settings).is_err());
+    }
     use xray_app_dispatcher::default::SimpleOhm;
     use xray_proxy_freedom::make_freedom_dial_fn;
     use xray_proxy_socks::protocol::{ATYP_DOMAIN, ATYP_IPV4};
@@ -1745,6 +1964,117 @@ mod tests {
         let mut got = vec![0u8; payload.len()];
         client.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, payload, "should receive echo through proxy");
+    }
+
+    /// 端到端：VLESS client（tcp+reality 出站）→ serve_reality_vless → freedom → echo。
+    /// 同时验证 Invalid（非 REALITY 客户端）→ fallback dest 透明转发。
+    #[tokio::test]
+    async fn vless_reality_inbound_e2e() {
+        // rustls 全局 provider（并行测试只装一次）
+        static PROVIDER: std::sync::Once = std::sync::Once::new();
+        PROVIDER.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+        use base64::Engine as _;
+        use xray_proxy_vless::encoding::client::{
+            decode_response_header, encode_request_header,
+        };
+        use xray_proxy_vless::encoding::VlessCommand;
+        use xray_transport::dialer::{StreamSettings, dial_with_settings};
+        use xray_transport::sockopt::SocketOptions;
+
+        // 1. echo server（VLESS 数据目标）
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = echo_listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        // 2. freedom outbound → SimpleOhm
+        let ohm = Arc::new(SimpleOhm::new());
+        let bridge = Arc::new(xray_app_dispatcher::default::DialBridge::new(
+            "freedom",
+            make_freedom_dial_fn(),
+        )) as Arc<dyn xray_app_dispatcher::DispatchHandler>;
+        ohm.set_default(bridge);
+
+        // 3. validator（test UUID）
+        let validator = Arc::new(VlessMemoryValidator::new());
+        let test_uuid = UUID::parse("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap();
+        let mut proto_account = VlessProtoAccount::default();
+        proto_account.id = "b831381d-6324-4d53-ad4f-8cda48b30811".to_string();
+        let account = VlessMemoryAccount::from_proto_account(&proto_account).unwrap();
+        validator
+            .add(VlessMemoryUser::new("e2e-user", 0, account))
+            .unwrap();
+
+        // 4. serve_reality_vless
+        let server_secret = x25519_dalek::StaticSecret::from([0x99u8; 32]);
+        let server_public = x25519_dalek::PublicKey::from(&server_secret);
+        let short_id = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let reality_cfg = RealityInboundConfig {
+            server_private_key: server_secret.to_bytes(),
+            short_ids: vec![short_id],
+            max_diff: 43200,
+            fallback_dest: format!("127.0.0.1:{}", echo_addr.port()),
+            xver: 0,
+        };
+        let rl = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rl_addr = rl.local_addr().unwrap();
+        let ohm_c = Arc::clone(&ohm);
+        let val_c = Arc::clone(&validator) as Arc<dyn VlessValidator>;
+        tokio::spawn(async move {
+            let _ = serve_reality_vless(rl, ohm_c, val_c, reality_cfg).await;
+        });
+
+        // 5. client：tcp+reality dial → VLESS 请求 → echo 回读
+        let _ = xray_transport_tcp::register::register_dialer();
+        let mut settings = StreamSettings::tcp();
+        settings.security = "reality".to_string();
+        settings.security_json = Some(serde_json::json!({
+            "serverName": "reality.local",
+            "publicKey": base64::engine::general_purpose::STANDARD.encode(server_public.to_bytes()),
+            "shortId": hex::encode(short_id),
+            "fingerprint": "chrome"
+        }));
+        let dest = Destination::tcp(
+            Address::IPv4(std::net::Ipv4Addr::LOCALHOST),
+            Port::new(rl_addr.port()),
+        );
+        let mut conn = dial_with_settings("tcp", &dest, &SocketOptions::default(), &settings)
+            .await
+            .expect("tcp+reality dial should succeed");
+
+        // VLESS 请求头（TCP → echo）
+        encode_request_header(
+            &mut conn,
+            0,
+            &test_uuid,
+            VlessCommand::Tcp,
+            Some(&Address::IPv4(std::net::Ipv4Addr::LOCALHOST)),
+            Some(echo_addr.port()),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        let _ = decode_response_header(&mut conn, 0).await.unwrap();
+
+        let payload = b"hello vless+reality!";
+        conn.write_all(payload).await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        conn.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, payload, "vless over reality should echo");
     }
 
     #[test]
