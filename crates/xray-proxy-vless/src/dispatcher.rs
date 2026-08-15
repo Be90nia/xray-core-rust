@@ -144,7 +144,9 @@ pub fn make_dial_fn(config: Arc<VlessOutboundConfig>) -> DialFn {
             };
 
             // 2. 写 VLESS 请求头（version + uuid + addons + command + target addr/port）
-            let addons = empty_addons();
+            // addons.flow 从 config 取（bd vxk）：flow=xtls-rprx-vision 时服务端启用 Vision。
+            let mut addons = empty_addons();
+            addons.flow = config.flow.clone();
             encode_request_header(
                 &mut conn,
                 VERSION,
@@ -237,5 +239,55 @@ mod tests {
         ));
         let _dial = make_dial_fn(Arc::clone(&cfg));
         assert_eq!(Arc::strong_count(&cfg), 2);
+    }
+
+    /// flow 字段上线验证：config.flow 经 make_dial_fn 写入请求头 addons.flow，
+    /// 服务端 decode_request_header 应读到 xtls-rprx-vision。
+    #[tokio::test]
+    async fn make_dial_fn_sends_flow_in_request_header() {
+        use crate::encoding::server::decode_request_header;
+        use crate::{MemoryAccount, MemoryUser, MemoryValidator, Validator as _};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+        use xray_proto::xray::proxy::vless::Account as ProtoAccount;
+
+        let test_uuid = UUID::parse("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap();
+
+        // fake VLESS server：decode 请求头 → 断言 flow → 回响应头
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let validator = MemoryValidator::new();
+        let mut proto_account = ProtoAccount::default();
+        proto_account.id = "b831381d-6324-4d53-ad4f-8cda48b30811".to_string();
+        let account = MemoryAccount::from_proto_account(&proto_account).unwrap();
+        validator.add(MemoryUser::new("u", 0, account)).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let decoded = decode_request_header(false, &mut None, &mut sock, &validator)
+                .await
+                .unwrap();
+            // 回响应头（version + addon_len）
+            crate::encoding::server::encode_response_header(&mut sock, VERSION, &empty_addons())
+                .await
+                .unwrap();
+            // drain 剩余（如果有）
+            let mut buf = [0u8; 64];
+            let _ = sock.read(&mut buf).await;
+            decoded.addons.flow
+        });
+
+        // client：make_dial_fn（flow=xtls-rprx-vision）
+        let cfg = Arc::new(
+            VlessOutboundConfig::new(test_uuid, Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(addr.port()))
+                .with_flow("xtls-rprx-vision"),
+        );
+        let dial = make_dial_fn(cfg);
+        let dest = Destination::tcp(Address::new_domain("target.example.com"), Port::new(80));
+        let mut conn = dial(&dest).await.expect("dial should succeed");
+        let _ = conn.write_all(b"x").await; // 触发服务端 drain
+
+        let flow = server.await.unwrap();
+        assert_eq!(flow, "xtls-rprx-vision", "flow must reach server request header");
     }
 }
