@@ -116,7 +116,7 @@ pub trait HysteriaTransport: Send + Sync {
         dest: &DialDestination,
         quic_config: &QuicConfig,
         auth_token: &str,
-        brutal_up_bps: u64,
+        brutal_down_bps: u64,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = std::io::Result<Arc<dyn QuicConn>>> + Send>,
     >;
@@ -235,7 +235,7 @@ impl HysteriaClient {
                 &self.dest,
                 &quic_config,
                 &self.config.auth,
-                self.quic_params.brutal_up,
+                self.quic_params.brutal_down,
             )
             .await
             .map_err(HysteriaError::Io)?;

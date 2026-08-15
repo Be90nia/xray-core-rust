@@ -481,7 +481,8 @@ async fn h3_auth(
                 };
                 let resp = http::Response::builder()
                     .status(status)
-                    .header(crate::config::ResponseHeaderUDPEnabled, "rl")
+                    // Go hub.go:50 strconv.FormatBool(validator != nil)
+                    .header(crate::config::ResponseHeaderUDPEnabled, "true")
                     .header(crate::config::CommonHeaderPadding, "0")
                     .body(());
                 match resp {
@@ -586,7 +587,9 @@ impl HysteriaHttp3Server for QuinnHttp3Server {
                             if let Some(auth_resp) = h.try_auth(&auth_req).await {
                                 let resp = http::Response::builder()
                                     .status(auth_resp.status_code)
-                                    .header("Hysteria-UDP", if auth_resp.udp_enabled { "rl" } else { "" })
+                                    // Go strconv.FormatBool——"true"/"false"，非 "rl"
+                                    .header("Hysteria-UDP", if auth_resp.udp_enabled { "true" } else { "false" })
+                                    .header(config::CommonHeaderCCRX, auth_resp.brutal_down_bps.to_string())
                                     .header(config::CommonHeaderPadding, &auth_resp.padding)
                                     .body(())
                                     .unwrap();

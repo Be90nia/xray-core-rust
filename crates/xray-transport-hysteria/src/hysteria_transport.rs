@@ -63,7 +63,7 @@ impl HysteriaTransport for QuinnHysteriaTransport {
         dest: &DialDestination,
         _quic_config: &QuicConfig,
         auth_token: &str,
-        brutal_up_bps: u64,
+        brutal_down_bps: u64,
     ) -> Pin<Box<dyn std::future::Future<Output = io::Result<Arc<dyn QuicConn>>> + Send>> {
         let dest_addr = dest.udp_addr;
         let host = dest.host.clone();
@@ -84,13 +84,13 @@ impl HysteriaTransport for QuinnHysteriaTransport {
                 .map_err(|e| io::Error::other(format!("quinn connect: {e}")))?;
 
             // 3. h3 client 发 POST /auth，返回保活项（driver + SendRequest）防止 h3 关闭 QUIC 连接。
-            let h3_keepalive = authenticate_via_h3(&conn, &auth_token, brutal_up_bps).await?;
+            let h3_keepalive = authenticate_via_h3(&conn, &auth_token, brutal_down_bps).await?;
 
             // 4. 包装返回：endpoint 必须保活（drop 会关闭 QUIC 连接），h3 保活项挂在 conn 上。
             // ponytail: Arc<QuinnQuicConn> → Arc<dyn QuicConn> 需 explicit cast
             let quic_conn = QuinnQuicConn::new(conn)
                 .with_endpoint(endpoint)
-                .with_h3_keepalive(h3_keepalive);
+                .with_h3_keepalive(Box::new(h3_keepalive));
             Ok(Arc::new(quic_conn) as Arc<dyn QuicConn>)
         })
     }
@@ -131,8 +131,8 @@ impl HysteriaTransport for QuinnHysteriaTransport {
 async fn authenticate_via_h3(
     conn: &QuinnConnection,
     auth_token: &str,
-    brutal_up_bps: u64,
-) -> io::Result<Box<dyn std::any::Any + Send + Sync>> {
+    brutal_down_bps: u64,
+) -> io::Result<H3Keepalive> {
     let h3_conn = h3_quinn::Connection::new(conn.clone());
     let (mut driver, mut send_req) = h3::client::new(h3_conn)
         .await
@@ -143,7 +143,8 @@ async fn authenticate_via_h3(
         .method(http::Method::POST)
         .uri(AUTH_URL)
         .header("Hysteria-Auth", auth_token)
-        .header("Hysteria-CC-RX", brutal_up_bps.to_string())
+        // Go dialer.go:203 请求头发 BrutalDown（客户端下行容量），非 BrutalUp
+        .header("Hysteria-CC-RX", brutal_down_bps.to_string())
         .header("Hysteria-Padding", padding)
         .body(())
         .expect("static request build");
@@ -169,6 +170,22 @@ async fn authenticate_via_h3(
             STATUS_AUTH_OK
         )));
     }
+
+    // 解析响应头（Go dialer.go:224-225）：
+    // - Hysteria-UDP：服务端是否启用 UDP（strconv.FormatBool 编码）
+    // - Hysteria-CC-RX：服务端 BrutalDown → 客户端 UseBrutal(min(BrutalUp, down)) 的 down
+    let udp_enabled = resp
+        .headers()
+        .get("Hysteria-UDP")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
+    let cc_rx_down = resp
+        .headers()
+        .get("Hysteria-CC-RX")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
     // drop request stream（sender_count 仍由 send_req 维持）
     drop(stream);
 
@@ -181,8 +198,28 @@ async fn authenticate_via_h3(
     });
     let send_req_keepalive = send_req.clone();
 
-    // ponytail: 不解析 Hysteria-UDP/Hysteria-CC-RX 响应头——切片1b 仅校验 auth 成功
-    Ok(Box::new((driver_task, send_req_keepalive)))
+    Ok(H3Keepalive {
+        driver_task,
+        send_req: send_req_keepalive,
+        udp_enabled,
+        cc_rx_down,
+    })
+}
+
+/// h3 auth 保活项 + 协商结果。
+///
+/// driver/send_req 必须持有到 QUIC 连接生命周期结束（见 [`authenticate_via_h3`] 文档）；
+/// udp_enabled/cc_rx_down 是服务端响应头解析结果，供拥塞控制选择
+/// （Go：`UseBrutal(conn, min(BrutalUp, down))`，down=0 或 BrutalUp=0 时退 BBR）。
+pub struct H3Keepalive {
+    #[allow(dead_code)]
+    pub driver_task: tokio::task::JoinHandle<()>,
+    #[allow(dead_code)]
+    pub send_req: h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>,
+    /// 服务端 Hysteria-UDP 响应头（是否启用 UDP relay）。
+    pub udp_enabled: bool,
+    /// 服务端 Hysteria-CC-RX 响应头（服务端下行容量，Brutal 协商用）。
+    pub cc_rx_down: u64,
 }
 
 /// 生成随机 auth padding（256~2048 字节，hex 编码）。
