@@ -38,9 +38,10 @@ pub fn register_all_features() {
     let _ = registry::register_feature("metrics", metrics_factory());
     let _ = registry::register_feature("stats", default_feature_factory("stats"));
     let _ = registry::register_feature("api", commander_factory());
+    let _ = registry::register_feature("fakeDns", fake_dns_factory());
 
     // SimpleFeature for apps without real Feature impl yet
-    for &kind in &["fakeDns", "burstObservatory", "version", "geodata"] {
+    for &kind in &["burstObservatory", "version", "geodata"] {
         let _ = registry::register_feature(kind, simple_feature_factory(kind));
     }
 
@@ -412,6 +413,61 @@ fn commander_factory() -> FeatureFactory {
     })
 }
 
+/// FakeDNS app 真实 factory：解析 `ipPool`/`poolSize` JSON → 初始化 [`Holder`]。
+///
+/// 对应 Go `app/dns/fakedns` 的 `init()` + `New(ctx, config)`。
+/// 缺省池 `240.0.0.0/4` + LRU 65535（Go `FakeIPv4Pool` 同值）。
+/// dispatcher 嗅探注入经 [`FakeDnsFeature::engine`] 取引擎视图。
+fn fake_dns_factory() -> FeatureFactory {
+    Arc::new(|data: &[u8]| {
+        let cfg: xray_conf::app_config::FakeDnsConfig =
+            serde_json::from_slice(data).map_err(|e| FeatureError::StartFailed {
+                name: "fakeDns",
+                message: format!("parse FakeDnsConfig: {e}"),
+            })?;
+        let holder = build_fake_dns_holder(&cfg)?;
+        Ok(Arc::new(FakeDnsFeature { holder }) as Arc<dyn Feature>)
+    })
+}
+
+/// FakeDnsConfig → 已初始化 Holder。缺省池 `240.0.0.0/4` + LRU 65535
+/// （Go `FakeIPv4Pool` 同值）。
+fn build_fake_dns_holder(cfg: &xray_conf::app_config::FakeDnsConfig) -> Result<Arc<xray_app_dns::fakedns::Holder>, FeatureError> {
+    let pool = xray_app_dns::fakedns::FakeDnsPool {
+        ip_pool: cfg
+            .ip_pool
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "240.0.0.0/4".to_string()),
+        lru_size: u64::from(cfg.pool_size.unwrap_or(65535)),
+    };
+    let mut holder = xray_app_dns::fakedns::Holder::with_config(pool);
+    holder.initialize().map_err(|e| FeatureError::StartFailed {
+        name: "fakeDns",
+        message: format!("initialize fake dns pool: {e}"),
+    })?;
+    Ok(Arc::new(holder))
+}
+
+/// FakeDNS Feature：持有真实 [`Holder`]（LRU 域名↔Fake IP 双向映射引擎）。
+struct FakeDnsFeature {
+    holder: Arc<xray_app_dns::fakedns::Holder>,
+}
+
+impl Feature for FakeDnsFeature {
+    fn feature_name(&self) -> &'static str {
+        "fakeDns"
+    }
+}
+
+impl FakeDnsFeature {
+    /// 引擎视图：DNS app / dispatcher 嗅探共用同一 Holder。
+    #[must_use]
+    pub fn engine(&self) -> Arc<xray_app_dns::fakedns::Holder> {
+        Arc::clone(&self.holder)
+    }
+}
+
 /// 为 api/metrics/fakeDns/observatory/burstObservatory/version/geodata
 /// 创建 SimpleFeature 工厂（实现 Feature trait 的最简 no-op）。
 fn simple_feature_factory(kind: &'static str) -> FeatureFactory {
@@ -484,6 +540,40 @@ mod tests {
         register_all_features();
         let result = registry::create_feature("dns", b"{not json");
         assert!(matches!(result, Err(FeatureError::StartFailed { name, .. }) if name == "dns"));
+    }
+
+    #[test]
+    fn fake_dns_factory_builds_working_engine() {
+        register_all_features();
+
+        let json = br#"{"ipPool":"198.18.0.0/15","poolSize":1024}"#;
+        let feat = registry::create_feature("fakeDns", json).expect("fakeDns config should build");
+        assert_eq!(feat.feature_name(), "fakeDns");
+        assert_ne!(feat.feature_name(), "simple", "should not be SimpleFeature");
+
+        // 直接验证引擎可做域名↔Fake IP 双向映射。
+        let cfg: xray_conf::app_config::FakeDnsConfig = serde_json::from_slice(json).unwrap();
+        let engine = build_fake_dns_holder(&cfg).expect("holder should initialize");
+        use xray_app_dns::nameserver::fakedns::FakeDnsEngine as _;
+        let ips = engine.get_fake_ip_for_domain("example.com");
+        assert!(!ips.is_empty(), "engine should allocate fake IPs");
+        let ip = ips[0];
+        assert!(engine.is_ip_in_pool(ip));
+        assert_eq!(
+            engine.get_domain_from_fake_dns(ip).as_deref(),
+            Some("example.com")
+        );
+    }
+
+    #[test]
+    fn fake_dns_factory_uses_default_pool_when_config_empty() {
+        let cfg: xray_conf::app_config::FakeDnsConfig = serde_json::from_slice(b"{}").unwrap();
+        let engine = build_fake_dns_holder(&cfg).expect("default pool should initialize");
+        use xray_app_dns::nameserver::fakedns::FakeDnsEngine as _;
+        let ips = engine.get_fake_ip_for_domain("x.com");
+        assert!(!ips.is_empty());
+        // 缺省池 240.0.0.0/4——分配的 IP 必须落在池内。
+        assert!(engine.is_ip_in_pool(ips[0]));
     }
 
     #[test]
