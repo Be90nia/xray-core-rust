@@ -177,33 +177,64 @@ fn parse_splithttp_config(json: Option<&serde_json::Value>) -> io::Result<Config
         ));
     };
 
-    let host = obj.get("host").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let path = obj.get("path").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let mode = obj.get("mode").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let no_grpc_header = obj.get("noGRPCHeader").or_else(|| obj.get("no_grpc_header")).and_then(|x| x.as_bool()).unwrap_or(false);
-    let no_sse_header = obj.get("noSSEHeader").or_else(|| obj.get("no_sse_header")).and_then(|x| x.as_bool()).unwrap_or(false);
-    let sc_max_each_post_bytes = obj.get("scMaxEachPostBytes").or_else(|| obj.get("sc_max_each_post_bytes")).and_then(parse_range);
-    let sc_min_posts_interval_ms = obj.get("scMinPostsIntervalMs").or_else(|| obj.get("sc_min_posts_interval_ms")).and_then(parse_range);
-    let sc_max_buffered_posts = obj.get("scMaxBufferedPosts").or_else(|| obj.get("sc_max_buffered_posts")).and_then(|x| x.as_i64()).unwrap_or(0);
-    let x_padding_bytes = obj.get("xPaddingBytes").or_else(|| obj.get("x_padding_bytes")).and_then(parse_range);
-    let uplink_http_method = obj.get("uplinkHTTPMethod").or_else(|| obj.get("uplink_http_method")).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let get_str = |k: &str| obj.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let get_bool = |k: &str| obj.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
+    let get_i64 = |k: &str| obj.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
+    let get_range = |k: &str| obj.get(k).and_then(parse_range);
 
     let headers = parse_headers(obj.get("header"))
         .or_else(|| parse_headers(obj.get("headers")))
         .unwrap_or_default();
 
+    // xmux 子对象 → XmuxConfig
+    let xmux = obj.get("xmux").and_then(|x| x.as_object()).map(|m| {
+        let g_range = |k: &str| m.get(k).and_then(parse_range);
+        crate::config::XmuxConfig {
+            max_concurrency: g_range("maxConcurrency"),
+            max_connections: g_range("maxConnections"),
+            c_max_reuse_times: g_range("cMaxReuseTimes"),
+            h_max_request_times: g_range("hMaxRequestTimes"),
+            h_max_reusable_secs: g_range("hMaxReusableSecs"),
+            h_keep_alive_period: m.get("hKeepAlivePeriod").and_then(|x| x.as_i64()).unwrap_or(0),
+        }
+    });
+
+    // downloadSettings 是嵌套 StreamConfig：取其中 splithttpSettings 递归解析
+    // ponytail: 只取 splithttpSettings 子对象；TLS/security 归 stream 层管，这里不碰。
+    let download_settings = obj.get("downloadSettings").and_then(|ds| {
+        ds.get("splithttpSettings")
+            .and_then(|v| parse_splithttp_config(Some(v)).ok())
+            .map(Box::new)
+    });
+
     Ok(Config {
-        host,
-        path,
-        mode,
+        host: get_str("host"),
+        path: get_str("path"),
+        mode: get_str("mode"),
         headers,
-        x_padding_bytes,
-        no_grpc_header,
-        no_sse_header,
-        sc_max_each_post_bytes,
-        sc_min_posts_interval_ms,
-        sc_max_buffered_posts,
-        uplink_http_method,
+        x_padding_bytes: get_range("xPaddingBytes"),
+        x_padding_obfs_mode: get_bool("xPaddingObfsMode"),
+        x_padding_key: get_str("xPaddingKey"),
+        x_padding_header: get_str("xPaddingHeader"),
+        x_padding_placement: get_str("xPaddingPlacement"),
+        x_padding_method: get_str("xPaddingMethod"),
+        uplink_http_method: get_str("uplinkHTTPMethod"),
+        session_placement: get_str("sessionPlacement"),
+        session_key: get_str("sessionKey"),
+        seq_placement: get_str("seqPlacement"),
+        seq_key: get_str("seqKey"),
+        uplink_data_placement: get_str("uplinkDataPlacement"),
+        uplink_data_key: get_str("uplinkDataKey"),
+        uplink_chunk_size: get_range("uplinkChunkSize"),
+        no_grpc_header: get_bool("noGRPCHeader"),
+        no_sse_header: get_bool("noSSEHeader"),
+        sc_max_each_post_bytes: get_range("scMaxEachPostBytes"),
+        sc_min_posts_interval_ms: get_range("scMinPostsIntervalMs"),
+        sc_max_buffered_posts: get_i64("scMaxBufferedPosts"),
+        sc_stream_up_server_secs: get_range("scStreamUpServerSecs"),
+        server_max_header_bytes: get_i64("serverMaxHeaderBytes") as i32,
+        xmux,
+        download_settings,
         ..Config::default()
     })
 }
@@ -250,6 +281,51 @@ mod tests {
         assert!(cfg.host.is_empty());
         assert!(cfg.path.is_empty());
         assert!(cfg.mode.is_empty());
+    }
+
+    #[test]
+    fn parse_splithttp_config_all_fields() {
+        // 对齐 Go SplitHTTPConfig 30 字段全量对拍
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"host":"h.com","path":"/p","mode":"stream-one",
+               "xPaddingBytes":{"from":100,"to":200},
+               "xPaddingObfsMode":true,"xPaddingKey":"k","xPaddingHeader":"X",
+               "xPaddingPlacement":"header","xPaddingMethod":"garble",
+               "uplinkHTTPMethod":"PUT","sessionPlacement":"query","sessionKey":"sid",
+               "seqPlacement":"query","seqKey":"seq","uplinkDataPlacement":"query",
+               "uplinkDataKey":"d","uplinkChunkSize":{"from":1000,"to":2000},
+               "scStreamUpServerSecs":{"from":1,"to":2},"serverMaxHeaderBytes":8192,
+               "xmux":{"maxConcurrency":{"from":1,"to":4},"maxConnections":{"from":2,"to":8},
+                       "cMaxReuseTimes":{"from":3,"to":3},"hMaxRequestTimes":{"from":5,"to":6},
+                       "hMaxReusableSecs":{"from":7,"to":8},"hKeepAlivePeriod":30},
+               "downloadSettings":{"splithttpSettings":{"host":"dl.example.com","path":"/dl"}},
+               "extra":{}}"#,
+        )
+        .unwrap();
+        let cfg = parse_splithttp_config(Some(&v)).unwrap();
+        assert_eq!(cfg.x_padding_bytes.as_ref().unwrap().from, 100);
+        assert_eq!(cfg.x_padding_bytes.as_ref().unwrap().to, 200);
+        assert!(cfg.x_padding_obfs_mode);
+        assert_eq!(cfg.x_padding_key, "k");
+        assert_eq!(cfg.x_padding_header, "X");
+        assert_eq!(cfg.x_padding_placement, "header");
+        assert_eq!(cfg.x_padding_method, "garble");
+        assert_eq!(cfg.uplink_http_method, "PUT");
+        assert_eq!(cfg.session_placement, "query");
+        assert_eq!(cfg.session_key, "sid");
+        assert_eq!(cfg.seq_placement, "query");
+        assert_eq!(cfg.seq_key, "seq");
+        assert_eq!(cfg.uplink_data_placement, "query");
+        assert_eq!(cfg.uplink_data_key, "d");
+        assert_eq!(cfg.uplink_chunk_size.as_ref().unwrap().from, 1000);
+        assert_eq!(cfg.sc_stream_up_server_secs.as_ref().unwrap().to, 2);
+        assert_eq!(cfg.server_max_header_bytes, 8192);
+        let xm = cfg.xmux.as_ref().unwrap();
+        assert_eq!(xm.max_concurrency.as_ref().unwrap().to, 4);
+        assert_eq!(xm.h_keep_alive_period, 30);
+        let dl = cfg.download_settings.as_ref().unwrap();
+        assert_eq!(dl.host, "dl.example.com");
+        assert_eq!(dl.path, "/dl");
     }
 
     #[test]
