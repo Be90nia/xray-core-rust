@@ -146,11 +146,12 @@ pub async fn serve_vmess(
         tokio::spawn(async move {
             let result = if let Some(acc) = tls {
                 match acc.accept(stream).await {
-                    Ok(tls_stream) => handle_connection(tls_stream, &handler, &validator, &history).await,
+                    Ok(tls_stream) => handle_connection(tls_stream, &handler, &validator, &history, false).await,
                     Err(e) => { tracing::warn!(error = %e, "vmess TLS accept failed"); return; }
                 }
             } else {
-                handle_connection(stream, &handler, &validator, &history).await
+                // Go：裸 TCP/Unix 连接认证失败时 drain 防时序指纹；TLS 连接不 drain
+                handle_connection(stream, &handler, &validator, &history, true).await
             };
             if let Err(e) = result {
                 tracing::debug!(error = %e, "vmess connection ended with error");
@@ -159,21 +160,35 @@ pub async fn serve_vmess(
     }
 }
 
-/// 处理单个 VMess 连接：decode header → encode response header → body chunk pump → dispatch。
 async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: S,
     handler: &Arc<dyn DispatchHandler>,
     validator: &Arc<TimedUserValidator>,
     history: &Arc<SessionHistory>,
+    is_drain: bool,
 ) -> std::io::Result<()> {
     let (mut stream_r, mut stream_w) = tokio::io::split(stream);
 
     // 1. decode VMess 请求头（async：先读 16B auth_id → AEAD 解密 → 解析）
     let mut session = ServerSession::new(validator, history);
-    let (header, _user) = session
-        .decode_request_header_async(&mut stream_r)
-        .await
-        .map_err(|e| std::io::Error::other(format!("vmess decode header: {e}")))?;
+    let decoded = session.decode_request_header_async(&mut stream_r).await;
+    let (header, _user) = match decoded {
+        Ok(v) => v,
+        Err(e) => {
+            // Go `server.go::DecodeRequestHeader`：认证失败先 AcknowledgeReceive（已读
+            // 字节），裸 TCP 连接再读走 drainer 决定的字节数才关闭（防时序指纹）。
+            let err = std::io::Error::other(format!("vmess decode header: {e}"));
+            if is_drain {
+                use xray_common::drain::{BehaviorSeedLimitedDrainer, Drainer as _};
+                let drainer =
+                    BehaviorSeedLimitedDrainer::new(crate::validator::Validator::behavior_seed(validator.as_ref()) as i64, 16 + 38, 3266, 64);
+                drainer.acknowledge_receive(16); // auth_id 已读（AEAD 内部计数不可得，近似）
+                // Go 由 SetReadDeadline(handshake timeout) 限制 decode+drain 总时长，对齐 4s
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(4), drainer.drain(&mut stream_r)).await;
+            }
+            return Err(err);
+        }
+    };
 
     // 2. 只处理 TCP；UDP/Mux 暂 warn 跳过
     if header.command != Command::Tcp {
