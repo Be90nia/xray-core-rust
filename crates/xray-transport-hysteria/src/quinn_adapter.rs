@@ -137,6 +137,9 @@ pub struct QuinnQuicConn {
     /// 同一条 QUIC 连接开 raw bidi stream，因此把 driver 和一份不 drop 的 `SendRequest`
     /// 挂在 conn 上保活，直到 conn 本身 drop。
     h3_keepalive: Option<Box<dyn std::any::Any + Send + Sync>>,
+    /// 拥塞控制槽位（client 认证协商后热切换 CC 用；server 端不包装 QuinnQuicConn，
+    /// slot 由 serve_hysteria_connection 直接持有）。
+    cc_slot: Option<std::sync::Arc<crate::congestion::quinn_bridge::HysteriaCCSlot>>,
 }
 
 impl std::fmt::Debug for QuinnQuicConn {
@@ -151,7 +154,7 @@ impl std::fmt::Debug for QuinnQuicConn {
 impl QuinnQuicConn {
     #[must_use]
     pub fn new(conn: Connection) -> Self {
-        Self { conn, endpoint: None, h3_keepalive: None }
+        Self { conn, endpoint: None, h3_keepalive: None, cc_slot: None }
     }
 
     /// 注入 endpoint（client 拨号后调用，保活 endpoint）。
@@ -160,7 +163,15 @@ impl QuinnQuicConn {
         self
     }
 
-    /// 注入 h3 保活项（client 认证成功后调用）。
+    /// 注入 CC 槽位（client 拨号时创建，auth 协商后热切换用）。
+    pub(crate) fn with_cc_slot(
+        mut self,
+        slot: std::sync::Arc<crate::congestion::quinn_bridge::HysteriaCCSlot>,
+    ) -> Self {
+        self.cc_slot = Some(slot);
+        self
+    }
+
     pub(crate) fn with_h3_keepalive(mut self, keepalive: Box<dyn std::any::Any + Send + Sync>) -> Self {
         self.h3_keepalive = Some(keepalive);
         self
@@ -231,18 +242,37 @@ impl QuicConn for QuinnQuicConn {
     }
 }
 
+/// [`CongestionSetter`] 的 quinn conn 实现（m9j：client 侧 auth 后热切换 CC）。
+///
+/// quinn 无 post-handshake CC API，实际由 conn 创建时装好的可热切换 factory +
+/// [`cc_slot`](QuinnQuicConn::with_cc_slot) 生效。
+impl crate::congestion::utils::CongestionSetter for QuinnQuicConn {
+    fn set_congestion_control(
+        &self,
+        cc: Box<dyn crate::congestion::types::CongestionControl>,
+    ) {
+        match &self.cc_slot {
+            Some(slot) => slot.set_congestion_control(cc),
+            None => tracing::warn!("QuinnQuicConn has no cc_slot, congestion control not set"),
+        }
+    }
+}
+
 // ===== quinn TransportConfig 构建（拥塞控制 + QUIC 参数；client dialer + server listener 共用） =====
 
 use std::time::Duration;
 use crate::config;
 use crate::dialer::QuicConfig;
 
-/// 将 [`QuicConfig`] 转为 quinn [`quinn::TransportConfig`]。
+/// 将 [`QuicConfig`] 转为 quinn [`quinn::TransportConfig`] + CC 槽位。
 ///
-/// 拥塞控制（对应 Go `quic.Config.CongestionControl`）：`congestion == "bbr"` →
-/// quinn-proto BBR；其他（`""`、`"cubic"`、`"new_reno"`）→ 默认 CUBIC。
-/// hysteria 协议默认 BBR（见 `QuicConfig::default_for_hysteria`）。
-pub(crate) fn build_hysteria_transport_config(qc: &QuicConfig) -> quinn::TransportConfig {
+/// 拥塞控制（对应 Go auth 后 `SetCongestionControl` switch）：预装可热切换工厂
+/// （初始 quinn CUBIC），auth 握手后由调用方用返回的 [`HysteriaCCSlot`] 按
+/// `apply_negotiated` 协商结果切换到 hysteria 自己的 Brutal/BBR。
+/// （旧实现按 congestion 字段预选 quinn 内建 BBR/CUBIC 是错的——Go 从不预选。）
+pub(crate) fn build_hysteria_transport_config(
+    qc: &QuicConfig,
+) -> (quinn::TransportConfig, std::sync::Arc<crate::congestion::quinn_bridge::HysteriaCCSlot>) {
     let mut t = quinn::TransportConfig::default();
     if qc.max_idle_timeout_ms > 0 {
         if let Ok(v) = quinn::VarInt::try_from(qc.max_idle_timeout_ms) {
@@ -258,26 +288,8 @@ pub(crate) fn build_hysteria_transport_config(qc: &QuicConfig) -> quinn::Transpo
     if qc.max_incoming_streams >= 0 {
         t.max_concurrent_bidi_streams(quinn::VarInt::try_from(qc.max_incoming_streams as u64).unwrap_or(quinn::VarInt::MAX));
     }
-    // 拥塞控制选择
-    match qc.congestion.to_ascii_lowercase().as_str() {
-        "bbr" => {
-            t.congestion_controller_factory(std::sync::Arc::new(
-                quinn_proto::congestion::BbrConfig::default(),
-            ));
-        }
-        "cubic" | "" | "new_reno" => {
-            t.congestion_controller_factory(std::sync::Arc::new(
-                quinn_proto::congestion::CubicConfig::default(),
-            ));
-        }
-        _ => {
-            // 未知类型回退默认（CUBIC），与 Go quic-go 未知回退一致。
-            t.congestion_controller_factory(std::sync::Arc::new(
-                quinn_proto::congestion::CubicConfig::default(),
-            ));
-        }
-    }
-    t
+    let slot = crate::congestion::quinn_bridge::install_swappable_cc(&mut t);
+    (t, slot)
 }
 
 // ===== 切片1b (续): QuinnQuicListener + QuinnListenerFactory =====
@@ -360,26 +372,39 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
         Box::pin(async move {
             let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
                 .map_err(|e| crate::error::HysteriaError::Io(io::Error::other(format!("rustls→quic server: {e}"))))?;
-            let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+            let mut template = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
             let qc = QuicConfig::from_params(&quic_params);
-            server_config.transport_config(Arc::new(build_hysteria_transport_config(&qc)));
-            let endpoint = quinn::Endpoint::server(server_config, bind_addr)
+            // 模板 transport config（endpoint 级兜底；每连接 accept_with 时覆盖）。
+            let (template_tc, _unused_slot) = build_hysteria_transport_config(&qc);
+            template.transport_config(Arc::new(template_tc));
+            let endpoint = quinn::Endpoint::server(template.clone(), bind_addr)
                 .map_err(|e| crate::error::HysteriaError::Io(io::Error::other(format!("bind: {e}"))))?;
 
-            // spawn accept loop：每个 QUIC conn → h3 auth → raw bidi streams → on_new_conn。
+            // spawn accept loop：每个 QUIC conn → h3 auth → CC 协商 → raw bidi streams → on_new_conn。
             // endpoint.close()（listener close）会让 accept 返回 None，循环自然退出。
+            // CC：每连接独立 slot（quinn 无 post-handshake 换 CC API，用 accept_with
+            // 给每个 incoming 配带独立 swappable factory 的 transport config）。
             let ep = endpoint.clone();
             tokio::spawn(async move {
                 while let Some(incoming) = ep.accept().await {
                     let validator = validator.clone();
                     let on_new_conn = on_new_conn.clone();
+                    let quic_params = quic_params.clone();
+                    let (tc, cc_slot) = build_hysteria_transport_config(&qc);
+                    let mut server_config = template.clone();
+                    server_config.transport_config(Arc::new(tc));
                     tokio::spawn(async move {
-                        match incoming.await {
-                            Ok(conn) => {
-                                serve_hysteria_connection(conn, validator, on_new_conn).await;
-                            }
+                        match incoming.accept_with(Arc::new(server_config)) {
+                            Ok(connecting) => match connecting.await {
+                                Ok(conn) => {
+                                    serve_hysteria_connection(conn, validator, on_new_conn, quic_params, cc_slot).await;
+                                }
+                                Err(e) => {
+                                    tracing::debug!(error = ?e, "hysteria quic handshake failed");
+                                }
+                            },
                             Err(e) => {
-                                tracing::debug!(error = ?e, "hysteria quic handshake failed");
+                                tracing::debug!(error = ?e, "hysteria quic accept failed");
                             }
                         }
                     });
@@ -392,14 +417,17 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
         })
     }
 }
-
-/// 服务单个 hysteria QUIC 连接：h3 `/auth` 握手 → raw bidi stream 循环。
+/// 服务单个 hysteria QUIC 连接：h3 `/auth` 握手 → CC 协商 → raw bidi stream 循环。
 ///
-/// 对应 Go `http3.Server.ServeQUICConn`（auth）+ `conn.AcceptStream`（data）。
+/// 对应 Go `http3.Server.ServeQUICConn`（auth + SetCongestionControl switch）+
+/// `conn.AcceptStream`（data）。CC 协商（hub.go:75-86）：`down` 取请求
+/// `Hysteria-CC-RX`（客户端下行容量），`UseBrutal(min(BrutalUp, down))`。
 async fn serve_hysteria_connection(
     conn: quinn::Connection,
     validator: Option<Arc<dyn crate::hub::AuthValidator>>,
     on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync>,
+    quic_params: Arc<QuicParams>,
+    cc_slot: std::sync::Arc<crate::congestion::quinn_bridge::HysteriaCCSlot>,
 ) {
     let remote = conn.remote_address();
     let local = conn
@@ -407,13 +435,27 @@ async fn serve_hysteria_connection(
         .map(|ip| SocketAddr::new(ip, 0))
         .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0));
 
-    // Phase 1: h3 /auth 握手
-    if !h3_auth(&conn, &validator).await {
-        tracing::warn!(%remote, "hysteria auth failed, closing");
-        conn.close(VarInt::from_u32(0), b"auth failed");
-        return;
-    }
+    // Phase 1: h3 /auth 握手（返回客户端 CCRX 供 CC 协商）
+    let auth_down = match h3_auth(&conn, &validator, &quic_params).await {
+        Some(down) => down,
+        None => {
+            tracing::warn!(%remote, "hysteria auth failed, closing");
+            conn.close(VarInt::from_u32(0), b"auth failed");
+            return;
+        }
+    };
     tracing::info!(%remote, "hysteria client authenticated");
+
+    // Phase 1.5: CC 协商（Go hub.go:75-86 switch）
+    if let Err(e) = crate::congestion::quinn_bridge::apply_negotiated(
+        &cc_slot,
+        &quic_params.congestion,
+        &quic_params.bbr_profile,
+        quic_params.brutal_up,
+        auth_down,
+    ) {
+        tracing::warn!(error = %e, %remote, "hysteria congestion negotiation failed, keeping default");
+    }
 
     // Phase 2: raw bidi streams（FrameTypeTCPRequest 前缀由 InterStreamConn 处理）
     loop {
@@ -433,6 +475,10 @@ async fn serve_hysteria_connection(
 
 /// h3 `/auth` 握手：accept 一个 HTTP/3 请求，校验 `Hysteria-Auth`，回应 233/403。
 ///
+/// 成功返回 `Some(客户端 Hysteria-CC-RX)`（客户端下行容量，Go hub.go:66 取请求头
+/// 供 UseBrutal(min(BrutalUp, down)) 协商）；响应头回 `Hysteria-CC-RX` = 本端
+/// BrutalDown（Go hub.go:51）供客户端对称协商。失败返回 None。
+///
 /// h3 server Connection 在函数内创建并使用。认证成功后，h3 server 的 Drop 会关闭
 /// QUIC 连接（H3_NO_ERROR）——用 `std::mem::forget` 防止，保持连接存活以接收 raw data stream。
 /// h3-quinn 的 incoming_bi 不会在认证结束后抢消费后续 bidi stream（stream::unfold 惰性，
@@ -440,25 +486,30 @@ async fn serve_hysteria_connection(
 async fn h3_auth(
     conn: &quinn::Connection,
     validator: &Option<Arc<dyn crate::hub::AuthValidator>>,
-) -> bool {
+    quic_params: &QuicParams,
+) -> Option<u64> {
     let h3_server: h3::server::Connection<h3_quinn::Connection, bytes::Bytes> =
         match h3::server::Connection::new(h3_quinn::Connection::new(conn.clone())).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::debug!(error = ?e, "h3 server init failed");
-                return false;
+                return None;
             }
         };
     let mut h3_server = h3_server;
+    /// wire 错误短路（须在 h3_server 绑定后定义，宏卫生）。
+    macro_rules! bail {
+        () => {{
+            std::mem::forget(h3_server);
+            return None;
+        }};
+    }
     loop {
         match h3_server.accept().await {
             Ok(Some(resolver)) => {
                 let (req, mut stream) = match resolver.resolve_request().await {
                     Ok(v) => v,
-                    Err(_) => {
-                        std::mem::forget(h3_server);
-                        return false;
-                    }
+                    Err(_) => bail!(),
                 };
                 let is_auth = req.method() == http::Method::POST
                     && req.uri().path() == crate::config::URLPath;
@@ -467,6 +518,13 @@ async fn h3_auth(
                     .get(crate::config::RequestHeaderAuth)
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
+                // 客户端下行容量（Go hub.go:66 请求头 CCRX → UseBrutal 的 down）。
+                let client_down = req
+                    .headers()
+                    .get(crate::config::CommonHeaderCCRX)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
                 let ok = if !is_auth {
                     false
                 } else if let Some(v) = validator {
@@ -483,6 +541,8 @@ async fn h3_auth(
                     .status(status)
                     // Go hub.go:50 strconv.FormatBool(validator != nil)
                     .header(crate::config::ResponseHeaderUDPEnabled, "true")
+                    // Go hub.go:51 本端 BrutalDown（客户端协商 UseBrutal 的 down）。
+                    .header(crate::config::CommonHeaderCCRX, quic_params.brutal_down.to_string())
                     .header(crate::config::CommonHeaderPadding, "0")
                     .body(());
                 match resp {
@@ -490,24 +550,17 @@ async fn h3_auth(
                         let _ = stream.send_response(r).await;
                         let _ = stream.finish().await;
                     }
-                    Err(_) => {
-                        std::mem::forget(h3_server);
-                        return false;
-                    }
+                    Err(_) => bail!(),
                 }
                 if ok {
                     std::mem::forget(h3_server);
-                    return true;
+                    return Some(client_down);
                 }
             }
-            Ok(None) => {
-                std::mem::forget(h3_server);
-                return false;
-            }
+            Ok(None) => bail!(),
             Err(e) => {
                 tracing::debug!(error = ?e, "h3 accept ended");
-                std::mem::forget(h3_server);
-                return false;
+                bail!();
             }
         }
     }
@@ -936,6 +989,105 @@ mod tests {
         let mut got = vec![0u8; payload.len()];
         isc.read(&mut got).await.expect("client read echo");
         assert_eq!(&got, payload, "echo roundtrip through QUIC + h3 auth");
+
+        let _ = listener.close().await;
+    }
+
+    /// 集成测试：Brutal 拥塞协商全链路（m9j）。
+    ///
+    /// client brutal_up=5MB/s + server brutal_down=8MB/s → 响应 CCRX=8MB/s →
+    /// `UseBrutal(min(5MB/s, 8MB/s))`；server 侧对称（请求 CCRX=3MB/s）。
+    /// 验证协商代码路径（头解析 + apply_negotiated + adapter 热切换）不破坏
+    /// 数据面。算法选择语义由 quinn_bridge 单测钉死。
+    ///
+    /// 带宽必须用现实量级：Brutal 窗口 = 2×bps×rtt，回环 RTT 亚毫秒下小带宽
+    /// 会把窗口钳到 1 MTU（1200B）导致 quinn 发送停滞（Go quic-go 同数学）。
+    #[tokio::test]
+    async fn listener_factory_brutal_negotiation_roundtrip() {
+        use crate::hysteria_transport::QuinnHysteriaTransport;
+        use crate::dialer::{DialDestination, HysteriaTransport, QuicConfig};
+        use std::sync::Arc;
+
+        ensure_crypto_provider();
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key_der = rustls::pki_types::PrivateKeyDer::try_from(
+            cert.key_pair.serialize_der(),
+        ).unwrap();
+        let server_tls = rustls::server::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.into()], key_der)
+            .unwrap();
+
+        let factory = QuinnListenerFactory::new(Arc::new(server_tls));
+        let proto_config = Arc::new(crate::proto_config::Config::default());
+        // server：congestion=""（默认 brutal 协商）+ brutal_up=9MB/s / brutal_down=8MB/s。
+        let quic_params = Arc::new(xray_proto::xray::transport::internet::QuicParams {
+            congestion: String::new(),
+            brutal_up: 9_000_000,
+            brutal_down: 8_000_000,
+            ..Default::default()
+        });
+        let masq = crate::hub::MasqType::NotFound;
+        struct TestValidator;
+        impl crate::hub::AuthValidator for TestValidator {
+            fn validate(&self, auth: &str) -> Option<String> {
+                if auth == "test-secret" { Some("user".into()) } else { None }
+            }
+            fn count(&self) -> usize { 1 }
+        }
+        let validator: Option<Arc<dyn crate::hub::AuthValidator>> = Some(Arc::new(TestValidator));
+
+        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel::<Arc<InterStreamConn>>();
+        let on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync> = Arc::new(move |s| {
+            let _ = stream_tx.send(s);
+        });
+
+        let listener = factory
+            .listen("127.0.0.1:0".parse().unwrap(), proto_config, quic_params, masq, validator, on_new_conn)
+            .await
+            .expect("listen should succeed");
+        let server_addr = listener.local_addr();
+
+        let client_tls = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        let transport = Arc::new(
+            QuinnHysteriaTransport::new(client_tls, "0.0.0.0:0".parse().unwrap()).expect("transport"),
+        );
+
+        // client：brutal_up=5MB/s；请求头 CCRX（brutal_down_bps）=3MB/s。
+        let dest = DialDestination { udp_addr: server_addr, host: "localhost".into() };
+        let qc = QuicConfig {
+            congestion: String::new(),
+            brutal_up: 5_000_000,
+            bbr_profile: "standard".into(),
+            ..QuicConfig::default_for_hysteria()
+        };
+        let conn = transport
+            .dial_and_authenticate(&dest, &qc, "test-secret", 3_000_000)
+            .await
+            .expect("dial + auth should succeed");
+
+        let stream = transport.open_stream(&conn).await.expect("open_stream");
+        let isc = Arc::new(InterStreamConn::new(stream, conn.local_addr(), conn.remote_addr(), false));
+        let payload = b"hello brutal!";
+        isc.write(payload).await.expect("client write");
+
+        let server_isc = tokio::time::timeout(std::time::Duration::from_secs(10), stream_rx.recv())
+            .await
+            .expect("server should receive stream via on_new_conn")
+            .expect("channel not empty");
+
+        let mut buf = vec![0u8; payload.len()];
+        server_isc.read(&mut buf).await.expect("server read");
+        server_isc.write(&buf).await.expect("server echo write");
+
+        let mut got = vec![0u8; payload.len()];
+        isc.read(&mut got).await.expect("client read echo");
+        assert_eq!(&got, payload, "echo roundtrip with Brutal negotiated both sides");
 
         let _ = listener.close().await;
     }

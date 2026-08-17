@@ -61,17 +61,21 @@ impl HysteriaTransport for QuinnHysteriaTransport {
     fn dial_and_authenticate(
         &self,
         dest: &DialDestination,
-        _quic_config: &QuicConfig,
+        quic_config: &QuicConfig,
         auth_token: &str,
         brutal_down_bps: u64,
     ) -> Pin<Box<dyn std::future::Future<Output = io::Result<Arc<dyn QuicConn>>> + Send>> {
         let dest_addr = dest.udp_addr;
         let host = dest.host.clone();
-        let client_config = self.client_config.clone();
+        let mut client_config = self.client_config.clone();
         let bind_addr = self.bind_addr;
         let auth_token = auth_token.to_string();
+        let quic_cfg = quic_config.clone();
         Box::pin(async move {
-            // 1. quinn endpoint
+            // 1. quinn endpoint（transport config 含可热切换 CC factory，auth 后协商）
+            let (transport_cfg, cc_slot) =
+                crate::quinn_adapter::build_hysteria_transport_config(&quic_cfg);
+            client_config.transport_config(Arc::new(transport_cfg));
             let mut endpoint = Endpoint::client(bind_addr)
                 .map_err(|e| io::Error::other(format!("quinn endpoint: {e}")))?;
             endpoint.set_default_client_config(client_config);
@@ -86,10 +90,23 @@ impl HysteriaTransport for QuinnHysteriaTransport {
             // 3. h3 client 发 POST /auth，返回保活项（driver + SendRequest）防止 h3 关闭 QUIC 连接。
             let h3_keepalive = authenticate_via_h3(&conn, &auth_token, brutal_down_bps).await?;
 
+            // 3.5 CC 协商（Go dialer.go:229-243 switch）：
+            // down = 响应 Hysteria-CC-RX（服务端下行容量）。
+            if let Err(e) = crate::congestion::quinn_bridge::apply_negotiated(
+                &cc_slot,
+                &quic_cfg.congestion,
+                &quic_cfg.bbr_profile,
+                quic_cfg.brutal_up,
+                h3_keepalive.cc_rx_down,
+            ) {
+                tracing::warn!(error = %e, "hysteria congestion negotiation failed, keeping default");
+            }
+
             // 4. 包装返回：endpoint 必须保活（drop 会关闭 QUIC 连接），h3 保活项挂在 conn 上。
             // ponytail: Arc<QuinnQuicConn> → Arc<dyn QuicConn> 需 explicit cast
             let quic_conn = QuinnQuicConn::new(conn)
                 .with_endpoint(endpoint)
+                .with_cc_slot(cc_slot)
                 .with_h3_keepalive(Box::new(h3_keepalive));
             Ok(Arc::new(quic_conn) as Arc<dyn QuicConn>)
         })

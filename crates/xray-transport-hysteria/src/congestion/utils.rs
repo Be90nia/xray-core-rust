@@ -40,7 +40,7 @@ pub fn normalize_bbr_profile(s: &str) -> crate::Result<&'static str> {
 /// 应用到具体的 QUIC conn（quinn_proto::congestion::Controller）。
 pub trait CongestionSetter: Send + Sync {
     /// 替换 conn 的 congestion control 算法为指定实现。
-    fn set_congestion_control(&self, cc: Arc<dyn CongestionControl>);
+    fn set_congestion_control(&self, cc: Box<dyn CongestionControl>);
 }
 
 /// 创建 BBR 发送器并应用到 setter（对应 Go `UseBBR`）。
@@ -53,13 +53,13 @@ pub fn use_bbr<S: CongestionSetter + ?Sized>(
     initial_packet_size: i64,
     profile: Profile,
 ) {
-    let sender = Arc::new(BbrSender::new(clock, initial_packet_size, profile));
+    let sender = Box::new(BbrSender::new(clock, initial_packet_size, profile));
     setter.set_congestion_control(sender);
 }
 
 /// 创建 BrutalSender 并应用到 setter（对应 Go `UseBrutal`）。
 pub fn use_brutal<S: CongestionSetter + ?Sized>(setter: &S, tx_bps: u64) {
-    let sender = Arc::new(BrutalSender::new(tx_bps));
+    let sender = Box::new(BrutalSender::new(tx_bps));
     setter.set_congestion_control(sender);
 }
 
@@ -89,7 +89,7 @@ mod tests {
 
     /// 测试用 setter：记录最后一次 set 的 cc 指针。
     struct TestSetter {
-        last_set: Mutex<Option<Arc<dyn CongestionControl>>>,
+        last_set: Mutex<Option<Box<dyn CongestionControl>>>,
     }
 
     impl TestSetter {
@@ -105,7 +105,7 @@ mod tests {
     }
 
     impl CongestionSetter for TestSetter {
-        fn set_congestion_control(&self, cc: Arc<dyn CongestionControl>) {
+        fn set_congestion_control(&self, cc: Box<dyn CongestionControl>) {
             *self.last_set.lock().unwrap() = Some(cc);
         }
     }

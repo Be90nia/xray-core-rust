@@ -12,6 +12,7 @@ pub mod brutal;
 pub mod pacer;
 pub mod types;
 pub mod utils;
+pub mod quinn_bridge;
 
 pub use brutal::BrutalSender;
 pub use pacer::Pacer;
