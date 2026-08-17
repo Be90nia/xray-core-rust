@@ -1295,4 +1295,156 @@ mod tests {
         }
         for h in sh.iter().chain(ch.iter()) { h.abort(); }
     }
+
+    /// VLESS+TLS+fallbacks：真 VLESS 客户端正常代理；非 VLESS（HTTPS 浏览器式）流量
+    /// 按 fallback 策略透明转发到 fallback dest（bd fsa）。
+    #[tokio::test]
+    async fn integration_vless_tls_fallback_routes_non_vless() {
+        let (cert_pem, key_pem) = xray_tls::certificate::generate_self_signed_cert(&["localhost"])
+            .expect("generate self-signed cert");
+
+        // fallback dest：echo（收到非 VLESS 数据并回显）
+        let fb_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fb_addr = fb_listener.local_addr().unwrap();
+        let fb_task = tokio::spawn(async move {
+            let (mut sock, _) = fb_listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            let n = sock.read(&mut buf).await.unwrap();
+            sock.write_all(&buf[..n]).await.unwrap();
+            buf[..n].to_vec()
+        });
+
+        // 正常代理目标 echo
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = echo_listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => { if sock.write_all(&buf[..n]).await.is_err() { break; } }
+                }
+            }
+        });
+
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let vless_port = probe.local_addr().unwrap().port(); drop(probe);
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_port = probe.local_addr().unwrap().port(); drop(probe);
+
+        let server_tls = format!(r#"{{"network":"tcp","security":"tls","tlsSettings":{{"certificates":[{{"certificate":[{:?}],"key":[{:?}]}}]}}}}"#, cert_pem, key_pem);
+        let client_tls = r#"{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true,"serverName":"localhost"}}"#;
+
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry {
+                kind: "vless".into(),
+                data: format!(r#"{{"clients":[{{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}}],"fallbacks":[{{"dest":"{fb_addr}","xver":0}}]}}"#).into_bytes(),
+            },
+            tag: "vless-fb-in".into(), port: Some(vless_port), listen: Some("127.0.0.1".into()),
+            stream_settings_json: Some(serde_json::from_str(&server_tls).unwrap()), sniffing_json: None,
+        });
+        server_cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            tag: "direct".into(), send_through: None, stream_settings_json: None,
+            proxy_settings_json: None, mux_json: None,
+        });
+        let (_si, _so, sh) = start_full(&server_cfg).await.expect("vless-fb server");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // A. 真 VLESS 客户端：SOCKS5 → VLESS+TLS → freedom → echo
+        let mut client_cfg = BuiltConfig::default();
+        client_cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry { kind: "socks".into(), data: vec![] },
+            tag: "socks-in".into(), port: Some(socks_port), listen: Some("127.0.0.1".into()),
+            stream_settings_json: None, sniffing_json: None,
+        });
+        client_cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry { kind: "vless".into(),
+                data: format!(r#"{{"vnext":[{{"address":"127.0.0.1","port":{vless_port},"users":[{{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"}}]}}]}}"#).into_bytes() },
+            tag: "proxy".into(), send_through: None,
+            stream_settings_json: Some(serde_json::from_str(client_tls).unwrap()),
+            proxy_settings_json: None, mux_json: None,
+        });
+        let (_ci, _co, ch) = start_full(&client_cfg).await.expect("vless-fb client");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut client = TcpStream::connect(format!("127.0.0.1:{socks_port}")).await.unwrap();
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut resp = [0u8; 2]; client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [0x05, 0x00]);
+        let ip = match echo_addr.ip() { std::net::IpAddr::V4(v) => v.octets(), _ => unreachable!() };
+        let mut req = vec![0x05, 0x01, 0x00, 0x01];
+        req.extend_from_slice(&ip); req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        client.write_all(&req).await.unwrap();
+        let mut cr = [0u8; 10]; client.read_exact(&mut cr).await.unwrap();
+        assert_eq!(cr[1], 0x00, "VLESS+TLS CONNECT with fallbacks configured");
+        let payload = b"hello vless with fallback!";
+        client.write_all(payload).await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got))
+            .await.expect("vless echo timeout").unwrap();
+        assert_eq!(&got, payload);
+
+        // B. 非 VLESS 客户端：TLS 连接发 HTTP 请求 → fallback dest 收到原始字节
+        //    （用 rustls 客户端绕过证书校验）
+        static PROVIDER: std::sync::Once = std::sync::Once::new();
+        PROVIDER.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
+        let mut roots = rustls::RootCertStore::empty();
+        let _ = &mut roots;
+        let cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(NoVerify))
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(cfg));
+        let tls_sock = tokio::net::TcpStream::connect(format!("127.0.0.1:{vless_port}")).await.unwrap();
+        let mut tls = connector.connect("localhost".try_into().unwrap(), tls_sock).await.unwrap();
+        tls.write_all(b"GET /web HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+        let mut fb_got = vec![0u8; 64];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), tls.read(&mut fb_got))
+            .await.expect("fallback echo timeout").unwrap();
+        assert!(fb_got[..n].starts_with(b"GET /web"), "fallback dest should receive original HTTP bytes");
+
+        // fallback echo 收到的也应是同一请求
+        let fb_bytes = fb_task.await.unwrap();
+        assert!(fb_bytes.starts_with(b"GET /web"), "fallback echo server got {fb_bytes:?}");
+
+        for h in sh.iter().chain(ch.iter()) { h.abort(); }
+    }
+
+    /// 测试用：跳过证书校验的 verifier。
+    #[derive(Debug)]
+    struct NoVerify;
+    impl rustls::client::danger::ServerCertVerifier for NoVerify {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(message, cert, dss, &rustls::crypto::ring::default_provider().signature_verification_algorithms)
+        }
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(message, cert, dss, &rustls::crypto::ring::default_provider().signature_verification_algorithms)
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+        }
+    }
 }

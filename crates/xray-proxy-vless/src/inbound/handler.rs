@@ -15,19 +15,34 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use xray_common::net::destination::Destination;
 
 use crate::error::{Result, VlessError};
 use crate::validator::Validator;
 
-/// Fallback 路由策略：`name → alpn → path → Destination` 三级 map。
+/// Fallback 路由策略：`name → alpn → path → FallbackDest` 三级 map。
 ///
 /// 对应 Go 端 `napfb` 字典：SNI 名字（或空）→ ALPN（或空）→ HTTP path → 目标。
 /// `name=""` 表示通配，`alpn=""` 同理。
 #[derive(Debug, Default, Clone)]
 pub struct FallbackPolicy {
     /// name → (alpn → (path → dest))
-    entries: HashMap<String, HashMap<String, HashMap<String, Destination>>>,
+    entries: HashMap<String, HashMap<String, HashMap<String, FallbackDest>>>,
+}
+
+/// 一条 fallback 目标：`dest`（"host:port"）+ PROXY protocol `xver`（0/1/2）。
+#[derive(Debug, Clone)]
+pub struct FallbackDest {
+    /// 目标地址字符串（直接 `TcpStream::connect`）。
+    pub dest: String,
+    /// PROXY protocol 版本（0=无，1=v1 文本，2=v2 二进制）。
+    pub xver: u8,
+}
+
+impl FallbackDest {
+    #[must_use]
+    pub fn new(dest: impl Into<String>, xver: u8) -> Self {
+        Self { dest: dest.into(), xver }
+    }
 }
 
 impl FallbackPolicy {
@@ -43,7 +58,7 @@ impl FallbackPolicy {
         name: impl Into<String>,
         alpn: impl Into<String>,
         path: impl Into<String>,
-        dest: Destination,
+        dest: FallbackDest,
     ) {
         self.entries
             .entry(name.into())
@@ -60,7 +75,7 @@ impl FallbackPolicy {
         name: &str,
         alpn: &str,
         path: &str,
-    ) -> Option<&Destination> {
+    ) -> Option<&FallbackDest> {
         self.entries
             .get(name)
             .and_then(|m| m.get(alpn))
@@ -84,7 +99,7 @@ impl FallbackPolicy {
         name: &str,
         alpn: &str,
         path: &str,
-    ) -> Option<&Destination> {
+    ) -> Option<&FallbackDest> {
         for (n, a, p) in [
             (name, alpn, path),
             (name, alpn, ""),
@@ -118,6 +133,7 @@ impl FallbackPolicy {
         self.len() == 0
     }
 }
+
 
 /// 从 first buffer 字节流中提取 HTTP path（从第 4 字节位置开始的 '/' 起算）。
 ///
@@ -206,10 +222,9 @@ impl InboundProcessor for VlessInboundProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xray_common::net::{address::Address, port::Port};
 
-    fn sample_dest(host: &str, port: u16) -> Destination {
-        Destination::tcp(Address::Domain(host.into()), Port::new(port))
+    fn sample_dest(host: &str, port: u16) -> FallbackDest {
+        FallbackDest::new(format!("{host}:{port}"), 0)
     }
 
     #[test]
@@ -219,7 +234,7 @@ mod tests {
         let d = p.find("example.com", "h2", "/api");
         assert!(d.is_some());
         let d = d.unwrap();
-        assert_eq!(d.port().value(), 8080);
+        assert_eq!(d.dest, "backend.local:8080");
     }
 
     #[test]
@@ -241,11 +256,11 @@ mod tests {
 
         // 精确命中
         let d = p.find_with_fallback("example.com", "h2", "/api").unwrap();
-        assert_eq!(d.port().value(), 9000);
+        assert_eq!(d.dest, "api.local:9000");
 
         // 未注册的 name 走通配
         let d = p.find_with_fallback("unknown.com", "h2", "/default").unwrap();
-        assert_eq!(d.port().value(), 80);
+        assert_eq!(d.dest, "default.local:80");
     }
 
     #[test]
@@ -255,7 +270,7 @@ mod tests {
 
         // alpn 未匹配具体条目，降级到 alpn=""
         let d = p.find_with_fallback("example.com", "h2", "/catchall").unwrap();
-        assert_eq!(d.port().value(), 9090);
+        assert_eq!(d.dest, "catch.local:9090");
     }
 
     #[test]

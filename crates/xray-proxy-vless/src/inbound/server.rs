@@ -43,6 +43,7 @@ pub async fn serve_vless(
     ohm: Arc<SimpleOhm>,
     validator: Arc<dyn Validator>,
     tls: Option<Arc<xray_transport::TlsAcceptor>>,
+    fallbacks: Option<Arc<crate::inbound::handler::FallbackPolicy>>,
 ) -> std::io::Result<()> {
     let handler = ohm
         .get_default_handler()
@@ -65,25 +66,212 @@ pub async fn serve_vless(
         let handler = Arc::clone(&handler);
         let validator = Arc::clone(&validator);
         let tls = tls.clone();
+        let fallbacks = fallbacks.clone();
+        let local = listener.local_addr()?;
         tokio::spawn(async move {
             let result = if let Some(acc) = tls {
                 match acc.accept(stream).await {
-                    Ok(tls_stream) => handle_connection(tls_stream, &handler, &validator).await,
+                    Ok(tls_stream) => {
+                        let conn = tls_stream.get_ref().1;
+                        let name = conn.server_name().unwrap_or("").to_string();
+                        let alpn = conn
+                            .alpn_protocol()
+                            .map(|p| String::from_utf8_lossy(p).into_owned())
+                            .unwrap_or_default();
+                        handle_connection_with_fallback(
+                            tls_stream, &handler, &validator, fallbacks, peer, local, name, alpn,
+                        )
+                        .await
+                    }
                     Err(e) => {
                         tracing::warn!(error = %e, "vless TLS accept failed");
                         return;
                     }
                 }
             } else {
-                handle_connection(stream, &handler, &validator).await
+                handle_connection_with_fallback(
+                    stream, &handler, &validator, fallbacks, peer, local, String::new(), String::new(),
+                )
+                .await
             };
             if let Err(e) = result {
                 tracing::debug!(error = %e, "vless connection ended with error");
             }
         });
-
-        let _ = peer;
     }
+}
+
+/// 前缀已读字节的 reader：先吐 `initial`，再透传内层流（与 tuic inbound 同模式）。
+struct InitialedReader<R> {
+    initial: std::io::Cursor<Vec<u8>>,
+    inner: R,
+}
+
+impl<R> InitialedReader<R> {
+    fn new(initial: Vec<u8>, inner: R) -> Self {
+        Self {
+            initial: std::io::Cursor::new(initial),
+            inner,
+        }
+    }
+
+    fn into_parts(self) -> (Vec<u8>, R) {
+        let pos = self.initial.position() as usize;
+        let mut initial = self.initial.into_inner();
+        let remaining = initial.split_off(pos);
+        (remaining, self.inner)
+    }
+}
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for InitialedReader<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.initial.position() < self.initial.get_ref().len() as u64 {
+            let unfilled = buf.initialize_unfilled();
+            let n = std::io::Read::read(&mut self.initial, unfilled)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            buf.advance(n);
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+/// 带 fallback 的连接处理（Go `vless/inbound/inbound.go::Process` 语义）：
+///
+/// 1. 预读 first buffer（最多 1024 字节）
+/// 2. first[0]==VLESS VERSION 且 decode 成功 → 正常 dispatch
+/// 3. 否则（非 VLESS 流量 / 认证失败）→ 查 FallbackPolicy 转发到 fallback dest
+pub async fn handle_connection_with_fallback<S>(
+    stream: S,
+    handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,
+    validator: &Arc<dyn Validator>,
+    fallbacks: Option<Arc<crate::inbound::handler::FallbackPolicy>>,
+    peer: std::net::SocketAddr,
+    local: std::net::SocketAddr,
+    tls_name: String,
+    tls_alpn: String,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncReadExt;
+
+    // 无 fallback 策略：维持原直连路径（不做 first 预读）
+    let Some(policy) = fallbacks else {
+        return handle_connection(stream, handler, validator).await;
+    };
+
+    let (mut read_half, write_half) = tokio::io::split(stream);
+
+    // 1. 预读 first buffer（读到至少 1 字节）
+    let mut first = vec![0u8; 1024];
+    let mut n = 0;
+    while n == 0 {
+        let read = read_half.read(&mut first[n..]).await?;
+        if read == 0 {
+            return Ok(()); // 客户端未发数据即关闭
+        }
+        n += read;
+    }
+    first.truncate(n);
+
+    // 2. VLESS 候选：首字节是 VERSION → 回灌后正常 decode；失败也走 fallback
+    if first[0] == VERSION {
+        let mut reader = InitialedReader::new(first.clone(), read_half);
+        if let Ok(decoded) =
+            decode_request_header(false, &mut None, &mut reader, validator.as_ref()).await
+        {
+            return finish_vless_dispatch(reader, write_half, decoded, handler).await;
+        }
+        // ponytail: decode 失败时 decode 已续读的 stream 字节不重放（Go 用
+        // connection buffer replay）；version=0 的畸形流量才走到这，正常
+        // fallback 客户端（first[0]!=VERSION）不受影响。
+        let (_, read_half_back) = reader.into_parts();
+        return do_fallback(
+            read_half_back,
+            write_half,
+            &first,
+            &policy,
+            peer,
+            local,
+            &tls_name,
+            &tls_alpn,
+        )
+        .await;
+    }
+
+    // 3. 非 VLESS 流量：直接 fallback
+    do_fallback(read_half, write_half, &first, &policy, peer, local, &tls_name, &tls_alpn).await
+}
+
+/// fallback：path 提取 → 查 policy → 透明转发（PROXY header + first 回放 + 双向 pipe）。
+async fn do_fallback<R, W>(
+    read_half: R,
+    write_half: W,
+    first: &[u8],
+    policy: &Arc<crate::inbound::handler::FallbackPolicy>,
+    peer: std::net::SocketAddr,
+    local: std::net::SocketAddr,
+    tls_name: &str,
+    tls_alpn: &str,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    let path = crate::inbound::handler::extract_path_from_first_bytes(first).unwrap_or("");
+    let Some(fb) = policy.find_with_fallback(tls_name, tls_alpn, path) else {
+        return Err(std::io::Error::other(
+            "vless decode failed and no fallback matched",
+        ));
+    };
+    tracing::debug!(dest = %fb.dest, xver = fb.xver, name = tls_name, alpn = tls_alpn, path, "vless fallback");
+    let mut conn = tokio::io::join(read_half, write_half);
+    let _ = xray_transport::fallback::fallback_to_dest(
+        &mut conn, first, &fb.dest, peer, local, fb.xver,
+    )
+    .await;
+    Ok(())
+}
+
+/// decode 成功后的收尾：响应头 + Link（读侧=回灌 reader）→ dispatch。
+async fn finish_vless_dispatch<R, W>(
+    mut reader: R,
+    mut write_half: W,
+    decoded: crate::encoding::server::DecodedRequest,
+    handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    use crate::encoding::{empty_addons, VlessCommand};
+    use xray_common::net::{destination::Destination, network::Network, port::Port};
+
+    if decoded.command != VlessCommand::Tcp {
+        tracing::warn!(command = ?decoded.command, "vless non-TCP command, sending empty response and closing");
+        let _ = encode_response_header(&mut write_half, VERSION, &empty_addons()).await;
+        return Ok(());
+    }
+
+    let address = decoded
+        .address
+        .ok_or_else(|| std::io::Error::other("vless decode: missing address for TCP command"))?;
+    let port = decoded
+        .port
+        .ok_or_else(|| std::io::Error::other("vless decode: missing port for TCP command"))?;
+    let dest = Destination::new(address, Port::new(port), Network::TCP);
+
+    encode_response_header(&mut write_half, VERSION, &empty_addons())
+        .await
+        .map_err(|e| std::io::Error::other(format!("vless encode response: {e}")))?;
+
+    let link = Link::new(new_reader(reader), new_writer(write_half));
+    let _ = handler.dispatch(&dest, link).await;
+    Ok(())
 }
 
 /// 处理单个 VLESS 连接：decode → dispatch。
@@ -206,7 +394,7 @@ mod tests {
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
         tokio::spawn(async move {
-            let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None).await;
+            let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None, None).await;
         });
 
         // 4. VLESS client：connect → encode request → decode response → echo round-trip
@@ -255,7 +443,7 @@ mod tests {
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
         tokio::spawn(async move {
-            let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None).await;
+            let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None, None).await;
         });
 
         // client 用一个随机的（未注册的）UUID

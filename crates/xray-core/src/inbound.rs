@@ -983,9 +983,11 @@ async fn spawn_one_inbound(
                 })))
             } else {
                 let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
-                tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_count(), tls = tls.is_some(), "vless inbound listening");
+                // VLESS fallbacks：Go napfb（name→alpn→path→dest+xver）
+                let fallbacks = build_vless_fallbacks(&ib.entry.data);
+                tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_count(), tls = tls.is_some(), fallbacks = fallbacks.as_ref().map_or(0, |f| f.len()), "vless inbound listening");
                 Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                    serve_vless(listener, ohm, validator, tls).await
+                    serve_vless(listener, ohm, validator, tls, fallbacks).await
                 })))
             }
         }
@@ -1241,6 +1243,29 @@ fn build_trojan_users(data: &[u8]) -> std::io::Result<HashMap<String, TrojanMemo
 }
 
 
+
+/// 从 inbound entry.data（JSON）解析 VLESS `fallbacks` 数组 → FallbackPolicy。
+///
+/// JSON 格式（Go `infra/conf/vless.go` VLessInboundFallback）：
+/// `{"fallbacks":[{"name":"sni","alpn":"h2","path":"/api","dest":"127.0.0.1:80","xver":0}]}`
+/// 空数组或缺失返回 None（维持无 fallback 的直连路径）。
+fn build_vless_fallbacks(data: &[u8]) -> Option<std::sync::Arc<xray_proxy_vless::FallbackPolicy>> {
+    let v: serde_json::Value = serde_json::from_slice(data).ok()?;
+    let fbs = v.get("fallbacks")?.as_array()?;
+    let mut policy = xray_proxy_vless::FallbackPolicy::new();
+    for fb in fbs {
+        let name = fb.get("name").and_then(|x| x.as_str()).unwrap_or("");
+        let alpn = fb.get("alpn").and_then(|x| x.as_str()).unwrap_or("");
+        let path = fb.get("path").and_then(|x| x.as_str()).unwrap_or("");
+        let Some(dest) = fb.get("dest").and_then(|x| x.as_str()) else {
+            tracing::warn!("vless fallback entry missing dest, skipped");
+            continue;
+        };
+        let xver = fb.get("xver").and_then(|x| x.as_u64()).unwrap_or(0).min(2) as u8;
+        policy.add(name, alpn, path, xray_proxy_vless::FallbackDest::new(dest, xver));
+    }
+    if policy.is_empty() { None } else { Some(std::sync::Arc::new(policy)) }
+}
 /// 从 inbound entry.data（JSON）解析 http accounts → HttpServerConfig。
 ///
 /// JSON 格式：`{"accounts":[{"user":"u","pass":"p"}]}`（用户可选）
