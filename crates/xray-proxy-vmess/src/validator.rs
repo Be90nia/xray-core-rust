@@ -94,6 +94,22 @@ impl TimedUserValidator {
     }
 }
 
+/// Go `crc64.Update(crc, MakeTable(crc64.ECMA), data)` 逐位等价实现。
+///
+/// 多项式 0xC96C5795D7870F42（反射序，Go crc64.ECMA）。
+/// 对拍向量：`crc64_ecma_update(0, b"123456789") == 0x995dc9bbdf1939fa`（Go Checksum 一致）。
+fn crc64_ecma_update(crc: u64, data: &[u8]) -> u64 {
+    const POLY: u64 = 0xC96C_5795_D787_0F42;
+    let mut crc = !crc;
+    for &v in data {
+        crc ^= u64::from(v);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 { (crc >> 1) ^ POLY } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
 impl Default for TimedUserValidator {
     fn default() -> Self {
         Self::new()
@@ -113,16 +129,9 @@ impl Validator for TimedUserValidator {
             let mut h = HmacSha256::new_from_slice(b"VMESSBSKDF").expect("key len ok");
             h.update(user.account.id.uuid().as_bytes());
             let sum = h.finalize().into_bytes();
-            // crc64 ECMA update（对应 Go `crc64.Update`）
-            // ponytail: 简化用 u64 累加而非完整 CRC64 表
-            let mut crc = inner.behavior_seed;
-            for chunk in sum.chunks_exact(8) {
-                let b = u64::from_be_bytes([
-                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-                ]);
-                crc = crc.wrapping_add(b);
-            }
-            inner.behavior_seed = crc;
+            // Go `crc64.Update(seed, MakeTable(ECMA), sum)` 的逐位等价实现
+            //（多项式 0xC96C5795D7870F42 反射序，与 Go crc64.ECMA 一致）。
+            inner.behavior_seed = crc64_ecma_update(inner.behavior_seed, &sum);
         }
 
         inner.users.insert(cmd_key, user);
@@ -284,6 +293,33 @@ mod tests {
         let err = v.get_aead(&auth_id).unwrap_err();
         // holder 已 remove_user，所以 NotFound（不可能是 Replay 因为 holder 内部状态也清了）
         assert!(matches!(err, crate::error::VmessError::UserNotFound));
+    }
+
+    /// Go crc64 对拍：向量由 Go 端 `crc64.Update(0, MakeTable(ECMA), hmac_sha256("VMESSBSKDF", id[16]byte]))` 生成。
+    #[test]
+    fn behavior_seed_matches_go_crc64_ecma() {
+        // 单 user：b831381d-...-8cda48b30811 → 0xa0c5c7e50d3ae3a3
+        let v = TimedUserValidator::new();
+        v.add(MemoryUser::new(
+            "alice",
+            MemoryAccount::new(UUID::parse("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap()),
+        ))
+        .unwrap();
+        assert_eq!(v.behavior_seed(), 0xa0c5_c7e5_0d3a_e3a3);
+
+        // 追加第二个 user 66ad4540-...-ea63445a9b57 → 滚动 update 至 0xfb57f36285b06841
+        let v2 = TimedUserValidator::new();
+        v2.add(MemoryUser::new(
+            "a",
+            MemoryAccount::new(UUID::parse("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap()),
+        ))
+        .unwrap();
+        v2.add(MemoryUser::new(
+            "b",
+            MemoryAccount::new(UUID::parse("66ad4540-b58c-4ad2-9926-ea63445a9b57").unwrap()),
+        ))
+        .unwrap();
+        assert_eq!(v2.behavior_seed(), 0xfb57_f362_85b0_6841);
     }
 
     fn now_unix() -> i64 {
