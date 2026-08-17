@@ -69,9 +69,15 @@ pub struct TuicInboundHandler {
     tag: String,
     started: AtomicBool,
     config: TuicInboundConfig,
+    /// 出站 dispatch（Some 时 Connect 走 dispatcher/router；None 直连目标——mock 场景）。
+    dispatch: Option<Arc<dyn xray_app_dispatcher::DispatchHandler>>,
     /// listener + accept 任务句柄，close 时 abort。
     slot: Mutex<Option<InboundSlot>>,
-}
+    /// 自签证书 DER（start 时生成，供 client trust store）。
+    cert_der: std::sync::Mutex<Option<Vec<u8>>>,
+    /// 实际监听端口（start 后有效；listen 配置 0 时由 OS 分配）。
+    local_port: std::sync::atomic::AtomicU16,
+ }
 
 struct InboundSlot {
     endpoint: Arc<quinn::Endpoint>,
@@ -80,17 +86,31 @@ struct InboundSlot {
 
 impl TuicInboundHandler {
     /// 构造入站 Handler。
-    ///
-    /// # 参数
-    /// - `tag`：handler 标签
-    /// - `config`：TUIC 入站配置
     pub fn new(tag: impl Into<String>, config: TuicInboundConfig) -> Result<Self> {
         Ok(Self {
             tag: tag.into(),
             started: AtomicBool::new(false),
             config,
+            dispatch: None,
             slot: Mutex::new(None),
+            cert_der: std::sync::Mutex::new(None),
+            local_port: std::sync::atomic::AtomicU16::new(0),
         })
+    }
+
+    /// 自签证书 DER（start 后可用，client trust store 用）。
+    pub fn cert_der(&self) -> Option<Vec<u8>> {
+        self.cert_der.lock().unwrap().clone()
+    }
+
+    /// 注入出站 dispatcher（生产路径：Connect 经 router 分发而非直连）。
+    #[must_use]
+    pub fn with_dispatch(
+        mut self,
+        dispatch: Arc<dyn xray_app_dispatcher::DispatchHandler>,
+    ) -> Self {
+        self.dispatch = Some(dispatch);
+        self
     }
 
     /// 构建 Quinn server 配置（TLS + transport）。
@@ -105,6 +125,8 @@ impl TuicInboundHandler {
             let tls = gen_self_signed(&self.config.server_name).map_err(|e| {
                 TuicError::Io(std::io::Error::other(format!("rcgen self-signed failed: {e}")))
             })?;
+            // 暴露自签证书给 client trust store
+            *self.cert_der.lock().unwrap() = Some(tls.cert_der.clone());
             (tls.cert_der, tls.key_der)
         };
 
@@ -124,6 +146,7 @@ impl TuicInboundHandler {
         let mut transport = quinn::TransportConfig::default();
         transport.datagram_receive_buffer_size(Some(8 * 1024));
         let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_server_cfg));
+
         server_cfg.transport_config(Arc::new(transport));
 
         Ok(server_cfg)
@@ -155,6 +178,7 @@ impl InboundHandler for TuicInboundHandler {
             InboundError::ListenError(format!("tuic local_addr: {e}"))
         })?;
 
+        self.local_port.store(local_addr.port(), std::sync::atomic::Ordering::SeqCst);
         tracing::info!(
             tag = %self.tag,
             addr = %local_addr,
@@ -166,6 +190,7 @@ impl InboundHandler for TuicInboundHandler {
         let tag = self.tag.clone();
         let endpoint_for_accept = Arc::clone(&endpoint);
 
+        let dispatch = self.dispatch.clone();
         let accept_task = tokio::spawn(async move {
             loop {
                 let incoming = endpoint_for_accept.accept().await;
@@ -174,8 +199,9 @@ impl InboundHandler for TuicInboundHandler {
                 };
                 let pwd = password.clone();
                 let t = tag.clone();
+                let dispatch = dispatch.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(incoming, uuid, &pwd).await {
+                    if let Err(e) = handle_connection(incoming, uuid, &pwd, dispatch).await {
                         tracing::debug!(tag = %t, error = ?e, "tuic inbound connection error");
                     }
                 });
@@ -200,17 +226,17 @@ impl InboundHandler for TuicInboundHandler {
         }
         Ok(())
     }
-
     fn port(&self) -> u16 {
-        self.config.listen.port()
+        let p = self.local_port.load(std::sync::atomic::Ordering::SeqCst);
+        if p != 0 { p } else { self.config.listen.port() }
     }
 }
 
-/// 处理单个 TUIC QUIC 连接：authenticate → accept_bi loop。
 async fn handle_connection(
     incoming: quinn::Incoming,
     expected_uuid: Uuid,
     password: &str,
+    dispatch: Option<Arc<dyn xray_app_dispatcher::DispatchHandler>>,
 ) -> Result<()> {
     let conn = incoming.await?;
 
@@ -251,17 +277,36 @@ async fn handle_connection(
         match read_frame_from_recv(recv_bi, 256).await {
             Ok((frame, recv_bi, initial_bytes)) => match frame {
                 BiFrame::Command(Command::Connect(addr)) => {
-                    let Some(target) = addr_to_socket_addr(&addr) else {
-                        tracing::warn!("tuic inbound: addr not ip literal: {addr:?}");
-                        continue;
-                    };
-                    tokio::spawn(async move {
-                        if let Err(e) =
-                            relay_to_tcp(target, send_bi, recv_bi, initial_bytes).await
-                        {
-                            tracing::debug!("tuic relay {target}: {e:?}");
+                    if let Some(handler) = dispatch.clone() {
+                        // 生产路径：构造 Destination + Link → dispatcher/router 分发。
+                        // initial_bytes 前置回 Link reader（read 一次读出 Connect+payload 的场景）。
+                        if let Some(dest) = tuic_addr_to_destination(&addr) {
+                            let link = xray_transport::link::Link::new(
+                                xray_buf::io::new_reader(InitialedReader::new(
+                                    initial_bytes, recv_bi,
+                                )),
+                                xray_buf::io::new_writer(send_bi),
+                            );
+                            tokio::spawn(async move {
+                                let _ = handler.dispatch(&dest, link).await;
+                            });
+                        } else {
+                            tracing::warn!("tuic inbound: unsupported addr: {addr:?}");
                         }
-                    });
+                    } else {
+                        // mock/直连路径（loopback 测试用）
+                        let Some(target) = addr_to_socket_addr(&addr) else {
+                            tracing::warn!("tuic inbound: addr not ip literal: {addr:?}");
+                            continue;
+                        };
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                relay_to_tcp(target, send_bi, recv_bi, initial_bytes).await
+                            {
+                                tracing::debug!("tuic relay {target}: {e:?}");
+                            }
+                        });
+                    }
                 }
                 BiFrame::Command(Command::Heartbeat) => {}
                 BiFrame::Command(_) => {}
@@ -280,5 +325,52 @@ async fn handle_connection(
     }
 
     Ok(())
+}
+
+/// 前缀已读字节的 reader：先吐 `initial`，再透传内层流。
+struct InitialedReader<R> {
+    initial: std::io::Cursor<Vec<u8>>,
+    inner: R,
+}
+
+impl<R> InitialedReader<R> {
+    fn new(initial: Vec<u8>, inner: R) -> Self {
+        Self {
+            initial: std::io::Cursor::new(initial),
+            inner,
+        }
+    }
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for InitialedReader<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if !self.initial.get_ref().is_empty() && self.initial.position() < self.initial.get_ref().len() as u64 {
+            let unfilled = buf.initialize_unfilled();
+            let n = std::io::Read::read(&mut self.initial, unfilled)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            buf.advance(n);
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+/// TUIC Address → xray Destination（TCP）。支持 Domain（dispatcher 解析 DNS）。
+fn tuic_addr_to_destination(addr: &crate::protocol::Address) -> Option<xray_common::net::destination::Destination> {
+    use xray_common::net::address::Address as XAddress;
+    use xray_common::net::destination::Destination;
+    use xray_common::net::network::Network;
+    use xray_common::net::port::Port;
+    let (addr, port) = match addr {
+        crate::protocol::Address::Domain(d, p) => (XAddress::Domain(d.clone()), *p),
+        crate::protocol::Address::Ipv4(ip, p) => (XAddress::IPv4(*ip), *p),
+        crate::protocol::Address::Ipv6(ip, p) => (XAddress::IPv6(*ip), *p),
+        crate::protocol::Address::None => return None,
+    };
+    Some(Destination::new(addr, Port::new(port), Network::TCP))
 }
 

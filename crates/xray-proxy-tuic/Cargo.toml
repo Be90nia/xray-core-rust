@@ -20,9 +20,10 @@ tracing = { workspace = true }
 rcgen = "0.13"
 
 xray-features = { path = "../xray-features" }
+xray-buf = { path = "../xray-buf" }
 async-trait = { workspace = true }
 
 [dev-dependencies]
+xray-proxy-freedom = { path = "../xray-proxy-freedom" }
 tokio = { workspace = true, features = ["full", "test-util"] }
 rcgen = "0.13"
-xray-buf = { path = "../xray-buf" }
