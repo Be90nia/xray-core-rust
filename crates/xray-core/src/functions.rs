@@ -1147,6 +1147,67 @@ mod tests {
         for h in sh.iter().chain(ch.iter()) { h.abort(); }
     }
 
+    /// Trojan+TLS+fallbacks：非 Trojan 流量（handshake 失败）→ fallback dest 收到原始字节（bd cvi）。
+    #[tokio::test]
+    async fn integration_trojan_tls_fallback_routes_failed_handshake() {
+        let (cert_pem, key_pem) = xray_tls::certificate::generate_self_signed_cert(&["localhost"])
+            .expect("generate self-signed cert");
+
+        // fallback dest：echo
+        let fb_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fb_addr = fb_listener.local_addr().unwrap();
+        let fb_task = tokio::spawn(async move {
+            let (mut sock, _) = fb_listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            let n = sock.read(&mut buf).await.unwrap();
+            sock.write_all(&buf[..n]).await.unwrap();
+            buf[..n].to_vec()
+        });
+
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let trojan_port = probe.local_addr().unwrap().port(); drop(probe);
+
+        let server_tls = format!(r#"{{"network":"tcp","security":"tls","tlsSettings":{{"certificates":[{{"certificate":[{:?}],"key":[{:?}]}}]}}}}"#, cert_pem, key_pem);
+
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry {
+                kind: "trojan".into(),
+                data: format!(r#"{{"clients":[{{"password":"test-pass-12345"}}],"fallbacks":[{{"dest":"{fb_addr}","xver":0}}]}}"#).into_bytes(),
+            },
+            tag: "trojan-fb-in".into(), port: Some(trojan_port), listen: Some("127.0.0.1".into()),
+            stream_settings_json: Some(serde_json::from_str(&server_tls).unwrap()), sniffing_json: None,
+        });
+        server_cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            tag: "direct".into(), send_through: None, stream_settings_json: None,
+            proxy_settings_json: None, mux_json: None,
+        });
+        let (_si, _so, sh) = start_full(&server_cfg).await.expect("trojan-fb server");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 非 Trojan 客户端：TLS 连接发 HTTP → fallback dest 收到原始字节
+        static PROVIDER: std::sync::Once = std::sync::Once::new();
+        PROVIDER.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
+        let cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(NoVerify))
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(cfg));
+        let sock = TcpStream::connect(format!("127.0.0.1:{trojan_port}")).await.unwrap();
+        let mut tls = connector.connect("localhost".try_into().unwrap(), sock).await.unwrap();
+        tls.write_all(b"GET /path/to/target HTTP/1.1\r\nHost: localhost.example.longdomain.com\r\nUser-Agent: fallback-test\r\n\r\n").await.unwrap();
+        let mut got = vec![0u8; 64];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), tls.read(&mut got))
+            .await.expect("fallback echo timeout").unwrap();
+        assert!(got[..n].starts_with(b"GET /"), "fallback dest should echo original bytes");
+
+        let fb_bytes = fb_task.await.unwrap();
+        assert!(fb_bytes.starts_with(b"GET /"), "fallback echo got {fb_bytes:?}");
+
+        for h in sh.iter() { h.abort(); }
+    }
+
     /// SOCKS5 → SOCKS-outbound → SOCKS-inbound → Freedom → echo（验证 socks outbound 双向桥接）
     #[tokio::test]
     async fn integration_socks_outbound_loopback_to_echo() {

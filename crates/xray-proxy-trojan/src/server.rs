@@ -168,7 +168,7 @@ impl InboundHandler for TrojanServer {
                                     if let Some(fb_policy) = &fallbacks {
                                         // ponytail: SNI/ALPN/path 来自 TLS 层，当前未接线，用空字符串通配匹配
                                         if let Some(fb) = fb_policy.decide("", "", "") {
-                                            if let Err(e) = do_fallback(recorder, &fb.dest).await {
+                        if let Err(e) = do_fallback(recorder, &fb.dest, 0, peer, std::net::SocketAddr::from(([0, 0, 0, 0], 0))).await {
                                                 warn!(tag = %tag, peer = %peer, error = %e, "fallback failed");
                                             }
                                         }
@@ -339,21 +339,19 @@ where
 /// Replay recorded bytes + pipe remaining stream to fallback destination.
 ///
 /// Corresponds to Go `proxy/trojan/server.go` fallback dial + `io.Copy` bridge.
-async fn do_fallback<S>(recorder: RecordingStream<S>, dest: &str) -> std::io::Result<()>
+async fn do_fallback<S>(
+    recorder: RecordingStream<S>,
+    dest: &str,
+    xver: u8,
+    peer: std::net::SocketAddr,
+    local: std::net::SocketAddr,
+) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let mut fallback = tokio::net::TcpStream::connect(dest).await?;
-    if !recorder.buf.is_empty() {
-        fallback.write_all(&recorder.buf).await?;
-    }
-    let (mut ori_r, mut ori_w) = tokio::io::split(recorder.inner);
-    let (mut fb_r, mut fb_w) = tokio::io::split(fallback);
-    tokio::try_join!(
-        async { tokio::io::copy(&mut ori_r, &mut fb_w).await },
-        async { tokio::io::copy(&mut fb_r, &mut ori_w).await },
-    )?;
-    Ok(())
+    // PROXY header + 录制首字节回放 + 双向 pipe（xray_transport::fallback 公共实现）
+    xray_transport::fallback::fallback_to_dest(recorder.inner, &recorder.buf, dest, peer, local, xver)
+        .await
 }
 
 // ============================================================================
@@ -361,15 +359,6 @@ where
 // ============================================================================
 
 /// Trojan inbound entry point (aligns with `xray_core::inbound::serve_socks5`).
-///
-/// # Parameters
-/// - `listener`: bound TCP listener
-/// - `ohm`: outbound handler manager (must have default handler)
-/// - `users`: user map, key = `MemoryUser::key_hash()`
-/// - `fallbacks`: optional fallback policy for handshake-failure redirect
-///
-/// # Errors
-/// Only `listener.local_addr()` failure returns error; accept/handshake/dispatch errors log and continue.
 pub async fn serve_trojan(
     listener: TcpListener,
     ohm: Arc<SimpleOhm>,
@@ -394,6 +383,7 @@ pub async fn serve_trojan(
         "trojan inbound listening"
     );
 
+    let local = listener.local_addr()?;
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -411,11 +401,18 @@ pub async fn serve_trojan(
             if let Some(acc) = tls {
                 match acc.accept(stream).await {
                     Ok(tls_stream) => {
+                        // fallback 路由需要 TLS 层 SNI/ALPN（Go：connectionState.ServerName / NegotiatedProtocol）
+                        let conn = tls_stream.get_ref().1;
+                        let name = conn.server_name().unwrap_or("").to_string();
+                        let alpn = conn
+                            .alpn_protocol()
+                            .map(|p| String::from_utf8_lossy(p).into_owned())
+                            .unwrap_or_default();
                         let recorder = RecordingStream {
                             inner: tls_stream,
                             buf: Vec::with_capacity(256),
                         };
-                        handle_trojan_connection(recorder, validator, handler, fb_policy, peer).await;
+                        handle_trojan_connection(recorder, validator, handler, fb_policy, peer, local, name, alpn).await;
                     }
                     Err(e) => warn!(error = %e, "trojan TLS accept failed"),
                 }
@@ -424,7 +421,7 @@ pub async fn serve_trojan(
                     inner: stream,
                     buf: Vec::with_capacity(256),
                 };
-                handle_trojan_connection(recorder, validator, handler, fb_policy, peer).await;
+                handle_trojan_connection(recorder, validator, handler, fb_policy, peer, local, String::new(), String::new()).await;
             }
         });
     }
@@ -437,6 +434,9 @@ async fn handle_trojan_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     handler: Arc<dyn xray_app_dispatcher::DispatchHandler>,
     fb_policy: Option<Arc<FallbackPolicy>>,
     peer: std::net::SocketAddr,
+    local: std::net::SocketAddr,
+    tls_name: String,
+    tls_alpn: String,
 ) {
     match trojan_server_handshake(&mut recorder, &validator).await {
         Ok((network, addr, port, user)) => {
@@ -454,9 +454,13 @@ async fn handle_trojan_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
         Err(e) => {
             warn!(peer = %peer, error = %e, "trojan handshake failed");
             if let Some(fb_policy) = &fb_policy {
-                // ponytail: SNI/ALPN/path from TLS layer not wired yet; use wildcard
-                if let Some(fb) = fb_policy.decide("", "", "") {
-                    if let Err(e) = do_fallback(recorder, &fb.dest).await {
+                let path = xray_transport::fallback::extract_path_from_first_bytes(&recorder.buf)
+                    .unwrap_or("");
+                if let Some(fb) = fb_policy.decide(&tls_name, &tls_alpn, path) {
+                    info!(peer = %peer, dest = %fb.dest, xver = fb.xver, name = %tls_name, alpn = %tls_alpn, path, "trojan fallback");
+                    if let Err(e) =
+                        do_fallback(recorder, &fb.dest, fb.xver as u8, peer, local).await
+                    {
                         warn!(peer = %peer, error = %e, "fallback failed");
                     }
                 }
@@ -464,7 +468,6 @@ async fn handle_trojan_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
         }
     }
 }
-
 // ============================================================================
 // UDP relay（UDP-over-TCP）
 // ============================================================================

@@ -34,9 +34,14 @@ pub fn get_transport_config(tag: &str) -> Option<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::LazyLock;
+
+    /// 全局 map 的测试间互斥（并行 clear/register 竞争曾致 flaky）。
+    static TEST_LOCK: LazyLock<parking_lot::Mutex<()>> = LazyLock::new(|| parking_lot::Mutex::new(()));
 
     #[test]
     fn register_and_get() {
+        let _g = TEST_LOCK.lock();
         transport_config().lock().unwrap().clear();
         register_transport_config("test-tgg", serde_json::json!({"k":"v"})).unwrap();
         assert_eq!(
@@ -47,6 +52,7 @@ mod tests {
 
     #[test]
     fn register_exceeds_capacity() {
+        let _g = TEST_LOCK.lock();
         transport_config().lock().unwrap().clear();
         for i in 0..MAX_CONFIG_ENTRIES {
             register_transport_config(&format!("cap-{i}"), serde_json::json!(i)).unwrap();

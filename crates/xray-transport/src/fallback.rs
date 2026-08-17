@@ -102,6 +102,21 @@ where
     Ok(())
 }
 
+/// 从 first buffer 字节流中提取 HTTP path（fallback 路由的 path 维度）。
+///
+/// 对应 Go 端 inbound.go 中 `first.Byte(3) == '/'` 后提取 path 的逻辑：
+/// - HTTP 请求行格式：`METHOD SP /path SP HTTP/...`
+/// - 扫描首个 '/' 到 ' ' 或 '\r' 或 '\n' 为止
+pub fn extract_path_from_first_bytes(first: &[u8]) -> Option<&str> {
+    let path_start = first.iter().position(|&b| b == b'/')?;
+    let path_end = first[path_start..]
+        .iter()
+        .position(|&b| b == b' ' || b == b'\r' || b == b'\n')
+        .map(|p| path_start + p)
+        .unwrap_or(first.len());
+    std::str::from_utf8(&first[path_start..path_end]).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

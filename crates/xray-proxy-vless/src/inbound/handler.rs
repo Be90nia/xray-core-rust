@@ -135,27 +135,8 @@ impl FallbackPolicy {
 }
 
 
-/// 从 first buffer 字节流中提取 HTTP path（从第 4 字节位置开始的 '/' 起算）。
-///
-/// 对应 Go 端 inbound.go 中 `first.Byte(3) == '/'` 后提取 path 的逻辑：
-/// - HTTP 请求行格式：`METHOD SP /path SP HTTP/...`，path 从字节 4 起算
-///   （METHOD 通常是 "GET"/"POST"，3 字节 + 1 SP = 字节 4 是 '/'）
-/// - 我们扫描 '\r' 或 ' ' 之前的内容作为 path
-///
-/// # Returns
-/// - 找到合法 path 时返回 `Some(path)`（不含 query）。
-/// - first 太短、首字节不是 '/'、或没有终止符时返回 `None`。
-pub fn extract_path_from_first_bytes(first: &[u8]) -> Option<&str> {
-    // 扫描首个 '/' 字节位置（对应 Go 端 fallback path 提取逻辑）
-    let path_start = first.iter().position(|&b| b == b'/')?;
-    // 扫描到 ' ' 或 '\r' 或 '\n' 为止
-    let path_end = first[path_start..]
-        .iter()
-        .position(|&b| b == b' ' || b == b'\r' || b == b'\n')
-        .map(|p| path_start + p)
-        .unwrap_or(first.len());
-    std::str::from_utf8(&first[path_start..path_end]).ok()
-}
+/// 从 first buffer 提取 HTTP path（已上移 `xray_transport::fallback`，re-export 保持模块 API）。
+pub use xray_transport::fallback::extract_path_from_first_bytes;
 
 // ---------------------------------------------------------------------------
 
