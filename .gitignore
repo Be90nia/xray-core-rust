@@ -39,3 +39,7 @@ coverage/
 .omo/
 # Local Pi runtime state
 .atl/
+
+# Beads / Dolt files (added by bd init)
+.beads/proxieddb/
+*.gate.lock*
