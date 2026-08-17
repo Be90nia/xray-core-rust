@@ -116,17 +116,12 @@ pub async fn serve_vmess(
     listener: TcpListener,
     ohm: Arc<SimpleOhm>,
     validator: Arc<TimedUserValidator>,
-    detour_to: Option<String>,
     tls: Option<Arc<xray_transport::TlsAcceptor>>,
 ) -> std::io::Result<()> {
-    let handler = match detour_to.as_deref() {
-        Some(tag) => ohm.get_handler(tag).ok_or_else(|| {
-            std::io::Error::other(format!("detour outbound tag not found: {tag}"))
-        })?,
-        None => ohm.get_default_handler().ok_or_else(|| {
-            std::io::Error::other("no default outbound handler registered")
-        })?,
-    };
+    // Go VMess inbound 无 detour 字段（未知 JSON 字段被忽略）：流量一律走默认出站 handler。
+    let handler = ohm
+        .get_default_handler()
+        .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
     let history = Arc::new(SessionHistory::new());
 
     tracing::info!(
@@ -505,7 +500,7 @@ mod tests {
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
         tokio::spawn(async move {
-            let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None, None).await;
+            let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None).await;
         });
 
         // 4. VMess client：connect → encode header → decode response header → echo round-trip
@@ -570,7 +565,7 @@ mod tests {
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
         tokio::spawn(async move {
-            let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None, None).await;
+            let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None).await;
         });
 
         // client 用未注册的随机 UUID

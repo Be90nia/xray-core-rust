@@ -138,6 +138,10 @@ pub fn parse_vmess_config(data: &[u8]) -> Result<VmessOutboundConfig, String> {
         .get("vnext")
         .and_then(|v| v.as_array())
         .ok_or_else(|| "missing vnext array".to_string())?;
+    // Go infra/conf/vmess.go：vnext/users 必须恰好 1 个，多端点应配多个 outbound + balancer。
+    if vnext.len() != 1 {
+        return Err(r#"vmess "vnext" should have one and only one member. Multiple endpoints should use multiple VMess outbounds and routing balancer instead"#.into());
+    }
     let first = vnext
         .first()
         .ok_or_else(|| "vnext array is empty".to_string())?;
@@ -149,11 +153,14 @@ pub fn parse_vmess_config(data: &[u8]) -> Result<VmessOutboundConfig, String> {
         .get("port")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| "missing vnext[0].port".to_string())?;
-    let user = first
+    let users = first
         .get("users")
         .and_then(|v| v.as_array())
-        .and_then(|arr| arr.first())
-        .ok_or_else(|| "missing vnext[0].users[0]".to_string())?;
+        .ok_or_else(|| "missing vnext[0].users".to_string())?;
+    if users.len() != 1 {
+        return Err(r#"vmess "users" should have one and only one member. Multiple members should use multiple VMess outbounds and routing balancer instead"#.into());
+    }
+    let user = users.first().unwrap();
     let user_id = user
         .get("id")
         .and_then(|v| v.as_str())
@@ -685,5 +692,17 @@ mod tests {
     fn parse_vmess_config_missing_vnext_fails() {
         let result = parse_vmess_config(b"{}");
         assert!(result.is_err());
+    }
+
+    /// Go infra/conf/vmess.go：vnext/users 恰好 1 个，多个直接拒绝。
+    #[test]
+    fn parse_vmess_config_multiple_vnext_fails() {
+        let data = r#"{
+            "vnext": [
+                { "address": "a.example.com", "port": 443, "users": [{ "id": "b831381d-6324-4d53-ad4f-8cda48b30811" }] },
+                { "address": "b.example.com", "port": 443, "users": [{ "id": "b831381d-6324-4d53-ad4f-8cda48b30811" }] }
+            ]
+        }"#;
+        assert!(parse_vmess_config(data.as_bytes()).is_err());
     }
 }

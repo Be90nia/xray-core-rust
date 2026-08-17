@@ -1018,20 +1018,11 @@ async fn spawn_one_inbound(
         }
         "vmess" => {
             let validator = build_vmess_validator(&ib.entry.data)?;
-            // VMess detour：Go DetourConfig.to 重定向到指定 outbound tag（可选）
-            let detour_to = serde_json::from_slice::<serde_json::Value>(&ib.entry.data)
-                .ok()
-                .and_then(|v| {
-                    v.get("detour")
-                        .and_then(|d| d.get("to"))
-                        .and_then(|t| t.as_str())
-                        .map(|s| s.to_string())
-                });
             let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
             let listener = TcpListener::bind(&addr).await?;
             tracing::info!(tag = %ib.tag, addr = %addr, tls = tls.is_some(), "vmess inbound listening");
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                serve_vmess(listener, ohm, validator, detour_to, tls).await
+                serve_vmess(listener, ohm, validator, tls).await
             })))
         }
         "http" => {
@@ -1332,11 +1323,17 @@ fn build_vmess_validator(data: &[u8]) -> std::io::Result<std::sync::Arc<VmessTim
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("vmess inbound settings JSON: {e}")))?;
     let validator = VmessTimedUserValidator::new();
+    // Go VMessDefaultConfig：{"default":{"level":N}}，user 未显式给 level 时的默认值。
+    let default_level = v
+        .get("default")
+        .and_then(|d| d.get("level"))
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0) as u32;
     if let Some(clients) = v.get("clients").and_then(|c| c.as_array()) {
         for c in clients {
             let id = c.get("id").and_then(|x| x.as_str()).unwrap_or("");
             let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let level = c.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            let level = c.get("level").and_then(|x| x.as_u64()).unwrap_or(u64::from(default_level)) as u32;
             let uuid = UUID::parse(id)
                 .ok_or_else(|| std::io::Error::other(format!("vmess invalid uuid: {id}")))?;
             let account = VmessMemoryAccount::new(uuid);

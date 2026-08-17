@@ -431,6 +431,10 @@ fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutboundConfig, S
         .get("vnext")
         .and_then(|v| v.as_array())
         .ok_or_else(|| "missing vnext array".to_string())?;
+    // Go infra/conf/vless.go：vnext/users 必须恰好 1 个，多端点应配多个 outbound + balancer。
+    if vnext.len() != 1 {
+        return Err(r#"vless "vnext" should have one and only one member. Multiple endpoints should use multiple VLESS outbounds and routing balancer instead"#.into());
+    }
     let first = vnext
         .first()
         .ok_or_else(|| "vnext array is empty".to_string())?;
@@ -442,11 +446,14 @@ fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutboundConfig, S
         .get("port")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| "missing vnext[0].port".to_string())?;
-    let user = first
+    let users = first
         .get("users")
         .and_then(|v| v.as_array())
-        .and_then(|arr| arr.first())
-        .ok_or_else(|| "missing vnext[0].users[0]".to_string())?;
+        .ok_or_else(|| "missing vnext[0].users".to_string())?;
+    if users.len() != 1 {
+        return Err(r#"vless "users" should have one and only one member. Multiple members should use multiple VLESS outbounds and routing balancer instead"#.into());
+    }
+    let user = users.first().unwrap();
     let user_id = user
         .get("id")
         .and_then(|v| v.as_str())
@@ -1215,6 +1222,35 @@ mod tests {
         register_outbounds(&built, &ohm, None).unwrap();
 
         assert!(ohm.get_handler("vless-out").is_some(), "vless should be registered");
+    }
+
+    /// Go infra/conf/vless.go：vnext/users 恰好 1 个，多个直接拒绝（应配多 outbound + balancer）。
+    #[test]
+    fn register_vless_rejects_multiple_vnext() {
+        let settings = r#"{
+            "vnext": [
+                { "address": "a.example.com", "port": 443, "users": [{ "id": "b831381d-6324-4d53-ad4f-8cda48b30811" }] },
+                { "address": "b.example.com", "port": 443, "users": [{ "id": "b831381d-6324-4d53-ad4f-8cda48b30811" }] }
+            ]
+        }"#;
+        assert!(parse_vless_config(settings.as_bytes()).is_err(),
+            "multiple vnext entries should be rejected like Go");
+    }
+
+    #[test]
+    fn register_vless_rejects_multiple_users() {
+        let settings = r#"{
+            "vnext": [{
+                "address": "example.com",
+                "port": 443,
+                "users": [
+                    { "id": "b831381d-6324-4d53-ad4f-8cda48b30811" },
+                    { "id": "66ad4540-b58c-4ad2-9926-ea63445a9b57" }
+                ]
+            }]
+        }"#;
+        assert!(parse_vless_config(settings.as_bytes()).is_err(),
+            "multiple users should be rejected like Go");
     }
 
     #[test]
