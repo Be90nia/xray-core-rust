@@ -360,20 +360,92 @@ fn parse_go_duration_ms(s: &str) -> Option<i64> {
 
 /// 为 routing/stats 创建 Default*Feature 工厂。
 ///
-/// 这些 Default*Feature 是 xray-features 中的占位实现，提供 trait check 通过
-/// + no-op 行为（路由由 dispatcher 直接匹配，统计为空容器）。
+/// routing 是 xray-features 占位实现（路由由 dispatcher 直接匹配）；
+/// stats 是真实 [`AppStatsFeature`]（包 `xray_app_stats::Manager`，计数器可注册/查询）。
 /// policy 走 [`policy_factory`]，dns 走 [`dns_factory`]。
 fn default_feature_factory(kind: &'static str) -> FeatureFactory {
     Arc::new(move |_data: &[u8]| {
         match kind {
             "routing" => Ok(Arc::new(xray_features::routing::DefaultRouterFeature) as Arc<dyn Feature>),
-            "stats" => Ok(Arc::new(xray_features::stats::DefaultStatsFeature::new()) as Arc<dyn Feature>),
+            "stats" => Ok(Arc::new(AppStatsFeature::new()) as Arc<dyn Feature>),
             _ => Err(FeatureError::StartFailed {
                 name: kind,
                 message: format!("{kind}: no Default*Feature available"),
             }),
         }
     })
+}
+
+/// 真实 stats Feature：包装 `xray_app_stats::Manager`（对应 Go `app/stats.Instance`）。
+///
+/// 替代 `DefaultStatsFeature`（NoopManager）——counter/online_map/channel 可真实注册与计数，
+/// api/其它 feature 经 [`xray_features::stats::Manager`] trait 消费。
+pub struct AppStatsFeature {
+    manager: std::sync::Arc<xray_app_stats::Manager>,
+}
+
+impl AppStatsFeature {
+    #[must_use]
+    pub fn new() -> Self {
+        Self { manager: std::sync::Arc::new(xray_app_stats::Manager::new_running()) }
+    }
+
+    /// 内部真实 Manager（供 commander/stats service 消费）。
+    #[must_use]
+    pub fn manager(&self) -> &std::sync::Arc<xray_app_stats::Manager> {
+        &self.manager
+    }
+}
+
+impl Default for AppStatsFeature {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl xray_features::Feature for AppStatsFeature {
+    fn feature_name(&self) -> &'static str {
+        "stats"
+    }
+}
+
+impl xray_features::stats::Manager for AppStatsFeature {
+    fn register_counter(&self, name: &str) -> Result<std::sync::Arc<dyn xray_features::stats::Counter>, xray_features::stats::ManagerError> {
+        self.manager.register_counter(name)
+    }
+    fn unregister_counter(&self, name: &str) {
+        self.manager.unregister_counter(name)
+    }
+    fn get_counter(&self, name: &str) -> Option<std::sync::Arc<dyn xray_features::stats::Counter>> {
+        self.manager.get_counter(name)
+    }
+    fn visit_counters(&self, f: &mut dyn FnMut(&str, &dyn xray_features::stats::Counter) -> bool) {
+        self.manager.visit_counters(f)
+    }
+    fn register_online_map(&self, name: &str) -> Result<std::sync::Arc<dyn xray_features::stats::OnlineMap>, xray_features::stats::ManagerError> {
+        self.manager.register_online_map(name)
+    }
+    fn unregister_online_map(&self, name: &str) {
+        self.manager.unregister_online_map(name)
+    }
+    fn get_online_map(&self, name: &str) -> Option<std::sync::Arc<dyn xray_features::stats::OnlineMap>> {
+        self.manager.get_online_map(name)
+    }
+    fn visit_online_maps(&self, f: &mut dyn FnMut(&str, &dyn xray_features::stats::OnlineMap) -> bool) {
+        self.manager.visit_online_maps(f)
+    }
+    fn register_channel(&self, name: &str) -> Result<std::sync::Arc<dyn xray_features::stats::Channel>, xray_features::stats::ManagerError> {
+        self.manager.register_channel(name)
+    }
+    fn unregister_channel(&self, name: &str) {
+        self.manager.unregister_channel(name)
+    }
+    fn get_channel(&self, name: &str) -> Option<std::sync::Arc<dyn xray_features::stats::Channel>> {
+        self.manager.get_channel(name)
+    }
+    fn get_all_online_users(&self) -> Vec<String> {
+        self.manager.get_all_online_users()
+    }
 }
 /// Commander (api) 真实 factory：解析 JSON `ApiConfig` → [`Commander`]。
 ///
@@ -540,6 +612,46 @@ mod tests {
         register_all_features();
         let result = registry::create_feature("dns", b"{not json");
         assert!(matches!(result, Err(FeatureError::StartFailed { name, .. }) if name == "dns"));
+    }
+
+    #[test]
+    fn stats_factory_wires_real_manager() {
+        register_all_features();
+
+        // factory 路径：kind=stats 构建成功且 name 正确（原 DefaultStatsFeature 是 Noop）。
+        let feat = registry::create_feature("stats", b"{}").expect("stats config should build");
+        assert_eq!(feat.feature_name(), "stats");
+    }
+
+    #[test]
+    fn app_stats_feature_counts_for_real() {
+        use xray_features::stats::Manager as _;
+
+        let mgr = AppStatsFeature::new();
+        let name = "user>>>email[test@a.com]>>>traffic>>>uplink";
+        let counter = mgr.register_counter(name).expect("counter should register");
+        counter.add(1024);
+        counter.add(23);
+        assert_eq!(counter.value(), 1047, "counter must actually accumulate (Noop stays 0)");
+
+        // 查询路径：get_counter 命中且值非零。
+        let got = mgr.get_counter(name).expect("counter should be queryable");
+        assert_eq!(got.value(), 1047);
+
+        // 遍历路径：visit_counters 能看到注册的 counter。
+        let mut seen = 0;
+        mgr.visit_counters(&mut |n, c| {
+            if n == name {
+                seen += 1;
+                assert_eq!(c.value(), 1047);
+            }
+            true
+        });
+        assert_eq!(seen, 1, "visit_counters should see the registered counter");
+
+        // unregister 后查询为空。
+        mgr.unregister_counter(name);
+        assert!(mgr.get_counter(name).is_none());
     }
 
     #[test]

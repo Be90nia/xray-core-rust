@@ -527,15 +527,32 @@ mod tests {
         assert_eq!(inst.feature_count(), 0);
         assert!(!inst.is_running());
     }
+
+    #[test]
+    fn essential_features_inject_real_stats_manager() {
+        // 空配置 → ensure_essential_features 注入 AppStatsFeature（真实计数，非 Noop）。
+        let built = xray_conf::BuiltConfig::default();
+        let inst = Instance::new_from_built(&built).expect("empty config should build");
+
+        use xray_features::stats::Manager as _;
+        let stats = inst
+            .get_feature::<crate::register::AppStatsFeature>()
+            .expect("stats should be injected when absent from config");
+        let counter = stats.register_counter("inbound>>>tag[in]>>>traffic>>>downlink").unwrap();
+        counter.add(512);
+        assert_eq!(counter.value(), 512, "injected stats must count for real");
+    }
 }
 
-/// essentialFeatures: 当配置中缺少关键 app 时，注入默认空实现。
+/// essentialFeatures: 当配置中缺少关键 app 时，注入默认实现。
 /// 对应 Go xray-core `essentialFeatures` 函数。
+///
+/// stats 注入真实 [`AppStatsFeature`]（Go 同样注入真实 app/stats.Instance），
+/// 其余为占位实现。
 fn ensure_essential_features(inst: &mut Instance) {
     use xray_features::dns::DefaultDnsFeature;
     use xray_features::policy::DefaultPolicyFeature;
     use xray_features::routing::DefaultRouterFeature;
-    use xray_features::stats::DefaultStatsFeature;
 
     if inst.get_feature::<DefaultDnsFeature>().is_none() {
         tracing::info!("no dns feature configured, injecting default");
@@ -549,9 +566,9 @@ fn ensure_essential_features(inst: &mut Instance) {
         tracing::info!("no router feature configured, injecting default");
         inst.add_feature(Arc::new(DefaultRouterFeature)).ok();
     }
-    if inst.get_feature::<DefaultStatsFeature>().is_none() {
-        tracing::info!("no stats feature configured, injecting default");
-        inst.add_feature(Arc::new(DefaultStatsFeature::new())).ok();
+    if inst.get_feature::<crate::register::AppStatsFeature>().is_none() {
+        tracing::info!("no stats feature configured, injecting real stats manager");
+        inst.add_feature(Arc::new(crate::register::AppStatsFeature::new())).ok();
     }
 }
 
