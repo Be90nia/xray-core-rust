@@ -5847,7 +5847,9 @@ name = "xray-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
+ "hex",
  "parking_lot",
  "prost",
  "rcgen 0.13.2",
@@ -5863,6 +5865,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "webpki-roots 1.0.8",
+ "x25519-dalek",
  "xray-app-commander",
  "xray-app-dispatcher",
  "xray-app-dns",
@@ -6162,6 +6165,7 @@ dependencies = [
 name = "xray-proxy-ss"
 version = "0.1.0"
 dependencies = [
+ "aes 0.9.1",
  "aes-gcm",
  "base64",
  "blake3",
@@ -6242,6 +6246,7 @@ dependencies = [
  "xray-buf",
  "xray-common",
  "xray-features",
+ "xray-proxy-freedom",
  "xray-transport",
 ]
 

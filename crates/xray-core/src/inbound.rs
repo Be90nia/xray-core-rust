@@ -1116,9 +1116,13 @@ async fn spawn_one_inbound(
                 handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))
             })))
         }
-        // tuic inbound：QUIC listener，当前 no-op（需要 quinn server adapter）
+        // tuic inbound：QUIC listener + auth + Connect → dispatcher/router 分发
         "tuic" => {
-            let handler = parse_tuic_inbound_config(&ib.entry.data, &addr)?;
+            let dispatch = ohm.get_default_handler().ok_or_else(|| {
+                std::io::Error::other("tuic inbound requires a default outbound handler")
+            })?;
+            let handler = parse_tuic_inbound_config(&ib.entry.data, &addr)?
+                .with_dispatch(dispatch);
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                 handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))
             })))
