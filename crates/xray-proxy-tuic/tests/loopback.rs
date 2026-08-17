@@ -113,6 +113,63 @@ async fn loopback_echo_works() {
     client.close(0u32.into(), b"");
 }
 
+/// 8hb/eim：auth 后 uni Heartbeat 与 bi relay 并存。
+///
+/// 服务端 select! 循环必须持续 accept_uni（Heartbeat/Dissociate），同时 bi
+/// stream relay 不受影响——心跳后 dial 仍能完成 echo。
+#[tokio::test]
+async fn heartbeat_then_bi_relay_still_works() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let echo_addr = start_echo_server().await;
+
+    let uuid = Uuid::new_v4();
+    let password = "heartbeat-test";
+    let (server, cert_der) = TuicMockServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        "localhost",
+        uuid,
+        password.to_string(),
+    )
+    .await
+    .expect("mock server bind");
+    let server_addr = server.local_addr();
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let client_cfg = make_client_config(&cert_der);
+    let client = Arc::new(
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            TuicClient::connect(server_addr, "localhost", uuid, password, client_cfg, QuinnConnectionPool::new()),
+        )
+        .await
+        .expect("connect timed out")
+        .expect("connect failed"),
+    );
+
+    // 周期心跳任务（eim）：短周期多发几帧（覆盖 auth 之后的首帧 uni）。
+    let hb = client.start_heartbeat(Duration::from_millis(50));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 心跳进行中 bi relay 仍然工作（8hb：服务端持续读 uni 不阻塞 bi）。
+    let target = Address::Ipv4(Ipv4Addr::new(127, 0, 0, 1), echo_addr.port());
+    let conn = tokio::time::timeout(Duration::from_secs(10), client.dial(target))
+        .await
+        .expect("dial timed out")
+        .expect("dial failed");
+    let (mut send, mut recv) = conn.into_split();
+    let payload = b"heartbeat alive";
+    send.write_all(payload).await.expect("write_all");
+    let mut got = vec![0u8; payload.len()];
+    recv.read_exact(&mut got).await.expect("read_exact");
+    assert_eq!(&got, payload);
+
+    hb.abort();
+    client.close(0u32.into(), b"");
+}
+
 #[tokio::test]
 async fn loopback_large_payload() {
     let _ = rustls::crypto::ring::default_provider().install_default();

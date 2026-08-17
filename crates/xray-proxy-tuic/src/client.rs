@@ -199,6 +199,27 @@ impl TuicClient {
         Ok(())
     }
 
+    /// 启动周期心跳任务（bd eim）：TUIC v5 需要心跳维持 NAT 映射。
+    ///
+    /// 任务每 `period` 发送一次 Heartbeat（uni stream），连接关闭后自动退出。
+    /// 官方 tuic client 默认 3s（`heartbeat` 配置项），此处由调用方传入。
+    /// 返回 JoinHandle 供需要取消时 abort。
+    pub fn start_heartbeat(
+        self: &Arc<Self>,
+        period: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let client = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(period).await;
+                if let Err(e) = client.heartbeat().await {
+                    tracing::debug!("tuic heartbeat stopped: {e}");
+                    break;
+                }
+            }
+        })
+    }
+
     /// 关闭底层 QUIC 连接。
     pub fn close(&self, error_code: quinn::VarInt, reason: &[u8]) {
         self.multiplexed.close(error_code, reason);

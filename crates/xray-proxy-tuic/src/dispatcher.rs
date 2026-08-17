@@ -101,6 +101,7 @@ fn dest_to_tuic_address(dest: &Destination) -> Result<Address, String> {
 ///
 /// 不会 panic；任何错误以 `Err(String)` 返回。
 pub fn make_dial_fn(client: Arc<TuicClient>) -> DialFn {
+    client.start_heartbeat(HEARTBEAT_INTERVAL);
     Arc::new(move |dest: &Destination| {
         let client = Arc::clone(&client);
         let addr = match dest_to_tuic_address(dest) {
@@ -152,16 +153,17 @@ pub fn make_dial_fn_lazy(
             }
         };
         Box::pin(async move {
-            // lazy init TuicClient
+            // lazy init TuicClient（含 QUIC 连接 + 认证），后续复用；init 即挂周期心跳。
             let c = client_cell
                 .get_or_try_init(|| async {
-                    TuicClient::connect(server_addr, &server_name, uuid, &password, rustls_config, pool)
+                    let c = TuicClient::connect(server_addr, &server_name, uuid, &password, rustls_config, pool)
                         .await
-                        .map(Arc::new)
-                        .map_err(|e| format!("tuic connect: {e}"))
+                        .map_err(|e| format!("tuic connect: {e}"))?;
+                    let c = Arc::new(c);
+                    c.start_heartbeat(HEARTBEAT_INTERVAL);
+                    Ok::<Arc<TuicClient>, String>(c)
                 })
-                .await
-                .map_err(|e| e.to_string())?;
+                .await?;
             let conn = tokio::time::timeout(Duration::from_secs(30), c.dial(addr))
                 .await
                 .map_err(|_| "tuic dial: timed out".to_string())?
@@ -170,6 +172,9 @@ pub fn make_dial_fn_lazy(
         })
     })
 }
+
+/// 心跳周期（官方 tuic client 默认 3s）。
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 
 impl TuicConnection {
     /// 从 TuicConn 构造：拆 send/recv，spawn pump，返回 duplex 客户端包装。
