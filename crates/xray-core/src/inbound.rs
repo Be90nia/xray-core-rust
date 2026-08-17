@@ -1009,10 +1009,11 @@ async fn spawn_one_inbound(
                     if list.is_empty() { None } else { Some(FallbackPolicy::from_list(&list)) }
                 })
                 .flatten();
+            let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
             let listener = TcpListener::bind(&addr).await?;
-            tracing::info!(tag = %ib.tag, addr = %addr, users = users.len(), "trojan inbound listening");
+            tracing::info!(tag = %ib.tag, addr = %addr, users = users.len(), tls = tls.is_some(), "trojan inbound listening");
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                serve_trojan(listener, ohm, users, fallbacks, None).await
+                serve_trojan(listener, ohm, users, fallbacks, tls).await
             })))
         }
         "vmess" => {
@@ -1026,10 +1027,11 @@ async fn spawn_one_inbound(
                         .and_then(|t| t.as_str())
                         .map(|s| s.to_string())
                 });
+            let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
             let listener = TcpListener::bind(&addr).await?;
-            tracing::info!(tag = %ib.tag, addr = %addr, "vmess inbound listening");
+            tracing::info!(tag = %ib.tag, addr = %addr, tls = tls.is_some(), "vmess inbound listening");
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                serve_vmess(listener, ohm, validator, detour_to, None).await
+                serve_vmess(listener, ohm, validator, detour_to, tls).await
             })))
         }
         "http" => {

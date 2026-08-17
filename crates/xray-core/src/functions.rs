@@ -991,6 +991,162 @@ mod tests {
         for h in sh.iter().chain(ch.iter()) { h.abort(); }
     }
 
+    /// Trojan+TLS 端到端：SOCKS5 → Trojan+TLS → Freedom → echo（验证 8m1 修复：streamSettings TLS 注入）
+    #[tokio::test]
+    async fn integration_trojan_over_tls_to_echo() {
+        let (cert_pem, key_pem) = xray_tls::certificate::generate_self_signed_cert(&["localhost"])
+            .expect("generate self-signed cert");
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = echo_listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => { if sock.write_all(&buf[..n]).await.is_err() { break; } }
+                }
+            }
+        });
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let trojan_port = probe.local_addr().unwrap().port(); drop(probe);
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_port = probe.local_addr().unwrap().port(); drop(probe);
+
+        let server_tls = format!(r#"{{"network":"tcp","security":"tls","tlsSettings":{{"certificates":[{{"certificate":[{:?}],"key":[{:?}]}}]}}}}"#, cert_pem, key_pem);
+        let client_tls = r#"{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true,"serverName":"localhost"}}"#;
+
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry { kind: "trojan".into(),
+                data: br#"{"clients":[{"password":"test-pass-12345"}]}"#.to_vec() },
+            tag: "trojan-tls-in".into(), port: Some(trojan_port), listen: Some("127.0.0.1".into()),
+            stream_settings_json: Some(serde_json::from_str(&server_tls).unwrap()), sniffing_json: None,
+        });
+        server_cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            tag: "direct".into(), send_through: None, stream_settings_json: None,
+            proxy_settings_json: None, mux_json: None,
+        });
+        let (_si, _so, sh) = start_full(&server_cfg).await.expect("trojan-tls server");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut client_cfg = BuiltConfig::default();
+        client_cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry { kind: "socks".into(), data: vec![] },
+            tag: "socks-in".into(), port: Some(socks_port), listen: Some("127.0.0.1".into()),
+            stream_settings_json: None, sniffing_json: None,
+        });
+        client_cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry { kind: "trojan".into(),
+                data: format!(r#"{{"servers":[{{"address":"127.0.0.1","port":{trojan_port},"password":"test-pass-12345"}}]}}"#).into_bytes() },
+            tag: "proxy".into(), send_through: None,
+            stream_settings_json: Some(serde_json::from_str(client_tls).unwrap()),
+            proxy_settings_json: None, mux_json: None,
+        });
+        let (_ci, _co, ch) = start_full(&client_cfg).await.expect("trojan-tls client");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut client = TcpStream::connect(format!("127.0.0.1:{socks_port}")).await.unwrap();
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut resp = [0u8; 2]; client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [0x05, 0x00]);
+        let ip = match echo_addr.ip() { std::net::IpAddr::V4(v) => v.octets(), _ => unreachable!() };
+        let mut req = vec![0x05, 0x01, 0x00, 0x01];
+        req.extend_from_slice(&ip); req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        client.write_all(&req).await.unwrap();
+        let mut cr = [0u8; 10]; client.read_exact(&mut cr).await.unwrap();
+        assert_eq!(cr[1], 0x00, "Trojan+TLS CONNECT");
+
+        let payload = b"hello trojan over tls!";
+        client.write_all(payload).await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got)).await {
+            Ok(Ok(_)) => assert_eq!(&got, payload, "echo through Trojan+TLS"),
+            Ok(Err(e)) => panic!("Trojan+TLS read error: {e}"),
+            Err(_) => panic!("timeout: Trojan+TLS inbound may ignore streamSettings TLS"),
+        }
+        for h in sh.iter().chain(ch.iter()) { h.abort(); }
+    }
+
+    /// VMess+TLS 端到端：SOCKS5 → VMess+TLS → Freedom → echo（验证 vmess inbound TLS 接线）
+    #[tokio::test]
+    async fn integration_vmess_over_tls_to_echo() {
+        let (cert_pem, key_pem) = xray_tls::certificate::generate_self_signed_cert(&["localhost"])
+            .expect("generate self-signed cert");
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = echo_listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => { if sock.write_all(&buf[..n]).await.is_err() { break; } }
+                }
+            }
+        });
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let vmess_port = probe.local_addr().unwrap().port(); drop(probe);
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_port = probe.local_addr().unwrap().port(); drop(probe);
+
+        let server_tls = format!(r#"{{"network":"tcp","security":"tls","tlsSettings":{{"certificates":[{{"certificate":[{:?}],"key":[{:?}]}}]}}}}"#, cert_pem, key_pem);
+        let client_tls = r#"{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true,"serverName":"localhost"}}"#;
+
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry { kind: "vmess".into(),
+                data: br#"{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}"#.to_vec() },
+            tag: "vmess-tls-in".into(), port: Some(vmess_port), listen: Some("127.0.0.1".into()),
+            stream_settings_json: Some(serde_json::from_str(&server_tls).unwrap()), sniffing_json: None,
+        });
+        server_cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            tag: "direct".into(), send_through: None, stream_settings_json: None,
+            proxy_settings_json: None, mux_json: None,
+        });
+        let (_si, _so, sh) = start_full(&server_cfg).await.expect("vmess-tls server");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut client_cfg = BuiltConfig::default();
+        client_cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry { kind: "socks".into(), data: vec![] },
+            tag: "socks-in".into(), port: Some(socks_port), listen: Some("127.0.0.1".into()),
+            stream_settings_json: None, sniffing_json: None,
+        });
+        client_cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry { kind: "vmess".into(),
+                data: format!(r#"{{"vnext":[{{"address":"127.0.0.1","port":{vmess_port},"users":[{{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","security":"auto"}}]}}]}}"#).into_bytes() },
+            tag: "proxy".into(), send_through: None,
+            stream_settings_json: Some(serde_json::from_str(client_tls).unwrap()),
+            proxy_settings_json: None, mux_json: None,
+        });
+        let (_ci, _co, ch) = start_full(&client_cfg).await.expect("vmess-tls client");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut client = TcpStream::connect(format!("127.0.0.1:{socks_port}")).await.unwrap();
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut resp = [0u8; 2]; client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [0x05, 0x00]);
+        let ip = match echo_addr.ip() { std::net::IpAddr::V4(v) => v.octets(), _ => unreachable!() };
+        let mut req = vec![0x05, 0x01, 0x00, 0x01];
+        req.extend_from_slice(&ip); req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        client.write_all(&req).await.unwrap();
+        let mut cr = [0u8; 10]; client.read_exact(&mut cr).await.unwrap();
+        assert_eq!(cr[1], 0x00, "VMess+TLS CONNECT");
+
+        let payload = b"hello vmess over tls!";
+        client.write_all(payload).await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got)).await {
+            Ok(Ok(_)) => assert_eq!(&got, payload, "echo through VMess+TLS"),
+            Ok(Err(e)) => panic!("VMess+TLS read error: {e}"),
+            Err(_) => panic!("timeout: VMess+TLS inbound may ignore streamSettings TLS"),
+        }
+        for h in sh.iter().chain(ch.iter()) { h.abort(); }
+    }
+
     /// SOCKS5 → SOCKS-outbound → SOCKS-inbound → Freedom → echo（验证 socks outbound 双向桥接）
     #[tokio::test]
     async fn integration_socks_outbound_loopback_to_echo() {
