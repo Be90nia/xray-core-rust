@@ -17,6 +17,8 @@ use xray_buf::io::{new_reader, new_writer};
 use xray_common::protocol::{Command, ResponseCommand, ResponseHeader, SecurityType};
 use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead, NoOpAeadCipher};
 use xray_transport::link::Link;
+use xray_common::net::address::Address;
+use xray_common::net::destination::Destination;
 
 use crate::encoding::server::{ServerSession, SessionHistory};
 use crate::encoding::{generate_chacha20poly1305_key, ChunkNonceGenerator};
@@ -190,12 +192,9 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         }
     };
 
-    // 2. 只处理 TCP；UDP/Mux 暂 warn 跳过
-    if header.command != Command::Tcp {
-        tracing::warn!(
-            command = ?header.command,
-            "vmess non-TCP command not yet supported, closing connection"
-        );
+    // 2. TCP/UDP 走完整数据路径；Mux 暂 warn 跳过（zx7 在 xray-core 层另行处理）。
+    if header.command == Command::Mux {
+        tracing::warn!("vmess mux command not yet supported, closing connection");
         return Ok(());
     }
 
@@ -275,7 +274,16 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         }
     };
 
-    // 7. duplex pump：解密 request chunks → 明文给 dispatch；dispatch 回的明文 → 加密为 response chunks
+    // 7. TCP：duplex pump + dispatch；UDP：chunk 即 packet（Go 非 cone 语义）
+    if header.command == Command::Udp {
+        return pump_udp_session(
+            stream_r, stream_w, &dest,
+            req_cipher, resp_cipher, req_iv, resp_iv,
+            req_size_parser, resp_size_parser, global_padding,
+        )
+        .await;
+    }
+
     let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF);
     let (server_r, server_w) = tokio::io::split(server_io);
     let (client_r, client_w) = tokio::io::split(client_io);
@@ -289,8 +297,6 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let _ = tokio::join!(pump_a, pump_b, dispatch_fut);
     Ok(())
 }
-
-/// 读取 VMess 请求 body 的 chunk 流（SizeParser 格式），解密后写入明文 sink。
 ///
 /// chunk 格式：`[size_field][AEAD ciphertext][padding]`。
 /// size_field 长度由 `size_parser.size_bytes()` 决定（Plain/Shake=2, AEAD=18）。
@@ -434,6 +440,140 @@ async fn pump_response_body<C, W>(
     }
     let _ = stream_w.flush().await;
     let _ = stream_w.shutdown().await;
+}
+
+/// VMess UDP 会话（Go 非 cone 语义）：chunk 边界即 UDP packet 边界。
+///
+/// - up：解密 request chunk → `send_to(header.dest)`
+/// - down：`recv_from` → 加密为 response chunk 写回
+///
+/// 客户端 TCP 断开（up EOF）时通过 mpsc 唤醒 down 循环，两侧同退。
+/// 目标地址在 request header 中（域名解析一次）。
+/// ponytail: per-session 单 socket 直连目标，b2e 中央 UDP dispatcher 建成后改走 dispatch。
+async fn pump_udp_session<R, W>(
+    mut stream_r: R,
+    mut stream_w: W,
+    dest: &Destination,
+    req_cipher: BodyCipher,
+    resp_cipher: BodyCipher,
+    req_iv: [u8; 16],
+    resp_iv: [u8; 16],
+    mut req_sp: Box<dyn SizeParser + Send>,
+    mut resp_sp: Box<dyn SizeParser + Send>,
+    global_padding: bool,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    use tokio::net::UdpSocket;
+
+    // 解析目标（域名 → SocketAddr，Go 由 internet 系统解析器完成）
+    let target: std::net::SocketAddr = match dest.address() {
+        Address::Domain(d) => tokio::net::lookup_host((d.as_str(), u16::from(dest.port())))
+            .await?
+            .next()
+            .ok_or_else(|| std::io::Error::other(format!("vmess udp: resolve {d} failed")))?,
+        Address::IPv4(a) => std::net::SocketAddr::new(std::net::IpAddr::from(*a), u16::from(dest.port())),
+        Address::IPv6(a) => std::net::SocketAddr::new(std::net::IpAddr::from(*a), u16::from(dest.port())),
+    };
+    let bind_addr: &str = if target.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
+
+    let (up_tx, mut up_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let up_sock = Arc::clone(&socket);
+    let up = async move {
+        let mut nonce_gen = ChunkNonceAdapter::new(&req_iv, 12);
+        loop {
+            // 与 pump_request_body 同构：padding → size → ciphertext → open
+            let padding_size = if global_padding {
+                usize::from(req_sp.next_padding_len())
+            } else {
+                0
+            };
+            let sb = req_sp.size_bytes();
+            let mut size_field = vec![0u8; sb];
+            if stream_r.read_exact(&mut size_field).await.is_err() {
+                break;
+            }
+            let total_size = usize::from(req_sp.decode(&size_field));
+            if total_size == 0 {
+                break; // 终止 chunk
+            }
+            let ciphertext_size = total_size.saturating_sub(padding_size);
+            let mut ciphertext = vec![0u8; total_size];
+            if stream_r.read_exact(&mut ciphertext).await.is_err() {
+                break;
+            }
+            let nonce = nonce_gen.next();
+            match req_cipher.open(&nonce, &[], &ciphertext[..ciphertext_size]) {
+                Ok(packet) => {
+                    if up_sock.send_to(&packet, target).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        drop(up_tx); // 唤醒 down 循环退出
+    };
+
+    let down = async {
+        let mut nonce_gen = ChunkNonceAdapter::new(&resp_iv, 12);
+        let mut buf = vec![0u8; 65_536];
+        // up 结束后仍保留收尾窗口：在途回包可能晚于终止 chunk 到达
+        //（Go 由 CancelAfterInactivity(ConnectionIdle) 管理，此处取短窗口）。
+        const UP_DONE_IDLE: std::time::Duration = std::time::Duration::from_millis(500);
+        let mut up_done = false;
+        loop {
+            let (packet, _from) = if up_done {
+                match tokio::time::timeout(UP_DONE_IDLE, socket.recv_from(&mut buf)).await {
+                    Ok(Ok(v)) => v,
+                    _ => break,
+                }
+            } else {
+                tokio::select! {
+                    r = socket.recv_from(&mut buf) => match r {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    },
+                    _ = up_rx.recv() => { up_done = true; continue; }
+                }
+            };
+            let nonce = nonce_gen.next();
+            let sealed = match resp_cipher.seal(&nonce, &[], &buf[..packet]) {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            let padding_size = if global_padding {
+                usize::from(resp_sp.next_padding_len())
+            } else {
+                0
+            };
+            let size_value = u16::try_from(sealed.len() + padding_size).unwrap_or(u16::MAX);
+            let sb = resp_sp.size_bytes();
+            let mut size_field = vec![0u8; sb];
+            resp_sp.encode(size_value, &mut size_field);
+            if stream_w.write_all(&size_field).await.is_err()
+                || stream_w.write_all(&sealed).await.is_err()
+            {
+                break;
+            }
+            if padding_size > 0 {
+                use rand::RngCore;
+                let mut pad = vec![0u8; padding_size];
+                rand::rng().fill_bytes(&mut pad);
+                if stream_w.write_all(&pad).await.is_err() {
+                    break;
+                }
+            }
+            let _ = stream_w.flush().await;
+        }
+        let _ = stream_w.shutdown().await;
+    };
+
+    tokio::join!(up, down);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -615,5 +755,64 @@ mod tests {
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionAborted => {}
             other => panic!("expected EOF or connection reset, got {other:?}"),
         }
+    }
+    /// VMess UDP e2e：client Command::Udp → server chunk→packet 转发 → UDP echo → 回包 chunk。
+    /// 对应 Go 非 cone 语义（chunk 边界即 packet 边界）。
+    #[tokio::test]
+    async fn vmess_inbound_udp_relay_e2e() {
+        use tokio::net::UdpSocket;
+
+        // 1. UDP echo server
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, from)) = echo.recv_from(&mut buf).await {
+                let _ = echo.send_to(&buf[..n], from).await;
+            }
+        });
+
+        // 2. serve_vmess（freedom ohm 不参与 UDP 路径，但保持结构一致）
+        let ohm = make_ohm_with_freedom();
+        let (validator, cmd_key) = make_validator_with_user();
+        let vmess_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let vmess_addr = vmess_listener.local_addr().unwrap();
+        let ohm_clone = Arc::clone(&ohm);
+        let validator_clone = Arc::clone(&validator);
+        tokio::spawn(async move {
+            let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None).await;
+        });
+
+        // 3. client：UDP command header 指向 echo
+        let mut client = tokio::net::TcpStream::connect(vmess_addr).await.unwrap();
+        let client_session = ClientSession::new();
+        let dest = Destination::udp(
+            Address::ipv4(std::net::Ipv4Addr::LOCALHOST),
+            Port::new(echo_addr.port()),
+        );
+        let header = RequestHeader::new(VERSION, Command::Udp, dest, SecurityType::Aes128Gcm);
+
+        let sealed_header = client_session
+            .encode_request_header(&header, &cmd_key)
+            .expect("encode header");
+        client.write_all(&sealed_header).await.unwrap();
+        let _resp = client_session
+            .decode_response_header_async(&mut client)
+            .await
+            .expect("decode response header");
+
+        // 4. 发一个 UDP packet chunk（encode_request_body_async 含终止 chunk）
+        let payload = b"hello vmess udp!";
+        client_session
+            .encode_request_body_async(&header, payload, &mut client)
+            .await
+            .expect("encode request body");
+
+        // 5. 读回包（终止 chunk 前收到 echo packet chunk）
+        let response = client_session
+            .decode_response_body_async(&header, &mut client)
+            .await
+            .expect("decode response body");
+        assert_eq!(response, payload);
     }
 }
