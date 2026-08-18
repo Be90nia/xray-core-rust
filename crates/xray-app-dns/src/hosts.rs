@@ -164,6 +164,55 @@ impl StaticHosts {
     }
 }
 
+/// 读取系统 hosts 文件（98g，对应 Go `readSystemHosts`）。
+///
+/// Windows：`%SystemRoot%\System32\drivers\etc\hosts`；其他：`/etc/hosts`。
+/// 文件不存在/不可读返回空列表（Go 在 config build 报错，但作为运行时
+/// 容错读不到就跳过更合理——Go 行为在 conf 层 fail-fast，此处等价：
+/// build 阶段调用，缺失即空）。
+pub fn read_system_hosts() -> Vec<HostMapping> {
+    let path = if cfg!(windows) {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        std::path::Path::new(&root).join("System32/drivers/etc/hosts")
+    } else {
+        std::path::PathBuf::from("/etc/hosts")
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(content) => parse_system_hosts(&content),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 解析 hosts 文件内容（对应 Go `readSystemHostsFrom`）：
+/// 去行内 `#` 注释 → fields（ip + 域名列表）→ 域名去尾 `.` + 小写 → 按域合并。
+/// 首 field 非 IP 的行跳过。
+pub fn parse_system_hosts(content: &str) -> Vec<HostMapping> {
+    use std::collections::HashMap;
+    let mut hosts: HashMap<String, Vec<IpAddr>> = HashMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        let line = match line.find('#') {
+            Some(i) => &line[..i],
+            None => line,
+        };
+        let mut fields = line.split_whitespace();
+        let Some(ip_str) = fields.next() else { continue };
+        let Ok(ip) = ip_str.parse::<IpAddr>() else { continue };
+        for domain in fields {
+            let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+            hosts.entry(domain).or_default().push(ip);
+        }
+    }
+    hosts
+        .into_iter()
+        .map(|(domain, ips)| HostMapping {
+            domain,
+            ips,
+            proxied_domain: String::new(),
+        })
+        .collect()
+}
+
 /// 按 IPOption 过滤 IP（同 Go `filterIP`）。
 fn filter_ip_entries(entries: &[&ResponseEntry], option: IpOption) -> Vec<Address> {
     let mut out = Vec::with_capacity(entries.len());
@@ -318,5 +367,23 @@ mod tests {
             Address::Domain(d) => assert_eq!(d, "unknown.com"),
             other => panic!("expected Domain, got {other:?}"),
         }
+    }
+
+    /// 98g：系统 hosts 解析（对齐 Go readSystemHostsFrom 语义）。
+    #[test]
+    fn parse_system_hosts_merges_and_normalizes() {
+        let content = "# comment\n127.0.0.1 localhost\n::1 localhost Localhost. # inline\nnot-an-ip skip.me\n10.0.0.1 alias.example.com other.example.com\n";
+        let mut mappings = parse_system_hosts(content);
+        assert_eq!(mappings.len(), 3); // localhost + alias + other
+        mappings.sort_by(|a, b| a.domain.cmp(&b.domain));
+        assert_eq!(mappings[0].domain, "alias.example.com");
+        let localhost = mappings.iter().find(|m| m.domain == "localhost").unwrap();
+        // "Localhost." 归一为 localhost → 重复 append（Go 同不去重）
+        assert_eq!(localhost.ips.len(), 3);
+        // 尾点剥离
+        let alias = mappings.iter().find(|m| m.domain == "alias.example.com").unwrap();
+        assert_eq!(alias.ips, vec![IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))]);
+        // 非法 IP 行整体跳过
+        assert!(mappings.iter().all(|m| m.domain != "skip.me"));
     }
 }

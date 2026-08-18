@@ -36,7 +36,7 @@ pub struct DnsAppConfig {
     pub client_ip: Option<String>,
     /// 服务 tag（用于日志）；缺省生成随机 tag。
     pub tag: Option<String>,
-    /// 查询策略：`"UseIP"` / `"UseIP4"` / `"UseIP6"` / `"UseSys"`。缺省 `UseIP`。
+    #[serde(rename = "queryStrategy")]
     pub query_strategy: Option<String>,
     /// 禁用 fallback（所有 nameserver 都失败时不再兜底）。
     pub disable_fallback: Option<bool>,
@@ -123,7 +123,11 @@ impl DnsAppConfig {
             }
         }
 
-        let mappings = parse_hosts(&self.hosts)?;
+        let mut mappings = parse_hosts(&self.hosts)?;
+        // 98g：useSystemHosts → 系统 hosts 合并（对应 Go readSystemHosts）
+        if self.use_system_hosts.unwrap_or(false) {
+            mappings.extend(crate::hosts::read_system_hosts());
+        }
         let hosts = StaticHosts::new(mappings)?;
 
         let tag = self.tag.unwrap_or_else(generate_random_tag);
