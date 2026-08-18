@@ -322,24 +322,41 @@ impl RelayInbound {
         })
     }
 
-    /// 处理入站 TCP 连接：按 destination 匹配用户。
+    /// 处理中继入站 TCP 连接（SIP022 relay，对齐 sing-shadowsocks relay.go）：
+    ///
+    /// wire：`[salt][identity_header(16B)][发往 destination 的 EISS 流...]`
+    /// - identity_header = AES(identitySubkey) 加密的 `blake3(dest_key)[..16]`
+    /// - identitySubkey = blake3::derive_key("shadowsocks 2022 identity subkey", serverPSK||salt)
+    ///
+    /// 匹配 destination 后**剥掉 16B identity_header**，返回
+    /// `(dest地址, dest端口, salt前缀, 剩余连接)`——转发字节 = `[salt] ++ 剩余原始字节`，
+    /// 内层是端到端 EISS 加密，中继不解不改（回程同样原样）。
     ///
     /// # Errors
-    /// - [`SsError::Ss2022NoUserMatched`]：无 destination 匹配。
-    /// - 透传其他错误。
-    pub async fn handle_conn(&self, conn: TcpStream) -> io::Result<InboundResult> {
-        let users: Vec<Ss2022User> = self
+    /// - [`SsError::Ss2022NoUserMatched`]：无 destination 身份匹配。
+    /// - 透传 IO 错误。
+    pub async fn handle_conn_relay(
+        &self,
+        mut conn: TcpStream,
+    ) -> io::Result<(Address, u16, Vec<u8>, TcpStream)> {
+        let salt_len = self.kind.key_size();
+        let mut salt = vec![0u8; salt_len];
+        conn.read_exact(&mut salt).await?;
+        let mut id_header = [0u8; crate::ss2022::key::IDENTITY_HEADER_LEN];
+        conn.read_exact(&mut id_header).await?;
+
+        // identity subkey → AES 单块解密
+        let subkey = crate::ss2022::key::derive_identity_subkey(&self.psk, &salt, self.kind);
+        let decrypted = crate::ss2022::key::ecb_block(self.kind, &subkey, &id_header, false)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+
+        // 匹配 destination（blake3(dest.key)[..16]）
+        let dest = self
             .destinations
             .iter()
-            .map(|d| Ss2022User {
-                email: d.email.clone(),
-                level: d.level,
-                psk: d.key.clone(),
-            })
-            .collect();
-        read_ss2022_request_multi(conn, &self.psk, self.kind, &users, self.timestamp_tolerance)
-            .await
-            .map_err(|e| io::Error::other(e.to_string()))
+            .find(|d| crate::ss2022::key::psk_identity(&d.key) == decrypted[..])
+            .ok_or_else(|| io::Error::other(SsError::Ss2022NoUserMatched.to_string()))?;
+        Ok((dest.address.clone(), dest.port, salt, conn))
     }
 
     /// 目标数量。
@@ -711,6 +728,121 @@ mod tests {
 
         let result = server.await.unwrap();
         assert!(result.is_err(), "unknown user PSK must be rejected");
+    }
+
+    /// SS-2022 relay e2e（对齐 sing-shadowsocks relay.go）：
+    /// Client(with_identity) → [salt][EIH][EISS] → RelayInbound 剥 EIH →
+    /// destination Ss2022Inbound 用 dest PSK 解密 → echo → 原路回包。
+    #[tokio::test]
+    async fn relay_tunnel_roundtrip() {
+        use crate::ss2022::client::Client2022;
+        use base64::Engine as _;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 0. 真实 echo 目标
+        let echo_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut c, _)) = echo_listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let (mut r, mut w) = c.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+
+        // 1. destination SS-2022 server（端到端密文的真正终结点）
+        let dest_psk = [0x44u8; 32];
+        let dest_psk_b64 = base64::engine::general_purpose::STANDARD.encode(dest_psk);
+        let dest_inbound = std::sync::Arc::new(
+            Ss2022Inbound::new("2022-blake3-aes-256-gcm", &dest_psk_b64, "u@dest").unwrap(),
+        );
+        let dest_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dest_port = dest_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((conn, _)) = dest_listener.accept().await else { break };
+                let ib = std::sync::Arc::clone(&dest_inbound);
+                tokio::spawn(async move {
+                    let Ok(result) = ib.handle_conn(conn).await else { return };
+                    // 解密 body → echo；echo 回包 → 加密回写
+                    let mut ss = result.stream;
+                    let _ = tokio::spawn(async move {
+                        loop {
+                            match ss.read_chunk().await {
+                                Ok(Some(p)) => {
+                                    // 简化：不真正连 echo（已在 client 侧验证往返），
+                                    // 直接回写相同 payload 模拟 echo
+                                    if ss.write_chunk(&p).await.is_err() { break; }
+                                    if ss.flush().await.is_err() { break; }
+                                }
+                                _ => break,
+                            }
+                        }
+                    })
+                    .await;
+                });
+            }
+        });
+
+        // 2. relay server（剥 EIH，原样转发到 destination）
+        let server_psk = [0x11u8; 32];
+        let server_psk_b64 = base64::engine::general_purpose::STANDARD.encode(server_psk);
+        let relay = std::sync::Arc::new(
+            RelayInbound::new(
+                "2022-blake3-aes-256-gcm",
+                &server_psk_b64,
+                vec![RelayDestination {
+                    key: dest_psk.to_vec(),
+                    address: Address::IPv4(std::net::Ipv4Addr::LOCALHOST),
+                    port: dest_port,
+                    email: "dest-1".into(),
+                    level: 0,
+                }],
+            )
+            .unwrap(),
+        );
+        let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_port = relay_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((conn, _)) = relay_listener.accept().await else { break };
+                let relay = std::sync::Arc::clone(&relay);
+                tokio::spawn(async move {
+                    let Ok((_addr, _port, salt, client)) = relay.handle_conn_relay(conn).await
+                    else { return };
+                    // 原样桥：salt 回灌 + 双向 copy
+                    let Ok(mut upstream) = tokio::net::TcpStream::connect(
+                        (std::net::Ipv4Addr::LOCALHOST, dest_port),
+                    ).await else { return };
+                    if upstream.write_all(&salt).await.is_err() { return; }
+                    let (mut cr, mut cw) = client.into_split();
+                    let (mut ur, mut uw) = upstream.into_split();
+                    let up = tokio::io::copy(&mut cr, &mut uw);
+                    let down = tokio::io::copy(&mut ur, &mut cw);
+                    let _ = tokio::join!(up, down);
+                });
+            }
+        });
+
+        // 3. client：dest PSK 加密 + relay server PSK 的 EIH
+        let client = Client2022::new(
+            "2022-blake3-aes-256-gcm",
+            &dest_psk_b64,
+            "127.0.0.1",
+            relay_port,
+        )
+        .unwrap()
+        .with_identity(&server_psk_b64)
+        .unwrap();
+        let mut stream = client.dial_target("127.0.0.1", echo_port).await.unwrap();
+
+        let payload = b"ss2022-relay-e2e";
+        stream.write_chunk(payload).await.unwrap();
+        stream.flush().await.unwrap();
+        let resp = stream.read_chunk().await.unwrap().expect("echo resp");
+        assert_eq!(resp, payload);
     }
 
     #[test]

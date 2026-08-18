@@ -91,7 +91,7 @@ pub fn decrypt_identity_header(ipsk: &[u8], header: &[u8], salt: &[u8], kind: Ci
 }
 
 /// AES-ECB 单块加/解密。128 cipher 用 AES-128，256/chacha 用 AES-256。
-fn ecb_block(kind: CipherKind2022, key: &[u8], block: &[u8; 16], encrypt: bool) -> Result<[u8; 16]> {
+pub fn ecb_block(kind: CipherKind2022, key: &[u8], block: &[u8; 16], encrypt: bool) -> Result<[u8; 16]> {
     use aes::cipher::{Array, BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
     let mut buf = *block;
     let enc = |buf: &mut [u8; 16]| -> Result<()> {

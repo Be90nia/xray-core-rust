@@ -596,9 +596,22 @@ pub async fn serve_ss(
                         .map_err(|e| std::io::Error::other(e.to_string()))
                 }
                 SsInboundMode::Ss2022Relay(ib) => {
-                    ib.handle_conn(stream).await
-                        .map(|r| (r.address, r.port, r.stream))
-                        .map_err(|e| std::io::Error::other(e.to_string()))
+                    // relay：身份匹配 + 剥 identity header，字节原样桥（无 chunk 解密）
+                    let (addr, port, prefix, tcp) = match ib.handle_conn_relay(stream).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "ss2022 relay handshake failed");
+                            return;
+                        }
+                    };
+                    let dest = Destination::new(addr, Port::new(port), Network::TCP);
+                    let (r, w) = tokio::io::split(tcp);
+                    let link = Link::new(
+                        new_reader(SsRelayReader::new(prefix, r)),
+                        new_writer(w),
+                    );
+                    let _ = handler.dispatch(&dest, link).await;
+                    return;
                 }
             };
             match handshake {
@@ -639,6 +652,7 @@ pub async fn serve_ss(
                             }
                         }
                     });
+
                     let (client_rd, client_wr) = tokio::io::split(client_io);
                     let link = Link::new(new_reader(client_rd), new_writer(client_wr));
                     let _ = handler.dispatch(&dest, link).await;
@@ -651,6 +665,34 @@ pub async fn serve_ss(
     }
 }
 
+/// 前缀字节回灌 reader（relay 模式把 salt 回灌到流头，与 vless/tuic InitialedReader 同模式）。
+struct SsRelayReader<R> {
+    initial: std::io::Cursor<Vec<u8>>,
+    inner: R,
+}
+
+impl<R> SsRelayReader<R> {
+    fn new(initial: Vec<u8>, inner: R) -> Self {
+        Self { initial: std::io::Cursor::new(initial), inner }
+    }
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for SsRelayReader<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.initial.position() < self.initial.get_ref().len() as u64 {
+            let unfilled = buf.initialize_unfilled();
+            let n = std::io::Read::read(&mut self.initial, unfilled)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            buf.advance(n);
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
 /// SS Legacy UDP relay 入口。
 ///
 /// 对应 Go `proxy/shadowsocks/server.go::handleUDPPayload`：
