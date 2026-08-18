@@ -75,7 +75,9 @@ impl SsInbound {
             .next()
             .ok_or_else(|| io::Error::other("no SS user configured"))?;
 
-        read_request(conn, &user.account, &user.email)
+        // 反探测种子（对应 Go validator.GetBehaviorSeed，ReadTCPSession 入参）。
+        let seed = self.server.validator.behavior_seed();
+        read_request(conn, &user.account, &user.email, seed)
             .await
             .map_err(|e| io::Error::other(e.to_string()))
     }

@@ -149,22 +149,71 @@ pub async fn read_request(
     mut conn: TcpStream,
     account: &MemoryAccount,
     user_email: &str,
+    behavior_seed: u64,
 ) -> Result<(RequestHeader, SSStream<TcpStream>)> {
+    use xray_common::drain::{BehaviorSeedLimitedDrainer, Drainer as _};
+
+    // 反探测 drainer（bd 7me，对应 Go ReadTCPSession protocol.go:59）：
+    // 失败时按 seed 派生预算排空连接，使攻击者无法从关闭时机判断认证结果。
+    let drainer = BehaviorSeedLimitedDrainer::new(behavior_seed as i64, 16 + 38, 3266, 64);
+
+    /// 失败路径统一：排空后返回原错误（4s deadline 防客户端不关连接时服务端挂起，
+    /// 对齐 Go SetReadDeadline(handshake)，与 vmess inbound 同模式）。
+    async fn bail(
+        drainer: &BehaviorSeedLimitedDrainer,
+        conn: &mut TcpStream,
+        err: crate::error::SsError,
+    ) -> crate::error::SsError {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            xray_common::drain::Drainer::drain(drainer, conn),
+        )
+        .await;
+        crate::error::SsError::Io(err.to_string())
+    }
+
     // 读 IV
     let iv_size = account.cipher.iv_size() as usize;
     let mut iv = vec![0u8; iv_size];
-    conn.read_exact(&mut iv).await?;
+    if let Err(e) = conn.read_exact(&mut iv).await {
+        // ponytail: Go 此处 AcknowledgeReceive(实际读取量)；read_exact 不回报部分读量，
+        // 不扣预算 = 排空量 ≥ Go（更保守的探测抵抗方向）。
+        return Err(bail(&drainer, &mut conn, e.into()).await);
+    }
+    drainer.acknowledge_receive(iv_size);
 
     // 构造 SSStream（nonce 从 [0xFF;n] 开始，第一次 read_chunk → [0;n]）
-    let mut stream = SSStream::new_client(conn, account, &iv)?;
+    let mut stream = match SSStream::new_client(conn, account, &iv) {
+        Ok(s) => s,
+        Err(e) => {
+            // conn 已被 new_client 消费且回收失败场景不存在（此处错误在包 conn 之前），
+            // Go 对应分支同样以 FullReader 排空——但 conn 已移动，无法回收。
+            // 该错误为 AEAD 构造（key/nonce 长度），不依赖网络输入，直接透传。
+            return Err(e);
+        }
+    };
 
     // 读首帧（addr+port）
-    let first_frame = stream
-        .read_chunk()
-        .await?
-        .ok_or_else(|| crate::error::SsError::ReadInitial("EOF reading first frame".to_string()))?;
+    let first_frame = match stream.read_chunk().await {
+        Ok(Some(f)) => f,
+        Ok(None) => {
+            let e = crate::error::SsError::ReadInitial("EOF reading first frame".to_string());
+            let mut conn = stream.into_inner();
+            return Err(bail(&drainer, &mut conn, e).await);
+        }
+        Err(e) => {
+            let mut conn = stream.into_inner();
+            return Err(bail(&drainer, &mut conn, e).await);
+        }
+    };
 
-    let (address, port, _) = read_address_port_ss(&first_frame)?;
+    let (address, port, _) = match read_address_port_ss(&first_frame) {
+        Ok(v) => v,
+        Err(e) => {
+            let mut conn = stream.into_inner();
+            return Err(bail(&drainer, &mut conn, e).await);
+        }
+    };
 
     let header = RequestHeader {
         version: crate::VERSION,
@@ -266,7 +315,7 @@ mod tests {
         let server_account = account.clone();
         let server_handle = tokio::spawn(async move {
             let (conn, _) = listener.accept().await.expect("accept");
-            let (header, mut stream) = read_request(conn, &server_account, "u@x.com")
+            let (header, mut stream) = read_request(conn, &server_account, "u@x.com", 0)
                 .await
                 .expect("read_request");
 
@@ -314,7 +363,7 @@ mod tests {
         let server_account = account.clone();
         let server_handle = tokio::spawn(async move {
             let (conn, _) = listener.accept().await.expect("accept");
-            let (_h, mut stream) = read_request(conn, &server_account, "u@x.com")
+            let (_h, mut stream) = read_request(conn, &server_account, "u@x.com", 0)
                 .await
                 .expect("read_request");
             let body = stream.read_chunk().await.expect("read").expect("body");
