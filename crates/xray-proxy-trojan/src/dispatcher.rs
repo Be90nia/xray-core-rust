@@ -11,9 +11,13 @@
 //! [`DialBridge`]: xray_app_dispatcher::default::DialBridge
 //! [`DialFn`]: xray_app_dispatcher::default::DialFn
 
+use std::io;
+use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use xray_app_dispatcher::default::DialFn;
 use xray_common::net::address::Address;
 use xray_common::net::destination::Destination;
@@ -101,6 +105,7 @@ pub fn make_dial_fn(config: Arc<TrojanOutboundConfig>) -> DialFn {
         let config = Arc::clone(&config);
         let target_addr = dest.address().clone();
         let target_port = dest.port().value();
+        let is_udp = dest.is_udp();
         Box::pin(async move {
             // 1. dial Trojan server：有 streamSettings 走 transport dialer（ws/grpc/...），否则裸 TCP。
             let server_dest = config.server_destination();
@@ -114,12 +119,13 @@ pub fn make_dial_fn(config: Arc<TrojanOutboundConfig>) -> DialFn {
                     .map_err(|e| format!("trojan dial server (tcp): {e}"))?,
             };
 
-            // 2. 构造 Trojan 请求头
+            // 2. 构造 Trojan 请求头（UDP dest → command UDP，Go client.go 同分支）
+            let network = if is_udp { TrojanNetwork::Udp } else { TrojanNetwork::Tcp };
             let mut header = Vec::with_capacity(128);
             write_request_header(
                 &mut header,
                 &config.account,
-                TrojanNetwork::Tcp,
+                network,
                 &target_addr,
                 target_port,
             );
@@ -129,9 +135,129 @@ pub fn make_dial_fn(config: Arc<TrojanOutboundConfig>) -> DialFn {
                 .await
                 .map_err(|e| format!("trojan write header: {e}"))?;
 
-            Ok(conn)
+            // 4. UDP：包一层 Trojan UDP 分帧（[addr][len][CRLF][payload] per packet，
+            //    Go PacketWriter/PacketReader）。write 边界≈packet 边界。
+            if is_udp {
+                Ok(Box::new(TrojanUdpFramedConn::new(conn, target_addr, target_port)) as Box<dyn Connection>)
+            } else {
+                Ok(conn)
+            }
         })
     })
+}
+
+/// Trojan UDP 分帧连接：把字节流 write 按 Trojan UDP 帧格式包装、read 剥帧。
+///
+/// 对应 Go `protocol.go::PacketWriter`/`PacketReader`。每帧：
+struct TrojanUdpFramedConn {
+    inner: Box<dyn Connection>,
+    addr: Address,
+    port: u16,
+    rbuf: Vec<u8>,
+    /// 待写完的帧（UDP 帧不可分，部分写时缓存剩余）
+    wpending: Vec<u8>,
+    wpos: usize,
+}
+
+impl TrojanUdpFramedConn {
+    fn new(inner: Box<dyn Connection>, addr: Address, port: u16) -> Self {
+        Self { inner, addr, port, rbuf: Vec::new(), wpending: Vec::new(), wpos: 0 }
+    }
+}
+
+impl AsyncWrite for TrojanUdpFramedConn {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        // 1. 先把 pending 帧写完（UDP 帧不可分）
+        while this.wpos < this.wpending.len() {
+            let n = std::task::ready!(
+                Pin::new(&mut *this.inner).poll_write(cx, &this.wpending[this.wpos..])
+            )?;
+            if n == 0 {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "trojan udp: frame write stalled")));
+            }
+            this.wpos += n;
+        }
+        // 2. 构造新帧并整帧写出
+        let chunk = &buf[..buf.len().min(crate::protocol::MAX_LENGTH)];
+        this.wpending = Vec::with_capacity(chunk.len() + 32);
+        crate::protocol::write_udp_packet(&mut this.wpending, &this.addr, this.port, chunk);
+        this.wpos = 0;
+        while this.wpos < this.wpending.len() {
+            let n = std::task::ready!(
+                Pin::new(&mut *this.inner).poll_write(cx, &this.wpending[this.wpos..])
+            )?;
+            if n == 0 {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "trojan udp: frame write stalled")));
+            }
+            this.wpos += n;
+        }
+        Poll::Ready(Ok(chunk.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+impl AsyncRead for TrojanUdpFramedConn {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            // 缓冲里有完整帧 → 剥帧返回 payload
+            if !self.rbuf.is_empty() {
+                let parsed = crate::protocol::parse_udp_packet(&self.rbuf);
+                if let Ok((_addr, _port, payload, consumed)) = parsed {
+                    let n = payload.len().min(buf.remaining());
+                    buf.put_slice(&payload[..n]);
+                    // 剩余 payload（buf 满时截断的部分）保留在缓冲头部
+                    let keep_from = consumed - payload.len() + n;
+                    self.rbuf.drain(..keep_from);
+                    return Poll::Ready(Ok(()));
+                }
+            }
+            // 缓冲不足一帧 → 从 inner 再读
+            let mut tmp = [0u8; 8192];
+            let mut rb = ReadBuf::new(&mut tmp);
+            match Pin::new(&mut *self.inner).poll_read(cx, &mut rb)? {
+                Poll::Ready(()) => {
+                    let filled = rb.filled();
+                    if filled.is_empty() {
+                        return if self.rbuf.is_empty() {
+                            Poll::Ready(Ok(())) // EOF
+                        } else {
+                            // 残留半帧：协议损坏，报错
+                            Poll::Ready(Err(io::Error::new(io::ErrorKind::UnexpectedEof, "trojan udp: truncated frame")))
+                        };
+                    }
+                    self.rbuf.extend_from_slice(filled);
+                }
+                Poll::Pending => {
+                    return Poll::Pending;
+                }
+            }
+        }
+    }
+}
+
+impl Connection for TrojanUdpFramedConn {
+    fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+        self.inner.remote_addr()
+    }
+    fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+        self.inner.local_addr()
+    }
 }
 
 #[cfg(test)]
@@ -162,5 +288,40 @@ mod tests {
         ));
         let _dial = make_dial_fn(Arc::clone(&cfg));
         assert_eq!(Arc::strong_count(&cfg), 2);
+    }
+
+    /// UDP 分帧 roundtrip：duplex 模拟 Trojan 服务器，验证
+    /// write → [addr][len][CRLF][payload] 帧、read → 剥帧还原。
+    #[tokio::test]
+    async fn udp_framed_conn_roundtrip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client_side, mut server_side) = tokio::io::duplex(4096);
+        let conn = TrojanUdpFramedConn::new(
+            Box::new(xray_transport::connection::DuplexConnection::new(client_side)),
+            Address::from_ipv4_bytes([8, 8, 8, 8]),
+            53,
+        );
+        let mut framed = conn;
+
+        // write 一个 packet → wire 上应是合法 Trojan UDP 帧
+        framed.write_all(b"query-payload").await.unwrap();
+        framed.flush().await.unwrap();
+        let mut wire = vec![0u8; 256];
+        let n = server_side.read(&mut wire).await.unwrap();
+        let wire = &wire[..n];
+        let (addr, port, payload, consumed) = crate::protocol::parse_udp_packet(wire).unwrap();
+        assert_eq!(addr, Address::from_ipv4_bytes([8, 8, 8, 8]));
+        assert_eq!(port, 53);
+        assert_eq!(payload, b"query-payload");
+        assert_eq!(consumed, n, "整帧消费");
+
+        // server 回一帧 → framed.read 剥帧得 payload
+        let mut resp = Vec::new();
+        crate::protocol::write_udp_packet(&mut resp, &addr, 53, b"answer-payload");
+        server_side.write_all(&resp).await.unwrap();
+        let mut out = vec![0u8; 128];
+        let rn = framed.read(&mut out).await.unwrap();
+        assert_eq!(&out[..rn], b"answer-payload");
     }
 }
