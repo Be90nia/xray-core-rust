@@ -72,12 +72,16 @@ impl CipherType {
     /// 对应 Go 端 JSON 配置 `method` 字段。
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "aes-128-gcm" => Some(Self::Aes128Gcm),
-            "aes-256-gcm" => Some(Self::Aes256Gcm),
-            "chacha20-poly1305" | "chacha20-ietf-poly1305" => Some(Self::ChaCha20Poly1305),
-            "xchacha20-poly1305" | "xchacha20-ietf-poly1305" => Some(Self::XChaCha20Poly1305),
-            "none" => Some(Self::None),
+        match name.to_ascii_lowercase().as_str() {
+            "aes-128-gcm" | "aead_aes_128_gcm" => Some(Self::Aes128Gcm),
+            "aes-256-gcm" | "aead_aes_256_gcm" => Some(Self::Aes256Gcm),
+            "chacha20-poly1305" | "aead_chacha20_poly1305" | "chacha20-ietf-poly1305" => {
+                Some(Self::ChaCha20Poly1305)
+            }
+            "xchacha20-poly1305" | "aead_xchacha20_poly1305" | "xchacha20-ietf-poly1305" => {
+                Some(Self::XChaCha20Poly1305)
+            }
+            "none" | "plain" => Some(Self::None),
             _ => None,
         }
     }
@@ -742,5 +746,19 @@ mod tests {
         let mut buf = vec![0u8; 10];
         let err = acc.cipher.encode_packet(&acc.key, &mut buf).unwrap_err();
         assert!(matches!(err, SsError::InsufficientData(10)));
+    }
+
+    /// 对齐 Go `infra/conf/shadowsocks.go::cipherFromString`：aead_* 别名 + plain + 大小写不敏感。
+    #[test]
+    fn cipher_from_name_aliases() {
+        assert_eq!(CipherType::from_name("aes-128-gcm"), Some(CipherType::Aes128Gcm));
+        assert_eq!(CipherType::from_name("aead_aes_128_gcm"), Some(CipherType::Aes128Gcm));
+        assert_eq!(CipherType::from_name("aead_aes_256_gcm"), Some(CipherType::Aes256Gcm));
+        assert_eq!(CipherType::from_name("aead_chacha20_poly1305"), Some(CipherType::ChaCha20Poly1305));
+        assert_eq!(CipherType::from_name("xchacha20-ietf-poly1305"), Some(CipherType::XChaCha20Poly1305));
+        assert_eq!(CipherType::from_name("aead_xchacha20_poly1305"), Some(CipherType::XChaCha20Poly1305));
+        assert_eq!(CipherType::from_name("plain"), Some(CipherType::None));
+        assert_eq!(CipherType::from_name("XCHACHA20-POLY1305"), Some(CipherType::XChaCha20Poly1305));
+        assert_eq!(CipherType::from_name("2022-blake3-aes-128-gcm"), None);
     }
 }

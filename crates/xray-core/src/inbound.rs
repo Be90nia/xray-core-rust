@@ -1479,12 +1479,7 @@ fn parse_ss2022_inbound_config(method: &str, v: &serde_json::Value) -> std::io::
 
 /// SS cipher 字符串 → CipherType。
 fn ss_cipher_from_str(s: &str) -> Option<SsCipherType> {
-    match s {
-        "aes-128-gcm" => Some(SsCipherType::Aes128Gcm),
-        "aes-256-gcm" => Some(SsCipherType::Aes256Gcm),
-        "chacha20-ietf-poly1305" => Some(SsCipherType::ChaCha20Poly1305),
-        _ => None,
-    }
+    SsCipherType::from_name(s)
 }
 
 /// 从 inbound entry.data（JSON）解析 hysteria inbound 配置。
