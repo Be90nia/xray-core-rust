@@ -962,8 +962,8 @@ async fn spawn_one_inbound(
     match ib.entry.kind.as_str() {
         "socks" => {
             let listener = TcpListener::bind(&addr).await?;
-            tracing::info!(tag = %ib.tag, addr = %addr, "socks5 inbound listening");
-            let config = Arc::new(ServerConfig::default());
+            let config = Arc::new(parse_socks_server_config(&ib.entry.data)?);
+            tracing::info!(tag = %ib.tag, addr = %addr, auth = ?config.auth_type, udp = config.udp_enabled, "socks5 inbound listening");
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                 serve_socks5(listener, ohm, config).await
             })))
@@ -1189,6 +1189,38 @@ async fn spawn_one_inbound(
             Ok(None)
         }
     }
+}
+
+/// 从 inbound entry.data（JSON）解析 SOCKS 服务端配置。
+///
+/// 字段对齐 Go `infra/conf/socks.go::SocksServerConfig`：
+/// `{"auth":"password","users":[{"user":"u","pass":"p"}],"udp":true,"userLevel":0}`。
+/// `users`/`accounts` 同义（Go 两个字段都收）；`ip`（UDP 回包地址）无消费方暂不解析。
+fn parse_socks_server_config(data: &[u8]) -> std::io::Result<ServerConfig> {
+    if data.is_empty() {
+        return Ok(ServerConfig::default());
+    }
+    let v: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| std::io::Error::other(format!("socks inbound settings JSON: {e}")))?;
+
+    let mut cfg = ServerConfig::default();
+    if v.get("auth").and_then(|x| x.as_str()) == Some("password") {
+        cfg.auth_type = xray_proxy_socks::config::AuthType::Password;
+    }
+    if let Some(users) = v
+        .get("users")
+        .or_else(|| v.get("accounts"))
+        .and_then(|x| x.as_array())
+    {
+        for u in users {
+            let user = u.get("user").and_then(|x| x.as_str()).unwrap_or("");
+            let pass = u.get("pass").and_then(|x| x.as_str()).unwrap_or("");
+            cfg.accounts.insert(user.to_string(), pass.to_string());
+        }
+    }
+    cfg.udp_enabled = v.get("udp").and_then(|x| x.as_bool()).unwrap_or(false);
+    cfg.user_level = v.get("userLevel").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    Ok(cfg)
 }
 
 ///
@@ -1848,6 +1880,29 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// parse_socks_server_config：auth/users/accounts/udp/userLevel 字段对齐 Go conf。
+    #[test]
+    fn parse_socks_server_config_full_fields() {
+        let json = br#"{"auth":"password","users":[{"user":"alice","pass":"p1"}],"udp":true,"userLevel":3}"#;
+        let cfg = parse_socks_server_config(json).unwrap();
+        assert_eq!(cfg.auth_type, xray_proxy_socks::config::AuthType::Password);
+        assert!(cfg.has_account("alice", "p1"));
+        assert!(cfg.requires_auth());
+        assert!(cfg.udp_enabled);
+        assert_eq!(cfg.user_level, 3);
+    }
+
+    /// accounts 别名 + 默认 noauth + 空配置。
+    #[test]
+    fn parse_socks_server_config_accounts_alias_and_default() {
+        let cfg = parse_socks_server_config(br#"{"accounts":[{"user":"bob","pass":"p2"}]}"#).unwrap();
+        assert!(cfg.has_account("bob", "p2"));
+        assert_eq!(cfg.auth_type, xray_proxy_socks::config::AuthType::NoAuth);
+        assert!(!cfg.udp_enabled);
+        let empty = parse_socks_server_config(b"").unwrap();
+        assert_eq!(empty, ServerConfig::default());
+    }
 
     /// parse_reality_config：privateKey/shortIds/dest 双形态/默认值。
     #[test]
