@@ -695,6 +695,8 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for SsRelayReader<R> 
 }
 /// SS Legacy UDP relay 入口。
 ///
+
+///
 /// 对应 Go `proxy/shadowsocks/server.go::handleUDPPayload`：
 /// recv_from → decode_udp_packet（匹配用户 + 解出目标/payload）→ 转发目标 →
 /// 回包 encode_udp_packet（发起用户的 account 加密）→ send_to 客户端。
@@ -770,6 +772,48 @@ pub async fn serve_ss_udp(udp_arc: Arc<tokio::net::UdpSocket>, ib: Arc<SsInbound
             };
             let _ = sock.send_to(&encoded, client).await;
         });
+    }
+}
+
+/// hysteria `TcpDispatcher` → xray `DispatchHandler` 适配器（rxw）。
+///
+/// InterStreamConn 用现成 `HysteriaConn` 包装成 Connection 后按 dispatch Link 桥接。
+#[derive(Debug)]
+struct HysteriaTcpDispatch(Arc<dyn xray_app_dispatcher::DispatchHandler>);
+
+impl xray_proxy_hysteria::TcpDispatcher for HysteriaTcpDispatch {
+    fn dispatch_tcp(
+        &self,
+        dest_addr: &str,
+        stream: std::sync::Arc<xray_transport_hysteria::conn::InterStreamConn>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + '_>> {
+        let handler = Arc::clone(&self.0);
+        // 解析 "host:port" → Destination（IPv4/IPv6/域名）
+        let Some((host, port_str)) = dest_addr.rsplit_once(':') else {
+            return Box::pin(std::future::ready(Err(std::io::Error::other(format!(
+                "hysteria dest parse: {dest_addr}"
+            )))));
+        };
+        let Ok(port) = port_str.parse::<u16>() else {
+            return Box::pin(std::future::ready(Err(std::io::Error::other(format!(
+                "hysteria dest port: {dest_addr}"
+            )))));
+        };
+        let address = if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
+            Address::IPv4(v4)
+        } else if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
+            Address::IPv6(v6)
+        } else {
+            Address::Domain(host.to_string())
+        };
+        let dest = Destination::new(address, Port::new(port), Network::TCP);
+        Box::pin(async move {
+            let conn = xray_transport_hysteria::HysteriaConn::new(stream);
+            let (r, w) = tokio::io::split(conn);
+            let link = Link::new(new_reader(r), new_writer(w));
+            let _ = handler.dispatch(&dest, link).await;
+            Ok(())
+        })
     }
 }
 
@@ -1220,15 +1264,19 @@ async fn spawn_one_inbound(
                 serve_ss(listener, ohm, inbound).await
             })))
         }
-        // hysteria inbound：HysteriaInboundHandler impl InboundHandler
-        "hysteria" => {
+        // hysteria inbound：HysteriaInboundHandler impl InboundHandler（rxw：接 dispatcher）
+        "hysteria" | "hysteria2" => {
             let bind_addr: std::net::SocketAddr = addr.parse()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("parse addr: {e}")))?;
             let (config, factory) = parse_hysteria_inbound_config(&ib.entry.data, bind_addr)?;
+            let dispatch = ohm.get_default_handler().ok_or_else(|| {
+                std::io::Error::other("hysteria inbound requires a default outbound handler")
+            })?;
             let handler = xray_proxy_hysteria::HysteriaInboundHandler::new(
                 &ib.tag, config, bind_addr, factory,
             )
-            .map_err(|e| std::io::Error::other(format!("hysteria inbound: {e}")))?;
+            .map_err(|e| std::io::Error::other(format!("hysteria inbound: {e}")))?
+            .with_dispatcher(Some(Arc::new(HysteriaTcpDispatch(dispatch))));
             tracing::info!(tag = %ib.tag, addr = %addr, "hysteria inbound listening");
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                 handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))
@@ -1938,6 +1986,7 @@ fn parse_duration_suffix(s: &str) -> std::io::Result<std::time::Duration> {
                 total_secs += n;
                 num_buf.clear();
             }
+
             'm' => {
                 let n: u64 = num_buf.parse().map_err(|_| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, format!("idleTimeout: bad number in '{s}'"))
@@ -1948,6 +1997,7 @@ fn parse_duration_suffix(s: &str) -> std::io::Result<std::time::Duration> {
             'h' => {
                 let n: u64 = num_buf.parse().map_err(|_| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, format!("idleTimeout: bad number in '{s}'"))
+
                 })?;
                 total_secs += n * 3600;
                 num_buf.clear();
@@ -2015,6 +2065,98 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// rxw：HysteriaTcpDispatch 适配器——mock QUIC stream → dispatch（freedom）→ echo 回环。
+    #[tokio::test]
+    async fn hysteria_tcp_dispatch_to_freedom_e2e() {
+        use xray_proxy_freedom::make_freedom_dial_fn;
+        use xray_proxy_hysteria::TcpDispatcher as _;
+        use xray_app_dispatcher::default::DialBridge;
+        use xray_transport_hysteria::conn::{InterStreamConn, QuicStream};
+
+        // duplex-backed mock QUIC stream（读写 halves 独立锁，避免 dispatch 桥双向互锁）
+        #[derive(Debug)]
+        struct DuplexQuicStream {
+            r: tokio::sync::Mutex<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+            w: tokio::sync::Mutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
+            local: std::net::SocketAddr,
+            remote: std::net::SocketAddr,
+        }
+        impl QuicStream for DuplexQuicStream {
+            fn read<'a>(&'a self, buf: &'a mut [u8])
+                -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<usize>> + Send + 'a>> {
+                Box::pin(async {
+                    use tokio::io::AsyncReadExt as _;
+                    self.r.lock().await.read(buf).await
+                })
+            }
+            fn write<'a>(&'a self, buf: &'a [u8])
+                -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<usize>> + Send + 'a>> {
+                Box::pin(async {
+                    use tokio::io::AsyncWriteExt as _;
+                    self.w.lock().await.write(buf).await
+                })
+            }
+            fn cancel_read(&self, _code: u64) {}
+            fn close(&self) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn local_addr(&self) -> std::net::SocketAddr { self.local }
+            fn remote_addr(&self) -> std::net::SocketAddr { self.remote }
+        }
+
+        // echo server
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut c, _)) = echo_listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let (mut r, mut w) = c.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+
+        // SimpleOhm + freedom
+        let ohm = Arc::new(SimpleOhm::new());
+        let bridge = Arc::new(DialBridge::new("freedom", make_freedom_dial_fn()))
+            as Arc<dyn xray_app_dispatcher::DispatchHandler>;
+        ohm.set_default(bridge);
+        let handler = ohm.get_default_handler().unwrap();
+
+        let local: std::net::SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let remote: std::net::SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let (client_side, server_side) = tokio::io::duplex(4096);
+        let (sr, sw) = tokio::io::split(server_side);
+        let stream: Arc<dyn QuicStream> = Arc::new(DuplexQuicStream {
+            r: tokio::sync::Mutex::new(sr),
+            w: tokio::sync::Mutex::new(sw),
+            local,
+            remote,
+        });
+        let conn = Arc::new(InterStreamConn::new(stream, local, remote, false));
+
+        let dispatch = HysteriaTcpDispatch(Arc::clone(&handler));
+        let conn2 = Arc::clone(&conn);
+        let dest = format!("127.0.0.1:{echo_port}");
+        tokio::spawn(async move {
+            use xray_proxy_hysteria::TcpDispatcher as _;
+            let _ = dispatch.dispatch_tcp(&dest, conn2).await;
+        });
+
+        // client：写 payload → dispatch 桥 → echo → 回包
+        let payload = b"hysteria-dispatch-e2e";
+        let mut client = client_side;
+        client.write_all(payload).await.unwrap();
+        let mut rbuf = vec![0u8; 128];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut rbuf))
+            .await.unwrap().unwrap();
+        assert_eq!(&rbuf[..n], payload);
+        drop(client);
+        // 留时间给桥收尾（read EOF → 关闭）
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 
     /// parse_socks_server_config：auth/users/accounts/udp/userLevel 字段对齐 Go conf。
     #[test]

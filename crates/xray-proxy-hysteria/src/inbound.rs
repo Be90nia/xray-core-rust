@@ -142,6 +142,13 @@ impl HysteriaInboundHandler {
         })
     }
 
+    /// 注入 TCP dispatcher（builder 风格，使 on_new_conn 真实转发 TCP 流）。
+    #[must_use]
+    pub fn with_dispatcher(mut self, dispatcher: Option<Arc<dyn TcpDispatcher>>) -> Self {
+        self.dispatcher = dispatcher;
+        self
+    }
+
     /// 构造入站 Handler（服务端配置模式，多用户 + dispatcher）。
     ///
     /// 对应 Go `NewServer(ctx, config)`。
