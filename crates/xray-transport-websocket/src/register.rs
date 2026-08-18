@@ -196,24 +196,59 @@ fn parse_ws_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
         ));
     };
 
-    let host = obj.get("host").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let path = obj.get("path").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let ed = obj.get("ed").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    let mut host = obj.get("host").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let mut path = obj.get("path").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let mut ed = obj.get("ed").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
     let heartbeat_period = obj
         .get("heartbeatPeriod")
         .and_then(|x| x.as_u64())
         .unwrap_or(0) as u32;
 
-    // header / headers 二选一（proto JSON 用 "header"，用户配置常写 "headers"）。
-    let header = parse_headers(obj.get("header"))
+    // Go `infra/conf/transport_internet.go::WebSocketConfig.Build`：
+    // path 中 `?ed=N` 提取为 Ed 字段并从 path 删除（其余 query 参数保留）。
+    if let Some((base, query)) = path.split_once('?') {
+        let mut kept = Vec::new();
+        for kv in query.split('&') {
+            if let Some(v) = kv.strip_prefix("ed=") {
+                if let Ok(n) = v.parse::<u32>() {
+                    ed = n;
+                    continue;
+                }
+            }
+            kept.push(kv);
+        }
+        path = if kept.is_empty() {
+            base.to_string()
+        } else {
+            format!("{base}?{}", kept.join("&"))
+        };
+    }
+
+    // Go：headers 里的 host（大小写不敏感）提升为 Host 字段并从 headers 删除。
+    let mut header = parse_headers(obj.get("header"))
         .or_else(|| parse_headers(obj.get("headers")))
         .unwrap_or_default();
+
+    if let Some(host_key) = header
+        .keys()
+        .find(|k| k.eq_ignore_ascii_case("host"))
+        .cloned()
+    {
+        let v = header.remove(&host_key).unwrap_or_default();
+        if host.is_empty() {
+            host = v;
+        }
+    }
+    let accept_proxy_protocol = obj
+        .get("acceptProxyProtocol")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
 
     Ok(Config {
         host,
         path,
         header,
-        accept_proxy_protocol: false,
+        accept_proxy_protocol,
         ed,
         heartbeat_period,
     })
@@ -299,5 +334,39 @@ mod tests {
         let cfg = parse_ws_config(Some(&v)).unwrap();
         assert_eq!(cfg.header.len(), 1);
         assert_eq!(cfg.header.get("good").unwrap(), "v");
+    }
+
+    /// 对齐 Go `WebSocketConfig.Build`：`path:"/ws?ed=2048"` → ed=2048, path="/ws"。
+    #[test]
+    fn parse_ws_config_path_ed_extraction() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"path":"/ws?ed=2048","acceptProxyProtocol":true}"#).unwrap();
+        let cfg = parse_ws_config(Some(&v)).unwrap();
+        assert_eq!(cfg.path, "/ws");
+        assert_eq!(cfg.ed, 2048);
+        assert!(cfg.accept_proxy_protocol);
+    }
+
+    /// 其余 query 参数保留，仅剥离 ed。
+    #[test]
+    fn parse_ws_config_path_ed_keeps_other_params() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"path":"/ws?x=1&ed=1024&y=2"}"#).unwrap();
+        let cfg = parse_ws_config(Some(&v)).unwrap();
+        assert_eq!(cfg.path, "/ws?x=1&y=2");
+        assert_eq!(cfg.ed, 1024);
+    }
+
+    /// Go 兼容：headers 里的 host 提升为 Host 字段并从 headers 删除。
+    #[test]
+    fn parse_ws_config_headers_host_promotion() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"headers":{"Host":"h.example.com","X-Foo":"1"}}"#,
+        )
+        .unwrap();
+        let cfg = parse_ws_config(Some(&v)).unwrap();
+        assert_eq!(cfg.host, "h.example.com");
+        assert!(!cfg.header.contains_key("Host"));
+        assert_eq!(cfg.header.get("X-Foo").map(String::as_str), Some("1"));
     }
 }
