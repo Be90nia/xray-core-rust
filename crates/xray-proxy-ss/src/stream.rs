@@ -111,11 +111,24 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
     /// plaintext 通常是一段应用层数据（HTTP 请求、TLS record 等）。
     /// 客户端的**第一个** `write_chunk` 应传 addr+port（SS 地址格式），作为首帧。
     ///
+    /// 超过单块上限时自动分块（对应 Go `AuthenticationWriter.writeStream` 按
+    /// `buf.Size(8192) - tag - 2` 分块），调用方无需关心大小。
+    /// 空输入不产生任何 chunk（size=0 是流结束标记，不能由本方法发出）。
+    ///
     /// # Errors
-    /// - [`SsError::InsufficientData`]：plaintext 过大（u16 溢出）。
     /// - [`SsError::AeadSeal`]：AEAD 加密失败。
     /// - [`SsError::Io`]：底层写失败。
     pub async fn write_chunk(&mut self, plaintext: &[u8]) -> Result<()> {
+        // 8192 = Go buf.Size；tag_size+2 是 size chunk 的 wire 开销。
+        let max_payload = 8192 - self.tag_size - 2;
+        for part in plaintext.chunks(max_payload.max(1)) {
+            self.write_single_chunk(part).await?;
+        }
+        Ok(())
+    }
+
+    /// 写单个（已保证 ≤ 块上限的）chunk。
+    async fn write_single_chunk(&mut self, plaintext: &[u8]) -> Result<()> {
         // seal size chunk
         self.increment_nonce();
         let plain_size = u16::try_from(plaintext.len())
@@ -425,6 +438,29 @@ mod tests {
 
         let received = server.read_chunk().await.expect("read");
         assert_eq!(received.as_deref(), Some(payload.as_slice()));
+    }
+
+    /// 单块上限 = 8192 - tag(16) - 2 = 8174。跨块 payload 自动分块，读侧多 chunk 重组。
+    /// 注意：duplex 缓冲仅 8KB，写端 20KB 会阻塞，读端必须 spawn 并发收。
+    #[tokio::test]
+    async fn multi_chunk_split_roundtrip() {
+        let (mut client, mut server) = roundtrip_pair(CipherType::Aes128Gcm).await;
+
+        let reader = tokio::spawn(async move {
+            let mut received = Vec::new();
+            for _ in 0..3 {
+                let chunk = server.read_chunk().await.expect("read").expect("chunk");
+                received.extend_from_slice(&chunk);
+            }
+            received
+        });
+
+        // 20000 = 3 块（8174 + 8174 + 3652）
+        let payload = vec![0xCDu8; 20_000];
+        client.write_chunk(&payload).await.expect("write");
+        client.flush().await.expect("flush");
+
+        assert_eq!(reader.await.expect("reader task"), payload);
     }
 
     #[tokio::test]
