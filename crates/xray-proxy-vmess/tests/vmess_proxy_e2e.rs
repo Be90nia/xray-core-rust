@@ -208,3 +208,88 @@ async fn vmess_proxy_to_echo_target_e2e() {
         "server: echoed payload should match sent"
     );
 }
+
+/// 5iy：生产路径多 chunk nonce 状态机验证。
+///
+/// make_vmess_dial_fn（VmessConn pump_up/pump_down，nonce 跨 chunk 持久）→
+/// serve_vmess（pump_request_body/pump_response_body，同状态机）→ freedom → echo。
+/// 20KB 强制 ≥3 chunk 双向；若任何一侧 nonce 重置，AEAD open 必失败/数据错乱。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vmess_multichunk_production_roundtrip_e2e() {
+    use xray_app_dispatcher::default::{DialBridge, SimpleOhm};
+    use xray_proxy_vmess::dispatcher::{make_vmess_dial_fn, VmessOutboundConfig};
+    use xray_proxy_vmess::inbound::server::serve_vmess;
+
+    // echo server
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((sock, _)) = echo_listener.accept().await else { break };
+            tokio::spawn(async move {
+                let (mut rd, mut wr) = tokio::io::split(sock);
+                let _ = tokio::io::copy(&mut rd, &mut wr).await;
+            });
+        }
+    });
+
+    // serve_vmess + freedom ohm
+    let ohm = Arc::new(SimpleOhm::new());
+    let bridge = Arc::new(DialBridge::new("freedom", xray_proxy_freedom::make_freedom_dial_fn()))
+        as Arc<dyn xray_app_dispatcher::DispatchHandler>;
+    ohm.set_default(bridge);
+
+    let uuid = sample_uuid();
+    let validator = Arc::new(TimedUserValidator::new());
+    validator
+        .add(MemoryUser::new("alice@example.com", MemoryAccount::new(uuid)))
+        .expect("add user");
+    let vmess_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind vmess");
+    let vmess_addr = vmess_listener.local_addr().unwrap();
+    let ohm2 = Arc::clone(&ohm);
+    let validator2 = Arc::clone(&validator);
+    tokio::spawn(async move {
+        let _ = serve_vmess(
+            vmess_listener,
+            ohm2,
+            validator2,
+            None,
+        )
+        .await;
+    });
+
+    // 生产 outbound：make_vmess_dial_fn → VmessConn
+    let cfg = Arc::new(VmessOutboundConfig::new(
+        sample_uuid(),
+        Address::from_ipv4_bytes([127, 0, 0, 1]),
+        Port::new(vmess_addr.port()),
+    ));
+    let dial = make_vmess_dial_fn(cfg);
+    let dest = Destination::new(
+        Address::from_ipv4_bytes([127, 0, 0, 1]),
+        Port::new(echo_port),
+        Network::TCP,
+    );
+    let mut conn = dial(&dest).await.expect("vmess dial");
+
+    // 20KB 分 3 次写（2×8192 + 3616）：多 chunk up + 多 chunk down
+    let payload: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+    for part in payload.chunks(8192) {
+        conn.write_all(part).await.expect("write part");
+    }
+    // 读回全部 echo
+    let mut received = Vec::new();
+    let mut rbuf = [0u8; 8192];
+    while received.len() < payload.len() {
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), conn.read(&mut rbuf))
+            .await
+            .expect("read timeout")
+            .expect("read");
+        if n == 0 {
+            break;
+        }
+        received.extend_from_slice(&rbuf[..n]);
+    }
+    assert_eq!(received.len(), payload.len(), "echo size mismatch");
+    assert_eq!(received, payload, "multi-chunk nonce continuity broken");
+}
