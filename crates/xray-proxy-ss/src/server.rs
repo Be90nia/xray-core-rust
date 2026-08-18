@@ -22,11 +22,11 @@ pub trait InboundProcessor: Send + Sync {
     /// - 透传解码错误。
     fn handle_tcp(&self, validator: &Validator, buf: &[u8]) -> Result<RequestHeader>;
 
-    /// 处理 UDP 包：解码数据包，返回 RequestHeader。
+    /// 处理 UDP 包：解码数据包，返回 RequestHeader + payload。
     ///
     /// # Errors
     /// - 透传解码错误。
-    fn handle_udp(&self, validator: &Validator, payload: &[u8]) -> Result<RequestHeader>;
+    fn handle_udp(&self, validator: &Validator, payload: &[u8]) -> Result<(RequestHeader, Vec<u8>)>;
 }
 
 /// No-op 处理器：直接调 protocol 函数。
@@ -37,7 +37,7 @@ impl InboundProcessor for NoopInboundProcessor {
         crate::protocol::decode_tcp_request_header(validator, buf)
     }
 
-    fn handle_udp(&self, validator: &Validator, payload: &[u8]) -> Result<RequestHeader> {
+    fn handle_udp(&self, validator: &Validator, payload: &[u8]) -> Result<(RequestHeader, Vec<u8>)> {
         crate::protocol::decode_udp_packet(validator, payload)
     }
 }
@@ -120,7 +120,7 @@ impl Server {
     ///
     /// # Errors
     /// - 透传 processor 错误。
-    pub fn handle_udp(&self, payload: &[u8]) -> Result<RequestHeader> {
+    pub fn handle_udp(&self, payload: &[u8]) -> Result<(RequestHeader, Vec<u8>)> {
         self.processor.handle_udp(&self.validator, payload)
     }
 }
@@ -294,9 +294,10 @@ mod tests {
         let encoded =
             crate::protocol::encode_udp_packet(&account, &addr, 443, b"test payload").expect("encode");
 
-        let header = server.handle_udp(&encoded).expect("handle");
+        let (header, data) = server.handle_udp(&encoded).expect("handle");
         assert_eq!(header.address, addr);
         assert_eq!(header.port, 443);
+        assert_eq!(data, b"test payload");
     }
 
     // ---- loopback 互通测试（client ↔ server in-process）----

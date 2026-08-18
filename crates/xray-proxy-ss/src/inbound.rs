@@ -13,7 +13,7 @@ use crate::config::MemoryAccount;
 use crate::protocol::RequestHeader;
 use crate::server::{read_request, Server};
 use crate::stream::SSStream;
-use crate::validator::MemoryUser;
+use crate::validator::{MemoryUser, Validator};
 
 /// SS 入站适配器：持有 [`Server`]（负责 SS 协议解析 + 用户验证），
 /// [`handle_conn`](Self::handle_conn) 解析入站连接并返回目标头 + 加密流。
@@ -51,6 +51,12 @@ impl SsInbound {
     #[must_use]
     pub fn with_server(server: Server) -> Self {
         Self { server }
+    }
+
+    /// 用户验证器（UDP relay 解码用）。
+    #[must_use]
+    pub fn validator(&self) -> &Validator {
+        &self.server.validator
     }
 
     /// 处理入站 TCP 连接：读 IV + 解密首帧 + 解析目标地址 → 返回目标头 + 加密流。

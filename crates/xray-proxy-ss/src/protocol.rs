@@ -191,12 +191,12 @@ pub fn encode_udp_packet(
 /// 1. `validator.Get(payload, UDP)` 匹配用户（None cipher 直接返回，AEAD 尝试 Open）
 /// 2. AEAD：返回的 `ret` 已是 plaintext；None：用 `cipher.decode_packet` 整体解密
 /// 3. 把首字节 `& 0x0F`（兼容性）
-/// 4. 解析 addr + port
+/// 4. 解析 addr + port，返回 header + payload（addr 之后的部分）
 ///
 /// # Errors
 /// - [`SsError::UserNotFound`]：未匹配到用户。
 /// - 透传 AEAD / cipher 错误。
-pub fn decode_udp_packet(validator: &Validator, payload: &[u8]) -> Result<RequestHeader> {
+pub fn decode_udp_packet(validator: &Validator, payload: &[u8]) -> Result<(RequestHeader, Vec<u8>)> {
     let r = validator.get(payload, RequestCommand::Udp)?;
 
     // 取得 plaintext（去掉 IV 部分）
@@ -225,15 +225,19 @@ pub fn decode_udp_packet(validator: &Validator, payload: &[u8]) -> Result<Reques
         plaintext[0] &= 0x0F;
     }
 
-    let (addr, port, _) = read_address_port_ss(&plaintext)?;
+    let (addr, port, consumed) = read_address_port_ss(&plaintext)?;
+    let data = plaintext[consumed..].to_vec();
 
-    Ok(RequestHeader {
-        version: crate::VERSION,
-        user: r.user,
-        command: RequestCommand::Udp,
-        address: addr,
-        port,
-    })
+    Ok((
+        RequestHeader {
+            version: crate::VERSION,
+            user: r.user,
+            command: RequestCommand::Udp,
+            address: addr,
+            port,
+        },
+        data,
+    ))
 }
 
 fn account_is_aead(account: &MemoryAccount) -> bool {
@@ -512,7 +516,7 @@ mod tests {
         let payload = b"hello shadowsocks udp payload";
 
         let encoded = encode_udp_packet(&account, &addr, 443, payload).expect("encode");
-        let header = decode_udp_packet(&validator, &encoded).expect("decode");
+        let (header, data) = decode_udp_packet(&validator, &encoded).expect("decode");
         assert_eq!(header.address, addr);
         assert_eq!(header.port, 443);
         assert_eq!(header.command, RequestCommand::Udp);
@@ -548,7 +552,7 @@ mod tests {
 
         let addr = Address::IPv4(std::net::Ipv4Addr::new(8, 8, 8, 8));
         let encoded = encode_udp_packet(&account, &addr, 53, b"query").expect("encode");
-        let header = decode_udp_packet(&validator, &encoded).expect("decode");
+        let (header, data) = decode_udp_packet(&validator, &encoded).expect("decode");
         assert_eq!(header.address, addr);
         assert_eq!(header.port, 53);
     }
@@ -563,7 +567,7 @@ mod tests {
 
         let addr = Address::IPv6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
         let encoded = encode_udp_packet(&account, &addr, 443, b"ipv6 test").expect("encode");
-        let header = decode_udp_packet(&validator, &encoded).expect("decode");
+        let (header, data) = decode_udp_packet(&validator, &encoded).expect("decode");
         assert_eq!(header.address, addr);
     }
 
