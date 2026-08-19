@@ -60,8 +60,8 @@ pub struct DohNameServer {
     server_name: String,
     /// TLS 客户端配置。
     tls_config: Arc<ClientConfig>,
-    /// DoH URL 路径（默认 `/dns-query`）。
-    url_path: String,
+    /// h2c 明文模式（Go `h2c://`）：跳过 TLS，HTTP/2 直接跑 TCP。
+    plain_h2c: bool,
     /// 缓存控制器。
     cache: Arc<CacheController>,
     /// EDNS0 client subnet。
@@ -83,14 +83,19 @@ impl DohNameServer {
         cache: Arc<CacheController>,
         client_ip: Vec<u8>,
         query_timeout: Duration,
+        plain_h2c: bool,
     ) -> Self {
-        let name = format!("DoH:{}", addr);
+        let name = if plain_h2c {
+            format!("DoH-h2c:{addr}")
+        } else {
+            format!("DoH:{addr}")
+        };
         Self {
             name,
             addr,
             server_name,
             tls_config,
-            url_path: DEFAULT_DOH_PATH.to_string(),
+            plain_h2c,
             cache,
             client_ip,
             query_timeout,
@@ -132,8 +137,45 @@ impl DohNameServer {
             cache,
             ns.client_ip.clone(),
             timeout_dur,
+            false,
         )))
     }
+
+    /// h2c（明文 HTTP/2）构造。对应 Go `NewDoHNameServer(u, dispatcher, true, ...)`。
+    pub fn from_config_h2c(ns: &NameServerConfig) -> Result<Box<dyn Server>, DnsError> {
+        let socket_addr = match &ns.address {
+            Address::IPv4(v) => SocketAddr::new(IpAddr::V4(*v), ns.port),
+            Address::IPv6(v) => SocketAddr::new(IpAddr::V6(*v), ns.port),
+            other => {
+                return Err(DnsError::WireFormat(format!(
+                    "doh-h2c nameserver requires IP address, got: {other:?}"
+                )));
+            }
+        };
+        let timeout_dur = if ns.timeout_ms > 0 {
+            Duration::from_millis(u64::from(ns.timeout_ms))
+        } else {
+            Duration::from_millis(4000)
+        };
+        let cache = Arc::new(CacheController::new(
+            format!("DoH-h2c:{socket_addr}"),
+            ns.disable_cache.unwrap_or(false),
+            ns.serve_stale.unwrap_or(false),
+            ns.serve_expired_ttl.unwrap_or(0),
+            ns.negative_ttl_secs.unwrap_or(0),
+        ));
+        Ok(Box::new(Self::new(
+            socket_addr,
+            String::new(),
+            xray_tls::utls::default_client_config(),
+            cache,
+            ns.client_ip.clone(),
+            timeout_dur,
+            true,
+        )))
+    }
+
+
 
     /// 发送单次 DNS 查询（DoH），等待响应。
     async fn query_once(
@@ -155,27 +197,36 @@ impl DohNameServer {
             })?
             .map_err(|e| DnsError::WireFormat(format!("doh connect: {e}")))?;
 
-        // TLS 握手。
-        let tls_stream = timeout(
-            self.query_timeout,
-            tls_client(
-                TcpConnection::new(tcp),
-                &self.server_name,
-                Arc::clone(&self.tls_config),
-            ),
-        )
-        .await
-        .map_err(|_| DnsError::WireFormat("doh tls handshake timeout".to_string()))?
-        .map_err(|e| DnsError::WireFormat(format!("doh tls handshake: {e}")))?;
-
-        // HTTP/2 handshake。
-        let (mut h2, h2_conn) = timeout(self.query_timeout, client::handshake(tls_stream))
+        // TLS 握手（h2c 明文跳过）+ HTTP/2 handshake。
+        let (mut h2, h2_conn): (_, Pin<Box<dyn Future<Output = ()> + Send>>) = if self.plain_h2c {
+            let (h2, conn) = timeout(self.query_timeout, client::handshake(tcp))
+                .await
+                .map_err(|_| DnsError::WireFormat("doh h2c handshake timeout".to_string()))?
+                .map_err(|e| DnsError::WireFormat(format!("doh h2c handshake: {e}")))?;
+            (h2, Box::pin(async move {
+                let _ = conn.await;
+            }))
+        } else {
+            let tls_stream = timeout(
+                self.query_timeout,
+                tls_client(
+                    TcpConnection::new(tcp),
+                    &self.server_name,
+                    Arc::clone(&self.tls_config),
+                ),
+            )
             .await
-            .map_err(|_| DnsError::WireFormat("doh h2 handshake timeout".to_string()))?
-            .map_err(|e| DnsError::WireFormat(format!("doh h2 handshake: {e}")))?;
-        tokio::spawn(async move {
-            let _ = h2_conn.await;
-        });
+            .map_err(|_| DnsError::WireFormat("doh tls handshake timeout".to_string()))?
+            .map_err(|e| DnsError::WireFormat(format!("doh tls handshake: {e}")))?;
+            let (h2, conn) = timeout(self.query_timeout, client::handshake(tls_stream))
+                .await
+                .map_err(|_| DnsError::WireFormat("doh h2 handshake timeout".to_string()))?
+                .map_err(|e| DnsError::WireFormat(format!("doh h2 handshake: {e}")))?;
+            (h2, Box::pin(async move {
+                let _ = conn.await;
+            }))
+        };
+        tokio::spawn(h2_conn);
 
         // 等待 h2 连接 ready（ready 消费 self 后返回 ready 态的 SendRequest）。
         h2 = timeout(self.query_timeout, h2.ready())
@@ -186,7 +237,7 @@ impl DohNameServer {
         // POST /dns-query + Content-Type: application/dns-message
         let request = Request::builder()
             .method(Method::POST)
-            .uri(&self.url_path)
+            .uri(DEFAULT_DOH_PATH)
             .header(CONTENT_TYPE, "application/dns-message")
             .body(())
             .map_err(|e| DnsError::WireFormat(format!("doh build request: {e}")))?;
@@ -297,6 +348,11 @@ pub fn new_doh_name_server(
     tls_config: Arc<ClientConfig>,
 ) -> Result<Box<dyn Server>, DnsError> {
     DohNameServer::from_config(ns, server_name, tls_config)
+}
+
+/// 构造 h2c（明文 HTTP/2）nameserver。
+pub fn new_doh_h2c_name_server(ns: &NameServerConfig) -> Result<Box<dyn Server>, DnsError> {
+    DohNameServer::from_config_h2c(ns)
 }
 
 #[cfg(test)]
@@ -434,6 +490,7 @@ mod tests {
             Arc::new(CacheController::new("test", true, false, 0, 0)),
             Vec::new(),
             Duration::from_secs(5),
+            false,
         );
         let rec = ns.query_once("example.com.", RecordType::A).await.unwrap();
         assert_eq!(rec.ips.len(), 1);
@@ -453,6 +510,7 @@ mod tests {
             Arc::new(CacheController::new("test", true, false, 0, 0)),
             Vec::new(),
             Duration::from_secs(5),
+            false,
         );
         let outcome = ns
             .send_query(
@@ -533,6 +591,7 @@ mod tests {
             Arc::new(CacheController::new("test", true, false, 0, 0)),
             Vec::new(),
             Duration::from_secs(5),
+            false,
         );
         let result = ns.query_once("bad.com.", RecordType::A).await;
         assert!(result.is_err());

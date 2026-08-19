@@ -202,12 +202,24 @@ impl Client {
 /// 仅接受 IP 地址（不含域名解析，避免 DNS 循环依赖）。
 /// server_name (TLS SNI) 取自 IP 字符串。
 pub fn new_server(url: &str) -> Result<Box<dyn Server>, DnsError> {
-    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    // Go nameserver.go NewServer：整串 localhost/fakedns 特判
+    let lower = url.trim().to_ascii_lowercase();
+    if lower == "localhost" {
+        return local::new_local_name_server();
+    }
+    if lower == "fakedns" {
+        let holder = crate::fakedns::Holder::new_default()?;
+        return Ok(Box::new(fakedns::FakeDnsServer::new(holder)));
+    }
+
+    let (scheme_raw, rest) = url.split_once("://").unwrap_or(("", url));
+    // "+local" 后缀（Go 经 dispatcher vs 直连）：Rust DNS 拨号均直连，语义等价 → 剥后缀
+    let scheme = scheme_raw.strip_suffix("+local").unwrap_or(scheme_raw);
 
     let default_port = match scheme {
         "" | "tcp" => 53u16,
         "tls" => 853,
-        "https" => 443,
+        "https" | "h2c" => 443,
         "quic" => 854,
         other => return Err(DnsError::WireFormat(format!("unknown DNS scheme: {other}"))),
     };
@@ -223,6 +235,7 @@ pub fn new_server(url: &str) -> Result<Box<dyn Server>, DnsError> {
         "tcp" => tcp::new_tcp_name_server(&ns),
         "tls" => dot::new_dot_name_server(&ns, server_name, utls::default_client_config()),
         "https" => doh::new_doh_name_server(&ns, server_name, utls::default_client_config()),
+        "h2c" => doh::new_doh_h2c_name_server(&ns),
         "quic" => quic::new_quic_name_server(&ns, server_name, utls::default_client_config()),
         _ => unreachable!(),
     }
@@ -313,6 +326,31 @@ mod tests {
         let client = Client::new(ns, IpOption::all(), server).unwrap();
         assert_eq!(client.timeout, Duration::from_millis(1000));
         assert_eq!(client.tag, "gcp");
+    }
+
+    #[test]
+    fn new_server_recognizes_localhost_and_fakedns() {
+        let local = new_server("localhost").unwrap();
+        assert_eq!(local.name(), "localhost");
+        let local_ci = new_server("LocalHost").unwrap();
+        assert_eq!(local_ci.name(), "localhost");
+        let fake = new_server("fakedns").unwrap();
+        assert!(fake.name().contains("FakeDNS"), "got: {}", fake.name());
+    }
+
+    #[test]
+    fn new_server_strips_local_suffix() {
+        // Go：https+local / tcp+local / quic+local 与无后缀版本等价（Rust 均直连）。
+        let a = new_server("tcp+local://8.8.8.8").unwrap();
+        assert!(a.name().contains("TCP") || a.name().contains("tcp"), "got: {}", a.name());
+        let b = new_server("https+local://8.8.8.8").unwrap();
+        assert!(b.name().starts_with("DoH:"), "got: {}", b.name());
+    }
+
+    #[test]
+    fn new_server_h2c_scheme_builds_plain_doh() {
+        let ns = new_server("h2c://8.8.8.8").unwrap();
+        assert!(ns.name().starts_with("DoH-h2c:"), "got: {}", ns.name());
     }
 
     #[test]
