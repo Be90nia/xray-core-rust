@@ -114,6 +114,10 @@ pub struct NameServerConfig {
     pub query_strategy: Option<QueryStrategy>,
     /// 策略 ID。
     pub policy_id: u32,
+    /// 期望 IP 规则（CIDR / geoip）。对应 Go `ExpectedIp`。
+    pub expected_ip_rules: Vec<xray_geodata::pb::IpRule>,
+    /// 不期望 IP 规则。对应 Go `UnexpectedIp`。
+    pub unexpected_ip_rules: Vec<xray_geodata::pb::IpRule>,
 }
 
 impl Default for NameServerConfig {
@@ -134,6 +138,8 @@ impl Default for NameServerConfig {
             negative_ttl_secs: None,
             query_strategy: None,
             policy_id: 0,
+            expected_ip_rules: Vec::new(),
+            unexpected_ip_rules: Vec::new(),
         }
     }
 }
@@ -164,8 +170,6 @@ impl Client {
         Ok(Self {
             server,
             skip_fallback: ns.skip_fallback,
-            expected_ips: None,
-            unexpected_ips: None,
             tag: if ns.tag.is_empty() {
                 "default".to_string()
             } else {
@@ -178,23 +182,75 @@ impl Client {
             policy_id: ns.policy_id,
             act_prior: ns.act_prior,
             act_unprior: ns.act_unprior,
+            expected_ips: build_ip_matcher(&ns.expected_ip_rules),
+            unexpected_ips: build_ip_matcher(&ns.unexpected_ip_rules),
         })
     }
 
-    /// 委托查询给内部 Server。
+    /// 委托查询给内部 Server，并应用 expected/unexpected IP 过滤。
+    /// 对应 Go `(*Client).QueryIP` 的四分支过滤（nameserver.go 195-225）：
+    /// 非 prior 的 expected 过滤空即 Err；非 unprior 的 unexpected 剥离空即 Err；
+    /// actPrior/actUnprior 命中非空时替换结果集。
     pub fn query_ip<'a>(
         &'a self,
         domain: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>> {
-        self.server.query_ip(domain, self.ip_option)
+        let fut = self.server.query_ip(domain, self.ip_option);
+        Box::pin(async move {
+            let (ips, ttl) = fut.await?;
+            if ips.is_empty() {
+                return Err(DnsError::EmptyResponse);
+            }
+            let mut ips = ips;
+            if let Some(m) = self.expected_ips.as_ref() {
+                if !self.act_prior {
+                    ips = m.filter_ips(&ips);
+                    if ips.is_empty() {
+                        return Err(DnsError::EmptyResponse);
+                    }
+                }
+            }
+            if let Some(m) = self.unexpected_ips.as_ref() {
+                if !self.act_unprior {
+                    ips.retain(|ip| !m.match_ip(*ip));
+                    if ips.is_empty() {
+                        return Err(DnsError::EmptyResponse);
+                    }
+                }
+            }
+            if let Some(m) = self.expected_ips.as_ref() {
+                if self.act_prior {
+                    let matched = m.filter_ips(&ips);
+                    if !matched.is_empty() {
+                        ips = matched;
+                    }
+                }
+            }
+            if let Some(m) = self.unexpected_ips.as_ref() {
+                if self.act_unprior {
+                    let matched = m.filter_ips(&ips);
+                    if !matched.is_empty() {
+                        ips = matched;
+                    }
+                }
+            }
+            Ok((ips, ttl))
+        })
     }
 }
 
-/// DNS URL scheme 工厂。解析 URL scheme 并构造对应 nameserver。
-///
-/// 支持的 URL scheme：
-/// - `IP[:port]` → UDP (默认 53)
-/// - `tcp://IP[:port]` → TCP (默认 53)
+/// 从 IP 规则列表构建匹配器（空列表 → None）。对应 Go `geodata.IPReg.BuildIPMatcher`。
+fn build_ip_matcher(
+    rules: &[xray_geodata::pb::IpRule],
+) -> Option<Box<dyn xray_geodata::matcher::ip::IPMatcher>> {
+    if rules.is_empty() {
+        return None;
+    }
+    match xray_geodata::matcher::ip::build_optimized_ip_matcher(rules) {
+        Ok(m) => Some(m),
+        Err(_) => None,
+    }
+}
 /// - `tls://IP[:port]` → DoT (默认 853)
 /// - `https://IP[:port][/path]` → DoH (默认 443, path 默认 /dns-query)
 /// - `quic://IP[:port]` → DoQ (默认 854)

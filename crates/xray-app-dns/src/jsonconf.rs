@@ -22,7 +22,10 @@ use crate::config::{IpOption, QueryStrategy, generate_random_tag, validate_clien
 use crate::error::DnsError;
 use crate::hosts::{HostMapping, StaticHosts};
 use crate::nameserver::{Client, NameServerConfig, new_server};
-use crate::server::DnsServiceConfig;
+use crate::server::{DnsServiceConfig, DomainMatcherInfo};
+use xray_geodata::matcher::domain::{
+    DomainRule as MatcherDomainRule, MphDomainMatcher,
+};
 
 /// 顶层 DNS app JSON 配置。对应 Go `infra/conf.DNSConfig`。
 #[derive(Debug, Default, Deserialize)]
@@ -107,10 +110,47 @@ impl DnsAppConfig {
         let client_ip = parse_client_ip(self.client_ip.as_deref())?;
         validate_client_ip_len(client_ip.len())?;
 
+        let datadir = resolve_asset_dir();
+        let loader = xray_geodata::loader::GeoDataLoader::new(datadir.clone());
+
         let mut clients: Vec<Arc<Client>> = Vec::with_capacity(self.servers.len());
+        // kvl：聚合 per-nameserver domain 规则（对应 Go dns.go effectiveRules/matcherInfos）。
+        let mut all_rules: Vec<MatcherDomainRule> = Vec::new();
+        let mut matcher_infos: Vec<DomainMatcherInfo> = Vec::new();
         for ns in &self.servers {
-            match build_client(ns, &client_ip, base_ip_option) {
-                Ok(c) => clients.push(Arc::new(c)),
+            match build_client(ns, &client_ip, base_ip_option, &datadir) {
+                Ok(c) => {
+                    let client_idx = clients.len() as u16;
+                    clients.push(Arc::new(c));
+                    // localhost server 优先本地域（Go localTLDsAndDotlessDomainsRules）。
+                    let push_rule = |dt, value: &str, infos: &mut Vec<DomainMatcherInfo>, rules: &mut Vec<MatcherDomainRule>| {
+                        infos.push(DomainMatcherInfo { client_idx, domain_rule: value.to_string() });
+                        rules.push(MatcherDomainRule::new(dt, value, rules.len() as u32));
+                    };
+                    if ns.address.trim().eq_ignore_ascii_case("localhost") {
+                        for (dt, v) in local_tlds_and_dotless_rules() {
+                            push_rule(dt, &v, &mut matcher_infos, &mut all_rules);
+                        }
+                    }
+                    for s in ns.domains.iter().flatten() {
+                        match parse_ns_domain_rule(s, &datadir, &loader) {
+                            Ok(entries) => {
+                                for (dt, v) in entries {
+                                    matcher_infos.push(DomainMatcherInfo {
+                                        client_idx,
+                                        domain_rule: s.clone(),
+                                    });
+                                    all_rules.push(MatcherDomainRule::new(
+                                        dt,
+                                        v,
+                                        all_rules.len() as u32,
+                                    ));
+                                }
+                            }
+                            Err(e) => tracing::warn!(rule = %s, error = %e, "dns: skip bad domain rule"),
+                        }
+                    }
+                }
                 Err(e) => {
                     // ponytail: 域名地址需 bootstrap 解析，new_server 暂不支持。
                     // 跳过并告警，避免单个 server 阻断整个 dns feature。
@@ -122,6 +162,17 @@ impl DnsAppConfig {
                 }
             }
         }
+        let domain_matcher = if all_rules.is_empty() {
+            None
+        } else {
+            match MphDomainMatcher::build(&all_rules) {
+                Ok(m) => Some(Box::new(m) as Box<dyn xray_geodata::matcher::domain::DomainMatcher>),
+                Err(e) => {
+                    tracing::warn!(error = %e, "dns: domain matcher build failed, fallback only");
+                    None
+                }
+            }
+        };
 
         let mut mappings = parse_hosts(&self.hosts)?;
         // 98g：useSystemHosts → 系统 hosts 合并（对应 Go readSystemHosts）
@@ -145,6 +196,8 @@ impl DnsAppConfig {
             serve_stale: self.serve_stale.unwrap_or(false),
             serve_expired_ttl: self.serve_expired_ttl.unwrap_or(0),
             use_system_hosts: self.use_system_hosts.unwrap_or(false),
+            domain_matcher,
+            matcher_infos,
         })
     }
 }
@@ -204,6 +257,7 @@ fn build_client(
     ns: &NameServerJson,
     global_client_ip: &[u8],
     base_ip_option: IpOption,
+    datadir: &std::path::Path,
 ) -> Result<Client, DnsError> {
     let url = build_server_url(&ns.address, ns.port);
     let server = new_server(&url)?;
@@ -216,6 +270,12 @@ fn build_client(
         client_ip
     };
 
+    // 6r0：expectedIPs/unexpectedIPs → IpRule（CIDR + geoip 展开）。
+    let expected_ip_rules =
+        parse_ns_ip_rules(ns.expected_ips.as_deref().unwrap_or(&[]), datadir)?;
+    let unexpected_ip_rules =
+        parse_ns_ip_rules(ns.unexpected_ips.as_deref().unwrap_or(&[]), datadir)?;
+
     let ns_cfg = NameServerConfig {
         client_ip,
         skip_fallback: ns.skip_fallback,
@@ -226,12 +286,124 @@ fn build_client(
         disable_cache: ns.disable_cache,
         serve_stale: None,
         serve_expired_ttl: None,
-        // ponytail: domains/expected_ips/unexpected_ips 解析到结构体即满足要求，
-        // 路由层已有；NameServerConfig 暂无对应字段承载，留待 IPMatcher/domains 接入。
+        expected_ip_rules,
+        unexpected_ip_rules,
         ..Default::default()
     };
 
     Client::new(ns_cfg, base_ip_option, server)
+}
+
+/// 资源目录（geosite.dat / geoip.dat 查找路径）。对应 Go `XRAY_LOCATION_ASSET`。
+fn resolve_asset_dir() -> std::path::PathBuf {
+    std::env::var("XRAY_LOCATION_ASSET")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
+
+/// 本地域 TLD + 无点域名规则（Go `localTLDsAndDotlessDomainsRules`，app/dns/config.go）。
+fn local_tlds_and_dotless_rules()
+-> Vec<(xray_geodata::matcher::domain::DomainType, &'static str)> {
+    use xray_geodata::matcher::domain::DomainType;
+    vec![
+        (DomainType::Regex, "^[^.]+$"),
+        (DomainType::Domain, "local"),
+        (DomainType::Domain, "localdomain"),
+        (DomainType::Domain, "localhost"),
+        (DomainType::Domain, "lan"),
+        (DomainType::Domain, "home.arpa"),
+        (DomainType::Domain, "example"),
+        (DomainType::Domain, "invalid"),
+        (DomainType::Domain, "test"),
+    ]
+}
+
+/// 解析单条 nameserver domain 规则字符串（Go `ParseDomainRule(s, Domain_Substr)`）。
+///
+/// 返回 `(DomainType, value)`；geosite 条目经 loader 展开为多条（此处返回首条，
+/// 展开型多规则由调用方聚合——见 `parse_ns_domain_rule` 内 geosite 分支）。
+fn parse_ns_domain_rule(
+    s: &str,
+    datadir: &std::path::Path,
+    loader: &xray_geodata::loader::GeoDataLoader,
+) -> Result<Vec<(xray_geodata::matcher::domain::DomainType, String)>, DnsError> {
+    use xray_geodata::matcher::domain::DomainType;
+    use xray_geodata::pb::domain_rule::Value as DV;
+
+    let pb_rule = xray_geodata::rule_parser::parse_domain_rule(
+        s,
+        xray_geodata::geosite::DomainType::Substr,
+        datadir,
+    )
+    .map_err(|e| DnsError::Features(xray_features::dns::DnsError::Other(e.to_string())))?;
+    let Some(value) = pb_rule.value else {
+        return Ok(Vec::new());
+    };
+    let to_matcher_type = |t: i32| {
+        DomainType::from_i32(t).ok_or_else(|| {
+            DnsError::Features(xray_features::dns::DnsError::Other(format!(
+                "unknown domain type: {t}"
+            )))
+        })
+    };
+    match value {
+        DV::Custom(d) => Ok(vec![(to_matcher_type(d.r#type)?, d.value)]),
+        DV::Geosite(g) => {
+            let file = if g.file.is_empty() { "geosite.dat" } else { &g.file };
+            let site = loader
+                .load_site_with_attrs(file, &g.code, &g.attrs)
+                .map_err(|e| {
+                    DnsError::Features(xray_features::dns::DnsError::Other(e.to_string()))
+                })?;
+            Ok(site
+                .domain
+                .into_iter()
+                .filter_map(|d| {
+                    Some((to_matcher_type(d.r#type).ok()?, d.value))
+                })
+                .collect())
+        }
+    }
+}
+
+/// 解析 nameserver IP 规则字符串列表（CIDR / `!` 反向 / geoip 展开）。
+fn parse_ns_ip_rules(
+    rules: &[String],
+    datadir: &std::path::Path,
+) -> Result<Vec<xray_geodata::pb::IpRule>, DnsError> {
+    use xray_geodata::pb::ip_rule::Value as IV;
+
+    let mut out = Vec::with_capacity(rules.len());
+    for s in rules {
+        let r = xray_geodata::rule_parser::parse_ip_rules(
+            &[s.clone()],
+            datadir,
+        )
+        .map_err(|e| {
+            DnsError::Features(xray_features::dns::DnsError::Other(e.to_string()))
+        })?;
+        for rule in r {
+            // geoip 条目展开为 Custom CIDR 列表（build_optimized_ip_matcher 的 geoip 分支为空 stub）。
+            if let Some(IV::Geoip(g)) = rule.value.as_ref() {
+                let file = if g.file.is_empty() { "geoip.dat" } else { &g.file };
+                let loader = xray_geodata::loader::GeoDataLoader::new(datadir.to_path_buf());
+                let geo = loader.load_ip(file, &g.code).map_err(|e| {
+                    DnsError::Features(xray_features::dns::DnsError::Other(e.to_string()))
+                })?;
+                for cidr in geo.cidr {
+                    out.push(xray_geodata::pb::IpRule {
+                        value: Some(IV::Custom(xray_geodata::pb::CidrRule {
+                            cidr: Some(cidr),
+                            reverse_match: g.reverse_match,
+                        })),
+                    });
+                }
+            } else {
+                out.push(rule);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// 解析静态 hosts map 为 [`HostMapping`] 列表。
@@ -353,5 +525,49 @@ mod tests {
         );
         assert_eq!(build_server_url("tls://1.1.1.1", None), "tls://1.1.1.1");
         assert_eq!(build_server_url("8.8.8.8", Some(0)), "8.8.8.8");
+    }
+
+    /// kvl：per-nameserver domains 路由——命中域名的 server 优先。
+    #[test]
+    fn build_domains_rule_routes_matching_domain_first() {
+        let json = r#"{
+            "servers": [
+                {"address": "8.8.8.8", "tag": "fallback"},
+                {"address": "1.1.1.1", "tag": "cn", "domains": ["domain:cn.test"]}
+            ]
+        }"#;
+        let cfg: DnsAppConfig = serde_json::from_str(json).unwrap();
+        let svc = crate::server::DnsService::new(cfg.build().unwrap());
+
+        // 命中 domain:cn.test → cn client 优先。
+        let sorted = svc.sort_clients("www.cn.test");
+        assert_eq!(sorted.len(), 2);
+        assert_eq!(sorted[0].tag, "cn");
+
+        // 未命中 → 按配置顺序 fallback。
+        let sorted = svc.sort_clients("example.com");
+        assert_eq!(sorted[0].tag, "fallback");
+    }
+
+    /// kvl：localhost server 自动附加本地域规则（Go localTLDsAndDotlessDomainsRules）。
+    #[test]
+    fn build_localhost_server_prioritizes_local_domains() {
+        let json = r#"{
+            "servers": [
+                {"address": "8.8.8.8", "tag": "remote"},
+                {"address": "localhost", "tag": "local"}
+            ]
+        }"#;
+        let cfg: DnsAppConfig = serde_json::from_str(json).unwrap();
+        let svc = crate::server::DnsService::new(cfg.build().unwrap());
+
+        // 无点域名（^[^.]+$）与 *.lan 命中 local client。
+        let sorted = svc.sort_clients("myhost");
+        assert_eq!(sorted[0].tag, "local");
+        let sorted = svc.sort_clients("printer.lan");
+        assert_eq!(sorted[0].tag, "local");
+        // 普通域名不命中。
+        let sorted = svc.sort_clients("example.com");
+        assert_eq!(sorted[0].tag, "remote");
     }
 }

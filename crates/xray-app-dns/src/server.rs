@@ -64,6 +64,10 @@ pub struct DnsServiceConfig {
     pub serve_expired_ttl: u32,
     /// 使用系统 hosts 文件。对应 Go `useSystemHosts`。
     pub use_system_hosts: bool,
+    /// 聚合域名匹配器（per-nameserver domains 路由）。对应 Go `DNS.domainMatcher`。
+    pub domain_matcher: Option<Box<dyn xray_geodata::matcher::domain::DomainMatcher>>,
+    /// 匹配信息（rule_id → client 索引）。对应 Go `DNS.matcherInfos`。
+    pub matcher_infos: Vec<DomainMatcherInfo>,
 }
 
 /// 顶层 DNS 服务。对应 Go `DNS` struct。
@@ -74,17 +78,19 @@ pub struct DnsService {
     /// 仅为 `sort_clients` 用，等 xray-geodata 暴露 `build_many` API 后接入。
     matcher: Mutex<Option<Box<dyn xray_geodata::matcher::domain::DomainMatcher>>>,
     /// 域名匹配信息列表（matcher rule_id → DomainMatcherInfo）。
-    matcher_infos: Vec<DomainMatcherInfo>,
+    matcher_infos: Mutex<Vec<DomainMatcherInfo>>,
 }
 
 impl DnsService {
     /// 构造服务。对应 Go `New(ctx, config)`（ctx 未使用故省略）。
     #[must_use]
-    pub fn new(cfg: DnsServiceConfig) -> Self {
+    pub fn new(mut cfg: DnsServiceConfig) -> Self {
+        let domain_matcher = cfg.domain_matcher.take();
+        let matcher_infos = std::mem::take(&mut cfg.matcher_infos);
         Self {
             cfg,
-            matcher: Mutex::new(None),
-            matcher_infos: Vec::new(),
+            matcher: Mutex::new(domain_matcher),
+            matcher_infos: Mutex::new(matcher_infos),
         }
     }
 
@@ -97,13 +103,8 @@ impl DnsService {
         matcher: Box<dyn xray_geodata::matcher::domain::DomainMatcher>,
         infos: Vec<DomainMatcherInfo>,
     ) {
-        let mut guard = self.matcher.lock();
-        *guard = Some(matcher);
-        // matcher_infos 是结构体字段，但 set_matcher 用 &self，需要内部可变性。
-        // ponytail: 改用 Mutex 包装 matcher_infos。
-        // 此处省略：实际实现需要 `matcher_infos: Mutex<Vec<...>>`。
-        // 当前简化：调用方在 new() 时一次性传入 infos。
-        let _ = infos; // TODO: 改为 Mutex<Vec> 后再赋值。
+        *self.matcher.lock() = Some(matcher);
+        *self.matcher_infos.lock() = infos;
     }
 
     /// 客户端数量。
@@ -130,15 +131,16 @@ impl DnsService {
 
         // 优先：matcher 命中。
         let matcher_opt = self.matcher.lock();
+        let infos = self.matcher_infos.lock();
         if let Some(matcher) = matcher_opt.as_ref() {
             let mut matches = matcher.match_domain(&domain.to_lowercase());
             matches.sort_unstable();
             for rule_id in matches {
                 let id = rule_id as usize;
-                if id >= self.matcher_infos.len() {
+                if id >= infos.len() {
                     continue;
                 }
-                let info = &self.matcher_infos[id];
+                let info = &infos[id];
                 let idx = usize::from(info.client_idx);
                 if idx >= self.cfg.clients.len() || used[idx] {
                     continue;
@@ -152,6 +154,7 @@ impl DnsService {
             }
         }
         drop(matcher_opt);
+        drop(infos);
 
         // Fallback：按顺序遍历。
         if !(self.cfg.disable_fallback || (self.cfg.disable_fallback_if_match && has_match)) {
@@ -408,6 +411,8 @@ mod tests {
             serve_stale: false,
             serve_expired_ttl: 0,
             use_system_hosts: false,
+            domain_matcher: None,
+            matcher_infos: Vec::new(),
         })
     }
 
@@ -427,6 +432,95 @@ mod tests {
         let svc = make_service(vec![c1, c2], Vec::new());
         let sorted = svc.sort_clients("example.com");
         assert_eq!(sorted.len(), 1); // 仅 a
+    }
+
+    /// 6r0：expectedIPs 过滤——仅保留匹配 IP；全不匹配 → ErrEmptyResponse。
+    #[tokio::test]
+    async fn client_query_ip_filters_by_expected_ips() {
+        use xray_geodata::pb::Cidr;
+        let ns = NameServerConfig {
+            tag: "exp".to_string(),
+            expected_ip_rules: vec![xray_geodata::pb::IpRule {
+                value: Some(xray_geodata::pb::ip_rule::Value::Custom(
+                    xray_geodata::pb::CidrRule {
+                        cidr: Some(Cidr {
+                            ip: vec![10, 0, 0, 0],
+                            prefix: 8,
+                        }),
+                        reverse_match: false,
+                    },
+                )),
+            }],
+            ..Default::default()
+        };
+        let server: Box<dyn Server> = Box::new(StaticServer {
+            name: "exp".to_string(),
+            ips: vec![
+                IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+                IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1)),
+            ],
+        });
+        let client = Client::new(ns, IpOption::all(), server).unwrap();
+
+        let (ips, _) = client.query_ip("x.com").await.unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))]);
+
+        // 返回 IP 全部不在期望范围 → ErrEmptyResponse。
+        let server2: Box<dyn Server> = Box::new(StaticServer {
+            name: "exp".to_string(),
+            ips: vec![IpAddr::V4(std::net::Ipv4Addr::new(172, 16, 0, 1))],
+        });
+        let client2 = Client::new(
+            NameServerConfig {
+                tag: "exp2".to_string(),
+                expected_ip_rules: vec![xray_geodata::pb::IpRule {
+                    value: Some(xray_geodata::pb::ip_rule::Value::Custom(
+                        xray_geodata::pb::CidrRule {
+                            cidr: Some(Cidr {
+                                ip: vec![10, 0, 0, 0],
+                                prefix: 8,
+                            }),
+                            reverse_match: false,
+                        },
+                    )),
+                }],
+                ..Default::default()
+            },
+            IpOption::all(),
+            server2,
+        )
+        .unwrap();
+        assert!(matches!(
+            client2.query_ip("x.com").await,
+            Err(DnsError::EmptyResponse)
+        ));
+    }
+
+    /// kvl：set_matcher 注入的 matcher + infos 必须都被 sort_clients 使用。
+    #[test]
+    fn set_matcher_binds_matcher_and_infos() {
+        use xray_geodata::matcher::domain::{DomainRule as MR, DomainType, MphDomainMatcher};
+
+        let c1 = make_client("a", false, false);
+        let c2 = make_client("b", false, false);
+        let svc = make_service(vec![c2, c1], Vec::new());
+
+        let matcher = Box::new(
+            MphDomainMatcher::build(&[MR::new(DomainType::Domain, "priority.test", 0)]).unwrap(),
+        );
+        svc.set_matcher(
+            matcher,
+            vec![DomainMatcherInfo {
+                client_idx: 1, // → client "a"（配置顺序第二个）
+                domain_rule: "domain:priority.test".to_string(),
+            }],
+        );
+
+        let sorted = svc.sort_clients("www.priority.test");
+        assert_eq!(sorted.len(), 2);
+        assert_eq!(sorted[0].tag, "a", "matcher+infos 注入后命中 client a");
+        // 未命中域名按 fallback 顺序。
+        assert_eq!(svc.sort_clients("other.com")[0].tag, "b");
     }
 
     #[test]
