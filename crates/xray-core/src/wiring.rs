@@ -117,6 +117,25 @@ impl DispatchRouter for RouterAdapter {
             Err(_) => None,
         }
     }
+
+    /// 带 DNS 解析的选路：委托 [`Router::pick_route_resolved`]（domainStrategy 分支）。
+    fn pick_outbound_tag_resolved<'a>(
+        &'a self,
+        dest: &'a Destination,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut data = dest_to_routing_data(dest);
+            match self.router.pick_route_resolved(&mut data).await {
+                Ok(route) => Some(route.outbound_tag),
+                Err(_) => None,
+            }
+        })
+    }
+
+    /// 注入 DNS 解析能力（domainStrategy IpOnDemand/IpIfNonMatch 用）。
+    fn set_dns_client(&self, dns: std::sync::Arc<dyn xray_features::dns::DnsClient>) {
+        self.router.set_dns_client(dns);
+    }
 }
 
 /// 从 `Destination` 构造 router 端 `RoutingData`（仅目标地址/端口/网络）。
@@ -641,5 +660,94 @@ mod tests {
             Network::TCP,
         );
         assert!(adapter.pick_outbound_tag(&tcp_dest).is_none());
+    }
+
+    // ---- domainStrategy DNS 解析路由（u2i）----
+
+    /// 计数 mock：固定返回 1.2.3.4。
+    struct CountingDns {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingDns {
+        fn new() -> Self {
+            Self { calls: std::sync::atomic::AtomicUsize::new(0) }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl xray_features::dns::DnsClient for CountingDns {
+        async fn lookup(
+            &self,
+            _domain: &str,
+        ) -> Result<Vec<Address>, xray_features::dns::DnsError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(vec![Address::IPv4("1.2.3.4".parse().expect("ip"))])
+        }
+
+        async fn lookup_ipv4(
+            &self,
+            domain: &str,
+        ) -> Result<Vec<Address>, xray_features::dns::DnsError> {
+            self.lookup(domain).await
+        }
+
+        async fn lookup_ipv6(
+            &self,
+            _domain: &str,
+        ) -> Result<Vec<Address>, xray_features::dns::DnsError> {
+            Ok(vec![])
+        }
+    }
+
+    fn resolved_dest() -> Destination {
+        use xray_common::net::network::Network;
+        Destination::new(Address::Domain("example.com".into()), Port::new(443), Network::TCP)
+    }
+
+    #[tokio::test]
+    async fn resolved_ip_on_demand_hits_ip_rule() {
+        let json = br#"{"domainStrategy":"IPOnDemand","rules":[{"outboundTag":"blocked","ip":["1.2.3.0/24"]}]}"#;
+        let adapter = build_router_adapter_from_json(json).expect("build adapter");
+        let dns = std::sync::Arc::new(CountingDns::new());
+        adapter.set_dns_client(dns.clone());
+        let tag = adapter.pick_outbound_tag_resolved(&resolved_dest()).await;
+        assert_eq!(tag.as_deref(), Some("blocked"));
+        assert_eq!(dns.calls(), 1, "IpOnDemand should resolve before matching");
+    }
+
+    #[tokio::test]
+    async fn resolved_ip_if_non_match_resolves_after_miss() {
+        let json = br#"{"domainStrategy":"IPIfNonMatch","rules":[{"outboundTag":"blocked","ip":["1.2.3.0/24"]}]}"#;
+        let adapter = build_router_adapter_from_json(json).expect("build adapter");
+        let dns = std::sync::Arc::new(CountingDns::new());
+        adapter.set_dns_client(dns.clone());
+        let tag = adapter.pick_outbound_tag_resolved(&resolved_dest()).await;
+        assert_eq!(tag.as_deref(), Some("blocked"));
+        assert_eq!(dns.calls(), 1, "IpIfNonMatch should resolve after first-round miss");
+    }
+
+    #[tokio::test]
+    async fn resolved_asis_skips_dns() {
+        let json = br#"{"domainStrategy":"AsIs","rules":[{"outboundTag":"blocked","ip":["1.2.3.0/24"]}]}"#;
+        let adapter = build_router_adapter_from_json(json).expect("build adapter");
+        let dns = std::sync::Arc::new(CountingDns::new());
+        adapter.set_dns_client(dns.clone());
+        let tag = adapter.pick_outbound_tag_resolved(&resolved_dest()).await;
+        assert!(tag.is_none(), "AsIs should not match by resolved IP");
+        assert_eq!(dns.calls(), 0, "AsIs must not query DNS");
+    }
+
+    #[tokio::test]
+    async fn resolved_without_dns_client_falls_back_to_domain_only() {
+        let json = br#"{"domainStrategy":"IPOnDemand","rules":[{"outboundTag":"blocked","ip":["1.2.3.0/24"]}]}"#;
+        let adapter = build_router_adapter_from_json(json).expect("build adapter");
+        // 未注入 DNS：IpOnDemand 退化为按域名匹配，IP 规则不命中
+        let tag = adapter.pick_outbound_tag_resolved(&resolved_dest()).await;
+        assert!(tag.is_none());
     }
 }

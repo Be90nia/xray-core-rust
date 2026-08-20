@@ -9,6 +9,7 @@ rust-version.workspace = true
 xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
 xray-geodata = { path = "../xray-geodata" }
+async-trait = "0.1"
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

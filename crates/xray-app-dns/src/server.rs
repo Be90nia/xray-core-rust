@@ -252,6 +252,75 @@ impl Feature for DnsService {
     }
 }
 
+/// Go：`*DNS` 实现 `dns.Client` 接口（`LookupIP`）。路由 domainStrategy 经此解析。
+#[async_trait::async_trait]
+impl xray_features::dns::DnsClient for DnsService {
+    async fn lookup(
+        &self,
+        domain: &str,
+    ) -> Result<Vec<xray_common::net::address::Address>, xray_features::dns::DnsError> {
+        let (ips, _) = self
+            .lookup_ip(domain, IpOption::all())
+            .await
+            .map_err(|e| xray_features::dns::DnsError::Other(e.to_string()))?;
+        Ok(ips
+            .into_iter()
+            .map(|ip| match ip {
+                IpAddr::V4(v) => xray_common::net::address::Address::IPv4(v),
+                IpAddr::V6(v) => xray_common::net::address::Address::IPv6(v),
+            })
+            .collect())
+    }
+
+    async fn lookup_ipv4(
+        &self,
+        domain: &str,
+    ) -> Result<Vec<xray_common::net::address::Address>, xray_features::dns::DnsError> {
+        let (ips, _) = self
+            .lookup_ip(
+                domain,
+                IpOption {
+                    ipv4_enable: true,
+                    ipv6_enable: false,
+                    fake_enable: false,
+                },
+            )
+            .await
+            .map_err(|e| xray_features::dns::DnsError::Other(e.to_string()))?;
+        Ok(ips
+            .into_iter()
+            .map(|ip| match ip {
+                IpAddr::V4(v) => xray_common::net::address::Address::IPv4(v),
+                IpAddr::V6(v) => xray_common::net::address::Address::IPv6(v),
+            })
+            .collect())
+    }
+
+    async fn lookup_ipv6(
+        &self,
+        domain: &str,
+    ) -> Result<Vec<xray_common::net::address::Address>, xray_features::dns::DnsError> {
+        let (ips, _) = self
+            .lookup_ip(
+                domain,
+                IpOption {
+                    ipv4_enable: false,
+                    ipv6_enable: true,
+                    fake_enable: false,
+                },
+            )
+            .await
+            .map_err(|e| xray_features::dns::DnsError::Other(e.to_string()))?;
+        Ok(ips
+            .into_iter()
+            .map(|ip| match ip {
+                IpAddr::V4(v) => xray_common::net::address::Address::IPv4(v),
+                IpAddr::V6(v) => xray_common::net::address::Address::IPv6(v),
+            })
+            .collect())
+    }
+}
+
 // ── Nameserver 查询编排 ──────────────────────────────────────────
 
 /// 串行查询：按优先级顺序遍历 clients，返回第一个成功结果。

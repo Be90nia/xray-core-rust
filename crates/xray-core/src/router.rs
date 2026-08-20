@@ -20,6 +20,22 @@ use xray_transport::link::Link;
 /// 路由查询 trait：给定目标，返回 outbound tag（None = 用 default）。
 pub trait DispatchRouter: Send + Sync {
     fn pick_outbound_tag(&self, dest: &Destination) -> Option<String>;
+
+    /// 带 DNS 解析的选路（routing domainStrategy）。
+    ///
+    /// 默认退化为同步 [`DispatchRouter::pick_outbound_tag`]（无 DNS 能力的 router
+    /// 或 AsIs 策略等价）。
+    fn pick_outbound_tag_resolved<'a>(
+        &'a self,
+        dest: &'a Destination,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>> {
+        Box::pin(async move { self.pick_outbound_tag(dest) })
+    }
+
+    /// 注入 DNS 解析能力（domainStrategy IpOnDemand/IpIfNonMatch 用）。
+    ///
+    /// 默认 no-op——无 DNS 能力的实现（TagRouter/PatternRouter）保持 AsIs 行为。
+    fn set_dns_client(&self, _dns: Arc<dyn xray_features::dns::DnsClient>) {}
 }
 
 /// 带路由的 DispatchHandler：包装在 default handler 外层。
@@ -49,7 +65,6 @@ impl std::fmt::Debug for RoutingHandler {
 
 impl DispatchHandler for RoutingHandler {
     fn tag(&self) -> &str { &self.tag }
-
     fn dispatch(
         &self,
         dest: &Destination,
@@ -60,7 +75,7 @@ impl DispatchHandler for RoutingHandler {
         let router = Arc::clone(&self.router);
         let dest_clone = clone_destination(dest);
         Box::pin(async move {
-            let tag_opt = router.pick_outbound_tag(&dest_clone);
+            let tag_opt = router.pick_outbound_tag_resolved(&dest_clone).await;
             let handler = match &tag_opt {
                 Some(tag) => ohm.get_handler(tag).unwrap_or_else(|| inner.clone()),
                 None => inner.clone(),

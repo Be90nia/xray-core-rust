@@ -150,6 +150,12 @@ pub async fn start_full_with_router(
     register_all_features();
     register_all_transports();
     let mut instance = Instance::new_from_built(built)?;
+
+    // DNS 注入（对应 Go 装配链：instance 创建后 router.dns = core.GetFeature(dns)）：
+    // routing domainStrategy（IpOnDemand/IpIfNonMatch）解析经 DnsClient 查询。
+    if let Some(dns) = instance.get_feature::<xray_app_dns::DnsService>() {
+        router.set_dns_client(Arc::clone(&dns) as Arc<dyn xray_features::dns::DnsClient>);
+    }
     let ohm = Arc::new(SimpleOhm::new());
     register_outbounds(built, &ohm, None)?;
 

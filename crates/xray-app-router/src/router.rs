@@ -44,6 +44,8 @@ pub struct Router {
     balancers: RwLock<HashMap<String, Arc<Balancer>>>,
     ohm: Arc<dyn OutboundHandlerSelector>,
     geo_loader: Option<Arc<GeoDataLoader>>,
+    /// DNS 解析能力（domainStrategy IpOnDemand/IpIfNonMatch 用）。
+    dns: RwLock<Option<Arc<dyn xray_features::dns::DnsClient>>>,
 }
 
 impl Router {
@@ -81,6 +83,7 @@ impl Router {
             balancers: RwLock::new(balancers),
             ohm,
             geo_loader,
+            dns: RwLock::new(None),
         }))
     }
 
@@ -93,7 +96,13 @@ impl Router {
             balancers: RwLock::new(HashMap::new()),
             ohm,
             geo_loader: None,
+            dns: RwLock::new(None),
         })
+    }
+
+    /// 注入 DNS 解析能力（对应 Go `r.dns`，由 core 装配时设置）。
+    pub fn set_dns_client(&self, dns: Arc<dyn xray_features::dns::DnsClient>) {
+        *self.dns.write() = Some(dns);
     }
 
     /// 返回域名策略。
@@ -124,6 +133,65 @@ impl Router {
             }
         }
         Err(RouterError::NoClue)
+    }
+    /// 带 DNS 解析的路由匹配。对应 Go `pickRouteInternal` 的 domainStrategy 分支。
+    ///
+    /// - `IpOnDemand`：匹配前先解析域名注入 target_ips（Go 用 ResolvableContext 懒解析，
+    ///   此处 eager——结果等价，多解析由 DnsService 缓存兜住）。
+    /// - `IpIfNonMatch`：第一轮全不中且目标为域名时，解析后重跑一轮。
+    /// - `AsIs` / 无 dns / skip_dns_resolve：退化为 [`Router::pick_route`]。
+    pub async fn pick_route_resolved(
+        &self,
+        ctx: &mut crate::context::RoutingData,
+    ) -> Result<Route, RouterError> {
+        let can_resolve = !ctx.get_skip_dns_resolve()
+            && self.domain_strategy != DomainStrategy::AsIs
+            && !ctx.get_target_domain().is_empty()
+            && ctx.get_target_ips().is_empty();
+        match self.domain_strategy {
+            DomainStrategy::IpOnDemand if can_resolve => {
+                self.resolve_into(ctx).await;
+                self.pick_route(ctx)
+            }
+            DomainStrategy::IpIfNonMatch => {
+                if let Ok(r) = self.pick_route(ctx) {
+                    return Ok(r);
+                }
+                if can_resolve {
+                    self.resolve_into(ctx).await;
+                    return self.pick_route(ctx);
+                }
+                Err(RouterError::NoClue)
+            }
+            _ => self.pick_route(ctx),
+        }
+    }
+
+    /// 解析 ctx.target_domain 注入 target_ips（失败保持原状，规则照域名匹配）。
+    async fn resolve_into(&self, ctx: &mut crate::context::RoutingData) {
+        use xray_common::net::address::Address;
+        let Some(dns) = self.dns.read().clone() else {
+            return;
+        };
+        // Go ResolvableContext：IPOption{IPv4+IPv6, FakeDisable}
+        match dns.lookup(ctx.get_target_domain()).await {
+            Ok(addrs) => {
+                let ips: Vec<_> = addrs
+                    .into_iter()
+                    .filter_map(|a| match a {
+                        Address::IPv4(v) => Some(std::net::IpAddr::V4(v)),
+                        Address::IPv6(v) => Some(std::net::IpAddr::V6(v)),
+                        Address::Domain(_) => None,
+                    })
+                    .collect();
+                if !ips.is_empty() {
+                    ctx.target_ips = ips;
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "router dns resolve failed, rules match by domain only");
+            }
+        }
     }
 
     /// 增加一条规则（运行时）。

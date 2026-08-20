@@ -82,6 +82,7 @@ path = "src/bin/xray.rs"
 uuid = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 serde_json = { workspace = true }
+async-trait = { workspace = true }
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 # TUN 设备代理——仅 Linux/Android/FreeBSD 自动编译
 # macOS/Windows 不编译（需 wintun.dll/utun 权限，用户可手动加回）
