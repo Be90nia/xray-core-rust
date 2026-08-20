@@ -100,11 +100,9 @@ where
             if mb.is_empty() {
                 break;
             }
-            let data = mb.to_vec();
-            if data.is_empty() {
+            if write_all_mb(&mut s_write, &mb).await.is_err() {
                 break;
             }
-            s_write.write_all(&data).await?;
         }
         let _ = s_write.shutdown().await;
         io::Result::Ok(())
@@ -112,9 +110,17 @@ where
 
     // 下行：stream → link.writer
     let down = async move {
-        let mut buf = vec![0u8; 8192];
+        // 池化读缓冲（xray-buf 分层池，对应 Go sync.Pool）；resize 置满长度供 read 覆写
+        let mut buf = xray_buf::alloc::alloc(xray_buf::alloc::DEFAULT_SIZE);
+        buf.resize(xray_buf::alloc::DEFAULT_SIZE, 0);
         loop {
-            let n = s_read.read(&mut buf).await?;
+            let n = match s_read.read(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    xray_buf::alloc::release(buf);
+                    return Err(e);
+                }
+            };
             if n == 0 {
                 break;
             }
@@ -124,6 +130,7 @@ where
                 break;
             }
         }
+        xray_buf::alloc::release(buf);
         // bridge 结束前通知读端 EOF（pipe.Writer.close）
         writer.shutdown();
         io::Result::Ok(())
@@ -134,6 +141,23 @@ where
         res = &mut down => res,
     };
     result
+}
+
+/// 逐 Buffer 写出 MultiBuffer（零拷贝，Buffer Drop 自动回池）。
+///
+/// 替代 `mb.to_vec()` 的整段拷贝分配。
+async fn write_all_mb<W>(w: &mut W, mb: &xray_buf::multi::MultiBuffer) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    for b in mb.iter() {
+        let bytes = b.bytes();
+        if !bytes.is_empty() {
+            w.write_all(bytes).await?;
+        }
+    }
+    Ok(())
 }
 
 /// 双向桥接 dispatcher [`Link`] 与 AsyncRead+AsyncWrite stream（`join!` 语义）。
@@ -181,11 +205,7 @@ where
             };
             match mb {
                 Ok(mb) if !mb.is_empty() => {
-                    let data = mb.to_vec();
-                    if data.is_empty() {
-                        break;
-                    }
-                    if s_write.write_all(&data).await.is_err() {
+                    if write_all_mb(&mut s_write, &mb).await.is_err() {
                         break;
                     }
                 }
@@ -200,7 +220,9 @@ where
     let down = async move {
         let mut up_done = up_done_rx;
         let mut window: Option<std::time::Duration> = None;
-        let mut buf = vec![0u8; 8192];
+        // 池化读缓冲（xray-buf 分层池，对应 Go sync.Pool）；resize 置满长度供 read 覆写
+        let mut buf = xray_buf::alloc::alloc(xray_buf::alloc::DEFAULT_SIZE);
+        buf.resize(xray_buf::alloc::DEFAULT_SIZE, 0);
         loop {
             let n = match window {
                 None => tokio::select! {
@@ -228,6 +250,7 @@ where
                 break;
             }
         }
+        xray_buf::alloc::release(buf);
         writer.shutdown();
         let _ = down_done_tx.send(Some(DEFAULT_DOWNLINK_ONLY_TIMEOUT));
         io::Result::Ok(())

@@ -388,7 +388,8 @@ async fn handle_plain_http(
         let mut mb = MultiBuffer::new();
         mb.merge_bytes(&request_head);
         let _ = up_w.write_multi_buffer(mb).await;
-        let mut buf = vec![0u8; 8192];
+        let mut buf = xray_buf::alloc::alloc(xray_buf::alloc::DEFAULT_SIZE);
+        buf.resize(xray_buf::alloc::DEFAULT_SIZE, 0);
         loop {
             match client_read.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
@@ -401,6 +402,7 @@ async fn handle_plain_http(
                 }
             }
         }
+        xray_buf::alloc::release(buf);
         up_w.shutdown(); // EOF → dispatch bridge 关闭目标写半部
     };
 
