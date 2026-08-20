@@ -570,7 +570,10 @@ impl DefaultDispatcher {
             .policy_manager
             .as_ref()
             .map_or(self.default_policy.clone(), |pm| pm.policy_for_level(0));
+        // pipe 选项对应 Go transport/pipe.OptionsFromContext：
+        // buffer.PerConnection → WithSizeLimit（512KiB 背压上限）。
         let pipe_opt = xray_buf::pipe::PipeOption {
+            limit: policy.buffer.connection as i64,
             idle_timeout: Some(policy.timeout.connection_idle),
             ..xray_buf::pipe::PipeOption::default()
         };

@@ -13,16 +13,27 @@ pub const FEATURE_POLICY: &str = "policy";
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default connection idle timeout (5 minutes).
+///
+/// 对应 Go `features/policy.SessionDefault().Timeouts.ConnectionIdle`（300s）。
 pub const DEFAULT_CONN_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Default uplink-only timeout (2 minutes).
-pub const DEFAULT_UPLINK_ONLY_TIMEOUT: Duration = Duration::from_secs(120);
+/// Default uplink-only timeout (1 second).
+///
+/// 对应 Go `SessionDefault().Timeouts.UplinkOnly`（1s）：上行结束后下行方向的
+/// 剩余存活窗口。
+pub const DEFAULT_UPLINK_ONLY_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Default downlink-only timeout (2 minutes).
-pub const DEFAULT_DOWNLINK_ONLY_TIMEOUT: Duration = Duration::from_secs(120);
+/// Default downlink-only timeout (1 second).
+///
+/// 对应 Go `SessionDefault().Timeouts.DownlinkOnly`（1s）：下行结束后上行方向的
+/// 剩余存活窗口。
+pub const DEFAULT_DOWNLINK_ONLY_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Default buffer connection size.
-pub const DEFAULT_BUFFER_CONNECTION: usize = 1024;
+/// Default per-connection pipe buffer limit (512 KiB).
+///
+/// 对应 Go `defaultBufferSize`（512*1024，`XRAY_BUFSIZE` env 可调——此处不读 env，
+/// 需要时在装配层读后覆盖 policy）。
+pub const DEFAULT_BUFFER_CONNECTION: usize = 512 * 1024;
 
 /// Default buffer write size.
 pub const DEFAULT_BUFFER_WRITE: usize = 1024;
@@ -194,8 +205,8 @@ mod tests {
         let timeout = TimeoutPolicy::default();
         assert_eq!(timeout.handshake, Duration::from_secs(5));
         assert_eq!(timeout.connection_idle, Duration::from_secs(300));
-        assert_eq!(timeout.uplink_only, Duration::from_secs(120));
-        assert_eq!(timeout.downlink_only, Duration::from_secs(120));
+        assert_eq!(timeout.uplink_only, Duration::from_secs(1));
+        assert_eq!(timeout.downlink_only, Duration::from_secs(1));
     }
 
     #[test]

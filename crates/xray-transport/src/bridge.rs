@@ -147,33 +147,78 @@ where
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use xray_buf::io::{Reader, Writer};
     use xray_buf::multi::MultiBuffer;
+    use xray_features::policy::{DEFAULT_DOWNLINK_ONLY_TIMEOUT, DEFAULT_UPLINK_ONLY_TIMEOUT};
 
     let Link { mut reader, mut writer } = link;
     let (mut s_read, mut s_write) = tokio::io::split(stream);
 
+    // 半关闭限窗（对应 Go policy Timeout.UplinkOnly/DownlinkOnly，proxy 层
+    // `defer timer.SetTimeout(...)` 语义）：一方向结束后，另一方向在窗口内
+    // 无新数据则断开，防止单方向停滞连接永久挂起。窗口按 activity 重置
+    // （读到新数据即续窗），与 Go CancelAfterInactivity + UpdateActivity 一致。
+    // up 结束 → down 剩余窗口 = uplink_only；down 结束 → up 剩余窗口 = downlink_only。
+    let (up_done_tx, up_done_rx) = tokio::sync::watch::channel(None::<std::time::Duration>);
+    let (down_done_tx, down_done_rx) = tokio::sync::watch::channel(None::<std::time::Duration>);
+
     let up = async move {
+        let mut down_done = down_done_rx;
+        let mut window: Option<std::time::Duration> = None;
         loop {
-            let mb = match reader.read_multi_buffer().await {
-                Ok(mb) => mb,
-                Err(_) => break,
+            // 读 future 每轮重建是 cancel-safe 的：select!/timeout 丢弃的 future
+            // 只可能处于 Pending（poll 到 Ready 的分支必被采用），无数据丢失。
+            let mb = match window {
+                None => tokio::select! {
+                    r = reader.read_multi_buffer() => r,
+                    _ = down_done.changed() => {
+                        window = *down_done.borrow();
+                        continue;
+                    }
+                },
+                Some(d) => match tokio::time::timeout(d, reader.read_multi_buffer()).await {
+                    Ok(r) => r,
+                    Err(_) => break, // downlink_only 窗口内无数据
+                },
             };
-            if mb.is_empty() {
-                break;
+            match mb {
+                Ok(mb) if !mb.is_empty() => {
+                    let data = mb.to_vec();
+                    if data.is_empty() {
+                        break;
+                    }
+                    if s_write.write_all(&data).await.is_err() {
+                        break;
+                    }
+                }
+                _ => break,
             }
-            let data = mb.to_vec();
-            if data.is_empty() {
-                break;
-            }
-            s_write.write_all(&data).await?;
         }
         let _ = s_write.shutdown().await;
+        let _ = up_done_tx.send(Some(DEFAULT_UPLINK_ONLY_TIMEOUT));
         io::Result::Ok(())
     };
 
     let down = async move {
+        let mut up_done = up_done_rx;
+        let mut window: Option<std::time::Duration> = None;
         let mut buf = vec![0u8; 8192];
         loop {
-            let n = s_read.read(&mut buf).await?;
+            let n = match window {
+                None => tokio::select! {
+                    n = s_read.read(&mut buf) => n,
+                    _ = up_done.changed() => {
+                        window = *up_done.borrow();
+                        continue;
+                    }
+                },
+                Some(d) => match tokio::time::timeout(d, s_read.read(&mut buf)).await {
+                    Ok(n) => n,
+                    Err(_) => break, // uplink_only 窗口内无数据
+                },
+            };
+            let n = match n {
+                Ok(n) => n,
+                Err(_) => break,
+            };
             if n == 0 {
                 break;
             }
@@ -184,6 +229,7 @@ where
             }
         }
         writer.shutdown();
+        let _ = down_done_tx.send(Some(DEFAULT_DOWNLINK_ONLY_TIMEOUT));
         io::Result::Ok(())
     };
 
@@ -200,44 +246,76 @@ where
 /// 用于代理链场景：原始 link ↔ client link ↔ chained handler。
 pub async fn bridge_link_with_link(link_a: Link, link_b: Link) -> io::Result<()> {
     use xray_buf::io::{Reader, Writer};
-    use xray_buf::multi::MultiBuffer;
+    use xray_features::policy::{DEFAULT_DOWNLINK_ONLY_TIMEOUT, DEFAULT_UPLINK_ONLY_TIMEOUT};
 
     let Link { reader: mut a_reader, writer: mut a_writer } = link_a;
     let Link { reader: mut b_reader, writer: mut b_writer } = link_b;
 
+    // 半关闭限窗语义同 bridge_link_with_stream_full（Go UplinkOnly/DownlinkOnly）。
+    let (up_done_tx, up_done_rx) = tokio::sync::watch::channel(None::<std::time::Duration>);
+    let (down_done_tx, down_done_rx) = tokio::sync::watch::channel(None::<std::time::Duration>);
+
     // 上行：a → b
     let up = async move {
+        let mut down_done = down_done_rx;
+        let mut window: Option<std::time::Duration> = None;
         loop {
-            let mb = match a_reader.read_multi_buffer().await {
-                Ok(mb) => mb,
-                Err(_) => break,
+            let mb = match window {
+                None => tokio::select! {
+                    r = a_reader.read_multi_buffer() => r,
+                    _ = down_done.changed() => {
+                        window = *down_done.borrow();
+                        continue;
+                    }
+                },
+                Some(d) => match tokio::time::timeout(d, a_reader.read_multi_buffer()).await {
+                    Ok(r) => r,
+                    Err(_) => break,
+                },
             };
-            if mb.is_empty() {
-                break;
-            }
-            if b_writer.write_multi_buffer(mb).await.is_err() {
-                break;
+            match mb {
+                Ok(mb) if !mb.is_empty() => {
+                    if b_writer.write_multi_buffer(mb).await.is_err() {
+                        break;
+                    }
+                }
+                _ => break,
             }
         }
         b_writer.shutdown();
+        let _ = up_done_tx.send(Some(DEFAULT_UPLINK_ONLY_TIMEOUT));
         io::Result::Ok(())
     };
 
     // 下行：b → a
     let down = async move {
+        let mut up_done = up_done_rx;
+        let mut window: Option<std::time::Duration> = None;
         loop {
-            let mb = match b_reader.read_multi_buffer().await {
-                Ok(mb) => mb,
-                Err(_) => break,
+            let mb = match window {
+                None => tokio::select! {
+                    r = b_reader.read_multi_buffer() => r,
+                    _ = up_done.changed() => {
+                        window = *up_done.borrow();
+                        continue;
+                    }
+                },
+                Some(d) => match tokio::time::timeout(d, b_reader.read_multi_buffer()).await {
+                    Ok(r) => r,
+                    Err(_) => break,
+                },
             };
-            if mb.is_empty() {
-                break;
-            }
-            if a_writer.write_multi_buffer(mb).await.is_err() {
-                break;
+            match mb {
+                Ok(mb) if !mb.is_empty() => {
+                    if a_writer.write_multi_buffer(mb).await.is_err() {
+                        break;
+                    }
+                }
+                _ => break,
             }
         }
         a_writer.shutdown();
+        let _ = down_done_tx.send(Some(DEFAULT_DOWNLINK_ONLY_TIMEOUT));
         io::Result::Ok(())
     };
 
@@ -422,6 +500,74 @@ mod tests {
             bridge_link_with_stream(link, client),
         );
         assert_eq!(&recv, b"downlink ok");
+    }
+
+    // ---- 半关闭限窗（policy UplinkOnly/DownlinkOnly，6bg）----
+
+    #[tokio::test]
+    async fn bridge_stream_full_halfclose_linger_then_close() {
+        use crate::link::Link;
+        use xray_buf::io::{Reader, Writer};
+        use xray_buf::multi::MultiBuffer;
+
+        let (up_r, up_w) = xray_buf::pipe::new();
+        let (dn_r, dn_w) = xray_buf::pipe::new();
+        let link = Link::new(Box::new(up_r), Box::new(dn_w));
+        let (mut stream_peer, stream) = tokio::io::duplex(8192);
+
+        let bridge = tokio::spawn(bridge_link_with_stream_full(link, stream));
+
+        // 上游写完即 EOF → bridge down 进入 uplink_only（1s）窗口
+        let mut producer = up_w;
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(b"req");
+        producer.write_multi_buffer(mb).await.unwrap();
+        producer.shutdown();
+
+        // 窗口内 stream 端送来响应 → 下行续传（activity 重置窗口）
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        stream_peer.write_all(b"resp").await.unwrap();
+
+        let mut consumer = dn_r;
+        let mb = consumer
+            .read_multi_buffer_timeout(std::time::Duration::from_secs(1))
+            .await
+            .expect("downlink should deliver within half-close window");
+        assert_eq!(mb.to_vec(), b"resp");
+
+        // 之后无数据 → 窗口耗尽 → bridge 结束（不永久挂起）
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), bridge)
+            .await
+            .expect("bridge must finish after window expires")
+            .expect("join error");
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn bridge_stream_full_halfclose_timeout_disconnects() {
+        use crate::link::Link;
+        use xray_buf::io::Writer;
+
+        let (up_r, up_w) = xray_buf::pipe::new();
+        let (dn_r, dn_w) = xray_buf::pipe::new();
+        let link = Link::new(Box::new(up_r), Box::new(dn_w));
+        // peer 保留不 drop：drop 会让 stream EOF 走正常结束而非超时路径
+        let (_stream_peer, stream) = tokio::io::duplex(8192);
+
+        let start = std::time::Instant::now();
+        // 上游立即 EOF（无数据）→ down 只能靠 uplink_only 窗口超时断开
+        up_w.shutdown();
+        let res = bridge_link_with_stream_full(link, stream).await;
+        assert!(res.is_ok());
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(900),
+            "half-close window should elapse before disconnect"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "should not hang forever"
+        );
+        let _ = dn_r;
     }
 
 }
