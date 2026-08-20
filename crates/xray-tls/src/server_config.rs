@@ -192,11 +192,38 @@ pub fn build_server_config(
     }
 
     let resolver = Arc::new(SniCertResolver::new(entries, reject_unknown));
-    let config = ServerConfig::builder()
+    let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(resolver);
 
+    // alpn：对齐 Go GetTLSConfig——NextProtos 取 tlsSettings.alpn，
+    // 为空时默认 ["h2", "http/1.1"]（WS/httpupgrade 依赖 http/1.1，gRPC 依赖 h2）。
+    config.alpn_protocols = parse_alpn(&json)?;
+
     Ok(Some(Arc::new(config)))
+}
+
+/// 解析 `tlsSettings.alpn` 数组；缺失或非数组时用默认 `["h2", "http/1.1"]`。
+///
+/// 对应 Go `GetTLSConfig`：`config.NextProtos = c.NextProtocol`（JSON `alpn`），
+/// 仍为空则 fallback `[]string{"h2", "http/1.1"}`。与 client_config.rs 行为对称。
+fn parse_alpn(json: &serde_json::Value) -> io::Result<Vec<Vec<u8>>> {
+    if let Some(arr) = json.get("alpn").and_then(|v| v.as_array()) {
+        arr.iter()
+            .map(|s| {
+                s.as_str()
+                    .map(|x| x.as_bytes().to_vec())
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "alpn array must contain only strings",
+                        )
+                    })
+            })
+            .collect()
+    } else {
+        Ok(vec![b"h2".to_vec(), b"http/1.1".to_vec()])
+    }
 }
 
 /// 从 `tlsSettings` JSON 解析全部命名证书。
@@ -299,6 +326,29 @@ mod tests {
     #[test]
     fn empty_security_returns_none() {
         assert!(build_server_config("", None).unwrap().is_none());
+    }
+
+    #[test]
+    fn server_config_defaults_alpn() {
+        let config =
+            build_server_config("tls", Some(&serde_json::json!({}))).unwrap().unwrap();
+        assert_eq!(
+            config.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+    }
+
+    #[test]
+    fn server_config_parses_alpn() {
+        let json = serde_json::json!({ "alpn": ["h2"] });
+        let config = build_server_config("tls", Some(&json)).unwrap().unwrap();
+        assert_eq!(config.alpn_protocols, vec![b"h2".to_vec()]);
+    }
+
+    #[test]
+    fn server_config_alpn_invalid_type_returns_err() {
+        let json = serde_json::json!({ "alpn": ["h2", 123] });
+        assert!(build_server_config("tls", Some(&json)).is_err());
     }
 
     #[test]
