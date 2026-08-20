@@ -192,14 +192,19 @@ fn resolve_config_files(args: &RunArgs) -> Result<Vec<PathBuf>> {
         return Ok(args.config.clone());
     }
 
-    // 2. -confdir
-    if let Some(dir) = &args.confdir {
+    // 2. -confdir 参数；缺省时查 xray.location.confdir env（Go GetConfDirPath）
+    let env_confdir = xray_common::platform::get_confdir_path();
+    let confdir: Option<&Path> = match &args.confdir {
+        Some(d) => Some(d.as_path()),
+        None => env_confdir.as_deref(),
+    };
+    if let Some(dir) = confdir {
         if dir.is_dir() {
             return Ok(scan_confdir(dir));
         }
     }
 
-    // 3. 工作目录默认
+    // 3. 工作目录默认 config.{ext}
     if let Ok(cwd) = std::env::current_dir() {
         for name in DEFAULT_CONFIG_FILES {
             let candidate = cwd.join(name);
@@ -209,7 +214,13 @@ fn resolve_config_files(args: &RunArgs) -> Result<Vec<PathBuf>> {
         }
     }
 
-    // 4. stdin（空回退，实际 stdin 读取留切片2）
+    // 4. Go GetConfigurationPath：xray.location.config（或 exe 目录）下的 config.json
+    let default_config = xray_common::platform::get_configuration_path();
+    if default_config.is_file() {
+        return Ok(vec![default_config]);
+    }
+
+    // 5. stdin（空回退，实际 stdin 读取留切片2）
     Ok(Vec::new())
 }
 

@@ -4,45 +4,72 @@
 
 pub mod env;
 
+use std::sync::LazyLock;
 use std::path::PathBuf;
 
-/// Xray 配置目录环境变量名
-const CONFIG_DIR_ENV: &str = "XRAY_CONFIG_DIR";
+use self::env::EnvFlag;
 
-/// Xray 资源目录环境变量名
-const RESOURCE_DIR_ENV: &str = "XRAY_RESOURCE_DIR";
+/// Go `platform.ConfigLocation`。
+static CONFIG_LOCATION: LazyLock<EnvFlag> =
+    LazyLock::new(|| EnvFlag::new("xray.location.config"));
 
-/// 获取配置目录路径。
-///
-/// 优先检查 `XRAY_CONFIG_DIR` 环境变量，若未设置则回退到平台默认路径：
-/// - Linux/macOS: `/usr/local/share/xray/`
-/// - Windows: `%ProgramFiles%\Xray\`
-pub fn get_configuration_path() -> PathBuf {
-    if let Ok(path) = std::env::var(CONFIG_DIR_ENV) {
-        return PathBuf::from(path);
-    }
+/// Go `platform.ConfdirLocation`。
+static CONFDIR_LOCATION: LazyLock<EnvFlag> =
+    LazyLock::new(|| EnvFlag::new("xray.location.confdir"));
 
-    #[cfg(target_os = "windows")]
-    {
-        std::env::var("ProgramFiles")
-            .map(|pf| PathBuf::from(pf).join("Xray"))
-            .unwrap_or_else(|_| PathBuf::from("C:\\Program Files\\Xray"))
-    }
+/// Go `platform.AssetLocation`。
+static ASSET_LOCATION: LazyLock<EnvFlag> =
+    LazyLock::new(|| EnvFlag::new("xray.location.asset"));
 
-    #[cfg(not(target_os = "windows"))]
-    {
-        PathBuf::from("/usr/local/share/xray/")
-    }
+/// Go `platform.CertLocation`。
+static CERT_LOCATION: LazyLock<EnvFlag> =
+    LazyLock::new(|| EnvFlag::new("xray.location.cert"));
+
+/// Go `getExecutableDir`：可执行文件所在目录，取不到时空串。
+fn executable_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_default()
 }
 
-/// 获取资源目录路径。
+/// 默认配置文件完整路径（Go `GetConfigurationPath`）。
 ///
-/// 优先检查 `XRAY_RESOURCE_DIR` 环境变量，若未设置则回退到配置目录路径。
+/// `xray.location.config`（或 `XRAY_LOCATION_CONFIG`）目录下的 `config.json`，
+/// 未设置时回退可执行文件同目录。
+pub fn get_configuration_path() -> PathBuf {
+    let dir = CONFIG_LOCATION
+        .get_value()
+        .map_or_else(executable_dir, PathBuf::from);
+    dir.join("config.json")
+}
+
+/// conf 目录（Go `GetConfDirPath`）：`xray.location.confdir`，未设置返回 `None`。
+pub fn get_confdir_path() -> Option<PathBuf> {
+    CONFDIR_LOCATION.get_value().map(PathBuf::from)
+}
+
+/// 资源目录（Go `GetAssetLocation` 的目录部分）：`xray.location.asset`
+/// 未设置时回退可执行文件同目录。
 pub fn get_resource_path() -> PathBuf {
-    if let Ok(path) = std::env::var(RESOURCE_DIR_ENV) {
-        return PathBuf::from(path);
-    }
-    get_configuration_path()
+    ASSET_LOCATION
+        .get_value()
+        .map_or_else(executable_dir, PathBuf::from)
+}
+
+/// 证书目录（Go `GetCertLocation` 的目录部分）：`xray.location.cert`
+/// 未设置时回退可执行文件同目录。
+pub fn get_cert_path() -> PathBuf {
+    CERT_LOCATION
+        .get_value()
+        .map_or_else(executable_dir, PathBuf::from)
+}
+
+/// JSON 严格模式（Go `UseStrictJSON`）：`xray.json.strict` == "true" 时
+/// 跳过注释剥离，按严格 RFC 8259 解析。默认 false（宽松，兼容人写注释配置）。
+pub fn use_strict_json() -> bool {
+    static STRICT: LazyLock<EnvFlag> = LazyLock::new(|| EnvFlag::new("xray.json.strict"));
+    STRICT.get_value() == Some("true")
 }
 
 #[cfg(test)]
@@ -50,22 +77,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_get_configuration_path_returns_path() {
-        let path = get_configuration_path();
-        assert!(!path.as_os_str().is_empty());
+    fn configuration_path_defaults_to_exe_dir_config_json() {
+        // env 未设置时回退 exe 目录（测试环境 current_exe 是测试二进制目录）
+        assert_eq!(
+            get_configuration_path(),
+            executable_dir().join("config.json")
+        );
     }
 
     #[test]
-    fn test_get_resource_path_returns_path() {
-        let path = get_resource_path();
-        assert!(!path.as_os_str().is_empty());
+    fn confdir_unset_is_none() {
+        // 测试进程通常未设置该 env；已设置时跳过断言
+        if std::env::var("xray.location.confdir").is_err()
+            && std::env::var("XRAY_LOCATION_CONFDIR").is_err()
+        {
+            assert!(get_confdir_path().is_none());
+        }
     }
 
     #[test]
-    fn test_resource_path_falls_back_to_config_path() {
-        // 当 XRAY_RESOURCE_DIR 未设置时，应与配置路径一致
-        if std::env::var(RESOURCE_DIR_ENV).is_err() {
-            assert_eq!(get_resource_path(), get_configuration_path());
+    fn strict_json_defaults_false() {
+        if std::env::var("xray.json.strict").is_err()
+            && std::env::var("XRAY_JSON_STRICT").is_err()
+        {
+            assert!(!use_strict_json());
         }
     }
 }

@@ -13,34 +13,40 @@ use std::io::Read;
 use crate::config::Config;
 use crate::error::{ConfError, Result};
 
-/// 从 reader 解析 JSON 配置（容忍 // 和 /* */ 注释）。
+/// 从 reader 解析 JSON 配置（默认容忍 // 和 /* */ 注释）。
+///
+/// `xray.json.strict`（或 `XRAY_JSON_STRICT`）== "true" 时跳过注释剥离，
+/// 按严格 RFC 8259 解析（对应 Go `platform.UseStrictJSON`）。
 pub fn decode_json(reader: impl Read) -> Result<Config> {
     let mut buf = String::new();
     reader.take(64 * 1024 * 1024).read_to_string(&mut buf)
         .map_err(|e| ConfError::Read(format!("read JSON: {e}")))?;
-    let stripped = strip_json_comments(&buf);
-    serde_json::from_str(&stripped).map_err(|e| ConfError::from_json("json", e))
+    decode_json_from_str(&buf)
 }
 
 /// 从 reader 解析严格 RFC 8259 JSON 配置。
 ///
 /// 用于远程源（HTTP）等机器生成、不应含注释的场景。
 pub fn decode_json_strict(reader: impl Read) -> Result<Config> {
-    // 当前 serde_json 默认 strict；保留独立函数以备将来引入 json5 容忍注释时分叉。
-    decode_json(reader)
+    let mut buf = String::new();
+    reader.take(64 * 1024 * 1024).read_to_string(&mut buf)
+        .map_err(|e| ConfError::Read(format!("read JSON: {e}")))?;
+    serde_json::from_str(&buf).map_err(|e| ConfError::from_json("json", e))
 }
 
-/// 从字符串切片解析 JSON 配置（容忍注释）。
+/// 从字符串切片解析 JSON 配置（容忍注释，strict env 可关）。
 pub fn decode_json_from_str(s: &str) -> Result<Config> {
+    if xray_common::platform::use_strict_json() {
+        return serde_json::from_str(s).map_err(|e| ConfError::from_json("json", e));
+    }
     let stripped = strip_json_comments(s);
     serde_json::from_str(&stripped).map_err(|e| ConfError::from_json("json", e))
 }
 
-/// 从字节切片解析 JSON 配置（容忍注释）。
+/// 从字节切片解析 JSON 配置（容忍注释，strict env 可关）。
 pub fn decode_json_from_slice(s: &[u8]) -> Result<Config> {
     let s = std::str::from_utf8(s).map_err(|e| ConfError::ParseSimple { format: "json", message: format!("UTF-8: {e}") })?;
-    let stripped = strip_json_comments(s);
-    serde_json::from_str(&stripped).map_err(|e| ConfError::from_json("json", e))
+    decode_json_from_str(s)
 }
 
 /// 剥离 JSON 配置中的 `//` 行注释和 `/* */` 块注释。

@@ -2,23 +2,30 @@
 //!
 //! 对应 Go 版本 `platform.NewEnvFlag`，提供环境变量读取和类型转换。
 
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 /// 环境标志，首次访问时从环境变量读取值并缓存。
 ///
 /// 对应 Go 版本 `platform.EnvFlag`。
 pub struct EnvFlag {
     name: String,
+    alt_name: String,
     value: OnceLock<Option<String>>,
 }
 
 impl EnvFlag {
     /// 创建新的环境标志。
     ///
-    /// `name` 为环境变量名称，值在首次 `get_value()` 调用时读取。
+    /// `name` 为环境变量名称（Go 点式如 `xray.location.asset`）。读取时先查
+    /// 原名，再查归一化大写形式（`XRAY_LOCATION_ASSET`），对应 Go
+    /// `platform.NewEnvFlag` 的 Name/AltName 双查。值在首次 `get_value()`
+    /// 调用时读取并缓存。
     pub fn new(name: impl Into<String>) -> Self {
+        let name = name.into();
+        let alt_name = name.to_uppercase().replace('.', "_");
         Self {
-            name: name.into(),
+            name,
+            alt_name,
             value: OnceLock::new(),
         }
     }
@@ -28,7 +35,16 @@ impl EnvFlag {
     /// 返回环境变量的字符串值引用，未设置时返回 `None`。
     pub fn get_value(&self) -> Option<&str> {
         self.value
-            .get_or_init(|| std::env::var(&self.name).ok())
+            .get_or_init(|| {
+                std::env::var(&self.name)
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .or_else(|| {
+                        std::env::var(&self.alt_name)
+                            .ok()
+                            .filter(|v| !v.is_empty())
+                    })
+            })
             .as_deref()
     }
 
@@ -36,10 +52,8 @@ impl EnvFlag {
     ///
     /// 以下值（不区分大小写）视为 `true`：`"1"`、`"true"`、`"yes"`、`"on"`。
     pub fn get_value_as_bool(&self) -> bool {
-        match self.get_value() {
-            Some(v) => matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
-            None => false,
-        }
+        self.get_value()
+            .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
     }
 
     /// 获取标志值的整数形式。
@@ -49,23 +63,16 @@ impl EnvFlag {
         self.get_value().and_then(|v| v.parse().ok())
     }
 }
-
-/// USE_READV 环境标志的名称
-const USE_READV_ENV_NAME: &str = "XRAY_USE_READV";
-
-/// 全局 USE_READV 标志实例
-static USE_READV_FLAG: OnceLock<EnvFlag> = OnceLock::new();
+/// USE_READV 环境标志（Go `xray.buf.readv`，alt `XRAY_BUF_READV`）。
+static USE_READV_FLAG: LazyLock<EnvFlag> =
+    LazyLock::new(|| EnvFlag::new("xray.buf.readv"));
 
 /// 获取 USE_READV 标志的值。
 ///
-/// 对应 Go 版本 `platform.UseReadV`。
-/// 当环境变量 `XRAY_USE_READV` 设置为 `"1"`、`"true"`、`"yes"` 或 `"on"` 时返回 `true`。
-///
-/// 在 Linux 平台上默认建议启用 readv，但此函数严格按环境变量判断。
+/// 对应 Go 版本 `platform.UseReadV`：`xray.buf.readv`（或 `XRAY_BUF_READV`）
+/// 设为真值时返回 `true`，未设置默认 `false`。
 pub fn use_readv() -> bool {
-    USE_READV_FLAG
-        .get_or_init(|| EnvFlag::new(USE_READV_ENV_NAME))
-        .get_value_as_bool()
+    USE_READV_FLAG.get_value_as_bool()
 }
 
 #[cfg(test)]

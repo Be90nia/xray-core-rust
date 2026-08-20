@@ -457,18 +457,10 @@ pub enum WiringError {
 
 /// 查找 GeoIP/GeoSite .dat 文件目录（对齐 Go `GetOBJPath`）。
 ///
-/// 查找顺序：`XRAY_LOCATION_ASSET` 环境变量 → 可执行文件同目录 → 当前工作目录。
+/// `xray.location.asset`（或 `XRAY_LOCATION_ASSET`）环境变量 → 可执行文件同目录。
 /// 找不到 .dat 文件不影响 loader 创建（load 时 warn skip），仅影响 geoip/geosite 规则匹配。
 fn resolve_asset_dir() -> std::path::PathBuf {
-    if let Ok(dir) = std::env::var("XRAY_LOCATION_ASSET") {
-        return std::path::PathBuf::from(dir);
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            return parent.to_path_buf();
-        }
-    }
-    std::path::PathBuf::from(".")
+    xray_common::platform::get_resource_path()
 }
 
 #[cfg(test)]

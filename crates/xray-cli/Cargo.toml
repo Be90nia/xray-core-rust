@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 xray-core = { path = "../xray-core" }
+xray-common = { path = "../xray-common" }
 xray-conf = { path = "../xray-conf" }
 xray-proto = { path = "../xray-proto", features = ["grpc-client"] }
 thiserror = { workspace = true }
