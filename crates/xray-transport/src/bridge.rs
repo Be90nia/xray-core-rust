@@ -171,7 +171,9 @@ where
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use xray_buf::io::{Reader, Writer};
     use xray_buf::multi::MultiBuffer;
-    use xray_features::policy::{DEFAULT_DOWNLINK_ONLY_TIMEOUT, DEFAULT_UPLINK_ONLY_TIMEOUT};
+    use xray_features::policy::{
+        DEFAULT_CONN_IDLE_TIMEOUT, DEFAULT_DOWNLINK_ONLY_TIMEOUT, DEFAULT_UPLINK_ONLY_TIMEOUT,
+    };
 
     let Link { mut reader, mut writer } = link;
     let (mut s_read, mut s_write) = tokio::io::split(stream);
@@ -192,7 +194,15 @@ where
             // 只可能处于 Pending（poll 到 Ready 的分支必被采用），无数据丢失。
             let mb = match window {
                 None => tokio::select! {
-                    r = reader.read_multi_buffer() => r,
+                    // 空闲 deadline（Go ConnectionIdle / CancelAfterInactivity）：
+                    // 双向均存活但 connection_idle 内无数据 → 断开
+                    res = tokio::time::timeout(
+                        DEFAULT_CONN_IDLE_TIMEOUT,
+                        reader.read_multi_buffer(),
+                    ) => match res {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    },
                     _ = down_done.changed() => {
                         window = *down_done.borrow();
                         continue;
@@ -217,6 +227,7 @@ where
         io::Result::Ok(())
     };
 
+
     let down = async move {
         let mut up_done = up_done_rx;
         let mut window: Option<std::time::Duration> = None;
@@ -226,7 +237,15 @@ where
         loop {
             let n = match window {
                 None => tokio::select! {
-                    n = s_read.read(&mut buf) => n,
+                    // 空闲 deadline（Go ConnectionIdle / CancelAfterInactivity）：
+                    // 双向均存活但 connection_idle 内无数据 → 断开
+                    res = tokio::time::timeout(
+                        DEFAULT_CONN_IDLE_TIMEOUT,
+                        s_read.read(&mut buf),
+                    ) => match res {
+                        Ok(n) => n,
+                        Err(_) => break,
+                    },
                     _ = up_done.changed() => {
                         window = *up_done.borrow();
                         continue;
@@ -269,7 +288,9 @@ where
 /// 用于代理链场景：原始 link ↔ client link ↔ chained handler。
 pub async fn bridge_link_with_link(link_a: Link, link_b: Link) -> io::Result<()> {
     use xray_buf::io::{Reader, Writer};
-    use xray_features::policy::{DEFAULT_DOWNLINK_ONLY_TIMEOUT, DEFAULT_UPLINK_ONLY_TIMEOUT};
+    use xray_features::policy::{
+        DEFAULT_CONN_IDLE_TIMEOUT, DEFAULT_DOWNLINK_ONLY_TIMEOUT, DEFAULT_UPLINK_ONLY_TIMEOUT,
+    };
 
     let Link { reader: mut a_reader, writer: mut a_writer } = link_a;
     let Link { reader: mut b_reader, writer: mut b_writer } = link_b;
@@ -285,7 +306,14 @@ pub async fn bridge_link_with_link(link_a: Link, link_b: Link) -> io::Result<()>
         loop {
             let mb = match window {
                 None => tokio::select! {
-                    r = a_reader.read_multi_buffer() => r,
+                    // 空闲 deadline 语义同 bridge_link_with_stream_full（ConnectionIdle）
+                    res = tokio::time::timeout(
+                        DEFAULT_CONN_IDLE_TIMEOUT,
+                        a_reader.read_multi_buffer(),
+                    ) => match res {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    },
                     _ = down_done.changed() => {
                         window = *down_done.borrow();
                         continue;
@@ -317,7 +345,14 @@ pub async fn bridge_link_with_link(link_a: Link, link_b: Link) -> io::Result<()>
         loop {
             let mb = match window {
                 None => tokio::select! {
-                    r = b_reader.read_multi_buffer() => r,
+                    // 空闲 deadline 语义同 bridge_link_with_stream_full（ConnectionIdle）
+                    res = tokio::time::timeout(
+                        DEFAULT_CONN_IDLE_TIMEOUT,
+                        b_reader.read_multi_buffer(),
+                    ) => match res {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    },
                     _ = up_done.changed() => {
                         window = *up_done.borrow();
                         continue;
