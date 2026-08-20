@@ -17,6 +17,38 @@ use std::sync::Arc;
 use xray_features::{Feature, FeatureError, Result};
 use tokio_util::sync::CancellationToken;
 
+/// 安装 panic → tracing hook（幂等，进程一次）。
+///
+/// 对应 Go `defer recover` 的观测语义（Go 主链路 proxyman/dispatcher 实际无
+/// recover，goroutine panic 直接杀进程；Rust tokio task panic 仅取消该 task、
+/// 资源随 unwind drop——本就比 Go 更安全，唯缺可见性）：task panic 统一记
+/// `tracing::error` 后转发默认 hook，不破坏测试 harness / stderr 行为。
+fn install_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let payload = info.payload();
+            let msg = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("<non-string panic payload>");
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}", l.file(), l.line()))
+                .unwrap_or_else(|| "<unknown>".into());
+            tracing::error!(
+                thread = std::thread::current().name().unwrap_or("<unnamed>"),
+                location = %location,
+                panic = %msg,
+                "task panicked"
+            );
+            default_hook(info);
+        }));
+    });
+}
+
 /// Xray 实例。一个实例承载一整套 Feature（dns/router/policy/stats/inbound/outbound 等），
 /// 注册顺序决定 `start` 顺序，`close` 顺序为 `start` 的逆序。
 ///
@@ -94,6 +126,7 @@ impl Instance {
     /// - 未注册的 `kind`：记 warn 跳过（对应 Go essentialFeatures 默认实现路径）
     /// - factory 内部错误：立即返回（如 prost decode 失败、配置非法）
     pub fn new_from_built(built: &xray_conf::BuiltConfig) -> Result<Self> {
+        install_panic_hook();
         let mut inst = Self::new();
         for entry in &built.apps {
             match xray_features::registry::create_feature(&entry.kind, &entry.data) {
@@ -281,6 +314,21 @@ impl Default for Instance {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    #[test]
+    fn panic_hook_install_is_idempotent() {
+        install_panic_hook();
+        install_panic_hook();
+    }
+
+    #[tokio::test]
+    async fn spawned_task_panic_is_contained_and_visible() {
+        install_panic_hook();
+        // task panic 只取消该 task（JoinError），进程与其余 task 存活
+        let panicked = tokio::spawn(async { panic!("boom") });
+        let healthy = tokio::spawn(async { 42 });
+        assert!(panicked.await.is_err(), "panic surfaces as JoinError");
+        assert_eq!(healthy.await.unwrap(), 42, "other tasks unaffected");
+    }
 
     /// 测试用 feature：记录 start/close 调用次数与顺序。
     struct CountingFeature {
