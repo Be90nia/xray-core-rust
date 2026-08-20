@@ -11,8 +11,10 @@ xray-features = { path = "../xray-features" }
 xray-buf = { path = "../xray-buf" }
 xray-transport = { path = "../xray-transport" }
 xray-proto = { path = "../xray-proto" }
+xray-xudp = { path = "../xray-xudp" }
 thiserror.workspace = true
 tokio.workspace = true
+rand = { workspace = true }
 tracing.workspace = true
 parking_lot.workspace = true
 httparse.workspace = true

@@ -31,6 +31,7 @@ pub mod dnssniffer;
 pub mod fakednssniffer;
 pub mod sniffer;
 pub mod stats;
+pub mod udp_session;
 
 pub use config::{Config, SessionConfig};
 pub use default::{
@@ -38,6 +39,7 @@ pub use default::{
     OutboundHandlerManager, RoutingContext, RoutingRouter, SimpleOhm,
 };
 pub use error::DispatcherError;
+pub use udp_session::UdpDispatchSession;
 pub use fakednssniffer::{
     DnsThenOthersSniffResult, FakeDnsEngine, FakeDnsSniffResult, FakeDnsSnifferFactory,
 };

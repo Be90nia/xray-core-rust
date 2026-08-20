@@ -14,14 +14,14 @@
 //! - TLS 包装层
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use xray_app_dispatcher::default::SimpleOhm;
@@ -39,7 +39,7 @@ use crate::protocol::{
 };
 use crate::validator::{MemoryUser, Validator};
 use xray_transport::link::Link;
-use xray_transport::udp::relay::UdpRelay;
+
 
 /// 包装流，记录所有读取字节用于 fallback 回放。
 struct RecordingStream<S> {
@@ -442,7 +442,7 @@ async fn handle_trojan_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
         Ok((network, addr, port, user)) => {
             if matches!(network, Network::Udp) {
                 info!(peer = %peer, user = %user.email, "trojan UDP relay start");
-                handle_trojan_udp_relay(recorder.inner).await;
+                handle_trojan_udp_relay(recorder.inner, handler).await;
                 return;
             }
             let dest = Destination::new(addr, Port::new(port), CommonNetwork::TCP);
@@ -469,106 +469,74 @@ async fn handle_trojan_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     }
 }
 // ============================================================================
-// UDP relay（UDP-over-TCP）
+// UDP relay（UDP-over-TCP，经中央 dispatcher）
 // ============================================================================
-
-/// 解析 `(Address, port)` 为 `SocketAddr`：IP 直接构造，域名走 DNS 解析。
-///
-/// # Errors
-/// 域名解析失败返回 `io::Error`。
-async fn resolve_udp_dest(addr: &Address, port: u16) -> std::io::Result<SocketAddr> {
-    match addr.ip() {
-        Some(ip) => Ok(SocketAddr::new(ip, port)),
-        None => {
-            let host = addr.as_domain().unwrap_or_default();
-            tokio::net::lookup_host((host, port))
-                .await?
-                .next()
-                .ok_or_else(|| std::io::Error::other(format!("dns resolve failed: {host}")))
-        }
-    }
-}
 
 /// Trojan 入站 UDP relay（UDP-over-TCP），对应 Go `proxy/trojan/server.go::handleUDPPayload`。
 ///
-/// 客户端握手后 TCP 流承载连续的 UDP 帧 `[addr+port][2B len][CRLF][payload]`：
-/// - 读循环：`parse_udp_packet_stream` 拆帧 → 解析目标 → `UdpRelay::send_to` 转发
-/// - 写循环：回包 channel → `write_udp_packet` 编码 → 回写客户端流
-///
-/// ponytail: 暂不做 per-dest 空闲淘汰 / 完整 NAT session 管理（连接级生命周期即可）。
-async fn handle_trojan_udp_relay<S>(stream: S)
+/// 客户端握手后 TCP 流承载连续的 UDP 帧 `[addr+port][2B len][CRLF][payload]`。
+/// 所有数据报经 [`UdpDispatchSession`] 走 dispatcher routing（域名目标原样
+/// 交给 outbound 解析，freedom 会解析），不再 raw socket 直连：
+/// - TCP 读分支：`parse_udp_packet_stream` 拆帧 → `Destination::udp` → `send_packet`
+/// - dispatch 读分支：`recv_packet` → `write_udp_packet` 编码 → 回写客户端流
+async fn handle_trojan_udp_relay<S>(
+    stream: S,
+    handler: Arc<dyn xray_app_dispatcher::DispatchHandler>,
+)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (read_half, write_half) = tokio::io::split(stream);
-    let writer = Arc::new(Mutex::new(write_half));
-    let relay = UdpRelay::new();
-    let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<(SocketAddr, Vec<u8>)>();
-
-    // 回包写循环：编码为 trojan UDP 帧后回写客户端
-    let writer_clone = Arc::clone(&writer);
-    let resp_task: JoinHandle<()> = tokio::spawn(async move {
-        while let Some((src, payload)) = resp_rx.recv().await {
-            let (addr, port) = address_port_from_socket(src);
-            let mut packet = Vec::with_capacity(payload.len() + 32);
-            write_udp_packet(&mut packet, &addr, port, &payload);
-            let mut w = writer_clone.lock().await;
-            if w.write_all(&packet).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // 读循环：拆帧 → 转发
-    let mut read_half = read_half;
+    let (mut read_half, mut write_half) = tokio::io::split(stream);
+    let mut session = xray_app_dispatcher::UdpDispatchSession::new(handler);
     let mut buf: Vec<u8> = Vec::with_capacity(16_384);
     let mut chunk = [0u8; 8192];
+
     loop {
-        match read_half.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-        }
-        let mut consumed = 0usize;
-        loop {
-            match parse_udp_packet_stream(&buf[consumed..]) {
-                Ok(Some((addr, port, payload, used))) => {
-                    consumed += used;
-                    match resolve_udp_dest(&addr, port).await {
-                        Ok(dest) => {
-                            if let Err(e) = relay.send_to(dest, payload, resp_tx.clone()).await {
-                                warn!(error = %e, dest = %dest, "trojan udp relay send_to failed");
+        tokio::select! {
+            r = read_half.read(&mut chunk) => {
+                match r {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+                let mut consumed = 0usize;
+                let mut fatal = false;
+                loop {
+                    match parse_udp_packet_stream(&buf[consumed..]) {
+                        Ok(Some((addr, port, payload, used))) => {
+                            consumed += used;
+                            let dest = Destination::new(addr, Port::new(port), CommonNetwork::UDP);
+                            if let Err(e) = session.send_packet(&dest, payload).await {
+                                warn!(error = %e, dest = %dest, "trojan udp send_packet failed");
                             }
                         }
-                        Err(e) => warn!(error = %e, "trojan udp dest resolve failed"),
+                        Ok(None) => break, // 数据不足，继续读
+                        Err(e) => {
+                            warn!(error = %e, "trojan udp parse fatal, aborting relay");
+                            fatal = true;
+                            break;
+                        }
                     }
                 }
-                Ok(None) => break, // 数据不足，继续读
-                Err(e) => {
-                    warn!(error = %e, "trojan udp parse fatal, aborting relay");
-                    // 丢弃已解析部分，终止 relay
-                    let _ = consumed; // keep partial buf
-                    relay.close().await;
-                    drop(resp_tx);
-                    let _ = resp_task.await;
-                    return;
+                if consumed > 0 {
+                    buf.drain(..consumed);
+                }
+                if fatal {
+                    break;
+                }
+            }
+            r = session.recv_packet() => {
+                match r {
+                    Ok(Some((source, payload))) => {
+                        let mut packet = Vec::with_capacity(payload.len() + 32);
+                        write_udp_packet(&mut packet, source.address(), source.port().value(), &payload);
+                        if write_half.write_all(&packet).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) | Err(_) => break, // outbound 关闭 / 错误
                 }
             }
         }
-        if consumed > 0 {
-            buf.drain(..consumed);
-        }
-    }
-
-    drop(resp_tx);
-    relay.close().await;
-    let _ = resp_task.await;
-}
-
-/// `SocketAddr` → `(Address, port)`（回包源地址编码用）。
-fn address_port_from_socket(src: SocketAddr) -> (Address, u16) {
-    match src {
-        SocketAddr::V4(v4) => (Address::IPv4(*v4.ip()), v4.port()),
-        SocketAddr::V6(v6) => (Address::IPv6(*v6.ip()), v6.port()),
     }
 }
 
@@ -581,7 +549,7 @@ mod tests {
     use xray_app_dispatcher::default::{DialBridge, SimpleOhm};
     use xray_app_dispatcher::DispatchHandler;
     use xray_common::net::address::Address;
-    use xray_proxy_freedom::make_freedom_dial_fn;
+    use xray_proxy_freedom::{FreedomDispatchBridge, make_freedom_dial_fn};
     use crate::protocol::{write_request_header, Network as TrojanNetwork};
 
     fn make_validator_with_user(password: &str) -> Arc<Validator> {
@@ -839,5 +807,117 @@ mod tests {
         let mut got = vec![0u8; payload.len()];
         client.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, payload, "should receive echo through trojan proxy");
+    }
+
+    /// 计数装饰器：证明 UDP 帧经 DispatchHandler 走 routing 而非 raw socket 直连。
+    #[derive(Debug)]
+    struct CountingDispatch {
+        inner: Arc<dyn DispatchHandler>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl DispatchHandler for CountingDispatch {
+        fn tag(&self) -> &str {
+            "counting-freedom"
+        }
+
+        fn dispatch(
+            &self,
+            dest: &Destination,
+            link: Link,
+        ) -> xray_app_dispatcher::default::PinFuture<()> {
+            let inner = Arc::clone(&self.inner);
+            let calls = Arc::clone(&self.calls);
+            let dest = dest.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                inner.dispatch(&dest, link).await;
+            })
+        }
+    }
+
+    /// 端到端：trojan UDP relay → 中央 dispatcher → freedom → UDP echo server。
+    ///
+    /// 验证 bd b2e：UDP 帧不再 raw socket 直连，而是经 `DispatchHandler`
+    /// 走 routing（calls 计数断言 dispatch link 真实建立）。
+    #[tokio::test]
+    async fn serve_trojan_udp_relay_dispatches_via_freedom() {
+        // 1. UDP echo server
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, src)) = echo.recv_from(&mut buf).await {
+                let _ = echo.send_to(&buf[..n], src).await;
+            }
+        });
+
+        // 2. dispatcher：freedom（TCP+UDP dispatch）外裹计数器
+        let ohm = Arc::new(SimpleOhm::new());
+        let freedom = Arc::new(FreedomDispatchBridge::from_bridge(Arc::new(
+            DialBridge::new("freedom", make_freedom_dial_fn()),
+        )));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = Arc::new(CountingDispatch {
+            inner: freedom,
+            calls: Arc::clone(&calls),
+        }) as Arc<dyn DispatchHandler>;
+        ohm.set_default(counting);
+
+        // 3. trojan inbound
+        let account = MemoryAccount::new("password");
+        let user = MemoryUser::new("udp-test@example.com", 0, account.clone());
+        let mut users = HashMap::new();
+        users.insert(user.key_hash(), user);
+        let trojan_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let trojan_addr = trojan_listener.local_addr().unwrap();
+        let ohm_clone = Arc::clone(&ohm);
+        tokio::spawn(async move {
+            let _ = serve_trojan(trojan_listener, ohm_clone, users, None, None).await;
+        });
+
+        // 4. client：UDP 模式 header + 一帧指向 echo server
+        let mut client = TcpStream::connect(trojan_addr).await.unwrap();
+        let dest_addr = Address::IPv4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+        let mut req = Vec::new();
+        write_request_header(
+            &mut req,
+            &account,
+            TrojanNetwork::Udp,
+            &dest_addr,
+            echo_addr.port(),
+        );
+        let payload = b"udp via dispatch";
+        write_udp_packet(&mut req, &dest_addr, echo_addr.port(), payload);
+        client.write_all(&req).await.unwrap();
+
+        // 5. 读回包帧（echo 经 freedom XUDP 回来）
+        let (raddr, rport, rpayload) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    if let Ok(Some((a, p, pl, _))) =
+                        crate::protocol::parse_udp_packet_stream(&buf)
+                    {
+                        return (a, p, pl.to_vec());
+                    }
+                    let n = client.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "client stream closed before udp response");
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+            },
+        )
+        .await
+        .expect("udp response within 5s");
+
+        assert_eq!(rpayload, payload);
+        assert_eq!(raddr, dest_addr);
+        assert_eq!(rport, echo_addr.port());
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "udp relay must go through dispatcher"
+        );
     }
 }

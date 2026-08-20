@@ -12,12 +12,11 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 use tokio::net::TcpListener;
 use xray_app_dispatcher::default::SimpleOhm;
-use xray_app_dispatcher::{DispatchHandler, OutboundHandlerManager};
+use xray_app_dispatcher::{DispatchHandler, OutboundHandlerManager, UdpDispatchSession};
 use xray_buf::io::{new_reader, new_writer};
 use xray_common::protocol::{Command, ResponseCommand, ResponseHeader, SecurityType};
 use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead, NoOpAeadCipher};
 use xray_transport::link::Link;
-use xray_common::net::address::Address;
 use xray_common::net::destination::Destination;
 
 use crate::encoding::server::{ServerSession, SessionHistory};
@@ -277,9 +276,9 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     // 7. TCP：duplex pump + dispatch；UDP：chunk 即 packet（Go 非 cone 语义）
     if header.command == Command::Udp {
         return pump_udp_session(
-            stream_r, stream_w, &dest,
+            stream_r, stream_w, &dest, Arc::clone(handler),
             req_cipher, resp_cipher, req_iv, resp_iv,
-            req_size_parser, resp_size_parser, global_padding,
+            req_size_parser, resp_size_parser, global_padding, no_termination,
         )
         .await;
     }
@@ -442,18 +441,56 @@ async fn pump_response_body<C, W>(
     let _ = stream_w.shutdown().await;
 }
 
+/// 将 payload 加密为单个 response chunk 写入 stream（VMess UDP 会话专用）。
+///
+/// 与 [`pump_response_body`] 的 chunk 写法一致；`payload` 为空时即终止 chunk
+/// （`seal([])`，客户端 chunk reader 以空明文为流结束信号）。
+async fn write_udp_chunk<W: AsyncWrite + Unpin>(
+    stream_w: &mut W,
+    cipher: &BodyCipher,
+    nonce_gen: &mut ChunkNonceAdapter,
+    sp: &mut (dyn SizeParser + Send),
+    global_padding: bool,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    let nonce = nonce_gen.next();
+    let sealed = cipher
+        .seal(&nonce, &[], payload)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let padding_size = if global_padding {
+        usize::from(sp.next_padding_len())
+    } else {
+        0
+    };
+    let size_value = u16::try_from(sealed.len() + padding_size).unwrap_or(u16::MAX);
+    let sb = sp.size_bytes();
+    let mut size_field = vec![0u8; sb];
+    sp.encode(size_value, &mut size_field);
+    stream_w.write_all(&size_field).await?;
+    stream_w.write_all(&sealed).await?;
+    if padding_size > 0 {
+        use rand::RngCore;
+        let mut pad = vec![0u8; padding_size];
+        rand::rng().fill_bytes(&mut pad);
+        stream_w.write_all(&pad).await?;
+    }
+    Ok(())
+}
+
 /// VMess UDP 会话（Go 非 cone 语义）：chunk 边界即 UDP packet 边界。
 ///
-/// - up：解密 request chunk → `send_to(header.dest)`
-/// - down：`recv_from` → 加密为 response chunk 写回
+/// - up：解密 request chunk → `UdpDispatchSession::send_packet`
+/// - down：`UdpDispatchSession::recv_packet` → 加密为 response chunk 写回
 ///
-/// 客户端 TCP 断开（up EOF）时通过 mpsc 唤醒 down 循环，两侧同退。
-/// 目标地址在 request header 中（域名解析一次）。
-/// ponytail: per-session 单 socket 直连目标，b2e 中央 UDP dispatcher 建成后改走 dispatch。
+/// 数据报经 dispatch（routing 规则选择 outbound），不再 per-session 直连
+/// raw socket；目标取自 request header，域名不本地解析（outbound 侧解析）。
+/// chunk 读取（多次 read_exact）不可取消，up 独立 async block 经 channel
+/// 与 relay 循环并发；客户端断开（up EOF）后保留收尾窗口，双侧同退。
 async fn pump_udp_session<R, W>(
     mut stream_r: R,
     mut stream_w: W,
     dest: &Destination,
+    handler: Arc<dyn DispatchHandler>,
     req_cipher: BodyCipher,
     resp_cipher: BodyCipher,
     req_iv: [u8; 16],
@@ -461,31 +498,21 @@ async fn pump_udp_session<R, W>(
     mut req_sp: Box<dyn SizeParser + Send>,
     mut resp_sp: Box<dyn SizeParser + Send>,
     global_padding: bool,
+    no_termination: bool,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    use tokio::net::UdpSocket;
+    let udp_dest = Destination::udp(dest.address().clone(), dest.port());
+    let mut session = UdpDispatchSession::new(handler);
 
-    // 解析目标（域名 → SocketAddr，Go 由 internet 系统解析器完成）
-    let target: std::net::SocketAddr = match dest.address() {
-        Address::Domain(d) => tokio::net::lookup_host((d.as_str(), u16::from(dest.port())))
-            .await?
-            .next()
-            .ok_or_else(|| std::io::Error::other(format!("vmess udp: resolve {d} failed")))?,
-        Address::IPv4(a) => std::net::SocketAddr::new(std::net::IpAddr::from(*a), u16::from(dest.port())),
-        Address::IPv6(a) => std::net::SocketAddr::new(std::net::IpAddr::from(*a), u16::from(dest.port())),
-    };
-    let bind_addr: &str = if target.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
-    let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
-
-    let (up_tx, mut up_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let up_sock = Arc::clone(&socket);
+    // up：解密 request chunk（与 pump_request_body 同构）→ channel 交 relay。
+    let (up_tx, mut up_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
     let up = async move {
         let mut nonce_gen = ChunkNonceAdapter::new(&req_iv, 12);
         loop {
-            // 与 pump_request_body 同构：padding → size → ciphertext → open
+            // padding → size → ciphertext → open
             let padding_size = if global_padding {
                 usize::from(req_sp.next_padding_len())
             } else {
@@ -507,72 +534,87 @@ where
             }
             let nonce = nonce_gen.next();
             match req_cipher.open(&nonce, &[], &ciphertext[..ciphertext_size]) {
+                // 空明文 chunk = 请求流终止（chunk writer Close 语义），不作为
+                // 数据报转发（dispatch 侧也会丢弃空 payload，转发即死锁）。
+                Ok(packet) if packet.is_empty() => break,
                 Ok(packet) => {
-                    if up_sock.send_to(&packet, target).await.is_err() {
-                        break;
+                    if up_tx.send(packet).await.is_err() {
+                        break; // relay 已退出
                     }
                 }
                 Err(_) => break,
             }
         }
-        drop(up_tx); // 唤醒 down 循环退出
+        drop(up_tx); // 唤醒 relay 退出
     };
 
-    let down = async {
-        let mut nonce_gen = ChunkNonceAdapter::new(&resp_iv, 12);
-        let mut buf = vec![0u8; 65_536];
+    // relay：session 双向。up 包 → send_packet（select 分支体内 await，不可
+    // 取消，无半帧风险）；recv_packet → 加密写回 stream_w（recv_packet 可
+    // 取消：半帧累积在 session 内部，取消不丢数据）。
+    let relay = async {
         // up 结束后仍保留收尾窗口：在途回包可能晚于终止 chunk 到达
         //（Go 由 CancelAfterInactivity(ConnectionIdle) 管理，此处取短窗口）。
         const UP_DONE_IDLE: std::time::Duration = std::time::Duration::from_millis(500);
+        let mut nonce_gen = ChunkNonceAdapter::new(&resp_iv, 12);
         let mut up_done = false;
         loop {
-            let (packet, _from) = if up_done {
-                match tokio::time::timeout(UP_DONE_IDLE, socket.recv_from(&mut buf)).await {
-                    Ok(Ok(v)) => v,
-                    _ => break,
-                }
+            let incoming = if up_done {
+                tokio::time::timeout(UP_DONE_IDLE, session.recv_packet())
+                    .await
+                    .unwrap_or(Ok(None)) // 收尾窗口超时 → 会话结束
             } else {
                 tokio::select! {
-                    r = socket.recv_from(&mut buf) => match r {
-                        Ok(v) => v,
-                        Err(_) => break,
-                    },
-                    _ = up_rx.recv() => { up_done = true; continue; }
+                    pkt = up_rx.recv() => {
+                        match pkt {
+                            Some(p) => {
+                                if session.send_packet(&udp_dest, &p).await.is_err() {
+                                    break; // dispatch link 已断
+                                }
+                                continue;
+                            }
+                            None => { up_done = true; continue; }
+                        }
+                    }
+                    r = session.recv_packet() => r,
                 }
             };
-            let nonce = nonce_gen.next();
-            let sealed = match resp_cipher.seal(&nonce, &[], &buf[..packet]) {
-                Ok(s) => s,
+            let (_source, payload) = match incoming {
+                Ok(Some(v)) => v,
+                Ok(None) => break, // outbound 关闭
                 Err(_) => break,
             };
-            let padding_size = if global_padding {
-                usize::from(resp_sp.next_padding_len())
-            } else {
-                0
-            };
-            let size_value = u16::try_from(sealed.len() + padding_size).unwrap_or(u16::MAX);
-            let sb = resp_sp.size_bytes();
-            let mut size_field = vec![0u8; sb];
-            resp_sp.encode(size_value, &mut size_field);
-            if stream_w.write_all(&size_field).await.is_err()
-                || stream_w.write_all(&sealed).await.is_err()
+            if write_udp_chunk(
+                &mut stream_w,
+                &resp_cipher,
+                &mut nonce_gen,
+                resp_sp.as_mut(),
+                global_padding,
+                &payload,
+            )
+            .await
+            .is_err()
             {
                 break;
             }
-            if padding_size > 0 {
-                use rand::RngCore;
-                let mut pad = vec![0u8; padding_size];
-                rand::rng().fill_bytes(&mut pad);
-                if stream_w.write_all(&pad).await.is_err() {
-                    break;
-                }
-            }
             let _ = stream_w.flush().await;
+        }
+        // 会话结束：写终止 chunk（seal([])），与 pump_response_body 流结束
+        // 行为一致——客户端 chunk reader 以空明文为流结束信号，缺失则挂起。
+        if !no_termination {
+            let _ = write_udp_chunk(
+                &mut stream_w,
+                &resp_cipher,
+                &mut nonce_gen,
+                resp_sp.as_mut(),
+                global_padding,
+                &[],
+            )
+            .await;
         }
         let _ = stream_w.shutdown().await;
     };
 
-    tokio::join!(up, down);
+    tokio::join!(up, relay);
     Ok(())
 }
 
@@ -594,7 +636,7 @@ mod tests {
     use xray_common::net::port::Port;
     use xray_common::protocol::RequestHeader;
     use xray_common::uuid::UUID;
-    use xray_proxy_freedom::make_freedom_dial_fn;
+    use xray_proxy_freedom::{make_freedom_dial_fn, FreedomDispatchBridge};
 
     const SAMPLE_UUID_STR: &str = "66ad4540-b58c-4ad2-9926-ea63445a9b57";
 
@@ -633,9 +675,11 @@ mod tests {
     /// 构造 SimpleOhm + freedom 默认 outbound。
     fn make_ohm_with_freedom() -> Arc<SimpleOhm> {
         let ohm = Arc::new(SimpleOhm::new());
-        let dial_fn = make_freedom_dial_fn();
-        let bridge =
-            Arc::new(DialBridge::new("freedom", dial_fn)) as Arc<dyn DispatchHandler>;
+        // 与生产 wiring（xray-core/src/outbound.rs）一致：
+        // TCP 走 DialBridge，UDP 走 FreedomDispatchBridge → freedom udp::relay。
+        let tcp_bridge = Arc::new(DialBridge::new("freedom", make_freedom_dial_fn()));
+        let bridge = Arc::new(FreedomDispatchBridge::from_bridge(tcp_bridge))
+            as Arc<dyn DispatchHandler>;
         ohm.set_default(bridge);
         ohm
     }
@@ -772,7 +816,7 @@ mod tests {
             }
         });
 
-        // 2. serve_vmess（freedom ohm 不参与 UDP 路径，但保持结构一致）
+        // 2. serve_vmess（UDP 经 dispatch → freedom outbound 转发）
         let ohm = make_ohm_with_freedom();
         let (validator, cmd_key) = make_validator_with_user();
         let vmess_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -28,7 +28,7 @@ use xray_buf::io::{Reader, Writer};
 use xray_buf::multi::MultiBuffer;
 use xray_common::net::address::Address;
 use xray_common::net::destination::Destination;
-
+use xray_common::net::port::Port;
 use xray_transport::link::Link;
 use xray_xudp::packet::{PacketError, PacketReader, PacketWriter};
 
@@ -58,15 +58,11 @@ pub async fn relay(dest: &Destination, link: Link) -> io::Result<()> {
     // 3. GlobalID（随机 8 字节，对应 Go xudp.NewPacketWriter 的 GlobalID）
     let global_id: [u8; GLOBAL_ID_LEN] = rand::random();
 
-    // XUDP 帧用原始 dest 做地址（与 Go freedom 一致）
-    let frame_dest = dest.clone();
-
     // 4. 响应 pump: socket.recv_from → XUDP 帧 → link.writer
     let resp_sock = Arc::clone(&sock);
-    let resp_dest = frame_dest.clone();
     let resp_global_id = global_id;
     let resp_task = tokio::spawn(async move {
-        pump_response(&resp_sock, &resp_dest, resp_global_id, &mut writer).await
+        pump_response(&resp_sock, resp_global_id, &mut writer).await
     });
 
     // 5. 请求 pump: link.reader → XUDP 帧 → socket.send_to
@@ -165,25 +161,33 @@ async fn parse_and_send(
 /// 响应方向：socket.recv_from → XUDP 帧 → link.writer。
 ///
 /// 对应 Go `freedom.Process` UDP 分支的 `response` goroutine +
-/// `xudp.NewPacketWriter(link.Writer, ctx)`。
+/// `xudp.NewPacketWriter(link.Writer, ctx)`。帧来源地址 = recv_from 的真实
+/// peer（multi-dest 会话下客户端才能区分各目标的响应来源）。
 async fn pump_response(
     sock: &UdpSocket,
-    frame_dest: &Destination,
     global_id: [u8; GLOBAL_ID_LEN],
     writer: &mut Box<dyn Writer>,
 ) -> io::Result<()> {
     let mut buf = vec![0u8; RECV_BUF_SIZE];
     loop {
-        let (n, _peer) = match sock.recv_from(&mut buf).await {
+        let (n, peer) = match sock.recv_from(&mut buf).await {
             Ok(v) => v,
             Err(_) => return Ok(()),
         };
         if n == 0 {
             continue;
         }
+        // 帧来源 = 响应真实来源
+        let source = Destination::udp(
+            match peer.ip() {
+                IpAddr::V4(v) => Address::IPv4(v),
+                IpAddr::V6(v) => Address::IPv6(v),
+            },
+            Port::new(peer.port()),
+        );
         // 用同步 PacketWriter 装帧
         let mut frame = Vec::with_capacity(n + 64);
-        let mut pw = PacketWriter::new(&mut frame, frame_dest.clone(), global_id);
+        let mut pw = PacketWriter::new(&mut frame, source, global_id);
         if pw.write_packet(&buf[..n]).is_err() {
             return Ok(());
         }
@@ -196,7 +200,6 @@ async fn pump_response(
         }
     }
 }
-
 /// Destination → SocketAddr（仅 IP 地址，Domain 返回 None）。
 fn dest_to_socket_addr(dest: &Destination) -> Option<SocketAddr> {
     let port = dest.port().value();

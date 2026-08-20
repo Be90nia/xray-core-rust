@@ -438,11 +438,8 @@ impl<R: Read> PacketReader<R> {
                 Err(e) => return Err(e),
             };
 
-            let udp_target = if meta.status() == FrameStatus::Keep {
-                meta.target().cloned()
-            } else {
-                None
-            };
+            // New/Keep 帧都带目标地址（Go xudp 读端对两者同样提取）
+            let udp_target = meta.target().cloned();
 
             if meta.has_data() {
                 let mut dl = [0u8; 2];

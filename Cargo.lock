@@ -5582,6 +5582,7 @@ version = "0.1.0"
 dependencies = [
  "httparse",
  "parking_lot",
+ "rand 0.9.4",
  "ring",
  "thiserror 2.0.18",
  "tokio",
@@ -5591,6 +5592,7 @@ dependencies = [
  "xray-features",
  "xray-proto",
  "xray-transport",
+ "xray-xudp",
 ]
 
 [[package]]

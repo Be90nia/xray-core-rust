@@ -38,7 +38,7 @@ use xray_proxy_http::ServerConfig as HttpServerConfig;
 use xray_proxy_http::server::{
     http_server_handshake, extract_request_path, build_forwarded_request, HandshakeResult,
 };
-use xray_app_dispatcher::DispatchHandler;
+use xray_app_dispatcher::{DispatchHandler, UdpDispatchSession};
 // zx7: mux inbound 检测
 use xray_mux::client::{MUX_COOL_ADDRESS, MUX_COOL_PORT};
 // 补全协议 inbound 注册
@@ -120,8 +120,10 @@ async fn handle_connection(
     match socks_req {
         SocksRequest::UdpAssociate(_, relay_socket) => {
             // UDP relay：spawn pump，保持 TCP 控制连接直到客户端断开
+            // handler 是 &Arc 引用，spawn 的 future 需 'static —— spawn 前 clone
+            let udp_handler = Arc::clone(handler);
             let relay = tokio::spawn(async move {
-                let _ = handle_udp_associate(relay_socket).await;
+                let _ = handle_udp_associate(relay_socket, udp_handler).await;
             });
             // SOCKS5 UDP ASSOCIATE 语义：TCP 控制连接存在期间 relay 有效。
             // 读到 EOF/错误（客户端关闭控制连接）即终止 relay。
@@ -132,7 +134,7 @@ async fn handle_connection(
         }
         SocksRequest::TcpConnect(addr) => {
             // 2. SocksAddr → Destination
-            let dest = socks_addr_to_destination(&addr)?;
+            let dest = socks_addr_to_destination(&addr, Network::TCP);
             // 3. 拆 TcpStream → (read, write) → Link
             // ponytail: tokio::io::split 返回的 ReadHalf/WriteHalf 是 'static + Send,
             // new_reader/new_writer 接受 AsyncRead/AsyncWrite + Unpin + Send + 'static.
@@ -195,100 +197,86 @@ async fn handle_mux_inbound_link(link: Link, handler: Arc<dyn xray_app_dispatche
     idle_h.abort();
 }
 
-/// `SocksAddr` → TCP `Destination`。
+/// `SocksAddr` → `Destination`（`network` 指定 TCP/UDP）。
 ///
 /// `Host::Ipv4` → `Address::IPv4`，`Ipv6` → `Address::IPv6`，`Domain` → `Address::Domain`。
-fn socks_addr_to_destination(addr: &SocksAddr) -> std::io::Result<Destination> {
+fn socks_addr_to_destination(addr: &SocksAddr, network: Network) -> Destination {
     let address = match &addr.host {
         Host::Ipv4(ip) => Address::IPv4(*ip),
         Host::Ipv6(ip) => Address::IPv6(*ip),
         Host::Domain(d) => Address::Domain(d.clone()),
     };
-    Ok(Destination::new(address, Port::new(addr.port), Network::TCP))
+    Destination::new(address, Port::new(addr.port), network)
+}
+
+/// `Destination` → `SocksAddr`（UDP 回包帧的 BND.ADDR 来源地址）。
+fn destination_to_socks_addr(dest: &Destination) -> SocksAddr {
+    let host = match dest.address() {
+        Address::IPv4(ip) => Host::Ipv4(*ip),
+        Address::IPv6(ip) => Host::Ipv6(*ip),
+        Address::Domain(d) => Host::Domain(d.clone()),
+    };
+    SocksAddr {
+        host,
+        port: dest.port().value(),
+    }
 }
 
 /// SOCKS5 UDP ASSOCIATE relay pump。
 ///
-/// 对应 Go `proxy/socks/server.go::handleUDPPayload`。
-/// 从 relay socket 读客户端 UDP 请求帧（SOCKS5 UDP encapsulation:
-/// `[RSV(2)][FRAG(1)][ATYP][DST.ADDR][DST.PORT][DATA]`），解码出目标地址 +
-/// payload，转发到目标并回传响应。当客户端 TCP 控制连接关闭时，
-/// 调用方 abort 本 task 终止 relay。
-///
-/// ponytail: 无 UDP dispatcher 路径，每个数据报独立开 ephemeral UDP socket
-/// 转发（匹配当前 codebase 的 TCP-only dispatch 架构）。升级路径：接入
-/// dispatcher 的 UDP session，复用 per-dest 长连接 socket。
-async fn handle_udp_associate(relay_socket: UdpSocket) -> std::io::Result<()> {
+/// 对应 Go `proxy/socks/server.go::handleUDPPayload`。所有数据报经
+/// [`UdpDispatchSession`] 走 dispatcher（routing 规则选 outbound），域名目标
+/// 原样透传由 outbound 解析。当客户端 TCP 控制连接关闭时，调用方 abort 本
+/// task 终止 relay。
+async fn handle_udp_associate(
+    relay_socket: UdpSocket,
+    handler: Arc<dyn DispatchHandler>,
+) -> std::io::Result<()> {
+    let mut session = UdpDispatchSession::new(handler);
     let mut buf = [0u8; 65535];
+    // 最近一个客户端地址：响应可能晚于请求到达，跨循环迭代记忆
+    let mut last_client: Option<SocketAddr> = None;
     loop {
-        let (n, client_addr) = match relay_socket.recv_from(&mut buf).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::debug!(error = %e, "socks udp relay recv failed");
-                continue;
+        tokio::select! {
+            v = relay_socket.recv_from(&mut buf) => {
+                let (n, client) = match v {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "socks udp relay recv failed");
+                        continue;
+                    }
+                };
+                last_client = Some(client);
+                // 解码 SOCKS5 UDP 请求帧 → (目标地址, payload)
+                let (dest_addr, payload) = match decode_udp_packet(&buf[..n]) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "socks udp decode failed; dropping");
+                        continue;
+                    }
+                };
+                let dest = socks_addr_to_destination(&dest_addr, Network::UDP);
+                if session.send_packet(&dest, payload).await.is_err() {
+                    tracing::debug!("socks udp dispatch send failed");
+                }
             }
-        };
-
-        // 解码 SOCKS5 UDP 请求帧 → (目标地址, payload)
-        let (dest_addr, payload) = match decode_udp_packet(&buf[..n]) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::debug!(error = %e, "socks udp decode failed; dropping");
-                continue;
+            r = session.recv_packet() => {
+                let (source, payload) = match r {
+                    Ok(Some(v)) => v,
+                    Ok(None) => return Ok(()), // outbound 关闭，会话结束
+                    Err(e) => {
+                        tracing::debug!(error = %e, "socks udp dispatch recv failed");
+                        continue;
+                    }
+                };
+                let Some(client) = last_client else { continue };
+                // 编码响应帧（BND.ADDR = 响应来源地址），发回客户端
+                let resp = encode_udp_packet(&destination_to_socks_addr(&source), &payload);
+                if relay_socket.send_to(&resp, client).await.is_err() {
+                    tracing::debug!("socks udp send_to client failed");
+                }
             }
-        };
-
-        // 域名走 tokio lookup；IP 直接构造
-        let dest = match resolve_udp_dest(&dest_addr).await {
-            Some(d) => d,
-            None => {
-                tracing::debug!(dest = ?dest_addr, "socks udp dest resolve failed");
-                continue;
-            }
-        };
-
-        // 转发：ephemeral UDP socket → connect → send → recv (5s timeout)
-        let fwd = match UdpSocket::bind("0.0.0.0:0").await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!(error = %e, "socks udp fwd bind failed");
-                continue;
-            }
-        };
-        if fwd.connect(dest).await.is_err() {
-            continue;
         }
-        if fwd.send(payload).await.is_err() {
-            continue;
-        }
-        let mut rbuf = [0u8; 65535];
-        let rn = match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            fwd.recv(&mut rbuf),
-        )
-        .await
-        {
-            Ok(Ok(n)) => n,
-            _ => continue, // 超时或错误：丢弃，不发响应
-        };
-
-        // 编码响应帧（BND.ADDR = 目标地址），发回客户端
-        let resp = encode_udp_packet(&dest_addr, &rbuf[..rn]);
-        if relay_socket.send_to(&resp, client_addr).await.is_err() {
-            continue;
-        }
-    }
-}
-
-/// `SocksAddr` → `SocketAddr`（域名走 `tokio::net::lookup_host` 解析）。
-async fn resolve_udp_dest(addr: &SocksAddr) -> Option<SocketAddr> {
-    match &addr.host {
-        Host::Ipv4(ip) => Some(SocketAddr::new((*ip).into(), addr.port)),
-        Host::Ipv6(ip) => Some(SocketAddr::new((*ip).into(), addr.port)),
-        Host::Domain(d) => tokio::net::lookup_host((d.as_str(), addr.port))
-            .await
-            .ok()?
-            .next(),
     }
 }
 
@@ -459,78 +447,53 @@ pub async fn serve_dokodemo(
 
 /// Dokodemo-door UDP inbound 服务入口。
 ///
-/// 对应 Go `Process()` 中 `network == UDP` 分支：recv_from → 转发到预定义 dest →
-/// recv 响应 → send_to 回客户端。
-///
-/// 当前使用 per-packet ephemeral socket 模式（与 SOCKS UDP associate 一致）。
-/// Go 生产环境用 FakeUDP（Linux TPROXY 伪造源地址），此处简化。
+/// 对应 Go `Process()` 中 `network == UDP` 分支：所有数据报经
+/// [`UdpDispatchSession`] 转发到预定义 `dest`（dokodemo 语义：固定目标），
+/// 响应回发给最近一个 peer。
 pub async fn serve_dokodemo_udp(
     udp: UdpSocket,
+    handler: Arc<dyn DispatchHandler>,
     dest: Destination,
 ) -> std::io::Result<()> {
-    let udp = Arc::new(udp);
     tracing::info!(addr = %udp.local_addr()?, dest = ?dest, "dokodemo UDP inbound listening");
+    let mut session = UdpDispatchSession::new(handler);
+    let dest = Destination::udp(dest.address().clone(), dest.port());
     let mut buf = [0u8; 65535];
+    // 最近一个 peer：响应可能晚于请求到达，跨循环迭代记忆
+    let mut last_peer: Option<SocketAddr> = None;
     loop {
-        let (n, peer) = match udp.recv_from(&mut buf).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(error = %e, "dokodemo udp recv failed");
-                continue;
-            }
-        };
-        // 解析目标 SocketAddr（域名走 DNS 解析）
-        let dest_addr = match resolve_dest_socketaddr(&dest).await {
-            Some(a) => a,
-            None => {
-                tracing::debug!(dest = ?dest, "dokodemo udp dest resolve failed");
-                continue;
-            }
-        };
-        let payload = buf[..n].to_vec();
-        let udp_sock = Arc::clone(&udp);
-        // ponytail: per-packet ephemeral forward; upgrade to session-based if QPS matters.
-        tokio::spawn(async move {
-            let fwd = match UdpSocket::bind("0.0.0.0:0").await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::debug!(error = %e, "dokodemo udp fwd bind failed");
-                    return;
+        tokio::select! {
+            v = udp.recv_from(&mut buf) => {
+                let (n, peer) = match v {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "dokodemo udp recv failed");
+                        continue;
+                    }
+                };
+                last_peer = Some(peer);
+                if session.send_packet(&dest, &buf[..n]).await.is_err() {
+                    tracing::debug!("dokodemo udp dispatch send failed");
                 }
-            };
-            if fwd.connect(dest_addr).await.is_err() {
-                return;
             }
-            if fwd.send(&payload).await.is_err() {
-                return;
+            r = session.recv_packet() => {
+                let (_source, payload) = match r {
+                    Ok(Some(v)) => v,
+                    Ok(None) => return Ok(()), // outbound 关闭，会话结束
+                    Err(e) => {
+                        tracing::debug!(error = %e, "dokodemo udp dispatch recv failed");
+                        continue;
+                    }
+                };
+                let Some(peer) = last_peer else { continue };
+                if udp.send_to(&payload, peer).await.is_err() {
+                    tracing::debug!("dokodemo udp send_to client failed");
+                }
             }
-            let mut rbuf = [0u8; 65535];
-            let rn = match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                fwd.recv(&mut rbuf),
-            ).await {
-                Ok(Ok(n)) => n,
-                _ => return,
-            };
-            if udp_sock.send_to(&rbuf[..rn], peer).await.is_err() {
-                tracing::debug!("dokodemo udp send_to client failed");
-            }
-        });
+        }
     }
 }
 
-/// 将 [`Destination`] 解析为 [`SocketAddr`]（域名走 `tokio::net::lookup_host`）。
-async fn resolve_dest_socketaddr(dest: &Destination) -> Option<SocketAddr> {
-    let port = dest.port().value();
-    match dest.address() {
-        Address::IPv4(v4) => Some(SocketAddr::new((*v4).into(), port)),
-        Address::IPv6(v6) => Some(SocketAddr::new((*v6).into(), port)),
-        Address::Domain(d) => tokio::net::lookup_host((d.as_str(), port))
-            .await
-            .ok()?
-            .next(),
-    }
-}
 
 /// SS 入站模式（legacy AEAD 或 SS-2022）。
 #[derive(Clone)]
@@ -1235,10 +1198,15 @@ async fn spawn_one_inbound(
             }
             if settings.allow_udp {
                 let udp = UdpSocket::bind(&addr).await?;
+                let dispatch = ohm.get_default_handler().ok_or_else(|| {
+                    std::io::Error::other(
+                        "dokodemo UDP inbound requires a default outbound handler",
+                    )
+                })?;
                 tracing::info!(tag = %ib.tag, addr = %addr, dest = ?dest, "dokodemo UDP inbound listening");
                 let dest_udp = dest.clone();
                 handles.push(tokio::spawn(async move {
-                    if let Err(e) = serve_dokodemo_udp(udp, dest_udp).await {
+                    if let Err(e) = serve_dokodemo_udp(udp, dispatch, dest_udp).await {
                         tracing::error!(error = %e, "dokodemo UDP inbound stopped");
                     }
                 }));
@@ -2497,7 +2465,7 @@ mod tests {
             host: Host::Ipv4(Ipv4Addr::new(1, 2, 3, 4)),
             port: 8080,
         };
-        let dest = socks_addr_to_destination(&addr).unwrap();
+        let dest = socks_addr_to_destination(&addr, Network::TCP);
         assert!(dest.is_tcp());
         assert_eq!(dest.port(), Port::new(8080));
         match dest.address() {
@@ -2512,13 +2480,107 @@ mod tests {
             host: Host::Domain("example.com".to_string()),
             port: 443,
         };
-        let dest = socks_addr_to_destination(&addr).unwrap();
+        let dest = socks_addr_to_destination(&addr, Network::TCP);
         assert_eq!(dest.port(), Port::new(443));
         match dest.address() {
             Address::Domain(d) => assert_eq!(d, "example.com"),
             other => panic!("expected Domain, got {other:?}"),
         }
         let _ = ATYP_DOMAIN; // 确认 import 路径
+    }
+
+    /// b2e：dispatch 被以 UDP dest 调用即回一个标记 XUDP 响应帧。
+    ///
+    /// 用于验证 inbound UDP relay 真正走 dispatcher（而非 raw socket 直连）：
+    /// 标记 payload 只有经 dispatch link 回来才可能出现。
+    #[derive(Debug)]
+    struct MarkerUdpDispatch {
+        marker: &'static [u8],
+    }
+
+    impl xray_app_dispatcher::DispatchHandler for MarkerUdpDispatch {
+        fn tag(&self) -> &str {
+            "marker-udp-dispatch"
+        }
+
+        fn dispatch(
+            &self,
+            dest: &Destination,
+            link: Link,
+        ) -> xray_app_dispatcher::default::PinFuture<()> {
+            let source = Destination::udp(dest.address().clone(), dest.port());
+            let marker = self.marker;
+            Box::pin(async move {
+                let Link { mut writer, .. } = link;
+                let mut frame = Vec::with_capacity(marker.len() + 64);
+                let mut pw = xray_xudp::packet::PacketWriter::new(&mut frame, source, [0u8; 8]);
+                let _ = pw.write_packet(marker);
+                drop(pw);
+                let mut mb = xray_buf::multi::MultiBuffer::new();
+                mb.merge_bytes(&frame);
+                let _ = writer.write_multi_buffer(mb).await;
+            })
+        }
+    }
+
+    /// b2e：SOCKS UDP ASSOCIATE relay 经 dispatcher（UdpDispatchSession）。
+    #[tokio::test]
+    async fn socks_udp_dispatch_roundtrip() {
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
+            Arc::new(MarkerUdpDispatch { marker: b"via-dispatch" });
+        tokio::spawn(async move {
+            let _ = handle_udp_associate(relay, handler).await;
+        });
+
+        // 客户端 → relay socket：SOCKS5 UDP 请求帧（目标仅作路由地址，不打真实包）
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = SocksAddr {
+            host: Host::Ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+            port: 53,
+        };
+        client
+            .send_to(&encode_udp_packet(&target, b"ping"), relay_addr)
+            .await
+            .unwrap();
+
+        // 响应必须是 MarkerUdpDispatch 写回的标记帧（raw 直连路径给不出）
+        let mut rbuf = [0u8; 1500];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.recv_from(&mut rbuf),
+        )
+        .await
+        .expect("response via dispatcher within 5s")
+        .unwrap();
+        let (_src, payload) = decode_udp_packet(&rbuf[..n]).unwrap();
+        assert_eq!(payload, b"via-dispatch");
+    }
+
+    /// b2e：dokodemo UDP inbound 经 dispatcher（固定 dest）。
+    #[tokio::test]
+    async fn dokodemo_udp_dispatch_roundtrip() {
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local = udp.local_addr().unwrap();
+        let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
+            Arc::new(MarkerUdpDispatch { marker: b"dokodemo-via-dispatch" });
+        let dest = Destination::udp(Address::IPv4(std::net::Ipv4Addr::new(8, 8, 8, 8)), Port::new(53));
+        tokio::spawn(async move {
+            let _ = serve_dokodemo_udp(udp, handler, dest).await;
+        });
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(b"ping", local).await.unwrap();
+        let mut rbuf = [0u8; 1500];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.recv_from(&mut rbuf),
+        )
+        .await
+        .expect("response via dispatcher within 5s")
+        .unwrap();
+        assert_eq!(&rbuf[..n], b"dokodemo-via-dispatch");
     }
 
     #[test]
