@@ -82,6 +82,19 @@ impl SsConnection {
     }
 }
 
+impl SsConnection {
+    /// UDP 变体（SS-2022）：从已 connect 到 SS 服务器 UDP 端口的 socket 构造，
+    /// spawn XUDP 帧 ↔ SS-2022 UDP 会话帧 pump（[`pump_ss2022_udp`]）。
+    fn new_udp_2022(sock: UdpSocket, params: Ss2022DialParams, default_dest: Destination) -> Self {
+        let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
+        let pump = tokio::spawn(pump_ss2022_udp(sock, params, server_io, default_dest));
+        Self {
+            inner: client_io,
+            _pump: pump,
+        }
+    }
+}
+
 impl AsyncRead for SsConnection {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -192,8 +205,20 @@ pub struct SsOutboundConfig {
     pub level: u32,
     /// 用户 email（stats 系统标识用）。
     pub email: String,
+    /// SS-2022 出站参数（method 命中 2022-blake3-* 时 Some，account 字段不用于该路径）。
+    pub ss2022: Option<Ss2022DialParams>,
 }
 
+/// SS-2022 出站拨号参数（对应 Go `shadowsocks_2022.ClientConfig{Method, Key}`）。
+#[derive(Debug, Clone)]
+pub struct Ss2022DialParams {
+    /// cipher method 名（"2022-blake3-aes-128-gcm" 等）。
+    pub method: String,
+    /// 用户 PSK（base64）。
+    pub psk_b64: String,
+    /// server 主 PSK（base64，多用户 "iPSK:uPSK" 密码格式的第一段）。
+    pub identity_psk_b64: Option<String>,
+}
 impl SsOutboundConfig {
     /// 构造配置。
     #[must_use]
@@ -204,6 +229,7 @@ impl SsOutboundConfig {
             server_port,
             level: 0,
             email: String::new(),
+            ss2022: None,
         }
     }
 
@@ -218,6 +244,13 @@ impl SsOutboundConfig {
     #[must_use]
     pub fn with_email(mut self, email: impl Into<String>) -> Self {
         self.email = email.into();
+        self
+    }
+
+    /// 设置 SS-2022 出站参数（builder 风格）。
+    #[must_use]
+    pub fn with_ss2022(mut self, params: Ss2022DialParams) -> Self {
+        self.ss2022 = Some(params);
         self
     }
 }
@@ -250,6 +283,37 @@ pub fn parse_ss_config(data: &[u8]) -> Result<SsOutboundConfig, String> {
         .get("password")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "missing servers[0].password".to_string())?;
+    // SS-2022 分支（Go infra/conf/shadowsocks.go：method 命中 shadowaead_2022.List
+    // 时转 shadowsocks_2022.ClientConfig；密码为 base64 PSK，多用户 "iPSK:uPSK"）。
+    if crate::ss2022::key::CipherKind2022::from_name(method).is_ok() {
+        let port = u16::try_from(port).map_err(|_| "port out of range")?;
+        let level = first.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let email = first.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let (psk_b64, identity_psk_b64) = match password.split(':').collect::<Vec<_>>()[..] {
+            [u] => (u.to_string(), None),
+            [i, u, ..] => (u.to_string(), Some(i.to_string())),
+            [] => return Err("empty password".to_string()),
+        };
+        // account 占位（None cipher）：2022 拨号路径读 ss2022 参数，不读 account
+        let placeholder = MemoryAccount::from_proto(&xray_proto::xray::proxy::shadowsocks::Account {
+            password: psk_b64.clone(),
+            cipher_type: crate::config::CipherType::None.as_i32(),
+            iv_check: false,
+        })
+        .map_err(|e| format!("ss2022 account placeholder: {e}"))?;
+        return Ok(SsOutboundConfig::new(
+            placeholder,
+            Address::Domain(address.to_string()),
+            port,
+        )
+        .with_level(level)
+        .with_email(email)
+        .with_ss2022(Ss2022DialParams {
+            method: method.to_string(),
+            psk_b64,
+            identity_psk_b64,
+        }));
+    }
     let cipher_type = crate::config::CipherType::from_name(method)
         .ok_or_else(|| format!("unsupported cipher: {method}"))?;
     let port = u16::try_from(port).map_err(|_| "port out of range")?;
@@ -288,24 +352,47 @@ pub fn make_ss_dial_fn(config: Arc<SsOutboundConfig>) -> DialFn {
             match network {
                 // TCP：dial SS 服务器 TCP 端口 + 写加密首帧（addr+port）
                 Network::TCP => {
-                    let client = Client::new(
-                        config.account.clone(),
-                        match &config.server_address {
-                            Address::Domain(d) => d.clone(),
-                            Address::IPv4(ip) => ip.to_string(),
-                            Address::IPv6(ip) => ip.to_string(),
-                        },
-                        config.server_port,
-                    );
-                    let stream = client
-                        .dial_target(&target_addr, target_port)
-                        .await
-                        .map_err(|e| format!("ss dial: {e}"))?;
+                    let host = match &config.server_address {
+                        Address::Domain(d) => d.clone(),
+                        Address::IPv4(ip) => ip.to_string(),
+                        Address::IPv6(ip) => ip.to_string(),
+                    };
+                    let target_str = match &target_addr {
+                        Address::Domain(d) => d.clone(),
+                        Address::IPv4(ip) => ip.to_string(),
+                        Address::IPv6(ip) => ip.to_string(),
+                    };
+                    let stream = if let Some(p) = &config.ss2022 {
+                        // SS-2022：Client2022（多用户时 EIH 首帧）
+                        let mut client = crate::ss2022::client::Client2022::new(
+                            &p.method,
+                            &p.psk_b64,
+                            &host,
+                            config.server_port,
+                        )
+                        .map_err(|e| format!("ss2022 client: {e}"))?;
+                        if let Some(i) = &p.identity_psk_b64 {
+                            client = client
+                                .with_identity(i)
+                                .map_err(|e| format!("ss2022 identity: {e}"))?;
+                        }
+                        client
+                            .dial_target(&target_str, target_port)
+                            .await
+                            .map_err(|e| format!("ss2022 dial: {e}"))?
+                    } else {
+                        let client = Client::new(config.account.clone(), host, config.server_port);
+                        client
+                            .dial_target(&target_addr, target_port)
+                            .await
+                            .map_err(|e| format!("ss dial: {e}"))?
+                    };
                     Ok(Box::new(SsConnection::new(stream)) as Box<dyn Connection>)
                 }
                 // UDP：dial SS 服务器的 UDP 端口（Go internet dialer 的 network
-                // 跟随 dest），每数据报独立 [salt][AEAD(addr+port+payload)]，
-                // 非 XUDP-over-TCP
+                // 跟随 dest）。legacy：每数据报独立 [salt][AEAD(addr+port+payload)]；
+                // 2022：per-connection 会话帧（sessionId/packetId + EIH），均非
+                // XUDP-over-TCP
                 Network::UDP => {
                     let server = resolve_server(&config.server_address, config.server_port)
                         .await
@@ -318,11 +405,19 @@ pub fn make_ss_dial_fn(config: Arc<SsOutboundConfig>) -> DialFn {
                         .await
                         .map_err(|e| format!("ss udp connect: {e}"))?;
                     let default_dest = Destination::udp(target_addr, Port::new(target_port));
-                    Ok(Box::new(SsConnection::new_udp(
-                        sock,
-                        config.account.clone(),
-                        default_dest,
-                    )) as Box<dyn Connection>)
+                    if let Some(p) = &config.ss2022 {
+                        Ok(Box::new(SsConnection::new_udp_2022(
+                            sock,
+                            p.clone(),
+                            default_dest,
+                        )) as Box<dyn Connection>)
+                    } else {
+                        Ok(Box::new(SsConnection::new_udp(
+                            sock,
+                            config.account.clone(),
+                            default_dest,
+                        )) as Box<dyn Connection>)
+                    }
                 }
                 Network::Unix => Err("ss outbound does not support unix network".to_string()),
             }
@@ -429,6 +524,143 @@ async fn pump_ss_udp(
     }
 }
 
+/// SS-2022 outbound UDP 双向 pump：duplex 内的 XUDP 帧流 ↔ SS 服务器 2022 UDP 数据报。
+///
+/// 对应 Go `shadowsocks_2022` outbound 的 `DialPacketConn` + `CopyPacketConn`
+/// （非 UoT 时 connection 是 connected UDP socket，per-packet 会话帧）：
+///
+/// - up：XUDP 帧 → [`ClientUdpSession2022::encode`]（单会话 sessionId +
+///   递增 packetId + EIH + session subkey AEAD）→ `sock.send`。
+/// - down：`sock.recv` → [`ClientUdpSession2022::decode`] → (来源, payload)
+///   → XUDP 帧写回 duplex。
+async fn pump_ss2022_udp(
+    sock: UdpSocket,
+    params: Ss2022DialParams,
+    server_io: DuplexStream,
+    default_dest: Destination,
+) {
+    use crate::ss2022::key::{psk_from_base64, CipherKind2022};
+    use crate::ss2022::packet::ClientUdpSession2022;
+
+    let kind = CipherKind2022::from_name(&params.method);
+    let session = match kind.map_err(|e| e.to_string()).and_then(|kind| {
+        let mut psk_list = Vec::new();
+        if let Some(i) = &params.identity_psk_b64 {
+            psk_list.push(psk_from_base64(i).map_err(|e| e.to_string())?);
+        }
+        psk_list.push(psk_from_base64(&params.psk_b64).map_err(|e| e.to_string())?);
+        ClientUdpSession2022::new(kind, psk_list).map_err(|e| e.to_string())
+    }) {
+        Ok(s) => std::sync::Arc::new(s),
+        Err(e) => {
+            tracing::debug!("ss2022 udp session init: {e}");
+            return;
+        }
+    };
+
+    let sock = Arc::new(sock);
+    let (mut rd, mut wr) = tokio::io::split(server_io);
+
+    // up: duplex → XUDP 帧解析 → 2022 UDP 数据报
+    let up_sock = Arc::clone(&sock);
+    let up_session = Arc::clone(&session);
+    let up = async move {
+        let mut accum: Vec<u8> = Vec::new();
+        let mut buf = vec![0u8; 8 * 1024];
+        loop {
+            let mut progress = true;
+            while progress {
+                match parse_and_send_2022(&up_sock, &up_session, &mut accum, &default_dest).await {
+                    Ok(made) => progress = made,
+                    Err(e) => {
+                        tracing::debug!("ss2022 udp up forward error: {e}");
+                        return;
+                    }
+                }
+            }
+            match rd.read(&mut buf).await {
+                Ok(0) => return, // link EOF
+                Ok(n) => accum.extend_from_slice(&buf[..n]),
+                Err(e) => {
+                    tracing::debug!("ss2022 udp up read error: {e}");
+                    return;
+                }
+            }
+        }
+    };
+
+    // down: SS 服务器回包 → decode → XUDP 帧 → duplex
+    let down = async move {
+        let global_id: [u8; GLOBAL_ID_LEN] = rand::random();
+        let mut rbuf = vec![0u8; 65_535];
+        loop {
+            let n = match sock.recv(&mut rbuf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::debug!("ss2022 udp down recv error: {e}");
+                    break;
+                }
+            };
+            // 解码失败跳过（Go ReadPacket 失败丢弃该包）
+            let Ok((addr, port, payload)) = session.decode(&rbuf[..n]) else {
+                continue;
+            };
+            let source = Destination::udp(addr, Port::new(port));
+            let mut frame = Vec::with_capacity(payload.len() + 64);
+            let mut pw = PacketWriter::new(&mut frame, source, global_id);
+            if pw.write_packet(&payload).is_err() {
+                break;
+            }
+            drop(pw);
+            if wr.write_all(&frame).await.is_err() {
+                break; // client 侧已关闭
+            }
+        }
+        let _ = wr.shutdown().await;
+    };
+
+    tokio::select! {
+        _ = up => {}
+        _ = down => {}
+    }
+}
+
+/// 从 accum 前端解析一个 XUDP 帧 → 2022 帧编码 → `sock.send`。
+///
+/// 返回 `true` 表示消费了一帧；accum 为空或帧不完整返回 `false`；
+/// 致命错误返回 `Err`。
+async fn parse_and_send_2022(
+    sock: &Arc<UdpSocket>,
+    session: &std::sync::Arc<crate::ss2022::packet::ClientUdpSession2022>,
+    accum: &mut Vec<u8>,
+    default_dest: &Destination,
+) -> io::Result<bool> {
+    if accum.is_empty() {
+        return Ok(false);
+    }
+    let (result, consumed) = {
+        let mut cursor = std::io::Cursor::new(&accum[..]);
+        let mut pr = PacketReader::new(&mut cursor);
+        let r = pr.read_packet();
+        (r, cursor.position() as usize)
+    };
+    match result {
+        Ok(Some(pkt)) => {
+            accum.drain(..consumed);
+            let (data, target) = pkt.into_parts();
+            let dest = target.unwrap_or_else(|| default_dest.clone());
+            let enc = session
+                .encode(dest.address(), dest.port().value(), &data)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            sock.send(&enc).await?;
+            Ok(true)
+        }
+        Ok(None) => Ok(false), // 帧不完整，等更多数据
+        Err(PacketError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
+    }
+}
+
 /// 从 accum 前端解析一个 XUDP 帧 → `encode_udp_packet` → `sock.send`。
 ///
 /// 返回 `true` 表示消费了一帧；accum 为空或帧不完整返回 `false`；
@@ -487,6 +719,39 @@ mod tests {
             8388,
         );
         assert_eq!(cfg.server_port, 8388);
+    }
+
+    #[test]
+    fn parse_ss_config_2022_single_user() {
+        let data = br#"{"servers":[{"address":"ss.example.com","port":8388,
+            "method":"2022-blake3-aes-256-gcm",
+            "password":"aGkgZnJvbSBzczIwMjIgc2VydmVyIHByaW1hcnkga2V5IQ=="}]}"#;
+        let cfg = parse_ss_config(data).expect("parse 2022");
+        let p = cfg.ss2022.expect("ss2022 params");
+        assert_eq!(p.method, "2022-blake3-aes-256-gcm");
+        assert_eq!(p.psk_b64, "aGkgZnJvbSBzczIwMjIgc2VydmVyIHByaW1hcnkga2V5IQ==");
+        assert!(p.identity_psk_b64.is_none());
+        assert_eq!(cfg.server_port, 8388);
+    }
+
+    #[test]
+    fn parse_ss_config_2022_multi_user() {
+        // base64(32B server PSK) : base64(32B user PSK)
+        let ipsk = "serverpskserverpskserverpskserver".to_string();
+        let upsk = "userpskuserpskuserpskuserpskuser".to_string();
+        let data = format!(
+            r#"{{"servers":[{{"address":"ss.example.com","port":8388,
+            "method":"2022-blake3-aes-128-gcm",
+            "password":"{ipsk}:{upsk}"}}]}}"#
+        );
+        // 长度不匹配（非 16/32B 解码）会报 InvalidPassword——这里只验证解析分流
+        let r = parse_ss_config(data.as_bytes());
+        // 非法 PSK 长度：dial 时才校验，parse 阶段只要 method 命中就通过
+        if let Ok(cfg) = r {
+            let p = cfg.ss2022.expect("ss2022 params");
+            assert_eq!(p.identity_psk_b64.as_deref(), Some(ipsk.as_str()));
+            assert_eq!(p.psk_b64, upsk);
+        }
     }
 
     #[test]

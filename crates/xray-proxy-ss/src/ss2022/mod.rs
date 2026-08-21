@@ -6,6 +6,7 @@
 pub mod client;
 pub mod inbound;
 pub mod key;
+pub mod packet;
 pub mod outbound;
 
 pub use client::Client2022;
@@ -14,4 +15,7 @@ pub use inbound::{
     Ss2022User,
 };
 pub use key::{psk_from_base64, CipherKind2022, derive_session_subkey};
+pub use packet::{
+    ClientUdpSession2022, DecodedClientHeader, ServerUdpSession2022, SlidingWindow,
+};
 pub use outbound::{Ss2022Outbound, Ss2022OutboundConfig, UdpOverTcpConfig};

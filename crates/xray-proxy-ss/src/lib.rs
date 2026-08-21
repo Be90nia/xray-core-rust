@@ -25,7 +25,7 @@ pub use error::{Result, SsError};
 pub use validator::Validator;
 pub use inbound::SsInbound;
 pub use outbound::SsOutbound;
-pub use dispatcher::{make_ss_dial_fn, parse_ss_config, SsConnection, SsOutboundConfig};
+pub use dispatcher::{make_ss_dial_fn, parse_ss_config, Ss2022DialParams, SsConnection, SsOutboundConfig};
 pub use ss2022::{
     Client2022, CipherKind2022, InboundResult, MultiUserInbound, RelayDestination,
     RelayInbound, Ss2022Inbound, Ss2022Outbound, Ss2022OutboundConfig, Ss2022User,

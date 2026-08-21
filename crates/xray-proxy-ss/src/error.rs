@@ -112,6 +112,12 @@ pub enum SsError {
 
     #[error("ss-2022 padding too large: {0}")]
     Ss2022PaddingTooLarge(usize),
+
+    #[error("ss-2022 packet id not unique (replay?)")]
+    Ss2022PacketIdNotUnique,
+
+    #[error("ss-2022 server packet clientSessionId mismatch")]
+    Ss2022BadClientSessionId,
 }
 
 impl From<std::io::Error> for SsError {

@@ -519,15 +519,46 @@ pub async fn serve_ss(
     let handler = ohm
         .get_default_handler()
         .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
-    // SS Legacy UDP relay：同端口 UDP 监听（Go Process(UDP) 分支）。SS2022 不在此列（agb）。
-    if let SsInboundMode::Legacy(ib) = &inbound {
+    // SS UDP relay：同端口 UDP 监听（Go Process(UDP) 分支；legacy 与 2022 均有）
+    enum SsUdpFlavor {
+        Legacy(Arc<SsInbound>),
+        Ss2022 {
+            kind: xray_proxy_ss::ss2022::key::CipherKind2022,
+            server_psk: Vec<u8>,
+            users: Vec<([u8; 16], Vec<u8>)>,
+        },
+    }
+    let udp_flavor = match &inbound {
+        SsInboundMode::Legacy(ib) => Some(SsUdpFlavor::Legacy(Arc::clone(ib))),
+        SsInboundMode::Ss2022(ib) => Some(SsUdpFlavor::Ss2022 {
+            kind: ib.kind(),
+            server_psk: ib.psk().to_vec(),
+            users: Vec::new(),
+        }),
+        SsInboundMode::Ss2022Multi(ib) => Some(SsUdpFlavor::Ss2022 {
+            kind: ib.kind(),
+            server_psk: ib.server_psk().to_vec(),
+            users: ib.udp_user_table(),
+        }),
+        // relay 模式 Go 走 RelayService NewPacketConnection（整 PacketConn 中继），
+        // 不在本批
+        SsInboundMode::Ss2022Relay(_) => None,
+    };
+    if let Some(flavor) = udp_flavor {
         let port = listener.local_addr()?.port();
         match tokio::net::UdpSocket::bind(("0.0.0.0", port)).await {
             Ok(sock) => {
-                let ib = Arc::clone(ib);
-                let udp_handler = Arc::clone(&handler);
+                let handler = Arc::clone(&handler);
                 tokio::spawn(async move {
-                    let _ = serve_ss_udp(Arc::new(sock), ib, udp_handler).await;
+                    let _ = match flavor {
+                        SsUdpFlavor::Legacy(ib) => {
+                            serve_ss_udp(Arc::new(sock), ib, handler).await
+                        }
+                        SsUdpFlavor::Ss2022 { kind, server_psk, users } => {
+                            serve_ss2022_udp(Arc::new(sock), kind, server_psk, users, handler)
+                                .await
+                        }
+                    };
                 });
             }
             Err(e) => tracing::warn!(error = %e, port, "ss udp bind failed, udp relay disabled"),
@@ -770,6 +801,150 @@ async fn ss_udp_client_relay(
                     Ok(None) => break, // outbound 关闭，会话结束
                     Err(e) => {
                         tracing::debug!(error = %e, "ss udp dispatch recv failed");
+                        continue; // 坏帧跳过（与 SOCKS relay 一致）
+                    }
+                }
+            }
+            _ = &mut idle => break, // 60s 空闲淘汰
+        }
+    }
+}
+
+/// SS-2022 UDP relay 入口（Go `MultiService.newPacket` + `udpNat`）。
+///
+/// recv_from → [`server_decode_header`]（ECB 头 + EIH 用户识别）→ 按 client
+/// sessionId 分发到 per-session NAT entry（[`ServerUdpSession2022`] +
+/// [`ss2022_udp_client_relay`]，Go `udpNat` cone 会话模型）。回包由 relay
+/// task 用该会话的 server sessionId/cipher `encode` 后 send_to 客户端。
+///
+/// `users` 空 = 单用户（AEAD key 直接从 server PSK 派生）。
+pub async fn serve_ss2022_udp(
+    udp: Arc<UdpSocket>,
+    kind: xray_proxy_ss::ss2022::key::CipherKind2022,
+    server_psk: Vec<u8>,
+    users: Vec<([u8; 16], Vec<u8>)>,
+    handler: Arc<dyn DispatchHandler>,
+) -> std::io::Result<()> {
+    use xray_proxy_ss::ss2022::packet::{server_decode_header, ServerUdpSession2022};
+
+    tracing::info!(addr = %udp.local_addr()?, "ss2022 udp relay listening");
+    let mut buf = vec![0u8; 65_536];
+    type Item = (Destination, Vec<u8>, SocketAddr);
+    let mut sessions: HashMap<u64, tokio::sync::mpsc::Sender<Item>> = HashMap::new();
+    let mut server_sessions: HashMap<u64, Arc<ServerUdpSession2022>> = HashMap::new();
+    loop {
+        let (n, client) = match udp.recv_from(&mut buf).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "ss2022 udp recv failed");
+                continue;
+            }
+        };
+        // ponytail: 收包时顺带清扫已退出（60s 空闲淘汰）会话的残留 sender；
+        // O(sessions)/包，海量并发 UDP 客户端时换后台定时清扫
+        sessions.retain(|_, tx| !tx.is_closed());
+        // 1. ECB 解头 + EIH 用户识别
+        let hdr = match server_decode_header(kind, &server_psk, &users, &buf[..n]) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::debug!(error = %e, "ss2022 udp decode header failed (unknown user?)");
+                continue;
+            }
+        };
+        let sid = hdr.session_id;
+        // 2. 查/建 per-sessionId NAT entry
+        if !server_sessions.contains_key(&sid) {
+            match ServerUdpSession2022::new(kind, hdr.aead_psk.to_vec(), sid) {
+                Ok(s) => {
+                    server_sessions.insert(sid, Arc::new(s));
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "ss2022 udp session init failed");
+                    continue;
+                }
+            }
+        }
+        let Some(session) = server_sessions.get(&sid) else {
+            continue;
+        };
+        // 3. AEAD 解 body + 解析目标（重放/时间戳校验在 decode_body 内）
+        let (address, port, payload) = match session.decode_body(
+            &hdr.hdr,
+            hdr.packet_id,
+            &buf[16 + hdr.eih_len..n],
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "ss2022 udp decode body failed");
+                continue;
+            }
+        };
+        let dest = Destination::new(address, Port::new(port), Network::UDP);
+        // 4. 分发到 relay task（首包懒建）
+        let tx = sessions.entry(sid).or_insert_with(|| {
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            tokio::spawn(ss2022_udp_client_relay(
+                Arc::clone(&udp),
+                client,
+                Arc::clone(session),
+                rx,
+                Arc::clone(&handler),
+            ));
+            tx
+        });
+        if tx.send((dest, payload, client)).await.is_err() {
+            // relay task 已退出（空闲淘汰）：丢弃 entry，该 session 下一包重建
+            sessions.remove(&sid);
+        }
+    }
+}
+
+/// 单 client session 的 SS-2022 UDP relay（Go 每个 udpNat entry 的读写 task）。
+///
+/// - up：主循环 decode 后的 (dest, payload) → [`UdpDispatchSession::send_packet`]
+/// - down：`recv_packet` 回包 → [`ServerUdpSession2022::encode`] →
+///   send_to 客户端（最新源地址，随每包更新）
+///
+/// 60s 双向无活动自动退出。
+async fn ss2022_udp_client_relay(
+    udp: Arc<UdpSocket>,
+    mut client: SocketAddr,
+    session: Arc<xray_proxy_ss::ss2022::packet::ServerUdpSession2022>,
+    mut rx: tokio::sync::mpsc::Receiver<(Destination, Vec<u8>, SocketAddr)>,
+    handler: Arc<dyn DispatchHandler>,
+) {
+    let mut dispatch = UdpDispatchSession::new(handler);
+    let idle = tokio::time::sleep(SS_UDP_IDLE_TIMEOUT);
+    tokio::pin!(idle);
+    loop {
+        tokio::select! {
+            item = rx.recv() => {
+                match item {
+                    Some((dest, payload, src)) => {
+                        client = src;
+                        if dispatch.send_packet(&dest, &payload).await.is_err() {
+                            break;
+                        }
+                        idle.as_mut().reset(tokio::time::Instant::now() + SS_UDP_IDLE_TIMEOUT);
+                    }
+                    None => break, // 主循环丢弃本 entry（会话被替换）
+                }
+            }
+            r = dispatch.recv_packet() => {
+                match r {
+                    Ok(Some((source, payload))) => {
+                        if let Ok(enc) = session.encode(
+                            source.address(),
+                            source.port().value(),
+                            &payload,
+                        ) {
+                            let _ = udp.send_to(&enc, client).await;
+                        }
+                        idle.as_mut().reset(tokio::time::Instant::now() + SS_UDP_IDLE_TIMEOUT);
+                    }
+                    Ok(None) => break, // outbound 关闭，会话结束
+                    Err(e) => {
+                        tracing::debug!(error = %e, "ss2022 udp dispatch recv failed");
                         continue; // 坏帧跳过（与 SOCKS relay 一致）
                     }
                 }
@@ -2165,6 +2340,227 @@ mod tests {
         drop(client);
         // 留时间给桥收尾（read EOF → 关闭）
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    /// agb：SS-2022 UDP inbound → dispatch → 回环 e2e（多用户 EIH，
+    /// MarkerUdpDispatch 验证真正经 dispatch link，模式同 ss_udp_dispatch_roundtrip）。
+    #[tokio::test]
+    async fn ss2022_udp_dispatch_roundtrip() {
+        use xray_proxy_ss::ss2022::key::{CipherKind2022, psk_identity};
+        use xray_proxy_ss::ss2022::packet::ClientUdpSession2022;
+
+        // 1. PSK（多用户：server iPSK + user uPSK）+ serve_ss2022_udp
+        let ipsk: Vec<u8> = (0..32u8).collect();
+        let upsk: Vec<u8> = (32..64u8).collect();
+        let users = vec![(psk_identity(&upsk), upsk.clone())];
+        let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
+            Arc::new(MarkerUdpDispatch { marker: b"ss2022-via-dispatch" });
+        tokio::spawn(serve_ss2022_udp(
+            Arc::new(relay),
+            CipherKind2022::Aes256Gcm,
+            ipsk.clone(),
+            users,
+            handler,
+        ));
+
+        // 2. client：2022 UDP 帧 → relay（目标任意，marker handler 不打真实包）
+        let client_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client_sock.connect(relay_addr).await.unwrap();
+        let client = ClientUdpSession2022::new(
+            CipherKind2022::Aes256Gcm,
+            vec![ipsk, upsk],
+        )
+        .unwrap();
+        let frame = client
+            .encode(&Address::IPv4(Ipv4Addr::LOCALHOST), 53, b"ping")
+            .unwrap();
+        client_sock.send(&frame).await.unwrap();
+
+        // 3. 收回帧并 decode 出标记 payload
+        let mut rbuf = vec![0u8; 2048];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_sock.recv(&mut rbuf),
+        )
+        .await
+        .expect("response via dispatcher within 5s")
+        .expect("recv");
+        let (_addr, _port, data) = client.decode(&rbuf[..n]).unwrap();
+        assert_eq!(data, b"ss2022-via-dispatch");
+    }
+
+    /// agb：SS-2022 UDP inbound → freedom UDP dispatch → 真 echo 回环 e2e
+    /// （FreedomDispatchBridge 的 UDP 分支走 udp::relay，DialBridge 仅 TCP）。
+    #[tokio::test]
+    async fn ss2022_udp_inbound_dispatch_to_freedom_e2e() {
+        use xray_proxy_freedom::dispatcher::FreedomDispatchBridge;
+        use xray_proxy_freedom::make_freedom_dial_fn;
+        use xray_app_dispatcher::default::DialBridge;
+        use xray_proxy_ss::ss2022::key::{CipherKind2022, psk_identity};
+        use xray_proxy_ss::ss2022::packet::ClientUdpSession2022;
+
+        // 1. UDP echo server
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        let echo_v4 = match echo_addr.ip() {
+            std::net::IpAddr::V4(v4) => v4,
+            _ => panic!("echo should be ipv4"),
+        };
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65_535];
+            loop {
+                let Ok((n, peer)) = echo.recv_from(&mut buf).await else { break };
+                let _ = echo.send_to(&buf[..n], peer).await;
+            }
+        });
+
+        // 2. PSK（多用户）+ serve_ss2022_udp + FreedomDispatchBridge
+        let ipsk: Vec<u8> = (0..32u8).collect();
+        let upsk: Vec<u8> = (32..64u8).collect();
+        let users = vec![(psk_identity(&upsk), upsk.clone())];
+        let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> = Arc::new(
+            FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new("freedom", make_freedom_dial_fn()))),
+        );
+        tokio::spawn(serve_ss2022_udp(
+            Arc::new(relay),
+            CipherKind2022::Aes256Gcm,
+            ipsk.clone(),
+            users,
+            handler,
+        ));
+
+        // 3. client：2022 UDP 帧 → serve → freedom dispatch → echo → 回帧
+        let client_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client_sock.connect(relay_addr).await.unwrap();
+        let client = ClientUdpSession2022::new(
+            CipherKind2022::Aes256Gcm,
+            vec![ipsk, upsk],
+        )
+        .unwrap();
+
+        let payload = b"ss2022-udp-dispatch-e2e".to_vec();
+        let frame = client
+            .encode(&Address::IPv4(echo_v4), echo_addr.port(), &payload)
+            .unwrap();
+        client_sock.send(&frame).await.unwrap();
+
+        let mut rbuf = vec![0u8; 65_535];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_sock.recv(&mut rbuf),
+        )
+        .await
+        .expect("recv timeout")
+        .expect("recv");
+        let (addr, port, echoed) = client.decode(&rbuf[..n]).unwrap();
+        assert_eq!(addr, Address::IPv4(echo_v4));
+        assert_eq!(port, echo_addr.port());
+        assert_eq!(echoed, payload);
+    }
+
+    /// agb：SS-2022 UDP outbound（make_ss_dial_fn 2022 分支）→ serve_ss2022_udp
+    /// 完整对拉 e2e：duplex XUDP 帧 → SsConnection 2022 pump → UDP → inbound
+    /// 解包 → freedom → echo → 回程全链。
+    #[tokio::test]
+    async fn ss2022_udp_outbound_inbound_roundtrip_e2e() {
+        use xray_proxy_freedom::dispatcher::FreedomDispatchBridge;
+        use xray_proxy_freedom::make_freedom_dial_fn;
+        use xray_app_dispatcher::default::DialBridge;
+        use xray_proxy_ss::ss2022::key::{CipherKind2022, psk_identity};
+        use base64::Engine as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::io::AsyncWriteExt as _;
+        use xray_xudp::packet::{PacketReader, PacketWriter};
+
+        // 1. UDP echo server
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        let echo_v4 = match echo_addr.ip() {
+            std::net::IpAddr::V4(v4) => v4,
+            _ => panic!("echo should be ipv4"),
+        };
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65_535];
+            loop {
+                let Ok((n, peer)) = echo.recv_from(&mut buf).await else { break };
+                let _ = echo.send_to(&buf[..n], peer).await;
+            }
+        });
+
+        // 2. SS-2022 server（inbound 侧，多用户）
+        let ipsk: Vec<u8> = (0..32u8).collect();
+        let upsk: Vec<u8> = (32..64u8).collect();
+        let users = vec![(psk_identity(&upsk), upsk.clone())];
+        let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_port = relay.local_addr().unwrap().port();
+        let echo_handler: Arc<dyn xray_app_dispatcher::DispatchHandler> = Arc::new(
+            FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new("freedom", make_freedom_dial_fn()))),
+        );
+        tokio::spawn(serve_ss2022_udp(
+            Arc::new(relay),
+            CipherKind2022::Aes256Gcm,
+            ipsk.clone(),
+            users,
+            echo_handler,
+        ));
+
+        // 3. SS-2022 outbound：parse_ss_config（2022 method 分流）+ make_ss_dial_fn
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let cfg_json = format!(
+            r#"{{"servers":[{{"address":"127.0.0.1","port":{relay_port},
+            "method":"2022-blake3-aes-256-gcm",
+            "password":"{}:{}"}}]}}"#,
+            b64.encode(&ipsk),
+            b64.encode(&upsk),
+        );
+        let cfg = std::sync::Arc::new(xray_proxy_ss::parse_ss_config(cfg_json.as_bytes()).unwrap());
+        assert!(cfg.ss2022.is_some(), "2022 method should route to ss2022 params");
+        let ss_bridge = Arc::new(DialBridge::new("ss2022-out", xray_proxy_ss::make_ss_dial_fn(cfg)));
+
+        // 4. dispatch link：duplex 承载 XUDP 帧流（模拟 inbound 侧）
+        let (mut client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let dest = Destination::new(Address::IPv4(echo_v4), Port::new(echo_addr.port()), Network::UDP);
+        let (srv_rd, srv_wr) = tokio::io::split(server_io);
+        tokio::spawn(async move {
+            ss_bridge.dispatch(&dest, xray_transport::link::Link::new(
+                xray_buf::io::new_reader(srv_rd),
+                xray_buf::io::new_writer(srv_wr),
+            )).await;
+        });
+
+        // 5. 写 XUDP 帧 → 2022 outbound → inbound 解包 → freedom → echo → 回帧
+        let payload = b"ss2022-outbound-e2e".to_vec();
+        let mut frame = Vec::new();
+        let mut pw = PacketWriter::new(
+            &mut frame,
+            Destination::new(Address::IPv4(echo_v4), Port::new(echo_addr.port()), Network::UDP),
+            [0u8; 8],
+        );
+        pw.write_packet(&payload).unwrap();
+        drop(pw);
+        client_io.write_all(&frame).await.unwrap();
+
+        let mut accum = Vec::new();
+        let mut buf = vec![0u8; 8 * 1024];
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let n = tokio::time::timeout_at(deadline, client_io.read(&mut buf))
+                .await
+                .expect("response within 5s")
+                .expect("read");
+            accum.extend_from_slice(&buf[..n]);
+            let mut cursor = std::io::Cursor::new(&accum[..]);
+            let mut pr = PacketReader::new(&mut cursor);
+            if let Ok(Some(pkt)) = pr.read_packet() {
+                let (data, _) = pkt.into_parts();
+                assert_eq!(data, payload);
+                return;
+            }
+        }
     }
 
     /// parse_socks_server_config：auth/users/accounts/udp/userLevel 字段对齐 Go conf。

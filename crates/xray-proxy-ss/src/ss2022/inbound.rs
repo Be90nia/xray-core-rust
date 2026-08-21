@@ -126,6 +126,12 @@ impl Ss2022Inbound {
     pub fn kind(&self) -> CipherKind2022 {
         self.kind
     }
+
+    /// 返回 server PSK（UDP relay 用）。
+    #[must_use]
+    pub fn psk(&self) -> &[u8] {
+        &self.psk
+    }
 }
 
 // ============================================================================
@@ -242,6 +248,29 @@ impl MultiUserInbound {
             return Err(SsError::UserNotFoundByEmail(email.to_string()));
         }
         Ok(())
+    }
+
+    /// 返回 cipher kind（UDP relay 用）。
+    #[must_use]
+    pub fn kind(&self) -> CipherKind2022 {
+        self.kind
+    }
+
+    /// 返回 server 主 PSK（UDP relay 的 EIH 解密 key）。
+    #[must_use]
+    pub fn server_psk(&self) -> &[u8] {
+        &self.psk
+    }
+
+    /// 返回用户 (identity, psk) 表快照（UDP relay 的 EIH 用户识别）。
+    #[must_use]
+    pub fn udp_user_table(&self) -> Vec<([u8; 16], Vec<u8>)> {
+        use crate::ss2022::key::psk_identity;
+        self.users
+            .lock()
+            .iter()
+            .map(|u| (psk_identity(&u.psk), u.psk.clone()))
+            .collect()
     }
 
     /// 当前用户数。
