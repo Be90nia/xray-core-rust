@@ -26,4 +26,5 @@ async-trait = { workspace = true }
 [dev-dependencies]
 xray-proxy-freedom = { path = "../xray-proxy-freedom" }
 tokio = { workspace = true, features = ["full", "test-util"] }
+parking_lot = { workspace = true }
 rcgen = "0.13"

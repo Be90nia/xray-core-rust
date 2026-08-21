@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
-use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -17,11 +16,11 @@ use uuid::Uuid;
 use xray_features::inbound::{InboundError, InboundHandler};
 
 use crate::error::{Result, TuicError};
-use crate::protocol::command::TOKEN_LEN;
-use crate::protocol::Command;
+use crate::protocol::command::{type_code, TOKEN_LEN};
+use crate::protocol::{Command, Packet};
 use crate::server::{
     addr_to_socket_addr, read_command_from_stream, read_frame_from_recv, relay_to_tcp,
-    relay_udp, BiFrame,
+    BiFrame, ReplySink, UdpAssocTable,
 };
 
 /// TUIC inbound 配置。
@@ -266,7 +265,11 @@ async fn handle_connection(
         }
     }
 
-    // accept_bi + accept_uni 双向循环（bd 8hb）：Heartbeat/Dissociate 走 uni stream。
+    // accept_bi + accept_uni + read_datagram 三路循环（bd 8hb + 7ry/1ur）：
+    // Heartbeat/Dissociate 走 uni stream；UDP 包可走 bi-stream（quic 模式）
+    // 或 QUIC DATAGRAM（native 模式，spec：datagram 承载完整 Packet 命令帧）。
+    // UDP 会话表注入 dispatch（with_dispatch 生产路径；None 回退 mock 直连）。
+    let mut udp_table = UdpAssocTable::new(dispatch.clone());
     loop {
         tokio::select! {
             bi = conn.accept_bi() => {
@@ -275,7 +278,7 @@ async fn handle_connection(
                     Err(quinn::ConnectionError::ApplicationClosed(_)) => break,
                     Err(e) => return Err(e.into()),
                 };
-                handle_bi_frame(send_bi, recv_bi, dispatch.clone()).await;
+                handle_bi_frame(send_bi, recv_bi, dispatch.clone(), &mut udp_table).await;
             }
             uni = conn.accept_uni() => {
                 let mut uni = match uni {
@@ -286,11 +289,19 @@ async fn handle_connection(
                 match read_command_from_stream(&mut uni, 64).await {
                     Ok(Command::Heartbeat) => {}
                     Ok(Command::Dissociate { assoc_id }) => {
-                        // UDP assoc 会话化属 7ry/1ur 范围；当前无 assoc 状态可清理。
-                        tracing::debug!("tuic inbound: dissociate assoc {assoc_id} (no assoc state)");
+                        udp_table.dissociate(assoc_id);
                     }
                     Ok(_) => {}
                     Err(e) => tracing::debug!("tuic inbound: uni stream read: {e:?}"),
+                }
+            }
+            dg = conn.read_datagram() => {
+                match dg {
+                    Ok(dg) => handle_datagram(&dg, &conn, &mut udp_table),
+                    Err(e) => {
+                        tracing::debug!("tuic inbound: datagram read: {e:?}");
+                        break;
+                    }
                 }
             }
         }
@@ -299,11 +310,32 @@ async fn handle_connection(
     Ok(())
 }
 
+/// 处理一个 QUIC DATAGRAM（native UDP 模式，bd 7ry）。
+///
+/// spec：datagram 承载完整命令帧（VER + TYPE + 负载）；Packet 路由到
+/// assoc 会话并以 datagram 模式回写，Heartbeat 等保活命令忽略。
+fn handle_datagram(
+    dg: &bytes::Bytes,
+    conn: &quinn::Connection,
+    table: &mut UdpAssocTable,
+) {
+    let mut cursor = &dg[..];
+    match crate::protocol::parse_header(&mut cursor) {
+        Ok(t) if t == type_code::PACKET => match Packet::read_payload(&mut cursor) {
+            Ok(pkt) => table.handle_packet(pkt, ReplySink::Dgram(conn.clone())),
+            Err(e) => tracing::debug!("tuic inbound: datagram packet parse: {e:?}"),
+        },
+        Ok(_) => {} // Heartbeat 可走 datagram（spec），保活语义无需处理
+        Err(e) => tracing::debug!("tuic inbound: datagram header: {e:?}"),
+    }
+}
+
 /// 处理一条 bi stream：Connect → dispatcher 生产路径 / mock 直连；Packet → UDP relay。
 async fn handle_bi_frame(
     send_bi: quinn::SendStream,
     recv_bi: quinn::RecvStream,
     dispatch: Option<Arc<dyn xray_app_dispatcher::DispatchHandler>>,
+    udp_table: &mut UdpAssocTable,
 ) {
     match read_frame_from_recv(recv_bi, 256).await {
         Ok((frame, recv_bi, initial_bytes)) => match frame {
@@ -342,17 +374,15 @@ async fn handle_bi_frame(
             BiFrame::Command(Command::Heartbeat) => {}
             BiFrame::Command(_) => {}
             BiFrame::Packet(pkt) => {
-                tokio::spawn(async move {
-                    if let Err(e) = relay_udp(pkt, send_bi, recv_bi, initial_bytes).await {
-                        tracing::debug!("tuic udp relay: {e:?}");
-                    }
-                });
+                // bi-stream 模式：路由进 assoc 会话（dispatch 模式域名透传）
+                udp_table.handle_packet(pkt, ReplySink::Bi(send_bi));
             }
         },
         Err(e) => {
             tracing::warn!("tuic inbound: failed to read frame: {e:?}");
         }
     }
+
 }
 
 /// 前缀已读字节的 reader：先吐 `initial`，再透传内层流。

@@ -5,16 +5,24 @@
 //! 2. quinn Endpoint::server 监听，ALPN 协商 h3 + tuic
 //! 3. accept_uni → Authenticate 校验 token（export_keying_material）
 //! 4. accept_bi → Connect → tokio TCP dial 目标 → 双向 copy（true relay）
-//! 5. accept_bi → Packet → tokio UDP dial 目标 → 单次 recv_from 响应 → Packet 帧回写
+//! 5. accept_bi → Packet / read_datagram → native datagram →
+//!    per-assoc UDP 会话表（bd 1ur/7ry）：assoc_id → 长生命周期出口，
+//!    响应按请求到达模式（bi-stream / datagram）回写；Dissociate 销毁会话
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::BufMut;
+use bytes::{BufMut, BytesMut};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
+
+use xray_app_dispatcher::{DispatchHandler, UdpDispatchSession};
+use xray_common::net::address::Address as XAddress;
+use xray_common::net::destination::Destination;
+use xray_common::net::port::Port;
 
 use crate::error::{Result, TuicError};
 use crate::protocol::command::{type_code, TOKEN_LEN};
@@ -166,9 +174,10 @@ async fn handle_connection(
         }
     }
 
-    // accept_bi + accept_uni 双向循环（bd 8hb）：
-    // TUIC v5 的 Heartbeat/Dissociate 走 uni stream，原先只 accept_bi 一次 uni
-    // 都不读，客户端后续 uni 帧被服务端永久忽略。
+    // accept_bi + accept_uni + read_datagram 三路循环（bd 8hb + 7ry/1ur）：
+    // Heartbeat/Dissociate 走 uni stream；UDP 包可走 bi-stream（quic 模式）
+    // 或 QUIC DATAGRAM（native 模式，spec：datagram 承载完整 Packet 命令帧）。
+    let mut udp_table = UdpAssocTable::new(None);
     loop {
         tokio::select! {
             bi = conn.accept_bi() => {
@@ -177,7 +186,7 @@ async fn handle_connection(
                     Err(quinn::ConnectionError::ApplicationClosed(_)) => break,
                     Err(e) => return Err(e.into()),
                 };
-                handle_bi_frame(send_bi, recv_bi).await;
+                handle_bi_frame(send_bi, recv_bi, &mut udp_table).await;
             }
             uni = conn.accept_uni() => {
                 let mut uni = match uni {
@@ -188,11 +197,19 @@ async fn handle_connection(
                 match read_command_from_stream(&mut uni, 64).await {
                     Ok(Command::Heartbeat) => {}
                     Ok(Command::Dissociate { assoc_id }) => {
-                        // UDP assoc 会话化属 7ry/1ur 范围；当前无 assoc 状态可清理。
-                        tracing::debug!("tuic server: dissociate assoc {assoc_id} (no assoc state)");
+                        udp_table.dissociate(assoc_id);
                     }
                     Ok(_) => {}
                     Err(e) => tracing::debug!("tuic server: uni stream read: {e:?}"),
+                }
+            }
+            dg = conn.read_datagram() => {
+                match dg {
+                    Ok(dg) => handle_datagram(&dg, &conn, &mut udp_table),
+                    Err(e) => {
+                        tracing::debug!("tuic server: datagram read: {e:?}");
+                        break;
+                    }
                 }
             }
         }
@@ -201,8 +218,32 @@ async fn handle_connection(
     Ok(())
 }
 
+/// 处理一个 QUIC DATAGRAM（native UDP 模式，bd 7ry）。
+///
+/// spec：datagram 承载完整命令帧（VER + TYPE + 负载）；Packet 路由到
+/// assoc 会话并以 datagram 模式回写，Heartbeat 等保活命令忽略。
+fn handle_datagram(
+    dg: &bytes::Bytes,
+    conn: &quinn::Connection,
+    table: &mut UdpAssocTable,
+) {
+    let mut cursor = &dg[..];
+    match crate::protocol::parse_header(&mut cursor) {
+        Ok(t) if t == type_code::PACKET => match Packet::read_payload(&mut cursor) {
+            Ok(pkt) => table.handle_packet(pkt, ReplySink::Dgram(conn.clone())),
+            Err(e) => tracing::debug!("tuic server: datagram packet parse: {e:?}"),
+        },
+        Ok(_) => {} // Heartbeat 可走 datagram（spec），保活语义无需处理
+        Err(e) => tracing::debug!("tuic server: datagram header: {e:?}"),
+    }
+}
+
 /// 处理一条 bi stream：读 Connect/Packet 帧并 spawn relay。
-async fn handle_bi_frame(send_bi: quinn::SendStream, recv_bi: quinn::RecvStream) {
+async fn handle_bi_frame(
+    send_bi: quinn::SendStream,
+    recv_bi: quinn::RecvStream,
+    udp_table: &mut UdpAssocTable,
+) {
     match read_frame_from_recv(recv_bi, 256).await {
         Ok((frame, recv_bi, initial_bytes)) => match frame {
             BiFrame::Command(Command::Connect(addr)) => {
@@ -221,11 +262,8 @@ async fn handle_bi_frame(send_bi: quinn::SendStream, recv_bi: quinn::RecvStream)
             BiFrame::Command(Command::Heartbeat) => {}
             BiFrame::Command(_) => {}
             BiFrame::Packet(pkt) => {
-                tokio::spawn(async move {
-                    if let Err(e) = relay_udp(pkt, send_bi, recv_bi, initial_bytes).await {
-                        tracing::debug!("tuic udp relay: {e:?}");
-                    }
-                });
+                // bi-stream 模式：路由进 assoc 会话，响应由会话 task 写回本 stream
+                udp_table.handle_packet(pkt, ReplySink::Bi(send_bi));
             }
         },
         Err(e) => {
@@ -320,51 +358,266 @@ pub(crate) async fn read_frame_from_recv(
     Ok((frame, stream, remaining))
 }
 
-/// UDP relay（quic 模式）：解析 Packet 帧 → dial UDP 目标 → send 数据 →
-/// recv_from 响应 → 以 Packet 帧格式回写到同 bi-stream → finish()。
+/// UDP assoc 会话空闲淘汰（对齐 Go `CancelAfterInactivity(1min)` 与 SS inbound 样板）。
+const UDP_ASSOC_IDLE: Duration = Duration::from_secs(60);
+
+/// 会话上行项：(目标, 负载, 回写目标)。
+type UdpAssocItem = (Destination, Vec<u8>, ReplySink);
+
+/// UDP 响应回写目标：与请求到达通道同模式（spec：server 按首包模式回写）。
 ///
-/// `initial_bytes` 是客户端随 Packet 帧一并发的多余字节（bi-stream 模式下应为空，
-/// 但兼容 read 一次拿全的场景）。
-///
-/// ponytail: 单次 recv_from（8KB 上限），不支持关联多个响应包；
-/// 真实实现需要 assoc_id → UDP socket 映射、持续 recv、按 pkt_id 回写。
-pub(crate) async fn relay_udp(
-    pkt: Packet,
-    mut send_bi: quinn::SendStream,
-    _recv_bi: quinn::RecvStream,
-    _initial_bytes: Vec<u8>,
-) -> Result<()> {
-    if pkt.frag_total > 1 {
-        // 分片不支持，直接拒绝（客户端切片2 不发分片包）
-        return Err(TuicError::UnsupportedFragment {
-            frag_total: pkt.frag_total,
-            frag_id: pkt.frag_id,
-        });
+/// bi 模式下每请求独占一个 stream，响应写回最近一个请求的 stream
+/// （ponytail: 逐个请求-响应的客户端精确正确；同 assoc 流水线并发时最佳努力）。
+pub(crate) enum ReplySink {
+    Bi(quinn::SendStream),
+    Dgram(quinn::Connection),
+}
+
+impl ReplySink {
+    /// 以 Packet 帧格式（VER + TYPE + 负载）回写一个响应。
+    async fn write_packet(&mut self, pkt: &Packet) -> Result<()> {
+        let mut out = BytesMut::with_capacity(pkt.encoded_len());
+        out.put_u8(crate::protocol::VERSION);
+        out.put_u8(type_code::PACKET);
+        pkt.write_payload(&mut out);
+        match self {
+            ReplySink::Bi(s) => {
+                s.write_all(&out).await?;
+                let _ = s.finish();
+            }
+            ReplySink::Dgram(c) => {
+                c.send_datagram(out.freeze()).map_err(TuicError::QuinnSendDatagram)?;
+            }
+        }
+        Ok(())
     }
-    let Some(target) = addr_to_socket_addr(&pkt.addr) else {
-        tracing::warn!("tuic udp relay: addr not ip literal: {:?}", pkt.addr);
-        return Ok(());
+}
+
+/// per-connection UDP 会话表（bd 1ur/7ry）：assoc_id → 会话 task sender。
+///
+/// 对应 TUIC v5 spec UDP relaying：客户端为每个 UDP 关联分配 assoc_id，
+/// server 维护 assoc_id → 长生命周期出口的映射；Dissociate 销毁。
+/// - dispatch 模式（Some）：走 [`UdpDispatchSession`] 路由，域名目标原样透传
+/// - 直连模式（None，mock）：长生命周期 UdpSocket + 本地 DNS 解析
+///
+/// bi-stream Packet 与 native datagram 共享本表（spec：同一 assoc 混用两种
+/// 到达模式时共用一个出口）。
+pub(crate) struct UdpAssocTable {
+    dispatcher: Option<Arc<dyn DispatchHandler>>,
+    sessions: HashMap<u16, tokio::sync::mpsc::Sender<UdpAssocItem>>,
+}
+
+impl UdpAssocTable {
+    pub(crate) fn new(dispatcher: Option<Arc<dyn DispatchHandler>>) -> Self {
+        Self {
+            dispatcher,
+            sessions: HashMap::new(),
+        }
+    }
+
+    /// 路由一个客户端 Packet 到其 assoc 会话；无则新建。
+    ///
+    /// 分片包仍拒绝（FRAG_TOTAL > 1）；通道满时丢包（UDP 有损语义）。
+    pub(crate) fn handle_packet(&mut self, pkt: Packet, sink: ReplySink) {
+        if pkt.frag_total > 1 {
+            tracing::warn!(
+                "tuic udp relay: fragment not supported (frag_total={}, frag_id={})",
+                pkt.frag_total,
+                pkt.frag_id
+            );
+            return;
+        }
+        // ponytail: 收包时顺带清扫已退出（空闲淘汰/出错）会话的残留 sender
+        self.sessions.retain(|_, tx| !tx.is_closed());
+        let Some(dest) = tuic_addr_to_udp_dest(&pkt.addr) else {
+            tracing::warn!("tuic udp relay: packet without target addr");
+            return;
+        };
+        let assoc_id = pkt.assoc_id;
+        let item = (dest, pkt.data, sink);
+        let tx = self.sessions.entry(assoc_id).or_insert_with(|| {
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            let dispatcher = self.dispatcher.clone();
+            tokio::spawn(udp_assoc_task(assoc_id, dispatcher, rx));
+            tx
+        });
+        if tx.try_send(item).is_err() {
+            tracing::debug!("tuic udp assoc {assoc_id} backlogged, dropping packet");
+        }
+    }
+
+    /// Dissociate（spec 0x03）：销毁会话，释放出口资源。
+    pub(crate) fn dissociate(&mut self, assoc_id: u16) {
+        self.sessions.remove(&assoc_id);
+    }
+}
+
+/// 单 assoc 会话 task：上行（客户端包 → outbound）+ 下行（outbound 响应 → 客户端）。
+///
+/// 发送端（表 entry）drop 或 60s 双向无活动时退出。
+async fn udp_assoc_task(
+    assoc_id: u16,
+    dispatcher: Option<Arc<dyn DispatchHandler>>,
+    mut rx: tokio::sync::mpsc::Receiver<UdpAssocItem>,
+) {
+    match dispatcher {
+        Some(d) => udp_assoc_dispatch(assoc_id, d, rx).await,
+        None => udp_assoc_direct(assoc_id, rx).await,
+    }
+}
+
+/// 直连模式（mock）：assoc 生命周期内单个 UdpSocket（cone 出口）。
+async fn udp_assoc_direct(assoc_id: u16, mut rx: tokio::sync::mpsc::Receiver<UdpAssocItem>) {
+    let udp = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!("tuic udp assoc {assoc_id} bind: {e:?}");
+            return;
+        }
     };
+    let mut sink: Option<ReplySink> = None;
+    let mut resp_buf = vec![0u8; 65_536];
+    let idle = tokio::time::sleep(UDP_ASSOC_IDLE);
+    tokio::pin!(idle);
+    loop {
+        tokio::select! {
+            item = rx.recv() => {
+                match item {
+                    Some((dest, payload, s)) => {
+                        sink = Some(s);
+                        if let Some(target) = resolve_udp_dest(&dest).await {
+                            if let Err(e) = udp.send_to(&payload, target).await {
+                                tracing::debug!("tuic udp assoc {assoc_id} send: {e:?}");
+                            }
+                        } else {
+                            tracing::debug!("tuic udp assoc {assoc_id} resolve failed: {dest:?}");
+                        }
+                        idle.as_mut().reset(tokio::time::Instant::now() + UDP_ASSOC_IDLE);
+                    }
+                    None => break, // Dissociate 或表清理
+                }
+            }
+            r = udp.recv_from(&mut resp_buf) => {
+                match r {
+                    Ok((n, peer)) => {
+                        if let Some(s) = sink.as_mut() {
+                            let pkt = Packet::new(
+                                assoc_id,
+                                0,
+                                socket_addr_to_tuic(peer),
+                                resp_buf[..n].to_vec(),
+                            );
+                            if let Err(e) = s.write_packet(&pkt).await {
+                                tracing::debug!("tuic udp assoc {assoc_id} reply: {e:?}");
+                            }
+                        }
+                        idle.as_mut().reset(tokio::time::Instant::now() + UDP_ASSOC_IDLE);
+                    }
+                    Err(e) => {
+                        tracing::debug!("tuic udp assoc {assoc_id} recv: {e:?}");
+                        break;
+                    }
+                }
+            }
+            _ = &mut idle => break, // 60s 空闲淘汰
+        }
+    }
+}
 
-    let udp = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
-    udp.send_to(&pkt.data, target).await?;
+/// dispatch 模式（生产）：[`UdpDispatchSession`] 路由，域名透传由 outbound 解析。
+async fn udp_assoc_dispatch(
+    assoc_id: u16,
+    dispatcher: Arc<dyn DispatchHandler>,
+    mut rx: tokio::sync::mpsc::Receiver<UdpAssocItem>,
+) {
+    let mut session = UdpDispatchSession::new(dispatcher);
+    let mut sink: Option<ReplySink> = None;
+    let idle = tokio::time::sleep(UDP_ASSOC_IDLE);
+    tokio::pin!(idle);
+    loop {
+        tokio::select! {
+            item = rx.recv() => {
+                match item {
+                    Some((dest, payload, s)) => {
+                        sink = Some(s);
+                        if let Err(e) = session.send_packet(&dest, &payload).await {
+                            tracing::debug!("tuic udp assoc {assoc_id} dispatch send: {e:?}");
+                            break;
+                        }
+                        idle.as_mut().reset(tokio::time::Instant::now() + UDP_ASSOC_IDLE);
+                    }
+                    None => break, // Dissociate 或表清理
+                }
+            }
+            r = session.recv_packet() => {
+                match r {
+                    Ok(Some((source, payload))) => {
+                        if let Some(s) = sink.as_mut() {
+                            let pkt = Packet::new(
+                                assoc_id,
+                                0,
+                                dest_to_tuic_addr(&source),
+                                payload,
+                            );
+                            if let Err(e) = s.write_packet(&pkt).await {
+                                tracing::debug!("tuic udp assoc {assoc_id} reply: {e:?}");
+                            }
+                        }
+                        idle.as_mut().reset(tokio::time::Instant::now() + UDP_ASSOC_IDLE);
+                    }
+                    Ok(None) => break, // outbound 关闭
+                    Err(e) => {
+                        tracing::debug!("tuic udp assoc {assoc_id} dispatch recv: {e:?}");
+                        continue; // 坏帧跳过（与 SS relay 一致）
+                    }
+                }
+            }
+            _ = &mut idle => break, // 60s 空闲淘汰
+        }
+    }
+}
 
-    // 等响应（单次 recv，带超时避免阻塞）
-    let mut resp_buf = vec![0u8; 8 * 1024];
-    let (n, _peer) = tokio::time::timeout(Duration::from_secs(10), udp.recv_from(&mut resp_buf))
-        .await
-        .map_err(|_| TuicError::UdpTimeout(Duration::from_secs(10)))??;
-    resp_buf.truncate(n);
+/// TUIC Address → UDP Destination（域名原样保留，由 outbound 解析）。
+pub(crate) fn tuic_addr_to_udp_dest(addr: &Address) -> Option<Destination> {
+    match addr {
+        Address::Domain(d, p) => {
+            Some(Destination::udp(XAddress::Domain(d.clone()), Port::new(*p)))
+        }
+        Address::Ipv4(ip, p) => Some(Destination::udp(XAddress::IPv4(*ip), Port::new(*p))),
+        Address::Ipv6(ip, p) => Some(Destination::udp(XAddress::IPv6(*ip), Port::new(*p))),
+        Address::None => None,
+    }
+}
 
-    // 回写 Packet 帧（VER + TYPE + ASSOC + PKT + FRAG + SIZE + ADDR + DATA）
-    let resp_pkt = Packet::new(pkt.assoc_id, pkt.pkt_id, Address::None, resp_buf);
-    let mut out = bytes::BytesMut::with_capacity(resp_pkt.encoded_len());
-    out.put_u8(crate::protocol::VERSION);
-    out.put_u8(type_code::PACKET);
-    resp_pkt.write_payload(&mut out);
-    send_bi.write_all(&out).await?;
-    let _ = send_bi.finish();
-    Ok(())
+/// xray Destination 来源 → TUIC Address（响应帧 ADDR 字段）。
+fn dest_to_tuic_addr(source: &Destination) -> Address {
+    let port = source.port().value();
+    match source.address() {
+        XAddress::Domain(d) => Address::Domain(d.clone(), port),
+        XAddress::IPv4(ip) => Address::Ipv4(*ip, port),
+        XAddress::IPv6(ip) => Address::Ipv6(*ip, port),
+    }
+}
+
+/// SocketAddr 来源 → TUIC Address（直连模式响应帧 ADDR 字段）。
+fn socket_addr_to_tuic(addr: SocketAddr) -> Address {
+    match addr.ip() {
+        IpAddr::V4(ip) => Address::Ipv4(ip, addr.port()),
+        IpAddr::V6(ip) => Address::Ipv6(ip, addr.port()),
+    }
+}
+
+/// 直连模式目标解析：IP 直用，域名走系统 DNS（dispatch 模式不经过本函数）。
+async fn resolve_udp_dest(dest: &Destination) -> Option<SocketAddr> {
+    let port = dest.port().value();
+    match dest.address() {
+        XAddress::IPv4(ip) => Some(SocketAddr::new(IpAddr::V4(*ip), port)),
+        XAddress::IPv6(ip) => Some(SocketAddr::new(IpAddr::V6(*ip), port)),
+        XAddress::Domain(d) => tokio::net::lookup_host((d.as_str(), port))
+            .await
+            .ok()
+            .and_then(|mut i| i.next()),
+    }
 }
 
 pub(crate) fn addr_to_socket_addr(addr: &crate::protocol::Address) -> Option<SocketAddr> {
@@ -372,5 +625,300 @@ pub(crate) fn addr_to_socket_addr(addr: &crate::protocol::Address) -> Option<Soc
         crate::protocol::Address::Ipv4(ip, port) => Some(SocketAddr::new(IpAddr::V4(*ip), *port)),
         crate::protocol::Address::Ipv6(ip, port) => Some(SocketAddr::new(IpAddr::V6(*ip), *port)),
         crate::protocol::Address::Domain(_, _) | crate::protocol::Address::None => None,
+    }
+}
+
+#[cfg(test)]
+mod udp_assoc_tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UdpSocket;
+    use uuid::Uuid;
+
+    use xray_app_dispatcher::default::PinFuture;
+    use xray_app_dispatcher::DispatchHandler;
+    use xray_features::inbound::InboundHandler;
+    use xray_common::net::address::Address as XAddress;
+    use xray_common::net::destination::Destination;
+    use xray_common::net::network::Network;
+    use xray_common::net::port::Port;
+    use xray_transport::link::Link;
+
+    use crate::client::TuicClient;
+    use crate::inbound::{TuicInboundConfig, TuicInboundHandler};
+    use crate::pool::QuinnConnectionPool;
+    use crate::protocol::{Address, Command};
+    use crate::server::TuicMockServer;
+
+    /// 普通 UDP echo server。
+    async fn start_udp_echo() -> SocketAddr {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind echo");
+        let addr = sock.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65_536];
+            loop {
+                let Ok((n, peer)) = sock.recv_from(&mut buf).await else { break };
+                if sock.send_to(&buf[..n], peer).await.is_err() {
+                    break;
+                }
+            }
+        });
+        addr
+    }
+
+    /// 元信息 echo：回 `{对端端口}|{payload}`，用于观测服务端出口端口。
+    async fn start_udp_meta_echo() -> SocketAddr {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind meta echo");
+        let addr = sock.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65_536];
+            loop {
+                let Ok((n, peer)) = sock.recv_from(&mut buf).await else { break };
+                let resp =
+                    format!("{}|{}", peer.port(), String::from_utf8_lossy(&buf[..n]));
+                if sock.send_to(resp.as_bytes(), peer).await.is_err() {
+                    break;
+                }
+            }
+        });
+        addr
+    }
+
+    fn make_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(cert_der.to_vec().into()).expect("add cert");
+        Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        )
+    }
+
+    async fn connect_mock(
+        password: &str,
+    ) -> (TuicClient, tokio::task::JoinHandle<()>) {
+        let uuid = Uuid::new_v4();
+        let (server, cert_der) = TuicMockServer::bind(
+            "127.0.0.1:0".parse().expect("parse addr"),
+            "localhost",
+            uuid,
+            password.to_string(),
+        )
+        .await
+        .expect("mock server bind");
+        let server_addr = server.local_addr();
+        let task = tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        let client = tokio::time::timeout(
+            Duration::from_secs(10),
+            TuicClient::connect(
+                server_addr,
+                "localhost",
+                uuid,
+                password,
+                make_client_config(&cert_der),
+                QuinnConnectionPool::new(),
+            ),
+        )
+        .await
+        .expect("connect timed out")
+        .expect("connect failed");
+        (client, task)
+    }
+
+    /// 捕获 dispatch 收到的 dest 并持续 drain link（不回包）的 handler。
+    #[derive(Debug)]
+    struct CaptureHandler(std::sync::Arc<parking_lot::Mutex<Vec<Destination>>>);
+
+    impl DispatchHandler for CaptureHandler {
+        fn tag(&self) -> &str {
+            "capture"
+        }
+        fn dispatch(&self, dest: &Destination, link: Link) -> PinFuture<()> {
+            self.0.lock().push(dest.clone());
+            Box::pin(async move {
+                use xray_buf::io::Reader;
+                let mut reader = link.reader;
+                while reader.read_multi_buffer().await.is_ok() {}
+            })
+        }
+    }
+
+    async fn connect_inbound(
+        handler: Arc<dyn DispatchHandler>,
+        password: &str,
+    ) -> TuicClient {
+        let uuid = Uuid::new_v4();
+        let inbound = TuicInboundHandler::new(
+            "tuic-in-test",
+            TuicInboundConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                server_name: "localhost".to_string(),
+                uuid,
+                password: password.to_string(),
+                cert_der: None,
+                key_der: None,
+            },
+        )
+        .unwrap()
+        .with_dispatch(handler);
+        inbound.start().await.expect("inbound start");
+        let server_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), inbound.port());
+        let cert_der = inbound.cert_der().expect("cert after start");
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            TuicClient::connect(
+                server_addr,
+                "localhost",
+                uuid,
+                password,
+                make_client_config(&cert_der),
+                QuinnConnectionPool::new(),
+            ),
+        )
+        .await
+        .expect("connect timed out")
+        .expect("connect failed")
+    }
+
+    /// ① 同一 assoc_id 的第二个包必须复用会话（不重建 outbound socket）。
+    #[tokio::test]
+    async fn udp_assoc_reuses_session_across_packets() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let echo_addr = start_udp_meta_echo().await;
+        let (client, _server) = connect_mock("assoc-reuse").await;
+
+        let assoc = client.dial_udp(0x0007);
+        let target = Address::Ipv4(Ipv4Addr::new(127, 0, 0, 1), echo_addr.port());
+        let mut ports = Vec::new();
+        for payload in ["first", "second"] {
+            let resp = tokio::time::timeout(
+                Duration::from_secs(10),
+                assoc.send_recv(target.clone(), payload.as_bytes(), None),
+            )
+            .await
+            .expect("send_recv timed out")
+            .expect("send_recv failed");
+            let resp = String::from_utf8(resp).expect("utf8");
+            let (port, echo_payload) = resp.split_once('|').expect("meta echo format");
+            assert_eq!(echo_payload, payload);
+            ports.push(port.to_string());
+        }
+        assert_eq!(ports[0], ports[1], "same assoc must reuse one outbound socket");
+        client.close(0u32.into(), b"");
+    }
+
+    /// ③ native datagram：服务端处理 QUIC DATAGRAM 并按同模式回写。
+    #[tokio::test]
+    async fn native_datagram_server_path() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let echo_addr = start_udp_echo().await;
+        let (client, _server) = connect_mock("native-dgram").await;
+
+        let assoc = client.dial_udp(0x0D11);
+        let target = Address::Ipv4(Ipv4Addr::new(127, 0, 0, 1), echo_addr.port());
+        let payload = b"native dgram ping";
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            assoc.send_recv_native(target, payload, None),
+        )
+        .await
+        .expect("native send_recv timed out")
+        .expect("native send_recv failed");
+        assert_eq!(resp, payload);
+        client.close(0u32.into(), b"");
+    }
+
+    /// ② 域名目标不丢弃：dispatch 收到的 dest 域名原样（Network::UDP）。
+    #[tokio::test]
+    async fn udp_domain_dest_reaches_dispatch_verbatim() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let store = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let client = connect_inbound(
+            Arc::new(CaptureHandler(std::sync::Arc::clone(&store))),
+            "domain-dest",
+        )
+        .await;
+
+        let assoc = client.dial_udp(0x0DD0);
+        let target = Address::Domain("example.invalid".to_string(), 53);
+        // 无 echo handler：预期超时，仅验证 dest 送达 dispatch
+        let _ = assoc
+            .send_recv(target, b"dns-q", Some(Duration::from_millis(500)))
+            .await;
+
+        for _ in 0..50 {
+            if store.lock().len() >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let got = store.lock().clone();
+        assert_eq!(got.len(), 1, "domain packet must reach dispatch exactly once");
+        assert_eq!(
+            got[0],
+            Destination::new(
+                XAddress::Domain("example.invalid".to_string()),
+                Port::new(53),
+                Network::UDP,
+            ),
+            "dispatch dest must carry verbatim domain over UDP"
+        );
+        client.close(0u32.into(), b"");
+    }
+
+    /// ④ Dissociate 销毁会话：同 assoc 再发包 → 新会话（dispatch 二次建立）。
+    #[tokio::test]
+    async fn dissociate_destroys_session() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let store = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let client = connect_inbound(
+            Arc::new(CaptureHandler(std::sync::Arc::clone(&store))),
+            "dissociate",
+        )
+        .await;
+
+        let assoc_id = 0x0D55;
+        let assoc = client.dial_udp(assoc_id);
+        let target = Address::Ipv4(Ipv4Addr::new(127, 0, 0, 1), 9);
+        let _ = assoc
+            .send_recv(target.clone(), b"a", Some(Duration::from_millis(500)))
+            .await;
+        for _ in 0..50 {
+            if store.lock().len() >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(store.lock().len(), 1, "first packet establishes session");
+
+        // 客户端 Dissociate（uni stream，spec 0x03）
+        let mut uni = client.quinn_conn().open_uni().await.expect("open uni");
+        let cmd = Command::Dissociate { assoc_id };
+        let mut buf = bytes::BytesMut::with_capacity(cmd.encoded_len());
+        cmd.write_to(&mut buf);
+        uni.write_all(&buf).await.expect("write dissociate");
+        let _ = uni.finish();
+
+        // 同 assoc 再发包 → 新会话
+        let _ = assoc
+            .send_recv(target, b"b", Some(Duration::from_millis(500)))
+            .await;
+        for _ in 0..50 {
+            if store.lock().len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            store.lock().len(),
+            2,
+            "dissociate must destroy session; next packet re-establishes"
+        );
+        client.close(0u32.into(), b"");
     }
 }

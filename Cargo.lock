@@ -6242,6 +6242,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "parking_lot",
  "quinn",
  "rcgen 0.13.2",
  "rustls",
