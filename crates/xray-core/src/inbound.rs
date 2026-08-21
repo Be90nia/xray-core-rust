@@ -516,22 +516,23 @@ pub async fn serve_ss(
     ohm: Arc<SimpleOhm>,
     inbound: SsInboundMode,
 ) -> std::io::Result<()> {
+    let handler = ohm
+        .get_default_handler()
+        .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
     // SS Legacy UDP relay：同端口 UDP 监听（Go Process(UDP) 分支）。SS2022 不在此列（agb）。
     if let SsInboundMode::Legacy(ib) = &inbound {
         let port = listener.local_addr()?.port();
         match tokio::net::UdpSocket::bind(("0.0.0.0", port)).await {
             Ok(sock) => {
                 let ib = Arc::clone(ib);
+                let udp_handler = Arc::clone(&handler);
                 tokio::spawn(async move {
-                    let _ = serve_ss_udp(Arc::new(sock), ib).await;
+                    let _ = serve_ss_udp(Arc::new(sock), ib, udp_handler).await;
                 });
             }
             Err(e) => tracing::warn!(error = %e, port, "ss udp bind failed, udp relay disabled"),
         }
     }
-    let handler = ohm
-        .get_default_handler()
-        .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
     tracing::info!(addr = %listener.local_addr()?, "ss inbound listening");
     loop {
         let (stream, _peer) = match listener.accept().await {
@@ -658,85 +659,123 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for SsRelayReader<R> 
         std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
+/// SS UDP per-client relay 的 channel 项：(目标, payload, 发起用户 account)。
+type SsUdpItem = (Destination, Vec<u8>, xray_proxy_ss::config::MemoryAccount);
+
+/// SS UDP per-client 会话空闲淘汰时限（Go `CancelAfterInactivity(1min)`）。
+const SS_UDP_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// SS Legacy UDP relay 入口。
 ///
-
-///
-/// 对应 Go `proxy/shadowsocks/server.go::handleUDPPayload`：
-/// recv_from → decode_udp_packet（匹配用户 + 解出目标/payload）→ 转发目标 →
-/// 回包 encode_udp_packet（发起用户的 account 加密）→ send_to 客户端。
-///
-/// ponytail: per-packet ephemeral socket（与 dokodemo/SOCKS UDP 既有模式一致），
-/// b2e 中央 UDP dispatcher 建成后改走 dispatch 会话。
-pub async fn serve_ss_udp(udp_arc: Arc<tokio::net::UdpSocket>, ib: Arc<SsInbound>) -> std::io::Result<()> {
-    use xray_proxy_ss::protocol::{decode_udp_packet, encode_udp_packet};
-    tracing::info!(addr = %udp_arc.local_addr()?, "ss udp relay listening");
+/// 对应 Go `proxy/shadowsocks/server.go::handleUDPPayload`：recv_from →
+/// decode_udp_packet（匹配用户 + 解出目标/payload）→ 按客户端源地址分发到
+/// per-client [`UdpDispatchSession`]（Go `udp.Dispatcher` cone 会话模型）。
+/// 回包由 [`ss_udp_client_relay`] 用发起用户的 account `encode_udp_packet`
+/// 后 send_to 客户端。
+pub async fn serve_ss_udp(
+    udp: Arc<tokio::net::UdpSocket>,
+    ib: Arc<SsInbound>,
+    handler: Arc<dyn DispatchHandler>,
+) -> std::io::Result<()> {
+    use xray_proxy_ss::protocol::decode_udp_packet;
+    tracing::info!(addr = %udp.local_addr()?, "ss udp relay listening");
     let mut buf = vec![0u8; 65_536];
+    let mut clients: HashMap<SocketAddr, tokio::sync::mpsc::Sender<SsUdpItem>> = HashMap::new();
     loop {
-        let (n, client) = match udp_arc.recv_from(&mut buf).await {
+        let (n, client) = match udp.recv_from(&mut buf).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "ss udp recv failed");
                 continue;
             }
         };
-        let packet = buf[..n].to_vec();
-        let (header, payload) = match decode_udp_packet(ib.validator(), &packet) {
+        // ponytail: 收包时顺带清扫已退出（60s 空闲淘汰）会话的残留 sender；
+        // O(clients)/包，海量并发 UDP 客户端时换后台定时清扫
+        clients.retain(|_, tx| !tx.is_closed());
+        let (header, payload) = match decode_udp_packet(ib.validator(), &buf[..n]) {
             Ok(v) => v,
             Err(e) => {
                 tracing::debug!(error = %e, "ss udp decode failed (unknown user?)");
                 continue;
             }
         };
-        let target_addr = header.address.clone();
-        let port = header.port;
-        let account = header.user.account.clone();
-        let sock = Arc::clone(&udp_arc);
-        tokio::spawn(async move {
-            // 解析目标并发送
-            let target: std::net::SocketAddr = match target_addr {
-                xray_common::net::address::Address::Domain(d) => {
-                    match tokio::net::lookup_host((d.as_str(), port)).await {
-                        Ok(mut it) => match it.next() {
-                            Some(a) => a,
-                            None => return,
-                        },
-                        Err(_) => return,
+        let dest = Destination::new(header.address.clone(), Port::new(header.port), Network::UDP);
+        let item = (dest, payload, header.user.account.clone());
+        let tx = clients.entry(client).or_insert_with(|| {
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            tokio::spawn(ss_udp_client_relay(
+                Arc::clone(&udp),
+                client,
+                rx,
+                Arc::clone(&handler),
+            ));
+            tx
+        });
+        if tx.send(item).await.is_err() {
+            // relay task 已退出（空闲淘汰）：丢弃 entry，该 client 下一包重建会话
+            clients.remove(&client);
+        }
+    }
+}
+
+/// 单客户端 SS UDP relay（Go 每个 NAT entry 的读写 task）。
+///
+/// - up：主循环 decode 后的 (dest, payload) → [`UdpDispatchSession::send_packet`]
+///   （首包懒建 dispatch link，域名目标原样透传由 outbound 解析）
+/// - down：`recv_packet` 回包 → 发起用户 account `encode_udp_packet` →
+///   send_to 客户端
+///
+/// 60s 双向无活动自动退出（Go `CancelAfterInactivity(1min)`）。
+async fn ss_udp_client_relay(
+    udp: Arc<tokio::net::UdpSocket>,
+    client: SocketAddr,
+    mut rx: tokio::sync::mpsc::Receiver<SsUdpItem>,
+    handler: Arc<dyn DispatchHandler>,
+) {
+    use xray_proxy_ss::protocol::encode_udp_packet;
+    let mut session = UdpDispatchSession::new(handler);
+    // 回包加密 account：跟随最近请求的用户（Go 按 client NAT entry 记 user）
+    let mut account: Option<xray_proxy_ss::config::MemoryAccount> = None;
+    let idle = tokio::time::sleep(SS_UDP_IDLE_TIMEOUT);
+    tokio::pin!(idle);
+    loop {
+        tokio::select! {
+            item = rx.recv() => {
+                match item {
+                    Some((dest, payload, acct)) => {
+                        account = Some(acct);
+                        if session.send_packet(&dest, &payload).await.is_err() {
+                            break;
+                        }
+                        idle.as_mut().reset(tokio::time::Instant::now() + SS_UDP_IDLE_TIMEOUT);
+                    }
+                    None => break, // 主循环丢弃本 entry（会话被替换）
+                }
+            }
+            r = session.recv_packet() => {
+                match r {
+                    Ok(Some((source, payload))) => {
+                        if let Some(acct) = &account {
+                            if let Ok(enc) = encode_udp_packet(
+                                acct,
+                                source.address(),
+                                source.port().value(),
+                                &payload,
+                            ) {
+                                let _ = udp.send_to(&enc, client).await;
+                            }
+                        }
+                        idle.as_mut().reset(tokio::time::Instant::now() + SS_UDP_IDLE_TIMEOUT);
+                    }
+                    Ok(None) => break, // outbound 关闭，会话结束
+                    Err(e) => {
+                        tracing::debug!(error = %e, "ss udp dispatch recv failed");
+                        continue; // 坏帧跳过（与 SOCKS relay 一致）
                     }
                 }
-                xray_common::net::address::Address::IPv4(a) => {
-                    std::net::SocketAddr::new(std::net::IpAddr::V4(a), port)
-                }
-                xray_common::net::address::Address::IPv6(a) => {
-                    std::net::SocketAddr::new(std::net::IpAddr::V6(a), port)
-                }
-            };
-            let outbound = match tokio::net::UdpSocket::bind(if target.is_ipv4() {
-                "0.0.0.0:0"
-            } else {
-                "[::]:0"
-            })
-            .await
-            {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            if outbound.send_to(&payload, target).await.is_err() {
-                return;
             }
-            let mut rbuf = vec![0u8; 65_536];
-            // 等回包（DNS 等请求-响应场景）
-            let Ok(Ok((rn, _))) =
-                tokio::time::timeout(std::time::Duration::from_secs(5), outbound.recv_from(&mut rbuf)).await
-            else {
-                return;
-            };
-            let encoded = match encode_udp_packet(&account, &header.address, port, &rbuf[..rn]) {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            let _ = sock.send_to(&encoded, client).await;
-        });
+            _ = &mut idle => break, // 60s 空闲淘汰
+        }
     }
 }
 
@@ -2151,51 +2190,44 @@ mod tests {
         assert_eq!(empty, ServerConfig::default());
     }
 
-    /// SS Legacy UDP relay e2e：encode_udp_packet → serve_ss_udp → UDP echo → 解密回包。
+    /// b2e：SS Legacy UDP relay 经 dispatcher（UdpDispatchSession）。
+    ///
+    /// MarkerUdpDispatch 只有经 dispatch link 才能回标记帧，raw 直连路径
+    /// 给不出；回包必须能用发起用户 account 解出标记 payload。
     #[tokio::test]
-    async fn ss_udp_relay_e2e() {
-        use xray_proxy_ss::config::{CipherType, MemoryAccount as SsAccount};
+    async fn ss_udp_dispatch_roundtrip() {
+        use xray_proxy_ss::config::MemoryAccount as SsAccount;
         use xray_proxy_ss::protocol::{decode_udp_packet, encode_udp_packet};
-        use xray_proxy_ss::validator::MemoryUser;
 
-        // 1. UDP echo 目标
-        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let echo_addr = echo.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut b = [0u8; 1500];
-            while let Ok((n, from)) = echo.recv_from(&mut b).await {
-                let _ = echo.send_to(&b[..n], from).await;
-            }
-        });
-
-        // 2. SS inbound（单用户 aes-128-gcm）+ serve_ss_udp
+        // 1. SS inbound（单用户 aes-128-gcm）+ serve_ss_udp（dispatch handler）
         let account = SsAccount::from_proto(&xray_proto::xray::proxy::shadowsocks::Account {
             password: "udp-test-pass".into(),
-            cipher_type: CipherType::Aes128Gcm.as_i32(),
+            cipher_type: SsCipherType::Aes128Gcm.as_i32(),
             iv_check: false,
         })
         .unwrap();
         let ib = Arc::new(SsInbound::new(account.clone(), "u@ss.udp"));
         let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let relay_addr = relay.local_addr().unwrap();
+        let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
+            Arc::new(MarkerUdpDispatch { marker: b"ss-via-dispatch" });
         let ib_clone = Arc::clone(&ib);
         tokio::spawn(async move {
-            let _ = serve_ss_udp(Arc::new(relay), ib_clone).await;
+            let _ = serve_ss_udp(Arc::new(relay), ib_clone, handler).await;
         });
 
-        // 3. client：encode 一个指向 echo 的 UDP 包发给 relay
+        // 2. client：encode 一个 UDP 包发给 relay（目标任意，dispatch 标记 handler 不打真实包）
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let payload = b"ss-udp-e2e-payload";
         let packet = encode_udp_packet(
             &account,
             &Address::IPv4(Ipv4Addr::LOCALHOST),
-            echo_addr.port(),
-            payload,
+            53,
+            b"ping",
         )
         .unwrap();
         client.send_to(&packet, relay_addr).await.unwrap();
 
-        // 4. 收回包并解密（发起用户 account 可解）
+        // 3. 收回包并解密（发起用户 account 可解出标记 payload）
         let mut rbuf = vec![0u8; 2048];
         let (n, _from) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -2205,7 +2237,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let (_header, data) = decode_udp_packet(ib.validator(), &rbuf[..n]).unwrap();
-        assert_eq!(data, payload);
+        assert_eq!(data, b"ss-via-dispatch");
     }
 
     /// parse_reality_config：privateKey/shortIds/dest 双形态/默认值。

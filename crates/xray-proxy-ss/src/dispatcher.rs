@@ -14,25 +14,33 @@
 //! [`DialFn`]: xray_app_dispatcher::default::DialFn
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
 use xray_app_dispatcher::default::DialFn;
 use xray_common::net::address::Address;
 use xray_common::net::destination::Destination;
+use xray_common::net::network::Network;
+use xray_common::net::port::Port;
 use xray_transport::connection::Connection;
+use xray_xudp::packet::{PacketError, PacketReader, PacketWriter};
 
 use crate::client::Client;
 use crate::config::MemoryAccount;
+use crate::protocol::{decode_udp_packet, encode_udp_packet};
 use crate::stream::SSStream;
+use crate::validator::{MemoryUser, Validator};
 
 /// SS duplex 缓冲（与 hysteria/tuic 一致：64 KiB）。
 const DUPLEX_BUF_SIZE: usize = 64 * 1024;
+
+/// XUDP GlobalID 长度（与 Go `xudp` / hysteria dispatcher 一致）。
+const GLOBAL_ID_LEN: usize = 8;
 
 /// SS 加密流 → Connection trait 实现。
 ///
@@ -54,6 +62,19 @@ impl SsConnection {
     pub fn new(stream: SSStream<TcpStream>) -> Self {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
         let pump = tokio::spawn(pump_ss_stream(stream, server_io));
+        Self {
+            inner: client_io,
+            _pump: pump,
+        }
+    }
+}
+
+impl SsConnection {
+    /// UDP 变体：从已 connect 到 SS 服务器 UDP 端口的 socket 构造，
+    /// spawn XUDP 帧 ↔ SS UDP 数据报 pump（[`pump_ss_udp`]）。
+    fn new_udp(sock: UdpSocket, account: MemoryAccount, default_dest: Destination) -> Self {
+        let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
+        let pump = tokio::spawn(pump_ss_udp(sock, account, server_io, default_dest));
         Self {
             inner: client_io,
             _pump: pump,
@@ -262,23 +283,185 @@ pub fn make_ss_dial_fn(config: Arc<SsOutboundConfig>) -> DialFn {
         let config = Arc::clone(&config);
         let target_addr = dest.address().clone();
         let target_port = dest.port().value();
+        let network = dest.network();
         Box::pin(async move {
-            let client = Client::new(
-                config.account.clone(),
-                match &config.server_address {
-                    Address::Domain(d) => d.clone(),
-                    Address::IPv4(ip) => ip.to_string(),
-                    Address::IPv6(ip) => ip.to_string(),
-                },
-                config.server_port,
-            );
-            let stream = client
-                .dial_target(&target_addr, target_port)
-                .await
-                .map_err(|e| format!("ss dial: {e}"))?;
-            Ok(Box::new(SsConnection::new(stream)) as Box<dyn Connection>)
+            match network {
+                // TCP：dial SS 服务器 TCP 端口 + 写加密首帧（addr+port）
+                Network::TCP => {
+                    let client = Client::new(
+                        config.account.clone(),
+                        match &config.server_address {
+                            Address::Domain(d) => d.clone(),
+                            Address::IPv4(ip) => ip.to_string(),
+                            Address::IPv6(ip) => ip.to_string(),
+                        },
+                        config.server_port,
+                    );
+                    let stream = client
+                        .dial_target(&target_addr, target_port)
+                        .await
+                        .map_err(|e| format!("ss dial: {e}"))?;
+                    Ok(Box::new(SsConnection::new(stream)) as Box<dyn Connection>)
+                }
+                // UDP：dial SS 服务器的 UDP 端口（Go internet dialer 的 network
+                // 跟随 dest），每数据报独立 [salt][AEAD(addr+port+payload)]，
+                // 非 XUDP-over-TCP
+                Network::UDP => {
+                    let server = resolve_server(&config.server_address, config.server_port)
+                        .await
+                        .map_err(|e| format!("ss udp dial: {e}"))?;
+                    let local = if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+                    let sock = UdpSocket::bind(local)
+                        .await
+                        .map_err(|e| format!("ss udp bind: {e}"))?;
+                    sock.connect(server)
+                        .await
+                        .map_err(|e| format!("ss udp connect: {e}"))?;
+                    let default_dest = Destination::udp(target_addr, Port::new(target_port));
+                    Ok(Box::new(SsConnection::new_udp(
+                        sock,
+                        config.account.clone(),
+                        default_dest,
+                    )) as Box<dyn Connection>)
+                }
+                Network::Unix => Err("ss outbound does not support unix network".to_string()),
+            }
         })
     })
+}
+
+/// 解析 SS 服务器地址 → SocketAddr（Domain 走系统 DNS）。
+async fn resolve_server(addr: &Address, port: u16) -> io::Result<SocketAddr> {
+    match addr {
+        Address::IPv4(ip) => Ok(SocketAddr::new(IpAddr::V4(*ip), port)),
+        Address::IPv6(ip) => Ok(SocketAddr::new(IpAddr::V6(*ip), port)),
+        Address::Domain(d) => tokio::net::lookup_host((d.as_str(), port))
+            .await?
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ss server dns: no address")),
+    }
+}
+
+/// SS outbound UDP 双向 pump：duplex 内的 XUDP 帧流 ↔ SS 服务器 UDP 数据报。
+///
+/// 对应 Go `shadowsocks` outbound UDP 分支（与 hysteria `pump_hysteria_udp` /
+/// freedom `pump_request`/`pump_response` 同构）：
+///
+/// - up：XUDP 帧 → [`encode_udp_packet`]（每数据报独立 salt + AEAD
+///   addr+port+payload）→ `sock.send`（已 connect SS 服务器）。帧内
+///   per-packet target 缺省用 `default_dest`。
+/// - down：`sock.recv` → [`decode_udp_packet`]（单用户 validator）→ 解出
+///   (来源, payload) → XUDP 帧写回 duplex。
+async fn pump_ss_udp(
+    sock: UdpSocket,
+    account: MemoryAccount,
+    server_io: DuplexStream,
+    default_dest: Destination,
+) {
+    let sock = Arc::new(sock);
+    let (mut rd, mut wr) = tokio::io::split(server_io);
+    // 回包解码 validator：单用户（出站只有一个 account）
+    let validator = Validator::new();
+    let _ = validator.add(MemoryUser::new("ss-udp-outbound", account.clone()));
+
+    // up: duplex → XUDP 帧解析 → SS UDP 数据报
+    let up_sock = Arc::clone(&sock);
+    let up = async move {
+        let mut accum: Vec<u8> = Vec::new();
+        let mut buf = vec![0u8; 8 * 1024];
+        loop {
+            // 先把 accum 里所有完整帧消费掉
+            let mut progress = true;
+            while progress {
+                match parse_and_send(&up_sock, &account, &mut accum, &default_dest).await {
+                    Ok(made) => progress = made,
+                    Err(e) => {
+                        tracing::debug!("ss udp up forward error: {e}");
+                        return;
+                    }
+                }
+            }
+            match rd.read(&mut buf).await {
+                Ok(0) => return, // link EOF
+                Ok(n) => accum.extend_from_slice(&buf[..n]),
+                Err(e) => {
+                    tracing::debug!("ss udp up read error: {e}");
+                    return;
+                }
+            }
+        }
+    };
+
+    // down: SS 服务器回包 → decode → XUDP 帧 → duplex
+    let down = async move {
+        let global_id: [u8; GLOBAL_ID_LEN] = rand::random();
+        let mut rbuf = vec![0u8; 65_535];
+        loop {
+            let n = match sock.recv(&mut rbuf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::debug!("ss udp down recv error: {e}");
+                    break;
+                }
+            };
+            // 解码失败跳过（Go DecodeUDPPacket 失败丢弃该包）
+            let Ok((header, payload)) = decode_udp_packet(&validator, &rbuf[..n]) else {
+                continue;
+            };
+            // 回包帧来源 = SS 解出的响应来源地址
+            let source = Destination::udp(header.address, Port::new(header.port));
+            let mut frame = Vec::with_capacity(payload.len() + 64);
+            let mut pw = PacketWriter::new(&mut frame, source, global_id);
+            if pw.write_packet(&payload).is_err() {
+                break;
+            }
+            drop(pw);
+            if wr.write_all(&frame).await.is_err() {
+                break; // client 侧已关闭
+            }
+        }
+        let _ = wr.shutdown().await;
+    };
+
+    tokio::select! {
+        _ = up => {}
+        _ = down => {}
+    }
+}
+
+/// 从 accum 前端解析一个 XUDP 帧 → `encode_udp_packet` → `sock.send`。
+///
+/// 返回 `true` 表示消费了一帧；accum 为空或帧不完整返回 `false`；
+/// 致命错误返回 `Err`。
+async fn parse_and_send(
+    sock: &Arc<UdpSocket>,
+    account: &MemoryAccount,
+    accum: &mut Vec<u8>,
+    default_dest: &Destination,
+) -> io::Result<bool> {
+    if accum.is_empty() {
+        return Ok(false);
+    }
+    let (result, consumed) = {
+        let mut cursor = std::io::Cursor::new(&accum[..]);
+        let mut pr = PacketReader::new(&mut cursor);
+        let r = pr.read_packet();
+        (r, cursor.position() as usize)
+    };
+    match result {
+        Ok(Some(pkt)) => {
+            accum.drain(..consumed);
+            let (data, target) = pkt.into_parts();
+            let dest = target.unwrap_or_else(|| default_dest.clone());
+            let enc = encode_udp_packet(account, dest.address(), dest.port().value(), &data)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            sock.send(&enc).await?;
+            Ok(true)
+        }
+        Ok(None) => Ok(false), // 帧不完整，等更多数据
+        Err(PacketError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
+    }
 }
 
 #[cfg(test)]
@@ -407,5 +590,74 @@ mod tests {
 
         assert_eq!(&got[..], payload, "echo through SsConnection pump");
         server_handle.await.expect("server task join");
+    }
+
+    /// UDP 分支 e2e：`make_ss_dial_fn`(UDP dest) → dial SS 服务器 UDP 端口 →
+    /// 每数据报 `[salt][AEAD(addr+port+payload)]` 编解码 → fake SS 服务器
+    /// echo 回包 → XUDP 帧经 dispatch 会话收回。
+    ///
+    /// MarkerUdp 式 raw 透传给不出回包（UDP echo 服务器与 SS 语义不同），
+    /// 只有 UDP 分支真实编解码 + XUDP 装拆帧才能 roundtrip。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ss_udp_dial_fn_roundtrips_through_udp_echo() {
+        use std::time::Duration;
+        use xray_app_dispatcher::UdpDispatchSession;
+
+        // 1. fake SS UDP 服务器：decode（匹配用户）→ echo → encode 回来源
+        let server = UdpSocket::bind("127.0.0.1:0").await.expect("bind server");
+        let server_addr = server.local_addr().unwrap();
+        let srv_account = make_account();
+        let validator = Validator::new();
+        validator
+            .add(MemoryUser::new("srv", srv_account.clone()))
+            .expect("add user");
+        tokio::spawn(async move {
+            let mut b = [0u8; 65_535];
+            while let Ok((n, from)) = server.recv_from(&mut b).await {
+                let Ok((header, payload)) = decode_udp_packet(&validator, &b[..n]) else {
+                    continue;
+                };
+                let Ok(enc) = encode_udp_packet(
+                    &srv_account,
+                    &header.address,
+                    header.port,
+                    &payload,
+                ) else {
+                    continue;
+                };
+                let _ = server.send_to(&enc, from).await;
+            }
+        });
+
+        // 2. outbound：DialBridge(make_ss_dial_fn) + UdpDispatchSession（XUDP 帧）
+        let cfg = Arc::new(SsOutboundConfig::new(
+            make_account(),
+            Address::IPv4(std::net::Ipv4Addr::LOCALHOST),
+            server_addr.port(),
+        ));
+        let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> = Arc::new(
+            xray_app_dispatcher::default::DialBridge::new(
+                "ss-udp-out",
+                make_ss_dial_fn(Arc::clone(&cfg)),
+            ),
+        );
+        let mut session = UdpDispatchSession::new(handler);
+
+        // 3. 经 dispatch 会话发 UDP 包，收回包（来源 = 请求目标）
+        let dest = Destination::udp(
+            Address::IPv4(std::net::Ipv4Addr::LOCALHOST),
+            Port::new(9),
+        );
+        let payload = b"ss-udp-outbound-e2e";
+        session.send_packet(&dest, payload).await.expect("send");
+
+        let (source, got) = tokio::time::timeout(Duration::from_secs(5), session.recv_packet())
+            .await
+            .expect("echo within 5s")
+            .expect("recv ok")
+            .expect("session alive");
+        assert_eq!(&got[..], payload);
+        assert_eq!(source.address(), dest.address());
+        assert_eq!(source.port(), dest.port());
     }
 }

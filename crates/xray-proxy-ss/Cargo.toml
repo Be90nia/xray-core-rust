@@ -20,6 +20,7 @@ prost = { workspace = true }
 xray-proto = { path = "../xray-proto" }
 xray-transport = { path = "../xray-transport" }
 xray-app-dispatcher = { path = "../xray-app-dispatcher" }
+xray-xudp = { path = "../xray-xudp" }
 serde_json = { workspace = true }
 # - aes-gcm：AES-128-GCM / AES-256-GCM
 # - chacha20poly1305：ChaCha20-Poly1305 / XChaCha20-Poly1305
