@@ -21,6 +21,7 @@ use xray_transport::link::Link;
 
 use crate::encoding::server::{decode_request_header, encode_response_header};
 use crate::encoding::{empty_addons, VlessCommand, VERSION};
+use crate::encryption::vision_conn::VisionConn;
 use crate::validator::Validator;
 
 /// VLESS inbound 服务入口。
@@ -237,9 +238,28 @@ where
     Ok(())
 }
 
+/// 组合流 marker trait：`dyn AsyncRead + AsyncWrite` 不能有两个主 trait，
+/// 用它把「VisionConn 包装后的流」与「原始流」抹平成同一类型。
+trait VlessStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> VlessStream for T {}
+
+/// Vision 首块 padding 携带的 uuid bytes（解码用户的账号 UUID，对齐 Go
+/// `request.User` 的 `ID.UUID()`）。非 vision flow 返回 `None`。
+fn vision_uuid_bytes(
+    decoded: &crate::encoding::server::DecodedRequest,
+) -> std::io::Result<Option<Vec<u8>>> {
+    if decoded.addons.flow != crate::FLOW_XRV {
+        return Ok(None);
+    }
+    let user = decoded.user.as_ref().ok_or_else(|| {
+        std::io::Error::other("vless vision: decoded request carries no user")
+    })?;
+    Ok(Some(user.account.id.uuid().as_bytes().to_vec()))
+}
+
 /// decode 成功后的收尾：响应头 + Link（读侧=回灌 reader）→ dispatch。
 async fn finish_vless_dispatch<R, W>(
-    mut reader: R,
+    reader: R,
     mut write_half: W,
     decoded: crate::encoding::server::DecodedRequest,
     handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,
@@ -257,6 +277,8 @@ where
         return Ok(());
     }
 
+    let vision_uuid = vision_uuid_bytes(&decoded)?;
+
     let address = decoded
         .address
         .ok_or_else(|| std::io::Error::other("vless decode: missing address for TCP command"))?;
@@ -269,7 +291,14 @@ where
         .await
         .map_err(|e| std::io::Error::other(format!("vless encode response: {e}")))?;
 
-    let link = Link::new(new_reader(reader), new_writer(write_half));
+    // flow=xtls-rprx-vision：join 读写半流 → VisionConn 包装（uuid 用解码用户）
+    // → 重新 split；非 vision 同样 join+split（零开销适配器，统一类型）。
+    let stream: Box<dyn VlessStream> = match vision_uuid {
+        Some(uuid) => Box::new(VisionConn::new(tokio::io::join(reader, write_half), uuid)),
+        None => Box::new(tokio::io::join(reader, write_half)),
+    };
+    let (rh, wh) = tokio::io::split(stream);
+    let link = Link::new(new_reader(rh), new_writer(wh));
     let _ = handler.dispatch(&dest, link).await;
     Ok(())
 }
@@ -300,6 +329,8 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
         return Ok(());
     }
 
+    let vision_uuid = vision_uuid_bytes(&decoded)?;
+
     let address = decoded
         .address
         .ok_or_else(|| std::io::Error::other("vless decode: missing address for TCP command"))?;
@@ -313,9 +344,13 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
         .await
         .map_err(|e| std::io::Error::other(format!("vless encode response: {e}")))?;
 
-    // 4. split → Link → dispatch（dispatch 内部拨号 + bridge，消耗 link）
-    // ponytail: tokio::io::split 返回的 ReadHalf/WriteHalf 是 'static + Send，
-    // new_reader/new_writer 接受 AsyncRead/AsyncWrite + Unpin + Send + 'static。
+    // 4. flow=xtls-rprx-vision：响应头已发出，业务流包 VisionConn（uuid 用解码
+    //    用户的，对齐 Go inbound clientReader/clientWriter 包装时机）
+    //    再 split → Link → dispatch；非 vision 直通。
+    let stream: Box<dyn VlessStream> = match vision_uuid {
+        Some(uuid) => Box::new(VisionConn::new(stream, uuid)),
+        None => Box::new(stream),
+    };
     let (read_half, write_half) = tokio::io::split(stream);
     let link = Link::new(new_reader(read_half), new_writer(write_half));
     let _ = handler.dispatch(&dest, link).await;
@@ -474,5 +509,145 @@ mod tests {
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionAborted => {}
             other => panic!("expected EOF or connection reset, got {other:?}"),
         }
+    }
+
+    /// 公共 harness：echo server + freedom dispatch + serve_vless（注册一个用户）。
+    /// 返回 (vless 监听地址, echo 端口, 用户 UUID)。
+    async fn spawn_vless_proxy_with_echo() -> (std::net::SocketAddr, u16, UUID) {
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = echo_listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let ohm = Arc::new(SimpleOhm::new());
+        ohm.set_default(Arc::new(DialBridge::new("freedom", make_freedom_dial_fn()))
+            as Arc<dyn xray_app_dispatcher::DispatchHandler>);
+
+        let (uuid, validator) = make_validator_with_user();
+        let vless_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let vless_addr = vless_listener.local_addr().unwrap();
+        let validator: Arc<dyn Validator> = validator;
+        tokio::spawn(async move {
+            let _ = serve_vless(vless_listener, ohm, validator, None, None).await;
+        });
+        (vless_addr, echo_port, uuid)
+    }
+
+    /// inbound：decoded.addons.flow=XRV 时服务端下行必须走 Vision padding：
+    /// 客户端裸读首段下行字节，应为 `[uuid(16)][command][content_len(2 BE)]
+    /// [padding_len(2 BE)][content]` 帧。未包装 → 裸 echo 内容 → fail/超时。
+    #[tokio::test]
+    async fn vless_inbound_pads_downlink_when_flow_xrv() {
+        use crate::encryption::vision::COMMAND_PADDING_CONTINUE;
+        use tokio::time::{timeout, Duration};
+
+        let (vless_addr, echo_port, uuid) = spawn_vless_proxy_with_echo().await;
+
+        let mut client = tokio::net::TcpStream::connect(vless_addr).await.unwrap();
+        let mut addons = empty_addons();
+        addons.flow = crate::FLOW_XRV.to_string();
+        encode_request_header(
+            &mut client,
+            VERSION,
+            &uuid,
+            VlessCommand::Tcp,
+            Some(&Address::from_ipv4_bytes([127, 0, 0, 1])),
+            Some(echo_port),
+            &addons,
+        )
+        .await
+        .unwrap();
+        decode_response_header(&mut client, VERSION).await.unwrap();
+
+        // 裸发 ping（inbound 对非 Vision 块是透传语义，无需客户端 padding）
+        client.write_all(b"ping").await.unwrap();
+        client.flush().await.unwrap();
+
+        // 裸读下行：uuid(16)+command(1)+content_len(2)+padding_len(2)+"ping"(4) = 25
+        let mut wire = [0u8; 25];
+        timeout(Duration::from_secs(10), client.read_exact(&mut wire))
+            .await
+            .expect("downlink must be a vision padding frame")
+            .unwrap();
+        assert_eq!(
+            &wire[..16],
+            uuid.as_bytes(),
+            "first downlink block must start with user uuid"
+        );
+        assert_eq!(wire[16], COMMAND_PADDING_CONTINUE, "data frame command");
+        assert_eq!(&wire[17..19], &[0, 4], "content_len BE");
+        assert_eq!(&wire[21..25], b"ping");
+    }
+
+    /// e2e：make_dial_fn(flow=XRV) ↔ serve_vless 全链路 Vision padding 对拉
+    ///（outbound 与 inbound 双端包装，padding 收发互解）。
+    #[tokio::test]
+    async fn vless_vision_e2e_client_and_server_roundtrip() {
+        use crate::dispatcher::{make_dial_fn, VlessOutboundConfig};
+        use tokio::time::{timeout, Duration};
+
+        let (vless_addr, echo_port, uuid) = spawn_vless_proxy_with_echo().await;
+
+        let cfg = Arc::new(
+            VlessOutboundConfig::new(
+                uuid,
+                Address::from_ipv4_bytes([127, 0, 0, 1]),
+                Port::new(vless_addr.port()),
+            )
+            .with_flow(crate::FLOW_XRV),
+        );
+        let dial = make_dial_fn(cfg);
+        let dest = Destination::tcp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(echo_port));
+        let mut conn = dial(&dest).await.expect("dial through vless server");
+
+        let payload = b"vision e2e roundtrip payload";
+        conn.write_all(payload).await.unwrap();
+        conn.flush().await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        timeout(Duration::from_secs(10), conn.read_exact(&mut got))
+            .await
+            .expect("echo through vision-wrapped vless path")
+            .unwrap();
+        assert_eq!(&got, payload);
+    }
+
+    /// 回归：flow 为空时 make_dial_fn 返回裸连接（无 Vision 包装），链路照常。
+    #[tokio::test]
+    async fn vless_no_flow_e2e_make_dial_fn_roundtrip() {
+        use crate::dispatcher::{make_dial_fn, VlessOutboundConfig};
+        use tokio::time::{timeout, Duration};
+
+        let (vless_addr, echo_port, uuid) = spawn_vless_proxy_with_echo().await;
+
+        let cfg = Arc::new(VlessOutboundConfig::new(
+            uuid,
+            Address::from_ipv4_bytes([127, 0, 0, 1]),
+            Port::new(vless_addr.port()),
+        ));
+        let dial = make_dial_fn(cfg);
+        let dest = Destination::tcp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(echo_port));
+        let mut conn = dial(&dest).await.expect("dial");
+
+        let payload = b"plain vless roundtrip";
+        conn.write_all(payload).await.unwrap();
+        conn.flush().await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        timeout(Duration::from_secs(10), conn.read_exact(&mut got))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&got, payload);
     }
 }

@@ -16,6 +16,7 @@
 use std::sync::Arc;
 
 use tokio::io::AsyncWriteExt;
+use crate::encryption::vision_conn::VisionConn;
 use xray_app_dispatcher::default::DialFn;
 use xray_common::net::address::Address;
 use xray_common::net::destination::Destination;
@@ -164,7 +165,16 @@ pub fn make_dial_fn(config: Arc<VlessOutboundConfig>) -> DialFn {
                 .await
                 .map_err(|e| format!("vless decode response header: {e}"))?;
 
-            // 3. conn 现在是 "已握手完成的 TCP"，bridge_link_with_stream 直接用
+            // 3. flow=xtls-rprx-vision（encryption=none）：请求/响应头交换完成后包装
+            //    VisionConn——padding 从业务数据开始（对齐 Go outbound VisionWriter/
+            //    VisionReader 的包装时机，首块 padding 携带本账号 uuid）。
+            //    ENC(mlkem768)+vision 组合走 CommonConn，见 bd 4lf/byo。
+            if config.flow == crate::FLOW_XRV && config.encryption == "none" {
+                let uuid_bytes = config.user_uuid.as_bytes().to_vec();
+                conn = Box::new(VisionConn::new(conn, uuid_bytes));
+            }
+
+            // conn 现在是 "已握手完成的 TCP"，bridge_link_with_stream 直接用
             Ok(conn)
         })
     })
@@ -289,5 +299,70 @@ mod tests {
 
         let flow = server.await.unwrap();
         assert_eq!(flow, "xtls-rprx-vision", "flow must reach server request header");
+    }
+
+    /// flow=XRV 时 make_dial_fn 返回的连接必须已包 VisionConn：首个业务写入
+    /// 在线上是 Vision padding 帧 `[uuid(16)][command][content_len(2 BE)]
+    /// [padding_len(2 BE)][content]`，而非裸 payload。未包装 → 首字节非 uuid → fail。
+    #[tokio::test]
+    async fn make_dial_fn_wraps_conn_with_vision_when_flow_xrv() {
+        use crate::encryption::vision::COMMAND_PADDING_CONTINUE;
+        use crate::encoding::server::decode_request_header;
+        use tokio::time::{timeout, Duration};
+        use crate::{MemoryAccount, MemoryUser, MemoryValidator, Validator as _};
+        use tokio::io::AsyncReadExt as _;
+        use xray_proto::xray::proxy::vless::Account as ProtoAccount;
+
+        let test_uuid = UUID::parse("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap();
+
+        // fake VLESS server：decode 请求头 → 回响应头 → 裸读线上首段业务字节
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let validator = MemoryValidator::new();
+        let mut proto_account = ProtoAccount::default();
+        proto_account.id = "b831381d-6324-4d53-ad4f-8cda48b30811".to_string();
+        let account = MemoryAccount::from_proto_account(&proto_account).unwrap();
+        validator.add(MemoryUser::new("u", 0, account)).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let _ = decode_request_header(false, &mut None, &mut sock, &validator)
+                .await
+                .unwrap();
+            crate::encoding::server::encode_response_header(&mut sock, VERSION, &empty_addons())
+                .await
+                .unwrap();
+            // uuid(16)+command(1)+content_len(2)+padding_len(2)+payload(14) = 35
+            let mut wire = [0u8; 35];
+            sock.read_exact(&mut wire).await.unwrap();
+            wire.to_vec()
+        });
+
+        // client：make_dial_fn（flow=xtls-rprx-vision）
+        let cfg = Arc::new(
+            VlessOutboundConfig::new(
+                test_uuid.clone(),
+                Address::from_ipv4_bytes([127, 0, 0, 1]),
+                Port::new(addr.port()),
+            )
+            .with_flow("xtls-rprx-vision"),
+        );
+        let dial = make_dial_fn(cfg);
+        let dest = Destination::tcp(Address::new_domain("target.example.com"), Port::new(80));
+        let mut conn = dial(&dest).await.expect("dial should succeed");
+        conn.write_all(b"vision-payload").await.unwrap();
+        conn.flush().await.unwrap();
+        drop(conn);
+
+        let wire = timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
+        let payload: &[u8] = b"vision-payload";
+        assert_eq!(
+            &wire[..16],
+            test_uuid.as_bytes(),
+            "first uplink block must start with user uuid"
+        );
+        assert_eq!(wire[16], COMMAND_PADDING_CONTINUE, "data frame command");
+        assert_eq!(&wire[17..19], &[0, payload.len() as u8], "content_len BE");
+        assert_eq!(&wire[21..21 + payload.len()], payload, "content after frame header");
     }
 }

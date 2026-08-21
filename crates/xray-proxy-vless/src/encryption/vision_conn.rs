@@ -14,8 +14,8 @@ use crate::encryption::vision::{
     TrafficState, COMMAND_PADDING_CONTINUE, COMMAND_PADDING_DIRECT, COMMAND_PADDING_END,
     DEFAULT_PADDING_SEED,
 };
-use rand::rngs::ThreadRng;
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::SeedableRng;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -45,7 +45,7 @@ pub struct VisionConn<C> {
     /// padding 模式标志（command=End 后关闭）。
     uplink_padding: bool,
     downlink_padding: bool,
-    rng: ThreadRng,
+    rng: StdRng,
     /// uplink TLS 过滤状态（检测 TLS 1.3 → enable_xtls → splice）。
     uplink_traffic: TrafficState,
     /// downlink TLS 过滤状态（检测服务器 TLS 1.3 → enable_xtls → splice）。
@@ -75,7 +75,7 @@ where
             uplink_write_pending: None,
             uplink_padding: true,
             downlink_padding: true,
-            rng: rand::rng(),
+            rng: StdRng::from_os_rng(),
             uplink_traffic: TrafficState::new(user_uuid.clone()),
             downlink_traffic: TrafficState::new(user_uuid.clone()),
         }
@@ -230,6 +230,20 @@ where
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// `Connection` 转发（地址信息透传内层，padding 层不改变连接属性），
+/// 让 `VisionConn<Box<dyn Connection>>` 可作为 `Box<dyn Connection>` 返回生产路径。
+impl<C> xray_transport::connection::Connection for VisionConn<C>
+where
+    C: xray_transport::connection::Connection,
+{
+    fn remote_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
+        self.inner.remote_addr()
+    }
+    fn local_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
+        self.inner.local_addr()
     }
 }
 
