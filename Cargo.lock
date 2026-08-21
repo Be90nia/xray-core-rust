@@ -6067,6 +6067,7 @@ name = "xray-proxy-dokodemo"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "libc",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

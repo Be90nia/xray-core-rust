@@ -7,14 +7,14 @@
 //!
 //! - [`config::Config`] + `predefined_address`/`allows_network` + Network 枚举 + prost 双向
 //! - [`server::DokodemoServer`] + `impl InboundHandler`（start/accept/close lifecycle）
-//!
-//! 切片3 待办：dispatch to outbound handler + `follow_redirect`（SO_ORIGINAL_DST）+
-//! port_map 端口映射 + TCP/UDP 双栈 + Unix socket 支持。
+//! - [`fakeudp::fake_udp`]：TPROXY 伪造源地址 UDP（Linux；非 Linux 返回错误）
+
 
 pub mod config;
 pub mod error;
 pub mod server;
 pub mod outbound;
+pub mod fakeudp;
 
 // 顶层 re-export。
 pub use config::{Config, Network, PredefinedAddress};

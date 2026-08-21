@@ -415,18 +415,112 @@ async fn handle_plain_http(
     tokio::join!(dispatch_and_cleanup, write_req, read_resp);
 }
 
-/// Dokodemo-door inbound 服务入口（tdy）。
+/// Dokodemo TCP inbound per-connection 目标解析选项。
 ///
-/// 接受连接 → 直接用预定义 `dest` 拼装 Link → dispatch（dokodemo 无握手协议）。
+/// 对应 Go `DokodemoDoor` 的 `rewriteAddress`/`rewritePort`/`portMap`/
+/// `followRedirect` + streamSettings TLS（`tls.NewListener` 包裹）。
+#[derive(Clone)]
+pub struct DokodemoTcpOptions {
+    /// 预定义目标（settings.address + settings.port）。
+    pub dest: Destination,
+    /// 端口映射：监听端口字符串 → `"host:port"`（host/port 均可缺省）。
+    /// 仅 `follow_redirect=false` 时生效。
+    pub port_map: HashMap<String, String>,
+    /// 跟随 iptables REDIRECT 原始目标（Linux `SO_ORIGINAL_DST`）+ TLS SNI 覆盖。
+    pub follow_redirect: bool,
+    /// TLS acceptor（streamSettings `security:tls` 时）。
+    pub tls: Option<Arc<xray_transport::TlsAcceptor>>,
+}
+
+/// 字符串解析为 [`Address`]：IPv4 → IPv6 → 域名。
+fn parse_address_str(s: &str) -> Address {
+    if let Ok(v4) = s.parse::<std::net::Ipv4Addr>() {
+        Address::IPv4(v4)
+    } else if let Ok(v6) = s.parse::<std::net::Ipv6Addr>() {
+        Address::IPv6(v6)
+    } else {
+        Address::Domain(s.to_string())
+    }
+}
+
+/// [`SocketAddr`] 的 IP 部分转 [`Address`]。
+fn socketaddr_to_address(addr: SocketAddr) -> Address {
+    match addr.ip() {
+        std::net::IpAddr::V4(v4) => Address::IPv4(v4),
+        std::net::IpAddr::V6(v6) => Address::IPv6(v6),
+    }
+}
+
+/// Dokodemo TCP per-connection dest 解析。对应 Go `Process()` L79-136。
+///
+/// `follow_redirect=true` 优先级：
+/// 1. `original_dst`（Linux `SO_ORIGINAL_DST`，iptables REDIRECT 透明代理）
+/// 2. TLS 握手 SNI 覆盖 address（port 保持；Go dokodemo.go:122-132，仅在未被
+///    original_dst 覆盖时）
+/// 3. predefined dest
+///
+/// `follow_redirect=false`：predefined dest + `port_map`（按监听端口查 map 改写，
+/// Go dokodemo.go:101-109）。
+fn resolve_dokodemo_tcp_dest(
+    opts: &DokodemoTcpOptions,
+    local_port: Option<u16>,
+    original_dst: Option<SocketAddr>,
+    tls_sni: Option<&str>,
+) -> Destination {
+    let mut dest = opts.dest.clone();
+    if opts.follow_redirect {
+        let mut overridden = false;
+        if let Some(orig) = original_dst {
+            dest = Destination::tcp(socketaddr_to_address(orig), Port::new(orig.port()));
+            overridden = true;
+        }
+        if !overridden {
+            if let Some(sni) = tls_sni.filter(|s| !s.is_empty()) {
+                dest = Destination::tcp(Address::Domain(sni.to_string()), dest.port());
+            }
+        }
+    } else if let Some(lp) = local_port {
+        // port_map：值 "host:port"，host/port 均可空（Go dokodemo.go:101-109，
+        // SplitHostPort 错误已在 parse 阶段校验，此处容错跳过）。
+        if let Some(mapping) = opts.port_map.get(&lp.to_string()) {
+            if let Some((host, port_str)) = mapping.rsplit_once(':') {
+                if !port_str.is_empty() {
+                    if let Ok(p) = port_str.parse::<u16>() {
+                        dest = Destination::tcp(dest.address().clone(), Port::new(p));
+                    }
+                }
+                let host = host.trim_start_matches('[').trim_end_matches(']');
+                if !host.is_empty() {
+                    dest = Destination::tcp(parse_address_str(host), dest.port());
+                }
+            }
+        }
+    }
+    dest
+}
+
+/// Dokodemo-door inbound 服务入口（tdy / i09）。
+///
+/// 接受连接 → 按 [`DokodemoTcpOptions`] 解析目标 dest（predefined / port_map /
+/// follow_redirect / TLS SNI）→ 拼装 Link → dispatch（dokodemo 无握手协议）。
+///
+/// 对应 Go `Process()`：TLS 由 listener 层包裹（`tls.NewListener`），SNI 在
+/// follow_redirect 未被 SO_ORIGINAL_DST 覆盖时改写 dest.address。
 pub async fn serve_dokodemo(
     listener: TcpListener,
     ohm: Arc<SimpleOhm>,
-    dest: Destination,
+    opts: DokodemoTcpOptions,
 ) -> std::io::Result<()> {
     let handler = ohm
         .get_default_handler()
         .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
-    tracing::info!(addr = %listener.local_addr()?, dest = ?dest, "dokodemo inbound listening");
+    tracing::info!(
+        addr = %listener.local_addr()?,
+        dest = ?opts.dest,
+        follow_redirect = opts.follow_redirect,
+        tls = opts.tls.is_some(),
+        "dokodemo inbound listening"
+    );
     loop {
         let (stream, _peer) = match listener.accept().await {
             Ok(v) => v,
@@ -436,11 +530,45 @@ pub async fn serve_dokodemo(
             }
         };
         let handler = Arc::clone(&handler);
-        let dest = dest.clone();
+        let opts = opts.clone();
         tokio::spawn(async move {
-            let (read_half, write_half) = tokio::io::split(stream);
-            let link = Link::new(new_reader(read_half), new_writer(write_half));
-            let _ = handler.dispatch(&dest, link).await;
+            let local_port = stream.local_addr().ok().map(|a| a.port());
+
+            // follow_redirect：Linux 下从 accept 的 fd 查 SO_ORIGINAL_DST。
+            // Go 由 TPROXY listener 在 transport 层写入 session ctx（Go dokodemo.go
+            // L113-121），Rust 在此直接 getsockopt；非 REDIRECT 连接返回 Err → 回落。
+            #[cfg(target_os = "linux")]
+            let original_dst = if opts.follow_redirect {
+                use std::os::fd::AsRawFd;
+                xray_transport::sockopt::get_original_dst(stream.as_raw_fd()).ok()
+            } else {
+                None
+            };
+            #[cfg(not(target_os = "linux"))]
+            let original_dst: Option<SocketAddr> = None;
+
+            if let Some(acc) = opts.tls.clone() {
+                match acc.accept(stream).await {
+                    Ok(tls_stream) => {
+                        // SNI 覆盖：握手完成后的 ClientHello server_name
+                        // （rustls ServerConnection::server_name）。
+                        let sni = tls_stream.get_ref().1.server_name();
+                        let dest =
+                            resolve_dokodemo_tcp_dest(&opts, local_port, original_dst, sni);
+                        let (read_half, write_half) = tokio::io::split(tls_stream);
+                        let link = Link::new(new_reader(read_half), new_writer(write_half));
+                        let _ = handler.dispatch(&dest, link).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "dokodemo TLS accept failed");
+                    }
+                }
+            } else {
+                let dest = resolve_dokodemo_tcp_dest(&opts, local_port, original_dst, None);
+                let (read_half, write_half) = tokio::io::split(stream);
+                let link = Link::new(new_reader(read_half), new_writer(write_half));
+                let _ = handler.dispatch(&dest, link).await;
+            }
         });
     }
 }
@@ -1396,16 +1524,31 @@ async fn spawn_one_inbound(
         "dokodemo" => {
             let settings = parse_dokodemo_settings(&ib.entry.data)?;
             let dest = settings.dest.clone();
-            // followRedirect 留 TODO: 需要从 listener fd 调 SO_ORIGINAL_DST（Linux-only）。
-            // 当前 TCP/UDP 走 predefined dest。
+            // TLS（streamSettings security=tls）：对应 Go tls.NewListener 包裹，
+            // SNI 在 serve_dokodemo 内用于 follow_redirect 未覆盖时的 dest 改写。
+            let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
+            // followRedirect 的 SO_ORIGINAL_DST 仅 Linux 可用；非 Linux 回落
+            // predefined dest（对齐 Go fakeudp_other.go 的平台差异处理方式）。
+            #[cfg(not(target_os = "linux"))]
+            if settings.follow_redirect {
+                tracing::warn!(
+                    tag = %ib.tag,
+                    "dokodemo followRedirect requires Linux (SO_ORIGINAL_DST); falling back to predefined dest"
+                );
+            }
             let mut handles = Vec::new();
             if settings.allow_tcp {
                 let listener = TcpListener::bind(&addr).await?;
-                tracing::info!(tag = %ib.tag, addr = %addr, dest = ?dest, "dokodemo TCP inbound listening");
+                tracing::info!(tag = %ib.tag, addr = %addr, dest = ?dest, tls = tls.is_some(), "dokodemo TCP inbound listening");
                 let ohm_tcp = Arc::clone(&ohm);
-                let dest_tcp = dest.clone();
+                let opts = DokodemoTcpOptions {
+                    dest: dest.clone(),
+                    port_map: settings.port_map,
+                    follow_redirect: settings.follow_redirect,
+                    tls,
+                };
                 handles.push(tokio::spawn(async move {
-                    if let Err(e) = serve_dokodemo(listener, ohm_tcp, dest_tcp).await {
+                    if let Err(e) = serve_dokodemo(listener, ohm_tcp, opts).await {
                         tracing::error!(error = %e, "dokodemo TCP inbound stopped");
                     }
                 }));
@@ -1693,8 +1836,7 @@ fn parse_dokodemo_dest(data: &[u8]) -> std::io::Result<Destination> {
 }
 
 /// Dokodemo inbound 解析后的完整设置。
-///
-/// 对应 Go `proxy/dokodemo/config.go::Config`。
+#[derive(Debug)]
 struct DokodemoInboundSettings {
     /// 预定义目标（TCP 和 UDP 各一份，网络类型不同）。
     dest: Destination,
@@ -1704,6 +1846,8 @@ struct DokodemoInboundSettings {
     allow_udp: bool,
     /// 是否跟随 iptables REDIRECT 原始目标（透明代理）。
     follow_redirect: bool,
+    /// 端口映射：监听端口字符串 → "host:port"。
+    port_map: HashMap<String, String>,
 }
 
 /// 从 inbound entry.data（JSON）解析完整 dokodemo 设置。
@@ -1718,25 +1862,46 @@ fn parse_dokodemo_settings(data: &[u8]) -> std::io::Result<DokodemoInboundSettin
     let port = v.get("port").and_then(|x| x.as_u64())
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "dokodemo: missing port"))?
         as u16;
-    let address = if let Ok(v4) = address_str.parse::<std::net::Ipv4Addr>() {
-        Address::IPv4(v4)
-    } else if let Ok(v6) = address_str.parse::<std::net::Ipv6Addr>() {
-        Address::IPv6(v6)
-    } else {
-        Address::Domain(address_str.to_string())
-    };
+    let address = parse_address_str(address_str);
     // network：逗号分隔，默认 tcp。对应 Go allowed_networks。
     let network_str = v.get("network").and_then(|x| x.as_str()).unwrap_or("tcp");
     let allow_tcp = network_str.contains("tcp");
     let allow_udp = network_str.contains("udp");
     let follow_redirect = v.get("followRedirect").and_then(|x| x.as_bool()).unwrap_or(false);
 
+    // portMap：监听端口 → "host:port"（Go infra/conf/dokodemo.go:17，值校验 L39-43
+    // SplitHostPort——host 可空、port 可空但必须有冒号且 port 为数字）。
+    let mut port_map = HashMap::new();
+    if let Some(map) = v.get("portMap").and_then(|x| x.as_object()) {
+        for (key, val) in map {
+            let val_str = val.as_str().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "dokodemo: portMap value must be a string",
+                )
+            })?;
+            let (_, port_str) = val_str.rsplit_once(':').ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("dokodemo: invalid portMap: {val_str} (missing port)"),
+                )
+            })?;
+            if !port_str.is_empty() && port_str.parse::<u16>().is_err() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("dokodemo: invalid portMap: {val_str} (bad port)"),
+                ));
+            }
+            port_map.insert(key.clone(), val_str.to_string());
+        }
+    }
+
     let dest = if allow_udp && !allow_tcp {
         Destination::new(address, Port::new(port), Network::UDP)
     } else {
         Destination::new(address, Port::new(port), Network::TCP)
     };
-    Ok(DokodemoInboundSettings { dest, allow_tcp, allow_udp, follow_redirect })
+    Ok(DokodemoInboundSettings { dest, allow_tcp, allow_udp, follow_redirect, port_map })
 }
 
 /// 从 inbound entry.data（JSON）解析 vmess clients → TimedUserValidator。
@@ -3009,6 +3174,403 @@ mod tests {
         .expect("response via dispatcher within 5s")
         .unwrap();
         assert_eq!(&rbuf[..n], b"dokodemo-via-dispatch");
+    }
+
+    fn tcp_opts() -> super::DokodemoTcpOptions {
+        super::DokodemoTcpOptions {
+            dest: Destination::tcp(
+                Address::IPv4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+                Port::new(80),
+            ),
+            port_map: HashMap::new(),
+            follow_redirect: false,
+            tls: None,
+        }
+    }
+
+    #[test]
+    fn resolve_dokodemo_port_map_rewrites_host_and_port() {
+        let mut opts = tcp_opts();
+        opts.port_map
+            .insert("80".to_string(), "192.168.99.1:9090".to_string());
+        let dest =
+            super::resolve_dokodemo_tcp_dest(&opts, Some(80), None, None);
+        assert_eq!(dest.port().value(), 9090);
+        match dest.address() {
+            Address::IPv4(v4) => assert_eq!(v4.octets(), [192, 168, 99, 1]),
+            other => panic!("expected mapped IPv4, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_dokodemo_port_map_port_only_keeps_address() {
+        let mut opts = tcp_opts();
+        opts.port_map.insert("80".to_string(), ":5353".to_string());
+        let dest =
+            super::resolve_dokodemo_tcp_dest(&opts, Some(80), None, None);
+        assert_eq!(dest.port().value(), 5353);
+        match dest.address() {
+            Address::IPv4(v4) => assert_eq!(v4.octets(), [10, 0, 0, 1]),
+            other => panic!("expected predefined IPv4, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_dokodemo_port_map_domain_host() {
+        let mut opts = tcp_opts();
+        opts.port_map
+            .insert("80".to_string(), "example.org:".to_string());
+        let dest =
+            super::resolve_dokodemo_tcp_dest(&opts, Some(80), None, None);
+        assert_eq!(dest.port().value(), 80);
+        match dest.address() {
+            Address::Domain(d) => assert_eq!(d, "example.org"),
+            other => panic!("expected Domain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_dokodemo_port_map_no_match_uses_predefined() {
+        let mut opts = tcp_opts();
+        opts.port_map
+            .insert("443".to_string(), "192.168.99.1:9090".to_string());
+        let dest =
+            super::resolve_dokodemo_tcp_dest(&opts, Some(80), None, None);
+        assert_eq!(dest.port().value(), 80);
+        match dest.address() {
+            Address::IPv4(v4) => assert_eq!(v4.octets(), [10, 0, 0, 1]),
+            other => panic!("expected predefined IPv4, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_dokodemo_sni_overrides_address_keeps_port() {
+        let mut opts = tcp_opts();
+        opts.follow_redirect = true;
+        let dest = super::resolve_dokodemo_tcp_dest(
+            &opts,
+            Some(80),
+            None,
+            Some("sni.example.com"),
+        );
+        assert_eq!(dest.port().value(), 80, "SNI 只覆盖 address，port 保持");
+        match dest.address() {
+            Address::Domain(d) => assert_eq!(d, "sni.example.com"),
+            other => panic!("expected SNI domain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_dokodemo_original_dst_wins_over_sni() {
+        let mut opts = tcp_opts();
+        opts.follow_redirect = true;
+        let orig: SocketAddr = "203.0.113.7:4433".parse().unwrap();
+        let dest = super::resolve_dokodemo_tcp_dest(
+            &opts,
+            Some(80),
+            Some(orig),
+            Some("sni.example.com"),
+        );
+        assert_eq!(dest.port().value(), 4433);
+        match dest.address() {
+            Address::IPv4(v4) => assert_eq!(v4.octets(), [203, 0, 113, 7]),
+            other => panic!("expected original dst IPv4, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_dokodemo_follow_redirect_falls_back_to_predefined() {
+        // 非 Linux / 非 REDIRECT 连接：无 original_dst、无 TLS → predefined
+        let mut opts = tcp_opts();
+        opts.follow_redirect = true;
+        let dest =
+            super::resolve_dokodemo_tcp_dest(&opts, Some(80), None, None);
+        assert_eq!(dest.port().value(), 80);
+        match dest.address() {
+            Address::IPv4(v4) => assert_eq!(v4.octets(), [10, 0, 0, 1]),
+            other => panic!("expected predefined IPv4, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_dokodemo_port_map_skipped_when_follow_redirect() {
+        // Go：portMap 分支在 !FollowRedirect 内，两者互斥
+        let mut opts = tcp_opts();
+        opts.follow_redirect = true;
+        opts.port_map
+            .insert("80".to_string(), "192.168.99.1:9090".to_string());
+        let dest =
+            super::resolve_dokodemo_tcp_dest(&opts, Some(80), None, None);
+        assert_eq!(dest.port().value(), 80);
+        match dest.address() {
+            Address::IPv4(v4) => assert_eq!(v4.octets(), [10, 0, 0, 1]),
+            other => panic!("expected predefined IPv4, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_dokodemo_settings_port_map() {
+        let settings = serde_json::json!({
+            "address": "1.2.3.4", "port": 80,
+            "portMap": { "80": "192.168.99.1:9090", "443": ":8443" }
+        });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let s = super::parse_dokodemo_settings(&data).unwrap();
+        assert_eq!(s.port_map.len(), 2);
+        assert_eq!(s.port_map.get("80").unwrap(), "192.168.99.1:9090");
+    }
+
+    #[test]
+    fn parse_dokodemo_settings_invalid_port_map_value() {
+        // Go infra/conf 校验 SplitHostPort 失败 → 配置错误
+        let settings = serde_json::json!({
+            "address": "1.2.3.4", "port": 80,
+            "portMap": { "80": "no-colon-here" }
+        });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let err = super::parse_dokodemo_settings(&data).unwrap_err();
+        assert!(err.to_string().contains("portMap"), "got: {err}");
+    }
+
+    /// i09：捕获 dispatch 收到的 dest（TCP），并回写标记确认链路。
+    #[derive(Debug)]
+    struct DestCaptureDispatch {
+        dest: parking_lot::Mutex<Option<Destination>>,
+    }
+
+    impl xray_app_dispatcher::DispatchHandler for DestCaptureDispatch {
+        fn tag(&self) -> &str {
+            "dest-capture"
+        }
+
+        fn dispatch(
+            &self,
+            dest: &Destination,
+            link: Link,
+        ) -> xray_app_dispatcher::default::PinFuture<()> {
+            *self.dest.lock() = Some(dest.clone());
+            Box::pin(async move {
+                let Link { mut writer, mut reader } = link;
+                let marker = b"ok".to_vec();
+                let mut mb = xray_buf::multi::MultiBuffer::new();
+                mb.merge_bytes(&marker);
+                let _ = writer.write_multi_buffer(mb).await;
+                // drain 入站：socket 带未读数据关闭会触发 RST，客户端读标记前连接被重置
+                loop {
+                    match reader.read_multi_buffer().await {
+                        Ok(mb) if mb.is_empty() => break,
+                        Ok(_) => continue,
+                        Err(_) => break,
+                    }
+                }
+            })
+        }
+    }
+
+    /// i09 e2e：dokodemo TCP port_map——按监听端口改写 dest（Go dokodemo.go:101-109）。
+    #[tokio::test]
+    async fn dokodemo_tcp_port_map_dispatch_e2e() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let ohm = Arc::new(SimpleOhm::new());
+        let capture = Arc::new(DestCaptureDispatch {
+            dest: parking_lot::Mutex::new(None),
+        });
+        ohm.set_default(capture.clone() as Arc<dyn DispatchHandler>);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let opts = DokodemoTcpOptions {
+            dest: Destination::tcp(
+                Address::IPv4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+                Port::new(80),
+            ),
+            port_map: [(port.to_string(), "192.168.99.1:9090".to_string())]
+                .into_iter()
+                .collect(),
+            follow_redirect: false,
+            tls: None,
+        };
+        tokio::spawn(async move {
+            let _ = serve_dokodemo(listener, ohm, opts).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        client.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 2];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ok");
+
+        let dest = capture.dest.lock().clone().expect("dest captured");
+        assert_eq!(dest.port().value(), 9090, "port should be port_map-mapped");
+        match dest.address() {
+            Address::IPv4(v4) => assert_eq!(v4.octets(), [192, 168, 99, 1]),
+            other => panic!("expected mapped IPv4, got {other:?}"),
+        }
+    }
+
+    /// i09 e2e：dokodemo + TLS + followRedirect——客户端 SNI 覆盖 dest.address
+    /// （Go dokodemo.go:122-132）。
+    #[tokio::test]
+    async fn dokodemo_tls_sni_override_e2e() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+
+        static PROVIDER: std::sync::Once = std::sync::Once::new();
+        PROVIDER.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+
+        #[derive(Debug)]
+        struct NoVerify;
+        impl rustls::client::danger::ServerCertVerifier for NoVerify {
+            fn verify_server_cert(
+                &self,
+                _end_entity: &rustls::pki_types::CertificateDer<'_>,
+                _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+                _server_name: &rustls::pki_types::ServerName<'_>,
+                _ocsp_response: &[u8],
+                _now: rustls::pki_types::UnixTime,
+            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                message: &[u8],
+                cert: &rustls::pki_types::CertificateDer<'_>,
+                dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+                rustls::crypto::verify_tls12_signature(
+                    message,
+                    cert,
+                    dss,
+                    &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+                )
+            }
+            fn verify_tls13_signature(
+                &self,
+                message: &[u8],
+                cert: &rustls::pki_types::CertificateDer<'_>,
+                dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+                rustls::crypto::verify_tls13_signature(
+                    message,
+                    cert,
+                    dss,
+                    &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+                )
+            }
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+                rustls::crypto::ring::default_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            }
+        }
+
+        // 1. 证书 SAN = 期望 SNI 域名
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(vec!["sni.example.com".to_string()])
+            .unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        let stream_settings = serde_json::json!({
+            "security": "tls",
+            "tlsSettings": { "cert": cert.pem(), "key": key_pair.serialize_pem() }
+        });
+        let tls = super::build_tls_acceptor(Some(&stream_settings))
+            .unwrap()
+            .expect("tls acceptor");
+
+        // 2. serve_dokodemo：predefined dest 1.2.3.4:80 + follow_redirect（SNI 门控）
+        let ohm = Arc::new(SimpleOhm::new());
+        let capture = Arc::new(DestCaptureDispatch {
+            dest: parking_lot::Mutex::new(None),
+        });
+        ohm.set_default(capture.clone() as Arc<dyn DispatchHandler>);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let opts = DokodemoTcpOptions {
+            dest: Destination::tcp(
+                Address::IPv4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
+                Port::new(80),
+            ),
+            port_map: HashMap::new(),
+            follow_redirect: true,
+            tls: Some(tls),
+        };
+        tokio::spawn(async move {
+            let _ = serve_dokodemo(listener, ohm, opts).await;
+        });
+
+        // 3. 客户端 TLS 握手带 SNI sni.example.com
+        let client_cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+        let sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from("sni.example.com")
+            .unwrap()
+            .to_owned();
+        let mut tls_client = connector.connect(server_name, sock).await.unwrap();
+
+        tls_client.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 2];
+        tls_client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ok");
+
+        // 4. dispatch dest.address 应为 SNI 域名（port 保持 predefined）
+        let dest = capture.dest.lock().clone().expect("dest captured");
+        assert_eq!(dest.port().value(), 80, "SNI 只覆盖 address");
+        match dest.address() {
+            Address::Domain(d) => assert_eq!(d, "sni.example.com"),
+            other => panic!("expected SNI domain, got {other:?}"),
+        }
+    }
+
+    /// i09 e2e：followRedirect 但无 NAT/非 Linux——回落 predefined dest。
+    #[tokio::test]
+    async fn dokodemo_follow_redirect_falls_back_to_predefined_e2e() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let ohm = Arc::new(SimpleOhm::new());
+        let capture = Arc::new(DestCaptureDispatch {
+            dest: parking_lot::Mutex::new(None),
+        });
+        ohm.set_default(capture.clone() as Arc<dyn DispatchHandler>);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let opts = DokodemoTcpOptions {
+            dest: Destination::tcp(
+                Address::IPv4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+                Port::new(443),
+            ),
+            port_map: HashMap::new(),
+            follow_redirect: true,
+            tls: None,
+        };
+        tokio::spawn(async move {
+            let _ = serve_dokodemo(listener, ohm, opts).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        client.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 2];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ok");
+
+        // 直连（无 iptables REDIRECT）：get_original_dst 失败/不可用 → predefined
+        let dest = capture.dest.lock().clone().expect("dest captured");
+        assert_eq!(dest.port().value(), 443);
+        match dest.address() {
+            Address::IPv4(v4) => assert_eq!(v4.octets(), [10, 0, 0, 1]),
+            other => panic!("expected predefined IPv4, got {other:?}"),
+        }
     }
 
     #[test]
