@@ -5,13 +5,13 @@
 //! # 范围
 //! 本模块只翻译**不涉及实际 TLS 握手与 x509 证书加载**的纯逻辑：
 //! - 椭圆曲线名称 ↔ CurveID 映射
-//! - MITM 来源判定（`IsFromMitm`）
-//! - 证书链钉扎验证（`verify_chain`/`VerifyResult`）
+//! - `config`：`CurveId` + `parse_curve_name` + `is_from_mitm` + `verify_chain` +
+//!   `security_params`（provider/版本/套件/曲线）+ `Option` 函数模式 + `RandCarrier`
 //! - `Option` 函数模式（`WithDestination`/`WithOverrideName`/`WithNextProto`）
-//! - `RandCarrier` 数据结构（不含实际 `rand.Read` 实现）
 //!
-//! 实际 `GetTLSConfig` 组装 `rustls::ClientConfig`、x509 加载、OCSP
-//! ticker 等 IO 逻辑未翻译——等接入 rustls 后再添加。
+//! `GetTLSConfig` 的 provider 组装（minVersion/maxVersion/cipherSuites/
+//! curvePreferences → `security_params`）也在此模块；完整 Client/ServerConfig
+//! 组装见 `client_config` / `server_config`。
 
 use subtle::ConstantTimeEq;
 
@@ -237,6 +237,181 @@ pub struct RandCarrier {
     pub verify_peer_cert_by_name: Vec<String>,
     /// pinned 证书 SHA-256 hash 列表（`pinned_peer_cert_sha256`）。
     pub pinned_peer_cert_sha256: Vec<Vec<u8>>,
+}
+
+// ============================================================
+// GetTLSConfig 的 provider 组装（minVersion/maxVersion/cipherSuites/curvePreferences）
+// ============================================================
+
+use std::sync::Arc as StdArc;
+
+use rustls::SupportedCipherSuite;
+use rustls::SupportedProtocolVersion;
+use rustls::version::{TLS12, TLS13};
+
+/// Go `tls.CipherSuites()` 套件名 → rustls ring provider suite。
+///
+/// TLS1.3 套件名两族不同（Go `TLS_AES_128_GCM_SHA256` vs rustls 常量 `TLS13_...`），
+/// TLS1.2 ECDHE 套件名一致。Go 支持的 CBC / 非 ECDHE / 静态 RSA 密钥交换套件
+/// rustls 出于安全永不支持 → `None`（调用方 warn 后跳过，对齐 Go `id[n] != 0` 跳过未知名）。
+fn go_cipher_suite(name: &str) -> Option<SupportedCipherSuite> {
+    use rustls::crypto::ring::cipher_suite as ring_suites;
+    Some(match name {
+        "TLS_AES_128_GCM_SHA256" => ring_suites::TLS13_AES_128_GCM_SHA256,
+        "TLS_AES_256_GCM_SHA384" => ring_suites::TLS13_AES_256_GCM_SHA384,
+        "TLS_CHACHA20_POLY1305_SHA256" => ring_suites::TLS13_CHACHA20_POLY1305_SHA256,
+        "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" => {
+            ring_suites::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+        }
+        "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" => {
+            ring_suites::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+        }
+        "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256" => {
+            ring_suites::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+        }
+        "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" => {
+            ring_suites::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+        }
+        "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" => {
+            ring_suites::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+        }
+        "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256" => {
+            ring_suites::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+        }
+        _ => return None,
+    })
+}
+
+/// [`CurveId`] → rustls `NamedGroup`（`SupportedKxGroup::name()` 的返回类型）。
+///
+/// 返回 `None` 表示 Unsupported：ring provider 无 secp521r1，亦无后量子
+/// MLKEM 混合组（需要 aws-lc-rs provider）。
+fn kx_named_group(c: CurveId) -> Option<rustls::NamedGroup> {
+    match c {
+        CurveId::X25519 => Some(rustls::NamedGroup::X25519),
+        CurveId::P256 => Some(rustls::NamedGroup::secp256r1),
+        CurveId::P384 => Some(rustls::NamedGroup::secp384r1),
+        CurveId::P521
+        | CurveId::X25519Mlkem768
+        | CurveId::SecP256r1Mlkem768
+        | CurveId::SecP384r1Mlkem1024 => None,
+    }
+}
+
+/// 版本字符串 `"1.0"`-`"1.3"` → 数字。未知值 `None`（对齐 Go switch：不认识就忽略保持默认）。
+fn parse_version_str(s: &str) -> Option<u16> {
+    match s {
+        "1.0" => Some(10),
+        "1.1" => Some(11),
+        "1.2" => Some(12),
+        "1.3" => Some(13),
+        _ => None,
+    }
+}
+fn json_string_list(json: &serde_json::Value, key: &str) -> Vec<String> {
+    match json.get(key) {
+        Some(serde_json::Value::String(s)) => vec![s.clone()],
+        Some(serde_json::Value::Array(items)) => {
+            items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// 组装 `minVersion`/`maxVersion`/`cipherSuites`/`curvePreferences` →
+/// 自定义 [`rustls::crypto::CryptoProvider`] + 协议版本列表。
+///
+/// 对应 Go `GetTLSConfig` L418-458。rustls 能力边界（一律 tracing warn，不 panic、
+/// 不静默假装生效、不硬塞）：
+/// - **TLS 1.0/1.1**：rustls 已移除（仅 1.2/1.3）→ Unsupported warn；
+///   minVersion 钳到 1.2，maxVersion < 1.2 时无可用版本 → 回落默认 [1.3, 1.2]。
+/// - **curvep521 / x25519mlkem768 / secp256r1mlkem768 / secp384r1mlkem1024**：
+///   ring provider 无对应 kx 组（aws-lc 才有）→ Unsupported warn 跳过。
+/// - **CBC / 非 ECDHE / RSA 密钥交换套件名**：rustls 永不支持 → warn 跳过。
+/// - 名字全不可用导致过滤结果为空 → 保留 provider 默认并 warn。
+///
+/// kx 组按用户顺序排列（对齐 Go `CurvePreferences` 语义）；
+/// 套件保持 ring 默认序（Go `CipherSuites` 也按映射表顺序追加）。
+pub(crate) fn security_params(
+    json: &serde_json::Value,
+) -> (StdArc<rustls::crypto::CryptoProvider>, Vec<&'static SupportedProtocolVersion>) {
+    let mut provider = rustls::crypto::ring::default_provider();
+
+    // cipherSuites：冒号分隔的 Go 套件名（L448-458）。
+    if let Some(spec) = json.get("cipherSuites").and_then(|v| v.as_str()) {
+        if !spec.is_empty() {
+            let mut suites = Vec::new();
+            for name in spec.split(':') {
+                match go_cipher_suite(name) {
+                    Some(s) => suites.push(s),
+                    None => {
+                        tracing::warn!(suite = name, "cipherSuites entry unsupported by rustls, skipped")
+                    }
+                }
+            }
+            if suites.is_empty() {
+                tracing::warn!("no usable cipher suite in cipherSuites, keeping provider defaults");
+            } else {
+                provider.cipher_suites = suites;
+            }
+        }
+    }
+
+    // curvePreferences（L418-420 + ParseCurveName）。
+    let curves = json_string_list(json, "curvePreferences");
+    if !curves.is_empty() {
+        let mut wanted: Vec<rustls::NamedGroup> = Vec::new();
+        for curve in &curves {
+            match parse_curve_name(curve).map(kx_named_group) {
+                Some(Some(group)) => {
+                    if !wanted.contains(&group) {
+                        wanted.push(group);
+                    }
+                }
+                Some(None) => {
+                    tracing::warn!(curve = curve.as_str(), "curve unsupported by rustls ring provider, skipped")
+                }
+                None => tracing::warn!(curve = curve.as_str(), "unsupported curve name, skipped"),
+            }
+        }
+        if wanted.is_empty() {
+            tracing::warn!("no usable curve in curvePreferences, keeping provider defaults");
+        } else {
+            let groups = provider.kx_groups.clone();
+            provider.kx_groups = wanted
+                .iter()
+                .filter_map(|group| groups.iter().copied().find(|g| g.name() == *group))
+                .collect();
+        }
+    }
+
+    // minVersion/maxVersion（L426-446）。
+    let lo = match json.get("minVersion").and_then(|v| v.as_str()).and_then(parse_version_str) {
+        Some(10) | Some(11) => {
+            tracing::warn!("TLS 1.0/1.1 unsupported by rustls, clamping minVersion to 1.2");
+            12
+        }
+        Some(v) => v,
+        None => 12,
+    };
+    let hi = match json.get("maxVersion").and_then(|v| v.as_str()).and_then(parse_version_str) {
+        Some(10) | Some(11) => 11, // < 1.2：rustls 无可用版本，稍后回落默认
+        Some(v) => v,
+        None => 13,
+    };
+    let mut versions: Vec<&'static SupportedProtocolVersion> = Vec::new();
+    if lo <= 13 && hi >= 13 {
+        versions.push(&TLS13);
+    }
+    if lo <= 12 && hi >= 12 {
+        versions.push(&TLS12);
+    }
+    if versions.is_empty() {
+        tracing::warn!("no usable protocol version (rustls requires >=1.2), using defaults");
+        versions = vec![&TLS13, &TLS12];
+    }
+
+    (StdArc::new(provider), versions)
 }
 
 #[cfg(test)]

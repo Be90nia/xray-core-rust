@@ -6,12 +6,17 @@
 use std::io;
 use std::sync::Arc;
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::server::WebPkiClientVerifier;
+use rustls::{RootCertStore, ServerConfig};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use rustls::ServerConfig;
 
-use crate::certificate::{extract_cert_names, generate_self_signed_cert};
+use crate::certificate::{
+    entry_certs_and_key, entry_usage, generate_self_signed_cert, EntryUsage,
+    extract_cert_names,
+};
+use crate::config::security_params;
 
 // ============================================================
 // NamedCertKey：rustls CertifiedKey + 预提取的 SNI 名称
@@ -191,10 +196,27 @@ pub fn build_server_config(
         )?);
     }
 
+    // minVersion/maxVersion/cipherSuites/curvePreferences → 自定义 provider + 版本列表
+    let (provider, versions) = security_params(&json);
+
     let resolver = Arc::new(SniCertResolver::new(entries, reject_unknown));
-    let mut config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_cert_resolver(resolver);
+    let builder = ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&versions)
+        .map_err(|e| io::Error::other(format!("protocol versions: {e}")))?;
+
+    // mTLS：`usage:"verify"` 条目构成客户端 CA 池时要求并验证客户端证书。
+    // Go v26 无服务端 mTLS（全仓无 ClientAuth），此处为 Rust 扩展——显式 opt-in，
+    // 未配置 verify 条目时保持 with_no_client_auth，既有配置行为不变。
+    let client_ca = client_ca_root_store(&json);
+    let builder = if client_ca.is_empty() {
+        builder.with_no_client_auth()
+    } else {
+        let verifier = WebPkiClientVerifier::builder(Arc::new(client_ca))
+            .build()
+            .map_err(|e| io::Error::other(format!("client CA verifier: {e}")))?;
+        builder.with_client_cert_verifier(verifier)
+    };
+    let mut config = builder.with_cert_resolver(resolver);
 
     // alpn：对齐 Go GetTLSConfig——NextProtos 取 tlsSettings.alpn，
     // 为空时默认 ["h2", "http/1.1"]（WS/httpupgrade 依赖 http/1.1，gRPC 依赖 h2）。
@@ -228,13 +250,18 @@ fn parse_alpn(json: &serde_json::Value) -> io::Result<Vec<Vec<u8>>> {
 
 /// 从 `tlsSettings` JSON 解析全部命名证书。
 ///
-/// 优先 `certificates[]`（每项 `certificateFile`+`keyFile`，支持多张）；
+/// 优先 `certificates[]`（file 或内联，支持多张，仅 `usage:"encipherment"`）；
 /// 若该数组为空且顶层存在内联 `cert`+`key`，则解析单张。
 fn build_named_cert_keys(json: &serde_json::Value) -> io::Result<Vec<NamedCertKey>> {
     let mut out = Vec::new();
     if let Some(arr) = json.get("certificates").and_then(|v| v.as_array()) {
         for entry in arr {
-            if let Some((certs, key)) = parse_file_entry(entry)? {
+            // Go BuildCertificates：仅 ENCIPHERMENT 条目用作服务端证书，
+            // "verify"（mTLS 客户端 CA）/"issue" 条目不参与。
+            if entry_usage(entry) != EntryUsage::Encipherment {
+                continue;
+            }
+            if let Some((certs, Some(key))) = entry_certs_and_key(entry)? {
                 out.push(NamedCertKey::from_cert_der(certs, key)?);
             }
         }
@@ -253,22 +280,25 @@ fn build_named_cert_keys(json: &serde_json::Value) -> io::Result<Vec<NamedCertKe
     Ok(out)
 }
 
-/// 解析单个 `certificates[]` 条目（`certificateFile` + `keyFile`）。
-/// 缺字段返回 `None`（跳过该条目）。
-fn parse_file_entry(
-    entry: &serde_json::Value,
-) -> io::Result<Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>> {
-    let cert_file = entry.get("certificateFile").and_then(|v| v.as_str());
-    let key_file = entry.get("keyFile").and_then(|v| v.as_str());
-    let (cf, kf) = match (cert_file, key_file) {
-        (Some(cf), Some(kf)) => (cf, kf),
-        _ => return Ok(None),
-    };
-    let cert_pem = std::fs::read(cf)
-        .map_err(|e| io::Error::other(format!("read cert file {cf}: {e}")))?;
-    let key_pem = std::fs::read(kf)
-        .map_err(|e| io::Error::other(format!("read key file {kf}: {e}")))?;
-    Ok(Some((pem_certs(&cert_pem)?, pem_key(&key_pem)?)))
+/// `certificates[]` 中 `usage:"verify"` 条目 → 客户端 CA 信任池（mTLS，Rust 扩展）。
+///
+/// 单条证书解析失败仅跳过该证书（容忍混入坏条目，不影响其余）。
+fn client_ca_root_store(json: &serde_json::Value) -> RootCertStore {
+    let mut store = RootCertStore::empty();
+    if let Some(arr) = json.get("certificates").and_then(|v| v.as_array()) {
+        for entry in arr {
+            if entry_usage(entry) != EntryUsage::Verify {
+                continue;
+            }
+            if let Ok(Some((certs, _))) = entry_certs_and_key(entry) {
+                for der in certs {
+                    // 解析失败跳过该证书
+                    let _ = store.add(der);
+                }
+            }
+        }
+    }
+    store
 }
 
 /// 从 PEM 字节解析全部证书。

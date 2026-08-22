@@ -7,7 +7,7 @@
 //! - `fingerprint`：uTLS 指纹名 → `Fingerprint` enum 路由（`get_fingerprint`）
 //! - `config`：`CurveId` + `parse_curve_name` + `is_from_mitm` + `verify_chain` +
 //!   `Option` 函数模式 + `RandCarrier` 数据结构
-//! - `certificate`：`CertificateUsage` enum + 类型安全 wrapper（`is_encipherment` 等）
+//! - `certificate`：证书生成/名称提取 + `certificates[]` 条目解析（usage/entry_certs_and_key）
 //! - `ech`：ECH key 二进制 TLV 解析 + `EchConfigCache` 数据结构 + `ech_cache_key`
 //! - `error`：统一 `TlsError` 枚举
 //! - `ocsp_stapling`：OCSP stapling 集成（`OcspStaplerConfig` + `build_server_config_with_stapling`）
@@ -21,7 +21,7 @@
 //!
 //! ## 后续工作
 //! - REALITY 切片 (k9t): 评估接入 watfaq-rustls git 依赖以实现真实指纹伪装
-//! - `GetTLSConfig` 组装 `rustls::ClientConfig`（依赖 x509 证书加载 + ALPN 配置）
+//! - TLS 热重载（ArcSwap + 定时任务，第 8 版 handoff 记录的技术债）
 //! - x509 证书加载（依赖 `x509-parser`）；OCSP stapling 已由 `ocsp-stapler` 实现
 //! - ECH DNS 查询（`apply_ech`/`query_record`，依赖 Phase 4 `xray-app-dns`）
 //!
