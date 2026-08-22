@@ -137,6 +137,16 @@ impl Udpmask for OriginalConfig {
     }
 }
 
+impl super::super::PacketCodec for OriginalConfig {
+    fn encode(&self, pkt: &[u8]) -> io::Result<Vec<u8>> {
+        Ok(seal(pkt))
+    }
+
+    fn decode(&self, pkt: &[u8]) -> io::Result<Vec<u8>> {
+        open(pkt)
+    }
+}
+
 /// `original` mode PacketConn 包装（对应 Go `simpleConn`）。
 struct SimpleConn {
     inner: Box<dyn UdpIo>,

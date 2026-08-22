@@ -22,22 +22,22 @@ use crate::listener::UdpHub;
 
 /// 同步 UDP hub：包装 `UdpSocket` 实现 [`UdpHub`] trait。
 ///
-/// 内部用 `parking_lot::Mutex` 保护 socket，让多线程接收/写入共享同一 socket。
+/// 内部共享底层 socket（`std::net::UdpSocket` 的 send/recv 均为 `&self` 且线程安全，
+/// 由内核串行化——对应 Go `net.UDPConn` 并发语义；不加大锁，否则「一个线程持锁阻塞
+/// recv + 另一线程写抢锁」会死锁，client 先发后收的 KCP 流程直接卡死）。
 /// `receive` 阻塞读一个包；上层应在独立线程或 `spawn_blocking` 中调用。
 pub struct StdUdpHub {
-    socket: Arc<Mutex<std::net::UdpSocket>>,
+    socket: Arc<std::net::UdpSocket>,
     local: Option<SocketAddr>,
 }
 
 impl StdUdpHub {
     /// 绑定 UDP socket（对应 Go `net.ListenUDP`）。
-    ///
-    /// `addr` 形如 `127.0.0.1:0`（系统分配端口）或 `0.0.0.0:443`。
     pub fn bind(addr: impl std::net::ToSocketAddrs) -> io::Result<Self> {
         let socket = std::net::UdpSocket::bind(addr)?;
         let local = socket.local_addr().ok();
         Ok(Self {
-            socket: Arc::new(Mutex::new(socket)),
+            socket: Arc::new(socket),
             local,
         })
     }
@@ -46,14 +46,14 @@ impl StdUdpHub {
     pub fn from_socket(socket: std::net::UdpSocket) -> Self {
         let local = socket.local_addr().ok();
         Self {
-            socket: Arc::new(Mutex::new(socket)),
+            socket: Arc::new(socket),
             local,
         }
     }
 
-    /// 拿底层 socket 的 Arc<Mutex> 引用（用于构造 [`StdPacketInput`] 复用同一 socket）。
+    /// 拿底层 socket 的共享引用（用于构造 [`StdPacketInput`] 复用同一 socket）。
     #[must_use]
-    pub fn socket_handle(&self) -> Arc<Mutex<std::net::UdpSocket>> {
+    pub fn socket_handle(&self) -> Arc<std::net::UdpSocket> {
         Arc::clone(&self.socket)
     }
 }
@@ -62,8 +62,7 @@ impl UdpHub for StdUdpHub {
     fn receive(&self) -> Option<(Vec<u8>, SocketAddr)> {
         // ponytail: 单次最大 1500 字节（标准 MTU），KCP segment 上限 < 1500
         let mut buf = [0u8; 1500];
-        let socket = self.socket.lock();
-        match socket.recv_from(&mut buf) {
+        match self.socket.recv_from(&mut buf) {
             Ok((n, src)) => Some((buf[..n].to_vec(), src)),
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
                 // 同步 socket 不会返 WouldBlock；防御性记录并返 None
@@ -74,13 +73,12 @@ impl UdpHub for StdUdpHub {
     }
 
     fn write_to(&self, payload: &[u8], dest: SocketAddr) -> io::Result<()> {
-        let socket = self.socket.lock();
-        socket.send_to(payload, dest)?;
+        self.socket.send_to(payload, dest)?;
         Ok(())
     }
 
     fn close(&self) {
-        // ponytail: Arc<Mutex> drop 后 socket 自动关闭；这里显式忽略
+        // ponytail: Arc drop 后 socket 自动关闭；这里显式忽略
         // （std::net::UdpSocket 无显式 close，Drop 时由 OS 回收）
     }
 
@@ -94,7 +92,7 @@ impl UdpHub for StdUdpHub {
 /// dialer 端用 `UdpSocket::connect` 后，从此 hub 读取服务端发回的 segment。
 /// 与 [`StdUdpHub`] 共享 socket handle，让 client 端既能写又能读。
 pub struct StdPacketInput {
-    socket: Arc<Mutex<std::net::UdpSocket>>,
+    socket: Arc<std::net::UdpSocket>,
 }
 
 impl StdPacketInput {
@@ -109,7 +107,7 @@ impl StdPacketInput {
     /// 从已建立的 socket 构造。
     pub fn from_socket(socket: std::net::UdpSocket) -> Self {
         Self {
-            socket: Arc::new(Mutex::new(socket)),
+            socket: Arc::new(socket),
         }
     }
 }
@@ -117,10 +115,79 @@ impl StdPacketInput {
 impl PacketInput for StdPacketInput {
     fn read_packet(&mut self) -> Option<Vec<u8>> {
         let mut buf = [0u8; 1500];
-        let socket = self.socket.lock();
-        match socket.recv(&mut buf) {
+        match self.socket.recv(&mut buf) {
             Ok(n) => Some(buf[..n].to_vec()),
             Err(_) => None,
+        }
+    }
+}
+
+/// finalmask 伪装包装的 UDP hub（对应 Go `udp.Hub` 建立时 `WrapPacketConnServer`，
+/// `transport/internet/udp/hub.go:71-72`）。
+///
+/// `write_to` 前 encode、`receive` 后 decode；decode 失败的包丢弃继续收，
+/// 不终止接收循环（对齐 Go mask conn 读校验失败 → 丢包语义）。
+pub struct MaskedUdpHub {
+    inner: Arc<dyn UdpHub>,
+    chain: xray_transport::finalmask::CodecChain,
+}
+
+impl MaskedUdpHub {
+    /// 包装底层 hub + 伪装链。
+    #[must_use]
+    pub fn new(inner: Arc<dyn UdpHub>, chain: xray_transport::finalmask::CodecChain) -> Self {
+        Self { inner, chain }
+    }
+}
+
+impl UdpHub for MaskedUdpHub {
+    fn receive(&self) -> Option<(Vec<u8>, SocketAddr)> {
+        loop {
+            let (pkt, src) = self.inner.receive()?;
+            match self.chain.decode(&pkt) {
+                Ok(decoded) => return Some((decoded, src)),
+                Err(_) => continue, // 伪装层校验失败：丢弃该包，继续收
+            }
+        }
+    }
+
+    fn write_to(&self, payload: &[u8], dest: SocketAddr) -> io::Result<()> {
+        let pkt = self.chain.encode(payload)?;
+        self.inner.write_to(&pkt, dest)
+    }
+
+    fn close(&self) {
+        self.inner.close();
+    }
+
+    fn local_addr(&self) -> Option<SocketAddr> {
+        self.inner.local_addr()
+    }
+}
+
+/// finalmask 伪装包装的 PacketInput（dialer 侧读路径，对应 Go `WrapPacketConnClient`
+/// 后 KCP 从 masked PacketConn 读）。
+pub struct MaskedPacketInput {
+    inner: Box<dyn PacketInput>,
+    chain: xray_transport::finalmask::CodecChain,
+}
+
+impl MaskedPacketInput {
+    /// 包装底层输入 + 伪装链。
+    #[must_use]
+    pub fn new(inner: Box<dyn PacketInput>, chain: xray_transport::finalmask::CodecChain) -> Self {
+        Self { inner, chain }
+    }
+}
+
+impl PacketInput for MaskedPacketInput {
+    fn read_packet(&mut self) -> Option<Vec<u8>> {
+        loop {
+            let pkt = self.inner.read_packet()?;
+            match self.chain.decode(&pkt) {
+                Ok(decoded) => return Some(decoded),
+                Err(_) => continue, // 校验失败：丢弃，继续读
+            }
         }
     }
 }

@@ -82,4 +82,4 @@ pub use state::{State, STATE_ACTIVE};
 pub use updater::{NoopUpdater, TokioUpdater, Updater};
 pub use udp_hub::{StdPacketInput, StdUdpHub};
 
-pub use register::register_listener;
+pub use register::{register_dialer, register_listener};

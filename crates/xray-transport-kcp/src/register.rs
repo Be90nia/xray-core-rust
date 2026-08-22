@@ -18,7 +18,9 @@ use crate::connection::{ConnMetadata, Connection, ConnectionCloser, KcpConn};
 use crate::dialer::{KcpDialerFactory, PacketInput, fetch_input, next_conv};
 use crate::io::KCPPacketReader;
 use crate::output::{SegmentWriter, SimpleSegmentWriter};
-use crate::udp_hub::{StdPacketInput, StdUdpHub};
+use xray_transport::finalmask::{parse_finalmask_udp_chain, CodecChain};
+
+use crate::udp_hub::{MaskedPacketInput, MaskedUdpHub, StdPacketInput, StdUdpHub};
 use crate::PROTOCOL_NAME;
 
 /// 注册 mKCP transport dialer。
@@ -71,21 +73,29 @@ async fn listen_kcp(
     settings: StreamSettings,
     handler: ConnHandler,
 ) -> io::Result<Box<dyn TransportListener>> {
-    // 1. 解析 kcpSettings JSON
-    let config = parse_kcp_config(settings.transport_json.as_ref())?;
-
-    // 2. 绑定 UDP socket
-    let hub = StdUdpHub::bind(addr)?;
-    let local = hub
-        .local_addr()
-        .ok_or_else(|| io::Error::other("kcp listener: local_addr unavailable after bind"))?;
+    // 1. 解析 kcpSettings JSON + finalmask 伪装链
+     let config = parse_kcp_config(settings.transport_json.as_ref())?;
+    let chain = parse_finalmask_udp_chain(settings.finalmask_json.as_ref())?;
+ 
+     // 2. 绑定 UDP socket
+    // mask 开启时包装 hub（对应 Go udp.Hub 建立时 WrapPacketConnServer，udp/hub.go:71-72）
+    let hub: Arc<dyn UdpHub> = {
+        let raw = Arc::new(StdUdpHub::bind(addr)?);
+        match chain {
+            Some(c) => Arc::new(MaskedUdpHub::new(raw, c)),
+            None => raw,
+        }
+    };
+     let local = hub
+         .local_addr()
+         .ok_or_else(|| io::Error::other("kcp listener: local_addr unavailable after bind"))?;
 
     // 3. packet reader + bridge handler（KCP ConnHandler → upstream xray_transport::ConnHandler）
     let reader = Arc::new(KCPPacketReader::new());
     let bridge: Arc<dyn KcpConnHandler> = Arc::new(UpstreamConnBridge(handler));
 
     // 4. 创建 KCP Listener
-    let listener = Arc::new(Listener::new(Arc::new(hub), reader, Arc::new(config), bridge));
+    let listener = Arc::new(Listener::new(hub, reader, Arc::new(config), bridge));
 
     // 5. spawn UDP recv loop（阻塞读 hub，分发到 KCP sessions）
     let listener_clone = Arc::clone(&listener);
@@ -130,14 +140,16 @@ async fn dial_kcp(
     dest: &xray_common::net::destination::Destination,
     settings: &StreamSettings,
 ) -> io::Result<Box<dyn xray_transport::connection::Connection>> {
-    // 1. 解析 kcpSettings JSON
+    // 1. 解析 kcpSettings JSON + finalmask 伪装链
     let config = parse_kcp_config(settings.transport_json.as_ref())?;
+    // mask 开启时包装 PacketConn（对应 Go dialer.go:59-82 WrapPacketConnClient）
+    let chain = parse_finalmask_udp_chain(settings.finalmask_json.as_ref())?;
 
     // 2. 解析目标地址
     let dest_addr = resolve_dest_to_socket_addr(dest)?;
 
-    // 3. 创建 UDP socket + KcpDialerFactory
-    let factory = StdKcpDialerFactory;
+    // 3. 创建 UDP socket + KcpDialerFactory（chain = None 时裸 segment，向后兼容）
+    let factory = StdKcpDialerFactory { chain };
 
     // 4. 通过 factory 创建底层连接
     let conv = next_conv();
@@ -193,6 +205,19 @@ fn parse_kcp_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
         ));
     };
 
+    // `header`/`seed` 已移除（PrintRemovedFeatureError），伪装配置迁移到
+    // `streamSettings.finalmask.udp`（`mkcp-legacy`）。对齐报错，不静默忽略。
+    for removed in ["header", "seed"] {
+        if obj.contains_key(removed) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "kcpSettings.{removed} was removed, use streamSettings.finalmask.udp (mkcp-legacy) instead"
+                ),
+            ));
+        }
+    }
+
     let mut config = default_config();
 
     if let Some(v) = obj.get("mtu").and_then(|x| x.as_i64()) {
@@ -238,7 +263,10 @@ fn resolve_dest_to_socket_addr(
 // ===== StdKcpDialerFactory =====
 
 /// 基于 `StdUdpHub` 的 `KcpDialerFactory` 实现。
-struct StdKcpDialerFactory;
+struct StdKcpDialerFactory {
+    /// finalmask 伪装链；`None` = 裸 segment（向后兼容）。
+    chain: Option<CodecChain>,
+}
 
 impl KcpDialerFactory for StdKcpDialerFactory {
     fn dial_udp(
@@ -262,11 +290,20 @@ impl KcpDialerFactory for StdKcpDialerFactory {
         // 创建 StdUdpHub（用于 SegmentWriter 写 UDP）
         let hub = StdUdpHub::from_socket(socket);
 
-        // 创建 PacketInput（从 hub 读取 UDP 包）
-        let packet_input = StdPacketInput::from_hub(&hub);
+        // 创建 PacketInput（从 hub 读取 UDP 包；mask 开启时 decode，对应 Go masked pktConn 读）
+        let packet_input: Box<dyn PacketInput> = match &self.chain {
+            Some(c) => Box::new(MaskedPacketInput::new(
+                Box::new(StdPacketInput::from_hub(&hub)),
+                c.clone(),
+            )),
+            None => Box::new(StdPacketInput::from_hub(&hub)),
+        };
 
-        // 创建 SegmentWriter（通过 hub 写 UDP 包到目标）
-        let writer = UdpSegmentWriter { hub };
+        // 创建 SegmentWriter（通过 hub 写 UDP 包到目标；mask 开启时 encode）
+        let writer = UdpSegmentWriter {
+            hub,
+            chain: self.chain.clone(),
+        };
         let segment_writer: Arc<dyn SegmentWriter> = Arc::new(SimpleSegmentWriter::new(writer));
 
         // 创建 Closer
@@ -278,23 +315,30 @@ impl KcpDialerFactory for StdKcpDialerFactory {
             remote_addr: Some(dest_addr),
         };
 
-        Ok((Box::new(packet_input), segment_writer, closer, meta))
+        Ok((packet_input, segment_writer, closer, meta))
     }
 }
 
-/// UDP segment 写入器（通过 `StdUdpHub` 写 UDP 包）。
+/// UDP segment 写入器（通过 `StdUdpHub` 写 UDP 包；mask 开启时先 encode）。
 struct UdpSegmentWriter {
     hub: StdUdpHub,
+    /// finalmask 伪装链；`None` = 裸 segment。
+    chain: Option<CodecChain>,
 }
 
 impl crate::output::UnderlyingWriter for UdpSegmentWriter {
     fn write_all(&self, buf: &[u8]) -> io::Result<()> {
+        use std::borrow::Cow;
+        // mask 开启时逐包 encode（对应 Go masked pktConn 写）
+        let pkt = match &self.chain {
+            Some(c) => Cow::Owned(c.encode(buf)?),
+            None => Cow::Borrowed(buf),
+        };
         // ponytail: connected UDP socket 用 send()，KCP segment < MTU 所以单次 send 足够
-        let socket = self.hub.socket_handle();
-        let sock = socket.lock();
+        let sock = self.hub.socket_handle();
         let mut written = 0;
-        while written < buf.len() {
-            let n = sock.send(&buf[written..])?;
+        while written < pkt.len() {
+            let n = sock.send(&pkt[written..])?;
             written += n;
         }
         Ok(())
@@ -348,5 +392,28 @@ mod tests {
         let r = parse_kcp_config(Some(&v));
         assert!(r.is_err());
         assert_eq!(r.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn parse_kcp_config_rejects_removed_header() {
+        // Go v26 KCPConfig.Build：header/seed 已移除（PrintRemovedFeatureError）
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"header":{"type":"srtp"}}"#).unwrap();
+        let err = match parse_kcp_config(Some(&v)) {
+            Err(e) => e,
+            Ok(_) => panic!("expected removed-feature error for header"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("kcpSettings.header was removed"));
+    }
+
+    #[test]
+    fn parse_kcp_config_rejects_removed_seed() {
+        let v: serde_json::Value = serde_json::from_str(r#"{"seed":"pw"}"#).unwrap();
+        let err = match parse_kcp_config(Some(&v)) {
+            Err(e) => e,
+            Ok(_) => panic!("expected removed-feature error for seed"),
+        };
+        assert!(err.to_string().contains("kcpSettings.seed was removed"));
     }
 }

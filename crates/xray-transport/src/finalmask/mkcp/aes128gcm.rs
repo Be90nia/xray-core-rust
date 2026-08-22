@@ -112,6 +112,37 @@ impl Udpmask for Aes128GcmConfig {
     }
 }
 
+/// 同步逐包 codec（供 KCP 等同步 UDP 栈复用同一套算子，见 [`super::super::PacketCodec`]）。
+pub struct Aes128GcmCodec {
+    cipher: Aes128Gcm,
+}
+
+impl Aes128GcmCodec {
+    /// 由 password 派生 AES-128 key 并构建 codec（同 [`Aes128GcmConfig::wrap_packet_conn_client`]
+    /// 内的 `sha256.Sum256(password)[:16]` 派生）。
+    ///
+    /// # Errors
+    /// - `InvalidInput`：AES-128 初始化失败。
+    pub fn new(password: &str) -> io::Result<Self> {
+        let h = digest(&SHA256, password.as_bytes());
+        let mut key = [0u8; 16];
+        key.copy_from_slice(&h.as_ref()[..16]);
+        Aes128Gcm::new(&key)
+            .map_err(map_crypto_err)
+            .map(|cipher| Self { cipher })
+    }
+}
+
+impl super::super::PacketCodec for Aes128GcmCodec {
+    fn encode(&self, pkt: &[u8]) -> io::Result<Vec<u8>> {
+        seal(&self.cipher, pkt)
+    }
+
+    fn decode(&self, pkt: &[u8]) -> io::Result<Vec<u8>> {
+        open(&self.cipher, pkt)
+    }
+}
+
 /// `aes128gcm` mode PacketConn 包装（对应 Go `aes128gcmConn`）。
 struct Aes128GcmConn {
     inner: Box<dyn UdpIo>,

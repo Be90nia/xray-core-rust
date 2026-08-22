@@ -394,6 +394,48 @@ impl Udpmask for HeaderConfig {
     }
 }
 
+/// 同步逐包 codec（供 KCP 等同步 UDP 栈复用同一套算子，见 [`super::super::PacketCodec`]）。
+///
+/// encode：`[header][payload]`（DTLS/SRTP/WeChat 序列号随发送递增，与 [`HeaderConn`] 一致）；
+/// decode：剥离 `size()` 字节（接收不更新状态）。
+pub struct HeaderCodec {
+    header: Mutex<Box<dyn Header>>,
+}
+
+impl HeaderCodec {
+    /// 从配置构建（对应 [`HeaderConfig`] → `build_header`）。
+    ///
+    /// # Errors
+    /// - `InvalidInput`：DNS 域名 label 过长等。
+    pub fn new(cfg: &HeaderConfig) -> io::Result<Self> {
+        Ok(Self {
+            header: Mutex::new(build_header(cfg)?),
+        })
+    }
+}
+
+impl super::super::PacketCodec for HeaderCodec {
+    fn encode(&self, pkt: &[u8]) -> io::Result<Vec<u8>> {
+        let mut h = self.header.lock();
+        let size = h.size();
+        let mut out = vec![0u8; size + pkt.len()];
+        h.serialize(&mut out[..size]);
+        out[size..].copy_from_slice(pkt);
+        Ok(out)
+    }
+
+    fn decode(&self, pkt: &[u8]) -> io::Result<Vec<u8>> {
+        let size = self.header.lock().size();
+        if pkt.len() < size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "header: packet shorter than header",
+            ));
+        }
+        Ok(pkt[size..].to_vec())
+    }
+}
+
 /// `header` mode PacketConn 包装（对应 Go `headerConn`）。
 struct HeaderConn {
     inner: Box<dyn UdpIo>,
