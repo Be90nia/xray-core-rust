@@ -29,6 +29,7 @@ pub mod default;
 pub mod error;
 pub mod dnssniffer;
 pub mod fakednssniffer;
+pub mod endpoint_override;
 pub mod sniffer;
 pub mod stats;
 pub mod udp_session;

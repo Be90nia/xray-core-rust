@@ -171,4 +171,72 @@ mod tests {
         assert_eq!(resp.to_vec(), payload);
         w.shutdown();
     }
+
+    /// bd g35 验收 3：UDP dest 经 DefaultDispatcher → FreedomDispatchBridge →
+    /// freedom udp relay（XUDP 帧 ↔ UDP 数据报）直发语义回归（b2e）。
+    #[tokio::test]
+    async fn dispatcher_e2e_freedom_udp_direct() {
+        use tokio::net::UdpSocket;
+        use xray_xudp::packet::{PacketReader, PacketWriter};
+
+        // 1. UDP echo server
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                match echo.recv_from(&mut buf).await {
+                    Ok((n, peer)) => {
+                        let _ = echo.send_to(&buf[..n], peer).await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // 2. dispatcher + FreedomDispatchBridge（TCP DialBridge + UDP relay）
+        let tcp_bridge = Arc::new(DialBridge::new("freedom-out", make_dial_fn()));
+        let ohm = SimpleOhm::new();
+        ohm.set_default(Arc::new(FreedomDispatchBridge::from_bridge(tcp_bridge)));
+        let mut dispatcher = DefaultDispatcher::new();
+        dispatcher.ohm = Some(Arc::new(ohm));
+
+        // 3. dispatch UDP dest → inbound Link
+        let dest = Destination::new(
+            Address::from_ipv4_bytes([127, 0, 0, 1]),
+            Port::new(echo_addr.port()),
+            Network::UDP,
+        );
+        let inbound = dispatcher
+            .dispatch(&dest, &SniffingRequest::default(), None, None)
+            .expect("dispatch returns inbound Link");
+        let mut w = inbound.writer;
+        let mut r = inbound.reader;
+
+        // 4. 写 XUDP New 帧 → freedom 拆帧 send_to → echo → 回帧
+        let mut frame = Vec::new();
+        {
+            let mut pw = PacketWriter::new(&mut frame, dest.clone(), [0x22; 8]);
+            pw.write_packet(b"udp-direct").unwrap();
+        }
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(&frame);
+        w.write_multi_buffer(mb).await.unwrap();
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            r.read_multi_buffer(),
+        )
+        .await
+        .expect("timeout reading udp echo");
+
+        // 读错误（EOF）也算失败——必须拿到回帧
+        let resp = resp.expect("read ok");
+        let resp_bytes = resp.to_vec();
+        let mut pr = PacketReader::new(std::io::Cursor::new(&resp_bytes[..]));
+        let pkt = pr.read_packet().unwrap().expect("echo frame");
+        assert_eq!(pkt.data(), b"udp-direct");
+        w.shutdown();
+        echo_task.abort();
+    }
 }

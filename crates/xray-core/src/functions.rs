@@ -176,6 +176,8 @@ async fn start_full_dispatched(
     dispatcher.stats = instance
         .get_feature::<crate::register::AppStatsFeature>()
         .map(|f| f as Arc<dyn xray_features::stats::Manager>);
+    // per-tag UDP443 策略（bd g35）：mux JSON → dispatch_link 前置检查
+    dispatcher.udp443_policies = crate::outbound::parse_udp443_policies(&built.outbounds);
     let dispatcher = Arc::new(dispatcher);
 
     let handles = spawn_inbounds(

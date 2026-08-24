@@ -23,6 +23,48 @@ use std::net::IpAddr;
 use xray_buf::multi::MultiBuffer;
 use std::pin::Pin;
 use std::sync::Arc;
+use xray_common::net::destination::Destination;
+
+// ========== UDP443 策略（bd g35） ==========
+
+/// UDP/443（QUIC over XUDP）策略，对应 Go `mux` 配置的 `xudpProxyUDP443`。
+///
+/// Go 基准 `app/proxyman/outbound/handler.go:220-228`：仅当出站启用 mux 时生效——
+/// - `Reject`：拒绝（`errors...AtInfo` + Interrupt 双向，Go 默认值）
+/// - `Skip`：绕过 mux/xudp 直发（Go `goto out` → `proxy.Process`）
+/// - `Allow`：走 xudp ClientManager（bd mbc/nww 接入前等价直发）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Udp443Policy {
+    /// 拒绝 UDP/443（默认）。
+    Reject,
+    /// 绕过 mux/xudp 直发出站。
+    Skip,
+    /// 允许经 xudp 代理（暂等价直发，mbc/nww 后区分）。
+    Allow,
+}
+
+impl Udp443Policy {
+    /// 从 mux 配置构建策略。
+    ///
+    /// 对应 Go `infra/conf/xray.go MuxConfig.Build` 的空串→`"reject"` 规范化 +
+    /// `NewHandler` 的 enabled 门控（mux 未启用时无 UDP443 检查）。
+    /// 非法值返回 `None` 并告警（Go 为启动错误；校验归 conf Build 阶段，此处降级跳过）。
+    #[must_use]
+    pub fn from_mux(enabled: bool, xudp_proxy_udp_443: &str) -> Option<Self> {
+        if !enabled {
+            return None;
+        }
+        match xudp_proxy_udp_443 {
+            "" | "reject" => Some(Self::Reject),
+            "skip" => Some(Self::Skip),
+            "allow" => Some(Self::Allow),
+            other => {
+                tracing::warn!(value = %other, r#"unknown "xudpProxyUDP443", ignoring"#);
+                None
+            }
+        }
+    }
+}
 use xray_common::net::network::Network;
 use xray_common::net::port::Port;
 
@@ -503,6 +545,11 @@ pub struct DefaultDispatcher {
     pub stats: Option<Arc<dyn xray_features::stats::Manager>>,
     /// FakeDnsEngine 引用
     pub fdns: Option<Arc<dyn crate::fakednssniffer::FakeDnsEngine>>,
+    /// per-outbound-tag 的 UDP443（QUIC over XUDP）策略（bd g35）。
+    ///
+    /// 对应 Go `Handler.udp443`（`senderSettings.MultiplexSettings.XudpProxyUDP443`，
+    /// 仅 mux enabled 时构建）。tag 无条目 = mux 未启用，不做 UDP443 检查。
+    pub udp443_policies: HashMap<String, Udp443Policy>,
 }
 
 impl Debug for DefaultDispatcher {
@@ -513,6 +560,7 @@ impl Debug for DefaultDispatcher {
             .field("has_stats", &self.stats.is_some())
             .field("has_policy_manager", &self.policy_manager.is_some())
             .field("has_fdns", &self.fdns.is_some())
+            .field("udp443_policies", &self.udp443_policies)
             .finish()
     }
 }
@@ -534,6 +582,7 @@ impl DefaultDispatcher {
             stats: None,
             fdns: None,
             policy_manager: None,
+            udp443_policies: HashMap::new(),
         }
     }
 
@@ -667,6 +716,7 @@ impl DefaultDispatcher {
         let router = self.router.clone();
         let fdns = self.fdns.clone();
         let stats = self.stats.clone();
+        let udp443_policies = self.udp443_policies.clone();
         let ohm = Arc::clone(ohm);
         let policy = self
             .policy_manager
@@ -733,6 +783,45 @@ impl DefaultDispatcher {
             let reader: Box<dyn xray_buf::io::Reader> =
                 crate::stats::maybe_wrap_reader(out_up, Box::new(cr));
             let writer = crate::stats::maybe_wrap_writer(out_dn, outbound_writer);
+
+            // ---- UDP443 policy（bd g35，Go handler.go:220-228） ----
+            // 仅 mux 启用的出站有条目（Go h.udp443 只在 MultiplexSettings.Enabled 时设置）。
+            if final_dest.network() == Network::UDP && final_dest.port().value() == 443 {
+                match udp443_policies.get(handler.tag()) {
+                    Some(Udp443Policy::Reject) => {
+                        // Go: test(errors.New("XUDP rejected UDP/443 traffic").AtInfo()) → Interrupt 双向
+                        tracing::info!(tag = %out_tag, "XUDP rejected UDP/443 traffic");
+                        writer.shutdown(); // 关闭下行 → inbound reader EOF
+                        return; // reader 随 drop 关闭上行
+                    }
+                    // skip（Go goto out 直发）/ allow（xudp dispatch，mbc/nww 接入前等价直发）
+                    Some(_) | None => {}
+                }
+            }
+
+            // ---- EndpointOverride（bd g35，Go handler.go:206-209） ----
+            // UDP 且 sniffing 将 OriginalTarget 改写为 Target 时，改写 XUDP 帧携带的
+            // 逐包地址：上行 original→override，下行 override→original。
+            let (reader, writer) = if final_dest.network() == Network::UDP
+                && final_dest.address() != dest.address()
+            {
+                let original = dest.address().clone();
+                let target = final_dest.address().clone();
+                (
+                    Box::new(crate::endpoint_override::EndpointOverrideReader::new(
+                        reader,
+                        original.clone(),
+                        target.clone(),
+                    )) as Box<dyn xray_buf::io::Reader>,
+                    Box::new(crate::endpoint_override::EndpointOverrideWriter::new(
+                        writer,
+                        target,
+                        original,
+                    )) as Box<dyn xray_buf::io::Writer>,
+                )
+            } else {
+                (reader, writer)
+            };
             let final_link = xray_transport::link::Link::new(reader, writer);
 
             let fut = handler.dispatch(&final_dest, final_link);
@@ -1604,5 +1693,309 @@ mod tests {
         assert!(up_ctr.value() > 0, "uplink counted {} bytes", up_ctr.value());
         assert!(dn_ctr.value() > 0, "downlink counted {} bytes", dn_ctr.value());
         w.shutdown();
+    }
+
+    // ---- UDP443 策略（bd g35，Go handler.go:220-228） ----
+
+    #[test]
+    fn udp443_policy_from_mux_variants() {
+        // mux 未启用：无策略（Go NewHandler 的 enabled 门控）
+        assert_eq!(Udp443Policy::from_mux(false, "reject"), None);
+        // 空串规范化为 reject（Go MuxConfig.Build）
+        assert_eq!(Udp443Policy::from_mux(true, ""), Some(Udp443Policy::Reject));
+        assert_eq!(Udp443Policy::from_mux(true, "reject"), Some(Udp443Policy::Reject));
+        assert_eq!(Udp443Policy::from_mux(true, "skip"), Some(Udp443Policy::Skip));
+        assert_eq!(Udp443Policy::from_mux(true, "allow"), Some(Udp443Policy::Allow));
+        // 非法值：None（Go 为启动错误，此处降级告警跳过）
+        assert_eq!(Udp443Policy::from_mux(true, "bogus"), None);
+    }
+
+    /// 计数 + 回显 handler：dispatch 计数，读一段回写后关闭。
+    #[derive(Debug)]
+    struct CountingEchoHandler {
+        called: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    }
+    impl DispatchHandler for CountingEchoHandler {
+        fn tag(&self) -> &str {
+            "udp-out"
+        }
+        fn dispatch(
+            &self,
+            _dest: &xray_common::net::destination::Destination,
+            link: xray_transport::link::Link,
+        ) -> PinFuture<()> {
+            let called = std::sync::Arc::clone(&self.called);
+            Box::pin(async move {
+                called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut r = link.reader;
+                let mut w = link.writer;
+                if let Ok(mb) = r.read_multi_buffer().await {
+                    if !mb.is_empty() {
+                        let _ = w.write_multi_buffer(mb).await;
+                    }
+                }
+                w.shutdown();
+            })
+        }
+    }
+
+    fn udp443_dispatcher(
+        policy: Option<Udp443Policy>,
+    ) -> (
+        DefaultDispatcher,
+        std::sync::Arc<std::sync::atomic::AtomicU32>,
+    ) {
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ohm = SimpleOhm::new();
+        ohm.set_default(std::sync::Arc::new(CountingEchoHandler {
+            called: std::sync::Arc::clone(&called),
+        }));
+        let mut d = DefaultDispatcher::new();
+        d.ohm = Some(std::sync::Arc::new(ohm));
+        if let Some(p) = policy {
+            d.udp443_policies.insert("udp-out".to_string(), p);
+        }
+        (d, called)
+    }
+
+    fn udp_dest_port_443() -> xray_common::net::destination::Destination {
+        use xray_common::net::address::Address;
+        Destination::new(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(443), Network::UDP)
+    }
+
+    #[tokio::test]
+    async fn udp443_reject_interrupts_udp_443_dispatch() {
+        use xray_buf::io::Reader;
+        let (d, called) = udp443_dispatcher(Some(Udp443Policy::Reject));
+
+        let inbound = d
+            .dispatch(&udp_dest_port_443(), &SniffingRequest::default(), None, None)
+            .expect("dispatch returns inbound Link");
+
+        // 下行被关闭：inbound reader 收到 EOF（pipe 约定 Err(Eof)）
+        let mut r = inbound.reader;
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            r.read_multi_buffer(),
+        )
+        .await
+        .expect("timeout waiting EOF");
+        assert!(
+            matches!(res, Err(xray_buf::io::Error::Eof)),
+            "reject should close downlink, got: {res:?}"
+        );
+        assert_eq!(
+            called.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "reject must not reach handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn udp443_skip_dispatches_udp_443_direct() {
+        use xray_buf::io::{Reader, Writer};
+        use xray_buf::multi::MultiBuffer;
+        let (d, called) = udp443_dispatcher(Some(Udp443Policy::Skip));
+
+        let inbound = d
+            .dispatch(&udp_dest_port_443(), &SniffingRequest::default(), None, None)
+            .expect("dispatch returns inbound Link");
+        let mut w = inbound.writer;
+        let mut r = inbound.reader;
+
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(b"quic-ish");
+        w.write_multi_buffer(mb).await.expect("write uplink");
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            r.read_multi_buffer(),
+        )
+        .await
+        .expect("timeout waiting echo")
+        .expect("read ok");
+        assert_eq!(resp.to_vec(), b"quic-ish");
+        assert_eq!(
+            called.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "skip = goto out: traffic dispatched direct"
+        );
+    }
+
+    // ---- EndpointOverride e2e（bd g35，Go handler.go:206-209） ----
+
+    /// fakedns 引擎：198.51.100.7 → sniffed.example.com。
+    #[derive(Debug)]
+    struct FixedFakeDns;
+    impl crate::fakednssniffer::FakeDnsEngine for FixedFakeDns {
+        fn get_domain_from_fake_dns(&self, addr: &IpAddr) -> String {
+            if *addr == IpAddr::from([198, 51, 100, 7]) {
+                String::from("sniffed.example.com")
+            } else {
+                String::new()
+            }
+        }
+    }
+
+    /// 记录首帧目标并回写（target = 改写后 dest）的 handler。
+    #[derive(Debug)]
+    struct FrameEchoHandler {
+        seen_target: Arc<parking_lot::Mutex<Option<xray_common::net::address::Address>>>,
+    }
+    impl DispatchHandler for FrameEchoHandler {
+        fn tag(&self) -> &str {
+            "frame-out"
+        }
+        fn dispatch(
+            &self,
+            dest: &xray_common::net::destination::Destination,
+            link: xray_transport::link::Link,
+        ) -> PinFuture<()> {
+            let seen = Arc::clone(&self.seen_target);
+            let dest = dest.clone();
+            Box::pin(async move {
+                use xray_buf::io::Reader as _;
+                let mut r = link.reader;
+                let mut w = link.writer;
+                // 累积读直到能解出一个 XUDP 帧
+                let mut acc = Vec::new();
+                let pkt = loop {
+                    if let Ok(mb) = r.read_multi_buffer().await {
+                        if mb.is_empty() {
+                            return;
+                        }
+                        acc.extend_from_slice(&mb.to_vec());
+                    }
+                    let mut pr = xray_xudp::packet::PacketReader::new(std::io::Cursor::new(&acc[..]));
+                    if let Ok(Some(pkt)) = pr.read_packet() {
+                        break pkt;
+                    }
+                };
+                let (data, target) = pkt.into_parts();
+                *seen.lock() = target.map(|t| t.address().clone());
+                // 回写帧：target = 改写后 dest（模拟 outbound 从改写目标收包）
+                let mut frame = Vec::new();
+                let mut pw = xray_xudp::packet::PacketWriter::new(
+                    &mut frame,
+                    dest.clone(),
+                    [0xAA; 8],
+                );
+                let _ = pw.write_packet(&data);
+                drop(pw);
+                let mut mb = xray_buf::multi::MultiBuffer::new();
+                mb.merge_bytes(&frame);
+                let _ = w.write_multi_buffer(mb).await;
+                w.shutdown();
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_link_udp_endpoint_override_rewrites_xudp_frames() {
+        use xray_buf::io::{Reader as _, Writer as _};
+        use xray_buf::multi::MultiBuffer;
+        use xray_common::net::address::Address;
+
+        let ohm = SimpleOhm::new();
+        let seen_target = Arc::new(parking_lot::Mutex::new(None));
+        ohm.set_default(Arc::new(FrameEchoHandler {
+            seen_target: Arc::clone(&seen_target),
+        }));
+        let mut d = DefaultDispatcher::new();
+        d.ohm = Some(Arc::new(ohm));
+        d.fdns = Some(Arc::new(FixedFakeDns));
+
+        let sniff = SniffingRequest {
+            enabled: true,
+            override_destination_for_protocol: vec!["fakedns".to_string()],
+            ..Default::default()
+        };
+
+        // 原始目标 fake IP 198.51.100.7:53 UDP；fakedns sniff 后改写为 domain
+        let dest = Destination::new(
+            Address::from_ipv4_bytes([198, 51, 100, 7]),
+            Port::new(53),
+            Network::UDP,
+        );
+        let inbound = d
+            .dispatch(&dest, &sniff, None, None)
+            .expect("dispatch returns inbound Link");
+        let mut w = inbound.writer;
+        let mut r = inbound.reader;
+
+        // 客户端写 XUDP New 帧（target = 198.51.100.7:53）
+        let mut frame = Vec::new();
+        {
+            let mut pw = xray_xudp::packet::PacketWriter::new(
+                &mut frame,
+                Destination::udp(Address::from_ipv4_bytes([198, 51, 100, 7]), Port::new(53)),
+                [0x11; 8],
+            );
+            pw.write_packet(b"udp-payload").unwrap();
+        }
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(&frame);
+        w.write_multi_buffer(mb).await.expect("write uplink frame");
+
+        // 读回包（下行帧来源应被改回原始 IP）
+        let mut acc = Vec::new();
+        let pkt = loop {
+            let resp = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                r.read_multi_buffer(),
+            )
+            .await
+            .expect("timeout reading downlink");
+            match resp {
+                Ok(mb) if !mb.is_empty() => acc.extend_from_slice(&mb.to_vec()),
+                _ => panic!("downlink closed before frame"),
+            }
+            let mut pr = xray_xudp::packet::PacketReader::new(std::io::Cursor::new(&acc[..]));
+            if let Ok(Some(pkt)) = pr.read_packet() {
+                break pkt;
+            }
+        };
+        let (data, target) = pkt.into_parts();
+        assert_eq!(data, b"udp-payload");
+        assert_eq!(
+            target.expect("downlink frame has source").address(),
+            &Address::from_ipv4_bytes([198, 51, 100, 7]),
+            "downlink frame source rewritten back to original"
+        );
+
+        // handler 侧：上行帧目标应已被改写为 sniffed domain
+        let seen = seen_target.lock().clone();
+        assert_eq!(
+            seen,
+            Some(Address::new_domain(String::from("sniffed.example.com"))),
+            "uplink frame target rewritten to override dest"
+        );
+    }
+
+    #[tokio::test]
+    async fn udp443_no_policy_flows_untouched() {
+        use xray_buf::io::{Reader, Writer};
+        use xray_buf::multi::MultiBuffer;
+        let (d, called) = udp443_dispatcher(None);
+
+        let inbound = d
+            .dispatch(&udp_dest_port_443(), &SniffingRequest::default(), None, None)
+            .expect("dispatch returns inbound Link");
+        let mut w = inbound.writer;
+        let mut r = inbound.reader;
+
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(b"quic");
+        w.write_multi_buffer(mb).await.expect("write uplink");
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            r.read_multi_buffer(),
+        )
+        .await
+        .expect("timeout waiting echo")
+        .expect("read ok");
+        assert_eq!(resp.to_vec(), b"quic");
+        assert_eq!(called.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

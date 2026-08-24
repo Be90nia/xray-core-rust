@@ -37,6 +37,14 @@ impl Writer for SizeStatWriter {
             self.writer.write_multi_buffer(mb).await
         })
     }
+
+    /// 关闭底层 writer（对应 Go `(*SizeStatWriter).Interrupt/Close` 委托内层）。
+    ///
+    /// bd g35：UDP443 reject 等链路中断路径经 stats 包装时，shutdown 必须穿透，
+    /// 否则下游 reader 收不到 EOF。
+    fn shutdown(&self) {
+        self.writer.shutdown();
+    }
 }
 
 impl SizeStatWriter {
@@ -265,5 +273,24 @@ mod tests {
         let reader = Box::new(FixedReader::new(vec![]));
         let wrapped = maybe_wrap_reader(None::<Arc<dyn Counter>>, reader);
         let _ = wrapped;
+    }
+
+    #[tokio::test]
+    async fn size_stat_writer_shutdown_propagates_to_inner() {
+        // reject 路径（bd g35）依赖 shutdown 穿透 stats 包装关闭下行
+        let (r, w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let counter: Arc<dyn Counter> = Arc::new(TestCounter::default());
+        let writer = maybe_wrap_writer(Some(counter), Box::new(w));
+
+        writer.shutdown();
+
+        let mut reader = Box::new(r) as Box<dyn xray_buf::io::Reader>;
+        let res = tokio::time::timeout(std::time::Duration::from_secs(2), reader.read_multi_buffer())
+            .await
+            .expect("shutdown not propagated: read hangs");
+        assert!(
+            matches!(res, Err(xray_buf::io::Error::Eof)),
+            "shutdown must propagate through SizeStatWriter, got: {res:?}"
+        );
     }
 }

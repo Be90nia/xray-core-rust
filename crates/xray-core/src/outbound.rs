@@ -202,6 +202,30 @@ fn parse_proxy_chain_tag(proxy_settings_json: Option<&serde_json::Value>) -> Opt
     let json = proxy_settings_json?;
     json.get("tag").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from)
 }
+
+/// 从 `BuiltOutbound.mux_json` 解析 per-tag UDP443（QUIC over XUDP）策略。
+///
+/// 对应 Go `NewHandler` 中 `senderSettings.MultiplexSettings` → `Handler.udp443`
+/// 的构建链（`app/proxyman/outbound/handler.go:122-168`）：仅 mux enabled 的
+/// 出站生成条目，供 `DefaultDispatcher::dispatch_link` 在 UDP/443 分发前检查。
+pub(crate) fn parse_udp443_policies(
+    outbounds: &[BuiltOutbound],
+) -> std::collections::HashMap<String, xray_app_dispatcher::default::Udp443Policy> {
+    let mut map = std::collections::HashMap::new();
+    for ob in outbounds {
+        let Some(mux_json) = ob.mux_json.as_ref() else { continue };
+        let Ok(cfg) = serde_json::from_value::<xray_conf::MuxConfig>(mux_json.clone()) else {
+            tracing::warn!(tag = %ob.tag, "invalid mux config, ignoring udp443 policy");
+            continue;
+        };
+        if let Some(policy) =
+            xray_app_dispatcher::default::Udp443Policy::from_mux(cfg.enabled, &cfg.xudp_proxy_udp_443)
+        {
+            map.insert(ob.tag.clone(), policy);
+        }
+    }
+    map
+}
 /// 构建单个 outbound 的 DispatchHandler（DialBridge）。
 ///
 /// 返回 `(handler, dial_bridge_ref, proxy_chain_tag)`。
@@ -1177,6 +1201,42 @@ mod tests {
             proxy_settings_json: None,
             mux_json: None,
         }
+    }
+
+    fn mux_outbound(tag: &str, mux_json: serde_json::Value) -> BuiltOutbound {
+        BuiltOutbound {
+            mux_json: Some(mux_json),
+            ..make_outbound("freedom", tag, "{}")
+        }
+    }
+
+    #[test]
+    fn parse_udp443_policies_from_mux_json() {
+        use xray_app_dispatcher::default::Udp443Policy;
+        use serde_json::json;
+
+        let outbounds = vec![
+            // mux enabled 无字段 → 空串规范化为 Reject（Go MuxConfig.Build）
+            mux_outbound("m1", json!({"enabled": true})),
+            // 显式 skip
+            mux_outbound("m2", json!({"enabled": true, "xudpProxyUDP443": "skip"})),
+            // allow
+            mux_outbound("m3", json!({"enabled": true, "xudpProxyUDP443": "allow"})),
+            // mux disabled → 无策略（Go NewHandler enabled 门控）
+            mux_outbound("m4", json!({"enabled": false, "xudpProxyUDP443": "reject"})),
+            // 无 mux 配置
+            make_outbound("freedom", "m5", "{}"),
+            // 非法值 → 无策略（降级告警）
+            mux_outbound("m6", json!({"enabled": true, "xudpProxyUDP443": "bogus"})),
+        ];
+
+        let map = parse_udp443_policies(&outbounds);
+        assert_eq!(map.get("m1"), Some(&Udp443Policy::Reject));
+        assert_eq!(map.get("m2"), Some(&Udp443Policy::Skip));
+        assert_eq!(map.get("m3"), Some(&Udp443Policy::Allow));
+        assert!(!map.contains_key("m4"));
+        assert!(!map.contains_key("m5"));
+        assert!(!map.contains_key("m6"));
     }
 
     #[test]
