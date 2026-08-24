@@ -5587,6 +5587,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "xray-app-stats",
  "xray-buf",
  "xray-common",
  "xray-features",

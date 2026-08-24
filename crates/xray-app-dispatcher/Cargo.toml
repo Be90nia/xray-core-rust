@@ -19,3 +19,6 @@ tracing.workspace = true
 parking_lot.workspace = true
 httparse.workspace = true
 ring.workspace = true
+
+[dev-dependencies]
+xray-app-stats = { path = "../xray-app-stats" }

@@ -1200,11 +1200,31 @@ pub async fn serve_dns(
 pub async fn spawn_inbounds(
     built: &BuiltConfig,
     ohm: Arc<SimpleOhm>,
+    dispatcher: Option<Arc<xray_app_dispatcher::DefaultDispatcher>>,
     shutdown_token: CancellationToken,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let mut handles = Vec::new();
     for ib in &built.inbounds {
-        if let Some(handle) = spawn_one_inbound(ib, Arc::clone(&ohm), shutdown_token.clone()).await? {
+        // 方案 B：生产链经 DefaultDispatcher（sniffing + stats + routing）。
+        // 每个 inbound 一份 ohm 快照，default 替换为携带该 inbound sniffing 配置
+        // 与 tag 的 wrapper；master ohm 的 default 保持真实出站（避免递归）。
+        let per_ohm = dispatcher
+            .as_ref()
+            .map(|d| {
+                let snap = Arc::new(ohm.snapshot());
+                let sniff =
+                    crate::wiring::sniffing_request_from_json(ib.sniffing_json.as_ref());
+                snap.set_default(Arc::new(crate::wiring::InboundDispatchHandler::new(
+                    Arc::clone(d),
+                    sniff,
+                    &ib.tag,
+                )));
+                snap
+            })
+            .unwrap_or_else(|| Arc::clone(&ohm));
+        if let Some(handle) =
+            spawn_one_inbound(ib, per_ohm, shutdown_token.clone()).await?
+        {
             handles.push(handle);
         }
     }

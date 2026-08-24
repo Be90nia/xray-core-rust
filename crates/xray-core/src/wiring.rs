@@ -11,13 +11,15 @@
 //! router 端 `get_vless_route() -> Port`。适配时用 `Port::new(0)` 占位
 //! （VLESS 路由 ID 当前 dispatcher 路径未填充）。
 
+use std::future::Future;
 use std::sync::Arc;
 
 use xray_app_dispatcher::default::{
-    DispatcherContext, Route as DispRoute, RoutingContext as DispRoutingContext, RoutingRouter,
+    DefaultDispatcher, DispatcherContext, Route as DispRoute, RoutingContext as DispRoutingContext,
+    RoutingRouter, SniffingRequest,
 };
-use xray_app_dispatcher::DispatcherError;
-use xray_proto::xray::common::geodata::{Cidr, CidrRule};
+use xray_app_dispatcher::{maybe_wrap_reader, maybe_wrap_writer, DispatchHandler, DispatcherError};
+use xray_proto::xray::common::geodata::CidrRule;
 use xray_app_router::balancing::NotImplementedSelector;
 use xray_app_router::context::RoutingData as RouterRoutingData;
 use xray_app_router::error::RouterError;
@@ -25,6 +27,7 @@ use xray_app_router::Router;
 use xray_common::net::address::Address;
 use xray_common::net::destination::Destination;
 use xray_common::net::port::Port;
+use xray_transport::link::Link;
 
 use crate::router::DispatchRouter;
 
@@ -90,7 +93,6 @@ fn map_router_err(e: RouterError) -> DispatcherError {
         other => DispatcherError::Other(format!("router: {other}")),
     }
 }
-
 impl RoutingRouter for RouterAdapter {
     fn pick_route(
         &self,
@@ -104,6 +106,25 @@ impl RoutingRouter for RouterAdapter {
             }),
             Err(e) => Err(map_router_err(e)),
         }
+    }
+
+    /// 带 DNS 解析的选路（domainStrategy IpOnDemand/IpIfNonMatch）：
+    /// 委托 [`Router::pick_route_resolved`]，携带完整 RoutingContext
+    /// （含 sniffed protocol / inbound tag）——生产 dispatch_link 的路由入口。
+    fn pick_route_resolved<'a>(
+        &'a self,
+        ctx: &'a dyn DispRoutingContext,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<DispRoute, DispatcherError>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut data = bridge_context(ctx);
+            match self.router.pick_route_resolved(&mut data).await {
+                Ok(route) => Ok(DispRoute {
+                    outbound_tag: route.outbound_tag,
+                    rule_tag: route.rule_tag,
+                }),
+                Err(e) => Err(map_router_err(e)),
+            }
+        })
     }
 }
 
@@ -149,6 +170,158 @@ fn dest_to_routing_data(dest: &Destination) -> RouterRoutingData {
         Address::Domain(d) => data = data.with_target_domain(d.clone()),
     }
     data
+}
+
+// ========== 生产接线（方案 B）：DefaultDispatcher 入口桥 ==========
+
+/// 把任意 [`DispatchRouter`] 暴露为 dispatcher 的 [`RoutingRouter`]。
+///
+/// `start_full_with_router(built, router: Arc<dyn DispatchRouter>)` 的适配层：
+/// `pick_route` 走同步 `pick_outbound_tag`（仅目标地址），`pick_route_resolved`
+/// 走 DNS 解析版。RouterAdapter 自身双 trait 实现时无需经过本桥。
+pub struct DispatchRouterBridge {
+    inner: Arc<dyn DispatchRouter>,
+}
+
+impl DispatchRouterBridge {
+    #[must_use]
+    pub fn new(inner: Arc<dyn DispatchRouter>) -> Self {
+        Self { inner }
+    }
+}
+
+impl std::fmt::Debug for DispatchRouterBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DispatchRouterBridge").finish()
+    }
+}
+
+/// 从 RoutingContext 提取目标 [`Destination`]（桥接用，仅目标地址/端口/网络）。
+fn ctx_target_dest(ctx: &dyn DispRoutingContext) -> Destination {
+    let addr = match ctx.get_target_ips().first() {
+        Some(std::net::IpAddr::V4(ip)) => Address::IPv4(*ip),
+        Some(std::net::IpAddr::V6(ip)) => Address::IPv6(*ip),
+        None => Address::Domain(ctx.get_target_domain().to_string()),
+    };
+    Destination::new(addr, ctx.get_target_port(), ctx.get_network())
+}
+
+impl RoutingRouter for DispatchRouterBridge {
+    fn pick_route(&self, ctx: &dyn DispRoutingContext) -> Result<DispRoute, DispatcherError> {
+        match self.inner.pick_outbound_tag(&ctx_target_dest(ctx)) {
+            Some(tag) => Ok(DispRoute::new(tag)),
+            None => Err(DispatcherError::Other("no route matched".into())),
+        }
+    }
+
+    fn pick_route_resolved<'a>(
+        &'a self,
+        ctx: &'a dyn DispRoutingContext,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<DispRoute, DispatcherError>> + Send + 'a>> {
+        Box::pin(async move {
+            let dest = ctx_target_dest(ctx);
+            match self.inner.pick_outbound_tag_resolved(&dest).await {
+                Some(tag) => Ok(DispRoute::new(tag)),
+                None => Err(DispatcherError::Other("no route matched".into())),
+            }
+        })
+    }
+}
+
+/// `BuiltInbound.sniffing` JSON → dispatcher [`SniffingRequest`]。
+///
+/// 字段映射对齐 Go `session.SniffingRequest` 构建（`infra/conf.SniffingConfig` →
+/// destOverride / domainsExcluded / ipsExcluded / metadataOnly / routeOnly）。
+/// 解析失败或无 sniffing 配置时返回 default（enabled=false，零行为变化）。
+#[must_use]
+pub fn sniffing_request_from_json(v: Option<&serde_json::Value>) -> SniffingRequest {
+    let Some(cfg) = v
+        .cloned()
+        .and_then(|v| serde_json::from_value::<xray_conf::SniffingConfig>(v).ok())
+    else {
+        return SniffingRequest::default();
+    };
+    SniffingRequest {
+        enabled: cfg.enabled,
+        metadata_only: cfg.metadata_only,
+        route_only: cfg.route_only,
+        override_destination_for_protocol: cfg.dest_override.0.clone(),
+        exclude_for_domain: cfg.domains_excluded.0.clone(),
+        exclude_for_ip: cfg
+            .ips_excluded
+            .0
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect(),
+    }
+}
+
+/// 生产 default handler：经 [`DefaultDispatcher::dispatch_link`] 分发。
+///
+/// 对应 Go inbound → `dispatcher.Dispatch` 入口。每个 inbound 一个实例：
+/// - 持该 inbound 的 sniffing 配置（首包嗅探 + dest 覆盖 + 回灌在 dispatch_link 内）
+/// - 包 inbound counter（`inbound>>>{tag}>>>traffic>>>{uplink,downlink}`）：
+///   uplink = inbound 写（link.writer），downlink = inbound 读（link.reader）
+pub struct InboundDispatchHandler {
+    dispatcher: Arc<DefaultDispatcher>,
+    sniff: SniffingRequest,
+    tag: String,
+}
+
+impl InboundDispatchHandler {
+    #[must_use]
+    pub fn new(dispatcher: Arc<DefaultDispatcher>, sniff: SniffingRequest, tag: &str) -> Self {
+        Self {
+            dispatcher,
+            sniff,
+            tag: tag.to_string(),
+        }
+    }
+
+    /// 懒注册并取该 inbound 的方向 counter。
+    fn inbound_counter(
+        &self,
+        direction: &str,
+    ) -> Option<Arc<dyn xray_features::stats::Counter>> {
+        self.dispatcher.stats.as_ref().and_then(|m| {
+            xray_features::stats::get_or_register_counter(
+                m.as_ref(),
+                &format!("inbound>>>{}>>>traffic>>>{direction}", self.tag),
+            )
+            .ok()
+        })
+    }
+}
+
+impl std::fmt::Debug for InboundDispatchHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InboundDispatchHandler")
+            .field("tag", &self.tag)
+            .field("sniffing_enabled", &self.sniff.enabled)
+            .finish()
+    }
+}
+
+impl DispatchHandler for InboundDispatchHandler {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    fn dispatch(
+        &self,
+        dest: &Destination,
+        link: Link,
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        let reader = maybe_wrap_reader(self.inbound_counter("downlink"), link.reader);
+        let writer = maybe_wrap_writer(self.inbound_counter("uplink"), link.writer);
+        let link = Link::new(reader, writer);
+        // dispatch_link 内部 spawn（sniffing → routing → outbound counter → handler），
+        // 此处仅同步返回。
+        if let Err(e) = self.dispatcher.dispatch_link(dest, link, &self.sniff) {
+            tracing::warn!(tag = %self.tag, error = %e, "dispatch_link failed");
+        }
+        Box::pin(std::future::ready(()))
+    }
 }
 
 /// 从路由配置 JSON 字节构造 [`RouterAdapter`]。

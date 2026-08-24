@@ -23,10 +23,10 @@ use xray_features::FeatureError;
 
 use crate::inbound::spawn_inbounds;
 use crate::outbound::register_outbounds;
-use crate::router::{DispatchRouter, RoutingHandler};
+use crate::router::DispatchRouter;
 use crate::register::{register_all_features, register_all_transports};
 use xray_app_dispatcher::default::SimpleOhm;
-use xray_app_dispatcher::{DispatchHandler, OutboundHandlerManager};
+use xray_app_dispatcher::{DefaultDispatcher, OutboundHandlerManager};
 
 /// 外部 API 调用错误。
 #[derive(Debug, Error)]
@@ -90,62 +90,60 @@ pub fn start_from_built(built: &xray_conf::BuiltConfig) -> Result<Arc<Instance>,
 ///
 /// # Routing 自动接入
 ///
-/// 如果 `built.apps` 含 `kind="routing"` 项，自动解析为 [`PatternRouter`](crate::router::PatternRouter)
-/// 并包装为 [`RoutingHandler`]。否则走纯 default outbound 路径。
+/// 如果 `built.apps` 含 `kind="routing"` 项，优先用 `xray-app-router` 的完整
+/// [`crate::wiring::RouterAdapter`]（rich RoutingContext + DNS resolved 选路）；
+/// 失败时回退 [`PatternRouter`](crate::router::PatternRouter)；否则走纯 default
+/// outbound 路径。三条路径统一经 [`DefaultDispatcher`]（sniffing + routing + stats）。
 pub async fn start_full(
     built: &xray_conf::BuiltConfig,
 ) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
-    // 检查是否有 routing app：优先用 xray-app-router 的完整 Router（含 GeoIP/GeoSite/
-    // balancer/observation 匹配能力），失败时回退到 PatternRouter（与历史行为一致）。
-    let router_opt: Option<Arc<dyn DispatchRouter>> = built
-        .apps
-        .iter()
-        .find(|a| a.kind == "routing")
-        .and_then(|a| {
-            match crate::wiring::build_router_adapter_from_json(&a.data) {
-                Ok(adapter) => Some(adapter as Arc<dyn DispatchRouter>),
-                Err(e) => {
-                    tracing::warn!(error = %e, "full Router init failed, falling back to PatternRouter");
-                    crate::router::PatternRouter::from_json(&a.data)
-                        .ok()
-                        .map(|r| Arc::new(r) as Arc<dyn DispatchRouter>)
+    if let Some(a) = built.apps.iter().find(|a| a.kind == "routing") {
+        match crate::wiring::build_router_adapter_from_json(&a.data) {
+            Ok(adapter) => {
+                let routing = Arc::clone(&adapter)
+                    as Arc<dyn xray_app_dispatcher::default::RoutingRouter>;
+                let dns_side = adapter as Arc<dyn DispatchRouter>;
+                return start_full_dispatched(built, Some(routing), Some(dns_side)).await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "full Router init failed, falling back to PatternRouter");
+                if let Ok(r) = crate::router::PatternRouter::from_json(&a.data) {
+                    return start_full_with_router(built, Arc::new(r)).await;
                 }
             }
-        });
-
-    match router_opt {
-        Some(router) => start_full_with_router(built, router).await,
-        None => start_full_no_router(built).await,
+        }
     }
-}
-
-/// 无 routing 的启动路径（内部辅助）。
-async fn start_full_no_router(
-    built: &xray_conf::BuiltConfig,
-) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
-    register_all_features();
-    register_all_transports();
-    let mut instance = Instance::new_from_built(built)?;
-    let ohm = Arc::new(SimpleOhm::new());
-    register_outbounds(built, &ohm, None)?;
-    let handles = spawn_inbounds(built, Arc::clone(&ohm), instance.shutdown_token().clone())
-        .await
-        .map_err(|e| CoreFunctionError::InstanceStart(e.to_string()))?;
-    instance.start()?;
-    tracing::info!(
-        inbounds = handles.len(),
-        "Xray instance started with full inbound/outbound stack"
-    );
-    Ok((Arc::new(instance), ohm, handles))
+    start_full_dispatched(built, None, None).await
 }
 
 /// 带路由的完整启动路径：Instance + SimpleOhm + outbounds + router + inbounds。
 ///
-/// 与 [`start_full`] 区别：在注册 outbounds 后，把 [`RoutingHandler`] 包装为新的 default
-/// handler，使 dispatch 时先查 router 规则。router 命中 → tagged outbound；miss → 原 default。
+/// router 经 [`crate::wiring::DispatchRouterBridge`] 暴露为 dispatcher 的
+/// `RoutingRouter`，与 [`start_full`] 的 RouterAdapter 路径同样经
+/// [`DefaultDispatcher::dispatch_link`] 分发（仅目标地址参与规则匹配）。
 pub async fn start_full_with_router(
     built: &xray_conf::BuiltConfig,
     router: Arc<dyn DispatchRouter>,
+) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
+    let bridge = Arc::new(crate::wiring::DispatchRouterBridge::new(Arc::clone(&router)))
+        as Arc<dyn xray_app_dispatcher::default::RoutingRouter>;
+    start_full_dispatched(built, Some(bridge), Some(router)).await
+}
+
+/// 共用装配路径（方案 B）：Instance + SimpleOhm + outbounds + DefaultDispatcher + inbounds。
+///
+/// 生产 default handler 经 [`DefaultDispatcher::dispatch_link`]：
+/// - sniffing：`BuiltInbound.sniffing` JSON → 首包嗅探 + dest 覆盖 + CachedReader 回灌
+/// - routing：`routing_router.pick_route_resolved`（domainStrategy DNS 解析路径）
+/// - stats：inbound/outbound tag counter（`{kind}>>>{tag}>>>traffic>>>{direction}`）
+///
+/// `routing_router` 为 None 时退 default handler（无路由行为），
+/// sniffing 与 counter 与路由无关始终生效。
+/// `dns_router` 仅用于 DNS client 注入（domainStrategy 解析）。
+async fn start_full_dispatched(
+    built: &xray_conf::BuiltConfig,
+    routing_router: Option<Arc<dyn xray_app_dispatcher::default::RoutingRouter>>,
+    dns_router: Option<Arc<dyn DispatchRouter>>,
 ) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
     register_all_features();
     register_all_transports();
@@ -153,30 +151,46 @@ pub async fn start_full_with_router(
 
     // DNS 注入（对应 Go 装配链：instance 创建后 router.dns = core.GetFeature(dns)）：
     // routing domainStrategy（IpOnDemand/IpIfNonMatch）解析经 DnsClient 查询。
-    if let Some(dns) = instance.get_feature::<xray_app_dns::DnsService>() {
-        router.set_dns_client(Arc::clone(&dns) as Arc<dyn xray_features::dns::DnsClient>);
+    if let (Some(dns), Some(r)) = (
+        instance.get_feature::<xray_app_dns::DnsService>(),
+        dns_router.as_ref(),
+    ) {
+        r.set_dns_client(Arc::clone(&dns) as Arc<dyn xray_features::dns::DnsClient>);
     }
+
     let ohm = Arc::new(SimpleOhm::new());
     register_outbounds(built, &ohm, None)?;
 
-    // 注入 router：把 default handler 包装为 RoutingHandler
-    if let Some(inner_default) = ohm.get_default_handler() {
-        let routing = Arc::new(RoutingHandler::new(
-            Arc::clone(&ohm),
-            inner_default,
-            router,
-        )) as Arc<dyn DispatchHandler>;
-        ohm.set_default(routing);
+    // DefaultDispatcher 装配（对应 Go dispatcher.Init(ohm, router, pm, sm)）
+    let mut dispatcher = DefaultDispatcher::new();
+    dispatcher.init(
+        &xray_app_dispatcher::Config::default(),
+        Arc::clone(&ohm) as Arc<dyn OutboundHandlerManager>,
+        routing_router,
+        xray_features::policy::Policy::default(),
+        None,
+    );
+    if let Some(pm) = instance.get_feature::<xray_app_policy::PolicyFeature>() {
+        dispatcher.set_policy_manager(pm);
     }
+    dispatcher.stats = instance
+        .get_feature::<crate::register::AppStatsFeature>()
+        .map(|f| f as Arc<dyn xray_features::stats::Manager>);
+    let dispatcher = Arc::new(dispatcher);
 
-    let handles = spawn_inbounds(built, Arc::clone(&ohm), instance.shutdown_token().clone())
-        .await
-        .map_err(|e| CoreFunctionError::InstanceStart(e.to_string()))?;
+    let handles = spawn_inbounds(
+        built,
+        Arc::clone(&ohm),
+        Some(dispatcher),
+        instance.shutdown_token().clone(),
+    )
+    .await
+    .map_err(|e| CoreFunctionError::InstanceStart(e.to_string()))?;
     instance.start()?;
     tracing::info!(
         inbounds = handles.len(),
-        routed = true,
-        "Xray instance started with router + full stack"
+        routed = dns_router.is_some(),
+        "Xray instance started via DefaultDispatcher (sniffing+stats+routing)"
     );
     Ok((Arc::new(instance), ohm, handles))
 }
@@ -1478,6 +1492,286 @@ mod tests {
         assert!(fb_bytes.starts_with(b"GET /web"), "fallback echo server got {fb_bytes:?}");
 
         for h in sh.iter().chain(ch.iter()) { h.abort(); }
+    }
+
+    /// 构造带 SNI 的最小 TLS ClientHello（满足 dispatcher TlsSniffer 的
+    /// record → handshake → extensions → SNI 解析路径）。
+    fn build_client_hello_with_sni(sni: &str) -> Vec<u8> {
+        let name = sni.as_bytes();
+        // SNI extension body: server_name_list
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(&((name.len() + 3) as u16).to_be_bytes()); // list_len
+        body.push(0x00); // name_type = host_name
+        body.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        body.extend_from_slice(name);
+        let mut ext: Vec<u8> = Vec::new();
+        ext.extend_from_slice(&0x0000u16.to_be_bytes()); // extension type = SNI
+        ext.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        ext.extend_from_slice(&body);
+
+        let mut hello: Vec<u8> = Vec::new();
+        hello.extend_from_slice(&[0x03, 0x01]); // client version
+        hello.extend_from_slice(&[0x42u8; 32]); // random
+        hello.push(0x00); // session_id_len
+        hello.extend_from_slice(&2u16.to_be_bytes()); // cipher_suites_len
+        hello.extend_from_slice(&[0x00, 0x2f]); // TLS_RSA_WITH_AES_128_CBC_SHA
+        hello.push(0x01); // compression_methods_len
+        hello.push(0x00);
+        hello.extend_from_slice(&(ext.len() as u16).to_be_bytes()); // extensions_len
+        hello.extend_from_slice(&ext);
+
+        let mut hs: Vec<u8> = vec![0x01]; // handshake type = ClientHello
+        let l = hello.len();
+        hs.extend_from_slice(&[(l >> 16) as u8, (l >> 8) as u8, l as u8]);
+        hs.extend_from_slice(&hello);
+
+        let mut rec: Vec<u8> = vec![0x16, 0x03, 0x01]; // record: Handshake
+        rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
+    /// sniffing e2e：TLS ClientHello SNI 被嗅探 → dest 覆写为域名 → domainSuffix
+    /// 路由规则命中 tagged socks outbound → 上游收到域名 CONNECT。
+    #[tokio::test]
+    async fn integration_sniffing_tls_sni_routes_by_sniffed_domain() {
+        use parking_lot::Mutex;
+
+        // 1. fake 上游 SOCKS5 server：记录 CONNECT 目标
+        let up_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_port = up_listener.local_addr().unwrap().port();
+        let target: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let t = Arc::clone(&target);
+        tokio::spawn(async move {
+            let (mut sock, _) = match up_listener.accept().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            // greeting: VER + NMETHODS + methods[NMETHODS]（no-auth 客户端 = 05 01 00）
+            let mut b = [0u8; 2];
+            if sock.read_exact(&mut b).await.is_err() {
+                return;
+            }
+            let mut methods = vec![0u8; b[1] as usize];
+            if sock.read_exact(&mut methods).await.is_err() {
+                return;
+            }
+            sock.write_all(&[0x05, 0x00]).await.unwrap();
+            let mut head = [0u8; 4];
+            if sock.read_exact(&mut head).await.is_err() {
+                return;
+            }
+            let addr = match head[3] {
+                0x01 => {
+                    let mut a = [0u8; 4];
+                    sock.read_exact(&mut a).await.unwrap();
+                    std::net::Ipv4Addr::from(a).to_string()
+                }
+                0x03 => {
+                    let mut l = [0u8; 1];
+                    sock.read_exact(&mut l).await.unwrap();
+                    let mut d = vec![0u8; l[0] as usize];
+                    sock.read_exact(&mut d).await.unwrap();
+                    String::from_utf8(d).unwrap()
+                }
+                _ => String::new(),
+            };
+            let mut p = [0u8; 2];
+            sock.read_exact(&mut p).await.unwrap();
+            *t.lock() = Some(addr);
+            // 回 CONNECT 成功，之后丢弃流量
+            sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        // 2. 配置：socks inbound（sniffing: tls）+ freedom default + socks tagged + routing
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let mut cfg = BuiltConfig::default();
+        cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry { kind: "socks".into(), data: vec![] },
+            tag: "socks-in".into(),
+            port: Some(socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: Some(serde_json::json!({
+                "enabled": true,
+                "destOverride": ["tls"]
+            })),
+        });
+        cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            tag: "direct".into(), // i=0 → default
+            send_through: None, stream_settings_json: None,
+            proxy_settings_json: None, mux_json: None,
+        });
+        cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry {
+                kind: "socks".into(),
+                data: format!(
+                    r#"{{"servers":[{{"address":"127.0.0.1","port":{up_port}}}]}}"#
+                )
+                .into_bytes(),
+            },
+            tag: "via-sni".into(),
+            send_through: None, stream_settings_json: None,
+            proxy_settings_json: None, mux_json: None,
+        });
+        cfg.apps.push(BuiltEntry {
+            kind: "routing".into(),
+            data: br#"{"domainStrategy":"AsIs","rules":[{"type":"field","domainSuffix":["sniff-test.example"],"outboundTag":"via-sni"}]}"#.to_vec(),
+        });
+
+        let (inst, _, handles) = start_full(&cfg).await.expect("sniffing config start");
+        assert!(inst.is_running());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 3. SOCKS5 CONNECT 1.2.3.4:443（任意不可达 IP；若嗅探失败会拨该 IP）
+        let mut client = TcpStream::connect(format!("127.0.0.1:{socks_port}"))
+            .await
+            .expect("connect socks");
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [0x05, 0x00]);
+        let mut req = vec![0x05, 0x01, 0x00, 0x01];
+        req.extend_from_slice(&[1, 2, 3, 4]);
+        req.extend_from_slice(&443u16.to_be_bytes());
+        client.write_all(&req).await.unwrap();
+        let mut cr = [0u8; 10];
+        client.read_exact(&mut cr).await.unwrap();
+        assert_eq!(cr[1], 0x00, "CONNECT should succeed");
+
+        // 4. 发 TLS ClientHello（SNI = www.sniff-test.example）
+        client
+            .write_all(&build_client_hello_with_sni("www.sniff-test.example"))
+            .await
+            .unwrap();
+
+        // 5. 等 fake 上游记录 CONNECT 目标
+        for _ in 0..100 {
+            if target.lock().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            target.lock().as_deref(),
+            Some("www.sniff-test.example"),
+            "SNI 应被嗅探并覆写 dest，路由命中 via-sni（上游收到域名 CONNECT）"
+        );
+        for h in handles.iter() {
+            h.abort();
+        }
+    }
+
+    /// stats counter e2e（无 router 路径）：流量经 DefaultDispatcher 后
+    /// inbound/outbound tag counter（{kind}>>>{tag}>>>traffic>>>{direction}）计数 > 0。
+    #[tokio::test]
+    async fn integration_stats_counters_via_default_dispatcher() {
+        use xray_features::stats::Manager as _;
+
+        // 1. echo server
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = echo_listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        // 2. 无 routing app：验证无 router 路径也有 sniffing+counter 管线
+        let mut cfg = BuiltConfig::default();
+        cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry { kind: "socks".into(), data: vec![] },
+            tag: "socks-in".into(),
+            port: Some(socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            tag: "direct".into(),
+            send_through: None, stream_settings_json: None,
+            proxy_settings_json: None, mux_json: None,
+        });
+
+        let (inst, _, handles) = start_full(&cfg).await.expect("stats config start");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 3. 走一轮 echo
+        let mut client = TcpStream::connect(format!("127.0.0.1:{socks_port}"))
+            .await
+            .expect("connect socks");
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        let ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
+        let mut req = vec![0x05, 0x01, 0x00, 0x01];
+        req.extend_from_slice(&ip);
+        req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        client.write_all(&req).await.unwrap();
+        let mut cr = [0u8; 10];
+        client.read_exact(&mut cr).await.unwrap();
+
+        let payload = b"count me through the dispatcher!";
+        client.write_all(payload).await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got))
+            .await
+            .expect("echo through dispatcher")
+            .unwrap();
+        assert_eq!(&got, payload);
+
+        // 4. counter 断言（AppStatsFeature 已被 ensure_essential_features 注入）
+        let stats = inst
+            .get_feature::<crate::register::AppStatsFeature>()
+            .expect("stats feature should be injected");
+        for name in [
+            "inbound>>>socks-in>>>traffic>>>uplink",
+            "inbound>>>socks-in>>>traffic>>>downlink",
+            "outbound>>>direct>>>traffic>>>uplink",
+            "outbound>>>direct>>>traffic>>>downlink",
+        ] {
+            let c = stats.get_counter(name).unwrap_or_else(|| {
+                panic!("counter {name} should be lazily registered")
+            });
+            assert!(
+                c.value() > 0,
+                "counter {name} should be positive, got {}",
+                c.value()
+            );
+        }
+        for h in handles.iter() {
+            h.abort();
+        }
     }
 
     /// 测试用：跳过证书校验的 verifier。

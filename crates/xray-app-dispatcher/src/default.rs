@@ -220,6 +220,17 @@ impl Route {
 pub trait RoutingRouter: Send + Sync + Debug {
     /// 选路。对应 Go `PickRoute(routing.Context) (Route, error)`。
     fn pick_route(&self, ctx: &dyn RoutingContext) -> Result<Route, DispatcherError>;
+
+    /// 带 DNS 解析的选路（routing domainStrategy IpOnDemand/IpIfNonMatch）。
+    ///
+    /// 默认退化为同步 [`RoutingRouter::pick_route`]——无 DNS 能力的 router
+    /// 或 AsIs 策略等价。生产接线见 `xray-core/src/wiring.rs::RouterAdapter`。
+    fn pick_route_resolved<'a>(
+        &'a self,
+        ctx: &'a dyn RoutingContext,
+    ) -> Pin<Box<dyn Future<Output = Result<Route, DispatcherError>> + Send + 'a>> {
+        Box::pin(async move { self.pick_route(ctx) })
+    }
 }
 
 /// 出站 handler trait（对应 Go `outbound.Handler.Dispatch(ctx, link)`）
@@ -462,6 +473,19 @@ fn build_routing_context(
     ctx
 }
 
+/// 懒注册并取 counter（对应 Go `stats.Manager.GetCounter` 的 create-if-missing 语义）。
+///
+/// Rust 端 [`xray_features::stats::Manager::get_counter`] 仅查询（miss 返回 None），
+/// dispatcher 需要在首次包装时注册 counter 才能被 stats API 查到。
+fn get_or_register_counter_opt(
+    stats: Option<&Arc<dyn xray_features::stats::Manager>>,
+    name: &str,
+) -> Option<Arc<dyn xray_features::stats::Counter>> {
+    stats.and_then(|m| {
+        xray_features::stats::get_or_register_counter(m.as_ref(), name).ok()
+    })
+}
+
 // ========== DefaultDispatcher ==========
 
 /// 默认分发器
@@ -582,30 +606,20 @@ impl DefaultDispatcher {
 
         // 查 inbound/outbound counter（对应 Go routedDispatch 中 getStatCounter）
         // counter_name 规则："{kind}>>>{tag}>>>traffic>>>{direction}"
+        // Go 的 stats.Manager.GetCounter 为 create-if-missing；Rust 端 get_counter 仅查询，
+        // 故用 get_or_register_counter 保持懒注册语义。
         // Go: inbound uplink = inbound 写上行 = up_w
         // Go: inbound downlink = inbound 读下行 = dn_r
         // Go: outbound uplink = outbound 读上行 = up_r
         // Go: outbound downlink = outbound 写下行 = dn_w
-        let inbound_uplink = inbound_tag.and_then(|tag| {
-            self.stats.as_ref().and_then(|m| {
-                m.get_counter(&format!("inbound>>>{tag}>>>traffic>>>uplink"))
-            })
-        });
-        let inbound_downlink = inbound_tag.and_then(|tag| {
-            self.stats.as_ref().and_then(|m| {
-                m.get_counter(&format!("inbound>>>{tag}>>>traffic>>>downlink"))
-            })
-        });
-        let outbound_uplink = outbound_tag.and_then(|tag| {
-            self.stats.as_ref().and_then(|m| {
-                m.get_counter(&format!("outbound>>>{tag}>>>traffic>>>uplink"))
-            })
-        });
-        let outbound_downlink = outbound_tag.and_then(|tag| {
-            self.stats.as_ref().and_then(|m| {
-                m.get_counter(&format!("outbound>>>{tag}>>>traffic>>>downlink"))
-            })
-        });
+        let inbound_uplink = inbound_tag
+            .and_then(|tag| get_or_register_counter_opt(self.stats.as_ref(), &format!("inbound>>>{tag}>>>traffic>>>uplink")));
+        let inbound_downlink = inbound_tag
+            .and_then(|tag| get_or_register_counter_opt(self.stats.as_ref(), &format!("inbound>>>{tag}>>>traffic>>>downlink")));
+        let outbound_uplink = outbound_tag
+            .and_then(|tag| get_or_register_counter_opt(self.stats.as_ref(), &format!("outbound>>>{tag}>>>traffic>>>uplink")));
+        let outbound_downlink = outbound_tag
+            .and_then(|tag| get_or_register_counter_opt(self.stats.as_ref(), &format!("outbound>>>{tag}>>>traffic>>>downlink")));
 
         // 包装 link 端的 writer/reader
         // inbound 端：写上行（uplink）+ 读下行（downlink）
@@ -652,6 +666,7 @@ impl DefaultDispatcher {
         let sniff_req = sniffing_request.clone();
         let router = self.router.clone();
         let fdns = self.fdns.clone();
+        let stats = self.stats.clone();
         let ohm = Arc::clone(ohm);
         let policy = self
             .policy_manager
@@ -679,10 +694,12 @@ impl DefaultDispatcher {
                 (dest.clone(), None)
             };
 
-            // ---- Phase 2: Routing ----
-            let handler = if let Some(ref r) = router {
+            // ---- Phase 2: Routing（resolved：domainStrategy DNS 解析路径） ----
+            // pick_route_resolved 默认退化为同步 pick_route；RouterAdapter 生产实现
+            // 委托 xray_app_router::Router::pick_route_resolved（携带完整 RoutingContext）。
+            let handler = if let Some(r) = &router {
                 let ctx = build_routing_context(&final_dest, sniffed_protocol.as_deref());
-                match r.pick_route(&ctx) {
+                match r.pick_route_resolved(&ctx).await {
                     Ok(route) => {
                         ohm.get_handler(&route.outbound_tag).or_else(|| {
                             tracing::warn!(tag = %route.outbound_tag, "routed handler not found, falling back to default");
@@ -700,9 +717,23 @@ impl DefaultDispatcher {
                 return;
             };
 
+            // outbound counter（对应 Go routedDispatch 的 getStatCounter，按命中 tag 懒注册）：
+            // uplink = outbound 读上行（reader），downlink = outbound 写下行（writer）
+            let out_tag = handler.tag().to_string();
+            let out_up = get_or_register_counter_opt(
+                stats.as_ref(),
+                &format!("outbound>>>{out_tag}>>>traffic>>>uplink"),
+            );
+            let out_dn = get_or_register_counter_opt(
+                stats.as_ref(),
+                &format!("outbound>>>{out_tag}>>>traffic>>>downlink"),
+            );
+
             // CachedReader 始终包装 outbound_reader，sniffing 时回放缓存首包
-            let reader: Box<dyn xray_buf::io::Reader> = Box::new(cr);
-            let final_link = xray_transport::link::Link::new(reader, outbound_writer);
+            let reader: Box<dyn xray_buf::io::Reader> =
+                crate::stats::maybe_wrap_reader(out_up, Box::new(cr));
+            let writer = crate::stats::maybe_wrap_writer(out_dn, outbound_writer);
+            let final_link = xray_transport::link::Link::new(reader, writer);
 
             let fut = handler.dispatch(&final_dest, final_link);
             let _ = fut.await;
@@ -1032,6 +1063,21 @@ impl SimpleOhm {
 
     pub fn set_default(&self, handler: Arc<dyn DispatchHandler>) {
         *self.default.write().unwrap() = Some(handler);
+    }
+
+    /// 浅快照：共享全部 tagged/default handler（Arc clone），后续对快照的
+    /// `set_default` 不影响原 ohm。
+    ///
+    /// 生产接线（`xray-core` 方案 B）用：每个 inbound 一份快照，default 替换为
+    /// 携带该 inbound sniffing 配置的 wrapper，master ohm 的 default 保持真实出站。
+    /// 若直接在 master 上 set_default 会造成 dispatch_link → get_default_handler
+    /// → wrapper 的无限递归。
+    #[must_use]
+    pub fn snapshot(&self) -> SimpleOhm {
+        Self {
+            default: std::sync::RwLock::new(self.default.read().unwrap().clone()),
+            tagged: std::sync::RwLock::new(self.tagged.read().unwrap().clone()),
+        }
     }
 
     #[allow(dead_code)]
@@ -1427,5 +1473,136 @@ mod tests {
 
         assert_eq!(resp.to_vec(), b"e2e dispatch bridge");
         w.shutdown(); // 关闭触发 bridge 结束
+    }
+
+    use xray_features::stats::Manager as _;
+
+    #[tokio::test]
+    async fn pick_route_resolved_default_degenerates_to_sync() {
+        #[derive(Debug)]
+        struct SyncOnlyRouter;
+        impl RoutingRouter for SyncOnlyRouter {
+            fn pick_route(&self, ctx: &dyn RoutingContext) -> Result<Route, DispatcherError> {
+                Ok(Route::new(format!("sync-{}", ctx.get_target_domain())))
+            }
+            // 不覆盖 pick_route_resolved：验证 trait 默认实现退化为同步 pick_route
+        }
+
+        let ctx = DispatcherContext::new().with_target_domain("example.com");
+        let route = SyncOnlyRouter.pick_route_resolved(&ctx).await.unwrap();
+        assert_eq!(route.outbound_tag, "sync-example.com");
+    }
+
+    #[tokio::test]
+    async fn dispatch_link_routes_resolved_and_counts_outbound_traffic() {
+        use std::future::Future;
+        use xray_buf::multi::MultiBuffer;
+        use xray_common::net::address::Address;
+        use xray_common::net::destination::Destination;
+
+        /// 一次性 echo handler：记录 dispatch 到的 dest domain，读一段回写后关闭。
+        #[derive(Debug)]
+        struct EchoHandler {
+            tag: &'static str,
+            dest_domain: Arc<parking_lot::Mutex<Option<String>>>,
+        }
+        impl DispatchHandler for EchoHandler {
+            fn tag(&self) -> &str {
+                self.tag
+            }
+            fn dispatch(
+                &self,
+                dest: &Destination,
+                link: xray_transport::link::Link,
+            ) -> PinFuture<()> {
+                let domain = dest.address().as_domain().map(str::to_string);
+                let recorded = Arc::clone(&self.dest_domain);
+                Box::pin(async move {
+                    *recorded.lock() = domain;
+                    let mut r = link.reader;
+                    let mut w = link.writer;
+                    if let Ok(mb) = r.read_multi_buffer().await {
+                        if !mb.is_empty() {
+                            let _ = w.write_multi_buffer(mb).await;
+                        }
+                    }
+                    w.shutdown();
+                })
+            }
+        }
+
+        /// resolved 版返回 tag-out；同步 pick_route 返回 should-not（若被调用即测试失败信号）。
+        #[derive(Debug)]
+        struct ResolvedRouter;
+        impl RoutingRouter for ResolvedRouter {
+            fn pick_route(&self, _ctx: &dyn RoutingContext) -> Result<Route, DispatcherError> {
+                Ok(Route::new("should-not"))
+            }
+            fn pick_route_resolved<'a>(
+                &'a self,
+                _ctx: &'a dyn RoutingContext,
+            ) -> Pin<Box<dyn Future<Output = Result<Route, DispatcherError>> + Send + 'a>> {
+                Box::pin(async move { Ok(Route::new("tag-out")) })
+            }
+        }
+
+        let ohm = SimpleOhm::new();
+        let hit_out = Arc::new(parking_lot::Mutex::new(None));
+        let hit_wrong = Arc::new(parking_lot::Mutex::new(None));
+        ohm.add(
+            "tag-out",
+            Arc::new(EchoHandler { tag: "tag-out", dest_domain: Arc::clone(&hit_out) }),
+        );
+        ohm.add(
+            "should-not",
+            Arc::new(EchoHandler { tag: "should-not", dest_domain: Arc::clone(&hit_wrong) }),
+        );
+
+        let stats = Arc::new(xray_app_stats::Manager::new_running());
+        let mut d = DefaultDispatcher::new();
+        d.ohm = Some(Arc::new(ohm));
+        d.router = Some(Arc::new(ResolvedRouter));
+        d.stats = Some(Arc::clone(&stats) as Arc<dyn xray_features::stats::Manager>);
+
+        let (up_r, up_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let (dn_r, dn_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let outbound = xray_transport::link::Link::new(Box::new(up_r), Box::new(dn_w));
+
+        let dest = Destination::new(
+            Address::new_domain("routed.example.com".to_string()),
+            Port::new(443),
+            Network::TCP,
+        );
+        d.dispatch_link(&dest, outbound, &SniffingRequest::default())
+            .expect("dispatch_link should spawn");
+
+        // 写上行
+        let mut w: Box<dyn xray_buf::io::Writer> = Box::new(up_w);
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(b"hello routed");
+        w.write_multi_buffer(mb).await.unwrap();
+
+        // 读下行（echo 回来）
+        let mut r: Box<dyn xray_buf::io::Reader> = Box::new(dn_r);
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
+            .await
+            .expect("timeout waiting echo")
+            .unwrap();
+        assert_eq!(resp.to_vec(), b"hello routed");
+
+        // resolved 路径选中 tag-out；同步版标签未被使用
+        assert_eq!(hit_out.lock().as_deref(), Some("routed.example.com"));
+        assert!(hit_wrong.lock().is_none());
+
+        // outbound counter 按命中 tag 懒注册并计数
+        let up_ctr = stats
+            .get_counter("outbound>>>tag-out>>>traffic>>>uplink")
+            .expect("uplink counter should be lazily registered");
+        let dn_ctr = stats
+            .get_counter("outbound>>>tag-out>>>traffic>>>downlink")
+            .expect("downlink counter should be lazily registered");
+        assert!(up_ctr.value() > 0, "uplink counted {} bytes", up_ctr.value());
+        assert!(dn_ctr.value() > 0, "downlink counted {} bytes", dn_ctr.value());
+        w.shutdown();
     }
 }
