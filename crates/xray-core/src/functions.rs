@@ -28,6 +28,32 @@ use crate::register::{register_all_features, register_all_transports};
 use xray_app_dispatcher::default::SimpleOhm;
 use xray_app_dispatcher::{DefaultDispatcher, OutboundHandlerManager};
 
+/// AccessLogSink → LogInstance 桥（bd 4uu）。
+///
+/// dispatcher crate 不依赖 xray-app-log（AccessLogSink trait 注入解耦），
+/// xray-core 同时依赖两者，在此把 [`xray_app_log::LogInstance`] 适配为
+/// dispatcher 的 access 记录 sink——对应 Go `log.Record(accessMessage)`
+/// 全局 handler → `app/log.Instance.Handle` 链。
+struct LogInstanceSink(Arc<xray_app_log::LogInstance>);
+
+impl xray_app_dispatcher::AccessLogSink for LogInstanceSink {
+    fn record_access(&self, e: &xray_app_dispatcher::AccessLogEntry) {
+        let status = if e.status == "rejected" {
+            xray_app_log::AccessStatus::Rejected
+        } else {
+            xray_app_log::AccessStatus::Accepted
+        };
+        self.0.handle(&xray_app_log::LogEntry::Access(xray_app_log::AccessMessage {
+            from: e.from.clone(),
+            to: e.to.clone(),
+            email: e.email.clone(),
+            detour: e.detour.clone(),
+            status: Some(status),
+            reason: e.reason.clone(),
+        }));
+    }
+}
+
 /// 外部 API 调用错误。
 #[derive(Debug, Error)]
 pub enum CoreFunctionError {
@@ -178,8 +204,25 @@ async fn start_full_dispatched(
         .map(|f| f as Arc<dyn xray_features::stats::Manager>);
     // per-tag UDP443 策略（bd g35）：mux JSON → dispatch_link 前置检查
     dispatcher.udp443_policies = crate::outbound::parse_udp443_policies(&built.outbounds);
+
+    // Access log 装配（bd 4uu，对应 Go logger 是首个启动的 App + dispatcher log.Record）：
+    // 无 log 配置块时按 Go DefaultLogConfig（access=None/error=Console/Warning）注入默认
+    // LogFeature；再把 LogInstance 适配为 dispatcher 的 AccessLogSink。
+    if instance.get_feature::<xray_app_log::LogFeature>().is_none() {
+        let feature = xray_app_log::LogFeature::new(xray_app_log::LogConfig::default())
+            .map_err(CoreFunctionError::from)?;
+        instance.add_feature(Arc::new(feature));
+    }
+    if let Some(log_feature) = instance.get_feature::<xray_app_log::LogFeature>() {
+        dispatcher.access_sink = Some(Arc::new(LogInstanceSink(Arc::clone(
+            log_feature.instance(),
+        ))));
+    }
     let dispatcher = Arc::new(dispatcher);
 
+    // 先 start features（LogInstance 等 handler 就绪）再起 inbound listener——
+    // 对应 Go：logger 是首个启动的 App，addInboundHandlers 在 instance.Start() 之后。
+    instance.start()?;
     let handles = spawn_inbounds(
         built,
         Arc::clone(&ohm),
@@ -188,11 +231,10 @@ async fn start_full_dispatched(
     )
     .await
     .map_err(|e| CoreFunctionError::InstanceStart(e.to_string()))?;
-    instance.start()?;
     tracing::info!(
         inbounds = handles.len(),
         routed = dns_router.is_some(),
-        "Xray instance started via DefaultDispatcher (sniffing+stats+routing)"
+        "Xray instance started via DefaultDispatcher (sniffing+stats+routing+accesslog)"
     );
     Ok((Arc::new(instance), ohm, handles))
 }
@@ -492,6 +534,127 @@ mod tests {
         for h in handles {
             h.abort();
         }
+    }
+    /// Access log e2e（bd 4uu）：log 配置块（access 文件）→ socks → freedom 全链路，
+    /// dispatch 后 access log 记录 from/to/detour（Go default.go:488-502 对齐）。
+    #[tokio::test]
+    async fn access_log_full_chain_socks_to_freedom_e2e() {
+        // 1. echo server
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = echo_listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        // 2. access log 临时文件
+        let access_path = std::env::temp_dir()
+            .join(format!("xray-access-e2e-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&access_path);
+
+        // 3. 找空闲端口给 socks inbound
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        // 4. BuiltConfig: log app（access 文件）+ socks inbound + freedom outbound
+        let mut built = BuiltConfig::default();
+        built.apps.push(BuiltEntry {
+            kind: "log".into(),
+            data: serde_json::to_vec(&serde_json::json!({
+                "loglevel": "warning",
+                "access": access_path.to_string_lossy(),
+            }))
+            .unwrap(),
+        });
+        built.inbounds.push(BuiltInbound {
+            entry: BuiltEntry {
+                kind: "socks".into(),
+                data: vec![],
+            },
+            tag: "socks-in".into(),
+            port: Some(socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        built.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry {
+                kind: "freedom".into(),
+                data: b"{}".to_vec(),
+            },
+            tag: "direct".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+        });
+
+        // 5. start_full + 等 listener
+        let (_inst, _ohm, handles) = start_full(&built).await.expect("start_full should succeed");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // 6. SOCKS5 CONNECT → echo
+        let mut client =
+            TcpStream::connect(format!("127.0.0.1:{socks_port}")).await.expect("connect socks");
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [0x05, 0x00]);
+
+        let ipv4 = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
+        let mut req = vec![0x05, 0x01, 0x00, 0x01];
+        req.extend_from_slice(&ipv4);
+        req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        client.write_all(&req).await.unwrap();
+        let mut connect_resp = [0u8; 10];
+        client.read_exact(&mut connect_resp).await.unwrap();
+        assert_eq!(connect_resp[1], 0x00, "CONNECT should succeed");
+
+        let payload = b"ping";
+        client.write_all(payload).await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        client.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, payload, "echo through chain");
+
+        // 7. 断言 access log：等记录落盘（record 在 handler.dispatch 前同步执行）
+        let content = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Ok(s) = std::fs::read_to_string(&access_path) {
+                    if s.contains("accepted") {
+                        return s;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("access log should be written");
+
+        // Go 格式：from {from} accepted {to} [{in >> out}]
+        let expected_to = format!("tcp:127.0.0.1:{}", echo_addr.port());
+        assert!(content.contains("accepted"), "line: {content}");
+        assert!(content.contains(&expected_to), "line: {content}");
+        assert!(content.contains("[socks-in >> direct]"), "line: {content}");
+        assert!(content.contains("from 127.0.0.1:"), "line: {content}");
+
+        for h in handles {
+            h.abort();
+        }
+        let _ = std::fs::remove_file(&access_path);
     }
 
     /// Graceful shutdown：cancel shutdown_token 后 inbound task 应退出。

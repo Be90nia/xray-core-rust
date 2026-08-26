@@ -186,15 +186,74 @@ fn stub_factory(kind: &'static str) -> FeatureFactory {
     })
 }
 
-/// Log app 真实 factory：从 proto 编码的配置字节创建 LogFeature。
+/// Log app 真实 factory：解析 log JSON（`xray-conf` 的 `LogConfig` 字节）→
+/// [`xray_app_log::LogConfig`] → [`LogFeature`]。
+///
+/// 对应 Go `infra/conf.LogConfig.Build()`（log.go:26-64）语义：
+/// - `access`/`error`：`"none"` → LogType::None；非空 → File + path；缺省 → Console
+///   （注意：Go 在 log 块存在时 access 默认 Console，与无 log 块的
+///   `DefaultLogConfig`（access=None）不同，此处保持一致）
+/// - `loglevel`：debug/info/error 映射级别，`none` 双双关闭，缺省 Warning
+/// - `dnsLog`/`maskAddress` 直传；`format`（Rust 扩展）`"json"` → Json
 fn log_factory() -> FeatureFactory {
     Arc::new(|data: &[u8]| {
-        let proto: xray_proto::xray::app::log::Config =
-            prost::Message::decode(data).unwrap_or_default();
-        let config = xray_app_log::LogConfig::from_proto(&proto);
+        let json_cfg: xray_conf::app_config::LogConfig =
+            serde_json::from_slice(data).map_err(|e| FeatureError::StartFailed {
+                name: "log",
+                message: format!("invalid log config: {e}"),
+            })?;
+        let config = build_log_config(&json_cfg);
         let feature = xray_app_log::LogFeature::new(config)?;
         Ok(Arc::new(feature) as Arc<dyn Feature>)
     })
+}
+
+/// JSON `LogConfig` → [`xray_app_log::LogConfig`]（Go `infra/conf/log.go Build`）。
+fn build_log_config(v: &xray_conf::app_config::LogConfig) -> xray_app_log::LogConfig {
+    use xray_app_log::{LogConfig, LogFormat, LogType, SeverityLevel};
+
+    let mut config = LogConfig {
+        error_log_type: LogType::Console,
+        access_log_type: LogType::Console,
+        enable_dns_log: v.dns_log.unwrap_or(false),
+        ..LogConfig::default()
+    };
+
+    match v.access.as_deref() {
+        Some("none") => config.access_log_type = LogType::None,
+        Some(p) if !p.is_empty() => {
+            config.access_log_path = p.to_string();
+            config.access_log_type = LogType::File;
+        }
+        _ => {}
+    }
+    match v.error.as_deref() {
+        Some("none") => config.error_log_type = LogType::None,
+        Some(p) if !p.is_empty() => {
+            config.error_log_path = p.to_string();
+            config.error_log_type = LogType::File;
+        }
+        _ => {}
+    }
+
+    match v.loglevel.as_deref().map(str::to_lowercase).as_deref() {
+        Some("debug") => config.error_log_level = SeverityLevel::Debug,
+        Some("info") => config.error_log_level = SeverityLevel::Info,
+        Some("error") => config.error_log_level = SeverityLevel::Error,
+        Some("none") => {
+            config.error_log_type = LogType::None;
+            config.access_log_type = LogType::None;
+        }
+        _ => config.error_log_level = SeverityLevel::Warning,
+    }
+
+    config.mask_address = v.mask_address.clone().unwrap_or_default();
+    config.format = v
+        .format
+        .as_deref()
+        .map(LogFormat::parse)
+        .unwrap_or(LogFormat::Console);
+    config
 }
 
 /// DNS app 真实 factory：解析顶层 dns JSON → [`DnsServiceConfig`] → [`DnsService`]。
@@ -761,6 +820,67 @@ mod tests {
         assert_eq!(parse_go_duration_ms("500ms"), Some(500));
         assert_eq!(parse_go_duration_ms(""), None);
         assert_eq!(parse_go_duration_ms("invalid"), None);
+    }
+
+    /// log 配置块解析（bd 4uu，对齐 Go infra/conf/log.go Build 语义）。
+    #[test]
+    fn log_factory_parses_full_config() {
+        use xray_app_log::{LogFormat, LogType, SeverityLevel};
+
+        let json = br#"{
+            "loglevel": "debug",
+            "access": "/tmp/access.log",
+            "error": "none",
+            "dnsLog": true,
+            "maskAddress": "half",
+            "format": "json"
+        }"#;
+        let json_cfg: xray_conf::app_config::LogConfig =
+            serde_json::from_slice(json).expect("log config should parse");
+        let cfg = build_log_config(&json_cfg);
+        assert_eq!(cfg.error_log_level, SeverityLevel::Debug);
+        assert_eq!(cfg.access_log_type, LogType::File);
+        assert_eq!(cfg.access_log_path, "/tmp/access.log");
+        assert_eq!(cfg.error_log_type, LogType::None);
+        assert!(cfg.enable_dns_log);
+        assert_eq!(cfg.mask_address, "half");
+        assert_eq!(cfg.format, LogFormat::Json);
+    }
+
+    /// 缺省 log 块字段：log 块存在时 access/error 缺省 Console（Go Build 语义），
+    /// loglevel 缺省 Warning，format 缺省 Console。
+    #[test]
+    fn log_factory_defaults_when_log_block_present() {
+        use xray_app_log::{LogFormat, LogType, SeverityLevel};
+
+        let json_cfg: xray_conf::app_config::LogConfig =
+            serde_json::from_slice(b"{}").unwrap();
+        let cfg = build_log_config(&json_cfg);
+        assert_eq!(cfg.access_log_type, LogType::Console);
+        assert_eq!(cfg.error_log_type, LogType::Console);
+        assert_eq!(cfg.error_log_level, SeverityLevel::Warning);
+        assert_eq!(cfg.format, LogFormat::Console);
+    }
+
+    /// loglevel=none：error 与 access 双双关闭（Go log.go:57-59）。
+    #[test]
+    fn log_factory_loglevel_none_disables_both() {
+        use xray_app_log::LogType;
+
+        let json_cfg: xray_conf::app_config::LogConfig =
+            serde_json::from_slice(br#"{"loglevel": "none"}"#).unwrap();
+        let cfg = build_log_config(&json_cfg);
+        assert_eq!(cfg.error_log_type, LogType::None);
+        assert_eq!(cfg.access_log_type, LogType::None);
+    }
+
+    /// log factory 从 JSON 字节构建 LogFeature 并 start（log 块真实生效链路）。
+    #[test]
+    fn log_factory_builds_feature_from_json() {
+        register_all_features();
+        let feat = registry::create_feature("log", br#"{"loglevel": "warning"}"#)
+            .expect("log config should build");
+        assert_eq!(feat.feature_name(), "log");
     }
 
     #[test]

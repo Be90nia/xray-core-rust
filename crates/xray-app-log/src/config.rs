@@ -103,6 +103,40 @@ impl SeverityLevel {
     pub fn as_i32(self) -> i32 {
         self as i32
     }
+
+    /// 小写名称（对齐 Go proto `Severity_String`：unknown/error/warning/info/debug）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Error => "error",
+            Self::Warning => "warning",
+            Self::Info => "info",
+            Self::Debug => "debug",
+        }
+    }
+}
+
+/// 日志输出格式。
+///
+/// Go v26.6.1 基线无 format 配置（console 单行 `Message.String()`），
+/// `json` 为 Rust 侧扩展（对齐 assignment 需求），字段名沿用 Go
+/// `log.AccessMessage` 结构体字段小写形式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogFormat {
+    #[default]
+    Console,
+    Json,
+}
+
+impl LogFormat {
+    /// 从配置字符串解析：`"json"` → Json，其余（含空）→ Console。
+    pub fn parse(s: &str) -> Self {
+        if s.eq_ignore_ascii_case("json") {
+            Self::Json
+        } else {
+            Self::Console
+        }
+    }
 }
 
 /// Log 配置，对应 proto `xray.app.log.Config`。
@@ -115,6 +149,8 @@ pub struct LogConfig {
     pub access_log_path: String,
     pub enable_dns_log: bool,
     pub mask_address: String,
+    /// 输出格式（console 单行 / json）。proto 无对应字段，from_proto 恒为 Console。
+    pub format: LogFormat,
 }
 
 impl Default for LogConfig {
@@ -127,6 +163,7 @@ impl Default for LogConfig {
             access_log_path: String::new(),
             enable_dns_log: false,
             mask_address: String::new(),
+            format: LogFormat::Console,
         }
     }
 }
@@ -142,6 +179,7 @@ impl LogConfig {
             access_log_path: p.access_log_path.clone(),
             enable_dns_log: p.enable_dns_log,
             mask_address: p.mask_address.clone(),
+            format: LogFormat::Console,
         }
     }
 
@@ -237,10 +275,20 @@ mod tests {
             access_log_path: "/var/log/access.log".into(),
             enable_dns_log: true,
             mask_address: "half".into(),
+            format: LogFormat::Console,
         };
         let p = c.to_proto();
         let c2 = LogConfig::from_proto(&p);
         assert_eq!(c, c2);
+    }
+
+    #[test]
+    fn log_format_parse() {
+        assert_eq!(LogFormat::parse("json"), LogFormat::Json);
+        assert_eq!(LogFormat::parse("JSON"), LogFormat::Json);
+        assert_eq!(LogFormat::parse("console"), LogFormat::Console);
+        assert_eq!(LogFormat::parse(""), LogFormat::Console);
+        assert_eq!(LogFormat::default(), LogFormat::Console);
     }
 
     #[test]

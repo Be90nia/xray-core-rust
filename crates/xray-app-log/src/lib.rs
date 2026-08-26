@@ -25,7 +25,7 @@ pub use command::{
     DefaultLogService, LogService, LogServiceDescriptor, LogServiceRegistrar,
     NoopLogServiceRegistrar,
 };
-pub use config::{LogConfig, LogType, SeverityLevel};
+pub use config::{LogConfig, LogFormat, LogType, SeverityLevel};
 pub use error::{at_error, at_warning, LogError};
 pub use instance::{
     AccessMessage, AccessStatus, ConsoleHandler, ConsoleHandlerCreator, DnsLog,

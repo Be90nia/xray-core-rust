@@ -95,12 +95,11 @@ pub async fn serve_socks5(
         let handler = Arc::clone(&handler);
         let config = Arc::clone(&config);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, &config, &handler).await {
+            if let Err(e) = handle_connection(stream, peer, &config, &handler).await {
                 tracing::debug!(error = %e, "socks5 connection ended with error");
             }
         });
 
-        let _ = peer; // 仅 log 级别可用，当前不记
     }
 }
 
@@ -109,6 +108,7 @@ pub async fn serve_socks5(
 /// 兼容 SOCKS4/4a/5。UDP ASSOCIATE 时 spawn relay pump 并保持 TCP 控制连接。
 async fn handle_connection(
     mut stream: TcpStream,
+    peer: std::net::SocketAddr,
     config: &ServerConfig,
     handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,
 ) -> std::io::Result<()> {
@@ -146,7 +146,14 @@ async fn handle_connection(
                 tokio::spawn(handle_mux_inbound_link(link, Arc::clone(handler)));
                 return Ok(());
             }
-            let _ = handler.dispatch(&dest, link).await;
+            // access log（bd 4uu）：from=客户端源地址（对应 Go socks server ctx
+            // ContextWithAccessMessage{From: conn.RemoteAddr()}）；email 留空（无认证），
+            // inbound_tag 由 InboundDispatchHandler 补齐。
+            let access = xray_app_dispatcher::AccessContext {
+                from: peer.to_string(),
+                ..Default::default()
+            };
+            let _ = handler.dispatch_with_access(&dest, link, access).await;
             Ok(())
         }
     }

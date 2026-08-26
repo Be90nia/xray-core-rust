@@ -10,19 +10,28 @@ use serde::{Deserialize, Serialize};
 // Log
 // =========================================================================
 
-/// 日志配置，对应 Go `infra/conf.LogConfig`。
+/// 日志配置，对应 Go `infra/conf.LogConfig`（json 字段：loglevel/access/error/
+/// dnsLog/maskAddress；`format` 为 Rust 扩展——Go v26.6.1 无此字段）。
 #[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 pub struct LogConfig {
-    /// 日志级别：`debug` / `info` / `warning` / `error` / `none`。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub loglevel: Option<String>,
-    /// Access log 文件路径，空字符串表示不记录。
+    /// Access log：文件路径，`"none"` 关闭，空（未配置）= console。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub access: Option<String>,
-    /// Error log 文件路径。
+    /// Error log：文件路径，`"none"` 关闭，空（未配置）= console。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// DNS 查询日志开关（Go json `dnsLog`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dns_log: Option<bool>,
+    /// 日志 IP 掩码：`"half"` / `"quarter"` / `"full"` 等（Go json `maskAddress`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mask_address: Option<String>,
+    /// 输出格式：`"json"` / `"console"`（Rust 扩展）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
 }
 
 // =========================================================================

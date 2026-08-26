@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 
-use crate::config::{LogConfig, LogType, SeverityLevel};
+use crate::config::{LogConfig, LogFormat, LogType, SeverityLevel};
 use crate::error::{at_error, at_warning, LogError};
 use crate::mask::mask_addresses;
 
@@ -36,22 +36,47 @@ pub struct AccessMessage {
     pub from: String,
     pub to: String,
     pub email: String,
-    pub tag: String,
+    /// 命中出站 tag（含 inTag 组合，对应 Go `AccessMessage.Detour`）。
+    pub detour: String,
     pub status: Option<AccessStatus>,
     pub reason: String,
 }
 
 impl AccessMessage {
-    /// 序列化为单行字符串（与 Go 版 `String()` 类似格式）。
+    /// 序列化为单行字符串，逐字节对齐 Go `(*AccessMessage).String()`
+    /// （common/log/access.go:32-59）：
+    /// `from {From} {status} {To}[ [{Detour}]][ {Reason}][ email: {Email}]`
     pub fn format(&self) -> String {
         let st = self
             .status
             .map(|s| s.as_str())
             .unwrap_or("unknown");
-        format!(
-            "from {} to {} email={} tag={} status={} reason={}",
-            self.from, self.to, self.email, self.tag, st, self.reason,
-        )
+        let mut s = format!("from {} {} {}", self.from, st, self.to);
+        if !self.detour.is_empty() {
+            s.push_str(&format!(" [{}]", self.detour));
+        }
+        if !self.reason.is_empty() {
+            s.push(' ');
+            s.push_str(&self.reason);
+        }
+        if !self.email.is_empty() {
+            s.push_str(&format!(" email: {}", self.email));
+        }
+        s
+    }
+
+    /// json 序列化（Rust 扩展格式，Go v26.6.1 无 json 日志）。
+    /// 字段名对齐 Go `AccessMessage` 结构体字段小写：from/to/status/reason/email/detour。
+    pub fn to_json(&self) -> String {
+        serde_json::json!({
+            "from": self.from,
+            "to": self.to,
+            "status": self.status.map(|s| s.as_str()).unwrap_or("unknown"),
+            "reason": self.reason,
+            "email": self.email,
+            "detour": self.detour,
+        })
+        .to_string()
     }
 }
 
@@ -67,6 +92,16 @@ impl DnsLog {
     pub fn format(&self) -> String {
         format!("dns query={} domain={} result={}", self.query, self.domain, self.result)
     }
+
+    /// json 序列化（Rust 扩展）。
+    pub fn to_json(&self) -> String {
+        serde_json::json!({
+            "query": self.query,
+            "domain": self.domain,
+            "result": self.result,
+        })
+        .to_string()
+    }
 }
 
 /// 通用日志消息（对应 Go `log.GeneralMessage`）。
@@ -79,6 +114,15 @@ pub struct GeneralMessage {
 impl GeneralMessage {
     pub fn format(&self) -> String {
         format!("[{}] {}", self.severity.as_i32(), self.content)
+    }
+
+    /// json 序列化（Rust 扩展）。severity 用小写名称（对齐 Go Severity_String）。
+    pub fn to_json(&self) -> String {
+        serde_json::json!({
+            "severity": self.severity.as_str(),
+            "content": self.content,
+        })
+        .to_string()
     }
 }
 
@@ -99,7 +143,33 @@ impl LogEntry {
             Self::General(m) => m.format(),
         }
     }
+
+    /// json 序列化（`LogFormat::Json` 时 handler 输出）。
+    pub fn to_json(&self) -> String {
+        match self {
+            Self::Access(m) => m.to_json(),
+            Self::Dns(m) => m.to_json(),
+            Self::General(m) => m.to_json(),
+        }
+    }
+
+    /// 按格式序列化：Console → [`Self::format`]，Json → [`Self::to_json`]。
+    pub fn format_with(&self, fmt: LogFormat) -> String {
+        match fmt {
+            LogFormat::Console => self.format(),
+            LogFormat::Json => self.to_json(),
+        }
+    }
 }
+
+/// HandlerCreator options（对应 Go `HandlerCreatorOptions` + Rust 扩展 format）。
+#[derive(Debug, Clone, Default)]
+pub struct HandlerCreatorOptions {
+    pub path: String,
+    /// 输出格式（json 为 Rust 扩展，Go v26.6.1 无）。
+    pub format: LogFormat,
+}
+
 
 /// LogHandler trait：实际写日志的处理器（file/console/none）。
 ///
@@ -108,11 +178,6 @@ pub trait LogHandler: Send + Sync {
     fn handle(&self, entry: &LogEntry);
 }
 
-/// HandlerCreator options（对应 Go `HandlerCreatorOptions`）。
-#[derive(Debug, Clone, Default)]
-pub struct HandlerCreatorOptions {
-    pub path: String,
-}
 
 /// Handler 工厂函数 trait。
 pub trait HandlerCreator: Send + Sync {
@@ -182,11 +247,14 @@ impl HandlerCreator for NoneHandlerCreator {
     }
 }
 
-/// Console handler：通过 tracing 宏输出日志到 stdout/stderr。
+/// Console handler：通过 tracing 宏输出日志到 stdout。
 ///
-/// 对应 Go `log.ConsoleHandler`。使用项目已有的 tracing 依赖，
-/// 无需额外日志后端。
-pub struct ConsoleHandler;
+/// 对应 Go consoleLogWriter（`common/log/logger.go`）：Go v26.6.1 中
+/// `LogType_Console` creator 一律用 `CreateStdoutLogWriter`（access 与 error
+/// 都写 stdout，`CreateStderrLogWriter` 未被 app/log 使用），此处保持一致不分流。
+pub struct ConsoleHandler {
+    format: LogFormat,
+}
 
 impl LogHandler for ConsoleHandler {
     fn handle(&self, entry: &LogEntry) {
@@ -198,8 +266,12 @@ impl LogHandler for ConsoleHandler {
                 SeverityLevel::Debug => tracing::debug!(target: "xray", "{}", m.content),
                 _ => tracing::info!(target: "xray", "{}", m.content),
             },
-            LogEntry::Access(m) => tracing::info!(target: "xray.access", "{}", m.format()),
-            LogEntry::Dns(m) => tracing::info!(target: "xray.dns", "{}", m.format()),
+            LogEntry::Access(_) => {
+                tracing::info!(target: "xray.access", "{}", entry.format_with(self.format))
+            }
+            LogEntry::Dns(_) => {
+                tracing::info!(target: "xray.dns", "{}", entry.format_with(self.format))
+            }
         }
     }
 }
@@ -211,9 +283,11 @@ impl HandlerCreator for ConsoleHandlerCreator {
     fn create(
         &self,
         _log_type: LogType,
-        _options: &HandlerCreatorOptions,
+        options: &HandlerCreatorOptions,
     ) -> Result<Option<Arc<dyn LogHandler>>, LogError> {
-        Ok(Some(Arc::new(ConsoleHandler)))
+        Ok(Some(Arc::new(ConsoleHandler {
+            format: options.format,
+        })))
     }
 }
 
@@ -224,17 +298,26 @@ impl HandlerCreator for ConsoleHandlerCreator {
 /// ponytail: per-write open — 如果性能不够，改用 RwLock<File> 持有句柄。
 pub struct FileHandler {
     path: String,
+    format: LogFormat,
 }
 
 impl FileHandler {
     pub fn new(path: String) -> Self {
-        Self { path }
+        Self {
+            path,
+            format: LogFormat::Console,
+        }
+    }
+
+    /// 带输出格式构造。
+    pub fn with_format(path: String, format: LogFormat) -> Self {
+        Self { path, format }
     }
 }
 
 impl LogHandler for FileHandler {
     fn handle(&self, entry: &LogEntry) {
-        let line = entry.format();
+        let line = entry.format_with(self.format);
         if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&self.path) {
             let _ = writeln!(f, "{line}");
         }
@@ -255,7 +338,10 @@ impl HandlerCreator for FileHandlerCreator {
                 "file log handler requires a non-empty path".into(),
             ));
         }
-        Ok(Some(Arc::new(FileHandler::new(options.path.clone()))))
+        Ok(Some(Arc::new(FileHandler::with_format(
+            options.path.clone(),
+            options.format,
+        ))))
     }
 }
 
@@ -294,7 +380,7 @@ impl MaskingHandler {
                 from: mask_addresses(&m.from, self.mask4, self.mask6),
                 to: mask_addresses(&m.to, self.mask4, self.mask6),
                 email: m.email.clone(),
-                tag: m.tag.clone(),
+                detour: m.detour.clone(),
                 status: m.status,
                 reason: mask_addresses(&m.reason, self.mask4, self.mask6),
             }),
@@ -379,6 +465,7 @@ impl LogInstance {
 
         let access_opts = HandlerCreatorOptions {
             path: self.config.access_log_path.clone(),
+            format: self.config.format,
         };
         match registry.create(self.config.access_log_type, &access_opts) {
             Ok(h) => g.access_logger = h.map(|h| self.wrap_with_mask(h)),
@@ -391,6 +478,7 @@ impl LogInstance {
 
         let error_opts = HandlerCreatorOptions {
             path: self.config.error_log_path.clone(),
+            format: self.config.format,
         };
         match registry.create(self.config.error_log_type, &error_opts) {
             Ok(h) => g.error_logger = h.map(|h| self.wrap_with_mask(h)),
@@ -532,21 +620,99 @@ mod tests {
         assert_eq!(AccessStatus::Rejected.as_str(), "rejected");
     }
 
+    /// Go `(*AccessMessage).String()` 精确对齐（common/log/access.go:32-59）。
     #[test]
-    fn access_format_contains_key_fields() {
+    fn access_format_matches_go() {
+        // 全字段：from {from} {status} {to} [{detour}] {reason} email: {email}
         let m = AccessMessage {
-            from: "1.1.1.1".into(),
-            to: "2.2.2.2".into(),
+            from: "1.1.1.1:1234".into(),
+            to: "tcp:2.2.2.2:443".into(),
             email: "u@e".into(),
-            tag: "t".into(),
+            detour: "socks-in >> direct".into(),
             status: Some(AccessStatus::Accepted),
             reason: "ok".into(),
         };
-        let s = m.format();
-        assert!(s.contains("1.1.1.1"));
-        assert!(s.contains("2.2.2.2"));
-        assert!(s.contains("u@e"));
-        assert!(s.contains("accepted"));
+        assert_eq!(m.format(), "from 1.1.1.1:1234 accepted tcp:2.2.2.2:443 [socks-in >> direct] ok email: u@e");
+
+        // 空字段逐段省略
+        let m = AccessMessage {
+            from: "1.1.1.1".into(),
+            to: "tcp:2.2.2.2:443".into(),
+            status: Some(AccessStatus::Rejected),
+            ..Default::default()
+        };
+        assert_eq!(m.format(), "from 1.1.1.1 rejected tcp:2.2.2.2:443");
+
+        // detour 无 inTag 时仅出站 tag
+        let m = AccessMessage {
+            from: "1.1.1.1".into(),
+            to: "tcp:2.2.2.2:443".into(),
+            detour: "direct".into(),
+            status: Some(AccessStatus::Accepted),
+            ..Default::default()
+        };
+        assert_eq!(m.format(), "from 1.1.1.1 accepted tcp:2.2.2.2:443 [direct]");
+    }
+
+    /// json 格式（Rust 扩展，字段名对齐 Go AccessMessage 小写）。
+    #[test]
+    fn access_json_contains_go_fields() {
+        let m = AccessMessage {
+            from: "1.1.1.1".into(),
+            to: "tcp:2.2.2.2:443".into(),
+            email: "u@e".into(),
+            detour: "direct".into(),
+            status: Some(AccessStatus::Accepted),
+            reason: String::new(),
+        };
+        let j: serde_json::Value = serde_json::from_str(&m.to_json()).unwrap();
+        assert_eq!(j["from"], "1.1.1.1");
+        assert_eq!(j["to"], "tcp:2.2.2.2:443");
+        assert_eq!(j["status"], "accepted");
+        assert_eq!(j["detour"], "direct");
+        assert_eq!(j["email"], "u@e");
+        assert_eq!(j["reason"], "");
+    }
+
+    #[test]
+    fn entry_format_with_switches_format() {
+        let m = LogEntry::Access(AccessMessage {
+            from: "1.1.1.1".into(),
+            to: "tcp:2.2.2.2:443".into(),
+            detour: "direct".into(),
+            status: Some(AccessStatus::Accepted),
+            ..Default::default()
+        });
+        assert_eq!(
+            m.format_with(LogFormat::Console),
+            "from 1.1.1.1 accepted tcp:2.2.2.2:443 [direct]"
+        );
+        let j: serde_json::Value = serde_json::from_str(&m.format_with(LogFormat::Json)).unwrap();
+        assert_eq!(j["status"], "accepted");
+    }
+
+    /// File handler 按 LogFormat 输出 json 行。
+    #[test]
+    fn file_handler_writes_json_line() {
+        let dir = std::env::temp_dir().join(format!("xray-log-json-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("access.json");
+        let _ = std::fs::remove_file(&path);
+
+        let h = FileHandler::with_format(path.to_string_lossy().into_owned(), LogFormat::Json);
+        h.handle(&LogEntry::Access(AccessMessage {
+            from: "1.1.1.1".into(),
+            to: "tcp:2.2.2.2:443".into(),
+            detour: "direct".into(),
+            status: Some(AccessStatus::Accepted),
+            ..Default::default()
+        }));
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let j: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(j["detour"], "direct");
+        assert_eq!(j["status"], "accepted");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -15,8 +15,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use xray_app_dispatcher::default::{
-    DefaultDispatcher, DispatcherContext, Route as DispRoute, RoutingContext as DispRoutingContext,
-    RoutingRouter, SniffingRequest,
+    AccessContext, DefaultDispatcher, DispatcherContext, Route as DispRoute,
+    RoutingContext as DispRoutingContext, RoutingRouter, SniffingRequest,
 };
 use xray_app_dispatcher::{maybe_wrap_reader, maybe_wrap_writer, DispatchHandler, DispatcherError};
 use xray_proto::xray::common::geodata::CidrRule;
@@ -312,12 +312,42 @@ impl DispatchHandler for InboundDispatchHandler {
         dest: &Destination,
         link: Link,
     ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        // 无 access 上下文 → 不记（等价 Go ctx 无 AccessMessage）
+        self.dispatch_internal(dest, link, None)
+    }
+
+    /// 带 access 上下文（对应 Go ctx 携带 `log.AccessMessage`）：
+    /// 协议层填充 from/email，此处补 inbound_tag 后进 dispatch_link。
+    fn dispatch_with_access(
+        &self,
+        dest: &Destination,
+        link: Link,
+        access: AccessContext,
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        let access = AccessContext {
+            inbound_tag: self.tag.clone(),
+            ..access
+        };
+        self.dispatch_internal(dest, link, Some(access))
+    }
+}
+
+impl InboundDispatchHandler {
+    fn dispatch_internal(
+        &self,
+        dest: &Destination,
+        link: Link,
+        access: Option<AccessContext>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
         let reader = maybe_wrap_reader(self.inbound_counter("downlink"), link.reader);
         let writer = maybe_wrap_writer(self.inbound_counter("uplink"), link.writer);
         let link = Link::new(reader, writer);
-        // dispatch_link 内部 spawn（sniffing → routing → outbound counter → handler），
+        // dispatch_link 内部 spawn（sniffing → routing → access log → outbound counter → handler），
         // 此处仅同步返回。
-        if let Err(e) = self.dispatcher.dispatch_link(dest, link, &self.sniff) {
+        if let Err(e) = self
+            .dispatcher
+            .dispatch_link(dest, link, &self.sniff, access)
+        {
             tracing::warn!(tag = %self.tag, error = %e, "dispatch_link failed");
         }
         Box::pin(std::future::ready(()))

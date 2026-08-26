@@ -36,8 +36,9 @@ pub mod udp_session;
 
 pub use config::{Config, SessionConfig};
 pub use default::{
-    CachedReader, DefaultDispatcher, DialBridge, DispatchHandler, DispatcherContext,
-    OutboundHandlerManager, RoutingContext, RoutingRouter, SimpleOhm,
+    AccessContext, AccessLogEntry, AccessLogSink, CachedReader, DefaultDispatcher, DialBridge,
+    DispatchHandler, DispatcherContext, OutboundHandlerManager, RoutingContext, RoutingRouter,
+    SimpleOhm,
 };
 pub use error::DispatcherError;
 pub use udp_session::UdpDispatchSession;

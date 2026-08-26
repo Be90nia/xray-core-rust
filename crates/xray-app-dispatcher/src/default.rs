@@ -290,6 +290,56 @@ pub trait DispatchHandler: Send + Sync + Debug {
         dest: &xray_common::net::destination::Destination,
         link: xray_transport::link::Link,
     ) -> PinFuture<()>;
+
+    /// 带 access 上下文的 dispatch（对应 Go ctx 携带 `log.AccessMessage`）。
+    ///
+    /// 默认实现丢弃 access 上下文等价 [`Self::dispatch`]——与 Go 一致：
+    /// 协议层未在 ctx 放 AccessMessage 时 dispatcher 不记 access log。
+    /// 由 [`crate::wiring`] 之外的生产入口（InboundDispatchHandler）覆写。
+    fn dispatch_with_access(
+        &self,
+        dest: &xray_common::net::destination::Destination,
+        link: xray_transport::link::Link,
+        access: AccessContext,
+    ) -> PinFuture<()> {
+        let _ = access;
+        self.dispatch(dest, link)
+    }
+}
+
+/// 入站连接的 access 上下文（对应 Go ctx 中的 `log.AccessMessage`，协议层填充）。
+///
+/// `inbound_tag` 由生产入口（InboundDispatchHandler）填充，协议层只需给
+/// `from`（客户端源地址）与 `email`（认证用户，无认证协议留空）。
+#[derive(Debug, Clone, Default)]
+pub struct AccessContext {
+    /// 客户端源地址（如 `1.2.3.4:1080`）。
+    pub from: String,
+    /// 认证用户 email（无认证留空）。
+    pub email: String,
+    /// 入站 tag（由 InboundDispatchHandler 填充）。
+    pub inbound_tag: String,
+}
+
+/// 一次 access 记录（对应 Go `log.AccessMessage` 最终形态）。
+#[derive(Debug, Clone, Default)]
+pub struct AccessLogEntry {
+    pub from: String,
+    pub to: String,
+    /// `"accepted"` / `"rejected"`。
+    pub status: &'static str,
+    pub reason: String,
+    pub email: String,
+    /// 命中出站（含 inTag 组合，规则同 Go default.go:488-502）。
+    pub detour: String,
+}
+
+/// Access 日志记录 sink。
+///
+/// dispatcher crate 不依赖 xray-app-log（保持零新增依赖），由装配层
+/// （xray-core functions.rs）注入 LogInstance 适配实现。
+pub trait AccessLogSink: Send + Sync {
+    fn record_access(&self, entry: &AccessLogEntry);
 }
 
 /// 出站处理器管理器（对应 Go `outbound.Manager`）
@@ -550,6 +600,10 @@ pub struct DefaultDispatcher {
     /// 对应 Go `Handler.udp443`（`senderSettings.MultiplexSettings.XudpProxyUDP443`，
     /// 仅 mux enabled 时构建）。tag 无条目 = mux 未启用，不做 UDP443 检查。
     pub udp443_policies: HashMap<String, Udp443Policy>,
+    /// Access 日志 sink（对应 Go dispatcher `log.Record(accessMessage)`，bd 4uu）。
+    ///
+    /// None = 不记 access log（等价 Go ctx 无 AccessMessage → 不 Record）。
+    pub access_sink: Option<Arc<dyn AccessLogSink>>,
 }
 
 impl Debug for DefaultDispatcher {
@@ -583,6 +637,7 @@ impl DefaultDispatcher {
             fdns: None,
             policy_manager: None,
             udp443_policies: HashMap::new(),
+            access_sink: None,
         }
     }
 
@@ -681,7 +736,7 @@ impl DefaultDispatcher {
         let inbound = xray_transport::link::Link::new(inbound_reader, inbound_writer);
         let outbound = xray_transport::link::Link::new(outbound_reader, outbound_writer);
         // 启动 outbound handler；dispatch_link 内部 spawn handler.dispatch(outbound)
-        self.dispatch_link(destination, outbound, sniffing_request)?;
+        self.dispatch_link(destination, outbound, sniffing_request, None)?;
         Ok(inbound)
     }
 
@@ -693,12 +748,17 @@ impl DefaultDispatcher {
     /// 1. 若 sniffing 启用：用 CachedReader 包装 outbound reader，读首包 → sniff → 可能覆盖 dest
     /// 2. 若有 router：用 RoutingContext 调 router.pick_route() 选出站 handler
     /// 3. 无 router 或路由失败：用默认 handler
-    /// 4. spawn handler.dispatch(link)
+    /// 4. 记 access log（Accepted，含 detour 组合；对应 Go default.go:488-502）
+    /// 5. spawn handler.dispatch(link)
+    ///
+    /// `access` 为 None 时不记（等价 Go ctx 无 AccessMessage）。
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch_link(
         &self,
         destination: &xray_common::net::destination::Destination,
         outbound: xray_transport::link::Link,
         sniffing_request: &SniffingRequest,
+        access: Option<AccessContext>,
     ) -> Result<(), DispatcherError> {
         let ohm = self.ohm.as_ref().ok_or_else(|| {
             DispatcherError::Other("no outbound handler manager registered".into())
@@ -707,6 +767,17 @@ impl DefaultDispatcher {
         // 预检查：如果没有 router 也没有 default handler，直接报错
         // （sniffing 后路由可能找到非 default handler，但无 router 无 default = 必定失败）
         if self.router.is_none() && ohm.get_default_handler().is_none() {
+            // 无路由可用 → Rejected（Go 仅 errors log；rejected 记录为 assignment 要求的扩展）
+            if let (Some(sink), Some(ctx)) = (&self.access_sink, access) {
+                sink.record_access(&AccessLogEntry {
+                    from: ctx.from,
+                    to: destination.to_string(),
+                    status: "rejected",
+                    reason: "no outbound handler available".into(),
+                    email: ctx.email,
+                    detour: ctx.inbound_tag,
+                });
+            }
             return Err(DispatcherError::HandlerNotFound("default".into()));
         }
 
@@ -718,6 +789,7 @@ impl DefaultDispatcher {
         let stats = self.stats.clone();
         let udp443_policies = self.udp443_policies.clone();
         let ohm = Arc::clone(ohm);
+        let access_sink = self.access_sink.clone();
         let policy = self
             .policy_manager
             .as_ref()
@@ -726,7 +798,6 @@ impl DefaultDispatcher {
 
         let outbound_reader = outbound.reader;
         let outbound_writer = outbound.writer;
-
         let fut = async move {
             // ---- Phase 1: Sniffing ----
             let mut cr = CachedReader::with_inner(outbound_reader);
@@ -743,30 +814,68 @@ impl DefaultDispatcher {
             } else {
                 (dest.clone(), None)
             };
-
             // ---- Phase 2: Routing（resolved：domainStrategy DNS 解析路径） ----
             // pick_route_resolved 默认退化为同步 pick_route；RouterAdapter 生产实现
             // 委托 xray_app_router::Router::pick_route_resolved（携带完整 RoutingContext）。
-            let handler = if let Some(r) = &router {
+            let (handler, routed_pick) = if let Some(r) = &router {
                 let ctx = build_routing_context(&final_dest, sniffed_protocol.as_deref());
                 match r.pick_route_resolved(&ctx).await {
                     Ok(route) => {
-                        ohm.get_handler(&route.outbound_tag).or_else(|| {
+                        let picked = ohm.get_handler(&route.outbound_tag);
+                        if picked.is_some() {
+                            (picked, true)
+                        } else {
                             tracing::warn!(tag = %route.outbound_tag, "routed handler not found, falling back to default");
-                            ohm.get_default_handler()
-                        })
+                            (ohm.get_default_handler(), false)
+                        }
                     }
-                    Err(_) => ohm.get_default_handler(),
+                    Err(_) => (ohm.get_default_handler(), false),
                 }
             } else {
-                ohm.get_default_handler()
+                (ohm.get_default_handler(), false)
             };
 
             let Some(handler) = handler else {
+                // 无可用出站 → Rejected（Go 此处仅 errors log 后 return，bd 4uu 扩展记录）
+                if let Some(sink) = &access_sink {
+                    if let Some(ctx) = &access {
+                        sink.record_access(&AccessLogEntry {
+                            from: ctx.from.clone(),
+                            to: final_dest.to_string(),
+                            status: "rejected",
+                            reason: "no outbound handler available".into(),
+                            email: ctx.email.clone(),
+                            detour: ctx.inbound_tag.clone(),
+                        });
+                    }
+                }
                 tracing::error!("no outbound handler available");
                 return;
             };
 
+            // ---- Access log（对应 Go default.go:488-502 routedDispatch 记录点） ----
+            // Go: Record 发生在 handler.Dispatch 之前，detour 组合规则：
+            //   inTag 空 → tag；isPickRoute=2（路由命中）→ "in -> tag"；其余 → "in >> tag"。
+            if let (Some(sink), Some(ctx)) = (&access_sink, &access) {
+                let out_tag_early = handler.tag();
+                let detour = if out_tag_early.is_empty() {
+                    String::new()
+                } else if ctx.inbound_tag.is_empty() {
+                    out_tag_early.to_string()
+                } else if routed_pick {
+                    format!("{} -> {}", ctx.inbound_tag, out_tag_early)
+                } else {
+                    format!("{} >> {}", ctx.inbound_tag, out_tag_early)
+                };
+                sink.record_access(&AccessLogEntry {
+                    from: ctx.from.clone(),
+                    to: final_dest.to_string(),
+                    status: "accepted",
+                    reason: String::new(),
+                    email: ctx.email.clone(),
+                    detour,
+                });
+            }
             // outbound counter（对应 Go routedDispatch 的 getStatCounter，按命中 tag 懒注册）：
             // uplink = outbound 读上行（reader），downlink = outbound 写下行（writer）
             let out_tag = handler.tag().to_string();
@@ -1202,6 +1311,7 @@ mod tests {
     use super::*;
     use crate::sniffer::SniffResult;
     use xray_common::net::network::Network;
+    use xray_common::net::address::Address;
 
     /// 测试用 SniffResult
     #[derive(Debug)]
@@ -1662,7 +1772,7 @@ mod tests {
             Port::new(443),
             Network::TCP,
         );
-        d.dispatch_link(&dest, outbound, &SniffingRequest::default())
+        d.dispatch_link(&dest, outbound, &SniffingRequest::default(), None)
             .expect("dispatch_link should spawn");
 
         // 写上行
@@ -1997,5 +2107,177 @@ mod tests {
         .expect("read ok");
         assert_eq!(resp.to_vec(), b"quic");
         assert_eq!(called.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // ========== access log（bd 4uu，对应 Go default.go:488-502） ==========
+
+    /// 捕获 AccessLogEntry 的 sink。
+    #[derive(Debug, Clone)]
+    struct CapturingSink(std::sync::Arc<parking_lot::Mutex<Vec<AccessLogEntry>>>);
+
+    impl AccessLogSink for CapturingSink {
+        fn record_access(&self, entry: &AccessLogEntry) {
+            self.0.lock().push(entry.clone());
+        }
+    }
+
+    /// dispatch 完成即发信号的 handler（让记录断言确定性）。
+    #[derive(Debug)]
+    struct SignalingHandler {
+        tag: String,
+        signal: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl DispatchHandler for SignalingHandler {
+        fn tag(&self) -> &str {
+            &self.tag
+        }
+        fn dispatch(
+            &self,
+            _dest: &Destination,
+            _link: xray_transport::link::Link,
+        ) -> PinFuture<()> {
+            self.signal
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    fn access_dest() -> Destination {
+        Destination::new(
+            Address::from_ipv4_bytes([127, 0, 0, 1]),
+            Port::new(8080),
+            Network::TCP,
+        )
+    }
+
+    #[tokio::test]
+    async fn dispatch_link_records_accepted_access_with_detour() {
+        use xray_buf::pipe;
+
+        let sink = CapturingSink(Default::default());
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let ohm = SimpleOhm::new();
+        ohm.set_default(std::sync::Arc::new(SignalingHandler {
+            tag: "direct".into(),
+            signal: called.clone(),
+        }));
+
+        let mut d = DefaultDispatcher::new();
+        d.init(
+            &crate::Config::default(),
+            std::sync::Arc::new(ohm),
+            None,
+            xray_features::policy::Policy::default(),
+            None,
+        );
+        d.access_sink = Some(std::sync::Arc::new(sink.clone()));
+
+        let (_r, _w) = pipe::new();
+        let link = xray_transport::link::Link::new(
+            Box::new(_r) as Box<dyn xray_buf::io::Reader>,
+            Box::new(_w) as Box<dyn xray_buf::io::Writer>,
+        );
+        let access = AccessContext {
+            from: "1.2.3.4:1080".into(),
+            email: "u@x.com".into(),
+            inbound_tag: "socks-in".into(),
+        };
+        d.dispatch_link(&access_dest(), link, &SniffingRequest::default(), Some(access))
+            .expect("dispatch_link ok");
+
+        // 等 handler 被调（record 严格发生在 handler.dispatch 之前）
+        for _ in 0..100 {
+            if called.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(called.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let entries = sink.0.lock().clone();
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.status, "accepted");
+        assert_eq!(e.from, "1.2.3.4:1080");
+        assert_eq!(e.to, "tcp:127.0.0.1:8080");
+        assert_eq!(e.email, "u@x.com");
+        // 无 router → 默认出站组合 "in >> tag"（Go default.go:498）
+        assert_eq!(e.detour, "socks-in >> direct");
+    }
+
+    #[tokio::test]
+    async fn dispatch_link_without_access_ctx_records_nothing() {
+        use xray_buf::pipe;
+
+        let sink = CapturingSink(Default::default());
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let ohm = SimpleOhm::new();
+        ohm.set_default(std::sync::Arc::new(SignalingHandler {
+            tag: "direct".into(),
+            signal: called.clone(),
+        }));
+
+        let mut d = DefaultDispatcher::new();
+        d.init(
+            &crate::Config::default(),
+            std::sync::Arc::new(ohm),
+            None,
+            xray_features::policy::Policy::default(),
+            None,
+        );
+        d.access_sink = Some(std::sync::Arc::new(sink.clone()));
+
+        let (_r, _w) = pipe::new();
+        let link = xray_transport::link::Link::new(
+            Box::new(_r) as Box<dyn xray_buf::io::Reader>,
+            Box::new(_w) as Box<dyn xray_buf::io::Writer>,
+        );
+        d.dispatch_link(&access_dest(), link, &SniffingRequest::default(), None)
+            .expect("dispatch_link ok");
+
+        for _ in 0..100 {
+            if called.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Go 语义：ctx 无 AccessMessage → 不 Record
+        assert!(sink.0.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_link_records_rejected_when_no_handler() {
+        let sink = CapturingSink(Default::default());
+        let mut d = DefaultDispatcher::new();
+        // 空 ohm：无 router 无 default → 同步 Err + Rejected 记录
+        d.init(
+            &crate::Config::default(),
+            std::sync::Arc::new(SimpleOhm::new()),
+            None,
+            xray_features::policy::Policy::default(),
+            None,
+        );
+        d.access_sink = Some(std::sync::Arc::new(sink.clone()));
+
+        let link = xray_transport::link::Link::new(
+            Box::new(xray_buf::pipe::new().0) as Box<dyn xray_buf::io::Reader>,
+            Box::new(xray_buf::pipe::new().1) as Box<dyn xray_buf::io::Writer>,
+        );
+        let access = AccessContext {
+            from: "1.2.3.4:1080".into(),
+            email: String::new(),
+            inbound_tag: "socks-in".into(),
+        };
+        let res = d.dispatch_link(&access_dest(), link, &SniffingRequest::default(), Some(access));
+        assert!(res.is_err(), "no handler should be a sync error");
+
+        let entries = sink.0.lock().clone();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, "rejected");
+        assert_eq!(entries[0].reason, "no outbound handler available");
+        assert_eq!(entries[0].to, "tcp:127.0.0.1:8080");
     }
 }

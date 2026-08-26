@@ -5687,6 +5687,7 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "regex",
+ "serde_json",
  "thiserror 2.0.18",
  "tracing",
  "xray-common",
