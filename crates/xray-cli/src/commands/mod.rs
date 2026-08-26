@@ -5,8 +5,10 @@
 pub mod api_args;
 pub mod api_client;
 pub mod api_exec;
+pub mod keys;
 pub mod tool;
 
 pub use api_args::*;
 pub use api_exec::*;
+pub use keys::*;
 pub use tool::*;

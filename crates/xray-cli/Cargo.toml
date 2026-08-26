@@ -21,6 +21,14 @@ uuid = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+base64 = "0.22"
+blake3 = "1"
+rand = { workspace = true }
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+# PQ 密钥生成（bd a1h）：ml-kem 与 xray-proxy-vless 对齐；ml-dsa 无 workspace 现成实现，
+# 预授权引入 RustCrypto 官方 crate
+ml-kem = "0.3"
+ml-dsa = { version = "0.1", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 tempfile = "3"

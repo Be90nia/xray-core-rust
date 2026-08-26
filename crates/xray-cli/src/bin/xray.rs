@@ -15,11 +15,13 @@
 //! - `xray api <sub>` — API 命令（22 个子命令）
 //! - `xray tls <sub>` — TLS 工具
 //! - `xray convert <sub>` — 格式转换
+//! - `xray x25519`（别名 curve25519）/ `wg` / `mldsa65` / `mlkem768` / `vlessenc` — 密钥生成
 
 use clap::{Parser, Subcommand};
 
 use xray_cli::commands::api_args::*;
 use xray_cli::commands::api_exec;
+use xray_cli::commands::keys;
 use xray_cli::commands::tool::{self, ConvertCommand, TlsCommand};
 use xray_cli::error::CliError;
 use xray_cli::run::{self, RunArgs};
@@ -145,6 +147,22 @@ enum Command {
     /// Generate UUID.
     Uuid(tool::UuidArgs),
 
+    /// Generate key pair for X25519 key exchange (REALITY, VLESS Encryption).
+    #[command(visible_alias = "curve25519")]
+    X25519(keys::X25519Args),
+
+    /// Generate key pair for X25519 key exchange (WireGuard).
+    Wg(keys::WgArgs),
+
+    /// Generate key pair for ML-DSA-65 post-quantum signature (REALITY).
+    Mldsa65(keys::Mldsa65Args),
+
+    /// Generate key pair for ML-KEM-768 post-quantum key exchange (VLESS Encryption).
+    Mlkem768(keys::Mlkem768Args),
+
+    /// Generate decryption/encryption json pair (VLESS Encryption).
+    Vlessenc,
+
     /// API commands to interact with a running Xray instance.
     Api {
         #[command(subcommand)]
@@ -216,6 +234,11 @@ async fn execute(command: Command) -> Result<(), CliError> {
             Ok(())
         }
         Command::Uuid(args) => tool::execute_uuid(&args),
+        Command::X25519(args) => keys::execute_x25519(&args),
+        Command::Wg(args) => keys::execute_wg(&args),
+        Command::Mldsa65(args) => keys::execute_mldsa65(&args),
+        Command::Mlkem768(args) => keys::execute_mlkem768(&args),
+        Command::Vlessenc => keys::execute_vlessenc(),
         Command::Api { command } => execute_api(&command).await,
         Command::Tls { command } => tool::execute_tls(&command),
         Command::Convert { command } => tool::execute_convert(&command),
