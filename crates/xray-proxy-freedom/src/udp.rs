@@ -38,11 +38,20 @@ const GLOBAL_ID_LEN: usize = 8;
 /// UDP recv 缓冲区大小（单包最大 65535 字节）。
 const RECV_BUF_SIZE: usize = 65535;
 
-/// Freedom UDP relay 主入口。
+/// Freedom UDP relay 主入口（无 noises）。
+pub async fn relay(dest: &Destination, link: Link) -> io::Result<()> {
+    relay_with_noises(dest, link, &[]).await
+}
+
+/// Freedom UDP relay 主入口（首包前注入 noises，对齐 Go `NoisePacketWriter`）。
 ///
 /// 解析目标地址 → 绑定 UDP socket → 双向并发转发 XUDP 帧与 UDP 数据报。
 /// 任一方向结束（EOF / 错误）时整体返回。
-pub async fn relay(dest: &Destination, link: Link) -> io::Result<()> {
+pub async fn relay_with_noises(
+    dest: &Destination,
+    link: Link,
+    noises: &[crate::config::Noise],
+) -> io::Result<()> {
     let Link { mut reader, mut writer } = link;
 
     // 1. 解析目标地址（Domain → IP）
@@ -66,7 +75,9 @@ pub async fn relay(dest: &Destination, link: Link) -> io::Result<()> {
     });
 
     // 5. 请求 pump: link.reader → XUDP 帧 → socket.send_to
-    let req_result = pump_request(&sock, default_target, &mut reader).await;
+    //    noises 在首个真实数据报前注入（对齐 Go NoisePacketWriter 首写触发）
+    let mut noises = if noises.is_empty() { None } else { Some(noises.to_vec()) };
+    let req_result = pump_request(&sock, default_target, &mut reader, &mut noises).await;
 
     // 请求方向结束（link EOF），等待响应方向也结束
     let _ = resp_task.await;
@@ -100,13 +111,14 @@ async fn pump_request(
     sock: &UdpSocket,
     default_target: SocketAddr,
     reader: &mut Box<dyn Reader>,
+    noises: &mut Option<Vec<crate::config::Noise>>,
 ) -> io::Result<()> {
     let mut accum: Vec<u8> = Vec::new();
     loop {
         // 尽量从 accum 解析完整帧
         let mut made_progress = true;
         while made_progress {
-            made_progress = parse_and_send(sock, &mut accum, default_target).await?;
+            made_progress = parse_and_send(sock, &mut accum, default_target, noises).await?;
         }
         // 读更多字节
         match reader.read_multi_buffer().await {
@@ -127,6 +139,7 @@ async fn parse_and_send(
     sock: &UdpSocket,
     accum: &mut Vec<u8>,
     default_target: SocketAddr,
+    noises: &mut Option<Vec<crate::config::Noise>>,
 ) -> io::Result<bool> {
     if accum.is_empty() {
         return Ok(false);
@@ -149,6 +162,11 @@ async fn parse_and_send(
                 .as_ref()
                 .and_then(dest_to_socket_addr)
                 .unwrap_or(default_target);
+            // 首个真实数据报前发送 noises（对齐 Go NoisePacketWriter.WriteMultiBuffer：
+            // 噪声包发往同一目标，applyTo 按目标 IP 族过滤，写后按 delay 睡眠）
+            if let Some(ns) = noises.take() {
+                send_noises(sock, target, &ns).await?;
+            }
             sock.send_to(&data, target).await?;
             Ok(true)
         }
@@ -156,6 +174,39 @@ async fn parse_and_send(
         Err(PacketError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
         Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
     }
+}
+
+/// 依次发送 noise 包到 `target`（对应 Go `NoisePacketWriter` 噪声循环 :691-724）。
+async fn send_noises(
+    sock: &UdpSocket,
+    target: SocketAddr,
+    noises: &[crate::config::Noise],
+) -> io::Result<()> {
+    use rand::RngCore;
+    for n in noises {
+        let is_v4 = target.is_ipv4();
+        match n.apply_to.as_str() {
+            "ipv4" if !is_v4 => continue,
+            "ipv6" if is_v4 => continue,
+            _ => {}
+        }
+        // 用户指定 packet 或随机长度噪声（[length_min, length_max) 半开，对齐 Go RandBetween）
+        let packet: Vec<u8> = if !n.packet.is_empty() {
+            n.packet.clone()
+        } else {
+            let mut buf = vec![0u8; crate::fragment::rand_between(n.length_min, n.length_max) as usize];
+            rand::rng().fill_bytes(&mut buf);
+            buf
+        };
+        sock.send_to(&packet, target).await?;
+        if n.delay_min != 0 || n.delay_max != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                crate::fragment::rand_between(n.delay_min, n.delay_max),
+            ))
+            .await;
+        }
+    }
+    Ok(())
 }
 
 /// 响应方向：socket.recv_from → XUDP 帧 → link.writer。

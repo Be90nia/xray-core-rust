@@ -6083,6 +6083,7 @@ name = "xray-proxy-freedom"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "parking_lot",
  "rand 0.9.4",
  "thiserror 2.0.18",
  "tokio",

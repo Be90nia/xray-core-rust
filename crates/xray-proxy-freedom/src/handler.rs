@@ -24,9 +24,10 @@ use xray_transport::sockopt::SocketOptions;
 use xray_transport::system_dialer::dial_system;
 
 use crate::config::{
-    Config, DomainStrategy, Fragment, FinalRule, DefaultRuleType, RuleAction,
+    Config, DomainStrategy, FinalRule, DefaultRuleType, RuleAction,
     get_default_rule_type,
 };
+use crate::fragment::FragmentConnection;
 
 /// Freedom 出站 Handler。
 ///
@@ -84,10 +85,14 @@ impl FreedomHandler {
             ))?;
 
         let filtered: Vec<_> = lookup_result
-            .filter(|addr| match strategy {
-                DomainStrategy::UseIPv4 | DomainStrategy::UseIPv4v6 => addr.is_ipv4(),
-                DomainStrategy::UseIPv6 | DomainStrategy::UseIPv6v4 => addr.is_ipv6(),
-                DomainStrategy::UseIP | DomainStrategy::AsIs => true,
+            .filter(|addr| {
+                if strategy.prefer_ipv4() && !strategy.has_fallback() {
+                    addr.is_ipv4()
+                } else if strategy.prefer_ipv6() && !strategy.has_fallback() {
+                    addr.is_ipv6()
+                } else {
+                    true
+                }
             })
             .collect();
 
@@ -97,11 +102,11 @@ impl FreedomHandler {
             ));
         }
 
-        // UseIPv4v6: prefer IPv4, fallback IPv6
-        // UseIPv6v4: prefer IPv6, fallback IPv4
+        // 46: prefer IPv4，fallback IPv6；64: prefer IPv6，fallback IPv4
+        // （Go LookupForIP 的 Resolve fallback——v4/v6 任一家族空时用另一族结果）
         let selected = match strategy {
-            DomainStrategy::UseIPv4v6 => filtered.iter().find(|a| a.is_ipv4()).or_else(|| filtered.first()),
-            DomainStrategy::UseIPv6v4 => filtered.iter().find(|a| a.is_ipv6()).or_else(|| filtered.first()),
+            s if s.prefer_ipv4() => filtered.iter().find(|a| a.is_ipv4()).or_else(|| filtered.first()),
+            s if s.prefer_ipv6() => filtered.iter().find(|a| a.is_ipv6()).or_else(|| filtered.first()),
             _ => filtered.first(),
         };
 
@@ -333,87 +338,20 @@ impl ProxyOutbound for FreedomHandler {
                 );
             }
         }
-        if !self.config.noises.is_empty() {
-            use tokio::io::AsyncWriteExt;
-            for noise in &self.config.noises {
-                let size = if noise.length_max > noise.length_min {
-                    rand::random_range(noise.length_min..=noise.length_max)
-                } else {
-                    noise.length_min
-                } as usize;
-                if size > 0 {
-                    let buf = vec![0u8; size];
-                    let _ = conn.as_mut().write_all(&buf).await;
-                }
-                if noise.delay_max > 0 {
-                    let delay = if noise.delay_max > noise.delay_min {
-                        rand::random_range(noise.delay_min..=noise.delay_max)
-                    } else {
-                        noise.delay_min
-                    };
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                }
-            }
-        }
+        // Fragment 配置存在时 dial 后包 writer（对齐 Go :410-418 FragmentWriter）；
+        // noises 是 UDP 路径特性（Go NoisePacketWriter 只包 UDP PacketWriter），
+        // TCP 路径不注入。
+        let conn: Box<dyn xray_transport::connection::Connection> = match &self.config.fragment {
+            Some(fragment) => Box::new(FragmentConnection::new(conn, fragment.clone())),
+            None => conn,
+        };
 
-        // Fragment: 首个 upstream chunk 分片写入（绕过 SNI 审查）。
-        if let Some(fragment) = &self.config.fragment {
-            self.bridge_with_fragment(link, conn, fragment).await
-                .map_err(|e| ProxymanError::OutboundProcessFailed(format!("fragment bridge failed: {e}")))
-        } else {
-            bridge_link_with_stream_full(link, conn).await
-                .map_err(|e| ProxymanError::OutboundProcessFailed(format!("bridge failed: {e}")))
-        }
+        bridge_link_with_stream_full(link, conn)
+            .await
+            .map_err(|e| ProxymanError::OutboundProcessFailed(format!("bridge failed: {e}")))
     }
 }
 
-impl FreedomHandler {
-    /// 分片桥接：首个 upstream chunk 按 fragment 配置分片写入，后续正常桥接。
-    async fn bridge_with_fragment(
-        &self,
-        link: Link,
-        mut conn: Box<dyn xray_transport::connection::Connection>,
-        fragment: &Fragment,
-    ) -> std::io::Result<()> {
-        use tokio::io::AsyncWriteExt;
-        use xray_buf::multi::MultiBuffer;
-
-        let Link { reader, writer } = link;
-        let mut reader = reader;
-
-        // 1. 读取首个 upstream chunk，分片写入 conn。
-        let mb = reader.read_multi_buffer().await.ok();
-        if let Some(mb) = &mb {
-            let data = mb.to_vec();
-            if !data.is_empty() {
-                let mut offset = 0usize;
-                while offset < data.len() {
-                    let frag_size = if fragment.length_max > fragment.length_min {
-                        rand::random_range(fragment.length_min..=fragment.length_max)
-                    } else {
-                        fragment.length_min
-                    } as usize;
-                    let end = (offset + frag_size.max(1)).min(data.len());
-                    conn.as_mut().write_all(&data[offset..end]).await?;
-                    conn.as_mut().flush().await?;
-                    if fragment.interval_max > 0 {
-                        let gap = if fragment.interval_max > fragment.interval_min {
-                            rand::random_range(fragment.interval_min..=fragment.interval_max)
-                        } else {
-                            fragment.interval_min
-                        };
-                        tokio::time::sleep(std::time::Duration::from_micros(gap)).await;
-                    }
-                    offset = end;
-                }
-            }
-        }
-
-        // 2. 后续数据用正常桥接。
-        let link = Link { reader, writer };
-        bridge_link_with_stream_full(link, conn).await
-    }
-}
 
 #[cfg(test)]
 mod tests {

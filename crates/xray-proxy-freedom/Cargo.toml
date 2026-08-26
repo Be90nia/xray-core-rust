@@ -22,4 +22,5 @@ xray-geodata = { path = "../xray-geodata" }
 tracing = { workspace = true }
 
 [dev-dependencies]
+parking_lot = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }

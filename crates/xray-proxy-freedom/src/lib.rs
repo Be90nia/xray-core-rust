@@ -11,9 +11,10 @@
 pub mod config;
 pub mod dispatcher;
 pub mod error;
+pub mod fragment;
 pub mod handler;
-pub mod udp;
 pub mod inbound;
+pub mod udp;
 
 pub use config::{
     Config, DestinationOverride, DomainStrategy, FinalRule, FinalRuleConfig, Fragment, Noise, Range,

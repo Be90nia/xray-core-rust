@@ -27,21 +27,29 @@ pub fn make_dial_fn() -> DialFn {
 
 /// 构造 Freedom 的 DialFn 闭包（携带解析后的 [`Config`]）。
 ///
-/// 当前 dial 路径仅消费 SocketOptions 默认值；domainStrategy/fragment/noises
-/// 已解析并存入 Config，待 DNS 解析 + fragment/noise 拨号路径接入后使用。
-/// ponytail: domain_strategy/fragment/noises 当前解析即存储，dial 未消费。
+/// 当前 dial 路径消费 SocketOptions 默认值与 `fragment`（TCP 分片包装，
+/// 对齐 Go :410-418）；domainStrategy 解析已存入 Config，DNS 策略拨号路径
+/// 未消费。noises 由 [`FreedomDispatchBridge::with_noises`] 接入 UDP 路径。
+/// ponytail: domain_strategy 当前解析即存储，dial 未消费。
 ///
 /// # Panics
 ///
 /// 不会 panic；错误以 `Err(String)` 返回。
-pub fn make_dial_fn_with_config(_config: Config) -> DialFn {
+pub fn make_dial_fn_with_config(config: Config) -> DialFn {
+    let fragment = config.fragment;
     Arc::new(move |dest: &Destination| {
         let dest = dest.clone();
+        let fragment = fragment.clone();
         Box::pin(async move {
             let sockopt = SocketOptions::default();
             let conn: Box<dyn Connection> = dial_system(&dest, &sockopt)
                 .await
                 .map_err(|e| format!("freedom dial: {e}"))?;
+            // fragment 配置存在时 dial 后包 writer（对齐 Go :410-418）
+            let conn: Box<dyn Connection> = match fragment {
+                Some(f) => Box::new(crate::fragment::FragmentConnection::new(conn, f)),
+                None => conn,
+            };
             Ok(conn)
         })
     })
@@ -58,13 +66,16 @@ use xray_transport::link::Link;
 /// Freedom dispatch handler——在 TCP DialBridge 之上增加 UDP relay。
 ///
 /// 对应 Go `proxy/freedom/freedom.go::Handler`：TCP 走 `dial_system` 流桥接
-/// （委托内部 [`DialBridge`]），UDP 走 [`crate::udp::relay`]（XUDP 帧 ↔ 原始数据报）。
+/// （委托内部 [`DialBridge`]，fragment 配置经 [`make_dial_fn_with_config`]
+/// 包装 writer）；UDP 走 [`crate::udp::relay_with_noises`]（XUDP 帧 ↔ 原始
+/// 数据报，noises 首包前注入，对齐 Go `NoisePacketWriter`）。
 ///
 /// **代理链**：仅 TCP 支持代理链（通过内部 DialBridge）；UDP 直连目标，
 /// 不支持代理链（与 Go freedom 一致——freedom 是直连出口）。
 pub struct FreedomDispatchBridge {
     tag: String,
     tcp: Arc<DialBridge>,
+    noises: Vec<crate::config::Noise>,
 }
 
 impl FreedomDispatchBridge {
@@ -72,7 +83,14 @@ impl FreedomDispatchBridge {
     #[must_use]
     pub fn from_bridge(dial_bridge: Arc<DialBridge>) -> Self {
         let tag = dial_bridge.tag().to_string();
-        Self { tag, tcp: dial_bridge }
+        Self { tag, tcp: dial_bridge, noises: Vec::new() }
+    }
+
+    /// 设置 UDP 路径首包前注入的 noises（对齐 Go `NoisePacketWriter` 写入时机）。
+    #[must_use]
+    pub fn with_noises(mut self, noises: Vec<crate::config::Noise>) -> Self {
+        self.noises = noises;
+        self
     }
 }
 
@@ -93,13 +111,14 @@ impl DispatchHandler for FreedomDispatchBridge {
         if dest.network() == Network::UDP {
             let tag = self.tag.clone();
             let dest = dest.clone();
+            let noises = self.noises.clone();
             Box::pin(async move {
-                if let Err(e) = crate::udp::relay(&dest, link).await {
+                if let Err(e) = crate::udp::relay_with_noises(&dest, link, &noises).await {
                     tracing::warn!(tag = %tag, "freedom udp relay ended: {e}");
                 }
             })
         } else {
-            // TCP：委托内部 DialBridge（保留代理链 / fragment / noise 等既有行为）
+            // TCP：委托内部 DialBridge（fragment 经 DialFn 包装，代理链在 bridge 内）
             self.tcp.dispatch(dest, link)
         }
     }
@@ -238,5 +257,103 @@ mod tests {
         assert_eq!(pkt.data(), b"udp-direct");
         w.shutdown();
         echo_task.abort();
+    }
+
+    /// bd v2q：fragment 配置经 make_dial_fn_with_config → DialBridge TCP 路径端到端。
+    /// tlshello 模式：客户端发一条 TLS record，服务端字节级解析应看到多条重组
+    /// record（分片发生在 wire 上，与 TCP 分段无关），payload 重组 == 原文，
+    /// 且回程（读路径透传）不受分片影响。
+    #[tokio::test]
+    async fn dispatcher_tcp_fragment_tlshello_e2e() {
+        use crate::config::Fragment;
+
+        // echo server：全量回显并保留收到的原始字节
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut all = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        all.extend_from_slice(&buf[..n]);
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            all
+        });
+
+        let config = Config {
+            fragment: Some(Fragment {
+                packets_from: 0,
+                packets_to: 1,
+                length_min: 4,
+                length_max: 4,
+                interval_min: 0,
+                interval_max: 0,
+                max_split_min: 0,
+                max_split_max: 0,
+            }),
+            ..Config::default()
+        };
+        let ohm = SimpleOhm::new();
+        ohm.set_default(Arc::new(DialBridge::new(
+            "freedom-frag",
+            make_dial_fn_with_config(config),
+        )));
+        let mut dispatcher = DefaultDispatcher::new();
+        dispatcher.ohm = Some(Arc::new(ohm));
+
+        let dest = Destination::new(
+            Address::from_ipv4_bytes([127, 0, 0, 1]),
+            Port::new(addr.port()),
+            Network::TCP,
+        );
+        let inbound = dispatcher
+            .dispatch(&dest, &SniffingRequest::default(), None, None)
+            .expect("dispatch returns inbound Link");
+        let mut w = inbound.writer;
+        let mut r = inbound.reader;
+
+        // 一条完整 TLS handshake record：type=22 + version 3,1 + len=12 + payload
+        let payload: Vec<u8> = (0..12u8).collect();
+        let mut record = vec![22u8, 3, 1, 0, payload.len() as u8];
+        record.extend_from_slice(&payload);
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(&record);
+        w.write_multi_buffer(mb).await.unwrap();
+
+        // 回程透传：echo 回来的字节 == 服务端收到的字节
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            r.read_multi_buffer(),
+        )
+        .await
+        .expect("timeout")
+        .expect("read ok");
+
+        w.shutdown();
+        let received = server.await.unwrap();
+        assert_eq!(resp.to_vec(), received, "down path transparent to fragmentation");
+
+        // 字节级解析：单条 record 被重组为多条小 record
+        let mut records = Vec::new();
+        let mut i = 0;
+        while i + 5 <= received.len() {
+            let l = ((received[i + 3] as usize) << 8) | received[i + 4] as usize;
+            assert!(i + 5 + l <= received.len(), "truncated record at {i}");
+            records.push((received[i], received[i + 5..i + 5 + l].to_vec()));
+            i += 5 + l;
+        }
+        assert_eq!(i, received.len(), "no trailing garbage");
+        assert!(records.len() >= 3, "fragmented on the wire: {} records", records.len());
+        assert!(records.iter().all(|(t, _)| *t == 22), "record type preserved");
+        let data: Vec<u8> = records.iter().flat_map(|(_, p)| p.clone()).collect();
+        assert_eq!(data, payload, "reassembled handshake == original");
     }
 }

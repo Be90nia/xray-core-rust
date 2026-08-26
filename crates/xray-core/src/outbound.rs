@@ -264,12 +264,15 @@ fn try_build_handler(
     match ob.entry.kind.as_str() {
         "freedom" => {
             let config = parse_freedom_config(&ob.entry.data);
+            let noises = config.noises.clone();
             let dial_fn = xray_proxy_freedom::make_freedom_dial_fn_with_config(config);
-            // TCP 走 DialBridge（保留代理链 / fragment / noise），UDP 走 FreedomDispatchBridge
+            // TCP 走 DialBridge（fragment 经 DialFn 包装 writer），UDP 走
+            // FreedomDispatchBridge（noises 首包前注入）
             let tcp_bridge = Arc::new(DialBridge::new(ob.tag.clone(), dial_fn));
-            let handler = Arc::new(xray_proxy_freedom::FreedomDispatchBridge::from_bridge(
-                Arc::clone(&tcp_bridge),
-            )) as Arc<dyn DispatchHandler>;
+            let handler = Arc::new(
+                xray_proxy_freedom::FreedomDispatchBridge::from_bridge(Arc::clone(&tcp_bridge))
+                    .with_noises(noises),
+            ) as Arc<dyn DispatchHandler>;
             let bridge_ref = if proxy_chain_tag.is_some() { Some(tcp_bridge) } else { None };
             Ok((handler, bridge_ref, proxy_chain_tag))
         }

@@ -40,6 +40,16 @@ pub enum DomainStrategy {
     UseIPv4v6 = 4,
     /// USE_IP64: 优先 IPv6，回退 IPv4
     UseIPv6v4 = 5,
+    /// FORCE_IP: 解析失败即失败（IPv4 或 IPv6）
+    ForceIP = 6,
+    /// FORCE_IP4: 强制 IPv4，解析失败即失败
+    ForceIPv4 = 7,
+    /// FORCE_IP6: 强制 IPv6，解析失败即失败
+    ForceIPv6 = 8,
+    /// FORCE_IP46: 强制 IPv4，回退 IPv6
+    ForceIPv4v6 = 9,
+    /// FORCE_IP64: 强制 IPv6，回退 IPv4
+    ForceIPv6v4 = 10,
 }
 
 impl DomainStrategy {
@@ -51,28 +61,96 @@ impl DomainStrategy {
             3 => Self::UseIPv6,
             4 => Self::UseIPv4v6,
             5 => Self::UseIPv6v4,
+            6 => Self::ForceIP,
+            7 => Self::ForceIPv4,
+            8 => Self::ForceIPv6,
+            9 => Self::ForceIPv4v6,
+            10 => Self::ForceIPv6v4,
             _ => Self::AsIs,
         }
+    }
+
+    /// Go `transport/internet/config.go` strategy 表：`[mode, prefer, fallback]`。
+    ///
+    /// mode：0=AsIs，1=Use，2=Force；prefer/fallback：0=任意，4=IPv4，6=IPv6。
+    #[must_use]
+    pub fn strategy_table(self) -> [u8; 3] {
+        match self {
+            Self::AsIs => [0, 0, 0],
+            Self::UseIP => [1, 0, 0],
+            Self::UseIPv4 => [1, 4, 0],
+            Self::UseIPv6 => [1, 6, 0],
+            Self::UseIPv4v6 => [1, 4, 6],
+            Self::UseIPv6v4 => [1, 6, 4],
+            Self::ForceIP => [2, 0, 0],
+            Self::ForceIPv4 => [2, 4, 0],
+            Self::ForceIPv6 => [2, 6, 0],
+            Self::ForceIPv4v6 => [2, 4, 6],
+            Self::ForceIPv6v4 => [2, 6, 4],
+        }
+    }
+
+    /// 解析失败时是否必须报错（Go `ForceIP()`：`strategy[s][0] == 2`）。
+    #[must_use]
+    pub fn force_ip(self) -> bool {
+        self.strategy_table()[0] == 2
+    }
+
+    /// 是否带解析策略（Go `HasStrategy()`：`strategy[s][0] != 0`）。
+    #[must_use]
+    pub fn has_strategy(self) -> bool {
+        self.strategy_table()[0] != 0
+    }
+
+    /// 优先 IPv4（Go `PreferIP4()`）。
+    #[must_use]
+    pub fn prefer_ipv4(self) -> bool {
+        self.strategy_table()[1] == 4
+    }
+
+    /// 优先 IPv6（Go `PreferIP6()`）。
+    #[must_use]
+    pub fn prefer_ipv6(self) -> bool {
+        self.strategy_table()[1] == 6
+    }
+
+    /// 有回退家族（Go `HasFallback()`）。
+    #[must_use]
+    pub fn has_fallback(self) -> bool {
+        self.strategy_table()[2] != 0
+    }
+
+    /// 回退到 IPv4（Go `FallbackIP4()`）。
+    #[must_use]
+    pub fn fallback_ipv4(self) -> bool {
+        self.strategy_table()[2] == 4
+    }
+
+    /// 回退到 IPv6（Go `FallbackIP6()`）。
+    #[must_use]
+    pub fn fallback_ipv6(self) -> bool {
+        self.strategy_table()[2] == 6
     }
 
     /// 是否需要 DNS 解析
     #[must_use]
     pub fn needs_resolution(self) -> bool {
-        !matches!(self, Self::AsIs)
+        self.has_strategy()
     }
 
     /// 解析后是否只接受 IPv4
     #[must_use]
     pub fn ipv4_only(self) -> bool {
-        matches!(self, Self::UseIPv4 | Self::UseIPv4v6)
+        self.prefer_ipv4() && !self.has_fallback()
     }
 
     /// 解析后是否只接受 IPv6
     #[must_use]
     pub fn ipv6_only(self) -> bool {
-        matches!(self, Self::UseIPv6 | Self::UseIPv6v4)
+        self.prefer_ipv6() && !self.has_fallback()
     }
 }
+
 use crate::error::Result;
 
 use std::net::IpAddr;
@@ -518,6 +596,72 @@ mod tests {
         assert_eq!(RuleAction::from_proto_value(1), RuleAction::Block);
         assert_eq!(RuleAction::Allow.to_proto_value(), 0);
         assert_eq!(RuleAction::Block.to_proto_value(), 1);
+    }
+
+    // ===== DomainStrategy FORCE_* (v2q) =====
+
+    #[test]
+    fn domain_strategy_force_variants_from_i32() {
+        // Go transport/internet/config.pb.go: DomainStrategy_FORCE_IP=6..FORCE_IP64=10
+        assert_eq!(DomainStrategy::from_i32(6), DomainStrategy::ForceIP);
+        assert_eq!(DomainStrategy::from_i32(7), DomainStrategy::ForceIPv4);
+        assert_eq!(DomainStrategy::from_i32(8), DomainStrategy::ForceIPv6);
+        assert_eq!(DomainStrategy::from_i32(9), DomainStrategy::ForceIPv4v6);
+        assert_eq!(DomainStrategy::from_i32(10), DomainStrategy::ForceIPv6v4);
+        assert_eq!(DomainStrategy::ForceIP as i32, 6);
+        assert_eq!(DomainStrategy::ForceIPv6v4 as i32, 10);
+    }
+
+    /// Go config.go `strategy` 表第 0 列 == 2 → ForceIP()。
+    #[test]
+    fn domain_strategy_force_ip_flag() {
+        for s in [
+            DomainStrategy::AsIs,
+            DomainStrategy::UseIP,
+            DomainStrategy::UseIPv4,
+            DomainStrategy::UseIPv6,
+            DomainStrategy::UseIPv4v6,
+            DomainStrategy::UseIPv6v4,
+        ] {
+            assert!(!s.force_ip(), "{s:?} is not force");
+        }
+        for s in [
+            DomainStrategy::ForceIP,
+            DomainStrategy::ForceIPv4,
+            DomainStrategy::ForceIPv6,
+            DomainStrategy::ForceIPv4v6,
+            DomainStrategy::ForceIPv6v4,
+        ] {
+            assert!(s.force_ip(), "{s:?} is force");
+            assert!(s.has_strategy(), "{s:?} has strategy");
+        }
+    }
+
+    /// Go LookupForIP 的家族选择：PreferIP4/6 + FallbackIP4/6。
+    #[test]
+    fn domain_strategy_family_preference() {
+        use DomainStrategy::*;
+        // (strategy, prefer4, prefer6, fb4, fb6)
+        let cases = [
+            (UseIP, false, false, false, false),
+            (UseIPv4, true, false, false, false),
+            (UseIPv6, false, true, false, false),
+            (UseIPv4v6, true, false, false, true),
+            (UseIPv6v4, false, true, true, false),
+            (ForceIP, false, false, false, false),
+            (ForceIPv4, true, false, false, false),
+            (ForceIPv6, false, true, false, false),
+            (ForceIPv4v6, true, false, false, true),
+            (ForceIPv6v4, false, true, true, false),
+        ];
+        for (s, p4, p6, f4, f6) in cases {
+            assert_eq!(s.prefer_ipv4(), p4, "{s:?}.prefer_ipv4");
+            assert_eq!(s.prefer_ipv6(), p6, "{s:?}.prefer_ipv6");
+            assert_eq!(s.fallback_ipv4(), f4, "{s:?}.fallback_ipv4");
+            assert_eq!(s.fallback_ipv6(), f6, "{s:?}.fallback_ipv6");
+            assert_eq!(s.has_fallback(), f4 || f6, "{s:?}.has_fallback");
+        }
+        assert!(!AsIs.has_strategy());
     }
 
     // ===== FinalRule::build =====
