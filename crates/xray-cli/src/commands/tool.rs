@@ -20,23 +20,51 @@ pub struct UuidArgs {
 
 /// uuid execute：生成或解析 UUID。
 pub fn execute_uuid(args: &UuidArgs) -> Result<(), CliError> {
-    match &args.input {
+    println!("{}", resolve_uuid(args.input.as_deref())?);
+    Ok(())
+}
+
+/// 解析/生成 UUID。输入 ≤30 字节：标准格式规范化，非标准串 v5 派生
+/// （对齐 Go `uuid.ParseString` 语义，`xray_common::uuid::UUID::parse`）。
+pub fn resolve_uuid(input: Option<&str>) -> Result<String, CliError> {
+    match input {
         Some(input) => {
             if input.len() > 30 {
                 return Err(CliError::InvalidArgument(
                     "input must be at most 30 bytes".to_string(),
                 ));
             }
-            let parsed = uuid::Uuid::parse_str(input)
-                .map_err(|e| CliError::UuidParseFailed(e.to_string()))?;
-            println!("{parsed}");
+            xray_common::uuid::UUID::parse(input)
+                .map(|u| u.to_string())
+                .ok_or_else(|| CliError::UuidParseFailed(input.to_string()))
         }
-        None => {
-            let id = uuid::Uuid::new_v4();
-            println!("{id}");
-        }
+        None => Ok(uuid::Uuid::new_v4().to_string()),
     }
-    Ok(())
+}
+
+#[cfg(test)]
+mod uuid_tests {
+    use super::*;
+
+    /// Go 对拍已知值：`uuid -i example` 走 v5 派生（uuid.ParseString ≤30 字节语义）。
+    #[test]
+    fn uuid_input_derives_v5() {
+        let out = resolve_uuid(Some("example")).expect("derive v5");
+        assert_eq!(out, "feb54431-301b-52bb-a6dd-e1e93e81bb9e");
+    }
+
+    /// >30 字节拒绝（Go uuid.go 语义）。
+    #[test]
+    fn uuid_input_over_30_bytes_rejected() {
+        assert!(resolve_uuid(Some(&"a".repeat(31))).is_err());
+    }
+
+    /// 无输入生成合法 v4。
+    #[test]
+    fn uuid_no_input_generates_v4() {
+        let out = resolve_uuid(None).expect("v4");
+        assert_eq!(uuid::Uuid::parse_str(&out).expect("parseable").get_version_num(), 4);
+    }
 }
 
 // ---------------------------------------------------------------------------

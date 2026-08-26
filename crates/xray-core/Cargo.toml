@@ -66,17 +66,11 @@ tokio-util = "0.7"
 tracing = { workspace = true }
 serde_json = { workspace = true }
 prost = { workspace = true }
-clap = { workspace = true }
 uuid = { workspace = true }
-anyhow = "1"
 rustls = { workspace = true }
 tonic = { workspace = true }
 webpki-roots = { workspace = true }
 tracing-subscriber = { workspace = true }
-
-[[bin]]
-name = "xray"
-path = "src/bin/xray.rs"
 
 [dev-dependencies]
 uuid = { workspace = true }
