@@ -43,8 +43,11 @@ use xray_proxy_trojan::{MemoryAccount, TrojanOutboundConfig};
 use xray_proxy_vless::VlessOutboundConfig;
 use xray_transport::dialer::StreamSettings;
 use xray_transport::link::Link;
-// zx7: mux outbound 骨架接入
-use xray_mux::client::{ClientManager, DialingWorkerFactory, IncrementalWorkerPicker};
+// mux outbound：client 数据路径
+use xray_mux::client::{
+    ClientManager, ClientWorker, DialingWorkerFactory, IncrementalWorkerPicker, UnderlyingSlot,
+    WorkerPicker,
+};
 use xray_mux::session::ClientStrategy;
 // 补全协议注册
 use xray_proxy_hysteria::HysteriaConfig;
@@ -128,8 +131,9 @@ impl xray_app_dispatcher::OutboundHandlerManager for OhmRef {
 pub fn register_outbounds(built: &BuiltConfig, ohm: &SimpleOhm, loopback_sink: Option<Arc<dyn LoopbackSink>>) -> Result<()> {
     // Phase 1: 注册所有 handler，收集需要代理链的 DialBridge 引用
     let mut chain_bridges: Vec<(Arc<DialBridge>, String)> = Vec::new(); // (bridge, chain_tag)
+    let mut mux_bridges: Vec<(Arc<MuxBridge>, Option<String>)> = Vec::new();
     for (i, ob) in built.outbounds.iter().enumerate() {
-        match try_build_handler(ob, loopback_sink.clone()) {
+        match try_build_handler(ob, loopback_sink.clone(), &mut mux_bridges) {
             Ok((handler, bridge_ref, proxy_chain_tag)) => {
                 let is_default = i == 0 || ob.tag == "direct";
                 if is_default {
@@ -174,6 +178,25 @@ pub fn register_outbounds(built: &BuiltConfig, ohm: &SimpleOhm, loopback_sink: O
                 chain_tag = %bridge.tag(),
                 "proxy chain configured"
             );
+        }
+    }
+
+    for (bridge, via_tag) in mux_bridges {
+        use xray_app_dispatcher::OutboundHandlerManager;
+        let underlying = match via_tag.as_deref().map(|t| ohm.get_handler(t)) {
+            Some(Some(h)) => Some(h),
+            Some(None) => {
+                tracing::warn!(tag = %bridge.tag(), via = ?via_tag, "mux via tag not found, fallback default");
+                ohm.get_default_handler()
+            }
+            None => ohm.get_default_handler(),
+        };
+        match underlying {
+            Some(h) => {
+                bridge.set_underlying(h);
+                tracing::debug!(tag = %bridge.tag(), "mux underlying configured");
+            }
+            None => tracing::warn!(tag = %bridge.tag(), "mux outbound has no underlying handler"),
         }
     }
 
@@ -235,9 +258,9 @@ pub(crate) fn parse_udp443_policies(
 fn try_build_handler(
     ob: &BuiltOutbound,
     loopback_sink: Option<Arc<dyn LoopbackSink>>,
+    mux_bridges: &mut Vec<(Arc<MuxBridge>, Option<String>)>,
 ) -> std::result::Result<(Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>), BuildError> {
     let proxy_chain_tag = parse_proxy_chain_tag(ob.proxy_settings_json.as_ref());
-
     match ob.entry.kind.as_str() {
         "freedom" => {
             let config = parse_freedom_config(&ob.entry.data);
@@ -284,8 +307,11 @@ fn try_build_handler(
             wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag)
         }
         "mux" => {
-            let concurrency = parse_mux_config(&ob.entry.data)?;
-            let handler = Arc::new(MuxBridge::new(ob.tag.clone(), concurrency)) as Arc<dyn DispatchHandler>;
+            let (concurrency, via_tag) = parse_mux_config(&ob.entry.data)?;
+            let (bridge, _slot) = MuxBridge::new(ob.tag.clone(), concurrency);
+            let bridge = Arc::new(bridge);
+            mux_bridges.push((Arc::clone(&bridge), via_tag));
+            let handler = bridge as Arc<dyn DispatchHandler>;
             Ok((handler, None, None))
         }
         "vmess" => {
@@ -368,36 +394,47 @@ fn try_build_handler(
         "tun" => {
             Err(BuildError::Unsupported("TUN outbound is only supported on Linux/Android/FreeBSD".to_string()))
         }
-        other => Err(BuildError::Unsupported(other.to_string())), 
+        other => Err(BuildError::Unsupported(other.to_string())),
     }
 }
 
-/// Mux outbound handler 骨架（zx7）。
+/// Mux outbound handler（mbc/nww）。
 ///
-/// 持有 mux [`ClientManager`]。dispatch 时调 `client_manager.dispatch()` 拿 worker。
-/// 当前骨架：session IO 桥接到 link 的部分待实现（需要 dialer 注入 + frame reader/writer loop）。
-/// TODO zx7-future: 把 `DialingWorkerFactory` 换成接底层 outbound 的真实 factory。
+/// 持有 mux [`ClientManager`]。dispatch 时 pick worker → `ClientWorker::dispatch`
+/// 把 link 桥接成 mux session（首帧 New，后续 Keep 帧，carrier 经底层 outbound
+/// 拨向 v1.mux.cool:9527）。底层 handler 经 [`UnderlyingSlot`] 延迟注入。
 pub struct MuxBridge {
     tag: String,
-    #[allow(dead_code)]
-    client_manager: ClientManager,
+    client_manager: Arc<ClientManager>,
+    slot: UnderlyingSlot,
 }
 
 impl MuxBridge {
     /// 构造 Mux outbound handler。`concurrency` 为最大并发会话数（0 = 不限制）。
     #[must_use]
-    pub fn new(tag: impl Into<String>, concurrency: u32) -> Self {
+    pub fn new(tag: impl Into<String>, concurrency: u32) -> (Self, UnderlyingSlot) {
         let strategy = ClientStrategy {
             max_concurrency: concurrency,
             max_connection: 0,
         };
-        let factory = Arc::new(DialingWorkerFactory::new(strategy));
+        // 空槽构造：register Phase 2 拿到底层 handler 后 set_underlying。
+        let slot: UnderlyingSlot = Arc::new(parking_lot::RwLock::new(None));
+        let factory = Arc::new(DialingWorkerFactory::with_slot(Arc::clone(&slot), strategy));
         let picker = Box::new(IncrementalWorkerPicker::new(factory));
-        let client_manager = ClientManager::new(true, picker);
-        Self {
-            tag: tag.into(),
-            client_manager,
-        }
+        let client_manager = Arc::new(ClientManager::new(true, picker));
+        (
+            Self {
+                tag: tag.into(),
+                client_manager,
+                slot: Arc::clone(&slot),
+            },
+            slot,
+        )
+    }
+
+    /// 回填底层 outbound handler（register Phase 2 调用）。
+    pub fn set_underlying(&self, handler: Arc<dyn DispatchHandler>) {
+        *self.slot.write() = Some(handler);
     }
 
     /// 是否启用 mux。
@@ -415,36 +452,43 @@ impl std::fmt::Debug for MuxBridge {
             .finish()
     }
 }
-
 impl DispatchHandler for MuxBridge {
     fn tag(&self) -> &str {
         &self.tag
     }
 
     fn dispatch(&self, dest: &Destination, link: Link) -> PinFuture<()> {
-        let tag = self.tag.clone();
         let dest = dest.clone();
+        let tag = self.tag.clone();
+        let client_manager = Arc::clone(&self.client_manager);
         Box::pin(async move {
-            // TODO zx7-future: 调 client_manager.dispatch() 拿 worker → allocate_session
-            // → 桥接 session input/output 到 link。
-            // 当前骨架：DialingWorkerFactory 没注入真实 dialer，只能 log + drop。
-            tracing::warn!(
-                tag = %tag,
-                dest = ?dest,
-                "mux outbound dispatch: session IO bridge not yet implemented, dropping link"
-            );
-            drop(link);
+            // pick worker → ClientWorker::dispatch 把 link 桥成 mux session
+            let worker = match client_manager.dispatch() {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!(tag = %tag, error = %e, "mux dispatch: no worker available");
+                    drop(link);
+                    return;
+                }
+            };
+            let inner = xray_mux::client::Link { reader: link.reader, writer: link.writer };
+            if !worker.dispatch(&dest, inner).await {
+                tracing::warn!(tag = %tag, "mux dispatch: worker full, dropping link");
+            }
         })
     }
 }
 
-/// 解析 mux outbound settings JSON → concurrency。
-///
-/// JSON 格式：`{"concurrency": 8}`（缺省 8）。
-fn parse_mux_config(data: &[u8]) -> std::result::Result<u32, String> {
+/// JSON 格式：`{"concurrency": 8, "via": "proxy-out"}`（concurrency 缺省 8）。
+fn parse_mux_config(data: &[u8]) -> std::result::Result<(u32, Option<String>), String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
     let concurrency = v.get("concurrency").and_then(|x| x.as_u64()).unwrap_or(8) as u32;
-    Ok(concurrency)
+    let via = v
+        .get("via")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    Ok((concurrency, via))
 }
 /// 解析 vless outbound settings JSON → VlessOutboundConfig。
 ///
@@ -1503,12 +1547,16 @@ mod tests {
 
     #[test]
     fn parse_mux_config_extracts_concurrency() {
-        assert_eq!(super::parse_mux_config(br#"{"concurrency":32}"#).unwrap(), 32);
+        assert_eq!(super::parse_mux_config(br#"{"concurrency":32}"#).unwrap(), (32, None));
+        assert_eq!(
+            super::parse_mux_config(br#"{"concurrency":16,"via":"proxy-out"}"#).unwrap(),
+            (16, Some("proxy-out".to_string()))
+        );
     }
 
     #[test]
     fn parse_mux_config_defaults_to_8() {
-        assert_eq!(super::parse_mux_config(b"{}").unwrap(), 8);
+        assert_eq!(super::parse_mux_config(b"{}").unwrap(), (8, None));
     }
 
     #[test]

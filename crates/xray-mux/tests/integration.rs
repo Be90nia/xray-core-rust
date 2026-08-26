@@ -11,10 +11,39 @@ use xray_common::net::network::Network;
 use xray_common::net::port::Port;
 use xray_mux::session::{ClientStrategy, SessionManager, TransferType};
 use xray_mux::frame::{FrameMetadata, SessionStatus};
-use xray_mux::client::{ClientWorker, ClientManager, Link, MUX_COOL_ADDRESS, WorkerPicker};
+use xray_mux::client::{
+    ClientWorker, ClientManager, DialingWorkerFactory, Link, MUX_COOL_ADDRESS, WorkerPicker,
+};
 use xray_mux::worker::{Dispatcher, DispatchError, Server, ServerWorker};
 use xray_buf::io::Writer;
 
+/// 回环 carrier 的测试 worker。
+fn loop_worker(strategy: ClientStrategy) -> Arc<ClientWorker> {
+    let (r, w) = xray_buf::pipe::new();
+    ClientWorker::new(
+        Link {
+            reader: Box::new(r),
+            writer: Box::new(w),
+        },
+        strategy,
+    )
+}
+
+/// 空底层 handler（dispatch 立即返回）。
+#[derive(Debug)]
+struct NopUnderlying;
+impl xray_app_dispatcher::DispatchHandler for NopUnderlying {
+    fn tag(&self) -> &str {
+        "nop"
+    }
+    fn dispatch(
+        &self,
+        _dest: &Destination,
+        _link: xray_transport::link::Link,
+    ) -> xray_app_dispatcher::default::PinFuture<()> {
+        Box::pin(async {})
+    }
+}
 // ========== Mock Dispatcher ==========
 
 struct MockDispatcher;
@@ -188,7 +217,7 @@ fn test_server_is_mux_destination() {
 
 #[tokio::test]
 async fn test_client_worker_allocate_session() {
-    let worker = Arc::new(ClientWorker::new(ClientStrategy::default()));
+    let worker = loop_worker(ClientStrategy::default());
     let session = worker.allocate_session().await;
     assert!(session.is_some());
     let s = session.unwrap();
@@ -202,7 +231,7 @@ async fn test_client_worker_max_concurrency() {
         max_concurrency: 1,
         max_connection: 0,
     };
-    let worker = Arc::new(ClientWorker::new(strategy));
+    let worker = loop_worker(strategy);
     let s1 = worker.allocate_session().await;
     assert!(s1.is_some());
     let s2 = worker.allocate_session().await;
@@ -211,7 +240,7 @@ async fn test_client_worker_max_concurrency() {
 
 #[tokio::test]
 async fn test_client_worker_close() {
-    let worker = Arc::new(ClientWorker::new(ClientStrategy::default()));
+    let worker = loop_worker(ClientStrategy::default());
     assert!(!worker.is_closed());
     worker.close();
     assert!(worker.is_closed());
@@ -223,7 +252,7 @@ async fn test_client_worker_is_full_with_max_connection() {
         max_concurrency: 0,
         max_connection: 1,
     };
-    let worker = Arc::new(ClientWorker::new(strategy));
+    let worker = loop_worker(strategy);
     assert!(!worker.is_full());
     assert!(!worker.is_closing());
 
@@ -261,7 +290,7 @@ impl WorkerPicker for SingleWorkerPicker {
 
 #[tokio::test]
 async fn test_client_manager_dispatch_success() {
-    let worker = Arc::new(ClientWorker::new(ClientStrategy::default()));
+    let worker = loop_worker(ClientStrategy::default());
     let mgr = ClientManager::new(true, Box::new(SingleWorkerPicker { worker }));
     let result = mgr.dispatch();
     assert!(result.is_ok());
@@ -292,7 +321,10 @@ async fn test_session_close_signal() {
 async fn test_incremental_picker_empty_initially() {
     use xray_mux::client::{DialingWorkerFactory, IncrementalWorkerPicker};
 
-    let factory = Arc::new(DialingWorkerFactory::new(ClientStrategy::default()));
+    let factory = Arc::new(DialingWorkerFactory::new(
+        Arc::new(NopUnderlying),
+        ClientStrategy::default(),
+    ));
     let picker = IncrementalWorkerPicker::new(factory);
     assert_eq!(picker.worker_count().await, 0);
 }

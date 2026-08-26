@@ -18,11 +18,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{watch, Mutex};
 use tokio::time::Duration;
 use tracing::debug;
+use xray_buf::buffer::Buffer;
 use xray_buf::io::{Reader, Writer};
+use xray_buf::multi::MultiBuffer;
+use xray_buf::reader::BufferedReader;
+use xray_buf::writer::BufferedWriter;
 use xray_common::net::destination::Destination;
 use xray_common::net::network::Network;
 
-use crate::session::{ClientStrategy, Session, SessionManager};
+use crate::frame::{FrameMetadata, SessionStatus, MAX_METADATA_LEN};
+use crate::session::{ClientStrategy, Session, SessionManager, TransferType};
+use crate::writer::{MuxWriter, SharedWriter};
 
 // ========== 常量 ==========
 
@@ -210,27 +216,43 @@ impl WorkerPicker for IncrementalWorkerPicker {
 
 /// 客户端工作单元。
 ///
-/// 对应 Go 版本 `ClientWorker`。
-/// 管理 SessionManager、心跳定时器和策略。
+/// 对应 Go 版本 `ClientWorker`：持有一条 carrier 链路，在其上复用多个子会话。
+/// 构造时启动两个数据循环：
+/// - `fetch_output`：carrier 读循环（Go `fetchOutput`，client.go:382-419）
+/// - `monitor`：16s 定时器，空闲时关闭 worker（Go `monitor`，client.go:226-244）
 pub struct ClientWorker {
     session_manager: Arc<SessionManager>,
     closed: AtomicBool,
     done_tx: watch::Sender<bool>,
     done_rx: watch::Receiver<bool>,
     strategy: ClientStrategy,
+    /// carrier 写端共享槽：全部 session 的 [`MuxWriter`] 经 [`SharedWriter`] 共写。
+    link_writer: Arc<Mutex<Option<Box<dyn Writer>>>>,
 }
 
 impl ClientWorker {
-    /// 创建新的 ClientWorker。
-    pub fn new(strategy: ClientStrategy) -> Self {
+    /// 创建新的 ClientWorker 并启动数据循环。
+    ///
+    /// 对应 Go `NewClientWorker`（`go c.fetchOutput()` / `go c.monitor()`）。
+    /// `link` 为 carrier 链路：reader 收服务端下发帧，writer 发客户端上行帧。
+    pub fn new(link: Link, strategy: ClientStrategy) -> Arc<Self> {
         let (done_tx, done_rx) = watch::channel(false);
-        Self {
+        let worker = Arc::new(Self {
             session_manager: Arc::new(SessionManager::new()),
             closed: AtomicBool::new(false),
             done_tx,
             done_rx,
             strategy,
-        }
+            link_writer: Arc::new(Mutex::new(Some(link.writer))),
+        });
+
+        let w = Arc::clone(&worker);
+        tokio::spawn(async move { w.fetch_output(BufferedReader::new(link.reader)).await });
+
+        let w = Arc::clone(&worker);
+        tokio::spawn(async move { w.monitor().await });
+
+        worker
     }
 
     /// 检查是否即将关闭（达到最大连接数）。
@@ -305,80 +327,356 @@ impl ClientWorker {
         )
     }
 
-    /// 启动 KeepAlive 定时发送任务。
+    /// 调度一条子连接到本 worker 的 carrier 上。
     ///
-    /// 对应 Go 版本 `ClientWorker.monitor` 中的 timer 逻辑。
-    /// 客户端每 16 秒向所有活跃 session 发送 KeepAlive 帧。
-    /// 同时检查空闲超时，关闭空闲超过 300 秒的 session。
-    pub fn spawn_keepalive(
-        &self,
-        link_writer: Arc<tokio::sync::Mutex<Option<Box<dyn xray_buf::io::Writer>>>>,
-    ) -> tokio::task::JoinHandle<()> {
-        use crate::frame::FrameMetadata;
-        use crate::session::SESSION_IDLE_TIMEOUT;
-        use xray_buf::buffer::Buffer;
-        use xray_buf::multi::MultiBuffer;
-        use tracing::warn;
+    /// 对应 Go `ClientWorker.Dispatch`（client.go:311-331）。
+    /// `dest` 为子会话真实目标（New 帧携带），`link` 为调用方链路。
+    ///
+    /// 会话生命周期绑定：等待 session done 后才返回
+    /// （Go :324-329 对非 pipe reader 的等待语义；Rust 无法从
+    /// `Box<dyn Reader>` 区分 pipe，统一等待——session 关闭
+    /// 即输入 EOF / 对端 End / worker 关闭时返回）。
+    pub async fn dispatch(&self, dest: &Destination, link: Link) -> bool {
+        if self.is_full() {
+            return false;
+        }
+        let Some(session) = self.session_manager.allocate(&self.strategy).await else {
+            return false;
+        };
+        session.set_input(BufferedReader::new(link.reader)).await;
+        session.set_output(BufferedWriter::new(link.writer)).await;
 
-        let session_manager = Arc::clone(&self.session_manager);
-        let mut done_rx = self.done_rx.clone();
-        let lw = link_writer;
+        let s = Arc::clone(&session);
+        let writer_slot = Arc::clone(&self.link_writer);
+        let target = dest.clone();
+        tokio::spawn(async move { Self::fetch_input(s, target, writer_slot).await });
 
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(CLIENT_KEEPALIVE_INTERVAL);
-            loop {
-                tokio::select! {
-                    _ = done_rx.changed() => break,
-                    _ = interval.tick() => {
-                        // 向所有活跃 session 发送 KeepAlive 帧
-                        let sessions = session_manager.active_sessions().await;
-                        for session in &sessions {
-                            if session.is_closed() { continue; }
-                            let meta = FrameMetadata::keep_alive(session.id());
-                            let mut vec = Vec::new();
-                            if meta.write_to(&mut vec).is_err() { continue; }
-                            let mb = MultiBuffer::from_buffer(Buffer::from_vec(vec));
-                            let mut wg = lw.lock().await;
-                            if let Some(ref mut writer) = *wg {
-                                let _ = writer.write_multi_buffer(mb).await;
-                            }
+        wait_done(session.done_receiver()).await;
+        true
+    }
+
+    /// session 上行循环：session.input → [`MuxWriter`] → carrier。
+    ///
+    /// 对应 Go `fetchInput`（client.go:259-287）。
+    /// 简化：Go 的 writeFirstPayload（100ms 首包试探，超时发空 New 帧）
+    /// 省略——首帧 New+数据由 [`MuxWriter`] 天然同批写出；无首包的
+    /// session 不提前注册到对端（后续首包到达时随 New 帧注册）。
+    async fn fetch_input(
+        session: Arc<Session>,
+        dest: Destination,
+        link_writer: Arc<Mutex<Option<Box<dyn Writer>>>>,
+    ) {
+        let transfer_type = if dest.network() == Network::UDP {
+            TransferType::Packet
+        } else {
+            TransferType::Stream
+        };
+        let mut writer = MuxWriter::new(
+            session.id(),
+            dest,
+            Box::new(SharedWriter::new(link_writer)),
+            transfer_type,
+            [0u8; 8],
+        );
+
+        let mut done = session.done_receiver();
+        loop {
+            let mut input = session.input().await;
+            let Some(reader) = input.as_mut() else { break };
+            // select session done：Session::close 需先拿 input 锁才能中断，
+            // 持锁阻塞读期间必须可被 done 打断，否则与 close 互相等待死锁
+            let read = tokio::select! {
+                r = reader.read_multi_buffer() => Some(r),
+                _ = wait_done(done.clone()) => None,
+            };
+            let mb = match read {
+                Some(Ok(mb)) => mb,
+                Some(Err(e)) => {
+                    if !matches!(e, xray_buf::io::Error::Eof) {
+                        writer.set_error();
+                    }
+                    break;
+                }
+                None => break,
+            };
+            if mb.is_empty() {
+                break;
+            }
+            session.add_uplink_bytes(mb.len() as u64);
+            session.touch_active().await;
+            if writer.write(mb).await.is_err() {
+                writer.set_error();
+                break;
+            }
+        }
+        // Go defer 顺序（client.go:272-273 LIFO）：End 帧先发，session 后关
+        let _ = writer.close().await;
+        session.close().await;
+    }
+
+    /// carrier 读循环。
+    ///
+    /// 对应 Go `fetchOutput`（client.go:382-419）：读帧 → 按 status 分发；
+    /// 任何读错/EOF 退出并关闭 worker。
+    async fn fetch_output(self: Arc<Self>, mut reader: BufferedReader) {
+        let done = self.done_rx();
+        loop {
+            let (meta, data) = tokio::select! {
+                _ = wait_done(done.clone()) => break,
+                frame = read_frame(&mut reader) => match frame {
+                    Ok(f) => f,
+                    Err(e) => {
+                        if !e.is_empty() {
+                            debug!("mux client fetch_output stopped: {}", e);
                         }
-                        // 检查空闲超时
-                        for session in sessions {
-                            if session.is_closed() { continue; }
-                            if session.is_idle_timeout(SESSION_IDLE_TIMEOUT).await {
-                                warn!("client session {} idle timeout, closing", session.id());
-                                session.close().await;
-                            }
-                        }
+                        break;
+                    }
+                },
+            };
+
+            match meta.session_status() {
+                // 数据已随帧读出，丢弃即可（Go: Copy(NewStreamReader, Discard)）
+                SessionStatus::KeepAlive | SessionStatus::New => {}
+                SessionStatus::End => {
+                    if let Some(session) = self.session_manager.get(meta.session_id()).await {
+                        session.close().await;
+                    }
+                }
+                SessionStatus::Keep => {
+                    if self.handle_status_keep(&meta, data).await {
+                        break;
                     }
                 }
             }
-        })
+        }
+        // Go fetchOutput defer: done.Close()
+        self.close();
     }
+
+    /// 处理 Keep 帧：数据写入对应 session 的 output（app 方向）。
+    ///
+    /// 对应 Go `handleStatusKeep`（client.go:347-370）。
+    /// 未知 session：ResponseWriter 发 End 帧通知对端 + 丢弃数据。
+    /// 返回 `true` 表示致命错误（fetch_output 应退出）。
+    async fn handle_status_keep(&self, meta: &FrameMetadata, data: Vec<u8>) -> bool {
+        let Some(session) = self.session_manager.get(meta.session_id()).await else {
+            let mut closing = MuxWriter::new_response_writer(
+                meta.session_id(),
+                Box::new(SharedWriter::new(Arc::clone(&self.link_writer))),
+                TransferType::Stream,
+            );
+            return closing.close().await.is_err();
+        };
+        if data.is_empty() {
+            return false;
+        }
+        session.add_downlink_bytes(data.len() as u64);
+        session.touch_active().await;
+        let mb = MultiBuffer::from_buffer(Buffer::from_vec(data));
+        let write_failed = {
+            let mut output = session.output().await;
+            match output.as_mut() {
+                Some(w) => w.write_multi_buffer_impl(mb).await.is_err(),
+                None => false,
+            }
+        };
+        if write_failed {
+            // 写下游失败：关闭 session，剩余数据丢弃（Go :363-367）
+            session.close().await;
+        }
+        false
+    }
+
+    /// 16s 定时监控。
+    ///
+    /// 对应 Go `monitor`（client.go:226-244）：
+    /// - done → 关闭全部 session（carrier 管道由 factory 任务中断）
+    /// - tick → 无会话且空闲 → 关闭 worker
+    async fn monitor(self: Arc<Self>) {
+        let done = self.done_rx();
+        // Go time.Ticker 首 tick 在 16s 后；tokio interval 首次立即触发，需偏移
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + CLIENT_KEEPALIVE_INTERVAL,
+            CLIENT_KEEPALIVE_INTERVAL,
+        );
+        loop {
+            // tick 前快照（Go :230-231，容忍 tick 间隙分配-释放的竞态语义）
+            let check_size = self.session_manager.size().await;
+            let check_count = self.session_manager.count();
+            tokio::select! {
+                _ = wait_done(done.clone()) => {
+                    self.session_manager.close().await;
+                    return;
+                }
+                _ = ticker.tick() => {
+                    if self.session_manager
+                        .close_if_no_session_and_idle(check_size, check_count)
+                        .await
+                    {
+                        debug!("mux client worker idle, closing");
+                        self.close();
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ========== 辅助函数 ==========
+
+/// 等待 watch 信号变为 true。
+///
+/// 先查当前值再订阅变更，容忍「订阅前已关闭」竞态
+/// （直接 `changed()` 会错过订阅前的发送）。
+pub(crate) async fn wait_done(mut rx: watch::Receiver<bool>) {
+    loop {
+        if *rx.borrow() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// 从 carrier 读取一个完整帧（metadata + 可选 data）。
+///
+/// 返回 `Err("")` 表示干净 EOF（对端正常关闭），其余为错误描述。
+async fn read_frame(reader: &mut BufferedReader) -> Result<(FrameMetadata, Vec<u8>), String> {
+    let mut len_buf = [0u8; 2];
+    read_exact(reader, &mut len_buf).await?;
+    let meta_len = u16::from_be_bytes(len_buf) as usize;
+    if meta_len > MAX_METADATA_LEN {
+        return Err(format!("meta_len too large: {meta_len}"));
+    }
+    let mut body = vec![0u8; meta_len];
+    read_exact(reader, &mut body).await?;
+    let mut full = Vec::with_capacity(2 + meta_len);
+    full.extend_from_slice(&len_buf);
+    full.extend_from_slice(&body);
+    let (meta, _) =
+        FrameMetadata::read_from_bytes(&full).map_err(|e| format!("parse meta: {e:?}"))?;
+
+    let data = if meta.has_data() {
+        let mut size_buf = [0u8; 2];
+        read_exact(reader, &mut size_buf).await?;
+        let size = u16::from_be_bytes(size_buf) as usize;
+        let mut data = vec![0u8; size];
+        read_exact(reader, &mut data).await?;
+        data
+    } else {
+        Vec::new()
+    };
+    Ok((meta, data))
+}
+
+/// 精确读满 `buf`。读到 0 字节（EOF）返回 `Err("")`，部分读后 EOF 带偏移描述。
+async fn read_exact(reader: &mut BufferedReader, buf: &mut [u8]) -> Result<(), String> {
+    let mut off = 0;
+    while off < buf.len() {
+        let n = reader.read(&mut buf[off..]).await;
+        if n == 0 {
+            return Err(if off == 0 {
+                String::new()
+            } else {
+                format!("EOF at offset {off}/{}", buf.len())
+            });
+        }
+        off += n;
+    }
+    Ok(())
 }
 
 // ========== DialingWorkerFactory ==========
 
+/// 底层 outbound handler 槽。
+///
+/// 注册流程（xray-core outbound.rs）Phase 1 先建 MuxBridge，
+/// Phase 2 才能解析 `via` tag / default handler，故底层 handler 经共享槽延迟注入。
+pub type UnderlyingSlot =
+    Arc<parking_lot::RwLock<Option<Arc<dyn xray_app_dispatcher::DispatchHandler>>>>;
+
 /// 拨号式 Worker 工厂。
 ///
-/// 对应 Go 版本 `DialingWorkerFactory`。
+/// 对应 Go 版本 `DialingWorkerFactory`（client.go:138-169）：
+/// `create` 建立两条 64KB 管道，worker 持内侧，`underlying` 持外侧
+/// 作为 carrier 连接发往 `v1.mux.cool:9527`；
+/// underlying 返回（carrier 断开）→ 关 worker + 中断管道；
+/// worker 关闭（空闲/外部）→ 中断管道终结 underlying。
 pub struct DialingWorkerFactory {
     /// 策略
     pub strategy: ClientStrategy,
+    /// 底层 outbound（carrier 建立者）
+    underlying: UnderlyingSlot,
 }
 
 impl DialingWorkerFactory {
-    /// 创建新的拨号式工厂。
-    pub fn new(strategy: ClientStrategy) -> Self {
-        Self { strategy }
+    /// 创建新的拨号式工厂，直接持有底层 handler。
+    pub fn new(
+        underlying: Arc<dyn xray_app_dispatcher::DispatchHandler>,
+        strategy: ClientStrategy,
+    ) -> Self {
+        Self {
+            strategy,
+            underlying: Arc::new(parking_lot::RwLock::new(Some(underlying))),
+        }
+    }
+
+    /// 以共享槽创建（延迟注入底层 handler，注册流程 Phase 2 用）。
+    #[must_use]
+    pub fn with_slot(underlying: UnderlyingSlot, strategy: ClientStrategy) -> Self {
+        Self { strategy, underlying }
     }
 }
 
 #[async_trait::async_trait]
 impl ClientWorkerFactory for DialingWorkerFactory {
     async fn create(&self) -> Arc<ClientWorker> {
-        Arc::new(ClientWorker::new(self.strategy.clone()))
+        // Go client.go:139 pipe.WithSizeLimit(64 * 1024) × 2
+        let option = xray_buf::pipe::PipeOption {
+            limit: 64 * 1024,
+            ..Default::default()
+        };
+        let (uplink_reader, uplink_writer) = xray_buf::pipe::new_with_option(option);
+        let (downlink_reader, downlink_writer) = xray_buf::pipe::new_with_option(option);
+
+        // Go client.go:143-146 NewClientWorker(Link{downlinkReader, upLinkWriter})
+        let worker = ClientWorker::new(
+            Link {
+                reader: Box::new(downlink_reader),
+                writer: Box::new(uplink_writer.clone()),
+            },
+            self.strategy.clone(),
+        );
+
+        let Some(underlying) = self.underlying.read().clone() else {
+            // 未注入底层 handler：carrier 立即终结
+            worker.close();
+            uplink_writer.interrupt();
+            downlink_writer.interrupt();
+            return worker;
+        };
+
+        let carrier = xray_transport::link::Link::new(
+            Box::new(uplink_reader),
+            Box::new(downlink_writer.clone()),
+        );
+        let dest = ClientWorker::mux_destination();
+        let w = Arc::clone(&worker);
+        tokio::spawn(async move {
+            let done = w.done_rx();
+            tokio::select! {
+                // carrier 结束（underlying.dispatch 返回）→ Go client.go:164 c.Close()
+                _ = underlying.dispatch(&dest, carrier) => {}
+                // worker 关闭（空闲/外部 close）→ 中断管道，终结 underlying
+                _ = wait_done(done.clone()) => {}
+            }
+            w.close();
+            uplink_writer.interrupt();
+            downlink_writer.interrupt();
+        });
+
+        worker
     }
 }
 
@@ -406,36 +704,65 @@ pub enum ClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xray_buf::pipe;
 
-    #[test]
-    fn test_client_worker_new() {
-        let worker = ClientWorker::new(ClientStrategy::default());
+    /// 回环 carrier 的测试 worker（carrier 管道两端都在 worker 内闭合）。
+    fn loop_worker(strategy: ClientStrategy) -> Arc<ClientWorker> {
+        let (r, w) = pipe::new();
+        ClientWorker::new(
+            Link {
+                reader: Box::new(r),
+                writer: Box::new(w),
+            },
+            strategy,
+        )
+    }
+
+    /// 空底层 handler（dispatch 立即返回 = carrier 立即断开）。
+    #[derive(Debug)]
+    struct NopUnderlying;
+    impl xray_app_dispatcher::DispatchHandler for NopUnderlying {
+        fn tag(&self) -> &str {
+            "nop"
+        }
+        fn dispatch(
+            &self,
+            _dest: &Destination,
+            _link: xray_transport::link::Link,
+        ) -> xray_app_dispatcher::default::PinFuture<()> {
+            Box::pin(async {})
+        }
+    }
+
+    #[tokio::test]
+    async fn test_client_worker_new() {
+        let worker = loop_worker(ClientStrategy::default());
         assert!(!worker.is_closed());
         assert!(!worker.is_full());
         assert!(!worker.is_closing());
     }
 
-    #[test]
-    fn test_client_worker_close() {
-        let worker = ClientWorker::new(ClientStrategy::default());
+    #[tokio::test]
+    async fn test_client_worker_close() {
+        let worker = loop_worker(ClientStrategy::default());
         worker.close();
         assert!(worker.is_closed());
     }
 
-    #[test]
-    fn test_client_worker_is_full_when_closed() {
-        let worker = ClientWorker::new(ClientStrategy::default());
+    #[tokio::test]
+    async fn test_client_worker_is_full_when_closed() {
+        let worker = loop_worker(ClientStrategy::default());
         worker.close();
         assert!(worker.is_full());
     }
 
-    #[test]
-    fn test_client_worker_is_closing_with_max_connection() {
+    #[tokio::test]
+    async fn test_client_worker_is_closing_with_max_connection() {
         let strategy = ClientStrategy {
             max_concurrency: 0,
             max_connection: 1,
         };
-        let worker = ClientWorker::new(strategy);
+        let worker = loop_worker(strategy);
         assert!(!worker.is_closing()); // count=0 < max_connection=1
     }
 
@@ -469,14 +796,14 @@ mod tests {
             max_concurrency: 10,
             max_connection: 5,
         };
-        let factory = DialingWorkerFactory::new(strategy);
+        let factory = DialingWorkerFactory::new(Arc::new(NopUnderlying), strategy);
         assert_eq!(factory.strategy.max_concurrency, 10);
     }
 
     #[tokio::test]
     async fn test_incremental_picker_cleanup() {
         let strategy = ClientStrategy::default();
-        let factory = Arc::new(DialingWorkerFactory::new(strategy));
+        let factory = Arc::new(DialingWorkerFactory::new(Arc::new(NopUnderlying), strategy));
         let picker = IncrementalWorkerPicker::new(factory);
         assert_eq!(picker.worker_count().await, 0);
         picker.cleanup().await;
@@ -485,7 +812,7 @@ mod tests {
     #[tokio::test]
     async fn test_incremental_picker_pick_internal() {
         let strategy = ClientStrategy::default();
-        let factory = Arc::new(DialingWorkerFactory::new(strategy));
+        let factory = Arc::new(DialingWorkerFactory::new(Arc::new(NopUnderlying), strategy));
         let picker = IncrementalWorkerPicker::new(factory);
         let worker = picker.pick_internal().await;
         assert!(worker.is_some());
@@ -494,10 +821,7 @@ mod tests {
 
     #[test]
     fn test_client_error_display() {
-        assert_eq!(
-            format!("{}", ClientError::MuxDisabled),
-            "mux is not enabled"
-        );
+        assert_eq!(format!("{}", ClientError::MuxDisabled), "mux is not enabled");
         assert_eq!(
             format!("{}", ClientError::NoAvailableWorker),
             "no available worker"
@@ -510,5 +834,157 @@ mod tests {
         fn _assert_link_send(reader: Box<dyn Reader>, writer: Box<dyn Writer>) -> Link {
             Link { reader, writer }
         }
+    }
+
+    // ========== E2E：双并发会话 × 单 carrier ==========
+
+    /// 单条 echo 会话：写 payload → 读回显 → 半关闭 → 等 dispatch 返回。
+    async fn run_echo_session(
+        worker: &Arc<ClientWorker>,
+        dest: &Destination,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let (req_rd, req_wr) = pipe::new();
+        let (resp_rd, resp_wr) = pipe::new();
+        let link = Link {
+            reader: Box::new(req_rd),
+            writer: Box::new(resp_wr),
+        };
+        let w = Arc::clone(worker);
+        let dest = dest.clone();
+        let handle = tokio::spawn(async move { w.dispatch(&dest, link).await });
+
+        let mut req_wr = req_wr;
+        let mut resp_rd = resp_rd;
+        req_wr
+            .write_multi_buffer(MultiBuffer::from_buffer(Buffer::from_vec(
+                payload.to_vec(),
+            )))
+            .await
+            .expect("write request");
+
+        // 会话存活期间收响应（全双工时序），读完再半关闭
+        let mut got = Vec::with_capacity(payload.len());
+        while got.len() < payload.len() {
+            let mb = resp_rd.read_multi_buffer().await.expect("read echo");
+            assert!(!mb.is_empty(), "unexpected EOF before echo complete");
+            got.extend_from_slice(&mb.to_vec());
+        }
+
+        // 客户端半关闭 → fetch_input 发 End 帧 → session 关闭 → dispatch 返回
+        let _ = req_wr.close();
+        assert!(
+            handle.await.expect("dispatch task join"),
+            "worker.dispatch should accept the session"
+        );
+        got
+    }
+
+    /// E2E：mux client 双并发 TCP 会话 ↔ ServerWorker echo。
+    ///
+    /// 拓扑：DialingWorkerFactory(underlying=CarrierHandler) 建单条 carrier
+    /// （内存管道）→ ServerWorker.process_frame 解帧 → EchoDispatcher 回显。
+    /// 断言：两会话独立 roundtrip + 单 carrier 承载双会话
+    /// （server session_manager.count == 2）。
+    #[tokio::test]
+    async fn e2e_two_concurrent_sessions_over_single_carrier() {
+        use crate::worker::{DispatchError, Dispatcher, ServerWorker};
+
+        // ---- 服务端子会话目标：echo ----
+        struct EchoDispatcher;
+        #[async_trait::async_trait]
+        impl Dispatcher for EchoDispatcher {
+            async fn dispatch(&self, _dest: Destination) -> Result<Link, DispatchError> {
+                let (r_up, w_up) = pipe::new();
+                let (r_down, w_down) = pipe::new();
+                tokio::spawn(async move {
+                    let mut r = r_up;
+                    let mut w = w_down;
+                    loop {
+                        match r.read_multi_buffer().await {
+                            Ok(mb) => {
+                                if mb.is_empty() {
+                                    break;
+                                }
+                                if w.write_multi_buffer(mb).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let _ = w.close();
+                });
+                Ok(Link {
+                    reader: Box::new(r_down),
+                    writer: Box::new(w_up),
+                })
+            }
+        }
+
+        // ---- carrier：把底层 dispatch 的 carrier link 喂给 ServerWorker ----
+        struct CarrierHandler {
+            server: Arc<ServerWorker>,
+        }
+        impl std::fmt::Debug for CarrierHandler {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("CarrierHandler").finish()
+            }
+        }
+        impl xray_app_dispatcher::DispatchHandler for CarrierHandler {
+            fn tag(&self) -> &str {
+                "e2e-carrier"
+            }
+            fn dispatch(
+                &self,
+                _dest: &Destination,
+                link: xray_transport::link::Link,
+            ) -> xray_app_dispatcher::default::PinFuture<()> {
+                let server = Arc::clone(&self.server);
+                Box::pin(async move {
+                    let mut reader = BufferedReader::new(link.reader);
+                    let writer: Arc<Mutex<Option<Box<dyn Writer>>>> =
+                        Arc::new(Mutex::new(Some(link.writer)));
+                    let (ka, idle) = server.spawn_keepalive_and_idle_timeout(Arc::clone(&writer));
+                    while matches!(server.process_frame(&mut reader, &writer).await, Ok(true)) {}
+                    server.close();
+                    ka.abort();
+                    idle.abort();
+                })
+            }
+        }
+
+        let server = Arc::new(ServerWorker::new(Arc::new(EchoDispatcher)));
+        let underlying: Arc<dyn xray_app_dispatcher::DispatchHandler> =
+            Arc::new(CarrierHandler {
+                server: Arc::clone(&server),
+            });
+
+        // ---- 客户端：factory → picker → worker（单 carrier）----
+        let factory = Arc::new(DialingWorkerFactory::new(
+            underlying,
+            ClientStrategy::default(),
+        ));
+        let picker = IncrementalWorkerPicker::new(factory);
+        let worker = picker.pick_internal().await.expect("worker created");
+
+        let dest = Destination::new(
+            xray_common::net::address::Address::new_domain("echo.internal"),
+            xray_common::net::port::Port::new(80),
+            Network::TCP,
+        );
+
+        let (echo1, echo2) = tokio::join!(
+            run_echo_session(&worker, &dest, b"ping-one"),
+            run_echo_session(&worker, &dest, b"ping-two"),
+        );
+        assert_eq!(echo1, b"ping-one".to_vec());
+        assert_eq!(echo2, b"ping-two".to_vec());
+
+        assert_eq!(
+            server.session_manager().count(),
+            2,
+            "two sessions multiplexed over one carrier"
+        );
     }
 }

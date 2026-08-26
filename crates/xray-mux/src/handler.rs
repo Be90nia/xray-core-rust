@@ -26,6 +26,27 @@ use crate::session::ClientStrategy;
 /// mux handler 的 proxy 类型 URL（注册标识）
 pub const MUX_PROXY_TYPE_URL: &str = "xray.mux";
 
+/// 占位底层 handler：carrier 永不建立（dispatch future 挂起）。
+///
+/// ponytail: MuxOutboundHandler 的 xray_features 数据路径尚未接 transport 层
+/// （真实生产路径走 xray-core outbound.rs 的 MuxBridge）；DialingWorkerFactory
+/// 构造需要底层 handler，此处给 pending 占位，等待 transport 接入时替换。
+#[derive(Debug)]
+struct PendingUnderlying;
+
+impl xray_app_dispatcher::DispatchHandler for PendingUnderlying {
+    fn tag(&self) -> &str {
+        "mux-pending"
+    }
+    fn dispatch(
+        &self,
+        _dest: &Destination,
+        _link: xray_transport::link::Link,
+    ) -> xray_app_dispatcher::default::PinFuture<()> {
+        Box::pin(std::future::pending())
+    }
+}
+
 // ========== MuxOutboundHandler ==========
 
 /// Mux 出站 Handler——包装底层 outbound 实现多路复用。
@@ -58,7 +79,10 @@ impl MuxOutboundHandler {
             max_concurrency: effective,
             max_connection: 0,
         };
-        let factory = Arc::new(DialingWorkerFactory::new(strategy));
+        let factory = Arc::new(DialingWorkerFactory::new(
+            Arc::new(PendingUnderlying),
+            strategy,
+        ));
         let picker = Arc::new(IncrementalWorkerPicker::new(factory));
         Self {
             tag: tag.into(),

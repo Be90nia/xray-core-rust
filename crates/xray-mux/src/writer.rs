@@ -3,6 +3,7 @@
 //! 实现 MuxWriter 用于写入 Mux 协议帧数据
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use xray_buf::buffer::Buffer;
 use xray_buf::multi::MultiBuffer;
@@ -133,6 +134,40 @@ impl Writer for MuxWriter {
                 MuxError::Io(msg) => buf_io::Error::WriteError(msg),
                 other => buf_io::Error::WriteError(format!("{:?}", other)),
             })
+        })
+    }
+}
+
+// ========== 共享写端适配器 ==========
+
+/// 共享写端适配器：多个 [`MuxWriter`] 经由它共写同一底层 writer。
+///
+/// mux carrier 写端被 worker 的全部 session 复用（Go 中多个 `*Writer`
+/// 直接共享同一 `buf.Writer` 指针；Rust 的 `Box<dyn Writer>` 独占所有权，
+/// 经此适配器 + `Arc<tokio::sync::Mutex<..>>` 串行化共写）。
+pub(crate) struct SharedWriter {
+    inner: Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>>,
+}
+
+impl SharedWriter {
+    pub(crate) fn new(inner: Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>>) -> Self {
+        Self { inner }
+    }
+}
+
+impl Writer for SharedWriter {
+    fn write_multi_buffer<'a>(
+        &'a mut self,
+        mb: MultiBuffer,
+    ) -> Pin<Box<dyn Future<Output = buf_io::Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut guard = self.inner.lock().await;
+            match guard.as_mut() {
+                Some(w) => w.write_multi_buffer(mb).await,
+                None => Err(buf_io::Error::WriteError(
+                    "mux carrier writer closed".to_string(),
+                )),
+            }
         })
     }
 }

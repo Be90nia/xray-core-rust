@@ -300,33 +300,45 @@ impl ServerWorker {
     }
 
     /// Handle session output (upstream data back to mux).
+    ///
+    /// 多 session 经 [`SharedWriter`] 共写 carrier 写端（旧实现 `take()`
+    /// 独占写端，第二个 session 会拿到 None 直接关闭，无法多路复用）。
     async fn handle_session_output(
         session: Arc<Session>,
         link_writer: Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>>,
     ) {
-        let writer = {
-            let mut wg = link_writer.lock().await;
-            wg.take()
-        };
-        let writer = match writer {
-            Some(w) => w,
-            None => { session.close().await; return; }
-        };
-        let mut rw = MuxWriter::new_response_writer(session.id(), writer, session.transfer_type());
+        let mut rw = MuxWriter::new_response_writer(
+            session.id(),
+            Box::new(crate::writer::SharedWriter::new(Arc::clone(&link_writer))),
+            session.transfer_type(),
+        );
+        let mut done = session.done_receiver();
         loop {
             let mut input = session.input().await;
-            match input.as_mut() {
-                Some(reader) => match reader.read_multi_buffer().await {
-                    Ok(mb) => {
-                        if mb.is_empty() { break; }
-                        let byte_count = mb.len() as u64;
-                        session.add_downlink_bytes(byte_count);
-                        session.touch_active().await;
-                        if rw.write(mb).await.is_err() { rw.set_error(); break; }
-                    }
-                    Err(_) => { rw.set_error(); break; }
-                },
+            let Some(reader) = input.as_mut() else { break };
+            // select session done：Session::close 需先拿 input 锁才能中断，
+            // 持锁阻塞读期间必须可被 done 打断，否则与 close 互相等待死锁
+            let read = tokio::select! {
+                r = reader.read_multi_buffer() => Some(r),
+                _ = crate::client::wait_done(done.clone()) => None,
+            };
+            let mb = match read {
+                Some(Ok(mb)) => mb,
+                Some(Err(_)) => {
+                    rw.set_error();
+                    break;
+                }
                 None => break,
+            };
+            if mb.is_empty() {
+                break;
+            }
+            let byte_count = mb.len() as u64;
+            session.add_downlink_bytes(byte_count);
+            session.touch_active().await;
+            if rw.write(mb).await.is_err() {
+                rw.set_error();
+                break;
             }
         }
         let _ = rw.close().await;
