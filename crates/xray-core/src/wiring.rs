@@ -346,7 +346,7 @@ impl InboundDispatchHandler {
         // 此处仅同步返回。
         if let Err(e) = self
             .dispatcher
-            .dispatch_link(dest, link, &self.sniff, access)
+            .dispatch_link(dest, link, &self.sniff, access, None)
         {
             tracing::warn!(tag = %self.tag, error = %e, "dispatch_link failed");
         }

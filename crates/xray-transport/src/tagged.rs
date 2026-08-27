@@ -1,6 +1,11 @@
 //! # Tagged connection
 //!
 //! 给 Connection 附加 tag 字段的包装。对应 Go `transport/internet/tagged.go`。
+//!
+//! Go `transport/internet/tagged/taggedimpl` 的 `DialTaggedOutbound`（forced outbound
+//! tag + SkipDNSResolve 经 dispatcher 定向拨号，bd kz1）Rust 等价物在
+//! `xray_app_dispatcher::default::DefaultDispatcher::dispatch_tagged`——transport 层
+//! 不依赖 dispatcher，故不在此实现。
 
 use std::io;
 use std::net::SocketAddr;

@@ -736,7 +736,53 @@ impl DefaultDispatcher {
         let inbound = xray_transport::link::Link::new(inbound_reader, inbound_writer);
         let outbound = xray_transport::link::Link::new(outbound_reader, outbound_writer);
         // 启动 outbound handler；dispatch_link 内部 spawn handler.dispatch(outbound)
-        self.dispatch_link(destination, outbound, sniffing_request, None)?;
+        self.dispatch_link(destination, outbound, sniffing_request, None, None)?;
+        Ok(inbound)
+    }
+
+    /// 经 forced tag 定向拨号（对应 Go `tagged/taggedimpl.DialTaggedOutbound`，bd kz1）。
+    ///
+    /// Go 语义（impl.go:15-36）：设 `Content.SkipDNSResolve=true` + forced outbound tag
+    /// 后走 `dispatcher.Dispatch` 完整链，消费点在 routedDispatch（default.go:443-454）：
+    /// tag 无效即丢弃链路、不落默认出站。返回 Link 等价 Go `cnc.NewConnection` 包装。
+    ///
+    /// `SkipDNSResolve` 无需传递：forced 分支不经过路由（其路由侧消费点天然跳过）；
+    /// handler 侧 TargetStrategy 的 per-request skip 在 Rust dial_fn 链无 ctx 可传
+    /// （gap 见 outbound.rs `wrap_dial_with_target_strategy` 注记）。
+    ///
+    /// Go 消费方：geodata 下载（download.go:76）/ observatory（observer.go:146）/
+    /// burst ping（ping.go:42）。
+    pub fn dispatch_tagged(
+        &self,
+        destination: &xray_common::net::destination::Destination,
+        tag: &str,
+    ) -> Result<xray_transport::link::Link, DispatcherError> {
+        if tag.is_empty() {
+            return Err(DispatcherError::Other("empty forced outbound tag".into()));
+        }
+        // pipe 选项与 dispatch() 一致（Go DialTaggedOutbound 经同一 Dispatch 入口建链）
+        let policy = self
+            .policy_manager
+            .as_ref()
+            .map_or(self.default_policy.clone(), |pm| pm.policy_for_level(0));
+        let pipe_opt = xray_buf::pipe::PipeOption {
+            limit: policy.buffer.connection as i64,
+            idle_timeout: Some(policy.timeout.connection_idle),
+            ..xray_buf::pipe::PipeOption::default()
+        };
+        let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
+        let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
+        // inbound/outbound tag counter 均省略：Go ctx 无 session（DialTaggedOutbound 场景），
+        // outbound counter 由 dispatch_link 尾段按命中 handler tag 懒注册。
+        let inbound = xray_transport::link::Link::new(Box::new(dn_r), Box::new(up_w));
+        let outbound = xray_transport::link::Link::new(Box::new(up_r), Box::new(dn_w));
+        self.dispatch_link(
+            destination,
+            outbound,
+            &SniffingRequest::default(),
+            None,
+            Some(tag),
+        )?;
         Ok(inbound)
     }
 
@@ -746,10 +792,12 @@ impl DefaultDispatcher {
     ///
     /// 流程（对应 Go `routedDispatch`）：
     /// 1. 若 sniffing 启用：用 CachedReader 包装 outbound reader，读首包 → sniff → 可能覆盖 dest
-    /// 2. 若有 router：用 RoutingContext 调 router.pick_route() 选出站 handler
-    /// 3. 无 router 或路由失败：用默认 handler
-    /// 4. 记 access log（Accepted，含 detour 组合；对应 Go default.go:488-502）
-    /// 5. spawn handler.dispatch(link)
+    /// 2. `forced_tag` 非空：按 tag 直取 handler，无效即 Err，不回退默认
+    ///    （Go default.go:443-454 "platform initialized detour"，tag 不存在直接丢弃不落默认出站）
+    /// 3. 若有 router：用 RoutingContext 调 router.pick_route() 选出站 handler
+    /// 4. 无 router 或路由失败：用默认 handler
+    /// 5. 记 access log（Accepted，含 detour 组合；对应 Go default.go:488-502）
+    /// 6. spawn handler.dispatch(link)
     ///
     /// `access` 为 None 时不记（等价 Go ctx 无 AccessMessage）。
     #[allow(clippy::too_many_arguments)]
@@ -759,15 +807,31 @@ impl DefaultDispatcher {
         outbound: xray_transport::link::Link,
         sniffing_request: &SniffingRequest,
         access: Option<AccessContext>,
+        forced_tag: Option<&str>,
     ) -> Result<(), DispatcherError> {
         let ohm = self.ohm.as_ref().ok_or_else(|| {
             DispatcherError::Other("no outbound handler manager registered".into())
         })?;
 
+        let forced_tag = forced_tag.map(str::to_string);
+        // 预检查：forced tag 无效即同步 Err，绝不回退默认出站
+        // （Go default.go:449-454 tag 不存在直接丢弃链路，DO NOT CHANGE 注释；
+        // Rust 侧提升为同步错误，语义等价且调用方可提前感知）
+        if !forced_tag.as_deref().unwrap_or_default().is_empty()
+            && ohm.get_handler(forced_tag.as_deref().unwrap_or_default()).is_none()
+        {
+            return Err(DispatcherError::HandlerNotFound(
+                forced_tag.unwrap_or_default(),
+            ));
+        }
+
         // 预检查：如果没有 router 也没有 default handler，直接报错
         // （sniffing 后路由可能找到非 default handler，但无 router 无 default = 必定失败）
-        if self.router.is_none() && ohm.get_default_handler().is_none() {
+        if forced_tag.as_deref().unwrap_or_default().is_empty()
+            && self.router.is_none()
+            && ohm.get_default_handler().is_none()
             // 无路由可用 → Rejected（Go 仅 errors log；rejected 记录为 assignment 要求的扩展）
+        {
             if let (Some(sink), Some(ctx)) = (&self.access_sink, access) {
                 sink.record_access(&AccessLogEntry {
                     from: ctx.from,
@@ -814,10 +878,27 @@ impl DefaultDispatcher {
             } else {
                 (dest.clone(), None)
             };
+            // ---- Phase 2: Forced tag 旁路（Go default.go:443-454）----
+            let (handler, routed_pick) = if !forced_tag.as_deref().unwrap_or_default().is_empty() {
+                let tag = forced_tag.clone().unwrap_or_default();
+                match ohm.get_handler(&tag) {
+                    Some(h) => {
+                        tracing::info!(tag = %tag, "taking platform initialized detour for [%final_dest]");
+                        (Some(h), false)
+                    }
+                    None => {
+                        // Go DO NOT CHANGE 注释：指定 tag 不存在时不得落到默认出站
+                        tracing::error!(tag = %tag, "non existing tag for platform initialized detour");
+                        outbound_writer.shutdown();
+                        // outbound_reader 随 drop 关闭上行
+                        return;
+                    }
+                }
+            }
             // ---- Phase 2: Routing（resolved：domainStrategy DNS 解析路径） ----
             // pick_route_resolved 默认退化为同步 pick_route；RouterAdapter 生产实现
             // 委托 xray_app_router::Router::pick_route_resolved（携带完整 RoutingContext）。
-            let (handler, routed_pick) = if let Some(r) = &router {
+            else if let Some(r) = &router {
                 let ctx = build_routing_context(&final_dest, sniffed_protocol.as_deref());
                 match r.pick_route_resolved(&ctx).await {
                     Ok(route) => {
@@ -1796,7 +1877,7 @@ mod tests {
             Port::new(443),
             Network::TCP,
         );
-        d.dispatch_link(&dest, outbound, &SniffingRequest::default(), None)
+        d.dispatch_link(&dest, outbound, &SniffingRequest::default(), None, None)
             .expect("dispatch_link should spawn");
 
         // 写上行
@@ -1827,6 +1908,203 @@ mod tests {
         assert!(up_ctr.value() > 0, "uplink counted {} bytes", up_ctr.value());
         assert!(dn_ctr.value() > 0, "downlink counted {} bytes", dn_ctr.value());
         w.shutdown();
+    }
+
+    // ---- DialTaggedOutbound（bd kz1，Go tagged/taggedimpl）----
+
+    /// 定向命中：dispatch_tagged("beta") 恰好派发到 beta，alpha 不被触碰；
+    /// 数据面经 pipe 回显证明 Link 双向接通（Go impl.go:25-35 Dispatch+NewConnection 等价）。
+    #[tokio::test]
+    async fn dispatch_tagged_routes_to_tag_handler_with_echo() {
+        use xray_buf::multi::MultiBuffer;
+        use xray_common::net::address::Address;
+        use xray_common::net::destination::Destination;
+
+        let alpha_called = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ohm = SimpleOhm::new();
+        ohm.add(
+            "alpha",
+            Arc::new(TaggedEchoHandler::new("alpha", alpha_called.clone())),
+        );
+        ohm.add(
+            "beta",
+            Arc::new(TaggedEchoHandler::new("beta", std::sync::Arc::new(
+                std::sync::atomic::AtomicU32::new(0),
+            ))),
+        );
+        let mut d = DefaultDispatcher::new();
+        d.ohm = Some(Arc::new(ohm));
+
+        let dest = Destination::new(
+            Address::new_domain("geodata.example.com".to_string()),
+            Port::new(443),
+            Network::TCP,
+        );
+        let link = d
+            .dispatch_tagged(&dest, "beta")
+            .expect("dispatch_tagged should route to beta");
+
+        let mut w = link.writer;
+        let mut r = link.reader;
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(b"ping tagged");
+        w.write_multi_buffer(mb).await.unwrap();
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
+            .await
+            .expect("timeout waiting echo")
+            .unwrap();
+        assert_eq!(resp.to_vec(), b"ping tagged");
+        w.shutdown();
+
+        assert_eq!(
+            alpha_called.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "forced tag must not touch other handlers"
+        );
+    }
+
+    /// 未命中：tag 不存在时同步 Err，绝不回退默认出站
+    /// （Go default.go:449-454 + DO NOT CHANGE 注释语义）。
+    #[tokio::test]
+    async fn dispatch_tagged_missing_tag_errors_without_fallback() {
+        use xray_common::net::address::Address;
+        use xray_common::net::destination::Destination;
+
+        let default_called = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ohm = SimpleOhm::new();
+        ohm.set_default(Arc::new(TaggedEchoHandler::new(
+            "default-out",
+            default_called.clone(),
+        )));
+        let mut d = DefaultDispatcher::new();
+        d.ohm = Some(Arc::new(ohm));
+
+        let dest = Destination::new(
+            Address::new_domain("geodata.example.com".to_string()),
+            Port::new(443),
+            Network::TCP,
+        );
+        let res = d.dispatch_tagged(&dest, "ghost");
+        assert!(res.is_err(), "missing tag must be a sync error");
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            default_called.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "missing tag must NOT fall back to default handler"
+        );
+    }
+
+    /// 集成：真实 DialBridge 数据面 + 定向 tag 命中（Go observatory/burst 经
+    /// tagged.Dialer 拨指定出站的场景）：real 拨向 echo server，decoy 在册不被触碰。
+    #[tokio::test]
+    async fn dispatch_tagged_e2e_dial_bridge_to_echo_server() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+        use xray_buf::io::Writer;
+        use xray_buf::multi::MultiBuffer;
+        use xray_common::net::address::Address;
+        use xray_common::net::destination::Destination;
+        use xray_common::net::network::Network;
+        use xray_common::net::port::Port;
+        use xray_transport::connection::TcpConnection;
+
+        // 1. echo server
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let _ = sock.write_all(&buf[..n]).await;
+                    }
+                }
+            }
+        });
+
+        // 2. real：DialBridge → echo；decoy：计数 handler（在册，命中即计数）
+        let dial: DialFn = Arc::new(move |_dest: &Destination| {
+            Box::pin(async move {
+                let stream = TcpStream::connect(("127.0.0.1", echo_port))
+                    .await
+                    .map_err(|e| format!("connect: {e}"))?;
+                Ok(Box::new(TcpConnection::new(stream)) as Box<dyn Connection>)
+            })
+        });
+        let decoy_called = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ohm = SimpleOhm::new();
+        ohm.add("real-out", Arc::new(DialBridge::new("real-out", dial)));
+        ohm.add(
+            "decoy-out",
+            Arc::new(TaggedEchoHandler::new("decoy-out", decoy_called.clone())),
+        );
+        let mut d = DefaultDispatcher::new();
+        d.ohm = Some(Arc::new(ohm));
+
+        // 3. 定向拨号 real-out → 回显
+        let dest = Destination::new(
+            Address::from_ipv4_bytes([127, 0, 0, 1]),
+            Port::new(echo_port),
+            Network::TCP,
+        );
+        let link = d
+            .dispatch_tagged(&dest, "real-out")
+            .expect("dispatch_tagged to real-out");
+        let mut w = link.writer;
+        let mut r = link.reader;
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(b"hello tagged outbound");
+        w.write_multi_buffer(mb).await.unwrap();
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
+            .await
+            .expect("timeout waiting echo")
+            .unwrap();
+        assert_eq!(resp.to_vec(), b"hello tagged outbound");
+        w.shutdown();
+
+        assert_eq!(
+            decoy_called.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "decoy outbound must stay untouched"
+        );
+    }
+
+    /// 可参数化 tag 的计数+回显 handler（kz1 定向拨号测试）。
+    #[derive(Debug)]
+    struct TaggedEchoHandler {
+        tag: &'static str,
+        called: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    }
+    impl TaggedEchoHandler {
+        fn new(tag: &'static str, called: std::sync::Arc<std::sync::atomic::AtomicU32>) -> Self {
+            Self { tag, called }
+        }
+    }
+    impl DispatchHandler for TaggedEchoHandler {
+        fn tag(&self) -> &str {
+            self.tag
+        }
+        fn dispatch(
+            &self,
+            _dest: &xray_common::net::destination::Destination,
+            link: xray_transport::link::Link,
+        ) -> PinFuture<()> {
+            let called = std::sync::Arc::clone(&self.called);
+            Box::pin(async move {
+                called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut r = link.reader;
+                let mut w = link.writer;
+                if let Ok(mb) = r.read_multi_buffer().await {
+                    if !mb.is_empty() {
+                        let _ = w.write_multi_buffer(mb).await;
+                    }
+                }
+                w.shutdown();
+            })
+        }
     }
 
     // ---- UDP443 策略（bd g35，Go handler.go:220-228） ----
@@ -2208,7 +2486,7 @@ mod tests {
             email: "u@x.com".into(),
             inbound_tag: "socks-in".into(),
         };
-        d.dispatch_link(&access_dest(), link, &SniffingRequest::default(), Some(access))
+        d.dispatch_link(&access_dest(), link, &SniffingRequest::default(), Some(access), None)
             .expect("dispatch_link ok");
 
         // 等 handler 被调（record 严格发生在 handler.dispatch 之前）
@@ -2259,7 +2537,7 @@ mod tests {
             Box::new(_r) as Box<dyn xray_buf::io::Reader>,
             Box::new(_w) as Box<dyn xray_buf::io::Writer>,
         );
-        d.dispatch_link(&access_dest(), link, &SniffingRequest::default(), None)
+        d.dispatch_link(&access_dest(), link, &SniffingRequest::default(), None, None)
             .expect("dispatch_link ok");
 
         for _ in 0..100 {
@@ -2295,7 +2573,7 @@ mod tests {
             email: String::new(),
             inbound_tag: "socks-in".into(),
         };
-        let res = d.dispatch_link(&access_dest(), link, &SniffingRequest::default(), Some(access));
+        let res = d.dispatch_link(&access_dest(), link, &SniffingRequest::default(), Some(access), None);
         assert!(res.is_err(), "no handler should be a sync error");
 
         let entries = sink.0.lock().clone();

@@ -75,7 +75,7 @@ impl LoopbackSink for DispatcherLoopbackSink {
     ) -> LoopbackFuture<std::result::Result<(), LoopbackError>> {
         use xray_app_dispatcher::default::SniffingRequest;
         let sniffing = SniffingRequest::default();
-        match self.inner.dispatch_link(&destination, link, &sniffing, None) {
+        match self.inner.dispatch_link(&destination, link, &sniffing, None, None) {
             Ok(()) => Box::pin(async { Ok(()) }),
             Err(e) => Box::pin(async move {
                 Err(LoopbackError::DispatchFailed(e.to_string()))
