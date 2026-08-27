@@ -395,9 +395,9 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
     fn listen(
         &self,
         bind_addr: SocketAddr,
-        _config: Arc<crate::proto_config::Config>,
+        config: Arc<crate::proto_config::Config>,
         quic_params: Arc<QuicParams>,
-        _masq: crate::hub::MasqType,
+        masq: crate::hub::MasqType,
         validator: Option<Arc<dyn crate::hub::AuthValidator>>,
         on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync>,
     ) -> Pin<Box<dyn std::future::Future<Output = crate::error::Result<Arc<dyn HysteriaQuicListener>>> + Send>> {
@@ -405,6 +405,10 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
         let mut rustls_config = (*self.rustls_server_config).clone();
         rustls_config.alpn_protocols = vec![b"h3".to_vec()];
         let salamander = self.salamander.clone();
+        // masq handler（对应 Go hub.go:210-254 listen 时 switch masqType 构造）+
+        // 静态 auth token（Go hub.go:63-64 validator 缺席时 config.Auth 对比）
+        let masq_handler = masq.build_handler();
+        let static_auth = config.auth.clone();
         Box::pin(async move {
             let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
                 .map_err(|e| crate::error::HysteriaError::Io(io::Error::other(format!("rustls→quic server: {e}"))))?;
@@ -434,6 +438,8 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
                     let validator = validator.clone();
                     let on_new_conn = on_new_conn.clone();
                     let quic_params = quic_params.clone();
+                    let masq_handler = masq_handler.clone();
+                    let static_auth = static_auth.clone();
                     let (tc, cc_slot) = build_hysteria_transport_config(&qc);
                     let mut server_config = template.clone();
                     server_config.transport_config(Arc::new(tc));
@@ -441,7 +447,7 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
                         match incoming.accept_with(Arc::new(server_config)) {
                             Ok(connecting) => match connecting.await {
                                 Ok(conn) => {
-                                    serve_hysteria_connection(conn, validator, on_new_conn, quic_params, cc_slot).await;
+                                    serve_hysteria_connection(conn, validator, on_new_conn, quic_params, cc_slot, masq_handler, static_auth).await;
                                 }
                                 Err(e) => {
                                     tracing::debug!(error = ?e, "hysteria quic handshake failed");
@@ -472,6 +478,8 @@ async fn serve_hysteria_connection(
     on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync>,
     quic_params: Arc<QuicParams>,
     cc_slot: std::sync::Arc<crate::congestion::quinn_bridge::HysteriaCCSlot>,
+    masq: Arc<dyn crate::hub::MasqueradeHandler>,
+    static_auth: String,
 ) {
     let remote = conn.remote_address();
     let local = conn
@@ -479,12 +487,14 @@ async fn serve_hysteria_connection(
         .map(|ip| SocketAddr::new(ip, 0))
         .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0));
 
-    // Phase 1: h3 /auth 握手（返回客户端 CCRX 供 CC 协商）
-    let auth_down = match h3_auth(&conn, &validator, &quic_params).await {
+    // Phase 1: h3 /auth 握手（返回客户端 CCRX 供 CC 协商）。
+    // 非 auth 请求 / 密码错由 h3_auth 内 masquerade 应答（连接保持，Go hub.go:112-117）；
+    // None 仅在 h3 层终结（客户端断开）时返回。
+    let auth_down = match h3_auth(&conn, &validator, &quic_params, &masq, &static_auth).await {
         Some(down) => down,
         None => {
-            tracing::warn!(%remote, "hysteria auth failed, closing");
-            conn.close(VarInt::from_u32(0), b"auth failed");
+            tracing::debug!(%remote, "hysteria h3 auth phase ended without auth");
+            conn.close(VarInt::from_u32(0), b"");
             return;
         }
     };
@@ -517,11 +527,13 @@ async fn serve_hysteria_connection(
     }
 }
 
-/// h3 `/auth` 握手：accept 一个 HTTP/3 请求，校验 `Hysteria-Auth`，回应 233/403。
+/// h3 请求处理：auth 判定 + masquerade 分发（对应 Go `httpHandler.ServeHTTP` hub.go:112-117）。
 ///
-/// 成功返回 `Some(客户端 Hysteria-CC-RX)`（客户端下行容量，Go hub.go:66 取请求头
-/// 供 UseBrutal(min(BrutalUp, down)) 协商）；响应头回 `Hysteria-CC-RX` = 本端
-/// BrutalDown（Go hub.go:51）供客户端对称协商。失败返回 None。
+/// 每个请求先过 AuthHTTP 判定（Go hub.go:44：POST + :authority=="hysteria" +
+/// path=="/auth"）；通过 → 233 + `Hysteria-*` 头，成功返回 `Some(客户端 CCRX)`
+/// （Go hub.go:66 供 UseBrutal(min(BrutalUp, down)) 协商）。
+/// 不通过（非 auth 请求或密码错，Go hub.go:67 user==nil 时直接 false）→ masq handler
+/// 应答并继续循环（连接保持）。None 仅在 h3 层 accept 终结时返回。
 ///
 /// h3 server Connection 在函数内创建并使用。认证成功后，h3 server 的 Drop 会关闭
 /// QUIC 连接（H3_NO_ERROR）——用 `std::mem::forget` 防止，保持连接存活以接收 raw data stream。
@@ -531,6 +543,8 @@ async fn h3_auth(
     conn: &quinn::Connection,
     validator: &Option<Arc<dyn crate::hub::AuthValidator>>,
     quic_params: &QuicParams,
+    masq: &Arc<dyn crate::hub::MasqueradeHandler>,
+    static_auth: &str,
 ) -> Option<u64> {
     let h3_server: h3::server::Connection<h3_quinn::Connection, bytes::Bytes> =
         match h3::server::Connection::new(h3_quinn::Connection::new(conn.clone())).await {
@@ -555,13 +569,20 @@ async fn h3_auth(
                     Ok(v) => v,
                     Err(_) => bail!(),
                 };
-                let is_auth = req.method() == http::Method::POST
-                    && req.uri().path() == crate::config::URLPath;
+                let method = req.method().as_str().to_string();
+                let path = req.uri().path().to_string();
+                // Go hub.go:44 r.Host == URLHost —— h3 的 :authority 伪头。
+                let host = req
+                    .uri()
+                    .authority()
+                    .map(|a| a.host().to_string())
+                    .unwrap_or_default();
                 let auth_hdr = req
                     .headers()
                     .get(crate::config::RequestHeaderAuth)
                     .and_then(|v| v.to_str().ok())
-                    .unwrap_or("");
+                    .unwrap_or("")
+                    .to_string();
                 // 客户端下行容量（Go hub.go:66 请求头 CCRX → UseBrutal 的 down）。
                 let client_down = req
                     .headers()
@@ -569,37 +590,70 @@ async fn h3_auth(
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(0);
+                let req_headers: HashMap<String, String> = req
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.as_str().to_string(),
+                            v.to_str().unwrap_or_default().to_string(),
+                        )
+                    })
+                    .collect();
+                drop(req);
+
+                let is_auth = method == "POST"
+                    && host == crate::config::URLHost
+                    && path == crate::config::URLPath;
+                // Go hub.go:61-65：validator 非空且 count>0 → 查表；否则 config.Auth
+                // 非空 → 静态比对；两者皆无 → false（安全侧：拒绝）。
                 let ok = if !is_auth {
                     false
-                } else if let Some(v) = validator {
-                    v.validate(auth_hdr).is_some()
                 } else {
-                    true
+                    match validator {
+                        Some(v) if v.count() > 0 => v.validate(&auth_hdr).is_some(),
+                        _ if !static_auth.is_empty() => auth_hdr == static_auth,
+                        _ => false,
+                    }
                 };
-                let status = if ok {
-                    crate::config::StatusAuthOK
-                } else {
-                    403u16
-                };
-                let resp = http::Response::builder()
-                    .status(status)
-                    // Go hub.go:50 strconv.FormatBool(validator != nil)
-                    .header(crate::config::ResponseHeaderUDPEnabled, "true")
-                    // Go hub.go:51 本端 BrutalDown（客户端协商 UseBrutal 的 down）。
-                    .header(crate::config::CommonHeaderCCRX, quic_params.brutal_down.to_string())
-                    .header(crate::config::CommonHeaderPadding, "0")
-                    .body(());
-                match resp {
+
+                if ok {
+                    // Go hub.go:49-53/102-105：233 + Hysteria-* 头
+                    let resp = http::Response::builder()
+                        .status(crate::config::StatusAuthOK)
+                        .header(crate::config::ResponseHeaderUDPEnabled, "true")
+                        // Go hub.go:51 本端 BrutalDown（客户端协商 UseBrutal 的 down）。
+                        .header(crate::config::CommonHeaderCCRX, quic_params.brutal_down.to_string())
+                        .header(crate::config::CommonHeaderPadding, "0")
+                        .body(());
+                    match resp {
+                        Ok(r) => {
+                            let _ = stream.send_response(r).await;
+                            let _ = stream.finish().await;
+                        }
+                        Err(_) => bail!(),
+                    }
+                    std::mem::forget(h3_server);
+                    return Some(client_down);
+                }
+
+                // masquerade（Go hub.go:112-117：AuthHTTP false → masqHandler.ServeHTTP）
+                let (status, headers, body) = masq.serve(&method, &path, &req_headers).await;
+                let mut builder = http::Response::builder().status(status);
+                for (k, v) in &headers {
+                    builder = builder.header(k.as_str(), v.as_str());
+                }
+                match builder.body(()) {
                     Ok(r) => {
                         let _ = stream.send_response(r).await;
+                        if !body.is_empty() {
+                            let _ = stream.send_data(bytes::Bytes::from(body)).await;
+                        }
                         let _ = stream.finish().await;
                     }
                     Err(_) => bail!(),
                 }
-                if ok {
-                    std::mem::forget(h3_server);
-                    return Some(client_down);
-                }
+                // 连接保持，继续处理后续请求（Go h3 server 持续 serve）
             }
             Ok(None) => bail!(),
             Err(e) => {
@@ -1288,6 +1342,223 @@ mod tests {
         let mut got = vec![0u8; payload.len()];
         isc.read(&mut got).await.expect("client read echo");
         assert_eq!(&got, payload, "echo roundtrip with Brutal negotiated both sides");
+
+        let _ = listener.close().await;
+    }
+
+    /// e2e masquerade（bd ect）：非 hysteria 的 h3 请求 → 伪装响应。
+    ///
+    /// 对齐 Go `hub.go:112-117` ServeHTTP：非 auth 请求（这里 GET /，:authority=
+    /// localhost ≠ hysteria）→ masqHandler。响应 status/headers/body 为
+    /// `MasqType::String` 配置原样；连接不关，第二个请求仍走 masq。
+    #[tokio::test]
+    async fn masquerade_serves_non_auth_h3_request() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        ensure_crypto_provider();
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key_der = rustls::pki_types::PrivateKeyDer::try_from(
+            cert.key_pair.serialize_der(),
+        ).unwrap();
+        let server_tls = rustls::server::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.into()], key_der)
+            .unwrap();
+
+        let factory = QuinnListenerFactory::new(Arc::new(server_tls));
+        let masq = crate::hub::MasqType::String {
+            body: "fake website".into(),
+            headers: HashMap::from([("X-Masq".to_string(), "1".to_string())]),
+            status_code: 200,
+        };
+        struct MasqValidator;
+        impl crate::hub::AuthValidator for MasqValidator {
+            fn validate(&self, auth: &str) -> Option<String> {
+                if auth == "secret" { Some("user".into()) } else { None }
+            }
+            fn count(&self) -> usize { 1 }
+        }
+        let on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync> = Arc::new(|_| {});
+        let listener = factory
+            .listen(
+                "127.0.0.1:0".parse().unwrap(),
+                Arc::new(crate::proto_config::Config::default()),
+                Arc::new(xray_proto::xray::transport::internet::QuicParams::default()),
+                masq,
+                Some(Arc::new(MasqValidator)),
+                on_new_conn,
+            )
+            .await
+            .expect("listen should succeed");
+        let server_addr = listener.local_addr();
+
+        // 普通 h3 客户端：GET /，无任何 hysteria 头
+        let mut client_crypto = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        client_crypto.alpn_protocols = vec![b"h3".to_vec()];
+        let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        ep.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).unwrap(),
+        )));
+        let conn = ep.connect(server_addr, "localhost").unwrap().await.unwrap();
+        let (mut driver, mut send_req) =
+            h3::client::new(h3_quinn::Connection::new(conn)).await.unwrap();
+        tokio::spawn(async move { let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await; });
+
+        async fn get_page(
+            send_req: &mut h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>,
+        ) -> (u16, Option<String>, Vec<u8>) {
+            let req = http::Request::builder()
+                .method("GET")
+                .uri("https://localhost/")
+                .body(())
+                .unwrap();
+            let mut stream = send_req.send_request(req).await.unwrap();
+            stream.finish().await.unwrap();
+            let resp = stream.recv_response().await.unwrap();
+            let status = resp.status().as_u16();
+            let x_masq = resp
+                .headers()
+                .get("X-Masq")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let mut body = Vec::new();
+            use bytes::Buf as _;
+            while let Some(chunk) = stream.recv_data().await.unwrap() {
+                body.extend_from_slice(chunk.chunk());
+            }
+            (status, x_masq, body)
+        }
+
+        let (status, x_masq, body) = get_page(&mut send_req).await;
+        assert_eq!(status, 200, "非 auth 请求必须收到 masq 响应而非 403/断连");
+        assert_eq!(x_masq.as_deref(), Some("1"));
+        assert_eq!(body, b"fake website");
+
+        // 同连接第二个请求：连接不因 masq 关闭（Go h3 server 持续 serve）
+        let (status, _, body) = get_page(&mut send_req).await;
+        assert_eq!((status, body.as_slice()), (200, &b"fake website"[..]));
+
+        let _ = listener.close().await;
+    }
+
+    /// e2e masquerade（bd ect）：auth 密码错 → 伪装响应（非 403/断连）；
+    /// 正确密码 auth → 233（正常 hysteria 流量不受 masquerade 影响）。
+    ///
+    /// 对齐 Go `hub.go:43-110`：AuthHTTP 校验失败不写响应直接 false → masqHandler；
+    /// 校验通过 → 233 + Hysteria-* 头。
+    #[tokio::test]
+    async fn masquerade_covers_failed_auth_and_correct_auth_works() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        ensure_crypto_provider();
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key_der = rustls::pki_types::PrivateKeyDer::try_from(
+            cert.key_pair.serialize_der(),
+        ).unwrap();
+        let server_tls = rustls::server::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.into()], key_der)
+            .unwrap();
+
+        let factory = QuinnListenerFactory::new(Arc::new(server_tls));
+        let masq = crate::hub::MasqType::String {
+            body: "masqueraded".into(),
+            headers: HashMap::new(),
+            status_code: 200,
+        };
+        struct MasqValidator2;
+        impl crate::hub::AuthValidator for MasqValidator2 {
+            fn validate(&self, auth: &str) -> Option<String> {
+                if auth == "secret" { Some("user".into()) } else { None }
+            }
+            fn count(&self) -> usize { 1 }
+        }
+        let on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync> = Arc::new(|_| {});
+        let listener = factory
+            .listen(
+                "127.0.0.1:0".parse().unwrap(),
+                Arc::new(crate::proto_config::Config::default()),
+                Arc::new(xray_proto::xray::transport::internet::QuicParams::default()),
+                masq,
+                Some(Arc::new(MasqValidator2)),
+                on_new_conn,
+            )
+            .await
+            .expect("listen should succeed");
+        let server_addr = listener.local_addr();
+
+        let mut client_crypto = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        client_crypto.alpn_protocols = vec![b"h3".to_vec()];
+        let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        ep.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).unwrap(),
+        )));
+        let conn = ep.connect(server_addr, "localhost").unwrap().await.unwrap();
+        let (mut driver, mut send_req) =
+            h3::client::new(h3_quinn::Connection::new(conn)).await.unwrap();
+        tokio::spawn(async move { let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await; });
+
+        // 错密码 POST /auth（hysteria 协议形态，:authority=hysteria）→ masq 响应
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("https://hysteria/auth")
+            .header("Hysteria-Auth", "wrong-password")
+            .body(())
+            .unwrap();
+        let mut stream = send_req.send_request(req).await.unwrap();
+        stream.finish().await.unwrap();
+        let resp = stream.recv_response().await.unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "auth 密码错必须落 masq（非 233/403/断连）"
+        );
+        let mut body = Vec::new();
+        use bytes::Buf as _;
+        while let Some(chunk) = stream.recv_data().await.unwrap() {
+            body.extend_from_slice(chunk.chunk());
+        }
+        assert_eq!(body, b"masqueraded");
+
+        // 新连接：正确密码 auth → 233（正常 hysteria 流量不受影响）
+        let conn2 = ep.connect(server_addr, "localhost").unwrap().await.unwrap();
+        let (mut driver2, mut send_req2) =
+            h3::client::new(h3_quinn::Connection::new(conn2)).await.unwrap();
+        tokio::spawn(async move { let _ = std::future::poll_fn(|cx| driver2.poll_close(cx)).await; });
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("https://hysteria/auth")
+            .header("Hysteria-Auth", "secret")
+            .header("Hysteria-CC-RX", "0")
+            .body(())
+            .unwrap();
+        let mut stream = send_req2.send_request(req).await.unwrap();
+        stream.finish().await.unwrap();
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.recv_response(),
+        )
+        .await
+        .expect("auth response should arrive")
+        .unwrap();
+        assert_eq!(resp.status().as_u16(), 233, "正确密码 auth → 233");
+        assert_eq!(
+            resp.headers().get("Hysteria-CC-RX").unwrap(),
+            "0",
+            "233 响应带 Hysteria-CC-RX（Go hub.go:103）"
+        );
 
         let _ = listener.close().await;
     }

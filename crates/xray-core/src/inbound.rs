@@ -2135,6 +2135,21 @@ fn parse_hysteria_inbound_config(
     let quic_params = xray_transport_hysteria::quic_params::parse_quic_params(finalmask_json)?
         .unwrap_or_else(xray_transport_hysteria::quic_params::default_hysteria_quic_params);
     let config = config.with_quic_params(quic_params);
+    // masquerade 嵌套对象（Go infra/conf transport_internet.go:498-549）：展开到
+    // proto 扁平字段再 MasqType::from_config（Go hub.go:210-254 同构）
+    let config = if v.get("masquerade").is_some() {
+        let mut proto = xray_transport_hysteria::proto_config::Config::default();
+        xray_transport_hysteria::proto_config::apply_masquerade_json(
+            &mut proto,
+            v.get("masquerade").unwrap_or(&serde_json::Value::Null),
+        )?;
+        config.with_masq(
+            xray_transport_hysteria::hub::MasqType::from_config(&proto)
+                .map_err(|e| std::io::Error::other(format!("hysteria masquerade: {e}")))?,
+        )
+    } else {
+        config
+    };
     // salamander UDP 混淆：streamSettings.finalmask.udp[]（对应 Go UdpmaskManager）
     let salamander = xray_transport_hysteria::salamander_socket::parse_salamander_obfs(finalmask_json)?;
     let factory: Arc<dyn xray_transport_hysteria::hub::HysteriaListenerFactory> =
@@ -2488,6 +2503,40 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// ect：`hysteriaSettings.masquerade` JSON → proxy HysteriaConfig.masq
+    /// （Go infra/conf transport_internet.go:498-549 展开路径）。
+    #[test]
+    fn parse_hysteria_inbound_masquerade() {
+        use xray_transport_hysteria::hub::MasqType;
+        let addr: std::net::SocketAddr = "127.0.0.1:8443".parse().unwrap();
+
+        // string 类：content/headers/statusCode 全解析
+        let data = br#"{"auth":"t","masquerade":{"type":"string","content":"hi","headers":{"X-A":"1"},"statusCode":418}}"#;
+        let (config, _factory) = parse_hysteria_inbound_config(data, addr, None).unwrap();
+        match config.masq.as_ref().unwrap() {
+            MasqType::String { body, headers, status_code } => {
+                assert_eq!(body, "hi");
+                assert_eq!(headers.get("X-A").unwrap(), "1");
+                assert_eq!(*status_code, 418);
+            }
+            other => panic!("expected String masq, got {other:?}"),
+        }
+
+        // file 类
+        let data = br#"{"masquerade":{"type":"file","dir":"/var/www"}}"#;
+        let (config, _factory) = parse_hysteria_inbound_config(data, addr, None).unwrap();
+        assert_eq!(config.masq.as_ref().unwrap(), &MasqType::File("/var/www".into()));
+
+        // 未知类型 → parse 错误（Go hub.go:252-253 "unknown masq type"）
+        let data = br#"{"masquerade":{"type":"bogus"}}"#;
+        assert!(parse_hysteria_inbound_config(data, addr, None).is_err());
+
+        // 无 masquerade → None（零行为变化）
+        let data = br#"{"auth":"t"}"#;
+        let (config, _factory) = parse_hysteria_inbound_config(data, addr, None).unwrap();
+        assert!(config.masq.is_none());
+    }
 
     /// rxw：HysteriaTcpDispatch 适配器——mock QUIC stream → dispatch（freedom）→ echo 回环。
     #[tokio::test]

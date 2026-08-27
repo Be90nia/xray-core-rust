@@ -67,6 +67,26 @@ impl MasqType {
             other => Err(HysteriaError::UnknownMasqType(other.into())),
         }
     }
+
+    /// 构造 masquerade handler（对应 Go `hub.go:210-254` listen 时 switch masqType）。
+    #[must_use]
+    pub fn build_handler(&self) -> std::sync::Arc<dyn MasqueradeHandler> {
+        match self {
+            Self::NotFound => std::sync::Arc::new(NotFoundMasqHandler),
+            Self::File(dir) => std::sync::Arc::new(FileMasqHandler::new(dir.clone())),
+            // Go 用 httputil.ReverseProxy 真反代（ErrorHandler 502）；本实现保持
+            // 503 类兜底响应（任务授权 "proxy 503 类"），url/rewrite_host/insecure
+            // 暂不消费（ponytail: 接入 hyper 反代时再扩展）。
+            Self::Proxy { .. } => std::sync::Arc::new(ProxyMasqHandler),
+            Self::String { body, headers, status_code } => {
+                std::sync::Arc::new(StringMasqHandler {
+                    body: body.clone(),
+                    headers: headers.clone(),
+                    status_code: *status_code,
+                })
+            }
+        }
+    }
 }
 
 /// Masquerade HTTP handler trait（对应 Go `http.Handler`）。
@@ -88,8 +108,23 @@ pub trait MasqueradeHandler: Send + Sync {
 }
 
 /// 默认 NotFound 实现（对应 Go `http.NotFoundHandler()`）。
+///
+/// body/headers 对齐 Go `http.Error(w, "404 page not found", 404)`：
+/// `"404 page not found\n"` + `Content-Type: text/plain; charset=utf-8` + `nosniff`。
 #[derive(Debug, Default)]
 pub struct NotFoundMasqHandler;
+
+/// Go `http.Error` 风格 404（FileServer/NotFoundHandler 共用）。
+fn go_not_found() -> (u16, HashMap<String, String>, Vec<u8>) {
+    (
+        404,
+        HashMap::from([
+            ("Content-Type".to_string(), "text/plain; charset=utf-8".to_string()),
+            ("X-Content-Type-Options".to_string(), "nosniff".to_string()),
+        ]),
+        b"404 page not found\n".to_vec(),
+    )
+}
 
 impl MasqueradeHandler for NotFoundMasqHandler {
     fn serve(
@@ -98,11 +133,122 @@ impl MasqueradeHandler for NotFoundMasqHandler {
         _path: &str,
         _headers: &HashMap<String, String>,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = (u16, HashMap<String, String>, Vec<u8>)> + Send,
-        >,
+        Box<dyn std::future::Future<Output = (u16, HashMap<String, String>, Vec<u8>)> + Send>,
     > {
-        Box::pin(async { (404, HashMap::new(), b"Not Found".to_vec()) })
+        Box::pin(async { go_not_found() })
+    }
+}
+
+/// File masquerade 实现（对应 Go `"file"` 分支 `http.FileServer(http.Dir(MasqFile))`）。
+///
+/// 最小语义对齐：GET/HEAD 之外 405（Go `serveFile`）；路径穿越（`..` 组件）拒绝；
+/// 目录 → `index.html`；缺失 404（Go body）。Go FileServer 的目录列表与 301
+/// 尾斜杠重定向未复刻（ponytail: 伪装场景只需文件内容，需要时再加）。
+#[derive(Debug, Clone)]
+pub struct FileMasqHandler {
+    /// 服务根目录（对应 Go `http.Dir(config.MasqFile)`）。
+    pub root: std::path::PathBuf,
+}
+
+impl FileMasqHandler {
+    #[must_use]
+    pub fn new(root: impl Into<std::path::PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+}
+
+/// URL path → root 内文件路径；目录解析到 index.html，`..` 组件拒绝（对应 Go http.Dir）。
+fn resolve_masq_file(
+    root: &std::path::Path,
+    url_path: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    let mut full = root.to_path_buf();
+    for comp in url_path.trim_start_matches('/').split('/') {
+        match comp {
+            "" | "." => continue,
+            ".." => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "path traversal",
+                ))
+            }
+            c => full.push(c),
+        }
+    }
+    if full.is_dir() {
+        full.push("index.html");
+    }
+    if !full.starts_with(root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "outside root",
+        ));
+    }
+    Ok(full)
+}
+
+/// 扩展名 → Content-Type（对应 Go `mime.TypeByExtension` 常见子集）。
+fn masq_content_type(p: &std::path::Path) -> String {
+    match p.extension().and_then(|e| e.to_str()).unwrap_or("") {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" => "text/javascript; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "txt" => "text/plain; charset=utf-8",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+impl MasqueradeHandler for FileMasqHandler {
+    fn serve(
+        &self,
+        method: &str,
+        path: &str,
+        _headers: &HashMap<String, String>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = (u16, HashMap<String, String>, Vec<u8>)> + Send>,
+    > {
+        let root = self.root.clone();
+        let method = method.to_string();
+        let path = path.to_string();
+        Box::pin(async move {
+            if method != "GET" && method != "HEAD" {
+                return (
+                    405,
+                    HashMap::from([
+                        ("Allow".to_string(), "GET, HEAD".to_string()),
+                        ("Content-Type".to_string(), "text/plain; charset=utf-8".to_string()),
+                        ("X-Content-Type-Options".to_string(), "nosniff".to_string()),
+                    ]),
+                    b"Method Not Allowed\n".to_vec(),
+                );
+            }
+            let resolved = match resolve_masq_file(&root, &path) {
+                Ok(p) => p,
+                Err(_) => return go_not_found(),
+            };
+            match tokio::fs::read(&resolved).await {
+                Ok(bytes) => (
+                    200,
+                    HashMap::from([(
+                        "Content-Type".to_string(),
+                        masq_content_type(&resolved),
+                    )]),
+                    if method == "HEAD" { Vec::new() } else { bytes },
+                ),
+                Err(_) => {
+                    // HEAD 不写 body（Go net/http HEAD 短路）
+                    let (s, h, _) = go_not_found();
+                    (s, h, if method == "HEAD" { Vec::new() } else { b"404 page not found\n".to_vec() })
+                }
+            }
+        })
     }
 }
 
@@ -454,7 +600,7 @@ mod tests {
         let h = NotFoundMasqHandler;
         let (status, _, body) = h.serve("GET", "/anything", &HashMap::new()).await;
         assert_eq!(status, 404);
-        assert_eq!(body, b"Not Found");
+        assert_eq!(body, b"404 page not found\n");
     }
 
     #[tokio::test]
@@ -528,5 +674,106 @@ mod tests {
         );
         assert_eq!(l.bind_addr(), addr);
         assert_eq!(l.masq_type(), &MasqType::File("/tmp".into()));
+    }
+
+    // ===== masquerade handler（bd ect：对齐 Go hub.go:210-254 switch + FileServer） =====
+
+    #[tokio::test]
+    async fn build_handler_maps_all_masq_types() {
+        // ""/"404" → NotFound；"file" → File；"proxy" → Proxy(503 类)；"string" → String
+        // 行为断言（trait object 无法 matches 具体类型）：
+        // NotFound → Go 404 body；Proxy → 503；String → 配置 body/status。
+        let n = MasqType::NotFound.build_handler();
+        let (status, _, body) = n.serve("GET", "/", &HashMap::new()).await;
+        assert_eq!((status, body.as_slice()), (404, &b"404 page not found\n"[..]));
+        let p = MasqType::Proxy { url: "https://e.com".into(), rewrite_host: false, insecure: false }
+            .build_handler();
+        assert_eq!(p.serve("GET", "/", &HashMap::new()).await.0, 503);
+        let s = MasqType::String {
+            body: "ok".into(),
+            headers: HashMap::new(),
+            status_code: 200,
+        }
+        .build_handler();
+        let (status, _, body) = s.serve("GET", "/", &HashMap::new()).await;
+        assert_eq!((status, body.as_slice()), (200, &b"ok"[..]));
+    }
+
+    #[tokio::test]
+    async fn not_found_handler_go_exact_body() {
+        // Go http.NotFoundHandler → http.Error(w, "404 page not found", 404)
+        let (status, headers, body) =
+            NotFoundMasqHandler.serve("GET", "/anything", &HashMap::new()).await;
+        assert_eq!(status, 404);
+        assert_eq!(body, b"404 page not found\n");
+        assert_eq!(headers.get("Content-Type").unwrap(), "text/plain; charset=utf-8");
+        assert_eq!(headers.get("X-Content-Type-Options").unwrap(), "nosniff");
+    }
+
+    #[tokio::test]
+    async fn file_masq_serves_file_content() {
+        let dir = std::env::temp_dir().join("hys_masq_test_file");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("page.html"), b"<h1>hi</h1>").unwrap();
+        let h = FileMasqHandler::new(dir);
+        let (status, headers, body) = h.serve("GET", "/page.html", &HashMap::new()).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"<h1>hi</h1>");
+        assert_eq!(headers.get("Content-Type").unwrap(), "text/html; charset=utf-8");
+    }
+
+    #[tokio::test]
+    async fn file_masq_directory_serves_index_html() {
+        let dir = std::env::temp_dir().join("hys_masq_test_dir");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub").join("index.html"), b"index page").unwrap();
+        let h = FileMasqHandler::new(dir);
+        // Go FileServer：目录路径（无/有尾斜杠）→ index.html
+        let (status, _, body) = h.serve("GET", "/sub", &HashMap::new()).await;
+        assert_eq!((status, body.as_slice()), (200, &b"index page"[..]));
+        let (status, _, body) = h.serve("GET", "/sub/", &HashMap::new()).await;
+        assert_eq!((status, body.as_slice()), (200, &b"index page"[..]));
+        // 根路径 → root/index.html（不存在 → 404）
+        let (status, _, _) = h.serve("GET", "/", &HashMap::new()).await;
+        assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
+    async fn file_masq_missing_file_404_go_body() {
+        let dir = std::env::temp_dir().join("hys_masq_test_404");
+        std::fs::create_dir_all(&dir).unwrap();
+        let h = FileMasqHandler::new(dir);
+        let (status, headers, body) = h.serve("GET", "/nope.html", &HashMap::new()).await;
+        assert_eq!(status, 404);
+        assert_eq!(body, b"404 page not found\n");
+        assert_eq!(headers.get("Content-Type").unwrap(), "text/plain; charset=utf-8");
+    }
+
+    #[tokio::test]
+    async fn file_masq_traversal_rejected() {
+        let dir = std::env::temp_dir().join("hys_masq_test_trav");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("secret.txt"), b"secret").unwrap();
+        let h = FileMasqHandler::new(dir.clone());
+        // Go http.Dir：root 外路径 → 打开失败 → 404
+        let (status, _, body) = h.serve("GET", "/../secret.txt", &HashMap::new()).await;
+        assert_eq!(status, 404);
+        assert_ne!(body, b"secret");
+        // URL 编码穿越（%2e%2e）同理拒绝——path 未解码前也含 ".." 组件即可拦
+        let (status, _, _) = h.serve("GET", "/%2e%2e/secret.txt", &HashMap::new()).await;
+        assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
+    async fn file_masq_method_not_allowed() {
+        // Go serveFile：非 GET/HEAD → 405 + Allow 头
+        let h = FileMasqHandler::new(std::env::temp_dir());
+        let (status, headers, _) = h.serve("POST", "/x.html", &HashMap::new()).await;
+        assert_eq!(status, 405);
+        assert_eq!(headers.get("Allow").unwrap(), "GET, HEAD");
+        // HEAD → 200 无 body
+        let (status, _, body) = h.serve("HEAD", "/", &HashMap::new()).await;
+        assert_eq!(status, 404, "HEAD 也走查找，仅 body 为空");
+        assert!(body.is_empty());
     }
 }

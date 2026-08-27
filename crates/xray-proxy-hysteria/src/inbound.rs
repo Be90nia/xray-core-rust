@@ -241,8 +241,13 @@ impl InboundHandler for HysteriaInboundHandler {
 
         let proto_config = Arc::new(self.build_proto_config());
         let quic_params = Arc::clone(&self.config.quic_params);
-        let masq = MasqType::from_config(&proto_config)
-            .map_err(|e| InboundError::ListenError(format!("masq config: {e}")))?;
+        // masq 优先取 proxy 层注入（xray-core parse_hysteria_inbound_config 从
+        // `hysteriaSettings.masquerade` JSON 解析）；None 时走 proto Config 默认路径
+        let masq = match self.config.masq.clone() {
+            Some(m) => m,
+            None => MasqType::from_config(&proto_config)
+                .map_err(|e| InboundError::ListenError(format!("masq config: {e}")))?,
+        };
         let validator: Option<Arc<dyn AuthValidator>> = if let Some(ref mv) = self.multi_validator {
             Some(Arc::clone(mv) as Arc<dyn AuthValidator>)
         } else if self.config.auth.is_empty() {

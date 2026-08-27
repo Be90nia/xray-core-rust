@@ -37,6 +37,9 @@ pub struct HysteriaConfig {
     /// QUIC 参数（`streamSettings.finalmask.quicParams` 解析产物；
     /// 无配置时为 Go nil 默认 bbr_profile=standard）。
     pub quic_params: Arc<xray_proto::xray::transport::internet::QuicParams>,
+    /// Masquerade 配置（`hysteriaSettings.masquerade` JSON 解析产物，Go infra/conf
+    /// 展开后的形态）。None = 走 proto Config 默认路径（NotFound）。
+    pub masq: Option<xray_transport_hysteria::hub::MasqType>,
 }
 
 impl HysteriaConfig {
@@ -56,13 +59,22 @@ impl HysteriaConfig {
             server_name,
             auth: auth.into(),
             alpn: Self::DEFAULT_ALPN.iter().map(|s| (*s).to_string()).collect(),
-            quic_params: Arc::new(default_hysteria_quic_params()),
             brutal_up_bps: 0,
             brutal_down_bps: 0,
             obfs: None,
             udp_idle_timeout_secs: Self::DEFAULT_UDP_IDLE_TIMEOUT,
+            quic_params: Arc::new(default_hysteria_quic_params()),
+            masq: None,
         }
     }
+
+    /// 设置 masquerade 配置（`hysteriaSettings.masquerade` → MasqType）。
+    #[must_use]
+    pub fn with_masq(mut self, masq: xray_transport_hysteria::hub::MasqType) -> Self {
+        self.masq = Some(masq);
+        self
+    }
+
 
     /// 设置 TLS SNI（不设则用 server_addr 的 host 部分）。
     #[must_use]
@@ -156,6 +168,7 @@ impl HysteriaConfig {
             obfs: None,
             udp_idle_timeout_secs: transport.udp_idle_timeout.max(0) as u64,
             quic_params: Arc::new(default_hysteria_quic_params()),
+            masq: None,
         }
     }
 }

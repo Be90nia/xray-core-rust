@@ -91,14 +91,19 @@ async fn listen_hysteria(
         crate::quic_params::parse_quic_params(settings.finalmask_json.as_ref())?
             .unwrap_or_else(crate::quic_params::default_hysteria_quic_params),
     );
-    // ponytail: factory 当前忽略 masq/validator/on_new_conn；后续接 HTTP/3 auth/masquerade 时再注入
+    // masq 从 proto Config 解析（masquerade JSON 已由 parse_hysteria_config 展开；
+    // 对应 Go hub.go:210-254 listen 时 switch masqType）
+    let masq = MasqType::from_config(&config)
+        .map_err(|e| io::Error::other(format!("hysteria masq config: {e}")))?;
+    // ponytail: 此链（transport registry）无 validator 注入点，静态 auth 由
+    // factory.listen 内部用 config.auth 兜底（Go hub.go:63-64 config.Auth 对比）
     let on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync> = Arc::new(|_| {});
     let listener = factory
         .listen(
             addr,
             config,
             quic_params,
-            MasqType::NotFound,
+            masq,
             None,
             on_new_conn,
         )
@@ -229,9 +234,11 @@ async fn dial_hysteria(
 
 /// 从 `hysteriaSettings` JSON 解析为 prost [`Config`]。
 ///
-/// 接受的 JSON 字段（对齐 proto3 JSON camelCase）：
+/// 接受的 JSON 字段：
 /// - `auth`：鉴权 token
-/// - `masqType`：伪装类型
+/// - `masqType`：伪装类型（proto3 JSON camelCase 兼容）
+/// - `masquerade`：伪装配置嵌套对象（Go 用户配置形态，infra/conf
+///   transport_internet.go:498-510 `Masquerade` struct → :542-549 展开为 proto 扁平字段）
 /// - `udpIdleTimeout`：UDP 空闲超时（秒）
 /// - `version`：协议版本
 ///
@@ -264,13 +271,17 @@ fn parse_hysteria_config(json: Option<&serde_json::Value>) -> io::Result<Config>
         .and_then(|x| x.as_i64())
         .unwrap_or(0) as i32;
 
-    Ok(Config {
+    let mut config = Config {
         auth,
         masq_type,
         udp_idle_timeout,
         version,
         ..Config::default()
-    })
+    };
+    if let Some(m) = obj.get("masquerade") {
+        crate::proto_config::apply_masquerade_json(&mut config, m)?;
+    }
+    Ok(config)
 }
 
 /// 把 `Destination` 解析为 `SocketAddr`（hysteria 强制 UDP，需 IP:port）。
@@ -328,5 +339,56 @@ mod tests {
         let r = parse_hysteria_config(Some(&v));
         assert!(r.is_err());
         assert_eq!(r.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// masquerade 嵌套对象 → proto 扁平字段（Go infra/conf transport_internet.go:498-510
+    /// + 542-549 展开）。四类形态各验一遍 + `MasqType::from_config` 回读等价。
+    #[test]
+    fn parse_hysteria_config_masquerade_object() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"auth":"t","masquerade":{"type":"file","dir":"/var/www"}}"#,
+        )
+        .unwrap();
+        let cfg = parse_hysteria_config(Some(&v)).unwrap();
+        assert_eq!(cfg.masq_type, "file");
+        assert_eq!(cfg.masq_file, "/var/www");
+        assert_eq!(
+            MasqType::from_config(&cfg).unwrap(),
+            MasqType::File("/var/www".into())
+        );
+
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"masquerade":{"type":"proxy","url":"https://e.com","rewriteHost":true,"insecure":true}}"#,
+        )
+        .unwrap();
+        let cfg = parse_hysteria_config(Some(&v)).unwrap();
+        assert!(cfg.masq_url_rewrite_host);
+        assert!(cfg.masq_url_insecure);
+        assert!(matches!(
+            MasqType::from_config(&cfg).unwrap(),
+            MasqType::Proxy { url, rewrite_host: true, insecure: true } if url == "https://e.com"
+        ));
+
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"masquerade":{"type":"string","content":"hi","headers":{"X-A":"1"},"statusCode":418}}"#,
+        )
+        .unwrap();
+        let cfg = parse_hysteria_config(Some(&v)).unwrap();
+        assert_eq!(cfg.masq_string, "hi");
+        assert_eq!(cfg.masq_string_headers.get("X-A").unwrap(), "1");
+        assert_eq!(cfg.masq_string_status_code, 418);
+        assert!(matches!(
+            MasqType::from_config(&cfg).unwrap(),
+            MasqType::String { body, status_code: 418, .. } if body == "hi"
+        ));
+    }
+
+    /// 无 masquerade 键 → 字段保持默认（零行为变化）。
+    #[test]
+    fn parse_hysteria_config_no_masquerade_untouched() {
+        let v: serde_json::Value = serde_json::from_str(r#"{"auth":"t"}"#).unwrap();
+        let cfg = parse_hysteria_config(Some(&v)).unwrap();
+        assert_eq!(cfg.masq_type, "");
+        assert_eq!(MasqType::from_config(&cfg).unwrap(), MasqType::NotFound);
     }
 }
