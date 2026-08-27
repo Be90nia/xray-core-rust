@@ -6314,6 +6314,7 @@ dependencies = [
  "bytes",
  "parking_lot",
  "quinn",
+ "quinn-proto",
  "rcgen 0.13.2",
  "rustls",
  "thiserror 2.0.18",

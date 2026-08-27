@@ -83,7 +83,9 @@ async fn listen_hysteria(
     })?;
 
     // 2. QuinnListenerFactory → listen
-    let factory = QuinnListenerFactory::new(tls_cfg);
+    let factory = QuinnListenerFactory::new(tls_cfg).with_salamander(
+        crate::salamander_socket::parse_salamander_obfs(settings.finalmask_json.as_ref())?,
+    );
     let config = Arc::new(parse_hysteria_config(settings.transport_json.as_ref())?);
     let quic_params = Arc::new(QuicParams::default());
     // ponytail: factory 当前忽略 masq/validator/on_new_conn；后续接 HTTP/3 auth/masquerade 时再注入
@@ -198,7 +200,10 @@ async fn dial_hysteria(
     let bind_addr: SocketAddr = "0.0.0.0:0".parse().map_err(|e: std::net::AddrParseError| {
         io::Error::other(format!("invalid bind addr: {e}"))
     })?;
-    let transport = QuinnHysteriaTransport::new(tls_client_config, bind_addr)?;
+    let transport = QuinnHysteriaTransport::new(tls_client_config, bind_addr)?
+        .with_salamander(crate::salamander_socket::parse_salamander_obfs(
+            settings.finalmask_json.as_ref(),
+        )?);
 
     let quic_params = Arc::new(xray_proto::xray::transport::internet::QuicParams::default());
     let client = HysteriaClient::new(

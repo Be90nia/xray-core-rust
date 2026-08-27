@@ -441,9 +441,14 @@ fn try_build_handler(
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoVerifier))
                 .with_no_client_auth();
+            let stream_settings = xray_transport::dialer::StreamSettings::from_json(ob.stream_settings_json.as_ref());
+            let salamander = xray_transport_hysteria::salamander_socket::parse_salamander_obfs(
+                stream_settings.finalmask_json.as_ref(),
+            ).map_err(|e| format!("hysteria finalmask: {e}"))?;
             let transport = xray_transport_hysteria::hysteria_transport::QuinnHysteriaTransport::new(
                 tls_config, "0.0.0.0:0".parse().map_err(|e| format!("bind addr: {e}"))?,
-            ).map_err(|e| format!("hysteria transport: {e}"))?;
+            ).map_err(|e| format!("hysteria transport: {e}"))?
+                .with_salamander(salamander);
             let dial_fn = xray_proxy_hysteria::make_hysteria_dial_fn(config, Arc::new(transport));
             wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag)
         }

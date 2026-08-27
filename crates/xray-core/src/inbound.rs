@@ -1653,7 +1653,7 @@ async fn spawn_one_inbound(
         "hysteria" | "hysteria2" => {
             let bind_addr: std::net::SocketAddr = addr.parse()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("parse addr: {e}")))?;
-            let (config, factory) = parse_hysteria_inbound_config(&ib.entry.data, bind_addr)?;
+            let (config, factory) = parse_hysteria_inbound_config(&ib.entry.data, bind_addr, ib.stream_settings_json.as_ref())?;
             let dispatch = ohm.get_default_handler().ok_or_else(|| {
                 std::io::Error::other("hysteria inbound requires a default outbound handler")
             })?;
@@ -2120,6 +2120,7 @@ fn ss_cipher_from_str(s: &str) -> Option<SsCipherType> {
 fn parse_hysteria_inbound_config(
     data: &[u8],
     bind_addr: std::net::SocketAddr,
+    finalmask_json: Option<&serde_json::Value>,
 ) -> std::io::Result<(xray_proxy_hysteria::HysteriaConfig, Arc<dyn xray_transport_hysteria::hub::HysteriaListenerFactory>)> {
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("hysteria inbound settings JSON: {e}")))?;
@@ -2130,8 +2131,10 @@ fn parse_hysteria_inbound_config(
     // 真实 quinn server adapter：自签证书（或配置 cert/key PEM），ALPN h3 由 listen() 设置
     let _ = rustls::crypto::ring::default_provider().install_default();
     let server_config = build_hysteria_tls_server_config(&v)?;
+    // salamander UDP 混淆：streamSettings.finalmask.udp[]（对应 Go UdpmaskManager）
+    let salamander = xray_transport_hysteria::salamander_socket::parse_salamander_obfs(finalmask_json)?;
     let factory: Arc<dyn xray_transport_hysteria::hub::HysteriaListenerFactory> =
-        Arc::new(QuinnListenerFactory::new(Arc::new(server_config)));
+        Arc::new(QuinnListenerFactory::new(Arc::new(server_config)).with_salamander(salamander));
     Ok((config, factory))
 }
 
