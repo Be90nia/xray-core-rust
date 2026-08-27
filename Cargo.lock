@@ -5901,6 +5901,7 @@ dependencies = [
 name = "xray-conf"
 version = "0.1.0"
 dependencies = [
+ "parking_lot",
  "serde",
  "serde_json",
  "serde_yaml",

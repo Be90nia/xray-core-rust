@@ -22,6 +22,7 @@
 pub mod link;
 pub mod bridge;
 pub mod connection;
+pub mod cnc;
 pub mod listener;
 pub mod dialer;
 pub mod system_dialer;
