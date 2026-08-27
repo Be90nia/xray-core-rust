@@ -3,7 +3,9 @@
 //! 这些类型对应 Go `infra/conf/common.go` 与 `infra/conf/xray.go` 中的 JSON 反序列化类型。
 //! 关注点是「从配置文件解析」，运行时转换（→ `xray_common::net::Address`）留给后续 Build 阶段。
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::borrow::Cow;
 use std::fmt;
 
 
@@ -57,8 +59,28 @@ impl From<&str> for Address {
 impl<'de> Deserialize<'de> for Address {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         // JSON 中地址恒为字符串（如 "1.2.3.4" / "example.com"）。
-        String::deserialize(d).map(Address)
+        // "env:VAR" 前缀先展开（Go common.go:59-61）。
+        let s = String::deserialize(d)?;
+        Ok(Address(expand_env(&s).into_owned()))
     }
+}
+
+/// `env:VAR` 前缀展开：读环境变量 VAR（先原名后大写下划线形式），未设置为空串。
+///
+/// 对应 Go `Address.UnmarshalJSON` / `parseStringPort` 的 env: 处理
+/// （common.go:59-61、132-134）+ `platform.NewEnvFlag` 的 Name/AltName 双查。
+fn expand_env(s: &str) -> Cow<'_, str> {
+    s.strip_prefix("env:").map_or_else(
+        || Cow::Borrowed(s),
+        |name| {
+            Cow::Owned(
+                xray_common::platform::env::EnvFlag::new(name)
+                    .get_value()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        },
+    )
 }
 
 // =========================================================================
@@ -135,6 +157,9 @@ impl<'de> Deserialize<'de> for PortList {
                         if part.is_empty() {
                             continue;
                         }
+                        // "env:VAR" 前缀展开（Go parseStringPort，common.go:132-134）。
+                        let expanded = expand_env(part);
+                        let part = expanded.as_ref();
                         if let Some((a, b)) = part.split_once('-') {
                             let start: u16 = a.trim().parse().map_err(|e| {
                                 E::custom(format!("invalid port start {a:?}: {e}"))
@@ -170,6 +195,152 @@ impl<'de> Deserialize<'de> for PortList {
         push_one::<D::Error>(&mut ranges, raw)?;
         Ok(PortList(ranges))
     }
+}
+
+// =========================================================================
+// User —— 配置层用户
+// =========================================================================
+
+/// 配置层用户（邮箱 + 权限等级）。
+///
+/// 对应 Go `infra/conf.User`（common.go:277-287）。各协议 inbound 的用户
+/// 列表项先解析为此类型，Build 阶段转为运行时 [`xray_common::protocol::User`]。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct User {
+    /// 用户邮箱（统计/限速标识）。Go `EmailString`。
+    #[serde(default)]
+    pub email: String,
+    /// 权限等级。Go `LevelByte byte`。
+    #[serde(default)]
+    pub level: u8,
+}
+
+impl User {
+    /// 转为运行时协议用户。对应 Go `(*User).Build()`（common.go:282-287）。
+    #[must_use]
+    pub fn build(&self) -> xray_common::protocol::user::User {
+        xray_common::protocol::user::User::new(self.email.clone()).with_level(u32::from(self.level))
+    }
+}
+
+// =========================================================================
+// Int32Range —— "1-2" 或 1 双形态整数区间
+// =========================================================================
+
+/// 整数区间，JSON 兼容 `"1-2"`（字符串）与 `1`（纯数字）两种形态。
+///
+/// 对应 Go `infra/conf.Int32Range`（common.go:289-338）。反序列化后
+/// `from <= to` 恒成立（原始顺序保留在 `left`/`right`）；负数可作哨兵值，
+/// 也支持负数区间 `"-114-514"` / `"-1919--810"`。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Int32Range {
+    /// 原始左值。
+    pub left: i32,
+    /// 原始右值。
+    pub right: i32,
+    /// 排序后下界（恒 `<= to`）。
+    pub from: i32,
+    /// 排序后上界（恒 `>= from`）。
+    pub to: i32,
+}
+
+impl Int32Range {
+    /// `from`/`to` 取 `left`/`right` 并保证 `from <= to`。
+    /// 对应 Go `ensureOrder`（common.go:332-338）。
+    fn ensure_order(&mut self) {
+        self.from = self.left;
+        self.to = self.right;
+        if self.from > self.to {
+            std::mem::swap(&mut self.from, &mut self.to);
+        }
+    }
+}
+
+impl fmt::Display for Int32Range {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Go String()（common.go:304-310）：左右相等输出单值，否则 "left-right"。
+        if self.left == self.right {
+            write!(f, "{}", self.left)
+        } else {
+            write!(f, "{}-{}", self.left, self.right)
+        }
+    }
+}
+
+impl Serialize for Int32Range {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        // Go MarshalJSON（common.go:299-302）：序列化为区间字符串。
+        s.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Int32Range {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // Go UnmarshalJSON（common.go:312-330）：字符串（区间语法）优先，纯数字次之。
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Str(String),
+            Int(i32),
+        }
+
+        let mut range = match Raw::deserialize(d) {
+            Ok(Raw::Str(s)) => {
+                let (left, right) = parse_range_string(&s).map_err(D::Error::custom)?;
+                Int32Range {
+                    left,
+                    right,
+                    ..Default::default()
+                }
+            }
+            Ok(Raw::Int(i)) => Int32Range {
+                left: i,
+                right: i,
+                ..Default::default()
+            },
+            Err(_) => {
+                return Err(D::Error::custom(
+                    "Invalid integer range, expected either string of form \"1-2\" or plain integer.",
+                ));
+            }
+        };
+        range.ensure_order();
+        Ok(range)
+    }
+}
+
+/// 解析区间字符串，支持负数：`"114-514"` `"-114-514"` `"-1919--810"` `"114514"` `""`。
+///
+/// 对应 Go `ParseRangeString`（common.go:350-377）。单值返回 `(v, v)`，空串返回 `(0, 0)`。
+pub fn parse_range_string(s: &str) -> Result<(i32, i32), String> {
+    // 纯数字（含负数单值）："114" / "-1"。
+    if let Ok(v) = s.parse::<i32>() {
+        return Ok((v, v));
+    }
+    // 空串视为 0（Go common.go:357-359）。
+    if s.is_empty() {
+        return Ok((0, 0));
+    }
+    // 区间：负数前缀需从第二个 '-' 切分，否则取第一个 '-'。
+    let parsed = if s.starts_with('-') {
+        split_from_second_dash(s)
+            .and_then(|(l, r)| Some((l.parse::<i32>().ok()?, r.parse::<i32>().ok()?)))
+    } else {
+        s.split_once('-')
+            .and_then(|(l, r)| Some((l.parse::<i32>().ok()?, r.parse::<i32>().ok()?)))
+    };
+    parsed.ok_or_else(|| format!("invalid range string: {s}"))
+}
+
+/// 从第二个 '-' 切分：`"-114-514"` → `("-114", "514")`；`"-1919--810"` → `("-1919", "-810")`。
+///
+/// 对应 Go `splitFromSecondDash`（common.go:340-348）。不足三段时返回 `None`。
+fn split_from_second_dash(s: &str) -> Option<(String, &str)> {
+    let mut parts = s.splitn(3, '-');
+    let p0 = parts.next()?;
+    let p1 = parts.next()?;
+    let p2 = parts.next()?;
+    Some((format!("{p0}-{p1}"), p2))
 }
 
 // =========================================================================
@@ -447,5 +618,158 @@ mod tests {
         let n: NetworkList = serde_json::from_str(r#""unix""#).unwrap();
         let v: Vec<String> = n.into();
         assert_eq!(v, vec!["unix".to_string()]);
+    }
+
+    // ----- User -----
+
+    #[test]
+    fn user_parse_and_build() {
+        // Go TestUserParsing：未知字段（id）忽略，email/level 正常解析并 Build。
+        let u: User = serde_json::from_str(
+            r#"{ "id": "96edb838-6d68-42ef-a933-25f7ac3a9d09", "email": "love@example.com", "level": 1 }"#,
+        )
+        .unwrap();
+        assert_eq!(u, User { email: "love@example.com".into(), level: 1 });
+        let p = u.build();
+        assert_eq!(p.email(), "love@example.com");
+        assert_eq!(p.level(), 1);
+    }
+
+    #[test]
+    fn user_defaults_and_level_overflow() {
+        let u: User = serde_json::from_str("{}").unwrap();
+        assert_eq!(u, User::default());
+        assert_eq!(u.build().level(), 0);
+        // Go LevelByte byte：256 溢出报错。
+        assert!(serde_json::from_str::<User>(r#"{ "level": 256 }"#).is_err());
+    }
+
+    // ----- Int32Range -----
+
+    #[test]
+    fn int32range_from_int() {
+        let r: Int32Range = serde_json::from_str("1").unwrap();
+        assert_eq!(r, Int32Range { left: 1, right: 1, from: 1, to: 1 });
+    }
+
+    #[test]
+    fn int32range_from_string_range() {
+        let r: Int32Range = serde_json::from_str(r#""1-2""#).unwrap();
+        assert_eq!(r, Int32Range { left: 1, right: 2, from: 1, to: 2 });
+    }
+
+    #[test]
+    fn int32range_swaps_from_to_when_left_gt_right() {
+        // Go 注释（common.go:291）：From > To 时交换，left/right 保留原值。
+        let r: Int32Range = serde_json::from_str(r#""5-1""#).unwrap();
+        assert_eq!(r, Int32Range { left: 5, right: 1, from: 1, to: 5 });
+    }
+
+    #[test]
+    fn int32range_negative_sentinels() {
+        let r: Int32Range = serde_json::from_str(r#""-1""#).unwrap();
+        assert_eq!(r, Int32Range { left: -1, right: -1, from: -1, to: -1 });
+
+        // Go splitFromSecondDash："-114-514" → ("-114", "514")
+        let r: Int32Range = serde_json::from_str(r#""-114-514""#).unwrap();
+        assert_eq!(r, Int32Range { left: -114, right: 514, from: -114, to: 514 });
+
+        // "-1919--810" → ("-1919", "-810")；from(-1919) < to(-810) 不交换
+        let r: Int32Range = serde_json::from_str(r#""-1919--810""#).unwrap();
+        assert_eq!(r, Int32Range { left: -1919, right: -810, from: -1919, to: -810 });
+    }
+
+    #[test]
+    fn int32range_empty_string_is_zero() {
+        // Go ParseRangeString："" 返回 (0, 0)。
+        let r: Int32Range = serde_json::from_str(r#""""#).unwrap();
+        assert_eq!(r, Int32Range::default());
+    }
+
+    #[test]
+    fn int32range_invalid_inputs() {
+        for json in [r#""abc""#, "1.5", r#""1-""#, "true", r#""1-2-3""#] {
+            assert!(
+                serde_json::from_str::<Int32Range>(json).is_err(),
+                "should reject {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn int32range_display_and_serialize() {
+        // Go String()/MarshalJSON（common.go:299-310）。
+        let single: Int32Range = serde_json::from_str("5").unwrap();
+        assert_eq!(single.to_string(), "5");
+        assert_eq!(serde_json::to_string(&single).unwrap(), r#""5""#);
+
+        let range: Int32Range = serde_json::from_str(r#""1-2""#).unwrap();
+        assert_eq!(range.to_string(), "1-2");
+        assert_eq!(serde_json::to_string(&range).unwrap(), r#""1-2""#);
+    }
+
+    // ----- env: 展开（进程环境变量共享，测试间互斥） -----
+
+    static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    #[test]
+    fn address_expands_env_prefix() {
+        let _g = ENV_LOCK.lock();
+        unsafe { std::env::set_var("XRAY_CONF_TEST_ADDR", "1.2.3.4") };
+        let a: Address = serde_json::from_str(r#""env:XRAY_CONF_TEST_ADDR""#).unwrap();
+        assert_eq!(a.as_str(), "1.2.3.4");
+        unsafe { std::env::remove_var("XRAY_CONF_TEST_ADDR") };
+    }
+
+    #[test]
+    fn address_env_unset_expands_to_empty() {
+        let _g = ENV_LOCK.lock();
+        // Go GetValue(default "")：未设置为空串。
+        let a: Address = serde_json::from_str(r#""env:XRAY_CONF_TEST_UNSET""#).unwrap();
+        assert_eq!(a.as_str(), "");
+    }
+
+    #[test]
+    fn address_without_env_prefix_untouched() {
+        let a: Address = serde_json::from_str(r#""env.example.com""#).unwrap();
+        assert_eq!(a.as_str(), "env.example.com");
+    }
+
+    #[test]
+    fn portlist_expands_env_port() {
+        // Go TestEnvPort（common_test.go:148-159）等价。
+        let _g = ENV_LOCK.lock();
+        unsafe { std::env::set_var("XRAY_CONF_TEST_PORT", "1234") };
+        let p: PortList = serde_json::from_str(r#""env:XRAY_CONF_TEST_PORT""#).unwrap();
+        assert_eq!(p.0, vec![PortRange::single(1234)]);
+        unsafe { std::env::remove_var("XRAY_CONF_TEST_PORT") };
+    }
+
+    #[test]
+    fn portlist_expands_env_range() {
+        let _g = ENV_LOCK.lock();
+        unsafe { std::env::set_var("XRAY_CONF_TEST_PORTS", "1000-2000") };
+        let p: PortList = serde_json::from_str(r#""env:XRAY_CONF_TEST_PORTS""#).unwrap();
+        assert_eq!(p.0, vec![PortRange { start: 1000, end: 2000 }]);
+        unsafe { std::env::remove_var("XRAY_CONF_TEST_PORTS") };
+    }
+
+    #[test]
+    fn portlist_env_in_comma_list() {
+        let _g = ENV_LOCK.lock();
+        unsafe { std::env::set_var("XRAY_CONF_TEST_P1", "80") };
+        let p: PortList = serde_json::from_str(r#""env:XRAY_CONF_TEST_P1,443""#).unwrap();
+        assert_eq!(p.0, vec![PortRange::single(80), PortRange::single(443)]);
+        unsafe { std::env::remove_var("XRAY_CONF_TEST_P1") };
+    }
+
+    #[test]
+    fn env_alt_name_uppercase_lookup() {
+        // Go NewEnvFlag 双查（platform.go:42-53）：原名失败后查大写下划线形式。
+        let _g = ENV_LOCK.lock();
+        unsafe { std::env::set_var("XRAY_CONF_TEST_ALT", "8080") };
+        let p: PortList = serde_json::from_str(r#""env:xray.conf.test.alt""#).unwrap();
+        assert_eq!(p.0, vec![PortRange::single(8080)]);
+        unsafe { std::env::remove_var("XRAY_CONF_TEST_ALT") };
     }
 }
