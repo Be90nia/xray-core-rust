@@ -43,7 +43,7 @@ async fn run_ss_e2e(ct: CipherType) {
     let account_clone = account.clone();
     let server_handle = tokio::spawn(async move {
         let (conn, _) = listener.accept().await.unwrap();
-        let (header, mut ss_stream) = read_request(conn, &account_clone, "alice")
+        let (header, mut ss_stream) = read_request(conn, &account_clone, "alice", 0)
             .await
             .expect("read_request");
 

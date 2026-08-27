@@ -150,7 +150,7 @@ async fn rust_ss_server_reads_go_client_request() {
 
     let server_handle = tokio::spawn(async move {
         let (conn, _) = listener.accept().await.expect("accept");
-        read_request(conn, &account_clone, "interop").await
+        read_request(conn, &account_clone, "interop", 0).await
     });
 
     // Rust SS client connects to Rust SS server (self-test to verify server works)
