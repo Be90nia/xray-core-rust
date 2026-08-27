@@ -40,6 +40,7 @@ pub use commander::{
     ReflectionService, Service, TypedMessageConfig,
 };
 pub use error::CommanderError;
+pub use grpc::{LoggerServiceImpl, OutboundRuntime};
 pub use outbound::{
     CommanderConn, OutboundListener, OutboundRegistrar, StubOutboundHandler,
 };

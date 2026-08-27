@@ -210,6 +210,11 @@ pub struct Commander {
     routing_service: Option<Arc<xray_app_router::command::RoutingService>>,
     /// 可选的 ObservatoryService gRPC 后端（注入后注册到 tonic server）。
     observatory_service: Option<Arc<dyn xray_app_observatory::command::ObservatoryService>>,
+    /// 生产 outbound 运行时（bd ze3）：HandlerService 操作真实 SimpleOhm。
+    /// `RwLock` 支持上层在 `Arc<Commander>` 上注入（get_feature 后 set）。
+    outbound_runtime: RwLock<Option<Arc<dyn crate::grpc::OutboundRuntime>>>,
+    /// LoggerService gRPC 后端（bd ze3）：DefaultLogService → LogInstance::restart。
+    logger_service: RwLock<Option<Arc<dyn xray_app_log::command::LogService>>>,
 }
 
 impl Commander {
@@ -231,6 +236,8 @@ impl Commander {
             stats_service: None,
             routing_service: None,
             observatory_service: None,
+            outbound_runtime: RwLock::new(None),
+            logger_service: RwLock::new(None),
         }
     }
     /// 从 [`Config`] 构造（不解码 TypedMessage，仅复制 tag/listen/service_configs 元数据）。
@@ -287,8 +294,18 @@ impl Commander {
         self.observatory_service = Some(service);
     }
 
+
+    /// 注入生产 outbound 运行时（bd ze3）。`&self`（内部 RwLock）：
+    /// 上层经 `instance.get_feature::<Commander>()` 拿到 `Arc` 后、`start()` 前注入。
+    pub fn set_outbound_runtime(&self, runtime: Arc<dyn crate::grpc::OutboundRuntime>) {
+        *self.outbound_runtime.write() = Some(runtime);
+    }
+
+    /// 注入 LoggerService gRPC 后端（bd ze3，`DefaultLogService` → LogInstance::restart）。
+    pub fn set_logger_service(&self, service: Arc<dyn xray_app_log::command::LogService>) {
+        *self.logger_service.write() = Some(service);
+    }
     /// 添加 service。返回是否成功（type_url 重复时拒绝）。
-    ///
     /// 对应 Go `c.services = append(c.services, service)`，加去重保护。
     pub fn add_service(&self, service: Arc<dyn Service>) -> bool {
         let mut services = self.services.write();
@@ -411,6 +428,8 @@ impl Commander {
 
         let router = grpc::build_router(
             Arc::clone(&self.handler_registry),
+            self.outbound_runtime.read().clone(),
+            self.logger_service.read().clone(),
             self.stats_service.clone(),
             self.routing_service.clone(),
             self.observatory_service.clone(),

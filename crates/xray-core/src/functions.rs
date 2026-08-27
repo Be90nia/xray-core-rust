@@ -220,6 +220,19 @@ async fn start_full_dispatched(
     }
     let dispatcher = Arc::new(dispatcher);
 
+    // Commander（api）真注入（bd ze3/bg7）：HandlerService 操作生产 SimpleOhm
+    //（proto config → try_build_handler 复用静态注册构建路径），
+    // LoggerService 接 DefaultLogService（LogInstance::restart）。
+    // 对应 Go Commander.Start 中 RequireFeatures(outbound.Manager, log.Instance)。
+    if let Some(commander) = instance.get_feature::<xray_app_commander::Commander>() {
+        commander.set_outbound_runtime(Arc::new(crate::outbound::ApiOutboundRuntime::new(
+            Arc::clone(&ohm),
+        )));
+        if let Some(log_feature) = instance.get_feature::<xray_app_log::LogFeature>() {
+            commander.set_logger_service(log_feature.log_service());
+        }
+    }
+
     // 先 start features（LogInstance 等 handler 就绪）再起 inbound listener——
     // 对应 Go：logger 是首个启动的 App，addInboundHandlers 在 instance.Start() 之后。
     instance.start()?;

@@ -249,4 +249,12 @@ pub mod xray {
     }
 }
 
+/// 全量 `FileDescriptorSet` 编码字节（grpc-client/grpc-server 构建时生成）。
+///
+/// 供 tonic-reflection server（`register_encoded_file_descriptor_set`）注册，
+/// 使 gRPC 客户端（grpcurl / CLI）可发现全部服务。
+#[cfg(any(feature = "grpc-client", feature = "grpc-server"))]
+pub const FILE_DESCRIPTOR_SET: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/xray_descriptor.bin"));
+
 pub use xray::*;

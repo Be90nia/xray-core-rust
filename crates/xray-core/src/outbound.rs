@@ -32,11 +32,13 @@ use std::sync::Arc;
 
 use xray_app_dispatcher::default::{DefaultDispatcher, DialBridge, PinFuture, SimpleOhm};
 use xray_app_dispatcher::DispatchHandler;
+use xray_app_dispatcher::OutboundHandlerManager;
 use xray_proxy_loopback::{LoopbackError, LoopbackFuture, LoopbackSink};
 use xray_common::net::address::Address;
 use xray_common::net::destination::Destination;
 use xray_common::net::port::Port;
 use xray_common::uuid::UUID;
+use xray_proto::xray::core::OutboundHandlerConfig as OutboundHandlerConfigProto;
 use xray_conf::{BuiltConfig, BuiltOutbound};
 use xray_features::Result;
 use xray_proxy_trojan::{MemoryAccount, TrojanOutboundConfig};
@@ -215,6 +217,109 @@ fn wrap_bridge(
     let handler = Arc::clone(&bridge) as Arc<dyn DispatchHandler>;
     let bridge_ref = if proxy_chain_tag.is_some() { Some(bridge) } else { None };
     Ok((handler, bridge_ref, proxy_chain_tag.clone()))
+}
+
+/// 构建单个 outbound handler（动态 AddOutbound 用，bd bg7）。
+///
+/// 与 [`try_build_handler`] 同一构建路径（协议全覆盖），mux outbound 返回
+/// `Unsupported`（动态 mux 依赖 register_outbounds 的 Phase 2 二次扫描，
+/// API 场景不适用）。
+pub fn build_single_outbound(
+    ob: &BuiltOutbound,
+) -> std::result::Result<Arc<dyn DispatchHandler>, BuildError> {
+    let mut mux_bridges = Vec::new();
+    let (handler, _, _) = try_build_handler(ob, None, &mut mux_bridges)?;
+    Ok(handler)
+}
+
+/// proto `OutboundHandlerConfig`（gRPC AddOutbound）→ `BuiltOutbound`。
+///
+/// TypedMessage 约定（与 CLI `api_exec::build_typed_message` 一致）：
+/// - `proxy_settings.type`：`xray.proxy.{protocol}.Config`，value = 协议 settings JSON
+/// - `sender_settings.type`：`xray.app.proxyman.outbound`，value = sender JSON
+///   （`streamSettings` 字段提升为 `BuiltOutbound.stream_settings_json`）
+pub fn built_outbound_from_proto(
+    cfg: &OutboundHandlerConfigProto,
+) -> std::result::Result<BuiltOutbound, BuildError> {
+    let type_url = cfg
+        .proxy_settings
+        .as_ref()
+        .map(|m| m.r#type.as_str())
+        .unwrap_or_default();
+    // 协议名：`xray.proxy.freedom.Config` → `freedom`。
+    let protocol = type_url
+        .strip_prefix("xray.proxy.")
+        .and_then(|s| s.strip_suffix(".Config"))
+        .ok_or_else(|| BuildError::Unsupported(type_url.to_string()))?;
+    let proxy_json: serde_json::Value = serde_json::from_slice(
+        &cfg.proxy_settings
+            .as_ref()
+            .map(|m| m.value.clone())
+            .unwrap_or_default(),
+    )
+    .map_err(|e| BuildError::Parse(e.to_string()))?;
+    let mut stream_settings_json = None;
+    if let Some(sender) = &cfg.sender_settings {
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&sender.value) {
+            stream_settings_json = v.get("streamSettings").cloned();
+        }
+    }
+    Ok(BuiltOutbound {
+        entry: xray_conf::BuiltEntry {
+            kind: protocol.to_string(),
+            data: serde_json::to_vec(&proxy_json).map_err(|e| BuildError::Parse(e.to_string()))?,
+        },
+        tag: cfg.tag.clone(),
+        send_through: None,
+        stream_settings_json,
+        proxy_settings_json: None,
+        mux_json: None,
+    })
+}
+
+/// commander HandlerService 的生产 outbound 运行时（bd ze3/bg7）。
+///
+/// 把 gRPC AddOutbound 的 proto config 经 [`built_outbound_from_proto`] →
+/// [`build_single_outbound`] 构建真实 handler 注册进 [`SimpleOhm`]——对应 Go
+/// `app/proxyman/command/handlers.go` 的 `addOutbound`（CreateObject + ohm.AddHandler）。
+pub struct ApiOutboundRuntime {
+    ohm: Arc<SimpleOhm>,
+}
+
+impl ApiOutboundRuntime {
+    #[must_use]
+    pub fn new(ohm: Arc<SimpleOhm>) -> Self {
+        Self { ohm }
+    }
+}
+
+impl xray_app_commander::OutboundRuntime for ApiOutboundRuntime {
+
+
+    fn add_outbound(
+        &self,
+        cfg: &OutboundHandlerConfigProto,
+    ) -> std::result::Result<(), String> {
+        let ob = built_outbound_from_proto(cfg).map_err(|e| format!("{e:?}"))?;
+        if self.ohm.get_handler(&cfg.tag).is_some() {
+            return Err(format!("existing tag found: {}", cfg.tag));
+        }
+        let handler = build_single_outbound(&ob).map_err(|e| format!("{e:?}"))?;
+        self.ohm.add(&cfg.tag, handler);
+        Ok(())
+    }
+
+    fn remove_outbound(&self, tag: &str) -> std::result::Result<(), String> {
+        if self.ohm.remove(tag) {
+            Ok(())
+        } else {
+            Err(format!("tag not found: {tag}"))
+        }
+    }
+
+    fn list_outbound_tags(&self) -> Vec<String> {
+        self.ohm.list_tags()
+    }
 }
 
 /// 从 `proxy_settings_json` 提取代理链 tag。

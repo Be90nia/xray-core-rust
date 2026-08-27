@@ -1282,6 +1282,30 @@ impl SimpleOhm {
     pub fn add(&self, tag: &str, handler: Arc<dyn DispatchHandler>) {
         self.tagged.write().unwrap().insert(tag.to_string(), handler);
     }
+
+    /// 移除 tag 对应的 handler。对应 Go `outbound.Manager.RemoveHandler`：
+    /// default handler 的 tag 与之相同时 default 一并清空。
+    /// 返回 tag 是否存在（不存在 = no-op，由调用方决定是否报错）。
+    pub fn remove(&self, tag: &str) -> bool {
+        let Some(_old) = self.tagged.write().unwrap().remove(tag) else {
+            return false;
+        };
+        let default_matches = self
+            .default
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|h| h.tag() == tag);
+        if default_matches {
+            *self.default.write().unwrap() = None;
+        }
+        true
+    }
+
+    /// 列出全部 tagged handler 的 tag（动态 AddOutbound/ListOutbounds 用）。
+    pub fn list_tags(&self) -> Vec<String> {
+        self.tagged.read().unwrap().keys().cloned().collect()
+    }
 }
 
 impl std::fmt::Debug for SimpleOhm {

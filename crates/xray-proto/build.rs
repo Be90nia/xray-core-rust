@@ -28,6 +28,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tonic_prost_build::configure()
             .build_server(is_grpc_server)
             .build_client(is_grpc_client)
+            // FileDescriptorSet：gRPC server reflection（tonic-reflection）注册用。
+            .file_descriptor_set_path(
+                std::path::Path::new(&std::env::var("OUT_DIR").unwrap_or_default())
+                    .join("xray_descriptor.bin"),
+            )
             .compile_protos(&proto_paths, &[&proto_dir])?;
     } else {
         prost_build::Config::new()

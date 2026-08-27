@@ -184,6 +184,7 @@ dashmap = "6"
 # gRPC over HTTP/2（对应 Go google.golang.org/grpc；xray-transport-grpc + xray-app-commander）
 tonic = "0.14"
 tonic-prost = "0.14"
+tonic-reflection = "0.14"
 # 系统进程信息（对应 Go shirou/gopsutil；xray-app-router find_process）
 sysinfo = "0.39"
 # 零拷贝 HTTP/1.x 解析（对应 Go net/http 内置；sniffer + 性能敏感路径）

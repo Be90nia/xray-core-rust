@@ -44,6 +44,11 @@ path = "integration/interop_ss_test.rs"
 [[test]]
 name = "integration_e2e"
 path = "integration/e2e_test.rs"
+
+[[test]]
+name = "integration_commander_api"
+path = "integration/commander_api_test.rs"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 xray-common = { path = "../crates/xray-common" }
@@ -55,7 +60,11 @@ xray-proxy-freedom = { path = "../crates/xray-proxy-freedom" }
 xray-app-dispatcher = { path = "../crates/xray-app-dispatcher" }
 xray-transport = { path = "../crates/xray-transport" }
 xray-buf = { path = "../crates/xray-buf" }
-xray-proto = { path = "../crates/xray-proto" }
+xray-proto = { path = "../crates/xray-proto", features = ["grpc-client"] }
+tonic = { workspace = true }
+tonic-reflection = { workspace = true }
+futures = { workspace = true }
+xray-app-log = { path = "../crates/xray-app-log" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
