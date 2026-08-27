@@ -68,7 +68,7 @@ use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
 
-use crate::sockopt::SocketOptions;
+use crate::sockopt::{HappyEyeballsConfig, SocketOptions};
 
 /// Transport 协议拨号函数签名。对应 Go `dialFunc`。
 ///
@@ -155,8 +155,9 @@ impl StreamSettings {
     /// 从 `sockopt_json` 解析 SocketOptions（对应 Go `SocketConfig`）。
     ///
     /// 支持字段：`mark` / `tcpFastOpen` / `tcpKeepAliveInterval`（秒）/
-    /// `tcpKeepAliveIdle`（秒）/ `v6only`。缺省字段用 [`SocketOptions::default`]。
-    /// Go 的 congestion/windowClamp/maxSeg/userTimeout/mptcp/interface 在
+    /// `tcpKeepAliveIdle`（秒）/ `v6only` / `dialerProxy` / `happyEyeballs`。
+    /// 缺省字段用 [`SocketOptions::default`]。Go 的 congestion/windowClamp/
+    /// maxSeg/userTimeout/mptcp/interface 在
     /// [`SocketOptions`](crate::sockopt::SocketOptions) 尚无对应字段，暂不解析。
     #[must_use]
     pub fn socket_options(&self) -> SocketOptions {
@@ -183,6 +184,24 @@ impl StreamSettings {
         }
         if let Some(v) = obj.get("dialerProxy").and_then(|v| v.as_str()) {
             opts.dialer_proxy = v.to_string();
+        }
+        // Happy Eyeballs（bd 0ko，Go `SocketConfig.HappyEyeballs`）。
+        // 缺省字段取 Go UnmarshalJSON 缺省值（transport_internet.go:1021）。
+        if let Some(he) = obj.get("happyEyeballs").and_then(|v| v.as_object()) {
+            let mut cfg = HappyEyeballsConfig::default();
+            if let Some(v) = he.get("prioritizeIPv6").and_then(|v| v.as_bool()) {
+                cfg.prioritize_ipv6 = v;
+            }
+            if let Some(v) = he.get("tryDelayMs").and_then(|v| v.as_u64()) {
+                cfg.try_delay_ms = v;
+            }
+            if let Some(v) = he.get("interleave").and_then(|v| v.as_u64()) {
+                cfg.interleave = v as u32;
+            }
+            if let Some(v) = he.get("maxConcurrentTry").and_then(|v| v.as_u64()) {
+                cfg.max_concurrent_try = v as u32;
+            }
+            opts.happy_eyeballs = Some(cfg);
         }
         opts
     }
@@ -345,6 +364,42 @@ mod transport_cache_tests {
         let mut s = StreamSettings::tcp();
         s.sockopt_json = Some(serde_json::json!({ "tcpFastOpen": 1 }));
         assert!(s.socket_options().tcp_fast_open);
+    }
+
+    /// Happy Eyeballs 配置解析（bd 0ko，Go `SocketConfig.HappyEyeballs`）。
+    #[test]
+    fn socket_options_parses_happy_eyeballs() {
+        let mut s = StreamSettings::tcp();
+        s.sockopt_json = Some(serde_json::json!({
+            "happyEyeballs": {
+                "prioritizeIPv6": true,
+                "tryDelayMs": 250,
+                "interleave": 2,
+                "maxConcurrentTry": 3
+            }
+        }));
+        let he = s.socket_options().happy_eyeballs.expect("happyEyeballs parsed");
+        assert!(he.prioritize_ipv6);
+        assert_eq!(he.try_delay_ms, 250);
+        assert_eq!(he.interleave, 2);
+        assert_eq!(he.max_concurrent_try, 3);
+
+        // 缺省字段取 Go UnmarshalJSON 缺省值（transport_internet.go:1021）。
+        let mut s = StreamSettings::tcp();
+        s.sockopt_json = Some(serde_json::json!({ "happyEyeballs": {} }));
+        let he = s.socket_options().happy_eyeballs.expect("happyEyeballs parsed");
+        assert_eq!(
+            he,
+            HappyEyeballsConfig {
+                prioritize_ipv6: false,
+                interleave: 1,
+                try_delay_ms: 0,
+                max_concurrent_try: 4,
+            }
+        );
+
+        // 无 happyEyeballs 字段 → None（默认关闭，对齐 Go TryDelayMs:0）。
+        assert!(StreamSettings::tcp().socket_options().happy_eyeballs.is_none());
     }
 
     /// dialerProxy 解析（bd enk，Go SocketConfig.DialerProxy）。

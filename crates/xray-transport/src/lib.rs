@@ -13,7 +13,7 @@
 //!
 //! ## 未实现（留 stub）
 //! `sockopt` / `tcp` / `udp` / `headers` / `finalmask` / `pipe` / `config` /
-//! `filelocker` / `happy_eyeballs` / `browser_dialer` / `tagged` / `memory_settings`
+//! `filelocker` / `browser_dialer` / `tagged` / `memory_settings`
 //! 这些模块依赖 Phase 4+ 未就绪的 `outbound.Manager` / `session.Outbound` /
 //! `policy.BufferPolicyFromContext` / 平台特定 syscall，留待具体传输实现 crate 处理。
 //!

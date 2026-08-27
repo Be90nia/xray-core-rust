@@ -52,6 +52,40 @@ pub struct SocketOptions {
     /// transport 层代理：经指定 tag 的 outbound handler 拨号而非直连。
     /// 对应 Go `SocketConfig.DialerProxy`（config.pb.go:735）。空串 = 直连。
     pub dialer_proxy: String,
+    /// Happy Eyeballs 竞争拨号配置。对应 Go `SocketConfig.HappyEyeballs`
+    /// （config.proto:157，字段 22）。`None` 或 `try_delay_ms == 0` = 关闭
+    /// （Go 默认 `TryDelayMs: 0`，infra/conf/transport_internet.go:1144）。
+    pub happy_eyeballs: Option<HappyEyeballsConfig>,
+ }
+
+/// Happy Eyeballs 配置。对应 Go `HappyEyeballsConfig`
+/// （transport/internet/config.proto:162-166 + infra/conf/transport_internet.go:1008-1030）。
+///
+/// JSON 字段名：`happyEyeballs: { prioritizeIPv6, tryDelayMs, interleave, maxConcurrentTry }`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HappyEyeballsConfig {
+    /// true → IPv6 先行；false → IPv4 先行。
+    pub prioritize_ipv6: bool,
+    /// 同族连续尝试几个地址再切换到另一族（RFC 8305 Address Family
+    /// Selection，Go sortIPs 的 `interleave`）。
+    pub interleave: u32,
+    /// 相邻两次拨号尝试的启动间隔（毫秒）。`0` = 整个功能关闭
+    /// （Go dialer.go:262 `TryDelayMs == 0` 降级为单 IP 直连）。
+    pub try_delay_ms: u64,
+    /// 最大并发拨号数。`0` = 关闭。
+    pub max_concurrent_try: u32,
+}
+
+impl Default for HappyEyeballsConfig {
+    fn default() -> Self {
+        // 与 Go infra/conf/transport_internet.go:1021 UnmarshalJSON 缺省值一致。
+        Self {
+            prioritize_ipv6: false,
+            interleave: 1,
+            try_delay_ms: 0,
+            max_concurrent_try: 4,
+        }
+    }
 }
 
 impl Default for SocketOptions {
@@ -66,7 +100,8 @@ impl Default for SocketOptions {
             bind_if_index: 0,
             ipv6_only: false,
             dialer_proxy: String::new(),
-        }
+            happy_eyeballs: None,
+         }
     }
 }
 

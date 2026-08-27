@@ -2,17 +2,17 @@
 //!
 //! 对应 Go `transport/internet/system_dialer.go` + `dialer.go::DialSystem`。
 //!
-//! ## 切片边界（P5-Sys 切片1）
+//! ## 切片边界（P5-Sys 切片1 + 后续批次）
 //!
 //! 实现 TCP 拨号 + 基础 sockopt + 全局 effective dialer + Controllers 注册 +
-//! transport_dialer_cache 注册表。切片2 待办：
+//! transport_dialer_cache 注册表 + redirect（bd enk，[`set_dialer_proxy_hook`]）+
+//! Happy Eyeballs 竞争拨号（bd 0ko，[`crate::happy_eyeballs`]）。仍留待办：
 //!
 //! - UDP 拨号（tokio UdpSocket + PacketConnWrapper）
-//! - LookupForIP（DNS 解析 + DomainStrategy）
+//! - LookupForIP（DomainStrategy 感知的 DNS 解析；当前用系统 DNS）
 //! - checkAddressPortStrategy（SRV/TXT 记录覆盖 dest）
-//! - redirect 已实现（bd enk，[`set_dialer_proxy_hook`]，DialerProxy）
-//! - HappyEyeballs（TcpRaceDial）
-//! - InitSystemDialer（dns.Client + outbound.Manager 注入）
+//! - InitSystemDialer 的 dns.Client 注入（当前 [`init_system_dialer`] 只装
+//!   [`DnsResolvingDialer`]）
 
 use std::future::Future;
 use std::io;
@@ -21,9 +21,11 @@ use std::pin::Pin;
 use std::sync::{OnceLock, Arc};
 
 use parking_lot::{Mutex, RwLock};
-use socket2::Socket as Socket2;
+use socket2::{SockRef, Socket as Socket2};
 use tokio::net::TcpStream;
 
+use xray_common::net::address::Address;
+use xray_common::net::network::Network;
 use xray_common::net::destination::Destination;
 
 use crate::connection::Connection;
@@ -96,17 +98,18 @@ impl DefaultSystemDialer {
             Err(e) => return Err(e),
         }
         // 转 tokio TcpStream。
+        // 转 tokio TcpStream。
         let std_stream: std::net::TcpStream = socket.into();
         std_stream.set_nonblocking(true)?;
         let tokio_stream = TcpStream::from_std(std_stream)?;
-        // 等待连接完成（带超时）。
-        tokio::time::timeout(timeout, async {
-            // tokio TcpStream 连接在 from_std 时已建立（如果 connect 成功）。
-            // 这里通过 writable 检查连接状态。
-            tokio_stream.writable().await
-        })
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "dial timeout"))??;
+        // 等待连接完成（带超时）。writable 触发 ≠ 连接成功——连接被拒/失败
+        // 同样触发 writable，必须查 SO_ERROR（Go net.Dialer 内建行为）。
+        tokio::time::timeout(timeout, tokio_stream.writable())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "dial timeout"))??;
+        if let Some(e) = SockRef::from(&tokio_stream).take_error()? {
+            return Err(e);
+        }
         Ok(tokio_stream)
     }
 }
@@ -292,13 +295,14 @@ pub fn clear_dialer_proxy_hook() {
 
 /// 系统拨号。对应 Go `dialer.go::DialSystem`。
 ///
-/// `sockopt.dialer_proxy` 非空时经 [`DIALER_PROXY_HOOK`] 重定向（bd enk）。
-/// DNS/SRV/TXT/HappyEyeballs 仍留切片2。
+/// - `sockopt.dialer_proxy` 非空时经 [`DIALER_PROXY_HOOK`] 重定向（bd enk）
+/// - 域名目标 + TCP + Happy Eyeballs 启用时竞争拨号（bd 0ko，
+///   [`crate::happy_eyeballs::tcp_race_dial`]）；其余情况走 effective dialer
 ///
 /// # 参数
 ///
-/// - `destination`：目标地址。切片1 要求是 IP（非 Domain），Domain 解析留切片2。
-/// - `sockopt`：socket 选项（含 `dialer_proxy`）。
+/// - `destination`：目标地址（IP 或 Domain；Domain 由 DnsResolvingDialer 解析）
+/// - `sockopt`：socket 选项（含 `dialer_proxy` / `happy_eyeballs`）。
 pub async fn dial_system(
     destination: &Destination,
     sockopt: &SocketOptions,
@@ -333,6 +337,43 @@ pub async fn dial_system(
         .ok()
         .flatten()
         .map(|ip| SocketAddr::new(ip, 0));
+
+    // Happy Eyeballs（bd 0ko）：对应 Go dialer.go:251-267——域名目标 + TCP +
+    // tryDelayMs/maxConcurrentTry 非零时，解析全部 IP 竞争拨号；每次尝试走
+    // 完整 dialer（sockopt / src 生效）。DialerProxy 非空时已在上方分流
+    // （Go dialer.go:262 条件 `len(sockopt.DialerProxy) > 0` 同样排除）。
+    if destination.network() == Network::TCP {
+        if let Some(cfg) = sockopt.happy_eyeballs.as_ref() {
+            if cfg.try_delay_ms > 0 && cfg.max_concurrent_try > 0 {
+                if let Address::Domain(domain) = destination.address() {
+                    match tokio::net::lookup_host((domain.as_str(), destination.port().value()))
+                        .await
+                    {
+                        Ok(resolved) => {
+                            let ips: Vec<IpAddr> = resolved.map(|a| a.ip()).collect();
+                            if ips.len() >= 2 {
+                                return crate::happy_eyeballs::tcp_race_dial(
+                                    dialer,
+                                    src,
+                                    &ips,
+                                    destination.port(),
+                                    sockopt,
+                                    cfg,
+                                )
+                                .await;
+                            }
+                            // <2 个 IP：走普通路径（对齐 Go dialer.go:262 len(ips)<2 降级）。
+                        }
+                        Err(e) => {
+                            // 解析失败走普通路径（对齐 Go dialer.go:257-261 非
+                            // ForceIP 行为），普通路径的 DnsResolvingDialer 会再报错。
+                            tracing::warn!(domain = %domain, error = %e, "happy eyeballs lookup failed");
+                        }
+                    }
+                }
+            }
+        }
+    }
     dialer.dial(src, destination, sockopt).await
 }
 

@@ -5920,6 +5920,7 @@ dependencies = [
  "hex",
  "parking_lot",
  "prost",
+ "rand 0.9.4",
  "rcgen 0.13.2",
  "rustls",
  "rustls-pemfile",
