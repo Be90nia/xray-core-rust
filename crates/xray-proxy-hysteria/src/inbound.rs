@@ -240,7 +240,7 @@ impl InboundHandler for HysteriaInboundHandler {
         }
 
         let proto_config = Arc::new(self.build_proto_config());
-        let quic_params = Arc::new(QuicParams::default());
+        let quic_params = Arc::clone(&self.config.quic_params);
         let masq = MasqType::from_config(&proto_config)
             .map_err(|e| InboundError::ListenError(format!("masq config: {e}")))?;
         let validator: Option<Arc<dyn AuthValidator>> = if let Some(ref mv) = self.multi_validator {

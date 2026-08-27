@@ -2131,6 +2131,10 @@ fn parse_hysteria_inbound_config(
     // 真实 quinn server adapter：自签证书（或配置 cert/key PEM），ALPN h3 由 listen() 设置
     let _ = rustls::crypto::ring::default_provider().install_default();
     let server_config = build_hysteria_tls_server_config(&v)?;
+    // streamSettings.finalmask.quicParams → HysteriaConfig（brutal/CC/windows/keepAlive）
+    let quic_params = xray_transport_hysteria::quic_params::parse_quic_params(finalmask_json)?
+        .unwrap_or_else(xray_transport_hysteria::quic_params::default_hysteria_quic_params);
+    let config = config.with_quic_params(quic_params);
     // salamander UDP 混淆：streamSettings.finalmask.udp[]（对应 Go UdpmaskManager）
     let salamander = xray_transport_hysteria::salamander_socket::parse_salamander_obfs(finalmask_json)?;
     let factory: Arc<dyn xray_transport_hysteria::hub::HysteriaListenerFactory> =

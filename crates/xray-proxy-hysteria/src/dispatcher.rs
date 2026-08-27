@@ -377,7 +377,7 @@ pub fn make_hysteria_dial_fn(
                 udp_idle_timeout: config.udp_idle_timeout_secs as i64,
                 ..ProtoConfig::default()
             });
-            let quic_params = Arc::new(xray_proto::xray::transport::internet::QuicParams::default());
+            let quic_params = Arc::clone(&config.quic_params);
 
             let client = manager.get_or_create(dial_dest, proto_config, quic_params);
 

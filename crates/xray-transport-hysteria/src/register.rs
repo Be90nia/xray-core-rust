@@ -87,7 +87,10 @@ async fn listen_hysteria(
         crate::salamander_socket::parse_salamander_obfs(settings.finalmask_json.as_ref())?,
     );
     let config = Arc::new(parse_hysteria_config(settings.transport_json.as_ref())?);
-    let quic_params = Arc::new(QuicParams::default());
+    let quic_params = Arc::new(
+        crate::quic_params::parse_quic_params(settings.finalmask_json.as_ref())?
+            .unwrap_or_else(crate::quic_params::default_hysteria_quic_params),
+    );
     // ponytail: factory 当前忽略 masq/validator/on_new_conn；后续接 HTTP/3 auth/masquerade 时再注入
     let on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync> = Arc::new(|_| {});
     let listener = factory
@@ -205,7 +208,10 @@ async fn dial_hysteria(
             settings.finalmask_json.as_ref(),
         )?);
 
-    let quic_params = Arc::new(xray_proto::xray::transport::internet::QuicParams::default());
+    let quic_params = Arc::new(
+        crate::quic_params::parse_quic_params(settings.finalmask_json.as_ref())?
+            .unwrap_or_else(crate::quic_params::default_hysteria_quic_params),
+    );
     let client = HysteriaClient::new(
         dial_dest,
         Arc::new(config),

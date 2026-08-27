@@ -98,7 +98,7 @@ impl OutboundHandler for HysteriaOutboundHandler {
         let dest = resolve_server_dest(&self.config.server_addr, &self.config.server_name)?;
 
         let proto_config = Arc::new(self.build_proto_config());
-        let quic_params = Arc::new(xray_proto::xray::transport::internet::QuicParams::default());
+        let quic_params = Arc::clone(&self.config.quic_params);
 
         let client = self
             .client_manager

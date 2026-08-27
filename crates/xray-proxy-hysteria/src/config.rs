@@ -6,10 +6,12 @@
 //!
 //! 入站配置 [`HysteriaInboundConfig`] 对应 Go `proxy/hysteria/server.go` 的 ServerConfig。
 
+use std::sync::Arc;
 use std::collections::HashMap;
 
 use parking_lot::Mutex;
 use xray_transport_hysteria::hub::AuthValidator;
+use xray_transport_hysteria::quic_params::default_hysteria_quic_params;
 
 use crate::error::{Result, HysteriaProxyError};
 
@@ -32,6 +34,9 @@ pub struct HysteriaConfig {
     pub obfs: Option<String>,
     /// UDP session 空闲超时（秒）。
     pub udp_idle_timeout_secs: u64,
+    /// QUIC 参数（`streamSettings.finalmask.quicParams` 解析产物；
+    /// 无配置时为 Go nil 默认 bbr_profile=standard）。
+    pub quic_params: Arc<xray_proto::xray::transport::internet::QuicParams>,
 }
 
 impl HysteriaConfig {
@@ -51,6 +56,7 @@ impl HysteriaConfig {
             server_name,
             auth: auth.into(),
             alpn: Self::DEFAULT_ALPN.iter().map(|s| (*s).to_string()).collect(),
+            quic_params: Arc::new(default_hysteria_quic_params()),
             brutal_up_bps: 0,
             brutal_down_bps: 0,
             obfs: None,
@@ -100,6 +106,13 @@ impl HysteriaConfig {
         self
     }
 
+    /// 设置 QUIC 参数（`finalmask.quicParams` 解析产物）。
+    #[must_use]
+    pub fn with_quic_params(mut self, p: xray_proto::xray::transport::internet::QuicParams) -> Self {
+        self.quic_params = Arc::new(p);
+        self
+    }
+
     /// 返回 auth 的 HTTP 头值。
     ///
     /// Hysteria 协议支持两种 auth 格式：
@@ -142,6 +155,7 @@ impl HysteriaConfig {
             brutal_down_bps: 0,
             obfs: None,
             udp_idle_timeout_secs: transport.udp_idle_timeout.max(0) as u64,
+            quic_params: Arc::new(default_hysteria_quic_params()),
         }
     }
 }

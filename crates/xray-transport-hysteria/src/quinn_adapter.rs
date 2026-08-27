@@ -289,8 +289,30 @@ pub(crate) fn build_hysteria_transport_config(
     if qc.max_incoming_streams >= 0 {
         t.max_concurrent_bidi_streams(quinn::VarInt::try_from(qc.max_incoming_streams as u64).unwrap_or(quinn::VarInt::MAX));
     }
+    // 流量控制窗口（Go dialer.go:86-89 / hub.go:265-268 Initial*+Max* → quinn 单窗口取 max）
+    let (stream_win, conn_win) = receive_windows(qc);
+    if let Ok(v) = quinn::VarInt::try_from(stream_win) {
+        t.stream_receive_window(v);
+    }
+    if let Ok(v) = quinn::VarInt::try_from(conn_win) {
+        t.receive_window(v);
+    }
+    // 禁用路径 MTU 探测（Go dialer.go:92 / hub.go:271；Windows 上 Go 恒 false，仅显式配置生效）
+    if qc.disable_path_mtu_discovery {
+        t.mtu_discovery_config(None);
+    }
     let slot = crate::congestion::quinn_bridge::install_swappable_cc(&mut t);
     (t, slot)
+}
+
+/// quic-go `Initial*ReceiveWindow`（初始信用）与 `Max*ReceiveWindow`（auto-tune 上限）
+/// 二值在 quinn 合一为固定窗口——取 max 对齐 Go 稳态。
+/// 返回 `(stream_window, connection_window)`。
+pub(crate) fn receive_windows(qc: &QuicConfig) -> (u64, u64) {
+    (
+        qc.initial_stream_receive_window.max(qc.max_stream_receive_window),
+        qc.initial_connection_receive_window.max(qc.max_connection_receive_window),
+    )
 }
 
 // ===== 切片1b (续): QuinnQuicListener + QuinnListenerFactory =====
@@ -800,6 +822,50 @@ mod tests {
     fn ensure_crypto_provider() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
+    }
+
+    /// quicParams 全字段 → `QuicConfig` → 窗口/keepalive/MTU 决策（Go dialer.go:85-115 /
+    /// hub.go:264-294 对齐；quinn 无 getter，断言决策纯函数 + build 不 panic）。
+    #[test]
+    fn transport_config_maps_all_quic_fields() {
+        use xray_proto::xray::transport::internet::QuicParams;
+        let qp = QuicParams {
+            congestion: "bbr".into(),
+            bbr_profile: "aggressive".into(),
+            brutal_up: 13_107_200,
+            init_stream_receive_window: 16_384,
+            max_stream_receive_window: 65_536,
+            init_conn_receive_window: 32_768,
+            max_conn_receive_window: 131_072,
+            max_idle_timeout: 45,
+            keep_alive_period: 15,
+            disable_path_mtu_discovery: true,
+            max_incoming_streams: 64,
+            ..QuicParams::default()
+        };
+        let qc = QuicConfig::from_params(&qp);
+        // 秒 → 毫秒（Go time.Duration(quicParams.MaxIdleTimeout) * time.Second）
+        assert_eq!(qc.max_idle_timeout_ms, 45_000);
+        assert_eq!(qc.keep_alive_period_ms, 15_000);
+        assert_eq!(qc.max_incoming_streams, 64);
+        assert!(qc.disable_path_mtu_discovery);
+        // CC 字段透传（auth 后 apply_negotiated 消费）
+        assert_eq!(qc.congestion, "bbr");
+        assert_eq!(qc.bbr_profile, "aggressive");
+        assert_eq!(qc.brutal_up, 13_107_200);
+        // quic-go Initial（初始信用）/ Max（auto-tune 上限）→ quinn 单固定窗口取 max
+        assert_eq!(receive_windows(&qc), (65_536, 131_072));
+        // build 不 panic（CC 槽位行为由 quinn_bridge 自测覆盖）
+        let _ = build_hysteria_transport_config(&qc);
+    }
+
+    /// 默认 quicParams：窗口 8MiB / 20MiB（Go 8388608 与 8388608*5/2）。
+    #[test]
+    fn transport_config_default_windows() {
+        let qc = QuicConfig::from_params(&xray_proto::xray::transport::internet::QuicParams::default());
+        assert_eq!(receive_windows(&qc), (8_388_608, 20_971_520));
+        assert!(!qc.disable_path_mtu_discovery);
+        assert_eq!(qc.keep_alive_period_ms, 0, "Go keep-alive 默认关闭（dialer.go:113-115 注释）");
     }
 
     /// 辅助：构造一对 QuinnQuicConn 对接（loopback）。

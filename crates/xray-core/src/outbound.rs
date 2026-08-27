@@ -603,6 +603,12 @@ fn try_build_handler(
             let salamander = xray_transport_hysteria::salamander_socket::parse_salamander_obfs(
                 stream_settings.finalmask_json.as_ref(),
             ).map_err(|e| format!("hysteria finalmask: {e}"))?;
+            // streamSettings.finalmask.quicParams → HysteriaConfig（brutal/CC/windows/keepAlive）
+            let quic_params = xray_transport_hysteria::quic_params::parse_quic_params(
+                stream_settings.finalmask_json.as_ref(),
+            ).map_err(|e| format!("hysteria quicParams: {e}"))?
+                .unwrap_or_else(xray_transport_hysteria::quic_params::default_hysteria_quic_params);
+            let config = config.with_quic_params(quic_params);
             let transport = xray_transport_hysteria::hysteria_transport::QuinnHysteriaTransport::new(
                 tls_config, "0.0.0.0:0".parse().map_err(|e| format!("bind addr: {e}"))?,
             ).map_err(|e| format!("hysteria transport: {e}"))?

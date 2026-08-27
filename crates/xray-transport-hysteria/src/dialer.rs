@@ -83,8 +83,13 @@ impl QuicConfig {
             } else {
                 p.max_conn_receive_window
             },
-            max_idle_timeout_ms: if p.max_idle_timeout == 0 { 30_000 } else { p.max_idle_timeout as u64 },
-            keep_alive_period_ms: p.keep_alive_period as u64,
+            // QuicParams 秒 → quinn 毫秒（Go dialer.go:90-91 `* time.Second`）
+            max_idle_timeout_ms: if p.max_idle_timeout <= 0 {
+                30_000
+            } else {
+                (p.max_idle_timeout as u64) * 1000
+            },
+            keep_alive_period_ms: p.keep_alive_period.max(0) as u64 * 1000,
             disable_path_mtu_discovery: p.disable_path_mtu_discovery,
             enable_datagrams: true,
             max_datagram_frame_size: crate::config::MaxDatagramFrameSize as u64,
@@ -421,8 +426,8 @@ mod tests {
             max_stream_receive_window: 200_000,
             init_conn_receive_window: 300_000,
             max_conn_receive_window: 400_000,
-            max_idle_timeout: 60_000,
-            keep_alive_period: 5000,
+            max_idle_timeout: 60,
+            keep_alive_period: 5,
             disable_path_mtu_discovery: true,
             max_incoming_streams: 256,
             ..QuicParams::default()
@@ -433,7 +438,7 @@ mod tests {
         assert_eq!(cfg.initial_connection_receive_window, 300_000);
         assert_eq!(cfg.max_connection_receive_window, 400_000);
         assert_eq!(cfg.max_idle_timeout_ms, 60_000);
-        assert_eq!(cfg.keep_alive_period_ms, 5000);
+        assert_eq!(cfg.keep_alive_period_ms, 5_000);
         assert!(cfg.disable_path_mtu_discovery);
         assert_eq!(cfg.max_incoming_streams, 256);
     }
