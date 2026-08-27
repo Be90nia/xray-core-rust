@@ -2,8 +2,10 @@
 //!
 //! 对应 Go 版本 `common/protocol/` 包，定义安全类型、命令、ID 和请求/响应头。
 
-pub mod user;
+pub mod account;
 pub mod server_spec;
+pub mod time;
+pub mod user;
 pub mod address_parser;
 
 use serde::{Deserialize, Serialize};
@@ -600,8 +602,7 @@ mod tests {
 
     #[test]
     fn test_request_header_with_user() {
-        use crate::protocol::user::User;
-        let user = MemoryUser::new(User::new("test@example.com"));
+        let user = MemoryUser::new("test@example.com");
         let header = RequestHeader::new(1, Command::Tcp, sample_destination(), SecurityType::Auto)
             .with_user(user);
         assert!(header.user.is_some());

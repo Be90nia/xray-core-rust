@@ -1,36 +1,42 @@
 //! 服务器规格类型
 //!
-//! 对应 Go 版本 `common/protocol/server_spec.go`，定义服务器规格和端点。
+//! 对应 Go 版本 `common/protocol/server_spec.go` + `server_spec.proto`。
+//! Go 消费方：vless/vmess/trojan/shadowsocks/socks/http/hysteria 的
+//! client/outbound（`protocol.NewServerSpecFromPB(config.Server/Receiver/Vnext)`）。
 
 use serde::{Deserialize, Serialize};
 
 use crate::net::address::Address;
 use crate::net::destination::Destination;
 use crate::net::port::Port;
+use crate::protocol::user::{MemoryUser, User};
 
-/// 服务器规格，描述目标服务器及其可选邮箱。
+/// 服务器规格，描述目标服务器及其可选用户。
 ///
-/// 对应 Go 版本的 `ServerSpec`，使用 builder 模式构建。
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// 对应 Go 版本的 `ServerSpec{Destination net.Destination; User *MemoryUser}`。
+/// 运行时结构（含已解析账户），与 Go 一致不参与序列化。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ServerSpec {
     destination: Destination,
-    email: Option<String>,
+    user: Option<MemoryUser>,
 }
 
 impl ServerSpec {
-    /// 创建新的服务器规格。
+    /// 创建新的服务器规格（无用户）。
     #[must_use]
     pub fn new(destination: Destination) -> Self {
         Self {
             destination,
-            email: None,
+            user: None,
         }
     }
 
-    /// 设置邮箱，返回新的 ServerSpec。
+    /// 设置用户，返回新的 ServerSpec。
+    ///
+    /// 对应 Go 版本的 `NewServerSpec(dest, user)`。
     #[must_use]
-    pub fn with_email(mut self, email: impl Into<String>) -> Self {
-        self.email = Some(email.into());
+    pub fn with_user(mut self, user: MemoryUser) -> Self {
+        self.user = Some(user);
         self
     }
 
@@ -40,27 +46,59 @@ impl ServerSpec {
         &self.destination
     }
 
-    /// 获取邮箱引用。
+    /// 获取用户引用。
     #[must_use]
-    pub fn email(&self) -> Option<&str> {
-        self.email.as_deref()
+    pub fn user(&self) -> Option<&MemoryUser> {
+        self.user.as_ref()
+    }
+
+    /// 从服务器端点（proto 形式）转换。
+    ///
+    /// 对应 Go 版本的 `NewServerSpecFromPB(spec *ServerEndpoint)`：
+    /// 目的地固定为 TCP（`net.TCPDestination`）。
+    /// 差异：Go 经 `User.ToMemoryUser()` 解析 typed account（依赖 proto
+    /// 实例注册表）；Rust 侧 email/level 透传，账户解析属各 proxy crate
+    /// 的消费方接入任务，此处置空。
+    #[must_use]
+    pub fn from_server_endpoint(endpoint: &ServerEndpoint) -> Self {
+        let user = endpoint.user().map(|u| {
+            MemoryUser::new(u.email())
+                .with_level(u.level())
+        });
+        Self {
+            destination: Destination::tcp(endpoint.address().clone(), endpoint.port()),
+            user,
+        }
     }
 }
 
-/// 服务器端点，由地址和端口组成。
+/// 服务器端点，由地址、端口和可选用户组成。
 ///
-/// 对应 Go 版本的 `ServerEndpoint`。
+/// 对应 Go 版本 `server_spec.proto` 的 `ServerEndpoint` 消息：
+/// `{ address IPOrDomain; port uint32; user User }`。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ServerEndpoint {
     address: Address,
     port: Port,
+    user: Option<User>,
 }
 
 impl ServerEndpoint {
     /// 创建新的服务器端点。
     #[must_use]
     pub fn new(address: Address, port: Port) -> Self {
-        Self { address, port }
+        Self {
+            address,
+            port,
+            user: None,
+        }
+    }
+
+    /// 设置用户（proto 形式），返回新的 ServerEndpoint。
+    #[must_use]
+    pub fn with_user(mut self, user: User) -> Self {
+        self.user = Some(user);
+        self
     }
 
     /// 获取地址引用。
@@ -73,6 +111,12 @@ impl ServerEndpoint {
     #[must_use]
     pub fn port(&self) -> Port {
         self.port
+    }
+
+    /// 获取用户（proto 形式）引用。
+    #[must_use]
+    pub fn user(&self) -> Option<&User> {
+        self.user.as_ref()
     }
 }
 
@@ -91,25 +135,23 @@ mod tests {
         Destination::tcp(Address::ipv4(Ipv4Addr::new(192, 168, 1, 1)), Port::new(443))
     }
 
+    // ========== ServerSpec ==========
+
     #[test]
     fn test_server_spec_new() {
         let dest = sample_destination();
         let spec = ServerSpec::new(dest.clone());
         assert_eq!(spec.destination(), &dest);
-        assert_eq!(spec.email(), None);
+        assert_eq!(spec.user(), None);
     }
 
     #[test]
-    fn test_server_spec_with_email() {
-        let spec = ServerSpec::new(sample_destination()).with_email("admin@example.com");
-        assert_eq!(spec.email(), Some("admin@example.com"));
-    }
-
-    #[test]
-    fn test_server_spec_builder_chain() {
-        let spec = ServerSpec::new(sample_destination()).with_email("user@test.com");
-        assert!(spec.email().is_some());
-        assert_eq!(spec.email().expect("email"), "user@test.com");
+    fn test_server_spec_with_user() {
+        let spec = ServerSpec::new(sample_destination())
+            .with_user(MemoryUser::new("admin@example.com").with_level(2));
+        let user = spec.user().expect("user");
+        assert_eq!(user.email(), "admin@example.com");
+        assert_eq!(user.level(), 2);
     }
 
     #[test]
@@ -118,16 +160,41 @@ mod tests {
         let b = ServerSpec::new(sample_destination());
         assert_eq!(a, b);
 
-        let c = ServerSpec::new(sample_destination()).with_email("diff@test.com");
+        let c = ServerSpec::new(sample_destination()).with_user(MemoryUser::new("diff@test.com"));
         assert_ne!(a, c);
     }
 
     #[test]
     fn test_server_spec_clone() {
-        let spec = ServerSpec::new(sample_destination()).with_email("test@test.com");
+        let spec = ServerSpec::new(sample_destination()).with_user(MemoryUser::new("u@test.com"));
         let cloned = spec.clone();
         assert_eq!(spec, cloned);
     }
+
+    /// 对应 Go `NewServerSpecFromPB`：目的地固定 TCP，无用户时 user 为空。
+    #[test]
+    fn test_from_server_endpoint_without_user() {
+        let endpoint = ServerEndpoint::new(Address::new_domain("example.com"), Port::new(443));
+        let spec = ServerSpec::from_server_endpoint(&endpoint);
+        assert_eq!(
+            spec.destination(),
+            &Destination::tcp(Address::new_domain("example.com"), Port::new(443))
+        );
+        assert_eq!(spec.user(), None);
+    }
+
+    #[test]
+    fn test_from_server_endpoint_with_user() {
+        let endpoint = ServerEndpoint::new(Address::new_domain("example.com"), Port::new(443))
+            .with_user(User::new("alice@example.com").with_level(3));
+        let spec = ServerSpec::from_server_endpoint(&endpoint);
+        let user = spec.user().expect("user");
+        assert_eq!(user.email(), "alice@example.com");
+        assert_eq!(user.level(), 3);
+        assert!(user.account().is_none()); // 账户解析待消费方接入
+    }
+
+    // ========== ServerEndpoint ==========
 
     #[test]
     fn test_server_endpoint_new() {
@@ -135,6 +202,14 @@ mod tests {
         let endpoint = ServerEndpoint::new(addr.clone(), Port::new(443));
         assert_eq!(endpoint.address(), &addr);
         assert_eq!(endpoint.port(), Port::new(443));
+        assert_eq!(endpoint.user(), None);
+    }
+
+    #[test]
+    fn test_server_endpoint_with_user() {
+        let endpoint = ServerEndpoint::new(Address::new_domain("example.com"), Port::new(443))
+            .with_user(User::new("bob@example.com"));
+        assert_eq!(endpoint.user().expect("user").email(), "bob@example.com");
     }
 
     #[test]
@@ -157,19 +232,16 @@ mod tests {
         let a = ServerEndpoint::new(Address::new_domain("test.com"), Port::new(443));
         let b = ServerEndpoint::new(Address::new_domain("test.com"), Port::new(443));
         assert_eq!(a, b);
-    }
 
-    #[test]
-    fn test_serde_roundtrip_server_spec() {
-        let spec = ServerSpec::new(sample_destination()).with_email("test@test.com");
-        let json = serde_json::to_string(&spec).expect("serialize");
-        let deserialized: ServerSpec = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(spec, deserialized);
+        let c = ServerEndpoint::new(Address::new_domain("test.com"), Port::new(443))
+            .with_user(User::new("x@test.com"));
+        assert_ne!(a, c);
     }
 
     #[test]
     fn test_serde_roundtrip_server_endpoint() {
-        let endpoint = ServerEndpoint::new(Address::new_domain("example.com"), Port::new(443));
+        let endpoint = ServerEndpoint::new(Address::new_domain("example.com"), Port::new(443))
+            .with_user(User::new("alice@example.com").with_level(1));
         let json = serde_json::to_string(&endpoint).expect("serialize");
         let deserialized: ServerEndpoint = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(endpoint, deserialized);

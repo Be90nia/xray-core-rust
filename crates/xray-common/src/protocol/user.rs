@@ -1,61 +1,46 @@
 //! 协议用户类型
 //!
-//! 对应 Go 版本 `common/protocol/user.go`，定义用户和内存用户类型。
+//! 对应 Go 版本 `common/protocol/user.go` + `user.proto`。
+//!
+//! Go `User.GetTypedAccount()`/`ToMemoryUser()` 依赖 proto 全局实例注册表
+//! （`TypedMessage.GetInstance()`），Rust 无对应机制，属各 proxy crate 的
+//! 消费方接入任务，此处不移植；`ToProtoUser`（运行时 → proto 方向）无此
+//! 依赖，按 Go 语义提供。
+
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use crate::protocol::account::Account;
+use crate::serial::TypedMessage;
 
-/// 类型化消息占位类型。
+
+/// 协议用户（proto 镜像），携带账户的原始序列化形式、邮箱和权限等级。
 ///
-/// 对应 Go 版本的 `serial.TypedMessage`，用于承载任意 protobuf 消息。
-/// 当前为占位实现，后续接入 protobuf 序列化时替换。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TypedMessage {
-    /// 消息类型 URL
-    type_url: String,
-    /// 消息原始字节
-    value: Vec<u8>,
-}
-
-impl TypedMessage {
-    /// 创建新的类型化消息。
-    #[must_use]
-    pub fn new(type_url: impl Into<String>, value: Vec<u8>) -> Self {
-        Self {
-            type_url: type_url.into(),
-            value,
-        }
-    }
-
-    /// 获取类型 URL。
-    #[must_use]
-    pub fn type_url(&self) -> &str {
-        &self.type_url
-    }
-
-    /// 获取原始字节。
-    #[must_use]
-    pub fn value(&self) -> &[u8] {
-        &self.value
-    }
-}
-
-/// 协议用户，包含邮箱和权限等级。
-///
-/// 对应 Go 版本的 `User` 结构体。
+/// 对应 Go 版本 `user.proto` 的 `User` 消息：
+/// `{ account *serial.TypedMessage; email string; level uint32 }`。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct User {
+    account: Option<TypedMessage>,
     email: String,
     level: u32,
 }
 
 impl User {
-    /// 创建新用户，默认权限等级为 0。
+    /// 创建新用户，默认无账户、权限等级 0。
     #[must_use]
     pub fn new(email: impl Into<String>) -> Self {
         Self {
+            account: None,
             email: email.into(),
             level: 0,
         }
+    }
+
+    /// 设置账户（序列化形式），返回新的 User。
+    #[must_use]
+    pub fn with_account(mut self, account: TypedMessage) -> Self {
+        self.account = Some(account);
+        self
     }
 
     /// 设置权限等级，返回新的 User。
@@ -63,6 +48,12 @@ impl User {
     pub fn with_level(mut self, level: u32) -> Self {
         self.level = level;
         self
+    }
+
+    /// 获取账户（序列化形式）引用。
+    #[must_use]
+    pub fn account(&self) -> Option<&TypedMessage> {
+        self.account.as_ref()
     }
 
     /// 获取邮箱引用。
@@ -78,48 +69,81 @@ impl User {
     }
 }
 
-/// 内存用户，关联 User 和其 Account 信息。
+/// 内存用户（运行时形式），持有已解析的账户。
 ///
-/// 对应 Go 版本的 `MemoryUser`，用于运行时用户状态管理。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 对应 Go 版本的 `MemoryUser`：
+/// `{ Account Account; Email string; Level uint32 }`（扁平结构）。
+/// Account 为各协议解析后的运行时账户（如 vless 的 UUID + cmd_key）。
+#[derive(Debug, Clone)]
 pub struct MemoryUser {
-    user: User,
-    account: Option<TypedMessage>,
+    account: Option<Arc<dyn Account>>,
+    email: String,
+    level: u32,
 }
 
 impl MemoryUser {
-    /// 创建新的内存用户，不带账户信息。
+    /// 创建新的内存用户，无账户、权限等级 0。
     #[must_use]
-    pub fn new(user: User) -> Self {
+    pub fn new(email: impl Into<String>) -> Self {
         Self {
-            user,
             account: None,
+            email: email.into(),
+            level: 0,
         }
     }
 
-    /// 设置账户信息，返回新的 MemoryUser。
+    /// 设置运行时账户，返回新的 MemoryUser。
     #[must_use]
-    pub fn with_account(mut self, account: TypedMessage) -> Self {
+    pub fn with_account(mut self, account: Arc<dyn Account>) -> Self {
         self.account = Some(account);
         self
     }
 
-    /// 获取用户引用。
+    /// 设置权限等级，返回新的 MemoryUser。
     #[must_use]
-    pub fn user(&self) -> &User {
-        &self.user
+    pub fn with_level(mut self, level: u32) -> Self {
+        self.level = level;
+        self
     }
 
-    /// 获取账户信息引用。
+    /// 获取运行时账户引用。
     #[must_use]
-    pub fn account(&self) -> Option<&TypedMessage> {
+    pub fn account(&self) -> Option<&Arc<dyn Account>> {
         self.account.as_ref()
+    }
+
+    /// 获取邮箱引用。
+    #[must_use]
+    pub fn email(&self) -> &str {
+        &self.email
+    }
+
+    /// 获取权限等级。
+    #[must_use]
+    pub fn level(&self) -> u32 {
+        self.level
+    }
+
+    /// 转换回 proto 用户。
+    ///
+    /// 对应 Go 版本的 `ToProtoUser(mu)`：账户经 `Account.ToProto()` 编码为
+    /// TypedMessage。Go 对 nil Account 会 panic；此处无账户时 proto 侧
+    /// account 字段留空。
+    #[must_use]
+    pub fn to_proto_user(&self) -> User {
+        User {
+            account: self.account.as_ref().map(|a| a.to_proto()),
+            email: self.email.clone(),
+            level: self.level,
+        }
     }
 }
 
+/// 相等性按用户身份（email + level）判定，不含账户：
+/// 与旧实现一致（按 User 比较），账户的相等性用 [`Account::equals`] 判定。
 impl PartialEq for MemoryUser {
     fn eq(&self, other: &Self) -> bool {
-        self.user == other.user
+        self.email == other.email && self.level == other.level
     }
 }
 
@@ -127,7 +151,8 @@ impl Eq for MemoryUser {}
 
 impl std::hash::Hash for MemoryUser {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.user.hash(state);
+        self.email.hash(state);
+        self.level.hash(state);
     }
 }
 
@@ -135,11 +160,33 @@ impl std::hash::Hash for MemoryUser {
 mod tests {
     use super::*;
 
+    /// 测试用账户实现（与 account.rs 测试同构）。
+    #[derive(Debug)]
+    struct TestAccount {
+        id: u32,
+    }
+
+    impl Account for TestAccount {
+        fn equals(&self, other: &dyn Account) -> bool {
+            other
+                .as_any()
+                .downcast_ref::<TestAccount>()
+                .is_some_and(|o| o.id == self.id)
+        }
+        fn to_proto(&self) -> TypedMessage {
+            TypedMessage::new("type.googleapis.com/test.Account", self.id.to_be_bytes().to_vec())
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
     #[test]
     fn test_user_new() {
         let user = User::new("test@example.com");
         assert_eq!(user.email(), "test@example.com");
         assert_eq!(user.level(), 0);
+        assert_eq!(user.account(), None);
     }
 
     #[test]
@@ -149,68 +196,94 @@ mod tests {
     }
 
     #[test]
+    fn test_user_with_account() {
+        let account = TypedMessage::new("type.googleapis.com/xray.account", vec![1, 2, 3]);
+        let user = User::new("test@example.com").with_account(account.clone());
+        assert_eq!(user.account(), Some(&account));
+    }
+
+    #[test]
     fn test_user_equality() {
         let a = User::new("test@example.com").with_level(5);
         let b = User::new("test@example.com").with_level(5);
         let c = User::new("other@example.com").with_level(5);
         assert_eq!(a, b);
         assert_ne!(a, c);
-    }
-
-    #[test]
-    fn test_user_clone() {
-        let user = User::new("test@example.com").with_level(3);
-        let cloned = user.clone();
-        assert_eq!(user, cloned);
+        // 账户参与 proto User 相等性（普通派生 PartialEq）
+        let d = User::new("test@example.com").with_level(5);
+        assert_ne!(
+            a.with_account(TypedMessage::new("t", vec![1])),
+            d.with_account(TypedMessage::new("t", vec![2]))
+        );
     }
 
     #[test]
     fn test_memory_user_new() {
-        let user = User::new("test@example.com");
-        let mem = MemoryUser::new(user.clone());
-        assert_eq!(mem.user(), &user);
-        assert_eq!(mem.account(), None);
+        let mem = MemoryUser::new("test@example.com");
+        assert_eq!(mem.email(), "test@example.com");
+        assert!(mem.account().is_none());
     }
 
     #[test]
-    fn test_memory_user_with_account() {
-        let user = User::new("test@example.com");
-        let account = TypedMessage::new("type.googleapis.com/xray.account", vec![1, 2, 3]);
-        let mem = MemoryUser::new(user).with_account(account.clone());
-        assert!(mem.account().is_some());
-        assert_eq!(mem.account().expect("account").type_url(), account.type_url());
+    fn test_memory_user_with_account_and_level() {
+        let mem = MemoryUser::new("test@example.com")
+            .with_level(3)
+            .with_account(Arc::new(TestAccount { id: 7 }));
+        assert_eq!(mem.level(), 3);
+        let account = mem.account().expect("account");
+        // 账户可用 Account::equals 比较
+        assert!(account.equals(&TestAccount { id: 7 }));
+        assert!(!account.equals(&TestAccount { id: 8 }));
     }
 
     #[test]
-    fn test_memory_user_equality_by_user() {
-        let user = User::new("test@example.com");
-        let a = MemoryUser::new(user.clone());
-        let b = MemoryUser::new(user.clone()).with_account(TypedMessage::new("test", vec![]));
-        // MemoryUser 相等性仅基于 User
+    fn test_memory_user_equality_by_identity() {
+        // 相等性仅基于 email + level（用户身份），不含账户
+        let a = MemoryUser::new("test@example.com").with_level(2);
+        let b = MemoryUser::new("test@example.com")
+            .with_level(2)
+            .with_account(Arc::new(TestAccount { id: 1 }));
         assert_eq!(a, b);
+        assert_ne!(a, MemoryUser::new("other@example.com").with_level(2));
+        assert_ne!(a, MemoryUser::new("test@example.com").with_level(3));
+    }
+
+    /// 对应 Go `ToProtoUser`：email/level 透传，账户经 to_proto 编码。
+    #[test]
+    fn test_to_proto_user() {
+        let mem = MemoryUser::new("test@example.com")
+            .with_level(5)
+            .with_account(Arc::new(TestAccount { id: 9 }));
+        let user = mem.to_proto_user();
+        assert_eq!(user.email(), "test@example.com");
+        assert_eq!(user.level(), 5);
+        let account = user.account().expect("encoded account");
+        assert_eq!(account.type_url(), "type.googleapis.com/test.Account");
+        assert_eq!(account.value(), 9u32.to_be_bytes());
+    }
+
+    /// 编译期：MemoryUser 可跨线程共享（validator 常见于多任务运行时）。
+    #[test]
+    fn test_memory_user_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<MemoryUser>();
     }
 
     #[test]
-    fn test_typed_message_new() {
-        let msg = TypedMessage::new("type.googleapis.com/test", vec![1, 2, 3]);
-        assert_eq!(msg.type_url(), "type.googleapis.com/test");
-        assert_eq!(msg.value(), &[1, 2, 3]);
+    fn test_to_proto_user_without_account() {
+        let mem = MemoryUser::new("nobody@example.com").with_level(1);
+        let user = mem.to_proto_user();
+        assert_eq!(user.account(), None);
+        assert_eq!(user.email(), "nobody@example.com");
     }
 
     #[test]
     fn test_serde_roundtrip_user() {
-        let user = User::new("test@example.com").with_level(5);
+        let user = User::new("test@example.com")
+            .with_level(5)
+            .with_account(TypedMessage::new("type.googleapis.com/t", vec![1, 2]));
         let json = serde_json::to_string(&user).expect("serialize");
         let deserialized: User = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(user, deserialized);
-    }
-
-    #[test]
-    fn test_serde_roundtrip_memory_user() {
-        let user = User::new("test@example.com").with_level(3);
-        let mem = MemoryUser::new(user);
-        let json = serde_json::to_string(&mem).expect("serialize");
-        let deserialized: MemoryUser = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(mem, deserialized);
     }
 }

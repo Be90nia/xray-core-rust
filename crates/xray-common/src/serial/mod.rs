@@ -5,7 +5,7 @@
 /// 带类型 URL 的消息，用于多态消息传递。
 ///
 /// 对应 Go 版本 `common/serial.TypedMessage`，类似 protobuf Any 的包装器。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TypedMessage {
     /// 类型标识 URL
     pub type_url: String,
