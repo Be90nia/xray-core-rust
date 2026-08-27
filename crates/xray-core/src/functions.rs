@@ -185,7 +185,14 @@ async fn start_full_dispatched(
     }
 
     let ohm = Arc::new(SimpleOhm::new());
-    register_outbounds(built, &ohm, None)?;
+    // DNS service 同步注入出站（bd bqm）：targetStrategy 域名解析经此生效
+    // （对应 Go 全局 internet.dnsClient 由 app/dns 初始化）。
+    register_outbounds(
+        built,
+        &ohm,
+        None,
+        instance.get_feature::<xray_app_dns::DnsService>(),
+    )?;
 
     // DefaultDispatcher 装配（对应 Go dispatcher.Init(ohm, router, pm, sm)）
     let mut dispatcher = DefaultDispatcher::new();
@@ -498,6 +505,7 @@ mod tests {
             stream_settings_json: None,
             proxy_settings_json: None,
             mux_json: None,
+            target_strategy: None,
         });
 
         // 4. start_full
@@ -611,6 +619,7 @@ mod tests {
             stream_settings_json: None,
             proxy_settings_json: None,
             mux_json: None,
+            target_strategy: None,
         });
 
         // 5. start_full + 等 listener
@@ -694,6 +703,7 @@ mod tests {
             stream_settings_json: None,
             proxy_settings_json: None,
             mux_json: None,
+            target_strategy: None,
         });
 
         let (mut inst, _ohm, handles) = start_full(&built).await.unwrap();
@@ -746,7 +756,7 @@ mod tests {
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
             tag: "direct".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("vmess server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -762,7 +772,7 @@ mod tests {
             entry: BuiltEntry { kind: "vmess".into(),
                 data: format!(r#"{{"vnext":[{{"address":"127.0.0.1","port":{vmess_port},"users":[{{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","security":"auto"}}]}}]}}"#).into_bytes() },
             tag: "proxy".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
         let (_ci, _co, ch) = start_full(&client_cfg).await.expect("vmess client");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -821,7 +831,7 @@ mod tests {
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
             tag: "direct".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("vless server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -836,7 +846,7 @@ mod tests {
             entry: BuiltEntry { kind: "vless".into(),
                 data: format!(r#"{{"vnext":[{{"address":"127.0.0.1","port":{vless_port},"users":[{{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"}}]}}]}}"#).into_bytes() },
             tag: "proxy".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
         let (_ci, _co, ch) = start_full(&client_cfg).await.expect("vless client");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -894,7 +904,7 @@ mod tests {
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
             tag: "direct".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("trojan server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -909,7 +919,7 @@ mod tests {
             entry: BuiltEntry { kind: "trojan".into(),
                 data: format!(r#"{{"servers":[{{"address":"127.0.0.1","port":{trojan_port},"password":"test-pass-12345"}}]}}"#).into_bytes() },
             tag: "proxy".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
         let (_ci, _co, ch) = start_full(&client_cfg).await.expect("trojan client");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -970,7 +980,7 @@ mod tests {
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
             tag: "direct".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("vless-ws server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -987,7 +997,7 @@ mod tests {
                 data: format!(r#"{{"vnext":[{{"address":"127.0.0.1","port":{vless_port},"users":[{{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"}}]}}]}}"#).into_bytes() },
             tag: "proxy".into(), send_through: None,
             stream_settings_json: Some(ws_settings.into()),
-            proxy_settings_json: None, mux_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
         let (_ci, _co, ch) = start_full(&client_cfg).await.expect("vless-ws client");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1065,7 +1075,7 @@ mod tests {
         cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
             tag: "default".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
         // routing config: IP 规则 → 127.0.0.0/8 走默认（验证 routing 不崩溃）
         // 注：完整路由测试需要 RouterAdapter + domain sniffing，此处验证 routing JSON 不破坏启动
@@ -1144,7 +1154,7 @@ mod tests {
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
             tag: "direct".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("vless-tls server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1161,7 +1171,7 @@ mod tests {
                 data: format!(r#"{{"vnext":[{{"address":"127.0.0.1","port":{vless_port},"users":[{{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"}}]}}]}}"#).into_bytes() },
             tag: "proxy".into(), send_through: None,
             stream_settings_json: Some(serde_json::from_str(client_tls).unwrap()),
-            proxy_settings_json: None, mux_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
         let (_ci, _co, ch) = start_full(&client_cfg).await.expect("vless-tls client");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1224,7 +1234,7 @@ mod tests {
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
             tag: "direct".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("trojan-tls server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1240,7 +1250,7 @@ mod tests {
                 data: format!(r#"{{"servers":[{{"address":"127.0.0.1","port":{trojan_port},"password":"test-pass-12345"}}]}}"#).into_bytes() },
             tag: "proxy".into(), send_through: None,
             stream_settings_json: Some(serde_json::from_str(client_tls).unwrap()),
-            proxy_settings_json: None, mux_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
         let (_ci, _co, ch) = start_full(&client_cfg).await.expect("trojan-tls client");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1302,7 +1312,7 @@ mod tests {
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
             tag: "direct".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("vmess-tls server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1318,7 +1328,7 @@ mod tests {
                 data: format!(r#"{{"vnext":[{{"address":"127.0.0.1","port":{vmess_port},"users":[{{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","security":"auto"}}]}}]}}"#).into_bytes() },
             tag: "proxy".into(), send_through: None,
             stream_settings_json: Some(serde_json::from_str(client_tls).unwrap()),
-            proxy_settings_json: None, mux_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
         let (_ci, _co, ch) = start_full(&client_cfg).await.expect("vmess-tls client");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1379,7 +1389,7 @@ mod tests {
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
             tag: "direct".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("trojan-fb server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1438,7 +1448,7 @@ mod tests {
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
             tag: "direct".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
         let (_, _, sh) = start_full(&server_cfg).await.expect("socks server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1454,7 +1464,7 @@ mod tests {
             entry: BuiltEntry { kind: "socks".into(),
                 data: format!(r#"{{"servers":[{{"address":"127.0.0.1","port":{socks_server_port}}}]}}"#).into_bytes() },
             tag: "proxy".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
         let (_, _, ch) = start_full(&client_cfg).await.expect("socks client");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1513,7 +1523,7 @@ mod tests {
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
             tag: "direct".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("ss server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1528,7 +1538,7 @@ mod tests {
             entry: BuiltEntry { kind: "shadowsocks".into(),
                 data: format!(r#"{{"servers":[{{"address":"127.0.0.1","port":{ss_port},"password":"test-pass","method":"aes-256-gcm"}}]}}"#).into_bytes() },
             tag: "proxy".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
         let (_ci, _co, ch) = start_full(&client_cfg).await.expect("ss client");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1607,7 +1617,7 @@ mod tests {
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
             tag: "direct".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("vless-fb server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1624,7 +1634,7 @@ mod tests {
                 data: format!(r#"{{"vnext":[{{"address":"127.0.0.1","port":{vless_port},"users":[{{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"}}]}}]}}"#).into_bytes() },
             tag: "proxy".into(), send_through: None,
             stream_settings_json: Some(serde_json::from_str(client_tls).unwrap()),
-            proxy_settings_json: None, mux_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
         let (_ci, _co, ch) = start_full(&client_cfg).await.expect("vless-fb client");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1791,7 +1801,7 @@ mod tests {
             entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
             tag: "direct".into(), // i=0 → default
             send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
         cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry {
@@ -1803,7 +1813,7 @@ mod tests {
             },
             tag: "via-sni".into(),
             send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
         cfg.apps.push(BuiltEntry {
             kind: "routing".into(),
@@ -1895,7 +1905,7 @@ mod tests {
             entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
             tag: "direct".into(),
             send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
 
         let (inst, _, handles) = start_full(&cfg).await.expect("stats config start");

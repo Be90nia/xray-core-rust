@@ -66,6 +66,7 @@ tokio-util = "0.7"
 tracing = { workspace = true }
 serde_json = { workspace = true }
 prost = { workspace = true }
+rand = { workspace = true }
 uuid = { workspace = true }
 rustls = { workspace = true }
 tonic = { workspace = true }

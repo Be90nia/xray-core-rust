@@ -130,12 +130,23 @@ impl xray_app_dispatcher::OutboundHandlerManager for OhmRef {
 /// 对应 Go `senderSettings.ProxySettings.Tag`。如果 outbound 配置了 `proxySettings.tag`，
 /// 注册完成后会二次扫描，为 DialBridge 设置 `proxy_chain_tag` + `outbound_manager`，
 /// 使其 dispatch 时通过 chained handler 拨号而非直接 dial。
-pub fn register_outbounds(built: &BuiltConfig, ohm: &SimpleOhm, loopback_sink: Option<Arc<dyn LoopbackSink>>) -> Result<()> {
+///
+/// ## targetStrategy（bd bqm）
+///
+/// `dns` 提供域名解析服务（对应 Go 全局 `internet.dnsClient`，由 `app/dns`
+/// 初始化后 `internet.InitDNSCache` 注入）。配置了 `targetStrategy`（非 AsIs）
+/// 的出站在拨号前经 [`wrap_dial_with_target_strategy`] 解析改写目标。
+pub fn register_outbounds(
+    built: &BuiltConfig,
+    ohm: &SimpleOhm,
+    loopback_sink: Option<Arc<dyn LoopbackSink>>,
+    dns: Option<Arc<xray_app_dns::DnsService>>,
+) -> Result<()> {
     // Phase 1: 注册所有 handler，收集需要代理链的 DialBridge 引用
     let mut chain_bridges: Vec<(Arc<DialBridge>, String)> = Vec::new(); // (bridge, chain_tag)
     let mut mux_bridges: Vec<(Arc<MuxBridge>, Option<String>)> = Vec::new();
     for (i, ob) in built.outbounds.iter().enumerate() {
-        match try_build_handler(ob, loopback_sink.clone(), &mut mux_bridges) {
+        match try_build_handler(ob, loopback_sink.clone(), &mut mux_bridges, dns.as_ref()) {
             Ok((handler, bridge_ref, proxy_chain_tag)) => {
                 let is_default = i == 0 || ob.tag == "direct";
                 if is_default {
@@ -208,11 +219,19 @@ pub fn register_outbounds(built: &BuiltConfig, ohm: &SimpleOhm, loopback_sink: O
 /// 包装 DialBridge 为 `(handler, Some(dial_bridge_arc), proxy_chain_tag)` 三元组。
 ///
 /// `proxy_chain_tag` 存在时保留 `Arc<DialBridge>` 引用，以便 Phase 2 设置代理链。
+/// `target_strategy` 有效（非 AsIs）时先经 [`wrap_dial_with_target_strategy`]
+/// 包装 dial_fn（bd bqm）。
 fn wrap_bridge(
     tag: String,
     dial_fn: xray_app_dispatcher::default::DialFn,
     proxy_chain_tag: &Option<String>,
+    target_strategy: Option<DomainStrategy>,
+    dns: Option<&Arc<xray_app_dns::DnsService>>,
 ) -> std::result::Result<(Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>), BuildError> {
+    let dial_fn = match target_strategy {
+        Some(s) => wrap_dial_with_target_strategy(dial_fn, s, dns.cloned()),
+        None => dial_fn,
+    };
     let bridge = Arc::new(DialBridge::new(tag, dial_fn));
     let handler = Arc::clone(&bridge) as Arc<dyn DispatchHandler>;
     let bridge_ref = if proxy_chain_tag.is_some() { Some(bridge) } else { None };
@@ -223,12 +242,13 @@ fn wrap_bridge(
 ///
 /// 与 [`try_build_handler`] 同一构建路径（协议全覆盖），mux outbound 返回
 /// `Unsupported`（动态 mux 依赖 register_outbounds 的 Phase 2 二次扫描，
-/// API 场景不适用）。
+/// API 场景不适用）。DNS 服务未注入（API 路径暂无 DnsService 传递链），
+/// targetStrategy=Force* 在该路径下解析域名会失败断链。
 pub fn build_single_outbound(
     ob: &BuiltOutbound,
 ) -> std::result::Result<Arc<dyn DispatchHandler>, BuildError> {
     let mut mux_bridges = Vec::new();
-    let (handler, _, _) = try_build_handler(ob, None, &mut mux_bridges)?;
+    let (handler, _, _) = try_build_handler(ob, None, &mut mux_bridges, None)?;
     Ok(handler)
 }
 
@@ -274,6 +294,9 @@ pub fn built_outbound_from_proto(
         stream_settings_json,
         proxy_settings_json: None,
         mux_json: None,
+        // proto sender_settings 的 targetStrategy（i32 枚举）→ 字符串的逆向
+        // 映射未实现（gRPC AddOutbound 携带该字段的场景待补，bd bqm 差异项）
+        target_strategy: None,
     })
 }
 
@@ -364,13 +387,25 @@ fn try_build_handler(
     ob: &BuiltOutbound,
     loopback_sink: Option<Arc<dyn LoopbackSink>>,
     mux_bridges: &mut Vec<(Arc<MuxBridge>, Option<String>)>,
+    dns: Option<&Arc<xray_app_dns::DnsService>>,
 ) -> std::result::Result<(Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>), BuildError> {
     let proxy_chain_tag = parse_proxy_chain_tag(ob.proxy_settings_json.as_ref());
+    // targetStrategy（bd bqm）：字符串 → 枚举；AsIs（无策略）不包装
+    // （Go handler.go:184 `HasStrategy()` 门控）
+    let target_strategy = ob
+        .target_strategy
+        .as_deref()
+        .and_then(parse_target_strategy)
+        .filter(|s| s.has_strategy());
     match ob.entry.kind.as_str() {
         "freedom" => {
             let config = parse_freedom_config(&ob.entry.data);
             let noises = config.noises.clone();
             let dial_fn = xray_proxy_freedom::make_freedom_dial_fn_with_config(config);
+            let dial_fn = match target_strategy {
+                Some(s) => wrap_dial_with_target_strategy(dial_fn, s, dns.cloned()),
+                None => dial_fn,
+            };
             // TCP 走 DialBridge（fragment 经 DialFn 包装 writer），UDP 走
             // FreedomDispatchBridge（noises 首包前注入）
             let tcp_bridge = Arc::new(DialBridge::new(ob.tag.clone(), dial_fn));
@@ -385,13 +420,13 @@ fn try_build_handler(
             let config = parse_vless_config(&ob.entry.data)?;
             let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_vless::make_vless_dial_fn(Arc::new(config));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns)
         }
         "trojan" => {
             let config = parse_trojan_config(&ob.entry.data)?;
             let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_trojan::make_trojan_dial_fn(Arc::new(config));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns)
         }
         "blackhole" => {
             let response = parse_blackhole_response(&ob.entry.data);
@@ -412,7 +447,7 @@ fn try_build_handler(
                 ),
             });
             let dial_fn = xray_proxy_socks::make_socks_dial_fn(client);
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns)
         }
         "mux" => {
             let (concurrency, via_tag) = parse_mux_config(&ob.entry.data)?;
@@ -426,12 +461,12 @@ fn try_build_handler(
             let config = xray_proxy_vmess::parse_vmess_config(&ob.entry.data)?;
             let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_vmess::make_vmess_dial_fn(Arc::new(config));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns)
         }
         "shadowsocks" => {
             let config = xray_proxy_ss::parse_ss_config(&ob.entry.data)?;
             let dial_fn = xray_proxy_ss::make_ss_dial_fn(Arc::new(config));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns)
         }
         "hysteria" => {
             let (server_addr, auth, server_name) = parse_hysteria_config(&ob.entry.data)?;
@@ -450,13 +485,13 @@ fn try_build_handler(
             ).map_err(|e| format!("hysteria transport: {e}"))?
                 .with_salamander(salamander);
             let dial_fn = xray_proxy_hysteria::make_hysteria_dial_fn(config, Arc::new(transport));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns)
         }
         "anytls" => {
             let config = parse_anytls_config(&ob.entry.data)?;
             let client = Arc::new(xray_proxy_anytls::AnytlsClient::new(config));
             let dial_fn = xray_proxy_anytls::make_anytls_dial_fn(client);
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns)
         }
         "tuic" => {
             let s = parse_tuic_config(&ob.entry.data)?;
@@ -479,12 +514,12 @@ fn try_build_handler(
                 rustls_config,
                 options,
             );
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns)
         }
         "wireguard" => {
             let config = parse_wireguard_config(&ob.entry.data)?;
             let dial_fn = xray_proxy_wireguard::make_wireguard_dial_fn(config);
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns)
         }
         "dns" => {
             let (handler, dns) = parse_dns_outbound_config(&ob.entry.data, &ob.tag)?;
@@ -506,17 +541,17 @@ fn try_build_handler(
             let config = xray_proxy_http::parse_http_config(&ob.entry.data)?;
             let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_http::make_http_dial_fn(Arc::new(config));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns)
         }
         "dokodemo" => {
             let config = parse_dokodemo_config(&ob.entry.data)?;
             let dial_fn = xray_proxy_dokodemo::make_dokodemo_dial_fn(config);
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns)
         }
         #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
         "tun" => {
             let dial_fn = xray_proxy_tun::make_tun_dial_fn();
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns)
         }
         #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
         "tun" => {
@@ -751,6 +786,130 @@ fn parse_freedom_domain_strategy(s: &str) -> DomainStrategy {
         "UseIPv6v4" => DomainStrategy::UseIPv6v4,
         _ => DomainStrategy::AsIs,
     }
+}
+
+/// `targetStrategy` 字符串 → 枚举（大小写不敏感）。
+///
+/// 对应 Go `infra/conf/xray.go:257-282`（`strings.ToLower` switch 的 11 个值）。
+/// 非法值返回 None（conf 层 `Config::build` 已校验合法值并硬报错，此处防御兜底）。
+fn parse_target_strategy(s: &str) -> Option<DomainStrategy> {
+    match s.to_lowercase().as_str() {
+        "" | "asis" => Some(DomainStrategy::AsIs),
+        "useip" => Some(DomainStrategy::UseIP),
+        "useipv4" => Some(DomainStrategy::UseIPv4),
+        "useipv6" => Some(DomainStrategy::UseIPv6),
+        "useipv4v6" => Some(DomainStrategy::UseIPv4v6),
+        "useipv6v4" => Some(DomainStrategy::UseIPv6v4),
+        "forceip" => Some(DomainStrategy::ForceIP),
+        "forceipv4" => Some(DomainStrategy::ForceIPv4),
+        "forceipv6" => Some(DomainStrategy::ForceIPv6),
+        "forceipv4v6" => Some(DomainStrategy::ForceIPv4v6),
+        "forceipv6v4" => Some(DomainStrategy::ForceIPv6v4),
+        _ => None,
+    }
+}
+
+/// `internet.LookupForIP` 等价实现。
+///
+/// 对应 Go `transport/internet/dialer.go:87-109` 的 `localAddr == nil` 分支
+/// （sendThrough/Via 未接入 bd 7zc，此处恒 nil）：
+/// 1. 按 strategy 的 prefer 家族查询（dialer.go:92-95）
+/// 2. 失败/空结果 + HasFallback → 按 fallback 家族再查（dialer.go:96-103）
+/// 3. 空结果 → ErrEmptyResponse（dialer.go:105-106）
+async fn lookup_for_ip(
+    dns: &xray_app_dns::DnsService,
+    domain: &str,
+    strategy: DomainStrategy,
+) -> std::result::Result<Vec<std::net::IpAddr>, String> {
+    use xray_app_dns::config::IpOption;
+    // Go `PreferIP4()/PreferIP6()`（config.go:110-116）：prefer 字段为 0（both）
+    // 时两个家族都启用。`xray_proxy_freedom::DomainStrategy::prefer_ipv4/6`
+    // 的语义不含 `==0` 分支（其 freedom 拨号过滤逻辑依赖该语义），故此处
+    // 直接按 strategy_table 构造，与 Go LookupForIP 的 IPOption 对齐。
+    let prefer_byte = strategy.strategy_table()[1];
+    let prefer = IpOption {
+        ipv4_enable: prefer_byte == 4 || prefer_byte == 0,
+        ipv6_enable: prefer_byte == 6 || prefer_byte == 0,
+        fake_enable: false,
+    };
+    let mut result = dns.lookup_ip(domain, prefer).await;
+    let need_fallback = match &result {
+        Ok((ips, _)) => ips.is_empty(),
+        Err(_) => true,
+    };
+    if need_fallback && strategy.has_fallback() {
+        let fallback = IpOption {
+            ipv4_enable: strategy.fallback_ipv4(),
+            ipv6_enable: strategy.fallback_ipv6(),
+            fake_enable: false,
+        };
+        result = dns.lookup_ip(domain, fallback).await;
+    }
+    match result {
+        Ok((ips, _)) if !ips.is_empty() => Ok(ips),
+        Ok(_) => Err("empty DNS response".to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// 用 targetStrategy 包装 dial_fn：域名目标在拨号前经 DNS 解析改写为 IP。
+///
+/// 对应 Go `app/proxyman/outbound/handler.go:184-205`（Handler.Dispatch 的
+/// TargetStrategy 段）：`HasStrategy` + 域名目标 → `LookupForIP` → 随机选一个
+/// IP 改写目标（handler.go:202 `ips[dice.Roll(len(ips))]`）；解析失败时
+/// Force* 断链报错（handler.go:192-197）、Use* 回退域名直连（handler.go:190-191）。
+///
+/// ## 与 Go 的差异（`DialFn` 签名无 session 上下文）
+///
+/// - `content.SkipDNSResolve` 门控未实现（Go handler.go:184）
+/// - UDP `GetDynamicStrategy(origTargetAddr)` 动态策略未实现（Go handler.go:186-188）；
+///   UDP 域名目标按原策略解析
+fn wrap_dial_with_target_strategy(
+    inner: xray_app_dispatcher::default::DialFn,
+    strategy: DomainStrategy,
+    dns: Option<Arc<xray_app_dns::DnsService>>,
+) -> xray_app_dispatcher::default::DialFn {
+    use rand::Rng;
+    use xray_common::net::address::Address;
+    use xray_common::net::destination::Destination;
+    Arc::new(move |dest: &Destination| {
+        let inner = Arc::clone(&inner);
+        let dns = dns.clone();
+        let dest = dest.clone();
+        Box::pin(async move {
+            // Go handler.go:184：仅域名目标走解析（`Family().IsDomain()` 门控）
+            let Address::Domain(domain) = dest.address() else {
+                return inner(&dest).await;
+            };
+            let domain = domain.clone();
+            let Some(dns) = dns else {
+                // Go dialer.go:88-90：dnsClient 未初始化 → 错误
+                if strategy.force_ip() {
+                    return Err(format!(
+                        "failed to resolve ip for target {domain}: DNS client not initialized"
+                    ));
+                }
+                return inner(&dest).await;
+            };
+            match lookup_for_ip(&dns, &domain, strategy).await {
+                Ok(ips) => {
+                    // Go handler.go:202：dice.Roll 随机选一个
+                    let ip = ips[rand::rng().random_range(0..ips.len())];
+                    tracing::info!(target = %domain, resolved = %ip, "target strategy resolved");
+                    let resolved = Destination::new(Address::from(ip), dest.port(), dest.network());
+                    inner(&resolved).await
+                }
+                Err(e) => {
+                    // Go handler.go:190-199：Force* 断链报错；Use* 回退域名直连
+                    if strategy.force_ip() {
+                        return Err(format!("failed to resolve ip for target {domain}: {e}"));
+                    }
+                    tracing::info!(target = %domain, error = %e, "resolve failed, fallback to domain");
+                    inner(&dest).await
+                }
+            }
+        })
+    })
 }
 
 /// 解析 fragment 子对象。
@@ -1478,6 +1637,7 @@ mod tests {
             stream_settings_json: None,
             proxy_settings_json: None,
             mux_json: None,
+            target_strategy: None,
         }
     }
 
@@ -1523,7 +1683,7 @@ mod tests {
         built.outbounds.push(make_outbound("freedom", "direct", "{}"));
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None).unwrap();
+        register_outbounds(&built, &ohm, None, None).unwrap();
 
         assert!(ohm.get_default_handler().is_some(), "freedom should be default");
         assert!(ohm.get_handler("direct").is_some(), "freedom should be tagged");
@@ -1536,7 +1696,7 @@ mod tests {
         built.outbounds.push(make_outbound("freedom", "direct", "{}"));
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None).unwrap();
+        register_outbounds(&built, &ohm, None, None).unwrap();
 
         // 第一个设为 default，"direct" 也设为 default（覆盖）
         assert!(ohm.get_default_handler().is_some());
@@ -1557,7 +1717,7 @@ mod tests {
         built.outbounds.push(make_outbound("vless", "vless-out", settings));
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None).unwrap();
+        register_outbounds(&built, &ohm, None, None).unwrap();
 
         assert!(ohm.get_handler("vless-out").is_some(), "vless should be registered");
     }
@@ -1604,7 +1764,7 @@ mod tests {
         built.outbounds.push(make_outbound("trojan", "trojan-out", settings));
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None).unwrap();
+        register_outbounds(&built, &ohm, None, None).unwrap();
 
         assert!(ohm.get_handler("trojan-out").is_some(), "trojan should be registered");
     }
@@ -1616,7 +1776,7 @@ mod tests {
         built.outbounds.push(make_outbound("dokodemo", "dokodemo-out", settings));
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None).unwrap();
+        register_outbounds(&built, &ohm, None, None).unwrap();
 
         assert!(ohm.get_handler("dokodemo-out").is_some(), "dokodemo should be registered");
     }
@@ -1628,7 +1788,7 @@ mod tests {
         built.outbounds.push(make_outbound("tun", "tun-out", "{}"));
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None).unwrap();
+        register_outbounds(&built, &ohm, None, None).unwrap();
 
         assert!(ohm.get_handler("tun-out").is_some(), "tun should be registered");
     }
@@ -1646,7 +1806,7 @@ mod tests {
         built.outbounds.push(make_outbound("vless", "bad-vless", settings));
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None).unwrap();
+        register_outbounds(&built, &ohm, None, None).unwrap();
 
         assert!(
             ohm.get_handler("bad-vless").is_none(),
@@ -1658,7 +1818,7 @@ mod tests {
     fn register_empty_outbounds_noop() {
         let built = BuiltConfig::default();
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None).unwrap();
+        register_outbounds(&built, &ohm, None, None).unwrap();
         assert!(ohm.get_default_handler().is_none());
     }
 
@@ -1725,7 +1885,7 @@ mod tests {
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("blackhole", "bh", "{}"));
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None).unwrap();
+        register_outbounds(&built, &ohm, None, None).unwrap();
         assert!(ohm.get_handler("bh").is_some(), "blackhole should register");
     }
 
@@ -1736,7 +1896,7 @@ mod tests {
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("blackhole", "bh-http", settings));
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None).unwrap();
+        register_outbounds(&built, &ohm, None, None).unwrap();
         assert!(ohm.get_handler("bh-http").is_some());
     }
 
@@ -1746,7 +1906,7 @@ mod tests {
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("socks", "socks-out", settings));
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None).unwrap();
+        register_outbounds(&built, &ohm, None, None).unwrap();
         assert!(ohm.get_handler("socks-out").is_some(), "socks outbound should register");
     }
 
@@ -1756,7 +1916,7 @@ mod tests {
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("socks", "socks-auth", settings));
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None).unwrap();
+        register_outbounds(&built, &ohm, None, None).unwrap();
         assert!(ohm.get_handler("socks-auth").is_some());
     }
 
@@ -1766,7 +1926,7 @@ mod tests {
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("mux", "mux-out", settings));
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None).unwrap();
+        register_outbounds(&built, &ohm, None, None).unwrap();
         assert!(ohm.get_handler("mux-out").is_some(), "mux outbound should register");
     }
 
@@ -1775,7 +1935,7 @@ mod tests {
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("mux", "mux-default", "{}"));
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None).unwrap();
+        register_outbounds(&built, &ohm, None, None).unwrap();
         assert!(ohm.get_handler("mux-default").is_some());
     }
 
@@ -1798,7 +1958,7 @@ mod tests {
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("socks", "bad-socks", "{}"));
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None).unwrap();
+        register_outbounds(&built, &ohm, None, None).unwrap();
         assert!(ohm.get_handler("bad-socks").is_none());
     }
 
@@ -1834,7 +1994,7 @@ mod tests {
         built.outbounds.push(ob);
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None).unwrap();
+        register_outbounds(&built, &ohm, None, None).unwrap();
 
         assert!(ohm.get_handler("proxy-out").is_some(), "proxy-out should be registered");
         assert!(ohm.get_handler("chain-out").is_some(), "chain-out should be registered");
@@ -2011,5 +2171,234 @@ mod tests {
         .expect("connect timed out")
         .expect("connect failed");
         client.close(0u32.into(), b"");
+    }
+
+    // ========== targetStrategy（bd bqm）==========
+
+    use std::sync::Mutex;
+    use xray_app_dispatcher::default::DialFn;
+    use xray_common::net::address::Address;
+    use xray_common::net::destination::Destination;
+    use xray_common::net::network::Network;
+    use xray_common::net::port::Port;
+
+    /// 记录 dest 的 fake dial_fn，返回 duplex 连接（不断链）。
+    fn recording_dial(recorded: Arc<Mutex<Vec<Destination>>>) -> DialFn {
+        Arc::new(move |dest: &Destination| {
+            let dest = dest.clone();
+            let recorded = Arc::clone(&recorded);
+            Box::pin(async move {
+                recorded.lock().expect("lock").push(dest);
+                let (client, _server) = tokio::io::duplex(4096);
+                Ok(Box::new(xray_transport::connection::DuplexConnection::new(client))
+                    as Box<dyn xray_transport::connection::Connection>)
+            })
+        })
+    }
+
+    /// 构造带静态 hosts 的 DnsService（hosts：resolve-test.invalid → 127.0.0.1）。
+    fn hosts_dns_service() -> Arc<xray_app_dns::DnsService> {
+        let cfg: xray_app_dns::DnsAppConfig = serde_json::from_str(
+            r#"{"hosts": {"resolve-test.invalid": "127.0.0.1"}}"#,
+        )
+        .expect("dns config json");
+        let svc = cfg.build().expect("dns config build");
+        Arc::new(xray_app_dns::DnsService::new(svc))
+    }
+
+    fn domain_dest(domain: &str) -> Destination {
+        Destination::new(
+            Address::Domain(domain.to_string()),
+            Port::new(443),
+            Network::TCP,
+        )
+    }
+
+    #[test]
+    fn parse_target_strategy_maps_go_enum_values() {
+        use xray_proxy_freedom::DomainStrategy;
+        // Go infra/conf/xray.go:257-282（ToLower switch）11 值 + 大小写不敏感。
+        assert_eq!(parse_target_strategy("AsIs"), Some(DomainStrategy::AsIs));
+        assert_eq!(parse_target_strategy("asis"), Some(DomainStrategy::AsIs));
+        assert_eq!(parse_target_strategy(""), Some(DomainStrategy::AsIs));
+        assert_eq!(parse_target_strategy("UseIP"), Some(DomainStrategy::UseIP));
+        assert_eq!(parse_target_strategy("useipv4"), Some(DomainStrategy::UseIPv4));
+        assert_eq!(parse_target_strategy("UseIPv6"), Some(DomainStrategy::UseIPv6));
+        assert_eq!(parse_target_strategy("useipv4v6"), Some(DomainStrategy::UseIPv4v6));
+        assert_eq!(parse_target_strategy("useipv6v4"), Some(DomainStrategy::UseIPv6v4));
+        assert_eq!(parse_target_strategy("ForceIP"), Some(DomainStrategy::ForceIP));
+        assert_eq!(parse_target_strategy("forceipv4"), Some(DomainStrategy::ForceIPv4));
+        assert_eq!(parse_target_strategy("ForceIPv6"), Some(DomainStrategy::ForceIPv6));
+        assert_eq!(parse_target_strategy("forceipv4v6"), Some(DomainStrategy::ForceIPv4v6));
+        assert_eq!(parse_target_strategy("forceipv6v4"), Some(DomainStrategy::ForceIPv6v4));
+        assert_eq!(parse_target_strategy("Nonsense"), None);
+    }
+
+    /// UseIP：域名 dest 在拨号前被解析改写为 IP（Go handler.go:200-202）。
+    #[tokio::test]
+    async fn target_strategy_useip_resolves_domain_before_dial() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let dial = wrap_dial_with_target_strategy(
+            recording_dial(Arc::clone(&recorded)),
+            xray_proxy_freedom::DomainStrategy::UseIP,
+            Some(hosts_dns_service()),
+        );
+        dial(&domain_dest("resolve-test.invalid")).await.expect("dial ok");
+        let got = recorded.lock().expect("lock").pop().expect("dial called");
+        assert_eq!(
+            got.address(),
+            &Address::from(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            "domain target should be rewritten to resolved IP"
+        );
+    }
+
+    /// IP dest 透传不查 DNS（Go handler.go:184 `Family().IsDomain()` 门控）。
+    #[tokio::test]
+    async fn target_strategy_skips_resolution_for_ip_dest() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let dial = wrap_dial_with_target_strategy(
+            recording_dial(Arc::clone(&recorded)),
+            xray_proxy_freedom::DomainStrategy::ForceIP,
+            None, // 无 DNS：若误查 DNS 则 ForceIP 必报错
+        );
+        dial(&Destination::new(
+            Address::from_ipv4_bytes([127, 0, 0, 1]),
+            Port::new(443),
+            Network::TCP,
+        ))
+        .await
+        .expect("ip dest dials without DNS");
+        assert_eq!(recorded.lock().expect("lock").len(), 1);
+    }
+
+    /// UseIP 解析失败回退域名直连（Go handler.go:190-199 非 Force 分支）。
+    #[tokio::test]
+    async fn target_strategy_useip_falls_back_to_domain_without_dns() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let dial = wrap_dial_with_target_strategy(
+            recording_dial(Arc::clone(&recorded)),
+            xray_proxy_freedom::DomainStrategy::UseIP,
+            None,
+        );
+        dial(&domain_dest("resolve-test.invalid")).await.expect("dial ok");
+        let got = recorded.lock().expect("lock").pop().expect("dial called");
+        assert_eq!(got.address(), &Address::Domain("resolve-test.invalid".into()));
+    }
+
+    /// ForceIP 解析失败直接断链（Go handler.go:192-197 Interrupt 分支）。
+    #[tokio::test]
+    async fn target_strategy_forceip_fails_without_dns() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let dial = wrap_dial_with_target_strategy(
+            recording_dial(Arc::clone(&recorded)),
+            xray_proxy_freedom::DomainStrategy::ForceIP,
+            None,
+        );
+        let err = match dial(&domain_dest("resolve-test.invalid")).await {
+            Err(e) => e,
+            Ok(_) => panic!("ForceIP must fail when DNS unavailable"),
+        };
+        assert!(err.contains("resolve-test.invalid"), "error mentions domain: {err}");
+        assert!(recorded.lock().expect("lock").is_empty(), "inner dial must not run");
+    }
+
+    /// e2e：JSON `targetStrategy: "UseIP"` → BuiltConfig → register_outbounds →
+    /// dispatch 域名 dest → hosts 解析 → freedom 拨号 → echo 回显。
+    /// 对照组（无 targetStrategy）：OS 无法解析 `.invalid` 域名 → 无回显。
+    #[tokio::test]
+    async fn target_strategy_end_to_end_json_to_echo() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use xray_buf::io::Reader as _;
+        use xray_buf::io::Writer as _;
+        use xray_buf::multi::MultiBuffer;
+
+        // echo server
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let _ = sock.write_all(&buf[..n]).await;
+                    }
+                }
+            }
+        });
+
+        let json = format!(
+            r#"{{"outbounds": [{{"protocol": "freedom", "tag": "out", "targetStrategy": "UseIP"}}]}}"#
+        );
+        let cfg = xray_conf::Config::from_json_str(&json).unwrap();
+        let built = cfg.build().unwrap();
+
+        let ohm = SimpleOhm::new();
+        register_outbounds(&built, &ohm, None, Some(hosts_dns_service())).unwrap();
+        let handler = ohm.get_handler("out").expect("outbound registered");
+
+        // inbound 侧 link：pipe 双向
+        let (up_r, mut up_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let (mut dn_r, dn_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let link = xray_transport::link::Link::new(
+            Box::new(up_r) as Box<dyn xray_buf::io::Reader>,
+            Box::new(dn_w) as Box<dyn xray_buf::io::Writer>,
+        );
+        let dest = Destination::new(
+            Address::Domain("resolve-test.invalid".into()),
+            Port::new(echo_port),
+            Network::TCP,
+        );
+        let fut = handler.dispatch(&dest, link);
+        tokio::spawn(async move {
+            let _ = fut.await;
+        });
+
+        // 写上行 → dispatch → UseIP 解析 → 127.0.0.1:echo_port → echo → 读下行
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(b"target-strategy-e2e");
+        up_w.write_multi_buffer(mb).await.unwrap();
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
+            .await
+            .expect("echo should come back via resolved IP")
+            .unwrap();
+        assert_eq!(resp.to_vec(), b"target-strategy-e2e");
+
+        // 对照组：无 targetStrategy → 域名直连 OS 解析失败（.invalid RFC 6761）→ 无回显
+        let plain = xray_conf::Config::from_json_str(
+            r#"{"outbounds": [{"protocol": "freedom", "tag": "plain"}]}"#,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let ohm2 = SimpleOhm::new();
+        register_outbounds(&plain, &ohm2, None, Some(hosts_dns_service())).unwrap();
+        let h2 = ohm2.get_handler("plain").unwrap();
+        let (up_r2, mut up_w2) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let (mut dn_r2, dn_w2) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let link2 = xray_transport::link::Link::new(
+            Box::new(up_r2) as Box<dyn xray_buf::io::Reader>,
+            Box::new(dn_w2) as Box<dyn xray_buf::io::Writer>,
+        );
+        let dest2 = Destination::new(
+            Address::Domain("resolve-test.invalid".into()),
+            Port::new(echo_port),
+            Network::TCP,
+        );
+        let fut2 = h2.dispatch(&dest2, link2);
+        tokio::spawn(async move {
+            let _ = fut2.await;
+        });
+        let mut mb2 = MultiBuffer::new();
+        mb2.merge_bytes(b"should-not-echo");
+        up_w2.write_multi_buffer(mb2).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), dn_r2.read_multi_buffer())
+                .await
+                .is_err(),
+            "AsIs (no strategy) must not resolve domain via DNS service"
+        );
     }
 }

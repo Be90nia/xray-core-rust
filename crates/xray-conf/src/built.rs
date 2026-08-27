@@ -70,6 +70,12 @@ pub struct BuiltOutbound {
     pub proxy_settings_json: Option<Value>,
     /// mux 子对象。
     pub mux_json: Option<Value>,
+    /// 出站目标解析策略（JSON `targetStrategy`，Go `OutboundDetourConfig.TargetStrategy`）。
+    ///
+    /// 原样字符串；合法性已在 [`Config::build`] 校验（对齐 Go
+    /// `infra/conf/xray.go:257-282` Build 时的 switch + 硬报错），
+    /// 枚举转换由消费端（`xray-core`）完成。
+    pub target_strategy: Option<String>,
 }
 
 /// 顶层配置构建产物，对应 Go `*core.Config`（prost）。
@@ -205,6 +211,14 @@ impl Config {
                 })?,
                 None => Vec::new(),
             };
+            if let Some(s) = ob.target_strategy.as_deref() {
+                if !is_valid_target_strategy(s) {
+                    return Err(ConfError::Build {
+                        what: "outbound.targetStrategy",
+                        message: format!("unsupported target domain strategy: {s}"),
+                    });
+                }
+            }
             out.outbounds.push(BuiltOutbound {
                 entry: BuiltEntry {
                     kind: ob.protocol.clone(),
@@ -217,11 +231,34 @@ impl Config {
                 mux_json: ob.mux.as_ref().map(|m| {
                     serde_json::to_value(m).unwrap_or(Value::Null)
                 }),
+                target_strategy: ob.target_strategy.clone(),
             });
         }
 
         Ok(out)
     }
+}
+
+/// 校验 `targetStrategy` 字符串合法性（大小写不敏感）。
+///
+/// 对应 Go `infra/conf/xray.go:257-282`：`strings.ToLower` switch 的 11 个合法值
+/// + 空串（等价 AsIs），其余 Build 硬报错。枚举转换在消费端完成（见
+/// `xray_core::outbound::parse_target_strategy`）。
+fn is_valid_target_strategy(s: &str) -> bool {
+    matches!(
+        s.to_lowercase().as_str(),
+        "" | "asis"
+            | "useip"
+            | "useipv4"
+            | "useipv6"
+            | "useipv4v6"
+            | "useipv6v4"
+            | "forceip"
+            | "forceipv4"
+            | "forceipv6"
+            | "forceipv4v6"
+            | "forceipv6v4"
+    )
 }
 
 #[cfg(test)]
@@ -315,6 +352,36 @@ mod tests {
         assert_eq!(proxy.entry.kind, "vless");
         let s: Value = serde_json::from_slice(&proxy.entry.data).unwrap();
         assert!(s["vnext"].is_array());
+    }
+
+    #[test]
+    fn build_outbound_target_strategy_passthrough() {
+        let json = r#"{
+            "outbounds": [
+                { "protocol": "freedom", "tag": "direct", "targetStrategy": "UseIP" },
+                { "protocol": "freedom", "tag": "asis-out" }
+            ]
+        }"#;
+        let cfg = Config::from_json_str(json).unwrap();
+        let built = cfg.build().unwrap();
+        assert_eq!(built.outbounds[0].target_strategy.as_deref(), Some("UseIP"));
+        assert_eq!(built.outbounds[1].target_strategy, None);
+    }
+
+    #[test]
+    fn build_outbound_target_strategy_invalid_rejected() {
+        // Go infra/conf/xray.go:280-281：非法值 Build 硬报错。
+        let json = r#"{
+            "outbounds": [
+                { "protocol": "freedom", "tag": "direct", "targetStrategy": "Nonsense" }
+            ]
+        }"#;
+        let cfg = Config::from_json_str(json).unwrap();
+        let err = cfg.build().expect_err("invalid targetStrategy must fail build");
+        assert!(
+            err.to_string().contains("unsupported target domain strategy"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
