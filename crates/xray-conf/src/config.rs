@@ -51,7 +51,8 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stats: Option<crate::app_config::StatsConfig>,
 
-    /// 反向代理配置（占位）。
+    /// 顶层反向代理配置（Go v26 已移除该 feature）。保留字段以便
+    /// `build()` 给出与 Go 对齐的 removed 错误而非静默吞掉。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reverse: Option<Value>,
 

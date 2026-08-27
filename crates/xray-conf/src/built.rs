@@ -21,7 +21,8 @@
 //! - `inbounds[i].kind`：协议名（`"vless"` / `"vmess"` / `"socks"` / `"freedom"` / ...）
 //! - `outbounds[i].kind`：协议名（同上）
 //!
-//! 注：`reverse` 字段在 Go 中已 `PrintRemovedFeatureError`，f2w 沿用此行为。
+//! 注：顶层 `reverse` 字段在 Go 中已 `PrintRemovedFeatureError`（removed feature），
+//! Rust 端 `Config::build()` 遇 `reverse` 同样返回 `ConfError::Removed` 硬报错。
 
 use serde_json::Value;
 
@@ -108,6 +109,7 @@ impl Config {
     /// # 错误
     ///
     /// - [`ConfError::Deprecated`]：使用了已废弃的全局 `transport` 字段。
+    /// - [`ConfError::Removed`]：使用了顶层 `reverse` 字段（Go v26 已移除）。
     /// - [`ConfError::Build`]：JSON 字段序列化失败（极少见，因字段已成功解析）。
     pub fn build(&self) -> Result<BuiltConfig> {
         if self.uses_deprecated_transport() {
@@ -117,10 +119,19 @@ impl Config {
             });
         }
 
+        // Go infra/conf/xray.go: `c.Reverse != nil` → PrintRemovedFeatureError 硬报错。
+        if self.reverse.is_some() {
+            return Err(ConfError::Removed {
+                feature: r#""legacy reverse""#,
+                migrate: r#""VLESS Reverse Proxy""#,
+            });
+        }
         let mut out = BuiltConfig::default();
 
         // App 字段：保持 Go 中的处理顺序，方便后续 Instance::new 注册 essentialFeatures。
-        // reverse 字段在 Go 中触发 PrintRemovedFeatureError，这里同样跳过。
+        // reverse 已在 build() 开头报 `ConfError::Removed`（Go v26 已移除该 feature）。
+
+
         macro_rules! push_app {
             ($field:expr, $kind:literal) => {
                 if let Some(v) = $field.as_ref() {
@@ -141,7 +152,7 @@ impl Config {
         push_app!(self.api, "api");
         push_app!(self.metrics, "metrics");
         push_app!(self.stats, "stats");
-        // reverse 在 Go 已废弃，跳过。
+        // reverse 在 Go v26 已移除，见 build() 开头的 ConfError::Removed 检查。
         push_app!(self.fake_dns, "fakeDns");
         push_app!(self.observatory, "observatory");
         push_app!(self.burst_observatory, "burstObservatory");
@@ -321,6 +332,22 @@ mod tests {
         let cfg: Config = serde_json::from_str(json).unwrap();
         let err = cfg.build().unwrap_err();
         assert!(matches!(err, ConfError::Deprecated { .. }));
+    }
+
+    #[test]
+    fn build_reverse_config_errors() {
+        // Go infra/conf/xray.go: `c.Reverse != nil` → PrintRemovedFeatureError。
+        let json = r#"{ "reverse": { "bridges": [ { "tag": "b", "domain": "test.example.com" } ] } }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let err = cfg.build().unwrap_err();
+        assert!(matches!(err, ConfError::Removed { .. }));
+        // 文案对齐 Go common/errors/feature_errors.go:27
+        assert_eq!(
+            err.to_string(),
+            "The feature \"legacy reverse\" has been removed and migrated to \
+             \"VLESS Reverse Proxy\". Please update your config(s) according \
+             to release note and documentation."
+        );
     }
 
     #[test]
