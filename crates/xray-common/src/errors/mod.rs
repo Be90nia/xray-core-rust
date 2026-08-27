@@ -7,6 +7,15 @@ use std::fmt;
 
 use crate::log::{self, Severity};
 
+mod feature_errors;
+mod multi_error;
+
+pub use feature_errors::{
+    print_deprecated_feature_warning, print_non_removal_deprecated_feature_warning,
+    print_removed_feature_error,
+};
+pub use multi_error::{all_equal, combine, MultiError};
+
 /// Xray 错误类型，包含上下文、严重级别和因果链。
 ///
 /// 对应 Go 版本 `common/errors.Error`，提供丰富的错误信息追踪。
