@@ -269,6 +269,23 @@ where
             .ok_or_else(|| HttpProxyError::InvalidRequest("missing Host header".into()))?;
         parse_host_port(host, 80)?
     };
+    // 4.5 透明代理检查（对应 Go handlePlainHTTP proxy/http/server.go:209：
+    // `!AllowTransparent && request.URL.Host == ""` → 400 Bad Request）。
+    // target 非绝对 URI（无 scheme）等价 Go `request.URL.Host == ""`。
+    if method != "CONNECT" && !config.allow_transparent && !target.contains("://") {
+        stream
+            .write_all(
+                b"HTTP/1.1 400 Bad Request\r\n\
+                  Proxy-Connection: close\r\n\
+                  Connection: close\r\n\
+                  Content-Length: 0\r\n\r\n",
+            )
+            .await?;
+        return Err(HttpProxyError::InvalidRequest(
+            "origin-form request target requires allowTransparent".into(),
+        ));
+    }
+
 
     // 5. 回 200（CONNECT）
     if method == "CONNECT" {
@@ -615,6 +632,41 @@ mod tests {
         assert_eq!(hs.target, "http://example.com/page?q=1");
         assert_eq!(hs.headers.get("host").unwrap(), "example.com");
         assert_eq!(hs.headers.get("user-agent").unwrap(), "test");
+    }
+
+    // ===== allowTransparent（透明代理）分支 =====
+
+    #[tokio::test]
+    async fn handshake_origin_form_rejected_without_allow_transparent() {
+        // origin-form（相对路径 target）在非透明模式下 400，对齐 Go
+        // proxy/http/server.go:209 `!AllowTransparent && request.URL.Host == ""`。
+        let req = b"GET /path?q=1 HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let (resp, result) = tcp_handshake(req, ServerConfig::default()).await;
+        assert!(result.is_err(), "origin-form should be rejected");
+        assert!(resp.contains("400"), "got: {resp}");
+        assert!(resp.contains("Connection: close"), "got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn handshake_origin_form_allowed_with_transparent() {
+        // allowTransparent=true 放行 origin-form，dest 从 Host header 解析。
+        let req = b"GET /path?q=1 HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let mut cfg = ServerConfig::default();
+        cfg.allow_transparent = true;
+        let (_, result) = tcp_handshake(req, cfg).await;
+        let hs = result.unwrap();
+        assert_eq!(hs.method, "GET");
+        assert_eq!(hs.target, "/path?q=1");
+        assert!(matches!(hs.dest.address(), Address::Domain(_)));
+    }
+
+    #[tokio::test]
+    async fn handshake_absolute_url_unaffected_by_transparent_flag() {
+        // 绝对 URI（代理正规形态）不受 allowTransparent 影响。
+        let req = b"GET http://example.com/path HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let (resp, result) = tcp_handshake(req, ServerConfig::default()).await;
+        assert!(result.is_ok());
+        assert!(!resp.contains("400"), "got: {resp}");
     }
 
     #[tokio::test]

@@ -290,10 +290,14 @@ async fn handle_udp_associate(
 /// HTTP proxy inbound 服务入口。
 ///
 /// 接受连接 → http_server_handshake → CONNECT 隧道 dispatch 或 plain HTTP 代理转发。
+/// `handshake_timeout` 对应 Go `proxy/http/server.go:112`
+/// `conn.SetReadDeadline(policy().Timeouts.Handshake)`（policy 来自
+/// `ForLevel(UserLevel)`，见 spawn_one_inbound http 分支）；None 时不限时。
 pub async fn serve_http(
     listener: TcpListener,
     ohm: Arc<SimpleOhm>,
     config: Arc<HttpServerConfig>,
+    handshake_timeout: Option<std::time::Duration>,
 ) -> std::io::Result<()> {
     let handler = ohm
         .get_default_handler()
@@ -309,9 +313,22 @@ pub async fn serve_http(
         };
         let handler = Arc::clone(&handler);
         let config = Arc::clone(&config);
+        let handshake_timeout = handshake_timeout;
         tokio::spawn(async move {
-            // 1. handshake
-            let hs = match http_server_handshake(&mut stream, &config).await {
+            // 1. handshake（按 userLevel 对应 policy 的 handshake 超时限制，
+            // 超时即断开——对应 Go SetReadDeadline 到期后 ReadRequest 超时错误）
+            let handshake_fut = http_server_handshake(&mut stream, &config);
+            let hs = match handshake_timeout {
+                Some(d) => match tokio::time::timeout(d, handshake_fut).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        tracing::debug!("http handshake timeout, closing connection");
+                        return;
+                    }
+                },
+                None => handshake_fut.await,
+            };
+            let hs = match hs {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::debug!(error = %e, "http handshake failed");
@@ -1229,8 +1246,13 @@ pub async fn spawn_inbounds(
                 snap
             })
             .unwrap_or_else(|| Arc::clone(&ohm));
+        // policy manager（dispatcher 装配时注入，见 start_full_dispatched）：
+        // 供 http inbound 按 userLevel 查 handshake 超时等 per-level 策略。
+        let policy = dispatcher
+            .as_ref()
+            .and_then(|d| d.policy_manager.clone());
         if let Some(handle) =
-            spawn_one_inbound(ib, per_ohm, shutdown_token.clone()).await?
+            spawn_one_inbound(ib, per_ohm, policy, shutdown_token.clone()).await?
         {
             handles.push(handle);
         }
@@ -1430,6 +1452,7 @@ async fn serve_reality_vless(
 async fn spawn_one_inbound(
     ib: &BuiltInbound,
     ohm: Arc<SimpleOhm>,
+    policy: Option<Arc<dyn xray_features::policy::PolicyManager>>,
     shutdown_token: CancellationToken,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     // TUN inbound 不需要 port/addr，提前处理
@@ -1542,10 +1565,18 @@ async fn spawn_one_inbound(
         }
         "http" => {
             let config = parse_http_config(&ib.entry.data)?;
+            // userLevel 生效：policy_for_level(UserLevel).timeout.handshake →
+            // serve_http 读首请求超时。对应 Go proxy/http/server.go:47-51 policy()
+            // + :112 SetReadDeadline(Timeouts.Handshake)。无 policy manager（如
+            // 无 policy 配置块）时限时关闭，等价 Go policy 零值默认由
+            // DefaultPolicyFeature 兜底——此处直接不设超时（dispatcher 同样无 pm）。
+            let handshake_timeout = policy
+                .as_ref()
+                .map(|pm| pm.policy_for_level(config.user_level).timeout.handshake);
             let listener = TcpListener::bind(&addr).await?;
             tracing::info!(tag = %ib.tag, addr = %addr, "http inbound listening");
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                serve_http(listener, ohm, Arc::new(config)).await
+                serve_http(listener, ohm, Arc::new(config), handshake_timeout).await
             })))
         }
         "dokodemo" => {
@@ -1835,9 +1866,10 @@ fn build_vless_fallbacks(data: &[u8]) -> Option<std::sync::Arc<xray_proxy_vless:
     }
     if policy.is_empty() { None } else { Some(std::sync::Arc::new(policy)) }
 }
-/// 从 inbound entry.data（JSON）解析 http accounts → HttpServerConfig。
+/// 从 inbound entry.data（JSON）解析 http inbound 配置 → HttpServerConfig。
 ///
-/// JSON 格式：`{"accounts":[{"user":"u","pass":"p"}]}`（用户可选）
+/// JSON 格式：`{"accounts":[{"user":"u","pass":"p"}],"allowTransparent":true,"userLevel":3}`。
+/// 字段名/零值默认对齐 Go infra/conf/http.go:25-30（Transparent→AllowTransparent、UserLevel→UserLevel）。
 fn parse_http_config(data: &[u8]) -> std::io::Result<HttpServerConfig> {
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("http inbound settings JSON: {e}")))?;
@@ -1851,6 +1883,14 @@ fn parse_http_config(data: &[u8]) -> std::io::Result<HttpServerConfig> {
             }
         }
     }
+    config.allow_transparent = v
+        .get("allowTransparent")
+        .and_then(|c| c.as_bool())
+        .unwrap_or(false);
+    config.user_level = v
+        .get("userLevel")
+        .and_then(|c| c.as_u64())
+        .unwrap_or(0) as u32;
     Ok(config)
 }
 
@@ -3394,6 +3434,62 @@ mod tests {
         }
     }
 
+    /// userLevel 生效：policy_for_level(UserLevel).timeout.handshake → serve_http
+    /// 首请求超时断开。对应 Go proxy/http/server.go:47-51 policy() +
+    /// :112 SetReadDeadline(Timeouts.Handshake)。
+    #[tokio::test]
+    async fn serve_http_handshake_timeout_from_user_level_policy() {
+        use tokio::io::AsyncReadExt;
+
+        struct FixedHandshakePolicy(std::time::Duration);
+        impl xray_features::policy::PolicyManager for FixedHandshakePolicy {
+            fn policy_for_level(&self, _level: u32) -> xray_features::policy::Policy {
+                let mut p = xray_features::policy::Policy::default();
+                p.timeout.handshake = self.0;
+                p
+            }
+            fn for_system(&self) -> xray_features::policy::SystemStats {
+                xray_features::policy::SystemStats::default()
+            }
+        }
+
+        let ohm = Arc::new(SimpleOhm::new());
+        let bridge = Arc::new(DestCaptureDispatch {
+            dest: parking_lot::Mutex::new(None),
+        }) as Arc<dyn xray_app_dispatcher::DispatchHandler>;
+        ohm.set_default(bridge);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut config = HttpServerConfig::default();
+        config.user_level = 3;
+        let pm: Arc<dyn xray_features::policy::PolicyManager> =
+            Arc::new(FixedHandshakePolicy(std::time::Duration::from_millis(120)));
+        let handshake_timeout = Some(pm.policy_for_level(config.user_level).timeout.handshake);
+        tokio::spawn(serve_http(
+            listener,
+            ohm,
+            Arc::new(config),
+            handshake_timeout,
+        ));
+
+        // 客户端连接后保持静默：超时到期 → 服务端断开 → 客户端读到 EOF。
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let t0 = std::time::Instant::now();
+        let mut buf = [0u8; 16];
+        let n = client.read(&mut buf).await.unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(n, 0, "expected EOF after handshake timeout");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(100),
+            "disconnect should come from timeout, not immediate: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "timeout too slow: {elapsed:?}"
+        );
+    }
+
     /// i09 e2e：dokodemo TCP port_map——按监听端口改写 dest（Go dokodemo.go:101-109）。
     #[tokio::test]
     async fn dokodemo_tcp_port_map_dispatch_e2e() {
@@ -3697,6 +3793,27 @@ mod tests {
         let data = b"{}";
         let cfg = super::parse_http_config(data).unwrap();
         assert!(cfg.accounts.is_empty());
+    }
+
+    #[test]
+    fn parse_http_config_transparent_and_user_level() {
+        // 键名/零值默认对齐 Go infra/conf/http.go:28-29（Transparent json:"allowTransparent"、UserLevel json:"userLevel"）。
+        let settings = serde_json::json!({
+            "allowTransparent": true,
+            "userLevel": 7
+        });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let cfg = super::parse_http_config(&data).unwrap();
+        assert!(cfg.allow_transparent);
+        assert_eq!(cfg.user_level, 7);
+    }
+
+    #[test]
+    fn parse_http_config_transparent_defaults_off() {
+        // Go Build() 直接透传，缺省即零值（false/0）。
+        let cfg = super::parse_http_config(br#"{"userLevel":0}"#).unwrap();
+        assert!(!cfg.allow_transparent);
+        assert_eq!(cfg.user_level, 0);
     }
 
     #[test]
