@@ -86,7 +86,10 @@ where
     use tokio::io::{AsyncWriteExt, copy_bidirectional};
     use tokio::net::TcpStream;
 
-    let mut dest_conn = TcpStream::connect(dest).await?;
+    // Go trojan server.go:455 / vless inbound.go:420 — fallback 拨号 retry.ExponentialBackoff(5, 100)
+    let mut dest_conn = crate::retry::exponential_backoff(5, 100, || TcpStream::connect(dest))
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
 
     // 1. 写 PROXY protocol header（xver 0 则跳过）
     let proxy_header = encode_proxy_header(xver, src, dst);

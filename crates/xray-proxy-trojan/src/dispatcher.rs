@@ -110,14 +110,18 @@ pub fn make_dial_fn(config: Arc<TrojanOutboundConfig>) -> DialFn {
             // 1. dial Trojan server：有 streamSettings 走 transport dialer（ws/grpc/...），否则裸 TCP。
             let server_dest = config.server_destination();
             let sockopt = config.stream_settings.as_ref().map(|s| s.socket_options()).unwrap_or_default();
-            let mut conn: Box<dyn Connection> = match &config.stream_settings {
-                Some(s) => dial(&server_dest, s, &sockopt)
-                    .await
-                    .map_err(|e| format!("trojan dial server ({}): {e}", s.protocol))?,
-                None => xray_transport::system_dialer::dial_system(&server_dest, &sockopt)
-                    .await
-                    .map_err(|e| format!("trojan dial server (tcp): {e}"))?,
-            };
+            let mut conn: Box<dyn Connection> = xray_transport::retry::exponential_backoff(5, 100, || async {
+                match &config.stream_settings {
+                    Some(s) => dial(&server_dest, s, &sockopt)
+                        .await
+                        .map_err(|e| format!("trojan dial server ({}): {e}", s.protocol)),
+                    None => xray_transport::system_dialer::dial_system(&server_dest, &sockopt)
+                        .await
+                        .map_err(|e| format!("trojan dial server (tcp): {e}")),
+                }
+            })
+            .await
+            .map_err(|e| format!("failed to find an available destination: {e}"))?;
 
             // 2. 构造 Trojan 请求头（UDP dest → command UDP，Go client.go 同分支）
             let network = if is_udp { TrojanNetwork::Udp } else { TrojanNetwork::Tcp };
