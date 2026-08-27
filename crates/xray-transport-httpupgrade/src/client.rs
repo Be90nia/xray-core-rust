@@ -68,12 +68,8 @@ impl HttpUpgradeClient {
         io.write_all(&req_bytes).await?;
         io.flush().await?;
 
-        if self.config.ed > 0 {
-            // ed > 0：0-RTT 模式，不立即读 101 响应，让上层先写 early data。
-            // 调用方需使用 dial_over_io_deferred 获取 DeferredResponseReader 包装。
-            // 此处仍立即读 101（与 ed==0 一致），因为泛型返回类型不同。
-            // 实际 0-RTT 由 dial_over_io_deferred 处理。
-        }
+        // 注：ed > 0 的 0-RTT 场景由 `dial_over_io_deferred` 处理（延迟读 101），
+        // 本方法始终立即读响应。
 
         // 2. 读响应直到 \r\n\r\n
         let mut buf: Vec<u8> = Vec::with_capacity(READ_INITIAL_CAPACITY);

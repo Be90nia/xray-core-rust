@@ -261,12 +261,19 @@ fn parse_httpupgrade_config(json: Option<&serde_json::Value>) -> io::Result<Conf
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
-    let path = obj
+    let mut path = obj
         .get("path")
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
-    let ed = obj.get("ed").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    let mut ed = obj.get("ed").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    // Go `HttpUpgradeConfig.Build`：path 中 `?ed=N` 提取为 ed 并从 path 删除
+    // （Go 用户配置层唯一来源；此处优先于直接 ed 字段）。
+    let (cleaned, path_ed) = crate::config::extract_ed_from_path(&path);
+    path = cleaned;
+    if let Some(e) = path_ed {
+        ed = e;
+    }
     let accept_proxy_protocol = obj
         .get("acceptProxyProtocol")
         .and_then(|x| x.as_bool())
@@ -322,6 +329,57 @@ mod tests {
         let cfg = parse_httpupgrade_config(Some(&v)).unwrap();
         assert_eq!(cfg.host, "h.example.com");
         assert_eq!(cfg.path, "/upgrade");
+        assert_eq!(cfg.ed, 2048);
+    }
+
+    /// 对齐 Go `HttpUpgradeConfig.Build`（infra/conf/transport_internet.go:186-210）：
+    /// `path:"/ws?ed=2048"` → ed=2048、path 剥离 query。
+    #[test]
+    fn parse_httpupgrade_config_path_ed_extraction() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"path":"/ws?ed=2048"}"#).unwrap();
+        let cfg = parse_httpupgrade_config(Some(&v)).unwrap();
+        assert_eq!(cfg.path, "/ws");
+        assert_eq!(cfg.ed, 2048);
+    }
+
+    /// 多参数：`ed` 提取后其余参数保留（Go `q.Del("ed")` + `q.Encode()`，按键排序）。
+    #[test]
+    fn parse_httpupgrade_config_path_ed_keeps_other_params() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"path":"/ws?x=1&ed=1024&y=2"}"#).unwrap();
+        let cfg = parse_httpupgrade_config(Some(&v)).unwrap();
+        assert_eq!(cfg.path, "/ws?x=1&y=2");
+        assert_eq!(cfg.ed, 1024);
+    }
+
+    /// 非法数值：Go `Ed, _ := strconv.Atoi(...)` 忽略错误 → ed=0，但 `ed` 参数仍被删除。
+    #[test]
+    fn parse_httpupgrade_config_path_ed_invalid_value_zero() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"path":"/ws?ed=abc"}"#).unwrap();
+        let cfg = parse_httpupgrade_config(Some(&v)).unwrap();
+        assert_eq!(cfg.path, "/ws");
+        assert_eq!(cfg.ed, 0);
+    }
+
+    /// 空值：Go `q.Get("ed") != ""` 不成立 → 整体不提取，path 原样保留。
+    #[test]
+    fn parse_httpupgrade_config_path_empty_ed_value_no_extraction() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"path":"/ws?ed="}"#).unwrap();
+        let cfg = parse_httpupgrade_config(Some(&v)).unwrap();
+        assert_eq!(cfg.path, "/ws?ed=");
+        assert_eq!(cfg.ed, 0);
+    }
+
+    /// path 中 `?ed=` 优先于直接 `ed` 字段（Go JSON 配置层只有 path 提取一条来源）。
+    #[test]
+    fn parse_httpupgrade_config_path_ed_overrides_direct_field() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"path":"/ws?ed=2048","ed":4096}"#).unwrap();
+        let cfg = parse_httpupgrade_config(Some(&v)).unwrap();
+        assert_eq!(cfg.path, "/ws");
         assert_eq!(cfg.ed, 2048);
     }
 
@@ -424,6 +482,87 @@ mod tests {
         let conn = result.unwrap();
         // 验证 Connection 可用
         assert!(conn.remote_addr().is_ok());
+        server.await.unwrap();
+    }
+
+    /// `?ed=` 端到端往返：path 提取 ed → 客户端 0-RTT（101 前先写 early data）→
+    /// 延迟读解析 101 → 读到服务端 payload。对齐 Go `dialer.go:114-118`（Ed!=0 时不预读响应）。
+    #[tokio::test]
+    async fn dial_httpupgrade_path_ed_early_data_roundtrip() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use xray_common::net::address::Address;
+        use xray_common::net::network::Network;
+        use xray_common::net::port::Port;
+        use std::net::Ipv4Addr;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            // 1. 读完整请求头；path 应已剥离 ?ed=2048。
+            //    early data 可能与请求头同段到达（TCP 合并）——保留 \r\n\r\n 之后的余留，
+            //    与生产端 hub.rs handshake_io 返回 leftover 的做法一致。
+            let mut req = Vec::new();
+            let hdr_end = loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                req.extend_from_slice(&buf[..n]);
+                if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let req_str = String::from_utf8_lossy(&req[..hdr_end]);
+            assert!(
+                req_str.starts_with("GET /ws HTTP/1.1"),
+                "path 应剥离 ?ed=2048，实际: {req_str}"
+            );
+            // 2. 收 early data（ed=0 时客户端会阻塞等 101 → 此处 5s 超时失败而非挂死）
+            let mut early = req[hdr_end..].to_vec();
+            while early.len() < 5 {
+                let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+                    .await
+                    .expect("early data 应在 101 响应之前到达")
+                    .expect("stream read");
+                assert!(n > 0);
+                early.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(&early[..5], b"early");
+            // 3. 回 101 + 服务端首包
+            stream
+                .write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\npong")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let dest = Destination::new(
+            Address::IPv4(Ipv4Addr::LOCALHOST),
+            Port::new(addr.port()),
+            Network::TCP,
+        );
+        let settings = StreamSettings {
+            protocol: "httpupgrade".to_string(),
+            transport_json: Some(serde_json::json!({"path":"/ws?ed=2048"})),
+            ..StreamSettings::tcp()
+        };
+        let mut conn = dial_httpupgrade(&dest, &SocketOptions::default(), &settings)
+            .await
+            .expect("dial should succeed");
+
+        // dial 返回即可写 early data（0-RTT，无需先等 101）
+        conn.write_all(b"early").await.unwrap();
+        conn.flush().await.unwrap();
+
+        // 首次 read：DeferredResponseReader 解析 101 后透传 payload
+        let mut out = vec![0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(5), conn.read(&mut out))
+            .await
+            .expect("read 应在 101 后返回")
+            .expect("read should succeed");
+        assert_eq!(&out[..n], b"pong");
         server.await.unwrap();
     }
 }
