@@ -126,6 +126,7 @@ pub fn make_dial_fn(client: Arc<TuicClient>) -> DialFn {
 /// `TuicClient`（含 QUIC 连接 + 认证），后续复用。
 ///
 /// # Panics
+///
 /// 不会 panic；任何错误以 `Err(String)` 返回。
 pub fn make_dial_fn_lazy(
     server_addr: SocketAddr,
@@ -133,10 +134,12 @@ pub fn make_dial_fn_lazy(
     uuid: uuid::Uuid,
     password: String,
     rustls_config: Arc<rustls::ClientConfig>,
+    options: crate::client::TuicConnectOptions,
 ) -> DialFn {
     use tokio::sync::OnceCell;
     let client: Arc<OnceCell<Arc<TuicClient>>> = Arc::new(OnceCell::new());
     let pool = crate::pool::QuinnConnectionPool::new();
+    let heartbeat = options.heartbeat;
 
     Arc::new(move |dest: &Destination| {
         let client_cell = Arc::clone(&client);
@@ -146,6 +149,7 @@ pub fn make_dial_fn_lazy(
         let password = password.clone();
         let rustls_config = Arc::clone(&rustls_config);
         let pool = pool.clone();
+        let options = options.clone();
         let addr = match dest_to_tuic_address(dest) {
             Ok(a) => a,
             Err(e) => {
@@ -156,11 +160,19 @@ pub fn make_dial_fn_lazy(
             // lazy init TuicClient（含 QUIC 连接 + 认证），后续复用；init 即挂周期心跳。
             let c = client_cell
                 .get_or_try_init(|| async {
-                    let c = TuicClient::connect(server_addr, &server_name, uuid, &password, rustls_config, pool)
-                        .await
-                        .map_err(|e| format!("tuic connect: {e}"))?;
+                    let c = TuicClient::connect_with(
+                        server_addr,
+                        &server_name,
+                        uuid,
+                        &password,
+                        rustls_config,
+                        options,
+                        pool,
+                    )
+                    .await
+                    .map_err(|e| format!("tuic connect: {e}"))?;
                     let c = Arc::new(c);
-                    c.start_heartbeat(HEARTBEAT_INTERVAL);
+                    c.start_heartbeat(heartbeat);
                     Ok::<Arc<TuicClient>, String>(c)
                 })
                 .await?;

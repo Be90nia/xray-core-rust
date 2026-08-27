@@ -454,10 +454,25 @@ fn try_build_handler(
             wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag)
         }
         "tuic" => {
-            let (server_addr, server_name, uuid, password) = parse_tuic_config(&ob.entry.data)?;
-            let rustls_config = build_tuic_rustls_config();
+            let s = parse_tuic_config(&ob.entry.data)?;
+            let rustls_config = build_tuic_rustls_config(
+                &s.alpn,
+                s.reduce_rtt,
+                s.insecure,
+                s.certificate.as_deref(),
+            )?;
+            let options = xray_proxy_tuic::TuicConnectOptions {
+                congestion_control: s.congestion_control,
+                heartbeat: s.heartbeat,
+                udp_relay_mode: s.udp_relay_mode,
+            };
             let dial_fn = xray_proxy_tuic::make_tuic_dial_fn_lazy(
-                server_addr, server_name, uuid, password, rustls_config,
+                s.server_addr,
+                s.server_name,
+                s.uuid,
+                s.password,
+                rustls_config,
+                options,
             );
             wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag)
         }
@@ -1211,10 +1226,37 @@ fn parse_hysteria_config(data: &[u8]) -> std::result::Result<(String, String, St
     Ok((server_addr, auth, server_name))
 }
 
-/// 解析 tuic outbound settings JSON → (server_addr, server_name, uuid, password)。
+/// tuic outbound 解析结果（官方 tuic-client relay 配置子集，bd 7p0）。
 ///
-/// JSON 格式：`{"servers":[{"address":"...","port":443,"uuid":"...","password":"..."}]}`。
-fn parse_tuic_config(data: &[u8]) -> std::result::Result<(std::net::SocketAddr, String, uuid::Uuid, String), String> {
+/// 字段与默认值对齐 Itsusinn/tuic（官方 TUIC 实现后继）client config.rs。
+struct TuicOutboundSettings {
+    server_addr: std::net::SocketAddr,
+    server_name: String,
+    uuid: uuid::Uuid,
+    password: String,
+    /// 拥塞控制（官方默认 bbr）。
+    congestion_control: xray_proxy_tuic::CongestionControl,
+    /// ALPN 列表；空 → 默认 ["h3","tuic"]。
+    alpn: Vec<Vec<u8>>,
+    /// 0-RTT（官方名 zero_rtt_handshake；quinn 经会话恢复自动 0-RTT）。
+    reduce_rtt: bool,
+    /// UDP relay 模式（官方默认 native）。
+    udp_relay_mode: xray_proxy_tuic::UdpRelayMode,
+    /// 心跳周期（官方默认 3s）。
+    heartbeat: std::time::Duration,
+    /// 跳过证书验证（显式 opt-in）。
+    insecure: bool,
+    /// 信任的服务端证书 PEM（自签 CA 场景）。
+    certificate: Option<String>,
+}
+
+/// 解析 tuic outbound settings JSON。
+///
+/// JSON 格式：`{"servers":[{"address":"...","port":443,"uuid":"...","password":"...",
+/// "server_name":"...","congestion_control":"bbr","alpn":["h3"],
+/// "reduce_rtt":false,"udp_relay_mode":"native","heartbeat":3,
+/// "insecure":false,"certificate":"<PEM>"}]}`。
+fn parse_tuic_config(data: &[u8]) -> std::result::Result<TuicOutboundSettings, String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
     let servers = v.get("servers").and_then(|v| v.as_array())
         .ok_or_else(|| "missing servers array".to_string())?;
@@ -1233,19 +1275,98 @@ fn parse_tuic_config(data: &[u8]) -> std::result::Result<(std::net::SocketAddr, 
         .map_err(|e| format!("invalid tuic server addr: {e}"))?;
     let uuid = uuid::Uuid::parse_str(uuid_str)
         .map_err(|e| format!("invalid tuic uuid: {e}"))?;
-    Ok((server_addr, server_name, uuid, password.to_string()))
+
+    let congestion_name = first.get("congestion_control").and_then(|v| v.as_str()).unwrap_or("bbr");
+    let congestion_control = xray_proxy_tuic::CongestionControl::from_name(congestion_name)
+        .ok_or_else(|| format!(
+            "invalid tuic congestion_control: {congestion_name} (valid: bbr, cubic, new_reno)"
+        ))?;
+    let alpn: Vec<Vec<u8>> = first.get("alpn").and_then(|v| v.as_array())
+        .map(|arr| arr.iter()
+            .filter_map(|x| x.as_str().map(|s| s.as_bytes().to_vec()))
+            .collect())
+        .unwrap_or_default();
+    let reduce_rtt = first.get("reduce_rtt").and_then(|v| v.as_bool())
+        .or_else(|| first.get("zero_rtt_handshake").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    let udp_mode_name = first.get("udp_relay_mode").and_then(|v| v.as_str()).unwrap_or("native");
+    let udp_relay_mode = xray_proxy_tuic::UdpRelayMode::from_name(udp_mode_name)
+        .ok_or_else(|| format!(
+            "invalid tuic udp_relay_mode: {udp_mode_name} (valid: native, quic)"
+        ))?;
+    let heartbeat_secs = first.get("heartbeat").and_then(|v| v.as_u64()).unwrap_or(3);
+    let insecure = first.get("insecure").and_then(|v| v.as_bool()).unwrap_or(false);
+    let certificate = first.get("certificate").and_then(|v| v.as_str()).map(String::from);
+    if let Some(fp) = first.get("fingerprint").and_then(|v| v.as_str()) {
+        tracing::warn!(fingerprint = %fp, "tuic fingerprint: rustls 无 uTLS 指纹模拟，忽略");
+    }
+
+    Ok(TuicOutboundSettings {
+        server_addr,
+        server_name,
+        uuid,
+        password: password.to_string(),
+        congestion_control,
+        alpn,
+        reduce_rtt,
+        udp_relay_mode,
+        heartbeat: std::time::Duration::from_secs(heartbeat_secs),
+        insecure,
+        certificate,
+    })
 }
 
-/// 构造 TUIC 用的 rustls ClientConfig（默认配置 + ring provider）。
-fn build_tuic_rustls_config() -> Arc<rustls::ClientConfig> {
+/// 构造 TUIC 用的 rustls ClientConfig（ring provider）。
+///
+/// 默认启用服务端证书验证（webpki 根 + 可选 `certificate` 附加 CA），
+/// 对齐 Go `tls.Config{InsecureSkipVerify}` 语义——仅 `insecure=true` 显式跳过。
+fn build_tuic_rustls_config(
+    alpn: &[Vec<u8>],
+    reduce_rtt: bool,
+    insecure: bool,
+    certificate: Option<&str>,
+) -> std::result::Result<Arc<rustls::ClientConfig>, String> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let mut config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerifier))
-        .with_no_client_auth();
-    // TUIC v5 要求 ALPN
-    config.alpn_protocols = vec![b"h3".to_vec(), b"tuic".to_vec()];
-    Arc::new(config)
+    let mut config = if insecure {
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth()
+    } else {
+        let mut roots = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect(),
+        };
+        if let Some(pem) = certificate {
+            let mut reader = std::io::BufReader::new(pem.as_bytes());
+            let mut added = 0usize;
+            for cert in rustls_pemfile::certs(&mut reader) {
+                let cert = cert.map_err(|e| format!("tuic certificate PEM parse: {e}"))?;
+                roots.add(cert).map_err(|e| format!("tuic certificate add: {e}"))?;
+                added += 1;
+            }
+            if added == 0 {
+                return Err("tuic certificate: no certificate found in PEM".to_string());
+            }
+        }
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    };
+    // TUIC v5 要求 ALPN；用户未配置时用默认 [h3, tuic]
+    config.alpn_protocols = if alpn.is_empty() {
+        vec![b"h3".to_vec(), b"tuic".to_vec()]
+    } else {
+        alpn.to_vec()
+    };
+    // 官方 zero_rtt_handshake：quinn 的 QuicClientConfig::try_from 强制
+    // enable_early_data=true，故此处只需控制会话恢复——true 启用恢复票据（复连自动 0-RTT），
+    // false 显式禁用（对齐官方默认：不尝试 0-RTT）。
+    config.resumption = if reduce_rtt {
+        rustls::client::Resumption::in_memory_sessions(256)
+    } else {
+        rustls::client::Resumption::disabled()
+    };
+    Ok(Arc::new(config))
 }
 
 
@@ -1712,5 +1833,178 @@ mod tests {
 
         assert!(ohm.get_handler("proxy-out").is_some(), "proxy-out should be registered");
         assert!(ohm.get_handler("chain-out").is_some(), "chain-out should be registered");
+    }
+
+    // ===== TUIC outbound 配置解析 + TLS 验证（bd 7p0） =====
+
+    const TUIC_TEST_UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
+
+    fn tuic_json(extra: &str) -> String {
+        format!(
+            r#"{{"servers":[{{"address":"127.0.0.1","port":8443,"uuid":"{TUIC_TEST_UUID}","password":"pw"{extra}}}]}}"#
+        )
+    }
+
+    /// 官方默认值（Itsusinn/tuic config.rs）：bbr / native / 3s / zero_rtt=false / 验证开启。
+    #[test]
+    fn parse_tuic_config_defaults_official() {
+        let s = parse_tuic_config(tuic_json("").as_bytes()).unwrap();
+        assert_eq!(s.congestion_control, xray_proxy_tuic::CongestionControl::Bbr);
+        assert_eq!(s.udp_relay_mode, xray_proxy_tuic::UdpRelayMode::Native);
+        assert_eq!(s.heartbeat, std::time::Duration::from_secs(3));
+        assert!(!s.reduce_rtt);
+        assert!(!s.insecure);
+        assert!(s.certificate.is_none());
+        assert!(s.alpn.is_empty());
+        assert_eq!(s.server_name, "127.0.0.1");
+    }
+
+    #[test]
+    fn parse_tuic_config_all_fields() {
+        let json = tuic_json(
+            r#","congestion_control":"cubic","alpn":["h3"],"reduce_rtt":true,"udp_relay_mode":"quic","heartbeat":10,"insecure":true,"certificate":"-----BEGIN CERTIFICATE-----""#,
+        );
+        let s = parse_tuic_config(json.as_bytes()).unwrap();
+        assert_eq!(s.congestion_control, xray_proxy_tuic::CongestionControl::Cubic);
+        assert_eq!(s.alpn, vec![b"h3".to_vec()]);
+        assert!(s.reduce_rtt);
+        assert_eq!(s.udp_relay_mode, xray_proxy_tuic::UdpRelayMode::Quic);
+        assert_eq!(s.heartbeat, std::time::Duration::from_secs(10));
+        assert!(s.insecure);
+        assert_eq!(s.certificate.as_deref(), Some("-----BEGIN CERTIFICATE-----"));
+    }
+
+    /// 官方字段名 zero_rtt_handshake 作为 reduce_rtt 的别名。
+    #[test]
+    fn parse_tuic_config_zero_rtt_handshake_alias() {
+        let json = tuic_json(r#","zero_rtt_handshake":true"#);
+        assert!(parse_tuic_config(json.as_bytes()).unwrap().reduce_rtt);
+    }
+
+    #[test]
+    fn parse_tuic_config_invalid_values_rejected() {
+        assert!(parse_tuic_config(tuic_json(r#","udp_relay_mode":"udp""#).as_bytes()).is_err());
+        assert!(parse_tuic_config(tuic_json(r#","congestion_control":"bbrv3""#).as_bytes()).is_err());
+    }
+
+    /// fingerprint（uTLS 指纹）rustls 不支持——解析不报错，仅告警忽略。
+    #[test]
+    fn parse_tuic_config_fingerprint_ignored() {
+        let json = tuic_json(r#","fingerprint":"chrome""#);
+        assert!(parse_tuic_config(json.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn build_tuic_rustls_config_alpn_default_and_custom() {
+        let c = build_tuic_rustls_config(&[], false, false, None).unwrap();
+        assert_eq!(c.alpn_protocols, vec![b"h3".to_vec(), b"tuic".to_vec()]);
+        let c = build_tuic_rustls_config(&[b"h3".to_vec()], false, false, None).unwrap();
+        assert_eq!(c.alpn_protocols, vec![b"h3".to_vec()]);
+    }
+
+    #[test]
+    fn build_tuic_rustls_config_bad_certificate_rejected() {
+        assert!(build_tuic_rustls_config(&[], false, false, Some("not a pem")).is_err());
+    }
+
+    /// DER → PEM（e2e 测试用）。
+    fn der_to_pem(der: &[u8]) -> String {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+        let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+        for chunk in b64.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(chunk).unwrap());
+            pem.push('\n');
+        }
+        pem.push_str("-----END CERTIFICATE-----\n");
+        pem
+    }
+
+    /// 起一个 mock TUIC server，返回 (addr, cert_der)。
+    async fn start_tuic_mock() -> (std::net::SocketAddr, Vec<u8>) {
+        let uuid = uuid::Uuid::parse_str(TUIC_TEST_UUID).unwrap();
+        let (server, cert_der) = xray_proxy_tuic::TuicMockServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            "localhost",
+            uuid,
+            "pw".to_string(),
+        )
+        .await
+        .expect("mock bind");
+        let addr = server.local_addr();
+        tokio::spawn(async move { let _ = server.run().await; });
+        (addr, cert_der)
+    }
+
+    /// e2e：默认（验证开启，无自签 CA）→ 自签证书被拒（~30s 后浮现 TLS 错误）。
+    #[tokio::test]
+    async fn tuic_default_tls_rejects_self_signed() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (addr, _cert) = start_tuic_mock().await;
+        let cfg = build_tuic_rustls_config(&[], false, false, None).unwrap();
+        let uuid = uuid::Uuid::parse_str(TUIC_TEST_UUID).unwrap();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            xray_proxy_tuic::TuicClient::connect(
+                addr,
+                "localhost",
+                uuid,
+                "pw",
+                cfg,
+                xray_proxy_tuic::QuinnConnectionPool::new(),
+            ),
+        )
+        .await
+        .expect("connect timed out");
+        assert!(res.is_err(), "default (verifying) TLS must reject self-signed cert");
+    }
+
+    /// e2e：certificate 指定服务端自签证书 → 验证通过连接成功。
+    #[tokio::test]
+    async fn tuic_certificate_pinned_tls_accepts_self_signed() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (addr, cert_der) = start_tuic_mock().await;
+        let pem = der_to_pem(&cert_der);
+        let cfg = build_tuic_rustls_config(&[], false, false, Some(&pem)).unwrap();
+        let uuid = uuid::Uuid::parse_str(TUIC_TEST_UUID).unwrap();
+        let client = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            xray_proxy_tuic::TuicClient::connect(
+                addr,
+                "localhost",
+                uuid,
+                "pw",
+                cfg,
+                xray_proxy_tuic::QuinnConnectionPool::new(),
+            ),
+        )
+        .await
+        .expect("connect timed out")
+        .expect("connect failed");
+        client.close(0u32.into(), b"");
+    }
+
+    /// e2e：insecure=true 显式跳过验证 → 自签证书放行。
+    #[tokio::test]
+    async fn tuic_insecure_tls_accepts_self_signed() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (addr, _cert) = start_tuic_mock().await;
+        let cfg = build_tuic_rustls_config(&[], false, true, None).unwrap();
+        let uuid = uuid::Uuid::parse_str(TUIC_TEST_UUID).unwrap();
+        let client = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            xray_proxy_tuic::TuicClient::connect(
+                addr,
+                "localhost",
+                uuid,
+                "pw",
+                cfg,
+                xray_proxy_tuic::QuinnConnectionPool::new(),
+            ),
+        )
+        .await
+        .expect("connect timed out")
+        .expect("connect failed");
+        client.close(0u32.into(), b"");
     }
 }

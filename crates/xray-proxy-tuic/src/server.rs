@@ -922,3 +922,125 @@ mod udp_assoc_tests {
         client.close(0u32.into(), b"");
     }
 }
+
+/// TLS 证书验证 + 连接选项 e2e（bd 7p0）。
+#[cfg(test)]
+mod tls_connect_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use uuid::Uuid;
+
+    use crate::error::TuicError;
+    use crate::client::{CongestionControl, TuicClient, TuicConnectOptions};
+    use crate::pool::QuinnConnectionPool;
+    use crate::server::TuicMockServer;
+
+    /// 验证路径必须拒绝自签证书：空 trust store 的客户端握手失败
+    /// （等效 webpki-only 根对自签的行为——默认路径不再是 NoVerifier）。
+    #[tokio::test]
+    async fn verifying_client_rejects_self_signed() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let uuid = Uuid::new_v4();
+        let (server, _cert) = TuicMockServer::bind(
+            "127.0.0.1:0".parse().expect("parse addr"),
+            "localhost",
+            uuid,
+            "tls-reject".to_string(),
+        )
+        .await
+        .expect("mock server bind");
+        let addr = server.local_addr();
+        tokio::spawn(async move { let _ = server.run().await; });
+
+        let cfg = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        // quinn 客户端验证失败经 ~30s idle timeout 才浮现错误（实测 31s），
+        // 故超时预算 45s；断言最终以 UnknownIssuer 类 TLS 错误拒绝
+        let res = tokio::time::timeout(
+            Duration::from_secs(45),
+            TuicClient::connect(addr, "localhost", uuid, "tls-reject", cfg, QuinnConnectionPool::new()),
+        )
+        .await;
+        assert!(
+            matches!(res, Ok(Err(TuicError::Quinn(_)))),
+            "verifying client must reject self-signed cert"
+        );
+    }
+    /// connect_with：BBR 拥塞控制生效 + 用户 ALPN 不被默认 [h3, tuic] 覆盖。
+    ///
+    /// ① 用户 ALPN=["tuic"] + BBR → 握手成功（CC factory 与非空 ALPN 路径可用）；
+    /// ② 用户 ALPN=["h3x"]（服务端不认识）→ 握手失败——若被默认覆盖则会成功。
+    #[tokio::test]
+    async fn connect_with_bbr_and_custom_alpn_ok() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let uuid = Uuid::new_v4();
+        let (server, cert_der) = TuicMockServer::bind(
+            "127.0.0.1:0".parse().expect("parse addr"),
+            "localhost",
+            uuid,
+            "bbr-alpn".to_string(),
+        )
+        .await
+        .expect("mock server bind");
+        let addr = server.local_addr();
+        tokio::spawn(async move { let _ = server.run().await; });
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(cert_der.to_vec().into()).expect("add cert");
+
+        // ① 用户 ALPN=["tuic"]：connect_with（BBR）握手成功——CC factory + 非空 ALPN 路径可用
+        let mut cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store.clone())
+            .with_no_client_auth();
+        cfg.alpn_protocols = vec![b"tuic".to_vec()];
+        let options = TuicConnectOptions {
+            congestion_control: CongestionControl::Bbr,
+            ..TuicConnectOptions::default()
+        };
+        let client = tokio::time::timeout(
+            Duration::from_secs(10),
+            TuicClient::connect_with(
+                addr,
+                "localhost",
+                uuid,
+                "bbr-alpn",
+                Arc::new(cfg),
+                options,
+                QuinnConnectionPool::new(),
+            ),
+        )
+        .await
+        .expect("connect timed out")
+        .expect("connect failed");
+        client.close(0u32.into(), b"");
+
+        // ② 用户 ALPN=["h3x"]（服务端不认识）：必须握手失败——
+        // 若 create_quic_connection 仍用默认 [h3, tuic] 覆盖用户列表，这里会连接成功
+        let mut bogus = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        bogus.alpn_protocols = vec![b"h3x".to_vec()];
+        let res = tokio::time::timeout(
+            // ALPN 协商失败与证书验证失败同样经 ~30s idle timeout 浮现
+            Duration::from_secs(45),
+            TuicClient::connect(
+                addr,
+                "localhost",
+                uuid,
+                "bbr-alpn",
+                Arc::new(bogus),
+                QuinnConnectionPool::new(),
+            ),
+        )
+        .await
+        .expect("connect timed out");
+        assert!(
+            res.is_err(),
+            "user-supplied ALPN must be honored, not clobbered by default"
+        );
+    }
+}

@@ -27,7 +27,7 @@ pub mod udp;
 pub mod h3;
 pub mod pool;
 
-pub use client::{TuicClient, TuicConn};
+pub use client::{CongestionControl, TuicClient, TuicConn, TuicConnectOptions, UdpRelayMode};
 pub use dispatcher::{make_dial_fn as make_tuic_dial_fn, make_dial_fn_lazy as make_tuic_dial_fn_lazy, TuicConnection};
 pub use error::{Result, TuicError};
 pub use protocol::{Address, Command, Packet, TOKEN_LEN, VERSION};

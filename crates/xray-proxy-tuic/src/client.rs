@@ -30,6 +30,80 @@ use crate::error::{Result, TuicError};
 use crate::protocol::address::Address;
 use crate::protocol::command::TOKEN_LEN;
 
+/// 拥塞控制算法（官方 tuic-client `congestion_control`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CongestionControl {
+    /// BBR（官方默认，Itsusinn/tuic config.rs `CongestionControl::Bbr`）。
+    #[default]
+    Bbr,
+    /// CUBIC。
+    Cubic,
+    /// New Reno——quinn 无内置实现，构建时回落 CUBIC。
+    NewReno,
+}
+
+impl CongestionControl {
+    /// 解析配置名（大小写不敏感）。未知值 → `None`（由配置层报错）。
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "bbr" => Some(Self::Bbr),
+            "cubic" => Some(Self::Cubic),
+            "new_reno" | "newreno" => Some(Self::NewReno),
+            _ => None,
+        }
+    }
+}
+
+/// UDP relay 模式（官方 tuic-client `udp_relay_mode`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UdpRelayMode {
+    /// native：QUIC DATAGRAM，保留 UDP 不可靠语义（官方默认）。
+    #[default]
+    Native,
+    /// quic：每包一个 bi-stream（可靠有序）。
+    Quic,
+}
+
+impl UdpRelayMode {
+    /// 解析配置名（大小写不敏感）。未知值 → `None`（由配置层报错）。
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "native" => Some(Self::Native),
+            "quic" => Some(Self::Quic),
+            _ => None,
+        }
+    }
+}
+
+/// TUIC outbound 连接选项（对应官方 tuic-client relay 配置子集，bd 7p0）。
+///
+/// 默认值对齐官方：`congestion_control=bbr`、`udp_relay_mode=native`、`heartbeat=3s`。
+#[derive(Debug, Clone)]
+pub struct TuicConnectOptions {
+    /// 拥塞控制算法。
+    pub congestion_control: CongestionControl,
+    /// 心跳周期（官方默认 3s）。
+    pub heartbeat: std::time::Duration,
+    /// UDP relay 模式。
+    ///
+    /// ponytail: outbound 生产路径 UDP 目前经 XUDP-over-TCP-relay 透明承载，
+    /// 本字段经解析校验后存储，供 [`crate::udp::TuicUdpAssoc`] 两种模式（native/quic）
+    /// 的调用方选择；独立 UDP 分支接入时生效。
+    pub udp_relay_mode: UdpRelayMode,
+}
+
+impl Default for TuicConnectOptions {
+    fn default() -> Self {
+        Self {
+            congestion_control: CongestionControl::Bbr,
+            heartbeat: std::time::Duration::from_secs(3),
+            udp_relay_mode: UdpRelayMode::Native,
+        }
+    }
+}
+
 /// TUIC 客户端。包装已认证的 quinn 连接，支持连接池复用。
 #[derive(Clone)]
 pub struct TuicClient {
@@ -81,6 +155,28 @@ impl TuicClient {
         rustls_config: Arc<rustls::ClientConfig>,
         pool: QuinnConnectionPool,
     ) -> Result<Self> {
+        Self::connect_with(
+            server,
+            server_name,
+            uuid,
+            password,
+            rustls_config,
+            TuicConnectOptions::default(),
+            pool,
+        )
+        .await
+    }
+
+    /// [`connect`](Self::connect) 的完整版：带连接选项（拥塞控制/心跳/UDP relay 模式）。
+    pub async fn connect_with(
+        server: impl ToSocketAddrs,
+        server_name: &str,
+        uuid: Uuid,
+        password: &str,
+        rustls_config: Arc<rustls::ClientConfig>,
+        options: TuicConnectOptions,
+        pool: QuinnConnectionPool,
+    ) -> Result<Self> {
         let server_addr = server.to_socket_addrs()?.next().ok_or_else(|| {
             std::io::Error::other("to_socket_addrs returned empty")
         })?;
@@ -96,12 +192,19 @@ impl TuicClient {
         let reconnect = ReconnectingConnection::new(pool.clone(), key.clone());
 
         // 获取或新建连接
+        let congestion_control = options.congestion_control;
         let pooled = reconnect
             .get_or_reconnect(|| {
                 let rustls_config = rustls_config.clone();
                 let server_name = server_name.to_string();
                 async move {
-                    Self::create_quic_connection(server_addr, &server_name, rustls_config).await
+                    Self::create_quic_connection(
+                        server_addr,
+                        &server_name,
+                        rustls_config,
+                        congestion_control,
+                    )
+                    .await
                 }
             })
             .await?;
@@ -141,10 +244,13 @@ impl TuicClient {
         server_addr: SocketAddr,
         server_name: &str,
         rustls_config: Arc<rustls::ClientConfig>,
+        congestion_control: CongestionControl,
     ) -> Result<quinn::Connection> {
-        // TUIC v5 要求 ALPN，在内部强制设置避免用户忘记
+        // TUIC v5 要求 ALPN；仅在未配置时用默认 [h3, tuic]，用户 alpn 不覆盖（bd 7p0）
         let mut rustls_config = (*rustls_config).clone();
-        rustls_config.alpn_protocols = vec![b"h3".to_vec(), b"tuic".to_vec()];
+        if rustls_config.alpn_protocols.is_empty() {
+            rustls_config.alpn_protocols = vec![b"h3".to_vec(), b"tuic".to_vec()];
+        }
         let rustls_config = Arc::new(rustls_config);
 
         let quinn_client_cfg = quinn::ClientConfig::new(Arc::new(
@@ -157,6 +263,19 @@ impl TuicClient {
         ));
         let mut transport = quinn::TransportConfig::default();
         transport.datagram_receive_buffer_size(Some(8 * 1024));
+        // 拥塞控制：bbr → quinn BBR；cubic/new_reno → CUBIC（quinn 无内置 NewReno）
+        match congestion_control {
+            CongestionControl::Bbr => {
+                transport.congestion_controller_factory(Arc::new(
+                    quinn_proto::congestion::BbrConfig::default(),
+                ));
+            }
+            CongestionControl::Cubic | CongestionControl::NewReno => {
+                transport.congestion_controller_factory(Arc::new(
+                    quinn_proto::congestion::CubicConfig::default(),
+                ));
+            }
+        }
         let mut quinn_client_cfg = quinn_client_cfg;
         quinn_client_cfg.transport_config(Arc::new(transport));
 
@@ -258,4 +377,37 @@ pub(crate) fn resolve_first(addr: impl ToSocketAddrs) -> Result<SocketAddr> {
         .next()
         .ok_or_else(|| std::io::Error::other("to_socket_addrs returned empty"))
         .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+
+    /// 官方 tuic-client 默认值：congestion_control=bbr、udp_relay_mode=native、heartbeat=3s。
+    /// 依据 Itsusinn/tuic（官方实现后继）crates/tuic-client/src/config.rs Relay 默认。
+    #[test]
+    fn connect_options_defaults_match_official() {
+        let o = TuicConnectOptions::default();
+        assert_eq!(o.congestion_control, CongestionControl::Bbr);
+        assert_eq!(o.udp_relay_mode, UdpRelayMode::Native);
+        assert_eq!(o.heartbeat, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn congestion_control_from_name() {
+        assert_eq!(CongestionControl::from_name("bbr"), Some(CongestionControl::Bbr));
+        assert_eq!(CongestionControl::from_name("CUBIC"), Some(CongestionControl::Cubic));
+        assert_eq!(CongestionControl::from_name("new_reno"), Some(CongestionControl::NewReno));
+        assert_eq!(CongestionControl::from_name("newreno"), Some(CongestionControl::NewReno));
+        assert_eq!(CongestionControl::from_name("bbrv3"), None);
+    }
+
+    #[test]
+    fn udp_relay_mode_from_name() {
+        assert_eq!(UdpRelayMode::from_name("native"), Some(UdpRelayMode::Native));
+        assert_eq!(UdpRelayMode::from_name("QUIC"), Some(UdpRelayMode::Quic));
+        assert_eq!(UdpRelayMode::from_name("udp"), None);
+    }
 }
