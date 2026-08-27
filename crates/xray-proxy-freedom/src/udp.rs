@@ -57,10 +57,18 @@ pub async fn relay_with_noises(
     // 1. 解析目标地址（Domain → IP）
     let default_target = resolve_socket_addr(dest).await?;
 
-    // 2. 绑定 UDP socket（与目标同族）
-    let bind_addr = match default_target {
-        SocketAddr::V4(_) => "0.0.0.0:0",
-        SocketAddr::V6(_) => "[::]:0",
+    // 2. 绑定 UDP socket：sendThrough 源地址优先（bd 7zc，对齐 Go
+    // system_dialer.go:59-84 ListenPacket 绑 srcAddr），否则与目标同族通配。
+    let src_ip = xray_transport::system_dialer::DIAL_SRC
+        .try_with(|v| *v)
+        .ok()
+        .flatten();
+    let bind_addr = match src_ip {
+        Some(ip) => SocketAddr::new(ip, 0),
+        None => match default_target {
+            SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
+            SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0),
+        },
     };
     let sock = Arc::new(UdpSocket::bind(bind_addr).await?);
 

@@ -76,6 +76,9 @@ pub struct FreedomDispatchBridge {
     tag: String,
     tcp: Arc<DialBridge>,
     noises: Vec<crate::config::Noise>,
+    /// sendThrough 源地址规格（bd 7zc）。UDP 分支拨号前解析并设 DIAL_SRC
+    /// （TCP 分支的源 bind 由 outbound 侧 dial_fn 包装层处理）。
+    send_through: Option<xray_transport::system_dialer::SendThroughSpec>,
 }
 
 impl FreedomDispatchBridge {
@@ -83,13 +86,24 @@ impl FreedomDispatchBridge {
     #[must_use]
     pub fn from_bridge(dial_bridge: Arc<DialBridge>) -> Self {
         let tag = dial_bridge.tag().to_string();
-        Self { tag, tcp: dial_bridge, noises: Vec::new() }
+        Self { tag, tcp: dial_bridge, noises: Vec::new(), send_through: None }
     }
 
     /// 设置 UDP 路径首包前注入的 noises（对齐 Go `NoisePacketWriter` 写入时机）。
     #[must_use]
     pub fn with_noises(mut self, noises: Vec<crate::config::Noise>) -> Self {
         self.noises = noises;
+        self
+    }
+
+    /// 设置 sendThrough 源地址（对齐 Go SenderConfig.Via 的 UDP 分支：
+    /// system_dialer.go:59-84 ListenPacket 绑源地址）。
+    #[must_use]
+    pub fn with_send_through(
+        mut self,
+        spec: xray_transport::system_dialer::SendThroughSpec,
+    ) -> Self {
+        self.send_through = Some(spec);
         self
     }
 }
@@ -111,9 +125,20 @@ impl DispatchHandler for FreedomDispatchBridge {
         if dest.network() == Network::UDP {
             let tag = self.tag.clone();
             let dest = dest.clone();
+            let send_through = self.send_through.clone();
             let noises = self.noises.clone();
             Box::pin(async move {
-                if let Err(e) = crate::udp::relay_with_noises(&dest, link, &noises).await {
+                // bd 7zc：sendThrough → DIAL_SRC scope → relay bind 源地址
+                // （对应 Go DialSystem UDP 分支 src 传递）。
+                let result = match send_through.as_ref().and_then(|s| s.resolve()) {
+                    Some(ip) => {
+                        xray_transport::system_dialer::DIAL_SRC
+                            .scope(Some(ip), crate::udp::relay_with_noises(&dest, link, &noises))
+                            .await
+                    }
+                    None => crate::udp::relay_with_noises(&dest, link, &noises).await,
+                };
+                if let Err(e) = result {
                     tracing::warn!(tag = %tag, "freedom udp relay ended: {e}");
                 }
             })
@@ -256,6 +281,75 @@ mod tests {
         let pkt = pr.read_packet().unwrap().expect("echo frame");
         assert_eq!(pkt.data(), b"udp-direct");
         w.shutdown();
+        echo_task.abort();
+    }
+
+    /// bd 7zc：sendThrough → freedom UDP relay 以指定源 IP bind（对齐 Go
+    /// system_dialer.go:59-84 UDP ListenPacket 绑 srcAddr）。echo server 记录
+    /// recv_from 的 peer，断言源 IP 为 127.0.0.2（loopback /8 内非默认源）。
+    #[tokio::test]
+    async fn dispatcher_e2e_freedom_udp_send_through_binds_source() {
+        use std::net::IpAddr;
+        use tokio::net::UdpSocket;
+        use xray_transport::system_dialer::SendThroughSpec;
+        use xray_xudp::packet::PacketWriter;
+
+        // 1. UDP echo server：记录首个 peer 源 IP
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        let peer_ip = Arc::new(parking_lot::Mutex::new(None::<IpAddr>));
+        let recorder = Arc::clone(&peer_ip);
+        let echo_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                match echo.recv_from(&mut buf).await {
+                    Ok((n, peer)) => {
+                        if recorder.lock().is_none() {
+                            *recorder.lock() = Some(peer.ip());
+                        }
+                        let _ = echo.send_to(&buf[..n], peer).await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // 2. FreedomDispatchBridge + sendThrough=127.0.0.2
+        let tcp_bridge = Arc::new(DialBridge::new("freedom-via", make_dial_fn()));
+        let bridge = FreedomDispatchBridge::from_bridge(tcp_bridge)
+            .with_send_through(SendThroughSpec::Fixed("127.0.0.2".parse().unwrap()));
+        let ohm = SimpleOhm::new();
+        ohm.set_default(Arc::new(bridge));
+        let mut dispatcher = DefaultDispatcher::new();
+        dispatcher.ohm = Some(Arc::new(ohm));
+
+        // 3. dispatch UDP dest → 写 XUDP 帧 → relay 以 127.0.0.2 bind 后 send_to
+        let dest = Destination::new(
+            Address::from_ipv4_bytes([127, 0, 0, 1]),
+            Port::new(echo_addr.port()),
+            Network::UDP,
+        );
+        let inbound = dispatcher
+            .dispatch(&dest, &SniffingRequest::default(), None, None)
+            .expect("dispatch returns inbound Link");
+        let mut w = inbound.writer;
+
+        let mut frame = Vec::new();
+        {
+            let mut pw = PacketWriter::new(&mut frame, dest.clone(), [0x33; 8]);
+            pw.write_packet(b"via-127.0.0.2").unwrap();
+        }
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(&frame);
+        w.write_multi_buffer(mb).await.unwrap();
+
+        // 等 echo 记录 peer（轮询 3s）
+        let expected: IpAddr = "127.0.0.2".parse().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while peer_ip.lock().is_none() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(*peer_ip.lock(), Some(expected), "UDP 源 IP 应为 sendThrough 指定的 127.0.0.2");
         echo_task.abort();
     }
 

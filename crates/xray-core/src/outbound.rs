@@ -216,6 +216,72 @@ pub fn register_outbounds(
     Ok(())
 }
 
+/// 解析 sendThrough 为源地址规格。对齐 Go `infra/conf/xray.go:287-301`：
+/// - 含 `/` → CIDR（前缀存 spec，拨号时随机取址，等价 Go `ViaCidr`+`ParseRandomIP`）
+/// - 域名只允许 `origin` / `srcip`（其余域名为配置错误，同 Go `"unable to send through"`）
+/// - IP → 固定源地址（Go `Via = address.Build()`）
+fn parse_send_through(
+    raw: &Option<String>,
+) -> std::result::Result<Option<xray_transport::system_dialer::SendThroughSpec>, BuildError> {
+    use xray_transport::system_dialer::SendThroughSpec;
+
+    let Some(raw) = raw else { return Ok(None) };
+    // Go ParseSendThough（xray.go:654）：取 "/" 前的地址部分
+    let addr_part = raw.split('/').next().unwrap_or_default();
+    let prefix_part = raw.split('/').nth(1);
+
+    if let Some(prefix) = prefix_part {
+        // CIDR 形态：地址必须可解析为 IP（Go ParseRandomIP 组 `ip+"/"+prefix`）
+        let base: std::net::IpAddr = addr_part.parse().map_err(|_| {
+            BuildError::Parse(format!("unable to send through: {raw}"))
+        })?;
+        let prefix: u8 = prefix.parse().map_err(|_| {
+            BuildError::Parse(format!("invalid sendThrough CIDR prefix: {raw}"))
+        })?;
+        let max = if base.is_ipv4() { 32 } else { 128 };
+        if prefix > max {
+            return Err(BuildError::Parse(format!("invalid sendThrough CIDR prefix: {raw}")));
+        }
+        return Ok(Some(SendThroughSpec::Cidr { base, prefix }));
+    }
+
+    // std IpAddr 解析覆盖 Go net.ParseAddress 的 IP family 判定；
+    // 解析失败 = Go 的 Domain 分支（只允许 origin/srcip，xray.go:293-298）
+    match addr_part.parse::<std::net::IpAddr>() {
+        Ok(ip) => Ok(Some(SendThroughSpec::Fixed(ip))),
+        Err(_) if addr_part == "origin" => Ok(Some(SendThroughSpec::Origin)),
+        Err(_) if addr_part == "srcip" => Ok(Some(SendThroughSpec::SrcIp)),
+        Err(_) => Err(BuildError::Parse(format!("unable to send through: {raw}"))),
+    }
+}
+
+/// 用 sendThrough 包装 dial_fn：每次拨号 resolve 源 IP 并设 [`DIAL_SRC`] scope。
+///
+/// 对应 Go `handler.go:303-307`（Handler.Dial 把 `Via` 写入 `ob.Gateway`）+
+/// `dialer.go:228-235`（DialSystem 读 `ob.Gateway` 传 src）。代理链 dispatch
+/// 不经 dial_fn（DialBridge::dispatch_via_chain），天然等价 Go
+/// `SetOutboundGateway` 的 `!ProxySettings.HasTag()` 门控。
+fn wrap_dial_with_send_through(
+    dial: xray_app_dispatcher::default::DialFn,
+    spec: xray_transport::system_dialer::SendThroughSpec,
+) -> xray_app_dispatcher::default::DialFn {
+    Arc::new(move |dest: &Destination| {
+        let dial = Arc::clone(&dial);
+        let spec = spec.clone();
+        let dest = dest.clone();
+        Box::pin(async move {
+            match spec.resolve() {
+                Some(ip) => {
+                    xray_transport::system_dialer::DIAL_SRC
+                        .scope(Some(ip), dial(&dest))
+                        .await
+                }
+                None => dial(&dest).await,
+            }
+        })
+    })
+}
+
 /// 包装 DialBridge 为 `(handler, Some(dial_bridge_arc), proxy_chain_tag)` 三元组。
 ///
 /// `proxy_chain_tag` 存在时保留 `Arc<DialBridge>` 引用，以便 Phase 2 设置代理链。
@@ -227,9 +293,15 @@ fn wrap_bridge(
     proxy_chain_tag: &Option<String>,
     target_strategy: Option<DomainStrategy>,
     dns: Option<&Arc<xray_app_dns::DnsService>>,
+    send_through: Option<&xray_transport::system_dialer::SendThroughSpec>,
 ) -> std::result::Result<(Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>), BuildError> {
     let dial_fn = match target_strategy {
         Some(s) => wrap_dial_with_target_strategy(dial_fn, s, dns.cloned()),
+        None => dial_fn,
+    };
+    // sendThrough（bd 7zc）包装在最外层：targetStrategy 改写目标后再定源地址族
+    let dial_fn = match send_through {
+        Some(spec) => wrap_dial_with_send_through(dial_fn, spec.clone()),
         None => dial_fn,
     };
     let bridge = Arc::new(DialBridge::new(tag, dial_fn));
@@ -397,6 +469,8 @@ fn try_build_handler(
         .as_deref()
         .and_then(parse_target_strategy)
         .filter(|s| s.has_strategy());
+    // sendThrough（bd 7zc）：outbound 顶层字段 → 源地址规格（Go xray.go:287-301）
+    let send_through = parse_send_through(&ob.send_through)?;
     match ob.entry.kind.as_str() {
         "freedom" => {
             let config = parse_freedom_config(&ob.entry.data);
@@ -406,13 +480,22 @@ fn try_build_handler(
                 Some(s) => wrap_dial_with_target_strategy(dial_fn, s, dns.cloned()),
                 None => dial_fn,
             };
+            // sendThrough：TCP 分支经 dial_fn 包装（每次拨号设 DIAL_SRC scope）
+            let dial_fn = match &send_through {
+                Some(spec) => wrap_dial_with_send_through(dial_fn, spec.clone()),
+                None => dial_fn,
+            };
             // TCP 走 DialBridge（fragment 经 DialFn 包装 writer），UDP 走
-            // FreedomDispatchBridge（noises 首包前注入）
+            // FreedomDispatchBridge（noises 首包前注入；sendThrough 经 with_send_through）
             let tcp_bridge = Arc::new(DialBridge::new(ob.tag.clone(), dial_fn));
-            let handler = Arc::new(
-                xray_proxy_freedom::FreedomDispatchBridge::from_bridge(Arc::clone(&tcp_bridge))
-                    .with_noises(noises),
-            ) as Arc<dyn DispatchHandler>;
+            let mut bridge = xray_proxy_freedom::FreedomDispatchBridge::from_bridge(
+                Arc::clone(&tcp_bridge),
+            )
+            .with_noises(noises);
+            if let Some(spec) = &send_through {
+                bridge = bridge.with_send_through(spec.clone());
+            }
+            let handler = Arc::new(bridge) as Arc<dyn DispatchHandler>;
             let bridge_ref = if proxy_chain_tag.is_some() { Some(tcp_bridge) } else { None };
             Ok((handler, bridge_ref, proxy_chain_tag))
         }
@@ -420,13 +503,13 @@ fn try_build_handler(
             let config = parse_vless_config(&ob.entry.data)?;
             let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_vless::make_vless_dial_fn(Arc::new(config));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
         }
         "trojan" => {
             let config = parse_trojan_config(&ob.entry.data)?;
             let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_trojan::make_trojan_dial_fn(Arc::new(config));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
         }
         "blackhole" => {
             let response = parse_blackhole_response(&ob.entry.data);
@@ -447,7 +530,7 @@ fn try_build_handler(
                 ),
             });
             let dial_fn = xray_proxy_socks::make_socks_dial_fn(client);
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
         }
         "mux" => {
             let (concurrency, via_tag) = parse_mux_config(&ob.entry.data)?;
@@ -461,12 +544,12 @@ fn try_build_handler(
             let config = xray_proxy_vmess::parse_vmess_config(&ob.entry.data)?;
             let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_vmess::make_vmess_dial_fn(Arc::new(config));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
         }
         "shadowsocks" => {
             let config = xray_proxy_ss::parse_ss_config(&ob.entry.data)?;
             let dial_fn = xray_proxy_ss::make_ss_dial_fn(Arc::new(config));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
         }
         "hysteria" => {
             let (server_addr, auth, server_name) = parse_hysteria_config(&ob.entry.data)?;
@@ -485,13 +568,13 @@ fn try_build_handler(
             ).map_err(|e| format!("hysteria transport: {e}"))?
                 .with_salamander(salamander);
             let dial_fn = xray_proxy_hysteria::make_hysteria_dial_fn(config, Arc::new(transport));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
         }
         "anytls" => {
             let config = parse_anytls_config(&ob.entry.data)?;
             let client = Arc::new(xray_proxy_anytls::AnytlsClient::new(config));
             let dial_fn = xray_proxy_anytls::make_anytls_dial_fn(client);
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
         }
         "tuic" => {
             let s = parse_tuic_config(&ob.entry.data)?;
@@ -514,12 +597,12 @@ fn try_build_handler(
                 rustls_config,
                 options,
             );
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
         }
         "wireguard" => {
             let config = parse_wireguard_config(&ob.entry.data)?;
             let dial_fn = xray_proxy_wireguard::make_wireguard_dial_fn(config);
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
         }
         "dns" => {
             let (handler, dns) = parse_dns_outbound_config(&ob.entry.data, &ob.tag)?;
@@ -541,17 +624,17 @@ fn try_build_handler(
             let config = xray_proxy_http::parse_http_config(&ob.entry.data)?;
             let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_http::make_http_dial_fn(Arc::new(config));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
         }
         "dokodemo" => {
             let config = parse_dokodemo_config(&ob.entry.data)?;
             let dial_fn = xray_proxy_dokodemo::make_dokodemo_dial_fn(config);
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
         }
         #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
         "tun" => {
             let dial_fn = xray_proxy_tun::make_tun_dial_fn();
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
         }
         #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
         "tun" => {
@@ -1704,6 +1787,110 @@ mod tests {
         assert!(ohm.get_handler("direct").is_some());
     }
 
+    /// bd 7zc：sendThrough → 拨号源 IP bind（Go xray.go:287 → handler.go:303 →
+    /// dialer.go:228 → system_dialer.go:33 bind 链）。
+    ///
+    /// 绑 127.0.0.2（loopback /8 内非默认源，有区分度：未生效时 OS 默认源是
+    /// 127.0.0.1），echo server accept 记录 peer 断言源 IP。
+    #[tokio::test]
+    async fn freedom_send_through_binds_source_ip() {
+        use std::net::IpAddr;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use xray_app_dispatcher::default::{DefaultDispatcher, SniffingRequest};
+        use xray_buf::io::Writer as _;
+        use xray_buf::multi::MultiBuffer;
+        use xray_common::net::address::Address;
+        use xray_common::net::destination::Destination;
+        use xray_common::net::network::Network;
+        use xray_common::net::port::Port;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = listener.local_addr().unwrap().port();
+        let peer_ip = std::sync::Arc::new(parking_lot::Mutex::new(None::<IpAddr>));
+        let peer_recorder = std::sync::Arc::clone(&peer_ip);
+        let accept_task = tokio::spawn(async move {
+            let (mut sock, peer) = listener.accept().await.unwrap();
+            *peer_recorder.lock() = Some(peer.ip());
+            let mut buf = [0u8; 64];
+            let n = sock.read(&mut buf).await.unwrap();
+            sock.write_all(&buf[..n]).await.unwrap();
+        });
+
+        // 2. freedom outbound + sendThrough=127.0.0.2
+        let ob = BuiltOutbound {
+            send_through: Some("127.0.0.2".to_string()),
+            ..make_outbound("freedom", "via-test", "{}")
+        };
+        let (handler, _, _) =
+            try_build_handler(&ob, None, &mut Vec::new(), None).expect("build freedom handler");
+
+        // 3. dispatcher → dispatch → echo
+        let ohm = SimpleOhm::new();
+        ohm.set_default(handler);
+        let mut d = DefaultDispatcher::new();
+        d.ohm = Some(std::sync::Arc::new(ohm));
+
+        let dest = Destination::new(
+            Address::from_ipv4_bytes([127, 0, 0, 1]),
+            Port::new(echo_port),
+            Network::TCP,
+        );
+        let inbound = d
+            .dispatch(&dest, &SniffingRequest::default(), None, None)
+            .expect("dispatch returns inbound Link");
+
+        let mut w = inbound.writer;
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(b"ping");
+        w.write_multi_buffer(mb).await.unwrap();
+
+        accept_task.await.unwrap();
+        assert_eq!(
+            *peer_ip.lock(),
+            Some("127.0.0.2".parse().unwrap()),
+            "连接源 IP 应为 sendThrough 指定的 127.0.0.2"
+        );
+    }
+
+
+    /// bd 7zc：parse_send_through 对齐 Go xray.go:287-301 解析与校验。
+    #[test]
+    fn parse_send_through_forms() {
+        use xray_transport::system_dialer::SendThroughSpec;
+
+        assert_eq!(parse_send_through(&None).unwrap(), None);
+        assert_eq!(
+            parse_send_through(&Some("192.168.1.5".into())).unwrap(),
+            Some(SendThroughSpec::Fixed("192.168.1.5".parse().unwrap()))
+        );
+        assert_eq!(
+            parse_send_through(&Some("fd00::1".into())).unwrap(),
+            Some(SendThroughSpec::Fixed("fd00::1".parse().unwrap()))
+        );
+        assert_eq!(
+            parse_send_through(&Some("10.0.0.0/24".into())).unwrap(),
+            Some(SendThroughSpec::Cidr {
+                base: "10.0.0.0".parse().unwrap(),
+                prefix: 24
+            })
+        );
+        assert_eq!(
+            parse_send_through(&Some("origin".into())).unwrap(),
+            Some(SendThroughSpec::Origin)
+        );
+        assert_eq!(
+            parse_send_through(&Some("srcip".into())).unwrap(),
+            Some(SendThroughSpec::SrcIp)
+        );
+        // 非 origin/srcip 域名：构建失败（Go "unable to send through"）
+        assert!(parse_send_through(&Some("example.com".into())).is_err());
+        // 非法 IP
+        assert!(parse_send_through(&Some("999.1.1.1".into())).is_err());
+        // CIDR 前缀非法
+        assert!(parse_send_through(&Some("10.0.0.0/xx".into())).is_err());
+        assert!(parse_send_through(&Some("10.0.0.0/33".into())).is_err());
+    }
     #[test]
     fn register_vless_parses_vnext() {
         let settings = r#"{

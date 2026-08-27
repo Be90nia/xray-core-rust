@@ -439,8 +439,9 @@ impl OutboundHandler for OutboundHandlerEntry {
                 }
             }
 
-            // 2. SendThrough/Via：如果 senderSettings.Via != nil，设置出口网关
-            // ponytail: skip for now, add when Via/SendThrough is wired
+            // 2. SendThrough/Via：生产实现在 xray-core try_build_handler（bd 7zc，
+            // wrap_dial_with_send_through → DIAL_SRC task-local → dial_system bind）；
+            // 本 crate（平行世界）不接入。
 
             // 3. 直接拨号：internet.Dial(ctx, dest, h.streamSettings)
             let conn = dial(&dest, &settings, &sockopt).await?;

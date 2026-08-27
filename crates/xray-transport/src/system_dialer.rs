@@ -202,6 +202,69 @@ pub fn registered_controllers() -> Vec<DialerController> {
     controllers().lock().clone()
 }
 
+/// sendThrough 源地址规格。对应 Go `proxyman.SenderConfig` 的 `Via`/`ViaCidr`
+/// （infra/conf/xray.go:287-301 解析）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendThroughSpec {
+    /// 固定源 IP（Go `Via` 为 IP 地址）。
+    Fixed(IpAddr),
+    /// CIDR 内随机源 IP（Go `ViaCidr`，拨号时 `ParseRandomIP` 取址）。
+    Cidr { base: IpAddr, prefix: u8 },
+    /// "origin"：入站本地 IP。
+    ///
+    /// ponytail: DialFn 链无 inbound 会话上下文，resolve 恒 None（等价 Go
+    /// inbound 无效时不设 Gateway 的分支，handler.go:337-342）；
+    /// 接入会话上下文时在此取 inbound.Local.Address。
+    Origin,
+    /// "srcip"：入站客户端源 IP（同 Origin 的 ponytail 边界）。
+    SrcIp,
+}
+
+impl SendThroughSpec {
+    /// 解析为本次拨号使用的源 IP；`None` 表示不 bind。
+    #[must_use]
+    pub fn resolve(&self) -> Option<IpAddr> {
+        match *self {
+            Self::Fixed(ip) => Some(ip),
+            Self::Cidr { base, prefix } => random_ip_in_cidr(base, prefix),
+            Self::Origin | Self::SrcIp => None,
+        }
+    }
+}
+
+/// CIDR 内随机取一 IP。对齐 Go `ParseRandomIP`（app/proxyman/outbound/handler.go:400-418）：
+/// 网络地址 + [0, 2^(bits-ones)) 随机偏移（不排除网络/广播地址，与 Go 一致）。
+fn random_ip_in_cidr(base: IpAddr, prefix: u8) -> Option<IpAddr> {
+    match base {
+        IpAddr::V4(v4) if prefix <= 32 => {
+            let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+            let size = 1u64 << (32 - prefix);
+            let offset = rand::random::<u32>() as u64 % size;
+            let ip = (u32::from(v4) & mask) as u64 + offset;
+            Some(IpAddr::V4(std::net::Ipv4Addr::from(ip as u32)))
+        }
+        IpAddr::V6(v6) if prefix <= 128 => {
+            let shift = 128 - prefix;
+            let mask = if shift >= 128 { 0 } else { u128::MAX << shift };
+            let network = u128::from(v6) & mask;
+            let size: u128 = 1u128.checked_shl(u32::try_from(shift).ok()?).unwrap_or(0);
+            let offset = if size == 0 {
+                rand::random::<u128>()
+            } else {
+                rand::random::<u128>() % size
+            };
+            Some(IpAddr::V6(std::net::Ipv6Addr::from(network + offset)))
+        }
+        _ => None,
+    }
+}
+
+tokio::task_local! {
+    /// 本次拨号的源 IP。对应 Go `session.Outbound.Gateway`（Handler.Dial 由
+    /// SenderConfig.Via 设置）经 `DialSystem` 传给 system dialer 的 `src`。
+    pub static DIAL_SRC: Option<IpAddr>;
+}
+
 /// 系统拨号。对应 Go `dialer.go::DialSystem`。
 ///
 /// 切片1 简化版：直接调 effective dialer，不处理 DNS/SRV/TXT/DialerProxy。
@@ -221,7 +284,15 @@ pub async fn dial_system(
         let guard = effective().read();
         Arc::clone(&*guard)
     };
-    dialer.dial(None, destination, sockopt).await
+    // sendThrough 源地址：对应 Go DialSystem 的 `src = ob.Gateway`
+    // （dialer.go:228-235）+ `resolveSrcAddr` 端口 0（system_dialer.go:33-46）。
+    // task-local 由上层 dial_fn 包装层建立（等价 Go Handler.Dial 设 ob.Gateway）。
+    let src = DIAL_SRC
+        .try_with(|v| *v)
+        .ok()
+        .flatten()
+        .map(|ip| SocketAddr::new(ip, 0));
+    dialer.dial(src, destination, sockopt).await
 }
 
 // ===== 辅助函数 =====
@@ -373,6 +444,84 @@ mod tests {
     fn destination_to_socket_addr_rejects_domain() {
         let dest = Destination::tcp(Address::new_domain("test.com"), Port::new(443));
         assert!(destination_to_socket_addr(&dest).is_err());
+    }
+
+    #[test]
+    fn send_through_spec_resolve_forms() {
+        let fixed: IpAddr = "192.168.1.5".parse().unwrap();
+        assert_eq!(SendThroughSpec::Fixed(fixed).resolve(), Some(fixed));
+        // origin/srcip 无会话上下文 → 不 bind（等价 Go inbound 无效分支）
+        assert_eq!(SendThroughSpec::Origin.resolve(), None);
+        assert_eq!(SendThroughSpec::SrcIp.resolve(), None);
+    }
+
+    #[test]
+    fn send_through_spec_cidr_random_within_subnet() {
+        let base: IpAddr = "10.0.0.0".parse().unwrap();
+        for _ in 0..64 {
+            let ip = SendThroughSpec::Cidr { base, prefix: 24 }.resolve().unwrap();
+            let o = match ip {
+                IpAddr::V4(v4) => v4.octets(),
+                _ => panic!("cidr base v4 should resolve v4"),
+            };
+            assert_eq!(&o[..3], &[10, 0, 0][..], "10.0.0.0/24 内：{ip}");
+        }
+        let base6: IpAddr = "fd00::".parse().unwrap();
+        let ip6 = SendThroughSpec::Cidr { base: base6, prefix: 120 }.resolve().unwrap();
+        assert!(ip6.is_ipv6());
+        // 非法前缀 → None
+        assert_eq!(random_ip_in_cidr(base, 33), None);
+        assert_eq!(random_ip_in_cidr(base6, 129), None);
+    }
+
+    /// bd 7zc：DIAL_SRC scope 内 dial_system 以指定源 IP bind（对齐 Go
+    /// system_dialer.go:103-110 dialer.LocalAddr）。127.0.0.2 是 loopback /8
+    /// 内非默认源——未生效时 OS 默认源是 127.0.0.1，断言有区分度。
+    #[tokio::test]
+    async fn dial_system_binds_dial_src_as_source_ip() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer_ip = Arc::new(parking_lot::Mutex::new(None::<IpAddr>));
+        let recorder = Arc::clone(&peer_ip);
+        let accept_task = tokio::spawn(async move {
+            let (_sock, peer) = listener.accept().await.unwrap();
+            *recorder.lock() = Some(peer.ip());
+        });
+        let dest = localhost_dest(addr.port());
+        let sockopt = SocketOptions::default();
+        let src: IpAddr = "127.0.0.2".parse().unwrap();
+        let conn = DIAL_SRC
+            .scope(Some(src), dial_system(&dest, &sockopt))
+            .await
+            .expect("dial with DIAL_SRC should succeed");
+        drop(conn);
+        accept_task.await.unwrap();
+        assert_eq!(*peer_ip.lock(), Some(src));
+    }
+
+    /// bd 7zc：源地址族与目标不符 → 拨号错误（对齐 Go net.Dialer 在
+    /// LocalAddr bind 失败时直接返回错误，不静默回退）。环境无 IPv6
+    /// loopback 时跳过。
+    #[tokio::test]
+    async fn dial_system_family_mismatch_v4_src_v6_dest_fails() {
+        let listener = match tokio::net::TcpListener::bind("[::1]:0").await {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let addr = listener.local_addr().unwrap();
+        let _accept = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let dest = Destination::tcp(
+            xray_common::net::address::Address::IPv6(std::net::Ipv6Addr::LOCALHOST),
+            Port::new(addr.port()),
+        );
+        let sockopt = SocketOptions::default();
+        let v4_src: IpAddr = "127.0.0.2".parse().unwrap();
+        let result = DIAL_SRC
+            .scope(Some(v4_src), dial_system(&dest, &sockopt))
+            .await;
+        assert!(result.is_err(), "v4 源 + v6 目标应拨号失败（对齐 Go）");
     }
 }
 
