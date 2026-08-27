@@ -181,6 +181,9 @@ impl StreamSettings {
         if let Some(v) = obj.get("v6only").and_then(|v| v.as_bool()) {
             opts.ipv6_only = v;
         }
+        if let Some(v) = obj.get("dialerProxy").and_then(|v| v.as_str()) {
+            opts.dialer_proxy = v.to_string();
+        }
         opts
     }
 }
@@ -342,6 +345,16 @@ mod transport_cache_tests {
         let mut s = StreamSettings::tcp();
         s.sockopt_json = Some(serde_json::json!({ "tcpFastOpen": 1 }));
         assert!(s.socket_options().tcp_fast_open);
+    }
+
+    /// dialerProxy 解析（bd enk，Go SocketConfig.DialerProxy）。
+    #[test]
+    fn socket_options_parses_dialer_proxy() {
+        let mut s = StreamSettings::tcp();
+        s.sockopt_json = Some(serde_json::json!({ "dialerProxy": "proxy-out" }));
+        assert_eq!(s.socket_options().dialer_proxy, "proxy-out");
+        // 缺省为空串。
+        assert_eq!(StreamSettings::tcp().socket_options().dialer_proxy, "");
     }
 
     #[test]

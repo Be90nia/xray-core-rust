@@ -339,7 +339,7 @@ impl TcpWorker {
         let listener = listen_tcp(
             self.address,
             self.stream_settings.clone(),
-            self.sockopt,
+            self.sockopt.clone(),
             handler,
         )
         .await

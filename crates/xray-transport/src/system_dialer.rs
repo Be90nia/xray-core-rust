@@ -10,7 +10,7 @@
 //! - UDP 拨号（tokio UdpSocket + PacketConnWrapper）
 //! - LookupForIP（DNS 解析 + DomainStrategy）
 //! - checkAddressPortStrategy（SRV/TXT 记录覆盖 dest）
-//! - redirect（pipe + outbound handler dispatch，DialerProxy）
+//! - redirect 已实现（bd enk，[`set_dialer_proxy_hook`]，DialerProxy）
 //! - HappyEyeballs（TcpRaceDial）
 //! - InitSystemDialer（dns.Client + outbound.Manager 注入）
 
@@ -265,19 +265,60 @@ tokio::task_local! {
     pub static DIAL_SRC: Option<IpAddr>;
 }
 
+/// DialerProxy 拨号钩子：`(tag, dest) → 经 tag outbound handler 建立的连接`。
+///
+/// 对应 Go `transport/internet/dialer.go:270-279`——`DialSystem` 遇到
+/// `sockopt.DialerProxy` 时经 outbound manager 查 handler 并 `redirect`
+/// （pipe + `h.Dispatch`，dialer.go:111-136）。本 crate 不能依赖 dispatcher
+/// （依赖反向），故由 xray-core 启动时注入实现（回调注入 trait 模式）。
+pub type DialerProxyHook = Arc<
+    dyn Fn(&str, &Destination) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Connection>>> + Send>>
+        + Send
+        + Sync,
+>;
+
+static DIALER_PROXY_HOOK: std::sync::RwLock<Option<DialerProxyHook>> =
+    std::sync::RwLock::new(None);
+
+/// 注册全局 DialerProxy 钩子（xray-core `register_outbounds` 调用）。
+pub fn set_dialer_proxy_hook(hook: DialerProxyHook) {
+    *DIALER_PROXY_HOOK.write().expect("DIALER_PROXY_HOOK lock poisoned") = Some(hook);
+}
+
+/// 清除钩子（测试隔离用）。
+pub fn clear_dialer_proxy_hook() {
+    *DIALER_PROXY_HOOK.write().expect("DIALER_PROXY_HOOK lock poisoned") = None;
+}
+
 /// 系统拨号。对应 Go `dialer.go::DialSystem`。
 ///
-/// 切片1 简化版：直接调 effective dialer，不处理 DNS/SRV/TXT/DialerProxy。
-/// 完整逻辑（LookupForIP/checkAddressPortStrategy/redirect/HappyEyeballs）留切片2。
+/// `sockopt.dialer_proxy` 非空时经 [`DIALER_PROXY_HOOK`] 重定向（bd enk）。
+/// DNS/SRV/TXT/HappyEyeballs 仍留切片2。
 ///
 /// # 参数
 ///
 /// - `destination`：目标地址。切片1 要求是 IP（非 Domain），Domain 解析留切片2。
-/// - `sockopt`：socket 选项。
+/// - `sockopt`：socket 选项（含 `dialer_proxy`）。
 pub async fn dial_system(
     destination: &Destination,
     sockopt: &SocketOptions,
 ) -> io::Result<Box<dyn Connection>> {
+    // DialerProxy（bd enk）：对应 Go dialer.go:270-279——非空时不直连，经指定
+    // tag 的 outbound handler 拨号（redirect）。src/DIAL_SRC 不参与（对齐
+    // Go dialer.go:233-235 `len(sockopt.DialerProxy) == 0` 才取 ob.Gateway）。
+    if !sockopt.dialer_proxy.is_empty() {
+        let hook = DIALER_PROXY_HOOK
+            .read()
+            .expect("DIALER_PROXY_HOOK lock poisoned")
+            .clone();
+        let Some(hook) = hook else {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "there is no outbound manager for dialerProxy",
+            ));
+        };
+        return hook(&sockopt.dialer_proxy, destination).await;
+    }
     // ponytail: clone Arc 后 drop guard，避免 RwLockReadGuard 跨 await 点
     // （否则 future 不是 Send，无法用于 async_trait 的 OutboundHandler::dial）。
     let dialer = {
@@ -522,6 +563,67 @@ mod tests {
             .scope(Some(v4_src), dial_system(&dest, &sockopt))
             .await;
         assert!(result.is_err(), "v4 源 + v6 目标应拨号失败（对齐 Go）");
+    }
+
+    // ===== DialerProxy（bd enk）=====
+
+    /// 钩子测试共享锁：全局静态钩子需要串行设置/清除。
+    static HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// dialerProxy 设置但无钩子（无 outbound manager）→ 报错（Go dialer.go:271-272）。
+    #[tokio::test]
+    async fn dial_system_dialer_proxy_without_hook_errors() {
+        let _guard = HOOK_TEST_LOCK.lock();
+        clear_dialer_proxy_hook();
+        let mut sockopt = SocketOptions::default();
+        sockopt.dialer_proxy = "proxy-out".into();
+        let dest = Destination::tcp(
+            xray_common::net::address::Address::from_ipv4_bytes([127, 0, 0, 1]),
+            xray_common::net::port::Port::new(1),
+        );
+        let err = match dial_system(&dest, &sockopt).await {
+            Err(e) => e,
+            Ok(_) => panic!("dialerProxy without hook should fail"),
+        };
+        assert!(
+            err.to_string().contains("no outbound manager"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// dialerProxy 设置 + 钩子 → 连接经钩子建立（tag 透传，Go dialer.go:274-278）。
+    #[tokio::test]
+    async fn dial_system_dialer_proxy_routes_via_hook() {
+        use std::sync::Arc as StdArc;
+        let _guard = HOOK_TEST_LOCK.lock();
+        let seen: StdArc<parking_lot::Mutex<Vec<(String, u16)>>> =
+            StdArc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen_hook = Arc::clone(&seen);
+        set_dialer_proxy_hook(Arc::new(move |tag: &str, dest: &Destination| {
+            let tag = tag.to_string();
+            let port = dest.port().value();
+            let seen = Arc::clone(&seen_hook);
+            Box::pin(async move {
+                seen.lock().push((tag, port));
+                let (client, _server) = tokio::io::duplex(64);
+                Ok(Box::new(crate::connection::DuplexConnection::new(client))
+                    as Box<dyn Connection>)
+            })
+        }));
+        let mut sockopt = SocketOptions::default();
+        sockopt.dialer_proxy = "socks-out".into();
+        let dest = Destination::tcp(
+            xray_common::net::address::Address::from_ipv4_bytes([127, 0, 0, 1]),
+            xray_common::net::port::Port::new(8080),
+        );
+        let conn = dial_system(&dest, &sockopt).await.expect("hook dial ok");
+        drop(conn);
+        assert_eq!(
+            seen.lock().as_slice(),
+            &[("socks-out".to_string(), 8080)],
+            "hook should receive tag and dest"
+        );
+        clear_dialer_proxy_hook();
     }
 }
 

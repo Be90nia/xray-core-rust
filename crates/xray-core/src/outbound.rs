@@ -194,6 +194,46 @@ pub fn register_outbounds(
         }
     }
 
+    // DialerProxy（bd enk）：注册全局 transport 层代理拨号钩子。
+    // 对应 Go dialer.go:270-279 `obm := outbound.ManagerFromContext(ctx)`——
+    // sockopt.dialerProxy 非空时 dial_system 经此重定向到 tag 对应 handler
+    // （redirect：pipe + h.Dispatch，dialer.go:111-136）。
+    // ponytail: 进程级单钩子（最后注册生效）；多 Instance 并存场景待需要时再改 per-instance。
+    let dialer_proxy_ohm: Arc<dyn xray_app_dispatcher::OutboundHandlerManager> =
+        Arc::new(OhmRef { inner: ohm });
+    xray_transport::system_dialer::set_dialer_proxy_hook(Arc::new(
+        move |tag: &str, dest: &Destination| {
+            use xray_app_dispatcher::OutboundHandlerManager;
+            let tag = tag.to_string();
+            let dest = dest.clone();
+            let ohm = Arc::clone(&dialer_proxy_ohm);
+            Box::pin(async move {
+                let Some(handler) = ohm.get_handler(&tag) else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "there is no outbound handler for dialerProxy",
+                    ));
+                };
+                tracing::debug!(tag = %tag, "redirecting request to dialerProxy {tag}");
+                // Go redirect（dialer.go:120-135）：两对 pipe，一端 dispatch 给
+                // chained handler，另一端包装为 Connection 返回。
+                // ponytail: 512KiB duplex 缓冲近似 Go 无界 pipe，超出走背压。
+                let (client, server) = tokio::io::duplex(512 * 1024);
+                let (server_r, server_w) = tokio::io::split(server);
+                let link = xray_transport::link::Link::new(
+                    xray_buf::io::new_reader(server_r),
+                    xray_buf::io::new_writer(server_w),
+                );
+                let fut = handler.dispatch(&dest, link);
+                tokio::spawn(async move {
+                    let _ = fut.await;
+                });
+                Ok(Box::new(xray_transport::connection::DuplexConnection::new(client))
+                    as Box<dyn xray_transport::connection::Connection>)
+            })
+        },
+    ));
+
     for (bridge, via_tag) in mux_bridges {
         use xray_app_dispatcher::OutboundHandlerManager;
         let underlying = match via_tag.as_deref().map(|t| ohm.get_handler(t)) {
@@ -1089,7 +1129,10 @@ fn parse_socks_outbound_config(
 fn parse_stream_settings(json: &Option<serde_json::Value>) -> Option<StreamSettings> {
     let s = StreamSettings::from_json(json.as_ref());
     // TCP + 无 security 等于没 streamSettings，返回 None 保持 raw TCP 路径。
-    if s.protocol == "tcp" && !s.is_tls() {
+    // 例外（bd enk）：配了 `sockopt` 不折叠——TCP+无 TLS 的 sockopt（如
+    // dialerProxy/mark）必须到达 dial_system（Go 中 SocketSettings 存在时
+    // sockopt 恒生效，dialer.go:270）。
+    if s.protocol == "tcp" && !s.is_tls() && s.sockopt_json.is_none() {
         None
     } else {
         Some(s)
@@ -2059,11 +2102,24 @@ mod tests {
     #[test]
     fn parse_stream_settings_ws_tls_returns_some() {
         let v: serde_json::Value = serde_json::from_str(
-            r#"{"network":"ws","security":"tls","wsSettings":{"path":"/ray"}}"#
-        ).unwrap();
+            r#"{"network":"ws","security":"tls","wsSettings":{"path":"/ray"}}"#,
+        )
+        .unwrap();
         let s = parse_stream_settings(&Some(v)).unwrap();
         assert_eq!(s.protocol, "ws");
         assert!(s.is_tls());
+    }
+
+    /// TCP+无 TLS 但有 sockopt → 不折叠为 None（bd enk：dialerProxy 等
+    /// sockopt 字段必须到达 dial_system）。
+    #[test]
+    fn parse_stream_settings_tcp_sockopt_keeps_some() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"sockopt": {"dialerProxy": "proxy-out"}}"#,
+        )
+        .unwrap();
+        let s = parse_stream_settings(&Some(v)).expect("sockopt must keep Some");
+        assert_eq!(s.socket_options().dialer_proxy, "proxy-out");
     }
 
     #[test]
@@ -2587,5 +2643,177 @@ mod tests {
                 .is_err(),
             "AsIs (no strategy) must not resolve domain via DNS service"
         );
+    }
+
+    // ===== DialerProxy（bd enk）=====
+
+    /// echo server：原样回显。返回端口。
+    async fn spawn_echo() -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if sock.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// 手工 socks5 服务器：no-auth 握手 + 记录 CONNECT 目标 + 双向桥接。
+    /// 记录是「经代理而非直连」的判别器。返回 (端口, 记录)。
+    async fn spawn_socks5_recorder() -> (
+        u16,
+        Arc<Mutex<Vec<(std::net::IpAddr, u16)>>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let recorded: Arc<Mutex<Vec<(std::net::IpAddr, u16)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let rec = Arc::clone(&recorded);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let rec = Arc::clone(&rec);
+                tokio::spawn(async move {
+                    // 生产版握手（与 SocksClient 交互已验证）→ 记录 CONNECT 目标 → 桥接。
+                    // 目标可能是 Domain（协议层不解析，由 socks server 端解析）——
+                    // 与真 socks server 行为一致：lookup_host 解析后拨号。
+                    let req = xray_proxy_socks::socks5_server_handshake(
+                        &mut sock,
+                        &xray_proxy_socks::ServerConfig::default(),
+                    )
+                    .await;
+                    let Ok(xray_proxy_socks::server::SocksRequest::TcpConnect(addr)) = req else {
+                        return;
+                    };
+                    let target_addr = match &addr.host {
+                        xray_proxy_socks::Host::Domain(d) => tokio::net::lookup_host(format!("{d}:{}", addr.port))
+                            .await
+                            .ok()
+                            .and_then(|mut i| i.next()),
+                        h => h.to_socket_addr(addr.port),
+                    };
+                    let Some(target_addr) = target_addr else {
+                        return;
+                    };
+                    rec.lock().expect("lock").push((target_addr.ip(), target_addr.port()));
+                    let Ok(mut target) = tokio::net::TcpStream::connect(target_addr).await
+                    else {
+                        return;
+                    };
+                    let _ = tokio::io::copy_bidirectional(&mut sock, &mut target).await;
+                });
+            }
+        });
+        (port, recorded)
+    }
+
+    /// e2e（bd enk）：transport 层代理——trojan-out 的底层 TCP 拨号经 socks-out
+    /// outbound 而非直连（Go dialer.go:270-279 redirect 语义）。
+    /// 两阶段：① `sockopt.dialerProxy` 直配 ② `proxySettings.transportLayer`
+    /// 配置注入（Go xray.go:316-327）。断言：socks5 服务器记录到
+    /// CONNECT = trojan 服务器地址（echo 端口），且 payload 经全链路回显。
+    /// 两阶段必须串行（全局钩子，最后注册生效）。
+    #[tokio::test]
+    async fn dialer_proxy_routes_transport_dial_via_socks_outbound() {
+        use xray_buf::multi::MultiBuffer;
+
+        for use_transport_layer in [false, true] {
+            let echo_port = spawn_echo().await;
+            let (socks_port, recorded) = spawn_socks5_recorder().await;
+
+            let (stream_json, proxy_json) = if use_transport_layer {
+                (
+                    String::new(),
+                    r#", "proxySettings": {"tag": "socks-out", "transportLayer": true }"#.to_string(),
+                )
+            } else {
+                (
+                    r#", "streamSettings": {"sockopt": {"dialerProxy": "socks-out"}}"#.to_string(),
+                    String::new(),
+                )
+            };
+            let json = format!(
+                r#"{{"outbounds": [
+                    {{"protocol": "trojan", "tag": "trojan-out",
+                      "settings": {{"servers": [{{"address": "127.0.0.1", "port": {echo_port}, "password": "test-pass-12345"}}]}}{stream_json}{proxy_json}}},
+                    {{"protocol": "socks", "tag": "socks-out",
+                      "settings": {{"servers": [{{"address": "127.0.0.1", "port": {socks_port}}}]}}}}
+                ]}}"#
+            );
+            let cfg = xray_conf::Config::from_json_str(&json).unwrap();
+            let built = cfg.build().unwrap();
+
+            let ohm = SimpleOhm::new();
+            register_outbounds(&built, &ohm, None, None).unwrap();
+            let handler = ohm.get_handler("trojan-out").expect("trojan-out registered");
+
+            let (up_r, mut up_w) =
+                xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+            let (mut dn_r, dn_w) =
+                xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+            let link = xray_transport::link::Link::new(
+                Box::new(up_r) as Box<dyn xray_buf::io::Reader>,
+                Box::new(dn_w) as Box<dyn xray_buf::io::Writer>,
+            );
+            // 最终目标（进入 trojan 头，socks 层不可见——socks 只见 trojan 服务器地址）
+            let dest = Destination::new(
+                Address::from_ipv4_bytes([127, 0, 0, 1]),
+                Port::new(80),
+                Network::TCP,
+            );
+            let fut = handler.dispatch(&dest, link);
+            tokio::spawn(async move {
+                let _ = fut.await;
+            });
+
+            let payload = b"dialer-proxy-e2e";
+            let mut mb = MultiBuffer::new();
+            mb.merge_bytes(payload);
+            up_w.write_multi_buffer(mb).await.unwrap();
+
+            // 读回显：echo 会把 trojan 头 + payload 原样反射回来
+            let mut acc: Vec<u8> = Vec::new();
+            let echoed = loop {
+                if acc.windows(payload.len()).any(|w| w == payload) {
+                    break true;
+                }
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    dn_r.read_multi_buffer(),
+                )
+                .await
+                {
+                    Ok(Ok(chunk)) => acc.extend_from_slice(&chunk.to_vec()),
+                    _ => break false,
+                }
+            };
+            assert!(
+                echoed,
+                "transportLayer={use_transport_layer}: payload should echo via proxy chain"
+            );
+
+            // 「经代理而非直连」判别：socks5 服务器必须见到 CONNECT → echo 端口
+            let rec = recorded.lock().expect("lock");
+            assert!(
+                rec.iter().any(|(_, p)| *p == echo_port),
+                "transportLayer={use_transport_layer}: socks outbound should see CONNECT to echo:{echo_port}, got {rec:?}"
+            );
+        }
     }
 }

@@ -219,6 +219,12 @@ impl Config {
                     });
                 }
             }
+            // transportLayer 代理门控（bd enk，Go infra/conf/xray.go:244-252 + 316-327）：
+            // `proxySettings.tag` 与 `sockopt.dialerProxy` 冲突检查；
+            // `transportLayer: true` → tag 注入 `sockopt.dialerProxy` 并清空 proxySettings
+            // （应用层链路降级为 transport 层代理，TLS 握手也经代理 outbound）。
+            let (stream_settings_json, proxy_settings_json) =
+                normalize_outbound_proxy(ob.stream_settings.as_ref(), ob.proxy_settings.as_ref())?;
             out.outbounds.push(BuiltOutbound {
                 entry: BuiltEntry {
                     kind: ob.protocol.clone(),
@@ -226,8 +232,8 @@ impl Config {
                 },
                 tag: ob.tag.clone(),
                 send_through: ob.send_through.clone(),
-                stream_settings_json: ob.stream_settings.clone(),
-                proxy_settings_json: ob.proxy_settings.clone(),
+                stream_settings_json,
+                proxy_settings_json,
                 mux_json: ob.mux.as_ref().map(|m| {
                     serde_json::to_value(m).unwrap_or(Value::Null)
                 }),
@@ -259,6 +265,53 @@ fn is_valid_target_strategy(s: &str) -> bool {
             | "forceipv4v6"
             | "forceipv6v4"
     )
+}
+
+/// proxySettings/streamSettings 的代理门控归一化（bd enk）。
+///
+/// 对应 Go `infra/conf/xray.go`：
+/// - `checkChainProxyConfig`（:244-252）：`proxySettings.tag` 与
+///   `sockopt.dialerProxy` 同时非空 → Build 硬报错（warning 级）。
+/// - transportLayer 注入（:316-327）：`transportLayer: true` 时把 tag 注入
+///   `sockopt.dialerProxy`（sockopt/streamSettings 不存在则创建），并清空
+///   proxySettings（应用层链路 → transport 层代理）。
+fn normalize_outbound_proxy(
+    stream_settings: Option<&Value>,
+    proxy_settings: Option<&Value>,
+) -> Result<(Option<Value>, Option<Value>)> {
+    let Some(ps) = proxy_settings else {
+        return Ok((stream_settings.cloned(), proxy_settings.cloned()));
+    };
+    let tag = ps.get("tag").and_then(|v| v.as_str()).unwrap_or("");
+    // 冲突检查（Go xray.go:248-250）。
+    let dialer_proxy = stream_settings
+        .and_then(|s| s.get("sockopt"))
+        .and_then(|s| s.get("dialerProxy"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !tag.is_empty() && !dialer_proxy.is_empty() {
+        return Err(ConfError::Build {
+            what: "outbound.proxySettings",
+            message: "proxySettings.tag is conflicted with sockopt.dialerProxy".to_string(),
+        });
+    }
+    // transportLayer 注入（Go xray.go:316-327）。JSON key 为 `transportLayer`
+    //（Go infra/conf/transport_internet.go:2251）。
+    if !ps.get("transportLayer").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Ok((stream_settings.cloned(), proxy_settings.cloned()));
+    }
+    let mut ss = match stream_settings.cloned() {
+        Some(v) if v.is_object() => v,
+        _ => serde_json::json!({}),
+    };
+    let obj = ss.as_object_mut().expect("guarded to object");
+    let sockopt = obj
+        .entry("sockopt")
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(so) = sockopt.as_object_mut() {
+        so.insert("dialerProxy".to_string(), Value::String(tag.to_string()));
+    }
+    Ok((Some(ss), None))
 }
 
 #[cfg(test)]
@@ -428,6 +481,92 @@ mod tests {
         let kinds: Vec<&str> = built.apps.iter().map(|a| a.kind.as_str()).collect();
         assert!(kinds.contains(&"fakeDns"));
         assert!(kinds.contains(&"burstObservatory"));
+    }
+
+    // ===== transportLayer 代理门控（bd enk）=====
+
+    /// transportLayer=true → tag 注入 sockopt.dialerProxy，proxySettings 清空。
+    #[test]
+    fn build_transport_layer_proxy_injects_dialer_proxy() {
+        let json = r#"{
+            "outbounds": [
+                {
+                    "protocol": "vless", "tag": "out",
+                    "proxySettings": { "tag": "proxy-out", "transportLayer": true },
+                    "streamSettings": { "network": "tcp", "security": "tls" }
+                }
+            ]
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let built = cfg.build().unwrap();
+        let ob = &built.outbounds[0];
+        assert!(ob.proxy_settings_json.is_none(), "proxySettings should be cleared");
+        let ss = ob.stream_settings_json.as_ref().unwrap();
+        assert_eq!(ss["sockopt"]["dialerProxy"], "proxy-out");
+        // 已有字段保留。
+        assert_eq!(ss["network"], "tcp");
+        assert_eq!(ss["security"], "tls");
+    }
+
+    /// transportLayer=true 且无 streamSettings → 创建 sockopt 容器。
+    #[test]
+    fn build_transport_layer_proxy_without_stream_settings() {
+        let json = r#"{
+            "outbounds": [
+                {
+                    "protocol": "vless", "tag": "out",
+                    "proxySettings": { "tag": "proxy-out", "transportLayer": true }
+                }
+            ]
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let built = cfg.build().unwrap();
+        let ob = &built.outbounds[0];
+        assert!(ob.proxy_settings_json.is_none());
+        assert_eq!(
+            ob.stream_settings_json.as_ref().unwrap()["sockopt"]["dialerProxy"],
+            "proxy-out"
+        );
+    }
+
+    /// transportLayer 缺省（false）→ 原样保留（应用层链路，Go xray.go:328）。
+    #[test]
+    fn build_plain_proxy_settings_passthrough() {
+        let json = r#"{
+            "outbounds": [
+                {
+                    "protocol": "vless", "tag": "out",
+                    "proxySettings": { "tag": "proxy-out" }
+                }
+            ]
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let built = cfg.build().unwrap();
+        assert_eq!(
+            built.outbounds[0].proxy_settings_json.as_ref().unwrap()["tag"],
+            "proxy-out"
+        );
+        assert!(built.outbounds[0].stream_settings_json.is_none());
+    }
+
+    /// proxySettings.tag 与 sockopt.dialerProxy 同时设置 → 冲突报错（Go xray.go:248-250）。
+    #[test]
+    fn build_tag_conflicts_with_dialer_proxy_errors() {
+        let json = r#"{
+            "outbounds": [
+                {
+                    "protocol": "vless", "tag": "out",
+                    "proxySettings": { "tag": "proxy-out" },
+                    "streamSettings": { "sockopt": { "dialerProxy": "other-out" } }
+                }
+            ]
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let err = cfg.build().unwrap_err();
+        assert!(
+            err.to_string().contains("conflicted"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -28,7 +28,7 @@ use socket2::Socket;
 /// - `tcp_nodelay = true`（Chrome 默认）
 /// - `tcp_keepalive_idle = 45s`
 /// - `tcp_keepalive_interval = 45s`
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SocketOptions {
     /// 是否启用 TCP_NODELAY（禁用 Nagle 算法）。默认 `true`。
     pub tcp_nodelay: bool,
@@ -49,6 +49,9 @@ pub struct SocketOptions {
     /// 是否限制 socket 仅使用 IPv6（不允许 IPv4-mapped 地址）。默认 `false`。
     /// 对应 Go `sockopt_ipv6_only` / `IPV6_V6ONLY`。socket2 跨平台 `set_only_v6()`。
     pub ipv6_only: bool,
+    /// transport 层代理：经指定 tag 的 outbound handler 拨号而非直连。
+    /// 对应 Go `SocketConfig.DialerProxy`（config.pb.go:735）。空串 = 直连。
+    pub dialer_proxy: String,
 }
 
 impl Default for SocketOptions {
@@ -62,6 +65,7 @@ impl Default for SocketOptions {
             tcp_fast_open: false,
             bind_if_index: 0,
             ipv6_only: false,
+            dialer_proxy: String::new(),
         }
     }
 }
@@ -201,9 +205,9 @@ mod tests {
     }
 
     #[test]
-    fn socket_options_is_copy_clone() {
+    fn socket_options_is_clone() {
         let opts = SocketOptions::default();
-        let cloned = opts;
+        let cloned = opts.clone();
         assert_eq!(opts, cloned);
     }
 }

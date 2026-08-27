@@ -362,7 +362,7 @@ impl OutboundHandler for OutboundHandlerEntry {
         let proxy = self.proxy.clone();
         let dialer: Arc<dyn OutboundDialer> = Arc::new(HandlerDialer {
             stream_settings: self.stream_settings.clone(),
-            socket_options: self.socket_options,
+            socket_options: self.socket_options.clone(),
             proxy_chain_tag: self.proxy_chain_tag.clone(),
             outbound_manager: self.outbound_manager.clone(),
         });
@@ -402,7 +402,7 @@ impl OutboundHandler for OutboundHandlerEntry {
     }
     fn dial(&self, dest: &Destination) -> PinFuture<io::Result<Box<dyn Connection>>> {
         let settings = self.stream_settings.clone();
-        let sockopt = self.socket_options;
+        let sockopt = self.socket_options.clone();
         let proxy_tag = self.proxy_chain_tag.clone();
         let outbound_manager = self.outbound_manager.clone();
         let dest = dest.clone();
