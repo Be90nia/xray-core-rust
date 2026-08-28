@@ -2431,6 +2431,31 @@ mod tests {
     use std::net::Ipv4Addr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// bd b8i 对称面：不支持平台（Windows/macOS 等）tun inbound →
+    /// `spawn_one_inbound` 返回 Unsupported 硬错误（对齐 Go 不支持平台
+    /// NewTun 失败 → inbound 创建失败的 fail-fast 语义）。
+    /// 支持平台分支见 outbound.rs `register_tun_outbound`（Linux 侧对称）。
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+    #[tokio::test]
+    async fn tun_inbound_rejected_on_unsupported_platform() {
+        let ib = BuiltInbound {
+            entry: xray_conf::BuiltEntry {
+                kind: "tun".to_string(),
+                data: b"{}".to_vec(),
+            },
+            tag: "tun-in".to_string(),
+            port: None,
+            listen: None,
+            stream_settings_json: None,
+            sniffing_json: None,
+        };
+        let err = spawn_one_inbound(&ib, Arc::new(SimpleOhm::new()), None, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "got: {err}");
+    }
+
+
     /// ect：`hysteriaSettings.masquerade` JSON → proxy HysteriaConfig.masq
     /// （Go infra/conf transport_internet.go:498-549 展开路径）。
     #[test]

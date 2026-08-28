@@ -2304,6 +2304,24 @@ mod tests {
         assert!(ohm.get_handler("tun-out").is_some(), "tun should be registered");
     }
 
+    /// bd b8i 对称面：不支持平台（Windows/macOS 等）tun outbound 构建 →
+    /// `BuildError::Unsupported` → register_outbounds warn+跳过（不硬错，
+    /// handler 不注册；kind 本身仍全平台注册，见 register.rs 测试）。
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+    #[test]
+    fn tun_outbound_skipped_on_unsupported_platform() {
+        let mut built = BuiltConfig::default();
+        built.outbounds.push(make_outbound("tun", "tun-out", "{}"));
+
+        let ohm = SimpleOhm::new();
+        register_outbounds(&built, &ohm, None, None).unwrap();
+
+        assert!(
+            ohm.get_handler("tun-out").is_none(),
+            "tun outbound must be skipped (warn) on unsupported platforms"
+        );
+    }
+
     #[test]
     fn register_vless_invalid_uuid_skipped() {
         let settings = r#"{

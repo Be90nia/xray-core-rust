@@ -24,9 +24,11 @@ use xray_features::{Feature, FeatureError, FeatureFactory, registry};
 ///                dokodemo, blackhole, dns, hysteria2, tuic, wireguard, anytls, tun*, loopback
 ///
 /// Proxy outbound: freedom, blackhole, dns, socks, http, shadowsocks,
-///                 vmess, vless, trojan, hysteria2, tuic, wireguard, loopback
+///                 vmess, vless, trojan, hysteria2, tuic, wireguard, loopback, tun*
 ///
-/// *tun 仅在 Linux/Android/FreeBSD 上注册。
+/// *tun 全平台注册（bd b8i，对齐 Go 无条件 init 注册）；支持平台
+/// （Linux/Android/FreeBSD）真实构建在 inbound/outbound 构建层，
+/// 不支持平台 factory/构建层明确拒绝。
 pub fn register_all_features() {
     // --- App kinds ---
     // Real factories (construct actual Feature implementations)
@@ -48,18 +50,16 @@ pub fn register_all_features() {
     for &kind in PROXY_INBOUND_KINDS {
         let _ = registry::register_feature(kind, stub_factory(kind));
     }
-    // TUN inbound
-    for &kind in TUN_INBOUND_KIND {
-        let _ = registry::register_feature(kind, stub_factory(kind));
-    }
 
     // --- Proxy outbound kinds ---
     for &kind in PROXY_OUTBOUND_KINDS {
         let _ = registry::register_feature(kind, stub_factory(kind));
     }
-    // TUN outbound
-    for &kind in TUN_OUTBOUND_KIND {
-        let _ = registry::register_feature(kind, stub_factory(kind));
+
+    // TUN（入站/出站同 kind "tun"）——全平台注册，平台差异在
+    // factory/构建层拒绝（bd b8i，对齐 Go handler.go:186 无条件注册）。
+    for &kind in TUN_KINDS {
+        let _ = registry::register_feature(kind, tun_factory(kind));
     }
 }
 
@@ -126,7 +126,7 @@ const APP_KINDS: &[&str] = &[
 ];
 
 /// 代理入站 kind 列表（与 `xray-conf` 解析的 protocol 值一致）。
-/// TUN 单独注册（平台门控）。
+/// TUN 单独注册（见 [`TUN_KINDS`]，全平台注册 + 平台感知 factory）。
 const PROXY_INBOUND_KINDS: &[&str] = &[
     "socks",
     "http",
@@ -143,15 +143,21 @@ const PROXY_INBOUND_KINDS: &[&str] = &[
     "loopback",
 ];
 
-/// TUN 入站 kind——仅 Linux/Android/FreeBSD 可用。
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
-const TUN_INBOUND_KIND: &[&str] = &["tun"];
+/// TUN 入站/出站 kind——**全平台注册**（bd b8i）。
+///
+/// 对齐 Go `proxy/tun/handler.go:186-194` init() 无条件 `RegisterConfig`：
+/// 注册不挑平台，平台差异在设备创建层拒绝（Go 设备层支持五平台——
+/// tun_windows.go/tun_darwin.go 均存在；tun_default.go:18-20 对五平台外
+/// 在 NewTun 报 "Tun is not supported on your platform"）。
+///
+/// Rust 设备适配目前仅 Linux/Android/FreeBSD（Windows/macOS 留后，
+/// bd b8i non-goal），不支持平台由 [`tun_factory`] 返回明确错误 +
+/// 构建层拒绝（`spawn_one_inbound` 硬错 / `try_build_handler`
+/// Unsupported→warn 跳过），而非不注册。
+const TUN_KINDS: &[&str] = &["tun"];
 
-/// TUN 入站 kind——非 Linux/Android/FreeBSD 不注册。
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
-const TUN_INBOUND_KIND: &[&str] = &[];
-
-/// 代理出站 kind 列表。TUN 单独注册（平台门控）。
+/// 代理出站 kind 列表（与 `xray-conf` 解析的 protocol 值一致）。
+/// TUN 单独注册（见 [`TUN_KINDS`]，全平台注册 + 平台感知 factory）。
 const PROXY_OUTBOUND_KINDS: &[&str] = &[
     "freedom",
     "blackhole",
@@ -167,13 +173,29 @@ const PROXY_OUTBOUND_KINDS: &[&str] = &[
     "loopback",
 ];
 
-/// TUN 出站 kind——仅 Linux/Android/FreeBSD 可用。
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
-const TUN_OUTBOUND_KIND: &[&str] = &["tun"];
-
-/// TUN 出站 kind——非 Linux/Android/FreeBSD 不注册。
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
-const TUN_OUTBOUND_KIND: &[&str] = &[];
+/// TUN 平台感知 factory（bd b8i）。
+///
+/// - Linux/Android/FreeBSD：stub factory（"not yet implemented"）——真实
+///   inbound/outbound 构建不经 registry（`spawn_one_inbound` /
+///   `try_build_handler` 直连 `xray-proxy-tun`）。
+/// - 其他平台（Windows/macOS 等）：明确 platform 错误。registry 消费方
+///   （instance.rs）对 StartFailed 是 warn+跳过，非致命。
+fn tun_factory(kind: &'static str) -> FeatureFactory {
+    if cfg!(any(target_os = "linux", target_os = "android", target_os = "freebsd")) {
+        stub_factory(kind)
+    } else {
+        Arc::new(move |_data: &[u8]| {
+            Err(FeatureError::StartFailed {
+                name: kind,
+                message: format!(
+                    "tun: not supported on {} (Rust port supports Linux/Android/FreeBSD; \
+                     Windows/macOS device adaptation pending)",
+                    std::env::consts::OS
+                ),
+            })
+        })
+    }
+}
 
 /// 创建 stub factory：返回 `StartFailed` 错误提示 "not yet implemented"。
 fn stub_factory(kind: &'static str) -> FeatureFactory {
@@ -711,9 +733,8 @@ mod tests {
         for &kind in APP_KINDS
             .iter()
             .chain(PROXY_INBOUND_KINDS)
-            .chain(TUN_INBOUND_KIND)
+            .chain(TUN_KINDS)
             .chain(PROXY_OUTBOUND_KINDS)
-            .chain(TUN_OUTBOUND_KIND)
         {
             // stub factory 应能被找到（不再返回 NotFound）
             let result = registry::create_feature(kind, b"{}");
@@ -724,6 +745,29 @@ mod tests {
             // stub factory 返回 StartFailed
             if let Err(FeatureError::StartFailed { name, .. }) = result {
                 assert_eq!(name, kind);
+            }
+        }
+    }
+
+    /// bd issue Xray-core-rust-b8i：TUN kind **全平台注册**（对齐 Go
+    /// `proxy/tun/handler.go:186-194` init() 无条件 `RegisterConfig`——
+    /// 注册不挑平台，平台差异在设备创建层拒绝，tun_default.go:18-20）。
+    /// 修复前 Windows/macOS 上 `create_feature("tun")` 返回 NotFound。
+    #[test]
+    fn tun_kind_registered_on_all_platforms() {
+        register_all_features();
+
+        let result = registry::create_feature("tun", b"{}");
+        assert!(
+            !matches!(result, Err(FeatureError::NotFound { .. })),
+            "tun must be registered on all platforms (Go registers unconditionally)"
+        );
+        if let Err(FeatureError::StartFailed { name, message }) = result {
+            assert_eq!(name, "tun");
+            if cfg!(any(target_os = "linux", target_os = "android", target_os = "freebsd")) {
+                assert!(message.contains("not yet implemented"), "got: {message}");
+            } else {
+                assert!(message.contains("not supported"), "got: {message}");
             }
         }
     }
@@ -983,9 +1027,8 @@ mod tests {
         let mut all: Vec<&str> = Vec::new();
         all.extend(APP_KINDS);
         all.extend(PROXY_INBOUND_KINDS);
-        all.extend(TUN_INBOUND_KIND);
+        all.extend(TUN_KINDS);
         all.extend(PROXY_OUTBOUND_KINDS);
-        all.extend(TUN_OUTBOUND_KIND);
         let mut sorted = all.clone();
         sorted.sort();
         sorted.dedup();
