@@ -6424,16 +6424,20 @@ dependencies = [
  "bytes",
  "hex",
  "parking_lot",
+ "rand 0.9.4",
+ "serde_json",
  "smoltcp",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "xray-app-dispatcher",
+ "xray-app-dns",
  "xray-buf",
  "xray-common",
  "xray-features",
  "xray-proto",
  "xray-transport",
+ "xray-xudp",
 ]
 
 [[package]]

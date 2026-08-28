@@ -13,6 +13,7 @@
 //! `dial` 建立 socket 后立即返回——上层桥接（Link ↔ smoltcp socket）留待后续切片。
 
 use async_trait::async_trait;
+use std::net::SocketAddr;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -42,11 +43,15 @@ pub struct WireguardOutboundHandler {
 impl WireguardOutboundHandler {
     /// 从 DeviceConfig 构造出站 Handler 并启动 driver。
     ///
-    /// - 解析 peer endpoint
+    /// - 解析 peer endpoint（域名经 `dns` 解析，Go `client.go:298-329`）
     /// - 绑定 UDP socket（本地随机端口）
     /// - 创建 smoltcp 网栈（从 config.endpoint 派生 interface 地址）
-    /// - spawn driver task
-    pub async fn new(tag: impl Into<String>, config: &DeviceConfig) -> Result<Self> {
+    /// - spawn driver task（`reserved` 字段写入 WG 包头，Warp 用）
+    pub async fn new(
+        tag: impl Into<String>,
+        config: &DeviceConfig,
+        dns: Option<&Arc<xray_app_dns::DnsService>>,
+    ) -> Result<Self> {
         let tag = tag.into();
         if config.peers.is_empty() {
             return Err(WgError::InvalidConfig("wireguard outbound requires at least one peer".into()));
@@ -56,8 +61,8 @@ impl WireguardOutboundHandler {
         // peer session
         let peer: SharedPeer = shared_peer(config, peer_cfg, 0)?;
 
-        // 远端 endpoint（必须是 IP:port，DNS 解析由上层负责）
-        let remote_addr = crate::peer::parse_endpoint_addr(&peer_cfg.endpoint)?;
+        // 远端 endpoint（IP:port；域名经 DNS 解析——Go client.go:298-329）
+        let remote_addr = resolve_endpoint_addr(&peer_cfg.endpoint, config, dns).await?;
 
         // 绑定本地 UDP（与远端同族）
         let bind_addr = if remote_addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
@@ -68,8 +73,9 @@ impl WireguardOutboundHandler {
         let mtu = config.effective_mtu() as usize;
         let netstack = Arc::new(AsyncMutex::new(WgNetStack::new(&local_cidrs, mtu)));
 
-        // driver
+        // driver（reserved → WG 包头，Go bind.go netBindClient.reserved）
         let driver = Arc::new(WgDriver::new(Arc::clone(&peer), sock, Arc::clone(&netstack)));
+        driver.set_reserved(config.reserved.clone());
         driver.set_remote(remote_addr);
         Arc::clone(&driver).spawn().await?;
 
@@ -81,6 +87,43 @@ impl WireguardOutboundHandler {
     pub fn netstack(&self) -> &Arc<AsyncMutex<WgNetStack>> {
         &self.netstack
     }
+}
+
+/// 解析 peer endpoint（`host:port`）。
+///
+/// IP 直连；域名经 `dns` + WireGuard `domainStrategy` 解析（Go `client.go:298-329`
+/// 的 createIPCRequest endpoint 分支，dice.Roll 随机选 IP）。
+async fn resolve_endpoint_addr(
+    endpoint: &str,
+    config: &DeviceConfig,
+    dns: Option<&Arc<xray_app_dns::DnsService>>,
+) -> Result<SocketAddr> {
+    if let Ok(addr) = crate::peer::parse_endpoint_addr(endpoint) {
+        return Ok(addr);
+    }
+    // host:port 拆分（Go net.SplitHostPort）
+    let (host, port) = endpoint
+        .rsplit_once(':')
+        .ok_or_else(|| WgError::InvalidEndpoint(format!("peer endpoint not host:port: {endpoint}")))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| WgError::InvalidEndpoint(format!("peer endpoint bad port: {endpoint}")))?;
+    let Some(dns) = dns else {
+        return Err(WgError::InvalidEndpoint(format!(
+            "peer endpoint is domain but no DNS service: {endpoint}"
+        )));
+    };
+    let (has_v4, has_v6) = crate::dispatcher::endpoint_families(config);
+    let ip = crate::dispatcher::resolve_dest_domain(
+        host,
+        config.domain_strategy,
+        has_v4,
+        has_v6,
+        dns,
+    )
+    .await
+    .map_err(|e| WgError::InvalidEndpoint(format!("peer endpoint DNS resolve: {e}")))?;
+    Ok(SocketAddr::new(ip, port))
 }
 
 #[async_trait]
@@ -231,7 +274,7 @@ mod tests {
             secret_key: sec,
             ..Default::default()
         };
-        let result = WireguardOutboundHandler::new("test", &cfg).await;
+        let result = WireguardOutboundHandler::new("test", &cfg, None).await;
         assert!(result.is_err(), "should reject empty peers");
     }
 
@@ -247,7 +290,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let result = WireguardOutboundHandler::new("test", &cfg).await;
+        let result = WireguardOutboundHandler::new("test", &cfg, None).await;
         assert!(result.is_err(), "should reject invalid endpoint");
     }
 }

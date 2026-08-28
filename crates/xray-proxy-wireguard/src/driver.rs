@@ -33,6 +33,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::interval;
 
+use crate::dispatcher::{apply_reserved, clear_reserved};
 use crate::error::{Result, WgError};
 use crate::netstack::WgNetStack;
 use crate::peer::SharedPeer;
@@ -62,6 +63,9 @@ pub struct WgDriver {
     addr_route: Mutex<HashMap<SocketAddr, usize>>,
     /// 每 peer 的 allowed_ips CIDR（出站 IP 包路由）。
     allowed_cidrs: Vec<Vec<smoltcp::wire::IpCidr>>,
+    /// WG 包头 reserved 字段（Go `bind.go netBindClient.reserved`，Warp 用）。
+    /// 长度 3 时发送路径写入包头 [1..4]。
+    reserved: Mutex<Vec<u8>>,
 }
 
 impl WgDriver {
@@ -91,7 +95,19 @@ impl WgDriver {
             netstack,
             remote: Mutex::new(None),
             addr_route: Mutex::new(HashMap::new()),
+            reserved: Mutex::new(Vec::new()),
         }
+    }
+
+    /// 设置 WG 包头 reserved 字段（3 字节，Cloudflare Warp 客户端标记）。
+    pub fn set_reserved(&self, reserved: Vec<u8>) {
+        *self.reserved.lock() = reserved;
+    }
+
+    /// 发送 WG 数据报（reserved 写包头，Go `bind.go:184-186` Send 语义）。
+    async fn send_wg(&self, wg: &mut [u8], target: SocketAddr) {
+        apply_reserved(wg, &self.reserved.lock().clone());
+        let _ = self.sock.send_to(wg, target).await;
     }
 
     /// 设置远端 endpoint（client 模式启动时）。
@@ -205,7 +221,9 @@ impl WgDriver {
                 result = self.sock.recv_from(&mut recv_buf) => {
                     match result {
                         Ok((n, src)) => {
-                            if n == 0 { continue; }
+                        if n == 0 { continue; }
+                            // Warp 下行可能带非零 reserved——清零后再解封装（Go bind.go:145-149）
+                            clear_reserved(&mut recv_buf[..n]);
                             let (peer_idx, outputs) = match self.decapsulate_incoming(&recv_buf[..n], src) {
                                 Some(v) => v,
                                 None => continue,
@@ -215,10 +233,10 @@ impl WgDriver {
                             for out in outputs {
                                 match out {
                                     Output::Ip(ip) => stack.ingest_rx(ip),
-                                    Output::Network(wg) => {
+                                    Output::Network(mut wg) => {
                                         let target = if multi { peer_endpoint } else { *self.remote.lock() };
                                         if let Some(t) = target {
-                                            let _ = self.sock.send_to(&wg, t).await;
+                                            self.send_wg(&mut wg, t).await;
                                         }
                                     }
                                 }
@@ -238,8 +256,8 @@ impl WgDriver {
                             let ep = if multi { peer.endpoint() } else { *self.remote.lock() };
                             if let Some(ep) = ep {
                                 for out in outs {
-                                    if let Output::Network(wg) = out {
-                                        let _ = self.sock.send_to(&wg, ep).await;
+                                    if let Output::Network(mut wg) = out {
+                                        self.send_wg(&mut wg, ep).await;
                                     }
                                 }
                             }
@@ -254,8 +272,8 @@ impl WgDriver {
                                     let remote = *self.remote.lock();
                                     if let Some(r) = remote {
                                         for out in outs {
-                                            if let Output::Network(wg) = out {
-                                                let _ = self.sock.send_to(&wg, r).await;
+                                            if let Output::Network(mut wg) = out {
+                                                self.send_wg(&mut wg, r).await;
                                             }
                                         }
                                     }
@@ -278,8 +296,8 @@ impl WgDriver {
                             Ok(outs) => {
                                 if let Some(ep) = endpoint {
                                     for out in outs {
-                                        if let Output::Network(wg) = out {
-                                            let _ = self.sock.send_to(&wg, ep).await;
+                                        if let Output::Network(mut wg) = out {
+                                            self.send_wg(&mut wg, ep).await;
                                         }
                                     }
                                 }

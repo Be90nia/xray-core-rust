@@ -647,7 +647,7 @@ fn try_build_handler(
         }
         "wireguard" => {
             let config = parse_wireguard_config(&ob.entry.data)?;
-            let dial_fn = xray_proxy_wireguard::make_wireguard_dial_fn(config);
+            let dial_fn = xray_proxy_wireguard::make_wireguard_dial_fn(config, dns.cloned());
             wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
         }
         "dns" => {

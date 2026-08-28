@@ -4,14 +4,15 @@
 //!
 //! ## 桥接架构
 //!
-//! smoltcp TCP socket 不直接 impl `AsyncRead/AsyncWrite`，需要中继：
+//! smoltcp TCP/UDP socket 不直接 impl `AsyncRead/AsyncWrite`，需要中继：
 //!
 //! ```text
-//! [上层 Link] ←→ [WireguardConnection (duplex half)] ←→ [中继 task] ←→ [smoltcp TCP socket]
+//! [上层 Link] ←→ [WireguardConnection (duplex half)] ←→ [中继 task] ←→ [smoltcp TCP/UDP socket]
 //! ```
 //!
 //! 中继 task 持有 duplex 另一端 + `Arc<AsyncMutex<WgNetStack>>` + socket handle，
 //! 用 `tokio::select!` 同时等待 duplex 可读 + 定时器，驱动 smoltcp socket IO。
+//! UDP 走 XUDP 帧约定（对应 Go `client.go` 的 `udpConnClient`——逐帧 UDP target）。
 //!
 //! # ponytail: 轮询式桥接，延迟 ~5ms 量级。waker 驱动优化留待吞吐量瓶颈时。
 
@@ -25,16 +26,19 @@ use std::time::Duration;
 use smoltcp::socket::tcp;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex as AsyncMutex, OnceCell};
+use xray_xudp::packet::{PacketReader, PacketWriter};
 
 use xray_app_dispatcher::default::DialFn;
+use xray_app_dns::DnsService;
 use xray_common::net::address::Address;
 use xray_common::net::destination::Destination;
 use xray_common::net::network::Network;
 use xray_transport::connection::Connection;
 
-use crate::config::DeviceConfig;
+use crate::config::{DeviceConfig, DomainStrategy};
 use crate::netstack::WgNetStack;
 use crate::outbound::WireguardOutboundHandler;
+
 
 /// duplex 缓冲大小。
 const DUPLEX_BUF: usize = 64 * 1024;
@@ -197,99 +201,406 @@ impl TcpRelay {
     }
 }
 
+/// smoltcp UDP socket ↔ tokio duplex 中继 task（XUDP 帧约定）。
+///
+/// 对应 Go `client.go:225-244` 的 UDP 分支：`DialUDPAddrPort` + `udpConnClient`。
+/// - 上行：duplex 字节流解 XUDP 帧 → 逐帧 UDP target `send_slice`
+/// - 下行：smoltcp `recv_slice`（源地址）→ XUDP 帧（target=源地址）写回 duplex
+struct UdpRelay {
+    from_client: tokio::io::DuplexStream,
+    to_client: tokio::io::DuplexStream,
+    netstack: Arc<AsyncMutex<WgNetStack>>,
+    handle: smoltcp::iface::SocketHandle,
+    /// dial 目标（XUDP 帧缺 target 时的默认值；帧 target 优先，Go `b.UDP` 语义）。
+    dest: Destination,
+    /// 半帧累积缓冲（一次 read 可能不含完整 XUDP 帧）。
+    acc: Vec<u8>,
+}
+
+impl UdpRelay {
+    async fn run(mut self) {
+        let poll_interval = Duration::from_millis(RELAY_POLL_MS);
+        let mut timer = tokio::time::interval(poll_interval);
+        timer.tick().await;
+
+        loop {
+            let mut user_buf = vec![0u8; 8192];
+            tokio::select! {
+                result = tokio::io::AsyncReadExt::read(&mut self.from_client, &mut user_buf) => {
+                    match result {
+                        Ok(0) | Err(_) => {
+                            let mut stack = self.netstack.lock().await;
+                            stack.remove_socket(self.handle);
+                            return;
+                        }
+                        Ok(n) => {
+                            user_buf.truncate(n);
+                            pump_client_to_udp(
+                                &self.netstack,
+                                self.handle,
+                                &user_buf,
+                                &self.dest,
+                                &mut self.acc,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                _ = timer.tick() => {}
+            }
+
+            if let Some(frame) = pump_udp_to_client(&self.netstack, self.handle, &self.dest).await {
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut self.to_client, &frame).await;
+            }
+        }
+    }
+}
+
+/// 上行泵：duplex 字节 → XUDP 帧 → smoltcp UDP socket 发送。
+///
+/// `acc` 跨调用保持未消费的半帧字节。坏帧丢弃已累积字节重同步。
+pub(crate) async fn pump_client_to_udp(
+    netstack: &Arc<AsyncMutex<WgNetStack>>,
+    handle: smoltcp::iface::SocketHandle,
+    bytes: &[u8],
+    default_dest: &Destination,
+    acc: &mut Vec<u8>,
+) {
+    use std::io::Read as _;
+    if bytes.is_empty() {
+        return;
+    }
+    acc.extend_from_slice(bytes);
+
+    loop {
+        let frame = {
+            let mut cursor = std::io::Cursor::new(&acc[..]);
+            let mut reader = PacketReader::new(&mut cursor);
+            match reader.read_packet() {
+                Ok(Some(pkt)) => Some((cursor.position() as usize, pkt)),
+                Ok(None) => None, // 半帧，等更多字节
+                Err(_) => {
+                    // 坏帧：丢弃全部已累积字节重同步
+                    acc.clear();
+                    None
+                }
+            }
+        };
+        let Some((consumed, pkt)) = frame else { break };
+        let (payload, target) = pkt.into_parts();
+        let dest = target.as_ref().unwrap_or(default_dest);
+        if let Some(endpoint) = destination_to_endpoint(dest) {
+            let mut stack = netstack.lock().await;
+            stack.poll(smoltcp::time::Instant::now());
+            stack.with_udp_socket(handle, |sock| {
+                let _ = sock.send_slice(&payload, endpoint);
+            });
+            stack.poll(smoltcp::time::Instant::now());
+        }
+        acc.drain(..consumed);
+    }
+}
+
+/// 下行泵：smoltcp UDP socket 接收 → XUDP 帧字节。
+///
+/// 返回 `None` 表示无数据。帧 target = 回包源地址（Go `udpConnClient.ReadMultiBuffer`
+/// 的 `b.UDP = addr` 语义）。
+pub(crate) async fn pump_udp_to_client(
+    netstack: &Arc<AsyncMutex<WgNetStack>>,
+    handle: smoltcp::iface::SocketHandle,
+    default_dest: &Destination,
+) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let received = {
+            let mut stack = netstack.lock().await;
+            stack.poll(smoltcp::time::Instant::now());
+            let mut buf = vec![0u8; 65535];
+            stack.with_udp_socket(handle, |sock| match sock.recv_slice(&mut buf) {
+                Ok((n, meta)) => {
+                    buf.truncate(n);
+                    Some((buf, meta.endpoint))
+                }
+                Err(_) => None,
+            })
+        };
+        let Some((payload, remote)) = received else { break };
+        let target = endpoint_to_destination(&remote).unwrap_or_else(|| default_dest.clone());
+        // ponytail: 每帧独立 writer（New 帧）——读端 New/Keep 均接受，语义等价
+        let mut writer = PacketWriter::new(Vec::new(), default_dest.clone(), [0u8; 8]);
+        let _ = writer.write_packet_with_udp_target(&payload, &target);
+        out.extend_from_slice(&writer.into_inner());
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// 域名目标解析（Go `client.go:167-187`）。
+///
+/// 用 WireGuard 自身的 `domainStrategy` + interface 地址族约束（`hasIPv4/6`）
+/// 解析；空结果且有 fallback 策略时二次解析；随机选一个 IP（`dice.Roll`）。
+pub(crate) async fn resolve_dest_domain(
+    domain: &str,
+    strategy: DomainStrategy,
+    has_v4: bool,
+    has_v6: bool,
+    dns: &Arc<DnsService>,
+) -> Result<std::net::IpAddr, String> {
+    use rand::Rng;
+    use xray_app_dns::config::IpOption;
+
+    let prefer = IpOption {
+        ipv4_enable: has_v4 && strategy.prefer_ip4(),
+        ipv6_enable: has_v6 && strategy.prefer_ip6(),
+        fake_enable: false,
+    };
+    let mut result = dns.lookup_ip(domain, prefer).await;
+    let need_fallback = match &result {
+        Ok((ips, _)) => ips.is_empty(),
+        Err(_) => true,
+    };
+    if need_fallback && (strategy.fallback_ip4() || strategy.fallback_ip6()) {
+        let fallback = IpOption {
+            ipv4_enable: has_v4 && strategy.fallback_ip4(),
+            ipv6_enable: has_v6 && strategy.fallback_ip6(),
+            fake_enable: false,
+        };
+        result = dns.lookup_ip(domain, fallback).await;
+    }
+    match result {
+        Ok((ips, _)) if !ips.is_empty() => {
+            let idx = rand::thread_rng().gen_range(0..ips.len());
+            Ok(ips[idx])
+        }
+        Ok(_) => Err("wireguard: empty DNS response".to_string()),
+        Err(e) => Err(format!("wireguard: DNS lookup failed: {e}")),
+    }
+}
+
+/// Destination（仅 IP）→ smoltcp IpEndpoint。
+fn destination_to_endpoint(dest: &Destination) -> Option<smoltcp::wire::IpEndpoint> {
+    let addr = match dest.address() {
+        Address::IPv4(v4) => smoltcp::wire::IpAddress::Ipv4(v4.octets().into()),
+        Address::IPv6(v6) => smoltcp::wire::IpAddress::Ipv6(v6.octets().into()),
+        Address::Domain(_) => return None,
+    };
+    Some(smoltcp::wire::IpEndpoint::new(addr, dest.port().value()))
+}
+
+/// smoltcp IpEndpoint → Destination（UDP）。
+fn endpoint_to_destination(ep: &smoltcp::wire::IpEndpoint) -> Option<Destination> {
+    let addr = match ep.addr {
+        smoltcp::wire::IpAddress::Ipv4(v4) => Address::from_ipv4_bytes(v4.octets()),
+        smoltcp::wire::IpAddress::Ipv6(v6) => Address::from_ipv6_bytes(v6.octets()),
+    };
+    Some(Destination::new(
+        addr,
+        xray_common::net::port::Port::new(ep.port),
+        Network::UDP,
+    ))
+}
+
+/// WireGuard 包头 reserved 字段——发送侧写入（Go `bind.go:184-186`）。
+///
+/// Cloudflare Warp 用这 3 字节区分客户端；`reserved` 长度非 3 时不动。
+pub(crate) fn apply_reserved(pkt: &mut [u8], reserved: &[u8]) {
+    if pkt.len() > 3 && reserved.len() == 3 {
+        pkt[1..4].copy_from_slice(reserved);
+    }
+}
+
+/// WireGuard 包头 reserved 字段——接收侧清零（Go `bind.go:145-149`）。
+pub(crate) fn clear_reserved(pkt: &mut [u8]) {
+    if pkt.len() > 3 {
+        pkt[1] = 0;
+        pkt[2] = 0;
+        pkt[3] = 0;
+    }
+}
+
 /// 构造 DialBridge 用的 DialFn 闭包（lazy init 模式）。
 ///
-/// 闭包捕获 `DeviceConfig`。首次 dial 时通过 `OnceCell` lazy init
+/// 闭包捕获 `DeviceConfig` + 可选 DNS 服务。首次 dial 时通过 `OnceCell` lazy init
 /// `WireguardOutboundHandler`（含 driver task + smoltcp netstack）。
+///
+/// - 域名目标：经 WireGuard 自身 `domainStrategy` 解析（Go `client.go:167-187`，
+///   `dns` 缺失时域名断链报错）
+/// - UDP 目标：smoltcp UDP socket + XUDP 帧中继（Go `client.go:225-244`）
 ///
 /// # Panics
 /// 不会 panic；任何错误以 `Err(String)` 返回。
-pub fn make_wireguard_dial_fn(config: DeviceConfig) -> DialFn {
+pub fn make_wireguard_dial_fn(
+    config: DeviceConfig,
+    dns: Option<Arc<DnsService>>,
+) -> DialFn {
     let handler: Arc<OnceCell<WireguardOutboundHandler>> = Arc::new(OnceCell::new());
     let config_clone = config.clone();
+    let dns_clone = dns.clone();
+    // interface 地址族（Go parseEndpoints 的 hasIPv4/hasIPv6）——约束 DNS 解析族
+    let (has_v4, has_v6) = endpoint_families(&config);
 
     Arc::new(move |dest: &Destination| {
         let dest = dest.clone();
         let config = config_clone.clone();
+        let dns = dns_clone.clone();
         let handler_cell = Arc::clone(&handler);
 
         Box::pin(async move {
             // lazy init WireguardOutboundHandler（含 driver task）
             let handler = handler_cell
                 .get_or_try_init(|| async {
-                    WireguardOutboundHandler::new("wireguard", &config).await
+                    WireguardOutboundHandler::new("wireguard", &config, dns.as_ref()).await
                 })
                 .await
                 .map_err(|e| format!("wireguard handler init: {e}"))?;
 
-            // 验证目标地址类型（WireGuard 仅支持 IP，不支持 Domain）
-            match dest.address() {
-                Address::IPv4(_) | Address::IPv6(_) => {}
-                Address::Domain(_) => {
-                    return Err(
-                        "wireguard outbound does not support Domain (DNS resolve by upper layer)"
-                            .to_string(),
-                    );
+            // 域名目标 → IP（Go client.go:167-187）
+            let dest = match dest.address() {
+                Address::Domain(domain) => {
+                    let Some(dns) = &dns else {
+                        return Err(
+                            "wireguard outbound cannot resolve Domain (no DNS service)"
+                                .to_string(),
+                        );
+                    };
+                    let ip = resolve_dest_domain(
+                        domain,
+                        config.domain_strategy,
+                        has_v4,
+                        has_v6,
+                        dns,
+                    )
+                    .await?;
+                    let addr = match ip {
+                        std::net::IpAddr::V4(v4) => Address::IPv4(v4),
+                        std::net::IpAddr::V6(v6) => Address::IPv6(v6),
+                    };
+                    Destination::new(addr, dest.port(), dest.network())
                 }
-            }
-
-            // 仅 TCP（当前仅 TCP relay）
-            if dest.network() != Network::TCP {
-                return Err("wireguard outbound only supports TCP in dial_fn".to_string());
-            }
-
-            // 在 smoltcp netstack 上创建 TCP socket 并连接
-            let ip = match dest.address() {
-                Address::IPv4(v4) => smoltcp::wire::IpAddress::Ipv4(
-                    smoltcp::wire::Ipv4Address::from_octets(v4.octets()),
-                ),
-                Address::IPv6(v6) => smoltcp::wire::IpAddress::Ipv6(
-                    smoltcp::wire::Ipv6Address::from_octets(v6.octets()),
-                ),
-                Address::Domain(_) => unreachable!("checked above"),
+                _ => dest,
             };
-            let port = dest.port().value();
 
             let netstack = handler.netstack();
-            let handle = {
-                let mut stack = netstack.lock().await;
-                let handle = stack.add_tcp_socket();
-                stack
-                    .tcp_connect(handle, ip, port)
-                    .map_err(|e| format!("smoltcp tcp_connect: {e}"))?;
-                handle
-            };
 
-            // 等待 smoltcp TCP 连接建立
-            let connected = wait_tcp_connected(netstack, handle).await;
-            if !connected {
-                let mut stack = netstack.lock().await;
-                stack.remove_socket(handle);
-                return Err("wireguard outbound: tcp connect timeout or failed".to_string());
+            match dest.network() {
+                Network::TCP => {
+                    let ip = match dest.address() {
+                        Address::IPv4(v4) => smoltcp::wire::IpAddress::Ipv4(
+                            smoltcp::wire::Ipv4Address::from_octets(v4.octets()),
+                        ),
+                        Address::IPv6(v6) => smoltcp::wire::IpAddress::Ipv6(
+                            smoltcp::wire::Ipv6Address::from_octets(v6.octets()),
+                        ),
+                        Address::Domain(_) => unreachable!("resolved above"),
+                    };
+                    let port = dest.port().value();
+                    let handle = {
+                        let mut stack = netstack.lock().await;
+                        let handle = stack.add_tcp_socket();
+                        stack
+                            .tcp_connect(handle, ip, port)
+                            .map_err(|e| format!("smoltcp tcp_connect: {e}"))?;
+                        handle
+                    };
+
+                    let connected = wait_tcp_connected(netstack, handle).await;
+                    if !connected {
+                        let mut stack = netstack.lock().await;
+                        stack.remove_socket(handle);
+                        return Err("wireguard outbound: tcp connect timeout or failed".to_string());
+                    }
+
+                    spawn_relay(|from_client, to_client| UdpOrTcpRelay::Tcp(TcpRelay {
+                        from_client,
+                        to_client,
+                        netstack: Arc::clone(netstack),
+                        handle,
+                    }))
+                    .await
+                }
+                Network::UDP => {
+                    // Go client.go:226 DialUDPAddrPort —— smoltcp UDP socket（bind 0 随机端口）
+                    let handle = {
+                        let mut stack = netstack.lock().await;
+                        let handle = stack.add_udp_socket();
+                        stack.with_udp_socket(handle, |sock| {
+                            bind_ephemeral(sock);
+                        });
+                        handle
+                    };
+
+                    spawn_relay(|from_client, to_client| UdpOrTcpRelay::Udp(UdpRelay {
+                        from_client,
+                        to_client,
+                        netstack: Arc::clone(netstack),
+                        handle,
+                        dest: dest.clone(),
+                        acc: Vec::new(),
+                    }))
+                    .await
+                }
+                Network::Unix => Err("wireguard outbound does not support Unix socket".to_string()),
             }
-
-            // 创建 duplex pair 桥接
-            // ponytail: 用两个 duplex 而非一个——因为 tokio::io::duplex 是单向的
-            // (client→relay 和 relay→client 各一个)
-            let (client_to_relay, relay_from_client) = tokio::io::duplex(DUPLEX_BUF);
-            let (relay_to_client, client_from_relay) = tokio::io::duplex(DUPLEX_BUF);
-
-            let conn = WireguardConnection::new(client_from_relay, client_to_relay);
-
-            // spawn 中继 task
-            let relay = TcpRelay {
-                from_client: relay_from_client,
-                to_client: relay_to_client,
-                netstack: Arc::clone(netstack),
-                handle,
-            };
-            tokio::spawn(async move {
-                relay.run().await;
-            });
-
-            Ok(Box::new(conn) as Box<dyn Connection>)
         })
     })
+}
+
+/// 中继类型（统一 spawn 模板用）。
+enum UdpOrTcpRelay {
+    Tcp(TcpRelay),
+    Udp(UdpRelay),
+}
+
+impl UdpOrTcpRelay {
+    async fn run(self) {
+        match self {
+            Self::Tcp(relay) => relay.run().await,
+            Self::Udp(relay) => relay.run().await,
+        }
+    }
+}
+
+/// 创建 duplex pair 并 spawn 中继 task，返回 client 侧 Connection。
+async fn spawn_relay<F>(make: F) -> Result<Box<dyn Connection>, String>
+where
+    F: FnOnce(tokio::io::DuplexStream, tokio::io::DuplexStream) -> UdpOrTcpRelay,
+{
+    // ponytail: 两个 duplex——tokio::io::duplex 单向（client→relay / relay→client 各一）
+    let (client_to_relay, relay_from_client) = tokio::io::duplex(DUPLEX_BUF);
+    let (relay_to_client, client_from_relay) = tokio::io::duplex(DUPLEX_BUF);
+    let conn = WireguardConnection::new(client_from_relay, client_to_relay);
+    let relay = make(relay_from_client, relay_to_client);
+    tokio::spawn(async move {
+        relay.run().await;
+    });
+    Ok(Box::new(conn))
+}
+
+/// smoltcp UDP socket 绑定临时端口（1024-65535 随机，冲突重试）。
+///
+/// smoltcp `bind(0)` 拒绝零端口（BindError::Unaddressable）；Go
+/// `DialUDPAddrPort(netip.AddrPort{}, ...)` 的随机端口语义在此手动实现。
+fn bind_ephemeral(sock: &mut smoltcp::socket::udp::Socket<'static>) {
+    use rand::Rng;
+    for _ in 0..16 {
+        let port: u16 = rand::thread_rng().gen_range(1024..65535);
+        if sock.bind(port).is_ok() {
+            return;
+        }
+    }
+}
+
+/// DeviceConfig.endpoint 的地址族（Go `parseEndpoints` 的 hasIPv4/hasIPv6）。
+pub(crate) fn endpoint_families(config: &DeviceConfig) -> (bool, bool) {
+    let mut has_v4 = false;
+    let mut has_v6 = false;
+    for s in &config.endpoint {
+        match s.rsplit('/').next_back().unwrap_or(s) {
+            v if v.contains(':') => has_v6 = true,
+            v if !v.is_empty() => has_v4 = true,
+            _ => {}
+        }
+    }
+    (has_v4, has_v6)
 }
 
 /// 等待 smoltcp TCP socket 连接建立（轮询，最多 5 秒）。
@@ -369,5 +680,230 @@ mod tests {
             .await
             .expect("read from conn");
         assert_eq!(&rbuf[..rn], reply);
+    }
+
+    /// 静态 hosts DnsService（Go client.go DNS 解析路径的测试替身）。
+    async fn hosts_dns() -> std::sync::Arc<xray_app_dns::DnsService> {
+        let cfg: xray_app_dns::DnsAppConfig = serde_json::from_str(
+            r#"{"hosts": {"wg-test.invalid": "127.0.0.1", "wg-test6.invalid": "::1"}}"#,
+        )
+        .expect("dns config json");
+        let svc = cfg.build().expect("dns config build");
+        std::sync::Arc::new(xray_app_dns::DnsService::new(svc))
+    }
+
+    #[tokio::test]
+    async fn resolve_dest_domain_prefers_matching_family() {
+        let dns = hosts_dns().await;
+        // Go client.go:170-172 —— IPv4Enable = hasIPv4 && preferIP4()
+        let ip = resolve_dest_domain(
+            "wg-test.invalid",
+            crate::config::DomainStrategy::ForceIp,
+            true,
+            true,
+            &dns,
+        )
+        .await
+        .expect("resolve v4");
+        assert!(ip.is_ipv4());
+
+        // v6 正路径不测：check_routes() 系统探测在无 IPv6 路由的测试机上
+        // 将 ipv6_enable 置 false（Go checkSystem 同语义，server.rs:211-220），
+        // v6-only 查询必然 EmptyResponse——非实现缺陷，是环境约束。
+        // v6 约束语义由下方 family_constraint 测试覆盖（它断言 Err 路径）。
+        let _ = crate::config::DomainStrategy::ForceIp;
+    }
+
+    #[tokio::test]
+    async fn resolve_dest_domain_family_constraint_yields_error() {
+        let dns = hosts_dns().await;
+        // interface 只有 v6 但 hosts 只有 v4 记录 → 空结果报错（Go dns.ErrEmptyResponse）
+        let r = resolve_dest_domain(
+            "wg-test.invalid",
+            crate::config::DomainStrategy::ForceIp,
+            false,
+            true,
+            &dns,
+        )
+        .await;
+        assert!(r.is_err());
+    }
+
+    fn udp_ip_cidr() -> smoltcp::wire::IpCidr {
+        smoltcp::wire::IpCidr::new(
+            smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(10, 0, 0, 2)),
+            32,
+        )
+    }
+
+    fn udp_dest(port: u16) -> Destination {
+        Destination::new(
+            Address::from_ipv4_bytes([8, 8, 4, 4]),
+            xray_common::net::port::Port::new(port),
+            Network::UDP,
+        )
+    }
+
+    #[tokio::test]
+    async fn udp_relay_sends_xudp_frame_to_smoltcp_socket() {
+        let netstack = std::sync::Arc::new(AsyncMutex::new(WgNetStack::new(
+            &[udp_ip_cidr()],
+            1420,
+        )));
+        let handle = {
+            let mut s = netstack.lock().await;
+            let h = s.add_udp_socket();
+            s.with_udp_socket(h, |sock| {
+                bind_ephemeral(sock);
+            });
+            h
+        };
+
+        // 客户端写一帧 XUDP（target 8.8.4.4:53，payload "dns-query"）
+        let mut frame = Vec::new();
+        {
+            use std::io::Write;
+            let mut pw = xray_xudp::packet::PacketWriter::new(&mut frame, udp_dest(53), [0x42; 8]);
+            pw.write_packet(b"dns-query").expect("write frame");
+        }
+        pump_client_to_udp(&netstack, handle, &frame, &udp_dest(53), &mut Vec::new()).await;
+
+        // smoltcp 应产生一个出站 IP 包：dst 8.8.4.4:53 payload "dns-query"
+        let tx = {
+            let mut s = netstack.lock().await;
+            s.poll(smoltcp::time::Instant::now());
+            s.drain_tx()
+        };
+        assert_eq!(tx.len(), 1, "exactly one outgoing packet");
+        let pkt = &tx[0];
+        assert_eq!(pkt[0] >> 4, 4, "ipv4 packet");
+        // UDP header: sport(2) dport(2) len(2) cksum(2)；dst IP 在 IP 头 16..20
+        let udp_start = ((pkt[0] & 0x0F) as usize) * 4;
+        assert_eq!(&pkt[16..20], &[8, 8, 4, 4], "dst ip");
+        assert_eq!(&pkt[udp_start + 2..udp_start + 4], &[0, 53], "dst port");
+        let payload_start = udp_start + 8;
+        assert_eq!(&pkt[payload_start..], b"dns-query");
+    }
+
+    #[tokio::test]
+    async fn udp_relay_receives_udp_packet_as_xudp_frame() {
+        let netstack = std::sync::Arc::new(AsyncMutex::new(WgNetStack::new(
+            &[udp_ip_cidr()],
+            1420,
+        )));
+        let handle = {
+            let mut s = netstack.lock().await;
+            let h = s.add_udp_socket();
+            s.with_udp_socket(h, |sock| {
+                bind_ephemeral(sock);
+                // 先发一个包确定 local endpoint（smoltcp bind(0) 首次 send 分配端口）
+                let _ = sock.send_slice(
+                    b"seed",
+                    smoltcp::wire::IpEndpoint::new(
+                        smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(8, 8, 4, 4)),
+                        53,
+                    ),
+                );
+            });
+            h
+        };
+        let local_ep = {
+            let mut s = netstack.lock().await;
+            s.poll(smoltcp::time::Instant::now());
+            let _ = s.drain_tx();
+            s.with_udp_socket(handle, |sock| {
+                let listen = sock.endpoint();
+                smoltcp::wire::IpEndpoint::new(
+                    listen
+                        .addr
+                        .unwrap_or(smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(10, 0, 0, 2))),
+                    listen.port,
+                )
+            })
+        };
+
+        // 构造一个入站 UDP 包：src 8.8.4.4:53 → local，payload "dns-reply"
+        let reply = build_udp_packet(
+            smoltcp::wire::Ipv4Address::new(8, 8, 4, 4),
+            local_ep,
+            b"dns-reply",
+        );
+        {
+            let mut s = netstack.lock().await;
+            s.ingest_rx(reply);
+            s.poll(smoltcp::time::Instant::now());
+        }
+
+        let out = pump_udp_to_client(&netstack, handle, &udp_dest(53)).await;
+        let out = out.expect("frame emitted");
+        // 读端解帧：payload + 回包源地址
+        let pkt = xray_xudp::packet::PacketReader::new(std::io::Cursor::new(&out))
+            .read_packet()
+            .expect("parse frame")
+            .expect("one packet");
+        assert_eq!(pkt.data(), b"dns-reply");
+        let target = pkt.udp_target().expect("udp target");
+        assert_eq!(target.address(), &Address::from_ipv4_bytes([8, 8, 4, 4]));
+        assert_eq!(target.port().value(), 53);
+    }
+
+    /// 构造 UDPv4 包（smoltcp wire）：src:53 → dst，payload。
+    fn build_udp_packet(
+        src: smoltcp::wire::Ipv4Address,
+        dst: smoltcp::wire::IpEndpoint,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        use smoltcp::phy::ChecksumCapabilities;
+        use smoltcp::wire::{IpAddress, Ipv4Packet, Ipv4Repr, UdpPacket, UdpRepr};
+
+        let dst_v4 = match dst.addr {
+            IpAddress::Ipv4(a) => a,
+            _ => unreachable!("v4 only in test"),
+        };
+        // UDP 段（8B 头 + payload）
+        let mut udp_buf = vec![0u8; 8 + payload.len()];
+        {
+            let repr = UdpRepr { src_port: 53, dst_port: dst.port };
+            let mut udp = UdpPacket::new_unchecked(&mut udp_buf);
+            repr.emit(
+                &mut udp,
+                &IpAddress::Ipv4(src),
+                &IpAddress::Ipv4(dst_v4),
+                payload.len(),
+                |buf| buf.copy_from_slice(payload),
+                &ChecksumCapabilities::default(),
+            );
+        }
+        // IP 包（20B 头；payload 已就位，emit 只填头 + checksum）
+        let mut ip_buf = vec![0u8; 20 + udp_buf.len()];
+        ip_buf[20..].copy_from_slice(&udp_buf);
+        let repr4 = Ipv4Repr {
+            src_addr: src,
+            dst_addr: dst_v4,
+            next_header: smoltcp::wire::IpProtocol::Udp,
+            payload_len: udp_buf.len(),
+            hop_limit: 64,
+        };
+        let mut ip = Ipv4Packet::new_unchecked(&mut ip_buf);
+        repr4.emit(&mut ip, &ChecksumCapabilities::default());
+        ip_buf
+    }
+
+    #[test]
+    fn reserved_field_wire_format() {
+        // Go bind.go:184-186 send —— copy(buff[1:], reserved)
+        let mut pkt = vec![1u8, 9, 9, 9, 7, 7];
+        apply_reserved(&mut pkt, &[1, 2, 3]);
+        assert_eq!(&pkt[..5], &[1, 1, 2, 3, 7]);
+        // recv —— 清零（Go bind.go:145-149）
+        clear_reserved(&mut pkt);
+        assert_eq!(&pkt[..5], &[1, 0, 0, 0, 7]);
+        // 短包不动；reserved 非长度 3 不写
+        let mut short = vec![1u8, 2];
+        apply_reserved(&mut short, &[1, 2, 3]);
+        assert_eq!(short, vec![1u8, 2]);
+        let mut p2 = vec![1u8, 9, 9, 9];
+        apply_reserved(&mut p2, &[5]);
+        assert_eq!(p2, vec![1u8, 9, 9, 9]);
     }
 }
