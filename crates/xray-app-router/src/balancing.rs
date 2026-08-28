@@ -443,4 +443,37 @@ mod tests {
         );
         assert!(matches!(b.pick_outbound(), Err(RouterError::EmptyBalancerResult)));
     }
+
+    #[test]
+    fn test_balancer_override_wins_over_valid_strategy() {
+        // override 在 strategy 返回有效 tag 时仍胜出（Go balancing.go:104-109）。
+        let b = Balancer::new(
+            vec![],
+            Arc::new(FixedStrategy("strategy-out".into())),
+            Arc::new(NotImplementedSelector),
+            "fallback",
+        );
+        b.set_override_target("override-out");
+        assert_eq!(b.pick_outbound().unwrap(), "override-out");
+    }
+
+    #[test]
+    fn test_balancer_clear_override_restores_strategy() {
+        // clear() 后 override 回退到空 → strategy 路径接管。
+        let o = Override::new();
+        o.put("temp");
+        assert_eq!(o.get(), "temp");
+        o.clear();
+        assert!(o.get().is_empty());
+        let b = Balancer::new(
+            vec![],
+            Arc::new(FixedStrategy("strategy-out".into())),
+            Arc::new(NotImplementedSelector),
+            "",
+        );
+        b.override_handle().put("override-out");
+        assert_eq!(b.pick_outbound().unwrap(), "override-out");
+        b.override_handle().clear();
+        assert_eq!(b.pick_outbound().unwrap(), "strategy-out");
+    }
 }
