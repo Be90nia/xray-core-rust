@@ -207,7 +207,57 @@ impl StreamSettings {
             }
             opts.happy_eyeballs = Some(cfg);
         }
-        opts
+        // domainStrategy（bd 5y8，Go infra/conf/transport_internet.go:1082-1108，
+        // 大小写不敏感；Go conf 对非法值硬报错，此 JSON 层宽容回退 AsIs 并 warn）。
+        if let Some(v) = obj.get("domainStrategy").and_then(|v| v.as_str()) {
+            opts.domain_strategy = parse_domain_strategy(v);
+        }
+        // addressPortStrategy（bd 5y8，transport_internet.go:1124-1142，同上宽容）。
+        if let Some(v) = obj.get("addressPortStrategy").and_then(|v| v.as_str()) {
+            opts.address_port_strategy = parse_address_port_strategy(v);
+        }
+         opts
+     }
+ }
+
+/// `domainStrategy` 字符串 → 枚举。对应 Go transport_internet.go:1082-1108
+/// 的 `strings.ToLower` switch；未知值 warn + AsIs（Go 在 conf Build 硬报错）。
+fn parse_domain_strategy(s: &str) -> crate::sockopt::DomainStrategy {
+    use crate::sockopt::DomainStrategy;
+    match s.to_ascii_lowercase().as_str() {
+        "asis" | "" => DomainStrategy::AsIs,
+        "useip" => DomainStrategy::UseIP,
+        "useipv4" => DomainStrategy::UseIPv4,
+        "useipv6" => DomainStrategy::UseIPv6,
+        "useipv4v6" => DomainStrategy::UseIPv4v6,
+        "useipv6v4" => DomainStrategy::UseIPv6v4,
+        "forceip" => DomainStrategy::ForceIP,
+        "forceipv4" => DomainStrategy::ForceIPv4,
+        "forceipv6" => DomainStrategy::ForceIPv6,
+        "forceipv4v6" => DomainStrategy::ForceIPv4v6,
+        "forceipv6v4" => DomainStrategy::ForceIPv6v4,
+        other => {
+            tracing::warn!(value = other, "unsupported domain strategy, fallback to AsIs");
+            DomainStrategy::AsIs
+        }
+    }
+}
+
+/// `addressPortStrategy` 字符串 → 枚举。对应 Go transport_internet.go:1124-1142。
+fn parse_address_port_strategy(s: &str) -> crate::sockopt::AddressPortStrategy {
+    use crate::sockopt::AddressPortStrategy;
+    match s.to_ascii_lowercase().as_str() {
+        "none" | "" => AddressPortStrategy::None,
+        "srvportonly" => AddressPortStrategy::SrvPortOnly,
+        "srvaddressonly" => AddressPortStrategy::SrvAddressOnly,
+        "srvportandaddress" => AddressPortStrategy::SrvPortAndAddress,
+        "txtportonly" => AddressPortStrategy::TxtPortOnly,
+        "txtaddressonly" => AddressPortStrategy::TxtAddressOnly,
+        "txtportandaddress" => AddressPortStrategy::TxtPortAndAddress,
+        other => {
+            tracing::warn!(value = other, "unsupported address port strategy, fallback to None");
+            AddressPortStrategy::None
+        }
     }
 }
 
@@ -416,6 +466,36 @@ mod transport_cache_tests {
         assert_eq!(s.socket_options().dialer_proxy, "proxy-out");
         // 缺省为空串。
         assert_eq!(StreamSettings::tcp().socket_options().dialer_proxy, "");
+    }
+
+    /// domainStrategy/addressPortStrategy 解析（bd 5y8，Go
+    /// transport_internet.go:1082-1142，大小写不敏感）。
+    #[test]
+    fn socket_options_parses_strategies() {
+        use crate::sockopt::{AddressPortStrategy, DomainStrategy};
+        let mut s = StreamSettings::tcp();
+        s.sockopt_json = Some(serde_json::json!({
+            "domainStrategy": "ForceIPv4v6",
+            "addressPortStrategy": "TxtPortAndAddress"
+        }));
+        let opts = s.socket_options();
+        assert_eq!(opts.domain_strategy, DomainStrategy::ForceIPv4v6);
+        assert_eq!(opts.address_port_strategy, AddressPortStrategy::TxtPortAndAddress);
+
+        // 大小写不敏感。
+        let mut s = StreamSettings::tcp();
+        s.sockopt_json = Some(serde_json::json!({ "domainStrategy": "USEIP" }));
+        assert_eq!(s.socket_options().domain_strategy, DomainStrategy::UseIP);
+
+        // 未知值回退默认（Go conf 层硬报错，此层宽容 + warn）。
+        let mut s = StreamSettings::tcp();
+        s.sockopt_json = Some(serde_json::json!({
+            "domainStrategy": "bogus",
+            "addressPortStrategy": "bogus"
+        }));
+        let opts = s.socket_options();
+        assert_eq!(opts.domain_strategy, DomainStrategy::AsIs);
+        assert_eq!(opts.address_port_strategy, AddressPortStrategy::None);
     }
 
     #[test]

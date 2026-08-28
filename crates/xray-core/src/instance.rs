@@ -160,9 +160,17 @@ impl Instance {
         // 确保最小配置也能正常启动（对应 Go xray-core essentialFeatures）。
         ensure_essential_features(&mut inst);
 
-        // InitSystemDialer: 注入 DNS 解析能力，使 Domain 目标地址可拨号。
-        // 对应 Go xray-core InitSystemDialer。
-        xray_transport::system_dialer::init_system_dialer();
+        // InitSystemDialer: 注入 DNS 解析能力 + dnsClient（LookupForIP 数据源）。
+        // 对应 Go InitSystemDialer(dc dns.Client, om)：dc 取已配置 DNS app，
+        // 无则 essentialFeatures 的 localdns（DefaultDnsFeature）。
+        let dns_client: Option<Arc<dyn xray_features::dns::DnsClient>> = inst
+            .get_feature::<xray_app_dns::DnsService>()
+            .map(|d| d as Arc<dyn xray_features::dns::DnsClient>)
+            .or_else(|| {
+                inst.get_feature::<xray_features::dns::DefaultDnsFeature>()
+                    .map(|d| d as Arc<dyn xray_features::dns::DnsClient>)
+            });
+        xray_transport::system_dialer::init_system_dialer(dns_client);
 
 
         tracing::info!(

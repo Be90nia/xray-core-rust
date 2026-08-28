@@ -28,6 +28,177 @@ use socket2::Socket;
 /// - `tcp_nodelay = true`（Chrome 默认）
 /// - `tcp_keepalive_idle = 45s`
 /// - `tcp_keepalive_interval = 45s`
+/// sockopt 域名解析策略。对应 Go `transport/internet.DomainStrategy`
+/// （config.pb.go 枚举 + config.go:13-26 strategy 表）。
+///
+/// 注意与 `xray_proxy_freedom::config::DomainStrategy`（Go `proxy/freedom`
+/// proto 枚举）是平行类型——Go 中二者同样各自定义（freedom 配置转换后写入
+/// `SocketConfig.DomainStrategy` 才进入拨号层）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(i32)]
+pub enum DomainStrategy {
+    /// AS_IS：不预解析，由系统 resolver 处理（默认）。
+    #[default]
+    AsIs = 0,
+    /// USE_IP：解析到任意族 IP。
+    UseIP = 1,
+    /// USE_IP4。
+    UseIPv4 = 2,
+    /// USE_IP6。
+    UseIPv6 = 3,
+    /// USE_IP46：优先 IPv4，回退 IPv6。
+    UseIPv4v6 = 4,
+    /// USE_IP64：优先 IPv6，回退 IPv4。
+    UseIPv6v4 = 5,
+    /// FORCE_IP：同 USE_IP，解析失败即失败。
+    ForceIP = 6,
+    /// FORCE_IP4。
+    ForceIPv4 = 7,
+    /// FORCE_IP6。
+    ForceIPv6 = 8,
+    /// FORCE_IP46。
+    ForceIPv4v6 = 9,
+    /// FORCE_IP64。
+    ForceIPv6v4 = 10,
+}
+
+impl DomainStrategy {
+    /// 从 proto i32 值构造。非法值回退 `AsIs`（Go config.pb.go 枚举范围外不存在）。
+    #[must_use]
+    pub const fn from_i32(v: i32) -> Self {
+        match v {
+            1 => Self::UseIP,
+            2 => Self::UseIPv4,
+            3 => Self::UseIPv6,
+            4 => Self::UseIPv4v6,
+            5 => Self::UseIPv6v4,
+            6 => Self::ForceIP,
+            7 => Self::ForceIPv4,
+            8 => Self::ForceIPv6,
+            9 => Self::ForceIPv4v6,
+            10 => Self::ForceIPv6v4,
+            _ => Self::AsIs,
+        }
+    }
+
+    /// Go `transport/internet/config.go:13-26` strategy 表：`[mode, prefer, fallback]`。
+    ///
+    /// mode：0=AsIs，1=Use，2=Force；prefer/fallback：0=both，4=IPv4，6=IPv6。
+    #[must_use]
+    pub const fn strategy_table(self) -> [u8; 3] {
+        match self {
+            Self::AsIs => [0, 0, 0],
+            Self::UseIP => [1, 0, 0],
+            Self::UseIPv4 => [1, 4, 0],
+            Self::UseIPv6 => [1, 6, 0],
+            Self::UseIPv4v6 => [1, 4, 6],
+            Self::UseIPv6v4 => [1, 6, 4],
+            Self::ForceIP => [2, 0, 0],
+            Self::ForceIPv4 => [2, 4, 0],
+            Self::ForceIPv6 => [2, 6, 0],
+            Self::ForceIPv4v6 => [2, 4, 6],
+            Self::ForceIPv6v4 => [2, 6, 4],
+        }
+    }
+
+    /// 是否带解析策略（Go `HasStrategy()`：mode != 0）。
+    #[must_use]
+    pub const fn has_strategy(self) -> bool {
+        self.strategy_table()[0] != 0
+    }
+
+    /// 解析失败是否必须报错（Go `ForceIP()`：mode == 2）。
+    #[must_use]
+    pub const fn force_ip(self) -> bool {
+        self.strategy_table()[0] == 2
+    }
+
+    /// 优先 IPv4（Go `PreferIP4()`：prefer==4 **或 both**）。
+    #[must_use]
+    pub const fn prefer_ipv4(self) -> bool {
+        let p = self.strategy_table()[1];
+        p == 4 || p == 0
+    }
+
+    /// 优先 IPv6（Go `PreferIP6()`：prefer==6 **或 both**）。
+    #[must_use]
+    pub const fn prefer_ipv6(self) -> bool {
+        let p = self.strategy_table()[1];
+        p == 6 || p == 0
+    }
+
+    /// 有回退家族（Go `HasFallback()`）。
+    #[must_use]
+    pub const fn has_fallback(self) -> bool {
+        self.strategy_table()[2] != 0
+    }
+
+    /// 回退 IPv4（Go `FallbackIP4()`）。
+    #[must_use]
+    pub const fn fallback_ipv4(self) -> bool {
+        self.strategy_table()[2] == 4
+    }
+
+    /// 回退 IPv6（Go `FallbackIP6()`）。
+    #[must_use]
+    pub const fn fallback_ipv6(self) -> bool {
+        self.strategy_table()[2] == 6
+    }
+}
+
+/// SRV/TXT 记录覆盖目标地址/端口策略。对应 Go
+/// `transport/internet.AddressPortStrategy`（config.pb.go:102-108）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(i32)]
+pub enum AddressPortStrategy {
+    /// 不覆盖（默认）。
+    #[default]
+    None = 0,
+    /// SRV 记录覆盖端口。
+    SrvPortOnly = 1,
+    /// SRV 记录覆盖地址。
+    SrvAddressOnly = 2,
+    /// SRV 记录覆盖端口 + 地址。
+    SrvPortAndAddress = 3,
+    /// TXT 记录覆盖端口。
+    TxtPortOnly = 4,
+    /// TXT 记录覆盖地址。
+    TxtAddressOnly = 5,
+    /// TXT 记录覆盖端口 + 地址。
+    TxtPortAndAddress = 6,
+}
+
+impl AddressPortStrategy {
+    /// 从 proto i32 值构造。非法值回退 `None`。
+    #[must_use]
+    pub const fn from_i32(v: i32) -> Self {
+        match v {
+            1 => Self::SrvPortOnly,
+            2 => Self::SrvAddressOnly,
+            3 => Self::SrvPortAndAddress,
+            4 => Self::TxtPortOnly,
+            5 => Self::TxtAddressOnly,
+            6 => Self::TxtPortAndAddress,
+            _ => Self::None,
+        }
+    }
+
+    /// SRV/TXT → 覆盖位（Go dialer.go:145-172 的 switch 展开）。
+    #[must_use]
+    pub const fn override_flags(self) -> (bool, bool, bool) {
+        // (is_srv, override_port, override_address)
+        match self {
+            Self::SrvPortOnly => (true, true, false),
+            Self::SrvAddressOnly => (true, false, true),
+            Self::SrvPortAndAddress => (true, true, true),
+            Self::TxtPortOnly => (false, true, false),
+            Self::TxtAddressOnly => (false, false, true),
+            Self::TxtPortAndAddress => (false, true, true),
+            Self::None => (false, false, false),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SocketOptions {
     /// 是否启用 TCP_NODELAY（禁用 Nagle 算法）。默认 `true`。
@@ -63,6 +234,12 @@ pub struct SocketOptions {
     /// （config.proto:157，字段 22）。`None` 或 `try_delay_ms == 0` = 关闭
     /// （Go 默认 `TryDelayMs: 0`，infra/conf/transport_internet.go:1144）。
     pub happy_eyeballs: Option<HappyEyeballsConfig>,
+    /// 域名解析策略。对应 Go `SocketConfig.DomainStrategy`
+    /// （config.pb.go:735 附近 + infra/conf/transport_internet.go:1037）。默认 `AsIs`。
+    pub domain_strategy: DomainStrategy,
+    /// SRV/TXT 记录覆盖目标地址/端口策略。对应 Go
+    /// `SocketConfig.AddressPortStrategy`（infra/conf/transport_internet.go:1050）。默认 `None`。
+    pub address_port_strategy: AddressPortStrategy,
  }
 
 /// Happy Eyeballs 配置。对应 Go `HappyEyeballsConfig`
@@ -109,6 +286,8 @@ impl Default for SocketOptions {
             ipv6_only: false,
             dialer_proxy: String::new(),
             happy_eyeballs: None,
+            domain_strategy: DomainStrategy::AsIs,
+            address_port_strategy: AddressPortStrategy::None,
          }
     }
 }
@@ -351,5 +530,85 @@ mod tests {
 
         drop(socket);
         accept_task.await.unwrap();
+    }
+
+    // ===== DomainStrategy / AddressPortStrategy（bd 5y8，Go config.go:13-26）=====
+
+    /// Go strategy 表逐行对照（config.go:13-26）。
+    #[test]
+    fn domain_strategy_table_matches_go() {
+        use DomainStrategy::*;
+        assert_eq!(AsIs.strategy_table(), [0, 0, 0]);
+        assert_eq!(UseIP.strategy_table(), [1, 0, 0]);
+        assert_eq!(UseIPv4.strategy_table(), [1, 4, 0]);
+        assert_eq!(UseIPv6.strategy_table(), [1, 6, 0]);
+        assert_eq!(UseIPv4v6.strategy_table(), [1, 4, 6]);
+        assert_eq!(UseIPv6v4.strategy_table(), [1, 6, 4]);
+        assert_eq!(ForceIP.strategy_table(), [2, 0, 0]);
+        assert_eq!(ForceIPv4.strategy_table(), [2, 4, 0]);
+        assert_eq!(ForceIPv6.strategy_table(), [2, 6, 0]);
+        assert_eq!(ForceIPv4v6.strategy_table(), [2, 4, 6]);
+        assert_eq!(ForceIPv6v4.strategy_table(), [2, 6, 4]);
+    }
+
+    /// Go PreferIP4/PreferIP6 的 both 语义：prefer==0 时两者皆真（config.go:110-116）。
+    #[test]
+    fn domain_strategy_prefer_includes_both() {
+        use DomainStrategy::*;
+        // UseIP/ForceIP：prefer=both → 两个 prefer 都为真。
+        for s in [UseIP, ForceIP] {
+            assert!(s.prefer_ipv4(), "{s:?} prefer both → v4 true");
+            assert!(s.prefer_ipv6(), "{s:?} prefer both → v6 true");
+        }
+        // UseIPv4v6：prefer=4 仅 v4；fallback=6。
+        assert!(UseIPv4v6.prefer_ipv4());
+        assert!(!UseIPv4v6.prefer_ipv6());
+        assert!(UseIPv4v6.has_fallback() && UseIPv4v6.fallback_ipv6());
+        // UseIPv6v4：prefer=6 仅 v6；fallback=4。
+        assert!(!UseIPv6v4.prefer_ipv4());
+        assert!(UseIPv6v4.prefer_ipv6());
+        assert!(UseIPv6v4.fallback_ipv4());
+        // AsIs：无策略无回退；Force*：force_ip。
+        assert!(!AsIs.has_strategy() && !AsIs.has_fallback());
+        assert!(ForceIPv4.force_ip() && ForceIPv4v6.force_ip());
+        assert!(!UseIPv4.force_ip());
+    }
+
+    #[test]
+    fn domain_strategy_from_i32_roundtrip_and_fallback() {
+        use DomainStrategy::*;
+        for (v, s) in [
+            (0, AsIs),
+            (1, UseIP),
+            (5, UseIPv6v4),
+            (10, ForceIPv6v4),
+        ] {
+            assert_eq!(DomainStrategy::from_i32(v), s);
+            assert_eq!(s as i32, v);
+        }
+        assert_eq!(DomainStrategy::from_i32(99), AsIs);
+        assert_eq!(DomainStrategy::from_i32(-1), AsIs);
+    }
+
+    /// Go dialer.go:145-172 的覆盖位展开。
+    #[test]
+    fn address_port_strategy_override_flags() {
+        use AddressPortStrategy::*;
+        assert_eq!(None.override_flags(), (false, false, false));
+        assert_eq!(SrvPortOnly.override_flags(), (true, true, false));
+        assert_eq!(SrvAddressOnly.override_flags(), (true, false, true));
+        assert_eq!(SrvPortAndAddress.override_flags(), (true, true, true));
+        assert_eq!(TxtPortOnly.override_flags(), (false, true, false));
+        assert_eq!(TxtAddressOnly.override_flags(), (false, false, true));
+        assert_eq!(TxtPortAndAddress.override_flags(), (false, true, true));
+        assert_eq!(AddressPortStrategy::from_i32(6), TxtPortAndAddress);
+        assert_eq!(AddressPortStrategy::from_i32(7), None);
+    }
+
+    #[test]
+    fn socket_options_defaults_include_strategies() {
+        let opts = SocketOptions::default();
+        assert_eq!(opts.domain_strategy, DomainStrategy::AsIs);
+        assert_eq!(opts.address_port_strategy, AddressPortStrategy::None);
     }
 }

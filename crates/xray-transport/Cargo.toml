@@ -37,6 +37,8 @@ rsa = "0.9"
 num-bigint = "0.4"
 num-traits = "0.2"
 num-integer = "0.1"
+# checkAddressPortStrategy 的 SRV/TXT 系统解析（Go 用 net.DefaultResolver）
+hickory-resolver = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -6505,6 +6505,7 @@ dependencies = [
  "blake2",
  "futures-util",
  "hex",
+ "hickory-resolver",
  "libc",
  "num-bigint",
  "num-integer",
