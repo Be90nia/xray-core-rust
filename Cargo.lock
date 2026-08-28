@@ -6099,6 +6099,7 @@ dependencies = [
  "xray-buf",
  "xray-common",
  "xray-features",
+ "xray-proxy-freedom",
  "xray-transport",
 ]
 

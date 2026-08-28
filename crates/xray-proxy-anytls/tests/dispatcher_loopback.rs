@@ -103,7 +103,7 @@ async fn dispatcher_e2e_anytls_loopback_echo() {
     // 2. anytls mock server
     let (server_config, cert_der) = make_server_config();
     let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
-    let anytls_server = AnytlsMockServer::start("127.0.0.1:0".parse().unwrap(), tls_acceptor)
+    let anytls_server = AnytlsMockServer::start("127.0.0.1:0".parse().unwrap(), tls_acceptor, None)
         .await
         .unwrap();
     let anytls_addr = anytls_server.local_addr;
@@ -168,7 +168,7 @@ async fn dispatcher_e2e_anytls_loopback_large_payload() {
     let echo_addr = start_echo_server().await;
     let (server_config, cert_der) = make_server_config();
     let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
-    let anytls_server = AnytlsMockServer::start("127.0.0.1:0".parse().unwrap(), tls_acceptor)
+    let anytls_server = AnytlsMockServer::start("127.0.0.1:0".parse().unwrap(), tls_acceptor, None)
         .await
         .unwrap();
     let anytls_addr = anytls_server.local_addr;

@@ -6,16 +6,22 @@
 //!
 //! 1. `InboundHandler::start` 被调用
 //! 2. 启动 TCP listener + TLS acceptor（[`tokio_rustls::TlsAcceptor`]）
-//! 3. 每个新 TLS conn 经 anytls server session 处理：读 SOCKS5 target → dial → 桥接
+//! 3. 每个新 TLS conn 经 anytls server session 处理：读 SOCKS5 target →
+//!    `dispatch = Some` 走 [`xray_app_dispatcher::DispatchHandler::dispatch`]，
+//!    `dispatch = None` 保留 mock 直连（loopback 测试）
 //! 4. `close` 时停止 listener 并清理资源
+//!
+//! 见 bd Xray-core-rust-dax。
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::info;
+use xray_app_dispatcher::DispatchHandler;
 use xray_features::inbound::{InboundError, InboundHandler};
 
 use crate::server::AnytlsMockServer;
@@ -27,6 +33,10 @@ pub struct AnytlsInboundHandler {
     tag: String,
     bind_addr: SocketAddr,
     tls_acceptor: tokio_rustls::TlsAcceptor,
+    /// 出站 dispatch（Some 时 session 流量经 router 分发；None 直连目标——mock）。
+    dispatch: Option<Arc<dyn DispatchHandler>>,
+    /// start 后实际监听端口（bind 0 时由 OS 分配），port() 返回此值。
+    local_port: AtomicU16,
     /// server 句柄 + accept 任务，close 时 stop。
     slot: Mutex<Option<InboundSlot>>,
 }
@@ -39,12 +49,7 @@ struct InboundSlot {
 }
 
 impl AnytlsInboundHandler {
-    /// 构造入站 Handler。
-    ///
-    /// # 参数
-    /// - `tag`：handler 标签
-    /// - `bind_addr`：TCP 监听地址（如 `0.0.0.0:443`）
-    /// - `tls_acceptor`：TLS 服务端 acceptor（证书/密钥配置）
+    /// 构造入站 Handler（mock 直连模式，loopback 测试用）。
     pub fn new(
         tag: impl Into<String>,
         bind_addr: SocketAddr,
@@ -54,8 +59,17 @@ impl AnytlsInboundHandler {
             tag: tag.into(),
             bind_addr,
             tls_acceptor,
+            dispatch: None,
+            local_port: AtomicU16::new(0),
             slot: Mutex::new(None),
         }
+    }
+
+    /// 注入出站 dispatcher（生产路径：session 流量经 router 分发而非直连）。
+    #[must_use]
+    pub fn with_dispatch(mut self, dispatch: Arc<dyn DispatchHandler>) -> Self {
+        self.dispatch = Some(dispatch);
+        self
     }
 
     /// 绑定地址。
@@ -77,11 +91,16 @@ impl InboundHandler for AnytlsInboundHandler {
             return Err(InboundError::AlreadyStarted(self.tag.clone()));
         }
 
-        let server = AnytlsMockServer::start(self.bind_addr, self.tls_acceptor.clone())
-            .await
-            .map_err(|e| InboundError::ListenError(format!("anytls listen: {e}")))?;
+        let server = AnytlsMockServer::start(
+            self.bind_addr,
+            self.tls_acceptor.clone(),
+            self.dispatch.clone(),
+        )
+        .await
+        .map_err(|e| InboundError::ListenError(format!("anytls listen: {e}")))?;
 
         let local_addr = server.local_addr;
+        self.local_port.store(local_addr.port(), Ordering::SeqCst);
         let tag = self.tag.clone();
 
         // spawn 一个 keep-alive 任务，持有 server 句柄直到 close 被调用
@@ -105,13 +124,15 @@ impl InboundHandler for AnytlsInboundHandler {
         if let Some(s) = slot {
             s._accept_task.abort();
             s.server.stop().await;
+            self.local_port.store(0, Ordering::SeqCst);
             info!(tag = %self.tag, "anytls inbound closed");
         }
         Ok(())
     }
 
     fn port(&self) -> u16 {
-        self.bind_addr.port()
+        let p = self.local_port.load(Ordering::SeqCst);
+        if p != 0 { p } else { self.bind_addr.port() }
     }
 }
 
@@ -135,7 +156,7 @@ mod tests {
     fn make_tls_acceptor() -> tokio_rustls::TlsAcceptor {
         init_crypto();
         let key_pair = KeyPair::generate().unwrap();
-        let mut params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+        let params = CertificateParams::new(vec!["localhost".into()]).unwrap();
         let cert = params.self_signed(&key_pair).unwrap();
 
         let cert_der = cert.der().clone();
@@ -168,6 +189,8 @@ mod tests {
     async fn start_and_close() {
         let h = make_handler();
         assert!(h.start().await.is_ok());
+        // start 后 port 应反映 OS 分配的实际端口（非零）
+        assert!(h.port() > 0, "port after start must be non-zero");
         // 第二次 start 应返回 AlreadyStarted
         let r = h.start().await;
         assert!(r.is_err());

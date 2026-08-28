@@ -1,21 +1,18 @@
-//! AnyTLS 端到端 loopback 测试。
+//! AnyTLS inbound → dispatcher/router e2e（bd Xray-core-rust-dax）。
 //!
 //! 拓扑：
 //! ```text
-//! AnytlsClient → TLS → AnytlsMockServer → dial TCP → EchoServer
-//!                                              ↓
-//! EchoServer ←———————————————————————————————┘
+//! AnytlsClient → TLS → AnytlsInboundHandler（with_dispatch = DialBridge(freedom)）
+//!                                       ↓ handler.dispatch(dest, link)
+//!                                       DialBridge → freedom → echo server
 //! ```
 //!
-//! 测试场景：
-//! 1. 起 echo TCP server
-//! 2. 自签证书 + 起 AnytlsMockServer
-//! 3. AnytlsClient dial 到 echo server
-//! 4. 客户端 write → server echo → 客户端 read，验证数据一致
+//! 关键改动：AnytlsMockServer 的 handle_session 从直连 `TcpStream::connect` 改为
+//! 走 `dispatch.dispatch(&dest, link)`，inbound 流量经 router 分发。
 
 #![cfg(test)]
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,11 +22,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
+use xray_app_dispatcher::default::{DialBridge, SimpleOhm};
+use xray_app_dispatcher::OutboundHandlerManager;
+use xray_features::inbound::InboundHandler;
 use xray_proxy_anytls::client::{AnytlsClient, ClientConfig};
-use xray_proxy_anytls::server::AnytlsMockServer;
+use xray_proxy_anytls::inbound::AnytlsInboundHandler;
 use xray_proxy_anytls::socks::SocksAddr;
-
-/// 简单 echo TCP server，返回收到的字节。
 async fn start_echo_server() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -54,7 +52,7 @@ async fn start_echo_server() -> SocketAddr {
     addr
 }
 
-/// 用 rcgen 自签证书生成 rustls server config。
+/// rcgen 自签证书 → rustls server config + cert_der。
 fn make_server_config() -> (RustlsServerConfig, Vec<u8>) {
     use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
     let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
@@ -74,7 +72,6 @@ fn make_server_config() -> (RustlsServerConfig, Vec<u8>) {
     (server_config, cert_der.to_vec())
 }
 
-/// 客户端 TLS config：信任自签证书（dangerous，测试专用）。
 fn make_client_config(server_cert_der: &[u8]) -> Arc<RustlsClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.add(server_cert_der.to_vec().into()).unwrap();
@@ -86,81 +83,59 @@ fn make_client_config(server_cert_der: &[u8]) -> Arc<RustlsClientConfig> {
 }
 
 #[tokio::test]
-async fn loopback_echo_works() {
+async fn inbound_dispatches_via_router() {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    // 1. 起 echo server
+
+    // 1. echo server（远端目标）
     let echo_addr = start_echo_server().await;
 
-    // 2. 自签证书 + server config
+    // 2. TLS acceptor（自签证书）
     let (server_config, cert_der) = make_server_config();
     let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
 
-    // 3. 起 anytls mock server
-    let anytls_server = AnytlsMockServer::start("127.0.0.1:0".parse().unwrap(), tls_acceptor, None)
-        .await
-        .unwrap();
-    let anytls_addr = anytls_server.local_addr;
+    // 3. dispatcher + DialBridge(freedom) —— 模拟生产 router
+    let ohm = Arc::new(SimpleOhm::new());
+    ohm.set_default(Arc::new(DialBridge::new(
+        "freedom",
+        xray_proxy_freedom::make_freedom_dial_fn(),
+    )));
+    let dispatch: Arc<dyn xray_app_dispatcher::DispatchHandler> =
+        ohm.get_default_handler().unwrap();
 
-    // 4. 构造 client config
+    // 4. AnyTLS inbound（with_dispatch）
+    let handler = AnytlsInboundHandler::new(
+        "anytls-in",
+        "127.0.0.1:0".parse().unwrap(),
+        tls_acceptor,
+    )
+    .with_dispatch(dispatch);
+    handler.start().await.expect("anytls inbound start");
+    let inbound_port = handler.port();
+    assert!(inbound_port > 0, "inbound must bind ephemeral port");
+
+    // 5. AnyTLS client → inbound → dispatch → freedom → echo
     let client_config = ClientConfig::new(
-        format!("127.0.0.1:{}", anytls_addr.port()),
+        format!("127.0.0.1:{inbound_port}"),
         "localhost",
         make_client_config(&cert_der),
     );
     let client = AnytlsClient::new(client_config);
 
-    // 5. dial 到 echo server
-    let target = SocksAddr::ipv4(std::net::Ipv4Addr::new(127, 0, 0, 1), echo_addr.port());
+    let target = SocksAddr::ipv4(Ipv4Addr::LOCALHOST, echo_addr.port());
     let mut conn = tokio::time::timeout(Duration::from_secs(10), client.dial(&target))
         .await
         .expect("dial timed out")
         .expect("dial failed");
 
-    // 6. write + read echo
-    let payload = b"hello anytls loopback!";
+    let payload = b"hello anytls via inbound dispatcher";
     conn.write_all(payload).await.unwrap();
-
     let mut got = vec![0u8; payload.len()];
     conn.read_exact(&mut got)
         .await
-        .expect("read_exact should succeed");
-    assert_eq!(&got, payload);
+        .expect("read_exact should succeed via dispatcher→freedom→echo");
+    assert_eq!(&got, payload, "inbound must relay via dispatcher/router");
 
+    drop(conn);
     let _ = client.close().await;
-    anytls_server.stop().await;
-}
-
-#[tokio::test]
-async fn loopback_large_payload() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let echo_addr = start_echo_server().await;
-    let (server_config, cert_der) = make_server_config();
-    let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
-    let anytls_server = AnytlsMockServer::start("127.0.0.1:0".parse().unwrap(), tls_acceptor, None)
-        .await
-        .unwrap();
-    let anytls_addr = anytls_server.local_addr;
-
-    let client_config = ClientConfig::new(
-        format!("127.0.0.1:{}", anytls_addr.port()),
-        "localhost",
-        make_client_config(&cert_der),
-    );
-    let client = AnytlsClient::new(client_config);
-    let target = SocksAddr::ipv4(std::net::Ipv4Addr::new(127, 0, 0, 1), echo_addr.port());
-    let mut conn = tokio::time::timeout(Duration::from_secs(10), client.dial(&target))
-        .await
-        .expect("dial timed out")
-        .expect("dial failed");
-
-    // 32 KiB payload，触发 duplex pump 多次循环
-    let payload: Vec<u8> = (0..32 * 1024).map(|i| (i % 256) as u8).collect();
-    conn.write_all(&payload).await.unwrap();
-
-    let mut got = vec![0u8; payload.len()];
-    conn.read_exact(&mut got).await.expect("read_exact failed");
-    assert_eq!(got, payload);
-
-    let _ = client.close().await;
-    anytls_server.stop().await;
+    handler.close().await.expect("inbound close");
 }
