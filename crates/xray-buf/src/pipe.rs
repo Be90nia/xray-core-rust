@@ -763,6 +763,55 @@ mod tests {
         assert!(w.is_closed());
     }
 
+    // ========== Go TestPipeWriteMultiThread / Interrupt-after-close ==========
+
+    /// Go pipe_test.go TestPipeWriteMultiThread：limit=0 + 10 并发 writer + close。
+    /// 语义：恰好一条写入 merge（isFull(cur)>0 阻塞其余），close 唤醒阻塞 writer
+    /// 各自释放 mb 不污染 buffered，reader 读到一条完整 "abcd"。
+    #[tokio::test]
+    async fn test_multi_writer_close_keeps_one_whole_write() {
+        let opt = PipeOption {
+            limit: 0,
+            ..PipeOption::default()
+        };
+        let (mut r, w) = new_with_option(opt);
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let mut w = w.clone();
+            handles.push(tokio::spawn(async move {
+                w.write_multi_buffer(mb(b"abcd")).await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        w.close().unwrap();
+        // Go 原版 errg.Wait() 裸调用忽略错误：恰一个 Ok，其余 Err
+        for h in handles {
+            let _ = h.await.unwrap();
+        }
+
+        // buffered 恰好一条完整写入（多条 merge 会是 "abcdabcd..."）
+        let out = r.read_multi_buffer().await.unwrap();
+        assert_eq!(out.to_vec(), b"abcd");
+        // 读完 EOF
+        let err = r.read_multi_buffer().await.unwrap_err();
+        assert!(matches!(err, Error::Eof));
+    }
+
+    /// Go impl.go Interrupt:194-199：closed 状态且有 buffered data 时 interrupt
+    /// → 状态转 Errord、data 被丢弃，reader 得错误而非 drain。
+    #[tokio::test]
+    async fn test_interrupt_after_close_discards_buffered_data() {
+        let (mut r, mut w) = new();
+        w.write_multi_buffer(mb(b"data")).await.unwrap();
+        w.close().unwrap();
+        // close 后 buffered 本可 drain（EOF 语义），interrupt 优先：丢弃并转 errord
+        w.interrupt();
+        assert_eq!(w.len(), 0);
+        let err = r.read_multi_buffer().await.unwrap_err();
+        assert!(matches!(err, Error::WriteError(_)), "got {err:?}");
+    }
+
     // ========== Clone ==========
 
     #[tokio::test]
