@@ -177,11 +177,14 @@ async fn start_full_dispatched(
 
     // DNS 注入（对应 Go 装配链：instance 创建后 router.dns = core.GetFeature(dns)）：
     // routing domainStrategy（IpOnDemand/IpIfNonMatch）解析经 DnsClient 查询。
-    if let (Some(dns), Some(r)) = (
-        instance.get_feature::<xray_app_dns::DnsService>(),
-        dns_router.as_ref(),
-    ) {
-        r.set_dns_client(Arc::clone(&dns) as Arc<dyn xray_features::dns::DnsClient>);
+    if let Some(r) = dns_router.as_ref() {
+        if let Some(dns) = instance.get_feature::<xray_app_dns::DnsService>() {
+            r.set_dns_client(Arc::clone(&dns) as Arc<dyn xray_features::dns::DnsClient>);
+        } else if let Some(local) = instance.get_feature::<xray_features::dns::DefaultDnsFeature>() {
+            // Go 装配链：无 dns app 时 router 经 RequireFeatures 拿到
+            // essentialFeatures 注册的 localdns 默认 client（core/xray.go:213）。
+            r.set_dns_client(Arc::clone(&local) as Arc<dyn xray_features::dns::DnsClient>);
+        }
     }
 
     let ohm = Arc::new(SimpleOhm::new());

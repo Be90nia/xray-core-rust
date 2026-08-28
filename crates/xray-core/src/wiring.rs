@@ -876,26 +876,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl xray_features::dns::DnsClient for CountingDns {
-        async fn lookup(
+        async fn lookup_ip(
             &self,
             _domain: &str,
-        ) -> Result<Vec<Address>, xray_features::dns::DnsError> {
+            _option: xray_features::dns::IpOption,
+        ) -> Result<(Vec<std::net::IpAddr>, u32), xray_features::dns::DnsError> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(vec![Address::IPv4("1.2.3.4".parse().expect("ip"))])
-        }
-
-        async fn lookup_ipv4(
-            &self,
-            domain: &str,
-        ) -> Result<Vec<Address>, xray_features::dns::DnsError> {
-            self.lookup(domain).await
-        }
-
-        async fn lookup_ipv6(
-            &self,
-            _domain: &str,
-        ) -> Result<Vec<Address>, xray_features::dns::DnsError> {
-            Ok(vec![])
+            Ok((
+                vec![std::net::IpAddr::V4("1.2.3.4".parse().expect("ip"))],
+                60,
+            ))
         }
     }
 

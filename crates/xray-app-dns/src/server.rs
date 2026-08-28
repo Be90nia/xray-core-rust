@@ -265,72 +265,19 @@ impl Feature for DnsService {
     }
 }
 
-/// Go：`*DNS` 实现 `dns.Client` 接口（`LookupIP`）。路由 domainStrategy 经此解析。
+/// Go：`*DNS` 实现 `dns.Client` 接口（`LookupIP(domain, option) -> ([]IP, ttl, err)`，
+/// app/dns/dns.go:215-265）。路由 domainStrategy 经此解析。
+///
+/// 方法名与固有 [`DnsService::lookup_ip`] 同名——固有方法在具体类型上优先，
+/// `dyn DnsClient` 上调用走本实现（与 Go `(*DNS).LookupIP` 同名实现接口一致）。
 #[async_trait::async_trait]
 impl xray_features::dns::DnsClient for DnsService {
-    async fn lookup(
+    async fn lookup_ip(
         &self,
         domain: &str,
-    ) -> Result<Vec<xray_common::net::address::Address>, xray_features::dns::DnsError> {
-        let (ips, _) = self
-            .lookup_ip(domain, IpOption::all())
-            .await
-            .map_err(|e| xray_features::dns::DnsError::Other(e.to_string()))?;
-        Ok(ips
-            .into_iter()
-            .map(|ip| match ip {
-                IpAddr::V4(v) => xray_common::net::address::Address::IPv4(v),
-                IpAddr::V6(v) => xray_common::net::address::Address::IPv6(v),
-            })
-            .collect())
-    }
-
-    async fn lookup_ipv4(
-        &self,
-        domain: &str,
-    ) -> Result<Vec<xray_common::net::address::Address>, xray_features::dns::DnsError> {
-        let (ips, _) = self
-            .lookup_ip(
-                domain,
-                IpOption {
-                    ipv4_enable: true,
-                    ipv6_enable: false,
-                    fake_enable: false,
-                },
-            )
-            .await
-            .map_err(|e| xray_features::dns::DnsError::Other(e.to_string()))?;
-        Ok(ips
-            .into_iter()
-            .map(|ip| match ip {
-                IpAddr::V4(v) => xray_common::net::address::Address::IPv4(v),
-                IpAddr::V6(v) => xray_common::net::address::Address::IPv6(v),
-            })
-            .collect())
-    }
-
-    async fn lookup_ipv6(
-        &self,
-        domain: &str,
-    ) -> Result<Vec<xray_common::net::address::Address>, xray_features::dns::DnsError> {
-        let (ips, _) = self
-            .lookup_ip(
-                domain,
-                IpOption {
-                    ipv4_enable: false,
-                    ipv6_enable: true,
-                    fake_enable: false,
-                },
-            )
-            .await
-            .map_err(|e| xray_features::dns::DnsError::Other(e.to_string()))?;
-        Ok(ips
-            .into_iter()
-            .map(|ip| match ip {
-                IpAddr::V4(v) => xray_common::net::address::Address::IPv4(v),
-                IpAddr::V6(v) => xray_common::net::address::Address::IPv6(v),
-            })
-            .collect())
+        option: IpOption,
+    ) -> Result<(Vec<IpAddr>, u32), xray_features::dns::DnsError> {
+        self.lookup_ip(domain, option).await.map_err(Into::into)
     }
 }
 
@@ -777,5 +724,58 @@ mod tests {
         let first = check_routes();
         let second = check_routes();
         assert_eq!(first, second);
+    }
+
+    // ---- features::dns::DnsClient trait 边界（drj：单方法 + IPOption + TTL）----
+
+    fn make_trait_service(hosts: Vec<HostMapping>) -> std::sync::Arc<dyn xray_features::dns::DnsClient>
+    {
+        std::sync::Arc::new(make_service(Vec::new(), hosts))
+    }
+
+    #[tokio::test]
+    async fn trait_lookup_ip_returns_ips_and_ttl() {
+        // Go：*DNS 实现 dns.Client（dns.go:215），hosts 命中 → (ips, ttl=10)。
+        let svc = make_trait_service(vec![HostMapping {
+            domain: "example.com".to_string(),
+            ips: vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))],
+            proxied_domain: String::new(),
+        }]);
+        let (ips, ttl) = svc
+            .lookup_ip("example.com", IpOption::all())
+            .await
+            .expect("hosts hit must resolve");
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
+        assert_eq!(ttl, 10);
+    }
+
+    #[tokio::test]
+    async fn trait_lookup_ip_propagates_rcode_error() {
+        // hosts `#<rcode>` 映射 → Err(Rcode)（Go hosts.go:84 经 dns.RCodeError 上抛）。
+        let svc = make_trait_service(vec![HostMapping {
+            domain: "blocked.com".to_string(),
+            ips: Vec::new(),
+            proxied_domain: "#3".to_string(),
+        }]);
+        let err = svc
+            .lookup_ip("blocked.com", IpOption::all())
+            .await
+            .expect_err("rcode mapping must error");
+        assert!(matches!(err, xray_features::dns::DnsError::Rcode(3)));
+        assert_eq!(xray_features::dns::rcode_from_error(&err), 3);
+    }
+
+    #[tokio::test]
+    async fn trait_lookup_ip_propagates_empty_response_when_option_filters_all() {
+        // IPOption 双禁 → EmptyResponse 跨 trait 边界保真（Go dns.ErrEmptyResponse）。
+        let svc = make_trait_service(Vec::new());
+        let err = svc
+            .lookup_ip(
+                "example.com",
+                IpOption { ipv4_enable: false, ipv6_enable: false, fake_enable: false },
+            )
+            .await
+            .expect_err("no family enabled must error");
+        assert!(matches!(err, xray_features::dns::DnsError::EmptyResponse));
     }
 }

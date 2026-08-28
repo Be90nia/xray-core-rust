@@ -13,8 +13,8 @@ use crate::config::IpOption;
 use crate::error::DnsError;
 use crate::nameserver::Server;
 
-/// 默认 TTL（Go `dns_feature.DefaultTTL` = 300）。
-const DEFAULT_TTL: u32 = 300;
+/// 默认 TTL（Go `dns.DefaultTTL` = 300，features/dns/client.go:37）。
+pub use xray_features::dns::DEFAULT_TTL;
 
 /// 本地系统 DNS nameserver。对应 Go `LocalNameServer`。
 ///

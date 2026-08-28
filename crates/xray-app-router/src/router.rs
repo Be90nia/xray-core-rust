@@ -169,21 +169,19 @@ impl Router {
 
     /// 解析 ctx.target_domain 注入 target_ips（失败保持原状，规则照域名匹配）。
     async fn resolve_into(&self, ctx: &mut crate::context::RoutingData) {
-        use xray_common::net::address::Address;
+        use xray_features::dns::IpOption;
         let Some(dns) = self.dns.read().clone() else {
             return;
         };
         // Go ResolvableContext：IPOption{IPv4+IPv6, FakeDisable}
-        match dns.lookup(ctx.get_target_domain()).await {
-            Ok(addrs) => {
-                let ips: Vec<_> = addrs
-                    .into_iter()
-                    .filter_map(|a| match a {
-                        Address::IPv4(v) => Some(std::net::IpAddr::V4(v)),
-                        Address::IPv6(v) => Some(std::net::IpAddr::V6(v)),
-                        Address::Domain(_) => None,
-                    })
-                    .collect();
+        // （app/router/router_test.go:176-179 同参数）。
+        let option = IpOption {
+            ipv4_enable: true,
+            ipv6_enable: true,
+            fake_enable: false,
+        };
+        match dns.lookup_ip(ctx.get_target_domain(), option).await {
+            Ok((ips, _ttl)) => {
                 if !ips.is_empty() {
                     ctx.target_ips = ips;
                 }

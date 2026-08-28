@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use crate::config::{IpOption, QueryStrategy, generate_random_tag, validate_client_ip_len};
+use crate::config::{IpOption, QueryStrategy, generate_random_tag, ip_option_from_strategy, validate_client_ip_len};
 use crate::error::DnsError;
 use crate::hosts::{HostMapping, StaticHosts};
 use crate::nameserver::{Client, NameServerConfig, new_server};
@@ -105,7 +105,7 @@ impl DnsAppConfig {
     /// 注册失败——保持 Go 的「尽力而为」语义。
     pub fn build(self) -> Result<DnsServiceConfig, DnsError> {
         let query_strategy = parse_query_strategy(self.query_strategy.as_deref());
-        let base_ip_option = IpOption::from_strategy(query_strategy);
+        let base_ip_option = ip_option_from_strategy(query_strategy);
 
         let client_ip = parse_client_ip(self.client_ip.as_deref())?;
         validate_client_ip_len(client_ip.len())?;
@@ -160,6 +160,24 @@ impl DnsAppConfig {
                         "dns: skip unbuildable nameserver"
                     );
                 }
+            }
+        }
+
+        // Go dns.go:167-170：无任何 nameserver 时注入 `localhost` client
+        // （NewLocalDNSClient —— nameserver_local.go:51-53，系统 resolver 兜底）。
+        // 注意：Go 此路径不走 updateRules，故不加 localTLDs 域名规则。
+        if clients.is_empty() {
+            match crate::nameserver::local::new_local_name_server() {
+                Ok(server) => {
+                    clients.push(Arc::new(Client::new(
+                        NameServerConfig::default(),
+                        base_ip_option,
+                        server,
+                    )?));
+                }
+                // Go NewLocalNameServer 不会失败；Rust 系统 resolver 配置不可读时
+                // 保持空 clients（查询时返回 EmptyResponse）而非阻断整个 feature。
+                Err(e) => tracing::warn!(error = %e, "dns: default localhost client unavailable"),
             }
         }
         let domain_matcher = if all_rules.is_empty() {
@@ -471,10 +489,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_empty_config_succeeds() {
+    fn build_empty_config_injects_localhost_client() {
+        // Go dns.go:167-170：无任何 nameserver → 注入 localhost 默认 client
+        // （NewLocalDNSClient，系统 resolver 兜底）。
         let cfg: DnsAppConfig = serde_json::from_str("{}").unwrap();
         let built = cfg.build().unwrap();
-        assert!(built.clients.is_empty());
+        // 系统 resolver 配置不可读的极端环境注入失败 → 0；正常环境恰 1。
+        assert!(built.clients.len() <= 1, "unexpected client count: {}", built.clients.len());
+        if let Some(c) = built.clients.first() {
+            assert_eq!(c.server.name(), "localhost");
+            assert!(c.server.is_disable_cache());
+        }
         assert_eq!(built.query_strategy, QueryStrategy::UseIp);
         assert!(!built.disable_fallback);
         assert!(built.tag.starts_with("xray.system."));
@@ -501,8 +526,12 @@ mod tests {
         let json = r#"{"servers": [{"address": "dns.google"}]}"#;
         let cfg: DnsAppConfig = serde_json::from_str(json).unwrap();
         let built = cfg.build().unwrap();
-        // 域名地址不可构造 → 跳过，clients 为空但不报错。
-        assert!(built.clients.is_empty());
+        // 域名地址不可构造 → 跳过；clients 落空后同样触发 localhost 兜底注入
+        // （Go：New() 在 clients 循环之后判空注入）。
+        assert!(built.clients.len() <= 1);
+        if let Some(c) = built.clients.first() {
+            assert_eq!(c.server.name(), "localhost");
+        }
     }
 
     #[test]

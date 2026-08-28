@@ -69,44 +69,21 @@ impl QueryStrategy {
     }
 }
 
-/// DNS 查询的 IP 过滤选项。对应 Go `features/dns.IPOption`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IpOption {
-    /// 启用 IPv4 查询。
-    pub ipv4_enable: bool,
-    /// 启用 IPv6 查询。
-    pub ipv6_enable: bool,
-    /// 启用 FakeDNS 响应。
-    pub fake_enable: bool,
-}
+/// DNS 查询的 IP 过滤选项。对应 Go `features/dns.IPOption`（client.go:10-15）。
+///
+/// 类型本体在 `xray-features::dns`（Go 同样定义于 features/dns，app/dns 引用之）；
+/// 此处 re-export 保持 `crate::config::IpOption` 路径兼容。
+pub use xray_features::dns::IpOption;
 
-impl IpOption {
-    /// 全开（默认值）。
-    #[must_use]
-    pub const fn all() -> Self {
-        Self {
-            ipv4_enable: true,
-            ipv6_enable: true,
-            fake_enable: true,
-        }
-    }
-
-    /// 是否完全无查询目标。
-    #[must_use]
-    pub const fn is_empty(self) -> bool {
-        !self.ipv4_enable && !self.ipv6_enable
-    }
-
-    /// 从查询策略推导默认 IPOption（不含 `UseSys` 的系统探测）。
-    /// `fake_enable` 默认 false，对应 Go `New()` 中初始 `ipOption`。
-    #[must_use]
-    pub const fn from_strategy(s: QueryStrategy) -> Self {
-        let (v4, v6) = s.ip_enables();
-        Self {
-            ipv4_enable: v4,
-            ipv6_enable: v6,
-            fake_enable: false,
-        }
+/// 从查询策略推导默认 IPOption（不含 `UseSys` 的系统探测）。
+/// `fake_enable` 默认 false，对应 Go `New()` 中初始 `ipOption`（dns.go:52-82）。
+#[must_use]
+pub const fn ip_option_from_strategy(s: QueryStrategy) -> IpOption {
+    let (v4, v6) = s.ip_enables();
+    IpOption {
+        ipv4_enable: v4,
+        ipv6_enable: v6,
+        fake_enable: false,
     }
 }
 
@@ -211,7 +188,7 @@ mod tests {
 
     #[test]
     fn ip_option_from_strategy_has_fake_disabled() {
-        let o = IpOption::from_strategy(QueryStrategy::UseIp);
+        let o = ip_option_from_strategy(QueryStrategy::UseIp);
         assert!(o.ipv4_enable && o.ipv6_enable);
         assert!(!o.fake_enable);
     }

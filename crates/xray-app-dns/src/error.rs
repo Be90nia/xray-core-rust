@@ -103,6 +103,22 @@ impl DnsError {
     }
 }
 
+/// app 层错误 → features 层错误（trait 边界透传）。
+///
+/// `EmptyResponse` / `RCodeError` 语义保真映射（Go 中两者为同一错误类型跨层传递），
+/// 其余降级为 `Other` 字符串。
+impl From<DnsError> for xray_features::dns::DnsError {
+    fn from(e: DnsError) -> Self {
+        use xray_features::dns::DnsError as F;
+        match e {
+            DnsError::EmptyResponse => F::EmptyResponse,
+            DnsError::RCodeError(code) => F::Rcode(code),
+            DnsError::Features(f) => f,
+            other => F::Other(other.to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
