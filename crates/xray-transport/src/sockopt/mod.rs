@@ -17,7 +17,7 @@ pub mod linux;
 pub mod windows;
 #[cfg(target_os = "macos")]
 pub mod darwin;
-#[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
+#[cfg(target_os = "freebsd")]
 pub mod freebsd;
 use std::time::Duration;
 use socket2::Socket;
@@ -39,8 +39,10 @@ pub struct SocketOptions {
     /// SO_MARK 包标记值（Linux fwmark），用于 iptables/fwmark 策略路由。`0`=不设置。
     /// 对应 Go `SocketConfig.Mark`。仅 Linux 有效，其他平台忽略。
     pub mark: u32,
-    /// TCP Fast Open。对应 Go `SocketConfig.Tfo`。
-    /// Windows 不支持 per-socket TFO（需系统级注册表设置），FreeBSD 12.1+/Linux 支持。
+    /// TCP Fast Open。对应 Go `SocketConfig.Tfo`（Go `ParseTFOValue()` 三态在平台
+    /// 模块以 `i32` 表达；bool `true` 映射为启用）。
+    /// Linux（TCP_FASTOPEN_CONNECT）/ FreeBSD 12.1+ / Windows 10 1607+（Winsock
+    /// TCP_FASTOPEN=15，见 [`windows`] 模块）支持；macOS 用 CLIENT/SERVER 位标志。
     pub tcp_fast_open: bool,
     /// Multipath TCP（MPTCP）。对应 Go `SocketConfig.TcpMptcp`（字段 19，JSON `tcpMptcp`）。
     /// 仅 Linux 生效；其他平台或不支持 MPTCP 的内核上静默回退普通 TCP
@@ -137,14 +139,10 @@ pub fn apply_outbound_socket_options(socket: &Socket, opts: &SocketOptions) -> s
             if opts.bind_if_index > 0 { linux_opt.set_so_bindtodevice(fd)?; }
         }
     }
-    // TCP_FASTOPEN：Windows 不支持 per-socket（系统级注册表），FreeBSD/Linux 支持。
-    // Go 在 Windows 也是 no-op（参见 sockopt_windows.go）。
-    #[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
-    {
-        if opts.tcp_fast_open {
-            let _ = opts; // FreeBSD TFO 需 libc::TCP_FASTOPEN，留 follow-up
-        }
-    }
+    // TCP_FASTOPEN：Go 各平台 outbound/inbound 均设置（Windows 是真实实现：对
+    // Winsock TCP_FASTOPEN=15 setsockopt，Win10 1607+ 支持，sockopt_windows.go:16-32）。
+    // 生产链路（dialer/listener）的 TFO 接入与 Linux/macOS 一致留待统一批次，
+    // 平台能力已就位于 [`windows`] / [`freebsd`] / [`linux`] / [`darwin`] 模块。
     Ok(())
 }
 
