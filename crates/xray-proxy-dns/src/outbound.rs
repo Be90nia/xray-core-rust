@@ -4,6 +4,7 @@
 //! 接收 dispatcher 转发的 DNS 查询字节 → 解析 → 调用上游 resolver → 返回 DNS 响应字节。
 
 use std::net::IpAddr;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use hickory_resolver::config::{ConnectionConfig, NameServerConfig, ResolverConfig};
@@ -104,6 +105,103 @@ fn error_response(id: u16, rcode: ResponseCode) -> Result<Vec<u8>> {
     Message::error_msg(id, OpCode::Query, rcode)
         .to_vec()
         .map_err(|e| DnsProxyError::ResponseBuildFailed(e.to_string()))
+}
+
+// ── 原样字节转发（Go outboundConn + Direct/ownLink 动作） ─────────────
+/// 解析 Destination 为 SocketAddr（域名经系统解析）。公开供装配层复用。
+pub async fn resolve_dest_socket_addr(
+    dest: &Destination,
+) -> std::result::Result<std::net::SocketAddr, String> {
+    dest_to_socket_addr(dest).await
+}
+
+async fn dest_to_socket_addr(
+    dest: &Destination,
+) -> std::result::Result<std::net::SocketAddr, String> {
+    use xray_common::net::address::Address;
+    let port = dest.port().value();
+    match dest.address() {
+        Address::IPv4(v4) => Ok(std::net::SocketAddr::from((*v4, port))),
+        Address::IPv6(v6) => Ok(std::net::SocketAddr::from((*v6, port))),
+        Address::Domain(d) => tokio::net::lookup_host((d.as_str(), port))
+            .await
+            .map_err(|e| e.to_string())?
+            .next()
+            .ok_or_else(|| "no address resolved".to_string()),
+    }
+}
+
+/// 原样转发 DNS 查询字节到上游（UDP 往返）。
+///
+/// 对应 Go `outboundConn` UDP 路径：query 原封不动发给上游（保留 EDNS0 /
+/// 任意 qType），响应字节原样返回。每查询独立 socket。
+///
+/// # Errors
+/// - [`DnsProxyError::UpstreamForwardFailed`]：拨号/转发/超时失败。
+pub async fn forward_udp_raw(
+    query: &[u8],
+    dest: &Destination,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    let addr = dest_to_socket_addr(dest)
+        .await
+        .map_err(|e| DnsProxyError::UpstreamForwardFailed(e))?;
+    let sock = tokio::net::UdpSocket::bind(if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" })
+        .await
+        .map_err(|e| DnsProxyError::UpstreamForwardFailed(format!("bind: {e}")))?;
+    sock.connect(addr)
+        .await
+        .map_err(|e| DnsProxyError::UpstreamForwardFailed(format!("connect: {e}")))?;
+    sock.send(query)
+        .await
+        .map_err(|e| DnsProxyError::UpstreamForwardFailed(format!("send: {e}")))?;
+    let mut buf = vec![0u8; 4096];
+    let n = tokio::time::timeout(timeout, sock.recv(&mut buf))
+        .await
+        .map_err(|_| DnsProxyError::UpstreamForwardFailed("udp upstream timeout".into()))?
+        .map_err(|e| DnsProxyError::UpstreamForwardFailed(format!("recv: {e}")))?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+/// 原样转发 DNS 查询字节到上游（TCP 长度前缀帧往返）。
+///
+/// 对应 Go `outboundConn` TCP 路径（`dns_proto.TCPWriter`/`NewTCPReader`）。
+///
+/// # Errors
+/// - [`DnsProxyError::UpstreamForwardFailed`]：拨号/转发/超时失败。
+/// - [`DnsProxyError::ResponseBuildFailed`]：query 超长。
+pub async fn forward_tcp_raw(
+    query: &[u8],
+    dest: &Destination,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let addr = dest_to_socket_addr(dest)
+        .await
+        .map_err(|e| DnsProxyError::UpstreamForwardFailed(e))?;
+    let mut stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr))
+        .await
+        .map_err(|_| DnsProxyError::UpstreamForwardFailed("tcp upstream connect timeout".into()))?
+        .map_err(|e| DnsProxyError::UpstreamForwardFailed(format!("connect: {e}")))?;
+    let framed = crate::handler::encode_tcp_dns_message(query)?;
+    stream
+        .write_all(&framed)
+        .await
+        .map_err(|e| DnsProxyError::UpstreamForwardFailed(format!("write: {e}")))?;
+    let mut len_buf = [0u8; 2];
+    tokio::time::timeout(timeout, stream.read_exact(&mut len_buf))
+        .await
+        .map_err(|_| DnsProxyError::UpstreamForwardFailed("tcp upstream read timeout".into()))?
+        .map_err(|e| DnsProxyError::UpstreamForwardFailed(format!("read len: {e}")))?;
+    let len = u16::from_be_bytes(len_buf) as usize;
+    let mut resp = vec![0u8; len];
+    tokio::time::timeout(timeout, stream.read_exact(&mut resp))
+        .await
+        .map_err(|_| DnsProxyError::UpstreamForwardFailed("tcp upstream read timeout".into()))?
+        .map_err(|e| DnsProxyError::UpstreamForwardFailed(format!("read body: {e}")))?;
+    Ok(resp)
 }
 
 #[async_trait]

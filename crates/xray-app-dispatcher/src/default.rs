@@ -1014,7 +1014,7 @@ impl DefaultDispatcher {
             };
             let final_link = xray_transport::link::Link::new(reader, writer);
 
-            let fut = handler.dispatch(&final_dest, final_link);
+            let fut = handler.dispatch_with_access(&final_dest, final_link, access.unwrap_or_default());
             let _ = fut.await;
         };
 

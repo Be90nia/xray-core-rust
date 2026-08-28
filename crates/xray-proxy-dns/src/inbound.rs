@@ -166,7 +166,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn handle_packet_return_rule_returns_refused() {
+    async fn handle_packet_return_rule_responds_with_rule_rcode() {
         let inbound = make_inbound_with_rules(vec![DnsRuleConfig {
             action: RuleAction::Return,
             q_type: vec![1],
@@ -177,11 +177,11 @@ mod tests {
             .handle_packet(&query)
             .await
             .expect("process")
-            .expect("Return 应返回 Some");
-        // 验证响应是 REFUSED(5)
+        .expect("Return 应返回 Some");
+        // Go rejectNonIPQuery：rCode 未配置 → 0（不再硬编码 REFUSED）。
         let (header, _) = crate::dns_message::parse_dns_query(&resp).expect("parse resp");
         assert!(header.is_response());
-        assert_eq!(header.rcode(), 5);
+        assert_eq!(header.rcode(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

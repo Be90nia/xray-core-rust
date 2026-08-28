@@ -27,52 +27,119 @@ use crate::error::{DnsProxyError, Result};
 pub struct Handler {
     /// 编译后的规则列表（按配置顺序）。
     rules: Vec<DnsRule>,
-    /// 重写上游 DNS 服务器地址（Hijack 动作目标）。
-    rewrite_server: Option<Destination>,
-    /// 查询超时。对应 Go `timeout`（从 `policy` 获取，切片2 默认 5s）。
+    /// 重写上游 DNS 服务器（network/address/port 三字段独立覆盖）。
+    /// 对应 Go `rewriteServer` + `Process` 中逐字段覆盖 dest 的逻辑。
+    rewrite: RewriteOverrides,
+    /// 查询超时。对应 Go `timeout`（从 `policy` 获取）。
     pub timeout: Duration,
+}
+
+/// rewriteServer 字段级覆盖。对应 Go `net.Destination` 三字段非零覆盖语义。
+#[derive(Debug, Clone, Default)]
+pub struct RewriteOverrides {
+    /// 覆盖网络类型（proto network != Unknown 时生效）。
+    pub network: Option<xray_common::net::network::Network>,
+    /// 覆盖地址。
+    pub address: Option<xray_common::net::address::Address>,
+    /// 覆盖端口（proto port != 0 时生效）。
+    pub port: Option<xray_common::net::port::Port>,
+}
+
+/// prost Endpoint → 字段级覆盖（Go `rewriteServer.AsDestination()` 的覆盖语义）。
+fn prost_endpoint_to_overrides(
+    ep: &xray_proto::xray::common::net::Endpoint,
+) -> RewriteOverrides {
+    use xray_common::net::address::Address;
+    use xray_common::net::network::Network;
+    use xray_common::net::port::Port;
+
+    let network = xray_proto::xray::common::net::Network::try_from(ep.network)
+        .ok()
+        .filter(|n| *n != xray_proto::xray::common::net::Network::Unknown)
+        .map(|n| match n {
+            xray_proto::xray::common::net::Network::Tcp => Network::TCP,
+            _ => Network::UDP,
+        });
+    let address = ep.address.as_ref().and_then(|iod| iod.address.as_ref()).map(
+        |a| match a {
+            xray_proto::xray::common::net::ip_or_domain::Address::Ip(bytes) => {
+                if bytes.len() == 4 {
+                    let mut b = [0u8; 4];
+                    b.copy_from_slice(bytes);
+                    Address::IPv4(std::net::Ipv4Addr::from(b))
+                } else {
+                    let mut b = [0u8; 16];
+                    b.copy_from_slice(&bytes[..16.min(bytes.len())]);
+                    Address::IPv6(std::net::Ipv6Addr::from(b))
+                }
+            }
+            xray_proto::xray::common::net::ip_or_domain::Address::Domain(d) => {
+                Address::Domain(d.clone())
+            }
+        },
+    );
+    let port = u16::try_from(ep.port).ok().filter(|p| *p != 0).map(Port::new);
+    RewriteOverrides { network, address, port }
 }
 
 impl Handler {
     /// 从配置初始化 Handler。对应 Go `Handler.Init(config, dnsClient, policyManager)`。
     ///
-    /// 切片2 不注入 `dns.Client` + `policy.Manager`（依赖未连接），用默认超时。
+    /// Rust 切片不注入 `dns.Client` + `policy.Manager`（由生产装配层
+    /// `DnsDispatchBridge` 持有 DnsService），超时用固定值。
     pub fn init(config: &Config) -> Self {
         let rules: Vec<DnsRule> = config.rule.iter().map(DnsRule::from_config).collect();
+        let rewrite = config
+            .rewrite_server
+            .as_ref()
+            .map(prost_endpoint_to_overrides)
+            .unwrap_or_default();
         Self {
             rules,
-            rewrite_server: config.rewrite_server.clone().map(|_ep| {
-                // ponytail: IPOrDomain → Destination 转换留切片3 强类型化。
-                // 当前从 prost Endpoint 提取 address/port。
-                Destination::tcp(
-                    xray_common::net::address::Address::Domain("placeholder".into()),
-                    xray_common::net::port::Port::new(53),
-                )
-            }),
+            rewrite,
             timeout: Duration::from_secs(5),
         }
     }
 
-    /// 查找首个匹配的规则。对应 Go `Handler` 内部规则遍历逻辑。
+    /// 查找首个匹配的规则，返回 `(action, rCode)`。
     ///
-    /// 返回匹配的 [`RuleAction`]，无匹配返回默认 [`RuleAction::Direct`]。
-    ///
-    /// 匹配条件：`rule.apply(q_type, domain)` 返回 true。
-    /// 切片2 `domain` 匹配依赖 `geodata::DomainMatcher`，当前 `apply` 只校验 qType。
+    /// 对应 Go `applyRules`：无规则命中时默认 A/AAAA → `Hijack`（内部
+    /// DNS 客户端解析，可触发 FakeDNS），其余类型 → `Return`（空响应）。
     #[must_use]
-    pub fn match_rules(&self, q_type: u16, domain: &str) -> RuleAction {
+    pub fn match_rules(&self, q_type: u16, domain: &str) -> (RuleAction, u16) {
         for rule in &self.rules {
             if rule.apply(q_type, domain) {
-                return rule.action;
+                return (rule.action, rule.r_code);
             }
         }
-        RuleAction::Direct
+        if q_type == QTYPE_A || q_type == QTYPE_AAAA {
+            (RuleAction::Hijack, 0)
+        } else {
+            (RuleAction::Return, 0)
+        }
     }
 
-    /// 重写上游 DNS 服务器（Hijack 动作目标）。
+    /// 应用 rewriteServer 覆盖。对应 Go `Process` 开头的 dest 三字段覆盖。
     #[must_use]
-    pub fn rewrite_server(&self) -> Option<&Destination> {
-        self.rewrite_server.as_ref()
+    pub fn rewrite_dest(&self, base: &Destination) -> Destination {
+        let mut dest = base.clone();
+        if let Some(n) = self.rewrite.network {
+            dest = dest.with_network(n);
+        }
+        if self.rewrite.address.is_some() || self.rewrite.port.is_some() {
+            let address = self.rewrite.address.clone().unwrap_or_else(|| base.address().clone());
+            let port = self.rewrite.port.unwrap_or(base.port());
+            dest = Destination::new(address, port, dest.network());
+        }
+        dest
+    }
+
+    /// 是否配置了 rewriteServer。
+    #[must_use]
+    pub fn has_rewrite(&self) -> bool {
+        self.rewrite.network.is_some()
+            || self.rewrite.address.is_some()
+            || self.rewrite.port.is_some()
     }
 
     /// 规则数量。
@@ -81,42 +148,55 @@ impl Handler {
         self.rules.len()
     }
 
-    /// 处理一条 DNS 查询，返回决策结果。对应 Go `Handler.Process` 的纯决策部分。
-    ///
-    /// 本函数不做 IO（dispatcher 模式）：
-    /// - 解析 DNS query（`parse_dns_query`）
-    /// - `match_rules` 查找首个命中规则
-    /// - 按 action 构造 [`ProcessOutcome`] 交由调用方（dispatcher）执行
-    ///
-    /// action → outcome 映射：
-    /// - `Direct` → [`ProcessOutcome::Forward`]（query 原样转给调用方）
-    /// - `Drop` → [`ProcessOutcome::Drop`]（不响应）
-    /// - `Return` → [`ProcessOutcome::Respond`]（构造 REFUSED 空响应）
-    /// - `Hijack` → [`ProcessOutcome::Hijack`]（转给 `rewrite_server`，调用方执行）
+    /// 处理一条 DNS 查询，返回决策结果（`process` 的纯决策核心，无 IO）。
     ///
     /// # Errors
     /// - [`DnsProxyError::QueryParseFailed`]：`query` 不是合法 DNS 消息。
     pub async fn process(&self, query: &[u8]) -> Result<ProcessOutcome> {
         let (header, question) = parse_dns_query(query)
             .map_err(|e| DnsProxyError::QueryParseFailed(e.to_string()))?;
-        let action = self.match_rules(question.q_type, &question.name);
+        let (action, r_code) = self.match_rules(question.q_type, &question.name);
         let outcome = match action {
             RuleAction::Drop => ProcessOutcome::Drop,
             RuleAction::Return => {
-                // Return 动作：REFUSED(5) 空响应
-                let response = build_dns_response(&header, &question, 5);
-                ProcessOutcome::Respond { response }
+                // Go rejectNonIPQuery：空域名（去尾点后）不构造响应。
+                if question.name.trim_end_matches('.').is_empty() {
+                    ProcessOutcome::Drop
+                } else {
+                    ProcessOutcome::Respond {
+                        response: build_dns_response(&header, &question, r_code as u8),
+                    }
+                }
             }
             RuleAction::Direct => ProcessOutcome::Forward {
                 query: query.to_vec(),
             },
-            RuleAction::Hijack => ProcessOutcome::Hijack {
-                query: query.to_vec(),
-            },
+            RuleAction::Hijack => {
+                // Go：非 A/AAAA 劫持 → rejectNonIPQuery（按规则 rCode 拒绝）。
+                if question.q_type != QTYPE_A && question.q_type != QTYPE_AAAA {
+                    if question.name.trim_end_matches('.').is_empty() {
+                        ProcessOutcome::Drop
+                    } else {
+                        ProcessOutcome::Respond {
+                            response: build_dns_response(&header, &question, r_code as u8),
+                        }
+                    }
+                } else {
+                    ProcessOutcome::Hijack {
+                        query: query.to_vec(),
+                    }
+                }
+            }
         };
         Ok(outcome)
     }
 }
+
+/// DNS QTYPE 常量（RFC 1035 §3.2.3）。
+pub const QTYPE_A: u16 = 1;
+/// AAAA 记录类型（RFC 3596）。
+pub const QTYPE_AAAA: u16 = 28;
+
 
 // ---------------------------------------------------------------------------
 // DNS over TCP 长度前缀帧（RFC 1035 §4.2.2）
@@ -163,13 +243,12 @@ pub enum ProcessOutcome {
     Hijack { query: Vec<u8> },
 }
 
-/// 对 DNS Question 应用 Handler 规则，返回决策结果。
+/// 对 DNS Question 应用 Handler 规则，返回决策结果（action）。
 ///
 /// 这是 `process` 的纯函数核心——不涉及 IO，便于测试。
-/// `process` 在切片3 中读消息 → 调此函数 → 按结果执行 IO。
 #[must_use]
 pub fn decide_action(handler: &Handler, question: &DnsQuestion) -> RuleAction {
-    handler.match_rules(question.q_type, &question.name)
+    handler.match_rules(question.q_type, &question.name).0
 }
 
 #[cfg(test)]
@@ -199,12 +278,6 @@ mod tests {
         assert_eq!(h.rule_count(), 1);
     }
 
-    #[test]
-    fn match_rules_no_match_returns_direct() {
-        let h = Handler::init(&Config::default());
-        assert_eq!(h.match_rules(1, "example.com"), RuleAction::Direct);
-        assert_eq!(h.match_rules(28, "test.com"), RuleAction::Direct);
-    }
 
     #[test]
     fn match_rules_qtype_drop_aaaa() {
@@ -218,9 +291,9 @@ mod tests {
         };
         let h = Handler::init(&cfg);
         // AAAA 匹配 Drop
-        assert_eq!(h.match_rules(28, "any.com"), RuleAction::Drop);
-        // A 不匹配，返回 Direct
-        assert_eq!(h.match_rules(1, "any.com"), RuleAction::Direct);
+        assert_eq!(h.match_rules(28, "any.com"), (RuleAction::Drop, 0));
+        // A 不匹配规则 → Go 默认 A/AAAA = Hijack（dns.go:148-150）
+        assert_eq!(h.match_rules(1, "any.com"), (RuleAction::Hijack, 0));
     }
 
     #[test]
@@ -230,6 +303,7 @@ mod tests {
                 DnsRuleConfig {
                     action: RuleAction::Return,
                     q_type: vec![1, 28], // A + AAAA
+                    r_code: 5,
                     ..Default::default()
                 },
                 DnsRuleConfig {
@@ -241,12 +315,12 @@ mod tests {
             ..Default::default()
         };
         let h = Handler::init(&cfg);
-        // A 匹配第一条规则（Return）
-        assert_eq!(h.match_rules(1, "x.com"), RuleAction::Return);
+        // A 匹配第一条规则（Return + rCode 5 透传）
+        assert_eq!(h.match_rules(1, "x.com"), (RuleAction::Return, 5));
         // AAAA 只匹配第一条规则
-        assert_eq!(h.match_rules(28, "x.com"), RuleAction::Return);
-        // 其他类型不匹配任何规则
-        assert_eq!(h.match_rules(15, "x.com"), RuleAction::Direct); // MX
+        assert_eq!(h.match_rules(28, "x.com"), (RuleAction::Return, 5));
+        // 其他类型不匹配任何规则 → Go 默认非 A/AAAA = Return（rCode 0）
+        assert_eq!(h.match_rules(15, "x.com"), (RuleAction::Return, 0)); // MX
     }
 
     #[test]
@@ -260,11 +334,77 @@ mod tests {
             ..Default::default()
         };
         let h = Handler::init(&cfg);
-        assert_eq!(h.match_rules(1, "a.com"), RuleAction::Hijack);
-        assert_eq!(h.match_rules(28, "b.com"), RuleAction::Hijack);
-        assert_eq!(h.match_rules(255, "c.com"), RuleAction::Hijack);
+        assert_eq!(h.match_rules(1, "a.com"), (RuleAction::Hijack, 0));
+        assert_eq!(h.match_rules(28, "b.com"), (RuleAction::Hijack, 0));
+        assert_eq!(h.match_rules(255, "c.com"), (RuleAction::Hijack, 0));
     }
 
+    /// Go applyRules 无匹配默认：A/AAAA → Hijack；其余 → Return。
+    #[test]
+    fn match_rules_defaults_a_hijack_others_return() {
+        let h = Handler::init(&Config::default());
+        assert_eq!(h.match_rules(1, "a.com"), (RuleAction::Hijack, 0));
+        assert_eq!(h.match_rules(28, "b.com"), (RuleAction::Hijack, 0));
+        assert_eq!(h.match_rules(15, "mx.com"), (RuleAction::Return, 0));
+        assert_eq!(h.match_rules(16, "txt.com"), (RuleAction::Return, 0));
+    }
+
+    /// rewriteServer 三字段独立覆盖（Go dns.go:166-174）。
+    #[test]
+    fn rewrite_dest_overrides_fields_independently() {
+        use xray_common::net::address::Address;
+        use xray_common::net::port::Port;
+
+        let base = Destination::udp(
+            Address::IPv4("8.8.8.8".parse().unwrap()),
+            Port::new(53),
+        );
+
+        // 未配置 → 原样。
+        let h = Handler::init(&Config::default());
+        assert!(!h.has_rewrite());
+        assert_eq!(h.rewrite_dest(&base), base);
+
+        // 仅重写端口（Go: RewriteServer.Port != 0 覆盖 port）。
+        let cfg = Config {
+            rewrite_server: Some(xray_proto::xray::common::net::Endpoint {
+                network: 0, // Unknown → 不覆盖
+                address: None,
+                port: 5353,
+            }),
+            ..Default::default()
+        };
+        let h = Handler::init(&cfg);
+        assert!(h.has_rewrite());
+        let d = h.rewrite_dest(&base);
+        assert_eq!(d.port().value(), 5353);
+        assert_eq!(*d.address(), base.address().clone());
+        assert!(d.is_udp());
+
+        // network=TCP + domain + port 全覆盖。
+        let cfg = Config {
+            rewrite_server: Some(xray_proto::xray::common::net::Endpoint {
+                network: 2, // TCP（xray.common.net.Network.TCP = 2）
+                address: Some(xray_proto::xray::common::net::IpOrDomain {
+                    address: Some(
+                        xray_proto::xray::common::net::ip_or_domain::Address::Domain(
+                            "dns.example.com".into(),
+                        ),
+                    ),
+                }),
+                port: 853,
+            }),
+            ..Default::default()
+        };
+        let h = Handler::init(&cfg);
+        let d = h.rewrite_dest(&base);
+        assert!(d.is_tcp());
+        assert_eq!(d.port().value(), 853);
+        assert_eq!(
+            *d.address(),
+            Address::Domain("dns.example.com".into())
+        );
+    }
     #[test]
     fn decide_action_uses_match_rules() {
         let cfg = Config {
@@ -316,27 +456,12 @@ mod tests {
     }
 
     #[test]
-    fn process_drop_when_rule_matches() {
-        let cfg = Config {
-            rule: vec![DnsRuleConfig {
-                action: RuleAction::Drop,
-                q_type: vec![1], // A
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let h = Handler::init(&cfg);
-        let query = make_query_bytes("example.com", 1);
-        let outcome = futures_lite_or_block_on(h.process(&query)).expect("process");
-        assert!(matches!(outcome, ProcessOutcome::Drop));
-    }
-
-    #[test]
-    fn process_respond_refused_when_action_return() {
+    fn process_respond_uses_rule_rcode() {
         let cfg = Config {
             rule: vec![DnsRuleConfig {
                 action: RuleAction::Return,
                 q_type: vec![1],
+                r_code: 5, // REFUSED
                 ..Default::default()
             }],
             ..Default::default()
@@ -346,10 +471,30 @@ mod tests {
         let outcome = futures_lite_or_block_on(h.process(&query)).expect("process");
         match outcome {
             ProcessOutcome::Respond { response } => {
-                // 解析响应验证 RCODE=5(REFUSED) + QR=1
-                let (header, _) = crate::dns_message::parse_dns_query(&response).expect("parse resp");
+                let (header, _) =
+                    crate::dns_message::parse_dns_query(&response).expect("parse resp");
                 assert!(header.is_response());
                 assert_eq!(header.rcode(), 5);
+            }
+            _ => panic!("expected Respond, got {outcome:?}"),
+        }
+
+        // rCode 未配置（默认 0）→ rcode 0 空响应。
+        let cfg0 = Config {
+            rule: vec![DnsRuleConfig {
+                action: RuleAction::Return,
+                q_type: vec![1],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let h0 = Handler::init(&cfg0);
+        let outcome = futures_lite_or_block_on(h0.process(&query)).expect("process");
+        match outcome {
+            ProcessOutcome::Respond { response } => {
+                let (header, _) =
+                    crate::dns_message::parse_dns_query(&response).expect("parse resp");
+                assert_eq!(header.rcode(), 0);
             }
             _ => panic!("expected Respond, got {outcome:?}"),
         }
@@ -357,13 +502,47 @@ mod tests {
 
     #[test]
     fn process_forward_when_action_direct() {
-        // 默认配置无规则 → Direct
-        let h = Handler::init(&Config::default());
+        // 显式 Direct 规则（无规则时 A/AAAA 默认 Hijack）。
+        let cfg = Config {
+            rule: vec![DnsRuleConfig {
+                action: RuleAction::Direct,
+                q_type: vec![28],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let h = Handler::init(&cfg);
         let query = make_query_bytes("x.com", 28);
         let outcome = futures_lite_or_block_on(h.process(&query)).expect("process");
         match outcome {
             ProcessOutcome::Forward { query: q } => assert_eq!(q, query),
             _ => panic!("expected Forward, got {outcome:?}"),
+        }
+    }
+
+    /// 无规则 + A 查询 → 默认 Hijack（Go dns.go:148）。
+    #[test]
+    fn process_default_a_query_hijacks() {
+        let h = Handler::init(&Config::default());
+        let query = make_query_bytes("default.example.com", 1);
+        let outcome = futures_lite_or_block_on(h.process(&query)).expect("process");
+        assert!(matches!(outcome, ProcessOutcome::Hijack { .. }));
+    }
+
+    /// 无规则 + TXT 查询 → 默认 Return 空响应（Go dns.go:150-151）。
+    #[test]
+    fn process_default_txt_query_returns_empty() {
+        let h = Handler::init(&Config::default());
+        let query = make_query_bytes("default.example.com", 16); // TXT
+        let outcome = futures_lite_or_block_on(h.process(&query)).expect("process");
+        match outcome {
+            ProcessOutcome::Respond { response } => {
+                let (header, _) =
+                    crate::dns_message::parse_dns_query(&response).expect("parse resp");
+                assert!(header.is_response());
+                assert_eq!(header.rcode(), 0);
+            }
+            _ => panic!("expected Respond, got {outcome:?}"),
         }
     }
 
@@ -383,6 +562,31 @@ mod tests {
         match outcome {
             ProcessOutcome::Hijack { query: q } => assert_eq!(q, query),
             _ => panic!("expected Hijack, got {outcome:?}"),
+        }
+    }
+
+    /// Hijack 规则命中非 A/AAAA → rejectNonIPQuery（Go dns.go:268-272）。
+    #[test]
+    fn process_hijack_non_ip_query_rejects() {
+        let cfg = Config {
+            rule: vec![DnsRuleConfig {
+                action: RuleAction::Hijack,
+                q_type: vec![], // 匹配所有
+                r_code: 5,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let h = Handler::init(&cfg);
+        let query = make_query_bytes("txt.example.com", 16); // TXT
+        let outcome = futures_lite_or_block_on(h.process(&query)).expect("process");
+        match outcome {
+            ProcessOutcome::Respond { response } => {
+                let (header, _) =
+                    crate::dns_message::parse_dns_query(&response).expect("parse resp");
+                assert_eq!(header.rcode(), 5);
+            }
+            _ => panic!("expected Respond, got {outcome:?}"),
         }
     }
 
@@ -416,10 +620,9 @@ mod tests {
         assert!(matches!(err, DnsProxyError::ResponseBuildFailed(_)));
     }
 
-
     #[test]
     fn rewrite_server_none_by_default() {
         let h = Handler::init(&Config::default());
-        assert!(h.rewrite_server().is_none());
+        assert!(!h.has_rewrite());
     }
 }

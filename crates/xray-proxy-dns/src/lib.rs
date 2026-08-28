@@ -28,6 +28,6 @@ pub mod outbound;
 pub use config::{Config, DnsRule, DnsRuleConfig, RuleAction};
 pub use dns_message::{DnsHeader, DnsQuestion, build_dns_response, build_ip_response, parse_dns_query};
 pub use error::{DnsProxyError, Result};
-pub use handler::{Handler, ProcessOutcome, decide_action};
+pub use handler::{Handler, ProcessOutcome, QTYPE_A, QTYPE_AAAA, decode_tcp_dns_message, decide_action, encode_tcp_dns_message};
 pub use inbound::DnsInbound;
-pub use outbound::DnsOutbound;
+pub use outbound::{DnsOutbound, forward_tcp_raw, forward_udp_raw, resolve_dest_socket_addr};

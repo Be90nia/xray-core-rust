@@ -651,8 +651,8 @@ fn try_build_handler(
             wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
         }
         "dns" => {
-            let (handler, dns) = parse_dns_outbound_config(&ob.entry.data, &ob.tag)?;
-            let bridge = DnsDispatchBridge::new(ob.tag.clone(), handler, dns, None);
+            let handler = parse_dns_outbound_config(&ob.entry.data)?;
+            let bridge = DnsDispatchBridge::new(ob.tag.clone(), handler, dns.cloned());
             Ok((Arc::new(bridge) as Arc<dyn DispatchHandler>, None, None))
         }
         "loopback" => {
@@ -1194,15 +1194,17 @@ impl DispatchHandler for StubDispatchBridge {
 
 /// DNS outbound handler：拦截 dispatcher 转发的 DNS 查询 → 规则匹配 → 转发/丢弃/返回/劫持。
 ///
-/// 对应 Go `proxy/dns/dns.go::Handler.Process`。
+/// 对应 Go `proxy/dns/dns.go::Handler.Process`：
+/// - ownLink 防环（dns.go:242-247）：本 DNS 服务自身的上游查询原样转发
+/// - 规则匹配 → Drop / Return（rCode 空响应）/ Hijack（DnsService.lookup_ip，
+///   fake_enable=true 可触发 FakeDNS）/ Direct（原样字节转发到 rewrite 后的 dest）
+/// - UDP 单请求-响应；TCP 双路 IO loop（request 帧 → 决策，response 帧 → 回写）
 /// DNS 不走标准 DialBridge（无 dial 语义），而是直接实现 DispatchHandler。
 struct DnsDispatchBridge {
     tag: String,
-    /// 规则匹配 Handler（qType + domain → action）。
+    /// 规则匹配 Handler（qType + domain → action + rCode）。
     handler: xray_proxy_dns::Handler,
-    /// hickory-resolver 转发（Direct 动作）。
-    dns: Arc<xray_proxy_dns::DnsOutbound>,
-    /// xray-app-dns 服务（Hijack 动作调用 lookup_ip）。None 时 Hijack 退化为 Direct。
+    /// xray-app-dns 服务：Hijack 动作 lookup_ip + ownLink 判定。
     dns_service: Option<Arc<xray_app_dns::server::DnsService>>,
 }
 
@@ -1210,12 +1212,19 @@ impl DnsDispatchBridge {
     fn new(
         tag: impl Into<String>,
         handler: xray_proxy_dns::Handler,
-        dns: xray_proxy_dns::DnsOutbound,
         dns_service: Option<Arc<xray_app_dns::server::DnsService>>,
     ) -> Self {
-        Self { tag: tag.into(), handler, dns: Arc::new(dns), dns_service }
+        Self { tag: tag.into(), handler, dns_service }
+    }
+
+    /// Go `isOwnLink`（dns.go:118-120）：DnsService 实现 ownLinkVerifier。
+    fn is_own_link(&self, inbound_tag: &str) -> bool {
+        self.dns_service
+            .as_ref()
+            .is_some_and(|s| s.is_own_link(inbound_tag))
     }
 }
+
 impl std::fmt::Debug for DnsDispatchBridge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DnsDispatchBridge")
@@ -1224,181 +1233,447 @@ impl std::fmt::Debug for DnsDispatchBridge {
     }
 }
 
+/// TCP DNS 帧增量解码器（RFC 1035 §4.2.2 长度前缀帧）。
+struct DnsFrameDecoder {
+    buf: Vec<u8>,
+}
+
+impl DnsFrameDecoder {
+    fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    /// 喂入字节，产出完整帧（无完整帧则缓存等待）。
+    fn feed(&mut self, chunk: &[u8], out: &mut Vec<Vec<u8>>) {
+        self.buf.extend_from_slice(chunk);
+        while self.buf.len() >= 2 {
+            let len = u16::from_be_bytes([self.buf[0], self.buf[1]]) as usize;
+            if self.buf.len() < 2 + len {
+                break;
+            }
+            out.push(self.buf[2..2 + len].to_vec());
+            self.buf.drain(..2 + len);
+        }
+    }
+}
+
+/// 按上游网络类型原样转发（Go outboundConn + connWriter）。
+async fn forward_raw(
+    query: &[u8],
+    upstream: &Destination,
+    timeout: std::time::Duration,
+) -> Option<Vec<u8>> {
+    let r = if upstream.is_tcp() {
+        xray_proxy_dns::forward_tcp_raw(query, upstream, timeout).await
+    } else {
+        xray_proxy_dns::forward_udp_raw(query, upstream, timeout).await
+    };
+    match r {
+        Ok(resp) => Some(resp),
+        Err(e) => {
+            tracing::debug!(upstream = %upstream, error = %e, "dns raw forward failed");
+            None
+        }
+    }
+}
+
+/// Hijack 动作：A/AAAA 查询经 DnsService.lookup_ip（fake_enable=true，
+/// 可命中 FakeDNS client）构造响应。对应 Go `handleIPQuery`（dns.go:313-391）。
+///
+/// 返回 `None` = 静默不回包（Go：err 非 RCodeError/EmptyResponse 时不响应）。
+async fn handle_ip_query(
+    query: &[u8],
+    svc: &Arc<xray_app_dns::server::DnsService>,
+) -> Option<Vec<u8>> {
+    use xray_app_dns::config::IpOption;
+
+    let (header, question) = xray_proxy_dns::parse_dns_query(query).ok()?;
+    let option = if question.q_type == xray_proxy_dns::QTYPE_A {
+        IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: true }
+    } else {
+        IpOption { ipv4_enable: false, ipv6_enable: true, fake_enable: true }
+    };
+    match svc.lookup_ip(&question.name, option).await {
+        Ok((ips, ttl)) if !ips.is_empty() => {
+            Some(xray_proxy_dns::build_ip_response(&header, &question, &ips, ttl))
+        }
+        // Go: ErrEmptyResponse → rCode 0 空响应（dns.go:334 构造空 answer）。
+        Err(xray_app_dns::error::DnsError::EmptyResponse) => {
+            Some(xray_proxy_dns::build_dns_response(&header, &question, 0))
+        }
+        // Go: RCodeFromError 提取 RCodeError → 响应带该 rCode。
+        Err(xray_app_dns::error::DnsError::RCodeError(rc)) => {
+            Some(xray_proxy_dns::build_dns_response(&header, &question, rc as u8))
+        }
+        // Go dns.go:334-337：其余错误静默（rCode 0 + ips 空 + 非 EmptyResponse）。
+        Ok((_, _)) | Err(_) => None,
+    }
+}
+
 impl DispatchHandler for DnsDispatchBridge {
     fn tag(&self) -> &str {
         &self.tag
     }
 
-    fn dispatch(&self, _dest: &Destination, link: Link) -> PinFuture<()> {
-        let tag = self.tag.clone();
-        let handler = self.handler.clone();
-        let dns = Arc::clone(&self.dns);
-        let dns_service = self.dns_service.clone();
+    fn dispatch(&self, dest: &Destination, link: Link) -> PinFuture<()> {
+        let (tag, handler, dns_service) =
+            (self.tag.clone(), self.handler.clone(), self.dns_service.clone());
+        let upstream = handler.rewrite_dest(dest);
+        let timeout = handler.timeout;
+        let own_link = self.is_own_link("");
         Box::pin(async move {
-            // 从 link.reader 读取 DNS 查询字节
-            let mut reader = link.reader;
-            let mut query_buf = Vec::new();
-            loop {
-                match reader.read_multi_buffer().await {
-                    Ok(mb) => {
-                        if mb.is_empty() { break; }
-                        for buf in mb.iter() {
-                            query_buf.extend_from_slice(buf.bytes());
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!(tag = %tag, "dns dispatch read end: {e}");
-                        break;
-                    }
-                }
-            }
-            if query_buf.is_empty() {
-                tracing::debug!(tag = %tag, "dns dispatch: empty query");
-                return;
-            }
+            dispatch_dns_link(tag, handler, dns_service, upstream, timeout, own_link, link).await;
+        })
+    }
 
-            // 规则匹配
-            let outcome = match handler.process(&query_buf).await {
-                Ok(o) => o,
-                Err(e) => {
-                    tracing::warn!(tag = %tag, "dns handler process: {e}");
-                    return;
-                }
-            };
-
-            let response = match outcome {
-                xray_proxy_dns::ProcessOutcome::Drop => {
-                    tracing::debug!(tag = %tag, "dns dispatch: dropped by rule");
-                    return;
-                }
-                xray_proxy_dns::ProcessOutcome::Respond { response } => Some(response),
-                xray_proxy_dns::ProcessOutcome::Forward { query } => {
-                    // Direct：转发到上游 DNS
-                    match dns.process(&query).await {
-                        Ok(resp) => Some(resp),
-                        Err(e) => {
-                            tracing::warn!(tag = %tag, "dns forward: {e}");
-                            None
-                        }
-                    }
-                }
-                xray_proxy_dns::ProcessOutcome::Hijack { query } => {
-                    // Hijack：调用 DnsService::lookup_ip() 解析，构造 DNS 响应
-                    match handle_hijack(&query, dns_service.as_ref()).await {
-                        Ok(resp) => Some(resp),
-                        Err(e) => {
-                            tracing::warn!(tag = %tag, "dns hijack: {e}, falling back to forward");
-                            // Hijack 失败退化为 Direct 转发
-                            match dns.process(&query).await {
-                                Ok(resp) => Some(resp),
-                                Err(e2) => {
-                                    tracing::warn!(tag = %tag, "dns hijack fallback forward: {e2}");
-                                    None
-                                }
-                            }
-                        }
-                    }
-                }
-            };
-
-            // 写回响应
-            if let Some(response) = response {
-                let mut writer = link.writer;
-                let resp_buf = xray_buf::buffer::Buffer::from_vec(response);
-                let resp_mb = xray_buf::multi::MultiBuffer::from_buffer(resp_buf);
-                if let Err(e) = writer.write_multi_buffer(resp_mb).await {
-                    tracing::warn!(tag = %tag, "dns dispatch write response: {e}");
-                }
-                writer.shutdown();
-            }
+    /// 带 access 上下文（Go ctx 携带 session.Inbound）——ownLink 判定入口。
+    fn dispatch_with_access(
+        &self,
+        dest: &Destination,
+        link: Link,
+        access: xray_app_dispatcher::default::AccessContext,
+    ) -> PinFuture<()> {
+        let own_link = self.is_own_link(&access.inbound_tag);
+        let (tag, handler, dns_service) =
+            (self.tag.clone(), self.handler.clone(), self.dns_service.clone());
+        let upstream = handler.rewrite_dest(dest);
+        let timeout = handler.timeout;
+        Box::pin(async move {
+            dispatch_dns_link(tag, handler, dns_service, upstream, timeout, own_link, link).await;
         })
     }
 }
 
-/// Hijack 动作：解析 DNS 查询 → 调用 DnsService::lookup_ip() → 构造 DNS 响应。
+/// DNS link 分发主体（Go `Handler.Process` 的 request/response 双 loop）。
 ///
-/// 对应 Go `proxy/dns/dns.go::Handler.handleIPQuery`。
-async fn handle_hijack(
+/// UDP（单请求-响应，对应 dokodemo UDP 分发的 per-session link）与
+/// TCP（长度前缀帧流，双路并发）分别处理。
+async fn dispatch_dns_link(
+    tag: String,
+    handler: xray_proxy_dns::Handler,
+    dns_service: Option<Arc<xray_app_dns::server::DnsService>>,
+    upstream: Destination,
+    timeout: std::time::Duration,
+    own_link: bool,
+    mut link: Link,
+) {
+    use xray_buf::io::{Reader, Writer};
+    use xray_buf::multi::MultiBuffer;
+
+    if upstream.is_udp() {
+        // ---- UDP：单包请求-响应（Go UDPReader/UDPWriter + outboundConn） ----
+        let query = match link.reader.read_multi_buffer().await {
+            Ok(mb) if !mb.is_empty() => {
+                let mut q = Vec::new();
+                for b in mb.iter() {
+                    q.extend_from_slice(b.bytes());
+                }
+                q
+            }
+            _ => return,
+        };
+        let response = if own_link {
+            // Go dns.go:242-247：自身流量原样转发，不做规则处理（防环）。
+            forward_raw(&query, &upstream, timeout).await
+        } else {
+            match handler.process(&query).await {
+                Ok(xray_proxy_dns::ProcessOutcome::Drop) => None,
+                Ok(xray_proxy_dns::ProcessOutcome::Respond { response }) => Some(response),
+                Ok(xray_proxy_dns::ProcessOutcome::Forward { query }) => {
+                    forward_raw(&query, &upstream, timeout).await
+                }
+                Ok(xray_proxy_dns::ProcessOutcome::Hijack { query }) => match &dns_service {
+                    Some(svc) => handle_ip_query(&query, svc).await,
+                    None => None,
+                },
+                Err(e) => {
+                    tracing::debug!(tag = %tag, "dns udp process: {e}");
+                    None
+                }
+            }
+        };
+        if let Some(resp) = response {
+            let buf = xray_buf::buffer::Buffer::from_vec(resp);
+            let mb = MultiBuffer::from_buffer(buf);
+            if let Err(e) = link.writer.write_multi_buffer(mb).await {
+                tracing::debug!(tag = %tag, "dns udp write: {e}");
+            }
+        }
+        link.writer.shutdown();
+        return;
+    }
+
+    // ---- TCP：长度前缀帧流，双路 IO loop（Go task.Run(request, response)） ----
+    // Go timeout = policy ConnectionIdle（Level0 = 300s），Rust 侧用同值常量做 idle。
+    const DNS_IDLE: std::time::Duration = std::time::Duration::from_secs(300);
+
+    let writer = Arc::new(tokio::sync::Mutex::new(link.writer));
+    // lazy 上游写半连接（Go outboundConn：Write 首拨）。读半连接经 channel
+    // 移交 response loop（Go connReady channel 的等价物）。
+    let write_slot: Arc<tokio::sync::Mutex<Option<tokio::net::tcp::OwnedWriteHalf>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let (read_tx, mut read_rx) = tokio::sync::mpsc::channel::<tokio::net::tcp::OwnedReadHalf>(1);
+
+    // response loop：读上游 TCP 帧 → 回写客户端（Go response()，dns.go:286-304）。
+    let response_loop = {
+        let writer = Arc::clone(&writer);
+        let tag = tag.clone();
+        use tokio::io::AsyncReadExt as _;
+        async move {
+            // 等待上游拨号（无上游查询时挂起，任一侧断开即整体结束）。
+            let Some(mut rh) = read_rx.recv().await else { return };
+            let mut decoder = DnsFrameDecoder::new();
+            let mut frames = Vec::new();
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let n = match tokio::time::timeout(DNS_IDLE, rh.read(&mut buf)).await {
+                    Ok(Ok(0)) | Err(_) => return, // EOF / idle 超时
+                    Ok(Ok(n)) => n,
+                    Ok(Err(e)) => {
+                        tracing::debug!(tag = %tag, "dns upstream read: {e}");
+                        return;
+                    }
+                };
+                frames.clear();
+                decoder.feed(&buf[..n], &mut frames);
+                for frame in frames.drain(..) {
+                    let resp = match xray_proxy_dns::encode_tcp_dns_message(&frame) {
+                        Ok(f) => f,
+                        Err(_) => continue,
+                    };
+                    let mb = xray_buf::multi::MultiBuffer::from_buffer(
+                        xray_buf::buffer::Buffer::from_vec(resp),
+                    );
+                    if let Err(e) = writer.lock().await.write_multi_buffer(mb).await {
+                        tracing::debug!(tag = %tag, "dns client write: {e}");
+                        return;
+                    }
+                }
+            }
+        }
+    };
+
+    // request loop：读客户端帧 → 决策（Go request()，dns.go:229-284）。
+    let writer_for_req = Arc::clone(&writer);
+    let request_loop = async move {
+        let mut decoder = DnsFrameDecoder::new();
+        let mut frames = Vec::new();
+        loop {
+            let mb = match tokio::time::timeout(DNS_IDLE, link.reader.read_multi_buffer()).await {
+                Ok(Ok(mb)) if !mb.is_empty() => mb,
+                Ok(Ok(_)) | Ok(Err(_)) | Err(_) => return, // EOF / idle 超时 / 断开
+            };
+            let mut chunk = Vec::new();
+            for b in mb.iter() {
+                chunk.extend_from_slice(b.bytes());
+            }
+            frames.clear();
+            decoder.feed(&chunk, &mut frames);
+            for query in frames.drain(..) {
+                if own_link {
+                    // Go dns.go:242-247：自身流量原样转发（防环）。
+                    write_or_inline_upstream(
+                        &write_slot,
+                        &read_tx,
+                        &writer_for_req,
+                        &tag,
+                        &upstream,
+                        &query,
+                        timeout,
+                    )
+                    .await;
+                    continue;
+                }
+                match handler.process(&query).await {
+                    Ok(xray_proxy_dns::ProcessOutcome::Drop) => {
+                        tracing::debug!(tag = %tag, "dns tcp query dropped by rule");
+                    }
+                    Ok(xray_proxy_dns::ProcessOutcome::Respond { response }) => {
+                        write_client_frame(&writer_for_req, &tag, &response).await;
+                    }
+                    Ok(xray_proxy_dns::ProcessOutcome::Forward { query }) => {
+                        write_or_inline_upstream(
+                            &write_slot,
+                            &read_tx,
+                            &writer_for_req,
+                            &tag,
+                            &upstream,
+                            &query,
+                            timeout,
+                        )
+                        .await;
+                    }
+                    Ok(xray_proxy_dns::ProcessOutcome::Hijack { query }) => {
+                        // Go: go h.handleIPQuery(...)——异步不阻塞请求循环。
+                        if let Some(svc) = dns_service.clone() {
+                            let w = Arc::clone(&writer_for_req);
+                            let t = tag.clone();
+                            tokio::spawn(async move {
+                                if let Some(resp) = handle_ip_query(&query, &svc).await {
+                                    write_client_frame(&w, &t, &resp).await;
+                                }
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(tag = %tag, "dns tcp process: {e}");
+                    }
+                }
+            }
+        }
+    };
+
+    // Go task.Run：任一 loop 结束即整体结束。
+    tokio::select! {
+        _ = request_loop => {},
+        _ = response_loop => {},
+    }
+    writer.lock().await.shutdown();
+}
+
+/// 写客户端（TCP 帧）。
+async fn write_client_frame(
+    writer: &Arc<tokio::sync::Mutex<Box<dyn xray_buf::io::Writer>>>,
+    tag: &str,
+    msg: &[u8],
+) {
+    let Ok(framed) = xray_proxy_dns::encode_tcp_dns_message(msg) else {
+        return;
+    };
+    let mb =
+        xray_buf::multi::MultiBuffer::from_buffer(xray_buf::buffer::Buffer::from_vec(framed));
+    if let Err(e) = writer.lock().await.write_multi_buffer(mb).await {
+        tracing::debug!(tag = %tag, "dns client write: {e}");
+    }
+}
+
+/// Direct/ownLink 写上游：TCP 上游经 lazy 连接（response loop 回流）；
+/// UDP 上游内联往返直接回写客户端。
+async fn write_or_inline_upstream(
+    write_slot: &Arc<tokio::sync::Mutex<Option<tokio::net::tcp::OwnedWriteHalf>>>,
+    read_tx: &tokio::sync::mpsc::Sender<tokio::net::tcp::OwnedReadHalf>,
+    writer: &Arc<tokio::sync::Mutex<Box<dyn xray_buf::io::Writer>>>,
+    tag: &str,
+    upstream: &Destination,
     query: &[u8],
-    dns_service: Option<&Arc<xray_app_dns::server::DnsService>>,
-) -> std::result::Result<Vec<u8>, String> {
-    let Some(svc) = dns_service else {
-        return Err("no DnsService available for Hijack".into());
+    timeout: std::time::Duration,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    if !upstream.is_tcp() {
+        // UDP 上游：内联往返（等价 Go UDPWriter/connReader 单包语义）。
+        if let Some(resp) = forward_raw(query, upstream, timeout).await {
+            write_client_frame(writer, tag, &resp).await;
+        }
+        return;
+    }
+
+    let Ok(framed) = xray_proxy_dns::encode_tcp_dns_message(query) else {
+        return;
     };
-
-    // 解析 DNS 查询获取 id/qType/domain
-    let (header, question) = xray_proxy_dns::parse_dns_query(query)
-        .map_err(|e| format!("parse query: {e}"))?;
-
-    // 只有 A(1) 和 AAAA(28) 走 lookup_ip，其他类型返回 REFUSED
-    let (ips, ttl) = match question.q_type {
-        1 => {
-            // A 记录：IPv4 only
-            let option = xray_app_dns::config::IpOption {
-                ipv4_enable: true,
-                ipv6_enable: false,
-                fake_enable: true,
-            };
-            svc.lookup_ip(&question.name, option).await
-                .map_err(|e| format!("lookup_ip v4: {e}"))?
+    let mut guard = write_slot.lock().await;
+    if guard.is_none() {
+        // lazy dial（Go outboundConn.Write → dial）。
+        let addr = match xray_proxy_dns::resolve_dest_socket_addr(upstream).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::debug!(upstream = %upstream, error = %e, "dns upstream resolve failed");
+                return;
+            }
+        };
+        match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
+            Ok(Ok(conn)) => {
+                let (rh, wh) = conn.into_split();
+                *guard = Some(wh);
+                let _ = read_tx.try_send(rh); // 唤醒 response loop
+            }
+            _ => {
+                tracing::debug!(upstream = %upstream, "dns upstream dial failed/timeout");
+                return;
+            }
         }
-        28 => {
-            // AAAA 记录：IPv6 only
-            let option = xray_app_dns::config::IpOption {
-                ipv4_enable: false,
-                ipv6_enable: true,
-                fake_enable: true,
-            };
-            svc.lookup_ip(&question.name, option).await
-                .map_err(|e| format!("lookup_ip v6: {e}"))?
+    }
+    if let Some(wh) = guard.as_mut() {
+        if let Err(e) = wh.write_all(&framed).await {
+            tracing::debug!(upstream = %upstream, error = %e, "dns upstream write failed");
         }
-        _ => {
-            // 非 IP 查询类型：返回 REFUSED
-            let resp = xray_proxy_dns::build_dns_response(&header, &question, 5);
-            return Ok(resp);
-        }
-    };
-
-    // 用手写 DNS 构造器生成带 A/AAAA 记录的响应
-    Ok(xray_proxy_dns::build_ip_response(&header, &question, &ips, ttl))
+    }
 }
 
 // ========== DNS Outbound 配置解析 ==========
 
 /// 从 outbound entry.data（JSON）解析 dns outbound 配置。
 ///
-/// JSON 格式：`{"servers":["8.8.8.8:53"], "rule":[...]}` 或空对象。
-/// 返回 (Handler, DnsOutbound)。
-fn parse_dns_outbound_config(
-    data: &[u8],
-    tag: &str,
-) -> std::result::Result<(xray_proxy_dns::Handler, xray_proxy_dns::DnsOutbound), String> {
+/// JSON（Rust 扩展，Go JSON 侧 dns outbound settings 为空对象）：
+/// `{"rule":[{"action":"drop","qType":[28],"rCode":5}], "rewriteServer":{...}}`
+fn parse_dns_outbound_config(data: &[u8]) -> std::result::Result<xray_proxy_dns::Handler, String> {
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| format!("dns outbound settings JSON: {e}"))?;
-    let config = xray_proxy_dns::Config::default();
-    let handler = xray_proxy_dns::Handler::init(&config);
-    // 解析上游 DNS 服务器列表
-    let servers: Vec<(std::net::IpAddr, u16)> = v.get("servers")
-        .and_then(|x| x.as_array())
-        .map(|arr| {
-            arr.iter().filter_map(|s| {
-                s.as_str().and_then(|addr| {
-                    let (ip, port) = addr.rsplit_once(':')?;
-                    let ip: std::net::IpAddr = ip.parse().ok()?;
-                    let port: u16 = port.parse().ok()?;
-                    Some((ip, port))
+    let mut config = xray_proxy_dns::Config::default();
+
+    if let Some(rules) = v.get("rule").and_then(|x| x.as_array()) {
+        for r in rules {
+            let action = match r.get("action") {
+                Some(serde_json::Value::String(s)) => match s.to_ascii_lowercase().as_str() {
+                    "drop" => xray_proxy_dns::RuleAction::Drop,
+                    "return" => xray_proxy_dns::RuleAction::Return,
+                    "hijack" => xray_proxy_dns::RuleAction::Hijack,
+                    _ => xray_proxy_dns::RuleAction::Direct,
+                },
+                _ => xray_proxy_dns::RuleAction::Direct,
+            };
+            let q_type = r
+                .get("qType")
+                .and_then(|x| x.as_array())
+                .map(|arr| {
+                    arr.iter().filter_map(|x| x.as_i64().map(|n| n as i32)).collect()
                 })
-            }).collect()
-        })
-        .unwrap_or_default();
-    let dns = if servers.is_empty() {
-        xray_proxy_dns::DnsOutbound::new_system(tag)
-            .map_err(|e| format!("dns outbound init: {e}"))?
-    } else {
-        xray_proxy_dns::DnsOutbound::new_with_servers(tag, &servers)
-            .map_err(|e| format!("dns outbound init: {e}"))?
-    };
-    Ok((handler, dns))
+                .unwrap_or_default();
+            let r_code = r.get("rCode").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            config.rule.push(xray_proxy_dns::DnsRuleConfig {
+                action,
+                q_type,
+                r_code,
+                domain: Vec::new(),
+            });
+        }
+    }
+
+    if let Some(rw) = v.get("rewriteServer") {
+        let network = match rw.get("network").and_then(|x| x.as_str()) {
+            Some("tcp") => 2,  // xray.common.net.Network.TCP
+            Some("udp") => 3,  // xray.common.net.Network.UDP
+            _ => 0,            // Unknown → 不覆盖
+        };
+        let address = rw.get("address").and_then(|x| x.as_str()).and_then(|s| {
+            if let Ok(v4) = s.parse::<std::net::Ipv4Addr>() {
+                Some(xray_proto::xray::common::net::IpOrDomain {
+                    address: Some(xray_proto::xray::common::net::ip_or_domain::Address::Ip(
+                        v4.octets().to_vec(),
+                    )),
+                })
+            } else if let Ok(v6) = s.parse::<std::net::Ipv6Addr>() {
+                Some(xray_proto::xray::common::net::IpOrDomain {
+                    address: Some(xray_proto::xray::common::net::ip_or_domain::Address::Ip(
+                        v6.octets().to_vec(),
+                    )),
+                })
+            } else if !s.is_empty() {
+                Some(xray_proto::xray::common::net::IpOrDomain {
+                    address: Some(xray_proto::xray::common::net::ip_or_domain::Address::Domain(
+                        s.to_string(),
+                    )),
+                })
+            } else {
+                None
+            }
+        });
+        let port = rw.get("port").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+        config.rewrite_server =
+            Some(xray_proto::xray::common::net::Endpoint { network, address, port });
+    }
+
+    Ok(xray_proxy_dns::Handler::init(&config))
 }
 
 
@@ -2821,5 +3096,330 @@ mod tests {
                 "transportLayer={use_transport_layer}: socks outbound should see CONNECT to echo:{echo_port}, got {rec:?}"
             );
         }
+    }
+
+    // ========== DnsDispatchBridge e2e（bd 8hl） ==========
+
+    /// 构造最小 DNS 查询（Header + Question）。
+    fn dns_make_query(id: u16, domain: &str, q_type: u16) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&id.to_be_bytes());
+        buf.extend_from_slice(&0x0100u16.to_be_bytes()); // RD
+        buf.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+        buf.extend_from_slice(&[0; 6]); // AN/NS/AR
+        for label in domain.split('.') {
+            buf.push(label.len() as u8);
+            buf.extend_from_slice(label.as_bytes());
+        }
+        buf.push(0);
+        buf.extend_from_slice(&q_type.to_be_bytes());
+        buf.extend_from_slice(&1u16.to_be_bytes()); // IN
+        buf
+    }
+
+    /// mock UDP DNS server：记录收到的原始 query，回固定响应。
+    async fn spawn_dns_udp_mock(
+        response: Vec<u8>,
+        captured: Arc<parking_lot::Mutex<Option<Vec<u8>>>>,
+    ) -> std::net::SocketAddr {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            if let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+                *captured.lock() = Some(buf[..n].to_vec());
+                let _ = sock.send_to(&response, peer).await;
+            }
+        });
+        addr
+    }
+
+    /// DnsService（含 fakedns client）——Hijack 动作 e2e 用。
+    fn make_fakedns_service(client_tag: &str) -> Arc<xray_app_dns::server::DnsService> {
+        use xray_app_dns::fakedns::Holder;
+        use xray_app_dns::nameserver::fakedns::FakeDnsServer;
+        use xray_app_dns::nameserver::{Client, NameServerConfig, Server};
+
+        let ns = NameServerConfig {
+            tag: client_tag.to_string(),
+            ..Default::default()
+        };
+        let fake: Box<dyn Server> =
+            Box::new(FakeDnsServer::new(Holder::new_default().unwrap()));
+        let client = Client::new(ns, xray_app_dns::config::IpOption::all(), fake).unwrap();
+        Arc::new(xray_app_dns::server::DnsService::new(
+            xray_app_dns::server::DnsServiceConfig {
+                client_ip: Vec::new(),
+                query_strategy: xray_app_dns::config::QueryStrategy::UseIp,
+                tag: "test-dns".into(),
+                hosts: xray_app_dns::hosts::StaticHosts::new(Vec::new()).unwrap(),
+                clients: vec![Arc::new(client)],
+                disable_fallback: false,
+                disable_fallback_if_match: false,
+                enable_parallel_query: false,
+                disable_cache: false,
+                serve_stale: false,
+                serve_expired_ttl: 0,
+                use_system_hosts: false,
+                domain_matcher: None,
+                matcher_infos: Vec::new(),
+            },
+        ))
+    }
+
+    /// dispatch bridge 并返回 (up_writer, dn_reader)。
+    fn spawn_dns_bridge(
+        bridge: &DnsDispatchBridge,
+        dest: &Destination,
+        access: Option<xray_app_dispatcher::default::AccessContext>,
+    ) -> (
+        Box<dyn xray_buf::io::Writer>,
+        Box<dyn xray_buf::io::Reader>,
+    ) {
+        let (up_r, up_w) = xray_buf::pipe::new();
+        let (dn_r, dn_w) = xray_buf::pipe::new();
+        let link = Link::new(
+            Box::new(up_r) as Box<dyn xray_buf::io::Reader>,
+            Box::new(dn_w) as Box<dyn xray_buf::io::Writer>,
+        );
+        match access {
+            Some(ctx) => {
+                let fut = bridge.dispatch_with_access(dest, link, ctx);
+                tokio::spawn(async move {
+                    let _ = fut.await;
+                });
+            }
+            None => {
+                let fut = bridge.dispatch(dest, link);
+                tokio::spawn(async move {
+                    let _ = fut.await;
+                });
+            }
+        }
+        (
+            Box::new(up_w) as Box<dyn xray_buf::io::Writer>,
+            Box::new(dn_r) as Box<dyn xray_buf::io::Reader>,
+        )
+    }
+
+    /// e2e：UDP Direct 规则 → 原样 query 转发到上游 → 响应回客户端。
+    #[tokio::test]
+    async fn dns_udp_direct_forwards_raw_roundtrip() {
+        use xray_buf::io::{Reader as _, Writer as _};
+        use xray_buf::multi::MultiBuffer;
+
+        let upstream_resp = dns_make_query(0x7777, "example.com", 1); // 原样回显即可
+        let captured: Arc<parking_lot::Mutex<Option<Vec<u8>>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let addr =
+            spawn_dns_udp_mock(upstream_resp.clone(), captured.clone()).await;
+
+        // Direct 规则（qType A）。
+        let handler =
+            parse_dns_outbound_config(br#"{"rule":[{"action":"direct","qType":[1]}]}"#)
+                .unwrap();
+        let bridge = DnsDispatchBridge::new("dns-out", handler, None);
+        let dest = Destination::udp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(addr.port()));
+        let (mut up_w, mut dn_r) = spawn_dns_bridge(&bridge, &dest, None);
+
+        let query = dns_make_query(0x1234, "example.com", 1);
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(&query);
+        up_w.write_multi_buffer(mb).await.unwrap();
+
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
+            .await
+            .expect("timeout waiting response")
+            .unwrap();
+        assert_eq!(resp.to_vec(), upstream_resp);
+        // 上游收到原样 query（未重新编码）。
+        assert_eq!(captured.lock().clone(), Some(query));
+    }
+
+    /// e2e：默认（无规则）A 查询 → Hijack → DnsService(fakedns) → fake IP 响应。
+    #[tokio::test]
+    async fn dns_udp_default_a_hijacks_via_fakedns() {
+        use xray_buf::io::{Reader as _, Writer as _};
+        use xray_buf::multi::MultiBuffer;
+
+        let svc = make_fakedns_service("fake-in");
+        let handler = parse_dns_outbound_config(b"{}").unwrap();
+        let bridge = DnsDispatchBridge::new("dns-out", handler, Some(svc));
+        // dest 无所谓（Hijack 不转发）。
+        let dest = Destination::udp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(53));
+        let (mut up_w, mut dn_r) = spawn_dns_bridge(&bridge, &dest, None);
+
+        let query = dns_make_query(0x4242, "fakedns.example.com", 1); // A
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(&query);
+        up_w.write_multi_buffer(mb).await.unwrap();
+
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
+            .await
+            .expect("timeout waiting hijack response")
+            .unwrap();
+        let resp = resp.to_vec();
+        // Header：id 回显 + QR=1。
+        assert_eq!(&resp[0..2], &0x4242u16.to_be_bytes());
+        assert_eq!(resp[2] & 0x80, 0x80, "response bit");
+        assert_eq!(resp[3] & 0x0F, 0, "rcode 0");
+        // ANCOUNT=1（fake IP 一条）。
+        assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 1);
+    }
+
+    /// e2e：ownLink（inbound tag = nameserver client tag）→ 原样转发不劫持。
+    #[tokio::test]
+    async fn dns_udp_own_link_bypasses_rules() {
+        use xray_buf::io::{Reader as _, Writer as _};
+        use xray_buf::multi::MultiBuffer;
+
+        let upstream_resp = dns_make_query(0x9999, "upstream.com", 1);
+        let captured: Arc<parking_lot::Mutex<Option<Vec<u8>>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let addr =
+            spawn_dns_udp_mock(upstream_resp.clone(), captured.clone()).await;
+
+        // 无规则（A 默认 Hijack）+ DnsService 带 client tag "self-loop"。
+        let svc = make_fakedns_service("self-loop");
+        let handler = parse_dns_outbound_config(b"{}").unwrap();
+        let bridge = DnsDispatchBridge::new("dns-out", handler, Some(svc));
+        let dest = Destination::udp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(addr.port()));
+
+        let mut access = xray_app_dispatcher::default::AccessContext::default();
+        access.inbound_tag = "self-loop".into();
+        let (mut up_w, mut dn_r) = spawn_dns_bridge(&bridge, &dest, Some(access));
+
+        let query = dns_make_query(0x5678, "raw.example.com", 1);
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(&query);
+        up_w.write_multi_buffer(mb).await.unwrap();
+
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
+            .await
+            .expect("timeout waiting own-link response")
+            .unwrap();
+        // 响应来自 mock（非 fakedns），上游收到原样 query。
+        assert_eq!(resp.to_vec(), upstream_resp);
+        assert_eq!(captured.lock().clone(), Some(query));
+    }
+
+    /// e2e：Return 规则 + rCode 5 + TXT 查询 → REFUSED 响应（Go rejectNonIPQuery）。
+    #[tokio::test]
+    async fn dns_udp_return_rule_responds_rcode() {
+        use xray_buf::io::{Reader as _, Writer as _};
+        use xray_buf::multi::MultiBuffer;
+
+        let handler = parse_dns_outbound_config(
+            br#"{"rule":[{"action":"return","qType":[16],"rCode":5}]}"#,
+        )
+        .unwrap();
+        let bridge = DnsDispatchBridge::new("dns-out", handler, None);
+        let dest = Destination::udp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(53));
+        let (mut up_w, mut dn_r) = spawn_dns_bridge(&bridge, &dest, None);
+
+        let query = dns_make_query(0x3141, "txt.example.com", 16); // TXT
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(&query);
+        up_w.write_multi_buffer(mb).await.unwrap();
+
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
+            .await
+            .expect("timeout waiting reject response")
+            .unwrap();
+        let resp = resp.to_vec();
+        assert_eq!(&resp[0..2], &0x3141u16.to_be_bytes());
+        assert_eq!(resp[2] & 0x80, 0x80, "response bit");
+        assert_eq!(resp[3] & 0x0F, 5, "rcode REFUSED");
+    }
+
+    /// e2e：TCP 双路 loop——Direct 规则经 TCP 上游多查询 pipeline 往返。
+    #[tokio::test]
+    async fn dns_tcp_direct_dual_loop_pipeline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use xray_buf::io::{Reader as _, Writer as _};
+        use xray_buf::multi::MultiBuffer;
+
+        // mock TCP DNS server：帧循环回显（改 id 尾字节区分）。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let mut pending = Vec::new();
+            loop {
+                let n = match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                pending.extend_from_slice(&buf[..n]);
+                // 解帧回显。
+                while pending.len() >= 2 {
+                    let len = u16::from_be_bytes([pending[0], pending[1]]) as usize;
+                    if pending.len() < 2 + len {
+                        break;
+                    }
+                    let mut frame = pending[2..2 + len].to_vec();
+                    // 标记响应位，证明来自 mock 而非客户端反射。
+                    frame[2] |= 0x80;
+                    sock.write_all(&(frame.len() as u16).to_be_bytes()).await.unwrap();
+                    sock.write_all(&frame).await.unwrap();
+                    pending.drain(..2 + len);
+                }
+            }
+        });
+
+        let handler =
+            parse_dns_outbound_config(br#"{"rule":[{"action":"direct","qType":[1]}]}"#)
+                .unwrap();
+        let bridge = DnsDispatchBridge::new("dns-out", handler, None);
+        let dest = Destination::tcp(
+            Address::from_ipv4_bytes([127, 0, 0, 1]),
+            Port::new(upstream_port),
+        );
+        let (mut up_w, mut dn_r) = spawn_dns_bridge(&bridge, &dest, None);
+
+        // 连发两帧（pipeline，不等第一响应）。
+        let q1 = dns_make_query(0x1111, "first.example.com", 1);
+        let q2 = dns_make_query(0x2222, "second.example.com", 1);
+        let mut all = Vec::new();
+        for q in [&q1, &q2] {
+            let framed = xray_proxy_dns::encode_tcp_dns_message(q).unwrap();
+            all.extend_from_slice(&framed);
+        }
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(&all);
+        up_w.write_multi_buffer(mb).await.unwrap();
+        // 不 shutdown——shutdown 触发 request loop EOF 退出（Go task.Run 同语义），
+        // 真实 TCP DNS 客户端等响应期间保持连接不关写侧。
+
+        // 读回两帧响应。
+        let mut acc = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while acc.len() < q1.len() + q2.len() + 4 && std::time::Instant::now() < deadline {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(1500),
+                dn_r.read_multi_buffer(),
+            )
+            .await
+            {
+                Ok(Ok(chunk)) => acc.extend_from_slice(&chunk.to_vec()),
+                _ => break,
+            }
+        }
+        assert!(
+            acc.len() >= q1.len() + q2.len() + 4,
+            "two framed responses expected, got {} bytes: {:02x?}",
+            acc.len(),
+            acc
+        );
+        // 首帧 id 回显 + QR 位（来自 mock）。
+        let l1 = u16::from_be_bytes([acc[0], acc[1]]) as usize;
+        assert_eq!(&acc[2..4], &0x1111u16.to_be_bytes());
+        assert_eq!(acc[4] & 0x80, 0x80, "QR from mock");
+        let off = 2 + l1;
+        let l2 = u16::from_be_bytes([acc[off], acc[off + 1]]) as usize;
+        assert_eq!(&acc[off + 2..off + 4], &0x2222u16.to_be_bytes());
+        assert_eq!(l1, q1.len(), "frame1 length");
+        assert_eq!(l2, q2.len(), "frame2 length");
     }
 }

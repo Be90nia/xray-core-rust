@@ -119,6 +119,19 @@ impl DnsService {
         self.cfg.enable_parallel_query
     }
 
+    /// 判断连接是否源自本 DNS 服务自身。对应 Go `(*DNS).IsOwnLink`
+    /// （app/dns/dns.go:202——proxy/dns ownLink 防环用）。
+    ///
+    /// inbound tag 与任一 nameserver client tag 相同即视为自身流量
+    /// （本服务发出的上游查询经 dispatcher 回环到 dns outbound 的场景）。
+    #[must_use]
+    pub fn is_own_link(&self, inbound_tag: &str) -> bool {
+        if inbound_tag.is_empty() {
+            return false; // Go: inbound == nil → false
+        }
+        self.cfg.clients.iter().any(|c| c.tag == inbound_tag)
+    }
+
     /// 排序客户端列表（按域名匹配优先 + fallback）。对应 Go `sortClients`。
     ///
     /// 输入：域名（大小写不敏感匹配）。
@@ -226,9 +239,9 @@ impl DnsService {
         }
 
         if self.cfg.enable_parallel_query {
-            parallel_query(&clients, domain).await
+            parallel_query(&clients, domain, effective).await
         } else {
-            serial_query(&clients, domain).await
+            serial_query(&clients, domain, effective).await
         }
     }
 
@@ -322,16 +335,20 @@ impl xray_features::dns::DnsClient for DnsService {
 }
 
 // ── Nameserver 查询编排 ──────────────────────────────────────────
-
 /// 串行查询：按优先级顺序遍历 clients，返回第一个成功结果。
 ///
-/// 对应 Go `(*DNS).queryIP` 串行路径。
+/// 对应 Go `(*DNS).queryIP` 串行路径（dns.go:365-369：`!option.FakeEnable`
+/// 且 client 为 FakeDNS 时跳过）。
 async fn serial_query(
     clients: &[Arc<Client>],
     domain: &str,
+    option: IpOption,
 ) -> Result<(Vec<IpAddr>, u32), DnsError> {
     let mut last_err = DnsError::EmptyResponse;
     for client in clients {
+        if !option.fake_enable && client.server.name().eq_ignore_ascii_case("FakeDNS") {
+            continue;
+        }
         match client.query_ip(domain).await {
             Ok(result) => return Ok(result),
             Err(e) => {
@@ -347,11 +364,13 @@ async fn serial_query(
 
 /// 并行查询：同时向所有 clients 发起查询，返回第一个成功结果。
 ///
-/// 对应 Go `(*DNS).queryIP` 并行路径（`parallelQuery`）。
+/// 对应 Go `(*DNS).queryIP` 并行路径（dns.go:455-459：FakeDNS 在
+/// `!option.FakeEnable` 时不参与查询）。
 /// ponytail: 用 tokio::JoinSet 并发执行，任一成功即取消其余。
 async fn parallel_query(
     clients: &[Arc<Client>],
     domain: &str,
+    option: IpOption,
 ) -> Result<(Vec<IpAddr>, u32), DnsError> {
     use tokio::task::JoinSet;
 
@@ -359,6 +378,9 @@ async fn parallel_query(
     let mut set = JoinSet::new();
 
     for client in clients {
+        if !option.fake_enable && client.server.name().eq_ignore_ascii_case("FakeDNS") {
+            continue;
+        }
         let c = Arc::clone(client);
         let d = domain_owned.clone();
         set.spawn(async move { c.query_ip(&d).await });
@@ -381,6 +403,7 @@ async fn parallel_query(
     }
     Err(last_err)
 }
+
 
 // ── 系统路由探测 ──────────────────────────────────────────────────
 
@@ -421,6 +444,7 @@ mod tests {
     use crate::config::QueryStrategy;
     use crate::hosts::HostMapping;
     use crate::nameserver::{NameServerConfig, Server};
+    use std::net::Ipv4Addr;
     use std::future::Future;
     use std::pin::Pin;
     use std::time::Duration;
@@ -688,6 +712,49 @@ mod tests {
         let svc = make_service(Vec::new(), Vec::new());
         assert_eq!(svc.clients_count(), 0);
         assert!(!svc.enable_parallel_query());
+    }
+
+    /// Go app/dns/dns.go:202 IsOwnLink——inbound tag 命中任一 client tag。
+    #[test]
+    fn is_own_link_matches_client_tags() {
+        let c1 = make_client("dns-remote", false, false);
+        let c2 = make_client("dns-local", false, false);
+        let svc = make_service(vec![c1, c2], Vec::new());
+        assert!(svc.is_own_link("dns-remote"));
+        assert!(svc.is_own_link("dns-local"));
+        assert!(!svc.is_own_link("other-inbound"));
+        // Go: inbound == nil → false；空 tag 等价无 inbound。
+        assert!(!svc.is_own_link(""));
+    }
+
+    /// Go dns.go:365-369——!FakeEnable 时 FakeDNS client 不参与查询。
+    #[tokio::test]
+    async fn lookup_ip_skips_fakedns_when_fake_disabled() {
+        use crate::nameserver::fakedns::FakeDnsServer;
+        use crate::fakedns::Holder;
+
+        // FakeDNS client（tag 无关，server name 决定跳过）。
+        let ns = NameServerConfig { tag: "fake".into(), ..Default::default() };
+        let fake: Box<dyn Server> = Box::new(FakeDnsServer::new(Holder::new_default().unwrap()));
+        let fake_client = Arc::new(Client::new(ns, IpOption::all(), fake).unwrap());
+        // 真实 client 兜底。
+        let real = make_client_with_ips(
+            "real", false, false,
+            vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))],
+        );
+        let svc = make_service(vec![fake_client, real], Vec::new());
+
+        // fake_enable=false：跳过 FakeDNS，拿到 real 的 9.9.9.9。
+        let no_fake = IpOption { ipv4_enable: true, ipv6_enable: true, fake_enable: false };
+        let (ips, _) = svc.lookup_ip("x.com", no_fake).await.unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))]);
+
+        // fake_enable=true：FakeDNS 优先，返回池内地址（240.0.0.0/4）。
+        let with_fake = IpOption { ipv4_enable: true, ipv6_enable: true, fake_enable: true };
+        let (ips, ttl) = svc.lookup_ip("x.com", with_fake).await.unwrap();
+        assert_eq!(ips.len(), 1);
+        assert_eq!(ttl, 1);
+        assert!(matches!(ips[0], IpAddr::V4(v4) if v4.octets()[0] >= 240));
     }
 
     #[test]
