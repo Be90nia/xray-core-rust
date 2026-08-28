@@ -621,10 +621,15 @@ impl Connection {
 /// KCP `Connection` 的 read/write 是同步非阻塞（返回 0 表示暂无数据），
 /// 通过 `Notify`（`data_input`/`data_output`）通知数据就绪。
 /// 本适配器用 `notified().await` 等待 + 同步 read/write 实现异步 IO。
+///
+/// 缓存的等待 future 不捕获任何 poll 调用参数（buf 大小/数据副本）——对齐 Go
+/// `waitForDataInput`/`waitForDataOutput`（connection.go）：唤醒后用当次 poll
+/// 的 buf 重新同步读/写，否则换 buf 复用未完成 future 会写出旧参数
+/// （put_slice 溢出 panic / 写出旧数据，bd Xray-core-rust-0mp）。
 pub struct KcpConn {
     inner: Arc<Connection>,
-    read_state: parking_lot::Mutex<Option<Pin<Box<dyn std::future::Future<Output = std::io::Result<(Vec<u8>, usize)>> + Send>>>>,
-    write_state: parking_lot::Mutex<Option<Pin<Box<dyn std::future::Future<Output = std::io::Result<usize>> + Send>>>>,
+    read_state: parking_lot::Mutex<Option<Pin<Box<dyn Future<Output = ()> + Send>>>>,
+    write_state: parking_lot::Mutex<Option<Pin<Box<dyn Future<Output = ()> + Send>>>>,
 }
 
 impl KcpConn {
@@ -653,52 +658,38 @@ impl tokio::io::AsyncRead for KcpConn {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        let remaining = buf.remaining();
-        if remaining == 0 {
+        if buf.remaining() == 0 {
             return std::task::Poll::Ready(Ok(()));
         }
 
-        // 先尝试同步读
-        let mut tmp = vec![0u8; remaining];
-        match self.inner.read(&mut tmp) {
-            Ok(0) => {}
-            Ok(n) => {
-                buf.put_slice(&tmp[..n]);
-                return std::task::Poll::Ready(Ok(()));
+        // 对齐 Go Connection.Read（connection.go:316）：循环「用当前 buf 同步读 →
+        // 无数据等通知」。缓存 future 只等 data_input（Go waitForDataInput 不携带
+        // 调用参数），唤醒后用本次 poll 的 buf 重读。
+        let mut tmp = vec![0u8; buf.remaining()];
+        loop {
+            match self.inner.read(&mut tmp) {
+                Ok(0) => {}
+                Ok(n) => {
+                    buf.put_slice(&tmp[..n]);
+                    return std::task::Poll::Ready(Ok(()));
+                }
+                Err(e) => {
+                    return std::task::Poll::Ready(Err(std::io::Error::other(e.to_string())))
+                }
             }
-            Err(e) => return std::task::Poll::Ready(Err(std::io::Error::other(e.to_string()))),
-        }
 
-        // 无数据：缓存 read future，等待 data_input 通知
-        let mut state = self.read_state.lock();
-        if state.is_none() {
-            let inner = Arc::clone(&self.inner);
-            *state = Some(Box::pin(async move {
-                loop {
+            let mut state = self.read_state.lock();
+            if state.is_none() {
+                let inner = Arc::clone(&self.inner);
+                *state = Some(Box::pin(async move {
                     inner.inner.data_input.notified().await;
-                    let mut tmp = vec![0u8; remaining];
-                    match inner.read(&mut tmp) {
-                        Ok(0) => continue,
-                        Ok(n) => return std::io::Result::Ok((tmp, n)),
-                        Err(e) => return Err(std::io::Error::other(e.to_string())),
-                    }
-                }
-            }));
-        }
-
-        let fut = state.as_mut().unwrap();
-        match fut.as_mut().poll(cx) {
-            std::task::Poll::Ready(result) => {
-                *state = None;
-                match result {
-                    Ok((data, n)) => {
-                        buf.put_slice(&data[..n]);
-                        std::task::Poll::Ready(Ok(()))
-                    }
-                    Err(e) => std::task::Poll::Ready(Err(e)),
-                }
+                }));
             }
-            std::task::Poll::Pending => std::task::Poll::Pending,
+            if state.as_mut().unwrap().as_mut().poll(cx).is_pending() {
+                return std::task::Poll::Pending;
+            }
+            // 通知已到达：消费掉缓存的 future（防重 poll 已完成 future），重读
+            *state = None;
         }
     }
 }
@@ -709,37 +700,29 @@ impl tokio::io::AsyncWrite for KcpConn {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        // 先尝试同步写
-        match self.inner.write(buf) {
-            Ok(0) => {}
-            Ok(n) => return std::task::Poll::Ready(Ok(n)),
-            Err(e) => return std::task::Poll::Ready(Err(std::io::Error::other(e.to_string()))),
-        }
-
-        // 发送窗口满：缓存 write future，等待 data_output 通知
-        let mut state = self.write_state.lock();
-        if state.is_none() {
-            let inner = Arc::clone(&self.inner);
-            let data = buf.to_vec();
-            *state = Some(Box::pin(async move {
-                loop {
-                    inner.inner.data_output.notified().await;
-                    match inner.write(&data) {
-                        Ok(0) => continue,
-                        Ok(n) => return std::io::Result::Ok(n),
-                        Err(e) => return Err(std::io::Error::other(e.to_string())),
-                    }
+        // 对齐 Go Connection.Write（connection.go:370 + waitForDataOutput）：
+        // 循环「用当前 buf 同步写 → 窗口满等通知」。缓存 future 只等
+        // data_output、不持有 buf 副本，唤醒后用本次 poll 的 buf 重写。
+        loop {
+            match self.inner.write(buf) {
+                Ok(0) => {}
+                Ok(n) => return std::task::Poll::Ready(Ok(n)),
+                Err(e) => {
+                    return std::task::Poll::Ready(Err(std::io::Error::other(e.to_string())))
                 }
-            }));
-        }
-
-        let fut = state.as_mut().unwrap();
-        match fut.as_mut().poll(cx) {
-            std::task::Poll::Ready(result) => {
-                *state = None;
-                std::task::Poll::Ready(result)
             }
-            std::task::Poll::Pending => std::task::Poll::Pending,
+
+            let mut state = self.write_state.lock();
+            if state.is_none() {
+                let inner = Arc::clone(&self.inner);
+                *state = Some(Box::pin(async move {
+                    inner.inner.data_output.notified().await;
+                }));
+            }
+            if state.as_mut().unwrap().as_mut().poll(cx).is_pending() {
+                return std::task::Poll::Pending;
+            }
+            *state = None;
         }
     }
 
@@ -776,6 +759,7 @@ mod tests {
     use crate::config::default_config;
     use crate::segment::{AckSegment, DataSegment, Segment};
     use parking_lot::Mutex as PMutex;
+    use tokio::io::AsyncRead as _;
     use std::sync::atomic::AtomicUsize;
 
     /// 收集所有写入的 segment（测试用 SegmentWriter）。
@@ -1085,5 +1069,118 @@ mod tests {
             1,
             "terminate should close closer"
         );
+    }
+
+    // ===== cached future 参数捕获 bug（bd Xray-core-rust-0mp）=====
+
+    fn noop_waker() -> std::task::Waker {
+        fn clone(_: *const ()) -> std::task::RawWaker {
+            std::task::RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        fn noop(_: *const ()) {}
+        static VTABLE: std::task::RawWakerVTable =
+            std::task::RawWakerVTable::new(clone, noop, noop, noop);
+        // SAFETY: vtable 函数均为 no-op
+        unsafe { std::task::Waker::from_raw(std::task::RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+
+    /// 复现（对应 issue 描述）：read_state 缓存的 future 捕获首次 poll 的 buf
+    /// 大小。注入线程在「poll_read 同步读返回 0」与「缓存 future 内 read」之间
+    /// 的窗口注入数据时，旧实现把 future 读出的 n 字节 put_slice 进更小的当前
+    /// buf → tokio `ReadBuf::put_slice` assert panic。
+    ///
+    /// 修复（对齐 Go `waitForDataInput`：等待不携带调用参数）：缓存 future 只等
+    /// 通知，唤醒后用当前 buf 重新同步读。
+    #[test]
+    fn poll_read_pending_future_does_not_capture_first_buf_size() {
+        const CONV: u16 = 7;
+        const ROUNDS: usize = 3000;
+        const PAYLOAD: usize = 500;
+        let (conn, _writer) = make_connection(CONV);
+        let conn = Arc::new(conn);
+        let mut kcp = Box::pin(KcpConn::new(conn.clone()));
+        let waker = noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        let injector = std::thread::spawn(move || {
+            let payload = vec![0xABu8; PAYLOAD];
+            for number in 0..ROUNDS as u32 {
+                let seg = make_data(CONV, number, &payload);
+                conn.input(vec![SegmentKind::Data(seg)]);
+            }
+        });
+
+        let total = ROUNDS * PAYLOAD;
+        let mut received = 0usize;
+        let mut big = [0u8; 1024];
+        let mut small = [0u8; 8];
+        let mut use_big = true;
+        let mut rounds = 0usize;
+        while received < total && rounds < 20_000_000 {
+            rounds += 1;
+            let filled = if use_big {
+                let mut rb = tokio::io::ReadBuf::new(&mut big);
+                match kcp.as_mut().poll_read(&mut cx, &mut rb) {
+                    std::task::Poll::Ready(Ok(())) => rb.filled().len(),
+                    std::task::Poll::Pending => {
+                        use_big = !use_big;
+                        continue;
+                    }
+                    std::task::Poll::Ready(Err(_)) => break,
+                }
+            } else {
+                let mut rb = tokio::io::ReadBuf::new(&mut small);
+                match kcp.as_mut().poll_read(&mut cx, &mut rb) {
+                    std::task::Poll::Ready(Ok(())) => rb.filled().len(),
+                    std::task::Poll::Pending => {
+                        use_big = !use_big;
+                        continue;
+                    }
+                    std::task::Poll::Ready(Err(_)) => break,
+                }
+            };
+            assert!(filled > 0);
+            assert!(
+                received + filled <= total,
+                "read more bytes than injected: {received} + {filled} > {total}"
+            );
+            received += filled;
+            use_big = !use_big;
+        }
+        injector.join().unwrap();
+        assert_eq!(received, total, "should drain all injected bytes losslessly");
+    }
+
+    /// write 侧回归保护：发送窗口满挂起 → ACK 开窗唤醒 → 用当次 poll 的 buf
+    /// 写出（read 侧参数捕获 panic 由上方并发测试锁定根因，write 侧为同构
+    /// 修复，本测试保护挂起/唤醒路径不回归）。
+    #[test]
+    fn poll_write_pends_on_full_window_and_resumes_with_current_buf() {
+        use tokio::io::AsyncWrite as _;
+        const CONV: u16 = 9;
+        let (conn, _writer) = make_connection(CONV);
+        let conn = Arc::new(conn);
+        let mut kcp = Box::pin(KcpConn::new(conn.clone()));
+        let waker = noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        // 填满发送窗口（每轮 1 段，直到 push 失败返回 0）
+        let filler = vec![0x11u8; 64];
+        while conn.write(&filler).unwrap() > 0 {}
+
+        // 窗口满：写挂起
+        let a = vec![0xAAu8; 64];
+        assert!(kcp.as_mut().poll_write(&mut cx, &a).is_pending());
+
+        // ACK 释放窗口（input 的 Ack 分支会 notify_one 唤醒写端）
+        conn.input(vec![SegmentKind::Ack(make_ack(CONV, 0))]);
+
+        // 唤醒后：换 buf 写出当前 buf 的数据（旧实现写出的是挂起时捕获的 a 副本）
+        let b = vec![0xBBu8; 64];
+        match kcp.as_mut().poll_write(&mut cx, &b) {
+            std::task::Poll::Ready(Ok(n)) => assert!(n > 0),
+            other => panic!("expected ready after window reopened, got {other:?}"),
+        }
+        assert!(!conn.inner.sending_worker.is_empty());
     }
 }
