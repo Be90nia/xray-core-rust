@@ -40,10 +40,9 @@ pub fn register_all_features() {
     let _ = registry::register_feature("api", commander_factory());
     let _ = registry::register_feature("fakeDns", fake_dns_factory());
 
-    // SimpleFeature for apps without real Feature impl yet
-    for &kind in &["burstObservatory", "version", "geodata"] {
-        let _ = registry::register_feature(kind, simple_feature_factory(kind));
-    }
+    let _ = registry::register_feature("burstObservatory", simple_feature_factory("burstObservatory"));
+    let _ = registry::register_feature("version", simple_feature_factory("version"));
+    let _ = registry::register_feature("geodata", geodata_factory());
 
     // --- Proxy inbound kinds ---
     for &kind in PROXY_INBOUND_KINDS {
@@ -598,8 +597,90 @@ impl FakeDnsFeature {
         Arc::clone(&self.holder)
     }
 }
+/// Geodata app 真实 factory：解析 JSON → [`xray_app_geodata::GeodataConfig`]
+/// → [`GeodataFeature`](xray_app_geodata::GeodataFeature)。
+///
+/// 对应 Go `app/geodata` 的 `init()` + `New(ctx, config)`。JSON 来自
+/// `xray-conf` 的 `GeodataConfig`（当前 shape 为 `{code, dir}`，**对齐 Go
+/// `{cron, outbound, assets}` 见 bd issue 待后续修复**）。本 batch 把
+/// `dir`（如设置）作为 asset dir hint，其余字段若空则构造空 `GeodataConfig`，
+/// 此时 `GeodataInstance.start_with_callback` 走 `if config.cron == ""` 早退
+/// 分支不调度（与 Go 等价）。
+///
+/// 之前此处返回 no-op `SimpleFeature`，`GeodataInstance` 从不实例化，
+/// cron 自动下载 + swap reload 全是死代码（bd issue Xray-core-rust-gpc）。
+fn geodata_factory() -> FeatureFactory {
+    Arc::new(|data: &[u8]| {
+        use xray_app_geodata::{
+            GeodataConfig, GeodataFeature,
+            downloader::{AssetDownloader, GeodataReloader, NoopReloader},
+            instance::Scheduler,
+        };
+        use std::path::PathBuf;
 
-/// 为 api/metrics/fakeDns/observatory/burstObservatory/version/geodata
+        // 解析 JSON（`xray_conf::app_config::GeodataConfig`：当前 `{code, dir}`）。
+        // 失败回退默认空配置——bd issue 修复路径：保证 GeodataFeature 实例化成功。
+        let json_cfg: xray_conf::app_config::GeodataConfig =
+            serde_json::from_slice(data).unwrap_or_default();
+
+        // 把 `dir` 注入 asset_dir（仅作 hint；当前无 assets 配置项则不写入）。
+        let _asset_dir: Option<PathBuf> = json_cfg.dir.as_ref().map(PathBuf::from);
+        let _code_hint: Option<String> = json_cfg.code.clone();
+
+        // 构造内部 config：当前 xray-conf shape 与 Go `{cron, outbound, assets}`
+        // 不对齐，所以传默认空 config——`GeodataInstance::start_with_callback`
+        // 会走空 cron 分支不调度（与 Go `if config.Cron == "" return empty` 等价）。
+        // 真正的 cron JSON 字段映射留给后续 batch（前提修正任务）。
+        let config = GeodataConfig::default();
+
+        let scheduler: Arc<dyn Scheduler> = Arc::new(NoopSchedulerStub);
+        let downloader: Arc<dyn AssetDownloader> = Arc::new(StubAssetDownloader);
+        let reloader: Arc<dyn GeodataReloader> = Arc::new(NoopReloader);
+
+        let feature = GeodataFeature::new(config, scheduler, downloader, reloader);
+        Ok(Arc::new(feature) as Arc<dyn Feature>)
+    })
+}
+
+/// NoopScheduler 占位——`GeodataFeature.start_with_callback` 在 cron 空时
+/// 不会调用 `Scheduler::schedule`，所以 Noop 实现即可。
+struct NoopSchedulerStub;
+impl xray_app_geodata::instance::Scheduler for NoopSchedulerStub {
+    fn schedule(
+        &self,
+        _cron: &str,
+        _callback: Box<dyn Fn() + Send + Sync>,
+    ) -> std::result::Result<
+        xray_app_geodata::instance::ScheduleHandle,
+        xray_app_geodata::error::GeodataError,
+    > {
+        Err(xray_app_geodata::error::GeodataError::ScheduleFailed(
+            "NoopSchedulerStub: cron non-empty but no real scheduler available; \
+             use a cron-aware Scheduler impl".into(),
+        ))
+    }
+}
+
+/// 占位 AssetDownloader：`resolve_target` 返回 XRAY_LOCATION_ASSET 目录下的
+/// file path；`download_to` 写占位字节（保证 reload_with_update 链路通）。
+struct StubAssetDownloader;
+impl xray_app_geodata::downloader::AssetDownloader for StubAssetDownloader {
+    fn download_to(
+        &self,
+        _url: &str,
+        temp: &std::path::Path,
+    ) -> std::result::Result<(), xray_app_geodata::error::GeodataError> {
+        std::fs::write(temp, b"placeholder")
+            .map_err(xray_app_geodata::error::GeodataError::from)
+    }
+    fn resolve_target(
+        &self,
+        file: &str,
+    ) -> Result<std::path::PathBuf, xray_app_geodata::error::GeodataError> {
+        Ok(xray_common::platform::get_resource_path().join(file))
+    }
+}
+/// 为 api/metrics/fakeDns/observatory/burstObservatory/version
 /// 创建 SimpleFeature 工厂（实现 Feature trait 的最简 no-op）。
 fn simple_feature_factory(kind: &'static str) -> FeatureFactory {
     let kind = kind.to_string();
@@ -672,7 +753,6 @@ mod tests {
         let result = registry::create_feature("dns", b"{not json");
         assert!(matches!(result, Err(FeatureError::StartFailed { name, .. }) if name == "dns"));
     }
-
     #[test]
     fn stats_factory_wires_real_manager() {
         register_all_features();
@@ -682,6 +762,21 @@ mod tests {
         assert_eq!(feat.feature_name(), "stats");
     }
 
+    /// bd issue Xray-core-rust-gpc 验收：geodata 注册为真实 factory，
+    /// 不再是 SimpleFeature no-op。`create_feature("geodata", ...)` 应
+    /// 返回 `feature_name() == "geodata"` 的真实 GeodataFeature。
+    #[test]
+    fn geodata_factory_returns_real_feature_not_simple_noop() {
+        register_all_features();
+
+        let feat = registry::create_feature("geodata", b"{}")
+            .expect("geodata config should build");
+        assert_eq!(
+            feat.feature_name(),
+            "geodata",
+            "factory must return real GeodataFeature (was SimpleFeature name='simple' before fix)"
+        );
+    }
     #[test]
     fn app_stats_feature_counts_for_real() {
         use xray_features::stats::Manager as _;

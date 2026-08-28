@@ -59,8 +59,8 @@ impl AssetDownloader for DefaultAssetDownloader {
 /// 把一组 asset 下载为 stage 列表。
 ///
 /// 对应 Go `downloader.download`：每个 asset 下载到 temp 文件；任一失败 → clean 已下载的。
-pub fn download_assets(
-    downloader: &dyn AssetDownloader,
+pub fn download_assets<D: AssetDownloader + ?Sized>(
+    downloader: &D,
     assets: &[GeodataAsset],
 ) -> Result<Vec<Stage>, GeodataError> {
     let mut staged: Vec<Stage> = Vec::with_capacity(assets.len());
@@ -77,8 +77,8 @@ pub fn download_assets(
 }
 
 /// 下载单个 asset 为 stage。
-fn download_one(
-    downloader: &dyn AssetDownloader,
+fn download_one<D: AssetDownloader + ?Sized>(
+    downloader: &D,
     asset: &GeodataAsset,
 ) -> Result<Stage, GeodataError> {
     let target = downloader.resolve_target(&asset.file)?;
@@ -93,15 +93,8 @@ fn download_one(
 
     Ok(Stage { target, temp })
 }
-
 /// 完整下载 + swap + reload + commit/rollback 流程。
-///
-/// 对应 Go `Instance.reloadWithUpdate`：
-/// 1. download_assets → stages
-/// 2. swap_all(stages) → tx
-/// 3. reloader.reload()
-/// 4. 失败 → tx.rollback()；成功 → tx.commit()
-pub fn reload_with_update<D: AssetDownloader, R: GeodataReloader>(
+pub fn reload_with_update<D: AssetDownloader + ?Sized, R: GeodataReloader + ?Sized>(
     downloader: &D,
     reloader: &R,
     assets: &[GeodataAsset],

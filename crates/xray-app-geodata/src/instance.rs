@@ -28,6 +28,7 @@ pub struct ScheduleHandle {
 }
 
 impl ScheduleHandle {
+    /// 构造调度句柄，传入 cancel 闭包。
     pub fn new(cancel: impl FnOnce() + Send + 'static) -> Self {
         Self {
             cancel: Box::new(cancel),
@@ -55,7 +56,8 @@ impl Scheduler for NoopScheduler {
 /// GeodataInstance：geodata crate 的主编排类。
 ///
 /// 持有 config + downloader + reloader，编排：
-///   - `start()`：通过 scheduler 注册 cron 调度
+///   - `start_with_callback()`：通过 scheduler 注册 cron 调度，
+///     传入的闭包是 cron 触发时**真正执行**的代码（不是占位的 `|| {}`）。
 ///   - `execute()`：手动触发一次 reload（cron 调度的回调内会调用此方法）
 ///   - `close()`：取消调度
 pub struct GeodataInstance {
@@ -90,9 +92,14 @@ impl GeodataInstance {
     /// Start：通过 scheduler 注册 cron 调度。
     ///
     /// 若 config.cron 为空，则不调度（与 Go 版 `if config.Cron == ""` 一致）。
-    pub fn start(
+    ///
+    /// `callback` 是 cron 触发时实际调用的闭包。**不是 `|| {}` 占位**——
+    /// bd issue Xray-core-rust-gpc 修复：之前 `|| {}` 导致自动下载/swap reload
+    /// 全是死代码。调用方需传入真正执行 `execute()` 的闭包。
+    pub fn start_with_callback(
         &self,
         scheduler: &dyn Scheduler,
+        callback: Box<dyn Fn() + Send + Sync>,
     ) -> Result<(), GeodataError> {
         let mut g = self.state.lock();
         if g.running {
@@ -100,7 +107,7 @@ impl GeodataInstance {
         }
 
         if !self.config.cron.is_empty() {
-            let handle = scheduler.schedule(&self.config.cron, Box::new(|| {}))?;
+            let handle = scheduler.schedule(&self.config.cron, callback)?;
             g.handle = Some(handle);
         }
         g.running = true;
@@ -123,10 +130,10 @@ impl GeodataInstance {
     /// 执行一次 reload（含 download + swap）。
     ///
     /// 对应 Go `Instance.execute` + `reloadWithUpdate`。
-    pub fn execute<D: AssetDownloader, R: GeodataReloader>(
+    pub fn execute(
         &self,
-        downloader: &D,
-        reloader: &R,
+        downloader: &dyn AssetDownloader,
+        reloader: &dyn GeodataReloader,
     ) -> Result<(), GeodataError> {
         if self.config.assets.is_empty() {
             // 无 asset：仅 reload
@@ -139,7 +146,7 @@ impl GeodataInstance {
     }
 
     /// 仅 reload（不下载，与 Go `reload()` 等价）。
-    pub fn reload_only<R: GeodataReloader>(&self, reloader: &R) -> Result<(), GeodataError> {
+    pub fn reload_only<R: GeodataReloader + ?Sized>(&self, reloader: &R) -> Result<(), GeodataError> {
         reloader.reload()
     }
 }
@@ -177,7 +184,7 @@ mod tests {
         let cfg = GeodataConfig::default();
         let inst = GeodataInstance::new(cfg);
         let (s, c) = counting_scheduler();
-        inst.start(&*s).unwrap();
+        inst.start_with_callback(&*s, Box::new(|| {})).unwrap();
         assert!(inst.is_running());
         assert_eq!(c.load(Ordering::SeqCst), 0);
         inst.close().unwrap();
@@ -191,7 +198,7 @@ mod tests {
         };
         let inst = GeodataInstance::new(cfg);
         let (s, c) = counting_scheduler();
-        inst.start(&*s).unwrap();
+        inst.start_with_callback(&*s, Box::new(|| {})).unwrap();
         assert_eq!(c.load(Ordering::SeqCst), 1);
         inst.close().unwrap();
     }
@@ -201,8 +208,10 @@ mod tests {
         let cfg = GeodataConfig::default();
         let inst = GeodataInstance::new(cfg);
         let (s, _) = counting_scheduler();
-        inst.start(&*s).unwrap();
-        let err = inst.start(&*s).unwrap_err();
+        inst.start_with_callback(&*s, Box::new(|| {})).unwrap();
+        let err = inst
+            .start_with_callback(&*s, Box::new(|| {}))
+            .unwrap_err();
         assert!(matches!(err, GeodataError::AlreadyRunning));
         inst.close().unwrap();
     }
@@ -220,7 +229,7 @@ mod tests {
         let cfg = GeodataConfig::default();
         let inst = GeodataInstance::new(cfg);
         let (s, _) = counting_scheduler();
-        inst.start(&*s).unwrap();
+        inst.start_with_callback(&*s, Box::new(|| {})).unwrap();
         inst.close().unwrap();
         assert!(!inst.is_running());
     }
@@ -233,9 +242,9 @@ mod tests {
         };
         let inst = GeodataInstance::new(cfg);
         let (s, _) = counting_scheduler();
-        inst.start(&*s).unwrap();
+        inst.start_with_callback(&*s, Box::new(|| {})).unwrap();
         inst.close().unwrap();
-        inst.start(&*s).unwrap();
+        inst.start_with_callback(&*s, Box::new(|| {})).unwrap();
         assert!(inst.is_running());
         inst.close().unwrap();
     }

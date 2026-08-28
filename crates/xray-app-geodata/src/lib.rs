@@ -17,16 +17,16 @@
 pub mod config;
 pub mod downloader;
 pub mod error;
+pub mod feature;
 pub mod instance;
 pub mod swap;
-
 pub use config::{GeodataAsset, GeodataConfig};
 pub use downloader::{
     download_assets, reload_with_update, AssetDownloader, DefaultAssetDownloader,
     GeodataReloader, NoopReloader,
 };
 pub use error::{at_error, at_warning, GeodataError};
+pub use feature::GeodataFeature;
 pub use instance::{
     GeodataInstance, NoopScheduler, ScheduleHandle, Scheduler,
 };
-pub use swap::{backup_file, clean, swap_all, swap_one, temp_file, Stage, Swap, Tx};
