@@ -7,8 +7,9 @@
 //! 实现 TCP 监听的核心路径：`DefaultListener` + `listen_system` async 函数 +
 //! 全局 `effective_listener` + `register_listener_controller`。
 //!
-//! 切片2 待办：Unix domain socket（FileLocker + 权限设置）+ `ListenPacket`（UDP）+
-//! `AcceptProxyProtocol`（proxyproto）+ 平台特定 sockopt（SO_REUSEPORT 等）。
+//! Unix domain socket（FileLocker + 权限 + Linux abstract `@`/`@@`）、TCP
+//! KeepAliveConfig（idle/interval 任一非零即启用）、TcpMptcp（Linux，静默回退）。
+//! 待办：`ListenPacket`（UDP）+ 平台特定 sockopt（SO_REUSEPORT 等）。
 
 use std::future::Future;
 use std::io;
@@ -70,13 +71,43 @@ impl DefaultListener {
     /// 对应 Go `DefaultListener.Listen(ctx, addr, sockopt)` 的 TCP 分支。
     /// sockopt 在 `accept` 时应用到每个入站连接（与 Go 一致）。
     pub async fn bind(addr: SocketAddr, sockopt: SocketOptions) -> io::Result<Self> {
-        let inner = TokioTcpListener::bind(addr).await?;
+        let inner = if sockopt.tcp_mptcp {
+            Self::bind_mptcp(addr).await?
+        } else {
+            TokioTcpListener::bind(addr).await?
+        };
         Ok(Self {
             inner,
             sockopt,
             controllers: Vec::new(),
             accept_proxy_protocol: false,
         })
+    }
+
+    /// MPTCP 监听绑定。对应 Go `lc.SetMultipathTCP(true)`（system_listener.go:110-112）。
+    ///
+    /// Linux：手动创建 socket 并在 bind 前设 `TCP_MPTCP`（内核不支持时记录并
+    /// 静默回退普通 TCP，对齐 Go）。其他平台：Go 本身不支持 MPTCP 监听，直接普通绑定。
+    #[cfg(not(target_os = "linux"))]
+    async fn bind_mptcp(addr: SocketAddr) -> io::Result<TokioTcpListener> {
+        TokioTcpListener::bind(addr).await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn bind_mptcp(addr: SocketAddr) -> io::Result<TokioTcpListener> {
+        use socket2::{Domain, Protocol, Type};
+        let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+        // TCP_MPTCP 必须在 listen 前设置；失败（如内核未编译 MPTCP）静默回退普通 TCP。
+        if let Err(e) = crate::sockopt::try_set_mptcp(&socket) {
+            tracing::debug!(error = %e, "MPTCP unavailable, falling back to TCP");
+        }
+        socket.bind(&addr.into())?;
+        socket.listen(128)?;
+        socket.set_nonblocking(true)?;
+        // Socket → OwnedFd → std TcpListener（socket2 无直接转换）。
+        let std_listener = std::net::TcpListener::from(std::os::fd::OwnedFd::from(socket));
+        Ok(TokioTcpListener::from_std(std_listener)?)
     }
 
     /// 用已绑定的 tokio listener 构造（测试或高级场景用）。
@@ -333,41 +364,50 @@ impl UnixListener {
     /// 绑定 Unix domain socket。对应 Go `DefaultListener.Listen` 的 Unix 分支。
     ///
     /// 地址格式：
-    /// - `/path/to/socket` — 普通路径
+    /// - `/path/to/socket` — 普通路径（FileLocker + 残留文件清理）
     /// - `/path/to/socket,0755` — 路径 + 八进制权限（bind 后 chmod）
-    /// - `@name` — Linux abstract socket（尚不支持，返回 `InvalidInput`）
+    /// - `@name` — Linux abstract socket（无 FileLocker，Go system_listener.go:119）
+    /// - `@@name` — abstract socket + haproxy padding（名字零填充到 108 字节，
+    ///   Go system_listener.go:121-126）
     ///
     /// # Errors
-    /// FileLocker 获取失败 / bind 失败 / 权限设置失败时返回 `io::Error`。
+    /// FileLocker 获取失败 / bind 失败 / 权限设置失败 / abstract 名超长时返回 `io::Error`。
     pub async fn bind(addr: &str, sockopt: SocketOptions) -> io::Result<Self> {
-        let (socket_path, perm) = parse_unix_addr(addr)?;
+        match parse_unix_addr(addr)? {
+            UnixAddrSpec::Abstract(name) => {
+                // abstract socket 在独立命名空间，无锁、无文件、无权限设置。
+                let inner = TokioUnixListener::from_std(bind_abstract_unix(&name)?)?;
+                Ok(Self {
+                    inner,
+                    sockopt,
+                    controllers: Vec::new(),
+                    _locker: None,
+                })
+            }
+            UnixAddrSpec::Path(socket_path, perm) => {
+                // normal unix domain socket needs lock
+                let mut lk = FileLocker::new(format!("{}.lock", socket_path.display()));
+                lk.acquire()?;
 
-        // FileLocker（abstract socket 不需要）
-        let locker = if socket_path.starts_with('\u{0}') {
-            None
-        } else {
-            let mut lk = FileLocker::new(format!("{}.lock", socket_path.display()));
-            lk.acquire()?;
-            Some(lk)
-        };
+                // 删除可能残留的旧 socket 文件（Go 标准库 net.ListenUnix 也这样做）
+                let _ = std::fs::remove_file(&socket_path);
+                let inner = TokioUnixListener::bind(&socket_path)?;
 
-        // 删除可能残留的旧 socket 文件（Go 标准库 net.ListenUnix 也这样做）
-        let _ = std::fs::remove_file(&socket_path);
-        let inner = TokioUnixListener::bind(&socket_path)?;
+                // bind 后设置权限
+                if let Some(mode) = perm {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(mode))
+                        .map_err(|e| io::Error::other(format!("failed to set permission: {e}")))?;
+                }
 
-        // bind 后设置权限
-        if let Some(mode) = perm {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(mode))
-                .map_err(|e| io::Error::other(format!("failed to set permission: {e}")))?;
+                Ok(Self {
+                    inner,
+                    sockopt,
+                    controllers: Vec::new(),
+                    _locker: Some(lk),
+                })
+            }
         }
-
-        Ok(Self {
-            inner,
-            sockopt,
-            controllers: Vec::new(),
-            _locker: locker,
-        })
     }
 
     /// 添加 fd 控制器。
@@ -387,23 +427,71 @@ impl SystemListener for UnixListener {
         })
     }
 
+
     fn local_addr(&self) -> io::Result<SocketAddr> {
         // Unix socket 没有 SocketAddr，返回 unspecified（模仿 Go）
         Ok(SocketAddr::from(([0, 0, 0, 0], 0)))
     }
 }
-
-/// 解析 Unix 地址（path 或 path,perm）。
-///
-/// 返回 (socket_path, optional_permission)。
-/// `@` 前缀（abstract socket）暂不支持。
+#[derive(Debug)]
 #[cfg(unix)]
-fn parse_unix_addr(addr: &str) -> io::Result<(PathBuf, Option<u32>)> {
-    // ponytail: abstract socket (@) 延后实现，需要 socket2 手动创建。
+enum UnixAddrSpec {
+    /// 普通文件系统路径 + 可选八进制权限。
+    Path(PathBuf, Option<u32>),
+    /// Linux abstract socket 的 sun_path 字节（已含前导 `\0`）。
+    Abstract(Vec<u8>),
+}
+
+/// 计算 Linux abstract unix socket 的 `sun_path` 字节。纯函数，无平台依赖。
+///
+/// 对应 Go `DefaultListener.Listen` 的 abstract 分支（system_listener.go:119-126）：
+/// - `@name` → `\0name`（abstract 命名空间，Go net 把 `@` 转 `\0`）
+/// - `@@name` → `\0name` + `\0` 填充到 108 字节（`sizeof(sockaddr_un.sun_path)`，
+///   haproxy padding 约定）
+/// - 名字部分超过 107 字节 → `None`（对齐 Go net "unix socket name too long"）
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+pub(crate) fn abstract_sockaddr_path(addr: &str) -> Option<Vec<u8>> {
+    const SUN_PATH_LEN: usize = 108; // Linux sockaddr_un.sun_path
+    let bytes = addr.as_bytes();
+    if bytes.first() != Some(&b'@') {
+        return None;
+    }
+    let padded = bytes.get(1) == Some(&b'@');
+    let name = &bytes[1..]; // 第二个 '@'（若有）由填充逻辑转成 '\0'
+    if padded {
+        // Go: fullAddr := make([]byte, 108); copy(fullAddr, address[1:])
+        let mut v = vec![0u8; SUN_PATH_LEN];
+        let n = name.len().min(SUN_PATH_LEN);
+        v[..n].copy_from_slice(&name[..n]);
+        v[0] = 0; // Go net 把首字节 '@' 转 abstract 前导 '\0'
+        Some(v)
+    } else {
+        if name.len() > SUN_PATH_LEN - 1 {
+            return None;
+        }
+        let mut v = Vec::with_capacity(name.len() + 1);
+        v.push(0);
+        v.extend_from_slice(name);
+        Some(v)
+    }
+}
+
+/// 解析 Unix 地址。
+///
+/// - Linux/Android：`@`/`@@` 前缀 → [`UnixAddrSpec::Abstract`]（lockfree）
+/// - 其他 unix：`@` 前缀 → `InvalidInput`（Go 端 abstract 仅支持 linux/android；
+///   Go 在 darwin 会把 `@x` 当字面路径走 FileLocker 最终 bind 失败，此处显式报错）
+/// - `path` / `path,perm`（八进制） → [`UnixAddrSpec::Path`]
+#[cfg(unix)]
+fn parse_unix_addr(addr: &str) -> io::Result<UnixAddrSpec> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Some(name) = abstract_sockaddr_path(addr) {
+        return Ok(UnixAddrSpec::Abstract(name));
+    }
     if addr.starts_with('@') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "abstract socket (@) not yet supported, use normal path",
+            "abstract socket (@) is only supported on Linux/Android",
         ));
     }
     if let Some(comma) = addr.rfind(',') {
@@ -415,9 +503,60 @@ fn parse_unix_addr(addr: &str) -> io::Result<(PathBuf, Option<u32>)> {
                 format!("invalid permission '{perm_str}': {e}"),
             )
         })?;
-        Ok((PathBuf::from(path), Some(perm)))
+        Ok(UnixAddrSpec::Path(PathBuf::from(path), Some(perm)))
     } else {
-        Ok((PathBuf::from(addr), None))
+        Ok(UnixAddrSpec::Path(PathBuf::from(addr), None))
+    }
+}
+
+/// 用 libc 手动创建 Linux abstract unix socket（std/tokio 不支持 abstract 地址）。
+///
+/// `name` 为完整 `sun_path` 字节（含前导 `\0`）。socket 以非阻塞创建，
+/// 可直接交给 [`TokioUnixListener::from_std`]。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn bind_abstract_unix(name: &[u8]) -> io::Result<std::os::unix::net::UnixListener> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: socket(2) 返回的 fd 所有权移交 std UnixListener（from_raw_fd）。
+    unsafe {
+        let fd = libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+        );
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut addr: libc::sockaddr_un = std::mem::zeroed();
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        if name.len() > addr.sun_path.len() {
+            libc::close(fd);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "abstract socket name too long",
+            ));
+        }
+        // sun_path 是 [c_char; 108]，逐字节 u8→c_char（abstract 名不含 NUL 终止）。
+        for (dst, src) in addr.sun_path.iter_mut().zip(name.iter()) {
+            *dst = *src as libc::c_char;
+        }
+        // abstract 地址长度 = sun_family(2) + 实际名字长度（无 '\0' 终止符）。
+        let addrlen = std::mem::size_of::<libc::sa_family_t>() + name.len();
+        if libc::bind(
+            fd,
+            (&addr as *const libc::sockaddr_un).cast(),
+            addrlen as libc::socklen_t,
+        ) < 0
+        {
+            let e = io::Error::last_os_error();
+            libc::close(fd);
+            return Err(e);
+        }
+        if libc::listen(fd, 128) < 0 {
+            let e = io::Error::last_os_error();
+            libc::close(fd);
+            return Err(e);
+        }
+        Ok(std::os::unix::net::UnixListener::from_raw_fd(fd))
     }
 }
 
@@ -640,24 +779,42 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn parse_unix_addr_plain_path() {
-        let (path, perm) = parse_unix_addr("/tmp/test.sock").unwrap();
-        assert_eq!(path, PathBuf::from("/tmp/test.sock"));
-        assert!(perm.is_none());
+        match parse_unix_addr("/tmp/test.sock").unwrap() {
+            UnixAddrSpec::Path(path, perm) => {
+                assert_eq!(path, PathBuf::from("/tmp/test.sock"));
+                assert!(perm.is_none());
+            }
+            other => panic!("expect Path, got {other:?}"),
+        }
     }
 
     #[cfg(unix)]
     #[test]
     fn parse_unix_addr_with_permission() {
-        let (path, perm) = parse_unix_addr("/tmp/test.sock,0755").unwrap();
-        assert_eq!(path, PathBuf::from("/tmp/test.sock"));
-        assert_eq!(perm, Some(0o755));
+        match parse_unix_addr("/tmp/test.sock,0755").unwrap() {
+            UnixAddrSpec::Path(path, perm) => {
+                assert_eq!(path, PathBuf::from("/tmp/test.sock"));
+                assert_eq!(perm, Some(0o755));
+            }
+            other => panic!("expect Path, got {other:?}"),
+        }
     }
 
+    /// `@` 前缀：Linux/Android 解析为 Abstract；其他 unix 显式报错
+    ///（Windows 无 unix socket，该分支 cfg 掉，走纯函数测试）。
     #[cfg(unix)]
     #[test]
-    fn parse_unix_addr_abstract_rejected() {
-        let err = parse_unix_addr("@abstract").unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    fn parse_unix_addr_abstract() {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        match parse_unix_addr("@abstract").unwrap() {
+            UnixAddrSpec::Abstract(n) => assert_eq!(n, b"\0abstract".to_vec()),
+            other => panic!("expect Abstract, got {other:?}"),
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            let err = parse_unix_addr("@abstract").unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        }
     }
 
     #[cfg(unix)]
@@ -679,5 +836,124 @@ mod tests {
         // drop 后 lock 文件应被删除
         assert!(!std::path::Path::new(&lock_path).exists(), "lock 文件应被删除");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ===== bd 6tl：abstract socket / KeepAliveConfig / TcpMptcp =====
+
+    /// abstract 地址 → sun_path 字节。纯函数，全平台可测
+    ///（Go system_listener.go:119-126）。
+    #[test]
+    fn abstract_sockaddr_path_variants() {
+        // @name → \0name
+        assert_eq!(
+            abstract_sockaddr_path("@name").unwrap(),
+            b"\0name".to_vec()
+        );
+        // @@name → \0 + name 零填充到 108 字节（haproxy padding）
+        let padded = abstract_sockaddr_path("@@name").unwrap();
+        assert_eq!(padded.len(), 108);
+        assert_eq!(&padded[..5], b"\0name");
+        assert!(padded[5..].iter().all(|&b| b == 0));
+        // @@ → 全零 108 字节
+        let empty = abstract_sockaddr_path("@@").unwrap();
+        assert_eq!(empty, vec![0u8; 108]);
+        // 非 @ 前缀 → None
+        assert!(abstract_sockaddr_path("/tmp/x.sock").is_none());
+        assert!(abstract_sockaddr_path("").is_none());
+        // @name 超长（> 107 字节）→ None（Go "unix socket name too long"）
+        let long = format!("@{}", "a".repeat(108));
+        assert!(abstract_sockaddr_path(&long).is_none());
+        // @@ 超长 → 对齐 Go copy() 截断到 108
+        let long_pad = format!("@@{}", "a".repeat(200));
+        assert_eq!(abstract_sockaddr_path(&long_pad).unwrap().len(), 108);
+    }
+
+    /// MPTCP 监听：Windows/非 Linux 走不可用分支——静默回退普通 TCP，监听照常工作
+    ///（对齐 Go `SetMultipathTCP` 平台不支持时的行为）；Linux 走 TCP_MPTCP setsockopt
+    /// 路径，内核不支持同样回退。两端均断言端到端可用。
+    #[tokio::test]
+    async fn mptcp_listener_binds_and_accepts() {
+        let sockopt = SocketOptions {
+            tcp_mptcp: true,
+            ..Default::default()
+        };
+        let listener = DefaultListener::bind("127.0.0.1:0".parse().unwrap(), sockopt)
+            .await
+            .expect("tcp_mptcp=true 时 bind 失败（应回退普通 TCP）");
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let mut conn = listener.accept().await.expect("accept 失败");
+            conn.write_all(b"mptcp").await.expect("write 失败");
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect 失败");
+        let mut buf = [0u8; 5];
+        client.read_exact(&mut buf).await.expect("read 失败");
+        assert_eq!(&buf, b"mptcp");
+
+        server.await.unwrap();
+    }
+
+    /// KeepAliveConfig 语义（Go system_listener.go:96-109）：idle/interval 任一 >0
+    /// 即启用 SO_KEEPALIVE；均未配置则保持默认关闭。经 accept 路径 + fd 控制器
+    /// 读取 accepted socket 的 SO_KEEPALIVE 状态验证。
+    #[tokio::test]
+    async fn inbound_keepalive_enabled_when_either_field_set() {
+        let ka_state = Arc::new(parking_lot::Mutex::new(None));
+        let hook = Arc::clone(&ka_state);
+
+        // 仅 interval（idle=0）：Go Enable=true、Idle 用系统默认。
+        let sockopt = SocketOptions {
+            tcp_keepalive_idle: std::time::Duration::ZERO,
+            tcp_keepalive_interval: std::time::Duration::from_secs(30),
+            ..Default::default()
+        };
+        let mut listener = DefaultListener::bind("127.0.0.1:0".parse().unwrap(), sockopt)
+            .await
+            .unwrap();
+        listener.add_controller(Arc::new(move |_net, _addr, socket| {
+            *hook.lock() = Some(socket.keepalive()?);
+            Ok(())
+        }));
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let _client = TcpStream::connect(addr).await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(*ka_state.lock(), Some(true), "interval-only 应启用 keepalive");
+    }
+
+    /// KeepAliveConfig：idle/interval 均为 0（Go Enable=false，lc.KeepAlive=-1）
+    /// → 不触碰 SO_KEEPALIVE，accepted socket 保持关闭。
+    #[tokio::test]
+    async fn inbound_keepalive_disabled_when_unset() {
+        let ka_state = Arc::new(parking_lot::Mutex::new(None));
+        let hook = Arc::clone(&ka_state);
+
+        let sockopt = SocketOptions {
+            tcp_keepalive_idle: std::time::Duration::ZERO,
+            tcp_keepalive_interval: std::time::Duration::ZERO,
+            ..Default::default()
+        };
+        let mut listener = DefaultListener::bind("127.0.0.1:0".parse().unwrap(), sockopt)
+            .await
+            .unwrap();
+        listener.add_controller(Arc::new(move |_net, _addr, socket| {
+            *hook.lock() = Some(socket.keepalive()?);
+            Ok(())
+        }));
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let _client = TcpStream::connect(addr).await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(*ka_state.lock(), Some(false), "未配置时不应启用 keepalive");
     }
 }

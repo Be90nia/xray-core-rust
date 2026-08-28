@@ -157,7 +157,7 @@ impl StreamSettings {
     /// 支持字段：`mark` / `tcpFastOpen` / `tcpKeepAliveInterval`（秒）/
     /// `tcpKeepAliveIdle`（秒）/ `v6only` / `dialerProxy` / `happyEyeballs`。
     /// 缺省字段用 [`SocketOptions::default`]。Go 的 congestion/windowClamp/
-    /// maxSeg/userTimeout/mptcp/interface 在
+    /// maxSeg/userTimeout/interface 在
     /// [`SocketOptions`](crate::sockopt::SocketOptions) 尚无对应字段，暂不解析。
     #[must_use]
     pub fn socket_options(&self) -> SocketOptions {
@@ -178,6 +178,10 @@ impl StreamSettings {
         }
         if let Some(v) = obj.get("tcpKeepAliveIdle").and_then(|v| v.as_u64()) {
             opts.tcp_keepalive_idle = std::time::Duration::from_secs(v);
+        }
+        // MPTCP（bd 6tl，Go `SocketConfig.TcpMptcp` 字段 19，JSON `tcpMptcp`）。
+        if let Some(v) = obj.get("tcpMptcp").and_then(|v| v.as_bool()) {
+            opts.tcp_mptcp = v;
         }
         if let Some(v) = obj.get("v6only").and_then(|v| v.as_bool()) {
             opts.ipv6_only = v;
@@ -343,11 +347,13 @@ mod transport_cache_tests {
             "tcpFastOpen": true,
             "tcpKeepAliveInterval": 30,
             "tcpKeepAliveIdle": 60,
+            "tcpMptcp": true,
             "v6only": true
         }));
         let o = s.socket_options();
         assert_eq!(o.mark, 255);
         assert!(o.tcp_fast_open);
+        assert!(o.tcp_mptcp);
         assert_eq!(o.tcp_keepalive_interval, std::time::Duration::from_secs(30));
         assert_eq!(o.tcp_keepalive_idle, std::time::Duration::from_secs(60));
         assert!(o.ipv6_only);

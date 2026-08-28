@@ -42,6 +42,11 @@ pub struct SocketOptions {
     /// TCP Fast Open。对应 Go `SocketConfig.Tfo`。
     /// Windows 不支持 per-socket TFO（需系统级注册表设置），FreeBSD 12.1+/Linux 支持。
     pub tcp_fast_open: bool,
+    /// Multipath TCP（MPTCP）。对应 Go `SocketConfig.TcpMptcp`（字段 19，JSON `tcpMptcp`）。
+    /// 仅 Linux 生效；其他平台或不支持 MPTCP 的内核上静默回退普通 TCP
+    ///（对齐 Go `net.ListenConfig.SetMultipathTCP` 行为）。监听 socket 在
+    /// bind 前设置 `TCP_MPTCP`，accept 出的连接自动为 MPTCP。
+    pub tcp_mptcp: bool,
     /// 绑定到指定网络接口索引。`0`=不绑定。
     /// 对应 Go `SocketConfig.Interface`（Go 用接口名字符串，Rust 用索引）。
     /// Linux: SO_BINDTODEVICE；Darwin: IP_BOUND_IF / IPV6_BOUND_IF。
@@ -97,6 +102,7 @@ impl Default for SocketOptions {
             tcp_keepalive_interval: Duration::from_secs(45),
             mark: 0,
             tcp_fast_open: false,
+            tcp_mptcp: false,
             bind_if_index: 0,
             ipv6_only: false,
             dialer_proxy: String::new(),
@@ -118,14 +124,9 @@ pub fn apply_outbound_socket_options(socket: &Socket, opts: &SocketOptions) -> s
     if opts.ipv6_only {
         socket.set_only_v6(true)?;
     }
-    // SO_KEEPALIVE + TCP_KEEPIDLE/TCP_KEEPINTVL：socket2 跨平台封装。
-    if opts.tcp_keepalive_idle != Duration::ZERO {
-        socket.set_tcp_keepalive(
-            &socket2::TcpKeepalive::new()
-                .with_time(opts.tcp_keepalive_idle)
-                .with_interval(opts.tcp_keepalive_interval),
-        )?;
-    }
+    // SO_KEEPALIVE + TCP_KEEPIDLE/TCP_KEEPINTVL（Go KeepAliveConfig 语义，见
+    // [`set_keepalive_config`]）。
+    set_keepalive_config(socket, opts)?;
     // SO_MARK：仅 Linux 有效。
     #[cfg(target_os = "linux")]
     {
@@ -151,20 +152,92 @@ pub fn apply_outbound_socket_options(socket: &Socket, opts: &SocketOptions) -> s
 /// 跨平台通用部分。
 ///
 /// 与 [`apply_outbound_socket_options`] 的差异：入站连接默认禁用 keepalive
-///（Go 端 `lc.KeepAlive = -1`），仅在 [`SocketOptions`] 显式配置非零 idle 时启用。
+///（Go 端 `lc.KeepAlive = -1`，system_listener.go:91），仅 idle/interval 任一
+/// 非零时启用（Go system_listener.go:102-109「任一 >0 即 Enable」）。
 pub fn apply_inbound_socket_options(socket: &Socket, opts: &SocketOptions) -> std::io::Result<()> {
     socket.set_nodelay(opts.tcp_nodelay)?;
     if opts.ipv6_only {
         socket.set_only_v6(true)?;
     }
-    if opts.tcp_keepalive_idle != Duration::ZERO {
-        socket.set_tcp_keepalive(
-            &socket2::TcpKeepalive::new()
-                .with_time(opts.tcp_keepalive_idle)
-                .with_interval(opts.tcp_keepalive_interval),
-        )?;
-    }
+    set_keepalive_config(socket, opts)?;
     Ok(())
+}
+
+#[cfg(windows)]
+/// Go 1.23 `net.KeepAliveConfig` 未配置字段（`-1`）的默认物化值
+///（Go net 文档：Idle/Interval 缺省 15s；Windows `SIO_KEEPALIVE_VALS` 要求显式值）。
+pub(crate) const DEFAULT_KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
+/// 同上，Interval 缺省 15s。
+#[cfg(windows)]
+pub(crate) const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// 应用 TCP keepalive 配置。对应 Go `net.KeepAliveConfig` 语义
+///（system_listener.go:96-109 / system_dialer.go:89-110）：
+///
+/// - `idle` 与 `interval` 均为 0（Go `Enable: false`）：不动 `SO_KEEPALIVE`（默认关）。
+/// - 任一非零（Go「任一 >0 即 Enable」）：设 `SO_KEEPALIVE=1`；未配置的字段用
+///   OS 默认——unix 上跳过对应 setsockopt（Linux 内核默认，对齐 Go `Idle: -1`）；
+///   Windows 上 `SIO_KEEPALIVE_VALS` 必须显式给值，物化为 Go 缺省 15s。
+///
+/// 与 Go 的差异：Go 的 `Count`（`TCP_KEEPCNT`）Xray 从不配置（恒 `-1` 用系统默认），
+/// 此处同样不设置。
+pub(crate) fn set_keepalive_config(socket: &Socket, opts: &SocketOptions) -> std::io::Result<()> {
+    let idle = opts.tcp_keepalive_idle;
+    let interval = opts.tcp_keepalive_interval;
+    if idle.is_zero() && interval.is_zero() {
+        return Ok(());
+    }
+    let mut ka = socket2::TcpKeepalive::new();
+    if !idle.is_zero() {
+        ka = ka.with_time(idle);
+    }
+    if !interval.is_zero() {
+        ka = ka.with_interval(interval);
+    }
+    // Windows：`SIO_KEEPALIVE_VALS` 的 time/interval 均不可为 0（socket2 会把
+    // `None` 序列化为 0ms），未配置字段物化 Go 缺省 15s。
+    #[cfg(windows)]
+    let ka = {
+        let mut ka = ka;
+        if idle.is_zero() {
+            ka = ka.with_time(DEFAULT_KEEPALIVE_IDLE);
+        }
+        if interval.is_zero() {
+            ka = ka.with_interval(DEFAULT_KEEPALIVE_INTERVAL);
+        }
+        ka
+    };
+    socket.set_tcp_keepalive(&ka)
+}
+
+/// 尝试启用 MPTCP（Linux `TCP_MPTCP=1`）。对应 Go `SetMultipathTCP(true)`
+///（system_listener.go:110-112）。
+///
+/// 必须在 `listen()` 之前对监听 socket 调用。内核不支持（`ENOPROTOOPT`）时
+/// 返回 Err，调用方按 Go 行为记录后静默回退普通 TCP。
+#[cfg(target_os = "linux")]
+/// Linux UAPI `TCP_MPTCP`（include/uapi/linux/tcp.h，值 30）。libc crate 未导出，
+/// 与 Go x/sys/unix 一样本地固定。
+const TCP_MPTCP: libc::c_int = 30;
+
+#[cfg(target_os = "linux")]
+pub(crate) fn try_set_mptcp(socket: &Socket) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: 对已创建 socket fd 设置整数选项；fd 由 socket2 Socket 持有，生命周期覆盖调用。
+    let ret = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            TCP_MPTCP,
+            &1i32 as *const i32 as *const libc::c_void,
+            std::mem::size_of::<i32>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// 获取被 iptables REDIRECT 的 TCP 连接的原始目标地址。
@@ -237,6 +310,7 @@ mod tests {
         assert_eq!(opts.tcp_keepalive_idle, Duration::from_secs(45));
         assert_eq!(opts.tcp_keepalive_interval, Duration::from_secs(45));
         assert!(!opts.tcp_fast_open, "TFO default should be false");
+        assert!(!opts.tcp_mptcp, "MPTCP default should be false");
     }
 
     #[test]
@@ -244,5 +318,40 @@ mod tests {
         let opts = SocketOptions::default();
         let cloned = opts.clone();
         assert_eq!(opts, cloned);
+    }
+
+    /// KeepAliveConfig 语义（Go system_listener.go:96-109）：idle/interval 任一
+    /// 非零即启用 SO_KEEPALIVE；均零则不触碰。真实 TCP 连接上验证。
+    #[tokio::test]
+    async fn keepalive_config_either_field_enables() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_task = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let socket = socket2::Socket::from(stream.into_std().unwrap());
+
+        // interval-only（idle=0）：应启用（旧实现只在 idle!=0 时启用——本修复点）。
+        let opts = SocketOptions {
+            tcp_keepalive_idle: Duration::ZERO,
+            tcp_keepalive_interval: Duration::from_secs(30),
+            ..Default::default()
+        };
+        set_keepalive_config(&socket, &opts).unwrap();
+        assert!(socket.keepalive().unwrap(), "interval-only 应启用 SO_KEEPALIVE");
+
+        // 均零：不动 SO_KEEPALIVE（先关掉再验证仍是关）。
+        socket.set_keepalive(false).unwrap();
+        let opts = SocketOptions {
+            tcp_keepalive_idle: Duration::ZERO,
+            tcp_keepalive_interval: Duration::ZERO,
+            ..Default::default()
+        };
+        set_keepalive_config(&socket, &opts).unwrap();
+        assert!(!socket.keepalive().unwrap(), "未配置不应启用 SO_KEEPALIVE");
+
+        drop(socket);
+        accept_task.await.unwrap();
     }
 }
