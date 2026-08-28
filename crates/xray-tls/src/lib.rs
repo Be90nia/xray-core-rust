@@ -8,7 +8,8 @@
 //! - `config`：`CurveId` + `parse_curve_name` + `is_from_mitm` + `verify_chain` +
 //!   `Option` 函数模式 + `RandCarrier` 数据结构
 //! - `certificate`：证书生成/名称提取 + `certificates[]` 条目解析（usage/entry_certs_and_key）
-//! - `ech`：ECH key 二进制 TLV 解析 + `EchConfigCache` 数据结构 + `ech_cache_key`
+//! - `ech`：ECH key 二进制 TLV 解析 + keyset 生成 + config list 解析/打包 + JSON 字段
+//!   解析 + `ApplyEch`（btls 客户端实装）+ `EchConfigCache` 数据结构 + `ech_cache_key`
 //! - `error`：统一 `TlsError` 枚举
 //! - `ocsp_stapling`：OCSP stapling 集成（`OcspStaplerConfig` + `build_server_config_with_stapling`）
 //! - `unsafe_conn`：`TLS_CLOSE_TIMEOUT` 常量

@@ -35,6 +35,11 @@ serde_json = { workspace = true }
 rcgen = "0.13"
 x509-parser = "0.18"
 
+# ECH keyset 生成（X25519 公钥派生，对应 Go main/commands/all/tls/ech.go）+ base64 解码
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+rand = { workspace = true }
+base64 = "0.22"
+
 [dev-dependencies]
 
 [features]

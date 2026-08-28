@@ -1002,12 +1002,19 @@ pub struct BtlsConn<S> {
 impl<S: Connection + Unpin> BtlsConn<S> {
     /// 创建 btls uTLS 连接（完成握手）。
     ///
-    /// 步骤：构建 connector → 配置指纹 → 创建 SslStream → 异步握手。
+    /// 步骤：构建 connector → 配置指纹 + ECH → 创建 SslStream → 异步握手。
+    ///
+    /// `ech_config_list`（`tlsSettings.echConfigList` 原文）非空时在握手前
+    /// `SSL_set1_ech_config_list`（对应 Go `ApplyECH` client 分支；resolve
+    /// 失败自动降级 invalid config 使握手失败，不静默明文）。
     pub async fn connect(
         stream: S,
         server_name: &str,
         fingerprint: Fingerprint,
+        ech_config_list: Option<&str>,
     ) -> io::Result<Self> {
+        use crate::ech::ApplyEch;
+
         let fp_config = connector_for_fingerprint(&fingerprint)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "fingerprint not supported by btls"))?
             .map_err(|e| io::Error::other(e.to_string()))?;
@@ -1028,10 +1035,16 @@ impl<S: Connection + Unpin> BtlsConn<S> {
             ssl.add_application_settings(fp_config.alps)
                 .map_err(|e| io::Error::other(e.to_string()))?;
         }
+        // ECH（加密 ClientHello）：握手前设置 config list
+        if let Some(list) = ech_config_list {
+            ssl.apply_ech(&[], list)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+        }
         debug!(
             target: "xray_tls::btls",
             fingerprint = ?fingerprint,
             server_name,
+            ech = ech_config_list.is_some(),
             "btls uTLS 握手开始"
         );
 

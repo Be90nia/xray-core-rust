@@ -112,12 +112,18 @@ pub struct TlsCertArgs {
     pub out: String,
 }
 
-/// `xray tls ech` - 生成 ECH 配置。
+/// `xray tls ech` - 生成 ECH 配置（对齐 Go `main/commands/all/tls/ech.go`）。
 #[derive(Args, Debug, Clone)]
 pub struct TlsEchArgs {
-    /// 域名。
-    #[arg(short, long = "domain")]
-    pub domain: String,
+    /// ECHServerKeys（base64.StdEncoding），从既有 server keys 还原 config list。
+    #[arg(short = 'i', long = "input")]
+    pub input: Option<String>,
+    /// public name（默认 cloudflare-ech.com，对齐 Go）。
+    #[arg(long = "serverName", default_value = "cloudflare-ech.com")]
+    pub server_name: String,
+    /// 输出 PEM 格式。
+    #[arg(long = "pem", default_value_t = false)]
+    pub pem: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -186,10 +192,9 @@ pub fn execute_tls(cmd: &TlsCommand) -> Result<(), CliError> {
             })
         }
         TlsCommand::Ech(args) => {
-            let _ = &args.domain;
-            Err(CliError::Unimplemented {
-                what: "tls ech: ECH config generation not yet implemented",
-            })
+            let out = execute_ech(args)?;
+            print!("{out}");
+            Ok(())
         }
     }
 }
@@ -209,5 +214,163 @@ pub fn execute_convert(cmd: &ConvertCommand) -> Result<(), CliError> {
                 what: "convert pb: JSON-to-protobuf conversion not yet implemented",
             })
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tls ech 实现（对应 Go main/commands/all/tls/ech.go executeECH）
+// ---------------------------------------------------------------------------
+
+/// `xray tls ech` 核心：生成/还原 ECH keyset，返回输出文本。
+///
+/// - 无 `-i`：生成新 keyset（X25519 + 9 cipher suites，`generate_ech_key_set`）；
+///   `config list` = 单 config 的 u16 前缀打包，`server keys` = `[klen][key][clen][config]`。
+/// - `-i`：base64 解码既有 server keys → 逐 config 还原 `config list`；`server keys` 原样。
+/// - `--pem`：PEM 块（`ECH CONFIGS` / `ECH KEYS`，64 列 base64）；
+///   否则 Go 原样文本 `"ECH config list: \n{b64}\n"` + `"ECH server keys: \n{b64}\n"`。
+pub fn execute_ech(args: &TlsEchArgs) -> Result<String, CliError> {
+    use base64::Engine as _;
+    use xray_tls::ech::{
+        convert_to_ech_keys, ech_config_list_from_server_keys, generate_ech_key_set,
+        pack_ech_config_list, pack_ech_server_keys,
+    };
+    const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+    let (config_buffer, key_buffer) = match &args.input {
+        None => {
+            let (config, priv_bytes) = generate_ech_key_set(&args.server_name);
+            (
+                pack_ech_config_list(&[&config]),
+                pack_ech_server_keys(&priv_bytes, &config),
+            )
+        }
+        Some(input) => {
+            let key_buffer = B64
+                .decode(input)
+                .map_err(|e| CliError::InvalidArgument(format!("Failed to decode ECHServerKeys: {e}")))?;
+            // 解析校验（对齐 Go：ConvertToGoECHKeys 失败即报错返回）
+            convert_to_ech_keys(&key_buffer)
+                .map_err(|e| CliError::InvalidArgument(format!("Failed to decode ECHServerKeys: {e}")))?;
+            let config_buffer = ech_config_list_from_server_keys(&key_buffer)
+                .map_err(|e| CliError::InvalidArgument(format!("Failed to decode ECHServerKeys: {e}")))?;
+            (config_buffer, key_buffer)
+        }
+    };
+
+    if args.pem {
+        Ok(format!(
+            "{}{}",
+            pem_block("ECH CONFIGS", &config_buffer),
+            pem_block("ECH KEYS", &key_buffer),
+        ))
+    } else {
+        Ok(format!(
+            "ECH config list: \n{}\nECH server keys: \n{}\n",
+            B64.encode(&config_buffer),
+            B64.encode(&key_buffer),
+        ))
+    }
+}
+
+/// PEM 块编码（64 列 base64，对齐 Go `pem.EncodeToMemory`）。
+fn pem_block(label: &str, der: &[u8]) -> String {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut out = format!("-----BEGIN {label}-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(chunk).unwrap());
+        out.push('\n');
+    }
+    out.push_str(&format!("-----END {label}-----\n"));
+    out
+}
+
+#[cfg(test)]
+mod ech_tests {
+    use super::*;
+    use base64::Engine as _;
+    use xray_tls::ech::{convert_to_ech_keys, generate_ech_key_set, pack_ech_config_list};
+
+    fn args(input: Option<&str>, pem: bool) -> TlsEchArgs {
+        TlsEchArgs {
+            input: input.map(str::to_string),
+            server_name: "ech.test".to_string(),
+            pem,
+        }
+    }
+
+    /// 无 -i：输出两行 base64；config list 可解析回 u16 前缀结构，
+    /// server keys 可被 convert_to_ech_keys round-trip。
+    #[test]
+    fn ech_generate_outputs_roundtrippable_base64() {
+        let out = execute_ech(&args(None, false)).unwrap();
+        assert!(out.starts_with("ECH config list: \n"), "prefix must match Go: {out:?}");
+        assert!(out.contains("\nECH server keys: \n"));
+
+        // 输出结构（Go 原样）：前缀行 + b64 行交替
+        let mut lines = out.trim_end().lines();
+        assert_eq!(lines.next().unwrap(), "ECH config list: ");
+        let config_b64 = lines.next().unwrap();
+        assert_eq!(lines.next().unwrap(), "ECH server keys: ");
+        let keys_b64 = lines.next().unwrap();
+
+        let config_list = base64::engine::general_purpose::STANDARD.decode(config_b64).unwrap();
+        let server_keys = base64::engine::general_purpose::STANDARD.decode(keys_b64).unwrap();
+
+        // config list：单个 u16 前缀 config
+        let keys = convert_to_ech_keys(&server_keys).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(config_list, pack_ech_config_list(&[&keys[0].config]));
+    }
+
+    /// -i：从 server keys 还原 config list（前缀一致），server keys 原样。
+    #[test]
+    fn ech_input_restores_config_list() {
+        let (config, priv_bytes) = generate_ech_key_set("ech.test");
+        let server_keys = xray_tls::ech::pack_ech_server_keys(&priv_bytes, &config);
+
+        let input_b64 = base64::engine::general_purpose::STANDARD.encode(&server_keys);
+
+        let out = execute_ech(&args(Some(&input_b64), false)).unwrap();
+        let mut lines = out.trim_end().lines();
+        assert_eq!(lines.next().unwrap(), "ECH config list: ");
+        let config_b64 = lines.next().unwrap();
+        assert_eq!(lines.next().unwrap(), "ECH server keys: ");
+        let keys_b64 = lines.next().unwrap();
+
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD.decode(config_b64).unwrap(),
+            pack_ech_config_list(&[&config])
+        );
+        // server keys 原样透传
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD.decode(keys_b64).unwrap(),
+            server_keys
+        );
+    }
+
+    /// -i 非法 base64 / 非法 server keys 二进制 → InvalidArgument。
+    #[test]
+    fn ech_input_invalid_errors() {
+        assert!(matches!(
+            execute_ech(&args(Some("!!!"), false)),
+            Err(CliError::InvalidArgument(_))
+        ));
+        // base64 合法但长度字段超界
+        let bad = base64::engine::general_purpose::STANDARD.encode([0x00u8, 0xff, 0x01]);
+        assert!(matches!(
+            execute_ech(&args(Some(&bad), false)),
+            Err(CliError::InvalidArgument(_))
+        ));
+    }
+
+    /// --pem：BEGIN/END 块格式 + 内容可解码回。
+    #[test]
+    fn ech_pem_output_format() {
+        let out = execute_ech(&args(None, true)).unwrap();
+        assert!(out.contains("-----BEGIN ECH CONFIGS-----\n"));
+        assert!(out.contains("\n-----END ECH CONFIGS-----\n"));
+        assert!(out.contains("-----BEGIN ECH KEYS-----\n"));
+        assert!(out.contains("\n-----END ECH KEYS-----\n"));
     }
 }

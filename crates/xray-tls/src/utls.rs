@@ -440,6 +440,7 @@ pub async fn u_client<S>(
     server_name: &str,
     config: Arc<ClientConfig>,
     fingerprint: Fingerprint,
+    ech_config_list: Option<&str>,
 ) -> io::Result<UConn<S>>
 where
     S: Connection + Unpin,
@@ -449,7 +450,7 @@ where
         match result {
             Ok(_) => {
                 debug!(target: "xray_tls::utls", ?fingerprint, server_name, "u_client: 尝试 btls 指纹伪装");
-                match crate::btls_client::BtlsConn::connect(stream, server_name, fingerprint).await {
+                match crate::btls_client::BtlsConn::connect(stream, server_name, fingerprint, ech_config_list).await {
                     Ok(btls_conn) => {
                         return Ok(UConn { inner: UConnInner::Btls(btls_conn), fingerprint });
                     }
@@ -466,7 +467,14 @@ where
         }
     }
 
-    // rustls fallback
+    // rustls fallback：无 ECH 能力（rustls 无该 feature），配置了 ECH 时 warn。
+    if let Some(list) = ech_config_list {
+        tracing::warn!(
+            target: "xray_tls::utls",
+            len = list.len(),
+            "ECH config list ignored on rustls fallback (btls fingerprint unavailable); connection proceeds without ECH"
+        );
+    }
     debug!(target: "xray_tls::utls", ?fingerprint, server_name, "u_client: rustls fallback");
     let inner = client(stream, server_name, config).await?;
     Ok(UConn { inner: UConnInner::Rustls(inner), fingerprint })
@@ -572,7 +580,7 @@ mod tests {
 
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         // Random 指纹不在 btls 支持列表，走 rustls fallback
-        let mut u = u_client(TcpConnection::new(tcp), "localhost", config, Fingerprint::Random)
+        let mut u = u_client(TcpConnection::new(tcp), "localhost", config, Fingerprint::Random, None)
             .await
             .expect("fallback ok");
         assert_eq!(u.fingerprint, Fingerprint::Random);
@@ -627,6 +635,7 @@ mod tests {
             TcpConnection::new(tcp),
             "cloudflare.com",
             Fingerprint::Chrome,
+            None,
         )
         .await
         .expect("btls Chrome 133 握手成功");
@@ -651,10 +660,12 @@ mod tests {
         let (addr, _cert_der) = spawn_test_server(b"btls-self-signed\n").await;
 
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+
         let result = crate::btls_client::BtlsConn::connect(
             TcpConnection::new(tcp),
             "localhost",
             Fingerprint::Chrome,
+            None,
         )
         .await;
 
@@ -720,6 +731,7 @@ mod tests {
                     TcpConnection::new(tcp),
                     server.trim_end_matches(":443"),
                     *fp,
+                    None,
                 )
                 .await
                 {

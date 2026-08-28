@@ -40,6 +40,10 @@ pub enum TlsError {
     #[error("invalid ECH DNS server format: {0}")]
     InvalidEchDnsServerFormat(String),
 
+    /// ECH 配置应用到 btls (BoringSSL) 失败（key 长度非法、TLV 结构错等）。
+    #[error("failed to apply ECH config: {0}")]
+    EchApply(String),
+
     /// pinned 证书哈希校验：peer 证书未被识别。
     #[error("peer cert is unrecognized (against pinnedPeerCertSha256)")]
     PinnedCertNotFound,

@@ -5877,6 +5877,7 @@ dependencies = [
  "xray-conf",
  "xray-core",
  "xray-proto",
+ "xray-tls",
 ]
 
 [[package]]
@@ -6474,9 +6475,11 @@ dependencies = [
 name = "xray-tls"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "btls",
  "hex",
  "ocsp-stapler",
+ "rand 0.9.4",
  "rcgen 0.13.2",
  "rustls",
  "rustls-pemfile",
@@ -6490,6 +6493,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "webpki-roots 1.0.8",
+ "x25519-dalek",
  "x509-parser",
  "xray-common",
  "xray-proto",
