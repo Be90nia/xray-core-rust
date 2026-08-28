@@ -23,7 +23,8 @@ use smoltcp::socket::tcp;
 use smoltcp::socket::udp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-    HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address,
+    HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv4Packet, Ipv4Repr,
+    Ipv6Address, Ipv6Packet, Ipv6Repr, IpProtocol, UdpPacket, UdpRepr,
 };
 
 /// smoltcp 协议栈 poll 一次处理的最大 RX 包数。
@@ -561,6 +562,163 @@ pub fn to_smoltcp_v6(addr: std::net::Ipv6Addr) -> Ipv6Address {
     Ipv6Address::from_octets(addr.octets())
 }
 
+/// 解析的 UDP 4 元组（IP+UDP 头中提取的 src/dst）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UdpPacketMeta {
+    pub src: IpEndpoint,
+    pub dst: IpEndpoint,
+}
+
+/// 从原始 IP 包解析 UDP 4 元组 + payload。
+///
+/// 对应 Go `stackGVisor.Start` 的 UDP handler：从 IP+UDP 头读取 src/dst，
+/// 把 raw UDP payload 交给 dispatcher（不是 smoltcp UDP socket）。
+///
+/// # 为什么不用 smoltcp UDP socket 接收
+///
+/// smoltcp 0.12 的 `udp::Socket::bind` 禁止 port 0（`BindError::Unaddressable`，
+/// `socket/udp.rs:222`），且 `accepts` 严格匹配 `endpoint.port == dst_port`
+///（`iface/interface/udp.rs:481`）——无法"接收任意端口的 UDP"。TUN 的语义是
+/// 截获所有进站 UDP，必须在 IP 层解析。
+///
+/// TCP 也存在同样限制（`socket/tcp.rs:863`），但 TCP 切片后续处理（需 SO_ORIGINAL_DST
+/// 等价方案或 gVisor 风格的 stack 改造）。当前切片仅修 UDP。
+///
+/// # 返回
+///
+/// - `Some((meta, payload))`：UDP 包解析成功
+/// - `None`：非 UDP 包 / 包太短 / 校验和错
+#[must_use]
+pub fn parse_udp_packet(pkt: &[u8]) -> Option<(UdpPacketMeta, &[u8])> {
+    if pkt.is_empty() {
+        return None;
+    }
+    let version = pkt[0] >> 4;
+    match version {
+        4 => {
+            let packet = Ipv4Packet::new_checked(pkt).ok()?;
+            let repr = Ipv4Repr::parse(&packet, &smoltcp::phy::ChecksumCapabilities::ignored()).ok()?;
+            if repr.next_header != IpProtocol::Udp {
+                return None;
+            }
+            let payload_start = packet.header_len() as usize;
+            let payload_end = payload_start + repr.payload_len;
+            if payload_end > pkt.len() {
+                return None;
+            }
+            let udp_pkt = UdpPacket::new_checked(&pkt[payload_start..payload_end]).ok()?;
+            let udp_repr = UdpRepr::parse(
+                &udp_pkt,
+                &IpAddress::Ipv4(repr.src_addr),
+                &IpAddress::Ipv4(repr.dst_addr),
+                &smoltcp::phy::ChecksumCapabilities::ignored(),
+            )
+            .ok()?;
+            let meta = UdpPacketMeta {
+                src: IpEndpoint::new(IpAddress::Ipv4(repr.src_addr), udp_repr.src_port),
+                dst: IpEndpoint::new(IpAddress::Ipv4(repr.dst_addr), udp_repr.dst_port),
+            };
+            Some((meta, udp_pkt.payload()))
+        }
+        6 => {
+            let packet = Ipv6Packet::new_checked(pkt).ok()?;
+            let repr = Ipv6Repr::parse(&packet).ok()?;
+            if repr.next_header != IpProtocol::Udp {
+                return None;
+            }
+            let payload_start = packet.header_len() as usize;
+            let payload_end = payload_start + repr.payload_len;
+            if payload_end > pkt.len() {
+                return None;
+            }
+            let udp_pkt = UdpPacket::new_checked(&pkt[payload_start..payload_end]).ok()?;
+            let udp_repr = UdpRepr::parse(
+                &udp_pkt,
+                &IpAddress::Ipv6(repr.src_addr),
+                &IpAddress::Ipv6(repr.dst_addr),
+                &smoltcp::phy::ChecksumCapabilities::ignored(),
+            )
+            .ok()?;
+            let meta = UdpPacketMeta {
+                src: IpEndpoint::new(IpAddress::Ipv6(repr.src_addr), udp_repr.src_port),
+                dst: IpEndpoint::new(IpAddress::Ipv6(repr.dst_addr), udp_repr.dst_port),
+            };
+            Some((meta, udp_pkt.payload()))
+        }
+        _ => None,
+    }
+}
+
+
+/// 构造 UDP 响应 IP 包（IPv4/IPv6，src/dst 已交换）。
+///
+/// 对应 Go `stackGVisor.writeRawUDPPacket`：dispatcher 处理完一包后，把响应
+/// payload 装回 IP+UDP 头，src = 原 dst、dst = 原 src，写回 TUN。
+///
+/// # 参数
+///
+/// - `src_ip` / `dst_ip`：必须同族（IPv4 或 IPv6），调用方保证
+/// - `src_port` / `dst_port`：UDP 端口
+/// - `payload`：UDP payload
+#[must_use]
+pub fn build_udp_response(
+    src_ip: IpAddress,
+    src_port: u16,
+    dst_ip: IpAddress,
+    dst_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    match (src_ip, dst_ip) {
+        (IpAddress::Ipv4(s4), IpAddress::Ipv4(d4)) => {
+            let udp_repr = UdpRepr { src_port, dst_port };
+            let ip_repr = Ipv4Repr {
+                src_addr: s4,
+                dst_addr: d4,
+                next_header: IpProtocol::Udp,
+                payload_len: udp_repr.header_len() + payload.len(),
+                hop_limit: 64,
+            };
+            let mut buf = vec![0u8; ip_repr.buffer_len() + udp_repr.header_len() + payload.len()];
+            let mut ip_pkt = Ipv4Packet::new_unchecked(&mut buf);
+            ip_repr.emit(&mut ip_pkt, &smoltcp::phy::ChecksumCapabilities::ignored());
+            let mut udp_pkt = UdpPacket::new_unchecked(&mut buf[ip_repr.buffer_len()..]);
+            udp_repr.emit(
+                &mut udp_pkt,
+                &IpAddress::Ipv4(s4),
+                &IpAddress::Ipv4(d4),
+                payload.len(),
+                |buf| buf.copy_from_slice(payload),
+                &smoltcp::phy::ChecksumCapabilities::ignored(),
+            );
+            buf
+        }
+        (IpAddress::Ipv6(s6), IpAddress::Ipv6(d6)) => {
+            let udp_repr = UdpRepr { src_port, dst_port };
+            let ip_repr = Ipv6Repr {
+                src_addr: s6,
+                dst_addr: d6,
+                next_header: IpProtocol::Udp,
+                payload_len: udp_repr.header_len() + payload.len(),
+                hop_limit: 64,
+            };
+            let mut buf = vec![0u8; ip_repr.buffer_len() + udp_repr.header_len() + payload.len()];
+            let mut ip_pkt = Ipv6Packet::new_unchecked(&mut buf);
+            ip_repr.emit(&mut ip_pkt);
+            let mut udp_pkt = UdpPacket::new_unchecked(&mut buf[ip_repr.buffer_len()..]);
+            udp_repr.emit(
+                &mut udp_pkt,
+                &IpAddress::Ipv6(s6),
+                &IpAddress::Ipv6(d6),
+                payload.len(),
+                |buf| buf.copy_from_slice(payload),
+                &smoltcp::phy::ChecksumCapabilities::ignored(),
+            );
+            buf
+        }
+        _ => panic!("build_udp_response: src/dst IP family mismatch"),
+    }
+}
+
 /// ICMP 校验和计算（RFC 792，与 IP 校验和算法相同）。
 fn icmp_checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
@@ -726,4 +884,93 @@ mod tests {
         assert_eq!(reply[20], 0, "ICMP type not Echo Reply (0)");
     }
 
+    // ===== parse_udp_packet / build_udp_response（bd 9wc） =====
+
+    fn make_ipv4_udp_packet(src_ip: [u8; 4], src_port: u16, dst_ip: [u8; 4], dst_port: u16, payload: &[u8]) -> Vec<u8> {
+        // IPv4 header (20) + UDP header (8) + payload
+        let total = 20 + 8 + payload.len();
+        let mut pkt = vec![0u8; total];
+        pkt[0] = 0x45; // version=4, IHL=5
+        pkt[1] = 0;
+        pkt[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        pkt[4..6].copy_from_slice(&0u16.to_be_bytes()); // ident
+        pkt[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // flags=DF, frag_off=0
+        pkt[8] = 64; // TTL
+        pkt[9] = 17; // protocol = UDP
+        pkt[10..12].copy_from_slice(&0u16.to_be_bytes()); // checksum (ignored by parser)
+        pkt[12..16].copy_from_slice(&src_ip);
+        pkt[16..20].copy_from_slice(&dst_ip);
+        // UDP header
+        pkt[20..22].copy_from_slice(&src_port.to_be_bytes());
+        pkt[22..24].copy_from_slice(&dst_port.to_be_bytes());
+        pkt[24..26].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        pkt[26..28].copy_from_slice(&0u16.to_be_bytes()); // UDP checksum (0 = disabled)
+        // payload
+        pkt[28..].copy_from_slice(payload);
+        pkt
+    }
+
+    #[test]
+    fn parse_udp_packet_ipv4_extracts_4tuple_and_payload() {
+        let pkt = make_ipv4_udp_packet([10, 0, 0, 2], 12345, [8, 8, 8, 8], 53, b"hello");
+        let (meta, payload) = parse_udp_packet(&pkt).expect("parse udp ipv4");
+        assert_eq!(meta.src.addr, IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 2)));
+        assert_eq!(meta.src.port, 12345);
+        assert_eq!(meta.dst.addr, IpAddress::Ipv4(Ipv4Address::new(8, 8, 8, 8)));
+        assert_eq!(meta.dst.port, 53);
+        assert_eq!(payload, b"hello");
+    }
+
+    #[test]
+    fn parse_udp_packet_returns_none_for_tcp() {
+        // 同样的 IPv4 header 但 protocol=TCP (6)
+        let mut pkt = make_ipv4_udp_packet([10, 0, 0, 2], 12345, [8, 8, 8, 8], 53, b"hello");
+        pkt[9] = 6; // TCP
+        assert!(parse_udp_packet(&pkt).is_none());
+    }
+
+    #[test]
+    fn parse_udp_packet_returns_none_for_truncated() {
+        // 截断：total length 报 50 但 buffer 只 20
+        let mut pkt = make_ipv4_udp_packet([10, 0, 0, 2], 12345, [8, 8, 8, 8], 53, b"hello");
+        pkt[2..4].copy_from_slice(&50u16.to_be_bytes());
+        assert!(parse_udp_packet(&pkt).is_none());
+    }
+
+    #[test]
+    fn parse_udp_packet_returns_none_for_empty() {
+        assert!(parse_udp_packet(&[]).is_none());
+    }
+
+    #[test]
+    fn build_udp_response_ipv4_roundtrip() {
+        // 构造包 → 解析 → 用 build_udp_response 构造响应 → 再解析响应验证 src/dst 交换
+        let req = make_ipv4_udp_packet([10, 0, 0, 2], 12345, [8, 8, 8, 8], 53, b"dns-query");
+        let (req_meta, req_payload) = parse_udp_packet(&req).expect("parse req");
+        assert_eq!(req_payload, b"dns-query");
+
+        let reply = build_udp_response(req_meta.dst.addr, req_meta.dst.port, req_meta.src.addr, req_meta.src.port, req_payload);
+        let (resp_meta, resp_payload) = parse_udp_packet(&reply).expect("parse resp");
+        // 响应的 src 应是请求的 dst；响应的 dst 应是请求的 src
+        assert_eq!(resp_meta.src.addr, req_meta.dst.addr);
+        assert_eq!(resp_meta.src.port, req_meta.dst.port);
+        assert_eq!(resp_meta.dst.addr, req_meta.src.addr);
+        assert_eq!(resp_meta.dst.port, req_meta.src.port);
+        assert_eq!(resp_payload, b"dns-query");
+    }
+
+    #[test]
+    fn build_udp_response_ipv6() {
+        // 构造 IPv6 + UDP 包（简化版：只用 Ipv6Repr emit 路径）
+        let s6 = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+        let d6 = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let reply = build_udp_response(IpAddress::Ipv6(s6), 53, IpAddress::Ipv6(d6), 33333, b"v6-payload");
+        assert!(reply[0] >> 4 == 6, "not IPv6");
+        let (meta, payload) = parse_udp_packet(&reply).expect("parse v6 reply");
+        assert_eq!(meta.src.addr, IpAddress::Ipv6(s6));
+        assert_eq!(meta.dst.addr, IpAddress::Ipv6(d6));
+        assert_eq!(meta.src.port, 53);
+        assert_eq!(meta.dst.port, 33333);
+        assert_eq!(payload, b"v6-payload");
+    }
 }

@@ -15,8 +15,8 @@
 //!
 //! ## UDP 数据报流
 //!
-//! 创建 Bind socket → poll 后 recv 数据报 → 通知上层 dispatcher。
-//! 对应 Go `udp.NewForwarder(handler.HandlePacket)`。
+//! 不走 smoltcp UDP socket（见下），由 driver loop 直接解 IP+UDP 头后 dispatch。
+//! 对应 Go `proxy/tun/stack_gvisor.go:103` 的 UDP handler。
 //!
 //! ## TCP dispatch
 //!
@@ -24,37 +24,54 @@
 //! `DispatchHandler::dispatch(dest, link)`。中继模式与
 //! `xray-proxy-wireguard/src/dispatcher.rs::TcpRelay` 一致。
 //!
-//! ## 当前限制
+//! ## UDP dispatch（bd 9wc，当前切片）
 //!
-//! - destination 取自 accepted socket 的 local endpoint（TUN 侧地址），
-//!   非原始目标地址（需 IP 头解析或 SO_ORIGINAL_DST，后续切片）。
-//! - UDP dispatch 留待后续切片。
+//! smoltcp 0.12 的 `udp::Socket::bind` 禁止 port 0 且 `accepts` 严格匹配
+//! `endpoint.port == dst_port`（`smoltcp/socket/udp.rs:222`、`iface/interface/udp.rs:481`），
+//! 无法"接收任意端口的 UDP"。TUN 必须截获所有 UDP 流量，绕过 smoltcp UDP socket：
+//!
+//! 1. 从 TUN recv IP 包后，先用 [`parse_udp_packet`] 解 IP+UDP 头，提取 (src, dst)。
+//!    是 UDP 包 → 走本路径；否则继续交给 smoltcp（TCP/ICMP）。
+//! 2. 按 `event.src`（IP+UDP 头的源端）作 full-cone NAT key，懒建
+//!    [`UdpDispatchSession`]，首包确定 routing。
+//! 3. session.send_packet(&dest, payload) 把数据转发到 dispatcher
+//!    （`dest = event.dst`，即 IP+UDP 头中的真实目标地址）。
+//! 4. session reader task 持续 recv 响应，用 [`build_udp_response`] 装回 IP+UDP
+//!    包（src/dst 交换），写回 TUN。
+//!
+//! # ponytail: 一个 remote src 一个 session
+//!
+//! 对应 Go `proxy/tun/udp_fullcone.go` 的 `udpConns map[net.Destination]*udpConn`：
+//! 按 source 分桶天然 cone NAT。session 生命周期由 inbound handler 持有
+//! （Arc<Mutex<HashMap>>），后续切片可加 idle 淘汰（Go `CancelAfterInactivity(1min)`）。
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex as ParkMutex;
-use tokio::sync::Mutex as AsyncMutex;
-use tokio::task::JoinHandle;
-use tokio::time::interval;
-use xray_features::inbound::{InboundError, InboundHandler};
 use smoltcp::iface::SocketHandle;
 use smoltcp::wire::IpEndpoint;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use xray_app_dispatcher::DispatchHandler;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::task::JoinHandle;
+use tokio::time::interval;
+use xray_app_dispatcher::{DispatchHandler, UdpDispatchSession};
 use xray_buf::io::{new_reader, new_writer};
 use xray_common::net::address::Address;
 use xray_common::net::destination::Destination;
 use xray_common::net::network::Network;
 use xray_common::net::port::Port;
+use xray_features::inbound::{InboundError, InboundHandler};
 use xray_transport::link::Link;
 
-use crate::config::StackOptions;
-use crate::config::Tun;
+use crate::config::{StackOptions, Tun};
 use crate::device::TunDevice;
 use crate::error::Result;
-use crate::netstack::TunNetStack;
+use crate::netstack::{
+    build_udp_response, parse_udp_packet, TunNetStack, UdpPacketMeta,
+};
 
 /// TUN 设备接收缓冲。
 const TUN_RECV_BUF_SIZE: usize = 65535;
@@ -208,6 +225,21 @@ impl InboundHandler for TunInboundHandler {
     }
 }
 
+/// per-source UDP session 存储（full-cone NAT，key = IP+UDP 源端点）。
+///
+/// 对应 Go `proxy/tun/udp_fullcone.go:31` 的 `udpConns map[net.Destination]*udpConn`：
+/// 按 source 分桶实现 cone NAT，每个 remote src 一个 dispatch link。
+type UdpSessions = Arc<ParkMutex<HashMap<IpEndpoint, Arc<UdpSessionEntry>>>>;
+
+/// 单个 remote src 的 session 条目：session + reader task handle。
+///
+/// reader 只 spawn 一次；后续包复用 task 即可（session 是 &mut self，
+/// send_packet 仍可并发调用——内部 duplex 是 &mut self + 异步，task 串行）。
+struct UdpSessionEntry {
+    session: AsyncMutex<UdpDispatchSession>,
+    reader_started: AtomicBool,
+}
+
 async fn tun_driver_loop(
     device: Arc<TunDevice>,
     netstack: Arc<AsyncMutex<TunNetStack>>,
@@ -216,8 +248,9 @@ async fn tun_driver_loop(
     let mut timer = interval(POLL_INTERVAL);
     let mut recv_buf = vec![0u8; TUN_RECV_BUF_SIZE];
 
-    // 初始化：创建 TCP Listen socket + UDP Bind socket
-    // 对应 Go stackGVisor.Start() 中 tcp.NewForwarder + udp.NewForwarder
+    // 初始化：仅创建 TCP Listen socket（TCP 后续切片处理 destination 提取）。
+    // UDP 走 IP+UDP 头解析路径，不创建 smoltcp UDP socket。
+    // 对应 Go stackGVisor.Start() 中 tcp.NewForwarder。
     // ponytail: 单端口监听（TUN 入站通常由 iptables/nftables 重定向到 TUN，
     // 实际 dest 地址在 IP 包头中，不依赖 listen 端口）
     // TODO: 多端口监听由上层配置注入
@@ -232,16 +265,8 @@ async fn tun_driver_loop(
         }
         Some(handle)
     };
-    let udp_bind_handle = {
-        let mut stack = netstack.lock().await;
-        let handle = stack.add_udp_socket();
-        if let Err(e) = stack.udp_bind(handle, 0) {
-            tracing::warn!(error = %e, "udp bind failed, inbound UDP disabled");
-        } else {
-            tracing::debug!(?handle, "udp bind socket created");
-        }
-        Some(handle)
-    };
+
+    let udp_sessions: UdpSessions = Arc::new(ParkMutex::new(HashMap::new()));
 
     tracing::debug!("tun driver main loop started");
 
@@ -252,18 +277,32 @@ async fn tun_driver_loop(
                 match result {
                     Ok(n) => {
                         if n == 0 { continue; }
-                        let pkt = recv_buf[..n].to_vec();
+                        let pkt = &recv_buf[..n];
+
+                        // 先尝试按 UDP 解析：能解出 4 元组就 bypass smoltcp，
+                        // 避免 smoltcp 对未 bind 端口发 ICMP port unreachable。
+                        // ponytail: 直接判字节，省一次 smoltcp poll 锁。
+                        if let Some((meta, payload)) = parse_udp_packet(pkt) {
+                            handle_udp_packet(
+                                &udp_sessions,
+                                meta,
+                                payload,
+                                Arc::clone(&dispatch),
+                                Arc::clone(&device),
+                            );
+                            continue;
+                        }
+
                         let mut stack = netstack.lock().await;
-                        stack.ingest_rx(pkt);
+                        stack.ingest_rx(pkt.to_vec());
                         stack.poll(smoltcp::time::Instant::now());
                         // 处理 ICMP echo request 并自动回复
                         stack.process_icmp_echo();
-                        // 检测 TCP/UDP 事件
+                        // 检测 TCP accept 事件
                         handle_socket_events(
                             &mut stack,
                             &netstack,
                             &mut tcp_listen_handle,
-                            udp_bind_handle,
                             &dispatch,
                         );
                         // drain tx 并写回 TUN
@@ -287,12 +326,11 @@ async fn tun_driver_loop(
                     stack.poll(smoltcp::time::Instant::now());
                     // 处理 ICMP echo request 并自动回复
                     stack.process_icmp_echo();
-                    // 检测 TCP/UDP 事件
+                    // 检测 TCP accept 事件
                     handle_socket_events(
                         &mut stack,
                         &netstack,
                         &mut tcp_listen_handle,
-                        udp_bind_handle,
                         &dispatch,
                     );
                     stack.drain_tx()
@@ -305,85 +343,205 @@ async fn tun_driver_loop(
     }
 }
 
-/// poll 后检测 TCP accept / UDP recv 事件。
+/// 单 UDP 数据报 → dispatch（full-cone NAT）。
 ///
-/// 对应 Go `stackGVisor.Start` 中 tcp/udp forwarder 的回调。
-/// TCP accept 后构造 Link 桥接 smoltcp socket → dispatcher。
+/// 对应 Go `udp_fullcone.go:HandlePacket`：按 src 懒建 `udpConn`，首次
+/// 确定 routing，后续包复用同一 session。响应回写由 [`UdpDispatchSession`]
+/// reader task 持续 recv 完成。
+fn handle_udp_packet(
+    sessions: &UdpSessions,
+    meta: UdpPacketMeta,
+    payload: &[u8],
+    dispatch: Arc<dyn DispatchHandler>,
+    device: Arc<TunDevice>,
+) {
+    // 懒建 session：按 src 找；不在则建。
+    let entry = {
+        let mut map = sessions.lock();
+        map.entry(meta.src)
+            .or_insert_with(|| {
+                Arc::new(UdpSessionEntry {
+                    session: AsyncMutex::new(UdpDispatchSession::new(Arc::clone(&dispatch))),
+                    reader_started: AtomicBool::new(false),
+                })
+            })
+            .clone()
+    };
+
+    // 把 dest + payload 通过 session 转发；首包懒建 dispatch link。
+    // 必须 spawn：send_packet 是 async，driver loop 不能 await（会阻塞 TUN recv）。
+    let dest = ip_endpoint_to_udp_destination(&meta.dst);
+    let Some(dest) = dest else {
+        tracing::warn!(src = %meta.src, dst = %meta.dst, "udp: invalid destination, dropping");
+        return;
+    };
+
+    let meta_src = meta.src;
+    let meta_dst = meta.dst;
+    let payload = payload.to_vec();
+    let entry_clone = Arc::clone(&entry);
+    tokio::spawn(async move {
+        let mut s = entry_clone.session.lock().await;
+        if let Err(e) = s.send_packet(&dest, &payload).await {
+            tracing::warn!(error = %e, src = %meta_src, dst = %meta_dst, "udp: session.send_packet failed");
+            return;
+        }
+        drop(s);
+        // 首包懒启 reader task（仅一次）：session 是 &mut self，
+        // 不能跨 await 持锁，所以 reader task 拿 Arc<UdpSessionEntry>。
+        spawn_udp_session_reader_if_first(&entry_clone, Arc::clone(&device), meta_src, meta_dst);
+    });
+}
+
+/// 把 IP 协议族的 smoltcp IpEndpoint 转 xray Destination（UDP）。
+fn ip_endpoint_to_udp_destination(ep: &IpEndpoint) -> Option<Destination> {
+    let address = match ep.addr {
+        smoltcp::wire::IpAddress::Ipv4(v4) => {
+            Address::IPv4(std::net::Ipv4Addr::from(v4.octets()))
+        }
+        smoltcp::wire::IpAddress::Ipv6(v6) => {
+            Address::IPv6(std::net::Ipv6Addr::from(v6.octets()))
+        }
+    };
+    Some(Destination::new(address, Port::new(ep.port), Network::UDP))
+}
+
+/// xray Address → smoltcp IpAddress（域名返回 None；build_udp_response 需要 IP）。
+fn address_to_smoltcp(addr: &Address) -> Option<smoltcp::wire::IpAddress> {
+    match addr {
+        Address::IPv4(v4) => Some(smoltcp::wire::IpAddress::Ipv4(
+            smoltcp::wire::Ipv4Address::from_octets(v4.octets()),
+        )),
+        Address::IPv6(v6) => Some(smoltcp::wire::IpAddress::Ipv6(
+            smoltcp::wire::Ipv6Address::from_octets(v6.octets()),
+        )),
+        Address::Domain(_) => None,
+    }
+}
+
+/// 首包懒启 UDP session reader task（每个 remote src 仅一次）。
+///
+/// reader 持续 `recv_packet()`，把 outbound 响应装回 IP+UDP 包（src/dst 交换），
+/// 写回 TUN。session 关闭后 `recv_packet()` 返回 `Ok(None)` → task 退出。
+///
+/// # ponytail: 不主动清理 sessions map
+///
+/// Go 端用 `CancelAfterInactivity(1min)` 回收空闲 udpConn。本切片先用 Arc 永久持有，
+/// 后续切片加 idle 淘汰（需要把 sessions 从 ParkMutex<HashMap> 升到带 idle 跟踪的
+/// 数据结构）。
+fn spawn_udp_session_reader_if_first(
+    entry: &Arc<UdpSessionEntry>,
+    device: Arc<TunDevice>,
+    original_src: IpEndpoint,
+    original_dst: IpEndpoint,
+) {
+    // compare_exchange 保证仅一次 spawn
+    if entry
+        .reader_started
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+
+    let entry = Arc::clone(entry);
+    tokio::spawn(async move {
+        loop {
+            let pkt = {
+                let mut s = entry.session.lock().await;
+                s.recv_packet().await
+            };
+            match pkt {
+                Ok(Some((resp_src, payload))) => {
+                    // resp_src 是 outbound 视角的来源（= 原 dst），构造 IP+UDP 回包
+                    let resp_ip = address_to_smoltcp(resp_src.address());
+                    let Some(resp_ip) = resp_ip else {
+                        tracing::warn!("udp: response destination is domain, cannot build IP packet");
+                        continue;
+                    };
+                    let reply = build_udp_response(
+                        resp_ip,
+                        resp_src.port().value(),
+                        original_src.addr,
+                        original_src.port,
+                        &payload,
+                    );
+                    if let Err(e) = device.send(&reply).await {
+                        tracing::warn!(error = %e, "udp: write reply to tun failed");
+                        return;
+                    }
+                }
+                Ok(None) => {
+                    tracing::debug!(src = %original_src, dst = %original_dst, "udp: session closed");
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, src = %original_src, dst = %original_dst, "udp: session.recv_packet failed");
+                    return;
+                }
+            }
+        }
+    });
+}
+
 fn handle_socket_events(
     stack: &mut TunNetStack,
     netstack: &Arc<AsyncMutex<TunNetStack>>,
     tcp_listen_handle: &mut Option<SocketHandle>,
-    udp_bind_handle: Option<SocketHandle>,
     dispatch: &Arc<dyn DispatchHandler>,
 ) {
     // TCP accept 检测
-    if let Some(handle) = *tcp_listen_handle {
-        if let Some(event) = stack.check_tcp_accept(handle) {
-            // accept 后该 socket 进入 Established，作为连接 socket；
-            // 新建一个 listen socket 接受下一个连接。
-            let new_listen = stack.add_tcp_socket();
-            if let Err(e) = stack.tcp_listen(new_listen, 0) {
-                tracing::warn!(error = %e, "tcp re-listen failed");
-            }
-            *tcp_listen_handle = Some(new_listen);
+    let Some(handle) = *tcp_listen_handle else { return };
+    let Some(event) = stack.check_tcp_accept(handle) else { return };
 
-            // 从 local endpoint 构建 destination
-            let dest = match ip_endpoint_to_destination(&event.local) {
-                Some(d) => d,
-                None => {
-                    tracing::warn!(
-                        remote = %event.remote,
-                        "tcp accept: no local endpoint, dropping connection"
-                    );
-                    stack.remove_socket(event.handle);
-                    return;
-                }
-            };
-
-            // 创建两路 duplex 桥接 smoltcp socket ↔ Link
-            // ponytail: 双 duplex（up/down 独立），与 wireguard TcpRelay 一致
-            let (client_to_relay, relay_from_client) = tokio::io::duplex(DUPLEX_BUF);
-            let (relay_to_client, client_from_relay) = tokio::io::duplex(DUPLEX_BUF);
-            let link = Link::new(new_reader(client_from_relay), new_writer(client_to_relay));
-
-            tracing::debug!(
-                handle = ?event.handle,
-                remote = %event.remote,
-                dest = ?dest,
-                "tcp connection accepted → dispatch"
-            );
-
-            // spawn 中继 task（smoltcp socket ↔ duplex）
-            let relay = TunTcpRelay {
-                from_client: relay_from_client,
-                to_client: relay_to_client,
-                netstack: Arc::clone(netstack),
-                handle: event.handle,
-            };
-            tokio::spawn(relay.run());
-
-            // spawn dispatch（link → outbound）
-            let dispatch = Arc::clone(dispatch);
-            tokio::spawn(async move {
-                dispatch.dispatch(&dest, link).await;
-            });
-        }
+    // accept 后该 socket 进入 Established，作为连接 socket；
+    // 新建一个 listen socket 接受下一个连接。
+    let new_listen = stack.add_tcp_socket();
+    if let Err(e) = stack.tcp_listen(new_listen, 0) {
+        tracing::warn!(error = %e, "tcp re-listen failed");
     }
+    *tcp_listen_handle = Some(new_listen);
 
-    // UDP recv 检测（dispatch 留待后续切片）
-    if let Some(handle) = udp_bind_handle {
-        loop {
-            let event = stack.udp_recv(handle);
-            let Some(event) = event else { break; };
-            tracing::trace!(
-                handle = ?event.handle,
+    // 从 local endpoint 构建 destination
+    let dest = match ip_endpoint_to_destination(&event.local) {
+        Some(d) => d,
+        None => {
+            tracing::warn!(
                 remote = %event.remote,
-                local_port = event.local_port,
-                len = event.payload.len(),
-                "udp datagram received"
+                "tcp accept: no local endpoint, dropping connection"
             );
+            stack.remove_socket(event.handle);
+            return;
         }
-    }
+    };
+
+    // 创建两路 duplex 桥接 smoltcp socket ↔ Link
+    // ponytail: 双 duplex（up/down 独立），与 wireguard TcpRelay 一致
+    let (client_to_relay, relay_from_client) = tokio::io::duplex(DUPLEX_BUF);
+    let (relay_to_client, client_from_relay) = tokio::io::duplex(DUPLEX_BUF);
+    let link = Link::new(new_reader(client_from_relay), new_writer(client_to_relay));
+
+    tracing::debug!(
+        handle = ?event.handle,
+        remote = %event.remote,
+        dest = ?dest,
+        "tcp connection accepted → dispatch"
+    );
+
+    // spawn 中继 task（smoltcp socket ↔ duplex）
+    let relay = TunTcpRelay {
+        from_client: relay_from_client,
+        to_client: relay_to_client,
+        netstack: Arc::clone(netstack),
+        handle: event.handle,
+    };
+    tokio::spawn(relay.run());
+
+    // spawn dispatch（link → outbound）
+    let dispatch = Arc::clone(dispatch);
+    tokio::spawn(async move {
+        dispatch.dispatch(&dest, link).await;
+    });
 }
 
 /// smoltcp IpEndpoint → Destination（TCP）。
@@ -600,6 +758,166 @@ mod tests {
         assert!(ip_endpoint_to_destination(&None).is_none());
     }
 
+    #[test]
+    fn ip_endpoint_to_udp_destination_ipv4() {
+        // UDP destination 从 IP+UDP 头的 dst 端提取（不是 socket local endpoint）
+        let ep = smoltcp::wire::IpEndpoint {
+            addr: smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(8, 8, 8, 8)),
+            port: 53,
+        };
+        let dest = ip_endpoint_to_udp_destination(&ep).expect("some dest");
+        assert_eq!(
+            dest.address(),
+            &Address::IPv4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+            "udp dest addr must come from IP+UDP header dst, not bound socket"
+        );
+        assert_eq!(dest.port().value(), 53);
+        assert_eq!(dest.network(), Network::UDP);
+    }
+
+    #[test]
+    fn ip_endpoint_to_udp_destination_ipv6() {
+        let ep = smoltcp::wire::IpEndpoint {
+            addr: smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            port: 443,
+        };
+        let dest = ip_endpoint_to_udp_destination(&ep).expect("some dest");
+        assert_eq!(dest.network(), Network::UDP);
+        assert_eq!(dest.port().value(), 443);
+    }
+
+    /// UDP 端到端 dispatch 路径（bd 9wc acceptance）：
+    /// 构造 fake IPv4+UDP 包（src=10.0.0.2:12345, dst=8.8.8.8:53）→ 解析 → dispatch → 验证
+    /// dispatcher 收到的 destination 与 IP 头的 dst 一致。
+    #[tokio::test]
+    async fn udp_dispatch_uses_real_destination_from_ip_header() {
+        use std::sync::Mutex;
+
+        // Capture handler：记录 dispatch 收到的 destination
+        #[derive(Debug)]
+        struct CaptureHandler(Arc<Mutex<Option<Destination>>>);
+        impl DispatchHandler for CaptureHandler {
+            fn tag(&self) -> &str { "capture" }
+            fn dispatch(
+                &self,
+                dest: &Destination,
+                _link: Link,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+                *self.0.lock().expect("lock") = Some(dest.clone());
+                Box::pin(async {})
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(None::<Destination>));
+        let handler: Arc<dyn DispatchHandler> = Arc::new(CaptureHandler(Arc::clone(&captured)));
+
+        // 构造 fake UDP 包：src=10.0.0.2:12345, dst=8.8.8.8:53, payload="dns-query"
+        let req = make_test_ipv4_udp_packet([10, 0, 0, 2], 12345, [8, 8, 8, 8], 53, b"dns-query");
+        let (meta, payload) = parse_udp_packet(&req).expect("parse fake udp packet");
+        assert_eq!(meta.dst.addr, smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(8, 8, 8, 8)));
+        assert_eq!(meta.dst.port, 53);
+        assert_eq!(payload, b"dns-query");
+
+        // 把真实 destination (meta.dst) 转 xray Destination，喂给 UdpDispatchSession
+        let dest = ip_endpoint_to_udp_destination(&meta.dst).expect("udp dest");
+        let mut session = UdpDispatchSession::new(handler);
+        session
+            .send_packet(&dest, payload)
+            .await
+            .expect("send_packet should succeed");
+
+        // 等 dispatch 跑完（spawn 后给点时间）
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let captured_dest = captured
+            .lock()
+            .expect("dispatcher should have been called")
+            .clone()
+            .expect("captured destination");
+        assert_eq!(
+            captured_dest.address(),
+            &Address::IPv4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+            "dispatcher must see real destination 8.8.8.8 (from IP header), not local endpoint"
+        );
+        assert_eq!(captured_dest.port().value(), 53);
+        assert_eq!(captured_dest.network(), Network::UDP);
+    }
+
+    /// 不同 source src 各自分桶（full-cone NAT 语义）：两个 src 各发一包 → 两路 dispatch。
+    #[tokio::test]
+    async fn udp_dispatch_full_cone_per_source() {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+
+        #[derive(Debug)]
+        struct CaptureHandler(Arc<Mutex<Vec<Destination>>>);
+        impl DispatchHandler for CaptureHandler {
+            fn tag(&self) -> &str { "capture" }
+            fn dispatch(
+                &self,
+                dest: &Destination,
+                _link: Link,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+                self.0.lock().expect("lock").push(dest.clone());
+                Box::pin(async {})
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::<Destination>::new()));
+        let handler: Arc<dyn DispatchHandler> = Arc::new(CaptureHandler(Arc::clone(&captured)));
+
+        let mut session1 = UdpDispatchSession::new(Arc::clone(&handler));
+        let mut session2 = UdpDispatchSession::new(Arc::clone(&handler));
+
+        let d1 = Destination::new(
+            Address::IPv4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+            Port::new(53),
+            Network::UDP,
+        );
+        let d2 = Destination::new(
+            Address::IPv4(std::net::Ipv4Addr::new(1, 1, 1, 1)),
+            Port::new(53),
+            Network::UDP,
+        );
+        session1.send_packet(&d1, b"from-session1").await.expect("s1");
+        session2.send_packet(&d2, b"from-session2").await.expect("s2");
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let seen: HashSet<_> = captured
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|d| (format!("{}", d.address()), d.port().value()))
+            .collect();
+        // 两路 dest 都应被 dispatch 看到（full-cone per-session）
+        assert!(seen.contains(&("8.8.8.8".to_string(), 53)));
+        assert!(seen.contains(&("1.1.1.1".to_string(), 53)));
+    }
+
+    /// 构造测试用 IPv4+UDP 包（与 netstack.rs 中 make_ipv4_udp_packet 等价，避免跨 crate 共享）。
+    fn make_test_ipv4_udp_packet(
+        src_ip: [u8; 4],
+        src_port: u16,
+        dst_ip: [u8; 4],
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let total = 20 + 8 + payload.len();
+        let mut pkt = vec![0u8; total];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 17; // UDP
+        pkt[12..16].copy_from_slice(&src_ip);
+        pkt[16..20].copy_from_slice(&dst_ip);
+        pkt[20..22].copy_from_slice(&src_port.to_be_bytes());
+        pkt[22..24].copy_from_slice(&dst_port.to_be_bytes());
+        pkt[24..26].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        pkt[28..].copy_from_slice(payload);
+        pkt
+    }
+
     /// 端到端 dispatch 路径：构造 netstack + listen socket，模拟 TCP accept
     /// （手动让 socket 进入 Established），验证 handle_socket_events 触发 dispatch。
     #[tokio::test]
@@ -633,7 +951,6 @@ mod tests {
                 &mut stack,
                 &netstack,
                 &mut tcp_listen,
-                None,
                 &dispatch,
             );
         }
