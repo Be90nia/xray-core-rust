@@ -2374,88 +2374,15 @@ impl Tun for TunPlaceholder {
 
 /// 从 inbound entry.data（JSON）解析 TUN inbound 配置 → StackOptions。
 ///
-/// JSON 格式：`{"idleTimeout":"30s"}`（idleTimeout 可选，默认 30s）。
-/// 设备参数（name/address/mtu）当前硬编码在 TunInboundHandler::start，
-/// 后续切片从 JSON 读取。
+/// JSON 字段与默认值对齐 Go `infra/conf/tun.go::TunConfig.Build`
+/// （name/mtu/gateway/dns/userLevel/autoSystemRoutingTable/autoOutboundsInterface
+/// + Rust 扩展 idleTimeout）；解析实现在 `xray_proxy_tun::config`（全平台可测）。
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
 fn parse_tun_inbound_config(data: &[u8]) -> std::io::Result<StackOptions> {
-    let mut opts = StackOptions::default();
+    let mut opts = StackOptions::parse_json(data)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")))?;
     opts.tun = Some(Box::new(TunPlaceholder));
-    if data.is_empty() {
-        return Ok(opts);
-    }
-    let v: serde_json::Value = serde_json::from_slice(data)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("tun config: {e}")))?;
-    // idleTimeout：数字（秒）或字符串（如 "30s"/"5m"）
-    if let Some(val) = v.get("idleTimeout") {
-        opts.idle_timeout = parse_duration_value(val)?;
-    }
     Ok(opts)
-}
-
-/// 解析 duration 值：数字=秒，字符串="30s"/"5m"/"1h"。
-fn parse_duration_value(val: &serde_json::Value) -> std::io::Result<std::time::Duration> {
-    match val {
-        serde_json::Value::Number(n) => {
-            let secs = n.as_u64().ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "idleTimeout: not a positive integer")
-            })?;
-            Ok(std::time::Duration::from_secs(secs))
-        }
-        serde_json::Value::String(s) => parse_duration_suffix(s),
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "idleTimeout: expected number or string",
-        )),
-    }
-}
-
-/// 解析带后缀的 duration 字符串（"30s"/"5m"/"1h"/"2h30m"）。
-fn parse_duration_suffix(s: &str) -> std::io::Result<std::time::Duration> {
-    let mut total_secs: u64 = 0;
-    let mut num_buf = String::new();
-    for ch in s.chars() {
-        match ch {
-            '0'..='9' => num_buf.push(ch),
-            's' => {
-                let n: u64 = num_buf.parse().map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("idleTimeout: bad number in '{s}'"))
-                })?;
-                total_secs += n;
-                num_buf.clear();
-            }
-
-            'm' => {
-                let n: u64 = num_buf.parse().map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("idleTimeout: bad number in '{s}'"))
-                })?;
-                total_secs += n * 60;
-                num_buf.clear();
-            }
-            'h' => {
-                let n: u64 = num_buf.parse().map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("idleTimeout: bad number in '{s}'"))
-
-                })?;
-                total_secs += n * 3600;
-                num_buf.clear();
-            }
-            _ => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("idleTimeout: unknown suffix '{ch}' in '{s}'"),
-                ));
-            }
-        }
-    }
-    // 无后缀的尾部数字视为秒
-    if !num_buf.is_empty() {
-        let n: u64 = num_buf.parse().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("idleTimeout: trailing number in '{s}'"))
-        })?;
-        total_secs += n;
-    }
-    Ok(std::time::Duration::from_secs(total_secs))
 }
 
 /// 从 inbound entry.data（JSON）解析 blackhole inbound 响应配置。

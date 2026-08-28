@@ -162,16 +162,17 @@ impl InboundHandler for TunInboundHandler {
             return Err(InboundError::AlreadyStarted(self.tag.clone()));
         }
 
-        // 取出 tun 配置并创建设备
-        let _tun_cfg = self
-            .options
+        // 取出 tun 配置（校验存在；设备参数从 options 读——对应 Go NewTun(options)）
+        let cfg = &self.options;
+        let _ = cfg
             .tun
             .as_ref()
             .ok_or_else(|| InboundError::ListenError("tun device config missing".into()))?;
 
-        // 创建 TUN 设备
+        // 创建 TUN 设备（JSON name/mtu/gateway；缺省由 parse_json 归一化）
+        let (v4_addr, v4_prefix) = cfg.device_ipv4();
         let device = Arc::new(
-            TunDevice::create("xray0", "10.0.0.1", 24, 1500)
+            TunDevice::create(&cfg.name, &v4_addr.to_string(), v4_prefix, cfg.mtu as u16)
                 .map_err(|e| InboundError::ListenError(format!("tun device create: {e}")))?,
         );
 
@@ -180,16 +181,11 @@ impl InboundHandler for TunInboundHandler {
             .start()
             .map_err(|e| InboundError::ListenError(format!("tun device start: {e}")))?;
 
-        // 用实际地址重建 netstack
-        let local_v4 = smoltcp::wire::Ipv4Address::new(10, 0, 0, 1);
-        let local = smoltcp::wire::IpCidr::new(
-            smoltcp::wire::IpAddress::Ipv4(local_v4),
-            24,
-        );
-        let mtu = 1500usize;
+        // 用配置地址重建 netstack（gateway 全部 CIDR；空则设备默认 v4）
         {
+            let locals = cfg.local_cidrs();
             let mut stack = self.netstack.lock().await;
-            *stack = TunNetStack::new(&[local], mtu);
+            *stack = TunNetStack::new(&locals, cfg.mtu as usize);
         }
 
         *self.device.lock() = Some(Arc::clone(&device));

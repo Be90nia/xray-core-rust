@@ -16,5 +16,6 @@ parking_lot = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tun-rs = { workspace = true }
+serde_json = { workspace = true }
 smoltcp = { workspace = true }
 async-trait = { workspace = true }
