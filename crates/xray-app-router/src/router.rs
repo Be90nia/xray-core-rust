@@ -22,7 +22,7 @@ use parking_lot::RwLock;
 use xray_geodata::loader::GeoDataLoader;
 use xray_proto::xray::app::router::{BalancingRule, Config, RoutingRule};
 
-use crate::balancing::{Balancer, BalancingStrategy, OutboundHandlerSelector};
+use crate::balancing::{Balancer, BalancingStrategy, ObservationProvider, OutboundHandlerSelector};
 use crate::config::DomainStrategy;
 use crate::context::RoutingContext;
 use crate::error::RouterError;
@@ -43,6 +43,12 @@ pub struct Router {
     rules: RwLock<Vec<Arc<Rule>>>,
     balancers: RwLock<HashMap<String, Arc<Balancer>>>,
     ohm: Arc<dyn OutboundHandlerSelector>,
+    /// 可选观测器（仅 LeastPing/LeastLoad 策略需要）。
+    ///
+    /// 对应 Go `extension.Observatory`，由 core 装配时通过 `Router::init` 或
+    /// `Router::set_observer` 注入。无观测器时 LeastPing/LeastLoad 策略在 `pick_outbound`
+    /// 返回空 → Balancer 走 fallback_tag，匹配 Go 行为。
+    observer: RwLock<Option<Arc<dyn ObservationProvider>>>,
     geo_loader: Option<Arc<GeoDataLoader>>,
     /// DNS 解析能力（domainStrategy IpOnDemand/IpIfNonMatch 用）。
     dns: RwLock<Option<Arc<dyn xray_features::dns::DnsClient>>>,
@@ -52,15 +58,20 @@ impl Router {
     /// 从 proto `Config` 初始化路由器。
     ///
     /// 对应 Go `router.Init`。
+    ///
+    /// `observer` 传入 `LeastPing` / `LeastLoad` 策略使用，传 `None` 时
+    /// 这两个策略构建仍会成功，但 `pick_outbound` 调用时返回空 → `Balancer`
+    /// 走 `fallback_tag` 分支（与 Go 无 observatory 时的行为一致）。
     pub fn init(
         config: &Config,
         ohm: Arc<dyn OutboundHandlerSelector>,
+        observer: Option<Arc<dyn ObservationProvider>>,
         geo_loader: Option<Arc<GeoDataLoader>>,
     ) -> Result<Arc<Self>, RouterError> {
         // 1. 构建平衡器映射
         let mut balancers: HashMap<String, Arc<Balancer>> = HashMap::new();
         for br in &config.balancing_rule {
-            let b = build_balancer(br, &ohm)?;
+            let b = build_balancer(br, &ohm, observer.as_ref().map(Arc::clone))?;
             if balancers.insert(br.tag.clone(), Arc::new(b)).is_some() {
                 return Err(RouterError::DuplicateBalancerTag);
             }
@@ -82,6 +93,7 @@ impl Router {
             rules: RwLock::new(rules),
             balancers: RwLock::new(balancers),
             ohm,
+            observer: RwLock::new(observer),
             geo_loader,
             dns: RwLock::new(None),
         }))
@@ -89,17 +101,35 @@ impl Router {
 
     /// 创建空 Router（仅测试用）。
     #[must_use]
-    pub fn empty(ohm: Arc<dyn OutboundHandlerSelector>) -> Arc<Self> {
+    pub fn empty(
+        ohm: Arc<dyn OutboundHandlerSelector>,
+        observer: Option<Arc<dyn ObservationProvider>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             domain_strategy: DomainStrategy::default(),
             rules: RwLock::new(Vec::new()),
             balancers: RwLock::new(HashMap::new()),
             ohm,
+            observer: RwLock::new(observer),
             geo_loader: None,
             dns: RwLock::new(None),
         })
     }
 
+    /// 注入观测器（对应 Go `extension.Observatory`）。
+    ///
+    /// 用于在 Router 已构建后再装配 observatory app。**注意**：已构建的
+    /// LeastPing/LeastLoad 策略不会回填 observer；应在 `Router::init` 阶段传入，
+    /// 或 rebuild 平衡器。此 setter 主要给 core 装配阶段使用。
+    pub fn set_observer(&self, observer: Arc<dyn ObservationProvider>) {
+        *self.observer.write() = Some(observer);
+    }
+
+    /// 返回观测器引用（仅查信息用）。
+    #[must_use]
+    pub fn observer(&self) -> Option<Arc<dyn ObservationProvider>> {
+        self.observer.read().clone()
+    }
     /// 注入 DNS 解析能力（对应 Go `r.dns`，由 core 装配时设置）。
     pub fn set_dns_client(&self, dns: Arc<dyn xray_features::dns::DnsClient>) {
         *self.dns.write() = Some(dns);
@@ -274,11 +304,18 @@ impl Router {
 
 /// 构建 Balancer。
 ///
-/// 对应 Go `BalancingRule.Build`。strategy_settings 当前不解析
-/// （TypedMessage 反序列化需上层提供），LeastLoad 使用默认配置。
+/// 对应 Go `BalancingRule.Build`（`app/router/config.go:121-165`）：
+/// - `random` / `""` / `roundrobin` 不依赖 observer
+/// - `leastping` / `leastload` 依赖 observer。无 observer 时**仍构建**，但
+///   策略在 `pick_outbound` 时返回空 → `Balancer` 走 `fallback_tag`（与 Go
+///   无 observatory 时返回空字符串 → fallback 的行为一致）。
+///
+/// `strategy_settings`（TypedMessage 反序列化）当前不解析：LeastLoad 用
+/// `StrategyLeastLoadConfig::default()` 兜底（同 Go 缺省值）。
 fn build_balancer(
     br: &BalancingRule,
     ohm: &Arc<dyn OutboundHandlerSelector>,
+    observer: Option<Arc<dyn ObservationProvider>>,
 ) -> Result<Balancer, RouterError> {
     let strategy: Arc<dyn BalancingStrategy> = match br.strategy.as_str() {
         "random" => Arc::new(crate::strategy_random::RandomStrategy::new(
@@ -287,29 +324,50 @@ fn build_balancer(
             br.fallback_tag.clone(),
         )),
         "leastping" => {
-            // 需 observer，当前 stub 返回 EmptyBalancerResult
-            // TODO: 接入 observation provider
-            return Err(RouterError::ObservationUnavailable(
-                "leastping requires observer".into(),
-            ));
+            // 始终构建；observer 缺失时 pick_outbound 返回 EmptyBalancerResult。
+            if let Some(obs) = observer {
+                Arc::new(crate::strategy_leastping::LeastPingStrategy::new(obs))
+            } else {
+                Arc::new(StubLeastPingStrategy)
+            }
         }
         "leastload" => {
-            // 同上
-            return Err(RouterError::ObservationUnavailable(
-                "leastload requires observer".into(),
-            ));
+            // 同 leastping；observer 缺失时返回空 → fallback。
+            if let Some(obs) = observer {
+                let cfg = br
+                    .strategy_settings
+                    .as_ref()
+                    .and_then(|ss| {
+                        // 反序列化 TypedMessage → StrategyLeastLoadConfig。
+                        // proto Any 解码需 xray-proto Any 支持；此处 try_decode 失败回退默认。
+                        let any = &ss.value;
+                        prost::Message::decode(any.as_slice()).ok()
+                    })
+                    .unwrap_or_default();
+                Arc::new(
+                    crate::strategy_leastload::LeastLoadStrategy::new(
+                        &cfg,
+                        br.outbound_selector.clone(),
+                        ohm.clone(),
+                        obs,
+                    )
+                    .map_err(|e| RouterError::Other(format!("leastload config: {e}")))?,
+                )
+            } else {
+                Arc::new(StubLeastLoadStrategy)
+            }
         }
         "" | "roundrobin" => Arc::new(crate::balancing::RoundRobinStrategy::new(
             br.outbound_selector.clone(),
             ohm.clone(),
-            None,
+            observer.clone(),
         )),
         other => {
             tracing::warn!(target: "xray_router", strategy = %other, "unknown strategy, falling back to roundrobin");
             Arc::new(crate::balancing::RoundRobinStrategy::new(
                 br.outbound_selector.clone(),
                 ohm.clone(),
-                None,
+                observer.clone(),
             ))
         }
     };
@@ -320,6 +378,22 @@ fn build_balancer(
         ohm.clone(),
         br.fallback_tag.clone(),
     ))
+}
+
+/// 无 observer 时的 LeastPing 占位：始终返回空 → Balancer 走 fallback。
+struct StubLeastPingStrategy;
+impl BalancingStrategy for StubLeastPingStrategy {
+    fn pick_outbound(&self) -> Result<String, RouterError> {
+        Err(RouterError::EmptyBalancerResult)
+    }
+}
+
+/// 无 observer 时的 LeastLoad 占位：始终返回空 → Balancer 走 fallback。
+struct StubLeastLoadStrategy;
+impl BalancingStrategy for StubLeastLoadStrategy {
+    fn pick_outbound(&self) -> Result<String, RouterError> {
+        Err(RouterError::EmptyBalancerResult)
+    }
 }
 
 #[cfg(test)]
@@ -362,7 +436,7 @@ mod tests {
 
     #[test]
     fn test_empty_router_returns_no_clue() {
-        let r = Router::empty(Arc::new(NotImplementedSelector));
+        let r = Router::empty(Arc::new(NotImplementedSelector), None);
         let ctx = RoutingData::new().with_target_domain("any");
         assert!(matches!(r.pick_route(&ctx), Err(RouterError::NoClue)));
     }
@@ -371,7 +445,7 @@ mod tests {
     fn test_simple_router_picks_matching_rule() {
         let mut cfg = Config::default();
         cfg.rule = vec![simple_tag_rule("direct", "example.com")];
-        let r = Router::init(&cfg, Arc::new(NotImplementedSelector), None).unwrap();
+        let r = Router::init(&cfg, Arc::new(NotImplementedSelector), None, None).unwrap();
         let hit = RoutingData::new().with_target_domain("example.com");
         let miss = RoutingData::new().with_target_domain("other.io");
         assert_eq!(
@@ -383,7 +457,7 @@ mod tests {
 
     #[test]
     fn test_add_and_remove_rule() {
-        let r = Router::empty(Arc::new(NotImplementedSelector));
+        let r = Router::empty(Arc::new(NotImplementedSelector), None);
         r.add_rule("rule1".into(), simple_tag_rule("tag1", "a.com")).unwrap();
         assert!(r.list_rules().contains(&"rule1".to_string()));
 
@@ -403,7 +477,7 @@ mod tests {
 
     #[test]
     fn test_reload_rules_replaces_all() {
-        let r = Router::empty(Arc::new(NotImplementedSelector));
+        let r = Router::empty(Arc::new(NotImplementedSelector), None);
         r.add_rule("r1".into(), simple_tag_rule("t1", "a.com")).unwrap();
         let new_rules = vec![
             simple_tag_rule("t2", "b.com"),
@@ -416,7 +490,7 @@ mod tests {
 
     #[test]
     fn test_override_balancer_not_found() {
-        let r = Router::empty(Arc::new(NotImplementedSelector));
+        let r = Router::empty(Arc::new(NotImplementedSelector), None);
         let err = r.override_balancer("nope", "target").unwrap_err();
         assert!(matches!(err, RouterError::BalancerNotFound(_)));
     }
@@ -425,7 +499,7 @@ mod tests {
     fn test_domain_strategy_from_config() {
         let mut cfg = Config::default();
         cfg.domain_strategy = 3; // IpOnDemand
-        let r = Router::init(&cfg, Arc::new(NotImplementedSelector), None).unwrap();
+        let r = Router::init(&cfg, Arc::new(NotImplementedSelector), None, None).unwrap();
         assert_eq!(r.domain_strategy(), DomainStrategy::IpOnDemand);
     }
 
@@ -523,7 +597,7 @@ mod tests {
 
         let mut cfg = Config::default();
         cfg.rule = vec![geoip_rule()];
-        let r = Router::init(&cfg, Arc::new(NotImplementedSelector), Some(loader)).unwrap();
+        let r = Router::init(&cfg, Arc::new(NotImplementedSelector), None, Some(loader)).unwrap();
 
         // 命中 CN CIDR 192.168.0.0/16
         let hit = RoutingData::new().with_target_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
@@ -546,7 +620,7 @@ mod tests {
 
         let mut cfg = Config::default();
         cfg.rule = vec![geosite_rule()];
-        let r = Router::init(&cfg, Arc::new(NotImplementedSelector), Some(loader)).unwrap();
+        let r = Router::init(&cfg, Arc::new(NotImplementedSelector), None, Some(loader)).unwrap();
 
         // baidu.com 是 Full 类型，应命中
         let hit_full = RoutingData::new().with_target_domain("baidu.com");
@@ -569,7 +643,156 @@ mod tests {
         let mut cfg = Config::default();
         cfg.rule = vec![geoip_rule()];
         // loader = None 时 GeoIP 变体被 skip，IPMatcher 收到空 vec 返回错（GeodataBuild）
-        let result = Router::init(&cfg, Arc::new(NotImplementedSelector), None);
+        let result = Router::init(&cfg, Arc::new(NotImplementedSelector), None, None);
         assert!(result.is_err(), "expected error when geoip rule present but no loader");
+    }
+
+    // ── Balancer strategy 装配 ──
+    //
+    // 验证 build_balancer 不再拒绝 leastping/leastload（h81 修复点）：
+    // - 有 observer：构建 + pick_outbound 返回正确 tag
+    // - 无 observer：构建成功 + pick_outbound → fallback_tag
+
+    use crate::balancing::{MemoryObservationProvider, SimpleSelector};
+    use xray_proto::xray::core::app::observatory::{ObservationResult, OutboundStatus};
+    /// 简单 tag 规则（domain="x.test" → tag）；用于挂上 BalancingRule。
+    fn simple_balance_rule(balancer_tag: &str) -> RoutingRule {
+        use xray_proto::xray::common::geodata::{Domain, DomainRule};
+        use xray_proto::xray::common::geodata::domain::Type as DT;
+        use xray_proto::xray::app::router::routing_rule::TargetTag;
+        RoutingRule {
+            target_tag: Some(TargetTag::BalancingTag(balancer_tag.into())),
+            rule_tag: String::new(),
+            domain: vec![DomainRule {
+                value: Some(xray_proto::xray::common::geodata::domain_rule::Value::Custom(Domain {
+                    r#type: DT::Full as i32,
+                    value: "x.test".into(),
+                    attribute: vec![],
+                })),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn balancing_rule_with(strategy: &str, tag: &str, fallback: &str) -> BalancingRule {
+        BalancingRule {
+            tag: tag.into(),
+            outbound_selector: vec!["a".into(), "b".into(), "c".into()],
+            strategy: strategy.into(),
+            strategy_settings: None,
+            fallback_tag: fallback.into(),
+        }
+    }
+
+    fn obs_with_alive(tag: &str, alive: bool, delay: i64) -> OutboundStatus {
+        OutboundStatus {
+            alive,
+            delay,
+            last_error_reason: String::new(),
+            outbound_tag: tag.into(),
+            last_seen_time: 0,
+            last_try_time: 0,
+            health_ping: None,
+        }
+    }
+
+    #[test]
+    fn test_build_balancer_leastping_with_observer_succeeds() {
+        let mut cfg = Config::default();
+        cfg.balancing_rule = vec![balancing_rule_with("leastping", "bl", "fb")];
+        cfg.rule = vec![simple_balance_rule("bl")];
+
+        let obs = Arc::new(MemoryObservationProvider::new());
+        obs.update(ObservationResult {
+            status: vec![
+                obs_with_alive("a", true, 100),
+                obs_with_alive("b", true, 50),
+                obs_with_alive("c", true, 200),
+            ],
+        });
+
+        let ohm = Arc::new(SimpleSelector::from_tags(["a", "b", "c"]));
+        let r = Router::init(&cfg, ohm, Some(obs), None).unwrap();
+
+        let ctx = RoutingData::new().with_target_domain("x.test");
+        // leastping 选最低延迟 → b
+        assert_eq!(r.pick_route(&ctx).unwrap().outbound_tag, "b");
+    }
+
+    #[test]
+    fn test_build_balancer_leastping_without_observer_falls_back() {
+        let mut cfg = Config::default();
+        cfg.balancing_rule = vec![balancing_rule_with("leastping", "bl", "fallback")];
+        cfg.rule = vec![simple_balance_rule("bl")];
+
+        let ohm = Arc::new(SimpleSelector::from_tags(["a", "b", "c"]));
+        // 无 observer：构建仍成功，pick 时走 fallback_tag
+        let r = Router::init(&cfg, ohm, None, None).unwrap();
+        let ctx = RoutingData::new().with_target_domain("x.test");
+        assert_eq!(r.pick_route(&ctx).unwrap().outbound_tag, "fallback");
+    }
+
+    #[test]
+    fn test_build_balancer_leastload_with_observer_succeeds() {
+        // 不设置 strategy_settings → build_balancer 走 unwrap_or_default 路径。
+        let mut cfg = Config::default();
+        cfg.balancing_rule = vec![balancing_rule_with("leastload", "bl", "fb")];
+        cfg.rule = vec![simple_balance_rule("bl")];
+
+        let obs = Arc::new(MemoryObservationProvider::new());
+        obs.update(ObservationResult {
+            status: vec![
+                obs_with_alive("a", true, 100),
+                obs_with_alive("b", true, 50),
+                obs_with_alive("c", true, 200),
+            ],
+        });
+        let ohm = Arc::new(SimpleSelector::from_tags(["a", "b", "c"]));
+        let r = Router::init(&cfg, ohm, Some(obs), None).unwrap();
+
+        let ctx = RoutingData::new().with_target_domain("x.test");
+        // leastload 默认 expected=1 选最低延迟 → b
+        assert_eq!(r.pick_route(&ctx).unwrap().outbound_tag, "b");
+    }
+
+    #[test]
+    fn test_build_balancer_leastload_without_observer_falls_back() {
+        let mut cfg = Config::default();
+        cfg.balancing_rule = vec![balancing_rule_with("leastload", "bl", "fb-tag")];
+        cfg.rule = vec![simple_balance_rule("bl")];
+
+        let ohm = Arc::new(SimpleSelector::from_tags(["a", "b", "c"]));
+        let r = Router::init(&cfg, ohm, None, None).unwrap();
+        let ctx = RoutingData::new().with_target_domain("x.test");
+        assert_eq!(r.pick_route(&ctx).unwrap().outbound_tag, "fb-tag");
+    }
+
+    #[test]
+    fn test_build_balancer_roundrobin_with_observer_filters_dead() {
+        // 验证 roundrobin 在有 observer 时只轮询 alive（与 Go 一致）。
+        let mut cfg = Config::default();
+        cfg.balancing_rule = vec![balancing_rule_with("roundrobin", "bl", "fb")];
+        cfg.rule = vec![simple_balance_rule("bl")];
+
+        let obs = Arc::new(MemoryObservationProvider::new());
+        // a 是死的，b/c alive
+        obs.update(ObservationResult {
+            status: vec![
+                obs_with_alive("a", false, 9999),
+                obs_with_alive("b", true, 50),
+                obs_with_alive("c", true, 100),
+            ],
+        });
+        let ohm = Arc::new(SimpleSelector::from_tags(["a", "b", "c"]));
+        let r = Router::init(&cfg, ohm, Some(obs), None).unwrap();
+
+        let ctx = RoutingData::new().with_target_domain("x.test");
+        // 第一轮：b 或 c（不会 a）。连点 4 次应只见 b/c
+        let mut picks = std::collections::HashSet::new();
+        for _ in 0..4 {
+            picks.insert(r.pick_route(&ctx).unwrap().outbound_tag);
+        }
+        assert!(!picks.contains("a"), "dead outbound a should not be picked");
+        assert!(picks.iter().all(|t| t == "b" || t == "c"));
     }
 }

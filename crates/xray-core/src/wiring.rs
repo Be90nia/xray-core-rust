@@ -367,13 +367,24 @@ impl InboundDispatchHandler {
 pub fn build_router_adapter_from_json(
     routing_json: &[u8],
 ) -> Result<Arc<RouterAdapter>, WiringError> {
+    build_router_adapter_from_json_with_observer(routing_json, None)
+}
+
+/// 同 [`build_router_adapter_from_json`]，额外传入观测器使 `leastping` /
+/// `leastload` 策略能拿到观测数据。
+pub fn build_router_adapter_from_json_with_observer(
+    routing_json: &[u8],
+    observer: Option<
+        Arc<dyn xray_app_router::balancing::ObservationProvider>,
+    >,
+) -> Result<Arc<RouterAdapter>, WiringError> {
     let config = parse_routing_json_to_proto(routing_json)?;
     let ohm: Arc<dyn xray_app_router::balancing::OutboundHandlerSelector> =
         Arc::new(NotImplementedSelector);
     let geo_loader = Some(Arc::new(xray_geodata::loader::GeoDataLoader::new(
         resolve_asset_dir(),
     )));
-    let router = Router::init(&config, ohm, geo_loader)
+    let router = Router::init(&config, ohm, observer, geo_loader)
         .map_err(|e| WiringError::RouterInit(e.to_string()))?;
     Ok(Arc::new(RouterAdapter::new(router)))
 }
@@ -672,7 +683,7 @@ mod tests {
 
     #[test]
     fn router_adapter_satisfies_routing_router() {
-        let r = Router::empty(Arc::new(NotImplementedSelector));
+        let r = Router::empty(Arc::new(NotImplementedSelector), None);
         let adapter = RouterAdapter::new(r);
         let ctx = DispatcherContext::new().with_target_domain("test.com");
         let result = <RouterAdapter as RoutingRouter>::pick_route(&adapter, &ctx);
@@ -682,7 +693,7 @@ mod tests {
     #[test]
     fn router_adapter_satisfies_dispatch_router() {
         use xray_common::net::network::Network;
-        let r = Router::empty(Arc::new(NotImplementedSelector));
+        let r = Router::empty(Arc::new(NotImplementedSelector), None);
         let adapter = RouterAdapter::new(r);
         let dest = Destination::new(
             Address::Domain("test.com".into()),
@@ -695,7 +706,7 @@ mod tests {
 
     #[test]
     fn router_adapter_debug_lists_rules() {
-        let r = Router::empty(Arc::new(NotImplementedSelector));
+        let r = Router::empty(Arc::new(NotImplementedSelector), None);
         let adapter = RouterAdapter::new(r);
         let s = format!("{adapter:?}");
         assert!(s.contains("RouterAdapter"));
@@ -934,5 +945,80 @@ mod tests {
         // 未注入 DNS：IpOnDemand 退化为按域名匹配，IP 规则不命中
         let tag = adapter.pick_outbound_tag_resolved(&resolved_dest()).await;
         assert!(tag.is_none());
+    }
+
+    // ---- balancer 策略 JSON 装配（h81 验收点）----
+
+    /// JSON → RouterAdapter，传入 observer（h81：build_balancer 不再拒绝 leastping）。
+    #[test]
+    fn build_adapter_with_balancer_leastping_succeeds() {
+        let json = br#"{
+            "balancers":[{"tag":"bl","selector":["a","b","c"],"strategy":"leastping","fallbackTag":"fb"}],
+            "rules":[{"balancerTag":"bl","domain":["x.test"]}]
+        }"#;
+        let adapter = build_router_adapter_from_json_with_observer(json, None)
+            .expect("leastping balancer should build even without observer");
+        // 没 observer → fallback
+        let dest = Destination::new(
+            Address::Domain("x.test".into()),
+            Port::new(443),
+            xray_common::net::network::Network::TCP,
+        );
+        assert_eq!(adapter.pick_outbound_tag(&dest).as_deref(), Some("fb"));
+    }
+
+    /// JSON + observer 装配 → 命中最低延迟出站。
+    #[test]
+    fn build_adapter_with_balancer_leastping_and_observer_picks_least_delay() {
+        use xray_app_router::balancing::ObservationProvider;
+
+        struct InlineObs(xray_proto::xray::core::app::observatory::ObservationResult);
+        impl ObservationProvider for InlineObs {
+            fn get_observation(
+                &self,
+            ) -> Result<
+                xray_proto::xray::core::app::observatory::ObservationResult,
+                xray_app_router::RouterError,
+            > {
+                Ok(self.0.clone())
+            }
+        }
+        let obs: Arc<dyn ObservationProvider> = Arc::new(InlineObs(
+            xray_proto::xray::core::app::observatory::ObservationResult {
+                status: vec![
+                    xray_proto::xray::core::app::observatory::OutboundStatus {
+                        outbound_tag: "a".into(),
+                        alive: true,
+                        delay: 100,
+                        ..Default::default()
+                    },
+                    xray_proto::xray::core::app::observatory::OutboundStatus {
+                        outbound_tag: "b".into(),
+                        alive: true,
+                        delay: 50,
+                        ..Default::default()
+                    },
+                    xray_proto::xray::core::app::observatory::OutboundStatus {
+                        outbound_tag: "c".into(),
+                        alive: true,
+                        delay: 200,
+                        ..Default::default()
+                    },
+                ],
+            },
+        ));
+
+        let json = br#"{
+            "balancers":[{"tag":"bl","selector":["a","b","c"],"strategy":"leastping"}],
+            "rules":[{"balancerTag":"bl","domain":["x.test"]}]
+        }"#;
+        let adapter = build_router_adapter_from_json_with_observer(json, Some(obs))
+            .expect("leastping + observer should build");
+        let dest = Destination::new(
+            Address::Domain("x.test".into()),
+            Port::new(443),
+            xray_common::net::network::Network::TCP,
+        );
+        assert_eq!(adapter.pick_outbound_tag(&dest).as_deref(), Some("b"));
     }
 }

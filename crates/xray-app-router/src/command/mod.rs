@@ -113,7 +113,7 @@ mod tests {
     fn with_router_list_rule_returns_empty() {
         use crate::balancing::{NotImplementedSelector, OutboundHandlerSelector};
         let ohm: Arc<dyn OutboundHandlerSelector> = Arc::new(NotImplementedSelector);
-        let router = Router::empty(ohm);
+        let router = Router::empty(ohm, None);
         let s = RoutingService::with_router(router);
         assert_eq!(s.list_rule().unwrap(), Vec::<String>::new());
     }
@@ -122,7 +122,7 @@ mod tests {
     fn with_router_get_balancer_info_unknown_tag() {
         use crate::balancing::{NotImplementedSelector, OutboundHandlerSelector};
         let ohm: Arc<dyn OutboundHandlerSelector> = Arc::new(NotImplementedSelector);
-        let router = Router::empty(ohm);
+        let router = Router::empty(ohm, None);
         let s = RoutingService::with_router(router);
         assert!(s.get_balancer_info("nonexistent").is_err());
     }

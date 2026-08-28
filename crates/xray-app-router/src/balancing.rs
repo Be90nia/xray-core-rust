@@ -117,6 +117,8 @@ impl RoundRobinStrategy {
             Ok(o) => o,
             Err(_) => return Ok(selected),
         };
+        // Go 语义：仅当观测结果存在时按 alive 过滤；找不到/没数据就返回空 list
+        // （非全部）。这样 RoundRobin 在所有出站都 dead 时返回空 → Balancer fallback。
         let alive: Vec<String> = selected
             .iter()
             .filter(|t| {
@@ -127,7 +129,7 @@ impl RoundRobinStrategy {
             })
             .cloned()
             .collect();
-        if alive.is_empty() { Ok(selected) } else { Ok(alive) }
+        Ok(alive)
     }
 }
 
