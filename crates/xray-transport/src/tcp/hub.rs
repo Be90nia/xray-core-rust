@@ -6,9 +6,10 @@
 //!
 //! - `TcpHubListener` — 持有 `DefaultListener` + `ConnHandler`，spawn accept 循环
 //! - `listen_tcp_impl` — `TransportListenFn` 实现，注册到全局 listener 注册表
-//! - `keep_accepting` — accept 循环：accept → TLS/REALITY/auth wrap → `add_conn`
+//! - `keep_accepting` — accept 循环：accept → header auth wrap → `add_conn`
+//!   （Go hub.go:125-127）
 //!
-//! TLS/REALITY/auth wrapping 当前为 stub（对应 crate 未集成），直接传原始连接。
+//! TLS/REALITY wrapping 不在 hub（生产 TLS 由 xray-core inbound 各协议层包装）。
 
 use std::io;
 use std::net::SocketAddr;
@@ -30,6 +31,9 @@ pub struct TcpHubListener {
     inner: DefaultListener,
     add_conn: ConnHandler,
     close_notify: Arc<Notify>,
+    /// header 伪装 authenticator（Go hub.go:24 `authConfig internet.ConnectionAuthenticator`）。
+    /// `None` = 未配置（type none/缺失）→ accept 后不包装。
+    auth: Option<Arc<crate::headers::http::HttpAuthenticator>>,
 }
 
 impl TcpHubListener {
@@ -50,6 +54,7 @@ impl TcpHubListener {
         addr: SocketAddr,
         sockopt: &SocketOptions,
         add_conn: ConnHandler,
+        auth: Option<Arc<crate::headers::http::HttpAuthenticator>>,
     ) -> io::Result<Self> {
         let inner = DefaultListener::bind(addr, sockopt.clone()).await?;
         let close_notify = Arc::new(Notify::new());
@@ -58,6 +63,7 @@ impl TcpHubListener {
             inner,
             add_conn,
             close_notify,
+            auth,
         };
 
         // ponytail: 暂不 spawn accept 循环——由调用方显式调用 `keep_accepting`
@@ -98,8 +104,13 @@ impl TcpHubListener {
                 result = &mut accept_fut => {
                     match result {
                         Ok(conn) => {
-                            // ponytail: TLS/REALITY/auth wrapping 留待对应 crate 集成。
-                            // 当前直接传原始连接给 add_conn。
+                            // ponytail: TLS/REALITY wrapping 留待对应 crate 集成
+                            //（生产 TLS 在 xray-core inbound 各协议层包装）。
+                            // header 伪装包装（Go hub.go:125-127 authConfig.Server）：
+                            let conn = match &self.auth {
+                                Some(a) => crate::headers::conn::wrap_server(conn, a),
+                                None => conn,
+                            };
                             (self.add_conn)(conn);
                         }
                         Err(e) => {
@@ -150,11 +161,14 @@ impl TransportListener for TcpHubListener {
 /// 注册到全局 listener 注册表，让 `listen_tcp("tcp", ...)` 可找到。
 pub async fn listen_tcp_impl(
     addr: SocketAddr,
-    _settings: crate::dialer::StreamSettings,
+    settings: crate::dialer::StreamSettings,
     sockopt: SocketOptions,
     handler: ConnHandler,
 ) -> io::Result<Box<dyn TransportListener>> {
-    let listener = TcpHubListener::listen(addr, &sockopt, handler).await?;
+    // header 伪装构建（Go hub.go:85-95：HeaderSettings → ConnectionAuthenticator，
+    // 失败报错；none/缺失 → None 不包装）。
+    let auth = crate::headers::conn::auth_from_json(settings.transport_json.as_ref())?;
+    let listener = TcpHubListener::listen(addr, &sockopt, handler, auth).await?;
     Ok(Box::new(listener) as Box<dyn TransportListener>)
 }
 
@@ -217,7 +231,7 @@ mod tests {
     async fn tcp_hub_listener_bind_and_accept() {
         let handler: ConnHandler = Arc::new(|_| {});
         let listener =
-            TcpHubListener::listen("127.0.0.1:0".parse().unwrap(), &SocketOptions::default(), handler)
+            TcpHubListener::listen("127.0.0.1:0".parse().unwrap(), &SocketOptions::default(), handler, None)
                 .await
                 .expect("listen 失败");
         let addr = listener.local_addr().expect("local_addr 失败");
@@ -239,7 +253,7 @@ mod tests {
     async fn tcp_hub_listener_local_addr() {
         let handler: ConnHandler = Arc::new(|_| {});
         let listener =
-            TcpHubListener::listen("127.0.0.1:0".parse().unwrap(), &SocketOptions::default(), handler)
+            TcpHubListener::listen("127.0.0.1:0".parse().unwrap(), &SocketOptions::default(), handler, None)
                 .await
                 .expect("listen 失败");
         let addr = listener.local_addr().expect("local_addr 失败");
@@ -258,7 +272,7 @@ mod tests {
         });
 
         let listener = Arc::new(
-            TcpHubListener::listen("127.0.0.1:0".parse().unwrap(), &SocketOptions::default(), handler)
+            TcpHubListener::listen("127.0.0.1:0".parse().unwrap(), &SocketOptions::default(), handler, None)
                 .await
                 .expect("listen 失败"),
         );
@@ -307,12 +321,79 @@ mod tests {
     async fn transport_listener_trait_close_and_local_addr() {
         let handler: ConnHandler = Arc::new(|_| {});
         let listener: Box<dyn TransportListener> = Box::new(
-            TcpHubListener::listen("127.0.0.1:0".parse().unwrap(), &SocketOptions::default(), handler)
+            TcpHubListener::listen("127.0.0.1:0".parse().unwrap(), &SocketOptions::default(), handler, None)
                 .await
                 .expect("listen 失败"),
         );
         let addr = listener.local_addr().expect("local_addr 失败");
         assert_ne!(addr.port(), 0);
         listener.close().expect("close 失败");
+    }
+}
+
+#[cfg(test)]
+mod header_wrap_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    /// inbound header 装配（Go tcp/hub.go:85-95 构建 + 125-127 accept 后包装）：
+    /// `header.type=http` → add_conn 收到的连接已被 server 包装——
+    /// 原始 client 手发 request header + payload，包装连接直接读出 payload；
+    /// 包装连接写回应时自动注入 response header。
+    #[tokio::test]
+    async fn tcp_hub_wraps_inbound_with_header_authenticator() {
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::channel::<Box<dyn Connection>>(1);
+        let handler: ConnHandler = Arc::new(move |conn| {
+            tx.try_send(conn).ok();
+        });
+
+        // settings JSON → auth（Go hub.go:85-95 装配路径）。
+        let auth = crate::headers::conn::auth_from_json(Some(&serde_json::json!({
+            "header": {"type": "http"}
+        })))
+        .expect("json 构建")
+        .expect("type http → Some");
+
+        let listener = Arc::new(
+            TcpHubListener::listen(
+                "127.0.0.1:0".parse().unwrap(),
+                &SocketOptions::default(),
+                handler,
+                Some(auth),
+            )
+            .await
+            .expect("listen 失败"),
+        );
+        let addr = listener.local_addr().expect("local_addr 失败");
+        let _loop = listener.spawn_accept_loop();
+
+        // 原始 client：手发 request header + payload。
+        let mut client = TcpStream::connect(addr).await.expect("connect 失败");
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\ninbound-payload")
+            .await
+            .expect("raw write");
+
+        // handler 收到的 conn 已被 server 包装（header 被吞，payload 透传）。
+        let mut wrapped = rx.recv().await.expect("应收到包装连接");
+        let mut buf = [0u8; 15];
+        wrapped
+            .read_exact(&mut buf)
+            .await
+            .expect("wrapped read");
+        assert_eq!(&buf, b"inbound-payload", "header 应被吞，payload 透传");
+
+        wrapped.write_all(b"resp").await.expect("wrapped write");
+        let mut got = [0u8; 512];
+        let n = client.read(&mut got).await.expect("client read");
+        let text = String::from_utf8_lossy(&got[..n]).to_string();
+        assert!(
+            text.starts_with("HTTP/1.1 200"),
+            "应注入 response header，实际 {text:?}"
+        );
+        assert!(text.ends_with("resp"), "payload 应跟随 header，实际 {text:?}");
     }
 }

@@ -32,16 +32,25 @@ pub fn register_dialer() -> io::Result<()> {
     Ok(())
 }
 
-/// 实际拨号：`dial_system` 建裸 TCP → 按 `security` 包装 TLS。
+/// 实际拨号：`dial_system` 建裸 TCP → 按 `security` 包装 TLS → 按 `header` 包装伪装。
 ///
-/// 对应 Go `tcp/dialer.go::Dial`：`internet.DialSystem` 后 `tls.ConfigFromStreamSettings` 包装。
+/// 对应 Go `tcp/dialer.go::Dial`：`internet.DialSystem` 后 `tls` 包装（line 36-102），
+/// 再 `HeaderSettings` → `ConnectionAuthenticator.Client(conn)`（line 104-115）。
 async fn dial_tcp(
     dest: &Destination,
     sockopt: &SocketOptions,
     settings: &StreamSettings,
 ) -> io::Result<Box<dyn Connection>> {
     let conn = xray_transport::system_dialer::dial_system(dest, sockopt).await?;
-    wrap_security(conn, settings, dest).await
+    let conn = wrap_security(conn, settings, dest).await?;
+    // header 伪装装配（Go tcp/dialer.go:105-115，TLS 之后）：
+    // `tcpSettings.header.type = "http"` → client 包装；`"none"`/缺失 → 不包装。
+    if let Some(auth) =
+        xray_transport::headers::conn::auth_from_json(settings.transport_json.as_ref())?
+    {
+        return Ok(xray_transport::headers::conn::wrap_client(conn, &auth));
+    }
+    Ok(conn)
 }
 
 /// 按 `settings.security` 包装 TLS / REALITY。`security="none"`（或空）原样返回。
