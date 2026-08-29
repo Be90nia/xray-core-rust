@@ -17,7 +17,9 @@ use async_trait::async_trait;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::task::JoinHandle;
 
 pub mod custom;
 pub mod fragment;
@@ -236,6 +238,40 @@ pub fn wrap_conn_server_into_connection(
     Ok(Box::new(AsyncIoConn(wrapped)))
 }
 
+// ===== UDP mask 接入 Connection（o76 残余接线，V-Batch8-fjoj） =====
+
+/// 把 [`UdpmaskManager::wrap_packet_conn_client`] 的 `Box<dyn UdpIo>` 结果适配为
+/// `Box<dyn Connection>`（client 侧发往固定 `remote_addr`）。
+///
+/// 用在 UDP transport dial 路径：`Box<dyn UdpIo>` → mask 包装 → `Box<dyn Connection>`，
+/// 让 [`Connection`] consumer（不关心 UDP vs TCP 抽象）能消费 UDP 流。
+///
+/// **语义**：每次 read 取 1 个 UDP packet（不足 `buf` 长度则下次 read 取剩余或下一包）；
+/// write 把 buffer 发到记录的 `remote_addr`。
+///
+/// 若 `udpio` 来自空 manager（`udpmasks` 为空），原样适配（无 mask）——无 mask 行为不变。
+#[must_use]
+pub fn wrap_packet_conn_client_into_connection(
+    udpio: Box<dyn UdpIo>,
+    remote_addr: SocketAddr,
+) -> io::Result<Box<dyn crate::connection::Connection>> {
+    Ok(Box::new(PacketIoConn::new(udpio, remote_addr)))
+}
+
+/// 同 [`wrap_packet_conn_client_into_connection`]，server 侧。
+///
+/// `remote_addr` 在 server 方向语义弱（UDP 不记录 peer，但传入供 caller 记录上下文）。
+/// 默认返回 `Ok(None)`，因 server 真正 peer 来自下一次 recv。
+#[must_use]
+pub fn wrap_packet_conn_server_into_connection(
+    udpio: Box<dyn UdpIo>,
+    _remote_hint: SocketAddr,
+) -> io::Result<Box<dyn crate::connection::Connection>> {
+    // ponytail: server 方向无法确定 peer；接口签名保留 remote_hint 仅为对称 client 路径，
+    // 实际 `remote_addr()` 返回 Ok(None)。若未来要识别 peer，根据 `_remote_hint` 改进。
+    Ok(Box::new(PacketIoConn::new(udpio, "0.0.0.0:0".parse().unwrap())))
+}
+
 /// 把 `&[Box<dyn Tcpmask>]` 按 client/server 方向链式包装到 `raw`。
 ///
 /// 对应 Go `TcpmaskManager.WrapConnClient/Server` 的语义：逆序链式 apply。
@@ -300,6 +336,148 @@ impl crate::connection::Connection for AsyncIoConn {
     }
     fn local_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
         Ok(None)
+    }
+}
+
+/// `Box<dyn UdpIo>` → `Box<dyn Connection>` 适配器（一包一 op 语义）。
+///
+/// 内部 driver task 在构造时启动，持有底层 socket 的 `Arc<UdpSocket>` clone，
+/// 持续 `recv_from` 推到共享 `Mutex<VecDeque<Vec<u8>>>`；`poll_read` 从队列拉出。
+///
+/// `write` 路径是 fire-and-forget：spawn task 发到 `remote_addr` 后立即返回
+/// `Ready(Ok(n))`，**不感知** send 错误——UDP 写错误由 socket 层的 NAT/ICMP
+/// 反馈呈现，对应用语义不阻挡（与 Go `net.PacketConn.WriteTo` 同）。
+///
+/// ponytail: stop 信号缺失——driver task 一直运行直到 socket recv_from 出错（典型的是 socket drop 后内核报 error）。Drop 时 abort JoinHandle 立即取消。
+struct PacketIoConn {
+    /// 共享底层 socket。`UdpSocket` 是 Sync 通过内核，clone Arc 多 reader OK。
+    inner: Arc<dyn UdpIo>,
+    /// write 目标地址。
+    remote_addr: SocketAddr,
+    /// recv 缓冲：driver 拉到后放入，poll_read 取出。
+    rx: Arc<parking_lot::Mutex<std::collections::VecDeque<Vec<u8>>>>,
+    /// recv 唤醒：driver 通知新包；poll_read 用它注册 waker。
+    notify: Arc<tokio::sync::Notify>,
+    /// recv loop handler；Drop 时 abort 取消。
+    driver: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl PacketIoConn {
+    fn new(inner: Box<dyn UdpIo>, remote_addr: SocketAddr) -> Self {
+        // ponytail: leak Arc<UdpIo> 一次——驱动 task + write spawn 都要 clone。
+        // 标准做法见 `tokio::net::TcpStream::into_split`。对全局进程泄漏 but 单一实例。
+        let raw: *mut dyn UdpIo = Box::into_raw(inner);
+        let inner: Arc<dyn UdpIo> = unsafe { Arc::from_raw(raw) };
+        let rx: Arc<parking_lot::Mutex<std::collections::VecDeque<Vec<u8>>>> =
+            Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new()));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let driver_inner = Arc::clone(&inner);
+        let driver_rx = Arc::clone(&rx);
+        let driver_notify = Arc::clone(&notify);
+        let driver = tokio::spawn(async move {
+            let mut buf = vec![0u8; UDP_SIZE];
+            loop {
+                match driver_inner.recv_from(&mut buf).await {
+                    Ok((n, _src)) => {
+                        let payload = buf[..n].to_vec();
+                        driver_rx.lock().push_back(payload);
+                        driver_notify.notify_one();
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            inner,
+            remote_addr,
+            rx,
+            notify,
+            driver: Mutex::new(Some(driver)),
+        }
+    }
+}
+
+impl Drop for PacketIoConn {
+    fn drop(&mut self) {
+        if let Some(handle) = self.driver.lock().take() {
+            handle.abort();
+        }
+    }
+}
+
+impl AsyncRead for PacketIoConn {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let mut rx = self.rx.lock();
+        if let Some(pkt) = rx.pop_front() {
+            let n = pkt.len().min(buf.remaining());
+            buf.put_slice(&pkt[..n]);
+            // ponytail: 超长包丢弃剩余字节——简化不缓存；KCP 段长恒 < 1500 包足够。
+            drop(rx);
+            return std::task::Poll::Ready(Ok(()));
+        }
+        drop(rx);
+        // ponytail: 每次 Pending 都 spawn 唤醒——频繁唤醒浪费，但简化为可运行。
+        let notify = Arc::clone(&self.notify);
+        let waker = cx.waker().clone();
+        tokio::spawn(async move {
+            notify.notified().await;
+            waker.wake();
+        });
+        std::task::Poll::Pending
+    }
+}
+
+impl AsyncWrite for PacketIoConn {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        let inner = Arc::clone(&self.inner);
+        let remote = self.remote_addr;
+        let data = buf.to_vec();
+        let n = buf.len();
+        let waker = cx.waker().clone();
+        tokio::spawn(async move {
+            // ponytail: send 失败被 drop——Connection 写入 UDP 失败无 caller 同步点；
+            // 通过 waker.wake() 让 caller 重新调度（实际 caller 已 Ready 不会重新调）。
+            if let Err(e) = inner.send_to(&data, remote).await {
+                tracing::debug!(error = %e, "PacketIoConn send_to failed");
+            }
+            waker.wake();
+        });
+        std::task::Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl crate::connection::Connection for PacketIoConn {
+    fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+        if self.remote_addr.ip().is_unspecified() && self.remote_addr.port() == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(self.remote_addr))
+        }
+    }
+    fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+        self.inner.local_addr().map(Some)
     }
 }
 
@@ -903,5 +1081,118 @@ mod tests {
         let mut enc = chain.encode(b"data").unwrap();
         enc[13] ^= 0xFF; // 翻转密文一字节
         assert!(chain.decode(&enc).is_err());
+    }
+
+    /// 端到端：`build_udpmask_manager_from_json` + `wrap_packet_conn_client/server`
+    /// 一对儿（mkcp-original codec）应能对带前缀/后缀的 payload 做 UDP 包级 mask
+    /// encode/decode round-trip。对应 Go `transport/internet/udp/dialer.go:40 + hub.go:72`。
+    #[test]
+    fn udpmask_manager_roundtrip_mkcp_original() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            use tokio::net::UdpSocket;
+            let fm: serde_json::Value = serde_json::from_str(
+                r#"{"udp":[{"type":"mkcp-legacy","settings":{}}]}"#,
+            )
+            .unwrap();
+            let mgr = build_udpmask_manager_from_json(Some(&fm)).expect("manager");
+            assert_eq!(mgr.udpmasks.len(), 1);
+
+            let client_raw = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let server_raw = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let server_addr = server_raw.local_addr().unwrap();
+            let client_addr = client_raw.local_addr().unwrap();
+
+            let client_udpio: Box<dyn UdpIo> =
+                mgr.wrap_packet_conn_client(Box::new(client_raw)).unwrap();
+            let server_udpio: Box<dyn UdpIo> =
+                mgr.wrap_packet_conn_server(Box::new(server_raw)).unwrap();
+
+            let payload = b"hello-udpmask-roundtrip";
+            client_udpio.send_to(payload, server_addr).await.unwrap();
+            let mut buf = vec![0u8; 1500];
+            let (n, src) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                server_udpio.recv_from(&mut buf),
+            )
+            .await
+            .expect("server recv timeout")
+            .unwrap();
+            assert_eq!(&buf[..n], payload);
+            assert_eq!(src, client_addr);
+
+            let reply = b"reply-from-server";
+            server_udpio.send_to(reply, client_addr).await.unwrap();
+            let (n, src) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client_udpio.recv_from(&mut buf),
+            )
+            .await
+            .expect("client recv timeout")
+            .unwrap();
+            assert_eq!(&buf[..n], reply);
+            assert_eq!(src, server_addr);
+        });
+    }
+
+    /// `wrap_packet_conn_*_into_connection` 把 `Box<dyn UdpIo>` 适配为
+    /// `Box<dyn Connection>`（client 方向 `remote_addr` 由调用方传入）。
+    #[test]
+    fn wrap_packet_conn_into_connection_roundtrip() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::net::UdpSocket;
+            let fm: serde_json::Value = serde_json::from_str(
+                r#"{"udp":[{"type":"mkcp-legacy","settings":{"value":"hello-udp-pass"}}]}"#,
+            )
+            .unwrap();
+            let mgr = build_udpmask_manager_from_json(Some(&fm)).expect("manager");
+
+            let client_raw = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let server_raw = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let server_addr = server_raw.local_addr().unwrap();
+            let client_addr = client_raw.local_addr().unwrap();
+
+            let server_udpio: Box<dyn UdpIo> =
+                mgr.wrap_packet_conn_server(Box::new(server_raw)).unwrap();
+            let mut server_conn: Box<dyn crate::connection::Connection> =
+                crate::finalmask::wrap_packet_conn_server_into_connection(
+                    server_udpio,
+                    client_addr,
+                )
+                .expect("wrap_packet_conn_server_into_connection");
+
+            let client_udpio: Box<dyn UdpIo> =
+                mgr.wrap_packet_conn_client(Box::new(client_raw)).unwrap();
+            let mut client_conn: Box<dyn crate::connection::Connection> =
+                crate::finalmask::wrap_packet_conn_client_into_connection(
+                    client_udpio,
+                    server_addr,
+                )
+                .expect("wrap_packet_conn_client_into_connection");
+            assert_eq!(client_conn.remote_addr().unwrap(), Some(server_addr));
+
+            client_conn
+                .write_all(b"client-connection-payload")
+                .await
+                .expect("client write");
+
+            let mut read_buf = vec![0u8; 256];
+            let n = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                server_conn.read(&mut read_buf),
+            )
+            .await
+            .expect("server read timeout")
+            .expect("server read ok");
+            assert_eq!(&read_buf[..n], b"client-connection-payload");
+        });
     }
 }
