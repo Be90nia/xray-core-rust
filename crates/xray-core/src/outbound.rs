@@ -876,6 +876,13 @@ fn parse_trojan_config(data: &[u8]) -> std::result::Result<TrojanOutboundConfig,
         .get("servers")
         .and_then(|v| v.as_array())
         .ok_or_else(|| "missing servers array".to_string())?;
+    // Go infra/conf/trojan.go:57-58：servers 必须恰有一个成员，多端点用 routing balancer。
+    if servers.len() != 1 {
+        return Err(format!(
+            "Trojan settings: \"servers\" should have one and only one member. \
+             Multiple endpoints in \"servers\" should use multiple Trojan outbounds and routing balancer instead"
+        ));
+    }
     // Trojan Flow 已移除（Go infra/conf/trojan.go:73-75，遍历全部 servers）。
     // Rust 保留现行为：warn + 忽略该字段继续解析。
     for server in servers {
@@ -2496,6 +2503,32 @@ mod tests {
         assert_eq!(config.account.password, "secret");
     }
 
+    /// Go infra/conf/trojan.go:57-58：servers 必须恰一个成员，多端点用 routing balancer。
+    #[test]
+    fn parse_trojan_config_rejects_multiple_servers() {
+        let data = r#"{
+            "servers": [
+                {"address": "a.example.com", "port": 443, "password": "pa"},
+                {"address": "b.example.com", "port": 443, "password": "pb"}
+            ]
+        }"#;
+        let err = parse_trojan_config(data.as_bytes()).unwrap_err();
+        assert!(
+            err.contains("should have one and only one member"),
+            "expected Go-equivalent error message, got: {err}"
+        );
+    }
+
+    /// Go infra/conf/trojan.go:57-58：servers 数组为空也报错（也属于 != 1）。
+    #[test]
+    fn parse_trojan_config_rejects_empty_servers() {
+        let data = r#"{ "servers": [] }"#;
+        let err = parse_trojan_config(data.as_bytes()).unwrap_err();
+        assert!(
+            err.contains("should have one and only one member"),
+            "expected Go-equivalent error message, got: {err}"
+        );
+    }
     #[test]
     fn parse_stream_settings_none_returns_none() {
         assert!(parse_stream_settings(&None).is_none());

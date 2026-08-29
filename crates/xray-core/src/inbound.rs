@@ -1545,7 +1545,9 @@ async fn spawn_one_inbound(
                             name: fb.get("name").and_then(|v| v.as_str()).unwrap_or("").into(),
                             alpn: fb.get("alpn").and_then(|v| v.as_str()).unwrap_or("").into(),
                             path: fb.get("path").and_then(|v| v.as_str()).unwrap_or("").into(),
-                            dest: fb.get("dest").and_then(|v| v.as_str()).unwrap_or("127.0.0.1:80").into(),
+                            dest: apply_unix_abstract_padding(
+                                fb.get("dest").and_then(|v| v.as_str()).unwrap_or("127.0.0.1:80"),
+                            ),
                             xver: fb.get("xver").and_then(|v| v.as_u64()).unwrap_or(0),
                         })
                     }).collect();
@@ -1823,18 +1825,50 @@ fn build_vless_validator(data: &[u8]) -> std::io::Result<std::sync::Arc<dyn Vles
             }
         }
     }
+
     Ok(std::sync::Arc::new(validator))
 }
 
+/// Linux abstract namespace padding（Go infra/conf/trojan.go:182-186）。
+///
+/// `dest` 以 `@@` 开头时（仅 unix 平台），把 `dest[1..]` 拷贝到 108 字节 NUL-padded
+/// buffer（首字节隐式 `'\0'`），返回该 buffer 的字符串表示。haproxy 等下游需要
+/// 固定长度的 `syscall.RawSockaddrUnix` 结构。
+///
+/// 非 unix 平台或 dest 不以 `@@` 开头时直接返回原值（保持 Windows 下无变换）。
+fn apply_unix_abstract_padding(dest: &str) -> String {
+    #[cfg(unix)]
+    {
+        // Linux `syscall.RawSockaddrUnix{}.Path` 字节数。
+        // ponytail: hardcoded 108 对齐 syscall.RawSockaddrUnix.Path；改需联动内核常量。
+        const UNIX_PATH_MAX: usize = 108;
+        if let Some(stripped) = dest.strip_prefix("@@") {
+            let mut buf = [0u8; UNIX_PATH_MAX];
+            let src = stripped.as_bytes();
+            let copy_len = src.len().min(UNIX_PATH_MAX);
+            buf[..copy_len].copy_from_slice(&src[..copy_len]);
+            // NUL 字节在 Rust String 中合法（`\0` 是 valid char），Linux 拨号时按
+            // 首个 NUL 截断 abstract namespace path。
+            return String::from_utf8_lossy(&buf).into_owned();
+        }
+    }
+    dest.to_string()
+}
 /// 从 inbound entry.data（JSON）解析 trojan clients → HashMap<key_hash, MemoryUser>。
 ///
-/// JSON 格式：`{"clients":[{"password":"...","email":""}]}`。
+/// JSON 格式：`{"clients":[{"password":"...","email":""}]}` 或 `{"users":[...]}`。
 /// 对每个 client：`MemoryAccount::new(password)`（内部计算 hex(sha224)）→ MemoryUser → key_hash 入表。
 fn build_trojan_users(data: &[u8]) -> std::io::Result<HashMap<String, TrojanMemoryUser>> {
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("trojan inbound settings JSON: {e}")))?;
     let mut users = HashMap::new();
-    if let Some(clients) = v.get("clients").and_then(|c| c.as_array()) {
+    // Go infra/conf/trojan.go:124-126：`if c.Clients != nil { c.Users = c.Clients }`
+    // — 若 `clients` 字段存在则覆盖 `users`，否则 fall back 到 `users`。
+    let client_list = v
+        .get("clients")
+        .or_else(|| v.get("users"))
+        .and_then(|c| c.as_array());
+    if let Some(clients) = client_list {
         for c in clients {
             // Trojan Flow 已移除（Go infra/conf/trojan.go:134-136 服务端逐用户检查）。
             // Rust 保留现行为：warn + 忽略该字段继续建用户。
@@ -3797,6 +3831,53 @@ mod tests {
         assert!(users.is_empty());
     }
 
+    /// Go infra/conf/trojan.go:115-116 + 124-126：`users` 与 `clients` 是 alias。
+    /// 本测验证：当 JSON 只提供 `users`（无 `clients`）时也能解析。
+    #[test]
+    fn build_trojan_users_parses_users_alias() {
+        let settings = serde_json::json!({
+            "users": [{ "password": "secret", "email": "alice", "level": 2 }],
+        });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let users = super::build_trojan_users(&data).unwrap();
+        assert_eq!(users.len(), 1);
+        let expected_account = TrojanMemoryAccount::new("secret");
+        let expected_user = TrojanMemoryUser::new("alice", 2, expected_account);
+        assert!(users.contains_key(&expected_user.key_hash()));
+    }
+
+    /// Go infra/conf/trojan.go:182-186：fallback.dest 以 `@@` 开头（unix）→ 108 字节 NUL padding。
+    /// 非 unix 平台（包括 Windows）→ 原样返回。
+    #[test]
+    fn apply_unix_abstract_padding_double_at_prefix() {
+        let got = super::apply_unix_abstract_padding("@@my-abstract-socket");
+        #[cfg(unix)]
+        {
+            // 首字节必须是 NUL（Linux abstract namespace 标识），后续紧跟 "@my-abstract-socket"
+            // — Go copy(fullAddr, fb.Dest[1:]) 跳过了首个 '@'。
+            assert_eq!(got.as_bytes()[0], 0, "first byte should be NUL");
+            assert!(got.starts_with("\0@my-abstract-socket"), "expected NUL+@my-... got {got:?}");
+            assert_eq!(got.len(), 108, "must pad to 108 bytes (syscall.RawSockaddrUnix.Path)");
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(got, "@@my-abstract-socket", "non-unix should passthrough");
+        }
+    }
+
+    /// 单 `@` 开头（普通 unix 路径）→ 不做 padding，原样返回。
+    #[test]
+    fn apply_unix_abstract_padding_single_at_passthrough() {
+        let got = super::apply_unix_abstract_padding("@/tmp/sock");
+        assert_eq!(got, "@/tmp/sock", "single @ is not abstract namespace");
+    }
+
+    /// 普通 host:port → 不做 padding，原样返回。
+    #[test]
+    fn apply_unix_abstract_padding_plain_dest_passthrough() {
+        let got = super::apply_unix_abstract_padding("127.0.0.1:8080");
+        assert_eq!(got, "127.0.0.1:8080");
+    }
     #[test]
     fn build_vmess_validator_parses_clients_json() {
         let uuid = "66ad4540-b58c-4ad2-9926-ea63445a9b57";
