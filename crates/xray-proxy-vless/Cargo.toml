@@ -31,6 +31,7 @@ aes = "0.9"
 ctr = "0.10"
 
 [dev-dependencies]
+xray-xudp = { path = "../xray-xudp" }
 tokio = { workspace = true, features = ["full", "test-util"] }
 xray-tls = { path = "../xray-tls" }
 tokio-tungstenite = { workspace = true }

@@ -192,7 +192,7 @@ impl InboundProcessor for VlessInboundProcessor {
         let validator = Arc::clone(&self.validator);
         let handler = Arc::clone(&self.handler);
         Box::pin(async move {
-            crate::inbound::server::handle_connection(conn, &handler, &validator)
+            crate::inbound::server::handle_connection(conn, &handler, &validator, None)
                 .await
                 .map_err(crate::error::VlessError::Io)
         })
