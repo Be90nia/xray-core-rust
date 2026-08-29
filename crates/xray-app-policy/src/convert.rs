@@ -89,6 +89,9 @@ pub fn system_stats_from_proto(proto: &ProtoSystemPolicy) -> SystemStats {
         inbound_downlink: stats.map(|s| s.inbound_downlink).unwrap_or(false),
         outbound_uplink: stats.map(|s| s.outbound_uplink).unwrap_or(false),
         outbound_downlink: stats.map(|s| s.outbound_downlink).unwrap_or(false),
+        // Rust proto 当前 SystemPolicy 仅暴露 stats，buffer 字段未生成。
+        // 默认 512 KiB 与 Go System{Buffer: defaultBufferPolicy()} 对齐。
+        buffer: BufferPolicy::default(),
     }
 }
 

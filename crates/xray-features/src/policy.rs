@@ -9,8 +9,12 @@ use crate::Feature;
 /// Feature type identifier for Policy.
 pub const FEATURE_POLICY: &str = "policy";
 
-/// Default handshake timeout (5 seconds).
-pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default handshake timeout (60 seconds).
+///
+/// 对应 Go `features/policy/policy.go:118 SessionDefault().Timeouts.Handshake`（60s）；
+/// 注释解释 "Align Handshake timeout with nginx client_header_timeout so that this
+/// value will not indicate server identity"。Rust 之前误写为 5s，偏离 Go。
+pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Default connection idle timeout (5 minutes).
 ///
@@ -87,7 +91,6 @@ impl Default for TimeoutPolicy {
     }
 }
 
-/// Statistics policy.
 ///
 /// Corresponds to Go's `features/policy.StatsPolicy`.
 #[derive(Debug, Clone)]
@@ -119,7 +122,7 @@ impl Default for StatsPolicy {
 /// Buffer policy for connection buffering.
 ///
 /// Corresponds to Go's `features/policy.BufferPolicy`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BufferPolicy {
     /// Connection buffer size.
     pub connection: usize,
@@ -136,19 +139,22 @@ impl Default for BufferPolicy {
     }
 }
 
-/// System-level statistics policy.
+/// System-level policy.
 ///
-/// Corresponds to Go's `features/policy.SystemStats`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// 对应 Go `features/policy.System = SystemStats + Buffer`：包含全局 stats 与 buffer 配置。
+/// Rust 之前只承载 stats 子结构，缺 buffer；现在补齐以对齐 Go System 结构（policy.go:52-56）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SystemStats {
-    /// Whether to enable stat counter for uplink traffic in inbound handlers.
+    /// 是否开启 inbound uplink/downlink 流量统计
+    ///（对应 Go `System.Stats.Inbound{Uplink,Downlink}`）。
     pub inbound_uplink: bool,
-    /// Whether to enable stat counter for downlink traffic in inbound handlers.
     pub inbound_downlink: bool,
-    /// Whether to enable stat counter for uplink traffic in outbound handlers.
+    /// 是否开启 outbound uplink/downlink 流量统计
+    ///（对应 Go `System.Stats.Outbound{Uplink,Downlink}`）。
     pub outbound_uplink: bool,
-    /// Whether to enable stat counter for downlink traffic in outbound handlers.
     pub outbound_downlink: bool,
+    /// 系统级连接缓冲策略（对应 Go `System.Buffer`）。
+    pub buffer: BufferPolicy,
 }
 
 /// Policy manager trait.
@@ -219,11 +225,12 @@ mod tests {
         assert!(!s.user_online);
     }
 
-
     #[test]
     fn test_default_timeout_policy() {
+        // 对齐 Go features/policy/policy.go:117-122 SessionDefault:
+        // Handshake=60s, ConnectionIdle=300s, UplinkOnly=1s, DownlinkOnly=1s
         let timeout = TimeoutPolicy::default();
-        assert_eq!(timeout.handshake, Duration::from_secs(5));
+        assert_eq!(timeout.handshake, Duration::from_secs(60));
         assert_eq!(timeout.connection_idle, Duration::from_secs(300));
         assert_eq!(timeout.uplink_only, Duration::from_secs(1));
         assert_eq!(timeout.downlink_only, Duration::from_secs(1));
@@ -269,9 +276,18 @@ mod tests {
     }
 
     #[test]
-    fn test_mock_policy_manager() {
-        let manager = MockPolicyManager;
-        let policy = manager.policy_for_level(0);
-        assert_eq!(policy.timeout.handshake, DEFAULT_HANDSHAKE_TIMEOUT);
+    fn test_system_stats_buffer_default_aligns_go_default() {
+        // 对齐 Go features/policy/policy.go:52-56 System{Buffer: defaultBufferPolicy()}
+        // 及 defaultBufferPolicy() = Buffer{PerConnection: 512 * 1024}（policy.go:108-112）。
+        // Rust proto 当前 SystemPolicy 未暴露 buffer 字段，所以 SystemStats.buffer 走
+        // BufferPolicy::default()=512 KiB。
+        let s = SystemStats::default();
+        assert_eq!(s.buffer.connection, DEFAULT_BUFFER_CONNECTION);
+        assert_eq!(s.buffer.connection, 512 * 1024);
+        assert_eq!(s.buffer.write, DEFAULT_BUFFER_WRITE);
+        // 同时验证 stats 子结构仍是 default（与原行为兼容）
+        assert!(!s.inbound_uplink);
+        assert!(!s.outbound_downlink);
     }
 }
+

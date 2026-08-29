@@ -51,16 +51,22 @@ impl Manager {
 impl PolicyManager for Manager {
     /// 按 level 查询运行时策略；找不到时返回 `Policy::default()`。
     ///
-    /// 对应 Go `(*Instance).ForLevel(level)`。
+    /// 对应 Go `(*Instance).ForLevel(level)` + `DefaultManager.ForLevel`：
+    /// - 默认返回 SessionDefault（Handshake=60s, ConnectionIdle=300s ...）
+    /// - level==1 强制 ConnectionIdle=600s（Go `default.go:18-20` 特判）
     fn policy_for_level(&self, level: u32) -> Policy {
-        self.levels.get(&level).cloned().unwrap_or_default()
+        let mut p = self.levels.get(&level).cloned().unwrap_or_default();
+        if level == 1 {
+            p.timeout.connection_idle = std::time::Duration::from_secs(600);
+        }
+        p
     }
 
     /// 查询系统级统计策略。
     ///
     /// 对应 Go `(*Instance).ForSystem()`。
     fn for_system(&self) -> SystemStats {
-        self.system
+        self.system.clone()
     }
 }
 
@@ -220,5 +226,26 @@ mod tests {
         assert!(p.stats.user_online);
         assert!(!p.stats.user_uplink);
         assert!(!p.stats.user_downlink);
+    }
+    #[test]
+    fn manager_level_1_conn_idle_promoted_to_600s() {
+        // 对齐 Go features/policy/default.go:18-20：level==1 时 ConnectionIdle 强制为 600s
+        // （覆盖 SessionDefault 的 300s）。其它字段保持默认。
+        let m = Manager::new(Config::default()).unwrap();
+        let p = m.policy_for_level(1);
+        assert_eq!(p.timeout.connection_idle, std::time::Duration::from_secs(600));
+        // 其他超时仍是 SessionDefault 值
+        assert_eq!(p.timeout.handshake, std::time::Duration::from_secs(60));
+        assert_eq!(p.timeout.uplink_only, std::time::Duration::from_secs(1));
+        assert_eq!(p.timeout.downlink_only, std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn manager_level_0_keeps_default_300s() {
+        // 对齐 Go SessionDefault().Timeouts.ConnectionIdle=300s（policy.go:119）。
+        let m = Manager::new(Config::default()).unwrap();
+        let p = m.policy_for_level(0);
+        assert_eq!(p.timeout.connection_idle, std::time::Duration::from_secs(300));
+        assert_eq!(p.timeout.handshake, std::time::Duration::from_secs(60));
     }
 }
