@@ -80,6 +80,13 @@ pub enum VmessError {
     #[error("invalid user: {0}")]
     InvalidUser(String),
 
+    /// legacy VMess（alterId≠0）不支持——本实现 AEAD-only。
+    ///
+    /// Go v26 已整体删除 alterId（proto/JSON 全无此字段），legacy 请求在服务端
+    /// 自然死于 "invalid user"；Rust 保留 alterId 兼容字段但在配置层显式拒绝。
+    #[error("legacy VMess (alterId={0}) is not supported, this build is AEAD-only")]
+    UnsupportedLegacyAlterId(i64),
+
     /// padding 读取失败。
     #[error("failed to read padding")]
     ReadPaddingFailed,
@@ -203,5 +210,12 @@ mod tests {
         let result = Account::decode(buf);
         let err: VmessError = result.unwrap_err().into();
         assert!(matches!(err, VmessError::ProstDecode(_)));
+    }
+
+    #[test]
+    fn display_unsupported_legacy_alter_id() {
+        let err = VmessError::UnsupportedLegacyAlterId(64);
+        let msg = err.to_string();
+        assert!(msg.contains("alterId=64") && msg.contains("AEAD-only"), "got: {msg}");
     }
 }

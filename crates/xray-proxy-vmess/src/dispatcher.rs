@@ -172,6 +172,17 @@ pub fn parse_vmess_config(data: &[u8]) -> Result<VmessOutboundConfig, String> {
         .unwrap_or("auto");
     let level = user.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let email = user.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    // alterId≠0 的 legacy VMess 不支持（AEAD-only）；数字/字符串形式都认
+    // （老配置生成器输出过字符串 alterId）。
+    let alter_id = user
+        .get("alterId")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok())))
+        .unwrap_or(0);
+    if alter_id != 0 {
+        tracing::warn!(alter_id, "vmess outbound: legacy VMess is not supported");
+        return Err(VmessError::UnsupportedLegacyAlterId(alter_id).to_string());
+    }
     Ok(VmessOutboundConfig::new(
         uuid,
         Address::Domain(address.to_string()),
@@ -704,5 +715,45 @@ mod tests {
             ]
         }"#;
         assert!(parse_vmess_config(data.as_bytes()).is_err());
+    }
+
+    /// alterId>0 的 legacy VMess 不支持（AEAD-only，对齐 Go v26 已删 alterId）。
+    #[test]
+    fn parse_vmess_config_alter_id_nonzero_fails() {
+        let data = r#"{
+            "vnext": [{
+                "address": "server.example.com",
+                "port": 8443,
+                "users": [{ "id": "b831381d-6324-4d53-ad4f-8cda48b30811", "alterId": 64 }]
+            }]
+        }"#;
+        let err = parse_vmess_config(data.as_bytes()).unwrap_err();
+        assert!(err.contains("alterId"), "unexpected error: {err}");
+    }
+
+    /// 老配置生成器（v2rayN 等）会输出字符串形式 alterId，同样拒绝。
+    #[test]
+    fn parse_vmess_config_alter_id_string_fails() {
+        let data = r#"{
+            "vnext": [{
+                "address": "server.example.com",
+                "port": 8443,
+                "users": [{ "id": "b831381d-6324-4d53-ad4f-8cda48b30811", "alterId": "64" }]
+            }]
+        }"#;
+        assert!(parse_vmess_config(data.as_bytes()).is_err());
+    }
+
+    /// alterId==0（或缺失）走现有 AEAD 路径。
+    #[test]
+    fn parse_vmess_config_alter_id_zero_ok() {
+        let data = r#"{
+            "vnext": [{
+                "address": "server.example.com",
+                "port": 8443,
+                "users": [{ "id": "b831381d-6324-4d53-ad4f-8cda48b30811", "alterId": 0 }]
+            }]
+        }"#;
+        assert!(parse_vmess_config(data.as_bytes()).is_ok());
     }
 }

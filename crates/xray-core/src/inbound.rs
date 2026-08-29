@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use xray_proto::xray::proxy::vless::Account as VlessProtoAccount;
 use xray_proxy_trojan::{serve_trojan, MemoryAccount as TrojanMemoryAccount, MemoryUser as TrojanMemoryUser, fallback::{Fallback, FallbackPolicy}};
 use xray_proxy_vless::{serve_vless, MemoryAccount as VlessMemoryAccount, MemoryUser as VlessMemoryUser, MemoryValidator as VlessMemoryValidator, Validator as VlessValidator};
-use xray_proxy_vmess::{serve_vmess, MemoryAccount as VmessMemoryAccount, MemoryUser as VmessMemoryUser, TimedUserValidator as VmessTimedUserValidator, Validator as VmessValidator};
+use xray_proxy_vmess::{serve_vmess, MemoryAccount as VmessMemoryAccount, MemoryUser as VmessMemoryUser, TimedUserValidator as VmessTimedUserValidator, Validator as VmessValidator, VmessError};
 use xray_common::uuid::UUID;
 // tdy: http + dokodemo inbound 集成
 use xray_proxy_http::ServerConfig as HttpServerConfig;
@@ -1429,8 +1429,13 @@ async fn serve_reality_vless(
         tokio::spawn(async move {
             match server_tls(stream, &key, &ids, max_diff).await {
                 Ok(RealityServerOutcome::Verified(tls)) => {
-                    if let Err(e) =
-                        xray_proxy_vless::handle_vless_connection(tls, &handler, &validator).await
+                    if let Err(e) = xray_proxy_vless::handle_vless_connection(
+                        tls,
+                        &handler,
+                        &validator,
+                        None, // VlessInboundOptions（mux/reverse）未接入生产 wiring
+                    )
+                    .await
                     {
                         tracing::debug!(error = %e, "reality vless connection ended with error");
                     }
@@ -1523,7 +1528,7 @@ async fn spawn_one_inbound(
                 let fallbacks = build_vless_fallbacks(&ib.entry.data);
                 tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_count(), tls = tls.is_some(), fallbacks = fallbacks.as_ref().map_or(0, |f| f.len()), "vless inbound listening");
                 Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                    serve_vless(listener, ohm, validator, tls, fallbacks).await
+                    serve_vless(listener, ohm, validator, tls, fallbacks, None).await
                 })))
             }
         }
@@ -1979,7 +1984,9 @@ fn parse_dokodemo_settings(data: &[u8]) -> std::io::Result<DokodemoInboundSettin
 /// 从 inbound entry.data（JSON）解析 vmess clients → TimedUserValidator。
 ///
 /// JSON 格式：`{"clients":[{"id":"uuid","level":0,"alterId":0,"email":""}]}`。
-/// 现代 VMess (AEAD) 不用 alterId，忽略该字段。`id` 解析为 `UUID` → `MemoryAccount::new(uuid)`。
+/// 现代 VMess (AEAD) 不用 alterId：Go v26 已删除该字段，legacy 请求在服务端死于
+/// "invalid user"。本实现保留兼容字段但 alterId≠0 直接拒绝（fail-fast），
+/// 不静默忽略。`id` 解析为 `UUID` → `MemoryAccount::new(uuid)`。
 fn build_vmess_validator(data: &[u8]) -> std::io::Result<std::sync::Arc<VmessTimedUserValidator>> {
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("vmess inbound settings JSON: {e}")))?;
@@ -1995,6 +2002,17 @@ fn build_vmess_validator(data: &[u8]) -> std::io::Result<std::sync::Arc<VmessTim
             let id = c.get("id").and_then(|x| x.as_str()).unwrap_or("");
             let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let level = c.get("level").and_then(|x| x.as_u64()).unwrap_or(u64::from(default_level)) as u32;
+            // alterId≠0 = legacy VMess 意图，AEAD-only 实现直接拒绝（数字/字符串都认）。
+            let alter_id = c
+                .get("alterId")
+                .and_then(|x| x.as_i64().or_else(|| x.as_str().and_then(|s| s.parse::<i64>().ok())))
+                .unwrap_or(0);
+            if alter_id != 0 {
+                tracing::warn!(alter_id, id, "vmess inbound: legacy VMess is not supported");
+                return Err(std::io::Error::other(
+                    VmessError::UnsupportedLegacyAlterId(alter_id).to_string(),
+                ));
+            }
             let uuid = UUID::parse(id)
                 .ok_or_else(|| std::io::Error::other(format!("vmess invalid uuid: {id}")))?;
             let account = VmessMemoryAccount::new(uuid);
@@ -3800,6 +3818,42 @@ mod tests {
             serde_json::json!({ "clients": [{ "id": "this-id-is-longer-than-thirty-bytes!!" }] });
         let data = serde_json::to_vec(&settings).unwrap();
         assert!(super::build_vmess_validator(&data).is_err());
+    }
+
+    /// alterId>0 的 legacy VMess 不支持（AEAD-only）：启动即报错，不静默忽略。
+    #[test]
+    fn build_vmess_validator_alter_id_nonzero_fails() {
+        let settings = serde_json::json!({
+            "clients": [{ "id": "66ad4540-b58c-4ad2-9926-ea63445a9b57", "alterId": 64 }]
+        });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let err = match super::build_vmess_validator(&data) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("alterId=64 should be rejected"),
+        };
+        assert!(err.contains("alterId"), "unexpected error: {err}");
+    }
+
+    /// 字符串形式 alterId（老配置生成器输出）同样拒绝。
+    #[test]
+    fn build_vmess_validator_alter_id_string_fails() {
+        let settings = serde_json::json!({
+            "clients": [{ "id": "66ad4540-b58c-4ad2-9926-ea63445a9b57", "alterId": "64" }]
+        });
+        let data = serde_json::to_vec(&settings).unwrap();
+        assert!(super::build_vmess_validator(&data).is_err());
+    }
+
+    /// alterId==0 走现有 AEAD 路径，validator 正常构建。
+    #[test]
+    fn build_vmess_validator_alter_id_zero_ok() {
+        let settings = serde_json::json!({
+            "clients": [{ "id": "66ad4540-b58c-4ad2-9926-ea63445a9b57", "alterId": 0 }]
+        });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let validator = super::build_vmess_validator(&data).unwrap();
+        use xray_proxy_vmess::Validator as VmessValidatorTrait;
+        assert_eq!(VmessValidatorTrait::count(&*validator), 1);
     }
 
     #[test]
