@@ -20,6 +20,11 @@ use crate::session::TransferType;
 const STREAM_CHUNK_SIZE: usize = 8 * 1024;
 
 /// Mux 帧写入器
+///
+/// `global_id` 用 `Option<[u8;8]>` 表达 Go 端 `xudp.GetGlobalID` 在 cone=false
+/// 或非 UDP inbound 时返回的全零值（Go 服务端 `if meta.GlobalID != [8]byte{}`
+/// 短路跳过 XUDP 路径）。Rust 旧版恒设 `[0;8]`，UDP dest 帧被服务端误判走 XUDP
+/// 路径丢弃内联 data。Option 化后 [0;8] → None → 仅在显式传入非零时下发。
 pub struct MuxWriter {
     dest: Option<Destination>,
     writer: BufferedWriter,
@@ -27,61 +32,117 @@ pub struct MuxWriter {
     followup: bool,
     has_error: bool,
     transfer_type: TransferType,
-    global_id: [u8; 8],
+    global_id: Option<[u8; 8]>,
 }
 
 impl MuxWriter {
-    /// 创建新的客户端写入器
+    /// 创建新的客户端写入器。
+    ///
+    /// `global_id`：UDP 会话源追踪的 8 字节标识，由 `xudp::global_id(&GlobalIdInput)`
+    /// 计算；非 UDP 场景或 cone=false 时传 `None`。
     pub fn new(
         id: u16,
         dest: Destination,
         writer: Box<dyn Writer>,
         transfer_type: TransferType,
-        global_id: [u8; 8],
+        global_id: Option<[u8; 8]>,
     ) -> Self {
-        Self { id, dest: Some(dest), writer: BufferedWriter::new(writer), followup: false, has_error: false, transfer_type, global_id }
+        Self {
+            id,
+            dest: Some(dest),
+            writer: BufferedWriter::new(writer),
+            followup: false,
+            has_error: false,
+            transfer_type,
+            global_id,
+        }
     }
 
-    /// 创建新的响应写入器
-    pub fn new_response_writer(id: u16, writer: Box<dyn Writer>, transfer_type: TransferType) -> Self {
-        Self { id, dest: None, writer: BufferedWriter::new(writer), followup: true, has_error: false, transfer_type, global_id: [0u8; 8] }
+    /// 创建新的响应写入器（服务端从 carrier 写到客户端方向）。
+    pub fn new_response_writer(
+        id: u16,
+        writer: Box<dyn Writer>,
+        transfer_type: TransferType,
+    ) -> Self {
+        Self {
+            id,
+            dest: None,
+            writer: BufferedWriter::new(writer),
+            followup: true,
+            has_error: false,
+            transfer_type,
+            global_id: None,
+        }
+    }
+
+    /// 设置全局 ID（用于 UDP 关联会话复用 packet session）。
+    pub fn set_global_id(&mut self, id: [u8; 8]) {
+        self.global_id = Some(id);
     }
 
     /// 获取下一帧的元数据
     fn get_next_frame_meta(&mut self) -> FrameMetadata {
-        let status = if self.followup { SessionStatus::Keep } else { self.followup = true; SessionStatus::New };
+        let status = if self.followup {
+            SessionStatus::Keep
+        } else {
+            self.followup = true;
+            SessionStatus::New
+        };
         let mut meta = FrameMetadata::new(self.id, status, Bitmask::default());
-        if let Some(ref dest) = self.dest { meta.set_target(dest.clone()); }
-        meta.set_global_id(self.global_id);
+        if let Some(ref dest) = self.dest {
+            meta.set_target(dest.clone());
+        }
+        if let Some(gid) = self.global_id {
+            meta.set_global_id(gid);
+        }
         meta
     }
-
     /// 仅写入元数据帧
+    ///
+    /// 小于缓冲区半容量的数据帧会被 `BufferedWriter` 滞留——每次写入后
+    /// `flush()`，避免首包/小包滞留 carrier 队列（Go 等价 `buf.Writer` 直透）。
     async fn write_meta_only(&mut self) -> Result<(), MuxError> {
         let meta = self.get_next_frame_meta();
         let mut vec = Vec::new();
-        meta.write_to(&mut vec).map_err(|e| MuxError::Io(format!("meta: {:?}", e)))?;
+        meta.write_to(&mut vec)
+            .map_err(|e| MuxError::Io(format!("meta: {:?}", e)))?;
         let mb = MultiBuffer::from_buffer(Buffer::from_vec(vec));
-        self.writer.write_multi_buffer_impl(mb).await
-            .map_err(|e| MuxError::Io(format!("write: {:?}", e)))
+        self.writer
+            .write_multi_buffer_impl(mb)
+            .await
+            .map_err(|e| MuxError::Io(format!("write: {:?}", e)))?;
+        self.writer
+            .flush()
+            .await
+            .map_err(|e| MuxError::Io(format!("flush: {:?}", e)))
     }
 
-    /// 写入元数据+数据帧
+    /// 写入元数据+数据帧；写入后 flush（详见 [`Self::write_meta_only`]）。
     async fn write_data(&mut self, data: MultiBuffer) -> Result<(), MuxError> {
         let mut meta = self.get_next_frame_meta();
         meta.set_option(OPTION_DATA);
-        write_meta_with_frame(&mut self.writer, meta, data).await
+        write_meta_with_frame(&mut self.writer, meta, data).await?;
+        self.writer
+            .flush()
+            .await
+            .map_err(|e| MuxError::Io(format!("flush: {:?}", e)))
     }
 
     /// 写入 MultiBuffer 数据
     pub async fn write(&mut self, mut mb: MultiBuffer) -> Result<(), MuxError> {
-        if mb.is_empty() { return self.write_meta_only().await; }
+        if mb.is_empty() {
+            return self.write_meta_only().await;
+        }
         while !mb.is_empty() {
             let chunk = if self.transfer_type == TransferType::Stream {
                 mb.split_size(STREAM_CHUNK_SIZE)
             } else {
                 match mb.split_first() {
-                    Some(b) => { let mut c = MultiBuffer::new(); c.push(b); c }
+                    Some(b) => {
+                        let mut c = MultiBuffer::new();
+                        c.push(b);
+                        c
+                    }
                     None => break,
                 }
             };
@@ -93,20 +154,39 @@ impl MuxWriter {
     /// 关闭写入器，发送 End 帧
     pub async fn close(&mut self) -> Result<(), MuxError> {
         let mut option = Bitmask::default();
-        if self.has_error { option.set(OPTION_ERROR); }
+        if self.has_error {
+            option.set(OPTION_ERROR);
+        }
         let meta = FrameMetadata::new(self.id, SessionStatus::End, option);
         let mut vec = Vec::new();
-        meta.write_to(&mut vec).map_err(|e| MuxError::Io(format!("close meta: {:?}", e)))?;
+        meta.write_to(&mut vec)
+            .map_err(|e| MuxError::Io(format!("close meta: {:?}", e)))?;
         let mb = MultiBuffer::from_buffer(Buffer::from_vec(vec));
-        self.writer.write_multi_buffer_impl(mb).await
-            .map_err(|e| MuxError::Io(format!("close write: {:?}", e)))
+        self.writer
+            .write_multi_buffer_impl(mb)
+            .await
+            .map_err(|e| MuxError::Io(format!("close write: {:?}", e)))?;
+        self.writer
+            .flush()
+            .await
+            .map_err(|e| MuxError::Io(format!("close flush: {:?}", e)))
     }
 
-    pub fn set_error(&mut self) { self.has_error = true; }
-    pub fn id(&self) -> u16 { self.id }
-    pub fn transfer_type(&self) -> TransferType { self.transfer_type }
-    pub fn is_followup(&self) -> bool { self.followup }
-    pub fn has_error(&self) -> bool { self.has_error }
+    pub fn set_error(&mut self) {
+        self.has_error = true;
+    }
+    pub fn id(&self) -> u16 {
+        self.id
+    }
+    pub fn transfer_type(&self) -> TransferType {
+        self.transfer_type
+    }
+    pub fn is_followup(&self) -> bool {
+        self.followup
+    }
+    pub fn has_error(&self) -> bool {
+        self.has_error
+    }
 }
 
 /// 写入元数据+数据帧到底层 Writer
@@ -187,7 +267,7 @@ mod tests {
 
     fn create_mux_writer(tt: TransferType) -> MuxWriter {
         let w = new_writer(Cursor::new(Vec::<u8>::new()));
-        MuxWriter::new(1u16, make_tcp_dest(), w, tt, [0u8; 8])
+        MuxWriter::new(1u16, make_tcp_dest(), w, tt, None)
     }
 
     fn create_response_writer(tt: TransferType) -> MuxWriter {

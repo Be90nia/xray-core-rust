@@ -376,7 +376,7 @@ impl ClientWorker {
             dest,
             Box::new(SharedWriter::new(link_writer)),
             transfer_type,
-            [0u8; 8],
+            None,
         );
 
         let mut done = session.done_receiver();

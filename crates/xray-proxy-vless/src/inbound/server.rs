@@ -47,10 +47,15 @@ use crate::validator::Validator;
 pub struct VlessInboundOptions {
     /// 启用 Mux 协议识别（仅识别首字节 0xFF；完整 mux server 协议不在本批次范围）。
     pub enable_mux: bool,
-    /// 启用 Reverse 协议接入（需要 `reverse_registry` 配合）。
+    /// 启用 Reverse 协议接入（需要 `reverse_registry` + `reverse_ohm` 配合：
+    /// inbound 经 `reverse_registry` 查 `PortalConfig.tag`，再由 `reverse_ohm`
+    /// 解析到 `PortalOutbound` handler 派发；Go `inbound.go:625-630` 的 `GetReverse`+
+    /// `r.GetOutboundOverride` 语义）。
     pub enable_reverse: bool,
     /// Reverse 注册表（`enable_reverse=true` 时必填）。
     pub reverse_registry: Option<Arc<crate::inbound::reverse::ReverseRegistry>>,
+    /// Reverse 解析用的出口管理器引用：Portal tag → `PortalOutbound` 查找。
+    pub reverse_ohm: Option<Arc<SimpleOhm>>,
 }
 
 /// VLESS inbound 服务入口。
@@ -495,14 +500,16 @@ where
     Ok(())
 }
 
-/// Reverse（Rvs）命令 relay：Portal 注册表查找 → dispatch。
-///
-/// 对应 Go `inbound.go:625-630` 的 `h.GetReverse(account) → r.NewMux(...)`。
-/// 本批次范围：仅注册表查找 + dispatch（Portal 的 mux client worker 完整实现
-/// 不在本批次）。若 feature flag 未启用或注册表缺失，维持 warn+close。
+/// Reverse（Rvs）命令 relay：Portal 注册表查找 → ohm 解析 PortalOutbound →
+/// dispatch。 对应 Go `inbound.go:625-630` 的 `h.GetReverse(account) → r.NewMux(...)`：
+/// inbound 解析到用户级别 portal 配置 → Reverse feature 找到对应 PortalOutbound
+/// → 由 PortalOutbound 在该出站槽上跑 mux carrier 桥接。 本批次完成接线层：
+/// linker 经 ReverseRegistry 查 tag，再经 `reverse_ohm` 取 handler，dispatch 入站
+/// link。Portal mux client worker 完整 mux 客户端由 [`crate::outbound::reverse`] +
+/// `xray-app-reverse::worker::PortalWorker` 接管（不在本批次）。
 async fn handle_reverse_relay<R, W>(
-    _reader: R,
-    _writer: W,
+    reader: R,
+    writer: W,
     decoded: &crate::encoding::server::DecodedRequest,
     _handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,
     options: Option<&VlessInboundOptions>,
@@ -521,38 +528,54 @@ where
         return Ok(());
     }
 
-    let registry = match opts.and_then(|o| o.reverse_registry.as_ref()) {
-        Some(r) => r,
-        None => {
-            tracing::warn!("vless Reverse enabled but no registry configured");
-            return Ok(());
-        }
-    };
+    let registry = opts
+        .and_then(|o| o.reverse_registry.as_ref())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "vless Reverse enabled but no registry configured")
+        })?;
+    let ohm: Arc<SimpleOhm> = opts
+        .and_then(|o| o.reverse_ohm.clone())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "vless Reverse enabled but no reverse_ohm configured")
+        })?;
 
-    // 用户查找：通过 decoded.user（UUID 已校验）
-    let user = match decoded.user.as_ref() {
-        Some(u) => u,
-        None => {
-            tracing::warn!("vless Reverse: decoded user missing");
-            return Ok(());
-        }
-    };
+    // 当前 Rust 端 MemoryAccount 暂无 Reverse.Tag 字段（Reverse 字段在 proto
+    // 转换层尚未启用）。本批次取注册表首条配置作为 portal 绑定（v1.rvs.cool
+    // 默认值由 PortalConfig::new 提供，与 Go 端默认值一致）。
+    let _ = &decoded.user; // 保留供后续按 account.Reverse.Tag 路由
+    let portal_tag = registry
+        .tags()
+        .first()
+        .cloned()
+        .ok_or_else(|| {
+            std::io::Error::other("vless Reverse registry empty")
+        })?;
+    let portal_cfg = registry.get_reverse(&portal_tag).map_err(|e| {
+        std::io::Error::other(format!("vless Reverse get_reverse: {}", e))
+    })?;
 
-    // Portal 查找：Go 端 account.Reverse.Tag → outbound tag → Reverse handler
-    // 当前 Rust 端 MemoryAccount 暂无 Reverse Tag 字段（Reverse 字段在 proto
-    // 转换层尚未启用）；本批次预留 registry 接口调用，命中即 OK。
-    let _ = registry; // 抑制 unused warning
-    let _ = user;
+    let portal_handler = ohm.get_handler(&portal_cfg.tag).ok_or_else(|| {
+        std::io::Error::other(format!(
+            "vless Reverse portal handler not registered for tag={}",
+            portal_cfg.tag
+        ))
+    })?;
 
-    // ponytail: Reverse 完整 mux client worker 在另外的 issue 实现（见
-    // inbound/reverse.rs 数据结构）。当前仅做注册表存在性检查 + warn 占位，
-    // 真正的 link → mux.ClientWorker → PortalWorker 桥接在后续 batch。
-    tracing::debug!(user = %user.email, "vless Reverse: registry lookup stub");
+    // Reverse destination: domain=portal_cfg.domain（默认 v1.rvs.cool），network=TCP
+    let dest = Destination::new(
+        xray_common::net::address::Address::Domain(portal_cfg.domain.clone()),
+        Port::new(0),
+        Network::TCP,
+    );
+    let link = Link::new(new_reader(reader), new_writer(writer));
+    tracing::debug!(
+        user = decoded.user.as_ref().map(|u| u.email.as_str()).unwrap_or("?"),
+        portal_tag = %portal_cfg.tag,
+        "vless Reverse: dispatch to PortalOutbound via ohm"
+    );
+    let _ = portal_handler.dispatch(&dest, link).await;
     Ok(())
 }
-
-/// 处理单个 VLESS 连接：decode → 按 command 分派。
-/// 与 `handle_connection_with_fallback` 区别：本函数不做 first 预读和 fallback
 /// 路由（直接 decode 整个 stream）。Command 分派由 `finish_vless_dispatch` 承担。
 pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: S,
@@ -1067,6 +1090,7 @@ mod tests {
             enable_mux: true,
             enable_reverse: false,
             reverse_registry: None,
+            reverse_ohm: None,
         };
         tokio::spawn(async move {
             let _ = serve_vless(
@@ -1129,6 +1153,7 @@ mod tests {
             enable_mux: true,
             enable_reverse: false,
             reverse_registry: None,
+            reverse_ohm: None,
         };
         tokio::spawn(async move {
             let _ = serve_vless(
@@ -1175,6 +1200,7 @@ mod tests {
             enable_mux: false,
             enable_reverse: false,
             reverse_registry: None,
+            reverse_ohm: None,
         };
         tokio::spawn(async move {
             let _ = serve_vless(
@@ -1206,7 +1232,13 @@ mod tests {
         let capture = std::sync::Arc::new(CaptureDispatchHandler::new());
         let capture_for_ohm: Arc<dyn xray_app_dispatcher::DispatchHandler> = capture.clone();
         let ohm = Arc::new(SimpleOhm::new());
-        ohm.set_default(capture_for_ohm);
+        ohm.set_default(Arc::clone(&capture_for_ohm));
+        // 注册 portal-tag 处 portal handler，验证 reverse wiring 走 ohm.get_handler
+        // → PortalOutbound 路径（call_count>0 即证明接线生效）。
+        ohm.add(
+            "portal-tag",
+            Arc::clone(&capture) as Arc<dyn xray_app_dispatcher::DispatchHandler>,
+        );
 
         let (uuid, validator) = make_validator_with_user();
         let vless_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1226,6 +1258,7 @@ mod tests {
             enable_mux: false,
             enable_reverse: true,
             reverse_registry: Some(Arc::clone(&registry)),
+            reverse_ohm: Some(Arc::clone(&ohm_clone)),
         };
         tokio::spawn(async move {
             let _ = serve_vless(

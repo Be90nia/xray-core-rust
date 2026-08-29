@@ -308,12 +308,12 @@ mod tests {
             assert_eq!(buf, [i]);
         }
 
+
         // 等待可能的额外 accept 注册（不应有）。
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         assert_eq!(tcp_count.load(Ordering::SeqCst), 1, "single TCP for all substreams");
     }
 
-    /// echo 回调：读什么写什么。
     async fn echo_fn(sock: MuxStream) {
         let (mut rd, mut wr) = tokio::io::split(sock);
         tokio::io::copy(&mut rd, &mut wr).await.ok();
