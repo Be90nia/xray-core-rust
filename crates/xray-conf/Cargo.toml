@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
+parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -16,4 +17,3 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-parking_lot = { workspace = true }

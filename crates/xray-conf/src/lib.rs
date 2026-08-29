@@ -25,14 +25,15 @@
 //! let cfg: Config = load_str(Format::Json, json).unwrap();
 //! assert_eq!(cfg.inbound_count(), 1);
 //! ```
-
 pub mod built;
 pub mod app_config;
 pub mod common;
 pub mod confloader;
 pub mod config;
 pub mod error;
+pub mod init;
 pub mod json;
+pub mod lint;
 pub mod toml_config;
 pub mod vformat;
 pub mod yaml;
