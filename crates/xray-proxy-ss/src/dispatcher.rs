@@ -32,6 +32,7 @@ use xray_xudp::packet::{PacketError, PacketReader, PacketWriter};
 
 use crate::client::Client;
 use crate::config::MemoryAccount;
+use crate::ss2022::UdpOverTcpConfig;
 use crate::protocol::{decode_udp_packet, encode_udp_packet};
 use crate::stream::SSStream;
 use crate::validator::{MemoryUser, Validator};
@@ -207,6 +208,8 @@ pub struct SsOutboundConfig {
     pub email: String,
     /// SS-2022 出站参数（method 命中 2022-blake3-* 时 Some，account 字段不用于该路径）。
     pub ss2022: Option<Ss2022DialParams>,
+    /// UDP-over-TCP 配置（仅 SS-2022 路径填充；Go 旧 AEAD ClientConfig 无 UoT 字段）。
+    pub udp_over_tcp: UdpOverTcpConfig,
 }
 
 /// SS-2022 出站拨号参数（对应 Go `shadowsocks_2022.ClientConfig{Method, Key}`）。
@@ -230,6 +233,7 @@ impl SsOutboundConfig {
             level: 0,
             email: String::new(),
             ss2022: None,
+            udp_over_tcp: UdpOverTcpConfig::default(),
         }
     }
 
@@ -251,6 +255,13 @@ impl SsOutboundConfig {
     #[must_use]
     pub fn with_ss2022(mut self, params: Ss2022DialParams) -> Self {
         self.ss2022 = Some(params);
+        self
+    }
+
+    /// 设置 UDP-over-TCP 配置（builder 风格）。
+    #[must_use]
+    pub fn with_udp_over_tcp(mut self, cfg: UdpOverTcpConfig) -> Self {
+        self.udp_over_tcp = cfg;
         self
     }
 }
@@ -289,6 +300,14 @@ pub fn parse_ss_config(data: &[u8]) -> Result<SsOutboundConfig, String> {
         let port = u16::try_from(port).map_err(|_| "port out of range")?;
         let level = first.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         let email = first.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        // uot/uotVersion → UdpOverTcpConfig（Go shadowsocks.go:243-244，零值 false/0）。
+        let uot_cfg = UdpOverTcpConfig {
+            enabled: first.get("uot").and_then(|v| v.as_bool()).unwrap_or(false),
+            version: first
+                .get("uotVersion")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as u32,
+        };
         let (psk_b64, identity_psk_b64) = match password.split(':').collect::<Vec<_>>()[..] {
             [u] => (u.to_string(), None),
             [i, u, ..] => (u.to_string(), Some(i.to_string())),
@@ -308,6 +327,7 @@ pub fn parse_ss_config(data: &[u8]) -> Result<SsOutboundConfig, String> {
         )
         .with_level(level)
         .with_email(email)
+        .with_udp_over_tcp(uot_cfg)
         .with_ss2022(Ss2022DialParams {
             method: method.to_string(),
             psk_b64,
@@ -787,6 +807,33 @@ mod tests {
     fn parse_ss_config_missing_servers_fails() {
         let result = parse_ss_config(b"{}");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_ss_config_maps_uot_to_udp_over_tcp() {
+        // 2022 路径：uot/uotVersion → UdpOverTcpConfig（Go shadowsocks.go:243-244）。
+        let data = br#"{"servers":[{"address":"ss.example.com","port":8388,
+            "method":"2022-blake3-aes-256-gcm",
+            "password":"aGkgZnJvbSBzczIwMjIgc2VydmVyIHByaW1hcnkga2V5IQ==",
+            "uot":true,"uotVersion":1}]}"#;
+        let cfg = parse_ss_config(data).unwrap();
+        assert!(cfg.udp_over_tcp.enabled);
+        assert_eq!(cfg.udp_over_tcp.version, 1);
+
+        // 缺省 uot → false/0。
+        let data = br#"{"servers":[{"address":"ss.example.com","port":8388,
+            "method":"2022-blake3-aes-256-gcm",
+            "password":"aGkgZnJvbSBzczIwMjIgc2VydmVyIHByaW1hcnkga2V5IQ=="}]}"#;
+        let cfg = parse_ss_config(data).unwrap();
+        assert!(!cfg.udp_over_tcp.enabled);
+        assert_eq!(cfg.udp_over_tcp.version, 0);
+
+        // 旧 AEAD 路径：Go 旧 ClientConfig 无 UoT 字段 → 保持默认。
+        let data = br#"{"servers":[{"address":"ss.example.com","port":8388,
+            "method":"aes-256-gcm","password":"secret","uot":true,"uotVersion":1}]}"#;
+        let cfg = parse_ss_config(data).unwrap();
+        assert!(!cfg.udp_over_tcp.enabled);
+        assert_eq!(cfg.udp_over_tcp.version, 0);
     }
 
     /// `SsConnection`（duplex pump）端到端：客户端 AsyncRead/AsyncWrite → 加密 chunk →

@@ -457,6 +457,383 @@ pub struct ShadowsocksServerTarget {
     pub uot_version: Option<i32>,
 }
 
+// =========================================================================
+// Shadowsocks method 解析与 Build 语义（Go infra/conf/shadowsocks.go）
+// =========================================================================
+
+/// SS method 解析结果，兼作 2022 / 旧 AEAD 分流判定。
+///
+/// 旧 AEAD 5 组对应 Go `cipherFromString`（shadowsocks.go:17-32，`strings.ToLower`
+/// 大小写不敏感 + `aead_*` 别名）；2022 3 方法对应 `shadowaead_2022.List` 精确匹配
+/// （shadowsocks.go:60 `C.Contains` 区分大小写——`"2022-BLAKE3-…"` 不命中 2022
+/// 分支，落入旧 AEAD 解析后报 unknown cipher method）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadowsocksMethod {
+    /// 2022-blake3-aes-128-gcm
+    Ss2022Aes128Gcm,
+    /// 2022-blake3-aes-256-gcm
+    Ss2022Aes256Gcm,
+    /// 2022-blake3-chacha20-poly1305
+    Ss2022ChaCha20Poly1305,
+    /// aes-128-gcm / aead_aes_128_gcm
+    Aes128Gcm,
+    /// aes-256-gcm / aead_aes_256_gcm
+    Aes256Gcm,
+    /// chacha20-poly1305 / aead_chacha20_poly1305 / chacha20-ietf-poly1305
+    ChaCha20Poly1305,
+    /// xchacha20-poly1305 / aead_xchacha20_poly1305 / xchacha20-ietf-poly1305
+    /// （conf 层识别；独立 cipher 实装为 non-goal）
+    XChaCha20Poly1305,
+    /// none / plain
+    None,
+}
+
+impl ShadowsocksMethod {
+    /// 解析 method 字符串。未知返回 `None`（对应 Go `CipherType_UNKNOWN` 哨兵，
+    /// 由调用方按上下文生成 "unknown/unsupported cipher method" 错误）。
+    #[must_use]
+    pub fn from_method(name: &str) -> Option<Self> {
+        // 2022：精确匹配（Go C.Contains(shadowaead_2022.List, cipher)）。
+        match name {
+            "2022-blake3-aes-128-gcm" => return Some(Self::Ss2022Aes128Gcm),
+            "2022-blake3-aes-256-gcm" => return Some(Self::Ss2022Aes256Gcm),
+            "2022-blake3-chacha20-poly1305" => return Some(Self::Ss2022ChaCha20Poly1305),
+            _ => {}
+        }
+        // 旧 AEAD：小写化匹配（Go cipherFromString）。
+        match name.to_ascii_lowercase().as_str() {
+            "aes-128-gcm" | "aead_aes_128_gcm" => Some(Self::Aes128Gcm),
+            "aes-256-gcm" | "aead_aes_256_gcm" => Some(Self::Aes256Gcm),
+            "chacha20-poly1305" | "aead_chacha20_poly1305" | "chacha20-ietf-poly1305" => {
+                Some(Self::ChaCha20Poly1305)
+            }
+            "xchacha20-poly1305" | "aead_xchacha20_poly1305" | "xchacha20-ietf-poly1305" => {
+                Some(Self::XChaCha20Poly1305)
+            }
+            "none" | "plain" => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    /// 是否 SS-2022 系列。
+    #[must_use]
+    pub fn is_ss2022(self) -> bool {
+        matches!(
+            self,
+            Self::Ss2022Aes128Gcm | Self::Ss2022Aes256Gcm | Self::Ss2022ChaCha20Poly1305
+        )
+    }
+}
+
+/// SS-2022 多用户产物中的用户。对应 Go `shadowsocks_2022.Account{Key}` +
+/// `protocol.User`（shadowsocks.go:144-151）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shadowsocks2022User {
+    /// 用户 PSK（base64）。
+    pub key: String,
+    pub email: String,
+    pub level: u8,
+}
+
+/// 旧 AEAD 产物中的用户。对应 Go `shadowsocks.Account`（shadowsocks.go:72-87）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowsocksAeadUser {
+    pub email: String,
+    pub level: u8,
+    pub password: String,
+    pub cipher: ShadowsocksMethod,
+}
+
+/// [`ShadowsocksInboundSettings::build`] 产物。对应 Go
+/// `ShadowsocksServerConfig.Build()` 的三条输出路径（shadowsocks.go:53-179）；
+/// Relay 分支（:160-178）未实装，命中时显式报错。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ShadowsocksServerBuild {
+    /// Go `shadowsocks_2022.ServerConfig` 单用户（:116-123，不校验 key 非空）。
+    Ss2022Single {
+        method: String,
+        key: String,
+        email: String,
+        network: Option<NetworkList>,
+    },
+    /// Go `shadowsocks_2022.MultiUserServerConfig`（:132-157）。
+    Ss2022MultiUser {
+        method: String,
+        key: String,
+        users: Vec<Shadowsocks2022User>,
+        network: Option<NetworkList>,
+    },
+    /// Go `shadowsocks.ServerConfig` 旧 AEAD（:64-110）。`users` 为空 Vec 对应
+    /// Go `Users` 为非 nil 空切片的边界（:67-68 不进循环、也不落顶层账户）。
+    LegacyAead {
+        users: Vec<ShadowsocksAeadUser>,
+        network: Option<NetworkList>,
+    },
+}
+
+impl ShadowsocksInboundSettings {
+    /// 对应 Go `ShadowsocksServerConfig.Build()`（shadowsocks.go:53-113）+
+    /// `buildShadowsocks2022`（:115-179）。错误文案与 Go 对齐。
+    ///
+    /// # Errors
+    /// - 多用户 2022 非 aes 方法 / 用户带 method / relay（未实装）
+    /// - 旧 AEAD 密码为空、cipher 不支持或未知
+    pub fn build(&self) -> crate::error::Result<ShadowsocksServerBuild> {
+        // Go :56-58：clients 非 nil 覆盖 users（含空切片）。
+        let users = self.clients.as_ref().or(self.users.as_ref()).map(Vec::as_slice);
+        if ShadowsocksMethod::from_method(&self.method).is_some_and(|m| m.is_ss2022()) {
+            match users {
+                None | Some([]) => Ok(ShadowsocksServerBuild::Ss2022Single {
+                    method: self.method.clone(),
+                    key: self.password.clone().unwrap_or_default(),
+                    email: self.email.clone().unwrap_or_default(),
+                    network: self.network.clone(),
+                }),
+                Some(u) => self.build_ss2022_multi(u),
+            }
+        } else {
+            self.build_legacy(users)
+        }
+    }
+
+    /// Go `buildShadowsocks2022` 多用户分支（:125-157；:125-127 空 method 检查在
+    /// Go 不可达——空 method 不会命中 2022 分流——故不复刻）。
+    fn build_ss2022_multi(
+        &self,
+        users: &[ShadowsocksUserConfig],
+    ) -> crate::error::Result<ShadowsocksServerBuild> {
+        // Go :128-130：多用户仅支持 blake3-aes-*-gcm（chacha 被拒）。
+        if !self.method.contains("aes") {
+            return Err(crate::error::ConfError::Invalid(
+                "shadowsocks 2022 (multi-user): only blake3-aes-*-gcm methods are supported"
+                    .into(),
+            ));
+        }
+        // Go :132：users[0].Address 决定 multi vs relay；relay 未实装（non-goal）。
+        if users[0].address.is_some() {
+            return Err(crate::error::ConfError::Invalid(
+                "shadowsocks 2022 (relay): relay server is not supported yet".into(),
+            ));
+        }
+        let mut out = Vec::with_capacity(users.len());
+        for user in users {
+            // Go :141-143：用户级 method 必须为空。
+            if user.method.as_deref().is_some_and(|m| !m.is_empty()) {
+                return Err(crate::error::ConfError::Invalid(
+                    "shadowsocks 2022 (multi-user): users must have empty method".into(),
+                ));
+            }
+            out.push(Shadowsocks2022User {
+                key: user.password.clone().unwrap_or_default(),
+                email: user.email.clone().unwrap_or_default(),
+                level: user.level.unwrap_or(0),
+            });
+        }
+        Ok(ShadowsocksServerBuild::Ss2022MultiUser {
+            method: self.method.clone(),
+            key: self.password.clone().unwrap_or_default(),
+            users: out,
+            network: self.network.clone(),
+        })
+    }
+
+    /// Go 旧 AEAD 分支（:64-110）。
+    fn build_legacy(
+        &self,
+        users: Option<&[ShadowsocksUserConfig]>,
+    ) -> crate::error::Result<ShadowsocksServerBuild> {
+        let network = self.network.clone();
+        match users {
+            Some(u) if !u.is_empty() => {
+                let mut out = Vec::with_capacity(u.len());
+                for user in u {
+                    // Go :76-78：先查密码。
+                    let password = user.password.clone().unwrap_or_default();
+                    if password.is_empty() {
+                        return Err(crate::error::ConfError::Invalid(
+                            "Shadowsocks password is not specified.".into(),
+                        ));
+                    }
+                    // Go :79-82：cipher 必须落在 AES_128_GCM..=XCHACHA20_POLY1305
+                    // 范围（proto 值 5..=8）——NONE=9 越界被拒、UNKNOWN 被拒。
+                    let name = user.method.as_deref().unwrap_or("");
+                    let cipher = ShadowsocksMethod::from_method(name).filter(|c| {
+                        matches!(
+                            c,
+                            ShadowsocksMethod::Aes128Gcm
+                                | ShadowsocksMethod::Aes256Gcm
+                                | ShadowsocksMethod::ChaCha20Poly1305
+                                | ShadowsocksMethod::XChaCha20Poly1305
+                        )
+                    });
+                    let cipher = cipher.ok_or_else(|| {
+                        crate::error::ConfError::Invalid(format!(
+                            "unsupported cipher method: {name}"
+                        ))
+                    })?;
+                    out.push(ShadowsocksAeadUser {
+                        email: user.email.clone().unwrap_or_default(),
+                        level: user.level.unwrap_or(0),
+                        password,
+                        cipher,
+                    });
+                }
+                Ok(ShadowsocksServerBuild::LegacyAead { users: out, network })
+            }
+            // Go :67-68：Users 非 nil 空切片 → 零用户产物（顶层账户不生效）。
+            Some(_) => Ok(ShadowsocksServerBuild::LegacyAead {
+                users: Vec::new(),
+                network,
+            }),
+            None => {
+                let password = self.password.clone().unwrap_or_default();
+                if password.is_empty() {
+                    return Err(crate::error::ConfError::Invalid(
+                        "Shadowsocks password is not specified.".into(),
+                    ));
+                }
+                // Go :102-104：顶层仅拒绝 UNKNOWN（none/plain 合法）。
+                let cipher = ShadowsocksMethod::from_method(&self.method).ok_or_else(|| {
+                    crate::error::ConfError::Invalid(format!(
+                        "unknown cipher method: {}",
+                        self.method
+                    ))
+                })?;
+                Ok(ShadowsocksServerBuild::LegacyAead {
+                    users: vec![ShadowsocksAeadUser {
+                        email: self.email.clone().unwrap_or_default(),
+                        level: self.level.unwrap_or(0),
+                        password,
+                        cipher,
+                    }],
+                    network,
+                })
+            }
+        }
+    }
+}
+
+/// [`ShadowsocksOutboundSettings::build`] 产物。对应 Go
+/// `ShadowsocksClientConfig.Build()`（shadowsocks.go:204-286）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ShadowsocksClientBuild {
+    /// Go `shadowsocks_2022.ClientConfig`（:238-245）。`udp_over_tcp`/`version`
+    /// 即 uot/uotVersion 字段映射落点，可直转运行时 `UdpOverTcpConfig`。
+    Ss2022 {
+        address: Address,
+        port: u16,
+        method: String,
+        key: String,
+        /// Go `ClientConfig.UdpOverTcp`（:243，`json:"uot"`）。
+        udp_over_tcp: bool,
+        /// Go `ClientConfig.UdpOverTcpVersion`（:244，`json:"uotVersion"`）。
+        udp_over_tcp_version: u32,
+    },
+    /// Go `shadowsocks.ClientConfig`（:249-283；Go 该分支不携带 UoT 字段）。
+    LegacyAead {
+        address: Address,
+        port: u16,
+        level: u8,
+        email: String,
+        password: String,
+        cipher: ShadowsocksMethod,
+    },
+}
+
+impl ShadowsocksOutboundSettings {
+    /// 对应 Go `ShadowsocksClientConfig.Build()`。错误文案与 Go 对齐。
+    ///
+    /// # Errors
+    /// - servers 数量 ≠ 1
+    /// - address 缺失 / port 为 0 / password 为空
+    /// - 旧 AEAD cipher 未知
+    pub fn build(&self) -> crate::error::Result<ShadowsocksClientBuild> {
+        // Go :207-220：顶层 address 折叠为单元素 servers（顶层字段优先）。
+        let folded;
+        let servers: &[ShadowsocksServerTarget] = if self.address.is_some() {
+            folded = vec![ShadowsocksServerTarget {
+                address: self.address.clone(),
+                port: self.port.unwrap_or(0),
+                level: self.level,
+                email: self.email.clone(),
+                method: self.method.clone(),
+                password: self.password.clone(),
+                uot: self.uot,
+                uot_version: self.uot_version,
+            }];
+            &folded
+        } else {
+            self.servers.as_deref().unwrap_or(&[])
+        };
+        // Go :221-223：servers 必须恰好 1 个。
+        if servers.len() != 1 {
+            return Err(crate::error::ConfError::Invalid(
+                r#"Shadowsocks settings: "servers" should have one and only one member. Multiple endpoints in "servers" should use multiple Shadowsocks outbounds and routing balancer instead"#
+                    .into(),
+            ));
+        }
+        let server = &servers[0];
+        let method = server.method.clone().unwrap_or_default();
+        // Go :227：2022 分流。
+        if ShadowsocksMethod::from_method(&method).is_some_and(|m| m.is_ss2022()) {
+            // Go :228-236 校验顺序：address → port → password。
+            let address = server.address.clone().ok_or_else(|| {
+                crate::error::ConfError::Invalid(
+                    "Shadowsocks server address is not set.".into(),
+                )
+            })?;
+            if server.port == 0 {
+                return Err(crate::error::ConfError::Invalid(
+                    "Invalid Shadowsocks port.".into(),
+                ));
+            }
+            let key = server.password.clone().unwrap_or_default();
+            if key.is_empty() {
+                return Err(crate::error::ConfError::Invalid(
+                    "Shadowsocks password is not specified.".into(),
+                ));
+            }
+            // Go :243-244：uot/uotVersion → UdpOverTcp 字段映射（int→uint32 环绕语义
+            // 与 Go 一致：负数经 `as u32` 回绕）。
+            return Ok(ShadowsocksClientBuild::Ss2022 {
+                address,
+                port: server.port,
+                method,
+                key,
+                udp_over_tcp: server.uot.unwrap_or(false),
+                udp_over_tcp_version: server.uot_version.unwrap_or(0) as u32,
+            });
+        }
+        // Go :249-283 旧 AEAD（servers==1 时 :251-252 的 multi-server 2022 检查不可达）。
+        let address = server
+            .address
+            .clone()
+            .ok_or_else(|| crate::error::ConfError::Invalid("Shadowsocks server address is not set.".into()))?;
+        if server.port == 0 {
+            return Err(crate::error::ConfError::Invalid(
+                "Invalid Shadowsocks port.".into(),
+            ));
+        }
+        let password = server.password.clone().unwrap_or_default();
+        if password.is_empty() {
+            return Err(crate::error::ConfError::Invalid(
+                "Shadowsocks password is not specified.".into(),
+            ));
+        }
+        let cipher = ShadowsocksMethod::from_method(&method).ok_or_else(|| {
+            crate::error::ConfError::Invalid(format!("unknown cipher method: {method}"))
+        })?;
+        Ok(ShadowsocksClientBuild::LegacyAead {
+            address,
+            port: server.port,
+            level: server.level.unwrap_or(0),
+            email: server.email.clone().unwrap_or_default(),
+            password,
+            cipher,
+        })
+    }
+}
+
 /// SOCKS5 出站 settings。对应 Go `SocksClientConfig`（socks.go:77-85）。
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -959,6 +1336,274 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(typed, OutboundSettings::Freedom(_)));
+    }
+
+    #[test]
+    fn shadowsocks_method_from_name_covers_go_five_groups() {
+        // Go cipherFromString（shadowsocks.go:17-32）5 组 + 大小写不敏感 + 别名。
+        let cases = &[
+            ("aes-128-gcm", ShadowsocksMethod::Aes128Gcm),
+            ("aead_aes_128_gcm", ShadowsocksMethod::Aes128Gcm),
+            ("AES-128-GCM", ShadowsocksMethod::Aes128Gcm),
+            ("aes-256-gcm", ShadowsocksMethod::Aes256Gcm),
+            ("aead_aes_256_gcm", ShadowsocksMethod::Aes256Gcm),
+            ("chacha20-poly1305", ShadowsocksMethod::ChaCha20Poly1305),
+            ("aead_chacha20_poly1305", ShadowsocksMethod::ChaCha20Poly1305),
+            ("chacha20-ietf-poly1305", ShadowsocksMethod::ChaCha20Poly1305),
+            ("xchacha20-poly1305", ShadowsocksMethod::XChaCha20Poly1305),
+            ("aead_xchacha20_poly1305", ShadowsocksMethod::XChaCha20Poly1305),
+            ("none", ShadowsocksMethod::None),
+            ("plain", ShadowsocksMethod::None),
+        ];
+        for (name, want) in cases {
+            assert_eq!(ShadowsocksMethod::from_method(name), Some(*want), "{name}");
+        }
+        // 2022 3 方法精确匹配（shadowaead_2022.List，:60）。
+        assert_eq!(
+            ShadowsocksMethod::from_method("2022-blake3-aes-128-gcm"),
+            Some(ShadowsocksMethod::Ss2022Aes128Gcm)
+        );
+        assert_eq!(
+            ShadowsocksMethod::from_method("2022-blake3-aes-256-gcm"),
+            Some(ShadowsocksMethod::Ss2022Aes256Gcm)
+        );
+        assert_eq!(
+            ShadowsocksMethod::from_method("2022-blake3-chacha20-poly1305"),
+            Some(ShadowsocksMethod::Ss2022ChaCha20Poly1305)
+        );
+        // 2022 名大小写敏感：大写变体不命中 2022，落入旧 AEAD 解析失败（UNKNOWN）。
+        assert_eq!(ShadowsocksMethod::from_method("2022-BLAKE3-AES-128-GCM"), None);
+        assert_eq!(ShadowsocksMethod::from_method("rc4-md5"), None);
+        // 分流判定。
+        assert!(ShadowsocksMethod::Ss2022ChaCha20Poly1305.is_ss2022());
+        assert!(!ShadowsocksMethod::Aes256Gcm.is_ss2022());
+    }
+
+    #[test]
+    fn shadowsocks_outbound_uot_uot_version_round_trip() {
+        // servers[0] 携带 uot/uotVersion → Ss2022 产物字段映射（Go :243-244）。
+        let raw = r#"{"servers":[{"address":"ss.example.com","port":8388,
+            "method":"2022-blake3-aes-256-gcm","password":"aGk=",
+            "uot":true,"uotVersion":1}]}"#;
+        let s: ShadowsocksOutboundSettings = serde_json::from_str(raw).unwrap();
+        // serde round-trip 不丢字段。
+        let back = serde_json::to_value(&s).unwrap();
+        assert_eq!(back["servers"][0]["uot"], true);
+        assert_eq!(back["servers"][0]["uotVersion"], 1);
+        match s.build().unwrap() {
+            ShadowsocksClientBuild::Ss2022 {
+                udp_over_tcp,
+                udp_over_tcp_version,
+                ..
+            } => {
+                assert!(udp_over_tcp);
+                assert_eq!(udp_over_tcp_version, 1);
+            }
+            other => panic!("expected Ss2022, got {other:?}"),
+        }
+
+        // 顶层 address 折叠路径（Go :207-220）同样携带 uot。
+        let folded = r#"{"address":"ss.example.com","port":8388,
+            "method":"2022-blake3-aes-256-gcm","password":"aGk=",
+            "uot":true,"uotVersion":2}"#;
+        let s: ShadowsocksOutboundSettings = serde_json::from_str(folded).unwrap();
+        match s.build().unwrap() {
+            ShadowsocksClientBuild::Ss2022 {
+                udp_over_tcp,
+                udp_over_tcp_version,
+                ..
+            } => {
+                assert!(udp_over_tcp);
+                assert_eq!(udp_over_tcp_version, 2);
+            }
+            other => panic!("expected Ss2022, got {other:?}"),
+        }
+
+        // 缺省 uot → false/0（Go 零值）。
+        let plain = r#"{"servers":[{"address":"ss.example.com","port":8388,
+            "method":"2022-blake3-aes-256-gcm","password":"aGk="}]}"#;
+        let s: ShadowsocksOutboundSettings = serde_json::from_str(plain).unwrap();
+        match s.build().unwrap() {
+            ShadowsocksClientBuild::Ss2022 {
+                udp_over_tcp,
+                udp_over_tcp_version,
+                ..
+            } => {
+                assert!(!udp_over_tcp);
+                assert_eq!(udp_over_tcp_version, 0);
+            }
+            other => panic!("expected Ss2022, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shadowsocks_inbound_users_multi_chacha_rejected() {
+        // Go :128-130：多用户仅支持 blake3-aes-*-gcm，chacha 报错。
+        let raw = r#"{"method":"2022-blake3-chacha20-poly1305","password":"aGk=",
+            "users":[{"password":"dXNlcg=="}]}"#;
+        let s: ShadowsocksInboundSettings = serde_json::from_str(raw).unwrap();
+        let err = s.build().unwrap_err().to_string();
+        assert!(
+            err.contains("only blake3-aes-*-gcm methods are supported"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn shadowsocks_inbound_users_multi_aes_builds_multi_user() {
+        // Go :132-157：无 relay address 的多用户 → MultiUserServerConfig。
+        let raw = r#"{"method":"2022-blake3-aes-256-gcm","password":"c2VydmVy",
+            "users":[{"password":"dXNlcjE=","email":"a@b","level":2},
+                     {"password":"dXNlcjI="}]}"#;
+        let s: ShadowsocksInboundSettings = serde_json::from_str(raw).unwrap();
+        match s.build().unwrap() {
+            ShadowsocksServerBuild::Ss2022MultiUser { method, key, users, .. } => {
+                assert_eq!(method, "2022-blake3-aes-256-gcm");
+                assert_eq!(key, "c2VydmVy");
+                assert_eq!(users.len(), 2);
+                assert_eq!(users[0].key, "dXNlcjE=");
+                assert_eq!(users[0].email, "a@b");
+                assert_eq!(users[0].level, 2);
+                assert_eq!(users[1].key, "dXNlcjI=");
+            }
+            other => panic!("expected Ss2022MultiUser, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shadowsocks_inbound_single_2022_and_relay_rejected() {
+        // 无 users → shadowsocks_2022.ServerConfig 单用户（Go :116-123）。
+        let raw = r#"{"method":"2022-blake3-aes-256-gcm","password":"aGk=","email":"s@x"}"#;
+        let s: ShadowsocksInboundSettings = serde_json::from_str(raw).unwrap();
+        match s.build().unwrap() {
+            ShadowsocksServerBuild::Ss2022Single { method, key, email, .. } => {
+                assert_eq!(method, "2022-blake3-aes-256-gcm");
+                assert_eq!(key, "aGk=");
+                assert_eq!(email, "s@x");
+            }
+            other => panic!("expected Ss2022Single, got {other:?}"),
+        }
+        // users[0].address 存在 → relay 分支（non-goal，显式报错）。
+        let relay = r#"{"method":"2022-blake3-aes-256-gcm","password":"aGk=",
+            "users":[{"password":"dXNlcg==","address":"127.0.0.1","port":8389}]}"#;
+        let s: ShadowsocksInboundSettings = serde_json::from_str(relay).unwrap();
+        let err = s.build().unwrap_err().to_string();
+        assert!(err.contains("relay"), "got: {err}");
+        // 多用户用户级 method 必须为空（Go :141-143）。
+        let with_method = r#"{"method":"2022-blake3-aes-256-gcm","password":"aGk=",
+            "users":[{"password":"dXNlcg==","method":"aes-256-gcm"}]}"#;
+        let s: ShadowsocksInboundSettings = serde_json::from_str(with_method).unwrap();
+        let err = s.build().unwrap_err().to_string();
+        assert!(err.contains("users must have empty method"), "got: {err}");
+    }
+
+    #[test]
+    fn shadowsocks_inbound_legacy_top_level_and_per_user() {
+        // 顶层单账户：none/plain 合法（Go :102-104 仅拒 UNKNOWN）。
+        let raw = r#"{"method":"none","password":"p"}"#;
+        let s: ShadowsocksInboundSettings = serde_json::from_str(raw).unwrap();
+        match s.build().unwrap() {
+            ShadowsocksServerBuild::LegacyAead { users, .. } => {
+                assert_eq!(users.len(), 1);
+                assert_eq!(users[0].cipher, ShadowsocksMethod::None);
+            }
+            other => panic!("expected LegacyAead, got {other:?}"),
+        }
+        // 顶层未知 cipher 报错。
+        let raw = r#"{"method":"rc4-md5","password":"p"}"#;
+        let s: ShadowsocksInboundSettings = serde_json::from_str(raw).unwrap();
+        let err = s.build().unwrap_err().to_string();
+        assert!(err.contains("unknown cipher method"), "got: {err}");
+        // 顶层密码为空报错。
+        let raw = r#"{"method":"aes-256-gcm"}"#;
+        let s: ShadowsocksInboundSettings = serde_json::from_str(raw).unwrap();
+        let err = s.build().unwrap_err().to_string();
+        assert!(err.contains("password is not specified"), "got: {err}");
+
+        // per-user：合法 AEAD（chacha 亦合法，Go 范围 5..=8 含 CHACHA=7）。
+        let raw = r#"{"method":"aes-256-gcm","users":[
+            {"method":"chacha20-poly1305","password":"u1","email":"a@b"},
+            {"method":"aes-128-gcm","password":"u2"}]}"#;
+        let s: ShadowsocksInboundSettings = serde_json::from_str(raw).unwrap();
+        match s.build().unwrap() {
+            ShadowsocksServerBuild::LegacyAead { users, .. } => {
+                assert_eq!(users.len(), 2);
+                assert_eq!(users[0].cipher, ShadowsocksMethod::ChaCha20Poly1305);
+                assert_eq!(users[0].email, "a@b");
+                assert_eq!(users[1].cipher, ShadowsocksMethod::Aes128Gcm);
+            }
+            other => panic!("expected LegacyAead, got {other:?}"),
+        }
+        // per-user none 越界被拒（proto NONE=9 > XCHACHA=8，Go :79-81）。
+        let raw = r#"{"method":"aes-256-gcm","users":[{"method":"none","password":"u"}]}"#;
+        let s: ShadowsocksInboundSettings = serde_json::from_str(raw).unwrap();
+        let err = s.build().unwrap_err().to_string();
+        assert!(err.contains("unsupported cipher method"), "got: {err}");
+        // per-user 密码为空优先于 cipher 检查（Go :76-78）。
+        let raw = r#"{"method":"aes-256-gcm","users":[{"method":"aes-256-gcm"}]}"#;
+        let s: ShadowsocksInboundSettings = serde_json::from_str(raw).unwrap();
+        let err = s.build().unwrap_err().to_string();
+        assert!(err.contains("password is not specified"), "got: {err}");
+
+        // clients 覆盖 users（Go :56-58），含空 clients 压成空 users 的 Go 边界。
+        let raw = r#"{"method":"aes-256-gcm","password":"top",
+            "users":[{"method":"aes-256-gcm","password":"u"}],
+            "clients":[]}"#;
+        let s: ShadowsocksInboundSettings = serde_json::from_str(raw).unwrap();
+        match s.build().unwrap() {
+            ShadowsocksServerBuild::LegacyAead { users, .. } => assert!(users.is_empty()),
+            other => panic!("expected LegacyAead, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shadowsocks_outbound_servers_rules_and_legacy() {
+        // servers ≠ 1 报错（Go :221-223）。
+        let raw = r#"{"servers":[
+            {"address":"a","port":1,"method":"aes-256-gcm","password":"p"},
+            {"address":"b","port":2,"method":"aes-256-gcm","password":"p"}]}"#;
+        let s: ShadowsocksOutboundSettings = serde_json::from_str(raw).unwrap();
+        let err = s.build().unwrap_err().to_string();
+        assert!(err.contains("one and only one member"), "got: {err}");
+        let s: ShadowsocksOutboundSettings = serde_json::from_str("{}").unwrap();
+        assert!(s.build().unwrap_err().to_string().contains("one and only one member"));
+
+        // 旧 AEAD 单 server（Go :249-283，不带 UoT 字段）。
+        let raw = r#"{"servers":[{"address":"ss.example.com","port":8388,
+            "method":"aes-256-gcm","password":"secret","level":3,"email":"a@b"}]}"#;
+        let s: ShadowsocksOutboundSettings = serde_json::from_str(raw).unwrap();
+        match s.build().unwrap() {
+            ShadowsocksClientBuild::LegacyAead {
+                address,
+                port,
+                level,
+                email,
+                password,
+                cipher,
+            } => {
+                assert_eq!(address, Address("ss.example.com".into()));
+                assert_eq!(port, 8388);
+                assert_eq!(level, 3);
+                assert_eq!(email, "a@b");
+                assert_eq!(password, "secret");
+                assert_eq!(cipher, ShadowsocksMethod::Aes256Gcm);
+            }
+            other => panic!("expected LegacyAead, got {other:?}"),
+        }
+        // 旧 AEAD 未知 cipher / 空 password / port 0。
+        let raw = r#"{"servers":[{"address":"a","port":8388,"method":"rc4-md5","password":"p"}]}"#;
+        let s: ShadowsocksOutboundSettings = serde_json::from_str(raw).unwrap();
+        assert!(s.build().unwrap_err().to_string().contains("unknown cipher method"));
+        let raw = r#"{"servers":[{"address":"a","port":8388,"method":"aes-256-gcm"}]}"#;
+        let s: ShadowsocksOutboundSettings = serde_json::from_str(raw).unwrap();
+        assert!(s
+            .build()
+            .unwrap_err()
+            .to_string()
+            .contains("password is not specified"));
+        let raw = r#"{"servers":[{"address":"a","port":0,"method":"aes-256-gcm","password":"p"}]}"#;
+        let s: ShadowsocksOutboundSettings = serde_json::from_str(raw).unwrap();
+        assert!(s.build().unwrap_err().to_string().contains("Invalid Shadowsocks port"));
     }
 }
 
