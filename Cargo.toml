@@ -194,6 +194,9 @@ ocsp-stapler = { version = "0.4", default-features = false, features = ["ring"] 
 # uTLS 指纹伪造（btls = 0x676e67/btls BoringSSL 绑定；提供 GREASE/extension permutation/ECH GREASE/key shares 等 BoringSSL 原生指纹 API；替代 Go uTLS）
 btls = { git = "https://github.com/0x676e67/btls", branch = "main" }
 tokio-btls = { git = "https://github.com/0x676e67/btls", branch = "main" }
+btls-sys = { git = "https://github.com/0x676e67/btls", branch = "main" }
+# btls SslRef ForeignTypeRef trait（from_ptr/as_ptr）
+foreign-types = "0.5"
 
 [patch.crates-io]
 rustls = { git = "https://github.com/Watfaq/rustls.git", branch = "watfaq/0.23.40" }

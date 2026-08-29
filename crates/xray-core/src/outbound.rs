@@ -951,14 +951,12 @@ async fn lookup_for_ip(
     strategy: DomainStrategy,
 ) -> std::result::Result<Vec<std::net::IpAddr>, String> {
     use xray_app_dns::config::IpOption;
-    // Go `PreferIP4()/PreferIP6()`（config.go:110-116）：prefer 字段为 0（both）
-    // 时两个家族都启用。`xray_proxy_freedom::DomainStrategy::prefer_ipv4/6`
-    // 的语义不含 `==0` 分支（其 freedom 拨号过滤逻辑依赖该语义），故此处
-    // 直接按 strategy_table 构造，与 Go LookupForIP 的 IPOption 对齐。
-    let prefer_byte = strategy.strategy_table()[1];
+    // Go `PreferIP4()/PreferIP6()`（config.go:110-116）：`strategy_table()[1] == 0`
+    // 时两家族都启用。`xray_proxy_freedom::DomainStrategy` 已对齐 Go（bd 3ln），
+    // 故直接复用 prefer_ipv4/6()，避免重复字面比较。
     let prefer = IpOption {
-        ipv4_enable: prefer_byte == 4 || prefer_byte == 0,
-        ipv6_enable: prefer_byte == 6 || prefer_byte == 0,
+        ipv4_enable: strategy.prefer_ipv4(),
+        ipv6_enable: strategy.prefer_ipv6(),
         fake_enable: false,
     };
     let mut result = dns.lookup_ip(domain, prefer).await;

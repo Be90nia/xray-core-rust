@@ -102,16 +102,22 @@ impl DomainStrategy {
         self.strategy_table()[0] != 0
     }
 
-    /// 优先 IPv4（Go `PreferIP4()`）。
+    /// 优先 IPv4（Go `PreferIP4()`，config.go:110-116）。
+    ///
+    /// `prefer == 0`（AsIs/UseIP/ForceIP）→ true：Go 视为"两个家族都可"。
     #[must_use]
     pub fn prefer_ipv4(self) -> bool {
-        self.strategy_table()[1] == 4
+        let p = self.strategy_table()[1];
+        p == 4 || p == 0
     }
 
-    /// 优先 IPv6（Go `PreferIP6()`）。
+    /// 优先 IPv6（Go `PreferIP6()`，config.go:114-116）。
+    ///
+    /// `prefer == 0`（AsIs/UseIP/ForceIP）→ true：Go 视为"两个家族都可"。
     #[must_use]
     pub fn prefer_ipv6(self) -> bool {
-        self.strategy_table()[1] == 6
+        let p = self.strategy_table()[1];
+        p == 6 || p == 0
     }
 
     /// 有回退家族（Go `HasFallback()`）。
@@ -642,13 +648,15 @@ mod tests {
     fn domain_strategy_family_preference() {
         use DomainStrategy::*;
         // (strategy, prefer4, prefer6, fb4, fb6)
+        // 注：Go config.go:110-116 — prefer=0（both）时 PreferIP4/6 都为 true。
+        // strategy 表：UseIP/ForceIP 的 prefer 列 = 0 → prefer4=prefer6=true。
         let cases = [
-            (UseIP, false, false, false, false),
+            (UseIP, true, true, false, false),
             (UseIPv4, true, false, false, false),
             (UseIPv6, false, true, false, false),
             (UseIPv4v6, true, false, false, true),
             (UseIPv6v4, false, true, true, false),
-            (ForceIP, false, false, false, false),
+            (ForceIP, true, true, false, false),
             (ForceIPv4, true, false, false, false),
             (ForceIPv6, false, true, false, false),
             (ForceIPv4v6, true, false, false, true),
@@ -662,6 +670,27 @@ mod tests {
             assert_eq!(s.has_fallback(), f4 || f6, "{s:?}.has_fallback");
         }
         assert!(!AsIs.has_strategy());
+    }
+
+    /// Go config.go:110-116 PreferIP4()/PreferIP6()：prefer=0 时两个家族都视为优先。
+    /// 与 `domain_strategy_family_preference` 中 UseIP/ForceIP 行同一断言，但显式
+    /// 标"both"分组，对齐 Go 文档行为（bd 3ln）。
+    #[test]
+    fn domain_strategy_prefer_zero_means_both() {
+        use DomainStrategy::*;
+        // prefer=0（UseIP / ForceIP / AsIs）：v4/v6 均视为"优先"。
+        for s in [UseIP, ForceIP] {
+            assert!(s.prefer_ipv4(), "{s:?} prefer=0 → prefer_ipv4 true");
+            assert!(s.prefer_ipv6(), "{s:?} prefer=0 → prefer_ipv6 true");
+        }
+        // AsIs：prefer=0 但 handler 层早退（has_strategy==false），不影响拨号过滤。
+        // 测试仅验证方法语义（==0 时双 true），不约束 AsIs 在拨号层行为。
+        assert!(AsIs.prefer_ipv4());
+        assert!(AsIs.prefer_ipv6());
+        // prefer=4 单边
+        assert!(UseIPv4.prefer_ipv4() && !UseIPv4.prefer_ipv6());
+        // prefer=6 单边
+        assert!(!UseIPv6.prefer_ipv4() && UseIPv6.prefer_ipv6());
     }
 
     // ===== FinalRule::build =====

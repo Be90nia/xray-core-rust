@@ -6449,9 +6449,11 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "base64",
+ "btls",
  "hex",
  "hkdf",
  "hmac",
+ "parking_lot",
  "prost",
  "rcgen 0.13.2",
  "rustls",
@@ -6477,6 +6479,8 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "btls",
+ "btls-sys",
+ "foreign-types",
  "hex",
  "ocsp-stapler",
  "rand 0.9.4",
