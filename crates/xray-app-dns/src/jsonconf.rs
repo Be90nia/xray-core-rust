@@ -13,6 +13,7 @@
 //! - EDNS0 `clientIp` 当前仅存入 `DnsServiceConfig`，不传透到 `new_server` 构造的
 //!   Server（`new_server` API 未暴露 client_ip 参数）。
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -85,7 +86,10 @@ pub struct NameServerJson {
     /// 期望返回的 IP 列表（CIDR）。对应 Go `expectedIPs`。
     #[serde(rename = "expectedIPs")]
     pub expected_ips: Option<Vec<String>>,
-    /// 不期望返回的 IP 列表（CIDR）。对应 Go `unexpectedIPs`。
+    /// 期望 IP 列表旧名（`expectedIPs` 为空时回填）。对应 Go `expectIPs`
+    /// （infra/conf/dns.go:26、dns.go:94-96）。
+    #[serde(rename = "expectIPs")]
+    pub expect_ips: Option<Vec<String>>,
     #[serde(rename = "unexpectedIPs")]
     pub unexpected_ips: Option<Vec<String>>,
     /// 本 server 的 tag（路由引用用）。对应 Go `tag`。
@@ -96,6 +100,24 @@ pub struct NameServerJson {
     /// 本 server 禁用缓存。对应 Go `disableCache`。
     #[serde(rename = "disableCache")]
     pub disable_cache: Option<bool>,
+    /// 是否优先解析（本 server 命中 expectedIPs 时强制启用）。对应 Go `NameServer.ActPrior`。
+    #[serde(rename = "actPrior")]
+    pub act_prior: Option<bool>,
+    /// 是否降级解析（本 server 命中 unexpectedIPs 时强制启用）。对应 Go `NameServer.ActUnprior`。
+    #[serde(rename = "actUnprior")]
+    pub act_unprior: Option<bool>,
+    /// 策略 ID。供上游派生 hash（独立 issue 8kha）。对应 Go proto `NameServer.policyID`。
+    #[serde(rename = "policyID")]
+    pub policy_id: Option<u32>,
+    /// 缓存过期后继续提供过期数据。对应 Go `serveStale`。
+    #[serde(rename = "serveStale")]
+    pub serve_stale: Option<bool>,
+    /// 过期数据可服务的负 TTL（秒）。对应 Go `serveExpiredTTL`。
+    #[serde(rename = "serveExpiredTTL")]
+    pub serve_expired_ttl: Option<u32>,
+    /// 负缓存 TTL（秒）；None/0 = 禁用。Rust 内部 cache 字段，Go 端无对应 JSON 字段。
+    #[serde(rename = "negativeTtlSecs")]
+    pub negative_ttl_secs: Option<u32>,
 }
 
 impl DnsAppConfig {
@@ -117,8 +139,24 @@ impl DnsAppConfig {
         // kvl：聚合 per-nameserver domain 规则（对应 Go dns.go effectiveRules/matcherInfos）。
         let mut all_rules: Vec<MatcherDomainRule> = Vec::new();
         let mut matcher_infos: Vec<DomainMatcherInfo> = Vec::new();
+        // 8kha：policy_id = 8 元组等价类的顺序编号。对应 Go `buildPolicyID`
+        // （infra/conf/dns.go:288-352）：规范化 key → map 去重，`nextPolicyID`
+        // 从 1 递增；相同元组复用同 id。非 hash（Go 语义如此），消费端
+        // `make_groups` 仅按 id 相等分组。
+        let mut policy_map: HashMap<String, u32> = HashMap::new();
+        let mut next_policy_id: u32 = 1;
         for ns in &self.servers {
-            match build_client(ns, &client_ip, base_ip_option, &datadir) {
+            // JSON `policyID` 非零为手动覆盖（4ah3 钦定扩展，Go 无此字段）；
+            // 否则用派生值。
+            let policy_id = match ns.policy_id.filter(|&v| v != 0) {
+                Some(v) => v,
+                None => *policy_map.entry(policy_key(ns)).or_insert_with(|| {
+                    let id = next_policy_id;
+                    next_policy_id += 1;
+                    id
+                }),
+            };
+            match build_client(ns, &client_ip, base_ip_option, &datadir, policy_id) {
                 Ok(c) => {
                     let client_idx = clients.len() as u16;
                     clients.push(Arc::new(c));
@@ -271,11 +309,15 @@ fn build_server_url(address: &str, port: Option<u16>) -> String {
 }
 
 /// 从 JSON nameserver 构造 [`Client`]。
+///
+/// `derived_policy_id` 为上游按 8 元组派生的策略 id（`build` 循环）；
+/// JSON `policyID` 非零时覆盖之（Go 无此字段，见 `build`）。
 fn build_client(
     ns: &NameServerJson,
     global_client_ip: &[u8],
     base_ip_option: IpOption,
     datadir: &std::path::Path,
+    derived_policy_id: u32,
 ) -> Result<Client, DnsError> {
     let url = build_server_url(&ns.address, ns.port);
     let server = new_server(&url)?;
@@ -289,8 +331,9 @@ fn build_client(
     };
 
     // 6r0：expectedIPs/unexpectedIPs → IpRule（CIDR + geoip 展开）。
+    // expectedIPs 为空时回填 expectIPs（Go dns.go:94-96，policy key 同读回填值）。
     let expected_ip_rules =
-        parse_ns_ip_rules(ns.expected_ips.as_deref().unwrap_or(&[]), datadir)?;
+        parse_ns_ip_rules(effective_expected_ips(ns), datadir)?;
     let unexpected_ip_rules =
         parse_ns_ip_rules(ns.unexpected_ips.as_deref().unwrap_or(&[]), datadir)?;
 
@@ -302,14 +345,77 @@ fn build_client(
         tag: ns.tag.clone().unwrap_or_default(),
         final_query: ns.final_query.unwrap_or(false),
         disable_cache: ns.disable_cache,
-        serve_stale: None,
-        serve_expired_ttl: None,
+        serve_stale: ns.serve_stale,
+        serve_expired_ttl: ns.serve_expired_ttl,
+        negative_ttl_secs: ns.negative_ttl_secs,
+        act_prior: ns.act_prior.unwrap_or(false),
+        act_unprior: ns.act_unprior.unwrap_or(false),
+        policy_id: ns.policy_id.filter(|&v| v != 0).unwrap_or(derived_policy_id),
         expected_ip_rules,
         unexpected_ip_rules,
         ..Default::default()
     };
 
     Client::new(ns_cfg, base_ip_option, server)
+}
+
+/// Go dns.go:94-96：`expectedIPs` 为空时回填 `expectIPs`（`Build` 内改写，
+/// `buildPolicyID` 与 IP 规则解析均读回填后的值）。
+fn effective_expected_ips(ns: &NameServerJson) -> &[String] {
+    const EMPTY: &[String] = &[];
+    let expected = ns.expected_ips.as_deref().unwrap_or(EMPTY);
+    if expected.is_empty() {
+        ns.expect_ips.as_deref().unwrap_or(EMPTY)
+    } else {
+        expected
+    }
+}
+
+/// 构造 policy 等价键。对应 Go `buildPolicyID` 的 key 段构造
+/// （infra/conf/dns.go:291-343）：`client|skip|qs|tag|domains|expected|expect|unexpected`
+/// 8 段，`|` 分隔；列表段元素 trim + 小写 + 排序后逗号连接，空列表为 `=[]`；
+/// `*` 不剥离（dns.go:99-106 的 actPrior 剥离只写局部变量，不影响 key）；
+/// `client` 段用 per-server JSON 值的规范化 IP 形式（全局 `clientIp` 不参与）。
+fn policy_key(ns: &NameServerJson) -> String {
+    fn write_list(sb: &mut String, tag: &str, lst: &[String]) {
+        sb.push_str(tag);
+        if lst.is_empty() {
+            sb.push_str("=[]|");
+            return;
+        }
+        let mut cp: Vec<String> = lst.iter().map(|s| s.trim().to_lowercase()).collect();
+        cp.sort();
+        sb.push('=');
+        sb.push_str(&cp.join(","));
+        sb.push('|');
+    }
+
+    let mut sb = String::new();
+    match ns.client_ip.as_deref().filter(|t| !t.is_empty()) {
+        Some(text) => {
+            // Go 写 net.Address 规范化形式（IP canonical，如 v6 压缩小写）。
+            let canon = text
+                .parse::<IpAddr>()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|_| text.to_string());
+            sb.push_str("client=");
+            sb.push_str(&canon);
+            sb.push('|');
+        }
+        None => sb.push_str("client=none|"),
+    }
+    sb.push_str(if ns.skip_fallback { "skip=1|" } else { "skip=0|" });
+    sb.push_str("qs=");
+    sb.push_str(&ns.query_strategy.as_deref().unwrap_or_default().trim().to_lowercase());
+    sb.push('|');
+    sb.push_str("tag=");
+    sb.push_str(&ns.tag.as_deref().unwrap_or_default().trim().to_lowercase());
+    sb.push('|');
+    write_list(&mut sb, "domains", ns.domains.as_deref().unwrap_or(&[]));
+    write_list(&mut sb, "expected", effective_expected_ips(ns));
+    write_list(&mut sb, "expect", ns.expect_ips.as_deref().unwrap_or(&[]));
+    write_list(&mut sb, "unexpected", ns.unexpected_ips.as_deref().unwrap_or(&[]));
+    sb
 }
 
 /// 资源目录（geosite.dat / geoip.dat 查找路径）。对应 Go `XRAY_LOCATION_ASSET`。
@@ -598,5 +704,69 @@ mod tests {
         // 普通域名不命中。
         let sorted = svc.sort_clients("example.com");
         assert_eq!(sorted[0].tag, "remote");
+    }
+
+    /// 4ah3：6 字段（actPrior/actUnprior/policyID/serveStale/serveExpiredTTL/negativeTtlSecs）
+    /// JSON 反序列化正确（含 camelCase rename + Option 默认 None）。
+    #[test]
+    fn nameserver_json_6_extra_fields_roundtrip() {
+        let json = r#"{
+            "address": "1.1.1.1",
+            "actPrior": true,
+            "actUnprior": false,
+            "policyID": 42,
+            "serveStale": true,
+            "serveExpiredTTL": 60,
+            "negativeTtlSecs": 30
+        }"#;
+        let ns: NameServerJson = serde_json::from_str(json).unwrap();
+        assert_eq!(ns.act_prior, Some(true));
+        assert_eq!(ns.act_unprior, Some(false));
+        assert_eq!(ns.policy_id, Some(42));
+        assert_eq!(ns.serve_stale, Some(true));
+        assert_eq!(ns.serve_expired_ttl, Some(60));
+        assert_eq!(ns.negative_ttl_secs, Some(30));
+
+        // 缺省：6 字段全部 None（serde(default)）。
+        let empty: NameServerJson = serde_json::from_str(r#"{"address": "1.1.1.1"}"#).unwrap();
+        assert_eq!(empty.act_prior, None);
+        assert_eq!(empty.act_unprior, None);
+        assert_eq!(empty.policy_id, None);
+        assert_eq!(empty.serve_stale, None);
+        assert_eq!(empty.serve_expired_ttl, None);
+        assert_eq!(empty.negative_ttl_secs, None);
+    }
+
+    /// 4ah3：6 字段透传到 NameServerConfig（最终落 Client.policy_id/act_prior/act_unprior +
+    /// Server 内 cache 的 serve_stale/serve_expired_ttl/negative_ttl_secs）。
+    #[test]
+    fn build_client_propagates_6_extra_fields() {
+        use crate::nameserver::Client;
+        let json = r#"{
+            "address": "1.1.1.1",
+            "actPrior": true,
+            "actUnprior": true,
+            "policyID": 7,
+            "serveStale": true,
+            "serveExpiredTTL": 45,
+            "negativeTtlSecs": 15,
+            "disableCache": true
+        }"#;
+        let ns: NameServerJson = serde_json::from_str(json).unwrap();
+        let datadir = std::path::Path::new("");
+        let client: Client =
+            build_client(&ns, &[], crate::config::IpOption::all(), datadir, 0).unwrap();
+
+        // Client 公开字段。
+        assert_eq!(client.policy_id, 7);
+        assert!(client.act_prior);
+        assert!(client.act_unprior);
+
+        // Server 公开接口：is_disable_cache 验证 disableCache + cache 实例化。
+        // serveStale/serveExpiredTTL/negativeTtlSecs 流入 Server.cache，由 build_client
+        // 内部经 new_server→from_config→CacheController::new 透传；
+        // 这里通过 server.name() + is_disable_cache 验证 Server 构造路径成功。
+        assert!(client.server.is_disable_cache());
+        assert!(client.server.name().starts_with("UDP:"));
     }
 }
