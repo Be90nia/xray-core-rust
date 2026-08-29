@@ -1999,4 +1999,258 @@ mod tests {
             rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
         }
     }
+
+    // ============ SOCKS5 UDP e2e 集成（bd 9i8w）============
+    //
+    // 对应 Go `testing/scenarios/socks_test.go::TestSocksBridageUDP` /
+    // `TestSocksBridageUDPWithRouting`：udp-server 提供 echo 端点；
+    // socks5 客户端走 TCP control connection + UDP ASSOCIATE 拿到 relay addr，
+    // 发 UDP 数据报经 socks inbound UDP relay → UdpDispatchSession →
+    // dispatcher 选 outbound → UDP echo 回包。
+    //
+    // inbound 端 UDP relay 由 `xray-core/src/inbound.rs::handle_udp_associate`
+    // 实现（UdpDispatchSession ↔ 客户端 UDP socket，XUDP 帧 ↔ SOCKS5 UDP 包
+    // 编解码），outbound 端 Freedom UDP 由 `xray-proxy-freedom::udp` 拆/装帧。
+
+    /// SOCKS5 UDP ASSOCIATE → Freedom UDP outbound → UDP echo server 全链路
+    /// e2e（对应 Go `TestSocksBridageUDP`）。
+    ///
+    /// 验证：客户端 UDP 数据报从 socks 监听端口进、穿过 dispatcher、
+    /// freedom 直发到 echo server、回包经同一链路返回客户端，全程 payload 完整。
+    #[tokio::test]
+    async fn integration_socks_udp_relay_to_echo() {
+        // 1. UDP echo server
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                match echo.recv_from(&mut buf).await {
+                    Ok((n, peer)) => {
+                        let _ = echo.send_to(&buf[..n], peer).await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // 2. 空闲端口：socks inbound
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        // 3. BuiltConfig: socks inbound (UDP enabled) + freedom outbound
+        let mut cfg = BuiltConfig::default();
+        cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry {
+                kind: "socks".into(),
+                data: br#"{"auth":"noauth","udp":true}"#.to_vec(),
+            },
+            tag: "socks-in".into(),
+            port: Some(socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            tag: "direct".into(),
+            send_through: None, stream_settings_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
+        });
+
+        let (_, _, handles) = start_full(&cfg).await.expect("socks+freedom start");
+        // 等 accept loop ready
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 4. 客户端：TCP control connection → SOCKS5 NoAuth → UDP ASSOCIATE
+        let mut tcp = TcpStream::connect(format!("127.0.0.1:{socks_port}"))
+            .await
+            .expect("connect socks control");
+        tcp.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut method_resp = [0u8; 2];
+        tcp.read_exact(&mut method_resp).await.unwrap();
+        assert_eq!(method_resp, [0x05, 0x00], "NoAuth method selected");
+
+        // UDP ASSOCIATE request: DST.ADDR/PORT = 0.0.0.0:0（客户端不在乎绑哪，
+        // 仅靠 TCP control connection 关联；reply 的 BND.ADDR/PORT 才是真 relay）
+        tcp.write_all(&[
+            0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0,
+        ])
+        .await
+        .unwrap();
+        let mut assoc_reply = [0u8; 10];
+        tcp.read_exact(&mut assoc_reply).await.unwrap();
+        assert_eq!(assoc_reply[0], 0x05, "UDP ASSOC reply VER");
+        assert_eq!(assoc_reply[1], 0x00, "UDP ASSOC reply REP=success");
+        assert_eq!(assoc_reply[2], 0x00, "RSV");
+        assert_eq!(assoc_reply[3], 0x01, "ATYP=IPv4");
+        let relay_ip = std::net::Ipv4Addr::new(
+            assoc_reply[4], assoc_reply[5], assoc_reply[6], assoc_reply[7],
+        );
+        let relay_port = u16::from_be_bytes([assoc_reply[8], assoc_reply[9]]);
+        assert_eq!(relay_ip, std::net::Ipv4Addr::new(127, 0, 0, 1));
+        assert!(relay_port > 0, "relay port should be assigned, got {relay_port}");
+
+        // 5. 客户端 UDP socket → 编码 SOCKS5 UDP 包 → send_to relay
+        let client_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let payload = b"hello-udp-echo-9i8w";
+        let ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
+        // [RSV=0,0][FRAG=0][ATYP=0x01][IPv4][port BE][payload]
+        let mut pkt = vec![0x00, 0x00, 0x00, 0x01];
+        pkt.extend_from_slice(&ip);
+        pkt.extend_from_slice(&echo_addr.port().to_be_bytes());
+        pkt.extend_from_slice(payload);
+        let relay = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            relay_port,
+        );
+        client_udp
+            .send_to(&pkt, relay)
+            .await
+            .expect("send udp packet to relay");
+
+        // 6. 等回包（自由客户端地址）
+        let mut resp_buf = vec![0u8; 65535];
+        let (n, _peer) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_udp.recv_from(&mut resp_buf),
+        )
+        .await
+        .expect("timeout waiting for echo")
+        .expect("recv udp echo");
+        assert!(n >= 10, "SOCKS5 UDP header is at least 10 bytes (RSV+FRAG+ATYP+IPv4+PORT)");
+        // 解码回包头，断言 payload 一致
+        assert_eq!(resp_buf[0..2], [0x00, 0x00], "RSV");
+        assert_eq!(resp_buf[2], 0x00, "FRAG=0");
+        assert_eq!(resp_buf[3], 0x01, "ATYP=IPv4");
+        let body = &resp_buf[10..n];
+        assert_eq!(body, payload, "echo payload roundtrip");
+
+        // 7. 清理
+        drop(client_udp);
+        // TCP control connection drop → relay task 在 inbound.rs read EOF 后被 abort
+        drop(tcp);
+        for h in handles.iter() {
+            h.abort();
+        }
+        echo_task.abort();
+    }
+
+    /// SOCKS5 UDP + Router 分流 e2e（对应 Go `TestSocksBridageUDPWithRouting`）：
+    /// routing 规则按 inboundTag 命中 `"out"` 出站（freedom），其他匹配 `blackhole`；
+    /// UDP 数据报走与 TCP 同一条 router 链路，证明 routing 路径覆盖 UDP。
+    #[tokio::test]
+    async fn integration_socks_udp_through_router() {
+        // 1. UDP echo server
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                match echo.recv_from(&mut buf).await {
+                    Ok((n, peer)) => {
+                        let _ = echo.send_to(&buf[..n], peer).await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // 2. 空闲端口：socks inbound
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        // 3. BuiltConfig: socks inbound (UDP enabled) + 2 outbounds (default=blackhole, out=freedom)
+        //    + routing app: inboundTag=socks-in → out (覆盖 default blackhole)
+        let mut cfg = BuiltConfig::default();
+        cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry {
+                kind: "socks".into(),
+                data: br#"{"auth":"noauth","udp":true}"#.to_vec(),
+            },
+            tag: "socks-in".into(),
+            port: Some(socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry { kind: "blackhole".into(), data: b"{}".to_vec() },
+            tag: "default".into(),
+            send_through: None, stream_settings_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
+        });
+        cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            tag: "out".into(),
+            send_through: None, stream_settings_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
+        });
+        cfg.apps.push(BuiltEntry {
+            kind: "routing".into(),
+            data: br#"{"domainStrategy":"AsIs","rules":[{"type":"field","inboundTag":["socks-in"],"outboundTag":"out"}]}"#.to_vec(),
+        });
+
+        let (_, _, handles) = start_full(&cfg).await.expect("socks+router start");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 4. 客户端：TCP control + UDP ASSOCIATE
+        let mut tcp = TcpStream::connect(format!("127.0.0.1:{socks_port}"))
+            .await
+            .expect("connect socks control");
+        tcp.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut method_resp = [0u8; 2];
+        tcp.read_exact(&mut method_resp).await.unwrap();
+        assert_eq!(method_resp, [0x05, 0x00]);
+        tcp.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let mut assoc_reply = [0u8; 10];
+        tcp.read_exact(&mut assoc_reply).await.unwrap();
+        assert_eq!(assoc_reply[1], 0x00, "UDP ASSOC REP=success");
+        let relay_port = u16::from_be_bytes([assoc_reply[8], assoc_reply[9]]);
+        assert!(relay_port > 0, "relay port should be assigned, got {relay_port}");
+
+        // 5. UDP 客户端发包 → relay → router 命中 out=freedom → echo
+        let client_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let payload = b"routed-udp-echo-9i8w";
+        let ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
+        let mut pkt = vec![0x00, 0x00, 0x00, 0x01];
+        pkt.extend_from_slice(&ip);
+        pkt.extend_from_slice(&echo_addr.port().to_be_bytes());
+        pkt.extend_from_slice(payload);
+        let relay = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            relay_port,
+        );
+        client_udp.send_to(&pkt, relay).await.expect("send routed udp");
+
+        // 6. 期望回包（route 命中 out=freedom → echo → 回包）；若 router 错配 default=blackhole
+        //    则 5s 内收不到任何回包 → timeout 失败
+        let mut resp_buf = vec![0u8; 65535];
+        let (n, _peer) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_udp.recv_from(&mut resp_buf),
+        )
+        .await
+        .expect("timeout: router may have routed to blackhole instead of out=freedom")
+        .expect("recv udp echo");
+        let body = &resp_buf[10..n];
+        assert_eq!(body, payload, "routed echo payload roundtrip");
+
+        drop(client_udp);
+        drop(tcp);
+        for h in handles.iter() {
+            h.abort();
+        }
+        echo_task.abort();
+    }
 }
