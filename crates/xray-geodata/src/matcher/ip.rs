@@ -914,3 +914,189 @@ mod tests {
         assert!(!matcher.match_ip(IpAddr::from([8, 8, 8, 8])));
     }
 }
+
+// ── IP registry (热替换) ─────────────────────────────────────────
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+
+/// IP 匹配器注册表 + 热替换。
+///
+/// 对应 Go `IPRegistry`：管理多个 `DynamicIPMatcher`，`Reload` 时
+/// 用新规则重建所有 matcher，原子切换内部状态。
+pub struct IpRegistry {
+    inner: RwLock<IpRegistryInner>,
+}
+
+struct IpRegistryInner {
+    entries: Vec<RegistryEntry>,
+}
+
+struct RegistryEntry {
+    matcher: Arc<DynamicIPMatcher>,
+    rules: Vec<IpRule>,
+}
+
+impl IpRegistry {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: RwLock::new(IpRegistryInner {
+                entries: Vec::new(),
+            }),
+        }
+    }
+
+    /// 添加一组规则并返回动态 IP 匹配器。
+    pub fn add_rules(
+        &self,
+        rules: &[IpRule],
+    ) -> Result<Arc<DynamicIPMatcher>, BuildIPMatcherError> {
+        let initial = build_optimized_ip_matcher(rules)?;
+        let matcher = Arc::new(DynamicIPMatcher::new(initial));
+        let mut g = self.inner.write().expect("IpRegistry poisoned");
+        g.entries.push(RegistryEntry {
+            matcher: Arc::clone(&matcher),
+            rules: rules.to_vec(),
+        });
+        Ok(matcher)
+    }
+
+    /// 用新规则列表重建所有匹配器（原子热切换）。
+    ///
+    /// 对应 Go `IPRegistry.Reload`：每个 entry 用 new_rules 重建 matcher。
+    pub fn reload_with(
+        &self,
+        new_rules: &[IpRule],
+    ) -> Result<(), BuildIPMatcherError> {
+        // 一次拷出 entries 引用，避免长时间持写锁。
+        let entries: Vec<Arc<DynamicIPMatcher>> = {
+            let g = self.inner.read().expect("IpRegistry poisoned");
+            g.entries.iter().map(|e| Arc::clone(&e.matcher)).collect()
+        };
+
+        // 重建一份（每个 entry 持有独立 Box<dyn IPMatcher>，避免共享 &mut）。
+        for entry in &entries {
+            let fresh = build_optimized_ip_matcher(new_rules)?;
+            entry.replace(fresh);
+        }
+        Ok(())
+    }
+
+    /// 当前注册的动态匹配器数量。
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.read().expect("IpRegistry poisoned").entries.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Default for IpRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 动态 IP 匹配器。
+///
+/// 对应 Go `DynamicIPMatcher`：`RwLock<Box<dyn IPMatcher>>` 持当前状态；
+/// `reverse` / `reverse_set` 是 `AtomicBool`，读取无锁。
+pub struct DynamicIPMatcher {
+    state: RwLock<Box<dyn IPMatcher>>,
+    reverse: AtomicBool,
+    reverse_set: AtomicBool,
+}
+
+impl DynamicIPMatcher {
+    fn new(initial: Box<dyn IPMatcher>) -> Self {
+        Self {
+            state: RwLock::new(initial),
+            reverse: AtomicBool::new(false),
+            reverse_set: AtomicBool::new(false),
+        }
+    }
+
+    /// 热替换内部状态。保留调用方的 reverse 标志语义（对齐 Go `Reload`）。
+    fn replace(&self, new_matcher: Box<dyn IPMatcher>) {
+        let reverse = self.reverse.load(Ordering::Acquire);
+        let reverse_set = self.reverse_set.load(Ordering::Acquire);
+        let mut new = new_matcher;
+        if reverse_set {
+            new.set_reverse(reverse);
+        } else if reverse {
+            new.toggle_reverse();
+        }
+        let mut g = self.state.write().expect("DynamicIPMatcher state poisoned");
+        *g = new;
+    }
+
+    /// 设置 reverse 标志并记录已显式设置过。
+    pub fn set_reverse(&self, reverse: bool) {
+        self.reverse.store(reverse, Ordering::Release);
+        self.reverse_set.store(true, Ordering::Release);
+        let mut g = self.state.write().expect("DynamicIPMatcher state poisoned");
+        g.set_reverse(reverse);
+    }
+
+    /// 切换 reverse 标志。
+    pub fn toggle_reverse(&self) {
+        let new = !self.reverse.load(Ordering::Acquire);
+        self.reverse.store(new, Ordering::Release);
+        let mut g = self.state.write().expect("DynamicIPMatcher state poisoned");
+        g.toggle_reverse();
+    }
+
+    /// 获取当前 reverse 标志。
+    #[must_use]
+    pub fn reverse(&self) -> bool {
+        self.reverse.load(Ordering::Acquire)
+    }
+
+    fn with_state<R>(&self, f: impl FnOnce(&dyn IPMatcher) -> R) -> R {
+        let g = self.state.read().expect("DynamicIPMatcher state poisoned");
+        f(&**g)
+    }
+}
+
+impl IPMatcher for DynamicIPMatcher {
+    fn match_ip(&self, ip: IpAddr) -> bool {
+        self.with_state(|m| m.match_ip(ip))
+    }
+    fn any_match(&self, ips: &[IpAddr]) -> bool {
+        self.with_state(|m| m.any_match(ips))
+    }
+    fn matches(&self, ips: &[IpAddr]) -> bool {
+        self.with_state(|m| m.matches(ips))
+    }
+    fn filter_ips(&self, ips: &[IpAddr]) -> Vec<IpAddr> {
+        self.with_state(|m| m.filter_ips(ips))
+    }
+    fn reverse(&self) -> bool {
+        self.reverse.load(Ordering::Acquire)
+    }
+    fn set_reverse(&mut self, _reverse: bool) {
+        // DynamicIPMatcher 顶层 API 请用 set_reverse(&self)。
+    }
+    fn toggle_reverse(&mut self) {
+        // 同上：通过顶层 toggle_reverse(&self) 调用。
+    }
+}
+
+impl std::fmt::Debug for DynamicIPMatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynamicIPMatcher")
+            .field("reverse", &self.reverse())
+            .finish()
+    }
+}
+
+/// 全局 IP 注册表实例。
+///
+/// 对应 Go `commongeodata.IPReg`。`routing` 层在 reload 时通过此处触达
+/// 所有已注册的 IP matcher。如需 per-instance registry，优先本地 `new()`。
+pub static IP_REG: std::sync::LazyLock<IpRegistry> = std::sync::LazyLock::new(IpRegistry::new);
+

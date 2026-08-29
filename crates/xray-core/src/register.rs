@@ -640,74 +640,43 @@ impl FakeDnsFeature {
 fn geodata_factory() -> FeatureFactory {
     Arc::new(|data: &[u8]| {
         use xray_app_geodata::{
-            GeodataConfig, GeodataFeature,
-            downloader::{AssetDownloader, GeodataReloader, NoopReloader},
+            CronScheduler, GeodataConfig, GeodataFeature, RealAssetDownloader,
+            downloader::{AssetDownloader, GeodataReloader, ReloadBothRegistries},
             instance::Scheduler,
         };
         use std::path::PathBuf;
 
         // 解析 JSON（`xray_conf::app_config::GeodataConfig`：当前 `{code, dir}`）。
-        // 失败回退默认空配置——bd issue 修复路径：保证 GeodataFeature 实例化成功。
+        // 失败回退默认空配置——保证 GeodataFeature 实例化成功。
         let json_cfg: xray_conf::app_config::GeodataConfig =
             serde_json::from_slice(data).unwrap_or_default();
 
-        // 把 `dir` 注入 asset_dir（仅作 hint；当前无 assets 配置项则不写入）。
-        let _asset_dir: Option<PathBuf> = json_cfg.dir.as_ref().map(PathBuf::from);
+        let asset_dir: Option<PathBuf> = json_cfg.dir.as_ref().map(PathBuf::from);
         let _code_hint: Option<String> = json_cfg.code.clone();
 
-        // 构造内部 config：当前 xray-conf shape 与 Go `{cron, outbound, assets}`
-        // 不对齐，所以传默认空 config——`GeodataInstance::start_with_callback`
-        // 会走空 cron 分支不调度（与 Go `if config.Cron == "" return empty` 等价）。
-        // 真正的 cron JSON 字段映射留给后续 batch（前提修正任务）。
+        // 当前 xray-conf shape 与 Go `{cron, outbound, assets}` 不对齐，
+        // 走空 config；`GeodataInstance::start_with_callback` 在 cron 空时
+        // 不调度（与 Go `if config.Cron == ""` 等价）。
+        // 真正 cron/JSON 字段映射留给后续 batch。
         let config = GeodataConfig::default();
 
-        let scheduler: Arc<dyn Scheduler> = Arc::new(NoopSchedulerStub);
-        let downloader: Arc<dyn AssetDownloader> = Arc::new(StubAssetDownloader);
-        let reloader: Arc<dyn GeodataReloader> = Arc::new(NoopReloader);
+        // 真实实现替换之前的 stub。
+        let scheduler: Arc<dyn Scheduler> = Arc::new(CronScheduler::new());
+        let downloader: Arc<dyn AssetDownloader> = Arc::new(
+            RealAssetDownloader::new(asset_dir.unwrap_or_else(default_asset_dir)),
+        );
+        let reloader: Arc<dyn GeodataReloader> = Arc::new(ReloadBothRegistries);
 
         let feature = GeodataFeature::new(config, scheduler, downloader, reloader);
         Ok(Arc::new(feature) as Arc<dyn Feature>)
     })
 }
 
-/// NoopScheduler 占位——`GeodataFeature.start_with_callback` 在 cron 空时
-/// 不会调用 `Scheduler::schedule`，所以 Noop 实现即可。
-struct NoopSchedulerStub;
-impl xray_app_geodata::instance::Scheduler for NoopSchedulerStub {
-    fn schedule(
-        &self,
-        _cron: &str,
-        _callback: Box<dyn Fn() + Send + Sync>,
-    ) -> std::result::Result<
-        xray_app_geodata::instance::ScheduleHandle,
-        xray_app_geodata::error::GeodataError,
-    > {
-        Err(xray_app_geodata::error::GeodataError::ScheduleFailed(
-            "NoopSchedulerStub: cron non-empty but no real scheduler available; \
-             use a cron-aware Scheduler impl".into(),
-        ))
-    }
+/// 默认 asset 目录：`XRAY_LOCATION_ASSET` 或 std::env::temp_dir() + "xray-geodata"。
+fn default_asset_dir() -> PathBuf {
+    xray_common::platform::get_resource_path()
 }
 
-/// 占位 AssetDownloader：`resolve_target` 返回 XRAY_LOCATION_ASSET 目录下的
-/// file path；`download_to` 写占位字节（保证 reload_with_update 链路通）。
-struct StubAssetDownloader;
-impl xray_app_geodata::downloader::AssetDownloader for StubAssetDownloader {
-    fn download_to(
-        &self,
-        _url: &str,
-        temp: &std::path::Path,
-    ) -> std::result::Result<(), xray_app_geodata::error::GeodataError> {
-        std::fs::write(temp, b"placeholder")
-            .map_err(xray_app_geodata::error::GeodataError::from)
-    }
-    fn resolve_target(
-        &self,
-        file: &str,
-    ) -> Result<std::path::PathBuf, xray_app_geodata::error::GeodataError> {
-        Ok(xray_common::platform::get_resource_path().join(file))
-    }
-}
 /// 为 api/metrics/fakeDns/observatory/burstObservatory/version
 /// 创建 SimpleFeature 工厂（实现 Feature trait 的最简 no-op）。
 fn simple_feature_factory(kind: &'static str) -> FeatureFactory {

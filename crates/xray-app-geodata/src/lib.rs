@@ -19,12 +19,14 @@ pub mod downloader;
 pub mod error;
 pub mod feature;
 pub mod instance;
+pub mod scheduler;
 pub mod swap;
 pub use config::{GeodataAsset, GeodataConfig};
 pub use downloader::{
-    download_assets, reload_with_update, AssetDownloader, DefaultAssetDownloader,
-    GeodataReloader, NoopReloader,
+    download_assets, reload_with_update, AssetDownloader,
+    DefaultAssetDownloader, GeodataReloader, NoopReloader, RealAssetDownloader,
 };
+pub use scheduler::CronScheduler;
 pub use error::{at_error, at_warning, GeodataError};
 pub use feature::GeodataFeature;
 pub use instance::{

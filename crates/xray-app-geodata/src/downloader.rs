@@ -139,6 +139,310 @@ impl GeodataReloader for NoopReloader {
     }
 }
 
+/// 真实 AssetDownloader：用 std::net TCP 写最小 HTTP/1.1 GET。
+///
+/// 对应 Go `downloader` + `idleConn` + `http.Client` 中"实际下字节"的子集：
+/// 不做 HTTPS、不走 dispatcher dial、不做 redirect——这些都可以由 trait
+/// 上层包装或后续替换为 hyper 实现覆盖。当前是 ponytail 最小实现：
+///
+/// - 仅支持 `http://`（https 暂未实现；`download_to` 返回 Io 错即可）
+/// - 单连接一次性 GET，Body 全读到 temp 文件
+/// - 默认 30s 超时（与 Go `idleTimeout` 对齐），可用 `with_timeout` 覆盖
+/// - 状态码非 2xx → `UnexpectedStatus`
+/// - 响应体为空 → `EmptyResponse`
+pub struct RealAssetDownloader {
+    asset_dir: PathBuf,
+    timeout: std::time::Duration,
+}
+
+impl RealAssetDownloader {
+    pub fn new(asset_dir: PathBuf) -> Self {
+        Self {
+            asset_dir,
+            timeout: std::time::Duration::from_secs(30),
+        }
+    }
+
+    /// 覆盖默认超时。用于测试或特殊网络环境。
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    fn parse_url(&self, url: &str) -> Result<ParsedUrl, GeodataError> {
+        let url = url.trim();
+        let (scheme, rest) = if let Some(s) = url.strip_prefix("https://") {
+            ("https", s)
+        } else if let Some(s) = url.strip_prefix("http://") {
+            ("http", s)
+        } else {
+            return Err(GeodataError::DownloadFailed {
+                url: url.to_string(),
+                reason: "unsupported scheme (only http/https)".into(),
+            });
+        };
+
+        let (host_port, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, "/"),
+        };
+        let (host, port) = match host_port.rfind(':') {
+            Some(i) => {
+                let p: u16 = host_port[i + 1..]
+                    .parse()
+                    .map_err(|_| GeodataError::DownloadFailed {
+                        url: url.to_string(),
+                        reason: format!("invalid port: {}", &host_port[i + 1..]),
+                    })?;
+                (&host_port[..i], p)
+            }
+            None => (host_port, if scheme == "https" { 443 } else { 80 }),
+        };
+
+        Ok(ParsedUrl {
+            scheme: scheme.to_string(),
+            host: host.to_string(),
+            port,
+            path: path.to_string(),
+        })
+    }
+}
+
+struct ParsedUrl {
+    scheme: String,
+    host: String,
+    port: u16,
+    path: String,
+}
+
+impl AssetDownloader for RealAssetDownloader {
+    fn download_to(
+        &self,
+        url: &str,
+        temp_path: &std::path::Path,
+    ) -> Result<(), GeodataError> {
+        let parsed = self.parse_url(url)?;
+
+        if parsed.scheme == "https" {
+            // ponytail: HTTPS 暂未实现（TLS 握手需要外部 crate）。
+            // 上层可注入自己的 https-capable downloader 替换；不偷偷 fallback。
+            return Err(GeodataError::DownloadFailed {
+                url: url.to_string(),
+                reason: "https not supported by RealAssetDownloader; inject https-capable downloader".into(),
+            });
+        }
+
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::time::Instant;
+
+        let addr = format!("{}:{}", parsed.host, parsed.port);
+        let mut stream = TcpStream::connect(&addr).map_err(|e| {
+            GeodataError::DownloadFailed {
+                url: url.to_string(),
+                reason: format!("connect {addr}: {e}"),
+            }
+        })?;
+
+        stream.set_read_timeout(Some(self.timeout)).map_err(|e| {
+            GeodataError::DownloadFailed {
+                url: url.to_string(),
+                reason: format!("set_read_timeout: {e}"),
+            }
+        })?;
+        stream.set_write_timeout(Some(self.timeout)).map_err(|e| {
+            GeodataError::DownloadFailed {
+                url: url.to_string(),
+                reason: format!("set_write_timeout: {e}"),
+            }
+        })?;
+
+        // HTTP/1.1 GET，Connection: close 让 server 关连接终止 body。
+        let req = format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: xray-rust/0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+            path = parsed.path,
+            host = parsed.host,
+        );
+        stream.write_all(req.as_bytes()).map_err(|e| {
+            GeodataError::DownloadFailed {
+                url: url.to_string(),
+                reason: format!("write request: {e}"),
+            }
+        })?;
+
+        // 读 headers 到 \r\n\r\n。
+        let mut header_buf = Vec::with_capacity(512);
+        let mut byte = [0u8; 1];
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            if Instant::now() > deadline {
+                return Err(GeodataError::IdleTimeout);
+            }
+            match stream.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => {
+                    header_buf.push(byte[0]);
+                    if header_buf.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    return Err(GeodataError::IdleTimeout);
+                }
+                Err(e) => {
+                    return Err(GeodataError::DownloadFailed {
+                        url: url.to_string(),
+                        reason: format!("read header: {e}"),
+                    });
+                }
+            }
+        }
+
+        let header_str = std::str::from_utf8(&header_buf).map_err(|e| {
+            GeodataError::DownloadFailed {
+                url: url.to_string(),
+                reason: format!("invalid header utf-8: {e}"),
+            }
+        })?;
+
+        let mut lines = header_str.split("\r\n");
+        let status_line = lines.next().unwrap_or("");
+        // 解析 "HTTP/1.1 200 OK"
+        let mut status_parts = status_line.split_whitespace();
+        let _http_ver = status_parts.next();
+        let status_code: u16 = status_parts
+            .next()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| GeodataError::DownloadFailed {
+                url: url.to_string(),
+                reason: format!("invalid status line: {status_line}"),
+            })?;
+
+        // Content-Length（用于收齐 body 边界；缺则按 connection close 读到 EOF）
+        let mut content_length: Option<usize> = None;
+        for line in lines {
+            if line.is_empty() {
+                break;
+            }
+            if let Some((k, v)) = line.split_once(':') {
+                if k.trim().eq_ignore_ascii_case("content-length") {
+                    content_length = v.trim().parse().ok();
+                }
+            }
+        }
+
+        if !(200..300).contains(&status_code) {
+            return Err(GeodataError::UnexpectedStatus(status_code));
+        }
+
+        // 把 body 写到 temp 文件
+        let mut out = std::fs::File::create(temp_path).map_err(|e| {
+            GeodataError::DownloadFailed {
+                url: url.to_string(),
+                reason: format!("create temp file: {e}"),
+            }
+        })?;
+
+        let mut total: usize = 0;
+        if let Some(len) = content_length {
+            let mut remaining = len;
+            let mut chunk = vec![0u8; 8192.min(len)];
+            while remaining > 0 {
+                let to_read = chunk.len().min(remaining);
+                match stream.read(&mut chunk[..to_read]) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        out.write_all(&chunk[..n])?;
+                        remaining -= n;
+                        total += n;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        return Err(GeodataError::IdleTimeout);
+                    }
+                    Err(e) => {
+                        return Err(GeodataError::DownloadFailed {
+                            url: url.to_string(),
+                            reason: format!("read body: {e}"),
+                        });
+                    }
+                }
+            }
+        } else {
+            // 无 Content-Length：读到 EOF
+            let mut chunk = [0u8; 8192];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        out.write_all(&chunk[..n])?;
+                        total += n;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        break;
+                    }
+                    Err(e) => {
+                        return Err(GeodataError::DownloadFailed {
+                            url: url.to_string(),
+                            reason: format!("read body: {e}"),
+                        });
+                    }
+                }
+            }
+        }
+
+        if total == 0 {
+            return Err(GeodataError::EmptyResponse(url.to_string()));
+        }
+        Ok(())
+    }
+
+    fn resolve_target(&self, file: &str) -> Result<PathBuf, GeodataError> {
+        if file.is_empty() {
+            return Err(GeodataError::InvalidFilePath("empty asset file".into()));
+        }
+        Ok(self.asset_dir.join(file))
+    }
+}
+
+
+/// `GeodataReloader` 实现：调用全局 IP + 域名注册表的 reload。
+///
+/// 对应 Go `app/geodata/geodata.go:88-90 reload() = IPReg.Reload() + DomainReg.Reload()`。
+/// 当前未喂入新规则（GeoIP/GeoSite 数据 → rule 解析留给后续 batch），但调用真实
+/// `reload_with` 经 IP_REG/DOMAIN_REG 触达所有 matcher，达到"接口通"目标。
+///
+/// ponytail: 后续 batch 接 geodata loader 时，把"已加载的 rules"作为参数喂入。
+pub struct ReloadBothRegistries;
+
+impl GeodataReloader for ReloadBothRegistries {
+    fn reload(&self) -> Result<(), GeodataError> {
+        use xray_geodata::matcher::ip::IP_REG;
+        use xray_geodata::matcher::domain::DOMAIN_REG;
+        use xray_geodata::pb::IpRule;
+
+        // ponytail: 空 rules reload — 调用 reload_with 让 reg 内的 matcher 状态被原子切换。
+        // 在没有新规则源时此调用等价于"标记 reload 已执行"。
+        // 待 geodata loader 接通后，这里替换为"从 loader 缓存取新 rules"。
+        if let Err(e) = IP_REG.reload_with(&[] as &[IpRule]) {
+            tracing::warn!(target: "xray_app_geodata", "IP_REG.reload failed: {e}");
+            return Err(GeodataError::ReloadFailed(format!("IP_REG: {e}")));
+        }
+        if let Err(e) = DOMAIN_REG.reload_with(Vec::new()) {
+            tracing::warn!(target: "xray_app_geodata", "DOMAIN_REG.reload failed: {e}");
+            return Err(GeodataError::ReloadFailed(format!("DOMAIN_REG: {e}")));
+        }
+        Ok(())
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

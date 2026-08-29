@@ -233,24 +233,24 @@ impl MphDomainMatcher {
                 DomainType::Full => {
                     mph.add_full_matcher(
                         &rule.value.to_lowercase(),
-                        rule.rule_id as u16,
+                        rule.rule_id,
                     );
                 }
                 DomainType::Domain => {
                     mph.add_domain_matcher(
                         &rule.value.to_lowercase(),
-                        rule.rule_id as u16,
+                        rule.rule_id,
                     );
                 }
                 DomainType::Substr => {
                     let matcher = super::SubstrMatcher::new(
                         rule.value.to_lowercase(),
                     );
-                    simple.add(Box::new(matcher), rule.rule_id as u16);
+                    simple.add(Box::new(matcher), rule.rule_id);
                 }
                 DomainType::Regex => {
                     let matcher = super::RegexMatcher::new(&rule.value)?;
-                    simple.add(Box::new(matcher), rule.rule_id as u16);
+                    simple.add(Box::new(matcher), rule.rule_id);
                 }
             }
         }
@@ -265,19 +265,8 @@ impl MphDomainMatcher {
 
 impl DomainMatcher for MphDomainMatcher {
     fn match_domain(&self, input: &str) -> Vec<u32> {
-        let mut results: Vec<u32> = self.mph
-            .match_str(input)
-            .into_iter()
-            .map(|v| v as u32)
-            .collect();
-
-        results.extend(
-            self.simple
-                .match_str(input)
-                .into_iter()
-                .map(|v| v as u32),
-        );
-
+        let mut results = self.mph.match_str(input);
+        results.extend(self.simple.match_str(input));
         results
     }
 
@@ -298,8 +287,7 @@ impl std::fmt::Debug for MphDomainMatcher {
 
 /// 值匹配器 trait（返回 u32 值）。
 ///
-/// 用于 CompactDomainMatcher 中的自定义匹配器部分，
-/// 区别于 `MatcherGroup`（返回 u16），此处返回 u32 以支持更大规则空间。
+/// 用于 CompactDomainMatcher 中的自定义匹配器部分。
 pub trait ValueMatcher: Send + Sync {
     /// 返回所有匹配的值列表。
     #[must_use]
@@ -469,7 +457,7 @@ impl DomainMatcherFactory for CompactDomainMatcherFactory {
 
         for rule in rules {
             let matcher = parse_domain(rule)?;
-            simple.add(matcher, rule.rule_id as u16);
+            simple.add(matcher, rule.rule_id);
         }
 
         // 包装 SimpleMatcherGroup 为 ValueMatcher
@@ -477,11 +465,7 @@ impl DomainMatcherFactory for CompactDomainMatcherFactory {
 
         impl ValueMatcher for SimpleValueMatcher {
             fn match_str(&self, input: &str) -> Vec<u32> {
-                self.0
-                    .match_str(input)
-                    .into_iter()
-                    .map(|v| v as u32)
-                    .collect()
+                self.0.match_str(input)
             }
         }
 
@@ -565,12 +549,14 @@ impl std::fmt::Debug for DynamicDomainMatcher {
 
 // ===== DomainRegistry =====
 
+use std::sync::Arc;
+
 /// 域名匹配器注册表。
 ///
 /// 对应 Go 版本 `DomainRegistry`，管理多个动态域名匹配器。
 pub struct DomainRegistry {
     factory: Box<dyn DomainMatcherFactory>,
-    matchers: Mutex<Vec<DynamicDomainMatcher>>,
+    matchers: Mutex<Vec<Arc<DynamicDomainMatcher>>>,
 }
 
 impl DomainRegistry {
@@ -584,25 +570,22 @@ impl DomainRegistry {
 
     /// 添加规则并创建新的动态匹配器。
     ///
-    /// 返回新匹配器的索引。
+    /// 返回新匹配器的 Arc 引用（用于 reload 时触达同一实例）。
     pub fn add_rules(
         &self,
         rules: Vec<DomainRule>,
-    ) -> Result<usize, MatcherError> {
-        let matcher = DynamicDomainMatcher::new();
+    ) -> Result<Arc<DynamicDomainMatcher>, MatcherError> {
+        let matcher = Arc::new(DynamicDomainMatcher::new());
         matcher.set_rules(rules, self.factory.as_ref())?;
         let mut matchers = self.matchers.lock().unwrap();
-        let idx = matchers.len();
-        matchers.push(matcher);
-        Ok(idx)
+        matchers.push(Arc::clone(&matcher));
+        Ok(matcher)
     }
 
     /// 查询指定索引的匹配器。
     pub fn get_matcher(&self, idx: usize) -> Option<DomainRegistryGuard<'_>> {
         let guard = self.matchers.lock().unwrap();
         if idx < guard.len() {
-            // 释放 Mutex 守卫，返回一个轻量级引用
-            // 由于 Mutex 的限制，这里返回索引供后续使用
             drop(guard);
             Some(DomainRegistryGuard {
                 registry: self,
@@ -624,7 +607,29 @@ impl DomainRegistry {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// 用新规则重建所有匹配器（原子热切换）。
+    ///
+    /// 对应 Go `DomainRegistry.Reload`：每个 entry 用 new_rules 重建。
+    pub fn reload_with(
+        &self,
+        new_rules: Vec<DomainRule>,
+    ) -> Result<(), MatcherError> {
+        let factory = self.factory.as_ref();
+        // 拷出 matcher 引用，避免长持锁。
+        let matchers: Vec<Arc<DynamicDomainMatcher>> = {
+            let g = self.matchers.lock().unwrap();
+            g.iter().cloned().collect()
+        };
+
+        for m in &matchers {
+            m.set_rules(new_rules.clone(), factory)?;
+        }
+        Ok(())
+    }
 }
+
+
 
 impl std::fmt::Debug for DomainRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -654,7 +659,17 @@ impl<'a> DomainRegistryGuard<'a> {
         let guard = self.registry.matchers.lock().unwrap();
         guard[self.index].match_any(input)
     }
+
 }
+
+/// 全局域名注册表实例。
+///
+/// 对应 Go `commongeodata.DomainReg`。Routing 层在 reload 时通过此处
+/// 触达所有已注册的域名 matcher。如需 per-instance registry，优先本地 `new()`。
+pub static DOMAIN_REG: std::sync::LazyLock<DomainRegistry> =
+    std::sync::LazyLock::new(|| {
+        DomainRegistry::new(Box::new(MphDomainMatcherFactory::new()))
+    });
 
 // ===== 单元测试 =====
 
@@ -917,10 +932,9 @@ mod tests {
     #[test]
     fn test_domain_registry_add_and_match() {
         let registry = DomainRegistry::new(Box::new(MphDomainMatcherFactory::new()));
-        let idx = registry.add_rules(vec![
+        let _idx = registry.add_rules(vec![
             DomainRule::full("example.com", 1),
         ]).unwrap();
-        assert_eq!(idx, 0);
         assert_eq!(registry.len(), 1);
 
         let guard = registry.get_matcher(0).unwrap();

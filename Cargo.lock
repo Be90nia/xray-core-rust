@@ -6054,7 +6054,6 @@ dependencies = [
  "xray-app-log",
  "xray-buf",
  "xray-common",
- "xray-conf",
  "xray-core",
  "xray-proto",
  "xray-proxy-freedom",
@@ -6062,6 +6061,7 @@ dependencies = [
  "xray-proxy-trojan",
  "xray-proxy-vless",
  "xray-proxy-vmess",
+ "xray-reality",
  "xray-tls",
  "xray-transport",
 ]
