@@ -102,6 +102,298 @@ pub fn pick_portal_worker<W: PickerWorker>(
 pub type SharedBridge = Arc<dyn Bridge>;
 pub type SharedPortal = Arc<dyn Portal>;
 
+// ===========================================================================
+// 生产实体（RuntimeBridge / RuntimePortal / LinkDispatch）
+//
+// 对应 Go `app/reverse/bridge.go`（Bridge 编排：monitor 2s + worker 清理）
+// 与 `app/reverse/portal.go`（Portal 编排：picker + outbound 注册）。
+// ===========================================================================
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use xray_common::net::destination::Destination;
+
+use crate::worker::{BridgeWorker, PortalWorker};
+
+/// Bridge monitor 周期（Go `bridge.go:44` Interval: 2s）。
+pub const BRIDGE_MONITOR_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Portal picker 清理周期（Go `portal.go:149` Interval: 30s）。
+pub const PICKER_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// 真实 dispatcher 抽象（Go `routing.Dispatcher` + ctx inbound tag）。
+///
+/// 生产实现：[`DefaultDispatcherAdapter`]（包 `DefaultDispatcher::dispatch`，
+/// inbound_tag 参数等价 Go `session.ContextWithInbound`）。
+#[async_trait::async_trait]
+pub trait LinkDispatch: Send + Sync {
+    /// 返回式 dispatch（Go `routing.Dispatcher.Dispatch(ctx, dest) (*Link, error)`）。
+    async fn dispatch(
+        &self,
+        dest: &Destination,
+        inbound_tag: Option<&str>,
+    ) -> Result<xray_transport::link::Link, ReverseError>;
+
+    /// 消费式 dispatch（Go `routing.Dispatcher.DispatchLink`）。
+    async fn dispatch_link(
+        &self,
+        dest: &Destination,
+        link: xray_transport::link::Link,
+        inbound_tag: Option<&str>,
+    ) -> Result<(), ReverseError>;
+}
+
+/// 生产适配器：`DefaultDispatcher` → [`LinkDispatch`]。
+pub struct DefaultDispatcherAdapter(pub std::sync::Arc<xray_app_dispatcher::DefaultDispatcher>);
+
+#[async_trait::async_trait]
+impl LinkDispatch for DefaultDispatcherAdapter {
+    async fn dispatch(
+        &self,
+        dest: &Destination,
+        inbound_tag: Option<&str>,
+    ) -> Result<xray_transport::link::Link, ReverseError> {
+        self.0
+            .dispatch(
+                dest,
+                &xray_app_dispatcher::default::SniffingRequest::default(),
+                inbound_tag,
+                None,
+            )
+            .map_err(|e| ReverseError::CreateBridgeWorker(e.to_string()))
+    }
+
+    async fn dispatch_link(
+        &self,
+        dest: &Destination,
+        link: xray_transport::link::Link,
+        inbound_tag: Option<&str>,
+    ) -> Result<(), ReverseError> {
+        self.0
+            .dispatch_link(
+                dest,
+                link,
+                &xray_app_dispatcher::default::SniffingRequest::default(),
+                inbound_tag.map(|tag| xray_app_dispatcher::default::AccessContext {
+                    inbound_tag: tag.to_string(),
+                    ..Default::default()
+                }),
+                None,
+            )
+            .map_err(|e| ReverseError::CreateBridgeWorker(e.to_string()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RuntimeBridge
+// ---------------------------------------------------------------------------
+
+/// Bridge 编排：周期 monitor 维护 BridgeWorker 池。
+///
+/// 对应 Go `Bridge`（bridge.go:20-99）：
+/// - `monitor`（2s）：清理非活跃 worker；worker=0 或平均连接 > 16 时新建
+/// - `Start`/`Close`：启停 monitor 周期任务
+pub struct RuntimeBridge {
+    dispatcher: std::sync::Arc<dyn LinkDispatch>,
+    tag: String,
+    domain: String,
+    workers: std::sync::Arc<parking_lot::Mutex<Vec<std::sync::Arc<BridgeWorker>>>>,
+    running: AtomicBool,
+}
+
+impl RuntimeBridge {
+    /// 对应 Go `NewBridge`（bridge.go:29-47）。
+    pub fn new(
+        config: &BridgeConfig,
+        dispatcher: std::sync::Arc<dyn LinkDispatch>,
+    ) -> Result<Self, ReverseError> {
+        validate_bridge_config(config)?;
+        Ok(Self {
+            dispatcher,
+            tag: config.tag.clone(),
+            domain: config.domain.clone(),
+            workers: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            running: AtomicBool::new(false),
+        })
+    }
+
+    /// monitor 一轮（Go `Bridge.monitor`，bridge.go:68-91）。
+    async fn monitor_step(
+        dispatcher: &std::sync::Arc<dyn LinkDispatch>,
+        domain: &str,
+        tag: &str,
+        workers: &std::sync::Arc<parking_lot::Mutex<Vec<std::sync::Arc<BridgeWorker>>>>,
+    ) -> Result<(), ReverseError> {
+        // cleanup（bridge.go:49-66）：保留 IsActive worker。
+        // Go 对 Closed worker 调 Timer.SetTimeout(0)——terminate=worker.Close 已
+        // 关闭，为幂等 no-op，此处等价省略。
+        workers.lock().retain(|w| w.is_active());
+
+        // 快照后逐个 await（parking_lot guard 不可跨 await）
+        let active: Vec<std::sync::Arc<BridgeWorker>> = workers
+            .lock()
+            .iter()
+            .filter(|w| w.is_active())
+            .cloned()
+            .collect();
+        let mut num_connections = 0u32;
+        let num_worker = active.len() as u32;
+        for w in &active {
+            num_connections += w.connections().await;
+        }
+
+        if should_create_bridge_worker(num_worker as usize, num_connections) {
+            match BridgeWorker::new(domain, tag, std::sync::Arc::clone(dispatcher)).await {
+                Ok(w) => workers.lock().push(w),
+                Err(e) => {
+                    // Go bridge.go:83-86：LogWarning + return nil（不中断 monitor）
+                    crate::error::at_warning(&e);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Bridge for RuntimeBridge {
+    fn start(&self) -> Result<(), ReverseError> {
+        if self.running.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let dispatcher = std::sync::Arc::clone(&self.dispatcher);
+        let domain = self.domain.clone();
+        let tag = self.tag.clone();
+        let workers = std::sync::Arc::clone(&self.workers);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(BRIDGE_MONITOR_INTERVAL).await;
+                if Self::monitor_step(&dispatcher, &domain, &tag, &workers)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Ok(())
+    }
+
+    fn close(&self) -> Result<(), ReverseError> {
+        // Go `Bridge.Close` = monitorTask.Close()（worker 交由各自 timer 收尾）
+        self.running.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    fn worker_count(&self) -> usize {
+        self.workers.lock().len()
+    }
+
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    fn domain(&self) -> &str {
+        &self.domain
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RuntimePortal
+// ---------------------------------------------------------------------------
+
+/// Portal 编排：picker + outbound 注册。
+///
+/// 对应 Go `Portal`（portal.go:23-101）：
+/// - `Start`：`ohm.AddHandler(tag, &Outbound{...})`；`Close`：RemoveHandler
+/// - `HandleConnection`（经 [`crate::outbound::PortalOutbound`]）：目标域命中 →
+///   建 ClientWorker+PortalWorker；否则 picker 选 worker dispatch
+pub struct RuntimePortal {
+    registrar: std::sync::Arc<dyn crate::outbound::OutboundRegistrar>,
+    tag: String,
+    domain: String,
+    picker: std::sync::Arc<StaticMuxPicker<std::sync::Arc<PortalWorker>>>,
+    running: AtomicBool,
+}
+
+impl RuntimePortal {
+    /// 对应 Go `NewPortal`（portal.go:31-54）。
+    pub fn new(
+        config: &PortalConfig,
+        registrar: std::sync::Arc<dyn crate::outbound::OutboundRegistrar>,
+    ) -> Result<Self, ReverseError> {
+        validate_portal_config(config)?;
+        Ok(Self {
+            registrar,
+            tag: config.tag.clone(),
+            domain: config.domain.clone(),
+            picker: std::sync::Arc::new(StaticMuxPicker::new()),
+            running: AtomicBool::new(false),
+        })
+    }
+
+    pub fn picker(&self) -> &std::sync::Arc<StaticMuxPicker<std::sync::Arc<PortalWorker>>> {
+        &self.picker
+    }
+}
+
+impl Portal for RuntimePortal {
+    fn start(&self) -> Result<(), ReverseError> {
+        if self.running.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        // Go portal.go:56-61：AddHandler；picker 30s cleanup（portal.go:145-152）
+        self.registrar.add_handler(
+            &self.tag,
+            std::sync::Arc::new(crate::outbound::PortalOutbound::new(
+                self.tag.clone(),
+                std::sync::Arc::clone(&self.picker),
+                self.domain.clone(),
+            )),
+        )?;
+        let picker = std::sync::Arc::clone(&self.picker);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(PICKER_CLEANUP_INTERVAL).await;
+                picker.cleanup();
+            }
+        });
+        Ok(())
+    }
+
+    fn close(&self) -> Result<(), ReverseError> {
+        self.running.store(false, Ordering::Release);
+        self.registrar.remove_handler(&self.tag)
+    }
+
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    fn domain(&self) -> &str {
+        &self.domain
+    }
+}
+
+/// Portal worker 的 [`PickerWorker`](crate::picker::PickerWorker) 转发（Arc 容器）。
+impl crate::picker::PickerWorker for std::sync::Arc<PortalWorker> {
+    fn is_full(&self) -> bool {
+        (**self).is_full()
+    }
+
+    fn is_closed(&self) -> bool {
+        (**self).is_closed()
+    }
+
+    fn is_draining(&self) -> bool {
+        (**self).is_draining()
+    }
+
+    fn active_connections(&self) -> u32 {
+        (**self).active_connections()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

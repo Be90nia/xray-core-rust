@@ -99,6 +99,138 @@ impl<B: Bridge, P: Portal> Reverse<B, P> {
     }
 }
 
+// ===========================================================================
+// ReverseFeature：xray_features::Feature 适配 + 生产工厂
+//
+// 对应 Go `app/reverse/reverse.go`：init() 注册 Config factory +
+// Reverse.Init(d, ohm) + Start/Close。Go v26 已移除 JSON reverse 配置
+// （infra/conf xray.go PrintRemovedFeatureError），app/reverse 仅经 VLESS
+// reverse（v1.rvs.cool）程序化消费——本 Feature 同样面向程序化构造：
+// factory 建 feature（proto Config），dispatcher/registrar 经
+// [`ReverseFeature::set_deps`] 注入（对应 Go core.RequireFeatures）后 start。
+// ===========================================================================
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use xray_features::{Feature, FeatureError};
+
+use crate::bridge::{LinkDispatch, RuntimeBridge, RuntimePortal};
+use crate::outbound::OutboundRegistrar;
+
+/// Reverse 运行时依赖（对应 Go `core.RequireFeatures(routing.Dispatcher, outbound.Manager)`）。
+#[derive(Clone)]
+pub struct ReverseDeps {
+    pub dispatcher: Arc<dyn LinkDispatch>,
+    pub registrar: Arc<dyn OutboundRegistrar>,
+}
+
+/// Bridge 工厂：[`RuntimeBridge`]。
+pub struct RuntimeBridgeFactory(pub Arc<dyn LinkDispatch>);
+
+impl crate::bridge::BridgeFactory for RuntimeBridgeFactory {
+    type Bridge = RuntimeBridge;
+
+    fn create(&self, config: &crate::config::BridgeConfig) -> Result<RuntimeBridge, ReverseError> {
+        RuntimeBridge::new(config, Arc::clone(&self.0))
+    }
+}
+
+/// Portal 工厂：[`RuntimePortal`]。
+pub struct RuntimePortalFactory(pub Arc<dyn OutboundRegistrar>);
+
+impl crate::bridge::PortalFactory for RuntimePortalFactory {
+    type Portal = RuntimePortal;
+
+    fn create(&self, config: &crate::config::PortalConfig) -> Result<RuntimePortal, ReverseError> {
+        RuntimePortal::new(config, Arc::clone(&self.0))
+    }
+}
+
+/// Reverse Feature：编排 bridges + portals（对应 Go `Reverse` struct，reverse.go:38-94）。
+///
+/// 生命周期：`new(config)` → `set_deps`（dispatcher + registrar）→ `start`
+/// （Go `Init` + `Start`：先 bridges 后 portals）→ `close`。
+pub struct ReverseFeature {
+    config: ReverseConfig,
+    deps: parking_lot::RwLock<Option<ReverseDeps>>,
+    inner: parking_lot::RwLock<Option<Reverse<RuntimeBridge, RuntimePortal>>>,
+    started: AtomicBool,
+}
+
+impl ReverseFeature {
+    #[must_use]
+    pub fn new(config: ReverseConfig) -> Self {
+        Self {
+            config,
+            deps: parking_lot::RwLock::new(None),
+            inner: parking_lot::RwLock::new(None),
+            started: AtomicBool::new(false),
+        }
+    }
+
+    /// 注入运行时依赖（对应 Go `core.RequireFeatures`，factory 时刻不可得）。
+    pub fn set_deps(
+        &self,
+        dispatcher: Arc<dyn LinkDispatch>,
+        registrar: Arc<dyn OutboundRegistrar>,
+    ) {
+        *self.deps.write() = Some(ReverseDeps {
+            dispatcher,
+            registrar,
+        });
+    }
+
+    pub fn config(&self) -> &ReverseConfig {
+        &self.config
+    }
+}
+
+impl Feature for ReverseFeature {
+    fn feature_name(&self) -> &'static str {
+        "ReverseFeature"
+    }
+
+    fn start(&self) -> Result<(), FeatureError> {
+        let err = |e: ReverseError| FeatureError::StartFailed {
+            name: "ReverseFeature",
+            message: e.to_string(),
+        };
+        let Some(deps) = self.deps.read().clone() else {
+            // 未注入依赖（对应 Go RequireFeatures 失败）：warn + 跳过
+            tracing::warn!(
+                target: "xray_app_reverse",
+                "reverse feature start skipped: no dispatcher/registrar injected"
+            );
+            return Ok(());
+        };
+        if self.started.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let mut reverse = Reverse::new(self.config.clone());
+        reverse
+            .init(
+                &RuntimeBridgeFactory(deps.dispatcher),
+                &RuntimePortalFactory(deps.registrar),
+            )
+            .map_err(err)?;
+        reverse.start().map_err(err)?;
+        *self.inner.write() = Some(reverse);
+        Ok(())
+    }
+
+    fn close(&self) -> Result<(), FeatureError> {
+        self.started.store(false, Ordering::Release);
+        if let Some(r) = self.inner.read().as_ref() {
+            r.close().map_err(|e| FeatureError::CloseFailed {
+                name: "ReverseFeature",
+                message: e.to_string(),
+            })?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,5 +447,106 @@ mod tests {
         r.init(&StubBridgeFactory, &StubPortalFactory).unwrap();
         assert_eq!(r.bridge_count(), 0);
         assert_eq!(r.portal_count(), 0);
+    }
+}
+
+// ===========================================================================
+// ReverseFeature 测试
+// ===========================================================================
+
+#[cfg(test)]
+mod feature_tests {
+    use super::*;
+    use crate::bridge::LinkDispatch;
+    use crate::config::{BridgeConfig, PortalConfig};
+    use crate::outbound::StubOutboundRegistrar;
+    use xray_buf::pipe;
+    use xray_common::net::destination::Destination;
+
+    #[derive(Default)]
+    struct MockLinkDispatch;
+
+    #[async_trait::async_trait]
+    impl LinkDispatch for MockLinkDispatch {
+        async fn dispatch(
+            &self,
+            _dest: &Destination,
+            _inbound_tag: Option<&str>,
+        ) -> Result<xray_transport::link::Link, ReverseError> {
+            let (r, w) = pipe::new();
+            Ok(xray_transport::link::Link::new(Box::new(r), Box::new(w)))
+        }
+
+        async fn dispatch_link(
+            &self,
+            _dest: &Destination,
+            _link: xray_transport::link::Link,
+            _inbound_tag: Option<&str>,
+        ) -> Result<(), ReverseError> {
+            Ok(())
+        }
+    }
+
+    fn sample_config() -> ReverseConfig {
+        ReverseConfig {
+            bridges: vec![BridgeConfig {
+                tag: "bridge".into(),
+                domain: "t.example.com".into(),
+            }],
+            portals: vec![PortalConfig {
+                tag: "portal".into(),
+                domain: "t.example.com".into(),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn feature_start_registers_portal_outbound_and_closes() {
+        let registrar = Arc::new(StubOutboundRegistrar::new());
+        let feature = ReverseFeature::new(sample_config());
+        feature.set_deps(
+            Arc::new(MockLinkDispatch),
+            Arc::clone(&registrar) as Arc<dyn crate::outbound::OutboundRegistrar>,
+        );
+
+        feature.start().expect("start");
+        assert_eq!(registrar.count(), 1, "portal outbound registered");
+        assert_eq!(registrar.tags(), vec!["portal".to_string()]);
+
+        // 幂等 start
+        feature.start().expect("start idempotent");
+        assert_eq!(registrar.count(), 1);
+
+        feature.close().expect("close");
+        assert_eq!(registrar.count(), 0, "portal outbound removed");
+    }
+
+    #[test]
+    fn feature_start_without_deps_warns_and_skips() {
+        let feature = ReverseFeature::new(sample_config());
+        // 无依赖：warn + Ok（对应 Go RequireFeatures 失败场景的安全降级）
+        feature.start().expect("start skipped without deps");
+        feature.close().expect("close");
+    }
+
+    #[tokio::test]
+    async fn feature_invalid_config_propagates() {
+        let registrar = Arc::new(StubOutboundRegistrar::new());
+        let feature = ReverseFeature::new(ReverseConfig {
+            bridges: vec![BridgeConfig {
+                tag: String::new(),
+                domain: "d".into(),
+            }],
+            portals: vec![],
+        });
+        feature.set_deps(
+            Arc::new(MockLinkDispatch),
+            Arc::clone(&registrar) as Arc<dyn crate::outbound::OutboundRegistrar>,
+        );
+        let err = feature.start().unwrap_err();
+        assert!(
+            matches!(err, FeatureError::StartFailed { .. }),
+            "invalid bridge config propagates: {err:?}"
+        );
     }
 }

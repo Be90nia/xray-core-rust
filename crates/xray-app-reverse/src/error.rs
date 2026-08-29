@@ -55,8 +55,17 @@ pub enum ReverseError {
     #[error("proto marshal/unmarshal failed: {0}")]
     ProtoError(String),
 
+    #[error("proto decode failed: {0}")]
+    ProtoDecode(String),
+
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl From<prost::DecodeError> for ReverseError {
+    fn from(e: prost::DecodeError) -> Self {
+        Self::ProtoDecode(e.to_string())
+    }
 }
 
 pub fn at_warning(err: &ReverseError) {

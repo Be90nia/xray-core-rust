@@ -46,6 +46,8 @@ pub fn register_all_features() {
     let _ = registry::register_feature("burstObservatory", simple_feature_factory("burstObservatory"));
     let _ = registry::register_feature("version", simple_feature_factory("version"));
     let _ = registry::register_feature("geodata", geodata_factory());
+    // Reverse：proto Config 程序化构造（Go v26 已移除 JSON 配置路径，见 reverse_factory）
+    let _ = registry::register_feature("reverse", reverse_factory());
 
     // --- Proxy inbound kinds ---
     for &kind in PROXY_INBOUND_KINDS {
@@ -482,6 +484,33 @@ impl AppStatsFeature {
     pub fn manager(&self) -> &std::sync::Arc<xray_app_stats::Manager> {
         &self.manager
     }
+}
+
+/// Reverse app factory：prost 解码 `xray.app.reverse.Config` → [`ReverseFeature`]。
+///
+/// 对应 Go `app/reverse` 的 `init()` + `New(ctx, config)`。Go v26 已移除 JSON
+/// reverse 配置（`infra/conf/xray.go:569-571` PrintRemovedFeatureError，迁移至
+/// VLESS Reverse Proxy），app/reverse 仅经 VLESS（`v1.rvs.cool`）程序化消费——
+/// 故本 factory 不经 xray-conf（顶层 `reverse` 字段被 `ConfError::Removed` 拦截），
+/// 消费方（VLESS 反向代理 / 程序化装配）直接以 proto 字节调用。
+///
+/// dispatcher/registrar 在 factory 时刻不可得（对应 Go `core.RequireFeatures`），
+/// 经 [`ReverseFeature::set_deps`] 注入后 `Feature::start` 生效；未注入时
+/// start 为 warn+跳过。
+fn reverse_factory() -> FeatureFactory {
+    use prost::Message as _;
+    Arc::new(|data: &[u8]| {
+        let proto = xray_proto::xray::app::reverse::Config::decode(data).map_err(|e| {
+            FeatureError::StartFailed {
+                name: "reverse",
+                message: format!("config decode: {e}"),
+            }
+        })?;
+        let feature = xray_app_reverse::ReverseFeature::new(
+            xray_app_reverse::ReverseConfig::from_proto(&proto),
+        );
+        Ok(Arc::new(feature) as Arc<dyn Feature>)
+    })
 }
 
 impl Default for AppStatsFeature {

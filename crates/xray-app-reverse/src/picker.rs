@@ -102,6 +102,15 @@ impl<W: PickerWorker> StaticMuxPicker<W> {
         best_idx.ok_or(ReverseError::NoWorkerAvailable)
     }
 
+    /// 选择并克隆最少连接 worker（生产路径：`W = Arc<PortalWorker>`）。
+    pub fn pick_available(&self) -> Result<W, ReverseError>
+    where
+        W: Clone,
+    {
+        let idx = self.pick_available_index()?;
+        Ok(self.workers.lock()[idx].clone())
+    }
+
     /// 取不可变借用 snapshot：所有 worker 的元信息（用于测试）。
     pub fn snapshot(&self) -> Vec<WorkerSnapshot> {
         self.workers

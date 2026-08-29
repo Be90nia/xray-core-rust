@@ -9,11 +9,17 @@ rust-version.workspace = true
 xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
 xray-proto = { path = "../xray-proto" }
+xray-buf = { path = "../xray-buf" }
+xray-transport = { path = "../xray-transport" }
+xray-mux = { path = "../xray-mux" }
+xray-app-dispatcher = { path = "../xray-app-dispatcher" }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "time", "macros", "sync", "rt"] }
+prost = { workspace = true }
+async-trait = { workspace = true }
 # yamux 多路复用：bridge↔portal 单 TCP 承载多个并发子流（与 Go hashicorp/yamux 线格式互通）
 yamux = { workspace = true }
 # futures↔tokio AsyncRead/Write 适配（yamux 用 futures traits）

@@ -1,103 +1,68 @@
-//! Portal outbound handler 集成（IO 边界 trait stub）。
+//! Portal outbound handler 集成。
 //!
-//! 对应 Go `portal.go` 的 `Outbound` struct（实现 `outbound.Handler`）+
+//! 对应 Go `portal.go` 的 `Outbound` struct（实现 `outbound.Handler.Dispatch`）+
 //! `Portal.Start()` 调用 `ohm.AddHandler` / `Portal.Close()` 调用 `ohm.RemoveHandler`。
 //!
-//! ## Rust 化策略
-//!
-//! - **不引入 transport::Link**：dispatch 依赖 transport 全链路 + mux，当前阶段留
-//!   trait 定义 + stub struct（与 `xray-app-commander/src/outbound.rs` 同模式）
-//! - **OutboundRegistrar trait**：对应 Go `outbound.Manager.AddHandler/RemoveHandler`，
-//!   上层 proxyman 注入实现
-//! - **ReverseOutboundHandler trait**：对应 Go `Outbound` struct，tag/closed/start/close
-//!   可独立测试；dispatch 方法留待 transport 就绪后补充
+//! - [`OutboundRegistrar`]：对应 Go `outbound.Manager.AddHandler/RemoveHandler`，
+//!   生产实现 [`SimpleOhmRegistrar`]（包 xray-app-dispatcher 的 `SimpleOhm`）
+//! - [`PortalOutbound`]：注册进 outbound manager 的 portal 出站 handler，
+//!   `dispatch` = Go `Outbound.Dispatch` → `Portal.HandleConnection`
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use xray_app_dispatcher::DispatchHandler;
+use xray_app_dispatcher::default::SimpleOhm;
+use xray_common::net::destination::Destination;
+use xray_mux::client::{ClientWorker, Link as MuxLink};
+use xray_mux::session::ClientStrategy;
+use xray_transport::link::Link as TransportLink;
+
+use crate::bridge::is_domain;
 use crate::error::ReverseError;
+use crate::picker::StaticMuxPicker;
+use crate::worker::PortalWorker;
 
 /// Outbound handler 注册 trait。
 ///
 /// 对应 Go `outbound.Manager.AddHandler / RemoveHandler`。
 /// Portal 在 `start()` 时注册、`close()` 时注销。
 pub trait OutboundRegistrar: Send + Sync {
-    /// 注册 handler。
-    fn add_handler(&self, handler: Arc<dyn ReverseOutboundHandler>) -> Result<(), ReverseError>;
+    /// 注册 handler（tag 对应 Portal.tag）。
+    fn add_handler(
+        &self,
+        tag: &str,
+        handler: Arc<dyn DispatchHandler>,
+    ) -> Result<(), ReverseError>;
 
     /// 按 tag 注销 handler。
     fn remove_handler(&self, tag: &str) -> Result<(), ReverseError>;
 }
 
-/// Reverse outbound handler 接口。
-///
-/// 对应 Go `portal.go` 的 `Outbound` struct（实现 `outbound.Handler`）。
-/// `dispatch` 依赖 `transport::Link` + mux，当前阶段留 trait 定义，
-/// 上层注入实现。
-pub trait ReverseOutboundHandler: Send + Sync {
-    /// handler 标识（与 Portal.tag 对应）。
-    fn tag(&self) -> &str;
+/// 生产注册器：`SimpleOhm`（xray-app-dispatcher）→ [`OutboundRegistrar`]。
+pub struct SimpleOhmRegistrar(pub Arc<SimpleOhm>);
 
-    /// 是否已关闭。
-    fn closed(&self) -> bool;
+impl OutboundRegistrar for SimpleOhmRegistrar {
+    fn add_handler(
+        &self,
+        tag: &str,
+        handler: Arc<dyn DispatchHandler>,
+    ) -> Result<(), ReverseError> {
+        self.0.add(tag, handler);
+        Ok(())
+    }
 
-    /// 启动 handler。
-    fn start(&self) -> Result<(), ReverseError>;
-
-    /// 关闭 handler。
-    fn close(&self) -> Result<(), ReverseError>;
-}
-
-/// 默认 handler 占位（无实际 dispatch，仅记录状态）。
-///
-/// 用于测试编排流程。实际场景由上层注入实现。
-pub struct StubOutboundHandler {
-    tag: String,
-    closed: AtomicBool,
-}
-
-impl StubOutboundHandler {
-    #[must_use]
-    pub fn new(tag: impl Into<String>) -> Self {
-        Self {
-            tag: tag.into(),
-            closed: AtomicBool::new(true),
+    fn remove_handler(&self, tag: &str) -> Result<(), ReverseError> {
+        if self.0.remove(tag) {
+            Ok(())
+        } else {
+            Err(ReverseError::OutboundMetadataMissing)
         }
     }
 }
 
-impl ReverseOutboundHandler for StubOutboundHandler {
-    fn tag(&self) -> &str {
-        &self.tag
-    }
-
-    fn closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
-    }
-
-    fn start(&self) -> Result<(), ReverseError> {
-        self.closed.store(false, Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn close(&self) -> Result<(), ReverseError> {
-        self.closed.store(true, Ordering::SeqCst);
-        Ok(())
-    }
-}
-
-impl std::fmt::Debug for StubOutboundHandler {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StubOutboundHandler")
-            .field("tag", &self.tag)
-            .field("closed", &self.closed())
-            .finish()
-    }
-}
-
-/// 测试用 stub registrar。
+/// 测试用注册器：记录 `(tag, handler)` 列表。
 pub struct StubOutboundRegistrar {
-    handlers: parking_lot::Mutex<Vec<Arc<dyn ReverseOutboundHandler>>>,
+    handlers: parking_lot::Mutex<Vec<(String, Arc<dyn DispatchHandler>)>>,
 }
 
 impl StubOutboundRegistrar {
@@ -111,6 +76,10 @@ impl StubOutboundRegistrar {
     pub fn count(&self) -> usize {
         self.handlers.lock().len()
     }
+
+    pub fn tags(&self) -> Vec<String> {
+        self.handlers.lock().iter().map(|(t, _)| t.clone()).collect()
+    }
 }
 
 impl Default for StubOutboundRegistrar {
@@ -120,19 +89,134 @@ impl Default for StubOutboundRegistrar {
 }
 
 impl OutboundRegistrar for StubOutboundRegistrar {
-    fn add_handler(&self, handler: Arc<dyn ReverseOutboundHandler>) -> Result<(), ReverseError> {
-        self.handlers.lock().push(handler);
+    fn add_handler(
+        &self,
+        tag: &str,
+        handler: Arc<dyn DispatchHandler>,
+    ) -> Result<(), ReverseError> {
+        self.handlers.lock().push((tag.to_string(), handler));
         Ok(())
     }
 
     fn remove_handler(&self, tag: &str) -> Result<(), ReverseError> {
         let mut handlers = self.handlers.lock();
         let before = handlers.len();
-        handlers.retain(|h| h.tag() != tag);
+        handlers.retain(|(t, _)| t != tag);
         if handlers.len() == before {
             return Err(ReverseError::OutboundMetadataMissing);
         }
         Ok(())
+    }
+}
+
+/// Portal outbound handler（对应 Go `portal.go` 的 `Outbound`，104-119 行）。
+///
+/// 持 picker + portal domain；`dispatch` 即 Go `Portal.HandleConnection`
+/// （portal.go:67-101）：
+/// - 目标域 == portal domain：本连接是 bridge 建来的反向 carrier——
+///   `mux.NewClientWorker(link)` + `NewPortalWorker` + `picker.AddWorker`
+/// - 其余：picker 选 worker，dispatch 子会话到 carrier
+pub struct PortalOutbound {
+    tag: String,
+    picker: Arc<StaticMuxPicker<Arc<PortalWorker>>>,
+    domain: String,
+}
+
+impl PortalOutbound {
+    #[must_use]
+    pub fn new(
+        tag: String,
+        picker: Arc<StaticMuxPicker<Arc<PortalWorker>>>,
+        domain: String,
+    ) -> Self {
+        Self { tag, picker, domain }
+    }
+
+    /// 对应 Go `Portal.HandleConnection`（portal.go:67-101）。
+    pub async fn handle_connection(
+        &self,
+        dest: &Destination,
+        link: TransportLink,
+    ) -> Result<(), ReverseError> {
+        if is_domain(dest.address().as_domain(), &self.domain) {
+            // 反向 carrier：在链路上起 mux client + portal worker
+            let client = ClientWorker::new(
+                MuxLink {
+                    reader: link.reader,
+                    writer: link.writer,
+                },
+                ClientStrategy::default(),
+            );
+            let worker = PortalWorker::new(client.clone()).map_err(|e| {
+                // Go Outbound.Dispatch 出错时 Interrupt(link)；此处 link 已并入
+                // ClientWorker，close 等价拆除
+                client.close();
+                e
+            })?;
+            self.picker.add_worker(worker);
+            // Go portal.go:87-92：reader 为 pipe 时立即返回（carrier 会话由
+            // ClientWorker 内部驱动，本函数无需等待）
+            return Ok(());
+        }
+
+        // 常规连接：picker 选 worker 后 dispatch。
+        // Go portal.go:96-99 的 UDP EndpointOverride（OriginalTarget ctx）无 Rust
+        // 对应物（dispatch 签名无 OriginalTarget），不翻译。
+        // Go ClientManager.Dispatch 仅对非 pipe reader 等待会话结束；Rust
+        // ClientWorker::dispatch 统一等待 → spawn 等价。
+        let worker = self.picker.pick_available()?;
+        let d = dest.clone();
+        tokio::spawn(async move {
+            worker
+                .client()
+                .dispatch(
+                    &d,
+                    MuxLink {
+                        reader: link.reader,
+                        writer: link.writer,
+                    },
+                )
+                .await;
+        });
+        Ok(())
+    }
+}
+
+impl DispatchHandler for PortalOutbound {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    /// 对应 Go `Outbound.Dispatch`（portal.go:113-119）：HandleConnection；
+    /// 出错 log + 拆链（Go Interrupt，此处已并入 handle_connection 错误路径）。
+    fn dispatch(
+        &self,
+        dest: &Destination,
+        link: TransportLink,
+    ) -> xray_app_dispatcher::default::PinFuture<()> {
+        let tag = self.tag.clone();
+        let picker = Arc::clone(&self.picker);
+        let domain = self.domain.clone();
+        let dest = dest.clone();
+        Box::pin(async move {
+            let outbound = PortalOutbound { tag, picker, domain };
+            if let Err(e) = outbound.handle_connection(&dest, link).await {
+                tracing::info!(
+                    target: "xray_app_reverse",
+                    error = %e,
+                    "failed to process reverse connection"
+                );
+            }
+        })
+    }
+}
+
+impl std::fmt::Debug for PortalOutbound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PortalOutbound")
+            .field("tag", &self.tag)
+            .field("domain", &self.domain)
+            .finish()
     }
 }
 
@@ -141,63 +225,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stub_handler_tag() {
-        let h = StubOutboundHandler::new("portal_out");
-        assert_eq!(h.tag(), "portal_out");
-    }
-
-    #[test]
-    fn stub_handler_initial_closed() {
-        let h = StubOutboundHandler::new("portal_out");
-        assert!(h.closed(), "stub 初始为 closed 状态");
-    }
-
-    #[test]
-    fn stub_handler_start_open() {
-        let h = StubOutboundHandler::new("portal_out");
-        h.start().unwrap();
-        assert!(!h.closed());
-    }
-
-    #[test]
-    fn stub_handler_close_close() {
-        let h = StubOutboundHandler::new("portal_out");
-        h.start().unwrap();
-        h.close().unwrap();
-        assert!(h.closed());
-    }
-
-    #[test]
-    fn stub_handler_start_close_start() {
-        let h = StubOutboundHandler::new("portal_out");
-        h.start().unwrap();
-        h.close().unwrap();
-        h.start().unwrap();
-        assert!(!h.closed());
-    }
-
-    #[test]
-    fn stub_handler_debug_format() {
-        let h = StubOutboundHandler::new("portal_out");
-        let s = format!("{h:?}");
-        assert!(s.contains("StubOutboundHandler"));
-        assert!(s.contains("portal_out"));
-    }
-
-    #[test]
-    fn reverse_outbound_handler_trait_object_safe() {
-        let h: Arc<dyn ReverseOutboundHandler> = Arc::new(StubOutboundHandler::new("portal_out"));
-        assert_eq!(h.tag(), "portal_out");
-        h.start().unwrap();
-        assert!(!h.closed());
-    }
-
-    #[test]
     fn stub_registrar_add_remove() {
         let reg = StubOutboundRegistrar::new();
-        let h: Arc<dyn ReverseOutboundHandler> = Arc::new(StubOutboundHandler::new("portal_out"));
-        reg.add_handler(h).unwrap();
+        let h = Arc::new(PortalOutbound::new(
+            "portal_out".into(),
+            Arc::new(StaticMuxPicker::new()),
+            "t.example.com".into(),
+        )) as Arc<dyn DispatchHandler>;
+        reg.add_handler("portal_out", h).unwrap();
         assert_eq!(reg.count(), 1);
+        assert_eq!(reg.tags(), vec!["portal_out".to_string()]);
         reg.remove_handler("portal_out").unwrap();
         assert_eq!(reg.count(), 0);
     }
@@ -212,8 +249,15 @@ mod tests {
     #[test]
     fn stub_registrar_add_multiple() {
         let reg = StubOutboundRegistrar::new();
-        reg.add_handler(Arc::new(StubOutboundHandler::new("a"))).unwrap();
-        reg.add_handler(Arc::new(StubOutboundHandler::new("b"))).unwrap();
+        let mk = |t: &str| {
+            Arc::new(PortalOutbound::new(
+                t.into(),
+                Arc::new(StaticMuxPicker::new()),
+                "d".into(),
+            )) as Arc<dyn DispatchHandler>
+        };
+        reg.add_handler("a", mk("a")).unwrap();
+        reg.add_handler("b", mk("b")).unwrap();
         assert_eq!(reg.count(), 2);
         reg.remove_handler("a").unwrap();
         assert_eq!(reg.count(), 1);
@@ -223,5 +267,17 @@ mod tests {
     fn stub_registrar_default_is_empty() {
         let reg = StubOutboundRegistrar::default();
         assert_eq!(reg.count(), 0);
+    }
+
+    #[test]
+    fn portal_outbound_debug_format() {
+        let h = PortalOutbound::new(
+            "portal_out".into(),
+            Arc::new(StaticMuxPicker::new()),
+            "d.example.com".into(),
+        );
+        let s = format!("{h:?}");
+        assert!(s.contains("PortalOutbound"));
+        assert!(s.contains("portal_out"));
     }
 }
