@@ -51,14 +51,11 @@ pub enum ConfError {
     #[error("toml error: {0}")]
     Toml(#[from] toml::de::Error),
 
-    /// 使用了已废弃的配置（如全局 transport 字段）。`hint` 给出迁移指引。
-    #[error("deprecated config: {feature}; migrate to {hint}")]
-    Deprecated { feature: &'static str, hint: &'static str },
-
-    /// 使用了已移除的配置（如顶层 `reverse` 字段）。对应 Go
+    /// 使用了已移除的配置（全局 `transport` / 顶层 `reverse` 字段）。对应 Go
     /// `common/errors.PrintRemovedFeatureError`，文案与 Go 对齐。
     #[error("The feature {feature} has been removed and migrated to {migrate}. Please update your config(s) according to release note and documentation.")]
     Removed { feature: &'static str, migrate: &'static str },
+
 
     /// Build 阶段序列化失败（极少触发，因字段已成功解析）。
     #[error("failed to build {what}: {message}")]

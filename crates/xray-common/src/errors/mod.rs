@@ -12,7 +12,7 @@ mod multi_error;
 
 pub use feature_errors::{
     print_deprecated_feature_warning, print_non_removal_deprecated_feature_warning,
-    print_removed_feature_error,
+    print_removed_feature_error, removed_feature_message, warn_removed_feature,
 };
 pub use multi_error::{all_equal, combine, MultiError};
 

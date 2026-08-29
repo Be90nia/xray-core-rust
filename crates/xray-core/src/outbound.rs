@@ -876,6 +876,13 @@ fn parse_trojan_config(data: &[u8]) -> std::result::Result<TrojanOutboundConfig,
         .get("servers")
         .and_then(|v| v.as_array())
         .ok_or_else(|| "missing servers array".to_string())?;
+    // Trojan Flow 已移除（Go infra/conf/trojan.go:73-75，遍历全部 servers）。
+    // Rust 保留现行为：warn + 忽略该字段继续解析。
+    for server in servers {
+        if let Some(w) = trojan_flow_removed_warning(server) {
+            xray_common::log::warning(w);
+        }
+    }
     let first = servers
         .first()
         .ok_or_else(|| "servers array is empty".to_string())?;
@@ -914,6 +921,11 @@ fn parse_freedom_config(data: &[u8]) -> FreedomConfig {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(data) else {
         return FreedomConfig::default();
     };
+    // 单数 noise 字段已移除（Go infra/conf/freedom.go:145-147）。
+    // Rust 保留现行为：warn + 忽略该字段（仅解析 noises 复数形式）。
+    if let Some(w) = freedom_noise_removed_warning(&v) {
+        xray_common::log::warning(w);
+    }
     let domain_strategy = v
         .get("domainStrategy")
         .and_then(|s| s.as_str())
@@ -931,6 +943,25 @@ fn parse_freedom_config(data: &[u8]) -> FreedomConfig {
         noises,
         ..Default::default()
     }
+}
+
+/// freedom 单数 `noise` 字段已移除（Go infra/conf/freedom.go:145-147，
+/// `PrintRemovedFeatureError("noise = { ... }", "noises = [ { ... } ]")`）。
+/// 返回 Go 对齐警告文案；键不存在返回 `None`。
+pub(crate) fn freedom_noise_removed_warning(v: &serde_json::Value) -> Option<String> {
+    v.get("noise")
+        .is_some()
+        .then(|| xray_common::errors::removed_feature_message("noise = { ... }", "noises = [ { ... } ]"))
+}
+
+/// Trojan Flow 已移除（Go infra/conf/trojan.go:73-75 客户端 / :134-136 服务端，
+/// `PrintRemovedFeatureError("Flow for Trojan", "")`）。flow 非空时返回 Go 对齐
+/// 警告文案（无迁移目标）。
+pub(crate) fn trojan_flow_removed_warning(user: &serde_json::Value) -> Option<String> {
+    user.get("flow")
+        .and_then(|f| f.as_str())
+        .is_some_and(|f| !f.is_empty())
+        .then(|| xray_common::errors::removed_feature_message("Flow for Trojan", ""))
 }
 
 /// 把 domainStrategy 字符串映射为枚举值。
@@ -2410,6 +2441,59 @@ mod tests {
             Address::Domain(d) => assert_eq!(d, "trojan.example.com"),
             other => panic!("expected Domain, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn freedom_noise_removed_warning_aligns_go() {
+        // Go infra/conf/freedom.go:145-147：单数 noise 已移除。
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"noise":{"lengthMin":100}}"#).unwrap();
+        assert_eq!(
+            freedom_noise_removed_warning(&v),
+            Some(
+                "The feature noise = { ... } has been removed and migrated to \
+                 noises = [ { ... } ]. Please update your config(s) according to \
+                 release note and documentation."
+                    .to_string()
+            )
+        );
+        // 复数 noises（现行形式）与缺省不触发
+        let v: serde_json::Value = serde_json::from_str(r#"{"noises":[]}"#).unwrap();
+        assert!(freedom_noise_removed_warning(&v).is_none());
+        assert!(freedom_noise_removed_warning(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn trojan_flow_removed_warning_aligns_go() {
+        // Go infra/conf/trojan.go:74 / :135：Flow for Trojan 已移除（无迁移目标）。
+        let user = serde_json::json!({"password": "p", "flow": "xtls-rprx-vision"});
+        assert_eq!(
+            trojan_flow_removed_warning(&user),
+            Some(
+                "The feature Flow for Trojan has been removed. Please update your \
+                 config(s) according to release note and documentation."
+                    .to_string()
+            )
+        );
+        // 空 flow（缺省）与非字符串不触发
+        assert!(trojan_flow_removed_warning(&serde_json::json!({"flow": ""})).is_none());
+        assert!(trojan_flow_removed_warning(&serde_json::json!({"password": "p"})).is_none());
+    }
+
+    #[test]
+    fn parse_trojan_config_with_flow_still_parses() {
+        // warn + skip 不阻断：flow 字段被忽略，其余字段正常解析。
+        let data = r#"{
+            "servers": [{
+                "address": "trojan.example.com",
+                "port": 443,
+                "password": "secret",
+                "flow": "xtls-rprx-vision"
+            }]
+        }"#;
+        let config = parse_trojan_config(data.as_bytes()).unwrap();
+        assert_eq!(config.server_port.value(), 443);
+        assert_eq!(config.account.password, "secret");
     }
 
     #[test]

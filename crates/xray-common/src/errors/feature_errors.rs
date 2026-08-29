@@ -25,16 +25,30 @@ pub fn print_deprecated_feature_warning(feature: &str, migrate_feature: &str) {
 ///
 /// 对应 Go `PrintRemovedFeatureError`（返回 error 而非日志）。
 pub fn print_removed_feature_error(feature: &str, migrate_feature: &str) -> Error {
+    Error::new(removed_feature_message(feature, migrate_feature))
+}
+
+/// 以 Warning 级别打印「已移除」特性文案（Go 文案逐字对齐）。
+///
+/// Go `PrintRemovedFeatureError` 返回 error 且各触发点硬报错；Rust 端部分
+/// 触发点按现有行为保留宽容（warn + 继续解析），共用本函数保证文案一致。
+pub fn warn_removed_feature(feature: &str, migrate_feature: &str) {
+    log::warning(removed_feature_message(feature, migrate_feature));
+}
+
+/// Go `PrintRemovedFeatureError` 的错误文案（两分支）。
+#[must_use]
+pub fn removed_feature_message(feature: &str, migrate_feature: &str) -> String {
     if migrate_feature.is_empty() {
-        Error::new(format!(
+        format!(
             "The feature {feature} has been removed. Please update your config(s) \
              according to release note and documentation."
-        ))
+        )
     } else {
-        Error::new(format!(
+        format!(
             "The feature {feature} has been removed and migrated to {migrate_feature}. \
              Please update your config(s) according to release note and documentation."
-        ))
+        )
     }
 }
 
@@ -124,5 +138,7 @@ mod tests {
         print_non_removal_deprecated_feature_warning("a", "b");
         print_deprecated_feature_warning("a", "b");
         print_deprecated_feature_warning("a", "");
+        warn_removed_feature("a", "b");
+        warn_removed_feature("a", "");
     }
 }

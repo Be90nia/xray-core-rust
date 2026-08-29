@@ -205,17 +205,17 @@ fn parse_kcp_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
         ));
     };
 
-    // `header`/`seed` 已移除（PrintRemovedFeatureError），伪装配置迁移到
-    // `streamSettings.finalmask.udp`（`mkcp-legacy`）。对齐报错，不静默忽略。
-    for removed in ["header", "seed"] {
-        if obj.contains_key(removed) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "kcpSettings.{removed} was removed, use streamSettings.finalmask.udp (mkcp-legacy) instead"
-                ),
-            ));
-        }
+    // `header`/`seed` 已移除（Go infra/conf/transport_internet.go:66-68，
+    // PrintRemovedFeatureError，两键合并为单一文案），伪装配置迁移到
+    // `streamSettings.finalmask.udp`（`mkcp-legacy`）。保留 Rust 现有硬报错行为。
+    if obj.contains_key("header") || obj.contains_key("seed") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            xray_common::errors::removed_feature_message(
+                "mkcp header & seed",
+                "finalmask/udp header-* & mkcp-original & mkcp-aes128gcm",
+            ),
+        ));
     }
 
     let mut config = default_config();
@@ -396,7 +396,8 @@ mod tests {
 
     #[test]
     fn parse_kcp_config_rejects_removed_header() {
-        // Go v26 KCPConfig.Build：header/seed 已移除（PrintRemovedFeatureError）
+        // Go v26 KCPConfig.Build：header/seed 已移除（PrintRemovedFeatureError，
+        // transport_internet.go:67，header/seed 合并为单一文案）
         let v: serde_json::Value =
             serde_json::from_str(r#"{"header":{"type":"srtp"}}"#).unwrap();
         let err = match parse_kcp_config(Some(&v)) {
@@ -404,7 +405,12 @@ mod tests {
             Ok(_) => panic!("expected removed-feature error for header"),
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert!(err.to_string().contains("kcpSettings.header was removed"));
+        assert_eq!(
+            err.to_string(),
+            "The feature mkcp header & seed has been removed and migrated to \
+             finalmask/udp header-* & mkcp-original & mkcp-aes128gcm. Please update your \
+             config(s) according to release note and documentation."
+        );
     }
 
     #[test]
@@ -414,6 +420,7 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("expected removed-feature error for seed"),
         };
-        assert!(err.to_string().contains("kcpSettings.seed was removed"));
+        // 同一触发点：Go 对 header||seed 用同一文案
+        assert!(err.to_string().contains("The feature mkcp header & seed has been removed"));
     }
 }

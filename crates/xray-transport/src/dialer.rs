@@ -13,7 +13,7 @@ use std::future::Future;
 use std::io;
 use std::net::IpAddr;
 use std::pin::Pin;
-
+use xray_common::errors::removed_feature_message;
 use xray_common::net::destination::Destination;
 
 use crate::connection::Connection;
@@ -132,6 +132,10 @@ impl StreamSettings {
     ///   `None` 返回默认 TCP。
     pub fn from_json(json: Option<&serde_json::Value>) -> Self {
         let Some(v) = json else { return Self::tcp(); };
+        // 已移除特性警告（Go infra/conf 硬报错；Rust 保留宽容行为：warn + 继续解析）。
+        for w in removed_feature_warnings(v) {
+            xray_common::log::warning(w);
+        }
         let protocol = v.get("network").and_then(|n| n.as_str()).unwrap_or("tcp").to_string();
         let security = v.get("security").and_then(|s| s.as_str()).unwrap_or("").to_string();
         // 协议特定配置：尝试 `<protocol>Settings`（如 `wsSettings`/`grpcSettings`/`tcpSettings`）。
@@ -145,7 +149,6 @@ impl StreamSettings {
         let finalmask_json = v.get("finalmask").cloned();
         Self { protocol, security, transport_json, security_json, sockopt_json, finalmask_json }
     }
-
     /// 是否启用 TLS（`security == "tls"` 或 `security == "reality"`）。
     #[must_use]
     pub fn is_tls(&self) -> bool {
@@ -279,6 +282,59 @@ fn protocol_settings_key(protocol: &str) -> Option<&'static str> {
     }
 }
 
+/// 检查 `streamSettings` JSON 中已移除的特性，返回 Go 对齐警告文案。
+///
+/// Go 基准（`infra/conf/transport_internet.go`，均在 conf Build 硬报错）：
+/// - `:988-989` `h2`/`h3`/`http` 传输 → HTTP transport（单一文案，三别名同触发）
+/// - `:990-991` `quic` 传输 → QUIC transport
+/// - `:1824-1827` finalmask `xdns` 的 `domain` 键（注：非 SOCKS 设置，
+///   Go 侧属 finalmask tcp 链的 Xdns 配置）
+/// - `:2048-2049` `security == "xtls"` → Legacy XTLS
+///
+/// Rust 保留现有宽容行为：`from_json` 仅 warn 不阻断，协议映射/安全层判定不变。
+fn removed_feature_warnings(v: &serde_json::Value) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let protocol = v.get("network").and_then(|n| n.as_str()).unwrap_or("tcp");
+    match protocol.to_ascii_lowercase().as_str() {
+        "http" | "h2" | "h3" => warnings.push(removed_feature_message(
+            "HTTP transport (without header padding, etc.)",
+            "XHTTP stream-one H2 & H3",
+        )),
+        "quic" => warnings.push(removed_feature_message(
+            "QUIC transport (without web service, etc.)",
+            "XHTTP stream-one H3",
+        )),
+        _ => {}
+    }
+    let security = v.get("security").and_then(|s| s.as_str()).unwrap_or("");
+    if security.eq_ignore_ascii_case("xtls") {
+        warnings.push(removed_feature_message(
+            "Legacy XTLS",
+            "xtls-rprx-vision with TLS or REALITY",
+        ));
+    }
+    let tcp_masks = v
+        .get("finalmask")
+        .and_then(|f| f.get("tcp"))
+        .and_then(|t| t.as_array());
+    if let Some(entries) = tcp_masks {
+        for entry in entries {
+            let is_xdns = entry.get("type").and_then(|t| t.as_str()) == Some("xdns");
+            let has_domain = entry
+                .get("settings")
+                .and_then(|s| s.get("domain"))
+                .is_some();
+            if is_xdns && has_domain {
+                warnings.push(removed_feature_message(
+                    "domain",
+                    "domains(server) & resolvers(client)",
+                ));
+            }
+        }
+    }
+    warnings
+}
+
 /// Transport dialer 全局注册表。对应 Go `transportDialerCache`。
 static TRANSPORT_DIALER_CACHE: OnceLock<RwLock<HashMap<String, TransportDialFn>>> = OnceLock::new();
 
@@ -388,6 +444,87 @@ mod transport_cache_tests {
     use xray_common::net::address::Address;
     use xray_common::net::port::Port;
     use std::net::Ipv4Addr;
+
+
+    // ===== removed_feature_warnings（Go infra/conf/transport_internet.go 对齐）=====
+
+    fn rfw(json: &str) -> Vec<String> {
+        removed_feature_warnings(&serde_json::from_str(json).unwrap())
+    }
+
+    #[test]
+    fn removed_warnings_http_h2_h3_transport() {
+        // Go :988-989（h2/h3/http 同一文案）
+        for network in ["http", "h2", "h3", "H2"] {
+            let warns = rfw(&format!(r#"{{"network":"{network}"}}"#));
+            assert_eq!(
+                warns,
+                vec![
+                    "The feature HTTP transport (without header padding, etc.) has been \
+                     removed and migrated to XHTTP stream-one H2 & H3. Please update your \
+                     config(s) according to release note and documentation."
+                        .to_string()
+                ],
+                "network={network}"
+            );
+        }
+    }
+
+    #[test]
+    fn removed_warnings_quic_transport() {
+        // Go :990-991
+        assert_eq!(
+            rfw(r#"{"network":"quic"}"#),
+            vec![
+                "The feature QUIC transport (without web service, etc.) has been removed \
+                 and migrated to XHTTP stream-one H3. Please update your config(s) \
+                 according to release note and documentation."
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn removed_warnings_legacy_xtls_security() {
+        // Go :2048-2049（大小写不敏感，与 Go strings.ToLower 一致）
+        assert_eq!(
+            rfw(r#"{"security":"xtls"}"#),
+            vec![
+                "The feature Legacy XTLS has been removed and migrated to \
+                 xtls-rprx-vision with TLS or REALITY. Please update your config(s) \
+                 according to release note and documentation."
+                    .to_string()
+            ]
+        );
+        assert_eq!(rfw(r#"{"security":"XTLS"}"#).len(), 1);
+    }
+
+    #[test]
+    fn removed_warnings_xdns_domain() {
+        // Go :1824-1827（finalmask tcp 链 xdns 的 settings.domain）
+        let warns = rfw(
+            r#"{"finalmask":{"tcp":[{"type":"xdns","settings":{"domain":"t.example.com"}}]}}"#,
+        );
+        assert_eq!(
+            warns,
+            vec![
+                "The feature domain has been removed and migrated to domains(server) & \
+                 resolvers(client). Please update your config(s) according to release \
+                 note and documentation."
+                    .to_string()
+            ]
+        );
+        // xdns 无 domain（用 domains/resolvers 新形式）不触发
+        assert!(rfw(r#"{"finalmask":{"tcp":[{"type":"xdns","settings":{"domains":["a.com"]}}]}}"#).is_empty());
+    }
+
+    #[test]
+    fn removed_warnings_clean_config_is_empty() {
+        // 常规 tcp/tls/ws 配置不触发任何警告
+        assert!(rfw(r#"{"network":"tcp","security":"tls","tlsSettings":{"alpn":["h2"]}}"#).is_empty());
+        assert!(rfw(r#"{"network":"ws","security":"reality"}"#).is_empty());
+        assert!(rfw("{}").is_empty());
+    }
 
     #[test]
     fn socket_options_parses_sockopt_json() {

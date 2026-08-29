@@ -114,14 +114,15 @@ impl Config {
     ///
     /// # 错误
     ///
-    /// - [`ConfError::Deprecated`]：使用了已废弃的全局 `transport` 字段。
-    /// - [`ConfError::Removed`]：使用了顶层 `reverse` 字段（Go v26 已移除）。
+    /// - [`ConfError::Removed`]：使用了全局 `transport` 字段（Go `xray.go:624-626`
+    ///   PrintRemovedFeatureError）或顶层 `reverse` 字段（`xray.go:569-571`）。
     /// - [`ConfError::Build`]：JSON 字段序列化失败（极少见，因字段已成功解析）。
     pub fn build(&self) -> Result<BuiltConfig> {
         if self.uses_deprecated_transport() {
-            return Err(ConfError::Deprecated {
+            // Go infra/conf/xray.go:624-626：Global transport config 已移除。
+            return Err(ConfError::Removed {
                 feature: "Global transport config",
-                hint: "streamSettings in inbounds and outbounds",
+                migrate: "streamSettings in inbounds and outbounds",
             });
         }
 
@@ -451,7 +452,14 @@ mod tests {
         let json = r#"{ "transport": { "http": { "path": "/x" } } }"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
         let err = cfg.build().unwrap_err();
-        assert!(matches!(err, ConfError::Deprecated { .. }));
+        // Go xray.go:624-626：PrintRemovedFeatureError（硬报错，文案对齐）。
+        assert!(matches!(err, ConfError::Removed { .. }));
+        assert_eq!(
+            err.to_string(),
+            "The feature Global transport config has been removed and migrated to \
+             streamSettings in inbounds and outbounds. Please update your config(s) \
+             according to release note and documentation."
+        );
     }
 
     #[test]

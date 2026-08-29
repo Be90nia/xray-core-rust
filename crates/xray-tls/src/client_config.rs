@@ -78,6 +78,14 @@ pub fn build_client_config(
         .and_then(|m| m.get("allowInsecure"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // Go infra/conf/transport_internet.go:698-700：allowInsecure 已移除（硬报错）。
+    // Rust 保留现行为：warn + 继续跳过证书验证。
+    if allow_insecure {
+        xray_common::errors::warn_removed_feature(
+            "\"allowInsecure\"",
+            "\"pinnedPeerCertSha256\"(pcs) and \"verifyPeerCertByName\"(vcn)",
+        );
+    }
 
     // alpn：数组；缺失用 DEFAULT_ALPN。
     let alpn_owned: Vec<Vec<u8>> = if let Some(arr) = obj.and_then(|m| m.get("alpn")).and_then(|v| v.as_array()) {

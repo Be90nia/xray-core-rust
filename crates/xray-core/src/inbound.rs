@@ -1831,6 +1831,11 @@ fn build_trojan_users(data: &[u8]) -> std::io::Result<HashMap<String, TrojanMemo
     let mut users = HashMap::new();
     if let Some(clients) = v.get("clients").and_then(|c| c.as_array()) {
         for c in clients {
+            // Trojan Flow 已移除（Go infra/conf/trojan.go:134-136 服务端逐用户检查）。
+            // Rust 保留现行为：warn + 忽略该字段继续建用户。
+            if let Some(w) = crate::outbound::trojan_flow_removed_warning(c) {
+                xray_common::log::warning(w);
+            }
             let password = c.get("password").and_then(|x| x.as_str()).unwrap_or("");
             let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let level = c.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
@@ -3754,6 +3759,18 @@ mod tests {
         assert!(users.contains_key(&expected_user.key_hash()));
     }
 
+
+    #[test]
+    fn build_trojan_users_with_flow_still_builds() {
+        // Trojan Flow 已移除（Go trojan.go:134-136 硬报错）；Rust warn + 不阻断：
+        // 带 flow 的 client 仍正常入表（触发文案断言见 outbound 侧 helper 测试）。
+        let settings = serde_json::json!({
+            "clients": [{ "password": "secret", "email": "alice", "flow": "xtls-rprx-vision" }],
+        });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let users = super::build_trojan_users(&data).unwrap();
+        assert_eq!(users.len(), 1, "flow field should not block user build");
+    }
     #[test]
     fn build_trojan_users_empty_clients() {
         let settings = serde_json::json!({});
