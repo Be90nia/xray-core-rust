@@ -9,4 +9,4 @@ pub mod packet;
 
 pub use address::Address;
 pub use command::{parse_header, Command, TOKEN_LEN, VERSION};
-pub use packet::Packet;
+pub use packet::{FragmentAssembler, Packet};

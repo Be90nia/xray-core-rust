@@ -29,8 +29,8 @@ pub mod pool;
 
 pub use client::{CongestionControl, TuicClient, TuicConn, TuicConnectOptions, UdpRelayMode};
 pub use dispatcher::{make_dial_fn as make_tuic_dial_fn, make_dial_fn_lazy as make_tuic_dial_fn_lazy, TuicConnection};
+pub use protocol::{Address, Command, FragmentAssembler, Packet, TOKEN_LEN, VERSION};
 pub use error::{Result, TuicError};
-pub use protocol::{Address, Command, Packet, TOKEN_LEN, VERSION};
 pub use server::TuicMockServer;
 pub use udp::TuicUdpAssoc;
 pub use h3::H3TuicTransport;

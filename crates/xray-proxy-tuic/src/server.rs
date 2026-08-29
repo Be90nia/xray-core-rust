@@ -405,6 +405,8 @@ impl ReplySink {
 pub(crate) struct UdpAssocTable {
     dispatcher: Option<Arc<dyn DispatchHandler>>,
     sessions: HashMap<u16, tokio::sync::mpsc::Sender<UdpAssocItem>>,
+    /// per-assoc 分片重组器（bd 2x5 分片实装）。
+    frags: HashMap<u16, crate::protocol::FragmentAssembler>,
 }
 
 impl UdpAssocTable {
@@ -412,23 +414,46 @@ impl UdpAssocTable {
         Self {
             dispatcher,
             sessions: HashMap::new(),
+            frags: HashMap::new(),
         }
     }
 
     /// 路由一个客户端 Packet 到其 assoc 会话；无则新建。
     ///
-    /// 分片包仍拒绝（FRAG_TOTAL > 1）；通道满时丢包（UDP 有损语义）。
+    /// 分片包走 per-assoc [`FragmentAssembler`] 重组：
+    /// 全部到齐后才路由；中间片静默缓存；非法 frag_total/frag_id 警告丢包。
+    /// 通道满时丢包（UDP 有损语义）。
     pub(crate) fn handle_packet(&mut self, pkt: Packet, sink: ReplySink) {
-        if pkt.frag_total > 1 {
-            tracing::warn!(
-                "tuic udp relay: fragment not supported (frag_total={}, frag_id={})",
-                pkt.frag_total,
-                pkt.frag_id
-            );
-            return;
-        }
         // ponytail: 收包时顺带清扫已退出（空闲淘汰/出错）会话的残留 sender
         self.sessions.retain(|_, tx| !tx.is_closed());
+        // 分片路径：喂给该 assoc 的 assembler，未到齐则缓存
+        if pkt.frag_total > 1 {
+            let assoc = pkt.assoc_id;
+            let assembler = self
+                .frags
+                .entry(assoc)
+                .or_insert_with(crate::protocol::FragmentAssembler::new);
+            match assembler.feed(pkt) {
+                Ok(Some(complete)) => {
+                    // 重组成功 → 走常规路由
+                    self.route_packet(complete, sink);
+                }
+                Ok(None) => {
+                    // 等待其他片
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "tuic udp relay: fragment assemble error assoc={assoc}: {e:?}"
+                    );
+                }
+            }
+            return;
+        }
+        self.route_packet(pkt, sink);
+    }
+
+    /// 内部：把（完整）Packet 投递到 assoc 会话。
+    fn route_packet(&mut self, pkt: Packet, sink: ReplySink) {
         let Some(dest) = tuic_addr_to_udp_dest(&pkt.addr) else {
             tracing::warn!("tuic udp relay: packet without target addr");
             return;
@@ -449,6 +474,8 @@ impl UdpAssocTable {
     /// Dissociate（spec 0x03）：销毁会话，释放出口资源。
     pub(crate) fn dissociate(&mut self, assoc_id: u16) {
         self.sessions.remove(&assoc_id);
+        // 清掉对应 assoc 的分片缓存（避免 GC）
+        self.frags.remove(&assoc_id);
     }
 }
 

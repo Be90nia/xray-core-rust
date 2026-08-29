@@ -21,11 +21,8 @@
 //! ## 分片
 //!
 //! 当 UDP 负载超过 QUIC datagram MTU（约 1200B）时需要分片。
-//! 本切片仅实现非分片路径（`FRAG_TOTAL=1, FRAG_ID=0`），
-//! 分片重组留待后续。`FRAG_TOTAL > 1` 时返回 [`TuicError::UnsupportedFragment`]。
-//!
-//! [`TuicError::UnsupportedFragment`]: crate::error::TuicError::UnsupportedFragment
-
+//! 接收端用 [`FragmentAssembler`]（per-assoc, per-pkt_id 缓存）按
+//! `frag_id` 升序拼接为完整 UDP 负载，详见其文档。
 use bytes::{Buf, BufMut};
 
 use super::address::Address;
@@ -92,11 +89,13 @@ impl Packet {
     /// 从 [`Buf`] 解析负载（调用方已用 [`crate::protocol::parse_header`] 消费 VER+TYPE，
     /// 并确认 TYPE 为 [`crate::protocol::Command::type_code`] 中 `PACKET`）。
     ///
+    /// 分片（`FRAG_TOTAL > 1`）也正常返回 Packet，caller 需自行喂给
+    /// [`FragmentAssembler`] 重组（bd 2x5）。
+    ///
     /// # Errors
     ///
     /// - [`TuicError::UnexpectedEof`]：字节不足
-    /// - [`TuicError::UnsupportedFragment`]：检测到分片（`FRAG_TOTAL > 1`）
-    /// - [`TuicError::PacketTooLarge`]：SIZE 超过 [`MAX_PACKET_PAYLOAD`]
+    /// - [`TuicError::PacketTooLarge`]：SIZE 超过 [`MAX_PACKET_PAYLOAD`]（单分片上限）
     pub fn read_payload<B: Buf>(buf: &mut B) -> Result<Self> {
         if buf.remaining() < 8 {
             return Err(TuicError::UnexpectedEof("packet header (>=8 bytes)"));
@@ -115,10 +114,6 @@ impl Packet {
         }
         let mut data = vec![0u8; size];
         buf.copy_to_slice(&mut data);
-        if frag_total > 1 {
-            // 切片2 不实现分片重组；caller 收到分片包直接拒绝。
-            return Err(TuicError::UnsupportedFragment { frag_total, frag_id });
-        }
         Ok(Self {
             assoc_id,
             pkt_id,
@@ -127,6 +122,106 @@ impl Packet {
             addr,
             data,
         })
+    }
+}
+
+/// 分片重组器（per-assoc, per-pkt_id 缓存分片）。
+///
+/// spec：客户端将 >MTU 的 UDP 包拆成 `frag_total` 个分片（同 `pkt_id`），
+/// 每个分片带 `frag_id`（0-based）和 `size`（本片字节数）。
+/// 接收端缓存分片直到全部到达，按 `frag_id` 升序拼接为完整 UDP 负载。
+///
+/// ## 行为
+/// - 单片（`frag_total=1`）即时返回，不入缓存
+/// - 多片：缓存到对应槽位，全部到齐时输出完整包并清理
+/// - 重复片（同 `frag_id`）忽略
+/// - `frag_id >= frag_total` 或 `frag_total == 0` 视为非法，返回 [`TuicError::UnsupportedFragment`]
+/// - 新 `pkt_id` 到达会丢弃旧缓存（同 hysteria `Defragger` 简化策略）
+///
+/// ponytail: 单 pkt_id 窗口简化（与 hysteria 一致），不维护 GC。
+/// 多多并行 pkt_id 时升级为 `HashMap<u16, PendingFrag>`。
+#[derive(Debug, Default)]
+pub struct FragmentAssembler {
+    /// 当前重组的 pkt_id。
+    pkt_id: u16,
+    /// 已收到的分片槽（None = 未到）。
+    frags: Vec<Option<Vec<u8>>>,
+    /// 已收到分片数。
+    received: u8,
+    /// 首个分片的 addr（spec：非首片 ADDR=0xff None）。
+    first_addr: Option<Address>,
+    /// assoc_id（透传给最终重组包）。
+    assoc_id: u16,
+}
+
+impl FragmentAssembler {
+    /// 构造空重组器。
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 投入一个分片，若所有分片齐备返回完整 UDP 包；否则返回 None。
+    ///
+    /// 单片（`frag_total=1`）直接返回 `Some(pkt)` 不缓存。
+    /// 多片：缓存到槽位；新 pkt_id 重置状态；同 frag_id 重复忽略。
+    ///
+    /// # Errors
+    /// - [`TuicError::UnsupportedFragment`]: 非法 `frag_total`/`frag_id` 组合
+    pub fn feed(&mut self, pkt: Packet) -> Result<Option<Packet>> {
+        // 单片直通
+        if pkt.frag_total <= 1 {
+            return Ok(Some(pkt));
+        }
+        if pkt.frag_total == 0 || pkt.frag_id >= pkt.frag_total {
+            return Err(TuicError::UnsupportedFragment {
+                frag_total: pkt.frag_total,
+                frag_id: pkt.frag_id,
+            });
+        }
+        // 新 pkt_id 或 frag_total 变化 → 重置
+        if pkt.pkt_id != self.pkt_id || self.frags.len() != pkt.frag_total as usize {
+            self.pkt_id = pkt.pkt_id;
+            self.frags = vec![None; pkt.frag_total as usize];
+            self.received = 0;
+            self.first_addr = None;
+        }
+        self.assoc_id = pkt.assoc_id;
+        if self.frags[pkt.frag_id as usize].is_none() {
+            // 首片记录 addr（spec 非首片 addr=0xff None）
+            if pkt.frag_id == 0 {
+                self.first_addr = Some(pkt.addr.clone());
+            }
+            self.frags[pkt.frag_id as usize] = Some(pkt.data);
+            self.received = self.received.saturating_add(1);
+        }
+        if self.received == pkt.frag_total {
+            // 全部到齐：按 frag_id 升序拼接
+            let mut data = Vec::new();
+            for frag in &self.frags {
+                if let Some(f) = frag {
+                    data.extend_from_slice(f);
+                }
+            }
+            let addr = self
+                .first_addr
+                .take()
+                .unwrap_or(crate::protocol::address::Address::None);
+            let completed = Packet {
+                assoc_id: self.assoc_id,
+                pkt_id: self.pkt_id,
+                frag_total: 1,
+                frag_id: 0,
+                addr,
+                data,
+            };
+            // 重置
+            self.frags.clear();
+            self.received = 0;
+            self.first_addr = None;
+            return Ok(Some(completed));
+        }
+        Ok(None)
     }
 }
 
@@ -224,5 +319,131 @@ mod tests {
         let _ = crate::protocol::parse_header(&mut cursor).unwrap();
         let err = Packet::read_payload(&mut cursor).unwrap_err();
         assert!(matches!(err, TuicError::PacketTooLarge(_)));
+    }
+
+    /// 构造一个手动分片 Packet（绕过 read_payload 的单片路径）。
+    fn make_frag(assoc_id: u16, pkt_id: u16, frag_id: u8, frag_total: u8, data: Vec<u8>) -> Packet {
+        Packet {
+            assoc_id,
+            pkt_id,
+            frag_total,
+            frag_id,
+            addr: if frag_id == 0 {
+                Address::Ipv4(Ipv4Addr::new(8, 8, 8, 8), 53)
+            } else {
+                Address::None
+            },
+            data,
+        }
+    }
+
+    #[test]
+    fn fragment_single_passthrough() {
+        let mut asm = FragmentAssembler::new();
+        let p = make_frag(1, 1, 0, 1, b"hello".to_vec());
+        let r = asm.feed(p.clone()).unwrap();
+        assert_eq!(r.unwrap(), p);
+    }
+
+    #[test]
+    fn fragment_ordered_assemble() {
+        let mut asm = FragmentAssembler::new();
+        // 3 片按序到达：0,1,2
+        let f0 = make_frag(1, 42, 0, 3, b"AAA".to_vec());
+        let f1 = make_frag(1, 42, 1, 3, b"BBB".to_vec());
+        let f2 = make_frag(1, 42, 2, 3, b"CCC".to_vec());
+        assert!(asm.feed(f0).unwrap().is_none());
+        assert!(asm.feed(f1).unwrap().is_none());
+        let r = asm.feed(f2).unwrap().expect("3rd should complete");
+        assert_eq!(r.frag_total, 1);
+        assert_eq!(r.frag_id, 0);
+        assert_eq!(r.pkt_id, 42);
+        assert_eq!(r.assoc_id, 1);
+        assert_eq!(r.data, b"AAABBBCCC");
+        // 首片 addr 应保留
+        assert_eq!(
+            r.addr,
+            Address::Ipv4(Ipv4Addr::new(8, 8, 8, 8), 53)
+        );
+    }
+
+    #[test]
+    fn fragment_out_of_order_assemble() {
+        let mut asm = FragmentAssembler::new();
+        // 3 片乱序：2,0,1
+        let f0 = make_frag(2, 7, 0, 3, b"AAA".to_vec());
+        let f1 = make_frag(2, 7, 1, 3, b"BBB".to_vec());
+        let f2 = make_frag(2, 7, 2, 3, b"CCC".to_vec());
+        assert!(asm.feed(f2).unwrap().is_none());
+        assert!(asm.feed(f0).unwrap().is_none());
+        let r = asm.feed(f1).unwrap().expect("3rd should complete");
+        // 拼接顺序必须按 frag_id 升序
+        assert_eq!(r.data, b"AAABBBCCC");
+    }
+
+    #[test]
+    fn fragment_duplicate_ignored() {
+        let mut asm = FragmentAssembler::new();
+        let f0 = make_frag(1, 1, 0, 2, b"X".to_vec());
+        let f1 = make_frag(1, 1, 1, 2, b"Y".to_vec());
+        assert!(asm.feed(f0.clone()).unwrap().is_none());
+        // 重复 f0 应被忽略（received 不递增）
+        assert!(asm.feed(f0).unwrap().is_none());
+        let r = asm.feed(f1).unwrap().expect("2nd unique should complete");
+        assert_eq!(r.data, b"XY");
+    }
+
+    #[test]
+    fn fragment_invalid_frag_id() {
+        let mut asm = FragmentAssembler::new();
+        let bad = make_frag(1, 1, 5, 3, b"oops".to_vec()); // frag_id=5 >= frag_total=3
+        let err = asm.feed(bad).unwrap_err();
+        assert!(matches!(err, TuicError::UnsupportedFragment { .. }));
+    }
+
+    #[test]
+    fn fragment_new_pkt_id_resets() {
+        let mut asm = FragmentAssembler::new();
+        // pkt_id=1 投 1 片
+        let f0 = make_frag(1, 1, 0, 2, b"A".to_vec());
+        assert!(asm.feed(f0).unwrap().is_none());
+        // 新 pkt_id=99 应重置
+        let g0 = make_frag(1, 99, 0, 2, b"B".to_vec());
+        assert!(asm.feed(g0).unwrap().is_none());
+        let g1 = make_frag(1, 99, 1, 2, b"D".to_vec());
+        let r = asm.feed(g1).unwrap().expect("2nd pkt complete");
+        assert_eq!(r.pkt_id, 99);
+        assert_eq!(r.data, b"BD");
+    }
+
+    #[test]
+    fn fragment_roundtrip_via_write_read() {
+        // 验证 wire format：两个分片序列化为 Packet 帧，再喂给 assembler，输出应一致
+        let mut asm = FragmentAssembler::new();
+        let f0 = make_frag(3, 100, 0, 2, vec![0xAB; 100]);
+        let f1 = make_frag(3, 100, 1, 2, vec![0xCD; 100]);
+
+        // 序列化 f0
+        let mut buf = vec![VERSION, crate::protocol::command::type_code::PACKET];
+        f0.write_payload(&mut buf);
+        let mut cur = &buf[..];
+        let _ = crate::protocol::parse_header(&mut cur).unwrap();
+        let p0 = Packet::read_payload(&mut cur).unwrap();
+        assert_eq!(p0.frag_total, 2);
+        assert_eq!(p0.frag_id, 0);
+        assert!(asm.feed(p0).unwrap().is_none());
+
+        // 序列化 f1
+        let mut buf = vec![VERSION, crate::protocol::command::type_code::PACKET];
+        f1.write_payload(&mut buf);
+        let mut cur = &buf[..];
+        let _ = crate::protocol::parse_header(&mut cur).unwrap();
+        let p1 = Packet::read_payload(&mut cur).unwrap();
+        assert_eq!(p1.frag_total, 2);
+        assert_eq!(p1.frag_id, 1);
+        let r = asm.feed(p1).unwrap().expect("complete");
+        assert_eq!(r.data.len(), 200);
+        assert!(r.data[..100].iter().all(|&b| b == 0xAB));
+        assert!(r.data[100..].iter().all(|&b| b == 0xCD));
     }
 }
