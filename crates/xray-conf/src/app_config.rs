@@ -56,6 +56,9 @@ pub struct PolicyLevel {
     pub stats_user_uplink: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stats_user_downlink: Option<bool>,
+    /// 是否启用 per-user 在线 IP 追踪。对应 Go json `statsUserOnline`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats_user_online: Option<bool>,
 }
 
 /// 系统级策略。

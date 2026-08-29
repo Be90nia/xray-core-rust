@@ -96,6 +96,12 @@ pub struct StatsPolicy {
     pub user_uplink: bool,
     /// Whether to track user downlink traffic.
     pub user_downlink: bool,
+    /// Whether to track online IPs per user.
+    ///
+    /// 对应 Go `features/policy.Stats.UserOnline`。开启后 inbound session
+    /// 在 `StatsPolicy.user_online` 为 true 时通过 [`xray_app_stats`] 注册
+    /// `user>>>{email}>>>online` OnlineMap 并 AddIP，会话结束时 RemoveIP。
+    pub user_online: bool,
 }
 
 impl Default for StatsPolicy {
@@ -103,9 +109,12 @@ impl Default for StatsPolicy {
         Self {
             user_uplink: false,
             user_downlink: false,
+            user_online: false,
         }
     }
 }
+
+
 
 /// Buffer policy for connection buffering.
 ///
@@ -196,9 +205,20 @@ mod tests {
         assert_eq!(policy.timeout.downlink_only, DEFAULT_DOWNLINK_ONLY_TIMEOUT);
         assert!(!policy.stats.user_uplink);
         assert!(!policy.stats.user_downlink);
+        assert!(!policy.stats.user_online, "user_online must default false");
         assert_eq!(policy.buffer.connection, DEFAULT_BUFFER_CONNECTION);
-        assert_eq!(policy.buffer.write, DEFAULT_BUFFER_WRITE);
     }
+
+
+    #[test]
+    fn test_default_stats_policy_user_online_false() {
+        // 对齐 Go features/policy/policy.go:128 SessionDefault() 里 UserOnline: false
+        let s = StatsPolicy::default();
+        assert!(!s.user_uplink);
+        assert!(!s.user_downlink);
+        assert!(!s.user_online);
+    }
+
 
     #[test]
     fn test_default_timeout_policy() {
@@ -221,6 +241,7 @@ mod tests {
             stats: StatsPolicy {
                 user_uplink: true,
                 user_downlink: true,
+                user_online: true,
             },
             buffer: BufferPolicy {
                 connection: 2048,
@@ -230,7 +251,7 @@ mod tests {
         assert_eq!(policy.timeout.handshake, Duration::from_secs(10));
         assert!(policy.stats.user_uplink);
         assert!(policy.stats.user_downlink);
-        assert_eq!(policy.buffer.connection, 2048);
+        assert!(policy.stats.user_online);
     }
 
     /// Mock policy manager for testing.

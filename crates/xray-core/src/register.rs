@@ -388,13 +388,18 @@ fn policy_level_to_proto(
         uplink_only: pl.uplink.map(|v| Second { value: v }),
         downlink_only: pl.downlink.map(|v| Second { value: v }),
     });
-    if pl.stats_user_uplink.is_some() || pl.stats_user_downlink.is_some() {
+
+    if pl.stats_user_uplink.is_some()
+        || pl.stats_user_downlink.is_some()
+        || pl.stats_user_online.is_some()
+    {
         p.stats = Some(policy::Stats {
             user_uplink: pl.stats_user_uplink.unwrap_or(false),
             user_downlink: pl.stats_user_downlink.unwrap_or(false),
-            user_online: false,
+            user_online: pl.stats_user_online.unwrap_or(false),
         });
     }
+
     if let Some(bs) = pl.buffer_size {
         p.buffer = Some(policy::Buffer {
             connection: bs as i32,
@@ -417,7 +422,6 @@ fn policy_system_to_proto(
         }),
     }
 }
-
 /// 解析 Go duration 字符串（如 `"1m"`, `"30s"`, `"500ms"`）为毫秒。
 /// 不支持复合形式（如 `"1m30s"`）；解析失败返回 `None`。
 fn parse_go_duration_ms(s: &str) -> Option<i64> {
@@ -428,7 +432,7 @@ fn parse_go_duration_ms(s: &str) -> Option<i64> {
     let split_pos = s.bytes().rposition(|b| !b.is_ascii_alphabetic())?;
     let (num_part, unit) = (&s[..=split_pos], &s[split_pos + 1..]);
     let num: f64 = num_part.parse().ok()?;
-    let ms = match unit {
+     let ms = match unit {
         "ms" => num,
         "s" => num * 1_000.0,
         "m" => num * 60_000.0,

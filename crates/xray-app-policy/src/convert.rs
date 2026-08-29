@@ -55,11 +55,10 @@ pub fn policy_from_proto(proto: &ProtoPolicy) -> Policy {
     }
 
     if let Some(stats) = proto.stats.as_ref() {
-        // TODO(features): proto Policy.Stats 还有 `user_online` 字段，
-        // 但 xray-features::StatsPolicy 暂未提供。features 升级后补此字段。
         policy.stats = StatsPolicy {
             user_uplink: stats.user_uplink,
             user_downlink: stats.user_downlink,
+            user_online: stats.user_online,
         };
     }
 
@@ -165,13 +164,14 @@ mod tests {
             stats: Some(PolicyStats {
                 user_uplink: true,
                 user_downlink: true,
-                user_online: false,
+                user_online: true,
             }),
             buffer: None,
         };
         let p = policy_from_proto(&proto);
         assert!(p.stats.user_uplink);
         assert!(p.stats.user_downlink);
+        assert!(p.stats.user_online, "user_online must round-trip from proto");
     }
 
     #[test]

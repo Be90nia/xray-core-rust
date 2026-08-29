@@ -73,13 +73,13 @@ mod tests {
         Policy as ProtoPolicy, Second, SystemPolicy as ProtoSystemPolicy,
     };
 
-    fn proto_policy_with_stats(up: bool, down: bool) -> ProtoPolicy {
+    fn proto_policy_with_stats(up: bool, down: bool, online: bool) -> ProtoPolicy {
         ProtoPolicy {
             timeout: None,
             stats: Some(PolicyStats {
                 user_uplink: up,
                 user_downlink: down,
-                user_online: false,
+                user_online: online,
             }),
             buffer: None,
         }
@@ -113,7 +113,7 @@ mod tests {
         let cfg = Config {
             level: {
                 let mut m = HashMap::new();
-                m.insert(1, proto_policy_with_stats(true, false));
+                m.insert(1, proto_policy_with_stats(true, false, false));
                 m
             },
             system: None,
@@ -129,7 +129,7 @@ mod tests {
         let cfg = Config {
             level: {
                 let mut m = HashMap::new();
-                m.insert(1, proto_policy_with_stats(true, true));
+                m.insert(1, proto_policy_with_stats(true, true, false));
                 m
             },
             system: None,
@@ -201,5 +201,24 @@ mod tests {
         // ForSystem 也通过 trait object 可用
         let s = pm.for_system();
         assert_eq!(s, SystemStats::default());
+    }
+
+    #[test]
+    fn manager_user_online_policy_round_trips() {
+        // proto user_online=true 必须经 Manager.for_level 透传到 features::StatsPolicy。
+        // 对齐 Go features/policy/policy.go:31 UserOnline + app/dispatcher/default.go:182-184。
+        let cfg = Config {
+            level: {
+                let mut m = HashMap::new();
+                m.insert(0, proto_policy_with_stats(false, false, true));
+                m
+            },
+            system: None,
+        };
+        let manager = Manager::new(cfg).unwrap();
+        let p = manager.policy_for_level(0);
+        assert!(p.stats.user_online);
+        assert!(!p.stats.user_uplink);
+        assert!(!p.stats.user_downlink);
     }
 }
