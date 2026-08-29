@@ -5787,6 +5787,7 @@ dependencies = [
 name = "xray-app-router"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "parking_lot",
  "prost",
  "rand 0.9.4",
@@ -5864,6 +5865,7 @@ dependencies = [
  "rand 0.9.4",
  "rustls",
  "rustls-pemfile",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "tempfile",

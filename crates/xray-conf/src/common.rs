@@ -113,8 +113,31 @@ impl PortRange {
 /// - `[80, "443", "1000-2000"]`（混合数组）
 ///
 /// 对应 Go `infra/conf.PortList`。字段名 `PortList` 在 Go 中也用于 JSON tag "port"。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+/// 序列化规则对应 Go `common/reflect/marshal.go:143-163 serializePortList`：
+/// 单 range 且 start == end → 数字；否则 `"80,443,1000-2000"` 逗号字符串。
+/// 保证序列化输出能被自身 [`Deserialize`](PortList) 重新解析（round-trip）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PortList(pub Vec<PortRange>);
+
+impl Serialize for PortList {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if self.0.len() == 1 && self.0[0].start == self.0[0].end {
+            return s.serialize_u16(self.0[0].start);
+        }
+        let parts: Vec<String> = self
+            .0
+            .iter()
+            .map(|r| {
+                if r.start == r.end {
+                    r.start.to_string()
+                } else {
+                    format!("{}-{}", r.start, r.end)
+                }
+            })
+            .collect();
+        s.serialize_str(&parts.join(","))
+    }
+}
 
 impl PortList {
     /// 是否为空。
@@ -706,6 +729,42 @@ mod tests {
         let range: Int32Range = serde_json::from_str(r#""1-2""#).unwrap();
         assert_eq!(range.to_string(), "1-2");
         assert_eq!(serde_json::to_string(&range).unwrap(), r#""1-2""#);
+    }
+
+    // ----- PortList 序列化（Go common/reflect/marshal.go:143-163 serializePortList） -----
+
+    #[test]
+    fn portlist_serialize_single_port_as_number() {
+        // Go：单 range 且 from == to → 数字。
+        let p: PortList = serde_json::from_str("443").unwrap();
+        assert_eq!(serde_json::to_string(&p).unwrap(), "443");
+    }
+
+    #[test]
+    fn portlist_serialize_range_as_string() {
+        // Go：范围 → "1000-2000"。
+        let p: PortList = serde_json::from_str(r#""1000-2000""#).unwrap();
+        assert_eq!(serde_json::to_string(&p).unwrap(), r#""1000-2000""#);
+    }
+
+    #[test]
+    fn portlist_serialize_multiple_as_comma_string() {
+        // Go：多 range → "80,443,1000-2000"。
+        let p: PortList = serde_json::from_str(r#"[80, "443", "1000-2000"]"#).unwrap();
+        assert_eq!(
+            serde_json::to_string(&p).unwrap(),
+            r#""80,443,1000-2000""#
+        );
+    }
+
+    #[test]
+    fn portlist_round_trip_all_forms() {
+        for json in ["443", r#""443""#, r#""80,443,1000-2000""#, r#"[80, "443"]"#] {
+            let p: PortList = serde_json::from_str(json).unwrap();
+            let out = serde_json::to_string(&p).unwrap();
+            let back: PortList = serde_json::from_str(&out).unwrap();
+            assert_eq!(back, p, "round trip failed for {json} -> {out}");
+        }
     }
 
     // ----- env: 展开（进程环境变量共享，测试间互斥） -----

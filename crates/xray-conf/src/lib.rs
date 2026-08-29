@@ -33,6 +33,7 @@ pub mod config;
 pub mod error;
 pub mod init;
 pub mod json;
+pub mod serial;
 pub mod lint;
 pub mod toml_config;
 pub mod vformat;
@@ -40,8 +41,9 @@ pub mod yaml;
 
 // 顶层 re-export：常用类型与函数直接从 crate 根访问。
 pub use common::{Address, Int32Range, Network, NetworkList, PortList, PortRange, StringList, User};
-pub use built::{BuiltConfig, BuiltEntry, BuiltInbound, BuiltOutbound};
 pub use config::{Config, InboundDetourConfig, MuxConfig, OutboundDetourConfig, SniffingConfig};
+pub use built::{BuiltConfig, BuiltEntry, BuiltInbound, BuiltOutbound};
+pub use serial::{build_config, merge_config_from_files, merge_configs};
 pub use confloader::{
     load_file, load_file_with_format, load_reader, load_str, load_str_auto_detect,
 };

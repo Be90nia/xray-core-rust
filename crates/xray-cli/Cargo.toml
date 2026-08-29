@@ -31,6 +31,7 @@ rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 x509-parser = "0.18"
 rustls-pemfile = "2"
+rustls-pki-types = "1"
 # PQ 密钥生成（bd a1h）：ml-kem 与 xray-proxy-vless 对齐；ml-dsa 无 workspace 现成实现，
 # 预授权引入 RustCrypto 官方 crate
 ml-kem = "0.3"

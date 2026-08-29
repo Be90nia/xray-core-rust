@@ -303,6 +303,7 @@ pub fn execute_hash(args: &TlsHashArgs) -> Result<String, CliError> {
     // 收集 DER：PEM 走 rustls_pemfile 块迭代；否则整文件当 DER 解析。
     let ders: Vec<Vec<u8>> = if bytes.windows(5).any(|w| w == b"BEGIN") {
         rustls_pemfile::certs(&mut bytes.as_slice())
+            .map(|r| r.map(|c| c.to_vec()))
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| CliError::InvalidArgument(format!("parse PEM: {e}")))?
     } else {

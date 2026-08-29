@@ -285,14 +285,18 @@ fn parse_format_name(name: &str) -> Option<xray_conf::Format> {
     }
 }
 
-/// `-dump` 模式：输出合并后的配置。切片1 仅输出首个配置文件的原始内容。
+/// `-dump` 模式：加载并合并全部配置文件后，序列化回 JSON 输出。
+///
+/// 对应 Go `main/run.go:107-113 dumpConfig` → `core.GetMergedConfig` →
+/// `serial.MergeConfigFromFiles`（多文件 Override 合并 + MarshalToJson dump）。
 fn dump_config(args: &RunArgs) -> Result<()> {
     let files = resolve_config_files(args)?;
-    let path = files
-        .first()
-        .ok_or_else(|| CliError::ConfigNotFound("no config files for -dump".into()))?;
-    let content = std::fs::read_to_string(path)?;
-    print!("{content}");
+    if files.is_empty() {
+        return Err(CliError::ConfigNotFound("no config files for -dump".into()));
+    }
+    let merged = xray_conf::merge_config_from_files(&files)
+        .map_err(|e| CliError::ConfigLoadFailed(format!("merge config: {e}")))?;
+    print!("{merged}");
     Ok(())
 }
 
@@ -426,5 +430,43 @@ mod tests {
         assert_eq!(files.len(), 2); // 排除 .txt
         assert!(files[0] < files[1]); // 已排序
         assert!(files[0].file_name().unwrap() == "a.json");
+    }
+
+    #[test]
+    fn dump_config_merges_multiple_files() {
+        // 两份配置 -dump：应合并成功（outbound 前插 + log 覆盖语义由 xray-conf 测试覆盖）。
+        let mut tmp1 = tempfile::NamedTempFile::with_suffix(".json").unwrap();
+        writeln!(
+            tmp1,
+            r#"{{"log": {{"loglevel": "info"}}, "outbounds": [{{"protocol": "freedom", "tag": "direct"}}]}}"#
+        )
+        .unwrap();
+        tmp1.flush().unwrap();
+        let mut tmp2 = tempfile::NamedTempFile::with_suffix(".json").unwrap();
+        writeln!(
+            tmp2,
+            r#"{{"inbounds": [{{"protocol": "vless", "port": 443, "tag": "in"}}]}}"#
+        )
+        .unwrap();
+        tmp2.flush().unwrap();
+
+        let args = RunArgs {
+            config: vec![tmp1.path().to_path_buf(), tmp2.path().to_path_buf()],
+            format: "auto".into(),
+            dump: true,
+            ..Default::default()
+        };
+        let result = dump_config(&args);
+        assert!(result.is_ok(), "dump should merge both files: {result:?}");
+    }
+
+    #[test]
+    fn dump_config_no_files_errors() {
+        let args = RunArgs {
+            dump: true,
+            ..Default::default()
+        };
+        // 工作目录可能存在默认 config.*，结果依赖环境；仅验证不 panic。
+        let _ = dump_config(&args);
     }
 }

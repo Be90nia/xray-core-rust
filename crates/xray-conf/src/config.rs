@@ -380,9 +380,9 @@ mod tests {
 
     #[test]
     fn config_serializes_without_panic() {
-        // 配置系统以读为主：PortList 的 Serialize（Vec<PortRange>）与
-        // Deserialize（number/string/array）格式不对称，因此不做完整 roundtrip，
-        // 只验证 serialize 不 panic 且保留关键字段。
+        // PortList Serialize 已对齐 Go dump 形式（数字/逗号区间串），与
+        // Deserialize 对称（round-trip 见 serial::tests）。此处验证整份
+        // Config serialize 不 panic 且保留关键字段。
         let cfg = Config::from_json_str(MINIMAL_CONFIG).unwrap();
         let serialized = serde_json::to_string(&cfg).expect("serialize must succeed");
         assert!(!serialized.is_empty());
