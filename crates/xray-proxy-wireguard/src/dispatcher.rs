@@ -419,9 +419,13 @@ pub(crate) fn clear_reserved(pkt: &mut [u8]) {
 
 /// 构造 DialBridge 用的 DialFn 闭包（lazy init 模式）。
 ///
-/// 闭包捕获 `DeviceConfig` + 可选 DNS 服务。首次 dial 时通过 `OnceCell` lazy init
-/// `WireguardOutboundHandler`（含 driver task + smoltcp netstack）。
+/// 闭包捕获 `DeviceConfig` + 可选 DNS 服务 + 可选 system dialer。首次 dial 时
+/// 通过 `OnceCell` lazy init `WireguardOutboundHandler`（含 driver task + smoltcp
+/// netstack）。
 ///
+/// - `system_dialer`：`Some` 时 WG 自身 UDP 经此拨号出站（Go `client.go:94-143`
+///   processWireGuard 的 `internet.Dialer`——UDP 可经 socks 等出站链）；
+///   `None` 直连（Go 无 ProxySettings 时的 raw UDP）
 /// - 域名目标：经 WireGuard 自身 `domainStrategy` 解析（Go `client.go:167-187`，
 ///   `dns` 缺失时域名断链报错）
 /// - UDP 目标：smoltcp UDP socket + XUDP 帧中继（Go `client.go:225-244`）
@@ -431,6 +435,7 @@ pub(crate) fn clear_reserved(pkt: &mut [u8]) {
 pub fn make_wireguard_dial_fn(
     config: DeviceConfig,
     dns: Option<Arc<DnsService>>,
+    system_dialer: Option<DialFn>,
 ) -> DialFn {
     let handler: Arc<OnceCell<WireguardOutboundHandler>> = Arc::new(OnceCell::new());
     let config_clone = config.clone();
@@ -442,13 +447,20 @@ pub fn make_wireguard_dial_fn(
         let dest = dest.clone();
         let config = config_clone.clone();
         let dns = dns_clone.clone();
+        let system_dialer = system_dialer.clone();
         let handler_cell = Arc::clone(&handler);
 
         Box::pin(async move {
             // lazy init WireguardOutboundHandler（含 driver task）
             let handler = handler_cell
                 .get_or_try_init(|| async {
-                    WireguardOutboundHandler::new("wireguard", &config, dns.as_ref()).await
+                    WireguardOutboundHandler::new_with_dialer(
+                        "wireguard",
+                        &config,
+                        dns.as_ref(),
+                        system_dialer.as_ref().cloned(),
+                    )
+                    .await
                 })
                 .await
                 .map_err(|e| format!("wireguard handler init: {e}"))?;
@@ -579,7 +591,7 @@ where
 ///
 /// smoltcp `bind(0)` 拒绝零端口（BindError::Unaddressable）；Go
 /// `DialUDPAddrPort(netip.AddrPort{}, ...)` 的随机端口语义在此手动实现。
-fn bind_ephemeral(sock: &mut smoltcp::socket::udp::Socket<'static>) {
+pub(crate) fn bind_ephemeral(sock: &mut smoltcp::socket::udp::Socket<'static>) {
     use rand::Rng;
     for _ in 0..16 {
         let port: u16 = rand::thread_rng().gen_range(1024..65535);
@@ -905,5 +917,113 @@ mod tests {
         let mut p2 = vec![1u8, 9, 9, 9];
         apply_reserved(&mut p2, &[5]);
         assert_eq!(p2, vec![1u8, 9, 9, 9]);
+    }
+
+    /// bd xoj：system dialer 注入——WG 自身 UDP 经 dialer 出站（Go bind.go:126-166
+    /// netBindClient.connectTo）。用户 UDP 请求驱动 smoltcp tx → WG 握手 init →
+    /// DialedUdp 惰性拨号 → XUDP 帧到达 mock「代理链」对端，帧 target = WG
+    /// endpoint，reserved 写入包头 [1..4]（Go bind.go:184-186）。
+    #[tokio::test]
+    async fn make_dial_fn_routes_wg_udp_via_system_dialer() {
+        use crate::config::PeerConfig;
+        use tokio::io::AsyncReadExt as _;
+        use xray_transport::connection::{Connection, DuplexConnection};
+
+        let seen: std::sync::Arc<tokio::sync::Mutex<Option<Destination>>> =
+            std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let (client_end, mut wg_wire) = tokio::io::duplex(64 * 1024);
+        let slot: std::sync::Arc<tokio::sync::Mutex<Option<tokio::io::DuplexStream>>> =
+            std::sync::Arc::new(tokio::sync::Mutex::new(Some(client_end)));
+        let dialer: DialFn = {
+            let seen = Arc::clone(&seen);
+            let slot = Arc::clone(&slot);
+            Arc::new(move |dest: &Destination| {
+                let seen = Arc::clone(&seen);
+                let slot = Arc::clone(&slot);
+                let dest = dest.clone();
+                Box::pin(async move {
+                    *seen.lock().await = Some(dest);
+                    match slot.lock().await.take() {
+                        Some(c) => Ok(Box::new(DuplexConnection::new(c)) as Box<dyn Connection>),
+                        None => Err("unexpected second dial".to_string()),
+                    }
+                })
+            })
+        };
+
+        let (sec_c, _) = {
+            use boringtun::x25519::{PublicKey, StaticSecret};
+            let secret_bytes: [u8; 32] = [0x77; 32];
+            let secret = StaticSecret::from(secret_bytes);
+            let public = PublicKey::from(&secret);
+            (hex::encode(secret_bytes), hex::encode(public.as_bytes()))
+        };
+        let (_, pub_s) = {
+            use boringtun::x25519::{PublicKey, StaticSecret};
+            let secret_bytes: [u8; 32] = [0x88; 32];
+            let secret = StaticSecret::from(secret_bytes);
+            let public = PublicKey::from(&secret);
+            (hex::encode(secret_bytes), hex::encode(public.as_bytes()))
+        };
+        let config = crate::config::DeviceConfig {
+            secret_key: sec_c,
+            endpoint: vec!["10.0.0.2/32".into()],
+            peers: vec![PeerConfig {
+                public_key: pub_s,
+                endpoint: "203.0.113.9:51820".into(),
+                ..Default::default()
+            }],
+            reserved: vec![7, 8, 9],
+            ..Default::default()
+        };
+
+        let dial_fn = make_wireguard_dial_fn(config, None, Some(dialer));
+        let conn = dial_fn(&udp_dest(53)).await.expect("dial through wireguard");
+
+        // 用户 UDP 请求（XUDP 帧）→ UdpRelay → smoltcp → tx → WG 握手 init → dialed
+        let mut frame = Vec::new();
+        {
+            let mut pw = PacketWriter::new(&mut frame, udp_dest(53), [0u8; 8]);
+            pw.write_packet(b"q").expect("write frame");
+        }
+        let mut conn = conn;
+        tokio::io::AsyncWriteExt::write_all(&mut conn, &frame)
+            .await
+            .expect("write xudp frame");
+
+        // mock「代理链」对端：dialer 收到 WG endpoint + XUDP 帧 target=endpoint
+        let mut buf = vec![0u8; 2048];
+        let n = tokio::time::timeout(Duration::from_secs(10), wg_wire.read(&mut buf))
+            .await
+            .expect("timeout waiting wg packet on dialed conn")
+            .expect("wire read");
+
+        let dialed_dest = seen.lock().await.clone().expect("dialer was called");
+        assert_eq!(
+            dialed_dest.address(),
+            &Address::from_ipv4_bytes([203, 0, 113, 9]),
+            "dialer 以 WG peer endpoint 拨号"
+        );
+        assert_eq!(dialed_dest.port().value(), 51820);
+        assert_eq!(dialed_dest.network(), Network::UDP);
+
+        let pkt = PacketReader::new(std::io::Cursor::new(&buf[..n]))
+            .read_packet()
+            .expect("parse frame")
+            .expect("one packet");
+        let target = pkt.udp_target().expect("udp target");
+        assert_eq!(
+            target.address(),
+            &Address::from_ipv4_bytes([203, 0, 113, 9]),
+            "XUDP 帧 target = WG endpoint"
+        );
+        assert_eq!(target.port().value(), 51820);
+        let data = pkt.data();
+        assert!(
+            matches!(data.first().map(|b| b & 0x07), Some(1 | 2 | 3 | 4)),
+            "WG 消息类型（握手/数据），got head: {:?}",
+            &data[..data.len().min(4)]
+        );
+        assert_eq!(&data[1..4], &[7, 8, 9], "reserved 写入包头（Go bind.go:184-186）");
     }
 }

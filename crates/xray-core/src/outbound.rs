@@ -647,7 +647,35 @@ fn try_build_handler(
         }
         "wireguard" => {
             let config = parse_wireguard_config(&ob.entry.data)?;
-            let dial_fn = xray_proxy_wireguard::make_wireguard_dial_fn(config, dns.cloned());
+            // Go handler.go:242 把 Handler 自身作为 internet.Dialer 传给
+            // proxy.Process；handler.go:274-302——ProxySettings.Tag 非空时 WG
+            // 自身 UDP 经 chained outbound（如 socks）拨号（pipe + Dispatch）。
+            // Rust 经 DIALER_PROXY_HOOK 同构管道：sockopt.dialer_proxy=tag →
+            // dial_system 重定向到 tag 对应 handler（register_outbounds 注册）。
+            let system_dialer: Option<xray_app_dispatcher::default::DialFn> =
+                proxy_chain_tag.as_ref().map(|chain_tag| {
+                    let tag = chain_tag.clone();
+                    Arc::new(move |dest: &Destination| {
+                        let dest = dest.clone();
+                        let tag = tag.clone();
+                        Box::pin(async move {
+                            let mut sockopt = xray_transport::sockopt::SocketOptions::default();
+                            sockopt.dialer_proxy = tag;
+                            xray_transport::system_dialer::dial_system(&dest, &sockopt)
+                                .await
+                                .map_err(|e| format!("wireguard chain dial: {e}"))
+                        }) as std::pin::Pin<Box<
+                            dyn Future<
+                                Output = std::result::Result<
+                                    Box<dyn xray_transport::connection::Connection>,
+                                    String,
+                                >,
+                            > + Send,
+                        >>
+                    }) as xray_app_dispatcher::default::DialFn
+                });
+            let dial_fn =
+                xray_proxy_wireguard::make_wireguard_dial_fn(config, dns.cloned(), system_dialer);
             wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
         }
         "dns" => {

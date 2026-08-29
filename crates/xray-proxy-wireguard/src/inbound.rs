@@ -112,7 +112,11 @@ impl WireguardInboundHandler {
         let local_cidrs = parse_local_cidrs(config)?;
         let mtu = config.effective_mtu() as usize;
         let netstack = Arc::new(AsyncMutex::new(WgNetStack::new(&local_cidrs, mtu)));
-        let driver = Arc::new(WgDriver::new_multi(peers, allowed_cidrs, sock, Arc::clone(&netstack)));
+        // num_workers（Go server.go:52 也传 conf.NumWorkers → netBind.workers）
+        let driver = Arc::new(
+            WgDriver::new_multi(peers, allowed_cidrs, sock, Arc::clone(&netstack))
+                .with_num_workers(config.num_workers),
+        );
 
         Ok(Self {
             tag,

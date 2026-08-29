@@ -24,7 +24,7 @@ use xray_common::session::Session;
 use xray_features::outbound::{OutboundError, OutboundHandler};
 
 use crate::config::DeviceConfig;
-use crate::driver::{bind_udp_socket, WgDriver};
+use crate::driver::{bind_udp_socket, WgDriver, WgTransport, DialedUdp};
 use crate::error::{Result, WgError};
 use crate::netstack::WgNetStack;
 use crate::peer::{shared_peer, SharedPeer};
@@ -41,16 +41,32 @@ pub struct WireguardOutboundHandler {
 }
 
 impl WireguardOutboundHandler {
-    /// 从 DeviceConfig 构造出站 Handler 并启动 driver。
-    ///
-    /// - 解析 peer endpoint（域名经 `dns` 解析，Go `client.go:298-329`）
-    /// - 绑定 UDP socket（本地随机端口）
-    /// - 创建 smoltcp 网栈（从 config.endpoint 派生 interface 地址）
-    /// - spawn driver task（`reserved` 字段写入 WG 包头，Warp 用）
+    /// 从 DeviceConfig 构造出站 Handler 并启动 driver（直连 UDP）。
     pub async fn new(
         tag: impl Into<String>,
         config: &DeviceConfig,
         dns: Option<&Arc<xray_app_dns::DnsService>>,
+    ) -> Result<Self> {
+        Self::new_with_dialer(tag, config, dns, None).await
+    }
+
+    /// 从 DeviceConfig 构造出站 Handler，WG 自身 UDP 可经 system dialer 出站。
+    ///
+    /// 对应 Go `client.go:94-143 processWireGuard(ctx, dialer)`——`dialer`
+    /// 为 `internet.Dialer`（Rust 侧 `DialFn`）：
+    /// - `Some`：WG peer endpoint 以 UDP dest 经出站链拨号（可经 socks 等），
+    ///   惰性连接（Go `netBindClient.connectTo` 在首次 Send 时拨）
+    /// - `None`：绑定本地直连 UDP socket（与远端同族，随机端口）
+    ///
+    /// 其余步骤：
+    /// - 解析 peer endpoint（域名经 `dns` 解析，Go `client.go:298-329`）
+    /// - 创建 smoltcp 网栈（从 config.endpoint 派生 interface 地址）
+    /// - spawn driver task（`reserved` 写 WG 包头 + `num_workers` worker 池）
+    pub async fn new_with_dialer(
+        tag: impl Into<String>,
+        config: &DeviceConfig,
+        dns: Option<&Arc<xray_app_dns::DnsService>>,
+        system_dialer: Option<xray_app_dispatcher::default::DialFn>,
     ) -> Result<Self> {
         let tag = tag.into();
         if config.peers.is_empty() {
@@ -64,17 +80,37 @@ impl WireguardOutboundHandler {
         // 远端 endpoint（IP:port；域名经 DNS 解析——Go client.go:298-329）
         let remote_addr = resolve_endpoint_addr(&peer_cfg.endpoint, config, dns).await?;
 
-        // 绑定本地 UDP（与远端同族）
-        let bind_addr = if remote_addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
-        let sock = bind_udp_socket(bind_addr).await?;
+        // WG UDP 传输：system dialer（代理链，Go netBindClient.connectTo）或直连 socket
+        let transport = match &system_dialer {
+            Some(dialer) => {
+                let addr = match remote_addr.ip() {
+                    std::net::IpAddr::V4(v4) => Address::IPv4(v4),
+                    std::net::IpAddr::V6(v6) => Address::IPv6(v6),
+                };
+                let dest = Destination::new(
+                    addr,
+                    xray_common::net::port::Port::new(remote_addr.port()),
+                    xray_common::net::network::Network::UDP,
+                );
+                WgTransport::Dialed(Arc::new(DialedUdp::new(Arc::clone(dialer), dest)))
+            }
+            None => {
+                // 绑定本地 UDP（与远端同族）
+                let bind_addr = if remote_addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+                WgTransport::Direct(bind_udp_socket(bind_addr).await?)
+            }
+        };
 
         // smoltcp 网栈——从 config.endpoint 解析 interface 地址
         let local_cidrs = parse_local_cidrs(config)?;
         let mtu = config.effective_mtu() as usize;
         let netstack = Arc::new(AsyncMutex::new(WgNetStack::new(&local_cidrs, mtu)));
 
-        // driver（reserved → WG 包头，Go bind.go netBindClient.reserved）
-        let driver = Arc::new(WgDriver::new(Arc::clone(&peer), sock, Arc::clone(&netstack)));
+        // driver（reserved → WG 包头；num_workers → worker 池，Go bind.go:94-104）
+        let driver = Arc::new(
+            WgDriver::with_transport(vec![peer], vec![vec![]], transport, Arc::clone(&netstack))
+                .with_num_workers(config.num_workers),
+        );
         driver.set_reserved(config.reserved.clone());
         driver.set_remote(remote_addr);
         Arc::clone(&driver).spawn().await?;
