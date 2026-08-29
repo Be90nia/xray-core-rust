@@ -225,6 +225,44 @@ pub struct HttpAccountConfig {
     pub pass: Option<String>,
 }
 
+/// [`HttpInboundSettings::build`] 产物。对应 Go `HTTPServerConfig.Build()`
+/// 输出的 `http.ServerConfig`（http.go:32-50）。
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct HttpServerBuild {
+    /// 用户账户表（username → password）。空表示匿名访问。
+    pub accounts: HashMap<String, String>,
+    /// 是否允许透明代理（解析绝对 URI 而非 Host header）。
+    pub allow_transparent: bool,
+    /// 用户等级（policy 分级）。
+    pub user_level: u32,
+}
+
+impl HttpInboundSettings {
+    /// 对应 Go `HTTPServerConfig.Build()`（http.go:32-50，无错误路径）。
+    ///
+    /// - `accounts` 非 none 时整体覆盖 `users`（含空数组——Go :38-40 以
+    ///   `Accounts != nil` 判定，空切片同样覆盖）；
+    /// - `users` 非空时折叠为 username → password map（:42-47）。
+    #[must_use]
+    pub fn build(&self) -> HttpServerBuild {
+        let users = self.accounts.as_ref().or(self.users.as_ref());
+        let mut accounts = HashMap::new();
+        if let Some(users) = users {
+            for account in users {
+                accounts.insert(
+                    account.user.clone().unwrap_or_default(),
+                    account.pass.clone().unwrap_or_default(),
+                );
+            }
+        }
+        HttpServerBuild {
+            accounts,
+            allow_transparent: self.allow_transparent.unwrap_or_default(),
+            user_level: self.user_level.unwrap_or_default(),
+        }
+    }
+}
+
 /// Dokodemo-door 入站 settings。对应 Go `DokodemoConfig`（dokodemo.go:10-20）。
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -886,6 +924,24 @@ pub struct HttpOutboundSettings {
     pub headers: Option<HashMap<String, String>>,
 }
 
+/// HTTP 出站 `servers[i].users[j]` 元素。对应 Go `HTTPRemoteConfig.Users`
+///（`json.RawMessage`，http.go:55）在 `HTTPClientConfig.Build` 中被同时
+/// 反序列化为 `protocol.User`（level/email，:93-102）与 `HTTPAccount`
+///（user/pass，:103-111）的联合字段面。
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HttpRemoteUserConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pass: Option<String>,
+}
+
+/// HTTP CONNECT 出站远端。对应 Go `HTTPRemoteConfig`（http.go:52-56）。
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HttpRemoteConfig {
@@ -893,7 +949,129 @@ pub struct HttpRemoteConfig {
     pub address: Option<Address>,
     pub port: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub users: Option<Vec<Value>>,
+    pub users: Option<Vec<HttpRemoteUserConfig>>,
+}
+
+/// HTTP 出站认证用户。对应 Go Build 产出的 `protocol.User`（level/email）
+/// + `http.Account`（username/password）组合（http.go:93-113）。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct HttpClientUserBuild {
+    pub level: u32,
+    pub email: String,
+    pub username: String,
+    pub password: String,
+}
+
+/// HTTP 自定义 header。对应 Go `http.Header`（config.proto；map 值转换产物，
+/// http.go:119-125）。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct HttpHeaderBuild {
+    pub key: String,
+    pub value: String,
+}
+
+/// [`HttpOutboundSettings::build`] 产物。对应 Go `HTTPClientConfig.Build()`
+/// 输出的 `http.ClientConfig{Server, Header}`（http.go:69-127）。
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct HttpClientBuild {
+    /// 上游端点地址（Go 未校验非空；缺失时透传 None）。
+    pub address: Option<Address>,
+    pub port: u16,
+    /// 认证用户（顶层折叠路径：username 非空才挂；servers 路径：users[0]）。
+    pub user: Option<HttpClientUserBuild>,
+    /// `headers` map 转换产物，按 key 排序（Go map 迭代序随机，此处取确定序）。
+    pub headers: Vec<HttpHeaderBuild>,
+}
+
+impl HttpOutboundSettings {
+    /// 对应 Go `HTTPClientConfig.Build()`（http.go:69-127）。错误文案与 Go 对齐。
+    ///
+    /// - 顶层 `address` 折叠为单元素 servers，顶层字段优先（:71-81）；
+    /// - `servers` 恰 1 个成员，否则报错（:82-84）；
+    /// - `servers[i].users` 至多 1 个成员，否则报错（:86-88）。
+    ///
+    /// # Errors
+    /// - `servers` 数量 ≠ 1（含顶层折叠后）
+    /// - 任一 server 的 `users` 数量 > 1
+    pub fn build(&self) -> crate::error::Result<HttpClientBuild> {
+        // Go :71-81：顶层 address 折叠为单元素 servers；username 非空时挂一个
+        // 占位 user（level/email/user/pass 届时全取顶层字段，:95-97/:104-106）。
+        let folded: Vec<HttpRemoteConfig>;
+        let servers: &[HttpRemoteConfig] = if self.address.is_some() {
+            let mut server = HttpRemoteConfig {
+                address: self.address.clone(),
+                port: self.port.unwrap_or_default(),
+                users: None,
+            };
+            if self.user.as_deref().is_some_and(|u| !u.is_empty()) {
+                server.users = Some(vec![HttpRemoteUserConfig::default()]);
+            }
+            folded = vec![server];
+            &folded
+        } else {
+            self.servers.as_deref().unwrap_or(&[])
+        };
+
+        if servers.len() != 1 {
+            return Err(crate::error::ConfError::Invalid(
+                r#"HTTP settings: "servers" should have one and only one member. Multiple endpoints in "servers" should use multiple HTTP outbounds and routing balancer instead"#
+                    .into(),
+            ));
+        }
+        let server = &servers[0];
+        if server.users.as_ref().is_some_and(|u| u.len() > 1) {
+            return Err(crate::error::ConfError::Invalid(
+                r#"HTTP servers: "users" should have one member at most. Multiple members in "users" should use multiple HTTP outbounds and routing balancer instead"#
+                    .into(),
+            ));
+        }
+
+        // Go :93-115：至多一个 user；顶层折叠路径取顶层字段，servers 路径取
+        // users[0] 自身字段（raw JSON 同时喂 protocol.User 与 HTTPAccount）。
+        let user = server
+            .users
+            .as_ref()
+            .and_then(|users| users.first())
+            .map(|u| {
+                if self.address.is_some() {
+                    HttpClientUserBuild {
+                        level: self.level.unwrap_or_default(),
+                        email: self.email.clone().unwrap_or_default(),
+                        username: self.user.clone().unwrap_or_default(),
+                        password: self.pass.clone().unwrap_or_default(),
+                    }
+                } else {
+                    HttpClientUserBuild {
+                        level: u.level.unwrap_or_default(),
+                        email: u.email.clone().unwrap_or_default(),
+                        username: u.user.clone().unwrap_or_default(),
+                        password: u.pass.clone().unwrap_or_default(),
+                    }
+                }
+            });
+
+        // Go :119-125：headers map → Header 列表（key/value 对）。
+        let mut headers: Vec<HttpHeaderBuild> = self
+            .headers
+            .as_ref()
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| HttpHeaderBuild {
+                        key: k.clone(),
+                        value: v.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        headers.sort_by(|a, b| a.key.cmp(&b.key));
+
+        Ok(HttpClientBuild {
+            address: server.address.clone(),
+            port: server.port,
+            user,
+            headers,
+        })
+    }
 }
 
 /// Freedom 出站 settings。对应 Go `FreedomConfig`（freedom.go:19-30）。
@@ -1118,6 +1296,11 @@ mod tests {
                 r#"{"accounts":[{"user":"u","pass":"p"}],"allowTransparent":true}"#,
             ),
             (
+                "http",
+                // users 键方向（与 accounts 别名双向）。
+                r#"{"users":[{"user":"u1","pass":"p1"}],"userLevel":2}"#,
+            ),
+            (
                 "dokodemo-door",
                 r#"{"address":"example.com","port":80,"network":["tcp"],"followRedirect":true}"#,
             ),
@@ -1166,6 +1349,16 @@ mod tests {
             (
                 "http",
                 r#"{"servers":[{"address":"example.com","port":8080}],"headers":{"User-Agent":"curl/7.88"}}"#,
+            ),
+            (
+                "http",
+                // servers.users 强类型（level/email + user/pass 联合字段面）。
+                r#"{"servers":[{"address":"a.example.com","port":8080,"users":[{"level":3,"email":"a@b.c","user":"u","pass":"p"}]}]}"#,
+            ),
+            (
+                "http",
+                // 顶层折叠路径（address/port/level/email/user/pass）。
+                r#"{"address":"1.2.3.4","port":8080,"level":1,"email":"e@x.y","user":"u","pass":"p"}"#,
             ),
             (
                 "freedom",
@@ -1605,5 +1798,186 @@ mod tests {
         let s: ShadowsocksOutboundSettings = serde_json::from_str(raw).unwrap();
         assert!(s.build().unwrap_err().to_string().contains("Invalid Shadowsocks port"));
     }
+
+    /// Trojan 入站配置：users/clients alias 都应正确解析（Go trojan.go:115-116）。
+    #[test]
+    fn trojan_inbound_settings_clients_and_users_alias() {
+        let raw_clients = r#"{"clients":[{"password":"a","level":1,"email":"a@x"}]}"#;
+        let raw_users = r#"{"users":[{"password":"b","level":2,"email":"b@x","flow":"x"}]}"#;
+        let s1: TrojanInboundSettings = serde_json::from_str(raw_clients).unwrap();
+        let s2: TrojanInboundSettings = serde_json::from_str(raw_users).unwrap();
+        assert_eq!(s1.clients.as_ref().unwrap().len(), 1);
+        assert_eq!(s1.users, None, "clients 字段未提供时不构造 users");
+        assert_eq!(s2.users.as_ref().unwrap().len(), 1);
+        assert_eq!(s2.clients, None, "users 字段未提供时不构造 clients");
+        let u = &s2.users.as_ref().unwrap()[0];
+        assert_eq!(u.password, "b");
+        assert_eq!(u.level, Some(2));
+        assert_eq!(u.email.as_deref(), Some("b@x"));
+        assert_eq!(u.flow.as_deref(), Some("x"));
+    }
+
+    /// TrojanUserConfig level/email/flow 字段 round-trip（Go trojan.go:106-111）。
+    #[test]
+    fn trojan_user_config_round_trips_all_fields() {
+        let raw = r#"{"password":"pw","level":3,"email":"u@x","flow":"xtls-rprx-vision"}"#;
+        let u: TrojanUserConfig = serde_json::from_str(raw).unwrap();
+        assert_eq!(u.password, "pw");
+        assert_eq!(u.level, Some(3));
+        assert_eq!(u.email.as_deref(), Some("u@x"));
+        assert_eq!(u.flow.as_deref(), Some("xtls-rprx-vision"));
+        let back = serde_json::to_string(&u).unwrap();
+        let u2: TrojanUserConfig = serde_json::from_str(&back).unwrap();
+        assert_eq!(u, u2);
+    }
+
+    /// TrojanOutboundSettings 多 servers → 解析 OK（互斥校验在 build 层做，本测验证解析）。
+    #[test]
+    fn trojan_outbound_settings_multi_servers_parse() {
+        let raw = r#"{"servers":[
+            {"address":"a.com","port":443,"password":"pa"},
+            {"address":"b.com","port":443,"password":"pb"}]}"#;
+        let s: TrojanOutboundSettings = serde_json::from_str(raw).unwrap();
+        assert_eq!(s.servers.as_ref().unwrap().len(), 2);
+    }
+
+    /// HTTP 入站 users/accounts alias：双向解析 + build 时 accounts 覆盖 users
+    ///（Go http.go:38-40，`Accounts != nil` 判定含空切片）。
+    #[test]
+    fn http_inbound_accounts_alias_overrides_users() {
+        // accounts 优先。
+        let raw = r#"{"users":[{"user":"u1","pass":"p1"}],
+            "accounts":[{"user":"u2","pass":"p2"}]}"#;
+        let s: HttpInboundSettings = serde_json::from_str(raw).unwrap();
+        let b = s.build();
+        assert_eq!(b.accounts.get("u2").map(String::as_str), Some("p2"));
+        assert!(!b.accounts.contains_key("u1"));
+
+        // 仅 users。
+        let s: HttpInboundSettings =
+            serde_json::from_str(r#"{"users":[{"user":"u1","pass":"p1"}]}"#).unwrap();
+        assert_eq!(s.build().accounts.get("u1").map(String::as_str), Some("p1"));
+
+        // accounts 空数组覆盖非空 users（Go：空切片 != nil）。
+        let s: HttpInboundSettings =
+            serde_json::from_str(r#"{"users":[{"user":"u1","pass":"p1"}],"accounts":[]}"#).unwrap();
+        assert!(s.build().accounts.is_empty());
+
+        // 双键 round-trip（serde 层别名双向）。
+        for raw in [
+            r#"{"users":[{"user":"u","pass":"p"}]}"#,
+            r#"{"accounts":[{"user":"u","pass":"p"}]}"#,
+        ] {
+            let s: HttpInboundSettings = serde_json::from_str(raw).unwrap();
+            let back = serde_json::to_string(&s).unwrap();
+            let v: Value = serde_json::from_str(&back).unwrap();
+            assert_eq!(v, serde_json::from_str::<Value>(raw).unwrap());
+        }
+    }
+
+    /// HTTP 入站 build 字段映射（allowTransparent/userLevel，Go http.go:33-36）。
+    #[test]
+    fn http_inbound_build_maps_transparent_and_level() {
+        let s: HttpInboundSettings = serde_json::from_str(
+            r#"{"users":[{"user":"u","pass":"p"}],"allowTransparent":true,"userLevel":7}"#,
+        )
+        .unwrap();
+        let b = s.build();
+        assert!(b.allow_transparent);
+        assert_eq!(b.user_level, 7);
+        // 默认值。
+        let b = HttpInboundSettings::default().build();
+        assert!(!b.allow_transparent);
+        assert_eq!(b.user_level, 0);
+        assert!(b.accounts.is_empty());
+    }
+
+    /// HTTP 出站 servers 恰 1 校验（Go http.go:82-84，文案对齐）。
+    #[test]
+    fn http_outbound_servers_must_have_exactly_one() {
+        // 0 个。
+        let s: HttpOutboundSettings = serde_json::from_str("{}").unwrap();
+        let err = s.build().unwrap_err().to_string();
+        assert!(err.contains(r#""servers" should have one and only one member"#), "got: {err}");
+
+        // 2 个。
+        let raw = r#"{"servers":[
+            {"address":"a","port":1},
+            {"address":"b","port":2}]}"#;
+        let s: HttpOutboundSettings = serde_json::from_str(raw).unwrap();
+        assert!(s.build().unwrap_err().to_string().contains("one and only one"));
+
+        // 顶层 address 折叠后恰 1（Go :71-81，覆盖 servers 字段）。
+        let raw = r#"{"address":"1.2.3.4","port":8080,
+            "servers":[{"address":"ignored","port":1}]}"#;
+        let s: HttpOutboundSettings = serde_json::from_str(raw).unwrap();
+        let b = s.build().unwrap();
+        assert_eq!(b.address, Some(Address("1.2.3.4".into())));
+        assert_eq!(b.port, 8080);
+
+        // 恰 1 个（servers 路径）。
+        let s: HttpOutboundSettings =
+            serde_json::from_str(r#"{"servers":[{"address":"a","port":80}]}"#).unwrap();
+        assert!(s.build().is_ok());
+    }
+
+    /// HTTP 出站 servers[i].users 至多 1 校验（Go http.go:86-88，文案对齐）。
+    #[test]
+    fn http_outbound_server_users_at_most_one() {
+        let raw = r#"{"servers":[{"address":"a","port":80,"users":[
+            {"user":"u1","pass":"p1"},{"user":"u2","pass":"p2"}]}]}"#;
+        let s: HttpOutboundSettings = serde_json::from_str(raw).unwrap();
+        let err = s.build().unwrap_err().to_string();
+        assert!(err.contains(r#""users" should have one member at most"#), "got: {err}");
+    }
+
+    /// HTTP 出站 user 两条路径（Go http.go:93-115）：顶层折叠取顶层字段
+    ///（username 非空才挂）；servers 路径取 users[0] 自身字段。
+    #[test]
+    fn http_outbound_user_from_legacy_and_server_paths() {
+        // 顶层折叠路径。
+        let raw = r#"{"address":"1.2.3.4","port":8080,"level":3,"email":"e@x.y","user":"u","pass":"p"}"#;
+        let s: HttpOutboundSettings = serde_json::from_str(raw).unwrap();
+        let u = s.build().unwrap().user.expect("user attached");
+        assert_eq!((u.level, u.email.as_str(), u.username.as_str(), u.password.as_str()), (3, "e@x.y", "u", "p"));
+
+        // 顶层 username 为空 → 不挂 user（Go :78 只查 Username）。
+        let raw = r#"{"address":"1.2.3.4","port":8080,"pass":"p"}"#;
+        let s: HttpOutboundSettings = serde_json::from_str(raw).unwrap();
+        assert!(s.build().unwrap().user.is_none());
+
+        // servers 路径：users[0] 自身字段（protocol.User + HTTPAccount 联合面）。
+        let raw = r#"{"servers":[{"address":"a","port":80,
+            "users":[{"level":5,"email":"s@x.y","user":"su","pass":"sp"}]}]}"#;
+        let s: HttpOutboundSettings = serde_json::from_str(raw).unwrap();
+        let u = s.build().unwrap().user.expect("user attached");
+        assert_eq!((u.level, u.email.as_str(), u.username.as_str(), u.password.as_str()), (5, "s@x.y", "su", "sp"));
+
+        // servers 路径空 users → 无 user。
+        let s: HttpOutboundSettings =
+            serde_json::from_str(r#"{"servers":[{"address":"a","port":80}]}"#).unwrap();
+        assert!(s.build().unwrap().user.is_none());
+    }
+
+    /// HTTP 出站 headers map → Header 列表转换（Go http.go:119-125）；
+    /// 按 key 排序保证确定性（Go map 迭代序随机）。
+    #[test]
+    fn http_outbound_headers_map_converts_to_sorted_list() {
+        let raw = r#"{"servers":[{"address":"a","port":80}],"headers":{"B":"2","A":"1","C":"3"}}"#;
+        let s: HttpOutboundSettings = serde_json::from_str(raw).unwrap();
+        let b = s.build().unwrap();
+        let pairs: Vec<(&str, &str)> = b
+            .headers
+            .iter()
+            .map(|h| (h.key.as_str(), h.value.as_str()))
+            .collect();
+        assert_eq!(pairs, vec![("A", "1"), ("B", "2"), ("C", "3")]);
+
+        // 无 headers → 空列表（Go :119 仍 make 空 slice）。
+        let s: HttpOutboundSettings =
+            serde_json::from_str(r#"{"servers":[{"address":"a","port":80}]}"#).unwrap();
+        assert!(s.build().unwrap().headers.is_empty());
+
+}
 }
 
