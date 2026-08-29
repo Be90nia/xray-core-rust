@@ -309,11 +309,59 @@ async fn serial_query(
     Err(last_err)
 }
 
-/// 并行查询：同时向所有 clients 发起查询，返回第一个成功结果。
+/// 名称服务器组（按相邻 `policy_id` 合并）。对应 Go `type group struct{ start, end int }`。
+#[derive(Debug, Clone, Copy)]
+struct Group {
+    start: usize,
+    end: usize, // inclusive
+}
+
+/// 把相邻且 `policy_id` 相同的 client 合并为一个 group。
+/// 对应 Go `(*DNS).makeGroups`（app/dns/dns.go:479-533）。
 ///
-/// 对应 Go `(*DNS).queryIP` 并行路径（dns.go:455-459：FakeDNS 在
-/// `!option.FakeEnable` 时不参与查询）。
-/// ponytail: 用 tokio::JoinSet 并发执行，任一成功即取消其余。
+/// 返回 `(groups, group_of)`：`groups[i].start..=groups[i].end` 是第 i 组的下标范围；
+/// `group_of[j]` 是下标 j 所属的组下标。
+fn make_groups(clients: &[Arc<Client>]) -> (Vec<Group>, Vec<usize>) {
+    let n = clients.len();
+    if n == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let mut groups: Vec<Group> = Vec::with_capacity(n);
+    let mut group_of: Vec<usize> = vec![0; n];
+    let (mut s, mut e) = (0usize, 0usize);
+    for i in 1..n {
+        if clients[i - 1].policy_id == clients[i].policy_id {
+            e = i;
+        } else {
+            for k in s..=e {
+                group_of[k] = groups.len();
+            }
+            groups.push(Group { start: s, end: e });
+            (s, e) = (i, i);
+        }
+    }
+    for k in s..=e {
+        group_of[k] = groups.len();
+    }
+    groups.push(Group { start: s, end: e });
+    (groups, group_of)
+}
+
+/// 并行查询：按 `policy_id` 相邻合并分组，组内 race minimum rtt，组间串行。
+///
+/// 对应 Go `(*DNS).parallelQuery`（app/dns/dns.go:386-438）：
+/// - `makeGroups` 合并相邻同 `policy_id` 的 client；
+/// - `asyncQueryAll` 同时向所有 client 发起查询；
+/// - 收集结果时按 group 序遍历：当前组内已收到任一成功即返回（组内 race）；
+///   当前组全部失败再进入下一组。
+/// 单个 client 的查询结果分类（避免 clone DnsError）。
+#[derive(Debug, Clone)]
+enum ClientOutcome {
+    Success(Vec<IpAddr>, u32),
+    Failure,
+    Pending,
+}
+
 async fn parallel_query(
     clients: &[Arc<Client>],
     domain: &str,
@@ -321,34 +369,100 @@ async fn parallel_query(
 ) -> Result<(Vec<IpAddr>, u32), DnsError> {
     use tokio::task::JoinSet;
 
-    let domain_owned = domain.to_string();
-    let mut set = JoinSet::new();
+    let (groups, _group_of) = make_groups(clients);
+    if groups.is_empty() {
+        return Err(DnsError::EmptyResponse);
+    }
 
-    for client in clients {
+    let domain_owned = domain.to_string();
+    let mut set: JoinSet<(usize, Result<(Vec<IpAddr>, u32), DnsError>)> = JoinSet::new();
+    let mut spawned = 0usize;
+
+    for (i, client) in clients.iter().enumerate() {
         if !option.fake_enable && client.server.name().eq_ignore_ascii_case("FakeDNS") {
             continue;
         }
         let c = Arc::clone(client);
         let d = domain_owned.clone();
-        set.spawn(async move { c.query_ip(&d).await });
+        set.spawn(async move { (i, c.query_ip(&d).await) });
+        spawned += 1;
     }
 
-    let mut last_err = DnsError::EmptyResponse;
-    while let Some(res) = set.join_next().await {
-        match res {
-            Ok(Ok(result)) => {
-                set.abort_all();
-                return Ok(result);
+    if spawned == 0 {
+        return Err(DnsError::EmptyResponse);
+    }
+
+    // 每个 client 的结果（Pending=未到，Success/Failure=已到）。
+    let mut outcomes: Vec<ClientOutcome> =
+        (0..clients.len()).map(|_| ClientOutcome::Pending).collect();
+    // 每个 group 剩余未完成 client 数（仅计入真实 spawned）。
+    // ponytail: 用 HashMap<group_idx, pending> 简化：group_idx 0..=len-1 顺序遍历。
+    let group_count = groups.len();
+    // 已聚合错误（仅 Debug 字符串，避免 clone DnsError）。
+    let mut errs: Vec<String> = Vec::new();
+    let mut non_empty_err_seen = false;
+
+    let mut next_group = 0usize;
+    while next_group < group_count {
+        let recv = set.join_next().await;
+        let (idx, outcome) = match recv {
+            Some(Ok(v)) => v,
+            _ => continue,
+        };
+        // 登记结果。
+        match &outcome {
+            Ok((ips, ttl)) if !ips.is_empty() => {
+                outcomes[idx] = ClientOutcome::Success(ips.clone(), *ttl);
             }
-            Ok(Err(e)) => {
-                last_err = e;
+            Ok(_) => {
+                // Ok 但空 IP → 视为 Failure（Go 同步 dns.ErrEmptyResponse）。
+                outcomes[idx] = ClientOutcome::Failure;
+                non_empty_err_seen |= false; // 空响应 → 后续聚合按 EmptyResponse 处理
             }
-            Err(_) => {
-                // JoinError (task panicked/cancelled)
+            Err(e) => {
+                outcomes[idx] = ClientOutcome::Failure;
+                non_empty_err_seen |= !matches!(e, DnsError::EmptyResponse);
+                errs.push(format!("{:?}", e));
             }
         }
+
+        // 当前 group 内任一成功 → 组内 race 立即返回。
+        let g = groups[next_group];
+        let mut success: Option<(Vec<IpAddr>, u32)> = None;
+        for j in g.start..=g.end {
+            if let ClientOutcome::Success(ips, ttl) = &outcomes[j] {
+                success = Some((ips.clone(), *ttl));
+                break;
+            }
+        }
+        if let Some((ips, ttl)) = success {
+            set.abort_all();
+            return Ok((ips, ttl));
+        }
+
+        // 当前 group 仍有人在跑：检查是否还有 pending。
+        // ponytail: 用 group 内 outcomes 状态推断（Pending 即未完成）。
+        let mut still_pending = 0usize;
+        for j in g.start..=g.end {
+            if matches!(outcomes[j], ClientOutcome::Pending) {
+                still_pending += 1;
+            }
+        }
+        if still_pending > 0 {
+            continue;
+        }
+
+        // 当前 group 全部到齐且全部失败 → 推进 next_group。
+        next_group += 1;
     }
-    Err(last_err)
+
+    if non_empty_err_seen {
+        Err(DnsError::Features(xray_features::dns::DnsError::Other(
+            errs.join("; "),
+        )))
+    } else {
+        Err(DnsError::EmptyResponse)
+    }
 }
 
 
@@ -424,15 +538,74 @@ mod tests {
     }
 
     fn make_client_with_ips(tag: &str, skip_fallback: bool, final_query: bool, ips: Vec<IpAddr>) -> Arc<Client> {
+        make_client_with_policy(tag, skip_fallback, final_query, ips, 0)
+    }
+
+    fn make_client_with_policy(
+        tag: &str,
+        skip_fallback: bool,
+        final_query: bool,
+        ips: Vec<IpAddr>,
+        policy_id: u32,
+    ) -> Arc<Client> {
         let ns = NameServerConfig {
             tag: tag.to_string(),
             skip_fallback,
             final_query,
+            policy_id,
             ..Default::default()
         };
         let server: Box<dyn Server> = Box::new(StaticServer {
             name: tag.to_string(),
             ips,
+        });
+        Arc::new(Client::new(ns, IpOption::all(), server).unwrap())
+    }
+
+    /// 测试用 Server：先 sleep `delay`，再返回固定 IP+TTL。
+    /// 用于构造 rtt 差异以验证 race minimum rtt 语义。
+    struct DelayedServer {
+        name: String,
+        ips: Vec<IpAddr>,
+        delay: Duration,
+    }
+
+    impl Server for DelayedServer {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn is_disable_cache(&self) -> bool {
+            false
+        }
+        fn query_ip<'a>(
+            &'a self,
+            _domain: &'a str,
+            _option: IpOption,
+        ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>> {
+            let ips = self.ips.clone();
+            let delay = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Ok((ips, 60))
+            })
+        }
+    }
+
+    fn make_delayed_client(
+        tag: &str,
+        policy_id: u32,
+        ips: Vec<IpAddr>,
+        delay: Duration,
+    ) -> Arc<Client> {
+        let ns = NameServerConfig {
+            tag: tag.to_string(),
+            policy_id,
+            ..Default::default()
+        };
+        let server: Box<dyn Server> = Box::new(DelayedServer {
+            name: tag.to_string(),
+            ips,
+            delay,
         });
         Arc::new(Client::new(ns, IpOption::all(), server).unwrap())
     }
@@ -777,5 +950,71 @@ mod tests {
             .await
             .expect_err("no family enabled must error");
         assert!(matches!(err, xray_features::dns::DnsError::EmptyResponse));
+    }
+
+    /// hmot：3 clients 同 policyID → 1 group race。
+    /// 验证 `make_groups` 相邻合并 + 组内 race minimum rtt（最快返回者胜出）。
+    #[tokio::test]
+    async fn parallel_query_same_policy_groups_into_one_race() {
+        let ip_a = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        let ip_b = IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2));
+        let ip_c = IpAddr::V4(Ipv4Addr::new(3, 3, 3, 3));
+        // 同一 policy_id=7，3 个 client，rtt 差异：b 最快、a 次之、c 最慢。
+        let c_a = make_delayed_client(
+            "a", 7, vec![ip_a],
+            Duration::from_millis(50),
+        );
+        let c_b = make_delayed_client(
+            "b", 7, vec![ip_b],
+            Duration::from_millis(10),
+        );
+        let c_c = make_delayed_client(
+            "c", 7, vec![ip_c],
+            Duration::from_millis(100),
+        );
+        let clients = vec![c_a, c_b, c_c];
+        // 先单独验证 make_groups：3 个同 policy → 1 group。
+        let (groups, group_of) = make_groups(&clients);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].start, 0);
+        assert_eq!(groups[0].end, 2);
+        for j in 0..3 {
+            assert_eq!(group_of[j], 0);
+        }
+        // 跑并行查询：应返回最快者（b，10ms）。
+        let (ips, _ttl) = parallel_query(&clients, "x.com", IpOption::all()).await.unwrap();
+        assert_eq!(ips, vec![ip_b], "组内 race 应返回最快完成的 client (b)");
+    }
+
+    /// hmot：3 clients 异 policyID → 3 groups 串行。
+    /// 验证组间 fallback：前组全失败 → 推进到后组；后组成功 → 返回。
+    #[tokio::test]
+    async fn parallel_query_diff_policy_serial_groups() {
+        // group0 (policy=1): 全失败（空响应）。
+        let g0_a = make_client_with_policy("g0a", false, false, Vec::new(), 1);
+        let g0_b = make_client_with_policy("g0b", false, false, Vec::new(), 1);
+        // group1 (policy=2): 也全失败。
+        let g1_a = make_client_with_policy("g1a", false, false, Vec::new(), 2);
+        let g1_b = make_client_with_policy("g1b", false, false, Vec::new(), 2);
+        // group2 (policy=3): 成功。
+        let success_ip = IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9));
+        let g2_a = make_delayed_client(
+            "g2a", 3, vec![success_ip],
+            Duration::from_millis(20),
+        );
+        let clients = vec![g0_a, g0_b, g1_a, g1_b, g2_a];
+        // make_groups：3 个不同 policy → 3 个 group，邻接合并按 [0..1][2..3][4..4]。
+        let (groups, group_of) = make_groups(&clients);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].start, 0);
+        assert_eq!(groups[0].end, 1);
+        assert_eq!(groups[1].start, 2);
+        assert_eq!(groups[1].end, 3);
+        assert_eq!(groups[2].start, 4);
+        assert_eq!(groups[2].end, 4);
+        assert_eq!(group_of, vec![0, 0, 1, 1, 2]);
+        // 跑并行查询：group0+1 全失败 → 推进到 group2 → 返回成功 IP。
+        let (ips, _ttl) = parallel_query(&clients, "x.com", IpOption::all()).await.unwrap();
+        assert_eq!(ips, vec![success_ip], "组间串行：前组全败 → 后组成功");
     }
 }
