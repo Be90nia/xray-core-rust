@@ -17,6 +17,7 @@
 
 pub mod handler;
 pub mod proxy_outbound;
+pub mod uot;
 
 pub use handler::{OutboundHandlerEntry, UotVersion, parse_random_ip};
 pub use proxy_outbound::{OutboundDialer, ProxyOutbound};

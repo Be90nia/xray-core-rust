@@ -16,6 +16,7 @@
 
 use crate::error::ProxymanError;
 use crate::inbound::PinFuture;
+
 use crate::outbound::proxy_outbound::{OutboundDialer, ProxyOutbound};
 use crate::outbound::OutboundHandler;
 use crate::stats::{Counter, StatsProvider, outbound_downlink_name, outbound_uplink_name};
