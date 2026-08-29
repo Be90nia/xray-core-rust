@@ -292,7 +292,7 @@ pub enum RealityServerOutcome<C> {
 /// 流程：
 /// 1. [`read_tls_record`] 读 ClientHello record
 /// 2. [`parse_client_hello`] + [`verify_reality_client_hello`] 验证
-/// 3. 成功：[`generate_self_signed_cert`] + [`build_server_config`] + rustls TLS 握手
+/// 3. 成功：[`generate_reality_ed25519_cert`] + [`build_server_config`] + rustls TLS 握手
 /// 4. 失败：返回 [`RealityServerOutcome::Invalid`]，调用方决定 fallback
 ///
 /// # 参数
@@ -339,10 +339,10 @@ where
             max_diff,
             allowed_short_ids,
         )?;
-        Ok::<_, RealityError>((parsed.server_name.clone().unwrap_or_else(|| "localhost".to_string()), auth_key))
+        Ok::<_, RealityError>(auth_key)
     })();
 
-    let (sni, auth_key) = match outcome {
+    let auth_key = match outcome {
         Ok(v) => v,
         Err(reason) => {
             return Ok(RealityServerOutcome::Invalid { conn, record, reason });
@@ -350,7 +350,7 @@ where
     };
 
     // 3. 成功分支：生成 REALITY HMAC 证书 + TLS 握手
-    let _ = &sni; // ponytail: sni 暂不用 (REALITY cert 用固定 SAN=reality.local)
+    // （证书为进程级固定空模板，Go init() 语义，与 SNI 无关）
     let (cert_der, key_der) = generate_reality_ed25519_cert(&auth_key)?;
     let server_config = build_server_config(cert_der, key_der)?;
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
@@ -980,8 +980,9 @@ mod tests {
         let reality_config = RealityConfig::from_proto(&proto).unwrap();
         let state = UConnState::new(reality_config).unwrap();
 
-        // 双向管道（足够大 buffer 避免 TCP 反压）
+        // 双向管道（足够大 buffer 避免 TCP 反压）+ Connection 适配（btls 路径要求）
         let (client, server) = duplex(65536);
+        let client = xray_transport::connection::DuplexConnection::new(client);
 
         // spawn server_tls
         let server_task = tokio::spawn(async move {
@@ -1000,6 +1001,57 @@ mod tests {
         match (client_result, server_result) {
             (Ok(Ok(_tls_stream)), Ok(RealityServerOutcome::Verified(_))) => {
                 // 完整 REALITY 握手成功！
+            }
+            (Ok(Ok(_)), Ok(_)) => panic!("server unexpected outcome"),
+            (Ok(Ok(_)), Err(e)) => panic!("server error: {e:?}"),
+            (Ok(Err(e)), _) => panic!("client u_client failed: {e:?}"),
+            (Err(_timeout), _) => panic!("client u_client timeout"),
+        }
+    }
+
+    /// watfaq-rustls fallback 路径 loopback（指纹 `randomizednoalpn` 不被 btls
+    /// 支持，u_client 走 `with_reality` rustls 握手）：完整 REALITY 握手 + 固定空模板
+    /// 证书 HMAC 验证（Go init() 语义 cert 的 e2e 证明，独立于 btls 指纹路径）。
+    #[tokio::test]
+    async fn reality_loopback_watfaq_fallback_fingerprint() {
+        ensure_crypto_provider();
+        use std::time::Duration;
+        use tokio::io::duplex;
+        use x25519_dalek::{PublicKey, StaticSecret};
+        use crate::client::{u_client, UConnState};
+        use crate::config::RealityConfig;
+        use xray_proto::transport::internet::reality::Config as ProtoConfig;
+
+        let server_priv_array = [0x11u8; 32];
+        let short_id = [0xaa; 8];
+
+        let server_secret = StaticSecret::from(server_priv_array);
+        let server_pub = PublicKey::from(&server_secret);
+
+        let proto = ProtoConfig {
+            fingerprint: "randomizednoalpn".into(),
+            public_key: server_pub.as_bytes().to_vec(),
+            server_name: "example.com".into(),
+            short_id: short_id.to_vec(),
+            ..Default::default()
+        };
+        let reality_config = RealityConfig::from_proto(&proto).unwrap();
+        let state = UConnState::new(reality_config).unwrap();
+
+        let (client, server) = duplex(65536);
+        let client = xray_transport::connection::DuplexConnection::new(client);
+
+        let server_task = tokio::spawn(async move {
+            server_tls(server, &server_priv_array, &[short_id], 43200).await
+        });
+
+        let client_result =
+            tokio::time::timeout(Duration::from_secs(10), u_client(client, state)).await;
+        let server_result = server_task.await.unwrap();
+
+        match (client_result, server_result) {
+            (Ok(Ok(_tls_stream)), Ok(RealityServerOutcome::Verified(_))) => {
+                // 完整 REALITY 握手成功（watfaq 路径 + 固定模板证书）
             }
             (Ok(Ok(_)), Ok(_)) => panic!("server unexpected outcome"),
             (Ok(Ok(_)), Err(e)) => panic!("server error: {e:?}"),

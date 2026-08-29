@@ -1069,6 +1069,21 @@ impl<S: Connection + Unpin> BtlsConn<S> {
             server_name: server_name.to_string(),
         })
     }
+
+    /// 从已握手 stream 组装（[`crate::btls_reality::connect_reality`] 用）。
+    pub(crate) fn from_parts(
+        stream: Pin<Box<TokioSslStream<S>>>,
+        fingerprint: Fingerprint,
+        server_name: &str,
+    ) -> Self {
+        Self { stream, fingerprint, server_name: server_name.to_string() }
+    }
+}
+
+/// 指纹是否被 btls 支持（REALITY u_client 路径选择的预检）。
+#[must_use]
+pub fn fingerprint_supported(fp: &Fingerprint) -> bool {
+    connector_for_fingerprint(fp).is_some()
 }
 
 impl<S: Connection + Unpin> AsyncRead for BtlsConn<S> {

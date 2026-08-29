@@ -26,6 +26,9 @@ rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
 rustls-pki-types = { workspace = true }
+# btls REALITY 指纹路径（SslRef 钩子 + X509 DER；FFI 经 xray-tls 转发）
+btls = { workspace = true }
+parking_lot = { workspace = true }
 # REALITY 配置从 JSON 解析需要 base64（publicKey）+ hex（shortId）
 base64 = "0.22"
 hex = "0.4"

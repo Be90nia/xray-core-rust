@@ -19,6 +19,9 @@ pub const SHORT_ID_LEN: usize = 8;
 /// X25519 私钥/公钥固定 32 字节。
 pub const X25519_KEY_LEN: usize = 32;
 
+/// ML-DSA-65 种子长度（Go `mldsa65.NewKeyFromSeed(*[32]byte)`）。
+pub const MLDSA65_SEED_LEN: usize = 32;
+
 /// REALITY ShortId（固定 8 字节）。
 ///
 /// 对应 Go 端 `*[8]byte`，Rust 端用 newtype 包装以便类型安全区分 `Vec<u8>`。
@@ -191,9 +194,22 @@ impl RealityConfig {
         }
 
         if !p.mldsa65_seed.is_empty() {
+            // Go: (*[32]byte)(c.Mldsa65Seed) —— 长度 != 32 直接 panic，
+            // Rust 端在配置期报错（等价的失败时机，更友好的失败方式）。
+            if p.mldsa65_seed.len() != MLDSA65_SEED_LEN {
+                return Err(RealityError::InvalidMldsa65SeedLen {
+                    actual: p.mldsa65_seed.len(),
+                });
+            }
             cfg.mldsa65_seed = Some(p.mldsa65_seed.clone());
-            // mldsa65_key 由 seed 派生：Go 端 `_, key := mldsa65.NewKeyFromSeed(...)`
-            // Rust 端不引 `circl/sign/mldsa65`，留 None；等接入后补
+            // Go: _, key := mldsa65.NewKeyFromSeed(...) → config.Mldsa65Key。
+            // 签名路径 stub（crate::mitm::generate_reality_ed25519_cert_mldsa65）：
+            // rustls 证书选定前拿不到 ServerHello 字节。非 PQC 客户端不受影响
+            // （Go 端 mldsa65 变体证书同样携带标准 HMAC 尾部，向后兼容）。
+            tracing::warn!(
+                "REALITY: mldsa65_seed configured but ML-DSA-65 cert signing is \
+                 not yet implemented; serving standard REALITY cert"
+            );
         }
         if let Some(lf) = &p.limit_fallback_upload {
             cfg.limit_fallback_upload = Some(LimitFallback::from_proto(lf));
@@ -335,6 +351,29 @@ mod tests {
         assert_eq!(cfg.mldsa65_seed, Some(vec![0xaa; 32]));
         // mldsa65_key 留 None（等接入 circl/sign/mldsa65）
         assert!(cfg.mldsa65_key.is_none());
+    }
+
+    /// Go `(*[32]byte)(c.Mldsa65Seed)`：长度 ≠ 32 直接失败
+    /// （Go panic → Rust 配置期错误）。
+    #[test]
+    fn from_proto_rejects_bad_mldsa65_seed_len() {
+        let mut p = proto_fixture();
+        p.mldsa65_seed = vec![0xaa; 31];
+        let err = RealityConfig::from_proto(&p).unwrap_err();
+        assert!(matches!(
+            err,
+            RealityError::InvalidMldsa65SeedLen { actual: 31 }
+        ));
+    }
+
+    /// 客户端字段 mldsa65_verify（proto field 25）透传。
+    #[test]
+    fn from_proto_mldsa65_verify_preserved() {
+        let mut p = proto_fixture();
+        p.mldsa65_verify = vec![0xbb; 1952];
+        let cfg = RealityConfig::from_proto(&p).unwrap();
+        assert_eq!(cfg.mldsa65_verify.len(), 1952);
+        assert_eq!(cfg.mldsa65_verify[0], 0xbb);
     }
 
     #[test]

@@ -20,7 +20,7 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio_rustls::client::TlsStream;
+use crate::client::RealityTlsStream;
 
 use xray_common::net::destination::Destination;
 use xray_transport::connection::Connection;
@@ -48,12 +48,14 @@ async fn dial_reality(dest: &Destination, settings: &StreamSettings) -> io::Resu
     let host = dest.address().to_string();
     let port = dest.port().value();
     let addr = format!("{host}:{port}");
-    let tcp = TcpStream::connect(&addr)
+    let tcp = tokio::net::TcpStream::connect(&addr)
         .await
         .map_err(|e| io::Error::other(format!("reality tcp connect to {addr}: {e}")))?;
 
-    let remote_addr = tcp.peer_addr().ok();
-    let local_addr = tcp.local_addr().ok();
+    let tcp = xray_transport::connection::TcpConnection::new(tcp);
+
+    let remote_addr = tcp.remote_addr().ok().flatten();
+    let local_addr = tcp.local_addr().ok().flatten();
 
     let tls_stream = u_client(tcp, state)
         .await
@@ -152,19 +154,19 @@ fn parse_reality_config(json: Option<&serde_json::Value>) -> io::Result<RealityC
 /// 包装 `tokio_rustls::client::TlsStream<S>`，提供 `remote_addr`/`local_addr`
 /// （从底层 TcpStream 拿，TLS handshake 之前快照保存）。
 pub struct RealityConnection<S> {
-    inner: TlsStream<S>,
+    inner: RealityTlsStream<S>,
     remote_addr: Option<SocketAddr>,
     local_addr: Option<SocketAddr>,
 }
 
 impl<S> RealityConnection<S> {
     #[must_use]
-    pub fn new(inner: TlsStream<S>) -> Self {
+    pub fn new(inner: RealityTlsStream<S>) -> Self {
         Self { inner, remote_addr: None, local_addr: None }
     }
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for RealityConnection<S> {
+impl<S: Connection> AsyncRead for RealityConnection<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -174,7 +176,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for RealityConnection<S> {
     }
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for RealityConnection<S> {
+impl<S: Connection> AsyncWrite for RealityConnection<S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -190,7 +192,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for RealityConnection<S> {
     }
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> Connection for RealityConnection<S> {
+impl<S: Connection> Connection for RealityConnection<S> {
     fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(self.remote_addr)
     }

@@ -1,19 +1,39 @@
-//! REALITY 服务端 MITM 证书生成。
+//! REALITY 服务端证书生成（Go 语义：进程级固定空证书模板 + 每连接 HMAC 原位覆盖）。
 //!
-//! 翻译自 Go `xtls/reality` 库的服务端证书伪造逻辑。Go 端连 dest 拿真实证书
-//! 后用 mldsa65 重新签名；Rust 端先用 rcgen 自签证书（SAN 从 SNI 提取），
-//! REALITY 客户端 InsecureSkipVerify=true + 自定义 REALITY 握手验证，不影响安全性。
+//! 翻译自 XTLS/REALITY `handshake_server_tls13.go` 的 `init()` 与 `handshake()`
+//! pickCertificate 块（xray-core v26.6.1 依赖 v0.0.0-20260322-9234c772ba8f）：
+//!
+//! - `init()`：进程启动生成一次 ed25519 密钥 + 极简空证书 `signedCert`
+//!   （`SerialNumber=0`，无 subject/SAN/扩展）；
+//! - 每连接（auth 成功后）：`cert = bytes.Clone(signedCert)`，把
+//!   `HMAC-SHA512(AuthKey, ed25519Pub)` 的 64 字节写入 cert 末尾 64 字节
+//!   （原位覆盖 ed25519 signatureValue）；客户端（reality.go
+//!   `VerifyPeerCertificate`：`h.Write(pub)` 后比对 `certs[0].Signature`）
+//!   重算 HMAC 比对，通过即 Verified；
+//! - 配置 `Mldsa65Key` 时 Go 换用带 3309 字节保留扩展（OID 0.0）的变体模板，
+//!   并把 `HMAC-SHA512(AuthKey, pub‖ClientHello‖ServerHello)` 的 ML-DSA-65
+//!   签名写入 `cert[126:]` 固定偏移——Rust 端签名路径 stub（见
+//!   [`generate_reality_ed25519_cert_mldsa65`]）。
+//!
+//! 注意：Go REALITY 服务端**不会**从 dest 获取或重签证书——dest 仅在 auth
+//! 失败后作 fallback 透明转发（客户端与真实 dest 直接完成 TLS，DPI 在该路径
+//! 看到的是 dest 的真证书）。本模块的空证书只呈现给持有私钥的 REALITY 客户端。
 //!
 //! # 工作流
 //!
-//! 1. [`generate_self_signed_cert`]：rcgen 为指定 SNI 生成自签证书
-//! 2. [`build_server_config`]：用证书构建 rustls `ServerConfig`
-//! 3. [`server_tls`]（[`crate::server`]）：peek ClientHello → verify → TLS 握手 / fallback
+//! 1. [`DUMMY_CERT`]：进程级固定模板（Go `init()` 等价）
+//! 2. [`generate_reality_ed25519_cert`]：克隆模板 + HMAC 覆盖末尾 64 字节
+//! 3. [`build_server_config`]：用证书构建 rustls `ServerConfig`
+//! 4. [`server_tls`]（[`crate::server`]）：peek ClientHello → verify → TLS 握手 / fallback
+
+use std::sync::LazyLock;
 
 use crate::error::{RealityError, Result};
-
 use rustls::ServerConfig;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+/// ML-DSA-65 签名长度（FIPS 204；Go 预留扩展 `empty[:3309]`）。
+pub const MLDSA65_SIGNATURE_LEN: usize = 3309;
 
 /// 为指定 SNI 生成自签证书。
 ///
@@ -46,22 +66,60 @@ pub fn build_server_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> Result<Server
     Ok(config)
 }
 
-/// 生成 REALITY Ed25519 证书（cert 末尾 64 字节 HMAC 签名）。
+/// 进程级固定 REALITY 证书模板（对应 Go `init()` 的 `ed25519Priv` + `signedCert`）。
+struct DummyCert {
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+    public_key_raw: [u8; 32],
+}
+
+static DUMMY_CERT: LazyLock<DummyCert> =
+    LazyLock::new(|| build_dummy_cert().expect("REALITY dummy cert template"));
+
+/// Go `init()` 等价：极简空证书（SerialNumber=0、空 subject、无 SAN、无扩展）。
 ///
-/// 翻译自 Go XTLS/REALITY `tls.go` 的 cert 生成逻辑：
+/// validity 用 rcgen 默认固定区间（1975-01-01..4096-01-01）：REALITY 客户端
+/// 走自定义 HMAC 验证、不校验时间窗，固定区间保证模板确定性。
 ///
-/// 1. rcgen 生成 Ed25519 self-signed cert
-/// 2. 取 Ed25519 公钥（32 字节）
-/// 3. 计算 HMAC-SHA512(auth_key, pub_key) → 64 字节签名
+/// # Errors
+/// - rcgen Ed25519 keypair 生成 / 签名失败 → [`RealityError::CertGenerate`]
+fn build_dummy_cert() -> Result<DummyCert> {
+    use rcgen::{CertificateParams, DistinguishedName, KeyPair, PKCS_ED25519, SerialNumber};
+
+    let mut params = CertificateParams::default();
+    params.distinguished_name = DistinguishedName::new(); // 清空默认 CN（Go: 空 pkix.Name）
+    // Go serial=0 经 yasna 编码为 `02 00`（INTEGER 内容 0 字节）＝非法定长 DER，
+    // BoringSSL 客户端解析 Certificate 直接 DECODE_ERROR（Go 自家 x509 容忍空
+    // INTEGER 故无此问题）。固定 serial=1 保持模板确定性且 DER 合法。
+    params.serial_number = Some(SerialNumber::from_slice(&[1]));
+    let key_pair = KeyPair::generate_for(&PKCS_ED25519)
+        .map_err(|e| RealityError::CertGenerate(format!("rcgen Ed25519 keypair: {e}")))?;
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|e| RealityError::CertGenerate(format!("rcgen self_signed: {e}")))?;
+    let public_key_raw: [u8; 32] = key_pair
+        .public_key_raw()
+        .try_into()
+        .map_err(|_| RealityError::CertGenerate("ed25519 public key != 32 bytes".into()))?;
+
+    Ok(DummyCert {
+        cert_der: cert.der().to_vec(),
+        key_der: key_pair.serialize_der(),
+        public_key_raw,
+    })
+}
+
+/// 生成 REALITY Ed25519 证书（Go `handshake()` pickCertificate 块的 Rust 等价）。
+///
+/// 1. 克隆进程级固定模板 [`DUMMY_CERT`]（Go `bytes.Clone(signedCert)`）
+/// 2. 计算 HMAC-SHA512(auth_key, 模板 ed25519 公钥)
 ///    （[`crate::crypto::sign_reality_certificate`]）
-/// 4. 覆盖 cert_der 末尾 64 字节为 HMAC 签名
+/// 3. 覆盖 cert_der 末尾 64 字节（Go `h.Sum(cert[:len(cert)-64])`——rcgen
+///    Ed25519 cert DER 末尾为 BIT STRING signature，内容恰 64 字节）
 ///
-/// rustls 不校验 cert 自身签名（trust anchor 在客户端），只验证
-/// CertificateVerify（标准 TLS 1.3 Ed25519 签名）。REALITY 客户端额外
-/// 校验 cert 末尾 64 字节为 HMAC。
-///
-/// 双签名机制：cert.signatureValue = HMAC（REALITY 校验）；
-/// CertificateVerify = 真 Ed25519 签名（标准 TLS 1.3）。
+/// rustls 不校验叶子证书自签（trust anchor 在客户端），只验证
+/// CertificateVerify（标准 TLS 1.3 Ed25519 签名，用模板私钥）。REALITY 客户端
+/// 额外校验 cert 末尾 64 字节为 HMAC。
 ///
 /// # 参数
 ///
@@ -69,48 +127,46 @@ pub fn build_server_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> Result<Server
 ///
 /// # 返回
 ///
-/// `(cert_der, key_der)`：HMAC 签名的 cert + PKCS#8 私钥。
+/// `(cert_der, key_der)`：HMAC 覆盖后的 cert + PKCS#8 私钥。
 ///
 /// # Errors
 ///
-/// - rcgen Ed25519 keypair 生成失败 → [`RealityError::CertGenerate`]
 /// - HMAC 计算失败 → [`RealityError::EmptySharedKey`]
-/// - cert_der 过短（< 64 字节） → [`RealityError::CertGenerate`]
 pub fn generate_reality_ed25519_cert(auth_key: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
-    use rcgen::{CertificateParams, KeyPair, PKCS_ED25519};
 
-    // ponytail: rcgen 不能模拟 Go 极简 params (SerialNumber=0, 无 issuer/subject/validity),
-    // 用 SAN=reality.local 占位 (不影响 REALITY 校验, 只用于 X.509 解析)
-    let params = CertificateParams::new(vec!["reality.local".to_string()])
-        .map_err(|e| RealityError::CertGenerate(format!("rcgen params: {e}")))?;
+    let dummy = &*DUMMY_CERT;
 
-    let key_pair = KeyPair::generate_for(&PKCS_ED25519)
-        .map_err(|e| RealityError::CertGenerate(format!("rcgen Ed25519 keypair: {e}")))?;
+    // Go: h := hmac.New(sha512.New, c.AuthKey); h.Write(ed25519Priv[32:])
+    let hmac_sig = crate::crypto::sign_reality_certificate(auth_key, &dummy.public_key_raw)?;
 
-    let cert = params
-        .self_signed(&key_pair)
-        .map_err(|e| RealityError::CertGenerate(format!("rcgen self_signed: {e}")))?;
-
-    let mut cert_der = cert.der().to_vec();
-    let key_der = key_pair.serialize_der();
-
-    // 取 Ed25519 公钥原始字节 (32 bytes)
-    let pub_key = key_pair.public_key_raw();
-
-    // HMAC-SHA512 签名
-    let hmac_sig = crate::crypto::sign_reality_certificate(auth_key, pub_key)?;
-
-    // 覆盖 cert_der 末尾 64 字节为 HMAC 签名
-    // rcgen Ed25519 cert DER 末尾结构: ... BIT STRING (03) | len (42) | unused_bits (00) | signature (64 bytes)
+    // Go: h.Sum(cert[:len(cert)-64])
+    let mut cert_der = dummy.cert_der.clone();
     let len = cert_der.len();
-    if len < 64 {
-        return Err(RealityError::CertGenerate(format!(
-            "cert_der too short: {len} bytes, need >= 64"
-        )));
-    }
     cert_der[len - 64..].copy_from_slice(&hmac_sig);
 
-    Ok((cert_der, key_der))
+    Ok((cert_der, dummy.key_der.clone()))
+}
+
+/// ML-DSA-65 变体证书 + 签名路径 stub（未实现）。
+///
+/// Go（handshake_server_tls13.go）：配置 `Mldsa65Key` 时换用带 3309 字节保留
+/// 扩展（OID 0.0）的模板证书；HMAC 覆盖后继续
+/// `h.Write(clientHello.original); h.Write(hello.original)`，把
+/// `HMAC-SHA512(AuthKey, pub‖CH‖SH)` 的 ML-DSA-65 签名写入 `cert[126:]`。
+///
+/// Rust 端阻塞点：rustls `ResolvesServerCert::resolve()` 只暴露 ClientHello，
+/// 证书选定前拿不到 ServerHello 原始字节（Go 在自家 TLS 栈握手函数内生成证书，
+/// 无此约束）。签名原语本身已可用（`ml_dsa` crate，见 xray-cli `gen_mldsa65`）。
+///
+/// # Errors
+///
+/// - 恒返回 [`RealityError::Mldsa65NotImplemented`]
+pub fn generate_reality_ed25519_cert_mldsa65(
+    _auth_key: &[u8],
+    _client_hello_raw: &[u8],
+    _server_hello_raw: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    Err(RealityError::Mldsa65NotImplemented)
 }
 
 #[cfg(test)]
@@ -154,6 +210,95 @@ mod tests {
         assert!(cert_der.len() > 100, "cert_der should be reasonable size");
         assert!(!key_der.is_empty());
         assert_eq!(cert_der[0], 0x30, "cert_der should start with SEQUENCE tag");
+    }
+
+    /// Go init()：进程级固定模板（signedCert + ed25519Priv），连接间仅末尾
+    /// 64 字节 HMAC 不同（Go handshake_server_tls13.go pickCertificate 块）。
+    #[test]
+    fn reality_cert_uses_static_template_across_calls() {
+        let (cert1, key1) = generate_reality_ed25519_cert(&[0x42u8; 32]).unwrap();
+        let (cert2, key2) = generate_reality_ed25519_cert(&[0x99u8; 32]).unwrap();
+
+        assert_eq!(key1, key2, "dummy cert key must be process-static (Go init)");
+        let n = cert1.len();
+        assert_eq!(n, cert2.len());
+        assert_eq!(
+            cert1[..n - 64],
+            cert2[..n - 64],
+            "cert template must be static"
+        );
+        assert_ne!(
+            cert1[n - 64..],
+            cert2[n - 64..],
+            "per-connection HMAC tail must differ"
+        );
+
+        // 相同 auth_key → 逐字节一致（HMAC 确定性）
+        let (cert3, _) = generate_reality_ed25519_cert(&[0x42u8; 32]).unwrap();
+        assert_eq!(cert1, cert3);
+    }
+
+    /// Go 空证书语义：无 SAN、无 subject CN——DPI 无法从证书匹配 SNI/身份。
+    /// （旧实现 SAN=reality.local + 默认 CN 是可检测伪迹。）
+    #[test]
+    fn reality_cert_has_no_identifiable_artifacts() {
+        let (cert_der, _) = generate_reality_ed25519_cert(&[0x42u8; 32]).unwrap();
+        assert!(
+            !cert_der.windows(13).any(|w| w == b"reality.local"),
+            "SAN reality.local artifact must be gone"
+        );
+        assert!(
+            !cert_der.windows(22).any(|w| w == b"rcgen self signed cert"),
+            "default rcgen CN must be cleared (Go: empty pkix.Name)"
+        );
+        // SAN 扩展 OID 2.5.29.17（DER: 06 03 55 1D 11）必须缺席
+        let san_oid: [u8; 5] = [0x06, 0x03, 0x55, 0x1d, 0x11];
+        assert!(
+            !cert_der.windows(san_oid.len()).any(|w| w == san_oid),
+            "Go dummy cert carries no SAN extension"
+        );
+    }
+
+    /// 从 cert DER 提取 ed25519 原始公钥（SPKI OID + BIT STRING 头后 32 字节）。
+    fn cert_ed25519_pubkey(cert_der: &[u8]) -> [u8; 32] {
+        const PAT: [u8; 8] = [0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
+        let pos = cert_der
+            .windows(PAT.len())
+            .position(|w| w == PAT)
+            .expect("ed25519 SPKI present");
+        cert_der[pos + PAT.len()..pos + PAT.len() + 32]
+            .try_into()
+            .unwrap()
+    }
+
+    /// 端到端重签验证（对应 Go 客户端 reality.go VerifyPeerCertificate 快速路径）：
+    /// 从生成证书提取 ed25519 公钥 → 重算 HMAC → 与末尾 64 字节比对。
+    #[test]
+    fn generate_reality_ed25519_cert_end_to_end_verify() {
+        let auth_key = [0x42u8; 32];
+        let (cert_der, _) = generate_reality_ed25519_cert(&auth_key).unwrap();
+
+        let pub_key = cert_ed25519_pubkey(&cert_der);
+        let tail: Vec<u8> = cert_der[cert_der.len() - 64..].to_vec();
+        assert!(
+            crate::crypto::verify_reality_certificate(&auth_key, &pub_key, &tail).unwrap(),
+            "client-side HMAC check must verify (Go VerifyPeerCertificate)"
+        );
+
+        // 错误 auth_key（MITM / 非 REALITY 场景）必须失败
+        assert!(
+            !crate::crypto::verify_reality_certificate(&[0x99u8; 32], &pub_key, &tail)
+                .unwrap(),
+            "wrong auth_key must not verify"
+        );
+    }
+
+    /// mldsa65 签名路径 stub：rustls 证书选定前拿不到 ServerHello 字节 → NotImplemented。
+    #[test]
+    fn mldsa65_cert_signing_stub_not_implemented() {
+        let err = generate_reality_ed25519_cert_mldsa65(&[0x42u8; 32], &[1, 2, 3], &[4, 5, 6])
+            .unwrap_err();
+        assert!(matches!(err, RealityError::Mldsa65NotImplemented));
     }
 
     #[test]

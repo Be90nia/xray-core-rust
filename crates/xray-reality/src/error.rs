@@ -94,6 +94,19 @@ pub enum RealityError {
     /// rcgen 证书生成或 rustls ServerConfig 构建失败。
     #[error("REALITY: certificate generation failed: {0}")]
     CertGenerate(String),
+
+    /// mldsa65_seed 长度不为 32（Go 端 `(*[32]byte)` 转换直接 panic）。
+    #[error("REALITY: mldsa65_seed length is {actual}, expected 32")]
+    InvalidMldsa65SeedLen { actual: usize },
+
+    /// ML-DSA-65 后量子证书签名未实现。
+    ///
+    /// Go（XTLS/REALITY handshake_server_tls13.go）在握手函数内部生成证书，
+    /// 先拿到 ServerHello 原始字节再把 mldsa65 签名写入 cert[126:]；Rust 端
+    /// rustls `ResolvesServerCert::resolve()` 只暴露 ClientHello，证书选定前
+    /// 无法获得 ServerHello 字节 → 签名路径暂缺（签名原语本身可用 `ml_dsa` crate）。
+    #[error("REALITY: mldsa65 certificate signing not yet implemented in Rust")]
+    Mldsa65NotImplemented,
 }
 
 /// REALITY crate 统一 Result 别名。

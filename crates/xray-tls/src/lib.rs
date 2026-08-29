@@ -42,5 +42,6 @@ pub mod ocsp_stapling;
 pub use utls::ConnInterface;
 
 pub mod btls_client;
+pub mod btls_reality;
 pub mod utls;
 pub mod grpc;
