@@ -158,7 +158,7 @@ pub trait MatcherGroup: Send + Sync {
     ///
     /// 对应 Go 版本 `MatcherGroup.Match`，返回空列表表示无匹配。
     #[must_use]
-    fn match_str(&self, input: &str) -> Vec<u16>;
+    fn match_str(&self, input: &str) -> Vec<u32>;
 
     /// 只要有一个匹配器匹配就返回 `true`。
     #[must_use]

@@ -40,10 +40,9 @@ impl Matcher for MatcherRef<'_> {
 /// 必须在添加所有匹配器后调用 `build()` 构建 MPH 哈希表和
 /// AC 自动机，之后才能查询。
 ///
-/// # 值转换
+/// # 值语义
 ///
-/// 内部 Group 使用 `u16` 存储，对外以 `u32` 返回。
-/// `add` 时 `u32` 截断为 `u16`，`match_str` 时 `u16` 扩展回 `u32`。
+/// 值以 `u32` 全程存储与返回，与 Go 版本 `uint32` 一致，无截断。
 pub struct MphValueMatcher {
   mph: MPHMatcherGroup,
   ac: ACMatcherGroup,
@@ -68,21 +67,20 @@ impl MphValueMatcher {
   /// - Substr → `ac`
   /// - Regex → `simple`
   ///
-  /// 值从 `u32` 截断为 `u16` 存入 Group。
+  /// 值以 `u32` 存入 Group。
   pub fn add(&mut self, matcher: Box<dyn Matcher>, value: u32) {
-    let v = value as u16;
     match matcher.matcher_type() {
       MatcherType::Full => {
-        self.mph.add_full_matcher(matcher.pattern(), v);
+        self.mph.add_full_matcher(matcher.pattern(), value);
       }
       MatcherType::Domain => {
-        self.mph.add_domain_matcher(matcher.pattern(), v);
+        self.mph.add_domain_matcher(matcher.pattern(), value);
       }
       MatcherType::Substr => {
-        self.ac.add(MatcherRef(matcher.as_ref()), v);
+        self.ac.add(MatcherRef(matcher.as_ref()), value);
       }
       MatcherType::Regex => {
-        self.simple.add(matcher, v);
+        self.simple.add(matcher, value);
       }
     }
   }
@@ -121,26 +119,9 @@ impl Default for MphValueMatcher {
 
 impl ValueMatcher for MphValueMatcher {
   fn match_str(&self, input: &str) -> Vec<u32> {
-    let mph_results: Vec<u32> = self
-      .mph
-      .match_str(input)
-      .into_iter()
-      .map(|v| v as u32)
-      .collect();
-
-    let ac_results: Vec<u32> = self
-      .ac
-      .match_str(input)
-      .into_iter()
-      .map(|v| v as u32)
-      .collect();
-
-    let simple_results: Vec<u32> = self
-      .simple
-      .match_str(input)
-      .into_iter()
-      .map(|v| v as u32)
-      .collect();
+    let mph_results = self.mph.match_str(input);
+    let ac_results = self.ac.match_str(input);
+    let simple_results = self.simple.match_str(input);
 
     composite_matches(&[mph_results, ac_results, simple_results])
   }
@@ -273,5 +254,32 @@ mod tests {
   fn test_mph_value_display() {
     let m = MphValueMatcher::new();
     assert!(format!("{}", m).contains("mph_value"));
+  }
+
+  #[test]
+  fn test_mph_value_no_u32_truncation() {
+    // Go 语义：value 全程 uint32 存储，无 u16 截断（matchergroup_mph.go 等）
+    for &v in &[65535u32, 65536, u32::MAX] {
+      let mut m = MphValueMatcher::new();
+      m.add(Box::new(FullMatcher::new("exact.com")), v);
+      m.add(
+        Box::new(DomainMatcherImpl::new("domain.com")),
+        v,
+      );
+      m.add(Box::new(SubstrMatcher::new("keyword")), v);
+      m.add(
+        Box::new(RegexMatcher::new(r"evil\..*").unwrap()),
+        v,
+      );
+      m.build().unwrap();
+      assert_eq!(m.match_str("exact.com"), vec![v], "full v={v}");
+      assert_eq!(
+        m.match_str("sub.domain.com"),
+        vec![v],
+        "domain v={v}"
+      );
+      assert_eq!(m.match_str("keyword.net"), vec![v], "substr v={v}");
+      assert_eq!(m.match_str("evil.com"), vec![v], "regex v={v}");
+    }
   }
 }

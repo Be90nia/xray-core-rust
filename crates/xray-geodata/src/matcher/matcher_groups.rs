@@ -23,11 +23,11 @@ use super::{DomainMatcher, FullMatcher, Matcher, MatcherGroup, MatcherType};
 
 /// 精确全匹配器组。
 ///
-/// 使用 `HashMap<String, Vec<u16>>` 加速精确匹配查找。
+/// 使用 `HashMap<String, Vec<u32>>` 加速精确匹配查找。
 /// 对应 Go 版本 `strmatcher.FullMatcherGroup`。
 #[derive(Debug, Clone)]
 pub struct FullMatcherGroup {
-    matchers: HashMap<String, Vec<u16>>,
+    matchers: HashMap<String, Vec<u32>>,
 }
 
 impl FullMatcherGroup {
@@ -42,7 +42,7 @@ impl FullMatcherGroup {
     /// 添加精确匹配规则。
     ///
     /// 同一模式可添加多个值，按添加顺序保留。
-    pub fn add(&mut self, matcher: FullMatcher, value: u16) {
+    pub fn add(&mut self, matcher: FullMatcher, value: u32) {
         self.matchers
             .entry(matcher.pattern().to_owned())
             .or_default()
@@ -57,7 +57,7 @@ impl Default for FullMatcherGroup {
 }
 
 impl MatcherGroup for FullMatcherGroup {
-    fn match_str(&self, input: &str) -> Vec<u16> {
+    fn match_str(&self, input: &str) -> Vec<u32> {
         self.matchers.get(input).cloned().unwrap_or_default()
     }
 
@@ -71,7 +71,7 @@ impl MatcherGroup for FullMatcherGroup {
 /// 域名字典树节点。
 #[derive(Debug, Clone, Default)]
 struct DomainTrieNode {
-    values: Vec<u16>,
+    values: Vec<u32>,
     children: HashMap<String, DomainTrieNode>,
 }
 
@@ -98,7 +98,7 @@ impl DomainMatcherGroup {
     /// 添加域名匹配规则。
     ///
     /// 域名按 `.` 分隔后逆序插入字典树。
-    pub fn add(&mut self, matcher: DomainMatcher, value: u16) {
+    pub fn add(&mut self, matcher: DomainMatcher, value: u32) {
         let labels: Vec<&str> = matcher.pattern().split('.').rev().collect();
         let mut node = &mut self.root;
         for label in &labels {
@@ -112,10 +112,10 @@ impl DomainMatcherGroup {
 }
 
 impl MatcherGroup for DomainMatcherGroup {
-    fn match_str(&self, input: &str) -> Vec<u16> {
+    fn match_str(&self, input: &str) -> Vec<u32> {
         let labels: Vec<&str> = input.split('.').rev().collect();
         let mut node = &self.root;
-        let mut matches: Vec<Vec<u16>> = Vec::new();
+        let mut matches: Vec<Vec<u32>> = Vec::new();
 
         if !node.values.is_empty() {
             matches.push(node.values.clone());
@@ -171,7 +171,7 @@ impl MatcherGroup for DomainMatcherGroup {
 /// 匹配器条目。
 struct SimpleMatcherEntry {
     matcher: Box<dyn Matcher>,
-    value: u16,
+    value: u32,
 }
 
 /// 简单线性扫描匹配器组。
@@ -192,7 +192,7 @@ impl SimpleMatcherGroup {
     }
 
     /// 添加任意类型的匹配器。
-    pub fn add(&mut self, matcher: Box<dyn Matcher>, value: u16) {
+    pub fn add(&mut self, matcher: Box<dyn Matcher>, value: u32) {
         self.entries.push(SimpleMatcherEntry { matcher, value });
     }
 }
@@ -204,7 +204,7 @@ impl Default for SimpleMatcherGroup {
 }
 
 impl MatcherGroup for SimpleMatcherGroup {
-    fn match_str(&self, input: &str) -> Vec<u16> {
+    fn match_str(&self, input: &str) -> Vec<u32> {
         self.entries
             .iter()
             .filter(|e| e.matcher.match_str(input))
@@ -233,7 +233,7 @@ impl std::fmt::Debug for SimpleMatcherGroup {
 #[derive(Debug, Clone)]
 struct SubstrMatcherEntry {
     pattern: String,
-    value: u16,
+    value: u32,
 }
 
 /// 子串搜索匹配器组。
@@ -257,7 +257,7 @@ impl SubstrMatcherGroup {
     }
 
     /// 添加子串匹配规则。
-    pub fn add(&mut self, pattern: impl Into<String>, value: u16) {
+    pub fn add(&mut self, pattern: impl Into<String>, value: u32) {
         self.entries.push(SubstrMatcherEntry {
             pattern: pattern.into(),
             value,
@@ -266,9 +266,9 @@ impl SubstrMatcherGroup {
 }
 
 impl MatcherGroup for SubstrMatcherGroup {
-    fn match_str(&self, input: &str) -> Vec<u16> {
+    fn match_str(&self, input: &str) -> Vec<u32> {
         // 对每个模式，找到其在输入中的最后出现位置
-        let mut positioned: Vec<(usize, usize, u16)> = Vec::new();
+        let mut positioned: Vec<(usize, usize, u32)> = Vec::new();
 
         for (idx, entry) in self.entries.iter().enumerate() {
             if let Some(pos) = input.rfind(&entry.pattern) {
@@ -302,7 +302,7 @@ enum ACMatchKind {
 /// AC 自动机匹配条目。
 #[derive(Debug, Clone)]
 struct ACMatcherEntry {
-    value: u16,
+    value: u32,
     kind: ACMatchKind,
 }
 
@@ -330,7 +330,7 @@ impl ACMatcherGroup {
     }
 
     /// 添加匹配规则。
-    pub fn add(&mut self, matcher: impl Matcher, value: u16) {
+    pub fn add(&mut self, matcher: impl Matcher, value: u32) {
         let kind = match matcher.matcher_type() {
             MatcherType::Full => ACMatchKind::Full,
             MatcherType::Domain => ACMatchKind::Domain,
@@ -389,15 +389,15 @@ pub enum ACMatcherGroupError {
 }
 
 impl MatcherGroup for ACMatcherGroup {
-    fn match_str(&self, input: &str) -> Vec<u16> {
+    fn match_str(&self, input: &str) -> Vec<u32> {
         let ac = match &self.ac {
             Some(ac) => ac,
             None => return Vec::new(),
         };
 
-        let mut full_matches: Vec<(usize, u16)> = Vec::new();
-        let mut domain_matches: Vec<(usize, u16)> = Vec::new();
-        let mut substr_matches: Vec<(usize, u16)> = Vec::new();
+        let mut full_matches: Vec<(usize, u32)> = Vec::new();
+        let mut domain_matches: Vec<(usize, u32)> = Vec::new();
+        let mut substr_matches: Vec<(usize, u32)> = Vec::new();
 
         for mat in ac.find_iter(input) {
             let idx = mat.pattern().as_usize();
@@ -433,7 +433,7 @@ impl MatcherGroup for ACMatcherGroup {
         }
 
         // 排序：按 end_pos 降序，同位置 Full > Domain > Substr
-        let mut all_matches: Vec<(usize, u8, u16)> = Vec::new();
+        let mut all_matches: Vec<(usize, u8, u32)> = Vec::new();
         for (pos, val) in full_matches {
             all_matches.push((pos, 0, val));
         }
@@ -518,7 +518,7 @@ const MPH_MATCH_TYPE_COUNT: usize = 2;
 #[derive(Debug, Clone)]
 struct MphRuleInfo {
     rolling_hash: u32,
-    matchers: [Vec<u16>; MPH_MATCH_TYPE_COUNT],
+    matchers: [Vec<u32>; MPH_MATCH_TYPE_COUNT],
 }
 
 /// 计算滚动 Rabin-Karp 哈希。
@@ -575,7 +575,7 @@ fn next_pow2(v: usize) -> usize {
 /// <http://cmph.sourceforge.net/papers/esa09.pdf>
 pub struct MPHMatcherGroup {
     rules: Vec<String>,
-    values: Vec<Vec<u16>>,
+    values: Vec<Vec<u32>>,
     level0: Vec<u32>,
     level0_mask: u32,
     level1: Vec<u32>,
@@ -619,7 +619,7 @@ impl MPHMatcherGroup {
     /// 添加精确全匹配规则。
     ///
     /// 模式会被转为小写存储。
-    pub fn add_full_matcher(&mut self, pattern: &str, value: u16) {
+    pub fn add_full_matcher(&mut self, pattern: &str, value: u32) {
         let pattern = pattern.to_lowercase();
         self.add_pattern(0, "", &pattern, MatcherType::Full, value);
     }
@@ -629,7 +629,7 @@ impl MPHMatcherGroup {
     /// 会自动添加两条规则：
     /// - 完整域名匹配（如 `example.com`）
     /// - 子域名匹配（如 `.example.com`）
-    pub fn add_domain_matcher(&mut self, pattern: &str, value: u16) {
+    pub fn add_domain_matcher(&mut self, pattern: &str, value: u32) {
         let pattern = pattern.to_lowercase();
         let hash = self.add_pattern(0, "", &pattern, MatcherType::Domain, value);
         self.add_pattern(hash, &pattern, ".", MatcherType::Domain, value);
@@ -644,7 +644,7 @@ impl MPHMatcherGroup {
         suffix_pattern: &str,
         pattern: &str,
         matcher_type: MatcherType,
-        value: u16,
+        value: u32,
     ) -> u32 {
         let full_pattern = format!("{pattern}{suffix_pattern}");
         let rule_infos = self
@@ -808,13 +808,13 @@ impl Default for MPHMatcherGroup {
 }
 
 impl MatcherGroup for MPHMatcherGroup {
-    fn match_str(&self, input: &str) -> Vec<u16> {
+    fn match_str(&self, input: &str) -> Vec<u32> {
         if !self.is_built() {
             return Vec::new();
         }
 
         let input_lower = input.to_lowercase();
-        let mut matches: Vec<Vec<u16>> = Vec::with_capacity(5);
+        let mut matches: Vec<Vec<u32>> = Vec::with_capacity(5);
         let mut hash: u32 = 0;
 
         let bytes = input_lower.as_bytes();
@@ -1055,15 +1055,15 @@ mod tests_mph {
     #[test]
     fn test_mph_large_pattern_set() {
         let mut group = MPHMatcherGroup::new();
-        for i in 0..100u16 {
+        for i in 0..100u32 {
             group.add_domain_matcher(&format!("domain{i}.com"), i);
         }
         group.build().unwrap();
 
         // 验证随机几个
-        assert_eq!(group.match_str("domain0.com"), vec![0u16]);
-        assert_eq!(group.match_str("domain50.com"), vec![50u16]);
-        assert_eq!(group.match_str("domain99.com"), vec![99u16]);
+        assert_eq!(group.match_str("domain0.com"), vec![0u32]);
+        assert_eq!(group.match_str("domain50.com"), vec![50u32]);
+        assert_eq!(group.match_str("domain99.com"), vec![99u32]);
         assert!(group.match_any("sub.domain42.com"));
         assert!(group.match_str("nonexistent.com").is_empty());
     }

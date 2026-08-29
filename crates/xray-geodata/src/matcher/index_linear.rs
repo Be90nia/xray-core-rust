@@ -57,26 +57,25 @@ impl IndexMatcher for LinearIndexMatcher {
   fn add(&mut self, matcher: Box<dyn Matcher>) -> u32 {
     self.count += 1;
     let idx = self.count;
-    let v = idx as u16;
 
     match matcher.matcher_type() {
       MatcherType::Full => {
         self.full.add(
           crate::matcher::FullMatcher::new(matcher.pattern()),
-          v,
+          idx,
         );
       }
       MatcherType::Domain => {
         self.domain.add(
           crate::matcher::DomainMatcher::new(matcher.pattern()),
-          v,
+          idx,
         );
       }
       MatcherType::Substr => {
-        self.substr.add(matcher.pattern(), v);
+        self.substr.add(matcher.pattern(), idx);
       }
       MatcherType::Regex => {
-        self.simple.add(matcher, v);
+        self.simple.add(matcher, idx);
       }
     }
 
@@ -89,33 +88,10 @@ impl IndexMatcher for LinearIndexMatcher {
   }
 
   fn match_str(&self, input: &str) -> Vec<u32> {
-    let full_results: Vec<u32> = self
-      .full
-      .match_str(input)
-      .into_iter()
-      .map(|v| v as u32)
-      .collect();
-
-    let domain_results: Vec<u32> = self
-      .domain
-      .match_str(input)
-      .into_iter()
-      .map(|v| v as u32)
-      .collect();
-
-    let substr_results: Vec<u32> = self
-      .substr
-      .match_str(input)
-      .into_iter()
-      .map(|v| v as u32)
-      .collect();
-
-    let simple_results: Vec<u32> = self
-      .simple
-      .match_str(input)
-      .into_iter()
-      .map(|v| v as u32)
-      .collect();
+    let full_results = self.full.match_str(input);
+    let domain_results = self.domain.match_str(input);
+    let substr_results = self.substr.match_str(input);
+    let simple_results = self.simple.match_str(input);
 
     composite_matches(&[
       full_results,

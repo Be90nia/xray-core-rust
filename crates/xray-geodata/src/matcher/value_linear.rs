@@ -20,10 +20,9 @@ use crate::matcher::domain::ValueMatcher;
 /// - `SubstrMatcherGroup`: 子串匹配
 /// - `SimpleMatcherGroup`: 正则匹配
 ///
-/// # 值转换
+/// # 值语义
 ///
-/// 内部 Group 使用 `u16` 存储，对外以 `u32` 返回。
-/// `add` 时 `u32` 截断为 `u16`，`match_str` 时 `u16` 扩展回 `u32`。
+/// 值以 `u32` 全程存储与返回，与 Go 版本 `uint32` 一致，无截断。
 pub struct LinearValueMatcher {
   full: FullMatcherGroup,
   domain: DomainMatcherGroup,
@@ -46,28 +45,26 @@ impl LinearValueMatcher {
   /// 添加匹配器及关联值。
   ///
   /// 按 `matcher_type()` 分派到对应的内部 Group。
-  /// 值从 `u32` 截断为 `u16` 存入 Group。
   pub fn add(&mut self, matcher: Box<dyn Matcher>, value: u32) {
-    let v = value as u16;
     match matcher.matcher_type() {
       MatcherType::Full => {
         // FullMatcherGroup 需要 FullMatcher 类型
         self.full.add(
           crate::matcher::FullMatcher::new(matcher.pattern()),
-          v,
+          value,
         );
       }
       MatcherType::Domain => {
         self.domain.add(
           crate::matcher::DomainMatcher::new(matcher.pattern()),
-          v,
+          value,
         );
       }
       MatcherType::Substr => {
-        self.substr.add(matcher.pattern(), v);
+        self.substr.add(matcher.pattern(), value);
       }
       MatcherType::Regex => {
-        self.simple.add(matcher, v);
+        self.simple.add(matcher, value);
       }
     }
   }
@@ -96,33 +93,10 @@ impl Default for LinearValueMatcher {
 
 impl ValueMatcher for LinearValueMatcher {
   fn match_str(&self, input: &str) -> Vec<u32> {
-    let full_results: Vec<u32> = self
-      .full
-      .match_str(input)
-      .into_iter()
-      .map(|v| v as u32)
-      .collect();
-
-    let domain_results: Vec<u32> = self
-      .domain
-      .match_str(input)
-      .into_iter()
-      .map(|v| v as u32)
-      .collect();
-
-    let substr_results: Vec<u32> = self
-      .substr
-      .match_str(input)
-      .into_iter()
-      .map(|v| v as u32)
-      .collect();
-
-    let simple_results: Vec<u32> = self
-      .simple
-      .match_str(input)
-      .into_iter()
-      .map(|v| v as u32)
-      .collect();
+    let full_results = self.full.match_str(input);
+    let domain_results = self.domain.match_str(input);
+    let substr_results = self.substr.match_str(input);
+    let simple_results = self.simple.match_str(input);
 
     composite_matches(&[
       full_results,
@@ -258,5 +232,31 @@ mod tests {
   fn test_linear_value_display() {
     let m = LinearValueMatcher::new();
     assert_eq!(format!("{}", m), "linear_value");
+  }
+
+  #[test]
+  fn test_linear_value_no_u32_truncation() {
+    // Go 语义：value 全程 uint32 存储，无 u16 截断（matchergroup_full.go 等）
+    for &v in &[65535u32, 65536, u32::MAX] {
+      let mut m = LinearValueMatcher::new();
+      m.add(Box::new(FullMatcher::new("exact.com")), v);
+      m.add(
+        Box::new(DomainMatcherImpl::new("domain.com")),
+        v,
+      );
+      m.add(Box::new(SubstrMatcher::new("keyword")), v);
+      m.add(
+        Box::new(RegexMatcher::new(r"evil\..*").unwrap()),
+        v,
+      );
+      assert_eq!(m.match_str("exact.com"), vec![v], "full v={v}");
+      assert_eq!(
+        m.match_str("sub.domain.com"),
+        vec![v],
+        "domain v={v}"
+      );
+      assert_eq!(m.match_str("keyword.net"), vec![v], "substr v={v}");
+      assert_eq!(m.match_str("evil.com"), vec![v], "regex v={v}");
+    }
   }
 }

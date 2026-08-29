@@ -69,20 +69,19 @@ impl IndexMatcher for MphIndexMatcher {
   fn add(&mut self, matcher: Box<dyn Matcher>) -> u32 {
     self.count += 1;
     let idx = self.count;
-    let v = idx as u16;
 
     match matcher.matcher_type() {
       MatcherType::Full => {
-        self.mph.add_full_matcher(matcher.pattern(), v);
+        self.mph.add_full_matcher(matcher.pattern(), idx);
       }
       MatcherType::Domain => {
-        self.mph.add_domain_matcher(matcher.pattern(), v);
+        self.mph.add_domain_matcher(matcher.pattern(), idx);
       }
       MatcherType::Substr => {
-        self.ac.add(MatcherRef(matcher.as_ref()), v);
+        self.ac.add(MatcherRef(matcher.as_ref()), idx);
       }
       MatcherType::Regex => {
-        self.simple.add(matcher, v);
+        self.simple.add(matcher, idx);
       }
     }
 
@@ -101,26 +100,9 @@ impl IndexMatcher for MphIndexMatcher {
   }
 
   fn match_str(&self, input: &str) -> Vec<u32> {
-    let mph_results: Vec<u32> = self
-      .mph
-      .match_str(input)
-      .into_iter()
-      .map(|v| v as u32)
-      .collect();
-
-    let ac_results: Vec<u32> = self
-      .ac
-      .match_str(input)
-      .into_iter()
-      .map(|v| v as u32)
-      .collect();
-
-    let simple_results: Vec<u32> = self
-      .simple
-      .match_str(input)
-      .into_iter()
-      .map(|v| v as u32)
-      .collect();
+    let mph_results = self.mph.match_str(input);
+    let ac_results = self.ac.match_str(input);
+    let simple_results = self.simple.match_str(input);
 
     composite_matches(&[mph_results, ac_results, simple_results])
   }
