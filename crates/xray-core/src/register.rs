@@ -7,7 +7,8 @@
 //! （返回 `FeatureError::StartFailed` 提示 "not yet implemented"）。
 //! 待各 crate 切片完成后，替换为真实 factory。
 
-use std::sync::Arc;
+use std::path::PathBuf;
+ use std::sync::Arc;
 
 use xray_features::{Feature, FeatureError, FeatureFactory, registry};
 

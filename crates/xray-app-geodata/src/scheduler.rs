@@ -121,6 +121,17 @@ impl Default for CronScheduler {
     }
 }
 
+/// Scheduler trait 适配 —— delegate 到 inherent `schedule` 方法。
+impl Scheduler for CronScheduler {
+    fn schedule(
+        &self,
+        expr: &str,
+        callback: Box<dyn Fn() + Send + Sync>,
+    ) -> Result<ScheduleHandle, GeodataError> {
+        Self::schedule(self, expr, callback)
+    }
+}
+
 fn make_handle(cancelled: Arc<AtomicBool>) -> ScheduleHandle {
     ScheduleHandle::new(move || {
         cancelled.store(true, Ordering::Release);
