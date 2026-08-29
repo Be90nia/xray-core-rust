@@ -5,6 +5,7 @@
 //! Phase A: 所有流量 XOR 加密（无 TLS header skip）。
 //! Phase B: TLS header skip 状态机（后续实现）。
 
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -12,6 +13,8 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::encryption::xor::CtrXor;
+use crate::encryption::{EncryptionConn, Result};
+
 
 /// XorConn：双 CTR XOR 连接包装。
 ///
@@ -98,7 +101,22 @@ where
     }
 }
 
-#[cfg(test)]
+impl<IO> EncryptionConn for XorConn<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    fn close(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            use tokio::io::AsyncWriteExt;
+            self.inner.shutdown().await?;
+            Ok(())
+        })
+    }
+}
+
+ #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};

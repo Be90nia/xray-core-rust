@@ -6039,7 +6039,9 @@ dependencies = [
 name = "xray-integration-tests"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "futures",
+ "rand 0.8.7",
  "serde",
  "serde_json",
  "tempfile",
@@ -6047,6 +6049,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tonic-reflection",
+ "x25519-dalek",
  "xray-app-dispatcher",
  "xray-app-log",
  "xray-buf",
@@ -6059,6 +6062,7 @@ dependencies = [
  "xray-proxy-trojan",
  "xray-proxy-vless",
  "xray-proxy-vmess",
+ "xray-tls",
  "xray-transport",
 ]
 
@@ -6388,6 +6392,7 @@ dependencies = [
  "xray-proxy-freedom",
  "xray-tls",
  "xray-transport",
+ "xray-xudp",
 ]
 
 [[package]]
