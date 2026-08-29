@@ -25,27 +25,29 @@
 //! let cfg: Config = load_str(Format::Json, json).unwrap();
 //! assert_eq!(cfg.inbound_count(), 1);
 //! ```
-pub mod built;
 pub mod app_config;
+pub mod built;
 pub mod common;
 pub mod confloader;
 pub mod config;
 pub mod error;
 pub mod init;
 pub mod json;
-pub mod protocols;
 pub mod lint;
+pub mod protocols;
+pub mod serial;
 pub mod toml_config;
 pub mod vformat;
 pub mod yaml;
 
-// 顶层 re-export：常用类型与函数直接从 crate 根访问。
-pub use common::{Address, Int32Range, Network, NetworkList, PortList, PortRange, StringList, User};
-pub use config::{Config, InboundDetourConfig, MuxConfig, OutboundDetourConfig, SniffingConfig};
+pub use built::{BuiltConfig, BuiltEntry, BuiltInbound, BuiltOutbound};
+ pub use common::{Address, Int32Range, Network, NetworkList, PortList, PortRange, StringList, User};
+ pub use config::{Config, InboundDetourConfig, MuxConfig, OutboundDetourConfig, SniffingConfig};
 pub use protocols::{
     dispatch_inbound_settings, dispatch_outbound_settings, InboundSettings, OutboundSettings,
 };
-pub use confloader::{
+pub use serial::{build_config, merge_config_from_files, merge_configs};
+ pub use confloader::{
     load_file, load_file_with_format, load_reader, load_str, load_str_auto_detect,
 };
 pub use error::{ConfError, Result};
