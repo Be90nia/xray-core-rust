@@ -49,6 +49,10 @@ path = "integration/e2e_test.rs"
 name = "integration_commander_api"
 path = "integration/commander_api_test.rs"
 
+[[test]]
+name = "integration_transport_interop"
+path = "integration/transport_interop_test.rs"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 xray-common = { path = "../crates/xray-common" }
@@ -70,4 +74,7 @@ serde_json = "1"
 thiserror = "2"
 tempfile = "3"
 xray-core = { path = "../crates/xray-core" }
-xray-conf = { path = "../crates/xray-conf" }
+xray-tls = { path = "../crates/xray-tls" }
+xray-reality = { path = "../crates/xray-reality" }
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+rand = "0.8"
