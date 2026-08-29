@@ -10,8 +10,8 @@
 //! - nameserver `address` 为域名时（如 `"dns.google"`），[`new_server`] 仅接受 IP
 //!   地址（避免 DNS 引导循环）。域名地址会在 `build` 阶段被跳过并告警；升级路径：
 //!   接入 bootstrap resolver 后在此预解析为 IP。
-//! - EDNS0 `clientIp` 当前仅存入 `DnsServiceConfig`，不传透到 `new_server` 构造的
-//!   Server（`new_server` API 未暴露 client_ip 参数）。
+//! - EDNS0 `clientIp` 经 `new_server_with_config` 全量透传到 Server 构造
+//!   （4ah3 接通；`new_server` 薄包装保留默认字段行为）。
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -22,7 +22,7 @@ use serde::Deserialize;
 use crate::config::{IpOption, QueryStrategy, generate_random_tag, ip_option_from_strategy, validate_client_ip_len};
 use crate::error::DnsError;
 use crate::hosts::{HostMapping, StaticHosts};
-use crate::nameserver::{Client, NameServerConfig, new_server};
+use crate::nameserver::{Client, NameServerConfig, new_server_with_config};
 use crate::server::{DnsServiceConfig, DomainMatcherInfo};
 use xray_geodata::matcher::domain::{
     DomainRule as MatcherDomainRule, MphDomainMatcher,
@@ -36,7 +36,9 @@ pub struct DnsAppConfig {
     pub servers: Vec<NameServerJson>,
     /// 静态 hosts：key 可带类型前缀（`domain:` / `full:`），value 为 IP 字符串或数组。
     pub hosts: serde_json::Map<String, serde_json::Value>,
-    /// 全局 EDNS0 client IP（字符串形式，如 `"1.2.3.4"`）。
+    /// 全局 EDNS0 client IP（字符串形式，如 `"1.2.3.4"`）。Go tag `clientIp`
+    /// （infra/conf/dns.go:163）；此前缺 rename，camelCase 配置被静默忽略（8kha 修复）。
+    #[serde(rename = "clientIp")]
     pub client_ip: Option<String>,
     /// 服务 tag（用于日志）；缺省生成随机 tag。
     pub tag: Option<String>,
@@ -71,7 +73,9 @@ pub struct NameServerJson {
     pub address: String,
     /// 端口覆盖（地址已含端口时忽略）。
     pub port: Option<u16>,
-    /// 本 server 的 EDNS0 client IP。
+    /// 本 server 的 EDNS0 client IP。Go tag `clientIp`（infra/conf/dns.go:21）；
+    /// 此前缺 rename，camelCase 配置被静默忽略（8kha 修复——policy key 依赖此字段）。
+    #[serde(rename = "clientIp")]
     pub client_ip: Option<String>,
     /// 是否跳过 fallback。
     #[serde(rename = "skipFallback")]
@@ -320,7 +324,6 @@ fn build_client(
     derived_policy_id: u32,
 ) -> Result<Client, DnsError> {
     let url = build_server_url(&ns.address, ns.port);
-    let server = new_server(&url)?;
 
     let client_ip = parse_client_ip(ns.client_ip.as_deref())?;
     let client_ip = if client_ip.is_empty() {
@@ -356,6 +359,9 @@ fn build_client(
         ..Default::default()
     };
 
+    // 4ah3：ns_cfg 全量经 new_server_with_config 流入具体 nameserver 构造
+    // （Go nameserver.go NewServer 收全量 proto——cache/timeout/clientIp 不丢字段）。
+    let (server, ns_cfg) = new_server_with_config(&url, ns_cfg)?;
     Client::new(ns_cfg, base_ip_option, server)
 }
 
@@ -762,11 +768,92 @@ mod tests {
         assert!(client.act_prior);
         assert!(client.act_unprior);
 
-        // Server 公开接口：is_disable_cache 验证 disableCache + cache 实例化。
-        // serveStale/serveExpiredTTL/negativeTtlSecs 流入 Server.cache，由 build_client
-        // 内部经 new_server→from_config→CacheController::new 透传；
-        // 这里通过 server.name() + is_disable_cache 验证 Server 构造路径成功。
+        // Server 公开接口：is_disable_cache 验证 disableCache 全链路接线
+        // （JSON → build_client → new_server_with_config → UdpNameServer cache）。
+        // serveStale/serveExpiredTTL/negativeTtlSecs 落 Server 内 CacheController，
+        // dyn Server 不暴露 cache——字段级断言见 udp.rs from_config 测试。
         assert!(client.server.is_disable_cache());
         assert!(client.server.name().starts_with("UDP:"));
+    }
+
+    /// 8kha：构建 DNS 配置并返回各 client 的 policy_id（按 servers 顺序）。
+    fn policy_ids(json: &str) -> Vec<u32> {
+        let cfg: DnsAppConfig = serde_json::from_str(json).unwrap();
+        let built = cfg.build().unwrap();
+        built.clients.iter().map(|c| c.policy_id).collect()
+    }
+
+    /// 8kha：8 元组相同（address 不参与 key）→ 复用同 id；规范化（大小写/
+    /// 空白/列表序）后等价视为相同；id 从 1 顺序递增（Go buildPolicyID，
+    /// infra/conf/dns.go:288-352，非 hash）。
+    #[test]
+    fn policy_id_same_tuple_shares_sequential_id() {
+        let ids = policy_ids(
+            r#"{
+            "servers": [
+                {"address": "8.8.8.8", "tag": "dns-a", "queryStrategy": "UseIPv4",
+                 "domains": ["b.com", "a.com"]},
+                {"address": "1.1.1.1", "tag": "DNS-A ", "queryStrategy": " useipv4 ",
+                 "domains": ["A.com", " b.com"]},
+                {"address": "9.9.9.9", "tag": "other"}
+            ]
+        }"#,
+        );
+        assert_eq!(ids, vec![1, 1, 2]);
+    }
+
+    /// 8kha：8 元组任一字段不同 → 不同 id（client/skip/qs/tag/domains/
+    /// expected/expect/unexpected 逐项变异）。
+    #[test]
+    fn policy_id_any_tuple_field_difference_changes_id() {
+        let baseline = r#"{"address":"8.8.8.8"}"#;
+        let mutants = [
+            r#"{"address":"8.8.8.8","clientIp":"1.2.3.4"}"#,
+            r#"{"address":"8.8.8.8","skipFallback":true}"#,
+            r#"{"address":"8.8.8.8","queryStrategy":"useIPv6"}"#,
+            r#"{"address":"8.8.8.8","tag":"t"}"#,
+            r#"{"address":"8.8.8.8","domains":["a.com"]}"#,
+            r#"{"address":"8.8.8.8","expectedIPs":["10.0.0.0/8"]}"#,
+            r#"{"address":"8.8.8.8","expectIPs":["192.168.0.0/16"]}"#,
+            r#"{"address":"8.8.8.8","unexpectedIPs":["172.16.0.0/12"]}"#,
+        ];
+        for m in mutants {
+            let ids = policy_ids(&format!(r#"{{"servers":[{baseline},{m}]}}"#));
+            assert_eq!(ids.len(), 2, "mutant {m}: both servers must build");
+            assert_ne!(ids[0], ids[1], "mutant {m} must yield distinct policy_id");
+        }
+    }
+
+    /// 8kha：expectedIPs 为空时回填 expectIPs（Go dns.go:94-96）——key 的
+    /// expected/expect 两段为 (X, X)；显式 expectedIPs=X（expect 空）段为
+    /// (X, [])，故与回填形式不同 id。
+    #[test]
+    fn policy_id_expected_backfill_from_expectips() {
+        let ids = policy_ids(
+            r#"{
+            "servers": [
+                {"address": "8.8.8.8", "expectIPs": ["10.0.0.0/8"]},
+                {"address": "1.1.1.1", "expectIPs": ["10.0.0.0/8"]},
+                {"address": "9.9.9.9", "expectedIPs": ["10.0.0.0/8"]}
+            ]
+        }"#,
+        );
+        assert_eq!(ids, vec![1, 1, 2]);
+    }
+
+    /// 8kha：JSON `policyID` 非零手动覆盖派生值（4ah3 扩展，Go 无此字段）；
+    /// 覆盖不消耗派生计数器，未覆盖 server 仍从 1 派生。
+    #[test]
+    fn policy_id_json_override_wins_over_derivation() {
+        let ids = policy_ids(
+            r#"{
+            "servers": [
+                {"address": "8.8.8.8", "policyID": 100},
+                {"address": "1.1.1.1", "policyID": 100},
+                {"address": "9.9.9.9"}
+            ]
+        }"#,
+        );
+        assert_eq!(ids, vec![100, 100, 1]);
     }
 }

@@ -258,14 +258,27 @@ fn build_ip_matcher(
 /// 仅接受 IP 地址（不含域名解析，避免 DNS 循环依赖）。
 /// server_name (TLS SNI) 取自 IP 字符串。
 pub fn new_server(url: &str) -> Result<Box<dyn Server>, DnsError> {
+    new_server_with_config(url, NameServerConfig::default()).map(|(server, _)| server)
+}
+
+/// 从 URL + 完整配置构造 Server。对应 Go `nameserver.go NewServer` 收全量
+/// `dns.NameServer` proto——`TimeoutMs`/`ClientIp`/`DisableCache`/`ServeStale`/
+/// `ServeExpiredTTL`/`NegativeTtl` 逐字段流入具体 nameserver 构造（cache +
+/// query_timeout + EDNS0）。默认字段路径见 [`new_server`]。
+///
+/// 返回补好 `address`/`port`（URL 解析结果）的完整 config，供 `Client::new` 复用。
+pub fn new_server_with_config(
+    url: &str,
+    mut cfg: NameServerConfig,
+) -> Result<(Box<dyn Server>, NameServerConfig), DnsError> {
     // Go nameserver.go NewServer：整串 localhost/fakedns 特判
     let lower = url.trim().to_ascii_lowercase();
     if lower == "localhost" {
-        return local::new_local_name_server();
+        return Ok((local::new_local_name_server()?, cfg));
     }
     if lower == "fakedns" {
         let holder = crate::fakedns::Holder::new_default()?;
-        return Ok(Box::new(fakedns::FakeDnsServer::new(holder)));
+        return Ok((Box::new(fakedns::FakeDnsServer::new(holder)), cfg));
     }
 
     let (scheme_raw, rest) = url.split_once("://").unwrap_or(("", url));
@@ -284,17 +297,19 @@ pub fn new_server(url: &str) -> Result<Box<dyn Server>, DnsError> {
     let host_port = rest.split('/').next().unwrap_or(rest);
 
     let (address, port, server_name) = parse_dns_url_host(host_port, default_port)?;
-    let ns = NameServerConfig { address, port, ..Default::default() };
+    cfg.address = address;
+    cfg.port = port;
 
-    match scheme {
-        "" => udp::new_classic_name_server(&ns),
-        "tcp" => tcp::new_tcp_name_server(&ns),
-        "tls" => dot::new_dot_name_server(&ns, server_name, utls::default_client_config()),
-        "https" => doh::new_doh_name_server(&ns, server_name, utls::default_client_config()),
-        "h2c" => doh::new_doh_h2c_name_server(&ns),
-        "quic" => quic::new_quic_name_server(&ns, server_name, utls::default_client_config()),
+    let server = match scheme {
+        "" => udp::new_classic_name_server(&cfg)?,
+        "tcp" => tcp::new_tcp_name_server(&cfg)?,
+        "tls" => dot::new_dot_name_server(&cfg, server_name, utls::default_client_config())?,
+        "https" => doh::new_doh_name_server(&cfg, server_name, utls::default_client_config())?,
+        "h2c" => doh::new_doh_h2c_name_server(&cfg)?,
+        "quic" => quic::new_quic_name_server(&cfg, server_name, utls::default_client_config())?,
         _ => unreachable!(),
-    }
+    };
+    Ok((server, cfg))
 }
 
 /// 解析 DNS URL 的 host:port 部分。仅接受 IP（IPv4/IPv6），拒绝域名。

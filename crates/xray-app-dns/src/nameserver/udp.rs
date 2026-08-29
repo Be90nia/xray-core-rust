@@ -79,10 +79,17 @@ impl UdpNameServer {
     }
 
 
-    /// 从 `NameServerConfig` 构造。
+    /// 从 `NameServerConfig` 构造（Box<dyn Server> 形态）。
     ///
     /// `ns.address` 必须能解析为 IP（域名地址会失败，调用方先做 DNS 查询）。
     pub fn from_config(ns: &NameServerConfig) -> Result<Box<dyn Server>, DnsError> {
+        Ok(Box::new(Self::from_config_bare(ns)?))
+    }
+
+    /// 从 `NameServerConfig` 构造具体类型。cache 4 字段
+    /// （disable_cache/serve_stale/serve_expired_ttl/negative_ttl_secs）
+    /// 流入 CacheController（Go nameserver.go NewServer 收全量 proto 语义）。
+    fn from_config_bare(ns: &NameServerConfig) -> Result<Self, DnsError> {
         let socket_addr = match &ns.address {
             Address::IPv4(v) => SocketAddr::new(IpAddr::V4(*v), ns.port),
             Address::IPv6(v) => SocketAddr::new(IpAddr::V6(*v), ns.port),
@@ -104,12 +111,7 @@ impl UdpNameServer {
             ns.serve_expired_ttl.unwrap_or(0),
             ns.negative_ttl_secs.unwrap_or(0),
         ));
-        Ok(Box::new(Self::new(
-            socket_addr,
-            cache,
-            ns.client_ip.clone(),
-            timeout,
-        )))
+        Ok(Self::new(socket_addr, cache, ns.client_ip.clone(), timeout))
     }
 
     /// 发送单次 DNS 查询并等待响应。
@@ -368,6 +370,27 @@ mod tests {
             .await;
         assert!(outcome.rec_v4.is_none());
         assert_eq!(outcome.errors.len(), 1);
+    }
+
+    /// 4ah3：from_config 消费 NameServerConfig 的 cache 4 字段
+    /// （disable_cache/serve_stale/serve_expired_ttl/negative_ttl_secs → CacheController），
+    /// 即 Go nameserver.go NewServer 收全量 proto 的语义。serveExpiredTTL 存负值。
+    #[test]
+    fn from_config_propagates_cache_fields() {
+        let ns = NameServerConfig {
+            address: Address::IPv4(Ipv4Addr::from_str("8.8.8.8").unwrap()),
+            port: 53,
+            disable_cache: Some(true),
+            serve_stale: Some(true),
+            serve_expired_ttl: Some(45),
+            negative_ttl_secs: Some(15),
+            ..Default::default()
+        };
+        let server = UdpNameServer::from_config_bare(&ns).unwrap();
+        assert!(server.cache.disable_cache);
+        assert!(server.cache.serve_stale);
+        assert_eq!(server.cache.serve_expired_ttl_secs, -45, "serveExpiredTTL 存为负值（Go 语义）");
+        assert_eq!(server.cache.negative_ttl_secs, 15);
     }
 
     #[test]
