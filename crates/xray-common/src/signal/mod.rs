@@ -130,9 +130,13 @@ impl ActivityTimer {
     /// 每次收到活动通知会重置超时计时。
     /// 此方法应在一个独立的 tokio 任务中运行。
     pub async fn run(&mut self) {
+        // Sliding window：每次 update_activity 重置 deadline。
+        // 实现：每轮循环 new sleep 直到超时（简单可靠，避免 Sleep::reset API 变化）。
+        // 性能开销可忽略（每次循环只一次 sleep，不在 hot path）。
         loop {
+            let deadline = tokio::time::Instant::now() + self.timeout;
             tokio::select! {
-                _ = tokio::time::sleep(self.timeout) => {
+                _ = tokio::time::sleep_until(deadline) => {
                     self.done.cancel();
                     return;
                 }
@@ -140,6 +144,7 @@ impl ActivityTimer {
                     if self.done.is_cancelled() {
                         return;
                     }
+                    // 重新循环 → 重新算 deadline（sliding window）
                 }
             }
         }
