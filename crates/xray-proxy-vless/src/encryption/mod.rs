@@ -1231,4 +1231,5 @@ mod tests {
         // shared secret 非零
         assert!(ss1.iter().any(|&b| b != 0));
 }
-
+    // closes `mod tests {`
+    }

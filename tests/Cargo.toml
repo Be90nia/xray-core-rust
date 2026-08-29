@@ -76,5 +76,6 @@ tempfile = "3"
 xray-core = { path = "../crates/xray-core" }
 xray-tls = { path = "../crates/xray-tls" }
 xray-reality = { path = "../crates/xray-reality" }
+base64 = "0.22"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 rand = "0.8"
