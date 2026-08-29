@@ -12,6 +12,7 @@ thiserror = { workspace = true }
 xray-transport = { path = "../xray-transport" }
 xray-app-dispatcher = { path = "../xray-app-dispatcher" }
 xray-buf = { path = "../xray-buf" }
+xray-proto = { path = "../xray-proto" }
 parking_lot = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

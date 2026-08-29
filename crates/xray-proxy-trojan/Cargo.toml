@@ -41,3 +41,4 @@ xray-tls = { path = "../xray-tls" }
 tokio-tungstenite = { workspace = true }
 futures-util = "0.3"
 xray-proxy-freedom = { path = "../xray-proxy-freedom" }
+serde_json = { workspace = true }

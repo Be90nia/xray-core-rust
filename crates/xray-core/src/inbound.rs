@@ -1545,6 +1545,7 @@ async fn spawn_one_inbound(
                             name: fb.get("name").and_then(|v| v.as_str()).unwrap_or("").into(),
                             alpn: fb.get("alpn").and_then(|v| v.as_str()).unwrap_or("").into(),
                             path: fb.get("path").and_then(|v| v.as_str()).unwrap_or("").into(),
+                            r#type: fb.get("type").and_then(|v| v.as_str()).unwrap_or("").into(),
                             dest: apply_unix_abstract_padding(
                                 fb.get("dest").and_then(|v| v.as_str()).unwrap_or("127.0.0.1:80"),
                             ),

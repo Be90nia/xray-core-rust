@@ -20,6 +20,7 @@ tracing = { workspace = true }
 parking_lot = { workspace = true }
 quinn = { workspace = true }
 rand = { workspace = true }
+prost = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

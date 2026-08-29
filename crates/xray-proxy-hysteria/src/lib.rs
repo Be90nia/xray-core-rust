@@ -36,7 +36,10 @@ pub mod outbound;
 pub mod protocol;
 pub mod dispatcher;
 
-pub use config::{HysteriaConfig, HysteriaInboundConfig, HysteriaUser, MultiUserValidator};
+pub use config::{
+    ClientConfig, HysteriaConfig, HysteriaInboundConfig, HysteriaUser, MultiUserValidator,
+    ServerConfig, HYSTERIA_ACCOUNT_TYPE_URL,
+};
 pub use error::{HysteriaProxyError, Result};
 pub use inbound::{HysteriaInboundHandler, StaticAuthValidator, TcpDispatcher};
 pub use outbound::HysteriaOutboundHandler;

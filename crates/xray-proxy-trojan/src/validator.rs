@@ -8,14 +8,18 @@
 //! 切片2 待办：接入 server Process 实际校验入站请求头 hash。
 
 use dashmap::DashMap;
+use prost::Message as _;
+use xray_proto::xray::common::protocol::User as ProtoUser;
+use xray_proto::xray::common::serial::TypedMessage;
+use xray_proto::xray::proxy::trojan::Account as ProtoAccount;
 
-use crate::config::{hex_string, MemoryAccount};
+use crate::config::{hex_string, MemoryAccount, ACCOUNT_TYPE_URL};
 use crate::error::{Result, TrojanError};
 
 /// Trojan 运行时用户（账户 + 元数据），对应 Go `protocol.MemoryUser`（Trojan 用法子集）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MemoryUser {
-    /// 用户邮箱（唯一标识，可空），对应 Go `MemoryUser.Email`。
+    /// 用户邮箱（唯一标识，可为空），对应 Go `MemoryUser.Email`。
     pub email: String,
     /// 用户等级（用于策略查表），对应 Go `MemoryUser.Level`。
     pub level: u32,
@@ -37,7 +41,40 @@ impl MemoryUser {
     pub fn key_hash(&self) -> String {
         hex_string(&self.account.key)
     }
+
+    /// 从 proto `protocol.User` 构造，对应 Go `User.ToMemoryUser()`：
+    /// account `TypedMessage` 解码为 trojan `Account`，再经 `AsAccount`
+    /// 得运行时账户（password + hexSha224 key）。
+    ///
+    /// # Errors
+    /// account 缺失、type_url 非 trojan Account、payload 解码失败 →
+    /// [`TrojanError::InvalidUserAccount`]。
+    pub fn from_proto_user(u: &ProtoUser) -> Result<Self> {
+        let tm = u.account.as_ref().ok_or(TrojanError::InvalidUserAccount)?;
+        if !tm.r#type.ends_with("xray.proxy.trojan.Account") {
+            return Err(TrojanError::InvalidUserAccount);
+        }
+        let acc = ProtoAccount::decode(tm.value.as_slice())
+            .map_err(|_| TrojanError::InvalidUserAccount)?;
+        Ok(Self::new(u.email.clone(), u.level, MemoryAccount::new(&acc.password)))
+    }
+
+    /// 序列化为 proto `protocol.User`：账户经 `ToProto` 编码为
+    /// `TypedMessage`（type_url = [`ACCOUNT_TYPE_URL`]，对应 Go
+    /// `serial.ToTypedMessage`，Go `infra/conf/trojan.go:137-141` 同构）。
+    #[must_use]
+    pub fn to_proto_user(&self) -> ProtoUser {
+        ProtoUser {
+            email: self.email.clone(),
+            level: self.level,
+            account: Some(TypedMessage {
+                r#type: ACCOUNT_TYPE_URL.to_string(),
+                value: self.account.to_proto().encode_to_vec(),
+            }),
+        }
+    }
 }
+
 
 /// Trojan 用户验证器：维护 email 与 hex(key) 双索引。
 ///

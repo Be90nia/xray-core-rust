@@ -68,6 +68,39 @@ impl MasqType {
         }
     }
 
+    /// 把 masquerade 运行时值写回 proto Config 的 masq 8 字段
+    ///（[`Self::from_config`] 的对偶，to_proto 方向）。
+    ///
+    /// 归一化语义（与 from_config 的解析默认一致）：
+    /// - NotFound → `masq_type = ""`（Go 默认分支，hub.go:212）
+    /// - String status_code 恒写非 0 值（from_config 已把 0 归一为 200）
+    ///
+    /// `version`/`auth`/`udp_idle_timeout` 三字段不在 masq 范围，
+    /// 由上层直接读写 prost Config（Go hub.go:63/95、dialer.go:202）。
+    pub fn to_config(&self, config: &mut Config) {
+        match self {
+            Self::NotFound => {
+                config.masq_type = String::new();
+            }
+            Self::File(dir) => {
+                config.masq_type = "file".into();
+                config.masq_file = dir.clone();
+            }
+            Self::Proxy { url, rewrite_host, insecure } => {
+                config.masq_type = "proxy".into();
+                config.masq_url = url.clone();
+                config.masq_url_rewrite_host = *rewrite_host;
+                config.masq_url_insecure = *insecure;
+            }
+            Self::String { body, headers, status_code } => {
+                config.masq_type = "string".into();
+                config.masq_string = body.clone();
+                config.masq_string_headers = headers.clone();
+                config.masq_string_status_code = i32::from(*status_code);
+            }
+        }
+    }
+
     /// 构造 masquerade handler（对应 Go `hub.go:210-254` listen 时 switch masqType）。
     #[must_use]
     pub fn build_handler(&self) -> std::sync::Arc<dyn MasqueradeHandler> {

@@ -6212,6 +6212,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "parking_lot",
+ "prost",
  "quinn",
  "rand 0.9.4",
  "rcgen 0.13.2",
@@ -6311,6 +6312,7 @@ dependencies = [
  "prost",
  "rand 0.9.4",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
@@ -6368,6 +6370,7 @@ dependencies = [
  "xray-buf",
  "xray-common",
  "xray-features",
+ "xray-proto",
  "xray-transport",
 ]
 

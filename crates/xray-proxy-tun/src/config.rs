@@ -16,6 +16,9 @@
 //! gVisor netstack / smoltcp-netstack 集成 + TCP/UDP 包处理。
 
 use std::time::Duration;
+
+use xray_proto::xray::proxy::tun::Config as ProtoConfig;
+
 use crate::error::{Result, TunError};
 
 /// 网络接口评分。用于 [`InterfaceUpdater`](crate#切片边界) 在未指定接口名时
@@ -230,6 +233,72 @@ impl StackOptions {
             )]
         } else {
             cidrs
+        }
+    }
+}
+
+// ===== proto Config 互转（bd v5g：proxy.tun.Config 7 字段） =====
+
+impl StackOptions {
+    /// 从 prost `Config` 构造（7 字段 + Go `TunConfig.Build()` 归一化）。
+    ///
+    /// 对应 Go `infra/conf/tun.go:18-40`：
+    /// - `auto_system_routing_table` 非空且未指定 interface → `"auto"`
+    /// - `name` 空 → `"xray0"`
+    /// - `MTU` 0 → 1500
+    ///
+    /// `tun` 设备与 `idle_timeout` 不来自 proto，保持默认（由调用方注入/覆盖）。
+    #[must_use]
+    pub fn from_proto(p: &ProtoConfig) -> Self {
+        let mut name = p.name.clone();
+        let mut mtu = p.mtu;
+        let auto_outbounds_interface = if p.auto_outbounds_interface.is_empty() {
+            None
+        } else {
+            Some(p.auto_outbounds_interface.clone())
+        };
+        // Build 归一化（Go infra/conf/tun.go:30-39）
+        let auto_outbounds_interface = if !p.auto_system_routing_table.is_empty()
+            && auto_outbounds_interface.is_none()
+        {
+            Some("auto".to_string())
+        } else {
+            auto_outbounds_interface
+        };
+        if name.is_empty() {
+            name = "xray0".to_string();
+        }
+        if mtu == 0 {
+            mtu = 1500;
+        }
+        Self {
+            name,
+            mtu,
+            gateway: p.gateway.clone(),
+            dns: p.dns.clone(),
+            user_level: p.user_level,
+            auto_system_routing_table: p.auto_system_routing_table.clone(),
+            auto_outbounds_interface,
+            ..Self::default()
+        }
+    }
+
+    /// 转换为 prost `Config`（7 字段；`auto_outbounds_interface` None → `""`）。
+    ///
+    /// 已归一化的运行时值（name/mtu 默认、interface "auto"）按当前值写回。
+    #[must_use]
+    pub fn to_proto(&self) -> ProtoConfig {
+        ProtoConfig {
+            name: self.name.clone(),
+            mtu: self.mtu,
+            gateway: self.gateway.clone(),
+            dns: self.dns.clone(),
+            user_level: self.user_level,
+            auto_system_routing_table: self.auto_system_routing_table.clone(),
+            auto_outbounds_interface: self
+                .auto_outbounds_interface
+                .clone()
+                .unwrap_or_default(),
         }
     }
 }
@@ -544,5 +613,85 @@ mod tests {
         let s = DummyStack;
         s.start().unwrap();
         s.close().unwrap();
+    }
+
+    // ===== from_proto/to_proto（bd v5g：proxy.tun.Config 7 字段） =====
+
+    fn full_proto_config() -> ProtoConfig {
+        ProtoConfig {
+            name: "tun0".into(),
+            mtu: 1400,
+            gateway: vec!["10.0.0.1/24".into(), "fd00::1/64".into()],
+            dns: vec!["1.1.1.1".into(), "8.8.8.8".into()],
+            user_level: 1,
+            auto_system_routing_table: vec!["60".into()],
+            auto_outbounds_interface: "wlan0".into(),
+        }
+    }
+
+    #[test]
+    fn stack_options_proto_roundtrip_all_fields() {
+        let p = full_proto_config();
+        let opts = StackOptions::from_proto(&p);
+        // 字段映射完整性（7 字段逐一断言）
+        assert_eq!(opts.name, "tun0");
+        assert_eq!(opts.mtu, 1400);
+        assert_eq!(opts.gateway, vec!["10.0.0.1/24".to_string(), "fd00::1/64".to_string()]);
+        assert_eq!(opts.dns, vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()]);
+        assert_eq!(opts.user_level, 1);
+        assert_eq!(opts.auto_system_routing_table, vec!["60".to_string()]);
+        assert_eq!(opts.auto_outbounds_interface.as_deref(), Some("wlan0"));
+        // 双向 round-trip（proto 等价断言：StackOptions 含 dyn Tun 不可 derive）
+        assert_eq!(opts.to_proto(), StackOptions::from_proto(&opts.to_proto()).to_proto());
+    }
+
+    #[test]
+    fn from_proto_applies_go_build_defaults() {
+        // Go infra/conf/tun.go:30-39：name 空→xray0、mtu 0→1500、
+        // routing table 非空且未指定 interface→auto
+        let p = ProtoConfig {
+            auto_system_routing_table: vec!["60".into()],
+            ..ProtoConfig::default()
+        };
+        let opts = StackOptions::from_proto(&p);
+        assert_eq!(opts.name, "xray0");
+        assert_eq!(opts.mtu, 1500);
+        assert_eq!(opts.auto_outbounds_interface.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn from_proto_none_interface_stays_none_without_routing_table() {
+        let opts = StackOptions::from_proto(&ProtoConfig::default());
+        assert_eq!(opts.auto_outbounds_interface, None);
+        assert_eq!(opts.to_proto().auto_outbounds_interface, "");
+    }
+
+    #[test]
+    fn json_and_proto_produce_equivalent_options() {
+        // JSON（Go infra/conf TunConfig JSON tag）与 proto（Build 产物）
+        // 表达同一配置 → 运行时 StackOptions 等价（proto 侧含 Build 归一化）
+        let json = br#"{
+            "name": "tun0", "mtu": 1400,
+            "gateway": ["10.0.0.1/24", "fd00::1/64"],
+            "dns": ["1.1.1.1", "8.8.8.8"],
+            "userLevel": 1,
+            "autoSystemRoutingTable": ["60"],
+            "autoOutboundsInterface": "wlan0"
+        }"#;
+        let from_json = StackOptions::parse_json(json).unwrap();
+        let from_proto = StackOptions::from_proto(&full_proto_config());
+        assert_eq!(from_json.name, from_proto.name);
+        assert_eq!(from_json.mtu, from_proto.mtu);
+        assert_eq!(from_json.gateway, from_proto.gateway);
+        assert_eq!(from_json.dns, from_proto.dns);
+        assert_eq!(from_json.user_level, from_proto.user_level);
+        assert_eq!(
+            from_json.auto_system_routing_table,
+            from_proto.auto_system_routing_table
+        );
+        assert_eq!(
+            from_json.auto_outbounds_interface,
+            from_proto.auto_outbounds_interface
+        );
     }
 }

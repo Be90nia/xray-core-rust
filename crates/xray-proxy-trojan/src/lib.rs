@@ -25,7 +25,10 @@ pub mod protocol;
 pub mod server;
 pub mod validator;
 
-pub use config::{hex_sha224, hex_string, Account, MemoryAccount, HEX_KEY_LEN};
+pub use config::{
+    hex_sha224, hex_string, Account, ClientConfig, MemoryAccount, ServerConfig, ACCOUNT_TYPE_URL,
+    HEX_KEY_LEN,
+};
 pub use error::{Result, TrojanError};
 pub use protocol::{
     addr_type, parse_request_header, parse_udp_packet, read_address_port, write_address_port,

@@ -10,6 +10,13 @@ use std::sync::Arc;
 use std::collections::HashMap;
 
 use parking_lot::Mutex;
+use prost::Message as _;
+use xray_proto::xray::common::protocol::{ServerEndpoint, User as ProtoUser};
+use xray_proto::xray::common::serial::TypedMessage;
+use xray_proto::xray::proxy::hysteria::{
+    ClientConfig as ProtoClientConfig, ServerConfig as ProtoServerConfig,
+};
+use xray_proto::xray::proxy::hysteria::account::Account as ProtoHysteriaAccount;
 use xray_transport_hysteria::hub::AuthValidator;
 use xray_transport_hysteria::quic_params::default_hysteria_quic_params;
 
@@ -194,7 +201,7 @@ fn server_name_from_addr(addr: &str) -> String {
 /// Hysteria 用户账号（对应 Go `proxy/hysteria/account/config.go` 的 `Account`）。
 ///
 /// 每个用户一个 `auth` token，客户端在 `Hysteria-Auth` 头中携带。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HysteriaUser {
     /// 用户邮箱（唯一标识，可为空）。
     pub email: String,
@@ -221,6 +228,43 @@ impl HysteriaUser {
         self.level = level;
         self
     }
+
+
+    /// 从 proto `protocol.User` 构造：account `TypedMessage` 解码为
+    /// `hysteria.account.Account{auth}`，对应 Go `User.ToMemoryUser()`
+    /// （server.go:31-35 逐用户解码入 Validator）。
+    ///
+    /// # Errors
+    /// account 缺失、type_url 非 hysteria account.Account、payload 解码失败 →
+    /// [`HysteriaProxyError::InvalidConfig`]。
+    pub fn from_proto_user(u: &ProtoUser) -> Result<Self> {
+        let tm = u.account.as_ref().ok_or_else(|| {
+            HysteriaProxyError::InvalidConfig(format!("user {} has no account", u.email))
+        })?;
+        if !tm.r#type.ends_with(HYSTERIA_ACCOUNT_TYPE_URL_SUFFIX) {
+            return Err(HysteriaProxyError::InvalidConfig(format!(
+                "user {} account type mismatch: {}",
+                u.email, tm.r#type
+            )));
+        }
+        let acc = ProtoHysteriaAccount::decode(tm.value.as_slice())
+            .map_err(|e| HysteriaProxyError::InvalidConfig(format!("account decode: {e}")))?;
+        Ok(Self { email: u.email.clone(), auth: acc.auth, level: u.level })
+    }
+
+    /// 序列化为 proto `protocol.User`（account 编码为 `TypedMessage`，
+    /// 对应 Go `serial.ToTypedMessage(acc)`，infra/conf/hysteria.go:56-63）。
+    #[must_use]
+    pub fn to_proto_user(&self) -> ProtoUser {
+        ProtoUser {
+            email: self.email.clone(),
+            level: self.level,
+            account: Some(TypedMessage {
+                r#type: HYSTERIA_ACCOUNT_TYPE_URL.to_string(),
+                value: ProtoHysteriaAccount { auth: self.auth.clone() }.encode_to_vec(),
+            }),
+        }
+    }
 }
 
 /// Hysteria 入站配置（服务端，对应 Go `proxy/hysteria/server.go` 的 ServerConfig）。
@@ -240,6 +284,72 @@ pub struct HysteriaInboundConfig {
     pub udp_idle_timeout_secs: u64,
     /// Masquerade 类型（对应 Go `config.MasqType`，空字符串 = NotFound）。
     pub masq_type: String,
+}
+
+/// Hysteria account 的 proto 类型 URL（Go `serial.ToTypedMessage` 产物）。
+pub const HYSTERIA_ACCOUNT_TYPE_URL: &str =
+    "type.googleapis.com/xray.proxy.hysteria.account.Account";
+
+/// type_url 后缀匹配用（from 方向接受任意前缀写法）。
+const HYSTERIA_ACCOUNT_TYPE_URL_SUFFIX: &str = "xray.proxy.hysteria.account.Account";
+
+/// Hysteria 客户端配置（proto 镜像），对应 proto `ClientConfig{version, server}`。
+///
+/// Go `client.go:31-46`：`server` 缺失即 `no target server found`，端点经
+/// `NewServerSpecFromPB` 转 ServerSpec；`version` 仅在 JSON 层校验
+///（infra/conf/hysteria.go:20-22 要求 ==2），运行时不读。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ClientConfig {
+    /// 协议版本（JSON 层要求 2）。
+    pub version: i32,
+    /// 服务器端点（address + port）。
+    pub server: Option<ServerEndpoint>,
+}
+
+impl ClientConfig {
+    /// 从 prost `ClientConfig` 构造。
+    #[must_use]
+    pub fn from_proto(p: ProtoClientConfig) -> Self {
+        Self { version: p.version, server: p.server }
+    }
+
+    /// 转换为 prost `ClientConfig`。
+    #[must_use]
+    pub fn to_proto(&self) -> ProtoClientConfig {
+        ProtoClientConfig { version: self.version, server: self.server.clone() }
+    }
+}
+
+/// Hysteria 服务端配置（proto 镜像），对应 proto `ServerConfig{users}`。
+///
+/// Go `server.go:29-40`：users 各经 `ToMemoryUser` 解码入 account.Validator。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ServerConfig {
+    /// 用户列表（auth 已从 account.Account 解码）。
+    pub users: Vec<HysteriaUser>,
+}
+
+impl ServerConfig {
+    /// 从 prost `ServerConfig` 构造（逐用户解码 account）。
+    ///
+    /// # Errors
+    /// 任一用户 account 无效 → [`HysteriaProxyError::InvalidConfig`]
+    ///（对应 Go server.go:33-35 `failed to get hysteria user` AtError）。
+    pub fn from_proto(p: ProtoServerConfig) -> Result<Self> {
+        Ok(Self {
+            users: p
+                .users
+                .iter()
+                .map(HysteriaUser::from_proto_user)
+                .collect::<Result<_>>()?,
+        })
+    }
+
+    /// 转换为 prost `ServerConfig`（用户账户重编码）。
+    #[must_use]
+    pub fn to_proto(&self) -> ProtoServerConfig {
+        ProtoServerConfig { users: self.users.iter().map(HysteriaUser::to_proto_user).collect() }
+    }
 }
 
 impl HysteriaInboundConfig {
@@ -509,5 +619,76 @@ mod tests {
             .with_obfs("salamander-key");
         assert_eq!(cfg.brutal_down_bps, 5_000_000);
         assert_eq!(cfg.obfs.as_deref(), Some("salamander-key"));
+    }
+
+    // ===== from_proto/to_proto（bd v5g：对齐 Go client.go/server.go + infra/conf/hysteria.go） =====
+
+    #[test]
+    fn hysteria_user_proto_roundtrip_all_fields() {
+        let u = HysteriaUser::new("u@a.com", "auth-token").with_level(2);
+        let p = u.to_proto_user();
+        // 字段映射完整性（Go infra/conf/hysteria.go:59-63：email/level/account.auth）
+        assert_eq!(p.email, "u@a.com");
+        assert_eq!(p.level, 2);
+        let tm = p.account.as_ref().unwrap();
+        assert_eq!(tm.r#type, HYSTERIA_ACCOUNT_TYPE_URL);
+        let acc = ProtoHysteriaAccount::decode(tm.value.as_slice()).unwrap();
+        assert_eq!(acc.auth, "auth-token");
+        assert_eq!(HysteriaUser::from_proto_user(&p).unwrap(), u);
+    }
+
+    #[test]
+    fn hysteria_user_from_proto_rejects_bad_account() {
+        // 无 account
+        assert!(HysteriaUser::from_proto_user(&ProtoUser::default()).is_err());
+        // type_url 不匹配
+        let mut u = ProtoUser::default();
+        u.account = Some(TypedMessage {
+            r#type: "type.googleapis.com/xray.proxy.trojan.Account".into(),
+            value: Vec::new(),
+        });
+        assert!(HysteriaUser::from_proto_user(&u).is_err());
+        // payload 非法
+        let mut u = ProtoUser::default();
+        u.account = Some(TypedMessage {
+            r#type: HYSTERIA_ACCOUNT_TYPE_URL.to_string(),
+            value: vec![0xff, 0xff, 0xff],
+        });
+        assert!(HysteriaUser::from_proto_user(&u).is_err());
+    }
+
+    #[test]
+    fn hysteria_client_config_proto_roundtrip() {
+        use xray_proto::xray::common::net::IpOrDomain;
+        // Go infra/conf/hysteria.go:19-32：JSON {version:2, address, port} → proto
+        let cfg = ClientConfig {
+            version: 2,
+            server: Some(ServerEndpoint {
+                address: Some(IpOrDomain {
+                    address: Some(xray_proto::xray::common::net::ip_or_domain::Address::Domain(
+                        "hy.example.com".into(),
+                    )),
+                }),
+                port: 443,
+                user: None,
+            }),
+        };
+        assert_eq!(ClientConfig::from_proto(cfg.to_proto()), cfg);
+        assert_eq!(ClientConfig::default().server, None);
+    }
+
+    #[test]
+    fn hysteria_server_config_proto_roundtrip() {
+        let cfg = ServerConfig {
+            users: vec![
+                HysteriaUser::new("a@a.com", "t1").with_level(1),
+                HysteriaUser::new("b@a.com", "t2"),
+            ],
+        };
+        let p = cfg.to_proto();
+        assert_eq!(p.users.len(), 2);
+        assert_eq!(p.users[0].email, "a@a.com");
+        assert_eq!(p.users[1].level, 0);
+        assert_eq!(ServerConfig::from_proto(p).unwrap(), cfg);
     }
 }

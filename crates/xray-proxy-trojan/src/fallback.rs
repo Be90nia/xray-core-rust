@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// 单个 Fallback 配置。对应 proto `Fallback`。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Fallback {
     /// SNI 匹配（空 = 通配）。
     pub name: String,
@@ -17,10 +17,44 @@ pub struct Fallback {
     pub alpn: String,
     /// HTTP path 匹配（空 = 通配）。
     pub path: String,
+    /// 拨号网络类型（`"tcp"` / `"unix"`，空 = 未指定）。
+    ///
+    /// 对应 proto `Fallback.type`；Go `server.go:457` `dialer.DialContext(ctx, fb.Type, fb.Dest)`。
+    pub r#type: String,
     /// 目标地址（host:port 或 Unix socket 路径）。
     pub dest: String,
     /// PROXY protocol 版本（0=禁用，1/2=启用）。
     pub xver: u64,
+}
+
+impl Fallback {
+    /// 从 prost `Fallback` 构造（全 6 字段）。
+    ///
+    /// 对应 Go `infra/conf/trojan.go:159-166` JSON→proto 的 proto 侧入口。
+    #[must_use]
+    pub fn from_proto(p: xray_proto::xray::proxy::trojan::Fallback) -> Self {
+        Self {
+            name: p.name,
+            alpn: p.alpn,
+            path: p.path,
+            r#type: p.r#type,
+            dest: p.dest,
+            xver: p.xver,
+        }
+    }
+
+    /// 转换为 prost `Fallback`。
+    #[must_use]
+    pub fn to_proto(&self) -> xray_proto::xray::proxy::trojan::Fallback {
+        xray_proto::xray::proxy::trojan::Fallback {
+            name: self.name.clone(),
+            alpn: self.alpn.clone(),
+            path: self.path.clone(),
+            r#type: self.r#type.clone(),
+            dest: self.dest.clone(),
+            xver: self.xver,
+        }
+    }
 }
 
 /// Path 层：`path → Fallback`，含通配。
@@ -151,6 +185,7 @@ mod tests {
             name: name.into(),
             alpn: alpn.into(),
             path: path.into(),
+            r#type: String::new(),
             dest: dest.into(),
             xver: 0,
         }
