@@ -168,7 +168,7 @@ async fn resolve_dest_socket_addr(dest: &Destination) -> Option<SocketAddr> {
 /// 从 `splithttpSettings` JSON 解析为强类型 [`Config`]。
 ///
 /// `None` 或非 object 返回 [`Config::default`]。
-fn parse_splithttp_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
+pub(crate) fn parse_splithttp_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
     let Some(v) = json else { return Ok(Config::default()); };
     let Some(obj) = v.as_object() else {
         return Err(io::Error::new(

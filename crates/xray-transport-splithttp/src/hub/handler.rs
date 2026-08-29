@@ -2,6 +2,10 @@
 //!
 //! 对应 Go `hub.go` 的 `requestHandler.ServeHTTP`。
 //! 三种模式分发：packet-up (POST+seq)、stream-up (POST 无 seq)、stream-down (GET)。
+//!
+//! 请求体不钉死 hyper `Incoming`：h1/h2 路径用 `Incoming`（`Error = hyper::Error`），
+//! H3 路径用 transport 层桥接体（`Error = io::Error`）。泛型 bound 只要求
+//! `Data = Bytes` + 错误可转 `BoxError`（`collect` 等消费端需要）。
 
 use std::io;
 use std::net::SocketAddr;
@@ -12,7 +16,7 @@ use futures_util::TryStreamExt;
 use http::HeaderMap;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
-use hyper::body::{Frame, Incoming};
+use hyper::body::Frame;
 use hyper::{Method, Request, Response, StatusCode};
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
@@ -42,11 +46,15 @@ const DUPLEX_BUF: usize = 64 * 1024;
 ///
 /// 提取 CORS header（对应 Go `WriteResponseHeader`，在每个响应上调用），
 /// 再委托 [`dispatch_request`]，最后把 CORS header 追加到最终响应。
-pub async fn handle_request(
-    req: Request<Incoming>,
+pub async fn handle_request<B>(
+    req: Request<B>,
     peer_addr: SocketAddr,
     ctx: &HandlerContext,
-) -> Response<BoxBody<Bytes, io::Error>> {
+) -> Response<BoxBody<Bytes, io::Error>>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + Unpin + BodyExt + 'static,
+    B::Error: Send + Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     let cors = ctx
         .config
         .write_response_header(req.method().as_str(), req.headers());
@@ -68,12 +76,15 @@ fn apply_cors_headers(
     resp
 }
 
-/// 请求分发：Host/Path 校验 → OPTIONS → 提取 meta → padding 校验 → 模式分发。
-async fn dispatch_request(
-    req: Request<Incoming>,
+async fn dispatch_request<B>(
+    req: Request<B>,
     peer_addr: SocketAddr,
     ctx: &HandlerContext,
-) -> Response<BoxBody<Bytes, io::Error>> {
+) -> Response<BoxBody<Bytes, io::Error>>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + Unpin + BodyExt + 'static,
+    B::Error: Send + Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     // 1. Host 验证
     if !ctx.host.is_empty() {
         let req_host = req
@@ -124,13 +135,16 @@ async fn dispatch_request(
     }
 }
 
-/// packet-up：POST + seq → 读 payload → push 到 UploadQueue。
-async fn handle_packet_up(
-    req: Request<Incoming>,
+async fn handle_packet_up<B>(
+    req: Request<B>,
     session_id: &str,
     seq_str: &str,
     ctx: &HandlerContext,
-) -> Response<BoxBody<Bytes, io::Error>> {
+) -> Response<BoxBody<Bytes, io::Error>>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + Unpin + BodyExt + 'static,
+    B::Error: Send + Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     let seq: u64 = match seq_str.parse() {
         Ok(n) => n,
         Err(_) => return status_response(StatusCode::INTERNAL_SERVER_ERROR),
@@ -158,12 +172,15 @@ async fn handle_packet_up(
     status_response(StatusCode::OK)
 }
 
-/// stream-up：POST 无 seq → 流式 body 转为有序 packet 序列。
-async fn handle_stream_up(
-    req: Request<Incoming>,
+async fn handle_stream_up<B>(
+    req: Request<B>,
     session_id: &str,
     ctx: &HandlerContext,
-) -> Response<BoxBody<Bytes, io::Error>> {
+) -> Response<BoxBody<Bytes, io::Error>>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + Unpin + BodyExt + 'static,
+    B::Error: Send + Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     let session = ctx.sessions.upsert(session_id, ctx.max_buffered_posts).await;
     let queue = Arc::clone(&session.upload_queue);
 
@@ -189,13 +206,16 @@ async fn handle_stream_up(
     resp
 }
 
-/// stream-down / stream-one：GET → 创建 ServerConn 交给 dispatcher。
-async fn handle_stream_down(
-    req: Request<Incoming>,
+async fn handle_stream_down<B>(
+    req: Request<B>,
     peer_addr: SocketAddr,
     session_id: &str,
     ctx: &HandlerContext,
-) -> Response<BoxBody<Bytes, io::Error>> {
+) -> Response<BoxBody<Bytes, io::Error>>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + Unpin + BodyExt + 'static,
+    B::Error: Send + Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     // 上行管道：reader → dispatcher
     let (upload_tx, upload_rx) = tokio::io::duplex(DUPLEX_BUF);
     // 下行管道：dispatcher → response body
@@ -275,10 +295,14 @@ async fn forward_queue_to_writer(queue: Arc<crate::UploadQueue>, mut writer: tok
 }
 
 /// 提取 packet-up payload（body / header / cookie / auto placement）。
-async fn extract_packet_payload(
-    req: Request<Incoming>,
+async fn extract_packet_payload<B>(
+    req: Request<B>,
     ctx: &HandlerContext,
-) -> Result<Vec<u8>, StatusCode> {
+) -> Result<Vec<u8>, StatusCode>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + Unpin + BodyExt + 'static,
+    B::Error: Send + Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     let placement = ctx.config.normalized_uplink_data_placement();
     let key = &ctx.config.uplink_data_key;
     let (parts, body) = req.into_parts();
@@ -345,7 +369,11 @@ fn extract_cookie_payload(headers: &HeaderMap, key: &str) -> Vec<u8> {
 }
 
 /// 校验 padding（简化版：检查 Referer header 的 x_padding query）。
-fn validate_padding(req: &Request<Incoming>, ctx: &HandlerContext) -> bool {
+fn validate_padding<B>(req: &Request<B>, ctx: &HandlerContext) -> bool
+where
+    B: hyper::body::Body<Data = Bytes> + Send + Unpin + BodyExt + 'static,
+    B::Error: Send + Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     // ponytail: 非强制 padding 校验。仅在 obfs_mode=false 时检查 Referer。
     // obfs_mode=true 时校验逻辑依赖完整 xpadding 模块，留后续。
     if ctx.config.x_padding_obfs_mode {
@@ -452,7 +480,6 @@ fn status_response(status: StatusCode) -> Response<BoxBody<Bytes, io::Error>> {
         .body(empty_body())
         .unwrap()
 }
-
 
 fn empty_body() -> BoxBody<Bytes, io::Error> {
     Full::new(Bytes::new())

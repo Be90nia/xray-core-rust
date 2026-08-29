@@ -10,6 +10,7 @@ xray-buf = { path = "../xray-buf" }
 xray-common = { path = "../xray-common" }
 xray-transport = { path = "../xray-transport" }
 xray-proto = { path = "../xray-proto" }
+xray-reality = { path = "../xray-reality" }
 xray-tls = { path = "../xray-tls" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -37,6 +38,8 @@ quinn.workspace = true
 rand = { workspace = true }
 tokio-util = "0.7"
 tokio-stream = "0.1"
+base64 = "0.22"
+hex = "0.4"
 
 [dev-dependencies]
 rcgen = "0.13"
