@@ -43,6 +43,16 @@ async fn dial_tcp(
 ) -> io::Result<Box<dyn Connection>> {
     let conn = xray_transport::system_dialer::dial_system(dest, sockopt).await?;
     let conn = wrap_security(conn, settings, dest).await?;
+    // Tcpmask 装配（Go tcp/dialer.go:28 WrapConnClient）：finalmask_json.tcp[] 每条 mask
+    // 链式 WrapConnClient；无 mask / 空数组 → 跳过（向后兼容）。
+    let mgr = xray_transport::finalmask::build_tcpmask_manager_from_json(
+        settings.finalmask_json.as_ref(),
+    )?;
+    let conn: Box<dyn Connection> = if !mgr.tcpmasks.is_empty() {
+        xray_transport::finalmask::wrap_conn_client_into_connection(&mgr, conn)?
+    } else {
+        conn
+    };
     // header 伪装装配（Go tcp/dialer.go:105-115，TLS 之后）：
     // `tcpSettings.header.type = "http"` → client 包装；`"none"`/缺失 → 不包装。
     if let Some(auth) =

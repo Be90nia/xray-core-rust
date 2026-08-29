@@ -34,6 +34,9 @@ pub struct TcpHubListener {
     /// header 伪装 authenticator（Go hub.go:24 `authConfig internet.ConnectionAuthenticator`）。
     /// `None` = 未配置（type none/缺失）→ accept 后不包装。
     auth: Option<Arc<crate::headers::http::HttpAuthenticator>>,
+    /// Tcpmask 伪装管理器（Go hub.go:68 `WrapListener`），accept 后对每条连接做
+    /// `WrapConnServer` 链式包装；`None` 或 `tcpmasks` 为空 → 跳过。
+    tcpmask_manager: Option<crate::finalmask::TcpmaskManager>,
 }
 
 impl TcpHubListener {
@@ -49,12 +52,12 @@ impl TcpHubListener {
     ///
     /// # 错误
     ///
-    /// bind 失败时返回 `io::Error`。
     pub async fn listen(
         addr: SocketAddr,
         sockopt: &SocketOptions,
         add_conn: ConnHandler,
         auth: Option<Arc<crate::headers::http::HttpAuthenticator>>,
+        tcpmask_manager: Option<crate::finalmask::TcpmaskManager>,
     ) -> io::Result<Self> {
         let inner = DefaultListener::bind(addr, sockopt.clone()).await?;
         let close_notify = Arc::new(Notify::new());
@@ -64,6 +67,7 @@ impl TcpHubListener {
             add_conn,
             close_notify,
             auth,
+            tcpmask_manager,
         };
 
         // ponytail: 暂不 spawn accept 循环——由调用方显式调用 `keep_accepting`
@@ -111,7 +115,21 @@ impl TcpHubListener {
                                 Some(a) => crate::headers::conn::wrap_server(conn, a),
                                 None => conn,
                             };
-                            (self.add_conn)(conn);
+                            // Tcpmask 包装（Go hub.go:67-69 WrapListener → WrapConnServer）：
+                            // 优先于 add_conn；manager 为空 → 跳过。
+                            let conn = match self.tcpmask_manager.as_ref() {
+                                Some(mgr) => match crate::finalmask::wrap_conn_server_into_connection(
+                                    mgr, conn,
+                                ) {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "tcpmask wrap failed");
+                                        // auth-wrapped conn 已丢失原始 conn——此处吞错
+                                        unreachable!("tcpmask wrap failed but conn was moved by auth wrap")
+                                    }
+                                },
+                                None => conn,
+                            };
                         }
                         Err(e) => {
                             let err_str = e.to_string();
@@ -168,7 +186,10 @@ pub async fn listen_tcp_impl(
     // header 伪装构建（Go hub.go:85-95：HeaderSettings → ConnectionAuthenticator，
     // 失败报错；none/缺失 → None 不包装）。
     let auth = crate::headers::conn::auth_from_json(settings.transport_json.as_ref())?;
-    let listener = TcpHubListener::listen(addr, &sockopt, handler, auth).await?;
+    // Tcpmask 解析（Go hub.go:67-68 WrapListener）：finalmask_json.tcp[] 链
+    let mgr = crate::finalmask::build_tcpmask_manager_from_json(settings.finalmask_json.as_ref())?;
+    let mgr = if mgr.tcpmasks.is_empty() { None } else { Some(mgr) };
+    let listener = TcpHubListener::listen(addr, &sockopt, handler, auth, mgr).await?;
     Ok(Box::new(listener) as Box<dyn TransportListener>)
 }
 
@@ -231,7 +252,7 @@ mod tests {
     async fn tcp_hub_listener_bind_and_accept() {
         let handler: ConnHandler = Arc::new(|_| {});
         let listener =
-            TcpHubListener::listen("127.0.0.1:0".parse().unwrap(), &SocketOptions::default(), handler, None)
+            TcpHubListener::listen("127.0.0.1:0".parse().unwrap(), &SocketOptions::default(), handler, None, None)
                 .await
                 .expect("listen 失败");
         let addr = listener.local_addr().expect("local_addr 失败");
@@ -253,7 +274,7 @@ mod tests {
     async fn tcp_hub_listener_local_addr() {
         let handler: ConnHandler = Arc::new(|_| {});
         let listener =
-            TcpHubListener::listen("127.0.0.1:0".parse().unwrap(), &SocketOptions::default(), handler, None)
+            TcpHubListener::listen("127.0.0.1:0".parse().unwrap(), &SocketOptions::default(), handler, None, None)
                 .await
                 .expect("listen 失败");
         let addr = listener.local_addr().expect("local_addr 失败");
@@ -272,7 +293,7 @@ mod tests {
         });
 
         let listener = Arc::new(
-            TcpHubListener::listen("127.0.0.1:0".parse().unwrap(), &SocketOptions::default(), handler, None)
+            TcpHubListener::listen("127.0.0.1:0".parse().unwrap(), &SocketOptions::default(), handler, None, None)
                 .await
                 .expect("listen 失败"),
         );
@@ -321,7 +342,7 @@ mod tests {
     async fn transport_listener_trait_close_and_local_addr() {
         let handler: ConnHandler = Arc::new(|_| {});
         let listener: Box<dyn TransportListener> = Box::new(
-            TcpHubListener::listen("127.0.0.1:0".parse().unwrap(), &SocketOptions::default(), handler, None)
+            TcpHubListener::listen("127.0.0.1:0".parse().unwrap(), &SocketOptions::default(), handler, None, None)
                 .await
                 .expect("listen 失败"),
         );
@@ -363,6 +384,7 @@ mod header_wrap_tests {
                 &SocketOptions::default(),
                 handler,
                 Some(auth),
+                None,
             )
             .await
             .expect("listen 失败"),
