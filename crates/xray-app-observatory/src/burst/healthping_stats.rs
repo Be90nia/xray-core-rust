@@ -71,6 +71,17 @@ impl HealthPingRtts {
         self.idx = (self.idx + 1) % self.cap;
     }
 
+    /// 最新写入的样本值（环形缓冲 idx 前一位）。
+    ///
+    /// 未写入过任何样本 → `None`。
+    pub fn latest(&self) -> Option<i64> {
+        if !self.initialized {
+            return None;
+        }
+        let last = (self.idx + self.cap - 1) % self.cap;
+        Some(self.rtts[last].value)
+    }
+
     /// 计算当前 statistics。
     ///
     /// 对应 Go `getStatistics`：跳过 untested + 过期项，统计 fail/avg/max/min/deviation。

@@ -26,6 +26,7 @@ pub mod observer;
 pub mod status;
 
 pub use burst::{
+    burst_observer::BurstObserver,
     healthping_settings::{HealthPingConfig, HealthPingSettings},
     healthping_stats::{HealthPingRtts, HealthPingStats, PingRtt},
     is_valid_rtt, RTT_FAILED, RTT_UNQUALIFIED, RTT_UNTESTED,

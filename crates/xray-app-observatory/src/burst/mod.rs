@@ -5,9 +5,11 @@
 //! - `healthping_result.go` HealthPingRTTS / HealthPingStats / 统计算法
 //! - `healthping.go` HealthPingSettings 校验
 
+pub mod burst_observer;
 pub mod healthping_settings;
 pub mod healthping_stats;
 
+pub use burst_observer::BurstObserver;
 pub use healthping_settings::{HealthPingConfig, HealthPingSettings};
 pub use healthping_stats::{HealthPingRtts, HealthPingStats, PingRtt};
 
