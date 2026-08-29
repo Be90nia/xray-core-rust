@@ -368,6 +368,7 @@ fn escape_value(s: &str) -> String {
 /// ## 优雅关闭
 /// `TokioHttpServer::shutdown()` 通过 Notify 唤醒所有 task，等待 5s 超时。
 /// 未显式 shutdown 时随 tokio runtime drop 自动释放。
+#[derive(Clone)]
 pub struct TokioHttpServer {
     inner: Arc<TokioHttpServerInner>,
 }

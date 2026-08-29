@@ -2,21 +2,55 @@
 //!
 //! 对应 Go `app/metrics/metrics.go` 中 `Handler` 作为 `features.Feature`。
 //!
-//! ## 当前限制
+//! ## `Feature::start` 编排（对应 Go `MetricsHandler.Start`，metrics.go:87-123）
 //!
-//! Go 版 `Start()` 需要 `outbound.Manager`（注册/移除 handler）+ HTTP server
-//! + stats/observability 收集器。Rust 端这些通过 trait 注入，factory 无法
-//! 在构造时获取——故 `start()` 暂不启动 HTTP listener。Handler 已构造并注册，
-//! 待 Instance 接线后可由上层注入依赖并调用 `MetricsHandler::start(...)`。
+//! 1. 若 `MetricsConfig::listen` 非空：`TokioHttpServer::start_http_listen` 绑端口
+//!    并 `tokio::spawn` accept loop，处理 `GET /metrics` 返回 Prometheus 文本。
+//! 2. 创建 `Outbound`（`OutboundListener` + tag）并经 registrar add。
+//! 3. 幂等：第二次 `start` 仅返回 `Ok(())`，不重复 spawn。
+//!
+//! `Feature::start` 假设在 tokio runtime 内被调用（与 `Commander::start` 一致，
+//! 由 `xray_core` Instance 保证）。
+//!
+//! ## 依赖注入
+//!
+//! 默认情况下 `MetricsFeature` 内部持有：
+//! - [`TokioHttpServer`]：真实 HTTP server（已实现）。
+//! - `EmptyStats` collector：返回空 `StatsSnapshot`；HTTP body 仅含 `# HELP`/`# TYPE`
+//!   头，仍能 curl 到合法 Prometheus exposition format。
+//! - `RecordingOutboundRegistrar`：仅记 tag。
+//!
+//! 上层可经 [`MetricsFeature::with_stats_collector`] / [`with_obs_collector`]
+//! 注入真实 stats/observability 收集器。
 
-use xray_features::{Feature, Result};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use xray_features::Feature;
 
 use crate::config::MetricsConfig;
-use crate::metrics::MetricsHandler;
+use crate::error::MetricsError;
+use crate::metrics::{
+    MetricsHandler, ObservationCollector, RecordingOutboundRegistrar, StatsCollector,
+    TokioHttpServer,
+};
 
-/// Metrics app Feature 实现。包装 [`MetricsHandler`]。
+/// 空 StatsCollector：返回空快照；HTTP body 仍含 `# HELP`/`# TYPE`。
+struct EmptyStats;
+impl StatsCollector for EmptyStats {
+    fn collect(&self) -> crate::metrics::StatsSnapshot {
+        crate::metrics::StatsSnapshot::default()
+    }
+}
+
+/// Metrics app Feature 实现。包装 [`MetricsHandler`] + 默认依赖。
 pub struct MetricsFeature {
     handler: MetricsHandler,
+    http_server: TokioHttpServer,
+    stats: parking_lot::RwLock<Arc<dyn StatsCollector>>,
+    obs: parking_lot::RwLock<Option<Arc<dyn ObservationCollector>>>,
+    registrar: Arc<RecordingOutboundRegistrar>,
+    started: AtomicBool,
 }
 
 impl MetricsFeature {
@@ -24,10 +58,29 @@ impl MetricsFeature {
     pub fn new(config: MetricsConfig) -> Self {
         Self {
             handler: MetricsHandler::new(config),
+            http_server: TokioHttpServer::new(),
+            stats: parking_lot::RwLock::new(Arc::new(EmptyStats)),
+            obs: parking_lot::RwLock::new(None),
+            registrar: Arc::new(RecordingOutboundRegistrar::new()),
+            started: AtomicBool::new(false),
         }
     }
 
-    /// 获取内部 MetricsHandler 引用（供 Instance 注入 http_server/stats 后启动）。
+    /// 注入 stats 收集器（应在 `start` 前调用）。
+    #[must_use]
+    pub fn with_stats_collector(self, stats: Arc<dyn StatsCollector>) -> Self {
+        *self.stats.write() = stats;
+        self
+    }
+
+    /// 注入 observation 收集器。
+    #[must_use]
+    pub fn with_obs_collector(self, obs: Arc<dyn ObservationCollector>) -> Self {
+        *self.obs.write() = Some(obs);
+        self
+    }
+
+    /// 获取内部 MetricsHandler 引用。
     pub fn handler(&self) -> &MetricsHandler {
         &self.handler
     }
@@ -38,13 +91,33 @@ impl Feature for MetricsFeature {
         "metrics"
     }
 
-    fn start(&self) -> Result<()> {
-        // ponytail: HTTP server + stats collector + outbound registrar
-        // injected from the instance. Not available at factory time.
-        Ok(())
+    fn start(&self) -> xray_features::Result<()> {
+        // 幂等保护。
+        if self.started.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let stats = self.stats.read().clone();
+        let obs = self.obs.read().clone();
+        self.handler
+            .start(&self.http_server, stats, obs, self.registrar.as_ref())
+            .map_err(|e: MetricsError| xray_features::FeatureError::StartFailed {
+                name: "metrics",
+                message: format!("{e}"),
+            })
     }
 
-    fn close(&self) -> Result<()> {
+    fn close(&self) -> xray_features::Result<()> {
+        self.started.store(false, Ordering::SeqCst);
+        // 通知 http_server 释放后台 task（5s timeout）。
+        let closer = self.http_server.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                closer.shutdown().await;
+            });
+        } else {
+            // 不在 runtime 内：spawn 时再尝试，不阻塞 close。
+            drop(closer);
+        }
         self.handler.close();
         Ok(())
     }
