@@ -14,7 +14,7 @@ use crate::status::StatusStore;
 
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
-use tokio::time::interval;
+use tokio::sync::watch;
 /// OutboundSelector trait：返回受观察的 outbound tag 列表。
 ///
 /// 对应 Go `outbound.HandlerSelector.Select(subjectSelector)`。
@@ -37,6 +37,14 @@ pub fn now_unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// 失败轮的 linear backoff 倍数：连续失败 n 轮 → n+1 倍间隔，上限 8。
+///
+/// Go `background()` 固定 sleepTime（observer.go:76-79），无退避；
+/// 任务要求 linear 失败退避（完整指数退避为 non-goal）。
+pub fn backoff_multiplier(consecutive_failures: u32) -> u32 {
+    consecutive_failures.saturating_add(1).min(8)
+}
+
 /// Observer：观察者编排类。
 ///
 /// 持有 config + StatusStore + IO 注入 trait，编排：
@@ -51,6 +59,7 @@ pub struct Observer {
 
 struct ObserverState {
     started: bool,
+    cancel_tx: Option<watch::Sender<bool>>,
 }
 
 impl Observer {
@@ -58,7 +67,10 @@ impl Observer {
         Self {
             config,
             status: Arc::new(StatusStore::new()),
-            state: Mutex::new(ObserverState { started: false }),
+            state: Mutex::new(ObserverState {
+                started: false,
+                cancel_tx: None,
+            }),
         }
     }
 
@@ -70,11 +82,15 @@ impl Observer {
         &self.status
     }
 
-    /// 启动后台定期探测循环。
+    /// 启动后台定期探测循环（同步：spawn 不需要 await）。
     ///
-    /// 使用 tokio::spawn 创建异步任务，按配置 interval 定期执行 probe_all。
-    /// 对应 Go `background()` goroutine。
-    pub async fn start(
+    /// 对应 Go `Observer.Start()`（observer.go:49-55）：SubjectSelector 非空才
+    /// `go background()`；background（observer.go:64-113）每轮先 probe 后 sleep
+    /// ProbeInterval（默认 10s）。
+    ///
+    /// 与 Go 的差异：连续失败轮（select 出错或全部 probe 死亡）触发 linear
+    /// backoff——睡眠时长 = interval × [`backoff_multiplier`]（Go 固定 interval）。
+    pub fn start(
         &self,
         selector: Arc<dyn OutboundSelector>,
         executor: Arc<dyn ProbeExecutor>,
@@ -84,54 +100,69 @@ impl Observer {
             return Err(ObservatoryError::AlreadyStarted);
         }
         if self.config.subject_selector.is_empty() {
-            // 与 Go 一致：subject_selector 为空时不实际启动 background
-            g.started = false;
+            // 与 Go 一致（observer.go:50）：subject_selector 为空时不启动 background
             return Ok(());
         }
         g.started = true;
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        g.cancel_tx = Some(cancel_tx);
         drop(g);
 
-        let config = self.config.clone();
+        let interval_ms = self.config.effective_probe_interval_ms() as u64;
+        let subject_selector = self.config.subject_selector.clone();
         let status = self.status.clone();
-        let interval_ms = config.effective_probe_interval_ms();
-        let subject_selector = config.subject_selector.clone();
 
         tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_millis(interval_ms as u64));
-            // 第一次也等待完整 interval（与 Go time.After 行为一致）
-            ticker.tick().await;
-
+            let mut cancel_rx = cancel_rx;
+            let mut fail_streak: u32 = 0;
             loop {
-                let tags = match selector.select(&subject_selector) {
-                    Ok(t) => t,
+                let round_failed = match selector.select(&subject_selector) {
+                    Ok(tags) => {
+                        status.clear_removed(&tags);
+                        let now = now_unix_secs();
+                        let mut any_alive = false;
+                        for tag in &tags {
+                            let result = executor.probe(tag);
+                            any_alive |= result.alive;
+                            status.update_with_probe_result(tag, &result, now);
+                        }
+                        // tags 非空且无一存活才算失败轮（空列表按正常间隔）
+                        !tags.is_empty() && !any_alive
+                    }
                     Err(e) => {
                         at_error(&e);
-                        ticker.tick().await;
-                        continue;
+                        true
                     }
                 };
 
-                // 先清理已移除的 outbound
-                status.clear_removed(&tags);
-
-                let now = now_unix_secs();
-                for tag in &tags {
-                    let result = executor.probe(tag);
-                    status.update_with_probe_result(tag, &result, now);
+                fail_streak = if round_failed {
+                    fail_streak.saturating_add(1)
+                } else {
+                    0
+                };
+                let delay = Duration::from_millis(interval_ms * backoff_multiplier(fail_streak) as u64);
+                tokio::select! {
+                    // biased：cancel 恒优先——否则 cancel 与 sleep 同时 ready 时
+                    // select 随机选 sleep 分支会多 probe 一轮（close 语义破坏）。
+                    biased;
+                    changed = cancel_rx.changed() => {
+                        let _ = changed; // 关闭或 sender drop 均退出
+                        break;
+                    }
+                    _ = tokio::time::sleep(delay) => {}
                 }
-
-                ticker.tick().await;
             }
         });
 
         Ok(())
     }
 
-    /// 标记为已停止。
+    /// 停止后台探测循环（对应 Go `Observer.Close()` → finished.Close()）。
     pub fn close(&self) -> Result<(), ObservatoryError> {
         let mut g = self.state.lock();
-        if !g.started {
-            return Ok(());
+        if let Some(tx) = g.cancel_tx.take() {
+            let _ = tx.send(true);
         }
         g.started = false;
         Ok(())
@@ -236,6 +267,43 @@ impl ProbeExecutor for FixedProbeExecutor {
     }
 }
 
+/// 计数 ProbeExecutor：测试用，统计 probe 调用次数。
+#[cfg(test)]
+pub(crate) struct CountingProbeExecutor {
+    count: std::sync::atomic::AtomicUsize,
+    alive: bool,
+}
+
+#[cfg(test)]
+impl CountingProbeExecutor {
+    pub(crate) fn new(alive: bool) -> Self {
+        Self {
+            count: std::sync::atomic::AtomicUsize::new(0),
+            alive,
+        }
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+impl ProbeExecutor for CountingProbeExecutor {
+    fn probe(&self, _tag: &str) -> ProbeResult {
+        self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ProbeResult {
+            alive: self.alive,
+            delay: if self.alive { 10 } else { 0 },
+            last_error_reason: if self.alive {
+                String::new()
+            } else {
+                "counting fixture failure".into()
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,7 +326,7 @@ mod tests {
         let o = Observer::new(cfg_with_selector(&["a"]));
         let selector = Arc::new(NoopOutboundSelector::new(vec!["a".into()]));
         let executor = Arc::new(FixedProbeExecutor::new());
-        o.start(selector, executor).await.unwrap();
+        o.start(selector, executor).unwrap();
         assert!(o.is_started());
     }
 
@@ -267,7 +335,7 @@ mod tests {
         let o = Observer::new(ObservatoryConfig::default());
         let selector = Arc::new(NoopOutboundSelector::new(vec![]));
         let executor = Arc::new(FixedProbeExecutor::new());
-        o.start(selector, executor).await.unwrap();
+        o.start(selector, executor).unwrap();
         assert!(!o.is_started()); // subject_selector 空
     }
 
@@ -276,8 +344,8 @@ mod tests {
         let o = Observer::new(cfg_with_selector(&["a"]));
         let selector = Arc::new(NoopOutboundSelector::new(vec!["a".into()]));
         let executor = Arc::new(FixedProbeExecutor::new());
-        o.start(selector.clone(), executor.clone()).await.unwrap();
-        let err = o.start(selector, executor).await.unwrap_err();
+        o.start(selector.clone(), executor.clone()).unwrap();
+        let err = o.start(selector, executor).unwrap_err();
         assert!(matches!(err, ObservatoryError::AlreadyStarted));
     }
 
@@ -286,9 +354,66 @@ mod tests {
         let o = Observer::new(cfg_with_selector(&["a"]));
         let selector = Arc::new(NoopOutboundSelector::new(vec!["a".into()]));
         let executor = Arc::new(FixedProbeExecutor::new());
-        o.start(selector, executor).await.unwrap();
+        o.start(selector, executor).unwrap();
         o.close().unwrap();
         assert!(!o.is_started());
+    }
+
+    fn fast_cfg() -> ObservatoryConfig {
+        ObservatoryConfig {
+            subject_selector: vec!["a".into()],
+            probe_interval: 50,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn start_spawns_probe_loop_writes_samples() {
+        let o = Observer::new(fast_cfg());
+        let executor = Arc::new(CountingProbeExecutor::new(true));
+        o.start(
+            Arc::new(NoopOutboundSelector::new(vec!["a".into()])),
+            executor.clone(),
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            executor.count() >= 2,
+            "probe loop should run repeatedly, got {}",
+            executor.count()
+        );
+        let obs = o.get_observation();
+        assert!(obs.status.iter().any(|s| s.outbound_tag == "a" && s.alive));
+    }
+
+    #[tokio::test]
+    async fn close_cancels_probe_loop() {
+        let o = Observer::new(fast_cfg());
+        let executor = Arc::new(CountingProbeExecutor::new(true));
+        o.start(
+            Arc::new(NoopOutboundSelector::new(vec!["a".into()])),
+            executor.clone(),
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(executor.count() >= 1);
+        o.close().unwrap();
+        let frozen = executor.count();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            executor.count(),
+            frozen,
+            "probe loop must stop after close"
+        );
+    }
+
+    #[test]
+    fn backoff_multiplier_linear_capped() {
+        assert_eq!(backoff_multiplier(0), 1);
+        assert_eq!(backoff_multiplier(1), 2);
+        assert_eq!(backoff_multiplier(2), 3);
+        assert_eq!(backoff_multiplier(7), 8);
+        assert_eq!(backoff_multiplier(100), 8, "capped at 8x");
     }
 
     #[test]

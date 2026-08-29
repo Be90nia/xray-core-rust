@@ -332,7 +332,8 @@ fn policy_factory() -> FeatureFactory {
 /// → [`ObservatoryFeature`](xray_app_observatory::ObservatoryFeature)。
 ///
 /// 对应 Go `app/observatory` 的 `init()` + `New(ctx, config)`。
-/// 探测循环暂不启动（需 OutboundSelector + ProbeExecutor 注入）。
+/// 探测循环：装配阶段 `set_io(selector, executor)` 后由 `Feature::start` 启动
+/// （factory 时无 outbound.Manager/dispatcher 可取，对应 Go RequireFeatures）。
 fn observatory_factory() -> FeatureFactory {
     Arc::new(|data: &[u8]| {
         let json_cfg: xray_conf::app_config::ObservatoryConfig =
@@ -357,8 +358,9 @@ fn observatory_factory() -> FeatureFactory {
 /// Metrics app 真实 factory：解析 JSON → proto Config →
 /// [`xray_app_metrics::MetricsConfig`] → [`MetricsFeature`](xray_app_metrics::MetricsFeature)。
 ///
-/// 对应 Go `app/metrics` 的 `init()` + `New(ctx, config)`。
-/// HTTP listener 暂不启动（需 MetricsHttpServer + StatsCollector 注入）。
+/// 对应 Go `app/metrics` 的 `init()` + `New(ctx, config)` + `Handler.Start()`。
+/// `Feature::start` 调用时启动 [`xray_app_metrics::TokioHttpServer`] 绑 `MetricsConfig::listen`
+/// 端口并 `tokio::spawn` accept loop，`GET /metrics` 返回 Prometheus exposition format。
 fn metrics_factory() -> FeatureFactory {
     Arc::new(|data: &[u8]| {
         let json_cfg: xray_conf::app_config::MetricsConfig =
