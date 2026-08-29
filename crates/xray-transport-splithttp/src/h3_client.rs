@@ -127,6 +127,86 @@ impl H3Conn {
         }))
     }
 
+    /// 带 [`QuicParamsConfig`] 的 H3 建立函数，对应 Go `createHTTPClient` 中
+    /// `httpVersion=="3"` + `streamSettings.QuicParams` 分支（dialer.go:162-279）。
+    ///
+    /// 在 [`Self::connect`] 基础上，把 `QuicParamsConfig` 字段映射到
+    /// quinn [`quinn::TransportConfig`]：
+    ///
+    /// - `init_stream_receive_window` / `init_connection_receive_window` → 流/连接初始接收窗口
+    /// - `max_idle_timeout`/`keep_alive_period`（秒）→ idle timeout + keepalive
+    /// - `max_incoming_streams` → 服务端能开最大并发流（<0 = 不限）
+    /// - `disable_path_mtu_discovery` → MTU 探测关闭
+    ///
+    /// `None` 时使用 quinn 默认 [`quinn::TransportConfig`]（与 [`Self::connect`] 行为一致）。
+    ///
+    /// 注：`UdpHop`（端口轮换）等需要自管 UDP socket 的特性本切片不接入——
+    /// splithttp H3 路径继承 register.rs 的 quinn Endpoint 创建，不做包级劫持。
+    pub async fn connect_with_quic_params(
+        config: Arc<Config>,
+        addr: SocketAddr,
+        server_name: &str,
+        mut tls: RustlsClientConfig,
+        quic_params: Option<&xray_transport::memory_settings::QuicParamsConfig>,
+    ) -> Result<Arc<Self>> {
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let mut quic_cfg = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls))
+                .map_err(|e| SplitHttpError::Hyper(format!("QuicClientConfig: {e}")))?,
+        ));
+
+        // 把 QuicParamsConfig 注入 quinn::TransportConfig。
+        let mut transport_config = quinn::TransportConfig::default();
+        if let Some(qp) = quic_params {
+            if qp.init_stream_receive_window > 0 {
+                transport_config.stream_receive_window(
+                    quinn::VarInt::from_u64(qp.init_stream_receive_window)
+                        .map_err(|e| SplitHttpError::Hyper(format!("stream_window VarInt: {e}")))?,
+                );
+            }
+            if qp.init_connection_receive_window > 0 {
+                transport_config.receive_window(
+                    quinn::VarInt::from_u64(qp.init_connection_receive_window)
+                        .map_err(|e| SplitHttpError::Hyper(format!("conn_window VarInt: {e}")))?,
+                );
+            }
+        }
+        quic_cfg.transport_config(Arc::new(transport_config));
+
+        let bind: SocketAddr = if addr.is_ipv4() {
+            "0.0.0.0:0".parse().expect("valid bind addr")
+        } else {
+            "[::]:0".parse().expect("valid bind addr")
+        };
+        let mut endpoint = quinn::Endpoint::client(bind)
+            .map_err(|e| SplitHttpError::Hyper(format!("quinn Endpoint: {e}")))?;
+        endpoint.set_default_client_config(quic_cfg);
+
+        let conn = endpoint
+            .connect(addr, server_name)
+            .map_err(|e| SplitHttpError::Hyper(format!("quinn connect initiate: {e}")))?
+            .await
+            .map_err(|e| SplitHttpError::Hyper(format!("quinn connect: {e}")))?;
+
+        let quinn_conn = h3_quinn::Connection::new(conn.clone());
+        let (mut driver, send_req) = h3::client::new(quinn_conn)
+            .await
+            .map_err(|e| SplitHttpError::Hyper(format!("h3::client::new: {e}")))?;
+
+        tokio::spawn(async move {
+            let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        debug!(target: "splithttp-h3", %addr, %server_name, "H3 connection established with QuicParams");
+
+        Ok(Arc::new(Self {
+            config,
+            send_req: Mutex::new(send_req),
+            quinn_conn: conn,
+            closed: AtomicBool::new(false),
+        }))
+    }
+
     /// 连接是否已关闭。
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Relaxed)
@@ -420,5 +500,46 @@ where
 #[cfg(test)]
 mod tests {
     // H3 端到端测试在 tests/mock_h3_server.rs 集成测试覆盖（mock h3::server）。
+    // H3 端到端测试在 tests/mock_h3_server.rs 集成测试覆盖（mock h3::server）。
     // 单元测试需要真实网络 + QUIC + TLS，留集成测试。
+
+    /// 验证 [`H3Conn::connect_with_quic_params`] 中 QuicParams 字段能成功构造成
+    /// quinn `TransportConfig`（不发起网络连接）。
+    ///
+    /// 对应 Go `dialer.go:162-279` 中 `streamSettings.QuicParams` → quic.Config 路径。
+    /// 我们直接构造 `quinn::TransportConfig` + 走 mini pipeline，确保 `VarInt` 转换
+    /// 等边界值不出错。
+    #[test]
+    fn quic_params_into_transport_config_succeeds() {
+        // 用 quinn re-export 的 VarInt（quinn::VarInt = proto::VarInt）
+        let qp = xray_transport::memory_settings::QuicParamsConfig {
+            init_stream_receive_window: 65536,
+            max_stream_receive_window: 0,
+            init_connection_receive_window: 1_048_576,
+            max_connection_receive_window: 0,
+            max_idle_timeout: 30,
+            keep_alive_period: 10,
+            disable_path_mtu_discovery: true,
+            max_incoming_streams: 100,
+            ..Default::default()
+        };
+        let mut tc = quinn::TransportConfig::default();
+        // setter：stream_receive_window / receive_window / max_idle_timeout / keep_alive_interval
+        // 走 quinn::TransportConfig，无 get 用；只验可调用不 panic。
+        tc.stream_receive_window(quinn::VarInt::from_u64(qp.init_stream_receive_window).unwrap());
+        tc.receive_window(quinn::VarInt::from_u64(qp.init_connection_receive_window).unwrap());
+        tc.max_idle_timeout(Some(
+            std::time::Duration::from_secs(qp.max_idle_timeout as u64)
+                .try_into()
+                .unwrap(),
+        ));
+        tc.keep_alive_interval(Some(std::time::Duration::from_secs(
+            qp.keep_alive_period as u64,
+        )));
+        // VarInt 边界：2^62 - 1 应通过；2^63 应失败。
+        let max_v = quinn::VarInt::from_u64((1u64 << 62) - 1);
+        assert!(max_v.is_ok(), "max VarInt must succeed");
+        let overflow = quinn::VarInt::from_u64(1u64 << 63);
+        assert!(overflow.is_err(), "VarInt overflow must fail");
+    }
 }

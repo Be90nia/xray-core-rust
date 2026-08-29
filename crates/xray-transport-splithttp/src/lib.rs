@@ -37,6 +37,7 @@ pub mod h1_conn;
 pub mod h3_client;
 pub mod hub;
 pub mod mux;
+pub mod batched_upload;
 pub mod upload_queue;
 pub mod xpadding;
 pub mod transport;

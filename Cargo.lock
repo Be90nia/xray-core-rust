@@ -5771,15 +5771,21 @@ dependencies = [
 name = "xray-app-reverse"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "parking_lot",
+ "prost",
  "rand 0.9.4",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "tracing",
+ "xray-app-dispatcher",
+ "xray-buf",
  "xray-common",
  "xray-features",
+ "xray-mux",
  "xray-proto",
+ "xray-transport",
  "yamux",
 ]
 
@@ -6668,6 +6674,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
+ "parking_lot",
  "quinn",
  "rand 0.9.4",
  "rcgen 0.13.2",

@@ -258,6 +258,54 @@ impl<C: XmuxConn + 'static> XmuxManager<C> {
     }
 }
 
+// ===== 切片 v7w9: 进程全局 XmuxManager 池 =====
+
+use std::collections::HashMap;
+use parking_lot::Mutex as PMutex;
+
+/// 进程级 `XmuxManager` 缓存——按 string key 缓存 `Arc<XmuxManager<C>>`。
+///
+/// 对应 Go `transport/internet/splithttp/dialer.go:46-79` 的 `globalDialerMap`
+/// （按 dialerConf{dest, streamSettings} 复用）。Rust 端用 `String` 作为通用 key。
+pub struct ManagerPool<C: XmuxConn + 'static> {
+    map: PMutex<HashMap<String, Arc<XmuxManager<C>>>>,
+}
+
+impl<C: XmuxConn + 'static> ManagerPool<C> {
+    pub fn new() -> Self {
+        Self { map: PMutex::new(HashMap::new()) }
+    }
+
+    /// 获取或创建并缓存 manager。
+    pub fn get_or<F>(&self, key: &str, mk: F) -> Arc<XmuxManager<C>>
+    where
+        F: FnOnce() -> Arc<XmuxManager<C>>,
+    {
+        let mut g = self.map.lock();
+        if let Some(m) = g.get(key) {
+            return m.clone();
+        }
+        let m = mk();
+        g.insert(key.to_string(), m.clone());
+        m
+    }
+
+    /// 测试用：当前池条目数。
+    pub fn len(&self) -> usize {
+        self.map.lock().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.lock().is_empty()
+    }
+}
+
+impl<C: XmuxConn + 'static> Default for ManagerPool<C> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,5 +538,35 @@ mod tests {
         // 已为 0 时不再减（fetch_update 返回 None）
         client.dec_left_requests();
         assert_eq!(client.left_requests(), 0);
+    }
+
+    /// `ManagerPool<FakeConn>::get_or`：同 key 返回同一 manager。
+    /// 对应 Go `globalDialerMap` 的语义（dialer.go:46-79）。
+    #[test]
+    fn manager_pool_returns_same_manager_for_same_key() {
+        let pool: ManagerPool<FakeConn> = ManagerPool::new();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let cc = counter.clone();
+        let mk = move || {
+            let n = cc.fetch_add(1, Ordering::SeqCst);
+            Arc::new(XmuxManager::new(XmuxConfig::default(), move || {
+                FakeConn::new(n)
+            }))
+        };
+
+        let m1 = pool.get_or("host:port:cfg", mk);
+        let same_ref: Arc<XmuxManager<FakeConn>> = pool.get_or("host:port:cfg", || {
+            panic!("factory must not be called for existing key");
+        });
+        let _ = same_ref;
+        // 内部 Arc 一致
+        assert!(Arc::ptr_eq(&m1, &same_ref));
+
+        // 不同 key 新建
+        let m2 = pool.get_or("other:port:cfg", || {
+            Arc::new(XmuxManager::new(XmuxConfig::default(), || FakeConn::new(999)))
+        });
+        assert!(!Arc::ptr_eq(&m1, &m2));
+        assert_eq!(pool.len(), 2);
     }
 }

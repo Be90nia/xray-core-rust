@@ -36,6 +36,7 @@ h3-quinn.workspace = true
 h2 = "0.4"
 quinn.workspace = true
 rand = { workspace = true }
+parking_lot = { workspace = true }
 tokio-util = "0.7"
 tokio-stream = "0.1"
 base64 = "0.22"
