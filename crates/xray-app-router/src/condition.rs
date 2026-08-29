@@ -432,7 +432,15 @@ fn find_process(source_ip: std::net::IpAddr, source_port: u16) -> Option<Process
     {
         proc_windows::find_process(source_ip, source_port)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    {
+        proc_macos::find_process(source_ip, source_port)
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        proc_freebsd::find_process(source_ip, source_port)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos", target_os = "freebsd")))]
     {
         let _ = (source_ip, source_port);
         None
@@ -689,6 +697,307 @@ mod proc_windows {
     }
 }
 
+
+/// lsof -F 输出解析器（纯文本，与平台无关）。
+///
+/// proc_macos::find_process 调 /usr/sbin/lsof 取原始字节流；
+/// 这里抽出 parse 逻辑便于在所有平台单测（不依赖 macOS shell-out）。
+///
+/// 输入格式（man lsof FIELD OUTPUT）：每行 <tag><value> 单字符前缀：
+/// - p<pid>：进程 ID
+/// - c<command>：进程命令名
+/// - i<local-addr>:<local-port>-<remote-addr>:<remote-port>：internet socket
+///
+/// 匹配语义：给定 (source_ip, source_port)，找出 i 行 local endpoint 等于该 (ip, port) 的第一个 PID。
+#[allow(dead_code)] // 仅 macOS proc_macos + tests 使用；其它平台构建时警告关闭
+mod lsof_parser {
+    use super::ProcessInfo;
+    use std::net::IpAddr;
+
+    pub(super) fn parse_lsof_output(
+        raw: &[u8],
+        want_ip: IpAddr,
+        want_port: u16,
+    ) -> Option<ProcessInfo> {
+        let text = std::str::from_utf8(raw).ok()?;
+        let mut cur_pid: Option<u32> = None;
+        let mut cur_cmd: Option<String> = None;
+        for line in text.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            let (tag, rest) = line.split_at(1);
+            match tag {
+                "p" => {
+                    cur_pid = rest.parse::<u32>().ok();
+                    cur_cmd = None;
+                }
+                "c" => {
+                    cur_cmd = Some(rest.to_string());
+                }
+                "i" => {
+                    if let Some(pid) = cur_pid {
+                        if lsof_line_matches(rest, want_ip, want_port) {
+                            let cmd = cur_cmd.unwrap_or_default();
+                            return Some(ProcessInfo {
+                                name: cmd,
+                                exe_path: String::new(),
+                                pid,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// lsof `-F` `i` 行内容（去掉前缀 `i`）：形如 `TCPv4:1.2.3.4:54321-5.6.7.8:80` 或 `TCPv4:*:22-LISTEN`。
+    /// 委托给 [`endpoint_matches`]。
+    fn lsof_line_matches(rest: &str, want_ip: IpAddr, want_port: u16) -> bool {
+        endpoint_matches(rest, want_ip, want_port)
+    }
+
+
+    fn endpoint_matches(ep: &str, want_ip: IpAddr, want_port: u16) -> bool {
+        // ep 形如 "TCPv4:1.2.3.4:54321-5.6.7.8:80"（lsof -F i 行去掉 'i' 前缀）。
+        // 1) 剥协议前缀（第一个 ':' 之前为协议名）。
+        let Some(colon_pos) = ep.find(':') else {
+            return false;
+        };
+        let after_proto = &ep[colon_pos + 1..];
+        // 2) split at last '-' 区分 local / remote；rfind 避免 IP 含 '-'（IPv6 无 '-'）。
+        let Some(dash_pos) = after_proto.rfind('-') else {
+            // LISTEN 之类无 remote：local = after_proto。
+            return parse_addr_port(after_proto)
+                .is_some_and(|(ip, port)| ip == want_ip && port == want_port);
+        };
+        let local = &after_proto[..dash_pos];
+        parse_addr_port(local)
+            .is_some_and(|(ip, port)| ip == want_ip && port == want_port)
+    }
+
+    /// 解析 `<addr>:<port>`（IPv6 不带括号；lsof -F 输出对 IPv6 用 `[addr]:port`）。
+    /// IPv6 在 lsof -F 中是 `[xxxx]:port` 形式；用 '[' 起始当作 v6。
+    fn parse_addr_port(s: &str) -> Option<(IpAddr, u16)> {
+        if let Some(rest) = s.strip_prefix('[') {
+            // IPv6: [xxxx]:port
+            let Some(bracket) = rest.find(']') else { return None; };
+            let addr_str = &rest[..bracket];
+            let after = &rest[bracket + 1..];
+            let port_str = after.strip_prefix(':')?;
+            let port = port_str.parse::<u16>().ok()?;
+            let ip = addr_str.parse::<IpAddr>().ok()?;
+            Some((ip, port))
+        } else {
+            // IPv4: <addr>:<port>；v4 addr 无 ':'，用最后一个 ':' 分。
+            let Some(colon_pos) = s.rfind(':') else { return None; };
+            let addr_str = &s[..colon_pos];
+            let port_str = &s[colon_pos + 1..];
+            let port = port_str.parse::<u16>().ok()?;
+            let ip = addr_str.parse::<IpAddr>().ok()?;
+            Some((ip, port))
+        }
+    }
+}
+
+ /// macOS lsof shell-out 实现。
+ ///
+ /// 对应 Go find_process_others.go：Go 在 macOS 上明确返回 process lookup is not supported。
+ /// Rust 实现调 /usr/sbin/lsof -F pcnTi -i :<port>[@ip] -nP 取机器可读输出，
+ /// 解析委托给 lsof_parser 模块。
+#[cfg(target_os = "macos")]
+mod proc_macos {
+    use super::lsof_parser::parse_lsof_output;
+    use std::net::IpAddr;
+    use std::process::Command;
+
+    pub(super) fn find_process(source_ip: IpAddr, source_port: u16) -> Option<super::ProcessInfo> {
+        let port_filter = format!(":{source_port}");
+        let ip_filter = match source_ip {
+            IpAddr::V4(v4) => Some(format!("@{}", v4)),
+            IpAddr::V6(v6) => Some(format!("@{}", v6)),
+        };
+        let mut args: Vec<&str> = vec!["-nP", "-F", "pcTi", "-i", &port_filter];
+        if let Some(ip) = &ip_filter {
+            args.insert(4, ip);
+        }
+        let output = Command::new("/usr/sbin/lsof").args(&args).output().ok()?;
+        if !output.status.success() && output.status.code() != Some(1) {
+            return None;
+        }
+        parse_lsof_output(&output.stdout, source_ip, source_port)
+    }
+}
+
+
+
+/// FreeBSD libprocstat 实现。
+///
+/// 对应 Go `find_process_others.go`：Go 在 FreeBSD 上同样明确返回
+/// "process lookup is not supported on this platform"。Rust 实现走
+/// `<libprocstat.h>`（FreeBSD 13+ 标准）：`procstat_open_sysctl` → 对每个 PID
+/// `procstat_getprocs(KERN_PROC_PID, pid)` → `procstat_getfiles` 列 fd → 筛
+/// `PS_FTYPE_SOCKET` → `procstat_get_socket_info` 读 `sockstat.ss_laddr`/`ss_lport`
+/// 与目标 local endpoint 比对。
+#[cfg(target_os = "freebsd")]
+mod proc_freebsd {
+    use super::ProcessInfo;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use libc::{
+        procstat_close, procstat_freefiles, procstat_freeprocs, procstat_getfiles,
+        procstat_getprocs, procstat_get_socket_info, procstat_open_sysctl,
+    };
+
+    /// `<sys/proc.h>` `PS_FTYPE_SOCKET = 2`（libc 未导出，本地固定）。
+    /// 见 `https://github.com/freebsd/freebsd-src/blob/main/sys/sys/proc.h`。
+    const PS_FTYPE_SOCKET: i32 = 2;
+
+    /// `<sys/socket.h>` 地址族。
+    const AF_INET: libc::sa_family_t = 2;
+    const AF_INET6: libc::sa_family_t = 28; // FreeBSD 值
+
+    /// `procstat_get_socket_info` errbuf 长度（`<libprocstat.h>` 写 1024）。
+    const ERRBUF_LEN: usize = 1024;
+
+    pub(super) fn find_process(source_ip: IpAddr, source_port: u16) -> Option<ProcessInfo> {
+        let ps = unsafe { procstat_open_sysctl() };
+        if ps.is_null() {
+            return None;
+        }
+        let result = scan_all_pids(ps, source_ip, source_port);
+        unsafe { procstat_close(ps) };
+        result
+    }
+
+    fn scan_all_pids(
+        ps: *mut libc::procstat,
+        source_ip: IpAddr,
+        source_port: u16,
+    ) -> Option<ProcessInfo> {
+        // 取全进程表。
+        let mut cnt: libc::c_uint = 0;
+        let kp = unsafe { procstat_getprocs(ps, libc::KERN_PROC_ALL, 0, &mut cnt) };
+        if kp.is_null() || cnt == 0 {
+            if !kp.is_null() {
+                unsafe { procstat_freeprocs(ps, kp) };
+            }
+            return None;
+        }
+        let mut hit: Option<ProcessInfo> = None;
+        let procs = unsafe { std::slice::from_raw_parts(kp, cnt as usize) };
+        for p in procs {
+            let pid = p.ki_pid as u32;
+            if pid <= 0 {
+                continue;
+            }
+            // 取该 PID 的 fd 链表头。
+            let files_head = unsafe { procstat_getfiles(ps, p as *const _ as *mut _, 0) };
+            if files_head.is_null() {
+                continue;
+            }
+            // 遍历 STAILQ（filestat.next.stqe_next 串联）。
+            let mut cur = unsafe { (*files_head).stqh_first };
+            while !cur.is_null() {
+                let f: &libc::filestat = unsafe { &*cur };
+                if f.fs_type == PS_FTYPE_SOCKET {
+                    let mut ss: libc::sockstat = unsafe { std::mem::zeroed() };
+                    let mut errbuf = [0i8; ERRBUF_LEN];
+                    let rc = unsafe {
+                        procstat_get_socket_info(ps, cur, &mut ss, errbuf.as_mut_ptr())
+                    };
+                    if rc == 0 && socket_matches(&ss, source_ip, source_port) {
+                        hit = read_process_info(pid);
+                        break;
+                    }
+                }
+                cur = unsafe { (*cur).next.stqe_next };
+            }
+            unsafe { procstat_freefiles(ps, files_head) };
+            if hit.is_some() {
+                break;
+            }
+        }
+        unsafe { procstat_freeprocs(ps, kp) };
+        hit
+    }
+
+    /// 从 `sockstat.sa_local: sockaddr_storage` 解 (family, addr, port) 比对。
+    fn socket_matches(ss: &libc::sockstat, want_ip: IpAddr, want_port: u16) -> bool {
+        // sockaddr_storage 布局：offset 0 = ss_len (u8), offset 1 = ss_family (sa_family_t=u8 on FreeBSD).
+        // ss_len 头 1 字节：FreeBSD sockaddr_storage 与 sockaddr_in/in6 头字段一致，
+        // 直接按 sockaddr_in/sockaddr_in6 解释。
+        let raw: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                &ss.sa_local as *const _ as *const u8,
+                std::mem::size_of::<libc::sockaddr_storage>(),
+            )
+        };
+        let len = raw[0] as usize;
+        if len < 2 {
+            return false;
+        }
+        // sa_family_t 在 BSD 系统上是 u8。
+        let family = raw[1] as libc::sa_family_t;
+        match (family, want_ip) {
+            (AF_INET, IpAddr::V4(v4)) => {
+                // sockaddr_in { u8 sin_len; u8 sin_family; u16 sin_port; struct in_addr sin_addr; }
+                if len < 8 {
+                    return false;
+                }
+                let port = u16::from_be_bytes([raw[2], raw[3]]);
+                if port != want_port {
+                    return false;
+                }
+                let addr = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]);
+                let have = Ipv4Addr::from(addr);
+                have == v4
+            }
+            (AF_INET6, IpAddr::V6(v6)) => {
+                // sockaddr_in6 { u8 sin6_len; u8 sin6_family; u16 sin6_port; u32 sin6_flowinfo;
+                //                  struct in6_addr sin6_addr; u32 sin6_scope_id; }
+                if len < 24 {
+                    return false;
+                }
+                let port = u16::from_be_bytes([raw[2], raw[3]]);
+                if port != want_port {
+                    return false;
+                }
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&raw[8..24]);
+                let have = Ipv6Addr::from(octets);
+                have == v6
+            }
+            _ => false,
+        }
+    }
+
+    /// sysinfo 兜底取进程名/exe。
+    fn read_process_info(pid: u32) -> Option<ProcessInfo> {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes(
+            sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
+            true,
+        );
+        let proc = sys.process(sysinfo::Pid::from_u32(pid))?;
+        let name = proc.name().to_string_lossy().into_owned();
+        let exe_path = proc.exe().map_or(String::new(), |p| p.to_string_lossy().into_owned());
+        if name.is_empty() && exe_path.is_empty() {
+            return None;
+        }
+        Some(ProcessInfo { name, exe_path, pid })
+    }
+
+    #[cfg(test)]
+    pub(super) fn socket_matches_for_test(ss: &libc::sockstat, ip: IpAddr, port: u16) -> bool {
+        socket_matches(ss, ip, port)
+    }
+}
+
+
+
 /// 获取当前进程信息。
 fn current_process_info() -> Option<ProcessInfo> {
     let mut sys = sysinfo::System::new();
@@ -794,6 +1103,7 @@ mod tests {
     use crate::context::RoutingData;
     use std::net::Ipv4Addr;
     use xray_common::net::port::PortRange;
+
 
     fn ctx_target_domain(d: &str) -> RoutingData {
         RoutingData::new().with_target_domain(d)
@@ -1110,13 +1420,13 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos", target_os = "freebsd"))]
         {
             let info = info.expect("find_process 应能解析本进程 loopback 连接");
             assert_eq!(info.pid, std::process::id(), "应解析到本测试进程");
             assert!(!info.name.is_empty(), "进程名不应为空");
         }
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos", target_os = "freebsd")))]
         {
             assert!(info.is_none(), "未支持平台应返回 None");
         }
@@ -1124,4 +1434,147 @@ mod tests {
         drop(server);
         drop(client);
     }
+
+    // ── lsof (macOS) 解析器单元测试 ──
+    // 纯文本解析，与平台 FFI 无关；macOS+FreeBSD+Windows 全部能跑。
+
+    #[test]
+    fn test_macos_lsof_parser_extracts_pid_and_command() {
+        let raw = b"p1234\nccurl\ntiPv4\niTCPv4:1.2.3.4:54321-5.6.7.8:80\n";
+        let info = lsof_parser::parse_lsof_output(
+            raw,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
+            54321,
+        );
+        let info = info.expect("lsof 解析应命中");
+        assert_eq!(info.pid, 1234);
+        assert_eq!(info.name, "curl");
+    }
+
+    #[test]
+    fn test_macos_lsof_parser_no_match() {
+        let raw = b"p1234\nccurl\ntiPv4\niTCPv4:1.2.3.4:11111-5.6.7.8:80\n";
+        let info = lsof_parser::parse_lsof_output(
+            raw,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
+            54321,
+        );
+        assert!(info.is_none());
+    }
+
+    #[test]
+    fn test_macos_lsof_parser_multi_pid_first_hit() {
+        let raw = b"\
+p111\ncnope\ntiPv4\niTCPv4:9.9.9.9:11111-1.1.1.1:80\n\
+p222\ncmatch\ntiPv4\niTCPv4:1.2.3.4:54321-5.6.7.8:80\n\
+";
+        let info = lsof_parser::parse_lsof_output(
+            raw,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
+            54321,
+        );
+        let info = info.expect("第二个 PID 应匹配");
+        assert_eq!(info.pid, 222);
+        assert_eq!(info.name, "match");
+    }
+
+    #[test]
+    fn test_macos_lsof_parser_ipv6() {
+        let raw = b"p9001\nctest\ntiPv6\niTCPv6:[2001:db8::1]:443-2001:db8::2:54321\n";
+        let info = lsof_parser::parse_lsof_output(
+            raw,
+            std::net::IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            443,
+        );
+        let info = info.expect("IPv6 端点应匹配");
+        assert_eq!(info.pid, 9001);
+    }
+
+    #[test]
+    fn test_macos_lsof_parser_wildcard_listen_no_match() {
+        let raw = b"p333\ncsshd\ntiPv4\niTCPv4:*:22-LISTEN\n";
+        let info = lsof_parser::parse_lsof_output(
+            raw,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            22,
+        );
+        assert!(info.is_none(), "通配符端点不应匹配具体 IP");
+    }
+
+
+    // ── FreeBSD sockstat 解析器 mock 测试（仅 freebsd 编译运行） ──
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn test_freebsd_sockstat_matches_v4_endpoint() {
+        // 手工构造 sockaddr_storage：len(1) + family(1) + port(2) + addr(4) = 8 bytes。
+        let ss: libc::sockstat = unsafe { std::mem::zeroed() };
+        // sa_local 头 8 字节：len=16（sizeof sockaddr_in），family=2（AF_INET），port=0xD431（54321 BE），
+        // addr=1.2.3.4（network byte order = 0x01020304）。
+        let raw = [
+            16u8, 2u8, 0xD4, 0x31, 0x01, 0x02, 0x03, 0x04,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let raw_ptr = raw.as_ptr() as *const u8;
+        let sa_ptr = &ss.sa_local as *const _ as *mut u8;
+        unsafe {
+            std::ptr::copy_nonoverlapping(raw_ptr, sa_ptr, raw.len());
+        }
+        assert!(proc_freebsd::socket_matches_for_test(
+            &ss,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
+            54321
+        ));
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn test_freebsd_sockstat_no_match_on_port_mismatch() {
+        let ss: libc::sockstat = unsafe { std::mem::zeroed() };
+        let raw = [
+            16u8, 2u8, 0xD4, 0x31, 0x01, 0x02, 0x03, 0x04,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let raw_ptr = raw.as_ptr() as *const u8;
+        let sa_ptr = &ss.sa_local as *const _ as *mut u8;
+        unsafe {
+            std::ptr::copy_nonoverlapping(raw_ptr, sa_ptr, raw.len());
+        }
+        // 端口不匹配（want 54322 vs real 54321）→ 不应命中
+        assert!(!proc_freebsd::socket_matches_for_test(
+            &ss,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
+            54322
+        ));
+    }
+
 }
+
