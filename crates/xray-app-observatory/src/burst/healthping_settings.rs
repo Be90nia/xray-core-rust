@@ -3,10 +3,14 @@
 //! 对应 Go `app/observatory/burst/healthping.go` 的 `HealthPingSettings` + `NewHealthPing`。
 
 use crate::error::ObservatoryError;
+use serde::{Deserialize, Serialize};
 use xray_proto::xray::core::app::observatory::burst::HealthPingConfig as ProtoHealthPingConfig;
 
 /// HealthPingConfig，对应 proto `HealthPingConfig`。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// JSON 字段命名采用 camelCase 对齐 Go proto（`samplingCount` / `httpMethod`）。
+/// 缺失字段用 `Default::default()`（空字符串 / 0）——proto 默认零值语义。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct HealthPingConfig {
     pub destination: String,
     pub connectivity: String,

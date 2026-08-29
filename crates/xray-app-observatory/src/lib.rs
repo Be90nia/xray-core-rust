@@ -17,6 +17,7 @@
 //! - [`observer::Observer`]：探测编排
 
 pub mod burst;
+pub mod burst_feature;
 pub mod command;
 pub mod config;
 pub mod error;
@@ -24,7 +25,6 @@ pub mod error_collector;
 pub mod feature;
 pub mod observer;
 pub mod status;
-
 pub use burst::{
     burst_observer::BurstObserver,
     healthping_settings::{HealthPingConfig, HealthPingSettings},
@@ -45,4 +45,5 @@ pub use observer::{
     FixedProbeExecutor, HttpProbeExecutor, NoopOutboundSelector, Observer,
     OutboundSelector, ProbeExecutor, RealOutboundSelector, now_unix_secs,
 };
+pub use burst_feature::BurstObservatoryFeature;
 pub use feature::ObservatoryFeature;

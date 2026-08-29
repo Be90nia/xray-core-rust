@@ -43,7 +43,7 @@ pub fn register_all_features() {
     let _ = registry::register_feature("api", commander_factory());
     let _ = registry::register_feature("fakeDns", fake_dns_factory());
 
-    let _ = registry::register_feature("burstObservatory", simple_feature_factory("burstObservatory"));
+    let _ = registry::register_feature("burstObservatory", burst_observatory_factory());
     let _ = registry::register_feature("version", simple_feature_factory("version"));
     let _ = registry::register_feature("geodata", geodata_factory());
     // Reverse：proto Config 程序化构造（Go v26 已移除 JSON 配置路径，见 reverse_factory）
@@ -358,6 +358,28 @@ fn observatory_factory() -> FeatureFactory {
     })
 }
 
+/// Burst Observatory app 真实 factory：解析 `BurstObservatoryConfig` JSON →
+/// [`BurstObservatoryFeature`](xray_app_observatory::BurstObservatoryFeature)。
+///
+/// 对应 Go `app/observatory/burst` 的 `init()` + `New(ctx, config)`。
+/// 探测循环：装配阶段 `set_io(executor)` 后由 `Feature::start` 启动
+/// scheduler（factory 时无 outbound.Manager/dispatcher 可取，
+/// 对应 Go RequireFeatures）。
+fn burst_observatory_factory() -> FeatureFactory {
+    Arc::new(|data: &[u8]| {
+        let json_cfg: xray_conf::app_config::BurstObservatoryConfig =
+            serde_json::from_slice(data).unwrap_or_default();
+
+        let subject_outbound = json_cfg.subject_outbound.unwrap_or_default();
+        let ping_config = json_cfg.ping_config.as_ref();
+
+        let feature = xray_app_observatory::BurstObservatoryFeature::new(
+            subject_outbound,
+            ping_config,
+        );
+        Ok(Arc::new(feature) as Arc<dyn Feature>)
+    })
+}
 /// Metrics app 真实 factory：解析 JSON → proto Config →
 /// [`xray_app_metrics::MetricsConfig`] → [`MetricsFeature`](xray_app_metrics::MetricsFeature)。
 ///
@@ -707,7 +729,7 @@ fn default_asset_dir() -> PathBuf {
     xray_common::platform::get_resource_path()
 }
 
-/// 为 api/metrics/fakeDns/observatory/burstObservatory/version
+/// 为 api/metrics/version
 /// 创建 SimpleFeature 工厂（实现 Feature trait 的最简 no-op）。
 fn simple_feature_factory(kind: &'static str) -> FeatureFactory {
     let kind = kind.to_string();
@@ -936,6 +958,52 @@ mod tests {
         let feat = registry::create_feature("observatory", json)
             .expect("observatory config should build");
         assert_eq!(feat.feature_name(), "observatory");
+    }
+
+    /// bd f23r：factory 阶段不注入 IO——`init_dependencies` 接到
+    /// `DepBag` 后才注入；subject_selector 非空时 start 会 fail-fast（返
+    /// StartFailed）直到 IO 就绪。
+    #[test]
+    fn observatory_factory_does_not_inject_io_at_construction() {
+        register_all_features();
+        let json =
+            br#"{"subject_outbound": "proxy1", "probe_interval": "30s"}"#;
+        let feat = registry::create_feature("observatory", json)
+            .expect("observatory config should build");
+        // factory 仅构造 ObservatoryFeature，IO 在 init_dependencies 阶段注入。
+        // start 阶段（无 IO + subject_selector 非空）必返 StartFailed。
+        let err = feat.start().expect_err("start must fail without IO injection");
+        assert!(
+            matches!(err, xray_features::FeatureError::StartFailed { name: "observatory", .. }),
+            "expected StartFailed, got: {err:?}"
+        );
+    }
+
+    /// bd f23r：Instance 装配路径——factory 创建的 ObservatoryFeature 经
+    /// `init_dependencies(DepBag)` 注入 IO 后 start 成功。
+    #[test]
+    fn observatory_init_dependencies_wires_io_then_start_succeeds() {
+        use std::sync::Arc;
+        use xray_features::{DepBag, OutboundTagSelector};
+
+        register_all_features();
+        let json =
+            br#"{"subject_outbound": "node1", "probe_url": "http://127.0.0.1:1/", "probe_interval": "60s"}"#;
+        let feat = registry::create_feature("observatory", json)
+            .expect("observatory config should build");
+
+        // 构造一个简单 backend——返回固定 tag 列表。
+        struct EchoBackend;
+        impl OutboundTagSelector for EchoBackend {
+            fn select_by_prefix(&self, p: &[String]) -> Vec<String> {
+                p.to_vec()
+            }
+        }
+        let bag = DepBag::new()
+            .with_outbound_selector(Arc::new(EchoBackend) as Arc<dyn OutboundTagSelector>);
+        feat.init_dependencies(&bag);
+        // 注入后 start 不再 fail-fast（即使探测失败，start 本身 OK）。
+        feat.start().expect("start should succeed after IO injected");
     }
 
     #[test]
