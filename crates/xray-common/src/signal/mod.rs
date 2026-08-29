@@ -13,7 +13,7 @@ use tokio::sync::{watch, Notify, Semaphore as TokioSemaphore};
 ///
 /// 对应 Go 版本 `done.Instance`，通过 `watch` channel 实现
 /// 取消通知，所有等待者会在取消时被唤醒。
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Done {
     cancel_tx: watch::Sender<bool>,
     done_rx: watch::Receiver<bool>,
@@ -64,10 +64,14 @@ impl Default for Done {
 // ========== Notifier ==========
 
 /// 活动通知器，基于 tokio `Notify` 实现。
-///
-/// 用于通知某个事件已发生，等待者会被唤醒。
 pub struct Notifier {
     notify: Arc<Notify>,
+}
+
+impl std::fmt::Debug for Notifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Notifier").finish_non_exhaustive()
+    }
 }
 
 impl Notifier {
@@ -109,6 +113,7 @@ impl Clone for Notifier {
 ///
 /// 对应 Go 版本 `CancelAfterInactivity`，在指定时间内
 /// 没有活动通知时自动取消。
+#[derive(Debug)]
 pub struct ActivityTimer {
     done: Done,
     notifier: Notifier,
@@ -116,7 +121,6 @@ pub struct ActivityTimer {
 }
 
 impl ActivityTimer {
-    /// 创建新的活动计时器，指定超时时间。
     pub fn new(timeout: std::time::Duration) -> Self {
         Self {
             done: Done::new(),
