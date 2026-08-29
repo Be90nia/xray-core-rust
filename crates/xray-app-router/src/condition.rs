@@ -257,18 +257,25 @@ impl Condition for NetworkMatcherCondition {
 
 // ── UserMatcher ──────────────────────────────────────────────
 
-/// 用户匹配器（邮箱/标识）。
+/// 用户匹配器（邮箱/标识，严格等值）。
 ///
-/// 对应 Go `UserMatcher`：ctx user 任一命中 patterns。
-/// pattern 以 `regexp:` 开头时按正则匹配；否则字面包含。
+/// 对应 Go `UserMatcher`：ctx user 与任一 pattern 全等匹配即命中。
+/// pattern 以 `regexp:` 开头时按正则匹配；否则字面 **严格等值**（Go `u == user`），
+/// 不做子串/前缀/包含——子串匹配历史上易误命中，官方亦不推荐。
 pub struct UserMatcherCondition {
     patterns: Vec<UserPattern>,
 }
 
+/// 旧 API 别名：保留历史子串匹配语义以兼容未迁移调用方。
+///
+/// ⚠ 语义与 Go `UserMatcher` 不一致。仅用于兼容历史配置，正式路由请用 `UserMatcherCondition`。
+#[deprecated(note = "substring semantics differ from Go UserMatcher; use UserMatcherCondition")]
+pub type UserMatcherLenient = UserMatcherCondition;
+
 #[derive(Debug)]
 enum UserPattern {
-    /// 字面包含（`patterns.contains(user)`）。
-    Substr(String),
+    /// 字面严格等值（`u == s`，对应 Go `u == user`）。
+    Literal(String),
     /// 正则匹配（去掉 `regexp:` 前缀后编译）。
     Regex(Regex),
 }
@@ -276,14 +283,14 @@ enum UserPattern {
 impl UserMatcherCondition {
     /// 从 proto `user_email` 列表构造。
     ///
-    /// `regexp:` 前缀触发正则模式（编译失败返回错误）。
+    /// `regexp:` 前缀触发正则模式（编译失败返回错误）；其余走严格等值。
     pub fn new(patterns: Vec<String>) -> Result<Self, regex::Error> {
         let mut parsed = Vec::with_capacity(patterns.len());
         for p in patterns {
             if let Some(rest) = p.strip_prefix("regexp:") {
                 parsed.push(UserPattern::Regex(Regex::new(rest)?));
             } else {
-                parsed.push(UserPattern::Substr(p));
+                parsed.push(UserPattern::Literal(p));
             }
         }
         Ok(Self { patterns: parsed })
@@ -297,7 +304,7 @@ impl Condition for UserMatcherCondition {
             return false;
         }
         self.patterns.iter().any(|p| match p {
-            UserPattern::Substr(s) => u.contains(s),
+            UserPattern::Literal(s) => u == s,
             UserPattern::Regex(r) => r.is_match(u),
         })
     }
@@ -350,20 +357,22 @@ impl Condition for ProtocolMatcherCondition {
 
 // ── AttributeMatcher ────────────────────────────────────────
 
-/// 属性匹配器。
+/// 属性匹配器（大小写不敏感）。
 ///
 /// 对应 Go `AttributeMatcher`：每个 key 对应一个正则；
-/// `apply` 返回 ctx attributes 所有键值都命中。
+/// key 两侧（配置与 ctx attribute）`strings.ToLower` 折叠以匹配 HTTP header
+/// 大小写不敏感惯例；value 用原值跑正则。
 pub struct AttributeMatcherCondition {
+    /// 已折叠到小写的 (lowercase key → compiled regex) 映射。
     patterns: HashMap<String, Regex>,
 }
 
 impl AttributeMatcherCondition {
-    /// 从 proto `attributes` map 构造。所有 value 作为正则。
+    /// 从 proto `attributes` map 构造。所有 value 作为正则；key 预先 ToLower 折叠。
     pub fn new(attrs: HashMap<String, String>) -> Result<Self, regex::Error> {
         let mut patterns = HashMap::with_capacity(attrs.len());
         for (k, v) in attrs {
-            patterns.insert(k, Regex::new(&v)?);
+            patterns.insert(k.to_lowercase(), Regex::new(&v)?);
         }
         Ok(Self { patterns })
     }
@@ -373,7 +382,9 @@ impl Condition for AttributeMatcherCondition {
     fn apply(&self, ctx: &dyn RoutingContext) -> bool {
         let attrs = ctx.get_attributes();
         for (k, re) in &self.patterns {
-            match attrs.get(k) {
+            // key 已在构造时 ToLower，attrs 侧也 ToLower 再查。
+            let folded = attrs.keys().find(|orig| orig.to_lowercase() == *k);
+            match folded.and_then(|orig| attrs.get(orig)) {
                 Some(v) => {
                     if !re.is_match(v) {
                         return false;
@@ -385,6 +396,7 @@ impl Condition for AttributeMatcherCondition {
         true
     }
 }
+
 
 // ── ProcessNameMatcher ────────────────────────────────────────
 
@@ -1204,15 +1216,38 @@ mod tests {
         assert!(!m.apply(&udp));
     }
 
-    // ── UserMatcher ──
+    // ── UserMatcher（严格等值语义，对齐 Go UserMatcher）──
 
     #[test]
-    fn test_user_matcher_substring() {
-        let m = UserMatcherCondition::new(vec!["admin".into()]).unwrap();
+    fn test_user_matcher_strict_equality() {
+        // 与 Go `if u == user` (condition.go:190) 一致：ctx user 与 pattern 全等才命中。
+        let m = UserMatcherCondition::new(vec![
+            "admin@example.com".into(),
+            "root@example.com".into(),
+        ])
+        .unwrap();
         let hit = RoutingData::new().with_user("admin@example.com");
+        let hit2 = RoutingData::new().with_user("root@example.com");
         let miss = RoutingData::new().with_user("user@example.com");
+        let miss_empty = RoutingData::new();
         assert!(m.apply(&hit));
+        assert!(m.apply(&hit2));
         assert!(!m.apply(&miss));
+        assert!(!m.apply(&miss_empty));
+    }
+
+    #[test]
+    fn test_user_matcher_substring_must_miss() {
+        // 子串不再命中：修复前的 bug 是 `u.contains(s)`，会把 "admin" 误匹配
+        // "admin@example.com"。修复后严格等值，子串必须 miss。
+        let m = UserMatcherCondition::new(vec!["admin".into()]).unwrap();
+        let ctx = RoutingData::new().with_user("admin@example.com");
+        assert!(
+            !m.apply(&ctx),
+            "严格等值下 'admin' 子串不应命中 'admin@example.com'"
+        );
+        let full = RoutingData::new().with_user("admin");
+        assert!(m.apply(&full), "全等仍是命中");
     }
 
     #[test]
@@ -1229,6 +1264,14 @@ mod tests {
         let m = UserMatcherCondition::new(vec!["x".into()]).unwrap();
         let empty = RoutingData::new();
         assert!(!m.apply(&empty));
+    }
+
+    #[test]
+    fn test_user_matcher_lenient_alias_still_compiles() {
+        // 历史 API 别名仍可用——编译期兜底（不验证 substring 行为，因为该类型已弃用）。
+        #[allow(deprecated)]
+        let _m: UserMatcherLenient =
+            UserMatcherCondition::new(vec!["x@example.com".into()]).unwrap();
     }
 
     // ── InboundTagMatcher ──
@@ -1275,6 +1318,41 @@ mod tests {
         let m = AttributeMatcherCondition::new(attrs).unwrap();
         let ctx = RoutingData::new();
         assert!(!m.apply(&ctx));
+    }
+
+    #[test]
+    fn test_attribute_matcher_case_insensitive_keys() {
+        // 对齐 Go `AttributeMatcher.Match` (condition.go:269-280)：
+        // 配置 key 与 ctx attribute key 两侧 ToLower 后比对。
+        let mut attrs = HashMap::new();
+        // 配置写成大写，ctx 用小写；两侧仍能匹配。
+        attrs.insert(":PATH".into(), "/api/.*".into());
+        let m = AttributeMatcherCondition::new(attrs).unwrap();
+        let mut ctx_attrs = HashMap::new();
+        ctx_attrs.insert(":path".into(), "/api/v1".into());
+        let hit = RoutingData::new().with_attributes(ctx_attrs);
+        assert!(
+            m.apply(&hit),
+            "key 大小写差异下应仍命中（两侧 ToLower 等价）"
+        );
+
+        // 反向：配置小写，ctx 大写，也匹配。
+        let mut attrs2 = HashMap::new();
+        attrs2.insert(":path".into(), "/api/.*".into());
+        let m2 = AttributeMatcherCondition::new(attrs2).unwrap();
+        let mut ctx_attrs2 = HashMap::new();
+        ctx_attrs2.insert(":PATH".into(), "/api/v1".into());
+        let hit2 = RoutingData::new().with_attributes(ctx_attrs2);
+        assert!(m2.apply(&hit2));
+
+        // value 不匹配正则时即便 key 命中也应 fail。
+        let mut attrs3 = HashMap::new();
+        attrs3.insert(":Path".into(), "/api/.*".into());
+        let m3 = AttributeMatcherCondition::new(attrs3).unwrap();
+        let mut ctx_attrs3 = HashMap::new();
+        ctx_attrs3.insert(":path".into(), "/static/file".into());
+        let miss = RoutingData::new().with_attributes(ctx_attrs3);
+        assert!(!m3.apply(&miss));
     }
 
     // ── ProcessNameMatcher ──
