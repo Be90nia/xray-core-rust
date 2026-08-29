@@ -544,11 +544,77 @@ mod tests {
         let obs = o.get_observation();
         assert!(obs.status.iter().any(|s| s.outbound_tag == "direct"));
     }
+
+    /// bd f23r：`RealOutboundSelector::with_selector` 把任意
+    /// `xray_features::OutboundTagSelector` 后端桥成 `OutboundSelector`，
+    /// 无 proxyman 直接依赖——验证桥按前缀筛 tag 行为。
+    #[test]
+    fn real_outbound_selector_with_selector_bridges_backend() {
+        use std::sync::Arc;
+        use xray_features::OutboundTagSelector;
+
+        struct FixedBackend(Vec<String>);
+        impl OutboundTagSelector for FixedBackend {
+            fn select_by_prefix(&self, _prefixes: &[String]) -> Vec<String> {
+                self.0.clone()
+            }
+        }
+
+        let backend: Arc<dyn OutboundTagSelector> =
+            Arc::new(FixedBackend(vec!["proxy1".into(), "proxy2".into()]));
+        let sel = RealOutboundSelector::with_selector(backend);
+        let tags = sel.select(&["any".into()]).unwrap();
+        assert_eq!(tags, vec!["proxy1", "proxy2"]);
+    }
+
+    /// bd f23r：HttpProbeExecutor 经真实 HTTP echo server 探测——验证
+    /// 探测读响应 + 写入请求路径都走真实 TCP（不依赖 mock）。
+    #[tokio::test]
+    async fn http_probe_executor_runs_against_echo_server() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let n = sock.read(&mut buf).await.unwrap();
+            // 任何 HTTP/1.1 请求 → 返 200 即可。
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+            )
+            .await
+            .unwrap();
+            let _ = n;
+        });
+
+        let exec = HttpProbeExecutor::new(
+            format!("http://{addr}/"),
+            "GET".to_string(),
+            5_000,
+        );
+        let result = tokio::task::spawn_blocking(move || exec.probe("test-tag"))
+            .await
+            .expect("spawn_blocking should not panic");
+        assert!(result.alive, "expected alive probe, got: {:?}", result);
+        assert!(result.delay >= 0);
+        server.await.unwrap();
+    }
 }
 
 /// 基于 OutboundManager 的 OutboundSelector 实现。
 ///
 /// 对应 Go `outbound.HandlerSelector`：通过 Manager.Select 按前缀筛选 tag。
+///
+/// # 两个构造入口
+///
+/// - [`Self::new`]：直接持有 `Arc<dyn OutboundSelector>`（已实现的 trait object），
+///   适用于观测器内部嵌套场景。
+/// - [`Self::with_selector`]：接受任意实现了
+///   [`xray_features::OutboundTagSelector`] 的后端（典型为
+///   `xray-app-proxyman::OutboundManager`），无 proxyman 直接依赖，
+///   避免循环依赖（xray-app-observatory 已被 proxyman 间接引用）。
 pub struct RealOutboundSelector {
     manager: Arc<dyn OutboundSelector>,
 }
@@ -557,6 +623,26 @@ impl RealOutboundSelector {
     pub fn new(manager: Arc<dyn OutboundSelector>) -> Self {
         Self { manager }
     }
+
+    /// 从 `xray_features::OutboundTagSelector` 适配构造。
+    ///
+    /// 内部包装一个 `OutboundSelector` 适配器（每次 `select` 转发到
+    /// `OutboundTagSelector::select_by_prefix`）。开销为一次间接调用 + 一次
+    /// Vec<String> 分配；observatory 探测间隔 ≥ 1s，可忽略。
+    pub fn with_selector(backend: Arc<dyn xray_features::OutboundTagSelector>) -> Self {
+        struct BackendAdapter(Arc<dyn xray_features::OutboundTagSelector>);
+        impl OutboundSelector for BackendAdapter {
+            fn select(
+                &self,
+                subject_selector: &[String],
+            ) -> Result<Vec<String>, ObservatoryError> {
+                Ok(self.0.select_by_prefix(subject_selector))
+            }
+        }
+        Self {
+            manager: Arc::new(BackendAdapter(backend)),
+        }
+    }
 }
 
 impl OutboundSelector for RealOutboundSelector {
@@ -564,7 +650,6 @@ impl OutboundSelector for RealOutboundSelector {
         self.manager.select(subject_selector)
     }
 }
-
 /// 基于 tokio::net::TcpStream 的 HTTP ProbeExecutor。
 ///
 /// 对应 Go `Observer.probe(outbound)`：建立 TCP 连接并发送 HTTP HEAD 请求。

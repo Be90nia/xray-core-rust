@@ -36,6 +36,29 @@ use xray_app_dispatcher::{DefaultDispatcher, OutboundHandlerManager};
 /// 全局 handler → `app/log.Instance.Handle` 链。
 struct LogInstanceSink(Arc<xray_app_log::LogInstance>);
 
+/// SimpleOhm → xray_features::OutboundTagSelector 桥（bd f23r wiring）。
+///
+/// `xray_app_dispatcher::SimpleOhm` 没有 `select_by_prefix`（仅 `list_tags`），
+/// 这里做一次过滤：subject_selector 任意一项是 tag 前缀即保留。
+/// SimpleOhm 不带 default 标识，此处把"无前缀"也按精确匹配兼容——足够
+/// observatory 探测（observatory 关注的是已注册 outbound 列表，不是 default 选择）。
+struct OhmTagSelector(Arc<SimpleOhm>);
+impl xray_features::OutboundTagSelector for OhmTagSelector {
+    fn select_by_prefix(&self, prefixes: &[String]) -> Vec<String> {
+        let all = self.0.list_tags();
+        if prefixes.is_empty() {
+            return all;
+        }
+        all.into_iter()
+            .filter(|tag| {
+                prefixes
+                    .iter()
+                    .any(|p| tag.starts_with(p.as_str()))
+            })
+            .collect()
+    }
+}
+
 impl xray_app_dispatcher::AccessLogSink for LogInstanceSink {
     fn record_access(&self, e: &xray_app_dispatcher::AccessLogEntry) {
         let status = if e.status == "rejected" {
@@ -196,6 +219,18 @@ async fn start_full_dispatched(
         None,
         instance.get_feature::<xray_app_dns::DnsService>(),
     )?;
+
+    // 装配阶段依赖二次注入（bd f23r）：register_outbounds 后 ohm 就绪，
+    // 把 SimpleOhm 包成 OutboundTagSelector 桥到 DepBag，再次调所有
+    // feature 的 init_dependencies——本次能拿到 ohm 的 tag 列表。
+    // 此次 init_dependencies 与 instance.new_from_built 里的第一次是幂等
+    // 的（已 set_io 的 feature 跳过），允许双阶段注入。
+    let ohm_selector: Arc<dyn xray_features::OutboundTagSelector> =
+        Arc::new(OhmTagSelector(Arc::clone(&ohm)));
+    let bag2 = xray_features::DepBag::new().with_outbound_selector(ohm_selector);
+    for feat in instance.features() {
+        feat.init_dependencies(&bag2);
+    }
 
     // DefaultDispatcher 装配（对应 Go dispatcher.Init(ohm, router, pm, sm)）
     let mut dispatcher = DefaultDispatcher::new();
@@ -2251,6 +2286,256 @@ mod tests {
         for h in handles.iter() {
             h.abort();
         }
+        echo_task.abort();
+    }
+
+    /// SS inbound UDP relay → Freedom outbound → UDP echo server 端到端。
+    ///
+    /// 对应 Go `TestShadowsocksAES128GCMUDP`（`testing/scenarios/shadowsocks_test.go:200`）：
+    /// 用 `encode_udp_packet` 构造 SS UDP 数据报（IV + AEAD(addr+port+payload)）发到
+    /// SS inbound UDP 端口（`serve_ss_udp` 自动同端口绑 UDP，参见
+    /// `xray-core/src/inbound.rs:684-718`），SS 解码后经 dispatcher → freedom
+    /// 直发到 UDP echo，回包由 inbound 用发起用户 account 重新 `encode_udp_packet`
+    /// 后 `send_to` 客户端，全程 payload 字节一致。
+    #[tokio::test]
+    async fn integration_ss_udp_relay_to_echo() {
+        use xray_common::net::address::Address;
+        use xray_proxy_ss::config::{CipherType, MemoryAccount};
+        use xray_proxy_ss::protocol::{decode_udp_packet, encode_udp_packet};
+        use xray_proxy_ss::validator::{MemoryUser, Validator};
+        use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
+        use std::net::Ipv4Addr;
+
+        // 1. UDP echo server
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                match echo.recv_from(&mut buf).await {
+                    Ok((n, peer)) => { let _ = echo.send_to(&buf[..n], peer).await; }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // 2. 空闲端口：SS inbound TCP/UDP 同端口
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ss_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        // 3. SS server（legacy AEAD，aes-256-gcm）+ freedom outbound
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry {
+                kind: "shadowsocks".into(),
+                data: br#"{"clients":[{"password":"test-pass","method":"aes-256-gcm"}]}"#.to_vec(),
+            },
+            tag: "ss-in".into(),
+            port: Some(ss_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        server_cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            tag: "direct".into(),
+            send_through: None, stream_settings_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
+        });
+        let (_si, _so, sh) = start_full(&server_cfg).await.expect("ss+freedom start");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 4. 客户端：构造 SS UDP 数据报 → SS UDP 端口 → 等回包
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let payload = b"ss-udp-echo-payload-7g3h";
+        let account = MemoryAccount::from_proto(&ProtoAccount {
+            password: "test-pass".to_string(),
+            cipher_type: CipherType::Aes256Gcm.as_i32(),
+            iv_check: false,
+        }).expect("from_proto");
+        let encoded = encode_udp_packet(
+            &account,
+            &Address::ipv4(match echo_addr.ip() {
+                std::net::IpAddr::V4(v) => v,
+                _ => Ipv4Addr::LOCALHOST,
+            }),
+            echo_addr.port(),
+            payload,
+        ).expect("encode udp packet");
+        let relay = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ss_port,
+        );
+        client.send_to(&encoded, relay).await.expect("send to ss udp");
+
+        // 5. 等回包（SS server 用同一 account 重新 encode → 客户端 decode 验证）
+        let mut resp = vec![0u8; 65535];
+        let (n, _peer) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.recv_from(&mut resp),
+        )
+        .await
+        .expect("timeout waiting for ss udp echo")
+        .expect("recv ss udp echo");
+
+        let validator = Validator::new();
+        validator.add(MemoryUser::new("u@ss.local", account.clone())).expect("add user");
+        let echo_ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v,
+            _ => unreachable!(),
+        };
+        let (header, body) = decode_udp_packet(&validator, &resp[..n]).expect("decode echo");
+        assert_eq!(header.address, Address::ipv4(echo_ip), "echo source address");
+        assert_eq!(header.port, echo_addr.port(), "echo source port");
+        assert_eq!(body, payload, "echo payload roundtrip");
+
+        drop(client);
+        for h in sh.iter() { h.abort(); }
+        echo_task.abort();
+    }
+
+    /// SS inbound UDP relay + Mux outbound 端到端。
+    ///
+    /// 对应 Go `TestShadowsocksAES128GCMUDPMux`
+    /// （`testing/scenarios/shadowsocks_test.go:294`）：客户端 socks UDP 通过
+    /// SS outbound（启用 mux）→ SS server UDP relay → freedom → UDP echo。
+    /// mux 路径：SS outbound 在 mux client 上开 XUDP session（network=UDP），
+    /// SS inbound 收到 `v1.mux.cool:9527` TCP 连接时由 mux ServerWorker 解帧
+    /// （参见 `xray-core/src/inbound.rs:166-201` is_mux_destination +
+    /// handle_mux_inbound_link），每个 mux session 按目标网络派发 UDP 帧。
+    #[tokio::test]
+    async fn integration_ss_udp_through_mux() {
+        use std::net::Ipv4Addr;
+
+        // 1. UDP echo server
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                match echo.recv_from(&mut buf).await {
+                    Ok((n, peer)) => { let _ = echo.send_to(&buf[..n], peer).await; }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // 2. 空闲端口：SS inbound TCP/UDP 同端口 + 客户端 socks inbound
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ss_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        // 3. SS server（legacy AEAD）+ freedom outbound
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry {
+                kind: "shadowsocks".into(),
+                data: br#"{"clients":[{"password":"test-pass","method":"aes-256-gcm"}]}"#.to_vec(),
+            },
+            tag: "ss-in".into(),
+            port: Some(ss_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        server_cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            tag: "direct".into(),
+            send_through: None, stream_settings_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
+        });
+        let (_si, _so, sh) = start_full(&server_cfg).await.expect("ss server");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 4. 客户端：socks inbound (UDP enabled) + SS outbound（启用 mux）
+        let mut client_cfg = BuiltConfig::default();
+        client_cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry {
+                kind: "socks".into(),
+                data: br#"{"auth":"noauth","udp":true}"#.to_vec(),
+            },
+            tag: "socks-in".into(),
+            port: Some(socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        client_cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry {
+                kind: "shadowsocks".into(),
+                data: format!(r#"{{"servers":[{{"address":"127.0.0.1","port":{ss_port},"password":"test-pass","method":"aes-256-gcm"}}]}}"#).into_bytes(),
+            },
+            tag: "proxy".into(),
+            send_through: None, stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: Some(serde_json::json!({"enabled": true, "concurrency": 8})),
+            target_strategy: None,
+        });
+        let (_ci, _co, ch) = start_full(&client_cfg).await.expect("socks+ss+mux client");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 5. socks5 TCP control → NoAuth → UDP ASSOCIATE
+        let mut tcp = TcpStream::connect(format!("127.0.0.1:{socks_port}"))
+            .await
+            .expect("connect socks control");
+        tcp.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut method_resp = [0u8; 2];
+        tcp.read_exact(&mut method_resp).await.unwrap();
+        assert_eq!(method_resp, [0x05, 0x00], "NoAuth method selected");
+        tcp.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.unwrap();
+        let mut assoc_reply = [0u8; 10];
+        tcp.read_exact(&mut assoc_reply).await.unwrap();
+        assert_eq!(assoc_reply[0], 0x05, "UDP ASSOC reply VER");
+        assert_eq!(assoc_reply[1], 0x00, "UDP ASSOC reply REP=success");
+        assert_eq!(assoc_reply[3], 0x01, "ATYP=IPv4");
+        let relay_port = u16::from_be_bytes([assoc_reply[8], assoc_reply[9]]);
+        assert!(relay_port > 0, "relay port should be assigned, got {relay_port}");
+
+        // 6. 客户端 UDP socket → socks5 UDP 包 → socks inbound relay → dispatcher →
+        //    mux SS outbound（carrier TCP 连 SS 服务器 TCP 端口，开 XUDP session
+        //    装 UDP 帧）→ SS server UDP relay 解码 → mux ServerWorker 解帧派发 →
+        //    freedom UDP → echo
+        let client_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let payload = b"ss-udp-mux-echo-2k8w";
+        let ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
+        // socks5 UDP: [RSV=0,0][FRAG=0][ATYP=0x01][IPv4][port BE][payload]
+        let mut pkt = vec![0x00, 0x00, 0x00, 0x01];
+        pkt.extend_from_slice(&ip);
+        pkt.extend_from_slice(&echo_addr.port().to_be_bytes());
+        pkt.extend_from_slice(payload);
+        let relay = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+            relay_port,
+        );
+        client_udp.send_to(&pkt, relay).await.expect("send udp via socks");
+
+        // 7. 等回包（UDP echo 经 SS+mux+freedom 来回往返）
+        let mut resp_buf = vec![0u8; 65535];
+        let (n, _peer) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_udp.recv_from(&mut resp_buf),
+        )
+        .await
+        .expect("timeout waiting for ss+udp+mux echo")
+        .expect("recv ss+udp+mux echo");
+        // socks5 UDP header 至少 10 字节
+        assert!(n >= 10, "socks5 udp header at least 10 bytes, got {n}");
+        assert_eq!(resp_buf[0..2], [0x00, 0x00], "RSV");
+        assert_eq!(resp_buf[2], 0x00, "FRAG=0");
+        assert_eq!(resp_buf[3], 0x01, "ATYP=IPv4");
+        let body = &resp_buf[10..n];
+        assert_eq!(body, payload, "echo payload through ss+udp+mux roundtrip");
+
+        drop(client_udp);
+        drop(tcp);
+        for h in sh.iter().chain(ch.iter()) { h.abort(); }
         echo_task.abort();
     }
 }

@@ -18,3 +18,6 @@ pub mod registry;
 // 顶层 re-export：Feature trait + 全局工厂注册表。
 pub use feature::{Feature, FeatureError, Result};
 pub use registry::{create_feature, is_registered, register_feature, FeatureFactory};
+
+pub mod deps;
+pub use deps::{DepBag, OutboundTagSelector};

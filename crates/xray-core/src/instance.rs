@@ -172,7 +172,13 @@ impl Instance {
             });
         xray_transport::system_dialer::init_system_dialer(dns_client);
 
-
+        // 装配阶段依赖注入（bd f23r）：构造 DepBag 并调用所有 feature 的
+        // `init_dependencies` hook。当前阶段 proxyman/OutboundManager 尚未
+        // 注册（register_outbounds 在 start_full 等上层 API 内发生），bag 留空；
+        let bag = xray_features::DepBag::new();
+        for feat in inst.features() {
+            feat.init_dependencies(&bag);
+        }
         tracing::info!(
             app_count = inst.feature_count(),
             inbound_count = built.inbound_count(),

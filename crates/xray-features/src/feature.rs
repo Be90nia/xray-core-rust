@@ -82,6 +82,18 @@ pub trait Feature: Any + Send + Sync + 'static {
     fn close(&self) -> Result<()> {
         Ok(())
     }
+
+    /// 装配阶段依赖注入 hook：Instance 在所有 feature 注册完成后、[`start`](Self::start)
+    /// 之前调用一次。feature 可在此拉取 outbound.Manager / dispatcher 等运行时依赖。
+    ///
+    /// 对应 Go `New(ctx, config)` 中 `RequireFeatures(...)` 反射 DI：Go 端通过
+    /// 反射扫回调参数类型 + features 列表匹配；Rust 端走显式 [`DepBag`](crate::deps::DepBag)，
+    /// 编译期类型安全，避免 Go 端 reflect panic。
+    ///
+    /// 默认 no-op：feature 无外部依赖时无需覆盖。
+    fn init_dependencies(&self, _deps: &crate::deps::DepBag) {
+        // 默认空实现
+    }
 }
 
 
@@ -118,6 +130,8 @@ mod tests {
         let f = NoopFeature;
         assert!(f.start().is_ok());
         assert!(f.close().is_ok());
+        // init_dependencies is fn(&DepBag) -> () (no Result); just verify it doesn't panic.
+        f.init_dependencies(&crate::deps::DepBag::new());
     }
 
     #[test]
