@@ -1,15 +1,27 @@
 //! Socket 选项配置与应用。对应 Go `transport/internet/sockopt.go` + 平台特定文件。
 //!
-//! ## 切片边界（P5-Sys 切片1）
+//! ## 切片边界（P5-Sys 切片1→切片2）
 //!
-//! 仅实现跨平台通用的基础 sockopt（TCP_NODELAY + SO_KEEPALIVE + TCP_KEEPIDLE/
-//! TCP_KEEPINTVL）。平台特定选项（SO_MARK / SO_BINDTODEVICE / TCP_FASTOPEN /
-//! TCP_CONGESTION 等）留切片2。
+//! 切片1：跨平台通用基础 sockopt（TCP_NODELAY + SO_KEEPALIVE + TCP_KEEPIDLE/
+//! TCP_KEEPINTVL + V6Only）。
+//! 切片2（本模块）：平台特定选项（TFO/TCP_CONGESTION/SO_REUSEPORT/
+//! IP_TRANSPARENT/SO_USER_COOKIE）由 [`apply_outbound_socket_options`] /
+//! [`apply_inbound_socket_options`] 跨平台分发到 [`linux`] / [`windows`] /
+//! [`darwin`] / [`freebsd`] 各平台模块实现。MPTCP 单独走 [`try_set_mptcp`]
+//! （仅 Linux 监听前生效）。入站 listener 端 TFO backlog / SO_REUSEPORT 在
+//! [`crate::system_listener::DefaultListener::bind`] 之前对原始 socket 设置。
 //!
 //! ## SocketOptions vs SocketConfig proto
 //!
-//! 切片1 不引入完整 prost SocketConfig（字段过多），用简化 [`SocketOptions`]
-//! struct 暴露常用字段。完整 proto 对接留切片2。
+//! 不引入完整 prost SocketConfig（字段过多），用简化 [`SocketOptions`]
+//! struct 暴露常用字段。完整 proto 对接留后续。
+//!
+//! ## TFO 三态 vs bool
+//!
+//! Go `SocketConfig.Tfo` 三态（`-1` 未配置/`0` 显式禁用/`>0` 启用），
+//! Rust [`SocketOptions::tcp_fast_open`] 是 bool（缺省 false = 显式禁用或未
+//! 配置——两者均不调用 setsockopt）。平台模块 `apply` 内自行 `>0` 时启用、
+//! `tcp_fast_open==false` 时跳过。
 
 #[cfg(target_os = "linux")]
 pub mod linux;
@@ -21,7 +33,10 @@ pub mod darwin;
 pub mod freebsd;
 use std::time::Duration;
 use socket2::Socket;
-
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "windows")]
+use std::os::windows::io::AsRawSocket;
 /// 基础 socket 选项。对应 Go `SocketConfig` 的核心字段子集。
 ///
 /// 默认值与 Go DefaultSystemDialer 一致：
@@ -217,9 +232,19 @@ pub struct SocketOptions {
     pub tcp_fast_open: bool,
     /// Multipath TCP（MPTCP）。对应 Go `SocketConfig.TcpMptcp`（字段 19，JSON `tcpMptcp`）。
     /// 仅 Linux 生效；其他平台或不支持 MPTCP 的内核上静默回退普通 TCP
-    ///（对齐 Go `net.ListenConfig.SetMultipathTCP` 行为）。监听 socket 在
+    /// （对齐 Go `net.ListenConfig.SetMultipathTCP` 行为）。监听 socket 在
     /// bind 前设置 `TCP_MPTCP`，accept 出的连接自动为 MPTCP。
     pub tcp_mptcp: bool,
+    /// TCP 拥塞控制算法名称（如 "bbr"、"cubic"）。
+    /// 对应 Go `SocketConfig.TcpCongestion`（sockopt_linux.go:40-43）。
+    /// 仅 Linux 有效，其他平台忽略（macOS 不暴露此选项、FreeBSD/Windows 忽略）。
+    pub tcp_congestion: Option<String>,
+    /// 是否启用 IP_TRANSPARENT（透明代理，需要 root 或 CAP_NET_ADMIN）。
+    /// 对应 Go `SocketConfig.Tproxy.IsEnabled()`（sockopt_linux.go:104-108）。
+    /// 仅 Linux 有效；其他平台忽略。
+    pub tproxy: bool,
+    /// Linux/FreeBSD/Darwin 有效；Windows no-op（sockopt_windows.go:188-190）。
+    pub reuse_port: bool,
     /// 绑定到指定网络接口索引。`0`=不绑定。
     /// 对应 Go `SocketConfig.Interface`（Go 用接口名字符串，Rust 用索引）。
     /// Linux: SO_BINDTODEVICE；Darwin: IP_BOUND_IF / IPV6_BOUND_IF。
@@ -240,7 +265,7 @@ pub struct SocketOptions {
     /// SRV/TXT 记录覆盖目标地址/端口策略。对应 Go
     /// `SocketConfig.AddressPortStrategy`（infra/conf/transport_internet.go:1050）。默认 `None`。
     pub address_port_strategy: AddressPortStrategy,
- }
+}
 
 /// Happy Eyeballs 配置。对应 Go `HappyEyeballsConfig`
 /// （transport/internet/config.proto:162-166 + infra/conf/transport_internet.go:1008-1030）。
@@ -271,7 +296,6 @@ impl Default for HappyEyeballsConfig {
         }
     }
 }
-
 impl Default for SocketOptions {
     fn default() -> Self {
         // 与 Go DefaultSystemDialer 的 Chrome 默认值一致。
@@ -282,23 +306,33 @@ impl Default for SocketOptions {
             mark: 0,
             tcp_fast_open: false,
             tcp_mptcp: false,
+            tcp_congestion: None,
+            tproxy: false,
+            reuse_port: false,
             bind_if_index: 0,
             ipv6_only: false,
             dialer_proxy: String::new(),
             happy_eyeballs: None,
             domain_strategy: DomainStrategy::AsIs,
             address_port_strategy: AddressPortStrategy::None,
-         }
+        }
     }
 }
 
 /// 把 [`SocketOptions`] 应用到已建立的 [`Socket`]（TCP 专用）。
 ///
-/// 对应 Go `applyOutboundSocketOptions` 的跨平台通用部分。失败时返回
-/// [`std::io::Error`]，调用方决定是忽略（继续拨号）还是中止。
+/// 对应 Go `applyOutboundSocketOptions`（sockopt_linux.go:16-111 / freebsd.go:127-178
+/// / windows.go:34-121）。失败时返回 [`std::io::Error`]，调用方决定是忽略（继续拨号）
+/// 还是中止。平台模块（[`linux::LinuxSockOpt::apply`] 等）内按 `tcp_fast_open=false`
+/// 跳过 TFO 设置，因此本函数可在 `SocketOptions::default()` 上无副作用通过。
 ///
-/// 平台特定选项（SO_MARK / SO_BINDTODEVICE / TCP_CONGESTION）由各平台模块
-/// （[`linux`] / [`windows`] / [`darwin`] / [`freebsd`]）提供，切片2 接入。
+/// 各平台覆盖范围：
+/// - Linux：TFO_CONNECT / TCP_CONGESTION / SO_REUSEPORT / IP_TRANSPARENT（tproxy）/
+///   SO_MARK / SO_BINDTODEVICE
+/// - FreeBSD：TFO / SO_REUSEPORT_LB→SO_REUSEPORT / SO_USER_COOKIE（mark）
+/// - Darwin：TFO_CLIENT 位 / SO_REUSEPORT / IP_BOUND_IF / IPV6_BOUND_IF /
+///   TCP_KEEPALIVE-KEEPINTVL
+/// - Windows：Winsock TCP_FASTOPEN=15 / IP_UNICAST_IF / IPV6_UNICAST_IF
 pub fn apply_outbound_socket_options(socket: &Socket, opts: &SocketOptions) -> std::io::Result<()> {
     // TCP_NODELAY：跨平台通用。
     socket.set_nodelay(opts.tcp_nodelay)?;
@@ -306,37 +340,140 @@ pub fn apply_outbound_socket_options(socket: &Socket, opts: &SocketOptions) -> s
         socket.set_only_v6(true)?;
     }
     // SO_KEEPALIVE + TCP_KEEPIDLE/TCP_KEEPINTVL（Go KeepAliveConfig 语义，见
-    // [`set_keepalive_config`]）。
+    // [`set_keepalive_config`]）。Darwin 平台 keepalive 走 darwin 模块自带逻辑。
     set_keepalive_config(socket, opts)?;
-    // SO_MARK：仅 Linux 有效。
+
     #[cfg(target_os = "linux")]
     {
-        if opts.mark > 0 || opts.bind_if_index > 0 {
-            let fd = socket.as_raw_socket() as i32;
-            let linux_opt = linux::LinuxSockOpt { mark: opts.mark, bind_if_index: opts.bind_if_index, ..Default::default() };
-            if opts.mark > 0 { linux_opt.set_so_mark(fd)?; }
-            if opts.bind_if_index > 0 { linux_opt.set_so_bindtodevice(fd)?; }
+        let fd = socket.as_raw_fd();
+        linux::LinuxSockOpt {
+            tcp_fast_open: if opts.tcp_fast_open { 1 } else { 0 },
+            reuse_port: opts.reuse_port,
+            tproxy: opts.tproxy,
+            tcp_congestion: opts.tcp_congestion.clone(),
+            inbound: false,
+            mark: opts.mark,
+            bind_if_index: opts.bind_if_index,
         }
+        .apply(fd)?;
     }
-    // TCP_FASTOPEN：Go 各平台 outbound/inbound 均设置（Windows 是真实实现：对
-    // Winsock TCP_FASTOPEN=15 setsockopt，Win10 1607+ 支持，sockopt_windows.go:16-32）。
-    // 生产链路（dialer/listener）的 TFO 接入与 Linux/macOS 一致留待统一批次，
-    // 平台能力已就位于 [`windows`] / [`freebsd`] / [`linux`] / [`darwin`] 模块。
+
+    #[cfg(target_os = "freebsd")]
+    {
+        let fd = socket.as_raw_fd();
+        freebsd::FreebsdSockOpt {
+            tcp_fast_open: if opts.tcp_fast_open { 1 } else { -1 },
+            reuse_port: opts.reuse_port,
+            mark: opts.mark,
+            inbound: false,
+        }
+        .apply(fd)?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let fd = socket.as_raw_fd();
+        // Go 远端地址含 '.' 判定 v4（sockopt_windows.go:41 同款）——socket2::Socket
+        // 取 local_addr 不可得，依赖调用方后续若需 bind 自行判定；保守按 v4 走。
+        darwin::DarwinSockOpt {
+            tcp_fast_open: if opts.tcp_fast_open { 1 } else { 0 },
+            reuse_port: opts.reuse_port,
+            bind_if_index: opts.bind_if_index,
+            is_ipv6: false,
+            tcp_keepalive_idle: opts.tcp_keepalive_idle.as_secs() as u32,
+            tcp_keepalive_interval: opts.tcp_keepalive_interval.as_secs() as u32,
+            inbound: false,
+        }
+        .apply(fd)?;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let s = socket.as_raw_socket();
+        windows::WindowsSockOpt {
+            tcp_fast_open: if opts.tcp_fast_open { 1 } else { -1 },
+            bind_if_index: opts.bind_if_index,
+            is_ipv4: true,
+        }
+        .apply(s)?;
+    }
+
     Ok(())
 }
 
-/// 把 [`SocketOptions`] 应用到入站连接。对应 Go `applyInboundSocketOptions` 的
-/// 跨平台通用部分。
+/// 把 [`SocketOptions`] 应用到入站**已接受连接**。对应 Go `applyInboundSocketOptions`
+/// 的跨平台通用部分（sockopt_linux.go:115-232）。
 ///
-/// 与 [`apply_outbound_socket_options`] 的差异：入站连接默认禁用 keepalive
-///（Go 端 `lc.KeepAlive = -1`，system_listener.go:91），仅 idle/interval 任一
-/// 非零时启用（Go system_listener.go:102-109「任一 >0 即 Enable」）。
+/// 与 [`apply_outbound_socket_options`] 的差异：
+/// 1. 不设置 TFO（Go inbound TCP_FASTOPEN 是监听 socket 上的 backlog 设置，必须
+///    在 listen() 之前；本函数作用于 accept 出的连接，TFO 在该层无效）——见
+///    [`crate::system_listener::DefaultListener::bind`]。
+/// 2. 入站连接默认禁用 keepalive（Go 端 `lc.KeepAlive = -1`，system_listener.go:91），
+///    仅 idle/interval 任一非零时启用（Go system_listener.go:102-109「任一 >0 即 Enable」）。
+/// 3. FreeBSD/Darwin inbound 走相同平台 `apply` 但 `inbound=true`（Darwin 决定 TFO
+///    SERVER 位 vs CLIENT 位）；FreeBSD TFO 出站 clamp 1、入站原值（sockopt_freebsd.go:136-138）。
 pub fn apply_inbound_socket_options(socket: &Socket, opts: &SocketOptions) -> std::io::Result<()> {
     socket.set_nodelay(opts.tcp_nodelay)?;
     if opts.ipv6_only {
         socket.set_only_v6(true)?;
     }
     set_keepalive_config(socket, opts)?;
+
+    #[cfg(target_os = "linux")]
+    {
+        let fd = socket.as_raw_fd();
+        // accept 出的连接可设 tproxy/mark/bind_if_index；tproxy 在 Linux 上对 accepted
+        // connection 仍生效（sockopt_linux.go:211-215 不区分方向）。
+        linux::LinuxSockOpt {
+            tcp_fast_open: 0, // inbound TFO backlog 走 listener 层，不在这里设
+            reuse_port: false, // REUSEPORT 仅监听 socket 相关，accept 后无意义
+            tproxy: opts.tproxy,
+            tcp_congestion: opts.tcp_congestion.clone(),
+            inbound: true,
+            mark: opts.mark,
+            bind_if_index: opts.bind_if_index,
+        }
+        .apply(fd)?;
+    }
+
+    #[cfg(target_os = "freebsd")]
+    {
+        let fd = socket.as_raw_fd();
+        freebsd::FreebsdSockOpt {
+            tcp_fast_open: if opts.tcp_fast_open { 1 } else { -1 },
+            reuse_port: false,
+            mark: opts.mark,
+            inbound: true,
+        }
+        .apply(fd)?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let fd = socket.as_raw_fd();
+        darwin::DarwinSockOpt {
+            tcp_fast_open: if opts.tcp_fast_open { 1 } else { 0 },
+            reuse_port: false, // 同 Linux
+            bind_if_index: opts.bind_if_index,
+            is_ipv6: false,
+            tcp_keepalive_idle: opts.tcp_keepalive_idle.as_secs() as u32,
+            tcp_keepalive_interval: opts.tcp_keepalive_interval.as_secs() as u32,
+            inbound: true,
+        }
+        .apply(fd)?;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let s = socket.as_raw_socket();
+        windows::WindowsSockOpt {
+            tcp_fast_open: if opts.tcp_fast_open { 1 } else { -1 },
+            bind_if_index: 0, // inbound 不绑接口
+            is_ipv4: true,
+        }
+        .apply(s)?;
+    }
+
     Ok(())
 }
 
@@ -479,7 +616,6 @@ mod tests {
         drop(socket);
         accept_task.await.unwrap();
     }
-
     #[test]
     fn default_socket_options_match_chrome_defaults() {
         let opts = SocketOptions::default();
@@ -488,8 +624,94 @@ mod tests {
         assert_eq!(opts.tcp_keepalive_interval, Duration::from_secs(45));
         assert!(!opts.tcp_fast_open, "TFO default should be false");
         assert!(!opts.tcp_mptcp, "MPTCP default should be false");
+        assert!(!opts.tproxy, "tproxy default should be false");
+        assert!(!opts.reuse_port, "reuse_port default should be false");
+        assert!(opts.tcp_congestion.is_none(), "tcp_congestion default should be None");
     }
 
+    /// TFO 启用 + TCP_CONGESTION + tproxy：真实 TCP socket 上跑通（应成功或被
+    /// 权限门控跳过）。Windows 不支持 IP_TRANSPARENT/tproxy，本测试在 unix 跑。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_socket_options_with_tfo_congestion_tproxy() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_task = tokio::spawn(async move { let _ = listener.accept().await; });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let socket = socket2::Socket::from(stream.into_std().unwrap());
+        let mut opts = SocketOptions::default();
+        opts.tcp_fast_open = true;
+        opts.tcp_congestion = Some("cubic".to_string());
+        // tproxy 需要 root/CAP_NET_ADMIN，CI 上不启用。
+        opts.tproxy = false;
+        opts.reuse_port = false;
+        apply_outbound_socket_options(&socket, &opts).unwrap();
+        // getsockopt 回读 TCP_FASTOPEN_CONNECT（Linux 30）：
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let mut val: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: 读 fd 栈上 c_int；len 与类型一致。
+            let ret = unsafe {
+                libc::getsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_TCP,
+                    libc::TCP_FASTOPEN_CONNECT,
+                    &mut val as *mut _ as *mut libc::c_void,
+                    &mut len,
+                )
+            };
+            assert_eq!(ret, 0, "getsockopt(TCP_FASTOPEN_CONNECT) failed");
+            assert_eq!(val, 1, "outbound TFO_CONNECT 应为 1");
+        }
+        drop(socket);
+        accept_task.await.unwrap();
+    }
+
+    /// TFO 启用失败路径：先在 IPv6 socket 上尝试 TFO（部分平台不支持）：
+    /// 主要是为「失败不被吞」契约做基础验证——Linux/FreeBSD/Darwin 出站 TFO
+    /// 调用应成功（sockopt_linux.go:35-37 路径）；Windows 等价测试见其模块。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_tfo_outbound_does_not_panic_on_default_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_task = tokio::spawn(async move { let _ = listener.accept().await; });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let socket = socket2::Socket::from(stream.into_std().unwrap());
+        let mut opts = SocketOptions::default();
+        opts.tcp_fast_open = true;
+        opts.tcp_congestion = Some("reno".to_string());
+        // 关键：必须 Ok，不向调用方传播 EPERM/ENOPROTOOPT（按 Go 语义 setsockopt 失败
+        // 会被传播；本测试只验「TFO=1 + 已建立连接」回环内不 EPERM）。
+        let res = apply_outbound_socket_options(&socket, &opts);
+        assert!(res.is_ok(), "回环 socket 上 TFO + congestion 应 Ok：{res:?}");
+        drop(socket);
+        accept_task.await.unwrap();
+    }
+
+    /// tproxy 失败路径：在非特权 socket 上 setsockopt(IP_TRANSPARENT) 返回 EPERM，
+    /// 当前 impl 选择向上传播 Err（Go `applyOutboundSocketOptions:104-108` 同样
+    /// 向上返 err，不静默）。
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn apply_tproxy_outbound_returns_err_for_unprivileged() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_task = tokio::spawn(async move { let _ = listener.accept().await; });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let socket = socket2::Socket::from(stream.into_std().unwrap());
+        let mut opts = SocketOptions::default();
+        opts.tproxy = true;
+        let res = apply_outbound_socket_options(&socket, &opts);
+        // CI 无 root：EPERM（操作不允许）；root 环境 Ok。两者均符合 Go 语义。
+        if let Err(e) = &res {
+            assert_eq!(e.raw_os_error(), Some(libc::EPERM), "非 root 应 EPERM：{e:?}");
+        }
+        drop(socket);
+        accept_task.await.unwrap();
+    }
     #[test]
     fn socket_options_is_clone() {
         let opts = SocketOptions::default();

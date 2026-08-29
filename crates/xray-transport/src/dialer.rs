@@ -186,6 +186,17 @@ impl StreamSettings {
         if let Some(v) = obj.get("tcpMptcp").and_then(|v| v.as_bool()) {
             opts.tcp_mptcp = v;
         }
+        // TFO（Go `SocketConfig.Tfo` JSON `tcpFastOpen`）在 socket_options 已解析；其余
+        // sockopt 字段（sockopt_linux.go:40-44 / :104-108 / sockopt_freebsd.go:128-132）：
+        if let Some(v) = obj.get("tcpCongestion").and_then(|v| v.as_str()) {
+            opts.tcp_congestion = Some(v.to_string());
+        }
+        if let Some(v) = obj.get("tproxy").and_then(|v| v.as_bool()) {
+            opts.tproxy = v;
+        }
+        if let Some(v) = obj.get("reusePort").and_then(|v| v.as_bool()) {
+            opts.reuse_port = v;
+        }
         if let Some(v) = obj.get("v6only").and_then(|v| v.as_bool()) {
             opts.ipv6_only = v;
         }
@@ -535,7 +546,10 @@ mod transport_cache_tests {
             "tcpKeepAliveInterval": 30,
             "tcpKeepAliveIdle": 60,
             "tcpMptcp": true,
-            "v6only": true
+            "v6only": true,
+            "tcpCongestion": "bbr",
+            "tproxy": true,
+            "reusePort": true
         }));
         let o = s.socket_options();
         assert_eq!(o.mark, 255);
@@ -544,8 +558,10 @@ mod transport_cache_tests {
         assert_eq!(o.tcp_keepalive_interval, std::time::Duration::from_secs(30));
         assert_eq!(o.tcp_keepalive_idle, std::time::Duration::from_secs(60));
         assert!(o.ipv6_only);
+        assert_eq!(o.tcp_congestion.as_deref(), Some("bbr"));
+        assert!(o.tproxy);
+        assert!(o.reuse_port);
     }
-
     #[test]
     fn socket_options_defaults_without_json() {
         let s = StreamSettings::tcp();

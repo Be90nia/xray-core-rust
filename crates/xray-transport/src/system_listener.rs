@@ -72,7 +72,9 @@ impl DefaultListener {
     /// sockopt 在 `accept` 时应用到每个入站连接（与 Go 一致）。
     pub async fn bind(addr: SocketAddr, sockopt: SocketOptions) -> io::Result<Self> {
         let inner = if sockopt.tcp_mptcp {
-            Self::bind_mptcp(addr).await?
+            Self::bind_mptcp(addr, &sockopt).await?
+        } else if Self::needs_prelisten_sockopt(&sockopt) {
+            Self::bind_with_prelisten_sockopt(addr, &sockopt).await?
         } else {
             TokioTcpListener::bind(addr).await?
         };
@@ -84,23 +86,140 @@ impl DefaultListener {
         })
     }
 
+    /// 预监听（pre-listen）socket 选项判断。
+    ///
+    /// 这些选项必须在 `listen()` 之前设置才能生效：
+    /// - Linux TCP_FASTOPEN backlog（sockopt_linux.go:122-127）
+    /// - SO_REUSEPORT（sockopt_linux.go:241-245）
+    /// - Windows TCP_FASTOPEN=15（sockopt_windows.go:125-127）
+    /// - FreeBSD TCP_FASTOPEN（sockopt_freebsd.go:187-192）
+    /// - Darwin TCP_FASTOPEN_SERVER 位（sockopt_darwin.go）
+    fn needs_prelisten_sockopt(sockopt: &SocketOptions) -> bool {
+        sockopt.tcp_fast_open || sockopt.reuse_port
+    }
+
+    /// 带预监听 socket 选项的绑定路径。对应 Go `lc.SetMultipathTCP(true)` 之外的
+    /// `applyInboundSocketOptions` 监听前分支（sockopt_linux.go:115-232）。
+    async fn bind_with_prelisten_sockopt(
+        addr: SocketAddr,
+        sockopt: &SocketOptions,
+    ) -> io::Result<TokioTcpListener> {
+        use socket2::{Domain, Type};
+        let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+        let socket = Socket::new(domain, Type::STREAM, Some(socket2::Protocol::TCP))?;
+        // SO_REUSEPORT 必须在 bind 前设。
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = socket.as_raw_fd();
+            #[cfg(target_os = "linux")]
+            if sockopt.reuse_port {
+                crate::sockopt::linux::LinuxSockOpt { reuse_port: true, ..Default::default() }
+                    .apply(fd)?;
+            }
+            #[cfg(target_os = "freebsd")]
+            if sockopt.reuse_port {
+                crate::sockopt::freebsd::FreebsdSockOpt { reuse_port: true, ..Default::default() }
+                    .apply(fd)?;
+            }
+            #[cfg(target_os = "macos")]
+            if sockopt.reuse_port {
+                crate::sockopt::darwin::DarwinSockOpt { reuse_port: true, inbound: true, ..Default::default() }
+                    .apply(fd)?;
+            }
+        }
+        socket.bind(&addr.into())?;
+        // TFO backlog 必须在 listen 前设（Linux TCP_FASTOPEN 等同 Go :122-127；
+        // FreeBSD 同；Windows 同）。
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = socket.as_raw_fd();
+            #[cfg(target_os = "linux")]
+            if sockopt.tcp_fast_open {
+                crate::sockopt::linux::LinuxSockOpt {
+                    tcp_fast_open: 1,
+                    inbound: true,
+                    ..Default::default()
+                }
+                .apply(fd)?;
+            }
+            #[cfg(target_os = "freebsd")]
+            if sockopt.tcp_fast_open {
+                crate::sockopt::freebsd::FreebsdSockOpt {
+                    tcp_fast_open: 1,
+                    inbound: true,
+                    ..Default::default()
+                }
+                .apply(fd)?;
+            }
+            #[cfg(target_os = "macos")]
+            if sockopt.tcp_fast_open {
+                crate::sockopt::darwin::DarwinSockOpt {
+                    tcp_fast_open: 1,
+                    inbound: true,
+                    ..Default::default()
+                }
+                .apply(fd)?;
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::io::AsRawSocket;
+            if sockopt.tcp_fast_open || sockopt.reuse_port {
+                // Windows setReusePort 为 no-op（sockopt_windows.go:188-190），仅 TFO 生效。
+                crate::sockopt::windows::WindowsSockOpt {
+                    tcp_fast_open: if sockopt.tcp_fast_open { 1 } else { -1 },
+                    ..Default::default()
+                }
+                .apply(socket.as_raw_socket())?;
+            }
+        }
+        socket.listen(128)?;
+        socket.set_nonblocking(true)?;
+        #[cfg(unix)]
+        let std_listener = std::net::TcpListener::from(std::os::fd::OwnedFd::from(socket));
+        #[cfg(target_os = "windows")]
+        // SAFETY: socket 持有原始 SOCKET 句柄，转 std TcpListener 夺走所有权。
+        let std_listener = unsafe {
+            use std::os::windows::io::{FromRawSocket, IntoRawSocket};
+            std::net::TcpListener::from_raw_socket(socket.into_raw_socket())
+        };
+        Ok(TokioTcpListener::from_std(std_listener)?)
+    }
+
     /// MPTCP 监听绑定。对应 Go `lc.SetMultipathTCP(true)`（system_listener.go:110-112）。
     ///
     /// Linux：手动创建 socket 并在 bind 前设 `TCP_MPTCP`（内核不支持时记录并
     /// 静默回退普通 TCP，对齐 Go）。其他平台：Go 本身不支持 MPTCP 监听，直接普通绑定。
     #[cfg(not(target_os = "linux"))]
-    async fn bind_mptcp(addr: SocketAddr) -> io::Result<TokioTcpListener> {
+    async fn bind_mptcp(addr: SocketAddr, _sockopt: &SocketOptions) -> io::Result<TokioTcpListener> {
         TokioTcpListener::bind(addr).await
     }
 
     #[cfg(target_os = "linux")]
-    async fn bind_mptcp(addr: SocketAddr) -> io::Result<TokioTcpListener> {
+    async fn bind_mptcp(addr: SocketAddr, sockopt: &SocketOptions) -> io::Result<TokioTcpListener> {
         use socket2::{Domain, Protocol, Type};
         let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
         let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
         // TCP_MPTCP 必须在 listen 前设置；失败（如内核未编译 MPTCP）静默回退普通 TCP。
         if let Err(e) = crate::sockopt::try_set_mptcp(&socket) {
             tracing::debug!(error = %e, "MPTCP unavailable, falling back to TCP");
+        }
+        // 顺路复用 prelisten 路径处理 TFO/REUSEPORT。
+        if sockopt.reuse_port {
+            use std::os::fd::AsRawFd;
+            crate::sockopt::linux::LinuxSockOpt { reuse_port: true, ..Default::default() }
+                .apply(socket.as_raw_fd())?;
+        }
+        if sockopt.tcp_fast_open {
+            use std::os::fd::AsRawFd;
+            crate::sockopt::linux::LinuxSockOpt {
+                tcp_fast_open: 1,
+                inbound: true,
+                ..Default::default()
+            }
+            .apply(socket.as_raw_fd())?;
         }
         socket.bind(&addr.into())?;
         socket.listen(128)?;
