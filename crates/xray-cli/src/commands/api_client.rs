@@ -1,9 +1,10 @@
 //! gRPC API 客户端封装。
 //!
-//! 通过 tonic dial 连接 commander gRPC server，提供三个 service client：
-//! - HandlerServiceClient（add/remove inbound/outbound）
-//! - StatsServiceClient（stats/stats-query/sys-stats）
-//! - RoutingServiceClient（add/remove rule）
+//! 通过 tonic dial 连接 commander gRPC server，提供四个 service client：
+//! - HandlerServiceClient（add/remove inbound/outbound + 用户管理）
+//! - StatsServiceClient（stats/stats-query/sys-stats + 在线用户）
+//! - RoutingServiceClient（add/remove rule + balancer）
+//! - LoggerServiceClient（restart-logger）
 
 use std::time::Duration;
 
@@ -52,6 +53,11 @@ impl ApiClient {
     /// 创建 RoutingService client（router command）。
     pub fn routing_client(&self) -> xray_proto::xray::app::router::command::routing_service_client::RoutingServiceClient<Channel> {
         xray_proto::xray::app::router::command::routing_service_client::RoutingServiceClient::new(self.channel.clone())
+    }
+
+    /// 创建 LoggerService client（log command：restart-logger）。
+    pub fn logger_client(&self) -> xray_proto::xray::app::log::command::logger_service_client::LoggerServiceClient<Channel> {
+        xray_proto::xray::app::log::command::logger_service_client::LoggerServiceClient::new(self.channel.clone())
     }
 
     /// 返回请求超时时长。

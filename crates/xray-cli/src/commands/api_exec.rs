@@ -1,17 +1,30 @@
 //! # API 命令 execute 函数
 //!
-//! 通过 gRPC 调用 commander API。8 个核心命令已接通真实 RPC，
-//! 其余命令仍返回 [`CliError::Unimplemented`]。
+//! 通过 gRPC 调用 commander API。Go 全部 23 个子命令已在 Rust 端接通真实 RPC
+//! （proxyman / stats / router / logger service client + HandlerService 用户管理）。
+//!
+//! 实现层仅做：参数反序列化 + gRPC request 构造 + RPC 调用 + 响应打印。
+//! 后端业务逻辑（commaner gRPC server）由 `xray-core` 端的 gRPC server 提供。
 
 use std::io::Read;
 
+
 use tonic::Request;
 
+use xray_proto::xray::app::log::command::RestartLoggerRequest;
 use xray_proto::xray::app::proxyman::command::{
-    AddInboundRequest, AddOutboundRequest, RemoveInboundRequest, RemoveOutboundRequest,
+    AddInboundRequest, AddOutboundRequest, AddUserOperation, AlterInboundRequest,
+    GetInboundUserRequest, ListInboundsRequest, ListOutboundsRequest, RemoveInboundRequest,
+    RemoveOutboundRequest, RemoveUserOperation,
 };
-use xray_proto::xray::app::router::command::{AddRuleRequest, RemoveRuleRequest};
-use xray_proto::xray::app::stats::command::{GetStatsRequest, QueryStatsRequest};
+use xray_proto::xray::app::router::command::{
+    AddRuleRequest, GetBalancerInfoRequest, ListRuleRequest, OverrideBalancerTargetRequest,
+    RemoveRuleRequest,
+};
+use xray_proto::xray::app::stats::command::{
+    GetAllOnlineUsersRequest, GetStatsRequest, GetUsersStatsRequest, QueryStatsRequest,
+    SysStatsRequest,
+};
 use xray_proto::xray::common::serial::TypedMessage;
 use xray_proto::xray::core::{InboundHandlerConfig, OutboundHandlerConfig};
 
@@ -19,16 +32,6 @@ use crate::commands::api_client::ApiClient;
 use crate::error::CliError;
 
 use super::api_args::*;
-
-/// 生成返回 Unimplemented 的函数体。
-macro_rules! api_stub {
-    ($args:expr, $what:expr) => {
-        {
-            let _ = &$args;
-            Err(CliError::Unimplemented { what: $what })
-        }
-    };
-}
 
 /// 读取配置参数（文件路径、`stdin:`、或 HTTP URL）。
 fn load_config(arg: &str) -> Result<Vec<u8>, CliError> {
@@ -321,82 +324,518 @@ pub async fn execute_stats_query(args: &StatsQueryArgs) -> Result<(), CliError> 
     print_response(&resp.into_inner(), args.api.json);
     Ok(())
 }
-
 // ---------------------------------------------------------------------------
-// 仍为 stub 的命令（待后续切片接通）
+// 接通 gRPC 的剩余 15 个命令
 // ---------------------------------------------------------------------------
 
-/// list-inbounds execute。
+/// list-inbounds：发送 ListInboundsRequest { is_only_tags }。
 pub async fn execute_list_inbounds(args: &ListInboundsArgs) -> Result<(), CliError> {
-    api_stub!(args.only_tags, "api list-inbounds: gRPC client not yet wired")
+    let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
+    let mut handler = client.handler_client();
+
+    let req = Request::new(ListInboundsRequest {
+        is_only_tags: args.only_tags,
+    });
+    let resp = handler
+        .list_inbounds(req)
+        .await
+        .map_err(|e| CliError::ApiRequestFailed(format!("failed to list inbounds: {e}")))?;
+
+    print_response(&resp.into_inner(), args.api.json);
+    Ok(())
 }
 
-/// list-outbounds execute。
+/// list-outbounds：发送 ListOutboundsRequest {}。
 pub async fn execute_list_outbounds(args: &ListOutboundsArgs) -> Result<(), CliError> {
-    api_stub!(args.only_tags, "api list-outbounds: gRPC client not yet wired")
+    let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
+    let mut handler = client.handler_client();
+
+    let req = Request::new(ListOutboundsRequest {});
+    let resp = handler
+        .list_outbounds(req)
+        .await
+        .map_err(|e| CliError::ApiRequestFailed(format!("failed to list outbounds: {e}")))?;
+
+    print_response(&resp.into_inner(), args.api.json);
+    Ok(())
 }
 
-/// list-rules execute。
+/// list-rules：发送 ListRuleRequest {}。
 pub async fn execute_list_rules(args: &ListRulesArgs) -> Result<(), CliError> {
-    api_stub!(args.api.server, "api list-rules: gRPC client not yet wired")
+    let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
+    let mut routing = client.routing_client();
+
+    let req = Request::new(ListRuleRequest {});
+    let resp = routing
+        .list_rule(req)
+        .await
+        .map_err(|e| CliError::ApiRequestFailed(format!("failed to list rules: {e}")))?;
+
+    print_response(&resp.into_inner(), args.api.json);
+    Ok(())
 }
 
-/// sys-stats execute。
+/// sys-stats：发送 SysStatsRequest {}。
 pub async fn execute_sys_stats(args: &SysStatsArgs) -> Result<(), CliError> {
-    api_stub!(args.api.server, "api sys-stats: gRPC client not yet wired")
+    let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
+    let mut stats = client.stats_client();
+
+    let req = Request::new(SysStatsRequest {});
+    let resp = stats
+        .get_sys_stats(req)
+        .await
+        .map_err(|e| CliError::ApiRequestFailed(format!("failed to get sys stats: {e}")))?;
+
+    print_response(&resp.into_inner(), args.api.json);
+    Ok(())
 }
 
-/// restart-logger execute。
+/// restart-logger：发送 RestartLoggerRequest {} 到 LoggerService。
 pub async fn execute_restart_logger(args: &RestartLoggerArgs) -> Result<(), CliError> {
-    api_stub!(args.api.server, "api restart-logger: gRPC client not yet wired")
+    let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
+    let mut logger = client.logger_client();
+
+    let req = Request::new(RestartLoggerRequest {});
+    logger
+        .restart_logger(req)
+        .await
+        .map_err(|e| CliError::ApiRequestFailed(format!("failed to restart logger: {e}")))?;
+
+    println!("logger restarted");
+    Ok(())
 }
 
-/// add-user execute。
+/// add-user：循环配置文件 → 提取 inbound 用户 → AlterInbound(AddUserOperation)。
+///
+/// 对应 Go `inbound_user_add.go::executeAddInboundUsers` + `extractInboundUsers`：
+/// 配置文件为标准 xray config JSON，每个 inbound 的 `settings.clients` (vmess) /
+/// `settings.clients` (vless/trojan) / `settings.users` (ss) 作为用户来源。
 pub async fn execute_add_user(args: &AddUserArgs) -> Result<(), CliError> {
-    api_stub!(args.config, "api add-user: gRPC client not yet wired")
+    let data = load_config(&args.config)?;
+    let inbounds = build_inbound_configs(&data)?;
+
+    let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
+    let mut handler = client.handler_client();
+
+    let mut success = 0;
+    for ib in &inbounds {
+        let tag = ib.tag.clone();
+        if tag.is_empty() {
+            continue;
+        }
+        let users = extract_users_from_inbound(ib);
+        if users.is_empty() {
+            continue;
+        }
+        for user in users {
+            if user.email.is_empty() {
+                continue;
+            }
+            let op = AddUserOperation { user: Some(user) };
+            let typed = TypedMessage {
+                r#type: "xray.app.proxyman.command.AddUserOperation".to_string(),
+                value: prost::Message::encode_to_vec(&op),
+            };
+            let req = Request::new(AlterInboundRequest {
+                tag: tag.clone(),
+                operation: Some(typed),
+            });
+            match handler.alter_inbound(req).await {
+                Ok(_) => {
+                    println!("add user: ok");
+                    success += 1;
+                }
+                Err(e) => {
+                    println!("add user error: {e}");
+                }
+            }
+        }
+    }
+    println!("Added {success} user(s) in total.");
+    Ok(())
 }
 
-/// remove-user execute。
+/// remove-user：对每个 email 调用 AlterInbound(RemoveUserOperation { email })。
 pub async fn execute_remove_user(args: &RemoveUserArgs) -> Result<(), CliError> {
-    api_stub!(args.emails, "api remove-user: gRPC client not yet wired")
+    if args.tag.is_empty() {
+        return Err(CliError::InvalidArgument("inbound tag not specified".into()));
+    }
+
+    let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
+    let mut handler = client.handler_client();
+
+    let mut success = 0;
+    for email in &args.emails {
+        println!("remove user: {email}");
+        let op = RemoveUserOperation { email: email.clone() };
+        let typed = TypedMessage {
+            r#type: "xray.app.proxyman.command.RemoveUserOperation".to_string(),
+            value: prost::Message::encode_to_vec(&op),
+        };
+        let req = Request::new(AlterInboundRequest {
+            tag: args.tag.clone(),
+            operation: Some(typed),
+        });
+        match handler.alter_inbound(req).await {
+            Ok(_) => success += 1,
+            Err(e) => println!("remove user error: {e}"),
+        }
+    }
+    println!("Removed {success} user(s) in total.");
+    Ok(())
 }
 
-/// inbound-user execute。
+/// inbound-user：发送 GetInboundUserRequest { tag, email }。
 pub async fn execute_inbound_user(args: &InboundUserArgs) -> Result<(), CliError> {
-    api_stub!(args.email, "api inbound-user: gRPC client not yet wired")
+    let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
+    let mut handler = client.handler_client();
+
+    let req = Request::new(GetInboundUserRequest {
+        tag: args.tag.clone(),
+        email: args.email.clone(),
+    });
+    let resp = handler
+        .get_inbound_users(req)
+        .await
+        .map_err(|e| CliError::ApiRequestFailed(format!("failed to get inbound user: {e}")))?;
+
+    print_response(&resp.into_inner(), args.api.json);
+    Ok(())
 }
 
-/// inbound-user-count execute。
+/// inbound-user-count：发送 GetInboundUserRequest { tag }（email 留空）。
 pub async fn execute_inbound_user_count(args: &InboundUserCountArgs) -> Result<(), CliError> {
-    api_stub!(args.tag, "api inbound-user-count: gRPC client not yet wired")
+    let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
+    let mut handler = client.handler_client();
+
+    let req = Request::new(GetInboundUserRequest {
+        tag: args.tag.clone(),
+        email: String::new(),
+    });
+    let resp = handler
+        .get_inbound_users_count(req)
+        .await
+        .map_err(|e| CliError::ApiRequestFailed(format!("failed to get inbound user count: {e}")))?;
+
+    print_response(&resp.into_inner(), args.api.json);
+    Ok(())
 }
 
-/// balancer-info execute。
+/// balancer-info：发送 GetBalancerInfoRequest { tag }。
 pub async fn execute_balancer_info(args: &BalancerInfoArgs) -> Result<(), CliError> {
-    api_stub!(args.balancer, "api balancer-info: gRPC client not yet wired")
+    let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
+    let mut routing = client.routing_client();
+
+    let req = Request::new(GetBalancerInfoRequest {
+        tag: args.balancer.clone(),
+    });
+    let resp = routing
+        .get_balancer_info(req)
+        .await
+        .map_err(|e| CliError::ApiRequestFailed(format!("failed to get balancer info: {e}")))?;
+
+    print_response(&resp.into_inner(), args.api.json);
+    Ok(())
 }
 
-/// balancer-override execute。
+/// balancer-override：发送 OverrideBalancerTargetRequest { balancer_tag, target }。
+/// `--remove` 模式：target 留空（清空覆盖）。
 pub async fn execute_balancer_override(args: &BalancerOverrideArgs) -> Result<(), CliError> {
-    api_stub!(args.remove, "api balancer-override: gRPC client not yet wired")
+    if args.balancer.is_empty() {
+        return Err(CliError::InvalidArgument("balancer tag not specified".into()));
+    }
+
+    let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
+    let mut routing = client.routing_client();
+
+    let target = if args.remove { String::new() } else { args.target.clone() };
+    let req = Request::new(OverrideBalancerTargetRequest {
+        balancer_tag: args.balancer.clone(),
+        target,
+    });
+    routing
+        .override_balancer_target(req)
+        .await
+        .map_err(|e| CliError::ApiRequestFailed(format!("failed to override balancer: {e}")))?;
+
+    Ok(())
 }
 
-/// source-ip-block execute。
+/// source-ip-block：构造 RoutingConfig（ruleTag + inboundTag + outboundTag + source ips），
+/// 若 `--reset` 先 RemoveRule，再 AddRule(append=true)。
 pub async fn execute_source_ip_block(args: &SourceIpBlockArgs) -> Result<(), CliError> {
-    api_stub!(args.ips, "api source-ip-block: gRPC client not yet wired")
+    if args.ips.is_empty() {
+        return Err(CliError::InvalidArgument("no IPs provided".into()));
+    }
+
+    // 构造与 Go 等价的 RoutingConfig JSON
+    let inbound_tag: Vec<String> = args.inbound.iter().cloned().collect();
+    let routing_json = serde_json::json!({
+        "routing": {
+            "rules": [{
+                "ruleTag": args.rule_tag,
+                "inboundTag": inbound_tag,
+                "outboundTag": args.outbound.as_deref().unwrap_or("blocked"),
+                "source": args.ips,
+            }]
+        }
+    });
+
+    let config = serde_json::to_vec(&routing_json).unwrap_or_default();
+    let typed = TypedMessage {
+        r#type: "xray.app.router.RoutingConfig".to_string(),
+        value: config,
+    };
+
+    let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
+    let mut routing = client.routing_client();
+
+    if args.reset {
+        let rm_req = Request::new(RemoveRuleRequest {
+            rule_tag: args.rule_tag.clone(),
+        });
+        let rm_resp = routing
+            .remove_rule(rm_req)
+            .await
+            .map_err(|e| CliError::ApiRequestFailed(format!("failed to remove rule: {e}")))?;
+        print_response(&rm_resp.into_inner(), args.api.json);
+    }
+
+    let req = Request::new(AddRuleRequest {
+        config: Some(typed),
+        should_append: true,
+    });
+    let resp = routing
+        .add_rule(req)
+        .await
+        .map_err(|e| CliError::ApiRequestFailed(format!("failed to add rule: {e}")))?;
+
+    print_response(&resp.into_inner(), args.api.json);
+    Ok(())
 }
 
-/// stats-online execute。
+/// stats-online：发送 GetStatsRequest { name: "user>>>EMAIL>>>online", reset: false }。
 pub async fn execute_stats_online(args: &StatsOnlineArgs) -> Result<(), CliError> {
-    api_stub!(args.email, "api stats-online: gRPC client not yet wired")
+    let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
+    let mut stats = client.stats_client();
+
+    let stat_name = format!("user>>>{}>>>online", args.email);
+    let req = Request::new(GetStatsRequest {
+        name: stat_name,
+        reset: false,
+    });
+    let resp = stats
+        .get_stats_online(req)
+        .await
+        .map_err(|e| CliError::ApiRequestFailed(format!("failed to get stats: {e}")))?;
+
+    print_response(&resp.into_inner(), args.api.json);
+    Ok(())
 }
 
-/// online-ip-list execute。
+/// online-ip-list：`--all` 模式 → GetUsersStatsRequest；否则 GetStatsRequest。
 pub async fn execute_online_ip_list(args: &OnlineIpListArgs) -> Result<(), CliError> {
-    api_stub!(args.all, "api online-ip-list: gRPC client not yet wired")
+    let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
+    let mut stats = client.stats_client();
+
+    if args.all {
+        if args.email.is_some() {
+            return Err(CliError::InvalidArgument(
+                "-all and -email are mutually exclusive".into(),
+            ));
+        }
+        let req = Request::new(GetUsersStatsRequest {
+            include_traffic: args.include_traffic,
+            reset: args.reset,
+        });
+        let resp = stats
+            .get_users_stats(req)
+            .await
+            .map_err(|e| CliError::ApiRequestFailed(format!("failed to get users stats: {e}")))?;
+        print_response(&resp.into_inner(), args.api.json);
+    } else {
+        let email = args
+            .email
+            .as_deref()
+            .ok_or_else(|| CliError::InvalidArgument("either -all or -email required".into()))?;
+        let stat_name = format!("user>>>{email}>>>online");
+        let req = Request::new(GetStatsRequest {
+            name: stat_name,
+            reset: false,
+        });
+        let resp = stats
+            .get_stats_online_ip_list(req)
+            .await
+            .map_err(|e| {
+                CliError::ApiRequestFailed(format!("failed to get online ip list: {e}"))
+            })?;
+        print_response(&resp.into_inner(), args.api.json);
+    }
+    Ok(())
 }
 
-/// online-users execute。
+/// online-users：发送 GetAllOnlineUsersRequest {}。
 pub async fn execute_online_users(args: &OnlineUsersArgs) -> Result<(), CliError> {
-    api_stub!(args.api.server, "api online-users: gRPC client not yet wired")
+    let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
+    let mut stats = client.stats_client();
+
+    let req = Request::new(GetAllOnlineUsersRequest {});
+    let resp = stats
+        .get_all_online_users(req)
+        .await
+        .map_err(|e| CliError::ApiRequestFailed(format!("failed to get online users: {e}")))?;
+
+    print_response(&resp.into_inner(), args.api.json);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// add-user 辅助：从 JSON 配置提取 (tag, Vec<User>)。
+// ---------------------------------------------------------------------------
+
+/// 从标准 xray config JSON 提取每个 inbound 的用户列表。
+///
+/// 对应 Go `extractInboundUsers` + 各协议的 `Build()`：支持 vmess / vless / trojan / ss /
+/// ss2022。每个用户构造 proto `User { level, email, account: TypedMessage }`。
+fn extract_users_from_inbound(ib: &InboundHandlerConfig) -> Vec<xray_proto::xray::common::protocol::User> {
+    let Some(proxy) = &ib.proxy_settings else { return Vec::new() };
+    // proxy.value 是 settings JSON 编码字节；根据 protocol 字段决定字段路径。
+    let settings: serde_json::Value = match serde_json::from_slice(&proxy.value) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    // vmess/vless/trojan: settings.clients[] = { id, email, level }
+    // ss/ss2022:        settings.users[]   = { email, level, password, method?, cipher? }
+    let candidates: &[(&str, &str)] = &[
+        ("vmess", "clients"),
+        ("vless", "clients"),
+        ("trojan", "clients"),
+        ("shadowsocks", "users"),
+        ("shadowsocks_2022", "users"),
+    ];
+    let mut users = Vec::new();
+    for (proto, field) in candidates {
+        if !proxy.r#type.contains(proto) {
+            continue;
+        }
+        let Some(arr) = settings.get(*field).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for entry in arr {
+            let email = entry
+                .get("email")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let level = entry
+                .get("level")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            let account_json = serde_json::to_vec(entry).unwrap_or_default();
+            let account = TypedMessage {
+                r#type: format!("xray.proxy.{proto}.Account"),
+                value: account_json,
+            };
+            users.push(xray_proto::xray::common::protocol::User {
+                level,
+                email,
+                account: Some(account),
+            });
+        }
+    }
+    users
+}
+
+/// 单元测试：验证协议字段路径与 User 构造。
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inbound_with_settings(proto: &str, settings_json: serde_json::Value) -> InboundHandlerConfig {
+        let value = serde_json::to_vec(&settings_json).unwrap();
+        InboundHandlerConfig {
+            tag: "vless-in".into(),
+            receiver_settings: None,
+            proxy_settings: Some(TypedMessage {
+                r#type: format!("xray.proxy.{proto}.Config"),
+                value,
+            }),
+        }
+    }
+
+    #[test]
+    fn extract_vless_users_builds_user_with_account() {
+        let ib = inbound_with_settings(
+            "vless",
+            serde_json::json!({
+                "clients": [
+                    {"id": "uuid-1", "email": "a@x", "level": 1},
+                    {"id": "uuid-2", "email": "b@x"}
+                ]
+            }),
+        );
+        let users = extract_users_from_inbound(&ib);
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0].email, "a@x");
+        assert_eq!(users[0].level, 1);
+        assert!(users[0].account.is_some());
+        let acc = users[0].account.as_ref().unwrap();
+        assert!(acc.r#type.contains("vless"));
+    }
+
+    #[test]
+    fn extract_vmess_users_uses_clients_field() {
+        let ib = inbound_with_settings(
+            "vmess",
+            serde_json::json!({
+                "clients": [{"id": "u", "email": "v@x", "level": 0}]
+            }),
+        );
+        let users = extract_users_from_inbound(&ib);
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].email, "v@x");
+    }
+
+    #[test]
+    fn extract_ss_users_uses_users_field() {
+        let ib = inbound_with_settings(
+            "shadowsocks",
+            serde_json::json!({
+                "users": [{"email": "ss@x", "password": "p", "method": "aes-256-gcm", "level": 0}]
+            }),
+        );
+        let users = extract_users_from_inbound(&ib);
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].email, "ss@x");
+    }
+
+    #[test]
+    fn extract_unknown_proto_returns_empty() {
+        let ib = inbound_with_settings("socks", serde_json::json!({"foo": "bar"}));
+        assert!(extract_users_from_inbound(&ib).is_empty());
+    }
+
+    #[test]
+    fn extract_missing_proxy_settings_returns_empty() {
+        let ib = InboundHandlerConfig {
+            tag: "x".into(),
+            receiver_settings: None,
+            proxy_settings: None,
+        };
+        assert!(extract_users_from_inbound(&ib).is_empty());
+    }
+
+    #[test]
+    fn extract_invalid_json_returns_empty() {
+        let ib = InboundHandlerConfig {
+            tag: "x".into(),
+            receiver_settings: None,
+            proxy_settings: Some(TypedMessage {
+                r#type: "xray.proxy.vmess.Config".into(),
+                value: vec![0xff, 0xfe],
+            }),
+        };
+        assert!(extract_users_from_inbound(&ib).is_empty());
+    }
 }

@@ -26,6 +26,11 @@ base64 = "0.22"
 blake3 = "1"
 rand = { workspace = true }
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+# tls ping：tokio-rustls 握手 + x509-parser 证书字段提取
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+x509-parser = "0.18"
+rustls-pemfile = "2"
 # PQ 密钥生成（bd a1h）：ml-kem 与 xray-proxy-vless 对齐；ml-dsa 无 workspace 现成实现，
 # 预授权引入 RustCrypto 官方 crate
 ml-kem = "0.3"

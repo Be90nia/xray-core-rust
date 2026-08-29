@@ -3,6 +3,8 @@
 //! 翻译自 Go `transport/internet/tls/config.go` + `infra/conf/transport_internet.go`
 //! 中与证书相关的部分：
 //! - `generate_self_signed_cert`：rcgen 自签（Go `tls.go::Generate`）
+//! - `generate_self_signed_cert_with_options`：支持 is_ca/org/CN/expire 的变体，
+//!   对应 Go `main/commands/all/tls/cert.go::executeCert` 的 flag 选项
 //! - `extract_cert_names`：CN + DNS SAN 提取（SNI 选择用）
 //! - `EntryUsage` + `entry_usage` + `entry_certs_and_key`：`certificates[]` 条目
 //!   的 usage 分类与 file-or-inline 读取（Go `TLSCertConfig.Build` + `readFileOrString`）
@@ -12,9 +14,16 @@
 //! 签发路径 `getGetCertificateFunc` 为非目标）、`is_certificate_expired`（热重载 ticker
 //! 专用，热重载为已知技术债）、`load_self_cert_pool`（被 DER 直加 `RootCertStore` 取代）。
 //! 钉扎校验 [`crate::config::verify_chain`] 由 `client_config` 的钉扎 verifier 接入。
-
+//!
+//! # 副作用
+//!
+//! `generate_self_signed_cert*` 是**确定性 + 无 I/O 副作用**的纯计算：rcgen 在内存
+//! 里构造 `CertificateParams` + 生成临时 `KeyPair` + 私钥签名 → 输出 PEM 文本。
+//! 调用方若要落盘需自行 `fs::write`。
 use std::io;
+use std::time::Duration as StdDuration;
 
+use rcgen::{BasicConstraints, IsCa, KeyUsagePurpose};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 // ============================================================
@@ -44,6 +53,71 @@ pub fn generate_self_signed_cert(common_names: &[&str]) -> io::Result<(String, S
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
     Ok((cert.pem(), key_pair.serialize_pem()))
 }
+/// `generate_self_signed_cert_with_options` 的可选参数。
+///
+/// 对应 Go `main/commands/all/tls/cert.go::executeCert` 的 flag：
+/// - `common_name` ↔ `--name`（CN；默认 "Xray Inc"）
+/// - `organization` ↔ `--org`（O；默认 "Xray Inc"）
+/// - `is_ca` ↔ `--ca`（CA 证书，签发能力 + key usages CertSign/KeyEncipherment/DigitalSignature）
+/// - `not_after` ↔ `--expire`（自此刻起的有效期，std 库 Duration）
+#[derive(Debug, Clone)]
+pub struct CertOptions {
+    pub common_name: String,
+    pub organization: String,
+    pub is_ca: bool,
+    pub not_after: StdDuration,
+}
+
+impl Default for CertOptions {
+    fn default() -> Self {
+        Self {
+            common_name: "Xray Inc".to_string(),
+            organization: "Xray Inc".to_string(),
+            is_ca: false,
+            not_after: StdDuration::from_secs(90 * 24 * 60 * 60),
+        }
+    }
+}
+
+/// 生成自签名证书（带 options）。
+///
+/// 对应 Go `main/commands/all/tls/cert.go::executeCert`。
+/// 返回 `(cert_pem, key_pem)`。
+pub fn generate_self_signed_cert_with_options(
+    domains: &[String],
+    opts: &CertOptions,
+) -> io::Result<(String, String)> {
+    let mut params = rcgen::CertificateParams::new(domains.to_vec())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    params.distinguished_name.push(
+        rcgen::DnType::CommonName,
+        opts.common_name.clone(),
+    );
+    params.distinguished_name.push(
+        rcgen::DnType::OrganizationName,
+        opts.organization.clone(),
+    );
+    let not_after = time::OffsetDateTime::now_utc()
+        + time::Duration::try_from(opts.not_after).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("not_after: {e}"))
+        })?;
+    params.not_after = not_after;
+    if opts.is_ca {
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::KeyEncipherment,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+    }
+    let key_pair = rcgen::KeyPair::generate()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    Ok((cert.pem(), key_pair.serialize_pem()))
+}
+
 
 /// 从单个 DER 证书提取 `(CommonName, DNS SANs)`，名称一律转小写。
 ///
@@ -213,6 +287,111 @@ mod tests {
         assert!(cn.is_none());
         assert!(sans.is_empty());
     }
+
+
+    #[test]
+    fn options_default_matches_go_ninety_days() {
+        // Go `cmdCert.Flag.Duration("expire", 90d)` 默认 90 天
+        assert_eq!(
+            CertOptions::default().not_after,
+            StdDuration::from_secs(90 * 24 * 60 * 60)
+        );
+        assert!(!CertOptions::default().is_ca);
+        assert_eq!(CertOptions::default().common_name, "Xray Inc");
+        assert_eq!(CertOptions::default().organization, "Xray Inc");
+    }
+
+    #[test]
+    fn with_options_ca_sets_basic_constraints() {
+        let (cert_pem, key_pem) = generate_self_signed_cert_with_options(
+            &["ca.test".to_string()],
+            &CertOptions {
+                is_ca: true,
+                ..CertOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(cert_pem.contains("BEGIN CERTIFICATE"));
+        assert!(key_pem.contains("BEGIN PRIVATE KEY"));
+        use x509_parser::prelude::FromDer;
+        let der = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap();
+        let (_, cert) =
+            x509_parser::certificate::X509Certificate::from_der(&der).unwrap();
+        let bc = cert.basic_constraints().unwrap();
+        assert!(bc.map(|b| b.value.ca).unwrap_or(false));
+    }
+
+    #[test]
+    fn with_options_org_and_cn_baked_into_subject() {
+        let (cert_pem, _) = generate_self_signed_cert_with_options(
+            &["test.example".to_string()],
+            &CertOptions {
+                common_name: "My CN".to_string(),
+                organization: "My Org".to_string(),
+                ..CertOptions::default()
+            },
+        )
+        .unwrap();
+        use x509_parser::prelude::FromDer;
+        let der = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap();
+        let (_, cert) =
+            x509_parser::certificate::X509Certificate::from_der(&der).unwrap();
+        let subject = cert.subject().to_string();
+        assert!(subject.contains("My Org"), "subject should contain O=My Org: {subject}");
+        assert!(subject.contains("My CN"), "subject should contain CN=My CN: {subject}");
+    }
+
+    #[test]
+    fn with_options_multiple_domains_appear_as_sans() {
+        let domains = vec!["a.test".to_string(), "b.test".to_string(), "c.test".to_string()];
+        let (cert_pem, _) = generate_self_signed_cert_with_options(
+            &domains,
+            &CertOptions::default(),
+        )
+        .unwrap();
+        use x509_parser::prelude::FromDer;
+        let der = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap();
+        let (_, cert) =
+            x509_parser::certificate::X509Certificate::from_der(&der).unwrap();
+        let sans: Vec<String> = cert
+            .subject_alternative_name()
+            .unwrap()
+            .unwrap()
+            .value
+            .general_names
+            .iter()
+            .filter_map(|gn| match gn {
+                x509_parser::prelude::GeneralName::DNSName(s) => Some(s.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(sans.contains(&"a.test".to_string()));
+        assert!(sans.contains(&"b.test".to_string()));
+        assert!(sans.contains(&"c.test".to_string()));
+    }
+
+    #[test]
+    fn with_options_zero_duration_succeeds() {
+        // not_after=0s 不应 panic；rcgen 接受 not_after = now
+        let result = generate_self_signed_cert_with_options(
+            &["x".to_string()],
+            &CertOptions {
+                not_after: StdDuration::from_secs(0),
+                ..CertOptions::default()
+            },
+        );
+        assert!(result.is_ok());
+    }
+
 
     #[test]
     fn entry_usage_mapping() {

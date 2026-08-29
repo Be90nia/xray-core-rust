@@ -240,7 +240,7 @@ async fn execute(command: Command) -> Result<(), CliError> {
         Command::Mlkem768(args) => keys::execute_mlkem768(&args),
         Command::Vlessenc => keys::execute_vlessenc(),
         Command::Api { command } => execute_api(&command).await,
-        Command::Tls { command } => tool::execute_tls(&command),
+        Command::Tls { command } => tool::execute_tls(&command).await,
         Command::Convert { command } => tool::execute_convert(&command),
     }
 }
