@@ -37,7 +37,8 @@ pub const DEFAULT_DOWNLINK_ONLY_TIMEOUT: Duration = Duration::from_secs(1);
 ///
 /// 对应 Go `defaultBufferSize`（512*1024，`XRAY_BUFSIZE` env 可调——此处不读 env，
 /// 需要时在装配层读后覆盖 policy）。
-pub const DEFAULT_BUFFER_CONNECTION: usize = 512 * 1024;
+/// 与 `BufferPolicy.connection` 同类型 `i32`。
+pub const DEFAULT_BUFFER_CONNECTION: i32 = 512 * 1024;
 
 /// Default buffer write size.
 pub const DEFAULT_BUFFER_WRITE: usize = 1024;
@@ -125,7 +126,14 @@ impl Default for StatsPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BufferPolicy {
     /// Connection buffer size.
-    pub connection: usize,
+    ///
+    /// `i32` 对齐 Go `Buffer.PerConnection int32`。约定：
+    /// - `>= 0`：每连接字节数（**仅 dispatch 用作 pipe limit，policy 本身不起分配**）。
+    /// - `-1`：无限缓冲。Go `pipe.OptionsFromContext` 见 `bp.PerConnection < 0` 分支跳过 SizeLimit；
+    ///   Rust 由 `xray_app_dispatcher` 直接透传到 `pipe.limit`，`pipe::PipeOption::is_full`
+    ///   在 `limit < 0` 时永不触发（已对齐 Go 行为）。
+    /// - `0`：不分配 per-conn 缓冲（VMessClosing/ZeroBuffer 等场景）。
+    pub connection: i32,
     /// Write buffer size.
     pub write: usize,
 }
@@ -172,10 +180,16 @@ pub struct SystemStats {
 ///   - `arm64` / `mips64` / `mips64el` → `4096`（4 KiB cache）
 ///   - 其他 → `524288`（512 KiB）
 #[must_use]
-pub fn default_buffer_connection_from_env(env_mb: Option<i64>) -> usize {
+pub fn default_buffer_connection_from_env(env_mb: Option<i64>) -> i32 {
     match env_mb {
-        Some(0) => usize::MAX,
-        Some(n) => (n as usize).saturating_mul(1024 * 1024),
+        Some(0) => -1, // -1 表示无限缓冲（policy.go:91-93 defaultBufferSize = -1）
+        Some(n) if n > 0 => {
+            let bytes = (n as i64).saturating_mul(1024 * 1024);
+            // clamp 到 i32 正值上限；超出视为「错误配置 → 0」（与 Go int32 截断语义近似）
+            i32::try_from(bytes.min(i32::MAX as i64)).unwrap_or(0)
+        }
+        // 负数（除 0）、无效输入 → 0（Go defaultBufferSize = int32(负) 截断到 0）
+        Some(_) => 0,
         None => {
             #[cfg(any(target_arch = "arm", target_arch = "mips"))]
             {
@@ -183,7 +197,7 @@ pub fn default_buffer_connection_from_env(env_mb: Option<i64>) -> usize {
             }
             #[cfg(any(target_arch = "arm64", target_arch = "mips64", target_arch = "mips64el"))]
             {
-                4 * 1024
+                (4 * 1024) as i32
             }
             #[cfg(not(any(
                 target_arch = "arm",
@@ -193,7 +207,7 @@ pub fn default_buffer_connection_from_env(env_mb: Option<i64>) -> usize {
                 target_arch = "mips64el",
             )))]
             {
-                512 * 1024
+                (512 * 1024) as i32
             }
         }
     }
@@ -332,29 +346,28 @@ mod tests {
         assert!(!s.outbound_downlink);
     }
 
-    // ====== 76q3: SystemBuffer PolicySystem.Stats/Buffer + env 解析 + GOARCH 分支 + Buffer=-1 无限 ======
+    // ====== 76q3 → 改: Buffer.connection: usize → i32，-1 直接对齐 Go int32 无限 ======
 
-    /// `XRAY_BUFSIZE=0` → 无限缓冲（policy.go:91-93：`defaultBufferSize = -1`，Rust 端映射为 `usize::MAX`）。
+    /// `XRAY_BUFSIZE=0` → 无限缓冲，对应 Go `policy.go:91-93 defaultBufferSize = -1`。
+    /// 现 `BufferPolicy.connection` 是 i32，-1 直接表达无限（不再映射为 usize::MAX）。
     #[test]
     fn test_default_buffer_env_zero_means_unlimited() {
-        // 对应 Go features/policy/policy.go:91-93: env=0 → defaultBufferSize = -1（无限）
         let size = default_buffer_connection_from_env(Some(0));
         assert_eq!(
-            size,
-            usize::MAX,
-            "env=0 must map to unlimited (usize::MAX), got {size}"
+            size, -1_i32,
+            "env=0 must map to unlimited (-1_i32), got {size}"
         );
     }
-
-    /// `XRAY_BUFSIZE=N`（N>0）→ N MiB（policy.go:104：`defaultBufferSize = int32(size) * 1024 * 1024`）。
+    /// `XRAY_BUFSIZE=N`（N>0）→ N MiB（policy.go:104 `defaultBufferSize = int32(size) * 1024 * 1024`）。
     #[test]
     fn test_default_buffer_env_n_mb_scales_by_mb() {
-        // 对应 Go features/policy/policy.go:103-104: env=N → N MiB
-        assert_eq!(default_buffer_connection_from_env(Some(1)), 1024 * 1024);
+        assert_eq!(default_buffer_connection_from_env(Some(1)), 1 * 1024 * 1024);
         assert_eq!(default_buffer_connection_from_env(Some(8)), 8 * 1024 * 1024);
         assert_eq!(default_buffer_connection_from_env(Some(64)), 64 * 1024 * 1024);
+        // 负数（除 0）→ 0（与 Go int32(负) 行为近似）；
+        // 巨大值会被 clamp 到 i32::MAX（与 Go int32 溢出不同，但不会 panic）。
+        assert_eq!(default_buffer_connection_from_env(Some(-7)), 0);
     }
-
     /// 未设 env：按本机 GOARCH 分支取值（policy.go:94-102）。
     /// 本机 Windows x86_64 落入「其他」分支 → 512 KiB。
     #[test]
@@ -435,11 +448,9 @@ mod tests {
 
     /// ivst · ZeroBuffer 行为：`Buffer.connection=0` 表示不分配 per-connection 缓冲
     /// （Go `testing/scenarios/policy_test.go:150 TestZeroBuffer` 测试场景）。
-    /// 本测试断言 connection=0 可正常表示，与负数 → usize::MAX 不冲突。
+    /// 本测试断言 connection=0 可正常表示，与无限（-1_i32）不冲突。
     #[test]
     fn test_zero_buffer_connection_zero_is_legal_value() {
-        // 对应 Go testing/scenarios/policy_test.go:150 TestZeroBuffer
-        // policy.Config{Buffer{Connection: 0}}
         let policy = Policy {
             timeout: TimeoutPolicy::default(),
             stats: StatsPolicy::default(),
@@ -449,10 +460,36 @@ mod tests {
             },
         };
         assert_eq!(policy.buffer.connection, 0, "Buffer.connection=0 is legal zero-buffer");
-        // 与「无限缓冲（usize::MAX）」互斥，二者分别对应：
+        // 0 ≠ -1（无限）；二者分别对应：
         //   0  = 不分配 per-conn 缓冲（VMessClosing/ZeroBuffer 场景）
-        //   usize::MAX = 无限（env=0 场景）
-        assert_ne!(policy.buffer.connection, usize::MAX);
+        //   -1 = 无限（env=0 / proto 一致）
+        assert_ne!(policy.buffer.connection, -1_i32);
+        assert_ne!(policy.buffer.connection, -2_i32); // 任意负值都不是合法下限
+    }
+
+    // ====== 改（Batch10 P3 无限支持）======
+
+    /// 默认 connection 与 Go defaultBufferSize 512 KiB 对齐。
+    #[test]
+    fn test_default_buffer_connection_is_positive_default() {
+        let buf = BufferPolicy::default();
+        assert_eq!(buf.connection, DEFAULT_BUFFER_CONNECTION);
+        assert!(buf.connection > 0, "default must not be unlimited");
+    }
+
+    /// Go semantic: BufferSize=0 (env) → -1 unlimited；
+    /// 这里用结构构造验证 connection=-1 可安全表示（不会 panic、不被 clamp 到 0）。
+    #[test]
+    fn test_buffer_connection_minus_one_is_unlimited_sentinel() {
+        let buf = BufferPolicy {
+            connection: -1,
+            write: DEFAULT_BUFFER_WRITE,
+        };
+        assert_eq!(buf.connection, -1);
+        // 作为 i64 透传到 pipe.limit（dispatcher default.rs:704,769）：
+        // `-1_i32 as i64 == -1_i64`，pipe.rs is_full 检查 `self.limit >= 0 && cur > limit`
+        // → 永真分支出无限语义。
+        let as_pipe_limit = buf.connection as i64;
+        assert!(as_pipe_limit < 0, "must stay negative when widened to i64");
     }
 }
-

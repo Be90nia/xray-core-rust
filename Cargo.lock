@@ -6087,6 +6087,7 @@ dependencies = [
  "xray-proxy-trojan",
  "xray-proxy-vless",
  "xray-proxy-vmess",
+ "xray-proxy-wireguard",
  "xray-reality",
  "xray-tls",
  "xray-transport",

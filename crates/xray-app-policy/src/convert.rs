@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use xray_features::policy::{BufferPolicy, Policy, StatsPolicy, TimeoutPolicy};
+use xray_features::policy::{BufferPolicy, Policy, StatsPolicy, TimeoutPolicy, DEFAULT_BUFFER_WRITE};
 use xray_proto::xray::app::policy::{Policy as ProtoPolicy, Second, SystemPolicy as ProtoSystemPolicy};
 
 pub use xray_features::policy::SystemStats;
@@ -63,15 +63,12 @@ pub fn policy_from_proto(proto: &ProtoPolicy) -> Policy {
     }
 
     if let Some(buf) = proto.buffer.as_ref() {
-        // proto 中 connection 是 int32，-1 表示无限缓冲；Rust BufferPolicy.connection 是 usize。
-        // 负值映射为 usize::MAX 表达"无限"。
-        let conn = if buf.connection < 0 {
-            usize::MAX
-        } else {
-            buf.connection as usize
-        };
+        // proto Buffer.connection 是 int32：-1 表示无限，0 = 不分配，>0 字节大小。
+        // Rust BufferPolicy.connection 也是 i32，1:1 直接对齐；dispatcher 层
+        // 把 i32 透传到 pipe.limit，`limit < 0` 时 pipe.rs is_full 永真分支出无限语义，
+        // 与 Go `transport/pipe.OptionsFromContext` `bp.PerConnection >= 0` 分支等价。
         policy.buffer = BufferPolicy {
-            connection: conn,
+            connection: buf.connection,
             write: policy.buffer.write, // proto 不提供 write 字段，保留默认
         };
     }
@@ -81,26 +78,33 @@ pub fn policy_from_proto(proto: &ProtoPolicy) -> Policy {
 
 /// 把 proto `SystemPolicy` 转换为本地 [`SystemStats`]。
 ///
-/// 对应 Go `(*SystemPolicy).ToCorePolicy()`。
+/// 对应 Go `(*SystemPolicy).ToCorePolicy()`。Batch10 P3 增补 proto `buffer`
+/// 子消息透传到 `SystemStats.buffer.connection`（i32 1:1）。
 pub fn system_stats_from_proto(proto: &ProtoSystemPolicy) -> SystemStats {
     let stats = proto.stats.as_ref();
+    let buffer = proto
+        .buffer
+        .as_ref()
+        .map_or_else(BufferPolicy::default, |b| BufferPolicy {
+            connection: b.connection,
+            write: DEFAULT_BUFFER_WRITE,
+        });
     SystemStats {
         inbound_uplink: stats.map(|s| s.inbound_uplink).unwrap_or(false),
         inbound_downlink: stats.map(|s| s.inbound_downlink).unwrap_or(false),
         outbound_uplink: stats.map(|s| s.outbound_uplink).unwrap_or(false),
         outbound_downlink: stats.map(|s| s.outbound_downlink).unwrap_or(false),
-        // Rust proto 当前 SystemPolicy 仅暴露 stats，buffer 字段未生成。
-        // 默认 512 KiB 与 Go System{Buffer: defaultBufferPolicy()} 对齐。
-        buffer: BufferPolicy::default(),
+        buffer,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xray_features::policy::DEFAULT_BUFFER_CONNECTION;
     use xray_proto::xray::app::policy::{
         policy::{Buffer as PolicyBuffer, Stats as PolicyStats, Timeout as PolicyTimeout},
-        system_policy::Stats as SystemPolicyStats,
+        system_policy::{Buffer as SystemPolicyBuffer, Stats as SystemPolicyStats},
     };
 
     #[test]
@@ -189,25 +193,28 @@ mod tests {
     }
 
     #[test]
-    fn policy_from_proto_negative_buffer_becomes_max() {
-        // Go 用 -1 表示无限缓冲；映射到 usize::MAX。
+    fn policy_from_proto_negative_buffer_becomes_minus_one() {
+        // Go 用 -1 表示无限缓冲；Rust BufferPolicy.connection 直接 i32 1:1 透传。
+        // 后续 dispatcher 写到 pipe.limit=-1，pipe.rs is_full 在 limit<0 时永真分支跳过 size check。
         let proto = ProtoPolicy {
             timeout: None,
             stats: None,
             buffer: Some(PolicyBuffer { connection: -1 }),
         };
         let p = policy_from_proto(&proto);
-        assert_eq!(p.buffer.connection, usize::MAX);
+        assert_eq!(p.buffer.connection, -1_i32, "negative i32 must survive as unlimited sentinel");
     }
 
     #[test]
     fn system_stats_from_proto_default() {
-        let proto = ProtoSystemPolicy { stats: None };
+        let proto = ProtoSystemPolicy { stats: None, buffer: None };
         let s = system_stats_from_proto(&proto);
         assert!(!s.inbound_uplink);
         assert!(!s.inbound_downlink);
         assert!(!s.outbound_uplink);
         assert!(!s.outbound_downlink);
+        // SystemPolicy proto 无 buffer 子消息 → 走 BufferPolicy::default()=512 KiB
+        assert_eq!(s.buffer.connection, DEFAULT_BUFFER_CONNECTION);
     }
 
     #[test]
@@ -219,6 +226,7 @@ mod tests {
                 outbound_uplink: true,
                 outbound_downlink: true,
             }),
+            buffer: None,
         };
         let s = system_stats_from_proto(&proto);
         assert!(s.inbound_uplink);
@@ -236,11 +244,55 @@ mod tests {
                 outbound_uplink: true,
                 outbound_downlink: false,
             }),
+            buffer: None,
         };
         let s = system_stats_from_proto(&proto);
         assert!(!s.inbound_uplink);
         assert!(s.inbound_downlink);
         assert!(s.outbound_uplink);
         assert!(!s.outbound_downlink);
+    }
+
+    // ====== 改（Batch10 P3 SystemPolicy proto buffer）======
+
+    #[test]
+    fn system_stats_from_proto_buffer_override_positive() {
+        let proto = ProtoSystemPolicy {
+            stats: None,
+            buffer: Some(SystemPolicyBuffer { connection: 2048 }),
+        };
+        let s = system_stats_from_proto(&proto);
+        assert_eq!(s.buffer.connection, 2048);
+    }
+
+    #[test]
+    fn system_stats_from_proto_buffer_override_unlimited() {
+        // SystemPolicy proto Buffer.connection=-1 → SystemStats.buffer.connection=-1（直接透传）。
+        let proto = ProtoSystemPolicy {
+            stats: None,
+            buffer: Some(SystemPolicyBuffer { connection: -1 }),
+        };
+        let s = system_stats_from_proto(&proto);
+        assert_eq!(s.buffer.connection, -1_i32);
+    }
+
+    #[test]
+    fn system_stats_from_proto_buffer_zero_is_legal() {
+        // SystemPolicy proto Buffer.connection=0 表示 ZeroBuffer；不走 default。
+        let proto = ProtoSystemPolicy {
+            stats: None,
+            buffer: Some(SystemPolicyBuffer { connection: 0 }),
+        };
+        let s = system_stats_from_proto(&proto);
+        assert_eq!(s.buffer.connection, 0, "Buffer=0 must survive round-trip");
+        assert_ne!(s.buffer.connection, DEFAULT_BUFFER_CONNECTION);
+    }
+
+    // 编译期自检：保证新生成 SystemPolicyBuffer struct 字段存在。
+    #[test]
+    fn system_policy_buffer_field_exists_compile_time() {
+        let buf = SystemPolicyBuffer::default();
+        assert_eq!(buf.connection, 0);
+        let _ = buf;
     }
 }

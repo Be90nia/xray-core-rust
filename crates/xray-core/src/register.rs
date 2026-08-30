@@ -455,6 +455,9 @@ fn policy_system_to_proto(
             outbound_uplink: sys.stats_outbound_uplink.unwrap_or(false),
             outbound_downlink: sys.stats_outbound_downlink.unwrap_or(false),
         }),
+        // Rust JSON `PolicySystem` 未暴露 buffer 字段（Go side 同样）；保留 None 走
+        // xray_app_policy 默认 512 KiB（policy.go:108-112 `defaultBufferPolicy`）。
+        buffer: None,
     }
 }
 /// 解析 Go duration 字符串（如 `"1m"`, `"30s"`, `"500ms"`）为毫秒。

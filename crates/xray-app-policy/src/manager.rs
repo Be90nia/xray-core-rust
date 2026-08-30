@@ -157,6 +157,7 @@ mod tests {
                     outbound_uplink: true,
                     outbound_downlink: false,
                 }),
+                buffer: None,
             }),
         };
         let manager = Manager::new(cfg).unwrap();

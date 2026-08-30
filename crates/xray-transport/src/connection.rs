@@ -135,6 +135,82 @@ impl Connection for TcpConnection {
     }
 }
 
+/// Unix domain socket 连接。仅 unix 目标编译。
+///
+/// 包装 `tokio::net::UnixStream`，提供 `Connection` 实现。供 splithttp unix
+/// listener 把 accepted UnixStream 经 tcpmask 包装后再下传（Go
+/// `splithttp/hub.go:547-549` 的 WrapListener 语义）。
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct UnixConnection {
+    inner: tokio::net::UnixStream,
+}
+
+#[cfg(unix)]
+impl UnixConnection {
+    #[must_use]
+    pub fn new(stream: tokio::net::UnixStream) -> Self {
+        Self { inner: stream }
+    }
+}
+
+#[cfg(unix)]
+impl AsyncRead for UnixConnection {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+#[cfg(unix)]
+impl AsyncWrite for UnixConnection {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(unix)]
+impl Connection for UnixConnection {
+    fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+        // UnixStream 无标准 SocketAddr；返回 None。
+        Ok(None)
+    }
+    fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+        Ok(None)
+    }
+    fn close_read(&mut self) -> io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let ret = unsafe { libc::shutdown(self.inner.as_raw_fd(), libc::SHUT_RD) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    fn close_write(&mut self) -> io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let ret = unsafe { libc::shutdown(self.inner.as_raw_fd(), libc::SHUT_WR) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
 impl AsyncRead for DuplexConnection {
     fn poll_read(
         mut self: Pin<&mut Self>,
