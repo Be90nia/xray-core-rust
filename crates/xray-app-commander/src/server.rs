@@ -127,8 +127,9 @@ impl std::fmt::Debug for OutboundListenerImpl {
 ///
 /// 持有 tag + 共享 listener 引用 + closed 状态。`close()` 同时关闭 listener。
 ///
-/// **未实现**：Go `Dispatch(ctx, *transport.Link)` 依赖 `xray_transport::Link`
-/// 全链路，待后续接入；上层拿到 [`OutboundListenerImpl`] 后即可启动 gRPC serve 循环。
+/// `dispatch`（Go `Outbound.Dispatch`，outbound.go:74-89）：Link →
+/// [`ContentNetworkConnection`](xray_transport::cnc) → 投递 listener →
+/// 阻塞等待连接关闭（closeSignal）。
 pub struct OutboundHandlerImpl {
     tag: String,
     listener: Arc<OutboundListenerImpl>,
@@ -150,32 +151,7 @@ impl OutboundHandlerImpl {
     pub fn listener(&self) -> &Arc<OutboundListenerImpl> {
         &self.listener
     }
-}
 
-#[async_trait::async_trait]
-impl XrayOutboundHandler for OutboundHandlerImpl {
-    fn tag(&self) -> &str {
-        &self.tag
-    }
-
-    async fn dial(
-        &self,
-        _destination: &Destination,
-        _session: &Session,
-    ) -> Result<(), OutboundError> {
-        // 当前阶段：不实际拨号，返回成功
-        // 后续接入 transport::Link 后实现真实 dispatch
-        Ok(())
-    }
-
-    fn can_handle(&self, _destination: &Destination) -> bool {
-        // 当前阶段：宣称能处理所有目的地
-        // 后续接入后根据 destination 做路由判断
-        true
-    }
-}
-
-impl OutboundHandlerImpl {
     /// 是否已关闭（本地状态，非 trait 方法）。
     pub fn closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
@@ -195,6 +171,99 @@ impl OutboundHandlerImpl {
         }
         // 关闭底层 listener（清空缓冲连接 + 唤醒 acceptor）
         self.listener.close()
+    }
+}
+
+impl xray_app_dispatcher::DispatchHandler for OutboundHandlerImpl {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    /// Link → cnc Connection → listener.add → 等待连接关闭。
+    ///
+    /// 对应 Go `Outbound.Dispatch`（outbound.go:74-89）：
+    /// - closed → 中断两侧（Rust：drop link parts 等价 Interrupt）；
+    /// - 正常 → `cnc.NewConnection(ConnectionInputMulti(w), ConnectionOutputMulti(r),
+    ///   ConnectionOnClose(closeSignal))` + `listener.add(c)` + `<-closeSignal.Wait()`。
+    fn dispatch(
+        &self,
+        _dest: &Destination,
+        link: xray_transport::link::Link,
+    ) -> xray_app_dispatcher::default::PinFuture<()> {
+        let listener = Arc::clone(&self.listener);
+        let closed = self.closed.load(Ordering::SeqCst);
+        Box::pin(async move {
+            if closed {
+                // Go: common.Interrupt(link.Reader/Writer) —— drop 即中断
+                return;
+            }
+            let (reader, writer) = link.into_parts();
+            let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
+            let conn = xray_transport::cnc::ContentNetworkConnection::new(reader, writer)
+                .with_on_close(move || {
+                    let _ = close_tx.send(());
+                });
+            listener.add(Box::new(conn));
+            // Go: <-closeSignal.Wait() —— Dispatch 阻塞到连接关闭（Drop 触发）
+            let _ = close_rx.await;
+        })
+    }
+}
+
+/// 生产路径遗留的简化 trait 实现（测试/编排用；gRPC HandlerService 的
+/// add/remove/list outbound 现走 [`crate::grpc::OutboundRuntime`] 或
+/// proxyman 领域 service）。
+#[async_trait::async_trait]
+impl XrayOutboundHandler for OutboundHandlerImpl {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    async fn dial(
+        &self,
+        _destination: &Destination,
+        _session: &Session,
+    ) -> Result<(), OutboundError> {
+        Ok(())
+    }
+
+    fn can_handle(&self, _destination: &Destination) -> bool {
+        true
+    }
+}
+
+/// DispatchHandler 注册器（Go `outbound.Manager.AddHandler/RemoveHandler`）。
+///
+/// Commander outbound 模式启动时把 [`OutboundHandlerImpl`] 注册进生产
+/// outbound manager（对应 Go `Commander.Start` 的 `ohm.RemoveHandler(tag)` +
+/// `ohm.AddHandler(&Outbound{...})`，commander.go:108-115）。
+pub trait DispatchRegistrar: Send + Sync {
+    /// 注册（覆盖同 tag 旧 handler）。
+    fn add_dispatch_handler(
+        &self,
+        tag: &str,
+        handler: Arc<dyn xray_app_dispatcher::DispatchHandler>,
+    ) -> Result<(), CommanderError>;
+
+    /// 按 tag 注销。返回是否存在。
+    fn remove_dispatch_handler(&self, tag: &str) -> bool;
+}
+
+/// 生产实现：dispatcher 的 `SimpleOhm`。
+pub struct SimpleOhmDispatchRegistrar(pub Arc<xray_app_dispatcher::default::SimpleOhm>);
+
+impl DispatchRegistrar for SimpleOhmDispatchRegistrar {
+    fn add_dispatch_handler(
+        &self,
+        tag: &str,
+        handler: Arc<dyn xray_app_dispatcher::DispatchHandler>,
+    ) -> Result<(), CommanderError> {
+        self.0.add(tag, handler);
+        Ok(())
+    }
+
+    fn remove_dispatch_handler(&self, tag: &str) -> bool {
+        self.0.remove(tag)
     }
 }
 

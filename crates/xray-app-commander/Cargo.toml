@@ -13,6 +13,9 @@ xray-app-stats = { path = "../xray-app-stats" }
 xray-app-router = { path = "../xray-app-router" }
 xray-app-log = { path = "../xray-app-log" }
 xray-app-observatory = { path = "../xray-app-observatory" }
+xray-app-proxyman = { path = "../xray-app-proxyman" }
+xray-app-dispatcher = { path = "../xray-app-dispatcher" }
+xray-transport = { path = "../xray-transport" }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
@@ -21,6 +24,10 @@ async-trait = { workspace = true }
 tonic = { workspace = true }
 tonic-reflection = { workspace = true }
 prost = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+xray-proto = { path = "../xray-proto", features = ["grpc-client"] }
+xray-buf = { path = "../xray-buf" }
+hyper-util = { workspace = true }

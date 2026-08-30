@@ -215,6 +215,13 @@ pub struct Commander {
     outbound_runtime: RwLock<Option<Arc<dyn crate::grpc::OutboundRuntime>>>,
     /// LoggerService gRPC 后端（bd ze3）：DefaultLogService → LogInstance::restart。
     logger_service: RwLock<Option<Arc<dyn xray_app_log::command::LogService>>>,
+    /// DispatchHandler 注册器（bd pa7）：outbound 模式下把 commander 的
+    /// outbound handler 注册进生产 outbound manager（SimpleOhm）。
+    dispatch_registrar: RwLock<Option<Arc<dyn crate::server::DispatchRegistrar>>>,
+    /// proxyman 领域 HandlerService（bd 7iqw）：inbound 7 op + alter_outbound 委托。
+    handler_service: RwLock<Option<Arc<dyn xray_app_proxyman::command::HandlerService>>>,
+    /// outbound 模式的 listener（start 后存在；close 时关闭以终止 serve）。
+    outbound_listener: RwLock<Option<Arc<crate::server::OutboundListenerImpl>>>,
 }
 
 impl Commander {
@@ -238,6 +245,9 @@ impl Commander {
             observatory_service: None,
             outbound_runtime: RwLock::new(None),
             logger_service: RwLock::new(None),
+            dispatch_registrar: RwLock::new(None),
+            handler_service: RwLock::new(None),
+            outbound_listener: RwLock::new(None),
         }
     }
     /// 从 [`Config`] 构造（不解码 TypedMessage，仅复制 tag/listen/service_configs 元数据）。
@@ -304,6 +314,21 @@ impl Commander {
     /// 注入 LoggerService gRPC 后端（bd ze3，`DefaultLogService` → LogInstance::restart）。
     pub fn set_logger_service(&self, service: Arc<dyn xray_app_log::command::LogService>) {
         *self.logger_service.write() = Some(service);
+    }
+
+    /// 注入 DispatchHandler 注册器（bd pa7）。`&self`（内部 RwLock）：
+    /// outbound 模式 start 前注入，commander 把自身 handler 注册进 SimpleOhm。
+    pub fn set_dispatch_registrar(&self, reg: Arc<dyn crate::server::DispatchRegistrar>) {
+        *self.dispatch_registrar.write() = Some(reg);
+    }
+
+    /// 注入 proxyman 领域 HandlerService（bd 7iqw）：inbound 7 op + alter_outbound
+    /// gRPC 委托（Go `handlerServer` 的 ihm/ohm）。
+    pub fn set_handler_service(
+        &self,
+        service: Arc<dyn xray_app_proxyman::command::HandlerService>,
+    ) {
+        *self.handler_service.write() = Some(service);
     }
     /// 添加 service。返回是否成功（type_url 重复时拒绝）。
     /// 对应 Go `c.services = append(c.services, service)`，加去重保护。
@@ -405,50 +430,119 @@ impl Commander {
         Ok(())
     }
 
-    /// 启动 gRPC server（listen 模式）。
+    /// 启动 gRPC server（三种模式，对应 Go `Commander.Start` commander.go:64-116）。
     ///
-    /// 解析 [`Self::listen`]，构建 tonic `Router`（注册 HandlerService），
-    /// `tokio::spawn` 后台 serve。JoinHandle 存入 `grpc_task`，供 [`Self::close`] abort。
+    /// 1. **TCP listen**：`router.serve(addr)` 后台 task；
+    /// 2. **Unix listen**（`/`/`@` 前缀）：`UnixListener` + `serve_with_incoming`
+    ///    （Go commander.go:81-82；tokio UDS 仅 unix 平台可用）；
+    /// 3. **outbound 模式**（listen=None）：`OutboundListenerImpl` +
+    ///    `OutboundHandlerImpl`（DispatchHandler，dispatch Link → cnc conn →
+    ///    listener）注册进注入的 dispatch registrar（SimpleOhm），gRPC serve
+    ///    循环从 listener accept（Go commander.go:101-115）。
     ///
     /// **必须在 tokio runtime 上下文中调用**（`Feature::start` 已保证）。
-    /// outbound 模式（listen=None）不启动 server，仅记日志（transport 全链路待接入）。
     fn serve_grpc(&self) -> Result<(), CommanderError> {
-        let Some(addr_str) = &self.listen else {
-            tracing::info!(
-                "commander (tag=`{}`) in outbound mode — gRPC serve skipped (no listen addr)",
-                self.tag
-            );
-            return Ok(());
-        };
-        let addr = grpc::parse_listen_addr(addr_str)
-            .map_err(|e| CommanderError::InvalidListenAddr {
-                addr: addr_str.clone(),
-                reason: e,
-            })?;
-
         let router = grpc::build_router(
             Arc::clone(&self.handler_registry),
+            self.handler_service.read().clone(),
             self.outbound_runtime.read().clone(),
             self.logger_service.read().clone(),
             self.stats_service.clone(),
             self.routing_service.clone(),
             self.observatory_service.clone(),
         );
-        tracing::info!("commander gRPC server listening on {addr} (tag=`{}`)", self.tag);
 
-        let handle = tokio::spawn(async move {
-            if let Err(e) = router.serve(addr).await {
-                tracing::error!("commander gRPC server exited with error: {e}");
+        match self.listen.as_deref().map(grpc::parse_listen_spec) {
+            // TCP listen 模式
+            Some(Ok(grpc::ListenSpec::Tcp(addr))) => {
+                tracing::info!("commander gRPC server listening on {addr} (tag=`{}`)", self.tag);
+                let handle = tokio::spawn(async move {
+                    if let Err(e) = router.serve(addr).await {
+                        tracing::error!("commander gRPC server exited with error: {e}");
+                    }
+                });
+                *self.grpc_task.lock() = Some(handle);
+                Ok(())
             }
-        });
-
-        *self.grpc_task.lock() = Some(handle);
-        Ok(())
+            // Unix domain socket listen 模式（Go commander.go:81-82）
+            #[cfg(unix)]
+            Some(Ok(grpc::ListenSpec::Unix(path))) => {
+                use tonic::codegen::tokio_stream::StreamExt as _;
+                use tokio::net::UnixListener;
+                let listener = UnixListener::bind(&path).map_err(|e| {
+                    CommanderError::InvalidListenAddr {
+                        addr: path.clone(),
+                        reason: format!("bind unix socket: {e}"),
+                    }
+                })?;
+                tracing::info!(
+                    "commander gRPC server listening on unix:{path} (tag=`{}`)",
+                    self.tag
+                );
+                let handle = tokio::spawn(async move {
+                    if let Err(e) = router
+                        .serve_with_incoming(tonic::codegen::tokio_stream::wrappers::UnixListenerStream::new(listener))
+                        .await
+                    {
+                        tracing::error!("commander gRPC server exited with error: {e}");
+                    }
+                });
+                *self.grpc_task.lock() = Some(handle);
+                Ok(())
+            }
+            // tokio UDS 仅 unix 平台；Windows 上 unix listen 明示不可用
+            #[cfg(not(unix))]
+            Some(Ok(grpc::ListenSpec::Unix(path))) => Err(CommanderError::InvalidListenAddr {
+                addr: path,
+                reason: "unix socket listen requires unix platform (tokio UDS unavailable on Windows)".into(),
+            }),
+            Some(Err(reason)) => Err(CommanderError::InvalidListenAddr {
+                addr: self.listen.clone().unwrap_or_default(),
+                reason,
+            }),
+            // outbound 模式：cnc dispatch → OutboundListener → gRPC serve
+            None => {
+                let listener = Arc::new(crate::server::OutboundListenerImpl::new());
+                let handler = Arc::new(crate::server::OutboundHandlerImpl::new(
+                    self.tag.clone(),
+                    Arc::clone(&listener),
+                ));
+                handler.start()?;
+                match self.dispatch_registrar.read().clone() {
+                    Some(reg) => {
+                        // Go commander.go:108-110：RemoveHandler 旧 tag（忽略错误）后 AddHandler。
+                        let _ = reg.remove_dispatch_handler(&self.tag);
+                        reg.add_dispatch_handler(&self.tag, handler)?;
+                    }
+                    None => {
+                        tracing::warn!(
+                            "commander outbound mode without dispatch registrar — \
+                             connections routed to tag `{}` will not reach the API server",
+                            self.tag
+                        );
+                    }
+                }
+                let incoming = grpc::ListenerIncoming::new(Arc::clone(&listener));
+                tracing::info!(
+                    "commander gRPC server serving via outbound handler (tag=`{}`)",
+                    self.tag
+                );
+                let handle = tokio::spawn(async move {
+                    if let Err(e) = router.serve_with_incoming(incoming).await {
+                        tracing::error!("commander gRPC server exited with error: {e}");
+                    }
+                });
+                *self.outbound_listener.write() = Some(listener);
+                *self.grpc_task.lock() = Some(handle);
+                Ok(())
+            }
+        }
     }
 
     /// 关闭 Commander。对应 Go `Commander.Close()`。
     ///
-    /// 标记 running=false 并 abort 后台 gRPC serve task。
+    /// 标记 running=false，关闭 outbound listener（终止 accept stream → serve
+    /// 循环退出），abort 后台 gRPC serve task。
     pub fn close(&self) -> Result<(), CommanderError> {
         let was_running = self
             .running
@@ -457,7 +551,12 @@ impl Commander {
             log_warning("commander not running, close is no-op");
             return Ok(());
         }
-        // abort 后台 gRPC serve task（listen 模式下存在）。
+        // outbound 模式：关 listener（accept 返回 None → serve_with_incoming 结束）
+        use crate::outbound::OutboundListener as _;
+        if let Some(listener) = self.outbound_listener.write().take() {
+            listener.close()?;
+        }
+        // abort 后台 gRPC serve task。
         if let Some(handle) = self.grpc_task.lock().take() {
             handle.abort();
             tracing::info!("commander gRPC server stopped (tag=`{}`)", self.tag);
@@ -818,5 +917,137 @@ mod tests {
         // 失败时 running 标志未回滚（Go 行为一致，错误冒泡给上层）
         // 这是设计取舍：要么回滚要么不回滚，Go 行为是 server 已创建 + 部分注册
         assert!(c.running());
+    }
+
+    // ===== bd pa7：outbound 模式（cnc dispatch → OutboundListener → gRPC）=====
+
+    /// duplex 半边 → tonic channel 的 Service（一次连接）。
+    /// `TokioIo` 适配 tokio AsyncRead/Write → hyper rt Read/Write。
+    struct DuplexConnector {
+        stream: Option<tokio::io::DuplexStream>,
+    }
+
+    impl tonic::codegen::Service<tonic::codegen::http::Uri> for DuplexConnector {
+        type Response = hyper_util::rt::TokioIo<tokio::io::DuplexStream>;
+        type Error = String;
+        type Future =
+            std::future::Ready<Result<hyper_util::rt::TokioIo<tokio::io::DuplexStream>, String>>;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: tonic::codegen::http::Uri) -> Self::Future {
+            match self.stream.take() {
+                Some(s) => std::future::ready(Ok(hyper_util::rt::TokioIo::new(s))),
+                None => std::future::ready(Err("stream already taken".into())),
+            }
+        }
+    }
+
+    /// outbound 模式 e2e：dispatch Link → cnc conn → listener → tonic serve →
+    /// gRPC client 完整往返（Go commander.go:101-115 + outbound.go:74-89）。
+    #[tokio::test]
+    async fn outbound_mode_serves_grpc_via_dispatch() {
+        use std::sync::Arc;
+        use xray_features::stats::Manager as _;
+        use xray_app_dispatcher::default::SimpleOhm;
+        use xray_app_dispatcher::OutboundHandlerManager as _;
+        use xray_app_dispatcher::DispatchHandler as _;
+        use xray_common::net::address::Address;
+        use xray_common::net::destination::Destination;
+        use xray_common::net::network::Network;
+        use xray_common::net::port::Port;
+        use xray_features::Feature as _;
+        use xray_proto::xray::app::stats::command::stats_service_client::StatsServiceClient;
+        use xray_proto::xray::app::stats::command::GetStatsRequest;
+
+        // 1. Commander outbound 模式 + SimpleOhm 注册器 + stats 后端
+        let ohm = Arc::new(SimpleOhm::new());
+        let stats_mgr = Arc::new(xray_app_stats::Manager::new_running());
+        let counter = stats_mgr.register_counter("unit>>>test>>>counter").unwrap();
+        counter.add(42);
+        assert_eq!(counter.value(), 42, "local counter incremented");
+        let mut commander = Commander::new("api", None);
+        commander.set_dispatch_registrar(Arc::new(crate::server::SimpleOhmDispatchRegistrar(
+            Arc::clone(&ohm),
+        )));
+        commander.set_stats_service(Arc::new(
+            xray_app_stats::command::DefaultStatsService::new(stats_mgr),
+        ));
+        commander.start().expect("commander start (outbound mode)");
+
+        // 2. 模拟 dispatcher：duplex → Link → ohm 中注册的 api handler dispatch
+        let (client_half, server_half) = tokio::io::duplex(64 * 1024);
+        let (s_r, s_w) = tokio::io::split(server_half);
+        let link = xray_transport::link::Link::new(
+            xray_buf::io::new_reader(s_r),
+            xray_buf::io::new_writer(s_w),
+        );
+        let handler = ohm.get_handler("api").expect("api handler registered in SimpleOhm");
+        let dest = Destination::new(Address::new_domain("api.internal".to_string()), Port::new(0), Network::TCP);
+        tokio::spawn(async move {
+            handler.dispatch(&dest, link).await;
+        });
+
+        // 3. tonic gRPC client 经 duplex 打 StatsService.GetStats
+        let channel = tonic::transport::Endpoint::from_static("http://localhost")
+            .connect_with_connector(DuplexConnector {
+                stream: Some(client_half),
+            })
+            .await
+            .expect("channel over duplex");
+        let mut client = StatsServiceClient::new(channel);
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.get_stats(GetStatsRequest {
+                name: "unit>>>test>>>counter".into(),
+                reset: false,
+            }),
+        )
+        .await
+        .expect("no timeout")
+        .expect("GetStats ok")
+        .into_inner();
+        let stat = resp.stat.expect("stat present");
+        assert_eq!(stat.value, 42);
+
+        // 4. close：listener 关闭 + serve task abort
+        commander.close().unwrap();
+        assert!(!commander.running());
+    }
+
+    /// DispatchHandler 直投：dispatch 后 listener 有 pending 连接（未 serve 场景）。
+    #[tokio::test]
+    async fn dispatch_handler_delivers_conn_to_listener() {
+        use std::sync::Arc;
+        use xray_app_dispatcher::DispatchHandler as _;
+        use xray_common::net::address::Address;
+        use xray_common::net::destination::Destination;
+        use xray_common::net::network::Network;
+        use xray_common::net::port::Port;
+
+        let listener = Arc::new(crate::server::OutboundListenerImpl::new());
+        let handler = crate::server::OutboundHandlerImpl::new("api", Arc::clone(&listener));
+        handler.start().unwrap();
+
+        let (r, w) = tokio::io::duplex(64);
+        let (s_r, s_w) = tokio::io::split(r);
+        let (_cr, _cw) = tokio::io::split(w);
+        let link = xray_transport::link::Link::new(
+            xray_buf::io::new_reader(s_r),
+            xray_buf::io::new_writer(s_w),
+        );
+        let dest = Destination::new(Address::new_domain("x".to_string()), Port::new(1), Network::TCP);
+        let h2 = Arc::new(handler) as Arc<dyn xray_app_dispatcher::DispatchHandler>;
+        let mut fut = Box::pin(h2.dispatch(&dest, link));
+        // 轮询 dispatch future（50ms 超时窗内 listener 收到连接；dispatch 本体
+        // 阻塞等 conn 关闭，超时返回属预期）
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(50), fut.as_mut()).await;
+        assert_eq!(listener.pending(), 1, "conn delivered to listener");
+        drop(fut);
     }
 }
