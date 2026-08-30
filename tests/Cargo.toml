@@ -98,6 +98,7 @@ xray-tls = { path = "../crates/xray-tls" }
 xray-reality = { path = "../crates/xray-reality" }
 xray-app-dns = { path = "../crates/xray-app-dns" }
 xray-conf = { path = "../crates/xray-conf" }
+xray-proxy-wireguard = { path = "../crates/xray-proxy-wireguard" }
 base64 = "0.22"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 rand = "0.8"

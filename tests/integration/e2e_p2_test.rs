@@ -303,14 +303,71 @@ async fn e2e_p2_wireguard_full_chain() {
         .await
         .expect("dokodemo accepts");
 
-    // (b) WireGuard inbound listening: UDP socket must NOT fail to bind (any
-    // sendto returns ok if listener up). Use a 1-byte probe; WG handshake is not
-    // expected to complete in this test.
-    let udp_probe = UdpSocket::bind("127.0.0.1:0").await.expect("udp probe");
-    udp_probe
-        .send_to(&[0u8; 32], ("127.0.0.1", wg_port))
+    // (b) WireGuard inbound 真实握手：boringtun `Tunnel` 构造客户端视角（sec_a, pub_b），
+    // 用 dummy IP 包触发 encapsulate 产生 handshake init → UDP sendto 到 wg_port →
+    // 服务端 driver worker_loop decapsulate 后产生 handshake response 回写到我们的
+    // UDP source → 我们 decapsulate response → time_since_last_handshake().is_some()。
+    use xray_proxy_wireguard::tunnel::{Output as TunnelOutput, Tunnel};
+    let mut client_tunnel = Tunnel::new(&sec_a, &pub_b, None, None, 0).expect("client tunnel");
+    // 用最小 IPv4 UDP 包（src=10.0.0.2, dst=10.0.0.1, proto=17）触发 encapsulate。
+    let ip_pkt: Vec<u8> = {
+        let payload = b"wg-hello";
+        let total_len = 20 + payload.len();
+        let mut pkt = Vec::with_capacity(total_len);
+        pkt.push(0x45); // version=4, IHL=5
+        pkt.push(0x00); // DSCP/ECN
+        pkt.extend_from_slice(&(total_len as u16).to_be_bytes());
+        pkt.extend_from_slice(&[0x00, 0x01]); // identification
+        pkt.extend_from_slice(&[0x00, 0x00]); // flags + frag offset
+        pkt.push(64); // TTL
+        pkt.push(17); // protocol = UDP
+        pkt.extend_from_slice(&[0x00, 0x00]); // checksum
+        pkt.extend_from_slice(&[10, 0, 0, 2]); // src = 10.0.0.2 (matches outbound)
+        pkt.extend_from_slice(&[10, 0, 0, 1]); // dst = 10.0.0.1 (matches inbound)
+        pkt.extend_from_slice(payload);
+        pkt
+    };
+    let init_outputs = client_tunnel
+        .encapsulate(&ip_pkt)
+        .expect("client encapsulate");
+    // 提取 handshake init bytes
+    let mut init_bytes: Option<Vec<u8>> = None;
+    for o in &init_outputs {
+        if let TunnelOutput::Network(wg) = o {
+            init_bytes = Some(wg.clone());
+            break;
+        }
+    }
+    let init_bytes = init_bytes.expect("expected handshake init from encapsulate");
+
+    // 用绑定到任意端口的 UDP socket 发 init 给服务端
+    let udp = UdpSocket::bind("127.0.0.1:0").await.expect("udp bind");
+    let our_addr = udp.local_addr().expect("udp local_addr");
+    udp.send_to(&init_bytes, ("127.0.0.1", wg_port))
         .await
-        .expect("wg-in udp reachable");
+        .expect("send init");
+
+    // 接收服务端 handshake response（driver worker_loop decapsulate 后 send_wg 回源地址）
+    let mut response = vec![0u8; 256];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), udp.recv_from(&mut response))
+        .await
+        .expect("handshake response within 5s")
+        .expect("recv_from ok");
+    response.truncate(n);
+
+    // 客户端 decapsulate 服务端 response：握手完成
+    let resp_outputs = client_tunnel
+        .decapsulate(&response)
+        .expect("client decapsulate response");
+    // response 应包含服务端 Output::Network（keepalive 等）或 Output::Ip——任一即可证
+    assert!(
+        !resp_outputs.is_empty(),
+        "expected server to produce outputs after handshake response, got 0"
+    );
+    assert!(
+        client_tunnel.time_since_last_handshake().is_some(),
+        "client handshake not completed after decapsulating server response"
+    );
 
     for h in handles {
         h.abort();
@@ -319,6 +376,8 @@ async fn e2e_p2_wireguard_full_chain() {
     // (c) Public key sanity (proves wg_keypair helper non-empty)
     assert_eq!(pub_a.len(), 64);
     assert_eq!(pub_b.len(), 64);
+    // (d) Sanity：our_addr 不应为 0 端口（确认 UDP 真的绑到本地端口）。
+    assert_ne!(our_addr.port(), 0, "udp should be bound to a real port");
 }
 
 // ============================================================

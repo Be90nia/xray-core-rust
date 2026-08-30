@@ -109,8 +109,16 @@ pub async fn listen_splithttp_unix(
 
     let listener = tokio::net::UnixListener::bind(path)?;
     // ponytail: SocketAddr 无法表达 unix 地址，元数据用 UNSPECIFIED 占位；
-// 接入 dispatcher 元数据时如需真实路径，扩 HandlerContext 字段。
+    // 接入 dispatcher 元数据时如需真实路径，扩 HandlerContext 字段。
     let placeholder = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+    // Tcpmask（Go hub.go:547-549：!isH3 && TcpmaskManager != nil → WrapListener，对
+    // tcp/unix 统一生效）。unix 路径 wrap 改为 per-conn（accept 后用 wrap_conn_server_into_connection
+    // 包装为 Box<dyn Connection>，与 TCP 分支一致）。
+    let tcpmask = Some(Arc::new(
+        xray_transport::finalmask::build_tcpmask_manager_from_json(
+            settings.finalmask_json.as_ref(),
+        )?,
+    ));
     let ctx = build_context(&config, placeholder, handler);
     tracing::info!(path, "listening UNIX domain socket for XHTTP");
 
@@ -120,11 +128,24 @@ pub async fn listen_splithttp_unix(
                 Ok((s, _)) => s,
                 Err(_) => continue,
             };
+            let conn: Box<dyn xray_transport::connection::Connection> = match tcpmask.as_ref() {
+                Some(mgr) => {
+                    let raw = Box::new(xray_transport::connection::UnixConnection::new(stream));
+                    match xray_transport::finalmask::wrap_conn_server_into_connection(mgr, raw) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "XHTTP unix tcpmask wrap failed");
+                            continue;
+                        }
+                    }
+                }
+                None => Box::new(xray_transport::connection::UnixConnection::new(stream)),
+            };
             let ctx = Arc::clone(&ctx);
             let tls = tls_cfg.clone();
             let rc = reality.clone();
             tokio::spawn(async move {
-                handle_accepted_stream(stream, placeholder, placeholder, tls, rc, ctx).await;
+                handle_accepted_stream(conn, placeholder, placeholder, tls, rc, ctx).await;
             });
         }
     });

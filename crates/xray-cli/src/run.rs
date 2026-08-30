@@ -53,6 +53,12 @@ pub struct RunArgs {
     /// 仅输出合并后的配置，不启动服务。
     #[arg(long = "dump")]
     pub dump: bool,
+
+    /// 仅 unix 目标：启用 splithttp unix domain socket 监听（Go hub.go:472-480
+    /// `port == 0` 分支）。Windows 编译时此字段不存在。
+    #[cfg(unix)]
+    #[arg(long = "unix", value_name = "PATH")]
+    pub unix_socket: Option<String>,
 }
 
 /// 支持的配置文件扩展名（用于 confdir 扫描）。
@@ -509,5 +515,19 @@ mod tests {
         };
         // 工作目录可能存在默认 config.*，结果依赖环境；仅验证不 panic。
         let _ = dump_config(&args);
+    }
+
+    /// `--unix` flag 在 unix 目标默认 None，Windows 目标不存在此字段。
+    #[cfg(unix)]
+    #[test]
+    fn unix_flag_defaults_none() {
+        let args = RunArgs::default();
+        assert!(args.unix_socket.is_none());
+        // 模拟带 flag 的解析（clap 默认行为）。
+        let args = RunArgs {
+            unix_socket: Some("/tmp/xh.sock".into()),
+            ..Default::default()
+        };
+        assert_eq!(args.unix_socket.as_deref(), Some("/tmp/xh.sock"));
     }
 }
