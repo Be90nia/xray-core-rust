@@ -39,6 +39,15 @@ pub trait ObservationProvider: Send + Sync {
 pub trait BalancingStrategy: Send + Sync {
     /// 返回出站 tag。空字符串表示未选中。
     fn pick_outbound(&self) -> Result<String, RouterError>;
+
+    /// 带 key 的选路：用于 ConsistentHashing 等需要稳定 affinity 的策略。
+    ///
+    /// 默认实现退化为 `pick_outbound()`（忽略 key，与现有策略行为一致）。
+    /// Rust-only 扩展（Go 无此概念）——`LeastLoadStrategy` 在 ConsistentHashing
+    /// 模式下 override 此方法，以实现 session-affinity 选路。
+    fn pick_outbound_with_key(&self, _key: u64) -> Result<String, RouterError> {
+        self.pick_outbound()
+    }
 }
 
 // ── Override ─────────────────────────────────────────────────
@@ -197,11 +206,20 @@ impl Balancer {
     ///
     /// 对应 Go `Balancer.PickOutbound`。
     pub fn pick_outbound(&self) -> Result<String, RouterError> {
+        self.pick_outbound_with_key(0)
+    }
+
+    /// 带 key 的 PickOutbound：override > strategy(with key) > fallback。
+    ///
+    /// key 仅对 override=空且策略支持 `pick_outbound_with_key` 的策略生效。
+    /// 当前用于 LeastLoadStrategy ConsistentHashing 模式：同一 key 命中同一 tag，
+    /// 实现 session-affinity。`key=0` 等价于 `pick_outbound()`（默认 trait 方法路径）。
+    pub fn pick_outbound_with_key(&self, key: u64) -> Result<String, RouterError> {
         let ov = self.override_target.get();
         if !ov.is_empty() {
             return Ok(ov);
         }
-        match self.strategy.pick_outbound() {
+        match self.strategy.pick_outbound_with_key(key) {
             Ok(tag) if !tag.is_empty() => Ok(tag),
             _ => {
                 if self.fallback_tag.is_empty() {

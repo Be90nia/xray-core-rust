@@ -302,6 +302,27 @@ impl Router {
     }
 }
 
+/// 从 RoutingContext 派生 stable hash key（用于 ConsistentHashing 等 affinity 策略）。
+///
+/// 优先级：target_ip → target_domain → source_ip → inbound_tag。
+/// 同一 ctx 在进程内始终返回同一 key（确定性），跨进程可能因 SipHash seed 不同
+/// 出现差异——对于 ConsistentHashing 同进程内 session-affinity 够用。
+pub(crate) fn ctx_hash_key(ctx: &dyn RoutingContext) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    if let Some(ip) = ctx.get_target_ips().first() {
+        ip.hash(&mut h);
+    } else if !ctx.get_target_domain().is_empty() {
+        ctx.get_target_domain().hash(&mut h);
+    } else if let Some(ip) = ctx.get_source_ips().first() {
+        ip.hash(&mut h);
+    } else {
+        ctx.get_inbound_tag().hash(&mut h);
+    }
+    h.finish()
+}
+
 /// 构建 Balancer。
 ///
 /// 对应 Go `BalancingRule.Build`（`app/router/config.go:121-165`）：
@@ -794,5 +815,84 @@ mod tests {
         }
         assert!(!picks.contains("a"), "dead outbound a should not be picked");
         assert!(picks.iter().all(|t| t == "b" || t == "c"));
+    }
+
+    /// 验证 `Router::pick_route(ctx)` 传递 ctx 到 ConsistentHashing 策略：
+    /// 同一 ctx（同 target_ip）→ 同一 outbound（session-affinity）。
+    /// 构造方式直接接 LeastLoadStrategy（proto StrategyLeastLoadConfig 不含 mode 字段，
+    /// `build_balancer` 只能造 Availability 模式；mode=Rust-only 扩展，此处手装验证
+    /// ctx → balancer.pick_outbound_with_key(ctx_hash_key(ctx)) 链通）。
+    #[test]
+    fn test_router_consistent_hashing_same_ctx_picks_same_outbound() {
+        use crate::balancing::MemoryObservationProvider;
+        use crate::strategy_leastload::LeastLoadStrategy;
+
+        let obs = Arc::new(MemoryObservationProvider::new());
+        obs.update(ObservationResult {
+            status: vec![
+                obs_with_alive("a", true, 50),
+                obs_with_alive("b", true, 50),
+                obs_with_alive("c", true, 50),
+            ],
+        });
+        let ohm = Arc::new(SimpleSelector::from_tags(["a", "b", "c"]));
+
+        // 手装 ConsistentHashing 策略 balancer。
+        let cfg = xray_proto::xray::app::router::StrategyLeastLoadConfig::default();
+        let strategy = Arc::new(
+            LeastLoadStrategy::consistent_hashing(
+                &cfg,
+                vec!["a".into(), "b".into(), "c".into()],
+                ohm.clone(),
+                obs,
+                64,
+            )
+            .unwrap(),
+        );
+        let balancer = Arc::new(Balancer::new(
+            vec!["a".into(), "b".into(), "c".into()],
+            strategy,
+            ohm,
+            "fb",
+        ));
+
+        // 直接构造 Rule 挂上该 balancer，绕过 build_balancer（其默认 Availability 模式）。
+        let rule = Rule {
+            tag: String::new(),
+            rule_tag: String::new(),
+            balancer: Some(balancer),
+            condition: None,
+            webhook: None,
+        };
+        let r = Router::empty(Arc::new(SimpleSelector::from_tags(["a", "b", "c"])), None);
+        *r.rules.write() = vec![Arc::new(rule)];
+
+        // 同一 ctx（target_ip）两次 pick_route → 同 outbound
+        let ctx1 = RoutingData::new()
+            .with_target_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let p1a = r.pick_route(&ctx1).unwrap().outbound_tag;
+        let p1b = r.pick_route(&ctx1).unwrap().outbound_tag;
+        assert_eq!(p1a, p1b, "same ctx must return same tag (session affinity)");
+        assert!(["a", "b", "c"].contains(&p1a.as_str()));
+
+        // 不同 ctx（不同 target_ip）→ 可能不同 outbound（ConsistentHashing 分布）
+        let ctx2 = RoutingData::new()
+            .with_target_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
+        let ctx3 = RoutingData::new()
+            .with_target_ip(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)));
+        let p2 = r.pick_route(&ctx2).unwrap().outbound_tag;
+        let p3 = r.pick_route(&ctx3).unwrap().outbound_tag;
+        assert!(["a", "b", "c"].contains(&p2.as_str()));
+        assert!(["a", "b", "c"].contains(&p3.as_str()));
+        // 跨 3 段不同 IP 命中分布应至少 2 个不同 tag（hash 散开）
+        let mut uniq = std::collections::HashSet::new();
+        uniq.insert(p1a);
+        uniq.insert(p2);
+        uniq.insert(p3);
+        assert!(
+            uniq.len() >= 2,
+            "consistent hashing should distribute across tags, got {:?}",
+            uniq
+        );
     }
 }

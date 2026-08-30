@@ -365,12 +365,10 @@ impl BalancingStrategy for LeastLoadStrategy {
             None => Err(RouterError::EmptyBalancerResult),
         }
     }
-}
 
-impl LeastLoadStrategy {
-    /// ConsistentHashing 模式专用入口：显式传入 hash key → 同一 key 总是选中同一 tag。
-    /// 当 key 来自 session/目的地址时实现 session 亲和。
-    pub fn pick_outbound_with_key(&self, key: u64) -> Result<String, RouterError> {
+    /// ConsistentHashing 模式 override：传同一 key 总是选同一 tag。
+    /// 其他模式退化为 `pick_outbound()`（忽略 key）。
+    fn pick_outbound_with_key(&self, key: u64) -> Result<String, RouterError> {
         if self.mode != BaselineMode::ConsistentHashing {
             return self.pick_outbound();
         }

@@ -43,6 +43,17 @@ impl Rule {
         Ok(self.tag.clone())
     }
 
+    /// 带 ctx 的选路：balancer 走 `pick_outbound_with_key(ctx_derived_key)`，
+    /// 支持 LeastLoadStrategy ConsistentHashing 等需要稳定 affinity 的策略。
+    /// 无 ctx key 字段时退化为 `get_tag()`（等同未传 key）。
+    pub fn get_tag_with_ctx(&self, ctx: &dyn crate::context::RoutingContext) -> Result<String, RouterError> {
+        if let Some(b) = &self.balancer {
+            let key = crate::router::ctx_hash_key(ctx);
+            return b.pick_outbound_with_key(key);
+        }
+        Ok(self.tag.clone())
+    }
+
     /// 对上下文应用规则。
     ///
     /// 返回 `Some(tag)` 表示命中；`None` 表示不命中。
@@ -57,7 +68,7 @@ impl Rule {
         if !hit {
             return None;
         }
-        let tag = match self.get_tag() {
+        let tag = match self.get_tag_with_ctx(ctx) {
             Ok(t) => t,
             Err(_) => return None,
         };
