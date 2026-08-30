@@ -655,9 +655,16 @@ impl std::fmt::Debug for SessionManager {
 /// XUDP 管理器。
 ///
 /// 对应 Go 版本的 `XUDPManager` 全局变量，管理所有 XUDP 会话扩展。
+///
+/// # 并发模型
+/// 内部 `entries` 用 `parking_lot::RwLock` 替代 `tokio::sync::Mutex`：
+/// 实际数据访问（`get`/`len`/`register`/`unregister`/`cleanup`）均为非阻塞
+/// 同步操作，无 `.await` 持锁点；在 multi_thread runtime 下亦不会因 `await`
+/// 切换线程而出现锁迁移或阻塞清理任务。对应 Go `XUDPManager` 仅 `sync.Mutex`
+/// 保护 map 的语义。
 pub struct XUDPManager {
     /// 条目映射表。
-    entries: Arc<Mutex<HashMap<[u8; 8], XUDP>>>,
+    entries: Arc<parking_lot::RwLock<HashMap<[u8; 8], XUDP>>>,
     /// 清理任务句柄。
     cleanup_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -667,7 +674,7 @@ impl XUDPManager {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            entries: Arc::new(Mutex::new(HashMap::new())),
+            entries: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             cleanup_handle: None,
         }
     }
@@ -682,21 +689,30 @@ impl XUDPManager {
             loop {
                 interval.tick().await;
                 let now = Instant::now();
-                let mut entries_guard = entries.lock().await;
-                let expired: Vec<[u8; 8]> = entries_guard
-                    .iter()
-                    .filter(|(_, x)| x.status == XudpStatus::Expiring && now >= x.expire)
-                    .map(|(id, _)| {
-                        debug!("XUDP del: {:?}", id);
-                        *id
-                    })
-                    .collect();
-                for id in expired {
-                    if let Some(xudp) = entries_guard.remove(&id) {
-                        tokio::spawn(async move {
-                            xudp.interrupt().await;
-                        });
+                // 写锁仅在清理窗口内持锁；xudp.interrupt() 在 spawn 中独立运行，
+                // 不再在持锁状态下跨 .await，避免 multi_thread runtime 下的锁迁移。
+                let expired: Vec<(XUDP, [u8; 8])> = {
+                    let mut guard = entries.write();
+                    let mut out = Vec::new();
+                    let ids: Vec<[u8; 8]> = guard
+                        .iter()
+                        .filter(|(_, x)| x.status == XudpStatus::Expiring && now >= x.expire)
+                        .map(|(id, _)| {
+                            debug!("XUDP del: {:?}", id);
+                            *id
+                        })
+                        .collect();
+                    for id in ids {
+                        if let Some(x) = guard.remove(&id) {
+                            out.push((x, id));
+                        }
                     }
+                    out
+                };
+                for (xudp, _id) in expired {
+                    tokio::spawn(async move {
+                        xudp.interrupt().await;
+                    });
                 }
             }
         });
@@ -705,45 +721,42 @@ impl XUDPManager {
 
     /// 注册 XUDP 条目。
     pub async fn register(&self, xudp: XUDP) {
-        let mut entries = self.entries.lock().await;
-        entries.insert(xudp.global_id, xudp);
+        // 同步锁，无 .await 持锁点；方法签名仍 async 以兼容调用方。
+        self.entries.write().insert(xudp.global_id, xudp);
     }
 
     /// 注销 XUDP 条目。
     pub async fn unregister(&self, global_id: &[u8; 8]) {
-        let mut entries = self.entries.lock().await;
-        entries.remove(global_id);
+        self.entries.write().remove(global_id);
     }
 
     /// 获取 XUDP 条目。
     pub async fn get(&self, global_id: &[u8; 8]) -> Option<XUDP> {
-        let entries = self.entries.lock().await;
-        entries.get(global_id).cloned()
+        self.entries.read().get(global_id).cloned()
     }
 
     /// 手动清理过期条目。
     pub async fn cleanup(&self) {
         let now = Instant::now();
-        let mut entries = self.entries.lock().await;
-        let expired: Vec<[u8; 8]> = entries
+        let mut guard = self.entries.write();
+        let expired: Vec<[u8; 8]> = guard
             .iter()
             .filter(|(_, x)| x.status == XudpStatus::Expiring && now >= x.expire)
             .map(|(id, _)| *id)
             .collect();
         for id in expired {
-            entries.remove(&id);
+            guard.remove(&id);
         }
     }
 
     /// 获取条目数量。
     pub async fn len(&self) -> usize {
-        let entries = self.entries.lock().await;
-        entries.len()
+        self.entries.read().len()
     }
 
     /// 检查是否为空。
     pub async fn is_empty(&self) -> bool {
-        self.len().await == 0
+        self.entries.read().is_empty()
     }
 }
 
@@ -1202,5 +1215,31 @@ mod tests {
     #[tokio::test]
     async fn test_session_idle_timeout_constant() {
         assert_eq!(SESSION_IDLE_TIMEOUT, Duration::from_secs(300));
+    }
+
+    // ========== multi_thread runtime 锁迁移回归 ==========
+
+    /// 模拟 vmess_over_mux_tcp_e2e 风格的并发场景：多 worker 线程同时
+    /// register/get/unregister。`parking_lot::RwLock` 的 .read()/.write()
+    /// 为同步短持锁，避免 multi_thread 下 `tokio::sync::Mutex` 的锁迁移。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_xudp_manager_concurrent_multi_thread_no_deadlock() {
+        let manager = Arc::new(XUDPManager::new());
+        let mut handles = Vec::new();
+        for w in 0u8..8 {
+            let m = Arc::clone(&manager);
+            handles.push(tokio::spawn(async move {
+                for i in 0u8..50 {
+                    let id = [w, i, 0, 0, 0, 0, 0, 0];
+                    m.register(XUDP::new(id)).await;
+                    let _ = m.get(&id).await;
+                    m.unregister(&id).await;
+                }
+            }));
+        }
+        for h in handles {
+            h.await.expect("worker join");
+        }
+        assert_eq!(manager.len().await, 0);
     }
 }
