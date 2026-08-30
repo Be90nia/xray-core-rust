@@ -75,6 +75,73 @@ pub fn use_readv() -> bool {
     USE_READV_FLAG.get_value_as_bool()
 }
 
+/// `xray.buf.splice`（alt `XRAY_BUF_SPLICE`）— freedom splice(2) zero-copy.
+///
+/// 对应 Go `platform.UseFreedomSplice`（common/platform/platform.go:17）。
+pub fn use_splice() -> bool {
+    static FLAG: LazyLock<EnvFlag> = LazyLock::new(|| EnvFlag::new("xray.buf.splice"));
+    FLAG.get_value_as_bool()
+}
+
+/// `xray.vmess.padding`（alt `XRAY_VMESS_PADDING`）— VMess outbound 全局 padding 开关。
+///
+/// 对应 Go `platform.UseVmessPadding`（proxy/vmess/outbound/outbound.go:240）。
+/// 当前 Rust VMess padding 由 per-session `GLOBAL_PADDING` flag 驱动；本 binding 暴露
+/// Go 等价 env 入口，便于上层装配或后续 VMess 启用点接入。
+pub fn use_vmess_padding() -> bool {
+    static FLAG: LazyLock<EnvFlag> = LazyLock::new(|| EnvFlag::new("xray.vmess.padding"));
+    FLAG.get_value_as_bool()
+}
+
+/// `xray.xudp.show`（alt `XRAY_XUDP_SHOW`）== "true" 时启用 XUDP 协议层日志。
+///
+/// 对应 Go `platform.XUDPLog`（common/xudp/xudp.go:35）。当前 Rust
+/// `xray_xudp::XudpConfig::from_env()` 走 `XUDP_LOG` 环境变量；这里补 Go 等价
+/// `xray.xudp.show` 入口。
+pub fn xudp_show() -> bool {
+    static FLAG: LazyLock<EnvFlag> = LazyLock::new(|| EnvFlag::new("xray.xudp.show"));
+    FLAG.get_value_as_bool()
+}
+
+/// `xray.xudp.basekey`（alt `XRAY_XUDP_BASEKEY`）— XUDP BaseKey 原始字符串值。
+///
+/// 对应 Go `platform.XUDPBaseKey`（common/xudp/xudp.go:42）。调用方负责 Base64
+/// URL-safe 解码及 32 字节校验。
+#[must_use]
+pub fn xudp_basekey_raw() -> Option<String> {
+    static FLAG: LazyLock<EnvFlag> = LazyLock::new(|| EnvFlag::new("xray.xudp.basekey"));
+    FLAG.get_value().map(str::to_owned)
+}
+
+/// `xray.cone.disabled`（alt `XRAY_CONE_DISABLED`）== "true" 时禁用 cone 模式。
+///
+/// 对应 Go `platform.UseCone`（core/xray.go:191：`!= "true"` 决定 cone 是否启用）。
+/// 返回值即 Go 「disabled」含义，调用方需取反得到 cone 启用状态。
+pub fn cone_disabled() -> bool {
+    static FLAG: LazyLock<EnvFlag> = LazyLock::new(|| EnvFlag::new("xray.cone.disabled"));
+    FLAG.get_value_as_bool()
+}
+
+/// `xray.browser.dialer`（alt `XRAY_BROWSER_DIALER`）— browser dialer 后端地址。
+///
+/// 对应 Go `platform.BrowserDialerAddress`（transport/internet/browser_dialer/
+/// dialer.go:46）。原始字符串由调用方解析（典型值：`ws://127.0.0.1:4321`）。
+#[must_use]
+pub fn browser_dialer_address() -> Option<String> {
+    static FLAG: LazyLock<EnvFlag> = LazyLock::new(|| EnvFlag::new("xray.browser.dialer"));
+    FLAG.get_value().map(str::to_owned)
+}
+
+/// `xray.tun.fd`（alt `XRAY_TUN_FD`）— Tun Fd 整数字符串。
+///
+/// 对应 Go `platform.TunFdKey`（proxy/tun/tun_android.go:27 / tun_darwin.go:54）。
+/// 未经设置返回 `None`；调用方负责 `str::from_str::<i32>()` 解析。
+#[must_use]
+pub fn tun_fd_raw() -> Option<String> {
+    static FLAG: LazyLock<EnvFlag> = LazyLock::new(|| EnvFlag::new("xray.tun.fd"));
+    FLAG.get_value().map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,5 +176,44 @@ mod tests {
     fn test_use_readv_returns_bool() {
         // 只验证函数可调用且返回布尔值
         let _val = use_readv();
+    }
+
+    // -------- 7 新 EnvFlag bindings --------
+    // 仅验证函数可调用 + 返回类型正确；env 未设置时返回 false/None。
+    // 设置真实 env 会污染进程全局且不可并行，跨测不可移植，故仅做「callable」检查。
+
+    #[test]
+    fn test_use_splice_returns_bool() {
+        let _val: bool = use_splice();
+    }
+
+    #[test]
+    fn test_use_vmess_padding_returns_bool() {
+        let _val: bool = use_vmess_padding();
+    }
+
+    #[test]
+    fn test_xudp_show_returns_bool() {
+        let _val: bool = xudp_show();
+    }
+
+    #[test]
+    fn test_xudp_basekey_raw_returns_option() {
+        let _val: Option<String> = xudp_basekey_raw();
+    }
+
+    #[test]
+    fn test_cone_disabled_returns_bool() {
+        let _val: bool = cone_disabled();
+    }
+
+    #[test]
+    fn test_browser_dialer_address_returns_option() {
+        let _val: Option<String> = browser_dialer_address();
+    }
+
+    #[test]
+    fn test_tun_fd_raw_returns_option() {
+        let _val: Option<String> = tun_fd_raw();
     }
 }
