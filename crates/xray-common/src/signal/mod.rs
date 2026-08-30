@@ -606,6 +606,7 @@ mod tests {
     #[tokio::test]
     async fn test_activity_timer_set_timeout_zero_finishes() {
         // Go common/signal/timer.go:57-60: SetTimeout(0) → 立即 finish（cancel done）。
+        let timer = ActivityTimer::new(Duration::from_secs(10));
         assert!(!timer.is_cancelled());
         timer.set_timeout(Duration::ZERO);
         assert!(timer.is_cancelled(), "set_timeout(0) 必须立即 cancel done");
