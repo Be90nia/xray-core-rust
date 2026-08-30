@@ -936,11 +936,17 @@ impl tonic::transport::server::Connected for CommanderStream {
 /// 构建已注册 command service 的 tonic `Router`。
 ///
 /// 返回的 `Router` 可 `.serve(addr)` 或 `.serve_with_incoming(..)` 启动。
-/// 始终注册 HandlerService 与 gRPC reflection（v1 + v1alpha，descriptor 来自
-/// `xray_proto`）；proxyman / outbound runtime / logger / stats / routing /
+/// HandlerService 始终注册；proxyman / outbound runtime / logger / stats / routing /
 /// observatory 仅在注入（`Some`）时注册。
+///
+/// **gRPC reflection opt-in**：仅当 [`commander::ReflectionService`] 通过
+/// [`Commander::add_service`] 注册（即上层 `ApiConfig.services` 含
+/// `"ReflectionService"`）时才注册 v1 + v1alpha——对应 Go `infra/conf/api.go:30`
+/// `"reflectionservice"` 关键字的 opt-in 语义。未声明时整个 gRPC server 不暴露
+/// reflection，避免 grpcurl 匿名枚举全部 command service。
 pub(crate) fn build_router(
     registry: Arc<OutboundHandlerRegistry>,
+    enable_reflection: bool,
     proxyman: Option<Arc<dyn xray_app_proxyman::command::HandlerService>>,
     outbound_runtime: Option<Arc<dyn OutboundRuntime>>,
     logger: Option<Arc<dyn xray_app_log::command::LogService>>,
@@ -969,19 +975,22 @@ pub(crate) fn build_router(
         server =
             server.add_service(ObservatoryServiceServer::new(ObservatoryServiceImpl::new(svc)));
     }
-    // reflection 常注册（bd ze3）：grpcurl / tonic-reflection client 可发现全部服务。
-    let reflect_builder = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(xray_proto::FILE_DESCRIPTOR_SET);
-    match reflect_builder.build_v1alpha() {
-        Ok(svc) => server = server.add_service(svc),
-        Err(e) => tracing::warn!("commander: reflection v1alpha unavailable: {e}"),
-    }
-    match tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(xray_proto::FILE_DESCRIPTOR_SET)
-        .build_v1()
-    {
-        Ok(svc) => server = server.add_service(svc),
-        Err(e) => tracing::warn!("commander: reflection v1 unavailable: {e}"),
+    // reflection opt-in：仅当用户显式注册 ReflectionService 时启用（Go
+    // `infra/conf/api.go:30` 的 `"reflectionservice"` 关键字语义）。
+    if enable_reflection {
+        let reflect_builder = tonic_reflection::server::Builder::configure()
+            .register_encoded_file_descriptor_set(xray_proto::FILE_DESCRIPTOR_SET);
+        match reflect_builder.build_v1alpha() {
+            Ok(svc) => server = server.add_service(svc),
+            Err(e) => tracing::warn!("commander: reflection v1alpha unavailable: {e}"),
+        }
+        match tonic_reflection::server::Builder::configure()
+            .register_encoded_file_descriptor_set(xray_proto::FILE_DESCRIPTOR_SET)
+            .build_v1()
+        {
+            Ok(svc) => server = server.add_service(svc),
+            Err(e) => tracing::warn!("commander: reflection v1 unavailable: {e}"),
+        }
     }
     server
 }

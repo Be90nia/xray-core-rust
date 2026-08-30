@@ -442,8 +442,16 @@ impl Commander {
     ///
     /// **必须在 tokio runtime 上下文中调用**（`Feature::start` 已保证）。
     fn serve_grpc(&self) -> Result<(), CommanderError> {
+        // reflection opt-in：仅当用户显式 add_service(ReflectionService) 时启用。
+        // 对应 Go `infra/conf/api.go:30` `"reflectionservice"` 关键字语义——
+        // 未声明时整个 gRPC server 不暴露 reflection（grpcurl 不可枚举）。
+        let enable_reflection = self
+            .services()
+            .iter()
+            .any(|s| s.type_url() == ReflectionService::TYPE_URL);
         let router = grpc::build_router(
             Arc::clone(&self.handler_registry),
+            enable_reflection,
             self.handler_service.read().clone(),
             self.outbound_runtime.read().clone(),
             self.logger_service.read().clone(),
