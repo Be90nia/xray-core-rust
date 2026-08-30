@@ -14,3 +14,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 hickory-resolver = { workspace = true }
 async-trait = { workspace = true }
+
+[dev-dependencies]
+hickory-resolver = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }

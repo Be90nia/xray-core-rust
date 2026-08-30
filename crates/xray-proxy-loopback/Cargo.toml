@@ -19,3 +19,5 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 xray-buf = { path = "../xray-buf" }
+parking_lot = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }

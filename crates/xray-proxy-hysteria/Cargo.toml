@@ -26,3 +26,4 @@ prost = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 rcgen = "0.13"
 rustls = { workspace = true, default-features = false, features = ["ring"] }
+rustls-pki-types = { workspace = true }
