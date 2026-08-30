@@ -95,6 +95,14 @@ pub fn register_all_transports() {
     let _ = xray_transport_splithttp::register::register_listener();
 
     // mKCP
+    //
+    // finalmask 语义注（o54c）：mKCP 不走异步 `UdpmaskManager`（PacketConn 包装），
+    // 而用同步逐包 codec 链 `xray_transport::finalmask::CodecChain`
+    // （`parse_finalmask_udp_chain`）——KCP 栈基于 `std::net::UdpSocket` 同步读，
+    // 在 socket 读写 seam 逐包 encode/decode，语义等价 Go
+    // `UdpmaskManager.WrapPacketConnClient/Server`（mkcp 算子对称、无握手，
+    // 双端共用同一编解码）。接线见 `xray-transport-kcp/src/register.rs`
+    // （`MaskedUdpHub` / `MaskedPacketInput`）。
     let _ = xray_transport_kcp::register::register_dialer();
     let _ = xray_transport_kcp::register::register_listener();
 
