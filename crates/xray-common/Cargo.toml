@@ -17,4 +17,5 @@ uuid = { workspace = true }
 rand = { workspace = true }
 md-5 = "0.10"
 sha1 = "0.10"
+parking_lot = { workspace = true }
 xray-buf = { path = "../xray-buf" }

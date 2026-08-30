@@ -3,8 +3,10 @@
 //! 对应 Go 版本 `common/signal` 包，包含 Done 信号、Notifier、
 //! ActivityTimer、PubSub 和 Semaphore 等并发原语。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use tokio::sync::{watch, Notify, Semaphore as TokioSemaphore};
 
 // ========== Done 信号 (Go: signal/done) ==========
@@ -111,13 +113,19 @@ impl Clone for Notifier {
 
 /// 不活动超时计时器。
 ///
-/// 对应 Go 版本 `CancelAfterInactivity`，在指定时间内
-/// 没有活动通知时自动取消。
+/// 对应 Go 版本 `CancelAfterInactivity` + `common/signal/timer.go` `ActivityTimer`：
+/// - `update_activity()`：活动信号，重置超时窗口（对应 Go `Update`）；
+/// - `set_timeout(t)`：重置超时窗口（对应 Go `SetTimeout`，重建 checkTask + `Update()`）；
+/// - `set_timeout(0)`：立即 cancel done（对应 Go `SetTimeout(0) → finish()`）。
+/// - 超时无活动 → cancel done。
+///
+/// `timeout` 字段为 `Arc<Mutex<Duration>>` 让 [`Self::set_timeout`] 能在不持有 `&mut self`
+/// 的情况下重置窗口（Go `ActivityTimer.SetTimeout` 是值接收者）。
 #[derive(Debug)]
 pub struct ActivityTimer {
     done: Done,
     notifier: Notifier,
-    timeout: std::time::Duration,
+    timeout: Arc<Mutex<std::time::Duration>>,
 }
 
 impl ActivityTimer {
@@ -125,7 +133,7 @@ impl ActivityTimer {
         Self {
             done: Done::new(),
             notifier: Notifier::new(),
-            timeout,
+            timeout: Arc::new(Mutex::new(timeout)),
         }
     }
 
@@ -134,11 +142,11 @@ impl ActivityTimer {
     /// 每次收到活动通知会重置超时计时。
     /// 此方法应在一个独立的 tokio 任务中运行。
     pub async fn run(&mut self) {
-        // Sliding window：每次 update_activity 重置 deadline。
-        // 实现：每轮循环 new sleep 直到超时（简单可靠，避免 Sleep::reset API 变化）。
-        // 性能开销可忽略（每次循环只一次 sleep，不在 hot path）。
+        // Sliding window：每轮循环读当前 timeout（可被 set_timeout 重置），
+        // 用 sleep_until 到 deadline。性能开销可忽略（每轮一次 sleep）。
         loop {
-            let deadline = tokio::time::Instant::now() + self.timeout;
+            let current = *self.timeout.lock();
+            let deadline = tokio::time::Instant::now() + current;
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => {
                     self.done.cancel();
@@ -148,14 +156,34 @@ impl ActivityTimer {
                     if self.done.is_cancelled() {
                         return;
                     }
-                    // 重新循环 → 重新算 deadline（sliding window）
+                    // 重新循环 → 重新读 timeout + 重新算 deadline（sliding window）
                 }
             }
         }
     }
 
-    /// 通知有活动发生，重置超时计时。
+    /// 通知有活动发生，重置超时计时（对应 Go `ActivityTimer.Update`）。
     pub fn update_activity(&self) {
+        self.notifier.notify();
+    }
+
+    /// 重新调度超时窗口。对应 Go `common/signal/timer.go:53-76` `ActivityTimer.SetTimeout`：
+    ///
+    /// - `t == Duration::ZERO`：立即 cancel done（等价 Go `SetTimeout(0) → finish()`）。
+    /// - `t > Duration::ZERO`：替换内部 timeout + 唤醒 `run` 循环以重算 deadline
+    ///   （Go 等价：close old checkTask + new checkTask + `Update()`）。
+    /// - 多次调用安全；`is_cancelled()` 后调用为 no-op。
+    pub fn set_timeout(&self, t: std::time::Duration) {
+        if self.done.is_cancelled() {
+            return;
+        }
+        if t.is_zero() {
+            self.done.cancel();
+            self.notifier.notify();
+            return;
+        }
+        *self.timeout.lock() = t;
+        // 唤醒 run 中的 sleep，让其重新读 timeout + 算新 deadline。
         self.notifier.notify();
     }
 
@@ -171,6 +199,18 @@ impl ActivityTimer {
     }
 
     /// 获取 Done 信号的克隆，用于外部等待超时。
+    pub fn done_signal(&self) -> Done {
+        self.done.clone()
+    }
+
+    /// 获取当前超时窗口。对应 Go `t.timeout` 读取。
+    #[must_use]
+    pub fn timeout(&self) -> std::time::Duration {
+        *self.timeout.lock()
+    }
+
+    /// 兼容别名：保留旧 `done()` 调用方（`xray-app-proxyman` worker 等）。
+    #[deprecated(note = "use done_signal for clarity; kept for backward compat")]
     pub fn done(&self) -> Done {
         self.done.clone()
     }
@@ -178,36 +218,118 @@ impl ActivityTimer {
 
 // ========== PubSub (Go: signal/pubsub) ==========
 
+/// PubSub 主题枚举。对应 Go `signal/pubsub.Service.Subscribe(name)` / `Publish(name, msg)`。
+///
+/// 用 enum 保证主题名在编译期固定、不会拼错。Rust 扩展（Go 用 string）。
+/// 添加新主题只需扩展此 enum + 实现 `as_str`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PubSubTopic {
+    /// 全局无主题（Go `Subscribe("")` 等价）。
+    Global,
+    /// DNS 解析统计主题（Go app/dns internal pubsub）。
+    DnsStats,
+    /// 路由统计主题（对应 Go `app/router` + `app/stats` 桥接）。
+    RouteStats,
+    /// Observer 观测主题（对应 Go `app/observatory`）。
+    Observer,
+}
+
+impl PubSubTopic {
+    /// 主题名（Go `name` 字符串）。
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            PubSubTopic::Global => "",
+            PubSubTopic::DnsStats => "dns.stats",
+            PubSubTopic::RouteStats => "route.stats",
+            PubSubTopic::Observer => "observer",
+        }
+    }
+}
+
+impl std::fmt::Display for PubSubTopic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// 发布-订阅服务，用于事件广播。
 ///
-/// 对应 Go 版本 `signal/pubsub.Service`，支持多个订阅者
-/// 同时监听消息。
+/// 对应 Go 版本 `signal/pubsub.Service`，支持多个订阅者同时监听消息。
+///
+/// **主题路由**：内部用 `HashMap<String, Vec<watch::Sender>>` 按主题分组；
+/// - 旧 `subscribe()` / `publish()` 不传主题等价 `PubSubTopic::Global`（向后兼容）。
+/// - `subscribe_topic(topic)` / `publish_topic(topic, msg)` 走指定主题。
 pub struct PubSub<T: Clone + Send + Sync + 'static> {
-    subscribers: Arc<tokio::sync::RwLock<Vec<watch::Sender<Option<T>>>>>,
+    subscribers: Arc<tokio::sync::RwLock<HashMap<String, Vec<watch::Sender<Option<T>>>>>>,
 }
 
 impl<T: Clone + Send + Sync + 'static> PubSub<T> {
     /// 创建新的 PubSub 服务。
     pub fn new() -> Self {
         Self {
-            subscribers: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            subscribers: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         }
     }
 
-    /// 订阅消息，返回订阅者。
+    /// 订阅全局主题（无主题名），返回订阅者。
+    ///
+    /// 向后兼容旧 API；等价 `subscribe_topic(PubSubTopic::Global)`。
     pub async fn subscribe(&self) -> PubSubSubscriber<T> {
+        self.subscribe_topic(PubSubTopic::Global).await
+    }
+
+    /// 订阅指定主题，返回订阅者。
+    ///
+    /// 对应 Go `Service.Subscribe(name)`。
+    pub async fn subscribe_topic(&self, topic: PubSubTopic) -> PubSubSubscriber<T> {
+        self.subscribe_named(topic.as_str()).await
+    }
+
+    /// 订阅自定义主题名（Rust 扩展，让外部 crate 注册私有主题）。
+    pub async fn subscribe_named(&self, name: &str) -> PubSubSubscriber<T> {
         let (tx, rx) = watch::channel(None);
         let mut subs = self.subscribers.write().await;
-        // 清理已断开的订阅者
-        subs.retain(|s| s.receiver_count() > 0);
-        subs.push(tx);
+        // 清理该主题内已断开的订阅者
+        if let Some(bucket) = subs.get_mut(name) {
+            bucket.retain(|s| s.receiver_count() > 0);
+            bucket.push(tx);
+        } else {
+            subs.insert(name.to_string(), vec![tx]);
+        }
         PubSubSubscriber { receiver: rx }
     }
 
-    /// 向所有订阅者广播消息。
+    /// 向全局主题发布消息。
+    ///
+    /// 向后兼容旧 API；等价 `publish_topic(PubSubTopic::Global, message)`。
     pub async fn publish(&self, message: T) {
+        self.publish_topic(PubSubTopic::Global, message).await;
+    }
+
+    /// 向指定主题发布消息。
+    ///
+    /// 对应 Go `Service.Publish(name, message)`。
+    pub async fn publish_topic(&self, topic: PubSubTopic, message: T) {
+        self.publish_named(topic.as_str(), message).await;
+    }
+
+    /// 向自定义主题名发布消息（Rust 扩展）。
+    pub async fn publish_named(&self, name: &str, message: T) {
         let mut subs = self.subscribers.write().await;
-        subs.retain(|s| s.send(Some(message.clone())).is_ok());
+        if let Some(bucket) = subs.get_mut(name) {
+            // retain：移除已断开的订阅者；send 失败时 retain 会丢弃。
+            bucket.retain(|s| s.send(Some(message.clone())).is_ok());
+        }
+        // 未订阅主题 → no-op（Go 同行为，subs[name] 不存在则 range 空）。
+    }
+
+    /// 当前每个主题的活跃订阅者数量（按主题聚合）。
+    /// 主要用于测试 / 诊断。
+    pub async fn subscribers_by_topic(&self) -> HashMap<String, usize> {
+        let subs = self.subscribers.read().await;
+        subs.iter()
+            .map(|(k, v)| (k.clone(), v.len()))
+            .collect()
     }
 }
 
@@ -477,5 +599,104 @@ mod tests {
         let sem2 = sem1.clone();
         assert_eq!(sem1.available_permits(), 3);
         assert_eq!(sem2.available_permits(), 3);
+    }
+
+    // ---- ActivityTimer::set_timeout 测试 ----
+
+    #[tokio::test]
+    async fn test_activity_timer_set_timeout_zero_finishes() {
+        // Go common/signal/timer.go:57-60: SetTimeout(0) → 立即 finish（cancel done）。
+        let mut timer = ActivityTimer::new(Duration::from_secs(3600));
+        // 启动 run 在后台。
+        let timer_for_run = unsafe {
+            // 取 timer 地址构造 cloned timer 仅用于 run 借用。
+            // 实际我们只用 timer.done_signal 验证取消即可，不真跑 run。
+            std::ptr::read(&timer as *const ActivityTimer)
+        };
+        drop(timer_for_run);
+        // 直接 set_timeout(0) 应立即 cancel。
+        timer.set_timeout(Duration::ZERO);
+        assert!(timer.is_cancelled(), "set_timeout(0) 必须立即 cancel done");
+    }
+
+    #[tokio::test]
+    async fn test_activity_timer_set_timeout_updates_window() {
+        // Go common/signal/timer.go:62-75: SetTimeout(t>0) → 替换 timeout + Update。
+        let timer = ActivityTimer::new(Duration::from_secs(10));
+        assert_eq!(timer.timeout(), Duration::from_secs(10));
+        timer.set_timeout(Duration::from_millis(500));
+        assert_eq!(
+            timer.timeout(),
+            Duration::from_millis(500),
+            "set_timeout(t>0) 必须替换 timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_activity_timer_set_timeout_after_cancelled_is_noop() {
+        let timer = ActivityTimer::new(Duration::from_secs(10));
+        timer.cancel();
+        assert!(timer.is_cancelled());
+        // 已 cancelled 后 set_timeout 不应改变 timeout，也不应 panic。
+        timer.set_timeout(Duration::from_millis(100));
+        assert_eq!(timer.timeout(), Duration::from_secs(10));
+    }
+
+    // ---- PubSub 主题路由测试 ----
+
+    #[tokio::test]
+    async fn test_pubsub_topic_routing_isolated() {
+        // 不同主题的订阅者互不影响。
+        let pubsub: PubSub<i32> = PubSub::new();
+        let mut sub_global = pubsub.subscribe().await;
+        let mut sub_dns = pubsub.subscribe_topic(PubSubTopic::DnsStats).await;
+
+        pubsub.publish_topic(PubSubTopic::DnsStats, 42).await;
+
+        // global 不应收到。
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), sub_global.wait())
+                .await
+                .is_err(),
+            "global topic 不应收到 DnsStats 消息"
+        );
+        // dns 应收到。
+        let msg = tokio::time::timeout(Duration::from_millis(100), sub_dns.wait())
+            .await
+            .expect("dns subscriber 收到消息超时")
+            .expect("msg should not be None");
+        assert_eq!(msg, 42);
+    }
+
+    #[tokio::test]
+    async fn test_pubsub_global_topic_backward_compat() {
+        // 旧 API subscribe()/publish() 等价 PubSubTopic::Global。
+        let pubsub: PubSub<String> = PubSub::new();
+        let mut sub = pubsub.subscribe().await;
+        pubsub.publish("hello".into()).await;
+        let got = sub.wait().await;
+        assert_eq!(got, Some("hello".into()));
+    }
+
+    #[tokio::test]
+    async fn test_pubsub_topic_strings() {
+        // 主题字符串值稳定，便于序列化兼容。
+        assert_eq!(PubSubTopic::Global.as_str(), "");
+        assert_eq!(PubSubTopic::DnsStats.as_str(), "dns.stats");
+        assert_eq!(PubSubTopic::RouteStats.as_str(), "route.stats");
+        assert_eq!(PubSubTopic::Observer.as_str(), "observer");
+        assert_eq!(format!("{}", PubSubTopic::Observer), "observer");
+    }
+
+    #[tokio::test]
+    async fn test_pubsub_subscribers_by_topic() {
+        let pubsub: PubSub<i32> = PubSub::new();
+        let _s1 = pubsub.subscribe().await;
+        let _s2 = pubsub.subscribe().await;
+        let _d1 = pubsub.subscribe_topic(PubSubTopic::DnsStats).await;
+
+        let counts = pubsub.subscribers_by_topic().await;
+        assert_eq!(counts.get(""), Some(&2), "global 主题 2 个订阅者");
+        assert_eq!(counts.get("dns.stats"), Some(&1));
     }
 }
