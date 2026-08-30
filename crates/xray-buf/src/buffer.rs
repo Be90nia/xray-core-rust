@@ -108,8 +108,39 @@ impl Buffer {
         &self.inner[self.start..self.end]
     }
 
-    /// 将读游标前进 n 字节（跳过 n 字节数据）。
+    /// 返回索引 `index` 处的字节（相对于未读数据起始位置）。
     ///
+    /// 对应 Go 的 `Buffer.Byte(index)`。`index=0` 表示第一个未读字节。
+    ///
+    /// # Panics
+    /// 如果 `index >= len()` 会 panic。
+    #[inline]
+    pub fn byte(&self, index: usize) -> u8 {
+        assert!(
+            index < self.len(),
+            "byte index {index} 超过未读数据长度 {}",
+            self.len()
+        );
+        self.inner[self.start + index]
+    }
+
+    /// 设置索引 `index` 处的字节为 `value`（相对于未读数据起始位置）。
+    ///
+    /// 对应 Go 的 `Buffer.SetByte(index, value)`。`index=0` 表示第一个未读字节。
+    ///
+    /// # Panics
+    /// 如果 `index >= len()` 会 panic。
+    #[inline]
+    pub fn set_byte(&mut self, index: usize, value: u8) {
+        assert!(
+            index < self.len(),
+            "set_byte index {index} 超过未读数据长度 {}",
+            self.len()
+        );
+        self.inner[self.start + index] = value;
+    }
+
+    /// 将读游标前进 n 字节（跳过 n 字节数据）。
     /// 对应 Go 的 `Buffer.Advance()`。
     ///
     /// # Panics
@@ -787,5 +818,40 @@ mod tests {
         let front = buf.split_to(5);
         // Split buffer 不继承 udp（新 Buffer 从 split 产生，语义上属于不同的数据包）
         assert!(front.udp().is_none());
+    }
+
+    #[test]
+    fn test_set_byte_basic() {
+        let mut buf = Buffer::from_bytes(BytesMut::from("hello"));
+        buf.set_byte(0, b'H');
+        buf.set_byte(4, b'X');
+        assert_eq!(buf.bytes(), b"HellX");
+    }
+
+    #[test]
+    fn test_byte_basic() {
+        let buf = Buffer::from_bytes(BytesMut::from("hello"));
+        assert_eq!(buf.byte(0), b'h');
+        assert_eq!(buf.byte(1), b'e');
+        assert_eq!(buf.byte(4), b'o');
+    }
+
+    #[test]
+    fn test_byte_after_advance() {
+        // Byte 索引是相对于未读数据起始位置的全局 index。
+        let mut buf = Buffer::from_bytes(BytesMut::from("hello"));
+        buf.advance(2);
+        assert_eq!(buf.byte(0), b'l');
+        assert_eq!(buf.byte(2), b'o');
+    }
+
+    #[test]
+    fn test_set_byte_after_advance() {
+        // advance(2) 后未读数据为 "llo"（len=3），set_byte(0,'L') → "Llo"。
+        let mut buf = Buffer::from_bytes(BytesMut::from("hello"));
+        buf.advance(2);
+        buf.set_byte(0, b'L');
+        assert_eq!(buf.bytes(), b"Llo");
+        assert_eq!(buf.byte(2), b'o');
     }
 }

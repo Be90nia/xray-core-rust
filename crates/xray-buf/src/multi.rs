@@ -112,8 +112,26 @@ impl MultiBuffer {
         result
     }
 
-    /// 取出第一个 Buffer。
+    /// 取出第一个 Buffer 并将其内容复制到 `dst`。
     ///
+    /// 对应 Go 的 `SplitFirstBytes(mb, p)`：split 出 first buffer 后将
+    /// 其内容 copy 到 `p`（最多 `min(first.len, p.len)` 字节），first buffer
+    /// 被消费掉（返回后已释放回池中）。
+    ///
+    /// 返回实际复制的字节数。空 MultiBuffer 时返回 0。
+    pub fn split_first_bytes(&mut self, dst: &mut [u8]) -> usize {
+        let first = match self.buffers.first_mut() {
+            Some(b) => b,
+            None => return 0,
+        };
+        let n = first.bytes().len().min(dst.len());
+        dst[..n].copy_from_slice(&first.bytes()[..n]);
+        // 释放 first buffer 后移除。
+        let mut removed = self.buffers.remove(0);
+        removed.release();
+        n
+    }
+
     /// 对应 Go 的 `SplitFirst`。
     pub fn split_first(&mut self) -> Option<Buffer> {
         if self.buffers.is_empty() {
@@ -790,5 +808,59 @@ mod tests {
         assert_eq!(mb.len(), 10);
         let vec = mb.to_vec();
         assert_eq!(vec, (0..10u8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_split_first_bytes_basic() {
+        // 对应 Go TestSplitFirstBytes：mb 只有一个 buffer "ab" + "cd" 两个 buffer。
+        // 第一个 buffer ("ab") 被完全消费并 copy 到 dst，mb 保留剩余 buffer。
+        let mut mb = MultiBuffer::from_buffers(vec![
+            make_buffer(b"ab"),
+            make_buffer(b"cd"),
+        ]);
+        let mut dst = [0u8; 2];
+        let n = mb.split_first_bytes(&mut dst);
+        assert_eq!(n, 2);
+        assert_eq!(&dst, b"ab");
+        // 第一个 buffer 被消费（释放），第二个保留
+        assert_eq!(mb.buffer_count(), 1);
+        assert_eq!(mb.to_vec(), b"cd");
+    }
+
+    #[test]
+    fn test_split_first_bytes_short_dst() {
+        // dst 比 first buffer 短：只 copy min(dst.len, first.len) 字节。
+        // first buffer 仍然被消费。
+        let mut mb = MultiBuffer::from_buffer(make_buffer(b"hello"));
+        let mut dst = [0u8; 3];
+        let n = mb.split_first_bytes(&mut dst);
+        assert_eq!(n, 3);
+        assert_eq!(&dst, b"hel");
+        assert_eq!(mb.len(), 0); // first buffer 被 release
+    }
+
+    #[test]
+    fn test_split_first_bytes_empty_multibuf() {
+        let mut mb = MultiBuffer::new();
+        let mut dst = [0u8; 4];
+        let n = mb.split_first_bytes(&mut dst);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_split_first_bytes_only_consumes_first() {
+        // 关键语义：SplitFirstBytes 只 split 第一个 Buffer，
+        // 后续 Buffer 保留在 mb 中。
+        let mut mb = MultiBuffer::from_buffers(vec![
+            make_buffer(b"hello"),
+            make_buffer(b"world"),
+        ]);
+        let mut dst = [0u8; 5];
+        let n = mb.split_first_bytes(&mut dst);
+        assert_eq!(n, 5);
+        assert_eq!(&dst, b"hello");
+        // 第一个 Buffer 消费，但第二个保留
+        assert_eq!(mb.buffer_count(), 1);
+        assert_eq!(mb.to_vec(), b"world");
     }
 }
