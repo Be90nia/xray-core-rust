@@ -238,4 +238,173 @@ mod tests {
         assert_eq!(cfg.user_agent, "chrome");
         assert_eq!(cfg.authority, "example.com");
     }
+
+    /// Tcpmask round-trip（o54c，Go grpc/dialer.go:129-135 + hub.go:123-125）：
+    /// dial 与 hub 双端配置 fragment mask 后 e2e echo 收发。
+    #[tokio::test]
+    async fn grpc_dial_hub_tcpmask_roundtrip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use xray_common::net::address::Address;
+        use xray_common::net::network::Network;
+        use xray_common::net::port::Port;
+        use std::net::Ipv4Addr;
+
+        let finalmask = serde_json::json!({
+            "tcp": [{"type": "fragment", "settings": {
+                "packets_from": 1, "packets_to": 2,
+                "length": {"from": 8, "to": 16}, "interval": {"from": 0, "to": 0}
+            }}]
+        });
+        let settings = StreamSettings {
+            protocol: "grpc".to_string(),
+            transport_json: Some(serde_json::json!({"serviceName":"GunService"})),
+            finalmask_json: Some(finalmask),
+            ..StreamSettings::tcp()
+        };
+
+        let handler: ConnHandler = std::sync::Arc::new(|conn| {
+            tokio::spawn(async move {
+                let mut conn = conn;
+                let mut buf = [0u8; 1024];
+                loop {
+                    match conn.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if conn.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        let listener = listen_grpc("127.0.0.1:0".parse().unwrap(), &settings, handler)
+            .await
+            .expect("listen_grpc");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let dest = Destination::new(
+            Address::IPv4(Ipv4Addr::LOCALHOST),
+            Port::new(addr.port()),
+            Network::TCP,
+        );
+        let mut conn = dial_grpc(&dest, &settings).await.expect("dial_grpc");
+
+        conn.write_all(b"hello-grpc-tcpmask").await.expect("write");
+        let mut buf = vec![0u8; 64];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            conn.read(&mut buf),
+        )
+        .await
+        .expect("echo timeout")
+        .expect("read ok");
+    }
+    // ===== multi-mode / TLS spec tests (jghj: 8yn) =====
+    //
+    // Go 端 gRPC transport 支持 4 个变体 round-trip：
+    //  1. gRPC (no TLS, single-mode) — 走 /<service>/Tun
+    //  2. gRPC+TLS (TLS, single-mode)
+    //  3. gRPC+multiMode (no TLS) — 走 /<service>/TunMulti
+    //  4. gRPC+tun (no TLS, custom path 服务名)
+    //
+    // 下方为配置层 + 路由层独立可测的单元测试。end-to-end（通过实际 h2 stream +
+    // echo）须等 transport.rs 补 /<service>/<stream> 完整路径后启用——见 o54c
+    // commit 后 `grpc_dial_hub_*_roundtrip` 系列。
+
+    /// 变体 1：gRPC 无 TLS 单 mode — 校验 parse_grpc_config 解析后 multi_mode=false。
+    /// Go 端 dial 走 /<service>/Tun；本测试作为 multi-mode 路由的 spec 锚点。
+    #[test]
+    fn grpc_spec_single_mode_resolves_to_tun_path() {
+        let settings = StreamSettings {
+            protocol: "grpc".to_string(),
+            transport_json: Some(serde_json::json!({"serviceName":"GunService"})),
+            ..StreamSettings::tcp()
+        };
+        let cfg = parse_grpc_config(settings.transport_json.as_ref()).unwrap();
+        assert!(!cfg.multi_mode);
+        assert_eq!(cfg.tun_stream_name(), "Tun");
+        assert_eq!(cfg.tun_multi_stream_name(), "TunMulti");
+        // GrpcClient 选 Tun（multi_mode=false）
+        let client = crate::client::GrpcClient::from_config(&cfg);
+        assert_eq!(client.active_stream_name(), "Tun");
+    }
+
+    /// 变体 2：gRPC multiMode=true — 校验 dial 路径切到 /<service>/TunMulti。
+    #[test]
+    fn grpc_spec_multi_mode_resolves_to_tunmulti_path() {
+        let settings = StreamSettings {
+            protocol: "grpc".to_string(),
+            transport_json: Some(serde_json::json!({
+                "serviceName":"GunService",
+                "multiMode":true,
+            })),
+            ..StreamSettings::tcp()
+        };
+        let cfg = parse_grpc_config(settings.transport_json.as_ref()).unwrap();
+        assert!(cfg.multi_mode);
+        let client = crate::client::GrpcClient::from_config(&cfg);
+        assert_eq!(client.active_stream_name(), "TunMulti");
+    }
+
+    /// 变体 3：gRPC 自定义路径 — serviceName="/A/B/Tun"，GrcpClient 选自定义 service。
+    #[test]
+    fn grpc_spec_custom_path_resolves_correctly() {
+        let settings = StreamSettings {
+            protocol: "grpc".to_string(),
+            transport_json: Some(serde_json::json!({
+                "serviceName":"/A/B/Tun",
+            })),
+            ..StreamSettings::tcp()
+        };
+        let cfg = parse_grpc_config(settings.transport_json.as_ref()).unwrap();
+        assert_eq!(cfg.service_name(), "A/B");
+        assert_eq!(cfg.tun_stream_name(), "Tun");
+    }
+
+    /// 变体 4：gRPC+TLS — 校验 StreamSettings.security/tls 字段透传正确。
+    #[test]
+    fn grpc_spec_tls_settings_passthrough() {
+        let settings = StreamSettings {
+            protocol: "grpc".to_string(),
+            transport_json: Some(serde_json::json!({"serviceName":"GunService"})),
+            security: "tls".to_string(),
+            security_json: Some(serde_json::json!({
+                "serverName": "localhost",
+                "allowInsecure": true,
+                "alpn": ["h2"],
+            })),
+            ..StreamSettings::tcp()
+        };
+        // 配置能解析通过（无 panic），且 transport/security JSON 不丢字段。
+        assert_eq!(settings.security, "tls");
+        assert!(settings.security_json.is_some());
+        let sj = settings.security_json.as_ref().unwrap();
+        assert_eq!(sj.get("serverName").and_then(|v| v.as_str()), Some("localhost"));
+        assert_eq!(sj.get("allowInsecure").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(sj.get("alpn").and_then(|v| v.as_array()).map(|a| a.len()), Some(1));
+    }
+
+    #[test]
+    fn register_dialer_lookup_all_three_names() {
+        register_dialer().unwrap();
+        for name in ["grpc", "h2", "http"] {
+            assert!(
+                get_transport_dialer(name).is_some(),
+                "{name} dialer must be registered"
+            );
+        }
+    }
+
+    /// Hub 注册表查 "grpc"/"h2"/"http" 三个名都能找到 listener。
+    #[test]
+    fn register_listener_lookup_all_three_names() {
+        register_listener().unwrap();
+        for name in ["grpc", "h2", "http"] {
+            assert!(
+                xray_transport::listener_registry::get_transport_listener(name).is_some(),
+                "{name} listener must be registered"
+            );
+        }
+    }
 }

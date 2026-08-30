@@ -52,9 +52,13 @@ path = "integration/e2e_p2_test.rs"
  name = "integration_commander_api"
  path = "integration/commander_api_test.rs"
 
-[[test]]
-name = "integration_transport_interop"
-path = "integration/transport_interop_test.rs"
+ [[test]]
+ name = "integration_grpc_multimode"
+ path = "integration/grpc_multimode_e2e_test.rs"
+
+ [[test]]
+ name = "integration_transport_interop"
+ path = "integration/transport_interop_test.rs"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
