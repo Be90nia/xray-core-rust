@@ -606,15 +606,7 @@ mod tests {
     #[tokio::test]
     async fn test_activity_timer_set_timeout_zero_finishes() {
         // Go common/signal/timer.go:57-60: SetTimeout(0) → 立即 finish（cancel done）。
-        let mut timer = ActivityTimer::new(Duration::from_secs(3600));
-        // 启动 run 在后台。
-        let timer_for_run = unsafe {
-            // 取 timer 地址构造 cloned timer 仅用于 run 借用。
-            // 实际我们只用 timer.done_signal 验证取消即可，不真跑 run。
-            std::ptr::read(&timer as *const ActivityTimer)
-        };
-        drop(timer_for_run);
-        // 直接 set_timeout(0) 应立即 cancel。
+        assert!(!timer.is_cancelled());
         timer.set_timeout(Duration::ZERO);
         assert!(timer.is_cancelled(), "set_timeout(0) 必须立即 cancel done");
     }
