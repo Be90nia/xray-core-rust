@@ -291,7 +291,7 @@ async fn serial_query(
     domain: &str,
     option: IpOption,
 ) -> Result<(Vec<IpAddr>, u32), DnsError> {
-    let mut last_err = DnsError::EmptyResponse;
+    let mut outcomes: Vec<Result<(Vec<IpAddr>, u32), DnsError>> = Vec::with_capacity(clients.len());
     for client in clients {
         if !option.fake_enable && client.server.name().eq_ignore_ascii_case("FakeDNS") {
             continue;
@@ -302,11 +302,11 @@ async fn serial_query(
                 if client.final_query {
                     return Err(e);
                 }
-                last_err = e;
+                outcomes.push(Err(e));
             }
         }
     }
-    Err(last_err)
+    Err(merge_query_errors(domain, &outcomes).expect_err("serial_query outcomes are all Err"))
 }
 
 /// 名称服务器组（按相邻 `policy_id` 合并）。对应 Go `type group struct{ start, end int }`。
@@ -395,12 +395,11 @@ async fn parallel_query(
     // 每个 client 的结果（Pending=未到，Success/Failure=已到）。
     let mut outcomes: Vec<ClientOutcome> =
         (0..clients.len()).map(|_| ClientOutcome::Pending).collect();
-    // 每个 group 剩余未完成 client 数（仅计入真实 spawned）。
-    // ponytail: 用 HashMap<group_idx, pending> 简化：group_idx 0..=len-1 顺序遍历。
+    // raw_errs 与 outcomes 索引对齐：存每个 client 的原始错误。
+    // 尾部 merge_query_errors 走 errRNF 优先级（Go dns.go:339-361 mergeQueryErrors）。
+    let mut raw_errs: Vec<Result<(Vec<IpAddr>, u32), DnsError>> =
+        (0..clients.len()).map(|_| Err(DnsError::EmptyResponse)).collect();
     let group_count = groups.len();
-    // 已聚合错误（仅 Debug 字符串，避免 clone DnsError）。
-    let mut errs: Vec<String> = Vec::new();
-    let mut non_empty_err_seen = false;
 
     let mut next_group = 0usize;
     while next_group < group_count {
@@ -409,7 +408,6 @@ async fn parallel_query(
             Some(Ok(v)) => v,
             _ => continue,
         };
-        // 登记结果。
         match &outcome {
             Ok((ips, ttl)) if !ips.is_empty() => {
                 outcomes[idx] = ClientOutcome::Success(ips.clone(), *ttl);
@@ -417,12 +415,11 @@ async fn parallel_query(
             Ok(_) => {
                 // Ok 但空 IP → 视为 Failure（Go 同步 dns.ErrEmptyResponse）。
                 outcomes[idx] = ClientOutcome::Failure;
-                non_empty_err_seen |= false; // 空响应 → 后续聚合按 EmptyResponse 处理
+                raw_errs[idx] = Err(DnsError::EmptyResponse);
             }
             Err(e) => {
                 outcomes[idx] = ClientOutcome::Failure;
-                non_empty_err_seen |= !matches!(e, DnsError::EmptyResponse);
-                errs.push(format!("{:?}", e));
+                raw_errs[idx] = Err(clone_dns_err(e));
             }
         }
 
@@ -441,7 +438,6 @@ async fn parallel_query(
         }
 
         // 当前 group 仍有人在跑：检查是否还有 pending。
-        // ponytail: 用 group 内 outcomes 状态推断（Pending 即未完成）。
         let mut still_pending = 0usize;
         for j in g.start..=g.end {
             if matches!(outcomes[j], ClientOutcome::Pending) {
@@ -452,26 +448,137 @@ async fn parallel_query(
             continue;
         }
 
-        // 当前 group 全部到齐且全部失败 → 推进 next_group。
+        // 当前 group 全部到齐且全部失败 → 输出 per-server logDecision
+        // （Go dns.go:430 `LogInfoInner` "failed to lookup ip in parallel query mode"）
+        // 然后推进 next_group。
+        for j in g.start..=g.end {
+            if matches!(outcomes[j], ClientOutcome::Failure) {
+                let server = clients[j].server.name();
+                if let Err(e) = &raw_errs[j] {
+                    tracing::info!(
+                        target: "xray.dns",
+                        server = %server,
+                        domain = %domain_owned,
+                        error = %e,
+                        "failed to lookup ip in parallel query mode",
+                    );
+                }
+            }
+        }
         next_group += 1;
     }
 
-    if non_empty_err_seen {
-        Err(DnsError::Features(xray_features::dns::DnsError::Other(
-            errs.join("; "),
-        )))
-    } else {
-        Err(DnsError::EmptyResponse)
+    Err(merge_query_errors(domain, &raw_errs).expect_err("parallel_query raw_errs are all Err"))
+}
+// ── 错误聚合 + 决策日志（Go dns.go:339-361 mergeQueryErrors + dns.go:330-337 logDecision）──
+
+/// 浅克隆 `DnsError`（`parallel_query` 收集 N 个独立 client 错误时需要复制所有权）。
+fn clone_dns_err(e: &DnsError) -> DnsError {
+    match e {
+        DnsError::RecordNotFound => DnsError::RecordNotFound,
+        DnsError::EmptyResponse => DnsError::EmptyResponse,
+        DnsError::RCodeError(c) => DnsError::RCodeError(*c),
+        DnsError::InvalidQueryStrategy(i) => DnsError::InvalidQueryStrategy(*i),
+        DnsError::NoQueryStrategy(s) => DnsError::NoQueryStrategy(s.clone()),
+        DnsError::InvalidClientIpLength(n) => DnsError::InvalidClientIpLength(*n),
+        DnsError::InvalidStaticHostsIP(s) => DnsError::InvalidStaticHostsIP(s.clone()),
+        DnsError::InvalidFakeDnsSetting => DnsError::InvalidFakeDnsSetting,
+        DnsError::InvalidFakeDnsCidr(s) => DnsError::InvalidFakeDnsCidr(s.clone()),
+        DnsError::LruBiggerThanSubnet { lru, rooms } => DnsError::LruBiggerThanSubnet {
+            lru: *lru,
+            rooms: *rooms,
+        },
+        DnsError::NoFakeDnsEngine => DnsError::NoFakeDnsEngine,
+        DnsError::Features(f) => DnsError::Features(f.clone()),
+        DnsError::NotImplemented(s) => DnsError::NotImplemented(s),
+        DnsError::WireFormat(s) => DnsError::WireFormat(s.clone()),
+        DnsError::SystemResolve(s) => DnsError::SystemResolve(s.clone()),
     }
 }
 
+/// 把 N 个 client 的查询结果聚合成单一错误。对应 Go `mergeQueryErrors` (dns.go:339-361)：
+///
+/// - 忽略 `RecordNotFound`（Go `errRecordNotFound`，对应「服务器无响应/未应答」）；
+/// - 取第一个非 RNF 错误作为 `noRNF`；
+/// - 出现第二个不同种类的非 RNF → 返回 combined 错误（Go `errors.Combine(errs...)`）；
+/// - 全 RNF → `RecordNotFound`；
+/// - 全 `EmptyResponse` → `EmptyResponse`；
+/// - 单一 `EmptyResponse` → `EmptyResponse`。
+fn merge_query_errors(
+    domain: &str,
+    outcomes: &[Result<(Vec<IpAddr>, u32), DnsError>],
+) -> Result<(Vec<IpAddr>, u32), DnsError> {
+    let errs: Vec<&DnsError> = outcomes
+        .iter()
+        .filter_map(|r| r.as_ref().err())
+        .collect();
+
+    if errs.is_empty() {
+        return Err(DnsError::EmptyResponse);
+    }
+
+    // 第一遍：识别 distinct error（非 RNF）。
+    let mut first_non_rnf: Option<&DnsError> = None;
+    let mut has_multiple_distinct = false;
+    for e in &errs {
+        if matches!(e, DnsError::RecordNotFound) {
+            continue;
+        }
+        match first_non_rnf {
+            None => first_non_rnf = Some(e),
+            Some(prev) if !same_dns_error_kind(prev, e) => {
+                has_multiple_distinct = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    if has_multiple_distinct {
+        // Go: errors.New("returning nil for domain ").Base(errors.Combine(errs...))
+        let combined = errs
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(DnsError::SystemResolve(format!(
+            "returning nil for domain {domain}: {combined}"
+        )));
+    }
+
+    if let Some(e) = first_non_rnf {
+        if matches!(e, DnsError::EmptyResponse) {
+            return Err(DnsError::EmptyResponse);
+        }
+        return Err(clone_dns_err(e));
+    }
+
+    Err(DnsError::RecordNotFound)
+}
+
+/// 两个 `DnsError` 是否属于"同类"。对应 Go `errors.Is(err, noRNF)`——
+/// 只对相同 enum 变体返回 true（简化版，不递归展开 nested error）。
+fn same_dns_error_kind(a: &DnsError, b: &DnsError) -> bool {
+    std::mem::discriminant(a) == std::mem::discriminant(b)
+}
+
+/// 输出 DNS 决策日志。对应 Go `logDecision` (dns.go:330-337)：
+/// `domain -> clientNames` 的 debug 信息；调用方已确定 client 列表时调用。
+pub fn log_decision(domain: &str, client_names: &[&str]) {
+    if client_names.is_empty() {
+        return;
+    }
+    tracing::debug!(
+        target: "xray.dns",
+        domain = %domain,
+        client_names = ?client_names,
+        "DNS resolution decision",
+    );
+}
 
 // ── 系统路由探测 ──────────────────────────────────────────────────
 
-/// 系统路由探测缓存。对应 Go `common/utils/probe_routes.go` 的 `routeCache`。
-///
 /// ponytail: Go 区分 GUI/非 GUI 平台用不同缓存策略（Once vs 100ms TTL），
-/// Rust 端统一用 OnceLock（探测结果在进程生命周期内稳定）。
 /// 如需动态刷新，改用 `parking_lot::Mutex` + 时间戳。
 static ROUTE_CACHE: OnceLock<(bool, bool)> = OnceLock::new();
 
@@ -1017,4 +1124,102 @@ mod tests {
         let (ips, _ttl) = parallel_query(&clients, "x.com", IpOption::all()).await.unwrap();
         assert_eq!(ips, vec![success_ip], "组间串行：前组全败 → 后组成功");
     }
+
+    // ---- merge_query_errors / log_decision 单元测试 ----
+
+    #[test]
+    fn merge_query_errors_all_rnf_returns_rnf() {
+        // Go dns.go:357-359：全 RNF → 返回 errRecordNotFound。
+        let outcomes: Vec<Result<(Vec<IpAddr>, u32), DnsError>> = vec![
+            Err(DnsError::RecordNotFound),
+            Err(DnsError::RecordNotFound),
+            Err(DnsError::RecordNotFound),
+        ];
+        let err = merge_query_errors("x.com", &outcomes).unwrap_err();
+        assert!(
+            matches!(err, DnsError::RecordNotFound),
+            "全 RNF → RecordNotFound (Go errRecordNotFound)"
+        );
+    }
+
+    #[test]
+    fn merge_query_errors_all_empty_returns_empty() {
+        // Go dns.go:354-356：noRNF == ErrEmptyResponse → ErrEmptyResponse。
+        let outcomes: Vec<Result<(Vec<IpAddr>, u32), DnsError>> = vec![
+            Err(DnsError::EmptyResponse),
+            Err(DnsError::EmptyResponse),
+        ];
+        let err = merge_query_errors("x.com", &outcomes).unwrap_err();
+        assert!(
+            matches!(err, DnsError::EmptyResponse),
+            "全 EmptyResponse → EmptyResponse"
+        );
+    }
+
+    #[test]
+    fn merge_query_errors_rnf_plus_real_returns_real() {
+        // Go dns.go:344-353：errRNF 忽略、第一个非 RNF 作为 noRNF。
+        let outcomes: Vec<Result<(Vec<IpAddr>, u32), DnsError>> = vec![
+            Err(DnsError::RecordNotFound),
+            Err(DnsError::RCodeError(3)),
+            Err(DnsError::RecordNotFound),
+        ];
+        let err = merge_query_errors("x.com", &outcomes).unwrap_err();
+        assert!(
+            matches!(err, DnsError::RCodeError(3)),
+            "errRNF 忽略 + 第一个非 RNF 取回"
+        );
+    }
+
+    #[test]
+    fn merge_query_errors_two_distinct_returns_combined() {
+        // Go dns.go:350-352：第二个不同的非 RNF → errors.Combine。
+        let outcomes: Vec<Result<(Vec<IpAddr>, u32), DnsError>> = vec![
+            Err(DnsError::RCodeError(3)),
+            Err(DnsError::WireFormat("bad packet".into())),
+        ];
+        let err = merge_query_errors("x.com", &outcomes).unwrap_err();
+        // combined 包在 SystemResolve variant（包含原始 combined 字符串）。
+        match err {
+            DnsError::SystemResolve(s) => {
+                assert!(s.contains("returning nil for domain x.com"));
+                assert!(s.contains("dns rcode error: 3"));
+                assert!(s.contains("dns wire format error: bad packet"));
+            }
+            other => panic!("expected SystemResolve combined, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_query_errors_same_kind_non_rnf_returns_first() {
+        // 两个同类非 RNF 不算 distinct。
+        let outcomes: Vec<Result<(Vec<IpAddr>, u32), DnsError>> = vec![
+            Err(DnsError::RCodeError(3)),
+            Err(DnsError::RCodeError(5)),
+        ];
+        let err = merge_query_errors("x.com", &outcomes).unwrap_err();
+        // 取第一个（RCodeError(3)）。
+        assert!(matches!(err, DnsError::RCodeError(3)));
+    }
+
+    #[test]
+    fn merge_query_errors_empty_inputs_returns_empty() {
+        let outcomes: Vec<Result<(Vec<IpAddr>, u32), DnsError>> = vec![];
+        let err = merge_query_errors("x.com", &outcomes).unwrap_err();
+        assert!(matches!(err, DnsError::EmptyResponse));
+    }
+
+    #[test]
+    fn log_decision_skips_when_no_clients() {
+        // 空 client_names 不应 panic、不应输出（业务保证无观察者时调用安全）。
+        log_decision("x.com", &[]);
+    }
+
+    #[test]
+    fn log_decision_emits_with_clients() {
+        // 实际 debug! 输出由 tracing subscriber 决定；这里只验证不 panic 且
+        // 函数签名可被外部 crate 调用（pub fn）。
+        log_decision("example.com", &["google", "cloudflare"]);
+    }
+
 }
