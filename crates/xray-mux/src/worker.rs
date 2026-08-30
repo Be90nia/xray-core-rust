@@ -233,29 +233,39 @@ impl ServerWorker {
         let tt = if target.network() == Network::UDP { TransferType::Packet } else { TransferType::Stream };
         let session = Arc::new(Session::new(meta.session_id(), tt));
         session.set_input(BufferedReader::new(link.reader)).await;
-        session.set_output(BufferedWriter::new(link.writer)).await;
-        if !self.session_manager.add(session.clone()).await {
-            session.close().await;
-            return Err(ServerError::SessionAddFailed(meta.session_id()));
+        // Packet 会话禁用 BufferedWriter 缓冲（直写）：包边界保持 + 小包即时
+        // 送达（Go server.go:271-277 直接使用 link.Writer，无缓冲包装）。
+        let mut output = BufferedWriter::new(link.writer);
+        if tt == TransferType::Packet {
+            output.set_buffered(false);
         }
         // 写入 New frame 的 data 到 session.output（在 spawn 反向 task 前同步完成，
         // 对齐 Go handleStatusNew 中 `buf.Copy(rr, s.output)` 的语义）
         if !data.is_empty() {
-            let mut guard = session.output().await;
-            if let Some(ref mut writer) = *guard {
-                let mb = MultiBuffer::from_buffer(Buffer::from_vec(data));
-                let _ = writer.write_multi_buffer_impl(mb).await;
-            }
+            output
+                .write_multi_buffer_impl(MultiBuffer::from_buffer(Buffer::from_vec(data)))
+                .await
+                .map_err(|e| ServerError::DispatchFailed(format!("initial data: {e}")))?;
+            output.flush().await.ok();
+        }
+        session.set_output(output).await;
+        if !self.session_manager.add(session.clone()).await {
+            session.close().await;
+            return Err(ServerError::SessionAddFailed(meta.session_id()));
         }
         let os = session.clone();
         let ow = link_writer.clone();
         tokio::spawn(async move { Self::handle_session_output(os, ow).await; });
         Ok(())
     }
-
     /// Handle XUDP New frame.
+    ///
+    /// `data` 为 New 帧内联数据——Go `handleStatusNew`（server.go:196-240）先经
+    /// `NewPacketReader` 读出，dispatch 后 `link.Writer.WriteMultiBuffer(mb)` 转发，
+    /// **不得丢弃**（bd 6z8 回归）。
     pub async fn handle_xudp_new(
         &self, meta: &FrameMetadata,
+        data: Vec<u8>,
         link_writer: &Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>>,
         global_id: [u8; 8],
     ) -> Result<(), ServerError> {
@@ -284,7 +294,20 @@ impl ServerWorker {
         };
         let ms = Arc::new(Session::new(meta.session_id(), TransferType::Packet));
         ms.set_input(BufferedReader::new(link.reader)).await;
-        ms.set_output(BufferedWriter::new(link.writer)).await;
+        // XUDP 恒为 Packet：直写（禁缓冲），New 帧内联 data 转发到 dispatch 目标
+        // （Go server.go:240 `link.Writer.WriteMultiBuffer(mb)`）。
+        // ponytail: Go hit 路径（同 GlobalID 复用）把 data 写旧 mux output 保持
+        // 旧 UDP 流；此处统一写新 session output——数据不丢，流身份不保留，
+        // 需要流连续性时再复用 xudp.mux 的 input/output。
+        let mut output = BufferedWriter::new(link.writer);
+        output.set_buffered(false);
+        if !data.is_empty() {
+            output
+                .write_multi_buffer_impl(MultiBuffer::from_buffer(Buffer::from_vec(data)))
+                .await
+                .map_err(|e| ServerError::DispatchFailed(format!("XUDP initial data: {e}")))?;
+        }
+        ms.set_output(output).await;
         xudp.set_mux(&ms);
         let session = Arc::new(Session::new(meta.session_id(), TransferType::Packet));
         session.set_xudp(xudp.clone()).await;
@@ -389,7 +412,7 @@ impl ServerWorker {
             SessionStatus::New => {
                 if meta.is_udp_target() && meta.global_id().is_some() {
                     let gid = *meta.global_id().unwrap();
-                    self.handle_xudp_new(&meta, link_writer, gid).await?;
+                    self.handle_xudp_new(&meta, data, link_writer, gid).await?;
                 } else {
                     self.handle_normal_new(&meta, data, link_writer).await?;
                 }
@@ -572,5 +595,147 @@ mod tests {
         let dest = Destination::new(Address::new_domain("example.com".to_string()), Port::new(443), Network::TCP);
         let result = adapter.dispatch(dest).await;
         assert!(result.is_ok(), "adapter should return a link");
+    }
+
+    // ===== bd 6z8：XUDP gate 触发 + New 帧内联 data 转发 + 首帧即时送达 =====
+
+    mod gate_tests {
+        use super::*;
+        use std::sync::Arc;
+        use tokio::sync::Mutex as AsyncMutex;
+        use xray_buf::io::{Reader as _, Writer as _};
+        use xray_buf::pipe;
+        use xray_buf::reader::BufferedReader;
+        use xray_common::net::address::Address;
+        use xray_common::net::port::Port;
+        use xray_common::serial;
+
+        /// 捕获 dispatcher：记录 dispatch dest，交出 payload 读端
+        /// （ret writer 保活，防 session input 立即 EOF）。
+        #[derive(Clone)]
+        struct CaptureDispatcher {
+            tx: tokio::sync::mpsc::UnboundedSender<(Destination, pipe::Reader)>,
+            keepers: Arc<parking_lot::Mutex<Vec<pipe::Writer>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Dispatcher for CaptureDispatcher {
+            async fn dispatch(&self, dest: Destination) -> Result<Link, DispatchError> {
+                let (ret_r, ret_w) = pipe::new();
+                let (pay_r, pay_w) = pipe::new();
+                self.keepers.lock().push(ret_w);
+                let _ = self.tx.send((dest.clone(), pay_r));
+                Ok(Link {
+                    reader: Box::new(ret_r),
+                    writer: Box::new(pay_w),
+                })
+            }
+        }
+
+        fn udp_dest() -> Destination {
+            Destination::new(
+                Address::ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+                Port::new(53),
+                Network::UDP,
+            )
+        }
+
+        fn tcp_dest() -> Destination {
+            Destination::new(
+                Address::new_domain("example.com".to_string()),
+                Port::new(443),
+                Network::TCP,
+            )
+        }
+
+        /// New 帧 + 内联 data 的线格式（meta + 2B size + payload）。
+        fn new_frame_with_data(meta: FrameMetadata, payload: &[u8]) -> Vec<u8> {
+            let mut buf = meta.to_bytes();
+            buf.extend_from_slice(&serial::write_uint16(payload.len() as u16));
+            buf.extend_from_slice(payload);
+            buf
+        }
+
+        /// 喂一帧到 ServerWorker，返回 dispatch 结果 (dest, payload reader)。
+        async fn process_one_frame(
+            frame: Vec<u8>,
+        ) -> (Destination, pipe::Reader, Arc<ServerWorker>) {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let dispatcher = CaptureDispatcher {
+                tx,
+                keepers: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            };
+            let server = Arc::new(ServerWorker::new(Arc::new(dispatcher)));
+            let (_lw_r, lw_w) = pipe::new();
+            let link_writer: Arc<AsyncMutex<Option<Box<dyn Writer>>>> =
+                Arc::new(AsyncMutex::new(Some(Box::new(lw_w))));
+            let mut reader = BufferedReader::new(xray_buf::io::new_reader(
+                std::io::Cursor::new(frame),
+            ));
+            let ok = server
+                .process_frame(&mut reader, &link_writer)
+                .await
+                .expect("frame processed");
+            assert!(ok, "frame should be processed");
+            let (dest, pay) = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("dispatch captured")
+                .expect("channel open");
+            (dest, pay, server)
+        }
+
+        /// 从 payload 读端读出全部字节（短超时：验证即时送达，非缓冲滞留）。
+        async fn read_payload(pay: &mut pipe::Reader) -> Vec<u8> {
+            let mb = tokio::time::timeout(std::time::Duration::from_millis(1500), pay.read_multi_buffer())
+                .await
+                .expect("payload must arrive without further writes (no buffer stall)")
+                .expect("read ok");
+            let mut out = Vec::new();
+            for b in mb.iter() {
+                out.extend_from_slice(b.bytes());
+            }
+            out
+        }
+
+        /// XUDP gate：New + UDP + global_id → handle_xudp_new 路径，
+        /// 内联 data 必须转发到 dispatch 目标（Go server.go:240）。bd 6z8。
+        #[tokio::test]
+        async fn xudp_new_frame_forwards_inline_data() {
+            let gid = [9u8; 8];
+            let mut meta = FrameMetadata::new_session(7, udp_dest());
+            meta.set_global_id(gid);
+            let frame = new_frame_with_data(meta, b"first-udp-packet");
+
+            let (dest, mut pay, _server) = process_one_frame(frame).await;
+
+            assert_eq!(dest.network(), Network::UDP);
+            let got = read_payload(&mut pay).await;
+            assert_eq!(got, b"first-udp-packet");
+        }
+
+        /// 普通路径：New + UDP（无 global_id）→ handle_normal_new Packet 会话，
+        /// 小包首帧即时送达（不得滞留 BufferedWriter 缓冲）。bd 6z8。
+        #[tokio::test]
+        async fn udp_new_small_first_frame_immediate() {
+            let meta = FrameMetadata::new_session(8, udp_dest());
+            let frame = new_frame_with_data(meta, b"tiny");
+
+            let (_dest, mut pay, _server) = process_one_frame(frame).await;
+
+            let got = read_payload(&mut pay).await;
+            assert_eq!(got, b"tiny");
+        }
+
+        /// 普通路径：New + TCP Stream 会话小首帧也即时送达。bd 6z8。
+        #[tokio::test]
+        async fn tcp_new_small_first_frame_immediate() {
+            let meta = FrameMetadata::new_session(9, tcp_dest());
+            let frame = new_frame_with_data(meta, b"GET /");
+
+            let (_dest, mut pay, _server) = process_one_frame(frame).await;
+
+            let got = read_payload(&mut pay).await;
+            assert_eq!(got, b"GET /");
+        }
     }
 }
