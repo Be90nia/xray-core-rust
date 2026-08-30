@@ -5803,17 +5803,19 @@ dependencies = [
 name = "xray-app-router"
 version = "0.1.0"
 dependencies = [
- "libc",
  "parking_lot",
  "prost",
  "rand 0.9.4",
  "regex",
+ "rustls",
  "serde",
  "serde_json",
  "sysinfo",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tracing",
+ "webpki-roots 1.0.8",
  "windows-sys 0.61.2",
  "xray-common",
  "xray-features",
