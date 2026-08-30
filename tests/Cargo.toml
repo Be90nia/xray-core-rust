@@ -44,10 +44,13 @@ path = "integration/interop_ss_test.rs"
 [[test]]
 name = "integration_e2e"
 path = "integration/e2e_test.rs"
-
 [[test]]
-name = "integration_commander_api"
-path = "integration/commander_api_test.rs"
+name = "integration_e2e_p2"
+path = "integration/e2e_p2_test.rs"
+
+ [[test]]
+ name = "integration_commander_api"
+ path = "integration/commander_api_test.rs"
 
 [[test]]
 name = "integration_transport_interop"
@@ -61,6 +64,7 @@ xray-proxy-vless = { path = "../crates/xray-proxy-vless" }
 xray-proxy-trojan = { path = "../crates/xray-proxy-trojan" }
 xray-proxy-ss = { path = "../crates/xray-proxy-ss" }
 xray-proxy-freedom = { path = "../crates/xray-proxy-freedom" }
+xray-mux = { path = "../crates/xray-mux" }
 xray-app-dispatcher = { path = "../crates/xray-app-dispatcher" }
 xray-transport = { path = "../crates/xray-transport" }
 xray-buf = { path = "../crates/xray-buf" }
@@ -76,6 +80,11 @@ tempfile = "3"
 xray-core = { path = "../crates/xray-core" }
 xray-tls = { path = "../crates/xray-tls" }
 xray-reality = { path = "../crates/xray-reality" }
+xray-app-dns = { path = "../crates/xray-app-dns" }
+xray-conf = { path = "../crates/xray-conf" }
 base64 = "0.22"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 rand = "0.8"
+hex = "0.4"
+boringtun = { workspace = true }
+sha2 = "0.10"
