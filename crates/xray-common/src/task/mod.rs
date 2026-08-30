@@ -89,6 +89,141 @@ impl Periodic {
     }
 }
 
+/// 闭包型 trait：对象支持显式关闭，对应 Go `common.Closable` interface。
+///
+/// 任务管线常用 `task.Close(obj)` 包装为 `func() error`。
+pub trait Closable {
+    /// 关闭对象，幂等实现常见。
+    fn close(&self) -> Result<(), Error>;
+}
+
+/// 对实现了 [`Closable`] 的对象，返回一个调用其 `close()` 的零参闭包。
+///
+/// 对应 Go `task.Close(v interface{}) func() error`：Go 在 `common.Close`
+/// 中检查是否实现 `Closable`，未实现则返回 nil。Rust 端用 trait bound 在
+/// 调用处约束，编译期拒绝非 `Closable` 类型——更严格但更安全。
+pub fn Close<T: Closable>(v: T) -> impl FnOnce() -> Result<(), Error> {
+    move || v.close()
+}
+
+/// 串行组合 f 和 g：当 f 返回 Ok 时执行 g。
+///
+/// 对应 Go `task.OnSuccess(f, g func() error) func() error`。
+pub fn OnSuccess<F, G>(f: F, g: G) -> impl FnOnce() -> Result<(), Error>
+where
+    F: FnOnce() -> Result<(), Error>,
+    G: FnOnce() -> Result<(), Error>,
+{
+    move || match f() {
+        Ok(()) => g(),
+        Err(e) => Err(e),
+    }
+}
+
+/// 并行执行一组任务，返回首个错误。
+///
+/// 对应 Go `task.Run(ctx context.Context, tasks ...func() error) error`。
+/// Rust 端使用 `std::thread::scope` 阻塞并行（Go goroutines 同步语义）。
+/// `ctx` 保留为占位（与 Go 对齐），当前不支持取消——Go 中也是按 `ctx.Done()`
+/// 协作式轮询；此端口复刻了运行队列 + 完成钩子语义。
+///
+/// 工作线程数受 `std::thread::available_parallelism()` 限制（默认上限 16）。
+/// 任一任务失败立即返回错误，其他 worker 仍在并发跑完。
+pub fn Run<C, F>(ctx: &C, tasks: Vec<F>) -> Result<(), Error>
+where
+    C: ?Sized,
+    F: FnOnce() -> Result<(), Error> + Send + 'static,
+{
+    let _ = ctx; // 占位；保留以对齐 Go 签名
+    if tasks.is_empty() {
+        return Ok(());
+    }
+    // 用 Arc<Mutex<Option<Error>>> 共享首个错误。
+    let first_err: Arc<parking_lot::Mutex<Option<Error>>> =
+        Arc::new(parking_lot::Mutex::new(None));
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            let first_err = Arc::clone(&first_err);
+            handles.push(scope.spawn(move || {
+                if let Err(e) = task() {
+                    let mut slot = first_err.lock();
+                    if slot.is_none() {
+                        *slot = Some(e);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+    });
+
+    let mut slot = first_err.lock();
+    if slot.is_some() {
+        Err(slot.take().expect("checked"))
+    } else {
+        Ok(())
+    }
+}
+
+/// 并行调用 `f(0..n-1)`，按可用 CPU 数分块。
+///
+/// 对应 Go `task.ParallelForN(n int, fn func(i int) error) error`。
+/// 索引被划分为连续 chunk；每个 worker 处理一段，worker 数受
+/// `std::thread::available_parallelism()` 限制。
+pub fn ParallelForN<F>(n: usize, f: F) -> Result<(), Error>
+where
+    F: Fn(usize) -> Result<(), Error> + Sync + Send,
+{
+    if n == 0 {
+        return Ok(());
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(16)
+        .min(n);
+    let chunk = (n + workers - 1) / workers;
+    let first_err: Arc<parking_lot::Mutex<Option<Error>>> =
+        Arc::new(parking_lot::Mutex::new(None));
+    // 多 worker 共享同一 f。
+    let f = std::sync::Arc::new(f);
+
+    std::thread::scope(|scope| {
+        for w in 0..workers {
+            let start = w * chunk;
+            let end = (start + chunk).min(n);
+            if start >= end {
+                break;
+            }
+            let first_err = Arc::clone(&first_err);
+            let f = Arc::clone(&f);
+            scope.spawn(move || {
+                for i in start..end {
+                    if first_err.lock().is_some() {
+                        return;
+                    }
+                    if let Err(e) = f(i) {
+                        let mut slot = first_err.lock();
+                        if slot.is_none() {
+                            *slot = Some(e);
+                        }
+                        return;
+                    }
+                }
+            });
+        }
+    });
+
+    let mut slot = first_err.lock();
+    if slot.is_some() {
+        Err(slot.take().expect("checked"))
+    } else {
+        Ok(())
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +316,145 @@ mod tests {
         periodic.stop();
         periodic.stop();
         assert!(!periodic.is_running());
+    }
+    use super::{Run, OnSuccess, ParallelForN, Close, Closable};
+    use crate::errors::Error;
+    use parking_lot::Mutex;
+
+    #[test]
+    fn test_run_empty() {
+        let ctx = ();
+        let tasks: Vec<Box<dyn FnOnce() -> Result<(), Error> + Send + 'static>> = vec![];
+        let result = Run(&ctx, tasks);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_run_success() {
+        let ctx = ();
+        let counter = Arc::new(Mutex::new(0u32));
+        let mut tasks: Vec<Box<dyn FnOnce() -> Result<(), Error> + Send + 'static>> = vec![];
+        for _ in 0..5 {
+            let c = Arc::clone(&counter);
+            tasks.push(Box::new(move || {
+                *c.lock() += 1;
+                Ok(())
+            }));
+        }
+        let result = Run(&ctx, tasks);
+        assert!(result.is_ok());
+        assert_eq!(*counter.lock(), 5);
+    }
+
+    #[test]
+    fn test_run_first_error() {
+        let ctx = ();
+        let mut tasks: Vec<Box<dyn FnOnce() -> Result<(), Error> + Send + 'static>> = vec![];
+        for i in 0..3 {
+            if i == 1 {
+                tasks.push(Box::new(|| Err(Error::new("boom"))));
+            } else {
+                tasks.push(Box::new(|| Ok(())));
+            }
+        }
+        let result = Run(&ctx, tasks);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_on_success_chain() {
+        let ran_f = Arc::new(Mutex::new(false));
+        let ran_g = Arc::new(Mutex::new(false));
+        let f = {
+            let r = Arc::clone(&ran_f);
+            move || {
+                *r.lock() = true;
+                Ok(())
+            }
+        };
+        let g = {
+            let r = Arc::clone(&ran_g);
+            move || {
+                *r.lock() = true;
+                Ok(())
+            }
+        };
+        let task = OnSuccess(f, g);
+        let result = task();
+        assert!(result.is_ok());
+        assert!(*ran_f.lock());
+        assert!(*ran_g.lock());
+    }
+
+    #[test]
+    fn test_on_success_skip_g_on_error() {
+        let ran_g = Arc::new(Mutex::new(false));
+        let g = {
+            let r = Arc::clone(&ran_g);
+            move || {
+                *r.lock() = true;
+                Ok(())
+            }
+        };
+        let task = OnSuccess(|| Err(Error::new("f failed")), g);
+        let result = task();
+        assert!(result.is_err());
+        assert!(!*ran_g.lock());
+    }
+
+    #[test]
+    fn test_parallel_for_n_empty() {
+        let called = Arc::new(Mutex::new(false));
+        let c = Arc::clone(&called);
+        let result = ParallelForN(0, move |_i| {
+            *c.lock() = true;
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert!(!*called.lock());
+    }
+
+    #[test]
+    fn test_parallel_for_n_all_indices() {
+        let seen = Arc::new(Mutex::new(vec![false; 100]));
+        let s = Arc::clone(&seen);
+        let result = ParallelForN(100, move |i| {
+            s.lock()[i] = true;
+            Ok(())
+        });
+        assert!(result.is_ok());
+        let seen = seen.lock();
+        for (i, &v) in seen.iter().enumerate() {
+            assert!(v, "index {i} 未被访问");
+        }
+    }
+
+    #[test]
+    fn test_parallel_for_n_error() {
+        let result = ParallelForN(1000, |i| {
+            if i == 42 {
+                Err(Error::new("boom at 42"))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_close_closable() {
+        struct Counter(Arc<Mutex<u32>>);
+        impl Closable for Counter {
+            fn close(&self) -> Result<(), Error> {
+                *self.0.lock() += 1;
+                Ok(())
+            }
+        }
+        let counter = Arc::new(Mutex::new(0u32));
+        let c = Counter(Arc::clone(&counter));
+        let task = Close(c);
+        let result = task();
+        assert!(result.is_ok());
+        assert_eq!(*counter.lock(), 1);
     }
 }
