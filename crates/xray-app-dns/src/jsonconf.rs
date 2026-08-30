@@ -263,11 +263,24 @@ impl DnsAppConfig {
 }
 
 /// 解析查询策略字符串。未知值回退到 `UseIp`（与 Go 默认一致）。
+///
+/// 别名表完整对齐 Go `resolveQueryStrategy`（infra/conf/dns.go:381-394）：
+/// - `UseIP`：useip / use_ip / use-ip
+/// - `UseIPv4`：useip4 / useipv4 / use_ip4 / use_ipv4 / use_ip_v4 / use-ip4 /
+///   use-ipv4 / use-ip-v4
+/// - `UseIPv6`：useip6 / useipv6 / use_ip6 / use_ipv6 / use_ip_v6 / use-ip6 /
+///   use-ipv6 / use-ip-v6
+/// - `UseSys`：usesys / usesystem / use_sys / use_system / use-sys / use-system
+/// `Lookup` 不在 Go 别名表内——保留为未知。
 fn parse_query_strategy(s: Option<&str>) -> QueryStrategy {
     match s.map(str::to_ascii_lowercase).as_deref() {
-        Some("useip4") => QueryStrategy::UseIp4,
-        Some("useip6") => QueryStrategy::UseIp6,
-        Some("usesys") => QueryStrategy::UseSys,
+        Some("useip4" | "useipv4" | "use_ip4" | "use_ipv4" | "use_ip_v4"
+            | "use-ip4" | "use-ipv4" | "use-ip-v4") => QueryStrategy::UseIp4,
+        Some("useip6" | "useipv6" | "use_ip6" | "use_ipv6" | "use_ip_v6"
+            | "use-ip6" | "use-ipv6" | "use-ip-v6") => QueryStrategy::UseIp6,
+        Some("usesys" | "usesystem" | "use_sys" | "use_system"
+            | "use-sys" | "use-system") => QueryStrategy::UseSys,
+        Some("useip" | "use_ip" | "use-ip") => QueryStrategy::UseIp,
         _ => QueryStrategy::UseIp,
     }
 }
@@ -855,5 +868,31 @@ mod tests {
         }"#,
         );
         assert_eq!(ids, vec![100, 100, 1]);
+    }
+
+    // 8b4c：queryStrategy 别名完整对齐 Go `resolveQueryStrategy`
+    // （infra/conf/dns.go:381-394）。覆盖 useip/ipv4/ipv6/sys 全部分隔形式。
+    #[test]
+    fn query_strategy_aliases_match_go_resolve_query_strategy() {
+        use crate::config::QueryStrategy;
+        use super::parse_query_strategy;
+        assert_eq!(parse_query_strategy(Some("UseIp")), QueryStrategy::UseIp);
+        assert_eq!(parse_query_strategy(Some("use_ip")), QueryStrategy::UseIp);
+        assert_eq!(parse_query_strategy(Some("use-ip")), QueryStrategy::UseIp);
+        assert_eq!(parse_query_strategy(Some("useipv4")), QueryStrategy::UseIp4);
+        assert_eq!(parse_query_strategy(Some("use_ip4")), QueryStrategy::UseIp4);
+        assert_eq!(parse_query_strategy(Some("use_ipv4")), QueryStrategy::UseIp4);
+        assert_eq!(parse_query_strategy(Some("use_ip_v4")), QueryStrategy::UseIp4);
+        assert_eq!(parse_query_strategy(Some("use-ip4")), QueryStrategy::UseIp4);
+        assert_eq!(parse_query_strategy(Some("use-ipv4")), QueryStrategy::UseIp4);
+        assert_eq!(parse_query_strategy(Some("use-ip-v4")), QueryStrategy::UseIp4);
+        assert_eq!(parse_query_strategy(Some("USEIPV6")), QueryStrategy::UseIp6);
+        assert_eq!(parse_query_strategy(Some("use_ipv6")), QueryStrategy::UseIp6);
+        assert_eq!(parse_query_strategy(Some("use-ipv6")), QueryStrategy::UseIp6);
+        assert_eq!(parse_query_strategy(Some("usesystem")), QueryStrategy::UseSys);
+        assert_eq!(parse_query_strategy(Some("use-sys")), QueryStrategy::UseSys);
+        // 未知值 → UseIp 默认
+        assert_eq!(parse_query_strategy(Some("uselookup")), QueryStrategy::UseIp);
+        assert_eq!(parse_query_strategy(None), QueryStrategy::UseIp);
     }
 }
