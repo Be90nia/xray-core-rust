@@ -62,7 +62,7 @@ fn make_trojan_users() -> HashMap<String, TrojanUser> {
 // Rust Trojan client connects to Go Trojan server, sends handshake, verifies.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Go xray-core binary; run with --ignored"]
+#[ignore = "requires XRAY_GO_BIN (Go xray-core binary); run with --ignored"]
 async fn go_trojan_server_rust_client_handshake() {
     // Start HTTP echo server as target
     let echo_port = spawn_http_echo_server()
@@ -152,7 +152,7 @@ async fn rust_trojan_client_connect(
 // -- Test 2: Rust Trojan server -> Go Trojan client (via Go xray SOCKS5 proxy) --
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Go xray-core binary; run with --ignored"]
+#[ignore = "requires XRAY_GO_BIN (Go xray-core binary); run with --ignored"]
 async fn rust_trojan_server_go_client() {
     // Start HTTP echo server as target
     let echo_port = spawn_http_echo_server()
@@ -213,7 +213,7 @@ async fn rust_trojan_server_go_client() {
 // Verify Rust Trojan server can parse Go Trojan client's handshake format.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Go xray-core binary; run with --ignored"]
+#[ignore = "requires XRAY_GO_BIN (Go xray-core binary); run with --ignored"]
 async fn rust_trojan_server_go_client_handshake_only() {
     let (validator, _account) = make_trojan_validator();
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

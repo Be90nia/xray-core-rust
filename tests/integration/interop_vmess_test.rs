@@ -59,13 +59,13 @@ fn make_vmess_validator() -> (Arc<TimedUserValidator>, [u8; 16]) {
 // Rust client connects directly to Go VMess server, sends data, verifies echo.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Go xray-core binary; run with --ignored"]
+#[ignore = "requires XRAY_GO_BIN (Go xray-core binary); run with --ignored"]
 async fn go_vmess_server_rust_client_aes128gcm() {
     run_go_server_rust_client(SecurityType::Aes128Gcm).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Go xray-core binary; run with --ignored"]
+#[ignore = "requires XRAY_GO_BIN (Go xray-core binary); run with --ignored"]
 async fn go_vmess_server_rust_client_chacha20poly1305() {
     run_go_server_rust_client(SecurityType::Chacha20Poly1305).await;
 }
@@ -163,13 +163,13 @@ async fn rust_vmess_client_connect(
 // Go xray acts as: SOCKS5 inbound -> VMess outbound -> Rust VMess server -> freedom -> echo
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Go xray-core binary; run with --ignored"]
+#[ignore = "requires XRAY_GO_BIN (Go xray-core binary); run with --ignored"]
 async fn rust_vmess_server_go_client_aes128gcm() {
     run_rust_server_go_client(SecurityType::Aes128Gcm).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Go xray-core binary; run with --ignored"]
+#[ignore = "requires XRAY_GO_BIN (Go xray-core binary); run with --ignored"]
 async fn rust_vmess_server_go_client_chacha20poly1305() {
     run_rust_server_go_client(SecurityType::Chacha20Poly1305).await;
 }

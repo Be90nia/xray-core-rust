@@ -42,19 +42,19 @@ fn make_ss_account(ct: CipherType) -> SsAccount {
 // Rust SS client connects directly to Go SS server, sends data.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Go xray-core binary; run with --ignored"]
+#[ignore = "requires XRAY_GO_BIN (Go xray-core binary); run with --ignored"]
 async fn go_ss_server_rust_client_aes128gcm() {
     run_go_ss_server_rust_client(CipherType::Aes128Gcm, "aes-128-gcm", 20061).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Go xray-core binary; run with --ignored"]
+#[ignore = "requires XRAY_GO_BIN (Go xray-core binary); run with --ignored"]
 async fn go_ss_server_rust_client_chacha20poly1305() {
     run_go_ss_server_rust_client(CipherType::ChaCha20Poly1305, "chacha20-ietf-poly1305", 20071).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Go xray-core binary; run with --ignored"]
+#[ignore = "requires XRAY_GO_BIN (Go xray-core binary); run with --ignored"]
 async fn go_ss_server_rust_client_aes256gcm() {
     run_go_ss_server_rust_client(CipherType::Aes256Gcm, "aes-256-gcm", 20081).await;
 }
@@ -140,7 +140,7 @@ async fn rust_ss_client_connect(
 // Verify Rust read_request can parse data sent by Go SS server.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Go xray-core binary; run with --ignored"]
+#[ignore = "requires XRAY_GO_BIN (Go xray-core binary); run with --ignored"]
 async fn rust_ss_server_reads_go_client_request() {
     // Start Rust SS server
     let account = make_ss_account(CipherType::Aes128Gcm);
@@ -183,7 +183,7 @@ async fn rust_ss_server_reads_go_client_request() {
 // Rust SS client connects, sends HTTP request through the tunnel.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Go xray-core binary; run with --ignored"]
+#[ignore = "requires XRAY_GO_BIN (Go xray-core binary); run with --ignored"]
 async fn go_ss_proxy_rust_client_aes128gcm_http() {
     // Start HTTP echo server as target
     let echo_port = spawn_http_echo_server()

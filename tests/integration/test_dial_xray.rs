@@ -20,9 +20,8 @@
 //! `get_default_handler().dispatch(...)`，但跨实例 SimpleOhm 共享 / 计数器
 //! 链路 / 反压等留 P4+）。
 //!
-//! **依赖 libclang/nasm**（xray-tls → btls-sys），标记 `#[ignore]`，与
-//! `e2e_vmess_proxy` 同模式。运行：`cargo test -p xray-integration-tests
-//! --test integration_dial_xray -- --ignored`。
+//! **依赖 libclang/nasm**（xray-tls → btls-sys）。运行：`cargo test -p xray-integration-tests
+//! --test integration_dial_xray`。
 //!
 //! 拓扑：
 //!   client Xray (dispatcher + vmess outbound) -- vmess protocol -->
@@ -45,7 +44,7 @@ use xray_proxy_vmess::account::cmd_key_of;
 use xray_proxy_vmess::encoding::client::ClientSession as VmessClientSession;
 use xray_proxy_vmess::encoding::VERSION as VMESS_VERSION;
 
-const VMESS_UUID_STR: &str = "dial-xray-test-9c8e4a2b-6f1d-4e0b-a5d8-7c9e2f3b8a01";
+const VMESS_UUID_STR: &str = "9c8e4a2b-6f1d-4e0b-a5d8-7c9e2f3b8a01";
 
 async fn pick_free_port() -> u16 {
     let probe = TcpListener::bind("127.0.0.1:0").await.expect("pick port");
@@ -153,7 +152,6 @@ async fn wait_ready(port: u16) {
 /// 4. VMess protocol roundtrip via direct outbound (intra-instance dispatch)
 ///    走 dispatcher + freedom default outbound — 验证 dispatcher→default outbound 链。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires full xray-core runtime (libclang/nasm); see task sk8r non-goals"]
 async fn dial_xray_two_instance_smoke() {
     let _ = UUID::parse(VMESS_UUID_STR).expect("uuid parse");
 
@@ -237,27 +235,22 @@ async fn dial_xray_two_instance_smoke() {
         .await
         .expect("vmess decode resp header");
 
-    // 写 PAYLOAD + 读 echo
+    // 写 PAYLOAD + 读 echo（VMess body 必须走 session 编解码，同 e2e_vmess_proxy 模式；
+    // 之前裸写 plaintext 导致服务端解密垃圾、echo 永不返回）
     let payload = b"hello dial_xray smoke test!";
-    client.write_all(payload).await.expect("write payload");
-
-    let mut buf = vec![0u8; payload.len()];
-    let mut got = 0;
-    let read_fut = async {
-        while got < buf.len() {
-            let n = client.read(&mut buf[got..]).await.expect("read");
-            if n == 0 {
-                break;
-            }
-            got += n;
-        }
-        got
-    };
-    let n = tokio::time::timeout(Duration::from_secs(5), read_fut)
+    session
+        .encode_request_body_async(&header, payload, &mut client)
         .await
-        .expect("echo roundtrip must complete in 5s");
-    assert_eq!(n, payload.len(), "echo length mismatch");
-    assert_eq!(&buf[..n], payload, "echo payload mismatch");
+        .expect("vmess encode body");
+    let response = tokio::time::timeout(Duration::from_secs(5), async {
+        session
+            .decode_response_body_async(&header, &mut client)
+            .await
+            .expect("vmess decode body")
+    })
+    .await
+    .expect("echo roundtrip must complete in 5s");
+    assert_eq!(response.as_slice(), payload, "echo payload mismatch");
 
     // cleanup
     for h in server_handles {

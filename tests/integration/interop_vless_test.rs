@@ -65,7 +65,7 @@ fn make_vless_validator() -> (Arc<MemoryValidator>, UUID) {
 // -- Test 1: Go VLESS server -> Rust VLESS client (wire-level compat) --
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Go xray-core binary; run with --ignored"]
+#[ignore = "requires XRAY_GO_BIN (Go xray-core binary); run with --ignored"]
 async fn go_vless_server_rust_client() {
     // Start HTTP echo server as target
     let echo_port = spawn_http_echo_server()
@@ -162,7 +162,7 @@ async fn rust_vless_client_connect(
 // -- Test 2: Rust VLESS server -> Go VLESS client (via Go xray SOCKS5 proxy) --
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Go xray-core binary; run with --ignored"]
+#[ignore = "requires XRAY_GO_BIN (Go xray-core binary); run with --ignored"]
 async fn rust_vless_server_go_client() {
     // Start HTTP echo server as target
     let echo_port = spawn_http_echo_server()

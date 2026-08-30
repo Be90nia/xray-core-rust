@@ -177,7 +177,7 @@ fn socks_inbound(port: u16) -> BuiltInbound {
 // --- Test 1: WebSocket transport (VLESS + WS) --------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires full xray-core runtime (libclang/nasm/btls)"]
+#[ignore = "known-fail: vless websocket transport chain, echo connection refused; pending transport fix"]
 async fn websocket_transport_via_vless_e2e() {
     let echo_addr = start_echo().await;
     let vless_port = pick_free_port().await;
@@ -215,7 +215,7 @@ async fn websocket_transport_via_vless_e2e() {
 // --- Test 2: gRPC transport (VLESS + gRPC) -----------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires full xray-core runtime (libclang/nasm/btls)"]
+#[ignore = "known-fail: vless grpc transport chain, echo connection refused; pending transport fix"]
 async fn grpc_transport_via_vless_e2e() {
     let echo_addr = start_echo().await;
     let vless_port = pick_free_port().await;
@@ -253,7 +253,7 @@ async fn grpc_transport_via_vless_e2e() {
 // --- Test 3: mKCP transport (VLESS + KCP) ------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires full xray-core runtime (libclang/nasm/btls)"]
+#[ignore = "known-fail: vless kcp transport chain, echo connection refused; pending transport fix"]
 async fn kcp_transport_via_vless_e2e() {
     let echo_addr = start_echo().await;
     let vless_port = pick_free_port().await;
@@ -289,7 +289,6 @@ async fn kcp_transport_via_vless_e2e() {
 // --- Test 4: TLS transport (VMess + TLS, self-signed + allowInsecure) -------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires full xray-core runtime (libclang/nasm/btls)"]
 async fn tls_transport_via_vmess_e2e() {
     let echo_addr = start_echo().await;
     let vmess_port = pick_free_port().await;
@@ -335,7 +334,7 @@ async fn tls_transport_via_vmess_e2e() {
 // --- Test 5: REALITY transport (VLESS + REALITY) ----------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires full xray-core runtime (libclang/nasm/btls)"]
+#[ignore = "known-fail: vless reality transport chain, echo connection refused; pending transport fix"]
 async fn reality_transport_via_vless_e2e() {
     use base64::Engine;
     use x25519_dalek::{PublicKey, StaticSecret};

@@ -6,8 +6,7 @@
 //!
 //! Covered protocols: VMess / VLESS / Trojan / SS.
 //!
-//! Note: tests are marked `#[ignore]` because they depend on the full xray-core runtime.
-//! Run with: `cargo test --test integration_e2e -- --ignored`.
+//! These tests require the full xray-core runtime (libclang/nasm + btls).
 
 use std::sync::Arc;
 
@@ -361,7 +360,6 @@ fn make_ss_account() -> SsMemoryAccount {
 
 /// VMess e2e: BuiltConfig(vmess inbound + freedom outbound) -> start_full -> VMess client -> echo -> verify.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires full xray-core runtime (libclang/nasm)"]
 async fn e2e_vmess_proxy() {
     let mut env = E2eTestBuilder::new().await.expect("echo server");
 
@@ -398,7 +396,6 @@ async fn e2e_vmess_proxy() {
 
 /// VLESS e2e: BuiltConfig(vless inbound + freedom outbound) -> start_full -> VLESS client -> echo -> verify.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires full xray-core runtime (libclang/nasm)"]
 async fn e2e_vless_proxy() {
     let mut env = E2eTestBuilder::new().await.expect("echo server");
 
@@ -434,7 +431,6 @@ async fn e2e_vless_proxy() {
 }
 /// Trojan e2e: BuiltConfig(trojan inbound + freedom outbound) -> start_full -> Trojan client -> echo -> verify.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires full xray-core runtime (libclang/nasm)"]
 async fn e2e_trojan_proxy() {
     let mut env = E2eTestBuilder::new().await.expect("echo server");
 
@@ -477,7 +473,6 @@ async fn e2e_trojan_proxy() {
 /// support is added to xray-core, this test should be replaced with a true
 /// SS inbound -> SS outbound -> echo server chain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires full xray-core runtime (libclang/nasm)"]
 async fn e2e_ss_proxy() {
     let mut env = E2eTestBuilder::new().await.expect("echo server");
 

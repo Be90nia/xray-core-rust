@@ -5,9 +5,7 @@
 //! but with the `wireguard` / `dokodemo` / `dns` / `tls-pinned` scenarios that were
 //! previously missing (only unit tests existed).
 //!
-//! All tests are `#[ignore]` because they require the full xray-core runtime
-//! (libclang/nasm + btls). Run with:
-//!   `cargo test --test integration_e2e_p2 -- --ignored`
+//! These tests require the full xray-core runtime (libclang/nasm + btls).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -219,7 +217,6 @@ fn wg_keypair(seed: u8) -> (String, String) {
 //   (c) Dokodemo inbound listens at configured port and accepts TCP.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires full xray-core runtime (libclang/nasm) + WG userspace netstack"]
 async fn e2e_p2_wireguard_full_chain() {
     let _echo = start_echo().await;
 
@@ -395,7 +392,6 @@ async fn e2e_p2_wireguard_full_chain() {
 // - SNI "localhost" set so the leaf is selected via SNI match.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires full xray-core runtime (libclang/nasm/btls)"]
 async fn e2e_p2_tls_utls_pinned() {
     use xray_tls::certificate::generate_self_signed_cert;
     use xray_tls::pin::generate_cert_hash;
@@ -482,7 +478,6 @@ fn generate_cert_hash_hex(der: &[u8]) -> String {
 // a TCP connection and the proxy rewrites dest = echo_addr.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires full xray-core runtime (libclang/nasm)"]
 async fn e2e_p2_dokodemo_full_chain() {
     let echo_addr = start_echo().await;
     let dokodemo_port = pick_free_port().await;
@@ -542,7 +537,6 @@ async fn e2e_p2_dokodemo_full_chain() {
 // end-to-end wire loopback" gap.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires full xray-core runtime (libclang/nasm)"]
 async fn e2e_p2_dns_core_resolution() {
     use xray_app_dns::nameserver::Server as _;
     use xray_core::Feature as _;
