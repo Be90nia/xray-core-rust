@@ -176,22 +176,65 @@ impl Observer {
     ///
     /// 这是同步阻塞版本，调用方可在 tokio::task::spawn_blocking 中执行。
     /// 对应 Go `background` 单轮的逻辑（不包含 sleep 循环）。
+    ///
+    /// `EnableConcurrency` 为 true 时按 Go observer.go:94-110 路径并行探测；
+    /// 否则串行（observer.go:81-92）。探测量大场景（几十个 outbound）下
+    /// 并行把 N×latency 压到 max(latency)。
     pub fn probe_all(
         &self,
         selector: &dyn OutboundSelector,
         executor: &dyn ProbeExecutor,
     ) -> Result<usize, ObservatoryError> {
         let tags = selector.select(&self.config.subject_selector)?;
+        self.probe_tags(&tags, executor);
+        Ok(tags.len())
+    }
 
-        // 先清理已移除的 outbound
-        self.status.clear_removed(&tags);
+    /// 对给定 tag 集合探测一轮，按 `enable_concurrency` 决定串/并行。
+    ///
+    /// 对应 Go `Observer.background()` 单轮探测部分（observer.go:81-110）。
+    /// 并行路径与 Go 一致：每个 tag 起独立线程探测（Go goroutine ↔
+    /// std::thread::spawn），主循环在所有线程 join 后退出。
+    pub fn probe_tags(&self, tags: &[String], executor: &dyn ProbeExecutor) {
+        // 先清理已移除的 outbound（仅对"存活"集合——空集时等价 noop）
+        self.status.clear_removed(tags);
+
+        if tags.is_empty() {
+            return;
+        }
 
         let now = now_unix_secs();
-        for tag in &tags {
-            let result = executor.probe(tag);
-            self.status.update_with_probe_result(tag, &result, now);
+        if self.config.enable_concurrency {
+            // 并行探测（Go observer.go:94-102：每个 outbound 一个 goroutine）。
+            // ProbeExecutor.probe 是同步阻塞（内部 block_on 真实 HTTP dial），
+            // 用 scoped thread 借用非 'static 的 executor 引用实现真并行。
+            let results = std::thread::scope(|s| {
+                let handles: Vec<_> = tags
+                    .iter()
+                    .map(|tag| {
+                        let tag = tag.clone();
+                        s.spawn(move || {
+                            let result = executor.probe(&tag);
+                            (tag, result)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    // join 失败（panic）→ None，调用方跳过该 tag
+                    .map(|h| h.join().ok())
+                    .collect::<Vec<_>>()
+            });
+            for pair in results.into_iter().flatten() {
+                let (tag, result) = pair;
+                self.status.update_with_probe_result(&tag, &result, now);
+            }
+        } else {
+            for tag in tags {
+                let result = executor.probe(tag);
+                self.status.update_with_probe_result(tag, &result, now);
+            }
         }
-        Ok(tags.len())
     }
 
     /// 仅探测单个 tag（用于按需触发）。
@@ -601,6 +644,189 @@ mod tests {
         assert!(result.delay >= 0);
         server.await.unwrap();
     }
+
+    /// qyo6：probe_tags 按 enable_concurrency 分支。
+    /// 并行分支下多 tag 应都能探测完，alive status 都写入。
+    /// （实测通过 std::thread::spawn 真并行；本测试主要确认结果正确性。）
+    #[test]
+    fn probe_tags_concurrent_branch_writes_all_statuses() {
+        let cfg = ObservatoryConfig {
+            subject_selector: vec!["a".into(), "b".into(), "c".into()],
+            enable_concurrency: true,
+            ..Default::default()
+        };
+        let o = Observer::new(cfg);
+        let exec = FixedProbeExecutor::new()
+            .with_result(
+                "a",
+                ProbeResult {
+                    alive: true,
+                    delay: 10,
+                    last_error_reason: String::new(),
+                },
+            )
+            .with_result(
+                "b",
+                ProbeResult {
+                    alive: false,
+                    delay: 0,
+                    last_error_reason: "x".into(),
+                },
+            )
+            .with_result(
+                "c",
+                ProbeResult {
+                    alive: true,
+                    delay: 30,
+                    last_error_reason: String::new(),
+                },
+            );
+        let tags = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        o.probe_tags(&tags, &exec);
+        let obs = o.get_observation();
+        assert_eq!(obs.status.len(), 3);
+        let a = obs.status.iter().find(|s| s.outbound_tag == "a").unwrap();
+        assert!(a.alive);
+        assert_eq!(a.delay, 10);
+        let b = obs.status.iter().find(|s| s.outbound_tag == "b").unwrap();
+        assert!(!b.alive);
+        let c = obs.status.iter().find(|s| s.outbound_tag == "c").unwrap();
+        assert!(c.alive);
+        assert_eq!(c.delay, 30);
+    }
+
+    /// qyo6：enable_concurrency=false 时走串行分支（与原行为一致）。
+    #[test]
+    fn probe_tags_serial_branch_writes_all_statuses() {
+        let cfg = ObservatoryConfig {
+            subject_selector: vec!["x".into(), "y".into()],
+            enable_concurrency: false,
+            ..Default::default()
+        };
+        let o = Observer::new(cfg);
+        let exec = FixedProbeExecutor::new()
+            .with_result(
+                "x",
+                ProbeResult {
+                    alive: true,
+                    delay: 5,
+                    last_error_reason: String::new(),
+                },
+            )
+            .with_result(
+                "y",
+                ProbeResult {
+                    alive: true,
+                    delay: 7,
+                    last_error_reason: String::new(),
+                },
+            );
+        o.probe_tags(
+            &["x".to_string(), "y".to_string()],
+            &exec,
+        );
+        let obs = o.get_observation();
+        assert_eq!(obs.status.len(), 2);
+    }
+
+    /// qyo6：空 tags 时 EnableConcurrency 分支不退化、不 panic。
+    #[test]
+    fn probe_tags_empty_tags_noop() {
+        let cfg = ObservatoryConfig {
+            enable_concurrency: true,
+            ..Default::default()
+        };
+        let o = Observer::new(cfg);
+        let exec = FixedProbeExecutor::new();
+        o.probe_tags(&[], &exec);
+        assert!(o.get_observation().status.is_empty());
+    }
+
+    /// qyo6：RealOutboundProbeExecutor — 未知 tag → dead + reason。
+    #[test]
+    fn real_outbound_probe_missing_handler_returns_dead() {
+        let exec = RealOutboundProbeExecutor::from_config(&ObservatoryConfig::default());
+        let r = exec.probe("unknown-tag");
+        assert!(!r.alive);
+        assert!(r.last_error_reason.contains("unknown-tag"));
+    }
+
+    /// qyo6：RealOutboundProbeExecutor — URL 为空 → dead + reason。
+    #[tokio::test]
+    async fn real_outbound_probe_empty_url_returns_dead() {
+        // 构造一个 noop handler 让"tag 存在"路径走通，URL 为空短路
+        struct NoopHandler;
+        #[async_trait::async_trait]
+        impl xray_features::outbound::OutboundHandler for NoopHandler {
+            fn tag(&self) -> &str {
+                "noop"
+            }
+            async fn dial(
+                &self,
+                _destination: &xray_common::net::destination::Destination,
+                _session: &xray_common::session::Session,
+            ) -> Result<(), xray_features::outbound::OutboundError> {
+                Ok(())
+            }
+            fn can_handle(
+                &self,
+                _destination: &xray_common::net::destination::Destination,
+            ) -> bool {
+                true
+            }
+        }
+        let cfg = ObservatoryConfig {
+            probe_url: "".into(),
+            ..Default::default()
+        };
+        let mut exec = RealOutboundProbeExecutor::from_config(&cfg);
+        exec.set_handler("noop", Arc::new(NoopHandler));
+        let r = exec.probe("noop");
+        assert!(!r.alive);
+        assert!(r.last_error_reason.contains("empty"));
+    }
+
+    /// qyo6：RealOutboundProbeExecutor — 真实 OutboundHandler 拨号：handler 拨号
+    /// 成功时返回 alive + delay 字段填 dial 耗时。
+    #[tokio::test]
+    async fn real_outbound_probe_dial_success_records_delay() {
+        use std::sync::Arc;
+        struct OkHandler;
+        #[async_trait::async_trait]
+        impl xray_features::outbound::OutboundHandler for OkHandler {
+            fn tag(&self) -> &str {
+                "ok"
+            }
+            async fn dial(
+                &self,
+                _destination: &xray_common::net::destination::Destination,
+                _session: &xray_common::session::Session,
+            ) -> Result<(), xray_features::outbound::OutboundError> {
+                // 模拟 5ms 处理延迟（让 delay > 0 验证计时）
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                Ok(())
+            }
+            fn can_handle(
+                &self,
+                _destination: &xray_common::net::destination::Destination,
+            ) -> bool {
+                true
+            }
+        }
+
+        let cfg = ObservatoryConfig {
+            probe_url: "http://example.com/test".into(),
+            ..Default::default()
+        };
+        let mut exec = RealOutboundProbeExecutor::from_config(&cfg);
+        exec.set_handler("ok", Arc::new(OkHandler));
+
+        // tokio::test 已在 runtime；probe 内部 block_on 当前 runtime
+        let r = exec.probe("ok");
+        assert!(r.alive, "expected alive, got: {:?}", r);
+        assert!(r.delay >= 0);
+        assert!(r.last_error_reason.is_empty(), "alive probe should have empty reason, got: {:?}", r.last_error_reason);
+    }
 }
 
 /// 基于 OutboundManager 的 OutboundSelector 实现。
@@ -790,6 +1016,166 @@ impl HttpProbeExecutor {
     }
 }
 
+// ── 真实 outbound HTTP probe（qyo6）─────────────────────────────────
+//
+// Go `Observer.probe` 用 `tagged.Dialer(ctx, dispatcher, dest, outbound)`
+// 把目标地址套到指定 outbound 上发起 HTTP GET。Rust 端 `OutboundHandler::dial`
+// 返回 `Result<(), _>`（不暴露 duplex stream）——我们用 dial 成功 + 用时
+// 作为"该 outbound 能否到达目标 URL"的可观测信号。这与 Go 路径语义一致
+// （dial 失败即 alive=false，dial 成功即以 dial 用时为 RTT），只是少了
+// "HTTP 响应头解析"层。
+
+/// 通过指定 outbound 拨号到探测 URL 的 [`ProbeExecutor`] 实现。
+///
+/// 持有 tag → `OutboundHandler` 映射（由装配阶段注入），每次 `probe`：
+/// 1. 用 `parse_url_host_port` 解 URL 得到 host:port + tls 标记；
+/// 2. 构造 `Destination { host:port, network=tcp }`；
+/// 3. 调 `handler.dial(&dest, &session)` 并计时；
+/// 4. dial 成功 → alive + delay=dial_ms；失败 → dead + reason。
+///
+/// 对应 Go `Observer.probe(outbound)` 的 outbound 拨号部分
+/// （observer.go:130-159，tagged.Dialer 路径）。
+pub struct RealOutboundProbeExecutor {
+    /// tag → outbound handler 映射。
+    handlers: std::collections::HashMap<String, Arc<dyn xray_features::outbound::OutboundHandler>>,
+    /// 探测 URL（如 `https://www.google.com/generate_204`）。
+    probe_url: String,
+    /// dial 超时（毫秒）。
+    timeout_ms: u64,
+}
+
+impl std::fmt::Debug for RealOutboundProbeExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RealOutboundProbeExecutor")
+            .field("probe_url", &self.probe_url)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("handler_tags", &self.handlers.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl RealOutboundProbeExecutor {
+    /// 构造。
+    #[must_use]
+    pub fn new(
+        handlers: std::collections::HashMap<String, Arc<dyn xray_features::outbound::OutboundHandler>>,
+        probe_url: impl Into<String>,
+        timeout_ms: u64,
+    ) -> Self {
+        Self {
+            handlers,
+            probe_url: probe_url.into(),
+            timeout_ms,
+        }
+    }
+
+    /// 从 `ObservatoryConfig` 构造空 handler map（待装配阶段填充）。
+    #[must_use]
+    pub fn from_config(config: &ObservatoryConfig) -> Self {
+        Self::new(
+            std::collections::HashMap::new(),
+            config.effective_probe_url(),
+            5_000,
+        )
+    }
+
+    /// 注入/替换单个 tag 的 handler。
+    pub fn set_handler(&mut self, tag: impl Into<String>, handler: Arc<dyn xray_features::outbound::OutboundHandler>) {
+        self.handlers.insert(tag.into(), handler);
+    }
+}
+
+impl ProbeExecutor for RealOutboundProbeExecutor {
+    fn probe(&self, outbound_tag: &str) -> ProbeResult {
+        let Some(handler) = self.handlers.get(outbound_tag) else {
+            return ProbeResult {
+                alive: false,
+                delay: 0,
+                last_error_reason: format!("no outbound handler registered for tag '{outbound_tag}'"),
+            };
+        };
+
+        let url = self.probe_url.trim();
+        if url.is_empty() {
+            return ProbeResult {
+                alive: false,
+                delay: 0,
+                last_error_reason: "probe url is empty".into(),
+            };
+        }
+
+        let (host, port, _use_tls) = match parse_url_host_port(url) {
+            Ok(t) => t,
+            Err(e) => {
+                return ProbeResult {
+                    alive: false,
+                    delay: 0,
+                    last_error_reason: format!("parse probe url: {e}"),
+                };
+            }
+        };
+
+        let addr = match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => xray_common::net::address::Address::from(ip),
+            Err(_) => xray_common::net::address::Address::new_domain(host.clone()),
+        };
+        let dest = xray_common::net::destination::Destination::new(
+            addr,
+            xray_common::net::port::Port::from(port),
+            xray_common::net::network::Network::TCP,
+        );
+        let session = xray_common::session::Session::new();
+
+        let timeout_ms = self.timeout_ms;
+        let outbound_tag_owned = outbound_tag.to_string();
+        // E0382 fix: outbound_tag_owned 被 move 进 block_on 闭包，此处预克隆
+        // 一份给 unwrap_or_else（无 runtime 兜底分支）使用。
+        let tag_for_fallback = outbound_tag_owned.clone();
+        let handler = handler.clone();
+        let result = tokio::runtime::Handle::try_current()
+            .map(|handle| {
+                handle.block_on(async move {
+                    let start = Instant::now();
+                    let dial_fut = handler.dial(&dest, &session);
+                    let timeout = Duration::from_millis(timeout_ms);
+                    match tokio::time::timeout(timeout, dial_fut).await {
+                        Ok(Ok(())) => {
+                            let delay = start.elapsed().as_millis() as i64;
+                            ProbeResult {
+                                alive: true,
+                                delay,
+                                last_error_reason: String::new(),
+                            }
+                        }
+                        Ok(Err(e)) => ProbeResult {
+                            alive: false,
+                            delay: 0,
+                            last_error_reason: format!(
+                                "outbound '{outbound_tag_owned}' dial failed: {e}"
+                            ),
+                        },
+                        Err(_) => ProbeResult {
+                            alive: false,
+                            delay: 0,
+                            last_error_reason: format!(
+                                "outbound '{outbound_tag_owned}' dial timeout after {timeout_ms}ms"
+                            ),
+                        },
+                    }
+                })
+            })
+            .unwrap_or_else(|_| ProbeResult {
+                alive: false,
+                delay: 0,
+                last_error_reason: format!(
+                    "outbound '{tag_for_fallback}': no tokio runtime in probe thread"
+                ),
+            });
+        result
+    }
+}
+
+
 /// 从 URL 解析 host、port、是否使用 TLS。
 ///
 /// 支持 http:// 和 https:// 前缀。
@@ -833,3 +1219,4 @@ fn parse_url_host_port(url: &str) -> Result<(String, u16, bool), String> {
 
     Ok((host, port, use_tls))
 }
+

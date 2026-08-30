@@ -43,7 +43,8 @@ pub use error::{at_error, at_warning, ObservatoryError};
 pub use error_collector::ErrorCollector;
 pub use observer::{
     FixedProbeExecutor, HttpProbeExecutor, NoopOutboundSelector, Observer,
-    OutboundSelector, ProbeExecutor, RealOutboundSelector, now_unix_secs,
+    OutboundSelector, ProbeExecutor, RealOutboundProbeExecutor, RealOutboundSelector,
+    now_unix_secs,
 };
 pub use burst_feature::BurstObservatoryFeature;
 pub use feature::ObservatoryFeature;
