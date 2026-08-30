@@ -88,6 +88,14 @@ async fn listen_httpupgrade(
     // 2. TLS 配置（可选）
     let tls_acceptor = build_tls_acceptor(settings)?;
 
+    // Tcpmask（Go httpupgrade/hub.go:145-147：`TcpmaskManager.WrapListener` →
+    // 每条 accept conn 过 `WrapConnServer` 再进 handler；空 manager = 恒等）。
+    let tcpmask = Arc::new(
+        xray_transport::finalmask::build_tcpmask_manager_from_json(
+            settings.finalmask_json.as_ref(),
+        )?,
+    );
+
     // 3. spawn accept loop
     let server = HttpUpgradeServer::new(config);
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -116,9 +124,19 @@ async fn listen_httpupgrade(
                 }
             }
 
-            // 分支：TLS / 明文 → handshake → Connection
             match do_handshake(tcp, &server, &tls_acceptor, remote).await {
-                Ok(conn) => handler(conn),
+                Ok(conn) => {
+                    // Tcpmask wrap 失败 → 丢弃该 conn 继续（Go tcpListener.Accept 语义）。
+                    match xray_transport::finalmask::wrap_conn_server_into_connection(
+                        &tcpmask,
+                        conn,
+                    ) {
+                        Ok(masked) => handler(masked),
+                        Err(e) => {
+                            tracing::debug!("HTTPUpgrade tcpmask wrap error: {e}");
+                        }
+                    }
+                }
                 Err(e) => {
                     tracing::debug!("HTTPUpgrade handshake error: {e}");
                 }
@@ -233,8 +251,8 @@ async fn dial_httpupgrade(
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("HTTPUpgrade handshake failed: {e}")))?;
         Box::new(httpupgrade_conn) as Box<dyn Connection>
     };
-
-    Ok(conn)
+    // Tcpmask（Go httpupgrade/dialer.go:55-60：`TcpmaskManager.WrapConnClient`）。
+    xray_transport::finalmask::wrap_conn_client_from_settings(settings, conn)
 }
 
 /// 从 `httpupgradeSettings` JSON 解析为强类型 [`Config`]。
@@ -564,5 +582,73 @@ mod tests {
             .expect("read should succeed");
         assert_eq!(&out[..n], b"pong");
         server.await.unwrap();
+    }
+
+    /// Tcpmask round-trip（o54c，Go httpupgrade/dialer.go:55-60 + hub.go:145-147）：
+    /// dial 与 hub 双端配置 fragment mask 后 e2e echo 收发。
+    #[tokio::test]
+    async fn httpupgrade_dial_hub_tcpmask_roundtrip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use xray_common::net::address::Address;
+        use xray_common::net::network::Network;
+        use xray_common::net::port::Port;
+        use std::net::Ipv4Addr;
+        use std::time::Duration;
+
+        let finalmask = serde_json::json!({
+            "tcp": [{"type": "fragment", "settings": {
+                "packets_from": 1, "packets_to": 2,
+                "length": {"from": 8, "to": 16}, "interval": {"from": 0, "to": 0}
+            }}]
+        });
+        let settings = StreamSettings {
+            protocol: "httpupgrade".to_string(),
+            transport_json: Some(serde_json::json!({"path":"/hu"})),
+            finalmask_json: Some(finalmask),
+            ..StreamSettings::tcp()
+        };
+
+        let handler: ConnHandler = Arc::new(|conn| {
+            tokio::spawn(async move {
+                let mut conn = conn;
+                let mut buf = [0u8; 1024];
+                loop {
+                    match conn.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if conn.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        let listener = listen_httpupgrade(
+            "127.0.0.1:0".parse().unwrap(),
+            &settings,
+            &SocketOptions::default(),
+            handler,
+        )
+        .await
+        .expect("listen_httpupgrade");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let dest = Destination::new(
+            Address::IPv4(Ipv4Addr::LOCALHOST),
+            Port::new(addr.port()),
+            Network::TCP,
+        );
+        let mut conn = dial_httpupgrade(&dest, &SocketOptions::default(), &settings)
+            .await
+            .expect("dial_httpupgrade");
+
+        conn.write_all(b"hello-hu-tcpmask").await.expect("write");
+        let mut buf = vec![0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(5), conn.read(&mut buf))
+            .await
+            .expect("echo timeout")
+            .expect("read ok");
+        assert_eq!(&buf[..n], b"hello-hu-tcpmask");
     }
 }

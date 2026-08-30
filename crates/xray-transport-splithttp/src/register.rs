@@ -145,9 +145,14 @@ async fn dial_splithttp(
             })?
     };
 
-    // Wrap !Sync reader in MutexReader → SplitConn that impl Connection.
-    let sync_conn = packet_conn.into_sync_reader();
-    Ok(Box::new(sync_conn) as Box<dyn Connection>)
+    // Tcpmask（Go splithttp/dialer.go:127-134：仅 h1/h2 路径的 dialContext 内
+    // WrapConnClient；h3/QUIC 无 Tcpmask）。
+    let sync_conn: Box<dyn Connection> = Box::new(packet_conn.into_sync_reader());
+    if http_version == "3" {
+        Ok(sync_conn)
+    } else {
+        xray_transport::finalmask::wrap_conn_client_from_settings(settings, sync_conn)
+    }
 }
 
 /// 将 [`Destination`] 解析为 [`SocketAddr`]（quinn/H3 需要；域名走系统 DNS）。
@@ -369,5 +374,75 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(r#"500"#).unwrap();
         let r = parse_range(&v).unwrap();
         assert_eq!((r.from, r.to), (500, 500));
+    }
+
+    /// Tcpmask round-trip（o54c，Go splithttp/dialer.go:127-134 + hub.go:547-549）：
+    /// 明文 HTTP/1.1 packet-up，dial 与 hub 双端配置 fragment mask 后 e2e echo。
+    #[tokio::test]
+    async fn splithttp_dial_hub_tcpmask_roundtrip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use xray_common::net::address::Address;
+        use xray_common::net::network::Network;
+        use xray_common::net::port::Port;
+        use std::net::Ipv4Addr;
+
+        let finalmask = serde_json::json!({
+            "tcp": [{"type": "fragment", "settings": {
+                "packets_from": 1, "packets_to": 2,
+                "length": {"from": 8, "to": 16}, "interval": {"from": 0, "to": 0}
+            }}]
+        });
+        let settings = StreamSettings {
+            protocol: "splithttp".to_string(),
+            transport_json: Some(serde_json::json!({"path":"/xh", "mode":"packet-up"})),
+            finalmask_json: Some(finalmask),
+            ..StreamSettings::tcp()
+        };
+
+        let handler: xray_transport::listener_registry::ConnHandler = Arc::new(|conn| {
+            tokio::spawn(async move {
+                let mut conn = conn;
+                let mut buf = [0u8; 1024];
+                loop {
+                    match conn.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if conn.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        let listener = listen_splithttp(
+            "127.0.0.1:0".parse().unwrap(),
+            &settings,
+            &SocketOptions::default(),
+            handler,
+        )
+        .await
+        .expect("listen_splithttp");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let dest = Destination::new(
+            Address::IPv4(Ipv4Addr::LOCALHOST),
+            Port::new(addr.port()),
+            Network::TCP,
+        );
+        let mut conn = dial_splithttp(&dest, &SocketOptions::default(), &settings)
+            .await
+            .expect("dial_splithttp");
+
+        conn.write_all(b"hello-xh-tcpmask").await.expect("write");
+        let mut buf = vec![0u8; 64];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            conn.read(&mut buf),
+        )
+        .await
+        .expect("echo timeout")
+        .expect("read ok");
+        assert_eq!(&buf[..n], b"hello-xh-tcpmask");
     }
 }

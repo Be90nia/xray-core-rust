@@ -24,9 +24,19 @@ pub async fn dial(dest: &Destination, settings: &StreamSettings) -> io::Result<B
     let tcp = TcpStream::connect(&addr).await?;
     tcp.set_nodelay(true).ok();
     let cfg = parse_config(settings)?;
-    let path = cfg.service_name();
+    // gRPC path：`/{service}/{stream}`（Go grpc URI 契约，server matches_path
+    // 对齐 server.rs:62-66；无前导 '/' 的裸服务名是非法 h2 URI → RST_STREAM）。
+    let path = format!(
+        "/{}/{}",
+        cfg.service_name(),
+        if cfg.multi_mode {
+            cfg.tun_multi_stream_name()
+        } else {
+            cfg.tun_stream_name()
+        }
+    );
 
-    if !settings.security.is_empty() && settings.security != "none" {
+    let conn = if !settings.security.is_empty() && settings.security != "none" {
         let sni = dest.address().to_string();
         let tls_cfg = xray_tls::client_config::build_client_config(
             &settings.security, settings.security_json.as_ref(), &sni,
@@ -37,7 +47,10 @@ pub async fn dial(dest: &Destination, settings: &StreamSettings) -> io::Result<B
         dial_h2(tls, &path).await
     } else {
         dial_h2(tcp, &path).await
-    }
+    }?;
+    // Tcpmask（Go grpc/dial.go:129-135：`TcpmaskManager.WrapConnClient`，
+    // security/protocol 栈建立后链式应用 finalmask_json.tcp[]）。
+    xray_transport::finalmask::wrap_conn_client_from_settings(settings, conn)
 }
 
 async fn dial_h2<T>(conn: T, path: &str) -> io::Result<Box<dyn Connection>>
@@ -75,21 +88,32 @@ pub async fn listen(addr: SocketAddr, settings: &StreamSettings, handler: ConnHa
     let tls_cfg = if !settings.security.is_empty() && settings.security != "none" {
         Some(xray_tls::server_config::build_server_config(&settings.security, settings.security_json.as_ref())?.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "TLS server config None"))?)
     } else { None };
+    // Tcpmask（Go grpc/hub.go:123-125：`TcpmaskManager.WrapListener` → 每条
+    // accept conn 过 `WrapConnServer`；空 manager = 恒等）。
+    let tcpmask = Arc::new(
+        xray_transport::finalmask::build_tcpmask_manager_from_json(
+            settings.finalmask_json.as_ref(),
+        )?,
+    );
     tokio::spawn(async move { loop {
         let (tcp,_) = match listener.accept().await { Ok(v)=>v, Err(_)=>continue };
         tcp.set_nodelay(true).ok();
-        let h=handler.clone(); let tls=tls_cfg.clone();
+        let h=handler.clone(); let tls=tls_cfg.clone(); let m=Some(tcpmask.clone());
         tokio::spawn(async move {
             if let Some(tc)=tls {
                 let acc=tokio_rustls::TlsAcceptor::from(tc);
-                match acc.accept(tcp).await { Ok(c)=>accept_h2(c,h).await, Err(_)=>{} }
-            } else { accept_h2(tcp,h).await; }
+                match acc.accept(tcp).await { Ok(c)=>accept_h2(c,h,m).await, Err(_)=>{} }
+            } else { accept_h2(tcp,h,m).await; }
         });
     }});
     Ok(Box::new(GrpcListener{local}))
 }
 
-async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(conn: T, handler: ConnHandler) {
+async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
+    conn: T,
+    handler: ConnHandler,
+    tcpmask: Option<Arc<xray_transport::finalmask::TcpmaskManager>>,
+) {
     let mut h2_srv = match server::handshake(conn).await { Ok(s)=>s, Err(_)=>return };
     while let Some(r)=h2_srv.accept().await {
         let (req,mut respond) = match r { Ok(v)=>v, Err(_)=>continue };
@@ -107,7 +131,16 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(conn: T, 
             let r=async{while let Some(d)=recv_body.data().await{let d=d.map_err(io_err)?;wr.write_all(&d).await?;let _=recv_body.flow_control().release_capacity(d.len());}Ok::<_,io::Error>(())};
             let _=tokio::try_join!(s,r);
         });
-        h2(Box::new(DuplexConn(client)));
+        let conn: Box<dyn Connection> = match tcpmask.as_ref() {
+            Some(m) => match xray_transport::finalmask::wrap_conn_server_into_connection(
+                m, Box::new(DuplexConn(client)),
+            ) {
+                Ok(c) => c,
+                Err(e) => { tracing::debug!("grpc tcpmask wrap failed: {e}"); continue; }
+            },
+            None => Box::new(DuplexConn(client)),
+        };
+        h2(conn);
     }
 }
 

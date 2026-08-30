@@ -96,6 +96,14 @@ async fn listen_ws(
     // 根据 security 决定是否包装 TLS。
     let use_tls = settings.security != "none" && !settings.security.is_empty();
 
+    // Tcpmask（Go websocket/hub.go:132-134：`TcpmaskManager.WrapListener` →
+    // 每条 accept conn 过 `WrapConnServer` 再进 handler；空 manager = 恒等）。
+    let tcpmask = Arc::new(
+        xray_transport::finalmask::build_tcpmask_manager_from_json(
+            settings.finalmask_json.as_ref(),
+        )?,
+    );
+
     // spawn accept loop。
     let handler = handler.clone();
     let tls_config = if use_tls {
@@ -115,7 +123,18 @@ async fn listen_ws(
                 } => {
                     match result {
                         Ok(accepted) => {
-                            handler(accepted.conn);
+                            // Tcpmask wrap 失败 → 丢弃该 conn 继续 accept
+                            // （Go finalmask.go tcpListener.Accept：wrap err →
+                            // conn.Close + 返回 err，accept 循环继续）。
+                            match xray_transport::finalmask::wrap_conn_server_into_connection(
+                                &tcpmask,
+                                accepted.conn,
+                            ) {
+                                Ok(conn) => handler(conn),
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "ws tcpmask wrap failed, dropping conn");
+                                }
+                            }
                         }
                         Err(e) => {
                             let msg = e.to_string();
@@ -175,7 +194,9 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
     .await
     .map_err(|e| io::Error::other(e))?;
 
-    Ok(Box::new(conn))
+    // Tcpmask（Go websocket/dialer.go:56-63：`TcpmaskManager.WrapConnClient`，
+    // security 包装之后链式应用 finalmask_json.tcp[]）。
+    xray_transport::finalmask::wrap_conn_client_from_settings(settings, Box::new(conn))
 }
 
 /// 从 path 提取 `?ed=N` 早期数据参数。
@@ -645,5 +666,66 @@ mod tests {
         assert_eq!(f("/ws?ed=2048#frag"), ("/ws#frag".to_string(), Some(2048)));
         // path 部分非法 % 转义 → 整体不动
         assert_eq!(f("/w%zz?ed=2048"), ("/w%zz?ed=2048".to_string(), None));
+    }
+
+    /// Tcpmask round-trip（o54c，Go websocket/dialer.go:56-63 + hub.go:132-134）：
+    /// dial 与 hub 双端配置 fragment mask 后 e2e echo 收发。
+    #[tokio::test]
+    async fn ws_dial_hub_tcpmask_roundtrip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use xray_common::net::address::Address;
+        use xray_common::net::network::Network;
+        use xray_common::net::port::Port;
+
+        let finalmask = serde_json::json!({
+            "tcp": [{"type": "fragment", "settings": {
+                "packets_from": 1, "packets_to": 2,
+                "length": {"from": 8, "to": 16}, "interval": {"from": 0, "to": 0}
+            }}]
+        });
+        let mut settings = StreamSettings::default();
+        settings.protocol = "websocket".to_string();
+        settings.transport_json = Some(serde_json::json!({"path": "/ws"}));
+        settings.finalmask_json = Some(finalmask);
+
+        // echo handler：读到什么写回什么。
+        let handler: ConnHandler = Arc::new(|conn| {
+            tokio::spawn(async move {
+                let mut conn = conn;
+                let mut buf = [0u8; 1024];
+                loop {
+                    match conn.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if conn.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        let listener = listen_ws("127.0.0.1:0".parse().unwrap(), &settings, &handler)
+            .await
+            .expect("listen_ws");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let dest = Destination::new(
+            Address::new_domain("127.0.0.1"),
+            Port::new(addr.port()),
+            Network::TCP,
+        );
+        let mut conn = dial_ws(&dest, &settings).await.expect("dial_ws");
+
+        conn.write_all(b"hello-ws-tcpmask").await.expect("write");
+        let mut buf = vec![0u8; 64];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            conn.read(&mut buf),
+        )
+        .await
+        .expect("echo timeout")
+        .expect("read ok");
+        assert_eq!(&buf[..n], b"hello-ws-tcpmask");
     }
 }

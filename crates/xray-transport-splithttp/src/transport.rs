@@ -65,12 +65,20 @@ pub async fn listen_splithttp(
         let tls = tls_cfg.expect("is_h3 implies Some");
         listen_h3(addr, tls, &config, handler).await
     } else {
+        // Tcpmask（Go splithttp/hub.go:547-549：`!isH3 && TcpmaskManager != nil`
+        // 才 WrapListener——H3/QUIC 分支不接 Tcpmask）。空 manager = 恒等。
+        let tcpmask = Some(Arc::new(
+            xray_transport::finalmask::build_tcpmask_manager_from_json(
+                settings.finalmask_json.as_ref(),
+            )?,
+        ));
         listen_tcp(
             addr,
             &settings.security,
             tls_cfg,
             settings.security_json.as_ref(),
             &config,
+            tcpmask,
             handler,
         )
         .await
@@ -123,13 +131,13 @@ pub async fn listen_splithttp_unix(
     Ok(Box::new(SplithttpListener { local: placeholder }))
 }
 
-/// TCP 监听 + accept 循环。对应 Go hub.go:536-545 + 551-578。
 async fn listen_tcp(
     addr: SocketAddr,
     security: &str,
     tls_cfg: Option<Arc<rustls::ServerConfig>>,
     security_json: Option<&serde_json::Value>,
     config: &Arc<Config>,
+    tcpmask: Option<Arc<xray_transport::finalmask::TcpmaskManager>>,
     handler: ConnHandler,
 ) -> io::Result<Box<dyn TransportListener>> {
     let tcp = tokio::net::TcpListener::bind(addr).await?;
@@ -146,6 +154,24 @@ async fn listen_tcp(
                 Err(_) => continue,
             };
             let _ = stream.set_nodelay(true);
+            // Tcpmask wrap（Go hub.go:546-549 WrapListener：mask 在 TLS/REALITY
+            // 之内、最贴近 wire；wrap 失败丢连接继续 accept）。
+            let stream: Box<dyn xray_transport::connection::Connection> =
+                match tcpmask.as_ref() {
+                    Some(m) => {
+                        match xray_transport::finalmask::wrap_conn_server_into_connection(
+                            m,
+                            Box::new(xray_transport::connection::TcpConnection::new(stream)),
+                        ) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::debug!(error = %e, "XHTTP tcpmask wrap failed");
+                                continue;
+                            }
+                        }
+                    }
+                    None => Box::new(xray_transport::connection::TcpConnection::new(stream)),
+                };
             let ctx = Arc::clone(&ctx);
             let tls = tls_cfg.clone();
             let rc = reality.clone();
