@@ -1224,4 +1224,42 @@ mod tests {
         // 默认 Ciphertext 构造需 kem 0.3 trait 依赖，已由 unit/integration 测试覆盖
         // （xray-proxy-vless/tests/），此处仅验 key 派生通路。
     }
+
+    /// ML-KEM-768 真实 round-trip：encapsulate → try_decapsulate → shared 字节相等。
+    /// 验证 `ml_kem::kem::{TryDecapsulate, Encapsulate}` trait 可达，
+    /// 证明 kem 0.3 re-export 在 xray-proxy-vless 编译路径可用。
+    #[test]
+    fn ml_kem_768_round_trip() {
+        use ml_kem::kem::{Decapsulate, Encapsulate};
+
+        let mut seed = [0u8; 64];
+        rand::rng().fill_bytes(&mut seed);
+        let dk = ml_kem::DecapsulationKey768::from_seed(ml_kem::Seed::from(seed));
+        let ek = dk.encapsulation_key();
+
+        // kem 0.3 的 `encapsulate()` 需 `ml-kem/getrandom` feature 门（已开）；
+        // 显式 RNG 路径改用 `try_decapsulate_slice`（不需 RNG）的 round-trip：
+        // 这里走 `encapsulate()` + `decapsulate(&ct)`，特征路径与 Go `mlkem768EKey.Encapsulate()`
+        // 完全对齐（返回 (ct, shared) → decapsulate 验证）。
+        let (ct, sender_shared) = ek.encapsulate();
+        let receiver_shared = dk.decapsulate(&ct);
+
+        assert_eq!(sender_shared.as_slice(), receiver_shared.as_slice());
+    }
+
+    /// ML-KEM-768 try_decapsulate smoke：默认（全零）Ciphertext 应可被
+    /// `try_decapsulate` 接受（返回错误或 SharedKey 都可，**只要不 panic**）。
+    /// 验证 trait API 路径可达。
+    #[test]
+    fn ml_kem_768_try_decapsulate_default_ciphertext() {
+        use ml_kem::kem::TryDecapsulate;
+
+        let mut seed = [0u8; 64];
+        rand::rng().fill_bytes(&mut seed);
+        let dk = ml_kem::DecapsulationKey768::from_seed(ml_kem::Seed::from(seed));
+
+        let default_ct = ml_kem::Ciphertext::<ml_kem::MlKem768>::default();
+        // 不 panic 即可；返回 Ok 或 Err 都合法——全零 ct 是有效密文长度。
+        let _ = dk.try_decapsulate(&default_ct);
+    }
 } // closes mod tests

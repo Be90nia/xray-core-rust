@@ -539,19 +539,31 @@ where
             std::io::Error::new(std::io::ErrorKind::Other, "vless Reverse enabled but no reverse_ohm configured")
         })?;
 
-    // 当前 Rust 端 MemoryAccount 暂无 Reverse.Tag 字段（Reverse 字段在 proto
-    // 转换层尚未启用）。本批次取注册表首条配置作为 portal 绑定（v1.rvs.cool
-    // 默认值由 PortalConfig::new 提供，与 Go 端默认值一致）。
-    let _ = &decoded.user; // 保留供后续按 account.Reverse.Tag 路由
-    let portal_tag = registry
-        .tags()
-        .first()
-        .cloned()
-        .ok_or_else(|| {
-            std::io::Error::other("vless Reverse registry empty")
-        })?;
+    // 按 account.Reverse.Tag 路由（Go `proxy/vless/inbound/inbound.go:198-216`）：
+    // 每个 VLESS 账户的 Reverse 字段携带目标 Portal 的 tag；inbound 用它从
+    // registry 查 PortalConfig（domain 等），再经 ohm 拿到 PortalOutbound handler
+    // 派发子会话。**禁止 fallback 到首条**——多账户各自路由独立 portal，
+    // 否则跨账户流量会全部汇聚到第一个 portal（与 Go 语义偏离）。
+    let user = decoded.user.as_ref().ok_or_else(|| {
+        std::io::Error::other("vless Reverse: no user attached to request")
+    })?;
+    let reverse_cfg = user.account.reverse.as_ref().ok_or_else(|| {
+        std::io::Error::other(format!(
+            "vless Reverse: user {} has no reverse config",
+            user.email
+        ))
+    })?;
+    let portal_tag = reverse_cfg.tag.clone();
+    if portal_tag.is_empty() {
+        return Err(std::io::Error::other(
+            "vless Reverse: empty reverse.tag on user account",
+        ));
+    }
     let portal_cfg = registry.get_reverse(&portal_tag).map_err(|e| {
-        std::io::Error::other(format!("vless Reverse get_reverse: {}", e))
+        std::io::Error::other(format!(
+            "vless Reverse get_reverse(tag={}): {}",
+            portal_tag, e
+        ))
     })?;
 
     let portal_handler = ohm.get_handler(&portal_cfg.tag).ok_or_else(|| {
