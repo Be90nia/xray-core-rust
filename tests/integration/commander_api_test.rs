@@ -86,6 +86,7 @@ async fn start_with_api() -> (Arc<xray_app_dispatcher::default::SimpleOhm>, Stri
             stream_settings_json: None,
             proxy_settings_json: None,
             mux_json: None,
+            target_strategy: None,
         }],
     };
 

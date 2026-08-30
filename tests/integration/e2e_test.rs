@@ -167,6 +167,7 @@ fn freedom_outbound(tag: &str) -> BuiltOutbound {
         stream_settings_json: None,
         proxy_settings_json: None,
         mux_json: None,
+        target_strategy: None,
     }
 }
 

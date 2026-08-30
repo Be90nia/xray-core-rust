@@ -44,6 +44,12 @@ impl From<&str> for E2eP2Error {
     }
 }
 
+impl From<String> for E2eP2Error {
+    fn from(s: String) -> Self {
+        Self::Codec(s)
+    }
+}
+
 /// Start a TCP echo server (write what you read). Returns bound address.
 async fn start_echo() -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
@@ -90,6 +96,7 @@ fn freedom_outbound(tag: &str) -> BuiltOutbound {
         stream_settings_json: None,
         proxy_settings_json: None,
         mux_json: None,
+        target_strategy: None,
     }
 }
 
@@ -135,6 +142,7 @@ fn vless_outbound(upstream_port: u16, stream_settings_json: Option<serde_json::V
         stream_settings_json,
         proxy_settings_json: None,
         mux_json: None,
+        target_strategy: None,
     }
 }
 
@@ -283,6 +291,7 @@ async fn e2e_p2_wireguard_full_chain() {
         stream_settings_json: None,
         proxy_settings_json: None,
         mux_json: None,
+        target_strategy: None,
     });
     built.outbounds.push(freedom_outbound("direct"));
 
@@ -476,6 +485,8 @@ async fn e2e_p2_dokodemo_full_chain() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires full xray-core runtime (libclang/nasm)"]
 async fn e2e_p2_dns_core_resolution() {
+    use xray_app_dns::nameserver::Server as _;
+    use xray_core::Feature as _;
     use xray_app_dns::DnsService;
     use xray_app_dns::cache_controller::CacheController;
     use xray_app_dns::config::IpOption;
