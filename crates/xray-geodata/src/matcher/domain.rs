@@ -14,11 +14,7 @@
 //! # 工厂模式
 //!
 //! - [`DomainMatcherFactory`] - 域名匹配器工厂 trait
-//! - [`MphDomainMatcherFactory`] - MPH 匹配器工厂
-//! - [`CompactDomainMatcherFactory`] - Compact 匹配器工厂
-
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use super::{
     DomainMatcher as DomainMatcherImpl, FullMatcher, Matcher,
@@ -28,8 +24,7 @@ use super::matcher_groups::{
     MPHMatcherGroup, SimpleMatcherGroup,
 };
 use super::MatcherError;
-
-// ===== DomainType =====
+use crate::weak_cache::WeakCacheMap;
 
 /// 域名规则类型。
 ///
@@ -378,18 +373,22 @@ pub trait DomainMatcherFactory: Send + Sync {
 ///
 /// 对应 Go 版本 `MphDomainMatcherFactory`，使用 `MPHMatcherGroup`
 /// 构建高性能域名匹配器。
+///
+/// 内置 [`WeakCacheMap`] 缓存（rules key → matcher 弱引用）：
+/// 内置 [`WeakCacheMap`] 缓存（rules key → matcher 弱引用）：
+/// 同一份 rules 重复 `build_matcher` 时直接返回缓存的 `Arc`，
+/// 避免重复构造昂贵的 trie/MPH。缓存条目在外部 Arc 全部释放后
+/// 由 `WeakCacheMap::load` 自动清理（无需后台线程）。
 pub struct MphDomainMatcherFactory {
-    #[allow(dead_code)] // 预留缓存字段，未来替代 WeakCacheMap
-    cache: Mutex<HashMap<String, Box<dyn DomainMatcher>>>,
+    /// 共享缓存。键为 `rules` 的稳定 hash（见 [`build_domain_rules_key`]）。
+    shared: WeakCacheMap<String, MphDomainMatcher>,
 }
 
 impl MphDomainMatcherFactory {
     /// 创建新的 MPH 匹配器工厂。
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            cache: Mutex::new(HashMap::new()),
-        }
+        Self { shared: WeakCacheMap::new() }
     }
 }
 
@@ -401,7 +400,9 @@ impl Default for MphDomainMatcherFactory {
 
 impl std::fmt::Debug for MphDomainMatcherFactory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MphDomainMatcherFactory").finish()
+        f.debug_struct("MphDomainMatcherFactory")
+            .field("cached", &self.shared.len())
+            .finish()
     }
 }
 
@@ -410,29 +411,34 @@ impl DomainMatcherFactory for MphDomainMatcherFactory {
         &self,
         rules: &[DomainRule],
     ) -> Result<Box<dyn DomainMatcher>, MatcherError> {
+        let key = build_domain_rules_key(rules);
+        // 先构造 matcher（可能失败），再包装成 Arc 存入缓存。
         let matcher = MphDomainMatcher::build(rules)?;
-        Ok(Box::new(matcher))
+        let arc: Arc<MphDomainMatcher> =
+            self.shared.get_or_insert_with(key, || Arc::new(matcher));
+        Ok(Box::new(ArcCloneMatcher(arc)))
     }
 }
 
 // ===== CompactDomainMatcherFactory =====
-
 /// Compact 域名匹配器工厂。
 ///
 /// 对应 Go 版本 `CompactDomainMatcherFactory`，使用 `SimpleMatcherGroup`
 /// 构建线性扫描匹配器。
+///
+/// 与 [`MphDomainMatcherFactory`] 同样带 [`WeakCacheMap`] 缓存：
+/// 同一份 rules 重复 `build_matcher` 时返回缓存的 `Arc<CompactDomainMatcher>`，
+/// 避免重复构造 trie 链。缓存条目在外部 Arc 全部释放后
+/// 由 `WeakCacheMap::load` 自动清理。
 pub struct CompactDomainMatcherFactory {
-    #[allow(dead_code)] // 预留缓存字段，未来替代 WeakCacheMap
-    cache: Mutex<HashMap<String, Box<dyn DomainMatcher>>>,
+    shared: WeakCacheMap<String, CompactDomainMatcher>,
 }
 
 impl CompactDomainMatcherFactory {
     /// 创建新的 Compact 匹配器工厂。
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            cache: Mutex::new(HashMap::new()),
-        }
+        Self { shared: WeakCacheMap::new() }
     }
 }
 
@@ -444,7 +450,9 @@ impl Default for CompactDomainMatcherFactory {
 
 impl std::fmt::Debug for CompactDomainMatcherFactory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CompactDomainMatcherFactory").finish()
+        f.debug_struct("CompactDomainMatcherFactory")
+            .field("cached", &self.shared.len())
+            .finish()
     }
 }
 
@@ -453,26 +461,30 @@ impl DomainMatcherFactory for CompactDomainMatcherFactory {
         &self,
         rules: &[DomainRule],
     ) -> Result<Box<dyn DomainMatcher>, MatcherError> {
-        let mut simple = SimpleMatcherGroup::new();
-
-        for rule in rules {
-            let matcher = parse_domain(rule)?;
-            simple.add(matcher, rule.rule_id);
-        }
-
-        // 包装 SimpleMatcherGroup 为 ValueMatcher
-        struct SimpleValueMatcher(SimpleMatcherGroup);
-
-        impl ValueMatcher for SimpleValueMatcher {
-            fn match_str(&self, input: &str) -> Vec<u32> {
-                self.0.match_str(input)
-            }
-        }
-
-        let custom: Box<dyn ValueMatcher> = Box::new(SimpleValueMatcher(simple));
-        let matcher = CompactDomainMatcher::new(custom, vec![], vec![]);
-        Ok(Box::new(matcher))
+        let key = build_domain_rules_key(rules);
+        // 闭包不能直接用 `?`（返回类型固定 Arc），先构造再插入。
+        let matcher = build_compact_inner(rules)?;
+        let arc: Arc<CompactDomainMatcher> =
+            self.shared.get_or_insert_with(key, || Arc::new(matcher));
+        Ok(Box::new(ArcCloneMatcher(arc)))
     }
+}
+
+/// 构造 `CompactDomainMatcher` 内部结构。
+fn build_compact_inner(rules: &[DomainRule]) -> Result<CompactDomainMatcher, MatcherError> {
+    let mut simple = SimpleMatcherGroup::new();
+    for rule in rules {
+        let matcher = parse_domain(rule)?;
+        simple.add(matcher, rule.rule_id);
+    }
+    struct SimpleValueMatcher(SimpleMatcherGroup);
+    impl ValueMatcher for SimpleValueMatcher {
+        fn match_str(&self, input: &str) -> Vec<u32> {
+            self.0.match_str(input)
+        }
+    }
+    let custom: Box<dyn ValueMatcher> = Box::new(SimpleValueMatcher(simple));
+    Ok(CompactDomainMatcher::new(custom, vec![], vec![]))
 }
 
 // ===== DynamicDomainMatcher =====
@@ -480,7 +492,6 @@ impl DomainMatcherFactory for CompactDomainMatcherFactory {
 /// 动态域名匹配器。
 ///
 /// 对应 Go 版本 `DynamicDomainMatcher`，支持运行时更新规则
-/// 并原子切换匹配器状态。
 pub struct DynamicDomainMatcher {
     state: std::sync::RwLock<Option<Box<dyn DomainMatcher>>>,
     rules: Mutex<Vec<DomainRule>>,
@@ -548,8 +559,6 @@ impl std::fmt::Debug for DynamicDomainMatcher {
 }
 
 // ===== DomainRegistry =====
-
-use std::sync::Arc;
 
 /// 域名匹配器注册表。
 ///
@@ -670,9 +679,54 @@ pub static DOMAIN_REG: std::sync::LazyLock<DomainRegistry> =
     std::sync::LazyLock::new(|| {
         DomainRegistry::new(Box::new(MphDomainMatcherFactory::new()))
     });
+// ===== 工厂辅助：WeakCacheMap 缓存键 + Arc→Box 包装 =====
+
+/// 由 [`DomainRule`] 列表派生稳定的字符串缓存键。
+///
+/// 对齐 Go `common/geodata/domain_matcher.go:buildDomainRulesKey`：
+/// - `type:value@rule_id` 拼接（规则顺序敏感——同规则不同顺序视为不同匹配器）
+/// - 空规则列表返回空字符串（调用方应视为不可缓存，跳过缓存写入）
+fn build_domain_rules_key(rules: &[DomainRule]) -> String {
+    if rules.is_empty() {
+        return String::new();
+    }
+    let mut buf = String::with_capacity(rules.len() * 16);
+    for r in rules {
+        buf.push_str(match r.domain_type {
+            DomainType::Full => "full",
+            DomainType::Domain => "domain",
+            DomainType::Substr => "substr",
+            DomainType::Regex => "regex",
+        });
+        buf.push(':');
+        buf.push_str(&r.value);
+        buf.push('@');
+        buf.push_str(&r.rule_id.to_string());
+        buf.push(',');
+    }
+    buf
+}
+
+/// `Arc<T>` → `Box<dyn Trait>` 的零拷贝包装（通过 `Arc::clone`，仅增引用计数）。
+///
+/// 工厂 [`DomainMatcherFactory::build_matcher`] 要求返回 `Box<dyn DomainMatcher>`，
+/// 而 [`WeakCacheMap`] 的值类型是 `Arc<MphDomainMatcher>` / `Arc<CompactDomainMatcher>`
+/// （具体类型，避免 trait object 二次装箱）。`ArcCloneMatcher` 实现 `DomainMatcher`
+/// trait 时内部 `Arc::clone` 出一个新 owned Arc——这与 Go `runtime.AddCleanup` 的
+/// 自动清理兼容：调用方 `Box::new(ArcCloneMatcher)` 持有 Arc 副本，工厂缓存的 Arc
+/// 可在本次调用返回后被释放，不影响调用方持有。
+struct ArcCloneMatcher<T: DomainMatcher + Send + Sync + 'static>(Arc<T>);
+
+impl<T: DomainMatcher + Send + Sync + 'static> DomainMatcher for ArcCloneMatcher<T> {
+    fn match_domain(&self, input: &str) -> Vec<u32> {
+        self.0.match_domain(input)
+    }
+    fn match_any(&self, input: &str) -> bool {
+        self.0.match_any(input)
+    }
+}
 
 // ===== 单元测试 =====
-
 #[cfg(test)]
 mod tests {
     use super::*;
