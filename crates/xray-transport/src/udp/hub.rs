@@ -10,7 +10,8 @@
 //!
 //! origDest（TPROXY 原始目标地址）：Linux 下通过 `recvmsg` 读取 `IP_RECVORIGDSTADDR`/
 //! `IPV6_RECVORIGDSTADDR` ancillary data 提取；非 Linux 平台不可用（`target = None`）。
-//! udpmask wrapping：尚未接入 `crate::finalmask::Udpmask`/`UdpmaskManager`（见 listen() 内 TODO）。
+//! udpmask wrapping：已接入 `crate::finalmask`——`listen()` 的 `udpmask` 参数
+//! 非 `None` 且非空时经 `WrapPacketConnServer` 包装（对应 Go hub.go:71-77）。
 
 use std::io;
 use std::net::SocketAddr;
@@ -89,6 +90,9 @@ impl Default for UdpHubBuilder {
 /// 消费者通过 `receive()` 获取 channel receiver。
 pub struct UdpHub {
     socket: Arc<UdpSocket>,
+    /// udpmask 包装后的 server 侧 UDP I/O（Go hub.go:71-77 `WrapPacketConnServer`）。
+    /// `None` = 无 mask，直接用 raw socket。recv 循环与 `send_to` 均经过此 io。
+    io: Option<Arc<dyn crate::finalmask::UdpIo>>,
     rx: mpsc::Receiver<UdpPacket>,
     close_notify: Arc<Notify>,
     recv_orig_dest: bool,
@@ -97,44 +101,64 @@ pub struct UdpHub {
 impl UdpHub {
     /// 创建 UDP Hub 并 spawn recv 循环。
     ///
-    /// 对应 Go `ListenUDP()`：bind → spawn `start()` → return。
+    /// 对应 Go `ListenUDP()`：bind → `UdpmaskManager.WrapPacketConnServer`（可选）
+    /// → spawn `start()` → return。
     ///
     /// # 参数
     ///
     /// - `addr`：监听地址
     /// - `options`：配置选项（`Capacity`、`ReceiveOriginalDestination`）
+    /// - `udpmask`：UDP 伪装链（Go hub.go:71-77：`streamSettings.UdpmaskManager != nil`
+    ///   时包装 conn，recv 侧 decode、`send_to` 侧 encode）。`None` / 空 manager =
+    ///   不包装（现有行为不变）。
     ///
     /// # 错误
     ///
-    /// bind 失败时返回 `io::Error`。
+    /// bind 失败 / mask 包装失败时返回 `io::Error`（后者对应 Go `"mask err"`）。
     pub async fn listen(
         addr: SocketAddr,
         options: &[Box<dyn HubOption>],
+        udpmask: Option<crate::finalmask::UdpmaskManager>,
     ) -> io::Result<Self> {
         let mut builder = UdpHubBuilder::default();
         for opt in options {
             opt.apply(&mut builder);
         }
 
-        let socket = bind_udp(addr, builder.recv_orig_dest).await?;
+        let socket = Arc::new(bind_udp(addr, builder.recv_orig_dest).await?);
+        // udpmask（Go hub.go:71-77）：包装后的 io 由 recv 循环与 send_to 共享。
+        // 注意：mask 后无法走 TPROXY recvmsg 路径——对齐 Go（masked conn 的
+        // `hub.conn.(*net.UDPConn)` 断言失败 → udpConn=nil → origDest 不可用）。
+        let io: Option<Arc<dyn crate::finalmask::UdpIo>> = match udpmask.as_ref() {
+            Some(mgr) if !mgr.udpmasks.is_empty() => {
+                let wrapped =
+                    mgr.wrap_packet_conn_server(Box::new(Arc::clone(&socket)))?;
+                Some(Arc::from(wrapped))
+            }
+            _ => None,
+        };
         let (tx, rx) = mpsc::channel(builder.capacity);
         let close_notify = Arc::new(Notify::new());
 
         let hub = Self {
-            socket: Arc::new(socket),
+            socket: Arc::clone(&socket),
+            io: io.clone(),
             rx,
             close_notify: Arc::clone(&close_notify),
             recv_orig_dest: builder.recv_orig_dest,
         };
 
         // Spawn recv 循环。
-        let socket = Arc::clone(&hub.socket);
         let recv_orig_dest = hub.recv_orig_dest;
         tokio::spawn(async move {
-            // TODO(udpmask): 在此用 `crate::finalmask::Udpmask`/`UdpmaskManager` 链式包装
-            // send/recv，把真实 UDP 流量伪装成常见协议特征。需把 dispatcher 的 NAT 会话
-            // 与 finalmask 配置解析串联，非 trivial；待 finalmask 配置接入后实现。
-            start_recv_loop(&socket, tx, close_notify, recv_orig_dest).await;
+            match io {
+                Some(io) => {
+                    start_recv_loop_masked(&io, tx, close_notify).await;
+                }
+                None => {
+                    start_recv_loop(&socket, tx, close_notify, recv_orig_dest).await;
+                }
+            }
         });
 
         Ok(hub)
@@ -154,7 +178,11 @@ impl UdpHub {
     ///
     /// 对应 Go `Hub.WriteTo(payload, dest)`。
     pub async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
-        self.socket.send_to(buf, addr).await
+        match &self.io {
+            // mask 路径：经 wrap_packet_conn_server 包装的 io 发送（encode 后上线）。
+            Some(io) => io.send_to(buf, addr).await,
+            None => self.socket.send_to(buf, addr).await,
+        }
     }
 
     /// 监听器本地地址。
@@ -224,6 +252,47 @@ async fn start_recv_loop(
             }
             _ = close_notify.notified() => {
                 // 收到关闭信号，退出循环。
+                break;
+            }
+        }
+    }
+}
+
+/// mask 后的 UDP 收包循环（Go `Hub.start()` 读 wrapped `net.PacketConn`）。
+///
+/// 读经 [`crate::finalmask::UdpIo`]（server 侧 wrap，recv 即 decode）；
+/// TPROXY origDest 不可用（mask 链无法透传 recvmsg ancillary data，
+/// `target` 恒 `None`——对齐 Go masked conn 下 `udpConn=nil` 的行为）。
+async fn start_recv_loop_masked(
+    io: &Arc<dyn crate::finalmask::UdpIo>,
+    tx: mpsc::Sender<UdpPacket>,
+    close_notify: Arc<Notify>,
+) {
+    let mut buf = [0u8; UDP_BUFFER_SIZE];
+    loop {
+        tokio::select! {
+            result = io.recv_from(&mut buf) => {
+                match result {
+                    Ok((n, source)) => {
+                        if n == 0 {
+                            continue;
+                        }
+                        let packet = UdpPacket {
+                            payload: buf[..n].to_vec(),
+                            source,
+                            target: None,
+                        };
+                        if tx.try_send(packet).is_err() {
+                            tracing::debug!("UDP hub cache full, dropping packet");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to read UDP msg");
+                        break;
+                    }
+                }
+            }
+            _ = close_notify.notified() => {
                 break;
             }
         }
@@ -504,7 +573,7 @@ mod tests {
 
     #[tokio::test]
     async fn udp_hub_bind_and_recv() {
-        let hub = UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[])
+        let hub = UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], None)
             .await
             .expect("listen 失败");
         let addr = hub.local_addr().expect("local_addr 失败");
@@ -531,7 +600,7 @@ mod tests {
 
     #[tokio::test]
     async fn udp_hub_local_addr() {
-        let hub = UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[])
+        let hub = UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], None)
             .await
             .expect("listen 失败");
         let addr = hub.local_addr().expect("local_addr 失败");
@@ -541,7 +610,7 @@ mod tests {
 
     #[tokio::test]
     async fn udp_hub_send_to() {
-        let hub = UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[])
+        let hub = UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], None)
             .await
             .expect("listen 失败");
         let hub_addr = hub.local_addr().expect("local_addr 失败");
@@ -569,7 +638,7 @@ mod tests {
 
     #[tokio::test]
     async fn udp_hub_close_stops_recv_loop() {
-        let hub = UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[])
+        let hub = UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], None)
             .await
             .expect("listen 失败");
 
@@ -595,7 +664,7 @@ mod tests {
     #[tokio::test]
     async fn udp_hub_capacity_option() {
         let options: Vec<Box<dyn HubOption>> = vec![Box::new(Capacity(10))];
-        let hub = UdpHub::listen("127.0.0.1:0".parse().unwrap(), &options)
+        let hub = UdpHub::listen("127.0.0.1:0".parse().unwrap(), &options, None)
             .await
             .expect("listen 失败");
         let addr = hub.local_addr().expect("local_addr 失败");
@@ -604,7 +673,7 @@ mod tests {
 
     #[tokio::test]
     async fn udp_hub_multiple_packets() {
-        let hub = UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[])
+        let hub = UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], None)
             .await
             .expect("listen 失败");
         let addr = hub.local_addr().expect("local_addr 失败");
@@ -634,5 +703,67 @@ mod tests {
 
         // 验证顺序（UDP 不保证顺序，但本地 loopback 通常有序）。
         assert_eq!(received.len(), 5);
+    }
+
+    /// udpmask round-trip（o54c，对应 Go hub.go:71-77）：hub 带 manager 监听，
+    /// 客户端同配置 `wrap_packet_conn_client` 后发包 → hub recv 循环 decode 出原文；
+    /// hub `send_to`（encode 上线）→ 客户端 decode 出原文。
+    #[tokio::test]
+    async fn udp_hub_listen_with_udpmask_roundtrip() {
+        use crate::finalmask::{UdpIo, build_udpmask_manager_from_json};
+
+        let fm: serde_json::Value = serde_json::from_str(
+            r#"{"udp":[{"type":"mkcp-legacy","settings":{}}]}"#,
+        )
+        .unwrap();
+        let mgr = build_udpmask_manager_from_json(Some(&fm)).expect("manager");
+
+        let hub = UdpHub::listen(
+            "127.0.0.1:0".parse().unwrap(),
+            &[],
+            Some(mgr),
+        )
+        .await
+        .expect("listen with udpmask 失败");
+        let hub_addr = hub.local_addr().expect("local_addr 失败");
+
+        // 客户端：同配置 client 侧 wrap。
+        let client_raw = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+        let client_addr = client_raw.local_addr().unwrap();
+        let client_mgr = build_udpmask_manager_from_json(Some(&fm)).expect("manager");
+        let client_io: Box<dyn UdpIo> = client_mgr
+            .wrap_packet_conn_client(Box::new(client_raw))
+            .expect("client wrap");
+
+        // 反向：hub.send_to（encode）→ client decode。
+        hub.send_to(b"masked-pong", client_addr)
+            .await
+            .expect("hub send_to");
+        let mut buf = vec![0u8; 1500];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client_io.recv_from(&mut buf),
+        )
+        .await
+        .expect("client recv timeout")
+        .expect("client recv ok");
+        assert_eq!(&buf[..n], b"masked-pong");
+
+        // 正向：client（encode）→ hub recv 循环 decode。
+        client_io
+            .send_to(b"masked-ping", hub_addr)
+            .await
+            .expect("client send_to");
+        let mut rx = hub.receive();
+        let packet = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            rx.recv(),
+        )
+        .await
+        .expect("hub recv timeout")
+        .expect("hub channel closed");
+        assert_eq!(&packet.payload, b"masked-ping");
+        assert_eq!(packet.source, client_addr);
+        assert!(packet.target.is_none());
     }
 }

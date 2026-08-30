@@ -586,7 +586,7 @@ impl UdpWorker {
     /// 启动 UDP 监听。要求 `Arc<Self>` 以便闭包持有引用。
     pub async fn start_arc(self: &Arc<Self>) -> Result<(), ProxymanError> {
         let options: Vec<Box<dyn HubOption>> = vec![Box::new(Capacity(256))];
-        let hub = UdpHub::listen(self.address, &options)
+        let hub = UdpHub::listen(self.address, &options, None)
             .await
             .map_err(|e| ProxymanError::ListenSocketFailed(e.to_string()))?;
 

@@ -65,6 +65,21 @@ impl UdpIo for tokio::net::UdpSocket {
     }
 }
 
+/// `Arc<UdpSocket>` 同样适配 [`UdpIo`]（共享同一内核 socket；
+/// `UdpHub` 把 socket 交给 mask 链包装后仍需自持句柄用于 `local_addr`/close）。
+#[async_trait]
+impl UdpIo for std::sync::Arc<tokio::net::UdpSocket> {
+    async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
+        tokio::net::UdpSocket::send_to(self.as_ref(), buf, addr).await
+    }
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        tokio::net::UdpSocket::recv_from(self.as_ref(), buf).await
+    }
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        tokio::net::UdpSocket::local_addr(self.as_ref())
+    }
+}
+
 /// UDP 伪装接口（对应 Go `Udpmask`）。
 pub trait Udpmask: Send + Sync {
     fn wrap_packet_conn_client(
@@ -236,6 +251,24 @@ pub fn wrap_conn_server_into_connection(
     let raw: Box<dyn AsyncIo> = conn_to_asyncio(conn);
     let wrapped = apply_tcpmasks(&mgr.tcpmasks, raw, false)?;
     Ok(Box::new(AsyncIoConn(wrapped)))
+}
+
+/// 便捷入口（TCP 系 transport dial 路径用）：从 `StreamSettings.finalmask_json`
+/// 构建 [`TcpmaskManager`] 并 client 侧包装 conn。
+///
+/// 对应 Go 各 TCP transport dial 中 `streamSettings.TcpmaskManager.WrapConnClient`
+/// （websocket/dialer.go:56-63、grpc/dial.go:129-135、httpupgrade/dialer.go:55-60、
+/// splithttp/dialer.go:127-134、tcp/dialer.go:27-33）。
+/// 无 mask / 空数组 → 原样返回（向后兼容）。
+pub fn wrap_conn_client_from_settings(
+    settings: &crate::dialer::StreamSettings,
+    conn: Box<dyn crate::connection::Connection>,
+) -> io::Result<Box<dyn crate::connection::Connection>> {
+    let mgr = build_tcpmask_manager_from_json(settings.finalmask_json.as_ref())?;
+    if mgr.tcpmasks.is_empty() {
+        return Ok(conn);
+    }
+    wrap_conn_client_into_connection(&mgr, conn)
 }
 
 // ===== UDP mask 接入 Connection（o76 残余接线，V-Batch8-fjoj） =====
