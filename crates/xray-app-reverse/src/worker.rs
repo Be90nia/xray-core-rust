@@ -145,16 +145,16 @@ fn control_pipe_option() -> PipeOption {
 
 /// 内部控制连接目标（Go `portal.go:241`：`UDPDestination(DomainAddress("reverse"), 0)`）。
 ///
-/// ponytail: Rust mux client 恒写 global_id `[0;8]`，server 端 UDP dest 强制走
-/// XUDP 路径（`handle_xudp_new`），New 帧内联 data 被丢弃（Go `xudp.GetGlobalID`
-/// 无全局 ID 时返回 nil → 普通 packet 路径，data 正常转发）。控制流改用 TCP dest
-/// 绕开 XUDP 状态机——域名 `reverse` + port 0 的识别语义不变，仅帧 transfer
-/// type 不同。mux crate Go 对齐缺口补齐（global_id 可空）后可回归 UDP。
+/// bd 6z8 回归 UDP：mux client 对无全局 ID 的 UDP dest 走普通 packet 路径
+/// （`MuxWriter` global_id=None），server `handle_normal_new` 转发 New 帧
+/// 内联 data 且 Packet 会话直写（无 BufferedWriter 滞留）。旧 TCP 规避
+/// 已随 mux server 修复（worker.rs `handle_xudp_new` data 转发 + 首帧
+/// 即时送达）移除。
 pub fn internal_control_destination() -> Destination {
     Destination::new(
         Address::new_domain(INTERNAL_DOMAIN.to_string()),
         Port::new(0),
-        Network::TCP,
+        Network::UDP,
     )
 }
 
@@ -815,8 +815,9 @@ mod entity_tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let worker = spawn_portal_topology(tx).await;
 
-        // 第一个心跳（≤2s 触发 + 帧传播）：dispatch 内部域 dest + Control(ACTIVE)
-        // （Go 为 UDP dest；TCP 规避 mux XUDP 丢内联 data，见 internal_control_destination）
+        // 第一个心跳（≤2s 触发 + 帧传播）：dispatch 内部域 dest + Control(ACTIVE)。
+        // bd 6z8：回归 Go portal.go:241 的 UDP dest（mux server 已转发 New 帧内联
+        // data，Packet 会话直写无滞留）。
         let (dest, mut pay_r) =
             tokio::time::timeout(std::time::Duration::from_secs(8), rx.recv())
                 .await
@@ -824,7 +825,7 @@ mod entity_tests {
                 .expect("channel open");
         assert_eq!(dest.address().as_domain(), Some("reverse"));
         assert_eq!(dest.port().value(), 0);
-        assert_eq!(dest.network(), Network::TCP);
+        assert_eq!(dest.network(), Network::UDP);
 
         let mb = tokio::time::timeout(std::time::Duration::from_secs(3), pay_r.read_multi_buffer())
             .await

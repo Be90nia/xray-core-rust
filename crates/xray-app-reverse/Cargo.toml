@@ -24,3 +24,12 @@ async-trait = { workspace = true }
 yamux = { workspace = true }
 # futures↔tokio AsyncRead/Write 适配（yamux 用 futures traits）
 tokio-util = { workspace = true, features = ["compat"] }
+
+[dev-dependencies]
+xray-app-dispatcher = { path = "../xray-app-dispatcher" }
+xray-common = { path = "../xray-common" }
+xray-buf = { path = "../xray-buf" }
+xray-proxy-freedom = { path = "../xray-proxy-freedom" }
+tokio = { workspace = true, features = ["full", "test-util"] }
+tokio-util = { workspace = true, features = ["compat", "io"] }
+yamux = { workspace = true }
