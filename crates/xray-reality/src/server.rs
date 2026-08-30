@@ -1059,4 +1059,118 @@ mod tests {
             (Err(_timeout), _) => panic!("client u_client timeout"),
         }
     }
+
+    /// bd xvkh：REALITY 指纹矩阵 e2e。
+    ///
+    /// 覆盖 Go 基准指纹表全集（D:/Project/Xray-core/transport/internet/tls/tls.go:203-232）：
+    /// - `PresetFingerprints`（tls.go:204-217）：chrome/firefox/safari/ios/android/
+    ///   edge/360/qq（random 系走 fallback 矩阵）
+    /// - `ModernFingerprints`（tls.go:219-232）：hellofirefox_120/148、hellochrome_120/
+    ///   131/133、helloios_13/14、helloedge_106、hellosafari_26_3、hello360_11_0、
+    ///   helloqq_11_1
+    /// - 旧版变体（btls 映射到就近 connector，见 xray-tls btls_client.rs）
+    ///
+    /// 注：派单提及的 "2345" 在 Go v26.6.1 基准不存在（PresetFingerprints 无此键），
+    /// 矩阵按 Go 实际集合执行。
+    async fn reality_loopback_with_fingerprint(fp: &str) {
+        use std::time::Duration;
+        use tokio::io::duplex;
+        use x25519_dalek::{PublicKey, StaticSecret};
+        use crate::client::{u_client, UConnState};
+        use crate::config::RealityConfig;
+        use xray_proto::transport::internet::reality::Config as ProtoConfig;
+
+        let server_priv_array = [0x11u8; 32];
+        let short_id = [0xaa; 8];
+
+        let server_secret = StaticSecret::from(server_priv_array);
+        let server_pub = PublicKey::from(&server_secret);
+
+        let proto = ProtoConfig {
+            fingerprint: fp.to_string(),
+            public_key: server_pub.as_bytes().to_vec(),
+            server_name: "example.com".into(),
+            short_id: short_id.to_vec(),
+            ..Default::default()
+        };
+        let reality_config = RealityConfig::from_proto(&proto).unwrap();
+        let state = UConnState::new(reality_config).unwrap();
+
+        let (client, server) = duplex(65536);
+        let client = xray_transport::connection::DuplexConnection::new(client);
+
+        let server_task = tokio::spawn(async move {
+            server_tls(server, &server_priv_array, &[short_id], 43200).await
+        });
+
+        let client_result =
+            tokio::time::timeout(Duration::from_secs(10), u_client(client, state)).await;
+        let server_result = server_task.await.unwrap();
+
+        match (client_result, server_result) {
+            (Ok(Ok(_tls_stream)), Ok(RealityServerOutcome::Verified(_))) => {}
+            (Ok(Ok(_)), Ok(_)) => panic!("[{fp}] server unexpected outcome"),
+            (Ok(Ok(_)), Err(e)) => panic!("[{fp}] server error: {e:?}"),
+            (Ok(Err(e)), _) => panic!("[{fp}] client u_client failed: {e:?}"),
+            (Err(_timeout), _) => panic!("[{fp}] client u_client timeout"),
+        }
+    }
+
+    /// btls 浏览器指纹主路径矩阵：preset 8 + modern 11 + 旧版 2 = 21 例。
+    ///
+    /// **ignore 根因（aai 遗留，非本批引入）**：btls 客户端路径 REALITY 注入
+    /// 在 BIO 写出时改写 ClientHello session_id（btls_reality.rs 拦截流），
+    /// 但 BoringSSL 在消息构建期已将**原** session_id 计入握手 transcript——
+    /// 服务端 transcript（含注入值）与客户端不一致 → ServerHello
+    /// legacy_session_id_echo / Finished 校验失败 → 客户端秒败
+    /// `TlsHandshake("[DECODE_ERROR]")`（既有 `reality_loopback_u_client_
+    /// with_server_tls` 同因失败，commit 30b84bd 注记）。修复需 btls fork 提供
+    /// pre-hash 注入 API（utls `hello.SessionId` 语义），属 btls-sys 层工作。
+    /// 修复后去 ignore 即为 ≥10 指纹 btls 路径验收门。
+    #[tokio::test]
+    #[ignore = "btls REALITY transcript mismatch (aai legacy DECODE_ERROR); needs pre-hash injection API in btls fork"]
+    async fn reality_fingerprint_matrix_btls() {
+        ensure_crypto_provider();
+        let matrix = [
+            // PresetFingerprints（Go tls.go:204-212）
+            "chrome",
+            "firefox",
+            "safari",
+            "ios",
+            "android",
+            "edge",
+            "360",
+            "qq",
+            // ModernFingerprints（Go tls.go:221-231）
+            "hellofirefox_120",
+            "hellofirefox_148",
+            "hellochrome_120",
+            "hellochrome_131",
+            "hellochrome_133",
+            "helloios_13",
+            "helloios_14",
+            "helloedge_106",
+            "hellosafari_26_3",
+            "hello360_11_0",
+            "helloqq_11_1",
+            // 旧版变体（btls 就近映射）
+            "hellochrome_100",
+            "hellofirefox_99",
+        ];
+        for fp in matrix {
+            reality_loopback_with_fingerprint(fp).await;
+        }
+    }
+
+    /// watfaq-rustls fallback 路径矩阵：`randomizednoalpn`/`hellorandomizednoalpn`
+    /// 是仅有的两个不被 btls connector 覆盖的指纹（btls_client.rs:975 仅映射
+    /// Random/Randomized/HelloRandomized/HelloRandomizedAlpn→Chrome133），走标准
+    /// rustls ClientHello + REALITY session_id 注入（transcript 一致，可完整握手）。
+    #[tokio::test]
+    async fn reality_fingerprint_matrix_watfaq_fallback() {
+        ensure_crypto_provider();
+        for fp in ["randomizednoalpn", "hellorandomizednoalpn"] {
+            reality_loopback_with_fingerprint(fp).await;
+        }
+    }
 }
