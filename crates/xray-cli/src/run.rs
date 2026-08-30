@@ -80,14 +80,19 @@ pub fn execute(args: RunArgs) -> Result<()> {
 
     let config_files = resolve_config_files(&args)?;
 
-    if config_files.is_empty() {
-        return Err(CliError::ConfigNotFound(
-            "no config file specified or found in default locations".into(),
-        ));
-    }
-
-    // 加载首个配置文件（多配置合并留切片3）
-    let config = load_first_config(&config_files, &args.format)?;
+    let config = if config_files.is_empty() {
+        // 无文件 → 走 stdin 兜底（对应 Go `getConfigFilePath` 返回 `stdin:` 分支，
+        // main/run.go:198-201）。
+        load_stdin_config(&args.format)?
+    } else if config_files.len() == 1
+        && config_files[0].to_string_lossy() == "stdin:"
+    {
+        // `-c stdin:` 显式走 stdin
+        load_stdin_config(&args.format)?
+    } else {
+        // 文件路径：多文件走 merge_configs，单文件走 load_one_config
+        load_first_config(&config_files, &args.format)?
+    };
     let built = config
         .build()
         .map_err(|e| CliError::StartFailed(format!("config build failed: {e}")))?;
@@ -251,13 +256,25 @@ fn has_config_extension(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// 加载首个配置文件解析为 [`xray_conf::Config`]。
+/// 加载（首个或全部）配置文件解析为 [`xray_conf::Config`]。
+///
+/// 对应 Go `core.LoadConfig("auto", configFiles)`（main/run.go:215）。
+/// 多文件场景：逐文件加载 + override 合并，对齐 Go `serial.MergeConfigs`
+/// （builder.go:36）。
 fn load_first_config(files: &[PathBuf], format_hint: &str) -> Result<xray_conf::Config> {
-    let path = files
-        .first()
-        .ok_or_else(|| CliError::ConfigNotFound("no config files resolved".into()))?;
+    // 单文件场景：走 `load_file_with_format`（保留 `-format` hint 语义）
+    if files.len() == 1 {
+        return load_one_config(&files[0], format_hint);
+    }
+    // 多文件场景：合并 override（首个整体生效，其余按 tag 覆盖字段）
+    let merged = xray_conf::merge_configs(files).map_err(|e| {
+        CliError::ConfigLoadFailed(format!("merge config: {e}"))
+    })?;
+    Ok(merged)
+}
 
-    // format=auto 时按扩展名识别
+/// 单文件加载（保留 `-format` hint + 显式扩展名检测）。
+fn load_one_config(path: &Path, format_hint: &str) -> Result<xray_conf::Config> {
     let format = if format_hint.eq_ignore_ascii_case("auto") {
         xray_conf::Format::from_path(path).ok_or_else(|| {
             CliError::ConfigLoadFailed(format!(
@@ -273,6 +290,30 @@ fn load_first_config(files: &[PathBuf], format_hint: &str) -> Result<xray_conf::
 
     xray_conf::load_file_with_format(path, format)
         .map_err(|e| CliError::ConfigLoadFailed(format!("{}: {e}", path.display())))
+}
+
+/// 从 stdin 读取 JSON/YAML/TOML 配置并解析。
+///
+/// 对应 Go `getConfigFilePath` 末尾 `stdin:` 兜底分支（main/run.go:198-201）。
+/// format_hint 为 "auto" 时按字节首字符探测：JSON `{`/`[`、TOML/YAML 看
+/// 头部 token。
+fn load_stdin_config(format_hint: &str) -> Result<xray_conf::Config> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut buf)
+        .map_err(|e| CliError::ConfigLoadFailed(format!("read stdin: {e}")))?;
+    let format = if format_hint.eq_ignore_ascii_case("auto") {
+        xray_conf::Format::detect(&buf).ok_or_else(|| {
+            CliError::ConfigLoadFailed("无法识别 stdin 配置格式".into())
+        })?
+    } else {
+        parse_format_name(format_hint).ok_or_else(|| {
+            CliError::ConfigLoadFailed(format!("不支持的格式: {format_hint}"))
+        })?
+    };
+    xray_conf::load_reader(format, buf.as_slice())
+        .map_err(|e| CliError::ConfigLoadFailed(format!("stdin: {e}")))
 }
 
 /// 格式名 → [`xray_conf::Format`] 枚举。

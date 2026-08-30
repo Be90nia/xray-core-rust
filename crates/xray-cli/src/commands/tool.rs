@@ -261,21 +261,104 @@ pub async fn execute_tls(cmd: &TlsCommand) -> Result<(), CliError> {
 }
 
 /// convert 子命令 execute。
+///
+/// 两条路径（对应 Go `main/commands/all/convert/{json,protobuf}.go`）：
+/// - `convert json <file>`：读 TypedMessage JSON (`{"type":..., "value":...}`)，
+///   把 base64 `value` 解码为字节并以 `"<base64>"` 形式输出（无 proto 注册表
+///   无法做结构化解码——ponytail 限制）。
+/// - `convert pb [-debug] [-type] <files...>`：合并多文件配置（merge override）
+///   后序列化为 JSON。`-debug` 等价 `-dump` 输出；`-outpbfile` 因需要
+///   `core.Config` proto 编码（详见 `xray_conf::serial` Non-goals）暂未实现。
 pub fn execute_convert(cmd: &ConvertCommand) -> Result<(), CliError> {
     match cmd {
-        ConvertCommand::Json(args) => {
-            let _ = (&args.inject_type, &args.input);
-            Err(CliError::Unimplemented {
-                what: "convert json: protobuf-to-JSON conversion not yet implemented",
-            })
-        }
-        ConvertCommand::Pb(args) => {
-            let _ = (&args.out, &args.debug, &args.inject_type, &args.inputs);
-            Err(CliError::Unimplemented {
-                what: "convert pb: JSON-to-protobuf conversion not yet implemented",
-            })
+        ConvertCommand::Json(args) => execute_convert_json(args),
+        ConvertCommand::Pb(args) => execute_convert_pb(args),
+    }
+}
+
+fn execute_convert_json(args: &ConvertJsonArgs) -> Result<(), CliError> {
+    let raw = read_input(&args.input)?;
+    let mut tm: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| {
+        CliError::ConfigLoadFailed(format!("not a TypedMessage JSON: {e}"))
+    })?;
+    if args.inject_type.is_empty() {
+        // 默认走"裸值"路径（无 type 注入）：保留 value 字段。
+        // 极简：把 value 字节 base64 解码后回写为 hex 形式便于阅读
+        // （无 proto 注册表场景）。type 字段（若有）原样保留。
+        if let Some(obj) = tm.as_object_mut() {
+            if let Some(val) = obj.get("value") {
+                if let Some(b64) = val.as_str() {
+                    if let Ok(bytes) = base64_decode(b64) {
+                        obj.insert(
+                            "value_hex".into(),
+                            serde_json::Value::String(hex_encode(&bytes)),
+                        );
+                    }
+                }
+            }
         }
     }
+    let pretty = serde_json::to_string_pretty(&tm)
+        .map_err(|e| CliError::ConfigLoadFailed(format!("marshal TypedMessage: {e}")))?;
+    println!("{pretty}");
+    Ok(())
+}
+
+fn execute_convert_pb(args: &ConvertPbArgs) -> Result<(), CliError> {
+    if !args.inject_type.is_empty() && !args.debug {
+        // 仅 `-type` 无 `-debug` → 同 debug 路径但保留 type 信息（对 JSON 已无意义，
+        // 仅按 Go 语义保留语义占位）。
+    }
+    let paths: Vec<std::path::PathBuf> =
+        args.inputs.iter().map(std::path::PathBuf::from).collect();
+    if args.debug {
+        // -debug：合并配置 → 序列化为 JSON 输出（对应 Go MarshalToJson +
+        // JSONMarshalWithoutEscape，protobuf.go:81-88）。
+        let merged = xray_conf::merge_config_from_files(&paths).map_err(|e| {
+            CliError::ConfigLoadFailed(format!("merge config: {e}"))
+        })?;
+        print!("{merged}");
+        Ok(())
+    } else if args.out.is_some() {
+        // -outpbfile：需要把 Config 序列化为 `core.Config` proto——超出当前
+        // xray-conf 切片（serial.rs Non-goals 段落明确）。Fail-fast 告知用户。
+        Err(CliError::Unimplemented {
+            what: "convert pb -outpbfile: JSON→proto encoding requires core.Config proto \
+                   registry (see xray_conf::serial non-goals; use `convert pb -debug` instead)",
+        })
+    } else {
+        Err(CliError::InvalidArgument(
+            "-debug or -outpbfile required for convert pb".into(),
+        ))
+    }
+}
+
+/// 从文件或 `stdin:` 读取全部字节。
+fn read_input(spec: &str) -> Result<Vec<u8>, CliError> {
+    if spec == "stdin:" {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)
+            .map_err(|e| CliError::InvalidArgument(format!("read stdin: {e}")))?;
+        Ok(buf)
+    } else {
+        std::fs::read(spec)
+            .map_err(|e| CliError::InvalidArgument(format!("read {spec}: {e}")))
+    }
+}
+
+fn base64_decode(s: &str) -> Result<Vec<u8>, CliError> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .map_err(|e| CliError::InvalidArgument(format!("base64 decode: {e}")))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 // ---------------------------------------------------------------------------

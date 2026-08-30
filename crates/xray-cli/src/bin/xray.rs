@@ -190,8 +190,19 @@ async fn main() -> std::process::ExitCode {
     match execute(command).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
+            // Go main/run.go:82 配置错误退出码 23（systemd 等 init 不重启）。
+            // 其他错误（IO / API / 参数）用 1。
             eprintln!("Error: {e}");
-            std::process::ExitCode::FAILURE
+            if matches!(
+                e,
+                CliError::ConfigNotFound(_)
+                    | CliError::ConfigLoadFailed(_)
+                    | CliError::InvalidConfig(_)
+            ) {
+                std::process::ExitCode::from(23)
+            } else {
+                std::process::ExitCode::FAILURE
+            }
         }
     }
 }
