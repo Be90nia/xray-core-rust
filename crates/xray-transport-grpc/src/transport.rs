@@ -24,17 +24,10 @@ pub async fn dial(dest: &Destination, settings: &StreamSettings) -> io::Result<B
     let tcp = TcpStream::connect(&addr).await?;
     tcp.set_nodelay(true).ok();
     let cfg = parse_config(settings)?;
-    // gRPC path：`/{service}/{stream}`（Go grpc URI 契约，server matches_path
-    // 对齐 server.rs:62-66；无前导 '/' 的裸服务名是非法 h2 URI → RST_STREAM）。
-    let path = format!(
-        "/{}/{}",
-        cfg.service_name(),
-        if cfg.multi_mode {
-            cfg.tun_multi_stream_name()
-        } else {
-            cfg.tun_stream_name()
-        }
-    );
+    // gRPC path：`/{service}/{stream}`（Go grpc URI 契约；无前导 '/' 的裸服务名
+    // 是非法 h2 URI → RST_STREAM）。防御性规整：service/stream 段为空或缺前导 '/'
+    // 时补默认（Go `TunCustomName` 等价但上游 service_name 对 "/foo" 返回空串）。
+    let path = normalize_grpc_path(&cfg);
 
     let conn = if !settings.security.is_empty() && settings.security != "none" {
         let sni = dest.address().to_string();
@@ -159,4 +152,68 @@ impl AsyncWrite for DuplexConn{
 impl Connection for DuplexConn{fn remote_addr(&self)->io::Result<Option<SocketAddr>>{Ok(None)}fn local_addr(&self)->io::Result<Option<SocketAddr>>{Ok(None)}}
 
 struct GrpcListener{local:SocketAddr}
-impl TransportListener for GrpcListener{fn local_addr(&self)->io::Result<SocketAddr>{Ok(self.local)}fn close(&self)->io::Result<()>{tracing::info!("gRPC listener close addr={}",self.local);Ok(())}}
+
+impl xray_transport::listener_registry::TransportListener for GrpcListener {
+    fn close(&self) -> io::Result<()> { Ok(()) }
+    fn local_addr(&self) -> io::Result<SocketAddr> { Ok(self.local) }
+}
+
+/// gRPC 路径规整：`/{service}/{stream}`（Go `TunCustomName` 等价）。
+pub(crate) fn normalize_grpc_path(cfg: &Config) -> String {
+    let (raw_service, raw_stream) = if cfg.multi_mode {
+        (cfg.service_name(), cfg.tun_multi_stream_name())
+    } else {
+        (cfg.service_name(), cfg.tun_stream_name())
+    };
+    let service = if raw_service.is_empty() {
+        "GunService".to_string()
+    } else if raw_service.starts_with('/') {
+        raw_service
+    } else {
+        format!("/{raw_service}")
+    };
+    let stream = if raw_stream.is_empty() {
+        if cfg.multi_mode { "TunMulti".to_string() } else { "Tun".to_string() }
+    } else if raw_stream.starts_with('/') {
+        raw_stream
+    } else {
+        format!("/{raw_stream}")
+    };
+    format!("{service}{stream}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn cfg_single(name: &str) -> Config {
+        let mut c = Config::default();
+        c.service_name = name.to_string();
+        c
+    }
+    fn cfg_multi(name: &str) -> Config {
+        let mut c = cfg_single(name);
+        c.multi_mode = true;
+        c
+    }
+    #[test]
+    fn normalize_old_school_single() {
+        assert_eq!(normalize_grpc_path(&cfg_single("GunService")), "/GunService/Tun");
+    }
+    #[test]
+    fn normalize_old_school_multi() {
+        assert_eq!(normalize_grpc_path(&cfg_multi("GunService")), "/GunService/TunMulti");
+    }
+    #[test]
+    fn normalize_custom_path() {
+        assert_eq!(normalize_grpc_path(&cfg_single("/A/B/Tun")), "/A/B/Tun");
+    }
+    #[test]
+    fn normalize_empty_service_fallback() {
+        assert_eq!(normalize_grpc_path(&cfg_single("")), "/GunService/Tun");
+    }
+    #[test]
+    fn normalize_degenerate_service_fallback() {
+        // serviceName="/foo" → service_name()=""（Go 退化），tun="foo"。
+        assert_eq!(normalize_grpc_path(&cfg_single("/foo")), "/GunService/foo");
+    }
+}
