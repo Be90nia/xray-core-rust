@@ -1,6 +1,10 @@
 //! 日志基础设施
 //!
 //! 对应 Go 版本 `common/log` 包，提供日志级别、消息类型、处理器接口和全局注册表。
+//! 带通道缓冲的通用 Logger 见 [`general_logger`]。
+//!
+
+
 
 use std::fmt;
 use std::sync::Arc;
@@ -132,6 +136,10 @@ fn clear_handlers() {
         handlers.clear();
     }
 }
+
+
+/// 带通道缓冲的通用 Logger，对应 Go `common/log/logger.go::generalLogger`。
+pub mod general_logger;
 
 #[cfg(test)]
 mod tests {
