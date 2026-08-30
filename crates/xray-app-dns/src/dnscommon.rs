@@ -226,10 +226,10 @@ pub fn response_code_to_u16(rc: ResponseCode) -> RCode {
 ///
 /// 参数：
 /// - `fqdn`: 已规范化的全限定域名（不以 `.` 结尾会被自动补上）
-/// - `record_type`: A / AAAA / MX / TXT 等
-/// - `req_id`: 16-bit 请求 ID（响应需匹配）
-/// - `client_ip`: EDNS0 client subnet。空 Vec 表示不加 EDNS0；
-///   长度 4 表示 IPv4 (/24)，长度 16 表示 IPv6 (/56)。
+/// `client_ip`: EDNS0 client subnet。空 Vec 表示不加 EDNS0；
+/// 长度 4 表示 IPv4 (/24)，长度 16 表示 IPv6 (/96)。
+/// 对齐 Go `app/dns/dnscommon.go:91` 注释 `// 24 for IPV4, 96 for IPv6` 和
+/// `dnscommon.go:94 netmask = 96`：IPv6 默认 /96（v26.6.1 行为）。
 ///
 /// 返回序列化后的 DNS wire bytes。
 pub fn build_dns_query(
@@ -256,7 +256,7 @@ pub fn build_dns_query(
             b.copy_from_slice(client_ip);
             std::net::IpAddr::V6(std::net::Ipv6Addr::from(b))
         };
-        let source_prefix: u8 = if client_ip.len() == 4 { 24 } else { 56 };
+        let source_prefix: u8 = if client_ip.len() == 4 { 24 } else { 96 };
         edns.options_mut().insert(EdnsOption::Subnet(ClientSubnet::new(
             addr,
             source_prefix,

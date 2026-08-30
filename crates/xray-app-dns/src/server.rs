@@ -138,6 +138,14 @@ impl DnsService {
     /// 输出：按优先级排序的 `Arc<Client>` 引用列表。
     #[must_use]
     pub fn sort_clients(&self, domain: &str) -> Vec<Arc<Client>> {
+        // helper: 把当前 ordered 转成 names 列表并调 log_decision（Go dns.go:330-337）。
+        // 只在非空时调（log_decision 内部已 short-circuit 空列表，但提早返回路径
+        // 直接构造 names 一次更省一次 Vec 分配）。
+        let emit_decision = |ordered: &[Arc<Client>]| {
+            let names: Vec<&str> = ordered.iter().map(|c| c.server.name()).collect();
+            log_decision(domain, &names);
+        };
+
         let mut ordered: Vec<Arc<Client>> = Vec::with_capacity(self.cfg.clients.len());
         let mut used = vec![false; self.cfg.clients.len()];
         let mut has_match = false;
@@ -162,6 +170,8 @@ impl DnsService {
                 ordered.push(Arc::clone(&self.cfg.clients[idx]));
                 has_match = true;
                 if self.cfg.clients[idx].final_query {
+                    // Go dns.go:293 — finalQuery 提前返回前输出 logDecision。
+                    emit_decision(&ordered);
                     return ordered;
                 }
             }
@@ -178,10 +188,15 @@ impl DnsService {
                 used[idx] = true;
                 ordered.push(Arc::clone(client));
                 if client.final_query {
+                    // Go dns.go:309 — finalQuery 提前返回前输出 logDecision。
+                    emit_decision(&ordered);
                     return ordered;
                 }
             }
         }
+
+        // Go dns.go:315 — 常规末尾输出 logDecision。
+        emit_decision(&ordered);
 
         // 兜底：无任何 client 命中且有 clients → 取第一个。
         if ordered.is_empty() && !self.cfg.clients.is_empty() {
@@ -299,6 +314,14 @@ async fn serial_query(
         match client.query_ip(domain).await {
             Ok(result) => return Ok(result),
             Err(e) => {
+                // Go dns.go:377 — per-server LogInfoInner "in serial query mode"。
+                tracing::info!(
+                    target: "xray.dns",
+                    server = %client.server.name(),
+                    domain = %domain,
+                    error = %e,
+                    "failed to lookup ip in serial query mode",
+                );
                 if client.final_query {
                     return Err(e);
                 }
@@ -1209,6 +1232,74 @@ mod tests {
         assert!(matches!(err, DnsError::EmptyResponse));
     }
 
+    // ---- serial_query 行为覆盖（Go dns.go:363-384 serialQuery）----
+
+    /// Go dns.go:365-369：!FakeEnable 时 FakeDNS client 不参与 serial query。
+    /// 通过 lookup_ip 间接覆盖 serial_query 的 FakeDNS 跳过路径（先前仅在
+    /// parallel_query 中显式覆盖）。
+    #[tokio::test]
+    async fn serial_query_skips_fakedns_when_fake_disabled() {
+        use crate::fakedns::Holder;
+        use crate::nameserver::fakedns::FakeDnsServer;
+
+        // FakeDNS server（name="FakeDNS" 是跳过判定依据）。
+        let ns = NameServerConfig { tag: "fake".into(), ..Default::default() };
+        let fake: Box<dyn Server> = Box::new(FakeDnsServer::new(Holder::new_default().unwrap()));
+        let fake_client = Arc::new(Client::new(ns, IpOption::all(), fake).unwrap());
+        let real = make_client_with_ips(
+            "real", false, false,
+            vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))],
+        );
+        // enable_parallel_query=false 走 serial_query；fake_enable=false 跳过 FakeDNS。
+        let svc = make_service(vec![fake_client, real], Vec::new());
+        let opt = IpOption { ipv4_enable: true, ipv6_enable: true, fake_enable: false };
+        let (ips, _) = svc.lookup_ip("x.com", opt).await.unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))]);
+    }
+
+    /// Go dns.go:373-374：串行查询首个返回非空 IP 的 client 即胜出。
+    #[tokio::test]
+    async fn serial_query_returns_first_non_empty() {
+        let a = make_client_with_ips("a", false, false, vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))]);
+        let b = make_client_with_ips("b", false, false, vec![IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))]);
+        // serial_query 顺序按 clients 切片序：a 先胜。
+        let (ips, _ttl) = serial_query(&[a, b], "x.com", IpOption::all()).await.unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))]);
+    }
+
+    /// Go dns.go: client.finalQuery 命中后即使失败也立刻返回该错误。
+    /// Rust 端 serial_query 行 302-304 等价语义。
+    #[tokio::test]
+    async fn serial_query_final_query_returns_its_error() {
+        // final_query client 失败 → 立即返回该错误（不进 merge_query_errors）。
+        struct FailServer;
+        impl Server for FailServer {
+            fn name(&self) -> &str { "fail" }
+            fn is_disable_cache(&self) -> bool { false }
+            fn query_ip<'a>(
+                &'a self,
+                _d: &'a str,
+                _o: IpOption,
+            ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>> {
+                Box::pin(async { Err(DnsError::RecordNotFound) })
+            }
+        }
+        let ns = NameServerConfig {
+            tag: "final".into(),
+            final_query: true,
+            ..Default::default()
+        };
+        let server: Box<dyn Server> = Box::new(FailServer);
+        let final_client = Arc::new(Client::new(ns, IpOption::all(), server).unwrap());
+        let err = serial_query(&[final_client], "x.com", IpOption::all()).await.unwrap_err();
+        assert!(matches!(err, DnsError::RecordNotFound),
+            "final_query 命中即返回该 client 的错误，不走 merge");
+    }
+
+    // ---- sort_clients 集成 logDecision（Go dns.go:293/309/315）----
+    // 验证 sort_clients 在 final_query 提前返回 + 常规末尾两条路径上
+    // 调用了 log_decision（行为侧：通过 sort_clients 返回的 Vec 与 names 序列
+    // 对齐断言；log_decision 副作用 debug! 不可断言）。
     #[test]
     fn log_decision_skips_when_no_clients() {
         // 空 client_names 不应 panic、不应输出（业务保证无观察者时调用安全）。

@@ -110,10 +110,13 @@ impl CacheController {
         self.ips.read().get(fqdn).cloned()
     }
 
-    /// 写入 / 合并记录。对应 Go `addIoResult` / `setRecord`。
-    ///
-    /// `is_v4=true` 更新 A 记录，`false` 更新 AAAA。
-    pub fn upsert(&self, fqdn: &str, is_v4: bool, record: IpRecord) {
+/// 写入 / 合并记录。对应 Go `addIoResult` / `setRecord`。
+///
+/// `is_v4=true` 更新 A 记录，`false` 更新 AAAA。
+pub fn upsert(&self, fqdn: &str, is_v4: bool, record: IpRecord) {
+        if self.disable_cache {
+            return;
+        }
         let mut ips = self.ips.write();
         let entry = ips
             .entry(fqdn.to_string())
@@ -406,5 +409,19 @@ mod tests {
         let later = now + Duration::from_secs(20);
         let keys = c.collect_expired_keys(later);
         assert!(keys.is_empty(), "expected no expired keys due to serve_stale grace");
+
+    }
+
+    /// 对应 Go `cache_controller.go:255-258`：`disableCache=true` 时
+    /// upsert 后立即返回，不写 `ips`，`find_records` 也无。
+    /// 对齐「discover-after-write」语义。
+    #[test]
+    fn upsert_no_op_when_disable_cache() {
+        let c = CacheController::new("test", true, false, 0, 0);
+        let now = Instant::now();
+        let rec = ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(60), 0, now);
+        c.upsert("example.com.", true, rec);
+        assert_eq!(c.len(), 0, "disable_cache upsert must be no-op");
+        assert!(c.find_records("example.com.").is_none());
     }
 }
