@@ -1173,4 +1173,39 @@ mod tests {
             reality_loopback_with_fingerprint(fp).await;
         }
     }
+
+    /// 全 21 指纹名查表（无 btls 握手）——验证 xray-tls::fingerprint::get_fingerprint
+    /// 能识别 21 个目标指纹名（preset 8 + modern 11 + 旧版 2 = 21）。
+    /// 真实握手测试见上方 `reality_fingerprint_matrix_btls`（#[ignore]，
+    /// btls transcript mismatch 修复后启用）。
+    #[test]
+    fn all_21_fingerprints_resolve() {
+        let names = [
+            // PresetFingerprints（Go tls.go:204-212）
+            "chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq",
+            // ModernFingerprints（Go tls.go:221-231）
+            "hellofirefox_120", "hellofirefox_148", "hellochrome_120", "hellochrome_131",
+            "hellochrome_133", "helloios_13", "helloios_14", "helloedge_106",
+            "hellosafari_26_3", "hello360_11_0", "helloqq_11_1",
+            // 旧版变体（btls 就近映射）
+            "hellochrome_100", "hellofirefox_99",
+        ];
+        assert_eq!(names.len(), 21, "matrix must be 21");
+        for name in names {
+            let fp = xray_tls::fingerprint::get_fingerprint(name)
+                .unwrap_or_else(|e| panic!("fingerprint {name} must resolve: {e}"));
+            // 解析后 enum variant 必非空/必可被 btls_client 路由
+            let supported = xray_tls::btls_client::fingerprint_supported(&fp);
+            assert!(
+                supported
+                    || matches!(fp,
+                        xray_tls::fingerprint::Fingerprint::HelloRandomized
+                        | xray_tls::fingerprint::Fingerprint::HelloRandomizedAlpn
+                        | xray_tls::fingerprint::Fingerprint::HelloRandomizedNoAlpn
+                        | xray_tls::fingerprint::Fingerprint::Randomized
+                        | xray_tls::fingerprint::Fingerprint::RandomizedNoAlpn),
+                "{name} ({fp:?}) must be either btls-supported or randomized-fallback"
+            );
+        }
+    }
 }
