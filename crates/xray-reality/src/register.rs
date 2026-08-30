@@ -99,7 +99,6 @@ pub async fn handshake_over(
 /// - `shortId` (hex string, optional)
 /// - `fingerprint` (string, optional, 默认 "chrome")
 fn parse_reality_config(json: Option<&serde_json::Value>) -> io::Result<RealityConfig> {
-    use base64::Engine;
     let json = json.ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidData, "reality requires security_json settings")
     })?;
@@ -121,14 +120,12 @@ fn parse_reality_config(json: Option<&serde_json::Value>) -> io::Result<RealityC
         .unwrap_or("chrome");
     let short_id_str = obj.get("shortId").and_then(|v| v.as_str()).unwrap_or("");
 
-    let public_key = base64::engine::general_purpose::STANDARD
-        .decode(public_key_b64)
-        .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("reality: invalid publicKey base64: {e}"),
-            )
-        })?;
+    let public_key = base64_url_decode(public_key_b64).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("reality: invalid publicKey base64: {public_key_b64}"),
+        )
+    })?;
     let short_id = if short_id_str.is_empty() {
         Vec::new()
     } else {
@@ -147,6 +144,17 @@ fn parse_reality_config(json: Option<&serde_json::Value>) -> io::Result<RealityC
         short_id,
         ..Default::default()
     })
+}
+
+/// base64 RawURL 解码（无 padding，兼容 std 变体）。对应 Go `base64.RawURLEncoding.DecodeString`。
+fn base64_url_decode(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    let normalized = s.replace('+', "-").replace('/', "_");
+    let normalized = normalized.trim_end_matches('=');
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(normalized)
+        .ok()
+        .or_else(|| base64::engine::general_purpose::STANDARD.decode(s).ok())
 }
 
 /// REALITY TLS 连接 wrapper（impl [`Connection`] trait）。
@@ -204,6 +212,7 @@ impl<S: Connection> Connection for RealityConnection<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
 
     #[test]
     fn register_dialer_is_idempotent() {
@@ -233,5 +242,45 @@ mod tests {
         .unwrap();
         let r = parse_reality_config(Some(&v));
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn parse_reality_config_accepts_url_safe_no_pad_public_key() {
+        // Go base64.RawURLEncoding(X25519 pubkey) — 测试集成套件也走 URL_SAFE_NO_PAD。
+        use base64::Engine as _;
+        let raw = [0x42u8; 32];
+        let url_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
+        let json: serde_json::Value = serde_json::json!({
+            "serverName": "reality.local",
+            "publicKey": url_b64,
+        });
+        let cfg = parse_reality_config(Some(&json)).expect("URL_SAFE_NO_PAD accepted");
+        assert_eq!(cfg.public_key, raw);
+    }
+
+    #[test]
+    fn parse_reality_config_accepts_standard_public_key() {
+        // 双兼容：标准 base64（含 + / =）也吃，回退路径。
+        use base64::Engine as _;
+        let raw = [0x37u8; 32];
+        let std_b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+        let json: serde_json::Value = serde_json::json!({
+            "serverName": "reality.local",
+            "publicKey": std_b64,
+        });
+        let cfg = parse_reality_config(Some(&json)).expect("STANDARD accepted");
+        assert_eq!(cfg.public_key, raw);
+    }
+
+    #[test]
+    fn base64_url_decode_variants() {
+        // URL-safe (X25519 公钥 32 字节)
+        let url = "j0DFrbaPJWJK5bIU6nZ6bslNgp09e14a0bpvPiE4KF8";
+        assert_eq!(base64_url_decode(url).unwrap().len(), 32);
+        // 标准 base64 也能解码（双兼容）
+        let std_enc = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        assert_eq!(base64_url_decode(&std_enc).unwrap().len(), 32);
+        // 非法 → None
+        assert!(base64_url_decode("!!!not-base64!!!").is_none());
     }
 }

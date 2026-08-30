@@ -1453,6 +1453,60 @@ async fn serve_reality_vless(
     }
 }
 
+/// settings.protocol 是否由 transport listener 承载（非裸 TCP）。
+///
+/// 对应 Go `tcp_hub.go::ListenTCP` 按 protocolName 查注册表；`tcp`/`raw`
+/// 走既有 serve_* 直连路径（TLS accept + fallback SNI/ALPN 提取在该层完成）。
+/// 别名表与 `xray_transport::dialer::protocol_settings_key` 一致。
+fn is_transport_listener_protocol(protocol: &str) -> bool {
+    matches!(
+        protocol,
+        "ws" | "websocket"
+            | "grpc" | "h2" | "http"
+            | "kcp" | "mkcp"
+            | "httpupgrade"
+            | "splithttp" | "xhttp"
+    )
+}
+
+/// 经 listener_registry 启动 transport inbound（ws/grpc/kcp/httpupgrade/splithttp）。
+///
+/// 对应 Go `proxyman` worker 对 `internet.ListenTCP` 的调用：TLS/security
+/// 由 transport hub 内部完成（grpc/ws hub 自带 accept_tls），上层 ConnHandler
+/// 收到的已是协议解包后的明文 conn。listener 移入 pending future 保活，
+/// shutdown abort 时随 task drop。
+async fn spawn_transport_listener_inbound(
+    tag: &str,
+    bind_addr: SocketAddr,
+    settings: xray_transport::dialer::StreamSettings,
+    shutdown_token: CancellationToken,
+    on_conn: xray_transport::listener_registry::ConnHandler,
+) -> std::io::Result<Option<JoinHandle<()>>> {
+    let listener = xray_transport::listener_registry::listen_tcp(
+        bind_addr,
+        settings,
+        xray_transport::sockopt::SocketOptions::default(),
+        on_conn,
+    )
+    .await?;
+    tracing::info!(tag = %tag, addr = %bind_addr, "transport inbound listening");
+    Ok(Some(spawn_inbound_serve(tag.to_string(), shutdown_token, async move {
+        let _listener = listener;
+        std::future::pending::<()>().await;
+        Ok(())
+    })))
+}
+
+/// `Box<dyn Connection>` 的 peer/local 地址（transport 解包层丢失时用 bind 地址兜底）。
+fn transport_conn_addrs(
+    conn: &dyn xray_transport::connection::Connection,
+    bind_addr: SocketAddr,
+) -> (SocketAddr, SocketAddr) {
+    let peer = conn.remote_addr().ok().flatten().unwrap_or(bind_addr);
+    let local = conn.local_addr().ok().flatten().unwrap_or(bind_addr);
+    (peer, local)
+}
+
 /// 按协议种类启动单个 inbound listener。
 async fn spawn_one_inbound(
     ib: &BuiltInbound,
@@ -1511,25 +1565,56 @@ async fn spawn_one_inbound(
         }
         "vless" => {
             let validator: Arc<dyn VlessValidator> = build_vless_validator(&ib.entry.data)?;
-            let listener = TcpListener::bind(&addr).await?;
             let settings = xray_transport::dialer::StreamSettings::from_json(
                 ib.stream_settings_json.as_ref(),
             );
-            if settings.security == "reality" {
-                // REALITY：server_tls 验证 → Verified 走 VLESS；Invalid fallback 到 dest
-                let reality = parse_reality_config(&settings)?;
-                tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_count(), fallback = %reality.fallback_dest, "vless+reality inbound listening");
-                Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                    serve_reality_vless(listener, ohm, validator, reality).await
-                })))
-            } else {
-                let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
-                // VLESS fallbacks：Go napfb（name→alpn→path→dest+xver）
+            if is_transport_listener_protocol(&settings.protocol) {
+                // transport 分支（ws/grpc/kcp/httpupgrade/splithttp）：listener_registry
+                // 承载监听，TLS/security 在 transport hub 内部终结——勿再叠
+                // build_tls_acceptor（双重握手）。
+                let handler = ohm.get_default_handler().ok_or_else(|| {
+                    std::io::Error::other("no default outbound handler registered")
+                })?;
                 let fallbacks = build_vless_fallbacks(&ib.entry.data);
-                tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_count(), tls = tls.is_some(), fallbacks = fallbacks.as_ref().map_or(0, |f| f.len()), "vless inbound listening");
-                Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                    serve_vless(listener, ohm, validator, tls, fallbacks, None).await
-                })))
+                let bind_addr: SocketAddr = addr.parse().map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("parse addr: {e}"))
+                })?;
+                tracing::info!(tag = %ib.tag, addr = %addr, network = %settings.protocol, security = %settings.security, users = validator.get_count(), "vless transport inbound listening");
+                let on_conn: xray_transport::listener_registry::ConnHandler = Arc::new(move |conn| {
+                    let handler = Arc::clone(&handler);
+                    let validator = Arc::clone(&validator);
+                    let fallbacks = fallbacks.clone();
+                    tokio::spawn(async move {
+                        let (peer, local) = transport_conn_addrs(conn.as_ref(), bind_addr);
+                        // TLS 已在 transport hub 内终结，name/alpn 不可得
+                        //（Go：非 *tls.Conn 连接同为空，path 仍从首字节提取）。
+                        if let Err(e) = xray_proxy_vless::handle_connection_with_fallback(
+                            conn, &handler, &validator, fallbacks, peer, local,
+                            String::new(), String::new(), None,
+                        ).await {
+                            tracing::debug!(error = %e, "vless transport connection ended with error");
+                        }
+                    });
+                });
+                spawn_transport_listener_inbound(&ib.tag, bind_addr, settings, shutdown_token, on_conn).await
+            } else {
+                let listener = TcpListener::bind(&addr).await?;
+                if settings.security == "reality" {
+                    // REALITY：server_tls 验证 → Verified 走 VLESS；Invalid fallback 到 dest
+                    let reality = parse_reality_config(&settings)?;
+                    tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_count(), fallback = %reality.fallback_dest, "vless+reality inbound listening");
+                    Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+                        serve_reality_vless(listener, ohm, validator, reality).await
+                    })))
+                } else {
+                    let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
+                    // VLESS fallbacks：Go napfb（name→alpn→path→dest+xver）
+                    let fallbacks = build_vless_fallbacks(&ib.entry.data);
+                    tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_count(), tls = tls.is_some(), fallbacks = fallbacks.as_ref().map_or(0, |f| f.len()), "vless inbound listening");
+                    Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+                        serve_vless(listener, ohm, validator, tls, fallbacks, None).await
+                    })))
+                }
             }
         }
         "trojan" => {
@@ -1555,21 +1640,84 @@ async fn spawn_one_inbound(
                     if list.is_empty() { None } else { Some(FallbackPolicy::from_list(&list)) }
                 })
                 .flatten();
-            let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
-            let listener = TcpListener::bind(&addr).await?;
-            tracing::info!(tag = %ib.tag, addr = %addr, users = users.len(), tls = tls.is_some(), "trojan inbound listening");
-            Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                serve_trojan(listener, ohm, users, fallbacks, tls).await
-            })))
+            let settings = xray_transport::dialer::StreamSettings::from_json(
+                ib.stream_settings_json.as_ref(),
+            );
+            if is_transport_listener_protocol(&settings.protocol) {
+                // transport 分支：listener_registry 承载，TLS 在 hub 内终结。
+                let handler = ohm.get_default_handler().ok_or_else(|| {
+                    std::io::Error::other("no default outbound handler registered")
+                })?;
+                let validator = Arc::new(xray_proxy_trojan::Validator::new());
+                for (_, user) in users {
+                    if let Err(e) = validator.add(user) {
+                        tracing::warn!(error = %e, "skip duplicate user during trojan transport inbound init");
+                    }
+                }
+                let bind_addr: SocketAddr = addr.parse().map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("parse addr: {e}"))
+                })?;
+                tracing::info!(tag = %ib.tag, addr = %addr, network = %settings.protocol, security = %settings.security, users = validator.get_count(), "trojan transport inbound listening");
+                let on_conn: xray_transport::listener_registry::ConnHandler = Arc::new(move |conn| {
+                    let validator = Arc::clone(&validator);
+                    let handler = Arc::clone(&handler);
+                    let fb_policy = fallbacks.clone();
+                    tokio::spawn(async move {
+                        let (peer, local) = transport_conn_addrs(conn.as_ref(), bind_addr);
+                        xray_proxy_trojan::serve_trojan_conn(
+                            conn, validator, handler, fb_policy, peer, local,
+                            String::new(), String::new(),
+                        ).await;
+                    });
+                });
+                spawn_transport_listener_inbound(&ib.tag, bind_addr, settings, shutdown_token, on_conn).await
+            } else {
+                let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
+                let listener = TcpListener::bind(&addr).await?;
+                tracing::info!(tag = %ib.tag, addr = %addr, users = users.len(), tls = tls.is_some(), "trojan inbound listening");
+                Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+                    serve_trojan(listener, ohm, users, fallbacks, tls).await
+                })))
+            }
         }
         "vmess" => {
             let validator = build_vmess_validator(&ib.entry.data)?;
-            let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
-            let listener = TcpListener::bind(&addr).await?;
-            tracing::info!(tag = %ib.tag, addr = %addr, tls = tls.is_some(), "vmess inbound listening");
-            Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                serve_vmess(listener, ohm, validator, tls).await
-            })))
+            let settings = xray_transport::dialer::StreamSettings::from_json(
+                ib.stream_settings_json.as_ref(),
+            );
+            if is_transport_listener_protocol(&settings.protocol) {
+                // transport 分支：listener_registry 承载，TLS 在 hub 内终结。
+                let handler = ohm.get_default_handler().ok_or_else(|| {
+                    std::io::Error::other("no default outbound handler registered")
+                })?;
+                let history = Arc::new(xray_proxy_vmess::SessionHistory::new());
+                // transport 层无 TLS 时维持裸 TCP 的 drain 防指纹语义（Go：!isTLS → drain）
+                let is_drain = !settings.is_tls();
+                let bind_addr: SocketAddr = addr.parse().map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("parse addr: {e}"))
+                })?;
+                tracing::info!(tag = %ib.tag, addr = %addr, network = %settings.protocol, security = %settings.security, "vmess transport inbound listening");
+                let on_conn: xray_transport::listener_registry::ConnHandler = Arc::new(move |conn| {
+                    let handler = Arc::clone(&handler);
+                    let validator = Arc::clone(&validator);
+                    let history = Arc::clone(&history);
+                    tokio::spawn(async move {
+                        if let Err(e) = xray_proxy_vmess::handle_vmess_connection(
+                            conn, &handler, &validator, &history, is_drain,
+                        ).await {
+                            tracing::debug!(error = %e, "vmess transport connection ended with error");
+                        }
+                    });
+                });
+                spawn_transport_listener_inbound(&ib.tag, bind_addr, settings, shutdown_token, on_conn).await
+            } else {
+                let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
+                let listener = TcpListener::bind(&addr).await?;
+                tracing::info!(tag = %ib.tag, addr = %addr, tls = tls.is_some(), "vmess inbound listening");
+                Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+                    serve_vmess(listener, ohm, validator, tls).await
+                })))
+            }
         }
         "http" => {
             let config = parse_http_config(&ib.entry.data)?;

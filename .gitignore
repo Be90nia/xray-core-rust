@@ -55,4 +55,10 @@ dns_test1.log
 dns_test2.log
 xc_check*.log
 xc_test*.log
+
+# Batch13 RC-A temporary
+build_reality.bat
+check_reality*.bat
+check_workspace.bat
+test_reality.bat
 tools/setup_boringssl_reality.py

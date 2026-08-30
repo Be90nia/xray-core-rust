@@ -427,6 +427,25 @@ pub async fn serve_trojan(
     }
 }
 
+/// 处理单个已解包 Trojan 连接（transport listener 路径）。
+///
+/// 与 [`serve_trojan`] 每 conn 逻辑相同，但连接来自 transport 层
+/// （ws/grpc/kcp 解包后），TLS 已在 transport hub 内终结——`tls_name`/
+/// `tls_alpn` 传空（Go：非 `*tls.Conn` 同为空）。
+pub async fn serve_trojan_conn<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    stream: S,
+    validator: Arc<Validator>,
+    handler: Arc<dyn xray_app_dispatcher::DispatchHandler>,
+    fb_policy: Option<Arc<FallbackPolicy>>,
+    peer: std::net::SocketAddr,
+    local: std::net::SocketAddr,
+    tls_name: String,
+    tls_alpn: String,
+) {
+    let recorder = RecordingStream { inner: stream, buf: Vec::with_capacity(256) };
+    handle_trojan_connection(recorder, validator, handler, fb_policy, peer, local, tls_name, tls_alpn).await;
+}
+
 /// 处理单个 Trojan 连接：handshake → dispatch / fallback。
 async fn handle_trojan_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut recorder: RecordingStream<S>,

@@ -38,6 +38,8 @@ pub use dispatcher::{make_vmess_dial_fn, parse_vmess_config, VmessOutboundConfig
 pub use error::{Result, VmessError};
 pub use validator::{MemoryUser, TimedUserValidator, Validator};
 pub use inbound::serve_vmess;
+pub use inbound::server::handle_connection as handle_vmess_connection;
+pub use encoding::server::SessionHistory;
 
 /// VMess 协议版本号（对应 Go 的 `encoding.Version` 常量）。
 pub const VERSION: u8 = 1;

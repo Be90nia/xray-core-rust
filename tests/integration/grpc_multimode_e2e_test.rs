@@ -172,7 +172,6 @@ async fn run_grpc_e2e(grpc_settings: serde_json::Value, payload: &[u8]) {
 
 // --- 变体 1: gRPC single mode (no TLS) — 路径 /<service>/Tun ---
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "known-fail: SOCKS5->VLESS->gRPC server->echo chain, echo read ConnectionReset; pending transport fix"]
 async fn grpc_single_mode_via_vless_e2e() {
     let grpc_settings: serde_json::Value = serde_json::from_str(
         r#"{"network":"grpc","security":"none","grpcSettings":{"serviceName":"GunService"}}"#,
@@ -183,7 +182,6 @@ async fn grpc_single_mode_via_vless_e2e() {
 
 // --- 变体 2: gRPC + TLS (allowInsecure, self-signed server) ---
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "known-fail: SOCKS5->VLESS->gRPC server->echo chain, echo read ConnectionReset; pending transport fix"]
 async fn grpc_tls_via_vless_e2e() {
     let grpc_settings: serde_json::Value = serde_json::from_str(
         r#"{
@@ -199,7 +197,6 @@ async fn grpc_tls_via_vless_e2e() {
 
 // --- 变体 3: gRPC multiMode=true — 路径 /<service>/TunMulti ---
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "known-fail: SOCKS5->VLESS->gRPC server->echo chain, echo read ConnectionReset; pending transport fix"]
 async fn grpc_multi_mode_via_vless_e2e() {
     let grpc_settings: serde_json::Value = serde_json::from_str(
         r#"{"network":"grpc","security":"none","grpcSettings":{"serviceName":"GunService","multiMode":true}}"#,
@@ -210,7 +207,6 @@ async fn grpc_multi_mode_via_vless_e2e() {
 
 // --- 变体 4: gRPC custom path — serviceName="/A/B/Tun" 路径 /A/B/Tun ---
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "known-fail: SOCKS5->VLESS->gRPC server->echo chain, echo read ConnectionReset; pending transport fix"]
 async fn grpc_custom_path_via_vless_e2e() {
     let grpc_settings: serde_json::Value = serde_json::from_str(
         r#"{"network":"grpc","security":"none","grpcSettings":{"serviceName":"/A/B/Tun"}}"#,

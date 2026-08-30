@@ -161,7 +161,7 @@ pub async fn serve_vmess(
     }
 }
 
-async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: S,
     handler: &Arc<dyn DispatchHandler>,
     validator: &Arc<TimedUserValidator>,

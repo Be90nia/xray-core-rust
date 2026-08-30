@@ -113,6 +113,14 @@ struct ConnectionInner {
     write_deadline: Mutex<Option<Instant>>,
 }
 
+impl Drop for ConnectionInner {
+    fn drop(&mut self) {
+        // 置位底层 socket 关闭标志，唤醒阻塞的 fetch_input/接收循环——否则
+        // Runtime::drop 等 blocking task 永不返回。
+        self.closer.close();
+    }
+}
+
 impl Connection {
     /// 生产构造（对应 Go `NewConnection`）。
     ///
@@ -351,7 +359,8 @@ impl Connection {
                     let opt = data.option;
                     self.handle_option(opt);
                     self.inner.receiving_worker.process_segment(data);
-                    if self.inner.receiving_worker.is_data_available() {
+                    let avail = self.inner.receiving_worker.is_data_available();
+                    if avail {
                         self.inner.data_input.notify_one();
                     }
                     self.wake_data_updater();

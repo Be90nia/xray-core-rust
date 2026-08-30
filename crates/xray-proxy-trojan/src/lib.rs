@@ -35,6 +35,6 @@ pub use protocol::{
     write_request_header, write_udp_packet, Network, COMMAND_TCP, COMMAND_UDP, CRLF, MAX_LENGTH,
 };
 pub use validator::{MemoryUser, Validator};
-pub use server::{serve_trojan, TrojanServer, trojan_server_handshake};
+pub use server::{serve_trojan, serve_trojan_conn, TrojanServer, trojan_server_handshake};
 pub use dispatcher::{make_dial_fn as make_trojan_dial_fn, TrojanOutboundConfig};
 pub use client::TrojanClient;

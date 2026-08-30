@@ -177,7 +177,6 @@ fn socks_inbound(port: u16) -> BuiltInbound {
 // --- Test 1: WebSocket transport (VLESS + WS) --------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "known-fail: vless websocket transport chain, echo connection refused; pending transport fix"]
 async fn websocket_transport_via_vless_e2e() {
     let echo_addr = start_echo().await;
     let vless_port = pick_free_port().await;
@@ -215,7 +214,6 @@ async fn websocket_transport_via_vless_e2e() {
 // --- Test 2: gRPC transport (VLESS + gRPC) -----------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "known-fail: vless grpc transport chain, echo connection refused; pending transport fix"]
 async fn grpc_transport_via_vless_e2e() {
     let echo_addr = start_echo().await;
     let vless_port = pick_free_port().await;
@@ -253,7 +251,7 @@ async fn grpc_transport_via_vless_e2e() {
 // --- Test 3: mKCP transport (VLESS + KCP) ------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "known-fail: vless kcp transport chain, echo connection refused; pending transport fix"]
+#[ignore = "known-fail: data path OK (assertions pass), test process hangs at exit: client bridge never releases kcp conn (Terminate/half-close propagation); server close path fixed"]
 async fn kcp_transport_via_vless_e2e() {
     let echo_addr = start_echo().await;
     let vless_port = pick_free_port().await;

@@ -131,7 +131,7 @@ impl Listener {
                     local_addr: local,
                     remote_addr: Some(src),
                 };
-                let new_conn = Arc::new(Connection::new_without_updater(
+                let new_conn = Arc::new(Connection::new(
                     meta,
                     writer,
                     closer,
@@ -342,8 +342,8 @@ mod tests {
         assert_eq!(handler.count.load(Ordering::SeqCst), 0);
     }
 
-    #[test]
-    fn on_receive_new_conv_creates_connection() {
+    #[tokio::test]
+    async fn on_receive_new_conv_creates_connection() {
         let (listener, _, handler) = make_listener();
         let src = "127.0.0.1:8080".parse().unwrap();
         let payload = make_data_packet(42, 0);
@@ -352,8 +352,8 @@ mod tests {
         assert_eq!(listener.active_connections(), 1);
     }
 
-    #[test]
-    fn on_receive_existing_conv_reuses_connection() {
+    #[tokio::test]
+    async fn on_receive_existing_conv_reuses_connection() {
         let (listener, _, handler) = make_listener();
         let src = "127.0.0.1:8080".parse().unwrap();
         let payload1 = make_data_packet(42, 0);
@@ -365,8 +365,8 @@ mod tests {
         assert_eq!(listener.active_connections(), 1);
     }
 
-    #[test]
-    fn on_receive_different_conv_creates_separate_connections() {
+    #[tokio::test]
+    async fn on_receive_different_conv_creates_separate_connections() {
         let (listener, _, handler) = make_listener();
         let src = "127.0.0.1:8080".parse().unwrap();
         listener.on_receive(&make_data_packet(1, 0), src);
@@ -385,8 +385,8 @@ mod tests {
         assert_eq!(listener.active_connections(), 0);
     }
 
-    #[test]
-    fn remove_drops_session() {
+    #[tokio::test]
+    async fn remove_drops_session() {
         let (listener, _, _) = make_listener();
         let src = "127.0.0.1:8080".parse().unwrap();
         listener.on_receive(&make_data_packet(42, 0), src);
@@ -396,8 +396,8 @@ mod tests {
         assert_eq!(listener.active_connections(), 0);
     }
 
-    #[test]
-    fn close_terminates_all_sessions() {
+    #[tokio::test]
+    async fn close_terminates_all_sessions() {
         let (listener, hub, _) = make_listener();
         let src = "127.0.0.1:8080".parse().unwrap();
         listener.on_receive(&make_data_packet(1, 0), src);

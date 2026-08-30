@@ -14,40 +14,58 @@
 use std::io::{self, ErrorKind};
 use std::net::SocketAddr;
 use std::sync::Arc;
-
-use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::dialer::PacketInput;
 use crate::listener::UdpHub;
-
 /// 同步 UDP hub：包装 `UdpSocket` 实现 [`UdpHub`] trait。
 ///
 /// 内部共享底层 socket（`std::net::UdpSocket` 的 send/recv 均为 `&self` 且线程安全，
 /// 由内核串行化——对应 Go `net.UDPConn` 并发语义；不加大锁，否则「一个线程持锁阻塞
 /// recv + 另一线程写抢锁」会死锁，client 先发后收的 KCP 流程直接卡死）。
 /// `receive` 阻塞读一个包；上层应在独立线程或 `spawn_blocking` 中调用。
+/// 同步 UDP hub：包装 `UdpSocket` 实现 [`UdpHub`] trait。
+///
+/// 内部共享底层 socket（`std::net::UdpSocket` 的 send/recv 均为 `&self` 且线程安全，
+/// 由内核串行化——对应 Go `net.UDPConn` 并发语义；不加大锁，否则「一个线程持锁阻塞
+/// recv + 另一线程写抢锁」会死锁，client 先发后收的 KCP 流程直接卡死）。
+///
+/// ## 关闭语义（std socket 无法用 closesocket 唤醒阻塞读）
+///
+/// socket 设 200ms 读超时，`receive` 变为「超时重试 + closed 标志检查」轮询；
+/// `close()` 置位 closed（与 [`StdPacketInput`]/`StdUdpCloser` 共享），让
+/// spawn_blocking 接收循环在 listener/conn drop 后 ≤200ms 内退出——否则
+/// `Runtime::drop` 等 blocking task 永不返回（e2e 测试挂死根因）。
 pub struct StdUdpHub {
     socket: Arc<std::net::UdpSocket>,
     local: Option<SocketAddr>,
+    closed: Arc<AtomicBool>,
 }
+
+/// 读超时：关闭延迟上界（轮询粒度）。
+const READ_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
 
 impl StdUdpHub {
     /// 绑定 UDP socket（对应 Go `net.ListenUDP`）。
     pub fn bind(addr: impl std::net::ToSocketAddrs) -> io::Result<Self> {
         let socket = std::net::UdpSocket::bind(addr)?;
         let local = socket.local_addr().ok();
+        socket.set_read_timeout(Some(READ_POLL_TIMEOUT))?;
         Ok(Self {
             socket: Arc::new(socket),
             local,
+            closed: Arc::new(AtomicBool::new(false)),
         })
     }
 
     /// 从已建立的 socket 构造（用于 dialer 端的 connected UDP socket）。
     pub fn from_socket(socket: std::net::UdpSocket) -> Self {
         let local = socket.local_addr().ok();
+        let _ = socket.set_read_timeout(Some(READ_POLL_TIMEOUT));
         Self {
             socket: Arc::new(socket),
             local,
+            closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -56,19 +74,36 @@ impl StdUdpHub {
     pub fn socket_handle(&self) -> Arc<std::net::UdpSocket> {
         Arc::clone(&self.socket)
     }
+
+    /// 关闭标志句柄（供 [`crate::register`] 的 closer / PacketInput 共享）。
+    #[must_use]
+    pub fn closed_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.closed)
+    }
+}
+
+/// 超时/瞬时错误：重试（对应 Go net 层对 UDP 瞬时错误的容忍；
+/// Windows connected UDP 收到 ICMP port-unreachable 时 recv 返回 ConnectionReset）。
+fn is_transient(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::ConnectionReset
+    )
 }
 
 impl UdpHub for StdUdpHub {
     fn receive(&self) -> Option<(Vec<u8>, SocketAddr)> {
         // ponytail: 单次最大 1500 字节（标准 MTU），KCP segment 上限 < 1500
         let mut buf = [0u8; 1500];
-        match self.socket.recv_from(&mut buf) {
-            Ok((n, src)) => Some((buf[..n].to_vec(), src)),
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                // 同步 socket 不会返 WouldBlock；防御性记录并返 None
-                None
+        loop {
+            if self.closed.load(Ordering::Acquire) {
+                return None;
             }
-            Err(_) => None,
+            match self.socket.recv_from(&mut buf) {
+                Ok((n, src)) => return Some((buf[..n].to_vec(), src)),
+                Err(e) if is_transient(&e) => continue,
+                Err(_) => return None,
+            }
         }
     }
 
@@ -78,8 +113,7 @@ impl UdpHub for StdUdpHub {
     }
 
     fn close(&self) {
-        // ponytail: Arc drop 后 socket 自动关闭；这里显式忽略
-        // （std::net::UdpSocket 无显式 close，Drop 时由 OS 回收）
+        self.closed.store(true, Ordering::Release);
     }
 
     fn local_addr(&self) -> Option<SocketAddr> {
@@ -87,37 +121,54 @@ impl UdpHub for StdUdpHub {
     }
 }
 
-/// 同步 PacketInput：包装共享 socket 实现客户端 UDP 读取。
-///
-/// dialer 端用 `UdpSocket::connect` 后，从此 hub 读取服务端发回的 segment。
-/// 与 [`StdUdpHub`] 共享 socket handle，让 client 端既能写又能读。
-pub struct StdPacketInput {
-    socket: Arc<std::net::UdpSocket>,
-}
-
 impl StdPacketInput {
-    /// 从 hub 复用 socket 构造。
+    /// 从 hub 复用 socket + 关闭标志构造。
     #[must_use]
     pub fn from_hub(hub: &StdUdpHub) -> Self {
         Self {
             socket: hub.socket_handle(),
+            closed: hub.closed_flag(),
         }
     }
 
-    /// 从已建立的 socket 构造。
+    /// 从已建立的 socket 构造（关闭标志独立）。
     pub fn from_socket(socket: std::net::UdpSocket) -> Self {
+        let _ = socket.set_read_timeout(Some(READ_POLL_TIMEOUT));
         Self {
             socket: Arc::new(socket),
+            closed: Arc::new(AtomicBool::new(false)),
         }
     }
+
+    /// 关闭标志句柄（供 closer 共享）。
+    #[must_use]
+    pub fn closed_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.closed)
+    }
+}
+
+/// 同步 PacketInput：包装共享 socket 实现客户端 UDP 读取。
+///
+/// dialer 端用 `UdpSocket::connect` 后，从此 hub 读取服务端发回的 segment。
+/// 与 [`StdUdpHub`] 共享 socket handle + 关闭标志，让 client 端既能写又能读、
+/// 且关闭时阻塞读能退出（见 [`StdUdpHub`] 关闭语义）。
+pub struct StdPacketInput {
+    socket: Arc<std::net::UdpSocket>,
+    closed: Arc<AtomicBool>,
 }
 
 impl PacketInput for StdPacketInput {
     fn read_packet(&mut self) -> Option<Vec<u8>> {
         let mut buf = [0u8; 1500];
-        match self.socket.recv(&mut buf) {
-            Ok(n) => Some(buf[..n].to_vec()),
-            Err(_) => None,
+        loop {
+            if self.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            match self.socket.recv(&mut buf) {
+                Ok(n) => return Some(buf[..n].to_vec()),
+                Err(e) if is_transient(&e) => continue,
+                Err(_) => return None,
+            }
         }
     }
 }

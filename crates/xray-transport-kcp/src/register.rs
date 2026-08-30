@@ -15,8 +15,8 @@ use xray_transport::listener_registry::{
 use crate::config::{Config, default_config};
 use crate::listener::{ConnHandler as KcpConnHandler, Listener, UdpHub};
 use crate::connection::{ConnMetadata, Connection, ConnectionCloser, KcpConn};
-use crate::dialer::{KcpDialerFactory, PacketInput, fetch_input, next_conv};
-use crate::io::KCPPacketReader;
+use crate::dialer::{KcpDialerFactory, PacketInput, next_conv};
+use crate::io::{KCPPacketReader, PacketReader as _};
 use crate::output::{SegmentWriter, SimpleSegmentWriter};
 use xray_transport::finalmask::{parse_finalmask_udp_chain, CodecChain};
 
@@ -89,7 +89,6 @@ async fn listen_kcp(
      let local = hub
          .local_addr()
          .ok_or_else(|| io::Error::other("kcp listener: local_addr unavailable after bind"))?;
-
     // 3. packet reader + bridge handler（KCP ConnHandler → upstream xray_transport::ConnHandler）
     let reader = Arc::new(KCPPacketReader::new());
     let bridge: Arc<dyn KcpConnHandler> = Arc::new(UpstreamConnBridge(handler));
@@ -135,6 +134,14 @@ impl TransportListener for KcpTransportListener {
     }
 }
 
+impl Drop for KcpTransportListener {
+    fn drop(&mut self) {
+        // spawn_blocking 接收循环靠 hub closed 标志退出；不关则 Runtime::drop
+        // 等待 blocking task 永不返回（上层持有者被 abort/直接 drop 时兜底）。
+        let _ = TransportListener::close(self);
+    }
+}
+
 /// 实际拨号：解析配置 → UDP → KcpDialerFactory → Connection → KcpConn。
 async fn dial_kcp(
     dest: &xray_common::net::destination::Destination,
@@ -145,7 +152,7 @@ async fn dial_kcp(
     // mask 开启时包装 PacketConn（对应 Go dialer.go:59-82 WrapPacketConnClient）
     let chain = parse_finalmask_udp_chain(settings.finalmask_json.as_ref())?;
 
-    // 2. 解析目标地址
+    // 2. 解析目标地址（对齐 Go internet.DialSystem：Domain 也解析）
     let dest_addr = resolve_dest_to_socket_addr(dest)?;
 
     // 3. 创建 UDP socket + KcpDialerFactory（chain = None 时裸 segment，向后兼容）
@@ -173,14 +180,29 @@ async fn dial_kcp(
         Arc::new(config),
     ));
 
-    // 7. spawn fetch_input 循环（在后台读取 UDP 包并分发到 Connection）
-    let conn_clone = Arc::clone(&conn);
+    // 7. spawn fetch_input 循环（在后台读取 UDP 包并分发到 Connection）。
+    //    持 Weak 而非 Arc：conn drop（含 task abort 等无 shutdown 路径）后，
+    //    ConnectionInner::drop → closer 置 closed 标志 → read_packet 退出，
+    //    本 blocking task 结束——否则 Runtime::drop 等待永不返回（测试挂死）。
+    let conn_weak = Arc::downgrade(&conn);
     let reader = KCPPacketReader::new();
     tokio::task::spawn_blocking(move || {
-        fetch_input(packet_input.as_mut(), &reader, &conn_clone);
+        loop {
+            let Some(conn_now) = conn_weak.upgrade() else { break };
+            match packet_input.read_packet() {
+                Some(payload) => {
+                    let segments = reader.read(&payload);
+                    if !segments.is_empty() {
+                        conn_now.input(segments);
+                    }
+                }
+                None => break,
+            }
+        }
     });
 
-    // 8. 包装为 KcpConn
+
+
     Ok(Box::new(KcpConn::new(conn)))
 }
 
@@ -241,23 +263,27 @@ fn parse_kcp_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
 
     Ok(config)
 }
-
 /// 把 `Destination` 解析为 `SocketAddr`。
+///
+/// 对齐 Go `DialKCP` 的 `internet.DialSystem`（net 系统拨号，域名/IP 字面量
+/// 均可解析）：IP 直取，Domain（含 `"127.0.0.1"` 字面量——xray-conf 的
+/// vnext address 惯以 Domain 承载）经系统 resolver 解析。
+/// ponytail: `ToSocketAddrs` 同步解析会占 runtime 线程；Go runtime 同样
+/// 线程池 getaddrinfo，DNS 热路径成瓶颈时再换异步 resolver。
 fn resolve_dest_to_socket_addr(
     dest: &xray_common::net::destination::Destination,
 ) -> io::Result<SocketAddr> {
-    use xray_common::net::address::Address;
-    let ip = match dest.address() {
-        Address::IPv4(ip) => std::net::IpAddr::V4(*ip),
-        Address::IPv6(ip) => std::net::IpAddr::V6(*ip),
-        Address::Domain(_) => {
-            return Err(io::Error::new(
+    use std::net::ToSocketAddrs;
+    let host = dest.address().to_string();
+    (host.as_str(), dest.port().value())
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| {
+            io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "kcp requires IP address destination (domain DNS resolution not yet supported)",
-            ));
-        }
-    };
-    Ok(SocketAddr::new(ip, dest.port().value()))
+                format!("kcp dest resolved to no address: {host}"),
+            )
+        })
 }
 
 // ===== StdKcpDialerFactory =====
@@ -287,8 +313,9 @@ impl KcpDialerFactory for StdKcpDialerFactory {
         let local_addr = socket.local_addr().ok();
         socket.connect(dest_addr)?;
 
-        // 创建 StdUdpHub（用于 SegmentWriter 写 UDP）
+        // 创建 StdUdpHub（用于 SegmentWriter 写 UDP；关闭标志与 PacketInput/closer 共享）
         let hub = StdUdpHub::from_socket(socket);
+        let closed_flag = hub.closed_flag();
 
         // 创建 PacketInput（从 hub 读取 UDP 包；mask 开启时 decode，对应 Go masked pktConn 读）
         let packet_input: Box<dyn PacketInput> = match &self.chain {
@@ -306,8 +333,8 @@ impl KcpDialerFactory for StdKcpDialerFactory {
         };
         let segment_writer: Arc<dyn SegmentWriter> = Arc::new(SimpleSegmentWriter::new(writer));
 
-        // 创建 Closer
-        let closer: Arc<dyn ConnectionCloser> = Arc::new(StdUdpCloser);
+        // 创建 Closer（共享 hub 关闭标志：conn drop → 置位 → 阻塞读退出）
+        let closer: Arc<dyn ConnectionCloser> = Arc::new(StdUdpCloser { closed: closed_flag });
 
         let meta = ConnMetadata {
             conv: 0, // conv 由上层设置
@@ -345,12 +372,14 @@ impl crate::output::UnderlyingWriter for UdpSegmentWriter {
     }
 }
 
-/// UDP socket closer。
-struct StdUdpCloser;
+/// UDP socket closer：置位共享关闭标志，唤醒阻塞的接收循环。
+struct StdUdpCloser {
+    closed: Arc<std::sync::atomic::AtomicBool>,
+}
 
 impl ConnectionCloser for StdUdpCloser {
     fn close(&self) {
-        // ponytail: std::net::UdpSocket 无显式 close，Drop 时由 OS 回收
+        self.closed.store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
