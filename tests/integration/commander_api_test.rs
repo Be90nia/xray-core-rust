@@ -224,3 +224,101 @@ async fn reflection_lists_commander_services() {
         "LoggerService missing from reflection list: {names:?}"
     );
 }
+
+/// bd xim8 修复验证：reflection 仅 opt-in。未在 `services` 中声明 `ReflectionService`
+/// 时，gRPC server **不暴露** reflection — `ServerReflectionInfo` 调用返回
+/// Unimplemented/Empty（grpcurl 匿名枚举不可达）。对应 Go `infra/conf/api.go:30`
+/// `"reflectionservice"` 关键字语义。
+#[tokio::test]
+async fn reflection_disabled_when_not_opted_in() {
+    // api cfg：无 ReflectionService
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    let api_addr = format!("127.0.0.1:{port}");
+
+    let api_cfg = ApiConfig {
+        tag: None,
+        listen: Some(api_addr.clone()),
+        services: Some(vec![
+            "HandlerService".to_string(),
+            "LoggerService".to_string(),
+            // 注意：未声明 ReflectionService → reflection 必须禁用
+        ]),
+    };
+    let built = BuiltConfig {
+        apps: vec![BuiltEntry {
+            kind: "api".to_string(),
+            data: serde_json::to_vec(&api_cfg).unwrap(),
+        }],
+        inbounds: vec![],
+        outbounds: vec![BuiltOutbound {
+            entry: BuiltEntry {
+                kind: "freedom".to_string(),
+                data: b"{}".to_vec(),
+            },
+            tag: "direct".to_string(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
+        }],
+    };
+    let (_ohm, addr, _instance) = match xray_core::functions::start_full(&built).await {
+        Ok(v) => v,
+        Err(e) => panic!("start_full failed: {e}"),
+    };
+    let channel = connect(&addr).await;
+    let mut reflection = ServerReflectionClient::new(channel);
+
+    // 尝试 ListServices — opt-out 时服务端无 reflection handler，应返回
+    // tonic::Status(Code::Unimplemented) 或 Empty。
+    let request_stream = futures::stream::iter(vec![ServerReflectionRequest {
+        host: String::new(),
+        message_request: Some(MessageRequest::ListServices("*".to_string())),
+    }]);
+    let result = reflection.server_reflection_info(request_stream).await;
+    // 任一形式都表示 reflection 已禁用：
+    // - bidi 第一次 recv 即收到 Unimplemented
+    // - 或 channel 报 unknown service
+    match result {
+        Err(status) => {
+            // bidi 错误（最常见）：server reflection 未注册 → Unimplemented
+            assert!(
+                status.code() == tonic::Code::Unimplemented
+                    || status.code() == tonic::Code::Unknown,
+                "expected Unimplemented/Unknown when reflection disabled, got {:?}",
+                status
+            );
+        }
+        Ok(resp) => {
+            // 极少见：bidi 返回 Ok 但流立即 Empty → 也算禁用
+            let mut stream = resp.into_inner();
+            let msg = stream.message().await;
+            match msg {
+                Ok(Some(mr)) => {
+                    // 服务端不应返回 ListServicesResponse — 只可能 ErrorInfo 或 empty
+                    if let Some(MessageResponse::ListServicesResponse(list)) =
+                        mr.message_response
+                    {
+                        panic!(
+                            "reflection must be disabled, but got {} services",
+                            list.service.len()
+                        );
+                    }
+                }
+                Ok(None) => { /* 空流 = 禁用 OK */ }
+                Err(status) => {
+                    // message() 收到 Unimplemented
+                    assert!(
+                        status.code() == tonic::Code::Unimplemented
+                            || status.code() == tonic::Code::Unknown,
+                        "expected Unimplemented/Unknown when reflection disabled, got {:?}",
+                        status
+                    );
+                }
+            }
+        }
+    }
+}
