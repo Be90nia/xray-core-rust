@@ -5617,6 +5617,8 @@ name = "xray-app-commander"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures",
+ "hyper-util",
  "parking_lot",
  "prost",
  "thiserror 2.0.18",
@@ -5624,13 +5626,17 @@ dependencies = [
  "tonic",
  "tonic-reflection",
  "tracing",
+ "xray-app-dispatcher",
  "xray-app-log",
  "xray-app-observatory",
+ "xray-app-proxyman",
  "xray-app-router",
  "xray-app-stats",
+ "xray-buf",
  "xray-common",
  "xray-features",
  "xray-proto",
+ "xray-transport",
 ]
 
 [[package]]
@@ -5729,6 +5735,7 @@ dependencies = [
 name = "xray-app-observatory"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "parking_lot",
  "serde",
  "serde_json",
@@ -5787,6 +5794,7 @@ dependencies = [
  "xray-features",
  "xray-mux",
  "xray-proto",
+ "xray-proxy-freedom",
  "xray-transport",
  "yamux",
 ]
@@ -5900,6 +5908,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "md-5",
+ "parking_lot",
  "prost",
  "rand 0.9.4",
  "serde",
@@ -6047,11 +6056,15 @@ dependencies = [
 name = "xray-integration-tests"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64",
+ "boringtun",
  "futures",
+ "hex",
  "rand 0.8.7",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -6059,10 +6072,13 @@ dependencies = [
  "tonic-reflection",
  "x25519-dalek",
  "xray-app-dispatcher",
+ "xray-app-dns",
  "xray-app-log",
  "xray-buf",
  "xray-common",
+ "xray-conf",
  "xray-core",
+ "xray-mux",
  "xray-proto",
  "xray-proxy-freedom",
  "xray-proxy-ss",
@@ -6217,6 +6233,7 @@ dependencies = [
  "rand 0.9.4",
  "rcgen 0.13.2",
  "rustls",
+ "rustls-pki-types",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6234,6 +6251,7 @@ name = "xray-proxy-loopback"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "parking_lot",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
