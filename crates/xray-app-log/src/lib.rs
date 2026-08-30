@@ -28,7 +28,7 @@ pub use command::{
 pub use config::{LogConfig, LogFormat, LogType, SeverityLevel};
 pub use error::{at_error, at_warning, LogError};
 pub use instance::{
-    AccessMessage, AccessStatus, ConsoleHandler, ConsoleHandlerCreator, DnsLog,
+    AccessMessage, AccessStatus, ConsoleHandler, ConsoleHandlerCreator, DnsLog, DnsStatus,
     FileHandler, FileHandlerCreator, GeneralMessage, HandlerCreator,
     HandlerCreatorOptions, HandlerCreatorRegistry, LogEntry, LogHandler, LogInstance,
     MaskingHandler, NoneHandlerCreator, register_default_creators,

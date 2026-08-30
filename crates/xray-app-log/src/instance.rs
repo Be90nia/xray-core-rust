@@ -80,27 +80,99 @@ impl AccessMessage {
     }
 }
 
+/// DNS 查询状态。对应 Go `common/log/dns.go:43-49` 的 `dnsStatus`。
+///
+/// 三态：
+/// - `Queried` → "got answer:"（真实查询返回）；
+/// - `CacheHit` → "cache HIT:"（缓存命中）；
+/// - `CacheOptimiste` → "cache OPTIMISTE:"（缓存过期但仍提供）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DnsStatus {
+    #[default]
+    Queried,
+    CacheHit,
+    CacheOptimiste,
+}
+
+impl DnsStatus {
+    /// Go `dnsStatus` 的字符串表示。对应 `common/log/dns.go:46-48`：
+    /// "got answer:" / "cache HIT:" / "cache OPTIMISTE:"。
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            DnsStatus::Queried => "got answer:",
+            DnsStatus::CacheHit => "cache HIT:",
+            DnsStatus::CacheOptimiste => "cache OPTIMISTE:",
+        }
+    }
+}
+
 /// DNS 日志消息（对应 Go `log.DNSLog`）。
+///
+/// 字段对齐 Go `common/log/dns.go:9-16`：
+/// `Server` / `Domain` / `Result` / `Status` / `Elapsed` / `Error`。
+///
+/// 额外保留 `query`（如 `"A example.com"`，含查询类型，便于人读）作为便捷字段。
 #[derive(Debug, Clone, Default)]
 pub struct DnsLog {
     pub query: String,
     pub domain: String,
     pub result: String,
+    /// 来源服务器名（Go `Server`）。为空时省略。
+    pub server: String,
+    /// 查询耗时毫秒（Go `Elapsed`，转毫秒便于日志展示）。
+    pub elapsed_ms: u64,
+    /// 三态文案模板（Go `Status`）。
+    pub status: DnsStatus,
+    /// 错误信息字符串。`None` 时省略。
+    pub error: Option<String>,
 }
 
 impl DnsLog {
+    /// 序列化为可读字符串。对应 Go `(*DNSLog).String()` (common/log/dns.go:18-41)：
+    ///
+    /// ```text
+    /// {server} {status} {domain} -> [{result}] {elapsed}ms <{error}>
+    /// ```
+    ///
+    /// `server` / `error` 为空时省略对应片段；`elapsed_ms == 0` 时省略耗时。
     pub fn format(&self) -> String {
-        format!("dns query={} domain={} result={}", self.query, self.domain, self.result)
+        use std::fmt::Write;
+        let mut s = String::new();
+        if !self.server.is_empty() {
+            s.push_str(&self.server);
+            s.push(' ');
+        }
+        s.push_str(self.status.as_str());
+        s.push(' ');
+        s.push_str(&self.domain);
+        s.push_str(" -> [");
+        s.push_str(&self.result);
+        s.push(']');
+        if self.elapsed_ms > 0 {
+            let _ = write!(s, " {}ms", self.elapsed_ms);
+        }
+        if let Some(err) = &self.error {
+            s.push_str(" <");
+            s.push_str(err);
+            s.push('>');
+        }
+        s
     }
 
-    /// json 序列化（Rust 扩展）。
+    /// json 序列化（Rust 扩展）。包含所有字段，对齐 Go `DNSLog` 全字段。
     pub fn to_json(&self) -> String {
-        serde_json::json!({
+        let mut obj = serde_json::json!({
             "query": self.query,
             "domain": self.domain,
             "result": self.result,
-        })
-        .to_string()
+            "server": self.server,
+            "elapsed_ms": self.elapsed_ms,
+            "status": self.status.as_str(),
+        });
+        if let Some(err) = &self.error {
+            obj["error"] = serde_json::Value::String(err.clone());
+        }
+        obj.to_string()
     }
 }
 
@@ -388,6 +460,10 @@ impl MaskingHandler {
                 query: mask_addresses(&m.query, self.mask4, self.mask6),
                 domain: mask_addresses(&m.domain, self.mask4, self.mask6),
                 result: mask_addresses(&m.result, self.mask4, self.mask6),
+                server: mask_addresses(&m.server, self.mask4, self.mask6),
+                elapsed_ms: m.elapsed_ms,
+                status: m.status,
+                error: m.error.as_ref().map(|e| mask_addresses(e, self.mask4, self.mask6)),
             }),
             LogEntry::General(m) => LogEntry::General(GeneralMessage {
                 severity: m.severity,
@@ -717,14 +793,94 @@ mod tests {
 
     #[test]
     fn dns_format_contains_fields() {
+        // 默认字段（空 server/error、elapsed=0）：仅 status + domain + result。
         let m = DnsLog {
             query: "A example.com".into(),
             domain: "example.com".into(),
-            result: "ok".into(),
+            result: "1.2.3.4".into(),
+            ..Default::default()
         };
         let s = m.format();
+        // 默认 DnsStatus::Queried → "got answer:" prefix。
+        assert!(s.contains("got answer:"), "status prefix missing: {s}");
         assert!(s.contains("example.com"));
-        assert!(s.contains("A example.com"));
+        assert!(s.contains("1.2.3.4"));
+        // elapsed_ms=0 → 不出现 "ms" 段。
+        assert!(!s.contains("ms"), "elapsed_ms=0 should omit ms: {s}");
+    }
+
+    #[test]
+    fn dns_format_includes_server_elapsed_error() {
+        // 全字段填充 → 验证 server/elapsed/error 三段都进入 output。
+        let m = DnsLog {
+            query: "A foo.com".into(),
+            domain: "foo.com".into(),
+            result: "9.9.9.9".into(),
+            server: "google".into(),
+            elapsed_ms: 23,
+            status: DnsStatus::Queried,
+            error: Some("nxdomain".into()),
+        };
+        let s = m.format();
+        assert!(s.starts_with("google got answer: foo.com -> [9.9.9.9]"), "{s}");
+        assert!(s.contains("23ms"), "elapsed missing: {s}");
+        assert!(s.ends_with("<nxdomain>"), "error trailing missing: {s}");
+    }
+
+    #[test]
+    fn dns_status_strings_match_go() {
+        // Go `common/log/dns.go:46-48`：
+        // DNSQueried = "got answer:"
+        // DNSCacheHit = "cache HIT:"
+        // DNSCacheOptimiste = "cache OPTIMISTE:"
+        assert_eq!(DnsStatus::Queried.as_str(), "got answer:");
+        assert_eq!(DnsStatus::CacheHit.as_str(), "cache HIT:");
+        assert_eq!(DnsStatus::CacheOptimiste.as_str(), "cache OPTIMISTE:");
+    }
+
+    #[test]
+    fn dns_format_cache_optimiste() {
+        // 缓存过期优化路径使用不同前缀。
+        let m = DnsLog {
+            query: "A stale.com".into(),
+            domain: "stale.com".into(),
+            result: "10.0.0.1".into(),
+            server: "cached".into(),
+            status: DnsStatus::CacheOptimiste,
+            elapsed_ms: 0,
+            error: Some("cached".into()),
+        };
+        let s = m.format();
+        assert!(s.contains("cache OPTIMISTE:"), "{s}");
+        assert!(s.contains("cached"));
+    }
+
+    #[test]
+    fn dns_to_json_includes_all_fields() {
+        let m = DnsLog {
+            query: "A bar.com".into(),
+            domain: "bar.com".into(),
+            result: "8.8.8.8".into(),
+            server: "cloudflare".into(),
+            elapsed_ms: 12,
+            status: DnsStatus::CacheHit,
+            error: Some("ttl=300".into()),
+        };
+        let j: serde_json::Value =
+            serde_json::from_str(&m.to_json()).expect("DnsLog to_json must be valid JSON");
+        assert_eq!(j["server"], "cloudflare");
+        assert_eq!(j["elapsed_ms"], 12);
+        assert_eq!(j["status"], "cache HIT:");
+        assert_eq!(j["error"], "ttl=300");
+        assert_eq!(j["domain"], "bar.com");
+    }
+
+    #[test]
+    fn dns_to_json_omits_error_when_none() {
+        let m = DnsLog::default();
+        let j: serde_json::Value =
+            serde_json::from_str(&m.to_json()).expect("DnsLog to_json must be valid JSON");
+        assert!(j.get("error").is_none(), "error=None 应省略");
     }
 
     #[test]
