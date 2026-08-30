@@ -265,11 +265,11 @@ async fn reflection_disabled_when_not_opted_in() {
             target_strategy: None,
         }],
     };
-    let (_ohm, addr, _instance) = match xray_core::functions::start_full(&built).await {
+    let (_instance, _ohm, _handles) = match xray_core::functions::start_full(&built).await {
         Ok(v) => v,
         Err(e) => panic!("start_full failed: {e}"),
     };
-    let channel = connect(&addr).await;
+    let channel = connect(&api_addr).await;
     let mut reflection = ServerReflectionClient::new(channel);
 
     // 尝试 ListServices — opt-out 时服务端无 reflection handler，应返回
