@@ -58,8 +58,19 @@ path = "integration/e2e_p2_test.rs"
 
  [[test]]
  name = "integration_transport_interop"
- path = "integration/transport_interop_test.rs"
+path = "integration/transport_interop_test.rs"
 
+[[test]]
+name = "integration_passive_connection"
+path = "integration/test_passive_connection.rs"
+
+[[test]]
+name = "integration_udp_connection"
+path = "integration/test_udp_connection.rs"
+
+[[test]]
+name = "integration_dial_xray"
+path = "integration/test_dial_xray.rs"
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 xray-common = { path = "../crates/xray-common" }
