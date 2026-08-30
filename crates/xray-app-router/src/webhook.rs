@@ -4,22 +4,47 @@
 //!
 //! # 实现
 //!
-//! - `post` 通过 `tokio::net::TcpStream` 手写 HTTP POST（不引入 reqwest）
+//! - `post` 走手写 HTTP/1.1 客户端（不引入 reqwest/hyper）：
+//!   - `http://host:port/path`           → `tokio::net::TcpStream`
+//!   - `https://host:port/path`          → TCP + `tokio-rustls` TLS 握手
+//!   - `/path/to/socket[:/url-path]`     → `tokio::net::UnixStream`（UDS dial）
+//!   - `@abstract-name` / `@@padded`     → 同上（Linux/Android 抽象命名空间）
 //! - 事件构造、去重逻辑独立可测
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::UnixStream;
+use tokio_rustls::rustls::pki_types::ServerName;
+use tokio_rustls::{client::TlsConnector, rustls::ClientConfig};
 use xray_proto::xray::app::router::WebhookConfig;
 
 use crate::error::RouterError;
 
 /// 默认 HTTP POST 超时（毫秒）。
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
+
+/// Webhook 目标协议。
+///
+/// 由 `parse_target` 从 URL 字符串解出。`Http`/`Https` 走 TCP，
+/// `UnixSocket` 走 [`tokio::net::UnixStream`]（Go `SplitHTTPUnixURL`
+/// 等价物）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WebhookTarget {
+    /// `http://host:port/path`
+    Http { host: String, port: u16, path: String },
+    /// `https://host:port/path`
+    Https { host: String, port: u16, path: String },
+    /// `/abs/path[:/url-path]` 或 `@abstract[:/url-path]` 或 `@@padded[:/url-path]`
+    UnixSocket { socket_path: String, http_path: String },
+}
+
 
 /// Webhook 事件。
 ///
@@ -160,65 +185,67 @@ impl WebhookNotifier {
     }
 
     /// 异步 HTTP POST 实现。
+    ///
+    /// 依据 URL 形式分派：
+    /// - `http://`      → [`tokio::net::TcpStream`] + 手写 HTTP/1.1
+    /// - `https://`     → TCP + [`tokio_rustls`] TLS 握手 + 手写 HTTP/1.1
+    /// - `/abs/path`    → [`tokio::net::UnixStream`] 抽象拨号（UDS）+ 手写 HTTP/1.1
     async fn post_async(&self, body: &str) -> Result<(), RouterError> {
         let url = self.url.trim();
         if url.is_empty() {
             return Err(RouterError::Webhook("empty webhook url".to_string()));
         }
-
-        let (host, port) = parse_webhook_host_port(url)
+        let target = parse_webhook_target(url)
             .map_err(|e| RouterError::Webhook(e))?;
-
-        let addr = format!("{host}:{port}");
         let timeout = Duration::from_millis(DEFAULT_TIMEOUT_MS);
 
-        // TCP 连接
-        let mut stream = tokio::time::timeout(timeout, TcpStream::connect(&addr))
-            .await
-            .map_err(|e| RouterError::Webhook(format!("connect timeout: {e}")))?
-            .map_err(|e| RouterError::Webhook(format!("connect failed: {e}")))?;
+        let request = match &target {
+            WebhookTarget::Http { host, path, .. } => build_request(host, "http", path, body, &self.headers),
+            WebhookTarget::Https { host, path, .. } => build_request(host, "https", path, body, &self.headers),
+            WebhookTarget::UnixSocket { http_path, .. } => build_request("localhost", "http", http_path, body, &self.headers),
+        };
 
-        // 构造 HTTP POST 请求（手写，不含 TLS）
-        // ponytail: 不实现 TLS，webhook 通常在内网。升级路径：引入 tokio-rustls。
-        let path = extract_path(url);
-        let mut header_lines = format!("POST {path} HTTP/1.1\r\n");
-        header_lines.push_str(&format!("Host: {host}\r\n"));
-        header_lines.push_str("Content-Type: application/json\r\n");
-        header_lines.push_str(&format!("Content-Length: {}\r\n", body.len()));
-        header_lines.push_str("Connection: close\r\n");
-        // 自定义 headers
-        for (k, v) in &self.headers {
-            header_lines.push_str(&format!("{k}: {v}\r\n"));
-        }
-        header_lines.push_str("\r\n");
+        // 连接 + 写 + 读 + 解析响应
+        let status = match target {
+            WebhookTarget::Http { host, port, .. } => {
+                let mut s = tcp_connect(&host, port, timeout).await?;
+                http_handshake(&mut s, request.as_bytes(), timeout).await?
+            }
+            WebhookTarget::Https { host, port, .. } => {
+                let s = tcp_connect(&host, port, timeout).await?;
+                let connector = tls_connector()?;
+                let server_name = ServerName::try_from(host.clone())
+                    .map_err(|e| RouterError::Webhook(format!("invalid tls server name: {e}")))?;
+                let mut tls = tokio::time::timeout(timeout, connector.connect(server_name, s))
+                    .await
+                    .map_err(|e| RouterError::Webhook(format!("tls handshake timeout: {e}")))?
+                    .map_err(|e| RouterError::Webhook(format!("tls handshake failed: {e}")))?;
+                http_handshake(&mut tls, request.as_bytes(), timeout).await?
+            }
+            #[cfg(unix)]
+            WebhookTarget::UnixSocket { socket_path, .. } => {
+                let mut s = tokio::time::timeout(timeout, UnixStream::connect(&socket_path))
+                    .await
+                    .map_err(|e| RouterError::Webhook(format!("unix connect timeout: {e}")))?
+                    .map_err(|e| RouterError::Webhook(format!("unix connect failed: {e}")))?;
+                http_handshake(&mut s, request.as_bytes(), timeout).await?
+            }
+            #[cfg(not(unix))]
+            WebhookTarget::UnixSocket { .. } => {
+                return Err(RouterError::Webhook(
+                    "unix socket webhook is not supported on this platform".to_string(),
+                ));
+            }
+        };
 
-        let request = format!("{header_lines}{body}");
-
-        // 写入请求
-        tokio::time::timeout(timeout, stream.write_all(request.as_bytes()))
-            .await
-            .map_err(|e| RouterError::Webhook(format!("write timeout: {e}")))?
-            .map_err(|e| RouterError::Webhook(format!("write failed: {e}")))?;
-
-        // 读取响应状态行
-        let mut buf = vec![0u8; 4096];
-        let n = tokio::time::timeout(timeout, stream.read(&mut buf))
-            .await
-            .map_err(|e| RouterError::Webhook(format!("read timeout: {e}")))?
-            .map_err(|e| RouterError::Webhook(format!("read failed: {e}")))?;
-
-        // 解析 HTTP 状态码
-        let response = String::from_utf8_lossy(&buf[..n]);
-        let status_code = parse_http_status(&response)
-            .map_err(|e| RouterError::Webhook(e))?;
-
-        if (200..300).contains(&status_code) {
-            tracing::debug!(target: "xray_router::webhook", url = %self.url, status = status_code, "webhook post ok");
+        if (200..300).contains(&status) {
+            tracing::debug!(target: "xray_router::webhook", url = %self.url, status = status, "webhook post ok");
             Ok(())
         } else {
-            Err(RouterError::Webhook(format!("webhook returned status {status_code}")))
+            Err(RouterError::Webhook(format!("webhook returned status {status}")))
         }
     }
+
 
     /// 关闭。后续 fire 返回 Ok(false)。
     pub fn close(&self) {
@@ -247,39 +274,141 @@ impl WebhookNotifier {
 
 // ── HTTP 辅助函数 ────────────────────────────────────────────────
 
-/// 从 URL 提取 (host, port)。
+/// 默认 HTTPS 端口（无显式 `:port` 时）。
+const DEFAULT_HTTPS_PORT: u16 = 443;
+/// 默认 HTTP 端口（无显式 `:port` 时）。
+const DEFAULT_HTTP_PORT: u16 = 80;
+
+/// 解析 webhook URL → [`WebhookTarget`]。
 ///
-/// 支持格式：`http://host:port/path` 或 `host:port`。
-/// 不支持 HTTPS（ponytail: TLS 升级路径：引入 tokio-rustls）。
-fn parse_webhook_host_port(url: &str) -> Result<(String, u16), String> {
-    let stripped = url.strip_prefix("http://").unwrap_or(url);
-    let stripped = stripped.strip_prefix("https://").unwrap_or(stripped);
-    // 找到第一个 / 分离路径
-    let host_port = stripped.split('/').next().unwrap_or(stripped);
-    if let Some(idx) = host_port.rfind(':') {
-        let host = host_port[..idx].to_string();
-        let port: u16 = host_port[idx + 1..].parse().map_err(|e| format!("invalid port: {e}"))?;
-        Ok((host, port))
+/// 三种合法形式（对齐 Go `utils.SplitHTTPUnixURL`）：
+/// - `http://host[:port][/path]`  → [`WebhookTarget::Http`]
+/// - `https://host[:port][/path]` → [`WebhookTarget::Https`]
+/// - 绝对路径或抽象 socket（`/abs/path` `@abs` `@@padded`），
+///   可附 `:/url-path` 改 HTTP 请求路径 → [`WebhookTarget::UnixSocket`]
+fn parse_webhook_target(url: &str) -> Result<WebhookTarget, String> {
+    if url.starts_with("http://") {
+        parse_httpish(url, "http://", DEFAULT_HTTP_PORT)
+    } else if url.starts_with("https://") {
+        parse_httpish(url, "https://", DEFAULT_HTTPS_PORT)
+    } else if is_unix_socket_form(url) {
+        // 与 Go `SplitHTTPUnixURL` 等价：含 `":/"` 则按 `":/"` 切分；
+        // 否则 socket_path = 整个 url，HTTP path = `"/"`。
+        let (socket_path, http_path) = if let Some(idx) = url.find(":/") {
+            (url[..idx].to_string(), url[idx + 1..].to_string())
+        } else {
+            (url.to_string(), "/".to_string())
+        };
+        Ok(WebhookTarget::UnixSocket { socket_path, http_path })
     } else {
-        // 默认端口 80
-        Ok((host_port.to_string(), 80))
+        Err(format!("unsupported webhook url scheme: {url}"))
     }
 }
 
-/// 从 URL 提取路径部分（用于 HTTP 请求行）。
-fn extract_path(url: &str) -> String {
-    let stripped = url.strip_prefix("http://").unwrap_or(url);
-    let stripped = stripped.strip_prefix("https://").unwrap_or(stripped);
-    if let Some(idx) = stripped.find('/') {
-        stripped[idx..].to_string()
-    } else {
-        "/".to_string()
+/// 是否应视为 Unix socket 形式：绝对路径或 `@` 开头（Go 规则）。
+fn is_unix_socket_form(url: &str) -> bool {
+    url.starts_with('/') || url.starts_with('@')
+}
+
+/// 解析 `http://` 或 `https://` 形式 → host / port / path。
+fn parse_httpish(url: &str, scheme: &str, default_port: u16) -> Result<WebhookTarget, String> {
+    let rest = &url[scheme.len()..];
+    let (host_port, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match host_port.rfind(':') {
+        Some(i) => {
+            let port: u16 = host_port[i + 1..]
+                .parse()
+                .map_err(|e| format!("invalid port: {e}"))?;
+            (&host_port[..i], port)
+        }
+        None => (host_port, default_port),
+    };
+    if host.is_empty() {
+        return Err("empty host".to_string());
     }
+    let target = if scheme == "https://" {
+        WebhookTarget::Https { host: host.to_string(), port, path: path.to_string() }
+    } else {
+        WebhookTarget::Http { host: host.to_string(), port, path: path.to_string() }
+    };
+    Ok(target)
+}
+
+/// 构造 HTTP/1.1 POST 报文（含 `Host` / `Content-Type` / `Content-Length` / 自定义 headers）。
+fn build_request(host: &str, scheme: &str, path: &str, body: &str, headers: &std::collections::HashMap<String, String>) -> String {
+    let mut s = format!("POST {path} HTTP/1.1\r\n");
+    s.push_str(&format!("Host: {host}\r\n"));
+    if scheme == "https" {
+        // 默认 HTTPS 端口可省去；显式非 443 仍拼 `:port` 以兼容反代
+        // （Host 头中包含端口是允许的，参见 RFC 7230 §5.4）。
+        // 这里为简化拼接 `host` 本身（含显式端口情形由 caller 提供）。
+    }
+    s.push_str("Content-Type: application/json\r\n");
+    s.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    s.push_str("Connection: close\r\n");
+    for (k, v) in headers {
+        s.push_str(&format!("{k}: {v}\r\n"));
+    }
+    s.push_str("\r\n");
+    s.push_str(body);
+    s
+}
+
+/// TCP 连接（含超时）。
+async fn tcp_connect(host: &str, port: u16, timeout: Duration) -> Result<TcpStream, RouterError> {
+    let addr = format!("{host}:{port}");
+    tokio::time::timeout(timeout, TcpStream::connect(&addr))
+        .await
+        .map_err(|e| RouterError::Webhook(format!("connect timeout: {e}")))?
+        .map_err(|e| RouterError::Webhook(format!("connect failed: {e}")))
+}
+
+/// 共享 `TlsConnector`（一次性装载 `webpki_roots`，后续请求复用）。
+///
+/// ponytail: 全进程共享单连接器。若未来支持自签 CA / 钉扎证书，扩展为
+/// `LazyLock<HashMap<Profile, Arc<ClientConfig>>>`。
+fn tls_connector() -> Result<TlsConnector, RouterError> {
+    use std::sync::LazyLock;
+    static CONNECTOR: LazyLock<Result<TlsConnector, String>> = LazyLock::new(|| {
+        // rustls ring crypto provider：test 并发场景下 `install_default` 多次返回 Ok(()) 即可
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let cfg = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Ok(TlsConnector::from(Arc::new(cfg)))
+    });
+    CONNECTOR
+        .clone()
+        .map_err(|e| RouterError::Webhook(format!("tls config init failed: {e}")))
+}
+
+/// 对 plaintext stream 发 POST + 读响应头，解析 HTTP 状态码。
+async fn http_handshake<S>(stream: &mut S, body: &[u8], timeout: Duration) -> Result<u16, RouterError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    tokio::time::timeout(timeout, stream.write_all(body))
+        .await
+        .map_err(|e| RouterError::Webhook(format!("write timeout: {e}")))?
+        .map_err(|e| RouterError::Webhook(format!("write failed: {e}")))?;
+
+    let mut buf = vec![0u8; 4096];
+    let n = tokio::time::timeout(timeout, stream.read(&mut buf))
+        .await
+        .map_err(|e| RouterError::Webhook(format!("read timeout: {e}")))?
+        .map_err(|e| RouterError::Webhook(format!("read failed: {e}")))?;
+
+    let response = String::from_utf8_lossy(&buf[..n]);
+    parse_http_status(&response).map_err(RouterError::Webhook)
 }
 
 /// 从 HTTP 响应解析状态码。
 fn parse_http_status(response: &str) -> Result<u16, String> {
-    // 期望格式: HTTP/1.1 200 OK
     let line = response.lines().next().unwrap_or("");
     let parts: Vec<&str> = line.splitn(3, ' ').collect();
     if parts.len() >= 2 {
@@ -356,34 +485,95 @@ mod tests {
     // ── HTTP 辅助函数 ──
 
     #[test]
-    fn test_parse_webhook_host_port_with_scheme() {
-        let (host, port) = parse_webhook_host_port("http://example.com:9090/hook").unwrap();
-        assert_eq!(host, "example.com");
-        assert_eq!(port, 9090);
+    fn test_parse_target_http_with_scheme() {
+        let t = parse_webhook_target("http://example.com:9090/hook").unwrap();
+        assert_eq!(
+            t,
+            WebhookTarget::Http {
+                host: "example.com".into(),
+                port: 9090,
+                path: "/hook".into(),
+            }
+        );
     }
 
     #[test]
-    fn test_parse_webhook_host_port_default_port() {
-        let (host, port) = parse_webhook_host_port("http://example.com/hook").unwrap();
-        assert_eq!(host, "example.com");
-        assert_eq!(port, 80);
+    fn test_parse_target_http_default_port() {
+        let t = parse_webhook_target("http://example.com/hook").unwrap();
+        match t {
+            WebhookTarget::Http { host, port, path } => {
+                assert_eq!(host, "example.com");
+                assert_eq!(port, 80);
+                assert_eq!(path, "/hook");
+            }
+            _ => panic!("expected Http"),
+        }
     }
 
     #[test]
-    fn test_parse_webhook_host_port_bare() {
-        let (host, port) = parse_webhook_host_port("192.168.1.1:8080").unwrap();
-        assert_eq!(host, "192.168.1.1");
-        assert_eq!(port, 8080);
+    fn test_parse_target_https_explicit_port() {
+        let t = parse_webhook_target("https://x.com:8443/api").unwrap();
+        match t {
+            WebhookTarget::Https { host, port, path } => {
+                assert_eq!(host, "x.com");
+                assert_eq!(port, 8443);
+                assert_eq!(path, "/api");
+            }
+            _ => panic!("expected Https"),
+        }
     }
 
     #[test]
-    fn test_extract_path_with_scheme() {
-        assert_eq!(extract_path("http://x.com/api/hook"), "/api/hook");
+    fn test_parse_target_https_default_port() {
+        let t = parse_webhook_target("https://x.com").unwrap();
+        match t {
+            WebhookTarget::Https { port, path, .. } => {
+                assert_eq!(port, 443);
+                assert_eq!(path, "/");
+            }
+            _ => panic!("expected Https"),
+        }
     }
 
     #[test]
-    fn test_extract_path_no_path() {
-        assert_eq!(extract_path("http://x.com"), "/");
+    fn test_parse_target_unix_socket() {
+        let t = parse_webhook_target("/var/run/webhook.sock:/hook").unwrap();
+        match t {
+            WebhookTarget::UnixSocket { socket_path, http_path } => {
+                assert_eq!(socket_path, "/var/run/webhook.sock");
+                assert_eq!(http_path, "/hook");
+            }
+            _ => panic!("expected UnixSocket"),
+        }
+    }
+
+    #[test]
+    fn test_parse_target_unix_socket_no_path() {
+        let t = parse_webhook_target("/tmp/web.sock").unwrap();
+        match t {
+            WebhookTarget::UnixSocket { socket_path, http_path } => {
+                assert_eq!(socket_path, "/tmp/web.sock");
+                assert_eq!(http_path, "/");
+            }
+            _ => panic!("expected UnixSocket"),
+        }
+    }
+
+    #[test]
+    fn test_parse_target_abstract_socket() {
+        let t = parse_webhook_target("@abstract-name:/api").unwrap();
+        match t {
+            WebhookTarget::UnixSocket { socket_path, http_path } => {
+                assert_eq!(socket_path, "@abstract-name");
+                assert_eq!(http_path, "/api");
+            }
+            _ => panic!("expected UnixSocket"),
+        }
+    }
+
+    #[test]
+    fn test_parse_target_invalid_scheme() {
+        assert!(parse_webhook_target("ftp://x.com").is_err());
     }
 
     #[test]

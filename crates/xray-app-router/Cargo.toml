@@ -23,8 +23,10 @@ serde_json = { workspace = true }
 prost = { workspace = true }
 sysinfo = { workspace = true }
 
-[target.'cfg(any(target_os = "macos", target_os = "freebsd"))'.dependencies]
-libc = "0.2"
+# HTTPS webhook (TLS client handshake for `https://` URLs)
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
