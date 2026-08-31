@@ -369,22 +369,7 @@ mod tests {
         assert_eq!(v.count(), 2);
     }
 
-    #[test]
-    fn add_non_aead_first_user_ok() {
-        let v = Validator::new();
-        v.add(make_user("u@x.com", CipherType::None, "p")).expect("add none first");
-        assert_eq!(v.count(), 1);
-    }
-
-    #[test]
-    fn add_non_aead_second_user_fails() {
-        let v = Validator::new();
-        v.add(make_user("u1@x.com", CipherType::None, "p1")).expect("first none");
-        let err = v
-            .add(make_user("u2@x.com", CipherType::None, "p2"))
-            .unwrap_err();
-        assert!(matches!(err, SsError::NoMultiUserForStreamCipher));
-    }
+    // ---- del / get_by_email ----
 
     // ---- del / get_by_email ----
 

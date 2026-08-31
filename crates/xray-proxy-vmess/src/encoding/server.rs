@@ -298,7 +298,7 @@ impl<'v> ServerSession<'v> {
                 let key = generate_chacha20poly1305_key(&self.request_body_key);
                 Box::new(ChaCha20Poly1305Aead::new(&key)?)
             }
-            SecurityType::None | SecurityType::Zero => Box::new(NoOpAeadCipher),
+
             other => {
                 return Err(VmessError::Other(format!(
                     "decode_request_body: unsupported security {:?}",
@@ -450,7 +450,7 @@ impl<'v> ServerSession<'v> {
                 let key = generate_chacha20poly1305_key(&self.response_body_key);
                 Box::new(ChaCha20Poly1305Aead::new(&key)?)
             }
-            SecurityType::None | SecurityType::Zero => Box::new(NoOpAeadCipher),
+
             other => {
                 return Err(VmessError::Other(format!(
                     "encode_response_body: unsupported security {:?}",

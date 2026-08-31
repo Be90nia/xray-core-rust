@@ -117,14 +117,13 @@ impl VmessOutboundConfig {
 
 /// 从 JSON 字符串解析 security 类型。
 ///
-/// Go 端 `security` 字段值：`"aes-128-gcm"` / `"chacha20-poly1305"` / `"auto"` / `"none"` / `"zero"`。
+/// Go 端 `security` 字段值：`"aes-128-gcm"` / `"chacha20-poly1305"` / `"auto"`。
+/// `"none"` / `"zero"` 已被 Go 上游移除（v26.7.28）。
 fn parse_security(s: &str) -> SecurityType {
     match s {
         "aes-128-gcm" | "aes-128-gcm@shadowsocks.org" => SecurityType::Aes128Gcm,
         "chacha20-poly1305" | "chacha20-poly1305@shadowsocks.org" => SecurityType::Chacha20Poly1305,
         "auto" => SecurityType::Auto,
-        "none" => SecurityType::None,
-        "zero" => SecurityType::Zero,
         _ => SecurityType::Auto,
     }
 }
@@ -228,14 +227,10 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>) -> DialFn {
             let security = resolve_security(config.security)
                 .map_err(|e| format!("vmess resolve security: {e}"))?;
             // 3. 构造请求头（resolved security）+ body option bits
-            //    option 语义对齐 Go outbound.go:102-113（用未 resolve 的 account security）：
-            //    - AEAD/None/Chacha → CHUNK_MASKING（length 字段 SHAKE128 掩码）
-            //    - AEAD/Chacha/Auto + masking → GLOBAL_PADDING
-            //    此前硬编码 option=0（Plain length 明文）——可被 VMess 主动探测定罪。
             let mut option = Bitmask::new(request_option::CHUNK_STREAM);
             let use_masking = matches!(
                 config.security,
-                SecurityType::Aes128Gcm | SecurityType::Chacha20Poly1305 | SecurityType::None
+                SecurityType::Aes128Gcm | SecurityType::Chacha20Poly1305
             );
             if use_masking {
                 option.set(request_option::CHUNK_MASKING);
@@ -248,7 +243,6 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>) -> DialFn {
                     option.set(request_option::GLOBAL_PADDING);
                 }
             }
-
             let account = MemoryAccount::new(config.user_uuid.clone())
                 .with_security(security.clone());
             let session = ClientSession::new();
@@ -480,19 +474,11 @@ fn build_body_ciphers(
             let s = BodyCipher::Chacha(ChaCha20Poly1305Aead::new(&sk)?);
             Ok((r, s))
         }
-        SecurityType::None | SecurityType::Zero => Ok((
-            BodyCipher::NoOp(NoOpAeadCipher),
-            BodyCipher::NoOp(NoOpAeadCipher),
-        )),
         other => Err(VmessError::Other(format!(
             "unsupported body security: {other:?}"
         ))),
     }
 }
-
-/// 上行 pump：从明文 duplex 读 → 按 VMess 请求 body chunk 格式加密写入 wire。
-///
-/// chunk 格式 `[size_field][AEAD ciphertext][padding]`（size = 密文+padding 长度，
 /// size_field 由 SizeParser 编码——CHUNK_MASKING 时 SHAKE128 掩码）。nonce 跨块自增。
 /// 流结束（EOF/错误）时写终止 chunk `seal([])`。
 async fn pump_up<C, R, W>(
@@ -658,14 +644,11 @@ mod tests {
         assert!(dest.is_tcp());
         assert_eq!(dest.port(), Port::new(443));
     }
-
     #[test]
     fn parse_security_mapping() {
         assert!(matches!(super::parse_security("aes-128-gcm"), SecurityType::Aes128Gcm));
         assert!(matches!(super::parse_security("chacha20-poly1305"), SecurityType::Chacha20Poly1305));
         assert!(matches!(super::parse_security("auto"), SecurityType::Auto));
-        assert!(matches!(super::parse_security("none"), SecurityType::None));
-        assert!(matches!(super::parse_security("zero"), SecurityType::Zero));
         assert!(matches!(super::parse_security("unknown"), SecurityType::Auto));
     }
 
@@ -680,8 +663,6 @@ mod tests {
         let _dial = make_vmess_dial_fn(Arc::clone(&cfg));
         assert_eq!(Arc::strong_count(&cfg), 2);
     }
-
-    #[test]
     fn parse_vmess_config_extracts_fields() {
         let data = r#"{
             "vnext": [{

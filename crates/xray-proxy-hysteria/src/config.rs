@@ -293,15 +293,12 @@ pub const HYSTERIA_ACCOUNT_TYPE_URL: &str =
 /// type_url 后缀匹配用（from 方向接受任意前缀写法）。
 const HYSTERIA_ACCOUNT_TYPE_URL_SUFFIX: &str = "xray.proxy.hysteria.account.Account";
 
-/// Hysteria 客户端配置（proto 镜像），对应 proto `ClientConfig{version, server}`。
+/// Hysteria 客户端配置（proto 镜像），对应 proto `ClientConfig{server}`（v26.7.28 移除 `version`）。
 ///
 /// Go `client.go:31-46`：`server` 缺失即 `no target server found`，端点经
-/// `NewServerSpecFromPB` 转 ServerSpec；`version` 仅在 JSON 层校验
-///（infra/conf/hysteria.go:20-22 要求 ==2），运行时不读。
+/// `NewServerSpecFromPB` 转 ServerSpec。`version` 字段已被 Go 上游删除。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ClientConfig {
-    /// 协议版本（JSON 层要求 2）。
-    pub version: i32,
     /// 服务器端点（address + port）。
     pub server: Option<ServerEndpoint>,
 }
@@ -310,13 +307,13 @@ impl ClientConfig {
     /// 从 prost `ClientConfig` 构造。
     #[must_use]
     pub fn from_proto(p: ProtoClientConfig) -> Self {
-        Self { version: p.version, server: p.server }
+        Self { server: p.server }
     }
 
     /// 转换为 prost `ClientConfig`。
     #[must_use]
     pub fn to_proto(&self) -> ProtoClientConfig {
-        ProtoClientConfig { version: self.version, server: self.server.clone() }
+        ProtoClientConfig { server: self.server.clone() }
     }
 }
 
@@ -660,9 +657,8 @@ mod tests {
     #[test]
     fn hysteria_client_config_proto_roundtrip() {
         use xray_proto::xray::common::net::IpOrDomain;
-        // Go infra/conf/hysteria.go:19-32：JSON {version:2, address, port} → proto
+
         let cfg = ClientConfig {
-            version: 2,
             server: Some(ServerEndpoint {
                 address: Some(IpOrDomain {
                     address: Some(xray_proto::xray::common::net::ip_or_domain::Address::Domain(

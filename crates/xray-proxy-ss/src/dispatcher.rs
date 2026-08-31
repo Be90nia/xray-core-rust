@@ -313,10 +313,11 @@ pub fn parse_ss_config(data: &[u8]) -> Result<SsOutboundConfig, String> {
             [i, u, ..] => (u.to_string(), Some(i.to_string())),
             [] => return Err("empty password".to_string()),
         };
-        // account 占位（None cipher）：2022 拨号路径读 ss2022 参数，不读 account
+        // account 占位：2022 拨号路径读 ss2022 参数，不读 account；cipher 字段用
+        // 任意 AEAD（None 已被 Go 上游 v26.7.28 删除）。
         let placeholder = MemoryAccount::from_proto(&xray_proto::xray::proxy::shadowsocks::Account {
             password: psk_b64.clone(),
-            cipher_type: crate::config::CipherType::None.as_i32(),
+            cipher_type: crate::config::CipherType::Aes128Gcm.as_i32(),
             iv_check: false,
         })
         .map_err(|e| format!("ss2022 account placeholder: {e}"))?;

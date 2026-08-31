@@ -263,9 +263,7 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
                 .map_err(|e| std::io::Error::other(format!("vmess chacha resp key: {e}")))?;
             (BodyCipher::Chacha(r), BodyCipher::Chacha(s))
         }
-        SecurityType::None | SecurityType::Zero => {
-            (BodyCipher::NoOp(NoOpAeadCipher), BodyCipher::NoOp(NoOpAeadCipher))
-        }
+
         other => {
             return Err(std::io::Error::other(format!(
                 "vmess unsupported security: {other:?}"

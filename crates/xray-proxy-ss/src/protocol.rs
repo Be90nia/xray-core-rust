@@ -683,13 +683,7 @@ mod tests {
         assert!(matches!(err, SsError::UserNotFound));
     }
 
-    #[test]
-    fn tcp_encode_none_cipher_errors() {
-        let account = make_account(CipherType::None, "password");
-        let addr = Address::Domain("x.com".to_string());
-        let err = encode_tcp_request_header(&account, &addr, 443).unwrap_err();
-        assert!(matches!(err, SsError::UnsupportedCipher));
-    }
+
 
     // ---- RequestHeader ----
 

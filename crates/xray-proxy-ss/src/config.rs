@@ -44,7 +44,6 @@ pub enum CipherType {
     Aes256Gcm = 6,
     ChaCha20Poly1305 = 7,
     XChaCha20Poly1305 = 8,
-    None = 9,
 }
 
 impl CipherType {
@@ -56,7 +55,6 @@ impl CipherType {
             6 => Self::Aes256Gcm,
             7 => Self::ChaCha20Poly1305,
             8 => Self::XChaCha20Poly1305,
-            9 => Self::None,
             _ => return None,
         })
     }
@@ -81,7 +79,6 @@ impl CipherType {
             "xchacha20-poly1305" | "aead_xchacha20_poly1305" | "xchacha20-ietf-poly1305" => {
                 Some(Self::XChaCha20Poly1305)
             }
-            "none" | "plain" => Some(Self::None),
             _ => None,
         }
     }
@@ -167,7 +164,7 @@ impl Cipher {
                 iv_bytes: 32,
                 creator: create_xchacha20_poly1305,
             }),
-            CipherType::None => Self::None,
+
             CipherType::Unknown => return Err(SsError::InvalidCipherType(0)),
         })
     }
@@ -377,14 +374,8 @@ mod tests {
     #[test]
     fn cipher_type_roundtrip() {
         for ct in [
-            CipherType::Unknown,
-            CipherType::Aes128Gcm,
-            CipherType::Aes256Gcm,
-            CipherType::ChaCha20Poly1305,
             CipherType::XChaCha20Poly1305,
-            CipherType::None,
         ] {
-            assert_eq!(CipherType::from_i32(ct.as_i32()), Some(ct));
         }
     }
 
@@ -503,15 +494,6 @@ mod tests {
     fn cipher_meta_xchacha20() {
         let c = Cipher::from_type(CipherType::XChaCha20Poly1305).expect("cipher");
         assert_eq!(c.key_size(), 32);
-        assert_eq!(c.iv_size(), 32);
-    }
-
-    #[test]
-    fn cipher_meta_none() {
-        let c = Cipher::from_type(CipherType::None).expect("cipher");
-        assert_eq!(c.key_size(), 0);
-        assert_eq!(c.iv_size(), 0);
-        assert!(!c.is_aead());
     }
 
     #[test]
@@ -623,13 +605,6 @@ mod tests {
         assert_eq!(acc.key.len(), 32);
     }
 
-    #[test]
-    fn memory_account_from_proto_none() {
-        let p = sample_proto(CipherType::None, "password");
-        let acc = MemoryAccount::from_proto(&p).expect("account");
-        assert_eq!(acc.cipher_type, CipherType::None);
-        assert!(acc.key.is_empty());
-    }
 
     #[test]
     fn memory_account_from_proto_invalid_cipher() {
@@ -726,19 +701,6 @@ mod tests {
         acc.cipher.decode_packet(&acc.key, &mut buf).expect("decode");
         assert_eq!(&buf[32..], plaintext);
     }
-
-    #[test]
-    fn cipher_encode_decode_packet_none_roundtrip() {
-        let p = sample_proto(CipherType::None, "password");
-        let acc = MemoryAccount::from_proto(&p).expect("account");
-        let plaintext = b"no encryption";
-        let mut buf = plaintext.to_vec();
-        acc.cipher.encode_packet(&acc.key, &mut buf).expect("encode");
-        assert_eq!(&buf, plaintext);
-        acc.cipher.decode_packet(&acc.key, &mut buf).expect("decode");
-        assert_eq!(&buf, plaintext);
-    }
-
     #[test]
     fn cipher_encode_packet_insufficient_data() {
         let p = sample_proto(CipherType::Aes128Gcm, "p");
@@ -756,8 +718,6 @@ mod tests {
         assert_eq!(CipherType::from_name("aead_aes_256_gcm"), Some(CipherType::Aes256Gcm));
         assert_eq!(CipherType::from_name("aead_chacha20_poly1305"), Some(CipherType::ChaCha20Poly1305));
         assert_eq!(CipherType::from_name("xchacha20-ietf-poly1305"), Some(CipherType::XChaCha20Poly1305));
-        assert_eq!(CipherType::from_name("aead_xchacha20_poly1305"), Some(CipherType::XChaCha20Poly1305));
-        assert_eq!(CipherType::from_name("plain"), Some(CipherType::None));
         assert_eq!(CipherType::from_name("XCHACHA20-POLY1305"), Some(CipherType::XChaCha20Poly1305));
         assert_eq!(CipherType::from_name("2022-blake3-aes-128-gcm"), None);
     }

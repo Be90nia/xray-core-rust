@@ -22,24 +22,19 @@ use self::user::MemoryUser;
 
 /// 加密安全类型。
 ///
-/// 对应 Go 版本的 `SecurityType` 枚举。
+/// 对应 Go 版本的 `SecurityType` 枚举（v26.7.28 协议层面对齐）：
+/// `LEGACY`/`ZERO`/`NONE` 已被 Go 上游删除。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum SecurityType {
     /// 未知安全类型
     Unknown = 0,
-    /// 遗留加密（AES-128-CFB）
-    Legacy = 1,
     /// 自动选择
     Auto = 2,
     /// AES-128-GCM
     Aes128Gcm = 3,
     /// ChaCha20-Poly1305
     Chacha20Poly1305 = 4,
-    /// 零加密（无加密但保留协议头）
-    Zero = 5,
-    /// 无加密
-    None = 6,
 }
 
 impl SecurityType {
@@ -54,35 +49,23 @@ impl SecurityType {
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
             0 => Some(Self::Unknown),
-            1 => Some(Self::Legacy),
             2 => Some(Self::Auto),
             3 => Some(Self::Aes128Gcm),
             4 => Some(Self::Chacha20Poly1305),
-            5 => Some(Self::Zero),
-            6 => Some(Self::None),
             _ => None,
         }
     }
 }
-
 impl std::fmt::Display for SecurityType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unknown => write!(f, "unknown"),
-            Self::Legacy => write!(f, "legacy"),
             Self::Auto => write!(f, "auto"),
             Self::Aes128Gcm => write!(f, "aes-128-gcm"),
             Self::Chacha20Poly1305 => write!(f, "chacha20-poly1305"),
-            Self::Zero => write!(f, "zero"),
-            Self::None => write!(f, "none"),
         }
     }
 }
-
-// ========== 传输类型 ==========
-
-/// 数据传输类型。
-///
 /// 对应 Go 版本的 `TransferType`，区分流式和包式传输。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
@@ -422,29 +405,27 @@ mod tests {
     use std::net::Ipv4Addr;
 
     // ========== SecurityType 测试 ==========
-
     #[test]
     fn test_security_type_as_u8() {
         assert_eq!(SecurityType::Unknown.as_u8(), 0);
-        assert_eq!(SecurityType::Legacy.as_u8(), 1);
         assert_eq!(SecurityType::Auto.as_u8(), 2);
         assert_eq!(SecurityType::Aes128Gcm.as_u8(), 3);
         assert_eq!(SecurityType::Chacha20Poly1305.as_u8(), 4);
-        assert_eq!(SecurityType::Zero.as_u8(), 5);
-        assert_eq!(SecurityType::None.as_u8(), 6);
     }
 
     #[test]
     fn test_security_type_from_u8() {
         assert_eq!(SecurityType::from_u8(0), Some(SecurityType::Unknown));
         assert_eq!(SecurityType::from_u8(3), Some(SecurityType::Aes128Gcm));
-        assert_eq!(SecurityType::from_u8(6), Some(SecurityType::None));
+        assert_eq!(SecurityType::from_u8(4), Some(SecurityType::Chacha20Poly1305));
+        assert_eq!(SecurityType::from_u8(5), None);
+        assert_eq!(SecurityType::from_u8(6), None);
         assert_eq!(SecurityType::from_u8(99), None);
     }
 
     #[test]
     fn test_security_type_roundtrip() {
-        for value in 0u8..=6 {
+        for value in [0u8, 2, 3, 4] {
             let st = SecurityType::from_u8(value).expect("valid");
             assert_eq!(st.as_u8(), value);
         }
@@ -454,9 +435,7 @@ mod tests {
     fn test_security_type_display() {
         assert_eq!(format!("{}", SecurityType::Aes128Gcm), "aes-128-gcm");
         assert_eq!(format!("{}", SecurityType::Auto), "auto");
-        assert_eq!(format!("{}", SecurityType::None), "none");
     }
-
     // ========== TransferType 测试 ==========
 
     #[test]

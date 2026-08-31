@@ -172,14 +172,22 @@ async fn resolve_dest_socket_addr(dest: &Destination) -> Option<SocketAddr> {
 
 /// 从 `splithttpSettings` JSON 解析为强类型 [`Config`]。
 ///
-/// `None` 或非 object 返回 [`Config::default`]。
+/// `None` 或非 object 返回 [`Config::default`]。xHTTP 默认 xmux 预设
+/// （Go v26.7.28 transport_method.go:452）即使在 `None` 时也套用，
+/// 让 `parse_splithttp_config(None)` 与 `parse_splithttp_config(Some({"xmux":{}}))`
+/// 行为一致：maxConnections = 3（anti-TSPU）。
 pub(crate) fn parse_splithttp_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
-    let Some(v) = json else { return Ok(Config::default()); };
-    let Some(obj) = v.as_object() else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "splithttpSettings must be a JSON object",
-        ));
+    let obj = match json {
+        None => return Ok(default_xhttp_config()),
+        Some(v) => match v.as_object() {
+            Some(o) => o,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "splithttpSettings must be a JSON object",
+                ));
+            }
+        },
     };
 
     let get_str = |k: &str| obj.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
@@ -192,17 +200,26 @@ pub(crate) fn parse_splithttp_config(json: Option<&serde_json::Value>) -> io::Re
         .unwrap_or_default();
 
     // xmux 子对象 → XmuxConfig
-    let xmux = obj.get("xmux").and_then(|x| x.as_object()).map(|m| {
-        let g_range = |k: &str| m.get(k).and_then(parse_range);
-        crate::config::XmuxConfig {
-            max_concurrency: g_range("maxConcurrency"),
-            max_connections: g_range("maxConnections"),
-            c_max_reuse_times: g_range("cMaxReuseTimes"),
-            h_max_request_times: g_range("hMaxRequestTimes"),
-            h_max_reusable_secs: g_range("hMaxReusableSecs"),
+    // ponytail: 与 Go v26.7.28 infra/conf/transport_method.go:452 对齐——
+    // 用户未提供 xmux（或提供空对象）时套默认预设：
+    // maxConnections {3,3}, hMaxRequestTimes {600,900}, hMaxReusableSecs {1800,3000}。
+    // 上一版 anti-TSPU 前默认 6；本次同步对齐 3（commit 18e28390）。
+    let xmux = match obj.get("xmux").and_then(|x| x.as_object()) {
+        Some(m) if !m.is_empty() => Some(crate::config::XmuxConfig {
+            max_concurrency: m.get("maxConcurrency").and_then(parse_range),
+            max_connections: m.get("maxConnections").and_then(parse_range),
+            c_max_reuse_times: m.get("cMaxReuseTimes").and_then(parse_range),
+            h_max_request_times: m.get("hMaxRequestTimes").and_then(parse_range),
+            h_max_reusable_secs: m.get("hMaxReusableSecs").and_then(parse_range),
             h_keep_alive_period: m.get("hKeepAlivePeriod").and_then(|x| x.as_i64()).unwrap_or(0),
-        }
-    });
+        }),
+        _ => Some(crate::config::XmuxConfig {
+            max_connections: Some(crate::config::RangeConfig::new(3, 3)),
+            h_max_request_times: Some(crate::config::RangeConfig::new(600, 900)),
+            h_max_reusable_secs: Some(crate::config::RangeConfig::new(1800, 3000)),
+            ..Default::default()
+        }),
+    };
 
     // downloadSettings 是嵌套 StreamConfig：取其中 splithttpSettings 递归解析
     // ponytail: 只取 splithttpSettings 子对象；TLS/security 归 stream 层管，这里不碰。
@@ -242,6 +259,20 @@ pub(crate) fn parse_splithttp_config(json: Option<&serde_json::Value>) -> io::Re
         download_settings,
         ..Config::default()
     })
+}
+
+/// xHTTP 默认配置（无 splithttpSettings JSON 时套用）。
+/// 与 `parse_splithttp_config(Some({"xmux":{}}))` 等价：除 xmux 默认预设外全空。
+fn default_xhttp_config() -> Config {
+    Config {
+        xmux: Some(crate::config::XmuxConfig {
+            max_connections: Some(crate::config::RangeConfig::new(3, 3)),
+            h_max_request_times: Some(crate::config::RangeConfig::new(600, 900)),
+            h_max_reusable_secs: Some(crate::config::RangeConfig::new(1800, 3000)),
+            ..Default::default()
+        }),
+        ..Config::default()
+    }
 }
 
 /// Parse a RangeConfig from JSON: either `{"from":N,"to":N}` or a single integer.
@@ -286,6 +317,47 @@ mod tests {
         assert!(cfg.host.is_empty());
         assert!(cfg.path.is_empty());
         assert!(cfg.mode.is_empty());
+    }
+
+    /// 对齐 Go v26.7.28 infra/conf/transport_method.go:452：
+    /// 用户未提供 `xmux` 子对象时套默认预设（anti-TSPU: maxConnections=3）。
+    #[test]
+    fn parse_xmux_default_preset_when_missing() {
+        let cfg = parse_splithttp_config(None).unwrap();
+        let xm = cfg.xmux.as_ref().expect("xmux preset applied");
+        assert_eq!(xm.max_connections.unwrap().from, 3);
+        assert_eq!(xm.max_connections.unwrap().to, 3);
+        assert_eq!(xm.h_max_request_times.unwrap().from, 600);
+        assert_eq!(xm.h_max_request_times.unwrap().to, 900);
+        assert_eq!(xm.h_max_reusable_secs.unwrap().from, 1800);
+        assert_eq!(xm.h_max_reusable_secs.unwrap().to, 3000);
+        // 其余字段保持零默认
+        assert!(xm.max_concurrency.is_none());
+        assert!(xm.c_max_reuse_times.is_none());
+    }
+
+    /// 对齐 Go v26.7.28：用户提供空 `xmux: {}` 也套默认预设。
+    #[test]
+    fn parse_xmux_empty_object_applies_preset() {
+        let v: serde_json::Value = serde_json::from_str(r#"{"xmux":{}}"#).unwrap();
+        let cfg = parse_splithttp_config(Some(&v)).unwrap();
+        let xm = cfg.xmux.as_ref().expect("preset");
+        assert_eq!(xm.max_connections.unwrap().to, 3);
+    }
+
+    /// 用户显式提供 xmux 子字段时不被默认预设覆盖（透传）。
+    #[test]
+    fn parse_xmux_explicit_value_passes_through() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"xmux":{"maxConnections":{"from":7,"to":9}}}"#,
+        )
+        .unwrap();
+        let cfg = parse_splithttp_config(Some(&v)).unwrap();
+        let xm = cfg.xmux.as_ref().expect("xmux present");
+        assert_eq!(xm.max_connections.unwrap().from, 7);
+        assert_eq!(xm.max_connections.unwrap().to, 9);
+        // 用户没填的字段保持 None（不被预设填 3）
+        assert!(xm.h_max_request_times.is_none());
     }
 
     #[test]
