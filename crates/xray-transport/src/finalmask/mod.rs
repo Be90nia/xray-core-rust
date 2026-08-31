@@ -397,10 +397,10 @@ struct PacketIoConn {
 
 impl PacketIoConn {
     fn new(inner: Box<dyn UdpIo>, remote_addr: SocketAddr) -> Self {
-        // ponytail: leak Arc<UdpIo> 一次——驱动 task + write spawn 都要 clone。
-        // 标准做法见 `tokio::net::TcpStream::into_split`。对全局进程泄漏 but 单一实例。
-        let raw: *mut dyn UdpIo = Box::into_raw(inner);
-        let inner: Arc<dyn UdpIo> = unsafe { Arc::from_raw(raw) };
+        // Box→Arc 必须走标准库 `From<Box<T>> for Arc<T>`（值 move 进带 {strong,weak} 计数头的新分配）。
+        // 此前 Box::into_raw + Arc::from_raw 是 UB：Box 分配没有计数头，Arc::clone 在分配外
+        // fetch_add、drop 按错误 layout dealloc → STATUS_HEAP_CORRUPTION(0xc0000374)。
+        let inner: Arc<dyn UdpIo> = inner.into();
         let rx: Arc<parking_lot::Mutex<std::collections::VecDeque<Vec<u8>>>> =
             Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new()));
         let notify = Arc::new(tokio::sync::Notify::new());

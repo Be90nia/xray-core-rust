@@ -130,6 +130,7 @@ impl TcpHubListener {
                                 },
                                 None => conn,
                             };
+                            (self.add_conn)(conn);
                         }
                         Err(e) => {
                             let err_str = e.to_string();

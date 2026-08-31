@@ -12,21 +12,20 @@
 //! - 每个 `UdpRelay` 绑定一次入站连接（连接级生命周期）。
 //! - `send_to(dest, payload, resp_tx)` 懒创建连接到 `dest` 的 UDP socket，并 spawn
 //!   reader + idle timer task。
-//! - 每个 session 配一个 [`xray_common::signal::ActivityTimer`]（Go
-//!   `CancelAfterInactivity` 等价，默认 60s）；reader 收到包 / `send_to` 重发均刷新；
-//!   超时后 timer task 中止 reader 并从 map 移除该项（防 socket 泄漏）。
+//! - 每 session 维护 `last_refresh` 时间戳（Go `CancelAfterInactivity` 等价，默认
+//!   60s）；reader 收到包 / `send_to` 重发均刷新；timer task 滑动检查超时后中止
+//!   reader 并从 map 移除该项（防 socket 泄漏）。
 //! - 连接结束时调用 [`UdpRelay::close`] 中止所有 reader / timer task。
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
-use xray_common::signal::ActivityTimer;
 
 /// UDP 接收缓冲（单包最大 64 KiB）。
 const RECV_BUF: usize = 65_535;
@@ -41,7 +40,7 @@ struct Session {
     sock: Arc<UdpSocket>,
     reader: JoinHandle<()>,
     timer: JoinHandle<()>,
-    activity: Arc<ActivityTimer>,
+    last_refresh: Arc<parking_lot::Mutex<Instant>>,
 }
 
 /// 连接级 UDP 中继：为每个目标地址维护一个 UDP socket。
@@ -89,7 +88,7 @@ impl UdpRelay {
         let sock = {
             let mut sessions = self.sessions.lock().await;
             if let Some(s) = sessions.get(&dest) {
-                s.activity.update_activity();
+                *s.last_refresh.lock() = Instant::now();
                 Arc::clone(&s.sock)
             } else {
                 let bind_addr: &str = match dest {
@@ -99,12 +98,14 @@ impl UdpRelay {
                 let sock = UdpSocket::bind(bind_addr).await?;
                 sock.connect(dest).await?;
                 let sock = Arc::new(sock);
-                let (reader, timer, activity) = spawn_session(
+                let last_refresh = Arc::new(parking_lot::Mutex::new(Instant::now()));
+                let (reader, timer) = spawn_session(
                     Arc::clone(&sock),
                     dest,
                     resp_tx,
                     Weak::clone(&self.self_weak),
                     self.idle_timeout,
+                    Arc::clone(&last_refresh),
                 );
                 sessions.insert(
                     dest,
@@ -112,7 +113,7 @@ impl UdpRelay {
                         sock: Arc::clone(&sock),
                         reader,
                         timer,
-                        activity,
+                        last_refresh,
                     },
                 );
                 sock
@@ -128,9 +129,7 @@ impl UdpRelay {
     pub async fn close(&self) {
         let mut sessions = self.sessions.lock().await;
         for (_, s) in sessions.drain() {
-            // 先 cancel activity（让 timer task 立即退出），再 abort reader /
-            // timer handle 兜底（防止 task 卡在别的 .await 上）。
-            s.activity.cancel();
+            // timer/reader task 直接 abort 兜底（task 卡在 recv/sleep 上立即回收）。
             s.reader.abort();
             s.timer.abort();
         }
@@ -155,66 +154,54 @@ impl UdpRelay {
 
 /// 每个 socket 的回包 reader + 空闲计时器。
 ///
-/// - reader: `recv → channel`，socket 出错 / activity cancelled 时退出。
-/// - timer: `ActivityTimer::run`；超时后升级 `Weak<UdpRelay>` 移除本 session，
-///   并 `abort()` reader 让其本地 `Arc<UdpSocket>` 立即 drop（关闭 socket）。
+/// - reader: `recv → channel`，socket 出错 / 被 abort 时退出；每次成功 recv 刷新
+///   `last_refresh` 时间戳。
+/// - timer: 滑动 idle 检查——睡到「上次刷新 + idle_timeout」，醒来后复查时间戳，
+///   有新刷新则继续睡；真超时后回收：升级 `Weak<UdpRelay>` 移除本 session 并
+///   `abort()` reader 让其本地 `Arc<UdpSocket>` 立即 drop（关闭 socket）。
+///
+/// ponytail: 纯时间戳排序，无唤醒通道——刷新写入先于 timer 判定读取即生效；
+/// 判定读取之后到达的刷新存在微秒级误杀窗口（Go timer.Stop 同类 race），实测无害。
 fn spawn_session(
     sock: Arc<UdpSocket>,
     dest: SocketAddr,
     resp_tx: mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>,
     relay: Weak<UdpRelay>,
     idle_timeout: Duration,
-) -> (JoinHandle<()>, JoinHandle<()>, Arc<ActivityTimer>) {
-    let activity = Arc::new(ActivityTimer::new(idle_timeout));
-    let activity_for_reader = Arc::clone(&activity);
-    let activity_for_timer = Arc::clone(&activity);
-    // timer 用 sock 的 clone 做 ptr_eq 比对；reader 独占 sock 的 recv。
+    last_refresh: Arc<parking_lot::Mutex<Instant>>,
+) -> (JoinHandle<()>, JoinHandle<()>) {
+    let last_refresh_for_reader = Arc::clone(&last_refresh);
     let sock_for_timer = Arc::clone(&sock);
 
-    // reader: 持续 recv，recv 出错 → 退出；每次成功 recv 刷新 activity。
-    // reader 退出时不主动改 map——交给 timer task 统一回收（避免 reader 与 timer
-    // 并发删除）。
+    // reader: 持续 recv，recv 出错 → 退出；每次成功 recv 刷新 last_refresh。
+    // reader 退出时不主动改 map——交给 timer task 统一回收（避免并发删除）。
     let reader = tokio::spawn(async move {
         let mut buf = vec![0u8; RECV_BUF];
-        let mut done = activity_for_reader.done();
         loop {
-            tokio::select! {
-                res = sock.recv(&mut buf) => {
-                    match res {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            activity_for_reader.update_activity();
-                            if resp_tx.send((dest, buf[..n].to_vec())).is_err() {
-                                break; // 调用方已停止接收
-                            }
-                        }
+            match sock.recv(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    *last_refresh_for_reader.lock() = Instant::now();
+                    if resp_tx.send((dest, buf[..n].to_vec())).is_err() {
+                        break; // 调用方已停止接收
                     }
-                }
-                _ = done.wait() => {
-                    // timer 已 cancel（超时 / close），reader 退出
-                    break;
                 }
             }
         }
     });
 
-    // timer: 阻塞到超时 / cancel。run() 返回后（无论是 timeout 还是 close 触发的
-    // cancel）：统一回收——升级 weak → 锁 map → 若 entry 仍是本 sock 则
-    // `abort reader` + 移除项。abort reader 让 reader 任务内本地 sock Arc 立即
-    // drop（关闭 socket）。`Arc::ptr_eq` 防 close→新建同名 dest 后被旧 timer 误删。
+    // timer: 睡到「上次刷新 + idle_timeout」，醒来复查时间戳——期间有刷新则重算
+    // 继续睡；真超时后统一回收：升级 weak → 锁 map → 若 entry 仍是本 sock 则移除
+    // + `abort reader`（reader 任务内本地 sock Arc 立即 drop，关闭 socket）。
+    // `Arc::ptr_eq` 防 close→新建同名 dest 后被旧 timer 误删（移除前 ptr 比对）。
     let timer = tokio::spawn(async move {
-        // 单独 timer 拥有 `activity_for_timer` 的独占所有权用于 run()。
-        let unique = match Arc::try_unwrap(activity_for_timer) {
-            Ok(t) => t,
-            Err(arc) => {
-                // 极端 fallback：reader 还持 activity 的引用 → 用 0 超时让
-                // run() 立即返回。后续回收逻辑统一执行。
-                drop(arc);
-                ActivityTimer::new(Duration::ZERO)
+        loop {
+            let since = last_refresh.lock().elapsed();
+            if since >= idle_timeout {
+                break;
             }
-        };
-        let mut timer = unique;
-        timer.run().await;
+            tokio::time::sleep(idle_timeout - since).await;
+        }
         if let Some(relay) = relay.upgrade() {
             let mut sessions = relay.sessions.lock().await;
             // 仅当 entry 仍是本 session 的 sock 时才回收——防 close→新建同名
@@ -232,7 +219,7 @@ fn spawn_session(
         }
     });
 
-    (reader, timer, activity)
+    (reader, timer)
 }
 
 #[cfg(test)]
