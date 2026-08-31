@@ -92,6 +92,30 @@ impl Client {
         stream.flush().await?;
         Ok(stream)
     }
+
+    /// [`Self::dial_target`] + 标记流为「读 Go 风格 server response」模式。
+    ///
+    /// 生产 outbound proxy 路径用（dispatcher / [`crate::dispatcher::SsConnection`]）：
+    /// SS TCP proxy 协议 server 在 response 开头发**新**随机 IV（Go `WriteTCPResponse`
+    /// 行196-202），client 必须先读 IV 并用它派生新 aead 才能解密 response chunks。
+    ///
+    /// IV 读取是 **lazy** 的（第一次 `read_chunk` 时执行）：server 只在拿到 target
+    /// 响应数据后才写 IV，若 dial 后同步读 IV 会与「server 等 client body」互等死锁。
+    ///
+    /// `dial_target` 本身不标记（用于 inbound server 测试场景——Rust inbound server
+    /// 不写 IV header，那个上下文读 response 无需 rekey）。
+    ///
+    /// # Errors
+    /// - 透传 [`Self::dial_target`] 错误。
+    pub async fn dial_target_for_proxy(
+        &self,
+        target_addr: &Address,
+        target_port: u16,
+    ) -> Result<SSStream<TcpStream>> {
+        let mut stream = self.dial_target(target_addr, target_port).await?;
+        stream.mark_response_rekey(self.account.clone());
+        Ok(stream)
+    }
 }
 
 #[cfg(test)]

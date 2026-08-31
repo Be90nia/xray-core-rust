@@ -26,6 +26,9 @@ pub struct SSStream<C> {
     aead: Box<dyn xray_crypto::aead::AeadCipher + Send + Sync>,
     nonce: Vec<u8>,
     tag_size: usize,
+    /// 非空 = 下次 `read_chunk` 前先读 server response 的新 IV 并 rekey aead
+    /// （Go `WriteTCPResponse` 模式）。见 [`Client::dial_target_for_proxy`]。
+    response_rekey: Option<MemoryAccount>,
 }
 
 impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
@@ -45,6 +48,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             aead,
             nonce: initial_nonce,
             tag_size,
+            response_rekey: None,
         })
     }
 
@@ -93,6 +97,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             aead,
             nonce: vec![0xFFu8; nonce_size],
             tag_size,
+            response_rekey: None,
         }
     }
 
@@ -192,7 +197,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         initial_nonce: Vec<u8>,
     ) -> Self {
         let tag_size = aead.tag_size();
-        Self { inner, aead, nonce: initial_nonce, tag_size }
+        Self { inner, aead, nonce: initial_nonce, tag_size, response_rekey: None }
     }
 
     /// 读一个 SS chunk，返回 plaintext。
@@ -203,6 +208,13 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
     /// - [`SsError::AeadOpen`]：AEAD 解密失败（tag 不匹配 / 数据损坏）。
     /// - [`SsError::Io`]：底层读失败（含 UnexpectedEof）。
     pub async fn read_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+        // lazy rekey：Go server response 以新 IV 开头（`WriteTCPResponse`），且只在
+        // server 有响应数据时才发出。dial 后立即读 IV 会与「server 等 client body、
+        // client 等 server IV」互等死锁，故延迟到第一次 read_chunk 时读取。
+        if let Some(account) = self.response_rekey.take() {
+            self.rekey_for_response(&account).await?;
+        }
+
         // 读 size chunk（2 + tag_size = 18B for AES-GCM/ChaCha20）
         let size_wire_len = 2 + self.tag_size;
         let mut size_buf = vec![0u8; size_wire_len];
@@ -274,6 +286,40 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
     #[must_use]
     pub fn into_inner(self) -> C {
         self.inner
+    }
+
+    /// 标记流为「读 Go 风格 server response」：第一次 `read_chunk` 前先读 IV 并 rekey。
+    ///
+    /// 对应 [`Client::dial_target_for_proxy`] 的 lazy rekey 模式。
+    pub fn mark_response_rekey(&mut self, account: MemoryAccount) {
+        self.response_rekey = Some(account);
+    }
+
+    /// 读 server response 的 IV + 用新 IV 派生新 aead + 重置 nonce 到 `[0xFF;n]`。
+    ///
+    /// 对应 Go `proxy/shadowsocks/protocol.go::ReadTCPResponse`（行165-189）：
+    /// server 在 TCP response 开头写**新**随机 IV（行196-202 `WriteTCPResponse`），
+    /// client 必须先读这个 IV，再用它派生 aead（HKDF-SHA1 subkey）才能解密
+    /// 后续 size/payload chunks。读完后 nonce 计数器回到 `[0xFF;n]`，下一次
+    /// `read_chunk` 第一次 increment → `[0;n]`（response 首帧 size）。
+    ///
+    /// # Errors
+    /// - [`SsError::Io`]：底层读 IV 失败。
+    /// - 透传 AEAD 派生错误。
+    pub async fn rekey_for_response(&mut self, account: &MemoryAccount) -> Result<()> {
+        let iv_size = account.cipher.iv_size() as usize;
+        let mut iv = vec![0u8; iv_size];
+        self.inner.read_exact(&mut iv).await?;
+        let aead = account
+            .cipher
+            .create_aead(&account.key, &iv)?
+            .ok_or(SsError::UnsupportedCipher)?;
+        let tag_size = aead.tag_size();
+        let nonce_size = aead.nonce_size();
+        self.aead = aead;
+        self.tag_size = tag_size;
+        self.nonce = vec![0xFFu8; nonce_size];
+        Ok(())
     }
 }
 
@@ -521,4 +567,104 @@ mod tests {
         assert_eq!(stream.nonce[1], 1);
         assert_eq!(stream.nonce[2..], vec![0u8; 10]);
     }
+
+    /// 模拟 Go `WriteTCPResponse`：server 生成新 IV 并写入 wire，后跟加密 chunks。
+    /// 对应 Go `proxy/shadowsocks/protocol.go::WriteTCPResponse` (行191-205) + `auth.go::seal`。
+    ///
+    /// 写入 `[新 IV (iv_size 字节)][size_chunk (2+tag)][payload_chunk (plain_len+tag)]`。
+    async fn write_go_style_response(
+        writer: &'_ mut tokio::io::DuplexStream,
+        account: &MemoryAccount,
+        plaintext: &[u8],
+    ) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let iv_size = account.cipher.iv_size() as usize;
+        let new_iv: Vec<u8> = (0..iv_size).map(|_| rand::random()).collect();
+        writer.write_all(&new_iv).await?;
+
+        let aead = account
+            .cipher
+            .create_aead(&account.key, &new_iv)
+            .expect("aead")
+            .expect("aead");
+        let tag_size = aead.tag_size();
+
+        // nonce: [0xFF;n] increment → [0;n] (size)
+        let mut nonce = vec![0xFFu8; aead.nonce_size()];
+        for b in &mut nonce {
+            *b = b.wrapping_add(1);
+            if *b != 0 { break; }
+        }
+        let plain_size = u16::try_from(plaintext.len()).unwrap();
+        let sealed_size = aead.seal(&nonce, &[], &plain_size.to_be_bytes()).unwrap();
+        writer.write_all(&sealed_size).await?;
+
+        // nonce increment → [1, 0, ...] (payload)
+        for b in &mut nonce {
+            *b = b.wrapping_add(1);
+            if *b != 0 { break; }
+        }
+        let sealed_payload = aead.seal(&nonce, &[], plaintext).unwrap();
+        writer.write_all(&sealed_payload).await?;
+        writer.flush().await?;
+        let _ = tag_size; // suppress unused if branches
+        Ok(())
+    }
+
+    /// **RED 失败测试**：模拟 Go server→client wire (IV + chunk)，
+    /// 验证 client 必须 rekey 后才能解密 server response。
+    ///
+    /// Root cause: Go `ReadTCPResponse` (proxy/shadowsocks/protocol.go:165-189)
+    /// 读 IV + 用 IV 派生新 aead + 起始 nonce `[0xFF;n]`。Rust `SSStream` 当前
+    /// 直接 read size chunk，没读 IV — wire format 不兼容。
+    #[tokio::test]
+    async fn read_chunk_after_rekey_decrypts_go_style_response() {
+        let account = make_account(CipherType::Aes128Gcm, "interop-ss-password");
+        let iv = random_iv(&account);
+
+        let (client_half, mut server_half) = duplex(8 * 1024);
+        // client: write first frame (addr+port) 占位
+        let mut client = SSStream::new_client(client_half, &account, &iv).expect("client");
+        let header = vec![0x01u8, 127, 0, 0, 1, 0, 80];
+        client.write_chunk(&header).await.expect("write header");
+        client.flush().await.expect("flush header");
+
+        // 模拟 Go server：写 response (IV + chunk) 到 server_half → client_half 读
+        let payload = b"hello ss interop test!";
+        write_go_style_response(&mut server_half, &account, payload).await.expect("write resp");
+
+        // **修复点**：client 必须先 rekey (读 IV + 派生新 aead + 重置 nonce)
+        // 后才能 read_chunk 解密 server response。
+        client.rekey_for_response(&account).await.expect("rekey");
+
+        let got = client.read_chunk().await.expect("read_chunk");
+        let got = got.expect("non-empty chunk");
+        assert_eq!(got, payload, "decrypted response should match original payload");
+    }
+
+    /// **辅助**：多个 cipher 的 wire compat sanity（防止 AES-128 修好后 ChaCha/AES-256 又坏）。
+    #[tokio::test]
+    async fn read_response_rekey_all_ciphers() {
+        for ct in [
+            CipherType::Aes128Gcm,
+            CipherType::Aes256Gcm,
+            CipherType::ChaCha20Poly1305,
+        ] {
+            let account = make_account(ct, "interop-ss-password");
+            let iv = random_iv(&account);
+
+            let (client_half, mut server_half) = duplex(8 * 1024);
+            let mut client = SSStream::new_client(client_half, &account, &iv).expect("client");
+            client.write_chunk(&[0x01, 127, 0, 0, 1, 0, 80]).await.expect("write");
+            client.flush().await.expect("flush");
+
+            write_go_style_response(&mut server_half, &account, b"PING").await.expect("write resp");
+            client.rekey_for_response(&account).await.expect("rekey");
+
+            let got = client.read_chunk().await.expect("read").expect("non-empty");
+            assert_eq!(got, b"PING", "{:?}: roundtrip mismatch", ct);
+        }
+    }
 }
+
+

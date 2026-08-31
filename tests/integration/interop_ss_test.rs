@@ -86,7 +86,6 @@ async fn run_go_ss_server_rust_client(
 
     // Rust SS client: connect to Go server, send data, verify echo
     let result = rust_ss_client_connect(ct, ss_port, echo_port).await;
-
     // Cleanup
     let _ = go_proc.kill().await;
     let _ = std::fs::remove_file(&config_path);
@@ -105,7 +104,7 @@ async fn rust_ss_client_connect(
 
     let target_addr = Address::ipv4(std::net::Ipv4Addr::LOCALHOST);
     let mut ss_stream = client
-        .dial_target(&target_addr, echo_port)
+        .dial_target_for_proxy(&target_addr, echo_port)
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
@@ -213,7 +212,7 @@ async fn go_ss_proxy_rust_client_aes128gcm_http() {
 
     let result = async {
         let mut ss_stream = client
-            .dial_target(&target_addr, echo_port)
+            .dial_target_for_proxy(&target_addr, echo_port)
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 

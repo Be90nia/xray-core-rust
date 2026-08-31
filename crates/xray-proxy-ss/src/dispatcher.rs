@@ -403,7 +403,7 @@ pub fn make_ss_dial_fn(config: Arc<SsOutboundConfig>) -> DialFn {
                     } else {
                         let client = Client::new(config.account.clone(), host, config.server_port);
                         client
-                            .dial_target(&target_addr, target_port)
+                            .dial_target_for_proxy(&target_addr, target_port)
                             .await
                             .map_err(|e| format!("ss dial: {e}"))?
                     };
