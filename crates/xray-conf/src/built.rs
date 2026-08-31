@@ -119,6 +119,14 @@ impl Config {
     ///   PrintRemovedFeatureError）或顶层 `reverse` 字段（`xray.go:569-571`）。
     /// - [`ConfError::Build`]：JSON 字段序列化失败（极少见，因字段已成功解析）。
     pub fn build(&self) -> Result<BuiltConfig> {
+        // Go xray.go:532-536：Build 第一步注入 env，先于后续 env:VAR 值展开。
+        // SAFETY: build_config 在进程启动早期、工作线程/异步 runtime 创建之前
+        // 单次调用，与 Go os.Setenv（xray.go:534）语义对齐；无并发 env 访问窗口。
+        if let Some(env) = &self.env {
+            for (key, value) in env {
+                unsafe { std::env::set_var(key, value) };
+            }
+        }
         if self.uses_deprecated_transport() {
             // Go infra/conf/xray.go:624-626：Global transport config 已移除。
             return Err(ConfError::Removed {
@@ -324,6 +332,8 @@ fn normalize_outbound_proxy(
 mod tests {
     use super::*;
 
+    static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     const MINIMAL_CONFIG: &str = r#"{
         "inbounds": [
             {
@@ -343,6 +353,23 @@ mod tests {
         "routing": { "rules": [] },
         "log": { "loglevel": "warning" }
     }"#;
+
+    #[test]
+    fn build_injects_env_vars() {
+        // Go xray.go:532-536：Build 第一步把 env 逐 key os.Setenv 注入进程环境，
+        // 使后续 env:VAR 值展开（PostProcessConfigureFile）能读到配置注入的变量。
+        let _g = ENV_LOCK.lock();
+        let probe = "XRAY_CONF_BUILD_ENV_PROBE";
+        unsafe { std::env::remove_var(probe) };
+
+        let cfg =
+            Config::from_json_str(r#"{ "env": { "XRAY_CONF_BUILD_ENV_PROBE": "injected" } }"#)
+                .unwrap();
+        cfg.build().expect("build must succeed");
+
+        assert_eq!(std::env::var(probe).as_deref(), Ok("injected"));
+        unsafe { std::env::remove_var(probe) };
+    }
 
     #[test]
     fn build_minimal_config_counts() {

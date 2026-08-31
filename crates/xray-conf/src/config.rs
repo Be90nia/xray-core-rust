@@ -81,6 +81,11 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport: Option<HashMap<String, Value>>,
 
+    /// 环境变量注入配置，对应 Go `EnvConfig`（xray.go:383）。
+    /// Build 时逐 key 注入进程环境（xray.go:532-536），供 `env:VAR` 值展开使用。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<HashMap<String, String>>,
+
     /// 入站配置列表。JSON tag 为 `"inbounds"`。
     #[serde(rename = "inbounds")]
     pub inbound_configs: Vec<InboundDetourConfig>,
@@ -388,5 +393,20 @@ mod tests {
         assert!(!serialized.is_empty());
         assert!(serialized.contains("vless"));
         assert!(serialized.contains("freedom"));
+    }
+    #[test]
+    fn env_parses_from_json() {
+        // Go EnvConfig = map[string]string（xray.go:383），顶层 json tag "env"（:396）。
+        let cfg = Config::from_json_str(
+            r#"{ "env": { "XRAY_ENV_A": "1", "XRAY_ENV_B": "x y" } }"#,
+        )
+        .unwrap();
+        let env = cfg.env.expect("env must parse");
+        assert_eq!(env.get("XRAY_ENV_A").map(String::as_str), Some("1"));
+        assert_eq!(env.get("XRAY_ENV_B").map(String::as_str), Some("x y"));
+
+        // 缺省：None。
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.env.is_none());
     }
 }

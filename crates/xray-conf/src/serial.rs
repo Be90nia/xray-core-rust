@@ -93,6 +93,13 @@ impl Config {
             self.geodata = other.geodata;
         }
 
+        // env：key 级合并而非整体替换（xray.go:452-457 EnvConfig.Override）。
+        if let Some(oenv) = other.env {
+            self.env
+                .get_or_insert_with(std::collections::HashMap::new)
+                .extend(oenv);
+        }
+
         // inbound：tag 命中替换，否则追加（xray.go:462-474）。
         if !other.inbound_configs.is_empty() {
             for ib in other.inbound_configs {
@@ -306,6 +313,38 @@ mod tests {
         base.override_with(tail, "99_zz_tail.json");
         let tags: Vec<&str> = base.outbound_configs.iter().map(|o| o.tag.as_str()).collect();
         assert_eq!(tags, vec!["proxy", "direct", "tail-ob"]);
+    }
+
+    #[test]
+    fn override_env_merges_by_key() {
+        // Go xray.go:452-457：env 是 key 级合并而非整体替换；o.Env == nil 时保留 base。
+        let mut base = Config::from_json_str(r#"{ "env": { "A": "1", "B": "2" } }"#).unwrap();
+        let other = Config::from_json_str(r#"{ "env": { "B": "3", "C": "4" } }"#).unwrap();
+
+        base.override_with(other, "second.json");
+
+        let env = base.env.as_ref().unwrap();
+        assert_eq!(env.get("A").map(String::as_str), Some("1")); // base 独有保留
+        assert_eq!(env.get("B").map(String::as_str), Some("3")); // override 赢
+        assert_eq!(env.get("C").map(String::as_str), Some("4")); // override 独有并入
+
+        // override 无 env：base 原样保留。
+        let mut base = Config::from_json_str(r#"{ "env": { "A": "1" } }"#).unwrap();
+        let other = Config::from_json_str("{}").unwrap();
+        base.override_with(other, "third.json");
+        assert_eq!(
+            base.env.as_ref().unwrap().get("A").map(String::as_str),
+            Some("1")
+        );
+
+        // base 无 env、override 有：采用 override。
+        let mut base = Config::from_json_str("{}").unwrap();
+        let other = Config::from_json_str(r#"{ "env": { "D": "5" } }"#).unwrap();
+        base.override_with(other, "fourth.json");
+        assert_eq!(
+            base.env.as_ref().unwrap().get("D").map(String::as_str),
+            Some("5")
+        );
     }
 
     // ----- to_json_value / to_json_string -----
