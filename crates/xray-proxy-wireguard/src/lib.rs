@@ -33,6 +33,7 @@ pub mod peer;
 pub mod tunnel;
 pub mod wireguard;
 pub mod dispatcher;
+pub mod users;
 
 // 顶层 re-export。
 pub use config::{DeviceConfig, DomainStrategy, PeerConfig};
@@ -45,3 +46,4 @@ pub use peer::{PeerSession, SharedPeer};
 pub use tunnel::{Output as TunnelOutput, Tunnel};
 pub use wireguard::{ParsedEndpoints, create_ipc_request, parse_endpoints, SERVER_LISTEN_PORT_PLACEHOLDER};
 pub use dispatcher::make_wireguard_dial_fn;
+pub use users::{WgUser, WgUserRegistry};

@@ -41,6 +41,7 @@ use crate::driver::{bind_udp_socket, WgDriver};
 use crate::error::Result;
 use crate::netstack::WgNetStack;
 use crate::peer::shared_peer;
+use crate::users::{DriverSlot, WgUserRegistry};
 
 /// duplex 缓冲大小。
 const DUPLEX_BUF: usize = 64 * 1024;
@@ -58,14 +59,16 @@ pub struct WireguardInboundHandler {
     tag: String,
     port: u16,
     started: AtomicBool,
-    /// driver 句柄——start() 后消费。
-    driver: ParkMutex<Option<Arc<WgDriver>>>,
+    /// driver 句柄槽——start() 后消费；与 registry 共享（动态热插）。
+    driver: DriverSlot,
     /// join handle——close() 用以终止 task。
     join: ParkMutex<Option<JoinHandle<()>>>,
     /// smoltcp 网栈句柄（与 driver 共享）。
     netstack: Arc<AsyncMutex<WgNetStack>>,
     /// dispatcher handler（TCP accept 后桥接到 outbound）。
     dispatch: Arc<dyn DispatchHandler>,
+    /// 动态用户注册表（AddUser/RemoveUser，Go `users sync.Map` 等价物）。
+    registry: WgUserRegistry,
 }
 
 impl WireguardInboundHandler {
@@ -104,6 +107,10 @@ impl WireguardInboundHandler {
             allowed_cidrs.push(cidrs);
         }
 
+        // 动态用户注册表（同 driver 槽 Arc 共享，AddUser/RemoveUser 热插）
+        let driver_slot: DriverSlot = Arc::new(ParkMutex::new(None));
+        let registry = WgUserRegistry::new(config.clone(), Arc::clone(&driver_slot))?;
+
         // 绑定监听 UDP
         let bind_addr = format!("0.0.0.0:{listen_port}");
         let sock = bind_udp_socket(&bind_addr).await?;
@@ -117,12 +124,15 @@ impl WireguardInboundHandler {
             WgDriver::new_multi(peers, allowed_cidrs, sock, Arc::clone(&netstack))
                 .with_num_workers(config.num_workers),
         );
+        // driver 注入槽——此后 AddUser 可用（Go "too early" 边界与此对应）
+        *driver_slot.lock() = Some(driver);
 
         Ok(Self {
             tag,
             port: listen_port,
             started: AtomicBool::new(false),
-            driver: ParkMutex::new(Some(driver)),
+            driver: driver_slot,
+            registry,
             join: ParkMutex::new(None),
             netstack,
             dispatch,
@@ -134,19 +144,19 @@ impl WireguardInboundHandler {
     pub fn netstack(&self) -> &Arc<AsyncMutex<WgNetStack>> {
         &self.netstack
     }
-}
 
-#[async_trait]
-impl InboundHandler for WireguardInboundHandler {
-    fn tag(&self) -> &str {
-        &self.tag
+    /// 动态用户注册表句柄（原生 AddUser/RemoveUser 入口）。
+    #[must_use]
+    pub fn user_registry(&self) -> &WgUserRegistry {
+        &self.registry
     }
 
-    /// 启动 driver task + accept loop。
+    /// 同步启动核心——proxyman 适配器复用（PinFuture 要求 'static，逻辑不借 self 跨 await）。
     ///
-    /// driver（WG 协议 + netstack poll）与 accept loop（TCP accept 检测 + dispatch）
-    /// 在同一 tokio task 内通过 `select!` 并发运行，共享 netstack AsyncMutex。
-    async fn start(&self) -> std::result::Result<(), InboundError> {
+    /// # Errors
+    /// - [`InboundError::AlreadyStarted`]：重复启动。
+    /// - [`InboundError::Closed`]：driver 槽为空。
+    pub(crate) fn do_start(&self) -> std::result::Result<(), InboundError> {
         if self.started.swap(true, Ordering::SeqCst) {
             return Err(InboundError::AlreadyStarted(self.tag.clone()));
         }
@@ -171,14 +181,34 @@ impl InboundHandler for WireguardInboundHandler {
         Ok(())
     }
 
-    /// 关闭 driver task + accept loop。
-    async fn close(&self) -> std::result::Result<(), InboundError> {
+    /// 同步关闭核心——proxyman 适配器复用。
+    pub(crate) fn do_close(&self) -> std::result::Result<(), InboundError> {
         self.started.store(false, Ordering::SeqCst);
         if let Some(handle) = self.join.lock().take() {
             handle.abort();
         }
         tracing::info!(tag = %self.tag, "wireguard inbound closed");
         Ok(())
+    }
+}
+
+#[async_trait]
+impl InboundHandler for WireguardInboundHandler {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    /// 启动 driver task + accept loop。
+    ///
+    /// driver（WG 协议 + netstack poll）与 accept loop（TCP accept 检测 + dispatch）
+    /// 在同一 tokio task 内通过 `select!` 并发运行，共享 netstack AsyncMutex。
+    async fn start(&self) -> std::result::Result<(), InboundError> {
+        Self::do_start(self)
+    }
+
+    /// 关闭 driver task + accept loop。
+    async fn close(&self) -> std::result::Result<(), InboundError> {
+        Self::do_close(self)
     }
 
     fn port(&self) -> u16 {

@@ -14,6 +14,7 @@ xray-transport = { path = "../xray-transport" }
 xray-xudp = { path = "../xray-xudp" }
 xray-app-dns = { path = "../xray-app-dns" }
 xray-buf = { path = "../xray-buf" }
+xray-app-proxyman = { path = "../xray-app-proxyman" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

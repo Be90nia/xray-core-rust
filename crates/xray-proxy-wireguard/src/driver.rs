@@ -33,7 +33,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
@@ -225,14 +225,24 @@ fn dest_socket_addr(dest: &Destination) -> SocketAddr {
     SocketAddr::new(ip, dest.port().value())
 }
 
+/// 动态 peer 表：peer 会话 + 每 peer allowed_ips 路由（Go `device.peers` 合并视图）。
+///
+/// AddUser/RemoveUser 运行时热插在此表完成；读多写少用 [`parking_lot::RwLock`]。
+/// peers 与 allowed_cidrs 同锁保护，保证路由视图与会话列表原子一致。
+#[derive(Default)]
+struct PeerTable {
+    peers: Vec<SharedPeer>,
+    allowed_cidrs: Vec<Vec<smoltcp::wire::IpCidr>>,
+}
+
 /// WireGuard driver——协调 UDP socket + Tunnel + netstack。
 ///
 /// 一个 driver 对应一个 peer + 一个 UdpSocket。
 /// 由 [`WireguardOutboundHandler`](crate::outbound::WireguardOutboundHandler) 或
 /// [`WireguardInboundHandler`](crate::inbound::WireguardInboundHandler) 创建并 spawn。
 pub struct WgDriver {
-    /// peer 会话列表（单 peer=client；多 peer=server multi-peer）。
-    peers: Vec<SharedPeer>,
+    /// 动态 peer 表（AddUser/RemoveUser 热插；Go `device.peers` 等价物）。
+    peer_table: RwLock<PeerTable>,
     /// UDP 传输——直连 socket 或经 system dialer 拨号（Go conn.Bind）。
     transport: WgTransport,
     /// smoltcp 网络栈。
@@ -241,8 +251,6 @@ pub struct WgDriver {
     remote: Mutex<Option<SocketAddr>>,
     /// server 模式 addr→peer index 路由缓存。
     addr_route: Mutex<HashMap<SocketAddr, usize>>,
-    /// 每 peer 的 allowed_ips CIDR（出站 IP 包路由）。
-    allowed_cidrs: Vec<Vec<smoltcp::wire::IpCidr>>,
     /// WG 包头 reserved 字段（Go `bind.go netBindClient.reserved`，Warp 用）。
     /// 长度 3 时发送路径写入包头 [1..4]。
     reserved: Mutex<Vec<u8>>,
@@ -291,8 +299,7 @@ impl WgDriver {
             d.set_queue_tx(tx.clone());
         }
         Self {
-            peers,
-            allowed_cidrs,
+            peer_table: RwLock::new(PeerTable { peers, allowed_cidrs }),
             transport,
             netstack,
             remote: Mutex::new(None),
@@ -309,6 +316,68 @@ impl WgDriver {
     pub fn with_num_workers(mut self, num_workers: i32) -> Self {
         self.num_workers = num_workers;
         self
+    }
+
+    /// 运行时热插 peer（对应 Go `dev.IpcSet("public_key=…\nreplace_allowed_ips=true\n…")`）。
+    ///
+    /// 同公钥已存在 → 原位替换（Go IpcSet replace 语义，幂等更新）；否则追加。
+    /// 热插使 addr→index 路由缓存失效（索引位移），整体清空。
+    pub fn add_peer(&self, peer: SharedPeer, cidrs: Vec<smoltcp::wire::IpCidr>) {
+        let pub_hex = peer.public_key_hex().to_string();
+        let mut table = self.peer_table.write();
+        match table
+            .peers
+            .iter()
+            .position(|p| p.public_key_hex().eq_ignore_ascii_case(&pub_hex))
+        {
+            Some(i) => {
+                table.peers[i] = peer;
+                table.allowed_cidrs[i] = cidrs;
+            }
+            None => {
+                table.peers.push(peer);
+                table.allowed_cidrs.push(cidrs);
+            }
+        }
+        drop(table);
+        self.addr_route.lock().clear();
+    }
+
+    /// 运行时移除 peer（对应 Go `dev.IpcSet("public_key=…\nremove=true\n")`）。
+    ///
+    /// 返回是否确实移除了一个 peer（Go 对不存在的 peer 静默忽略）。
+    pub fn remove_peer(&self, public_key_hex: &str) -> bool {
+        let mut table = self.peer_table.write();
+        let Some(i) = table
+            .peers
+            .iter()
+            .position(|p| p.public_key_hex().eq_ignore_ascii_case(public_key_hex))
+        else {
+            return false;
+        };
+        table.peers.remove(i);
+        table.allowed_cidrs.remove(i);
+        drop(table);
+        self.addr_route.lock().clear();
+        true
+    }
+
+    /// 当前 peer 数。
+    #[must_use]
+    pub fn peer_count(&self) -> usize {
+        self.peer_table.read().peers.len()
+    }
+
+    /// 多 peer 模式判定（实时读取——动态 AddUser/RemoveUser 后即时生效）。
+    #[must_use]
+    fn is_multi(&self) -> bool {
+        self.peer_count() > 1
+    }
+
+    /// 按 index 取 peer 快照（管理面 / 测试只读用）。
+    #[must_use]
+    pub fn peer(&self, idx: usize) -> Option<SharedPeer> {
+        self.peer_table.read().peers.get(idx).cloned()
     }
 
     /// 设置 WG 包头 reserved 字段（3 字节，Cloudflare Warp 客户端标记）。
@@ -336,7 +405,9 @@ impl WgDriver {
     /// 设置远端 endpoint（client 模式启动时）。
     pub fn set_remote(&self, addr: SocketAddr) {
         *self.remote.lock() = Some(addr);
-        self.peers[0].set_endpoint(addr);
+        if let Some(peer) = self.peer_table.read().peers.first() {
+            peer.set_endpoint(addr);
+        }
     }
 
     /// 尝试解封装入站包，返回 (peer_idx, outputs)。
@@ -344,40 +415,51 @@ impl WgDriver {
     /// 单 peer：直接解封装。
     /// 多 peer：先查 addr_route 缓存，miss 时遍历所有 peer。
     fn decapsulate_incoming(&self, data: &[u8], src: SocketAddr) -> Option<(usize, Vec<Output>)> {
-        if self.peers.len() == 1 {
-            self.peers[0].set_endpoint(src);
+        let table = self.peer_table.read();
+        if table.peers.len() == 1 {
+            table.peers[0].set_endpoint(src);
             *self.remote.lock() = Some(src);
-            self.peers[0].with_tunnel(|t| t.decapsulate(data)).ok().map(|outs| (0, outs))
-        } else {
-            // 查缓存
-            let cached = self.addr_route.lock().get(&src).copied();
-            if let Some(idx) = cached {
-                if idx < self.peers.len() {
-                    self.peers[idx].set_endpoint(src);
-                    if let Ok(outs) = self.peers[idx].with_tunnel(|t| t.decapsulate(data)) {
-                        if !outs.is_empty() {
-                            return Some((idx, outs));
-                        }
-                    }
-                }
-            }
-            // 遍历所有 peer（WG MAC 验证确保只有正确 peer 产生输出）
-            for (idx, peer) in self.peers.iter().enumerate() {
+            return table
+                .peers[0]
+                .with_tunnel(|t| t.decapsulate(data))
+                .ok()
+                .map(|outs| (0, outs));
+        }
+        // 查缓存
+        let cached = self.addr_route.lock().get(&src).copied();
+        if let Some(idx) = cached {
+            // 表可能已被 add/remove 热插改变——越界视为 miss
+            if let Some(peer) = table.peers.get(idx) {
                 peer.set_endpoint(src);
                 if let Ok(outs) = peer.with_tunnel(|t| t.decapsulate(data)) {
                     if !outs.is_empty() {
-                        self.addr_route.lock().insert(src, idx);
                         return Some((idx, outs));
                     }
                 }
             }
-            None
         }
+        // 遍历所有 peer（WG MAC 验证确保只有正确 peer 产生输出）
+        let mut matched: Option<(usize, Vec<Output>)> = None;
+        for (idx, peer) in table.peers.iter().enumerate() {
+            peer.set_endpoint(src);
+            if let Ok(outs) = peer.with_tunnel(|t| t.decapsulate(data)) {
+                if !outs.is_empty() {
+                    matched = Some((idx, outs));
+                    break;
+                }
+            }
+        }
+        if let Some((idx, outs)) = matched {
+            drop(table);
+            self.addr_route.lock().insert(src, idx);
+            return Some((idx, outs));
+        }
+        None
     }
 
     /// 根据出站 IP 包目的地址路由到正确 peer。
     fn route_outgoing(&self, ip_pkt: &[u8]) -> usize {
-        if self.peers.len() == 1 {
+        if self.peer_count() == 1 {
             return 0;
         }
         let dest = match ip_pkt.first() {
@@ -400,7 +482,7 @@ impl WgDriver {
             }
             _ => return 0,
         };
-        for (idx, cidrs) in self.allowed_cidrs.iter().enumerate() {
+        for (idx, cidrs) in self.peer_table.read().allowed_cidrs.iter().enumerate() {
             for cidr in cidrs {
                 if cidr.contains_addr(&dest) {
                     return idx;
@@ -446,9 +528,8 @@ impl WgDriver {
             }
         }
         let _shut = ShutGuard(shut_tx);
-        let multi = self.peers.len() > 1;
         tracing::debug!(
-            peer_count = self.peers.len(),
+            peer_count = self.peer_count(),
             workers = effective_workers(self.num_workers),
             "wg driver main loop started"
         );
@@ -477,29 +558,39 @@ impl WgDriver {
 
         let mut timer = interval(TIMER_INTERVAL);
         let mut last_keepalive = std::time::Instant::now();
-        let keepalive_interval = self.peers[0].with_tunnel(|t| t.keepalive_interval());
+        let keepalive_interval =
+            self.peer(0).and_then(|p| p.with_tunnel(|t| t.keepalive_interval()));
 
         loop {
             timer.tick().await;
-            for peer in &self.peers {
-                let timer_outputs = peer.with_tunnel(|t| t.update_timers());
-                if let Ok(outs) = timer_outputs {
-                    let ep = if multi { peer.endpoint() } else { *self.remote.lock() };
-                    if let Some(ep) = ep {
-                        for out in outs {
-                            if let Output::Network(mut wg) = out {
-                                self.send_wg(&mut wg, ep).await;
-                            }
+            let timer_batches: Vec<(Option<SocketAddr>, Vec<Output>)> = {
+                let table = self.peer_table.read();
+                let multi = table.peers.len() > 1;
+                table
+                    .peers
+                    .iter()
+                    .map(|peer| {
+                        let ep = if multi { peer.endpoint() } else { *self.remote.lock() };
+                        let outs = peer.with_tunnel(|t| t.update_timers()).unwrap_or_default();
+                        (ep, outs)
+                    })
+                    .collect()
+            };
+            for (ep, outs) in timer_batches {
+                if let Some(ep) = ep {
+                    for out in outs {
+                        if let Output::Network(mut wg) = out {
+                            self.send_wg(&mut wg, ep).await;
                         }
                     }
                 }
             }
-            if !multi {
+            if !self.is_multi() {
                 if let Some(interval_secs) = keepalive_interval {
                     if last_keepalive.elapsed().as_secs() >= u64::from(interval_secs) {
                         last_keepalive = std::time::Instant::now();
-                        let ka_outputs = self.peers[0].with_tunnel(|t| t.encapsulate(&[]));
-                        if let Ok(outs) = ka_outputs {
+                        let ka_outputs = self.peer(0).map(|p| p.with_tunnel(|t| t.encapsulate(&[])));
+                        if let Some(Ok(outs)) = ka_outputs {
                             let remote = *self.remote.lock();
                             if let Some(r) = remote {
                                 for out in outs {
@@ -520,16 +611,28 @@ impl WgDriver {
             if tx_pkts.is_empty() { continue; }
             for pkt in &tx_pkts {
                 let peer_idx = self.route_outgoing(pkt);
-                let endpoint = if multi { self.peers[peer_idx].endpoint() } else { *self.remote.lock() };
-                if endpoint.is_none() { continue; }
-                let enc_outputs = self.peers[peer_idx].with_tunnel(|t| t.encapsulate(pkt));
+                let encrypted = {
+                    let table = self.peer_table.read();
+                    let multi = table.peers.len() > 1;
+                    let endpoint = if multi {
+                        table.peers.get(peer_idx).and_then(|p| p.endpoint())
+                    } else {
+                        *self.remote.lock()
+                    };
+                    match endpoint {
+                        Some(ep) => table
+                            .peers
+                            .get(peer_idx)
+                            .map(|p| (ep, p.with_tunnel(|t| t.encapsulate(pkt)))),
+                        None => None,
+                    }
+                };
+                let Some((ep, enc_outputs)) = encrypted else { continue };
                 match enc_outputs {
                     Ok(outs) => {
-                        if let Some(ep) = endpoint {
-                            for out in outs {
-                                if let Output::Network(mut wg) = out {
-                                    self.send_wg(&mut wg, ep).await;
-                                }
+                        for out in outs {
+                            if let Output::Network(mut wg) = out {
+                                self.send_wg(&mut wg, ep).await;
                             }
                         }
                     }
@@ -547,7 +650,6 @@ impl WgDriver {
         rx: Arc<AsyncMutex<mpsc::Receiver<WgDatagram>>>,
         mut shut: watch::Receiver<bool>,
     ) {
-        let multi = self.peers.len() > 1;
         loop {
             let (pkt, src) = {
                 let mut guard = rx.lock().await;
@@ -564,12 +666,12 @@ impl WgDriver {
                 continue;
             };
             let mut stack = self.netstack.lock().await;
-            let peer_endpoint = self.peers[peer_idx].endpoint();
+            let peer_endpoint = self.peer(peer_idx).and_then(|p| p.endpoint());
             for out in outputs {
                 match out {
                     Output::Ip(ip) => stack.ingest_rx(ip),
                     Output::Network(mut wg) => {
-                        let target = if multi { peer_endpoint } else { *self.remote.lock() };
+                        let target = if self.is_multi() { peer_endpoint } else { *self.remote.lock() };
                         if let Some(t) = target {
                             self.send_wg(&mut wg, t).await;
                         }
@@ -642,6 +744,86 @@ mod tests {
             smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(o1, o2, o3, o4)),
             32,
         )
+    }
+
+    /// 构造多 peer driver（Dialed 假传输——本组测试不跑 main_loop，无需真实 socket）。
+    fn make_multi_driver(
+        peers: Vec<crate::peer::SharedPeer>,
+        cidrs: Vec<Vec<smoltcp::wire::IpCidr>>,
+    ) -> WgDriver {
+        let dest = Destination::new(
+            Address::from_ipv4_bytes([203, 0, 113, 1]),
+            Port::new(51820),
+            Network::UDP,
+        );
+        let dialer: DialFn = Arc::new(|_| Box::pin(async { Err("unused".to_string()) }));
+        let ns = Arc::new(AsyncMutex::new(WgNetStack::new(&[v4_cidr(10, 0, 0, 1)], 1420)));
+        WgDriver::with_transport(peers, cidrs, WgTransport::Dialed(Arc::new(DialedUdp::new(dialer, dest))), ns)
+    }
+
+    fn cidr_24(o1: u8, o2: u8, o3: u8) -> smoltcp::wire::IpCidr {
+        smoltcp::wire::IpCidr::new(
+            smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(o1, o2, o3, 0)),
+            24,
+        )
+    }
+
+    /// AddUser/RemoveUser 热插：追加翻转 is_multi、按公钥移除、重复移除 false。
+    #[test]
+    fn add_peer_then_remove_peer_updates_table() {
+        let (sec_s, pub_a) = make_keypair(0x22);
+        let (_, pub_b) = make_keypair(0x33);
+        let device = DeviceConfig { secret_key: sec_s, ..Default::default() };
+        let static_peer = shared_peer(
+            &device,
+            &PeerConfig { public_key: pub_a, allowed_ips: vec!["10.0.1.0/24".into()], ..Default::default() },
+            0,
+        )
+        .expect("static peer");
+        let driver = make_multi_driver(vec![static_peer], vec![vec![cidr_24(10, 0, 1)]]);
+        assert_eq!(driver.peer_count(), 1);
+        assert!(!driver.is_multi(), "单 peer 模式");
+
+        // AddUser：动态追加（Go dev.IpcSet add），is_multi 即时翻转
+        let dyn_session = shared_peer(
+            &device,
+            &PeerConfig { public_key: pub_b.clone(), allowed_ips: vec!["10.0.2.0/24".into()], ..Default::default() },
+            1,
+        )
+        .expect("dyn peer");
+        driver.add_peer(dyn_session, vec![cidr_24(10, 0, 2)]);
+        assert_eq!(driver.peer_count(), 2);
+        assert!(driver.is_multi(), "热插后多 peer 路由即时生效");
+
+        // RemoveUser（Go dev.IpcSet remove=true）
+        assert!(driver.remove_peer(&pub_b), "移除已存在 peer 返回 true");
+        assert_eq!(driver.peer_count(), 1);
+        assert!(!driver.remove_peer(&pub_b), "重复移除返回 false（Go 静默语义）");
+    }
+
+    /// 同公钥重复 AddUser = 原位替换（Go IpcSet replace_allowed_ips=true +
+    /// users.Store 幂等语义），公钥比较忽略大小写（Go 按 32 字节比较）。
+    #[test]
+    fn add_peer_same_public_key_replaces_in_place() {
+        let (sec_s, pub_a) = make_keypair(0x22);
+        let device = DeviceConfig { secret_key: sec_s, ..Default::default() };
+        let p1 = shared_peer(
+            &device,
+            &PeerConfig { public_key: pub_a.clone(), allowed_ips: vec!["10.0.1.0/24".into()], ..Default::default() },
+            0,
+        )
+        .expect("p1");
+        let driver = make_multi_driver(vec![p1], vec![vec![cidr_24(10, 0, 1)]]);
+
+        let p2 = shared_peer(
+            &device,
+            &PeerConfig { public_key: pub_a.to_uppercase(), allowed_ips: vec!["10.0.9.0/24".into()], ..Default::default() },
+            1,
+        )
+        .expect("p2");
+        driver.add_peer(p2, vec![cidr_24(10, 0, 9)]);
+        assert_eq!(driver.peer_count(), 1, "同公钥（忽略大小写）原位替换不追加");
+        assert_eq!(driver.peer(0).expect("peer").public_key_hex(), &pub_a.to_uppercase(), "会话已替换");
     }
 
     #[test]
@@ -785,14 +967,16 @@ mod tests {
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
-            if client.peers[0].is_online() && server.peers[0].is_online() {
+            if client.peer(0).is_some_and(|p| p.is_online())
+                && server.peer(0).is_some_and(|p| p.is_online())
+            {
                 break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
                 "handshake not completed within 10s (client online: {}, server online: {})",
-                client.peers[0].is_online(),
-                server.peers[0].is_online()
+                client.peer(0).is_some_and(|p| p.is_online()),
+                server.peer(0).is_some_and(|p| p.is_online())
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }

@@ -245,6 +245,19 @@ fn parse_public(hex_str: &str) -> Result<PublicKey> {
     Ok(PublicKey::from(arr))
 }
 
+/// 由本端私钥推导公钥 hex（对应 Go server.go NewServer 的 `curve25519.ScalarBaseMult`）。
+///
+/// [`crate::users::WgUserRegistry::add_user`] 的 "invalid public key" 自检用
+/// （Go server.go:144-146：禁止添加与本端公钥相同的 peer）。
+///
+/// # Errors
+///
+/// - [`WgError::InvalidConfig`]：私钥不是 64 hex 字符。
+pub fn public_key_from_secret(secret_hex: &str) -> Result<String> {
+    let secret = parse_secret(secret_hex)?;
+    Ok(hex::encode(PublicKey::from(&secret).as_bytes()))
+}
+
 fn parse_psk(hex_str: &str) -> Result<[u8; 32]> {
     hex_to_array_32(hex_str, "pre_shared_key")
 }

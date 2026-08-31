@@ -6480,6 +6480,7 @@ dependencies = [
  "tracing",
  "xray-app-dispatcher",
  "xray-app-dns",
+ "xray-app-proxyman",
  "xray-buf",
  "xray-common",
  "xray-features",
