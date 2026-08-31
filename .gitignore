@@ -44,21 +44,6 @@ coverage/
 .beads/proxieddb/
 *.gate.lock*
 
-# Batch11 temporary logs
-*.log
-btls_inject.log
-build_env.sh
-cargo_run.bat
-dice_test.log
-dns_baseline.log
-dns_test1.log
-dns_test2.log
-xc_check*.log
-xc_test*.log
 
-# Batch13 RC-A temporary
-build_reality.bat
-check_reality*.bat
-check_workspace.bat
-test_reality.bat
-tools/setup_boringssl_reality.py
+# Local logs
+*.log
