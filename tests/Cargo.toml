@@ -105,3 +105,4 @@ rand = "0.8"
 hex = "0.4"
 boringtun = { workspace = true }
 sha2 = "0.10"
+rustls = { workspace = true }

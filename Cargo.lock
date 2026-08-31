@@ -6064,6 +6064,7 @@ dependencies = [
  "futures",
  "hex",
  "rand 0.8.7",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
