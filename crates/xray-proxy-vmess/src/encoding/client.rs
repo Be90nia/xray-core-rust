@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use xray_common::bitmask::Bitmask;
 use xray_common::net::address::Address;
 use xray_common::protocol::{Command, RequestHeader, ResponseCommand, ResponseHeader, SecurityType, SwitchAccountCommand};
-use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead, NoOpAeadCipher};
+use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
@@ -186,9 +186,6 @@ impl ClientSession {
                 let key = generate_chacha20poly1305_key(&self.request_body_key);
                 Box::new(ChaCha20Poly1305Aead::new(&key)?)
             }
-            #[allow(deprecated)]
-            SecurityType::None | SecurityType::Zero => Box::new(NoOpAeadCipher),
-
             other => {
                 return Err(VmessError::Other(format!(
                     "encode_request_body: unsupported security {:?}",
@@ -371,8 +368,7 @@ impl ClientSession {
                 let key = generate_chacha20poly1305_key(&self.response_body_key);
                 Box::new(ChaCha20Poly1305Aead::new(&key)?)
             }
-            #[allow(deprecated)]
-            SecurityType::None | SecurityType::Zero => Box::new(NoOpAeadCipher),
+
 
             other => {
                 return Err(VmessError::Other(format!(
@@ -426,8 +422,7 @@ impl ClientSession {
                 let key = generate_chacha20poly1305_key(&self.request_body_key);
                 Box::new(ChaCha20Poly1305Aead::new(&key)?)
             }
-            #[allow(deprecated)]
-            SecurityType::None | SecurityType::Zero => Box::new(NoOpAeadCipher),
+
 
             other => {
                 return Err(VmessError::Other(format!(
@@ -523,8 +518,7 @@ impl ClientSession {
                 let key = generate_chacha20poly1305_key(&self.response_body_key);
                 Box::new(ChaCha20Poly1305Aead::new(&key)?)
             }
-            #[allow(deprecated)]
-            SecurityType::None | SecurityType::Zero => Box::new(NoOpAeadCipher),
+
 
             other => {
                 return Err(VmessError::Other(format!(

@@ -31,15 +31,16 @@ pub mod common;
 pub mod confloader;
 pub mod config;
 pub mod error;
+pub use error::ConfError;
 pub mod init;
 pub mod json;
 pub mod lint;
+pub mod outbound_security;
 pub mod protocols;
 pub mod serial;
 pub mod toml_config;
 pub mod vformat;
 pub mod yaml;
-
 pub use built::{BuiltConfig, BuiltEntry, BuiltInbound, BuiltOutbound};
  pub use common::{Address, Int32Range, Network, NetworkList, PortList, PortRange, StringList, User};
  pub use config::{Config, InboundDetourConfig, MuxConfig, OutboundDetourConfig, SniffingConfig};
@@ -50,5 +51,5 @@ pub use serial::{build_config, merge_config_from_files, merge_configs};
  pub use confloader::{
     load_file, load_file_with_format, load_reader, load_str, load_str_auto_detect,
 };
-pub use error::{ConfError, Result};
+pub use outbound_security::validate_outbound_transport_security;
 pub use vformat::Format;

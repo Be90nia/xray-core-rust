@@ -206,8 +206,6 @@ async fn run_rust_server_go_client(security: SecurityType) {
     let go_security = match security {
         SecurityType::Aes128Gcm => "aes-128-gcm",
         SecurityType::Chacha20Poly1305 => "chacha20-poly1305",
-        SecurityType::None => "none",
-        SecurityType::Auto => "auto",
         _ => "auto",
     };
     let config = XrayConfig {

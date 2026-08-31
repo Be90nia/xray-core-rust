@@ -2,8 +2,7 @@
 //!
 //! 对应 Go `proxy/shadowsocks/config.go`：
 //! - `CipherType` enum
-//! - `MemoryAccount` 运行时账户
-//! - `Cipher` (enum，包含 `Aead` 和 `None`)
+//! - `Cipher` (enum，仅 `Aead`；`None` 已删除对齐 Go v26.7.28 d7fa2076 明文禁令)
 //! - `passwordToCipherKey` / `hkdfSHA1`
 //! - proto `Account` ↔ 内存账户互转
 //!
@@ -116,7 +115,7 @@ pub fn create_xchacha20_poly1305(key: &[u8]) -> std::result::Result<InnerAead, C
 }
 
 // ============================================================================
-// Cipher：AEAD 或 None 的统一接口
+// Cipher：AEAD 统一接口（None cipher 已删除对齐 Go v26.7.28）
 // ============================================================================
 
 /// Shadowsocks Cipher 配置（不含 key），对应 Go `Cipher` interface。
@@ -124,8 +123,6 @@ pub fn create_xchacha20_poly1305(key: &[u8]) -> std::result::Result<InnerAead, C
 pub enum Cipher {
     /// AEAD 密码器配置（不含具体 key）。
     Aead(AeadCipher),
-    /// None cipher：无加密。
-    None,
 }
 
 /// AEAD 密码器配置（struct，与 trait `xray_crypto::aead::AeadCipher` 同名但不同），
@@ -173,7 +170,6 @@ impl Cipher {
     pub fn key_size(&self) -> u32 {
         match self {
             Self::Aead(c) => c.key_bytes,
-            Self::None => 0,
         }
     }
 
@@ -181,7 +177,6 @@ impl Cipher {
     pub fn iv_size(&self) -> u32 {
         match self {
             Self::Aead(c) => c.iv_bytes,
-            Self::None => 0,
         }
     }
 
@@ -198,7 +193,6 @@ impl Cipher {
     /// - 透传 creator 错误。
     pub fn create_aead(&self, key: &[u8], iv: &[u8]) -> Result<Option<InnerAead>> {
         match self {
-            Self::None => Ok(None),
             Self::Aead(c) => {
                 let mut subkey = vec![0u8; c.key_bytes as usize];
                 hkdf_sha1(key, iv, &mut subkey);

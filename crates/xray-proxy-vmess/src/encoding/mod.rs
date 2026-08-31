@@ -188,40 +188,6 @@ impl ShakeSizeParser {
     }
 }
 
-// ============================================================================
-// NoOpAuthenticator（对应 Go 同名类型，已 DEPRECATED 但保留兼容）
-// ============================================================================
-
-/// No-op AEAD：直接复制 plaintext，无加密无 tag。
-///
-/// 对应 Go `NoOpAuthenticator`，用于 SecurityType::NONE + chunk stream + packet 模式。
-pub struct NoOpAuthenticator;
-
-impl NoOpAuthenticator {
-    /// Nonce 大小（恒为 0）。
-    #[must_use]
-    pub const fn nonce_size() -> usize {
-        0
-    }
-
-    /// Overhead（恒为 0）。
-    #[must_use]
-    pub const fn overhead() -> usize {
-        0
-    }
-
-    /// Seal：返回 plaintext 副本（对应 Go `Seal`）。
-    #[must_use]
-    pub fn seal(plaintext: &[u8]) -> Vec<u8> {
-        plaintext.to_vec()
-    }
-
-    /// Open：返回 ciphertext 副本（对应 Go `Open`，永远成功）。
-    #[must_use]
-    pub fn open(ciphertext: &[u8]) -> Vec<u8> {
-        ciphertext.to_vec()
-    }
-}
 
 // ============================================================================
 // PlainChunkSizeParser（对应 Go `crypto.PlainChunkSizeParser`）
@@ -452,22 +418,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn plain_parser_roundtrip() {
-        let mut out = [0u8; 2];
-        PlainChunkSizeParser::encode(0x1234, &mut out);
-        assert_eq!(PlainChunkSizeParser::decode(&out), 0x1234);
-    }
-
-    #[test]
-    fn noop_authenticator_seal_open_roundtrip() {
-        let pt = b"hello";
-        let sealed = NoOpAuthenticator::seal(pt);
-        let opened = NoOpAuthenticator::open(&sealed);
-        assert_eq!(pt.as_slice(), opened.as_slice());
-        assert_eq!(NoOpAuthenticator::overhead(), 0);
-        assert_eq!(NoOpAuthenticator::nonce_size(), 0);
-    }
 
     #[test]
     fn write_address_port_ipv4() {

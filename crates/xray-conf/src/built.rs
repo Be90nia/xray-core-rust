@@ -28,6 +28,7 @@ use serde_json::Value;
 
 use crate::config::Config;
 use crate::error::{ConfError, Result};
+use crate::outbound_security::validate_outbound_transport_security;
 
 /// 单个构建产物条目：种类键 + JSON 字节。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,11 +222,15 @@ impl Config {
                 }
             }
             // transportLayer 代理门控（bd enk，Go infra/conf/xray.go:244-252 + 316-327）：
-            // `proxySettings.tag` 与 `sockopt.dialerProxy` 冲突检查；
-            // `transportLayer: true` → tag 注入 `sockopt.dialerProxy` 并清空 proxySettings
-            // （应用层链路降级为 transport 层代理，TLS 握手也经代理 outbound）。
             let (stream_settings_json, proxy_settings_json) =
                 normalize_outbound_proxy(ob.stream_settings.as_ref(), ob.proxy_settings.as_ref())?;
+            // 明文出站禁令（d7fa2076，对应 Go infra/conf/xray.go:245-266）：
+            // vless encryption=none 或 trojan 无 TLS 且目标非私网时报错。
+            validate_outbound_transport_security(
+                &ob.protocol,
+                &data,
+                stream_settings_json.as_ref(),
+            )?;
             out.outbounds.push(BuiltOutbound {
                 entry: BuiltEntry {
                     kind: ob.protocol.clone(),

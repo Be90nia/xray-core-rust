@@ -18,16 +18,10 @@ use crate::uuid::UUID;
 
 use self::user::MemoryUser;
 
-// ========== 安全类型 ==========
-
 /// 加密安全类型。
 ///
-/// 对应 Go 版本的 `SecurityType` 枚举（v26.7.28 协议层面对齐）：
-/// `LEGACY`/`ZERO`/`NONE` 已被 Go 上游删除。
-///
-/// **保留说明**：本枚举**临时保留** `None`/`Zero` 两个 `#[deprecated]` 变体，
-/// 用于 v26.6.1 历史 VMess e2e 测试 fixture（明文 outbound 路径测试）。
-/// 待 Batch16-M 实现 d7fa2076 明文禁令后，连同生产路径与测试 fixture 一起移除。
+/// 对应 Go 版本的 `SecurityType` 枚举（v26.7.28 d7fa2076 已对齐协议层）：
+/// `LEGACY`/`ZERO`/`NONE` 已全部删除（明文出站禁令 d7fa2076）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum SecurityType {
@@ -39,12 +33,6 @@ pub enum SecurityType {
     Aes128Gcm = 3,
     /// ChaCha20-Poly1305
     Chacha20Poly1305 = 4,
-    /// 无加密（Go v26.7.28 已删除，仅保留测试 fixture）
-    #[deprecated(note = "Removed in Go v26.7.28 (d7fa2076). Reserved for e2e test fixture; do not use in production.")]
-    None = 5,
-    /// 全零加密（Go v26.7.28 已删除，仅保留测试 fixture）
-    #[deprecated(note = "Removed in Go v26.7.28 (d7fa2076). Reserved for e2e test fixture; do not use in production.")]
-    Zero = 6,
 }
 
 impl SecurityType {
@@ -62,24 +50,17 @@ impl SecurityType {
             2 => Some(Self::Auto),
             3 => Some(Self::Aes128Gcm),
             4 => Some(Self::Chacha20Poly1305),
-            #[allow(deprecated)]
-            5 => Some(Self::None),
-            #[allow(deprecated)]
-            6 => Some(Self::Zero),
             _ => None,
         }
     }
 }
 impl std::fmt::Display for SecurityType {
-    #[allow(deprecated)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unknown => write!(f, "unknown"),
             Self::Auto => write!(f, "auto"),
             Self::Aes128Gcm => write!(f, "aes-128-gcm"),
             Self::Chacha20Poly1305 => write!(f, "chacha20-poly1305"),
-            Self::None => write!(f, "none"),
-            Self::Zero => write!(f, "zero"),
         }
     }
 }
@@ -431,20 +412,16 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn test_security_type_from_u8() {
         assert_eq!(SecurityType::from_u8(0), Some(SecurityType::Unknown));
         assert_eq!(SecurityType::from_u8(3), Some(SecurityType::Aes128Gcm));
         assert_eq!(SecurityType::from_u8(4), Some(SecurityType::Chacha20Poly1305));
-        assert_eq!(SecurityType::from_u8(5), Some(SecurityType::None));
-        assert_eq!(SecurityType::from_u8(6), Some(SecurityType::Zero));
         assert_eq!(SecurityType::from_u8(99), None);
     }
 
     #[test]
-    #[allow(deprecated)]
     fn test_security_type_roundtrip() {
-        for value in [0u8, 2, 3, 4, 5, 6] {
+        for value in [0u8, 2, 3, 4] {
             let st = SecurityType::from_u8(value).expect("valid");
             assert_eq!(st.as_u8(), value);
         }

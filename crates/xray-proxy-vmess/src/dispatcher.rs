@@ -31,7 +31,7 @@ use xray_common::protocol::{request_option, Command, RequestHeader, SecurityType
 use xray_common::bitmask::Bitmask;
 use crate::encoding::body_chunk::{PlainSizeParser, ShakeSizeParserAdapter, SizeParser};
 use xray_common::uuid::UUID;
-use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead, NoOpAeadCipher};
+use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead};
 use xray_transport::connection::Connection;
 use xray_transport::sockopt::SocketOptions;
 
@@ -400,12 +400,11 @@ fn resolve_security(s: SecurityType) -> Result<SecurityType, VmessError> {
     }
 }
 
-/// VMess body 加密枚举：统一 Aes128Gcm / ChaCha20-Poly1305 / NoOp 为同一类型，
+/// VMess body 加密枚举：统一 Aes128Gcm / ChaCha20-Poly1305 为同一类型，
 /// 供 pump 函数泛型使用（`Box<dyn AeadCipher>` 不实现 `AeadCipher`，故用枚举统一）。
 enum BodyCipher {
     Aes(Aes128Gcm),
     Chacha(ChaCha20Poly1305Aead),
-    NoOp(NoOpAeadCipher),
 }
 
 impl AeadCipher for BodyCipher {
@@ -413,21 +412,18 @@ impl AeadCipher for BodyCipher {
         match self {
             BodyCipher::Aes(c) => c.nonce_size(),
             BodyCipher::Chacha(c) => c.nonce_size(),
-            BodyCipher::NoOp(c) => c.nonce_size(),
         }
     }
     fn tag_size(&self) -> usize {
         match self {
             BodyCipher::Aes(c) => c.tag_size(),
             BodyCipher::Chacha(c) => c.tag_size(),
-            BodyCipher::NoOp(c) => c.tag_size(),
         }
     }
     fn key_size(&self) -> usize {
         match self {
             BodyCipher::Aes(c) => c.key_size(),
             BodyCipher::Chacha(c) => c.key_size(),
-            BodyCipher::NoOp(c) => c.key_size(),
         }
     }
     fn seal(
@@ -439,7 +435,6 @@ impl AeadCipher for BodyCipher {
         match self {
             BodyCipher::Aes(c) => c.seal(nonce, aad, plaintext),
             BodyCipher::Chacha(c) => c.seal(nonce, aad, plaintext),
-            BodyCipher::NoOp(c) => c.seal(nonce, aad, plaintext),
         }
     }
     fn open(
@@ -451,7 +446,6 @@ impl AeadCipher for BodyCipher {
         match self {
             BodyCipher::Aes(c) => c.open(nonce, aad, ciphertext),
             BodyCipher::Chacha(c) => c.open(nonce, aad, ciphertext),
-            BodyCipher::NoOp(c) => c.open(nonce, aad, ciphertext),
         }
     }
 }

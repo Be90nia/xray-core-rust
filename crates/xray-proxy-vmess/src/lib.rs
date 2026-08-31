@@ -12,8 +12,7 @@
 //!     `Seal/Open VMess AEAD Header` + `AuthIDDecoderHolder`（含反重放）
 //!   - `validator`：`TimedUserValidator` 整合 AuthIDDecoderHolder + behaviorSeed
 //!   - `encoding::auth`：`Authenticate`（FNV1a）+ `GenerateChacha20Poly1305Key` +
-//!     `GenerateChunkNonce` + `ShakeSizeParser` + `AEADSizeParser` + `NoOpAuthenticator`
-//!   - `encoding::client`：`ClientSession::EncodeRequestHeader`（AEAD 完整）
+//!     `GenerateChunkNonce` + `ShakeSizeParser` + `AEADSizeParser`
 //!   - `encoding::server`：`ServerSession::DecodeRequestHeader`（AEAD 完整）+ `SessionHistory`
 //!
 //! - **trait + stub**（IO 边界，依赖 buf chunk reader/writer + cryption_io 完整链路）：

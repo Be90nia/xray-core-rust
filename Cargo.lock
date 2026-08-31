@@ -5936,6 +5936,7 @@ dependencies = [
  "tracing",
  "xray-common",
  "xray-features",
+ "xray-geodata",
 ]
 
 [[package]]

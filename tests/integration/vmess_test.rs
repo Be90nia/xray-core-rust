@@ -240,33 +240,6 @@ async fn vmess_e2e_aes128gcm_large_payload() {
     );
 }
 
-// =====================================================================
-// pfmm: VMess 变体覆盖——None/Zero cipher + AuthenticatedLength + Mux TCP/UDP e2e
-// =====================================================================
-//
-// 对应 Go `testing/scenarios/policy_test.go` + `proxy/vmess/encoding/{client,server}.go` 的
-// Security 类型分支、LengthAuth option、v1.mux.cool 多路复用场景。沿用文件顶部
-// `SAMPLE_UUID_STR`（与同文件其他测试共享 SessionHistory 反重放状态隔离）。
-
-/// VMess `SecurityType::None` 端到端：无加密 body（AES-GCM NoOp cipher）+ PlainSizeParser
-/// 走完 inbound→freedom→echo 路径。
-///
-/// 对应 Go `proxy/vmess/encoding/client.go:119-126` + `server.go:265-269`：
-/// security=NONE → NewNoOpAuthenticator + (无 chunk stream 时走默认 chunk 流)。
-/// 对齐 bd 3lm `cmd/vmess` cipher none 工具的 roundtrip 等价测试。
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn vmess_e2e_security_none() {
-    run_vmess_e2e(SecurityType::None).await;
-}
-
-/// VMess `SecurityType::Zero` 端到端：与 None 等价的零加密路径，但 header.security 字段值为 5。
-///
-/// 对应 Go `proxy/vmess/outbound/outbound.go:115-119`：security=ZERO 仍映射为 NONE body
-/// cipher，但保留不同 security 字段以在 dispatcher 阶段区分。
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn vmess_e2e_security_zero() {
-    run_vmess_e2e(SecurityType::Zero).await;
-}
 
 /// VMess `request_option::AUTHENTICATED_LENGTH` 端到端：客户端 header 置该位 →
 /// 服务端按 KDF16(auth_len) 派生 16B key，size parser 走 AEAD 加密长度字段（18B）。

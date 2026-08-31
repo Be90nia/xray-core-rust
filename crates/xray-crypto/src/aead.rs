@@ -115,42 +115,6 @@ pub trait AeadCipher {
 }
 
 // ---------------------------------------------------------------------------
-// NoOp AEAD (VMess SecurityType::None/Zero)
-// ---------------------------------------------------------------------------
-
-/// No-op AEAD cipher: passes plaintext through unchanged.
-///
-/// Used for VMess `SecurityType::None` and `SecurityType::Zero` where
-/// no encryption is applied but the chunk framing protocol is preserved.
-/// `seal` returns plaintext copy; `open` returns ciphertext copy;
-/// `nonce_size`/`tag_size`/`key_size` all return 0.
-pub struct NoOpAeadCipher;
-
-impl AeadCipher for NoOpAeadCipher {
-    fn nonce_size(&self) -> usize { 0 }
-    fn tag_size(&self) -> usize { 0 }
-    fn key_size(&self) -> usize { 0 }
-
-    fn seal(
-        &self,
-        _nonce: &[u8],
-        _aad: &[u8],
-        plaintext: &[u8],
-    ) -> Result<Vec<u8>, CryptoError> {
-        Ok(plaintext.to_vec())
-    }
-
-    fn open(
-        &self,
-        _nonce: &[u8],
-        _aad: &[u8],
-        ciphertext: &[u8],
-    ) -> Result<Vec<u8>, CryptoError> {
-        Ok(ciphertext.to_vec())
-    }
-}
-
-// ---------------------------------------------------------------------------
 // AES-GCM (ring backend)
 // ---------------------------------------------------------------------------
 

@@ -22,7 +22,7 @@
 
 use std::io::{Read, Write};
 
-use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead, NoOpAeadCipher};
+use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead};
 use xray_crypto::authenticator::{Authenticator, BytesGenerator, DynamicAEADAuthenticator};
 use xray_crypto::chunk::{AEADChunkSizeParser, ChunkSizeDecoder, ChunkSizeEncoder};
 
@@ -597,7 +597,7 @@ fn size_parser_max_padding_hint(_p: &dyn SizeParser) -> u16 {
 mod tests {
     use super::*;
     use xray_crypto::aead::{Aes128Gcm, ChaCha20Poly1305Aead};
-    use crate::encoding::NoOpAuthenticator;
+
 
     fn make_cipher() -> Aes128Gcm {
         Aes128Gcm::new(&[0x42u8; 16]).expect("aes")
@@ -684,22 +684,11 @@ mod tests {
         let mut nr = make_nonce_gen();
         let mut sp_w = PlainSizeParser;
         let mut sp_r = PlainSizeParser;
-
-        let mut buf: Vec<u8> = Vec::new();
+        let mut buf = Vec::new();
         encode_chunk_stream(&mut buf, b"secret", &cipher_w, &mut nw, &mut sp_w, false, false).expect("encode");
 
         let err = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn noop_authenticator_seal_open_preserves_bytes() {
-        // 验证 NoOpAuthenticator 行为（chunk stream NONE 模式用）
-        let pt = b"hello";
-        let sealed = NoOpAuthenticator::seal(pt);
-        let opened = NoOpAuthenticator::open(&sealed);
-        assert_eq!(pt.as_slice(), opened.as_slice());
-        assert_eq!(NoOpAuthenticator::overhead(), 0);
     }
 
     #[test]
