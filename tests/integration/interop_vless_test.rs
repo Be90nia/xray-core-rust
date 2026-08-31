@@ -121,10 +121,14 @@ async fn rust_vless_client_connect(
     .await
     .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-    // Read response header
-    let _resp_addons = decode_response_header(&mut client, VERSION)
-        .await
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    // NOTE: Go xray buffers the response header with `SetFlushNext` — it is
+    // only flushed with the FIRST upstream data chunk (proxy/vless/inbound/
+    // inbound.go:618-623 + common/buf/writer.go:211-216). The real Go client
+    // runs request-send and response-read concurrently (outbound.go task.Run),
+    // so a sequential "wait for response header before sending payload" dead-
+    // locks: server waits for upstream data, echo waits for our HTTP request.
+    // Send the payload FIRST, then read header+body from the stream (the
+    // header is guaranteed to precede body bytes on the wire).
 
     // Send HTTP request
     let http_req = format!(
@@ -133,7 +137,13 @@ async fn rust_vless_client_connect(
     );
     client.write_all(http_req.as_bytes()).await?;
 
-    // Read response
+    // Now the upstream echo will respond; Go flushes the buffered response
+    // header with the first upstream chunk, so read it here.
+    let _resp_addons = decode_response_header(&mut client, VERSION)
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    // Read response body
     let mut buf = vec![0u8; 4096];
     let mut total = Vec::new();
     loop {

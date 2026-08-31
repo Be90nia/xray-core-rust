@@ -80,7 +80,7 @@ pub async fn start_go_xray(config_path: &std::path::Path) -> Result<Child> {
         return Err(InteropError::GoBinaryNotFound { path: bin });
     }
 
-    let child = Command::new(&bin)
+    let mut child = Command::new(&bin)
         .arg("run")
         .arg("-c")
         .arg(config_path)
@@ -89,6 +89,35 @@ pub async fn start_go_xray(config_path: &std::path::Path) -> Result<Child> {
         .kill_on_drop(true)
         .spawn()
         .map_err(|source| InteropError::GoProcessStartFailed { source })?;
+
+    // Drain stdout/stderr to log files in the background. Without this, Go
+    // xray blocks once its 64KiB pipe buffer fills (access-log traffic),
+    // which manifests as the Rust client hanging in read calls. Filenames
+    // are unique per config (PID suffix via atomic counter fallback) so
+    // concurrent test binaries don't clobber each other's logs.
+    let log_id = std::process::id();
+    let log_dir = std::env::temp_dir().join("xray_interop_go_logs");
+    std::fs::create_dir_all(&log_dir).ok();
+    if let Some(stdout) = child.stdout.take() {
+        let path = log_dir.join(format!("go_{log_id}_stdout.log"));
+        tokio::spawn(async move {
+            let mut s = stdout;
+            if let Ok(f) = tokio::fs::File::create(path).await {
+                let mut f = f;
+                let _ = tokio::io::copy(&mut s, &mut f).await;
+            }
+        });
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let path = log_dir.join(format!("go_{log_id}_stderr.log"));
+        tokio::spawn(async move {
+            let mut s = stderr;
+            if let Ok(f) = tokio::fs::File::create(path).await {
+                let mut f = f;
+                let _ = tokio::io::copy(&mut s, &mut f).await;
+            }
+        });
+    }
 
     Ok(child)
 }
@@ -305,7 +334,14 @@ pub struct Outbound {
 pub fn freedom_outbound() -> Outbound {
     Outbound {
         protocol: "freedom".into(),
-        settings: None,
+        // Go xray v26 freedom blocks private targets (127.0.0.0/8 etc.) by
+        // default when the inbound is trojan/vless/vmess/ss (SSRF guard,
+        // proxy/freedom/freedom.go getDefaultFinalRule). Tests dial local
+        // echo servers, so allow loopback explicitly.
+        settings: Some(serde_json::json!({
+            "domainStrategy": "asis",
+            "finalRules": [{ "action": "allow", "ip": ["127.0.0.0/8"] }]
+        })),
         stream_settings: None,
         tag: Some("direct".into()),
     }
