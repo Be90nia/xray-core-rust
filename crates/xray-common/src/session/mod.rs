@@ -15,6 +15,10 @@ use crate::net::port::Port;
 use crate::protocol::user::User;
 use crate::signal::ActivityTimer;
 use crate::uuid::UUID;
+pub mod context;
+
+pub use context::{FullHandler, SessionDispatcher, TrackedRequestErrorFeedback};
+
 
 // ========== SessionConn (type-erased raw conn for splice copy) ==========
 
@@ -604,7 +608,26 @@ pub struct Session {
     pub content: Content,
     /// 套接字选项。
     pub sockopt: Sockopt,
+    // ---- context.go 携带值（Go 经 context.Value 传递，Rust 落字段）----
+    /// 是否反向 mux（Go `isReverseMuxKey`，context.go:78-87）。
+    pub is_reverse_mux: bool,
+    /// mux 子上下文标记：仅自身流量超时才取消（Go `timeoutOnlyKey`，context.go:141-150）。
+    pub timeout_only: bool,
+    /// muxcool 服务端允许的网络类型（Go `allowedNetworkKey`，context.go:152-161）。
+    /// `None` 对应 Go `net.Network_Unknown`。
+    pub allowed_network: Option<Network>,
+    /// MITM ALPN 是否 http/1.1（Go `mitmAlpn11Key`，context.go:174-183）。
+    pub mitm_alpn11: bool,
+    /// MITM 服务器名（Go `mitmServerNameKey`，context.go:185-194）。空串为默认。
+    pub mitm_server_name: String,
+    /// ss2022 入站获取 dispatcher（Go `dispatcherKey`，context.go:130-139）。
+    pub dispatcher: Option<Arc<dyn SessionDispatcher>>,
+    /// outbound 完整 handler（Go `fullHandlerKey`，context.go:163-172）。
+    pub full_handler: Option<Arc<dyn FullHandler>>,
+    /// observer 回传出站错误的 tracker（Go `trackedConnectionErrorKey`，context.go:115-128）。
+    pub error_tracker: Option<Arc<dyn TrackedRequestErrorFeedback>>,
 }
+
 
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -614,9 +637,18 @@ impl std::fmt::Debug for Session {
             .field("outbound", &self.outbound)
             .field("content", &self.content)
             .field("sockopt", &self.sockopt)
+            .field("is_reverse_mux", &self.is_reverse_mux)
+            .field("timeout_only", &self.timeout_only)
+            .field("allowed_network", &self.allowed_network)
+            .field("mitm_alpn11", &self.mitm_alpn11)
+            .field("mitm_server_name", &self.mitm_server_name)
+            .field("dispatcher", &self.dispatcher.as_ref().map(|_| "<Arc<dyn SessionDispatcher>>"))
+            .field("full_handler", &self.full_handler.as_ref().map(|_| "<Arc<dyn FullHandler>>"))
+            .field("error_tracker", &self.error_tracker.as_ref().map(|_| "<Arc<dyn TrackedRequestErrorFeedback>>"))
             .finish()
     }
 }
+
 
 impl Clone for Session {
     fn clone(&self) -> Self {
@@ -626,9 +658,18 @@ impl Clone for Session {
             outbound: self.outbound.clone(),
             content: self.content.clone(),
             sockopt: self.sockopt.clone(),
+            is_reverse_mux: self.is_reverse_mux,
+            timeout_only: self.timeout_only,
+            allowed_network: self.allowed_network,
+            mitm_alpn11: self.mitm_alpn11,
+            mitm_server_name: self.mitm_server_name.clone(),
+            dispatcher: self.dispatcher.clone(), // Arc<dyn ...>: Clone by Arc bump
+            full_handler: self.full_handler.clone(), // Arc<dyn ...>: Clone by Arc bump
+            error_tracker: self.error_tracker.clone(), // Arc<dyn ...>: Clone by Arc bump
         }
     }
 }
+
 
 impl Session {
     /// 创建新的会话。
@@ -639,6 +680,14 @@ impl Session {
             outbound: Outbound::new(),
             content: Content::new(),
             sockopt: Sockopt::new(),
+            is_reverse_mux: false,
+            timeout_only: false,
+            allowed_network: None,
+            mitm_alpn11: false,
+            mitm_server_name: String::new(),
+            dispatcher: None,
+            full_handler: None,
+            error_tracker: None,
         }
     }
 
