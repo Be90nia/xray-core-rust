@@ -126,19 +126,29 @@ async fn rust_vmess_client_connect(
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     client.write_all(&sealed_header).await?;
 
-    // Read response header
-    let _resp = client_session
-        .decode_response_header_async(&mut client)
-        .await
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-    // Send request body (HTTP GET to echo server)
+    // Send request body (HTTP GET to echo server) BEFORE reading the response
+    // header — a real Go VMess client streams body immediately after the header
+    // (outbound.go wires request/response copy concurrently). The Go server only
+    // flushes its buffered response after upstream (freedom→echo) returns data,
+    // which requires the request body to arrive first; reading the response
+    // header first deadlocks.
     let http_req = format!(
         "GET /interop HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
         echo_port
     );
+    // Encode the body (chunk + termination chunk) into one buffer and write it
+    // in a SINGLE write_all: if the termination chunk lands in a separate TCP
+    // segment that is still in flight when the Go server finishes and closes,
+    // the close aborts with RST and discards Go's pending response.
+    let mut body_wire: Vec<u8> = Vec::new();
     client_session
-        .encode_request_body_async(&header, http_req.as_bytes(), &mut client)
+        .encode_request_body(&header, http_req.as_bytes(), &mut body_wire)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    client.write_all(&body_wire).await?;
+
+    // Read response header
+    let _resp = client_session
+        .decode_response_header_async(&mut client)
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 

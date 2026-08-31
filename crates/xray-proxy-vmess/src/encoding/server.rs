@@ -314,7 +314,7 @@ impl<'v> ServerSession<'v> {
         } else {
             Box::new(PlainSizeParser)
         };
-        let plaintext = body_chunk::decode_chunk_stream(reader, cipher.as_ref(), &mut nonce_gen, size_parser.as_mut(), request.option.has(request_option::GLOBAL_PADDING), request.option.has(request_option::NO_TERMINATION_SIGNAL))?;
+        let plaintext = body_chunk::decode_chunk_stream(reader, cipher.as_ref(), &mut nonce_gen, size_parser.as_mut(), request.option.has(request_option::GLOBAL_PADDING))?;
         Ok(plaintext)
     }
 
@@ -582,7 +582,7 @@ impl<'v> ServerSession<'v> {
         } else {
             Box::new(PlainSizeParser)
         };
-        let plaintext = body_chunk::decode_chunk_stream_async(reader, cipher.as_ref(), &mut nonce_gen, size_parser.as_mut(), request.option.has(request_option::GLOBAL_PADDING), request.option.has(request_option::NO_TERMINATION_SIGNAL)).await?;
+        let plaintext = body_chunk::decode_chunk_stream_async(reader, cipher.as_ref(), &mut nonce_gen, size_parser.as_mut(), request.option.has(request_option::GLOBAL_PADDING)).await?;
         Ok(plaintext)
     }
 

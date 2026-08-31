@@ -321,6 +321,57 @@ fn write_one_chunk<W: Write>(
 // decode_chunk_stream：从 reader 读取并解码 chunk 流，返回所有明文
 // ============================================================================
 
+/// 读 size 字段，对齐 Go `io.ReadFull` 的 EOF 语义：
+/// - 0 字节即 EOF（chunk 边界干净关闭）→ `Ok(false)`（调用方按流结束处理）
+/// - 读到部分字节后 EOF → `Err`（截断 chunk，真实错误）
+fn read_size_field_or_eof<R: Read>(reader: &mut R, size_field: &mut [u8]) -> std::io::Result<bool> {
+    let mut filled = 0usize;
+    while filled < size_field.len() {
+        match reader.read(&mut size_field[filled..]) {
+            Ok(0) => {
+                if filled == 0 {
+                    return Ok(false);
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "early eof in chunk size field",
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
+}
+
+/// [`read_size_field_or_eof`] 的 async 版。
+async fn read_size_field_or_eof_async<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    size_field: &mut [u8],
+) -> std::io::Result<bool> {
+    use tokio::io::AsyncReadExt;
+    let mut filled = 0usize;
+    while filled < size_field.len() {
+        match reader.read(&mut size_field[filled..]).await {
+            Ok(0) => {
+                if filled == 0 {
+                    return Ok(false);
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "early eof in chunk size field",
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
+}
+
+
 /// 从 reader 读取 chunk 流并解码，返回拼接后的所有明文。
 ///
 /// 算法（对应 Go `AuthenticationReader.ReadMultiBuffer`）：
@@ -330,10 +381,13 @@ fn write_one_chunk<W: Write>(
 /// 4. padding_size 由 size_parser.next_padding_len() 给出（与 encoder 同步）
 /// 5. AEAD open 前 (size - padding_size) 字节，丢弃 padding
 /// 6. plaintext 为空 → 流结束（终止 chunk）
+/// 7. size_field 起点处干净 EOF（0 字节）→ 流结束
+///    （Go 端 `buf.Copy` 吞 `io.EOF`；服务端在请求无 CHUNK_STREAM 时
+///    不写终止 chunk，靠 EOF 结束流——对齐 Go 客户端语义）
 ///
 /// # Errors
 ///
-/// - IO 错误（含 EOF）
+/// - IO 错误（chunk 边界干净 EOF 除外——那是正常流结束）
 /// - AEAD 解密失败
 pub fn decode_chunk_stream<R: Read>(
     reader: &mut R,
@@ -341,7 +395,6 @@ pub fn decode_chunk_stream<R: Read>(
     nonce_gen: &mut dyn ChunkNonce,
     size_parser: &mut dyn SizeParser,
     global_padding: bool,
-    no_termination: bool,
 ) -> std::io::Result<Vec<u8>> {
     let mut output = Vec::new();
     loop {
@@ -352,10 +405,11 @@ pub fn decode_chunk_stream<R: Read>(
 
         let sb = size_parser.size_bytes();
         let mut size_field = vec![0u8; sb];
-        match reader.read_exact(&mut size_field) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && no_termination => {
-                // NoTerminationSignal：靠 EOF 判断流结束
+        match read_size_field_or_eof(reader, &mut size_field) {
+            Ok(true) => {}
+            Ok(false) => {
+                // chunk 边界干净 EOF = 对端关闭流（Go buf.Copy 吞 io.EOF 视为正常结束）。
+                // Go 服务端在请求无 CHUNK_STREAM option 时不写终止 chunk，靠 EOF 结束响应流。
                 return Ok(output);
             }
             Err(e) => return Err(e),
@@ -475,11 +529,12 @@ async fn write_one_chunk_async<W: AsyncWrite + Unpin>(
 
 /// 从 reader 异步读取 chunk 流并解码，返回拼接后的所有明文。
 ///
-/// 逻辑与 [`decode_chunk_stream`] 相同，IO 用 `tokio::io::AsyncRead`。
+/// 逻辑与 [`decode_chunk_stream`] 相同（含 chunk 边界干净 EOF = 流结束语义），
+/// IO 用 `tokio::io::AsyncRead`。
 ///
 /// # Errors
 ///
-/// - IO 错误（含 EOF）
+/// - IO 错误（chunk 边界干净 EOF 除外——那是正常流结束）
 /// - AEAD 解密失败
 pub async fn decode_chunk_stream_async<R: AsyncRead + Unpin>(
     reader: &mut R,
@@ -487,7 +542,6 @@ pub async fn decode_chunk_stream_async<R: AsyncRead + Unpin>(
     nonce_gen: &mut dyn ChunkNonce,
     size_parser: &mut dyn SizeParser,
     global_padding: bool,
-    no_termination: bool,
 ) -> std::io::Result<Vec<u8>> {
     let mut output = Vec::new();
     loop {
@@ -495,10 +549,11 @@ pub async fn decode_chunk_stream_async<R: AsyncRead + Unpin>(
 
         let sb = size_parser.size_bytes();
         let mut size_field = vec![0u8; sb];
-        match reader.read_exact(&mut size_field).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && no_termination => {
-                // NoTerminationSignal：靠 EOF 判断流结束
+        match read_size_field_or_eof_async(reader, &mut size_field).await {
+            Ok(true) => {}
+            Ok(false) => {
+                // chunk 边界干净 EOF = 对端关闭流（Go buf.Copy 吞 io.EOF 视为正常结束）。
+                // Go 服务端在请求无 CHUNK_STREAM option 时不写终止 chunk，靠 EOF 结束响应流。
                 return Ok(output);
             }
             Err(e) => return Err(e),
@@ -571,7 +626,7 @@ mod tests {
         encode_chunk_stream(&mut buf, b"", &cipher_w, &mut nw, &mut sp_w, false, false).expect("encode");
         assert!(!buf.is_empty()); // 至少有终止 chunk
 
-        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false, false).expect("decode");
+        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false).expect("decode");
         assert!(decoded.is_empty());
     }
 
@@ -588,7 +643,7 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         encode_chunk_stream(&mut buf, data, &cipher_w, &mut nw, &mut sp_w, false, false).expect("encode");
 
-        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false, false).expect("decode");
+        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false).expect("decode");
         assert_eq!(decoded, data);
     }
 
@@ -606,7 +661,7 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         encode_chunk_stream(&mut buf, &data, &cipher_w, &mut nw, &mut sp_w, false, false).expect("encode");
 
-        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false, false).expect("decode");
+        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false).expect("decode");
         assert_eq!(decoded, data);
     }
 
@@ -623,7 +678,7 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         encode_chunk_stream(&mut buf, data, &cipher_w, &mut nw, &mut sp_w, false, false).expect("encode");
 
-        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false, false).expect("decode");
+        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false).expect("decode");
         assert_eq!(decoded, data);
     }
 
@@ -639,7 +694,7 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         encode_chunk_stream(&mut buf, b"secret", &cipher_w, &mut nw, &mut sp_w, false, false).expect("encode");
 
-        let err = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false, false).unwrap_err();
+        let err = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
@@ -679,7 +734,7 @@ mod tests {
         encode_chunk_stream(&mut buf, data, &cipher_w, &mut nw, &mut sp_w, false, false).expect("encode");
 
         let decoded =
-            decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false, false).expect("decode");
+            decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false).expect("decode");
         assert_eq!(decoded, data);
     }
 
@@ -696,7 +751,7 @@ mod tests {
         let mut sp_r = PlainSizeParser;
         encode_chunk_stream(&mut buf, data, &aes_w, &mut nw, &mut sp_w, false, false).expect("aes encode");
         let decoded =
-            decode_chunk_stream(&mut &buf[..], &aes_r, &mut nr, &mut sp_r, false, false).expect("aes decode");
+            decode_chunk_stream(&mut &buf[..], &aes_r, &mut nr, &mut sp_r, false).expect("aes decode");
         assert_eq!(decoded, data);
 
         // ChaCha20 独立流
@@ -707,7 +762,7 @@ mod tests {
         let mut nr2 = ChunkNonceAdapter::new(&[0xBBu8; 16], 12);
         encode_chunk_stream(&mut buf2, data, &chacha_w, &mut nw2, &mut sp_w, false, false).expect("chacha encode");
         let decoded2 =
-            decode_chunk_stream(&mut &buf2[..], &chacha_r, &mut nr2, &mut sp_r, false, false).expect("chacha decode");
+            decode_chunk_stream(&mut &buf2[..], &chacha_r, &mut nr2, &mut sp_r, false).expect("chacha decode");
         assert_eq!(decoded2, data);
     }
 
@@ -742,7 +797,7 @@ mod tests {
     let mut buf: Vec<u8> = Vec::new();
     encode_chunk_stream(&mut buf, data, &cipher_w, &mut nw, &mut sp_w, false, false).expect("encode");
 
-    let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false, false).expect("decode");
+    let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false).expect("decode");
     assert_eq!(decoded, data);
     }
 
@@ -785,7 +840,7 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         encode_chunk_stream(&mut buf, data, &cipher_w, &mut nw, &mut sp_w, false, false).expect("encode");
 
-        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false, false).expect("decode");
+        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false).expect("decode");
         assert_eq!(decoded, data);
     }
 
@@ -804,7 +859,7 @@ mod tests {
             .await
             .expect("encode");
 
-        let decoded = decode_chunk_stream_async(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false, false)
+        let decoded = decode_chunk_stream_async(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false)
             .await
             .expect("decode");
         assert_eq!(decoded, data);
@@ -825,7 +880,7 @@ mod tests {
             .await
             .expect("encode");
 
-        let decoded = decode_chunk_stream_async(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false, false)
+        let decoded = decode_chunk_stream_async(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false)
             .await
             .expect("decode");
         assert_eq!(decoded, data);
@@ -848,7 +903,7 @@ mod tests {
             .expect("encode");
         // 没有终止 chunk：buf 只有数据 chunk
 
-        let decoded = decode_chunk_stream_async(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false, true)
+        let decoded = decode_chunk_stream_async(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false)
             .await
             .expect("decode via EOF");
         assert_eq!(decoded, data);
@@ -869,7 +924,7 @@ mod tests {
         encode_chunk_stream(&mut buf, data, &cipher_w, &mut nw, &mut sp_w, false, false).expect("encode");
 
         // 验证 encode+decode round-trip 正确（无 padding，SHAKE128 流同步）
-        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false, false).expect("decode");
+        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, false).expect("decode");
         assert_eq!(decoded, data);
     }
 
@@ -887,7 +942,7 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         encode_chunk_stream(&mut buf, data, &cipher_w, &mut nw, &mut sp_w, true, false).expect("encode");
 
-        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, true, false).expect("decode");
+        let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, true).expect("decode");
         assert_eq!(decoded, data);
     }
 }
