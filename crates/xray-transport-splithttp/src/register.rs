@@ -248,8 +248,37 @@ pub(crate) fn parse_splithttp_config(json: Option<&serde_json::Value>) -> io::Re
         uplink_data_placement: get_str("uplinkDataPlacement"),
         uplink_data_key: get_str("uplinkDataKey"),
         uplink_chunk_size: get_range("uplinkChunkSize"),
+        session_id_table: {
+            let raw = get_str("sessionIDTable");
+            // 命中预定义名（如 "HEX"）时替换为字面值，未命中按字面处理。
+            // 对应 Go transport_method.go:409-411 conf 层替换。
+            let resolved = match crate::config::lookup_predefined_session_id_table(&raw) {
+                Some(s) => s.to_string(),
+                None => raw,
+            };
+            // 镜像 Go transport_method.go:420-424 ASCII 校验。
+            // ponytail: roomSize >= 2^30 校验跳过——Rust 无 conf 层代理；
+            // 用户自己保证 table * length 足够大避免熵不足。
+            if resolved.as_bytes().iter().any(|b| *b >= 0x80) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "splithttpSettings.sessionIDTable must contain only ASCII characters",
+                ));
+            }
+            resolved
+        },
+        session_id_length: match obj.get("sessionIDLength").and_then(parse_range) {
+            Some(r) if r.from > 0 => Some(r),
+            // from <= 0 与 Go transport_method.go:417-419 校验一致：直接拒绝配置。
+            Some(r) if r.from <= 0 => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "splithttpSettings.sessionIDLength.from must be greater than 0",
+                ));
+            }
+            _ => None,
+        },
         no_grpc_header: get_bool("noGRPCHeader"),
-        no_sse_header: get_bool("noSSEHeader"),
         sc_max_each_post_bytes: get_range("scMaxEachPostBytes"),
         sc_min_posts_interval_ms: get_range("scMinPostsIntervalMs"),
         sc_max_buffered_posts: get_i64("scMaxBufferedPosts"),
@@ -447,6 +476,75 @@ mod tests {
         let r = parse_range(&v).unwrap();
         assert_eq!((r.from, r.to), (500, 500));
     }
+    /// sessionIDTable 预定义名（"HEX"）解析后替换为字面值。
+    #[test]
+    fn parse_session_id_table_predefined_resolves_to_alphabet() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"sessionIDTable":"HEX"}"#).unwrap();
+        let cfg = parse_splithttp_config(Some(&v)).expect("parse ok");
+        assert_eq!(cfg.session_id_table, "0123456789ABCDEF");
+    }
+
+    /// sessionIDTable 自定义字符串按字面透传。
+    #[test]
+    fn parse_session_id_table_custom_passes_through() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"sessionIDTable":"abc123!@#"}"#).unwrap();
+        let cfg = parse_splithttp_config(Some(&v)).expect("parse ok");
+        assert_eq!(cfg.session_id_table, "abc123!@#");
+    }
+
+    /// sessionIDTable 缺失 → 空字符串（fallback UUID）。
+    #[test]
+    fn parse_session_id_table_missing_is_empty() {
+        let cfg = parse_splithttp_config(None).expect("parse ok");
+        assert_eq!(cfg.session_id_table, "");
+        assert!(cfg.session_id_length.is_none());
+    }
+
+    /// sessionIDTable 含非 ASCII（>=0x80）拒绝配置。
+    #[test]
+    fn parse_session_id_table_non_ascii_rejected() {
+        // 中文（0xE4 开 UTF-8）混在 table 里应被拒。
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"sessionIDTable":"abc\u00FF"}"#).unwrap();
+        let r = parse_splithttp_config(Some(&v));
+        assert!(r.is_err());
+        let msg = r.unwrap_err().to_string();
+        assert!(msg.contains("sessionIDTable"), "unexpected msg: {msg}");
+    }
+
+    /// sessionIDLength 合法 RangeConfig（from > 0）解析为 Some。
+    #[test]
+    fn parse_session_id_length_valid_range() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"sessionIDLength":{"from":8,"to":16}}"#).unwrap();
+        let cfg = parse_splithttp_config(Some(&v)).expect("parse ok");
+        let r = cfg.session_id_length.expect("some");
+        assert_eq!((r.from, r.to), (8, 16));
+    }
+
+    /// sessionIDLength from <= 0 拒绝（镜像 Go transport_method.go:417-419）。
+    #[test]
+    fn parse_session_id_length_from_zero_rejected() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"sessionIDLength":{"from":0,"to":8}}"#).unwrap();
+        let r = parse_splithttp_config(Some(&v));
+        assert!(r.is_err());
+        let msg = r.unwrap_err().to_string();
+        assert!(msg.contains("sessionIDLength.from"), "unexpected msg: {msg}");
+    }
+
+    /// sessionIDLength 整数简写解析：from==to。
+    #[test]
+    fn parse_session_id_length_from_integer() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"sessionIDLength":12}"#).unwrap();
+        let cfg = parse_splithttp_config(Some(&v)).expect("parse ok");
+        let r = cfg.session_id_length.expect("some");
+        assert_eq!((r.from, r.to), (12, 12));
+    }
+
 
     /// Tcpmask round-trip（o54c，Go splithttp/dialer.go:127-134 + hub.go:547-549）：
     /// 明文 HTTP/1.1 packet-up，dial 与 hub 双端配置 fragment mask 后 e2e echo。

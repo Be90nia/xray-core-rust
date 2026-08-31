@@ -39,6 +39,32 @@ pub const PLACEMENT_BODY: &str = "body";
 /// Placement 策略：自动选择（实现决定）。
 pub const PLACEMENT_AUTO: &str = "auto";
 
+// ===== Session ID 字符集预设（对应 Go `splithttp.PredefinedTable`）=====
+
+/// 命名字符集 → 字面字符集。命中时 [`Config::generate_session_id`] 用字面值替换预设名。
+///
+/// 对应 Go `config.go:494-504` `PredefinedTable`。空字符串对应"无预设"分支。
+pub const PREDEFINED_SESSION_ID_TABLE: &[(&str, &str)] = &[
+    ("ALPHABET", "ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+    ("Alphabet", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"),
+    ("BASE36", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+    ("Base62", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"),
+    ("HEX", "0123456789ABCDEF"),
+    ("alphabet", "abcdefghijklmnopqrstuvwxyz"),
+    ("base36", "0123456789abcdefghijklmnopqrstuvwxyz"),
+    ("hex", "0123456789abcdef"),
+    ("number", "0123456789"),
+];
+
+/// 按预设名查找字符集（区分大小写），未命中返回 `None`。
+#[must_use]
+pub fn lookup_predefined_session_id_table(name: &str) -> Option<&'static str> {
+    PREDEFINED_SESSION_ID_TABLE
+        .iter()
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| *v)
+}
+
 // ===== RangeConfig =====
 
 /// 范围配置（含随机采样）。对应 proto `RangeConfig`。
@@ -180,6 +206,14 @@ pub struct Config {
     pub uplink_chunk_size: Option<RangeConfig>,
     /// 服务端：最大 header 字节数。
     pub server_max_header_bytes: i32,
+    /// 自定义 sessionID 字符集。命中 [`PREDEFINED_SESSION_ID_TABLE`] 预设名时
+    /// 替换为预设字符集（如 `"HEX"` → `"0123456789ABCDEF"`），否则按字面字符串处理。
+    /// 对应 proto `sessionIDTable=28`（Go `Config.SessionIDTable`）。
+    pub session_id_table: String,
+    /// sessionID 长度随机范围（from..=to）。`None` 或 `from<=0` 时
+    /// [`Config::generate_session_id`] 退化为 UUID。
+    /// 对应 proto `sessionIDLength=29`（Go `Config.SessionIDLength`）。
+    pub session_id_length: Option<RangeConfig>,
 }
 
 impl Config {
@@ -298,6 +332,56 @@ impl Config {
         }
     }
 
+    /// sessionID 字符集：命中预设名（如 `"HEX"`）则替换为字面值，否则返回原字符串。
+    /// 空字符串返回空（[`Config::generate_session_id`] 会退化为 UUID）。
+    /// 对应 Go `GetNormalizedSessionIDTable` 行为（proto conf 层替换，预设查表）。
+    #[must_use]
+    pub fn normalized_session_id_table(&self) -> &str {
+        match lookup_predefined_session_id_table(&self.session_id_table) {
+            Some(s) => s,
+            None => &self.session_id_table,
+        }
+    }
+
+    /// sessionID 长度随机范围。`None` 或 `from<=0` 返回 `{0,0}`，
+    /// 让 [`Config::generate_session_id`] 的 `length > 0` 分支失败，退化到 UUID。
+    /// 对应 Go `GetNormalizedSessionIDLength`（proto nil → {0,0}）。
+    #[must_use]
+    pub fn normalized_session_id_length(&self) -> RangeConfig {
+        match self.session_id_length {
+            Some(r) if r.from > 0 => r,
+            _ => RangeConfig { from: 0, to: 0 },
+        }
+    }
+
+    /// 生成 sessionID。对应 Go `Config.GenerateSessionID()`（config.go:506-522）。
+    ///
+    /// 行为：
+    /// - 若 `normalized_session_id_table` 非空 **且** `normalized_session_id_length.from > 0`：
+    ///   从字符集随机取 `length` 字节（length 在 `[from, to]` 范围内随机）。
+    /// - 否则：返回标准 UUID 字符串（与现有 XHTTP 默认行为兼容）。
+    ///
+    /// 注意：stream-one 模式下 Go 端直接跳过 `GenerateSessionID`（`sessionId = ""`），
+    /// 本方法不做此判定，由调用方负责（`dialer::dial` 的 stream-one 分支传 `String::new()`）。
+    #[must_use]
+    pub fn generate_session_id(&self) -> String {
+        let table = self.normalized_session_id_table();
+        let length_cfg = self.normalized_session_id_length();
+        let length = length_cfg.rand();
+        if !table.is_empty() && length > 0 {
+            let table_bytes = table.as_bytes();
+            let mut buf = vec![0u8; length as usize];
+            let mut rng = rand::rng();
+            for b in &mut buf {
+                *b = table_bytes[rng.random_range(0..table_bytes.len())];
+            }
+            // SAFETY: 所有随机字节来自 ASCII 字符集（按 conf 层校验过），UTF-8 安全。
+            String::from_utf8(buf).unwrap_or_default()
+        } else {
+            uuid::Uuid::new_v4().to_string()
+        }
+    }
+
     /// session placement。空返回默认 `path`。
     #[must_use]
     pub fn normalized_session_placement(&self) -> &str {
@@ -410,6 +494,8 @@ impl Config {
             uplink_data_key: p.uplink_data_key,
             uplink_chunk_size: p.uplink_chunk_size.map(range_from_proto),
             server_max_header_bytes: p.server_max_header_bytes,
+            session_id_table: p.session_id_table,
+            session_id_length: p.session_id_length.map(range_from_proto),
         })
     }
 
@@ -444,6 +530,8 @@ impl Config {
             uplink_data_key: self.uplink_data_key.clone(),
             uplink_chunk_size: self.uplink_chunk_size.map(range_to_proto),
             server_max_header_bytes: self.server_max_header_bytes,
+            session_id_table: self.session_id_table.clone(),
+            session_id_length: self.session_id_length.map(range_to_proto),
         }
     }
 }
@@ -1294,5 +1382,121 @@ mod tests {
         let out = cfg.write_response_header("OPTIONS", &headers);
         assert_header(&out, "Access-Control-Allow-Methods", "*");
         assert_header(&out, "Access-Control-Allow-Headers", "*");
+    }
+    // ===== sessionIDTable / sessionIDLength / generate_session_id =====
+
+    #[test]
+    fn lookup_predefined_session_id_table_finds_all_named_alphabets() {
+        // 9 个预设名必须全部命中（与 Go config.go:494-504 PredefinedTable 对齐）。
+        for (name, expected) in [
+            ("ALPHABET", "ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+            ("Alphabet", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"),
+            ("BASE36", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+            ("Base62", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"),
+            ("HEX", "0123456789ABCDEF"),
+            ("alphabet", "abcdefghijklmnopqrstuvwxyz"),
+            ("base36", "0123456789abcdefghijklmnopqrstuvwxyz"),
+            ("hex", "0123456789abcdef"),
+            ("number", "0123456789"),
+        ] {
+            assert_eq!(lookup_predefined_session_id_table(name), Some(expected));
+        }
+        assert_eq!(lookup_predefined_session_id_table(""), None);
+        assert_eq!(lookup_predefined_session_id_table("nonexistent"), None);
+    }
+
+    #[test]
+    fn normalized_session_id_table_resolves_predefined_passthrough_literal() {
+        // 命中预设 → 返回字面值
+        let cfg = Config { session_id_table: "HEX".into(), ..Default::default() };
+        assert_eq!(cfg.normalized_session_id_table(), "0123456789ABCDEF");
+        // 未命中 → 原样返回（用户自定义字符集）
+        let cfg = Config { session_id_table: "abc123".into(), ..Default::default() };
+        assert_eq!(cfg.normalized_session_id_table(), "abc123");
+        // 空 → 空（fallback 到 UUID）
+        assert_eq!(Config::default().normalized_session_id_table(), "");
+    }
+
+    #[test]
+    fn normalized_session_id_length_defaults_to_zero_when_invalid() {
+        // None / from<=0 / 缺失都退化为 {0,0}，让 generate_session_id fallback。
+        assert_eq!(Config::default().normalized_session_id_length(), RangeConfig { from: 0, to: 0 });
+        let cfg = Config { session_id_length: Some(RangeConfig::new(0, 8)), ..Default::default() };
+        assert_eq!(cfg.normalized_session_id_length(), RangeConfig { from: 0, to: 0 });
+        let cfg = Config { session_id_length: Some(RangeConfig::new(-5, 8)), ..Default::default() };
+        assert_eq!(cfg.normalized_session_id_length(), RangeConfig { from: 0, to: 0 });
+        // from>0 → 原样
+        let cfg = Config { session_id_length: Some(RangeConfig::new(8, 16)), ..Default::default() };
+        assert_eq!(cfg.normalized_session_id_length(), RangeConfig { from: 8, to: 16 });
+    }
+
+    #[test]
+    fn generate_session_id_no_table_returns_uuid() {
+        // 向后兼容：未配置 table/length 时返回 UUID 字符串。
+        let cfg = Config::default();
+        let id = cfg.generate_session_id();
+        let parsed = uuid::Uuid::parse_str(&id).expect("must be valid UUID");
+        assert_eq!(parsed.get_version_num(), 4);
+    }
+
+    #[test]
+    fn generate_session_id_custom_table_returns_chars_in_table_with_length() {
+        // 有 table + length>0：每次返回的字符串每个字节必须是 table 成员，且长度 == length_cfg.rand()。
+        let cfg = Config {
+            session_id_table: "ABC".into(), // 字面值字符集
+            session_id_length: Some(RangeConfig::new(8, 8)), // 固定 length=8
+            ..Default::default()
+        };
+        for _ in 0..20 {
+            let id = cfg.generate_session_id();
+            assert_eq!(id.len(), 8, "expected len=8, got {id:?}");
+            for c in id.chars() {
+                assert!(matches!(c, 'A' | 'B' | 'C'), "char {c:?} not in table");
+            }
+        }
+    }
+
+    #[test]
+    fn generate_session_id_predefined_hex_returns_hex_chars_with_length() {
+        // 预设名 "HEX" → 字面值 "0123456789ABCDEF"，length=12。
+        let cfg = Config {
+            session_id_table: "HEX".into(),
+            session_id_length: Some(RangeConfig::new(12, 12)),
+            ..Default::default()
+        };
+        let id = cfg.generate_session_id();
+        assert_eq!(id.len(), 12);
+        for c in id.chars() {
+            assert!(matches!(c, '0'..='9' | 'A'..='F'), "char {c:?} not in HEX");
+        }
+    }
+
+    #[test]
+    fn generate_session_id_length_without_table_falls_back_to_uuid() {
+        // 只有 length 没有 table → fallback UUID（Go 行为：table=="" 时走 else 分支）。
+        let cfg = Config {
+            session_id_length: Some(RangeConfig::new(8, 8)),
+            ..Default::default()
+        };
+        let id = cfg.generate_session_id();
+        assert!(uuid::Uuid::parse_str(&id).is_ok(), "expected UUID, got {id:?}");
+    }
+
+    #[test]
+    fn proto_roundtrip_preserves_session_id_fields() {
+        // from_proto → to_proto → from_proto 必须保持字段一致。
+        let cfg = Config {
+            session_id_table: "HEX".into(),
+            session_id_length: Some(RangeConfig::new(16, 32)),
+            ..Default::default()
+        };
+        let proto = cfg.to_proto();
+        assert_eq!(proto.session_id_table, "HEX");
+        assert_eq!(proto.session_id_length.as_ref().unwrap().from, 16);
+        assert_eq!(proto.session_id_length.as_ref().unwrap().to, 32);
+        let cfg2 = Config::from_proto(proto).expect("from_proto");
+        assert_eq!(cfg2.session_id_table, "HEX");
+        assert_eq!(cfg2.session_id_length, Some(RangeConfig::new(16, 32)));
+        // 整 struct round-trip 不要求相等（其他字段非覆盖项不必全一致），仅断言本字段。
     }
 }

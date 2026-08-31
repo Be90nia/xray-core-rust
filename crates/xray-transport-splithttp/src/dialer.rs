@@ -13,7 +13,7 @@ use hyper_util::rt::TokioExecutor;
 use tokio::io::{AsyncRead as AsyncReadTrait, AsyncReadExt, AsyncWrite as AsyncWriteTrait, DuplexStream};
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::debug;
-use uuid::Uuid;
+
 use crate::client::{DefaultDialerClient, ReqBody, make_stream_body};
 use crate::config::Config;
 use crate::connection::SplitConn;
@@ -309,7 +309,7 @@ pub async fn dial(
     let session_id = if mode == "stream-one" {
         String::new()
     } else {
-        Uuid::new_v4().to_string()
+        config.generate_session_id()
     };
     let base_uri = build_request_url(
         scheme,
@@ -476,7 +476,7 @@ pub async fn dial_h3(
     let session_id = if mode == "stream-one" {
         String::new()
     } else {
-        Uuid::new_v4().to_string()
+        config.generate_session_id()
     };
     let base_uri = build_request_url(
         scheme,
