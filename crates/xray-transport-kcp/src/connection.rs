@@ -747,7 +747,11 @@ impl tokio::io::AsyncWrite for KcpConn {
         self: Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        let _ = self.inner.close();
+        // ponytail: bridge 半关闭时关闭底层 UDP socket——close() 仅置 ReadyToClose，
+        // client 端无 listener 触发 Terminated，fetch_input 阻塞 recv 永不返回
+        // （Runtime::drop 等 spawn_blocking 测试挂死根因）。Go dialer 由 listener
+        // Terminate 兜底；Rust dialer 必经此处。
+        self.inner.terminate();
         std::task::Poll::Ready(Ok(()))
     }
 }
