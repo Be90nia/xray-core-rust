@@ -280,11 +280,15 @@ where
 ///
 /// 双向流处理：raw→pipe 解密，pipe→raw 加密。
 pub(super) async fn tcp_bridge(
-    mut raw: Box<dyn super::super::AsyncIo>,
+    raw: Box<dyn super::super::AsyncIo>,
     mut pipe: tokio::io::DuplexStream,
     is_client: bool,
     config: super::Config,
 ) {
+    // 握手阶段需要同时读写 raw，所以这里不能 split；握手成功后把 raw move 进
+    // tokio::io::split 拿到独立的两个 half（read + write），padding/CFB8 都基于
+    // 这两个 half。
+    let mut raw = raw;
     let handshake_result = if is_client {
         client_handshake(
             &mut raw,
@@ -309,6 +313,38 @@ pub(super) async fn tcp_bridge(
     };
 
     let (mut r, mut w) = tokio::io::split(raw);
+
+    // 跑 2612 padding 调度（握手 → 加密隧道之间），模拟 MC 流量形状。
+    // `padding_disabled` 仅测试用：e2e 单向数据流测试没有下游 consumer，padding
+    // 双向写入会卡 buffer。
+    if !config.padding_disabled {
+        let schedule = if is_client {
+            match super::padding_preset::new_client_padding_schedule_2612() {
+                Ok(s) => s,
+                Err(_) => return,
+            }
+        } else {
+            match super::padding_preset::new_server_padding_schedule_2612() {
+                Ok(s) => s,
+                Err(_) => return,
+            }
+        };
+        // Rust 暂未实现 Login Acknowledged packet——此处 first_turn_prefix_length
+        // 传 0（对应 Go `loginAcknowledgedLength`）。Go v26.7.28 的 Login Ack 在
+        // 26.7.x 系列还会跟随 padding 一并完善，本次同步只覆盖 padding 调度部分。
+        if let Err(_) = super::padding::run_padding_schedule(
+            &mut r,
+            &mut w,
+            is_client,
+            0,
+            &schedule,
+        )
+        .await
+        {
+            return;
+        }
+    }
+
     let mut enc = Cfb8Enc::new(&secret, &secret);
     let mut dec = Cfb8Dec::new(&secret, &secret);
     let mut enc_buf = vec![0u8; super::super::UDP_SIZE];

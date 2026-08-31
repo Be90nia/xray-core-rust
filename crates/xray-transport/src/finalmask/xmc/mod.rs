@@ -12,10 +12,14 @@
 //! - [`cfb8`]：AES-128-CFB8 流加密（1 字节 feedback）
 //! - [`derivation`]：从 password 确定性派生 RSA-1024 私钥
 //! - [`conn`]：客户端/服务端握手流程 + TCP bridge
+//! - [`padding`]：握手后的方向性 padding 调度（对应 Go `padding.go`）
+//! - [`padding_preset`]：MC 26.1.2 startup + play_join padding 模板
 
 pub mod cfb8;
 pub mod conn;
 pub mod derivation;
+pub mod padding;
+pub mod padding_preset;
 pub mod protocol;
 
 use std::io;
@@ -35,6 +39,9 @@ pub struct Config {
     pub rsa_public_key: Vec<u8>,
     /// 伪装连接的主机名（写入 Handshake packet 的 serverAddress 字段）。
     pub hostname: String,
+    /// 跳过握手后的方向性 padding 调度（仅测试用——e2e 单向数据流测试没有下游
+    /// consumer，padding 双向写入会卡 buffer）。
+    pub padding_disabled: bool,
 }
 
 impl Tcpmask for Config {
@@ -79,6 +86,7 @@ mod tests {
             rsa_private_key: private_der,
             rsa_public_key: public_der,
             hostname: "localhost".into(),
+            padding_disabled: true,
         };
 
         let (client_raw, server_raw) = tokio::io::duplex(UDP_SIZE * 4);
@@ -123,8 +131,8 @@ mod tests {
             rsa_private_key: private_der,
             rsa_public_key: public_der,
             hostname: "localhost".into(),
+            padding_disabled: true,
         };
-
         let (client_raw, server_raw) = tokio::io::duplex(UDP_SIZE * 4);
         let wrapped_client: Box<dyn AsyncIo> =
             config.wrap_conn_client(Box::new(client_raw)).unwrap();
@@ -165,6 +173,7 @@ mod tests {
             rsa_private_key: private_der.clone(),
             rsa_public_key: public_der.clone(),
             hostname: "localhost".into(),
+            padding_disabled: true,
         };
         let client_cfg = Config {
             usernames: vec!["test_user".into()],
@@ -172,8 +181,8 @@ mod tests {
             rsa_private_key: vec![],
             rsa_public_key: public_der,
             hostname: "localhost".into(),
+            padding_disabled: true,
         };
-
         let (client_raw, server_raw) = tokio::io::duplex(UDP_SIZE * 4);
         let wrapped_client: Box<dyn AsyncIo> =
             client_cfg.wrap_conn_client(Box::new(client_raw)).unwrap();
