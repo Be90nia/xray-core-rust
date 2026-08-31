@@ -40,7 +40,10 @@ pub use config::Config;
 pub use connection::HttpUpgradeConnection;
 pub use dialer::{build_upgrade_request, parse_upgrade_response};
 pub use error::{HttpUpgradeError, Result};
-pub use hub::{UpgradeRequest, build_upgrade_response, parse_upgrade_request, parse_x_forwarded_for};
+pub use hub::{
+    UpgradeRequest, apply_trusted_x_forwarded_for, build_upgrade_response,
+    parse_upgrade_request, parse_x_forwarded_for,
+};
 pub use deferred::DeferredResponseReader;
 
 pub use register::{register_dialer, register_listener};

@@ -158,10 +158,13 @@ impl StreamSettings {
     /// 从 `sockopt_json` 解析 SocketOptions（对应 Go `SocketConfig`）。
     ///
     /// 支持字段：`mark` / `tcpFastOpen` / `tcpKeepAliveInterval`（秒）/
-    /// `tcpKeepAliveIdle`（秒）/ `v6only` / `dialerProxy` / `happyEyeballs`。
-    /// 缺省字段用 [`SocketOptions::default`]。Go 的 congestion/windowClamp/
-    /// maxSeg/userTimeout/interface 在
-    /// [`SocketOptions`](crate::sockopt::SocketOptions) 尚无对应字段，暂不解析。
+    /// `tcpKeepAliveIdle`（秒）/ `tcpMptcp` / `tcpCongestion` / `tproxy` / `reusePort` /
+    /// `v6only` / `dialerProxy` / `happyEyeballs` / `domainStrategy` /
+    /// `addressPortStrategy` / `trustedXForwardedFor` / `tcpWindowClamp` / `tcpMaxSeg` /
+    /// `penetrate` / `tcpUserTimeout`（毫秒）/ `customSockopt`。
+    /// 缺省字段用 [`SocketOptions::default`]。Go `interface`（接口名字符串）JSON 暂不
+    /// 解析（[`SocketOptions::bind_if_index`](crate::sockopt::SocketOptions) 字段已备，
+    /// 尚无 JSON 入口）。
     #[must_use]
     pub fn socket_options(&self) -> SocketOptions {
         let mut opts = SocketOptions::default();
@@ -190,6 +193,22 @@ impl StreamSettings {
         // sockopt 字段（sockopt_linux.go:40-44 / :104-108 / sockopt_freebsd.go:128-132）：
         if let Some(v) = obj.get("tcpCongestion").and_then(|v| v.as_str()) {
             opts.tcp_congestion = Some(v.to_string());
+        }
+        // TCP_WINDOW_CLAMP / TCP_MAXSEG / penetrate / TCP_USER_TIMEOUT（Go
+        // `SocketConfig` 字段 15/17/18/16，JSON tcpWindowClamp/tcpMaxSeg/penetrate/
+        // tcpUserTimeout，infra/conf/transport_sockopt.go:55-58；三个 TCP 选项仅
+        // Linux 应用，其余平台解析存储——见 sockopt 模块）。
+        if let Some(v) = obj.get("tcpWindowClamp").and_then(|v| v.as_i64()) {
+            opts.tcp_window_clamp = v as i32;
+        }
+        if let Some(v) = obj.get("tcpMaxSeg").and_then(|v| v.as_i64()) {
+            opts.tcp_max_seg = v as i32;
+        }
+        if let Some(v) = obj.get("penetrate").and_then(|v| v.as_bool()) {
+            opts.penetrate = v;
+        }
+        if let Some(v) = obj.get("tcpUserTimeout").and_then(|v| v.as_i64()) {
+            opts.tcp_user_timeout = v as i32;
         }
         if let Some(v) = obj.get("tproxy").and_then(|v| v.as_bool()) {
             opts.tproxy = v;
@@ -229,6 +248,32 @@ impl StreamSettings {
         // addressPortStrategy（bd 5y8，transport_internet.go:1124-1142，同上宽容）。
         if let Some(v) = obj.get("addressPortStrategy").and_then(|v| v.as_str()) {
             opts.address_port_strategy = parse_address_port_strategy(v);
+        }
+        // customSockopt（Go `SocketConfig.CustomSockopt` 字段 20，infra/conf
+        // transport_sockopt.go:12-19/123-135；全 string 字段原样透传，应用层
+        // `apply_custom_sockopt` 按 system/network 过滤后 setsockopt）。
+        if let Some(arr) = obj.get("customSockopt").and_then(|v| v.as_array()) {
+            opts.custom_sockopt = arr
+                .iter()
+                .filter_map(|c| {
+                    let o = c.as_object()?;
+                    Some(crate::sockopt::CustomSockopt {
+                        system: o.get("system").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                        network: o.get("network").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                        level: o.get("level").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                        opt: o.get("opt").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                        value: o.get("value").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                        r#type: o.get("type").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                    })
+                })
+                .collect();
+        }
+
+        // trustedXForwardedFor（Go `SocketConfig.TrustedXForwardedFor` 字段 23，
+        // JSON 字符串数组；headers.go ApplyTrustedXForwardedFor 信任门控名单）。
+        if let Some(v) = obj.get("trustedXForwardedFor").and_then(|v| v.as_array()) {
+            opts.trusted_x_forwarded_for =
+                v.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
         }
          opts
      }
@@ -619,6 +664,66 @@ mod transport_cache_tests {
         assert_eq!(s.socket_options().dialer_proxy, "proxy-out");
         // 缺省为空串。
         assert_eq!(StreamSettings::tcp().socket_options().dialer_proxy, "");
+    }
+
+    /// trustedXForwardedFor 解析（Go `SocketConfig.TrustedXForwardedFor`
+    /// 字段 23，repeated string，JSON 字符串数组）。
+    #[test]
+    fn socket_options_parses_trusted_x_forwarded_for() {
+        let mut s = StreamSettings::tcp();
+        s.sockopt_json = Some(serde_json::json!({
+            "trustedXForwardedFor": ["X-Real-IP", "CF-Connecting-IP"]
+        }));
+        assert_eq!(
+            s.socket_options().trusted_x_forwarded_for,
+            vec!["X-Real-IP".to_string(), "CF-Connecting-IP".to_string()]
+        );
+        // 缺省为空名单（默认永不采纳 XFF）。
+        assert!(StreamSettings::tcp().socket_options().trusted_x_forwarded_for.is_empty());
+    }
+
+    /// 末端 5 字段解析（Go infra/conf/transport_sockopt.go:55-62 字段定义：
+    /// tcpWindowClamp/tcpMaxSeg/penetrate/tcpUserTimeout 四标量 + customSockopt
+    /// 列表 roundtrip；customSockopt 全 string 字段原样透传）。
+    #[test]
+    fn socket_options_parses_end_fields_and_custom_sockopt() {
+        let mut s = StreamSettings::tcp();
+        s.sockopt_json = Some(serde_json::json!({
+            "tcpWindowClamp": 65536,
+            "tcpMaxSeg": 1200,
+            "tcpUserTimeout": 10000,
+            "penetrate": true,
+            "customSockopt": [
+                { "system": "linux", "network": "tcp", "level": "6",
+                  "opt": "5", "value": "1", "type": "int" },
+                { "network": "udp", "opt": "123", "value": "hello", "type": "str" }
+            ]
+        }));
+        let o = s.socket_options();
+        assert_eq!(o.tcp_window_clamp, 65536);
+        assert_eq!(o.tcp_max_seg, 1200);
+        assert_eq!(o.tcp_user_timeout, 10000);
+        assert!(o.penetrate);
+        // customSockopt 列表逐条 roundtrip（Go CustomSockoptConfig 六字段）。
+        assert_eq!(o.custom_sockopt.len(), 2);
+        assert_eq!(o.custom_sockopt[0].system, "linux");
+        assert_eq!(o.custom_sockopt[0].network, "tcp");
+        assert_eq!(o.custom_sockopt[0].level, "6");
+        assert_eq!(o.custom_sockopt[0].opt, "5");
+        assert_eq!(o.custom_sockopt[0].value, "1");
+        assert_eq!(o.custom_sockopt[0].r#type, "int");
+        assert_eq!(o.custom_sockopt[1].network, "udp");
+        assert_eq!(o.custom_sockopt[1].opt, "123");
+        assert_eq!(o.custom_sockopt[1].value, "hello");
+        assert_eq!(o.custom_sockopt[1].r#type, "str");
+
+        // 缺省：无字段 → Default（三 TCP 选项 0 / penetrate false / 列表空）。
+        let d = StreamSettings::tcp().socket_options();
+        assert_eq!(d.tcp_window_clamp, 0);
+        assert_eq!(d.tcp_max_seg, 0);
+        assert_eq!(d.tcp_user_timeout, 0);
+        assert!(!d.penetrate);
+        assert!(d.custom_sockopt.is_empty());
     }
 
     /// domainStrategy/addressPortStrategy 解析（bd 5y8，Go

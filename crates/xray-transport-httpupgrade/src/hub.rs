@@ -9,7 +9,7 @@
 //! TLS 包装、PROXY protocol 解析留切片2。
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use crate::config::Config;
 use crate::error::{HttpUpgradeError, Result};
@@ -133,6 +133,46 @@ pub fn parse_x_forwarded_for(value: &str) -> Vec<IpAddr> {
         .map(|s| s.trim())
         .filter_map(|s| s.parse::<IpAddr>().ok())
         .collect()
+}
+
+/// 按信任门控从请求头提取 `X-Forwarded-For` 覆盖源地址。对应 Go
+/// `common/protocol/http/headers.go::ApplyTrustedXForwardedFor`（hub.go:89-94 应用点）。
+///
+/// 返回 `Some(addr)`（端口恒 0，对齐 Go `TCPAddr{IP, 0}`）仅当：`trusted`
+/// 名单中任一 header 出现在请求中，且 XFF 首段（逗号前）解析为 IP。
+/// 其余情况一律返回 `None`（调用方保持真实连接地址）：
+/// - 请求无 XFF —— 无日志
+/// - 名单命中但 XFF 首段非 IP —— 无日志（对齐 Go for 循环内直接 return）
+/// - 无名单（默认不信任，防伪造）—— Go LogWarning
+/// - 有名单但名单 header 均不在场 —— Go LogError（疑似伪造）
+///
+/// `headers` 为 `parse_upgrade_request` 产出的小写键 map；`trusted` 条目
+/// 按小写匹配（Go `http.Header` 大小写不敏感语义）。
+pub fn apply_trusted_x_forwarded_for(
+    headers: &HashMap<String, String>,
+    trusted: &[String],
+) -> Option<SocketAddr> {
+    let Some(value) = headers.get("x-forwarded-for").filter(|v| !v.is_empty()) else {
+        return None;
+    };
+    // 首段 + trim（Go value[:idx] 后 ParseAddress 对首尾非 alnum 串 TrimSpace）。
+    let first = value.split(',').next().unwrap_or(value).trim();
+    if trusted
+        .iter()
+        .any(|t| headers.contains_key(t.to_ascii_lowercase().as_str()))
+    {
+        return first.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, 0));
+    }
+    if trusted.is_empty() {
+        tracing::warn!(
+            xff = value,
+            "received \"X-Forwarded-For\" but \"sockopt.trustedXForwardedFor\" is not configured; \
+             ignoring it and using the real remote address"
+        );
+    } else {
+        tracing::warn!(xff = value, "ignored potentially forged \"X-Forwarded-For\"");
+    }
+    None
 }
 
 /// 校验请求 Host 是否匹配配置允许的 host 列表（逗号分隔）。对应 Go
@@ -298,5 +338,52 @@ mod tests {
         assert_eq!(parsed.path, "/ws");
         let resp = build_upgrade_response();
         assert!(!resp.is_empty());
+    }
+
+    #[test]
+    fn xff_gate_empty_trusted_never_adopts() {
+        // 名单为空（默认）→ 永不采纳，即使请求带 XFF。
+        let mut h = HashMap::new();
+        h.insert("x-forwarded-for".to_string(), "10.0.0.1".to_string());
+        assert!(apply_trusted_x_forwarded_for(&h, &[]).is_none());
+    }
+
+    #[test]
+    fn xff_gate_trusted_header_present_adopts_first_ip_with_zero_port() {
+        let mut h = HashMap::new();
+        h.insert("x-forwarded-for".to_string(), "10.0.0.1, 192.168.1.1".to_string());
+        h.insert("x-real-ip".to_string(), "1.2.3.4".to_string());
+        let trusted = vec!["X-Real-IP".to_string()]; // 大小写不敏感匹配
+        let addr = apply_trusted_x_forwarded_for(&h, &trusted).unwrap();
+        assert_eq!(addr.port(), 0);
+        assert_eq!(addr.ip().to_string(), "10.0.0.1"); // 首段
+    }
+
+    #[test]
+    fn xff_gate_trusted_configured_but_header_absent_rejects() {
+        let mut h = HashMap::new();
+        h.insert("x-forwarded-for".to_string(), "10.0.0.1".to_string());
+        let trusted = vec!["X-Real-IP".to_string()];
+        assert!(apply_trusted_x_forwarded_for(&h, &trusted).is_none());
+    }
+
+    #[test]
+    fn xff_gate_non_ip_first_segment_rejects() {
+        let mut h = HashMap::new();
+        h.insert("x-forwarded-for".to_string(), "evil.example, 1.2.3.4".to_string());
+        h.insert("x-real-ip".to_string(), "1.2.3.4".to_string());
+        let trusted = vec!["X-Real-IP".to_string()];
+        assert!(apply_trusted_x_forwarded_for(&h, &trusted).is_none());
+    }
+
+    #[test]
+    fn xff_gate_no_xff_returns_none() {
+        let h: HashMap<String, String> = HashMap::new();
+        let trusted = vec!["X-Real-IP".to_string()];
+        assert!(apply_trusted_x_forwarded_for(&h, &trusted).is_none());
+        // XFF 值为空串等同不存在（Go header.Get == ""）。
+        let mut h_empty = HashMap::new();
+        h_empty.insert("x-forwarded-for".to_string(), String::new());
+        assert!(apply_trusted_x_forwarded_for(&h_empty, &trusted).is_none());
     }
 }

@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::config::Config;
 use crate::connection::HttpUpgradeConnection;
 use crate::error::Result;
-use crate::hub::{build_upgrade_response, parse_upgrade_request};
+use crate::hub::{apply_trusted_x_forwarded_for, build_upgrade_response, parse_upgrade_request};
 
 /// HTTP/1.1 请求头读取缓冲初始大小（含 `\r\n\r\n` 终止符）。
 const READ_INITIAL_CAPACITY: usize = 1024;
@@ -28,13 +28,16 @@ const READ_MAX_CAPACITY: usize = 64 * 1024;
 pub struct HttpUpgradeServer {
     /// 协议配置（提供 host 白名单 + path 校验）。
     pub config: Config,
+    /// 可信 XFF header 名单（来自 `sockopt.trustedXForwardedFor`）。
+    /// 空 = 永不采纳 XFF（默认不信任，防伪造；Go hub.go:90-94）。
+    pub trusted_x_forwarded_for: Vec<String>,
 }
 
 impl HttpUpgradeServer {
     /// 构造 server。
     #[must_use]
     pub fn new(config: Config) -> Self {
-        Self { config }
+        Self { config, trusted_x_forwarded_for: Vec::new() }
     }
 
     /// 在已建立的 IO 上执行服务端握手。
@@ -88,8 +91,10 @@ impl HttpUpgradeServer {
         io.write_all(&resp_bytes).await?;
         io.flush().await?;
 
-        // 4. 提取 remote_addr_override
-        let remote_addr = remote_addr_from_forwarded(&req.forwarded_for);
+        // 4. XFF 信任门控提取 remote_addr_override（Go hub.go:89-94：
+        // 默认不信任，仅名单命中时采纳，None = 上层保持真实连接地址）。
+        let remote_addr =
+            apply_trusted_x_forwarded_for(&req.headers, &self.trusted_x_forwarded_for);
 
         // 余留 payload（紧跟 \r\n\r\n 之后的字节）
         // parse_upgrade_request 内部找到 \r\n\r\n 但不返回位置，需要重新计算
@@ -104,11 +109,6 @@ impl HttpUpgradeServer {
 
         Ok((HttpUpgradeConnection::new(io, remote_addr), leftover))
     }
-}
-
-/// 从 XFF 列表构造 remote_addr（首个 IP + 端口 0，对齐 Go 行为）。
-fn remote_addr_from_forwarded(forwarded: &[IpAddr]) -> Option<SocketAddr> {
-    forwarded.first().map(|ip| SocketAddr::new(*ip, 0))
 }
 
 /// 在字节流中查找 `\r\n\r\n` 位置。返回起始下标。
@@ -170,8 +170,10 @@ mod tests {
         assert_eq!(leftover, b"hello after");
     }
 
+    /// 伪造 XFF 默认被拒：未配置 `trustedXForwardedFor` 时不采纳（Go 默认不信任，
+    /// headers.go ApplyTrustedXForwardedFor 名单为空走 warning 路径）。
     #[tokio::test]
-    async fn handshake_extracts_xff_to_remote_addr() {
+    async fn handshake_rejects_xff_by_default_without_trusted_config() {
         let server = HttpUpgradeServer::new(make_config("/ws"));
         let (mut server_io, mut client_io) = duplex(8192);
 
@@ -183,10 +185,46 @@ mod tests {
         let _ = client_io.read(&mut buf).await;
 
         let (conn, _leftover) = handle.await.unwrap().unwrap();
+        assert!(conn.remote_addr_override.is_none());
+    }
+
+    /// 门控开：请求携带名单中的可信 header → 采纳 XFF 首段为源地址（端口 0）。
+    #[tokio::test]
+    async fn handshake_adopts_xff_when_trusted_header_present() {
+        let mut server = HttpUpgradeServer::new(make_config("/ws"));
+        server.trusted_x_forwarded_for = vec!["X-Real-IP".into()];
+        let (mut server_io, mut client_io) = duplex(8192);
+
+        let req = b"GET /ws HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nX-Real-IP: 1.2.3.4\r\nX-Forwarded-For: 10.0.0.1, 192.168.1.1\r\n\r\n";
+        client_io.write_all(req).await.unwrap();
+
+        let handle = tokio::spawn(async move { server.handshake_io(server_io).await });
+        let mut buf = vec![0u8; 1024];
+        let _ = client_io.read(&mut buf).await;
+
+        let (conn, _leftover) = handle.await.unwrap().unwrap();
         assert_eq!(
             conn.remote_addr_override,
             Some(SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)), 0))
         );
+    }
+
+    /// 门控开但名单 header 均不在场 → 拒绝（Go error「potentially forged」路径）。
+    #[tokio::test]
+    async fn handshake_rejects_xff_when_trusted_header_absent() {
+        let mut server = HttpUpgradeServer::new(make_config("/ws"));
+        server.trusted_x_forwarded_for = vec!["X-Real-IP".into()];
+        let (mut server_io, mut client_io) = duplex(8192);
+
+        let req = b"GET /ws HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nX-Forwarded-For: 10.0.0.1\r\n\r\n";
+        client_io.write_all(req).await.unwrap();
+
+        let handle = tokio::spawn(async move { server.handshake_io(server_io).await });
+        let mut buf = vec![0u8; 1024];
+        let _ = client_io.read(&mut buf).await;
+
+        let (conn, _leftover) = handle.await.unwrap().unwrap();
+        assert!(conn.remote_addr_override.is_none());
     }
 
     #[tokio::test]
@@ -223,17 +261,4 @@ mod tests {
         assert!(matches!(err, crate::error::HttpUpgradeError::InvalidHttpFormat(_)));
     }
 
-    #[test]
-    fn remote_addr_helper_uses_first_ip_with_zero_port() {
-        let ips = vec!["10.0.0.1".parse().unwrap(), "192.168.1.1".parse().unwrap()];
-        let addr = remote_addr_from_forwarded(&ips).unwrap();
-        assert_eq!(addr.port(), 0);
-        assert_eq!(addr.ip().to_string(), "10.0.0.1");
-    }
-
-    #[test]
-    fn remote_addr_helper_empty_returns_none() {
-        let ips: Vec<IpAddr> = vec![];
-        assert!(remote_addr_from_forwarded(&ips).is_none());
-    }
 }

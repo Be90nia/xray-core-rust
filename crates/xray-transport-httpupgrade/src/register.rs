@@ -75,7 +75,7 @@ pub fn register_listener() -> io::Result<()> {
 async fn listen_httpupgrade(
     addr: SocketAddr,
     settings: &StreamSettings,
-    _sockopt: &SocketOptions,
+    sockopt: &SocketOptions,
     handler: ConnHandler,
 ) -> io::Result<Box<dyn TransportListener>> {
     let config = parse_httpupgrade_config(settings.transport_json.as_ref())?;
@@ -96,8 +96,10 @@ async fn listen_httpupgrade(
         )?,
     );
 
-    // 3. spawn accept loop
-    let server = HttpUpgradeServer::new(config);
+    // 3. spawn accept loop（XFF 信任名单来自 sockopt.trustedXForwardedFor，
+    // Go hub.go:117-121 + 90-94）。
+    let mut server = HttpUpgradeServer::new(config);
+    server.trusted_x_forwarded_for = sockopt.trusted_x_forwarded_for.clone();
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
 

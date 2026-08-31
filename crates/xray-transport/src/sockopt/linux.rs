@@ -7,6 +7,7 @@
 //! - SO_REUSEPORT
 //! - IP_TRANSPARENT（透明代理）
 //! - TCP_CONGESTION（拥塞控制算法）
+//! - TCP_WINDOW_CLAMP / TCP_USER_TIMEOUT / TCP_MAXSEG（Go sockopt_linux.go:46-62）
 //!
 //! 所有 unsafe 调用均带 SAFETY 注释。
 
@@ -31,6 +32,15 @@ pub struct LinuxSockOpt {
     /// 绑定到指定网络接口索引。`0`=不绑定。
     /// 对应 Go `SO_BINDTODEVICE`。通过 `if_indextoname` 转为接口名后 setsockopt。
     pub bind_if_index: u32,
+    /// TCP_WINDOW_CLAMP 边界缓冲上限（字节）。`0`=不设置。
+    /// 对应 Go `SocketConfig.TcpWindowClamp`（sockopt_linux.go:46-50/155-159）。
+    pub tcp_window_clamp: i32,
+    /// TCP_USER_TIMEOUT（毫秒，RFC 5482）。`0`=不设置。
+    /// 对应 Go `SocketConfig.TcpUserTimeout`（sockopt_linux.go:52-56/161-165）。
+    pub tcp_user_timeout: i32,
+    /// TCP_MAXSEG 最大 MSS（字节）。`0`=不设置。
+    /// 对应 Go `SocketConfig.TcpMaxSeg`（sockopt_linux.go:58-62/167-171）。
+    pub tcp_max_seg: i32,
 }
 
 impl LinuxSockOpt {
@@ -59,6 +69,18 @@ impl LinuxSockOpt {
         // TCP_CONGESTION
         if let Some(ref algo) = self.tcp_congestion {
             self.set_tcp_congestion(fd, algo)?;
+        }
+
+        // TCP_WINDOW_CLAMP / TCP_USER_TIMEOUT / TCP_MAXSEG（Go sockopt_linux.go:46-62；
+        // 入站分支 :155-171 同型应用，`>0` 才设置）。
+        if self.tcp_window_clamp > 0 {
+            Self::set_tcp_int(fd, libc::TCP_WINDOW_CLAMP, self.tcp_window_clamp)?;
+        }
+        if self.tcp_user_timeout > 0 {
+            Self::set_tcp_int(fd, libc::TCP_USER_TIMEOUT, self.tcp_user_timeout)?;
+        }
+        if self.tcp_max_seg > 0 {
+            Self::set_tcp_int(fd, libc::TCP_MAXSEG, self.tcp_max_seg)?;
         }
 
         // SO_MARK
@@ -150,6 +172,24 @@ impl LinuxSockOpt {
                 fd,
                 libc::SOL_IP,
                 libc::IP_TRANSPARENT,
+                &val as *const i32 as *const libc::c_void,
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            );
+            if ret < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// TCP 整数选项通用 setter（TCP_WINDOW_CLAMP / TCP_USER_TIMEOUT / TCP_MAXSEG）。
+    fn set_tcp_int(fd: i32, opt: i32, val: i32) -> io::Result<()> {
+        // SAFETY: setsockopt 对已验证 fd 设置 TCP 整数选项，内核验证参数合法性。
+        unsafe {
+            let ret = libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                opt,
                 &val as *const i32 as *const libc::c_void,
                 std::mem::size_of::<i32>() as libc::socklen_t,
             );

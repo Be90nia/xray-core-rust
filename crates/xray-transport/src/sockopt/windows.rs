@@ -16,8 +16,11 @@
 //! - keepalive → `set_keepalive_config`（Go Windows 仅 SO_KEEPALIVE 开关 :73-81；
 //!   socket2 `SIO_KEEPALIVE_VALS` 物化更完整）
 //!
-//! 未实现：Go `CustomSockopt`（SocketOptions 无对应字段；Go Windows 仅支持
-//! int 类型，str 类型直接报错，:113）。
+//! CustomSockopt：由通用层 mod.rs 的 `apply_custom_sockopt` 应用
+//! （int 类型全支持；str 类型报错不支持，Go :113 "Str type does not supported
+//! on windows"）。TcpWindowClamp/TcpUserTimeout/TcpMaxSeg 仅解析存储——Go
+//! sockopt_windows.go 同样不应用这三项（Winsock 无 TCP_USER_TIMEOUT/
+//! TCP_WINDOW_CLAMP 导出）。
 
 use std::io;
 
@@ -40,7 +43,7 @@ unsafe extern "system" {
     fn setsockopt(s: usize, level: i32, optname: i32, optval: *const i32, optlen: i32) -> i32;
 }
 
-fn setsockopt_int(s: usize, level: i32, optname: i32, val: i32) -> io::Result<()> {
+pub(crate) fn setsockopt_int(s: usize, level: i32, optname: i32, val: i32) -> io::Result<()> {
     // SAFETY: s 为有效 SOCKET 句柄（调用方来自 socket2::Socket::as_raw_socket）；
     // optval 指向栈上 i32，optlen 与类型一致；winsock 同步返回，不保留指针。
     let ret = unsafe { setsockopt(s, level, optname, &val, std::mem::size_of::<i32>() as i32) };

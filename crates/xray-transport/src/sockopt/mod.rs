@@ -265,6 +265,33 @@ pub struct SocketOptions {
     /// SRV/TXT 记录覆盖目标地址/端口策略。对应 Go
     /// `SocketConfig.AddressPortStrategy`（infra/conf/transport_internet.go:1050）。默认 `None`。
     pub address_port_strategy: AddressPortStrategy,
+    /// 可信 `X-Forwarded-For` 采纳门控 header 名单。对应 Go
+    /// `SocketConfig.TrustedXForwardedFor`（config.proto 字段 23，`repeated string`，
+    /// JSON `trustedXForwardedFor`）。入站仅当请求携带名单中任一 header 时才把
+    /// XFF 首段采纳为源地址；空 = 永不采纳（防伪造，Go headers.go
+    /// `ApplyTrustedXForwardedFor`）。
+    pub trusted_x_forwarded_for: Vec<String>,
+    /// TCP_WINDOW_CLAMP 边界缓冲上限（字节）。对应 Go `SocketConfig.TcpWindowClamp`
+    /// （config.proto 字段 15，JSON `tcpWindowClamp`）。仅 Linux 应用
+    /// （sockopt_linux.go:46-50/155-159）；Go Windows/Darwin/FreeBSD 分支均不应用，
+    /// 其余平台仅解析存储。`0`=不设置。
+    pub tcp_window_clamp: i32,
+    /// TCP_USER_TIMEOUT（毫秒，RFC 5482）。对应 Go `SocketConfig.TcpUserTimeout`
+    /// （字段 16，JSON `tcpUserTimeout`）。仅 Linux 应用（sockopt_linux.go:52-56）。
+    /// `0`=不设置。
+    pub tcp_user_timeout: i32,
+    /// TCP_MAXSEG 最大 MSS（字节）。对应 Go `SocketConfig.TcpMaxSeg`
+    /// （字段 17，JSON `tcpMaxSeg`）。仅 Linux 应用（sockopt_linux.go:58-62）。
+    /// `0`=不设置。
+    pub tcp_max_seg: i32,
+    /// splithttp 拨号时下载连接继承本 sockopt。对应 Go `SocketConfig.Penetrate`
+    /// （字段 18，JSON `penetrate`；消费点 splithttp/dialer.go:387）。
+    pub penetrate: bool,
+    /// 自定义 setsockopt 列表。对应 Go `SocketConfig.CustomSockopt`
+    /// （字段 20，JSON `customSockopt`）。Linux/Darwin/Windows 应用（int 类型全平台；
+    /// str 类型 Windows 报错不支持，Go sockopt_windows.go:113），FreeBSD 不应用
+    /// （Go sockopt_freebsd.go 无 custom 循环）。
+    pub custom_sockopt: Vec<CustomSockopt>,
 }
 
 /// Happy Eyeballs 配置。对应 Go `HappyEyeballsConfig`
@@ -296,6 +323,25 @@ impl Default for HappyEyeballsConfig {
         }
     }
 }
+/// 自定义 socket 选项条目。对应 Go `internet.CustomSockopt`（config.proto:94-101）。
+/// 全字段 string（proto 原样）：level/opt 为十进制数字字符串，应用时才 Atoi
+/// （Go `strconv.Atoi` 失败静默取 0，此处同款）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CustomSockopt {
+    /// 限定 OS（`runtime.GOOS` 形式，如 "linux"/"windows"）；空 = 全平台。
+    pub system: String,
+    /// 限定网络前缀（"tcp"/"tcp4"/"udp"…，Go `strings.HasPrefix` 匹配）；空 = 全网络。
+    pub network: String,
+    /// setsockopt level 十进制字符串；空 = 0x6（IPPROTO_TCP，Go 默认）。
+    pub level: String,
+    /// setsockopt optname 十进制字符串；空 = Go 报错 "No opt!"。
+    pub opt: String,
+    /// 选项值（int 十进制 / str 原样字节）。
+    pub value: String,
+    /// 值类型："int" 或 "str"，其他值 Go 报错 "unknown CustomSockopt type"。
+    pub r#type: String,
+}
+
 impl Default for SocketOptions {
     fn default() -> Self {
         // 与 Go DefaultSystemDialer 的 Chrome 默认值一致。
@@ -315,6 +361,12 @@ impl Default for SocketOptions {
             happy_eyeballs: None,
             domain_strategy: DomainStrategy::AsIs,
             address_port_strategy: AddressPortStrategy::None,
+            trusted_x_forwarded_for: Vec::new(),
+            tcp_window_clamp: 0,
+            tcp_user_timeout: 0,
+            tcp_max_seg: 0,
+            penetrate: false,
+            custom_sockopt: Vec::new(),
         }
     }
 }
@@ -327,12 +379,13 @@ impl Default for SocketOptions {
 /// 跳过 TFO 设置，因此本函数可在 `SocketOptions::default()` 上无副作用通过。
 ///
 /// 各平台覆盖范围：
-/// - Linux：TFO_CONNECT / TCP_CONGESTION / SO_REUSEPORT / IP_TRANSPARENT（tproxy）/
-///   SO_MARK / SO_BINDTODEVICE
+/// - Linux：TFO_CONNECT / TCP_CONGESTION / TCP_WINDOW_CLAMP / TCP_USER_TIMEOUT /
+///   TCP_MAXSEG / SO_REUSEPORT / IP_TRANSPARENT（tproxy）/ SO_MARK / SO_BINDTODEVICE
 /// - FreeBSD：TFO / SO_REUSEPORT_LB→SO_REUSEPORT / SO_USER_COOKIE（mark）
 /// - Darwin：TFO_CLIENT 位 / SO_REUSEPORT / IP_BOUND_IF / IPV6_BOUND_IF /
 ///   TCP_KEEPALIVE-KEEPINTVL
 /// - Windows：Winsock TCP_FASTOPEN=15 / IP_UNICAST_IF / IPV6_UNICAST_IF
+/// - CustomSockopt：Linux/Darwin/Windows 应用（FreeBSD 无），见 [`apply_custom_sockopt`]
 pub fn apply_outbound_socket_options(socket: &Socket, opts: &SocketOptions) -> std::io::Result<()> {
     // TCP_NODELAY：跨平台通用。
     socket.set_nodelay(opts.tcp_nodelay)?;
@@ -354,6 +407,9 @@ pub fn apply_outbound_socket_options(socket: &Socket, opts: &SocketOptions) -> s
             inbound: false,
             mark: opts.mark,
             bind_if_index: opts.bind_if_index,
+            tcp_window_clamp: opts.tcp_window_clamp,
+            tcp_user_timeout: opts.tcp_user_timeout,
+            tcp_max_seg: opts.tcp_max_seg,
         }
         .apply(fd)?;
     }
@@ -398,6 +454,9 @@ pub fn apply_outbound_socket_options(socket: &Socket, opts: &SocketOptions) -> s
         .apply(s)?;
     }
 
+    // CustomSockopt：Linux/Darwin/Windows 应用，FreeBSD 无（Go 各平台文件差异）。
+    #[cfg(not(target_os = "freebsd"))]
+    apply_custom_sockopt(socket, opts)?;
     Ok(())
 }
 
@@ -432,6 +491,9 @@ pub fn apply_inbound_socket_options(socket: &Socket, opts: &SocketOptions) -> st
             inbound: true,
             mark: opts.mark,
             bind_if_index: opts.bind_if_index,
+            tcp_window_clamp: opts.tcp_window_clamp,
+            tcp_user_timeout: opts.tcp_user_timeout,
+            tcp_max_seg: opts.tcp_max_seg,
         }
         .apply(fd)?;
     }
@@ -474,6 +536,142 @@ pub fn apply_inbound_socket_options(socket: &Socket, opts: &SocketOptions) -> st
         .apply(s)?;
     }
 
+    // CustomSockopt：Linux/Darwin/Windows 应用，FreeBSD 无（Go 各平台文件差异）。
+    #[cfg(not(target_os = "freebsd"))]
+    apply_custom_sockopt(socket, opts)?;
+    Ok(())
+}
+
+/// 应用 [`SocketOptions::custom_sockopt`]。对应 Go 各平台 apply*SocketOptions 的
+/// custom 循环（sockopt_linux.go:66-102/172-208、sockopt_windows.go:84-118/145-179、
+/// sockopt_darwin.go:152-188/248-284；sockopt_freebsd.go 无此循环，调用点已 cfg 门控）。
+///
+/// - `system` 过滤：非空且 ≠ 当前 OS 跳过（`std::env::consts::OS` ≡ `runtime.GOOS`）。
+/// - `network` 前缀过滤（Go `strings.HasPrefix`）：Go 调用层只产生 "tcp"/"udp" 两族
+///   （net.Dial network），此处按 socket 类型等价推导；"tcp" 前缀天然覆盖 tcp4/tcp6。
+/// - `opt` 为空报 "No opt!"；Atoi 失败静默取 0（Go `opt, _ = strconv.Atoi` 同款）。
+/// - `type`：`"int"` 全平台 / `"str"` Windows 报错不支持（Go :113）/ 其他值报
+///   "unknown CustomSockopt type"。
+fn apply_custom_sockopt(socket: &Socket, opts: &SocketOptions) -> std::io::Result<()> {
+    if opts.custom_sockopt.is_empty() {
+        return Ok(());
+    }
+    let network = if socket.r#type().is_ok_and(|t| t == socket2::Type::DGRAM) {
+        "udp"
+    } else {
+        "tcp"
+    };
+    for custom in &opts.custom_sockopt {
+        if !custom.system.is_empty() && custom.system != std::env::consts::OS {
+            continue;
+        }
+        if !network.starts_with(custom.network.as_str()) {
+            continue;
+        }
+        if custom.opt.is_empty() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "No opt!"));
+        }
+        let opt: i32 = custom.opt.parse().unwrap_or(0);
+        let level: i32 = if custom.level.is_empty() {
+            0x6 // Go 默认 IPPROTO_TCP
+        } else {
+            custom.level.parse().unwrap_or(0)
+        };
+        match custom.r#type.as_str() {
+            "int" => {
+                let value: i32 = custom.value.parse().unwrap_or(0);
+                set_custom_sockopt_int(socket, level, opt, value)?;
+            }
+            "str" => {
+                #[cfg(target_os = "windows")]
+                {
+                    return Err(std::io::Error::other(
+                        "failed to set CustomSockoptString: Str type does not supported on windows",
+                    ));
+                }
+                #[cfg(unix)]
+                {
+                    let c_val = std::ffi::CString::new(custom.value.as_bytes()).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "customSockopt value contains null byte",
+                        )
+                    })?;
+                    set_custom_sockopt_str(socket, level, opt, &c_val)?;
+                }
+            }
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unknown CustomSockopt type: {other}"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// CustomSockopt int 值 setsockopt（跨平台）。
+fn set_custom_sockopt_int(
+    socket: &Socket,
+    level: i32,
+    opt: i32,
+    value: i32,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        // SAFETY: setsockopt 对有效 fd 设置整数选项；内核验证 level/opt 组合，
+        // 指针指向栈上 i32，同步调用不保留指针。
+        let ret = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                level as libc::c_int,
+                opt as libc::c_int,
+                &value as *const i32 as *const libc::c_void,
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::setsockopt_int(socket.as_raw_socket() as usize, level, opt, value)
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        let _ = (socket, level, opt, value);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "custom sockopt: unsupported platform",
+        ))
+    }
+}
+
+#[cfg(unix)]
+/// CustomSockopt str 值 setsockopt（unix；Go `syscall.SetsockoptString` 同形，
+/// 按字节写入不含 NUL 终止符）。
+fn set_custom_sockopt_str(
+    socket: &Socket,
+    level: i32,
+    opt: i32,
+    value: &std::ffi::CStr,
+) -> std::io::Result<()> {
+    // SAFETY: setsockopt 对有效 fd 写入 CStr 字节；指针生命周期覆盖同步调用。
+    let ret = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            level as libc::c_int,
+            opt as libc::c_int,
+            value.as_ptr() as *const libc::c_void,
+            value.to_bytes().len() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(())
 }
 
@@ -832,5 +1030,89 @@ mod tests {
         let opts = SocketOptions::default();
         assert_eq!(opts.domain_strategy, DomainStrategy::AsIs);
         assert_eq!(opts.address_port_strategy, AddressPortStrategy::None);
+    }
+    /// CustomSockopt 应用：int 类型经真实 setsockopt 生效（TCP_NODELAY=1 回读验证，
+    /// 对应 Go custom 循环 sockopt_linux.go:66-102 / windows:84-118；network 前缀
+    /// "tcp" 匹配、level 缺省 0x6=IPPROTO_TCP、Atoi 解析）。
+    #[tokio::test]
+    async fn custom_sockopt_int_applies_on_real_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_task = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let socket = socket2::Socket::from(stream.into_std().unwrap());
+
+        let mut opts = SocketOptions::default();
+        opts.tcp_nodelay = false; // 先关，custom int 应把它打开
+        opts.custom_sockopt.push(CustomSockopt {
+            network: "tcp".to_string(),
+            level: "6".to_string(), // IPPROTO_TCP
+            opt: "1".to_string(),   // TCP_NODELAY
+            value: "1".to_string(),
+            r#type: "int".to_string(),
+            ..Default::default()
+        });
+        apply_outbound_socket_options(&socket, &opts).unwrap();
+        assert!(socket.nodelay().unwrap(), "customSockopt int 应已设置 TCP_NODELAY");
+
+        drop(socket);
+        accept_task.await.unwrap();
+    }
+
+    /// CustomSockopt 过滤与错误路径：system 不匹配跳过（Go LogDebug+continue）、
+    /// opt 缺失报 "No opt!"（sockopt_linux.go:81-82）、未知 type 报错（:98-99）。
+    #[tokio::test]
+    async fn custom_sockopt_filter_and_error_paths() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_task = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let socket = socket2::Socket::from(stream.into_std().unwrap());
+        let mut opts = SocketOptions::default();
+        opts.tcp_nodelay = false;
+
+        // system 不匹配当前 OS → 跳过，不报错、不生效。
+        #[cfg(target_os = "windows")]
+        let other_os = "linux";
+        #[cfg(not(target_os = "windows"))]
+        let other_os = "windows";
+        opts.custom_sockopt.push(CustomSockopt {
+            system: other_os.to_string(),
+            network: "tcp".to_string(),
+            level: "6".to_string(),
+            opt: "1".to_string(),
+            value: "1".to_string(),
+            r#type: "int".to_string(),
+        });
+        apply_outbound_socket_options(&socket, &opts).unwrap();
+        assert!(!socket.nodelay().unwrap(), "system 不匹配应跳过");
+
+        // opt 缺失 → "No opt!"。
+        opts.custom_sockopt.clear();
+        opts.custom_sockopt.push(CustomSockopt {
+            network: "tcp".to_string(),
+            value: "1".to_string(),
+            r#type: "int".to_string(),
+            ..Default::default()
+        });
+        let err = apply_outbound_socket_options(&socket, &opts).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("No opt!"), "应报 No opt!：{err}");
+
+        // 未知 type → "unknown CustomSockopt type"。
+        opts.custom_sockopt[0].opt = "1".to_string();
+        opts.custom_sockopt[0].r#type = "bogus".to_string();
+        let err = apply_outbound_socket_options(&socket, &opts).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown CustomSockopt type"),
+            "应报 unknown type：{err}"
+        );
+
+        drop(socket);
+        accept_task.await.unwrap();
     }
 }
