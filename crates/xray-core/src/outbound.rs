@@ -30,7 +30,7 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use xray_app_dispatcher::default::{DefaultDispatcher, DialBridge, PinFuture, SimpleOhm};
+use xray_app_dispatcher::default::{DefaultDispatcher, DialBridge, PinFuture, SimpleOhm, SniffingRequest};
 use xray_app_dispatcher::DispatchHandler;
 use xray_app_dispatcher::OutboundHandlerManager;
 use xray_proxy_loopback::{LoopbackError, LoopbackFuture, LoopbackSink};
@@ -64,6 +64,18 @@ use xray_proxy_wireguard::DeviceConfig;
 #[derive(Debug)]
 struct DispatcherLoopbackSink {
     inner: Arc<DefaultDispatcher>,
+    /// Go loopback.go:56-62 `init` 构建的 SniffingRequest；None → default
+    /// （enabled=false，重分发不嗅探，等价 Go 零值 SniffingRequest）。
+    sniffing: Option<SniffingRequest>,
+}
+
+impl DispatcherLoopbackSink {
+    /// 附加 loopback 配置解析出的嗅探请求（对应 Go `Loopback.init`，loopback.go:56-62）。
+    #[must_use]
+    fn with_sniffing(mut self, sniffing: SniffingRequest) -> Self {
+        self.sniffing = Some(sniffing);
+        self
+    }
 }
 
 impl LoopbackSink for DispatcherLoopbackSink {
@@ -73,8 +85,8 @@ impl LoopbackSink for DispatcherLoopbackSink {
         destination: xray_common::net::destination::Destination,
         link: xray_transport::link::Link,
     ) -> LoopbackFuture<std::result::Result<(), LoopbackError>> {
-        use xray_app_dispatcher::default::SniffingRequest;
-        let sniffing = SniffingRequest::default();
+        // Go loopback.go:32-36：content.SniffingRequest = l.sniffingRequest 注入重分发。
+        let sniffing = self.sniffing.clone().unwrap_or_default();
         match self.inner.dispatch_link(&destination, link, &sniffing, None, None) {
             Ok(()) => Box::pin(async { Ok(()) }),
             Err(e) => Box::pin(async move {
@@ -684,7 +696,12 @@ fn try_build_handler(
             Ok((Arc::new(bridge) as Arc<dyn DispatchHandler>, None, None))
         }
         "loopback" => {
-            let inbound_tag = parse_loopback_config(&ob.entry.data)?;
+            // Go loopback.go:56-62：sniffing 经 BuildSniffingRequest 注入重分发。
+            // TODO(loopback-sniffing): LoopbackSink trait（xray-proxy-loopback，非本批
+            // 文件域）签名无 sniffing 参数，且 functions.rs 装配 sink 当前传 None；
+            // 请求已由 parse_loopback_config 构建就绪，sink 装配接
+            // DispatcherLoopbackSink::with_sniffing 后即端到端生效。
+            let (inbound_tag, _sniffing) = parse_loopback_config(&ob.entry.data)?;
             let handler = xray_proxy_loopback::LoopbackHandler::with_inbound_tag(
                 ob.tag.clone(), inbound_tag,
             );
@@ -2037,15 +2054,21 @@ fn parse_wireguard_config(data: &[u8]) -> std::result::Result<DeviceConfig, Stri
     })
 }
 
-/// 解析 loopback outbound settings JSON → inbound_tag。
+/// 解析 loopback outbound settings JSON → (inbound_tag, 嗅探请求)。
 ///
-/// JSON 格式：`{ "inboundTag": "..." }`
-fn parse_loopback_config(data: &[u8]) -> std::result::Result<String, String> {
+/// JSON 格式：`{ "inboundTag": "...", "sniffing": {...} }`。对应 Go
+/// `LoopbackConfig`（infra/conf/loopback.go:9-12）；sniffing 复用 inbound 的
+/// [`crate::wiring::sniffing_request_from_json`] 转换（Go
+/// `proxyman.BuildSniffingRequest`，由 `Loopback.init` loopback.go:56-62 注入）。
+fn parse_loopback_config(data: &[u8]) -> std::result::Result<(String, SniffingRequest), String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
-    v.get("inboundTag")
+    let inbound_tag = v
+        .get("inboundTag")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| "missing inboundTag".to_string())
+        .ok_or_else(|| "missing inboundTag".to_string())?;
+    let sniffing = crate::wiring::sniffing_request_from_json(v.get("sniffing"));
+    Ok((inbound_tag, sniffing))
 }
 
 /// 解析 dokodemo outbound settings JSON → DokodemoOutboundConfig。
@@ -2146,6 +2169,40 @@ mod tests {
         assert!(!map.contains_key("m4"));
         assert!(!map.contains_key("m5"));
         assert!(!map.contains_key("m6"));
+    }
+
+    #[test]
+    fn parse_loopback_config_without_sniffing_defaults_disabled() {
+        let (tag, sniffing) = parse_loopback_config(br#"{"inboundTag":"socks-in"}"#).unwrap();
+        assert_eq!(tag, "socks-in");
+        assert!(!sniffing.enabled, "无 sniffing → default 请求（不嗅探，等价 Go 零值）");
+    }
+
+    #[test]
+    fn parse_loopback_config_with_sniffing_builds_request() {
+        let raw = br#"{"inboundTag":"socks-in","sniffing":{"enabled":true,"destOverride":["http","tls"],"routeOnly":true}}"#;
+        let (tag, sniffing) = parse_loopback_config(raw).unwrap();
+        assert_eq!(tag, "socks-in");
+        assert!(sniffing.enabled);
+        assert_eq!(sniffing.override_destination_for_protocol, ["http", "tls"]);
+        assert!(sniffing.route_only);
+    }
+
+    #[test]
+    fn loopback_sink_with_sniffing_carries_request() {
+        let req = SniffingRequest {
+            enabled: true,
+            override_destination_for_protocol: vec!["tls".to_string()],
+            ..Default::default()
+        };
+        let sink = DispatcherLoopbackSink {
+            inner: Arc::new(DefaultDispatcher::new()),
+            sniffing: None,
+        }
+        .with_sniffing(req);
+        let carried = sink.sniffing.as_ref().expect("with_sniffing 应附加请求");
+        assert!(carried.enabled);
+        assert_eq!(carried.override_destination_for_protocol, ["tls"]);
     }
 
     #[test]

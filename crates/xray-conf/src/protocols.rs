@@ -1159,12 +1159,31 @@ pub struct BlackholeResponseConfig {
     pub r#type: Option<String>,
 }
 
-/// Loopback 出站 settings。对应 Go `LoopbackConfig`（loopback.go:8-10）。
-#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+/// Loopback 出站 settings。对应 Go `LoopbackConfig`（infra/conf/loopback.go:9-12）。
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LoopbackOutboundSettings {
     #[serde(rename = "inboundTag")]
     pub inbound_tag: String,
+    /// 对应 Go `LoopbackConfig.Sniffing`（loopback.go:11）：回环重分发时注入的
+    /// 嗅探请求（Go proxy/loopback/loopback.go:33-35,56-62）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sniffing: Option<crate::config::SniffingConfig>,
+}
+
+/// 手写 PartialEq：`config::SniffingConfig` 未 derive PartialEq 且非本文件域，
+/// 经 JSON 归一化比较（struct serde 序列化字段序确定，等价逐字段比较）。
+impl PartialEq for LoopbackOutboundSettings {
+    fn eq(&self, other: &Self) -> bool {
+        self.inbound_tag == other.inbound_tag
+            && match (&self.sniffing, &other.sniffing) {
+                (None, None) => true,
+                (Some(a), Some(b)) => {
+                    serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
+                }
+                _ => false,
+            }
+    }
 }
 
 /// Hysteria2 出站 settings。对应 Go `HysteriaClientConfig`（hysteria.go:13-17）。
@@ -1450,6 +1469,40 @@ mod tests {
             dispatch_inbound_settings("block", v).unwrap().unwrap(),
             InboundSettings::Blackhole(_)
         ));
+    }
+
+    #[test]
+    fn loopback_settings_roundtrip_without_sniffing() {
+        let raw = r#"{"inboundTag":"socks-in"}"#;
+        let v: Value = serde_json::from_str(raw).unwrap();
+        let parsed = dispatch_outbound_settings("loopback", v.clone()).unwrap().unwrap();
+        let back = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(back, v);
+    }
+
+    #[test]
+    fn loopback_settings_roundtrip_with_sniffing() {
+        // 对应 Go LoopbackConfig.Sniffing（loopback.go:11），镜像 infra/conf SniffingConfig
+        let raw = r#"{"inboundTag":"socks-in","sniffing":{"enabled":true,"destOverride":["http","tls"],"metadataOnly":false,"routeOnly":true}}"#;
+        let v: Value = serde_json::from_str(raw).unwrap();
+        let parsed = dispatch_outbound_settings("loopback", v.clone()).unwrap().unwrap();
+        let OutboundSettings::Loopback(s) = &parsed else {
+            panic!("expected loopback settings");
+        };
+        let sc = s.sniffing.as_ref().expect("sniffing 应解析");
+        assert!(sc.enabled);
+        assert!(sc.route_only);
+        assert_eq!(sc.dest_override.0, ["http", "tls"]);
+        // SniffingConfig（config.rs，非本文件域）空 Vec 总是物化为 []，
+        // 故断言语义字段 + 二次 roundtrip 稳定，而非 back == 原文。
+        let back = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(back["inboundTag"], "socks-in");
+        assert_eq!(back["sniffing"]["destOverride"], serde_json::json!(["http", "tls"]));
+        assert_eq!(back["sniffing"]["routeOnly"], true);
+        let reparsed = dispatch_outbound_settings("loopback", back.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::to_value(&reparsed).unwrap(), back);
     }
 
     #[test]
