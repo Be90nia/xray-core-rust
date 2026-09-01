@@ -11,7 +11,7 @@ import glob
 
 INJECT = "\nOPENSSL_NO_ASM:INTERNAL=YES\nCMAKE_VS_GLOBALS:INTERNAL=TrackFileAccess=false\n"
 
-for p in glob.glob(r"target/debug/build/btls-sys-*/out/build/CMakeCache.txt"):
+for p in glob.glob(r"target/*/build/btls-sys-*/out/build/CMakeCache.txt"):
     body = open(p, encoding="utf-8", errors="replace").read()
     if "OPENSSL_NO_ASM:INTERNAL=YES" in body:
         print(f"skip (injected): {os.path.dirname(os.path.dirname(p))}")

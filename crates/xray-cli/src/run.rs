@@ -77,7 +77,7 @@ const DEFAULT_CONFIG_FILES: &[&str] = &[
 ///
 /// 切片2 完整启动链路：`load_first_config` → `Config::build` → `start_from_built`
 /// → 等待 SIGINT/SIGTERM → 优雅 `close`。
-pub fn execute(args: RunArgs) -> Result<()> {
+pub async fn execute(args: RunArgs) -> Result<()> {
     if args.dump {
         return dump_config(&args);
     }
@@ -109,30 +109,22 @@ pub fn execute(args: RunArgs) -> Result<()> {
         return Ok(());
     }
 
-    // 创建 tokio runtime 用于 async 启动 + 信号等待
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| CliError::StartFailed(format!("tokio runtime init failed: {e}")))?;
-
-    // start_full 注册传输 + outbound + spawn inbound，返回 (instance, ohm, handles)
-    let (instance, _ohm, handles) = rt.block_on(async {
-        xray_core::start_full(&built)
-            .await
-            .map_err(|e| CliError::StartFailed(e.to_string()))
-    })?;
+    // 直接用调用方(main 的 #[tokio::main])提供的 runtime;本函数自身再
+    // Runtime::new().block_on 会触发"Cannot start a runtime from within a
+    // runtime"(嵌套 runtime panic,release 冒烟实测)。
+    // start_full 注册传输 + outbound + spawn inbound,返回 (instance, ohm, handles)
+    let (instance, _ohm, handles) = xray_core::start_full(&built)
+        .await
+        .map_err(|e| CliError::StartFailed(e.to_string()))?;
 
     // 等待 Ctrl-C / SIGTERM 信号
-    rt.block_on(wait_for_signal());
+    wait_for_signal().await;
 
-    // 优雅关闭：close() 取消 shutdown_token → 所有 inbound serve task 收到 cancel 通知。
-    // join handles 让 listener 停止 accept（drain 连接留后续），再 drop runtime。
+    // 优雅关闭:close() 取消 shutdown_token → 所有 inbound serve task 收到 cancel 通知。
     close_if_sole_owner(instance)?;
-    rt.block_on(async {
-        for h in handles {
-            let _ = h.await;
-        }
-    });
+    for h in handles {
+        let _ = h.await;
+    }
     tracing::info!("xray instance shutdown");
     Ok(())
 }
@@ -451,7 +443,7 @@ mod tests {
             ..Default::default()
         };
         // test 模式应该成功（配置可解析）
-        let result = execute(args);
+        let result = tokio::runtime::Runtime::new().unwrap().block_on(execute(args));
         assert!(result.is_ok(), "test mode should succeed: {result:?}");
     }
 
@@ -463,7 +455,7 @@ mod tests {
         };
         // 无配置且工作目录无默认 → ConfigNotFound 或空回退
         // 实际行为取决于运行环境，仅验证不 panic
-        let _ = execute(args);
+        let _ = tokio::runtime::Runtime::new().unwrap().block_on(execute(args));
     }
 
     #[test]

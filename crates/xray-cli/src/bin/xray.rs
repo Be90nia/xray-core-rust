@@ -31,7 +31,7 @@ use xray_cli::version;
 #[derive(Parser, Debug)]
 #[command(
     name = "xray",
-    version = "26.6.1",
+    version = "26.7.28",
     about = "Xray is a platform for building proxies."
 )]
 struct Cli {
@@ -239,7 +239,7 @@ async fn execute_api(cmd: &ApiCommand) -> Result<(), CliError> {
 /// 子命令 dispatch。
 async fn execute(command: Command) -> Result<(), CliError> {
     match command {
-        Command::Run(args) => run::execute(args),
+        Command::Run(args) => run::execute(args).await,
         Command::Version => {
             version::print_version();
             Ok(())

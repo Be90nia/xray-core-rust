@@ -9,10 +9,9 @@
 pub const VERSION_X: u8 = 26;
 
 /// 次版本号。对应 Go `Version_y`。
-pub const VERSION_Y: u8 = 6;
+pub const VERSION_Y: u8 = 7;
 
-/// 修订号。对应 Go `Version_z`。
-pub const VERSION_Z: u8 = 1;
+pub const VERSION_Z: u8 = 28;
 
 /// 内部代号。对应 Go `codename`。
 pub const CODENAME: &str = "Xray, Penetrates Everything.";
@@ -26,7 +25,7 @@ pub const BUILD: &str = match option_env!("XRAY_BUILD") {
     None => "Custom",
 };
 
-/// 返回形如 `"26.6.1"` 的版本字符串。
+/// 返回形如 `"26.7.28"` 的版本字符串。
 ///
 /// 对应 Go `Version()`。注意 Go 文档说明常规发布可省略 `.z`，本 Rust 端始终带 z，
 /// 避免下游解析分支。
