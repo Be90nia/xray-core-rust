@@ -82,7 +82,9 @@ pub async fn execute(args: RunArgs) -> Result<()> {
         return dump_config(&args);
     }
 
-    print_version();
+    // 注意:Go `xray run` 不向 stdout 打印版本信息(仅通过 log 系统)。
+    // Rust 此前 print_version 到 stdout 会污染 V2RayN 等 GUI 客户端的
+    // 进程 stdout 解析/测速判定。版本信息由 `xray version` 子命令提供。
 
     let config_files = resolve_config_files(&args)?;
 
