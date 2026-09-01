@@ -140,9 +140,14 @@ impl StreamSettings {
         let security = v.get("security").and_then(|s| s.as_str()).unwrap_or("").to_string();
         // 协议特定配置：尝试 `<protocol>Settings`（如 `wsSettings`/`grpcSettings`/`tcpSettings`）。
         // Go JSON 解析器约定 `network` 值与 settings 字段名对应（`tcp`→`tcpSettings`, `ws`→`wsSettings`, ...）。
+        // ponytail: Go JSON 字段名约定 `<proto>Settings`，但 Go xhttp 网络对应的
+        // JSON 字段是 `xhttpSettings`（与 splithttpSettings 都合法；客户端常混用）。
+        // ponytail: 取两者之一，避免 xhttpSettings JSON 字段被丢弃导致 splithttp
+        // 配置丢失（host/path/mode 等全部退化为默认 + dest fallback）。
         let transport_json = protocol_settings_key(&protocol)
-            .and_then(|k| v.get(k).cloned());
-        // 安全配置：`tlsSettings` 或 `realitySettings`。
+            .and_then(|k| v.get(k).cloned())
+            .or_else(|| v.get("xhttpSettings").cloned())
+;
         let security_json = v.get("tlsSettings").cloned().or_else(|| v.get("realitySettings").cloned());
         // Socket 选项（`sockopt`）与 finalmask 流量伪装配置。
         let sockopt_json = v.get("sockopt").cloned();

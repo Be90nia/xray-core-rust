@@ -128,7 +128,6 @@ fn build_request(uri: &str, cfg: &Config, ed: Option<&[u8]>) -> Result<WsRequest
             );
         }
     }
-
     Ok(req)
 }
 

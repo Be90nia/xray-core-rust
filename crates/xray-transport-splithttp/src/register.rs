@@ -56,8 +56,6 @@ async fn dial_splithttp(
 ) -> io::Result<Box<dyn Connection>> {
     let config = parse_splithttp_config(settings.transport_json.as_ref())?;
     let config = Arc::new(config);
-
-    // Host: 配置优先，缺失用 dest 地址。
     let default_sni = dest.address().to_string();
     let host = if config.host.is_empty() {
         format!("{}:{}", dest.address(), dest.port())
@@ -65,7 +63,6 @@ async fn dial_splithttp(
         format!("{}:{}", config.host, dest.port())
     };
 
-    // Scheme: TLS/REALITY → https，否则 http。
     let has_tls = matches!(settings.security.as_str(), "tls" | "reality");
     let has_reality = settings.security == "reality";
     let scheme = if has_tls { "https" } else { "http" };

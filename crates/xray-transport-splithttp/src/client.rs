@@ -149,9 +149,9 @@ impl DefaultDialerClient {
             .parse()
             .map_err(|e| SplitHttpError::InvalidUrl(format!("uri {e}")))?;
 
-        let mut builder = Request::builder().method(method).uri(uri);
-        for (name, value) in meta.headers {
-            builder = builder.header(name, value);
+        let mut builder = Request::builder().method(method.clone()).uri(uri.clone());
+        for (name, value) in meta.headers.iter() {
+            builder = builder.header(name.as_str(), value.as_str());
         }
         if !meta.cookies.is_empty() {
             let cookie_str = meta
@@ -160,7 +160,7 @@ impl DefaultDialerClient {
                 .map(|(k, v)| format!("{k}={v}"))
                 .collect::<Vec<_>>()
                 .join("; ");
-            builder = builder.header("Cookie", cookie_str);
+            builder = builder.header("Cookie", cookie_str.as_str());
         }
         builder
             .body(body)
