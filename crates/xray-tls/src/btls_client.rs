@@ -75,6 +75,9 @@ const CHROME_133_CIPHER_LIST: &str = concat!(
 
 /// Chrome 133 signature algorithms。
 const CHROME_133_SIGALGS: &str = concat!(
+    // ponytail (REALITY): Go REALITY 服务端证书/CertificateVerify 用 Ed25519
+    // (0x0807),真实 Chrome 不发送该算法但 Go utls Chrome 指纹接受 —— 必须加。
+    "ed25519:",
     "ecdsa_secp256r1_sha256:",
     "rsa_pss_rsae_sha256:",
     "rsa_pkcs1_sha256:",
@@ -96,10 +99,11 @@ const CHROME_133_ALPN: &[u8] = b"\x02h2\x08http/1.1";
 /// Chrome 133 key shares（PQ X25519MLKEM768 + X25519）。
 /// 对应 Chrome 133 ClientHello 的 key_share 扩展。
 /// 注意: btls/BoringSSL 自动从 set_curves_list 的前 N 组生成 key share。
-const CHROME_133_KEY_SHARES: &[KeyShare] = &[
-    KeyShare::X25519_MLKEM768,
-    KeyShare::X25519,
-];
+/// ponytail: 只发 X25519。Chrome133 原生含 X25519MLKEM768,但 REALITY 服务端
+/// (xtls/reality)优先选 MLKEM768 组协商,而客户端 auth_key 派生只支持纯 X25519
+/// (SSL_get_x25519_key_share_private),服务端选 hybrid → auth_key 不一致 → 断连。
+/// 指纹保真度损失极小(key_share 顺序差异),换来 REALITY 端到端可用。
+const CHROME_133_KEY_SHARES: &[KeyShare] = &[KeyShare::X25519];
 
 /// Chrome 133 ALPS 数据（h2）。
 const CHROME_133_ALPS: &[u8] = b"\x02h2";

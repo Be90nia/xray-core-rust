@@ -19,6 +19,7 @@
 //! 通过 [`RealityHooks`] 注入；本模块只负责时序编排与 SSL 材料导出
 //! （[`x25519_key_share_private`]，BoringSSL patch `SSL_get_x25519_key_share_private`）。
 
+use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -36,35 +37,99 @@ use crate::fingerprint::Fingerprint;
 /// REALITY 客户端钩子：btls 握手的关键时点回调。
 ///
 /// 由 `xray-reality` 实现（协议算法在那边）；本 crate 只编排时序。
+/// REALITY 回调用的 SSL 裸指针（避免下游 crate 直接依赖 btls-sys）。
+pub type RealitySslPtr = *mut btls_sys::SSL;
+
 pub trait RealityHooks: Send + Sync {
     /// ClientHello record 写出前调用（`record` 可原地改写，须保持长度不变）。
     ///
     /// `record` 是本次 BIO 写出的完整字节（TLS record 对齐，可能含多条
     /// record 连写，如 ClientHello + CCS）；实现自行解析定位 ClientHello 的
     /// session_id 字段。HRR 后的第二个 ClientHello 也会经过此回调。
-    ///
-    /// 可用 [`x25519_key_share_private`] 从 `ssl` 导出 X25519 key share
     /// 私钥派生 auth_key。
     fn rewrite_client_hello(&self, ssl: &SslRef, record: &mut [u8]) -> io::Result<()>;
 
+    /// ponytail (REALITY): transcript 一致的 ClientHello 注入。
+    /// 由 BoringSSL `ssl_add_message_cbb` 在消息序列化后、计入 transcript 前
+    /// 调用（SSL_set_reality_rewrite_cb 全局回调）。`msg` = 完整 handshake
+    /// message（type(1)+len(3)+body，无 record 头）。BIO 层改写会让 transcript
+    /// 与线上 bytes 不一致 → 握手密钥全部错乱（BAD_DECRYPT），必须在此改写。
+    fn rewrite_client_hello_msg(
+        &self,
+        ssl_ptr: RealitySslPtr,
+        msg: &mut [u8],
+    ) -> io::Result<()> {
+        Err(io::Error::other(
+            "REALITY: rewrite_client_hello_msg not implemented",
+        ))
+    }
+
     /// TLS 握手完成后、连接返回前调用（证书验证）。
-    /// 验证失败返回 Err → 握手断连（对应 Go `uConn.Verified == false` 路径：
-    /// "received real certificate (potential MITM or redirection)"）。
+    /// 验证失败返回 Err → 握手断连（对应 Go `uConn.Verified == false`）。
     fn verify_handshake(&self, ssl: &SslRef) -> io::Result<()>;
 }
 
-/// 导出当前 SSL 的 X25519 key share 私钥（32 字节 raw）。
+/// 导出当前 SSL 的 X25519 key share 私钥（32 字节 raw，裸指针版）。
 ///
-/// 须在 ClientHello 构建后（即 [`RealityHooks::rewrite_client_hello`] 回调内）
-/// 调用；无 X25519 key share 时返回 None（如指纹只发 PQ 组）。
-///
-/// 对应 Go `uConn.HandshakeState.State13.KeyShareKeys.Ecdhe` 的私钥访问。
+/// transcript 回调窗口内使用；无 X25519 key share 时返回 None。
+#[must_use]
+pub fn x25519_key_share_private_raw(ssl: *mut btls_sys::SSL) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    // SAFETY: ssl 指针在握手窗口内由 TokioSslStream 持有；out 是 32 字节缓冲。
+    let ok = unsafe { btls_sys::SSL_get_x25519_key_share_private(ssl, out.as_mut_ptr()) };
+    if ok == 1 { Some(out) } else { None }
+}
+
+/// per-SSL REALITY hooks 注册表（transcript 回调按 ssl 裸指针查找）。
+static REALITY_HOOKS: parking_lot::Mutex<Option<HashMap<usize, Arc<dyn RealityHooks>>>> =
+    parking_lot::Mutex::new(None);
+static TRAMPOLINE_INSTALLED: std::sync::Once = std::sync::Once::new();
+
+extern "C" fn reality_rewrite_trampoline(
+    ssl: *mut btls_sys::SSL,
+    msg: *mut u8,
+    msg_len: usize,
+) -> i32 {
+    eprintln!("[REALITY dbg] trampoline FIRED ssl={:p} len={}", ssl, msg_len);
+    let hooks = REALITY_HOOKS
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&(ssl as usize)).cloned());
+    let Some(hooks) = hooks else { return 1 };
+    // SAFETY: msg/len 由 BoringSSL 在 ssl_add_message_cbb 内提供，握手窗口内有效。
+    let buf = unsafe { std::slice::from_raw_parts_mut(msg, msg_len) };
+    match hooks.rewrite_client_hello_msg(ssl, buf) {
+        Ok(()) => 1,
+        Err(e) => {
+            eprintln!("[REALITY dbg] trampoline rewrite failed: {e}");
+            0
+        }
+    }
+}
+
+
+/// 注册 per-SSL hooks 并安装全局 trampoline（幂等）。
+pub fn register_reality_hooks(ssl_key: usize, hooks: Arc<dyn RealityHooks>) {
+    TRAMPOLINE_INSTALLED.call_once(|| unsafe {
+        btls_sys::SSL_set_reality_rewrite_cb(Some(reality_rewrite_trampoline));
+    });
+    REALITY_HOOKS
+        .lock()
+        .get_or_insert_with(HashMap::new)
+        .insert(ssl_key, hooks);
+}
+
+/// 注销 per-SSL hooks（握手结束/失败后调用）。
+pub fn unregister_reality_hooks(ssl_key: usize) {
+    if let Some(m) = REALITY_HOOKS.lock().as_mut() {
+        m.remove(&ssl_key);
+    }
+}
+
+/// 导出当前 SSL 的 X25519 key share 私钥（32 字节 raw；`&SslRef` 版，BIO 路径用）。
 #[must_use]
 pub fn x25519_key_share_private(ssl: &SslRef) -> Option<[u8; 32]> {
-    let mut out = [0u8; 32];
-    // SAFETY: ssl 指针来自存活的 SslRef；out 是 32 字节缓冲，符合 C 签名。
-    let ok = unsafe { btls_sys::SSL_get_x25519_key_share_private(ssl.as_ptr(), out.as_mut_ptr()) };
-    if ok == 1 { Some(out) } else { None }
+    x25519_key_share_private_raw(ssl.as_ptr())
 }
 
 /// 拦截流：ClientHello record 写出前回调 [`RealityHooks::rewrite_client_hello`]。
@@ -131,11 +196,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for HelloRewriteStream<S> {
 
 // SAFETY: 同 Send——ssl_ptr 仅在握手窗口解引用，无并发访问路径。
 unsafe impl<S: Send> Sync for HelloRewriteStream<S> {}
-/// `poll_write` 的 buf 是 `&[u8]` 而钩子签名要 `&mut [u8]`：record 改写是
-/// 等长原地替换，改的就是即将写出的缓冲本身。BoringSSL 经 BIO 写出的数据
-/// 缓冲在 poll_write 返回前归 BIO 层所有，等长改写安全。
-///
-/// （内联于 `poll_write`，无独立函数。）
 
 impl<S: Connection + Unpin> Connection for HelloRewriteStream<S> {
     fn remote_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
@@ -146,14 +206,11 @@ impl<S: Connection + Unpin> Connection for HelloRewriteStream<S> {
     }
 }
 
-/// 创建 REALITY 客户端 btls 连接（浏览器指纹握手 + REALITY 注入 + 证书验证）。
+/// 创建 REALITY 客户端 btls 连接（浏览器指纹握手 + REALITY transcript 注入 + 证书验证）。
 ///
-/// 对应 Go `reality.UClient`：指纹握手走 [`BtlsConn::connect`] 同款路径
-/// （connector/key shares/ALPS），叠加 [`RealityHooks`] 的两处回调。
-///
-/// # Errors
-/// - 指纹不被 btls 支持（`InvalidInput`）——调用方可 fallback rustls
-/// - 握手 IO / hooks 验证失败
+/// 对应 Go `reality.UClient`。session_id 注入由 BoringSSL 内部
+/// `ssl_add_message_cbb` 回调（transcript 计入前）完成，保证 transcript 与
+/// 线上 bytes 一致；握手完成后做证书 HMAC 验证。
 pub async fn connect_reality<S>(
     stream: S,
     server_name: &str,
@@ -182,21 +239,28 @@ where
             .map_err(|e| io::Error::other(e.to_string()))?;
     }
 
-    // REALITY 拦截：记录 ssl 裸指针（SslStream 拥有 SSL，握手窗口内有效）；
-    // hooks 克隆一份留在本函数做握手后验证。
-    let ssl_ptr: *mut btls_sys::SSL = ssl.as_ptr();
+    // REALITY transcript 注入：注册 per-SSL hooks，BoringSSL 在
+    // ssl_add_message_cbb（transcript 计入前）回调改写 ClientHello。
+    // BIO 层改写（HelloRewriteStream）已废弃 —— transcript 会与线上 bytes
+    // 不一致导致握手密钥错乱（BAD_DECRYPT）。
+    let ssl_key = ssl.as_ptr() as usize;
+    register_reality_hooks(ssl_key, Arc::clone(&hooks));
     let rewrite_stream = HelloRewriteStream {
         inner: stream,
-        hooks: Some(Arc::clone(&hooks)),
-        ssl_ptr: Some(ssl_ptr),
+        hooks: None,
+        ssl_ptr: None,
     };
 
     let tls_stream = TokioSslStream::new(ssl, rewrite_stream)
         .map_err(|e| io::Error::other(e.to_string()))?;
 
     let mut pinned = Box::pin(tls_stream);
-    pinned.as_mut().connect().await
-        .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e.to_string()))?;
+    let connect_result = pinned.as_mut().connect().await;
+    unregister_reality_hooks(ssl_key);
+    if let Err(e) = connect_result {
+        eprintln!("[REALITY dbg] SslStream::connect failed: {e:?}");
+        return Err(io::Error::new(io::ErrorKind::ConnectionAborted, e.to_string()));
+    }
 
     // REALITY 证书验证（HMAC-SHA512；失败 = 真证书/MITM → 断连）
     hooks.verify_handshake(pinned.ssl())?;

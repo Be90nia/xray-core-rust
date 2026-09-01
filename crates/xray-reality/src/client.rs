@@ -138,7 +138,9 @@ impl<S: Connection> Connection for RealityTlsStream<S> {
 
 /// REALITY session_id 明文里的协议版本（watfaq 语义 `[1, 8, 1]`，
 /// 与服务端 [`crate::server`] 解码兼容）。
-const REALITY_VERSION: [u8; 3] = [1, 8, 1];
+// REALITY session_id 明文头 3 字节 = 客户端 Xray 版本 (major,minor,patch)。
+// 服务端 (v26.3.27+) 拒绝过低版本客户端 → 必须声明 ≥26.3.27。
+const REALITY_VERSION: [u8; 3] = [26, 7, 28];
 
 /// btls REALITY 钩子：session_id 注入 + 证书 HMAC 验证。
 ///
@@ -222,6 +224,55 @@ impl RealityHooks for BtlsRealityHooks {
         Ok(())
     }
 
+    /// ponytail (REALITY): transcript 一致注入 —— BoringSSL
+    /// ssl_add_message_cbb 在计入 transcript 前回调。
+    ///
+    /// `msg` = 完整 handshake message（type(1)+len(3)+body，无 record 头），
+    /// 字段偏移与 record body 相同：random=6..38、sid_len=38、sid=39..71。
+    fn rewrite_client_hello_msg(
+        &self,
+        ssl_ptr: xray_tls::btls_reality::RealitySslPtr,
+        msg: &mut [u8],
+    ) -> io::Result<()> {
+        if msg.len() < 71 || msg[0] != 1 {
+            return Ok(());
+        }
+        const HS_HDR: usize = 1 + 3 + 2;
+        const SID_LEN_OFF: usize = HS_HDR + 32;
+        const SID_OFF: usize = SID_LEN_OFF + 1;
+        if msg[SID_LEN_OFF] != 32 {
+            return Err(io::Error::other("REALITY: unexpected session_id length in ClientHello"));
+        }
+        let random: [u8; 32] = msg[HS_HDR..HS_HDR + 32]
+            .try_into()
+            .map_err(|_| io::Error::other("REALITY: short ClientHello random"))?;
+
+        let priv_key = xray_tls::btls_reality::x25519_key_share_private_raw(ssl_ptr)
+            .ok_or_else(|| {
+                io::Error::other(
+                    "REALITY: current fingerprint does not offer an X25519 key share",
+                )
+            })?;
+        let auth_key = crypto::derive_auth_key(&priv_key, &self.server_pub, &random[..20])
+            .map_err(|e| io::Error::other(e.to_string()))?;
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0);
+        let mut sid = crypto::encode_session_id(REALITY_VERSION, ts, &self.short_id)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+
+        // AAD = zero-sid 版 message；Go: aead.Seal(sid[:0], random[20:], sid[:16], hello.Raw)
+        let mut aad = msg.to_vec();
+        aad[SID_OFF..SID_OFF + 32].fill(0);
+        crypto::encrypt_session_id(&auth_key, &random[20..], &mut sid, &aad)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+
+        msg[SID_OFF..SID_OFF + 32].copy_from_slice(&sid);
+        *self.auth_key.lock() = Some(auth_key);
+        Ok(())
+    }
     /// 握手后验证证书：末尾 64 字节须为 HMAC-SHA512(auth_key, ed25519 pubkey)。
     ///
     /// 对应 Go `UConn.VerifyPeerCertificate`；失败 = 真证书/被转发 → 断连。
@@ -236,6 +287,11 @@ impl RealityHooks for BtlsRealityHooks {
         let der = x509_to_der(&cert)
             .ok_or_else(|| io::Error::other("REALITY: failed to encode peer certificate"))?;
         let Some(pub_key) = extract_ed25519_pubkey(&der) else {
+            eprintln!(
+                "[REALITY dbg verify] extract FAILED: der.len={} head16={:02x?}",
+                der.len(),
+                &der[..16.min(der.len())]
+            );
             return Err(io::Error::other(
                 "REALITY: received real certificate (potential MITM or redirection)",
             ));
@@ -245,6 +301,10 @@ impl RealityHooks for BtlsRealityHooks {
         }
         let sig = &der[der.len() - 64..];
         let ok = crypto::verify_reality_certificate(&auth_key, &pub_key, sig).unwrap_or(false);
+        eprintln!(
+            "[REALITY dbg verify] extracted ed25519 pub[:8]={:02x?} hmac_ok={} auth_key[:8]={:02x?}",
+            &pub_key[..8], ok, &auth_key[..8]
+        );
         if !ok {
             return Err(io::Error::other(
                 "REALITY: received real certificate (potential MITM or redirection)",
