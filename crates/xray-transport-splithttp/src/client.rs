@@ -97,7 +97,10 @@ impl DefaultDialerClient {
     /// 创建新客户端。`tls_config` 由调用方（[`crate::dialer`]）从 `stream_settings`
     /// 构造，简化为 webpki-roots + ring provider 默认（切片 F 接入 REALITY 时改）。
     #[must_use]
-    pub fn new(config: Arc<Config>, tls_config: RustlsClientConfig) -> Self {
+    pub fn new(config: Arc<Config>, mut tls_config: RustlsClientConfig) -> Self {
+        // ponytail: hyper-rustls 0.27.9 禁止预定义 ALPN(会 panic);
+        // 由 builder.enable_http1()+enable_http2() 内部按协议版本自动设置。
+        tls_config.alpn_protocols.clear();
         let https = HttpsConnectorBuilder::new()
             .with_tls_config(tls_config)
             .https_or_http()

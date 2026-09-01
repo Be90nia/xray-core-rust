@@ -184,6 +184,14 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    // 初始化 tracing subscriber 否则 tracing macros 输出会被丢弃(Rust xray 之前
+    // 完全静默,真实失败无法定位)。默认 level=info;RUST_LOG 可覆盖(例:RUST_LOG=xray_tls=debug)。
+    use tracing_subscriber::{fmt, EnvFilter};
+    let _ = fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .try_init();
     let cli = Cli::parse();
     // v4 兼容：无子命令时默认 run
     let command = cli.command.unwrap_or(Command::Run(RunArgs::default()));
