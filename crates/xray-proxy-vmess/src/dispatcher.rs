@@ -263,13 +263,9 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>) -> DialFn {
                 .await
                 .map_err(|e| format!("vmess flush header: {e}"))?;
 
-            // 4. 读服务端响应头（服务端解码请求头后立即发送），消费掉响应头字节
-            session
-                .decode_response_header_async(&mut conn)
-                .await
-                .map_err(|e| format!("vmess decode response header: {e}"))?;
-
-            // 5. 构造 body 加密状态（request_body_key/iv 加密上行，response_body_key/iv 解密下行）
+            // 5. 构造 body 加密状态（request_body_key/iv 加密上行，response_body_key/iv 解密下行）。
+            //    响应头解码移入 down pump（与上行并发）：Go 服务端把响应头缓冲到首块
+            //    下行数据才 flush（SetFlushNext），dial 阶段同步等待会造成双向死锁。
             let (req_cipher, resp_cipher) = build_body_ciphers(security, &session)
                 .map_err(|e| format!("vmess build body cipher: {e}"))?;
             let req_iv = session.request_body_iv;
@@ -287,10 +283,10 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>) -> DialFn {
             } else {
                 Box::new(PlainSizeParser)
             };
-
-            // 7. 返回 VmessConn（内部 spawn 双向 chunk pump）
+            // 7. 返回 VmessConn（内部 spawn 双向 chunk pump；响应头在 down pump 内惰性解码）
             Ok(Box::new(VmessConn::from_conn(
                 conn,
+                session,
                 req_cipher,
                 req_iv,
                 req_size_parser,
@@ -322,6 +318,7 @@ impl VmessConn {
     /// 从底层连接构造：spawn 双向 pump（明文 duplex ↔ chunk 密文 wire），返回 duplex 客户端包装。
     fn from_conn(
         conn: Box<dyn Connection>,
+        session: ClientSession,
         req_cipher: BodyCipher,
         req_iv: [u8; 16],
         req_size_parser: Box<dyn SizeParser + Send>,
@@ -334,11 +331,21 @@ impl VmessConn {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF);
         let (stream_r, stream_w) = tokio::io::split(conn);
         let pump = tokio::spawn(async move {
-            let (server_r, server_w) = tokio::io::split(server_io);
+            let (server_r, mut server_w) = tokio::io::split(server_io);
             // up: 明文 duplex → chunk 加密 → wire（请求 body）
             let up = pump_up(server_r, stream_w, req_cipher, req_iv, req_size_parser, req_padding);
-            // down: wire → chunk 解密 → 明文 duplex（响应 body）
-            let down = pump_down(stream_r, server_w, resp_cipher, resp_iv, resp_size_parser, resp_padding);
+            // down: 先惰性解码响应头，再 chunk 解密 → 明文 duplex。
+            // 与 up 并发执行：服务端（Go SetFlushNext）把响应头缓冲到首块下行数据，
+            // 上行数据必须先于响应头到达，因此不能在 dial 阶段同步等待响应头。
+            let down = async move {
+                let mut sr = stream_r;
+                if let Err(e) = session.decode_response_header_async(&mut sr).await {
+                    tracing::debug!(error = %e, "vmess decode response header failed");
+                    let _ = server_w.shutdown().await;
+                    return;
+                }
+                pump_down(sr, server_w, resp_cipher, resp_iv, resp_size_parser, resp_padding).await;
+            };
             tokio::join!(up, down);
         });
         Self {
@@ -730,5 +737,80 @@ mod tests {
             }]
         }"#;
         assert!(parse_vmess_config(data.as_bytes()).is_ok());
+    }
+
+    /// 模拟 Go vmess inbound 的 `SetFlushNext` 缓冲语义：服务端解码请求头后
+    /// **不立即**发送响应头，而是缓冲到首块下行数据一起 flush。生产 dial fn 若
+    /// 在拨号阶段同步阻塞等待响应头，将与服务端互相等待造成死锁
+    /// （Go outbound 的 header/body 并发 copy 不存在此问题）。
+    #[tokio::test]
+    async fn dial_does_not_block_on_response_header_go_set_flush_next_semantics() {
+        use crate::encoding::server::{ServerSession, SessionHistory};
+        use crate::validator::{MemoryUser, TimedUserValidator, Validator};
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let server_port = listener.local_addr().unwrap().port();
+        let body_arrived = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&body_arrived);
+
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let uuid = UUID::parse("66ad4540-b58c-4ad2-9926-ea63445a9b57").expect("uuid");
+            let validator = TimedUserValidator::new();
+            let account = MemoryAccount::new(uuid);
+            validator
+                .add(MemoryUser::new("t@example.com", account))
+                .expect("add user");
+            let history = SessionHistory::new();
+            let mut server = ServerSession::new(&validator, &history);
+            let (_req, _) = server.decode_request_header(&mut sock).expect("decode header");
+            // 不立即回响应头：等客户端 body 首字节到达（SetFlushNext 语义）。
+            let mut b = [0u8; 1];
+            sock.read_exact(&mut b).expect("read body byte");
+            flag.store(true, Ordering::SeqCst);
+            let resp = xray_common::protocol::ResponseHeader::new(Command::Tcp);
+            server
+                .encode_response_header(&resp, &mut sock)
+                .expect("encode response header");
+            // 保持连接片刻，让 down pump 的 chunk 读取自然等 EOF。
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+
+        let uuid = UUID::parse("66ad4540-b58c-4ad2-9926-ea63445a9b57").expect("uuid");
+        let cfg = Arc::new(VmessOutboundConfig::new(
+            uuid,
+            Address::from_ipv4_bytes([127, 0, 0, 1]),
+            Port::new(server_port),
+        ));
+        let dial = make_vmess_dial_fn(Arc::clone(&cfg));
+        let dest = Destination::new(
+            Address::from_ipv4_bytes([127, 0, 0, 1]),
+            Port::new(1),
+            Network::TCP,
+        );
+
+        // 修复断言 1：dial 不得阻塞等待响应头（修复前此处 2s 超时 panic）。
+        let mut conn = tokio::time::timeout(std::time::Duration::from_secs(2), dial(&dest))
+            .await
+            .expect("dial must not block on response header")
+            .expect("dial ok");
+
+        // 修复断言 2：dial 返回后立即写 body（Go 并发 copy 语义），服务端必须收到。
+        use tokio::io::AsyncWriteExt;
+        conn.write_all(b"payload").await.expect("write body");
+        conn.flush().await.expect("flush body");
+
+        for _ in 0..50 {
+            if body_arrived.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            body_arrived.load(Ordering::SeqCst),
+            "server must receive body without having sent the response header"
+        );
     }
 }

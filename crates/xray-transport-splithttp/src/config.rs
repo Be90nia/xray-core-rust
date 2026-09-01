@@ -558,17 +558,18 @@ pub struct RequestMeta {
 }
 
 impl Config {
-    /// 默认请求 header 列表：复制 `c.headers` + `User-Agent: fetch`（未配置时）。
+    /// 默认请求 header 列表：复制 `c.headers` + 浏览器伪装默认头。
     ///
-    /// 对应 Go `GetRequestHeader`。`utils.TryDefaultHeadersWith(header, "fetch")`
-    /// 简化为仅设 User-Agent（其余默认 header 由浏览器拨号器路径补充，切片 A 不用）。
+    /// 对应 Go 26.7.28 `GetRequestHeader` → `utils.TryDefaultHeadersWith(header, "fetch")`：
+    /// UA 未配置 → 整套 Chrome 伪装头；UA 为 chrome/firefox/safari/edge/curl/golang
+    /// → 对应伪装；其他自定义值 → 原样保留。见 [`crate::browser`]。
     #[must_use]
     pub fn get_request_header(&self) -> Vec<(String, String)> {
         let mut headers: Vec<(String, String)> =
             self.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent")) {
-            headers.push(("User-Agent".to_string(), "fetch".to_string()));
-        }
+        // 对齐 Go 26.7.28 `GetRequestHeader`：UA 缺省时生成整套 Chrome 伪装头
+        // （`utils.TryDefaultHeadersWith(header, "fetch")`），过 CDN bot 检测。
+        crate::browser::try_default_headers_with(&mut headers, "fetch");
         headers
     }
 
@@ -1182,11 +1183,22 @@ mod tests {
     // ===== RequestMeta / fill_* =====
 
     #[test]
-    fn get_request_header_default_user_agent_when_empty() {
+    fn get_request_header_default_masquerades_as_chrome() {
         let cfg = Config::default();
         let headers = cfg.get_request_header();
-        let has_ua = headers.iter().any(|(k, v)| k == "User-Agent" && v == "fetch");
-        assert!(has_ua, "default User-Agent 'fetch' should be set when headers empty");
+        let ua = headers
+            .iter()
+            .find(|(k, _)| k == "User-Agent")
+            .map(|(_, v)| v.as_str())
+            .expect("User-Agent must be set when headers empty");
+        assert!(
+            ua.contains("Chrome/") && ua.contains("Safari/537.36"),
+            "default UA must masquerade as Chrome (Go 26.7.28 TryDefaultHeadersWith), got: {ua}"
+        );
+        assert!(
+            headers.iter().any(|(k, v)| k == "Sec-Fetch-Mode" && v == "cors"),
+            "fetch variant Sec-Fetch-Mode required"
+        );
     }
 
     #[test]
@@ -1283,7 +1295,13 @@ mod tests {
         let pad_value = referer.strip_prefix("https://example.com/ws?x_padding=").unwrap();
         assert!(!pad_value.is_empty(), "padding value must be non-empty, got empty");
         assert!(pad_value.chars().all(|c| c == 'X'), "default repeat-x padding should be all X, got {pad_value}");
-        assert!(meta.headers.iter().any(|(k, v)| k == "User-Agent" && v == "fetch"));
+        let ua = meta
+            .headers
+            .iter()
+            .find(|(k, _)| k == "User-Agent")
+            .map(|(_, v)| v.as_str())
+            .expect("User-Agent must be set");
+        assert!(ua.contains("Chrome/"), "UA must masquerade as Chrome, got: {ua}");
     }
 
     #[test]
