@@ -286,6 +286,93 @@ async fn handle_udp_associate(
         }
     }
 }
+/// Mixed proxy inbound(V2RayN / Go xray `mixed` 协议 = socks + http 复合 listener)。
+///
+/// 单 listener 每连接 peek 1 字节嗅探:0x05 → SOCKS5;ASCII 字母开头 → HTTP。
+/// 对应 Go `proxy/mixed/mixed.go` 同一 listener 上 mux socks 与 http 两个 handler。
+/// ponytail:握手超时简化(传 None);后续透传 policy.map(...)
+async fn serve_mixed(
+    listener: TcpListener,
+    ohm: Arc<SimpleOhm>,
+    socks_cfg: Arc<ServerConfig>,
+    http_cfg: Arc<HttpServerConfig>,
+    handshake_timeout: Option<std::time::Duration>,
+) -> std::io::Result<()> {
+    let handler = ohm
+        .get_default_handler()
+        .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
+    tracing::info!(addr = %listener.local_addr()?, "mixed (socks+http) inbound listening");
+    loop {
+        let (mut stream, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "mixed accept failed");
+                continue;
+            }
+        };
+        let handler = Arc::clone(&handler);
+        let socks_cfg = Arc::clone(&socks_cfg);
+        let http_cfg = Arc::clone(&http_cfg);
+        let handshake_timeout = handshake_timeout;
+        tokio::spawn(async move {
+            // 1 字节 sniff(带超时避免恶意 client 占资源)
+            let mut sniff = [0u8; 1];
+            let read_res = match handshake_timeout {
+                Some(d) => tokio::time::timeout(d, stream.peek(&mut sniff)).await,
+                None => Ok(stream.peek(&mut sniff).await),
+            };
+            let n = match read_res { Ok(Ok(n)) => n, _ => return };
+            if n == 0 { return; }
+            if sniff[0] == 0x05 {
+                // SOCKS5 路径
+                match socks_handshake(&mut stream, &socks_cfg).await {
+                    Ok(SocksRequest::TcpConnect(addr)) => {
+                        let dest = socks_addr_to_destination(&addr, Network::TCP);
+                        let (read_half, write_half) = tokio::io::split(stream);
+                        let link = Link::new(new_reader(read_half), new_writer(write_half));
+                        if is_mux_destination(&dest) {
+                            tokio::spawn(handle_mux_inbound_link(link, handler));
+                        } else {
+                            let _ = handler.dispatch(&dest, link).await;
+                        }
+                    }
+                    Ok(SocksRequest::UdpAssociate(_, _)) => {
+                        // UDP associate 简化:暂不支持(mixed UDP 罕见,跟 socks5 UDP 等价)
+                        tracing::debug!("mixed: udp associate not supported in mixed mode");
+                    }
+                    Err(e) => tracing::debug!(error = %e, "mixed socks handshake failed"),
+                }
+            } else if sniff[0].is_ascii_alphabetic() {
+                // HTTP 路径(简化版:仅 CONNECT + plain,无 mux 派生)
+                let handshake_fut = http_server_handshake(&mut stream, &http_cfg);
+                let hs = match handshake_timeout {
+                    Some(d) => match tokio::time::timeout(d, handshake_fut).await {
+                        Ok(r) => r,
+                        Err(_) => return,
+                    },
+                    None => handshake_fut.await,
+                };
+                let hs = match hs { Ok(v) => v, Err(_) => return };
+                if hs.method != "CONNECT" {
+                    handle_plain_http(stream, hs, Arc::clone(&handler)).await;
+                } else {
+                    let dest = hs.dest;
+                    let (read_half, write_half) = tokio::io::split(stream);
+                    let link = Link::new(new_reader(read_half), new_writer(write_half));
+                    if is_mux_destination(&dest) {
+                        tokio::spawn(handle_mux_inbound_link(link, handler));
+                    } else {
+                        let _ = handler.dispatch(&dest, link).await;
+                    }
+                }
+            } else {
+                tracing::debug!(first_byte = sniff[0], "mixed: unknown first byte, closing");
+            }
+            let _ = peer; // 仅用于 closure capture
+        });
+    }
+}
+
 
 /// HTTP proxy inbound 服务入口。
 ///
@@ -1561,6 +1648,17 @@ async fn spawn_one_inbound(
             tracing::info!(tag = %ib.tag, addr = %addr, auth = ?config.auth_type, udp = config.udp_enabled, "socks5 inbound listening");
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                 serve_socks5(listener, ohm, config).await
+            })))
+        }
+        "mixed" => {
+            // V2RayN / Go xray mixed 协议 = socks + http 复合 listener。
+            // 单 listener peek 首字节嗅探:0x05 → socks;ASCII 字母开头 → http。
+            let socks_cfg = Arc::new(parse_socks_server_config(&ib.entry.data)?);
+            let http_cfg = Arc::new(parse_http_config(&ib.entry.data)?);
+            let listener = TcpListener::bind(&addr).await?;
+            tracing::info!(tag = %ib.tag, addr = %addr, "mixed (socks+http) inbound listening");
+            Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+                serve_mixed(listener, ohm, socks_cfg, http_cfg, None).await
             })))
         }
         "vless" => {
