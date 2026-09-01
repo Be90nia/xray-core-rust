@@ -6529,6 +6529,7 @@ dependencies = [
  "foreign-types",
  "hex",
  "ocsp-stapler",
+ "parking_lot",
  "rand 0.9.4",
  "rcgen 0.13.2",
  "rustls",
