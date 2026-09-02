@@ -106,19 +106,30 @@ def cfg(uri, socks_port=11080):
               "insecure":q.get("insecure",q.get("allow_insecure","false")).lower()=="true"}
         if q.get("certificate"): sv["certificate"] = q["certificate"]
         return {"protocol":"tuic","tag":tag,"settings":{"servers":[sv]}}
-    if u.startswith("anytls://"):
-        # anytls://<password>@host:port?security=tls&sni=&type=tcp&headerType=none
-        # userinfo 只有 password，urlparse 会把它放在 p.password
-        pw = p.password or p.username
-        host = p.hostname; port = p.port
-        sv = {
+    if u.startswith("hysteria2://"):
+        # hysteria2://password@host:port?sni=&alpn=h3&congestion_control=cubic
+        pw = up.unquote(p.password or p.username or "")
+        host = p.hostname; port = p.port or 443
+        sv = {"address": host, "port": port,
+              "auth": pw,
+              "serverName": q.get("sni") or q.get("serverName") or host,
+              "alpn": [a for a in q.get("alpn", "").split(",") if a],
+              "congestion_control": q.get("congestion_control", "bbr")}
+        if q.get("insecure", q.get("allow_insecure", "false")).lower() == "true":
+            sv["insecure"] = True
+        return {"protocol": "hysteria", "tag": tag, "settings": {"servers": [sv]}}
+    if u.startswith("naive+https://"):
+        # naive+https://user:pass@host:port?security=tls&type=tcp&headerType=none
+        user = up.unquote(p.username or "")
+        pw = up.unquote(p.password or "")
+        host = p.hostname; port = p.port or 443
+        return {"protocol":"naive","tag":tag,"settings":{
             "server": host,
-            "server_port": port,
+            "port": port,
             "sni": q.get("sni") or host,
-            "insecure": q.get("insecure", q.get("allow_insecure", "false")).lower() == "true",
+            "username": user,
             "password": pw,
-        }
-        return {"protocol":"anytls","tag":tag,"settings":sv}
+        }}
     raise ValueError(f"unsupported scheme: {u[:20]}")
 
 def main():
