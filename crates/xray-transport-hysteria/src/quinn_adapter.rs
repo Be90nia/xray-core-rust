@@ -516,6 +516,17 @@ async fn serve_hysteria_connection(
         match conn.accept_bi().await {
             Ok((send, recv)) => {
                 let qs = QuinnQuicStream::new(send, recv, local, remote);
+                let frame_type = match crate::conn::read_varint_stream(&qs).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::debug!(error = ?error, %remote, "hysteria stream frame type read failed");
+                        continue;
+                    }
+                };
+                if frame_type != crate::config::FrameTypeTCPRequest {
+                    let _ = qs.cancel_read(0x101);
+                    continue;
+                }
                 let isc = Arc::new(InterStreamConn::new(Arc::new(qs), local, remote, false));
                 on_new_conn(isc);
             }

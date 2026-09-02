@@ -385,7 +385,7 @@ pub fn make_hysteria_dial_fn(
             match dest.network() {
                 Network::TCP => {
                     let stream = client
-                        .tcp()
+                        .tcp(dest.address(), dest.port())
                         .await
                         .map_err(|e| format!("hysteria tcp dial: {e}"))?;
                     Ok(Box::new(HysteriaConnection::from_stream(stream)) as Box<dyn Connection>)

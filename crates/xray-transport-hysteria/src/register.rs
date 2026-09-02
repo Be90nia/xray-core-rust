@@ -149,6 +149,17 @@ async fn accept_hysteria_conn(conn: Arc<dyn QuicConn>, handler: ConnHandler) {
         };
         let stream: Arc<dyn QuicStream> =
             Arc::new(QuinnQuicStream::new(send, recv, local, remote));
+        let frame_type = match crate::conn::read_varint_stream(&*stream).await {
+            Ok(value) => value,
+            Err(_) => {
+                let _ = stream.cancel_read(0x101);
+                continue;
+            }
+        };
+        if frame_type != crate::config::FrameTypeTCPRequest {
+            let _ = stream.cancel_read(0x101);
+            continue;
+        }
         let inter = Arc::new(InterStreamConn::new(stream, local, remote, false));
         handler(Box::new(HysteriaConn::new(inter)));
     }
@@ -205,7 +216,6 @@ async fn dial_hysteria(
         udp_addr: dest_addr,
         host: default_sni.clone(),
     };
-
     // 4. 创建 transport + client
     let bind_addr: SocketAddr = "0.0.0.0:0".parse().map_err(|e: std::net::AddrParseError| {
         io::Error::other(format!("invalid bind addr: {e}"))
@@ -226,11 +236,21 @@ async fn dial_hysteria(
         quic_params,
         Arc::new(transport),
     );
-
-    // 5. 建立连接 → HysteriaConn（已实现 AsyncRead + AsyncWrite + Connection）
-    let conn = client.tcp().await.map_err(|e| {
-        io::Error::other(format!("hysteria dial failed: {e}"))
-    })?;
+    let target_addr = match dest.address() {
+        xray_common::net::address::Address::Domain(host) => {
+            xray_common::net::address::Address::new_domain(host)
+        }
+        xray_common::net::address::Address::IPv4(ip) => {
+            xray_common::net::address::Address::IPv4(*ip)
+        }
+        xray_common::net::address::Address::IPv6(ip) => {
+            xray_common::net::address::Address::IPv6(*ip)
+        }
+    };
+    let conn = client
+        .tcp(&target_addr, dest.port())
+        .await
+        .map_err(|e| io::Error::other(format!("hysteria dial failed: {e}")))?;
 
     Ok(Box::new(HysteriaConn::new(conn)))
 }

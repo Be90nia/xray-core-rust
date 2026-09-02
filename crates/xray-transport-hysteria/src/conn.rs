@@ -9,16 +9,76 @@
 //! 上层（quinn adapter）实现此 trait。hysteria 内部独立可测的部分是
 //! InterConn 状态机 + UdpSessionManager 的 id 分配 + 清理逻辑。
 
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::pin::Pin;
 
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 
-use crate::config::{UDP_MESSAGE_CHAN_SIZE, IDLE_CLEANUP_INTERVAL};
+use crate::config::{IDLE_CLEANUP_INTERVAL, TcpRequestPadding, UDP_MESSAGE_CHAN_SIZE};
 use crate::error::Result;
+
+/// Encode a QUIC varint.
+#[must_use]
+pub fn encode_varint(v: u64) -> Vec<u8> {
+    if v < (1 << 6) {
+        vec![v as u8]
+    } else if v < (1 << 14) {
+        vec![((v >> 8) as u8) | 0b0100_0000, v as u8]
+    } else if v < (1 << 30) {
+        vec![
+            ((v >> 24) as u8) | 0b1000_0000,
+            (v >> 16) as u8,
+            (v >> 8) as u8,
+            v as u8,
+        ]
+    } else {
+        vec![
+            ((v >> 56) as u8) | 0b1100_0000,
+            (v >> 48) as u8,
+            (v >> 40) as u8,
+            (v >> 32) as u8,
+            (v >> 24) as u8,
+            (v >> 16) as u8,
+            (v >> 8) as u8,
+            v as u8,
+        ]
+    }
+}
+
+/// Decode a QUIC varint from an async stream. This is used once at the server
+/// boundary to peek/consume the Hysteria frame type before dispatching payload.
+pub(crate) async fn read_varint_stream(stream: &dyn QuicStream) -> io::Result<u64> {
+    let mut first = [0u8; 1];
+    stream.read(&mut first).await?;
+    let len = 1usize << (first[0] >> 6);
+    if len == 1 {
+        return Ok(u64::from(first[0]));
+    }
+    let mut rest = vec![0u8; len - 1];
+    stream.read(&mut rest).await?;
+    let mut value = u64::from(first[0] & 0x3f);
+    for byte in rest {
+        value = (value << 8) | u64::from(byte);
+    }
+    Ok(value)
+}
+
+/// Write the Hysteria TCP request body without its frame type.
+#[must_use]
+pub fn write_tcp_request_body(addr: &str) -> Vec<u8> {
+    let padding = TcpRequestPadding.get().generate();
+    let addr = addr.as_bytes();
+    let padding_len = padding.len();
+    let mut out = encode_varint(addr.len() as u64);
+    out.extend_from_slice(addr);
+    out.extend_from_slice(&encode_varint(padding_len as u64));
+    out.extend_from_slice(padding.as_bytes());
+    out
+}
 
 /// QUIC stream 抽象（对应 Go `*quic.Stream`）。
 ///
@@ -36,7 +96,7 @@ pub trait QuicStream: Send + Sync + std::fmt::Debug {
         buf: &'a [u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<usize>> + Send + 'a>>;
 
-    /// 取消读（对应 Go `stream.CancelRead(code)`）。
+    /// cancel read（对应 Go `stream.CancelRead(code)`）。
     fn cancel_read(&self, code: u64);
 
     /// 关闭（对应 Go `stream.Close()`）。
@@ -48,6 +108,7 @@ pub trait QuicStream: Send + Sync + std::fmt::Debug {
     /// 远端地址。
     fn remote_addr(&self) -> SocketAddr;
 }
+
 
 /// QUIC conn 抽象（对应 Go `*quic.Conn`）。
 pub trait QuicConn: Send + Sync {
@@ -309,35 +370,6 @@ impl xray_transport::connection::Connection for HysteriaConn {
     }
 }
 
-/// 编码 QUIC varint（对应 Go `quicvarint.Append(nil, v)`）。
-///
-/// 0x401 在 0b01xx_xxxx_xxxx_xxxx 范围（2 字节形式：前缀 01）。
-#[must_use]
-pub fn encode_varint(v: u64) -> Vec<u8> {
-    if v < (1 << 6) {
-        vec![v as u8]
-    } else if v < (1 << 14) {
-        vec![((v >> 8) as u8) | 0b0100_0000, v as u8]
-    } else if v < (1 << 30) {
-        vec![
-            ((v >> 24) as u8) | 0b1000_0000,
-            (v >> 16) as u8,
-            (v >> 8) as u8,
-            v as u8,
-        ]
-    } else {
-        vec![
-            ((v >> 56) as u8) | 0b1100_0000,
-            (v >> 48) as u8,
-            (v >> 40) as u8,
-            (v >> 32) as u8,
-            (v >> 24) as u8,
-            (v >> 16) as u8,
-            (v >> 8) as u8,
-            v as u8,
-        ]
-    }
-}
 
 /// UDP session 抽象（对应 Go `InterConn`）。
 ///

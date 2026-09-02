@@ -225,7 +225,13 @@ async fn authenticate_via_h3(
         .headers()
         .get("Hysteria-CC-RX")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
+        .map(|s| {
+            if s.eq_ignore_ascii_case("auto") {
+                0
+            } else {
+                s.parse::<u64>().unwrap_or(0)
+            }
+        })
         .unwrap_or(0);
     // drop request stream（sender_count 仍由 send_req 维持）
     drop(stream);

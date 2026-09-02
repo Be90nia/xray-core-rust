@@ -107,7 +107,7 @@ impl OutboundHandler for HysteriaOutboundHandler {
         match destination.network() {
             Network::TCP => {
                 client
-                    .tcp()
+                    .tcp(destination.address(), destination.port())
                     .await
                     .map_err(|e| OutboundError::ConnectionFailed(format!("hysteria tcp: {e}")))?;
                 tracing::debug!(
