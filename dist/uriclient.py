@@ -106,6 +106,19 @@ def cfg(uri, socks_port=11080):
               "insecure":q.get("insecure",q.get("allow_insecure","false")).lower()=="true"}
         if q.get("certificate"): sv["certificate"] = q["certificate"]
         return {"protocol":"tuic","tag":tag,"settings":{"servers":[sv]}}
+    if u.startswith("anytls://"):
+        # anytls://<password>@host:port?security=tls&sni=&type=tcp&headerType=none
+        # userinfo 只有 password，urlparse 会把它放在 p.password
+        pw = p.password or p.username
+        host = p.hostname; port = p.port
+        sv = {
+            "server": host,
+            "server_port": port,
+            "sni": q.get("sni") or host,
+            "insecure": q.get("insecure", q.get("allow_insecure", "false")).lower() == "true",
+            "password": pw,
+        }
+        return {"protocol":"anytls","tag":tag,"settings":sv}
     if u.startswith("hysteria2://"):
         # hysteria2://password@host:port?sni=&alpn=h3&congestion_control=cubic
         pw = up.unquote(p.password or p.username or "")
