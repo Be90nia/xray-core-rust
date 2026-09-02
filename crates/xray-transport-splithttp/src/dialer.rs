@@ -706,7 +706,11 @@ mod tests {
         let tls = rustls::ClientConfig::builder()
             .with_root_certificates(rustls::RootCertStore::empty())
             .with_no_client_auth();
-        let client = Arc::new(DefaultDialerClient::new(config.clone(), tls.into()));
+        let client = Arc::new(DefaultDialerClient::new(
+            config.clone(),
+            tls.into(),
+            DialTarget { host: "h".into(), port: 0, sni: String::new() },
+        ));
         let result = dial(client, config, "http", "h", false).await;
         let err = match result {
             Err(e) => e,

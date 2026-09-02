@@ -16,7 +16,7 @@ use xray_transport::dialer::{StreamSettings, TransportDialFn, register_transport
 use xray_transport::listener_registry::{TransportListenFn, register_transport_listener};
 use xray_transport::sockopt::SocketOptions;
 
-use crate::client::DefaultDialerClient;
+use crate::client::{DefaultDialerClient, DialTarget};
 use crate::config::Config;
 use crate::dialer;
 use crate::h3_client::H3Conn;
@@ -57,6 +57,10 @@ async fn dial_splithttp(
     let config = parse_splithttp_config(settings.transport_json.as_ref())?;
     let config = Arc::new(config);
     let default_sni = dest.address().to_string();
+    // ponytail: 域名前置部署下，SNI 用 tlsSettings.serverName（CF 选 tunnel/zone），
+    // 但 :authority（h2 伪头 = Host 头语义）必须等于 dial 的 dest——实测：
+    // CF argo 隧道 + cdn 都只对 :authority=dest 响应（Python h2 GET 0.25s），
+    // 对 :authority=config.host（sg-argo/cdn_sg）始终 8s+ 超时。
     let host = if config.host.is_empty() {
         format!("{}:{}", dest.address(), dest.port())
     } else {
@@ -131,8 +135,23 @@ async fn dial_splithttp(
             })?
     } else {
         // HTTP/1.1 / HTTP/2 path（hyper + hyper-rustls）。
-        let client = Arc::new(DefaultDialerClient::new(config.clone(), rustls_config));
-        dialer::dial(client, config, scheme, &host, has_tls)
+        // Bug A: TCP 必须恒拨 `dest`，URL authority（config.host）仅作 Host 头；
+        // 否则域名前置（home.begonia92.top→CF→sg-argo.yzswgroup.top）会连接
+        // 到错误边缘（实测 CF argo 直连 h2 GET 不回包→挂死）。
+        // Bug B: 第 5 个参数是 `has_reality`，不是 `has_tls`——否则无显式 mode 的
+        // TLS 节点（vmess+xhttp）被错判 stream-one → 服务器 400 拒绝。
+        let dial_target = DialTarget {
+            host: dest.address().to_string(),
+            port: dest.port().value(),
+            sni: settings
+                .security_json
+                .as_ref()
+                .and_then(|j| j.get("serverName").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_string(),
+        };
+        let client = Arc::new(DefaultDialerClient::new(config.clone(), rustls_config, dial_target));
+        dialer::dial(client, config, scheme, &host, has_reality)
             .await
             .map_err(|e| {
                 io::Error::new(

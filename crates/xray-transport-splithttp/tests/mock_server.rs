@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use webpki_roots::TLS_SERVER_ROOTS;
 
-use xray_transport_splithttp::client::DefaultDialerClient;
+use xray_transport_splithttp::client::{DefaultDialerClient, DialTarget};
 use xray_transport_splithttp::config::Config;
 use xray_transport_splithttp::dialer::dial_packet_up;
 use xray_transport_splithttp::error::SplitHttpError;
@@ -108,7 +108,11 @@ async fn dial_packet_up_end_to_end_via_mock_http1_server() {
         ..Default::default()
     });
     let tls_config = make_tls_config();
-    let client = Arc::new(DefaultDialerClient::new(config, tls_config));
+    let client = Arc::new(DefaultDialerClient::new(
+        config,
+        tls_config,
+        DialTarget { host: "127.0.0.1".into(), port: server_addr.port(), sni: String::new() },
+    ));
 
     let base_uri = format!("http://127.0.0.1:{}/", server_addr.port());
     let session_id = "test-session-1".to_string();
@@ -166,7 +170,11 @@ async fn post_packet_returns_bad_status_on_500() {
 
     let config = Arc::new(Config::default());
     let tls_config = make_tls_config();
-    let client = Arc::new(DefaultDialerClient::new(config, tls_config));
+    let client = Arc::new(DefaultDialerClient::new(
+        config,
+        tls_config,
+        DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() },
+    ));
     let base_uri = format!("http://127.0.0.1:{}/", addr.port());
 
     let result = client.post_packet(&base_uri, "sess", "0", b"x".to_vec()).await;
@@ -206,7 +214,11 @@ async fn open_stream_returns_bad_status_on_non_200() {
 
     let config = Arc::new(Config::default());
     let tls_config = make_tls_config();
-    let client = Arc::new(DefaultDialerClient::new(config, tls_config));
+    let client = Arc::new(DefaultDialerClient::new(
+        config,
+        tls_config,
+        DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() },
+    ));
     let base_uri = format!("http://127.0.0.1:{}/", addr.port());
 
     let result = client.open_stream(&base_uri, "sess", None).await;

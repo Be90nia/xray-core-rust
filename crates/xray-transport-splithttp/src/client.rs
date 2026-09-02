@@ -34,15 +34,66 @@ use http::{Method, StatusCode, Uri};
 use hyper::body::Frame;
 use http_body_util::{BodyDataStream, BodyExt, Full, StreamBody};
 use http_body_util::combinators::BoxBody;
-use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_rustls::{FixedServerNameResolver, HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::connect::{HttpConnector, HttpInfo};
 use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::dns::Name as DnsName;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use rustls::ClientConfig as RustlsClientConfig;
+use rustls::pki_types::ServerName;
+use tower_service::Service as TowerService;
 
 use crate::config::{Config, RequestMeta};
 use crate::error::{Result, SplitHttpError};
 use crate::xpadding::apply_xpadding_to_request_meta;
+
+/// 拨号目标——Go `splithttp/dialer.go::dialContext` 语义：TCP 恒拨出站 `dest`
+/// （`internet.DialSystem(ctxInner, dest, ...)`），URL authority（`config.host`）
+/// 仅作 Host/:authority 头；TLS SNI 用 tlsSettings.serverName（缺省 dest 地址）。
+///
+/// 域名前置（domain fronting）部署下 URI host 与 dest 是两个不同域名：解析
+/// URI host 会连到错误入口（实测 CF argo 隧道边缘对直连 h2 GET 不回包→挂死）。
+#[derive(Debug, Clone)]
+pub struct DialTarget {
+    /// TCP 拨号主机（dest.address 原样；域名在 resolver 内做系统 DNS）。
+    pub host: String,
+    /// TCP 拨号端口（dest.port）。
+    pub port: u16,
+    /// TLS SNI。空 = 回退 hyper 默认（URI authority host）。
+    pub sni: String,
+}
+
+/// 忽略 URI host、恒解析 `DialTarget` 的 DNS resolver（hyper-util Service 语义）。
+#[derive(Debug, Clone)]
+struct DestResolver {
+    host: std::sync::Arc<str>,
+    port: u16,
+}
+
+impl TowerService<DnsName> for DestResolver {
+    type Response = std::vec::IntoIter<SocketAddr>;
+    type Error = std::io::Error;
+    type Future = std::pin::Pin<
+        Box<dyn Future<Output = std::io::Result<std::vec::IntoIter<SocketAddr>>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _name: DnsName) -> Self::Future {
+        let host = std::sync::Arc::clone(&self.host);
+        let port = self.port;
+        Box::pin(async move {
+            tokio::net::lookup_host((host.as_ref(), port))
+                .await
+                .map(|it| it.collect::<Vec<_>>().into_iter())
+        })
+    }
+}
 
 /// 统一 hyper 请求 body 类型（允许 `Full<Bytes>` 和 `StreamBody` 都能发送）。
 ///
@@ -54,7 +105,7 @@ pub type ReqBody = BoxBody<Bytes, std::io::Error>;
 ///
 /// packet-up 用 `Full<Bytes>`（一次性 body）；stream-up/stream-one 用 `StreamBody`
 ///（流式上传）。两者都 box 成 [`ReqBody`]。
-pub type HyperClient = Client<HttpsConnector<HttpConnector>, ReqBody>;
+pub type HyperClient = Client<HttpsConnector<HttpConnector<DestResolver>>, ReqBody>;
 
 /// 构造一次性 body（`Vec<u8>` → `Full<Bytes>` boxed）。
 fn make_full_body(b: Vec<u8>) -> ReqBody {
@@ -95,19 +146,34 @@ pub struct DefaultDialerClient {
 
 impl DefaultDialerClient {
     /// 创建新客户端。`tls_config` 由调用方（[`crate::dialer`]）从 `stream_settings`
-    /// 构造，简化为 webpki-roots + ring provider 默认（切片 F 接入 REALITY 时改）。
+    /// 构造；`dial` 指定 Go 语义：TCP 恒拨出站 `dest`，URL authority 仅作 Host 头；
+    /// 域名前置（domain fronting）部署：dest=home.begonia92.top，URL host=sg-argo
+    /// （TLS SNI 与 Host 头），与 Go `splithttp/dialer.go::dialContext` 等价。
+    ///
+    /// ponytail: hyper-rustls 0.27.9 enable_http1+enable_http2 会把 alpn 设回
+    /// `[h2, http/1.1]`（builder.rs:346），覆盖我们传入 `tls_settings.alpn` 的
+    /// 用户偏好——splithttp Go 端空 alpn 默认亦此值，行为一致。
     #[must_use]
-    pub fn new(config: Arc<Config>, mut tls_config: RustlsClientConfig) -> Self {
-        // ponytail: hyper-rustls 0.27.9 禁止预定义 ALPN(会 panic);
-        // 由 builder.enable_http1()+enable_http2() 内部按协议版本自动设置。
-        tls_config.alpn_protocols.clear();
-        let https = HttpsConnectorBuilder::new()
+    pub fn new(
+        config: Arc<Config>,
+        tls_config: RustlsClientConfig,
+        dial: DialTarget,
+    ) -> Self {
+        let mut builder = HttpsConnectorBuilder::new()
             .with_tls_config(tls_config)
-            .https_or_http()
-            .enable_http1()
-            .enable_http2()
-            .build();
-        // ponytail: 默认 pool_idle_timeout=90s + pool_max_idle_per_host=usize::MAX
+            .https_or_http();
+        // 1) 锁定 TCP 拨号到 dest；忽略 URI authority（Go dialContext 语义）。
+        let mut http = HttpConnector::new_with_resolver(DestResolver {
+            host: std::sync::Arc::from(dial.host.as_str()),
+            port: dial.port,
+        });
+        http.enforce_http(false);
+        // 2) SNI 用 tlsSettings.serverName（Go WithDestination 等价：空回退 dest.host）。
+        let sni = if dial.sni.is_empty() { dial.host } else { dial.sni };
+        if let Ok(sn) = ServerName::try_from(sni) {
+            builder = builder.with_server_name_resolver(FixedServerNameResolver::new(sn));
+        }
+        let https = builder.enable_http1().enable_http2().wrap_connector(http);
         // （hyper-util 默认值，等价 Go http.Transport.IdleConnTimeout）。pool_timer
         // 必须配，否则 idle_timeout 不生效（hyper-util 已知坑）。
         let client = Client::builder(TokioExecutor::new())
@@ -149,8 +215,16 @@ impl DefaultDialerClient {
             .parse()
             .map_err(|e| SplitHttpError::InvalidUrl(format!("uri {e}")))?;
 
+        // h2/2 协议层禁止 Host 作为常规 header——它由 :authority 伪头承载。
+        // hyper-util client.rs:300 会按 URI authority 自动补 Host，与 config.host
+        // 拼成 `Host: sg-argo...` + `:authority: sg-argo...` 双发。CF argo 隧道
+        // 实测对这种双发不响应（vs Go http2 在 wire 上剥 Host，仅发 :authority）。
+        // ponytail: 显式去掉 Host header，让 wire 上只走 :authority，对齐 Go。
         let mut builder = Request::builder().method(method.clone()).uri(uri.clone());
         for (name, value) in meta.headers.iter() {
+            if name.eq_ignore_ascii_case("Host") {
+                continue;
+            }
             builder = builder.header(name.as_str(), value.as_str());
         }
         if !meta.cookies.is_empty() {
