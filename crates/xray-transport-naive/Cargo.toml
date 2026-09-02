@@ -1,0 +1,25 @@
+[package]
+name = "xray-transport-naive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+xray-common = { path = "../xray-common" }
+xray-transport = { path = "../xray-transport" }
+xray-tls = { path = "../xray-tls" }
+xray-app-dispatcher = { path = "../xray-app-dispatcher" }
+tokio = { workspace = true }
+hyper = { workspace = true }
+serde_json = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+http = { workspace = true }
+futures-util = { workspace = true }
+bytes = { workspace = true }
+tokio-util = "0.7"
+tokio-stream = "0.1"
+rand = { workspace = true }
+tracing = { workspace = true }
+base64 = "0.22"

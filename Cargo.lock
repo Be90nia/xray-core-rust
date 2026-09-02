@@ -6007,6 +6007,7 @@ dependencies = [
  "xray-transport-httpupgrade",
  "xray-transport-hysteria",
  "xray-transport-kcp",
+ "xray-transport-naive",
  "xray-transport-quic",
  "xray-transport-splithttp",
  "xray-transport-tcp",
@@ -6667,6 +6668,29 @@ dependencies = [
  "xray-buf",
  "xray-common",
  "xray-proto",
+ "xray-tls",
+ "xray-transport",
+]
+
+[[package]]
+name = "xray-transport-naive"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bytes",
+ "futures-util",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rand 0.9.4",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "xray-app-dispatcher",
+ "xray-common",
  "xray-tls",
  "xray-transport",
 ]
