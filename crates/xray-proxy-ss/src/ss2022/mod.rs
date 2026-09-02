@@ -14,7 +14,7 @@ pub use inbound::{
     InboundResult, MultiUserInbound, RelayDestination, RelayInbound, Ss2022Inbound,
     Ss2022User,
 };
-pub use key::{psk_from_base64, CipherKind2022, derive_session_subkey};
+pub use key::{derive_psk, psk_from_base64, CipherKind2022, derive_session_subkey};
 pub use packet::{
     ClientUdpSession2022, DecodedClientHeader, ServerUdpSession2022, SlidingWindow,
 };

@@ -38,7 +38,9 @@ use xray_crypto::aead::{AeadCipher, Aes128Gcm, Aes256Gcm};
 
 use crate::error::{Result, SsError};
 use crate::protocol::{read_address_port_ss, write_address_port_ss};
-use crate::ss2022::key::{derive_session_subkey, ecb_block, psk_identity, CipherKind2022};
+use crate::ss2022::key::{
+    derive_psk, derive_session_subkey, ecb_block, psk_identity, CipherKind2022,
+};
 
 /// client 帧类型字节。
 pub const HEADER_TYPE_CLIENT: u8 = 0;
@@ -255,17 +257,16 @@ impl ClientUdpSession2022 {
         if psk_list.is_empty() {
             return Err(SsError::Ss2022MissingKey);
         }
-        for psk in &psk_list {
-            if psk.len() != kind.key_size() {
-                return Err(SsError::InvalidPassword(format!(
-                    "PSK length {} != key_size {}",
-                    psk.len(),
-                    kind.key_size()
-                )));
-            }
-        }
+        let psk_list: Vec<Vec<u8>> = psk_list
+            .into_iter()
+            .map(|p| derive_psk(&p, kind))
+            .collect::<Result<Vec<_>>>()?;
         let session_id = rand::random::<u64>();
-        let subkey = derive_session_subkey(&psk_list[psk_list.len() - 1], &session_id.to_be_bytes(), kind);
+        let subkey = derive_session_subkey(
+            &psk_list[psk_list.len() - 1],
+            &session_id.to_be_bytes(),
+            kind,
+        );
         Ok(Self {
             kind,
             cipher: build_aead(kind, &subkey)?,

@@ -131,6 +131,33 @@ pub fn ecb_block(kind: CipherKind2022, key: &[u8], block: &[u8; 16], encrypt: bo
     Ok(buf)
 }
 
+/// 把用户提供的 PSK 规整为 cipher 所需的 key 长度。
+///
+/// 对应 sing-shadowsocks `shadowaead_2022.Key(key, keyLength)`：
+/// - 等长：原样返回
+/// - 太长：SHA-256 后截断到 `kind.key_size()`（sing-shadowsocks Go 行为）
+/// - 太短：报错
+///
+/// 这允许用户在 aes-128-gcm (16B) 配置下提供 32B PSK——sing-shadowsocks 测试里
+/// `rand.Read(password)` 永远是 32 字节就靠这条规则通过。
+pub fn derive_psk(psk: &[u8], kind: CipherKind2022) -> Result<Vec<u8>> {
+    let want = kind.key_size();
+    if psk.len() == want {
+        Ok(psk.to_vec())
+    } else if psk.len() > want {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(psk);
+        Ok(h.finalize()[..want].to_vec())
+    } else {
+        Err(SsError::InvalidPassword(format!(
+            "PSK length {} < key_size {}",
+            psk.len(),
+            want
+        )))
+    }
+}
+
 /// PSK 从 base64 解码（SIP022 要求 PSK 密码学安全随机 + base64 编码）。
 pub fn psk_from_base64(s: &str) -> Result<Vec<u8>> {
     use base64::Engine;
@@ -202,5 +229,41 @@ mod tests {
     #[test]
     fn psk_decode_invalid() {
         assert!(psk_from_base64("!!!invalid base64!!!").is_err());
+    }
+
+    #[test]
+    fn derive_psk_exact_length_passthrough() {
+        // 16B PSK + aes-128-gcm（key_size 16）→ 原样返回
+        let psk = vec![0xAAu8; 16];
+        let got = derive_psk(&psk, CipherKind2022::Aes128Gcm).unwrap();
+        assert_eq!(got, psk);
+    }
+
+    #[test]
+    fn derive_psk_too_long_sha256_truncates() {
+        // #26 URI 场景：32B PSK + aes-128-gcm → SHA-256 截断到 16B
+        let psk = vec![0xBBu8; 32];
+        let got = derive_psk(&psk, CipherKind2022::Aes128Gcm).unwrap();
+        assert_eq!(got.len(), 16);
+        // 等价手算 SHA-256(psk)[..16]
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&psk);
+        assert_eq!(got, h.finalize()[..16].to_vec());
+    }
+
+    #[test]
+    fn derive_psk_too_long_chacha_passthrough() {
+        // chacha20-poly1305 key_size=32；32B PSK 直接返回
+        let psk = vec![0xCCu8; 32];
+        let got = derive_psk(&psk, CipherKind2022::ChaCha20Poly1305).unwrap();
+        assert_eq!(got, psk);
+    }
+
+    #[test]
+    fn derive_psk_too_short_errors() {
+        // aes-128-gcm 需要 16B，输入 8B → 报错
+        let psk = vec![0u8; 8];
+        assert!(derive_psk(&psk, CipherKind2022::Aes128Gcm).is_err());
     }
 }

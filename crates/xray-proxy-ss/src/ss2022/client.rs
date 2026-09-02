@@ -21,7 +21,9 @@ use tokio::net::TcpStream;
 use xray_crypto::aead::{AeadCipher, Aes128Gcm, Aes256Gcm, ChaCha20Poly1305Aead};
 
 use crate::error::{Result, SsError};
-use crate::ss2022::key::{derive_session_subkey, psk_from_base64, CipherKind2022};
+use crate::ss2022::key::{
+    derive_psk, derive_session_subkey, psk_from_base64, CipherKind2022,
+};
 use crate::stream::SSStream;
 
 /// SS-2022 TCP client。
@@ -40,17 +42,9 @@ impl Client2022 {
     /// # Errors
     /// - [`SsError::InvalidCipherName`]：cipher 名称不支持。
     /// - [`SsError::InvalidPassword`]：PSK base64 解码失败或长度不匹配。
-    #[inline]
     pub fn new(cipher: &str, psk_b64: &str, host: &str, port: u16) -> Result<Self> {
         let kind = CipherKind2022::from_name(cipher)?;
-        let psk = psk_from_base64(psk_b64)?;
-        if psk.len() != kind.key_size() {
-            return Err(SsError::InvalidPassword(format!(
-                "PSK length {} != key_size {}",
-                psk.len(),
-                kind.key_size()
-            )));
-        }
+        let psk = derive_psk(&psk_from_base64(psk_b64)?, kind)?;
         Ok(Self {
             psk,
             identity_psk: None,
@@ -63,14 +57,7 @@ impl Client2022 {
     /// 设置 server 主 PSK（iPSK）启用多用户 EIH（SIP023）。
     /// 单端口多用户服务器配置 "server_psk:user_psk" 时：psk=user_psk，此处传 server_psk。
     pub fn with_identity(mut self, server_psk_b64: &str) -> Result<Self> {
-        let ipsk = psk_from_base64(server_psk_b64)?;
-        if ipsk.len() != self.kind.key_size() {
-            return Err(SsError::InvalidPassword(format!(
-                "identity PSK length {} != key_size {}",
-                ipsk.len(),
-                self.kind.key_size()
-            )));
-        }
+        let ipsk = derive_psk(&psk_from_base64(server_psk_b64)?, self.kind)?;
         self.identity_psk = Some(ipsk);
         Ok(self)
     }

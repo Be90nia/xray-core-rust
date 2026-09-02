@@ -32,7 +32,9 @@ use xray_common::net::address::Address;
 
 use crate::error::{Result, SsError};
 use crate::protocol::addr_type;
-use crate::ss2022::key::{derive_session_subkey, psk_from_base64, CipherKind2022};
+use crate::ss2022::key::{
+    derive_psk, derive_session_subkey, psk_from_base64, CipherKind2022,
+};
 use crate::stream::SSStream;
 
 // ============================================================================
@@ -86,17 +88,7 @@ impl Ss2022Inbound {
     /// - [`SsError::Ss2022MissingKey`]：PSK 为空。
     pub fn new(cipher: &str, psk_b64: &str, email: impl Into<String>) -> Result<Self> {
         let kind = CipherKind2022::from_name(cipher)?;
-        let psk = psk_from_base64(psk_b64)?;
-        if psk.is_empty() {
-            return Err(SsError::Ss2022MissingKey);
-        }
-        if psk.len() != kind.key_size() {
-            return Err(SsError::InvalidPassword(format!(
-                "PSK length {} != key_size {}",
-                psk.len(),
-                kind.key_size()
-            )));
-        }
+        let psk = derive_psk(&psk_from_base64(psk_b64)?, kind)?;
         Ok(Self {
             psk,
             kind,
@@ -167,27 +159,17 @@ impl MultiUserInbound {
         users: Vec<Ss2022User>,
     ) -> Result<Self> {
         let kind = CipherKind2022::from_name(cipher)?;
-        let psk = psk_from_base64(server_psk_b64)?;
-        if psk.is_empty() {
-            return Err(SsError::Ss2022MissingKey);
-        }
-        if psk.len() != kind.key_size() {
-            return Err(SsError::InvalidPassword(format!(
-                "Server PSK length {} != key_size {}",
-                psk.len(),
-                kind.key_size()
-            )));
-        }
-        for user in &users {
-            if user.psk.len() != kind.key_size() {
-                return Err(SsError::InvalidPassword(format!(
-                    "User '{}' PSK length {} != key_size {}",
-                    user.email,
-                    user.psk.len(),
-                    kind.key_size()
-                )));
-            }
-        }
+        let psk = derive_psk(&psk_from_base64(server_psk_b64)?, kind)?;
+        let users = users
+            .into_iter()
+            .map(|u| {
+                Ok::<_, SsError>(Ss2022User {
+                    email: u.email,
+                    level: u.level,
+                    psk: derive_psk(&u.psk, kind)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             psk,
             kind,
@@ -217,14 +199,7 @@ impl MultiUserInbound {
         if user.email.is_empty() {
             return Err(SsError::EmptyEmail);
         }
-        if user.psk.len() != self.kind.key_size() {
-            return Err(SsError::InvalidPassword(format!(
-                "User '{}' PSK length {} != key_size {}",
-                user.email,
-                user.psk.len(),
-                self.kind.key_size()
-            )));
-        }
+        let psk = derive_psk(&user.psk, self.kind)?;
         let mut users = self.users.lock();
         if users.iter().any(|u| u.email == user.email) {
             return Err(SsError::UserNotFoundByEmail(format!(
@@ -232,7 +207,11 @@ impl MultiUserInbound {
                 user.email
             )));
         }
-        users.push(user);
+        users.push(Ss2022User {
+            email: user.email,
+            level: user.level,
+            psk,
+        });
         Ok(())
     }
 
@@ -332,17 +311,7 @@ impl RelayInbound {
         if !matches!(kind, CipherKind2022::Aes128Gcm | CipherKind2022::Aes256Gcm) {
             return Err(SsError::Ss2022UnsupportedMethod(cipher.to_string()));
         }
-        let psk = psk_from_base64(server_psk_b64)?;
-        if psk.is_empty() {
-            return Err(SsError::Ss2022MissingKey);
-        }
-        if psk.len() != kind.key_size() {
-            return Err(SsError::InvalidPassword(format!(
-                "Server PSK length {} != key_size {}",
-                psk.len(),
-                kind.key_size()
-            )));
-        }
+        let psk = derive_psk(&psk_from_base64(server_psk_b64)?, kind)?;
         Ok(Self {
             psk,
             kind,
