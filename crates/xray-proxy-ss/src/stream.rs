@@ -29,6 +29,8 @@ pub struct SSStream<C> {
     /// 非空 = 下次 `read_chunk` 前先读 server response 的新 IV 并 rekey aead
     /// （Go `WriteTCPResponse` 模式）。见 [`Client::dial_target_for_proxy`]。
     response_rekey: Option<MemoryAccount>,
+    /// 半帧状态：size chunk 已解、payload 未收齐时的 wire 长度（`try_open_chunk` 用）。
+    pending_payload: Option<usize>,
 }
 
 impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
@@ -49,6 +51,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             nonce: initial_nonce,
             tag_size,
             response_rekey: None,
+            pending_payload: None,
         })
     }
 
@@ -98,6 +101,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             nonce: vec![0xFFu8; nonce_size],
             tag_size,
             response_rekey: None,
+            pending_payload: None,
         }
     }
 
@@ -197,7 +201,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         initial_nonce: Vec<u8>,
     ) -> Self {
         let tag_size = aead.tag_size();
-        Self { inner, aead, nonce: initial_nonce, tag_size, response_rekey: None }
+        Self { inner, aead, nonce: initial_nonce, tag_size, response_rekey: None, pending_payload: None }
     }
 
     /// 读一个 SS chunk，返回 plaintext。
@@ -254,7 +258,71 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
 
         Ok(Some(plaintext))
     }
+    /// 从应用层缓冲 `pending` 解出一个完整 SS chunk（`try_open_chunk` 返回态）。
+    ///
+    /// - `NeedMore`：数据不足（不推进 nonce、不改缓冲语义之外的状态）
+    /// - `Message`：解出一帧明文（nonce 推进，wire 字节从 pending drain）
+    /// - `End`：0 长度 chunk = 流结束标记
+    ///
+    /// 与 [`Self::read_chunk`] 的区别：读来源是调用方维护的缓冲而非直接 IO，
+    /// 使 pump 层可以用 cancel-safe 的单次底层 read 喂数据（`Box<dyn Connection>`
+    /// 无 TcpStream::readable）。半帧状态存 [`Self::pending_payload`]。
+    pub fn try_open_chunk(&mut self, pending: &mut Vec<u8>) -> Result<ChunkOut> {
+        // lazy rekey（缓冲版）：IV 不够时原样放回等待
+        if let Some(account) = self.response_rekey.take() {
+            let iv_size = account.cipher.iv_size() as usize;
+            if pending.len() < iv_size {
+                self.response_rekey = Some(account);
+                return Ok(ChunkOut::NeedMore);
+            }
+            let iv: Vec<u8> = pending.drain(..iv_size).collect();
+            let aead = account
+                .cipher
+                .create_aead(&account.key, &iv)?
+                .ok_or(SsError::UnsupportedCipher)?;
+            self.tag_size = aead.tag_size();
+            self.nonce = vec![0xFFu8; aead.nonce_size()];
+            self.aead = aead;
+        }
 
+        // 半帧恢复：size chunk 已解，直接等 payload
+        let wire_len = if let Some(n) = self.pending_payload {
+            n
+        } else {
+            let size_wire_len = 2 + self.tag_size;
+            if pending.len() < size_wire_len {
+                return Ok(ChunkOut::NeedMore);
+            }
+            let size_buf: Vec<u8> = pending.drain(..size_wire_len).collect();
+            self.increment_nonce();
+            let size_plain = self
+                .aead
+                .open(&self.nonce, &[], &size_buf)
+                .map_err(|e| SsError::AeadOpen(e.to_string()))?;
+            if size_plain.len() < 2 {
+                return Err(SsError::InsufficientData(size_plain.len()));
+            }
+            let payload_len = u16::from_be_bytes([size_plain[0], size_plain[1]]) as usize;
+            if payload_len == 0 {
+                return Ok(ChunkOut::End);
+            }
+            let wire = payload_len + self.tag_size;
+            self.pending_payload = Some(wire);
+            wire
+        };
+
+        if pending.len() < wire_len {
+            return Ok(ChunkOut::NeedMore);
+        }
+        let payload_buf: Vec<u8> = pending.drain(..wire_len).collect();
+        self.pending_payload = None;
+        self.increment_nonce();
+        let plaintext = self
+            .aead
+            .open(&self.nonce, &[], &payload_buf)
+            .map_err(|e| SsError::AeadOpen(e.to_string()))?;
+        Ok(ChunkOut::Message(plaintext))
+    }
     /// 读一个 raw chunk（直接 open，无 size prefix），指定 wire 长度。
     ///
     /// 用于 SS-2022 响应的 header chunk（fixed + variable），
@@ -269,7 +337,6 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             .map_err(|e| SsError::AeadOpen(e.to_string()))?;
         Ok(plaintext)
     }
-
     /// 获取底层连接的不可变引用。
     #[must_use]
     pub fn get_ref(&self) -> &C {
@@ -321,6 +388,15 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         self.nonce = vec![0xFFu8; nonce_size];
         Ok(())
     }
+}
+/// [`SSStream::try_open_chunk`] 的返回态。
+pub enum ChunkOut {
+    /// 缓冲数据不足，等待更多 wire 字节。
+    NeedMore,
+    /// 解出一帧明文。
+    Message(Vec<u8>),
+    /// 0 长度 chunk：流结束标记。
+    End,
 }
 
 /// 根据 account 的 cipher 类型返回 aead nonce 大小。

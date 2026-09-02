@@ -604,6 +604,8 @@ fn try_build_handler(
         }
         "shadowsocks" => {
             let config = xray_proxy_ss::parse_ss_config(&ob.entry.data)?;
+            let config =
+                config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_ss::make_ss_dial_fn(Arc::new(config));
             wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
         }

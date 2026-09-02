@@ -10,7 +10,6 @@
 //!
 //! 调用方通过 [`Client::dial_target`] 一次性完成 1-4，返回的 `SSStream` 直接写 body。
 
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use xray_common::net::address::Address;
 
@@ -59,18 +58,30 @@ impl Client {
     /// - 透传 `SSStream::new_client` AEAD 初始化错误。
     pub async fn connect_tcp(&self) -> Result<SSStream<TcpStream>> {
         let addr = format!("{}:{}", self.server_host, self.server_port);
-        let mut tcp = TcpStream::connect(&addr).await?;
+        let tcp = TcpStream::connect(&addr).await?;
         tcp.set_nodelay(true).ok();
+        self.connect_tcp_on(tcp).await
+    }
 
+    /// 在**已建立**的连接上写随机 IV 并构造 SSStream（生产 transport 路径用）。
+    ///
+    /// # Errors
+    /// - [`crate::error::SsError::Io`]：写 IV 失败。
+    /// - 透传 `SSStream::new_client` AEAD 初始化错误。
+    pub async fn connect_tcp_on<C>(&self, mut conn: C) -> Result<SSStream<C>>
+    where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         // 写随机 IV（长度 = cipher.iv_size()；None cipher iv_size=0，跳过）
         let iv_size = self.account.cipher.iv_size() as usize;
         let iv: Vec<u8> = (0..iv_size).map(|_| rand::random()).collect();
         if iv_size > 0 {
-            tcp.write_all(&iv).await?;
-            tcp.flush().await?;
+            use tokio::io::AsyncWriteExt;
+            conn.write_all(&iv).await?;
+            conn.flush().await?;
         }
 
-        SSStream::new_client(tcp, &self.account, &iv)
+        SSStream::new_client(conn, &self.account, &iv)
     }
 
     /// 连接 + 发首帧（addr+port），返回 `SSStream` 供上层写 body。
@@ -85,7 +96,26 @@ impl Client {
         target_addr: &Address,
         target_port: u16,
     ) -> Result<SSStream<TcpStream>> {
-        let mut stream = self.connect_tcp().await?;
+        let tcp = TcpStream::connect(format!("{}:{}", self.server_host, self.server_port)).await?;
+        tcp.set_nodelay(true).ok();
+        self.dial_target_on(tcp, target_addr, target_port).await
+    }
+
+    /// [`Self::dial_target`] 在**已建立**连接上的版本（生产 transport 路径用）。
+    ///
+    /// # Errors
+    /// - 透传 [`Self::connect_tcp_on`] 错误。
+    /// - 透传 `SSStream::write_chunk` AEAD seal/IO 错误。
+    pub async fn dial_target_on<C>(
+        &self,
+        conn: C,
+        target_addr: &Address,
+        target_port: u16,
+    ) -> Result<SSStream<C>>
+    where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let mut stream = self.connect_tcp_on(conn).await?;
         let mut first_frame = Vec::new();
         write_address_port_ss(&mut first_frame, target_addr, target_port);
         stream.write_chunk(&first_frame).await?;
@@ -112,7 +142,25 @@ impl Client {
         target_addr: &Address,
         target_port: u16,
     ) -> Result<SSStream<TcpStream>> {
-        let mut stream = self.dial_target(target_addr, target_port).await?;
+        let tcp = TcpStream::connect(format!("{}:{}", self.server_host, self.server_port)).await?;
+        tcp.set_nodelay(true).ok();
+        self.dial_target_for_proxy_on(tcp, target_addr, target_port).await
+    }
+
+    /// [`Self::dial_target_for_proxy`] 在**已建立**连接上的版本（生产 transport 路径用）。
+    ///
+    /// # Errors
+    /// - 透传 [`Self::dial_target_on`] 错误。
+    pub async fn dial_target_for_proxy_on<C>(
+        &self,
+        conn: C,
+        target_addr: &Address,
+        target_port: u16,
+    ) -> Result<SSStream<C>>
+    where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let mut stream = self.dial_target_on(conn, target_addr, target_port).await?;
         stream.mark_response_rekey(self.account.clone());
         Ok(stream)
     }

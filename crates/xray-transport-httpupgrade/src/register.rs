@@ -220,14 +220,30 @@ async fn dial_httpupgrade(
     let tcp_conn = xray_transport::system_dialer::dial_system(dest, sockopt).await?;
 
     // 2. 可选 TLS 包装
-    let tls_config = xray_tls::client_config::build_client_config(
+    let mut tls_config = xray_tls::client_config::build_client_config(
         &settings.security,
         settings.security_json.as_ref(),
         &default_sni,
     )?;
+    // Go httpupgrade/dialer.go：`tls.WithNextProto("http/1.1")`——upgrade 是
+    // HTTP/1.1 语义，ALPN 含 "h2" 时 CDN 协商 h2 导致 upgrade 帧解析失败。
+    if let Some(cfg) = tls_config.as_mut() {
+        if let Some(c) = std::sync::Arc::get_mut(cfg) {
+            c.alpn_protocols = vec![b"http/1.1".to_vec()];
+        }
+    }
+
+    // Go：SNI = tlsSettings.serverName（缺失用 dest）——与拨号目标解耦（CDN 场景）。
+    let sni = settings
+        .security_json
+        .as_ref()
+        .and_then(|v| v.get("serverName"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| default_sni.clone());
 
     let upgraded_conn: Box<dyn Connection> = if let Some(cfg) = tls_config {
-        let tls_conn = xray_tls::utls::client(tcp_conn, &default_sni, cfg)
+        let tls_conn = xray_tls::utls::client(tcp_conn, &sni, cfg)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("TLS handshake failed: {e}")))?;
         Box::new(tls_conn)

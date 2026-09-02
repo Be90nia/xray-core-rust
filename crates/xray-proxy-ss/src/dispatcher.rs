@@ -45,7 +45,7 @@ const GLOBAL_ID_LEN: usize = 8;
 
 /// SS 加密流 → Connection trait 实现。
 ///
-/// 桥接 `SSStream<TcpStream>` 的 `write_chunk`/`read_chunk` 到
+/// 桥接 `SSStream<Box<dyn Connection>>` 的 `write_chunk`/`read_chunk` 到
 /// `AsyncRead`/`AsyncWrite`：spawn 一个 [`pump_ss_stream`] task，在 SS 加密
 /// chunk 流与 `tokio::io::duplex` 明文 IO 之间双向搬运。`SsConnection` 自身只
 /// 持有 duplex 客户端半 + pump task 句柄，trait 方法全部委托给 duplex。
@@ -60,7 +60,7 @@ impl SsConnection {
     /// 从已写完首帧（addr+port）的 `SSStream` 构造。
     /// 首帧由 `Client::dial_target` 写入，本包装只负责 body 加密透传。
     #[must_use]
-    pub fn new(stream: SSStream<TcpStream>) -> Self {
+    pub fn new(stream: SSStream<Box<dyn Connection>>) -> Self {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
         let pump = tokio::spawn(pump_ss_stream(stream, server_io));
         Self {
@@ -136,17 +136,42 @@ impl Connection for SsConnection {
 /// 双向 pump：在 `SSStream`（加密 chunk 流）与 `DuplexStream`（明文 IO）之间桥接。
 ///
 /// - up：read duplex（8KB）→ `write_chunk` → flush（明文 → 密文 chunk）
-/// - down：`read_chunk` → write_all duplex（密文 chunk → 明文）
+/// - down：底层单次 read（cancel-safe）→ `pending` 缓冲 → `try_open_chunk`
+///   完整解帧（nonce 只在整帧解出时推进，select! 取消不损流状态）
 ///
 /// `SSStream` 的 `write_chunk`/`read_chunk` 共享单一 nonce 计数器且均需 `&mut self`，
 /// 不可并发持有（也无法像 hysteria 那样 `split` 成独立读写半）。故采用 `select!` 串行
-/// 推进：down 方向用 `get_mut().readable()`（cancel-safe）作就绪信号，一旦可读即在
-/// handler 内完整执行 `read_chunk`（不被 `select!` 取消，避免 nonce 在 size/payload
-/// 分帧中途推进导致流状态损坏）；up 方向用 cancel-safe 的 `AsyncReadExt::read`。
-async fn pump_ss_stream(mut stream: SSStream<TcpStream>, server_io: DuplexStream) {
+/// 推进：down 方向不直接调 async `read_chunk`（其内部 read_exact 半途被取消会丢字节），
+/// 而是用 cancel-safe 的单次底层 `read` 喂 `pending`，再同步解帧；up 方向用
+/// cancel-safe 的 `AsyncReadExt::read`。连接为 transport 层产物
+/// `Box<dyn Connection>`（ws+tls 包装或裸 TCP），无 TcpStream::readable 可用。
+async fn pump_ss_stream(mut stream: SSStream<Box<dyn Connection>>, server_io: DuplexStream) {
     let (mut rd, mut wr) = tokio::io::split(server_io);
     let mut up_buf = vec![0u8; 8 * 1024];
+    let mut down_buf = vec![0u8; 16 * 1024];
+    let mut pending: Vec<u8> = Vec::new();
     loop {
+        // 先把 pending 中完整帧全部解出（NeedMore 才进 select 等新数据）
+        loop {
+            match stream.try_open_chunk(&mut pending) {
+                Ok(crate::stream::ChunkOut::Message(plaintext)) => {
+                    if wr.write_all(&plaintext).await.is_err() {
+                        return;
+                    }
+                    let _ = wr.flush().await;
+                }
+                Ok(crate::stream::ChunkOut::NeedMore) => break,
+                Ok(crate::stream::ChunkOut::End) => {
+                    // 0 长度 chunk = 流结束标记
+                    let _ = wr.shutdown().await;
+                    return;
+                }
+                Err(e) => {
+                    tracing::debug!("ss pump down decode error: {e}");
+                    return;
+                }
+            }
+        }
         tokio::select! {
             // up: 明文 duplex 读 → 加密 chunk 写到 SS wire
             n = rd.read(&mut up_buf) => {
@@ -169,20 +194,14 @@ async fn pump_ss_stream(mut stream: SSStream<TcpStream>, server_io: DuplexStream
                     }
                 }
             }
-            // down: 等 SS 底层 socket 可读（cancel-safe，不借 read_chunk 的 &mut stream）
-            _ = stream.get_mut().readable() => {
-                // socket 可读 → handler 内独占 stream 完整执行一次 read_chunk（不被取消）
-                match stream.read_chunk().await {
-                    Ok(Some(plaintext)) => {
-                        if wr.write_all(&plaintext).await.is_err() {
-                            break;
-                        }
-                        let _ = wr.flush().await;
-                    }
-                    Ok(None) => {
+            // down: cancel-safe 单次底层读 → pending（解帧在循环顶部同步完成）
+            n = stream.get_mut().read(&mut down_buf) => {
+                match n {
+                    Ok(0) => {
                         let _ = wr.shutdown().await;
                         break;
                     }
+                    Ok(n) => pending.extend_from_slice(&down_buf[..n]),
                     Err(e) => {
                         tracing::debug!("ss pump down read error: {e}");
                         break;
@@ -210,6 +229,8 @@ pub struct SsOutboundConfig {
     pub ss2022: Option<Ss2022DialParams>,
     /// UDP-over-TCP 配置（仅 SS-2022 路径填充；Go 旧 AEAD ClientConfig 无 UoT 字段）。
     pub udp_over_tcp: UdpOverTcpConfig,
+    /// 可选 streamSettings（TLS/WS/...）。None 走 raw TCP（与 trojan/vmess dispatcher 一致）。
+    pub stream_settings: Option<xray_transport::dialer::StreamSettings>,
 }
 
 /// SS-2022 出站拨号参数（对应 Go `shadowsocks_2022.ClientConfig{Method, Key}`）。
@@ -234,7 +255,15 @@ impl SsOutboundConfig {
             email: String::new(),
             ss2022: None,
             udp_over_tcp: UdpOverTcpConfig::default(),
+            stream_settings: None,
         }
+    }
+
+    /// 设置 streamSettings（builder 风格）。
+    #[must_use]
+    pub fn with_stream_settings(mut self, settings: Option<xray_transport::dialer::StreamSettings>) -> Self {
+        self.stream_settings = settings;
+        self
     }
 
     /// 设置用户 level（builder 风格）。
@@ -371,7 +400,8 @@ pub fn make_ss_dial_fn(config: Arc<SsOutboundConfig>) -> DialFn {
         let network = dest.network();
         Box::pin(async move {
             match network {
-                // TCP：dial SS 服务器 TCP 端口 + 写加密首帧（addr+port）
+                // TCP：先建到 SS 服务器的传输连接（streamSettings 走 transport
+                // dialer（ws+tls/...），否则裸 TCP），再在其上跑 SS 协议握手
                 Network::TCP => {
                     let host = match &config.server_address {
                         Address::Domain(d) => d.clone(),
@@ -383,6 +413,32 @@ pub fn make_ss_dial_fn(config: Arc<SsOutboundConfig>) -> DialFn {
                         Address::IPv4(ip) => ip.to_string(),
                         Address::IPv6(ip) => ip.to_string(),
                     };
+                    // 1. 到 SS 服务器的连接（与 trojan dispatcher 同模式）
+                    let server_dest = Destination::tcp(
+                        config.server_address.clone(),
+                        Port::new(config.server_port),
+                    );
+                    let sockopt = config
+                        .stream_settings
+                        .as_ref()
+                        .map(|s| s.socket_options())
+                        .unwrap_or_default();
+                    let conn: Box<dyn Connection> = match &config.stream_settings {
+                        Some(s) => xray_transport::dialer::dial(&server_dest, s, &sockopt)
+                            .await
+                            .map_err(|e| format!("ss dial server ({}): {e}", s.protocol))?,
+                        None => {
+                            let sa = resolve_server(&config.server_address, config.server_port)
+                                .await
+                                .map_err(|e| format!("ss resolve server: {e}"))?;
+                            let tcp = TcpStream::connect(sa)
+                                .await
+                                .map_err(|e| format!("ss dial server (tcp): {e}"))?;
+                            tcp.set_nodelay(true).ok();
+                            Box::new(xray_transport::connection::TcpConnection::new(tcp))
+                        }
+                    };
+                    // 2. 在该连接上跑 SS 协议握手 + 拨 target
                     let stream = if let Some(p) = &config.ss2022 {
                         // SS-2022：Client2022（多用户时 EIH 首帧）
                         let mut client = crate::ss2022::client::Client2022::new(
@@ -398,13 +454,13 @@ pub fn make_ss_dial_fn(config: Arc<SsOutboundConfig>) -> DialFn {
                                 .map_err(|e| format!("ss2022 identity: {e}"))?;
                         }
                         client
-                            .dial_target(&target_str, target_port)
+                            .dial_target_on(conn, &target_str, target_port)
                             .await
                             .map_err(|e| format!("ss2022 dial: {e}"))?
                     } else {
                         let client = Client::new(config.account.clone(), host, config.server_port);
                         client
-                            .dial_target_for_proxy(&target_addr, target_port)
+                            .dial_target_for_proxy_on(conn, &target_addr, target_port)
                             .await
                             .map_err(|e| format!("ss dial: {e}"))?
                     };
@@ -888,8 +944,15 @@ mod tests {
 
         // 3. client：dial_target（写 IV + 首帧）→ SsConnection::new → AsyncRead/Write
         let client = Client::new(account, inbound_addr.ip().to_string(), inbound_addr.port());
+        let tcp = TcpStream::connect((inbound_addr.ip(), inbound_addr.port()))
+            .await
+            .expect("connect inbound");
         let stream = client
-            .dial_target(&Address::IPv4(echo_v4), echo_addr.port())
+            .dial_target_on(
+                Box::new(xray_transport::connection::TcpConnection::new(tcp)) as Box<dyn Connection>,
+                &Address::IPv4(echo_v4),
+                echo_addr.port(),
+            )
             .await
             .expect("dial_target");
         let mut conn = SsConnection::new(stream);

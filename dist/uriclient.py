@@ -82,13 +82,19 @@ def cfg(uri, socks_port=11080):
         out = {"protocol":"shadowsocks","tag":tag,"settings":{"servers":[{"address":host,"port":port,"method":method,"password":pw}]}}
         net=q.get("type","")
         plugin = q.get("plugin","")
+        # SIP002 plugin 串: "v2ray-plugin;mode=websocket;host=X;path=/Y;tls;mux=0"
+        pargs = {}
+        for part in plugin.split(";"):
+            if not part: continue
+            if "=" in part: k,v = part.split("=",1); pargs[k]=v
+            else: pargs[part]=True
         if "v2ray-plugin" in plugin or net=="ws":
-            ss={"network":"ws","wsSettings":{"path":q.get("path","/")}}
-            if q.get("host"): ss["wsSettings"]["host"]=q["host"]
-            # plugin tls flag
-            tls_in = ("tls" in plugin)
-            if tls_in:
-                ss["security"]="tls"; ss["tlsSettings"]={"serverName":q.get("host") or host, "fingerprint":"chrome"}
+            ws_path = pargs.get("path") or q.get("path") or "/"
+            ws_host = pargs.get("host") or q.get("host")
+            ss={"network":"ws","wsSettings":{"path":ws_path}}
+            if ws_host: ss["wsSettings"]["host"]=ws_host
+            if pargs.get("tls") or q.get("security")=="tls":
+                ss["security"]="tls"; ss["tlsSettings"]={"serverName":ws_host or host, "fingerprint":"chrome"}
             out["streamSettings"]=ss
         return out
     if u.startswith("tuic://"):

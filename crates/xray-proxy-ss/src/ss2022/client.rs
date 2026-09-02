@@ -16,7 +16,6 @@
 //! 10. read_chunk 循环读响应
 
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use xray_crypto::aead::{AeadCipher, Aes128Gcm, Aes256Gcm, ChaCha20Poly1305Aead};
 
@@ -92,10 +91,31 @@ impl Client2022 {
         target_addr: &str,
         target_port: u16,
     ) -> Result<SSStream<TcpStream>> {
-        // 1. TCP connect
-        let mut conn = TcpStream::connect((self.server_host.as_str(), self.server_port)).await?;
+        let conn = TcpStream::connect((self.server_host.as_str(), self.server_port)).await?;
+        self.dial_target_on(conn, target_addr, target_port).await
+    }
 
-        // 2-4. 随机 salt + derive subkey + build AEAD
+    /// 在**已建立**的连接上发送 salt + header（fixed + variable），拨号到 target。
+    ///
+    /// 生产路径（dispatcher）经 transport 层（ws+tls 等 streamSettings 包装）拿到
+    /// 连接后调用本方法完成 SS-2022 握手；[`Self::dial_target`] 是裸 TCP 便捷版。
+    ///
+    /// 返回 `SSStream<C>`，调用方继续 `write_chunk` 发送 body + `read_chunk` 读响应。
+    ///
+    /// # Errors
+    /// - [`SsError::Io`]：写失败。
+    /// - [`SsError::AeadSeal`]：AEAD 加密失败。
+    /// - 透传 AEAD 初始化错误。
+    pub async fn dial_target_on<C>(
+        &self,
+        mut conn: C,
+        target_addr: &str,
+        target_port: u16,
+    ) -> Result<SSStream<C>>
+    where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        // 随机 salt + derive subkey + build AEAD
         let salt = self.random_salt();
         let subkey = derive_session_subkey(&self.psk, &salt, self.kind);
         let aead = self.build_aead(&subkey)?;
@@ -118,7 +138,7 @@ impl Client2022 {
         // variable-header-chunk 明文长度 = addr_port + 2(paddingLen field) + padding
         let variable_len = addr_port_len + 2 + padding_len as usize;
 
-        // 5. 手动 seal fixed-header-chunk (11B): headerType=0 + timestamp_BE_u64 + variableLen_BE_u16
+        // 手动 seal fixed-header-chunk (11B): headerType=0 + timestamp_BE_u64 + variableLen_BE_u16
         //    SS-2022 header 用直接 seal（无 size prefix），对应 Go shadowaead.Writer.WriteChunk
         let mut fixed = Vec::with_capacity(11);
         fixed.push(0u8); // headerType=0 client
@@ -129,7 +149,7 @@ impl Client2022 {
             .map_err(|e| SsError::AeadSeal(e.to_string()))?;
         increment_nonce(&mut nonce); // [0;12] → [1,0,...]
 
-        // 6. 手动 seal variable-header-chunk: addr+port + paddingLen_BE_u16 + padding
+        // 手动 seal variable-header-chunk: addr+port + paddingLen_BE_u16 + padding
         let mut var = Vec::with_capacity(variable_len);
         var.push(3u8); // ATYP=3 domain
         var.push(u8::try_from(target_addr.len()).map_err(|_| SsError::InvalidRemoteAddress)?);
@@ -144,7 +164,7 @@ impl Client2022 {
             .map_err(|e| SsError::AeadSeal(e.to_string()))?;
         increment_nonce(&mut nonce); // [1,0,...] → [2,0,...]
 
-        // 7. 合并发送 salt [+ EIH] + sealed_fixed + sealed_var（一次性，避免分次写导致 DPI 识别）
+        // 合并发送 salt [+ EIH] + sealed_fixed + sealed_var（一次性，避免分次写导致 DPI 识别）
         let mut header_buf =
             Vec::with_capacity(salt.len() + sealed_fixed.len() + sealed_var.len() + 16);
         header_buf.extend_from_slice(&salt);
@@ -156,10 +176,11 @@ impl Client2022 {
         }
         header_buf.extend_from_slice(&sealed_fixed);
         header_buf.extend_from_slice(&sealed_var);
+        use tokio::io::AsyncWriteExt;
         conn.write_all(&header_buf).await?;
         conn.flush().await?;
 
-        // 8. nonce 回退到 [1,0,...]，SSStream write_chunk increment → [2,0,...]（body size nonce）
+        // nonce 回退到 [1,0,...]，SSStream write_chunk increment → [2,0,...]（body size nonce）
         nonce[0] = 1;
         let stream = SSStream::new_with_aead_and_nonce(conn, aead, nonce);
 

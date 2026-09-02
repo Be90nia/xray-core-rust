@@ -179,17 +179,31 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
 
     // 默认 SNI 用 dest 地址（与 Go `serverName = dest address` 一致）。
     let default_sni = dest.address().to_string();
-    let tls_config = xray_tls::client_config::build_client_config(
+    let mut tls_config = xray_tls::client_config::build_client_config(
         &settings.security,
         settings.security_json.as_ref(),
         &default_sni,
     )?;
+    // Go websocket/dialer.go：`tls.WithNextProto("http/1.1")`——WS upgrade 是
+    // HTTP/1.1 语义；默认 ALPN 含 "h2" 时 CDN（Cloudflare）会协商 h2，随后
+    // tungstenite 发 HTTP/1.1 upgrade 被 h2 帧流打断（httparse: invalid HTTP version）。
+    if let Some(cfg) = tls_config.as_mut() {
+        if let Some(c) = std::sync::Arc::get_mut(cfg) {
+            c.alpn_protocols = vec![b"http/1.1".to_vec()];
+        }
+    }
 
     let conn = dial(DialOptions {
         config: &config,
         destination: dest,
         early_data: None,
         tls_config,
+        tls_server_name: settings
+            .security_json
+            .as_ref()
+            .and_then(|v| v.get("serverName"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
     })
     .await
     .map_err(|e| io::Error::other(e))?;

@@ -19,12 +19,11 @@
 use std::sync::Arc;
 
 use base64::Engine;
-use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::client::Request as WsRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use tokio_tungstenite::{Connector, MaybeTlsStream};
+use tokio_tungstenite::{client_async_tls_with_config, Connector, MaybeTlsStream};
 
 use xray_common::net::destination::Destination;
 
@@ -42,30 +41,52 @@ pub struct DialOptions<'a> {
     pub early_data: Option<&'a [u8]>,
     /// 可选 rustls `ClientConfig`（`Some` → `wss://`，`None` → `ws://`）。
     pub tls_config: Option<Arc<rustls::ClientConfig>>,
+    /// TLS SNI（`tlsSettings.serverName`）。None 用 destination 地址。
+    /// Go：拨号目标（dest）与 SNI 解耦（CDN/argo 场景 SNI/Host 是配置域名）。
+    pub tls_server_name: Option<String>,
 }
 
 /// 完成 WS 握手并返回字节流包装。
 ///
 /// 返回 `WsConnection<MaybeTlsStream<TcpStream>>`，可直接作为
 /// `AsyncRead + AsyncWrite + Connection` 使用。
-pub async fn dial(opts: DialOptions<'_>) -> Result<WsConnection<MaybeTlsStream<tokio::net::TcpStream>>>
-{
-    let uri = build_request_uri(opts.config, opts.destination, opts.tls_config.is_some());
+pub async fn dial(
+    opts: DialOptions<'_>,
+) -> Result<WsConnection<MaybeTlsStream<Box<dyn xray_transport::connection::Connection>>>> {
+    // TLS 自管时 URI 也必须用 ws://：tungstenite 的 uri_mode 按 scheme 判断，
+    // wss + Connector::Plain 会报 "TLS support not compiled in"。
+    let uri = build_request_uri(opts.config, opts.destination, false);
     let request = build_request(&uri, opts.config, opts.early_data)?;
-
-    let connector = opts.tls_config.map(|c| Connector::Rustls(Arc::new((*c).clone())));
 
     // ponytail: WebSocketConfig 默认 64 MiB max_message_size 足够代理流量。
     let ws_cfg = WebSocketConfig::default();
 
-    let (stream, _resp) = match connector {
-        Some(c) => connect_async_tls_with_config(request, Some(ws_cfg), false, Some(c)).await?,
-        None => connect_async_tls_with_config(request, Some(ws_cfg), false, None).await?,
+    // 自管 TCP + TLS：tokio-tungstenite 的 connect_async_tls_with_config 用
+    // URI authority 做 SNI，而 CDN/argo 场景 URI authority（拨号目标）与
+    // SNI/Host（配置域名）必须解耦（Go NetDial(dest) + ServerName(tlsSettings)）。
+    // connector=None 时 tungstenite 把传入流当 TLS-ready（Plain 包装）。
+    let host = opts.destination.address().to_string();
+    let port = opts.destination.port().value();
+    let tcp = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+    tcp.set_nodelay(true).ok();
+
+    let stream: Box<dyn xray_transport::connection::Connection> = match opts.tls_config {
+        Some(cfg) => {
+            let sni = opts.tls_server_name.as_deref().unwrap_or(host.as_str());
+            let tls_stream =
+                xray_tls::utls::client(Box::new(xray_transport::connection::TcpConnection::new(tcp)) as Box<dyn xray_transport::connection::Connection>, sni, cfg)
+                    .await?;
+            Box::new(tls_stream)
+        }
+        None => Box::new(xray_transport::connection::TcpConnection::new(tcp)),
     };
 
-    // tokio-tungstenite 内部已拨 TCP + 完成 TLS 握手 + WS Upgrade。
-    // remote/local addr：底层 TcpStream 可能由 MaybeTlsStream 包装，地址不暴露；
-    // 切片2 留 None，调用方需要时通过 dispatcher 注入。
+    // connector=None 时 tungstenite(native-tls feature)会对流再叠一层 TLS;
+    // 我们的 TLS 分支已自管 TLS,必须显式 Plain(仅明文分支也是 Plain 包装)。
+    let (stream, _resp) =
+        client_async_tls_with_config(request, stream, Some(ws_cfg), Some(Connector::Plain)).await?;
+
+    // remote/local addr：地址不暴露；调用方需要时通过 dispatcher 注入。
     Ok(WsConnection::from_stream(stream, None, None))
 }
 
