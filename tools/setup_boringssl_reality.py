@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""重建 target/boringssl-patched（btls vendor + btls patch 集 + REALITY patch）。
+"""重建 target/boringssl-patched（btls vendor + btls patch 集 + REALITY patch 集）。
 
 btls-sys 走 BORING_BSSL_SOURCE_PATH + BORING_BSSL_ASSUME_PATCHED=1 构建时
 要求该目录已含全部 patch（vendor boringssl 原样不含）。本脚本幂等：
@@ -8,8 +8,12 @@ btls-sys 走 BORING_BSSL_SOURCE_PATH + BORING_BSSL_ASSUME_PATCHED=1 构建时
 2. rm -rf target/boringssl-patched && 复制 vendor boringssl
 3. git init + 按 btls-sys build/main.rs 相同顺序应用 patch：
    boring-pq → 0001..0010（非 fips）→ boringssl-loongarch
-4. 应用 tools/reality-boringssl.patch（SSL_get_x25519_key_share_private，
-   REALITY 客户端 X25519 key share 私钥导出，aai）
+4. 应用 REALITY patch 集（HANDOFF_FINAL_PUSH.md §6.1，7 步）：
+   - SSL_get_x25519_key_share_private（ssl.h + ssl_lib.cc）
+   - SSL_set_reality_rewrite_cb 全局回调（ssl.h + ssl_lib.cc）
+   - ssl_reality_rewrite_maybe（internal.h 声明 + handshake.cc /
+     handshake_client.cc 两处调用点）
+   - tls13_client.cc 删 session_id 回显比对（服务端 v26.3.27+ 必需）
 
 首次 cmake configure 失败后由 tools/inject_btls_cache.py 注入 CMakeCache
 （OPENSSL_NO_ASM + TrackFileAccess），与本脚本无关。
@@ -40,82 +44,15 @@ BTLS_BASE_PATCHES = [
 ]
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-REALITY_PATCH = REPO_ROOT / "tools" / "reality-boringssl.patch"
 
+# ============================================================
+# REALITY patch 集（HANDOFF_FINAL_PUSH.md §6.1）
+# ============================================================
 
-def find_btls_sys() -> Path:
-    """定位 cargo git checkout 的 btls-sys 目录（deps/boringssl 在其下）。"""
-    cargo_git = Path.home() / ".cargo" / "git" / "checkouts"
-    if not cargo_git.exists():
-        raise SystemExit(f"no cargo git checkouts at {cargo_git}")
-    candidates = []
-    for d in cargo_git.glob("btls-*/*/btls-sys"):
-        if (d / "deps" / "boringssl" / "ssl" / "ssl_lib.cc").exists() and (
-            d / "patches"
-        ).is_dir():
-            candidates.append(d)
-    if not candidates:
-        raise SystemExit("btls-sys checkout not found under ~/.cargo/git/checkouts")
-    # 最新 mtime 的 checkout（当前 lock 使用的）
-    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    if len(candidates) > 1:
-        print(f"multiple checkouts found, using newest: {candidates[0]}")
-        for c in candidates[1:]:
-            print(f"  ignored: {c}")
-    return candidates[0]
-
-
-def run(cmd: list[str], cwd: Path | None = None) -> None:
-    print(f"+ {' '.join(cmd)}" + (f"  (cwd={cwd})" if cwd else ""))
-    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
-    if r.returncode != 0:
-        sys.stdout.write(r.stdout)
-        sys.stderr.write(r.stderr)
-        raise SystemExit(f"command failed ({r.returncode}): {' '.join(cmd)}")
-
-
-def _force_remove(func, path, _exc):
-    """rmtree onexc：git pack 文件只读，chmod 后重删。"""
-    import os
-    os.chmod(path, 0o666)
-    func(path)
-
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dest", default=str(REPO_ROOT / "target" / "boringssl-patched"))
-    ap.add_argument("--btls-sys", default=None, help="btls-sys checkout dir override")
-    args = ap.parse_args()
-
-    btls_sys = Path(args.btls_sys) if args.btls_sys else find_btls_sys()
-    src = btls_sys / "deps" / "boringssl"
-    dest = Path(args.dest)
-
-    if not (src / "ssl" / "ssl_lib.cc").exists():
-        raise SystemExit(f"vendor boringssl not found: {src}")
-
-    print(f"rebuilding {dest} from {src}")
-    if dest.exists():
-        shutil.rmtree(dest, onexc=_force_remove)
-    shutil.copytree(src, dest)
-
-    # btls patch 应用需要 git repo（与 build/main.rs 行为一致）
-    run(["git", "init"], cwd=dest)
-    run(["git", "add", "-A"], cwd=dest)
-
-    patches_dir = btls_sys / "patches"
-    for name in BTLS_BASE_PATCHES:
-        patch = patches_dir / name
-        if not patch.exists():
-            raise SystemExit(f"btls patch missing: {patch}")
-        run(["git", "apply", "--whitespace=fix", str(patch)], cwd=dest)
-        print(f"applied {name}")
-
-    apply_reality_patch(dest)
-
-    print(f"\ndone: {dest}")
-    print("next: cargo build with BORING_BSSL_SOURCE_PATH=<dest> + "
-          "BORING_BSSL_ASSUME_PATCHED=1; on first cmake configure failure run "
-          "tools/inject_btls_cache.py then rebuild")
+REALITY_SSL_H_DECL = """
+OPENSSL_EXPORT int SSL_get_x25519_key_share_private(const SSL *ssl,
+                                                    uint8_t out_priv[32]);
+"""
 
 REALITY_SSL_LIB_IMPL = """
 int SSL_get_x25519_key_share_private(const SSL *ssl, uint8_t out_priv[32]) {
@@ -145,6 +82,102 @@ int SSL_get_x25519_key_share_private(const SSL *ssl, uint8_t out_priv[32]) {
 }
 """
 
+REALITY_REWRITE_SSL_H_DECL = """
+OPENSSL_EXPORT void SSL_set_reality_rewrite_cb(
+    int (*cb)(SSL *ssl, uint8_t *msg, size_t msg_len));
+"""
+
+REALITY_REWRITE_SSL_LIB_IMPL = """
+int (*g_reality_rewrite_cb)(SSL *ssl, uint8_t *msg, size_t msg_len) = nullptr;
+void SSL_set_reality_rewrite_cb(int (*cb)(SSL *ssl, uint8_t *msg, size_t msg_len)) {
+  g_reality_rewrite_cb = cb;
+}
+
+namespace bssl {
+bool ssl_reality_rewrite_maybe(SSLImpl *ssl, Array<uint8_t> *msg) {
+  if (g_reality_rewrite_cb == nullptr || (*msg).empty() ||
+      (*msg)[0] != SSL3_MT_CLIENT_HELLO) {
+    return true;
+  }
+  return g_reality_rewrite_cb(reinterpret_cast<SSL *>(ssl), (*msg).data(),
+                              (*msg).size()) != 0;
+}
+}  // namespace bssl
+"""
+
+# handshake.cc / handshake_client.cc：finish_message 后、add_message 前注入
+HANDSHAKE_CBB_OLD = """bool ssl_add_message_cbb(SSLImpl *ssl, CBB *cbb) {
+  Array<uint8_t> msg;
+  if (!ssl->method->finish_message(ssl, cbb, &msg) ||
+      !ssl->method->add_message(ssl, std::move(msg))) {
+"""
+
+HANDSHAKE_CBB_NEW = """bool ssl_add_message_cbb(SSLImpl *ssl, CBB *cbb) {
+  Array<uint8_t> msg;
+  if (!ssl->method->finish_message(ssl, cbb, &msg) ||
+      !ssl_reality_rewrite_maybe(ssl, &msg) ||
+      !ssl->method->add_message(ssl, std::move(msg))) {
+"""
+
+CLIENT_HELLO_OLD = """      !ssl->method->finish_message(ssl, cbb.get(), &msg)) {
+    return false;
+  }
+
+  return ssl->method->add_message(ssl, std::move(msg));
+}
+"""
+
+CLIENT_HELLO_NEW = """      !ssl->method->finish_message(ssl, cbb.get(), &msg)) {
+    return false;
+  }
+
+  if (!ssl_reality_rewrite_maybe(ssl, &msg)) {
+    return false;
+  }
+  return ssl->method->add_message(ssl, std::move(msg));
+}
+"""
+
+# tls13_client.cc：删 session_id 回显（服务端 v26.3.27+ 拒绝明文 sid 回显）
+TLS13_SID_DECL_OLD = """  Span<const uint8_t> expected_session_id =
+      SSL_is_dtls(hs->ssl) ? Span<const uint8_t>() : Span(hs->session_id);
+
+"""
+
+TLS13_SID_CMP_OLD = """      Span<const uint8_t>(out->session_id) != expected_session_id ||
+"""
+
+
+def find_btls_sys() -> Path:
+    """定位 cargo git checkout 的 btls-sys 目录（deps/boringssl 在其下）。"""
+    base = Path.home() / ".cargo" / "git" / "checkouts"
+    candidates = []
+    for btls_dir in base.glob("btls-*"):
+        for rev in btls_dir.iterdir():
+            candidate = rev / "btls-sys"
+            if (candidate / "deps" / "boringssl" / "ssl" / "ssl_lib.cc").exists():
+                candidates.append(candidate)
+    if not candidates:
+        raise SystemExit("btls-sys checkout not found under " + str(base))
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    print(f"multiple checkouts found, using newest: {candidates[0]}")
+    return candidates[0]
+
+
+def run(cmd: list[str], cwd: Path | None = None) -> None:
+    print(f"+ {' '.join(cmd)}" + (f"  (cwd={cwd})" if cwd else ""))
+    r = subprocess.run(cmd, cwd=cwd)
+    if r.returncode != 0:
+        raise SystemExit(f"command failed ({r.returncode}): {' '.join(cmd)}")
+
+
+def _force_remove(func, path, _exc):
+    """rmtree onexc：git pack 文件只读，chmod 后重删。"""
+    import os
+    import stat
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
 
 def insert_after(text: str, anchor: str, insertion: str) -> str:
     idx = text.find(anchor)
@@ -154,32 +187,44 @@ def insert_after(text: str, anchor: str, insertion: str) -> str:
     return text[:end] + insertion + text[end:]
 
 
-def apply_reality_patch(dest: Path) -> None:
-    """插入 SSL_get_x25519_key_share_private（REALITY 客户端 X25519 私钥导出）。
+def replace_exact(text: str, old: str, new: str, what: str) -> str:
+    n = text.count(old)
+    if n != 1:
+        raise SystemExit(f"{what}: anchor count {n} != 1 (already applied?)")
+    return text.replace(old, new)
 
-    锚点式文本插入（行号漂移免疫）；已存在则跳过（幂等）。
-    """
-    marker = "SSL_get_x25519_key_share_private"
 
+def apply_reality_patches(dest: Path) -> None:
+    """应用 REALITY patch 集（锚点式插入/替换，幂等）。"""
+    # ---- 1/2. ssl.h 声明 ----
     ssl_h = dest / "include" / "openssl" / "ssl.h"
     text = ssl_h.read_text(encoding="utf-8")
-    if marker not in text:
-        # 锚点：SSL_set1_client_key_shares 声明（3 行）结尾
+    add = []
+    if "SSL_get_x25519_key_share_private" not in text:
+        add.append(REALITY_SSL_H_DECL)
+    if "SSL_set_reality_rewrite_cb" not in text:
+        add.append(REALITY_REWRITE_SSL_H_DECL)
+    if add:
         anchor = (
             "OPENSSL_EXPORT int SSL_set1_client_key_shares(SSL *ssl,\n"
             "                                              const uint16_t *group_ids,\n"
             "                                              size_t num_group_ids);\n"
         )
-        text = insert_after(text, anchor, "\n" + REALITY_SSL_H_DECL)
+        text = insert_after(text, anchor, "\n" + "\n".join(add))
         ssl_h.write_text(text, encoding="utf-8", newline="\n")
         print("applied reality patch: ssl.h")
     else:
         print("reality patch already present: ssl.h (skip)")
 
+    # ---- 3. ssl_lib.cc 实现（全局区：C linkage + bssl helper）----
     ssl_lib = dest / "ssl" / "ssl_lib.cc"
     text = ssl_lib.read_text(encoding="utf-8")
-    if marker not in text:
-        # 锚点：SSL_set1_client_key_shares 实现块结尾（return 1; 后的 }）
+    add = []
+    if "SSL_get_x25519_key_share_private" not in text:
+        add.append(REALITY_SSL_LIB_IMPL)
+    if "SSL_set_reality_rewrite_cb" not in text:
+        add.append(REALITY_REWRITE_SSL_LIB_IMPL)
+    if add:
         anchor = (
             "int SSL_set1_client_key_shares(SSL *ssl, const uint16_t *group_ids,\n"
             "                               size_t num_group_ids) {"
@@ -187,16 +232,100 @@ def apply_reality_patch(dest: Path) -> None:
         idx = text.find(anchor)
         if idx < 0:
             raise SystemExit("reality patch anchor not found in ssl_lib.cc")
-        # 实现块末尾：从锚点起找第一个 "\n}\n"
         close = text.find("\n}\n", idx)
         if close < 0:
             raise SystemExit("SSL_set1_client_key_shares impl end not found")
         end = close + len("\n}\n")
-        text = text[:end] + "\n" + REALITY_SSL_LIB_IMPL + text[end:]
+        text = text[:end] + "\n" + "\n".join(add) + text[end:]
         ssl_lib.write_text(text, encoding="utf-8", newline="\n")
         print("applied reality patch: ssl_lib.cc")
     else:
         print("reality patch already present: ssl_lib.cc (skip)")
+
+    # ---- 4. internal.h 声明 ----
+    internal_h = dest / "ssl" / "internal.h"
+    text = internal_h.read_text(encoding="utf-8")
+    if "ssl_reality_rewrite_maybe" not in text:
+        anchor = "bool ssl_add_message_cbb(SSLImpl *ssl, CBB *cbb);\n"
+        text = insert_after(
+            text, anchor, "\nbool ssl_reality_rewrite_maybe(SSLImpl *ssl, Array<uint8_t> *msg);\n"
+        )
+        internal_h.write_text(text, encoding="utf-8", newline="\n")
+        print("applied reality patch: internal.h")
+    else:
+        print("reality patch already present: internal.h (skip)")
+
+    # ---- 5. handshake.cc ssl_add_message_cbb 调用点 ----
+    handshake_cc = dest / "ssl" / "handshake.cc"
+    text = handshake_cc.read_text(encoding="utf-8")
+    if "ssl_reality_rewrite_maybe" not in text:
+        text = replace_exact(text, HANDSHAKE_CBB_OLD, HANDSHAKE_CBB_NEW, "handshake.cc")
+        handshake_cc.write_text(text, encoding="utf-8", newline="\n")
+        print("applied reality patch: handshake.cc")
+    else:
+        print("reality patch already present: handshake.cc (skip)")
+
+    # ---- 6. handshake_client.cc ssl_add_client_hello 调用点（关键）----
+    client_cc = dest / "ssl" / "handshake_client.cc"
+    text = client_cc.read_text(encoding="utf-8")
+    if "ssl_reality_rewrite_maybe" not in text:
+        text = replace_exact(text, CLIENT_HELLO_OLD, CLIENT_HELLO_NEW, "handshake_client.cc")
+        client_cc.write_text(text, encoding="utf-8", newline="\n")
+        print("applied reality patch: handshake_client.cc")
+    else:
+        print("reality patch already present: handshake_client.cc (skip)")
+
+    # ---- 7. tls13_client.cc 删 session_id 回显 ----
+    tls13_cc = dest / "ssl" / "tls13_client.cc"
+    text = tls13_cc.read_text(encoding="utf-8")
+    if "expected_session_id" in text:
+        if text.count(TLS13_SID_DECL_OLD) != 1 or text.count(TLS13_SID_CMP_OLD) != 1:
+            raise SystemExit("tls13_client.cc: session_id anchors drifted; re-derive")
+        text = text.replace(TLS13_SID_DECL_OLD, "")
+        text = text.replace(TLS13_SID_CMP_OLD, "")
+        if "expected_session_id" in text:
+            raise SystemExit("tls13_client.cc: expected_session_id residue after removal")
+        tls13_cc.write_text(text, encoding="utf-8", newline="\n")
+        print("applied reality patch: tls13_client.cc (session_id echo removed)")
+    else:
+        print("reality patch already present: tls13_client.cc (skip)")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dest", default=str(REPO_ROOT / "target" / "boringssl-patched"))
+    ap.add_argument("--btls-sys", default=None, help="btls-sys checkout dir override")
+    args = ap.parse_args()
+    btls_sys = Path(args.btls_sys) if args.btls_sys else find_btls_sys()
+    src = btls_sys / "deps" / "boringssl"
+    dest = Path(args.dest)
+
+    if not (src / "ssl" / "ssl_lib.cc").exists():
+        raise SystemExit(f"vendor boringssl not found: {src}")
+
+    print(f"rebuilding {dest} from {src}")
+    if dest.exists():
+        shutil.rmtree(dest, onexc=_force_remove)
+    shutil.copytree(src, dest)
+
+    # btls patch 应用需要 git repo（与 build/main.rs 行为一致）
+    run(["git", "init"], cwd=dest)
+    run(["git", "add", "-A"], cwd=dest)
+
+    patches_dir = btls_sys / "patches"
+    for name in BTLS_BASE_PATCHES:
+        patch = patches_dir / name
+        if not patch.exists():
+            raise SystemExit(f"btls patch missing: {patch}")
+        run(["git", "apply", "--whitespace=fix", str(patch)], cwd=dest)
+        print(f"applied {name}")
+
+    apply_reality_patches(dest)
+
+    print(f"\ndone: {dest}")
+    print("next: cargo build with BORING_BSSL_SOURCE_PATH=<dest> + "
+          "BORING_BSSL_ASSUME_PATCHED=1; on first cmake configure failure run "
+          "tools/inject_btls_cache.py then rebuild")
 
 
 if __name__ == "__main__":
