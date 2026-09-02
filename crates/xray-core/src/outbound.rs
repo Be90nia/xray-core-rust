@@ -1910,7 +1910,8 @@ fn parse_hysteria_config(data: &[u8]) -> std::result::Result<(String, String, St
 ///
 /// 字段与默认值对齐 Itsusinn/tuic（官方 TUIC 实现后继）client config.rs。
 struct TuicOutboundSettings {
-    server_addr: std::net::SocketAddr,
+    /// `host:port` 或 `ip:port` 原样保留；域名在 dial 时由 ToSocketAddrs 解析。
+    server_addr: String,
     server_name: String,
     uuid: uuid::Uuid,
     password: String,
@@ -1951,8 +1952,9 @@ fn parse_tuic_config(data: &[u8]) -> std::result::Result<TuicOutboundSettings, S
         .ok_or_else(|| "missing servers[0].password".to_string())?;
     let server_name = first.get("server_name").and_then(|v| v.as_str())
         .unwrap_or(address).to_string();
-    let server_addr: std::net::SocketAddr = format!("{address}:{port}").parse()
-        .map_err(|e| format!("invalid tuic server addr: {e}"))?;
+    // 域名地址（真实节点）保留原样，dial 时 ToSocketAddrs 解析；此处 parse::<SocketAddr>
+    // 会硬拒域名（bd #17/#30 根因："invalid socket address syntax"）
+    let server_addr = format!("{address}:{port}");
     let uuid = uuid::Uuid::parse_str(uuid_str)
         .map_err(|e| format!("invalid tuic uuid: {e}"))?;
 
@@ -2807,6 +2809,18 @@ mod tests {
         assert!(s.certificate.is_none());
         assert!(s.alpn.is_empty());
         assert_eq!(s.server_name, "127.0.0.1");
+    }
+
+    /// 域名 address 必须保留原样（String），由 dial 时 ToSocketAddrs 解析；
+    /// 配置解析期 parse::<SocketAddr> 会硬拒真实节点（bd #17/#30 根因）。
+    #[test]
+    fn parse_tuic_config_domain_address_kept_for_dial() {
+        let json = format!(
+            r#"{{"servers":[{{"address":"sg.example.top","port":443,"uuid":"{TUIC_TEST_UUID}","password":"pw"}}]}}"#
+        );
+        let s = parse_tuic_config(json.as_bytes()).unwrap();
+        assert_eq!(s.server_addr, "sg.example.top:443");
+        assert_eq!(s.server_name, "sg.example.top");
     }
 
     #[test]

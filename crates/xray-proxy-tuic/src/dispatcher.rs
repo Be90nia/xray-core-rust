@@ -128,8 +128,10 @@ pub fn make_dial_fn(client: Arc<TuicClient>) -> DialFn {
 /// # Panics
 ///
 /// 不会 panic；任何错误以 `Err(String)` 返回。
+/// `server_addr` 为 `host:port` 或 `ip:port`；域名在首次 dial 时经
+/// `ToSocketAddrs` 系统 DNS 解析（bd #17：真实节点 address 是域名）。
 pub fn make_dial_fn_lazy(
-    server_addr: SocketAddr,
+    server_addr: String,
     server_name: String,
     uuid: uuid::Uuid,
     password: String,
@@ -142,8 +144,9 @@ pub fn make_dial_fn_lazy(
     let heartbeat = options.heartbeat;
 
     Arc::new(move |dest: &Destination| {
+        let server_addr_log = server_addr.clone();
         let client_cell = Arc::clone(&client);
-        let server_addr = server_addr;
+        let server_addr = server_addr.clone();
         let server_name = server_name.clone();
         let uuid = uuid;
         let password = password.clone();
@@ -175,11 +178,20 @@ pub fn make_dial_fn_lazy(
                     c.start_heartbeat(heartbeat);
                     Ok::<Arc<TuicClient>, String>(c)
                 })
-                .await?;
-            let conn = tokio::time::timeout(Duration::from_secs(30), c.dial(addr))
                 .await
-                .map_err(|_| "tuic dial: timed out".to_string())?
-                .map_err(|e| format!("tuic dial: {e}"))?;
+                .inspect_err(|e| tracing::warn!(server = %server_addr_log, "tuic client init failed: {e}"))?;
+            let conn = match tokio::time::timeout(Duration::from_secs(30), c.dial(addr.clone())).await
+            {
+                Ok(Ok(conn)) => conn,
+                Ok(Err(e)) => {
+                    tracing::warn!(target = ?addr, "tuic dial failed: {e}");
+                    return Err(format!("tuic dial: {e}"));
+                }
+                Err(_) => {
+                    tracing::warn!(target = ?addr, "tuic dial timed out");
+                    return Err("tuic dial: timed out".to_string());
+                }
+            };
             Ok(Box::new(TuicConnection::from_conn(conn)) as Box<dyn Connection>)
         })
     })

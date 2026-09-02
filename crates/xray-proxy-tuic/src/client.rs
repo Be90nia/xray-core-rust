@@ -279,10 +279,16 @@ impl TuicClient {
         let mut quinn_client_cfg = quinn_client_cfg;
         quinn_client_cfg.transport_config(Arc::new(transport));
 
-        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
-            .map_err(|e| {
-                TuicError::Io(std::io::Error::other(format!("endpoint bind: {e}")))
-            })?;
+        // 本地 endpoint bind 族必须匹配目标族：域名解析出 IPv6（如 [::1]/AAAA）
+        // 时 v4 socket 无法发送 v6 包，quinn 会静默重传直至挂死
+        let local_bind: std::net::SocketAddr = if server_addr.is_ipv6() {
+            "[::]:0".parse().unwrap()
+        } else {
+            "0.0.0.0:0".parse().unwrap()
+        };
+        let mut endpoint = quinn::Endpoint::client(local_bind).map_err(|e| {
+            TuicError::Io(std::io::Error::other(format!("endpoint bind: {e}")))
+        })?;
         endpoint.set_default_client_config(quinn_client_cfg);
 
         let conn = endpoint

@@ -4,7 +4,7 @@
 //! [`make_dial_fn`] 闭包内部 dial → `HysteriaClient::tcp()` → pump 桥接到 duplex。
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -364,9 +364,13 @@ pub fn make_hysteria_dial_fn(
             // resolve server address from config
             let server_addr_str = &config.server_addr;
             let server_name = &config.server_name;
+            // server_addr 可为 IP:port 或域名（真实节点如 sg.example.top）：
+            // IP 直接命中，域名经系统 DNS 解析（对齐 Go dialer 的 LookupHost 语义）
             let udp_addr: SocketAddr = server_addr_str
-                .parse()
-                .map_err(|e| format!("hysteria server addr parse: {e}"))?;
+                .to_socket_addrs()
+                .map_err(|e| format!("hysteria server resolve: {e}"))?
+                .next()
+                .ok_or_else(|| "hysteria server resolve: empty result".to_string())?;
             let dial_dest = DialDestination {
                 udp_addr,
                 host: server_name.clone(),
@@ -382,20 +386,31 @@ pub fn make_hysteria_dial_fn(
             let client = manager.get_or_create(dial_dest, proto_config, quic_params);
 
             // TCP 走 QUIC stream 中继；UDP 走 QUIC datagram session（InterConn）
+            // 失败路径统一 warn（真实节点排障：错误静默曾导致 curl 只见连接断开）
             match dest.network() {
                 Network::TCP => {
-                    let stream = client
-                        .tcp(dest.address(), dest.port())
-                        .await
-                        .map_err(|e| format!("hysteria tcp dial: {e}"))?;
-                    Ok(Box::new(HysteriaConnection::from_stream(stream)) as Box<dyn Connection>)
+                    let result = client.tcp(dest.address(), dest.port()).await;
+                    match result {
+                        Ok(stream) => {
+                            Ok(Box::new(HysteriaConnection::from_stream(stream)) as Box<dyn Connection>)
+                        }
+                        Err(e) => {
+                            tracing::warn!(server = %server_addr_str, target = ?dest.address(), "hysteria tcp dial failed: {e}");
+                            Err(format!("hysteria tcp dial: {e}"))
+                        }
+                    }
                 }
                 Network::UDP => {
-                    let conn = client
-                        .udp()
-                        .await
-                        .map_err(|e| format!("hysteria udp dial: {e}"))?;
-                    Ok(Box::new(HysteriaConnection::from_udp(conn, dest)) as Box<dyn Connection>)
+                    let result = client.udp().await;
+                    match result {
+                        Ok(conn) => {
+                            Ok(Box::new(HysteriaConnection::from_udp(conn, dest)) as Box<dyn Connection>)
+                        }
+                        Err(e) => {
+                            tracing::warn!(server = %server_addr_str, "hysteria udp dial failed: {e}");
+                            Err(format!("hysteria udp dial: {e}"))
+                        }
+                    }
                 }
                 Network::Unix => {
                     Err("hysteria outbound does not support unix network in dial_fn".to_string())
@@ -602,6 +617,66 @@ mod tests {
         assert_eq!(seen[1].1.addr, "alt.example.com:5353");
         assert_eq!(seen[1].1.data, b"query-2".as_slice());
     }
+    /// 捕获 dial_and_authenticate 收到的 DialDestination（域名解析断言用）。
+    struct CaptureTransport {
+        conn: Arc<MockEchoConn>,
+        captured: Arc<parking_lot::Mutex<Option<DialDestination>>>,
+    }
+
+    impl HysteriaTransport for CaptureTransport {
+        fn dial_and_authenticate(
+            &self,
+            dest: &DialDestination,
+            _quic_config: &QuicConfig,
+            _auth_token: &str,
+            _brutal_down_bps: u64,
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<Arc<dyn QuicConn>>> + Send>> {
+            *self.captured.lock() = Some(DialDestination {
+                udp_addr: dest.udp_addr,
+                host: dest.host.clone(),
+            });
+            let conn = Arc::clone(&self.conn) as Arc<dyn QuicConn>;
+            Box::pin(async move { Ok(conn) })
+        }
+
+        fn open_stream(
+            &self,
+            _conn: &Arc<dyn QuicConn>,
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<Arc<dyn xray_transport_hysteria::conn::QuicStream>>> + Send>>
+        {
+            Box::pin(async { Err(std::io::Error::other("mock: udp-only transport")) })
+        }
+    }
+
+    /// 域名 server_addr 应在拨号时经系统 DNS 解析为 IP（bd #30：
+    /// "sg.yzswgroup.top:443".parse::<SocketAddr>() 失败导致直连 FAIL）。
+    #[tokio::test]
+    async fn domain_server_addr_resolved_before_dial() {
+        let (mock_conn, _seen) = MockEchoConn::new();
+        let captured: Arc<parking_lot::Mutex<Option<DialDestination>>> = Arc::default();
+        let transport = CaptureTransport {
+            conn: mock_conn,
+            captured: Arc::clone(&captured),
+        };
+        // 生产路径 outbound.rs: HysteriaConfig::new(addr, auth).with_server_name(sni)
+        let dial = make_hysteria_dial_fn(
+            HysteriaConfig::new("localhost:443", "auth-token")
+                .with_server_name("sg.example.top"),
+            Arc::new(transport),
+        );
+
+        let dest =
+            Destination::new(Address::new_domain("dns.example.com"), Port::new(53), Network::UDP);
+        dial(&dest).await.expect("dial with domain server_addr should succeed");
+
+        let d = captured.lock().take().expect("transport should have been dialed");
+        // localhost 在 Windows hosts 先解析 ::1，Linux/部分环境为 127.0.0.1——
+        // 断言"解析为 loopback IP:443"而非特定 v4 地址
+        assert!(d.udp_addr.ip().is_loopback(), "localhost should resolve to loopback, got {}", d.udp_addr);
+        assert_eq!(d.udp_addr.port(), 443);
+        assert_eq!(d.host, "sg.example.top");
+    }
+
 
     #[test]
     fn parse_udp_source_handles_domain_ip_and_ipv6() {
