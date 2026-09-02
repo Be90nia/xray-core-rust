@@ -717,6 +717,11 @@ fn try_build_handler(
             let dial_fn = xray_proxy_http::make_http_dial_fn(Arc::new(config));
             wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
         }
+        "naive" => {
+            let config = parse_naive_config(&ob.entry.data)?;
+            let dial_fn = xray_transport_naive::make_naive_dial_fn(config);
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
+        }
         "dokodemo" => {
             let config = parse_dokodemo_config(&ob.entry.data)?;
             let dial_fn = xray_proxy_dokodemo::make_dokodemo_dial_fn(config);
@@ -1804,6 +1809,20 @@ fn parse_anytls_config(data: &[u8]) -> std::result::Result<xray_proxy_anytls::Cl
     ))
 }
 
+// ========== naive 配置解析 ==========
+
+/// 解析 naive outbound settings JSON → NaiveConfig。
+///
+/// JSON 格式（uriclient.py 生成）：
+/// `{ "server": "...", "port": 443, "sni": "...", "username": "...", "password": "..." }`
+fn parse_naive_config(
+    data: &[u8],
+) -> std::result::Result<xray_transport_naive::NaiveConfig, String> {
+    let v: serde_json::Value =
+        serde_json::from_slice(data).map_err(|e| format!("naive settings: {e}"))?;
+    xray_transport_naive::NaiveConfig::from_json(&v)
+}
+
 /// 跳过证书验证（insecure=true 场景）。
 struct NoVerifier;
 
@@ -1861,7 +1880,8 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 
 /// 解析 hysteria outbound settings JSON → (server_addr, auth, server_name)。
 ///
-/// JSON 格式：`{"servers":[{"address":"...","port":443,"auth":"..."}]}`。
+/// JSON 格式：`{"servers":[{"address":"...","port":443,"auth"|"password":"...",
+/// "serverName"|"sni":"..."}]}`。
 fn parse_hysteria_config(data: &[u8]) -> std::result::Result<(String, String, String), String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
     let servers = v.get("servers").and_then(|v| v.as_array())
@@ -1871,11 +1891,15 @@ fn parse_hysteria_config(data: &[u8]) -> std::result::Result<(String, String, St
         .ok_or_else(|| "missing servers[0].address".to_string())?;
     let port = first.get("port").and_then(|v| v.as_u64())
         .ok_or_else(|| "missing servers[0].port".to_string())?;
-    let auth = first.get("auth").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let server_addr = format!("{address}:{port}");
-    let server_name = first.get("server_name").and_then(|v| v.as_str())
-        .unwrap_or(address).to_string();
-    Ok((server_addr, auth, server_name))
+    let auth = first.get("auth").or_else(|| first.get("password"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let server_name = first.get("serverName")
+        .or_else(|| first.get("server_name"))
+        .or_else(|| first.get("sni"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(address);
+    Ok((format!("{address}:{port}"), auth.to_string(), server_name.to_string()))
 }
 
 /// tuic outbound 解析结果（官方 tuic-client relay 配置子集，bd 7p0）。

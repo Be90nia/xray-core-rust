@@ -38,6 +38,7 @@ xray-transport-quic = { path = "../xray-transport-quic" }
 xray-transport-httpupgrade = { path = "../xray-transport-httpupgrade" }
 xray-transport-kcp = { path = "../xray-transport-kcp" }
 xray-transport-splithttp = { path = "../xray-transport-splithttp" }
+xray-transport-naive = { path = "../xray-transport-naive" }
 xray-transport-websocket = { path = "../xray-transport-websocket" }
 xray-app-commander = { path = "../xray-app-commander" }
 xray-app-dns = { path = "../xray-app-dns" }
