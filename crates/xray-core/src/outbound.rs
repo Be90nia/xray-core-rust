@@ -160,8 +160,12 @@ pub fn register_outbounds(
     for (i, ob) in built.outbounds.iter().enumerate() {
         match try_build_handler(ob, loopback_sink.clone(), &mut mux_bridges, dns.as_ref()) {
             Ok((handler, bridge_ref, proxy_chain_tag)) => {
-                let is_default = i == 0 || ob.tag == "direct";
-                if is_default {
+                // Go proxyman/outbound/outbound.go:109-111：首个注册成功者即默认
+                // 出站（if defaultHandler == nil），后注册者绝不覆盖、无 tag 特判。
+                // 旧实现 `i == 0 || ob.tag == "direct"` 使 [proxy, direct] 配置的
+                // default 被 direct 覆盖，无路由流量全部直连（32 节点 YouTube
+                // 实测全挂、旧 204 测试假阳性的根因）。
+                if ohm.get_default_handler().is_none() {
                     ohm.set_default(handler.clone());
                 }
                 ohm.add(&ob.tag, handler);
@@ -171,7 +175,7 @@ pub fn register_outbounds(
                 tracing::debug!(
                     tag = %ob.tag,
                     protocol = %ob.entry.kind,
-                    default = is_default,
+                    default = ohm.get_default_handler().as_ref().map(|h| h.tag() == ob.tag).unwrap_or(false),
                     "outbound registered"
                 );
             }
@@ -2164,6 +2168,21 @@ mod tests {
             mux_json: Some(mux_json),
             ..make_outbound("freedom", tag, "{}")
         }
+    }
+
+    /// 对齐 Go proxyman/outbound/outbound.go:109-111：default = 首个注册成功的
+    /// outbound，后注册者绝不覆盖（Go 无任何 tag 特判）。旧实现
+    /// `i==0 || ob.tag=="direct"` 使 [proxy, direct] 配置的 default 被 direct
+    /// 覆盖，无路由流量全部直连（32 节点 YouTube 实测全挂的根因）。
+    #[test]
+    fn register_outbounds_first_success_is_default() {
+        let mut cfg = BuiltConfig::default();
+        cfg.outbounds.push(make_outbound("freedom", "proxy", "{}"));
+        cfg.outbounds.push(make_outbound("freedom", "direct", "{}"));
+        let ohm = SimpleOhm::new();
+        register_outbounds(&cfg, &ohm, None, None).unwrap();
+        let d = ohm.get_default_handler().expect("default handler set");
+        assert_eq!(d.tag(), "proxy", "首个 outbound 应保持为默认出站");
     }
 
     #[test]
