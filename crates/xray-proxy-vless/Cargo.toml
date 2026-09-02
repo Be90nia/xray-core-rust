@@ -29,10 +29,11 @@ chacha20poly1305 = "0.11.0-rc.3"
 # CTR stream (relay chain hash32 + XorConn) — 与 xray-crypto 对齐
 aes = "0.9"
 ctr = "0.10"
+base64 = "0.22"
 
 [dev-dependencies]
 xray-xudp = { path = "../xray-xudp" }
-tokio = { workspace = true, features = ["full", "test-util"] }
+
 xray-tls = { path = "../xray-tls" }
 tokio-tungstenite = { workspace = true }
 futures-util = "0.3"

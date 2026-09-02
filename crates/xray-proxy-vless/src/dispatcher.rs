@@ -46,6 +46,12 @@ pub struct VlessOutboundConfig {
     pub flow: String,
     /// 加密方式（默认 `none`，对应 VLESS 无加密；其他值交给 encryption 层）。
     pub encryption: String,
+    /// ENC 解析后参数（Go `infra/conf/vless.go:333-370` 出站 encryption 校验结果）。
+    /// `None` 时按 `encryption == "none"` 处理；`Some` 时 make_dial_fn 在 dial 后
+    /// 立即执行 ENC 握手（`ClientInstance::handshake`）并用 [`EncConnectionAdapter`]
+    /// 包裹。**目前 vless 配置 path 不传入**——留给 production 调用者显式配置；
+    /// inbound 解码 users[].encryption 后通过 builder 注入。
+    pub enc_params: Option<crate::encryption::ClientEncParams>,
     /// 用户 level（policy/stats 系统用）。
     pub level: u32,
     /// 用户 email（stats 系统标识用）。
@@ -63,11 +69,11 @@ impl VlessOutboundConfig {
             stream_settings: None,
             flow: String::new(),
             encryption: "none".to_string(),
+            enc_params: None,
             level: 0,
             email: String::new(),
         }
     }
-
     /// 指定 streamSettings（builder 风格）。
     ///
     /// `Some(ws_settings)` 后拨号走 ws transport；`None` 回退 raw TCP。
@@ -83,7 +89,6 @@ impl VlessOutboundConfig {
         self.flow = flow.into();
         self
     }
-
     /// 设置 encryption（builder 风格）。
     #[must_use]
     pub fn with_encryption(mut self, encryption: impl Into<String>) -> Self {
@@ -91,14 +96,24 @@ impl VlessOutboundConfig {
         self
     }
 
+    /// 设置 ENC 解析参数（Go `infra/conf/vless.go` 出站 encryption 校验后传入）。
+    ///
+    /// 调用方需先用 [`crate::encryption::parse_client_encryption`] 把 raw 字符串
+    /// 解析成 [`crate::encryption::ClientEncParams`]，再传入。设为 `None` 走明文。
+    #[must_use]
+    pub fn with_encryption_params(
+        mut self,
+        params: Option<crate::encryption::ClientEncParams>,
+    ) -> Self {
+        self.enc_params = params;
+        self
+    }
     /// 设置用户 level（builder 风格）。
     #[must_use]
     pub fn with_level(mut self, level: u32) -> Self {
         self.level = level;
         self
     }
-
-    /// 设置用户 email（builder 风格）。
     #[must_use]
     pub fn with_email(mut self, email: impl Into<String>) -> Self {
         self.email = email.into();
@@ -144,6 +159,26 @@ pub fn make_dial_fn(config: Arc<VlessOutboundConfig>) -> DialFn {
                     .map_err(|e| format!("vless dial server (tcp): {e}"))?,
             };
 
+            // 2a. VLESS ENC 握手（仅当 config.enc_params 已注入时执行）。
+            //     对齐 Go `proxy/vless/outbound/outbound.go:211-216`：
+            //     dial 之后、写请求头之前执行 `h.encryption.Handshake(conn)`，
+            //     用加密层 (CommonConn/XorConn) 包装原始连接。后续请求头、
+            //     响应头、payload 全部走加密层 AEAD 帧。
+            //     缺这一段 → 服务端 h.decryption.Handshake 在裸 VLESS 头字节上
+            //     解析失败直接关流（vless inbound inbound.go:276-278）。
+            if let Some(enc) = config.enc_params.clone() {
+                use crate::encryption::ClientInstance;
+                let mut client = ClientInstance::new();
+                client
+                    .init(enc.keys, enc.xor_mode, enc.seconds, &enc.padding)
+                    .map_err(|e| format!("vless enc init: {e}"))?;
+                let enc_conn = client
+                    .handshake(conn)
+                    .await
+                    .map_err(|e| format!("vless enc handshake: {e}"))?;
+                conn = Box::new(crate::encryption::EncConnectionAdapter::new(enc_conn));
+            }
+
             // 2. 写 VLESS 请求头（version + uuid + addons + command + target addr/port）
             // addons.flow 从 config 取（bd vxk）：flow=xtls-rprx-vision 时服务端启用 Vision。
             let mut addons = empty_addons();
@@ -160,12 +195,13 @@ pub fn make_dial_fn(config: Arc<VlessOutboundConfig>) -> DialFn {
             .await
             .map_err(|e| format!("vless encode header: {e}"))?;
 
-            // 2b. 读取服务端响应头（version + addon_len = 2 bytes），防止泄漏到数据流
-            crate::encoding::client::decode_response_header(&mut conn, VERSION)
-                .await
-                .map_err(|e| format!("vless decode response header: {e}"))?;
+            // 2b. 响应头消费推迟到读路径（对齐 Go postRequest/getResponse 并发时序：
+            //     Go 服务端响应头经 BufferedWriter SetFlushNext 缓冲到首个下行数据
+            //     才 flush；dial 阶段同步等待会让上行首包发不出去 → 双向互等 →
+            //     服务端超时断开。vision 首块 uuid padding 尤甚，见 #9/#15/#32）。
+            conn = Box::new(crate::encoding::client::ResponseHeaderReader::new(conn, VERSION));
 
-            // 3. flow=xtls-rprx-vision（encryption=none）：请求/响应头交换完成后包装
+            // 3. flow=xtls-rprx-vision（encryption=none）：请求头写出后即包装
             //    VisionConn——padding 从业务数据开始（对齐 Go outbound VisionWriter/
             //    VisionReader 的包装时机，首块 padding 携带本账号 uuid）。
             //    ENC(mlkem768)+vision 组合走 CommonConn，见 bd 4lf/byo。
@@ -211,9 +247,7 @@ pub fn make_dial_fn_with_addons(config: Arc<VlessOutboundConfig>, addons: Addons
             .await
             .map_err(|e| format!("vless encode header: {e}"))?;
 
-            crate::encoding::client::decode_response_header(&mut conn, VERSION)
-                .await
-                .map_err(|e| format!("vless decode response header: {e}"))?;
+            conn = Box::new(crate::encoding::client::ResponseHeaderReader::new(conn, VERSION));
             Ok(conn)
         })
     })
@@ -364,5 +398,96 @@ mod tests {
         assert_eq!(wire[16], COMMAND_PADDING_CONTINUE, "data frame command");
         assert_eq!(&wire[17..19], &[0, payload.len() as u8], "content_len BE");
         assert_eq!(&wire[21..21 + payload.len()], payload, "content after frame header");
+    }
+
+    /// 回归（#9/#15/#32 early eof 根因）：dial 不得阻塞等待响应头。Go 服务端
+    /// 响应头经 SetFlushNext 缓冲到首个下行数据才 flush——mock 服务端模拟该
+    /// 时序：收到首个 vision padding 块之后才写响应头。旧行为（dial 内同步
+    /// decode_response_header）在此死锁 → 本测试超时失败。
+    #[tokio::test]
+    async fn vision_dial_returns_before_deferred_response_header() {
+        use crate::encoding::server::decode_request_header;
+        use crate::encryption::vision::xtls_padding;
+        use crate::{MemoryAccount, MemoryUser, MemoryValidator, Validator as _};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::time::{timeout, Duration};
+        use xray_proto::xray::proxy::vless::Account as ProtoAccount;
+
+        let test_uuid = UUID::parse("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let validator = MemoryValidator::new();
+        let mut proto_account = ProtoAccount::default();
+        proto_account.id = "b831381d-6324-4d53-ad4f-8cda48b30811".to_string();
+        let account = MemoryAccount::from_proto_account(&proto_account).unwrap();
+        validator.add(MemoryUser::new("u", 0, account)).unwrap();
+
+        // mock Go 服务端时序：请求头 → 等 client 首块 vision padding（uuid 前缀）
+        // → 此时才回「响应头 + vision padding 块（echo）」
+        let payload: Vec<u8> = b"inner-clienthello".to_vec();
+        let server_uuid = test_uuid.as_bytes().to_vec();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let _ = decode_request_header(false, &mut None, &mut sock, &validator)
+                .await
+                .unwrap();
+            // 读首块 padding：uuid(16) + cmd(1) + content_len(2) + pad_len(2) + content
+            let mut hdr = [0u8; 21];
+            sock.read_exact(&mut hdr).await.unwrap();
+            assert_eq!(&hdr[..16], &server_uuid[..], "server must see uuid-prefixed block");
+            let content_len = ((hdr[17] as usize) << 8) | hdr[18] as usize;
+            let pad_len = ((hdr[19] as usize) << 8) | hdr[20] as usize;
+            let mut content = vec![0u8; content_len];
+            sock.read_exact(&mut content).await.unwrap();
+            let mut pad = vec![0u8; pad_len];
+            let _ = sock.read_exact(&mut pad).await; // padding 字节可能与其他数据合并到达
+            // 首块下行数据触发响应头 flush（Go SetFlushNext 语义）
+            crate::encoding::server::encode_response_header(&mut sock, VERSION, &empty_addons())
+                .await
+                .unwrap();
+            let mut uuid_opt = Some(server_uuid.clone());
+            let mut rng = rand::rngs::StdRng::from_os_rng();
+            let block = xtls_padding(
+                Some(&content),
+                crate::encryption::vision::COMMAND_PADDING_CONTINUE,
+                &mut uuid_opt,
+                false,
+                &crate::encryption::vision::DEFAULT_PADDING_SEED,
+                &mut rng,
+            );
+            sock.write_all(&block).await.unwrap();
+            sock.flush().await.unwrap();
+            content
+        });
+
+        let cfg = Arc::new(
+            VlessOutboundConfig::new(
+                test_uuid,
+                Address::from_ipv4_bytes([127, 0, 0, 1]),
+                Port::new(addr.port()),
+            )
+            .with_flow("xtls-rprx-vision"),
+        );
+        let dial = make_dial_fn(cfg);
+        let dest = Destination::tcp(Address::new_domain("target.example.com"), Port::new(80));
+        // 核心断言：服务端尚未写响应头，dial 必须先行返回（3s 内）
+        let mut conn = timeout(Duration::from_secs(3), dial(&dest))
+            .await
+            .expect("dial must not block on deferred response header")
+            .expect("dial ok");
+
+        conn.write_all(&payload).await.unwrap();
+        conn.flush().await.unwrap();
+        let mut echo = vec![0u8; payload.len()];
+        timeout(Duration::from_secs(5), conn.read_exact(&mut echo))
+            .await
+            .expect("downlink echo within 5s")
+            .unwrap();
+        assert_eq!(echo, payload, "vision roundtrip: header consumed + unpadded echo");
+
+        let got = timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
+        assert_eq!(got, payload);
     }
 }

@@ -3,7 +3,10 @@
 //! 对应 Go 版本 `proxy/vless/encoding/encoding.go` 中的 `EncodeRequestHeader`
 //! 和 `DecodeResponseHeader`。
 
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use xray_common::net::address::Address;
 use xray_common::uuid::UUID;
 use xray_proto::xray::proxy::vless::encoding::Addons;
@@ -70,6 +73,157 @@ pub async fn decode_response_header<R: AsyncRead + Unpin>(
     expected_version: u8,
 ) -> Result<Addons> {
     crate::encoding::decode_response_header(reader, expected_version).await
+}
+
+/// 惰性消费 VLESS 响应头的连接包装。
+///
+/// 对齐 Go outbound 的并发时序：Go 客户端 `postRequest`（发请求头 + 首块业务
+/// 数据）与 `getResponse`（读响应头）经 `task.Run` 并发执行；Go 服务端响应头经
+/// `BufferedWriter` + `SetFlushNext` 缓冲到**首个下行数据**才 flush。若在 dial
+/// 阶段同步读响应头，上行首包（vision 首块 padding 尤甚——服务端 VisionReader
+/// 等待 uuid 前缀块）发不出去，服务端永远没有下行数据 → 双向互等 → 服务端超时
+/// 断开（#9/#15/#32 "early eof" 根因）。此包装把响应头消费推迟到首次读。
+pub struct ResponseHeaderReader<C> {
+    inner: C,
+    expected_version: u8,
+    /// 首读阶段累积字节：响应头 + 可能超读的后续数据。
+    head: Vec<u8>,
+    head_pos: usize,
+    /// 响应头已完整消费。
+    done: bool,
+}
+
+impl<C> ResponseHeaderReader<C> {
+    /// 包装 `inner`，在首次读时消费并校验 `[version][addon_len][addons]`。
+    #[must_use]
+    pub fn new(inner: C, expected_version: u8) -> Self {
+        Self {
+            inner,
+            expected_version,
+            head: Vec::with_capacity(8),
+            head_pos: 0,
+            done: false,
+        }
+    }
+
+    /// 从 `inner` 读到 `head` 至少 `want` 字节。EOF/错误透传。
+    fn fill_head(
+        inner: &mut C,
+        cx: &mut Context<'_>,
+        head: &mut Vec<u8>,
+        want: usize,
+    ) -> Poll<io::Result<()>>
+    where
+        C: AsyncRead + Unpin,
+    {
+        while head.len() < want {
+            let mut tmp = [0u8; 128];
+            let mut rb = ReadBuf::new(&mut tmp);
+            match Pin::new(&mut *inner).poll_read(cx, &mut rb) {
+                Poll::Ready(Ok(())) => {
+                    let n = rb.filled().len();
+                    if n == 0 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "vless response header: early eof",
+                        )));
+                    }
+                    head.extend_from_slice(&rb.filled()[..n]);
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<C> AsyncRead for ResponseHeaderReader<C>
+where
+    C: AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if !this.done {
+            // 头部至少 2 字节（version + addon_len）
+            // fill_head may return Pending when socket has no data yet
+            // (need to wait for waker); short-circuit to avoid head[..1] OOB.
+            match Self::fill_head(&mut this.inner, cx, &mut this.head, 2) {
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(())) => {}
+            }
+            let addon_len = this.head[1] as usize;
+            if addon_len > 0 {
+                match Self::fill_head(
+                    &mut this.inner,
+                    cx,
+                    &mut this.head,
+                    2 + addon_len,
+                ) {
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(())) => {}
+                }
+            }
+            if this.head[0] != this.expected_version {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "vless response version mismatch: expected {} got {}",
+                        this.expected_version, this.head[0]
+                    ),
+                )));
+            }
+            this.head_pos = 2 + addon_len; // 头部字节已消费，仅超读部分返回
+        }
+        // 响应头之后超读的数据先吐出
+        if this.head_pos < this.head.len() {
+            let avail = &this.head[this.head_pos..];
+            let n = avail.len().min(buf.remaining());
+            buf.put_slice(&avail[..n]);
+            this.head_pos += n;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<C> AsyncWrite for ResponseHeaderReader<C>
+where
+    C: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+impl<C> xray_transport::connection::Connection for ResponseHeaderReader<C>
+where
+    C: xray_transport::connection::Connection,
+{
+    fn remote_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
+        self.inner.remote_addr()
+    }
+    fn local_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
+        self.inner.local_addr()
+    }
 }
 
 // ---------------------------------------------------------------------------

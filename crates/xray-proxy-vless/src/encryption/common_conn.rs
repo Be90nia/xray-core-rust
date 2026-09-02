@@ -217,7 +217,7 @@ where
 
 impl<C> super::EncryptionConn for CommonConn<C>
 where
-    C: AsyncRead + AsyncWrite + Unpin + Send,
+    C: AsyncRead + AsyncWrite + Unpin + Send + Sync,
 {
     fn close(
         &mut self,

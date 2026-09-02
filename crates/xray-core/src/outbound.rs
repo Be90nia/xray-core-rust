@@ -890,9 +890,8 @@ fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutboundConfig, S
         Port::new(u16::try_from(port).map_err(|_| "port out of range")?),
     )
     .with_flow(flow)
-    .with_encryption(encryption)
-    .with_level(level)
-    .with_email(email))
+    .with_encryption(encryption.clone())
+    .with_encryption_params(xray_proxy_vless::encryption::parse_client_encryption(&encryption)))
 }
 
 /// 解析 trojan outbound settings JSON → TrojanOutboundConfig。
