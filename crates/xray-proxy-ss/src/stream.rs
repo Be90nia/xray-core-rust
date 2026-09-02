@@ -17,62 +17,119 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::config::MemoryAccount;
 use crate::error::{Result, SsError};
 
-/// SS 流式 AEAD 读写器。
+/// SS 流式 AEAD 读写器（**读/写双方向独立 AEAD+nonce**）。
 ///
-/// 持有底层连接（`AsyncRead + AsyncWrite`）+ AEAD cipher + nonce 状态。
-/// 每次 `write_chunk`/`read_chunk` 消耗 2 个 nonce（size + payload）。
+/// 持有底层连接（`AsyncRead + AsyncWrite`）+ 两个独立的 AEAD cipher + 两个独立的
+/// nonce 状态（分别服务走 / 读侧）。SS wire 上每方向 AEAD 计数器独立递增——
+/// 与 sing `shadowaead.Reader`/`Writer` 一致。本结构之前读写共享 AEAD+nonce，
+/// 在 legacy IV rekey 和 SS-2022 response rekey 后会造成写方向 nonce 错乱。
 pub struct SSStream<C> {
     inner: C,
-    aead: Box<dyn xray_crypto::aead::AeadCipher + Send + Sync>,
-    nonce: Vec<u8>,
+    write_aead: std::sync::Arc<dyn xray_crypto::aead::AeadCipher + Send + Sync>,
+    write_nonce: Vec<u8>,
+    read_aead: std::sync::Arc<dyn xray_crypto::aead::AeadCipher + Send + Sync>,
+    read_nonce: Vec<u8>,
     tag_size: usize,
-    /// 非空 = 下次 `read_chunk` 前先读 server response 的新 IV 并 rekey aead
-    /// （Go `WriteTCPResponse` 模式）。见 [`Client::dial_target_for_proxy`]。
+    /// 非空 = 下次 `read_chunk` 前先读 server response 的新 IV 并 rekey 读侧 AEAD
+    /// （legacy Go `WriteTCPResponse` 模式）。见 [`Client::dial_target_for_proxy`]。
     response_rekey: Option<MemoryAccount>,
+    /// 非空 = 下次 `try_open_chunk` 推进 SS-2022 响应头分阶段解析
+    ///（sing `clientConn.readResponse`：salt→subkey→fixed chunk→variable chunk）。
+    /// 见 [`Client2022::dial_target_on`]。
+    response_rekey_2022: Option<Rekey2022>,
     /// 半帧状态：size chunk 已解、payload 未收齐时的 wire 长度（`try_open_chunk` 用）。
     pending_payload: Option<usize>,
+}
+
+/// SS-2022 响应头分阶段解析（读侧 lazy rekey，缓冲版）。
+///
+/// 响应 wire：`[salt(salt_size)][sealed fixed_header(1+8+salt_size+2 + tag)]
+///            [sealed variable_header(var_len + tag)]<body chunks...>`
+///
+/// sing `clientConn.readResponse`：salt → blake3 重派生 subkey → 用新 AEAD 解
+/// fixed header（type=1 + timestamp + echoed salt + variable length）→ 解
+/// variable header（padding，丢弃）→ 后续 body chunks 标准 size+payload。
+/// 各阶段都可能因缓冲字节不够而回退等待；drained 字节不可恢复。
+enum Rekey2022 {
+    /// 等待 response salt（salt_size 字节），随后派生读侧 AEAD。
+    Salt {
+        psk: Vec<u8>,
+        kind: crate::ss2022::CipherKind2022,
+        request_salt: Vec<u8>,
+    },
+    /// 等待 fixed header chunk wire 字节（fixed_plain + tag）。
+    Fixed {
+        fixed_plain: usize,
+        request_salt: Vec<u8>,
+    },
+    /// 等待 variable header chunk wire 字节（var_len + tag，内容验证后丢弃）。
+    Var { var_len: usize },
+}
+
+/// LE increment（byte[0]++，进位），对应 Go `GenerateIncreasingNonce`。
+fn increment_nonce_bytes(nonce: &mut [u8]) {
+    for b in nonce.iter_mut() {
+        *b = b.wrapping_add(1);
+        if *b != 0 {
+            break;
+        }
+    }
+}
+
+/// 由 account 的 cipher 类型返回 aead nonce 大小。
+///
+/// - AES-128/256-GCM、ChaCha20-Poly1305：12
+/// - XChaCha20-Poly1305：24
+fn ss_nonce_size(account: &MemoryAccount) -> usize {
+    use crate::config::CipherType;
+    match account.cipher_type {
+        CipherType::XChaCha20Poly1305 => 24,
+        _ => 12,
+    }
 }
 
 impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
     /// 通用构造：传入初始 nonce 状态。
     ///
     /// # Errors
-    /// - [`SsError::UnsupportedCipher`]：None cipher 不支持流式 AEAD。
-    /// - 透传 AEAD 初始化错误。
     pub fn new(inner: C, account: &MemoryAccount, iv: &[u8], initial_nonce: Vec<u8>) -> Result<Self> {
-        let aead = account
+        let write_aead = account
             .cipher
             .create_aead(&account.key, iv)?
             .ok_or(SsError::UnsupportedCipher)?;
-        let tag_size = aead.tag_size();
+        // 读写两方向需要独立的 AEAD 实例（AeadCipher 非 Clone）；构造同 key/iv。
+        let read_aead = account
+            .cipher
+            .create_aead(&account.key, iv)?
+            .ok_or(SsError::UnsupportedCipher)?;
+        let tag_size = write_aead.tag_size();
         Ok(Self {
             inner,
-            aead,
-            nonce: initial_nonce,
+            write_aead: std::sync::Arc::from(write_aead),
+            write_nonce: initial_nonce.clone(),
+            read_aead: std::sync::Arc::from(read_aead),
+            read_nonce: initial_nonce,
             tag_size,
             response_rekey: None,
+            response_rekey_2022: None,
             pending_payload: None,
         })
     }
 
-    /// client 端构造：nonce 从 `[0xFF;n]` 开始。
+    /// client 端构造：读写 nonce 均从 `[0xFF;n]` 开始。
     ///
     /// 第一次 `write_chunk` 前 increment → `[0;n]`（首帧 size）→ `[1,0,...]`（首帧 payload）。
     /// 首帧 plaintext 应为 addr+port（SS 地址格式）。
     /// # Errors
     /// - 透传 [`Self::new`] 错误。
     pub fn new_client(inner: C, account: &MemoryAccount, iv: &[u8]) -> Result<Self> {
-        // nonce_size = aead.nonce_size()，但此处还没创建 aead。
-        // AES-GCM/ChaCha20-Poly1305 的 nonce 都是 12；XChaCha20 是 24。
-        // 用 iv_size 推断：AES/ChaCha = 16/32（iv）→ aead nonce = 12；
-        //                 XChaCha = 32（iv）→ aead nonce = 24。
-        // 更稳妥：直接用 account 的 cipher 类型决定。
         let nonce_size = ss_nonce_size(account);
         Self::new(inner, account, iv, vec![0xFFu8; nonce_size])
     }
 
-    /// server body 构造：首帧已由 `decode_tcp_request_header` 消耗（nonce `[0;n]`+`[1,0,...]`），
-    /// body 从 `[2,0,...]` 开始。初始 nonce = `[1,0,...]`，第一次 increment → `[2,0,...]`。
+    /// server body 构造：读写 nonce 均从 `[1,0,...]` 开始
+    /// （首帧 `[0;n]`+`[1,0,...]` 已由 `decode_tcp_request_header` 消耗，
+    /// 下一次 increment = `[2,0,...]` 进入 body）。
     /// # Errors
     /// - 透传 [`Self::new`] 错误。
     pub fn new_server_body(inner: C, account: &MemoryAccount, iv: &[u8]) -> Result<Self> {
@@ -84,10 +141,11 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         Self::new(inner, account, iv, initial)
     }
 
-    /// SS-2022 通用构造：传入已派生的 AEAD + nonce_size。
+    /// SS-2022 通用构造：传入已派生的 AEAD + nonce_size（读写同 nonce 起 `[0xFF;n]`）。
     ///
-    /// nonce 从 `[0xFF;n]` 开始，第一次 increment → `[0;n]`（与 SS-2022 规范一致）。
-    /// 用于 SS-2022（blake3 subkey）等非 MemoryAccount 构造场景。
+    /// 调用方负责把读侧 rekey 触发条件设上（`mark_response_rekey_2022`）——
+    /// 此构造函数本身读侧是占位 aead；首次 `try_open_chunk` 先跑 rekey 状态机
+    /// 才会替换读侧 AEAD。
     #[must_use]
     pub fn new_with_aead(
         inner: C,
@@ -95,23 +153,18 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         nonce_size: usize,
     ) -> Self {
         let tag_size = aead.tag_size();
+        // 读写共享同一 Arc；读侧 aead 会被 rekey 替换（独立 Arc swap）。
+        let arc = std::sync::Arc::from(aead);
         Self {
             inner,
-            aead,
-            nonce: vec![0xFFu8; nonce_size],
+            write_aead: std::sync::Arc::clone(&arc),
+            write_nonce: vec![0xFFu8; nonce_size],
+            read_aead: arc,
+            read_nonce: vec![0xFFu8; nonce_size],
             tag_size,
             response_rekey: None,
+            response_rekey_2022: None,
             pending_payload: None,
-        }
-    }
-
-    /// LE increment（byte[0]++，进位），对应 Go `GenerateIncreasingNonce`。
-    fn increment_nonce(&mut self) {
-        for b in &mut self.nonce {
-            *b = b.wrapping_add(1);
-            if *b != 0 {
-                break;
-            }
         }
     }
 
@@ -139,19 +192,19 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
     /// 写单个（已保证 ≤ 块上限的）chunk。
     async fn write_single_chunk(&mut self, plaintext: &[u8]) -> Result<()> {
         // seal size chunk
-        self.increment_nonce();
+        increment_nonce_bytes(&mut self.write_nonce);
         let plain_size = u16::try_from(plaintext.len())
             .map_err(|_| SsError::InsufficientData(plaintext.len()))?;
         let sealed_size = self
-            .aead
-            .seal(&self.nonce, &[], &plain_size.to_be_bytes())
+            .write_aead
+            .seal(&self.write_nonce, &[], &plain_size.to_be_bytes())
             .map_err(|e| SsError::AeadSeal(e.to_string()))?;
 
         // seal payload chunk
-        self.increment_nonce();
+        increment_nonce_bytes(&mut self.write_nonce);
         let sealed_payload = self
-            .aead
-            .seal(&self.nonce, &[], plaintext)
+            .write_aead
+            .seal(&self.write_nonce, &[], plaintext)
             .map_err(|e| SsError::AeadSeal(e.to_string()))?;
 
         self.inner.write_all(&sealed_size).await?;
@@ -166,10 +219,10 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
     ///
     /// 与 `write_chunk` 的区别：只 seal 一次（不分 size/payload），nonce 只 increment 一次。
     pub async fn write_raw_chunk(&mut self, plaintext: &[u8]) -> Result<()> {
-        self.increment_nonce();
+        increment_nonce_bytes(&mut self.write_nonce);
         let sealed = self
-            .aead
-            .seal(&self.nonce, &[], plaintext)
+            .write_aead
+            .seal(&self.write_nonce, &[], plaintext)
             .map_err(|e| SsError::AeadSeal(e.to_string()))?;
         self.inner.write_all(&sealed).await?;
         Ok(())
@@ -190,21 +243,37 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         self.inner.shutdown().await?;
         Ok(())
     }
-
-    /// SS-2022 通用构造：传入已派生的 AEAD + 初始 nonce。
+    /// SS-2022 通用构造：传入已派生的 AEAD + 初始 nonce（写侧用）。
     ///
-    /// 用于手动 seal header 后，body 阶段接管 SSStream 的场景。
+    /// 写侧 aead = 入参 aead；写侧 nonce = `initial_nonce`。读侧 aead 占位同源
     #[must_use]
     pub fn new_with_aead_and_nonce(
         inner: C,
+
+
         aead: Box<dyn xray_crypto::aead::AeadCipher + Send + Sync>,
         initial_nonce: Vec<u8>,
     ) -> Self {
         let tag_size = aead.tag_size();
-        Self { inner, aead, nonce: initial_nonce, tag_size, response_rekey: None, pending_payload: None }
+        let nonce_size = aead.nonce_size();
+        // 读写共享同一 Arc（写侧+占位读侧同实例）；读侧 aead 将在 SS-2022
+        // rekey 时被替换为独立 response subkey Arc。rekey 前不应被读侧调用，
+        // 生产路径总是先 `mark_response_rekey_2022` 再驱动 `try_open_chunk`。
+        let arc = std::sync::Arc::from(aead);
+        Self {
+            inner,
+            write_aead: std::sync::Arc::clone(&arc),
+            write_nonce: initial_nonce,
+            read_aead: arc,
+            read_nonce: vec![0xFFu8; nonce_size],
+            tag_size,
+            response_rekey: None,
+            response_rekey_2022: None,
+            pending_payload: None,
+        }
     }
 
-    /// 读一个 SS chunk，返回 plaintext。
+    /// 读一个 SS chunk，返回 plaintext（legacy 路径；SS-2022 走 `try_open_chunk`）。
     ///
     /// 返回 `Ok(None)` 表示流结束（inner EOF 或读到 0 长度 chunk）。
     ///
@@ -229,10 +298,10 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         }
 
         // open size chunk
-        self.increment_nonce();
+        increment_nonce_bytes(&mut self.read_nonce);
         let size_plain = self
-            .aead
-            .open(&self.nonce, &[], &size_buf)
+            .read_aead
+            .open(&self.read_nonce, &[], &size_buf)
             .map_err(|e| SsError::AeadOpen(e.to_string()))?;
         if size_plain.len() < 2 {
             return Err(SsError::InsufficientData(size_plain.len()));
@@ -250,14 +319,15 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         self.inner.read_exact(&mut payload_buf).await?;
 
         // open payload
-        self.increment_nonce();
+        increment_nonce_bytes(&mut self.read_nonce);
         let plaintext = self
-            .aead
-            .open(&self.nonce, &[], &payload_buf)
+            .read_aead
+            .open(&self.read_nonce, &[], &payload_buf)
             .map_err(|e| SsError::AeadOpen(e.to_string()))?;
 
         Ok(Some(plaintext))
     }
+
     /// 从应用层缓冲 `pending` 解出一个完整 SS chunk（`try_open_chunk` 返回态）。
     ///
     /// - `NeedMore`：数据不足（不推进 nonce、不改缓冲语义之外的状态）
@@ -268,7 +338,12 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
     /// 使 pump 层可以用 cancel-safe 的单次底层 read 喂数据（`Box<dyn Connection>`
     /// 无 TcpStream::readable）。半帧状态存 [`Self::pending_payload`]。
     pub fn try_open_chunk(&mut self, pending: &mut Vec<u8>) -> Result<ChunkOut> {
-        // lazy rekey（缓冲版）：IV 不够时原样放回等待
+        // SS-2022 响应分阶段 rekey（缓冲版）—— sing clientConn.readResponse。
+        // 必须在 legacy rekey 前推进：salt 已 drained 字节不可恢复，状态机需顺序消费。
+        if self.response_rekey_2022.is_some() {
+            return self.drive_2022_rekey(pending);
+        }
+        // legacy IV rekey（缓冲版）：IV 不够时原样放回等待
         if let Some(account) = self.response_rekey.take() {
             let iv_size = account.cipher.iv_size() as usize;
             if pending.len() < iv_size {
@@ -281,8 +356,8 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
                 .create_aead(&account.key, &iv)?
                 .ok_or(SsError::UnsupportedCipher)?;
             self.tag_size = aead.tag_size();
-            self.nonce = vec![0xFFu8; aead.nonce_size()];
-            self.aead = aead;
+            self.read_nonce = vec![0xFFu8; aead.nonce_size()];
+            self.read_aead = std::sync::Arc::from(aead);
         }
 
         // 半帧恢复：size chunk 已解，直接等 payload
@@ -294,10 +369,10 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
                 return Ok(ChunkOut::NeedMore);
             }
             let size_buf: Vec<u8> = pending.drain(..size_wire_len).collect();
-            self.increment_nonce();
+            increment_nonce_bytes(&mut self.read_nonce);
             let size_plain = self
-                .aead
-                .open(&self.nonce, &[], &size_buf)
+                .read_aead
+                .open(&self.read_nonce, &[], &size_buf)
                 .map_err(|e| SsError::AeadOpen(e.to_string()))?;
             if size_plain.len() < 2 {
                 return Err(SsError::InsufficientData(size_plain.len()));
@@ -316,13 +391,146 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         }
         let payload_buf: Vec<u8> = pending.drain(..wire_len).collect();
         self.pending_payload = None;
-        self.increment_nonce();
+        increment_nonce_bytes(&mut self.read_nonce);
         let plaintext = self
-            .aead
-            .open(&self.nonce, &[], &payload_buf)
+            .read_aead
+            .open(&self.read_nonce, &[], &payload_buf)
             .map_err(|e| SsError::AeadOpen(e.to_string()))?;
         Ok(ChunkOut::Message(plaintext))
     }
+
+    /// SS-2022 响应 rekey 状态机：salt → fixed → var（sing `readResponse` 缓冲版）。
+    fn drive_2022_rekey(&mut self, pending: &mut Vec<u8>) -> Result<ChunkOut> {
+        // 循环推进各阶段；任一阶段需更多字节 → NeedMore（状态保留）。
+        loop {
+            let stage = match self.response_rekey_2022.take() {
+                Some(s) => s,
+                None => break, // rekey 完成，落到下面的 half-frame / body loop。
+            };
+            match stage {
+                Rekey2022::Salt { psk, kind, request_salt } => {
+                    let salt_size = kind.salt_size();
+                    if pending.len() < salt_size {
+                        self.response_rekey_2022 = Some(Rekey2022::Salt { psk, kind, request_salt });
+                        return Ok(ChunkOut::NeedMore);
+                    }
+                    let salt: Vec<u8> = pending.drain(..salt_size).collect();
+                    let subkey = crate::ss2022::derive_session_subkey(&psk, &salt, kind);
+                    let aead = crate::ss2022::key::build_aead(kind, &subkey)
+                        .map_err(|e| SsError::InitDecode(e.to_string()))?;
+                    self.tag_size = aead.tag_size();
+                    self.read_nonce = vec![0xFFu8; aead.nonce_size()];
+                    self.read_aead = std::sync::Arc::from(aead);
+                    let fixed_plain = 1 + 8 + salt_size + 2;
+                    self.response_rekey_2022 = Some(Rekey2022::Fixed { fixed_plain, request_salt });
+                    // 立即进入下一阶段
+                }
+                Rekey2022::Fixed { fixed_plain, request_salt } => {
+                    let wire = fixed_plain + self.tag_size;
+                    if pending.len() < wire {
+                        self.response_rekey_2022 = Some(Rekey2022::Fixed { fixed_plain, request_salt });
+                        return Ok(ChunkOut::NeedMore);
+                    }
+                    let buf: Vec<u8> = pending.drain(..wire).collect();
+                    increment_nonce_bytes(&mut self.read_nonce);
+                    let plain = self
+                        .read_aead
+                        .open(&self.read_nonce, &[], &buf)
+                        .map_err(|e| SsError::AeadOpen(e.to_string()))?;
+                    if plain.len() != fixed_plain {
+                        return Err(SsError::InsufficientData(plain.len()));
+                    }
+                    // headerType(1) + epoch(8) + echo_salt(salt_len) + var_len(2)
+                    let header_type = plain[0];
+                    if header_type != 1 {
+                        return Err(SsError::Ss2022InvalidHeaderType(header_type));
+                    }
+                    let epoch = u64::from_be_bytes(
+                        plain[1..9].try_into().expect("epoch slice is 8 bytes"),
+                    );
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|e| SsError::GetCipher(e.to_string()))?
+                        .as_secs();
+                    if now.abs_diff(epoch) > 30 {
+                        return Err(SsError::Ss2022TimestampCheck(format!(
+                            "epoch {epoch} vs now {now}"
+                        )));
+                    }
+                    let salt_len = fixed_plain - 11;
+                    let echo = &plain[9..9 + salt_len];
+                    // sing: reject if echoed salt > sent salt (lexicographic).
+                    if echo.cmp(request_salt.as_slice()) == std::cmp::Ordering::Greater {
+                        return Err(SsError::Ss2022BadRequestSalt);
+                    }
+                    let var_len = u16::from_be_bytes(
+                        [plain[9 + salt_len], plain[10 + salt_len]],
+                    ) as usize;
+                    self.response_rekey_2022 = Some(Rekey2022::Var { var_len });
+                }
+                Rekey2022::Var { var_len } => {
+                    let wire = var_len + self.tag_size;
+                    if pending.len() < wire {
+                        self.response_rekey_2022 = Some(Rekey2022::Var { var_len });
+                        return Ok(ChunkOut::NeedMore);
+                    }
+                    let buf: Vec<u8> = pending.drain(..wire).collect();
+                    increment_nonce_bytes(&mut self.read_nonce);
+                    let _plain = self
+                        .read_aead
+                        .open(&self.read_nonce, &[], &buf)
+                        .map_err(|e| SsError::AeadOpen(e.to_string()))?;
+                    // rekey 完成：read_nonce 现处于 [1,0,...]，body size chunk
+                    // increment → [2] open，对齐 sing body 计数起点。
+                }
+            }
+        }
+        // rekey 完成；进入正常 body 解帧（沿用下方 half-frame + size/payload 路径）。
+        // 重新进入 try_open_chunk 本体后半（跳过本轮 rekey 块直接到 body loop）。
+        // 这里通过递归调用 try_open_chunk 自身避免代码重复；pending 不含被本函数消耗字节。
+        self.try_open_chunk_body(pending)
+    }
+
+    /// `try_open_chunk` 的 size/payload 解帧主体（在 SS-2022 rekey 完成后调用）。
+    fn try_open_chunk_body(&mut self, pending: &mut Vec<u8>) -> Result<ChunkOut> {
+        let wire_len = if let Some(n) = self.pending_payload {
+            n
+        } else {
+            let size_wire_len = 2 + self.tag_size;
+            if pending.len() < size_wire_len {
+                return Ok(ChunkOut::NeedMore);
+            }
+            let size_buf: Vec<u8> = pending.drain(..size_wire_len).collect();
+            increment_nonce_bytes(&mut self.read_nonce);
+            let size_plain = self
+                .read_aead
+                .open(&self.read_nonce, &[], &size_buf)
+                .map_err(|e| SsError::AeadOpen(e.to_string()))?;
+            if size_plain.len() < 2 {
+                return Err(SsError::InsufficientData(size_plain.len()));
+            }
+            let payload_len = u16::from_be_bytes([size_plain[0], size_plain[1]]) as usize;
+            if payload_len == 0 {
+                return Ok(ChunkOut::End);
+            }
+            let wire = payload_len + self.tag_size;
+            self.pending_payload = Some(wire);
+            wire
+        };
+
+        if pending.len() < wire_len {
+            return Ok(ChunkOut::NeedMore);
+        }
+        let payload_buf: Vec<u8> = pending.drain(..wire_len).collect();
+        self.pending_payload = None;
+        increment_nonce_bytes(&mut self.read_nonce);
+        let plaintext = self
+            .read_aead
+            .open(&self.read_nonce, &[], &payload_buf)
+            .map_err(|e| SsError::AeadOpen(e.to_string()))?;
+        Ok(ChunkOut::Message(plaintext))
+    }
+
     /// 读一个 raw chunk（直接 open，无 size prefix），指定 wire 长度。
     ///
     /// 用于 SS-2022 响应的 header chunk（fixed + variable），
@@ -330,13 +538,14 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
     pub async fn read_raw_chunk(&mut self, wire_len: usize) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; wire_len];
         self.inner.read_exact(&mut buf).await?;
-        self.increment_nonce();
+        increment_nonce_bytes(&mut self.read_nonce);
         let plaintext = self
-            .aead
-            .open(&self.nonce, &[], &buf)
+            .read_aead
+            .open(&self.read_nonce, &[], &buf)
             .map_err(|e| SsError::AeadOpen(e.to_string()))?;
         Ok(plaintext)
     }
+
     /// 获取底层连接的不可变引用。
     #[must_use]
     pub fn get_ref(&self) -> &C {
@@ -355,20 +564,29 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         self.inner
     }
 
-    /// 标记流为「读 Go 风格 server response」：第一次 `read_chunk` 前先读 IV 并 rekey。
+    /// 标记流为「读 Go 风格 server response」（legacy IV rekey）：
+    /// 第一次 `read_chunk` 前先读 IV 并 rekey 读侧 AEAD。
     ///
     /// 对应 [`Client::dial_target_for_proxy`] 的 lazy rekey 模式。
     pub fn mark_response_rekey(&mut self, account: MemoryAccount) {
         self.response_rekey = Some(account);
     }
 
-    /// 读 server response 的 IV + 用新 IV 派生新 aead + 重置 nonce 到 `[0xFF;n]`。
+    /// 标记流为「读 SS-2022 server response」（响应头分阶段解析）：
+    /// 第一次 `try_open_chunk` 前先按 sing `readResponse` 格式消费 salt →
+    /// fixed header chunk → variable header chunk，然后切到 body chunks。
+    pub fn mark_response_rekey_2022(
+        &mut self,
+        psk: Vec<u8>,
+        kind: crate::ss2022::CipherKind2022,
+        request_salt: Vec<u8>,
+    ) {
+        self.response_rekey_2022 = Some(Rekey2022::Salt { psk, kind, request_salt });
+    }
+
+    /// 读 server response 的 IV + 用新 IV 派生新 aead + 重置读侧 nonce 到 `[0xFF;n]`。
     ///
-    /// 对应 Go `proxy/shadowsocks/protocol.go::ReadTCPResponse`（行165-189）：
-    /// server 在 TCP response 开头写**新**随机 IV（行196-202 `WriteTCPResponse`），
-    /// client 必须先读这个 IV，再用它派生 aead（HKDF-SHA1 subkey）才能解密
-    /// 后续 size/payload chunks。读完后 nonce 计数器回到 `[0xFF;n]`，下一次
-    /// `read_chunk` 第一次 increment → `[0;n]`（response 首帧 size）。
+    /// 对应 Go `proxy/shadowsocks/protocol.go::ReadTCPResponse`（行165-189）。
     ///
     /// # Errors
     /// - [`SsError::Io`]：底层读 IV 失败。
@@ -381,11 +599,9 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             .cipher
             .create_aead(&account.key, &iv)?
             .ok_or(SsError::UnsupportedCipher)?;
-        let tag_size = aead.tag_size();
-        let nonce_size = aead.nonce_size();
-        self.aead = aead;
-        self.tag_size = tag_size;
-        self.nonce = vec![0xFFu8; nonce_size];
+        self.tag_size = aead.tag_size();
+        self.read_nonce = vec![0xFFu8; aead.nonce_size()];
+        self.read_aead = std::sync::Arc::from(aead);
         Ok(())
     }
 }
@@ -395,19 +611,8 @@ pub enum ChunkOut {
     NeedMore,
     /// 解出一帧明文。
     Message(Vec<u8>),
-    /// 0 长度 chunk：流结束标记。
+    /// 0 长度 chunk = 流结束标记。
     End,
-}
-
-/// 根据 account 的 cipher 类型返回 aead nonce 大小。
-///
-/// - AES-128/256-GCM、ChaCha20-Poly1305：12
-/// - XChaCha20-Poly1305：24
-fn ss_nonce_size(account: &MemoryAccount) -> usize {
-    match account.cipher_type {
-        crate::config::CipherType::XChaCha20Poly1305 => 24,
-        _ => 12,
-    }
 }
 
 // ============================================================================

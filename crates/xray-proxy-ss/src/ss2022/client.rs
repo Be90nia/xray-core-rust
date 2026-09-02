@@ -180,11 +180,105 @@ impl Client2022 {
         conn.write_all(&header_buf).await?;
         conn.flush().await?;
 
-        // nonce 回退到 [1,0,...]，SSStream write_chunk increment → [2,0,...]（body size nonce）
         nonce[0] = 1;
-        let stream = SSStream::new_with_aead_and_nonce(conn, aead, nonce);
+        let mut stream = SSStream::new_with_aead_and_nonce(conn, aead, nonce);
+        // SS-2022 响应头分阶段 rekey：sing `clientConn.readResponse`
+        //（salt → blake3 重派生 subkey → fixed header chunk → variable header chunk）。
+        stream.mark_response_rekey_2022(self.psk.clone(), self.kind, salt);
 
         Ok(stream)
+    }
+
+    /// 读取服务器响应握手：固定头 + 变量头，返回带响应 aead 的新 SSStream。
+    ///
+    /// wire 顺序（SS-2022 规范 + Go sing-shadowsocks 行为）：
+    /// 1. server_salt (cleartext, `key_size` bytes)
+    /// 2. sealed fixed-chunk: headerType=1 | timestamp(8) | requestSalt(salt_len) | payloadLen(2)
+    ///    共 `1+8+salt_len+2` 明文 + 16 字节 tag
+    /// 3. sealed variable-chunk: server's first payload part (size + tag)
+    ///
+    /// 返回的 SSStream nonce 为 `[1,0,...]`，后续 `read_chunk` 自动 nonce 推进
+    /// `[2,0,...]` → `[3,0,...]` 等读 size+payload 格式响应包。
+    ///
+    /// # Errors
+    /// - [`SsError::Io`]：读失败或 server EOF。
+    /// - [`SsError::AeadOpen`]：AEAD 解密失败（PSK 不一致 / 数据损坏 / 截断）。
+    pub async fn read_response_handshake<C>(
+        &self,
+        mut stream: SSStream<C>,
+    ) -> Result<SSStream<C>>
+    where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let conn = stream.get_mut();
+        use tokio::io::AsyncReadExt;
+
+        let tag_size: usize = 16;
+        let salt_size = self.kind.salt_size();
+
+        // 1. 读 server salt
+        let mut resp_salt = vec![0u8; salt_size];
+        conn.read_exact(&mut resp_salt).await?;
+
+        // 2. 派生响应 session subkey + 构造响应 aead
+        let resp_subkey = derive_session_subkey(&self.psk, &resp_salt, self.kind);
+        let resp_aead = self.build_aead(&resp_subkey)?;
+        let nonce_size = resp_aead.nonce_size();
+        let mut nonce = vec![0u8; nonce_size];
+
+        // 3. 读 fixed chunk：1+8+salt_len+2 明文 + 16 tag
+        let fixed_plain_len = 1 + 8 + salt_size + 2;
+        let fixed_wire_len = fixed_plain_len + tag_size;
+        let mut fixed_wire = vec![0u8; fixed_wire_len];
+        conn.read_exact(&mut fixed_wire).await?;
+
+        let fixed_plain = resp_aead
+            .open(&nonce, &[], &fixed_wire)
+            .map_err(|e| SsError::AeadOpen(e.to_string()))?;
+        if fixed_plain.len() < fixed_plain_len {
+            return Err(SsError::InsufficientData(fixed_plain.len()));
+        }
+        if fixed_plain[0] != 1 {
+            return Err(SsError::Ss2022InvalidHeaderType(fixed_plain[0]));
+        }
+        // 时间戳校验（客户端不要求严格匹配，但拒绝太离谱的）
+        let server_ts = u64::from_be_bytes([
+            fixed_plain[1], fixed_plain[2], fixed_plain[3], fixed_plain[4],
+            fixed_plain[5], fixed_plain[6], fixed_plain[7], fixed_plain[8],
+        ]);
+        let now_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| SsError::GetCipher(e.to_string()))?
+            .as_secs();
+        if server_ts.abs_diff(now_ts) > 60 {
+            return Err(SsError::Ss2022TimestampCheck(format!(
+                "server timestamp {} out of window (now={})",
+                server_ts, now_ts
+            )));
+        }
+        // requestSalt = server 给我们回显的客户端 salt（前 salt_size 字节）
+        // Go 比较但客户端 outbound 仅记录不强制（PSK 已绑定身份）。
+        let payload_len = u16::from_be_bytes([
+            fixed_plain[1 + 8 + salt_size],
+            fixed_plain[1 + 8 + salt_size + 1],
+        ]) as usize;
+        increment_nonce(&mut nonce); // [0;n] → [1,0,...]
+
+        // 4. 读 variable chunk：payload_len 明文 + 16 tag
+        if payload_len > 900 + 260 {
+            return Err(SsError::Ss2022PaddingTooLarge(payload_len));
+        }
+        let var_wire_len = payload_len + tag_size;
+        let mut var_wire = vec![0u8; var_wire_len];
+        conn.read_exact(&mut var_wire).await?;
+        let _var_plain = resp_aead
+            .open(&nonce, &[], &var_wire)
+            .map_err(|e| SsError::AeadOpen(e.to_string()))?;
+        increment_nonce(&mut nonce); // [1,0,...] → [2,0,...]
+
+        // 5. 重建 SSStream，nonce 设为 [1,0,...]：下次 read_chunk increment → [2,0,...]（size）
+        let conn = stream.into_inner();
+        Ok(SSStream::new_with_aead_and_nonce(conn, resp_aead, vec![1u8; 12]))
     }
 }
 

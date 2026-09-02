@@ -118,6 +118,8 @@ pub enum SsError {
 
     #[error("ss-2022 server packet clientSessionId mismatch")]
     Ss2022BadClientSessionId,
+    #[error("ss-2022 request salt mismatch")]
+    Ss2022BadRequestSalt,
 }
 
 impl From<std::io::Error> for SsError {

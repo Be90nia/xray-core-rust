@@ -57,6 +57,18 @@ pub fn derive_session_subkey(psk: &[u8], salt: &[u8], kind: CipherKind2022) -> V
     hash[..kind.key_size()].to_vec()
 }
 
+/// 从 subkey 构造 SS-2022 AEAD cipher。
+///
+/// 对应 sing `Method.constructor`：3 种 2022 cipher 之一。
+pub(crate) fn build_aead(kind: CipherKind2022, subkey: &[u8]) -> Result<Box<dyn xray_crypto::aead::AeadCipher + Send + Sync>> {
+    use xray_crypto::aead::{Aes128Gcm, Aes256Gcm, ChaCha20Poly1305Aead};
+    match kind {
+        CipherKind2022::Aes128Gcm => Ok(Box::new(Aes128Gcm::new(subkey)?)),
+        CipherKind2022::Aes256Gcm => Ok(Box::new(Aes256Gcm::new(subkey)?)),
+        CipherKind2022::ChaCha20Poly1305 => Ok(Box::new(ChaCha20Poly1305Aead::new(subkey)?)),
+    }
+}
+
 /// SIP023 identity subkey context。
 const IDENTITY_CTX: &str = "shadowsocks 2022 identity subkey";
 
