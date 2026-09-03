@@ -209,14 +209,15 @@ impl TuicClient {
             })
             .await?;
 
-        // 认证
+        // 认证：token = TLS exporter(label=uuid 16字节, context=password)。
+        // 官方 EAimTY/tuic v5 语义 (tuic-server 1.0.0 tuic/src/model/authenticate.rs) 用
+        // uuid.as_ref() 取 16 原始字节；之前误用 uuid.to_string() 的 36 字节带连字符字符串，
+        // 服务端校验 AuthFailed → 连接被关 → 整个 TCP relay 无响应。
         let mut token = [0u8; TOKEN_LEN];
-        let uuid_str = uuid.to_string();
         pooled
             .conn
-            .export_keying_material(&mut token, uuid_str.as_bytes(), password.as_bytes())
+            .export_keying_material(&mut token, uuid.as_bytes(), password.as_bytes())
             .map_err(|_| TuicError::KeyingMaterialExport)?;
-
         // open uni stream → write Authenticate
         let mut uni = pooled.conn.open_uni().await?;
         let cmd = crate::protocol::Command::Authenticate {

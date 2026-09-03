@@ -66,8 +66,108 @@ pub(crate) async fn read_varint_stream(stream: &dyn QuicStream) -> io::Result<u6
     }
     Ok(value)
 }
+/// Read exactly `n` bytes from the QUIC stream (loops on partial reads).
+async fn read_exact_stream(stream: &dyn QuicStream, mut buf: &mut [u8]) -> io::Result<()> {
+    while !buf.is_empty() {
+        let n = stream.read(buf).await?;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "hysteria: stream closed mid-frame"));
+        }
+        buf = &mut buf[n..];
+    }
+    Ok(())
+}
 
-/// Write the Hysteria TCP request body without its frame type.
+/// Discard exactly `n` bytes from the QUIC stream (loops on partial reads).
+async fn discard_exact_stream(stream: &dyn QuicStream, mut n: usize) -> io::Result<()> {
+    let mut scratch = [0u8; 4096];
+    while n > 0 {
+        let take = n.min(scratch.len());
+        read_exact_stream(stream, &mut scratch[..take]).await?;
+        n -= take;
+    }
+    Ok(())
+}
+
+/// Read a QUIC varint from the stream byte-by-byte. Required because the QUIC
+/// stream `read` call may return fewer bytes than requested — varint continuation
+/// bytes must each arrive as a single read.
+pub(crate) async fn read_varint_exact_stream(stream: &dyn QuicStream) -> io::Result<u64> {
+    let mut first = [0u8; 1];
+    read_exact_stream(stream, &mut first).await?;
+    let prefix = first[0] >> 6;
+    if prefix == 0 {
+        return Ok(u64::from(first[0]));
+    }
+    let len = 1usize << prefix;
+    let mut rest = vec![0u8; len - 1];
+    // Rest bytes: read one byte at a time so each falls into its own `read` call.
+    // quinn RecvStream::read returns whatever is available (>=1B on success or Ok(0));
+    // reading a single byte per loop iteration is the only safe way to avoid
+    // accidentally consuming bytes from a later frame.
+    for slot in rest.iter_mut() {
+        let mut b = [0u8; 1];
+        read_exact_stream(stream, &mut b).await?;
+        *slot = b[0];
+    }
+    let mut value = u64::from(first[0] & 0x3f);
+    for byte in rest {
+        value = (value << 8) | u64::from(byte);
+    }
+    Ok(value)
+}
+
+/// Read and validate the Hysteria TCPResponse frame (status + msg + padding).
+///
+/// Official apernet/hysteria v2 server writes this frame before relaying data on
+/// each TCP stream; client (non-fast-open) must consume it before passing the
+/// stream to the proxy. Without this, the response frame leaks into the
+/// proxied bytes and the first client TLS handshake fails (SEC_E_INVALID_TOKEN
+/// / "HTTP/0.9 when not allowed").
+///
+/// Format: status(1B) + varint(msg_len<=2048) + msg + varint(pad_len<=4096) + pad.
+/// status==1 is dial failure; msg is returned to the caller as an error.
+pub(crate) async fn read_tcp_response_stream(
+    stream: &dyn QuicStream,
+) -> io::Result<()> {
+    use std::convert::TryFrom;
+    const MAX_MSG: u64 = 2048;
+    const MAX_PAD: u64 = 4096;
+
+    let mut status = [0u8; 1];
+    read_exact_stream(stream, &mut status).await?;
+    let msg_len = read_varint_exact_stream(stream).await?;
+    if msg_len > MAX_MSG {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("hysteria tcp response msg_len {msg_len} > {MAX_MSG}"),
+        ));
+    }
+    let mut msg = vec![0u8; usize::try_from(msg_len).unwrap_or(0)];
+    if msg_len > 0 {
+        read_exact_stream(stream, &mut msg).await?;
+    }
+    let pad_len = read_varint_exact_stream(stream).await?;
+    if pad_len > MAX_PAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("hysteria tcp response pad_len {pad_len} > {MAX_PAD}"),
+        ));
+    }
+    let pad_usize = usize::try_from(pad_len).unwrap_or(0);
+    if pad_usize > 0 {
+        discard_exact_stream(stream, pad_usize).await?;
+    }
+    if status[0] != 0 {
+        let msg_str = String::from_utf8_lossy(&msg).into_owned();
+        return Err(io::Error::other(format!(
+            "hysteria tcp dial rejected by server: {msg_str}"
+        )));
+    }
+    Ok(())
+}
+
+/// Write the Hysteria TCP request body without its frame type (added by InterStreamConn).
 #[must_use]
 pub fn write_tcp_request_body(addr: &str) -> Vec<u8> {
     let padding = TcpRequestPadding.get().generate();
@@ -148,7 +248,7 @@ pub trait QuicConn: Send + Sync {
 /// client 模式下首包需在数据前加 `FrameTypeTCPRequest` 前缀（QUIC varint 编码）。
 #[derive(Debug)]
 pub struct InterStreamConn {
-    stream: Arc<dyn QuicStream>,
+    pub(super) stream: Arc<dyn QuicStream>,
     local: SocketAddr,
     remote: SocketAddr,
     /// client 模式（首包加 frame type 前缀）。

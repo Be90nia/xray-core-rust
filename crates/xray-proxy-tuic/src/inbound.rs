@@ -238,12 +238,10 @@ async fn handle_connection(
     dispatch: Option<Arc<dyn xray_app_dispatcher::DispatchHandler>>,
 ) -> Result<()> {
     let conn = incoming.await?;
-
-    // 生成 expected_token（TLS keying Material Exporter）
-    let mut expected_token = [0u8; TOKEN_LEN];
-    let uuid_str = expected_uuid.to_string();
-    conn.export_keying_material(&mut expected_token, uuid_str.as_bytes(), password.as_bytes())
-        .map_err(|_| TuicError::KeyingMaterialExport)?;
+        // 生成 expected_token (对齐官方 tuic v5: label=UUID 16字节)
+        let mut expected_token = [0u8; TOKEN_LEN];
+        conn.export_keying_material(&mut expected_token, expected_uuid.as_bytes(), password.as_bytes())
+            .map_err(|_| TuicError::KeyingMaterialExport)?;
 
     // accept_uni 读 Authenticate
     let mut uni = conn.accept_uni().await?;

@@ -286,10 +286,18 @@ impl HysteriaClient {
         isc.write(&write_tcp_request_body(&addr))
             .await
             .map_err(HysteriaError::Io)?;
+        // 读取服务端 TCPResponse 帧（status + msg + padding）。官方 apernet/hysteria v2
+        // 服务端写入此帧，客户端必须消费后再透传流量；否则响应帧泄漏到代理字节流，
+        // 首个 TLS 握手失败 (SEC_E_INVALID_TOKEN / HTTP/0.9 when not allowed)。
+        crate::conn::read_tcp_response_stream(&*isc.stream)
+            .await
+            .map_err(HysteriaError::Io)?;
         Ok(isc)
     }
 
     /// 建立 UDP session（对应 Go `client.udp()`）。
+
+
     pub async fn udp(&self) -> Result<Arc<crate::conn::InterConn>> {
         self.ensure_connected().await?;
         let conn = self
