@@ -150,12 +150,15 @@ where
         let this = self.get_mut();
         if !this.done {
             // 头部至少 2 字节（version + addon_len）
-            // fill_head may return Pending when socket has no data yet
-            // (need to wait for waker); short-circuit to avoid head[..1] OOB.
-            match Self::fill_head(&mut this.inner, cx, &mut this.head, 2) {
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(())) => {}
+            if let Poll::Ready(Err(e)) =
+                Self::fill_head(&mut this.inner, cx, &mut this.head, 2)
+            {
+                return Poll::Ready(Err(e));
+            }
+            if this.head.len() < 2 {
+                // fill_head returned Ready(Ok) but head is incomplete — treat as Pending
+                // (next poll will retry). Avoid head[..1] OOB on EOF/partial read.
+                return Poll::Pending;
             }
             let addon_len = this.head[1] as usize;
             if addon_len > 0 {
@@ -180,8 +183,8 @@ where
                 )));
             }
             this.head_pos = 2 + addon_len; // 头部字节已消费，仅超读部分返回
+            this.done = true; // 关键修复：mark 响应头 done,否则下次 poll_read 永远等 head
         }
-        // 响应头之后超读的数据先吐出
         if this.head_pos < this.head.len() {
             let avail = &this.head[this.head_pos..];
             let n = avail.len().min(buf.remaining());
