@@ -287,11 +287,6 @@ impl RealityHooks for BtlsRealityHooks {
         let der = x509_to_der(&cert)
             .ok_or_else(|| io::Error::other("REALITY: failed to encode peer certificate"))?;
         let Some(pub_key) = extract_ed25519_pubkey(&der) else {
-            eprintln!(
-                "[REALITY dbg verify] extract FAILED: der.len={} head16={:02x?}",
-                der.len(),
-                &der[..16.min(der.len())]
-            );
             return Err(io::Error::other(
                 "REALITY: received real certificate (potential MITM or redirection)",
             ));
@@ -301,10 +296,6 @@ impl RealityHooks for BtlsRealityHooks {
         }
         let sig = &der[der.len() - 64..];
         let ok = crypto::verify_reality_certificate(&auth_key, &pub_key, sig).unwrap_or(false);
-        eprintln!(
-            "[REALITY dbg verify] extracted ed25519 pub[:8]={:02x?} hmac_ok={} auth_key[:8]={:02x?}",
-            &pub_key[..8], ok, &auth_key[..8]
-        );
         if !ok {
             return Err(io::Error::other(
                 "REALITY: received real certificate (potential MITM or redirection)",

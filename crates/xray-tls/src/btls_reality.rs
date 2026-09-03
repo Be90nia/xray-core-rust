@@ -105,7 +105,6 @@ extern "C" fn reality_rewrite_trampoline(
     msg: *mut u8,
     msg_len: usize,
 ) -> i32 {
-    eprintln!("[REALITY dbg] trampoline FIRED ssl={:p} len={}", ssl, msg_len);
     let hooks = REALITY_HOOKS
         .lock()
         .as_ref()

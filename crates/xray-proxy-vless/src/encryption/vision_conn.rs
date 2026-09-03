@@ -139,11 +139,8 @@ where
                     let content =
                         xtls_unpadding(&tmp[..n], &mut this.downlink_state, &this.user_uuid);
                     let cmd = this.downlink_state.current_command;
-                    eprintln!(
-                        "[VISION dbg] down read n={} -> content={} cmd={} state(c/c/p)={}/{}/{}",
-                        n, content.len(), cmd, this.downlink_state.remaining_command,
-                        this.downlink_state.remaining_content, this.downlink_state.remaining_padding
-                    );
+
+
                     if cmd == COMMAND_PADDING_END as i32 {
                         this.downlink_padding = false;
                     } else if cmd == COMMAND_PADDING_DIRECT as i32 {
