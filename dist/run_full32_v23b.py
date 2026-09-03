@@ -1,0 +1,77 @@
+"""全 32 节点通测 v23b(skip 1-14, fix None stderr).
+
+基线: HEAD=1939d02, xray.exe mtime 2026-09-03 12:01:36.
+跑法: skip 1..14 (已 v23a 验证), only run 15..32.
+补丁: code.stderr 可能 None(curl 中文页 0xce utf-8 解码挂)→ decode('utf-8','replace').
+"""
+import subprocess, time, os, sys, json
+sys.path.insert(0, 'dist')
+from uriclient import cfg
+
+URI_FILE = 'vps测试连接.txt'
+BIN = 'dist/xray.exe'
+WORK = 'D:/tmp/xray_real'
+os.makedirs(WORK, exist_ok=True)
+
+# Skip 已测 1..14,只跑 15..32
+SKIP = set(range(1, 15))
+
+def test(idx, uri, url):
+    sp = 17800 + idx
+    try:
+        ob = cfg(uri.strip(), sp)
+    except Exception as e:
+        return f'#{idx}\tPARSE\t{e}'
+    cfgobj = {
+        'log':{'loglevel':'warn'},
+        'inbounds':[{'tag':'socks-in','listen':'127.0.0.1','port':sp,'protocol':'socks','settings':{'udp':True}}],
+        'outbounds':[ob,{'tag':'direct','protocol':'freedom','settings':{}}],
+        'routing':{'rules':[{'type':'field','port':'1-65535','outboundTag':ob.get('tag','proxy') or 'proxy'}]}
+    }
+    cp = f'{WORK}/f_{idx}.json'
+    lp = f'{WORK}/f_{idx}.log'
+    bp = f'{WORK}/f_{idx}.body'
+    open(cp,'w',encoding='utf-8').write(json.dumps(cfgobj, ensure_ascii=False))
+    open(bp,'wb').close()
+    subprocess.run(['cmd','/c','taskkill /F /IM xray.exe'], capture_output=True, timeout=5)
+    time.sleep(0.2)
+    p = subprocess.Popen([BIN,'run','-c',cp], stdout=open(lp,'wb'), stderr=subprocess.STDOUT)
+    time.sleep(2.5)
+    code = subprocess.run(['curl','-sS','--max-time','12','-x',f'socks5h://127.0.0.1:{sp}', url, '-o', bp, '-w','HTTP:%{http_code}'], capture_output=True, timeout=15)
+    bs = os.path.getsize(bp)
+    with open(bp,'rb') as f:
+        body = f.read()
+    net = ob.get('streamSettings',{}).get('network','tcp')
+    sec = ob.get('streamSettings',{}).get('security','none')
+    proto = ob.get('protocol','?')
+    expected = b'YouTube' if 'youtube' in url else b'Google' if 'google' in url else b''
+    flag = 'PASS' if (bs > 5000 and expected in body) else 'FAIL'
+    raw_err = code.stderr or b''
+    err = raw_err.decode('utf-8','replace').strip()[:80]
+    p.terminate()
+    try:
+        p.wait(timeout=3)
+    except Exception:
+        p.kill()
+    subprocess.run(['cmd','/c','taskkill /F /IM xray.exe'], capture_output=True, timeout=5)
+    http_field = code.stdout.decode('ascii','replace').strip() if code.stdout else ''
+    return f'[{flag}] #{idx}\t{proto}\t{sec}/{net}\tHTTP={http_field:12s}\tbody={bs:7d}B\t{err}'
+
+uris = [u.strip() for u in open(URI_FILE, encoding='utf-8') if u.strip() and not u.startswith('#') and not u.startswith('{')]
+print(f'# 共 {len(uris)} 个节点,跳过 {sorted(SKIP)} (v23a 已测)')
+print('# proto  sec/net  HTTP  body marker err')
+
+results = []
+for i, uri in enumerate(uris, 1):
+    if i in SKIP:
+        continue
+    line = test(i, uri, 'https://www.youtube.com/')
+    print(line, flush=True)
+    results.append(line)
+
+passes = sum(1 for l in results if l.startswith('[PASS]'))
+fails = sum(1 for l in results if l.startswith('[FAIL]'))
+parses = sum(1 for l in results if l.startswith('[PARSE'))
+print(f'\n=== v23b #15-{len(uris)}: {passes}/{len(results)} PASS  {fails} FAIL  {parses} PARSE ===')
+with open(f'{WORK}/f_results_v23b.txt','w',encoding='utf-8') as f:
+    f.write('\n'.join(results))
