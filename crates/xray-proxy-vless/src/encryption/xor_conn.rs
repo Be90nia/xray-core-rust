@@ -103,7 +103,7 @@ where
 
 impl<IO> EncryptionConn for XorConn<IO>
 where
-    IO: AsyncRead + AsyncWrite + Unpin + Send,
+    IO: AsyncRead + AsyncWrite + Unpin + Send + Sync,
 {
     fn close(
         &mut self,

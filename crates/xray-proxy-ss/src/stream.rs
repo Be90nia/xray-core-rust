@@ -469,6 +469,25 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
                     self.response_rekey_2022 = Some(Rekey2022::Var { var_len });
                 }
                 Rekey2022::Var { var_len } => {
+                    // sing server writeResponse（service.go:294-296）payload_len>0 时
+                    // WriteChunk(header, payload[:payloadLen]) 把 payload 字节直接 seal
+                    // 进 var chunk——**var chunk 就是 first body 字节**，不是单独的
+                    // "variable header"！sing client readResponse（protocol.go:392）
+                    // reader.ReadWithLength(length) 把 var_len 字节 open 后**缓存**在
+                    // reader.cached，下一次 Read() 返给用户。所以 Rust 之前把 var 当
+                    // `_plain` 丢弃是错的——那是真实响应体第一段。
+                    //
+                    // 修复：drain var_len+tag → increment nonce → open → 返 Message。
+                    // nonce 序列：Fixed 已 increment → [0,0,...n]，Var 再 increment →
+                    // [1,0,...n]（对齐 sing cached 时的 nonce）。Body 后续 size/payload
+                    // chunk 在 try_open_chunk_body 解，nonce 序列对齐 sing
+                    // ReadWithLengthChunk。
+                    //
+                    // payload_len=0 时 sing server 不写 var chunk（service.go:294 if），
+                    // 但 wire 上 sing client 仍 reader.ReadWithLength(0) 读 16B sealed
+                    // zero——这是 sing client+server 配对 bug；**实际 sing-box 服务端
+                    // 始终发 payload>0**（HTTP body 第一块），var_len=0 走"无 var chunk"
+                    // fast path（不进 Var phase 状态机），由 Fixed 完成后直接进 body。
                     let wire = var_len + self.tag_size;
                     if pending.len() < wire {
                         self.response_rekey_2022 = Some(Rekey2022::Var { var_len });
@@ -476,12 +495,11 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
                     }
                     let buf: Vec<u8> = pending.drain(..wire).collect();
                     increment_nonce_bytes(&mut self.read_nonce);
-                    let _plain = self
+                    let plain = self
                         .read_aead
                         .open(&self.read_nonce, &[], &buf)
                         .map_err(|e| SsError::AeadOpen(e.to_string()))?;
-                    // rekey 完成：read_nonce 现处于 [1,0,...]，body size chunk
-                    // increment → [2] open，对齐 sing body 计数起点。
+                    return Ok(ChunkOut::Message(plain));
                 }
             }
         }

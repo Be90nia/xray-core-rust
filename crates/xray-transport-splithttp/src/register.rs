@@ -14,6 +14,7 @@ use xray_common::net::destination::Destination;
 use xray_transport::connection::Connection;
 use xray_transport::dialer::{StreamSettings, TransportDialFn, register_transport_dialer};
 use xray_transport::listener_registry::{TransportListenFn, register_transport_listener};
+use xray_transport::system_dialer::dial_system;
 use xray_transport::sockopt::SocketOptions;
 
 use crate::client::{DefaultDialerClient, DialTarget};
@@ -134,31 +135,70 @@ async fn dial_splithttp(
                 )
             })?
     } else {
-        // HTTP/1.1 / HTTP/2 path（hyper + hyper-rustls）。
-        // Bug A: TCP 必须恒拨 `dest`，URL authority（config.host）仅作 Host 头；
-        // 否则域名前置（home.begonia92.top→CF→sg-argo.yzswgroup.top）会连接
-        // 到错误边缘（实测 CF argo 直连 h2 GET 不回包→挂死）。
-        // Bug B: 第 5 个参数是 `has_reality`，不是 `has_tls`——否则无显式 mode 的
-        // TLS 节点（vmess+xhttp）被错判 stream-one → 服务器 400 拒绝。
-        let dial_target = DialTarget {
-            host: dest.address().to_string(),
-            port: dest.port().value(),
-            sni: settings
-                .security_json
-                .as_ref()
-                .and_then(|j| j.get("serverName").and_then(|v| v.as_str()))
-                .unwrap_or("")
-                .to_string(),
-        };
-        let client = Arc::new(DefaultDialerClient::new(config.clone(), rustls_config, dial_target));
-        dialer::dial(client, config, scheme, &host, has_reality)
-            .await
-            .map_err(|e| {
+        // REALITY xhttp: TCP → REALITY TLS handshake (u_client + session_id/auth_key
+        // 重写 + cert HMAC) → h2 直握手 stream-one。hyper-rustls 不知道 REALITY,
+        // 必须自己做完 TLS 握手再传 TLS 流给 `dial_reality_stream_one`。
+        // 对应 Go `splithttp/dialer.go::Dial` 在 `reality.UClient(conn, ...)` 闭包里
+        // 包 TCP 触发的同一行为，Rust 端拆分到 splithttp 路径专用。
+        if has_reality {
+            let tcp_conn = dial_system(dest, _sockopt).await.map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::ConnectionRefused,
-                    format!("splithttp dial failed: {e}"),
+                    format!("splithttp reality dial_system: {e}"),
                 )
-            })?
+            })?;
+            let remote_addr = tcp_conn.remote_addr().ok().flatten();
+            let local_addr = tcp_conn.local_addr().ok().flatten();
+            let tls_stream = xray_reality::register::handshake_over(tcp_conn, settings)
+                .await
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        format!("splithttp reality handshake: {e}"),
+                    )
+                })?;
+            let remote = remote_addr.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
+            let local = local_addr.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
+            // base_uri 必须拼 config.path — 否则 splithttp request URL 是 host/ 而不是 host/path,
+            // 服务端 REALITY handler 找不到 path 返回 404（fix-reality-xhttp-11 子代理 25min 调研结论）。
+            // 用 normalized_path() 自动补前导 / + 加末尾 /，与 dial() 函数 (line 314-318) 对齐。
+            let base_uri = format!("{scheme}://{host}{path}", path = config.normalized_path());
+            let session_id = String::new();
+            dialer::dial_reality_stream_one(tls_stream, remote, local, base_uri, session_id, config)
+                .await
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        format!("splithttp reality stream-one: {e}"),
+                    )
+                })?
+        } else {
+            // HTTP/1.1 / HTTP/2 path（hyper + hyper-rustls）。
+            // Bug A: TCP 必须恒拨 `dest`，URL authority（config.host）仅作 Host 头；
+            // 否则域名前置（home.begonia92.top→CF→sg-argo.yzswgroup.top）会连接
+            // 到错误边缘（实测 CF argo 直连 h2 GET 不回包→挂死）。
+            // Bug B: 第 5 个参数是 `has_reality`，不是 `has_tls`——否则无显式 mode 的
+            // TLS 节点（vmess+xhttp）被错判 stream-one → 服务器 400 拒绝。
+            let dial_target = DialTarget {
+                host: dest.address().to_string(),
+                port: dest.port().value(),
+                sni: settings
+                    .security_json
+                    .as_ref()
+                    .and_then(|j| j.get("serverName").and_then(|v| v.as_str()))
+                    .unwrap_or("")
+                    .to_string(),
+            };
+            let client = Arc::new(DefaultDialerClient::new(config.clone(), rustls_config, dial_target));
+            dialer::dial(client, config, scheme, &host, has_reality)
+                .await
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        format!("splithttp dial failed: {e}"),
+                    )
+                })?
+        }
     };
 
     // Tcpmask（Go splithttp/dialer.go:127-134：仅 h1/h2 路径的 dialContext 内

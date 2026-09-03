@@ -454,16 +454,15 @@ pub fn make_ss_dial_fn(config: Arc<SsOutboundConfig>) -> DialFn {
                                 .with_identity(i)
                                 .map_err(|e| format!("ss2022 identity: {e}"))?;
                         }
-                        let req_stream = client
+                        // dial_target_on 已 mark_response_rekey_2022 设响应 rekey 状态机；
+                        // pump_ss_stream 首次 try_open_chunk 时会经 drive_2022_rekey 解
+                        // salt+fixed+var（payload=0 时只读 salt+fixed）。此处不再额外
+                        // read_response_handshake，否则双重读同 conn → 首 read_exact EOF。
+                        let stream = client
                             .dial_target_on(conn, &target_str, target_port)
                             .await
                             .map_err(|e| format!("ss2022 dial: {e}"))?;
-                        // 读服务器响应握手：salt + fixed_resp + var_resp，
-                        // 返回新 SSStream 带响应 aead 用于读响应 body chunks。
-                        client
-                            .read_response_handshake(req_stream)
-                            .await
-                            .map_err(|e| format!("ss2022 read response: {e}"))?
+                        stream
                     } else {
 
                         let client = Client::new(config.account.clone(), host, config.server_port);

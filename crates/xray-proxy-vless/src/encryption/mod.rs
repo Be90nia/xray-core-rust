@@ -866,6 +866,7 @@ impl ServerInstance {
             (server_hello, aead, peer_aead, ticket, united_key)
         };
         // 13. 发送 serverHello
+        conn.write_all(&server_hello).await?;
         conn.flush().await?;
 
         // 14. 读 client padding：encryptedLength(18) + encryptedPadding(DecodeLength)
