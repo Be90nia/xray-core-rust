@@ -14,7 +14,7 @@ use tokio::io::{AsyncRead as AsyncReadTrait, AsyncReadExt, AsyncWrite as AsyncWr
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::debug;
 
-use crate::client::{DefaultDialerClient, ReqBody, make_stream_body};
+use crate::client::{DefaultDialerClient, DialTarget, ReqBody, make_stream_body};
 use crate::config::Config;
 use crate::connection::SplitConn;
 use crate::error::{Result, SplitHttpError};
@@ -555,7 +555,6 @@ where
     let (mut sender, conn) = http2::handshake::<_, _, ReqBody>(TokioExecutor::new(), io)
         .await
         .map_err(|e| SplitHttpError::Hyper(format!("h2 handshake: {e}")))?;
-
     // spawn conn driver（必须，否则 h2 连接不动）
     tokio::spawn(async move {
         if let Err(e) = conn.await {
@@ -564,14 +563,25 @@ where
     });
 
     // 创建上传 pipe
-    let (pipe_client, pipe_server) = tokio::io::duplex(8192);
+    let (mut pipe_client, pipe_server) = tokio::io::duplex(8192);
+
+    // Pre-seed: write 1 byte to pipe_client before send_request so the h2 conn
+    // driver emits a DATA frame immediately after HEADERS. Without this,
+    // ReaderStream over the empty pipe_server returns Pending and the conn
+    // driver spawns a parked pipe task; sing-box (ss2022) then resets the
+    // stream on its idle timeout when no DATA arrives within the window.
+    use tokio::io::AsyncWriteExt;
+    pipe_client
+        .write_all(&[0u8])
+        .await
+        .map_err(|e| SplitHttpError::Hyper(format!("preseed pipe: {e}")))?;
+
     let upload_stream = ReaderStream::new(pipe_server);
 
     // 构造 RequestMeta + hyper Request（stream-one body 通过 streaming body 发送）
     let meta = config.build_stream_request_meta(&base_uri, &session_id, Some(Vec::new()))?;
     let body = make_stream_body(upload_stream);
     let req = DefaultDialerClient::build_request_with_body(meta, body)?;
-
     let resp = sender
         .send_request(req)
         .await
@@ -579,7 +589,6 @@ where
     if resp.status() != StatusCode::OK {
         return Err(SplitHttpError::BadStatus(resp.status().as_u16()));
     }
-
     let resp_body = resp.into_body();
     let download_stream = http_body_util::BodyDataStream::new(resp_body).map_err(map_hyper_err_to_io);
     let download_reader: Box<dyn AsyncReadTrait + Send + Unpin> =
@@ -781,5 +790,81 @@ mod tests {
         // 仅验证构造不出错 + has_download_settings flag 正确传递
         assert!(main.download_settings.is_some());
         assert_eq!(resolve_mode(&main.mode, false, true), "packet-up");
+    }
+    // ===== dial_reality_stream_one: DATA 帧时序测试 =====
+
+    /// 验证 `dial_reality_stream_one` 在 send_request 之前向 pipe_client 预写 1 字节，
+    /// 让 h2 conn driver 在 HEADERS 之后立即发出 DATA 帧（sing-box ss2022 不会因为
+    /// 收不到首帧 DATA 而在 idle timeout 后 RST_STREAM）。
+    ///
+    /// mock server：handshake 完成后立即记录 accept 时间，再读 request body 第一帧
+    /// DATA 并记录时间。断言 HEADERS → DATA 的间隔 < 200ms（旧实现会 Pending 无限）。
+    #[tokio::test]
+    async fn dial_reality_stream_one_sends_data_immediately_after_headers() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        let config = Arc::new(Config {
+            host: "example.com".into(),
+            path: "/ws".into(),
+            mode: "stream-one".into(),
+            ..Default::default()
+        });
+
+        let server_task = tokio::spawn(async move {
+            use futures_util::StreamExt;
+            let mut conn = h2::server::handshake(server_io)
+                .await
+                .expect("server h2 handshake");
+            let (request, mut respond) = conn
+                .accept()
+                .await
+                .expect("accept")
+                .expect("request");
+            let headers_at = std::time::Instant::now();
+
+            let _chunk = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                request.into_body().next(),
+            )
+            .await
+            .expect("DATA timeout (server not woken — fix broken)")
+            .expect("stream ended before DATA")
+            .expect("DATA read error");
+            let data_at = std::time::Instant::now();
+            let gap = data_at.duration_since(headers_at);
+
+            let resp = http::Response::builder()
+                .status(200)
+                .body(())
+                .expect("response build");
+            let mut send = respond
+                .send_response(resp, false)
+                .expect("send_response");
+            send.send_data(bytes::Bytes::from_static(b"hello"), true)
+                .expect("send_data");
+
+            // 让 conn driver 跑一会（Connection 不 impl Future，手动 spawn 一个 driver）
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            gap
+        });
+
+        let remote: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let result = dial_reality_stream_one(
+            client_io,
+            remote,
+            local,
+            "https://example.com/ws".to_string(),
+            String::new(),
+            config,
+        )
+        .await;
+        assert!(result.is_ok(), "dial_reality_stream_one failed: {:?}", result.err());
+
+        let gap = server_task.await.expect("server task panicked");
+        assert!(
+            gap < std::time::Duration::from_millis(200),
+            "DATA frame should arrive within 200ms of HEADERS (pre-seeded pipe byte), got {gap:?}"
+        );
     }
 }

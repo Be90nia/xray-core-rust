@@ -34,7 +34,7 @@ uuid = { workspace = true }
 # H3 (splithttp packet-up/stream-up/stream-one over HTTP/3)
 h3.workspace = true
 h3-quinn.workspace = true
-h2 = "0.4"
+h2 = { version = "0.4", features = ["stream"] }
 quinn.workspace = true
 rand = { workspace = true }
 parking_lot = { workspace = true }
