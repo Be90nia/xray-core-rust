@@ -80,6 +80,22 @@ where
             downlink_traffic: TrafficState::new(user_uuid.clone()),
         }
     }
+    /// dial 同步阶段主动发 uuid-only padding 块,后续 chunk 进 vision content。
+    /// 对齐 Go outbound VisionWriter mb[0]=nil → XtlsPadding(None, CommandPaddingContinue)。
+    pub async fn write_uuid_only_padding(&mut self) -> io::Result<()> {
+        use crate::encryption::vision::{xtls_padding, COMMAND_PADDING_CONTINUE};
+        use tokio::io::AsyncWriteExt;
+        let padded = xtls_padding(
+            None,
+            COMMAND_PADDING_CONTINUE,
+            &mut self.uplink_uuid_pending,
+            true,
+            &DEFAULT_PADDING_SEED,
+            &mut self.rng,
+        );
+        self.inner.write_all(&padded).await?;
+        Ok(())
+    }
 }
 
 impl<C> AsyncRead for VisionConn<C>

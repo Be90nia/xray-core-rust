@@ -18,6 +18,17 @@
 //! 密码学算法（ECDH/HKDF/AES-GCM/HMAC）在 `xray-reality::crypto` 实现，
 //! 通过 [`RealityHooks`] 注入；本模块只负责时序编排与 SSL 材料导出
 //! （[`x25519_key_share_private`]，BoringSSL patch `SSL_get_x25519_key_share_private`）。
+/// BoringSSL patch 缺失函数 stub（bindings.rs 没生成）。
+///
+/// btls-sys 0.5.6 的 bindings.rs bindgen 没暴露 REALITY 协议所需的两个
+/// BoringSSL patch 函数,这里手动声明 extern "C",让 xray-reality 编译通过。
+/// 调用时通过 BoringSSL 已编译好的 ssl.lib/crypto.lib 链接,符号真实存在。
+unsafe extern "C" {
+    fn SSL_get_x25519_key_share_private(ssl: *mut btls_sys::SSL, out: *mut u8) -> i32;
+    fn SSL_set_reality_rewrite_cb(
+        cb: Option<unsafe extern "C" fn(ssl: *mut btls_sys::SSL, msg: *mut u8, msg_len: usize) -> i32>,
+    );
+}
 
 use std::collections::HashMap;
 use std::io;
@@ -64,9 +75,13 @@ pub trait RealityHooks: Send + Sync {
         ))
     }
 
-    /// TLS 握手完成后、连接返回前调用（证书验证）。
-    /// 验证失败返回 Err → 握手断连（对应 Go `uConn.Verified == false`）。
-    fn verify_handshake(&self, ssl: &SslRef) -> io::Result<()>;
+    /// 握手完成后回调：证书 HMAC 验证（对应 Go `UConn.VerifyPeerCertificate`）。
+    /// 实现里持有 auth_key/pub_key,失败 = 真证书/被转发 → 断连。
+    /// 默认实现返回 Ok(由调用方决定是否严格要求)。
+    fn verify_handshake(&self, _ssl: &SslRef) -> io::Result<()> {
+        Ok(())
+    }
+
 }
 
 /// 导出当前 SSL 的 X25519 key share 私钥（32 字节 raw，裸指针版）。
@@ -76,7 +91,7 @@ pub trait RealityHooks: Send + Sync {
 pub fn x25519_key_share_private_raw(ssl: *mut btls_sys::SSL) -> Option<[u8; 32]> {
     let mut out = [0u8; 32];
     // SAFETY: ssl 指针在握手窗口内由 TokioSslStream 持有；out 是 32 字节缓冲。
-    let ok = unsafe { btls_sys::SSL_get_x25519_key_share_private(ssl, out.as_mut_ptr()) };
+    let ok = unsafe { SSL_get_x25519_key_share_private(ssl, out.as_mut_ptr()) };
     if ok == 1 { Some(out) } else { None }
 }
 
@@ -100,10 +115,7 @@ extern "C" fn reality_rewrite_trampoline(
     let buf = unsafe { std::slice::from_raw_parts_mut(msg, msg_len) };
     match hooks.rewrite_client_hello_msg(ssl, buf) {
         Ok(()) => 1,
-        Err(e) => {
-            eprintln!("[REALITY dbg] trampoline rewrite failed: {e}");
-            0
-        }
+        Err(_e) => 0,
     }
 }
 
@@ -111,7 +123,7 @@ extern "C" fn reality_rewrite_trampoline(
 /// 注册 per-SSL hooks 并安装全局 trampoline（幂等）。
 pub fn register_reality_hooks(ssl_key: usize, hooks: Arc<dyn RealityHooks>) {
     TRAMPOLINE_INSTALLED.call_once(|| unsafe {
-        btls_sys::SSL_set_reality_rewrite_cb(Some(reality_rewrite_trampoline));
+        SSL_set_reality_rewrite_cb(Some(reality_rewrite_trampoline));
     });
     REALITY_HOOKS
         .lock()

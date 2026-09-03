@@ -200,14 +200,26 @@ pub fn make_dial_fn(config: Arc<VlessOutboundConfig>) -> DialFn {
             //     才 flush；dial 阶段同步等待会让上行首包发不出去 → 双向互等 →
             //     服务端超时断开。vision 首块 uuid padding 尤甚，见 #9/#15/#32）。
             conn = Box::new(crate::encoding::client::ResponseHeaderReader::new(conn, VERSION));
-
             // 3. flow=xtls-rprx-vision（encryption=none）：请求头写出后即包装
             //    VisionConn——padding 从业务数据开始（对齐 Go outbound VisionWriter/
             //    VisionReader 的包装时机，首块 padding 携带本账号 uuid）。
             //    ENC(mlkem768)+vision 组合走 CommonConn，见 bd 4lf/byo。
             if config.flow == crate::FLOW_XRV && config.encryption == "none" {
                 let uuid_bytes = config.user_uuid.as_bytes().to_vec();
-                conn = Box::new(VisionConn::new(conn, uuid_bytes));
+                let mut vision = VisionConn::new(conn, uuid_bytes);
+                // Go 行为：postRequest 等 500ms 拿首块 client data,若拿不到就手动
+                // 发一个空 content 的 padding 块（mb[0]=nil → VisionWriter 强制
+                // XtlsPadding(None, CommandPaddingContinue) → 首块只有 uuid + 随机
+                // padding,不带 client data）。Rust bridge 双向并发是立刻有 client
+                // data,如果直接发首块 padding 会把 client data 当 content 一起塞进
+                // uuid 块,导致 server VisionReader 解析失败 → 双向 Alert。
+                // 修复:dispatcher 显式调 write_uuid_only_padding 先发 uuid-only
+                // padding 块,后续 chunk 才进 vision content。
+                vision
+                    .write_uuid_only_padding()
+                    .await
+                    .map_err(|e| format!("vless vision pre-padding: {e}"))?;
+                conn = Box::new(vision);
             }
 
             // conn 现在是 "已握手完成的 TCP"，bridge_link_with_stream 直接用
