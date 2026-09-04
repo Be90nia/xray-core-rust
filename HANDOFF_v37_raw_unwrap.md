@@ -1,16 +1,11 @@
 # HANDOFF v40 (2026-09-05) — 🎉 **32/32 全通达成**(v37→v40 一日战役)
 
 ## 0. 仓库状态
-
-- **✅ 32/32 PASS 0 FAIL(HEAD 36f8812, PM 亲自全套复跑独立复现, `D:/tmp/final_32of32.txt` 逐行核对)**: 本轮四场战役净增 13 节点——vision splice(#9 #15 #32 e5cc465)+naive(#29 2c01504)+anytls(#31 f069f1c)+argo h3(#1 #18 f559f03)+mlkem ENC(#7 #10 #11 #12 #13 #16 42d0e02)
-- **旧协议本地互操作矩阵全绿**(ProtoInterop, VPS 未配的协议按用户指令用本地 Go server 调通): ss aes128/aes256/chacha20/xchacha20/ss2022×3/kcp default+tuned/grpc gun(3 修复 36f8812)/srtp+quic 双侧一致移除;run_matrix.py + scapy 抓包 harness 留存 D:/tmp/proto_interop/
-- **dist/xray.exe**: 42d0e02 构建;历史 baseline 备份 D:/tmp/xray_baseline_321fec.exe(321fec, 19/32 时代)
-- **验收口径(长期有效)**:全套 [PASS] 标记有假 PASS 前科(run_full32.py:40 阈值 bs>5000)——验收以单节点 `python D:/tmp/test_node.py <N>` body≥870000B 为准,全套跑完逐节点核对 body
-- **方法论沉淀**: 本地 Go server(可 debug log)+oracle 逐步解密+scapy 抓包字节 diff = wire 协议调试三板斧(用户指定模式,远端 VPS 盲调不可比);部署副本 md5 必校验(探针零输出的假象=旧二进制)
-- **已知非阻塞遗留**: server 侧 inbound VisionConn splice/ENC 0-RTT 会话未实现(outbound 全通);Rust 0-RTT 快路径未启用(恒 1-RTT,功能正确);grpc server 侧 pump 同病未修;ss2022 多 PSK/重放防护未测
-- **2026-09-04 晚基线全套实测**(`D:/tmp/baseline_v37_full32.txt`):表观 21/32 PASS,但 **#9=10477B / #15=15983B 是假 PASS**(run_full32.py:40 判定阈值 `bs>5000 and expected in body`,partial 头部含 YouTube 即过),真实全量基线 = **19/32**;真 FAIL 13 节点 = §5 分诊表,完全自洽
-- **实施中发现的两个补充根因**(已修,§2 路线之外):① `ResponseHeaderReader`/`Box<dyn Connection>` 的 Connection impl 未穿透 raw_tcp_clone(dyn 分发断链,dispatcher L202 响应头包装层)→ client.rs 双路径穿透;② END/DIRECT 帧跨 poll_read 块时原方案见 cmd 即切 raw → 丢帧尾+外层密文泄漏 → 对齐 Go proxy.go XtlsUnpadding 块完成判定(`remaining_content<=0 && remaining_padding<=0 && cmd!=0`)后才切换
-
+- **✅ v41 全协议调通收官(2026-09-05 凌晨)**: ① VPS 32/32 全通(4092505, PM 两轮独立复跑 `D:/tmp/final_32of32.txt`/`final_v41_full32.txt` 均逐行核对); ② **wireguard 互操作打通**(d8a114b: smoltcp 0.12 端口 0 恒 Unaddressable 需自分配+TX checksum 未开致 gVisor 静默丢包;YouTube 经 WG 隧道 875KB+scapy Noise 握手证据); ③ **server 侧补全+反向互操作**(6f27649/dd9bdbf: grpc server 三病对称修复+content-type+ss inbound transport 接线缺失+ss legacy 响应缺新 IV/rekey 违反 Go wire——Go client→Rust server 的 grpc/kcp/ss 三发 874-878KB 全 PASS)
+- **dist/xray.exe**: cac121fc(全功能: 32 节点修复+wg+server 侧), ss nonce 改动补验 #26-28 全绿;历史 baseline 备份 D:/tmp/xray_baseline_321fec.exe(19/32 时代)
+- **验收口径(长期有效)**:全套 [PASS] 标记有假 PASS 前科——以单节点 `python D:/tmp/test_node.py <N>` body≥870000B 为准;**改动波及共用代码时必须重编译后用新二进制复验**(本次 ss nonce 分离就需补验 #26-28)
+- **方法论沉淀**: wire 调试三板斧(本地 Go server+oracle 逐步解密+scapy 抓包字节 diff);部署副本 md5 必校验;两个 scout 线索均可证伪,dbg 实证优先
+- **已知非阻塞遗留**: server 侧 inbound VisionConn splice/ENC 0-RTT 会话未实现;Rust 0-RTT 快路径未启用(恒 1-RTT);wg 首连 ~30% 概率 5s 超时重试即过(smoltcp SynSent 重传疑点);ss2022 relay_tunnel_roundtrip 测试单跑挂起(既有);ss2022 多 PSK/重放防护未测;grpc server accept_h2 对称性已修但仅 grpc/ss/kcp 三发验证
 ## 1. #9 #15 #32(vless+vision partial ~10KB)真根因 —— wire-level 已实证
 
 **模型**(此前会话反复搞错的点,这次是对的):
