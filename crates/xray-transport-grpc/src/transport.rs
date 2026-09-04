@@ -136,13 +136,19 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
             let _=respond.send_response(r,true); continue;
         }
         let mut recv_body=req.into_body();
-        let mut send_resp=match respond.send_response(http::Response::builder().status(200).body(()).unwrap(),false){Ok(s)=>s,Err(_)=>continue};
+        let mut send_resp=match respond.send_response(http::Response::builder().status(200)
+            // Go grpc-go 校验响应 content-type（缺失报 "malformed header: missing HTTP content-type"）
+            .header("content-type","application/grpc").body(()).unwrap(),false){Ok(s)=>s,Err(_)=>continue};
         let (client,server)=tokio::io::duplex(64*1024);
         let h2=handler.clone();
         tokio::spawn(async move {
             let (mut rd,mut wr)=tokio::io::split(server);
-            let s=async{let mut buf=vec![0u8;32*1024];loop{let n=rd.read(&mut buf).await?;if n==0{let _=send_resp.send_data(Bytes::new(),true);break;}send_resp.send_data(Bytes::copy_from_slice(&buf[..n]),false).map_err(io_err)?;}Ok::<_,io::Error>(())};
-            let r=async{while let Some(d)=recv_body.data().await{let d=d.map_err(io_err)?;wr.write_all(&d).await?;let _=recv_body.flow_control().release_capacity(d.len());}Ok::<_,io::Error>(())};
+            // Go grpc-gun server 语义对称（参考 dial_h2）：下行 DATA 必须是
+            // gRPC length-prefix 帧（裸字节被 Go client grpc 库当帧头误读）；
+            // 上行 DATA 是连续 gRPC 帧，逐帧解出 Hunk payload（剥 5B 帧头 +
+            // Hunk proto）再交给下游 inbound，否则协议头解析错位。
+            let s=async{let mut buf=vec![0u8;32*1024];loop{let n=rd.read(&mut buf).await?;if n==0{let _=send_resp.send_data(Bytes::new(),true);break;}let frame=crate::encoding::encode_hunk_frame(&buf[..n]);send_resp.send_data(Bytes::from(frame),false).map_err(io_err)?;}Ok::<_,io::Error>(())};
+            let r=async{let mut acc:Vec<u8>=Vec::new();while let Some(d)=recv_body.data().await{let d=d.map_err(io_err)?;let _=recv_body.flow_control().release_capacity(d.len());acc.extend_from_slice(&d);loop{match crate::encoding::decode_hunk_frame(&acc,None).map_err(io_err)?{Some((used,data))=>{acc.drain(..used);wr.write_all(&data).await?;}None=>break,}}}Ok::<_,io::Error>(())};
             let _=tokio::try_join!(s,r);
         });
         let conn: Box<dyn Connection> = match tcpmask.as_ref() {

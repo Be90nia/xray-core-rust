@@ -145,12 +145,15 @@ impl Server {
 /// - [`crate::error::SsError::ReadInitial`]：首帧 EOF。
 /// - 透传 `SSStream` AEAD 初始化错误。
 /// - 透传 `read_address_port_ss` 解析错误。
-pub async fn read_request(
-    mut conn: TcpStream,
+pub async fn read_request<C>(
+    mut conn: C,
     account: &MemoryAccount,
     user_email: &str,
     behavior_seed: u64,
-) -> Result<(RequestHeader, SSStream<TcpStream>)> {
+) -> Result<(RequestHeader, SSStream<C>)>
+where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
     use xray_common::drain::{BehaviorSeedLimitedDrainer, Drainer as _};
 
     // 反探测 drainer（bd 7me，对应 Go ReadTCPSession protocol.go:59）：
@@ -161,7 +164,7 @@ pub async fn read_request(
     /// 对齐 Go SetReadDeadline(handshake)，与 vmess inbound 同模式）。
     async fn bail(
         drainer: &BehaviorSeedLimitedDrainer,
-        conn: &mut TcpStream,
+        conn: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
         err: crate::error::SsError,
     ) -> crate::error::SsError {
         let _ = tokio::time::timeout(
@@ -222,7 +225,15 @@ pub async fn read_request(
         address,
         port,
     };
-
+    // Go `WriteTCPResponse`（protocol.go:191-204）：响应方向必须生成新随机 IV
+    // 先行写出并重派生写侧 AEAD。旧实现复用请求 IV 且不写 IV header——
+    // Rust↔Rust 自洽，但 Go client 按标准先读 IV 再解密，报
+    // "cipher: message authentication failed"（反向互操作实测）。
+    stream
+        .begin_server_response(account)
+        .await
+        .map_err(|e| crate::error::SsError::Io(e.to_string()))?;
+ 
     Ok((header, stream))
 }
 
@@ -334,7 +345,7 @@ mod tests {
         // client: dial_target + send body + read response
         let client = Client::new(account, "127.0.0.1".to_string(), port);
         let target_addr = Address::Domain("example.com".to_string());
-        let mut stream = client.dial_target(&target_addr, 80).await.expect("dial");
+        let mut stream = client.dial_target_for_proxy(&target_addr, 80).await.expect("dial");
 
         // 发 body
         let http_req = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
@@ -375,7 +386,7 @@ mod tests {
 
         let client = Client::new(account, "127.0.0.1".to_string(), port);
         let target = Address::Domain("test.com".to_string());
-        let mut stream = client.dial_target(&target, 443).await.expect("dial");
+        let mut stream = client.dial_target_for_proxy(&target, 443).await.expect("dial");
         stream.write_chunk(b"ping").await.expect("write");
         stream.flush().await.expect("flush");
 
