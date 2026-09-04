@@ -5,7 +5,8 @@
 //! - [`CommonConn::poll_read`]：从底层读 → 按 TLS record 切片 → AEAD 解密 → 返回明文
 //!
 //! nonce 达到 MaxNonce 时按 Go 语义重建 AEAD（用当前 header 作 context）。
-//! 阶段 A 简化：PreWrite / PeerPadding / serverRandom 首次读延后（handshake 阶段已建好 AEAD 对）。
+//! 0-RTT：上行 AEAD 构造时给定（context=加密后 ticket）；下行 AEAD 延迟到首次
+//! 读，用 server 首发的 16B 随机数建立（[`CommonConn::new_zero_rtt`]）。
 
 use crate::encryption::aead::{Aead, MAX_NONCE, NONCE_LEN};
 use crate::encryption::common::{
@@ -29,7 +30,9 @@ const TAG_LEN: usize = 16;
 pub struct CommonConn<C> {
     conn: C,
     aead: Aead,
-    peer_aead: Aead,
+    /// 下行 AEAD。0-RTT 时为 `None`：延迟到首次读，用 server 首发的 16B 随机数
+    /// 建立（Go common.go:84-93）。
+    peer_aead: Option<Aead>,
     /// 重建 AEAD 所需：UnitedKey + use_aes（对齐 Go 轮换语义）。
     united_key: Vec<u8>,
     use_aes: bool,
@@ -53,7 +56,24 @@ where
         Self {
             conn,
             aead,
-            peer_aead,
+            peer_aead: Some(peer_aead),
+            use_aes,
+            united_key,
+            raw_buf: Vec::new(),
+            decrypted: Vec::new(),
+            decrypted_pos: 0,
+            write_pending: None,
+            closed: false,
+        }
+    }
+
+    /// 0-RTT 构造（Go client.go:122-126）：上行 AEAD 已就绪（context=加密后
+    /// ticket 32B），下行 `peer_aead` 延迟到首次读时用 server 随机数建立。
+    pub fn new_zero_rtt(conn: C, aead: Aead, united_key: Vec<u8>, use_aes: bool) -> Self {
+        Self {
+            conn,
+            aead,
+            peer_aead: None,
             use_aes,
             united_key,
             raw_buf: Vec::new(),
@@ -76,6 +96,33 @@ where
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         loop {
+            // 0-RTT（Go common.go:84-93）：下行 AEAD 未建立时先读 server 首发的
+            // 16B 随机数，以其为 context 建立（恰好 16B，不属于任何 record）。
+            if this.peer_aead.is_none() {
+                while this.raw_buf.len() < 16 {
+                    let mut tmp = [0u8; 4096];
+                    let mut rb = ReadBuf::new(&mut tmp);
+                    match Pin::new(&mut this.conn).poll_read(cx, &mut rb) {
+                        Poll::Ready(Ok(())) => {
+                            let n = rb.filled().len();
+                            if n == 0 {
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::UnexpectedEof,
+                                    "EOF before 0-RTT server random",
+                                )));
+                            }
+                            this.raw_buf.extend_from_slice(&tmp[..n]);
+                        }
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+                let server_random: [u8; 16] =
+                    this.raw_buf[..16].try_into().expect("16B server random");
+                this.peer_aead =
+                    Some(Aead::new(&server_random, &this.united_key, this.use_aes));
+                this.raw_buf.drain(..16);
+            }
             // 1. 已解密明文优先返回
             if this.decrypted_pos < this.decrypted.len() {
                 let avail = &this.decrypted[this.decrypted_pos..];
@@ -102,7 +149,11 @@ where
                     // 完整 record：解密
                     let data: Vec<u8> = this.raw_buf[TLS_RECORD_HEADER_LEN..total].to_vec();
                     let mut plaintext = Vec::with_capacity(data.len().saturating_sub(TAG_LEN));
-                    if let Err(e) = this.peer_aead.open(&mut plaintext, None, &data, &header) {
+                    let peer_aead = this
+                        .peer_aead
+                        .as_mut()
+                        .expect("peer_aead established at loop top");
+                    if let Err(e) = peer_aead.open(&mut plaintext, None, &data, &header) {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             e.to_string(),
