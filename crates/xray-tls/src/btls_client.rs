@@ -1119,13 +1119,18 @@ impl<S: Connection + Unpin> AsyncWrite for BtlsConn<S> {
 
 impl<S: Connection + Unpin> Connection for BtlsConn<S> {
     fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
-        // btls SslStream 不暴露底层流，需通过 SslRef 获取
-        // 暂时返回 None（不影响核心功能，Connection trait 允许）
         Ok(None)
     }
 
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(None)
+    }
+
+    fn raw_tcp_clone(&self) -> Option<tokio::net::TcpStream> {
+        // 穿透 BoringSSL 层克隆内层流的裸 TCP（共享 socket，vision splice 用）。
+        // 内层继续沿 Connection 链穿透（TcpConnection / HelloRewriteStream / Box）。
+        let stream: &TokioSslStream<S> = self.stream.as_ref().get_ref();
+        stream.get_ref().raw_tcp_clone()
     }
 }
 

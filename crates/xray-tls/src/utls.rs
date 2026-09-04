@@ -150,6 +150,11 @@ impl<S: Connection + Unpin> Connection for Conn<S> {
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         self.inner.get_ref().0.local_addr()
     }
+
+    fn raw_tcp_clone(&self) -> Option<tokio::net::TcpStream> {
+        // 穿透 rustls 层克隆内层流的裸 TCP（vision splice 用）。
+        self.inner.get_ref().0.raw_tcp_clone()
+    }
 }
 
 impl<S: Connection + Unpin> ConnInterface for Conn<S> {
@@ -348,6 +353,13 @@ impl<S: Connection + Unpin> Connection for UConn<S> {
         match &self.inner {
             UConnInner::Rustls(c) => c.local_addr(),
             UConnInner::Btls(c) => c.local_addr(),
+        }
+    }
+
+    fn raw_tcp_clone(&self) -> Option<tokio::net::TcpStream> {
+        match &self.inner {
+            UConnInner::Rustls(c) => c.raw_tcp_clone(),
+            UConnInner::Btls(c) => c.raw_tcp_clone(),
         }
     }
 }
