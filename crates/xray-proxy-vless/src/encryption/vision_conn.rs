@@ -141,12 +141,9 @@ where
                     let cmd = this.downlink_state.current_command;
 
 
-                    if cmd == COMMAND_PADDING_END as i32 {
-                        this.downlink_padding = false;
-                    } else if cmd == COMMAND_PADDING_DIRECT as i32 {
-                        // splice：绕过 Vision padding，后续直接 CommonConn read（AEAD 仍生效）
-                        this.downlink_padding = false;
-                    }
+                    // ponytail fix #15: 忽略 server splice 指令 (cmd=END/DIRECT 都保持 padding),
+                    // 因为 Rust 没有 raw-TCP unwrap, 直接 inner.read 会让 btls BAD_DECRYPT.
+                    let _ = cmd;
                     if !content.is_empty() {
                         // downlink TLS 过滤：检测下行 TLS 1.3 → enable_xtls
                         // 对齐 Go VisionReader 的 xtls_filter_tls 调用
@@ -154,7 +151,11 @@ where
                             xtls_filter_tls(&[&content], &mut this.downlink_traffic);
                         }
                         // splice 触发：enable_xtls + 完整 TLS ApplicationData record
-                        if this.downlink_traffic.enable_xtls
+                        // ponytail fix #15: Rust 没有 raw-TCP unwrap (Go 用 UnwrapRawConn),
+                        // splice 后 inner.poll_read 仍走 btls, 但 server splice 后会发 raw bytes,
+                        // 导致 client.bts BAD_DECRYPT. 暂时禁用 client splice trigger,
+                        // 走 CONTINUE 全路径 (性能略损但保证正确).
+                        if false && this.downlink_traffic.enable_xtls
                             && is_complete_record(&content)
                         {
                             this.downlink_padding = false;
@@ -223,12 +224,8 @@ where
                 xtls_filter_tls(&[&buf[..n]], &mut this.uplink_traffic);
             }
             // splice 触发：enable_xtls + 完整 TLS ApplicationData record
-            let command = if this.uplink_traffic.enable_xtls && is_complete_record(&buf[..n]) {
-                this.uplink_padding = false;
-                COMMAND_PADDING_DIRECT
-            } else {
-                COMMAND_PADDING_CONTINUE
-            };
+            // ponytail fix #15: 禁用 server splice (原因同 poll_read).
+            let command = COMMAND_PADDING_CONTINUE;
             let padded = xtls_padding(
                 Some(&buf[..n]),
                 command,
