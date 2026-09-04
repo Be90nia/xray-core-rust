@@ -130,7 +130,7 @@ pub fn build_client_config(
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
         {
-            custom_root_store(&json)
+            custom_root_store(&json)?
         } else {
             let mut store = RootCertStore::empty();
             store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -153,19 +153,23 @@ pub fn build_client_config(
 /// （对应 Go `loadSelfCertPool`——遍历全部 `Certificate`，不筛 usage）。
 ///
 /// 未配置任何证书 → 空池（对齐 Go：空 `x509.CertPool`，一切验证失败）。
-fn custom_root_store(json: &serde_json::Value) -> RootCertStore {
+///
+/// # Errors
+/// 条目非法（内联类型错误/内容缺失/PEM 无证书块）时传播——对齐 Go：配置
+/// 加载期即报错，不在信任根构建层静默吞掉。
+fn custom_root_store(json: &serde_json::Value) -> io::Result<RootCertStore> {
     let mut store = RootCertStore::empty();
     if let Some(arr) = json.get("certificates").and_then(|v| v.as_array()) {
         for entry in arr {
-            if let Ok(Some((certs, _))) = entry_certs_and_key(entry) {
-                for der in certs {
-                    // 单条解析失败跳过（对齐 Go 逐条 AppendCertsFromPEM 的容错语义）
-                    let _ = store.add(der);
-                }
+            let (certs, _) = entry_certs_and_key(entry)?;
+            for der in certs {
+                // 单条证书不被信任时跳过（对齐 Go 逐条 AppendCertsFromPEM 的容错语义：
+                // 追加失败只影响该条证书，不中断池构建）
+                let _ = store.add(der);
             }
         }
     }
-    store
+    Ok(store)
 }
 
 /// 解析 `pinnedPeerCertSha256`：逗号分隔 hex 字符串（容忍 OpenSSL 冒号格式）。
@@ -210,7 +214,8 @@ fn client_identity(
 ) -> io::Result<Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>> {
     if let Some(arr) = json.get("certificates").and_then(|v| v.as_array()) {
         for entry in arr {
-            if let Some((certs, Some(key))) = entry_certs_and_key(entry)? {
+            let (certs, key) = entry_certs_and_key(entry)?;
+            if let Some(key) = key {
                 return Ok(Some((certs, key)));
             }
         }
@@ -389,6 +394,17 @@ impl ServerCertVerifier for NoCertificateVerification {
 mod tests {
     use super::*;
     use rustls::version::{TLS12, TLS13};
+
+    #[test]
+    fn client_invalid_inline_cert_errors_instead_of_silent_skip() {
+        // disableSystemRoot=true 时信任根来自 certificates[]；条目类型非法
+        // → custom_root_store Err 传播（对齐 Go 配置加载 error），不再静默吞掉。
+        let v = serde_json::json!({
+            "disableSystemRoot": true,
+            "certificates": [{ "certificate": 42 }]
+        });
+        assert!(build_client_config("tls", Some(&v), "fallback.com").is_err());
+    }
 
     fn install_provider() {
         let _ = rustls::crypto::ring::default_provider().install_default();

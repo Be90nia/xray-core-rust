@@ -207,7 +207,7 @@ pub fn build_server_config(
     // mTLS：`usage:"verify"` 条目构成客户端 CA 池时要求并验证客户端证书。
     // Go v26 无服务端 mTLS（全仓无 ClientAuth），此处为 Rust 扩展——显式 opt-in，
     // 未配置 verify 条目时保持 with_no_client_auth，既有配置行为不变。
-    let client_ca = client_ca_root_store(&json);
+    let client_ca = client_ca_root_store(&json)?;
     let builder = if client_ca.is_empty() {
         builder.with_no_client_auth()
     } else {
@@ -261,8 +261,12 @@ fn build_named_cert_keys(json: &serde_json::Value) -> io::Result<Vec<NamedCertKe
             if entry_usage(entry) != EntryUsage::Encipherment {
                 continue;
             }
-            if let Some((certs, Some(key))) = entry_certs_and_key(entry)? {
-                out.push(NamedCertKey::from_cert_der(certs, key)?);
+            let (certs, key) = entry_certs_and_key(entry)?;
+            match key {
+                Some(key) => out.push(NamedCertKey::from_cert_der(certs, key)?),
+                None => tracing::warn!(
+                    "certificates[] encipherment entry has certificate but no key; skipped"
+                ),
             }
         }
     }
@@ -282,23 +286,26 @@ fn build_named_cert_keys(json: &serde_json::Value) -> io::Result<Vec<NamedCertKe
 
 /// `certificates[]` 中 `usage:"verify"` 条目 → 客户端 CA 信任池（mTLS，Rust 扩展）。
 ///
-/// 单条证书解析失败仅跳过该证书（容忍混入坏条目，不影响其余）。
-fn client_ca_root_store(json: &serde_json::Value) -> RootCertStore {
+/// 条目非法（内联类型错误/内容缺失/PEM 无证书块）→ `Err` 传播——对齐 Go：
+/// `TLSCertConfig.Build` 在配置加载期报错，不在池构建层静默吞掉；条目内
+/// 单张 DER 不被信任仅跳过（对齐 Go 逐条 `AppendCertsFromPEM` 容错）。
+///
+/// # Errors
+/// 条目解析失败时传播。
+fn client_ca_root_store(json: &serde_json::Value) -> io::Result<RootCertStore> {
     let mut store = RootCertStore::empty();
     if let Some(arr) = json.get("certificates").and_then(|v| v.as_array()) {
         for entry in arr {
             if entry_usage(entry) != EntryUsage::Verify {
                 continue;
             }
-            if let Ok(Some((certs, _))) = entry_certs_and_key(entry) {
-                for der in certs {
-                    // 解析失败跳过该证书
-                    let _ = store.add(der);
-                }
+            let (certs, _) = entry_certs_and_key(entry)?;
+            for der in certs {
+                let _ = store.add(der);
             }
         }
     }
-    store
+    Ok(store)
 }
 
 /// 从 PEM 字节解析全部证书。
@@ -386,6 +393,17 @@ mod tests {
         // 无证书配置 → 回退自签名（不再报错），保证服务端可启动
         let config = build_server_config("tls", Some(&serde_json::json!({}))).unwrap();
         assert!(config.is_some());
+    }
+
+    #[test]
+    fn tls_invalid_inline_cert_errors_instead_of_silent_fallback() {
+        // Go：certificates 条目类型非法 = JSON 反序列化到 []string 失败 = 配置加载 error。
+        // 对齐：非法内联必须报错，不得静默回退自签证书。
+        let config = build_server_config(
+            "tls",
+            Some(&serde_json::json!({ "certificates": [{ "certificate": [1, 2, 3] }] })),
+        );
+        assert!(config.is_err(), "非法内联数字数组必须报错");
     }
 
     #[test]

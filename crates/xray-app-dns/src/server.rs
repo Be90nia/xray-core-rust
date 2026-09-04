@@ -24,7 +24,7 @@ use parking_lot::Mutex;
 use xray_features::Feature;
 use xray_features::dns::DnsError as FeaturesDnsError;
 
-use crate::config::{to_net_ip, IpOption};
+use crate::config::{to_net_ip, IpOption, QueryStrategy};
 use crate::error::DnsError;
 use crate::hosts::StaticHosts;
 use crate::nameserver::Client;
@@ -205,9 +205,9 @@ impl DnsService {
         ordered
     }
 
-    /// 顶层查询入口。对应 Go `(*DNS).LookupIP`。
+    /// 顶层查询入口。对应 Go `(*DNS).LookupIP`（dns.go:216-265）。
     ///
-    /// 流程：域名规范化 → check_routes → hosts 查询 → nameservers 查询。
+    /// 流程：域名规范化 → 服务级 `query_strategy` 钳制 → hosts 查询 → nameservers 查询。
     /// nameservers 查询支持串行/并行（由 `enable_parallel_query` 配置决定）。
     pub async fn lookup_ip(
         &self,
@@ -221,13 +221,23 @@ impl DnsService {
             )));
         }
 
-        // checkSystem：探测系统 IPv4/IPv6 路由可达性。
-        // 对应 Go: option.IPv4Enable &&= supportIPv4; option.IPv6Enable &&= supportIPv6
-        let (support_v4, support_v6) = check_routes();
-        let effective = IpOption {
-            ipv4_enable: option.ipv4_enable && support_v4,
-            ipv6_enable: option.ipv6_enable && support_v6,
-            ..option
+        // 服务级 query_strategy 钳制（Go dns.go:223-230 双分支）：
+        // UseSys → 按 OS 路由可达性钳制；其余策略 → per-query option AND 服务级族
+        // （`fake_enable` 不参与钳制，逐字透传 per-query option）。
+        let effective = if matches!(self.cfg.query_strategy, QueryStrategy::UseSys) {
+            let (support_v4, support_v6) = check_routes();
+            IpOption {
+                ipv4_enable: option.ipv4_enable && support_v4,
+                ipv6_enable: option.ipv6_enable && support_v6,
+                ..option
+            }
+        } else {
+            let (svc_v4, svc_v6) = self.cfg.query_strategy.ip_enables();
+            IpOption {
+                ipv4_enable: option.ipv4_enable && svc_v4,
+                ipv6_enable: option.ipv6_enable && svc_v6,
+                ..option
+            }
         };
 
         if !effective.ipv4_enable && !effective.ipv6_enable {
@@ -739,19 +749,23 @@ mod tests {
         });
         Arc::new(Client::new(ns, IpOption::all(), server).unwrap())
     }
-
-    fn make_service(clients: Vec<Arc<Client>>, hosts: Vec<HostMapping>) -> DnsService {
-        make_service_cfg(clients, hosts, false)
-    }
-
     fn make_service_cfg(
         clients: Vec<Arc<Client>>,
         hosts: Vec<HostMapping>,
         enable_parallel_query: bool,
     ) -> DnsService {
+        make_service_strategy(clients, hosts, QueryStrategy::UseIp, enable_parallel_query)
+    }
+
+    fn make_service_strategy(
+        clients: Vec<Arc<Client>>,
+        hosts: Vec<HostMapping>,
+        query_strategy: QueryStrategy,
+        enable_parallel_query: bool,
+    ) -> DnsService {
         DnsService::new(DnsServiceConfig {
             client_ip: Vec::new(),
-            query_strategy: QueryStrategy::UseIp,
+            query_strategy,
             tag: "test".to_string(),
             hosts: StaticHosts::new(hosts).unwrap(),
             clients,
@@ -766,6 +780,11 @@ mod tests {
             matcher_infos: Vec::new(),
         })
     }
+
+    fn make_service(clients: Vec<Arc<Client>>, hosts: Vec<HostMapping>) -> DnsService {
+        make_service_cfg(clients, hosts, false)
+    }
+
 
     #[test]
     fn sort_clients_returns_all_when_no_matcher() {
@@ -1415,6 +1434,49 @@ mod tests {
             fake_enable: false,
         };
         let res = client.query_ip("mixed.example", v6_only).await;
+        assert!(matches!(res, Err(DnsError::EmptyResponse)));
+    }
+
+    // ---- 服务级 query_strategy 钳制（Go dns.go:228-229，LookupIP 入口层）----
+
+    /// 服务级 USE_IP4 钳制 per-query 默认族：请求 all() 也只透传 v4。
+    /// 与 Client 层 AND（nameserver.go:174-175）不等价——本钳制还作用于
+    /// 静态 hosts 查询（hosts.lookup 用钳制后的 effective option）。
+    #[tokio::test]
+    async fn lookup_ip_service_strategy_clamps_per_query_option() {
+        let c = make_filter_client("mix", None, mixed_family_ips());
+        let svc = make_service_strategy(vec![c], Vec::new(), QueryStrategy::UseIp4, false);
+        let (ips, _) = svc.lookup_ip("mixed.example", IpOption::all()).await.unwrap();
+        assert!(
+            ips.iter().all(|ip| matches!(ip, IpAddr::V4(_))),
+            "服务级 USE_IP4 应钳制请求 option=all，实际 {ips:?}"
+        );
+    }
+
+    /// 服务级 USE_IP4 + 请求仅 v6 → 双禁用 → ErrEmptyResponse（Go dns.go:232-234）。
+    #[tokio::test]
+    async fn lookup_ip_service_strategy_double_disabled_yields_empty_response() {
+        let c = make_filter_client("mix", None, mixed_family_ips());
+        let svc = make_service_strategy(vec![c], Vec::new(), QueryStrategy::UseIp4, false);
+        let v6_only = IpOption { ipv4_enable: false, ipv6_enable: true, fake_enable: false };
+        let res = svc.lookup_ip("mixed.example", v6_only).await;
+        assert!(matches!(res, Err(DnsError::EmptyResponse)));
+    }
+    /// 服务级钳制同样作用于静态 hosts：v6-only hosts 记录在服务级 USE_IP4 下
+    /// 被过滤 → EmptyResponse（Go hosts.Lookup 用钳制后的 option）。
+    #[tokio::test]
+    async fn lookup_ip_service_strategy_clamps_static_hosts() {
+        let svc = make_service_strategy(
+            Vec::new(),
+            vec![HostMapping {
+                domain: "v6host.example".to_string(),
+                ips: vec!["2606:2800::6810:84e5".parse::<IpAddr>().unwrap()],
+                proxied_domain: String::new(),
+            }],
+            QueryStrategy::UseIp4,
+            false,
+        );
+        let res = svc.lookup_ip("v6host.example", IpOption::all()).await;
         assert!(matches!(res, Err(DnsError::EmptyResponse)));
     }
 
