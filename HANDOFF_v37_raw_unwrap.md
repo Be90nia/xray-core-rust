@@ -2,8 +2,8 @@
 
 ## 0. 仓库状态
 
-- **✅ 本轮修复全部完成(2026-09-04 晚, e5cc465+2c01504+f069f1c)**: vision splice(#9 #15 #32)+naive(#29)+anytls(#31)全真 PASS;全套 **24/32 PASS**(真实基线 19 净增 5),8 FAIL 全部为 §5 分诊未动节点,零回归(#4 #24 抽查+全套逐行核对)
-- **dist/xray.exe**: 含全部修复(f069f1c 构建);修复前 baseline 备份 `D:/tmp/xray_baseline_321fec.exe`(md5 321fec...)
+- **✅ v39 收官(2026-09-04 深夜, f559f03)**: 全套 **26/32 PASS**——本轮累计 vision splice(#9 #15 #32)+naive(#29)+anytls(#31)+argo h3(#1 #18)净增 7;剩余 6 FAIL = **纯 mlkem 组**(#7 #10 #11 #12 #13 #16,ArgoH3Fix 分组修正:#7 URI 简化标签误归 argo,失败模式 curl 35 与 mlkem 组一致)
+- **dist/xray.exe**: f559f03 构建(h3 lazy reader);历史 baseline 备份 D:/tmp/xray_baseline_321fec.exe
 - **2026-09-04 晚基线全套实测**(`D:/tmp/baseline_v37_full32.txt`):表观 21/32 PASS,但 **#9=10477B / #15=15983B 是假 PASS**(run_full32.py:40 判定阈值 `bs>5000 and expected in body`,partial 头部含 YouTube 即过),真实全量基线 = **19/32**;真 FAIL 13 节点 = §5 分诊表,完全自洽
 - **验收口径(长期有效)**:全套脚本 [PASS] 标记不可信——验收以单节点 `python D:/tmp/test_node.py <N>` body≥870000B 为准,全套跑完逐节点核对 body
 - **实施中发现的两个补充根因**(已修,§2 路线之外):① `ResponseHeaderReader`/`Box<dyn Connection>` 的 Connection impl 未穿透 raw_tcp_clone(dyn 分发断链,dispatcher L202 响应头包装层)→ client.rs 双路径穿透;② END/DIRECT 帧跨 poll_read 块时原方案见 cmd 即切 raw → 丢帧尾+外层密文泄漏 → 对齐 Go proxy.go XtlsUnpadding 块完成判定(`remaining_content<=0 && remaining_padding<=0 && cmd!=0`)后才切换
@@ -84,8 +84,8 @@ python dist/run_full32.py
 | 节点 | 根因 | 状态 | 剩余工作 |
 |---|---|---|---|
 | #9 #15 #32 vision partial | splice 后须绕外层 TLS 读 raw TCP | ✅ **已修**(raw_tcp_clone 穿透链+raw_fallback,874-877KB 真PASS,e5cc465) | 无 |
-| #1 #7 #18 argo+xhttp | **CF argo tunnel 按 TLS 栈指纹白名单放行(ArgoFix 40 轮迭代二分实证)**: Go TLS 栈=200 档(含无 fp 普通 hello)/python ssl=403/rustls=RST/btls=tarpit→RST;h2 帧字节已 MITM 重放排除;btls ClientHello 逐字节对齐 utls 后仍被拒——剩 3 处 BoringSSL 内部格式差异(ECH GREASE body 218B vs 186B/ALPS 6B vs 5B/cert_compression 4B vs 3B)不可配置;hyper 直握+DirectH2Client+参数对齐 Go(4MB/1GB/16KB/10MB/45s)均无效 | 未验收改动已回退(曾致 #4/#23 RST 回归,history://ArgoFix 可考) | 三选一: (1) patch BoringSSL 三处格式(btls-sys patch 机制,高难) (2) **h3/quinn 路径(改动最小,QUIC Initial 加密绕开 TCP TLS 栈检测;已探到 quinn✓/h3 握手✓/GET 发出✓ 但 10s 无响应,查 h3 头/回源/quinn 传输参数)** (3) 与节点方确认 CF zone bot 检测配置 |
-| #10-#13 #16 mlkem | vless ENC 架构错位 | 未动 | 2-3 天 |
+| #1 #18 argo+xhttp | CF argo 按 TCP TLS 栈白名单拒(rustls=RST/btls=tarpit,详见 history://ArgoFix 二分实证) | ✅ **已修 h3 路线**(换 QUIC 检测面: CF QUIC 面放行 quinn 无需 TP 对齐;真根因=h3 GET 同步等响应与 POST 上传顺序死锁,改 lazy reader 对齐 Go gotConn;876-880KB,f559f03;alpn=[h3] 由节点配置驱动,dist/uriclient.py 测试注入) | 无 |
+| **mlkem 组 ×6: #7 #10 #11 #12 #13 #16**(原分诊 #7 误归 argo,#18 实为 trojan+xhttp 无 mlkem) | vless ENC mlkem768 0-RTT;统一 `encryption=mlkem768x25519plus.native.0rtt.<ek>` + `seconds=1`;parse/1-RTT/0-RTT client pre_write 已实装(params.rs/outbound.rs:887/mod.rs:332-382),0-RTT cache 未实装;**两个待实证线索**: (a) ArgoH3Fix 称 dispatcher.rs L52 自认 enc_params 配置链未接线 (b) MlkemScout 称 Rust server 侧 length==32 拒绝是首因——outbound 场景(远端 Go server)此推理存疑,实施须先 dbg 实证 client handshake 卡点(发 pre_write 后读 serverHello?);#11 为 reality+ENC 分支顺序正交错位(ENC 包流致 reality dialer 拿不到裸流) | MlkemScout 已摸底(缺口清单+Go wire 格式+byte-diff harness 方案,history://MlkemScout) | 先实证 client 卡点→对齐 Go wire(client.go Handshake: iv+relays→nfsAEAD.seal(pfs 1250+padding≥34)→serverHello 1120+32)→0-RTT cache 实装;预估 1-2 天 |
 | #29 naive | hyper 1.10.1 CONNECT 三坑(body 被丢/200 body 空/SendRequest drop 触 GOAWAY) | ✅ **已修**(OnUpgrade 语义重写,874768B,2c01504) | 无 |
 | #31 anytls | 客户端不发 auth 帧+anytls-rs 0.3.5 漏 cmdSYN(sing-box 需显式 SYN 开流) | ✅ **已修**(auth 帧+Settings→SYN→PSH 帧序,877561B,f069f1c) | 无 |
 
