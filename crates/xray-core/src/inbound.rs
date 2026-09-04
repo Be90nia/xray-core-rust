@@ -747,6 +747,77 @@ pub enum SsInboundMode {
     Ss2022Relay(Arc<xray_proxy_ss::ss2022::RelayInbound>),
 }
 
+/// SS inbound 双向 pump + dispatch（Legacy 握手后共用，泛型以支持 transport 流）。
+///
+/// up: ss_stream.read_chunk → server_io（密文→明文，供 dispatch reader）；
+/// down: server_io 读 → ss_stream.write_chunk（明文→密文，回包给客户端）。
+async fn spawn_ss_pump<C>(
+    mut ss_stream: xray_proxy_ss::stream::SSStream<C>,
+    dest: Destination,
+    handler: std::sync::Arc<dyn DispatchHandler>,
+) where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    // 单 task select! 串行推进：SSStream 共享 nonce 计数器不可并发持有 read/write &mut。
+    tokio::spawn(async move {
+        let (mut srv_rd, mut srv_wr) = tokio::io::split(server_io);
+        let mut down_buf = vec![0u8; 8 * 1024];
+        loop {
+            tokio::select! {
+                chunk = ss_stream.read_chunk() => {
+                    match chunk {
+                        Ok(Some(plaintext)) => {
+                            if tokio::io::AsyncWriteExt::write_all(&mut srv_wr, &plaintext).await.is_err() { break; }
+                            if tokio::io::AsyncWriteExt::flush(&mut srv_wr).await.is_err() { break; }
+                        }
+                        Ok(None) => { let _ = tokio::io::AsyncWriteExt::shutdown(&mut srv_wr).await; break; }
+                        Err(e) => { tracing::debug!("ss pump up read: {e}"); break; }
+                    }
+                }
+                n = tokio::io::AsyncReadExt::read(&mut srv_rd, &mut down_buf) => {
+                    match n {
+                        Ok(0) => { let _ = ss_stream.shutdown().await; break; }
+                        Ok(n) => {
+                            if ss_stream.write_chunk(&down_buf[..n]).await.is_err() { break; }
+                            if ss_stream.flush().await.is_err() { break; }
+                        }
+                        Err(e) => { tracing::debug!("ss pump down read: {e}"); break; }
+                    }
+                }
+            }
+        }
+    });
+    let (client_rd, client_wr) = tokio::io::split(client_io);
+    let link = Link::new(new_reader(client_rd), new_writer(client_wr));
+    let _ = handler.dispatch(&dest, link).await;
+}
+
+/// Legacy SS 单条 TCP 连接完整 pipeline：握手 → pump → dispatch。
+///
+/// serve_ss accept loop 与 transport inbound（grpc/kcp/ws hub）共用；
+/// transport 分支的 conn 已被 hub 解包为明文流。
+async fn ss_legacy_pipeline<C>(
+    ib: std::sync::Arc<xray_proxy_ss::inbound::SsInbound>,
+    handler: std::sync::Arc<dyn DispatchHandler>,
+    stream: C,
+) where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let handshake = ib.handle_conn(stream).await.map(|(header, ss_stream)| {
+        (header.address, header.port, ss_stream)
+    });
+    match handshake {
+        Ok((address, port, ss_stream)) => {
+            let dest = Destination::new(address, Port::new(port), Network::TCP);
+            spawn_ss_pump(ss_stream, dest, handler).await;
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "ss inbound handshake failed");
+        }
+    }
+}
+
 /// Shadowsocks inbound 服务入口。
 ///
 /// 接受连接 → handle_conn → parse dest → dispatch。
@@ -815,86 +886,44 @@ pub async fn serve_ss(
         let handler = Arc::clone(&handler);
         let mode = inbound.clone();
         tokio::spawn(async move {
-            let handshake = match &mode {
+            match mode {
                 SsInboundMode::Legacy(ib) => {
-                    ib.handle_conn(stream).await.map(|(header, ss_stream)| {
-                        (header.address, header.port, ss_stream)
-                    }).map_err(|e| std::io::Error::other(e.to_string()))
+                    ss_legacy_pipeline(ib, handler, stream).await;
                 }
                 SsInboundMode::Ss2022(ib) => {
-                    ib.handle_conn(stream).await
+                    let handshake = ib.handle_conn(stream).await
                         .map(|r| (r.address, r.port, r.stream))
-                        .map_err(|e| std::io::Error::other(e.to_string()))
+                        .map_err(|e| std::io::Error::other(e.to_string()));
+                    if let Ok((address, port, ss_stream)) = handshake {
+                        let dest = Destination::new(address, Port::new(port), Network::TCP);
+                        spawn_ss_pump(ss_stream, dest, handler).await;
+                    } else if let Err(e) = handshake {
+                        tracing::debug!(error = %e, "ss inbound handshake failed");
+                    }
                 }
                 SsInboundMode::Ss2022Multi(ib) => {
-                    ib.handle_conn(stream).await
+                    let handshake = ib.handle_conn(stream).await
                         .map(|r| (r.address, r.port, r.stream))
-                        .map_err(|e| std::io::Error::other(e.to_string()))
+                        .map_err(|e| std::io::Error::other(e.to_string()));
+                    if let Ok((address, port, ss_stream)) = handshake {
+                        let dest = Destination::new(address, Port::new(port), Network::TCP);
+                        spawn_ss_pump(ss_stream, dest, handler).await;
+                    } else if let Err(e) = handshake {
+                        tracing::debug!(error = %e, "ss inbound handshake failed");
+                    }
                 }
                 SsInboundMode::Ss2022Relay(ib) => {
                     // relay：身份匹配 + 剥 identity header，字节原样桥（无 chunk 解密）
-                    let (addr, port, prefix, tcp) = match ib.handle_conn_relay(stream).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::debug!(error = %e, "ss2022 relay handshake failed");
-                            return;
-                        }
+                    let Ok((_addr, port, prefix, tcp)) = ib.handle_conn_relay(stream).await else {
+                        return;
                     };
-                    let dest = Destination::new(addr, Port::new(port), Network::TCP);
+                    let dest = Destination::new(_addr, Port::new(port), Network::TCP);
                     let (r, w) = tokio::io::split(tcp);
                     let link = Link::new(
                         new_reader(SsRelayReader::new(prefix, r)),
                         new_writer(w),
                     );
                     let _ = handler.dispatch(&dest, link).await;
-                    return;
-                }
-            };
-            match handshake {
-                Ok((address, port, mut ss_stream)) => {
-                    let dest = Destination::new(address, Port::new(port), Network::TCP);
-                    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-                    // 双向 pump（与 outbound SsConnection 对称）：单个 task select! 串行推进，
-                    // 因 SSStream 共享 nonce 计数器不可并发持有 read/write &mut。
-                    // up: ss_stream.read_chunk → server_io (密文→明文, 供 dispatch reader)
-                    // down: server_io 读 → ss_stream.write_chunk (明文→密文, 回包给客户端)
-                    tokio::spawn(async move {
-                        let (mut srv_rd, mut srv_wr) = tokio::io::split(server_io);
-                        let mut down_buf = vec![0u8; 8 * 1024];
-                        loop {
-                            tokio::select! {
-                                // up: 客户端密文 chunk → 解密 → server_io 写端（流向 dispatch）
-                                chunk = ss_stream.read_chunk() => {
-                                    match chunk {
-                                        Ok(Some(plaintext)) => {
-                                            if tokio::io::AsyncWriteExt::write_all(&mut srv_wr, &plaintext).await.is_err() { break; }
-                                            if tokio::io::AsyncWriteExt::flush(&mut srv_wr).await.is_err() { break; }
-                                        }
-                                        Ok(None) => { let _ = tokio::io::AsyncWriteExt::shutdown(&mut srv_wr).await; break; }
-                                        Err(e) => { tracing::debug!("ss pump up read: {e}"); break; }
-                                    }
-                                }
-                                // down: dispatch 回包（server_io 读端）→ 加密 chunk → 写回客户端
-                                n = tokio::io::AsyncReadExt::read(&mut srv_rd, &mut down_buf) => {
-                                    match n {
-                                        Ok(0) => { let _ = ss_stream.shutdown().await; break; }
-                                        Ok(n) => {
-                                            if ss_stream.write_chunk(&down_buf[..n]).await.is_err() { break; }
-                                            if ss_stream.flush().await.is_err() { break; }
-                                        }
-                                        Err(e) => { tracing::debug!("ss pump down read: {e}"); break; }
-                                    }
-                                }
-                            }
-                        }
-                    });
-
-                    let (client_rd, client_wr) = tokio::io::split(client_io);
-                    let link = Link::new(new_reader(client_rd), new_writer(client_wr));
-                    let _ = handler.dispatch(&dest, link).await;
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "ss inbound handshake failed");
                 }
             }
         });
@@ -1896,6 +1925,31 @@ async fn spawn_one_inbound(
         }
         // shadowsocks inbound：SsInbound + serve_ss accept loop
         "shadowsocks" => {
+            let settings = xray_transport::dialer::StreamSettings::from_json(
+                ib.stream_settings_json.as_ref(),
+            );
+            // transport 分支（grpc/kcp/ws hub 承载）：仅 Legacy 模式接线（2022 模式
+            // 的 handle_conn 尚为 TcpStream 特化，保持裸 TCP 回落不回归）。
+            if is_transport_listener_protocol(&settings.protocol) {
+                if let SsInboundMode::Legacy(ss_ib) = parse_ss_inbound_config(&ib.entry.data)? {
+                    let handler = ohm.get_default_handler().ok_or_else(|| {
+                        std::io::Error::other("no default outbound handler registered")
+                    })?;
+                    let bind_addr: SocketAddr = addr.parse().map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("parse addr: {e}"))
+                    })?;
+                    tracing::info!(tag = %ib.tag, addr = %addr, network = %settings.protocol, security = %settings.security, "ss transport inbound listening");
+                    let on_conn: xray_transport::listener_registry::ConnHandler = Arc::new(move |conn| {
+                        let ib = Arc::clone(&ss_ib);
+                        let handler = Arc::clone(&handler);
+                        tokio::spawn(async move {
+                            ss_legacy_pipeline(ib, handler, conn).await;
+                        });
+                    });
+                    return spawn_transport_listener_inbound(&ib.tag, bind_addr, settings, shutdown_token, on_conn).await;
+                }
+                tracing::warn!(tag = %ib.tag, network = %settings.protocol, "ss transport inbound only supports legacy AEAD mode; falling back to raw TCP");
+            }
             let listener = TcpListener::bind(&addr).await?;
             let inbound = parse_ss_inbound_config(&ib.entry.data)?;
             tracing::info!(tag = %ib.tag, addr = %addr, "shadowsocks inbound listening");
