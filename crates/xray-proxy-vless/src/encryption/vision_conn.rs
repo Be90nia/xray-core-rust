@@ -141,24 +141,19 @@ where
                     let cmd = this.downlink_state.current_command;
 
 
-                    if cmd == COMMAND_PADDING_END as i32 {
-                        this.downlink_padding = false;
-                    } else if cmd == COMMAND_PADDING_DIRECT as i32 {
-                        // splice：绕过 Vision padding，后续直接 CommonConn read（AEAD 仍生效）
-                        this.downlink_padding = false;
-                    }
+                    // ponytail fix: 不再响应 server splice 指令（cmd=END/DIRECT 都不切换）。
+                    // 原因: Rust 没 raw-TCP unwrap，splice 后 inner=bts.read 会把 server splice 后
+                    // 发的 raw bytes 当作 REALITY 密文解密 → BAD_DECRYPT。
+                    // 保持 downlink_padding=true, 始终走 vision unpadding 路径。
+                    let _ = cmd;
                     if !content.is_empty() {
                         // downlink TLS 过滤：检测下行 TLS 1.3 → enable_xtls
                         // 对齐 Go VisionReader 的 xtls_filter_tls 调用
                         if this.downlink_traffic.number_of_packet_to_filter > 0 {
                             xtls_filter_tls(&[&content], &mut this.downlink_traffic);
                         }
-                        // splice 触发：enable_xtls + 完整 TLS ApplicationData record
-                        if this.downlink_traffic.enable_xtls
-                            && is_complete_record(&content)
-                        {
-                            this.downlink_padding = false;
-                        }
+                        // ponytail fix: 禁用 client splice trigger (原因同上)
+                        let _ = (this.downlink_traffic.enable_xtls, is_complete_record(&content));
                         this.downlink_pending = content;
                         this.downlink_pending_pos = 0;
                     }
@@ -222,13 +217,8 @@ where
             if this.uplink_traffic.number_of_packet_to_filter > 0 {
                 xtls_filter_tls(&[&buf[..n]], &mut this.uplink_traffic);
             }
-            // splice 触发：enable_xtls + 完整 TLS ApplicationData record
-            let command = if this.uplink_traffic.enable_xtls && is_complete_record(&buf[..n]) {
-                this.uplink_padding = false;
-                COMMAND_PADDING_DIRECT
-            } else {
-                COMMAND_PADDING_CONTINUE
-            };
+            // ponytail fix: 禁用 server splice trigger, 永远发 CONTINUE 帧
+            let command = COMMAND_PADDING_CONTINUE;
             let padded = xtls_padding(
                 Some(&buf[..n]),
                 command,
