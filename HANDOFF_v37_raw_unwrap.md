@@ -1,13 +1,15 @@
-# HANDOFF v37 (2026-09-04) — vision splice raw-unwrap 路线(新会话从这里开工)
+# HANDOFF v40 (2026-09-05) — 🎉 **32/32 全通达成**(v37→v40 一日战役)
 
 ## 0. 仓库状态
 
-- **✅ v39 收官(2026-09-04 深夜, f559f03)**: 全套 **26/32 PASS**——本轮累计 vision splice(#9 #15 #32)+naive(#29)+anytls(#31)+argo h3(#1 #18)净增 7;剩余 6 FAIL = **纯 mlkem 组**(#7 #10 #11 #12 #13 #16,ArgoH3Fix 分组修正:#7 URI 简化标签误归 argo,失败模式 curl 35 与 mlkem 组一致)
-- **dist/xray.exe**: f559f03 构建(h3 lazy reader);历史 baseline 备份 D:/tmp/xray_baseline_321fec.exe
+- **✅ 32/32 PASS 0 FAIL(HEAD 36f8812, PM 亲自全套复跑独立复现, `D:/tmp/final_32of32.txt` 逐行核对)**: 本轮四场战役净增 13 节点——vision splice(#9 #15 #32 e5cc465)+naive(#29 2c01504)+anytls(#31 f069f1c)+argo h3(#1 #18 f559f03)+mlkem ENC(#7 #10 #11 #12 #13 #16 42d0e02)
+- **旧协议本地互操作矩阵全绿**(ProtoInterop, VPS 未配的协议按用户指令用本地 Go server 调通): ss aes128/aes256/chacha20/xchacha20/ss2022×3/kcp default+tuned/grpc gun(3 修复 36f8812)/srtp+quic 双侧一致移除;run_matrix.py + scapy 抓包 harness 留存 D:/tmp/proto_interop/
+- **dist/xray.exe**: 42d0e02 构建;历史 baseline 备份 D:/tmp/xray_baseline_321fec.exe(321fec, 19/32 时代)
+- **验收口径(长期有效)**:全套 [PASS] 标记有假 PASS 前科(run_full32.py:40 阈值 bs>5000)——验收以单节点 `python D:/tmp/test_node.py <N>` body≥870000B 为准,全套跑完逐节点核对 body
+- **方法论沉淀**: 本地 Go server(可 debug log)+oracle 逐步解密+scapy 抓包字节 diff = wire 协议调试三板斧(用户指定模式,远端 VPS 盲调不可比);部署副本 md5 必校验(探针零输出的假象=旧二进制)
+- **已知非阻塞遗留**: server 侧 inbound VisionConn splice/ENC 0-RTT 会话未实现(outbound 全通);Rust 0-RTT 快路径未启用(恒 1-RTT,功能正确);grpc server 侧 pump 同病未修;ss2022 多 PSK/重放防护未测
 - **2026-09-04 晚基线全套实测**(`D:/tmp/baseline_v37_full32.txt`):表观 21/32 PASS,但 **#9=10477B / #15=15983B 是假 PASS**(run_full32.py:40 判定阈值 `bs>5000 and expected in body`,partial 头部含 YouTube 即过),真实全量基线 = **19/32**;真 FAIL 13 节点 = §5 分诊表,完全自洽
-- **验收口径(长期有效)**:全套脚本 [PASS] 标记不可信——验收以单节点 `python D:/tmp/test_node.py <N>` body≥870000B 为准,全套跑完逐节点核对 body
 - **实施中发现的两个补充根因**(已修,§2 路线之外):① `ResponseHeaderReader`/`Box<dyn Connection>` 的 Connection impl 未穿透 raw_tcp_clone(dyn 分发断链,dispatcher L202 响应头包装层)→ client.rs 双路径穿透;② END/DIRECT 帧跨 poll_read 块时原方案见 cmd 即切 raw → 丢帧尾+外层密文泄漏 → 对齐 Go proxy.go XtlsUnpadding 块完成判定(`remaining_content<=0 && remaining_padding<=0 && cmd!=0`)后才切换
-- **遗留(非阻塞)**: server 侧 inbound VisionConn 的 InnerRawClone 返回 None(server splice 不工作,三节点均为 outbound 场景);上行非 TLS 目标保持 CONTINUE(与 Go L379 提前 End 分支不同,行为同 v2 基线)
 
 ## 1. #9 #15 #32(vless+vision partial ~10KB)真根因 —— wire-level 已实证
 
