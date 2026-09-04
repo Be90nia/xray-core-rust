@@ -40,6 +40,11 @@ pub struct WgNetStack {
     iface: Interface,
     device: VirtualDevice,
     sockets: SocketSet<'static>,
+    /// 下一个 TCP 临时端口种子（smoltcp 0.12 connect 要求本地端口非 0）。
+    ///
+    /// # ponytail: 顺序分配 32768..=60767，绕回前不重用；同远端旧连接仍开着的
+    /// 精确 tuple 复用需 28000 并发连接，超出代理场景——瓶颈出现再做空闲端口扫描。
+    next_ephemeral: u16,
 }
 
 impl WgNetStack {
@@ -83,6 +88,7 @@ impl WgNetStack {
             device,
             // ponytail: SocketSet 用 Vec 作 backing storage，'static bound 由 alloc 满足
             sockets: SocketSet::new(Vec::new()),
+            next_ephemeral: 0,
         }
     }
 
@@ -155,6 +161,9 @@ impl WgNetStack {
 
     /// 发起 TCP 连接（client side）。
     ///
+    /// 本地端口在此分配——smoltcp 0.12 `connect` 要求本地端口非 0（传 0 恒报
+    /// `Unaddressable`），本地地址留 `None` 由栈按接口地址自动选源。
+    ///
     /// 返回 `Err` 表示 smoltcp 拒绝（如地址族不匹配）。
     pub fn tcp_connect(
         &mut self,
@@ -162,11 +171,12 @@ impl WgNetStack {
         remote: IpAddress,
         port: u16,
     ) -> Result<(), tcp::ConnectError> {
+        self.next_ephemeral = self.next_ephemeral.wrapping_add(1);
+        let local_port = 32768 + (self.next_ephemeral as u32 % 28000) as u16;
+        let local = smoltcp::wire::IpListenEndpoint { addr: None, port: local_port };
         let socket = self.sockets.get_mut::<tcp::Socket<'static>>(handle);
-        // local_endpoint 用 0.0.0.0:0（让 smoltcp 自动选 src 地址）
-        socket.connect(self.iface.context(), (remote, port), 0)
+        socket.connect(self.iface.context(), (remote, port), local)
     }
-
     /// TCP 监听（server side）。对应 Go `tcp.NewForwarder` 的 listen 语义。
     ///
     /// 把 socket 置为 Listen 状态，接受任意源地址的连接。
@@ -316,8 +326,14 @@ impl phy::Device for VirtualDevice {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
         caps.max_transmission_unit = self.mtu;
-        // 关闭校验和卸载：WireGuard userspace path 自己算
-        caps.checksum = smoltcp::phy::ChecksumCapabilities::ignored();
+        // TX 必须算校验和：WireGuard 只做加密，不改内层 IP/TCP 包——对端
+        // （wireguard-go + gVisor / 内核）按标准栈校验，缺校验和静默丢包。
+        // RX 跳过校验：对端是可信 userspace 栈（gVisor 发包必带校验和）。
+        caps.checksum.ipv4 = smoltcp::phy::Checksum::Tx;
+        caps.checksum.tcp = smoltcp::phy::Checksum::Tx;
+        caps.checksum.udp = smoltcp::phy::Checksum::Tx;
+        caps.checksum.icmpv4 = smoltcp::phy::Checksum::Tx;
+        caps.checksum.icmpv6 = smoltcp::phy::Checksum::Tx;
         caps
     }
 }
@@ -380,6 +396,25 @@ mod tests {
         stack.ingest_rx(pkt);
         stack.poll(Instant::now());
         let _ = stack.drain_tx();
+    }
+
+    #[test]
+    fn tcp_connect_allocates_nonzero_local_port_and_distinct_tuples() {
+        let mut stack = make_stack();
+        let h1 = stack.add_tcp_socket();
+        let h2 = stack.add_tcp_socket();
+        let dst = IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1));
+        // smoltcp 0.12 对本地端口 0 恒报 Unaddressable——内部分配端口后必须成功
+        stack.tcp_connect(h1, dst, 80).expect("first connect");
+    }
+
+    #[test]
+    fn device_computes_tx_checksums() {
+        let stack = make_stack();
+        let caps = smoltcp::phy::Device::capabilities(&stack.device);
+        assert!(caps.checksum.ipv4.tx());
+        assert!(caps.checksum.tcp.tx());
+        assert!(caps.checksum.udp.tx());
     }
 
     fn make_icmp_echo_request() -> Vec<u8> {
