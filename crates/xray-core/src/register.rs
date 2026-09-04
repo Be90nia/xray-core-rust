@@ -992,8 +992,8 @@ mod tests {
 
     /// bd f23r：Instance 装配路径——factory 创建的 ObservatoryFeature 经
     /// `init_dependencies(DepBag)` 注入 IO 后 start 成功。
-    #[test]
-    fn observatory_init_dependencies_wires_io_then_start_succeeds() {
+    #[tokio::test]
+    async fn observatory_init_dependencies_wires_io_then_start_succeeds() {
         use std::sync::Arc;
         use xray_features::{DepBag, OutboundTagSelector};
 

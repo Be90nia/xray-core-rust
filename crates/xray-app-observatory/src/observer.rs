@@ -775,11 +775,10 @@ mod tests {
                 true
             }
         }
-        let cfg = ObservatoryConfig {
-            probe_url: "".into(),
-            ..Default::default()
-        };
-        let mut exec = RealOutboundProbeExecutor::from_config(&cfg);
+        // from_config 经 effective_probe_url 会把空 URL 替换成默认值——用 new()
+        // 构造空 probe_url 才能覆盖"URL 为空 → dead"短路分支（不进 runtime 路径）。
+        let mut exec =
+            RealOutboundProbeExecutor::new(std::collections::HashMap::new(), "", 5_000);
         exec.set_handler("noop", Arc::new(NoopHandler));
         let r = exec.probe("noop");
         assert!(!r.alive);
@@ -911,23 +910,20 @@ impl HttpProbeExecutor {
 impl ProbeExecutor for HttpProbeExecutor {
     fn probe(&self, outbound_tag: &str) -> ProbeResult {
         let _start = Instant::now();
-        let result = tokio::runtime::Handle::try_current()
-            .map(|handle| {
-                handle.block_on(async { self.probe_async(outbound_tag).await })
+        // probe 是同步契约，可能从 async 上下文（background 探测循环）调用；
+        // 在当前 runtime 上 block_on 会 panic（Cannot start a runtime from within
+        // a runtime）。专用线程 + 独立 runtime 对任何调用上下文安全。
+        let result = std::thread::scope(|s| {
+            s.spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                rt.block_on(async { self.probe_async(outbound_tag).await })
             })
-            .unwrap_or_else(|_| {
-                // 无 tokio runtime 时同步探测
-                std::thread::scope(|s| {
-                    s.spawn(|| {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .map_err(|e| e.to_string())?;
-                        rt.block_on(async { self.probe_async(outbound_tag).await })
-                    }).join().unwrap_or_else(|e| Err(format!("thread panicked: {e:?}")))
-                })
-            });
-
+            .join()
+            .unwrap_or_else(|e| Err(format!("thread panicked: {e:?}")))
+        });
         match result {
             Ok(delay_ms) => ProbeResult {
                 alive: true,
@@ -1128,50 +1124,59 @@ impl ProbeExecutor for RealOutboundProbeExecutor {
 
         let timeout_ms = self.timeout_ms;
         let outbound_tag_owned = outbound_tag.to_string();
-        // E0382 fix: outbound_tag_owned 被 move 进 block_on 闭包，此处预克隆
-        // 一份给 unwrap_or_else（无 runtime 兜底分支）使用。
-        let tag_for_fallback = outbound_tag_owned.clone();
         let handler = handler.clone();
-        let result = tokio::runtime::Handle::try_current()
-            .map(|handle| {
-                handle.block_on(async move {
-                    let start = Instant::now();
-                    let dial_fut = handler.dial(&dest, &session);
-                    let timeout = Duration::from_millis(timeout_ms);
-                    match tokio::time::timeout(timeout, dial_fut).await {
-                        Ok(Ok(())) => {
-                            let delay = start.elapsed().as_millis() as i64;
-                            ProbeResult {
+        // probe 是同步契约，典型调用方是 background 探测循环（async 上下文）。
+        // 在当前 runtime 上 block_on 会 panic "Cannot start a runtime from within
+        // a runtime"——专用线程 + 独立 runtime 对任何调用上下文安全（与
+        // HttpProbeExecutor 的无 runtime 分支同一模式）。
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+                match rt {
+                    Ok(rt) => rt.block_on(async move {
+                        let start = Instant::now();
+                        let dial_fut = handler.dial(&dest, &session);
+                        let timeout = Duration::from_millis(timeout_ms);
+                        match tokio::time::timeout(timeout, dial_fut).await {
+                            Ok(Ok(())) => ProbeResult {
                                 alive: true,
-                                delay,
+                                delay: start.elapsed().as_millis() as i64,
                                 last_error_reason: String::new(),
-                            }
+                            },
+                            Ok(Err(e)) => ProbeResult {
+                                alive: false,
+                                delay: 0,
+                                last_error_reason: format!(
+                                    "outbound '{outbound_tag_owned}' dial failed: {e}"
+                                ),
+                            },
+                            Err(_) => ProbeResult {
+                                alive: false,
+                                delay: 0,
+                                last_error_reason: format!(
+                                    "outbound '{outbound_tag_owned}' dial timeout after {timeout_ms}ms"
+                                ),
+                            },
                         }
-                        Ok(Err(e)) => ProbeResult {
-                            alive: false,
-                            delay: 0,
-                            last_error_reason: format!(
-                                "outbound '{outbound_tag_owned}' dial failed: {e}"
-                            ),
-                        },
-                        Err(_) => ProbeResult {
-                            alive: false,
-                            delay: 0,
-                            last_error_reason: format!(
-                                "outbound '{outbound_tag_owned}' dial timeout after {timeout_ms}ms"
-                            ),
-                        },
-                    }
-                })
+                    }),
+                    Err(e) => ProbeResult {
+                        alive: false,
+                        delay: 0,
+                        last_error_reason: format!(
+                            "outbound '{outbound_tag_owned}': probe runtime build failed: {e}"
+                        ),
+                    },
+                }
             })
-            .unwrap_or_else(|_| ProbeResult {
+            .join()
+            .unwrap_or_else(|e| ProbeResult {
                 alive: false,
                 delay: 0,
-                last_error_reason: format!(
-                    "outbound '{tag_for_fallback}': no tokio runtime in probe thread"
-                ),
-            });
-        result
+                last_error_reason: format!("probe thread panicked: {e:?}"),
+            })
+        })
     }
 }
 

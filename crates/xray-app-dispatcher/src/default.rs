@@ -899,7 +899,12 @@ impl DefaultDispatcher {
             // pick_route_resolved 默认退化为同步 pick_route；RouterAdapter 生产实现
             // 委托 xray_app_router::Router::pick_route_resolved（携带完整 RoutingContext）。
             else if let Some(r) = &router {
-                let ctx = build_routing_context(&final_dest, sniffed_protocol.as_deref());
+                let mut ctx = build_routing_context(&final_dest, sniffed_protocol.as_deref());
+                // Go routing.Context 携带 inbound tag（InboundTagMatcher 依赖）：
+                // 从 access 上下文回填，否则 inboundTag 规则永不命中、恒落 default。
+                if let Some(a) = &access {
+                    ctx = ctx.with_inbound_tag(a.inbound_tag.as_str());
+                }
                 match r.pick_route_resolved(&ctx).await {
                     Ok(route) => {
                         let picked = ohm.get_handler(&route.outbound_tag);

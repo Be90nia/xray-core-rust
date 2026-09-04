@@ -312,8 +312,14 @@ impl DispatchHandler for InboundDispatchHandler {
         dest: &Destination,
         link: Link,
     ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
-        // 无 access 上下文 → 不记（等价 Go ctx 无 AccessMessage）
-        self.dispatch_internal(dest, link, None)
+        // UDP relay（socks/dokodemo/ss）无协议层 access（from/email 留空），
+        // 但 inbound_tag 必须补齐——否则 router 的 inboundTag 规则永不命中
+        // （Go UDP dispatch 的 ctx 同样携带 inbound 信息）。
+        let access = AccessContext {
+            inbound_tag: self.tag.clone(),
+            ..Default::default()
+        };
+        self.dispatch_internal(dest, link, Some(access))
     }
 
     /// 带 access 上下文（对应 Go ctx 携带 `log.AccessMessage`）：
