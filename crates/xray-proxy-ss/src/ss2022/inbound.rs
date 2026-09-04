@@ -459,7 +459,9 @@ async fn read_ss2022_request(
 
     // 7. 构造 SSStream
     nonce[0] = 1;
-    let stream = SSStream::new_with_aead_and_nonce(conn, aead, nonce);
+    let mut stream = SSStream::new_with_aead_and_nonce(conn, aead, nonce);
+    // server 读侧续接请求 nonce 序列（body 首帧 [2,0..]）
+    stream.continue_read_nonce();
 
     Ok((address, port, stream))
 }
@@ -550,7 +552,9 @@ async fn read_ss2022_request_multi(
     let (address, port) = parse_variable_header(&variable_plain)?;
 
     nonce[0] = 1;
-    let stream = SSStream::new_with_aead_and_nonce(conn, aead, nonce);
+    let mut stream = SSStream::new_with_aead_and_nonce(conn, aead, nonce);
+    // server 读侧续接请求 nonce 序列（body 首帧 [2,0..]）
+    stream.continue_read_nonce();
 
     Ok(InboundResult {
         address,
@@ -730,7 +734,7 @@ mod tests {
 
     /// SS-2022 relay e2e（对齐 sing-shadowsocks relay.go）：
     /// Client(with_identity) → [salt][EIH][EISS] → RelayInbound 剥 EIH →
-    /// destination Ss2022Inbound 用 dest PSK 解密 → echo → 原路回包。
+    /// destination Ss2022Inbound 用 dest PSK 解密 → echo（sing writeResponse 响应头）→ 原路回包。
     #[tokio::test]
     async fn relay_tunnel_roundtrip() {
         use crate::ss2022::client::Client2022;
@@ -764,22 +768,37 @@ mod tests {
                 let ib = std::sync::Arc::clone(&dest_inbound);
                 tokio::spawn(async move {
                     let Ok(result) = ib.handle_conn(conn).await else { return };
-                    // 解密 body → echo；echo 回包 → 加密回写
+                    // 读一个 body chunk（请求 AEAD 续接 header nonce 序列，
+                    // continue_read_nonce 后 body 首帧在 [2,0..] 解）。
                     let mut ss = result.stream;
-                    let _ = tokio::spawn(async move {
-                        loop {
-                            match ss.read_chunk().await {
-                                Ok(Some(p)) => {
-                                    // 简化：不真正连 echo（已在 client 侧验证往返），
-                                    // 直接回写相同 payload 模拟 echo
-                                    if ss.write_chunk(&p).await.is_err() { break; }
-                                    if ss.flush().await.is_err() { break; }
-                                }
-                                _ => break,
-                            }
-                        }
-                    })
-                    .await;
+                    let Ok(Some(p)) = ss.read_chunk().await else { return };
+                    // sing server writeResponse 响应 wire：resp_salt ||
+                    // AEAD(fixed：type=1+epoch+echo_salt+var_len) || AEAD(var=first body)。
+                    // dest_psk 32B 恰为 key_size，derive_psk 恒等；echo_salt 全零
+                    // （client 只校验 echo ≤ 请求盐 lexicographic）。
+                    let kind = CipherKind2022::from_name("2022-blake3-aes-256-gcm").unwrap();
+                    let resp_subkey = derive_session_subkey(&dest_psk, &[0u8; 32], kind);
+                    let resp_aead = build_aead(kind, &resp_subkey).unwrap();
+                    let epoch = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    let mut fixed = Vec::with_capacity(43);
+                    fixed.push(1u8);
+                    fixed.extend_from_slice(&epoch.to_be_bytes());
+                    fixed.extend_from_slice(&[0u8; 32]);
+                    fixed.extend_from_slice(&(p.len() as u16).to_be_bytes());
+                    let mut nonce = vec![0u8; 12];
+                    let sealed_fixed = resp_aead.seal(&nonce, &[], &fixed).unwrap();
+                    increment_nonce(&mut nonce);
+                    let sealed_var = resp_aead.seal(&nonce, &[], &p).unwrap();
+                    let mut out =
+                        Vec::with_capacity(32 + sealed_fixed.len() + sealed_var.len());
+                    out.extend_from_slice(&[0u8; 32]); // resp_salt
+                    out.extend_from_slice(&sealed_fixed);
+                    out.extend_from_slice(&sealed_var);
+                    ss.get_mut().write_all(&out).await.unwrap();
+                    ss.flush().await.unwrap();
                 });
             }
         });
@@ -834,13 +853,38 @@ mod tests {
         .unwrap()
         .with_identity(&server_psk_b64)
         .unwrap();
-        let mut stream = client.dial_target("127.0.0.1", echo_port).await.unwrap();
+        // 看门狗：wire 任一侧失配时快速失败而非无限挂起（挂起测试回归防护）
+        let roundtrip = async {
+            let mut stream = client.dial_target("127.0.0.1", echo_port).await.unwrap();
 
-        let payload = b"ss2022-relay-e2e";
-        stream.write_chunk(payload).await.unwrap();
-        stream.flush().await.unwrap();
-        let resp = stream.read_chunk().await.unwrap().expect("echo resp");
-        assert_eq!(resp, payload);
+            let payload = b"ss2022-relay-e2e";
+            stream.write_chunk(payload).await.unwrap();
+            stream.flush().await.unwrap();
+            // SS-2022 响应必须走 try_open_chunk（read_chunk 是 legacy 路径，
+            // 不跑 drive_2022_rekey 响应头状态机）
+            let mut pending: Vec<u8> = Vec::new();
+            let mut down_buf = vec![0u8; 16 * 1024];
+            loop {
+                match stream.try_open_chunk(&mut pending) {
+                    Ok(crate::stream::ChunkOut::Message(p)) => {
+                        assert_eq!(p, payload, "relay e2e roundtrip");
+                        return;
+                    }
+                    Ok(crate::stream::ChunkOut::End) => {
+                        panic!("stream ended before echo response");
+                    }
+                    Ok(crate::stream::ChunkOut::NeedMore) => {
+                        let n = stream.get_mut().read(&mut down_buf).await.unwrap();
+                        assert!(n > 0, "EOF before echo response");
+                        pending.extend_from_slice(&down_buf[..n]);
+                    }
+                    Err(e) => panic!("try_open_chunk: {e}"),
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), roundtrip)
+            .await
+            .expect("relay roundtrip timed out (wire mismatch)");
     }
 
     #[test]

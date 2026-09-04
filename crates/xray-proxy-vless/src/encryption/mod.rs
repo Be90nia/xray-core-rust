@@ -1239,10 +1239,10 @@ mod tests {
     /// 0-RTT 快路径全链路（对齐 Go client.go:113-129 + server.go:198-235 +
     /// common.go:84-93）：第一连 1-RTT 写缓存 → 第二连 0-RTT pre_write + 手动
     /// Go 语义双向验收（Rust ServerInstance 尚不支持 server 0-RTT）。
-    /// ponytail: 双向 wire 验收在 tokio current-thread duplex 上会挂起（探针证实
-    /// pre_write/缓存键/双向 AEAD ctx 字节全部正确后仍挂，疑 duplex poll 交互），
-    /// ignore 待查；缓存语义与 1-RTT 路径由 client_server_1rtt_cache_fill 覆盖。
-    #[ignore = "duplex poll hang under investigation; byte-level wire verified via probes"]
+    /// 挂起根因是测试脚本自身的两处笔误（非 duplex poll / 产品代码问题）：
+    /// ① 下行 record 验收后又追加了第二个 `read_exact`，等一条永不存在的
+    /// record（无限阻塞）；② 上行验收期望客户端发 `c2s-0rtt`，但测试从未
+    /// 通过 c2 写入该数据。两处修正后 duplex 上稳定绿。
     #[tokio::test]
     async fn zero_rtt_cache_and_wire_roundtrip() {
         use rand_core::RngCore;
@@ -1337,12 +1337,14 @@ mod tests {
             s2c_aead.seal(&mut down, None, payload, &hdr).unwrap();
             let mut buf = vec![0u8; payload.len()];
             server_io.write_all(&down).await.unwrap();
-            if tokio::time::timeout(std::time::Duration::from_millis(500), c2.read_exact(&mut buf))
-                .await
-                .is_err()
-            {
+            let Ok(Ok(_)) = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                c2.read_exact(&mut buf),
+            )
+            .await
+            else {
                 continue;
-            }
+            };
             // 独立实例自检：相同 (sr, uk) 派生的 AEAD 必须能解开 down 里的 record
             {
                 let mut probe = crate::encryption::aead::Aead::new(&sr, &uk, true);
@@ -1352,10 +1354,10 @@ mod tests {
                     .expect("probe: fresh Aead(sr,uk) must open the record");
                 assert_eq!(probe_pt, payload, "probe roundtrip");
             }
-            c2.read_exact(&mut buf).await.unwrap();
             assert_eq!(&buf, payload, "下行经 serverRandom 建立的下行 AEAD 解密");
 
             // 6. 上行（Go server.go:230）：client AEAD context = 加密 ticket 32B
+            c2.write_all(b"c2s-0rtt").await.unwrap();
             let mut up_hdr = [0u8; 5];
             server_io.read_exact(&mut up_hdr).await.unwrap();
             let up_len =

@@ -582,6 +582,14 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         self.inner
     }
 
+    /// server 侧预设读侧 nonce 续接请求 header 序列（sing 无方向独立 reset）：
+    /// `read_ss2022_request*` 已按 [0;12]/[1,0..] 消费 fixed/var 两个 chunk，
+    /// body 首帧在 [2,0..] 解——读侧起点须与写侧相同（[1,0..]，首个
+    /// increment 后对齐）。client 流读侧恒被 response rekey 覆盖，不受影响。
+    pub(crate) fn continue_read_nonce(&mut self) {
+        self.read_nonce = self.write_nonce.clone();
+    }
+
     /// 标记流为「读 Go 风格 server response」（legacy IV rekey）：
     /// 第一次 `read_chunk` 前先读 IV 并 rekey 读侧 AEAD。
     ///
