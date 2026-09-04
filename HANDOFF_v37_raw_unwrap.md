@@ -2,11 +2,12 @@
 
 ## 0. 仓库状态
 
-- **HEAD**: 02b83a3(docs: HANDOFF v36)+ 本 commit(connection.rs raw_tcp_clone 雏形)
-- **dist/xray.exe**: md5 `321fec760f9f6fb394735f55dbe46939` = 干净 v34 baseline 编译,未含 raw_tcp_clone(该改动 Windows 下惰性,无需急拷)
-- **2026-09-04 晚实测单节点**:#9=10477B / #15=10477B / #32=4560B,全 partial FAIL(curl 56 missing close_notify)——§1 模型与 §5 分诊实证成立;**全套 PASS 数以复测为准**(记忆记载"21/32"与分诊表 13 节点 FAIL 矛盾,不可信)
-- **开工第一件事**:`python dist/run_full32.py` 复测钉死基线(单节点验证命令 `python D:/tmp/test_node.py <N>`)
-- 工作树应只剩 dist/ 下 untracked 测试脚本;`git status` 有 M crates/xray-transport/src/connection.rs = 本 commit 之前状态
+- **✅ 修复已完成并验证(2026-09-04 晚,本 commit)**: §2 全 4 步 + §3 Windows 缺口落地,#9=876942B / #15=876732B / #32=877393B 全真 PASS(≥870KB 无 close_notify);全套 **22/32 PASS**(真实基线 19 + 净新增 #32,#9/#15 从假 PASS 转真),10 FAIL 全部为 §5 分诊非本任务节点,零回归(#4 #24 抽查 PASS)
+- **dist/xray.exe**: md5 `b3c09ba5759c2c6f18c433ac6097f163` = 含修复新二进制;修复前 baseline 备份 `D:/tmp/xray_baseline_321fec.exe`(md5 321fec...)
+- **2026-09-04 晚基线全套实测**(`D:/tmp/baseline_v37_full32.txt`):表观 21/32 PASS,但 **#9=10477B / #15=15983B 是假 PASS**(run_full32.py:40 判定阈值 `bs>5000 and expected in body`,partial 头部含 YouTube 即过),真实全量基线 = **19/32**;真 FAIL 13 节点 = §5 分诊表,完全自洽
+- **验收口径(长期有效)**:全套脚本 [PASS] 标记不可信——验收以单节点 `python D:/tmp/test_node.py <N>` body≥870000B 为准,全套跑完逐节点核对 body
+- **实施中发现的两个补充根因**(已修,§2 路线之外):① `ResponseHeaderReader`/`Box<dyn Connection>` 的 Connection impl 未穿透 raw_tcp_clone(dyn 分发断链,dispatcher L202 响应头包装层)→ client.rs 双路径穿透;② END/DIRECT 帧跨 poll_read 块时原方案见 cmd 即切 raw → 丢帧尾+外层密文泄漏 → 对齐 Go proxy.go XtlsUnpadding 块完成判定(`remaining_content<=0 && remaining_padding<=0 && cmd!=0`)后才切换
+- **遗留(非阻塞)**: server 侧 inbound VisionConn 的 InnerRawClone 返回 None(server splice 不工作,三节点均为 outbound 场景);上行非 TLS 目标保持 CONTINUE(与 Go L379 提前 End 分支不同,行为同 v2 基线)
 
 ## 1. #9 #15 #32(vless+vision partial ~10KB)真根因 —— wire-level 已实证
 
@@ -78,11 +79,11 @@ python dist/run_full32.py
 ```
 风险点:若 #9 通了但 #26-28 ss 或 trojan 掉了 → raw_tcp_clone/trigger 影响了别的路径,回查 vision_conn 改动是否只影响 flow=xtls-rprx-vision 分支(dispatcher.rs:207 的 if 才包 VisionConn,其他协议不经过)。
 
-## 5. 剩余 11 FAIL 分诊(更新版)
+## 5. 剩余 10 FAIL 分诊(v37 修复后)
 
-| 节点 | 根因 | 本会话动作 | 剩余工作 |
+| 节点 | 根因 | 状态 | 剩余工作 |
 |---|---|---|---|
-| #9 #15 #32 vision partial | splice 后须绕外层 TLS 读 raw TCP | 根因实证 + trait 雏形 | §2 第 2-4 步 + §3 Windows,2-4h |
+| #9 #15 #32 vision partial | splice 后须绕外层 TLS 读 raw TCP | ✅ **已修**(raw_tcp_clone 穿透链 + raw_fallback,872-877KB 真PASS) | 无 |
 | #1 #7 #18 argo+xhttp | CF 严格反指纹;强制 stream-one 会 400(splithttp bad status:400,server 要 packet-up) | 尝试+回退(73467d0) | 重写 packet-up/stream-up dialer 用 http2::handshake+btls(保持 mode 语义),3-4h 高回归风险 |
 | #10-#13 #16 mlkem | vless ENC 架构错位 | 未动 | 2-3 天 |
 | #29 #31 naive/anytls | 协议层缺口 | 未动 | 1-2 天 |

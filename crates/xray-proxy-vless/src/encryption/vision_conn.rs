@@ -20,9 +20,31 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
+use xray_transport::connection::Connection;
 
 /// padding 块 content 上限（BUF_SIZE - header(5) - uuid(16) = 8171）。
 const MAX_PADDING_CONTENT: usize = 8171;
+/// 内层裸 TCP 克隆入口（vision splice 用）。
+///
+/// 生产链内层是 `Box<dyn Connection>`（实现 [`Connection`]，穿透到最底层
+/// `TcpConnection::raw_tcp_clone`）；tests/inbound 的内层（`CommonConn<DuplexStream>`、
+/// `tokio::io::Join`）无裸 TCP 可克隆，走默认 `None`。
+pub(crate) trait InnerRawClone {
+    fn inner_raw_tcp_clone(&self) -> Option<TcpStream> {
+        None
+    }
+}
+
+impl InnerRawClone for Box<dyn Connection> {
+    fn inner_raw_tcp_clone(&self) -> Option<TcpStream> {
+        (**self).raw_tcp_clone()
+    }
+}
+
+impl<A: AsyncRead, B: AsyncWrite> InnerRawClone for tokio::io::Join<A, B> {}
+
+impl InnerRawClone for CommonConn<tokio::io::DuplexStream> {}
 /// Vision 连接：包装 [`CommonConn`]，提供 XTLS-Vision padding。
 ///
 /// 对应 Go 的 VisionReader/VisionWriter。padding 模式下每个读写都包装/解包
@@ -50,6 +72,8 @@ pub struct VisionConn<C> {
     uplink_traffic: TrafficState,
     /// downlink TLS 过滤状态（检测服务器 TLS 1.3 → enable_xtls → splice）。
     downlink_traffic: TrafficState,
+    /// splice 后的裸 TCP 读直通道（server 发 DIRECT 帧后克隆内层 socket）。
+    raw_fallback: Option<TcpStream>,
 }
 
 impl<C> VisionConn<C>
@@ -78,6 +102,7 @@ where
             rng: StdRng::from_os_rng(),
             uplink_traffic: TrafficState::new(user_uuid.clone()),
             downlink_traffic: TrafficState::new(user_uuid.clone()),
+            raw_fallback: None,
         }
     }
     /// dial 同步阶段主动发 uuid-only padding 块,后续 chunk 进 vision content。
@@ -100,7 +125,7 @@ where
 
 impl<C> AsyncRead for VisionConn<C>
 where
-    C: AsyncRead + AsyncWrite + Unpin,
+    C: AsyncRead + AsyncWrite + Unpin + InnerRawClone,
 {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -122,8 +147,13 @@ where
                 return Poll::Ready(Ok(()));
             }
 
-            // 2. padding 关闭 → 直接 CommonConn read（无 unpadding）
+            // 2. padding 关闭 → 优先裸 TCP 直读；raw 通道不可用（无 TLS 或
+            //    非生产链内层）才退 inner。splice 后读 inner 会把对端在裸 TCP
+            //    上发的明文 TLS records 当外层密文解密 → 永远解不开。
             if !this.downlink_padding {
+                if let Some(raw) = this.raw_fallback.as_mut() {
+                    return Pin::new(raw).poll_read(cx, buf);
+                }
                 return Pin::new(&mut this.inner).poll_read(cx, buf);
             }
 
@@ -139,21 +169,31 @@ where
                     let content =
                         xtls_unpadding(&tmp[..n], &mut this.downlink_state, &this.user_uuid);
                     let cmd = this.downlink_state.current_command;
-
-
-                    // ponytail fix: 不再响应 server splice 指令（cmd=END/DIRECT 都不切换）。
-                    // 原因: Rust 没 raw-TCP unwrap，splice 后 inner=bts.read 会把 server splice 后
-                    // 发的 raw bytes 当作 REALITY 密文解密 → BAD_DECRYPT。
-                    // 保持 downlink_padding=true, 始终走 vision unpadding 路径。
-                    let _ = cmd;
+                    // server 关闭下行 padding：END=只关 padding（继续读 TLS 层），
+                    // DIRECT=splice——server 已 UnwrapRawConn，此后在裸 TCP 上
+                    // 收发端到端 TLS records。本帧 content 先入 pending 返回给
+                    // caller，再克隆裸 socket 切换读通道（对齐 Go XtlsRead）。
+                    // 对齐 Go VisionReader（proxy.go L244-253）：仅当当前帧
+                    // 完成（content/padding 无残留）时 END/DIRECT 才生效；
+                    // End/Direct 帧可能跨块，帧未完成就切 raw 会跳过帧尾字节
+                    // 并把外层 TLS 密文当裸流转发 → curl 解密失败。
+                    let frames_done = this.downlink_state.remaining_content <= 0
+                        && this.downlink_state.remaining_padding <= 0
+                        && cmd != 0;
+                    if frames_done {
+                        if cmd == COMMAND_PADDING_END as i32 {
+                            this.downlink_padding = false;
+                        } else if cmd == COMMAND_PADDING_DIRECT as i32 {
+                            this.downlink_padding = false;
+                            this.raw_fallback = this.inner.inner_raw_tcp_clone();
+                        }
+                    }
                     if !content.is_empty() {
                         // downlink TLS 过滤：检测下行 TLS 1.3 → enable_xtls
                         // 对齐 Go VisionReader 的 xtls_filter_tls 调用
                         if this.downlink_traffic.number_of_packet_to_filter > 0 {
                             xtls_filter_tls(&[&content], &mut this.downlink_traffic);
                         }
-                        // ponytail fix: 禁用 client splice trigger (原因同上)
-                        let _ = (this.downlink_traffic.enable_xtls, is_complete_record(&content));
                         this.downlink_pending = content;
                         this.downlink_pending_pos = 0;
                     }
@@ -168,7 +208,7 @@ where
 
 impl<C> AsyncWrite for VisionConn<C>
 where
-    C: AsyncRead + AsyncWrite + Unpin,
+    C: AsyncRead + AsyncWrite + Unpin + InnerRawClone,
 {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -203,8 +243,12 @@ where
                 }
             }
 
-            // 2. padding 关闭 → 直接 CommonConn write
+            // 2. padding 关闭 → 优先裸 TCP 直写（splice 后对端已拆外层 TLS，
+            //    写 inner 会把 caller 的 TLS records 当明文再加密一层）。
             if !this.uplink_padding {
+                if let Some(raw) = this.raw_fallback.as_mut() {
+                    return Pin::new(raw).poll_write(cx, buf);
+                }
                 return Pin::new(&mut this.inner).poll_write(cx, buf);
             }
 
@@ -217,8 +261,21 @@ where
             if this.uplink_traffic.number_of_packet_to_filter > 0 {
                 xtls_filter_tls(&[&buf[..n]], &mut this.uplink_traffic);
             }
-            // ponytail fix: 禁用 server splice trigger, 永远发 CONTINUE 帧
-            let command = COMMAND_PADDING_CONTINUE;
+            // splice trigger（对齐 Go VisionWriter.WriteMultiBuffer L356-393）：
+            // Go 的 TrafficState.EnableXtls 是共享字段——由下行 ServerHello
+            // 检测置位，上行 writer 直接读它（Rust 侧两个实例，等价于读
+            // downlink_traffic）。触发还需 caller 写入是完整的 TLS app-data
+            // record（0x17 0x03 0x03 前缀 = curl 的端到端 TLS records）。
+            let is_app_data = buf.len() >= 3 && buf[0] == 0x17 && buf[1] == 0x03 && buf[2] == 0x03;
+            let command = if this.downlink_traffic.enable_xtls
+                && is_app_data
+                && is_complete_record(buf)
+                && n == buf.len()
+            {
+                COMMAND_PADDING_DIRECT
+            } else {
+                COMMAND_PADDING_CONTINUE
+            };
             let padded = xtls_padding(
                 Some(&buf[..n]),
                 command,
@@ -228,16 +285,30 @@ where
                 &mut this.rng,
             );
             this.uplink_write_pending = Some((padded, 0, n));
+            if command == COMMAND_PADDING_DIRECT {
+                this.uplink_padding = false;
+                this.raw_fallback = this.inner.inner_raw_tcp_clone();
+            }
             // continue → 步骤 1 写 pending
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        let this = self.get_mut();
+        if let Some(raw) = this.raw_fallback.as_mut() {
+            return Pin::new(raw).poll_flush(cx);
+        }
+        Pin::new(&mut this.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        let this = self.get_mut();
+        if let Some(raw) = this.raw_fallback.as_mut() {
+            // splice 后对端已拆外层 TLS：半关闭通知必须走裸 TCP（inner 的
+            // TLS close_notify 会被对端当 raw bytes 转发污染下游流）。
+            return Pin::new(raw).poll_shutdown(cx);
+        }
+        Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
 
@@ -245,7 +316,7 @@ where
 /// 让 `VisionConn<Box<dyn Connection>>` 可作为 `Box<dyn Connection>` 返回生产路径。
 impl<C> xray_transport::connection::Connection for VisionConn<C>
 where
-    C: xray_transport::connection::Connection,
+    C: xray_transport::connection::Connection + InnerRawClone,
 {
     fn remote_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
         self.inner.remote_addr()

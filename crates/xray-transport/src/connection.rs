@@ -133,8 +133,27 @@ impl Connection for TcpConnection {
             // from_std 要求非阻塞模式。tokio 持有的 fd 是非阻塞的；dup 继承同样 flags。
             TcpStream::from_std(std_stream).ok()
         }
-        #[cfg(not(unix))]
-        { None }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::{AsRawSocket, FromRawSocket};
+            // tokio TcpStream 无 try_clone：借 raw SOCKET 构造不接管所有权的
+            // std 视图（ManuallyDrop 防 drop 关闭原 handle），std TcpStream::
+            // try_clone（内部 DuplicateHandle）复制独立 handle，再转回 tokio
+            // （from_std 要求非阻塞，tokio 持有的 socket 已是）。
+            // SAFETY: raw handle 由 self.inner 持有且调用期间有效；视图被
+            // ManuallyDrop 包裹不会关闭它，克隆出的 handle 独立拥有新句柄。
+            let raw = self.inner.as_raw_socket();
+            let view = std::mem::ManuallyDrop::new(unsafe { std::net::TcpStream::from_raw_socket(raw) });
+            let cloned = match view.try_clone() {
+                Ok(s) => s,
+                Err(_) => return None,
+            };
+            TcpStream::from_std(cloned).ok()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            None
+        }
     }
     fn close_read(&mut self) -> io::Result<()> {
         #[cfg(unix)]
@@ -305,6 +324,11 @@ impl Connection for Box<dyn Connection> {
 
     fn close_write(&mut self) -> io::Result<()> {
         (**self).close_write()
+    }
+
+    fn raw_tcp_clone(&self) -> Option<TcpStream> {
+        // 穿透 Box 转发到内层具体连接（vision splice 依赖此链路）。
+        (**self).raw_tcp_clone()
     }
 }
 

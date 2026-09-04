@@ -215,6 +215,10 @@ impl<S: Connection + Unpin> Connection for HelloRewriteStream<S> {
     fn local_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
         self.inner.local_addr()
     }
+    fn raw_tcp_clone(&self) -> Option<tokio::net::TcpStream> {
+        // BIO 拦截层只在握手窗口起作用，连接建立后穿透内层克隆裸 TCP。
+        self.inner.raw_tcp_clone()
+    }
 }
 
 /// 创建 REALITY 客户端 btls 连接（浏览器指纹握手 + REALITY transcript 注入 + 证书验证）。

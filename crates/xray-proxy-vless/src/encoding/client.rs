@@ -227,6 +227,21 @@ where
     fn local_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
         self.inner.local_addr()
     }
+    fn raw_tcp_clone(&self) -> Option<tokio::net::TcpStream> {
+        // vision splice：穿透响应头缓冲层克隆裸 TCP（装箱后经 dyn 分发到达这里）。
+        self.inner.raw_tcp_clone()
+    }
+}
+
+impl<C> crate::encryption::vision_conn::InnerRawClone for ResponseHeaderReader<C>
+where
+    C: xray_transport::connection::Connection + crate::encryption::vision_conn::InnerRawClone,
+{
+    fn inner_raw_tcp_clone(&self) -> Option<tokio::net::TcpStream> {
+        // vision splice：穿透响应头缓冲层克隆裸 TCP（响应头消费完后由
+        // VisionConn 切换读通道，本层不再参与）。
+        self.inner.inner_raw_tcp_clone()
+    }
 }
 
 // ---------------------------------------------------------------------------

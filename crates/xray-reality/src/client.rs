@@ -125,13 +125,20 @@ impl<S: Connection> Connection for RealityTlsStream<S> {
     fn remote_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
         match self {
             RealityTlsStream::Btls(c) => c.remote_addr(),
-            RealityTlsStream::Rustls(_) => Ok(None),
+            RealityTlsStream::Rustls(t) => t.get_ref().0.remote_addr(),
         }
     }
     fn local_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
         match self {
             RealityTlsStream::Btls(c) => c.local_addr(),
-            RealityTlsStream::Rustls(_) => Ok(None),
+            RealityTlsStream::Rustls(t) => t.get_ref().0.local_addr(),
+        }
+    }
+    fn raw_tcp_clone(&self) -> Option<tokio::net::TcpStream> {
+        // 穿透 TLS 层克隆内层流的裸 TCP（vision splice 用）。
+        match self {
+            RealityTlsStream::Btls(c) => c.raw_tcp_clone(),
+            RealityTlsStream::Rustls(t) => t.get_ref().0.raw_tcp_clone(),
         }
     }
 }

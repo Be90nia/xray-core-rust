@@ -207,6 +207,10 @@ impl<S: Connection> Connection for RealityConnection<S> {
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(self.local_addr)
     }
+    fn raw_tcp_clone(&self) -> Option<TcpStream> {
+        // 穿透到 REALITY TLS 流继续克隆裸 TCP（vision splice 用）。
+        self.inner.raw_tcp_clone()
+    }
 }
 
 #[cfg(test)]
