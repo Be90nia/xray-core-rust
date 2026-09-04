@@ -321,9 +321,9 @@ impl H3Conn {
         })?;
         drop(send_req);
 
-        if let Some(b) = body {
+        if let Some(b) = &body {
             stream
-                .send_data(Bytes::from(b))
+                .send_data(Bytes::copy_from_slice(b))
                 .await
                 .map_err(|e| SplitHttpError::Hyper(format!("h3 send_data: {e}")))?;
         }
@@ -332,6 +332,20 @@ impl H3Conn {
             .await
             .map_err(|e| SplitHttpError::Hyper(format!("h3 finish: {e}")))?;
 
+        let (remote, local) = self.addrs();
+        if body.is_none() {
+            // stream-down GET：发出即返回（对齐 Go `DefaultDialerClient::OpenStream`
+            // 的 gotConn 语义——只等连接建立，响应在后台 goroutine 处理）。
+            // server 端对 GET 立即回 200 headers（hub.go WriteHeader+Flush），数据
+            // 后续流式；非 200 仅记日志、读端 EOF。旧实现同步 `recv_response`
+            // 会阻塞 dial：packet-up 的 POST 上传任务在 GET 之后才 spawn，而
+            // server 的 GET/POST 建流时序需要请求先行发出——顺序死锁，dial
+            // 挂到外层超时（CF/QUIC 面本身放行 quinn，与本 bug 无关）。
+            let reader = spawn_h3_lazy_reader(self.clone(), stream);
+            return Ok((reader, remote, local));
+        }
+
+        // body = Some（一次性 POST）：对齐 Go `PostPacket`，同步等响应。
         let resp = stream
             .recv_response()
             .await
@@ -341,7 +355,6 @@ impl H3Conn {
         }
 
         let reader = spawn_h3_recv_reader(stream);
-        let (remote, local) = self.addrs();
         Ok((reader, remote, local))
     }
 
@@ -439,15 +452,10 @@ impl H3Conn {
             .finish()
             .await
             .map_err(|e| SplitHttpError::Hyper(format!("h3 finish download: {e}")))?;
-        let resp = dl_stream
-            .recv_response()
-            .await
-            .map_err(|e| SplitHttpError::Hyper(format!("h3 recv_response download: {e}")))?;
-        if resp.status() != StatusCode::OK {
-            return Err(SplitHttpError::BadStatus(resp.status().as_u16()));
-        }
 
-        let reader = spawn_h3_recv_reader(dl_stream);
+        // GET 下载同样 lazy 化（对齐 Go `OpenStream`；理由同 `open_stream`
+        // 的 stream-down 分支——响应头不得阻塞 dial 调用方）。
+        let reader = spawn_h3_lazy_reader(self.clone(), dl_stream);
         let (remote, local) = self.addrs();
         Ok((Some(reader), remote, local))
     }
@@ -497,9 +505,62 @@ where
     Box::new(reader)
 }
 
+/// stream-down GET 的 lazy 读端（对齐 Go `WaitReadCloser` 语义）。
+///
+/// dial 调用方不被响应头阻塞：spawn 的后台任务先收响应头——200 则进入
+/// `recv_data` 数据循环；非 200 仅记日志并结束（读端 EOF，对齐 Go
+/// `"unexpected status"` 分支）；错误则 `mark_closed` + EOF。数据经 channel
+/// 转发，转换方式与 [`spawn_h3_recv_reader`] 相同。
+fn spawn_h3_lazy_reader<S, B>(
+    this: std::sync::Arc<H3Conn>,
+    mut stream: h3::client::RequestStream<S, B>,
+) -> Box<dyn AsyncReadTrait + Send + Unpin>
+where
+    h3::client::RequestStream<S, B>: Send,
+    S: h3::quic::RecvStream + Send + 'static,
+    B: Buf + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel::<std::io::Result<Bytes>>(8);
+    tokio::spawn(async move {
+        match stream.recv_response().await {
+            Ok(resp) if resp.status() == StatusCode::OK => {}
+            Ok(resp) => {
+                debug!(target: "splithttp-h3", status = %resp.status(), "unexpected GET status");
+                return;
+            }
+            Err(e) => {
+                this.mark_closed();
+                debug!(target: "splithttp-h3", error = %e, "GET recv_response failed");
+                return;
+            }
+        }
+        loop {
+            match stream.recv_data().await {
+                Ok(Some(mut buf)) => {
+                    let len = buf.remaining();
+                    let bytes = buf.copy_to_bytes(len);
+                    if tx.send(Ok(bytes)).await.is_err() {
+                        return; // 接收端 drop，结束
+                    }
+                }
+                Ok(None) => return,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            e.to_string(),
+                        )))
+                        .await;
+                    return;
+                }
+            }
+        }
+    });
+    Box::new(StreamReader::new(ReceiverStream::new(rx)))
+}
+
 #[cfg(test)]
 mod tests {
-    // H3 端到端测试在 tests/mock_h3_server.rs 集成测试覆盖（mock h3::server）。
     // H3 端到端测试在 tests/mock_h3_server.rs 集成测试覆盖（mock h3::server）。
     // 单元测试需要真实网络 + QUIC + TLS，留集成测试。
 

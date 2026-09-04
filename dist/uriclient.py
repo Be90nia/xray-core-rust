@@ -24,6 +24,20 @@ def parse_ss(uri):
     return method, password, host, int(port)
 
 def cfg(uri, socks_port=11080):
+    out = _cfg_impl(uri, socks_port)
+    # argo tunnel 节点（域名含 argo）：CF 仅在 QUIC/h3 面放行处理（TCP h2 面按
+    # TLS 栈白名单拒非 Go 栈）。节点方正确配置即 alpn=["h3"]，客户端走
+    # splithttp H3 over QUIC（Go xray 实测 200）。cdn 域名不受影响。
+    ss = out.get("streamSettings") or {}
+    tls = ss.get("tlsSettings") or {}
+    if ss.get("network") == "xhttp" and ss.get("security") == "tls" \
+            and "argo" in (tls.get("serverName") or "") and not tls.get("alpn"):
+        tls["alpn"] = ["h3"]
+        ss["tlsSettings"] = tls
+        out["streamSettings"] = ss
+    return out
+
+def _cfg_impl(uri, socks_port=11080):
     u = uri.strip()
     p = up.urlparse(u)
     tag = "proxy"; q = dict(up.parse_qsl(p.query, keep_blank_values=True))
