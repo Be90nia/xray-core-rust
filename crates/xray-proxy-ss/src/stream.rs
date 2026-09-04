@@ -622,6 +622,35 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         self.read_aead = std::sync::Arc::from(aead);
         Ok(())
     }
+
+    /// server 端响应方向 rekey，对应 Go `WriteTCPResponse`
+    /// （proxy/shadowsocks/protocol.go:191-204）：生成新随机 IV **先行明文写出**，
+    /// 写侧 AEAD 用新 IV 重派生（HKDF-SHA1 `"ss-subkey"`），write_nonce 重置
+    /// `[0xFF;n]`（首写 increment → `[0;n]`，与 client `rekey_for_response`
+    /// 的读侧序列对称）。
+    ///
+    /// 必须在响应数据写出前恰好调用一次；读侧不动（请求方向 AEAD 继续用）。
+    ///
+    /// # Errors
+    /// - [`SsError::Io`]：底层写 IV 失败。
+    /// - 透传 AEAD 派生错误。
+    pub async fn begin_server_response(&mut self, account: &MemoryAccount) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let iv_size = account.cipher.iv_size() as usize;
+        let iv: Vec<u8> = (0..iv_size).map(|_| rand::random::<u8>()).collect();
+        if iv_size > 0 {
+            self.inner.write_all(&iv).await?;
+            self.inner.flush().await?;
+        }
+        let aead = account
+            .cipher
+            .create_aead(&account.key, &iv)?
+            .ok_or(SsError::UnsupportedCipher)?;
+        let nonce_size = aead.nonce_size();
+        self.write_aead = std::sync::Arc::from(aead);
+        self.write_nonce = vec![0xFFu8; nonce_size];
+        Ok(())
+    }
 }
 /// [`SSStream::try_open_chunk`] 的返回态。
 pub enum ChunkOut {
@@ -822,49 +851,39 @@ mod tests {
 
     #[test]
     fn server_body_initial_nonce_state() {
-        // new_server_body 初始 nonce = [1,0,...]，第一次 increment → [2,0,...]
-        // 模拟 decode_tcp_request_header 已消耗首帧 nonce [0;n]+[1,0,...]
+        // new_server_body 初始 nonce = [1,0,...]（读写同 initial）；
+        // 模拟 decode_tcp_request_header 已消耗首帧 nonce [0;n]+[1,0,...]，
+        // 下一次 increment = [2,0,...] 进入 body 首个 size chunk。
         let account = make_account(CipherType::Aes128Gcm, "password");
         let iv = random_iv(&account);
         let (_a, b) = tokio::io::duplex(64);
         let mut stream = SSStream::new_server_body(b, &account, &iv).expect("server body");
 
-        // 初始 [1,0,...]
-        assert_eq!(stream.nonce[0], 1);
-        assert_eq!(stream.nonce[1..], vec![0u8; 11]);
+        assert_eq!(stream.write_nonce[0], 1);
+        assert_eq!(stream.write_nonce[1..], vec![0u8; 11]);
+        assert_eq!(stream.read_nonce[0], 1);
 
-        // increment → [2,0,...]（body 首个 size chunk）
-        stream.increment_nonce();
-        assert_eq!(stream.nonce[0], 2);
-        assert_eq!(stream.nonce[1..], vec![0u8; 11]);
+        increment_nonce_bytes(&mut stream.write_nonce);
+        assert_eq!(stream.write_nonce[0], 2);
+        assert_eq!(stream.write_nonce[1..], vec![0u8; 11]);
     }
 
     #[test]
     fn nonce_increment_le_carry() {
-        // 测试 LE increment 进位
-        let account = make_account(CipherType::Aes128Gcm, "p");
-        let iv = random_iv(&account);
-        let (_duplex_a, duplex_b) = tokio::io::duplex(64);
-        let mut stream = SSStream::new_client(duplex_b, &account, &iv).expect("stream");
+        // LE increment 进位语义（Go GenerateIncreasingNonce 对齐）
+        let mut n = vec![0xFFu8; 12];
+        increment_nonce_bytes(&mut n);
+        assert_eq!(n, vec![0u8; 12]);
 
-        // 初始 [0xFF; 12]
-        assert_eq!(stream.nonce, vec![0xFFu8; 12]);
+        increment_nonce_bytes(&mut n);
+        assert_eq!(n[0], 1);
+        assert_eq!(n[1..], vec![0u8; 11]);
 
-        // increment → [0; 12]
-        stream.increment_nonce();
-        assert_eq!(stream.nonce, vec![0u8; 12]);
-
-        // increment → [1, 0, ...]
-        stream.increment_nonce();
-        assert_eq!(stream.nonce[0], 1);
-        assert_eq!(stream.nonce[1..], vec![0u8; 11]);
-
-        // 设 nonce[0] = 0xFF，increment → [0, 1, 0, ...]（进位）
-        stream.nonce[0] = 0xFF;
-        stream.increment_nonce();
-        assert_eq!(stream.nonce[0], 0);
-        assert_eq!(stream.nonce[1], 1);
-        assert_eq!(stream.nonce[2..], vec![0u8; 10]);
+        n[0] = 0xFF;
+        increment_nonce_bytes(&mut n);
+        assert_eq!(n[0], 0);
+        assert_eq!(n[1], 1);
+        assert_eq!(n[2..], vec![0u8; 10]);
     }
 
     /// 模拟 Go `WriteTCPResponse`：server 生成新 IV 并写入 wire，后跟加密 chunks。

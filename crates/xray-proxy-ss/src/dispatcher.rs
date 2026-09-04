@@ -955,13 +955,13 @@ mod tests {
             .await
             .expect("connect inbound");
         let stream = client
-            .dial_target_on(
+            .dial_target_for_proxy_on(
                 Box::new(xray_transport::connection::TcpConnection::new(tcp)) as Box<dyn Connection>,
                 &Address::IPv4(echo_v4),
                 echo_addr.port(),
             )
             .await
-            .expect("dial_target");
+            .expect("dial_target_for_proxy_on");
         let mut conn = SsConnection::new(stream);
 
         let payload = b"hello ss duplex pump!";

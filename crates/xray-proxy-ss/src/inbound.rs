@@ -69,10 +69,13 @@ impl SsInbound {
     /// 返回 [`io::Error`]（`ErrorKind::Other`）当：
     /// - validator 无用户配置
     /// - SS 协议解析失败（IV/首帧读取、AEAD 初始化、地址解析）
-    pub async fn handle_conn(
+    pub async fn handle_conn<C>(
         &self,
-        conn: TcpStream,
-    ) -> io::Result<(RequestHeader, SSStream<TcpStream>)> {
+        conn: C,
+    ) -> io::Result<(RequestHeader, SSStream<C>)>
+    where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    {
         let user = self
             .server
             .validator
