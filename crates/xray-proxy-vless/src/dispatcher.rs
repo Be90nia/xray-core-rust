@@ -142,8 +142,21 @@ impl VlessOutboundConfig {
 ///
 /// 不会 panic；任何错误以 `Err(String)` 返回。
 pub fn make_dial_fn(config: Arc<VlessOutboundConfig>) -> DialFn {
+    // ENC 客户端实例 Handler 级共享（对齐 Go outbound.go:94 `handler.encryption`
+    // 是 Handler 字段）：跨连接持有 0-RTT pfs_key/ticket/expire 缓存，0-RTT 快路径
+    // 依赖第二连能读到第一连写入的缓存。tokio Mutex：handshake(&mut self) 跨 await。
+    let enc_client: Option<Arc<tokio::sync::Mutex<crate::encryption::ClientInstance>>> =
+        config.enc_params.as_ref().map(|enc| {
+            use crate::encryption::ClientInstance;
+            let mut client = ClientInstance::new();
+            // init 仅在 padding 解析失败时出错；ClientEncParams 已按 Go 规则校验
+            // 格式。失败时 keys 为空 → 后续 handshake 显式报 "no nfs_pkeys initialized"。
+            let _ = client.init(enc.keys.clone(), enc.xor_mode, enc.seconds, &enc.padding);
+            Arc::new(tokio::sync::Mutex::new(client))
+        });
     Arc::new(move |dest: &Destination| {
         let config = Arc::clone(&config);
+        let enc_client = enc_client.clone();
         let target_addr = dest.address().clone();
         let target_port = dest.port();
         Box::pin(async move {
@@ -165,13 +178,8 @@ pub fn make_dial_fn(config: Arc<VlessOutboundConfig>) -> DialFn {
             //     用加密层 (CommonConn/XorConn) 包装原始连接。后续请求头、
             //     响应头、payload 全部走加密层 AEAD 帧。
             //     缺这一段 → 服务端 h.decryption.Handshake 在裸 VLESS 头字节上
-            //     解析失败直接关流（vless inbound inbound.go:276-278）。
-            if let Some(enc) = config.enc_params.clone() {
-                use crate::encryption::ClientInstance;
-                let mut client = ClientInstance::new();
-                client
-                    .init(enc.keys, enc.xor_mode, enc.seconds, &enc.padding)
-                    .map_err(|e| format!("vless enc init: {e}"))?;
+            if let Some(client) = enc_client {
+                let mut client = client.lock().await;
                 let enc_conn = client
                     .handshake(conn)
                     .await
@@ -268,6 +276,7 @@ pub fn make_dial_fn_with_addons(config: Arc<VlessOutboundConfig>, addons: Addons
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::SeedableRng;
     use xray_common::net::address::Address;
     use xray_common::uuid::UUID;
 
