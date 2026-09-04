@@ -311,7 +311,7 @@ async fn serial_query(
         if !option.fake_enable && client.server.name().eq_ignore_ascii_case("FakeDNS") {
             continue;
         }
-        match client.query_ip(domain).await {
+        match client.query_ip(domain, option).await {
             Ok(result) => return Ok(result),
             Err(e) => {
                 // Go dns.go:377 — per-server LogInfoInner "in serial query mode"。
@@ -407,7 +407,7 @@ async fn parallel_query(
         }
         let c = Arc::clone(client);
         let d = domain_owned.clone();
-        set.spawn(async move { (i, c.query_ip(&d).await) });
+        set.spawn(async move { (i, c.query_ip(&d, option).await) });
         spawned += 1;
     }
 
@@ -741,6 +741,14 @@ mod tests {
     }
 
     fn make_service(clients: Vec<Arc<Client>>, hosts: Vec<HostMapping>) -> DnsService {
+        make_service_cfg(clients, hosts, false)
+    }
+
+    fn make_service_cfg(
+        clients: Vec<Arc<Client>>,
+        hosts: Vec<HostMapping>,
+        enable_parallel_query: bool,
+    ) -> DnsService {
         DnsService::new(DnsServiceConfig {
             client_ip: Vec::new(),
             query_strategy: QueryStrategy::UseIp,
@@ -749,7 +757,7 @@ mod tests {
             clients,
             disable_fallback: false,
             disable_fallback_if_match: false,
-            enable_parallel_query: false,
+            enable_parallel_query,
             disable_cache: false,
             serve_stale: false,
             serve_expired_ttl: 0,
@@ -805,7 +813,7 @@ mod tests {
         });
         let client = Client::new(ns, IpOption::all(), server).unwrap();
 
-        let (ips, _) = client.query_ip("x.com").await.unwrap();
+        let (ips, _) = client.query_ip("x.com", IpOption::all()).await.unwrap();
         assert_eq!(ips, vec![IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))]);
 
         // 返回 IP 全部不在期望范围 → ErrEmptyResponse。
@@ -834,7 +842,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            client2.query_ip("x.com").await,
+            client2.query_ip("x.com", IpOption::all()).await,
             Err(DnsError::EmptyResponse)
         ));
     }
@@ -1294,6 +1302,120 @@ mod tests {
         let err = serial_query(&[final_client], "x.com", IpOption::all()).await.unwrap_err();
         assert!(matches!(err, DnsError::RecordNotFound),
             "final_query 命中即返回该 client 的错误，不走 merge");
+    }
+
+    // ---- WgTimeoutFix 族过滤回归：option 必须贯穿 service→client→nameserver ----
+
+    /// 尊重 IpOption 的 mock nameserver：模拟真实 nameserver（udp.rs 等）按族过滤。
+    struct FamilyFilterServer {
+        name: String,
+        ips: Vec<IpAddr>,
+    }
+
+    impl Server for FamilyFilterServer {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn is_disable_cache(&self) -> bool {
+            false
+        }
+        fn query_ip<'a>(
+            &'a self,
+            _domain: &'a str,
+            option: IpOption,
+        ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>> {
+            let ips: Vec<IpAddr> = self
+                .ips
+                .iter()
+                .copied()
+                .filter(|ip| match ip {
+                    IpAddr::V4(_) => option.ipv4_enable,
+                    IpAddr::V6(_) => option.ipv6_enable,
+                })
+                .collect();
+            Box::pin(async move { Ok((ips, 60)) })
+        }
+    }
+
+    fn make_filter_client(
+        tag: &str,
+        query_strategy: Option<QueryStrategy>,
+        ips: Vec<IpAddr>,
+    ) -> Arc<Client> {
+        let ns = NameServerConfig {
+            tag: tag.to_string(),
+            query_strategy,
+            ..Default::default()
+        };
+        let server: Box<dyn Server> = Box::new(FamilyFilterServer {
+            name: tag.to_string(),
+            ips,
+        });
+        Arc::new(Client::new(ns, IpOption::all(), server).unwrap())
+    }
+
+    fn mixed_family_ips() -> Vec<IpAddr> {
+        vec![
+            IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
+            IpAddr::V6("2606:2800::6810:84e5".parse().unwrap()),
+        ]
+    }
+
+    fn v4_only() -> IpOption {
+        IpOption {
+            ipv4_enable: true,
+            ipv6_enable: false,
+            fake_enable: false,
+        }
+    }
+
+    /// 回归（WgTimeoutFix 定位）：ipv6_enable=false 时 serial_query 须把 option
+    /// 传递到 client/nameserver，返回纯 v4。修复前 client 用构造时静态
+    /// IpOption::all() 查询，AAAA 记录混入结果。
+    #[tokio::test]
+    async fn lookup_ip_v4_only_returns_pure_v4_serial() {
+        let c = make_filter_client("mix", None, mixed_family_ips());
+        let svc = make_service(vec![c], Vec::new());
+        let (ips, _) = svc.lookup_ip("mixed.example", v4_only()).await.unwrap();
+        assert!(
+            ips.iter().all(|ip| matches!(ip, IpAddr::V4(_))),
+            "ipv6_enable=false 应返回纯 v4，实际 {ips:?}"
+        );
+    }
+
+    /// 同上，并行路径：parallel_query 同样须传递 option。
+    #[tokio::test]
+    async fn lookup_ip_v4_only_returns_pure_v4_parallel() {
+        let c = make_filter_client("mix", None, mixed_family_ips());
+        let svc = make_service_cfg(vec![c], Vec::new(), true);
+        let (ips, _) = svc.lookup_ip("mixed.example", v4_only()).await.unwrap();
+        assert!(
+            ips.iter().all(|ip| matches!(ip, IpAddr::V4(_))),
+            "ipv6_enable=false 应返回纯 v4，实际 {ips:?}"
+        );
+    }
+
+    /// client 级 AND 语义（Go nameserver.go:174-175）：nameserver 自身
+    /// query_strategy=USE_IP4 时，请求 option=all 也只允许 v4 透传；
+    /// 请求与策略双双禁用同一族 → ErrEmptyResponse。
+    #[tokio::test]
+    async fn client_query_ip_ands_request_option_with_client_strategy() {
+        let client = make_filter_client("v4only", Some(QueryStrategy::UseIp4), mixed_family_ips());
+        let (ips, _) = client
+            .query_ip("mixed.example", IpOption::all())
+            .await
+            .unwrap();
+        assert!(
+            ips.iter().all(|ip| matches!(ip, IpAddr::V4(_))),
+            "client 策略 USE_IP4 应钳制请求 option，实际 {ips:?}"
+        );
+        let v6_only = IpOption {
+            ipv4_enable: false,
+            ipv6_enable: true,
+            fake_enable: false,
+        };
+        let res = client.query_ip("mixed.example", v6_only).await;
+        assert!(matches!(res, Err(DnsError::EmptyResponse)));
     }
 
     // ---- sort_clients 集成 logDecision（Go dns.go:293/309/315）----

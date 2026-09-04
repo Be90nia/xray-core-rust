@@ -187,15 +187,25 @@ impl Client {
         })
     }
 
-    /// 委托查询给内部 Server，并应用 expected/unexpected IP 过滤。
-    /// 对应 Go `(*Client).QueryIP` 的四分支过滤（nameserver.go 195-225）：
+    /// 委托查询给内部 Server：per-query option 先与 client 静态策略取 AND
+    /// （对应 Go nameserver.go:173-180，双双禁用即 ErrEmptyResponse），再应用
+    /// expected/unexpected IP 四分支过滤（nameserver.go 195-225）：
     /// 非 prior 的 expected 过滤空即 Err；非 unprior 的 unexpected 剥离空即 Err；
     /// actPrior/actUnprior 命中非空时替换结果集。
     pub fn query_ip<'a>(
         &'a self,
         domain: &'a str,
+        option: IpOption,
     ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>> {
-        let fut = self.server.query_ip(domain, self.ip_option);
+        let option = IpOption {
+            ipv4_enable: option.ipv4_enable && self.ip_option.ipv4_enable,
+            ipv6_enable: option.ipv6_enable && self.ip_option.ipv6_enable,
+            ..option
+        };
+        if !option.ipv4_enable && !option.ipv6_enable {
+            return Box::pin(async { Err(DnsError::EmptyResponse) });
+        }
+        let fut = self.server.query_ip(domain, option);
         Box::pin(async move {
             let (ips, ttl) = fut.await?;
             if ips.is_empty() {
@@ -452,7 +462,7 @@ mod tests {
             ttl: 60,
         });
         let client = Client::new(ns, IpOption::all(), server).unwrap();
-        let (ips, ttl) = client.query_ip("example.com").await.unwrap();
+        let (ips, ttl) = client.query_ip("example.com", IpOption::all()).await.unwrap();
         assert_eq!(ips.len(), 1);
         assert_eq!(ttl, 60);
     }
