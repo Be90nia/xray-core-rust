@@ -84,7 +84,7 @@ python dist/run_full32.py
 | 节点 | 根因 | 状态 | 剩余工作 |
 |---|---|---|---|
 | #9 #15 #32 vision partial | splice 后须绕外层 TLS 读 raw TCP | ✅ **已修**(raw_tcp_clone 穿透链+raw_fallback,874-877KB 真PASS,e5cc465) | 无 |
-| #1 #7 #18 argo+xhttp | splithttp 非 REALITY 路径=纯 rustls+hyper 池化 h2,未接 fingerprint;argo 边缘接受 rustls hello(ws/httpupgrade 同 hello h1 全 PASS)但卡 h2 组合;强制 stream-one 会 400(server 要 packet-up) | scout 已摸底(ArgoScout) | register.rs L152-190 else 块加 fingerprint→u_client 分支(抄 tcp/register.rs:83-120)+client.rs 加 DirectH2Client(样板 dialer.rs:543-560 http2::handshake)≈220-310 行;回归面=#4/#23 同带 fp=chrome 会切新路径;:authority 取值争议见 register.rs L52-55 注释 |
+| #1 #7 #18 argo+xhttp | **CF argo tunnel 按 TLS 栈指纹白名单放行(ArgoFix 40 轮迭代二分实证)**: Go TLS 栈=200 档(含无 fp 普通 hello)/python ssl=403/rustls=RST/btls=tarpit→RST;h2 帧字节已 MITM 重放排除;btls ClientHello 逐字节对齐 utls 后仍被拒——剩 3 处 BoringSSL 内部格式差异(ECH GREASE body 218B vs 186B/ALPS 6B vs 5B/cert_compression 4B vs 3B)不可配置;hyper 直握+DirectH2Client+参数对齐 Go(4MB/1GB/16KB/10MB/45s)均无效 | 未验收改动已回退(曾致 #4/#23 RST 回归,history://ArgoFix 可考) | 三选一: (1) patch BoringSSL 三处格式(btls-sys patch 机制,高难) (2) **h3/quinn 路径(改动最小,QUIC Initial 加密绕开 TCP TLS 栈检测;已探到 quinn✓/h3 握手✓/GET 发出✓ 但 10s 无响应,查 h3 头/回源/quinn 传输参数)** (3) 与节点方确认 CF zone bot 检测配置 |
 | #10-#13 #16 mlkem | vless ENC 架构错位 | 未动 | 2-3 天 |
 | #29 naive | hyper 1.10.1 CONNECT 三坑(body 被丢/200 body 空/SendRequest drop 触 GOAWAY) | ✅ **已修**(OnUpgrade 语义重写,874768B,2c01504) | 无 |
 | #31 anytls | 客户端不发 auth 帧+anytls-rs 0.3.5 漏 cmdSYN(sing-box 需显式 SYN 开流) | ✅ **已修**(auth 帧+Settings→SYN→PSH 帧序,877561B,f069f1c) | 无 |
