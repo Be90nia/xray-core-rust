@@ -55,21 +55,42 @@ where T: AsyncRead + AsyncWrite + Send + Unpin + 'static {
         .header("content-type", "application/grpc").header("te", "trailers")
         .body(()).map_err(io_err)?;
     let (resp_fut, mut send_stream) = send_req.send_request(req, false).map_err(io_err)?;
-    let resp = resp_fut.await.map_err(io_err)?;
-    let mut recv_stream = resp.into_body();
+    // Go grpc-gun 语义：HEADERS 发出后立即泵上行 DATA，不等待响应头——
+    // grpc server 收满一个完整 message 才回 :status 200；若先等响应头，
+    // 双方互等 → 服务端超时 RST（interop 实测 wire 证据）。
     let (client, server) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
         let (mut rd, mut wr) = tokio::io::split(server);
-        let s = async { let mut buf = vec![0u8; 32*1024]; loop {
-            let n = rd.read(&mut buf).await?;
-            if n==0 { let _=send_stream.send_data(Bytes::new(),true); break; }
-            send_stream.send_data(Bytes::copy_from_slice(&buf[..n]),false).map_err(io_err)?;
-        } Ok::<_,io::Error>(()) };
-        let r = async { while let Some(d)=recv_stream.data().await {
-            let d=d.map_err(io_err)?; wr.write_all(&d).await?;
-            let _=recv_stream.flow_control().release_capacity(d.len());
-        } Ok::<_,io::Error>(()) };
-        let _=tokio::try_join!(s,r);
+        let up = async {
+            let mut buf = vec![0u8; 32*1024];
+            loop {
+                let n = rd.read(&mut buf).await?;
+                if n==0 { let _=send_stream.send_data(Bytes::new(),true); break; }
+                // 每个 read chunk 一帧 gRPC message（hunk 载体，边界对上游流协议透明）
+                let frame = crate::encoding::encode_hunk_frame(&buf[..n]);
+                send_stream.send_data(Bytes::from(frame),false).map_err(io_err)?;
+            }
+            Ok::<_,io::Error>(())
+        };
+        let down = async {
+            let resp = resp_fut.await.map_err(io_err)?;
+            let mut recv_stream = resp.into_body();
+            let mut acc: Vec<u8> = Vec::new();
+            while let Some(d)=recv_stream.data().await {
+                let d=d.map_err(io_err)?;
+                let _=recv_stream.flow_control().release_capacity(d.len());
+                acc.extend_from_slice(&d);
+                // DATA 流是连续 gRPC frames，逐帧解出 Hunk payload 下发
+                loop {
+                    match crate::encoding::decode_hunk_frame(&acc, None).map_err(io_err)? {
+                        Some((used, data)) => { acc.drain(..used); wr.write_all(&data).await?; }
+                        None => break,
+                    }
+                }
+            }
+            Ok::<_,io::Error>(())
+        };
+        let _=tokio::try_join!(up,down);
     });
     Ok(Box::new(DuplexConn(client)))
 }
@@ -166,7 +187,7 @@ pub(crate) fn normalize_grpc_path(cfg: &Config) -> String {
         (cfg.service_name(), cfg.tun_stream_name())
     };
     let service = if raw_service.is_empty() {
-        "GunService".to_string()
+        "/GunService".to_string()
     } else if raw_service.starts_with('/') {
         raw_service
     } else {
