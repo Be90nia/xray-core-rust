@@ -105,6 +105,7 @@ async fn loopback_echo_works() {
     let client_config = ClientConfig::new(
         format!("127.0.0.1:{}", anytls_addr.port()),
         "localhost",
+        "test-password",
         make_client_config(&cert_der),
     );
     let client = AnytlsClient::new(client_config);
@@ -144,6 +145,7 @@ async fn loopback_large_payload() {
     let client_config = ClientConfig::new(
         format!("127.0.0.1:{}", anytls_addr.port()),
         "localhost",
+        "test-password",
         make_client_config(&cert_der),
     );
     let client = AnytlsClient::new(client_config);

@@ -15,9 +15,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anytls::proxy::session::Client as AnytlsClientInner;
+use anytls::core::{Command, Frame};
+use anytls::proxy::session::{Client as AnytlsClientInner, DEFAULT_SID};
 use anytls::runtime::DefaultPaddingFactory;
 use anytls::{AsyncReadWrite, DialOutFunc};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
 use tokio_rustls::TlsConnector;
 
@@ -34,6 +36,8 @@ pub struct ClientConfig {
     pub server_addr: String,
     /// TLS SNI（伪装域名）。
     pub sni: String,
+    /// 协议认证密码（`anytls://<password>@host:port`）。
+    pub password: String,
     /// TLS 客户端配置（验证服务端证书）。
     pub tls_config: Arc<rustls::ClientConfig>,
     /// 空闲会话检查间隔。
@@ -50,11 +54,13 @@ impl ClientConfig {
     pub fn new(
         server_addr: impl Into<String>,
         sni: impl Into<String>,
+        password: impl Into<String>,
         tls_config: Arc<rustls::ClientConfig>,
     ) -> Self {
         Self {
             server_addr: server_addr.into(),
             sni: sni.into(),
+            password: password.into(),
             tls_config,
             idle_check_interval: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(60),
@@ -74,25 +80,40 @@ impl AnytlsClient {
     pub fn new(config: ClientConfig) -> Self {
         let server_addr = config.server_addr.clone();
         let sni = config.sni.clone();
+        let password_sha256: [u8; 32] = Sha256::digest(config.password.as_bytes()).into();
         let tls_config = config.tls_config.clone();
+        let padding = DefaultPaddingFactory::load();
 
-        // dial_out：会话池 miss 时被调用，建立到 server 的 TLS 连接
+        // dial_out：会话池 miss 时被调用，建立到 server 的 TLS 连接。
+        // 协议要求（protocol.md Authentication）：TLS 握手完成后必须立即发送认证帧
+        // `sha256(password) || padding0_len(BE u16) || padding0`，不发则 server 拒识/挂起。
+        let dial_padding = padding.clone();
         let dial_out: DialOutFunc = Box::new(move || {
             let server_addr = server_addr.clone();
             let sni = sni.clone();
             let tls_config = tls_config.clone();
+            let padding = dial_padding.clone();
             Box::pin(async move {
                 let tcp = tokio::net::TcpStream::connect(&server_addr).await?;
                 let connector = TlsConnector::from(tls_config);
                 let server_name =
                     rustls::pki_types::ServerName::try_from(sni.clone())
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-                let tls = connector.connect(server_name, tcp).await?;
+                let mut tls = connector.connect(server_name, tcp).await?;
+                let padding_len = {
+                    let factory = padding.read().await;
+                    factory
+                        .generate_record_payload_sizes(0)
+                        .first()
+                        .copied()
+                        .unwrap_or(0) as u16
+                };
+                let auth_frame = build_auth_frame(&password_sha256, padding_len);
+                tls.write_all(&auth_frame).await?;
                 Ok(Box::new(tls) as Box<dyn AsyncReadWrite>)
             })
         });
 
-        let padding = DefaultPaddingFactory::load();
         let inner = AnytlsClientInner::new(
             dial_out,
             padding,
@@ -108,6 +129,12 @@ impl AnytlsClient {
     /// 流程：create_stream → 写 SOCKS5 目标 → spawn pump → 返回 duplex 包装。
     pub async fn dial(&self, target: &SocksAddr) -> Result<AnytlsConn> {
         let stream = self.inner.create_stream().await?;
+        // 补发 cmdSYN：anytls-rs 0.3.x 单流模式不再自动发 SYN，但 sing-box/anytls-go
+        // server 为多路复用语义——须收到 cmdSYN(sid=1) 才打开流，否则 Psh 被静默忽略。
+        // 帧序 Settings → SYN → PSH(socks target)，对齐 protocol.md packet 1 定义。
+        stream
+            .write_frame(Frame::new(Command::Syn, DEFAULT_SID))
+            .await?;
         // 协议要求：客户端在 stream 首帧写 SOCKS5 格式目标地址
         let socks_bytes = target.encode();
         stream.write(&socks_bytes).await?;
@@ -219,4 +246,54 @@ async fn pump_stream(
         let _ = session.terminate().await;
     };
     tokio::join!(down, up);
+}
+
+/// 构造 AnyTLS 认证帧（protocol.md Authentication，开销 34 字节 + padding0）：
+/// `sha256(password)`(32B) || padding0 长度（Big-Endian uint16）|| padding0（全零）。
+fn build_auth_frame(password_sha256: &[u8; 32], padding_len: u16) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(34 + padding_len as usize);
+    frame.extend_from_slice(password_sha256);
+    frame.extend_from_slice(&padding_len.to_be_bytes());
+    frame.resize(frame.len() + padding_len as usize, 0);
+    frame
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// sha256(b"test-password") 预期值（sha256sum 实算锚定，防算法被误改）。
+    const TEST_PASSWORD_SHA256_HEX: &str =
+        "c638833f69bbfb3c267afa0a74434812436b8f08a81fd263c6be6871de4f1265";
+
+    fn expected_sha256() -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (i, chunk) in TEST_PASSWORD_SHA256_HEX.as_bytes().chunks(2).enumerate() {
+            out[i] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 16).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn auth_frame_layout_matches_protocol() {
+        let sha: [u8; 32] = Sha256::digest(b"test-password").into();
+        assert_eq!(sha, expected_sha256());
+
+        // 默认 paddingScheme `0=30-30` → padding0 = 30B，总长 64B。
+        let frame = build_auth_frame(&sha, 30);
+        assert_eq!(frame.len(), 64);
+        assert_eq!(&frame[..32], &sha);
+        // padding0 长度 Big-Endian u16
+        assert_eq!(&frame[32..34], &[0x00, 0x1e]);
+        assert!(frame[34..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn auth_frame_zero_padding() {
+        let sha = expected_sha256();
+        let frame = build_auth_frame(&sha, 0);
+        assert_eq!(frame.len(), 34);
+        assert_eq!(&frame[..32], &sha);
+        assert_eq!(&frame[32..34], &[0x00, 0x00]);
+    }
 }

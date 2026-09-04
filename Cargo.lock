@@ -6132,6 +6132,7 @@ dependencies = [
  "async-trait",
  "rcgen 0.13.2",
  "rustls",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",

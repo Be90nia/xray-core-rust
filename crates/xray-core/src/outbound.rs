@@ -1772,7 +1772,7 @@ fn parse_dns_outbound_config(data: &[u8]) -> std::result::Result<xray_proxy_dns:
 
 /// 解析 anytls outbound settings JSON → ClientConfig。
 ///
-/// JSON 格式：`{ "server": "...", "server_port": 443, "sni": "...", "insecure": false }`
+/// JSON 格式：`{ "server": "...", "server_port": 443, "sni": "...", "insecure": false, "password": "..." }`
 fn parse_anytls_config(data: &[u8]) -> std::result::Result<xray_proxy_anytls::ClientConfig, String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
     let address = v
@@ -1792,6 +1792,10 @@ fn parse_anytls_config(data: &[u8]) -> std::result::Result<xray_proxy_anytls::Cl
         .get("insecure")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let password = v
+        .get("password")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     // 构造 rustls ClientConfig
     let _ = rustls::crypto::ring::default_provider().install_default();
     let tls_config = if insecure {
@@ -1810,6 +1814,7 @@ fn parse_anytls_config(data: &[u8]) -> std::result::Result<xray_proxy_anytls::Cl
     Ok(xray_proxy_anytls::ClientConfig::new(
         &format!("{address}:{port}"),
         sni,
+        password,
         Arc::new(tls_config),
     ))
 }
