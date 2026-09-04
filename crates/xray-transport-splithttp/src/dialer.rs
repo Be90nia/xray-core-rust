@@ -178,7 +178,6 @@ pub async fn dial_stream_one(
     let (pipe_client, pipe_server) = tokio::io::duplex(8192);
     let upload_stream = ReaderStream::new(pipe_server);
 
-    // 2. POST upload（等响应）
     let (response_opt, remote, local) = client
         .open_stream_uploading(&base_uri, &session_id, upload_stream, false)
         .await?;
@@ -562,19 +561,13 @@ where
         }
     });
 
-    // 创建上传 pipe
-    let (mut pipe_client, pipe_server) = tokio::io::duplex(8192);
-
-    // Pre-seed: write 1 byte to pipe_client before send_request so the h2 conn
-    // driver emits a DATA frame immediately after HEADERS. Without this,
-    // ReaderStream over the empty pipe_server returns Pending and the conn
-    // driver spawns a parked pipe task; sing-box (ss2022) then resets the
-    // stream on its idle timeout when no DATA arrives within the window.
-    use tokio::io::AsyncWriteExt;
-    pipe_client
-        .write_all(&[0u8])
-        .await
-        .map_err(|e| SplitHttpError::Hyper(format!("preseed pipe: {e}")))?;
+    // 创建上传 pipe。
+    // ponytail: 不要 pre-seed 任何字节进 pipe——Go dialer.go stream-one 分支没有
+    // pre-seed；写进去的字节会污染上行流（vless ENC handshake 的 clientHello 被
+    // 整体错位 1 字节 → 服务端 ML-KEM decapsulate 失败 → RST → 客户端 early eof）。
+    // sing-box idle-RST 场景由调用方 dial 后立即写首包（如 ENC clientHello 2388B）
+    // 自然满足，无 DATA 帧延迟窗口。
+    let (pipe_client, pipe_server) = tokio::io::duplex(8192);
 
     let upload_stream = ReaderStream::new(pipe_server);
 
@@ -798,7 +791,10 @@ mod tests {
     /// 收不到首帧 DATA 而在 idle timeout 后 RST_STREAM）。
     ///
     /// mock server：handshake 完成后立即记录 accept 时间，再读 request body 第一帧
-    /// DATA 并记录时间。断言 HEADERS → DATA 的间隔 < 200ms（旧实现会 Pending 无限）。
+    /// DATA 并记录时间。断言 HEADERS → DATA 的间隔 < 200ms。
+    /// （旧实现靠 pre-seed 1 字节进 pipe 保 DATA 及时——但该字节会污染上行流，
+    /// vless ENC handshake 被错位 1 字节导致服务端 RST。现由调用方 dial 后立即
+    /// 写首包保证 DATA 及时，本测试模拟该行为。）
     #[tokio::test]
     async fn dial_reality_stream_one_sends_data_immediately_after_headers() {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -821,6 +817,28 @@ mod tests {
                 .expect("accept")
                 .expect("request");
             let headers_at = std::time::Instant::now();
+            // 驱动 server Connection：flush 响应帧 / 接收 DATA（h2 的帧收发只在
+            // Connection::accept poll 时推进；不 spawn 此循环 200 帧滞留 → 客户端
+            // send_request 死等 → 与 #11 无关的 mock 侧假死）。
+            let mut driver_conn = conn;
+            tokio::spawn(async move {
+                loop {
+                    match driver_conn.accept().await {
+                        Some(Ok(_)) => continue,
+                        _ => break,
+                    }
+                }
+            });
+            // Go xray requestHandler 语义：POST 一到先回 200 响应头，下行流随后。
+            // （真实服务端若等首包才回 200，dial 会与首包写入形成死锁——#11 实测
+            // Go 服务端先回 200。）
+            let resp = http::Response::builder()
+                .status(200)
+                .body(())
+                .expect("response build");
+            let mut send = respond
+                .send_response(resp, false)
+                .expect("send_response");
 
             let _chunk = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
@@ -832,14 +850,6 @@ mod tests {
             .expect("DATA read error");
             let data_at = std::time::Instant::now();
             let gap = data_at.duration_since(headers_at);
-
-            let resp = http::Response::builder()
-                .status(200)
-                .body(())
-                .expect("response build");
-            let mut send = respond
-                .send_response(resp, false)
-                .expect("send_response");
             send.send_data(bytes::Bytes::from_static(b"hello"), true)
                 .expect("send_data");
 
@@ -859,12 +869,15 @@ mod tests {
             config,
         )
         .await;
-        assert!(result.is_ok(), "dial_reality_stream_one failed: {:?}", result.err());
+        let mut conn = result.expect("dial_reality_stream_one failed");
+        // 调用方语义：dial 后立即写首包（ENC clientHello / vless 头）。
+        use tokio::io::AsyncWriteExt;
+        conn.write_all(b"P").await.expect("first-packet write");
 
         let gap = server_task.await.expect("server task panicked");
         assert!(
             gap < std::time::Duration::from_millis(200),
-            "DATA frame should arrive within 200ms of HEADERS (pre-seeded pipe byte), got {gap:?}"
+            "DATA frame should arrive within 200ms of HEADERS (first packet written by caller), got {gap:?}"
         );
     }
 }
