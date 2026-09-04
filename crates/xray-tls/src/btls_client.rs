@@ -98,12 +98,11 @@ const CHROME_133_ALPN: &[u8] = b"\x02h2\x08http/1.1";
 
 /// Chrome 133 key shares（PQ X25519MLKEM768 + X25519）。
 /// 对应 Chrome 133 ClientHello 的 key_share 扩展。
-/// 注意: btls/BoringSSL 自动从 set_curves_list 的前 N 组生成 key share。
-/// ponytail: 只发 X25519。Chrome133 原生含 X25519MLKEM768,但 REALITY 服务端
-/// (xtls/reality)优先选 MLKEM768 组协商,而客户端 auth_key 派生只支持纯 X25519
-/// (SSL_get_x25519_key_share_private),服务端选 hybrid → auth_key 不一致 → 断连。
-/// 指纹保真度损失极小(key_share 顺序差异),换来 REALITY 端到端可用。
-const CHROME_133_KEY_SHARES: &[KeyShare] = &[KeyShare::X25519];
+/// ponytail: 加回 X25519_MLKEM768 key_share entry（之前只发 X25519 导致服务端选
+/// MLKEM768 时 key_share 为空 → 断连；Go uTLS Chrome 133 双发 GREASE + MLKEM768 + X25519，
+/// 与之对齐。REALITY 兼容问题此前测试时 VPS 端未严格选 MLKEM768 所以未暴露，
+/// 现在补回真 MLKEM768 key share 后 server 选 X25519 仍工作（xtls/reality 容忍）。
+const CHROME_133_KEY_SHARES: &[KeyShare] = &[KeyShare::X25519_MLKEM768, KeyShare::X25519];
 
 /// Chrome 133 ALPS 数据（h2）。
 const CHROME_133_ALPS: &[u8] = b"\x02h2";
@@ -184,8 +183,8 @@ const CHROME_131_CURVES: &str = CHROME_133_CURVES;
 /// Chrome 131 ALPN（与 Chrome 133 相同）。
 const CHROME_131_ALPN: &[u8] = CHROME_133_ALPN;
 
-/// Chrome 131 key shares（仅 X25519，无 PQ）。
-const CHROME_131_KEY_SHARES: &[KeyShare] = &[KeyShare::X25519];
+/// Chrome 131 key shares（PQ X25519MLKEM768 + X25519，与 Chrome 133 一致）。
+const CHROME_131_KEY_SHARES: &[KeyShare] = &[KeyShare::X25519_MLKEM768, KeyShare::X25519];
 
 /// Chrome 131 ALPS 数据（h2，与 Chrome 133 相同）。
 const CHROME_131_ALPS: &[u8] = CHROME_133_ALPS;
@@ -257,9 +256,9 @@ const CHROME_120_CIPHER_LIST: &str = CHROME_133_CIPHER_LIST;
 #[cfg(test)]
 const CHROME_120_SIGALGS: &str = CHROME_133_SIGALGS;
 
-/// Chrome 120 supported groups（与 Chrome 133 相同，无 PQ）。
+/// Chrome 120 supported groups（无 PQ，MLKEM768 是 Chrome 131+ 特性）。
 #[cfg(test)]
-const CHROME_120_CURVES: &str = CHROME_133_CURVES;
+const CHROME_120_CURVES: &str = "X25519:P-256:P-384";
 
 /// Chrome 120 ALPN（与 Chrome 133 相同）。
 #[cfg(test)]
