@@ -1118,8 +1118,11 @@ mod tests {
 
         // open a data stream
         let stream = transport.open_stream(&conn).await.expect("open_stream");
-        // client=false：纯 echo 验证 QUIC stream 双向通（FrameTypeTCPRequest 前缀由 conn.rs 单测覆盖）
-        let isc = Arc::new(InterStreamConn::new(stream, conn.local_addr(), conn.remote_addr(), false));
+        // client=true：协议要求首写带 varint(FrameTypeTCPRequest) 前缀——server 的
+        // serve_hysteria_connection 读到 0x401 才会经 on_new_conn 投递（生产
+        // ClientInstance::tcp 同款；client=false 裸写会被 server 当未知 frame type
+        // cancel_read 掉 → 本测试超时）。
+        let isc = Arc::new(InterStreamConn::new(stream, conn.local_addr(), conn.remote_addr(), true));
 
         // quinn 0.11 的 open_bi 是 lazy 的——STREAM frame 延迟到首次 write 才发出。
         // 故 client 必须先 write 再等 on_new_conn，否则 server accept_bi 永不返回。
@@ -1237,7 +1240,7 @@ mod tests {
 
         // bidi stream echo（双向数据均过 XOR）
         let stream = transport.open_stream(&conn).await.expect("open_stream");
-        let isc = Arc::new(InterStreamConn::new(stream, conn.local_addr(), conn.remote_addr(), false));
+        let isc = Arc::new(InterStreamConn::new(stream, conn.local_addr(), conn.remote_addr(), true));
         let payload = b"salamander obfs echo!";
         isc.write(payload).await.expect("client write");
 
@@ -1337,7 +1340,7 @@ mod tests {
             .expect("dial + auth should succeed");
 
         let stream = transport.open_stream(&conn).await.expect("open_stream");
-        let isc = Arc::new(InterStreamConn::new(stream, conn.local_addr(), conn.remote_addr(), false));
+        let isc = Arc::new(InterStreamConn::new(stream, conn.local_addr(), conn.remote_addr(), true));
         let payload = b"hello brutal!";
         isc.write(payload).await.expect("client write");
 

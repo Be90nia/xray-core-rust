@@ -280,6 +280,30 @@ mod tests {
     use xray_common::net::address::Address;
     use xray_common::uuid::UUID;
 
+    /// 读一个 Vision padding 块：`[uuid(16, 仅首块)][command(1)][content_len(2 BE)]
+    /// [padding_len(2 BE)][content][padding]`。`has_uuid` = 首块（带 uuid 前缀）。
+    /// 返回 (uuid, command, content, padding_len)。
+    async fn read_vision_block(
+        sock: &mut tokio::net::TcpStream,
+        has_uuid: bool,
+    ) -> (Option<Vec<u8>>, u8, Vec<u8>, usize) {
+        use tokio::io::AsyncReadExt;
+        let mut hdr = vec![0u8; if has_uuid { 21 } else { 5 }];
+        sock.read_exact(&mut hdr).await.unwrap();
+        let (uuid, off) = if has_uuid {
+            (Some(hdr[..16].to_vec()), 16)
+        } else {
+            (None, 0)
+        };
+        let content_len = ((hdr[off + 1] as usize) << 8) | hdr[off + 2] as usize;
+        let pad_len = ((hdr[off + 3] as usize) << 8) | hdr[off + 4] as usize;
+        let mut content = vec![0u8; content_len];
+        sock.read_exact(&mut content).await.unwrap();
+        let mut pad = vec![0u8; pad_len];
+        sock.read_exact(&mut pad).await.unwrap();
+        (uuid, hdr[off], content, pad_len)
+    }
+
     #[test]
     fn config_server_destination_roundtrip() {
         let uuid = UUID::new();
@@ -356,21 +380,23 @@ mod tests {
         assert_eq!(flow, "xtls-rprx-vision", "flow must reach server request header");
     }
 
-    /// flow=XRV 时 make_dial_fn 返回的连接必须已包 VisionConn：首个业务写入
-    /// 在线上是 Vision padding 帧 `[uuid(16)][command][content_len(2 BE)]
-    /// [padding_len(2 BE)][content]`，而非裸 payload。未包装 → 首字节非 uuid → fail。
+    /// flow=XRV 时 make_dial_fn 返回的连接必须已包 VisionConn。线上形态：
+    /// 首块 = dial 内 write_uuid_only_padding 发出的 uuid-only padding 块
+    /// `[uuid(16)][command][content_len=0][padding_len][padding]`；首个业务
+    /// 写入 = 第二个 padding 块（uuid 已消费，无前缀）。未包装 → 首字节非
+    /// uuid / 业务内容裸奔 → fail。
     #[tokio::test]
     async fn make_dial_fn_wraps_conn_with_vision_when_flow_xrv() {
         use crate::encryption::vision::COMMAND_PADDING_CONTINUE;
         use crate::encoding::server::decode_request_header;
         use tokio::time::{timeout, Duration};
         use crate::{MemoryAccount, MemoryUser, MemoryValidator, Validator as _};
-        use tokio::io::AsyncReadExt as _;
         use xray_proto::xray::proxy::vless::Account as ProtoAccount;
 
         let test_uuid = UUID::parse("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap();
+        let server_uuid = test_uuid.as_bytes().to_vec();
 
-        // fake VLESS server：decode 请求头 → 回响应头 → 裸读线上首段业务字节
+        // fake VLESS server：decode 请求头 → 回响应头 → 读 uuid-only 块 → 读业务块
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let validator = MemoryValidator::new();
@@ -384,13 +410,19 @@ mod tests {
             let _ = decode_request_header(false, &mut None, &mut sock, &validator)
                 .await
                 .unwrap();
-            crate::encoding::server::encode_response_header(&mut sock, VERSION, &empty_addons())
-                .await
-                .unwrap();
-            // uuid(16)+command(1)+content_len(2)+padding_len(2)+payload(14) = 35
-            let mut wire = [0u8; 35];
-            sock.read_exact(&mut wire).await.unwrap();
-            wire.to_vec()
+            // 注：此处不回 VLESS 响应头——本测试只验证上行 wire 形态，client
+            // 不读；若先写响应头，client 关闭时接收队列有未读数据 → Windows
+            // 以 RST 代 FIN → server 后续 read_exact 以 10053 中断。
+            // 首块：uuid-only padding
+            let (uuid1, cmd1, content1, _) = read_vision_block(&mut sock, true).await;
+            assert_eq!(uuid1.as_deref(), Some(server_uuid.as_slice()), "first block must start with user uuid");
+            assert_eq!(cmd1, COMMAND_PADDING_CONTINUE, "data frame command");
+            assert!(content1.is_empty(), "uuid-only block carries no content");
+            // 第二块：业务 payload（uuid 写一次后不再出现）
+            let (uuid2, cmd2, content2, _) = read_vision_block(&mut sock, false).await;
+            assert!(uuid2.is_none(), "uuid must be written exactly once");
+            assert_eq!(cmd2, COMMAND_PADDING_CONTINUE, "data frame command");
+            content2
         });
 
         // client：make_dial_fn（flow=xtls-rprx-vision）
@@ -409,26 +441,22 @@ mod tests {
         conn.flush().await.unwrap();
         drop(conn);
 
-        let wire = timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
         let payload: &[u8] = b"vision-payload";
+        let content = timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
         assert_eq!(
-            &wire[..16],
-            test_uuid.as_bytes(),
-            "first uplink block must start with user uuid"
+            content, payload,
+            "business block content must be the payload verbatim"
         );
-        assert_eq!(wire[16], COMMAND_PADDING_CONTINUE, "data frame command");
-        assert_eq!(&wire[17..19], &[0, payload.len() as u8], "content_len BE");
-        assert_eq!(&wire[21..21 + payload.len()], payload, "content after frame header");
     }
 
     /// 回归（#9/#15/#32 early eof 根因）：dial 不得阻塞等待响应头。Go 服务端
     /// 响应头经 SetFlushNext 缓冲到首个下行数据才 flush——mock 服务端模拟该
-    /// 时序：收到首个 vision padding 块之后才写响应头。旧行为（dial 内同步
+    /// 时序：读完 uuid-only 块 + 业务块之后才写响应头。旧行为（dial 内同步
     /// decode_response_header）在此死锁 → 本测试超时失败。
     #[tokio::test]
     async fn vision_dial_returns_before_deferred_response_header() {
         use crate::encoding::server::decode_request_header;
-        use crate::encryption::vision::xtls_padding;
+        use crate::encryption::vision::{xtls_padding, COMMAND_PADDING_CONTINUE};
         use crate::{MemoryAccount, MemoryUser, MemoryValidator, Validator as _};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
@@ -436,6 +464,7 @@ mod tests {
         use xray_proto::xray::proxy::vless::Account as ProtoAccount;
 
         let test_uuid = UUID::parse("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap();
+        let server_uuid = test_uuid.as_bytes().to_vec();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -445,25 +474,24 @@ mod tests {
         let account = MemoryAccount::from_proto_account(&proto_account).unwrap();
         validator.add(MemoryUser::new("u", 0, account)).unwrap();
 
-        // mock Go 服务端时序：请求头 → 等 client 首块 vision padding（uuid 前缀）
-        // → 此时才回「响应头 + vision padding 块（echo）」
+        // mock Go 服务端时序：请求头 → uuid-only 块 → 业务块 → 此时才回
+        // 「响应头 + vision padding 块（echo 业务内容）」
         let payload: Vec<u8> = b"inner-clienthello".to_vec();
-        let server_uuid = test_uuid.as_bytes().to_vec();
+        let server_payload = payload.clone();
         let server = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let _ = decode_request_header(false, &mut None, &mut sock, &validator)
                 .await
                 .unwrap();
-            // 读首块 padding：uuid(16) + cmd(1) + content_len(2) + pad_len(2) + content
-            let mut hdr = [0u8; 21];
-            sock.read_exact(&mut hdr).await.unwrap();
-            assert_eq!(&hdr[..16], &server_uuid[..], "server must see uuid-prefixed block");
-            let content_len = ((hdr[17] as usize) << 8) | hdr[18] as usize;
-            let pad_len = ((hdr[19] as usize) << 8) | hdr[20] as usize;
-            let mut content = vec![0u8; content_len];
-            sock.read_exact(&mut content).await.unwrap();
-            let mut pad = vec![0u8; pad_len];
-            let _ = sock.read_exact(&mut pad).await; // padding 字节可能与其他数据合并到达
+            // 首块：uuid-only padding（此时尚未回响应头——dial 必须已先行返回）
+            let (uuid1, cmd1, content1, _) = read_vision_block(&mut sock, true).await;
+            assert_eq!(uuid1.as_deref(), Some(server_uuid.as_slice()), "server must see uuid-prefixed block");
+            assert_eq!(cmd1, COMMAND_PADDING_CONTINUE);
+            assert!(content1.is_empty());
+            // 业务块：client 首个 payload
+            let (uuid2, _, content2, _) = read_vision_block(&mut sock, false).await;
+            assert!(uuid2.is_none());
+            assert_eq!(content2, server_payload, "server must receive the business payload");
             // 首块下行数据触发响应头 flush（Go SetFlushNext 语义）
             crate::encoding::server::encode_response_header(&mut sock, VERSION, &empty_addons())
                 .await
@@ -471,8 +499,8 @@ mod tests {
             let mut uuid_opt = Some(server_uuid.clone());
             let mut rng = rand::rngs::StdRng::from_os_rng();
             let block = xtls_padding(
-                Some(&content),
-                crate::encryption::vision::COMMAND_PADDING_CONTINUE,
+                Some(&content2),
+                COMMAND_PADDING_CONTINUE,
                 &mut uuid_opt,
                 false,
                 &crate::encryption::vision::DEFAULT_PADDING_SEED,
@@ -480,7 +508,7 @@ mod tests {
             );
             sock.write_all(&block).await.unwrap();
             sock.flush().await.unwrap();
-            content
+            content2
         });
 
         let cfg = Arc::new(
