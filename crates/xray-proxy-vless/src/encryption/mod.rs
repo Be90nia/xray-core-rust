@@ -227,6 +227,14 @@ impl ClientInstance {
                 index = 1088;
             }
 
+            // Go client.go:98-99：XorMode>0 → NewCTR(NfsPKeysBytes[j], iv) XOR 本段，
+            // 让 X25519 pub / ML-KEM ct 与随机字节可区分；server 端持派生公钥
+            // 以同一 CTR 还原（Go server.go:142-143）。缺失 → xor_mode>0 时
+            // server 还原出垃圾 → ECDH/decapsulate 必败。
+            if self.xor_mode > 0 {
+                let mut ctr = CtrXor::new(pk, &iv)?;
+                ctr.apply(&mut client_hello[pos..pos + index]);
+            }
             // lastCTR: XOR 当前段前32字节（防 relay 替换）
             if let Some(mut ctr) = last_ctr.take() {
                 ctr.apply(&mut client_hello[pos..pos + 32]);
@@ -302,9 +310,9 @@ impl ClientInstance {
     /// 完整流程：relay chain → pfsKeyExchange → 发送 clientHello → 读服务端响应 →
     /// 派生 UnitedKey → 构造加密 CommonConn。
     ///
-    /// # 阶段 A 限制
-    /// - `xor_mode == 2`（XorConn）：未实现
-    /// - `seconds > 0`（0-RTT）：未实现
+    /// # 行为说明
+    /// - `xor_mode == 2`：末段包 XorConn（读 CTR=ticket、写 CTR=iv，对齐 Go client.go:206-207）
+    /// - `seconds > 0` 且有未过期缓存：走 0-RTT 快路径（Go client.go:113-129）
     /// - padding：最小 34 字节（不分段发送）
     ///
     /// # Errors
@@ -566,8 +574,7 @@ enum NfsSKey {
 /// [`ServerInstance::init`] 解析私钥；[`ServerInstance::handshake`] 解密客户端握手。
 ///
 /// # 阶段 B 限制
-/// - `xor_mode == 2`（XorConn）：未实现
-/// - 0-RTT（`seconds_from/to > 0` + ticket session 管理）：未实现
+/// - 0-RTT（`seconds_from/to > 0` + ticket session 管理）：未实现（客户端 ticket 请求被拒）
 /// - padding 分段发送：简化为一次发送
 pub struct ServerInstance {
     /// NFS 私钥数组（按 init 顺序）。
@@ -911,8 +918,8 @@ impl ServerInstance {
         if self.xor_mode == 2 {
             let xor_conn = crate::encryption::xor_conn::XorConn::new(
                 conn,
-                CtrXor::new(&united_key_bytes, &ticket_arr)?,    // 读：解密客户端 write_ctr
-                CtrXor::new(&united_key_bytes, &iv)?,            // 写：加密（iv 与 client 写侧一致）
+                CtrXor::new(&united_key_bytes, &iv)?,         // 读：解密 client 写侧 CTR(iv)（Go server.go:325 PeerCTR）
+                CtrXor::new(&united_key_bytes, &ticket_arr)?, // 写：加密给 client 读侧 CTR(ticket)（Go server.go:325 CTR）
             );
             Ok(Box::new(xor_conn))
         } else {

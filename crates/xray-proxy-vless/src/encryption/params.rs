@@ -138,8 +138,8 @@ mod tests {
 
     #[test]
     fn parses_mlkem768_pub() {
-        // 1184B ML-KEM ek = 1578 chars base64url no-pad（ceil(1184*4/3) = 1579, no-pad ≈ 1578）
-        let b64ml: String = "A".repeat(1578);
+        // 1184B ML-KEM ek = 1579 chars base64url no-pad（395 组 x4 - 1 padding）
+        let b64ml: String = "A".repeat(1579);
         let raw = format!("mlkem768x25519plus.native.0rtt.{b64ml}");
         let p = parse_client_encryption(&raw).expect("parse");
         assert_eq!(p.keys.len(), 1);
@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn parses_real_vps_link() {
         // 实际 VPS 节点 #10 mlkem 链接
-        let raw = "mlkem768x25519plus.native.0rtt.nOBcbXEFa0hjb-hGAfGBK5g96NmCpWA4nrtKRESyvsu8Gtl0LYLAEphydgeiNzlxOoYmt3tHBKkl68W3fEwlYfh8ZQtDvGl7K6IV1MVDQBtLieGbVkiVXYvFcpLEYFlO3LIxsOwHwGAy4umunqOGQOmDfbBOtAltcLWHInkLzqR7uEfGcXIDV2RvC1YD20oPuNmKZRO_s0vI9wbBzmxmCcwpk5ZiO2eNBekwu3xC42lZ8St05IlVcFFDfbkJk5SM8qqy1QpFMvhHBSW_78NQzMxOdkcjwMfKTqnHqacZ2cGmWZer2iGSBCU0UZSG6RyQA_YaCMmXr-OzDEdZ6sBQshsjmMOD91geV5JQdzQmHyULQhqkdhtLQYiOpalba9a0yWOFmFsAPgw3rujFN7CLbiF1LgEXqEWOtEUYu7uDzgKw_OyTk9LDsZsSZgZh6MoaQeY_wIa7jotBB8pEz7O-nQpwSnI-5HxVxfuqFzYTOwULZ2dfjVQ_MSc-cHJA0uY_hPYkrXx6IQNa3qB88mLOw_hP7CJgP4gZYTuWOxtAVarEeRJkwIV9e0hPpquzJIuFvMu0CUqeewsAabptsqBfp4soxWEcOUNZBGNJdbBAEZsfqfvOnrYgDOKSrstswxOeYlckdVix5BUHMQmuz4tJp-IKZ-e59xGyHAYp-KYxSknErbUgnjIJ1wFVb-Ms7AKjQ3gh_-KyB";
+        let raw = "mlkem768x25519plus.native.0rtt.nOBcbXEFa0hjb-hGAfGBK5g96NmCpWA4nrtKRESyvsu8Gtl0LYLAEphydgeiNzlxOoYmt3tHBKkl68W3fEwlYfh8ZQtDvGl7K6IV1MVDQBtLieGbVkiVXYvFcpLEYFlO3LIxsOwHwGAy4umunqOGQOmDfbBOtAltcLWHInkLzqR7uEfGcXIDV2RvC1YD20oPuNmKZRO_s0vI9wbBzmxmCcwpk5ZiO2eNBekwu3xC42lZ8St05IlVcFFDfbkJk5SM8qqy1QpFMvhHBSW_78NQzMxOdkcjwMfKTqnHqacZ2cGmWZer2iGSBCU0UZSG6RyQA_YaCMmXr-OzDEdZ6sBQshsjmMOD91geV5JQdzQmHyULQhqkdhtLQYiOpalba9a0yWOFmFsAPgw3rujFN7CLbiF1LgEXqEWOtEUYu7uDzgKw_OyTk9LDsZsSZgZh6MoaQeY_wIa7jotBB8pEz7O-nQpwSnI-5HxVxfuqFzYTOwULZ2dfjVQ_MSc-cHJA0uY_hPYkrXx6IQNa3qB88mLOw_hP7CJgP4gZYTuWOxtAVarEeRJkwIV9e0hPpquzJIuFvMu0CUqeewsAabptsqBfp4soxWEcOUNZBGNJdbBAEZsfqfvOnrYgDOKSrstswxOeYlckdVix5BUHMQmuz4tJp-IKZ-e59xGyHAYp-KYxSknErbUgnjIJ1wFVb-Ms7AKjQ3gh_-KyBlhOAZWRXIljBiyefrS8beQAl1SbtAeum7jFT4tHspA-GQJFfOu1hgR0SpgYaUWKiqFAHoKBm2fAOdqGXHnOD9C5laosYUWsHMi3bmKAacE2qnI1oJWy90K962Wp5KDN9bIxDgtoPYyFb7MVzERIxYU65SR1r6nKnKQexsB6mHlM74zB9Bi__9FK8tRFYEmXNIsQIaq0YPVSHyyL3Gtq0Ei5E8AFELRip9FLnwZ1qoYzS1OxWsqbPOiXkei_ORDLgzteFUVEjVsuGUNy_HQ7mXBueCvBO3qn-rcaXRyti5xFsoAjcFsb2gRO7AuOmOmQsDmrcPkosoUoZnZUjtt2UyJNKmxVW2m6WybJIlMbyagttwQpQAVCgng41GmVEAxN5zV6MwgXHxan45SfHxoaa0yh9RO5KZGzYTEdOxFTP6Iscgk9xKtoe5kmIHqLuYuLo3hBnXUf2dMksHxyqfYzVpJzC5XA2YfK01HOP7SG91J54hyLKhZoGEwdbCuUKikMfjQYgIKLo_Yq0fFqOIG-IxofaxCO8Nk_kOPDc_OlkLk7mzQtdhZsyBCkygWksBpPODgU_SBh_TI4Llcg5elHHZLGBGnN70scrUZyVnxEyEYwK0OWPRcwv8RG-WwLV_dlDmIMMEKLwkFb2dhFs9M76BIjjmNH6MYFfGY8WJlgn1hs4GPFLMRX6JtACclPqTV24Eh38ReQltfGhEVFc-l7I_SjdjeFTmp0dnSz_7YihuVmb7SorURMiiAW9Kw-JUCT_ec8jYRaJxBfzZMbtRsIZQsFdhRQr0aBQJxb2cHMMuaM1rJDuQcAwYxb6_3DDmRYrqr6tArgwR1lEc00NcLMLbhaxnXgnYpTunA";
         let p = parse_client_encryption(raw).expect("parse real link");
         // VPS 公钥应是 ML-KEM-768 (1184B)
         assert!(p.keys.iter().any(|k| k.len() == 1184), "expected 1184B ML-KEM ek, got lens {:?}", p.keys.iter().map(|k| k.len()).collect::<Vec<_>>());

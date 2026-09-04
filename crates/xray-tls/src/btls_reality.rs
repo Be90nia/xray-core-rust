@@ -5,10 +5,10 @@
 //!
 //! - **指纹层**：BoringSSL 原生浏览器 ClientHello（Chrome/Firefox/Safari/...，
 //!   cipher 顺序/扩展/GREASE 均由 BoringSSL 生成，DPI 无法区分）。
-//! - **REALITY 层**：在 ClientHello record 写出前（BIO 拦截）回调钩子改写
-//!   session_id 字段（32 字节等长替换，不改 record 长度）；握手完成后回调
-//!   证书验证（对应 Go `reality.UClient` 的 `hello.SessionId` 注入 +
-//!   `VerifyPeerCertificate`）。
+//! - **REALITY 层**：在 ClientHello 计入 transcript 前（BoringSSL
+//!   `ssl_add_message_cbb` 回调）改写 session_id 字段（32 字节等长替换）；
+//!   握手完成后回调证书验证（对应 Go `reality.UClient` 的 `hello.SessionId`
+//!   注入 + `VerifyPeerCertificate`）。
 //!
 //! 对应 Go 语义（`transport/internet/reality/reality.go:133-177`）：
 //! `tls.GetFingerprint` → `utls.UClient`（浏览器指纹握手）→ `BuildHandshakeState`
@@ -143,24 +143,14 @@ pub fn x25519_key_share_private(ssl: &SslRef) -> Option<[u8; 32]> {
     x25519_key_share_private_raw(ssl.as_ptr())
 }
 
-/// 拦截流：ClientHello record 写出前回调 [`RealityHooks::rewrite_client_hello`]。
+/// BIO 侧透传流：`SslStream` 的底层连接包装。
 ///
-/// 包装底层流塞进 `SslStream` 的 BIO 侧：BoringSSL 握手写 ClientHello 时，
-/// 数据经过本流的 `poll_write`，改写后再落底层流。
+/// REALITY 的 ClientHello 改写已迁移至 `ssl_add_message_cbb` trampoline
+/// （[`register_reality_hooks`]）——BIO 层改写会让 transcript 与线上 bytes
+/// 不一致 → 握手密钥全部错乱（BAD_DECRYPT），本流只做透明转发。
 pub struct HelloRewriteStream<S> {
     inner: S,
-    hooks: Option<Arc<dyn RealityHooks>>,
-    /// SSL 裸指针：仅用于在回调内构造 `&SslRef` 导出 key share 私钥。
-    ///
-    /// SAFETY: 指针指向的 SSL 由外层 `SslStream` 拥有；回调只发生在握手
-    /// （`SslStream::connect`）期间，此时 SslStream 存活，指针有效。
-    /// `None`（测试用）跳过钩子直接透传。
-    ssl_ptr: Option<*mut btls_sys::SSL>,
 }
-
-// SAFETY: ssl_ptr 仅在 poll_write（握手窗口）解引用，SslStream 存活期间
-// SSL 不跨线程释放；hooks 为 Arc<dyn RealityHooks>（Send+Sync）。
-unsafe impl<S: Send> Send for HelloRewriteStream<S> {}
 
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for HelloRewriteStream<S> {
     fn poll_read(
@@ -178,21 +168,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for HelloRewriteStream<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        // 每次写都回调（首个 ClientHello + HRR 后的第二个都覆盖）；
-        // 非握手数据（CCS record、应用数据）由 hooks 内部自行跳过。
-        if let (Some(hooks), Some(ssl_ptr)) = (&self.hooks, self.ssl_ptr) {
-            // SAFETY: 见结构体文档——握手窗口内 SslStream 持有该 SSL。
-            let ssl = unsafe { SslRef::from_ptr(ssl_ptr) };
-            // SAFETY: BIO write buffer 在 poll_write 期间归 BIO 层所有且可写；
-            // hooks 的契约是等长原地替换（见 trait 文档）。经 as_ptr 取裸指针
-            // 构造可变切片，避免 &T→&mut T 引用转换 UB。
-            let record = unsafe {
-                std::slice::from_raw_parts_mut(buf.as_ptr().cast_mut(), buf.len())
-            };
-            if let Err(e) = hooks.rewrite_client_hello(ssl, record) {
-                return Poll::Ready(Err(e));
-            }
-        }
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
@@ -205,8 +180,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for HelloRewriteStream<S> {
     }
 }
 
-// SAFETY: 同 Send——ssl_ptr 仅在握手窗口解引用，无并发访问路径。
-unsafe impl<S: Send> Sync for HelloRewriteStream<S> {}
 
 impl<S: Connection + Unpin> Connection for HelloRewriteStream<S> {
     fn remote_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
@@ -260,11 +233,7 @@ where
     // 不一致导致握手密钥错乱（BAD_DECRYPT）。
     let ssl_key = ssl.as_ptr() as usize;
     register_reality_hooks(ssl_key, Arc::clone(&hooks));
-    let rewrite_stream = HelloRewriteStream {
-        inner: stream,
-        hooks: None,
-        ssl_ptr: None,
-    };
+    let rewrite_stream = HelloRewriteStream { inner: stream };
 
     let tls_stream = TokioSslStream::new(ssl, rewrite_stream)
         .map_err(|e| io::Error::other(e.to_string()))?;
@@ -308,40 +277,11 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (client, mut server) = tokio::io::duplex(1024);
-        let mut rw = HelloRewriteStream { inner: client, hooks: None, ssl_ptr: None };
+        let mut rw = HelloRewriteStream { inner: client };
         rw.write_all(&[5, 1, 2, 3]).await.unwrap();
         let mut buf = [0u8; 4];
         server.read_exact(&mut buf).await.unwrap();
         assert_eq!(buf, [5, 1, 2, 3]);
     }
 
-    /// 有 hooks 时回调可等长改写（标志翻转），长度不变、后续透传。
-    #[tokio::test]
-    async fn hello_rewrite_stream_rewrites_in_place() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        struct FlipHooks;
-        impl RealityHooks for FlipHooks {
-            fn rewrite_client_hello(&self, _ssl: &SslRef, record: &mut [u8]) -> io::Result<()> {
-                for b in record.iter_mut() {
-                    *b ^= 0xff;
-                }
-                Ok(())
-            }
-            fn verify_handshake(&self, _ssl: &SslRef) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let (client, mut server) = tokio::io::duplex(1024);
-        let mut rw = HelloRewriteStream {
-            inner: client,
-            hooks: Some(Arc::new(FlipHooks)),
-            ssl_ptr: None, // hooks 不解引用 ssl → null 安全
-        };
-        rw.write_all(&[0x00, 0x0f, 0xf0]).await.unwrap();
-        let mut buf = [0u8; 3];
-        server.read_exact(&mut buf).await.unwrap();
-        assert_eq!(buf, [0xff, 0xf0, 0x0f]);
-    }
 }
