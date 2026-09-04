@@ -368,12 +368,38 @@ pub(crate) async fn resolve_dest_domain(
     }
     match result {
         Ok((ips, _)) if !ips.is_empty() => {
-            let idx = rand::thread_rng().gen_range(0..ips.len());
-            Ok(ips[idx])
+            let usable = filter_by_interface_family(ips, has_v4, has_v6);
+            if usable.is_empty() {
+                return Err(
+                    "wireguard: no DNS candidate matches interface address families".to_string(),
+                );
+            }
+            let idx = rand::thread_rng().gen_range(0..usable.len());
+            Ok(usable[idx])
         }
         Ok(_) => Err("wireguard: empty DNS response".to_string()),
         Err(e) => Err(format!("wireguard: DNS lookup failed: {e}")),
     }
+}
+
+/// 按接口地址族过滤候选 IP（保持原有顺序）。
+///
+/// smoltcp 接口只配了 v4（或只配了 v6）地址时，选中另一族目标会让 connect
+/// 进入无源地址的 SynSent——SYN 无响应直到 `wait_tcp_connected` 超时。
+/// 上游 DNS（`xray-app-dns` serial/parallel_query 当前丢弃顶层 IpOption，
+/// 返回混合族列表）无法依赖，故在此出口处强制约束。
+#[must_use]
+fn filter_by_interface_family(
+    ips: Vec<std::net::IpAddr>,
+    has_v4: bool,
+    has_v6: bool,
+) -> Vec<std::net::IpAddr> {
+    ips.into_iter()
+        .filter(|ip| match ip {
+            std::net::IpAddr::V4(_) => has_v4,
+            std::net::IpAddr::V6(_) => has_v6,
+        })
+        .collect()
 }
 
 /// Destination（仅 IP）→ smoltcp IpEndpoint。
@@ -739,6 +765,49 @@ mod tests {
         )
         .await;
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn interface_family_filter_mixed_candidates() {
+        let v4 = |o: [u8; 4]| std::net::IpAddr::V4(std::net::Ipv4Addr::from(o));
+        let v6 = |s: u16| std::net::IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0x4860, 0, 0, 0, 0, 0, s));
+        let mixed = vec![v4([1, 2, 3, 4]), v6(1), v4([5, 6, 7, 8]), v6(2)];
+
+        // v4-only 接口（172.16.0.2/32 常见配置）：混合候选必须全部收敛为 v4。
+        // 上游 DNS serial_query 丢弃顶层 IpOption 返回混合族列表，
+        // 不过滤时 dice 以 50% 概率选中 v6 → smoltcp 无源地址 → SYN 黑洞超时。
+        let got = filter_by_interface_family(mixed.clone(), true, false);
+        assert_eq!(got, vec![v4([1, 2, 3, 4]), v4([5, 6, 7, 8])]);
+
+        // v6-only 接口：对称约束。
+        let got = filter_by_interface_family(mixed.clone(), false, true);
+        assert_eq!(got, vec![v6(1), v6(2)]);
+
+        // 双族接口：全保留（原顺序）。
+        let got = filter_by_interface_family(mixed.clone(), true, true);
+        assert_eq!(got, mixed);
+
+        // 候选与接口族完全无交集 → 空（调用方报错，而非静默选中后挂 5s）。
+        let got = filter_by_interface_family(vec![v4([9, 9, 9, 9])], false, true);
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_dest_domain_rejects_candidates_outside_interface_families() {
+        // hosts 只有 v4 记录 + v6-only 接口：现有 family_constraint 测试
+        // （上方）由 hosts 层过滤产生 Err；此处覆盖出口过滤分支——
+        // v4-only 接口 + v4-only 记录正常解析（回归面：过滤不得误杀合法候选）。
+        let dns = hosts_dns().await;
+        let ip = resolve_dest_domain(
+            "wg-test.invalid",
+            crate::config::DomainStrategy::ForceIp,
+            true,
+            false,
+            &dns,
+        )
+        .await
+        .expect("v4-only interface with v4 record resolves");
+        assert!(ip.is_ipv4());
     }
 
     fn udp_ip_cidr() -> smoltcp::wire::IpCidr {
