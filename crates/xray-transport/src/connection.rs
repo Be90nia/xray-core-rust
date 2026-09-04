@@ -48,6 +48,16 @@ pub trait Connection: AsyncRead + AsyncWrite + Send + Sync + Unpin {
     fn close_write(&mut self) -> io::Result<()> {
         Ok(())
     }
+
+    /// 尝试克隆底层裸 TCP socket（Go `UnwrapRawConn` 的等价物）。
+    ///
+    /// TLS/REALITY 等安全层实现应穿透自身返回内层 TcpStream 的 `try_clone()`
+    /// （共享同一 socket，不占用所有权）。裸 TCP 连接返回自身克隆。
+    /// 用于 vless vision splice：splice 切换后双方在裸 TCP 上传输端到端
+    /// TLS records（TLS 终结点移至 curl↔origin），必须绕过本地安全层读写。
+    fn raw_tcp_clone(&self) -> Option<TcpStream> {
+        None
+    }
 }
 
 
@@ -108,6 +118,23 @@ impl Connection for TcpConnection {
     }
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(Some(self.inner.local_addr()?))
+    }
+    fn raw_tcp_clone(&self) -> Option<TcpStream> {
+        // tokio::net::TcpStream 没有 try_clone；通过 dup(fd) 复制底层 socket 后
+        // 用 TcpStream::from_std 构造独立 AsyncRead/AsyncWrite handle。
+        // 两个 handle 共享同一个内核 socket,可独立 poll,关闭其一不影响另一。
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::{AsRawFd, FromRawFd};
+            let fd = self.inner.as_raw_fd();
+            let new_fd = unsafe { libc::dup(fd) };
+            if new_fd < 0 { return None; }
+            let std_stream = unsafe { std::net::TcpStream::from_raw_fd(new_fd) };
+            // from_std 要求非阻塞模式。tokio 持有的 fd 是非阻塞的；dup 继承同样 flags。
+            TcpStream::from_std(std_stream).ok()
+        }
+        #[cfg(not(unix))]
+        { None }
     }
     fn close_read(&mut self) -> io::Result<()> {
         #[cfg(unix)]
