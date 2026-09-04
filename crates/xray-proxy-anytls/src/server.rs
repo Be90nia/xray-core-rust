@@ -99,13 +99,29 @@ async fn handle_conn(
     tls_acceptor: TlsAcceptor,
     dispatch: Option<Arc<dyn DispatchHandler>>,
 ) {
-    let tls: TlsStream<TcpStream> = match tls_acceptor.accept(tcp).await {
+    let mut tls: TlsStream<TcpStream> = match tls_acceptor.accept(tcp).await {
         Ok(t) => t,
         Err(e) => {
             debug!("anytls mock server TLS accept failed: {e}");
             return;
         }
     };
+    // 消费客户端认证帧（protocol.md Authentication）：
+    // `sha256(password)`(32B) || padding0 长度（BE u16）|| padding0。
+    // mock 不校验密码，但必须按帧格式读掉，否则 auth 字节会被 session loop 误解析为 session frame。
+    let mut auth_head = [0u8; 34];
+    if let Err(e) = tls.read_exact(&mut auth_head).await {
+        debug!("anytls mock server: read auth head failed: {e}");
+        return;
+    }
+    let padding0_len = u16::from_be_bytes([auth_head[32], auth_head[33]]) as usize;
+    if padding0_len > 0 {
+        let mut pad0 = vec![0u8; padding0_len];
+        if let Err(e) = tls.read_exact(&mut pad0).await {
+            debug!("anytls mock server: read padding0 failed: {e}");
+            return;
+        }
+    }
     let padding = DefaultPaddingFactory::load();
     let on_new_session: Box<dyn Fn(Arc<Session>) + Send + Sync> = Box::new(move |session| {
         let dispatch = dispatch.clone();

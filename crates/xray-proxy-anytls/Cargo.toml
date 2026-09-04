@@ -15,6 +15,7 @@ tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 anytls = { workspace = true }
+sha2 = "0.10"
 tracing = { workspace = true }
 xray-features = { path = "../xray-features" }
 async-trait = { workspace = true }

@@ -117,6 +117,7 @@ async fn inbound_dispatches_via_router() {
     let client_config = ClientConfig::new(
         format!("127.0.0.1:{inbound_port}"),
         "localhost",
+        "test-password",
         make_client_config(&cert_der),
     );
     let client = AnytlsClient::new(client_config);

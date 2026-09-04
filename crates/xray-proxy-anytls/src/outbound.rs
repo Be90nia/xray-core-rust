@@ -136,7 +136,7 @@ mod tests {
                 .with_custom_certificate_verifier(Arc::new(dangerous::NoVerifier))
                 .with_no_client_auth(),
         );
-        let config = ClientConfig::new("127.0.0.1:443", "example.com", tls_config);
+        let config = ClientConfig::new("127.0.0.1:443", "example.com", "test-password", tls_config);
         AnytlsOutboundHandler::new("test", config)
     }
 

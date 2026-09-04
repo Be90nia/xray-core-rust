@@ -112,6 +112,7 @@ async fn dispatcher_e2e_anytls_loopback_echo() {
     let client_config = ClientConfig::new(
         format!("127.0.0.1:{}", anytls_addr.port()),
         "localhost",
+        "test-password",
         make_client_config(&cert_der),
     );
     let client = Arc::new(AnytlsClient::new(client_config));
@@ -176,6 +177,7 @@ async fn dispatcher_e2e_anytls_loopback_large_payload() {
     let client_config = ClientConfig::new(
         format!("127.0.0.1:{}", anytls_addr.port()),
         "localhost",
+        "test-password",
         make_client_config(&cert_der),
     );
     let client = Arc::new(AnytlsClient::new(client_config));
