@@ -419,9 +419,10 @@ impl ClientInstance {
             client_hello[pad_offset..pad_offset + 18].copy_from_slice(&pad_tmp);
             let mut pad_tmp2 = Vec::with_capacity(16);
             nfs_aead.seal(&mut pad_tmp2, None, &[], &[])?;
+            // Go client.go:140 Seal(padding[:18], nil, padding[18:paddingLength-16]) —
+            // 密文必须写入 client_hello，否则发出全零字节（服务端 AEAD open 必败）。
+            client_hello[pad_offset + 18..pad_offset + PADDING_LEN].copy_from_slice(&pad_tmp2);
         }
-
-        // 6. 发送 clientHello（阶段 A 不分段）
         conn.write_all(&client_hello).await?;
         let mut encrypted_pfs = vec![0u8; 1088 + 32 + 16];
         conn.read_exact(&mut encrypted_pfs).await?;
