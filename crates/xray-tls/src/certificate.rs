@@ -193,7 +193,11 @@ pub fn entry_usage(entry: &serde_json::Value) -> EntryUsage {
 /// 读取 file-or-inline 字段：`xxxFile`（磁盘路径）优先，否则内联 `xxx`。
 ///
 /// 内联值支持 string 或 string 数组（数组按 Go `readFileOrString` 用 `\n` 连接，
-/// 即 PEM 按行拆成数组元素的写法）。两者均缺失返回 `Ok(None)`。
+/// 即 PEM 按行拆成数组元素的写法）。字段缺失或显式 `null` 返回 `Ok(None)`。
+///
+/// 内联类型非法（非 string、非字符串数组，如数字数组）→ `Err`。对齐 Go
+/// `TLSCertConfig.CertStr []string`（infra/conf/transport_security.go:250）：
+/// JSON 反序列化类型不匹配在配置加载期即报错，不存在"静默跳过、回退自签"路径。
 fn file_or_inline(
     file: Option<&str>,
     inline: Option<&serde_json::Value>,
@@ -205,45 +209,67 @@ fn file_or_inline(
             .map_err(|e| io::Error::other(format!("read {what} file {f}: {e}")));
     }
     match inline {
-        Some(serde_json::Value::String(s)) => Ok(Some(s.clone().into_bytes())),
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => {
+            if s.is_empty() {
+                // Go: "" 无法反序列化为 []string → 配置错误
+                return Err(io::Error::other(format!("{what}: empty inline value")));
+            }
+            Ok(Some(s.clone().into_bytes()))
+        }
         Some(serde_json::Value::Array(items)) => {
-            let lines: Vec<&str> = items.iter().filter_map(|v| v.as_str()).collect();
-            if lines.is_empty() {
-                return Ok(None);
+            let mut lines = Vec::with_capacity(items.len());
+            for v in items {
+                let Some(s) = v.as_str() else {
+                    return Err(io::Error::other(format!(
+                        "{what}: expected string or array of PEM lines, got {v}"
+                    )));
+                };
+                lines.push(s);
             }
             Ok(Some(lines.join("\n").into_bytes()))
         }
-        _ => Ok(None),
+        Some(other) => Err(io::Error::other(format!(
+            "{what}: expected string or array of PEM lines, got {other}"
+        ))),
     }
 }
 
 /// 解析单个 `certificates[]` 条目 → `(证书链, 可选私钥)`。
 ///
-/// 对应 Go `TLSCertConfig.Build` 的读取部分：
+/// 对应 Go `TLSCertConfig.Build`（infra/conf/transport_security.go:260-298）：
 /// `certificateFile`+`keyFile`（磁盘）或 `certificate`+`key`（内联）。
 ///
-/// - 无证书内容 → `Ok(None)`（调用方跳过该条目）。
-/// - key 缺失 → `Ok(Some((certs, None)))`——`usage:"verify"` 的 CA 条目
-///   合法地不带私钥。
+/// - 证书内容缺失（无 file 且无内联/内联为空）→ `Err`——对齐 Go
+///   `readFileOrString` 的 "both file and bytes are empty." → Build error；
+///   Go 中无内容条目不存在跳过语义，配置直接加载失败。
+/// - PEM 解析出 0 张证书 → `Err`（Go 侧空内容透传后在 X509KeyPair 层报错；
+///   宁可启动报错也不静默回退自签证书）。
+/// - key 缺失 → key 为 `None`——`usage:"verify"` 的 CA 条目合法地不带私钥
+///   （Go 仅在 `len(KeyFile)>0 || len(KeyStr)>0` 时才读取 key）。
 ///
 /// # Errors
-/// - 证书/私钥文件读取失败或 PEM 解析失败。
+/// - 证书/私钥文件读取失败、内联类型非法或 PEM 解析失败/无证书块。
 pub fn entry_certs_and_key(
     entry: &serde_json::Value,
-) -> io::Result<Option<(Vec<CertificateDer<'static>>, Option<PrivateKeyDer<'static>>)>> {
+) -> io::Result<(Vec<CertificateDer<'static>>, Option<PrivateKeyDer<'static>>)> {
     let cert_bytes = file_or_inline(
         entry.get("certificateFile").and_then(|v| v.as_str()),
         entry.get("certificate"),
         "certificate",
     )?;
     let Some(cert_bytes) = cert_bytes else {
-        return Ok(None);
+        return Err(io::Error::other(
+            "certificate: both file and inline content are empty",
+        ));
     };
     let certs = rustls_pemfile::certs(&mut cert_bytes.as_slice())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| io::Error::other(format!("parse cert PEM: {e}")))?;
     if certs.is_empty() {
-        return Ok(None);
+        return Err(io::Error::other(
+            "certificate: no PEM certificate block found",
+        ));
     }
 
     let key_bytes = file_or_inline(
@@ -256,8 +282,9 @@ pub fn entry_certs_and_key(
             .map_err(|e| io::Error::other(format!("parse key PEM: {e}")))?,
         None => None,
     };
-    Ok(Some((certs, key)))
+    Ok((certs, key))
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -286,6 +313,73 @@ mod tests {
         let (cn, sans) = extract_cert_names(&[0u8; 4]);
         assert!(cn.is_none());
         assert!(sans.is_empty());
+    }
+
+    // ---- certificates[] 条目非法内联格式 → Err（对齐 Go TLSCertConfig.Build）----
+
+    fn cert_entry(inline: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "certificate": inline })
+    }
+
+    #[test]
+    fn entry_rejects_numeric_array_inline() {
+        // ServerMatrix 实测场景：PEM 写成数字数组 → Go 侧 unmarshal error，
+        // Rust 侧必须报错而非静默回退自签证书。
+        let e = cert_entry(serde_json::json!([1, 2, 3]));
+        assert!(entry_certs_and_key(&e).is_err());
+    }
+
+    #[test]
+    fn entry_rejects_scalar_inline() {
+        for e in [
+            cert_entry(serde_json::json!(12345)),
+            cert_entry(serde_json::json!(true)),
+            cert_entry(serde_json::json!({"pem": "x"})),
+        ] {
+            assert!(entry_certs_and_key(&e).is_err(), "scalar inline must error");
+        }
+    }
+
+    #[test]
+    fn entry_rejects_mixed_type_array_inline() {
+        let e = cert_entry(serde_json::json!(["-----BEGIN CERTIFICATE-----", 1]));
+        assert!(entry_certs_and_key(&e).is_err());
+    }
+
+    #[test]
+    fn entry_rejects_missing_or_empty_content() {
+        // 无 file 且无内联 → Go readFileOrString "both file and bytes are empty"
+        assert!(entry_certs_and_key(&serde_json::json!({})).is_err());
+        assert!(entry_certs_and_key(&cert_entry(serde_json::json!([]))).is_err());
+        assert!(entry_certs_and_key(&cert_entry(serde_json::json!(""))).is_err());
+        // 非 PEM 字符串 → 解析出 0 张证书
+        assert!(entry_certs_and_key(&cert_entry(serde_json::json!("not a pem"))).is_err());
+    }
+
+    #[test]
+    fn entry_rejects_bad_key_type_but_allows_missing_key() {
+        let (pem, key) = generate_self_signed_cert(&["k.test"]).unwrap();
+        let bad_key = serde_json::json!({ "certificate": pem, "key": 42 });
+        assert!(entry_certs_and_key(&bad_key).is_err());
+        // key 缺失合法（verify CA 条目）
+        let no_key = serde_json::json!({ "certificate": pem });
+        let (certs, k) = entry_certs_and_key(&no_key).unwrap();
+        assert_eq!(certs.len(), 1);
+        assert!(k.is_none());
+        let _ = key;
+    }
+
+    #[test]
+    fn entry_accepts_string_and_pem_line_array() {
+        let (pem, _) = generate_self_signed_cert(&["ok.test"]).unwrap();
+        // 整段字符串
+        let (certs, _) = entry_certs_and_key(&cert_entry(serde_json::json!(pem.clone()))).unwrap();
+        assert_eq!(certs.len(), 1);
+        // PEM 行数组（Go readFileOrString join "\n"）
+        let lines: Vec<&str> = pem.lines().collect();
+        let (certs2, _) =
+            entry_certs_and_key(&cert_entry(serde_json::json!(lines))).unwrap();
+        assert_eq!(certs2, certs);
     }
 
 
@@ -412,7 +506,7 @@ mod tests {
     fn entry_certs_and_key_inline() {
         let (cert_pem, key_pem) = generate_self_signed_cert(&["localhost"]).unwrap();
         let v = serde_json::json!({ "certificate": cert_pem, "key": key_pem });
-        let (certs, key) = entry_certs_and_key(&v).unwrap().unwrap();
+        let (certs, key) = entry_certs_and_key(&v).unwrap();
         assert_eq!(certs.len(), 1);
         assert!(key.is_some());
     }
@@ -422,15 +516,16 @@ mod tests {
         // usage:"verify" 的 CA 条目只有证书 → key 为 None，不报错
         let (cert_pem, _) = generate_self_signed_cert(&["ca.test"]).unwrap();
         let v = serde_json::json!({ "certificate": cert_pem, "usage": "verify" });
-        let (certs, key) = entry_certs_and_key(&v).unwrap().unwrap();
+        let (certs, key) = entry_certs_and_key(&v).unwrap();
         assert_eq!(certs.len(), 1);
         assert!(key.is_none());
     }
 
     #[test]
-    fn entry_certs_and_key_missing_cert_skips() {
+    fn entry_certs_and_key_missing_cert_errors() {
+        // 对齐 Go：无 file 且无内联 → Build error，不再跳过
         let v = serde_json::json!({ "key": "-----BEGIN PRIVATE KEY-----\n" });
-        assert!(entry_certs_and_key(&v).unwrap().is_none());
+        assert!(entry_certs_and_key(&v).is_err());
     }
 
     #[test]
@@ -439,14 +534,14 @@ mod tests {
         let (cert_pem, _) = generate_self_signed_cert(&["localhost"]).unwrap();
         let lines: Vec<&str> = cert_pem.lines().collect();
         let v = serde_json::json!({ "certificate": lines });
-        let (certs, _) = entry_certs_and_key(&v).unwrap().unwrap();
+        let (certs, _) = entry_certs_and_key(&v).unwrap();
         assert_eq!(certs.len(), 1);
     }
 
     #[test]
-    fn entry_certs_and_key_bad_pem_skips() {
+    fn entry_certs_and_key_bad_pem_errors() {
+        // 对齐 Go：PEM 无证书块 → Err（宁启动报错不静默回退自签）
         let v = serde_json::json!({ "certificate": "not a pem", "key": "also not" });
-        // 证书解析不到任何 DER → 跳过（Ok(None)）
-        assert!(entry_certs_and_key(&v).unwrap().is_none());
+        assert!(entry_certs_and_key(&v).is_err());
     }
 }
