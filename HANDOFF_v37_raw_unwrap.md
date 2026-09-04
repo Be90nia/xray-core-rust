@@ -2,8 +2,8 @@
 
 ## 0. 仓库状态
 
-- **✅ 修复已完成并验证(2026-09-04 晚,本 commit)**: §2 全 4 步 + §3 Windows 缺口落地,#9=876942B / #15=876732B / #32=877393B 全真 PASS(≥870KB 无 close_notify);全套 **22/32 PASS**(真实基线 19 + 净新增 #32,#9/#15 从假 PASS 转真),10 FAIL 全部为 §5 分诊非本任务节点,零回归(#4 #24 抽查 PASS)
-- **dist/xray.exe**: md5 `b3c09ba5759c2c6f18c433ac6097f163` = 含修复新二进制;修复前 baseline 备份 `D:/tmp/xray_baseline_321fec.exe`(md5 321fec...)
+- **✅ 本轮修复全部完成(2026-09-04 晚, e5cc465+2c01504+f069f1c)**: vision splice(#9 #15 #32)+naive(#29)+anytls(#31)全真 PASS;全套 **24/32 PASS**(真实基线 19 净增 5),8 FAIL 全部为 §5 分诊未动节点,零回归(#4 #24 抽查+全套逐行核对)
+- **dist/xray.exe**: 含全部修复(f069f1c 构建);修复前 baseline 备份 `D:/tmp/xray_baseline_321fec.exe`(md5 321fec...)
 - **2026-09-04 晚基线全套实测**(`D:/tmp/baseline_v37_full32.txt`):表观 21/32 PASS,但 **#9=10477B / #15=15983B 是假 PASS**(run_full32.py:40 判定阈值 `bs>5000 and expected in body`,partial 头部含 YouTube 即过),真实全量基线 = **19/32**;真 FAIL 13 节点 = §5 分诊表,完全自洽
 - **验收口径(长期有效)**:全套脚本 [PASS] 标记不可信——验收以单节点 `python D:/tmp/test_node.py <N>` body≥870000B 为准,全套跑完逐节点核对 body
 - **实施中发现的两个补充根因**(已修,§2 路线之外):① `ResponseHeaderReader`/`Box<dyn Connection>` 的 Connection impl 未穿透 raw_tcp_clone(dyn 分发断链,dispatcher L202 响应头包装层)→ client.rs 双路径穿透;② END/DIRECT 帧跨 poll_read 块时原方案见 cmd 即切 raw → 丢帧尾+外层密文泄漏 → 对齐 Go proxy.go XtlsUnpadding 块完成判定(`remaining_content<=0 && remaining_padding<=0 && cmd!=0`)后才切换
@@ -79,14 +79,15 @@ python dist/run_full32.py
 ```
 风险点:若 #9 通了但 #26-28 ss 或 trojan 掉了 → raw_tcp_clone/trigger 影响了别的路径,回查 vision_conn 改动是否只影响 flow=xtls-rprx-vision 分支(dispatcher.rs:207 的 if 才包 VisionConn,其他协议不经过)。
 
-## 5. 剩余 10 FAIL 分诊(v37 修复后)
+## 5. 剩余 8 FAIL 分诊(v38 最终版)
 
 | 节点 | 根因 | 状态 | 剩余工作 |
 |---|---|---|---|
-| #9 #15 #32 vision partial | splice 后须绕外层 TLS 读 raw TCP | ✅ **已修**(raw_tcp_clone 穿透链 + raw_fallback,872-877KB 真PASS) | 无 |
-| #1 #7 #18 argo+xhttp | CF 严格反指纹;强制 stream-one 会 400(splithttp bad status:400,server 要 packet-up) | 尝试+回退(73467d0) | 重写 packet-up/stream-up dialer 用 http2::handshake+btls(保持 mode 语义),3-4h 高回归风险 |
+| #9 #15 #32 vision partial | splice 后须绕外层 TLS 读 raw TCP | ✅ **已修**(raw_tcp_clone 穿透链+raw_fallback,874-877KB 真PASS,e5cc465) | 无 |
+| #1 #7 #18 argo+xhttp | splithttp 非 REALITY 路径=纯 rustls+hyper 池化 h2,未接 fingerprint;argo 边缘接受 rustls hello(ws/httpupgrade 同 hello h1 全 PASS)但卡 h2 组合;强制 stream-one 会 400(server 要 packet-up) | scout 已摸底(ArgoScout) | register.rs L152-190 else 块加 fingerprint→u_client 分支(抄 tcp/register.rs:83-120)+client.rs 加 DirectH2Client(样板 dialer.rs:543-560 http2::handshake)≈220-310 行;回归面=#4/#23 同带 fp=chrome 会切新路径;:authority 取值争议见 register.rs L52-55 注释 |
 | #10-#13 #16 mlkem | vless ENC 架构错位 | 未动 | 2-3 天 |
-| #29 #31 naive/anytls | 协议层缺口 | 未动 | 1-2 天 |
+| #29 naive | hyper 1.10.1 CONNECT 三坑(body 被丢/200 body 空/SendRequest drop 触 GOAWAY) | ✅ **已修**(OnUpgrade 语义重写,874768B,2c01504) | 无 |
+| #31 anytls | 客户端不发 auth 帧+anytls-rs 0.3.5 漏 cmdSYN(sing-box 需显式 SYN 开流) | ✅ **已修**(auth 帧+Settings→SYN→PSH 帧序,877561B,f069f1c) | 无 |
 
 ## 6. 本会话已废弃结论(别再踩)
 
