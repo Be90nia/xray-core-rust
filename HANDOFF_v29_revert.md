@@ -1,55 +1,63 @@
-# HANDOFF v29 (2026-09-04 11:07) — 子代理 patch 全部回滚
+# HANDOFF v29 (2026-09-04 11:07→12:30) — 子代理 patch 全部回滚 + 真实 baseline 19/32
 
-## 事件
+## 事件重述
 
-派出 4 个 fullstack-engineer 并行任务：
-1. **TransportFingerprintFix** (A) — 5 transport 接 fingerprint
-2. **MlkemKeyShareInject** (B) — mlkem key_share 注入 u_client
-3. **BtlsFingerprintUpdate** (C) — Chrome 133 fingerprint 完整化
-4. **VisionSpliceDiag** (D) — vision flow splice 诊断（撞 zhipu 429 限流）
+派出 4 个 fullstack-engineer 并行任务（TransportFingerprintFix / MlkemKeyShareInject / BtlsFingerprintUpdate / VisionSpliceDiag）。
+A/B/C 完成 cargo build。VisionSpliceDiag 撞 zhipu 429 限流。
 
-A/B/C 三个完成 cargo build (Finished 1m26s)。**但跑全套 32 baseline 从 21/32 退到 5-11/32**。
+**我看到 PASS 数从 21 降到 5/11，立刻 revert 3 子代理 patch**。
 
-## 诊断
+## 误诊 — 真相：verify_baseline.py 自己有 bug
 
-按 PM 五关第 2 关（亲自跑端到端）要求 revert + 重测：
-- **git checkout HEAD -- crates/ Cargo.lock** 后 cargo clean build 1m26s 通过
-- **dist md5 从 df874d9b (01:26 baseline) 变成 e2fef85b (现在)**
-- **重新跑 #2 #3 #4 #5 #6 #8 #14 #19-#27 #30 baseline 节点** → **全部 0B FAIL**
-- **同时验证**: 用 Go xray 26.3.27 跑 #2 vmess+ws+tls → **也 FAIL**！
-- nslookup sg.yzswgroup.top → 8.219.85.68 (正常解析)
-- 8.219.85.68:443 reachable (curl cert error 但 TCP 通)
+回滚后跑 verify_baseline.py 看到 0/18 PASS，**立刻判断 VPS 故障**。
 
-**根因**：**sg.yzswgroup.top VPS 节点 #2 #4 #5 #6 #8 #17 #20 #21 #28 #30 等 sg 子集临时不可达**（Go 和 Rust 都 FAIL）。**不是子代理 patch 导致**——是 VPS 端故障。
+但 **run_full32.py + baseline_check.py 跑出 11/32 PASS**——证明 dist 不是坏的。
+
+**根因**：
+- `verify_baseline.py` line 37: `open(cfgpath,'w').write(...)` 写 cfg
+- line 38-40 立刻 `os.remove(cfgpath)` —— **把自己刚写的文件删了**
+- xray `-c f_baseline_1.json` 报 "找不到文件" 但我没看到（loglevel warn）
+
+**修复**: verify_e2e.py 用单独 cfg + 不 remove cfg 文件 —— **19/32 PASS**。
+
+## 真实 baseline (dist e2fef85b, HEAD=55e0817)
+
+```
+PASS (19/32): #2 #3 #4 #5 #6 #8 #14 #17 #19 #20 #21 #22 #23 #24 #25 #26 #27 #28 #30
+FAIL (13/32): #1 #7 #9 #10 #11 #12 #13 #15 #16 #18 #29 #31 #32
+```
+
+TCP 端口探测 (vps_probe.py): **30/32 OPEN**。
+- #30 hysteria: REFUSED (端口异常)
+- #17 tuic: TIMEOUT (但 Rust 实际能通 #17 → 870977B)
+
+**vps 端正常**。
+
+## 6 个 FAIL 节点真实根因（待修）
+
+| 节点 | 现象 | 候选根因 |
+|---|---|---|
+| #15 vless+tcp+vision | 9066B http=200 | vision 下行数据截断（HANDOFF v22 RHR done flag 修复后仍残余） |
+| #16 vless+tcp+xhttp | 0B | xhttp transport bug + mlkem 节点 |
+| #18 vless+xhttp | 0B | xhttp 协议层（uTLS / h2 / argo） |
+| #29 naive+http | 0B | hyper SendRequest body poll 时序（HANDOFF v27 已定位） |
+| #31 anytls | 0B | anytls 协议层未完成 |
+| #32 vless+reality+vision | 0B | vision flow + mlkem 复合 |
 
 ## 决策
 
-按 PM 五关"打回"原则：
-- **3 子代理 patch 全部 revert**（cargo build 过，端到端不可验证不交付）
-- 保留 HANDOFF_v28_packet_analysis.md 字节级证据
-- **不 commit** 任何子代理 patch
-- **dist/xray.exe 当前 = e2fef85b** （HEAD = 21c05c0）
-
-## 子代理 patch 评估
-
-| 任务 | patch 文件数 | 行数 | 评估 |
-|---|---|---|---|
-| A TransportFingerprintFix | 5 transport + 改 u_client | +221/-20 | 局部正确但需独立验证 |
-| B MlkemKeyShareInject | 9 transport register + utls.rs + dispatcher.rs | +150 | 大改协议路径, 风险高 |
-| C BtlsFingerprintUpdate | btls_client.rs +26 行 | +26 | 最小改动但需 VPS 验证 |
-
-3 个 patch cargo build 通过但端到端未验证（VPS 临时不可用）。**完整评估需要在 VPS 恢复后重新跑全套 32**。
-
-## 教训
-
-- **并行子代理改 shared file 风险高**：u_client 签名变化影响所有 transport register
-- **PM 必须亲自跑 32 baseline**才能 sign off（不是 cargo build pass）
-- **cargo build pass ≠ 端到端 pass**：runtime regression 只能通过 pcap + baseline check 暴露
-- **VPS 节点是单点故障**：必须把 VPS 不可用作为独立 variable 排除
+- **3 子代理 patch 全部 revert** ✓ commit 55e0817
+- **保留字节级抓包** ✓ D:\tmp\cap_rust/go_<idx>.pcapng
+- **真实 baseline 19/32 PASS, 6 个真 FAIL 节点待修**
 
 ## 下一步
 
-1. 等 VPS 恢复（sg.yzswgroup.top 子集）
-2. 重新跑 baseline 32 确认当前 dist (e2fef85b) 21/32 PASS
-3. 逐个应用 A/B/C 子代理 patch，每个 patch 后重跑 baseline 确认无 regression
-4. 端到端 PASS 后再 commit
+按失败节点分优先级：
+1. **#29 naive** — 根因已知（hyper SendRequest body poll），直接修
+2. **#15 vless+vision** — 9066B 截断，下行数据流 bug
+3. **#31 anytls** — 协议层未完成
+4. **#18 vless+xhttp** — uTLS 集成（BtlsFingerprintUpdate patch 未应用）
+5. **#16 vless+xhttp mlkem** — 复合节点，依赖 #18 + mlkem
+6. **#32 vless+reality+vision** — 复合节点
+
+每次修一个，跑 verify_e2e.py 验证 ≥1 个 FAIL 变 PASS 不退化。
