@@ -7,26 +7,27 @@
 //! 4. CONNECT authority-form 请求 + `padding`/`padding-type-request`/
 //!    `Proxy-Authorization: Basic` 头
 //! 5. 200 响应含 `padding` 头 → 双向首 8 帧帧化，否则直通
+//!
+//! 隧道上下行经 hyper 的 CONNECT-upgrade（`OnUpgrade`）交付：h2 层收到 200
+//! 后把 h2 流的收发两端打包成 `Upgraded`（hyper 不支持 CONNECT 请求体——
+//! 请求 body 会被直接丢弃，上行数据必须写 `Upgraded`）。
 
 use std::io;
 use std::pin::Pin;
 
+use std::sync::{Arc, Mutex};
 use std::task::{ready, Context, Poll};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use bytes::Bytes;
-use futures_util::TryStreamExt;
 use http::header::HeaderValue;
 use http::{Method, StatusCode};
-use http_body_util::{BodyDataStream, StreamBody};
-use hyper::body::Frame;
+use http_body_util::Empty;
 use hyper::client::conn::http2;
+use hyper::upgrade::{OnUpgrade, Upgraded};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use tokio_util::sync::PollSender;
 use xray_common::net::address::Address;
 use xray_common::net::destination::Destination;
 use xray_common::net::network::Network;
@@ -41,8 +42,6 @@ use crate::uri::NaiveConfig;
 
 /// Chrome 桌面 UA（对齐 naiveproxy 默认 extra headers 场景）。
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
-type FrameResult = Result<Frame<Bytes>, std::convert::Infallible>;
-type H2Sender = PollSender<FrameResult>;
 
 /// 建立 naive 隧道（CONNECT authority-form 指向 `target_host:target_port`）。
 ///
@@ -68,17 +67,16 @@ pub async fn dial_naive(
     let (mut sender, conn) = http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
         .await
         .map_err(|e| format!("naive h2 handshake: {e}"))?;
-    // h2 连接驱动（必须后台跑，否则流不动）
-    tokio::spawn(async move {
+
+    // h2 连接驱动：hyper 的 conn future 必须被持续 poll（后台任务 1）。
+    let driver = tokio::spawn(async move {
         if let Err(e) = conn.await {
             tracing::debug!(target: "naive", error = %e, "h2 connection driver ended");
         }
     });
 
     let authority = format!("{target_host}:{target_port}");
-    let (tx, rx) = mpsc::channel::<FrameResult>(16);
-    let req = build_connect_request(&authority, config, rx)?;
-    let tx = PollSender::new(tx);
+    let req = build_connect_request(&authority, config)?;
     let resp = sender
         .send_request(req)
         .await
@@ -92,23 +90,39 @@ pub async fn dial_naive(
     // 响应含 padding 头 → 服务端支持 kVariant1，双向首 8 帧帧化
     let padded = resp.headers().contains_key("padding");
 
-    let body_data = BodyDataStream::new(resp.into_body())
-        .map_err(|e| io::Error::other(e.to_string()));
-    let reader = tokio_util::io::StreamReader::new(body_data);
+    // hyper 对 CONNECT 200：双向流经 OnUpgrade 交付（响应 body 恒为空）。
+    let on_upgrade = resp
+        .extensions()
+        .get::<OnUpgrade>()
+        .cloned()
+        .ok_or_else(|| format!("naive CONNECT {authority}: no upgrade extension"))?;
+    drop(resp);
+
+    // SendRequest 保活到 driver 结束（后台任务 2）：drop 它即通知 hyper
+    // 优雅关闭整条 h2 连接（graceful GOAWAY 会终止活跃 CONNECT 流）。
+    tokio::spawn(async move {
+        let _keep_alive = sender;
+        let _ = driver.await;
+    });
+
+    let upgraded = on_upgrade
+        .await
+        .map_err(|e| format!("naive CONNECT {authority}: upgrade failed: {e}"))?;
+    let (rd, wr) = tokio::io::split(UpgradeConn(Arc::new(Mutex::new(TokioIo::new(upgraded)))));
     let tunnel = NaiveConn {
-        reader: PaddingReader::new(reader, padded),
-        writer: PaddingWriter::new(H2Writer { tx: Some(tx) }, padded),
+        reader: PaddingReader::new(rd, padded),
+        writer: PaddingWriter::new(wr, padded),
     };
     tracing::debug!(target: "naive", %authority, padded, "naive tunnel established");
     Ok(Box::new(tunnel))
 }
 
-/// 构造 CONNECT 请求（authority-form + naive padding/auth 头）。
+/// 构造 CONNECT 请求（authority-form + naive padding/auth 头；body 为空——
+/// hyper 的 h2 CONNECT 不支持请求体，上行数据在 upgrade 后写 `Upgraded`）。
 fn build_connect_request(
     authority: &str,
     config: &NaiveConfig,
-    rx: mpsc::Receiver<FrameResult>,
-) -> Result<http::Request<StreamBody<ReceiverStream<FrameResult>>>, String> {
+) -> Result<http::Request<Empty<Bytes>>, String> {
     let auth: http::uri::Authority = authority
         .parse()
         .map_err(|e| format!("naive authority {authority}: {e}"))?;
@@ -128,8 +142,44 @@ fn build_connect_request(
         .header("padding-type-request", HeaderValue::from_static("1"))
         .header(http::header::PROXY_AUTHORIZATION, proxy_auth)
         .header(http::header::USER_AGENT, HeaderValue::from_static(USER_AGENT))
-        .body(StreamBody::new(ReceiverStream::new(rx)))
+        .body(Empty::<Bytes>::new())
         .map_err(|e| format!("naive build request: {e}"))
+}
+
+/// `Upgraded` 的 `Sync` 包装（hyper `Upgraded` 仅 `Send`，而
+/// [`Connection`] 要求 `Sync`；锁只在 poll 同步段内短暂持有，不跨 await）。
+struct UpgradeConn(Arc<Mutex<TokioIo<Upgraded>>>);
+
+impl AsyncRead for UpgradeConn {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        out: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        Pin::new(&mut *g).poll_read(cx, out)
+    }
+}
+
+impl AsyncWrite for UpgradeConn {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        Pin::new(&mut *g).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        Pin::new(&mut *g).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        Pin::new(&mut *g).poll_shutdown(cx)
+    }
 }
 
 // ============================================================
@@ -286,53 +336,6 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for PaddingWriter<W> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.as_mut().inner).poll_shutdown(cx)
-    }
-}
-
-// ============================================================
-// h2 请求体写端（mpsc → StreamBody）
-// ============================================================
-
-/// h2 上行流 writer：`poll_write` 投递 DATA Frame，`poll_shutdown` 关闭通道（END_STREAM）。
-pub struct H2Writer {
-    tx: Option<H2Sender>,
-}
-
-impl AsyncWrite for H2Writer {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = &mut *self;
-        let tx = this.tx.as_mut().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "naive h2 stream closed")
-        })?;
-        match tx.poll_reserve(cx) {
-            Poll::Ready(Ok(())) => {
-                let frame = Frame::data(Bytes::copy_from_slice(buf));
-                tx.send_item(Ok(frame))
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "naive h2 channel closed")
-                    })?;
-                Poll::Ready(Ok(buf.len()))
-            }
-            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "naive h2 channel closed",
-            ))),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // 丢弃 Sender → StreamBody 结束 → h2 END_STREAM
-        self.tx.take();
-        Poll::Ready(Ok(()))
     }
 }
 
