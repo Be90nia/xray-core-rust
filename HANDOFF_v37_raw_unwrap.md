@@ -2,10 +2,10 @@
 
 ## 0. 仓库状态
 - **✅ v41 全协议调通收官(2026-09-05 凌晨)**: ① VPS 32/32 全通(4092505, PM 两轮独立复跑 `D:/tmp/final_32of32.txt`/`final_v41_full32.txt` 均逐行核对); ② **wireguard 互操作打通**(d8a114b: smoltcp 0.12 端口 0 恒 Unaddressable 需自分配+TX checksum 未开致 gVisor 静默丢包;YouTube 经 WG 隧道 875KB+scapy Noise 握手证据); ③ **server 侧补全+反向互操作**(6f27649/dd9bdbf: grpc server 三病对称修复+content-type+ss inbound transport 接线缺失+ss legacy 响应缺新 IV/rekey 违反 Go wire——Go client→Rust server 的 grpc/kcp/ss 三发 874-878KB 全 PASS)
-- **dist/xray.exe**: cac121fc(全功能: 32 节点修复+wg+server 侧), ss nonce 改动补验 #26-28 全绿;历史 baseline 备份 D:/tmp/xray_baseline_321fec.exe(19/32 时代)
+- **✅ v42 质量打磨轮(2026-09-05, c4cf909+6f32c25)**: ENC 0-RTT 快路径启用(xor_mode=0+seconds>0 即走,缓存 PfsKey+新 nfsKey 对齐 Go;本地双连实证 conn1 缓存写入→conn2 fast path engaged 双 200)+app-dns 族过滤根治(serial/parallel_query 透传 IpOption,ipv6_enable=false 不再混 AAAA——wg 首连 50% 超时的上游根因,wg 出口另有防御过滤双保险)+wg 首连超时根因修复(dispatcher 族过滤,30/30 零超时);v42 合集二进制全套复跑 32/32 零回归;dist/xray.exe=e65c506b
+- **遗留更新**: wg 首连超时已修(出 HASH);新增遗留: zero_rtt wire 单测 duplex 挂起(ignore 留查,字节已探针验证)、服务级 query_strategy AND 的 s.ipOption 钳制 Rust 无对应(Go dns.go:228-229 既有差异)、grpc server 深层对称性仅三发验证
 - **验收口径(长期有效)**:全套 [PASS] 标记有假 PASS 前科——以单节点 `python D:/tmp/test_node.py <N>` body≥870000B 为准;**改动波及共用代码时必须重编译后用新二进制复验**(本次 ss nonce 分离就需补验 #26-28)
 - **方法论沉淀**: wire 调试三板斧(本地 Go server+oracle 逐步解密+scapy 抓包字节 diff);部署副本 md5 必校验;两个 scout 线索均可证伪,dbg 实证优先
-- **已知非阻塞遗留**: server 侧 inbound VisionConn splice/ENC 0-RTT 会话未实现;Rust 0-RTT 快路径未启用(恒 1-RTT);wg 首连 ~30% 概率 5s 超时重试即过(smoltcp SynSent 重传疑点);ss2022 relay_tunnel_roundtrip 测试单跑挂起(既有);ss2022 多 PSK/重放防护未测;grpc server accept_h2 对称性已修但仅 grpc/ss/kcp 三发验证
 ## 1. #9 #15 #32(vless+vision partial ~10KB)真根因 —— wire-level 已实证
 
 **模型**(此前会话反复搞错的点,这次是对的):
