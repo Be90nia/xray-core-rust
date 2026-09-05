@@ -116,6 +116,9 @@ pub enum SsError {
     #[error("ss-2022 packet id not unique (replay?)")]
     Ss2022PacketIdNotUnique,
 
+    #[error("ss-2022 request salt not unique (replay?)")]
+    Ss2022SaltNotUnique,
+
     #[error("ss-2022 server packet clientSessionId mismatch")]
     Ss2022BadClientSessionId,
     #[error("ss-2022 request salt mismatch")]
