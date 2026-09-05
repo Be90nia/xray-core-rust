@@ -25,7 +25,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 
 use rustls_pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -83,6 +83,8 @@ pub struct Conn<S> {
     inner: ClientTlsStream<S>,
     /// 握手时传入的 SNI（rustls ClientConnection 不公开 SNI 读取 API）。
     server_name: String,
+    /// write 后底层尚有滞留未冲净（见 `Conn::poll_write` 的实现注释）。
+    dirty: bool,
 }
 
 impl<S> Conn<S> {
@@ -120,9 +122,20 @@ impl<S: Connection + Unpin> AsyncRead for Conn<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // dirty 期间借读侧 poll 机会推进滞留：对端通常阻塞在读我们的
+        // 尾部数据上（请求没发全它不回响应），duplex/TCP 窗口一旦空出
+        // 即唤醒本任务，此处 flush 得以继续，否则滞留无 poll 机会可推。
+        // flush 的 Pending/Err 不改变 read 结果（底层若断，read 自会报）。
+        if self.dirty {
+            match Pin::new(&mut self.inner).poll_flush(cx) {
+                Poll::Ready(Ok(())) => self.dirty = false,
+                Poll::Pending | Poll::Ready(Err(_)) => {}
+            }
+        }
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
+
 
 impl<S: Connection + Unpin> AsyncWrite for Conn<S> {
     fn poll_write(
@@ -130,11 +143,28 @@ impl<S: Connection + Unpin> AsyncWrite for Conn<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        let n = ready!(Pin::new(&mut self.inner).poll_write(cx, buf))?;
+        // tokio-rustls 0.26 是 BufWriter 语义：poll_write Ok(n) 只保证
+        // 数据进入 rustls session 缓冲，write_io Pending（底层窗口满）时
+        // 尾部 TLS record 滞留缓冲，须 poll_flush 才落底层。上层 pump
+        // （bridge write_all 循环）不 flush——若尾 chunk 滞留后上层转入
+        // 等响应，滞留永不发出，对端凑不齐请求 → 双向死锁。此处尽力
+        // flush；Pending 时不得上传（上层会把 Pending 视为 0 进展而重发
+        // 整段 buf，内层已接受的数据被重复加密），记 dirty 留给读侧推进。
+        match Pin::new(&mut self.inner).poll_flush(cx) {
+            Poll::Ready(Ok(())) => self.dirty = false,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => self.dirty = true,
+        }
+        Poll::Ready(Ok(n))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        let res = Pin::new(&mut self.inner).poll_flush(cx);
+        if matches!(res, Poll::Ready(Ok(()))) {
+            self.dirty = false;
+        }
+        res
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -198,6 +228,8 @@ impl<S: Connection + Unpin> ConnInterface for Conn<S> {
 /// 包装 `tokio_rustls::server::TlsStream<S>`，对齐 Go `tls.Conn` (server)。
 pub struct ServerConn<S> {
     inner: ServerTlsStream<S>,
+    /// write 后底层尚有滞留未冲净（同 `Conn::dirty`，见其 poll_write 注释）。
+    dirty: bool,
 }
 
 impl<S> ServerConn<S> {
@@ -227,6 +259,13 @@ impl<S: Connection + Unpin> AsyncRead for ServerConn<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // 同 Conn::poll_read：dirty 期间借读侧 poll 机会推进 write 滞留。
+        if self.dirty {
+            match Pin::new(&mut self.inner).poll_flush(cx) {
+                Poll::Ready(Ok(())) => self.dirty = false,
+                Poll::Pending | Poll::Ready(Err(_)) => {}
+            }
+        }
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
@@ -237,11 +276,22 @@ impl<S: Connection + Unpin> AsyncWrite for ServerConn<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        // 同 Conn::poll_write：尽力冲净 session 滞留，Pending 记 dirty。
+        let n = ready!(Pin::new(&mut self.inner).poll_write(cx, buf))?;
+        match Pin::new(&mut self.inner).poll_flush(cx) {
+            Poll::Ready(Ok(())) => self.dirty = false,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => self.dirty = true,
+        }
+        Poll::Ready(Ok(n))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        let res = Pin::new(&mut self.inner).poll_flush(cx);
+        if matches!(res, Poll::Ready(Ok(()))) {
+            self.dirty = false;
+        }
+        res
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -422,7 +472,7 @@ where
     let server: ServerName<'static> = ServerName::try_from(server_name.to_string())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid server name: {e}")))?;
     let tls_stream = connector.connect(server, stream).await?;
-    Ok(Conn { inner: tls_stream, server_name: server_name.to_string() })
+    Ok(Conn { inner: tls_stream, server_name: server_name.to_string(), dirty: false })
 }
 
 /// 创建标准 rustls TLS 服务端连接（完成握手）。
@@ -437,7 +487,7 @@ where
 {
     let acceptor = TlsAcceptor::from(config);
     let tls_stream = acceptor.accept(stream).await?;
-    Ok(ServerConn { inner: tls_stream })
+    Ok(ServerConn { inner: tls_stream, dirty: false })
 }
 
 /// 创建 uTLS 指纹伪装客户端连接。
