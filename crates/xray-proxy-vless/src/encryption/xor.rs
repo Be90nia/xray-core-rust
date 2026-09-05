@@ -5,7 +5,7 @@
 //!
 //! Rust 用 RustCrypto `ctr::Ctr128BE<Aes256>`（与 xray-crypto 对齐），counter 语义一致。
 //!
-//! `XorConn`（xor_mode==2，连接层双 CTR + TLS header skip 状态机）阶段 A 暂不实现。
+//! `XorConn`（xor_mode==2）见 [`crate::encryption::xor_conn`]：header-only XOR 状态机。
 
 use crate::error::{Result, VlessError};
 use aes::cipher::{KeyIvInit, StreamCipher};

@@ -392,17 +392,23 @@ impl ClientInstance {
                     let aead =
                         crate::encryption::aead::Aead::new(&enc_ticket, &united_key, use_aes);
                     if self.xor_mode == 2 {
-                        // Go client.go:124：XorConn 写 CTR iv=iv、读 CTR iv=server
-                        // 首发随机数（延迟建立）。读侧用 ticket 是既有偏差——xor_mode==2
-                        // 无真实节点（VPS 全 0），保持 Phase A 行为不变。
+                        // Go client.go:123-125：写 CTR=NewCTR(uk, iv)（out_skip=0，
+                        // PreWrite 已在握手期 raw 发出）；读侧 PeerCTR 延迟——下行头
+                        // 16B serverRandom 透传给 CommonConn 的 0-RTT 分支并回填
+                        // （in_skip=16，Go common.go:84-92）。XorConn 包在 CommonConn
+                        // 之下（Go 层次 CommonConn{Conn: XorConn{conn}}）。
                         let write_ctr = CtrXor::new(&united_key, &iv)?;
-                        let read_ctr = CtrXor::new(&united_key, &ticket)?;
-                        let xor_conn = crate::encryption::xor_conn::XorConn::new(
+                        let xor_conn = crate::encryption::xor_conn::XorConn::new_deferred_read(
                             conn,
-                            read_ctr,
                             write_ctr,
+                            0,
+                            16,
+                            united_key.clone(),
                         );
-                        return Ok(Box::new(xor_conn));
+                        let conn_wrapper = crate::encryption::common_conn::CommonConn::new_zero_rtt(
+                            xor_conn, aead, united_key, use_aes,
+                        );
+                        return Ok(Box::new(conn_wrapper));
                     }
                     let conn_wrapper = crate::encryption::common_conn::CommonConn::new_zero_rtt(
                         conn, aead, united_key, use_aes,
@@ -530,14 +536,27 @@ impl ClientInstance {
             );
         }
 
-        // 14. 构造加密连接：xor_mode==2 包 XorConn（写 iv=iv，读 iv=ticket）；其他走 CommonConn 直包。
+        // 14. 构造加密连接：xor_mode==2 时 XorConn 包在 CommonConn 之下（record 封装
+        //     + header-only XOR）；mode 0/1 走 CommonConn 直包。
         if self.xor_mode == 2 {
+            // Go client.go:206-208：NewXorConn(conn, CTR(uk,iv), CTR(uk,encryptedTicket[:16]),
+            // 0, PeerPaddingLen)。下行 padding 已在握手期读掉（上方步骤 12），故
+            // in_skip=0；XorConn 包在 CommonConn 之下（Go：CommonConn{Conn: XorConn}）。
             let xor_conn = crate::encryption::xor_conn::XorConn::new(
                 conn,
-                CtrXor::new(&united_key, &ticket_pt[..16])?,
-                CtrXor::new(&united_key, &iv)?,
+                CtrXor::new(&united_key, &ticket_pt[..16])?, // 读：Go PeerCTR
+                CtrXor::new(&united_key, &iv)?,              // 写：Go CTR
+                0,
+                0,
             );
-            Ok(Box::new(xor_conn))
+            let conn_wrapper = crate::encryption::common_conn::CommonConn::new(
+                xor_conn,
+                aead,
+                peer_aead,
+                use_aes,
+                united_key,
+            );
+            Ok(Box::new(conn_wrapper))
         } else {
             let conn_wrapper = crate::encryption::common_conn::CommonConn::new(
                 conn,
@@ -1018,14 +1037,24 @@ impl ServerInstance {
         let mut encrypted_padding = vec![0u8; client_pad_len];
         conn.read_exact(&mut encrypted_padding).await?;
 
-        // 15. 构造加密连接：xor_mode==2 包 XorConn（对齐 Go server.go handshake 末段 NewXorConn）
+        // 15. 构造加密连接：xor_mode==2 时 XorConn 包在 CommonConn 之下
+        //     （Go server.go:324-326：CommonConn{Conn: XorConn{conn}}，skip 0/0）。
         if self.xor_mode == 2 {
             let xor_conn = crate::encryption::xor_conn::XorConn::new(
                 conn,
                 CtrXor::new(&united_key_bytes, &iv)?,         // 读：解密 client 写侧 CTR(iv)（Go server.go:325 PeerCTR）
                 CtrXor::new(&united_key_bytes, &ticket_arr)?, // 写：加密给 client 读侧 CTR(ticket)（Go server.go:325 CTR）
+                0,
+                0,
             );
-            Ok(Box::new(xor_conn))
+            let conn_wrapper = crate::encryption::common_conn::CommonConn::new(
+                xor_conn,
+                aead,
+                peer_aead,
+                use_aes,
+                united_key_bytes,
+            );
+            Ok(Box::new(conn_wrapper))
         } else {
             let conn_wrapper = crate::encryption::common_conn::CommonConn::new(
                 conn,
@@ -1127,14 +1156,25 @@ impl ServerInstance {
             peer_aead = crate::encryption::aead::Aead::new(&encrypted_ticket, &united_key, use_aes);
         }
         if self.xor_mode == 2 {
-            // Go server.go:232：写 CTR=NewCTR(uk, PreWrite)（outSkip=16，Rust XorConn
-            // Phase A 无 skip 简化），读 CTR=NewCTR(uk, iv)（解 client 写侧）。
+            // Go server.go:231-233：写 CTR=NewCTR(uk, PreWrite)、读 CTR=NewCTR(uk, iv)、
+            // outSkip=16（PreWrite 经 CommonConn 首写 prepend，过 XorConn 透传不 XOR）、
+            // inSkip=0。XorConn 包在 CommonConn 之下（CommonConn{Conn: XorConn{conn}}）。
             let xor_conn = crate::encryption::xor_conn::XorConn::new(
                 conn,
                 CtrXor::new(&united_key, iv)?,
                 CtrXor::new(&united_key, &pre_write)?,
+                16,
+                0,
             );
-            return Ok(Box::new(xor_conn));
+            let conn_wrapper = crate::encryption::common_conn::CommonConn::new_server_zero_rtt(
+                xor_conn,
+                aead,
+                peer_aead,
+                pre_write.to_vec(),
+                united_key,
+                use_aes,
+            );
+            return Ok(Box::new(conn_wrapper));
         }
         let conn_wrapper = crate::encryption::common_conn::CommonConn::new_server_zero_rtt(
             conn,
