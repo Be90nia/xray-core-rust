@@ -264,10 +264,8 @@ impl Client2022 {
         ]) as usize;
         increment_nonce(&mut nonce); // [0;n] → [1,0,...]
 
-        // 4. 读 variable chunk：payload_len 明文 + 16 tag
-        if payload_len > 900 + 260 {
-            return Err(SsError::Ss2022PaddingTooLarge(payload_len));
-        }
+        // 4. 读 variable chunk：payload_len 明文 + 16 tag（= server 首段响应 payload，
+        // 上限即 u16，sing 无 900+260 之类限制）
         let var_wire_len = payload_len + tag_size;
         let mut var_wire = vec![0u8; var_wire_len];
         conn.read_exact(&mut var_wire).await?;
