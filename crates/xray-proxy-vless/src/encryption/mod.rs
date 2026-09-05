@@ -19,6 +19,7 @@
 //! 因此本模块仅声明 trait + 数据结构骨架，所有 IO 操作返回
 //! [`VlessError::NotImplemented`]。等上层 transport 链路 + Rust 加密 crate 接入后
 //! 再注入实现。
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use parking_lot::RwLock;
 
@@ -44,7 +45,7 @@ pub mod vision;
 pub mod vision_conn;
 /// 客户端 ENC 字符串解析（Go `infra/conf/vless.go` 出站 encryption 校验对齐）。
 pub mod params;
-pub use params::{parse_client_encryption, ClientEncParams};
+pub use params::{parse_client_encryption, parse_server_decryption, ClientEncParams, ServerDecParams};
 pub mod adapter;
 pub use adapter::EncConnectionAdapter;
 
@@ -568,14 +569,64 @@ enum NfsSKey {
     MlKem(ml_kem::DecapsulationKey768),
 }
 
+/// 服务端 0-RTT 会话（对应 Go `ServerSession`，server.go:20-23）。
+#[derive(Default)]
+struct ServerSession {
+    /// 1-RTT 时协商的 pfs_key（64B = mlkem768Key + x25519Key，server.go:282）。
+    pfs_key: Vec<u8>,
+    /// 本会话已使用的 nfs_key（Go `NfsKeys sync.Map`，server.go:223）：同一 ticket
+    /// 二次携带同一 nfs_key = replay，拒绝。
+    nfs_keys: HashSet<[u8; 32]>,
+}
+
+/// 会话存储（对应 Go `ServerInstance` 的 RWLock 保护字段，server.go:36-40）。
+#[derive(Default)]
+struct SessionStore {
+    /// ticket → 会话（Go `Sessions`）。
+    sessions: HashMap<[u8; 16], ServerSession>,
+    /// FIFO ticket 队列（Go `Tickets`）。
+    tickets: Vec<[u8; 16]>,
+    /// 预期过期分钟 → 该分钟入库的 ticket（Go `Lasts`，key=(now+max)/60+2）。
+    lasts: HashMap<i64, [u8; 16]>,
+    /// 关闭标志（Go `Closed`）：置位后后台清理任务退出。
+    closed: bool,
+}
+
+impl SessionStore {
+    /// 过期清理（Go server.go:90-102）：取出本分钟应过期的 ticket，删掉队列中
+    /// 该 ticket 及其之前的全部会话（含 minute-1 保险条目）。
+    fn cleanup_expired(&mut self, minute: i64) {
+        self.lasts.remove(&(minute - 1)); // insurance
+        let last = self.lasts.remove(&minute).unwrap_or([0u8; 16]);
+        if last == [0u8; 16] {
+            return;
+        }
+        if let Some(j) = self.tickets.iter().position(|&t| t == last) {
+            for t in &self.tickets[..=j] {
+                self.sessions.remove(t);
+            }
+            self.tickets.drain(..=j);
+        }
+    }
+}
+
+/// 当前 Unix 分钟（Go `time.Now().Unix()/60`）。
+fn unix_minute() -> i64 {
+    (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) / 60) as i64
+}
+
 /// 服务端加密实例（对应 Go `ServerInstance`）。
 ///
 /// 持有 NFS 私钥数组 + 公钥字节 + blake3 hash + relay 长度。
 /// [`ServerInstance::init`] 解析私钥；[`ServerInstance::handshake`] 解密客户端握手。
 ///
-/// # 阶段 B 限制
-/// - 0-RTT（`seconds_from/to > 0` + ticket session 管理）：未实现（客户端 ticket 请求被拒）
-/// - padding 分段发送：简化为一次发送
+/// 0-RTT（`seconds_from/seconds_to > 0`）：1-RTT 成功后 ticket+PfsKey 入
+/// [`SessionStore`]（跨连接共享，对齐 Go handler 级单例），后续连接凭 ticket
+/// 走 0-RTT（replay 防护 + 过期清理见 [`SessionStore`]）。
+/// padding 分段发送：简化为一次发送。
 pub struct ServerInstance {
     /// NFS 私钥数组（按 init 顺序）。
     nfs_skeys: Vec<NfsSKey>,
@@ -587,12 +638,15 @@ pub struct ServerInstance {
     relays_length: usize,
     /// XOR 模式（0=off, 1=XOR relays, 2=XorConn）。
     xor_mode: u32,
-    /// 0-RTT ticket 有效期范围（秒）；阶段 B 固定 0（禁 0-RTT）。
+    /// 0-RTT ticket 有效期范围（秒）。
     seconds_from: u32,
     seconds_to: u32,
-    /// padding 配置（阶段 B 简化，默认空）。
+    /// padding 配置（阶段简化，默认空）。
     padding_lens: Vec<common::PaddingTriple>,
     padding_gaps: Vec<common::PaddingTriple>,
+    /// 0-RTT 会话存储（跨连接共享；对齐 Go `ServerInstance` 的
+    /// Lasts/Tickets/Sessions/Closed RWLock 字段）。
+    sessions: std::sync::Arc<parking_lot::Mutex<SessionStore>>,
 }
 
 impl Default for ServerInstance {
@@ -607,6 +661,7 @@ impl Default for ServerInstance {
             seconds_to: 0,
             padding_lens: Vec::new(),
             padding_gaps: Vec::new(),
+            sessions: std::sync::Arc::new(parking_lot::Mutex::new(SessionStore::default())),
         }
     }
 }
@@ -681,7 +736,29 @@ impl ServerInstance {
         }
         relays -= 32; // 末尾无下段 hash
         self.relays_length = relays.max(0) as usize;
+        // 0-RTT 会话管理（Go server.go:78-106）：seconds 配置启用时每 60s 清一次
+        // 过期 ticket；`closed` 置位后任务退出（Go Closed bool）。
+        if self.seconds_from > 0 || self.seconds_to > 0 {
+            let store = std::sync::Arc::clone(&self.sessions);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                interval.tick().await; // 首次 tick 立即返回，跳过
+                loop {
+                    interval.tick().await;
+                    let mut s = store.lock();
+                    if s.closed {
+                        return;
+                    }
+                    s.cleanup_expired(unix_minute());
+                }
+            });
+        }
         Ok(())
+    }
+
+    /// 关闭实例：置位 `closed`，后台清理任务退出（对应 Go `ServerInstance.Close`）。
+    pub fn close(&self) {
+        self.sessions.lock().closed = true;
     }
 
     /// 反向解析 relay chain（对应 Go `Handshake` relay 循环的服务端镜像）。
@@ -780,7 +857,7 @@ impl ServerInstance {
     /// # Errors
     /// IO / 解密 / 协议错误返回 [`VlessError`]。
     pub async fn handshake<C>(
-        &mut self,
+        &self,
         conn: C,
     ) -> Result<Box<dyn EncryptionConn>>
     where
@@ -817,13 +894,12 @@ impl ServerInstance {
         let mut length_pt = Vec::with_capacity(2);
         nfs_aead.open(&mut length_pt, None, &encrypted_length, &[])?; // → nonce 0001
         let length = u16::from_be_bytes([length_pt[0], length_pt[1]]) as usize;
-
-        //    无法解密。重放合法凭据需要 Sessions map + Tickets store（Go 服务端 117-328 行），
-        //    当前直接拒绝以避免半完成握手。
+        // 5. 0-RTT ticket 路径（Go server.go:198-235）：client 快路径凭缓存 ticket
+        //    重连——解 ticket → 查会话（replay 防护/过期噪声）→ PreWrite 16B 随机。
         if length == 32 {
-            return Err(VlessError::Other(
-                "0-RTT replay not supported on server (Phase B)".into(),
-            ));
+            return self
+                .handshake_zero_rtt(conn, &mut nfs_aead, &nfs_key, &iv)
+                .await;
         }
 
         // 6. 读 encryptedPfsPublicKey(length) → pfs_public_key(1216)
@@ -882,11 +958,39 @@ impl ServerInstance {
             );
             let mut ticket = [0u8; 16];
             rng.fill_bytes(&mut ticket);
-            // Go server.go:271-277：seconds 编码进 ticket 前 2B（client Open 后
-            // DecodeLength 得 seconds 并设 Expire）。seconds_from=0 时保持全零
-            // （client 不缓存），与既有 Rust↔Rust 测试行为一致。
-            let secs = u16::try_from(self.seconds_from).unwrap_or(u16::MAX);
-            ticket[0..2].copy_from_slice(&secs.to_be_bytes());
+            // Go server.go:271-277：协商有效期秒数（to==0 → from×rand[50,100)/100，
+            // 否则 rand[from,to)），编码进 ticket 前 2B（client Open 后 DecodeLength
+            // 得 seconds 并设 Expire）。seconds=0 时 ticket 保持随机（client 不缓存）。
+            use rand::Rng as _;
+            let seconds: u64 = if self.seconds_to == 0 {
+                u64::from(self.seconds_from) * rng.random_range(50u64..100) / 100
+            } else if self.seconds_from >= self.seconds_to {
+                // Go RandBetween：from==to → 恒返回 from（crypto.go:13-14）
+                u64::from(self.seconds_from)
+            } else {
+                rng.random_range(u64::from(self.seconds_from)..u64::from(self.seconds_to))
+            };
+            // Go server.go:278-284：seconds>0 时 ticket+pfsKey 入会话库
+            // （Lasts 预期过期分钟 / Tickets FIFO / Sessions map）。
+            if seconds > 0 {
+                let max_seconds = i64::from(self.seconds_from.max(self.seconds_to));
+                // Go server.go:280：(time.Now().Unix() + max(seconds))/60 + 2 —— 秒级
+                // 时间戳换算分钟，+2 保险余量。
+                let now_secs = unix_minute() * 60;
+                let mut store = self.sessions.lock();
+                store
+                    .lasts
+                    .insert((now_secs + max_seconds) / 60 + 2, ticket);
+                store.tickets.push(ticket);
+                store.sessions.insert(
+                    ticket,
+                    ServerSession {
+                        pfs_key: pfs_key.clone(),
+                        nfs_keys: HashSet::new(),
+                    },
+                );
+                tracing::info!(sessions = store.sessions.len(), seconds, "vless enc: 1-RTT done, session stored (ticket issued)");
+            }
             let mut server_hello = Vec::with_capacity(1136 + 32 + 34);
             nfs_aead.seal(
                 &mut server_hello,
@@ -932,6 +1036,115 @@ impl ServerInstance {
             );
             Ok(Box::new(conn_wrapper))
         }
+    }
+
+    /// 0-RTT ticket 路径（对齐 Go `server.go Handshake` length==32 分支，198-235 行）。
+    ///
+    /// 流程：`seconds_from/seconds_to` 均 0 → 拒绝；解 nfsAEAD 密封的 16B ticket →
+    /// 查会话库：miss 时写随机噪声（让 client 重新握手）后报 expired ticket；hit 时
+    /// 以 nfs_key 做 replay 防护（同 ticket 同 nfs_key 二次使用即拒），派生
+    /// `united_key = 缓存 pfs_key + 本次 nfs_key`，下行 AEAD context=16B PreWrite
+    /// 随机数、上行 context=加密 ticket 32B。
+    ///
+    /// # Errors
+    /// 未启用 0-RTT / IO / ticket 解密失败 / 过期 / replay 返回 [`VlessError`]。
+    async fn handshake_zero_rtt<C>(
+        &self,
+        mut conn: C,
+        nfs_aead: &mut crate::encryption::aead::Aead,
+        nfs_key: &[u8; 32],
+        iv: &[u8; 16],
+    ) -> Result<Box<dyn EncryptionConn>>
+    where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
+    {
+        use rand::Rng as _;
+        use rand_core::RngCore;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let use_aes = true;
+        if self.seconds_from == 0 && self.seconds_to == 0 {
+            return Err(VlessError::Other("0-RTT is not allowed".into()));
+        }
+        // Go server.go:202-209：读 nfsAEAD 密封的 encryptedTicket(32B) → ticket 明文(16B)
+        let mut encrypted_ticket = [0u8; 32];
+        conn.read_exact(&mut encrypted_ticket).await?;
+        let mut ticket_pt = Vec::with_capacity(16);
+        nfs_aead.open(&mut ticket_pt, None, &encrypted_ticket, &[])?;
+        let ticket: [u8; 16] = ticket_pt
+            .as_slice()
+            .try_into()
+            .map_err(|_| VlessError::Other("ticket plaintext not 16 bytes".into()))?;
+
+        // Go server.go:210-222：查会话；miss → 写噪声让 client 重新握手
+        let hit_pfs_key = self.sessions.lock().sessions.get(&ticket).map(|s| s.pfs_key.clone());
+        let Some(pfs_key) = hit_pfs_key else {
+            // 噪声长度匹配 1-RTT server hello（1279..2279），随机重填直到不是
+            // 合法 TLS record header（防被上层误解析）。
+            let mut noises = vec![0u8; rand::rng().random_range(1279usize..2279)];
+            loop {
+                rand::rng().fill_bytes(&mut noises);
+                let hdr: [u8; 5] = noises[..5].try_into().expect("noise >= 5 bytes");
+                if crate::encryption::common::decode_tls_record_header(&hdr).is_err() {
+                    break;
+                }
+            }
+            conn.write_all(&noises).await?;
+            conn.flush().await?;
+            return Err(VlessError::Other("expired ticket".into()));
+        };
+
+        // Go server.go:223-225：replay 防护——同一 ticket 已用过同一 nfsKey 即拒
+        // （正常 client 每次连接新协商 nfs_key，重放整条连接字节必然同 nfs_key）。
+        let aead;
+        let peer_aead;
+        let pre_write;
+        let united_key;
+        {
+            let mut store = self.sessions.lock();
+            let session = store
+                .sessions
+                .get_mut(&ticket)
+                .expect("session checked above");
+            if !session.nfs_keys.insert(*nfs_key) {
+                return Err(VlessError::Other("replay detected".into()));
+            }
+            tracing::info!(nfs_keys = session.nfs_keys.len(), "vless enc: 0-RTT ticket accepted (session hit, replay-guard recorded)");
+            // Go server.go:226：缓存 pfs_key + 本次新 nfs_key（同 nfsKey 链接上下行，
+            // 防 server→client 的另一请求）。
+            united_key = {
+                let mut v = Vec::with_capacity(96);
+                v.extend_from_slice(&pfs_key);
+                v.extend_from_slice(nfs_key);
+                v
+            };
+            // Go server.go:227-230：PreWrite 16B 随机（恒信自己不信 client，且防被
+            // 解析为 TLS 造成 native/xorpub 误中断）；下行 AEAD ctx=PreWrite，上行
+            // ctx=encryptedTicket（不可变 ctx + 上下行 ctx 长度不同防反射）。
+            let mut pw = [0u8; 16];
+            rand::rng().fill_bytes(&mut pw);
+            pre_write = pw;
+            aead = crate::encryption::aead::Aead::new(&pw, &united_key, use_aes);
+            peer_aead = crate::encryption::aead::Aead::new(&encrypted_ticket, &united_key, use_aes);
+        }
+        if self.xor_mode == 2 {
+            // Go server.go:232：写 CTR=NewCTR(uk, PreWrite)（outSkip=16，Rust XorConn
+            // Phase A 无 skip 简化），读 CTR=NewCTR(uk, iv)（解 client 写侧）。
+            let xor_conn = crate::encryption::xor_conn::XorConn::new(
+                conn,
+                CtrXor::new(&united_key, iv)?,
+                CtrXor::new(&united_key, &pre_write)?,
+            );
+            return Ok(Box::new(xor_conn));
+        }
+        let conn_wrapper = crate::encryption::common_conn::CommonConn::new_server_zero_rtt(
+            conn,
+            aead,
+            peer_aead,
+            pre_write.to_vec(),
+            united_key,
+            use_aes,
+        );
+        Ok(Box::new(conn_wrapper))
     }
 }
 
@@ -1378,6 +1591,308 @@ mod tests {
             return;
         }
         panic!("0-RTT wire verification failed after 32 attempts");
+    }
+
+    // === server 0-RTT 会话全流程（对齐 Go server.go Sessions/replay/过期语义） ===
+
+    /// X25519 密钥对（client pkeys / server skeys）。
+    fn x25519_keypair() -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let mut priv_bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut priv_bytes);
+        let secret = x25519_dalek::StaticSecret::from(priv_bytes);
+        (
+            vec![x25519_dalek::PublicKey::from(&secret).as_bytes().to_vec()],
+            vec![priv_bytes.to_vec()],
+        )
+    }
+
+    /// 手动构造 0-RTT 首包（对齐 Go client.go:113-129 wire）：iv(16) +
+    /// ephemeral pub(32) + nfsAEAD(EncodeLength(32))(18) + nfsAEAD(ticket)(32)。
+    /// ephemeral pub 最高位恒 0（server 恒拒非零，Go server.go:150-152）。
+    fn build_zero_rtt_first_flight(server_pub_bytes: &[u8], cached_ticket: &[u8; 16]) -> Vec<u8> {
+        let server_pub = x25519_dalek::PublicKey::from(
+            <[u8; 32]>::try_from(server_pub_bytes).expect("server pub 32B"),
+        );
+        loop {
+            let mut ep = [0u8; 32];
+            rand::rng().fill_bytes(&mut ep);
+            let eph = x25519_dalek::StaticSecret::from(ep);
+            let pub_bytes = x25519_dalek::PublicKey::from(&eph).to_bytes();
+            if pub_bytes[31] > 127 {
+                continue;
+            }
+            let nfs_key = eph.diffie_hellman(&server_pub);
+            let mut iv = [0u8; 16];
+            rand::rng().fill_bytes(&mut iv);
+            let mut nfs_aead = crate::encryption::aead::Aead::new(&iv, nfs_key.as_bytes(), true);
+            let mut ff = Vec::with_capacity(16 + 32 + 18 + 32);
+            ff.extend_from_slice(&iv);
+            ff.extend_from_slice(&pub_bytes);
+            nfs_aead
+                .seal(&mut ff, None, &32u16.to_be_bytes(), &[])
+                .unwrap();
+            nfs_aead.seal(&mut ff, None, cached_ticket, &[]).unwrap();
+            return ff;
+        }
+    }
+
+    /// 双连全流程：连接 1 走 1-RTT 建会话（server 会话库 +1），连接 2 同一
+    /// client/server 实例走 0-RTT（会话命中、不新增会话）且双向数据互通。
+    /// X25519 ephemeral pub 最高位随机 ~50% 被 server 拒 → 整连重试 32 次。
+    #[tokio::test]
+    async fn zero_rtt_server_dual_connection_full_flow() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (client_pkeys, server_skeys) = x25519_keypair();
+        let mut client = ClientInstance::new();
+        client.init(client_pkeys.clone(), 0, 600, "").unwrap();
+        let mut server = ServerInstance::new();
+        server.init(server_skeys.clone(), 0, 600, 600, "").unwrap();
+
+        // 连接 1：1-RTT
+        let mut established = false;
+        for _ in 0..32 {
+            let (c1, s1) = tokio::io::duplex(64 * 1024);
+            let r = tokio::join!(client.handshake(c1), server.handshake(s1));
+            if !matches!(r, (Ok(_), Ok(_))) {
+                continue;
+            }
+            let store = server.sessions.lock();
+            assert_eq!(store.sessions.len(), 1, "1-RTT 后应建 1 条会话");
+            assert_eq!(store.tickets.len(), 1);
+            assert_eq!(
+                store.sessions.values().next().unwrap().pfs_key.len(),
+                64,
+                "会话缓存 pfs_key(64B)"
+            );
+            assert!(client.expire_cache.read().is_some(), "client 已缓存凭据");
+            established = true;
+            break;
+        }
+        assert!(established, "1-RTT first connection failed after 32 attempts");
+
+        // 连接 2：0-RTT 快路径
+        for _ in 0..32 {
+            let (c2, s2) = tokio::io::duplex(64 * 1024);
+            let r = tokio::join!(client.handshake(c2), server.handshake(s2));
+            let (Ok(mut cc), Ok(mut ss)) = r else {
+                continue;
+            };
+            assert_eq!(
+                server.sessions.lock().sessions.len(),
+                1,
+                "0-RTT 命中既有会话，不新增（新增=走了 1-RTT 假绿）"
+            );
+            assert_eq!(
+                server.sessions.lock().sessions.values().next().unwrap().nfs_keys.len(),
+                1,
+                "本次连接的 nfs_key 已入 replay 防护集"
+            );
+            cc.write_all(b"c2s-0rtt-data").await.unwrap();
+            cc.flush().await.unwrap();
+            let mut buf = [0u8; 13];
+            ss.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"c2s-0rtt-data");
+            ss.write_all(b"s2c-0rtt-data").await.unwrap();
+            ss.flush().await.unwrap();
+            let mut buf2 = [0u8; 13];
+            cc.read_exact(&mut buf2).await.unwrap();
+            assert_eq!(&buf2, b"s2c-0rtt-data");
+            return;
+        }
+        panic!("0-RTT second connection failed after 32 attempts");
+    }
+
+    /// replay 拒绝：同一 0-RTT 首包字节（同 iv/relays/ticket → 同 nfs_key）二次
+    /// 提交同一 server 实例 → "replay detected"（Go server.go:223-225）。
+    #[tokio::test]
+    async fn zero_rtt_replay_detected_on_duplicate_first_flight() {
+        let (client_pkeys, server_skeys) = x25519_keypair();
+        let mut client = ClientInstance::new();
+        client.init(client_pkeys.clone(), 0, 600, "").unwrap();
+        let mut server = ServerInstance::new();
+        server.init(server_skeys.clone(), 0, 600, 600, "").unwrap();
+
+        // 连接 1：1-RTT 建会话
+        let mut established = false;
+        for _ in 0..32 {
+            let (c1, s1) = tokio::io::duplex(64 * 1024);
+            let r = tokio::join!(client.handshake(c1), server.handshake(s1));
+            if matches!(r, (Ok(_), Ok(_))) {
+                established = true;
+                break;
+            }
+        }
+        assert!(established, "1-RTT first connection failed after 32 attempts");
+
+        // 连接 2：手动构造 0-RTT 首包（同 client 缓存 ticket + 新 ephemeral），
+        // 先提交一次（会话命中），再原样重放。
+        let cached_ticket = *client.ticket_cache.read().as_ref().expect("ticket cached");
+        let first_flight = build_zero_rtt_first_flight(&client_pkeys[0], &cached_ticket);
+        {
+            let (mut fake_c, fake_s) = tokio::io::duplex(64 * 1024);
+            use tokio::io::AsyncWriteExt as _;
+            fake_c.write_all(&first_flight).await.unwrap();
+            server
+                .handshake(fake_s)
+                .await
+                .expect("同一首包首次提交应成功（会话命中）");
+        }
+
+        // 重放同一首包字节 → replay detected（同 nfs_key 二次使用）
+        for _ in 0..4 {
+            let (mut fake_c, fake_s) = tokio::io::duplex(64 * 1024);
+            use tokio::io::AsyncWriteExt as _;
+            fake_c.write_all(&first_flight).await.unwrap();
+            let err = match server.handshake(fake_s).await {
+                Err(e) => e,
+                Ok(_) => panic!("replayed first flight must be rejected"),
+            };
+            let msg = match &err {
+                VlessError::Other(m) => m.clone(),
+                other => panic!("unexpected error kind: {other:?}"),
+            };
+            assert!(
+                msg.contains("replay detected"),
+                "重放应报 replay detected，实际: {msg}"
+            );
+        }
+    }
+
+    /// 过期 ticket：会话库无此 ticket（server 重启/过期）→ 写 1279..2279B 非 TLS
+    /// header 噪声让 client 重新握手 + "expired ticket"（Go server.go:213-222）。
+    #[tokio::test]
+    async fn zero_rtt_expired_ticket_writes_noise() {
+        use tokio::io::AsyncReadExt;
+        let (client_pkeys, server_skeys) = x25519_keypair();
+        let mut client = ClientInstance::new();
+        client.init(client_pkeys.clone(), 0, 600, "").unwrap();
+        let mut server = ServerInstance::new();
+        server.init(server_skeys.clone(), 0, 600, 600, "").unwrap();
+        // 连接 1：1-RTT 建会话 + client 缓存
+        let mut established = false;
+        for _ in 0..32 {
+            let (c1, s1) = tokio::io::duplex(64 * 1024);
+            let r = tokio::join!(client.handshake(c1), server.handshake(s1));
+            if matches!(r, (Ok(_), Ok(_))) {
+                established = true;
+                break;
+            }
+        }
+        assert!(established, "1-RTT first connection failed after 32 attempts");
+        // 全新 server 实例（同密钥、seconds>0、零会话）模拟 server 侧重启/过期
+        let mut fresh_server = ServerInstance::new();
+        fresh_server.init(server_skeys.clone(), 0, 600, 600, "").unwrap();
+
+        // 手动构造 0-RTT 首包（ticket 在 fresh_server 会话库中不存在）
+        let cached_ticket = *client.ticket_cache.read().as_ref().expect("ticket cached");
+        let first_flight = build_zero_rtt_first_flight(&client_pkeys[0], &cached_ticket);
+
+        let (mut fake_c, fake_s) = tokio::io::duplex(64 * 1024);
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        fake_c.write_all(&first_flight).await.unwrap();
+        let err = match fresh_server.handshake(fake_s).await {
+            Err(e) => e,
+            Ok(_) => panic!("expired ticket must be rejected"),
+        };
+        let msg = match &err {
+            VlessError::Other(m) => m.clone(),
+            other => panic!("unexpected error kind: {other:?}"),
+        };
+        assert!(msg.contains("expired ticket"), "实际: {msg}");
+
+        // 发起方读到 1279..2279B 噪声（非 TLS header，长度匹配 1-RTT server hello），
+        // 对应 Go client 侧触发重新握手语义。
+        use tokio::io::AsyncReadExt as _;
+        let mut noise = Vec::new();
+        fake_c.read_to_end(&mut noise).await.unwrap();
+        assert!(
+            (1279..2279).contains(&noise.len()),
+            "噪声长度应匹配 1-RTT server hello 范围，实际 {}",
+            noise.len()
+        );
+        let hdr: [u8; 5] = noise[..5].try_into().unwrap();
+        assert!(
+            crate::encryption::common::decode_tls_record_header(&hdr).is_err(),
+            "噪声应非法 TLS header"
+        );
+    }
+
+    /// 过期清理语义（Go server.go:90-102）：当下分钟清理不动未来分钟条目；
+    /// 目标分钟清理删除该 ticket 及之前的全部会话（Tickets FIFO 截断），
+    /// 并带走 minute-1 保险条目。
+    #[tokio::test]
+    async fn session_expiry_cleanup_matches_go_semantics() {
+        let (client_pkeys, server_skeys) = x25519_keypair();
+        let mut client = ClientInstance::new();
+        client.init(client_pkeys.clone(), 0, 600, "").unwrap();
+        let mut server = ServerInstance::new();
+        server.init(server_skeys.clone(), 0, 600, 600, "").unwrap();
+        let mut established = false;
+        for _ in 0..32 {
+            let (c1, s1) = tokio::io::duplex(64 * 1024);
+            let r = tokio::join!(client.handshake(c1), server.handshake(s1));
+            if matches!(r, (Ok(_), Ok(_))) {
+                established = true;
+                break;
+            }
+        }
+        assert!(established, "1-RTT first connection failed after 32 attempts");
+        let expiry_minute = *server
+            .sessions
+            .lock()
+            .lasts
+            .keys()
+            .next()
+            .expect("1-RTT 应写入 lasts");
+        assert!(expiry_minute > unix_minute(), "过期分钟应在未来");
+
+        // 当下分钟清理：不动
+        server.sessions.lock().cleanup_expired(unix_minute());
+        assert_eq!(server.sessions.lock().sessions.len(), 1);
+
+        // 保险条目：minute-1 也应在目标清理时一并删除
+        server
+            .sessions
+            .lock()
+            .lasts
+            .insert(expiry_minute - 1, [7u8; 16]);
+
+        // 目标分钟清理：会话清空
+        server.sessions.lock().cleanup_expired(expiry_minute);
+        let store = server.sessions.lock();
+        assert!(store.sessions.is_empty(), "目标分钟清理应删会话");
+        assert!(store.tickets.is_empty(), "Tickets FIFO 截断为空");
+        assert!(!store.lasts.contains_key(&expiry_minute));
+        assert!(!store.lasts.contains_key(&(expiry_minute - 1)), "minute-1 保险删除");
+    }
+
+    /// seconds 全 0 配置拒绝 0-RTT（Go server.go:199-201 "0-RTT is not allowed"）。
+    #[tokio::test]
+    async fn zero_rtt_rejected_when_seconds_disabled() {
+        let (client_pkeys, server_skeys) = x25519_keypair();
+        // client 有缓存（手动填充）但 server seconds=0
+        let mut client = ClientInstance::new();
+        client.init(client_pkeys.clone(), 0, 600, "").unwrap();
+        *client.pfs_key_cache.write() = Some(vec![0xAA; 64]);
+        *client.ticket_cache.write() = Some([0xBB; 16]);
+        *client.expire_cache.write() = Some(Instant::now() + std::time::Duration::from_secs(60));
+        let mut server = ServerInstance::new();
+        server.init(server_skeys.clone(), 0, 0, 0, "").unwrap();
+
+        // 手动构造 0-RTT 首包（seconds=0 的 server 必须拒绝）
+        let first_flight = build_zero_rtt_first_flight(&client_pkeys[0], &[0xBB; 16]);
+        let (mut fake_c, fake_s) = tokio::io::duplex(64 * 1024);
+        use tokio::io::AsyncWriteExt as _;
+        fake_c.write_all(&first_flight).await.unwrap();
+        let err = match server.handshake(fake_s).await {
+            Err(e) => e,
+            Ok(_) => panic!("0-RTT must be rejected when seconds disabled"),
+        };
+        let msg = match &err {
+            VlessError::Other(m) => m.clone(),
+            other => panic!("unexpected error kind: {other:?}"),
+        };
+        assert!(msg.contains("0-RTT is not allowed"), "实际: {msg}");
     }
     /// ML-KEM-768 烟雾测试：仅验 from_seed → encapsulation_key 通路可达
     #[test]

@@ -30,7 +30,7 @@ use xray_conf::{BuiltConfig, BuiltInbound};
 use std::collections::HashMap;
 use xray_proto::xray::proxy::vless::Account as VlessProtoAccount;
 use xray_proxy_trojan::{serve_trojan, MemoryAccount as TrojanMemoryAccount, MemoryUser as TrojanMemoryUser, fallback::{Fallback, FallbackPolicy}};
-use xray_proxy_vless::{serve_vless, MemoryAccount as VlessMemoryAccount, MemoryUser as VlessMemoryUser, MemoryValidator as VlessMemoryValidator, Validator as VlessValidator};
+use xray_proxy_vless::{serve_vless, MemoryAccount as VlessMemoryAccount, MemoryUser as VlessMemoryUser, MemoryValidator as VlessMemoryValidator, Validator as VlessValidator, VlessInboundOptions};
 use xray_proxy_vmess::{serve_vmess, MemoryAccount as VmessMemoryAccount, MemoryUser as VmessMemoryUser, TimedUserValidator as VmessTimedUserValidator, Validator as VmessValidator, VmessError};
 use xray_common::uuid::UUID;
 // tdy: http + dokodemo inbound 集成
@@ -1518,6 +1518,7 @@ async fn serve_reality_vless(
     ohm: Arc<SimpleOhm>,
     validator: Arc<dyn VlessValidator>,
     cfg: RealityInboundConfig,
+    options: Option<VlessInboundOptions>,
 ) -> std::io::Result<()> {
     use xray_reality::server::{RealityServerOutcome, fallback_to_dest, server_tls};
 
@@ -1537,6 +1538,7 @@ async fn serve_reality_vless(
         };
         let handler = Arc::clone(&handler);
         let validator = Arc::clone(&validator);
+        let options = options.clone();
         let key = cfg.server_private_key;
         let ids = cfg.short_ids.clone();
         let max_diff = cfg.max_diff;
@@ -1549,7 +1551,7 @@ async fn serve_reality_vless(
                         tls,
                         &handler,
                         &validator,
-                        None, // VlessInboundOptions（mux/reverse）未接入生产 wiring
+                        options.clone(),
                     )
                     .await
                     {
@@ -1692,6 +1694,13 @@ async fn spawn_one_inbound(
         }
         "vless" => {
             let validator: Arc<dyn VlessValidator> = build_vless_validator(&ib.entry.data)?;
+            // ENC decryption（Go inbound.go:104-114 handler.decryption）：settings
+            // 级 "mlkem768x25519plus.*" 字符串 → handler 级共享 ServerInstance。
+            let decryption = build_vless_decryption(&ib.entry.data)?;
+            let options = VlessInboundOptions {
+                decryption: decryption.clone(),
+                ..Default::default()
+            };
             let settings = xray_transport::dialer::StreamSettings::from_json(
                 ib.stream_settings_json.as_ref(),
             );
@@ -1711,13 +1720,13 @@ async fn spawn_one_inbound(
                     let handler = Arc::clone(&handler);
                     let validator = Arc::clone(&validator);
                     let fallbacks = fallbacks.clone();
+                    let options = options.clone();
                     tokio::spawn(async move {
                         let (peer, local) = transport_conn_addrs(conn.as_ref(), bind_addr);
                         // TLS 已在 transport hub 内终结，name/alpn 不可得
-                        //（Go：非 *tls.Conn 连接同为空，path 仍从首字节提取）。
                         if let Err(e) = xray_proxy_vless::handle_connection_with_fallback(
                             conn, &handler, &validator, fallbacks, peer, local,
-                            String::new(), String::new(), None,
+                            String::new(), String::new(), Some(options),
                         ).await {
                             tracing::debug!(error = %e, "vless transport connection ended with error");
                         }
@@ -1731,15 +1740,15 @@ async fn spawn_one_inbound(
                     let reality = parse_reality_config(&settings)?;
                     tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_count(), fallback = %reality.fallback_dest, "vless+reality inbound listening");
                     Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                        serve_reality_vless(listener, ohm, validator, reality).await
+                        serve_reality_vless(listener, ohm, validator, reality, Some(options)).await
                     })))
                 } else {
                     let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
                     // VLESS fallbacks：Go napfb（name→alpn→path→dest+xver）
                     let fallbacks = build_vless_fallbacks(&ib.entry.data);
-                    tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_count(), tls = tls.is_some(), fallbacks = fallbacks.as_ref().map_or(0, |f| f.len()), "vless inbound listening");
+                    tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_count(), tls = tls.is_some(), fallbacks = fallbacks.as_ref().map_or(0, |f| f.len()), enc = decryption.is_some(), "vless inbound listening");
                     Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                        serve_vless(listener, ohm, validator, tls, fallbacks, None).await
+                        serve_vless(listener, ohm, validator, tls, fallbacks, Some(options)).await
                     })))
                 }
             }
@@ -2128,6 +2137,38 @@ fn build_vless_validator(data: &[u8]) -> std::io::Result<std::sync::Arc<dyn Vles
     }
 
     Ok(std::sync::Arc::new(validator))
+}
+
+/// 解析 settings.decryption → handler 级共享 ENC 解密实例（Go inbound.go:104-114）。
+///
+/// `"none"`/缺省 → `None`（无 ENC 层）；`"mlkem768x25519plus.<mode>.<seconds>s.<keys>"` →
+/// 初始化 [`xray_proxy_vless::encryption::ServerInstance`]（私钥 32B=X25519 /
+/// 64B=ML-KEM-768 seed）。非法非 none 值报错（Go conf 层 Build 同为 error）。
+fn build_vless_decryption(
+    data: &[u8],
+) -> std::io::Result<Option<std::sync::Arc<xray_proxy_vless::encryption::ServerInstance>>> {
+    use xray_proxy_vless::encryption::{parse_server_decryption, ServerInstance as EncServerInstance};
+    let v: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| std::io::Error::other(format!("vless inbound settings JSON: {e}")))?;
+    let raw = v
+        .get("decryption")
+        .and_then(|d| d.as_str())
+        .unwrap_or("none");
+    let Some(p) = parse_server_decryption(raw) else {
+        if raw != "none" && !raw.is_empty() {
+            return Err(std::io::Error::other(format!(
+                "VLESS settings: unsupported \"decryption\": {raw}"
+            )));
+        }
+        return Ok(None);
+    };
+    let mut inst = EncServerInstance::new();
+    let key_count = p.keys.len();
+    inst
+        .init(p.keys, p.xor_mode, p.seconds_from, p.seconds_to, &p.padding)
+        .map_err(|e| std::io::Error::other(format!("vless decryption init: {e}")))?;
+    tracing::info!(seconds_from = p.seconds_from, seconds_to = p.seconds_to, keys = key_count, "vless enc decryption enabled");
+    Ok(Some(std::sync::Arc::new(inst)))
 }
 
 /// Linux abstract namespace padding（Go infra/conf/trojan.go:182-186）。

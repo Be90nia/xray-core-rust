@@ -43,6 +43,10 @@ pub struct CommonConn<C> {
     decrypted_pos: usize,
     /// 待发送的密文 + 已发送偏移 + 对应明文长度。
     write_pending: Option<(Vec<u8>, usize, usize)>,
+    /// 首写前缀（Go `CommonConn.PreWrite`）：server 0-RTT 握手后的首个下行
+    /// record 前附加的 16B 明文随机数，client 以其派生下行 AEAD（Go common.go:69-72，
+    /// 首写时取出拼接后清空）。
+    pre_write: Option<Vec<u8>>,
     closed: bool,
 }
 
@@ -59,6 +63,7 @@ where
             peer_aead: Some(peer_aead),
             use_aes,
             united_key,
+            pre_write: None,
             raw_buf: Vec::new(),
             decrypted: Vec::new(),
             decrypted_pos: 0,
@@ -76,6 +81,33 @@ where
             peer_aead: None,
             use_aes,
             united_key,
+            pre_write: None,
+            raw_buf: Vec::new(),
+            decrypted: Vec::new(),
+            decrypted_pos: 0,
+            write_pending: None,
+            closed: false,
+        }
+    }
+
+    /// server 0-RTT 构造（Go server.go:227-230）：下行 AEAD 已就绪
+    /// （context=PreWrite 16B 随机数），上行 `peer_aead` context=客户端加密 ticket
+    /// 32B；`pre_write` 在首个下行 record 前明文写出（Go common.go:69-72）。
+    pub fn new_server_zero_rtt(
+        conn: C,
+        aead: Aead,
+        peer_aead: Aead,
+        pre_write: Vec<u8>,
+        united_key: Vec<u8>,
+        use_aes: bool,
+    ) -> Self {
+        Self {
+            conn,
+            aead,
+            peer_aead: Some(peer_aead),
+            use_aes,
+            united_key,
+            pre_write: Some(pre_write),
             raw_buf: Vec::new(),
             decrypted: Vec::new(),
             decrypted_pos: 0,
@@ -247,7 +279,12 @@ where
                 this.aead = Aead::new(&header, &this.united_key, this.use_aes);
             }
 
-            let mut ct = Vec::with_capacity(TLS_RECORD_HEADER_LEN + n + TAG_LEN);
+            let mut ct = Vec::with_capacity(TLS_RECORD_HEADER_LEN + n + TAG_LEN + 16);
+            // 首写前缀（Go common.go:69-72）：server 0-RTT 的 16B 明文随机数
+            // 与首个 record 同次写出，随后清空（后续写不含前缀）。
+            if let Some(pre) = this.pre_write.take() {
+                ct.extend_from_slice(&pre);
+            }
             ct.extend_from_slice(&header);
             if let Err(e) = this.aead.seal(&mut ct, None, data, &header) {
                 return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())));

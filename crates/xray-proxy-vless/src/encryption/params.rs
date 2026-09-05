@@ -95,6 +95,82 @@ pub fn parse_client_encryption(raw: &str) -> Option<ClientEncParams> {
     Some(ClientEncParams { keys, xor_mode, seconds, padding })
 }
 
+/// ENC 入站参数（解析后等价于 Go conf.Build 之后的 `inbound.Config` 字段集合）。
+///
+/// - `keys`：`base64url-decoded` 私钥（X25519 seed 32B 或 ML-KEM-768 seed 64B）
+/// - `seconds_from`/`seconds_to`：ticket 有效期范围（Go `SecondsFrom/SecondsTo`）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerDecParams {
+    pub keys: Vec<Vec<u8>>,
+    pub xor_mode: u32,
+    pub seconds_from: u32,
+    pub seconds_to: u32,
+    pub padding: String,
+}
+
+/// 校验 + 解析服务端 decryption 字符串。
+///
+/// 格式（Go `infra/conf/vless.go:107-149`）：
+/// `mlkem768x25519plus.<mode>.<from>[-<to>]s.<keys...>[.padding...]`，
+/// keys 解码后 32B（X25519 私钥）或 64B（ML-KEM-768 seed）；短 part（<20 字符）
+/// 为 padding 段。返回 `None` 时调用方按 `"none"` 处理或报 unsupported。
+pub fn parse_server_decryption(raw: &str) -> Option<ServerDecParams> {
+    if raw.is_empty() || raw == "none" {
+        return None;
+    }
+    let s: Vec<&str> = raw.split('.').collect();
+    if s.len() < 4 || s[0] != "mlkem768x25519plus" {
+        return None;
+    }
+    let xor_mode = match s[1] {
+        "native" => 0,
+        "xorpub" => 1,
+        "random" => 2,
+        _ => return None,
+    };
+    // 秒段："<from>s" / "<from>-<to>s"（尾缀 s 可省，Go TrimSuffix）
+    let t: Vec<&str> = s[2].strip_suffix('s').unwrap_or(s[2]).splitn(2, '-').collect();
+    let seconds_from: u32 = t[0].parse().ok()?;
+    let seconds_to: u32 = match t.get(1) {
+        Some(v) => v.parse().ok()?,
+        None => 0,
+    };
+    // padding 与 keys（对齐 client 侧：短 part 为 padding 段）
+    let mut padding_len: usize = 0;
+    let mut keys: Vec<Vec<u8>> = Vec::with_capacity(s.len().saturating_sub(3));
+    for part in &s[3..] {
+        if part.len() < 20 {
+            padding_len += part.len() + 1;
+            continue;
+        }
+        let bytes = URL_SAFE_NO_PAD.decode(part.as_bytes()).ok()?;
+        if bytes.len() != 32 && bytes.len() != 64 {
+            return None;
+        }
+        keys.push(bytes);
+    }
+    if keys.is_empty() {
+        return None;
+    }
+    let prefix_len = 27 + s[2].len();
+    let padding = if padding_len > 0 {
+        let end = prefix_len + padding_len.saturating_sub(1);
+        if end > raw.len() {
+            return None;
+        }
+        raw[prefix_len..end].to_string()
+    } else {
+        String::new()
+    };
+    Some(ServerDecParams {
+        keys,
+        xor_mode,
+        seconds_from,
+        seconds_to,
+        padding,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

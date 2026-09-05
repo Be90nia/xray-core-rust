@@ -43,7 +43,7 @@ use crate::validator::Validator;
 /// - `reverse_registry`：启用 Reverse 时必填；Portal 注册表（domain → PortalConfig）。
 ///
 /// 默认全 false（`Default::default()`），与既有行为一致（warn 跳过非 TCP 命令）。
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct VlessInboundOptions {
     /// 启用 Mux 协议识别（仅识别首字节 0xFF；完整 mux server 协议不在本批次范围）。
     pub enable_mux: bool,
@@ -56,6 +56,11 @@ pub struct VlessInboundOptions {
     pub reverse_registry: Option<Arc<crate::inbound::reverse::ReverseRegistry>>,
     /// Reverse 解析用的出口管理器引用：Portal tag → `PortalOutbound` 查找。
     pub reverse_ohm: Option<Arc<SimpleOhm>>,
+    /// ENC 解密实例（Go `inbound.go:81 handler.decryption`，settings.decryption
+    /// 非 "none" 时启用）：连接进入 VLESS 编码层前先跑 ML-KEM-768/X25519 握手
+    /// （1-RTT / 0-RTT ticket）。handler 级共享（`Arc`），所有连接共用
+    /// Sessions/replay 防护状态。
+    pub decryption: Option<Arc<crate::encryption::ServerInstance>>,
 }
 
 /// VLESS inbound 服务入口。
@@ -206,9 +211,30 @@ pub async fn handle_connection_with_fallback<S>(
     options: Option<VlessInboundOptions>,
 ) -> std::io::Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
 {
     use tokio::io::AsyncReadExt;
+
+    /// 类型擦除连接（S 与 ENC 握手产物统一为 boxed trait object；ENC 产物是
+    /// `Box<dyn EncryptionConn>`，其 supertrait 已覆盖本 trait，coercion 直达）。
+    trait ErasedConn: AsyncRead + AsyncWrite + Unpin + Send {}
+    impl<T: AsyncRead + AsyncWrite + Unpin + Send + ?Sized> ErasedConn for T {}
+
+    // ENC 解密层（Go inbound.go:275-278）：settings.decryption 非 "none" 时，
+    // 连接先跑 ML-KEM-768/X25519 握手（1-RTT 或 0-RTT ticket）再进 VLESS 编码层。
+    // decryption 与 fallbacks 在 Go conf 层互斥（vless.go:157-159），故握手置于
+    // fallback 预读之前。
+    let stream: std::pin::Pin<Box<dyn ErasedConn>> = match options.as_ref().and_then(|o| o.decryption.clone()) {
+        Some(dec) => Box::pin(
+            dec.handshake(stream)
+                .await
+                .map_err(|e| {
+                    tracing::info!(error = %e, "vless enc handshake failed");
+                    std::io::Error::other(format!("vless enc handshake: {e}"))
+                })?,
+        ),
+        None => Box::pin(stream),
+    };
 
     // 无 fallback 策略：维持原直连路径（不做 first 预读）
     let Some(policy) = fallbacks else {
@@ -1103,6 +1129,7 @@ mod tests {
             enable_reverse: false,
             reverse_registry: None,
             reverse_ohm: None,
+            decryption: None,
         };
         tokio::spawn(async move {
             let _ = serve_vless(
@@ -1166,6 +1193,7 @@ mod tests {
             enable_reverse: false,
             reverse_registry: None,
             reverse_ohm: None,
+            decryption: None,
         };
         tokio::spawn(async move {
             let _ = serve_vless(
@@ -1213,6 +1241,7 @@ mod tests {
             enable_reverse: false,
             reverse_registry: None,
             reverse_ohm: None,
+            decryption: None,
         };
         tokio::spawn(async move {
             let _ = serve_vless(
@@ -1271,6 +1300,7 @@ mod tests {
             enable_reverse: true,
             reverse_registry: Some(Arc::clone(&registry)),
             reverse_ohm: Some(Arc::clone(&ohm_clone)),
+            decryption: None,
         };
         tokio::spawn(async move {
             let _ = serve_vless(
