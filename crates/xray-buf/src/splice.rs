@@ -8,7 +8,7 @@
 #[cfg(target_os = "linux")]
 mod linux {
     use std::io;
-    use std::os::fd::{AsRawFd, BorrowedFd};
+    use std::os::fd::{AsFd, BorrowedFd};
     use std::time::Duration;
 
     use nix::fcntl::{splice, SpliceFFlags};
@@ -18,7 +18,7 @@ mod linux {
     const BACKOFF: Duration = Duration::from_millis(1);
 
     fn splice_one_way(
-        fd_in: i32, fd_out: i32,
+        fd_in: BorrowedFd<'_>, fd_out: BorrowedFd<'_>,
         pipe_read: BorrowedFd<'_>, pipe_write: BorrowedFd<'_>,
     ) -> io::Result<u64> {
         let flags = SpliceFFlags::SPLICE_F_NONBLOCK;
@@ -45,12 +45,12 @@ mod linux {
 
     pub async fn splice_copy_bidirectional<A, B>(a: A, b: B) -> io::Result<(u64, u64)>
     where
-        A: AsRawFd + Send + 'static,
-        B: AsRawFd + Send + 'static,
+        A: AsFd + Send + 'static,
+        B: AsFd + Send + 'static,
     {
-        let a_fd = a.as_raw_fd();
-        let b_fd = b.as_raw_fd();
         tokio::task::spawn_blocking(move || {
+            let a_fd = a.as_fd();
+            let b_fd = b.as_fd();
             let (pr, pw) = pipe2(nix::fcntl::OFlag::O_NONBLOCK)
                 .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
             let a2b = splice_one_way(a_fd, b_fd, pr.as_fd(), pw.as_fd())?;

@@ -223,7 +223,6 @@ impl LinuxSockOpt {
         }
         Ok(())
     }
-}
 
     /// 设置 SO_MARK（包标记，用于 iptables/fwmark 策略路由）。
     /// 对应 Go `unix.SetsockoptInt(fd, SOL_SOCKET, SO_MARK, mark)`。
@@ -280,6 +279,7 @@ impl LinuxSockOpt {
         }
         Ok(())
     }
+}
 
 /// Linux SO_ORIGINAL_DST 常量。libc crate 未导出此值。
 /// 对应 Go `syscall.SO_ORIGINAL_DST = 80`。

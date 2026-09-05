@@ -412,8 +412,10 @@ async fn start_recv_loop_tproxy_linux(
                         if n == 0 {
                             continue;
                         }
+                        // 先拷出 control_len，释放 msg 对 name/cmsg_buf 的可变借用。
+                        let control_len = msg.control_len();
                         let source = name.as_socket();
-                        let target = parse_orig_dst_from_cmsg(&cmsg_buf, msg.control_len());
+                        let target = parse_orig_dst_from_cmsg(&cmsg_buf, control_len);
                         let payload = unsafe {
                             std::slice::from_raw_parts(data_buf.as_ptr() as *const u8, n).to_vec()
                         };
