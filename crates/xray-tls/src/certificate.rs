@@ -235,6 +235,22 @@ fn file_or_inline(
     }
 }
 
+/// 从 PEM 解析私钥，对齐 Go `tls.X509KeyPair`：PEM 标签仅作提示，按 DER 内容
+/// 识别实际格式。
+///
+/// rustls-pemfile 纯按 PEM 标签分发（`RSA PRIVATE KEY` → Pkcs1），而 Go `tls cert`
+/// 生成的 PEM 是错标的（RSA 标签 + SEC1 EC 内容，Go `X509KeyPair` 逐格式尝试所以
+/// 自家能用）。错标交 rustls-pemfile 后被错误定形为 Pkcs1，签名密钥解析按 RSA 走
+/// 必败（"failed to parse private key as RSA, ECDSA, or EdDSA"）。此处用
+/// [`PrivateKeyDer::try_from`]（官方 DER 内容嗅探：跳过外层 SEQUENCE 头后按
+/// version 模式识别 Pkcs8/Pkcs1/Sec1）重新定形；内容无法识别时保留原标签结果，
+/// 正确标签路径行为不变。
+pub(crate) fn pem_private_key(pem: &[u8]) -> io::Result<Option<PrivateKeyDer<'static>>> {
+    let key = rustls_pemfile::private_key(&mut pem.as_ref())
+        .map_err(|e| io::Error::other(format!("parse key PEM: {e}")))?;
+    Ok(key.map(|k| PrivateKeyDer::try_from(k.secret_der().to_vec()).unwrap_or(k)))
+}
+
 /// 解析单个 `certificates[]` 条目 → `(证书链, 可选私钥)`。
 ///
 /// 对应 Go `TLSCertConfig.Build`（infra/conf/transport_security.go:260-298）：
@@ -278,8 +294,7 @@ pub fn entry_certs_and_key(
         "key",
     )?;
     let key = match key_bytes {
-        Some(b) => rustls_pemfile::private_key(&mut b.as_slice())
-            .map_err(|e| io::Error::other(format!("parse key PEM: {e}")))?,
+        Some(b) => pem_private_key(&b)?,
         None => None,
     };
     Ok((certs, key))
@@ -338,6 +353,48 @@ mod tests {
         ] {
             assert!(entry_certs_and_key(&e).is_err(), "scalar inline must error");
         }
+    }
+
+    // ---- 私钥解析：错标 PEM 按 DER 内容重定形（对齐 Go X509KeyPair）----
+
+    /// Go `tls cert` v26.7.28 的实际产出（D:/tmp/interop_key.pem）：RSA PEM 标签
+    /// + PKCS#8 包装的 EC P-256 内容（DER 以 30 81 87 02 01 00 30 开头——Go 侧
+    /// X509KeyPair 不看标签照样能用）。
+    const MISLABELED_EC_KEY_PEM: &str = "\
+-----BEGIN RSA PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg6sUhV38mcGUNG/uc
+aZ9A3Sng12a1YFnJcLOELh+loNChRANCAATG2iorYlDeMjaVlb7XdvtKt1Og/t5H
+45rFCy1LsSXiGo2MktbCiNQHg972FJTwSy5QLYLcuKBbveAMQyiwAs3C
+-----END RSA PRIVATE KEY-----
+";
+
+    /// 纯 SEC1（ECPrivateKey，DER 以 30 6b 02 01 01 04 开头），内容取自上一
+    /// fixture 内嵌的 EC 私钥（EC PRIVATE KEY 正确标签）。
+    const SEC1_EC_KEY_PEM: &str = "\
+-----BEGIN EC PRIVATE KEY-----
+MGsCAQEEIOrFIVd/JnBlDRv7nGmfQN0p4NdmtWBZyXCzhC4fpaDQoUQDQgAExtoq
+K2JQ3jI2lZW+13b7SrdToP7eR+OaxQstS7El4hqNjJLWwojUB4Pe9hSU8EsuUC2C
+3LigW73gDEMosALNwg==
+-----END EC PRIVATE KEY-----
+";
+
+    #[test]
+    fn mislabeled_rsa_tag_ec_content_resolved_as_pkcs8() {
+        let key = pem_private_key(MISLABELED_EC_KEY_PEM.as_bytes()).unwrap().unwrap();
+        assert!(matches!(key, PrivateKeyDer::Pkcs8(_)));
+    }
+
+    #[test]
+    fn correctly_labeled_ec_key_resolved_as_sec1() {
+        let key = pem_private_key(SEC1_EC_KEY_PEM.as_bytes()).unwrap().unwrap();
+        assert!(matches!(key, PrivateKeyDer::Sec1(_)));
+    }
+
+    #[test]
+    fn correctly_labeled_pkcs8_key_resolved_as_pkcs8() {
+        let (_, key_pem) = generate_self_signed_cert(&["localhost"]).unwrap();
+        let key = pem_private_key(key_pem.as_bytes()).unwrap().unwrap();
+        assert!(matches!(key, PrivateKeyDer::Pkcs8(_)));
     }
 
     #[test]
