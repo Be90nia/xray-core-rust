@@ -47,3 +47,12 @@ coverage/
 
 # Local logs
 *.log
+
+# 本地节点凭据与产物(严禁入库)
+vps测试连接.txt
+dist/xray*.exe
+dist/*.body
+dist/*.err
+dist/*.txt
+dist/__pycache__/
+dist/interop_run/
