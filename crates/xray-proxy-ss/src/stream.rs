@@ -39,6 +39,11 @@ pub struct SSStream<C> {
     response_rekey_2022: Option<Rekey2022>,
     /// 半帧状态：size chunk 已解、payload 未收齐时的 wire 长度（`try_open_chunk` 用）。
     pending_payload: Option<usize>,
+    /// SS-2022 服务端响应懒写头状态（`mark_server_response_2022` 设置）。
+    pending_server_2022: Option<PendingServer2022>,
+    /// 已解密待交付的请求首段明文（SS-2022 variable chunk 尾部 payload，
+    /// 对应 sing `serverConn` reader 的 cached 语义）。
+    plain_prefix: Vec<u8>,
 }
 
 /// SS-2022 响应头分阶段解析（读侧 lazy rekey，缓冲版）。
@@ -64,6 +69,13 @@ enum Rekey2022 {
     },
     /// 等待 variable header chunk wire 字节（var_len + tag，内容验证后丢弃）。
     Var { var_len: usize },
+}
+
+/// SS-2022 服务端响应头懒写出输入（sing `serverConn.writeResponse` 所需）。
+struct PendingServer2022 {
+    psk: Vec<u8>,
+    kind: crate::ss2022::CipherKind2022,
+    request_salt: Vec<u8>,
 }
 
 /// LE increment（byte[0]++，进位），对应 Go `GenerateIncreasingNonce`。
@@ -113,6 +125,8 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             response_rekey: None,
             response_rekey_2022: None,
             pending_payload: None,
+            pending_server_2022: None,
+            plain_prefix: Vec::new(),
         })
     }
 
@@ -165,6 +179,8 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             response_rekey: None,
             response_rekey_2022: None,
             pending_payload: None,
+            pending_server_2022: None,
+            plain_prefix: Vec::new(),
         }
     }
 
@@ -181,9 +197,55 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
     /// - [`SsError::AeadSeal`]：AEAD 加密失败。
     /// - [`SsError::Io`]：底层写失败。
     pub async fn write_chunk(&mut self, plaintext: &[u8]) -> Result<()> {
+        if plaintext.is_empty() {
+            return Ok(());
+        }
+        // SS-2022 服务端响应懒写头（sing `serverConn.writeResponse`，service.go:261）：
+        // [resp_salt][AEAD(fixed: type=1|epoch|echo_salt|payload_len)][AEAD(首段数据)]。
+        // 响应握手 chunk **无 2B size 前缀**（sing Writer.WriteChunk 直 seal，客户端
+        // Reader.ReadWithLength 定长读），fixed 用 nonce [0]、首段数据 [1]；之后
+        // body 才走 [2B size+tag][payload+tag] 常规 chunk（nonce [2] 起）。
+        let mut rest = plaintext;
+        if let Some(p) = self.pending_server_2022.take() {
+            let salt: Vec<u8> = (0..p.kind.salt_size()).map(|_| rand::random::<u8>()).collect();
+            let subkey = crate::ss2022::derive_session_subkey(&p.psk, &salt, p.kind);
+            let aead = crate::ss2022::key::build_aead(p.kind, &subkey)
+                .map_err(|e| SsError::InitDecode(e.to_string()))?;
+            self.tag_size = aead.tag_size();
+            self.write_nonce = vec![0xFFu8; aead.nonce_size()];
+            self.write_aead = std::sync::Arc::from(aead);
+            let first_len = plaintext.len().min(8192 - self.tag_size - 2);
+            let epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| SsError::GetCipher(e.to_string()))?
+                .as_secs();
+            let mut fixed = Vec::with_capacity(11 + p.request_salt.len());
+            fixed.push(1u8); // HeaderTypeServer
+            fixed.extend_from_slice(&epoch.to_be_bytes());
+            fixed.extend_from_slice(&p.request_salt);
+            fixed.extend_from_slice(
+                &u16::try_from(first_len)
+                    .map_err(|_| SsError::InsufficientData(first_len))?
+                    .to_be_bytes(),
+            );
+            self.inner.write_all(&salt).await?;
+            increment_nonce_bytes(&mut self.write_nonce);
+            let sealed_fixed = self
+                .write_aead
+                .seal(&self.write_nonce, &[], &fixed)
+                .map_err(|e| SsError::AeadSeal(e.to_string()))?;
+            self.inner.write_all(&sealed_fixed).await?;
+            increment_nonce_bytes(&mut self.write_nonce);
+            let sealed_first = self
+                .write_aead
+                .seal(&self.write_nonce, &[], &plaintext[..first_len])
+                .map_err(|e| SsError::AeadSeal(e.to_string()))?;
+            self.inner.write_all(&sealed_first).await?;
+            rest = &plaintext[first_len..];
+        }
         // 8192 = Go buf.Size；tag_size+2 是 size chunk 的 wire 开销。
         let max_payload = 8192 - self.tag_size - 2;
-        for part in plaintext.chunks(max_payload.max(1)) {
+        for part in rest.chunks(max_payload.max(1)) {
             self.write_single_chunk(part).await?;
         }
         Ok(())
@@ -270,6 +332,8 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             response_rekey: None,
             response_rekey_2022: None,
             pending_payload: None,
+            pending_server_2022: None,
+            plain_prefix: Vec::new(),
         }
     }
 
@@ -281,6 +345,11 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
     /// - [`SsError::AeadOpen`]：AEAD 解密失败（tag 不匹配 / 数据损坏）。
     /// - [`SsError::Io`]：底层读失败（含 UnexpectedEof）。
     pub async fn read_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+        // SS-2022 服务端：variable chunk 尾部携带的请求首段 payload
+        //（sing reader.cached 语义）先于 body chunk 交付。
+        if !self.plain_prefix.is_empty() {
+            return Ok(Some(std::mem::take(&mut self.plain_prefix)));
+        }
         // lazy rekey：Go server response 以新 IV 开头（`WriteTCPResponse`），且只在
         // server 有响应数据时才发出。dial 后立即读 IV 会与「server 等 client body、
         // client 等 server IV」互等死锁，故延迟到第一次 read_chunk 时读取。
@@ -338,6 +407,9 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
     /// 使 pump 层可以用 cancel-safe 的单次底层 read 喂数据（`Box<dyn Connection>`
     /// 无 TcpStream::readable）。半帧状态存 [`Self::pending_payload`]。
     pub fn try_open_chunk(&mut self, pending: &mut Vec<u8>) -> Result<ChunkOut> {
+        if !self.plain_prefix.is_empty() {
+            return Ok(ChunkOut::Message(std::mem::take(&mut self.plain_prefix)));
+        }
         // SS-2022 响应分阶段 rekey（缓冲版）—— sing clientConn.readResponse。
         // 必须在 legacy rekey 前推进：salt 已 drained 字节不可恢复，状态机需顺序消费。
         if self.response_rekey_2022.is_some() {
@@ -608,6 +680,23 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         request_salt: Vec<u8>,
     ) {
         self.response_rekey_2022 = Some(Rekey2022::Salt { psk, kind, request_salt });
+    }
+
+    /// 服务端模式：标记下行首写时发 SS-2022 响应头（sing `writeResponse`）。
+    /// `psk` 为已规整的 server/user PSK；`request_salt` 为客户端请求 salt（回显用）。
+    pub(crate) fn mark_server_response_2022(
+        &mut self,
+        psk: Vec<u8>,
+        kind: crate::ss2022::CipherKind2022,
+        request_salt: Vec<u8>,
+    ) {
+        self.pending_server_2022 = Some(PendingServer2022 { psk, kind, request_salt });
+    }
+
+    /// 预置已解密明文（SS-2022 variable chunk 尾部的请求首段 payload），
+    /// 下次 `read_chunk`/`try_open_chunk` 先于 wire chunk 交付。
+    pub(crate) fn push_plain_prefix(&mut self, data: &[u8]) {
+        self.plain_prefix.extend_from_slice(data);
     }
 
     /// 读 server response 的 IV + 用新 IV 派生新 aead + 重置读侧 nonce 到 `[0xFF;n]`。

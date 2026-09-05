@@ -15,10 +15,8 @@
 //! 3. 构造 AEAD，nonce [0;12]
 //! 4. open fixed-header-chunk：headerType + timestamp_BE_u64 + variableLen_BE_u16
 //! 5. 验证 headerType（0=client）+ timestamp（防重放）
-//! 6. open variable-header-chunk：addr+port + paddingLen + padding
-//! 7. 构造 SSStream 继续读写 body
-//!
-//! 多用户/中继：用每个 user PSK 尝试 open fixed-header，成功即匹配该用户。
+//! 6. open variable-header-chunk：addr+port + paddingLen + padding（尾部含客户端首段 payload，先于 body 交付）
+//! 7. 构造 SSStream 继续读写 body（下行首写自动发 sing writeResponse 响应头）
 
 use std::io;
 use std::sync::Arc;
@@ -467,10 +465,8 @@ async fn read_ss2022_request(
 
     let variable_len = u16::from_be_bytes([fixed_plain[9], fixed_plain[10]]) as usize;
 
-    // 5. 读 variable-header-chunk
-    if variable_len > 900 + 260 {
-        return Err(SsError::Ss2022PaddingTooLarge(variable_len));
-    }
+    // 5. 读 variable-header-chunk（sing 无额外上限，u16 即 wire 上限；
+    // variable chunk 内含 padding + 客户端首段 payload——Go DialEarlyConn 首写）
     let variable_wire_len = variable_len + tag_size;
     let mut variable_wire = vec![0u8; variable_wire_len];
     conn.read_exact(&mut variable_wire).await?;
@@ -480,14 +476,27 @@ async fn read_ss2022_request(
         .map_err(|e| SsError::AeadOpen(e.to_string()))?;
     increment_nonce(&mut nonce);
 
-    // 6. 解析 variable-header
-    let (address, port) = parse_variable_header(&variable_plain)?;
+    // 6. 解析 variable-header：addr+port + paddingLen + padding [+ 首段 payload]
+    let (address, port, hdr_end) = parse_variable_header(&variable_plain)?;
+    if variable_plain.len() < hdr_end + 2 {
+        return Err(SsError::InsufficientData(variable_plain.len()));
+    }
+    let padding_len = u16::from_be_bytes([variable_plain[hdr_end], variable_plain[hdr_end + 1]]);
+    let payload_start = hdr_end + 2 + padding_len as usize;
+    if payload_start > variable_plain.len() {
+        return Err(SsError::InsufficientData(variable_plain.len()));
+    }
+    let first_payload = variable_plain[payload_start..].to_vec();
 
     // 7. 构造 SSStream
     nonce[0] = 1;
     let mut stream = SSStream::new_with_aead_and_nonce(conn, aead, nonce);
     // server 读侧续接请求 nonce 序列（body 首帧 [2,0..]）
     stream.continue_read_nonce();
+    // variable chunk 尾部首段 payload 先于 body chunk 交付（sing reader.cached 语义）
+    stream.push_plain_prefix(&first_payload);
+    // 下行首写时发 sing writeResponse 响应头（新 salt + echo request salt）
+    stream.mark_server_response_2022(server_psk.to_vec(), kind, salt);
 
     Ok((address, port, stream))
 }
@@ -566,9 +575,6 @@ async fn read_ss2022_request_multi(
     check_timestamp(timestamp, timestamp_tolerance)?;
 
     let variable_len = u16::from_be_bytes([fixed_plain[9], fixed_plain[10]]) as usize;
-    if variable_len > 900 + 260 {
-        return Err(SsError::Ss2022PaddingTooLarge(variable_len));
-    }
 
     let mut nonce = nonce;
     increment_nonce(&mut nonce);
@@ -581,12 +587,26 @@ async fn read_ss2022_request_multi(
         .map_err(|e| SsError::AeadOpen(e.to_string()))?;
     increment_nonce(&mut nonce);
 
-    let (address, port) = parse_variable_header(&variable_plain)?;
+    // 6. 解析 variable-header：addr+port + paddingLen + padding [+ 首段 payload]
+    let (address, port, hdr_end) = parse_variable_header(&variable_plain)?;
+    if variable_plain.len() < hdr_end + 2 {
+        return Err(SsError::InsufficientData(variable_plain.len()));
+    }
+    let padding_len = u16::from_be_bytes([variable_plain[hdr_end], variable_plain[hdr_end + 1]]);
+    let payload_start = hdr_end + 2 + padding_len as usize;
+    if payload_start > variable_plain.len() {
+        return Err(SsError::InsufficientData(variable_plain.len()));
+    }
+    let first_payload = variable_plain[payload_start..].to_vec();
 
     nonce[0] = 1;
     let mut stream = SSStream::new_with_aead_and_nonce(conn, aead, nonce);
     // server 读侧续接请求 nonce 序列（body 首帧 [2,0..]）
     stream.continue_read_nonce();
+    // variable chunk 尾部首段 payload 先于 body chunk 交付（sing reader.cached 语义）
+    stream.push_plain_prefix(&first_payload);
+    // 下行首写时发 sing writeResponse 响应头（新 salt + echo request salt）
+    stream.mark_server_response_2022(user.psk.clone(), kind, salt);
 
     Ok(InboundResult {
         address,
@@ -612,7 +632,8 @@ fn check_timestamp(timestamp: u64, tolerance: u64) -> Result<()> {
 }
 
 /// 解析 variable-header：addr+port + paddingLen_BE_u16 + padding。
-fn parse_variable_header(buf: &[u8]) -> Result<(Address, u16)> {
+/// 返回 `(address, port, 端口字段之后的偏移)`（供调用方剥离 padding/取首段 payload）。
+fn parse_variable_header(buf: &[u8]) -> Result<(Address, u16, usize)> {
     if buf.is_empty() {
         return Err(SsError::InsufficientData(0));
     }
@@ -666,7 +687,7 @@ fn parse_variable_header(buf: &[u8]) -> Result<(Address, u16)> {
     }
     let port = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
 
-    Ok((address, port))
+    Ok((address, port, offset + 2))
 }
 
 
@@ -678,12 +699,14 @@ mod tests {
     /// 构造固定 salt 的 SS-2022 请求 wire：salt || [EIH] || sealed_fixed || sealed_var。
     ///
     /// 镜像 [`crate::ss2022::client::Client2022::dial_target_on`] 的 header 构造，
-    /// salt 由调用方固定以供重放测试。
+    /// salt 由调用方固定以供重放测试；`first_payload` 走 variable chunk 尾部
+    ///（Go DialEarlyConn 首写 / sing writeRequest(payload) 语义）。
     fn build_request_wire(
         kind: CipherKind2022,
         salt: &[u8],
         ipsk: Option<&[u8]>,
         upsk: &[u8],
+        first_payload: &[u8],
     ) -> Vec<u8> {
         use crate::ss2022::key::encrypt_identity_header;
         let subkey = derive_session_subkey(upsk, salt, kind);
@@ -691,7 +714,7 @@ mod tests {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let padding_len: u16 = 16;
         let addr_port_len = 1 + 1 + 11 + 2; // ATYP + len + "example.com" + port
-        let variable_len = addr_port_len + 2 + padding_len as usize;
+        let variable_len = addr_port_len + 2 + padding_len as usize + first_payload.len();
 
         let mut fixed = Vec::with_capacity(11);
         fixed.push(0u8); // headerType = 0 client
@@ -708,6 +731,7 @@ mod tests {
         var.extend_from_slice(&443u16.to_be_bytes());
         var.extend_from_slice(&padding_len.to_be_bytes());
         var.extend(std::iter::repeat(0u8).take(padding_len as usize));
+        var.extend_from_slice(first_payload);
         let sealed_var = aead.seal(&nonce, &[], &var).unwrap();
 
         let mut out = Vec::with_capacity(salt.len() + 16 + sealed_fixed.len() + sealed_var.len());
@@ -827,6 +851,7 @@ mod tests {
             &[0xAAu8; 32],
             None,
             &psk,
+            &[],
         );
         let mut c1 = tokio::net::TcpStream::connect(addr).await.unwrap();
         c1.write_all(&wire).await.unwrap();
@@ -888,6 +913,7 @@ mod tests {
             &[0xBBu8; 32],
             Some(&server_psk),
             &user_psk,
+            &[],
         );
         let mut c1 = tokio::net::TcpStream::connect(addr).await.unwrap();
         c1.write_all(&wire).await.unwrap();
@@ -1179,5 +1205,88 @@ mod tests {
         assert!(build_aead(CipherKind2022::Aes128Gcm, &sub16).is_ok());
         assert!(build_aead(CipherKind2022::Aes256Gcm, &sub32).is_ok());
         assert!(build_aead(CipherKind2022::ChaCha20Poly1305, &sub32).is_ok());
+    }
+
+    /// Go 26.7.28 (sing v0.2.7) 互操作语义回归：
+    /// ① 客户端首段 payload 塞在 variable chunk 尾部（Go DialEarlyConn 首写），
+    ///    server 必须先于 body chunk 交付（此前被静默丢弃 → 目标收不到请求）；
+    /// ② server 下行首写必须发 sing writeResponse 响应头（resp_salt +
+    ///    fixed(type=1|epoch|echo_salt|payload_len) + var chunk），用响应 subkey
+    ///    加密、nonce 重新计数（此前用请求 subkey 写裸 body chunk → Go client
+    ///    readResponse 卡死/解密失败）。
+    #[tokio::test]
+    async fn sing_semantics_first_payload_and_response_header() {
+        use base64::Engine as _;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let psk = [0x66u8; 16];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(psk);
+        let salt = [0x77u8; 16];
+        let inbound =
+            std::sync::Arc::new(Ss2022Inbound::new("2022-blake3-aes-128-gcm", &b64, "u1").unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (conn, _) = listener.accept().await.unwrap();
+            let mut r = inbound.handle_conn(conn).await.unwrap();
+            assert_eq!(r.address, Address::Domain("example.com".to_string()));
+            // ① 首段 payload 先于 body chunk 交付
+            let first = r.stream.read_chunk().await.unwrap().expect("first payload");
+            assert_eq!(first, b"GET / one".to_vec(), "variable chunk 尾部首段 payload");
+            let second = r.stream.read_chunk().await.unwrap().expect("body chunk");
+            assert_eq!(second, b"BODY".to_vec(), "后续 body chunk nonce 续接");
+            // ② 下行首写触发 writeResponse 响应头
+            r.stream.write_chunk(b"RESP").await.unwrap();
+            r.stream.flush().await.unwrap();
+        });
+
+        let wire =
+            build_request_wire(CipherKind2022::Aes128Gcm, &salt, None, &psk, b"GET / one");
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        c.write_all(&wire).await.unwrap();
+
+        // 请求 body：常规 chunk（nonce [2,0..] size / [3,0..] payload），镜像 sing Writer
+        let subkey = derive_session_subkey(&psk, &salt, CipherKind2022::Aes128Gcm);
+        let req_aead = build_aead(CipherKind2022::Aes128Gcm, &subkey).unwrap();
+        let mut nonce = vec![2u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut body_wire = Vec::new();
+        body_wire.extend_from_slice(&req_aead.seal(&nonce, &[], &4u16.to_be_bytes()).unwrap());
+        increment_nonce(&mut nonce);
+        body_wire.extend_from_slice(&req_aead.seal(&nonce, &[], b"BODY").unwrap());
+        c.write_all(&body_wire).await.unwrap();
+        c.flush().await.unwrap();
+
+        // ③ 手工解 server 响应：resp_salt || AEAD(fixed) || AEAD(var=RESP)。
+        // 响应握手 chunk 无 size 前缀（sing WriteChunk 直 seal / ReadWithLength
+        // 定长读），fixed 用 nonce [0]、var（首段响应数据）用 nonce [1]。
+        let mut resp_salt = vec![0u8; 16];
+        c.read_exact(&mut resp_salt).await.unwrap();
+        let resp_subkey = derive_session_subkey(&psk, &resp_salt, CipherKind2022::Aes128Gcm);
+        let resp_aead = build_aead(CipherKind2022::Aes128Gcm, &resp_subkey).unwrap();
+        let zero = [0u8; 12];
+        let one = [1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut fixed_wire = vec![0u8; (1 + 8 + 16 + 2) + 16];
+        c.read_exact(&mut fixed_wire).await.unwrap();
+        let fixed = resp_aead.open(&zero, &[], &fixed_wire).unwrap();
+        assert_eq!(fixed.len(), 1 + 8 + 16 + 2, "响应 fixed chunk 明文长度");
+        assert_eq!(fixed[0], 1, "HeaderTypeServer");
+        let epoch = u64::from_be_bytes(fixed[1..9].try_into().unwrap());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(now.abs_diff(epoch) <= 30, "epoch within ±30s");
+        assert_eq!(&fixed[9..25], &salt, "echo 必须回显请求 salt");
+        let payload_len = u16::from_be_bytes([fixed[25], fixed[26]]) as usize;
+        assert_eq!(payload_len, 4, "payload_len = 首段响应数据长度");
+        let mut var_wire = vec![0u8; payload_len + 16];
+        c.read_exact(&mut var_wire).await.unwrap();
+        let var = resp_aead.open(&one, &[], &var_wire).unwrap();
+        assert_eq!(var, b"RESP".to_vec(), "var chunk = 首段响应 payload（无 size 前缀）");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("sing semantics roundtrip timed out")
+            .unwrap();
     }
 }
