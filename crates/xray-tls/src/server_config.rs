@@ -14,7 +14,7 @@ use rustls::sign::CertifiedKey;
 
 use crate::certificate::{
     entry_certs_and_key, entry_usage, generate_self_signed_cert, EntryUsage,
-    extract_cert_names,
+    extract_cert_names, pem_private_key,
 };
 use crate::config::security_params;
 
@@ -317,9 +317,7 @@ fn pem_certs(pem: &[u8]) -> io::Result<Vec<CertificateDer<'static>>> {
 
 /// 从 PEM 字节解析单个私钥。
 fn pem_key(pem: &[u8]) -> io::Result<PrivateKeyDer<'static>> {
-    rustls_pemfile::private_key(&mut pem.as_ref())
-        .map_err(|e| io::Error::other(format!("parse key PEM: {e}")))?
-        .ok_or_else(|| io::Error::other("no private key found in PEM"))
+    pem_private_key(pem)?.ok_or_else(|| io::Error::other("no private key found in PEM"))
 }
 
 #[cfg(test)]
@@ -511,5 +509,41 @@ mod tests {
         assert!(r.select(Some("a.com")).is_none());
         assert!(r.is_empty());
         assert_eq!(r.len(), 0);
+    }
+    // ---- 错标私钥端到端：Go `tls cert` RSA 标签 + SEC1 EC 内容可构建 ServerConfig ----
+
+    /// Go `tls cert` 产出的证书与错标私钥（配对，EC P-256，CN/SAN localhost）。
+    const INTEROP_CERT_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBlDCCATugAwIBAgIQFY1cJZFGA1u7e9HWjp8HVTAKBggqhkjOPQQDAjAmMREw
+DwYDVQQKEwhYcmF5IEluYzERMA8GA1UEAxMIWHJheSBJbmMwHhcNMjYwOTA1MTIz
+MzQ0WhcNMjYxMjA0MTMzMzQ0WjAmMREwDwYDVQQKEwhYcmF5IEluYzERMA8GA1UE
+AxMIWHJheSBJbmMwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATG2iorYlDeMjaV
+lb7XdvtKt1Og/t5H45rFCy1LsSXiGo2MktbCiNQHg972FJTwSy5QLYLcuKBbveAM
+QyiwAs3Co0swSTAOBgNVHQ8BAf8EBAMCBaAwEwYDVR0lBAwwCgYIKwYBBQUHAwEw
+DAYDVR0TAQH/BAIwADAUBgNVHREEDTALgglsb2NhbGhvc3QwCgYIKoZIzj0EAwID
+RwAwRAIgF5275gUcKE9+SimhqLtg4UjlRDIQfGylQTGI/HrpEaMCIEwfccV2Die8
+L/EzZ6oFnWkJn4Xwk63v0lFlyMd6x3fa
+-----END CERTIFICATE-----
+";
+    const INTEROP_KEY_PEM: &str = "\
+-----BEGIN RSA PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg6sUhV38mcGUNG/uc
+aZ9A3Sng12a1YFnJcLOELh+loNChRANCAATG2iorYlDeMjaVlb7XdvtKt1Og/t5H
+45rFCy1LsSXiGo2MktbCiNQHg972FJTwSy5QLYLcuKBbveAMQyiwAs3C
+-----END RSA PRIVATE KEY-----
+";
+
+    #[test]
+    fn mislabeled_rsa_tag_ec_key_builds_server_config() {
+        install_provider();
+        let json = serde_json::json!({ "cert": INTEROP_CERT_PEM, "key": INTEROP_KEY_PEM });
+        let cfg = build_server_config("tls", Some(&json))
+            .unwrap()
+            .expect("tls config must build with mislabeled key");
+        assert_eq!(
+            cfg.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
     }
 }

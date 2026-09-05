@@ -91,8 +91,8 @@ fn load_certified_key(certs_pem: &[u8], key_pem: &[u8]) -> Result<CertifiedKey, 
         return Err(TlsError::PemLoad("no certificates found in PEM input".into()));
     }
 
-    // 解析 PEM 私钥
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_pem.as_ref())
+    // 解析 PEM 私钥（对齐 Go X509KeyPair：错标 PEM 按 DER 内容重定形）
+    let key: PrivateKeyDer<'static> = crate::certificate::pem_private_key(key_pem)
         .map_err(|e| TlsError::PemLoad(format!("failed to parse private key: {e}")))?
         .ok_or_else(|| TlsError::PemLoad("no private key found in PEM input".into()))?;
 
