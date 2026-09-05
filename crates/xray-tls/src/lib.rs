@@ -45,3 +45,5 @@ pub mod btls_client;
 pub mod btls_reality;
 pub mod utls;
 pub mod grpc;
+#[cfg(test)]
+mod stress_tests;
