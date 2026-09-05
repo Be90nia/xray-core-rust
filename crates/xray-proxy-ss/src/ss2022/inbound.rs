@@ -35,6 +35,7 @@ use crate::protocol::addr_type;
 use crate::ss2022::key::{
     derive_psk, derive_session_subkey, psk_from_base64, CipherKind2022,
 };
+use crate::ss2022::replay::{SaltReplayFilter, REPLAY_WINDOW};
 use crate::stream::SSStream;
 
 // ============================================================================
@@ -77,6 +78,8 @@ pub struct Ss2022Inbound {
     email: String,
     /// 时间戳容忍窗口（秒），默认 30。
     timestamp_tolerance: u64,
+    /// 明文 salt 重放过滤器（sing `replay.NewSimple(60s)` 语义，check 即注册）。
+    replay: SaltReplayFilter,
 }
 
 impl Ss2022Inbound {
@@ -94,6 +97,7 @@ impl Ss2022Inbound {
             kind,
             email: email.into(),
             timestamp_tolerance: 30,
+            replay: SaltReplayFilter::new(REPLAY_WINDOW),
         })
     }
 
@@ -102,7 +106,13 @@ impl Ss2022Inbound {
     /// # Errors
     /// - 透传 AEAD、IO、协议解析错误。
     pub async fn handle_conn(&self, conn: TcpStream) -> io::Result<InboundResult> {
-        let result = read_ss2022_request(conn, &self.psk, self.kind, self.timestamp_tolerance)
+        let result = read_ss2022_request(
+            conn,
+            &self.psk,
+            self.kind,
+            self.timestamp_tolerance,
+            &self.replay,
+        )
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
         Ok(InboundResult {
@@ -134,8 +144,8 @@ impl Ss2022Inbound {
 ///
 /// 对应 Go `MultiUserInbound` struct（`proxy/shadowsocks_2022/inbound_multi.go`）。
 ///
-/// 用 server PSK 派生 subkey 后，逐个 user PSK 尝试 open fixed-header。
-/// 匹配成功则用该 user 的 PSK 继续解密 variable-header。
+/// TCP 多用户识别：EIH（identity header）= AES-ECB(identitySubkey(iPSK, salt))，
+/// 解密得 `psk_identity(uPSK)` 查用户表；session key 由命中的 uPSK 派生。
 pub struct MultiUserInbound {
     /// 服务端主 PSK。
     psk: Vec<u8>,
@@ -144,6 +154,8 @@ pub struct MultiUserInbound {
     users: Arc<Mutex<Vec<Ss2022User>>>,
     /// 时间戳容忍窗口（秒）。
     timestamp_tolerance: u64,
+    /// 明文 salt 重放过滤器（sing `replay.NewSimple(60s)` 语义，check 即注册）。
+    replay: SaltReplayFilter,
 }
 
 impl MultiUserInbound {
@@ -175,6 +187,7 @@ impl MultiUserInbound {
             kind,
             users: Arc::new(Mutex::new(users)),
             timestamp_tolerance: 30,
+            replay: SaltReplayFilter::new(REPLAY_WINDOW),
         })
     }
 
@@ -185,7 +198,14 @@ impl MultiUserInbound {
     /// - 透传其他错误。
     pub async fn handle_conn(&self, conn: TcpStream) -> io::Result<InboundResult> {
         let users = self.users.lock().clone();
-        read_ss2022_request_multi(conn, &self.psk, self.kind, &users, self.timestamp_tolerance)
+        read_ss2022_request_multi(
+            conn,
+            &self.psk,
+            self.kind,
+            &users,
+            self.timestamp_tolerance,
+            &self.replay,
+        )
             .await
             .map_err(|e| io::Error::other(e.to_string()))
     }
@@ -396,11 +416,17 @@ async fn read_ss2022_request(
     server_psk: &[u8],
     kind: CipherKind2022,
     timestamp_tolerance: u64,
+    replay: &SaltReplayFilter,
 ) -> Result<(Address, u16, SSStream<TcpStream>)> {
     // 1. 读 salt
     let salt_size = kind.salt_size();
     let mut salt = vec![0u8; salt_size];
     conn.read_exact(&mut salt).await?;
+
+    // 重放检查（Go sing：解密前 Check，check 即注册，重放 = ErrSaltNotUnique）
+    if !replay.check(&salt) {
+        return Err(SsError::Ss2022SaltNotUnique);
+    }
 
     // 2. 派生 session subkey
     let subkey = derive_session_subkey(server_psk, &salt, kind);
@@ -466,21 +492,27 @@ async fn read_ss2022_request(
     Ok((address, port, stream))
 }
 
-/// 多用户请求读取：先读 salt + fixed-header wire bytes，逐用户尝试 open。
+/// 多用户请求读取：salt || EIH(16B) || fixed-chunk wire，EIH 识别用户。
 ///
-/// SS-2022 多用户匹配：用 server_psk||user_psk 作为 PSK 派生 subkey，
-/// 尝试 open fixed-header，成功即匹配该用户。
+/// SS-2022 多用户匹配：identitySubkey = blake3::derive_key(iPSK||salt)，
+/// EIH 解密得 `psk_identity(uPSK)` 查表；session key 用命中用户的 uPSK 派生。
 async fn read_ss2022_request_multi(
     mut conn: TcpStream,
     server_psk: &[u8],
     kind: CipherKind2022,
     users: &[Ss2022User],
     timestamp_tolerance: u64,
+    replay: &SaltReplayFilter,
 ) -> Result<InboundResult> {
     // 1. 读 salt
     let salt_size = kind.salt_size();
     let mut salt = vec![0u8; salt_size];
     conn.read_exact(&mut salt).await?;
+
+    // 重放检查（Go sing：解密前 Check，check 即注册，重放 = ErrSaltNotUnique）
+    if !replay.check(&salt) {
+        return Err(SsError::Ss2022SaltNotUnique);
+    }
 
     // 2. SIP023 EIH：wire 顺序 salt || EIH || AEAD chunks（先读 16B identity header）
     let tag_size: usize = match kind {
@@ -642,6 +674,240 @@ fn parse_variable_header(buf: &[u8]) -> Result<(Address, u16)> {
 mod tests {
     use super::*;
 
+
+    /// 构造固定 salt 的 SS-2022 请求 wire：salt || [EIH] || sealed_fixed || sealed_var。
+    ///
+    /// 镜像 [`crate::ss2022::client::Client2022::dial_target_on`] 的 header 构造，
+    /// salt 由调用方固定以供重放测试。
+    fn build_request_wire(
+        kind: CipherKind2022,
+        salt: &[u8],
+        ipsk: Option<&[u8]>,
+        upsk: &[u8],
+    ) -> Vec<u8> {
+        use crate::ss2022::key::encrypt_identity_header;
+        let subkey = derive_session_subkey(upsk, salt, kind);
+        let aead = build_aead(kind, &subkey).unwrap();
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let padding_len: u16 = 16;
+        let addr_port_len = 1 + 1 + 11 + 2; // ATYP + len + "example.com" + port
+        let variable_len = addr_port_len + 2 + padding_len as usize;
+
+        let mut fixed = Vec::with_capacity(11);
+        fixed.push(0u8); // headerType = 0 client
+        fixed.extend_from_slice(&timestamp.to_be_bytes());
+        fixed.extend_from_slice(&(variable_len as u16).to_be_bytes());
+        let mut nonce = vec![0u8; 12];
+        let sealed_fixed = aead.seal(&nonce, &[], &fixed).unwrap();
+        increment_nonce(&mut nonce);
+
+        let mut var = Vec::with_capacity(variable_len);
+        var.push(3u8); // ATYP domain
+        var.push(11u8);
+        var.extend_from_slice(b"example.com");
+        var.extend_from_slice(&443u16.to_be_bytes());
+        var.extend_from_slice(&padding_len.to_be_bytes());
+        var.extend(std::iter::repeat(0u8).take(padding_len as usize));
+        let sealed_var = aead.seal(&nonce, &[], &var).unwrap();
+
+        let mut out = Vec::with_capacity(salt.len() + 16 + sealed_fixed.len() + sealed_var.len());
+        out.extend_from_slice(salt);
+        if let Some(ik) = ipsk {
+            out.extend_from_slice(&encrypt_identity_header(ik, upsk, salt, kind).unwrap());
+        }
+        out.extend_from_slice(&sealed_fixed);
+        out.extend_from_slice(&sealed_var);
+        out
+    }
+
+    /// 多 PSK roundtrip（对齐 Go `MultiService.UpdateUsersWithPasswords`）：
+    /// server 配 2+ PSK 用户池，两个 client 各用其中一 PSK 连通，
+    /// 各自 body 用各自 uPSK 派生的 AEAD 上下文独立解密。
+    #[tokio::test]
+    async fn multi_user_two_clients_roundtrip() {
+        use crate::ss2022::client::Client2022;
+        use base64::Engine as _;
+        use tokio::io::AsyncWriteExt;
+
+        let server_psk = [0x11u8; 32];
+        let alice_psk = [0x22u8; 32];
+        let bob_psk = [0x33u8; 32];
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+
+        let inbound = std::sync::Arc::new(
+            MultiUserInbound::new(
+                "2022-blake3-aes-256-gcm",
+                &b64(&server_psk),
+                vec![
+                    Ss2022User {
+                        email: "alice".into(),
+                        level: 0,
+                        psk: alice_psk.to_vec(),
+                    },
+                    Ss2022User {
+                        email: "bob".into(),
+                        level: 0,
+                        psk: bob_psk.to_vec(),
+                    },
+                ],
+            )
+            .unwrap(),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (email, fill) in [("alice", 0x77u8), ("bob", 0x88u8)] {
+                let (conn, _) = listener.accept().await.unwrap();
+                let mut result = inbound.handle_conn(conn).await.unwrap();
+                assert_eq!(result.user_email, email, "EIH must identify the right user");
+                let payload = vec![fill; 64];
+                let got = result
+                    .stream
+                    .read_chunk()
+                    .await
+                    .unwrap()
+                    .expect("body chunk");
+                assert_eq!(
+                    got, payload,
+                    "{email} body must decrypt with its own PSK context"
+                );
+            }
+        });
+
+        for (psk, fill) in [(&alice_psk, 0x77u8), (&bob_psk, 0x88u8)] {
+            let client = Client2022::new(
+                "2022-blake3-aes-256-gcm",
+                &b64(psk),
+                "127.0.0.1",
+                addr.port(),
+            )
+            .unwrap()
+            .with_identity(&b64(&server_psk))
+            .unwrap();
+            let mut stream = client.dial_target("example.com", 443).await.unwrap();
+            stream.write_chunk(&vec![fill; 64]).await.unwrap();
+            stream.flush().await.unwrap();
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("multi-user roundtrip timed out")
+            .unwrap();
+    }
+
+    /// TCP salt 重放防护（对齐 Go sing `replay.NewSimple(60s)`，解密前 Check）：
+    /// 单用户 inbound 同 salt 二次握手必须拒绝，异 salt 连接不受影响。
+    #[tokio::test]
+    async fn salt_replay_rejected_single_user() {
+        use base64::Engine as _;
+        use tokio::io::AsyncWriteExt;
+
+        let psk = [0x11u8; 32];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(psk);
+        let inbound = std::sync::Arc::new(
+            Ss2022Inbound::new("2022-blake3-aes-256-gcm", &b64, "u1").unwrap(),
+        );
+        let listener = std::sync::Arc::new(
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        );
+        let addr = listener.local_addr().unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let ib = std::sync::Arc::clone(&inbound);
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (conn, _) = listener.accept().await.unwrap();
+                let _ = tx.send(ib.handle_conn(conn).await);
+            }
+        });
+
+        let wire = build_request_wire(
+            CipherKind2022::Aes256Gcm,
+            &[0xAAu8; 32],
+            None,
+            &psk,
+        );
+        let mut c1 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        c1.write_all(&wire).await.unwrap();
+        let mut c2 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        c2.write_all(&wire).await.unwrap();
+
+        let r1 = rx.recv().await.unwrap().expect("first use of salt must pass");
+        assert_eq!(r1.address, Address::Domain("example.com".to_string()));
+        let err = rx
+            .recv()
+            .await
+            .unwrap()
+            .err()
+            .expect("replayed salt must be rejected");
+        assert!(
+            err.to_string().contains("salt not unique"),
+            "expected salt-not-unique, got: {err}"
+        );
+        server.await.unwrap();
+    }
+
+    /// TCP salt 重放防护（多用户路径）：同 salt 二次握手必须拒绝。
+    #[tokio::test]
+    async fn salt_replay_rejected_multi_user() {
+        use base64::Engine as _;
+        use tokio::io::AsyncWriteExt;
+
+        let server_psk = [0x11u8; 32];
+        let user_psk = [0x22u8; 32];
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let inbound = std::sync::Arc::new(
+            MultiUserInbound::new(
+                "2022-blake3-aes-256-gcm",
+                &b64(&server_psk),
+                vec![Ss2022User {
+                    email: "alice".into(),
+                    level: 0,
+                    psk: user_psk.to_vec(),
+                }],
+            )
+            .unwrap(),
+        );
+        let listener = std::sync::Arc::new(
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        );
+        let addr = listener.local_addr().unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let ib = std::sync::Arc::clone(&inbound);
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (conn, _) = listener.accept().await.unwrap();
+                let _ = tx.send(ib.handle_conn(conn).await);
+            }
+        });
+
+        let wire = build_request_wire(
+            CipherKind2022::Aes256Gcm,
+            &[0xBBu8; 32],
+            Some(&server_psk),
+            &user_psk,
+        );
+        let mut c1 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        c1.write_all(&wire).await.unwrap();
+        let mut c2 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        c2.write_all(&wire).await.unwrap();
+
+        let r1 = rx.recv().await.unwrap().expect("first use of salt must pass");
+        assert_eq!(r1.user_email, "alice");
+        let err = rx
+            .recv()
+            .await
+            .unwrap()
+            .err()
+            .expect("replayed salt must be rejected");
+        assert!(
+            err.to_string().contains("salt not unique"),
+            "expected salt-not-unique, got: {err}"
+        );
+        server.await.unwrap();
+    }
     /// SIP023 EIH 端到端：Client2022(with_identity) 写 EIH → MultiUserInbound 匹配对应用户。
     #[tokio::test]
     async fn multi_user_eih_roundtrip() {

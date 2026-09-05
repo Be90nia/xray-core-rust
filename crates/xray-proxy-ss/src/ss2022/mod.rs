@@ -8,6 +8,7 @@ pub mod inbound;
 pub mod key;
 pub mod packet;
 pub mod outbound;
+pub mod replay;
 
 pub use client::Client2022;
 pub use inbound::{
