@@ -1793,7 +1793,7 @@ async fn spawn_one_inbound(
                 let bind_addr: SocketAddr = addr.parse().map_err(|e| {
                     std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("parse addr: {e}"))
                 })?;
-                tracing::info!(tag = %ib.tag, addr = %addr, network = %settings.protocol, security = %settings.security, users = validator.get_count(), "trojan transport inbound listening");
+                tracing::info!(tag = %ib.tag, addr = %addr, network = %settings.protocol, security = %settings.security, users = validator.get_key_count(), "trojan transport inbound listening");
                 let on_conn: xray_transport::listener_registry::ConnHandler = Arc::new(move |conn| {
                     let validator = Arc::clone(&validator);
                     let handler = Arc::clone(&handler);

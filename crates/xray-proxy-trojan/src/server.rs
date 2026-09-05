@@ -379,7 +379,7 @@ pub async fn serve_trojan(
 
     info!(
         addr = %listener.local_addr()?,
-        users = validator.get_count(),
+        users = validator.get_key_count(),
         "trojan inbound listening"
     );
 
