@@ -1715,7 +1715,7 @@ async fn spawn_one_inbound(
                 let bind_addr: SocketAddr = addr.parse().map_err(|e| {
                     std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("parse addr: {e}"))
                 })?;
-                tracing::info!(tag = %ib.tag, addr = %addr, network = %settings.protocol, security = %settings.security, users = validator.get_count(), "vless transport inbound listening");
+                tracing::info!(tag = %ib.tag, addr = %addr, network = %settings.protocol, security = %settings.security, users = validator.get_uuid_count(), "vless transport inbound listening");
                 let on_conn: xray_transport::listener_registry::ConnHandler = Arc::new(move |conn| {
                     let handler = Arc::clone(&handler);
                     let validator = Arc::clone(&validator);
@@ -1738,7 +1738,7 @@ async fn spawn_one_inbound(
                 if settings.security == "reality" {
                     // REALITY：server_tls 验证 → Verified 走 VLESS；Invalid fallback 到 dest
                     let reality = parse_reality_config(&settings)?;
-                    tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_count(), fallback = %reality.fallback_dest, "vless+reality inbound listening");
+                    tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_uuid_count(), fallback = %reality.fallback_dest, "vless+reality inbound listening");
                     Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                         serve_reality_vless(listener, ohm, validator, reality, Some(options)).await
                     })))
@@ -1746,7 +1746,7 @@ async fn spawn_one_inbound(
                     let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
                     // VLESS fallbacks：Go napfb（name→alpn→path→dest+xver）
                     let fallbacks = build_vless_fallbacks(&ib.entry.data);
-                    tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_count(), tls = tls.is_some(), fallbacks = fallbacks.as_ref().map_or(0, |f| f.len()), enc = decryption.is_some(), "vless inbound listening");
+                    tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_uuid_count(), tls = tls.is_some(), fallbacks = fallbacks.as_ref().map_or(0, |f| f.len()), enc = decryption.is_some(), "vless inbound listening");
                     Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                         serve_vless(listener, ohm, validator, tls, fallbacks, Some(options)).await
                     })))
@@ -3484,7 +3484,7 @@ mod tests {
         let ohm_c = Arc::clone(&ohm);
         let val_c = Arc::clone(&validator) as Arc<dyn VlessValidator>;
         tokio::spawn(async move {
-            let _ = serve_reality_vless(rl, ohm_c, val_c, reality_cfg).await;
+            let _ = serve_reality_vless(rl, ohm_c, val_c, reality_cfg, None).await;
         });
 
         // 5. client：tcp+reality dial → VLESS 请求 → echo 回读
@@ -4129,6 +4129,30 @@ mod tests {
         let validator = super::build_vless_validator(&data).unwrap();
         use xray_proxy_vless::Validator as VlessValidatorTrait;
         assert_eq!(VlessValidatorTrait::get_count(&*validator), 0);
+    }
+
+    #[test]
+    fn build_vless_validator_email_less_clients_counted_and_auth_enforced() {
+        // 生产最小配置形态：client 无 email（users=0 复现形态）。
+        let ua = "b831381d-6324-4d53-ad4f-8cda48b30811";
+        let ub = "66ad4540-b58c-4ad2-9926-ea63445a9b57";
+        let settings = serde_json::json!({
+            "clients": [{ "id": ua, "level": 0 }, { "id": ub }],
+            "decryption": "none",
+        });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let validator = super::build_vless_validator(&data).unwrap();
+        use xray_proxy_vless::Validator as VlessValidatorTrait;
+        // 启动日志口径：UUID 可认证用户数 = 2（get_count 只数 email 表 → 0）
+        assert_eq!(VlessValidatorTrait::get_uuid_count(&*validator), 2);
+        assert_eq!(VlessValidatorTrait::get_count(&*validator), 0);
+        // 合法 UUID 均可解析出用户；未注册 UUID 拒绝（认证语义）
+        let a = xray_common::uuid::UUID::parse(ua).expect("uuid a");
+        let b = xray_common::uuid::UUID::parse(ub).expect("uuid b");
+        assert!(VlessValidatorTrait::get(&*validator, &a).is_some());
+        assert!(VlessValidatorTrait::get(&*validator, &b).is_some());
+        let bad = xray_common::uuid::UUID::parse("d342d11e-d424-4583-b36e-524ab1f0afa4").expect("uuid bad");
+        assert!(VlessValidatorTrait::get(&*validator, &bad).is_none());
     }
 
     #[test]

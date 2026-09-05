@@ -31,8 +31,14 @@ pub trait Validator: Send + Sync {
     /// 返回所有用户的列表。
     fn get_all(&self) -> Vec<MemoryUser>;
 
-    /// 返回用户数量。
+    /// 返回用户数量（Go `GetCount` 语义：只数 email 表）。
     fn get_count(&self) -> i64;
+
+    /// 返回可被 UUID 认证的用户数量（UUID 索引大小）。
+    ///
+    /// 生产配置的 client 通常不带 email（`get_count` 恒 0，Go 同语义）；
+    /// 启动日志/可观测性展示「已载入用户数」应使用本方法。
+    fn get_uuid_count(&self) -> i64;
 }
 
 /// 运行时 VLESS 用户（对应 Go `protocol.MemoryUser` + 类型化 Account）。
@@ -135,6 +141,10 @@ impl Validator for MemoryValidator {
     fn get_count(&self) -> i64 {
         self.email_index.read().len() as i64
     }
+
+    fn get_uuid_count(&self) -> i64 {
+        self.uuid_index.read().len() as i64
+    }
 }
 
 /// 便捷构造 `Arc<dyn Validator>`。
@@ -161,6 +171,7 @@ mod tests {
 
     const UUID_A: &str = "66ad4540-b58c-4ad2-9926-ea63445a9b57";
     const UUID_B: &str = "11111111-2222-3333-4444-555555555555";
+    const UUID_C: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
 
     #[test]
     fn process_uuid_zeroes_bytes_6_and_7() {
@@ -217,6 +228,21 @@ mod tests {
         v.add(sample_user("", UUID_A)).expect("add 1");
         v.add(sample_user("", UUID_B)).expect("add 2");
         assert_eq!(v.get_count(), 0);
+    }
+
+    #[test]
+    fn uuid_count_counts_uuid_indexed_users() {
+        // 无 email 的 client 只进 UUID 索引：get_count（Go GetCount 语义）恒 0，
+        // get_uuid_count 反映真实可认证用户数。
+        let v = MemoryValidator::new();
+        assert_eq!(v.get_uuid_count(), 0);
+        v.add(sample_user("", UUID_A)).expect("add 1");
+        v.add(sample_user("", UUID_B)).expect("add 2");
+        v.add(sample_user("c@example.com", UUID_C)).expect("add 3");
+        assert_eq!(v.get_count(), 1);
+        assert_eq!(v.get_uuid_count(), 3);
+        v.del("c@example.com").expect("del");
+        assert_eq!(v.get_uuid_count(), 2);
     }
 
     #[test]
