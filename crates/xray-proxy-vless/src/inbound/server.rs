@@ -788,6 +788,114 @@ mod tests {
         }
     }
 
+    /// 认证语义（对齐 Go `inbound.go::Process` → DecodeRequestHeader）：
+    /// validator 载入 2 个无 email client（生产 build_vless_validator 的载入形态），
+    /// 两个合法 UUID 均完成握手（响应头）+ echo 回环；未注册 UUID 被拒（连接关闭）。
+    #[tokio::test]
+    async fn vless_inbound_authenticates_two_email_less_clients() {
+        // echo server（accept 循环：两个合法连接各回显一次）
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = echo_listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if sock.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        // 2 个无 email 用户（模拟生产 settings.clients 无 email 字段）
+        let ids = [
+            "b831381d-6324-4d53-ad4f-8cda48b30811",
+            "66ad4540-b58c-4ad2-9926-ea63445a9b57",
+        ];
+        let v = MemoryValidator::new();
+        for id in ids {
+            let user = MemoryUser {
+                level: 0,
+                email: String::new(),
+                account: MemoryAccount::from_proto_account(&xray_proto::xray::proxy::vless::Account {
+                    id: id.to_string(),
+                    ..Default::default()
+                })
+                .unwrap(),
+            };
+            v.add(user).unwrap();
+        }
+        assert_eq!(v.get_uuid_count(), 2);
+        let validator: Arc<dyn Validator> = Arc::new(v);
+
+        let ohm = Arc::new(SimpleOhm::new());
+        ohm.set_default(
+            Arc::new(DialBridge::new("freedom", make_freedom_dial_fn()))
+                as Arc<dyn xray_app_dispatcher::DispatchHandler>,
+        );
+        let vless_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let vless_addr = vless_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = serve_vless(vless_listener, ohm, validator, None, None, None).await;
+        });
+
+        // 两个合法 UUID：握手（响应头）+ echo 回环均通过
+        for id in ids {
+            let uuid = UUID::parse(id).unwrap();
+            let mut client = tokio::net::TcpStream::connect(vless_addr).await.unwrap();
+            encode_request_header(
+                &mut client,
+                VERSION,
+                &uuid,
+                VlessCommand::Tcp,
+                Some(&Address::from_ipv4_bytes([127, 0, 0, 1])),
+                Some(echo_port),
+                &empty_addons(),
+            )
+            .await
+            .unwrap();
+            decode_response_header(&mut client, VERSION)
+                .await
+                .expect("registered UUID must pass auth handshake");
+            let payload = b"ping";
+            client.write_all(payload).await.unwrap();
+            let mut got = vec![0u8; payload.len()];
+            client.read_exact(&mut got).await.unwrap();
+            assert_eq!(&got, payload, "echo roundtrip for {id}");
+        }
+
+        // 未注册 UUID：server 认证失败关闭连接 → EOF / reset
+        let mut client = tokio::net::TcpStream::connect(vless_addr).await.unwrap();
+        encode_request_header(
+            &mut client,
+            VERSION,
+            &UUID::new(),
+            VlessCommand::Tcp,
+            Some(&Address::from_ipv4_bytes([127, 0, 0, 1])),
+            Some(80),
+            &empty_addons(),
+        )
+        .await
+        .unwrap();
+        let mut buf = [0u8; 16];
+        match client.read(&mut buf).await {
+            Ok(0) => {}
+            Err(e) if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            ) => {}
+            other => panic!("expected auth rejection, got {other:?}"),
+        }
+    }
+
     /// 公共 harness：echo server + freedom dispatch + serve_vless（注册一个用户）。
     /// 返回 (vless 监听地址, echo 端口, 用户 UUID)。
     async fn spawn_vless_proxy_with_echo() -> (std::net::SocketAddr, u16, UUID) {
