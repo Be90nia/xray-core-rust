@@ -50,6 +50,16 @@ pub struct CommonConn<C> {
     closed: bool,
 }
 
+impl<C> CommonConn<C> {
+    /// 内层连接访问（vision splice 的 `InnerRawClone` 穿透与测试裸读用）。
+    pub(crate) fn inner_conn(&self) -> &C {
+        &self.conn
+    }
+    pub(crate) fn inner_conn_mut(&mut self) -> &mut C {
+        &mut self.conn
+    }
+}
+
 impl<C> CommonConn<C>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
@@ -197,7 +207,6 @@ where
                     continue; // 回到步骤 1 返回明文
                 }
             }
-
             // 3. raw_buf 不足，从底层读
             let mut tmp = [0u8; 16_384];
             let mut rb = ReadBuf::new(&mut tmp);
@@ -244,9 +253,15 @@ where
             // 1. 先发完 pending
             if let Some((ct, sent, plain_len)) = this.write_pending.take() {
                 match Pin::new(&mut this.conn).poll_write(cx, &ct[sent..]) {
+                    // AsyncWrite 协议：非空 buf 的 Ok(0) = 写入器无法再接受数据。
+                    // 裸 Pending 此处没有 waker 注册（底层返回的是 Ready），
+                    // 返回它会丢唤醒——部分写入 + 跨缓冲窗口时即死锁。
                     Poll::Ready(Ok(0)) => {
                         this.write_pending = Some((ct, sent, plain_len));
-                        return Poll::Pending;
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "inner conn accepted 0 bytes",
+                        )));
                     }
                     Poll::Ready(Ok(n)) => {
                         let new_sent = sent + n;
@@ -254,9 +269,15 @@ where
                             return Poll::Ready(Ok(plain_len));
                         }
                         this.write_pending = Some((ct, new_sent, plain_len));
-                        return Poll::Pending;
+                        // 底层刚返回 Ready（部分写入）：立即重试剩余字节。
+                        // 若在此返回 Pending，没有任何 poll 注册过 waker，
+                        // 上层不再被唤醒 → 剩余字节滞留 → 对端凑不齐 record
+                        // → 跨缓冲窗口流式死锁。
+                        continue;
                     }
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    // 唯一合法的 Pending 出口：底层本次确实 Pending，
+                    // 已用当前 cx 注册 waker。
                     Poll::Pending => {
                         this.write_pending = Some((ct, sent, plain_len));
                         return Poll::Pending;
