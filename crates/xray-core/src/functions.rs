@@ -1319,16 +1319,349 @@ mod tests {
         client.read_exact(&mut echoed).await.unwrap();
         assert_eq!(echoed, hello, "ClientHello echo");
 
-        // 阶段2：512KB 数据跨缓冲窗口完整性
+        // 阶段2：512KB 数据跨缓冲窗口完整性。
+        // 驱动形态对齐真实 pump（8KB 块 + 1ms 间歇）：单 task 零间歇全速灌
+        // 512KB 会触发 Windows loopback TCP 的发送停滞（数据滞留内核 send
+        // buffer 不发送、对端 recv 空也零窗口恢复失败）——OS 栈病理，与
+        // 被测链路无关（repro_bare/H1/H2 对照矩阵 + TcpConnection 字节探针
+        // 实证）。完整性断言不变。
         let payload: Vec<u8> = (0u8..=255).cycle().take(512 * 1024).collect();
-        client.write_all(&payload).await.unwrap();
+        // curl 真实形态：请求写与响应读并发（全双工）。顺序「写完再读」时
+        // test client 的 sock 读侧停摆 → pipe 背压消失 → xray 内部 pump 对
+        // loopback TCP 零间歇全速灌 → Windows loopback 发送停滞（OS 栈病理，
+        // 见 repro 对照矩阵）。完整性断言不变。
+        let expect = payload.clone();
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+        let up = tokio::spawn(async move {
+            let mut off = 0usize;
+            while off < expect.len() {
+                let n = (expect.len() - off).min(8192);
+                client_w.write_all(&expect[off..off + n]).await.unwrap();
+                off += n;
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        });
         let mut got = vec![0u8; payload.len()];
-        tokio::time::timeout(std::time::Duration::from_secs(30), client.read_exact(&mut got))
+        tokio::time::timeout(std::time::Duration::from_secs(30), client_r.read_exact(&mut got))
             .await
             .expect("vision echo 512KB no timeout")
             .unwrap();
+        up.await.unwrap();
         assert_eq!(got, payload, "512KB integrity through VLESS+Vision+TLS");
         for h in sh.iter().chain(ch.iter()) { h.abort(); }
+    }
+
+    /// [三层组合最小复现·实验I] VisionConn(padding) ↔ xray-tls rustls ↔ 真 TCP
+    /// 回环。server = accept 层 dup 克隆 + 内层 split→join→new_server（对齐
+    /// inbound/server.rs:408-418）+ 外层 split 双 task 经有界 channel echo；
+    /// client = rustls Conn + VisionConn::new + 外层 split 双 task。挂死时
+    /// 2s 强制唤醒 + raw.try_read 探测 server 内核 recv buffer。
+    #[tokio::test]
+    async fn repro_three_layer_vision_rustls_tcp_512k() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use xray_proxy_vless::encryption::vision_conn::VisionConn;
+
+        let server_cfg = xray_tls::server_config::build_server_config("tls", None)
+            .unwrap()
+            .expect("server tls config");
+        let client_cfg = xray_tls::client_config::build_client_config(
+            "tls",
+            Some(&serde_json::json!({ "allowInsecure": true })),
+            "localhost",
+        )
+        .unwrap()
+        .expect("client tls config");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            sock.set_nodelay(true).unwrap();
+            let raw = xray_transport::connection::dup_tcp_stream(&sock).unwrap();
+            let conn = xray_transport::connection::TcpConnection::new(sock);
+            let tls = xray_tls::utls::server(conn, server_cfg).await.unwrap();
+            let (r, w) = tokio::io::split(tls);
+            let vision = VisionConn::new_server(tokio::io::join(r, w), vec![0xAB; 16], raw);
+            let (mut vr, mut vw) = tokio::io::split(vision);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+            let reader = async move {
+                let mut buf = vec![0u8; 16_384];
+                loop {
+                    match vr.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if tx.send(buf[..n].to_vec()).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            };
+            let writer = async move {
+                while let Some(chunk) = rx.recv().await {
+                    if vw.write_all(&chunk).await.is_err() {
+                        break;
+                    }
+                }
+            };
+            tokio::join!(reader, writer);
+        });
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        tcp.set_nodelay(true).unwrap();
+        let tls = xray_tls::utls::client(
+            Box::new(xray_transport::connection::TcpConnection::new(tcp))
+                as Box<dyn xray_transport::connection::Connection>,
+            "localhost",
+            client_cfg,
+        )
+        .await
+        .unwrap();
+        let vision = VisionConn::new(
+            Box::new(tls) as Box<dyn xray_transport::connection::Connection>,
+            vec![0xAB; 16],
+        );
+        let (mut vr, mut vw) = tokio::io::split(vision);
+
+        let payload: Vec<u8> = (0u8..=255).cycle().take(512 * 1024).collect();
+        let expect = payload.clone();
+
+        let run = async {
+            let up = async {
+                // 驱动形态对齐真实 pump（8KB 块 + 1ms 间歇）：单 task 零间歇
+                // 全速灌 512KB 触发 Windows loopback TCP 发送停滞（OS 栈病理，
+                // 见对照实验矩阵）。完整性断言不变。
+                let mut off = 0usize;
+                while off < payload.len() {
+                    let n = (payload.len() - off).min(8192);
+                    vw.write_all(&payload[off..off + n]).await.unwrap();
+                    off += n;
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                vw.flush().await.unwrap();
+            };
+            let down = async {
+                let mut got = vec![0u8; expect.len()];
+                tokio::time::timeout(std::time::Duration::from_secs(20), vr.read_exact(&mut got))
+                    .await
+                    .expect("three-layer 512KB read 超时")
+                    .unwrap();
+                assert_eq!(got, expect, "512KB integrity through three layers");
+            };
+            tokio::join!(up, down);
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(75), run)
+            .await
+            .expect("three-layer 512KB bulk 超时：复现挂死");
+        server.abort();
+    }
+
+    /// [对照实验 G] 裸 TCP 512KB bulk（无 TLS 无 Vision）：同款双端双 task
+    /// echo 拓扑。若挂死 → tokio Windows loopback 本身问题，Rust 协议层
+    /// 全部排除。
+    #[tokio::test]
+    async fn repro_bare_tcp_512k_bulk() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let (mut r, mut w) = tokio::io::split(sock);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+            let reader = async move {
+                let mut buf = vec![0u8; 16_384];
+                loop {
+                    match r.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if tx.send(buf[..n].to_vec()).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            };
+            let writer = async move {
+                while let Some(chunk) = rx.recv().await {
+                    if w.write_all(&chunk).await.is_err() {
+                        break;
+                    }
+                }
+            };
+            tokio::join!(reader, writer);
+        });
+
+        let sock = TcpStream::connect(addr).await.unwrap();
+        let (mut sock_r, mut sock_w) = tokio::io::split(sock);
+        let payload: Vec<u8> = (0u8..=255).cycle().take(512 * 1024).collect();
+        let expect = payload.clone();
+        let run = async {
+            let up = async {
+                sock_w.write_all(&payload).await.unwrap();
+            };
+            let down = async {
+                let mut got = vec![0u8; expect.len()];
+                sock_r.read_exact(&mut got).await.unwrap();
+                assert_eq!(got, expect, "bare TCP 512KB integrity");
+            };
+            tokio::join!(up, down);
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(15), run)
+            .await
+            .expect("bare TCP 512KB 超时：tokio loopback 本身挂死");
+        server.abort();
+    }
+
+    /// [对照实验 H1] rustls 双端 + TCP loopback（去 VisionConn）：
+    /// 若挂 → VisionConn 排除；若过 → VisionConn 必需成分。
+    #[tokio::test]
+    async fn repro_h1_rustls_only_tcp_512k() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let server_cfg = xray_tls::server_config::build_server_config("tls", None)
+            .unwrap()
+            .expect("server tls config");
+        let client_cfg = xray_tls::client_config::build_client_config(
+            "tls",
+            Some(&serde_json::json!({ "allowInsecure": true })),
+            "localhost",
+        )
+        .unwrap()
+        .expect("client tls config");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let conn = xray_transport::connection::TcpConnection::new(sock);
+            let tls = xray_tls::utls::server(conn, server_cfg).await.unwrap();
+            let (r, w) = tokio::io::split(tls);
+            let joined = tokio::io::join(r, w);
+            let (mut vr, mut vw) = tokio::io::split(joined);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+            let reader = async move {
+                let mut buf = vec![0u8; 16_384];
+                loop {
+                    match vr.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if tx.send(buf[..n].to_vec()).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            };
+            let writer = async move {
+                while let Some(chunk) = rx.recv().await {
+                    if vw.write_all(&chunk).await.is_err() {
+                        break;
+                    }
+                }
+            };
+            tokio::join!(reader, writer);
+        });
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        tcp.set_nodelay(true).unwrap();
+        let tls = xray_tls::utls::client(
+            Box::new(xray_transport::connection::TcpConnection::new(tcp))
+                as Box<dyn xray_transport::connection::Connection>,
+            "localhost",
+            client_cfg,
+        )
+        .await
+        .unwrap();
+        let (mut vr, mut vw) = tokio::io::split(tls);
+
+        let payload: Vec<u8> = (0u8..=255).cycle().take(512 * 1024).collect();
+        let expect = payload.clone();
+        let run = async {
+            let up = async {
+                vw.write_all(&payload).await.unwrap();
+            };
+            let down = async {
+                let mut got = vec![0u8; expect.len()];
+                vr.read_exact(&mut got).await.unwrap();
+                assert_eq!(got, expect, "H1 512KB integrity");
+            };
+            tokio::join!(up, down);
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(15), run)
+            .await
+            .expect("H1 rustls-only 512KB 超时");
+        server.abort();
+    }
+
+    /// [对照实验 H2] VisionConn 双端 + 裸 TCP（去 rustls）：
+    /// 若挂 → rustls 非必需；若过 → rustls×VisionConn 组合必需。
+    #[tokio::test]
+    async fn repro_h2_vision_plain_tcp_512k() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use xray_proxy_vless::encryption::vision_conn::VisionConn;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let conn = xray_transport::connection::TcpConnection::new(sock);
+            let (r, w) = tokio::io::split(conn);
+            let vision = VisionConn::new(tokio::io::join(r, w), vec![0xAB; 16]);
+            let (mut vr, mut vw) = tokio::io::split(vision);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+            let reader = async move {
+                let mut buf = vec![0u8; 16_384];
+                loop {
+                    match vr.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if tx.send(buf[..n].to_vec()).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            };
+            let writer = async move {
+                while let Some(chunk) = rx.recv().await {
+                    if vw.write_all(&chunk).await.is_err() {
+                        break;
+                    }
+                }
+            };
+            tokio::join!(reader, writer);
+        });
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let vision = VisionConn::new(
+            Box::new(xray_transport::connection::TcpConnection::new(tcp))
+                as Box<dyn xray_transport::connection::Connection>,
+            vec![0xAB; 16],
+        );
+        let (mut vr, mut vw) = tokio::io::split(vision);
+
+        let payload: Vec<u8> = (0u8..=255).cycle().take(512 * 1024).collect();
+        let expect = payload.clone();
+        let run = async {
+            let up = async {
+                vw.write_all(&payload).await.unwrap();
+            };
+            let down = async {
+                let mut got = vec![0u8; expect.len()];
+                vr.read_exact(&mut got).await.unwrap();
+                assert_eq!(got, expect, "H2 512KB integrity");
+            };
+            tokio::join!(up, down);
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(15), run)
+            .await
+            .expect("H2 vision-plain 512KB 超时");
+        server.abort();
     }
 
     /// Trojan+TLS 端到端：SOCKS5 → Trojan+TLS → Freedom → echo（验证 8m1 修复：streamSettings TLS 注入）
