@@ -199,6 +199,15 @@ impl ServerConfigAndStapler {
     }
 }
 
+impl std::fmt::Debug for ServerConfigAndStapler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfigAndStapler")
+            .field("server_config", &self.server_config)
+            .field("stapler_enabled", &self.stapler.is_some())
+            .finish()
+    }
+}
+
 // ============================================================
 // 测试
 // ============================================================
@@ -242,9 +251,11 @@ mod tests {
 
     #[test]
     fn load_certified_key_rejects_empty_key() {
-        // 有效的证书 PEM 但无私钥
-        let certs_pem = b"-----BEGIN CERTIFICATE-----\nMIIBjTCCAWOgAwIBAgIUfZxZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYwDQYJKoZIhvcNAQELBQAwETEPMA0GA1UEAwwGVGVzdENBMCAXDTI0MDEwMTAwMDAwMFoYDzIwNTQwMTAxMDAwMDAwWjARMQ8wDQYDVQQDDAY8VGVzdD4wWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYxo4HCMIG/MA4GA1UdDwEB/wQEAwIHgDATBgNVHSUEDDAKBggrBgEFBQcDATAdBgNVHQ4EFgQUZzYxZzYxZzYxZzYxZzYxZzYxZzYwHwYDVR0jBBgwFoAUZzYxZzYxZzYxZzYxZzYxZzYxZzYwDAYDVR0TBAUwAwEB/zAJBgcqhkjOPQ4BAgNHADBEAiAZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYIGC2BQCMQCIQDZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYxZzYw==\n-----END CERTIFICATE-----\n";
-        let result = load_certified_key(certs_pem, b"");
+        // 有效的证书 PEM（rcgen 现生成）但无私钥
+        let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = cert_params.self_signed(&key_pair).unwrap();
+        let result = load_certified_key(cert.pem().as_bytes(), b"");
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, TlsError::PemLoad(_)));
@@ -294,9 +305,9 @@ mod tests {
         assert!(err.to_string().contains("at least 2 certificates"));
     }
 
-    /// 测试 OCSP stapling 启用且有完整证书链时成功构建。
-    #[test]
-    fn build_server_config_enabled_with_chain() {
+    /// `Stapler::new` 内部 spawn 后台 worker，需要 tokio runtime。
+    #[tokio::test]
+    async fn build_server_config_enabled_with_chain() {
         // 生成 CA + end-entity 证书链
         let ca_params = rcgen::CertificateParams::new(vec!["Test CA".to_string()]).unwrap();
         let ca_key_pair = rcgen::KeyPair::generate().unwrap();
