@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use xray_app_dispatcher::default::SimpleOhm;
 use xray_app_dispatcher::OutboundHandlerManager;
 use xray_buf::io::{new_reader, new_writer};
@@ -118,6 +118,9 @@ pub async fn serve_vless(
         let local = listener.local_addr()?;
         tokio::spawn(async move {
             let result = if let Some(acc) = tls {
+                // vision splice：TLS accept 消费 socket 前 dup 裸 TCP 克隆，
+                // END/DIRECT 帧后读写直通（Go UnwrapRawConn 等价路径）。
+                let raw_tcp = xray_transport::connection::dup_tcp_stream(&stream);
                 match acc.accept(stream).await {
                     Ok(tls_stream) => {
                         let conn = tls_stream.get_ref().1;
@@ -128,7 +131,7 @@ pub async fn serve_vless(
                             .unwrap_or_default();
                         handle_connection_with_fallback(
                             tls_stream, &handler, &validator, fallbacks, peer, local, name, alpn,
-                            options,
+                            options, raw_tcp,
                         )
                         .await
                     }
@@ -140,7 +143,7 @@ pub async fn serve_vless(
             } else {
                 handle_connection_with_fallback(
                     stream, &handler, &validator, fallbacks, peer, local, String::new(), String::new(),
-                    options,
+                    options, None,
                 )
                 .await
             };
@@ -209,6 +212,7 @@ pub async fn handle_connection_with_fallback<S>(
     tls_name: String,
     tls_alpn: String,
     options: Option<VlessInboundOptions>,
+    raw_tcp: Option<TcpStream>,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
@@ -238,7 +242,7 @@ where
 
     // 无 fallback 策略：维持原直连路径（不做 first 预读）
     let Some(policy) = fallbacks else {
-        return handle_connection(stream, handler, validator, options).await;
+        return handle_connection(stream, handler, validator, options, raw_tcp).await;
     };
 
     let (mut read_half, write_half) = tokio::io::split(stream);
@@ -261,7 +265,8 @@ where
         if let Ok(decoded) =
             decode_request_header(false, &mut None, &mut reader, validator.as_ref()).await
         {
-            return finish_vless_dispatch(reader, write_half, decoded, handler, options).await;
+            return finish_vless_dispatch(reader, write_half, decoded, handler, options, raw_tcp)
+                .await;
         }
         // ponytail: decode 失败时 decode 已续读的 stream 字节不重放（Go 用
         // connection buffer replay）；version=0 的畸形流量才走到这，正常
@@ -345,6 +350,7 @@ async fn finish_vless_dispatch<R, W>(
     decoded: crate::encoding::server::DecodedRequest,
     handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,
     options: Option<VlessInboundOptions>,
+    raw_tcp: Option<TcpStream>,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -360,7 +366,7 @@ where
     // 2. 按 command 分派
     match decoded.command {
         VlessCommand::Tcp => {
-            finish_tcp_dispatch(reader, write_half, &decoded, handler).await
+            finish_tcp_dispatch(reader, write_half, &decoded, handler, raw_tcp).await
         }
         VlessCommand::Udp => {
             handle_udp_relay(reader, write_half, &decoded, handler).await
@@ -380,6 +386,7 @@ async fn finish_tcp_dispatch<R, W>(
     write_half: W,
     decoded: &crate::encoding::server::DecodedRequest,
     handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,
+    raw_tcp: Option<TcpStream>,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -397,9 +404,16 @@ where
 
     // flow=xtls-rprx-vision：join 读写半流 → VisionConn 包装（uuid 用解码用户）
     // → 重新 split；非 vision 同样 join+split（零开销适配器，统一类型）。
-    let stream: Box<dyn VlessStream> = match vision_uuid {
-        Some(uuid) => Box::new(VisionConn::new(tokio::io::join(reader, write_half), uuid)),
-        None => Box::new(tokio::io::join(reader, write_half)),
+    let stream: Box<dyn VlessStream> = match (vision_uuid, raw_tcp) {
+        (Some(uuid), Some(raw)) => Box::new(VisionConn::new_server(
+            tokio::io::join(reader, write_half),
+            uuid,
+            raw,
+        )),
+        (Some(uuid), None) => {
+            Box::new(VisionConn::new(tokio::io::join(reader, write_half), uuid))
+        }
+        (None, _) => Box::new(tokio::io::join(reader, write_half)),
     };
     let (rh, wh) = tokio::io::split(stream);
     let link = Link::new(new_reader(rh), new_writer(wh));
@@ -620,6 +634,7 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
     handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,
     validator: &Arc<dyn Validator>,
     options: Option<VlessInboundOptions>,
+    raw_tcp: Option<TcpStream>,
 ) -> std::io::Result<()> {
     let mut stream = stream;
 
@@ -631,7 +646,7 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
 
     // 2. 按 command 分派：拆 reader/writer 后交 finish_vless_dispatch。
     let (read_half, write_half) = tokio::io::split(stream);
-    finish_vless_dispatch(read_half, write_half, decoded, handler, options).await
+    finish_vless_dispatch(read_half, write_half, decoded, handler, options, raw_tcp).await
 }
 
 // ---------------------------------------------------------------------------

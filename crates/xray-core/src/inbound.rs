@@ -1552,6 +1552,7 @@ async fn serve_reality_vless(
                         &handler,
                         &validator,
                         options.clone(),
+                        None,
                     )
                     .await
                     {
@@ -1726,7 +1727,7 @@ async fn spawn_one_inbound(
                         // TLS 已在 transport hub 内终结，name/alpn 不可得
                         if let Err(e) = xray_proxy_vless::handle_connection_with_fallback(
                             conn, &handler, &validator, fallbacks, peer, local,
-                            String::new(), String::new(), Some(options),
+                            String::new(), String::new(), Some(options), None,
                         ).await {
                             tracing::debug!(error = %e, "vless transport connection ended with error");
                         }

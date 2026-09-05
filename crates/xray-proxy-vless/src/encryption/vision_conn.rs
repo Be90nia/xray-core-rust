@@ -44,6 +44,12 @@ impl InnerRawClone for Box<dyn Connection> {
 
 impl<A: AsyncRead, B: AsyncWrite> InnerRawClone for tokio::io::Join<A, B> {}
 
+impl InnerRawClone for CommonConn<tokio::net::TcpStream> {
+    fn inner_raw_tcp_clone(&self) -> Option<TcpStream> {
+        xray_transport::connection::dup_tcp_stream(self.inner_conn())
+    }
+}
+
 impl InnerRawClone for CommonConn<tokio::io::DuplexStream> {}
 /// Vision 连接：包装 [`CommonConn`]，提供 XTLS-Vision padding。
 ///
@@ -72,8 +78,10 @@ pub struct VisionConn<C> {
     uplink_traffic: TrafficState,
     /// downlink TLS 过滤状态（检测服务器 TLS 1.3 → enable_xtls → splice）。
     downlink_traffic: TrafficState,
-    /// splice 后的裸 TCP 读直通道（server 发 DIRECT 帧后克隆内层 socket）。
+    /// splice 后的裸 TCP 读直通道（DIRECT 帧后启用：取 raw_tcp 或克隆内层）。
     raw_fallback: Option<TcpStream>,
+    /// server 模式注入的裸 TCP 克隆（accept 层 dup，DIRECT 前不启用）。
+    raw_tcp: Option<TcpStream>,
 }
 
 impl<C> VisionConn<C>
@@ -103,8 +111,35 @@ where
             uplink_traffic: TrafficState::new(user_uuid.clone()),
             downlink_traffic: TrafficState::new(user_uuid.clone()),
             raw_fallback: None,
+            raw_tcp: None,
         }
     }
+
+    /// server 模式构造（vision splice）：accept 层在 TLS accept 消费 socket 前
+    /// dup 出的裸 TCP 克隆。仅 DIRECT 帧（双向都切裸流）后启用；END 只关
+    /// padding 不切 raw——对端仍在安全层内说话，提前直通裸流会读到密文。
+    #[must_use]
+    pub fn new_server(conn: C, user_uuid: Vec<u8>, raw_tcp: TcpStream) -> Self {
+        let uplink_uuid_pending = Some(user_uuid.clone());
+        Self {
+            inner: conn,
+            user_uuid: user_uuid.clone(),
+            uplink_uuid_pending,
+            uplink_state: DirectionState::default(),
+            downlink_state: DirectionState::default(),
+            downlink_pending: Vec::new(),
+            downlink_pending_pos: 0,
+            uplink_write_pending: None,
+            uplink_padding: true,
+            downlink_padding: true,
+            rng: StdRng::from_os_rng(),
+            uplink_traffic: TrafficState::new(user_uuid.clone()),
+            downlink_traffic: TrafficState::new(user_uuid.clone()),
+            raw_fallback: None,
+            raw_tcp: Some(raw_tcp),
+        }
+    }
+
     /// dial 同步阶段主动发 uuid-only padding 块,后续 chunk 进 vision content。
     /// 对齐 Go outbound VisionWriter mb[0]=nil → XtlsPadding(None, CommandPaddingContinue)。
     pub async fn write_uuid_only_padding(&mut self) -> io::Result<()> {
@@ -185,7 +220,12 @@ where
                             this.downlink_padding = false;
                         } else if cmd == COMMAND_PADDING_DIRECT as i32 {
                             this.downlink_padding = false;
-                            this.raw_fallback = this.inner.inner_raw_tcp_clone();
+                            if this.raw_fallback.is_none() {
+                                this.raw_fallback = this
+                                    .raw_tcp
+                                    .take()
+                                    .or_else(|| this.inner.inner_raw_tcp_clone());
+                            }
                         }
                     }
                     if !content.is_empty() {
@@ -223,9 +263,14 @@ where
                     return Poll::Ready(Ok(orig_len));
                 }
                 match Pin::new(&mut this.inner).poll_write(cx, &padded[sent..]) {
+                    // Ok(0)（非空 buf）= 底层无法再接受数据；裸 Pending 无 waker
+                    // 注册（底层刚返回 Ready），跨窗口背压下会死锁。
                     Poll::Ready(Ok(0)) => {
                         this.uplink_write_pending = Some((padded, sent, orig_len));
-                        return Poll::Pending;
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "inner conn accepted 0 bytes",
+                        )));
                     }
                     Poll::Ready(Ok(n)) => {
                         let new_sent = sent + n;
@@ -287,7 +332,10 @@ where
             this.uplink_write_pending = Some((padded, 0, n));
             if command == COMMAND_PADDING_DIRECT {
                 this.uplink_padding = false;
-                this.raw_fallback = this.inner.inner_raw_tcp_clone();
+                if this.raw_fallback.is_none() {
+                    this.raw_fallback =
+                        this.raw_tcp.take().or_else(|| this.inner.inner_raw_tcp_clone());
+                }
             }
             // continue → 步骤 1 写 pending
         }
@@ -330,6 +378,21 @@ where
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// 构造 TCP 回环 socket 对 + 各自的裸克隆件（server splice 测试）。
+    async fn make_tcp_pair() -> (
+        (tokio::net::TcpStream, tokio::net::TcpStream),
+        (tokio::net::TcpStream, tokio::net::TcpStream),
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (s, _) = listener.accept().await.unwrap();
+        let c2 = xray_transport::connection::dup_tcp_stream(&c).unwrap();
+        let s2 = xray_transport::connection::dup_tcp_stream(&s).unwrap();
+        ((c, c2), (s, s2))
+    }
+
 
     /// 构造一对互连的 VisionConn（共享相同 AEAD key，模拟 handshake 后状态）。
     fn make_pair() -> (
@@ -518,4 +581,129 @@ mod tests {
         assert_eq!(buf_a, expected);
         assert_eq!(buf_b, expected);
     }
+    /// 跨缓冲窗口流式压力：512KB 经 64KB duplex 窗口（读侧=server 角色）。
+    /// 内置 timeout 防挂死整个套件；超时打印两侧进度。
+    #[tokio::test]
+    async fn server_mode_uplink_stream_stress() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let (mut a, mut b) = make_pair();
+        const TOTAL: usize = 512 * 1024;
+        let payload: Vec<u8> = (0u8..=255).cycle().take(TOTAL).collect();
+        let payload_clone = payload.clone();
+        let wrote = Arc::new(AtomicUsize::new(0));
+        let read = Arc::new(AtomicUsize::new(0));
+        let (w, r) = (wrote.clone(), read.clone());
+        let work = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            async {
+                tokio::join!(
+            async move {
+                let mut off = 0;
+                while off < payload.len() {
+                    let n = a.write(&payload[off..]).await.unwrap();
+                    off += n;
+                    w.store(off, Ordering::Relaxed);
+                }
+                a.flush().await.unwrap();
+            },
+            async move {
+                let mut got = vec![0u8; TOTAL];
+                let mut off = 0;
+                while off < TOTAL {
+                    let n = b.read(&mut got[off..]).await.unwrap();
+                    if n == 0 {
+                        panic!("EOF at {off}");
+                    }
+                    off += n;
+                    r.store(off, Ordering::Relaxed);
+                }
+                assert_eq!(got, payload_clone);
+            }
+            )
+            }
+        )
+        .await;
+        if work.is_err() {
+            panic!(
+                "stress timeout: wrote={} read={}",
+                wrote.load(Ordering::Relaxed),
+                read.load(Ordering::Relaxed)
+            );
+        }
+    }
+
+    /// server 下行 splice：enable_xtls + 完整 app-data record → 发 DIRECT 帧 +
+    /// 自身写切裸 TCP。对端经安全层收到 DIRECT 帧 content，随后在裸 socket
+    /// 上直收后续明文。
+    #[tokio::test]
+    async fn server_splice_downlink_direct_and_raw_write() {
+        let ((c, _c2), (s, s2)) = make_tcp_pair().await;
+        let uuid = vec![0xABu8; 16];
+        let key = b"united-key".to_vec();
+        let mut server = VisionConn::new_server(
+            CommonConn::new(s, Aead::new(b"ctx", &key, true), Aead::new(b"ctx", &key, true), true, key.clone()),
+            uuid,
+            s2,
+        );
+        // 白盒置位（生产由读侧 xtls_filter_tls 检测 ClientHello 置位）
+        server.downlink_traffic.enable_xtls = true;
+        let app = build_tls_app_data(b"GET / HTTP/1.1\r\n\r\n");
+        server.write_all(&app).await.unwrap();
+        server.flush().await.unwrap();
+        let mut peer = CommonConn::new(c, Aead::new(b"ctx", &key, true), Aead::new(b"ctx", &key, true), true, key.clone());
+
+        let frame_len = 16 + 5 + app.len();
+        let mut frame = vec![0u8; frame_len];
+        peer.read_exact(&mut frame).await.unwrap();
+        assert_eq!(&frame[..16], &vec![0xABu8; 16][..], "首帧带 uuid 前缀");
+        assert_eq!(frame[16], COMMAND_PADDING_DIRECT);
+        let clen = u16::from_be_bytes([frame[17], frame[18]]) as usize;
+        assert_eq!(clen, app.len());
+        assert_eq!(&frame[21..], &app);
+        // splice 后 server 直写裸 TCP：对端裸 socket 直收（无 AEAD 包装）
+        server.write_all(b"raw-after-splice").await.unwrap();
+        server.flush().await.unwrap();
+        let mut raw = [0u8; 16];
+        peer.inner_conn_mut().read_exact(&mut raw).await.unwrap();
+        assert_eq!(&raw, b"raw-after-splice");
+    }
+
+    /// server 读侧 splice：收 client DIRECT 帧 → 自身读切裸 TCP。
+    async fn server_splice_read_switch_on_client_direct() {
+        let ((c, mut c2), (s, s2)) = make_tcp_pair().await;
+        let uuid = vec![0xABu8; 16];
+        let key = b"united-key".to_vec();
+        let mut server = VisionConn::new_server(
+            CommonConn::new(s, Aead::new(b"ctx", &key, true), Aead::new(b"ctx", &key, true), true, key.clone()),
+            uuid.clone(),
+            s2,
+        );
+        // client 发 DIRECT padding 帧（content=app record），经安全层
+        let app = build_tls_app_data(b"hello-direct");
+        let padded = xtls_padding(
+            Some(&app),
+            COMMAND_PADDING_DIRECT,
+            &mut Some(uuid.clone()),
+            false,
+            &DEFAULT_PADDING_SEED,
+            &mut StdRng::from_os_rng(),
+        );
+        let mut client = CommonConn::new(c, Aead::new(b"ctx", &key, true), Aead::new(b"ctx", &key, true), true, key.clone());
+        client.write_all(&padded).await.unwrap();
+        client.flush().await.unwrap();
+
+        // server 读：unpadding 提取 content + 切 raw
+        let mut got = vec![0u8; app.len()];
+        server.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, app);
+
+        // client 此后在裸 socket 上发明文：server 直收
+        c2.write_all(b"raw-upstream").await.unwrap();
+        c2.flush().await.unwrap();
+        let mut raw = [0u8; 12];
+        server.read_exact(&mut raw).await.unwrap();
+        assert_eq!(&raw, b"raw-upstream");
+    }
 }
+

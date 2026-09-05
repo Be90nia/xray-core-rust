@@ -61,6 +61,43 @@ pub trait Connection: AsyncRead + AsyncWrite + Send + Sync + Unpin {
 }
 
 
+/// 复制 `tokio::net::TcpStream` 底层 socket 为独立 handle（vision splice 用）。
+///
+/// tokio TcpStream 无 `try_clone`：unix 走 `dup(fd)`，windows 走
+/// `DuplicateHandle`（经 std `try_clone`）。两个 handle 共享同一内核 socket，
+/// 可独立 poll，关闭其一不影响另一。失败返回 `None`。
+pub fn dup_tcp_stream(stream: &TcpStream) -> Option<TcpStream> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        let fd = stream.as_raw_fd();
+        let new_fd = unsafe { libc::dup(fd) };
+        if new_fd < 0 {
+            return None;
+        }
+        let std_stream = unsafe { std::net::TcpStream::from_raw_fd(new_fd) };
+        // from_std 要求非阻塞模式。tokio 持有的 fd 是非阻塞的；dup 继承同样 flags。
+        TcpStream::from_std(std_stream).ok()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsRawSocket, FromRawSocket};
+        // 借 raw SOCKET 构造不接管所有权的 std 视图（ManuallyDrop 防 drop
+        // 关闭原 handle），try_clone 复制独立 handle，再转回 tokio。
+        // SAFETY: raw handle 由 stream 持有且调用期间有效；视图被
+        // ManuallyDrop 包裹不会关闭它，克隆出的 handle 独立拥有新句柄。
+        let raw = stream.as_raw_socket();
+        let view = std::mem::ManuallyDrop::new(unsafe { std::net::TcpStream::from_raw_socket(raw) });
+        let cloned = view.try_clone().ok()?;
+        TcpStream::from_std(cloned).ok()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = stream;
+        None
+    }
+}
+
 /// TCP 连接。
 ///
 /// 包装 `tokio::net::TcpStream`，提供 `Connection` 实现。作为参考实现存在，
@@ -120,40 +157,7 @@ impl Connection for TcpConnection {
         Ok(Some(self.inner.local_addr()?))
     }
     fn raw_tcp_clone(&self) -> Option<TcpStream> {
-        // tokio::net::TcpStream 没有 try_clone；通过 dup(fd) 复制底层 socket 后
-        // 用 TcpStream::from_std 构造独立 AsyncRead/AsyncWrite handle。
-        // 两个 handle 共享同一个内核 socket,可独立 poll,关闭其一不影响另一。
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::{AsRawFd, FromRawFd};
-            let fd = self.inner.as_raw_fd();
-            let new_fd = unsafe { libc::dup(fd) };
-            if new_fd < 0 { return None; }
-            let std_stream = unsafe { std::net::TcpStream::from_raw_fd(new_fd) };
-            // from_std 要求非阻塞模式。tokio 持有的 fd 是非阻塞的；dup 继承同样 flags。
-            TcpStream::from_std(std_stream).ok()
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::{AsRawSocket, FromRawSocket};
-            // tokio TcpStream 无 try_clone：借 raw SOCKET 构造不接管所有权的
-            // std 视图（ManuallyDrop 防 drop 关闭原 handle），std TcpStream::
-            // try_clone（内部 DuplicateHandle）复制独立 handle，再转回 tokio
-            // （from_std 要求非阻塞，tokio 持有的 socket 已是）。
-            // SAFETY: raw handle 由 self.inner 持有且调用期间有效；视图被
-            // ManuallyDrop 包裹不会关闭它，克隆出的 handle 独立拥有新句柄。
-            let raw = self.inner.as_raw_socket();
-            let view = std::mem::ManuallyDrop::new(unsafe { std::net::TcpStream::from_raw_socket(raw) });
-            let cloned = match view.try_clone() {
-                Ok(s) => s,
-                Err(_) => return None,
-            };
-            TcpStream::from_std(cloned).ok()
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            None
-        }
+        dup_tcp_stream(&self.inner)
     }
     fn close_read(&mut self) -> io::Result<()> {
         #[cfg(unix)]
