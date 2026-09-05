@@ -98,7 +98,10 @@ async fn vless_reality_vision_vps_interop() {
     // 5. VisionConn 包装 tls，发 HTTP GET（自动 Vision padding，首块带 uuid）
     eprintln!("[4/5] Vision padding + HTTP GET");
     let uuid_bytes = uuid.as_bytes().to_vec();
-    let mut vision = VisionConn::new(tls, uuid_bytes);
+    // v50 起 VisionConn 的 AsyncRead/AsyncWrite 带 InnerRawClone bound；经
+    // Box<dyn Connection> 适配（RealityTlsStream 已实现 Connection）。
+    let mut vision =
+        VisionConn::new(Box::new(tls) as Box<dyn xray_transport::connection::Connection>, uuid_bytes);
     let http_req = b"GET / HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\n\r\n";
     vision
         .write_all(http_req)
