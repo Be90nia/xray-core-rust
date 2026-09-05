@@ -145,7 +145,7 @@ pub async fn serve_vless(
                 .await
             };
             if let Err(e) = result {
-                tracing::debug!(error = %e, "vless connection ended with error");
+                tracing::info!(error = %e, "vless connection ended with error");
             }
         });
     }

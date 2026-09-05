@@ -156,10 +156,20 @@ impl Validator {
         self.email.len()
     }
 
+    /// 返回可认证的用户数量（key 索引大小）。
+    ///
+    /// 生产配置的 client 通常不带 email（`get_count` 恒 0，Go `GetCount`
+    /// 同为 email-only 语义）；启动日志展示「已载入用户数」应使用本方法。
+    /// 对齐 vless validator 的 `get_uuid_count` 口径。
+    pub fn get_key_count(&self) -> usize {
+        self.users.len()
+    }
+
     /// 按 56 字节 hex key 直接查找（便捷方法，等价于 `get(&hex_string(key))`）。
     pub fn get_by_key(&self, key: &[u8]) -> Option<MemoryUser> {
         self.get(&hex_string(key))
     }
+
 }
 
 #[cfg(test)]
@@ -226,6 +236,8 @@ mod tests {
         assert!(v.get_by_email("").is_none());
         // 但按 key 仍能查到
         assert!(v.get_by_key(&key).is_some());
+        // key 计数口径：空 email 用户可认证，get_key_count 应计入
+        assert_eq!(v.get_key_count(), 1);
     }
 
     #[test]
@@ -269,6 +281,8 @@ mod tests {
         let mut emails: Vec<_> = all.iter().map(|u| u.email.as_str()).collect();
         emails.sort();
         assert_eq!(emails, vec!["a@x.com", "b@x.com", "c@x.com"]);
+        // key 计数口径与 email 口径在有 email 时一致
+        assert_eq!(v.get_key_count(), 3);
     }
 
     #[test]
