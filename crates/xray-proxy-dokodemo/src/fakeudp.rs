@@ -33,7 +33,7 @@ fn fake_udp_linux(addr: SocketAddr, mark: u32) -> io::Result<tokio::net::UdpSock
 
     unsafe {
         let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
-        let fd = libc::socket(domain, libc::SOCK_DGRAM, 0);
+        let mut fd = libc::socket(domain, libc::SOCK_DGRAM, 0);
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -55,7 +55,13 @@ fn fake_udp_linux(addr: SocketAddr, mark: u32) -> io::Result<tokio::net::UdpSock
             if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
                 return Err(io::Error::last_os_error());
             }
-            Ok(tokio::net::UdpSocket::from_raw_fd(fd))
+            // tokio 1.x UdpSocket 无 FromRawFd impl；等价路径 = std FromRawFd + from_std。
+            // from_std Err 时 std socket 已 drop 关闭 fd，置 -1 让外层 close 成为 no-op。
+            let res = tokio::net::UdpSocket::from_std(std::net::UdpSocket::from_raw_fd(fd));
+            if res.is_err() {
+                fd = -1;
+            }
+            Ok(res?)
         })();
 
         if result.is_err() {

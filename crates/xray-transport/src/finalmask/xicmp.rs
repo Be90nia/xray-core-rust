@@ -528,7 +528,7 @@ pub fn random_client_id() -> [u8; 8] {
 fn xicmp_open_client(cfg: &XicmpConfig) -> io::Result<Box<dyn UdpIo>> {
     #[cfg(target_os = "linux")]
     {
-        linux_open_client(cfg)
+        linux_impl::linux_open_client(cfg)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -544,7 +544,7 @@ fn xicmp_open_client(cfg: &XicmpConfig) -> io::Result<Box<dyn UdpIo>> {
 fn xicmp_open_server(cfg: &XicmpConfig) -> io::Result<Box<dyn UdpIo>> {
     #[cfg(target_os = "linux")]
     {
-        linux_open_server(cfg)
+        linux_impl::linux_open_server(cfg)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -580,7 +580,8 @@ mod linux_impl {
     impl LinuxIcmpRawSocket {
         /// 打开 IPv4 ICMP raw socket（`ip4:icmp`）。需 CAP_NET_RAW 或 root。
         pub fn open_v4() -> io::Result<Self> {
-            let sock = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))?;
+            // socket2 0.5 的 Type::RAW 被 `all` feature 门控；From<c_int> 无门控，等价。
+            let sock = Socket::new(Domain::IPV4, Type::from(libc::SOCK_RAW), Some(Protocol::ICMPV4))?;
             sock.set_nonblocking(true)?;
             let fd = AsyncFd::new(sock)?;
             Ok(Self { _fd: fd })
@@ -588,7 +589,7 @@ mod linux_impl {
 
         /// 打开 IPv6 ICMPv6 raw socket（`ip6:ipv6-icmp`）。
         pub fn open_v6() -> io::Result<Self> {
-            let sock = Socket::new(Domain::IPV6, Type::RAW, Some(Protocol::ICMPV6))?;
+            let sock = Socket::new(Domain::IPV6, Type::from(libc::SOCK_RAW), Some(Protocol::ICMPV6))?;
             sock.set_nonblocking(true)?;
             let fd = AsyncFd::new(sock)?;
             Ok(Self { _fd: fd })
