@@ -114,3 +114,59 @@ nonce 换 key 不对称 / SlidingWindow 淘汰后重放窗口 / from_utf8_unchec
 4. **传输层 R1-R3**(hysteria UDP 互通断裂/multiMode 丢数据/mKCP 泄漏)
 5. **可观测性 O1-O3 + 第一轮泄漏/挂死/功能组**
 6. P2/P3 按需
+
+---
+
+# 第三轮专项审计 (2026-09-05,4 切面)
+
+负优化专项(用户明令)/ DNS+路由引擎 / 加解密字节级 / 依赖健康。方法论强化:**"确认干净"是合法结论,禁止凑数**;每条修复建议附负优化自查。
+
+## 第三轮统计
+
+| 切面 | 报告 | P0 | P1 | P2 | P3 |
+|---|---|---|---|---|---|
+| 负优化专项 | [negative_optimization.md](negative_optimization.md) | 0 | 0 | 9 | 14 |
+| DNS+路由 | [dns_routing.md](dns_routing.md) | **1** | 6 | 14 | 7 |
+| 加解密 | [crypto.md](crypto.md) | 0 | 1 | 3 | 5 |
+| 依赖健康 | [dependencies.md](dependencies.md) | 0 | 1 | 6 | 11 |
+| **小计** | | **1** | **8** | **32** | **37** |
+
+## 三轮合计: P0×4 / P1×43 / P2×114 / P3×53
+
+## 第三轮新 P0
+
+- **DNS parallel_query JoinSet 排空无限自旋**(xray-app-dns/server.rs:437-502):enableParallelQuery+多 policy 组(geosite 国内外分流典型形态)前组全败+后组结果先到 → 解析任务永久挂死烧满一核。修:join_next() 返回 None 跳出+组 race 检查对齐 Go dns.go:414-437
+
+## 第三轮 P1(8 条)
+
+**DNS/路由(6)**:
+- singleflight 领导任务中止→条目泄漏+同 key 查询永久挂起(cached.rs:107-130,P0 的放大器)
+- hosts 环形配置无限递归(server.rs:248-253,Go maxDepth 耗尽后落 nameserver)
+- leastload tolerance/baselines 算法整体偏离 Go(strategy_leastload.rs:229-283,默认 tolerance=0 全灭节点恒 fallback,leastload 实质不可用)
+- random 策略杜撰 50/50 fallback(Go 无此语义,一半流量固定走 fallback,strategy_random.rs:44-49)
+- 路由命中但 tag 不存在→静默回落默认出站(Go 源码明令 DO NOT CHANGE,流量泄露面,default.rs:908-916)
+- routeOnly 丢弃嗅探域名→域名分流整体失效(default.rs:529-535)
+
+**加解密(1)**:
+- VLESS ENC 0-RTT 票据失效无恢复:服务端重启后客户端缓存票据有效期内每次重连必败(common_conn.rs:185-188,Go 靠客户端 Read 自愈)
+
+**依赖(1)**:
+- h2 0.4.15 命中 RUSTSEC-2026-0258(无界空 DATA 帧→内存耗尽;cargo-deny 实拉 DB 验证非记忆猜测),`cargo update -p h2` 一行修
+
+## 负优化专项结论(用户明令)
+
+- **前两轮 38 项 P0/P1 修复建议逐条预审完成**:5 项标高危前置(ENC 缩锁/writev/CommonConn 池化/finalmask waker/mux wrap——触碰 v49/v50/v51 事故同文件,必须带测试阶梯+benchmark 才可合入);3 项行为激活型(Selector/FakeDNS/httpupgrade/键族)需 changelog+兼容 alias
+- **3 项依赖修复明确判定为负优化不做**:强删 fork aws_lc_rs(provider panic 风险)/退回 aead 0.5/换 rsa 实现
+- 历史回退模式 6 类,现存同类隐患 4 处已立案;v50/v51/v54 根治点复查无回归;唯一正向性能提交 b069b1a 未被回退
+- 代码自认妥协 144 处 ponytail 注释纪律良好,立案其中真正欠账 23 条;P-A 症状抑制模式存量 4 处建议统一改 Build 期硬错
+- 生产调试打印残留仅 btls_reality.rs:245 一处 eprintln(一行删)
+
+## 确认干净项(三轮累计,节选)
+
+trojan/hysteria 混淆层字节级全绿;vmess/ENC/ss2022/REALITY 主体一致(44 抽查点);KCP 状态机/gRPC 帧/WS 帧/quicParams 干净;DNS singleflight 算法本体正确;rustls/quinn/tokio/ring RUSTSEC 零命中;无重复 JSON 库;git 依赖 rev 已锁;生产代码无注释掉的功能代码。
+
+## 审计过程事故记录
+
+- timeouts.md 首轮未落盘(reviewer 代理无写盘权限),已由 PM 从 transcript 恢复
+- dns_routing.md 首写流超时,已令代理续写成功
+
