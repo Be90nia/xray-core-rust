@@ -72,6 +72,27 @@ async fn dial_splithttp(
     let has_reality = settings.security == "reality";
     let scheme = if has_tls { "https" } else { "http" };
 
+    // tlsSettings.fingerprint：h1/h2 路径走 hyper-rustls、h3 路径走 quinn，
+    // 两者都只接受 rustls ClientConfig——btls uTLS ClientHello 指纹无法注入。
+    // 配置了 fingerprint（且非 REALITY，REALITY 已有 btls 指纹握手）时降级为
+    // rustls 默认 ClientHello 并 warn（对齐 Go tls.UClient 只在 tcp 直连类
+    // 传输生效的边界；完整支持需 hyper connector 泛型化，另行立项）。
+    if has_tls && !has_reality {
+        let fp = settings
+            .security_json
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .and_then(|m| m.get("fingerprint"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !fp.is_empty() {
+            tracing::warn!(
+                target: "xray_transport_splithttp",
+                "tlsSettings.fingerprint={fp} not supported on hyper-rustls/quinn stack; using default rustls ClientHello"
+            );
+        }
+    }
+
     // Build rustls ClientConfig.
     let tls_config = xray_tls::client_config::build_client_config(
         &settings.security,
@@ -247,6 +268,17 @@ pub(crate) fn parse_splithttp_config(json: Option<&serde_json::Value>) -> io::Re
     };
 
     let get_str = |k: &str| obj.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    // 新键优先、旧键兜底（Go v26.7.28 transport_method.go:269-270 用
+    // sessionIDPlacement/sessionIDKey；Rust 早期键 sessionPlacement/sessionKey
+    // 继续兼容，取第一个非空字符串值）。
+    let get_str2 = |k_new: &str, k_old: &str| {
+        obj.get(k_new)
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| obj.get(k_old).and_then(|x| x.as_str()))
+            .unwrap_or("")
+            .to_string()
+    };
     let get_bool = |k: &str| obj.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
     let get_i64 = |k: &str| obj.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
     let get_range = |k: &str| obj.get(k).and_then(parse_range);
@@ -297,8 +329,8 @@ pub(crate) fn parse_splithttp_config(json: Option<&serde_json::Value>) -> io::Re
         x_padding_placement: get_str("xPaddingPlacement"),
         x_padding_method: get_str("xPaddingMethod"),
         uplink_http_method: get_str("uplinkHTTPMethod"),
-        session_placement: get_str("sessionPlacement"),
-        session_key: get_str("sessionKey"),
+        session_placement: get_str2("sessionIDPlacement", "sessionPlacement"),
+        session_key: get_str2("sessionIDKey", "sessionKey"),
         seq_placement: get_str("seqPlacement"),
         seq_key: get_str("seqKey"),
         uplink_data_placement: get_str("uplinkDataPlacement"),
@@ -335,6 +367,7 @@ pub(crate) fn parse_splithttp_config(json: Option<&serde_json::Value>) -> io::Re
             _ => None,
         },
         no_grpc_header: get_bool("noGRPCHeader"),
+        no_sse_header: get_bool("noSSEHeader"),
         sc_max_each_post_bytes: get_range("scMaxEachPostBytes"),
         sc_min_posts_interval_ms: get_range("scMinPostsIntervalMs"),
         sc_max_buffered_posts: get_i64("scMaxBufferedPosts"),
@@ -488,6 +521,53 @@ mod tests {
         let dl = cfg.download_settings.as_ref().unwrap();
         assert_eq!(dl.host, "dl.example.com");
         assert_eq!(dl.path, "/dl");
+    }
+
+    #[test]
+    fn parse_splithttp_config_session_id_new_keys() {
+        // Go v26.7.28 键名：sessionIDPlacement / sessionIDKey。
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"sessionIDPlacement":"header","sessionIDKey":"X-Sid"}"#,
+        )
+        .unwrap();
+        let cfg = parse_splithttp_config(Some(&v)).unwrap();
+        assert_eq!(cfg.session_placement, "header");
+        assert_eq!(cfg.session_key, "X-Sid");
+    }
+
+    #[test]
+    fn parse_splithttp_config_session_id_legacy_keys_still_work() {
+        // 旧键（Rust 早期实现）：sessionPlacement / sessionKey 兼容双读。
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"sessionPlacement":"query","sessionKey":"sid"}"#).unwrap();
+        let cfg = parse_splithttp_config(Some(&v)).unwrap();
+        assert_eq!(cfg.session_placement, "query");
+        assert_eq!(cfg.session_key, "sid");
+    }
+
+    #[test]
+    fn parse_splithttp_config_session_id_new_keys_win_over_legacy() {
+        // 新旧键同时出现：新键优先。
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"sessionIDPlacement":"cookie","sessionPlacement":"query",
+                "sessionIDKey":"new","sessionKey":"old"}"#,
+        )
+        .unwrap();
+        let cfg = parse_splithttp_config(Some(&v)).unwrap();
+        assert_eq!(cfg.session_placement, "cookie");
+        assert_eq!(cfg.session_key, "new");
+    }
+
+    #[test]
+    fn parse_splithttp_config_no_sse_header() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"noSSEHeader":true,"noGRPCHeader":true}"#).unwrap();
+        let cfg = parse_splithttp_config(Some(&v)).unwrap();
+        assert!(cfg.no_sse_header);
+        assert!(cfg.no_grpc_header);
+        // 缺省 false。
+        let cfg = parse_splithttp_config(Some(&serde_json::json!({}))).unwrap();
+        assert!(!cfg.no_sse_header);
     }
 
     #[test]

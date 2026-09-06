@@ -153,44 +153,56 @@ async fn roundtrip_through(proxy_addr: SocketAddr, settings: &StreamSettings) ->
     echoed[..n].to_vec()
 }
 
-#[tokio::test]
+/// multi_thread flavor：即使某环节陷入 std 阻塞也不拖死 runtime 计时器，
+/// 保证整体 60s 超时总能触发（挂死可见性）。
+#[tokio::test(flavor = "multi_thread")]
 async fn mask_on_roundtrip_and_wire_bytes_are_masked() {
-    register_dialer().unwrap();
-    register_listener().unwrap();
+    let run = async {
+        register_dialer().unwrap();
+        register_listener().unwrap();
 
-    let settings = mkcp_settings(Some(MASK_ON));
-    let server_addr = setup_server(&settings).await;
-    let proxy = RecordingProxy::start(server_addr);
+        let settings = mkcp_settings(Some(MASK_ON));
+        let server_addr = setup_server(&settings).await;
+        let proxy = RecordingProxy::start(server_addr);
 
-    // 1. 数据 roundtrip
-    let echoed = roundtrip_through(proxy.addr, &settings).await;
-    assert_eq!(echoed, b"hello mkcp mask e2e");
+        // 1. 数据 roundtrip
+        let echoed = roundtrip_through(proxy.addr, &settings).await;
+        assert_eq!(echoed, b"hello mkcp mask e2e");
 
-    // 2. 线上字节非裸 KCP：同配置 chain 可 decode（AEAD tag 验证 = 密码学证明）
-    let fm: serde_json::Value = serde_json::from_str(MASK_ON).unwrap();
-    let chain = parse_finalmask_udp_chain(Some(&fm)).unwrap().expect("chain");
-    let raw = proxy.first_packet();
-    let decoded = chain.decode(&raw).expect("captured packet decodes under mask chain");
-    assert_eq!(raw.len() - decoded.len(), 28 + 4, "overhead = aes128gcm(28) + srtp(4)");
-    assert_ne!(raw, decoded, "wire bytes differ from plaintext KCP segment");
+        // 2. 线上字节非裸 KCP：同配置 chain 可 decode（AEAD tag 验证 = 密码学证明）
+        let fm: serde_json::Value = serde_json::from_str(MASK_ON).unwrap();
+        let chain = parse_finalmask_udp_chain(Some(&fm)).unwrap().expect("chain");
+        let raw = proxy.first_packet();
+        let decoded = chain.decode(&raw).expect("captured packet decodes under mask chain");
+        assert_eq!(raw.len() - decoded.len(), 28 + 4, "overhead = aes128gcm(28) + srtp(4)");
+        assert_ne!(raw, decoded, "wire bytes differ from plaintext KCP segment");
+    };
+    if tokio::time::timeout(Duration::from_secs(60), run).await.is_err() {
+        panic!("mask_on_roundtrip exceeded 60s overall budget — hung");
+    }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn mask_off_roundtrip_unchanged_and_wire_is_bare_kcp() {
-    register_dialer().unwrap();
-    register_listener().unwrap();
+    let run = async {
+        register_dialer().unwrap();
+        register_listener().unwrap();
 
-    let settings = mkcp_settings(None);
-    let server_addr = setup_server(&settings).await;
-    let proxy = RecordingProxy::start(server_addr);
+        let settings = mkcp_settings(None);
+        let server_addr = setup_server(&settings).await;
+        let proxy = RecordingProxy::start(server_addr);
 
-    let echoed = roundtrip_through(proxy.addr, &settings).await;
-    assert_eq!(echoed, b"hello mkcp mask e2e");
+        let echoed = roundtrip_through(proxy.addr, &settings).await;
+        assert_eq!(echoed, b"hello mkcp mask e2e");
 
-    // 回归：无 finalmask 时线上是裸 KCP——同 chain decode 必失败
-    // （original FNV/长度校验 + AEAD tag 校验不可能偶然通过）
-    let fm: serde_json::Value = serde_json::from_str(MASK_ON).unwrap();
-    let chain = parse_finalmask_udp_chain(Some(&fm)).unwrap().expect("chain");
-    let raw = proxy.first_packet();
-    assert!(chain.decode(&raw).is_err(), "bare KCP packet must not decode under mask chain");
+        // 回归：无 finalmask 时线上是裸 KCP——同 chain decode 必失败
+        // （original FNV/长度校验 + AEAD tag 校验不可能偶然通过）
+        let fm: serde_json::Value = serde_json::from_str(MASK_ON).unwrap();
+        let chain = parse_finalmask_udp_chain(Some(&fm)).unwrap().expect("chain");
+        let raw = proxy.first_packet();
+        assert!(chain.decode(&raw).is_err(), "bare KCP packet must not decode under mask chain");
+    };
+    if tokio::time::timeout(Duration::from_secs(60), run).await.is_err() {
+        panic!("mask_off_roundtrip exceeded 60s overall budget — hung");
+    }
 }

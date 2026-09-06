@@ -78,11 +78,15 @@ impl DefaultListener {
         } else {
             TokioTcpListener::bind(addr).await?
         };
+        // PROXY protocol 开关接线：sockopt.acceptProxyProtocol 自动传入
+        // （Go system_listener.go:169-172 按 sockopt 包 proxyproto.Listener；
+        // tcpSettings 等传输级值由 transport 装配处 OR 进 sockopt 后到达这里）。
+        let accept_proxy_protocol = sockopt.accept_proxy_protocol;
         Ok(Self {
             inner,
             sockopt,
             controllers: Vec::new(),
-            accept_proxy_protocol: false,
+            accept_proxy_protocol,
         })
     }
 
@@ -231,16 +235,19 @@ impl DefaultListener {
 
     /// 用已绑定的 tokio listener 构造（测试或高级场景用）。
     pub fn from_tokio(inner: TokioTcpListener, sockopt: SocketOptions) -> Self {
+        let accept_proxy_protocol = sockopt.accept_proxy_protocol;
         Self {
             inner,
             sockopt,
             controllers: Vec::new(),
-            accept_proxy_protocol: false,
+            accept_proxy_protocol,
         }
     }
 
     /// 启用/禁用 PROXY protocol 支持。对应 Go `ListenConfig.AcceptProxyProtocol`。
     /// 启用后，accept 时先读取 PROXY protocol header 提取真实源地址。
+    /// 构造时已从 `sockopt.accept_proxy_protocol` 自动接线（双入口：sockopt 与
+    /// 传输级 settings）；本方法用于显式覆盖该值。
     #[must_use]
     pub fn with_accept_proxy_protocol(mut self, enabled: bool) -> Self {
         self.accept_proxy_protocol = enabled;
@@ -770,6 +777,70 @@ mod tests {
         client.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"ok");
 
+        server.await.unwrap();
+    }
+
+    /// sockopt.acceptProxyProtocol → DefaultListener 开关端到端（Go
+    /// system_listener.go:169-172）：开启时 accept 读掉 PROXY v1 header，
+    /// remote_addr 覆盖为声明源地址，应用流从 header 之后开始。
+    #[tokio::test]
+    async fn sockopt_accept_proxy_protocol_switch_on() {
+        use crate::proxy_protocol::build_proxy_header;
+        let fake_src: SocketAddr = "198.51.100.17:47211".parse().unwrap();
+        let mut sockopt = SocketOptions::default();
+        sockopt.accept_proxy_protocol = true;
+        let listener = DefaultListener::bind("127.0.0.1:0".parse().unwrap(), sockopt)
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let mut conn = listener.accept().await.expect("accept 失败");
+            // remote_addr 被 PROXY header 声明源覆盖。
+            assert_eq!(conn.remote_addr().unwrap().unwrap(), fake_src);
+            // header 被消费，不泄漏进应用流。
+            let mut buf = [0u8; 5];
+            conn.read_exact(&mut buf).await.expect("read 失败");
+            assert_eq!(&buf, b"PING!");
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect 失败");
+        client
+            .write_all(&build_proxy_header(1, fake_src, addr))
+            .await
+            .unwrap();
+        client.write_all(b"PING!").await.unwrap();
+        server.await.unwrap();
+    }
+
+    /// 默认（sockopt.acceptProxyProtocol=false）：开关关闭，PROXY header 不被
+    /// 消费——首读原样拿到 header 字节，remote_addr 仍是真实 TCP peer
+    /// （既有行为不回归）。
+    #[tokio::test]
+    async fn sockopt_accept_proxy_protocol_default_off_keeps_header_in_stream() {
+        use crate::proxy_protocol::build_proxy_header;
+        let fake_src: SocketAddr = "198.51.100.17:47212".parse().unwrap();
+        let listener = DefaultListener::bind("127.0.0.1:0".parse().unwrap(), SocketOptions::default())
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let mut conn = listener.accept().await.expect("accept 失败");
+            // remote_addr 是真实 TCP peer（loopback），不是 PROXY 声明源。
+            let remote = conn.remote_addr().unwrap().unwrap();
+            assert_ne!(remote, fake_src);
+            // 首读 = header 原样字节（开关关闭时不消费）。
+            let mut buf = [0u8; 6];
+            conn.read_exact(&mut buf).await.expect("read 失败");
+            assert_eq!(&buf, b"PROXY ");
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect 失败");
+        client
+            .write_all(&build_proxy_header(1, fake_src, addr))
+            .await
+            .unwrap();
         server.await.unwrap();
     }
 

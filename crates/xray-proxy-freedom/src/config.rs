@@ -159,8 +159,11 @@ impl DomainStrategy {
 
 use crate::error::Result;
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, LazyLock};
+use xray_common::net::address::Address;
+use xray_common::net::destination::Destination;
+use xray_common::net::network::Network;
 use xray_common::net::port::{MemoryPortList, Port, PortRange};
 use xray_geodata::matcher::ip::{HeuristicIPMatcher, IPMatcher};
 use xray_proto::xray::common::geodata::ip_rule;
@@ -202,6 +205,29 @@ pub struct DestinationOverride {
     pub server: Option<xray_proto::xray::common::protocol::ServerEndpoint>,
 }
 
+impl DestinationOverride {
+    /// 从 freedom settings JSON 解析（Go `infra/conf/freedom.go` DestinationOverride）。
+    ///
+    /// 形态：`{"server": {"address": "1.2.3.4" | "example.com", "port": 443}}`。
+    /// 无 `server` 键返回 `None`。
+    pub fn from_json(v: &serde_json::Value) -> Option<Self> {
+        let server = v.get("server")?;
+        let address = server.get("address").and_then(|a| a.as_str()).map(|s| {
+            xray_proto::xray::common::net::IpOrDomain {
+                address: Some(address_str_to_ip_or_domain(s)),
+            }
+        });
+        let port = server.get("port").and_then(|p| p.as_u64()).unwrap_or(0) as u32;
+        Some(Self {
+            server: Some(xray_proto::xray::common::protocol::ServerEndpoint {
+                address,
+                port,
+                user: None,
+            }),
+        })
+    }
+}
+
 /// TCP 分片配置。对应 proto `Fragment`。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Fragment {
@@ -236,6 +262,189 @@ pub struct FinalRuleConfig {
     /// IP CIDR 规则（prost repeated message）。
     pub ip: Vec<xray_proto::xray::common::geodata::IpRule>,
     pub block_delay: Option<Range>,
+}
+
+impl FinalRuleConfig {
+    /// 从 freedom settings JSON 解析（Go `infra/conf/freedom.go:46-52`
+    /// `FreedomFinalRuleConfig` + `Build` :252-288）。
+    ///
+    /// 形态：`{"action": "block", "network": "tcp,udp", "port": "443,80-90",
+    /// "ip": ["10.0.0.0/8"], "blockDelay": "30-90" | {"from":30,"to":90}}`。
+    pub fn from_json(v: &serde_json::Value) -> Result<Self> {
+        let action = match v
+            .get("action")
+            .and_then(|a| a.as_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "allow" => RuleAction::Allow,
+            "block" => RuleAction::Block,
+            other => {
+                return Err(crate::error::FreedomError::InvalidConfig(format!(
+                    "unknown finalRule action: {other}"
+                )))
+            }
+        };
+        let networks = v.get("network").map(json_network_list).unwrap_or_default();
+        let port_list = v.get("port").and_then(json_port_list);
+        let ip = v
+            .get("ip")
+            .map(json_ip_rules)
+            .unwrap_or_default();
+        let block_delay = v.get("blockDelay").and_then(json_int32_range);
+        Ok(Self {
+            action,
+            networks,
+            port_list,
+            ip,
+            block_delay,
+        })
+    }
+}
+
+/// 地址字符串 → proto `IpOrDomain` oneof（先试 IPv4，再 IPv6，否则域名）。
+fn address_str_to_ip_or_domain(
+    s: &str,
+) -> xray_proto::xray::common::net::ip_or_domain::Address {
+    use xray_proto::xray::common::net::ip_or_domain::Address as IoD;
+    if let Ok(v4) = s.parse::<Ipv4Addr>() {
+        IoD::Ip(v4.octets().to_vec())
+    } else if let Ok(v6) = s.parse::<Ipv6Addr>() {
+        IoD::Ip(v6.octets().to_vec())
+    } else {
+        IoD::Domain(s.to_string())
+    }
+}
+
+/// Go `NetworkList`：`"tcp,udp"` 字符串或字符串数组 → proto `Network` i32 列表。
+fn json_network_list(v: &serde_json::Value) -> Vec<i32> {
+    let tokens: Vec<String> = match v {
+        serde_json::Value::String(s) => {
+            s.split(',').map(|t| t.trim().to_string()).collect()
+        }
+        serde_json::Value::Array(a) => a
+            .iter()
+            .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+            .collect(),
+        _ => Vec::new(),
+    };
+    tokens
+        .into_iter()
+        .filter_map(|t| match t.to_ascii_lowercase().as_str() {
+            "tcp" => Some(xray_proto::xray::common::net::Network::Tcp as i32),
+            "udp" => Some(xray_proto::xray::common::net::Network::Udp as i32),
+            "unix" => Some(xray_proto::xray::common::net::Network::Unix as i32),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Go `PortList`：`"443,80-90"` 字符串 / 数字数组 / 混合数组 → proto `PortList`。
+fn json_port_list(v: &serde_json::Value) -> Option<xray_proto::xray::common::net::PortList> {
+    let items: Vec<String> = match v {
+        serde_json::Value::String(s) => {
+            s.split(',').map(|t| t.trim().to_string()).collect()
+        }
+        serde_json::Value::Array(a) => a
+            .iter()
+            .map(|x| match x {
+                serde_json::Value::String(s) => s.trim().to_string(),
+                serde_json::Value::Number(n) => n.to_string(),
+                _ => String::new(),
+            })
+            .collect(),
+        serde_json::Value::Number(n) => vec![n.to_string()],
+        _ => return None,
+    };
+    let mut range = Vec::new();
+    for item in items {
+        let Some((from, to)) = parse_port_range_str(&item) else {
+            continue;
+        };
+        range.push(xray_proto::xray::common::net::PortRange { from, to });
+    }
+    if range.is_empty() {
+        return None;
+    }
+    Some(xray_proto::xray::common::net::PortList { range })
+}
+
+/// `"443"` / `"80-90"` → (from, to)。解析失败返回 `None`。
+fn parse_port_range_str(s: &str) -> Option<(u32, u32)> {
+    match s.split_once('-') {
+        Some((a, b)) => {
+            let from: u32 = a.trim().parse().ok()?;
+            let to: u32 = b.trim().parse().ok()?;
+            (from <= to).then_some((from, to))
+        }
+        None => s.trim().parse::<u32>().ok().map(|p| (p, p)),
+    }
+}
+
+/// Go `StringList` IP 规则：`["10.0.0.0/8", "fc00::/7", "1.2.3.4"]` → proto `IpRule`
+/// 列表（Custom CIDR；裸 IP 视为 /32 或 /128）。无法解析的项跳过。
+fn json_ip_rules(v: &serde_json::Value) -> Vec<xray_proto::xray::common::geodata::IpRule> {
+    let items: Vec<&str> = match v {
+        serde_json::Value::String(s) => s.split(',').map(|t| t.trim()).collect(),
+        serde_json::Value::Array(a) => {
+            a.iter().filter_map(|x| x.as_str().map(|s| s.trim())).collect()
+        }
+        _ => return Vec::new(),
+    };
+    items
+        .into_iter()
+        .filter_map(|s| {
+            let (ip_str, prefix) = match s.split_once('/') {
+                Some((ip, p)) => (ip, p.parse::<u32>().ok()?),
+                None => (s, 0),
+            };
+            let ip: IpAddr = ip_str.parse().ok()?;
+            let prefix = match (ip, prefix) {
+                (IpAddr::V4(_), 0) => 32,
+                (IpAddr::V6(_), 0) => 128,
+                (_, p) => p,
+            };
+            Some(xray_proto::xray::common::geodata::IpRule {
+                value: Some(ip_rule::Value::Custom(
+                    xray_proto::xray::common::geodata::CidrRule {
+                        cidr: Some(xray_proto::xray::common::geodata::Cidr {
+                            ip: match ip {
+                                IpAddr::V4(v4) => v4.octets().to_vec(),
+                                IpAddr::V6(v6) => v6.octets().to_vec(),
+                            },
+                            prefix,
+                        }),
+                        reverse_match: false,
+                    },
+                )),
+            })
+        })
+        .collect()
+}
+
+/// Go `Int32Range`：`"30-90"` 字符串或 `{"from":30,"to":90}` 对象 → `Range`。
+fn json_int32_range(v: &serde_json::Value) -> Option<Range> {
+    match v {
+        serde_json::Value::String(s) => {
+            let (a, b) = s.split_once('-')?;
+            let from = a.trim().parse::<i64>().ok()?;
+            let to = b.trim().parse::<i64>().ok()?;
+            Some(Range {
+                min: from.max(0) as u64,
+                max: to.max(0) as u64,
+            })
+        }
+        serde_json::Value::Object(o) => {
+            let from = o.get("from").and_then(|x| x.as_i64()).unwrap_or(0);
+            let to = o.get("to").and_then(|x| x.as_i64()).unwrap_or(0);
+            Some(Range {
+                min: from.max(0) as u64,
+                max: to.max(0) as u64,
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Freedom 主配置。对应 proto `xray.proxy.freedom.Config`。
@@ -588,6 +797,145 @@ pub enum DefaultRuleType {
     BlockPrivate,
     /// 阻止所有地址。
     BlockAll,
+}
+
+/// 原生 `Network` → proto 值索引。对应 Go `int(network)`（Tcp=2/Udp=3/Unix=4）。
+///
+/// `FinalRule::build` 用 proto 值填 `network` 数组，匹配侧必须用同一索引口径。
+#[must_use]
+pub fn network_index(network: Network) -> usize {
+    match network {
+        Network::TCP => 2,
+        Network::UDP => 3,
+        Network::Unix => 4,
+    }
+}
+
+/// 首个命中的规则（配置规则优先，其次默认规则）。对应 Go `matchFinalRule` :187-197。
+#[must_use]
+pub fn match_final_rules(
+    rules: &[FinalRule],
+    default_rule: Option<&FinalRule>,
+    dest: &Destination,
+) -> Option<FinalRule> {
+    let idx = network_index(dest.network());
+    let port = dest.port().value();
+    let ip = dest.address().ip();
+    for rule in rules {
+        if rule.apply(idx, port, ip) {
+            return Some(rule.clone());
+        }
+    }
+    if let Some(dr) = default_rule {
+        if dr.apply(idx, port, ip) {
+            return Some(dr.clone());
+        }
+    }
+    None
+}
+
+/// 命中 Block 规则与否（Go :335-339 的 `rule.action == Block` 判定）。
+#[must_use]
+pub fn is_blocked_by_rules(
+    rules: &[FinalRule],
+    default_rule: Option<&FinalRule>,
+    dest: &Destination,
+) -> bool {
+    match_final_rules(rules, default_rule, dest)
+        .is_some_and(|r| r.action == RuleAction::Block)
+}
+
+/// 目标改写：Go `Process` :269-279 + `isValidAddress` :240-247。
+///
+/// `server.address` 有效（非 AnyIP/AnyIPv6）时改写地址；`server.port != 0` 时改写端口。
+#[must_use]
+pub fn apply_destination_override(
+    dest: &Destination,
+    ov: Option<&DestinationOverride>,
+) -> Destination {
+    let Some(server) = ov.and_then(|o| o.server.as_ref()) else {
+        return dest.clone();
+    };
+    let mut address = dest.address().clone();
+    if let Some(new_addr) = server.address.as_ref().and_then(ip_or_domain_to_address) {
+        if is_valid_override_address(&new_addr) {
+            address = new_addr;
+        }
+    }
+    let port = if server.port != 0 {
+        Port::new(server.port as u16)
+    } else {
+        dest.port()
+    };
+    Destination::new(address, port, dest.network())
+}
+
+/// Go `isValidAddress` :240-247——排除 AnyIP（0.0.0.0）与 AnyIPv6（::）。
+fn is_valid_override_address(addr: &Address) -> bool {
+    match addr {
+        Address::IPv4(v4) => !v4.is_unspecified(),
+        Address::IPv6(v6) => !v6.is_unspecified(),
+        Address::Domain(_) => true,
+    }
+}
+
+/// proto `IpOrDomain` → 原生 `Address`。IP 字节数非 4/16 返回 `None`。
+fn ip_or_domain_to_address(iod: &xray_proto::xray::common::net::IpOrDomain) -> Option<Address> {
+    use xray_proto::xray::common::net::ip_or_domain::Address as IoD;
+    match iod.address.as_ref()? {
+        IoD::Ip(bytes) => match bytes.as_slice() {
+            [a, b, c, d] => Some(Address::IPv4(Ipv4Addr::new(*a, *b, *c, *d))),
+            b16 => Some(Address::IPv6(Ipv6Addr::from_octets(
+                b16.try_into().ok()?,
+            ))),
+        },
+        IoD::Domain(d) => Some(Address::Domain(d.clone())),
+    }
+}
+
+/// 黑洞：drain 上游输入直到 `block_delay(rule)` 超时，随后关闭下游。
+///
+/// 对应 Go `Process` blockedDest 分支 :352-366——不拨号，慢速丢弃防探测。
+pub(crate) async fn blackhole_link(
+    link: xray_transport::link::Link,
+    tag: &str,
+    rule: &FinalRule,
+) {
+    let delay = block_delay(rule);
+    tracing::info!(
+        tag = %tag,
+        ?delay,
+        "freedom: target blocked by final rule, blackholing connection"
+    );
+    let xray_transport::link::Link { mut reader, writer } = link;
+    // EOF 语义与 udp pump 一致：Err 或 Ok(空 buffer) 都视为对端关闭
+    let drain = async {
+        loop {
+            match reader.read_multi_buffer().await {
+                Ok(mb) if !mb.is_empty() => continue,
+                _ => break,
+            }
+        }
+    };
+    tokio::select! {
+        _ = drain => {}
+        _ = tokio::time::sleep(delay) => {}
+    }
+    writer.shutdown();
+}
+
+/// 计算阻断延时。对应 Go `Handler.blockDelay` :226-238。
+///
+/// 默认 [30, 90] 秒；`rule.block_delay` 可覆盖。`dice.Roll(span+1)` → [0, span]。
+#[must_use]
+pub fn block_delay(rule: &FinalRule) -> std::time::Duration {
+    let (min, max) = match rule.block_delay {
+        Some(r) => (r.min, r.max),
+        None => (30, 90),
+    };
+    let span = if max >= min { max - min } else { min - max };
+    let roll = rand::random_range(0..=span);
+    std::time::Duration::from_secs(min + roll)
 }
 
 #[cfg(test)]
@@ -959,5 +1307,116 @@ mod tests {
         let proto = cfg.to_proto();
         let cfg2 = Config::from_proto(proto).unwrap();
         assert_eq!(cfg, cfg2);
+    }
+
+    // ===== destinationOverride 消费（Go :269-279 + isValidAddress）=====
+
+    /// Go 标准键 `destinationOverride.server.{address,port}` 生效：改写地址与端口。
+    #[test]
+    fn destination_override_go_keys_rewrite_target() {
+        let ov = DestinationOverride::from_json(&serde_json::json!(
+            {"server": {"address": "9.9.9.9", "port": 1080}}
+        ))
+        .expect("go keys");
+        let dest = Destination::tcp(Address::Domain("example.com".into()), Port::new(5900));
+        let rewritten = apply_destination_override(&dest, Some(&ov));
+        assert_eq!(rewritten.address(), &Address::IPv4("9.9.9.9".parse().unwrap()));
+        assert_eq!(rewritten.port().value(), 1080);
+        // 网络类型保持
+        assert!(rewritten.is_tcp());
+    }
+
+    /// AnyIP（0.0.0.0 / ::）无效：地址不改写；port 0 不改写端口。
+    #[test]
+    fn destination_override_skips_anyip_and_zero_port() {
+        let ov = DestinationOverride::from_json(&serde_json::json!(
+            {"server": {"address": "0.0.0.0", "port": 0}}
+        ))
+        .expect("json");
+        let dest = Destination::udp(Address::IPv4("8.8.8.8".parse().unwrap()), Port::new(53));
+        let rewritten = apply_destination_override(&dest, Some(&ov));
+        assert_eq!(rewritten, dest, "AnyIP + port 0 must not rewrite");
+        // IPv6 Any
+        let ov6 = DestinationOverride::from_json(&serde_json::json!(
+            {"server": {"address": "::", "port": 1234}}
+        ))
+        .expect("json");
+        let rewritten6 = apply_destination_override(&dest, Some(&ov6));
+        assert_eq!(rewritten6.address(), dest.address(), ":: must not rewrite address");
+        assert_eq!(rewritten6.port().value(), 1234, "valid port still applies");
+    }
+
+    /// 旧 Rust 方言（无 destinationOverride 键）→ None，不改写。
+    #[test]
+    fn destination_override_absent_is_identity() {
+        let dest = Destination::tcp(Address::Domain("example.com".into()), Port::new(443));
+        assert_eq!(apply_destination_override(&dest, None), dest);
+    }
+
+    // ===== FinalRuleConfig JSON（Go FreedomFinalRuleConfig + Build）=====
+
+    #[test]
+    fn final_rule_from_json_full_fields() {
+        let cfg = FinalRuleConfig::from_json(&serde_json::json!({
+            "action": "block",
+            "network": "tcp,udp",
+            "port": "53,80-90",
+            "ip": ["10.0.0.0/8", "192.168.1.1"],
+            "blockDelay": "30-90"
+        }))
+        .unwrap();
+        assert_eq!(cfg.action, RuleAction::Block);
+        assert_eq!(cfg.networks.len(), 2);
+        let rule = FinalRule::build(&cfg).unwrap();
+        // 10.x UDP 53 → 命中
+        assert!(rule.apply(
+            network_index(Network::UDP),
+            53,
+            Some("10.1.2.3".parse().unwrap())
+        ));
+        // 8.8.8.8 → 不在 IP 段 → 不命中
+        assert!(!rule.apply(
+            network_index(Network::UDP),
+            53,
+            Some("8.8.8.8".parse().unwrap())
+        ));
+        // 裸 IP → /32；端口不在列表 → 不命中
+        assert!(!rule.apply(
+            network_index(Network::TCP),
+            443,
+            Some("192.168.1.1".parse().unwrap())
+        ));
+        // blockDelay 解析
+        assert_eq!(cfg.block_delay.map(|r| (r.min, r.max)), Some((30, 90)));
+    }
+
+    #[test]
+    fn final_rule_from_json_object_block_delay_and_allow_action() {
+        let cfg = FinalRuleConfig::from_json(&serde_json::json!({
+            "action": "allow",
+            "blockDelay": {"from": 5, "to": 9}
+        }))
+        .unwrap();
+        assert_eq!(cfg.action, RuleAction::Allow);
+        // 无 network 限制 = 全网络
+        let rule = FinalRule::build(&cfg).unwrap();
+        assert!(rule.match_network(network_index(Network::TCP)));
+        assert!(rule.match_network(network_index(Network::UDP)));
+        assert_eq!(cfg.block_delay.map(|r| (r.min, r.max)), Some((5, 9)));
+    }
+
+    #[test]
+    fn final_rule_unknown_action_is_error() {
+        assert!(FinalRuleConfig::from_json(&serde_json::json!({"action": "drop"})).is_err());
+        assert!(FinalRuleConfig::from_json(&serde_json::json!({})).is_err());
+    }
+
+    // ===== 索引口径（proto 值 Tcp=2/Udp=3）=====
+
+    #[test]
+    fn network_index_uses_proto_values() {
+        assert_eq!(network_index(Network::TCP), 2);
+        assert_eq!(network_index(Network::UDP), 3);
+        assert_eq!(network_index(Network::Unix), 4);
     }
 }

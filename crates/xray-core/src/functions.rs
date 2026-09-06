@@ -146,23 +146,7 @@ pub fn start_from_built(built: &xray_conf::BuiltConfig) -> Result<Arc<Instance>,
 pub async fn start_full(
     built: &xray_conf::BuiltConfig,
 ) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
-    if let Some(a) = built.apps.iter().find(|a| a.kind == "routing") {
-        match crate::wiring::build_router_adapter_from_json(&a.data) {
-            Ok(adapter) => {
-                let routing = Arc::clone(&adapter)
-                    as Arc<dyn xray_app_dispatcher::default::RoutingRouter>;
-                let dns_side = adapter as Arc<dyn DispatchRouter>;
-                return start_full_dispatched(built, Some(routing), Some(dns_side)).await;
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "full Router init failed, falling back to PatternRouter");
-                if let Ok(r) = crate::router::PatternRouter::from_json(&a.data) {
-                    return start_full_with_router(built, Arc::new(r)).await;
-                }
-            }
-        }
-    }
-    start_full_dispatched(built, None, None).await
+    start_full_dispatched(built, None).await
 }
 
 /// 带路由的完整启动路径：Instance + SimpleOhm + outbounds + router + inbounds。
@@ -174,9 +158,7 @@ pub async fn start_full_with_router(
     built: &xray_conf::BuiltConfig,
     router: Arc<dyn DispatchRouter>,
 ) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
-    let bridge = Arc::new(crate::wiring::DispatchRouterBridge::new(Arc::clone(&router)))
-        as Arc<dyn xray_app_dispatcher::default::RoutingRouter>;
-    start_full_dispatched(built, Some(bridge), Some(router)).await
+    start_full_dispatched(built, Some(router)).await
 }
 
 /// 共用装配路径（方案 B）：Instance + SimpleOhm + outbounds + DefaultDispatcher + inbounds。
@@ -191,12 +173,67 @@ pub async fn start_full_with_router(
 /// `dns_router` 仅用于 DNS client 注入（domainStrategy 解析）。
 async fn start_full_dispatched(
     built: &xray_conf::BuiltConfig,
-    routing_router: Option<Arc<dyn xray_app_dispatcher::default::RoutingRouter>>,
-    dns_router: Option<Arc<dyn DispatchRouter>>,
+    // 外部注入路由器（`start_full_with_router` 路径）；None 时按 routing app 自动装配。
+    routing_override: Option<Arc<dyn DispatchRouter>>,
 ) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
     register_all_features();
     register_all_transports();
     let mut instance = Instance::new_from_built(built)?;
+
+    let ohm = Arc::new(SimpleOhm::new());
+
+    // Routing 自动接入：routing app 存在时优先完整 RouterAdapter（rich RoutingContext
+    // + DNS resolved 选路 + balancer selector 接真实 ohm + observatory 观测器）；
+    // 失败回退 PatternRouter；否则走纯 default outbound 路径。
+    let (routing_router, dns_router) = if let Some(r) = routing_override {
+        let bridge = Arc::new(crate::wiring::DispatchRouterBridge::new(Arc::clone(&r)))
+            as Arc<dyn xray_app_dispatcher::default::RoutingRouter>;
+        (Some(bridge), Some(r))
+    } else {
+        match built.apps.iter().find(|a| a.kind == "routing") {
+            Some(a) => {
+                // 观测器：observatory app 存在时桥接（leastping/leastload 观测数据源，
+                // Go RequireFeatures(observatory) 等价）。
+                let observer: Option<
+                    Arc<dyn xray_app_router::balancing::ObservationProvider>,
+                > = instance
+                    .get_feature::<xray_app_observatory::ObservatoryFeature>()
+                    .map(|f| {
+                        Arc::new(crate::wiring::ObservatoryProviderBridge(f)) as Arc<_>
+                    });
+                match crate::wiring::build_router_adapter_from_json_with_ohm(
+                    &a.data,
+                    &ohm,
+                    observer,
+                ) {
+                    Ok(adapter) => {
+                        let routing = Arc::clone(&adapter)
+                            as Arc<dyn xray_app_dispatcher::default::RoutingRouter>;
+                        let dns_side = Arc::clone(&adapter) as Arc<dyn DispatchRouter>;
+                        (Some(routing), Some(dns_side))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "full Router init failed, falling back to PatternRouter"
+                        );
+                        match crate::router::PatternRouter::from_json(&a.data) {
+                            Ok(r) => {
+                                let r: Arc<dyn DispatchRouter> = Arc::new(r);
+                                let bridge = Arc::new(
+                                    crate::wiring::DispatchRouterBridge::new(Arc::clone(&r)),
+                                ) as Arc<dyn xray_app_dispatcher::default::RoutingRouter>;
+                                let dns_side = Arc::clone(&r) as Arc<dyn DispatchRouter>;
+                                (Some(bridge), Some(dns_side))
+                            }
+                            Err(_) => (None, None),
+                        }
+                    }
+                }
+            }
+            None => (None, None),
+        }
+    };
 
     // DNS 注入（对应 Go 装配链：instance 创建后 router.dns = core.GetFeature(dns)）：
     // routing domainStrategy（IpOnDemand/IpIfNonMatch）解析经 DnsClient 查询。
@@ -210,7 +247,6 @@ async fn start_full_dispatched(
         }
     }
 
-    let ohm = Arc::new(SimpleOhm::new());
     // DNS service 同步注入出站（bd bqm）：targetStrategy 域名解析经此生效
     // （对应 Go 全局 internet.dnsClient 由 app/dns 初始化）。
     register_outbounds(
@@ -249,6 +285,11 @@ async fn start_full_dispatched(
         .map(|f| f as Arc<dyn xray_features::stats::Manager>);
     // per-tag UDP443 策略（bd g35）：mux JSON → dispatch_link 前置检查
     dispatcher.udp443_policies = crate::outbound::parse_udp443_policies(&built.outbounds);
+    // FakeDNS 注入（对应 Go dispatcher.fdns，嗅探阶段反查 fake IP 域名）：
+    // fakeDns app 存在时 engine() → dispatcher.set_fdns。
+    if let Some(f) = instance.get_feature::<crate::register::FakeDnsFeature>() {
+        dispatcher.set_fdns(Some(crate::register::fake_dns_engine_bridge(f.engine())));
+    }
 
     // Access log 装配（bd 4uu，对应 Go logger 是首个启动的 App + dispatcher log.Record）：
     // 无 log 配置块时按 Go DefaultLogConfig（access=None/error=Console/Warning）注入默认
@@ -341,6 +382,13 @@ mod tests {
     use xray_conf::{BuiltConfig, BuiltEntry, BuiltInbound, BuiltOutbound};
     use xray_app_dispatcher::OutboundHandlerManager;
 
+    /// 集成链路测试的 freedom settings：显式 allow 全放行。
+    ///
+    /// freedom 默认规则按入站协议名推导（Go getDefaultFinalRule）：
+    /// vless/vmess/trojan/shadowsocks* 入站 → BlockPrivate（geoip:private 含
+    /// 127.0.0.0/8）——回环 echo 会被黑洞。Go 语义下配置 finalRules 先于默认
+    /// 规则匹配（matchFinalRule），显式 allow 即逃生门。
+    const FREEDOM_ALLOW_ALL_SETTINGS: &[u8] = br#"{"finalRules":[{"action":"allow"}]}"#;
     /// 测试用 Feature：记录 start 次数。
     struct SharedCounterFeature {
         counter: StdArc<AtomicUsize>,
@@ -536,7 +584,7 @@ mod tests {
         built.outbounds.push(BuiltOutbound {
             entry: BuiltEntry {
                 kind: "freedom".into(),
-                data: b"{}".to_vec(),
+                data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec(),
             },
             tag: "direct".into(),
             send_through: None,
@@ -650,7 +698,7 @@ mod tests {
         built.outbounds.push(BuiltOutbound {
             entry: BuiltEntry {
                 kind: "freedom".into(),
-                data: b"{}".to_vec(),
+                data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec(),
             },
             tag: "direct".into(),
             send_through: None,
@@ -735,7 +783,7 @@ mod tests {
             sniffing_json: None,
         });
         built.outbounds.push(BuiltOutbound {
-            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(),
             send_through: None,
             stream_settings_json: None,
@@ -792,7 +840,7 @@ mod tests {
             stream_settings_json: None, sniffing_json: None,
         });
         server_cfg.outbounds.push(BuiltOutbound {
-            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(), send_through: None, stream_settings_json: None,
             proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
@@ -867,7 +915,7 @@ mod tests {
             stream_settings_json: None, sniffing_json: None,
         });
         server_cfg.outbounds.push(BuiltOutbound {
-            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(), send_through: None, stream_settings_json: None,
             proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
@@ -940,7 +988,7 @@ mod tests {
             stream_settings_json: None, sniffing_json: None,
         });
         server_cfg.outbounds.push(BuiltOutbound {
-            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(), send_through: None, stream_settings_json: None,
             proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
@@ -1016,7 +1064,7 @@ mod tests {
             stream_settings_json: Some(ws_settings.into()), sniffing_json: None,
         });
         server_cfg.outbounds.push(BuiltOutbound {
-            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(), send_through: None, stream_settings_json: None,
             proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
@@ -1111,7 +1159,7 @@ mod tests {
         });
         // outbound A: freedom (默认)
         cfg.outbounds.push(BuiltOutbound {
-            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "default".into(), send_through: None, stream_settings_json: None,
             proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
@@ -1190,7 +1238,7 @@ mod tests {
             stream_settings_json: Some(serde_json::from_str(&server_tls).unwrap()), sniffing_json: None,
         });
         server_cfg.outbounds.push(BuiltOutbound {
-            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(), send_through: None, stream_settings_json: None,
             proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
@@ -1275,7 +1323,7 @@ mod tests {
             stream_settings_json: Some(serde_json::from_str(&server_tls).unwrap()), sniffing_json: None,
         });
         server_cfg.outbounds.push(BuiltOutbound {
-            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(), send_through: None, stream_settings_json: None,
             proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
@@ -1697,7 +1745,7 @@ mod tests {
             stream_settings_json: Some(serde_json::from_str(&server_tls).unwrap()), sniffing_json: None,
         });
         server_cfg.outbounds.push(BuiltOutbound {
-            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(), send_through: None, stream_settings_json: None,
             proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
@@ -1775,7 +1823,7 @@ mod tests {
             stream_settings_json: Some(serde_json::from_str(&server_tls).unwrap()), sniffing_json: None,
         });
         server_cfg.outbounds.push(BuiltOutbound {
-            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(), send_through: None, stream_settings_json: None,
             proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
@@ -1852,7 +1900,7 @@ mod tests {
             stream_settings_json: Some(serde_json::from_str(&server_tls).unwrap()), sniffing_json: None,
         });
         server_cfg.outbounds.push(BuiltOutbound {
-            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(), send_through: None, stream_settings_json: None,
             proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
@@ -1911,7 +1959,7 @@ mod tests {
             stream_settings_json: None, sniffing_json: None,
         });
         server_cfg.outbounds.push(BuiltOutbound {
-            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(), send_through: None, stream_settings_json: None,
             proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
@@ -1986,7 +2034,7 @@ mod tests {
             stream_settings_json: None, sniffing_json: None,
         });
         server_cfg.outbounds.push(BuiltOutbound {
-            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(), send_through: None, stream_settings_json: None,
             proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
@@ -2080,7 +2128,7 @@ mod tests {
             stream_settings_json: Some(serde_json::from_str(&server_tls).unwrap()), sniffing_json: None,
         });
         server_cfg.outbounds.push(BuiltOutbound {
-            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(), send_through: None, stream_settings_json: None,
             proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
@@ -2263,7 +2311,7 @@ mod tests {
             })),
         });
         cfg.outbounds.push(BuiltOutbound {
-            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(), // i=0 → default
             send_through: None, stream_settings_json: None,
             proxy_settings_json: None, mux_json: None, target_strategy: None,
@@ -2367,7 +2415,7 @@ mod tests {
             sniffing_json: None,
         });
         cfg.outbounds.push(BuiltOutbound {
-            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(),
             send_through: None, stream_settings_json: None,
             proxy_settings_json: None, mux_json: None, target_strategy: None,
@@ -2515,7 +2563,7 @@ mod tests {
             sniffing_json: None,
         });
         cfg.outbounds.push(BuiltOutbound {
-            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(),
             send_through: None, stream_settings_json: None,
             proxy_settings_json: None, mux_json: None, target_strategy: None,
@@ -2648,7 +2696,7 @@ mod tests {
             proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
         cfg.outbounds.push(BuiltOutbound {
-            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "out".into(),
             send_through: None, stream_settings_json: None,
             proxy_settings_json: None, mux_json: None, target_strategy: None,
@@ -2765,7 +2813,7 @@ mod tests {
             sniffing_json: None,
         });
         server_cfg.outbounds.push(BuiltOutbound {
-            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(),
             send_through: None, stream_settings_json: None,
             proxy_settings_json: None, mux_json: None, target_strategy: None,
@@ -2870,7 +2918,7 @@ mod tests {
             sniffing_json: None,
         });
         server_cfg.outbounds.push(BuiltOutbound {
-            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(),
             send_through: None, stream_settings_json: None,
             proxy_settings_json: None, mux_json: None, target_strategy: None,

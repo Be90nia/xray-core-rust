@@ -204,6 +204,12 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
             .and_then(|v| v.get("serverName"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
+        fingerprint: settings
+            .security_json
+            .as_ref()
+            .and_then(|v| v.get("fingerprint"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
     })
     .await
     .map_err(|e| io::Error::other(e))?;

@@ -4,7 +4,7 @@
 //! 核心逻辑（globalConv 原子递增 + fetchInput 分发）可测。
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use crate::connection::{ConnMetadata, Connection, ConnectionCloser};
 use crate::error::{KcpError, Result};
@@ -12,11 +12,15 @@ use crate::io::PacketReader;
 use crate::output::SegmentWriter;
 
 /// 全局 conversation ID（对应 Go `globalConv`）。
-static GLOBAL_CONV: AtomicU32 = AtomicU32::new(0);
+///
+/// 首次访问时以 `dice.RollUint16()` 随机播种（Go `dialer.go` 包级变量
+/// `var globalConv uint32 = dice.RollUint16()` 的初始化语义），生产路径无需显式 init。
+static GLOBAL_CONV: LazyLock<AtomicU32> =
+    LazyLock::new(|| AtomicU32::new(u32::from(xray_common::dice::roll_uint16())));
 
-/// 初始化 globalConv（启动时调用一次，对应 Go `dice.RollUint16()`）。
+/// 显式覆写 globalConv（测试定标用；生产 seeding 由 LazyLock 首访随机完成）。
 pub fn init_global_conv(seed: u16) {
-    GLOBAL_CONV.store(seed as u32, Ordering::SeqCst);
+    GLOBAL_CONV.store(u32::from(seed), Ordering::SeqCst);
 }
 
 /// 原子递增并返回下一个 conv（对应 Go `atomic.AddUint32(&globalConv, 1)` as uint16）。

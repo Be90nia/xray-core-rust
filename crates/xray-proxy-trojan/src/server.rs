@@ -223,7 +223,27 @@ impl InboundHandler for TrojanServer {
 /// - [`TrojanError::ReadCrlf`]: CRLF 不匹配
 /// - [`TrojanError::ReadCommand`]: CMD 非法
 /// - [`TrojanError::ReadAddressPort`]: addr/port 解析失败
+/// - [`TrojanError::HandshakeTimeout`]: 整段握手读超时（60s）
 pub async fn trojan_server_handshake<S>(
+    stream: &mut S,
+    validator: &Validator,
+) -> crate::Result<(Network, Address, u16, MemoryUser)>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin + Send,
+{
+    // Go `server.go::Process`：conn.SetReadDeadline(SessionDefault().Timeouts.Handshake
+    // = 60s) 限制整段握手读取；超时按握手失败处理（防静默连接占位，
+    // 对齐 nginx client_header_timeout 语义，见 features/policy/policy.go:125-133）。
+    tokio::time::timeout(
+        xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT,
+        trojan_server_handshake_inner(stream, validator),
+    )
+    .await
+    .map_err(|_| crate::TrojanError::HandshakeTimeout)?
+}
+
+/// 握手协议本体（无超时；超时由 [`trojan_server_handshake`] 统一包裹）。
+async fn trojan_server_handshake_inner<S>(
     stream: &mut S,
     validator: &Validator,
 ) -> crate::Result<(Network, Address, u16, MemoryUser)>
@@ -632,6 +652,26 @@ mod tests {
         let mut cursor = std::io::Cursor::new(header);
         let result = trojan_server_handshake(&mut cursor, &validator).await;
         assert!(result.is_err());
+    }
+
+    /// 静默客户端（握手半途不发数据）→ 整段握手读 60s 超时终止
+    /// （Go SessionDefault().Timeouts.Handshake=60s；start_paused 自动推进挂钟）。
+    #[tokio::test(start_paused = true)]
+    async fn handshake_read_timeout_terminates() {
+        let validator = make_validator_with_user("password");
+        // client 端存活但不写任何字节 → read_exact 永等 → 60s deadline 触发
+        let (_silent_client, mut server) = tokio::io::duplex(64);
+
+        let started = std::time::Instant::now();
+        let result = trojan_server_handshake(&mut server, &validator).await;
+        assert!(
+            matches!(result, Err(crate::TrojanError::HandshakeTimeout)),
+            "silent client must hit handshake timeout, got {result:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "paused clock must auto-advance past the 60s deadline"
+        );
     }
 
     #[tokio::test]

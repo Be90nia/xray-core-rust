@@ -12,6 +12,7 @@ xray-proto = { path = "../xray-proto" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+xray-geodata = { path = "../xray-geodata" }
 hickory-resolver = { workspace = true }
 async-trait = { workspace = true }
 

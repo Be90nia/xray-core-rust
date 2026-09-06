@@ -11,6 +11,7 @@ xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
 xray-app-dispatcher = { path = "../xray-app-dispatcher" }
 xray-transport = { path = "../xray-transport" }
+xray-xudp = { path = "../xray-xudp" }
 parking_lot = { workspace = true }
 async-trait = "0.1"
 tokio = { workspace = true }

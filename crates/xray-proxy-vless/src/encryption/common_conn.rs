@@ -40,9 +40,12 @@ pub struct CommonConn<C> {
     raw_buf: Vec<u8>,
     /// 已解密待读的明文。
     decrypted: Vec<u8>,
+    /// 已解密待读的明文偏移。
     decrypted_pos: usize,
     /// 待发送的密文 + 已发送偏移 + 对应明文长度。
     write_pending: Option<(Vec<u8>, usize, usize)>,
+    /// 0-RTT 缓存 handle（仅 0-RTT 构造注入）：票据失效时清空三缓存。
+    cache: Option<std::sync::Arc<super::ZeroRttCache>>,
     /// 首写前缀（Go `CommonConn.PreWrite`）：server 0-RTT 握手后的首个下行
     /// record 前附加的 16B 明文随机数，client 以其派生下行 AEAD（Go common.go:69-72，
     /// 首写时取出拼接后清空）。
@@ -73,6 +76,7 @@ where
             peer_aead: Some(peer_aead),
             use_aes,
             united_key,
+            cache: None,
             pre_write: None,
             raw_buf: Vec::new(),
             decrypted: Vec::new(),
@@ -84,13 +88,20 @@ where
 
     /// 0-RTT 构造（Go client.go:122-126）：上行 AEAD 已就绪（context=加密后
     /// ticket 32B），下行 `peer_aead` 延迟到首次读时用 server 随机数建立。
-    pub fn new_zero_rtt(conn: C, aead: Aead, united_key: Vec<u8>, use_aes: bool) -> Self {
+    pub fn new_zero_rtt(
+        conn: C,
+        aead: Aead,
+        united_key: Vec<u8>,
+        use_aes: bool,
+        cache: Option<std::sync::Arc<super::ZeroRttCache>>,
+    ) -> Self {
         Self {
             conn,
             aead,
             peer_aead: None,
             use_aes,
             united_key,
+            cache,
             pre_write: None,
             raw_buf: Vec::new(),
             decrypted: Vec::new(),
@@ -117,6 +128,7 @@ where
             peer_aead: Some(peer_aead),
             use_aes,
             united_key,
+            cache: None,
             pre_write: Some(pre_write),
             raw_buf: Vec::new(),
             decrypted: Vec::new(),
@@ -184,7 +196,27 @@ where
                     this.raw_buf[..TLS_RECORD_HEADER_LEN].try_into().unwrap();
                 let len = match decode_tls_record_header(&header) {
                     Ok(l) => l,
-                    Err(e) => return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string()))),
+                    Err(e) => {
+                        // 0-RTT 票据失效（Go server.go:210-222 session miss → 回噪声）：
+                        // 噪声的 [16..21] 不是合法 record header。比对 united_key 前缀
+                        // 64B 与缓存 pfs_key 确认本连接确用缓存票据建立，清空三缓存让
+                        // 下条连接回到 1-RTT 慢路径，并返回专用错误供 dispatcher 自动重试。
+                        if this.united_key.len() >= 64 {
+                            if let Some(cache) = &this.cache {
+                                if cache.matches_pfs_key(&this.united_key[..64]) {
+                                    cache.clear();
+                                    return Poll::Ready(Err(io::Error::new(
+                                        io::ErrorKind::ConnectionReset,
+                                        super::TICKET_REJECTED_MSG,
+                                    )));
+                                }
+                            }
+                        }
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            e.to_string(),
+                        )));
+                    }
                 };
                 let total = TLS_RECORD_HEADER_LEN + len as usize;
                 if this.raw_buf.len() >= total {

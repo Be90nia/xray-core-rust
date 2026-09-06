@@ -175,15 +175,32 @@ impl TransportListener for TcpHubListener {
 
 // ===== TransportListenFn 实现 =====
 
+/// 提取 `tcpSettings.acceptProxyProtocol`（Go transport_method.go:234 TCPConfig JSON
+/// 键；Go tcp/hub.go:37-40 监听时把 `l.config.AcceptProxyProtocol` OR 进
+/// `SocketSettings.AcceptProxyProtocol`）。缺省/非 bool → false。
+fn accept_proxy_protocol_from_tcp_settings(settings: &crate::dialer::StreamSettings) -> bool {
+    settings
+        .transport_json
+        .as_ref()
+        .and_then(|v| v.get("acceptProxyProtocol"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 /// TCP 协议的 `TransportListenFn` 实现。
 ///
 /// 注册到全局 listener 注册表，让 `listen_tcp("tcp", ...)` 可找到。
 pub async fn listen_tcp_impl(
     addr: SocketAddr,
     settings: crate::dialer::StreamSettings,
-    sockopt: SocketOptions,
+    mut sockopt: SocketOptions,
     handler: ConnHandler,
 ) -> io::Result<Box<dyn TransportListener>> {
+    // tcpSettings.acceptProxyProtocol OR 进 sockopt（Go hub.go:40：
+    // `streamSettings.SocketSettings.AcceptProxyProtocol = l.config.AcceptProxyProtocol
+    //  || streamSettings.SocketSettings.AcceptProxyProtocol`——后者已由
+    //  StreamSettings::socket_options 从 sockopt JSON 解析）。
+    sockopt.accept_proxy_protocol |= accept_proxy_protocol_from_tcp_settings(&settings);
     // header 伪装构建（Go hub.go:85-95：HeaderSettings → ConnectionAuthenticator，
     // 失败报错；none/缺失 → None 不包装）。
     let auth = crate::headers::conn::auth_from_json(settings.transport_json.as_ref())?;
@@ -350,6 +367,35 @@ mod tests {
         let addr = listener.local_addr().expect("local_addr 失败");
         assert_ne!(addr.port(), 0);
         listener.close().expect("close 失败");
+    }
+
+    /// tcpSettings.acceptProxyProtocol → sockopt 装配（Go tcp/hub.go:37-40）：
+    /// tcpSettings 携带该键时经 listen_tcp_impl OR 进 sockopt，listener 开关打开。
+    #[tokio::test]
+    async fn tcp_settings_accept_proxy_protocol_reaches_listener_switch() {
+        let mut settings = crate::dialer::StreamSettings::tcp();
+        settings.transport_json = Some(serde_json::json!({ "acceptProxyProtocol": true }));
+        // 解析半边：transport JSON → bool。
+        assert!(accept_proxy_protocol_from_tcp_settings(&settings));
+        // 装配半边：listen_tcp_impl 用该 settings 绑定成功（开关在内部生效）。
+        let handler: ConnHandler = Arc::new(|_| {});
+        let listener = listen_tcp_impl(
+            "127.0.0.1:0".parse().unwrap(),
+            settings,
+            SocketOptions::default(),
+            handler,
+        )
+        .await
+        .expect("listen_tcp_impl 失败");
+        assert_ne!(listener.local_addr().expect("local_addr 失败").port(), 0);
+
+        // 缺省/非 bool → false（Go TCPConfig 缺省 false）。
+        assert!(!accept_proxy_protocol_from_tcp_settings(
+            &crate::dialer::StreamSettings::tcp()
+        ));
+        let mut settings = crate::dialer::StreamSettings::tcp();
+        settings.transport_json = Some(serde_json::json!({ "acceptProxyProtocol": "yes" }));
+        assert!(!accept_proxy_protocol_from_tcp_settings(&settings));
     }
 }
 

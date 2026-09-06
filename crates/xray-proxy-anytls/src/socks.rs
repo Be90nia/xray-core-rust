@@ -49,15 +49,21 @@ impl SocksAddr {
     }
 
     /// 编码为 SOCKS5 字节流（ATYP+ADDR+PORT，大端端口）。
-    #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
+    ///
+    /// 域名超 255 字节返回显式错误（RFC 1928 长度为单字节），不再 panic。
+    pub fn encode(&self) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
         match self {
             Self::Domain(host, port) => {
-                buf.push(atyp::DOMAIN);
                 let host_bytes = host.as_bytes();
-                // 域名长度用单字节（RFC 1928 限制 255 字节）
-                buf.push(u8::try_from(host_bytes.len()).expect("domain too long"));
+                let len = u8::try_from(host_bytes.len()).map_err(|_| {
+                    AnytlsError::InvalidSocksAddr(format!(
+                        "domain too long: {} bytes (max 255)",
+                        host_bytes.len()
+                    ))
+                })?;
+                buf.push(atyp::DOMAIN);
+                buf.push(len);
                 buf.extend_from_slice(host_bytes);
                 buf.extend_from_slice(&port.to_be_bytes());
             }
@@ -72,7 +78,7 @@ impl SocksAddr {
                 buf.extend_from_slice(&addr.port().to_be_bytes());
             }
         }
-        buf
+        Ok(buf)
     }
 
     /// 从 SOCKS5 字节流解码（与 `encode` 互逆）。
@@ -177,7 +183,7 @@ mod tests {
     #[test]
     fn roundtrip_domain() {
         let addr = SocksAddr::domain("example.com", 443);
-        let bytes = addr.encode();
+        let bytes = addr.encode().unwrap();
         assert_eq!(bytes[0], atyp::DOMAIN);
         let (decoded, n) = SocksAddr::decode(&bytes).unwrap();
         assert_eq!(n, bytes.len());
@@ -193,7 +199,7 @@ mod tests {
     #[test]
     fn roundtrip_ipv4() {
         let addr = SocksAddr::ipv4(Ipv4Addr::new(127, 0, 0, 1), 8080);
-        let bytes = addr.encode();
+        let bytes = addr.encode().unwrap();
         assert_eq!(bytes[0], atyp::IPV4);
         let (decoded, n) = SocksAddr::decode(&bytes).unwrap();
         assert_eq!(n, 7);
@@ -208,7 +214,7 @@ mod tests {
             0,
             0,
         ));
-        let bytes = addr.encode();
+        let bytes = addr.encode().unwrap();
         assert_eq!(bytes[0], atyp::IPV6);
         let (decoded, n) = SocksAddr::decode(&bytes).unwrap();
         assert_eq!(n, 19);
@@ -246,5 +252,13 @@ mod tests {
         assert!(SocksAddr::decode(&[0x05]).is_err()); // 未知 ATYP
         assert!(SocksAddr::parse("no_port").is_err());
         assert!(SocksAddr::parse("host:99999").is_err()); // 端口超范围
+    }
+
+    /// 域名超 255 字节：显式错误而非 panic（RFC 1928 长度单字节上限）。
+    #[test]
+    fn encode_rejects_domain_over_255() {
+        let addr = SocksAddr::domain("x".repeat(256), 443);
+        let err = addr.encode().unwrap_err();
+        assert!(err.to_string().contains("domain too long"), "got {err}");
     }
 }

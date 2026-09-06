@@ -14,9 +14,7 @@
 //!   方法占位，调用方提供具体实现（实现时需要持有 `tokio::task::JoinSet`）。
 //! - Go `init()` 全局注册：Rust 无副作用全局。
 
-use std::future::Future;
 use std::net::IpAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -244,39 +242,38 @@ impl DnsService {
             return Err(DnsError::EmptyResponse);
         }
 
-        // 静态 hosts 查询。
-        let addrs = self.cfg.hosts.lookup(domain, effective)?;
-        if !addrs.is_empty() {
-            if addrs.len() == 1 {
-                if let xray_common::net::address::Address::Domain(d) = &addrs[0] {
-                    let new_domain = d.clone();
-                    return self.recursive_lookup_domain(&new_domain, effective).await;
+        // 静态 hosts 查询（Go dns.go:246-268）。`None` = 未记录；
+        // `Some(vec![])` = 记录存在但按 option 过滤后无有效 IP。
+        let mut ns_domain = domain.to_string();
+        match self.cfg.hosts.lookup(domain, effective)? {
+            None => {}
+            Some(addrs) => {
+                if let [xray_common::net::address::Address::Domain(d)] = addrs.as_slice() {
+                    // 域名替换：以尾域名走 nameservers，不再进 hosts
+                    // （Go dns.go:250-252；多级替换由 hosts 内部 max_depth 解开，
+                    // 旧实现递归整条 lookup_ip 会在 a.com↔b.com 环上无限展开）。
+                    tracing::info!(target: "xray.dns", from = %domain, to = %d, "domain replaced");
+                    ns_domain = d.clone();
+                } else if addrs.is_empty() {
+                    return Err(DnsError::EmptyResponse);
+                } else {
+                    let ips = to_net_ip(&addrs)?;
+                    return Ok((ips, 10));
                 }
             }
-            let ips = to_net_ip(&addrs)?;
-            return Ok((ips, 10));
         }
 
-        // Nameservers 查询。
-        let clients = self.sort_clients(domain);
+        // Nameservers 查询（hosts 域名替换后的尾域名也走这里）。
+        let clients = self.sort_clients(&ns_domain);
         if clients.is_empty() {
             return Err(DnsError::EmptyResponse);
         }
 
         if self.cfg.enable_parallel_query {
-            parallel_query(&clients, domain, effective).await
+            parallel_query(&clients, &ns_domain, effective).await
         } else {
-            serial_query(&clients, domain, effective).await
+            serial_query(&clients, &ns_domain, effective).await
         }
-    }
-
-    /// 内部递归：域名被 hosts 重定向到另一个域名时再次查询。
-    fn recursive_lookup_domain<'a>(
-        &'a self,
-        domain: &'a str,
-        option: IpOption,
-    ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>> {
-        Box::pin(self.lookup_ip(domain, option))
     }
 }
 
@@ -432,14 +429,19 @@ async fn parallel_query(
     // 尾部 merge_query_errors 走 errRNF 优先级（Go dns.go:339-361 mergeQueryErrors）。
     let mut raw_errs: Vec<Result<(Vec<IpAddr>, u32), DnsError>> =
         (0..clients.len()).map(|_| Err(DnsError::EmptyResponse)).collect();
-    let group_count = groups.len();
-
+    // 对齐 Go dns.go:412-437：每收到一个结果，从 next_group 起连续推进内层
+    // 检查循环——某组结果已全部收齐时立即判断（race/推进下一组），不等新结果；
+    // JoinSet 排空（join_next 返回 None）即所有结果到齐，退出循环聚合错误。
+    // 旧实现 None 时 continue 自旋，且组推进后先 join_next 才检查下一组，
+    // 「下一组结果先到」的场景会挂死。
     let mut next_group = 0usize;
-    while next_group < group_count {
-        let recv = set.join_next().await;
-        let (idx, outcome) = match recv {
-            Some(Ok(v)) => v,
-            _ => continue,
+    while let Some(joined) = set.join_next().await {
+        let (idx, outcome) = match joined {
+            Ok(v) => v,
+            // 任务 panic（JoinError）：该 client 结果永不到达，JoinSet 排空后由
+            // merge_query_errors 兜底（Go asyncQueryAll 保证每 client 至少一条结果，
+            // panic 属异常路径）。
+            Err(_) => continue,
         };
         match &outcome {
             Ok((ips, ttl)) if !ips.is_empty() => {
@@ -456,52 +458,53 @@ async fn parallel_query(
             }
         }
 
-        // 当前 group 内任一成功 → 组内 race 立即返回。
-        let g = groups[next_group];
-        let mut success: Option<(Vec<IpAddr>, u32)> = None;
-        for j in g.start..=g.end {
-            if let ClientOutcome::Success(ips, ttl) = &outcomes[j] {
-                success = Some((ips.clone(), *ttl));
+        // 内层组推进（Go dns.go:418-437 的 `for nextGroup < len(groups)`）。
+        while next_group < groups.len() {
+            let g = groups[next_group];
+            // 组内 race：任一成功立即返回（minimum rtt）。
+            if let Some((ips, ttl)) = group_success(&outcomes, g) {
+                set.abort_all();
+                return Ok((ips, ttl));
+            }
+            // 组内仍有查询未返回：等待下一个结果。
+            if group_pending(&outcomes, g) {
                 break;
             }
-        }
-        if let Some((ips, ttl)) = success {
-            set.abort_all();
-            return Ok((ips, ttl));
-        }
-
-        // 当前 group 仍有人在跑：检查是否还有 pending。
-        let mut still_pending = 0usize;
-        for j in g.start..=g.end {
-            if matches!(outcomes[j], ClientOutcome::Pending) {
-                still_pending += 1;
-            }
-        }
-        if still_pending > 0 {
-            continue;
-        }
-
-        // 当前 group 全部到齐且全部失败 → 输出 per-server logDecision
-        // （Go dns.go:430 `LogInfoInner` "failed to lookup ip in parallel query mode"）
-        // 然后推进 next_group。
-        for j in g.start..=g.end {
-            if matches!(outcomes[j], ClientOutcome::Failure) {
-                let server = clients[j].server.name();
-                if let Err(e) = &raw_errs[j] {
+            // 组内全部到齐且全部失败 → per-server 决策日志后推进下一组
+            // （Go dns.go:430 `LogInfoInner` "failed to lookup ip in parallel query mode"）。
+            for j in g.start..=g.end {
+                if let (ClientOutcome::Failure, Err(e)) = (&outcomes[j], &raw_errs[j]) {
                     tracing::info!(
                         target: "xray.dns",
-                        server = %server,
+                        server = %clients[j].server.name(),
                         domain = %domain_owned,
                         error = %e,
                         "failed to lookup ip in parallel query mode",
                     );
                 }
             }
+            next_group += 1;
         }
-        next_group += 1;
     }
 
     Err(merge_query_errors(domain, &raw_errs).expect_err("parallel_query raw_errs are all Err"))
+}
+
+/// 组内任一已收结果成功 → 返回 (ips, ttl)（Go dns.go:419-426 组内 race）。
+fn group_success(outcomes: &[ClientOutcome], g: Group) -> Option<(Vec<IpAddr>, u32)> {
+    outcomes[g.start..=g.end]
+        .iter()
+        .find_map(|o| match o {
+            ClientOutcome::Success(ips, ttl) => Some((ips.clone(), *ttl)),
+            _ => None,
+        })
+}
+
+/// 组内是否还有未返回的查询（Go dns.go:428 pending 计数 > 0）。
+fn group_pending(outcomes: &[ClientOutcome], g: Group) -> bool {
+    outcomes[g.start..=g.end]
+        .iter()
+        .any(|o| matches!(o, ClientOutcome::Pending))
 }
 // ── 错误聚合 + 决策日志（Go dns.go:339-361 mergeQueryErrors + dns.go:330-337 logDecision）──
 
@@ -553,7 +556,7 @@ fn merge_query_errors(
     // 第一遍：识别 distinct error（非 RNF）。
     let mut first_non_rnf: Option<&DnsError> = None;
     let mut has_multiple_distinct = false;
-    for e in &errs {
+    for e in errs.iter().copied() {
         if matches!(e, DnsError::RecordNotFound) {
             continue;
         }
@@ -1054,6 +1057,56 @@ mod tests {
         let first = check_routes();
         let second = check_routes();
         assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn parallel_query_returns_when_later_group_results_arrive_early() {
+        // Go dns.go:418-437 内层 for：组 0 结果收齐推进到组 1 时，组 1 的成功
+        // 结果可能早已收齐——必须立即返回，而不是回头 join_next（JoinSet 已空，
+        // 旧实现在此自旋挂死）。
+        let g0a = make_delayed_client("g0a", 1, Vec::new(), Duration::from_millis(300));
+        let g0b = make_delayed_client("g0b", 1, Vec::new(), Duration::from_millis(300));
+        let g1 = make_delayed_client(
+            "g1",
+            2,
+            vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))],
+            Duration::from_millis(10),
+        );
+        let svc = make_service_cfg(vec![g0a, g0b, g1], Vec::new(), true);
+        let fut = svc.lookup_ip("slow-first.com", IpOption::all());
+        let (ips, _) = tokio::time::timeout(Duration::from_secs(2), fut)
+            .await
+            .expect("must not spin after JoinSet drains")
+            .expect("group 1 success must win");
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))]);
+    }
+
+    #[tokio::test]
+    async fn hosts_redirect_cycle_terminates_at_nameservers() {
+        // Go dns.go:250-253：hosts 域名替换后不再进 hosts，直接走 nameservers。
+        // a.com↔b.com 环配置下旧实现无限递归；新实现替换一次后查 nameservers，
+        // 无可用 nameserver → EmptyResponse，有限时间返回。
+        let svc = make_service(
+            Vec::new(),
+            vec![
+                HostMapping {
+                    domain: "a.com".to_string(),
+                    ips: Vec::new(),
+                    proxied_domain: "b.com".to_string(),
+                },
+                HostMapping {
+                    domain: "b.com".to_string(),
+                    ips: Vec::new(),
+                    proxied_domain: "a.com".to_string(),
+                },
+            ],
+        );
+        let fut = svc.lookup_ip("a.com", IpOption::all());
+        match tokio::time::timeout(Duration::from_secs(2), fut).await {
+            Ok(Err(DnsError::EmptyResponse)) => {}
+            Ok(other) => panic!("expected EmptyResponse, got {other:?}"),
+            Err(_) => panic!("hosts redirect cycle must terminate"),
+        }
     }
 
     // ---- features::dns::DnsClient trait 边界（drj：单方法 + IPOption + TTL）----

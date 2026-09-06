@@ -11,16 +11,23 @@ use xray_transport_hysteria::config::{TcpRequestPadding, TcpResponsePadding};
 
 use crate::error::HysteriaProxyError;
 
-// ===== 常量（与 Go 一致） =====
+// ===== 常量 =====
 
-/// 地址最大长度（防 DoS，对应 Go `MaxAddressLength = 2048`）。
-pub const MAX_ADDRESS_LENGTH: u64 = 2048;
+/// 地址最大长度（防 DoS）。
+///
+/// 合法地址是 `host:port`：域名 ≤253 + `:` + 端口 ≤5 = ≤259 字节，271 留少量裕量。
+/// 比 Go 基准的 2048 更紧——超过该值必为恶意 varint 声明。
+pub const MAX_ADDRESS_LENGTH: u64 = 271;
 
-/// 消息最大长度（对应 Go `MaxMessageLength = 2048`）。
-pub const MAX_MESSAGE_LENGTH: u64 = 2048;
+/// 消息最大长度（64 KiB）。
+///
+/// Go 基准为 2048；放宽到 64 KiB 上限（超限仍拒绝，接受侧不放大分配）。
+pub const MAX_MESSAGE_LENGTH: u64 = 64 * 1024;
 
-/// Padding 最大长度（对应 Go `MaxPaddingLength = 4096`）。
-pub const MAX_PADDING_LENGTH: u64 = 4096;
+/// Padding 最大长度（64 KiB）。
+///
+/// padding 读取后即丢弃（[`discard_exact`] 按块读，不按声明值预分配）。
+pub const MAX_PADDING_LENGTH: u64 = 64 * 1024;
 
 // ===== QUIC varint 读写 =====
 
@@ -90,6 +97,20 @@ pub fn varint_len(v: u64) -> usize {
         8
     }
 }
+
+/// 按块读丢弃 `n` 字节（不按 `n` 预分配堆缓冲）。
+///
+/// padding 声明值上限 64 KiB 且读后即弃，固定 4 KiB 栈缓冲循环消化即可，
+/// 避免按恶意声明值做大额堆分配。
+fn discard_exact<R: Read>(r: &mut R, mut n: u64) -> io::Result<()> {
+    let mut chunk = [0u8; 4096];
+    while n > 0 {
+        let want = chunk.len().min(n as usize);
+        r.read_exact(&mut chunk[..want])?;
+        n -= want as u64;
+    }
+    Ok(())
+}
 // ===== TCP 请求 / 响应 =====
 
 /// 读取 TCP 请求帧（对应 Go `ReadTCPRequest`）。
@@ -111,8 +132,7 @@ pub fn read_tcp_request<R: Read>(r: &mut R) -> Result<String, HysteriaProxyError
         return Err(HysteriaProxyError::ProtocolParse("invalid padding length".into()));
     }
     if padding_len > 0 {
-        let mut discard = vec![0u8; padding_len as usize];
-        r.read_exact(&mut discard)
+        discard_exact(r, padding_len)
             .map_err(|e| HysteriaProxyError::ProtocolParse(format!("tcp request padding: {e}")))?;
     }
     String::from_utf8(addr_buf)
@@ -164,8 +184,7 @@ pub fn read_tcp_response<R: Read>(r: &mut R) -> Result<(bool, String), HysteriaP
         return Err(HysteriaProxyError::ProtocolParse("invalid padding length".into()));
     }
     if padding_len > 0 {
-        let mut discard = vec![0u8; padding_len as usize];
-        r.read_exact(&mut discard).map_err(|e| {
+        discard_exact(r, padding_len).map_err(|e| {
             HysteriaProxyError::ProtocolParse(format!("tcp response padding: {e}"))
         })?;
     }
@@ -258,7 +277,7 @@ impl UdpMessage {
         let mut cursor = io::Cursor::new(&msg[8..]);
         let addr_len = read_varint(&mut cursor)
             .map_err(|e| HysteriaProxyError::ProtocolParse(format!("udp msg addr len: {e}")))?;
-        if addr_len == 0 || addr_len > MAX_MESSAGE_LENGTH {
+        if addr_len == 0 || addr_len > MAX_ADDRESS_LENGTH {
             return Err(HysteriaProxyError::ProtocolParse("invalid address length".into()));
         }
         let consumed = cursor.position() as usize;
@@ -515,5 +534,76 @@ mod tests {
             let n = write_varint(&mut buf, v);
             assert_eq!(varint_len(v), n, "varint_len mismatch for {v}");
         }
+    }
+
+    // ===== varint 限幅回归（超限帧被拒） =====
+
+    /// varint → bytes（测试辅助；`write_varint` 需要预分配缓冲，不增长 Vec）。
+    fn varint_bytes(v: u64) -> Vec<u8> {
+        let mut b = [0u8; 8];
+        let n = write_varint(&mut b, v);
+        b[..n].to_vec()
+    }
+
+    #[test]
+    fn tcp_request_rejects_oversize_addr_len() {
+        let buf = varint_bytes(MAX_ADDRESS_LENGTH + 1);
+        let err = read_tcp_request(&mut io::Cursor::new(&buf)).unwrap_err();
+        assert!(err.to_string().contains("invalid address length"), "got {err}");
+    }
+
+    #[test]
+    fn tcp_request_rejects_oversize_padding_len() {
+        let addr = b"example.com:443";
+        let mut buf = varint_bytes(addr.len() as u64);
+        buf.extend_from_slice(addr);
+        buf.extend(varint_bytes(MAX_PADDING_LENGTH + 1));
+        let err = read_tcp_request(&mut io::Cursor::new(&buf)).unwrap_err();
+        assert!(err.to_string().contains("invalid padding length"), "got {err}");
+    }
+
+    #[test]
+    fn tcp_request_discards_padding_up_to_limit() {
+        // 上限值 64 KiB padding 合法，且被块读完整消化（位置=总长证明无残留）
+        let addr = b"example.com:443";
+        let mut buf = varint_bytes(addr.len() as u64);
+        buf.extend_from_slice(addr);
+        buf.extend(varint_bytes(MAX_PADDING_LENGTH));
+        buf.extend(std::iter::repeat_n(0u8, MAX_PADDING_LENGTH as usize));
+        let mut cursor = io::Cursor::new(&buf);
+        let decoded = read_tcp_request(&mut cursor).expect("64KiB padding should be accepted");
+        assert_eq!(decoded, "example.com:443");
+        assert_eq!(cursor.position() as usize, buf.len(), "padding fully consumed");
+    }
+
+    #[test]
+    fn tcp_response_rejects_oversize_msg_len() {
+        let mut buf = vec![0u8]; // status
+        buf.extend(varint_bytes(MAX_MESSAGE_LENGTH + 1));
+        buf.extend(varint_bytes(0));
+        let err = read_tcp_response(&mut io::Cursor::new(&buf)).unwrap_err();
+        assert!(err.to_string().contains("invalid message length"), "got {err}");
+    }
+
+    #[test]
+    fn tcp_response_accepts_msg_over_legacy_2k_limit() {
+        // 旧上限 2048、现上限 64 KiB：2049 字节消息应被接受（放宽不收紧消息面）
+        let msg = "x".repeat(2049);
+        let mut buf = vec![0u8]; // status
+        buf.extend(varint_bytes(msg.len() as u64));
+        buf.extend_from_slice(msg.as_bytes());
+        buf.extend(varint_bytes(0));
+        let (ok, decoded) =
+            read_tcp_response(&mut io::Cursor::new(&buf)).expect("2049B msg should be accepted");
+        assert!(ok);
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn udp_message_rejects_oversize_addr_len() {
+        let mut m = vec![0u8; 8];
+        m.extend(varint_bytes(MAX_ADDRESS_LENGTH + 1));
+        let err = UdpMessage::parse(&m).unwrap_err();
+        assert!(err.to_string().contains("invalid address length"), "got {err}");
     }
 }

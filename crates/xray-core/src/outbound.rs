@@ -54,7 +54,7 @@ use xray_mux::session::ClientStrategy;
 // 补全协议注册
 use xray_proxy_hysteria::HysteriaConfig;
 use xray_proxy_freedom::{Config as FreedomConfig, DomainStrategy, Fragment, Noise};
-use xray_proxy_wireguard::DeviceConfig;
+use xray_proxy_wireguard::{DeviceConfig, DomainStrategy as WgDomainStrategy};
 
 
 /// Dispatcher → LoopbackSink 桥接。
@@ -157,8 +157,25 @@ pub fn register_outbounds(
     // Phase 1: 注册所有 handler，收集需要代理链的 DialBridge 引用
     let mut chain_bridges: Vec<(Arc<DialBridge>, String)> = Vec::new(); // (bridge, chain_tag)
     let mut mux_bridges: Vec<(Arc<MuxBridge>, Option<String>)> = Vec::new();
+    // freedom 默认 final rule 的入站选择（Go getDefaultFinalRule(inbound.Name) :154-169）：
+    // inbound tag → 协议名 → DefaultRuleType。无匹配协议的入站不入表（= 无默认规则）。
+    let inbound_default_rules: std::collections::HashMap<String, xray_proxy_freedom::DefaultRuleType> =
+        built
+            .inbounds
+            .iter()
+            .filter_map(|ib| {
+                xray_proxy_freedom::get_default_rule_type(&ib.entry.kind)
+                    .map(|rule| (ib.tag.clone(), rule))
+            })
+            .collect();
     for (i, ob) in built.outbounds.iter().enumerate() {
-        match try_build_handler(ob, loopback_sink.clone(), &mut mux_bridges, dns.as_ref()) {
+        match try_build_handler(
+            ob,
+            loopback_sink.clone(),
+            &mut mux_bridges,
+            dns.as_ref(),
+            &inbound_default_rules,
+        ) {
             Ok((handler, bridge_ref, proxy_chain_tag)) => {
                 // Go proxyman/outbound/outbound.go:109-111：首个注册成功者即默认
                 // 出站（if defaultHandler == nil），后注册者绝不覆盖、无 tag 特判。
@@ -376,7 +393,13 @@ pub fn build_single_outbound(
     ob: &BuiltOutbound,
 ) -> std::result::Result<Arc<dyn DispatchHandler>, BuildError> {
     let mut mux_bridges = Vec::new();
-    let (handler, _, _) = try_build_handler(ob, None, &mut mux_bridges, None)?;
+    let (handler, _, _) = try_build_handler(
+        ob,
+        None,
+        &mut mux_bridges,
+        None,
+        &std::collections::HashMap::new(),
+    )?;
     Ok(handler)
 }
 
@@ -510,12 +533,14 @@ pub(crate) fn parse_udp443_policies(
 /// 返回 `(handler, dial_bridge_ref, proxy_chain_tag)`。
 /// - `handler`: 注册到 Ohm 的 DispatchHandler
 /// - `dial_bridge_ref`: 如果是 DialBridge 类型，保留 Arc 引用以便 Phase 2 设置代理链
-/// - `proxy_chain_tag`: 对应 Go `senderSettings.ProxySettings.Tag`，存在时表示需要代理链
 fn try_build_handler(
     ob: &BuiltOutbound,
     loopback_sink: Option<Arc<dyn LoopbackSink>>,
     mux_bridges: &mut Vec<(Arc<MuxBridge>, Option<String>)>,
     dns: Option<&Arc<xray_app_dns::DnsService>>,
+    // 入站 tag → 默认 final rule 类型（freedom 默认规则按入站协议名推导，
+    // Go getDefaultFinalRule；API 单构建路径传空表 = 无默认规则）
+    inbound_default_rules: &std::collections::HashMap<String, xray_proxy_freedom::DefaultRuleType>,
 ) -> std::result::Result<(Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>), BuildError> {
     let proxy_chain_tag = parse_proxy_chain_tag(ob.proxy_settings_json.as_ref());
     // targetStrategy（bd bqm）：字符串 → 枚举；AsIs（无策略）不包装
@@ -531,6 +556,13 @@ fn try_build_handler(
         "freedom" => {
             let config = parse_freedom_config(&ob.entry.data);
             let noises = config.noises.clone();
+            let destination_override = config.destination_override.clone();
+            // finalRules 预构建（Go Handler.Init :206-219；构建失败的项跳过）
+            let final_rules: Vec<xray_proxy_freedom::FinalRule> = config
+                .final_rules
+                .iter()
+                .filter_map(|rc| xray_proxy_freedom::FinalRule::build(rc).ok())
+                .collect();
             let dial_fn = xray_proxy_freedom::make_freedom_dial_fn_with_config(config);
             let dial_fn = match target_strategy {
                 Some(s) => wrap_dial_with_target_strategy(dial_fn, s, dns.cloned()),
@@ -541,13 +573,16 @@ fn try_build_handler(
                 Some(spec) => wrap_dial_with_send_through(dial_fn, spec.clone()),
                 None => dial_fn,
             };
-            // TCP 走 DialBridge（fragment 经 DialFn 包装 writer），UDP 走
-            // FreedomDispatchBridge（noises 首包前注入；sendThrough 经 with_send_through）
+            // TCP 走 DialBridge（fragment/override/proxyProtocol 经 DialFn 消费），UDP 走
+            // FreedomDispatchBridge（noises + override + finalRules + 入站默认规则）
             let tcp_bridge = Arc::new(DialBridge::new(ob.tag.clone(), dial_fn));
             let mut bridge = xray_proxy_freedom::FreedomDispatchBridge::from_bridge(
                 Arc::clone(&tcp_bridge),
             )
-            .with_noises(noises);
+            .with_noises(noises)
+            .with_destination_override(destination_override)
+            .with_final_rules(final_rules)
+            .with_inbound_default_rules(inbound_default_rules.clone());
             if let Some(spec) = &send_through {
                 bridge = bridge.with_send_through(spec.clone());
             }
@@ -843,6 +878,28 @@ fn parse_mux_config(data: &[u8]) -> std::result::Result<(u32, Option<String>), S
 /// JSON 格式：`{ "vnext": [{ "address": "...", "port": 443, "users": [{ "id": "uuid" }] }] }`
 fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutboundConfig, String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
+    // Go infra/conf/vless.go:263-271 扁平形式：顶层 address 非空 → 以顶层
+    // id/flow/encryption/level/email 构造 vnext[0]（覆盖显式 vnext 数组）。
+    let v = if v.get("address").and_then(|a| a.as_str()).is_some() {
+        let mut obj = v.as_object().cloned().unwrap_or_default();
+        obj.insert(
+            "vnext".into(),
+            serde_json::json!([{
+                "address": v.get("address"),
+                "port": v.get("port"),
+                "users": [{
+                    "id": v.get("id"),
+                    "flow": v.get("flow"),
+                    "encryption": v.get("encryption"),
+                    "level": v.get("level"),
+                    "email": v.get("email"),
+                }],
+            }]),
+        );
+        serde_json::Value::Object(obj)
+    } else {
+        v
+    };
     let vnext = v
         .get("vnext")
         .and_then(|v| v.as_array())
@@ -899,6 +956,25 @@ fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutboundConfig, S
 /// JSON 格式：`{ "servers": [{ "address": "...", "port": 443, "password": "..." }] }`
 fn parse_trojan_config(data: &[u8]) -> std::result::Result<TrojanOutboundConfig, String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
+    // Go infra/conf/trojan.go:45-56 扁平形式：顶层 address 非空 → 以顶层
+    // password/level/email/flow 构造 servers[0]（覆盖显式 servers 数组）。
+    let v = if v.get("address").and_then(|a| a.as_str()).is_some() {
+        let mut obj = v.as_object().cloned().unwrap_or_default();
+        obj.insert(
+            "servers".into(),
+            serde_json::json!([{
+                "address": v.get("address"),
+                "port": v.get("port"),
+                "password": v.get("password"),
+                "level": v.get("level"),
+                "email": v.get("email"),
+                "flow": v.get("flow"),
+            }]),
+        );
+        serde_json::Value::Object(obj)
+    } else {
+        v
+    };
     let servers = v
         .get("servers")
         .and_then(|v| v.as_array())
@@ -971,10 +1047,39 @@ fn parse_freedom_config(data: &[u8]) -> FreedomConfig {
         .and_then(|n| n.as_array())
         .map(|arr| arr.iter().filter_map(parse_freedom_noise).collect())
         .unwrap_or_default();
+    // destinationOverride / proxyProtocol / finalRules（Go FreedomConfig json 键，
+    // freedom.go:19-29；解析在 freedom crate `from_json`，Go 语义对齐）
+    let destination_override = v
+        .get("destinationOverride")
+        .and_then(xray_proxy_freedom::DestinationOverride::from_json);
+    let proxy_protocol = v
+        .get("proxyProtocol")
+        .and_then(|p| p.as_u64())
+        .unwrap_or(0) as u32;
+    let final_rules: Vec<xray_proxy_freedom::FinalRuleConfig> = v
+        .get("finalRules")
+        .and_then(|r| r.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|rv| {
+                    match xray_proxy_freedom::FinalRuleConfig::from_json(rv) {
+                        Ok(c) => Some(c),
+                        Err(e) => {
+                            xray_common::log::warning(format!("freedom finalRule ignored: {e}"));
+                            None
+                        }
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     FreedomConfig {
         domain_strategy: domain_strategy as i32,
+        destination_override,
+        proxy_protocol,
         fragment,
         noises,
+        final_rules,
         ..Default::default()
     }
 }
@@ -2058,34 +2163,128 @@ fn build_tuic_rustls_config(
 }
 
 
+/// camelCase 主键（Go infra/conf wireguard.go:17-68 JSON tag）缺失时读 snake_case 别名。
+fn wg_get<'a>(
+    v: &'a serde_json::Value,
+    camel: &str,
+    snake: &str,
+) -> Option<&'a serde_json::Value> {
+    v.get(camel).or_else(|| v.get(snake))
+}
+
+/// Go infra/conf/wireguard.go:148-174 `ParseWireGuardKey`：64 字符 hex 原样通过；
+/// 否则按 base64（含 `+`/`/` 用标准表，否则 URL 表，容忍单个尾部 `=`）解码为小写 hex。
+fn parse_wireguard_key(s: &str) -> std::result::Result<String, String> {
+    use base64::Engine as _;
+    if s.is_empty() {
+        return Err("key must not be empty".to_string());
+    }
+    if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(s.to_string());
+    }
+    let trimmed = s.strip_suffix('=').unwrap_or(s);
+    let decoded = if trimmed.contains('+') || trimmed.contains('/') {
+        base64::engine::general_purpose::STANDARD_NO_PAD.decode(trimmed)
+    } else {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(trimmed)
+    }
+    .map_err(|e| format!("failed to deserialize key: {e}"))?;
+    Ok(decoded.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Go infra/conf/wireguard.go:120-134 domainStrategy → [`WgDomainStrategy`]。
+fn parse_wireguard_domain_strategy(
+    s: Option<&str>,
+) -> std::result::Result<WgDomainStrategy, String> {
+    match s.unwrap_or("").to_ascii_lowercase().as_str() {
+        "" | "forceip" => Ok(WgDomainStrategy::ForceIp),
+        "forceipv4" => Ok(WgDomainStrategy::ForceIp4),
+        "forceipv6" => Ok(WgDomainStrategy::ForceIp6),
+        "forceipv4v6" => Ok(WgDomainStrategy::ForceIp46),
+        "forceipv6v4" => Ok(WgDomainStrategy::ForceIp64),
+        other => Err(format!("unsupported domain strategy: {other}")),
+    }
+}
+
 /// 解析 wireguard outbound settings JSON → DeviceConfig。
 ///
-/// JSON 格式：`{"secretKey":"...","peers":[{"publicKey":"...","endpoint":"..."}]}`。
+/// JSON 格式（Go `infra/conf/wireguard.go:17-68`，camelCase 主键、snake_case 别名双读）：
+/// `{"secretKey":"...","peers":[{"publicKey":"...","preSharedKey":"...","endpoint":"...",
+/// "keepAlive":25,"allowedIPs":["0.0.0.0/0"]}],"mtu":1420,"reserved":[2,5,1],
+/// "domainStrategy":"ForceIP"}`。
 fn parse_wireguard_config(data: &[u8]) -> std::result::Result<DeviceConfig, String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
-    let secret_key = v.get("secretKey").and_then(|x| x.as_str())
+    let secret_key = wg_get(&v, "secretKey", "secret_key").and_then(|x| x.as_str())
         .ok_or_else(|| "missing secretKey".to_string())?;
+    let secret_key = parse_wireguard_key(secret_key)?;
     let mut peers = Vec::new();
     if let Some(arr) = v.get("peers").and_then(|x| x.as_array()) {
         for p in arr {
-            let public_key = p.get("publicKey").and_then(|x| x.as_str())
+            let public_key = wg_get(p, "publicKey", "public_key").and_then(|x| x.as_str())
                 .ok_or_else(|| "missing peer publicKey".to_string())?;
+            let public_key = parse_wireguard_key(public_key)?;
             let endpoint = p.get("endpoint").and_then(|x| x.as_str())
                 .ok_or_else(|| "missing peer endpoint".to_string())?;
+            // Go wireguard.go:39-44：空 PreSharedKey → 无 PSK。
+            let pre_shared_key = match wg_get(p, "preSharedKey", "pre_shared_key")
+                .and_then(|x| x.as_str())
+            {
+                Some(s) if !s.is_empty() => parse_wireguard_key(s)?,
+                _ => String::new(),
+            };
+            // Go wireguard.go:47-49 KeepAlive → persistent_keepalive_interval（秒）。
+            let keep_alive = wg_get(p, "keepAlive", "keep_alive").and_then(|x| x.as_u64())
+                .map(|n| u32::try_from(n).map_err(|_| "keepAlive out of u32 range".to_string()))
+                .transpose()?
+                .unwrap_or(0);
+            // Go wireguard.go:50-54 AllowedIPs；缺省由消费侧按全路由处理，不在此展开默认 CIDR。
+            let allowed_ips = wg_get(p, "allowedIPs", "allowed_ips")
+                .and_then(|x| x.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default();
             peers.push(xray_proxy_wireguard::PeerConfig {
-                public_key: public_key.to_string(),
+                public_key,
                 endpoint: endpoint.to_string(),
-                ..Default::default()
+                pre_shared_key,
+                keep_alive,
+                allowed_ips,
             });
         }
     }
     let endpoint = v.get("address").and_then(|x| x.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
         .unwrap_or_else(|| vec!["10.0.0.2/32".to_string()]);
+    // Go wireguard.go:106-110：MTU 0 → 消费侧 effective_mtu() 回落 1420。
+    let mtu = wg_get(&v, "mtu", "mtu").and_then(|x| x.as_i64())
+        .map(|n| i32::try_from(n).map_err(|_| "mtu out of i32 range".to_string()))
+        .transpose()?
+        .unwrap_or(0);
+    // Go wireguard.go:112-115："reserved" 应为空或恰好 3 字节。
+    let reserved = wg_get(&v, "reserved", "reserved").and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .map(|x| {
+                    x.as_u64()
+                        .and_then(|n| u8::try_from(n).ok())
+                        .ok_or_else(|| "reserved must be a byte array".to_string())
+                })
+                .collect::<std::result::Result<Vec<u8>, String>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    if !reserved.is_empty() && reserved.len() != 3 {
+        return Err(r#""reserved" should be empty or 3 bytes"#.to_string());
+    }
+    let domain_strategy = parse_wireguard_domain_strategy(
+        wg_get(&v, "domainStrategy", "domain_strategy").and_then(|x| x.as_str()),
+    )?;
     Ok(DeviceConfig {
-        secret_key: secret_key.to_string(),
+        secret_key,
         peers,
         endpoint,
+        mtu,
+        reserved,
+        domain_strategy,
         ..Default::default()
     })
 }
@@ -2318,8 +2517,14 @@ mod tests {
             send_through: Some("127.0.0.2".to_string()),
             ..make_outbound("freedom", "via-test", "{}")
         };
-        let (handler, _, _) =
-            try_build_handler(&ob, None, &mut Vec::new(), None).expect("build freedom handler");
+        let (handler, _, _) = try_build_handler(
+            &ob,
+            None,
+            &mut Vec::new(),
+            None,
+            &std::collections::HashMap::new(),
+        )
+        .expect("build freedom handler");
 
         // 3. dispatcher → dispatch → echo
         let ohm = SimpleOhm::new();
@@ -2558,6 +2763,143 @@ mod tests {
         }
     }
 
+    // ===== 扁平 outbound 形式（Go infra/conf 顶层 address → vnext/servers[0]） =====
+
+    /// Go vless.go:263-271：顶层 address/id/flow → vnext[0]。
+    #[test]
+    fn parse_vless_config_flat_form() {
+        let data = r#"{
+            "address": "flat.example.com",
+            "port": 8443,
+            "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+            "flow": "xtls-rprx-vision"
+        }"#;
+        let config = parse_vless_config(data.as_bytes()).unwrap();
+        assert_eq!(config.server_port.value(), 8443);
+        assert_eq!(
+            config.user_uuid.to_string(),
+            "b831381d-6324-4d53-ad4f-8cda48b30811"
+        );
+        assert_eq!(config.flow, "xtls-rprx-vision");
+        match &config.server_address {
+            Address::Domain(d) => assert_eq!(d, "flat.example.com"),
+            other => panic!("expected Domain, got {other:?}"),
+        }
+    }
+
+    /// Go trojan.go:45-56：顶层 address/password → servers[0]。
+    #[test]
+    fn parse_trojan_config_flat_form() {
+        let data = r#"{ "address": "trojan.example.com", "port": 443, "password": "flat-pw" }"#;
+        let config = parse_trojan_config(data.as_bytes()).unwrap();
+        assert_eq!(config.server_port.value(), 443);
+        assert_eq!(config.account.password, "flat-pw");
+        match &config.server_address {
+            Address::Domain(d) => assert_eq!(d, "trojan.example.com"),
+            other => panic!("expected Domain, got {other:?}"),
+        }
+    }
+
+    /// Go Build()：扁平 address 非空时直接覆盖显式 Servers/Vnext 数组。
+    #[test]
+    fn flat_form_overrides_explicit_array() {
+        let trojan = r#"{
+            "address": "flat.example.com",
+            "port": 443,
+            "password": "flat-pw",
+            "servers": [{ "address": "array.example.com", "port": 9999, "password": "array-pw" }]
+        }"#;
+        let config = parse_trojan_config(trojan.as_bytes()).unwrap();
+        assert_eq!(config.account.password, "flat-pw");
+        match &config.server_address {
+            Address::Domain(d) => assert_eq!(d, "flat.example.com"),
+            other => panic!("expected Domain, got {other:?}"),
+        }
+    }
+
+    // ===== wireguard 六键解析透传 =====
+
+    #[test]
+    fn parse_wireguard_config_six_keys_passthrough() {
+        let secret = "aa".repeat(32);
+        let pub_key = "bb".repeat(32);
+        let psk = "cc".repeat(32);
+        let data = format!(
+            r#"{{
+                "secretKey": "{secret}",
+                "peers": [{{
+                    "publicKey": "{pub_key}",
+                    "endpoint": "1.2.3.4:51820",
+                    "preSharedKey": "{psk}",
+                    "keepAlive": 25,
+                    "allowedIPs": ["0.0.0.0/0", "::/0"]
+                }}],
+                "mtu": 1400,
+                "reserved": [2, 5, 1],
+                "domainStrategy": "ForceIPv4"
+            }}"#
+        );
+        let config = parse_wireguard_config(data.as_bytes()).unwrap();
+        assert_eq!(config.secret_key, secret);
+        assert_eq!(config.effective_mtu(), 1400);
+        assert_eq!(config.reserved, vec![2, 5, 1]);
+        assert_eq!(config.domain_strategy, WgDomainStrategy::ForceIp4);
+        let peer = &config.peers[0];
+        assert_eq!(peer.public_key, pub_key);
+        assert_eq!(peer.pre_shared_key, psk);
+        assert_eq!(peer.keep_alive, 25);
+        assert_eq!(peer.allowed_ips, vec!["0.0.0.0/0", "::/0"]);
+        // 既有消费链：解析出的六键能直接构造 Tunnel（PSK/keepalive 进 boringtun）
+        xray_proxy_wireguard::Tunnel::from_config(&config, peer)
+            .expect("parsed keys must feed the existing tunnel chain");
+    }
+
+    #[test]
+    fn parse_wireguard_config_snake_aliases_and_base64_key() {
+        // snake_case 别名双读 + base64 密钥归一化（Go ParseWireGuardKey → hex）
+        use base64::Engine as _;
+        let psk_b64 = base64::engine::general_purpose::STANDARD.encode([0xddu8; 32]);
+        let data = format!(
+            r#"{{
+                "secretKey": "{}",
+                "peers": [{{
+                    "publicKey": "{}",
+                    "endpoint": "1.2.3.4:51820",
+                    "pre_shared_key": "{psk_b64}",
+                    "keep_alive": 15,
+                    "allowed_ips": ["10.0.0.0/8"]
+                }}],
+                "domain_strategy": "forceipv6"
+            }}"#,
+            "aa".repeat(32),
+            "bb".repeat(32),
+        );
+        let config = parse_wireguard_config(data.as_bytes()).unwrap();
+        let peer = &config.peers[0];
+        assert_eq!(peer.pre_shared_key, "dd".repeat(32), "base64 PSK normalized to hex");
+        assert_eq!(peer.keep_alive, 15);
+        assert_eq!(peer.allowed_ips, vec!["10.0.0.0/8"]);
+        assert_eq!(config.domain_strategy, WgDomainStrategy::ForceIp6);
+    }
+
+    #[test]
+    fn parse_wireguard_config_rejects_bad_reserved_and_strategy() {
+        let base = |extra: &str| {
+            format!(
+                r#"{{"secretKey": "{}", "peers": [{{"publicKey": "{}", "endpoint": "e:1"}}], {extra}}}"#,
+                "aa".repeat(32),
+                "bb".repeat(32),
+            )
+        };
+        // Go wireguard.go:112-115：reserved 非空须恰好 3 字节
+        let err = parse_wireguard_config(base(r#""reserved": [1, 2]"#).as_bytes()).unwrap_err();
+        assert!(err.contains("should be empty or 3 bytes"), "got {err}");
+        // Go wireguard.go:120-134：未知策略拒绝
+        let err =
+            parse_wireguard_config(base(r#""domainStrategy": "bogus""#).as_bytes()).unwrap_err();
+        assert!(err.contains("unsupported domain strategy"), "got {err}");
+    }
+
     #[test]
     fn freedom_noise_removed_warning_aligns_go() {
         // Go infra/conf/freedom.go:145-147：单数 noise 已移除。
@@ -2576,6 +2918,30 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(r#"{"noises":[]}"#).unwrap();
         assert!(freedom_noise_removed_warning(&v).is_none());
         assert!(freedom_noise_removed_warning(&serde_json::json!({})).is_none());
+    }
+
+    /// 装配接线：freedom settings JSON 的 destinationOverride / proxyProtocol /
+    /// finalRules 经 parse_freedom_config 进入强类型 Config（Go 标准键）。
+    #[test]
+    fn parse_freedom_config_wires_override_proxy_protocol_and_final_rules() {
+        let json = r#"{
+            "domainStrategy": "UseIP",
+            "destinationOverride": {"server": {"address": "9.9.9.9", "port": 1080}},
+            "proxyProtocol": 2,
+            "finalRules": [
+                {"action": "block", "network": "tcp,udp", "port": "53", "ip": ["10.0.0.0/8"]}
+            ]
+        }"#;
+        let cfg = parse_freedom_config(json.as_bytes());
+        let ov = cfg.destination_override.expect("override parsed");
+        let server = ov.server.expect("server set");
+        assert_eq!(server.port, 1080);
+        assert_eq!(cfg.proxy_protocol, 2);
+        assert_eq!(cfg.final_rules.len(), 1);
+        let rule = xray_proxy_freedom::FinalRule::build(&cfg.final_rules[0]).unwrap();
+        assert_eq!(rule.action, xray_proxy_freedom::RuleAction::Block);
+        assert!(rule.apply(2, 53, Some("10.1.2.3".parse().unwrap())));
+        assert!(!rule.apply(2, 53, Some("8.8.8.8".parse().unwrap())));
     }
 
     #[test]

@@ -290,7 +290,7 @@ async fn handle_udp_associate(
 ///
 /// 单 listener 每连接 peek 1 字节嗅探:0x05 → SOCKS5;ASCII 字母开头 → HTTP。
 /// 对应 Go `proxy/mixed/mixed.go` 同一 listener 上 mux socks 与 http 两个 handler。
-/// ponytail:握手超时简化(传 None);后续透传 policy.map(...)
+/// 握手限时由 [`handshake_timeout_for`] 提供（policy 或 Go SessionDefault 60s 兜底）。
 async fn serve_mixed(
     listener: TcpListener,
     ohm: Arc<SimpleOhm>,
@@ -532,8 +532,8 @@ async fn handle_plain_http(
 /// `followRedirect` + streamSettings TLS（`tls.NewListener` 包裹）。
 #[derive(Clone)]
 pub struct DokodemoTcpOptions {
-    /// 预定义目标（settings.address + settings.port）。
-    pub dest: Destination,
+    /// 预定义目标（settings.address + settings.port，均可缺省 → `None`）。
+    pub dest: Option<Destination>,
     /// 端口映射：监听端口字符串 → `"host:port"`（host/port 均可缺省）。
     /// 仅 `follow_redirect=false` 时生效。
     pub port_map: HashMap<String, String>,
@@ -566,48 +566,76 @@ fn socketaddr_to_address(addr: SocketAddr) -> Address {
 ///
 /// `follow_redirect=true` 优先级：
 /// 1. `original_dst`（Linux `SO_ORIGINAL_DST`，iptables REDIRECT 透明代理）
-/// 2. TLS 握手 SNI 覆盖 address（port 保持；Go dokodemo.go:122-132，仅在未被
-///    original_dst 覆盖时）
-/// 3. predefined dest
+/// 2. TLS 握手 SNI 覆盖 address（port 保持 rewrite 值，缺省 0；Go dokodemo.go:122-132，
+///    仅在未被 original_dst 覆盖时）
+/// 3. predefined dest；三者皆无 → `None`（Go：dest 无效，dispatch 失败）
 ///
-/// `follow_redirect=false`：predefined dest + `port_map`（按监听端口查 map 改写，
-/// Go dokodemo.go:101-109）。
+/// `follow_redirect=false`：predefined dest 回填（address 缺省 → 本机回环、
+/// port 缺省 → 本地端口，Go dokodemo.go:86-100）+ `port_map`（:101-109）。
+/// 返回 `None` = 无有效目标（仅 follow_redirect 且 original/SNI/rewrite 皆缺时）。
 fn resolve_dokodemo_tcp_dest(
     opts: &DokodemoTcpOptions,
+    local_ip: Option<std::net::IpAddr>,
     local_port: Option<u16>,
     original_dst: Option<SocketAddr>,
     tls_sni: Option<&str>,
-) -> Destination {
+) -> Option<Destination> {
     let mut dest = opts.dest.clone();
     if opts.follow_redirect {
         let mut overridden = false;
         if let Some(orig) = original_dst {
-            dest = Destination::tcp(socketaddr_to_address(orig), Port::new(orig.port()));
+            dest = Some(Destination::tcp(socketaddr_to_address(orig), Port::new(orig.port())));
             overridden = true;
         }
         if !overridden {
             if let Some(sni) = tls_sni.filter(|s| !s.is_empty()) {
-                dest = Destination::tcp(Address::Domain(sni.to_string()), dest.port());
+                let port = dest.as_ref().map_or(0, |d| d.port().value());
+                dest = Some(Destination::tcp(
+                    Address::Domain(sni.to_string()),
+                    Port::new(port),
+                ));
             }
         }
-    } else if let Some(lp) = local_port {
+        dest
+    } else {
+        // rewrite 缺省回填（Go dokodemo.go:86-100）：address → 本机回环
+        // （依监听地址族选 v4/v6），port → 本地监听端口。
+        let mut d = dest.unwrap_or_else(|| {
+            Destination::tcp(loopback_addr(local_ip), Port::new(0))
+        });
+        if d.port().value() == 0 {
+            if let Some(lp) = local_port {
+                d = Destination::tcp(d.address().clone(), Port::new(lp));
+            }
+        }
         // port_map：值 "host:port"，host/port 均可空（Go dokodemo.go:101-109，
         // SplitHostPort 错误已在 parse 阶段校验，此处容错跳过）。
-        if let Some(mapping) = opts.port_map.get(&lp.to_string()) {
-            if let Some((host, port_str)) = mapping.rsplit_once(':') {
-                if !port_str.is_empty() {
-                    if let Ok(p) = port_str.parse::<u16>() {
-                        dest = Destination::tcp(dest.address().clone(), Port::new(p));
+        if let Some(lp) = local_port {
+            if let Some(mapping) = opts.port_map.get(&lp.to_string()) {
+                if let Some((host, port_str)) = mapping.rsplit_once(':') {
+                    if !port_str.is_empty() {
+                        if let Ok(p) = port_str.parse::<u16>() {
+                            d = Destination::tcp(d.address().clone(), Port::new(p));
+                        }
                     }
-                }
-                let host = host.trim_start_matches('[').trim_end_matches(']');
-                if !host.is_empty() {
-                    dest = Destination::tcp(parse_address_str(host), dest.port());
+                    let host = host.trim_start_matches('[').trim_end_matches(']');
+                    if !host.is_empty() {
+                        d = Destination::tcp(parse_address_str(host), d.port());
+                    }
                 }
             }
         }
+        Some(d)
     }
-    dest
+}
+
+/// rewrite address 缺省时的本机回环地址（Go dokodemo.go:91-96：依监听
+/// 地址族选 127.0.0.1 / ::1）。
+fn loopback_addr(local_ip: Option<std::net::IpAddr>) -> Address {
+    match local_ip {
+        Some(std::net::IpAddr::V6(_)) => Address::IPv6(std::net::Ipv6Addr::LOCALHOST),
+        _ => Address::IPv4(std::net::Ipv4Addr::LOCALHOST),
+    }
 }
 
 /// Dokodemo-door inbound 服务入口（tdy / i09）。
@@ -643,6 +671,7 @@ pub async fn serve_dokodemo(
         let handler = Arc::clone(&handler);
         let opts = opts.clone();
         tokio::spawn(async move {
+            let local_ip = stream.local_addr().ok().map(|a| a.ip());
             let local_port = stream.local_addr().ok().map(|a| a.port());
 
             // follow_redirect：Linux 下从 accept 的 fd 查 SO_ORIGINAL_DST。
@@ -659,26 +688,43 @@ pub async fn serve_dokodemo(
             let original_dst: Option<SocketAddr> = None;
 
             if let Some(acc) = opts.tls.clone() {
-                match acc.accept(stream).await {
-                    Ok(tls_stream) => {
+                // TLS 握手首包（ClientHello）读超时：静默连接占位防护
+                // （Go SessionDefault Timeouts.Handshake=60s 同源）。
+                match tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, acc.accept(stream)).await {
+                    Ok(Ok(tls_stream)) => {
                         // SNI 覆盖：握手完成后的 ClientHello server_name
                         // （rustls ServerConnection::server_name）。
                         let sni = tls_stream.get_ref().1.server_name();
-                        let dest =
-                            resolve_dokodemo_tcp_dest(&opts, local_port, original_dst, sni);
-                        let (read_half, write_half) = tokio::io::split(tls_stream);
-                        let link = Link::new(new_reader(read_half), new_writer(write_half));
-                        let _ = handler.dispatch(&dest, link).await;
+                        match resolve_dokodemo_tcp_dest(&opts, local_ip, local_port, original_dst, sni)
+                        {
+                            Some(dest) => {
+                                let (read_half, write_half) = tokio::io::split(tls_stream);
+                                let link = Link::new(new_reader(read_half), new_writer(write_half));
+                                let _ = handler.dispatch(&dest, link).await;
+                            }
+                            None => tracing::warn!(
+                                "dokodemo: no valid destination (followRedirect without original dst/SNI/rewrite)"
+                            ),
+                        }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::warn!(error = %e, "dokodemo TLS accept failed");
+                    }
+                    Err(_) => {
+                        tracing::debug!("dokodemo TLS accept timeout");
                     }
                 }
             } else {
-                let dest = resolve_dokodemo_tcp_dest(&opts, local_port, original_dst, None);
-                let (read_half, write_half) = tokio::io::split(stream);
-                let link = Link::new(new_reader(read_half), new_writer(write_half));
-                let _ = handler.dispatch(&dest, link).await;
+                match resolve_dokodemo_tcp_dest(&opts, local_ip, local_port, original_dst, None) {
+                    Some(dest) => {
+                        let (read_half, write_half) = tokio::io::split(stream);
+                        let link = Link::new(new_reader(read_half), new_writer(write_half));
+                        let _ = handler.dispatch(&dest, link).await;
+                    }
+                    None => tracing::warn!(
+                        "dokodemo: no valid destination (followRedirect without original dst/rewrite)"
+                    ),
+                }
             }
         });
     }
@@ -686,53 +732,216 @@ pub async fn serve_dokodemo(
 
 /// Dokodemo-door UDP inbound 服务入口。
 ///
-/// 对应 Go `Process()` 中 `network == UDP` 分支：所有数据报经
-/// [`UdpDispatchSession`] 转发到预定义 `dest`（dokodemo 语义：固定目标），
-/// 响应回发给最近一个 peer。
+/// 对应 Go `Process()` 中 `network == UDP` 分支：数据报按 peer 源地址分桶到
+/// per-peer [`UdpDispatchSession`]（Go `udp.Dispatcher` 会话模型），响应回发
+/// 给产生它的会话的 peer——不再共享 last_peer（多客户端交错时回包串扰）。
+///
+/// 底层 socket 由 [`xray_transport::udp::hub::UdpHub`] 承载：
+/// `follow_redirect=true` 时以 `ReceiveOriginalDestination` 监听（Linux 下
+/// IP_TRANSPARENT + IP_RECVORIGDSTADDR，逐包携带原始目标，对应 Go
+/// `HubReceiveOriginalDestination`），回包经 fakeudp 伪造源地址
+/// （Go dokodemo.go:158-176 PacketWriter + fakeudp_linux.go）；非 Linux/
+/// 未命中 TPROXY 时回包直接从监听 socket 发出（已知平台降级，对齐 Go
+/// fakeudp_other.go）。
+///
+/// `dest`：predefined 目标（dokodemo 语义：固定目标；address/port 缺省时
+/// 回填本机回环 + 本地端口，Go dokodemo.go:86-100）。
 pub async fn serve_dokodemo_udp(
-    udp: UdpSocket,
+    bind_addr: SocketAddr,
     handler: Arc<dyn DispatchHandler>,
-    dest: Destination,
+    dest: Option<Destination>,
+    follow_redirect: bool,
 ) -> std::io::Result<()> {
-    tracing::info!(addr = %udp.local_addr()?, dest = ?dest, "dokodemo UDP inbound listening");
-    let mut session = UdpDispatchSession::new(handler);
-    let dest = Destination::udp(dest.address().clone(), dest.port());
-    let mut buf = [0u8; 65535];
-    // 最近一个 peer：响应可能晚于请求到达，跨循环迭代记忆
-    let mut last_peer: Option<SocketAddr> = None;
+    use xray_transport::udp::hub::ReceiveOriginalDestination;
+    let hub = xray_transport::udp::hub::UdpHub::listen(
+        bind_addr,
+        &[Box::new(ReceiveOriginalDestination(follow_redirect))],
+        None,
+    )
+    .await?;
+    serve_dokodemo_udp_on(hub, handler, dest).await
+}
+
+/// 已建 [`UdpHub`] 的 dokodemo UDP 服务循环（测试/组合入口）。
+pub async fn serve_dokodemo_udp_on(
+    hub: xray_transport::udp::hub::UdpHub,
+    handler: Arc<dyn DispatchHandler>,
+    dest: Option<Destination>,
+) -> std::io::Result<()> {
+    let local = hub.local_addr().ok();
+    let local_port = local.as_ref().map(|a| a.port());
+    let mut dest =
+        dest.unwrap_or_else(|| Destination::udp(loopback_addr(local.map(|a| a.ip())), Port::new(0)));
+    if dest.port().value() == 0 {
+        if let Some(lp) = local_port {
+            dest = Destination::udp(dest.address().clone(), Port::new(lp));
+        }
+    }
+    tracing::info!(addr = ?local, dest = ?dest, "dokodemo UDP inbound listening");
+
+    let (mut hub_rx, hub) = hub.split();
+    // per-peer 会话表：首包建会话 task；空闲清扫复用 retain 模式（同 SS UDP
+    // relay 的 sessions.retain，本表按 idle 时间判定，60s 对齐 Go udp
+    // Dispatcher 的会话超时）。
+    let mut peers: HashMap<SocketAddr, PeerSession> = HashMap::new();
+    let mut cleanup_at = tokio::time::Instant::now() + DOKODEMO_UDP_IDLE;
     loop {
         tokio::select! {
-            v = udp.recv_from(&mut buf) => {
-                let (n, peer) = match v {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "dokodemo udp recv failed");
-                        continue;
+            pkt = hub_rx.recv() => {
+                let Some(pkt) = pkt else { return Ok(()) }; // hub 关闭
+                let peer = pkt.source;
+                // 逐包目标：TPROXY 命中原始目标用之，否则 predefined
+                // （Go destinationOverridden → ob.Target 覆盖）。
+                let dest_override = pkt
+                    .target
+                    .map(|a| Destination::udp(socketaddr_to_address(a), Port::new(a.port())));
+                let entry = match peers.entry(peer) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        let (tx, rx) = tokio::sync::mpsc::channel(64);
+                        let overridden = dest_override.is_some();
+                        let first_dest = dest_override.clone().unwrap_or_else(|| dest.clone());
+                        tokio::spawn(dokodemo_peer_relay(
+                            peer,
+                            rx,
+                            Arc::clone(&handler),
+                            first_dest,
+                            Arc::clone(&hub),
+                            overridden,
+                        ));
+                        e.insert(PeerSession {
+                            tx,
+                            last_active: tokio::time::Instant::now(),
+                        })
                     }
                 };
-                last_peer = Some(peer);
-                if session.send_packet(&dest, &buf[..n]).await.is_err() {
-                    tracing::debug!("dokodemo udp dispatch send failed");
+                entry.last_active = tokio::time::Instant::now();
+                if entry.tx.send((dest_override, pkt.payload)).await.is_err() {
+                    tracing::debug!("dokodemo udp peer session closed; packet dropped");
+                }
+            }
+            _ = tokio::time::sleep_until(cleanup_at) => {
+                // 丢弃 idle / 已关会话：tx drop → peer task 退出 → link/fake socket 释放
+                peers.retain(|_, p| {
+                    !p.tx.is_closed() && p.last_active.elapsed() < DOKODEMO_UDP_IDLE
+                });
+                cleanup_at = tokio::time::Instant::now() + DOKODEMO_UDP_IDLE;
+            }
+        }
+    }
+}
+
+/// dokodemo UDP 会话空闲清理阈值（60s，Go udp Dispatcher 会话超时同值）。
+const DOKODEMO_UDP_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// per-peer 会话表条目。
+struct PeerSession {
+    /// 主循环 → peer task 的入站包队列 `(逐包 dest 覆盖, payload)`。
+    tx: tokio::sync::mpsc::Sender<(Option<Destination>, Vec<u8>)>,
+    last_active: tokio::time::Instant,
+}
+
+/// 单 peer UDP 会话任务：入站队列 → [`UdpDispatchSession`] → 响应回发本 peer。
+///
+/// 响应路径（对齐 Go dokodemo.go:158-176 PacketWriter）：
+/// - 非 TPROXY：响应经监听 socket（hub）回发（Go `SequentialWriter{conn}`）。
+/// - TPROXY（Linux）：响应源为 IP 时经 fakeudp 伪造源地址回发（per 源缓存，
+///   Go `w.conns`）；源伪造不可用时丢弃该响应（Go 同款 LogInfo+continue）。
+async fn dokodemo_peer_relay(
+    peer: SocketAddr,
+    mut rx: tokio::sync::mpsc::Receiver<(Option<Destination>, Vec<u8>)>,
+    handler: Arc<dyn DispatchHandler>,
+    default_dest: Destination,
+    hub: Arc<xray_transport::udp::hub::UdpHub>,
+    overridden: bool,
+) {
+    let mut session = UdpDispatchSession::new(handler);
+    #[allow(unused_mut)]
+    let mut fake_cache: HashMap<(std::net::IpAddr, u16), Arc<tokio::net::UdpSocket>> =
+        HashMap::new();
+    loop {
+        tokio::select! {
+            r = rx.recv() => {
+                match r {
+                    Some((dest, payload)) => {
+                        let d = dest.as_ref().unwrap_or(&default_dest);
+                        if session.send_packet(d, &payload).await.is_err() {
+                            tracing::debug!("dokodemo udp dispatch send failed");
+                        }
+                    }
+                    None => return, // idle 清扫丢表项（tx 关闭）
                 }
             }
             r = session.recv_packet() => {
-                let (_source, payload) = match r {
-                    Ok(Some(v)) => v,
-                    Ok(None) => return Ok(()), // outbound 关闭，会话结束
+                match r {
+                    Ok(Some((source, payload))) => {
+                        // TPROXY（Linux）：按响应源选 fakeudp；None=经 hub 回发
+                        #[cfg(target_os = "linux")]
+                        let fake = if overridden {
+                            fake_responder(&mut fake_cache, &source)
+                        } else {
+                            None
+                        };
+                        #[cfg(not(target_os = "linux"))]
+                        let fake: Option<Arc<tokio::net::UdpSocket>> = None;
+                        #[cfg(not(target_os = "linux"))]
+                        let _ = (&overridden, &source, &fake_cache);
+                        match fake {
+                            Some(s) => {
+                                if s.send_to(&payload, peer).await.is_err() {
+                                    tracing::debug!("dokodemo udp fakeudp send_to client failed");
+                                }
+                            }
+                            None => {
+                                if hub.send_to(&payload, peer).await.is_err() {
+                                    tracing::debug!("dokodemo udp send_to client failed");
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => return, // outbound 关闭，会话结束
                     Err(e) => {
                         tracing::debug!(error = %e, "dokodemo udp dispatch recv failed");
                         continue;
                     }
-                };
-                let Some(peer) = last_peer else { continue };
-                if udp.send_to(&payload, peer).await.is_err() {
-                    tracing::debug!("dokodemo udp send_to client failed");
                 }
             }
         }
     }
 }
 
+/// TPROXY 响应回发 socket：按响应源（IP）取/建 fakeudp 透明 socket。
+///
+/// - 响应源为 IP：`fakeudp` bind 到该源地址（per 源缓存，Go `w.conns` 同键）。
+/// - 创建失败（需 CAP_NET_ADMIN）或源为域名（无法 bind）：返回 `None`，调用
+///   方丢弃该响应（Go PacketWriter 创建失败 LogInfo+drop 同款降级）。
+/// mark 恒 0：Rust dokodemo UDP 路径未接 session sockopt mark（Go 缺省 0 同值）。
+#[cfg(target_os = "linux")]
+fn fake_responder(
+    cache: &mut HashMap<(std::net::IpAddr, u16), Arc<tokio::net::UdpSocket>>,
+    source: &Destination,
+) -> Option<Arc<tokio::net::UdpSocket>> {
+    let ip = match source.address() {
+        Address::IPv4(v4) => std::net::IpAddr::V4(*v4),
+        Address::IPv6(v6) => std::net::IpAddr::V6(*v6),
+        Address::Domain(_) => return None,
+    };
+    let key = (ip, source.port().value());
+    if let Some(s) = cache.get(&key) {
+        return Some(Arc::clone(s));
+    }
+    match xray_proxy_dokodemo::fakeudp::fake_udp(SocketAddr::new(ip, key.1), 0) {
+        Ok(s) => {
+            let s = Arc::new(s);
+            cache.insert(key, Arc::clone(&s));
+            Some(s)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "dokodemo TPROXY fakeudp create failed; response dropped");
+            None
+        }
+    }
+}
 
 /// SS 入站模式（legacy AEAD 或 SS-2022）。
 #[derive(Clone)]
@@ -804,9 +1013,16 @@ async fn ss_legacy_pipeline<C>(
 ) where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let handshake = ib.handle_conn(stream).await.map(|(header, ss_stream)| {
-        (header.address, header.port, ss_stream)
-    });
+    // 首包读超时（Go SessionDefault Timeouts.Handshake=60s 同源）：静默连接
+    // 占位防护；transport 分支共用本函数，一并覆盖。
+    let handshake =
+        match tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, ib.handle_conn(stream)).await {
+            Ok(r) => r.map(|(header, ss_stream)| (header.address, header.port, ss_stream)),
+            Err(_) => {
+                tracing::debug!("ss legacy inbound handshake timeout");
+                return;
+            }
+        };
     match handshake {
         Ok((address, port, ss_stream)) => {
             let dest = Destination::new(address, Port::new(port), Network::TCP);
@@ -891,9 +1107,16 @@ pub async fn serve_ss(
                     ss_legacy_pipeline(ib, handler, stream).await;
                 }
                 SsInboundMode::Ss2022(ib) => {
-                    let handshake = ib.handle_conn(stream).await
-                        .map(|r| (r.address, r.port, r.stream))
-                        .map_err(|e| std::io::Error::other(e.to_string()));
+                    let handshake = tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, ib.handle_conn(stream)).await;
+                    let handshake = match handshake {
+                        Ok(r) => r
+                            .map(|resp| (resp.address, resp.port, resp.stream))
+                            .map_err(|e| std::io::Error::other(e.to_string())),
+                        Err(_) => {
+                            tracing::debug!("ss2022 inbound handshake timeout");
+                            return;
+                        }
+                    };
                     if let Ok((address, port, ss_stream)) = handshake {
                         let dest = Destination::new(address, Port::new(port), Network::TCP);
                         spawn_ss_pump(ss_stream, dest, handler).await;
@@ -902,9 +1125,16 @@ pub async fn serve_ss(
                     }
                 }
                 SsInboundMode::Ss2022Multi(ib) => {
-                    let handshake = ib.handle_conn(stream).await
-                        .map(|r| (r.address, r.port, r.stream))
-                        .map_err(|e| std::io::Error::other(e.to_string()));
+                    let handshake = tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, ib.handle_conn(stream)).await;
+                    let handshake = match handshake {
+                        Ok(r) => r
+                            .map(|resp| (resp.address, resp.port, resp.stream))
+                            .map_err(|e| std::io::Error::other(e.to_string())),
+                        Err(_) => {
+                            tracing::debug!("ss2022 multi inbound handshake timeout");
+                            return;
+                        }
+                    };
                     if let Ok((address, port, ss_stream)) = handshake {
                         let dest = Destination::new(address, Port::new(port), Network::TCP);
                         spawn_ss_pump(ss_stream, dest, handler).await;
@@ -914,7 +1144,17 @@ pub async fn serve_ss(
                 }
                 SsInboundMode::Ss2022Relay(ib) => {
                     // relay：身份匹配 + 剥 identity header，字节原样桥（无 chunk 解密）
-                    let Ok((_addr, port, prefix, tcp)) = ib.handle_conn_relay(stream).await else {
+                    let handshake =
+                        tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, ib.handle_conn_relay(stream)).await;
+                    let handshake = match handshake {
+                        Ok(v) => v,
+                        Err(_) => {
+                            tracing::debug!("ss2022 relay inbound handshake timeout");
+                            return;
+                        }
+                    };
+                    let Ok((_addr, port, prefix, tcp)) = handshake else {
+                        tracing::debug!("ss2022 relay inbound handshake failed");
                         return;
                     };
                     let dest = Destination::new(_addr, Port::new(port), Network::TCP);
@@ -1626,6 +1866,23 @@ fn transport_conn_addrs(
     (peer, local)
 }
 
+/// 无 policy manager 时的 inbound 握手/首包读超时兜底。Go `SessionDefault()`
+/// `Timeouts.Handshake = 60s`（features/policy/policy.go:125-133，注释：对齐
+/// nginx client_header_timeout 以免暴露服务端身份）；ss/dokodemo 路径同样取值。
+const DEFAULT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 按 userLevel 查 policy 的握手超时；无 policy manager 时回退
+/// [`DEFAULT_HANDSHAKE_TIMEOUT`]（Go DefaultPolicyFeature 兜底语义）。
+fn handshake_timeout_for(
+    policy: &Option<std::sync::Arc<dyn xray_features::policy::PolicyManager>>,
+    level: u32,
+) -> std::time::Duration {
+    policy
+        .as_ref()
+        .map(|pm| pm.policy_for_level(level).timeout.handshake)
+        .unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT)
+}
+
 /// 按协议种类启动单个 inbound listener。
 async fn spawn_one_inbound(
     ib: &BuiltInbound,
@@ -1687,10 +1944,13 @@ async fn spawn_one_inbound(
             // 单 listener peek 首字节嗅探:0x05 → socks;ASCII 字母开头 → http。
             let socks_cfg = Arc::new(parse_socks_server_config(&ib.entry.data)?);
             let http_cfg = Arc::new(parse_http_config(&ib.entry.data)?);
+            // 嗅探/socks/http 三段握手读共用一个限时；对齐 Go mixed mux 的两个
+            // handler（socks/http 均按 policy().Timeouts.Handshake 限时）。
+            let handshake_timeout = handshake_timeout_for(&policy, http_cfg.user_level);
             let listener = TcpListener::bind(&addr).await?;
             tracing::info!(tag = %ib.tag, addr = %addr, "mixed (socks+http) inbound listening");
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                serve_mixed(listener, ohm, socks_cfg, http_cfg, None).await
+                serve_mixed(listener, ohm, socks_cfg, http_cfg, Some(handshake_timeout)).await
             })))
         }
         "vless" => {
@@ -1757,26 +2017,8 @@ async fn spawn_one_inbound(
         "trojan" => {
             let users = build_trojan_users(&ib.entry.data)?;
             // Trojan fallback：解析 JSON fallbacks 数组构建决策树
-            let fallbacks = serde_json::from_slice::<serde_json::Value>(&ib.entry.data)
-                .ok()
-                .and_then(|v| v.get("fallbacks").cloned())
-                .and_then(|fbs| serde_json::from_value::<Vec<serde_json::Value>>(fbs).ok())
-                .map(|fbs| {
-                    let list: Vec<Fallback> = fbs.into_iter().filter_map(|fb| {
-                        Some(Fallback {
-                            name: fb.get("name").and_then(|v| v.as_str()).unwrap_or("").into(),
-                            alpn: fb.get("alpn").and_then(|v| v.as_str()).unwrap_or("").into(),
-                            path: fb.get("path").and_then(|v| v.as_str()).unwrap_or("").into(),
-                            r#type: fb.get("type").and_then(|v| v.as_str()).unwrap_or("").into(),
-                            dest: apply_unix_abstract_padding(
-                                fb.get("dest").and_then(|v| v.as_str()).unwrap_or("127.0.0.1:80"),
-                            ),
-                            xver: fb.get("xver").and_then(|v| v.as_u64()).unwrap_or(0),
-                        })
-                    }).collect();
-                    if list.is_empty() { None } else { Some(FallbackPolicy::from_list(&list)) }
-                })
-                .flatten();
+            // （dest 数字/缺失对齐 Go trojan.go:151-198，解析失败即启动失败）
+            let fallbacks = build_trojan_fallbacks(&ib.entry.data)?;
             let settings = xray_transport::dialer::StreamSettings::from_json(
                 ib.stream_settings_json.as_ref(),
             );
@@ -1860,16 +2102,14 @@ async fn spawn_one_inbound(
             let config = parse_http_config(&ib.entry.data)?;
             // userLevel 生效：policy_for_level(UserLevel).timeout.handshake →
             // serve_http 读首请求超时。对应 Go proxy/http/server.go:47-51 policy()
-            // + :112 SetReadDeadline(Timeouts.Handshake)。无 policy manager（如
-            // 无 policy 配置块）时限时关闭，等价 Go policy 零值默认由
-            // DefaultPolicyFeature 兜底——此处直接不设超时（dispatcher 同样无 pm）。
-            let handshake_timeout = policy
-                .as_ref()
-                .map(|pm| pm.policy_for_level(config.user_level).timeout.handshake);
+            // + :112 SetReadDeadline(Timeouts.Handshake)；无 policy manager（如
+            // 无 policy 配置块）时对齐 Go SessionDefault 兜底 60s
+            // （features/policy/policy.go:130），不再无限时。
+            let handshake_timeout = handshake_timeout_for(&policy, config.user_level);
             let listener = TcpListener::bind(&addr).await?;
             tracing::info!(tag = %ib.tag, addr = %addr, "http inbound listening");
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                serve_http(listener, ohm, Arc::new(config), handshake_timeout).await
+                serve_http(listener, ohm, Arc::new(config), Some(handshake_timeout)).await
             })))
         }
         "dokodemo" => {
@@ -1884,7 +2124,7 @@ async fn spawn_one_inbound(
             if settings.follow_redirect {
                 tracing::warn!(
                     tag = %ib.tag,
-                    "dokodemo followRedirect requires Linux (SO_ORIGINAL_DST); falling back to predefined dest"
+                    "dokodemo followRedirect requires Linux (SO_ORIGINAL_DST / UDP TPROXY); falling back to predefined dest"
                 );
             }
             let mut handles = Vec::new();
@@ -1905,7 +2145,9 @@ async fn spawn_one_inbound(
                 }));
             }
             if settings.allow_udp {
-                let udp = UdpSocket::bind(&addr).await?;
+                let bind_addr: SocketAddr = addr.parse().map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("parse addr: {e}"))
+                })?;
                 let dispatch = ohm.get_default_handler().ok_or_else(|| {
                     std::io::Error::other(
                         "dokodemo UDP inbound requires a default outbound handler",
@@ -1913,8 +2155,11 @@ async fn spawn_one_inbound(
                 })?;
                 tracing::info!(tag = %ib.tag, addr = %addr, dest = ?dest, "dokodemo UDP inbound listening");
                 let dest_udp = dest.clone();
+                let follow_redirect = settings.follow_redirect;
                 handles.push(tokio::spawn(async move {
-                    if let Err(e) = serve_dokodemo_udp(udp, dispatch, dest_udp).await {
+                    if let Err(e) =
+                        serve_dokodemo_udp(bind_addr, dispatch, dest_udp, follow_redirect).await
+                    {
                         tracing::error!(error = %e, "dokodemo UDP inbound stopped");
                     }
                 }));
@@ -2081,7 +2326,8 @@ async fn spawn_one_inbound(
 ///
 /// 字段对齐 Go `infra/conf/socks.go::SocksServerConfig`：
 /// `{"auth":"password","users":[{"user":"u","pass":"p"}],"udp":true,"userLevel":0}`。
-/// `users`/`accounts` 同义（Go 两个字段都收）；`ip`（UDP 回包地址）无消费方暂不解析。
+/// `users`/`accounts` 同义（Go 两个字段都收）；`ip`（Go `Host`，UDP relay 绑定
+/// 地址，`xray-proxy-socks` UDP ASSOCIATE 消费）解析为 proto `IPOrDomain`。
 fn parse_socks_server_config(data: &[u8]) -> std::io::Result<ServerConfig> {
     if data.is_empty() {
         return Ok(ServerConfig::default());
@@ -2106,6 +2352,25 @@ fn parse_socks_server_config(data: &[u8]) -> std::io::Result<ServerConfig> {
     }
     cfg.udp_enabled = v.get("udp").and_then(|x| x.as_bool()).unwrap_or(false);
     cfg.user_level = v.get("userLevel").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    // `ip`（Go socks.go:35 `Host *Address json:"ip"`）：UDP relay 绑定 IP；
+    // 未配置时 config.address 保持 None，socks 侧回退 127.0.0.1（既有默认行为）。
+    if let Some(ip_str) = v.get("ip").and_then(|x| x.as_str()) {
+        cfg.address = Some(match parse_address_str(ip_str) {
+            Address::IPv4(ip) => xray_proto::xray::common::net::IpOrDomain {
+                address: Some(xray_proto::xray::common::net::ip_or_domain::Address::Ip(
+                    ip.octets().to_vec(),
+                )),
+            },
+            Address::IPv6(ip) => xray_proto::xray::common::net::IpOrDomain {
+                address: Some(xray_proto::xray::common::net::ip_or_domain::Address::Ip(
+                    ip.octets().to_vec(),
+                )),
+            },
+            Address::Domain(d) => xray_proto::xray::common::net::IpOrDomain {
+                address: Some(xray_proto::xray::common::net::ip_or_domain::Address::Domain(d)),
+            },
+        });
+    }
     Ok(cfg)
 }
 
@@ -2229,6 +2494,80 @@ fn build_trojan_users(data: &[u8]) -> std::io::Result<HashMap<String, TrojanMemo
     Ok(users)
 }
 
+/// 从 inbound entry.data（JSON）解析 trojan `fallbacks` 数组 → FallbackPolicy。
+///
+/// dest 形态对齐 Go `infra/conf/trojan.go:151-198`：
+/// - json 数字 N（或纯数字字符串）→ `"localhost:N"`（:154-155 + :188-190）；
+/// - `type` 缺省时按 dest 形态推导（:177-194）：`@`/`/` 前缀 → unix
+///   （`@@` 抽象套接字做 108 字节 NUL padding），`host:port` → tcp；
+/// - dest 缺失/null 且 `type` 也缺省 → 报错（:196-198；不再回退 127.0.0.1:80），
+///   与 Go 一致：fallbacks 配置错误 = inbound 启动失败。
+fn build_trojan_fallbacks(data: &[u8]) -> std::io::Result<Option<std::sync::Arc<FallbackPolicy>>> {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(data) else {
+        return Ok(None);
+    };
+    let Some(fbs) = v.get("fallbacks").and_then(|f| f.as_array()) else {
+        return Ok(None);
+    };
+    let mut list = Vec::with_capacity(fbs.len());
+    for fb in fbs {
+        let name = fb.get("name").and_then(|x| x.as_str()).unwrap_or("").into();
+        let alpn = fb.get("alpn").and_then(|x| x.as_str()).unwrap_or("").into();
+        let path = fb.get("path").and_then(|x| x.as_str()).unwrap_or("").into();
+        let xver = fb.get("xver").and_then(|x| x.as_u64()).unwrap_or(0);
+        let mut dest = match fb.get("dest") {
+            Some(serde_json::Value::Number(n)) => n.to_string(),
+            Some(serde_json::Value::String(s)) => s.clone(),
+            _ => String::new(),
+        };
+        let mut fb_type = fb.get("type").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        if fb_type.is_empty() && !dest.is_empty() {
+            if dest == "serve-ws-none" {
+                // Go trojan.go:178-179：内建 ws 服务标记，透传给 serve 侧。
+            } else if dest.starts_with('/') || dest.starts_with('@') {
+                fb_type = "unix".into();
+                dest = apply_unix_abstract_padding(&dest);
+            } else {
+                if dest.parse::<i64>().is_ok() {
+                    dest = format!("localhost:{dest}");
+                }
+                if looks_like_host_port(&dest) {
+                    fb_type = "tcp".into();
+                }
+            }
+        }
+        if fb_type.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                r#"trojan fallbacks: please fill in a valid value for every "dest""#,
+            ));
+        }
+        list.push(Fallback { name, alpn, path, r#type: fb_type, dest, xver });
+    }
+    if list.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(FallbackPolicy::from_list(&list)))
+    }
+}
+
+/// `host:port` 形态判定（Go `net.SplitHostPort` 的轻量版，仅用于 fallback
+/// type=tcp 推导）：host 非空、port 全数字非空；host 含裸冒号视为非法
+/// （方括号 IPv6 例外，`]` 结尾即合法）。
+fn looks_like_host_port(s: &str) -> bool {
+    match s.rsplit_once(':') {
+        Some((h, p)) => {
+            !h.is_empty()
+                && !p.is_empty()
+                && p.bytes().all(|b| b.is_ascii_digit())
+                && (!h.contains(':') || h.ends_with(']'))
+        }
+        None => false,
+    }
+}
+
+
+
 
 
 /// 从 inbound entry.data（JSON）解析 VLESS `fallbacks` 数组 → FallbackPolicy。
@@ -2255,13 +2594,18 @@ fn build_vless_fallbacks(data: &[u8]) -> Option<std::sync::Arc<xray_proxy_vless:
 }
 /// 从 inbound entry.data（JSON）解析 http inbound 配置 → HttpServerConfig。
 ///
-/// JSON 格式：`{"accounts":[{"user":"u","pass":"p"}],"allowTransparent":true,"userLevel":3}`。
+/// JSON 格式：`{"users":[{"user":"u","pass":"p"}],"allowTransparent":true,"userLevel":3}`。
+/// `users`/`accounts` 同义（Go http.go:26-27 两个字段都收），users 优先。
 /// 字段名/零值默认对齐 Go infra/conf/http.go:25-30（Transparent→AllowTransparent、UserLevel→UserLevel）。
 fn parse_http_config(data: &[u8]) -> std::io::Result<HttpServerConfig> {
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("http inbound settings JSON: {e}")))?;
     let mut config = HttpServerConfig::default();
-    if let Some(accounts) = v.get("accounts").and_then(|c| c.as_array()) {
+    if let Some(accounts) = v
+        .get("users")
+        .or_else(|| v.get("accounts"))
+        .and_then(|c| c.as_array())
+    {
         for a in accounts {
             let user = a.get("user").and_then(|x| x.as_str()).unwrap_or("");
             let pass = a.get("pass").and_then(|x| x.as_str()).unwrap_or("");
@@ -2281,19 +2625,13 @@ fn parse_http_config(data: &[u8]) -> std::io::Result<HttpServerConfig> {
     Ok(config)
 }
 
-/// 从 inbound entry.data（JSON）解析 dokodemo 配置 → Destination（预定义目标）。
-///
-/// JSON 格式：`{"address":"1.2.3.4","port":80,"network":"tcp"}`（address+port 必填）。
-/// 委托给 [`parse_dokodemo_settings`]，返回其 `dest` 字段。
-fn parse_dokodemo_dest(data: &[u8]) -> std::io::Result<Destination> {
-    Ok(parse_dokodemo_settings(data)?.dest)
-}
-
-/// Dokodemo inbound 解析后的完整设置。
+/// 解析后的完整 dokodemo 设置。
 #[derive(Debug)]
 struct DokodemoInboundSettings {
-    /// 预定义目标（TCP 和 UDP 各一份，网络类型不同）。
-    dest: Destination,
+    /// 预定义目标（TCP 和 UDP 各一份，网络类型不同）。address/port 均可缺省
+    /// （Go `RewriteAddress`/`RewritePort` 独立可选）；仅 address 给出时 port=0，
+    /// 由 serve 侧回填本地端口（Go dokodemo.go:86-100）。
+    dest: Option<Destination>,
     /// 是否允许 TCP。
     allow_tcp: bool,
     /// 是否允许 UDP。
@@ -2305,18 +2643,15 @@ struct DokodemoInboundSettings {
 }
 
 /// 从 inbound entry.data（JSON）解析完整 dokodemo 设置。
-///
 /// JSON 格式：`{"address":"1.2.3.4","port":80,"network":"tcp,udp","followRedirect":true}`。
-/// `network` 可选（默认 `"tcp"`）；`followRedirect` 可选（默认 `false`）。
+/// `network` 可选（默认 `"tcp"`）；`followRedirect` 可选（默认 `false`）；
+/// `address`/`port` 可选（Go dokodemo.go:26-31：address→RewriteAddress、
+/// port→RewritePort 独立生效；followRedirect 透明代理时目标取 SO_ORIGINAL_DST）。
 fn parse_dokodemo_settings(data: &[u8]) -> std::io::Result<DokodemoInboundSettings> {
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("dokodemo inbound settings JSON: {e}")))?;
-    let address_str = v.get("address").and_then(|x| x.as_str())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "dokodemo: missing address"))?;
-    let port = v.get("port").and_then(|x| x.as_u64())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "dokodemo: missing port"))?
-        as u16;
-    let address = parse_address_str(address_str);
+    let address = v.get("address").and_then(|x| x.as_str()).map(parse_address_str);
+    let port = v.get("port").and_then(|x| x.as_u64()).map(|p| p as u16);
     // network：逗号分隔，默认 tcp。对应 Go allowed_networks。
     let network_str = v.get("network").and_then(|x| x.as_str()).unwrap_or("tcp");
     let allow_tcp = network_str.contains("tcp");
@@ -2350,11 +2685,15 @@ fn parse_dokodemo_settings(data: &[u8]) -> std::io::Result<DokodemoInboundSettin
         }
     }
 
-    let dest = if allow_udp && !allow_tcp {
-        Destination::new(address, Port::new(port), Network::UDP)
-    } else {
-        Destination::new(address, Port::new(port), Network::TCP)
-    };
+    // address/port 独立可选：仅 address 时 port=0（serve 侧回填本地端口）。
+    let dest = address.map(|address| {
+        let port = port.unwrap_or(0);
+        if allow_udp && !allow_tcp {
+            Destination::new(address, Port::new(port), Network::UDP)
+        } else {
+            Destination::new(address, Port::new(port), Network::TCP)
+        }
+    });
     Ok(DokodemoInboundSettings { dest, allow_tcp, allow_udp, follow_redirect, port_map })
 }
 
@@ -2401,11 +2740,11 @@ fn build_vmess_validator(data: &[u8]) -> std::io::Result<std::sync::Arc<VmessTim
     }
     Ok(std::sync::Arc::new(validator))
 }
-
 /// 从 inbound entry.data（JSON）解析 SS 客户端 → SsInbound。
 ///
-/// JSON 格式：`{"method":"aes-128-gcm","password":"..."}` 或
-/// `{"clients":[{"method":"aes-128-gcm","password":"...","email":""}]}`。
+/// JSON 格式：`{"method":"aes-128-gcm","password":"..."}`（单用户）或
+/// `{"users":[{"method":"aes-128-gcm","password":"...","email":""}]}`。
+/// `users`/`clients` 同义（Go shadowsocks.go:46-47 两个字段都收），users 优先。
 fn parse_ss_inbound_config(data: &[u8]) -> std::io::Result<SsInboundMode> {
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("ss inbound settings JSON: {e}")))?;
@@ -2418,7 +2757,11 @@ fn parse_ss_inbound_config(data: &[u8]) -> std::io::Result<SsInboundMode> {
 
     // Legacy SS AEAD
     use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
-    if let Some(clients) = v.get("clients").and_then(|c| c.as_array()) {
+    if let Some(clients) = v
+        .get("users")
+        .or_else(|| v.get("clients"))
+        .and_then(|c| c.as_array())
+    {
         let mut users = Vec::new();
         for c in clients {
             let password = c.get("password").and_then(|x| x.as_str()).unwrap_or("");
@@ -2449,6 +2792,11 @@ fn parse_ss_inbound_config(data: &[u8]) -> std::io::Result<SsInboundMode> {
 }
 
 /// SS-2022 入站配置解析。
+///
+/// 形态判定对齐 Go `buildShadowsocks2022`（infra/conf/shadowsocks.go:113-177）：
+/// `destinations[]`（Rust 旧形）或 `users[]`/`clients[]` 首元素带 `address`
+/// （Go 形 relay，:130）→ 中继；数组无 `address` → 多用户；无数组 → 单用户。
+/// `users` 主键，`clients` 旧名回退（:46-47,54-56）。
 fn parse_ss2022_inbound_config(method: &str, v: &serde_json::Value) -> std::io::Result<SsInboundMode> {
     use xray_proxy_ss::ss2022::{MultiUserInbound, RelayDestination, RelayInbound, Ss2022Inbound, Ss2022User};
     use xray_proxy_ss::ss2022::key::psk_from_base64;
@@ -2483,10 +2831,59 @@ fn parse_ss2022_inbound_config(method: &str, v: &serde_json::Value) -> std::io::
         return Ok(SsInboundMode::Ss2022Relay(Arc::new(relay)));
     }
 
-    // 多用户模式：clients 数组
-    if let Some(clients) = v.get("clients").and_then(|c| c.as_array()) {
+    // users/clients 双读（Go shadowsocks.go:46-47,54-56）
+    let users_arr = v
+        .get("users")
+        .or_else(|| v.get("clients"))
+        .and_then(|c| c.as_array());
+
+    // 中继模式（Go 形）：首元素带 address → 按 relay destination 解析
+    // （Go shadowsocks.go:130 判定 + :162-175 构建；address/port 主键，
+    // server/server_port 为 Rust 旧名回退，不作为判定依据）。
+    if let Some(user_list) = users_arr {
+        let go_relay = user_list
+            .first()
+            .is_some_and(|u| u.get("address").and_then(|x| x.as_str()).is_some());
+        if go_relay {
+            let mut destinations = Vec::new();
+            for u in user_list {
+                let key_b64 = u.get("password").and_then(|x| x.as_str()).unwrap_or("");
+                let email = u.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let level = u.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                let addr_str = u
+                    .get("address")
+                    .or_else(|| u.get("server"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("127.0.0.1");
+                let port = u
+                    .get("port")
+                    .or_else(|| u.get("server_port"))
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0) as u16;
+                let psk = psk_from_base64(key_b64)
+                    .map_err(|e| std::io::Error::other(format!("ss2022 relay PSK: {e}")))?;
+                destinations.push(RelayDestination {
+                    key: psk,
+                    address: parse_address_str(addr_str),
+                    port,
+                    email,
+                    level,
+                });
+            }
+            if destinations.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "ss2022 relay: no destinations",
+                ));
+            }
+            let relay = RelayInbound::new(method, server_psk, destinations)
+                .map_err(|e| std::io::Error::other(format!("ss2022 relay: {e}")))?;
+            return Ok(SsInboundMode::Ss2022Relay(Arc::new(relay)));
+        }
+
+        // 多用户模式：数组无 address（Go shadowsocks.go:130 → MultiUserServerConfig）
         let mut users = Vec::new();
-        for c in clients {
+        for c in user_list {
             let psk_b64 = c.get("password").and_then(|x| x.as_str()).unwrap_or("");
             let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let level = c.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
@@ -3226,6 +3623,126 @@ mod tests {
         assert_eq!(empty, ServerConfig::default());
     }
 
+    /// `ip` 字段（Go socks.go:35 `Host`）→ config.address（UDP relay 绑定消费）。
+    #[test]
+    fn parse_socks_server_config_ip_field() {
+        use xray_proto::xray::common::net::ip_or_domain::Address as ProtoAddr;
+        let cfg = parse_socks_server_config(br#"{"ip":"127.0.0.9","udp":true}"#).unwrap();
+        let addr = cfg.address.expect("ip should populate config.address");
+        assert_eq!(
+            addr.address,
+            Some(ProtoAddr::Ip(vec![127, 0, 0, 9])),
+            "ipv4 → 4-byte Ip"
+        );
+        let cfg6 = parse_socks_server_config(br#"{"ip":"::1"}"#).unwrap();
+        let addr6 = cfg6.address.expect("ipv6 should populate too");
+        assert!(matches!(
+            &addr6.address,
+            Some(ProtoAddr::Ip(b)) if b.len() == 16
+        ));
+        let cfg_none = parse_socks_server_config(br#"{"udp":true}"#).unwrap();
+        assert!(cfg_none.address.is_none(), "no ip → None（127.0.0.1 回退在 socks 侧）");
+    }
+
+    /// legacy ss：`users` 主键（Go shadowsocks.go:46）与 `clients` 旧名回退。
+    #[test]
+    fn parse_ss_inbound_config_users_alias_and_clients_fallback() {
+        let users_json = br#"{"method":"aes-128-gcm","users":[
+            {"method":"aes-128-gcm","password":"pw1","email":"a@x"},
+            {"method":"aes-256-gcm","password":"pw2","email":"b@x"}]}"#;
+        let mode = super::parse_ss_inbound_config(users_json).unwrap();
+        let SsInboundMode::Legacy(ib) = &mode else {
+            panic!("users[] should build legacy ss inbound");
+        };
+        assert_eq!(ib.server().users_count(), 2, "users[] → 2 users");
+
+        let clients_json = br#"{"method":"aes-128-gcm","clients":[
+            {"method":"aes-128-gcm","password":"pw1","email":"a@x"}]}"#;
+        let mode = super::parse_ss_inbound_config(clients_json).unwrap();
+        let SsInboundMode::Legacy(ib) = &mode else {
+            panic!("clients[] fallback should still work");
+        };
+        assert_eq!(ib.server().users_count(), 1, "clients[] → 1 user");
+    }
+
+    /// ss2022 多用户：`users[]`（无 address → multi，Go shadowsocks.go:130）。
+    #[test]
+    fn parse_ss2022_inbound_config_users_alias_multi() {
+        // 16 字节 PSK 的标准 base64（aes-128-gcm PSK 长度要求）。
+        let psk = "EREREREREREREREREREREA==";
+        let json = format!(
+            r#"{{"method":"2022-blake3-aes-128-gcm","password":"{psk}",
+                "users":[{{"password":"{psk}","email":"a@x"}},
+                         {{"password":"{psk}","email":"b@x","level":2}}]}}"#
+        );
+        let mode = super::parse_ss_inbound_config(json.as_bytes()).unwrap();
+        let SsInboundMode::Ss2022Multi(multi) = &mode else {
+            panic!("users[] without address should build multi-user inbound");
+        };
+        assert_eq!(multi.users_count(), 2);
+        // clients 旧名回退
+        let json = format!(
+            r#"{{"method":"2022-blake3-aes-128-gcm","password":"{psk}",
+                "clients":[{{"password":"{psk}","email":"a@x"}}]}}"#
+        );
+        let mode = super::parse_ss_inbound_config(json.as_bytes()).unwrap();
+        let SsInboundMode::Ss2022Multi(multi) = &mode else {
+            panic!("clients[] fallback should build multi-user inbound");
+        };
+        assert_eq!(multi.users_count(), 1);
+    }
+
+    /// ss2022 中继 Go 形：`users[0].address` 非空 → relay（Go shadowsocks.go:130），
+    /// address/port 主键 + server/server_port 旧名回退；`destinations[]` 旧形保持兼容。
+    #[test]
+    fn parse_ss2022_inbound_config_go_relay_users_address() {
+        use xray_common::net::address::Address;
+        let psk = "EREREREREREREREREREREA==";
+        // Go 形：users[].address/port
+        let json = format!(
+            r#"{{"method":"2022-blake3-aes-128-gcm","password":"{psk}",
+                "users":[{{"password":"{psk}","address":"10.0.0.1","port":8388,"email":"r1"}},
+                         {{"password":"{psk}","address":"relay.example.com","port":9}}]}}"#
+        );
+        let mode = super::parse_ss_inbound_config(json.as_bytes()).unwrap();
+        let SsInboundMode::Ss2022Relay(relay) = &mode else {
+            panic!("users[0].address should detect relay mode");
+        };
+        assert_eq!(relay.destinations_count(), 2);
+
+        // 旧名回退：users[] 带 server/server_port 也判 relay（键回退，判定仍看 address）
+        let json = format!(
+            r#"{{"method":"2022-blake3-aes-128-gcm","password":"{psk}",
+                "users":[{{"password":"{psk}","address":"10.0.0.2","server_port":8388}}]}}"#
+        );
+        let mode = super::parse_ss_inbound_config(json.as_bytes()).unwrap();
+        assert!(matches!(mode, SsInboundMode::Ss2022Relay(_)));
+
+        // Rust 旧形：destinations[] → relay（既有行为不回归）
+        let json = format!(
+            r#"{{"method":"2022-blake3-aes-128-gcm","password":"{psk}",
+                "destinations":[{{"password":"{psk}","server":"10.0.0.3","server_port":8388}}]}}"#
+        );
+        let mode = super::parse_ss_inbound_config(json.as_bytes()).unwrap();
+        let SsInboundMode::Ss2022Relay(relay) = &mode else {
+            panic!("destinations[] legacy form should stay relay");
+        };
+        assert_eq!(relay.destinations_count(), 1);
+        let _ = Address::Domain(String::new()); // 类型锚定
+    }
+
+    /// ss2022：users[] 无 address 时绝不误判 relay（回归防护）。
+    #[test]
+    fn parse_ss2022_inbound_config_users_without_address_stays_multi() {
+        let psk = "EREREREREREREREREREREA==";
+        let json = format!(
+            r#"{{"method":"2022-blake3-aes-128-gcm","password":"{psk}",
+                "users":[{{"password":"{psk}","port":8388}}]}}"#
+        );
+        let mode = super::parse_ss_inbound_config(json.as_bytes()).unwrap();
+        assert!(matches!(mode, SsInboundMode::Ss2022Multi(_)));
+    }
+
     /// b2e：SS Legacy UDP relay 经 dispatcher（UdpDispatchSession）。
     ///
     /// MarkerUdpDispatch 只有经 dispatch link 才能回标记帧，raw 直连路径
@@ -3629,13 +4146,15 @@ mod tests {
     /// b2e：dokodemo UDP inbound 经 dispatcher（固定 dest）。
     #[tokio::test]
     async fn dokodemo_udp_dispatch_roundtrip() {
-        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let local = udp.local_addr().unwrap();
+        let hub = xray_transport::udp::hub::UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], None)
+            .await
+            .unwrap();
+        let local = hub.local_addr().unwrap();
         let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
             Arc::new(MarkerUdpDispatch { marker: b"dokodemo-via-dispatch" });
         let dest = Destination::udp(Address::IPv4(std::net::Ipv4Addr::new(8, 8, 8, 8)), Port::new(53));
         tokio::spawn(async move {
-            let _ = serve_dokodemo_udp(udp, handler, dest).await;
+            let _ = serve_dokodemo_udp_on(hub, handler, Some(dest)).await;
         });
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -3651,12 +4170,80 @@ mod tests {
         assert_eq!(&rbuf[..n], b"dokodemo-via-dispatch");
     }
 
+    /// per-peer：每个 peer 的 dispatch 会话各自回发标记帧——两个客户端并发，
+    /// 各自只收到自己会话的响应（旧单 session+last_peer 模型下两客户端共享
+    /// 一个 dispatch，只会出现同一个标记 / 回包串扰）。
+    #[derive(Debug)]
+    struct CounterUdpDispatch {
+        counter: std::sync::atomic::AtomicU32,
+    }
+
+    impl xray_app_dispatcher::DispatchHandler for CounterUdpDispatch {
+        fn tag(&self) -> &str {
+            "counter-udp-dispatch"
+        }
+
+        fn dispatch(
+            &self,
+            dest: &Destination,
+            link: Link,
+        ) -> xray_app_dispatcher::default::PinFuture<()> {
+            let n = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let marker = format!("peer-{n}");
+            let source = Destination::udp(dest.address().clone(), dest.port());
+            Box::pin(async move {
+                let Link { mut writer, .. } = link;
+                let mut frame = Vec::with_capacity(marker.len() + 64);
+                let mut pw = xray_xudp::packet::PacketWriter::new(&mut frame, source, [0u8; 8]);
+                let _ = pw.write_packet(marker.as_bytes());
+                drop(pw);
+                let mut mb = xray_buf::multi::MultiBuffer::new();
+                mb.merge_bytes(&frame);
+                let _ = writer.write_multi_buffer(mb).await;
+            })
+        }
+    }
+    #[tokio::test]
+    async fn dokodemo_udp_per_peer_sessions_no_cross_delivery() {
+        let hub = xray_transport::udp::hub::UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], None)
+            .await
+            .unwrap();
+        let local = hub.local_addr().unwrap();
+        let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> = Arc::new(CounterUdpDispatch {
+            counter: std::sync::atomic::AtomicU32::new(0),
+        });
+        let dest = Destination::udp(Address::IPv4(std::net::Ipv4Addr::new(8, 8, 8, 8)), Port::new(53));
+        tokio::spawn(async move {
+            let _ = serve_dokodemo_udp_on(hub, handler, Some(dest)).await;
+        });
+
+        let client_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client_a.send_to(b"from-a", local).await.unwrap();
+        client_b.send_to(b"from-b", local).await.unwrap();
+
+        async fn recv_marker(sock: &UdpSocket) -> String {
+            let mut rbuf = [0u8; 1500];
+            let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(5), sock.recv_from(&mut rbuf))
+                .await
+                .expect("per-peer response within 5s")
+                .unwrap();
+            String::from_utf8_lossy(&rbuf[..n]).into_owned()
+        }
+        let (ma, mb) = tokio::join!(recv_marker(&client_a), recv_marker(&client_b));
+
+        // 恰好两个会话各发各的标记：集合为 {peer-0, peer-1} 且互不相同
+        // （共享单 session 模型只会产出同一个标记，且可能串投）。
+        let mut markers = vec![ma.as_str(), mb.as_str()];
+        markers.sort_unstable();
+        assert_eq!(markers, vec!["peer-0", "peer-1"], "each peer must get its own session marker");
+    }
     fn tcp_opts() -> super::DokodemoTcpOptions {
         super::DokodemoTcpOptions {
-            dest: Destination::tcp(
+            dest: Some(Destination::tcp(
                 Address::IPv4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
                 Port::new(80),
-            ),
+            )),
             port_map: HashMap::new(),
             follow_redirect: false,
             tls: None,
@@ -3668,8 +4255,8 @@ mod tests {
         let mut opts = tcp_opts();
         opts.port_map
             .insert("80".to_string(), "192.168.99.1:9090".to_string());
-        let dest =
-            super::resolve_dokodemo_tcp_dest(&opts, Some(80), None, None);
+        let dest = super::resolve_dokodemo_tcp_dest(&opts, None, Some(80), None, None)
+            .unwrap();
         assert_eq!(dest.port().value(), 9090);
         match dest.address() {
             Address::IPv4(v4) => assert_eq!(v4.octets(), [192, 168, 99, 1]),
@@ -3681,8 +4268,8 @@ mod tests {
     fn resolve_dokodemo_port_map_port_only_keeps_address() {
         let mut opts = tcp_opts();
         opts.port_map.insert("80".to_string(), ":5353".to_string());
-        let dest =
-            super::resolve_dokodemo_tcp_dest(&opts, Some(80), None, None);
+        let dest = super::resolve_dokodemo_tcp_dest(&opts, None, Some(80), None, None)
+            .unwrap();
         assert_eq!(dest.port().value(), 5353);
         match dest.address() {
             Address::IPv4(v4) => assert_eq!(v4.octets(), [10, 0, 0, 1]),
@@ -3695,8 +4282,8 @@ mod tests {
         let mut opts = tcp_opts();
         opts.port_map
             .insert("80".to_string(), "example.org:".to_string());
-        let dest =
-            super::resolve_dokodemo_tcp_dest(&opts, Some(80), None, None);
+        let dest = super::resolve_dokodemo_tcp_dest(&opts, None, Some(80), None, None)
+            .unwrap();
         assert_eq!(dest.port().value(), 80);
         match dest.address() {
             Address::Domain(d) => assert_eq!(d, "example.org"),
@@ -3709,8 +4296,8 @@ mod tests {
         let mut opts = tcp_opts();
         opts.port_map
             .insert("443".to_string(), "192.168.99.1:9090".to_string());
-        let dest =
-            super::resolve_dokodemo_tcp_dest(&opts, Some(80), None, None);
+        let dest = super::resolve_dokodemo_tcp_dest(&opts, None, Some(80), None, None)
+            .unwrap();
         assert_eq!(dest.port().value(), 80);
         match dest.address() {
             Address::IPv4(v4) => assert_eq!(v4.octets(), [10, 0, 0, 1]),
@@ -3724,10 +4311,12 @@ mod tests {
         opts.follow_redirect = true;
         let dest = super::resolve_dokodemo_tcp_dest(
             &opts,
+            None,
             Some(80),
             None,
             Some("sni.example.com"),
-        );
+        )
+        .unwrap();
         assert_eq!(dest.port().value(), 80, "SNI 只覆盖 address，port 保持");
         match dest.address() {
             Address::Domain(d) => assert_eq!(d, "sni.example.com"),
@@ -3742,10 +4331,12 @@ mod tests {
         let orig: SocketAddr = "203.0.113.7:4433".parse().unwrap();
         let dest = super::resolve_dokodemo_tcp_dest(
             &opts,
+            None,
             Some(80),
             Some(orig),
             Some("sni.example.com"),
-        );
+        )
+        .unwrap();
         assert_eq!(dest.port().value(), 4433);
         match dest.address() {
             Address::IPv4(v4) => assert_eq!(v4.octets(), [203, 0, 113, 7]),
@@ -3758,8 +4349,8 @@ mod tests {
         // 非 Linux / 非 REDIRECT 连接：无 original_dst、无 TLS → predefined
         let mut opts = tcp_opts();
         opts.follow_redirect = true;
-        let dest =
-            super::resolve_dokodemo_tcp_dest(&opts, Some(80), None, None);
+        let dest = super::resolve_dokodemo_tcp_dest(&opts, None, Some(80), None, None)
+            .unwrap();
         assert_eq!(dest.port().value(), 80);
         match dest.address() {
             Address::IPv4(v4) => assert_eq!(v4.octets(), [10, 0, 0, 1]),
@@ -3774,14 +4365,72 @@ mod tests {
         opts.follow_redirect = true;
         opts.port_map
             .insert("80".to_string(), "192.168.99.1:9090".to_string());
-        let dest =
-            super::resolve_dokodemo_tcp_dest(&opts, Some(80), None, None);
+        let dest = super::resolve_dokodemo_tcp_dest(&opts, None, Some(80), None, None)
+            .unwrap();
         assert_eq!(dest.port().value(), 80);
         match dest.address() {
             Address::IPv4(v4) => assert_eq!(v4.octets(), [10, 0, 0, 1]),
             other => panic!("expected predefined IPv4, got {other:?}"),
         }
     }
+
+    /// dokodemo settings：address/port 可选（Go rewriteAddress/rewritePort 独立可选）。
+    #[test]
+    fn parse_dokodemo_settings_address_port_optional() {
+        // 全缺 → dest None（followRedirect 透明代理形态）
+        let s = super::parse_dokodemo_settings(br#"{"followRedirect":true}"#).unwrap();
+        assert!(s.dest.is_none(), "no address/port → dest None");
+        assert!(s.follow_redirect);
+        // 只给 address → port=0（serve 侧回填本地端口）
+        let s = super::parse_dokodemo_settings(br#"{"address":"10.1.2.3"}"#).unwrap();
+        let d = s.dest.expect("address-only should build dest");
+        assert_eq!(d.port().value(), 0);
+        // address+port 齐全（既有形态不回归）
+        let s = super::parse_dokodemo_settings(br#"{"address":"example.com","port":443}"#).unwrap();
+        let d = s.dest.expect("full form should build dest");
+        assert_eq!(d.port().value(), 443);
+        assert!(matches!(d.address(), Address::Domain(_)));
+    }
+
+    /// 非 follow_redirect 且无 predefined：回填本机回环 + 本地端口（Go dokodemo.go:86-100）。
+    #[test]
+    fn resolve_dokodemo_backfills_loopback_when_no_predefined() {
+        let mut opts = tcp_opts();
+        opts.dest = None;
+        let dest = super::resolve_dokodemo_tcp_dest(
+            &opts,
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            Some(1080),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(dest.port().value(), 1080, "port 回填本地监听端口");
+        match dest.address() {
+            Address::IPv4(v4) => assert_eq!(v4.octets(), [127, 0, 0, 1]),
+            other => panic!("expected loopback IPv4, got {other:?}"),
+        }
+        // v6 监听 → ::1
+        let dest = super::resolve_dokodemo_tcp_dest(
+            &opts,
+            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
+            Some(1080),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(dest.address(), Address::IPv6(_)));
+    }
+
+    /// follow_redirect 且 original/SNI/rewrite 皆缺 → None（无有效目标，跳过 dispatch）。
+    #[test]
+    fn resolve_dokodemo_follow_redirect_without_any_target_returns_none() {
+        let mut opts = tcp_opts();
+        opts.dest = None;
+        opts.follow_redirect = true;
+        assert!(super::resolve_dokodemo_tcp_dest(&opts, None, Some(80), None, None).is_none());
+    }
+
 
     #[test]
     fn parse_dokodemo_settings_port_map() {
@@ -3912,10 +4561,10 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let opts = DokodemoTcpOptions {
-            dest: Destination::tcp(
+            dest: Some(Destination::tcp(
                 Address::IPv4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
                 Port::new(80),
-            ),
+            )),
             port_map: [(port.to_string(), "192.168.99.1:9090".to_string())]
                 .into_iter()
                 .collect(),
@@ -4022,10 +4671,10 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let opts = DokodemoTcpOptions {
-            dest: Destination::tcp(
+            dest: Some(Destination::tcp(
                 Address::IPv4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
                 Port::new(80),
-            ),
+            )),
             port_map: HashMap::new(),
             follow_redirect: true,
             tls: Some(tls),
@@ -4075,10 +4724,10 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let opts = DokodemoTcpOptions {
-            dest: Destination::tcp(
+            dest: Some(Destination::tcp(
                 Address::IPv4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
                 Port::new(443),
-            ),
+            )),
             port_map: HashMap::new(),
             follow_redirect: true,
             tls: None,
@@ -4213,6 +4862,56 @@ mod tests {
         assert!(users.contains_key(&expected_user.key_hash()));
     }
 
+    /// Go trojan.go:154-155 + 188-190：dest 数字 N → "localhost:N"，type 缺省推导 tcp。
+    #[test]
+    fn build_trojan_fallbacks_numeric_dest_becomes_localhost() {
+        let settings = serde_json::json!({
+            "fallbacks": [{ "dest": 8080 }]
+        });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let policy = super::build_trojan_fallbacks(&data).unwrap().expect("one fallback");
+        let fb = policy.decide("", "", "").expect("wildcard fallback");
+        assert_eq!(fb.dest, "localhost:8080");
+        assert_eq!(fb.r#type, "tcp");
+    }
+
+    /// Go trojan.go:196-198：dest 缺失且 type 缺省 → 报错（不再回退 127.0.0.1:80）。
+    #[test]
+    fn build_trojan_fallbacks_missing_dest_is_error() {
+        let settings = serde_json::json!({ "fallbacks": [{ "name": "sni" }] });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let err = super::build_trojan_fallbacks(&data).unwrap_err();
+        assert!(err.to_string().contains("dest"), "error should mention dest: {err}");
+    }
+
+    /// Go trojan.go:191-193：host:port 字符串 → type tcp；既有行为不回归。
+    #[test]
+    fn build_trojan_fallbacks_host_port_dest_derives_tcp() {
+        let settings = serde_json::json!({
+            "fallbacks": [{ "dest": "127.0.0.1:8080", "xver": 1 }]
+        });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let policy = super::build_trojan_fallbacks(&data).unwrap().expect("one fallback");
+        let fb = policy.decide("", "", "").expect("wildcard fallback");
+        assert_eq!(fb.dest, "127.0.0.1:8080");
+        assert_eq!(fb.r#type, "tcp");
+        assert_eq!(fb.xver, 1);
+    }
+
+    /// Go trojan.go:180-186：`@@` 前缀 + type 缺省 → unix + 抽象套接字 padding。
+    #[test]
+    fn build_trojan_fallbacks_abstract_unix_dest_derives_unix() {
+        let settings = serde_json::json!({
+            "fallbacks": [{ "dest": "@@haproxy" }]
+        });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let policy = super::build_trojan_fallbacks(&data).unwrap().expect("one fallback");
+        let fb = policy.decide("", "", "").expect("wildcard fallback");
+        assert_eq!(fb.r#type, "unix");
+        #[cfg(unix)]
+        assert!(fb.dest.starts_with('\0'), "abstract socket should be NUL-padded");
+    }
+
     /// Go infra/conf/trojan.go:182-186：fallback.dest 以 `@@` 开头（unix）→ 108 字节 NUL padding。
     /// 非 unix 平台（包括 Windows）→ 原样返回。
     #[test]
@@ -4322,6 +5021,34 @@ mod tests {
         assert!(cfg.accounts.is_empty());
     }
 
+    /// `users` 主键（Go http.go:26）+ `accounts` 旧名回退 + 双键并存 users 优先。
+    #[test]
+    fn parse_http_config_users_alias_and_priority() {
+        let data = serde_json::json!({
+            "users": [{ "user": "alice", "pass": "p1" }]
+        });
+        let cfg = super::parse_http_config(&serde_json::to_vec(&data).unwrap()).unwrap();
+        assert!(cfg.has_account("alice", "p1"), "users[] should populate accounts");
+
+        // clients…不对，http 的旧键是 accounts：只给 accounts 仍解析（兼容）
+        let data = serde_json::json!({
+            "accounts": [{ "user": "bob", "pass": "p2" }]
+        });
+        // http 的旧键是 accounts：只给 accounts 仍解析（兼容）
+        let cfg = super::parse_http_config(&serde_json::to_vec(&data).unwrap()).unwrap();
+        assert!(cfg.has_account("bob", "p2"), "accounts[] fallback should still work");
+
+        // 双键并存：users 优先（任务规定模式；Go 单键场景不受影响）
+        let data = serde_json::json!({
+            "users": [{ "user": "winner", "pass": "wp" }],
+            "accounts": [{ "user": "loser", "pass": "lp" }]
+        });
+        let cfg = super::parse_http_config(&serde_json::to_vec(&data).unwrap()).unwrap();
+        assert!(cfg.has_account("winner", "wp"), "users takes priority");
+        assert!(!cfg.has_account("loser", "lp"), "accounts ignored when users present");
+    }
+
+
     #[test]
     fn parse_http_config_transparent_and_user_level() {
         // 键名/零值默认对齐 Go infra/conf/http.go:28-29（Transparent json:"allowTransparent"、UserLevel json:"userLevel"）。
@@ -4347,7 +5074,7 @@ mod tests {
     fn parse_dokodemo_dest_ipv4() {
         let settings = serde_json::json!({ "address": "192.168.1.1", "port": 8080 });
         let data = serde_json::to_vec(&settings).unwrap();
-        let dest = super::parse_dokodemo_dest(&data).unwrap();
+        let dest = super::parse_dokodemo_settings(&data).unwrap().dest.unwrap();
         assert!(matches!(dest.address(), Address::IPv4(_)));
         assert_eq!(dest.port().value(), 8080);
     }
@@ -4356,23 +5083,28 @@ mod tests {
     fn parse_dokodemo_dest_domain() {
         let settings = serde_json::json!({ "address": "example.com", "port": 443 });
         let data = serde_json::to_vec(&settings).unwrap();
-        let dest = super::parse_dokodemo_dest(&data).unwrap();
+        let dest = super::parse_dokodemo_settings(&data).unwrap().dest.unwrap();
         assert!(matches!(dest.address(), Address::Domain(_)));
         assert_eq!(dest.port().value(), 443);
     }
 
+    /// Go parity：只给 port（缺 address）→ dest None（rewrite 缺省回填在 serve 侧）。
     #[test]
-    fn parse_dokodemo_dest_missing_address_returns_err() {
+    fn parse_dokodemo_port_only_dest_none() {
         let settings = serde_json::json!({ "port": 80 });
         let data = serde_json::to_vec(&settings).unwrap();
-        assert!(super::parse_dokodemo_dest(&data).is_err());
+        let s = super::parse_dokodemo_settings(&data).unwrap();
+        assert!(s.dest.is_none());
     }
 
+    /// Go parity：只给 address → dest Some 且 port=0（serve 侧回填本地端口）。
     #[test]
-    fn parse_dokodemo_dest_missing_port_returns_err() {
+    fn parse_dokodemo_address_only_port_zero() {
         let settings = serde_json::json!({ "address": "1.2.3.4" });
         let data = serde_json::to_vec(&settings).unwrap();
-        assert!(super::parse_dokodemo_dest(&data).is_err());
+        let s = super::parse_dokodemo_settings(&data).unwrap();
+        let d = s.dest.expect("address-only should build dest");
+        assert_eq!(d.port().value(), 0);
     }
 
     #[test]
@@ -4383,7 +5115,7 @@ mod tests {
         assert!(s.allow_tcp);
         assert!(!s.allow_udp);
         assert!(!s.follow_redirect);
-        assert!(s.dest.is_tcp());
+        assert!(s.dest.as_ref().unwrap().is_tcp());
     }
 
     #[test]
@@ -4393,7 +5125,7 @@ mod tests {
         let s = super::parse_dokodemo_settings(&data).unwrap();
         assert!(!s.allow_tcp);
         assert!(s.allow_udp);
-        assert!(s.dest.is_udp());
+        assert!(s.dest.as_ref().unwrap().is_udp());
     }
 
     #[test]

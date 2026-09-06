@@ -221,14 +221,24 @@ impl AsyncRead for TrojanUdpFramedConn {
         loop {
             // 缓冲里有完整帧 → 剥帧返回 payload
             if !self.rbuf.is_empty() {
-                let parsed = crate::protocol::parse_udp_packet(&self.rbuf);
-                if let Ok((_addr, _port, payload, consumed)) = parsed {
-                    let n = payload.len().min(buf.remaining());
-                    buf.put_slice(&payload[..n]);
-                    // 剩余 payload（buf 满时截断的部分）保留在缓冲头部
-                    let keep_from = consumed - payload.len() + n;
-                    self.rbuf.drain(..keep_from);
-                    return Poll::Ready(Ok(()));
+                match crate::protocol::parse_udp_packet_stream(&self.rbuf) {
+                    Ok(Some((_addr, _port, payload, consumed))) => {
+                        let n = payload.len().min(buf.remaining());
+                        buf.put_slice(&payload[..n]);
+                        // 剩余 payload（buf 满时截断的部分）保留在缓冲头部
+                        let keep_from = consumed - payload.len() + n;
+                        self.rbuf.drain(..keep_from);
+                        return Poll::Ready(Ok(()));
+                    }
+                    Ok(None) => {} // 数据不足一帧，继续从 inner 读
+                    // 致命帧错误（ATYP 非法 / payload 超限）→ 终止会话；
+                    // 对齐入站 server.rs UDP relay fatal 分支与 Go PacketReader
+                    Err(e) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("trojan udp: parse frame: {e}"),
+                        )));
+                    }
                 }
             }
             // 缓冲不足一帧 → 从 inner 再读
@@ -327,5 +337,27 @@ mod tests {
         let mut out = vec![0u8; 128];
         let rn = framed.read(&mut out).await.unwrap();
         assert_eq!(&out[..rn], b"answer-payload");
+    }
+
+    /// 致命帧（ATYP 非法）→ read 返回 Err 终止会话，而非静默吞错挂死
+    /// （对齐入站 server.rs UDP relay fatal 分支；修复前坏帧滞留 rbuf 被无限重读）。
+    #[tokio::test]
+    async fn udp_framed_conn_fatal_frame_terminates() {
+        let (client_side, mut server_side) = tokio::io::duplex(4096);
+        let mut framed = TrojanUdpFramedConn::new(
+            Box::new(xray_transport::connection::DuplexConnection::new(client_side)),
+            Address::from_ipv4_bytes([8, 8, 8, 8]),
+            53,
+        );
+
+        // 非法 ATYP 0xFF：parse_udp_packet_stream 判致命错误（InsufficientData 才算不足）
+        server_side.write_all(&[0xFF]).await.unwrap();
+
+        let mut out = [0u8; 16];
+        let result = framed.read(&mut out).await;
+        assert!(
+            result.is_err(),
+            "fatal frame must terminate the session, got {result:?}"
+        );
     }
 }

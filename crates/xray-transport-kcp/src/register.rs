@@ -94,7 +94,7 @@ async fn listen_kcp(
     let bridge: Arc<dyn KcpConnHandler> = Arc::new(UpstreamConnBridge(handler));
 
     // 4. 创建 KCP Listener
-    let listener = Arc::new(Listener::new(hub, reader, Arc::new(config), bridge));
+    let listener = Listener::new(hub, reader, Arc::new(config), bridge);
 
     // 5. spawn UDP recv loop（阻塞读 hub，分发到 KCP sessions）
     let listener_clone = Arc::clone(&listener);

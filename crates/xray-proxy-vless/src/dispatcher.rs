@@ -13,9 +13,14 @@
 //! [`DialFn`]: xray_app_dispatcher::default::DialFn
 //! [`Connection`]: xray_transport::connection::Connection
 
+use std::future::Future;
+use std::io;
+use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
-
-use tokio::io::AsyncWriteExt;
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use crate::encryption::vision_conn::VisionConn;
 use xray_app_dispatcher::default::DialFn;
 use xray_common::net::address::Address;
@@ -130,110 +135,266 @@ impl VlessOutboundConfig {
     }
 }
 
+/// ENC 握手（含拨号后全部缓存操作）总超时，对齐 Go SessionDefault
+/// Handshake=60s（infra/conf/policy.go:130）。服务端黑洞（accept 后不读不回）
+/// 时 handshake 内 read_exact 永久 Pending，60s 后本条拨号报错回收，不悬挂。
+const ENC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+type EstablishFn =
+    Arc<dyn Fn(&Destination) -> Pin<Box<dyn Future<Output = Result<Box<dyn Connection>, String>> + Send>>
+        + Send
+        + Sync>;
 
 /// 构造 VLESS 的 DialFn 闭包。
 ///
 /// 闭包捕获 `Arc<VlessOutboundConfig>`，每次调用：
-/// 1. dial_system 到 VLESS 服务器 → `Box<dyn Connection>`
-/// 2. `encode_request_header` 写 VLESS 头（含目标地址）到连接
-/// 3. 返回连接（已是带 VLESS 头的 TCP，后续双向透传）
+/// 1. dial 到 VLESS 服务器 → `Box<dyn Connection>`
+/// 2. （配置 ENC 时）`ClientInstance::handshake` 包装为加密连接
+/// 3. `encode_request_header` 写 VLESS 头（含目标地址）
+/// 4. ENC 配置下再包一层 [`EncRetryConn`]：0-RTT 票据失效自动重拨一次
 ///
 /// # Panics
 ///
 /// 不会 panic；任何错误以 `Err(String)` 返回。
 pub fn make_dial_fn(config: Arc<VlessOutboundConfig>) -> DialFn {
+    make_dial_fn_with_handshake_timeout(config, ENC_HANDSHAKE_TIMEOUT)
+}
+
+/// 显式指定 ENC 握手超时（测试注入短超时；生产走 [`make_dial_fn`] 的 60s 缺省）。
+pub fn make_dial_fn_with_handshake_timeout(
+    config: Arc<VlessOutboundConfig>,
+    handshake_timeout: Duration,
+) -> DialFn {
     // ENC 客户端实例 Handler 级共享（对齐 Go outbound.go:94 `handler.encryption`
-    // 是 Handler 字段）：跨连接持有 0-RTT pfs_key/ticket/expire 缓存，0-RTT 快路径
-    // 依赖第二连能读到第一连写入的缓存。tokio Mutex：handshake(&mut self) 跨 await。
-    let enc_client: Option<Arc<tokio::sync::Mutex<crate::encryption::ClientInstance>>> =
+    // 是 Handler 字段）：跨连接持有 0-RTT pfs_key/ticket/expire 缓存。缓存本身
+    // 是内部 parking_lot RwLock（读写均瞬时），handshake(&self) 锁内无 IO——
+    // 对齐 Go client.go 锁粒度（RWMutex 只在读写缓存瞬间持有），无外层互斥。
+    let enc_client: Option<Arc<crate::encryption::ClientInstance>> =
         config.enc_params.as_ref().map(|enc| {
             use crate::encryption::ClientInstance;
             let mut client = ClientInstance::new();
             // init 仅在 padding 解析失败时出错；ClientEncParams 已按 Go 规则校验
             // 格式。失败时 keys 为空 → 后续 handshake 显式报 "no nfs_pkeys initialized"。
             let _ = client.init(enc.keys.clone(), enc.xor_mode, enc.seconds, &enc.padding);
-            Arc::new(tokio::sync::Mutex::new(client))
+            Arc::new(client)
         });
-    Arc::new(move |dest: &Destination| {
+    let establish: EstablishFn = {
         let config = Arc::clone(&config);
-        let enc_client = enc_client.clone();
-        let target_addr = dest.address().clone();
-        let target_port = dest.port();
+        Arc::new(move |dest: &Destination| {
+            let config = Arc::clone(&config);
+            let enc_client = enc_client.clone();
+            let target_addr = dest.address().clone();
+            let target_port = dest.port();
+            Box::pin(async move {
+                establish_conn(
+                    config,
+                    enc_client,
+                    target_addr,
+                    target_port,
+                    handshake_timeout,
+                )
+                .await
+            })
+        })
+    };
+    if config.enc_params.is_none() {
+        // 无 ENC：不存在票据失效路径，直接返回（不包重试层）。
+        return Arc::new(move |dest: &Destination| establish(dest));
+    }
+    Arc::new(move |dest: &Destination| {
+        let establish = Arc::clone(&establish);
+        let dest = dest.clone();
         Box::pin(async move {
-            // 1. dial VLESS server：有 streamSettings 走 transport dialer（ws/grpc/...），否则裸 TCP。
-            let server_dest = config.server_destination();
-            let sockopt = config.stream_settings.as_ref().map(|s| s.socket_options()).unwrap_or_default();
-            let mut conn: Box<dyn Connection> = match &config.stream_settings {
-                Some(s) => dial(&server_dest, s, &sockopt)
-                    .await
-                    .map_err(|e| format!("vless dial server ({}): {e}", s.protocol))?,
-                None => xray_transport::system_dialer::dial_system(&server_dest, &sockopt)
-                    .await
-                    .map_err(|e| format!("vless dial server (tcp): {e}"))?,
-            };
-
-            // 2a. VLESS ENC 握手（仅当 config.enc_params 已注入时执行）。
-            //     对齐 Go `proxy/vless/outbound/outbound.go:211-216`：
-            //     dial 之后、写请求头之前执行 `h.encryption.Handshake(conn)`，
-            //     用加密层 (CommonConn/XorConn) 包装原始连接。后续请求头、
-            //     响应头、payload 全部走加密层 AEAD 帧。
-            //     缺这一段 → 服务端 h.decryption.Handshake 在裸 VLESS 头字节上
-            if let Some(client) = enc_client {
-                let mut client = client.lock().await;
-                let enc_conn = client
-                    .handshake(conn)
-                    .await
-                    .map_err(|e| format!("vless enc handshake: {e}"))?;
-                conn = Box::new(crate::encryption::EncConnectionAdapter::new(enc_conn));
-            }
-
-            // 2. 写 VLESS 请求头（version + uuid + addons + command + target addr/port）
-            // addons.flow 从 config 取（bd vxk）：flow=xtls-rprx-vision 时服务端启用 Vision。
-            let mut addons = empty_addons();
-            addons.flow = config.flow.clone();
-            encode_request_header(
-                &mut conn,
-                VERSION,
-                &config.user_uuid,
-                VlessCommand::Tcp,
-                Some(&target_addr),
-                Some(target_port.value()),
-                &addons,
-            )
-            .await
-            .map_err(|e| format!("vless encode header: {e}"))?;
-
-            // 2b. 响应头消费推迟到读路径（对齐 Go postRequest/getResponse 并发时序：
-            //     Go 服务端响应头经 BufferedWriter SetFlushNext 缓冲到首个下行数据
-            //     才 flush；dial 阶段同步等待会让上行首包发不出去 → 双向互等 →
-            //     服务端超时断开。vision 首块 uuid padding 尤甚，见 #9/#15/#32）。
-            conn = Box::new(crate::encoding::client::ResponseHeaderReader::new(conn, VERSION));
-            // 3. flow=xtls-rprx-vision（encryption=none）：请求头写出后即包装
-            //    VisionConn——padding 从业务数据开始（对齐 Go outbound VisionWriter/
-            //    VisionReader 的包装时机，首块 padding 携带本账号 uuid）。
-            //    ENC(mlkem768)+vision 组合走 CommonConn，见 bd 4lf/byo。
-            if config.flow == crate::FLOW_XRV && config.encryption == "none" {
-                let uuid_bytes = config.user_uuid.as_bytes().to_vec();
-                let mut vision = VisionConn::new(conn, uuid_bytes);
-                // Go 行为：postRequest 等 500ms 拿首块 client data,若拿不到就手动
-                // 发一个空 content 的 padding 块（mb[0]=nil → VisionWriter 强制
-                // XtlsPadding(None, CommandPaddingContinue) → 首块只有 uuid + 随机
-                // padding,不带 client data）。Rust bridge 双向并发是立刻有 client
-                // data,如果直接发首块 padding 会把 client data 当 content 一起塞进
-                // uuid 块,导致 server VisionReader 解析失败 → 双向 Alert。
-                // 修复:dispatcher 显式调 write_uuid_only_padding 先发 uuid-only
-                // padding 块,后续 chunk 才进 vision content。
-                vision
-                    .write_uuid_only_padding()
-                    .await
-                    .map_err(|e| format!("vless vision pre-padding: {e}"))?;
-                conn = Box::new(vision);
-            }
-
-            // conn 现在是 "已握手完成的 TCP"，bridge_link_with_stream 直接用
-            Ok(conn)
+            let conn = establish(&dest).await?;
+            Ok(Box::new(EncRetryConn::new(conn, establish, dest)) as Box<dyn Connection>)
         })
     })
+}
+
+/// 建立一条完整 VLESS 出站连接：dial → （可选 ENC 握手，带超时）→ 请求头 →
+/// 响应头消费推迟 → （可选 vision 包装）。
+async fn establish_conn(
+    config: Arc<VlessOutboundConfig>,
+    enc_client: Option<Arc<crate::encryption::ClientInstance>>,
+    target_addr: Address,
+    target_port: Port,
+    handshake_timeout: std::time::Duration,
+) -> Result<Box<dyn Connection>, String> {
+    // 1. dial VLESS server：有 streamSettings 走 transport dialer（ws/grpc/...），否则裸 TCP。
+    let server_dest = config.server_destination();
+    let sockopt = config
+        .stream_settings
+        .as_ref()
+        .map(|s| s.socket_options())
+        .unwrap_or_default();
+    let mut conn: Box<dyn Connection> = match &config.stream_settings {
+        Some(s) => dial(&server_dest, s, &sockopt)
+            .await
+            .map_err(|e| format!("vless dial server ({}): {e}", s.protocol))?,
+        None => xray_transport::system_dialer::dial_system(&server_dest, &sockopt)
+            .await
+            .map_err(|e| format!("vless dial server (tcp): {e}"))?,
+    };
+
+    // 2a. VLESS ENC 握手（仅当 config.enc_params 已注入时执行）。
+    //     对齐 Go `proxy/vless/outbound/outbound.go:211-216`：dial 之后、写请求头
+    //     之前执行 `h.encryption.Handshake(conn)`，用加密层 (CommonConn/XorConn)
+    //     包装原始连接。timeout 包裹全程：服务端黑洞（accept 后不回握手响应）
+    //     时本条拨号超时报错，连接不悬挂。
+    if let Some(client) = enc_client {
+        let enc_conn = match tokio::time::timeout(handshake_timeout, client.handshake(conn)).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => return Err(format!("vless enc handshake: {e}")),
+            Err(_) => {
+                return Err(format!(
+                    "vless enc handshake timeout after {handshake_timeout:?}: server unresponsive"
+                ))
+            }
+        };
+        conn = Box::new(crate::encryption::EncConnectionAdapter::new(enc_conn));
+    }
+
+    // 2. 写 VLESS 请求头（version + uuid + addons + command + target addr/port）
+    // addons.flow 从 config 取（bd vxk）：flow=xtls-rprx-vision 时服务端启用 Vision。
+    let mut addons = empty_addons();
+    addons.flow = config.flow.clone();
+    encode_request_header(
+        &mut conn,
+        VERSION,
+        &config.user_uuid,
+        VlessCommand::Tcp,
+        Some(&target_addr),
+        Some(target_port.value()),
+        &addons,
+    )
+    .await
+    .map_err(|e| format!("vless encode header: {e}"))?;
+
+    // 2b. 响应头消费推迟到读路径（对齐 Go postRequest/getResponse 并发时序：
+    //     Go 服务端响应头经 BufferedWriter SetFlushNext 缓冲到首个下行数据
+    //     才 flush；dial 阶段同步等待会让上行首包发不出去 → 双向互等 →
+    //     服务端超时断开。vision 首块 uuid padding 尤甚，见 #9/#15/#32）。
+    conn = Box::new(crate::encoding::client::ResponseHeaderReader::new(conn, VERSION));
+    // 3. flow=xtls-rprx-vision（encryption=none）：请求头写出后即包装
+    //    VisionConn——padding 从业务数据开始（对齐 Go outbound VisionWriter/
+    //    VisionReader 的包装时机，首块 padding 携带本账号 uuid）。
+    //    ENC(mlkem768)+vision 组合走 CommonConn，见 bd 4lf/byo。
+    if config.flow == crate::FLOW_XRV && config.encryption == "none" {
+        let uuid_bytes = config.user_uuid.as_bytes().to_vec();
+        let mut vision = VisionConn::new(conn, uuid_bytes);
+        // Go 行为：postRequest 等 500ms 拿首块 client data,若拿不到就手动
+        // 发一个空 content 的 padding 块（mb[0]=nil → VisionWriter 强制
+        // XtlsPadding(None, CommandPaddingContinue) → 首块只有 uuid + 随机
+        // padding,不带 client data）。Rust bridge 双向并发是立刻有 client
+        // data,如果直接发首块 padding 会把 client data 当 content 一起塞进
+        // uuid 块,导致 server VisionReader 解析失败 → 双向 Alert。
+        // 修复:dispatcher 显式调 write_uuid_only_padding 先发 uuid-only
+        // padding 块,后续 chunk 才进 vision content。
+        vision
+            .write_uuid_only_padding()
+            .await
+            .map_err(|e| format!("vless vision pre-padding: {e}"))?;
+        conn = Box::new(vision);
+    }
+
+    // conn 现在是 "已握手完成的 TCP"，bridge_link_with_stream 直接用
+    Ok(conn)
+}
+
+/// 判断错误是否为 0-RTT 票据拒绝（[`crate::encryption::TICKET_REJECTED_MSG`]）。
+fn is_ticket_rejected(e: &io::Error) -> bool {
+    e.to_string().contains(crate::encryption::TICKET_REJECTED_MSG)
+}
+
+/// ENC 0-RTT 票据失效自动恢复连接：首读遇票据拒绝专用错误时，重新执行一次
+/// 完整拨号（新 TCP + 1-RTT 握手 + 新请求头，`establish` 内已由 CommonConn
+/// 清空失效缓存）并重放读。仅失效路径多一次 dial，happy path 零开销。
+/// 写路径不重试：业务写重放有数据完整性风险，失败照旧上抛。
+struct EncRetryConn {
+    inner: Box<dyn Connection>,
+    establish: EstablishFn,
+    dest: Destination,
+    retried: bool,
+    /// Mutex 包装只为 Sync（Connection 要求）：poll 单线程独占，锁无竞争。
+    reconnecting: parking_lot::Mutex<Option<Pin<Box<dyn Future<Output = Result<Box<dyn Connection>, String>> + Send>>>>,
+}
+
+impl EncRetryConn {
+    fn new(inner: Box<dyn Connection>, establish: EstablishFn, dest: Destination) -> Self {
+        Self {
+            inner,
+            establish,
+            dest,
+            retried: false,
+            reconnecting: parking_lot::Mutex::new(None),
+        }
+    }
+}
+
+impl AsyncRead for EncRetryConn {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            {
+                let mut slot = this.reconnecting.lock();
+                if let Some(fut) = slot.as_mut() {
+                    match fut.as_mut().poll(cx) {
+                        Poll::Ready(Ok(conn)) => {
+                            this.inner = conn;
+                            *slot = None;
+                            this.retried = true;
+                        }
+                        Poll::Ready(Err(e)) => {
+                            *slot = None;
+                            this.retried = true;
+                            return Poll::Ready(Err(io::Error::other(format!(
+                                "vless enc retry dial: {e}"
+                            ))));
+                        }
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+            }
+            match Pin::new(&mut *this.inner).poll_read(cx, buf) {
+                Poll::Ready(Err(e)) if !this.retried && is_ticket_rejected(&e) => {
+                    *this.reconnecting.lock() = Some((this.establish)(&this.dest));
+                    continue;
+                }
+                r => return r,
+            }
+        }
+    }
+}
+
+impl AsyncWrite for EncRetryConn {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.get_mut().inner).poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+impl Connection for EncRetryConn {
+    fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+        self.inner.remote_addr()
+    }
+
+    fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+        self.inner.local_addr()
+    }
 }
 
 /// 兼容：直接传 Addons（高级用户可注入 flow）。
@@ -538,5 +699,178 @@ mod tests {
 
         let got = timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
         assert_eq!(got, payload);
+    }
+
+    /// 修复回归用例：ENC 共享实例的锁跨无超时握手 → 服务端黑洞（accept 后
+    /// 不回握手响应）时 outbound 永久挂死。现在握手全程 60s 缺省超时
+    /// （对齐 Go SessionDefault Handshake=60s），此处注入 500ms 短超时验证：
+    /// dial 必须在超时窗口报错返回，而不是悬挂。
+    #[tokio::test]
+    async fn enc_handshake_blackhole_times_out() {
+        use crate::encryption::ClientEncParams;
+        // 黑洞 server：bind 后不 accept、不读、不回
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cfg = Arc::new(
+            VlessOutboundConfig::new(
+                UUID::new(),
+                Address::from_ipv4_bytes([127, 0, 0, 1]),
+                Port::new(addr.port()),
+            )
+            .with_encryption_params(Some(ClientEncParams {
+                keys: vec![vec![0xABu8; 32]],
+                xor_mode: 0,
+                seconds: 600,
+                padding: String::new(),
+            })),
+        );
+        let dial = make_dial_fn_with_handshake_timeout(cfg, Duration::from_millis(500));
+        let dest = Destination::tcp(Address::new_domain("target.example.com"), Port::new(80));
+        let started = std::time::Instant::now();
+        let res = tokio::time::timeout(Duration::from_secs(5), dial(&dest))
+            .await
+            .expect("dial must not hang forever (regression: unbounded handshake)");
+        let msg = match res {
+            Err(msg) => msg,
+            Ok(_) => panic!("black-holed handshake must fail"),
+        };
+        assert!(msg.contains("timeout"), "实际错误: {msg}");
+        assert!(
+            started.elapsed() >= Duration::from_millis(450),
+            "应在握手超时窗口之后失败，实际 {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// [`EncRetryConn`]：首读遇 0-RTT 票据拒绝专用错误 → 自动重拨一次（新握手）
+    /// → 重放读成功；之后再次遇同类错误不再重试（只重试一次）。
+    #[tokio::test]
+    async fn enc_retry_conn_retries_once_on_ticket_rejection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncReadExt as _;
+
+        struct MockErrConn {
+            msg: String,
+        }
+        impl AsyncRead for MockErrConn {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, self.msg.clone())))
+            }
+        }
+        impl AsyncWrite for MockErrConn {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Err(io::Error::other("mock write")))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl Connection for MockErrConn {
+            fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+            fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+        }
+
+        /// 先吐 9B 数据，读尽后报票据拒绝（模拟重连成功后再次失效）。
+        struct MockDataThenErrConn {
+            data: Vec<u8>,
+            pos: usize,
+        }
+        impl AsyncRead for MockDataThenErrConn {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                let this = self.get_mut();
+                if this.pos < this.data.len() {
+                    let n = (this.data.len() - this.pos).min(buf.remaining());
+                    buf.put_slice(&this.data[this.pos..this.pos + n]);
+                    this.pos += n;
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    crate::encryption::TICKET_REJECTED_MSG,
+                )))
+            }
+        }
+        impl AsyncWrite for MockDataThenErrConn {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Err(io::Error::other("mock write")))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl Connection for MockDataThenErrConn {
+            fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+            fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+        }
+
+        let dials = Arc::new(AtomicUsize::new(0));
+        let establish: EstablishFn = {
+            let dials = Arc::clone(&dials);
+            Arc::new(move |_dest: &Destination| {
+                let dials = Arc::clone(&dials);
+                Box::pin(async move {
+                    let n = dials.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        Ok(Box::new(MockErrConn {
+                            msg: crate::encryption::TICKET_REJECTED_MSG.to_string(),
+                        }) as Box<dyn Connection>)
+                    } else {
+                        Ok(Box::new(MockDataThenErrConn {
+                            data: b"recovered".to_vec(),
+                            pos: 0,
+                        }) as Box<dyn Connection>)
+                    }
+                })
+            })
+        };
+        let dest = Destination::tcp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(443));
+        let first = establish(&dest).await.expect("first dial ok");
+        assert_eq!(dials.load(Ordering::SeqCst), 1);
+        let mut rc = EncRetryConn::new(first, Arc::clone(&establish), dest);
+
+        // 首读：BadConn 报票据拒绝 → 自动重拨 → GoodConn 数据重放成功
+        let mut buf = [0u8; 9];
+        rc.read_exact(&mut buf).await.expect("read must recover via retry");
+        assert_eq!(&buf, b"recovered");
+        assert_eq!(dials.load(Ordering::SeqCst), 2, "票据拒绝应恰好重拨一次");
+
+        // 第二次同类错误：retried=true，不再重拨，错误直接上抛
+        let mut buf2 = [0u8; 1];
+        let err = rc
+            .read_exact(&mut buf2)
+            .await
+            .expect_err("second rejection must surface");
+        assert!(is_ticket_rejected(&err));
+        assert_eq!(dials.load(Ordering::SeqCst), 2, "只重试一次");
     }
 }

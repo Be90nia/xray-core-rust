@@ -93,7 +93,7 @@ pub struct UdpHub {
     /// udpmask 包装后的 server 侧 UDP I/O（Go hub.go:71-77 `WrapPacketConnServer`）。
     /// `None` = 无 mask，直接用 raw socket。recv 循环与 `send_to` 均经过此 io。
     io: Option<Arc<dyn crate::finalmask::UdpIo>>,
-    rx: mpsc::Receiver<UdpPacket>,
+    rx: Option<mpsc::Receiver<UdpPacket>>,
     close_notify: Arc<Notify>,
     recv_orig_dest: bool,
 }
@@ -137,13 +137,13 @@ impl UdpHub {
             }
             _ => None,
         };
-        let (tx, rx) = mpsc::channel(builder.capacity);
+        let (tx, rx) = mpsc::channel::<UdpPacket>(builder.capacity);
         let close_notify = Arc::new(Notify::new());
 
         let hub = Self {
             socket: Arc::clone(&socket),
             io: io.clone(),
-            rx,
+            rx: Some(rx),
             close_notify: Arc::clone(&close_notify),
             recv_orig_dest: builder.recv_orig_dest,
         };
@@ -167,11 +167,23 @@ impl UdpHub {
     /// 获取收包 channel receiver。
     ///
     /// 对应 Go `Hub.Receive() <-chan *udp.Packet`。
-    /// 调用后 receiver 所有权转移，只能调用一次。
+    /// 调用后 receiver 所有权转移，只能调用一次；hub 本体被消费
+    /// （`send_to` 等随之不可用）。
     pub fn receive(mut self) -> mpsc::Receiver<UdpPacket> {
         // ponytail: 消费 receiver，让调用方直接 await。
         // 如果需要多次获取，改用 Arc<Mutex<Receiver>> 或 watch channel。
-        self.rx
+        self.rx.take().expect("receive() called twice")
+    }
+
+    /// 拆分 hub：`(收包 receiver, 共享发送端)`。
+    ///
+    /// 与 [`Self::receive`] 的区别：返回的 `Arc<UdpHub>` 保留 `send_to`/
+    /// `local_addr`/`close` 能力——dokodemo UDP relay 等 inbound 需要在
+    /// 收包循环之外向多个 peer 回包，用它把发送端共享给各会话任务
+    /// （同一 socket，响应源端口与监听端口一致）。
+    pub fn split(mut self) -> (mpsc::Receiver<UdpPacket>, Arc<UdpHub>) {
+        let rx = self.rx.take().expect("split() called after receive()");
+        (rx, Arc::new(self))
     }
 
     /// 发送 UDP 包到指定地址。

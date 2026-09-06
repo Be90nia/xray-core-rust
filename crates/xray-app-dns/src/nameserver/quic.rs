@@ -107,6 +107,7 @@ impl DoqNameServer {
             ns.serve_expired_ttl.unwrap_or(0),
             ns.negative_ttl_secs.unwrap_or(0),
         ));
+        cache.start_cleanup_task(crate::cache_controller::CLEANUP_INTERVAL);
         Ok(Box::new(Self::new(
             socket_addr,
             server_name,

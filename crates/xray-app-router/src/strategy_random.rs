@@ -2,8 +2,9 @@
 //!
 //! 翻译自 `app/router/strategy_random.go`。
 //!
-//! 从 selector 选出的 outbounds 中随机取一个。
-//! `fallback_tag` 非空时按 50/50 概率随机选 fallback 或选中 tag。
+//! 从 selector 选出的 outbounds 中均匀随机取一个。空候选返回
+//! `EmptyBalancerResult`，由 Balancer 落 `fallbackTag`（Go `Balancer.PickOutbound`：
+//! fallback 是 Balancer 职责，策略本身不掺 fallback）。
 
 use std::sync::Arc;
 
@@ -16,21 +17,12 @@ use crate::error::RouterError;
 pub struct RandomStrategy {
     selectors: Vec<String>,
     ohm: Arc<dyn OutboundHandlerSelector>,
-    fallback_tag: String,
 }
 
 impl RandomStrategy {
     /// 创建。
-    pub fn new(
-        selectors: Vec<String>,
-        ohm: Arc<dyn OutboundHandlerSelector>,
-        fallback_tag: impl Into<String>,
-    ) -> Self {
-        Self {
-            selectors,
-            ohm,
-            fallback_tag: fallback_tag.into(),
-        }
+    pub fn new(selectors: Vec<String>, ohm: Arc<dyn OutboundHandlerSelector>) -> Self {
+        Self { selectors, ohm }
     }
 }
 
@@ -41,16 +33,7 @@ impl BalancingStrategy for RandomStrategy {
             return Err(RouterError::EmptyBalancerResult);
         }
         let mut rng = rand::rng();
-        let pick = outs.choose(&mut rng).expect("non-empty checked").clone();
-
-        // 与 Go 一致：fallback 非空时按 50/50 跟 fallback 随机
-        if !self.fallback_tag.is_empty() {
-            let coin: bool = rand::random();
-            if coin {
-                return Ok(self.fallback_tag.clone());
-            }
-        }
-        Ok(pick)
+        Ok(outs.choose(&mut rng).expect("non-empty checked").clone())
     }
 }
 
@@ -71,7 +54,6 @@ mod tests {
         let s = RandomStrategy::new(
             vec![].into(),
             Arc::new(FixedSelector(vec!["a".into(), "b".into(), "c".into()])),
-            "",
         );
         let pick = s.pick_outbound().unwrap();
         assert!(pick == "a" || pick == "b" || pick == "c");
@@ -79,31 +61,17 @@ mod tests {
 
     #[test]
     fn test_random_empty_returns_error() {
-        let s = RandomStrategy::new(
-            vec![],
-            Arc::new(FixedSelector(vec![])),
-            "",
-        );
+        let s = RandomStrategy::new(vec![], Arc::new(FixedSelector(vec![])));
         assert!(matches!(s.pick_outbound(), Err(RouterError::EmptyBalancerResult)));
     }
 
     #[test]
-    fn test_random_with_fallback_can_return_either() {
-        // 多次抽样验证 fallback 可能被选中（并非要求 50% 精准，只验逻辑路径）
-        let s = RandomStrategy::new(
-            vec![],
-            Arc::new(FixedSelector(vec!["a".into()])),
-            "fb",
-        );
-        let mut seen_a = false;
-        let mut seen_fb = false;
-        for _ in 0..100 {
-            match s.pick_outbound().unwrap().as_str() {
-                "a" => seen_a = true,
-                "fb" => seen_fb = true,
-                _ => {}
-            }
+    fn test_random_uniform_among_candidates_only() {
+        // 候选集外的 tag 永不返回（50/50 fallback 杜撰语义已删）；
+        // 单候选时恒返回该候选。
+        let s = RandomStrategy::new(vec![], Arc::new(FixedSelector(vec!["a".into()])));
+        for _ in 0..50 {
+            assert_eq!(s.pick_outbound().unwrap(), "a");
         }
-        assert!(seen_a || seen_fb);
     }
 }

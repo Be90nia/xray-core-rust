@@ -493,10 +493,9 @@ where
 /// 创建 uTLS 指纹伪装客户端连接。
 ///
 /// 对应 Go `utls.UClient(c, config, fingerprint)`。
-///
-/// **当前实现**：fallback 到标准 rustls 握手，`fingerprint` 仅作 log 标记。
-/// 真实 uTLS ClientHello 指纹伪装（GREASE/扩展顺序/ClientHello 字节布局）
-/// 待 REALITY 任务再评估 watfaq-rustls git 依赖。
+/// **当前实现**：指纹在 btls 支持清单内走 [`crate::btls_client::BtlsConn`]
+/// 真实浏览器指纹握手；清单外指纹返回 `InvalidData` 硬错（不再静默回退
+/// rustls），connector 构建失败同样硬错。
 pub async fn u_client<S>(
     stream: S,
     server_name: &str,
@@ -524,7 +523,9 @@ where
                 }
             }
             Err(e) => {
-                debug!(target: "xray_tls::utls", ?fingerprint, error = %e, "btls connector 构建失败, fallback 到 rustls");
+                // 清单外指纹（InvalidData）等 connector 构建失败：硬错。
+                // 配置了指纹却静默回退标准 rustls 等于伪装失效（批3 裁决）。
+                return Err(e);
             }
         }
     }

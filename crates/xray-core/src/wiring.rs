@@ -16,11 +16,11 @@ use std::sync::Arc;
 
 use xray_app_dispatcher::default::{
     AccessContext, DefaultDispatcher, DispatcherContext, Route as DispRoute,
-    RoutingContext as DispRoutingContext, RoutingRouter, SniffingRequest,
+    RoutingContext as DispRoutingContext, RoutingRouter, SimpleOhm, SniffingRequest,
 };
 use xray_app_dispatcher::{maybe_wrap_reader, maybe_wrap_writer, DispatchHandler, DispatcherError};
 use xray_proto::xray::common::geodata::CidrRule;
-use xray_app_router::balancing::NotImplementedSelector;
+use xray_app_router::balancing::{NotImplementedSelector, ObservationProvider, OutboundHandlerSelector};
 use xray_app_router::context::RoutingData as RouterRoutingData;
 use xray_app_router::error::RouterError;
 use xray_app_router::Router;
@@ -62,8 +62,11 @@ impl std::fmt::Debug for RouterAdapter {
 }
 
 /// 把 dispatcher 的 `RoutingContext` 字段拷贝到 router 的 `RoutingData`。
+///
+/// Go `routing.Context.GetTarget` 语义：`RouteTarget` 有效时优先（routeOnly：
+/// 路由用嗅探域名，拨号保持原 dest）。
 fn bridge_context(ctx: &dyn DispRoutingContext) -> RouterRoutingData {
-    RouterRoutingData {
+    let mut data = RouterRoutingData {
         target_ips: ctx.get_target_ips().to_vec(),
         target_domain: ctx.get_target_domain().to_string(),
         target_port: ctx.get_target_port(),
@@ -80,7 +83,21 @@ fn bridge_context(ctx: &dyn DispRoutingContext) -> RouterRoutingData {
         inbound_tag: ctx.get_inbound_tag().to_string(),
         protocol: ctx.get_protocol().to_string(),
         skip_dns_resolve: ctx.get_skip_dns_resolve(),
+    };
+    if let Some(rt) = ctx.get_route_target() {
+        match rt.address().ip() {
+            Some(ip) => {
+                data.target_ips = vec![ip];
+                data.target_domain.clear();
+            }
+            None => {
+                data.target_domain = rt.address().as_domain().unwrap_or("").to_string();
+                data.target_ips.clear();
+            }
+        }
+        data.target_port = rt.port();
     }
+    data
 }
 
 /// 把 router 的 `RouterError` 映射为 dispatcher 的 `DispatcherError`。
@@ -360,11 +377,57 @@ impl InboundDispatchHandler {
     }
 }
 
+/// [`SimpleOhm`] → `OutboundHandlerSelector` 适配器。
+///
+/// 对应 Go `outbound.HandlerSelector.Select`（app/proxyman/outbound/outbound.go:164）：
+/// tagged handler 全集按 selectors 前缀匹配，返回排序后的 tag 列表；空 selectors
+/// 返回空（走 Balancer fallback）。
+struct OhmOutboundSelector {
+    inner: *const SimpleOhm,
+}
+
+// Safety: SimpleOhm 是 Send + Sync；指针所指 ohm 由装配方持有（`start_full_dispatched`
+// 的 `ohm: Arc<SimpleOhm>`）覆盖 RouterAdapter 整个生命周期（outbound.rs::OhmRef 同款）。
+unsafe impl Send for OhmOutboundSelector {}
+// Safety: 同上；内部仅读 RwLock（list_tags），无 &mut。
+unsafe impl Sync for OhmOutboundSelector {}
+
+impl OutboundHandlerSelector for OhmOutboundSelector {
+    fn select_outbounds(&self, selectors: &[String]) -> Result<Vec<String>, RouterError> {
+        // Safety: 指针在适配器生命周期内有效（见 unsafe impl 注释）
+        let ohm: &SimpleOhm = unsafe { &*self.inner };
+        let mut tags: Vec<String> = Vec::new();
+        for tag in ohm.list_tags() {
+            if selectors.iter().any(|s| tag.starts_with(s.as_str())) {
+                tags.push(tag);
+            }
+        }
+        tags.sort();
+        Ok(tags)
+    }
+}
+
+/// ObservatoryFeature 观测快照 → router `ObservationProvider` 桥
+/// （leastping / leastload 的观测数据源）。
+pub struct ObservatoryProviderBridge(pub Arc<xray_app_observatory::ObservatoryFeature>);
+
+impl ObservationProvider for ObservatoryProviderBridge {
+    fn get_observation(
+        &self,
+    ) -> Result<xray_proto::xray::core::app::observatory::ObservationResult, RouterError> {
+        // observatory 内部自定义 ObservationResult → proto 形态（router 侧 trait 签名）
+        Ok(self.0.observer().get_observation().to_proto())
+    }
+}
+
 /// 从路由配置 JSON 字节构造 [`RouterAdapter`]。
 ///
 /// 解析 `domain` / `domainSuffix` / `domainKeyword` / `ip` (CIDR) / `outboundTag`
 /// 为 proto `Config` → `Router::init`。其他 proto 字段（balancer、user、protocol 等）
 /// 留空——这些字段在 dispatcher 提供完整 `RoutingContext` 时才会被规则匹配用到。
+///
+/// balancer selector 为 `NotImplementedSelector`（无 ohm 可选）——balancer 规则
+/// 一律走 fallback。生产装配用 [`build_router_adapter_from_json_with_ohm`]。
 ///
 /// # Errors
 ///
@@ -373,20 +436,40 @@ impl InboundDispatchHandler {
 pub fn build_router_adapter_from_json(
     routing_json: &[u8],
 ) -> Result<Arc<RouterAdapter>, WiringError> {
-    build_router_adapter_from_json_with_observer(routing_json, None)
+    build_adapter(
+        parse_routing_json_to_proto(routing_json)?,
+        Arc::new(NotImplementedSelector),
+        None,
+    )
 }
 
-/// 同 [`build_router_adapter_from_json`]，额外传入观测器使 `leastping` /
-/// `leastload` 策略能拿到观测数据。
-pub fn build_router_adapter_from_json_with_observer(
+/// 同 [`build_router_adapter_from_json`]，balancer selector 接真实 [`SimpleOhm`]
+/// （Go `Balancer.SelectOutbounds` 语义），并传入观测器使 `leastping` / `leastload`
+/// 策略能拿到观测数据。
+///
+/// `ohm` 必须在返回的 RouterAdapter 整个生命周期内存活（生产路径 `ohm: Arc<SimpleOhm>`
+/// 由 Instance 持有，天然满足）。
+///
+/// # Errors
+///
+/// 同 [`build_router_adapter_from_json`]。
+pub fn build_router_adapter_from_json_with_ohm(
     routing_json: &[u8],
-    observer: Option<
-        Arc<dyn xray_app_router::balancing::ObservationProvider>,
-    >,
+    ohm: &SimpleOhm,
+    observer: Option<Arc<dyn ObservationProvider>>,
 ) -> Result<Arc<RouterAdapter>, WiringError> {
-    let config = parse_routing_json_to_proto(routing_json)?;
-    let ohm: Arc<dyn xray_app_router::balancing::OutboundHandlerSelector> =
-        Arc::new(NotImplementedSelector);
+    build_adapter(
+        parse_routing_json_to_proto(routing_json)?,
+        Arc::new(OhmOutboundSelector { inner: std::ptr::from_ref(ohm) }),
+        observer,
+    )
+}
+
+fn build_adapter(
+    config: xray_proto::xray::app::router::Config,
+    ohm: Arc<dyn OutboundHandlerSelector>,
+    observer: Option<Arc<dyn ObservationProvider>>,
+) -> Result<Arc<RouterAdapter>, WiringError> {
     let geo_loader = Some(Arc::new(xray_geodata::loader::GeoDataLoader::new(
         resolve_asset_dir(),
     )));
@@ -687,6 +770,25 @@ fn resolve_asset_dir() -> std::path::PathBuf {
 mod tests {
     use super::*;
 
+    /// 测试桩 handler：dispatch 即返回（SimpleOhm 注册用）。
+    #[derive(Debug)]
+    struct NullHandler(String);
+    impl DispatchHandler for NullHandler {
+        fn tag(&self) -> &str {
+            &self.0
+        }
+        fn dispatch(
+            &self,
+            _dest: &Destination,
+            _link: Link,
+        ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+            Box::pin(std::future::ready(()))
+        }
+    }
+    fn test_handler(tag: &str) -> Arc<dyn DispatchHandler> {
+        Arc::new(NullHandler(tag.to_string()))
+    }
+
     #[test]
     fn router_adapter_satisfies_routing_router() {
         let r = Router::empty(Arc::new(NotImplementedSelector), None);
@@ -962,7 +1064,7 @@ mod tests {
             "balancers":[{"tag":"bl","selector":["a","b","c"],"strategy":"leastping","fallbackTag":"fb"}],
             "rules":[{"balancerTag":"bl","domain":["x.test"]}]
         }"#;
-        let adapter = build_router_adapter_from_json_with_observer(json, None)
+        let adapter = build_router_adapter_from_json_with_ohm(json, &SimpleOhm::new(), None)
             .expect("leastping balancer should build even without observer");
         // 没 observer → fallback
         let dest = Destination::new(
@@ -971,6 +1073,36 @@ mod tests {
             xray_common::net::network::Network::TCP,
         );
         assert_eq!(adapter.pick_outbound_tag(&dest).as_deref(), Some("fb"));
+    }
+
+    /// selector 适配器：SimpleOhm tagged handlers 按 selector 前缀匹配（Go
+    /// `Manager.Select`），排序返回；random 策略在候选内均匀随机。
+    #[test]
+    fn build_adapter_with_ohm_random_strategy_picks_registered_tag() {
+        let json = br#"{
+            "balancers":[{"tag":"bl","selector":["proxy-"],"strategy":"random"}],
+            "rules":[{"balancerTag":"bl","domain":["x.test"]}]
+        }"#;
+        let ohm = SimpleOhm::new();
+        ohm.add("proxy-a", test_handler("proxy-a"));
+        ohm.add("proxy-b", test_handler("proxy-b"));
+        ohm.add("direct", test_handler("direct"));
+        let adapter = build_router_adapter_from_json_with_ohm(json, &ohm, None)
+            .expect("random balancer with ohm should build");
+        let dest = Destination::new(
+            Address::Domain("x.test".into()),
+            Port::new(443),
+            xray_common::net::network::Network::TCP,
+        );
+        // "direct" 不匹配前缀 "proxy-"，永不选中；balancer 无 fallbackTag，
+        // selector 返回空时才落 default——这里候选非空。
+        for _ in 0..20 {
+            let tag = adapter.pick_outbound_tag(&dest).expect("pick");
+            assert!(
+                tag == "proxy-a" || tag == "proxy-b",
+                "unexpected tag {tag}"
+            );
+        }
     }
 
     /// JSON + observer 装配 → 命中最低延迟出站。
@@ -1018,7 +1150,7 @@ mod tests {
             "balancers":[{"tag":"bl","selector":["a","b","c"],"strategy":"leastping"}],
             "rules":[{"balancerTag":"bl","domain":["x.test"]}]
         }"#;
-        let adapter = build_router_adapter_from_json_with_observer(json, Some(obs))
+        let adapter = build_router_adapter_from_json_with_ohm(json, &SimpleOhm::new(), Some(obs))
             .expect("leastping + observer should build");
         let dest = Destination::new(
             Address::Domain("x.test".into()),
@@ -1026,5 +1158,30 @@ mod tests {
             xray_common::net::network::Network::TCP,
         );
         assert_eq!(adapter.pick_outbound_tag(&dest).as_deref(), Some("b"));
+    }
+
+    /// bridge_context 消费 route_target（Go `routing.Context.GetTarget`：
+    /// RouteTarget 有效时优先于 Target——routeOnly 路由用嗅探域名）。
+    #[test]
+    fn pick_route_prefers_route_target_over_target() {
+        let json = br#"{"rules":[{"outboundTag":"routed","domain":["sniffed.example.com"]}]}"#;
+        let adapter = build_router_adapter_from_json(json).expect("build adapter");
+
+        // routeOnly 形态：target 是 IP（无域名规则可命中），route_target 是嗅探域名。
+        let mut ctx = DispatcherContext::new().with_target_port(Port::new(443));
+        ctx.target_ips = vec![std::net::IpAddr::from([1, 2, 3, 4])];
+        ctx.route_target = Some(Destination::new(
+            Address::Domain("sniffed.example.com".into()),
+            Port::new(443),
+            xray_common::net::network::Network::TCP,
+        ));
+        let route = <RouterAdapter as RoutingRouter>::pick_route(&adapter, &ctx)
+            .expect("route target domain rule should hit");
+        assert_eq!(route.outbound_tag, "routed");
+
+        // 无 route_target：仅 IP 的 ctx 不命中域名规则。
+        let mut plain = DispatcherContext::new().with_target_port(Port::new(443));
+        plain.target_ips = vec![std::net::IpAddr::from([1, 2, 3, 4])];
+        assert!(<RouterAdapter as RoutingRouter>::pick_route(&adapter, &plain).is_err());
     }
 }

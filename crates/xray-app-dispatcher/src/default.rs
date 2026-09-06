@@ -90,6 +90,13 @@ pub trait RoutingContext: Send + Sync + Debug {
     fn get_inbound_tag(&self) -> &str;
     fn get_protocol(&self) -> &str;
     fn get_skip_dns_resolve(&self) -> bool;
+
+    /// 路由目标覆盖（Go `session.Outbound.RouteTarget`：valid 时优先于 Target 参与
+    /// 路由）。routeOnly 场景路由用嗅探域名、拨号保持原 dest。默认 None（等价
+    /// Go RouteTarget 无效）。
+    fn get_route_target(&self) -> Option<&xray_common::net::destination::Destination> {
+        None
+    }
 }
 
 /// 拥有所有字段的 [`RoutingContext`] 实现，用 builder 模式构造。
@@ -123,6 +130,8 @@ pub struct DispatcherContext {
     pub protocol: String,
     /// 是否跳过 DNS 解析
     pub skip_dns_resolve: bool,
+    /// 路由目标覆盖（Go `RouteTarget`；Some 时路由用此目标，拨号仍用原 dest）。
+    pub route_target: Option<xray_common::net::destination::Destination>,
 }
 
 impl Default for DispatcherContext {
@@ -149,6 +158,7 @@ impl DispatcherContext {
             inbound_tag: String::new(),
             protocol: String::new(),
             skip_dns_resolve: false,
+            route_target: None,
         }
     }
 
@@ -224,6 +234,9 @@ impl RoutingContext for DispatcherContext {
     }
     fn get_skip_dns_resolve(&self) -> bool {
         self.skip_dns_resolve
+    }
+    fn get_route_target(&self) -> Option<&xray_common::net::destination::Destination> {
+        self.route_target.as_ref()
     }
 }
 
@@ -442,7 +455,14 @@ async fn sniff_connection(
     req: &SniffingRequest,
     fdns: Option<&dyn crate::fakednssniffer::FakeDnsEngine>,
     handshake_timeout: std::time::Duration,
-) -> Result<(xray_common::net::destination::Destination, Option<String>), DispatcherError> {
+) -> Result<
+    (
+        xray_common::net::destination::Destination,
+        Option<String>,
+        Option<xray_common::net::destination::Destination>,
+    ),
+    DispatcherError,
+> {
     // 读首包（带超时）
     let read_result = tokio::time::timeout(
         handshake_timeout,
@@ -457,7 +477,7 @@ async fn sniff_connection(
 
     let payload = cr.cached_bytes();
     if payload.is_empty() {
-        return Ok((dest.clone(), None));
+        return Ok((dest.clone(), None, None));
     }
     let network = dest.network();
 
@@ -494,16 +514,20 @@ async fn sniff_connection(
                     content,
                 );
                 if should_override(&composite, req, dest_ip, Some(&metadata_protocol)) {
-                    let new_dest = override_dest(dest, &metadata_domain, req)?;
-                    return Ok((new_dest, Some(metadata_protocol)));
+                    // fakedns 路径（Go default.go:311 判 protocol != "fakedns" 才走
+                    // RouteOnly）：拨号必须跟域名（fake IP 不可直连）→ 按 false 传。
+                    let (new_dest, route_target) =
+                        override_dest(dest, &metadata_domain, false)?;
+                    return Ok((new_dest, Some(metadata_protocol), route_target));
                 }
             } else {
                 // 仅 content 结果
                 if should_override(content.as_ref(), req, dest_ip, None) {
                     let proto = content.protocol().to_string();
                     let domain = content.domain().to_string();
-                    let new_dest = override_dest(dest, &domain, req)?;
-                    return Ok((new_dest, Some(proto)));
+                    let (new_dest, route_target) =
+                        override_dest(dest, &domain, req.route_only)?;
+                    return Ok((new_dest, Some(proto), route_target));
                 }
             }
         }
@@ -512,32 +536,44 @@ async fn sniff_connection(
             if !metadata_domain.is_empty() {
                 let meta_result = crate::fakednssniffer::FakeDnsSniffResult::new(&metadata_domain);
                 if should_override(&meta_result, req, dest_ip, Some(&metadata_protocol)) {
-                    let new_dest = override_dest(dest, &metadata_domain, req)?;
-                    return Ok((new_dest, Some(metadata_protocol.clone())));
+                    let (new_dest, route_target) =
+                        override_dest(dest, &metadata_domain, false)?;
+                    return Ok((new_dest, Some(metadata_protocol.clone()), route_target));
                 }
             }
         }
     }
 
-    Ok((dest.clone(), None))
+    Ok((dest.clone(), None, None))
 }
 
-/// 根据 sniffing 结果覆盖 destination。
+/// 根据 sniffing 结果产出拨号目标与路由目标。
+///
+/// 对应 Go default.go:311-315：非 routeOnly → Target = 域名 dest（拨号与路由都用
+/// 域名）；routeOnly → RouteTarget = 域名 dest（仅路由用嗅探域名），拨号保持原
+/// dest。fakedns 路径拨号必须跟域名（fake IP 不可直连），由调用方以
+/// `route_only=false` 传入。返回 `(拨号 dest, 路由覆盖 dest)`。
 fn override_dest(
     dest: &xray_common::net::destination::Destination,
     domain: &str,
-    req: &SniffingRequest,
-) -> Result<xray_common::net::destination::Destination, DispatcherError> {
-    if req.route_only {
-        tracing::debug!(domain = %domain, "sniffed (route_only, dest unchanged)");
-        return Ok(dest.clone());
-    }
+    route_only: bool,
+) -> Result<
+    (
+        xray_common::net::destination::Destination,
+        Option<xray_common::net::destination::Destination>,
+    ),
+    DispatcherError,
+> {
     let new_addr = xray_common::net::address::Address::new_domain(domain.to_string());
-    let new_dest = xray_common::net::destination::Destination::new(
+    let domain_dest = xray_common::net::destination::Destination::new(
         new_addr, dest.port(), dest.network(),
     );
+    if route_only {
+        tracing::debug!(domain = %domain, "sniffed (route_only, dest unchanged, route target set)");
+        return Ok((dest.clone(), Some(domain_dest)));
+    }
     tracing::debug!(domain = %domain, "sniffed, overriding dest");
-    Ok(new_dest)
+    Ok((domain_dest, None))
 }
 
 /// 从 destination + sniffing 结果构造 RoutingContext。
@@ -662,6 +698,11 @@ impl DefaultDispatcher {
     /// 而非使用硬编码 `default_policy`。当前 user_level 固定 0（dispatch 签名未携带用户信息）。
     pub fn set_policy_manager(&mut self, pm: Arc<dyn xray_features::policy::PolicyManager>) {
         self.policy_manager = Some(pm);
+    }
+
+    /// 注入 FakeDNS 引擎（对应 Go `DefaultDispatcher.fdns`，嗅探阶段反查 fake IP 域名）。
+    pub fn set_fdns(&mut self, fdns: Option<Arc<dyn crate::fakednssniffer::FakeDnsEngine>>) {
+        self.fdns = fdns;
     }
 
     /// Start 钩子（空操作）。对应 Go `(*DefaultDispatcher).Start()`。
@@ -865,18 +906,18 @@ impl DefaultDispatcher {
         let fut = async move {
             // ---- Phase 1: Sniffing ----
             let mut cr = CachedReader::with_inner(outbound_reader);
-            let (final_dest, sniffed_protocol) = if sniff_req.enabled {
+            let (final_dest, sniffed_protocol, route_target) = if sniff_req.enabled {
                 match sniff_connection(
                     &mut cr, &dest, &sniff_req, fdns.as_deref(), handshake_timeout,
                 ).await {
-                    Ok((d, proto)) => (d, proto),
+                    Ok((d, proto, rt)) => (d, proto, rt),
                     Err(e) => {
                         tracing::debug!(dest = %dest, error = %e, "sniffing failed, using original dest");
-                        (dest.clone(), None)
+                        (dest.clone(), None, None)
                     }
                 }
             } else {
-                (dest.clone(), None)
+                (dest.clone(), None, None)
             };
             // ---- Phase 2: Forced tag 旁路（Go default.go:443-454）----
             let (handler, routed_pick) = if !forced_tag.as_deref().unwrap_or_default().is_empty() {
@@ -905,16 +946,23 @@ impl DefaultDispatcher {
                 if let Some(a) = &access {
                     ctx = ctx.with_inbound_tag(a.inbound_tag.as_str());
                 }
+                // routeOnly（Go default.go:311-315）：路由用嗅探域名（route_target），
+                // 拨号保持 final_dest（原 dest）。
+                if let Some(rt) = &route_target {
+                    ctx.route_target = Some(rt.clone());
+                }
                 match r.pick_route_resolved(&ctx).await {
-                    Ok(route) => {
-                        let picked = ohm.get_handler(&route.outbound_tag);
-                        if picked.is_some() {
-                            (picked, true)
-                        } else {
-                            tracing::warn!(tag = %route.outbound_tag, "routed handler not found, falling back to default");
-                            (ohm.get_default_handler(), false)
+                    Ok(route) => match ohm.get_handler(&route.outbound_tag) {
+                        Some(h) => (Some(h), true),
+                        None => {
+                            // Go default.go:469-470 DO NOT CHANGE：路由指定的 outboundTag
+                            // 不存在时不得落默认出站（如 VLESS Reverse Proxy）。
+                            tracing::warn!(tag = %route.outbound_tag, "non existing outTag");
+                            outbound_writer.shutdown();
+                            // outbound_reader 随 drop 关闭上行
+                            return;
                         }
-                    }
+                    },
                     Err(_) => (ohm.get_default_handler(), false),
                 }
             } else {
@@ -2587,4 +2635,233 @@ mod tests {
         assert_eq!(entries[0].reason, "no outbound handler available");
         assert_eq!(entries[0].to, "tcp:127.0.0.1:8080");
     }
+
+    // ---- routeOnly / tag 断链（批 3，Go default.go:311-315/469-470）----
+
+    /// 构造最小 TLS ClientHello（含 SNI；sniffer.rs 测试同款构造）。
+    fn build_minimal_client_hello(domain: &[u8]) -> Vec<u8> {
+        let mut hello = Vec::new();
+        hello.push(0x01); // ClientHello
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]); // version TLS 1.2
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0x00); // session_id_len = 0
+        body.extend_from_slice(&[0x00, 0x02]); // cipher_suites_len = 2
+        body.extend_from_slice(&[0x00, 0x2f]); // TLS_RSA_WITH_AES_128_CBC_SHA
+        body.push(0x01); // compression_methods_len = 1
+        body.push(0x00); // null compression
+
+        let mut extensions = Vec::new();
+        let mut sni_data = Vec::new();
+        let sni_entry_len = 1 + 2 + domain.len();
+        sni_data.extend_from_slice(&(sni_entry_len as u16).to_be_bytes());
+        sni_data.push(0x00); // host_name type
+        sni_data.extend_from_slice(&(domain.len() as u16).to_be_bytes());
+        sni_data.extend_from_slice(domain);
+
+        extensions.extend_from_slice(&[0x00, 0x00]); // extension type SNI
+        extensions.extend_from_slice(&(sni_data.len() as u16).to_be_bytes());
+        extensions.extend_from_slice(&sni_data);
+
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+
+        let body_len = body.len() as u32;
+        hello.extend_from_slice(&body_len.to_be_bytes()[1..]);
+        hello.extend_from_slice(&body);
+        hello
+    }
+
+    /// 记录 dispatch 收到的完整 dest 后关闭下行。
+    #[derive(Debug)]
+    struct RecordingHandler {
+        tag: &'static str,
+        seen_dest: Arc<parking_lot::Mutex<Option<xray_common::net::destination::Destination>>>,
+    }
+    impl DispatchHandler for RecordingHandler {
+        fn tag(&self) -> &str {
+            self.tag
+        }
+        fn dispatch(
+            &self,
+            dest: &xray_common::net::destination::Destination,
+            link: xray_transport::link::Link,
+        ) -> PinFuture<()> {
+            let seen = Arc::clone(&self.seen_dest);
+            let dest = dest.clone();
+            Box::pin(async move {
+                *seen.lock() = Some(dest);
+                link.writer.shutdown();
+            })
+        }
+    }
+
+    /// 记录路由上下文目标域名；域名命中 routed-tag，否则 ip-tag。
+    #[derive(Debug)]
+    struct DomainRouter {
+        seen_domain: Arc<parking_lot::Mutex<Option<String>>>,
+    }
+    impl RoutingRouter for DomainRouter {
+        fn pick_route(&self, ctx: &dyn RoutingContext) -> Result<Route, DispatcherError> {
+            // 模拟 RouterAdapter::bridge_context（Go GetTarget）：RouteTarget 有效时优先。
+            let domain = ctx
+                .get_route_target()
+                .and_then(|rt| rt.address().as_domain().map(str::to_string))
+                .unwrap_or_else(|| ctx.get_target_domain().to_string());
+            *self.seen_domain.lock() = Some(domain.clone());
+            if domain == "sniffed.example.com" {
+                Ok(Route::new("routed-tag"))
+            } else {
+                Ok(Route::new("ip-tag"))
+            }
+        }
+        fn pick_route_resolved<'a>(
+            &'a self,
+            ctx: &'a dyn RoutingContext,
+        ) -> Pin<Box<dyn Future<Output = Result<Route, DispatcherError>> + Send + 'a>> {
+            Box::pin(async move { self.pick_route(ctx) })
+        }
+    }
+
+    /// routeOnly：路由用嗅探域名（命中域名规则），拨号保持原 dest（IP 不改写）。
+    /// 对应 Go default.go:311-315。
+    #[tokio::test]
+    async fn dispatch_link_route_only_routes_by_sniffed_domain_dials_original_dest() {
+        use xray_buf::io::Writer as _;
+        use xray_buf::multi::MultiBuffer;
+        use xray_common::net::address::Address;
+
+        let ohm = SimpleOhm::new();
+        let routed_dest = Arc::new(parking_lot::Mutex::new(None));
+        let ip_dest = Arc::new(parking_lot::Mutex::new(None));
+        ohm.add(
+            "routed-tag",
+            Arc::new(RecordingHandler { tag: "routed-tag", seen_dest: Arc::clone(&routed_dest) }),
+        );
+        ohm.add(
+            "ip-tag",
+            Arc::new(RecordingHandler { tag: "ip-tag", seen_dest: Arc::clone(&ip_dest) }),
+        );
+        let seen_domain = Arc::new(parking_lot::Mutex::new(None));
+        let mut d = DefaultDispatcher::new();
+        d.ohm = Some(Arc::new(ohm));
+        d.router = Some(Arc::new(DomainRouter { seen_domain: Arc::clone(&seen_domain) }));
+
+        let sniff = SniffingRequest {
+            enabled: true,
+            override_destination_for_protocol: vec!["tls".to_string()],
+            route_only: true,
+            ..Default::default()
+        };
+
+        let dest = xray_common::net::destination::Destination::new(
+            Address::from_ipv4_bytes([1, 2, 3, 4]),
+            Port::new(443),
+            Network::TCP,
+        );
+        let mut payload = vec![0x16, 0x03, 0x01];
+        let hello = build_minimal_client_hello(b"sniffed.example.com");
+        payload.extend_from_slice(&(hello.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&hello);
+
+        let (up_r, mut up_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let (dn_r, dn_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let outbound = xray_transport::link::Link::new(Box::new(up_r), Box::new(dn_w));
+
+        d.dispatch_link(&dest, outbound, &sniff, None, None)
+            .expect("dispatch_link ok");
+
+        // 发 ClientHello（嗅探读首包）
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(&payload);
+        up_w.write_multi_buffer(mb).await.unwrap();
+
+        for _ in 0..200 {
+            if routed_dest.lock().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            seen_domain.lock().as_deref(),
+            Some("sniffed.example.com"),
+            "routing must use sniffed domain under route_only"
+        );
+        let seen = routed_dest.lock().clone().expect("routed handler dispatched");
+        assert_eq!(
+            seen.address().ip(),
+            Some(std::net::IpAddr::from([1, 2, 3, 4])),
+            "dial dest must stay original under route_only"
+        );
+        assert!(ip_dest.lock().is_none(), "ip-tag must not be picked");
+        let _ = dn_r;
+        up_w.shutdown();
+    }
+
+    /// 路由指定的 outboundTag 不存在 → 关闭下行不落默认出站
+    /// （Go default.go:469-470 DO NOT CHANGE）。
+    #[tokio::test]
+    async fn dispatch_link_missing_routed_tag_shuts_down_instead_of_default() {
+        #[derive(Debug)]
+        struct MissingRouter;
+        impl RoutingRouter for MissingRouter {
+            fn pick_route(&self, _ctx: &dyn RoutingContext) -> Result<Route, DispatcherError> {
+                Ok(Route::new("missing-tag"))
+            }
+            fn pick_route_resolved<'a>(
+                &'a self,
+                _ctx: &'a dyn RoutingContext,
+            ) -> Pin<Box<dyn Future<Output = Result<Route, DispatcherError>> + Send + 'a>> {
+                Box::pin(async move { Ok(Route::new("missing-tag")) })
+            }
+        }
+
+        let ohm = SimpleOhm::new();
+        let default_hit = Arc::new(parking_lot::Mutex::new(None));
+        ohm.set_default(Arc::new(RecordingHandler {
+            tag: "default-out",
+            seen_dest: Arc::clone(&default_hit),
+        }));
+        let mut d = DefaultDispatcher::new();
+        d.ohm = Some(Arc::new(ohm));
+        d.router = Some(Arc::new(MissingRouter));
+
+        let dest = xray_common::net::destination::Destination::new(
+            xray_common::net::address::Address::new_domain("x.test".to_string()),
+            Port::new(443),
+            Network::TCP,
+        );
+        let (up_r, up_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let (dn_r, dn_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let outbound = xray_transport::link::Link::new(Box::new(up_r), Box::new(dn_w));
+
+        d.dispatch_link(&dest, outbound, &SniffingRequest::default(), None, None)
+            .expect("dispatch_link ok");
+        let mut r: Box<dyn xray_buf::io::Reader> = Box::new(dn_r);
+        let eof = match tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer()).await {
+            Err(_) => panic!("timeout waiting EOF"),
+            Ok(Err(_)) => true, // writer shutdown → 管道 EOF
+
+            Ok(Ok(mb)) => mb.is_empty(),
+        };
+        assert!(eof, "downlink should be EOF after missing-tag shutdown");
+
+        // 默认出站不得被触发
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(default_hit.lock().is_none(), "must not fall back to default outbound");
+        drop(up_w);
+    }
+
+    /// set_fdns 注入（对应 Go dispatcher.fdns）。
+    #[test]
+    fn set_fdns_stores_engine() {
+        let mut d = DefaultDispatcher::new();
+        assert!(d.fdns.is_none());
+        d.set_fdns(Some(Arc::new(FixedFakeDns)));
+        assert!(d.fdns.is_some());
+    }
+
 }
+

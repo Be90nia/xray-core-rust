@@ -221,10 +221,16 @@ impl Balancer {
         }
         match self.strategy.pick_outbound_with_key(key) {
             Ok(tag) if !tag.is_empty() => Ok(tag),
-            _ => {
+            err => {
+                // selector/策略出错（Err）或返回空 tag 均走 fallback（Go balancing.go:96-119
+                // 的两个 fallback 分支），并记 warn 便于观测。
                 if self.fallback_tag.is_empty() {
-                    Err(RouterError::EmptyBalancerResult)
+                    Err(match err {
+                        Ok(_) => RouterError::EmptyBalancerResult,
+                        Err(e) => e,
+                    })
                 } else {
+                    tracing::warn!(fallback = %self.fallback_tag, "balancer fallback");
                     Ok(self.fallback_tag.clone())
                 }
             }

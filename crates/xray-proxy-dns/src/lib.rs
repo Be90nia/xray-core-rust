@@ -12,10 +12,10 @@
 //!
 //! 实现配置层 + [`config::DnsRule::match_q_type`] / [`config::DnsRule::apply`] 纯函数：
 //! - [`config::Config`] / [`config::DnsRuleConfig`] / [`config::RuleAction`] — 配置层 + prost 双向
-//! - [`config::DnsRule`] — 运行时规则 + qType 匹配
+//! - [`config::DnsRule`] — 运行时规则 + qType 匹配 + domain 匹配
+//!   （已接 `xray_geodata` matcher，就地编译 Full/Domain/Substr/Regex）
 //!
-//! 切片2 待办：domain 匹配（依赖 `geodata::DomainMatcher`）+ DNS 查询解析（dnsmessage）+
-//! 上游转发（依赖 `features::dns::Client`）+ Handler::Init/Process + FakeDNS 集成。
+//! 上游转发（依赖 `features::dns::Client`）+ FakeDNS 集成由切片3 承接。
 
 pub mod config;
 pub mod dns_message;
