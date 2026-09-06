@@ -170,3 +170,49 @@ trojan/hysteria 混淆层字节级全绿;vmess/ENC/ss2022/REALITY 主体一致(4
 - timeouts.md 首轮未落盘(reviewer 代理无写盘权限),已由 PM 从 transcript 恢复
 - dns_routing.md 首写流超时,已令代理续写成功
 
+---
+
+# 第四轮审计 (2026-09-05,3 切面)
+
+简单协议栈 / mux-reverse 字节级 / **动态验证轮(实跑测试套件,以运行结果为证据)**。
+
+## 第四轮统计
+
+| 切面 | 报告 | P1 | P2 | P3 |
+|---|---|---|---|---|
+| 简单协议栈 | [simple_proxy.md](simple_proxy.md) | 5 | 6 | 3 |
+| mux/XUDP/reverse | [mux_reverse.md](mux_reverse.md) | 4 | 4 | 4 |
+| 动态测试 | [dynamic_tests.md](dynamic_tests.md) | 1 | 1 | 3 |
+| **小计** | | **10** | **11** | **10** |
+
+## 四轮合计: P0×4 / P1×53 / P2×125 / P3×63
+
+## 第四轮 P1(10 条)
+
+**简单协议(5)**:
+- freedom destinationOverride 生产不消费(TPROXY 透明代理静默拨原始目标) dispatcher.rs:38-53
+- freedom 默认私网阻断口径断裂+UDP 路径零 FinalRule → 远端客户端可经 freedom 直访 127.0.0.1/169.254.169.254(SSRF 面) udp.rs:196-263
+- dokodemo UDP 单 session+last_peer → 多客户端响应错发(DNS/QUIC 透明转发数据错乱) inbound.rs:692-720
+- dokodemo TPROXY UDP 语义缺失(回包源=代理地址非原始目标,Linux 上也未实现) inbound.rs:1898-1920
+- socks UDP ASSOC 硬编码 127.0.0.1 → 非 loopback 监听时远程 UDP 中继整体不可用 server.rs:243-247
+
+**mux/XUDP(4)**:
+- mux 服务端 session 永不移除(Arc::get_mut 恒失败,每子连接泄漏一个) session.rs:541-545
+- 客户端缺 writeFirstPayload → SSH/FTP/SMTP 等服务端先说协议经 mux 永不到达 banner client.rs:356-364
+- **XUDP 服务端装配断裂:真实 I/O 绑孤儿对象,首包后立即 End —— mux+XUDP 服务端不可用** worker.rs:311-318
+- XUDP GlobalID 客户端零接线(生产恒传 None) client.rs:374-380
+
+**动态验证(1)**:
+- kcp mask_roundtrip e2e 双用例确定性挂死(finalmask 唯一 e2e 不可用;头号嫌疑=已立案 mKCP sessions 泄漏 R3,关联未证实不重复立案) tests/mask_roundtrip.rs:157
+
+## 动态验证画像(硬证据)
+
+- **workspace 全量 lib 单测:52 目标 5557 passed / 0 failed / 4 ignored,零 panic 零编译错误**——xray-common 历史 flaky 443/0,vless 219/core 246 基线增长无回归
+- 集成 45/0 全绿;14 个 Go↔Rust 互操作因旧机残留路径默认跳过(E:\Projcet 残留,P3 一行修)
+- kcp tests/ 挂死坐实"必须 --lib"铁律根源;grpc_multimode 4/4 全绿与静态 R2(multiMode 截断)不矛盾——仅 Rust↔Rust 属覆盖盲区
+- 零失败用例 → 无 flaky 分诊需求
+
+## SimpleProxyAudit 纠偏
+
+纠正第一轮 completeness.md「freedom destOverride 完整」的误判(实际生产不消费)——已在 simple_proxy.md 标注。
+
