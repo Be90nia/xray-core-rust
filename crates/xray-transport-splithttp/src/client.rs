@@ -22,9 +22,12 @@
 //! - HTTP/3 / QUIC → 切片 G（可选）
 //! - xmux 多路复用 → 切片 E
 
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -34,14 +37,17 @@ use http::{Method, StatusCode, Uri};
 use hyper::body::Frame;
 use http_body_util::{BodyDataStream, BodyExt, Full, StreamBody};
 use http_body_util::combinators::BoxBody;
-use hyper_rustls::{FixedServerNameResolver, HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::client::legacy::connect::{HttpConnector, HttpInfo};
+use hyper_rustls::{FixedServerNameResolver, HttpsConnector, HttpsConnectorBuilder, MaybeHttpsStream};
+use hyper_util::client::legacy::connect::{Connected, Connection as HttpConnection, HttpConnector, HttpInfo};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::dns::Name as DnsName;
-use hyper_util::rt::{TokioExecutor, TokioTimer};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::ClientConfig as RustlsClientConfig;
 use rustls::pki_types::ServerName;
 use tower_service::Service as TowerService;
+pub use xray_tls::fingerprint::Fingerprint;
+use xray_tls::utls::{ConnInterface, UConn};
+use xray_transport::connection::TcpConnection;
 
 use crate::config::{Config, RequestMeta};
 use crate::error::{Result, SplitHttpError};
@@ -65,7 +71,7 @@ pub struct DialTarget {
 
 /// 忽略 URI host、恒解析 `DialTarget` 的 DNS resolver（hyper-util Service 语义）。
 #[derive(Debug, Clone)]
-struct DestResolver {
+pub struct DestResolver {
     host: std::sync::Arc<str>,
     port: u16,
 }
@@ -105,7 +111,144 @@ pub type ReqBody = BoxBody<Bytes, std::io::Error>;
 ///
 /// packet-up 用 `Full<Bytes>`（一次性 body）；stream-up/stream-one 用 `StreamBody`
 ///（流式上传）。两者都 box 成 [`ReqBody`]。
-pub type HyperClient = Client<HttpsConnector<HttpConnector<DestResolver>>, ReqBody>;
+pub type HyperClient = Client<SplitConnector, ReqBody>;
+
+/// 出站 connector（[`TowerService`] for `Uri`）。
+///
+/// - [`SplitConnector::Rustls`]：hyper-rustls 现有路径（fingerprint 空），原样转发。
+/// - [`SplitConnector::Btls`]：fingerprint 非空，TCP 后用 `xray_tls::utls::u_client`
+///   完成 btls 真实浏览器指纹握手（对应 Go splithttp `dialContext` 的 `tls.UClient`）。
+#[derive(Clone)]
+pub enum SplitConnector {
+    Rustls(HttpsConnector<HttpConnector<DestResolver>>),
+    Btls(BtlsDial),
+}
+
+/// [`SplitConnector::Btls`] 分支的拨号参数（忽略 URI authority，恒拨 dest）。
+#[derive(Clone)]
+pub struct BtlsDial {
+    pub host: Arc<str>,
+    pub port: u16,
+    /// TLS SNI（tlsSettings.serverName，空回退 dest host）。
+    pub sni: String,
+    /// rustls ClientConfig（u_client 的语义参数；btls 清单内指纹握手用 btls
+    /// 自建 config，清单外指纹由 u_client 回退此 config 走 rustls）。
+    pub config: Arc<RustlsClientConfig>,
+    pub fingerprint: Fingerprint,
+}
+
+/// [`SplitConnector`] 的统一 response 流。满足 hyper-util legacy Client 的
+/// Connect bound：`hyper::rt::Read/Write` + legacy `Connection` + Unpin + Send。
+///
+/// - Rustls 分支原生 `MaybeHttpsStream` 自带 rt traits（转发保留 `connected()`
+///   的 ALPN/HttpInfo 元数据）。
+/// - Btls 分支 `UConn` 只实现 tokio traits，用 `TokioIo` 桥接。
+pub enum SplitStream {
+    Rustls(MaybeHttpsStream<TokioIo<tokio::net::TcpStream>>),
+    Btls {
+        io: TokioIo<UConn<TcpConnection>>,
+        /// ALPN 协商出 `h2` 时 hyper 须走 HTTP/2（`Connected::negotiated_h2`）。
+        alpn_h2: bool,
+    },
+}
+
+impl TowerService<Uri> for SplitConnector {
+    type Response = SplitStream;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<SplitStream, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        match self {
+            SplitConnector::Rustls(c) => c.poll_ready(cx),
+            SplitConnector::Btls(_) => Poll::Ready(Ok(())),
+        }
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        match self {
+            SplitConnector::Rustls(c) => {
+                let fut = c.call(uri);
+                Box::pin(async move { Ok(SplitStream::Rustls(fut.await?)) })
+            }
+            SplitConnector::Btls(dial) => {
+                let dial = dial.clone();
+                Box::pin(async move {
+                    // Go dialContext：TCP 恒拨出站 dest，忽略 URI authority。
+                    let tcp =
+                        tokio::net::TcpStream::connect((dial.host.to_string(), dial.port)).await?;
+                    tcp.set_nodelay(true).ok();
+                    let conn = xray_tls::utls::u_client(
+                        TcpConnection::new(tcp),
+                        &dial.sni,
+                        dial.config.clone(),
+                        dial.fingerprint,
+                        None,
+                    )
+                    .await?;
+                    // ALPN 协商结果决定 hyper 的 HTTP 版本（浏览器预设 [h2, http/1.1]）。
+                    let alpn_h2 = ConnInterface::negotiated_protocol(&conn).await == "h2";
+                    Ok(SplitStream::Btls { io: TokioIo::new(conn), alpn_h2 })
+                })
+            }
+        }
+    }
+}
+
+impl hyper::rt::Read for SplitStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            SplitStream::Rustls(s) => Pin::new(s).poll_read(cx, buf),
+            SplitStream::Btls { io, .. } => Pin::new(io).poll_read(cx, buf),
+        }
+    }
+}
+
+impl hyper::rt::Write for SplitStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            SplitStream::Rustls(s) => Pin::new(s).poll_write(cx, buf),
+            SplitStream::Btls { io, .. } => Pin::new(io).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            SplitStream::Rustls(s) => Pin::new(s).poll_flush(cx),
+            SplitStream::Btls { io, .. } => Pin::new(io).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            SplitStream::Rustls(s) => Pin::new(s).poll_shutdown(cx),
+            SplitStream::Btls { io, .. } => Pin::new(io).poll_shutdown(cx),
+        }
+    }
+}
+
+impl HttpConnection for SplitStream {
+    fn connected(&self) -> Connected {
+        match self {
+            SplitStream::Rustls(s) => s.connected(),
+            SplitStream::Btls { alpn_h2, .. } => {
+                let connected = Connected::new();
+                if *alpn_h2 {
+                    connected.negotiated_h2()
+                } else {
+                    connected
+                }
+            }
+        }
+    }
+}
 
 /// 构造一次性 body（`Vec<u8>` → `Full<Bytes>` boxed）。
 fn make_full_body(b: Vec<u8>) -> ReqBody {
@@ -150,6 +293,9 @@ impl DefaultDialerClient {
     /// 域名前置（domain fronting）部署：dest=home.begonia92.top，URL host=sg-argo
     /// （TLS SNI 与 Host 头），与 Go `splithttp/dialer.go::dialContext` 等价。
     ///
+    /// `fingerprint` 非空时出站用 btls `u_client` 完成真实浏览器指纹握手
+    /// （Go `tls.UClient` 等价）；`None` 保持 hyper-rustls 路径零变化。
+    ///
     /// ponytail: hyper-rustls 0.27.9 enable_http1+enable_http2 会把 alpn 设回
     /// `[h2, http/1.1]`（builder.rs:346），覆盖我们传入 `tls_settings.alpn` 的
     /// 用户偏好——splithttp Go 端空 alpn 默认亦此值，行为一致。
@@ -158,28 +304,42 @@ impl DefaultDialerClient {
         config: Arc<Config>,
         tls_config: RustlsClientConfig,
         dial: DialTarget,
+        fingerprint: Option<Fingerprint>,
     ) -> Self {
-        let mut builder = HttpsConnectorBuilder::new()
-            .with_tls_config(tls_config)
-            .https_or_http();
-        // 1) 锁定 TCP 拨号到 dest；忽略 URI authority（Go dialContext 语义）。
-        let mut http = HttpConnector::new_with_resolver(DestResolver {
-            host: std::sync::Arc::from(dial.host.as_str()),
-            port: dial.port,
-        });
-        http.enforce_http(false);
-        // 2) SNI 用 tlsSettings.serverName（Go WithDestination 等价：空回退 dest.host）。
-        let sni = if dial.sni.is_empty() { dial.host } else { dial.sni };
-        if let Ok(sn) = ServerName::try_from(sni) {
-            builder = builder.with_server_name_resolver(FixedServerNameResolver::new(sn));
-        }
-        let https = builder.enable_http1().enable_http2().wrap_connector(http);
+        // SNI 用 tlsSettings.serverName（Go WithDestination 等价：空回退 dest.host）。
+        let sni = if dial.sni.is_empty() { dial.host.clone() } else { dial.sni };
+        let connector = if let Some(fp) = fingerprint {
+            // Go dial.go:138-145：fingerprint 配置时 tls.UClient。TCP 由
+            // [`SplitConnector::Btls`] 恒拨 dest 后在 connector 内完成指纹握手。
+            SplitConnector::Btls(BtlsDial {
+                host: std::sync::Arc::from(dial.host.as_str()),
+                port: dial.port,
+                sni,
+                config: Arc::new(tls_config),
+                fingerprint: fp,
+            })
+        } else {
+            let mut builder = HttpsConnectorBuilder::new()
+                .with_tls_config(tls_config)
+                .https_or_http();
+            // 1) 锁定 TCP 拨号到 dest；忽略 URI authority（Go dialContext 语义）。
+            let mut http = HttpConnector::new_with_resolver(DestResolver {
+                host: std::sync::Arc::from(dial.host.as_str()),
+                port: dial.port,
+            });
+            http.enforce_http(false);
+            if let Ok(sn) = ServerName::try_from(sni) {
+                builder = builder.with_server_name_resolver(FixedServerNameResolver::new(sn));
+            }
+            let https = builder.enable_http1().enable_http2().wrap_connector(http);
+            SplitConnector::Rustls(https)
+        };
         // （hyper-util 默认值，等价 Go http.Transport.IdleConnTimeout）。pool_timer
         // 必须配，否则 idle_timeout 不生效（hyper-util 已知坑）。
         let client = Client::builder(TokioExecutor::new())
             .pool_timer(TokioTimer::new())
             .pool_idle_timeout(Some(Duration::from_secs(90)))
-            .build(https);
+            .build(connector);
         Self {
             config,
             client,

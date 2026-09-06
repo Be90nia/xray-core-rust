@@ -133,6 +133,28 @@ fn parse_security(s: &str) -> SecurityType {
 /// JSON 格式：`{ "vnext": [{ "address": "...", "port": 443, "users": [{ "id": "uuid", "security": "aes-128-gcm" }] }] }`
 pub fn parse_vmess_config(data: &[u8]) -> Result<VmessOutboundConfig, String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
+    // Go infra/conf/vmess.go:112-134 扁平形式：顶层 address 非空 → 以顶层
+    // id/security/level/email 构造 vnext[0]（覆盖显式 vnext；Go Build 里
+    // flat 时 user 只取顶层 Level/Email/ID/Security）。形态同 trojan flat。
+    let v = if v.get("address").and_then(|a| a.as_str()).is_some() {
+        let mut obj = v.as_object().cloned().unwrap_or_default();
+        obj.insert(
+            "vnext".into(),
+            serde_json::json!([{
+                "address": v.get("address"),
+                "port": v.get("port"),
+                "users": [{
+                    "id": v.get("id"),
+                    "security": v.get("security"),
+                    "level": v.get("level"),
+                    "email": v.get("email"),
+                }],
+            }]),
+        );
+        serde_json::Value::Object(obj)
+    } else {
+        v
+    };
     let vnext = v
         .get("vnext")
         .and_then(|v| v.as_array())
@@ -737,6 +759,36 @@ mod tests {
             }]
         }"#;
         assert!(parse_vmess_config(data.as_bytes()).is_ok());
+    }
+
+    /// Go infra/conf/vmess.go:112-134 扁平形式：顶层 address/id/security 构造
+    /// vnext[0]，覆盖显式 vnext；缺 id 时等价 vnext 路径报 missing id。
+    #[test]
+    fn parse_vmess_config_flat_top_level_fields() {
+        let data = br#"{
+            "address": "flat.example.com",
+            "port": 8443,
+            "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+            "security": "aes-128-gcm",
+            "level": 2,
+            "email": "flat@x.test"
+        }"#;
+        let config = parse_vmess_config(data).unwrap();
+        assert_eq!(config.server_port.value(), 8443);
+        assert_eq!(config.level, 2);
+        assert_eq!(config.email, "flat@x.test");
+        assert!(matches!(config.security, SecurityType::Aes128Gcm));
+        match &config.server_address {
+            Address::Domain(d) => assert_eq!(d, "flat.example.com"),
+            other => panic!("unexpected address: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_vmess_config_flat_missing_id_fails() {
+        let data = br#"{ "address": "flat.example.com", "port": 443 }"#;
+        let err = parse_vmess_config(data).unwrap_err();
+        assert!(err.contains("id"), "unexpected error: {err}");
     }
 
     /// 模拟 Go vmess inbound 的 `SetFlushNext` 缓冲语义：服务端解码请求头后

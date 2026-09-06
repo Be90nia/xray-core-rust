@@ -180,28 +180,24 @@ async fn dial_kcp(
         Arc::new(config),
     ));
 
-    // 7. spawn fetch_input 循环（在后台读取 UDP 包并分发到 Connection）。
-    //    持 Weak 而非 Arc：conn drop（含 task abort 等无 shutdown 路径）后，
-    //    ConnectionInner::drop → closer 置 closed 标志 → read_packet 退出，
-    //    本 blocking task 结束——否则 Runtime::drop 等待永不返回（测试挂死）。
+    // 7. spawn fetch_input 循环（后台读 UDP 包并分发到 Connection）。
+    //    铁律：阻塞读 packet_input 期间绝不持有 conn 强引用。若持 Arc 等待，
+    //    Connection 的最后一个强引用在循环自己手里 → ConnectionInner::drop
+    //    永不发生 → closer 置 closed 标志永不触发 → read_packet 永不返回
+    //    （自持挂死；Runtime::drop 等待 blocking task = 测试/进程挂死）。
+    //    正确形态：先 read_packet 阻塞读，读到包后再 upgrade 分发。
     let conn_weak = Arc::downgrade(&conn);
     let reader = KCPPacketReader::new();
     tokio::task::spawn_blocking(move || {
         loop {
+            let Some(payload) = packet_input.read_packet() else { break };
             let Some(conn_now) = conn_weak.upgrade() else { break };
-            match packet_input.read_packet() {
-                Some(payload) => {
-                    let segments = reader.read(&payload);
-                    if !segments.is_empty() {
-                        conn_now.input(segments);
-                    }
-                }
-                None => break,
+            let segments = reader.read(&payload);
+            if !segments.is_empty() {
+                conn_now.input(segments);
             }
         }
     });
-
-
 
     Ok(Box::new(KcpConn::new(conn)))
 }

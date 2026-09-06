@@ -1,7 +1,7 @@
 //! 切片 A 端到端集成测试：mock HTTP server + dial_packet_up。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use webpki_roots::TLS_SERVER_ROOTS;
 
-use xray_transport_splithttp::client::{DefaultDialerClient, DialTarget};
+use xray_transport_splithttp::client::{DefaultDialerClient, DialTarget, Fingerprint};
 use xray_transport_splithttp::config::Config;
 use xray_transport_splithttp::dialer::dial_packet_up;
 use xray_transport_splithttp::error::SplitHttpError;
@@ -112,6 +112,7 @@ async fn dial_packet_up_end_to_end_via_mock_http1_server() {
         config,
         tls_config,
         DialTarget { host: "127.0.0.1".into(), port: server_addr.port(), sni: String::new() },
+        None,
     ));
 
     let base_uri = format!("http://127.0.0.1:{}/", server_addr.port());
@@ -174,6 +175,7 @@ async fn post_packet_returns_bad_status_on_500() {
         config,
         tls_config,
         DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() },
+        None,
     ));
     let base_uri = format!("http://127.0.0.1:{}/", addr.port());
 
@@ -218,6 +220,7 @@ async fn open_stream_returns_bad_status_on_non_200() {
         config,
         tls_config,
         DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() },
+        None,
     ));
     let base_uri = format!("http://127.0.0.1:{}/", addr.port());
 
@@ -227,4 +230,151 @@ async fn open_stream_returns_bad_status_on_non_200() {
         matches!(err, SplitHttpError::BadStatus(404)),
         "expected BadStatus(404), got {err:?}"
     );
+}
+
+// ===== tlsSettings.fingerprint 出站（btls u_client connector）端到端 =====
+
+/// 自签证书 TLS mock server：ALPN 可配，h1/h2 双协议 serve。
+async fn mock_splithttp_tls_server(
+    listener: TcpListener,
+    server_cfg: std::sync::Arc<rustls::ServerConfig>,
+    use_http2: bool,
+    download_payload: Vec<u8>,
+    got_get: std::sync::Arc<AtomicBool>,
+) {
+    let acceptor = tokio_rustls::TlsAcceptor::from(server_cfg);
+    loop {
+        let Ok((stream, _)) = listener.accept().await else { break };
+        let acceptor = acceptor.clone();
+        let dl = download_payload.clone();
+        let got_get = got_get.clone();
+        tokio::spawn(async move {
+            let Ok(tls) = acceptor.accept(stream).await else { return };
+            let svc = service_fn(move |req: Request<Incoming>| {
+                let dl = dl.clone();
+                let got_get = got_get.clone();
+                async move {
+                    if req.method() == Method::GET {
+                        got_get.store(true, Ordering::Relaxed);
+                        Ok::<_, std::convert::Infallible>(
+                            Response::builder().status(StatusCode::OK)
+                                .body(Full::new(Bytes::from(dl))).unwrap(),
+                        )
+                    } else {
+                        Ok(Response::builder().status(StatusCode::OK)
+                            .body(Full::new(Bytes::new())).unwrap())
+                    }
+                }
+            });
+            if use_http2 {
+                let _ = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection(TokioIo::new(tls), svc)
+                    .await;
+            } else {
+                let _ = http1::Builder::new().serve_connection(TokioIo::new(tls), svc).await;
+            }
+        });
+    }
+}
+
+/// 自签证书 server config（ALPN 决定协商结果 → hyper 的 HTTP 版本判定）。
+fn self_signed_server_config(alpn: Vec<Vec<u8>>) -> std::sync::Arc<rustls::ServerConfig> {
+    let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+    let key = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+    let mut cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.cert.der().clone()], key)
+        .unwrap();
+    cfg.alpn_protocols = alpn;
+    std::sync::Arc::new(cfg)
+}
+
+async fn spawn_fingerprint_test(
+    use_http2: bool,
+    alpn: Vec<Vec<u8>>,
+) -> (Arc<AtomicBool>, tokio::task::JoinHandle<()>, u16) {
+    ensure_crypto_provider();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let payload = if use_http2 { b"fp-download-h2" } else { b"fp-download-h1" }.to_vec();
+    let got_get = Arc::new(AtomicBool::new(false));
+    let server = tokio::spawn(mock_splithttp_tls_server(
+        listener,
+        self_signed_server_config(alpn),
+        use_http2,
+        payload,
+        got_get.clone(),
+    ));
+    let _ = payload;
+    (got_get, server, addr.port())
+}
+
+/// fingerprint=chrome 出站：btls 指纹握手 + ALPN 协商 http/1.1 → hyper h1 roundtrip。
+#[tokio::test]
+async fn fingerprint_btls_end_to_end_http1() {
+    let (got_get, server, port) = spawn_fingerprint_test(false, vec![b"http/1.1".to_vec()]).await;
+    let config = Arc::new(Config {
+        host: format!("127.0.0.1:{port}"),
+        path: "/".into(),
+        ..Default::default()
+    });
+    let client = Arc::new(DefaultDialerClient::new(
+        config,
+        make_tls_config(),
+        DialTarget { host: "127.0.0.1".into(), port, sni: String::new() },
+        Some(Fingerprint::Chrome),
+    ));
+
+    let mut conn = dial_packet_up(
+        client,
+        format!("https://127.0.0.1:{port}/"),
+        "fp-sess".into(),
+        1024,
+        0,
+    )
+    .await
+    .unwrap();
+    let mut buf = vec![0u8; b"fp-download-h1".len()];
+    conn.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"fp-download-h1");
+    assert!(got_get.load(Ordering::Relaxed), "server must see the GET");
+
+    drop(conn);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    server.abort();
+}
+
+/// fingerprint=chrome 出站：ALPN 协商 h2 → connector 标记 negotiated_h2 → hyper h2。
+#[tokio::test]
+async fn fingerprint_btls_end_to_end_http2() {
+    let (got_get, server, port) = spawn_fingerprint_test(true, vec![b"h2".to_vec()]).await;
+    let config = Arc::new(Config {
+        host: format!("127.0.0.1:{port}"),
+        path: "/".into(),
+        ..Default::default()
+    });
+    let client = Arc::new(DefaultDialerClient::new(
+        config,
+        make_tls_config(),
+        DialTarget { host: "127.0.0.1".into(), port, sni: String::new() },
+        Some(Fingerprint::Chrome),
+    ));
+
+    let mut conn = dial_packet_up(
+        client,
+        format!("https://127.0.0.1:{port}/"),
+        "fp-sess".into(),
+        1024,
+        0,
+    )
+    .await
+    .unwrap();
+    let mut buf = vec![0u8; b"fp-download-h2".len()];
+    conn.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"fp-download-h2");
+    assert!(got_get.load(Ordering::Relaxed), "server must see the GET");
+
+    drop(conn);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    server.abort();
 }

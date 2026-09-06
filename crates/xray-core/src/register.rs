@@ -605,6 +605,39 @@ impl xray_features::stats::Manager for AppStatsFeature {
         self.manager.get_all_online_users()
     }
 }
+
+/// bd 3xmjx：metrics `/metrics` 端点的真实 stats 源。
+///
+/// 对应 Go app/metrics/metrics.go:181-196 `stats()`——VisitCounters 解析
+/// `>>>` 命名计数器（`inbound>>>tag>>>traffic>>>uplink`），len<4 跳过；
+/// 类型取 [0]（inbound/outbound/user），tag/user 取 [1]，方向取 [3]。
+impl xray_app_metrics::StatsCollector for AppStatsFeature {
+    fn collect(&self) -> xray_app_metrics::StatsSnapshot {
+        use xray_features::stats::Manager as _;
+        let mut snap = xray_app_metrics::StatsSnapshot::default();
+        self.manager.visit_counters(&mut |name, counter| {
+            let parts: Vec<&str> = name.split(">>>").collect();
+            if parts.len() < 4 {
+                return true; // Go len(nameSplit) < 4 跳过
+            }
+            let value = counter.value();
+            let entry = match parts[0] {
+                "inbound" => snap.inbound.entry(parts[1].to_string()).or_default(),
+                "outbound" => snap.outbound.entry(parts[1].to_string()).or_default(),
+                "user" => snap.user.entry(parts[1].to_string()).or_default(),
+                _ => return true,
+            };
+            match parts[3] {
+                "uplink" => entry.uplink = value,
+                "downlink" => entry.downlink = value,
+                _ => {}
+            }
+            true
+        });
+        snap
+    }
+}
+
 /// Commander (api) 真实 factory：解析 JSON `ApiConfig` → [`Commander`]。
 ///
 /// 对应 Go `app/commander` 的 `init()` + `New(ctx, config)`。`xray-conf` 把 `api`
@@ -928,6 +961,42 @@ mod tests {
         // unregister 后查询为空。
         mgr.unregister_counter(name);
         assert!(mgr.get_counter(name).is_none());
+    }
+
+    /// bd 3xmjx：AppStatsFeature 作为 metrics StatsCollector——`>>>` 命名
+    /// 解析（Go metrics.go:181-196）：[0]=类型、[1]=tag/user、[3]=方向；
+    /// len<4 与未知类型跳过。
+    #[test]
+    fn app_stats_feature_collects_metrics_snapshot() {
+        use xray_app_metrics::StatsCollector as _;
+        use xray_features::stats::Manager as _;
+
+        let mgr = AppStatsFeature::new();
+        mgr.register_counter("inbound>>>socks-in>>>traffic>>>uplink")
+            .expect("register")
+            .add(111);
+        mgr.register_counter("inbound>>>socks-in>>>traffic>>>downlink")
+            .expect("register")
+            .add(222);
+        mgr.register_counter("outbound>>>direct>>>traffic>>>uplink")
+            .expect("register")
+            .add(7);
+        mgr.register_counter("user>>>a@b>>>traffic>>>downlink")
+            .expect("register")
+            .add(9);
+        // len<4 与未知类型/方向：跳过。
+        mgr.register_counter("short>>>name").expect("register");
+        mgr.register_counter("bogus>>>x>>>traffic>>>uplink").expect("register");
+        mgr.register_counter("inbound>>>socks-in>>>traffic>>>sideways")
+            .expect("register");
+
+        let snap = mgr.collect();
+        assert_eq!(snap.inbound["socks-in"].uplink, 111);
+        assert_eq!(snap.inbound["socks-in"].downlink, 222);
+        assert_eq!(snap.outbound["direct"].uplink, 7);
+        assert_eq!(snap.user["a@b"].downlink, 9);
+        assert_eq!(snap.outbound.len(), 1, "bogus type must not land");
+        assert_eq!(snap.inbound.len(), 1, "unknown direction must not land");
     }
 
     #[test]

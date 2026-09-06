@@ -73,6 +73,12 @@ impl MetricsFeature {
         self
     }
 
+    /// 装配阶段注入 stats 收集器（`&self` 版本：Instance 持 `Arc<MetricsFeature>`
+    /// 时调用，bd 3xmjx；内部 RwLock，start 前生效）。
+    pub fn set_stats_collector(&self, stats: Arc<dyn StatsCollector>) {
+        *self.stats.write() = stats;
+    }
+
     /// 注入 observation 收集器。
     #[must_use]
     pub fn with_obs_collector(self, obs: Arc<dyn ObservationCollector>) -> Self {
