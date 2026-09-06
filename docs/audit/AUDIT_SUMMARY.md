@@ -216,3 +216,59 @@ trojan/hysteria 混淆层字节级全绿;vmess/ENC/ss2022/REALITY 主体一致(4
 
 纠正第一轮 completeness.md「freedom destOverride 完整」的误判(实际生产不消费)——已在 simple_proxy.md 标注。
 
+
+---
+
+# 第五轮:协议级配置全链审计 (2026-09-06,5 协议族,用户点名的最后一块)
+
+方法:以 Go infra/conf 全部 JSON 字段为基准,逐字段比对 Rust serde 解析命名→生产消费点,**inbound/outbound 双侧**。产出 5 份报告、约 **416 个字段级判定**。
+
+## 第五轮统计
+
+| 报告 | 字段判定 | P0 | P1 | P2 | P3 |
+|---|---|---|---|---|---|
+| [cfg_vless.md](cfg_vless.md) | ≈70 | 0 | 0 | 8 | 9 |
+| [cfg_vmess_trojan.md](cfg_vmess_trojan.md) | 38 | 0 | 4 | 4 | 13 |
+| [cfg_ss_socks.md](cfg_ss_socks.md) | 68 | 0 | 4 | 8 | 7 |
+| [cfg_stream.md](cfg_stream.md) | ≈148 | 0 | 8 | 16 | 6 |
+| [cfg_misc.md](cfg_misc.md) | ≈92 | 0 | 2 | 5 | 4 |
+| **小计** | **≈416** | **0** | **18** | **41** | **39** |
+
+## 五轮总计: P0×4 / P1×71 / P2×166 / P3×101 ≈ 342 条
+
+## 第五轮 P1(18 条)——配置静默失效实锤(用户直觉正确)
+
+**认证/安全类(最严重)**:
+- HTTP inbound `users` 键未解析(只读 accounts)→ Go 风格配置 **Basic 认证静默关闭=开放代理** (inbound.rs:2266)
+- anytls 入站零认证(mock 不校验密码,settings 无 password 键) anytls/server.rs:109
+- socks `udp:false` 零消费 → ASSOCIATE 恒开 server.rs:247
+- grpc 入站不校验 serviceName(任意 POST 放行,反探测失效) grpc/transport.rs:100
+- splithttp xPaddingObfsMode 服务端校验桩恒放行(反探测场景裸奔) hub/handler.rs:379
+
+**Go 标准键静默丢(用户配置不生效)**:
+- VMess inbound `users` 主键丢弃 → 零用户全拒无日志(仅认 clients)
+- SS `users` 主键未解析 + 2022 relay Go 形态(users[].address/port)不认 → 静默落单用户
+- VMess/Trojan outbound 平铺形式(顶层 address/port)不支持 → 拒启
+- wireguard 六键(preSharedKey/keepAlive/allowedIPs/mtu/reserved/domainStrategy)解析层全丢 → **Cloudflare Warp 类节点直接不可用**
+- splithttp `sessionIDPlacement`/`sessionIDKey` 键名错位(读 sessionPlacement/sessionKey)
+- splithttp `noSSEHeader` 解析缺键(伪装分支不可用)
+- sockopt `tproxy` 类型错位(string 枚举当 bool)→ **透明代理全废**
+- acceptProxyProtocol 双入口全断 → PROXY 协议场景拿不到真实源地址
+
+**出站断链**:
+- tlsSettings.fingerprint 仅 tcp/REALITY 出站生效,ws/grpc/httpupgrade/splithttp **静默走标准指纹**(抗探测归零)
+- grpc 出站 6 字段(authority/user_agent/idle_timeout 等)解析未消费
+- Trojan fallbacks dest 数字形式静默落 127.0.0.1:80(错后端)
+
+## 横切结论(第五轮核心发现)
+
+**"Go 主键 vs Rust 别名"模式系统性存在**:vless clients(SS/trojan/vmess/socks/http 同族——vless 做了旧名回退,其余五协议都没做,回退实现本身在仓库里已有可抄)。
+**协议层 camelCase 键名错位与 app 层(第二轮)同病**,覆盖:users/sessionIDPlacement/noSSEHeader/tproxy/obfsPassword 等。
+
+## 确认干净(字段级,节选)
+
+VLESS ENC 双侧全链逐字节干净(padding 切片公式同构+interop 4/4 实证);kcpSettings 主干六键双侧生效;finalmask.quicParams 13 项对称;TUIC 出站全键消费;mkcp header 族 6/6 对齐;naive 结构一致。约 416 判定中 ✅ 生效约 230。
+
+## 过程事故(记录)
+
+reviewer 代理无写盘工具+单次输出流超时 → 5 路中 4 路报告初写失败;经"分段落盘"指令自救 3 份 + 誊写员验收 2 份恢复,**零发现丢失**(TranscribeStream 验收修正 cfg_stream 统计错报并恢复漏列发现#8)。
