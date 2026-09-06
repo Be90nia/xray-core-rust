@@ -46,10 +46,7 @@ use xray_proxy_vless::VlessOutboundConfig;
 use xray_transport::dialer::StreamSettings;
 use xray_transport::link::Link;
 // mux outbound：client 数据路径
-use xray_mux::client::{
-    ClientManager, ClientWorker, DialingWorkerFactory, IncrementalWorkerPicker, UnderlyingSlot,
-    WorkerPicker,
-};
+use xray_mux::client::{DialingWorkerFactory, IncrementalWorkerPicker, UnderlyingSlot};
 use xray_mux::session::ClientStrategy;
 // 补全协议注册
 use xray_proxy_hysteria::HysteriaConfig;
@@ -788,7 +785,10 @@ fn try_build_handler(
 /// 拨向 v1.mux.cool:9527）。底层 handler 经 [`UnderlyingSlot`] 延迟注入。
 pub struct MuxBridge {
     tag: String,
-    client_manager: Arc<ClientManager>,
+    /// worker 选择器（直接持 Arc：`pick_internal` async 路径才能按需
+    /// bootstrap 首个 worker——`ClientManager::dispatch` 的 sync
+    /// `pick_available` 无法创建，见 xray-mux handler.rs:138 注脚）。
+    picker: Arc<IncrementalWorkerPicker>,
     slot: UnderlyingSlot,
 }
 
@@ -803,12 +803,11 @@ impl MuxBridge {
         // 空槽构造：register Phase 2 拿到底层 handler 后 set_underlying。
         let slot: UnderlyingSlot = Arc::new(parking_lot::RwLock::new(None));
         let factory = Arc::new(DialingWorkerFactory::with_slot(Arc::clone(&slot), strategy));
-        let picker = Box::new(IncrementalWorkerPicker::new(factory));
-        let client_manager = Arc::new(ClientManager::new(true, picker));
+        let picker = Arc::new(IncrementalWorkerPicker::new(factory));
         (
             Self {
                 tag: tag.into(),
-                client_manager,
+                picker,
                 slot: Arc::clone(&slot),
             },
             slot,
@@ -820,10 +819,10 @@ impl MuxBridge {
         *self.slot.write() = Some(handler);
     }
 
-    /// 是否启用 mux。
+    /// 是否启用 mux（muxJson 在场即启用，与既有构造恒 true 一致）。
     #[must_use]
     pub fn is_enabled(&self) -> bool {
-        self.client_manager.enabled
+        true
     }
 }
 
@@ -843,19 +842,52 @@ impl DispatchHandler for MuxBridge {
     fn dispatch(&self, dest: &Destination, link: Link) -> PinFuture<()> {
         let dest = dest.clone();
         let tag = self.tag.clone();
-        let client_manager = Arc::clone(&self.client_manager);
+        let picker = Arc::clone(&self.picker);
         Box::pin(async move {
-            // pick worker → ClientWorker::dispatch 把 link 桥成 mux session
-            let worker = match client_manager.dispatch() {
-                Ok(w) => w,
-                Err(e) => {
-                    tracing::warn!(tag = %tag, error = %e, "mux dispatch: no worker available");
-                    drop(link);
-                    return;
-                }
+            // pick（或 bootstrap）worker → ClientWorker::dispatch 把 link 桥成 mux session
+            let Some(worker) = picker.pick_internal().await else {
+                tracing::warn!(tag = %tag, "mux dispatch: no worker available");
+                drop(link);
+                return;
             };
             let inner = xray_mux::client::Link { reader: link.reader, writer: link.writer };
             if !worker.dispatch(&dest, inner).await {
+                tracing::warn!(tag = %tag, "mux dispatch: worker full, dropping link");
+            }
+        })
+    }
+
+    /// bd 4jyhm：带源调度（Go client.go:271 `xudp.GetGlobalID(ctx)`）——
+    /// UDP 目标 + cone 启用（`xray.cone.disabled` 未设）时按入站源
+    /// （`access.from`，协议层 UDP relay 填充）计算 XUDP GlobalID 随 New 帧
+    /// 下发，服务端按 GlobalID 复用 cone 会话。TCP/无源走普通 dispatch。
+    /// Go 另按 inbound.Name 白名单（dokodemo/socks/shadowsocks/tun）过滤；
+    /// Rust 侧 UDP relay 链路必带 from，等价语义由「from 非空 + UDP dest」表达。
+    fn dispatch_with_access(
+        &self,
+        dest: &Destination,
+        link: Link,
+        access: xray_app_dispatcher::default::AccessContext,
+    ) -> PinFuture<()> {
+        if dest.network() != xray_common::net::network::Network::UDP || access.from.is_empty() {
+            return self.dispatch(dest, link);
+        }
+        let dest = dest.clone();
+        let tag = self.tag.clone();
+        let picker = Arc::clone(&self.picker);
+        let input = xray_xudp::GlobalIdInput {
+            source: format!("udp:{}", access.from),
+            source_network: xray_common::net::network::Network::UDP,
+            cone: !xray_common::platform::env::cone_disabled(),
+        };
+        Box::pin(async move {
+            let Some(worker) = picker.pick_internal().await else {
+                tracing::warn!(tag = %tag, "mux dispatch: no worker available");
+                drop(link);
+                return;
+            };
+            let inner = xray_mux::client::Link { reader: link.reader, writer: link.writer };
+            if !worker.dispatch_with_source(&dest, inner, Some(&input)).await {
                 tracing::warn!(tag = %tag, "mux dispatch: worker full, dropping link");
             }
         })
@@ -3913,6 +3945,186 @@ mod tests {
         // ANCOUNT=1（fake IP 一条）。
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 1);
     }
+
+    /// bd 4jyhm：MuxBridge::dispatch_with_access——UDP 目标 + 入站源时
+    /// carrier New 帧必须携带 XUDP GlobalID（Go client.go:271
+    /// `xudp.GetGlobalID(ctx)` 语义）；TCP 目标退化为无源 dispatch。
+    #[tokio::test]
+    async fn mux_bridge_dispatch_with_access_carries_global_id_for_udp() {
+        use xray_buf::io::Reader as _;
+        use xray_buf::io::Writer as _;
+        use tokio::io::AsyncWriteExt as _;
+
+        // ---- 捕获 carrier 字节的假 underlying（DialingWorkerFactory 拨号落点）----
+        #[derive(Debug)]
+        struct CaptureUnderlying {
+            captured: Arc<parking_lot::Mutex<Vec<u8>>>,
+        }
+        impl DispatchHandler for CaptureUnderlying {
+            fn tag(&self) -> &str {
+                "capture-underlying"
+            }
+            fn dispatch(&self, _dest: &Destination, link: Link) -> PinFuture<()> {
+                let captured = Arc::clone(&self.captured);
+                Box::pin(async move {
+                    let mut r = xray_buf::reader::BufferedReader::new(link.reader);
+                    loop {
+                        match r.read_multi_buffer().await {
+                            Ok(mb) if !mb.is_empty() => {
+                                let mut c = captured.lock();
+                                for b in mb.iter() {
+                                    c.extend_from_slice(b.bytes());
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                })
+            }
+        }
+
+        let (bridge, slot) = MuxBridge::new("mux-gid", 4);
+        let captured: Arc<parking_lot::Mutex<Vec<u8>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        bridge.set_underlying(Arc::new(CaptureUnderlying {
+            captured: Arc::clone(&captured),
+        }));
+
+        // 子会话 link：client 侧首包 "probe" 随 New 帧下发。
+        let (mut child_client, child_server) = tokio::io::duplex(64 * 1024);
+        let (sr, sw) = tokio::io::split(child_server);
+        let link = Link::new(xray_buf::io::new_reader(sr), xray_buf::io::new_writer(sw));
+        child_client.write_all(b"probe").await.unwrap();
+
+        let dest = Destination::udp(
+            Address::ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+            Port::new(53),
+        );
+        let access = xray_app_dispatcher::default::AccessContext {
+            from: "10.0.0.9:5555".to_string(),
+            ..Default::default()
+        };
+        // session done 永不等来（无回程），spawn 丢后半程——只关心 carrier 字节。
+        let fut = bridge.dispatch_with_access(&dest, link, access);
+        let task = tokio::spawn(fut);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let snap = captured.lock().clone();
+                if snap.len() > 6 {
+                    let meta_len = u16::from_be_bytes([snap[0], snap[1]]) as usize;
+                    if snap.len() >= 2 + meta_len {
+                        break snap;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("carrier New frame within timeout");
+
+        let snap = captured.lock().clone();
+        let meta_len = u16::from_be_bytes([snap[0], snap[1]]) as usize;
+        let (meta, _) = xray_mux::frame::FrameMetadata::read_from_bytes(&snap[..2 + meta_len])
+            .expect("parse New frame meta");
+        let expected_gid = xray_xudp::global_id(&xray_xudp::GlobalIdInput {
+            source: "udp:10.0.0.9:5555".to_string(),
+            source_network: xray_common::net::network::Network::UDP,
+            cone: true,
+        });
+        assert_ne!(expected_gid, [0u8; 8]);
+        assert_eq!(
+            meta.global_id(),
+            Some(&expected_gid),
+            "UDP New frame must carry source-derived GlobalID"
+        );
+        task.abort();
+    }
+
+    /// bd 4jyhm 对称面：TCP 目标不携带 GlobalID（Go GetGlobalID 仅 UDP 源）。
+    #[tokio::test]
+    async fn mux_bridge_dispatch_with_access_tcp_has_no_global_id() {
+        use xray_buf::io::Reader as _;
+        use xray_buf::io::Writer as _;
+        use tokio::io::AsyncWriteExt as _;
+
+        #[derive(Debug)]
+        struct CaptureUnderlying {
+            captured: Arc<parking_lot::Mutex<Vec<u8>>>,
+        }
+        impl DispatchHandler for CaptureUnderlying {
+            fn tag(&self) -> &str {
+                "capture-underlying-tcp"
+            }
+            fn dispatch(&self, _dest: &Destination, link: Link) -> PinFuture<()> {
+                let captured = Arc::clone(&self.captured);
+                Box::pin(async move {
+                    let mut r = xray_buf::reader::BufferedReader::new(link.reader);
+                    loop {
+                        match r.read_multi_buffer().await {
+                            Ok(mb) if !mb.is_empty() => {
+                                let mut c = captured.lock();
+                                for b in mb.iter() {
+                                    c.extend_from_slice(b.bytes());
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                })
+            }
+        }
+
+        let (bridge, slot) = MuxBridge::new("mux-gid-tcp", 4);
+        let captured: Arc<parking_lot::Mutex<Vec<u8>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        bridge.set_underlying(Arc::new(CaptureUnderlying {
+            captured: Arc::clone(&captured),
+        }));
+
+        let (mut child_client, child_server) = tokio::io::duplex(64 * 1024);
+        let (sr, sw) = tokio::io::split(child_server);
+        let link = Link::new(xray_buf::io::new_reader(sr), xray_buf::io::new_writer(sw));
+        child_client.write_all(b"probe").await.unwrap();
+
+        let dest = Destination::new(
+            Address::new_domain("example.com".to_string()),
+            Port::new(443),
+            xray_common::net::network::Network::TCP,
+        );
+        let access = xray_app_dispatcher::default::AccessContext {
+            from: "10.0.0.9:5555".to_string(),
+            ..Default::default()
+        };
+        let fut = bridge.dispatch_with_access(&dest, link, access);
+        let task = tokio::spawn(fut);
+
+        let snap = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let s = captured.lock().clone();
+                if s.len() > 6 {
+                    let meta_len = u16::from_be_bytes([s[0], s[1]]) as usize;
+                    if s.len() >= 2 + meta_len {
+                        break s;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("carrier New frame within timeout");
+
+        let meta_len = u16::from_be_bytes([snap[0], snap[1]]) as usize;
+        let (meta, _) = xray_mux::frame::FrameMetadata::read_from_bytes(&snap[..2 + meta_len])
+            .expect("parse New frame meta");
+        assert_eq!(
+            meta.global_id(),
+            None,
+            "TCP New frame must not carry GlobalID"
+        );
+        task.abort();
+    }
+
 
     /// e2e：ownLink（inbound tag = nameserver client tag）→ 原样转发不劫持。
     #[tokio::test]

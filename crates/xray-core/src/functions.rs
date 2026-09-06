@@ -283,6 +283,13 @@ async fn start_full_dispatched(
     dispatcher.stats = instance
         .get_feature::<crate::register::AppStatsFeature>()
         .map(|f| f as Arc<dyn xray_features::stats::Manager>);
+    // bd 3xmjx：metrics `/metrics` 端点接真实 stats manager（非 EmptyStats）——
+    // 对应 Go metrics.New(ctx) RequireFeatures 拿 stats.Manager。
+    if let Some(metrics) = instance.get_feature::<xray_app_metrics::MetricsFeature>() {
+        if let Some(stats) = instance.get_feature::<crate::register::AppStatsFeature>() {
+            metrics.set_stats_collector(stats);
+        }
+    }
     // per-tag UDP443 策略（bd g35）：mux JSON → dispatch_link 前置检查
     dispatcher.udp443_policies = crate::outbound::parse_udp443_policies(&built.outbounds);
     // FakeDNS 注入（对应 Go dispatcher.fdns，嗅探阶段反查 fake IP 域名）：
@@ -2474,6 +2481,63 @@ mod tests {
             h.abort();
         }
     }
+
+    /// bd 3xmjx：metrics app 装配接线——start_full 后 `/metrics` 输出真实
+    /// stats 计数（非 EmptyStats）：注册 counter 后 HTTP body 必须含值。
+    #[tokio::test]
+    async fn integration_metrics_app_exposes_real_stats_counters() {
+        use xray_features::stats::Manager as _;
+
+        // 1. 探测空闲端口给 metrics listen。
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let metrics_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let mut cfg = BuiltConfig::default();
+        cfg.apps.push(BuiltEntry {
+            kind: "metrics".into(),
+            data: format!(r#"{{"listen":"127.0.0.1:{metrics_port}"}}"#).into_bytes(),
+        });
+        let (inst, _, handles) = start_full(&cfg).await.expect("metrics config start");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 2. 经 AppStatsFeature 注册并累计一个 counter。
+        let stats = inst
+            .get_feature::<crate::register::AppStatsFeature>()
+            .expect("stats feature injected");
+        stats
+            .register_counter("inbound>>>m-in>>>traffic>>>uplink")
+            .expect("register")
+            .add(777);
+
+        // 3. GET /metrics 必须看到 777（EmptyStats 只输出 HELP/TYPE 头）。
+        let mut resp = TcpStream::connect(format!("127.0.0.1:{metrics_port}"))
+            .await
+            .expect("connect metrics http");
+        resp.write_all(b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut body = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), resp.read_to_end(&mut body))
+            .await
+            .expect("read metrics body within timeout")
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        let hit = text.contains("xray_traffic_bytes{type=\"inbound\",tag=\"m-in\",direction=\"uplink\"} 777");
+        assert!(
+            hit,
+            "/metrics must expose real stats counter, got: {text}"
+        );
+        // 关停 metrics HTTP server（accept task 随 close 退出，否则测试进程
+        // 退出阶段被挂起任务拖住）。
+        if let Some(mf) = inst.get_feature::<xray_app_metrics::MetricsFeature>() {
+            let _ = mf.close();
+        }
+        for h in handles.iter() {
+            h.abort();
+        }
+    }
+
 
     /// 测试用：跳过证书校验的 verifier。
     #[derive(Debug)]

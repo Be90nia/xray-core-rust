@@ -22,7 +22,7 @@ use xray_common::net::port::Port;
 use xray_transport::connection::Connection;
 use xray_transport::dialer::{dial_with_settings, StreamSettings};
 use xray_transport::finalmask::parse_finalmask_udp_chain;
-use xray_transport::listener_registry::{listen_tcp, ConnHandler};
+use xray_transport::listener_registry::{listen_tcp, ConnHandler, TransportListener};
 use xray_transport::sockopt::SocketOptions;
 use xray_transport_kcp::{register_dialer, register_listener};
 
@@ -123,14 +123,16 @@ fn echo_handler() -> ConnHandler {
     })
 }
 
-async fn setup_server(settings: &StreamSettings) -> SocketAddr {
+async fn setup_server(settings: &StreamSettings) -> (SocketAddr, Box<dyn TransportListener>) {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let listener = listen_tcp(addr, settings.clone(), SocketOptions::default(), echo_handler())
         .await
         .expect("listen mkcp");
     let local = listener.local_addr().expect("local addr");
-    std::mem::forget(listener); // 保活接收循环（Go 同样：listener 由 hub 生命周期持有）
-    local
+    // listener 由调用方持有至测试体结束：drop → hub.close() → spawn_blocking 接收循环
+    // ≤200ms 退出。不可 mem::forget：hub 永不关闭会使接收循环无限运行，
+    // tokio Runtime::drop 等待 blocking task 永不返回 = 测试挂死。
+    (local, listener)
 }
 
 async fn roundtrip_through(proxy_addr: SocketAddr, settings: &StreamSettings) -> Vec<u8> {
@@ -162,7 +164,7 @@ async fn mask_on_roundtrip_and_wire_bytes_are_masked() {
         register_listener().unwrap();
 
         let settings = mkcp_settings(Some(MASK_ON));
-        let server_addr = setup_server(&settings).await;
+        let (server_addr, _listener) = setup_server(&settings).await;
         let proxy = RecordingProxy::start(server_addr);
 
         // 1. 数据 roundtrip
@@ -189,7 +191,7 @@ async fn mask_off_roundtrip_unchanged_and_wire_is_bare_kcp() {
         register_listener().unwrap();
 
         let settings = mkcp_settings(None);
-        let server_addr = setup_server(&settings).await;
+        let (server_addr, _listener) = setup_server(&settings).await;
         let proxy = RecordingProxy::start(server_addr);
 
         let echoed = roundtrip_through(proxy.addr, &settings).await;

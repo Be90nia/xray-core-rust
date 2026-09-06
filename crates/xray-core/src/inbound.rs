@@ -73,6 +73,7 @@ pub async fn serve_socks5(
     listener: TcpListener,
     ohm: Arc<SimpleOhm>,
     config: Arc<ServerConfig>,
+    handshake_timeout: Option<std::time::Duration>,
 ) -> std::io::Result<()> {
     let handler = ohm
         .get_default_handler()
@@ -95,7 +96,9 @@ pub async fn serve_socks5(
         let handler = Arc::clone(&handler);
         let config = Arc::clone(&config);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, peer, &config, &handler).await {
+            if let Err(e) =
+                handle_connection(stream, peer, &config, &handler, handshake_timeout).await
+            {
                 tracing::debug!(error = %e, "socks5 connection ended with error");
             }
         });
@@ -104,18 +107,32 @@ pub async fn serve_socks5(
 }
 
 /// 处理单个 SOCKS 连接：handshake → dispatch（TCP CONNECT）或 UDP relay。
-///
-/// 兼容 SOCKS4/4a/5。UDP ASSOCIATE 时 spawn relay pump 并保持 TCP 控制连接。
 async fn handle_connection(
     mut stream: TcpStream,
     peer: std::net::SocketAddr,
     config: &ServerConfig,
     handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,
+    handshake_timeout: Option<std::time::Duration>,
 ) -> std::io::Result<()> {
-    // 1. SOCKS 握手（兼容 4/4a/5）
-    let socks_req = socks_handshake(&mut stream, config)
-        .await
-        .map_err(|e| std::io::Error::other(format!("socks handshake: {e}")))?;
+    // 1. SOCKS 握手（兼容 4/4a/5）；受握手限时约束（Go proxy/socks/server.go
+    // Process: SetReadDeadline(policy().Timeouts.Handshake)，超时断开；仅覆盖
+    // 握手阶段，dispatch 数据路径不限时）
+    let socks_req = {
+        let handshake_fut = socks_handshake(&mut stream, config);
+        let res = match handshake_timeout {
+            Some(d) => tokio::time::timeout(d, handshake_fut).await,
+            None => Ok(handshake_fut.await),
+        };
+        match res {
+            Ok(r) => r.map_err(|e| std::io::Error::other(format!("socks handshake: {e}")))?,
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "socks handshake timeout",
+                ))
+            }
+        }
+    };
 
     match socks_req {
         SocksRequest::UdpAssociate(_, relay_socket) => {
@@ -324,8 +341,16 @@ async fn serve_mixed(
             let n = match read_res { Ok(Ok(n)) => n, _ => return };
             if n == 0 { return; }
             if sniff[0] == 0x05 {
-                // SOCKS5 路径
-                match socks_handshake(&mut stream, &socks_cfg).await {
+                // SOCKS5 路径（握手与 sniff/http 段共用同一限时）
+                let hs_fut = socks_handshake(&mut stream, &socks_cfg);
+                let hs = match handshake_timeout {
+                    Some(d) => match tokio::time::timeout(d, hs_fut).await {
+                        Ok(r) => r,
+                        Err(_) => return,
+                    },
+                    None => hs_fut.await,
+                };
+                match hs {
                     Ok(SocksRequest::TcpConnect(addr)) => {
                         let dest = socks_addr_to_destination(&addr, Network::TCP);
                         let (read_half, write_half) = tokio::io::split(stream);
@@ -1204,6 +1229,22 @@ type SsUdpItem = (Destination, Vec<u8>, xray_proxy_ss::config::MemoryAccount);
 /// SS UDP per-client 会话空闲淘汰时限（Go `CancelAfterInactivity(1min)`）。
 const SS_UDP_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// SS-2022 UDP AEAD 会话表存活期（bd 29nk，对齐 sing-shadowsocks
+/// `udpSessions: LruCache{WithAge(udpTimeout)}`——Go Xray inbound.go:57
+/// `NewServiceWithPassword(..., 500, ...)` 传 udpTimeout=500s）。
+const SS2022_UDP_SESSION_LIFETIME: std::time::Duration = std::time::Duration::from_secs(500);
+
+/// 惰性清扫过期的 AEAD 会话条目（对齐 sing LruCache `maybeDeleteOldest`：
+/// Store/Load 时从表里删 `expires <= now`；`WithUpdateAgeOnGet` 由调用方
+/// 命中时刷新 deadline 表达）。返回清扫后条数。
+fn sweep_expired_ss2022_sessions(
+    server_sessions: &mut HashMap<u64, (Arc<xray_proxy_ss::ss2022::packet::ServerUdpSession2022>, std::time::Instant)>,
+    now: std::time::Instant,
+) -> usize {
+    server_sessions.retain(|_, (_, deadline)| *deadline > now);
+    server_sessions.len()
+}
+
 /// SS Legacy UDP relay 入口。
 ///
 /// 对应 Go `proxy/shadowsocks/server.go::handleUDPPayload`：recv_from →
@@ -1339,7 +1380,10 @@ pub async fn serve_ss2022_udp(
     let mut buf = vec![0u8; 65_536];
     type Item = (Destination, Vec<u8>, SocketAddr);
     let mut sessions: HashMap<u64, tokio::sync::mpsc::Sender<Item>> = HashMap::new();
-    let mut server_sessions: HashMap<u64, Arc<ServerUdpSession2022>> = HashMap::new();
+    let mut server_sessions: HashMap<
+        u64,
+        (Arc<ServerUdpSession2022>, std::time::Instant),
+    > = HashMap::new();
     loop {
         let (n, client) = match udp.recv_from(&mut buf).await {
             Ok(v) => v,
@@ -1351,6 +1395,10 @@ pub async fn serve_ss2022_udp(
         // ponytail: 收包时顺带清扫已退出（60s 空闲淘汰）会话的残留 sender；
         // O(sessions)/包，海量并发 UDP 客户端时换后台定时清扫
         sessions.retain(|_, tx| !tx.is_closed());
+        // bd 29nk：顺带惰性清扫超龄（500s 无活动）AEAD 会话——表此前只增不删，
+        // 海量 UDP 客户端下是内存泄漏；对齐 Go sing udpSessions LRU 淘汰。
+        let now = std::time::Instant::now();
+        sweep_expired_ss2022_sessions(&mut server_sessions, now);
         // 1. ECB 解头 + EIH 用户识别
         let hdr = match server_decode_header(kind, &server_psk, &users, &buf[..n]) {
             Ok(h) => h,
@@ -1364,7 +1412,7 @@ pub async fn serve_ss2022_udp(
         if !server_sessions.contains_key(&sid) {
             match ServerUdpSession2022::new(kind, hdr.aead_psk.to_vec(), sid) {
                 Ok(s) => {
-                    server_sessions.insert(sid, Arc::new(s));
+                    server_sessions.insert(sid, (Arc::new(s), now + SS2022_UDP_SESSION_LIFETIME));
                 }
                 Err(e) => {
                     tracing::debug!(error = %e, "ss2022 udp session init failed");
@@ -1372,9 +1420,12 @@ pub async fn serve_ss2022_udp(
                 }
             }
         }
-        let Some(session) = server_sessions.get(&sid) else {
+        // 命中即刷新存活期（sing WithUpdateAgeOnGet 语义）。
+        let Some((session, deadline)) = server_sessions.get_mut(&sid) else {
             continue;
         };
+        *deadline = now + SS2022_UDP_SESSION_LIFETIME;
+        let session = Arc::clone(session);
         // 3. AEAD 解 body + 解析目标（重放/时间戳校验在 decode_body 内）
         let (address, port, payload) = match session.decode_body(
             &hdr.hdr,
@@ -1394,7 +1445,7 @@ pub async fn serve_ss2022_udp(
             tokio::spawn(ss2022_udp_client_relay(
                 Arc::clone(&udp),
                 client,
-                Arc::clone(session),
+                Arc::clone(&session),
                 rx,
                 Arc::clone(&handler),
             ));
@@ -1934,9 +1985,11 @@ async fn spawn_one_inbound(
         "socks" => {
             let listener = TcpListener::bind(&addr).await?;
             let config = Arc::new(parse_socks_server_config(&ib.entry.data)?);
+            // 握手限时（Go proxy/socks：SetReadDeadline(policy().Timeouts.Handshake)）
+            let handshake_timeout = Some(handshake_timeout_for(&policy, config.user_level));
             tracing::info!(tag = %ib.tag, addr = %addr, auth = ?config.auth_type, udp = config.udp_enabled, "socks5 inbound listening");
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                serve_socks5(listener, ohm, config).await
+                serve_socks5(listener, ohm, config, handshake_timeout).await
             })))
         }
         "mixed" => {
@@ -2234,10 +2287,11 @@ async fn spawn_one_inbound(
         "anytls" => {
             let bind_addr: std::net::SocketAddr = addr.parse()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("parse addr: {e}")))?;
-            let tls_acceptor = parse_anytls_tls_acceptor(&ib.entry.data)?;
+            let (tls_acceptor, password) = parse_anytls_tls_acceptor(&ib.entry.data)?;
             let handler = xray_proxy_anytls::AnytlsInboundHandler::new(
                 &ib.tag, bind_addr, tls_acceptor,
-            );
+            )
+            .with_password(password);
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                 handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))
             })))
@@ -2996,11 +3050,13 @@ fn build_hysteria_tls_server_config(
         .map_err(|e| std::io::Error::other(format!("rustls server config: {e}")))?)
 }
 
-/// 从 inbound entry.data（JSON）解析 anytls TLS acceptor。
+/// 从 inbound entry.data（JSON）解析 anytls TLS acceptor + 认证密码。
 ///
-/// JSON 格式：`{"cert":"...","key":"..."}`（PEM 格式）。
-/// 缺省时用自签名证书（仅测试场景）。
-fn parse_anytls_tls_acceptor(data: &[u8]) -> std::io::Result<tokio_rustls::TlsAcceptor> {
+/// JSON 格式：`{"cert":"...","key":"...","password":"..."}`（cert/key 为 PEM）。
+/// cert/key 缺省时用自签名证书（仅测试场景）；password 缺省时不校验客户端认证帧。
+fn parse_anytls_tls_acceptor(
+    data: &[u8],
+) -> std::io::Result<(tokio_rustls::TlsAcceptor, Option<String>)> {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("anytls inbound settings JSON: {e}")))?;
@@ -3038,7 +3094,12 @@ fn parse_anytls_tls_acceptor(data: &[u8]) -> std::io::Result<tokio_rustls::TlsAc
         .with_no_client_auth()
         .with_single_cert(vec![cert_der.into()], key_der)
         .map_err(|e| std::io::Error::other(format!("rustls server config: {e}")))?;
-    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
+    let password = v
+        .get("password")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    Ok((tokio_rustls::TlsAcceptor::from(Arc::new(config)), password))
 }
 
 /// 从 inbound entry.data（JSON）解析 wireguard inbound 配置。
@@ -3252,6 +3313,22 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "got: {err}");
     }
 
+    /// bd 1zko8：anytls settings 解析补 password——`password` 键解析为
+    /// Some；缺省/空串为 None（不校验）；cert/key 缺省走自签（测试场景）。
+    #[test]
+    fn parse_anytls_tls_acceptor_password() {
+        let (acceptor, pw) = parse_anytls_tls_acceptor(br#"{"password":"s3cret"}"#).unwrap();
+        assert_eq!(pw.as_deref(), Some("s3cret"));
+        let _ = acceptor; // 自签构造成功即合法
+
+        let (_, pw) = parse_anytls_tls_acceptor(b"{}").unwrap();
+        assert_eq!(pw, None, "missing password must stay None");
+
+        let (_, pw) = parse_anytls_tls_acceptor(br#"{"password":""}"#).unwrap();
+        assert_eq!(pw, None, "empty password must stay None");
+    }
+
+
 
     /// ect：`hysteriaSettings.masquerade` JSON → proxy HysteriaConfig.masq
     /// （Go infra/conf transport_internet.go:498-549 展开路径）。
@@ -3427,6 +3504,36 @@ mod tests {
         let (_addr, _port, data) = client.decode(&rbuf[..n]).unwrap();
         assert_eq!(data, b"ss2022-via-dispatch");
     }
+
+    /// bd 29nk：server_sessions 过期清扫——deadline <= now 的条目被清
+    /// （sing LruCache `expires <= now` 删语义），存活条目保留，空表 no-op。
+    #[test]
+    fn sweep_expired_ss2022_sessions_drops_only_expired() {
+        use xray_proxy_ss::ss2022::key::CipherKind2022;
+        use xray_proxy_ss::ss2022::packet::ServerUdpSession2022;
+
+        let mk = |sid: u64| {
+            Arc::new(ServerUdpSession2022::new(CipherKind2022::Aes256Gcm, vec![7u8; 32], sid).unwrap())
+        };
+        let now = std::time::Instant::now();
+        let mut table: HashMap<u64, (Arc<ServerUdpSession2022>, std::time::Instant)> = HashMap::new();
+        // expired：deadline 恰等于 now（边界，Go `expires <= now` 删）。
+        table.insert(1, (mk(1), now));
+        // expired：deadline 已过。
+        table.insert(2, (mk(2), now - std::time::Duration::from_secs(1)));
+        // alive：还有 300s。
+        table.insert(3, (mk(3), now + std::time::Duration::from_secs(300)));
+
+        assert_eq!(sweep_expired_ss2022_sessions(&mut table, now), 1);
+        assert!(table.contains_key(&3), "alive session must survive sweep");
+        assert!(!table.contains_key(&1), "boundary-dead session must be swept");
+        assert!(!table.contains_key(&2), "past-deadline session must be swept");
+
+        assert_eq!(sweep_expired_ss2022_sessions(&mut table, now), 1);
+        let mut empty: HashMap<u64, (Arc<ServerUdpSession2022>, std::time::Instant)> = HashMap::new();
+        assert_eq!(sweep_expired_ss2022_sessions(&mut empty, now), 0);
+    }
+
 
     /// agb：SS-2022 UDP inbound → freedom UDP dispatch → 真 echo 回环 e2e
     /// （FreedomDispatchBridge 的 UDP 分支走 udp::relay，DialBridge 仅 TCP）。
@@ -3892,7 +3999,7 @@ mod tests {
         let config = Arc::new(ServerConfig::default());
         let ohm_clone = Arc::clone(&ohm);
         tokio::spawn(async move {
-            let _ = serve_socks5(socks_listener, ohm_clone, config).await;
+            let _ = serve_socks5(socks_listener, ohm_clone, config, None).await;
         });
 
         // 4. SOCKS5 client：连 socks5 → handshake → 请求 echo server → 写数据 → 读 echo
@@ -4537,6 +4644,46 @@ mod tests {
         let n = client.read(&mut buf).await.unwrap();
         let elapsed = t0.elapsed();
         assert_eq!(n, 0, "expected EOF after handshake timeout");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(100),
+            "disconnect should come from timeout, not immediate: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "timeout too slow: {elapsed:?}"
+        );
+    }
+
+    /// socks 握手限时行为测试：客户端连上后保持静默，handshake_timeout 到期
+    /// → 服务端断开 → 客户端读到 EOF（Go proxy/socks SetReadDeadline 语义）。
+    /// None 时不限时由既有握手 e2e 覆盖。
+    #[tokio::test]
+    async fn serve_socks5_handshake_timeout_disconnects_silent_client() {
+        use tokio::io::AsyncReadExt;
+
+        let ohm = Arc::new(SimpleOhm::new());
+        let bridge = Arc::new(DestCaptureDispatch {
+            dest: parking_lot::Mutex::new(None),
+        }) as Arc<dyn xray_app_dispatcher::DispatchHandler>;
+        ohm.set_default(bridge);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = Arc::new(parse_socks_server_config(b"{}").unwrap());
+        tokio::spawn(serve_socks5(
+            listener,
+            ohm,
+            config,
+            Some(std::time::Duration::from_millis(120)),
+        ));
+
+        // 客户端连接后不发任何字节：超时到期 → 服务端断开 → EOF。
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let t0 = std::time::Instant::now();
+        let mut buf = [0u8; 16];
+        let n = client.read(&mut buf).await.unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(n, 0, "expected EOF after socks handshake timeout");
         assert!(
             elapsed >= std::time::Duration::from_millis(100),
             "disconnect should come from timeout, not immediate: {elapsed:?}"

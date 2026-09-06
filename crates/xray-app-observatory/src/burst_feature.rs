@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 use xray_features::{Feature, FeatureError, Result};
 
 use crate::burst::{BurstObserver, HealthPingConfig, HealthPingSettings};
-use crate::observer::ProbeExecutor;
+use crate::observer::{HttpProbeExecutor, ProbeExecutor};
 
 /// Burst Observatory app Feature 实现。包装 [`BurstObserver`] + 调度 IO。
 pub struct BurstObservatoryFeature {
@@ -97,6 +97,24 @@ impl Feature for BurstObservatoryFeature {
         self.observer.stop_scheduler();
         Ok(())
     }
+
+    /// bd 2umqf：装配阶段接线（对应 Go RequireFeatures 拿 outbound.Manager +
+    /// dispatcher）。`outbound_selector` 到场（`init_dependencies` 二次注入，
+    /// functions.rs bag2）时用 health ping settings 构造 [`HttpProbeExecutor`]
+    /// 注入——subject 非空时 `start` 不再 StartFailed。幂等：已注入跳过
+    /// （f23r 双阶段注入惯例，factory 阶段仍不注入）。
+    fn init_dependencies(&self, deps: &xray_features::DepBag) {
+        if deps.outbound_selector.is_none() || self.executor.lock().is_some() {
+            return;
+        }
+        let s = self.observer.settings();
+        let timeout_ms = (s.timeout / 1_000_000).max(1) as u64;
+        self.set_io(Arc::new(HttpProbeExecutor::new(
+            s.destination.clone(),
+            s.http_method.clone(),
+            timeout_ms,
+        )));
+    }
 }
 
 #[cfg(test)]
@@ -156,5 +174,43 @@ mod tests {
         assert_eq!(s.interval, 15_000_000_000);
         assert_eq!(s.timeout, 3_000_000_000);
         assert_eq!(s.http_method, "GET");
+    }
+
+    struct NoTags;
+    impl xray_features::OutboundTagSelector for NoTags {
+        fn select_by_prefix(&self, _prefixes: &[String]) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    /// bd 2umqf：init_dependencies 接线——DepBag 带 outbound_selector 时注入
+    /// executor，subject 非空的 start 不再 StartFailed；无 selector 时仍
+    /// fail-fast（factory 阶段无 DepBag 的 f23r 语义保持）。
+    #[tokio::test]
+    async fn init_dependencies_wires_executor_and_start_succeeds() {
+        // destination 指向本地必败端口，探测循环不碰外网。
+        let ping = serde_json::json!({
+            "destination": "http://127.0.0.1:1/",
+            "interval": 3_600_000_000_000i64,
+            "timeout": 500_000_000i64,
+        });
+        let f = BurstObservatoryFeature::new("out-a".into(), Some(&ping));
+        f.start()
+            .expect_err("without bag injection start must still fail");
+
+        let sel: Arc<dyn xray_features::OutboundTagSelector> = Arc::new(NoTags);
+        let bag = xray_features::DepBag::new().with_outbound_selector(sel);
+        f.init_dependencies(&bag);
+        f.start().expect("start after init_dependencies must succeed");
+        assert!(f.observer.is_scheduler_running());
+        f.close().expect("close");
+    }
+
+    #[test]
+    fn init_dependencies_without_selector_stays_unwired() {
+        let f = BurstObservatoryFeature::new("out-a".into(), None);
+        f.init_dependencies(&xray_features::DepBag::new());
+        let err = f.start().expect_err("no selector → no executor → StartFailed");
+        assert!(matches!(err, FeatureError::StartFailed { .. }));
     }
 }

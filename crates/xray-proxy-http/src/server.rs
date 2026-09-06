@@ -230,12 +230,20 @@ where
     let method = parts[0].to_ascii_uppercase();
     let target = parts[1].to_string();
 
-    // 2. 读 headers
+    // 2. 读 headers（最多 [`MAX_HTTP_HEADER_LINES`] 行，防无界头部注入；
+    // Go http.ReadRequest 语义下请求行+headers 共享 1MB 总预算，此处按行数收紧）
     let mut headers: HashMap<String, String> = HashMap::new();
+    let mut header_lines = 0usize;
     loop {
         let line = read_http_line(stream).await?;
         if line.is_empty() {
             break;
+        }
+        header_lines += 1;
+        if header_lines > MAX_HTTP_HEADER_LINES {
+            return Err(HttpProxyError::InvalidRequest(format!(
+                "too many HTTP header lines (>{MAX_HTTP_HEADER_LINES})"
+            )));
         }
         if let Some((k, v)) = line.split_once(':') {
             headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
@@ -302,6 +310,13 @@ where
     })
 }
 
+/// 单行（请求行/头部行）字节上限。Go `http.ReadRequest` 对请求行+headers 共享
+/// `DefaultMaxHeaderBytes`(1MB) 总预算；本实现逐字节读行，按 16KB/行收紧
+/// （正常 HTTP 头远低于此），防御恶意无界行撑爆内存。
+const MAX_HTTP_LINE_BYTES: usize = 16 * 1024;
+/// 请求头最大行数（不含请求行）。Go 无显式行数限制（受 1MB 总预算约束）；
+/// 此处 128 行等价收紧，防慢速逐行注入。
+const MAX_HTTP_HEADER_LINES: usize = 128;
 /// 读一行 HTTP header（到 `\r\n`，返回不含 `\r\n` 的内容）。
 async fn read_http_line<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<String> {
     let mut buf = Vec::with_capacity(128);
@@ -321,6 +336,11 @@ async fn read_http_line<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Strin
         prev_was_cr = byte[0] == b'\r';
         if !prev_was_cr {
             buf.push(byte[0]);
+            if buf.len() > MAX_HTTP_LINE_BYTES {
+                return Err(HttpProxyError::InvalidRequest(format!(
+                    "http header line exceeds {MAX_HTTP_LINE_BYTES} bytes"
+                )));
+            }
         }
     }
     String::from_utf8(buf)
@@ -521,6 +541,30 @@ mod tests {
         assert!(result.is_err());
         assert!(resp.contains("407"), "got: {resp}");
         assert!(resp.contains("Proxy-Authenticate"));
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_oversized_line() {
+        // 请求行超长（> MAX_HTTP_LINE_BYTES）→ InvalidRequest。Go http.ReadRequest
+        // 以 DefaultMaxHeaderBytes(1MB) 总预算拒绝超界流量，此处按 16KB/行收紧。
+        let mut req = b"CONNECT ".to_vec();
+        req.extend(std::iter::repeat_n(b'a', MAX_HTTP_LINE_BYTES + 1));
+        req.extend_from_slice(b":443 HTTP/1.1\r\n\r\n");
+        let (_, result) = tcp_handshake(&req, ServerConfig::default()).await;
+        assert!(result.is_err(), "oversized request line must be rejected");
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_too_many_header_lines() {
+        // 129 个 header 行（> MAX_HTTP_HEADER_LINES）→ InvalidRequest。
+        // Go 无显式行数限制（1MB 总预算约束），此处按 128 行收紧。
+        let mut req = b"CONNECT example.com:443 HTTP/1.1\r\n".to_vec();
+        for i in 0..=MAX_HTTP_HEADER_LINES {
+            req.extend_from_slice(format!("X-Pad-{i}: v\r\n").as_bytes());
+        }
+        req.extend_from_slice(b"\r\n");
+        let (_, result) = tcp_handshake(&req, ServerConfig::default()).await;
+        assert!(result.is_err(), "too many header lines must be rejected");
     }
 
     #[tokio::test]

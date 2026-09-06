@@ -197,6 +197,18 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for InitialedReader<R
     }
 }
 
+/// 握手限时来源（Go SessionDefault 60s）。独立成函数仅为可测性：cfg(test)
+/// 下收短到 100ms，让"静默客户端 → 超时断开"行为测试无需真实等待 60s；
+/// 产品路径（非 test）恒为 SessionDefault 真值。
+#[cfg(not(test))]
+fn handshake_timeout() -> std::time::Duration {
+    xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT
+}
+
+#[cfg(test)]
+fn handshake_timeout() -> std::time::Duration {
+    std::time::Duration::from_millis(100)
+}
 /// 带 fallback 的连接处理（Go `vless/inbound/inbound.go::Process` 语义）：
 ///
 /// 1. 预读 first buffer（最多 1024 字节）
@@ -240,18 +252,39 @@ where
         None => Box::pin(stream),
     };
 
-    // 无 fallback 策略：维持原直连路径（不做 first 预读）
+    // 握手限时（Go inbound.go:281-284：SetReadDeadline(policy 或 SessionDefault
+    // 60s) 在 ENC 握手之后、首包读之前设置；deadline 覆盖首包预读 + decode 总
+    // 时长，decode 成功或 fallback 时解除）。vless crate 不持 policy manager，
+    // 用 SessionDefault 60s 兜底（同 xray-core handshake_timeout_for 无 policy 分支）。
+    let handshake_deadline =
+        tokio::time::Instant::now() + handshake_timeout();
+
+    // 无 fallback 策略：维持原直连路径（不做 first 预读；deadline 由
+    // handle_connection 内部建立，语义同上）
     let Some(policy) = fallbacks else {
         return handle_connection(stream, handler, validator, options, raw_tcp).await;
     };
 
     let (mut read_half, write_half) = tokio::io::split(stream);
 
-    // 1. 预读 first buffer（读到至少 1 字节）
+    // 1. 预读 first buffer（读到至少 1 字节；受握手限时约束，超时即断开）
     let mut first = vec![0u8; 1024];
     let mut n = 0;
     while n == 0 {
-        let read = read_half.read(&mut first[n..]).await?;
+        let read = match tokio::time::timeout_at(
+            handshake_deadline,
+            read_half.read(&mut first[n..]),
+        )
+        .await
+        {
+            Ok(r) => r?,
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "vless handshake read timeout",
+                ))
+            }
+        };
         if read == 0 {
             return Ok(()); // 客户端未发数据即关闭
         }
@@ -262,27 +295,31 @@ where
     // 2. VLESS 候选：首字节是 VERSION → 回灌后正常 decode；失败也走 fallback
     if first[0] == VERSION {
         let mut reader = InitialedReader::new(first.clone(), read_half);
-        if let Ok(decoded) =
-            decode_request_header(false, &mut None, &mut reader, validator.as_ref()).await
-        {
-            return finish_vless_dispatch(reader, write_half, decoded, handler, options, raw_tcp)
+        let mut fb_first: Option<Vec<u8>> = None;
+        let decode_fut =
+            decode_request_header(false, &mut fb_first, &mut reader, validator.as_ref());
+        let decoded = match tokio::time::timeout_at(handshake_deadline, decode_fut).await {
+            Ok(Ok(decoded)) => decoded,
+            // decode 失败/超时（含握手限时到期）→ fallback（Go inbound.go:314-318
+            // isfb 时清 read deadline 走 fallback；timeout_at 中断未破坏底层流，
+            // 已读字节经 into_parts 不重放，语义同下）
+            _ => {
+                let (_, read_half_back) = reader.into_parts();
+                return do_fallback(
+                    read_half_back,
+                    write_half,
+                    &first,
+                    &policy,
+                    peer,
+                    local,
+                    &tls_name,
+                    &tls_alpn,
+                )
                 .await;
-        }
-        // ponytail: decode 失败时 decode 已续读的 stream 字节不重放（Go 用
-        // connection buffer replay）；version=0 的畸形流量才走到这，正常
-        // fallback 客户端（first[0]!=VERSION）不受影响。
-        let (_, read_half_back) = reader.into_parts();
-        return do_fallback(
-            read_half_back,
-            write_half,
-            &first,
-            &policy,
-            peer,
-            local,
-            &tls_name,
-            &tls_alpn,
-        )
-        .await;
+            }
+        };
+        return finish_vless_dispatch(reader, write_half, decoded, handler, options, raw_tcp)
+            .await;
     }
 
     // 3. 非 VLESS 流量：直接 fallback
@@ -638,11 +675,23 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
 ) -> std::io::Result<()> {
     let mut stream = stream;
 
+    // 握手限时（Go inbound.go:281-284：decode 前 SetReadDeadline(policy 或
+    // SessionDefault 60s)，覆盖整个 decode 阶段；vless crate 不持 policy
+    // manager，用 SessionDefault 60s 兜底）
+    let handshake_deadline =
+        tokio::time::Instant::now() + handshake_timeout();
+
     // 1. decode VLESS request header（isfb=false，全部从 stream 读）
     let mut first: Option<Vec<u8>> = None;
-    let decoded = decode_request_header(false, &mut first, &mut stream, validator.as_ref())
-        .await
-        .map_err(|e| std::io::Error::other(format!("vless decode: {e}")))?;
+    let decoded = tokio::time::timeout_at(
+        handshake_deadline,
+        decode_request_header(false, &mut first, &mut stream, validator.as_ref()),
+    )
+    .await
+    .map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "vless handshake read timeout")
+    })?
+    .map_err(|e| std::io::Error::other(format!("vless decode: {e}")))?;
 
     // 2. 按 command 分派：拆 reader/writer 后交 finish_vless_dispatch。
     let (read_half, write_half) = tokio::io::split(stream);
@@ -650,9 +699,6 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
 }
 
 // ---------------------------------------------------------------------------
-// 测试
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1229,6 +1275,45 @@ mod tests {
                 let _ = reader.read_multi_buffer().await;
             })
         }
+    }
+
+    /// 握手限时（Go inbound.go:281-284 SetReadDeadline(SessionDefault 60s)）：
+    /// 客户端连上后保持静默 → 超时到期 → 服务端以 TimedOut 退出、连接关闭、
+    /// dispatch 不被调用。cfg(test) 下限时收短为 100ms（见 handshake_timeout）。
+    #[tokio::test]
+    async fn vless_handshake_timeout_closes_silent_connection() {
+        let capture = std::sync::Arc::new(CaptureDispatchHandler::new());
+        let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> = capture.clone();
+        let (_, validator) = make_validator_with_user();
+        let validator: Arc<dyn Validator> = validator;
+
+        let (mut client, server_stream) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn({
+            let handler_for_task = handler.clone();
+            let validator = validator.clone();
+            async move {
+                handle_connection(server_stream, &handler_for_task, &validator, None, None).await
+            }
+        });
+
+        // 静默不发任何字节：跳过握手限时（cfg(test) 下为 100ms）。
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // 服务端以超时错误退出
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
+        assert!(result.is_ok(), "server should exit after handshake timeout");
+        let joined = result.unwrap();
+        assert!(
+            matches!(&joined, Ok(Err(e)) if e.kind() == std::io::ErrorKind::TimedOut),
+            "expected TimedOut error, got: {joined:?}"
+        );
+        assert_eq!(*capture.called.lock(), 0, "dispatch must not run");
+
+        // 客户端读到 EOF（对端已关闭）
+        let mut buf = [0u8; 16];
+        let n = client.read(&mut buf).await.unwrap_or(0);
+        assert_eq!(n, 0, "connection should be closed after handshake timeout");
     }
 
     /// VLESS Mux command + enable_mux=true + 首字节 0xFF：dispatch 应被调用一次，

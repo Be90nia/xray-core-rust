@@ -96,6 +96,10 @@ pub fn x25519_key_share_private_raw(ssl: *mut btls_sys::SSL) -> Option<[u8; 32]>
 }
 
 /// per-SSL REALITY hooks 注册表（transcript 回调按 ssl 裸指针查找）。
+///
+/// 键 = SSL 裸指针地址。地址复用不串号由 [`RealityHooksGuard`] 保证：
+/// 条目只被注册它的同一实例删除（`Arc::ptr_eq` compare-and-remove），
+/// 且 `connect_reality` 全路径保证注销先于 SSL 释放（先注销后 free）。
 static REALITY_HOOKS: parking_lot::Mutex<Option<HashMap<usize, Arc<dyn RealityHooks>>>> =
     parking_lot::Mutex::new(None);
 static TRAMPOLINE_INSTALLED: std::sync::Once = std::sync::Once::new();
@@ -137,6 +141,38 @@ pub fn unregister_reality_hooks(ssl_key: usize) {
     }
 }
 
+
+/// per-SSL hooks 的 RAII guard：构造即注册，drop 时 compare-and-remove。
+///
+/// 对应 Go 的函数作用域生命周期：`connect_reality` 中 new 失败、connect
+/// 失败、verify 失败、成功返回每条路径都经过 guard drop，注册/注销必然
+/// 对称；drop 仅当表中条目仍是自己注册的实例（[`Arc::ptr_eq`]）才删除，
+/// SSL 释放后地址复用时旧 guard 不会误删新连接的条目。
+struct RealityHooksGuard {
+    ssl_key: usize,
+    hooks: Arc<dyn RealityHooks>,
+}
+
+impl RealityHooksGuard {
+    fn register(ssl_key: usize, hooks: &Arc<dyn RealityHooks>) -> Self {
+        register_reality_hooks(ssl_key, Arc::clone(hooks));
+        Self { ssl_key, hooks: Arc::clone(hooks) }
+    }
+}
+
+impl Drop for RealityHooksGuard {
+    fn drop(&mut self) {
+        let mut table = REALITY_HOOKS.lock();
+        if let Some(map) = table.as_mut() {
+            if map
+                .get(&self.ssl_key)
+                .is_some_and(|h| Arc::ptr_eq(h, &self.hooks))
+            {
+                map.remove(&self.ssl_key);
+            }
+        }
+    }
+}
 /// 导出当前 SSL 的 X25519 key share 私钥（32 字节 raw；`&SslRef` 版，BIO 路径用）。
 #[must_use]
 pub fn x25519_key_share_private(ssl: &SslRef) -> Option<[u8; 32]> {
@@ -231,8 +267,10 @@ where
     // ssl_add_message_cbb（transcript 计入前）回调改写 ClientHello。
     // BIO 层改写（HelloRewriteStream）已废弃 —— transcript 会与线上 bytes
     // 不一致导致握手密钥错乱（BAD_DECRYPT）。
+    // guard 对称注册/注销（new 失败 `?`、connect 失败、verify 失败、成功
+    // 返回全部覆盖）；每条路径在 SSL 释放前显式注销，杜绝地址复用窗口。
     let ssl_key = ssl.as_ptr() as usize;
-    register_reality_hooks(ssl_key, Arc::clone(&hooks));
+    let hooks_guard = RealityHooksGuard::register(ssl_key, &hooks);
     let rewrite_stream = HelloRewriteStream { inner: stream };
 
     let tls_stream = TokioSslStream::new(ssl, rewrite_stream)
@@ -240,14 +278,16 @@ where
 
     let mut pinned = Box::pin(tls_stream);
     let connect_result = pinned.as_mut().connect().await;
-    unregister_reality_hooks(ssl_key);
     if let Err(e) = connect_result {
+        drop(hooks_guard); // 提前返回时 SSL 随 pinned 释放，须先注销
         eprintln!("[REALITY dbg] SslStream::connect failed: {e:?}");
         return Err(io::Error::new(io::ErrorKind::ConnectionAborted, e.to_string()));
     }
 
     // REALITY 证书验证（HMAC-SHA512；失败 = 真证书/MITM → 断连）
-    hooks.verify_handshake(pinned.ssl())?;
+    let verify = hooks.verify_handshake(pinned.ssl());
+    drop(hooks_guard); // verify 失败提前返回时 SSL 随 pinned 释放，须先注销
+    verify?;
 
     Ok(BtlsConn::from_parts(pinned, fingerprint, server_name))
 }
@@ -282,6 +322,98 @@ mod tests {
         let mut buf = [0u8; 4];
         server.read_exact(&mut buf).await.unwrap();
         assert_eq!(buf, [5, 1, 2, 3]);
+    }
+
+    // ===== RealityHooksGuard 注册/注销对称性 =====
+
+    #[derive(Default)]
+    struct ProbeHooks {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl RealityHooks for ProbeHooks {
+        fn rewrite_client_hello(&self, _ssl: &SslRef, _record: &mut [u8]) -> io::Result<()> {
+            Ok(())
+        }
+        fn rewrite_client_hello_msg(&self, _ssl: RealitySslPtr, _msg: &mut [u8]) -> io::Result<()> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn registered_hooks(ssl_key: usize) -> Option<Arc<dyn RealityHooks>> {
+        REALITY_HOOKS
+            .lock()
+            .as_ref()
+            .and_then(|m| m.get(&ssl_key))
+            .cloned()
+    }
+
+    fn registry_contains(hooks: &Arc<dyn RealityHooks>) -> bool {
+        REALITY_HOOKS
+            .lock()
+            .as_ref()
+            .is_some_and(|m| m.values().any(|h| Arc::ptr_eq(h, hooks)))
+    }
+
+    /// guard 生命周期 = 注册表条目生命周期（`TokioSslStream::new` 失败
+    /// `?` 提前返回时由 guard drop 注销，不再泄漏条目）。
+    #[test]
+    fn hooks_guard_registers_and_unregisters() {
+        let key = 0xaaaa_usize;
+        let hooks: Arc<dyn RealityHooks> = Arc::new(ProbeHooks::default());
+        let guard = RealityHooksGuard::register(key, &hooks);
+        assert!(registered_hooks(key).is_some());
+        drop(guard);
+        assert!(registered_hooks(key).is_none());
+    }
+
+    /// 地址复用：同一键被新实例覆盖后，旧 guard drop 不得误删后继条目。
+    #[test]
+    fn hooks_guard_does_not_remove_successor_entry() {
+        let key = 0xbbbb_usize;
+        let old: Arc<dyn RealityHooks> = Arc::new(ProbeHooks::default());
+        let succ: Arc<dyn RealityHooks> = Arc::new(ProbeHooks::default());
+        let old_guard = RealityHooksGuard::register(key, &old);
+        let succ_guard = RealityHooksGuard::register(key, &succ); // 模拟地址复用后新连接注册
+        drop(old_guard);
+        let surviving = registered_hooks(key).expect("successor entry must survive");
+        assert!(Arc::ptr_eq(&surviving, &succ));
+        drop(succ_guard);
+        assert!(registered_hooks(key).is_none());
+    }
+
+    /// trampoline 按指针键派发：注销后同地址调用不得命中（残留串号防护）。
+    #[test]
+    fn trampoline_dispatches_only_to_registered_hooks() {
+        let key = 0xcccc_usize;
+        let probe = Arc::new(ProbeHooks::default());
+        let guard = RealityHooksGuard::register(key, &(Arc::clone(&probe) as Arc<dyn RealityHooks>));
+        let ssl = key as RealitySslPtr;
+        let mut msg = [1u8; 8];
+        assert_eq!(reality_rewrite_trampoline(ssl, msg.as_mut_ptr(), msg.len()), 1);
+        assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(guard);
+        assert_eq!(reality_rewrite_trampoline(ssl, msg.as_mut_ptr(), msg.len()), 1);
+        assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// connect_reality 提前失败（`?` 路径）后注册表不得残留该 hooks 实例。
+    #[tokio::test]
+    async fn connect_reality_unregisters_hooks_on_early_failure() {
+        use xray_transport::connection::DuplexConnection;
+
+        let (client, peer) = tokio::io::duplex(1024);
+        drop(peer); // 对端关闭 → 握手必败
+        let hooks: Arc<dyn RealityHooks> = Arc::new(ProbeHooks::default());
+        let result = connect_reality(
+            DuplexConnection::new(client),
+            "example.com",
+            Fingerprint::Chrome,
+            Arc::clone(&hooks),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!registry_contains(&hooks));
     }
 
 }

@@ -155,6 +155,9 @@ where T: AsyncRead + AsyncWrite + Send + Unpin + 'static {
     // grpc server 收满一个完整 message 才回 :status 200；若先等响应头，
     // 双方互等 → 服务端超时 RST（interop 实测 wire 证据）。
     let (client, server) = tokio::io::duplex(64 * 1024);
+    // multiMode 走 TunMulti RPC（每帧 MultiHunk，Go dial.go:65 NewMultiHunkConn）；
+    // 单 hunk 模式每帧 Hunk（Tun）。
+    let multi_mode = cfg.multi_mode;
     tokio::spawn(async move {
         let (mut rd, mut wr) = tokio::io::split(server);
         let up = async {
@@ -163,7 +166,11 @@ where T: AsyncRead + AsyncWrite + Send + Unpin + 'static {
                 let n = rd.read(&mut buf).await?;
                 if n==0 { let _=send_stream.send_data(Bytes::new(),true); break; }
                 // 每个 read chunk 一帧 gRPC message（hunk 载体，边界对上游流协议透明）
-                let frame = crate::encoding::encode_hunk_frame(&buf[..n]);
+                let frame = if multi_mode {
+                    crate::encoding::encode_multi_hunk_frame(&[&buf[..n]])
+                } else {
+                    crate::encoding::encode_hunk_frame(&buf[..n])
+                };
                 send_stream.send_data(Bytes::from(frame),false).map_err(io_err)?;
             }
             Ok::<_,io::Error>(())
@@ -176,10 +183,19 @@ where T: AsyncRead + AsyncWrite + Send + Unpin + 'static {
                 let d=d.map_err(io_err)?;
                 let _=recv_stream.flow_control().release_capacity(d.len());
                 acc.extend_from_slice(&d);
-                // DATA 流是连续 gRPC frames，逐帧解出 Hunk payload 下发
                 loop {
-                    match crate::encoding::decode_hunk_frame(&acc, None).map_err(io_err)? {
-                        Some((used, data)) => { acc.drain(..used); wr.write_all(&data).await?; }
+                    let frame = if multi_mode {
+                        crate::encoding::decode_multi_hunk_frame(&acc, None).map_err(io_err)?
+                    } else {
+                        crate::encoding::decode_hunk_frame(&acc, None)
+                            .map_err(io_err)?
+                            .map(|(used, data)| (used, vec![data]))
+                    };
+                    match frame {
+                        Some((used, datas)) => {
+                            acc.drain(..used);
+                            for data in datas { wr.write_all(&data).await?; }
+                        }
                         None => break,
                     }
                 }
@@ -197,6 +213,7 @@ pub async fn listen(addr: SocketAddr, settings: &StreamSettings, handler: ConnHa
     // 非空 serviceName → 请求 path 必须等于 normalize_grpc_path，否则 404；
     // 空 serviceName 保持现状全放行（兼容既有部署）。
     let expected_path = if cfg.service_name.is_empty() { None } else { Some(normalize_grpc_path(&cfg)) };
+    let multi_mode = cfg.multi_mode;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
     let tls_cfg = if !settings.security.is_empty() && settings.security != "none" {
@@ -213,11 +230,12 @@ pub async fn listen(addr: SocketAddr, settings: &StreamSettings, handler: ConnHa
         let (tcp,_) = match listener.accept().await { Ok(v)=>v, Err(_)=>continue };
         tcp.set_nodelay(true).ok();
         let h=handler.clone(); let tls=tls_cfg.clone(); let m=Some(tcpmask.clone()); let ep=expected_path.clone();
+        let mm=multi_mode;
         tokio::spawn(async move {
             if let Some(tc)=tls {
                 let acc=tokio_rustls::TlsAcceptor::from(tc);
-                match acc.accept(tcp).await { Ok(c)=>accept_h2(c,h,m,ep).await, Err(_)=>{} }
-            } else { accept_h2(tcp,h,m,ep).await; }
+                match acc.accept(tcp).await { Ok(c)=>accept_h2(c,h,m,ep,mm).await, Err(_)=>{} }
+            } else { accept_h2(tcp,h,m,ep,mm).await; }
         });
     }});
     Ok(Box::new(GrpcListener{local}))
@@ -228,6 +246,7 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
     handler: ConnHandler,
     tcpmask: Option<Arc<xray_transport::finalmask::TcpmaskManager>>,
     expected_path: Option<String>,
+    multi_mode: bool,
 ) {
     let mut h2_srv = match server::handshake(conn).await { Ok(s)=>s, Err(_)=>return };
     while let Some(r)=h2_srv.accept().await {
@@ -252,10 +271,13 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
             let (mut rd,mut wr)=tokio::io::split(server);
             // Go grpc-gun server 语义对称（参考 dial_h2）：下行 DATA 必须是
             // gRPC length-prefix 帧（裸字节被 Go client grpc 库当帧头误读）；
-            // 上行 DATA 是连续 gRPC 帧，逐帧解出 Hunk payload（剥 5B 帧头 +
-            // Hunk proto）再交给下游 inbound，否则协议头解析错位。
-            let s=async{let mut buf=vec![0u8;32*1024];loop{let n=rd.read(&mut buf).await?;if n==0{let _=send_resp.send_data(Bytes::new(),true);break;}let frame=crate::encoding::encode_hunk_frame(&buf[..n]);send_resp.send_data(Bytes::from(frame),false).map_err(io_err)?;}Ok::<_,io::Error>(())};
-            let r=async{let mut acc:Vec<u8>=Vec::new();while let Some(d)=recv_body.data().await{let d=d.map_err(io_err)?;let _=recv_body.flow_control().release_capacity(d.len());acc.extend_from_slice(&d);loop{match crate::encoding::decode_hunk_frame(&acc,None).map_err(io_err)?{Some((used,data))=>{acc.drain(..used);wr.write_all(&data).await?;}None=>break,}}}Ok::<_,io::Error>(())};
+            // multiMode 走 TunMulti RPC：每帧 MultiHunk（Go hub.go:40
+            // NewMultiHunkConn），下行解出 repeated bytes 逐段下发；单 hunk
+            // 模式每帧 Hunk。decode_multi_hunk_frame 才能解出多元素帧——
+            // 用 decode_hunk_frame 解 MultiHunk wire 会把 repeated bytes
+            // 合并覆盖，只留最后一个元素（截断 bug）。
+            let s=async{let mut buf=vec![0u8;32*1024];loop{let n=rd.read(&mut buf).await?;if n==0{let _=send_resp.send_data(Bytes::new(),true);break;}let frame=if multi_mode{crate::encoding::encode_multi_hunk_frame(&[&buf[..n]])}else{crate::encoding::encode_hunk_frame(&buf[..n])};send_resp.send_data(Bytes::from(frame),false).map_err(io_err)?;}Ok::<_,io::Error>(())};
+            let r=async{let mut acc:Vec<u8>=Vec::new();while let Some(d)=recv_body.data().await{let d=d.map_err(io_err)?;let _=recv_body.flow_control().release_capacity(d.len());acc.extend_from_slice(&d);loop{let frame=if multi_mode{crate::encoding::decode_multi_hunk_frame(&acc,None).map_err(io_err)?}else{crate::encoding::decode_hunk_frame(&acc,None).map_err(io_err)?.map(|(u,data)|(u,vec![data]))};match frame{Some((used,datas))=>{acc.drain(..used);for data in datas{wr.write_all(&data).await?;}}None=>break,}}}Ok::<_,io::Error>(())};
             let _=tokio::try_join!(s,r);
         });
         let conn: Box<dyn Connection> = match tcpmask.as_ref() {
@@ -331,6 +353,7 @@ fn resolve_user_agent(ua: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     fn cfg_single(name: &str) -> Config {
         let mut c = Config::default();
         c.service_name = name.to_string();
@@ -456,5 +479,105 @@ mod tests {
             .header("content-type", "application/grpc").body(()).unwrap();
         let (resp, _stream) = send_req.send_request(req, true).unwrap();
         assert_eq!(resp.await.unwrap().status(), 200);
+    }
+
+    /// multiMode 客户端（TunMulti）：上行每帧 MultiHunk；下行多元素 MultiHunk
+    /// 帧全部元素拼接到达（修复前 decode_hunk_frame 把 repeated bytes 覆盖
+    /// 合并只留最后元素 = 截断）。
+    #[tokio::test]
+    async fn dial_h2_multi_mode_roundtrips_multi_element_frames() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut cfg = Config::default();
+        cfg.multi_mode = true;
+
+        let server = tokio::spawn(async move {
+            let (server_tcp, _) = listener.accept().await.unwrap();
+            let mut h2s = server::handshake(server_tcp).await.unwrap();
+            let (req, mut respond) = h2s.accept().await.unwrap().unwrap();
+            // multiMode 路径名（normalize_grpc_path cfg_multi 语义）
+            assert_eq!(req.uri().path(), "/GunService/TunMulti");
+            // 上行首帧是 MultiHunk（单元素）
+            let mut body = req.into_body();
+            let d = body.data().await.unwrap().unwrap();
+            let (used, datas) =
+                crate::encoding::decode_multi_hunk_frame(&d, None).unwrap().unwrap();
+            assert_eq!(used, d.len());
+            assert_eq!(datas, vec![b"ping".to_vec()]);
+            let resp = http::Response::builder().status(200)
+                .header("content-type", "application/grpc").body(()).unwrap();
+            let mut sr = respond.send_response(resp, false).unwrap();
+            // 回多元素 MultiHunk 帧
+            let frame = crate::encoding::encode_multi_hunk_frame(&[b"first", b"second"]);
+            sr.send_data(Bytes::from(frame), true).ok();
+            // 驱动 h2 server 连接直到客户端关闭——task 提前结束会 drop h2s
+            // 发 GOAWAY，把 client 侧还没消费的 DATA 帧掐死（EOF 竞速）。
+            while let Some(r) = h2s.accept().await { let _ = r; }
+        });
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let mut conn =
+            dial_h2(tcp, "/GunService/TunMulti", "", "http", None, &cfg).await.unwrap();
+        conn.write_all(b"ping").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut buf = vec![0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(2), conn.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..n], b"firstsecond", "multi-element MultiHunk must not truncate");
+        // 先关客户端连接：server task 的 accept 循环要等对端关闭才退出。
+        drop(conn);
+        server.await.unwrap();
+    }
+
+    /// multiMode 服务端：listen(multiMode) → client 发多元素 MultiHunk 帧 →
+    /// handler 连接读出全部元素拼接（accept_h2 下行泵 decode_multi_hunk_frame）。
+    #[tokio::test]
+    async fn listen_multi_mode_delivers_all_hunk_elements() {
+        let settings = StreamSettings {
+            protocol: "grpc".to_string(),
+            transport_json: Some(serde_json::json!({"serviceName": "MySvc", "multiMode": true})),
+            ..StreamSettings::tcp()
+        };
+        let (tx, mut rx) = tokio::sync::watch::channel(Vec::new());
+        let handler: ConnHandler = Arc::new(move |conn| {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut conn = conn;
+                use tokio::io::AsyncReadExt;
+                let mut buf = vec![0u8; 64];
+                let n = conn.read(&mut buf).await.unwrap_or(0);
+                let _ = tx.send(buf[..n].to_vec());
+            });
+        });
+        let listener = listen("127.0.0.1:0".parse().unwrap(), &settings, handler)
+            .await
+            .expect("listen");
+        let addr = listener.local_addr().unwrap();
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let (mut send_req, conn) = client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move { let _ = conn.await; });
+        let req = Request::builder().method("POST").uri("/MySvc/TunMulti")
+            .header("content-type", "application/grpc").body(()).unwrap();
+        let (resp_fut, mut stream) = send_req.send_request(req, false).unwrap();
+        tokio::spawn(async move { let _ = resp_fut.await; });
+        stream
+            .send_data(
+                Bytes::from(crate::encoding::encode_multi_hunk_frame(&[b"alpha", b"beta", b"gamma"])),
+                true,
+            )
+            .unwrap();
+
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            rx.wait_for(|v| !v.is_empty()),
+        )
+        .await;
+        let got = rx.borrow().clone();
+        assert_eq!(got, b"alphabetagamma", "multi-element MultiHunk must not truncate");
     }
 }

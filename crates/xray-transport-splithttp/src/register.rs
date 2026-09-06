@@ -72,26 +72,28 @@ async fn dial_splithttp(
     let has_reality = settings.security == "reality";
     let scheme = if has_tls { "https" } else { "http" };
 
-    // tlsSettings.fingerprint：h1/h2 路径走 hyper-rustls、h3 路径走 quinn，
-    // 两者都只接受 rustls ClientConfig——btls uTLS ClientHello 指纹无法注入。
-    // 配置了 fingerprint（且非 REALITY，REALITY 已有 btls 指纹握手）时降级为
-    // rustls 默认 ClientHello 并 warn（对齐 Go tls.UClient 只在 tcp 直连类
-    // 传输生效的边界；完整支持需 hyper connector 泛型化，另行立项）。
-    if has_tls && !has_reality {
-        let fp = settings
-            .security_json
-            .as_ref()
-            .and_then(|v| v.as_object())
-            .and_then(|m| m.get("fingerprint"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if !fp.is_empty() {
-            tracing::warn!(
-                target: "xray_transport_splithttp",
-                "tlsSettings.fingerprint={fp} not supported on hyper-rustls/quinn stack; using default rustls ClientHello"
-            );
-        }
-    }
+    // tlsSettings.fingerprint：h1/h2 路径出站走自定义 hyper connector
+    // （DefaultDialerClient::new），TCP 后用 btls u_client 完成真实浏览器指纹
+    // 握手（对齐 Go splithttp dialContext 的 tls.UClient）。h3（quinn）只吃
+    // rustls ClientConfig，指纹仍降级（h3 分支内 warn）。REALITY 的指纹由
+    // REALITY 握手自管（u_client + session_id 重写），不在此注入。
+    let fp_name = settings
+        .security_json
+        .as_ref()
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("fingerprint"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let fingerprint = if has_tls && !has_reality && !fp_name.is_empty() {
+        Some(xray_tls::fingerprint::get_fingerprint(fp_name).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid fingerprint: {e}"),
+            )
+        })?)
+    } else {
+        None
+    };
 
     // Build rustls ClientConfig.
     let tls_config = xray_tls::client_config::build_client_config(
@@ -123,6 +125,12 @@ async fn dial_splithttp(
     let http_version = dialer::decide_http_version(has_tls, has_reality, &next_protocol);
 
     let packet_conn = if http_version == "3" {
+        if !fp_name.is_empty() {
+            tracing::warn!(
+                target: "xray_transport_splithttp",
+                "tlsSettings.fingerprint={fp_name} not supported on quinn (HTTP/3) stack; using default rustls ClientHello"
+            );
+        }
         // HTTP/3 over QUIC path（对应 Go `createHTTPClient` 中 `httpVersion=="3"` 分支）。
         // quinn 需要 `SocketAddr`（不做 DNS），域名走 `tokio::net::lookup_host` 解析。
         let socket_addr = resolve_dest_socket_addr(dest)
@@ -210,7 +218,12 @@ async fn dial_splithttp(
                     .unwrap_or("")
                     .to_string(),
             };
-            let client = Arc::new(DefaultDialerClient::new(config.clone(), rustls_config, dial_target));
+            let client = Arc::new(DefaultDialerClient::new(
+                config.clone(),
+                rustls_config,
+                dial_target,
+                fingerprint,
+            ));
             dialer::dial(client, config, scheme, &host, has_reality)
                 .await
                 .map_err(|e| {
@@ -231,7 +244,6 @@ async fn dial_splithttp(
         xray_transport::finalmask::wrap_conn_client_from_settings(settings, sync_conn)
     }
 }
-
 /// 将 [`Destination`] 解析为 [`SocketAddr`]（quinn/H3 需要；域名走系统 DNS）。
 ///
 /// 对应 Go `internet.DialSystem` 中 `dest.Network == UDP` 的域名解析。
