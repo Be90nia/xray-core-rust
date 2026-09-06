@@ -327,16 +327,27 @@ impl ClientWorker {
         )
     }
 
-    /// 调度一条子连接到本 worker 的 carrier 上。
+    /// 调度一条子连接到本 worker 的 carrier 上（无源信息变体）。
     ///
-    /// 对应 Go `ClientWorker.Dispatch`（client.go:311-331）。
     /// `dest` 为子会话真实目标（New 帧携带），`link` 为调用方链路。
-    ///
-    /// 会话生命周期绑定：等待 session done 后才返回
-    /// （Go :324-329 对非 pipe reader 的等待语义；Rust 无法从
-    /// `Box<dyn Reader>` 区分 pipe，统一等待——session 关闭
-    /// 即输入 EOF / 对端 End / worker 关闭时返回）。
+    /// New 帧不带 GlobalID——服务端按普通 packet 路径处理（Go ctx 无
+    /// inbound/cone 时 `xudp.GetGlobalID` 返回零值的等价）。
     pub async fn dispatch(&self, dest: &Destination, link: Link) -> bool {
+        self.dispatch_with_source(dest, link, None).await
+    }
+
+    /// 带入站源信息的调度（Go client.go:271 `xudp.GetGlobalID(ctx)`）。
+    ///
+    /// `dest` 为 UDP 且 `input.cone` 时经 `xray_xudp::global_id` 计算源追踪
+    /// GlobalID 随 New 帧下发，服务端按 GlobalID 复用 XUDP 会话（cone NAT 下
+    /// 同源多目标共享单条 UDP 通道）。计算为零值（非 UDP 源等）或 `input`
+    /// 为 None 时不带 GlobalID（兼容）。
+    pub async fn dispatch_with_source(
+        &self,
+        dest: &Destination,
+        link: Link,
+        input: Option<&xray_xudp::GlobalIdInput>,
+    ) -> bool {
         if self.is_full() {
             return false;
         }
@@ -346,10 +357,16 @@ impl ClientWorker {
         session.set_input(BufferedReader::new(link.reader)).await;
         session.set_output(BufferedWriter::new(link.writer)).await;
 
+        let global_id = if dest.network() == Network::UDP {
+            input.map(xray_xudp::global_id).filter(|g| *g != [0u8; 8])
+        } else {
+            None
+        };
+
         let s = Arc::clone(&session);
         let writer_slot = Arc::clone(&self.link_writer);
         let target = dest.clone();
-        tokio::spawn(async move { Self::fetch_input(s, target, writer_slot).await });
+        tokio::spawn(async move { Self::fetch_input(s, target, writer_slot, global_id).await });
 
         wait_done(session.done_receiver()).await;
         true
@@ -357,14 +374,16 @@ impl ClientWorker {
 
     /// session 上行循环：session.input → [`MuxWriter`] → carrier。
     ///
-    /// 对应 Go `fetchInput`（client.go:259-287）。
-    /// 简化：Go 的 writeFirstPayload（100ms 首包试探，超时发空 New 帧）
-    /// 省略——首帧 New+数据由 [`MuxWriter`] 天然同批写出；无首包的
-    /// session 不提前注册到对端（后续首包到达时随 New 帧注册）。
+    /// 对应 Go `fetchInput`（client.go:259-287）。首包试探即 Go
+    /// `writeFirstPayload`（client.go:246-257，fetchInput :276 调用）：
+    /// [`FIRST_PAYLOAD_TIMEOUT`] 内无首包则发送仅含元数据的空 New 帧——
+    /// 服务端收到即 dispatch 目标，服务端先说协议（SSH/FTP/SMTP）不再挂死；
+    /// 有首包则随 New 帧同批写出。
     async fn fetch_input(
         session: Arc<Session>,
         dest: Destination,
         link_writer: Arc<Mutex<Option<Box<dyn Writer>>>>,
+        global_id: Option<[u8; 8]>,
     ) {
         let transfer_type = if dest.network() == Network::UDP {
             TransferType::Packet
@@ -376,37 +395,76 @@ impl ClientWorker {
             dest,
             Box::new(SharedWriter::new(link_writer)),
             transfer_type,
-            None,
+            global_id,
         );
 
-        let mut done = session.done_receiver();
-        loop {
+        let done = session.done_receiver();
+        // Go writeFirstPayload：CopyOnceTimeout(100ms)。超时 → 写空
+        // MultiBuffer（write_meta_only：仅元数据 New 帧）；EOF/读错误 →
+        // Go 返回 err 走 hasError 收尾（不发首帧）。
+        enum First {
+            Payload(MultiBuffer),
+            Probe,
+            Abort,
+        }
+        let first = {
             let mut input = session.input().await;
-            let Some(reader) = input.as_mut() else { break };
-            // select session done：Session::close 需先拿 input 锁才能中断，
-            // 持锁阻塞读期间必须可被 done 打断，否则与 close 互相等待死锁
-            let read = tokio::select! {
-                r = reader.read_multi_buffer() => Some(r),
-                _ = wait_done(done.clone()) => None,
-            };
-            let mb = match read {
-                Some(Ok(mb)) => mb,
-                Some(Err(e)) => {
-                    if !matches!(e, xray_buf::io::Error::Eof) {
-                        writer.set_error();
+            match input.as_mut() {
+                None => First::Abort,
+                Some(reader) => tokio::select! {
+                    r = tokio::time::timeout(FIRST_PAYLOAD_TIMEOUT, reader.read_multi_buffer()) => match r {
+                        Ok(Ok(mb)) => First::Payload(mb),
+                        Ok(Err(_)) => First::Abort,
+                        Err(_elapsed) => First::Probe,
+                    },
+                    _ = wait_done(done.clone()) => First::Abort,
+                },
+            }
+        };
+        let mut errored = matches!(first, First::Abort);
+        match first {
+            First::Payload(mb) => {
+                if !mb.is_empty() {
+                    session.add_uplink_bytes(mb.len() as u64);
+                    session.touch_active().await;
+                }
+                errored = writer.write(mb).await.is_err();
+            }
+            First::Probe => {
+                errored = writer.write(MultiBuffer::new()).await.is_err();
+            }
+            First::Abort => {}
+        }
+
+        if !errored {
+            loop {
+                let mut input = session.input().await;
+                let Some(reader) = input.as_mut() else { break };
+                // select session done：Session::close 需先拿 input 锁才能中断，
+                // 持锁阻塞读期间必须可被 done 打断，否则与 close 互相等待死锁
+                let read = tokio::select! {
+                    r = reader.read_multi_buffer() => Some(r),
+                    _ = wait_done(done.clone()) => None,
+                };
+                let mb = match read {
+                    Some(Ok(mb)) => mb,
+                    Some(Err(e)) => {
+                        if !matches!(e, xray_buf::io::Error::Eof) {
+                            writer.set_error();
+                        }
+                        break;
                     }
+                    None => break,
+                };
+                if mb.is_empty() {
                     break;
                 }
-                None => break,
-            };
-            if mb.is_empty() {
-                break;
-            }
-            session.add_uplink_bytes(mb.len() as u64);
-            session.touch_active().await;
-            if writer.write(mb).await.is_err() {
-                writer.set_error();
-                break;
+                session.add_uplink_bytes(mb.len() as u64);
+                session.touch_active().await;
+                if writer.write(mb).await.is_err() {
+                    writer.set_error();
+                    break;
+                }
             }
         }
         // Go defer 顺序（client.go:272-273 LIFO）：End 帧先发，session 后关
@@ -986,5 +1044,107 @@ mod tests {
             2,
             "two sessions multiplexed over one carrier"
         );
+    }
+
+    /// E2E：服务端先说协议（SSH/FTP/SMTP）。客户端无首包时 fetch_input
+    /// 100ms 超时发空 New 帧触发服务端 dispatch（Go `writeFirstPayload`，
+    /// client.go:246-257）；服务端 banner 经 pump 回流到客户端。
+    /// 旧实现省略首包试探：无首包 session 永不注册到对端 → 双向挂死。
+    #[tokio::test]
+    async fn e2e_empty_new_probe_dispatches_server_speaks_first() {
+        use crate::worker::{DispatchError as SrvDispatchError, Dispatcher, ServerWorker};
+
+        // 捕获 dispatch 的服务端：立即向"上游→客户端"方向写 banner
+        struct BannerDispatcher {
+            tx: tokio::sync::mpsc::UnboundedSender<Destination>,
+        }
+        #[async_trait::async_trait]
+        impl Dispatcher for BannerDispatcher {
+            async fn dispatch(&self, dest: Destination) -> Result<Link, SrvDispatchError> {
+                let _ = self.tx.send(dest.clone());
+                let (r_down, w_down) = pipe::new();
+                let (_up_r, up_w) = pipe::new();
+                let mut w = w_down;
+                w.write_multi_buffer(MultiBuffer::from_buffer(Buffer::from_vec(
+                    b"SSH-2.0-XRAY\r\n".to_vec(),
+                )))
+                .await
+                .expect("write banner");
+                let _ = w.close();
+                Ok(Link {
+                    reader: Box::new(r_down),
+                    writer: Box::new(up_w),
+                })
+            }
+        }
+
+        let (c_read, s_write) = pipe::new(); // server → client
+        let (s_read, c_write) = pipe::new(); // client → server
+        let client = ClientWorker::new(
+            Link {
+                reader: Box::new(c_read),
+                writer: Box::new(c_write),
+            },
+            ClientStrategy::default(),
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = Arc::new(ServerWorker::new(Arc::new(BannerDispatcher { tx })));
+        let mut reader = BufferedReader::new(Box::new(s_read));
+        let link_writer: Arc<Mutex<Option<Box<dyn Writer>>>> =
+            Arc::new(Mutex::new(Some(Box::new(s_write))));
+        let (ka, idle) = server.spawn_keepalive_and_idle_timeout(Arc::clone(&link_writer));
+        let frame_server = Arc::clone(&server);
+        tokio::spawn(async move {
+            loop {
+                match frame_server.process_frame(&mut reader, &link_writer).await {
+                    Ok(true) => continue,
+                    _ => break,
+                }
+            }
+            frame_server.close();
+            ka.abort();
+            idle.abort();
+        });
+
+        // 客户端 dispatch：reader 有写端但永不写数据 → 首包试探超时发空 New
+        let (req_rd, req_wr) = pipe::new();
+        let (resp_rd, resp_wr) = pipe::new();
+        let dest = Destination::new(
+            xray_common::net::address::Address::new_domain("ssh.internal"),
+            xray_common::net::port::Port::new(22),
+            Network::TCP,
+        );
+        let w = Arc::clone(&client);
+        let d = dest.clone();
+        let dispatch_task = tokio::spawn(async move {
+            w.dispatch(
+                &d,
+                Link {
+                    reader: Box::new(req_rd),
+                    writer: Box::new(resp_wr),
+                },
+            )
+            .await
+        });
+
+        // 核心断言：客户端零 payload，服务端仍收到 New 并 dispatch
+        let captured = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("server must dispatch on empty New probe")
+            .expect("channel open");
+        assert_eq!(captured.address().as_domain(), Some("ssh.internal"));
+
+        // 服务端先说的 banner 回流到客户端 resp 读端
+        let mut resp = resp_rd;
+        let mb = tokio::time::timeout(std::time::Duration::from_secs(2), resp.read_multi_buffer())
+            .await
+            .expect("banner within timeout")
+            .expect("read ok");
+        assert_eq!(mb.to_vec(), b"SSH-2.0-XRAY\r\n");
+
+        // 收尾：关写端 → End → dispatch 返回
+        let _ = req_wr.close();
+        assert!(dispatch_task.await.expect("join"), "dispatch accepted");
     }
 }

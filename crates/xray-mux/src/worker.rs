@@ -231,7 +231,7 @@ impl ServerWorker {
             ServerError::DispatchFailed(format!("dispatch to {}: {}", target, e))
         })?;
         let tt = if target.network() == Network::UDP { TransferType::Packet } else { TransferType::Stream };
-        let session = Arc::new(Session::new(meta.session_id(), tt));
+        let session = Session::new(meta.session_id(), tt);
         session.set_input(BufferedReader::new(link.reader)).await;
         // Packet 会话禁用 BufferedWriter 缓冲（直写）：包边界保持 + 小包即时
         // 送达（Go server.go:271-277 直接使用 link.Writer，无缓冲包装）。
@@ -249,10 +249,9 @@ impl ServerWorker {
             output.flush().await.ok();
         }
         session.set_output(output).await;
-        if !self.session_manager.add(session.clone()).await {
-            session.close().await;
+        let Some(session) = self.session_manager.add(session).await else {
             return Err(ServerError::SessionAddFailed(meta.session_id()));
-        }
+        };
         let os = session.clone();
         let ow = link_writer.clone();
         tokio::spawn(async move { Self::handle_session_output(os, ow).await; });
@@ -263,6 +262,11 @@ impl ServerWorker {
     /// `data` 为 New 帧内联数据——Go `handleStatusNew`（server.go:196-240）先经
     /// `NewPacketReader` 读出，dispatch 后 `link.Writer.WriteMultiBuffer(mb)` 转发，
     /// **不得丢弃**（bd 6z8 回归）。
+    ///
+    /// 会话装配对齐 Go server.go:247-260：`x.Mux` 即加入 sessionManager 的那个
+    /// 会话——input=link.Reader（真实上游 I/O）、output=link.Writer（Keep 帧
+    /// 下行转发目标），`handle()` 泵任务读真 I/O 回写 carrier。旧实现的孤儿
+    /// ms 使泵任务读空 input 立即退出，上游数据永远回不来。
     pub async fn handle_xudp_new(
         &self, meta: &FrameMetadata,
         data: Vec<u8>,
@@ -273,8 +277,7 @@ impl ServerWorker {
             ServerError::InvalidFrame("XUDP session without target".to_string())
         })?;
         let xmgr = &self.xudp_manager;
-        let existing = xmgr.get(&global_id).await;
-        let mut xudp = match existing {
+        let mut xudp = match xmgr.get(&global_id).await {
             None => { let x = XUDP::new(global_id); xmgr.register(x.clone()).await; x }
             Some(mut ex) => {
                 if ex.status == XudpStatus::Initializing {
@@ -282,6 +285,7 @@ impl ServerWorker {
                     return Ok(());
                 }
                 ex.status = XudpStatus::Initializing;
+                xmgr.register(ex.clone()).await; // Go 指针原地改状态的 Rust 等价
                 ex
             }
         };
@@ -292,8 +296,6 @@ impl ServerWorker {
                 return Err(ServerError::DispatchFailed(format!("XUDP dispatch: {}", e)));
             }
         };
-        let ms = Arc::new(Session::new(meta.session_id(), TransferType::Packet));
-        ms.set_input(BufferedReader::new(link.reader)).await;
         // XUDP 恒为 Packet：直写（禁缓冲），New 帧内联 data 转发到 dispatch 目标
         // （Go server.go:240 `link.Writer.WriteMultiBuffer(mb)`）。
         // ponytail: Go hit 路径（同 GlobalID 复用）把 data 写旧 mux output 保持
@@ -307,15 +309,18 @@ impl ServerWorker {
                 .await
                 .map_err(|e| ServerError::DispatchFailed(format!("XUDP initial data: {e}")))?;
         }
-        ms.set_output(output).await;
-        xudp.set_mux(&ms);
-        let session = Arc::new(Session::new(meta.session_id(), TransferType::Packet));
-        session.set_xudp(xudp.clone()).await;
-        if !self.session_manager.add(session.clone()).await {
-            session.close().await;
+        let session = Session::new(meta.session_id(), TransferType::Packet);
+        session.set_input(BufferedReader::new(link.reader)).await;
+        session.set_output(output).await;
+        let Some(session) = self.session_manager.add(session).await else {
             return Err(ServerError::SessionAddFailed(meta.session_id()));
-        }
+        };
+        xudp.set_mux(&session);
         xudp.status = XudpStatus::Active;
+        // 注册表条目与 session 内快照都取 Active+mux（注册表存 clone，需重注册
+        // 写回）：close 时 Active→Expiring，后续同 GlobalID New 可命中复用。
+        session.set_xudp(xudp.clone()).await;
+        xmgr.register(xudp).await;
         let os = session.clone();
         let ow = link_writer.clone();
         tokio::spawn(async move { Self::handle_session_output(os, ow).await; });
@@ -736,6 +741,168 @@ mod tests {
 
             let got = read_payload(&mut pay).await;
             assert_eq!(got, b"GET /");
+        }
+    }
+
+    /// XUDP e2e：client GlobalID 接线 + server 装配 + 双向收发。
+    mod xudp_e2e_tests {
+        use super::*;
+        use crate::client::{ClientWorker, Link as ClientLink};
+        use crate::session::ClientStrategy;
+        use tokio::sync::Mutex as AsyncMutex;
+        use xray_buf::pipe;
+
+        /// UDP 捕获 dispatcher：交出"注入上游响应"的写端与"观察客户端
+        /// 上行"的读端（Go 等价：真 UDP socket 两方向）。
+        struct UdpCaptureDispatcher {
+            tx: tokio::sync::mpsc::UnboundedSender<(Destination, pipe::Writer, pipe::Reader)>,
+        }
+
+        #[async_trait::async_trait]
+        impl Dispatcher for UdpCaptureDispatcher {
+            async fn dispatch(&self, dest: Destination) -> Result<Link, DispatchError> {
+                let (r_down, w_down) = pipe::new(); // 上游→客户端：测试持 w_down 注入
+                let (up_r, up_w) = pipe::new(); // 客户端→上游：测试持 up_r 观察
+                let _ = self.tx.send((dest, w_down, up_r));
+                Ok(Link {
+                    reader: Box::new(r_down),
+                    writer: Box::new(up_w),
+                })
+            }
+        }
+
+        fn udp_target() -> Destination {
+            Destination::new(
+                Address::ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+                Port::new(53),
+                Network::UDP,
+            )
+        }
+
+        /// ClientWorker ↔ ServerWorker 直连管道拓扑 + UDP 捕获 dispatcher。
+        async fn spawn_topology()
+        -> (Arc<ClientWorker>, Arc<ServerWorker>, tokio::sync::mpsc::UnboundedReceiver<(Destination, pipe::Writer, pipe::Reader)>) {
+            let (c_read, s_write) = pipe::new(); // server → client
+            let (s_read, c_write) = pipe::new(); // client → server
+            let client = ClientWorker::new(
+                ClientLink {
+                    reader: Box::new(c_read),
+                    writer: Box::new(c_write),
+                },
+                ClientStrategy::default(),
+            );
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let server = Arc::new(ServerWorker::new(Arc::new(UdpCaptureDispatcher { tx })));
+            let mut reader = BufferedReader::new(Box::new(s_read));
+            let link_writer: Arc<AsyncMutex<Option<Box<dyn Writer>>>> =
+                Arc::new(AsyncMutex::new(Some(Box::new(s_write))));
+            let (ka, idle) = server.spawn_keepalive_and_idle_timeout(Arc::clone(&link_writer));
+            let frame_server = Arc::clone(&server);
+            tokio::spawn(async move {
+                loop {
+                    match frame_server.process_frame(&mut reader, &link_writer).await {
+                        Ok(true) => continue,
+                        _ => break,
+                    }
+                }
+                frame_server.close();
+                ka.abort();
+                idle.abort();
+            });
+            (client, server, rx)
+        }
+
+        async fn read_all(r: &mut pipe::Reader) -> Vec<u8> {
+            let mb = tokio::time::timeout(std::time::Duration::from_secs(3), r.read_multi_buffer())
+                .await
+                .expect("payload within timeout")
+                .expect("read ok");
+            let mut out = Vec::new();
+            for b in mb.iter() {
+                out.extend_from_slice(b.bytes());
+            }
+            out
+        }
+
+        /// 验收：XUDP New 后能收发。客户端 dispatch_with_source 按 cone 入站源
+        /// 计算 GlobalID（Go client.go:271），服务端装配 XUDP 会话（Go
+        /// server.go:247-260：manager session 直绑 dispatch I/O，泵任务读真
+        /// I/O 回写 carrier——旧实现孤儿 ms 使上游响应永远回不来）。
+        #[tokio::test]
+        async fn xudp_new_bidirectional_send_receive() {
+            use xray_xudp::GlobalIdInput;
+
+            let (client, server, mut rx) = spawn_topology().await;
+
+            // 客户端：UDP dest + cone 入站源 → GlobalID 随 New 帧下发
+            let input = GlobalIdInput {
+                source: "udp:10.0.0.1:5400".to_string(),
+                source_network: Network::UDP,
+                cone: true,
+            };
+            let gid = xray_xudp::global_id(&input);
+            assert_ne!(gid, [0u8; 8], "cone UDP source must yield nonzero GlobalID");
+
+            let (req_rd, req_wr) = pipe::new();
+            let (resp_rd, resp_wr) = pipe::new();
+            // 先写上行 payload（探针窗口内就绪）→ fetch_input 首读即得数据，
+            // New 帧携带内联 data + GlobalID 同批下发（Go XUDP 线形态；空 New
+            // 按 Go frame.go:216 语义不带 GlobalID，服务端按普通 packet 路径）。
+            let mut req = req_wr;
+            req.write_multi_buffer(MultiBuffer::from_buffer(Buffer::from_vec(
+                b"dns-query".to_vec(),
+            )))
+            .await
+            .expect("write uplink");
+
+            let w = Arc::clone(&client);
+            let d = udp_target();
+            let task = tokio::spawn(async move {
+                w.dispatch_with_source(&d, ClientLink {
+                    reader: Box::new(req_rd),
+                    writer: Box::new(resp_wr),
+                }, Some(&input))
+                .await
+            });
+
+            // 服务端 dispatch UDP 目标 + XUDP 装配完成（Active + mux 接线）
+            let (dest, w_down, mut up_r) =
+                tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+                    .await
+                    .expect("dispatch within timeout")
+                    .expect("channel open");
+            assert_eq!(dest.network(), Network::UDP);
+            assert_eq!(server.active_connections().await, 1, "XUDP session registered");
+            let entry = server
+                .xudp_manager
+                .get(&gid)
+                .await
+                .expect("XUDP entry keyed by client GlobalID");
+            assert_eq!(entry.status, XudpStatus::Active, "entry must be Active after assembly");
+
+            // 上行：New 内联 data → 到达"上游"读端
+            let got = read_all(&mut up_r).await;
+            assert_eq!(got, b"dns-query", "uplink must reach dispatch target");
+
+            // 下行：上游响应 → 泵任务读真 I/O → Keep 帧 → 客户端 resp 读端
+            let mut resp = resp_rd;
+            let mut pong = w_down;
+            pong.write_multi_buffer(MultiBuffer::from_buffer(Buffer::from_vec(
+                b"dns-answer".to_vec(),
+            )))
+            .await
+            .expect("write downlink");
+            let _ = pong.close();
+            let back = tokio::time::timeout(std::time::Duration::from_secs(3), resp.read_multi_buffer())
+                .await
+                .expect("downlink within timeout")
+                .expect("read ok");
+            assert_eq!(back.to_vec(), b"dns-answer", "upstream response must flow back via pump");
+
+            // 收尾：客户端半关闭 → End → server session 摘除
+            let _ = req.close();
+            let _ = task.await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), resp.read_multi_buffer()).await;
         }
     }
 }

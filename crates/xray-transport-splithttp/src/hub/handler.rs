@@ -368,16 +368,19 @@ fn extract_cookie_payload(headers: &HeaderMap, key: &str) -> Vec<u8> {
     }
 }
 
-/// 校验 padding（简化版：检查 Referer header 的 x_padding query）。
+/// 校验 padding。obfs 模式对齐 Go hub.go:141-148：按 XPaddingPlacement 提取
+/// （cookie → header/queryInHeader → query），空值或长度不合法一律 400；
+/// 非 obfs 保持既有 Referer/x_padding query 宽松校验（历史行为，客户端不
+/// 强制带 padding）。
 fn validate_padding<B>(req: &Request<B>, ctx: &HandlerContext) -> bool
 where
     B: hyper::body::Body<Data = Bytes> + Send + Unpin + BodyExt + 'static,
     B::Error: Send + Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    // ponytail: 非强制 padding 校验。仅在 obfs_mode=false 时检查 Referer。
-    // obfs_mode=true 时校验逻辑依赖完整 xpadding 模块，留后续。
+    let range = ctx.config.get_normalized_x_padding_bytes();
     if ctx.config.x_padding_obfs_mode {
-        return true; // 留后续实现
+        let padding = extract_obfs_padding(req.headers(), req.uri(), ctx.config.as_ref());
+        return is_padding_valid(&padding, range.from, range.to, &ctx.config.x_padding_method);
     }
     let referer = match req.headers().get("Referer").and_then(|v| v.to_str().ok()) {
         Some(r) => r,
@@ -388,7 +391,6 @@ where
     if padding_val.is_empty() {
         return true; // 无 padding 不校验
     }
-    let range = ctx.config.get_normalized_x_padding_bytes();
     is_padding_valid(
         &padding_val,
         range.from,
@@ -397,9 +399,48 @@ where
     )
 }
 
-/// 从 URL query string 中提取指定 key 的 value。
+/// obfs 模式 padding 提取。对应 Go `Config.ExtractXPaddingFromRequest` obfs
+/// 路径（xpadding.go:271-304）：cookie(key) → header（placement=header 取整值，
+/// 否则按 queryInHeader 语义解析 header 值里的 query 参数）→ URL query(key)。
+/// 键名/header 名缺省与客户端构造侧（`build_xpadding_config`）对称。
+fn extract_obfs_padding(headers: &HeaderMap, uri: &http::Uri, cfg: &Config) -> String {
+    let key = if cfg.x_padding_key.is_empty() { "x_padding" } else { cfg.x_padding_key.as_str() };
+    let header = if cfg.x_padding_header.is_empty() { "Referer" } else { cfg.x_padding_header.as_str() };
+
+    // 1. cookie(key)
+    let cookie_val = cookie_get(headers, key);
+    if !cookie_val.is_empty() {
+        return cookie_val;
+    }
+
+    // 2. header / queryInHeader
+    if let Some(val) = headers.get(header).and_then(|v| v.to_str().ok()) {
+        if !val.is_empty() {
+            if cfg.x_padding_placement == PLACEMENT_HEADER {
+                return val.to_string();
+            }
+            // queryInHeader：header 值是 URL，padding 在其 query 参数里。
+            let from_url = extract_query_value(val, key);
+            if !from_url.is_empty() {
+                return from_url;
+            }
+        }
+    }
+
+    // 3. URL query(key)
+    if let Some(q) = uri.query() {
+        let query_val = extract_query_value(q, key);
+        if !query_val.is_empty() {
+            return query_val;
+        }
+    }
+    String::new()
+}
+
+/// 从 URL 或纯 query string 中提取指定 key 的 value。
+/// 兼容两种输入：完整 URL（取 `?` 后段）与裸 query（无 `?` 时整串即 query）。
 fn extract_query_value(url: &str, key: &str) -> String {
-    let query = url.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let query = url.split_once('?').map(|(_, q)| q).unwrap_or(url);
     for pair in query.split('&') {
         if let Some(eq) = pair.find('=') {
             if &pair[..eq] == key {
@@ -502,6 +543,78 @@ mod tests {
     #[test]
     fn base64url_decode_empty() {
         assert_eq!(base64url_decode("").unwrap(), Vec::<u8>::new());
+    }
+
+    fn obfs_cfg(placement: &str, key: &str, header: &str) -> Config {
+        Config {
+            x_padding_obfs_mode: true,
+            x_padding_placement: placement.into(),
+            x_padding_key: key.into(),
+            x_padding_header: header.into(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn extract_obfs_padding_from_cookie() {
+        let cfg = obfs_cfg("cookie", "XPad", "Referer");
+        let mut headers = HeaderMap::new();
+        headers.insert("cookie", "sid=1; XPad=COOKIE_VAL".parse().unwrap());
+        let uri = "http://h/path".parse().unwrap();
+        assert_eq!(extract_obfs_padding(&headers, &uri, &cfg), "COOKIE_VAL");
+    }
+
+    #[test]
+    fn extract_obfs_padding_from_header_whole_value() {
+        let cfg = obfs_cfg("header", "x_padding", "X-Padding");
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Padding", "XXXXX".parse().unwrap());
+        let uri = "http://h/path".parse().unwrap();
+        assert_eq!(extract_obfs_padding(&headers, &uri, &cfg), "XXXXX");
+    }
+
+    #[test]
+    fn extract_obfs_padding_query_in_header() {
+        // 默认 placement（空 = 非 header 分支）+ 默认 Referer：header 值是
+        // URL，padding 在其 query 参数（queryInHeader 语义）。
+        let cfg = obfs_cfg("", "", "");
+        let mut headers = HeaderMap::new();
+        headers.insert("Referer", "https://ref.example/page?x_padding=QQ".parse().unwrap());
+        let uri = "http://h/path".parse().unwrap();
+        assert_eq!(extract_obfs_padding(&headers, &uri, &cfg), "QQ");
+    }
+
+    #[test]
+    fn extract_obfs_padding_from_uri_query() {
+        let cfg = obfs_cfg("", "", "");
+        let headers = HeaderMap::new();
+        let uri = "http://h/path?x_padding=QQQ&other=1".parse().unwrap();
+        assert_eq!(extract_obfs_padding(&headers, &uri, &cfg), "QQQ");
+    }
+
+    #[test]
+    fn extract_obfs_padding_missing_returns_empty() {
+        let cfg = obfs_cfg("", "", "");
+        let headers = HeaderMap::new();
+        let uri = "http://h/path".parse().unwrap();
+        assert_eq!(extract_obfs_padding(&headers, &uri, &cfg), "");
+    }
+
+    #[test]
+    fn extract_query_value_accepts_bare_query() {
+        assert_eq!(extract_query_value("a=1&x_padding=X&b=2", "x_padding"), "X");
+        assert_eq!(extract_query_value("https://h/p?x_padding=Y", "x_padding"), "Y");
+    }
+
+    #[test]
+    fn obfs_padding_length_rejects_out_of_range() {
+        // 服务端 obfs 校验语义：padding 值经 is_padding_valid 长度门。
+        let cfg = obfs_cfg("", "", "");
+        let range = cfg.get_normalized_x_padding_bytes();
+        assert!(is_padding_valid(&"X".repeat(200), range.from, range.to, &cfg.x_padding_method));
+        assert!(!is_padding_valid(&"X".repeat(10_000), range.from, range.to, &cfg.x_padding_method));
+        // 空 padding（无值）→ false → 400（Go hub.go:141-148 无条件校验）。
+        assert!(!is_padding_valid("", range.from, range.to, &cfg.x_padding_method));
     }
 
     #[test]

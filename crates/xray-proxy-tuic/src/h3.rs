@@ -37,6 +37,13 @@ mod h3_frame_type {
     pub const GOAWAY: u8 = 0x07;
 }
 
+/// HTTP/3 帧负载最大长度（1 MiB）。
+///
+/// [`H3TuicTransport::read_frame_payload`] 入口限幅：帧长度是对方声明的 varint
+///（可至 2^62），未限幅直接按声明值预分配会被恶意长度打爆内存。
+/// 常量模式与 hysteria `MAX_*_LENGTH` 一致。
+pub const MAX_FRAME_PAYLOAD_LENGTH: u64 = 1_048_576;
+
 /// HTTP/3 SETTINGS 标识符。
 mod h3_settings_id {
     /// QPACK 最大动态表容量。
@@ -179,10 +186,15 @@ impl H3TuicTransport {
     }
 
     /// 读取 HTTP/3 帧负载。
+    ///
+    /// 入口按声明长度限幅（[`MAX_FRAME_PAYLOAD_LENGTH`]），超限返回
+    /// [`TuicError::ProtocolParse`]，不做预分配。
     pub async fn read_frame_payload(
         recv: &mut quinn::RecvStream,
+        frame_type: u8,
         len: u64,
     ) -> Result<Vec<u8>> {
+        check_frame_len(frame_type, len)?;
         let mut buf = vec![0u8; len as usize];
         recv.read_exact(&mut buf)
             .await
@@ -205,7 +217,7 @@ impl H3TuicTransport {
         if frame_type != h3_frame_type::SETTINGS {
             return Err(TuicError::UnexpectedEof("h3 control stream not SETTINGS"));
         }
-        let payload = Self::read_frame_payload(recv, len).await?;
+        let payload = Self::read_frame_payload(recv, frame_type, len).await?;
         // 校验 settings 含 H3_DATAGRAM=1（TUIC 伪装需要）
         let mut saw_datagram = false;
         let mut i = 0;
@@ -274,6 +286,18 @@ impl H3TuicTransport {
         let expected_hex = token_to_hex(expected_token);
         token_hex == expected_hex.as_bytes()
     }
+}
+
+/// 帧长度限幅检查：声明长度超过 [`MAX_FRAME_PAYLOAD_LENGTH`] 即拒绝。
+///
+/// 独立纯函数以便单测覆盖边界（`read_frame_payload` 本体需要 quinn stream）。
+fn check_frame_len(frame_type: u8, len: u64) -> Result<()> {
+    if len > MAX_FRAME_PAYLOAD_LENGTH {
+        return Err(TuicError::ProtocolParse(format!(
+            "h3 frame payload too large: type={frame_type:#04x} len={len} (max {MAX_FRAME_PAYLOAD_LENGTH})"
+        )));
+    }
+    Ok(())
 }
 
 /// 在 `haystack` 中查找首个 `needle` 子序列；找不到返回 None。
@@ -493,5 +517,23 @@ mod tests {
             i += 1 + 1 + bytes_to_read;
         }
         assert!(saw_datagram, "H3_DATAGRAM=1 must be detected");
+    }
+
+    /// 限幅回归：超限帧被拒（恶意 varint 声明不可触发大分配）。
+    #[test]
+    fn frame_len_limit_rejects_oversize() {
+        let err = check_frame_len(h3_frame_type::DATA, MAX_FRAME_PAYLOAD_LENGTH + 1).unwrap_err();
+        assert!(matches!(err, TuicError::ProtocolParse(_)), "got {err:?}");
+        assert!(err.to_string().contains("too large"), "got {err}");
+        // 恶意最大声明同样被拒
+        let err = check_frame_len(h3_frame_type::SETTINGS, u64::MAX).unwrap_err();
+        assert!(matches!(err, TuicError::ProtocolParse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn frame_len_limit_accepts_boundary() {
+        // 恰好 1 MiB 与空帧都放行（边界=上限本身不拒）
+        check_frame_len(h3_frame_type::DATA, MAX_FRAME_PAYLOAD_LENGTH).expect("1MiB frame allowed");
+        check_frame_len(h3_frame_type::SETTINGS, 0).expect("empty frame allowed");
     }
 }

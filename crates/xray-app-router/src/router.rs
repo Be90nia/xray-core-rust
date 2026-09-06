@@ -339,10 +339,10 @@ fn build_balancer(
     observer: Option<Arc<dyn ObservationProvider>>,
 ) -> Result<Balancer, RouterError> {
     let strategy: Arc<dyn BalancingStrategy> = match br.strategy.as_str() {
+        // fallback 语义在 Balancer（Go balancing.go），策略不掺 fallback。
         "random" => Arc::new(crate::strategy_random::RandomStrategy::new(
             br.outbound_selector.clone(),
             ohm.clone(),
-            br.fallback_tag.clone(),
         )),
         "leastping" => {
             // 始终构建；observer 缺失时 pick_outbound 返回 EmptyBalancerResult。

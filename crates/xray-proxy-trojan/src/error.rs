@@ -53,6 +53,9 @@ pub enum TrojanError {
     #[error("insufficient data: need {0}, have {1}")]
     InsufficientData(usize, usize),
 
+    #[error("handshake timeout")]
+    HandshakeTimeout,
+
     #[error("io: {0}")]
     Io(String),
 }

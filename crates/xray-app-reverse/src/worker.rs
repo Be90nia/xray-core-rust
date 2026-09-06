@@ -326,6 +326,31 @@ pub struct BridgeWorker {
     self_ref: RwLock<Option<std::sync::Weak<Self>>>,
 }
 
+/// mux [`ServerWorker`] 的 dispatcher 适配（Weak 拆环）。
+///
+/// 强引用环：`BridgeWorker.worker → Arc<ServerWorker> → dispatcher →
+/// Arc<BridgeWorker>`，双方永不 drop（worker 池移除后整对泄漏）。
+/// ServerWorker 生命周期本就由 BridgeWorker.worker/timer 持有，dispatcher
+/// 边改 Weak 后无环；upgrade 失败 = BridgeWorker 已拆除，返回 NoRoute
+/// （Go 等价：worker 已 Close，不再有可用 dispatcher）。
+struct WeakBridgeDispatcher(std::sync::Weak<BridgeWorker>);
+
+#[async_trait::async_trait]
+impl xray_mux::worker::Dispatcher for WeakBridgeDispatcher {
+    async fn dispatch(
+        &self,
+        dest: Destination,
+    ) -> Result<MuxLink, xray_mux::worker::DispatchError> {
+        let me = self
+            .0
+            .upgrade()
+            .ok_or_else(|| {
+                xray_mux::worker::DispatchError::NoRoute("bridge worker dropped".to_string())
+            })?;
+        me.as_ref().dispatch(dest).await
+    }
+}
+
 impl BridgeWorker {
     /// 创建 BridgeWorker：dispatch carrier + 起 mux ServerWorker + 60s timer。
     ///
@@ -352,7 +377,9 @@ impl BridgeWorker {
         });
         *me.self_ref.write() = Some(Arc::downgrade(&me));
 
-        let server = Arc::new(ServerWorker::new(me.clone()));
+        let server = Arc::new(ServerWorker::new(Arc::new(WeakBridgeDispatcher(
+            Arc::downgrade(&me),
+        ))));
         *me.worker.write() = Some(Arc::clone(&server));
 
         let timer_server = Arc::clone(&server);
@@ -954,5 +981,23 @@ mod entity_tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0.address().as_domain(), Some("service.local"));
         assert_eq!(calls[0].1.as_deref(), Some("bridge-tag"));
+    }
+
+    /// 拆环回归（fix ⑤）：外部引用释放后 BridgeWorker 必须可回收。
+    /// 旧实现 worker→ServerWorker→dispatcher→worker 强环，worker 池移除后
+    /// 双方永不 drop。
+    #[tokio::test]
+    async fn bridge_worker_freed_after_external_refs_dropped() {
+        let mock = std::sync::Arc::new(MockLinkDispatch::default());
+        let weak = {
+            let w = BridgeWorker::new("t.example.com", "bridge-tag", mock.clone())
+                .await
+                .expect("bridge worker");
+            std::sync::Arc::downgrade(&w)
+        };
+        assert!(
+            weak.upgrade().is_none(),
+            "BridgeWorker must not be kept alive by its own ServerWorker (reference cycle)"
+        );
     }
 }

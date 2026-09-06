@@ -36,6 +36,10 @@ pub enum Fingerprint {
     Randomized,
     /// uTLS 的 `HelloRandomizedNoALPN`。
     RandomizedNoAlpn,
+    /// uTLS `HelloUniformRandomized`（均匀权重随机化）。Go xray 未收录该预设
+    /// 名，Rust 端按 uTLS 库补全；btls 侧就近映射见
+    /// `btls_client::connector_for_fingerprint`。
+    UniformRandom,
     /// Go 端 `"unsafe"` 是一个无操作占位（实际允许 InsecureSkipVerify）。
     Unsafe,
 
@@ -174,6 +178,9 @@ fn lookup_preset(name: &str) -> Option<Fingerprint> {
         "random" => Fingerprint::Random,
         "randomized" => Fingerprint::Randomized,
         "randomizednoalpn" => Fingerprint::RandomizedNoAlpn,
+        // `uniformrandom`：Go xray 未收录，对齐 uTLS `HelloUniformRandomized`
+        // 预设名的超集扩展（配置层宽容，btls 侧就近映射）。
+        "uniformrandom" => Fingerprint::UniformRandom,
         "unsafe" => Fingerprint::Unsafe,
         _ => return None,
     };

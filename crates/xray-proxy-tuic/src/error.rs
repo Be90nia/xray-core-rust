@@ -23,6 +23,10 @@ pub enum TuicError {
     #[error("unexpected end of stream: {0}")]
     UnexpectedEof(&'static str),
 
+    /// 协议解析错误（帧限幅/格式等；对齐 hysteria `ProtocolParse` 命名）。
+    #[error("protocol parse error: {0}")]
+    ProtocolParse(String),
+
     /// quinn 错误。
     #[error("quinn error: {0}")]
     Quinn(#[from] quinn::ConnectionError),

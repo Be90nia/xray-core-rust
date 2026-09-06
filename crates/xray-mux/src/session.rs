@@ -523,28 +523,32 @@ impl SessionManager {
         Some(session)
     }
 
-    /// 添加已存在的会话。
+    /// 添加已存在的会话并设置父管理器弱引用。
     ///
     /// 对应 Go 版本 `SessionManager.Add(*Session)`。
     ///
-    /// 返回 `true` 表示添加成功，`false` 表示管理器已关闭。
-    pub async fn add(&self, mut session: Arc<Session>) -> bool {
+    /// 接收未共享的 `Session`，Arc 包装在本方法内完成：父引用必须在首次
+    /// clone 前设置——若入参已是共享 Arc，`Arc::get_mut` 恒失败导致 parent
+    /// 缺失，会话关闭时无法从管理器摘除（条目泄漏，size 永不归零，
+    /// monitor 空闲判定 `CloseIfNoSessionAndIdle` 永不满足 → worker 不回收）。
+    ///
+    /// 返回 `Some(Arc<Session>)` 表示添加成功（新会话的唯一强引用交还调用方），
+    /// `None` 表示管理器已关闭。
+
+    pub async fn add(&self, mut session: Session) -> Option<Arc<Session>> {
         let mut inner = self.shared.inner.write().await;
 
         if inner.closed {
-            return false;
+            return None;
         }
 
         inner.count = inner.count.saturating_add(1);
         self.shared.count.store(inner.count, Ordering::Release);
 
-        // 设置父管理器弱引用
-        if let Some(s) = Arc::get_mut(&mut session) {
-            s.set_parent(Arc::downgrade(&self.shared));
-        }
-
-        inner.sessions.insert(session.id(), session);
-        true
+        session.set_parent(Arc::downgrade(&self.shared));
+        let session = Arc::new(session);
+        inner.sessions.insert(session.id(), Arc::clone(&session));
+        Some(session)
     }
 
     /// 移除会话。
@@ -1128,6 +1132,32 @@ mod tests {
         session.close().await;
         assert_eq!(manager.size().await, 0);
         assert!(manager.get(session.id()).await.is_none());
+    }
+
+    /// add() 路径的 parent 接线回归：经 add() 入册的会话关闭后必须从管理器
+    /// 摘除（旧实现入参为共享 Arc，`Arc::get_mut` 恒失败 → parent 缺失 →
+    /// 条目泄漏，size 永不归零）。
+    #[tokio::test]
+    async fn test_session_manager_add_close_removes_entry() {
+        let manager = SessionManager::new();
+        let session = manager
+            .add(Session::new(7, TransferType::Stream))
+            .await
+            .expect("add on open manager");
+        assert_eq!(manager.size().await, 1);
+
+        session.close().await;
+        assert_eq!(manager.size().await, 0, "entry must be removed on close");
+        assert!(manager.get(7).await.is_none());
+
+        // 已关闭的管理器 add 返回 None
+        manager.close().await;
+        assert!(
+            manager
+                .add(Session::new(8, TransferType::Stream))
+                .await
+                .is_none()
+        );
     }
 
     // ========== Debug 格式化测试 ==========

@@ -243,6 +243,12 @@ pub struct SocketOptions {
     /// 对应 Go `SocketConfig.Tproxy.IsEnabled()`（sockopt_linux.go:104-108）。
     /// 仅 Linux 有效；其他平台忽略。
     pub tproxy: bool,
+    /// accept 后读取 PROXY protocol header 提取真实源地址。对应 Go
+    /// `SocketConfig.AcceptProxyProtocol`（字段 7，transport_sockopt.go:49，JSON
+    /// `acceptProxyProtocol`；消费点 system_listener.go:169-172 包 proxyproto.Listener）。
+    /// tcp/ws/httpupgrade transport 各自 settings 的 `acceptProxyProtocol` 在 Go
+    /// hub.go 监听时 OR 进本字段（tcp/hub.go:40），Rust 同构在 transport 装配处 OR。
+    pub accept_proxy_protocol: bool,
     /// Linux/FreeBSD/Darwin 有效；Windows no-op（sockopt_windows.go:188-190）。
     pub reuse_port: bool,
     /// 绑定到指定网络接口索引。`0`=不绑定。
@@ -354,6 +360,7 @@ impl Default for SocketOptions {
             tcp_mptcp: false,
             tcp_congestion: None,
             tproxy: false,
+            accept_proxy_protocol: false,
             reuse_port: false,
             bind_if_index: 0,
             ipv6_only: false,

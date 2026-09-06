@@ -328,7 +328,14 @@ fn policy_factory() -> FeatureFactory {
                 Ok(n) => n,
                 Err(_) => continue,
             };
-            proto.level.insert(lv, policy_level_to_proto(pl));
+            let level_policy = policy_level_to_proto(pl);
+            if let Some(buf) = level_policy.buffer.as_ref() {
+                // 启动可见性：打印该 level 生效的 per-connection 缓冲（字节；-1=无限）。
+                // 未配置 buffer_size 的 level 走 xray-features env 缺省语义
+                // （`default_buffer_connection_from_env`，对齐 Go -17 哨兵/分架构默认）。
+                tracing::info!(level = lv, connection = buf.connection, "policy: per-connection buffer size");
+            }
+            proto.level.insert(lv, level_policy);
         }
         if let Some(sys) = json_cfg.system.as_ref() {
             proto.system = Some(policy_system_to_proto(sys));
@@ -436,9 +443,11 @@ fn policy_level_to_proto(
     }
 
     if let Some(bs) = pl.buffer_size {
-        p.buffer = Some(policy::Buffer {
-            connection: bs as i32,
-        });
+        // 对齐 Go infra/conf/policy.go:42-50：JSON 值以 KB 计，>=0 时 ×1024 转字节；
+        // <0 为显式无限制，固定 -1 哨兵（pipe 侧 limit<0 即无限）。乘法溢出 wrap
+        // 与 Go int32 溢出行为一致。
+        let connection = if bs >= 0 { bs.wrapping_mul(1024) } else { -1 };
+        p.buffer = Some(policy::Buffer { connection });
     }
     p
 }
@@ -671,7 +680,10 @@ fn build_fake_dns_holder(cfg: &xray_conf::app_config::FakeDnsConfig) -> Result<A
 }
 
 /// FakeDNS Feature：持有真实 [`Holder`]（LRU 域名↔Fake IP 双向映射引擎）。
-struct FakeDnsFeature {
+///
+/// pub 供装配层（functions.rs）`instance.get_feature::<FakeDnsFeature>()` 取出，
+/// 经 [`fake_dns_engine_bridge`] 注入 dispatcher（对应 Go dispatcher.fdns）。
+pub struct FakeDnsFeature {
     holder: Arc<xray_app_dns::fakedns::Holder>,
 }
 
@@ -687,6 +699,34 @@ impl FakeDnsFeature {
     pub fn engine(&self) -> Arc<xray_app_dns::fakedns::Holder> {
         Arc::clone(&self.holder)
     }
+}
+
+/// [`Holder`] → dispatcher `FakeDnsEngine` 适配（嗅探阶段反查 fake IP 域名）。
+///
+/// dispatcher crate 定义独立 trait 避免反向依赖；xray-app-dns 的引擎 trait 签名
+/// 不同（`IpAddr -> Option<String>`），在此桥接为 dispatcher 形态
+/// （`&IpAddr -> String`，无匹配返回空串）。
+pub struct FakeDnsEngineBridge(Arc<xray_app_dns::fakedns::Holder>);
+
+impl std::fmt::Debug for FakeDnsEngineBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FakeDnsEngineBridge").finish()
+    }
+}
+
+impl xray_app_dispatcher::fakednssniffer::FakeDnsEngine for FakeDnsEngineBridge {
+    fn get_domain_from_fake_dns(&self, addr: &std::net::IpAddr) -> String {
+        use xray_app_dns::nameserver::fakedns::FakeDnsEngine as _;
+        self.0.get_domain_from_fake_dns(*addr).unwrap_or_default()
+    }
+}
+
+/// 从 fakeDns Feature 引擎构造 dispatcher 侧引擎桥。
+#[must_use]
+pub fn fake_dns_engine_bridge(
+    holder: Arc<xray_app_dns::fakedns::Holder>,
+) -> Arc<dyn xray_app_dispatcher::fakednssniffer::FakeDnsEngine> {
+    Arc::new(FakeDnsEngineBridge(holder))
 }
 /// Geodata app 真实 factory：解析 JSON → [`xray_app_geodata::GeodataConfig`]
 /// → [`GeodataFeature`](xray_app_geodata::GeodataFeature)。
@@ -924,6 +964,30 @@ mod tests {
         assert!(engine.is_ip_in_pool(ips[0]));
     }
 
+    /// 批 3②：feature("fakeDns") → FakeDnsFeature::engine() → dispatcher 桥
+    /// （fake_ip → 域名反查；dispatcher 侧签名 &IpAddr -> String）。
+    #[test]
+    fn fake_dns_engine_bridge_recovers_domain_from_fake_ip() {
+        use xray_app_dns::nameserver::fakedns::FakeDnsEngine as _;
+        let cfg: xray_conf::app_config::FakeDnsConfig =
+            serde_json::from_slice(br#"{"ipPool":"198.18.0.0/15"}"#).unwrap();
+        let feature = FakeDnsFeature { holder: build_fake_dns_holder(&cfg).unwrap() };
+        let engine = feature.engine();
+        let ip = engine.get_fake_ip_for_domain("bridge.example.com")[0];
+
+        let bridged = fake_dns_engine_bridge(engine);
+        assert_eq!(
+            bridged.get_domain_from_fake_dns(&ip),
+            "bridge.example.com",
+            "dispatcher-side engine must recover the domain"
+        );
+        assert_eq!(
+            bridged.get_domain_from_fake_dns(&std::net::IpAddr::from([8, 8, 8, 8])),
+            "",
+            "non-fake IP yields empty string"
+        );
+    }
+
     #[test]
     fn policy_factory_returns_real_policy_feature() {
         register_all_features();
@@ -947,6 +1011,20 @@ mod tests {
             registry::create_feature("policy", json).expect("policy with levels should build");
         assert_eq!(feat.feature_name(), "policy");
         assert_ne!(feat.feature_name(), "simple");
+    }
+    /// bufferSize 单位与负值语义：KB→字节（×1024）；负值 → -1（无限制）。
+    /// 对齐 Go infra/conf/policy.go:42-50。
+    #[test]
+    fn policy_level_buffer_size_kb_to_bytes_negative_means_unlimited() {
+        let pl: xray_conf::app_config::PolicyLevel =
+            serde_json::from_str(r#"{"buffer_size": 512}"#).unwrap();
+        let p = policy_level_to_proto(&pl);
+        assert_eq!(p.buffer.expect("buffer set").connection, 512 * 1024);
+
+        let pl: xray_conf::app_config::PolicyLevel =
+            serde_json::from_str(r#"{"buffer_size": -1}"#).unwrap();
+        let p = policy_level_to_proto(&pl);
+        assert_eq!(p.buffer.expect("buffer set").connection, -1);
     }
 
     #[test]

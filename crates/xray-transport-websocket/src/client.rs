@@ -44,6 +44,9 @@ pub struct DialOptions<'a> {
     /// TLS SNI（`tlsSettings.serverName`）。None 用 destination 地址。
     /// Go：拨号目标（dest）与 SNI 解耦（CDN/argo 场景 SNI/Host 是配置域名）。
     pub tls_server_name: Option<String>,
+    /// tlsSettings.fingerprint。字段保留但接线禁用：配置被有意忽略（恒走
+    /// 标准 rustls），原因见 `dial` 内历史禁区注释。
+    pub fingerprint: Option<String>,
 }
 
 /// 完成 WS 握手并返回字节流包装。
@@ -69,13 +72,14 @@ pub async fn dial(
     let port = opts.destination.port().value();
     let tcp = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
     tcp.set_nodelay(true).ok();
-
     let stream: Box<dyn xray_transport::connection::Connection> = match opts.tls_config {
         Some(cfg) => {
             let sni = opts.tls_server_name.as_deref().unwrap_or(host.as_str());
-            let tls_stream =
-                xray_tls::utls::client(Box::new(xray_transport::connection::TcpConnection::new(tcp)) as Box<dyn xray_transport::connection::Connection>, sni, cfg)
-                    .await?;
+            let inner = Box::new(xray_transport::connection::TcpConnection::new(tcp))
+                as Box<dyn xray_transport::connection::Connection>;
+            // 禁区: ws/httpupgrade 的 u_client 接线实测 VPS 15 节点 Connection reset (2026-09-06 run_full32 17/32), btls 与该类端点不兼容, 启用前须先解决 btls 层兼容性 — fingerprint 被有意忽略, 恒走 rustls。
+            let tls_stream: Box<dyn xray_transport::connection::Connection> =
+                Box::new(xray_tls::utls::client(inner, sni, cfg).await?);
             Box::new(tls_stream)
         }
         None => Box::new(xray_transport::connection::TcpConnection::new(tcp)),

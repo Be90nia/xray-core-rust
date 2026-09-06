@@ -28,7 +28,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use rand::Rng;
+use rand::seq::IndexedRandom;
 
 use crate::balancing::{BalancingStrategy, ObservationProvider, OutboundHandlerSelector};
 use crate::error::RouterError;
@@ -39,21 +39,40 @@ use xray_proto::xray::core::app::observatory::OutboundStatus;
 use xray_proto::xray::app::router::StrategyLeastLoadConfig;
 
 
-/// 有效 RTT：优先 health_ping.average，回退 delay。
-fn effective_rtt(s: &OutboundStatus) -> i64 {
-    s.health_ping.as_ref().filter(|h| h.average > 0).map(|h| h.average).unwrap_or(s.delay)
+/// Go `node`：健康检查结果的最小拷贝（ms 值，与 baselines/maxRTT 同单位比较）。
+#[derive(Debug, Clone)]
+struct Node {
+    tag: String,
+    count_all: i64,
+    count_fail: i64,
+    rtt_average: i64,
+    rtt_deviation_cost: f64,
 }
 
-/// RTT-Deviation-Cost：Go 算法 `value * sqrt(cost)`。
+/// Go `leastloadSort`：cost 升序 → RTTAverage 升序 → CountFail 升序 →
+/// CountAll 降序 → Tag 升序。
+fn leastload_sort(nodes: &mut [Node]) {
+    nodes.sort_by(|a, b| {
+        a.rtt_deviation_cost
+            .partial_cmp(&b.rtt_deviation_cost)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.rtt_average.cmp(&b.rtt_average))
+            .then_with(|| a.count_fail.cmp(&b.count_fail))
+            .then_with(|| b.count_all.cmp(&a.count_all))
+            .then_with(|| a.tag.cmp(&b.tag))
+    });
+}
+
+/// RTT-Deviation-Cost：Go `costs.Apply(tag, value) = value * sqrt(cost)`。
 ///
-/// Rust 端取浮点权重 `costs.apply(tag, rtt) = rtt * sqrt(cost)`。
-/// `costs` 缺省时权重 = 1.0 → RTT-Deviation-Cost = RTT。
-fn rtt_deviation_cost(costs: Option<&WeightManager>, tag: &str, rtt: i64) -> f64 {
+/// Go `getNodes`：有 health ping 时 `value = Deviation`，否则 `value = Delay`。
+/// `costs` 缺省时权重 = 1.0 → RTT-Deviation-Cost = value。
+fn rtt_deviation_cost(costs: Option<&WeightManager>, tag: &str, value: i64) -> f64 {
     let w = match costs {
         Some(wm) => wm.get(tag),
         None => 1.0,
     };
-    (rtt as f64) * w.sqrt().max(0.0)
+    (value as f64) * w.sqrt().max(0.0)
 }
 
 
@@ -143,7 +162,12 @@ impl LeastLoadStrategy {
             selectors,
             ohm,
             observer,
-            baselines: config.baselines.clone(),
+            // Go 依赖 conf 层保证顺序；此处排序保证 baseline 升序累计走查语义。
+            baselines: {
+                let mut b = config.baselines.clone();
+                b.sort_unstable();
+                b
+            },
             expected: config.expected,
             max_rtt: config.max_rtt,
             tolerance: config.tolerance,
@@ -188,103 +212,132 @@ impl LeastLoadStrategy {
         )
     }
 
-    /// 收集所有 alive 且 RTT 满足 baselines+max_rtt 的节点。
+    /// Go `shouldSelectNode`：alive / maxRTT / candidates / tolerance 失败率过滤。
     ///
-    /// 返回 `(tag, rtt, rtt_deviation_cost)` 列表，按 RTT-Deviation-Cost 升序。
-    fn get_nodes(&self) -> Result<Vec<(String, i64, f64)>, RouterError> {
+    /// tolerance 仅在 health ping 样本 > 0 且 tolerance > 0 时启用：
+    /// `fail/all > tolerance` 的节点剔除。
+    fn should_select_node(&self, v: &OutboundStatus, candidates: &[String]) -> bool {
+        if !v.alive {
+            return false;
+        }
+        if self.max_rtt != 0 && v.delay >= self.max_rtt {
+            return false;
+        }
+        if !candidates.iter().any(|t| t == &v.outbound_tag) {
+            return false;
+        }
+        if let Some(h) = &v.health_ping {
+            if h.all > 0
+                && self.tolerance > 0.0
+                && h.fail as f64 / h.all as f64 > f64::from(self.tolerance)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Go `getNodes`：过滤 + 构造节点 + `leastloadSort`。
+    ///
+    /// 无 health ping 的节点以 Delay 兜底（CountAll/CountFail 初始 1，Go 同值）；
+    /// cost 取值：有 ping 用 Deviation，无 ping 用 Delay。
+    fn get_nodes(&self) -> Result<Vec<Node>, RouterError> {
         let obs = self.observer.get_observation()?;
         let selected = self.ohm.select_outbounds(&self.selectors)?;
-        let mut nodes: Vec<(String, i64, f64)> = Vec::new();
+        let mut nodes: Vec<Node> = Vec::new();
         for status in &obs.status {
-            if !status.alive {
+            if !self.should_select_node(status, &selected) {
                 continue;
             }
-            if !selected.iter().any(|t| t == &status.outbound_tag) {
-                continue;
-            }
-            let rtt = effective_rtt(status);
-            if rtt <= 0 {
-                continue;
-            }
-            if self.max_rtt > 0 && rtt > self.max_rtt {
-                continue;
-            }
-            // baselines 过滤：RTT 必须在任一 baseline + tolerance 范围内
-            if !self.baselines.is_empty() {
-                let tol_ns = (f64::from(self.tolerance) * rtt as f64) as i64;
-                let acceptable = self.baselines.iter().any(|b| {
-                    (rtt - b).abs() <= tol_ns
-                });
-                if !acceptable {
-                    continue;
-                }
-            }
-            let cost = rtt_deviation_cost(self.costs.as_ref(), &status.outbound_tag, rtt);
-            nodes.push((status.outbound_tag.clone(), rtt, cost));
+            let (average, deviation, count_all, count_fail) = match &status.health_ping {
+                Some(h) => (h.average, h.deviation, h.all, h.fail),
+                None => (status.delay, status.delay, 1, 1),
+            };
+            let cost_value = if status.health_ping.is_some() { deviation } else { status.delay };
+            let cost = rtt_deviation_cost(self.costs.as_ref(), &status.outbound_tag, cost_value);
+            nodes.push(Node {
+                tag: status.outbound_tag.clone(),
+                count_all,
+                count_fail,
+                rtt_average: average,
+                rtt_deviation_cost: cost,
+            });
         }
-        // Go 排序键：RTTDeviationCost asc → RTTAverage asc → CountFail asc → CountAll desc → Tag asc
-        nodes.sort_by(|a, b| {
-            a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.cmp(&b.1))
-                .then_with(|| a.0.cmp(&b.0))
-        });
+        leastload_sort(&mut nodes);
         Ok(nodes)
     }
 
-    /// Availability 模式选择：取前 `expected` 个候选，按 cost 反比权重随机择一。
-    fn select_availability(&self, nodes: &[(String, i64, f64)]) -> Option<String> {
+    /// Go `selectLeastLoad`：baselines 升序累计上限走查（`count >= expected` 即断）。
+    ///
+    /// - expected > 可用数 → 全量返回（Go line 103-105）
+    /// - expected <= 0 → 按 1 处理
+    /// - 无 baselines → 前 expected 个
+    /// - 走查后 count < expected 且 Expected > 0 → 补到 expected（Go line 134-136）
+    fn select_least_load<'a>(&self, nodes: &'a [Node]) -> &'a [Node] {
         if nodes.is_empty() {
-            return None;
+            return &[];
         }
-        let take = if self.expected > 0 {
-            (self.expected as usize).min(nodes.len())
-        } else {
-            // Go reference：`expected<=0` 时强制取 1 个最低节点（同 line 113-115）。
-            1.min(nodes.len())
-        };
-        let candidates = &nodes[..take];
-        // cost 越低越优，反比权重 1/(c+ε) 概率加权随机择一。
-        let weights: Vec<f64> = candidates
-            .iter()
-            .map(|(_, _, c)| 1.0 / (c + 1.0))
-            .collect();
-        let total: f64 = weights.iter().sum();
-        if total <= 0.0 || candidates.len() == 1 {
-            return Some(candidates[0].0.clone());
+        let available = nodes.len();
+        if self.expected > 0 && self.expected as usize > available {
+            return nodes;
         }
-        let mut pick = rand::rng().random::<f64>() * total;
-        for (i, w) in weights.iter().enumerate() {
-            pick -= w;
-            if pick <= 0.0 {
-                return Some(candidates[i].0.clone());
+        let expected = if self.expected > 0 { self.expected as usize } else { 1 };
+        if self.baselines.is_empty() {
+            return &nodes[..expected.min(available)];
+        }
+        let mut count = 0usize;
+        for baseline in &self.baselines {
+            let baseline = *baseline as f64;
+            for i in count..available {
+                if nodes[i].rtt_deviation_cost >= baseline {
+                    break;
+                }
+                count = i + 1;
+            }
+            if count >= expected {
+                break;
             }
         }
-        Some(candidates[0].0.clone())
+        if self.expected > 0 && count < expected {
+            count = expected;
+        }
+        &nodes[..count.min(available)]
+    }
+
+    /// Availability 模式选择：在选中集内均匀随机（Go `PickOutbound` dice.Roll）。
+    fn select_availability(&self, nodes: &[Node]) -> Option<String> {
+        let selected = self.select_least_load(nodes);
+        selected.choose(&mut rand::rng()).map(|n| n.tag.clone())
     }
 
     /// Adaptive 模式：用 EMA 平滑当前 cost，择最低分。
-    fn select_adaptive(&self, nodes: &[(String, i64, f64)]) -> Option<String> {
+    fn select_adaptive(&self, nodes: &[Node]) -> Option<String> {
         if nodes.is_empty() {
             return None;
         }
         let mut state = self.ema_state.lock();
         let mut best: Option<(String, f64)> = None;
-        for (tag, _rtt, cost) in nodes {
-            let new_score = self.ema_alpha * cost + (1.0 - self.ema_alpha) * state.get(tag).copied().unwrap_or(*cost);
-            state.insert(tag.clone(), new_score);
+        for node in nodes {
+            let prev = state
+                .get(&node.tag)
+                .copied()
+                .unwrap_or(node.rtt_deviation_cost);
+            let new_score =
+                self.ema_alpha * node.rtt_deviation_cost + (1.0 - self.ema_alpha) * prev;
+            state.insert(node.tag.clone(), new_score);
             if best.as_ref().map_or(true, |(_, b)| new_score < *b) {
-                best = Some((tag.clone(), new_score));
+                best = Some((node.tag.clone(), new_score));
             }
         }
         best.map(|(t, _)| t)
     }
 
     /// ConsistentHashing 模式：用 key 哈希 → 在环上顺时针查第一个候选。
-    fn select_consistent_hashing(&self, nodes: &[(String, i64, f64)], key: u64) -> Option<String> {
+    fn select_consistent_hashing(&self, nodes: &[Node], key: u64) -> Option<String> {
         if nodes.is_empty() {
             return None;
         }
-        let tags: Vec<String> = nodes.iter().map(|(t, _, _)| t.clone()).collect();
+        let tags: Vec<String> = nodes.iter().map(|n| n.tag.clone()).collect();
         // 重建环：成员变化时按当前 nodes 重建（轻量级；vnodes 数默认 64）。
         let ring = self.hash_ring.as_ref().expect("hash_ring set for ConsistentHashing");
         let mut ring = ring.clone();
@@ -600,6 +653,158 @@ mod tests {
         }
         // ring 必须覆盖至少 2 个 tag（否则算法退化为固定常量映射）。
         assert!(seen.len() >= 2, "ring should cover multiple tags, got {:?}", seen);
+    }
+
+    // ---- Go 语义对拍（app/router/strategy_leastload.go）----
+
+    /// 带 health ping 的 status 构造（Go observatory.OutboundStatus）。
+    fn ping_status(
+        tag: &str, alive: bool, delay: i64,
+        average: i64, deviation: i64, all: i64, fail: i64,
+    ) -> OutboundStatus {
+        OutboundStatus {
+            alive,
+            delay,
+            last_error_reason: String::new(),
+            outbound_tag: tag.into(),
+            last_seen_time: 0,
+            last_try_time: 0,
+            health_ping: Some(xray_proto::xray::core::app::observatory::HealthPingMeasurementResult {
+                all,
+                fail,
+                deviation,
+                average,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// tolerance = 失败率过滤：fail/all > tolerance 的节点剔除（Go shouldSelectNode）。
+    #[test]
+    fn test_tolerance_filters_high_failure_rate() {
+        let obs = ObservationResult {
+            status: vec![
+                ping_status("fast_bad", true, 50, 50, 50, 10, 9),
+                ping_status("slow_ok", true, 200, 200, 200, 10, 1),
+            ],
+        };
+        let s = LeastLoadStrategy::new(
+            &cfg(vec![], 1, 0, 0.5),
+            vec![],
+            Arc::new(FixedSelector(vec!["fast_bad".into(), "slow_ok".into()])),
+            Arc::new(FixedObs(obs)),
+        )
+        .unwrap();
+        // fast_bad 失败率 0.9 > 0.5 被过滤 → slow_ok 入选。
+        assert_eq!(s.pick_outbound().unwrap(), "slow_ok");
+    }
+
+    /// tolerance = 0 → 失败率过滤不启用（Go `Tolerance > 0` 门）。
+    #[test]
+    fn test_tolerance_zero_disables_failure_filter() {
+        let obs = ObservationResult {
+            status: vec![
+                ping_status("fast_bad", true, 50, 50, 50, 10, 10),
+                ping_status("slow_ok", true, 200, 200, 200, 10, 0),
+            ],
+        };
+        let s = LeastLoadStrategy::new(
+            &cfg(vec![], 1, 0, 0.0),
+            vec![],
+            Arc::new(FixedSelector(vec!["fast_bad".into(), "slow_ok".into()])),
+            Arc::new(FixedObs(obs)),
+        )
+        .unwrap();
+        assert_eq!(s.pick_outbound().unwrap(), "fast_bad");
+    }
+
+    /// baselines 累计上限走查：乱序 baselines 构造时排序，选中集 = 前 count 个，
+    /// 候选只在选中集内均匀随机（Go selectLeastLoad + PickOutbound）。
+    #[test]
+    fn test_baselines_walk_selects_prefix_set() {
+        let obs = ObservationResult {
+            status: vec![
+                status("a", true, 50),
+                status("b", true, 100),
+                status("c", true, 200),
+                status("d", true, 400),
+            ],
+        };
+        // 排序后 baselines [60, 150]：walk 到 150 时 count=2 >= expected=2 即断。
+        // 选中集 {a, b}，c/d 永不选中。
+        let s = LeastLoadStrategy::new(
+            &cfg(vec![150, 60], 2, 0, 0.0),
+            vec![],
+            Arc::new(FixedSelector(vec!["a".into(), "b".into(), "c".into(), "d".into()])),
+            Arc::new(FixedObs(obs)),
+        )
+        .unwrap();
+        for _ in 0..40 {
+            let p = s.pick_outbound().unwrap();
+            assert!(p == "a" || p == "b", "picked {p} outside selected set");
+        }
+    }
+
+    /// expected > 可用数 → 全量返回（Go line 103-105）。
+    #[test]
+    fn test_expected_gt_available_returns_all() {
+        let obs = ObservationResult {
+            status: vec![
+                status("a", true, 50),
+                status("b", true, 100),
+                status("c", true, 200),
+            ],
+        };
+        let s = LeastLoadStrategy::new(
+            &cfg(vec![], 5, 0, 0.0),
+            vec![],
+            Arc::new(FixedSelector(vec!["a".into(), "b".into(), "c".into()])),
+            Arc::new(FixedObs(obs)),
+        )
+        .unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..60 {
+            seen.insert(s.pick_outbound().unwrap());
+        }
+        assert_eq!(seen.len(), 3, "all three should be pickable, got {seen:?}");
+    }
+
+    /// 排序键：cost/average 相同时 CountFail 升序（Go leastloadSort）。
+    #[test]
+    fn test_sort_prefers_lower_fail_count() {
+        let obs = ObservationResult {
+            status: vec![
+                ping_status("many_fail", true, 100, 100, 100, 100, 80),
+                ping_status("few_fail", true, 100, 100, 100, 100, 10),
+            ],
+        };
+        let s = LeastLoadStrategy::new(
+            &cfg(vec![], 1, 0, 0.0),
+            vec![],
+            Arc::new(FixedSelector(vec!["many_fail".into(), "few_fail".into()])),
+            Arc::new(FixedObs(obs)),
+        )
+        .unwrap();
+        assert_eq!(s.pick_outbound().unwrap(), "few_fail");
+    }
+
+    /// 排序键：cost/average/fail 相同时 CountAll 降序（Go leastloadSort）。
+    #[test]
+    fn test_sort_prefers_higher_sample_count() {
+        let obs = ObservationResult {
+            status: vec![
+                ping_status("few_samples", true, 100, 100, 100, 20, 0),
+                ping_status("many_samples", true, 100, 100, 100, 200, 0),
+            ],
+        };
+        let s = LeastLoadStrategy::new(
+            &cfg(vec![], 1, 0, 0.0),
+            vec![],
+            Arc::new(FixedSelector(vec!["few_samples".into(), "many_samples".into()])),
+            Arc::new(FixedObs(obs)),
+        )
+        .unwrap();
+        assert_eq!(s.pick_outbound().unwrap(), "many_samples");
     }
 
     #[test]

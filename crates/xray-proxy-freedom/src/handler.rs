@@ -137,20 +137,7 @@ impl FreedomHandler {
         dest: &Destination,
         default_rule: Option<&FinalRule>,
     ) -> Option<FinalRule> {
-        let net_idx = network_index(dest.network());
-        let port = dest.port().value();
-        let ip = dest.address().ip();
-        for rule in &self.final_rules {
-            if rule.apply(net_idx, port, ip) {
-                return Some(rule.clone());
-            }
-        }
-        if let Some(dr) = default_rule {
-            if dr.apply(net_idx, port, ip) {
-                return Some(dr.clone());
-            }
-        }
-        None
+        crate::config::match_final_rules(&self.final_rules, default_rule, dest)
     }
 
     /// 若目标被 Block 规则命中，返回该规则（dial 前调用）。
@@ -169,46 +156,9 @@ impl FreedomHandler {
     /// 对应 Go `Process` 中 `blockedDest != nil` 分支——不拨号，drain input→Discard，
     /// 超时后 Interrupt + Close，防探测。
     async fn blackhole(&self, link: Link, rule: &FinalRule) -> Result<(), ProxymanError> {
-        let delay = block_delay(rule);
-        tracing::info!(
-            tag = %self.tag,
-            ?delay,
-            "freedom: target blocked by final rule, blackholing connection"
-        );
-        let Link { reader, writer } = link;
-        let drain = async {
-            let mut r = reader;
-            while r.read_multi_buffer().await.is_ok() {}
-        };
-        tokio::select! {
-            _ = drain => {}
-            _ = tokio::time::sleep(delay) => {}
-        }
-        writer.shutdown();
+        crate::config::blackhole_link(link, &self.tag, rule).await;
         Ok(())
     }
-}
-
-/// Network → `[bool; 8]` 索引（TCP=0, UDP=1, Unix=2）。对应 Go `int(network)`。
-fn network_index(network: Network) -> usize {
-    match network {
-        Network::TCP => 0,
-        Network::UDP => 1,
-        Network::Unix => 2,
-    }
-}
-
-/// 计算阻断延时。对应 Go `Handler.blockDelay`。
-///
-/// 默认 [30, 90] 秒；`rule.block_delay` 可覆盖。`dice.Roll(span+1)` → [0, span]。
-fn block_delay(rule: &FinalRule) -> std::time::Duration {
-    let (min, max) = match rule.block_delay {
-        Some(r) => (r.min, r.max),
-        None => (30, 90),
-    };
-    let span = if max >= min { max - min } else { min - max };
-    let roll = rand::random_range(0..=span);
-    std::time::Duration::from_secs(min + roll)
 }
 
 #[async_trait]

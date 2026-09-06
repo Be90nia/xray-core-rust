@@ -9,6 +9,9 @@
 //! [`DialFn`]: xray_app_dispatcher::default::DialFn
 //! [`Connection`]: xray_transport::connection::Connection
 
+use std::collections::HashMap;
+use std::net::SocketAddr;
+
 use xray_app_dispatcher::default::DialFn;
 use xray_common::net::destination::Destination;
 use xray_transport::connection::Connection;
@@ -25,11 +28,12 @@ pub fn make_dial_fn() -> DialFn {
     make_dial_fn_with_config(Config::default())
 }
 
-/// 构造 Freedom 的 DialFn 闭包（携带解析后的 [`Config`]）。
-///
-/// 当前 dial 路径消费 SocketOptions 默认值与 `fragment`（TCP 分片包装，
-/// 对齐 Go :410-418）；domainStrategy 解析已存入 Config，DNS 策略拨号路径
-/// 未消费。noises 由 [`FreedomDispatchBridge::with_noises`] 接入 UDP 路径。
+/// dial 路径消费：SocketOptions、`fragment`（TCP 分片包装，对齐 Go :410-418）、
+/// `destinationOverride`（拨号前改写目标，对齐 Go :269-279；UDP 逐包改写见
+/// [`crate::udp`]）、`proxyProtocol`（拨号后写 PROXY protocol 头，对齐 Go :367-376）。
+/// domainStrategy 解析已存入 Config，DNS 策略拨号路径未消费。noises 由
+/// [`FreedomDispatchBridge::with_noises`] 接入 UDP 路径。finalRules 的 Block
+/// 检查在 [`FreedomDispatchBridge`]（需要 link 做黑洞，dial_fn 无 link）。
 /// ponytail: domain_strategy 当前解析即存储，dial 未消费。
 ///
 /// # Panics
@@ -37,14 +41,22 @@ pub fn make_dial_fn() -> DialFn {
 /// 不会 panic；错误以 `Err(String)` 返回。
 pub fn make_dial_fn_with_config(config: Config) -> DialFn {
     let fragment = config.fragment;
+    let destination_override = config.destination_override;
+    let proxy_protocol = config.proxy_protocol;
     Arc::new(move |dest: &Destination| {
         let dest = dest.clone();
         let fragment = fragment.clone();
+        let destination_override = destination_override.clone();
         Box::pin(async move {
+            // destinationOverride 改写（Go :269-279；isValidAddress 排除 AnyIP）
+            let dial_dest =
+                crate::config::apply_destination_override(&dest, destination_override.as_ref());
             let sockopt = SocketOptions::default();
-            let conn: Box<dyn Connection> = dial_system(&dest, &sockopt)
+            let conn: Box<dyn Connection> = dial_system(&dial_dest, &sockopt)
                 .await
                 .map_err(|e| format!("freedom dial: {e}"))?;
+            // PROXY protocol 头（Go :367-376）：拨号后、任何业务数据前写
+            let conn = write_proxy_protocol_header(conn, proxy_protocol).await?;
             // fragment 配置存在时 dial 后包 writer（对齐 Go :410-418）
             let conn: Box<dyn Connection> = match fragment {
                 Some(f) => Box::new(crate::fragment::FragmentConnection::new(conn, f)),
@@ -53,6 +65,46 @@ pub fn make_dial_fn_with_config(config: Config) -> DialFn {
             Ok(conn)
         })
     })
+}
+
+tokio::task_local! {
+    /// PROXY protocol 头的源地址（入站客户端源，对应 Go `session.Inbound.Source`）。
+    /// 由 [`FreedomDispatchBridge::dispatch_with_access`] 从 `AccessContext.from`
+    /// 注入；纯 DialFn 调用方无此值 → warn + 跳过（Go `inbound == nil` 场景）。
+    static PROXY_PROTO_SRC: Option<SocketAddr>;
+}
+
+/// `proxyProtocol` ∈ {1,2} 时在连接上写 PROXY protocol 头（Go :367-376）。
+///
+/// 源地址来自 [`PROXY_PROTO_SRC`] task-local；无源信息（无入站上下文）→
+/// warn + 跳过，不为改 DialFn 签名。
+async fn write_proxy_protocol_header(
+    mut conn: Box<dyn Connection>,
+    version: u32,
+) -> Result<Box<dyn Connection>, String> {
+    if version != 1 && version != 2 {
+        return Ok(conn);
+    }
+    let src = PROXY_PROTO_SRC.try_with(|v| *v).ok().flatten();
+    let dst = conn.remote_addr().ok().flatten();
+    let (Some(src), Some(dst)) = (src, dst) else {
+        tracing::warn!(
+            version,
+            "freedom: proxyProtocol enabled but session has no source info, skipping header"
+        );
+        return Ok(conn);
+    };
+    let header = xray_transport::build_proxy_header(version as u8, src, dst);
+    if header.is_empty() {
+        tracing::warn!(version, "freedom: invalid PROXY protocol version, skipping header");
+        return Ok(conn);
+    }
+    use tokio::io::AsyncWriteExt;
+    conn.as_mut()
+        .write_all(&header)
+        .await
+        .map_err(|e| format!("freedom: PROXY protocol write failed: {e}"))?;
+    Ok(conn)
 }
 
 use std::sync::Arc;
@@ -66,9 +118,16 @@ use xray_transport::link::Link;
 /// Freedom dispatch handler——在 TCP DialBridge 之上增加 UDP relay。
 ///
 /// 对应 Go `proxy/freedom/freedom.go::Handler`：TCP 走 `dial_system` 流桥接
-/// （委托内部 [`DialBridge`]，fragment 配置经 [`make_dial_fn_with_config`]
-/// 包装 writer）；UDP 走 [`crate::udp::relay_with_noises`]（XUDP 帧 ↔ 原始
-/// 数据报，noises 首包前注入，对齐 Go `NoisePacketWriter`）。
+/// （委托内部 [`DialBridge`]，fragment/destinationOverride/proxyProtocol 配置经
+/// [`make_dial_fn_with_config`] 消费）；UDP 走 [`crate::udp::relay_policy`]
+/// （XUDP 帧 ↔ 原始数据报，noises 首包前注入 + 逐包 override/Block 检查，
+/// 对齐 Go `PacketWriter`/`NoisePacketWriter`）。
+///
+/// finalRules：TCP dial 前 Block 检查 → 黑洞（Go :335-366）；UDP 请求/响应
+/// 双向逐包检查（Go :515-517 / :634-637）。默认规则按入站协议名推导
+/// （Go `getDefaultFinalRule(inbound.Name)` :154-169）——入站 tag → 协议名
+/// 映射由 xray-core 装配时经 [`Self::with_inbound_default_rules`] 注入，
+/// 无映射（入站未注册/无 access 上下文）= 无默认规则（对应 Go `inbound == nil`）。
 ///
 /// **代理链**：仅 TCP 支持代理链（通过内部 DialBridge）；UDP 直连目标，
 /// 不支持代理链（与 Go freedom 一致——freedom 是直连出口）。
@@ -79,6 +138,12 @@ pub struct FreedomDispatchBridge {
     /// sendThrough 源地址规格（bd 7zc）。UDP 分支拨号前解析并设 DIAL_SRC
     /// （TCP 分支的源 bind 由 outbound 侧 dial_fn 包装层处理）。
     send_through: Option<xray_transport::system_dialer::SendThroughSpec>,
+    /// destinationOverride（TCP Block 检查 + UDP 逐包改写；拨号改写在 dial_fn 内）。
+    destination_override: Option<crate::config::DestinationOverride>,
+    /// 预构建的 final rules（`FinalRule::build` 失败的项跳过，与 Handler 口径一致）。
+    final_rules: Vec<crate::config::FinalRule>,
+    /// 入站 tag → 默认规则类型（xray-core 装配注入）。
+    inbound_rules: Arc<HashMap<String, crate::config::DefaultRuleType>>,
 }
 
 impl FreedomDispatchBridge {
@@ -86,7 +151,15 @@ impl FreedomDispatchBridge {
     #[must_use]
     pub fn from_bridge(dial_bridge: Arc<DialBridge>) -> Self {
         let tag = dial_bridge.tag().to_string();
-        Self { tag, tcp: dial_bridge, noises: Vec::new(), send_through: None }
+        Self {
+            tag,
+            tcp: dial_bridge,
+            noises: Vec::new(),
+            send_through: None,
+            destination_override: None,
+            final_rules: Vec::new(),
+            inbound_rules: Arc::new(HashMap::new()),
+        }
     }
 
     /// 设置 UDP 路径首包前注入的 noises（对齐 Go `NoisePacketWriter` 写入时机）。
@@ -106,13 +179,58 @@ impl FreedomDispatchBridge {
         self.send_through = Some(spec);
         self
     }
+
+    /// 设置 destinationOverride（TCP dial 改写在 dial_fn；此处供 Block 检查
+    /// 与 UDP 逐包改写——Go :269-279 override 先于 finalRule 匹配）。
+    #[must_use]
+    pub fn with_destination_override(
+        mut self,
+        ov: Option<crate::config::DestinationOverride>,
+    ) -> Self {
+        self.destination_override = ov;
+        self
+    }
+
+    /// 设置预构建的 final rules（TCP dial 前 + UDP 双向逐包 Block 检查）。
+    #[must_use]
+    pub fn with_final_rules(mut self, rules: Vec<crate::config::FinalRule>) -> Self {
+        self.final_rules = rules;
+        self
+    }
+
+    /// 设置入站 tag → 默认规则类型映射（对应 Go `getDefaultFinalRule(inbound)`，
+    /// 由 xray-core 装配时从 inbound (tag, protocol) 清单构建）。
+    #[must_use]
+    pub fn with_inbound_default_rules(
+        mut self,
+        rules: HashMap<String, crate::config::DefaultRuleType>,
+    ) -> Self {
+        self.inbound_rules = Arc::new(rules);
+        self
+    }
 }
 
 impl std::fmt::Debug for FreedomDispatchBridge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FreedomDispatchBridge")
             .field("tag", &self.tag)
+            .field("final_rules", &self.final_rules.len())
+            .field("has_override", &self.destination_override.is_some())
             .finish_non_exhaustive()
+    }
+}
+
+impl FreedomDispatchBridge {
+    /// 组装 UDP relay 策略（Go `Process` 的 UDPOverride + defaultRule 形态）。
+    fn udp_policy(
+        &self,
+        default_rule: Option<crate::config::FinalRule>,
+    ) -> crate::udp::UdpPolicy {
+        crate::udp::UdpPolicy {
+            destination_override: self.destination_override.clone(),
+            final_rules: self.final_rules.clone(),
+            default_rule,
+        }
     }
 }
 
@@ -122,29 +240,70 @@ impl DispatchHandler for FreedomDispatchBridge {
     }
 
     fn dispatch(&self, dest: &Destination, link: Link) -> PinFuture<()> {
+        // 无 access 上下文：无默认规则（Go `getDefaultFinalRule(nil)` 返回 nil）、
+        // 无 PROXY protocol 源（warn + 跳过）。
+        self.dispatch_with_access(dest, link, xray_app_dispatcher::AccessContext::default())
+    }
+
+    fn dispatch_with_access(
+        &self,
+        dest: &Destination,
+        link: Link,
+        access: xray_app_dispatcher::AccessContext,
+    ) -> PinFuture<()> {
+        // 默认规则：入站 tag → 协议名映射推导（Go getDefaultFinalRule(inbound.Name)）
+        let default_rule = self
+            .inbound_rules
+            .get(access.inbound_tag.as_str())
+            .copied()
+            .map(crate::config::FinalRule::build_default_rule);
+
         if dest.network() == Network::UDP {
             let tag = self.tag.clone();
             let dest = dest.clone();
             let send_through = self.send_through.clone();
             let noises = self.noises.clone();
+            let policy = self.udp_policy(default_rule);
             Box::pin(async move {
                 // bd 7zc：sendThrough → DIAL_SRC scope → relay bind 源地址
                 // （对应 Go DialSystem UDP 分支 src 传递）。
                 let result = match send_through.as_ref().and_then(|s| s.resolve()) {
                     Some(ip) => {
                         xray_transport::system_dialer::DIAL_SRC
-                            .scope(Some(ip), crate::udp::relay_with_noises(&dest, link, &noises))
+                            .scope(Some(ip), crate::udp::relay_policy(&dest, link, &noises, &policy))
                             .await
                     }
-                    None => crate::udp::relay_with_noises(&dest, link, &noises).await,
+                    None => crate::udp::relay_policy(&dest, link, &noises, &policy).await,
                 };
                 if let Err(e) = result {
                     tracing::warn!(tag = %tag, "freedom udp relay ended: {e}");
                 }
             })
         } else {
-            // TCP：委托内部 DialBridge（fragment 经 DialFn 包装，代理链在 bridge 内）
-            self.tcp.dispatch(dest, link)
+            // TCP：finalRule Block 检查在 override 后的目标上匹配（Go :289-339
+            // dialDest = override 后的 destination）。命中 → 黑洞不拨号。
+            let check_dest =
+                crate::config::apply_destination_override(dest, self.destination_override.as_ref());
+            let blocked = crate::config::match_final_rules(
+                &self.final_rules,
+                default_rule.as_ref(),
+                &check_dest,
+            )
+            .filter(|r| r.action == crate::config::RuleAction::Block);
+            if let Some(rule) = blocked {
+                let tag = self.tag.clone();
+                return Box::pin(async move {
+                    crate::config::blackhole_link(link, &tag, &rule).await;
+                });
+            }
+
+            // PROXY protocol 源注入 task-local：DialFn 闭包在本 future 轮询期间执行
+            // （DialBridge::dispatch 不另起 task），scope 覆盖 dial + 头写入。
+            let src = access.from.parse::<SocketAddr>().ok();
+            let inner = self.tcp.dispatch(dest, link);
+            Box::pin(async move {
+                PROXY_PROTO_SRC.scope(src, inner).await;
+            })
         }
     }
 }
@@ -449,5 +608,224 @@ mod tests {
         assert!(records.iter().all(|(t, _)| *t == 22), "record type preserved");
         let data: Vec<u8> = records.iter().flat_map(|(_, p)| p.clone()).collect();
         assert_eq!(data, payload, "reassembled handshake == original");
+    }
+    /// TCP finalRule Block：命中黑洞不拨号（对端连接计数为 0）。
+    #[tokio::test]
+    async fn tcp_block_rule_blackholes_without_dialing() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = listener.local_addr().unwrap();
+        let conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let conns_srv = Arc::clone(&conns);
+        tokio::spawn(async move {
+            while let Ok((_, _)) = listener.accept().await {
+                conns_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        let rule_cfg = crate::config::FinalRuleConfig::from_json(&serde_json::json!({
+            "action": "block", "ip": ["127.0.0.0/8"], "blockDelay": {"from": 0, "to": 0}
+        }))
+        .unwrap();
+        let bridge = FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new(
+            "freedom-out",
+            make_dial_fn(),
+        )))
+        .with_final_rules(vec![crate::config::FinalRule::build(&rule_cfg).unwrap()]);
+
+        let dest = Destination::new(
+            Address::from_ipv4_bytes([127, 0, 0, 1]),
+            Port::new(echo_addr.port()),
+            Network::TCP,
+        );
+        let pipe_opt = xray_buf::pipe::PipeOption::default();
+        let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
+        let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
+        let link = xray_transport::link::Link::new(
+            Box::new(up_r) as Box<dyn Reader>,
+            Box::new(dn_w) as Box<dyn Writer>,
+        );
+        let task = tokio::spawn(async move { bridge.dispatch(&dest, link).await });
+
+        // 客户端写数据后关闭 → blackhole drain 读到 EOF 提前返回
+        let mut w = Box::new(up_w) as Box<dyn Writer>;
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(b"probe");
+        w.write_multi_buffer(mb).await.unwrap();
+        drop(w);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("blackhole should return after drain EOF")
+            .ok()
+            .expect("dispatch ok");
+        assert_eq!(
+            conns.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "blocked target must never be dialed"
+        );
+        let _ = dn_r;
+    }
+
+    /// 入站 tag → 协议名默认规则：vless 入站 → BlockPrivate（127.0.0.0/8 被阻）；
+    /// 未注册 tag（socks）→ 无默认规则正常拨号。
+    #[tokio::test]
+    async fn inbound_default_rule_map_derives_block_private() {
+        // echo server（记录连接数）
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if sock.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let make_bridge = || {
+            FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new(
+                "freedom-out",
+                make_dial_fn(),
+            )))
+            .with_inbound_default_rules(std::collections::HashMap::from([(
+                "vless-in".to_string(),
+                crate::config::DefaultRuleType::BlockPrivate,
+            )]))
+        };
+        let dest = Destination::new(
+            Address::from_ipv4_bytes([127, 0, 0, 1]),
+            Port::new(echo_addr.port()),
+            Network::TCP,
+        );
+        let pipe_opt = xray_buf::pipe::PipeOption::default();
+        let new_link = || {
+            let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
+            let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
+            (
+                xray_transport::link::Link::new(
+                    Box::new(up_r) as Box<dyn Reader>,
+                    Box::new(dn_w) as Box<dyn Writer>,
+                ),
+                up_w,
+                dn_r,
+            )
+        };
+
+        // 阶段 1：vless-in → BlockPrivate（127.0.0.0/8）→ 黑洞，写后关 up 触发 drain EOF
+        {
+            let (link, mut up_w, _dn_r) = new_link();
+            let access = xray_app_dispatcher::AccessContext {
+                inbound_tag: "vless-in".into(),
+                ..Default::default()
+            };
+            let bridge = make_bridge();
+            let task = tokio::spawn(bridge.dispatch_with_access(&dest, link, access));
+            let mut mb = MultiBuffer::new();
+            mb.merge_bytes(b"probe");
+            up_w.write_multi_buffer(mb).await.unwrap();
+            up_w.shutdown(); // xray-buf pipe 无 Drop 关闭——显式 shutdown 才有 EOF
+            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .expect("blackhole drain should end")
+                .ok()
+                .expect("dispatch ok");
+        }
+
+        // 阶段 2：socks-in（不在映射 → 无默认规则）→ 正常拨号 echo
+        {
+            let (link, mut up_w, mut dn_r) = new_link();
+            let access = xray_app_dispatcher::AccessContext {
+                inbound_tag: "socks-in".into(),
+                ..Default::default()
+            };
+            let bridge = make_bridge();
+            let task = tokio::spawn(bridge.dispatch_with_access(&dest, link, access));
+            let mut mb = MultiBuffer::new();
+            mb.merge_bytes(b"echo-me");
+            up_w.write_multi_buffer(mb).await.unwrap();
+            let resp = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                dn_r.read_multi_buffer(),
+            )
+            .await
+            .expect("timeout")
+            .expect("read ok");
+            assert_eq!(resp.to_vec(), b"echo-me");
+            up_w.shutdown();
+            task.abort();
+        }
+    }
+
+    /// proxyProtocol=1 + access.from → 拨号后首字节为 PROXY v1 头（Go :367-376）。
+    #[tokio::test]
+    async fn proxy_protocol_header_written_when_source_available() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 256];
+            let n = sock.read(&mut buf).await.unwrap();
+            let text = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(
+                text.starts_with("PROXY "),
+                "first bytes must be PROXY header, got: {text:?}"
+            );
+            // 头之后回显剩余负载
+            if let Some(idx) = text.find("\r\n") {
+                let rest = &buf[idx + 2..n];
+                if !rest.is_empty() {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = sock.write_all(rest).await;
+                }
+            }
+        });
+
+        // proxyProtocol=1 进 dial_fn（生产 parse_freedom_config 路径等价）
+        let config = Config {
+            proxy_protocol: 1,
+            ..Default::default()
+        };
+        let bridge = FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new(
+            "freedom-out",
+            make_dial_fn_with_config(config),
+        )));
+
+        let dest = Destination::new(
+            Address::from_ipv4_bytes([127, 0, 0, 1]),
+            Port::new(echo_addr.port()),
+            Network::TCP,
+        );
+        let pipe_opt = xray_buf::pipe::PipeOption::default();
+        let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
+        let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
+        let link = xray_transport::link::Link::new(
+            Box::new(up_r) as Box<dyn Reader>,
+            Box::new(dn_w) as Box<dyn Writer>,
+        );
+        let access = xray_app_dispatcher::AccessContext {
+            from: "198.51.100.7:4444".into(),
+            ..Default::default()
+        };
+        let task = tokio::spawn(bridge.dispatch_with_access(&dest, link, access));
+
+        let mut w = Box::new(up_w) as Box<dyn Writer>;
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(b"payload-after-header");
+        w.write_multi_buffer(mb).await.unwrap();
+
+        let mut r = Box::new(dn_r) as Box<dyn Reader>;
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
+            .await
+            .expect("timeout waiting echo")
+            .expect("read ok");
+        assert_eq!(resp.to_vec(), b"payload-after-header");
+        w.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
     }
 }

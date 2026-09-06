@@ -163,7 +163,8 @@ impl StreamSettings {
     /// 从 `sockopt_json` 解析 SocketOptions（对应 Go `SocketConfig`）。
     ///
     /// 支持字段：`mark` / `tcpFastOpen` / `tcpKeepAliveInterval`（秒）/
-    /// `tcpKeepAliveIdle`（秒）/ `tcpMptcp` / `tcpCongestion` / `tproxy` / `reusePort` /
+    /// `tcpKeepAliveIdle`（秒）/ `tcpMptcp` / `tcpCongestion` / `tproxy`（字符串枚举或 bool）/
+    /// `acceptProxyProtocol` / `reusePort` /
     /// `v6only` / `dialerProxy` / `happyEyeballs` / `domainStrategy` /
     /// `addressPortStrategy` / `trustedXForwardedFor` / `tcpWindowClamp` / `tcpMaxSeg` /
     /// `penetrate` / `tcpUserTimeout`（毫秒）/ `customSockopt`。
@@ -215,8 +216,16 @@ impl StreamSettings {
         if let Some(v) = obj.get("tcpUserTimeout").and_then(|v| v.as_i64()) {
             opts.tcp_user_timeout = v as i32;
         }
-        if let Some(v) = obj.get("tproxy").and_then(|v| v.as_bool()) {
-            opts.tproxy = v;
+        // tproxy（Go `SocketConfig.TProxy` JSON 是字符串枚举：transport_sockopt.go:48，
+        // Build() :85-93 仅 "tproxy"/"redirect"（大小写不敏感）启用，其余静默 Off；
+        // Rust 历史 JSON 常写 bool——双类型兼容，其他类型一律 false）。
+        if let Some(v) = obj.get("tproxy") {
+            opts.tproxy = parse_tproxy(v);
+        }
+        // acceptProxyProtocol（Go `SocketConfig.AcceptProxyProtocol` 字段 7，
+        // transport_sockopt.go:49；消费点 system_listener.go:169-172）。
+        if let Some(v) = obj.get("acceptProxyProtocol").and_then(|v| v.as_bool()) {
+            opts.accept_proxy_protocol = v;
         }
         if let Some(v) = obj.get("reusePort").and_then(|v| v.as_bool()) {
             opts.reuse_port = v;
@@ -322,6 +331,20 @@ fn parse_address_port_strategy(s: &str) -> crate::sockopt::AddressPortStrategy {
             tracing::warn!(value = other, "unsupported address port strategy, fallback to None");
             AddressPortStrategy::None
         }
+    }
+}
+
+/// `tproxy` 值 → bool。Go JSON `tproxy` 是字符串枚举（transport_sockopt.go:48，
+/// Build() :85-93）：`"tproxy"` / `"redirect"`（大小写不敏感）启用透明代理，其余值
+/// 静默 Off（与 Go 一致不报错）；Rust 历史上解析 bool——双类型兼容：bool 原样，
+/// 字符串按 Go 枚举，其他类型 false。
+fn parse_tproxy(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::String(s) => {
+            matches!(s.to_ascii_lowercase().as_str(), "tproxy" | "redirect")
+        }
+        _ => false,
     }
 }
 
@@ -623,6 +646,50 @@ mod transport_cache_tests {
         let mut s = StreamSettings::tcp();
         s.sockopt_json = Some(serde_json::json!({ "tcpFastOpen": 1 }));
         assert!(s.socket_options().tcp_fast_open);
+    }
+
+    /// tproxy 双类型解析（Go transport_sockopt.go:48/:85-93 字符串枚举 +
+    /// Rust 历史 bool 兼容）。
+    #[test]
+    fn socket_options_parses_tproxy_string_and_bool() {
+        // Go 主形态：字符串枚举，大小写不敏感。
+        for s in ["tproxy", "redirect", "TProxy", "REDIRECT"] {
+            let mut st = StreamSettings::tcp();
+            st.sockopt_json = Some(serde_json::json!({ "tproxy": s }));
+            assert!(st.socket_options().tproxy, "tproxy={s} 应启用");
+        }
+        // 其他字符串 → Off（Go Build() default 分支静默 Off）。
+        for s in ["off", "", "on", "tproxyy"] {
+            let mut st = StreamSettings::tcp();
+            st.sockopt_json = Some(serde_json::json!({ "tproxy": s }));
+            assert!(!st.socket_options().tproxy, "tproxy={s} 应 Off");
+        }
+        // 兼容历史 bool 形态（既有用户配置不能失效）。
+        let mut st = StreamSettings::tcp();
+        st.sockopt_json = Some(serde_json::json!({ "tproxy": true }));
+        assert!(st.socket_options().tproxy);
+        let mut st = StreamSettings::tcp();
+        st.sockopt_json = Some(serde_json::json!({ "tproxy": false }));
+        assert!(!st.socket_options().tproxy);
+        // 其他类型（数字）→ false。
+        let mut st = StreamSettings::tcp();
+        st.sockopt_json = Some(serde_json::json!({ "tproxy": 1 }));
+        assert!(!st.socket_options().tproxy);
+        // 缺省 false。
+        assert!(!StreamSettings::tcp().socket_options().tproxy);
+    }
+
+    /// acceptProxyProtocol sockopt 入口解析（Go transport_sockopt.go:49 字段 7）。
+    #[test]
+    fn socket_options_parses_accept_proxy_protocol() {
+        let mut st = StreamSettings::tcp();
+        st.sockopt_json = Some(serde_json::json!({ "acceptProxyProtocol": true }));
+        assert!(st.socket_options().accept_proxy_protocol);
+        let mut st = StreamSettings::tcp();
+        st.sockopt_json = Some(serde_json::json!({ "acceptProxyProtocol": false }));
+        assert!(!st.socket_options().accept_proxy_protocol);
+        // 缺省 false。
+        assert!(!StreamSettings::tcp().socket_options().accept_proxy_protocol);
     }
 
     /// Happy Eyeballs 配置解析（bd 0ko，Go `SocketConfig.HappyEyeballs`）。

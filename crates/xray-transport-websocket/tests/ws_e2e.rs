@@ -79,6 +79,7 @@ async fn client_server_roundtrip_echo() {
         destination: &dest,
         early_data: None,
         tls_config: None,
+        fingerprint: None,
     };
     let mut client = dial(opts).await.expect("dial");
 
@@ -107,6 +108,7 @@ async fn large_payload_multi_frame_roundtrip() {
         destination: &dest,
         early_data: None,
         tls_config: None,
+        fingerprint: None,
     };
     let mut client = dial(opts).await.expect("dial");
 
@@ -152,6 +154,7 @@ async fn early_data_delivered_to_server_first_read() {
         destination: &dest,
         early_data: Some(&ed),
         tls_config: None,
+        fingerprint: None,
     };
     let _client = dial(opts).await.expect("dial");
 
@@ -192,6 +195,7 @@ async fn server_rejects_wrong_path() {
         destination: &dest,
         early_data: None,
         tls_config: None,
+        fingerprint: None,
     };
     let result = dial(opts).await;
     assert!(result.is_err(), "client dial should fail with 404");
@@ -233,6 +237,7 @@ async fn server_validates_custom_host_header() {
         destination: &dest,
         early_data: None,
         tls_config: None,
+        fingerprint: None,
     };
     let mut client = dial(opts).await.expect("dial should succeed with matching host");
 
@@ -273,6 +278,7 @@ async fn server_rejects_mismatched_host() {
         destination: &dest,
         early_data: None,
         tls_config: None,
+        fingerprint: None,
     };
     let result = dial(opts).await;
     assert!(result.is_err(), "mismatched host should be rejected");

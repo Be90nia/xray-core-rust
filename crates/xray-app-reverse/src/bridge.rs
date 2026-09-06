@@ -109,7 +109,7 @@ pub type SharedPortal = Arc<dyn Portal>;
 // 与 `app/reverse/portal.go`（Portal 编排：picker + outbound 注册）。
 // ===========================================================================
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::watch;
 use std::time::Duration;
 
 use xray_common::net::destination::Destination;
@@ -121,6 +121,18 @@ pub const BRIDGE_MONITOR_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Portal picker 清理周期（Go `portal.go:149` Interval: 30s）。
 pub const PICKER_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// 等待停止信号（close 发 true 或 sender 被 drop/摘除）。
+async fn wait_stop(rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *rx.borrow() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
 
 /// 真实 dispatcher 抽象（Go `routing.Dispatcher` + ctx inbound tag）。
 ///
@@ -199,7 +211,9 @@ pub struct RuntimeBridge {
     tag: String,
     domain: String,
     workers: std::sync::Arc<parking_lot::Mutex<Vec<std::sync::Arc<BridgeWorker>>>>,
-    running: AtomicBool,
+    /// monitor 停止信号（close 发 true 并摘除 sender；重启建新信道——旧循环
+    /// 盯旧信道必然退出，close/start 往返不会叠加 monitor 循环）。
+    stop_tx: parking_lot::Mutex<Option<watch::Sender<bool>>>,
 }
 
 impl RuntimeBridge {
@@ -214,7 +228,7 @@ impl RuntimeBridge {
             tag: config.tag.clone(),
             domain: config.domain.clone(),
             workers: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
-            running: AtomicBool::new(false),
+            stop_tx: parking_lot::Mutex::new(None),
         })
     }
 
@@ -258,16 +272,23 @@ impl RuntimeBridge {
 
 impl Bridge for RuntimeBridge {
     fn start(&self) -> Result<(), ReverseError> {
-        if self.running.swap(true, Ordering::AcqRel) {
-            return Ok(());
+        let mut guard = self.stop_tx.lock();
+        if guard.is_some() {
+            return Ok(()); // monitor 已在跑
         }
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        *guard = Some(stop_tx);
+        drop(guard);
         let dispatcher = std::sync::Arc::clone(&self.dispatcher);
         let domain = self.domain.clone();
         let tag = self.tag.clone();
         let workers = std::sync::Arc::clone(&self.workers);
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(BRIDGE_MONITOR_INTERVAL).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(BRIDGE_MONITOR_INTERVAL) => {}
+                    _ = wait_stop(&mut stop_rx) => break,
+                }
                 if Self::monitor_step(&dispatcher, &domain, &tag, &workers)
                     .await
                     .is_err()
@@ -281,7 +302,9 @@ impl Bridge for RuntimeBridge {
 
     fn close(&self) -> Result<(), ReverseError> {
         // Go `Bridge.Close` = monitorTask.Close()（worker 交由各自 timer 收尾）
-        self.running.store(false, Ordering::Release);
+        if let Some(tx) = self.stop_tx.lock().take() {
+            let _ = tx.send(true);
+        }
         Ok(())
     }
 
@@ -313,7 +336,8 @@ pub struct RuntimePortal {
     tag: String,
     domain: String,
     picker: std::sync::Arc<StaticMuxPicker<std::sync::Arc<PortalWorker>>>,
-    running: AtomicBool,
+    /// picker 清理循环停止信号（语义同 [`RuntimeBridge::stop_tx`]）。
+    stop_tx: parking_lot::Mutex<Option<watch::Sender<bool>>>,
 }
 
 impl RuntimePortal {
@@ -328,7 +352,7 @@ impl RuntimePortal {
             tag: config.tag.clone(),
             domain: config.domain.clone(),
             picker: std::sync::Arc::new(StaticMuxPicker::new()),
-            running: AtomicBool::new(false),
+            stop_tx: parking_lot::Mutex::new(None),
         })
     }
 
@@ -339,8 +363,9 @@ impl RuntimePortal {
 
 impl Portal for RuntimePortal {
     fn start(&self) -> Result<(), ReverseError> {
-        if self.running.swap(true, Ordering::AcqRel) {
-            return Ok(());
+        let mut guard = self.stop_tx.lock();
+        if guard.is_some() {
+            return Ok(()); // 已在跑
         }
         // Go portal.go:56-61：AddHandler；picker 30s cleanup（portal.go:145-152）
         self.registrar.add_handler(
@@ -351,10 +376,16 @@ impl Portal for RuntimePortal {
                 self.domain.clone(),
             )),
         )?;
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        *guard = Some(stop_tx);
+        drop(guard);
         let picker = std::sync::Arc::clone(&self.picker);
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(PICKER_CLEANUP_INTERVAL).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(PICKER_CLEANUP_INTERVAL) => {}
+                    _ = wait_stop(&mut stop_rx) => break,
+                }
                 picker.cleanup();
             }
         });
@@ -362,7 +393,9 @@ impl Portal for RuntimePortal {
     }
 
     fn close(&self) -> Result<(), ReverseError> {
-        self.running.store(false, Ordering::Release);
+        if let Some(tx) = self.stop_tx.lock().take() {
+            let _ = tx.send(true);
+        }
         self.registrar.remove_handler(&self.tag)
     }
 

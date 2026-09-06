@@ -149,7 +149,7 @@ pub async fn serve_vmess(
                 handle_connection(stream, &handler, &validator, &history, true).await
             };
             if let Err(e) = result {
-                tracing::debug!(error = %e, "vmess connection ended with error");
+                tracing::info!(error = %e, "vmess connection ended with error");
             }
         });
     }
@@ -166,7 +166,23 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
 
     // 1. decode VMess 请求头（async：先读 16B auth_id → AEAD 解密 → 解析）
     let mut session = ServerSession::new(validator, history);
-    let decoded = session.decode_request_header_async(&mut stream_r).await;
+    // Go `server.go::Process`：conn.SetReadDeadline(SessionDefault().Timeouts.Handshake
+    // = 60s) 一次性覆盖 decode 与 drain 总时长（绝对 deadline 语义）。
+    let handshake_deadline =
+        tokio::time::Instant::now() + xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT;
+    let decoded = match tokio::time::timeout_at(
+        handshake_deadline,
+        session.decode_request_header_async(&mut stream_r),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "vmess handshake read timeout",
+        )
+        .into()),
+    };
     let (header, _user) = match decoded {
         Ok(v) => v,
         Err(e) => {
@@ -178,8 +194,9 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
                 let drainer =
                     BehaviorSeedLimitedDrainer::new(crate::validator::Validator::behavior_seed(validator.as_ref()) as i64, 16 + 38, 3266, 64);
                 drainer.acknowledge_receive(16); // auth_id 已读（AEAD 内部计数不可得，近似）
-                // Go 由 SetReadDeadline(handshake timeout) 限制 decode+drain 总时长，对齐 4s
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(4), drainer.drain(&mut stream_r)).await;
+                // drain 受同一 handshake deadline 限制（Go SetReadDeadline 覆盖
+                // decode+drain 总时长；原硬编码 4s 偏离 policy 缺省 60s）
+                let _ = tokio::time::timeout_at(handshake_deadline, drainer.drain(&mut stream_r)).await;
             }
             return Err(err);
         }
@@ -745,8 +762,10 @@ mod tests {
         run_vmess_e2e(SecurityType::Chacha20Poly1305).await;
     }
 
-    /// 无效用户（validator 中不存在）→ server 关闭连接，client 收到 EOF 或 reset。
-    #[tokio::test]
+    /// 无效用户（validator 中不存在）→ server drain（Go 语义等满 60s handshake
+    /// deadline 才关闭，防时序指纹）后关连接，client 收到 EOF 或 reset。
+    /// start_paused 让 60s drain deadline 挂钟自动推进，测试瞬间完成。
+    #[tokio::test(start_paused = true)]
     async fn vmess_inbound_rejects_unknown_user() {
         let ohm = make_ohm_with_freedom();
 
@@ -851,5 +870,34 @@ mod tests {
             .await
             .expect("decode response body");
         assert_eq!(response, payload);
+    }
+
+    /// 静默客户端（握手半途不写数据）→ 60s 握手读超时终止连接
+    /// （Go SessionDefault().Timeouts.Handshake=60s；start_paused 自动推进挂钟；
+    /// 修复前该连接 task 永远挂起占位，drain 也卡在硬编码 4s 起点前）。
+    #[tokio::test(start_paused = true)]
+    async fn vmess_inbound_handshake_read_timeout() {
+        let ohm = make_ohm_with_freedom();
+        let handler = ohm.get_default_handler().expect("default handler");
+        let (validator, _cmd_key) = make_validator_with_user();
+        let history = Arc::new(SessionHistory::new());
+
+        // 对端只写 8 字节（不足 16B auth_id）后沉默 → decode 在 60s deadline 终止
+        let (mut client, server) = tokio::io::duplex(64);
+        let server_task = tokio::spawn(async move {
+            handle_connection(server, &handler, &validator, &history, true).await
+        });
+        client.write_all(&[0u8; 8]).await.unwrap();
+
+        let started = std::time::Instant::now();
+        let result = server_task.await.expect("task join");
+        assert!(
+            result.is_err(),
+            "silent client must be terminated by handshake deadline, got {result:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "paused clock must auto-advance past the 60s deadline"
+        );
     }
 }

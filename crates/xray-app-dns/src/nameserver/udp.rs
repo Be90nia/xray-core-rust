@@ -111,6 +111,7 @@ impl UdpNameServer {
             ns.serve_expired_ttl.unwrap_or(0),
             ns.negative_ttl_secs.unwrap_or(0),
         ));
+        cache.start_cleanup_task(crate::cache_controller::CLEANUP_INTERVAL);
         Ok(Self::new(socket_addr, cache, ns.client_ip.clone(), timeout))
     }
 

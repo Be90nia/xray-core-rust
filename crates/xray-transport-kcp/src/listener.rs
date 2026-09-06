@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex;
 
@@ -66,6 +66,9 @@ pub struct Listener {
     hub: Arc<dyn UdpHub>,
     config: Arc<crate::config::Config>,
     add_conn: Arc<dyn ConnHandler>,
+    /// 自身弱引用（[`Listener::new`] 经 `Arc::new_cyclic` 注入），供 ListenerWriter
+    /// close 时回摘 sessions 表项（对应 Go Writer 持 `listener *Listener`）。
+    self_weak: Weak<Listener>,
 }
 
 struct ListenerInner {
@@ -76,15 +79,18 @@ struct ListenerInner {
 impl Listener {
     /// 构造（对应 Go `NewListener`，但不 spawn 接收循环）。
     ///
-    /// 接收循环由调用方负责（生产用 tokio::spawn 调 `handle_one_packet`）。
+    /// 返回 `Arc<Listener>`：ListenerWriter 需要自身弱引用以在会话 close 时
+    /// 从 sessions 表摘除自己。接收循环由调用方负责（生产用 tokio::spawn
+    /// 调 `handle_one_packet`）。
     #[must_use]
     pub fn new(
         hub: Arc<dyn UdpHub>,
         reader: Arc<dyn PacketReader>,
         config: Arc<crate::config::Config>,
         add_conn: Arc<dyn ConnHandler>,
-    ) -> Self {
-        Self {
+    ) -> Arc<Self> {
+        Arc::new_cyclic(|weak| Self {
+            self_weak: weak.clone(),
             inner: Mutex::new(ListenerInner {
                 sessions: HashMap::new(),
                 closed: false,
@@ -93,7 +99,7 @@ impl Listener {
             reader,
             config,
             add_conn,
-        }
+        })
     }
 
     /// 处理一个 UDP 包（对应 Go `Listener.OnReceive`）。
@@ -124,6 +130,7 @@ impl Listener {
                 let writer = Arc::new(ListenerWriter::new(
                     id.clone(),
                     Arc::clone(&self.hub),
+                    self.self_weak.clone(),
                 ));
                 let closer = writer.clone();
                 let meta = ConnMetadata {
@@ -197,17 +204,19 @@ impl Listener {
 
 /// Listener 会话 writer（对应 Go `Writer struct`）。
 ///
-/// 每个会话一个，写 UDP + close 时从 listener 移除自己。
-/// 注意：当前简化为只写 UDP，不自动 remove（remove 由 Connection terminate 触发）。
+/// 每个会话一个：写 UDP + close 时持自身 `Weak<Listener>` 回摘 sessions 表项
+/// （对应 Go listener.go:167-170 `Writer.Close → listener.Remove(id)`），
+/// 终止的 mKCP 会话不再无限累积。
 pub struct ListenerWriter {
     id: ConnectionId,
     hub: Arc<dyn UdpHub>,
+    listener: Weak<Listener>,
 }
 
 impl ListenerWriter {
     #[must_use]
-    pub fn new(id: ConnectionId, hub: Arc<dyn UdpHub>) -> Self {
-        Self { id, hub }
+    pub fn new(id: ConnectionId, hub: Arc<dyn UdpHub>, listener: Weak<Listener>) -> Self {
+        Self { id, hub, listener }
     }
 }
 
@@ -222,9 +231,11 @@ impl SegmentWriter for ListenerWriter {
 
 impl ConnectionCloser for ListenerWriter {
     fn close(&self) {
-        // 实际 remove 需要访问 Listener（Go 中 writer 持有 listener 引用）。
-        // 简化：close 时仅 hub.close 由 Listener.close 统一处理。
-        // 若需精细 remove，上层可调 listener.remove(&self.id)。
+        // 对齐 Go `Writer.Close`：从 sessions 表摘除本会话。Listener 已全部释放时
+        // upgrade 失败即无需摘除；HashMap::remove 幂等，重复 close 安全。
+        if let Some(listener) = self.listener.upgrade() {
+            listener.remove(&self.id);
+        }
     }
 }
 
@@ -290,7 +301,7 @@ mod tests {
         }
     }
 
-    fn make_listener() -> (Listener, Arc<MockHub>, Arc<CountingHandler>) {
+    fn make_listener() -> (Arc<Listener>, Arc<MockHub>, Arc<CountingHandler>) {
         let hub = MockHub::new();
         let reader = Arc::new(crate::io::KCPPacketReader::new());
         let config = Arc::new(default_config());
@@ -393,6 +404,17 @@ mod tests {
         assert_eq!(listener.active_connections(), 1);
         let id = ConnectionId::new(src, 42);
         listener.remove(&id);
+        assert_eq!(listener.active_connections(), 0);
+    }
+    #[tokio::test]
+    async fn conn_terminate_removes_session_from_listener() {
+        let (listener, _, handler) = make_listener();
+        let src = "127.0.0.1:8080".parse().unwrap();
+        listener.on_receive(&make_data_packet(7, 0), src);
+        assert_eq!(listener.active_connections(), 1);
+        let conn = handler.conns.lock()[0].clone();
+        // 对齐 Go Writer.Close → listener.Remove：会话终止即摘表，防 sessions 泄漏。
+        conn.terminate();
         assert_eq!(listener.active_connections(), 0);
     }
 

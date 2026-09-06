@@ -6,7 +6,7 @@
 //!
 //! 对应 Go `proxy/socks/server.go` 的 `Server.handshake5` + `Server.Process`（连接处理部分）。
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -239,14 +239,22 @@ where
             "unsupported CMD: {cmd} (only CONNECT=1 and UDP_ASSOCIATE=3 supported)"
         )));
     }
+    // UDP ASSOCIATE 需 udp_enabled（Go protocol.go:171-175）：未启用时回 CMD not supported 并拒绝
+    if cmd == CMD_UDP_ASSOCIATE && !config.udp_enabled {
+        let reply = [SOCKS5_VERSION, STATUS_CMD_NOT_SUPPORT, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0];
+        let _ = stream.write_all(&reply).await;
+        return Err(SocksError::HandshakeFailed("UDP is not enabled".into()));
+    }
 
     // 解析地址（从 ATYP 开始读剩余字节）
     let atyp = req_header[3];
     let (addr, _consumed) = parse_address_port_from_stream(stream, atyp).await?;
 
     if cmd == CMD_UDP_ASSOCIATE {
-        // UDP ASSOCIATE: bind 一个 UDP relay socket，回复 relay 地址给客户端
-        let relay_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await
+        // UDP ASSOCIATE: bind UDP relay socket——配置 address 时绑定该 IP（Go protocol.go:199-205），
+        // 未配置回退 127.0.0.1（既有默认行为不变）；BND.ADDR 回 relay 实际地址
+        let bind_ip = config_address_ip(config);
+        let relay_socket = tokio::net::UdpSocket::bind((bind_ip, 0)).await
             .map_err(SocksError::Io)?;
         let relay_addr = relay_socket.local_addr().map_err(SocksError::Io)?;
 
@@ -279,6 +287,33 @@ where
     Ok(SocksRequest::TcpConnect(addr))
 }
 
+/// 从配置 address（IPOrDomain）提取 UDP relay 绑定 IP。
+///
+/// Go protocol.go:199-205：配置 address 时绑定该 IP（BND.ADDR 回同地址）；
+/// 未配置 / 域名 / 字节长度非法时回退 `127.0.0.1`（既有默认行为不变）。
+fn config_address_ip(config: &ServerConfig) -> IpAddr {
+    use xray_proto::xray::common::net::ip_or_domain::Address as ProtoAddr;
+    config
+        .address
+        .as_ref()
+        .and_then(|a| a.address.as_ref())
+        .and_then(|addr| match addr {
+            ProtoAddr::Ip(bytes) => proto_bytes_to_ip(bytes),
+            ProtoAddr::Domain(_) => None,
+        })
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+}
+
+/// prost IPOrDomain 的 IP 字节（4/16 字节）→ [`IpAddr`]；长度非法返回 `None`。
+fn proto_bytes_to_ip(bytes: &[u8]) -> Option<IpAddr> {
+    if let Ok([a, b, c, d]) = <[u8; 4]>::try_from(bytes) {
+        return Some(IpAddr::V4(Ipv4Addr::new(a, b, c, d)));
+    }
+    <[u8; 16]>::try_from(bytes)
+        .ok()
+        .map(|o| IpAddr::V6(o.into()))
+}
+
 /// SOCKS4/4a 服务端握手。VER(=0x04) 已由 [`socks_handshake`] 读取，本函数从 CMD 起始。
 ///
 /// 协议（SOCKS4）:
@@ -292,11 +327,20 @@ where
 /// SOCKS4a：当 DSTIP = `0.0.0.x`（x≠0）时，USERID NULL 之后跟一个 null 结尾域名。
 ///
 /// 仅支持 CONNECT（CD=1）。回复 `[VN=0, CD=90/91, DSTPORT=0, DSTIP=0]`。
+/// 配置密码认证时整体拒绝（Go protocol.go:53-56）。
 /// 对应 Go `ServerSession.handshake4`。
-pub async fn socks4_handshake<RW>(stream: &mut RW, _config: &ServerConfig) -> Result<SocksRequest>
+pub async fn socks4_handshake<RW>(stream: &mut RW, config: &ServerConfig) -> Result<SocksRequest>
 where
     RW: AsyncReadExt + AsyncWriteExt + Unpin,
 {
+
+    // Go protocol.go:53-56：配置密码认证时 SOCKS4 整体拒绝——其 USERID 无法承载 RFC 1929 认证
+    if config.auth_type == AuthType::Password {
+        let _ = stream.write_all(&[0x00, SOCKS4_REQUEST_REJECTED, 0, 0, 0, 0, 0, 0]).await;
+        return Err(SocksError::HandshakeFailed(
+            "SOCKS4 is not allowed when auth is required".into(),
+        ));
+    }
     // VER(0x04) 已读；读 CMD(1) + DSTPORT(2 BE) + DSTIP(4)
     let mut buf = [0u8; 7];
     stream.read_exact(&mut buf).await?;
@@ -364,13 +408,9 @@ fn select_method(client_methods: &[u8], config: &ServerConfig) -> (u8, bool) {
             }
         }
         AuthType::Password => {
-            // 优先密码认证
+            // 严格拒绝（Go protocol.go:109-118）：配置密码认证时仅接受 0x02，不回退 0x00——回退即认证绕过
             if client_methods.contains(&AUTH_PASSWORD) {
                 (AUTH_PASSWORD, true)
-            } else if client_methods.contains(&AUTH_NOT_REQUIRED) {
-                // 回退到无认证（与 Go 一致：如果客户端不支持密码但服务端配置 Password，
-                // 仍允许 NoAuth 连接——实际生产应严格拒绝）
-                (AUTH_NOT_REQUIRED, false)
             } else {
                 (AUTH_NO_MATCHING_METHOD, false)
             }
@@ -406,8 +446,8 @@ where
     let password_str = String::from_utf8_lossy(&password);
 
     let success = config.has_account(&username_str, &password_str);
-    // 回 [VER=1, STATUS=0(success)/1(failure)]
-    stream.write_all(&[0x01, if success { 0x00 } else { 0x01 }]).await?;
+    // 回 [VER=1, STATUS=0(success)/0xFF(failure)]（Go protocol.go:130）
+    stream.write_all(&[0x01, if success { 0x00 } else { 0xFF }]).await?;
 
     if !success {
         return Err(SocksError::AuthFailed(format!(
@@ -674,7 +714,7 @@ mod tests {
     async fn handshake_udp_associate_returns_relay_addr() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let config = ServerConfig::default();
+        let config = ServerConfig { udp_enabled: true, ..Default::default() };
 
         let server = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
@@ -839,6 +879,172 @@ mod tests {
             assert_eq!(reply[1], SOCKS4_REQUEST_GRANTED);
             let r = server.await.unwrap().unwrap();
             assert!(matches!(r, SocksRequest::TcpConnect(_)));
+        }
+    }
+
+    // ===== 回归：认证绕过严格拒绝（Go protocol.go:109-118, 52-56）=====
+
+    #[tokio::test]
+    async fn select_method_rejects_noauth_when_password_configured() {
+        let config = ServerConfig {
+            auth_type: AuthType::Password,
+            ..Default::default()
+        };
+        let (method, needs_auth) = select_method(&[AUTH_NOT_REQUIRED], &config);
+        assert_eq!(method, AUTH_NO_MATCHING_METHOD);
+        assert!(!needs_auth);
+    }
+
+    #[tokio::test]
+    async fn handshake_noauth_method_rejected_when_password_configured() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut config = ServerConfig::default();
+        config.auth_type = AuthType::Password;
+        config.accounts.insert("u".into(), "p".into());
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            socks5_server_handshake(&mut sock, &config).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        // 客户端只声明 NoAuth（0x00）——配置密码时必须回 0xFF 拒绝
+        client.write_all(&[SOCKS5_VERSION, 1, AUTH_NOT_REQUIRED]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp[0], SOCKS5_VERSION);
+        assert_eq!(resp[1], AUTH_NO_MATCHING_METHOD, "0x00 must be rejected when password auth configured");
+
+        let result = server.await.unwrap();
+        assert!(result.is_err(), "handshake must fail for NoAuth-only client");
+    }
+
+    #[tokio::test]
+    async fn handshake_password_auth_still_succeeds_when_configured() {
+        // 严格拒绝不得误伤合法密码认证路径
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut config = ServerConfig::default();
+        config.auth_type = AuthType::Password;
+        config.accounts.insert("u".into(), "p".into());
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            socks5_server_handshake(&mut sock, &config).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(&[SOCKS5_VERSION, 1, AUTH_PASSWORD]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp[1], AUTH_PASSWORD);
+        // RFC 1929: [VER=1, ULEN, UNAME, PLEN, PASSWD]
+        client.write_all(&[0x01, 1, b'u', 1, b'p']).await.unwrap();
+        let mut auth_resp = [0u8; 2];
+        client.read_exact(&mut auth_resp).await.unwrap();
+        assert_eq!(auth_resp, [0x01, 0x00]);
+        client.write_all(&[SOCKS5_VERSION, CMD_TCP_CONNECT, 0x00, ATYP_IPV4, 1, 2, 3, 4, 0, 80]).await.unwrap();
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], STATUS_SUCCESS);
+
+        let result = server.await.unwrap();
+        assert!(matches!(result.unwrap(), SocksRequest::TcpConnect(_)));
+    }
+
+    #[tokio::test]
+    async fn socks4_rejected_when_password_configured() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut config = ServerConfig::default();
+        config.auth_type = AuthType::Password;
+        config.accounts.insert("u".into(), "p".into());
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let r = socks_handshake(&mut sock, &config).await;
+            // 拒绝后服务端仍有未读请求字节，立即 drop 会发 RST 吞掉在途拒绝帧——
+            // 留时间让客户端读完（Windows loopback RST 竞态，见 v49 教训）
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            r
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        socks4_client_connect(&mut client, [1, 2, 3, 4], 8080, "u").await;
+        let mut reply = [0u8; 8];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], SOCKS4_REQUEST_REJECTED, "SOCKS4 must be rejected when auth required");
+
+        let result = server.await.unwrap();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn udp_associate_rejected_when_udp_disabled() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = ServerConfig::default(); // udp_enabled: false（默认）
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let r = socks5_server_handshake(&mut sock, &config).await;
+            // 拒绝后服务端仍有未读地址字节，立即 drop 会发 RST 吞掉在途拒绝帧——
+            // 留时间让客户端读完（Windows loopback RST 竞态，见 v49 教训）
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            r
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(&[SOCKS5_VERSION, 1, AUTH_NOT_REQUIRED]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        client.write_all(&[SOCKS5_VERSION, CMD_UDP_ASSOCIATE, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0]).await.unwrap();
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], STATUS_CMD_NOT_SUPPORT, "ASSOCIATE must get CMD_NOT_SUPPORTED when udp disabled");
+
+        let result = server.await.unwrap();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn udp_associate_binds_configured_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = ServerConfig {
+            udp_enabled: true,
+            address: Some(xray_proto::xray::common::net::IpOrDomain {
+                address: Some(xray_proto::xray::common::net::ip_or_domain::Address::Ip(vec![127, 0, 0, 9])),
+            }),
+            ..Default::default()
+        };
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            socks5_server_handshake(&mut sock, &config).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(&[SOCKS5_VERSION, 1, AUTH_NOT_REQUIRED]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        client.write_all(&[SOCKS5_VERSION, CMD_UDP_ASSOCIATE, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0]).await.unwrap();
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], STATUS_SUCCESS);
+        // BND.ADDR = 配置的 address IP（Go protocol.go:199-205）
+        assert_eq!(&reply[4..8], &[127, 0, 0, 9], "BND.ADDR must be the configured address");
+
+        match server.await.unwrap().unwrap() {
+            SocksRequest::UdpAssociate(relay_addr, socket) => {
+                assert_eq!(relay_addr.host, Host::Ipv4(std::net::Ipv4Addr::new(127, 0, 0, 9)));
+                assert_eq!(
+                    socket.local_addr().unwrap().ip(),
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 9))
+                );
+            }
+            other => panic!("expected UdpAssociate, got {other:?}"),
         }
     }
 }

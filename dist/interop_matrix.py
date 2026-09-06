@@ -80,7 +80,7 @@ def run_one(idx, proto, server_bin, client_bin, tag):
     S = P + 1
     si, co = build(proto, P, client_bin == RUST)
     scfg = {"log": {"loglevel": "warning"}, "inbounds": [si],
-            "outbounds": [{"protocol": "freedom", "settings": {}}]}
+            "outbounds": [{"protocol": "freedom", "settings": {"finalRules": [{"action": "allow"}]}}]}
     ccfg = {"log": {"loglevel": "warning"},
             "inbounds": [{"listen": "127.0.0.1", "port": S, "protocol": "socks", "settings": {"udp": True}}],
             "outbounds": [co]}

@@ -99,16 +99,18 @@ impl StaticHosts {
         })
     }
 
-    /// 查询域名，返回 IP/重定向域名或 RCode 错误。
+    /// 查询域名。对应 Go `(*StaticHosts).Lookup`（hosts.go:96-116）。
     ///
-    /// 对应 Go `(*StaticHosts).Lookup`。递归最大 5 次防止 A->B->A 循环。
+    /// 返回 `None` = 域名未记录；`Some(vec![])` = 记录存在但按 option 过滤后无 IP；
+    /// `Some([Address::Domain(_)])` = 域名替换（递归 unwrap 最大 5 次防 A→B→A 环，
+    /// 耗尽后返回尾域名，由上层走 nameservers 查询）。
     pub fn lookup(
         &self,
         domain: &str,
         option: IpOption,
-    ) -> Result<Vec<Address>, DnsError> {
+    ) -> Result<Option<Vec<Address>>, DnsError> {
         let Some(m) = &self.matcher else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let m: &dyn DomainMatcher = m.as_ref();
         self.lookup_inner(domain, option, 5, m)
@@ -120,7 +122,7 @@ impl StaticHosts {
         option: IpOption,
         max_depth: i32,
         matcher: &dyn DomainMatcher,
-    ) -> Result<Vec<Address>, DnsError> {
+    ) -> Result<Option<Vec<Address>>, DnsError> {
         let lower = domain.to_lowercase();
         let matched_ids = matcher.match_domain(&lower);
 
@@ -135,7 +137,7 @@ impl StaticHosts {
         }
 
         if entries.is_empty() {
-            return Ok(Vec::new());
+            return Ok(None);
         }
 
         // 先处理首个 RCode（Go 行为：单返回匹配返回 rcode）。
@@ -150,17 +152,18 @@ impl StaticHosts {
             if let ResponseEntry::Domain(d) = entries[0] {
                 if max_depth > 0 {
                     let inner = self.lookup_inner(d, option, max_depth - 1, matcher)?;
-                    if !inner.is_empty() {
-                        return Ok(inner);
+                    if let Some(inner) = inner {
+                        // 子域已记录（含"记录但过滤后为空"，对齐 Go unwrapped != nil）。
+                        return Ok(Some(inner));
                     }
                 }
-                // unwrap 失败：返回原域名。
-                return Ok(vec![Address::Domain(d.clone())]);
+                // unwrap 耗尽或子域未记录：返回尾域名，上层以它走 nameservers。
+                return Ok(Some(vec![Address::Domain(d.clone())]));
             }
         }
 
         // 过滤 IP。
-        Ok(filter_ip_entries(&entries, option))
+        Ok(Some(filter_ip_entries(&entries, option)))
     }
 }
 
@@ -290,13 +293,13 @@ mod tests {
     fn empty_mappings_returns_empty_lookup() {
         let h = StaticHosts::new(Vec::new()).unwrap();
         let out = h.lookup("anything.com", IpOption::all()).unwrap();
-        assert!(out.is_empty());
+        assert!(out.is_none());
     }
 
     #[test]
     fn lookup_returns_ips_for_known_domain() {
         let h = StaticHosts::new(vec![mapping_ip("example.com", &["1.2.3.4"])]).unwrap();
-        let out = h.lookup("example.com", IpOption::all()).unwrap();
+        let out = h.lookup("example.com", IpOption::all()).unwrap().unwrap();
         assert_eq!(out.len(), 1);
         assert!(out[0].is_ipv4());
     }
@@ -304,7 +307,7 @@ mod tests {
     #[test]
     fn lookup_case_insensitive() {
         let h = StaticHosts::new(vec![mapping_ip("example.com", &["1.2.3.4"])]).unwrap();
-        let out = h.lookup("EXAMPLE.COM", IpOption::all()).unwrap();
+        let out = h.lookup("EXAMPLE.COM", IpOption::all()).unwrap().unwrap();
         assert_eq!(out.len(), 1);
     }
 
@@ -312,7 +315,7 @@ mod tests {
     fn lookup_returns_empty_for_unknown_domain() {
         let h = StaticHosts::new(vec![mapping_ip("example.com", &["1.2.3.4"])]).unwrap();
         let out = h.lookup("other.com", IpOption::all()).unwrap();
-        assert!(out.is_empty());
+        assert!(out.is_none());
     }
 
     #[test]
@@ -323,7 +326,7 @@ mod tests {
             ipv6_enable: false,
             fake_enable: true,
         };
-        let out = h.lookup("example.com", v4_only).unwrap();
+        let out = h.lookup("example.com", v4_only).unwrap().unwrap();
         assert_eq!(out.len(), 1);
         assert!(out[0].is_ipv4());
     }
@@ -335,7 +338,7 @@ mod tests {
             mapping_ip("target.com", &["9.9.9.9"]),
         ])
         .unwrap();
-        let out = h.lookup("alias.com", IpOption::all()).unwrap();
+        let out = h.lookup("alias.com", IpOption::all()).unwrap().unwrap();
         assert_eq!(out.len(), 1);
         match &out[0] {
             Address::IPv4(v) => assert_eq!(*v, Ipv4Addr::new(9, 9, 9, 9)),
@@ -361,10 +364,26 @@ mod tests {
     fn lookup_keeps_redirect_domain_when_unwrap_fails() {
         let h =
             StaticHosts::new(vec![mapping_redirect("alias.com", "unknown.com")]).unwrap();
-        let out = h.lookup("alias.com", IpOption::all()).unwrap();
+        let out = h.lookup("alias.com", IpOption::all()).unwrap().unwrap();
         assert_eq!(out.len(), 1);
         match &out[0] {
             Address::Domain(d) => assert_eq!(d, "unknown.com"),
+            other => panic!("expected Domain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lookup_redirect_cycle_terminates_with_tail_domain() {
+        // a.com ↔ b.com 互指：unwrap 深度耗尽后返回尾域名，不死循环。
+        let h = StaticHosts::new(vec![
+            mapping_redirect("a.com", "b.com"),
+            mapping_redirect("b.com", "a.com"),
+        ])
+        .unwrap();
+        let out = h.lookup("a.com", IpOption::all()).unwrap().unwrap();
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            Address::Domain(d) => assert_eq!(d, "a.com"),
             other => panic!("expected Domain, got {other:?}"),
         }
     }

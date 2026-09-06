@@ -29,31 +29,127 @@ pub async fn dial(dest: &Destination, settings: &StreamSettings) -> io::Result<B
     // 时补默认（Go `TunCustomName` 等价但上游 service_name 对 "/foo" 返回空串）。
     let path = normalize_grpc_path(&cfg);
 
+    // Go dial.go:156-164 三级回退：authority → tlsSettings.serverName →
+    // 非 reality 的域名目标；全空 = 不发 :authority（gRPC 默认行为）。
+    let server_name = settings
+        .security_json
+        .as_ref()
+        .and_then(|v| v.get("serverName"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let authority = if !cfg.authority.is_empty() {
+        cfg.authority.clone()
+    } else if !server_name.is_empty() {
+        server_name.clone()
+    } else if settings.security != "reality" && dest.address().is_domain() {
+        dest.address().to_string()
+    } else {
+        String::new()
+    };
+    // Go dial.go:190-202：UA 预设映射（golang → 不发 UA）。
+    let user_agent = resolve_user_agent(&cfg.user_agent);
+
     let conn = if !settings.security.is_empty() && settings.security != "none" {
-        let sni = dest.address().to_string();
+        let sni = if server_name.is_empty() { dest.address().to_string() } else { server_name };
         let tls_cfg = xray_tls::client_config::build_client_config(
             &settings.security, settings.security_json.as_ref(), &sni,
         )?.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "TLS config None"))?;
-        let connector = tokio_rustls::TlsConnector::from(tls_cfg);
-        let dns = tokio_rustls::rustls::pki_types::ServerName::try_from(sni).map_err(io_err)?;
-        let tls = connector.connect(dns, tcp).await.map_err(io_err)?;
-        dial_h2(tls, &path).await
+        // Go dial.go:138-145：fingerprint 配置时走 tls.UClient（btls 真实
+        // 浏览器 ClientHello），否则标准 TLS 客户端。
+        let fp_name = settings
+            .security_json
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .and_then(|m| m.get("fingerprint"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let tcp_conn = xray_transport::connection::TcpConnection::new(tcp);
+        let tls_stream: Box<dyn Connection> = if !fp_name.is_empty() {
+            let fp = xray_tls::fingerprint::get_fingerprint(fp_name).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("invalid fingerprint: {e}"))
+            })?;
+            Box::new(xray_tls::utls::u_client(tcp_conn, &sni, tls_cfg, fp, None).await.map_err(io_err)?)
+        } else {
+            Box::new(xray_tls::utls::client(tcp_conn, &sni, tls_cfg).await.map_err(io_err)?)
+        };
+        dial_h2(tls_stream, &path, &authority, "https", user_agent.as_deref(), &cfg).await
     } else {
-        dial_h2(tcp, &path).await
+        dial_h2(tcp, &path, &authority, "http", user_agent.as_deref(), &cfg).await
     }?;
     // Tcpmask（Go grpc/dial.go:129-135：`TcpmaskManager.WrapConnClient`，
     // security/protocol 栈建立后链式应用 finalmask_json.tcp[]）。
     xray_transport::finalmask::wrap_conn_client_from_settings(settings, conn)
 }
-
-async fn dial_h2<T>(conn: T, path: &str) -> io::Result<Box<dyn Connection>>
+async fn dial_h2<T>(
+    conn: T,
+    path: &str,
+    authority: &str,
+    scheme: &str,
+    user_agent: Option<&str>,
+    cfg: &Config,
+) -> io::Result<Box<dyn Connection>>
 where T: AsyncRead + AsyncWrite + Send + Unpin + 'static {
-    let (mut send_req, h2_conn) = client::handshake(conn).await.map_err(io_err)?;
-    tokio::spawn(async move { let _ = h2_conn.await; });
-    let req = Request::builder()
-        .method("POST").uri(path)
-        .header("content-type", "application/grpc").header("te", "trailers")
-        .body(()).map_err(io_err)?;
+    // Go dial.go:174-176：initialWindowsSize → SETTINGS_INITIAL_WINDOW_SIZE。
+    let mut builder = client::Builder::new();
+    if cfg.initial_windows_size > 0 {
+        builder.initial_window_size(cfg.initial_windows_size as u32);
+    }
+    let (mut send_req, mut h2_conn) = builder.handshake(conn).await.map_err(io_err)?;
+    // Go dial.go:166-172 keepalive：idle_timeout 周期发 PING，health_check_timeout
+    // 内未回 PONG 视为死链断连。h2 无内置 keepalive，用 ping_pong 手动泵驱动；
+    // permit_without_stream（无活跃流也 ping）h2 无法感知活跃流数，按恒保活处理。
+    let (ka_idle, ka_timeout) = (
+        cfg.idle_timeout,
+        cfg.health_check_timeout,
+    );
+    tokio::spawn(async move {
+        if ka_idle <= 0 {
+            let _ = h2_conn.await;
+            return;
+        }
+        let mut pinger = h2_conn.ping_pong();
+        let Some(pinger) = pinger.as_mut() else {
+            let _ = h2_conn.await;
+            return;
+        };
+        let period = std::time::Duration::from_secs(ka_idle as u64);
+        let pong_timeout = std::time::Duration::from_secs(ka_timeout.max(0) as u64);
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await; // 首跳立即返回
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    match tokio::time::timeout(pong_timeout, pinger.ping(h2::Ping::opaque())).await {
+                        Ok(Ok(_)) => {}
+                        // PONG 超时 / PING 失败 → break 后 drop 连接 task 断链。
+                        _ => break,
+                    }
+                }
+                _ = &mut h2_conn => break,
+            }
+        }
+    });
+    // :authority 伪头：配了 authority 才发完整 URI（h2 由 URI 生成
+    // :scheme/:authority/:path）；未配保持 path-only URI（现状兼容）。
+    let uri = if authority.is_empty() {
+        path.parse::<http::Uri>().map_err(io_err)?
+    } else {
+        http::Uri::builder()
+            .scheme(scheme)
+            .authority(authority)
+            .path_and_query(path)
+            .build()
+            .map_err(io_err)?
+    };
+    let mut rb = Request::builder()
+        .method("POST").uri(uri)
+        .header("content-type", "application/grpc").header("te", "trailers");
+    if let Some(ua) = user_agent {
+        rb = rb.header("user-agent", ua);
+    }
+    let req = rb.body(()).map_err(io_err)?;
     let (resp_fut, mut send_stream) = send_req.send_request(req, false).map_err(io_err)?;
     // Go grpc-gun 语义：HEADERS 发出后立即泵上行 DATA，不等待响应头——
     // grpc server 收满一个完整 message 才回 :status 200；若先等响应头，
@@ -97,6 +193,10 @@ where T: AsyncRead + AsyncWrite + Send + Unpin + 'static {
 
 pub async fn listen(addr: SocketAddr, settings: &StreamSettings, handler: ConnHandler) -> io::Result<Box<dyn TransportListener>> {
     let cfg = parse_config(settings)?;
+    // serviceName 校验（Go gRPC 框架按注册 path 路由，未知 method 404）：
+    // 非空 serviceName → 请求 path 必须等于 normalize_grpc_path，否则 404；
+    // 空 serviceName 保持现状全放行（兼容既有部署）。
+    let expected_path = if cfg.service_name.is_empty() { None } else { Some(normalize_grpc_path(&cfg)) };
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
     let tls_cfg = if !settings.security.is_empty() && settings.security != "none" {
@@ -112,12 +212,12 @@ pub async fn listen(addr: SocketAddr, settings: &StreamSettings, handler: ConnHa
     tokio::spawn(async move { loop {
         let (tcp,_) = match listener.accept().await { Ok(v)=>v, Err(_)=>continue };
         tcp.set_nodelay(true).ok();
-        let h=handler.clone(); let tls=tls_cfg.clone(); let m=Some(tcpmask.clone());
+        let h=handler.clone(); let tls=tls_cfg.clone(); let m=Some(tcpmask.clone()); let ep=expected_path.clone();
         tokio::spawn(async move {
             if let Some(tc)=tls {
                 let acc=tokio_rustls::TlsAcceptor::from(tc);
-                match acc.accept(tcp).await { Ok(c)=>accept_h2(c,h,m).await, Err(_)=>{} }
-            } else { accept_h2(tcp,h,m).await; }
+                match acc.accept(tcp).await { Ok(c)=>accept_h2(c,h,m,ep).await, Err(_)=>{} }
+            } else { accept_h2(tcp,h,m,ep).await; }
         });
     }});
     Ok(Box::new(GrpcListener{local}))
@@ -127,6 +227,7 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
     conn: T,
     handler: ConnHandler,
     tcpmask: Option<Arc<xray_transport::finalmask::TcpmaskManager>>,
+    expected_path: Option<String>,
 ) {
     let mut h2_srv = match server::handshake(conn).await { Ok(s)=>s, Err(_)=>return };
     while let Some(r)=h2_srv.accept().await {
@@ -134,6 +235,12 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
         if req.method()!="POST" {
             let r=http::Response::builder().status(404).body(()).unwrap();
             let _=respond.send_response(r,true); continue;
+        }
+        if let Some(expected) = &expected_path {
+            if req.uri().path() != expected {
+                let r=http::Response::builder().status(404).body(()).unwrap();
+                let _=respond.send_response(r,true); continue;
+            }
         }
         let mut recv_body=req.into_body();
         let mut send_resp=match respond.send_response(http::Response::builder().status(200)
@@ -209,6 +316,18 @@ pub(crate) fn normalize_grpc_path(cfg: &Config) -> String {
     format!("{service}{stream}")
 }
 
+/// Go dial.go:190-202 的 userAgent 预设映射。`None` = 不发 User-Agent（`golang`）。
+/// 版本号取项目统一锚定值（与 naive 预设同源；不参与互操作契约）。
+fn resolve_user_agent(ua: &str) -> Option<String> {
+    match ua {
+        "" | "chrome" => Some("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36".to_string()),
+        "firefox" => Some("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0".to_string()),
+        "edge" => Some("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0".to_string()),
+        "golang" => None,
+        other => Some(other.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +361,100 @@ mod tests {
     fn normalize_degenerate_service_fallback() {
         // serviceName="/foo" → service_name()=""（Go 退化），tun="foo"。
         assert_eq!(normalize_grpc_path(&cfg_single("/foo")), "/GunService/foo");
+    }
+
+    #[test]
+    fn resolve_user_agent_presets() {
+        assert_eq!(resolve_user_agent(""), resolve_user_agent("chrome"));
+        assert_eq!(resolve_user_agent("chrome").unwrap(), "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36");
+        assert!(resolve_user_agent("edge").unwrap().ends_with("Edg/133.0.0.0"));
+        assert!(resolve_user_agent("firefox").unwrap().contains("Firefox/133.0"));
+        assert_eq!(resolve_user_agent("golang"), None);
+        assert_eq!(resolve_user_agent("custom/9").as_deref(), Some("custom/9"));
+    }
+
+    #[tokio::test]
+    async fn dial_h2_sends_authority_and_user_agent() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut cfg = Config::default();
+        cfg.idle_timeout = 30;
+        cfg.health_check_timeout = 10;
+        cfg.permit_without_stream = true;
+        cfg.initial_windows_size = 65535;
+        let dialer = tokio::spawn(async move {
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            dial_h2(tcp, "/GunService/Tun", "auth.example.com", "http", Some("custom/1.0"), &cfg).await
+        });
+        let (server_tcp, _) = listener.accept().await.unwrap();
+        let mut h2s = server::handshake(server_tcp).await.unwrap();
+        let (req, mut respond) = h2s.accept().await.unwrap().unwrap();
+        // :authority/:scheme/:path 伪头由完整 URI 生成；user-agent 透传。
+        assert_eq!(req.uri().host(), Some("auth.example.com"));
+        assert_eq!(req.uri().scheme_str(), Some("http"));
+        assert_eq!(req.uri().path(), "/GunService/Tun");
+        assert_eq!(req.headers().get("user-agent").map(|v| v.to_str().unwrap()), Some("custom/1.0"));
+        let resp = http::Response::builder().status(200)
+            .header("content-type", "application/grpc").body(()).unwrap();
+        let mut sr = respond.send_response(resp, false).unwrap();
+        sr.send_data(Bytes::new(), true).ok();
+        assert!(dialer.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn grpc_rejects_wrong_service_name_but_accepts_expected() {
+        let settings = StreamSettings {
+            protocol: "grpc".to_string(),
+            transport_json: Some(serde_json::json!({"serviceName": "MySvc"})),
+            ..StreamSettings::tcp()
+        };
+        let handler: ConnHandler = Arc::new(|_conn| {});
+        let listener = listen("127.0.0.1:0".parse().unwrap(), &settings, handler)
+            .await
+            .expect("listen");
+        let addr = listener.local_addr().unwrap();
+
+        let connect = async || {
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let (mut send_req, conn) = client::handshake(tcp).await.unwrap();
+            tokio::spawn(async move { let _ = conn.await; });
+            send_req
+        };
+
+        // 正确 path → 200（进入 gun 泵）。
+        let mut send_req = connect().await;
+        let req = Request::builder().method("POST").uri("/MySvc/Tun")
+            .header("content-type", "application/grpc").body(()).unwrap();
+        let (resp, _stream) = send_req.send_request(req, true).unwrap();
+        assert_eq!(resp.await.unwrap().status(), 200);
+
+        // 错误 path → 404（Go gRPC 框架未知 method 语义）。
+        let mut send_req = connect().await;
+        let req = Request::builder().method("POST").uri("/Other/Tun")
+            .header("content-type", "application/grpc").body(()).unwrap();
+        let (resp, _stream) = send_req.send_request(req, true).unwrap();
+        assert_eq!(resp.await.unwrap().status(), 404);
+    }
+
+    #[tokio::test]
+    async fn grpc_empty_service_name_allows_any_path() {
+        // 空 serviceName = 现状兼容：全放行。
+        let settings = StreamSettings {
+            protocol: "grpc".to_string(),
+            transport_json: Some(serde_json::json!({})),
+            ..StreamSettings::tcp()
+        };
+        let handler: ConnHandler = Arc::new(|_conn| {});
+        let listener = listen("127.0.0.1:0".parse().unwrap(), &settings, handler)
+            .await
+            .expect("listen");
+        let addr = listener.local_addr().unwrap();
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let (mut send_req, conn) = client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move { let _ = conn.await; });
+        let req = Request::builder().method("POST").uri("/Anything/Goes")
+            .header("content-type", "application/grpc").body(()).unwrap();
+        let (resp, _stream) = send_req.send_request(req, true).unwrap();
+        assert_eq!(resp.await.unwrap().status(), 200);
     }
 }

@@ -13,7 +13,7 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast;
 
@@ -21,6 +21,39 @@ use crate::cache_controller::CacheController;
 use crate::config::IpOption;
 use crate::dnscommon::{merge_records, IpRecord};
 use crate::error::DnsError;
+
+/// singleflight 等待者的兜底超时。领导者底层查询各自带 per-query timeout
+/// （默认 4s），此处取同量级值，防领导者异常挂起时等待者被无限拖住。
+const SF_WAIT_TIMEOUT: Duration = Duration::from_secs(4);
+
+type SfMap = tokio::sync::Mutex<
+    std::collections::HashMap<(String, bool, bool), broadcast::Sender<QueryOutcome>>,
+>;
+
+/// 按 key 移除 singleflight 条目；`same_channel` 校验防止误删后来领导者的新条目。
+fn remove_sf_entry(sf: &SfMap, key: &(String, bool, bool), tx: &broadcast::Sender<QueryOutcome>) {
+    if let Ok(mut sf) = sf.try_lock() {
+        if sf.get(key).is_some_and(|t| t.same_channel(tx)) {
+            sf.remove(key);
+        }
+    }
+}
+
+/// 领导者守卫：fetch 正常返回、出错返回或被上层 abort（如 parallel_query 的
+/// `abort_all`）时，Drop 保证把本条 singleflight 条目从 map 移除——
+/// 条目泄漏会让后续同 key 查询永远走「等待者」路径。
+struct SfLeaderGuard<'a> {
+    sf: &'a SfMap,
+    key: (String, bool, bool),
+    tx: broadcast::Sender<QueryOutcome>,
+}
+
+impl Drop for SfLeaderGuard<'_> {
+    fn drop(&mut self) {
+        // Drop 不能 await；try_lock 失败时条目由等待者的 remove_sf_entry 兜底清除。
+        remove_sf_entry(self.sf, &self.key, &self.tx);
+    }
+}
 
 /// 缓存型 nameserver 接口。对应 Go `CachedNameserver` interface。
 pub trait CachedNameserver: Send + Sync {
@@ -91,9 +124,9 @@ pub async fn query_ip<S: CachedNameserver>(
 
 /// 实际查询 + 缓存写入。对应 Go `fetch` + `doFetch`。
 ///
-/// ponytail: 省略 singleflight 去重（per-key Mutex）与 pubsub 订阅，直接串行
-/// send_query + 合并。多并发请求去重在 `CacheController` 的 RwLock 层面已部分缓解；
-/// 真实部署可在 `fetch` 外层包一层 `DashMap<String, Shared<...>>` 实现 singleflight。
+/// singleflight 去重：同 key 并发查询合并为一次 `send_query`，等待者共享
+/// 领导者结果（领导者条目由 `SfLeaderGuard` 保证移除）；pubsub 订阅仍由
+/// `CacheEvent` 广播承担。
 pub async fn fetch<S: CachedNameserver>(
     server: &S,
     fqdn: &str,
@@ -102,31 +135,39 @@ pub async fn fetch<S: CachedNameserver>(
     let cache = server.cache_controller();
     let sf_key = (fqdn.to_string(), option.ipv4_enable, option.ipv6_enable);
 
-    // singleflight：如果已有同名查询在进行，等待其结果。
+    // singleflight：如果已有同名查询在进行，等待其结果；否则成为领导者。
+    // 领导者条目由 SfLeaderGuard 在 Drop 时移除——正常完成、错误、被上层
+    // abort（如 parallel_query 的 abort_all）都保证不泄漏。
     let outcome = {
         let mut sf = cache.single_flight.lock().await;
-        if let Some(tx) = sf.get(&sf_key) {
-            let mut rx = tx.subscribe();
+        if let Some(tx) = sf.get(&sf_key).cloned() {
             drop(sf);
-            match rx.recv().await {
-                Ok(o) => o,
-                Err(_) => {
-                    // 发送方已 drop（超时/错误），回退到直查
-                    server.send_query(fqdn, option).await
-                }
+            let mut rx = tx.subscribe();
+            // 丢弃自己的 sender 克隆：channel 关闭只取决于 map 内（领导者侧）
+            // 的 sender——领导者被 abort 时 guard Drop 移除它，等待者的 recv
+            // 才能立即得到 Closed 而非空等。
+            drop(tx);
+            // 等待者兜底超时：领导者异常挂起时不被无限拖住。
+            // 条目统一由领导者侧 guard 移除（等待者不清理，避免误删超时
+            // 期间新领导者的条目；Go singleflight 同为领导者单点删除）。
+            match tokio::time::timeout(SF_WAIT_TIMEOUT, rx.recv()).await {
+                Ok(Ok(o)) => o,
+                _ => server.send_query(fqdn, option).await,
             }
         } else {
             let (tx, _) = broadcast::channel(1);
-            sf.insert(sf_key.clone(), tx);
+            sf.insert(sf_key.clone(), tx.clone());
             drop(sf);
+            let _guard = SfLeaderGuard {
+                sf: &cache.single_flight,
+                key: sf_key.clone(),
+                tx: tx.clone(),
+            };
 
             let outcome = server.send_query(fqdn, option).await;
 
-            // 广播给等待者。
-            let mut sf = cache.single_flight.lock().await;
-            if let Some(tx) = sf.remove(&sf_key) {
-                let _ = tx.send(outcome.clone());
-            }
+            // 广播给等待者（条目移除由 guard Drop 完成）。
+            let _ = tx.send(outcome.clone());
             outcome
         }
     };
@@ -298,5 +339,113 @@ mod tests {
                 assert!(is_v4);
             }
         }
+    }
+
+    /// 可控挂起的 Server：`hang=true` 时 send_query 循环等待，false 时返回成功。
+    struct HangServer {
+        cache: Arc<CacheController>,
+        hang: std::sync::atomic::AtomicBool,
+    }
+
+    impl CachedNameserver for HangServer {
+        fn cache_controller(&self) -> &CacheController {
+            &self.cache
+        }
+
+        async fn send_query(&self, _fqdn: &str, _option: IpOption) -> QueryOutcome {
+            while self.hang.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            QueryOutcome { rec_v4: Some(v4_record(60)), rec_v6: None, errors: Vec::new() }
+        }
+    }
+
+    #[tokio::test]
+    async fn singleflight_leader_abort_does_not_leak_and_key_recovers() {
+        let cache = Arc::new(CacheController::new("test", false, false, 0, 0));
+        let server = Arc::new(HangServer {
+            cache,
+            hang: std::sync::atomic::AtomicBool::new(true),
+        });
+
+        // 领导者：进入 fetch 后停在挂起的 send_query 上。
+        let leader = tokio::spawn({
+            let server = server.clone();
+            async move { fetch(&*server, "a.com.", v4_only_option()).await }
+        });
+        // 等领导者注册条目。
+        loop {
+            if server.cache.single_flight.lock().await.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // 等待者：进入等待者路径（recv 广播）。
+        let waiter = tokio::spawn({
+            let server = server.clone();
+            async move { fetch(&*server, "a.com.", v4_only_option()).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // 解除挂起并中止领导者：guard Drop 必须移除条目，等待者收到
+        // channel 关闭后回退直查成功。
+        server.hang.store(false, std::sync::atomic::Ordering::SeqCst);
+        leader.abort();
+        let (ips, _) = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("waiter must not hang after leader abort")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ips.len(), 1);
+
+        // 同 key 再查：可恢复（条目已被清，新查询正常成为领导者）。
+        let (ips, _) = fetch(&*server, "a.com.", v4_only_option()).await.unwrap();
+        assert_eq!(ips.len(), 1);
+        assert!(
+            server.cache.single_flight.lock().await.is_empty(),
+            "singleflight entry must be cleaned up"
+        );
+    }
+
+    #[tokio::test]
+    async fn singleflight_deduplicates_concurrent_same_key_queries() {
+        struct CountingServer {
+            cache: Arc<CacheController>,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl CachedNameserver for CountingServer {
+            fn cache_controller(&self) -> &CacheController {
+                &self.cache
+            }
+            async fn send_query(&self, _fqdn: &str, _option: IpOption) -> QueryOutcome {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // 留出并发窗口让第二个请求进入等待者路径。
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                QueryOutcome { rec_v4: Some(v4_record(60)), rec_v6: None, errors: Vec::new() }
+            }
+        }
+
+        let cache = Arc::new(CacheController::new("test", false, false, 0, 0));
+        let server = Arc::new(CountingServer {
+            cache,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let f1 = tokio::spawn({
+            let server = server.clone();
+            async move { fetch(&*server, "dup.com.", v4_only_option()).await }
+        });
+        let f2 = tokio::spawn({
+            let server = server.clone();
+            async move { fetch(&*server, "dup.com.", v4_only_option()).await }
+        });
+        let (r1, r2) = tokio::join!(f1, f2);
+        assert!(r1.unwrap().is_ok());
+        assert!(r2.unwrap().is_ok());
+        assert_eq!(
+            server.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "same-key concurrent queries must hit send_query once"
+        );
+        assert!(server.cache.single_flight.lock().await.is_empty());
     }
 }

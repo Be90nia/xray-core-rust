@@ -233,17 +233,25 @@ pub fn upsert(&self, fqdn: &str, is_v4: bool, record: IpRecord) {
         (has_expired, shrunk)
     }
 
-    /// 启动后台 cleanup tokio task。
+    /// 启动后台 cleanup tokio task，按 `interval` 周期执行 [`Self::run_cleanup`]。
     ///
-    /// 返回 `JoinHandle`，调用方可保留以便 shutdown。
+    /// 返回 `JoinHandle`，调用方可保留以便 shutdown。生产调用点传
+    /// [`CLEANUP_INTERVAL`]；测试传短周期。
     /// 对应 Go `cacheCleanup.Start()`。
-    pub fn start_cleanup_task(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+    ///
+    /// 当前线程无 tokio runtime 时返回 `None`（同步上下文构建配置/单测），
+    /// 不 spawn——后台任务本就无处运行。
+    pub fn start_cleanup_task(
+        self: &Arc<Self>,
+        interval: Duration,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let handle = tokio::runtime::Handle::try_current().ok()?;
         let ctrl = Arc::clone(self);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
-            interval.tick().await; // 跳过首次立即触发
+        Some(handle.spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await; // 跳过首次立即触发
             loop {
-                interval.tick().await;
+                ticker.tick().await;
                 let now = Instant::now();
                 let (cleaned, shrunk) = ctrl.run_cleanup(now);
                 if cleaned || shrunk {
@@ -255,7 +263,7 @@ pub fn upsert(&self, fqdn: &str, is_v4: bool, record: IpRecord) {
                     );
                 }
             }
-        })
+        }))
     }
 
     /// 计算考虑 `serve_stale` 后的“有效当前时间”。
@@ -423,5 +431,25 @@ mod tests {
         c.upsert("example.com.", true, rec);
         assert_eq!(c.len(), 0, "disable_cache upsert must be no-op");
         assert!(c.find_records("example.com.").is_none());
+    }
+
+    #[tokio::test]
+    async fn cleanup_task_removes_expired_entries() {
+        let c = Arc::new(CacheController::new("test", false, false, 0, 0));
+        let now = Instant::now();
+        let expired = ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(0), 0, now);
+        c.upsert("gone.com.", true, expired);
+        let live = ip_record(2, vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))], Duration::from_secs(120), 0, now);
+        c.upsert("live.com.", true, live);
+
+        // 生产接线验证：start_cleanup_task 周期执行 run_cleanup。
+        let _handle = c.start_cleanup_task(Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            c.find_records("gone.com.").is_none(),
+            "expired entry must be removed by cleanup task"
+        );
+        assert!(c.find_records("live.com.").is_some(), "live entry must survive");
     }
 }

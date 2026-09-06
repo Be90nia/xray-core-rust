@@ -86,7 +86,7 @@ async fn listen_httpupgrade(
     let local = listener.local_addr()?;
 
     // 2. TLS 配置（可选）
-    let tls_acceptor = build_tls_acceptor(settings)?;
+    let tls_config = build_tls_server_config(settings)?;
 
     // Tcpmask（Go httpupgrade/hub.go:145-147：`TcpmaskManager.WrapListener` →
     // 每条 accept conn 过 `WrapConnServer` 再进 handler；空 manager = 恒等）。
@@ -126,7 +126,7 @@ async fn listen_httpupgrade(
                 }
             }
 
-            match do_handshake(tcp, &server, &tls_acceptor, remote).await {
+            match do_handshake(tcp, &server, tls_config.clone(), remote).await {
                 Ok(conn) => {
                     // Tcpmask wrap 失败 → 丢弃该 conn 继续（Go tcpListener.Accept 语义）。
                     match xray_transport::finalmask::wrap_conn_server_into_connection(
@@ -151,30 +151,42 @@ async fn listen_httpupgrade(
 
 async fn do_handshake(
     tcp: tokio::net::TcpStream,
-    _server: &HttpUpgradeServer,
-    _tls_acceptor: &Option<tokio_rustls::TlsAcceptor>,
-    _remote: SocketAddr,
+    server: &HttpUpgradeServer,
+    tls_config: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
+    remote: SocketAddr,
 ) -> io::Result<Box<dyn Connection>> {
-    // ponytail: TLS 路径待 build_tls_acceptor 实现后接入（见 hjo3）。
-    // 当前 build_tls_acceptor 返回 Unsupported，所以 tls_acceptor 始终为 None。
-    let wrapped = xray_transport::connection::TcpConnection::new(tcp);
-    let (conn, _leftover) = _server.handshake_io(wrapped).await
+    // security=tls：先完成 TLS accept，再在其上做 HTTP upgrade 握手
+    // （Go hub.go：tls.Server(conn) 后进 upgrade handler）；非 TLS 直连。
+    let wrapped: Box<dyn Connection> = match tls_config {
+        Some(cfg) => {
+            let tls = xray_tls::utls::server(
+                xray_transport::connection::TcpConnection::new(tcp),
+                cfg,
+            )
+            .await?;
+            Box::new(tls)
+        }
+        None => Box::new(xray_transport::connection::TcpConnection::new(tcp)),
+    };
+    let (conn, _leftover) = server
+        .handshake_io(wrapped)
+        .await
         .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("HTTPUpgrade handshake: {e}")))?;
     let final_conn = if conn.remote_addr_override.is_some() { conn }
-        else { HttpUpgradeConnection::with_remote_addr(conn.into_inner(), _remote) };
+        else { HttpUpgradeConnection::with_remote_addr(conn.into_inner(), remote) };
     Ok(Box::new(final_conn) as Box<dyn Connection>)
 }
 
-/// 构建 TLS acceptor（如果 security == "tls"）。
+/// 构建 TLS server config（如果 security == "tls"），非 TLS 返回 None。
 ///
-/// ponytail: TLS server config 待 xray_tls::ocsp_stapling 集成后实现（见 hjo3）。
-/// 当前 security=tls 时返回 Unsupported，非 TLS 返回 None。
-fn build_tls_acceptor(settings: &StreamSettings) -> io::Result<Option<tokio_rustls::TlsAcceptor>> {
-    let config = xray_tls::server_config::build_server_config(
+/// 对应 Go `hub.go` 的 `tlsConfig := tls.ConfigFromStreamSettings(...)`。
+fn build_tls_server_config(
+    settings: &StreamSettings,
+) -> io::Result<Option<Arc<tokio_rustls::rustls::ServerConfig>>> {
+    xray_tls::server_config::build_server_config(
         &settings.security,
         settings.security_json.as_ref(),
-    )?;
-    Ok(config.map(|c| tokio_rustls::TlsAcceptor::from(c)))
+    )
 }
 
 /// HTTPUpgrade transport listener 句柄。
@@ -243,6 +255,8 @@ async fn dial_httpupgrade(
         .unwrap_or_else(|| default_sni.clone());
 
     let upgraded_conn: Box<dyn Connection> = if let Some(cfg) = tls_config {
+        // 禁区: ws/httpupgrade 的 u_client 接线实测 VPS 15 节点 Connection reset (2026-09-06 run_full32 17/32), btls 与该类端点不兼容, 启用前须先解决 btls 层兼容性 — fingerprint_name 透传解析保留, 接线恒走 rustls。
+        let _register_passthrough = fingerprint_name(settings);
         let tls_conn = xray_tls::utls::client(tcp_conn, &sni, cfg)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("TLS handshake failed: {e}")))?;
@@ -342,10 +356,37 @@ fn parse_headers(v: Option<&serde_json::Value>) -> Option<std::collections::Hash
     Some(map)
 }
 
+
+/// 读 `tlsSettings.fingerprint`（空 = 未配置）。Go `tls.GetFingerprint` 的
+/// 前置解析；四个传输出站共用同款语义，与 tcp register 内联实现一致。
+fn fingerprint_name(settings: &StreamSettings) -> &str {
+    settings
+        .security_json
+        .as_ref()
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("fingerprint"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     use xray_transport::dialer::get_transport_dialer;
+
+    #[test]
+    fn tls_server_config_none_when_security_empty() {
+        let settings = StreamSettings::tcp();
+        assert!(build_tls_server_config(&settings).unwrap().is_none());
+    }
+
+    #[test]
+    fn fingerprint_name_reads_tls_settings() {
+        let mut s = StreamSettings::tcp();
+        s.security_json = Some(serde_json::json!({"fingerprint": "chrome"}));
+        assert_eq!(fingerprint_name(&s), "chrome");
+        // 未配置 → 空串（走标准 rustls 分支）。
+        assert_eq!(fingerprint_name(&StreamSettings::tcp()), "");
+    }
 
     #[test]
     fn parse_httpupgrade_config_none_returns_default() {

@@ -16,7 +16,8 @@
 //! - 360 11.0（Chrome-like，无 ALPS/ECH/delegated_credentials）
 //! - QQ 11.1（Chrome-like，有 ALPS，无 ECH/delegated_credentials）
 //!
-//! 其他指纹将 fallback 到标准 rustls。
+//! 清单外指纹返回 `InvalidData` 硬错（不再静默回退标准 rustls）：配置了
+//! 指纹说明用户在意 ClientHello 伪装，静默降级等于伪装失效。
 
 use std::future::Future;
 use std::io;
@@ -135,6 +136,16 @@ fn chrome_133_ext_perm() -> Vec<btls::ssl::ExtensionType> {
 
 /// 构建带 Chrome 133 指纹的 SslConnector。
 fn chrome_133_connector() -> io::Result<SslConnector> {
+    chrome_133_connector_alpn(CHROME_133_ALPN)
+}
+
+/// Chrome 133 无 ALPN 变体：uTLS `HelloRandomizedNoALPN` 的就近映射底座
+/// （ALPS 依赖 ALPN 协商，无 ALPN 时由调用方一并置空）。
+fn chrome_133_connector_no_alpn() -> io::Result<SslConnector> {
+    chrome_133_connector_alpn(b"")
+}
+
+fn chrome_133_connector_alpn(alpn: &'static [u8]) -> io::Result<SslConnector> {
     let mut builder =
         SslConnector::builder(SslMethod::tls()).map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -147,9 +158,11 @@ fn chrome_133_connector() -> io::Result<SslConnector> {
     builder
         .set_curves_list(CHROME_133_CURVES)
         .map_err(|e| io::Error::other(e.to_string()))?;
-    builder
-        .set_alpn_protos(CHROME_133_ALPN)
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    if !alpn.is_empty() {
+        builder
+            .set_alpn_protos(alpn)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+    }
     builder.set_grease_enabled(true);
     builder.set_permute_extensions(true);
     builder.set_extension_permutation(&chrome_133_ext_perm())
@@ -830,7 +843,10 @@ fn qq_11_1_connector() -> io::Result<SslConnector> {
 
     Ok(builder.build())
 }
-/// 根据指纹选择 btls 连接器。返回 `None` 表示该指纹不支持 btls（fallback rustls）。
+/// 根据指纹选择 btls 连接器。
+///
+/// 返回 `Some(Ok(config))` = btls 支持；`Some(Err(_))` = 清单外指纹（硬错
+/// `InvalidData`，不再静默回退标准 rustls）；函数不再返回 `None`。
 pub(crate) fn connector_for_fingerprint(fp: &Fingerprint) -> Option<io::Result<FingerprintConfig>> {
     match fp {
         Fingerprint::Chrome | Fingerprint::HelloChrome133 => {
@@ -982,8 +998,31 @@ pub(crate) fn connector_for_fingerprint(fp: &Fingerprint) -> Option<io::Result<F
                 connector: c, key_shares: CHROME_133_KEY_SHARES, alps: CHROME_133_ALPS,
             }))
         }
-        // No-ALPN variants → still None (no ALPN fingerprint not implemented)
-        _ => None,
+        // RandomizedNoALPN：uTLS 随机化指纹的无 ALPN 变体。btls 无法复刻
+        // uTLS 的 cipher/扩展顺序随机化，就近映射到无 ALPN 的 Chrome 133
+        // 配置（ALPS 依赖 ALPN 协商，随之一并置空）。
+        Fingerprint::RandomizedNoAlpn | Fingerprint::HelloRandomizedNoAlpn => {
+            Some(chrome_133_connector_no_alpn().map(|c| FingerprintConfig {
+                connector: c,
+                key_shares: CHROME_133_KEY_SHARES,
+                alps: b"",
+            }))
+        }
+        // UniformRandom：uTLS 均匀权重随机化（Go xray 未收录该预设名，Rust
+        // 端按 uTLS 库补全）。btls 无逐字段均匀随机化能力，就近映射 Chrome 133。
+        Fingerprint::UniformRandom => {
+            Some(chrome_133_connector().map(|c| FingerprintConfig {
+                connector: c, key_shares: CHROME_133_KEY_SHARES, alps: CHROME_133_ALPS,
+            }))
+        }
+        // 清单外指纹：硬错 InvalidData。配置了指纹说明用户在意 ClientHello
+        // 伪装，静默回退标准 rustls 等于伪装失效（批3 裁决：显式失败）。
+        _ => Some(Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "fingerprint {fp:?} not supported by btls; pick a supported fingerprint (silent rustls fallback removed)"
+            ),
+        ))),
     }
 }
 
@@ -1018,9 +1057,17 @@ impl<S: Connection + Unpin> BtlsConn<S> {
     ) -> io::Result<Self> {
         use crate::ech::ApplyEch;
 
-        let fp_config = connector_for_fingerprint(&fingerprint)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "fingerprint not supported by btls"))?
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        let fp_config = match connector_for_fingerprint(&fingerprint) {
+            Some(Ok(c)) => c,
+            // 清单外指纹：透传 InvalidData 硬错（不静默降级）
+            Some(Err(e)) => return Err(e),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fingerprint not supported by btls",
+                ))
+            }
+        };
 
         let mut cfg = fp_config.connector
             .configure()
@@ -1084,9 +1131,12 @@ impl<S: Connection + Unpin> BtlsConn<S> {
 }
 
 /// 指纹是否被 btls 支持（REALITY u_client 路径选择的预检）。
+///
+/// 清单外指纹为 `false`（`Some(Err)` 不算支持）；调用方（如 REALITY）据此
+/// 走各自的平台降级路径，u_client 主路径则直接硬错。
 #[must_use]
 pub fn fingerprint_supported(fp: &Fingerprint) -> bool {
-    connector_for_fingerprint(fp).is_some()
+    matches!(connector_for_fingerprint(fp), Some(Ok(_)))
 }
 
 impl<S: Connection + Unpin> AsyncRead for BtlsConn<S> {
@@ -1163,5 +1213,61 @@ impl<S: Connection + Unpin> ConnInterface for BtlsConn<S> {
             .map(|p| String::from_utf8_lossy(p).to_string())
             .unwrap_or_default();
         Box::pin(async move { proto })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fingerprint::get_fingerprint;
+
+    /// ModernFingerprints 全池 + 补齐清单（android/randomized 家族/
+    /// uniformrandom）必须 btls 可用（Some(Ok)），且 fingerprint_supported 同步。
+    #[test]
+    fn fingerprint_list_fully_supported_by_btls() {
+        let mut names = vec![
+            "chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq",
+            "random", "randomized", "randomizednoalpn", "uniformrandom",
+            "hellofirefox_120", "hellofirefox_148", "hellochrome_120",
+            "hellochrome_131", "hellochrome_133", "helloios_13", "helloios_14",
+            "helloedge_106", "hellosafari_26_3", "hello360_11_0", "helloqq_11_1",
+        ];
+        for name in names.drain(..) {
+            let fp = get_fingerprint(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let r = connector_for_fingerprint(&fp)
+                .unwrap_or_else(|| panic!("{name}: no connector"));
+            assert!(r.is_ok(), "{name} ({fp:?}) must build a connector: {:?}", r.err());
+            assert!(super::fingerprint_supported(&fp), "{name} must be supported");
+        }
+    }
+
+    /// 清单外指纹（unsafe/hellochrome_58 等旧变体之外的占位）——这里以
+    /// `Unsafe` 为样本——必须 Some(Err) 且错误类别为 InvalidData（硬错，
+    /// 不再静默回退标准 rustls）。
+    #[test]
+    fn unsupported_fingerprint_fails_hard_with_invalid_data() {
+        let fp = get_fingerprint("unsafe").expect("unsafe must resolve");
+        let r = connector_for_fingerprint(&fp).expect("returns Some(Err), never None");
+        let err = match r {
+            Ok(_) => panic!("out-of-list fingerprint must fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "got: {err}");
+        assert!(!super::fingerprint_supported(&fp));
+    }
+
+    /// 无 ALPN 变体产出的 connector 不带 ALPN 扩展底座（alps 置空跳过）。
+    #[test]
+    fn randomized_no_alpn_skips_alps() {
+        let fp = Fingerprint::RandomizedNoAlpn;
+        let cfg = connector_for_fingerprint(&fp)
+            .expect("Some")
+            .expect("Ok");
+        assert!(cfg.alps.is_empty());
+        // 有 ALPN 变体对照：Chrome 133 携带 h2 ALPS
+        let with = connector_for_fingerprint(&Fingerprint::Chrome)
+            .expect("Some")
+            .expect("Ok");
+        assert!(!with.alps.is_empty());
     }
 }

@@ -14,10 +14,76 @@ use xray_proto::xray::core::app::observatory::burst::HealthPingConfig as ProtoHe
 pub struct HealthPingConfig {
     pub destination: String,
     pub connectivity: String,
+    /// Go json `interval` 为 `duration.Duration`：整数（纳秒）或字符串（`"1m"`/`"500ms"`）。
+    #[serde(deserialize_with = "duration_nanos::deserialize")]
     pub interval: i64,
+    /// Go json 键为 `sampling`（router_strategy.go:51）、proto 字段 `samplingCount`；
+    /// 两者都接受。
+    #[serde(alias = "sampling")]
     pub sampling_count: i32,
+    /// 同 `interval`：Go `duration.Duration` 双形态。
+    #[serde(deserialize_with = "duration_nanos::deserialize")]
     pub timeout: i64,
     pub http_method: String,
+}
+
+/// Go `duration.Duration` JSON 双形态反序列化：整数 = 纳秒；
+/// 字符串 = Go duration（`time.ParseDuration` 正数子集：`ns|us|µs|ms|s|m|h` 单位序列）。
+mod duration_nanos {
+    use serde::{Deserialize, Deserializer};
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<i64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum V {
+            Nanos(i64),
+            Str(String),
+        }
+        match V::deserialize(deserializer)? {
+            V::Nanos(n) => Ok(n),
+            V::Str(s) => parse_go_duration(&s)
+                .ok_or_else(|| serde::de::Error::custom(format!("invalid Go duration: {s}"))),
+        }
+    }
+
+    /// `"300ms"` / `"1.5h"` / `"2h45m"` → 纳秒。非法输入返回 `None`。
+    pub(super) fn parse_go_duration(s: &str) -> Option<i64> {
+        let s = s.trim();
+        if s.is_empty() {
+            return None;
+        }
+        let mut total: i64 = 0;
+        let mut rest = s;
+        while !rest.is_empty() {
+            let num_end = rest
+                .find(|c: char| !c.is_ascii_digit() && c != '.')
+                .unwrap_or(rest.len());
+            if num_end == 0 {
+                return None;
+            }
+            let num: f64 = rest[..num_end].parse().ok()?;
+            rest = &rest[num_end..];
+            // 单位最长匹配在前（"ms" 先于 "m"）
+            let (unit, mult): (&str, i64) = [
+                ("ns", 1),
+                ("us", 1_000),
+                ("µs", 1_000),
+                ("ms", 1_000_000),
+                ("s", 1_000_000_000),
+                ("m", 60_000_000_000),
+                ("h", 3_600_000_000_000),
+            ]
+            .into_iter()
+            .find(|(u, _)| rest.starts_with(u))
+            .map(|(u, m)| (u, m))?;
+            rest = &rest[unit.len()..];
+            total = total.checked_add((num * mult as f64) as i64)?;
+        }
+        Some(total)
+    }
 }
 
 impl HealthPingConfig {
@@ -328,5 +394,48 @@ mod tests {
         };
         let p = c.to_proto();
         assert_eq!(HealthPingConfig::from_proto(&p), c);
+    }
+
+    /// Go 键双读：`sampling`（Go json）与 `samplingCount`（proto camelCase）都接受；
+    /// `interval`/`timeout` 接受 Go duration 字符串或纳秒整数。
+    #[test]
+    fn sampling_alias_and_duration_strings() {
+        let c: HealthPingConfig = serde_json::from_value(serde_json::json!({
+            "destination": "https://x/204",
+            "interval": "2m",
+            "sampling": 20,
+            "timeout": "5s"
+        }))
+        .unwrap();
+        assert_eq!(c.interval, 120_000_000_000);
+        assert_eq!(c.sampling_count, 20);
+        assert_eq!(c.timeout, 5_000_000_000);
+
+        let camel: HealthPingConfig = serde_json::from_value(serde_json::json!({
+            "samplingCount": 7, "interval": 500, "timeout": "500ms"
+        }))
+        .unwrap();
+        assert_eq!(camel.sampling_count, 7);
+        assert_eq!(camel.interval, 500);
+        assert_eq!(camel.timeout, 500_000_000);
+
+        // 归一化链路：字符串 duration → settings（经 from_config 默认值/下限钳制）
+        let settings = HealthPingSettings::from_config(Some(&c));
+        assert_eq!(settings.sampling_count, 20);
+        assert_eq!(settings.interval, 120_000_000_000);
+    }
+
+    /// parse_go_duration：复合形式 + 非法输入。
+    #[test]
+    fn parse_go_duration_units_and_errors() {
+        use super::duration_nanos::parse_go_duration;
+        assert_eq!(parse_go_duration("1m"), Some(60_000_000_000));
+        assert_eq!(parse_go_duration("500ms"), Some(500_000_000));
+        assert_eq!(parse_go_duration("1h30m"), Some(5_400_000_000_000));
+        assert_eq!(parse_go_duration("1.5s"), Some(1_500_000_000));
+        assert_eq!(parse_go_duration("10us"), Some(10_000));
+        assert_eq!(parse_go_duration(""), None);
+        assert_eq!(parse_go_duration("abc"), None);
+        assert_eq!(parse_go_duration("5x"), None);
     }
 }

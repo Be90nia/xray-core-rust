@@ -136,7 +136,7 @@ impl AnytlsClient {
             .write_frame(Frame::new(Command::Syn, DEFAULT_SID))
             .await?;
         // 协议要求：客户端在 stream 首帧写 SOCKS5 格式目标地址
-        let socks_bytes = target.encode();
+        let socks_bytes = target.encode()?;
         stream.write(&socks_bytes).await?;
 
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
