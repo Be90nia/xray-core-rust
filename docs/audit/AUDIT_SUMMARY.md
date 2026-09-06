@@ -57,3 +57,60 @@ nonce 换 key 不对称 / SlidingWindow 淘汰后重放窗口 / from_utf8_unchec
 3. **P1 功能组**: balancer NotImplementedSelector / httpupgrade TLS 丢弃 / FakeDNS 未接线(用户可感知的功能缺失)
 4. **P1 性能组**: writev / 分配池化(收益最大路径: 加密数据面)
 5. P2 按需清偿
+
+---
+
+# 第二轮补漏审计 (2026-09-05,5 切面)
+
+第一轮没覆盖的切面:全平台对称 / 配置→装配 diff / 超时矩阵 / 传输层字节级 / 可观测性。
+
+## 第二轮统计
+
+| 切面 | 报告 | P1 | P2 | P3 |
+|---|---|---|---|---|
+| 全平台对称 | [platform.md](platform.md) | 0 | 3 | 5 |
+| 配置→装配 diff | [config_wiring.md](config_wiring.md) | 4 | 10 | - |
+| 超时/资源限制矩阵 | [timeouts.md](timeouts.md) | 3 | 7 | - |
+| 传输层深度 | [transport_deep.md](transport_deep.md) | 3 | 16 | 9 |
+| 可观测性/统计 | [observability.md](observability.md) | 3 | 3 | 1 |
+| **小计** | | **13** | **39** | **15** |
+
+## 两轮合计: P0×3 / P1×35 / P2×82 / P3×16
+
+## 第二轮 P1(13 条)
+
+**配置静默失效组(系统性 camelCase 键名不匹配)**:
+- C1 policy 键族静默全丢(connIdle/uplinkOnly/bufferSize/statsUser*/system) app_config.rs:42-87
+- C2 observatory/burstObservatory 键族整体 no-op app_config.rs:94-120
+- C3 burst executor 生产无注入路径,Rust 方言键致 instance.start() 硬失败 burst_feature.rs:59
+- C4 出站级 mux.enabled 静默无复用(concurrency 零消费) outbound.rs:490-507
+
+**超时/资源限制组**:
+- T1 vless/trojan/vmess/ss 四协议 inbound 握手读无超时,配 policy 也不生效(slowloris 全覆盖) vless server.rs:643 等
+- T2 policy bufferSize 单位错 1024 倍:用户配 512KB 被钳成 512B,吞吐坍缩 register.rs:436-443
+- T3 hysteria 认证后 varint 直接分配→单帧进程 abort(TUIC P0 同族,认证后降 P1) protocol.rs:105-116
+
+**传输层组**:
+- R1 hysteria UDP 中继 Rust↔Go 断裂:Go 日期门触发 quic-go 不发 DATAGRAM TP,send_datagram 全败(quinn 无 AssumePeer);TCP 路径不受影响故 32 节点未暴露 quinn_adapter.rs:193
+- R2 gRPC multiMode 多元素 MultiHunk 帧静默截断→Go→Rust 方向数据丢失 bulk 必现 transport.rs:76-88
+- R3 mKCP 服务端 sessions 表永久泄漏(close 空实现)+同 conv 重连锁死 listener.rs:223-228
+
+**可观测性组**:
+- O1 用户级流量统计/在线 IP 统计生产零接线(消费端就绪计数端缺失,配置静默无效) default.rs:713-734
+- O2 metrics 导出器 StatsCollector 未注入,/metrics 恒空 register.rs:397-410
+- O3 anytls 出站 >255 字节域名 expect panic,远端一条 HTTP CONNECT 稳定复现(全仓 317 处 unwrap 审计后唯一网络可达 panic) anytls socks.rs:56-62
+
+## 亮点确认(干净项)
+
+- KCP 状态机/RTT/序号回绕、gRPC 帧编解码/半关闭、WS 帧桥、quicParams 映射、tuic 池生命周期:字节级对照确认干净
+- 平台五维(dup/epoll-IOCP/信号/路径/setrlimit)核销无缺口;Linux/Windows 双向无 P1 平台缺陷
+- xpadding Huffman 表 19 处错值(P2,脚本对拍 RFC 7541 发现)——tokenish 指纹用户注意
+
+## 修订后修复顺序
+
+1. **P0×3**(不变): SOCKS 认证绕过 / HTTP 握手无界 / TUIC 帧限幅
+2. **新增 P1 插队**: 四协议握手无超时(T1,与 P0 同族 slowloris) / bufferSize 1024 倍(T2,一配就坏) / hysteria varint 炸弹(T3)
+3. **配置失效组 C1-C4**(用户配置静默不生效,信任损害最大面)
+4. **传输层 R1-R3**(hysteria UDP 互通断裂/multiMode 丢数据/mKCP 泄漏)
+5. **可观测性 O1-O3 + 第一轮泄漏/挂死/功能组**
+6. P2/P3 按需
