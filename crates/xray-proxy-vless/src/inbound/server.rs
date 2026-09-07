@@ -318,8 +318,18 @@ where
                 .await;
             }
         };
-        return finish_vless_dispatch(reader, write_half, decoded, handler, options, raw_tcp)
-            .await;
+        // per-user stats 上下文（Go inbound.go Process 认证后 ctx 带 user）：
+        // from=客户端源地址，email/level=认证用户。
+        let access = xray_app_dispatcher::AccessContext {
+            from: peer.to_string(),
+            email: decoded.user.as_ref().map_or(String::new(), |u| u.email.clone()),
+            level: decoded.user.as_ref().map_or(0, |u| u.level),
+            ..Default::default()
+        };
+        return finish_vless_dispatch(
+            reader, write_half, decoded, handler, options, raw_tcp, access,
+        )
+        .await;
     }
 
     // 3. 非 VLESS 流量：直接 fallback
@@ -388,6 +398,7 @@ async fn finish_vless_dispatch<R, W>(
     handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,
     options: Option<VlessInboundOptions>,
     raw_tcp: Option<TcpStream>,
+    access: xray_app_dispatcher::AccessContext,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -403,13 +414,13 @@ where
     // 2. 按 command 分派
     match decoded.command {
         VlessCommand::Tcp => {
-            finish_tcp_dispatch(reader, write_half, &decoded, handler, raw_tcp).await
+            finish_tcp_dispatch(reader, write_half, &decoded, handler, raw_tcp, &access).await
         }
         VlessCommand::Udp => {
             handle_udp_relay(reader, write_half, &decoded, handler).await
         }
         VlessCommand::Mux => {
-            handle_mux_relay(reader, write_half, &decoded, handler, options.as_ref()).await
+            handle_mux_relay(reader, write_half, &decoded, handler, options.as_ref(), &access).await
         }
         VlessCommand::Rvs => {
             handle_reverse_relay(reader, write_half, &decoded, handler, options.as_ref()).await
@@ -424,6 +435,7 @@ async fn finish_tcp_dispatch<R, W>(
     decoded: &crate::encoding::server::DecodedRequest,
     handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,
     raw_tcp: Option<TcpStream>,
+    access: &xray_app_dispatcher::AccessContext,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -454,7 +466,7 @@ where
     };
     let (rh, wh) = tokio::io::split(stream);
     let link = Link::new(new_reader(rh), new_writer(wh));
-    let _ = handler.dispatch(&dest, link).await;
+    let _ = handler.dispatch_with_access(&dest, link, access.clone()).await;
     Ok(())
 }
 
@@ -531,6 +543,7 @@ async fn handle_mux_relay<R, W>(
     decoded: &crate::encoding::server::DecodedRequest,
     handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,
     options: Option<&VlessInboundOptions>,
+    access: &xray_app_dispatcher::AccessContext,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -573,7 +586,7 @@ where
         Network::TCP,
     );
     let link = Link::new(new_reader(rh), new_writer(wh));
-    let _ = handler.dispatch(&dest, link).await;
+    let _ = handler.dispatch_with_access(&dest, link, access.clone()).await;
     Ok(())
 }
 
@@ -694,8 +707,25 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
     .map_err(|e| std::io::Error::other(format!("vless decode: {e}")))?;
 
     // 2. 按 command 分派：拆 reader/writer 后交 finish_vless_dispatch。
+    // REALITY 直连路径（handle_connection 签名未携带 peer，生产调用点
+    // inbound.rs:1841 不可改）：from 留空 → per-user counter 正常挂接，
+    // online IP 不记（Go ctx 有 Source，Rust 此路径无源地址可用）。
+    let access = xray_app_dispatcher::AccessContext {
+        email: decoded.user.as_ref().map_or(String::new(), |u| u.email.clone()),
+        level: decoded.user.as_ref().map_or(0, |u| u.level),
+        ..Default::default()
+    };
     let (read_half, write_half) = tokio::io::split(stream);
-    finish_vless_dispatch(read_half, write_half, decoded, handler, options, raw_tcp).await
+    finish_vless_dispatch(
+        read_half,
+        write_half,
+        decoded,
+        handler,
+        options,
+        raw_tcp,
+        access,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

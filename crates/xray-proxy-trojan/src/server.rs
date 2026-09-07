@@ -488,7 +488,15 @@ async fn handle_trojan_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
             let (read_half, write_half) = tokio::io::split(recorder.inner);
             let link = Link::new(new_reader(read_half), new_writer(write_half));
             info!(peer = %peer, user = %user.email, dest = %dest, "trojan dispatching");
-            let _ = handler.dispatch(&dest, link).await;
+            // per-user stats（Go trojan/inbound 认证后 ctx 带 user 语义）：
+            // from=客户端源地址，email/level=认证用户。
+            let access = xray_app_dispatcher::AccessContext {
+                from: peer.to_string(),
+                email: user.email.clone(),
+                level: user.level,
+                ..Default::default()
+            };
+            let _ = handler.dispatch_with_access(&dest, link, access).await;
         }
         Err(e) => {
             warn!(peer = %peer, error = %e, "trojan handshake failed");

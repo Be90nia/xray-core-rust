@@ -19,6 +19,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 pub mod custom;
@@ -387,12 +388,17 @@ struct PacketIoConn {
     inner: Arc<dyn UdpIo>,
     /// write 目标地址。
     remote_addr: SocketAddr,
-    /// recv 缓冲：driver 拉到后放入，poll_read 取出。
-    rx: Arc<parking_lot::Mutex<std::collections::VecDeque<Vec<u8>>>>,
-    /// recv 唤醒：driver 通知新包；poll_read 用它注册 waker。
-    notify: Arc<tokio::sync::Notify>,
+    /// 读队列：driver 收包推入；`poll_recv` 在 `Pending` 时注册 waker——
+    /// 语义与 `Notify` + 每次 spawn 唤醒等价，但零辅助任务。
+    rx: Mutex<Option<mpsc::UnboundedReceiver<Vec<u8>>>>,
+    /// 写队列：`poll_write` 推入后单个 send worker 顺序 `send_to`——
+    /// 复用 worker 而非每包 spawn（每包 spawn 在高 PPS 下堆积一次性任务）。
+    /// FIFO 顺序也严格于原并发 spawn。
+    tx: mpsc::UnboundedSender<Vec<u8>>,
     /// recv loop handler；Drop 时 abort 取消。
     driver: Mutex<Option<JoinHandle<()>>>,
+    /// send worker handler；Drop 时 abort 取消。
+    worker: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl PacketIoConn {
@@ -401,31 +407,39 @@ impl PacketIoConn {
         // 此前 Box::into_raw + Arc::from_raw 是 UB：Box 分配没有计数头，Arc::clone 在分配外
         // fetch_add、drop 按错误 layout dealloc → STATUS_HEAP_CORRUPTION(0xc0000374)。
         let inner: Arc<dyn UdpIo> = inner.into();
-        let rx: Arc<parking_lot::Mutex<std::collections::VecDeque<Vec<u8>>>> =
-            Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new()));
-        let notify = Arc::new(tokio::sync::Notify::new());
+        let (pkt_tx, pkt_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (snd_tx, mut snd_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let driver_inner = Arc::clone(&inner);
-        let driver_rx = Arc::clone(&rx);
-        let driver_notify = Arc::clone(&notify);
         let driver = tokio::spawn(async move {
             let mut buf = vec![0u8; UDP_SIZE];
             loop {
                 match driver_inner.recv_from(&mut buf).await {
                     Ok((n, _src)) => {
-                        let payload = buf[..n].to_vec();
-                        driver_rx.lock().push_back(payload);
-                        driver_notify.notify_one();
+                        if pkt_tx.send(buf[..n].to_vec()).is_err() {
+                            break; // 读端已 drop
+                        }
                     }
                     Err(_) => break,
+                }
+            }
+        });
+        let worker_inner = Arc::clone(&inner);
+        let worker = tokio::spawn(async move {
+            while let Some(data) = snd_rx.recv().await {
+                // ponytail: send 失败仅记日志——Connection 写入 UDP 失败无 caller 同步点，
+                // UDP 写错误由 socket 层 NAT/ICMP 反馈呈现（Go PacketConn.WriteTo 同）。
+                if let Err(e) = worker_inner.send_to(&data, remote_addr).await {
+                    tracing::debug!(error = %e, "PacketIoConn send_to failed");
                 }
             }
         });
         Self {
             inner,
             remote_addr,
-            rx,
-            notify,
+            rx: Mutex::new(Some(pkt_rx)),
+            tx: snd_tx,
             driver: Mutex::new(Some(driver)),
+            worker: Mutex::new(Some(worker)),
         }
     }
 }
@@ -433,6 +447,9 @@ impl PacketIoConn {
 impl Drop for PacketIoConn {
     fn drop(&mut self) {
         if let Some(handle) = self.driver.lock().take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.worker.lock().take() {
             handle.abort();
         }
     }
@@ -445,44 +462,38 @@ impl AsyncRead for PacketIoConn {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
         let mut rx = self.rx.lock();
-        if let Some(pkt) = rx.pop_front() {
-            let n = pkt.len().min(buf.remaining());
-            buf.put_slice(&pkt[..n]);
-            // ponytail: 超长包丢弃剩余字节——简化不缓存；KCP 段长恒 < 1500 包足够。
-            drop(rx);
+        let Some(recv) = rx.as_mut() else {
+            // driver 已退出且队列排空：EOF（0 字节 Ready 读），上层据此断链而非挂死。
             return std::task::Poll::Ready(Ok(()));
+        };
+        match recv.poll_recv(cx) {
+            std::task::Poll::Ready(Some(pkt)) => {
+                let n = pkt.len().min(buf.remaining());
+                buf.put_slice(&pkt[..n]);
+                // ponytail: 超长包丢弃剩余字节——简化不缓存；KCP 段长恒 < 1500 包足够。
+                std::task::Poll::Ready(Ok(()))
+            }
+            std::task::Poll::Ready(None) => {
+                *rx = None;
+                std::task::Poll::Ready(Ok(()))
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
         }
-        drop(rx);
-        // ponytail: 每次 Pending 都 spawn 唤醒——频繁唤醒浪费，但简化为可运行。
-        let notify = Arc::clone(&self.notify);
-        let waker = cx.waker().clone();
-        tokio::spawn(async move {
-            notify.notified().await;
-            waker.wake();
-        });
-        std::task::Poll::Pending
     }
 }
 
 impl AsyncWrite for PacketIoConn {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        _cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
-        let inner = Arc::clone(&self.inner);
-        let remote = self.remote_addr;
-        let data = buf.to_vec();
         let n = buf.len();
-        let waker = cx.waker().clone();
-        tokio::spawn(async move {
-            // ponytail: send 失败被 drop——Connection 写入 UDP 失败无 caller 同步点；
-            // 通过 waker.wake() 让 caller 重新调度（实际 caller 已 Ready 不会重新调）。
-            if let Err(e) = inner.send_to(&data, remote).await {
-                tracing::debug!(error = %e, "PacketIoConn send_to failed");
-            }
-            waker.wake();
-        });
+        // fire-and-forget：入队即 Ready；worker 异步发送。队列关闭仅在 conn 已
+        // 半亡（worker 被 abort）时发生，包静默丢弃与原 spawn-丢包语义一致。
+        if self.tx.send(buf.to_vec()).is_err() {
+            tracing::debug!("PacketIoConn send queue closed, packet dropped");
+        }
         std::task::Poll::Ready(Ok(n))
     }
 

@@ -2934,19 +2934,150 @@ mod tests {
         echo_task.abort();
     }
 
-    /// SS inbound UDP relay + Mux outbound 端到端。
+    /// 出站级 mux（settings.mux.enabled）TCP 多连接复用端到端。
     ///
-    /// 对应 Go `TestShadowsocksAES128GCMUDPMux`
-    /// （`testing/scenarios/shadowsocks_test.go:294`）：客户端 socks UDP 通过
-    /// SS outbound（启用 mux）→ SS server UDP relay → freedom → UDP echo。
-    /// mux 路径：SS outbound 在 mux client 上开 XUDP session（network=UDP），
-    /// SS inbound 收到 `v1.mux.cool:9527` TCP 连接时由 mux ServerWorker 解帧
-    /// （参见 `xray-core/src/inbound.rs:166-201` is_mux_destination +
-    /// handle_mux_inbound_link），每个 mux session 按目标网络派发 UDP 帧。
+    /// 对齐 Go `app/proxyman/outbound/handler.go:123-145`：出站带
+    /// `"mux":{"enabled":true,"concurrency":8}` 时拨号链包 MuxBridge，
+    /// N 个客户端连接复用同一条 carrier（v1.mux.cool:9527 信令连接）。
+    /// 拓扑：client [socks-in → socks-out(mux)] → 计数 forwarder →
+    /// server [socks-in（is_mux_destination 终止 mux）→ freedom] → TCP echo。
     #[tokio::test]
-    async fn integration_ss_udp_through_mux() {
-        use std::net::Ipv4Addr;
+    async fn integration_outbound_mux_tcp_reuses_single_carrier() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
+        // 1. TCP echo server
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = echo_listener.accept().await else { break };
+                let (mut r, mut w) = sock.into_split();
+                tokio::spawn(async move {
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+
+        // 2. carrier 计数 forwarder：client mux worker → server socks 的每条
+        //    TCP 连接在此过路计数（复用断言的观测点）
+        let fwd_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fwd_port = fwd_listener.local_addr().unwrap().port();
+        let carrier_count = Arc::new(AtomicUsize::new(0));
+        let server_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_port = server_probe.local_addr().unwrap().port();
+        drop(server_probe);
+        let count = Arc::clone(&carrier_count);
+        let fwd_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut down, _)) = fwd_listener.accept().await else { break };
+                count.fetch_add(1, Ordering::SeqCst);
+                let Ok(mut up) = TcpStream::connect(("127.0.0.1", server_port)).await else { break };
+                let _ = tokio::io::copy_bidirectional(&mut down, &mut up).await;
+            }
+        });
+
+        // 3. 服务端：socks inbound（mux.cool dest 转 mux ServerWorker）+ freedom
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry { kind: "socks".into(), data: br#"{"auth":"noauth"}"#.to_vec() },
+            tag: "socks-in".into(),
+            port: Some(server_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        server_cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
+            tag: "direct".into(),
+            send_through: None, stream_settings_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
+        });
+        let (_si, _so, sh) = start_full(&server_cfg).await.expect("socks server");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 4. 客户端：socks inbound + socks outbound（出站级 mux.enabled，concurrency 8）
+        let client_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_port = client_probe.local_addr().unwrap().port();
+        drop(client_probe);
+        let mut client_cfg = BuiltConfig::default();
+        client_cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry { kind: "socks".into(), data: br#"{"auth":"noauth"}"#.to_vec() },
+            tag: "socks-in".into(),
+            port: Some(client_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        client_cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry {
+                kind: "socks".into(),
+                data: format!(r#"{{"servers":[{{"address":"127.0.0.1","port":{fwd_port}}}]}}"#)
+                    .into_bytes(),
+            },
+            tag: "proxy".into(),
+            send_through: None, stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: Some(serde_json::json!({"enabled": true, "concurrency": 8})),
+            target_strategy: None,
+        });
+        let (_ci, _co, ch) = start_full(&client_cfg).await.expect("socks+mux client");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 5. 3 个并发客户端连接 → mux 出站（首个 dispatch bootstrap worker，
+        //    pick_internal 持锁跨 create，后续全部复用同一 worker/carrier）
+        let echo_ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
+        let mut handles = Vec::new();
+        for i in 0..3 {
+            let payload = format!("mux-tcp-echo-{i}");
+            handles.push(tokio::spawn(async move {
+                let mut c = TcpStream::connect(("127.0.0.1", client_port))
+                    .await
+                    .expect("connect client socks");
+                c.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+                let mut m = [0u8; 2];
+                c.read_exact(&mut m).await.unwrap();
+                assert_eq!(m, [0x05, 0x00], "NoAuth method selected");
+                let mut req = vec![0x05, 0x01, 0x00, 0x01];
+                req.extend_from_slice(&echo_ip);
+                req.extend_from_slice(&echo_addr.port().to_be_bytes());
+                c.write_all(&req).await.unwrap();
+                let mut rep = [0u8; 10];
+                c.read_exact(&mut rep).await.unwrap();
+                assert_eq!(rep[1], 0x00, "socks connect via mux carrier success");
+                c.write_all(payload.as_bytes()).await.unwrap();
+                let mut buf = vec![0u8; payload.len()];
+                c.read_exact(&mut buf).await.unwrap();
+                assert_eq!(buf, payload.as_bytes(), "echo roundtrip via mux carrier");
+            }));
+        }
+        for h in handles {
+            h.await.expect("client task join");
+        }
+
+        // 6. 复用断言：3 个会话只建立 1 条 carrier TCP 连接
+        assert_eq!(
+            carrier_count.load(Ordering::SeqCst),
+            1,
+            "3 mux sessions must reuse a single carrier connection"
+        );
+
+        for h in sh.iter().chain(ch.iter()) {
+            h.abort();
+        }
+        fwd_task.abort();
+        echo_task.abort();
+    }
+
+    /// 出站级 mux UDP 数据报端到端（XUDP GlobalID 路径）。
+    ///
+    /// socks UDP relay → dispatcher UDP relay（dispatch_with_access）→
+    /// [`MuxBridge::dispatch_with_access`]（XUDP GlobalID New 帧）→ carrier →
+    /// server socks inbound mux 终止 → freedom UDP → UDP echo 回程。
+    #[tokio::test]
+    async fn integration_udp_relay_through_outbound_mux() {
         // 1. UDP echo server
         let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let echo_addr = echo.local_addr().unwrap();
@@ -2960,23 +3091,20 @@ mod tests {
             }
         });
 
-        // 2. 空闲端口：SS inbound TCP/UDP 同端口 + 客户端 socks inbound
-        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let ss_port = probe.local_addr().unwrap().port();
-        drop(probe);
-        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let socks_port = probe.local_addr().unwrap().port();
-        drop(probe);
+        // 2. 空闲端口
+        let server_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_port = server_probe.local_addr().unwrap().port();
+        drop(server_probe);
+        let client_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_port = client_probe.local_addr().unwrap().port();
+        drop(client_probe);
 
-        // 3. SS server（legacy AEAD）+ freedom outbound
+        // 3. 服务端：socks inbound（UDP relay + mux 终止）+ freedom
         let mut server_cfg = BuiltConfig::default();
         server_cfg.inbounds.push(BuiltInbound {
-            entry: BuiltEntry {
-                kind: "shadowsocks".into(),
-                data: br#"{"clients":[{"password":"test-pass","method":"aes-256-gcm"}]}"#.to_vec(),
-            },
-            tag: "ss-in".into(),
-            port: Some(ss_port),
+            entry: BuiltEntry { kind: "socks".into(), data: br#"{"auth":"noauth"}"#.to_vec() },
+            tag: "socks-in".into(),
+            port: Some(server_port),
             listen: Some("127.0.0.1".into()),
             stream_settings_json: None,
             sniffing_json: None,
@@ -2987,26 +3115,25 @@ mod tests {
             send_through: None, stream_settings_json: None,
             proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
-        let (_si, _so, sh) = start_full(&server_cfg).await.expect("ss server");
+        let (_si, _so, sh) = start_full(&server_cfg).await.expect("socks server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        // 4. 客户端：socks inbound (UDP enabled) + SS outbound（启用 mux）
+        // 4. 客户端：socks inbound（udp:true）+ socks outbound（出站级 mux.enabled）
         let mut client_cfg = BuiltConfig::default();
         client_cfg.inbounds.push(BuiltInbound {
-            entry: BuiltEntry {
-                kind: "socks".into(),
-                data: br#"{"auth":"noauth","udp":true}"#.to_vec(),
-            },
+            entry: BuiltEntry { kind: "socks".into(), data: br#"{"auth":"noauth","udp":true}"#.to_vec() },
             tag: "socks-in".into(),
-            port: Some(socks_port),
+            port: Some(client_port),
             listen: Some("127.0.0.1".into()),
             stream_settings_json: None,
             sniffing_json: None,
         });
         client_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry {
-                kind: "shadowsocks".into(),
-                data: format!(r#"{{"servers":[{{"address":"127.0.0.1","port":{ss_port},"password":"test-pass","method":"aes-256-gcm"}}]}}"#).into_bytes(),
+                kind: "socks".into(),
+                data: format!(
+                    r#"{{"servers":[{{"address":"127.0.0.1","port":{server_port}}}]}}"#
+                ).into_bytes(),
             },
             tag: "proxy".into(),
             send_through: None, stream_settings_json: None,
@@ -3014,67 +3141,56 @@ mod tests {
             mux_json: Some(serde_json::json!({"enabled": true, "concurrency": 8})),
             target_strategy: None,
         });
-        let (_ci, _co, ch) = start_full(&client_cfg).await.expect("socks+ss+mux client");
+        let (_ci, _co, ch) = start_full(&client_cfg).await.expect("socks+mux client");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // 5. socks5 TCP control → NoAuth → UDP ASSOCIATE
-        let mut tcp = TcpStream::connect(format!("127.0.0.1:{socks_port}"))
+        let mut tcp = TcpStream::connect(("127.0.0.1", client_port))
             .await
             .expect("connect socks control");
         tcp.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-        let mut method_resp = [0u8; 2];
-        tcp.read_exact(&mut method_resp).await.unwrap();
-        assert_eq!(method_resp, [0x05, 0x00], "NoAuth method selected");
+        let mut m = [0u8; 2];
+        tcp.read_exact(&mut m).await.unwrap();
+        assert_eq!(m, [0x05, 0x00], "NoAuth method selected");
         tcp.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.unwrap();
-        let mut assoc_reply = [0u8; 10];
-        tcp.read_exact(&mut assoc_reply).await.unwrap();
-        assert_eq!(assoc_reply[0], 0x05, "UDP ASSOC reply VER");
-        assert_eq!(assoc_reply[1], 0x00, "UDP ASSOC reply REP=success");
-        assert_eq!(assoc_reply[3], 0x01, "ATYP=IPv4");
-        let relay_port = u16::from_be_bytes([assoc_reply[8], assoc_reply[9]]);
-        assert!(relay_port > 0, "relay port should be assigned, got {relay_port}");
+        let mut assoc = [0u8; 10];
+        tcp.read_exact(&mut assoc).await.unwrap();
+        assert_eq!(assoc[1], 0x00, "UDP ASSOC success");
+        let relay_port = u16::from_be_bytes([assoc[8], assoc[9]]);
+        assert!(relay_port > 0, "relay port assigned");
 
-        // 6. 客户端 UDP socket → socks5 UDP 包 → socks inbound relay → dispatcher →
-        //    mux SS outbound（carrier TCP 连 SS 服务器 TCP 端口，开 XUDP session
-        //    装 UDP 帧）→ SS server UDP relay 解码 → mux ServerWorker 解帧派发 →
-        //    freedom UDP → echo
+        // 6. UDP 数据报 → mux XUDP session → freedom UDP → echo
         let client_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let payload = b"ss-udp-mux-echo-2k8w";
+        let payload = b"udp-via-outbound-mux";
         let ip = match echo_addr.ip() {
             std::net::IpAddr::V4(v) => v.octets(),
             _ => unreachable!(),
         };
-        // socks5 UDP: [RSV=0,0][FRAG=0][ATYP=0x01][IPv4][port BE][payload]
         let mut pkt = vec![0x00, 0x00, 0x00, 0x01];
         pkt.extend_from_slice(&ip);
         pkt.extend_from_slice(&echo_addr.port().to_be_bytes());
         pkt.extend_from_slice(payload);
-        let relay = std::net::SocketAddr::new(
-            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
-            relay_port,
-        );
-        client_udp.send_to(&pkt, relay).await.expect("send udp via socks");
+        client_udp
+            .send_to(&pkt, ("127.0.0.1", relay_port))
+            .await
+            .expect("send udp via socks");
 
-        // 7. 等回包（UDP echo 经 SS+mux+freedom 来回往返）
-        let mut resp_buf = vec![0u8; 65535];
-        let (n, _peer) = tokio::time::timeout(
+        let mut resp = vec![0u8; 65535];
+        let (n, _) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            client_udp.recv_from(&mut resp_buf),
+            client_udp.recv_from(&mut resp),
         )
         .await
-        .expect("timeout waiting for ss+udp+mux echo")
-        .expect("recv ss+udp+mux echo");
-        // socks5 UDP header 至少 10 字节
+        .expect("timeout waiting for udp via outbound mux echo")
+        .expect("recv udp echo");
         assert!(n >= 10, "socks5 udp header at least 10 bytes, got {n}");
-        assert_eq!(resp_buf[0..2], [0x00, 0x00], "RSV");
-        assert_eq!(resp_buf[2], 0x00, "FRAG=0");
-        assert_eq!(resp_buf[3], 0x01, "ATYP=IPv4");
-        let body = &resp_buf[10..n];
-        assert_eq!(body, payload, "echo payload through ss+udp+mux roundtrip");
+        assert_eq!(&resp[10..n], &payload[..], "datagram roundtrip via outbound mux");
 
         drop(client_udp);
         drop(tcp);
-        for h in sh.iter().chain(ch.iter()) { h.abort(); }
+        for h in sh.iter().chain(ch.iter()) {
+            h.abort();
+        }
         echo_task.abort();
     }
 }

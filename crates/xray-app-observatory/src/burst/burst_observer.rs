@@ -98,20 +98,26 @@ impl BurstObserver {
     /// - tags 为空 → no-op；
     /// - 否则 `doCheck(ctx, tags, 0, 1)`——每个 tag 探测一轮，RTT 记入样本表。
     pub fn check(&self, tags: &[String], executor: &dyn ProbeExecutor) -> HashMap<String, i64> {
-        let mut out = HashMap::new();
         if tags.is_empty() {
-            return out; // Go healthping.go:149-151：空 tags no-op
+            return HashMap::new(); // Go healthping.go:149-151：空 tags no-op
         }
         let now = now_unix_nanos();
-        let mut g = self.rtts.lock();
+        // 锁外探测（对齐 Go doCheck：MeasureDelay 不持 access 锁）。
+        let mut results = Vec::with_capacity(tags.len());
         for tag in tags {
             let result = executor.probe(tag);
             let rtt = if result.alive { result.delay } else { RTT_FAILED };
+            results.push((tag.clone(), rtt));
+        }
+        // 短临界区：仅结果写回（对齐 Go PutResult）。
+        let mut g = self.rtts.lock();
+        let mut out = HashMap::with_capacity(results.len());
+        for (tag, rtt) in results {
             let entry = g
                 .entry(tag.clone())
                 .or_insert_with(|| HealthPingRtts::new(self.capacity, self.validity_nanos));
             entry.put(rtt, now);
-            out.insert(tag.clone(), rtt);
+            out.insert(tag, rtt);
         }
         out
     }
@@ -214,30 +220,51 @@ impl BurstObserver {
     /// 每个 tag × rounds 个 ping，结果写入 Results 表。
     /// rounds = sampling_count（由 settings 提供）。
     ///
-    /// 取消语义：`cancel_pending` 标记新一轮已覆盖——do_check 入口检查
-    /// 自身是否已被覆盖，若是则提前退出。生产路径下 ProbeExecutor.probe 是
-    /// 同步阻塞调用，本实装直接顺序执行；占位 cancel 检查保留扩展点。
+    /// 锁形态对齐 Go `doCheck`/`PutResult`：探测（`executor.probe`，同步阻塞
+    /// 最坏 connect-timeout 5s/次）在 `rtts` 锁外执行，临界区仅覆盖结果写回——
+    /// 否则 `create_result` 等读者会被 `tags × rounds × 5s` 量级的探测整段堵死。
+    ///
+    /// 取消语义：`cancel_pending` 标记新一轮已覆盖——每轮探测前检查自身是否
+    /// 已被覆盖，若是则提前退出；已探测完成的样本仍写回（对齐 Go 每轮
+    /// `PutResult` 即时落表的语义）。
     pub fn do_check(&self, tags: &[String], executor: &dyn ProbeExecutor) {
         if tags.is_empty() {
             return; // Go healthping.go:167-169：count==0 早退
         }
         let rounds = self.settings.sampling_count.max(1) as usize;
-        // 记录入口时的 cancel-pending 标记，do_check 末尾比对：
+        // 记录入口时的 cancel-pending 标记，逐轮比对：
         // 若被覆盖则提前退出（对应 Go healthping.go:217-229）。
         let entry_cancel = self.cancel_pending.load(Ordering::Acquire);
         let now = now_unix_nanos();
-        let mut g = self.rtts.lock();
+        // 锁外探测：收集 (tag, samples)，probe 不持 rtts 锁。
+        let mut collected: Vec<(String, Vec<i64>)> = Vec::with_capacity(tags.len());
+        let mut cancelled = false;
         for tag in tags {
-            let entry = g
-                .entry(tag.clone())
-                .or_insert_with(|| HealthPingRtts::new(self.capacity, self.validity_nanos));
+            let mut samples = Vec::with_capacity(rounds);
             for _ in 0..rounds {
                 if self.cancel_pending.load(Ordering::Acquire) != entry_cancel {
-                    return; // 上轮已被新轮覆盖，提前退出（Go healthping.go:224-228）
+                    // 上轮已被新轮覆盖，提前退出；已完成轮次的样本保留
+                    // （Go 每轮探测完立即 PutResult，已完成样本已入表）。
+                    cancelled = true;
+                    break;
                 }
                 // 真实探测：probe → rtt = alive ? delay : RTT_FAILED
                 let result = executor.probe(tag);
                 let rtt = if result.alive { result.delay } else { RTT_FAILED };
+                samples.push(rtt);
+            }
+            collected.push((tag.clone(), samples));
+            if cancelled {
+                break; // Go healthping.go:224-228
+            }
+        }
+        // 短临界区：仅结果写回（对齐 Go PutResult 的 access 锁范围）。
+        let mut g = self.rtts.lock();
+        for (tag, samples) in collected {
+            let entry = g
+                .entry(tag)
+                .or_insert_with(|| HealthPingRtts::new(self.capacity, self.validity_nanos));
+            for rtt in samples {
                 entry.put(rtt, now);
             }
         }
@@ -554,5 +581,85 @@ mod tests {
         obs.check(&["a".into()], &executor);
         obs.cleanup(&[]);
         assert!(obs.latest_rtt("a").is_none());
+    }
+
+    // ===========================================================================
+    // 锁形态测试：probe 必须在 rtts 锁外执行（对齐 Go doCheck/PutResult）
+    // ===========================================================================
+
+    /// probe 内断言 rtts 锁此刻空闲——若 do_check/check 在临界区内调用 probe，
+    /// parking_lot Mutex 不可重入，try_lock 必返回 None 使断言失败。
+    struct LockAssertingExecutor {
+        observer: Arc<BurstObserver>,
+        context: &'static str,
+    }
+
+    impl ProbeExecutor for LockAssertingExecutor {
+        fn probe(&self, _tag: &str) -> ProbeResult {
+            assert!(
+                self.observer.rtts.try_lock().is_some(),
+                "probe must run outside the rtts lock ({})",
+                self.context
+            );
+            alive(1)
+        }
+    }
+
+    #[test]
+    fn do_check_probe_runs_outside_rtts_lock() {
+        let obs = observer_with_interval(2, 60_000_000_000);
+        let executor = LockAssertingExecutor {
+            observer: obs.clone(),
+            context: "do_check",
+        };
+        obs.do_check(&["a".to_string(), "b".to_string()], &executor);
+    }
+
+    #[test]
+    fn check_probe_runs_outside_rtts_lock() {
+        let obs = observer_with_interval(2, 60_000_000_000);
+        let executor = LockAssertingExecutor {
+            observer: obs.clone(),
+            context: "check",
+        };
+        obs.check(&["a".to_string()], &executor);
+    }
+
+    #[test]
+    fn do_check_cancel_keeps_collected_samples_and_stops() {
+        // 取消后：已完成轮次的样本写回、未完成轮次不再探测（对齐 Go 每轮
+        // PutResult 即时落表 + cancelPending 提前退出）。
+        struct CancelAfterSecondProbe {
+            observer: Arc<BurstObserver>,
+            probes: std::sync::atomic::AtomicUsize,
+        }
+        impl ProbeExecutor for CancelAfterSecondProbe {
+            fn probe(&self, _tag: &str) -> ProbeResult {
+                if self.probes.fetch_add(1, Ordering::SeqCst) == 1 {
+                    // 第二轮完成后覆盖 cancel-pending，模拟新一轮到来
+                    let new_cancel = Box::into_raw(Box::new(()));
+                    let _ = self.observer.cancel_pending.swap(new_cancel, Ordering::AcqRel);
+                }
+                alive(7)
+            }
+        }
+        let obs = observer_with_interval(3, 60_000_000_000);
+        let executor = CancelAfterSecondProbe {
+            observer: obs.clone(),
+            probes: std::sync::atomic::AtomicUsize::new(0),
+        };
+        obs.do_check(&["a".to_string()], &executor);
+        assert_eq!(
+            executor.probes.load(Ordering::SeqCst),
+            2,
+            "取消后不再继续探测第 3 轮"
+        );
+        let stats = obs
+            .rtts
+            .lock()
+            .get("a")
+            .expect("已完成轮次的样本应写回")
+            .statistics(now_unix_nanos());
+        assert_eq!(stats.all, 2, "已完成轮次的 2 条样本保留");
     }
 }

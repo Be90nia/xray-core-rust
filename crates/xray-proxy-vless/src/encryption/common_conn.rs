@@ -8,9 +8,9 @@
 //! 0-RTT：上行 AEAD 构造时给定（context=加密后 ticket）；下行 AEAD 延迟到首次
 //! 读，用 server 首发的 16B 随机数建立（[`CommonConn::new_zero_rtt`]）。
 
-use crate::encryption::aead::{Aead, MAX_NONCE, NONCE_LEN};
+use crate::encryption::aead::{Aead, MAX_NONCE, NONCE_LEN, TAG_LEN};
 use crate::encryption::common::{
-    decode_tls_record_header, write_tls_record_header, TLS_PAYLOAD_MIN, TLS_RECORD_HEADER_LEN,
+    decode_tls_record_header, write_tls_record_header, TLS_PAYLOAD_MAX, TLS_RECORD_HEADER_LEN,
 };
 use crate::error::{Result, VlessError};
 use std::io;
@@ -21,8 +21,6 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// 单段明文上限（对齐 Go `CommonConn` 的 8192）。
 const MAX_SEGMENT: usize = 8192;
 
-/// GCM/Poly1305 认证标签长度。
-const TAG_LEN: usize = 16;
 
 /// 加密连接：包装底层 `C`，实现 [`EncryptionConn`]。
 ///
@@ -36,14 +34,19 @@ pub struct CommonConn<C> {
     /// 重建 AEAD 所需：UnitedKey + use_aes（对齐 Go 轮换语义）。
     united_key: Vec<u8>,
     use_aes: bool,
-    /// 从底层读到但尚未切分成 record 的原始字节。
+    /// 从底层读到但尚未切分成 record 的原始字节；`raw_pos` 为已消费游标。
+    /// 游标追平长度即整体清空——整 record 消费路径零 memmove（替代 drain 搬移）。
     raw_buf: Vec<u8>,
-    /// 已解密待读的明文。
+    raw_pos: usize,
+    /// 已解密待读的明文（复用缓冲，原地解密，Go 池化等价物）。
     decrypted: Vec<u8>,
     /// 已解密待读的明文偏移。
     decrypted_pos: usize,
-    /// 待发送的密文 + 已发送偏移 + 对应明文长度。
-    write_pending: Option<(Vec<u8>, usize, usize)>,
+    /// 常驻写缓冲（Go 池化等价物）：[pre_write] || header || ciphertext || tag。
+    /// pending 发送期间保持不动，发送完毕后下一段复用——写路径零堆分配。
+    write_buf: Vec<u8>,
+    /// 待发送：(write_buf 已发送偏移, 对应明文长度)。
+    write_pending: Option<(usize, usize)>,
     /// 0-RTT 缓存 handle（仅 0-RTT 构造注入）：票据失效时清空三缓存。
     cache: Option<std::sync::Arc<super::ZeroRttCache>>,
     /// 首写前缀（Go `CommonConn.PreWrite`）：server 0-RTT 握手后的首个下行
@@ -78,9 +81,11 @@ where
             united_key,
             cache: None,
             pre_write: None,
-            raw_buf: Vec::new(),
-            decrypted: Vec::new(),
+            raw_buf: Vec::with_capacity(16_384),
+            raw_pos: 0,
+            decrypted: Vec::with_capacity(TLS_PAYLOAD_MAX as usize),
             decrypted_pos: 0,
+            write_buf: Vec::with_capacity(16 + TLS_RECORD_HEADER_LEN + MAX_SEGMENT + TAG_LEN),
             write_pending: None,
             closed: false,
         }
@@ -103,9 +108,11 @@ where
             united_key,
             cache,
             pre_write: None,
-            raw_buf: Vec::new(),
-            decrypted: Vec::new(),
+            raw_buf: Vec::with_capacity(16_384),
+            raw_pos: 0,
+            decrypted: Vec::with_capacity(TLS_PAYLOAD_MAX as usize),
             decrypted_pos: 0,
+            write_buf: Vec::with_capacity(16 + TLS_RECORD_HEADER_LEN + MAX_SEGMENT + TAG_LEN),
             write_pending: None,
             closed: false,
         }
@@ -130,9 +137,11 @@ where
             united_key,
             cache: None,
             pre_write: Some(pre_write),
-            raw_buf: Vec::new(),
-            decrypted: Vec::new(),
+            raw_buf: Vec::with_capacity(16_384),
+            raw_pos: 0,
+            decrypted: Vec::with_capacity(TLS_PAYLOAD_MAX as usize),
             decrypted_pos: 0,
+            write_buf: Vec::with_capacity(16 + TLS_RECORD_HEADER_LEN + MAX_SEGMENT + TAG_LEN),
             write_pending: None,
             closed: false,
         }
@@ -153,7 +162,7 @@ where
             // 0-RTT（Go common.go:84-93）：下行 AEAD 未建立时先读 server 首发的
             // 16B 随机数，以其为 context 建立（恰好 16B，不属于任何 record）。
             if this.peer_aead.is_none() {
-                while this.raw_buf.len() < 16 {
+                while this.raw_buf.len() - this.raw_pos < 16 {
                     let mut tmp = [0u8; 4096];
                     let mut rb = ReadBuf::new(&mut tmp);
                     match Pin::new(&mut this.conn).poll_read(cx, &mut rb) {
@@ -171,11 +180,17 @@ where
                         Poll::Pending => return Poll::Pending,
                     }
                 }
-                let server_random: [u8; 16] =
-                    this.raw_buf[..16].try_into().expect("16B server random");
+                let server_random: [u8; 16] = this.raw_buf
+                    [this.raw_pos..this.raw_pos + 16]
+                    .try_into()
+                    .expect("16B server random");
                 this.peer_aead =
                     Some(Aead::new(&server_random, &this.united_key, this.use_aes));
-                this.raw_buf.drain(..16);
+                this.raw_pos += 16;
+                if this.raw_pos == this.raw_buf.len() {
+                    this.raw_buf.clear();
+                    this.raw_pos = 0;
+                }
             }
             // 1. 已解密明文优先返回
             if this.decrypted_pos < this.decrypted.len() {
@@ -190,10 +205,14 @@ where
                 return Poll::Ready(Ok(()));
             }
 
-            // 2. 尝试从 raw_buf 提取完整 record
-            if this.raw_buf.len() >= TLS_RECORD_HEADER_LEN {
-                let header: [u8; TLS_RECORD_HEADER_LEN] =
-                    this.raw_buf[..TLS_RECORD_HEADER_LEN].try_into().unwrap();
+            // 2. 尝试从 raw_buf 窗口提取完整 record
+            let avail = this.raw_buf.len() - this.raw_pos;
+            if avail >= TLS_RECORD_HEADER_LEN {
+                let base = this.raw_pos;
+                let header: [u8; TLS_RECORD_HEADER_LEN] = this.raw_buf
+                    [base..base + TLS_RECORD_HEADER_LEN]
+                    .try_into()
+                    .expect("header slice len");
                 let len = match decode_tls_record_header(&header) {
                     Ok(l) => l,
                     Err(e) => {
@@ -219,22 +238,27 @@ where
                     }
                 };
                 let total = TLS_RECORD_HEADER_LEN + len as usize;
-                if this.raw_buf.len() >= total {
-                    // 完整 record：解密
-                    let data: Vec<u8> = this.raw_buf[TLS_RECORD_HEADER_LEN..total].to_vec();
-                    let mut plaintext = Vec::with_capacity(data.len().saturating_sub(TAG_LEN));
+                if avail >= total {
+                    // 完整 record：密文||tag 拷入复用的 decrypted 原地解密（零分配），
+                    // 消费游标推进替代 drain memmove。
+                    this.decrypted.clear();
+                    this.decrypted
+                        .extend_from_slice(&this.raw_buf[base + TLS_RECORD_HEADER_LEN..base + total]);
                     let peer_aead = this
                         .peer_aead
                         .as_mut()
                         .expect("peer_aead established at loop top");
-                    if let Err(e) = peer_aead.open(&mut plaintext, None, &data, &header) {
+                    if let Err(e) = peer_aead.open_in_place(None, &mut this.decrypted, &header) {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             e.to_string(),
                         )));
                     }
-                    this.raw_buf.drain(..total);
-                    this.decrypted = plaintext;
+                    this.raw_pos = base + total;
+                    if this.raw_pos == this.raw_buf.len() {
+                        this.raw_buf.clear();
+                        this.raw_pos = 0;
+                    }
                     this.decrypted_pos = 0;
                     continue; // 回到步骤 1 返回明文
                 }
@@ -247,7 +271,7 @@ where
                     let n = rb.filled().len();
                     if n == 0 {
                         // EOF：raw_buf 残留 = 不完整 record
-                        if this.raw_buf.is_empty() {
+                        if this.raw_pos == this.raw_buf.len() {
                             return Poll::Ready(Ok(())); // 干净 EOF
                         }
                         return Poll::Ready(Err(io::Error::new(
@@ -282,14 +306,14 @@ where
                 )));
             }
 
-            // 1. 先发完 pending
-            if let Some((ct, sent, plain_len)) = this.write_pending.take() {
-                match Pin::new(&mut this.conn).poll_write(cx, &ct[sent..]) {
+            // 1. 先发完 pending（发送窗口 = 常驻 write_buf 的已发送偏移起）
+            if let Some((sent, plain_len)) = this.write_pending.take() {
+                match Pin::new(&mut this.conn).poll_write(cx, &this.write_buf[sent..]) {
                     // AsyncWrite 协议：非空 buf 的 Ok(0) = 写入器无法再接受数据。
                     // 裸 Pending 此处没有 waker 注册（底层返回的是 Ready），
                     // 返回它会丢唤醒——部分写入 + 跨缓冲窗口时即死锁。
                     Poll::Ready(Ok(0)) => {
-                        this.write_pending = Some((ct, sent, plain_len));
+                        this.write_pending = Some((sent, plain_len));
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::WriteZero,
                             "inner conn accepted 0 bytes",
@@ -297,10 +321,10 @@ where
                     }
                     Poll::Ready(Ok(n)) => {
                         let new_sent = sent + n;
-                        if new_sent >= ct.len() {
+                        if new_sent >= this.write_buf.len() {
                             return Poll::Ready(Ok(plain_len));
                         }
-                        this.write_pending = Some((ct, new_sent, plain_len));
+                        this.write_pending = Some((new_sent, plain_len));
                         // 底层刚返回 Ready（部分写入）：立即重试剩余字节。
                         // 若在此返回 Pending，没有任何 poll 注册过 waker，
                         // 上层不再被唤醒 → 剩余字节滞留 → 对端凑不齐 record
@@ -311,13 +335,13 @@ where
                     // 唯一合法的 Pending 出口：底层本次确实 Pending，
                     // 已用当前 cx 注册 waker。
                     Poll::Pending => {
-                        this.write_pending = Some((ct, sent, plain_len));
+                        this.write_pending = Some((sent, plain_len));
                         return Poll::Pending;
                     }
                 }
             }
 
-            // 2. 构造新段
+            // 2. 构造新段（全部写入常驻 write_buf 复用，零堆分配——Go 池化等价物）
             let n = buf.len().min(MAX_SEGMENT);
             if n == 0 {
                 return Poll::Ready(Ok(0));
@@ -332,17 +356,21 @@ where
                 this.aead = Aead::new(&header, &this.united_key, this.use_aes);
             }
 
-            let mut ct = Vec::with_capacity(TLS_RECORD_HEADER_LEN + n + TAG_LEN + 16);
+            this.write_buf.clear();
             // 首写前缀（Go common.go:69-72）：server 0-RTT 的 16B 明文随机数
             // 与首个 record 同次写出，随后清空（后续写不含前缀）。
             if let Some(pre) = this.pre_write.take() {
-                ct.extend_from_slice(&pre);
+                this.write_buf.extend_from_slice(&pre);
             }
-            ct.extend_from_slice(&header);
-            if let Err(e) = this.aead.seal(&mut ct, None, data, &header) {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())));
-            }
-            this.write_pending = Some((ct, 0, n));
+            this.write_buf.extend_from_slice(&header);
+            let hdr_end = this.write_buf.len();
+            this.write_buf.extend_from_slice(data);
+            let tag = this
+                .aead
+                .seal_in_place(None, &mut this.write_buf[hdr_end..], &header)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            this.write_buf.extend_from_slice(&tag);
+            this.write_pending = Some((0, n));
             // continue → 下次迭代进入“发 pending”分支
         }
     }

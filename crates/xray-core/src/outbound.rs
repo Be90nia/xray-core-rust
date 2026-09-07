@@ -525,12 +525,82 @@ pub(crate) fn parse_udp443_policies(
     }
     map
 }
-/// 构建单个 outbound 的 DispatchHandler（DialBridge）。
+/// 出站级 mux.enabled 包装（w1l8，Go `senderSettings.MultiplexSettings`，
+/// `app/proxyman/outbound/handler.go:123-145`）：任意协议出站带
+/// `"mux": {"enabled": true}` 时 dispatch 包一层 [`MuxBridge`]——concurrency
+/// 0→8（Go "same as before"）、<0 完全禁用不包装。底层 handler 为出站自身，
+/// worker carrier 经该出站协议拨向 v1.mux.cool:9527，多连接复用同一 carrier。
+/// protocol=="mux" 出站本身已是 MuxBridge，不叠包。UDP443 策略仍由 dispatcher
+/// 按 tag 检查、UDP GlobalID 走 [`MuxBridge::dispatch_with_access`]，均不受影响。
+fn try_build_handler(
+    ob: &BuiltOutbound,
+    loopback_sink: Option<Arc<dyn LoopbackSink>>,
+    mux_bridges: &mut Vec<(Arc<MuxBridge>, Option<String>)>,
+    dns: Option<&Arc<xray_app_dns::DnsService>>,
+    // 入站 tag → 默认 final rule 类型（freedom 默认规则按入站协议名推导，
+    // Go getDefaultFinalRule；API 单构建路径传空表 = 无默认规则）
+    inbound_default_rules: &std::collections::HashMap<String, xray_proxy_freedom::DefaultRuleType>,
+) -> std::result::Result<(Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>), BuildError> {
+    let (handler, bridge_ref, proxy_chain_tag) = build_protocol_handler(
+        ob,
+        loopback_sink,
+        mux_bridges,
+        dns,
+        inbound_default_rules,
+    )?;
+    if ob.entry.kind != "mux" {
+        if let Some(concurrency) = outbound_mux_concurrency(ob) {
+            let (mut mux_bridge, _slot) = MuxBridge::new(ob.tag.clone(), concurrency);
+            if outbound_mux_udp443_skip(ob) {
+                mux_bridge = mux_bridge.with_udp443_skip();
+            }
+            mux_bridge.set_underlying(Arc::clone(&handler));
+            return Ok((
+                Arc::new(mux_bridge) as Arc<dyn DispatchHandler>,
+                bridge_ref,
+                proxy_chain_tag,
+            ));
+        }
+    }
+    Ok((handler, bridge_ref, proxy_chain_tag))
+}
+
+/// 出站级 mux 并发数（Go `NewHandler` :124-130 门控）：mux_json 缺失/解析失败/
+/// enabled=false/concurrency<0 → `None`（不包装）；concurrency==0 → 8。
+/// ponytail: Go 的 MaxConnection=128 与 xudp 独立 ClientManager 未拆——单
+/// MuxBridge 管理器 + XUDP GlobalID 路径已覆盖语义，>128 worker 场景再补。
+fn outbound_mux_concurrency(ob: &BuiltOutbound) -> Option<u32> {
+    let cfg = serde_json::from_value::<xray_conf::MuxConfig>(ob.mux_json.clone()?).ok()?;
+    if !cfg.enabled || cfg.concurrency < 0 {
+        return None;
+    }
+    Some(if cfg.concurrency == 0 {
+        8
+    } else {
+        cfg.concurrency as u32
+    })
+}
+
+/// 出站级 UDP443 skip 旁路开关（Go `NewHandler` :167 `h.udp443` +
+/// Dispatch :226-228 `case "skip": goto out`）：仅 `xudpProxyUDP443: "skip"`
+/// 时 UDP/443 绕过 mux 直发底层出站。Reject 由 dispatcher 按 tag 处理。
+fn outbound_mux_udp443_skip(ob: &BuiltOutbound) -> bool {
+    let Some(v) = ob.mux_json.as_ref() else {
+        return false;
+    };
+    let Ok(cfg) = serde_json::from_value::<xray_conf::MuxConfig>(v.clone()) else {
+        return false;
+    };
+    xray_app_dispatcher::default::Udp443Policy::from_mux(cfg.enabled, &cfg.xudp_proxy_udp_443)
+        == Some(xray_app_dispatcher::default::Udp443Policy::Skip)
+}
+
+/// 按协议构建单个 outbound 的 DispatchHandler（DialBridge）。
 ///
 /// 返回 `(handler, dial_bridge_ref, proxy_chain_tag)`。
 /// - `handler`: 注册到 Ohm 的 DispatchHandler
 /// - `dial_bridge_ref`: 如果是 DialBridge 类型，保留 Arc 引用以便 Phase 2 设置代理链
-fn try_build_handler(
+fn build_protocol_handler(
     ob: &BuiltOutbound,
     loopback_sink: Option<Arc<dyn LoopbackSink>>,
     mux_bridges: &mut Vec<(Arc<MuxBridge>, Option<String>)>,
@@ -790,6 +860,8 @@ pub struct MuxBridge {
     /// `pick_available` 无法创建，见 xray-mux handler.rs:138 注脚）。
     picker: Arc<IncrementalWorkerPicker>,
     slot: UnderlyingSlot,
+    /// UDP/443 skip 旁路（Go handler.go:226-228 `case "skip": goto out`）。
+    udp443_skip: bool,
 }
 
 impl MuxBridge {
@@ -809,6 +881,7 @@ impl MuxBridge {
                 tag: tag.into(),
                 picker,
                 slot: Arc::clone(&slot),
+                udp443_skip: false,
             },
             slot,
         )
@@ -823,6 +896,14 @@ impl MuxBridge {
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         true
+    }
+
+    /// 开启 UDP/443 skip 旁路：UDP/443 不进 mux 会话，直发底层出站
+    /// （Go `case "skip": goto out` → `proxy.Process`）。
+    #[must_use]
+    pub fn with_udp443_skip(mut self) -> Self {
+        self.udp443_skip = true;
+        self
     }
 }
 
@@ -869,6 +950,17 @@ impl DispatchHandler for MuxBridge {
         link: Link,
         access: xray_app_dispatcher::default::AccessContext,
     ) -> PinFuture<()> {
+        // UDP/443 skip 旁路（Go handler.go:226-228 `case "skip": goto out`）：
+        // 绕过 mux 会话直发底层出站。Reject 已由 dispatcher 按 tag 处理。
+        if self.udp443_skip
+            && dest.network() == xray_common::net::network::Network::UDP
+            && dest.port().value() == 443
+        {
+            let underlying = self.slot.read().clone();
+            if let Some(u) = underlying {
+                return u.dispatch_with_access(dest, link, access);
+            }
+        }
         if dest.network() != xray_common::net::network::Network::UDP || access.from.is_empty() {
             return self.dispatch(dest, link);
         }
@@ -3142,6 +3234,183 @@ mod tests {
     #[test]
     fn parse_mux_config_defaults_to_8() {
         assert_eq!(super::parse_mux_config(b"{}").unwrap(), (8, None));
+    }
+
+    /// 出站级 mux 并发门控（Go NewHandler :124-130）：enabled=false /
+    /// concurrency<0 / 无 mux_json 不包装；0 → 8；正值透传。
+    #[test]
+    fn outbound_mux_concurrency_gates_like_go_new_handler() {
+        use serde_json::json;
+        let ob = |mux: Option<serde_json::Value>| BuiltOutbound {
+            mux_json: mux,
+            ..make_outbound("freedom", "m", "{}")
+        };
+        // enabled=false → None（Go h.mux = nil）
+        assert_eq!(super::outbound_mux_concurrency(&ob(Some(json!({"enabled": false})))), None);
+        // 无 mux_json → None
+        assert_eq!(super::outbound_mux_concurrency(&ob(None)), None);
+        // concurrency<0 → None（Go ClientManager{Enabled: false} 直通）
+        assert_eq!(
+            super::outbound_mux_concurrency(&ob(Some(json!({"enabled": true, "concurrency": -1})))),
+            None
+        );
+        // 0 → 8（Go "same as before" 默认）
+        assert_eq!(
+            super::outbound_mux_concurrency(&ob(Some(json!({"enabled": true})))),
+            Some(8)
+        );
+        // 正值透传
+        assert_eq!(
+            super::outbound_mux_concurrency(&ob(Some(json!({"enabled": true, "concurrency": 16})))),
+            Some(16)
+        );
+    }
+
+    /// 包装行为：mux enabled 的 freedom 出站构建出 MuxBridge（tag 不变、
+    /// underlying 已回填），bridge_ref 仍返回给 Phase 2 代理链。
+    #[tokio::test]
+    async fn mux_enabled_freedom_outbound_wraps_in_mux_bridge() {
+        let ob = BuiltOutbound {
+            mux_json: Some(serde_json::json!({"enabled": true, "concurrency": 8})),
+            proxy_settings_json: Some(serde_json::json!({"tag": "chain-out"})),
+            ..make_outbound("freedom", "muxed", "{}")
+        };
+        let (handler, bridge_ref, chain_tag) = super::try_build_handler(
+            &ob,
+            None,
+            &mut Vec::new(),
+            None,
+            &std::collections::HashMap::new(),
+        )
+        .expect("build muxed freedom handler");
+        assert_eq!(handler.tag(), "muxed", "wrapper keeps outbound tag");
+        assert_eq!(chain_tag.as_deref(), Some("chain-out"));
+        assert!(bridge_ref.is_some(), "Phase 2 proxy chain ref preserved");
+        // 包装类型可由 Debug 名识别（MuxBridge 手写 Debug 以结构名开头）
+        assert!(
+            format!("{handler:?}").starts_with("MuxBridge"),
+            "mux enabled must wrap in MuxBridge, got: {handler:?}"
+        );
+    }
+
+    #[test]
+    fn mux_disabled_freedom_outbound_not_wrapped() {
+        let plain = BuiltOutbound {
+            mux_json: Some(serde_json::json!({"enabled": false})),
+            ..make_outbound("freedom", "plain", "{}")
+        };
+        let (handler, _, _) = super::try_build_handler(
+            &plain,
+            None,
+            &mut Vec::new(),
+            None,
+            &std::collections::HashMap::new(),
+        )
+        .expect("build plain freedom handler");
+        assert!(
+            !format!("{handler:?}").starts_with("MuxBridge"),
+            "mux disabled must not wrap, got: {handler:?}"
+        );
+    }
+
+    /// UDP/443 skip 旁路行为（Go `case "skip": goto out`）：skip 出站的
+    /// UDP/443 字节直达底层出站（无 mux New 帧前缀），仍走 mux 会话的流量
+    /// 才会带帧头。helper 门控：仅 skip 值为 true。
+    #[test]
+    fn outbound_mux_udp443_skip_gate() {
+        let ob = |mux: Option<serde_json::Value>| BuiltOutbound {
+            mux_json: mux,
+            ..make_outbound("freedom", "m", "{}")
+        };
+        assert!(super::outbound_mux_udp443_skip(&ob(Some(
+            serde_json::json!({"enabled": true, "xudpProxyUDP443": "skip"})
+        ))));
+        // reject / allow / 缺省（规范化 reject）/ disabled 均不旁路
+        assert!(!super::outbound_mux_udp443_skip(&ob(Some(
+            serde_json::json!({"enabled": true, "xudpProxyUDP443": "reject"})
+        ))));
+        assert!(!super::outbound_mux_udp443_skip(&ob(Some(
+            serde_json::json!({"enabled": true, "xudpProxyUDP443": "allow"})
+        ))));
+        assert!(!super::outbound_mux_udp443_skip(&ob(Some(
+            serde_json::json!({"enabled": true})
+        ))));
+        assert!(!super::outbound_mux_udp443_skip(&ob(None)));
+    }
+
+    #[tokio::test]
+    async fn udp443_skip_sends_raw_to_underlying() {
+        use xray_buf::io::Reader as _;
+        use tokio::io::AsyncWriteExt as _;
+
+        #[derive(Debug)]
+        struct CaptureUnderlying {
+            captured: Arc<parking_lot::Mutex<Vec<u8>>>,
+        }
+        impl DispatchHandler for CaptureUnderlying {
+            fn tag(&self) -> &str {
+                "capture-skip"
+            }
+            fn dispatch(&self, _dest: &Destination, link: Link) -> PinFuture<()> {
+                let captured = Arc::clone(&self.captured);
+                Box::pin(async move {
+                    let mut r = xray_buf::reader::BufferedReader::new(link.reader);
+                    loop {
+                        match r.read_multi_buffer().await {
+                            Ok(mb) if !mb.is_empty() => {
+                                let mut c = captured.lock();
+                                for b in mb.iter() {
+                                    c.extend_from_slice(b.bytes());
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                })
+            }
+        }
+
+        let captured: Arc<parking_lot::Mutex<Vec<u8>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (bridge, _slot) = MuxBridge::new("mux-skip", 8);
+        let bridge = bridge.with_udp443_skip();
+        bridge.set_underlying(Arc::new(CaptureUnderlying {
+            captured: Arc::clone(&captured),
+        }));
+        let bridge = Arc::new(bridge);
+
+        let (mut child, child_server) = tokio::io::duplex(64 * 1024);
+        let (sr, sw) = tokio::io::split(child_server);
+        let link = Link::new(xray_buf::io::new_reader(sr), xray_buf::io::new_writer(sw));
+        child.write_all(b"raw-probe").await.unwrap();
+
+        let dest = Destination::new(
+            Address::ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+            Port::new(443),
+            xray_common::net::network::Network::UDP,
+        );
+        let access = xray_app_dispatcher::default::AccessContext {
+            from: "10.0.0.9:5555".to_string(),
+            ..Default::default()
+        };
+        let task = tokio::spawn(bridge.dispatch_with_access(&dest, link, access));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !captured.lock().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("raw bytes reach underlying within timeout");
+        let snap = captured.lock().clone();
+        assert_eq!(
+            &snap[..],
+            b"raw-probe",
+            "UDP/443 skip must bypass mux (no New frame meta prefix)"
+        );
+        task.abort();
     }
 
     #[test]
