@@ -284,7 +284,11 @@ pub(crate) fn build_hysteria_transport_config(
         t.keep_alive_interval(Some(Duration::from_millis(qc.keep_alive_period_ms)));
     }
     if qc.enable_datagrams {
-        t.datagram_receive_buffer_size(Some(8192));
+        // 对齐 Go MaxDatagramFrameSize=1200（config.go:24）：quinn 的 TP 取值即
+        // 此 buffer（transport_parameters.rs:170），广告 8192 会使 quic-go 对端
+        // 按 ~1286B 分片、quinn 实收仅首片 → 对齐 1200 后 Go 按 ≤1191 分片互通。
+        // ponytail: 1200 也压低本地收包排队上限（一次 ~1 个 datagram），泵常读可接受。
+        t.datagram_receive_buffer_size(Some(1200));
     }
     if qc.max_incoming_streams >= 0 {
         t.max_concurrent_bidi_streams(quinn::VarInt::try_from(qc.max_incoming_streams as u64).unwrap_or(quinn::VarInt::MAX));
@@ -400,6 +404,7 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
         masq: crate::hub::MasqType,
         validator: Option<Arc<dyn crate::hub::AuthValidator>>,
         on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync>,
+        on_new_udp_session: Option<Arc<dyn Fn(Arc<crate::conn::InterConn>) + Send + Sync>>,
     ) -> Pin<Box<dyn std::future::Future<Output = crate::error::Result<Arc<dyn HysteriaQuicListener>>> + Send>> {
         // ponytail: hysteria ALPN 固定 h3（与 client hysteria_transport::QuinnHysteriaTransport 对称）
         let mut rustls_config = (*self.rustls_server_config).clone();
@@ -409,6 +414,7 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
         // 静态 auth token（Go hub.go:63-64 validator 缺席时 config.Auth 对比）
         let masq_handler = masq.build_handler();
         let static_auth = config.auth.clone();
+        let udp_idle_timeout = Duration::from_secs(config.udp_idle_timeout.max(0) as u64);
         Box::pin(async move {
             let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
                 .map_err(|e| crate::error::HysteriaError::Io(io::Error::other(format!("rustls→quic server: {e}"))))?;
@@ -437,6 +443,7 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
                 while let Some(incoming) = ep.accept().await {
                     let validator = validator.clone();
                     let on_new_conn = on_new_conn.clone();
+                    let on_new_udp = on_new_udp_session.clone();
                     let quic_params = quic_params.clone();
                     let masq_handler = masq_handler.clone();
                     let static_auth = static_auth.clone();
@@ -447,7 +454,7 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
                         match incoming.accept_with(Arc::new(server_config)) {
                             Ok(connecting) => match connecting.await {
                                 Ok(conn) => {
-                                    serve_hysteria_connection(conn, validator, on_new_conn, quic_params, cc_slot, masq_handler, static_auth).await;
+                                    serve_hysteria_connection(conn, validator, on_new_conn, quic_params, cc_slot, masq_handler, static_auth, udp_idle_timeout, on_new_udp).await;
                                 }
                                 Err(e) => {
                                     tracing::debug!(error = ?e, "hysteria quic handshake failed");
@@ -480,6 +487,8 @@ async fn serve_hysteria_connection(
     cc_slot: std::sync::Arc<crate::congestion::quinn_bridge::HysteriaCCSlot>,
     masq: Arc<dyn crate::hub::MasqueradeHandler>,
     static_auth: String,
+    udp_idle_timeout: Duration,
+    on_new_udp_session: Option<Arc<dyn Fn(Arc<crate::conn::InterConn>) + Send + Sync>>,
 ) {
     let remote = conn.remote_address();
     let local = conn
@@ -509,6 +518,15 @@ async fn serve_hysteria_connection(
         auth_down,
     ) {
         tracing::warn!(error = %e, %remote, "hysteria congestion negotiation failed, keeping default");
+    }
+
+    // Phase 1.6: UDP relay 数据面（对应 Go hub 的 udpSessionManager + go run()/clean()）。
+    // datagram 与 bidi stream 是 QUIC 独立通道，同一 conn 上互不干扰；
+    // conn 断开时 receive_datagram Err → close_all 兜底。
+    if let Some(on_udp) = on_new_udp_session {
+        let udp_sm = crate::conn::UdpSessionManager::new(udp_idle_timeout, Some(on_udp));
+        let udp_conn: Arc<dyn QuicConn> = Arc::new(QuinnQuicConn::new(conn.clone()));
+        udp_sm.start(udp_conn, local, remote).await;
     }
 
     // Phase 2: raw bidi streams（FrameTypeTCPRequest 前缀由 InterStreamConn 处理）
@@ -1094,7 +1112,7 @@ mod tests {
         });
 
         let listener = factory
-            .listen("127.0.0.1:0".parse().unwrap(), proto_config, quic_params, masq, validator, on_new_conn)
+            .listen("127.0.0.1:0".parse().unwrap(), proto_config, quic_params, masq, validator, on_new_conn, None)
             .await
             .expect("listen should succeed");
         let server_addr = listener.local_addr();
@@ -1211,6 +1229,7 @@ mod tests {
                 crate::hub::MasqType::NotFound,
                 validator,
                 on_new_conn,
+                None,
             )
             .await
             .expect("listen with salamander should succeed");
@@ -1313,7 +1332,7 @@ mod tests {
         });
 
         let listener = factory
-            .listen("127.0.0.1:0".parse().unwrap(), proto_config, quic_params, masq, validator, on_new_conn)
+            .listen("127.0.0.1:0".parse().unwrap(), proto_config, quic_params, masq, validator, on_new_conn, None)
             .await
             .expect("listen should succeed");
         let server_addr = listener.local_addr();
@@ -1404,6 +1423,7 @@ mod tests {
                 masq,
                 Some(Arc::new(MasqValidator)),
                 on_new_conn,
+                None,
             )
             .await
             .expect("listen should succeed");
@@ -1505,6 +1525,7 @@ mod tests {
                 masq,
                 Some(Arc::new(MasqValidator2)),
                 on_new_conn,
+                None,
             )
             .await
             .expect("listen should succeed");

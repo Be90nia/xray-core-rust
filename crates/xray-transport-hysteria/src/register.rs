@@ -108,6 +108,7 @@ async fn listen_hysteria(
             masq,
             None,
             on_new_conn,
+            None,
         )
         .await
         .map_err(|e| io::Error::other(format!("hysteria listen bind failed: {e}")))?;

@@ -656,6 +656,8 @@ struct UdpSessionInner {
     /// 接收 datagram 后，对新 session id 调用（注入到 dispatcher）。
     on_new_session: Option<Arc<dyn Fn(Arc<InterConn>) + Send + Sync>>,
     udp_idle_timeout: Duration,
+    /// QUIC conn 引用（server feed 路径建 session 时注入 write_fn，回包链用）。
+    conn: Option<Arc<dyn QuicConn>>,
 }
 
 impl std::fmt::Debug for UdpSessionManager {
@@ -676,6 +678,7 @@ impl UdpSessionManager {
             closed: false,
             on_new_session,
             udp_idle_timeout,
+            conn: None,
         }));
         Arc::new(Self {
             inner,
@@ -687,6 +690,10 @@ impl UdpSessionManager {
     /// 启动后台清理 + recv 任务（对应 Go `go udpSM.clean(); go udpSM.run()`）。
     pub async fn start(self: &Arc<Self>, conn: Arc<dyn QuicConn>, local: SocketAddr, remote: SocketAddr) {
         let inner = Arc::clone(&self.inner);
+        {
+            let mut g = self.inner.lock().await;
+            g.conn = Some(Arc::clone(&conn));
+        }
         let timeout = {
             let g = self.inner.lock().await;
             g.udp_idle_timeout
@@ -794,9 +801,18 @@ impl UdpSessionInner {
             sess.feed(datagram[4..].to_vec());
             return;
         }
-        // 新 id（server 路径）：创建 InterConn 并 on_new_session
+        // 新 id（server 路径）：创建 InterConn 并 on_new_session。
+        // write_fn/close_fn 对齐 client 的 create_session——回包经 conn.send_datagram 出去。
         let on_new = self.on_new_session.clone();
         let sess = Arc::new(InterConn::new(local, remote, id, UDP_MESSAGE_CHAN_SIZE));
+        if let Some(conn) = &self.conn {
+            let conn_for_write = Arc::clone(conn);
+            sess.set_write_fn(move |payload: &[u8]| {
+                let conn = Arc::clone(&conn_for_write);
+                let payload = payload.to_vec();
+                Box::pin(async move { conn.send_datagram(&payload).await })
+            });
+        }
         sess.feed(datagram[4..].to_vec());
         self.sessions.insert(id, Arc::clone(&sess));
         if let Some(f) = on_new {
@@ -816,6 +832,37 @@ impl UdpSessionInner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试用 QuicConn：send_datagram 捕获到共享缓冲，receive_datagram 永久挂起。
+    struct NoopConn {
+        local: SocketAddr,
+        remote: SocketAddr,
+        sent: parking_lot::Mutex<Vec<Vec<u8>>>,
+    }
+    impl QuicConn for NoopConn {
+        fn send_datagram<'a>(
+            &'a self,
+            data: &'a [u8],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>> {
+            self.sent.lock().push(data.to_vec());
+            Box::pin(async { Ok(()) })
+        }
+        fn receive_datagram(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<u8>>> + Send>> {
+            Box::pin(async {
+                std::future::pending::<()>().await;
+                unreachable!()
+            })
+        }
+        fn close_with_error(&self, _code: u64, _reason: &str) {}
+        fn local_addr(&self) -> SocketAddr {
+            self.local
+        }
+        fn remote_addr(&self) -> SocketAddr {
+            self.remote
+        }
+    }
 
     #[test]
     fn encode_varint_one_byte() {
@@ -935,35 +982,7 @@ mod tests {
     async fn udp_session_manager_create_assigns_incrementing_ids() {
         let local: SocketAddr = "127.0.0.1:80".parse().unwrap();
         let remote: SocketAddr = "127.0.0.1:443".parse().unwrap();
-        // 用 NoopConn 避免真实 QUIC
-        struct NoopConn {
-            local: SocketAddr,
-            remote: SocketAddr,
-        }
-        impl QuicConn for NoopConn {
-            fn send_datagram<'a>(
-                &'a self,
-                _data: &'a [u8],
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn receive_datagram(
-                &self,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<u8>>> + Send>> {
-                Box::pin(async {
-                    std::future::pending::<()>().await;
-                    unreachable!()
-                })
-            }
-            fn close_with_error(&self, _code: u64, _reason: &str) {}
-            fn local_addr(&self) -> SocketAddr {
-                self.local
-            }
-            fn remote_addr(&self) -> SocketAddr {
-                self.remote
-            }
-        }
-        let conn: Arc<dyn QuicConn> = Arc::new(NoopConn { local, remote });
+        let conn: Arc<dyn QuicConn> = Arc::new(NoopConn { local, remote, sent: parking_lot::Mutex::new(Vec::new()) });
         let mgr = UdpSessionManager::new(Duration::from_secs(60), None);
         let s1 = mgr.create_session(Arc::clone(&conn), local, remote).await.unwrap();
         let s2 = mgr.create_session(Arc::clone(&conn), local, remote).await.unwrap();
@@ -972,6 +991,40 @@ mod tests {
         assert_eq!(mgr.session_count().await, 2);
     }
 
+    #[tokio::test]
+    async fn server_feed_path_creates_session_with_write_fn() {
+        // server 路径：未知 id 的 datagram → 自动建 session + on_new_session 回调，
+        // 回包 write 注入 4B session id 信封后经 conn.send_datagram 出去。
+        let local: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let remote: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let noop = Arc::new(NoopConn { local, remote, sent: parking_lot::Mutex::new(Vec::new()) });
+        let conn: Arc<dyn QuicConn> = Arc::clone(&noop) as Arc<dyn QuicConn>;
+        let (tx, mut rx) = mpsc::unbounded_channel::<Arc<InterConn>>();
+        let mgr = UdpSessionManager::new(Duration::from_secs(60), Some(Arc::new(move |s| {
+            let _ = tx.send(s);
+        })));
+        mgr.start(Arc::clone(&conn), local, remote).await;
+
+        // 模拟 client 上行 datagram：[id=7 BE][body...]
+        {
+            let mut g = mgr.inner.lock().await;
+            g.feed(7, vec![0, 0, 0, 7, 0xAA, 0xBB], local, remote);
+        }
+        let sess = rx.recv().await.expect("on_new_session fired");
+        assert_eq!(sess.id(), 7);
+        assert_eq!(mgr.session_count().await, 1);
+
+        // session 读到的是剥除 4B 信封后的 body
+        let mut buf = [0u8; 16];
+        let n = sess.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], &[0xAA, 0xBB]);
+
+        // 回包：write 注入 4B 信封 → conn.send_datagram（write_fn 注入验证）
+        sess.write(&[0x11]).await.unwrap();
+        let out = noop.sent.lock();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], vec![0, 0, 0, 7, 0x11]);
+    }
     #[test]
     fn inter_conn_touch_updates_last_active() {
         let local: SocketAddr = "127.0.0.1:80".parse().unwrap();

@@ -18,7 +18,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use xray_proto::xray::transport::internet::QuicParams;
 
-use crate::conn::{InterStreamConn, QuicConn, QuicStream};
+use crate::conn::{InterConn, InterStreamConn, QuicConn, QuicStream};
 use crate::context::ContextValues;
 use crate::error::{HysteriaError, Result};
 use crate::proto_config::Config;
@@ -429,6 +429,9 @@ pub trait HysteriaListenerFactory: Send + Sync {
         masq: MasqType,
         validator: Option<Arc<dyn AuthValidator>>,
         on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync>,
+        // auth 后每个新 UDP session（4B session id 首包触发，对应 Go udpSessionManager.addConn）。
+        // None = 不启用 UDP 数据面。
+        on_new_udp_session: Option<Arc<dyn Fn(Arc<InterConn>) + Send + Sync>>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Arc<dyn HysteriaQuicListener>>> + Send>>;
 }
 
@@ -528,6 +531,7 @@ impl HysteriaListenerFactory for StubListenerFactory {
         _masq: MasqType,
         _validator: Option<Arc<dyn AuthValidator>>,
         _on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync>,
+        _on_new_udp_session: Option<Arc<dyn Fn(Arc<InterConn>) + Send + Sync>>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Arc<dyn HysteriaQuicListener>>> + Send>> {
         Box::pin(async { Err(HysteriaError::ConnectionClosed) })
     }
@@ -673,6 +677,7 @@ mod tests {
                 MasqType::NotFound,
                 None,
                 on_new,
+                None,
             ));
         assert!(matches!(r, Err(HysteriaError::ConnectionClosed)));
     }

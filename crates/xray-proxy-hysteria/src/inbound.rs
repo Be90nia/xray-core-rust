@@ -27,7 +27,7 @@ use tokio::task::JoinHandle;
 use tracing::info;
 use xray_features::inbound::{InboundError, InboundHandler};
 use xray_proto::xray::transport::internet::QuicParams;
-use xray_transport_hysteria::conn::InterStreamConn;
+use xray_transport_hysteria::conn::{InterConn, InterStreamConn};
 use xray_transport_hysteria::hub::{
     AuthValidator, HysteriaListener, HysteriaListenerFactory, HysteriaQuicListener, MasqType,
 };
@@ -101,6 +101,8 @@ pub struct HysteriaInboundHandler {
     multi_validator: Option<Arc<MultiUserValidator>>,
     /// 可选的 TCP 调度器（inbound_config 模式下使用）。
     dispatcher: Option<Arc<dyn TcpDispatcher>>,
+    /// 可选的 UDP 调度器（生产路由 handler，UDP relay 数据面经 UdpDispatchSession 出站）。
+    udp_dispatcher: Option<Arc<dyn xray_app_dispatcher::DispatchHandler>>,
     /// listener + accept 任务句柄，close 时 abort。
     slot: Mutex<Option<InboundSlot>>,
 }
@@ -138,6 +140,7 @@ impl HysteriaInboundHandler {
             inbound_config: None,
             multi_validator: None,
             dispatcher: None,
+            udp_dispatcher: None,
             slot: Mutex::new(None),
         })
     }
@@ -146,6 +149,16 @@ impl HysteriaInboundHandler {
     #[must_use]
     pub fn with_dispatcher(mut self, dispatcher: Option<Arc<dyn TcpDispatcher>>) -> Self {
         self.dispatcher = dispatcher;
+        self
+    }
+
+    /// 注入 UDP 调度器（builder 风格，启用 server 侧 UDP relay 数据面）。
+    #[must_use]
+    pub fn with_udp_dispatcher(
+        mut self,
+        udp_dispatcher: Option<Arc<dyn xray_app_dispatcher::DispatchHandler>>,
+    ) -> Self {
+        self.udp_dispatcher = udp_dispatcher;
         self
     }
 
@@ -189,6 +202,7 @@ impl HysteriaInboundHandler {
             inbound_config: Some(inbound_config),
             multi_validator: Some(validator),
             dispatcher,
+            udp_dispatcher: None,
             slot: Mutex::new(None),
         })
     }
@@ -280,6 +294,21 @@ impl InboundHandler for HysteriaInboundHandler {
                 }
             });
 
+        // on_new_udp_session 回调：auth 后每个新 UDP session（首包 4B session id）触发。
+        // 对应 Go server.go UDP 分支——每个 session 当一条虚拟连接 dispatch。
+        let udp_dispatcher = self.udp_dispatcher.clone();
+        let on_new_udp_session: Option<Arc<dyn Fn(Arc<InterConn>) + Send + Sync>> =
+            udp_dispatcher.map(|disp| {
+                Arc::new(move |sess: Arc<InterConn>| {
+                    let disp = Arc::clone(&disp);
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_udp_session(sess, disp).await {
+                            tracing::warn!(error = %e, "hysteria inbound udp session error");
+                        }
+                    });
+                }) as Arc<dyn Fn(Arc<InterConn>) + Send + Sync>
+            });
+
         let quic_listener = self
             .factory
             .listen(
@@ -289,6 +318,7 @@ impl InboundHandler for HysteriaInboundHandler {
                 masq,
                 validator,
                 Arc::clone(&on_new_conn),
+                on_new_udp_session,
             )
             .await
             .map_err(|e| InboundError::ListenError(format!("hysteria listen: {e}")))?;
@@ -404,6 +434,75 @@ async fn handle_tcp_stream(
         }
     }
 }
+
+/// 处理入站 UDP session：UdpMessage 解码（含分片重组）→ dispatcher UDP 出站 → 回包编码写回。
+///
+/// 对应 Go `Server.Process` 的 UDP 分支（server.go:102-128）：每个 UDP session 当一条
+/// 虚拟连接，首包目标决定 dispatch 目标（cone NAT 由 UdpDispatchSession 单 link 保证）。
+/// 会话生命周期由 transport 层 UdpSessionManager 的空闲清理托管（session 关闭 →
+/// read 返回 EOF → 本任务退出）。
+async fn handle_udp_session(
+    sess: Arc<InterConn>,
+    dispatcher: Arc<dyn xray_app_dispatcher::DispatchHandler>,
+) -> std::io::Result<()> {
+    use crate::protocol::{Defragger, UdpMessage};
+    use xray_app_dispatcher::UdpDispatchSession;
+
+    let mut session = UdpDispatchSession::new(dispatcher);
+    let mut df = Defragger::new();
+    let mut buf = vec![0u8; 65535];
+    loop {
+        tokio::select! {
+            // 上行：client datagram（已剥 4B session id 信封）→ 解码重组 → dispatch
+            n = sess.read(&mut buf) => {
+                let n = n?;
+                if n == 0 {
+                    break;
+                }
+                // feed 剥了 4B 信封 → 前补哑元对齐 UdpMessage 的 8B 头布局
+                let mut full = Vec::with_capacity(4 + n);
+                full.extend_from_slice(&[0u8; 4]);
+                full.extend_from_slice(&buf[..n]);
+                // Go UDPReader.ReadFrom：解析/重组/地址解析失败 continue 跳过
+                let Ok(msg) = UdpMessage::parse(&full) else {
+                    continue;
+                };
+                let Some(msg) = df.feed(&msg) else {
+                    continue;
+                };
+                let Some(dest) = crate::dispatcher::parse_udp_source(&msg.addr) else {
+                    continue;
+                };
+                session.send_packet(&dest, &msg.data).await?;
+            }
+            // 下行：outbound 回包 → UdpMessage 编码 → 4B session id 信封写回 client
+            r = session.recv_packet() => {
+                match r {
+                    Ok(Some((source, payload))) => {
+                        let msg = UdpMessage {
+                            session_id: 0, // 真实 id 由 InterConn::write 信封注入
+                            packet_id: 0,
+                            frag_id: 0,
+                            frag_count: 1,
+                            addr: crate::dispatcher::dest_net_addr(&source),
+                            data: payload,
+                        };
+                        // 超 MTU 自动分片（对端 UDPReader+Defragger 重组）
+                        crate::dispatcher::write_udp_message(&sess, &msg).await?;
+                    }
+                    Ok(None) => break, // outbound 关闭
+                    Err(e) => {
+                        // 坏帧跳过（与 tuic/SS relay 一致）
+                        tracing::debug!(error = %e, remote = %sess.remote_addr(), "hysteria udp dispatch recv");
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 
 
 #[cfg(test)]

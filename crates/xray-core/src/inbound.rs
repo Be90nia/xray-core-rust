@@ -2277,7 +2277,8 @@ async fn spawn_one_inbound(
                 &ib.tag, config, bind_addr, factory,
             )
             .map_err(|e| std::io::Error::other(format!("hysteria inbound: {e}")))?
-            .with_dispatcher(Some(Arc::new(HysteriaTcpDispatch(dispatch))));
+            .with_dispatcher(Some(Arc::new(HysteriaTcpDispatch(Arc::clone(&dispatch)))))
+            .with_udp_dispatcher(Some(dispatch));
             tracing::info!(tag = %ib.tag, addr = %addr, "hysteria inbound listening");
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                 handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))

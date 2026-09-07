@@ -290,14 +290,11 @@ async fn parse_and_forward(
                 addr,
                 data,
             };
-            let mut wire = vec![0u8; msg.size()];
-            let n = msg.serialize(&mut wire);
-            // 剥掉 serialize 的 4B session_id 字段：wire 布局 = [id 信封][body]，
-            // 对齐 Go（Serialize 跳过 SessionID 写入、InterConn.Write 覆盖为 c.id）。
-            // ponytail: 不做超限分片——Go 依赖 quic.DatagramTooLargeError 携带的
-            // MaxDatagramPayloadSize，Rust io::Error 无此信息；超限包 send_datagram
-            // 报错断开
-            conn.write(&wire[4..n]).await?;
+            if let Err(e) = write_udp_message(conn, &msg).await {
+                // 对齐 Go UDPWriter（client.go:209-223）：DatagramTooLarge 属可恢复
+                // 错误——丢弃本包继续（UDP 语义），不杀 relay 会话。
+                tracing::debug!("hysteria udp up forward error: {e}");
+            }
             Ok(true)
         }
         Ok(None) => Ok(false), // 流内干净结束，但 accum 可能有残留 → 等更多数据
@@ -305,16 +302,44 @@ async fn parse_and_forward(
         Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
     }
 }
+/// QUIC datagram 单帧 payload 上限：1200（Go `hysteria.MaxDatagramFrameSize`）
+/// − 4（InterConn session id 信封）− 9（quinn `Datagram::SIZE_BOUND` 帧界）=
+/// 1187，保证加信封后的 datagram 不超对端上限。超限消息按 Go `UDPWriter`
+/// （client.go:209-219 DatagramTooLarge→FragUDPMessage）同款语义分片；对端
+/// UDPReader+Defragger 天然重组。
+pub(crate) const MAX_DATAGRAM_PAYLOAD: usize = 1200 - 4 - 9;
+
+/// 序列化 UdpMessage 并经 InterConn 写出；超 MTU 时自动分片。
+/// 写入 body 已剥 4B session_id 字段（InterConn::write 注入真实 id 信封）。
+pub(crate) async fn write_udp_message(
+    conn: &Arc<InterConn>,
+    msg: &UdpMessage,
+) -> io::Result<()> {
+    let frags = if msg.size() > MAX_DATAGRAM_PAYLOAD {
+        crate::protocol::frag_udp_message(msg, MAX_DATAGRAM_PAYLOAD)
+    } else {
+        std::slice::from_ref(msg).to_vec()
+    };
+    for frag in &frags {
+        let mut wire = vec![0u8; frag.size()];
+        let n = frag.serialize(&mut wire);
+        if n == 0 {
+            continue; // 序列化超上限（不应发生）
+        }
+        conn.write(&wire[4..n]).await?;
+    }
+    Ok(())
+}
 
 /// Destination → `"host:port"`（Address Display 对 IPv6 已加方括号，与 Go `NetAddr` 一致）。
-fn dest_net_addr(dest: &Destination) -> String {
+pub(crate) fn dest_net_addr(dest: &Destination) -> String {
     format!("{}:{}", dest.address(), dest.port().value())
 }
 
 /// `"host:port"` → UDP Destination（对应 Go `net.ParseDestination("udp:"+addr)`）。
 ///
 /// 解析失败返回 `None`（调用方跳过该消息，对齐 Go `ReadFrom` 的 continue）。
-fn parse_udp_source(addr: &str) -> Option<Destination> {
+pub(crate) fn parse_udp_source(addr: &str) -> Option<Destination> {
     let (host, port) = addr.rsplit_once(':')?;
     let port = Port::new(port.parse::<u16>().ok()?);
     let host = host
