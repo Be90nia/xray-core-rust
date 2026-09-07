@@ -323,7 +323,8 @@ pub trait DispatchHandler: Send + Sync + Debug {
 /// 入站连接的 access 上下文（对应 Go ctx 中的 `log.AccessMessage`，协议层填充）。
 ///
 /// `inbound_tag` 由生产入口（InboundDispatchHandler）填充，协议层只需给
-/// `from`（客户端源地址）与 `email`（认证用户，无认证协议留空）。
+/// `from`（客户端源地址）、`email`（认证用户，无认证协议留空）与 `level`
+/// （用户策略层级，对应 Go `session.Inbound.User.Level`，默认 0）。
 #[derive(Debug, Clone, Default)]
 pub struct AccessContext {
     /// 客户端源地址（如 `1.2.3.4:1080`）。
@@ -332,6 +333,8 @@ pub struct AccessContext {
     pub email: String,
     /// 入站 tag（由 InboundDispatchHandler 填充）。
     pub inbound_tag: String,
+    /// 认证用户策略层级（对应 Go `user.Level`，用于 per-user policy 查询）。
+    pub level: u32,
 }
 
 /// 一次 access 记录（对应 Go `log.AccessMessage` 最终形态）。
@@ -612,6 +615,33 @@ fn get_or_register_counter_opt(
     stats.and_then(|m| {
         xray_features::stats::get_or_register_counter(m.as_ref(), name).ok()
     })
+}
+
+/// 从 access.from（`SocketAddr` 字符串形态）提取主机部分。
+///
+/// 对应 Go `sessionInbound.Source.Address.String()`：`1.2.3.4:80` → `1.2.3.4`、
+/// `[::1]:80` → `[::1]`（带方括号，与 OnlineMap localhost 字面量形态一致）。
+fn source_host(from: &str) -> &str {
+    match from.rfind(':') {
+        Some(i) => &from[..i],
+        None => from,
+    }
+}
+
+/// 在线 IP 引用计数守卫：连接 fut 结束（含 early return / panic unwind）时
+/// 自动 remove_ip。对应 Go `context.AfterFunc(ctx, func() { om.RemoveIP(ip) })`
+/// （default.go:224-229）。
+struct OnlineIpGuard {
+    om: Option<Arc<dyn xray_features::stats::OnlineMap>>,
+    ip: String,
+}
+
+impl Drop for OnlineIpGuard {
+    fn drop(&mut self) {
+        if let Some(om) = &self.om {
+            om.remove_ip(&self.ip);
+        }
+    }
 }
 
 // ========== DefaultDispatcher ==========
@@ -895,12 +925,22 @@ impl DefaultDispatcher {
         let udp443_policies = self.udp443_policies.clone();
         let ohm = Arc::clone(ohm);
         let access_sink = self.access_sink.clone();
+        // per-user policy 层级（Go d.policy.ForLevel(user.Level)，default.go:162）：
+        // access.level 缺省 0，无用户信息时与既有行为一致。
+        let user_level = access.as_ref().map_or(0, |a| a.level);
         let policy = self
             .policy_manager
             .as_ref()
-            .map_or(self.default_policy.clone(), |pm| pm.policy_for_level(0));
+            .map_or(self.default_policy.clone(), |pm| {
+                pm.policy_for_level(user_level)
+            });
         let handshake_timeout = policy.timeout.handshake;
-
+        // per-user stats 上下文（Go getLink default.go:161-185）：email 非空才挂接。
+        let user_email = access.as_ref().map_or(String::new(), |a| a.email.clone());
+        let user_host = access
+            .as_ref()
+            .map_or(String::new(), |a| source_host(&a.from).to_string());
+        let policy_stats = policy.stats.clone();
         let outbound_reader = outbound.reader;
         let outbound_writer = outbound.writer;
         let fut = async move {
@@ -1023,9 +1063,53 @@ impl DefaultDispatcher {
             );
 
             // CachedReader 始终包装 outbound_reader，sniffing 时回放缓存首包
-            let reader: Box<dyn xray_buf::io::Reader> =
+            let mut reader: Box<dyn xray_buf::io::Reader> =
                 crate::stats::maybe_wrap_reader(out_up, Box::new(cr));
-            let writer = crate::stats::maybe_wrap_writer(out_dn, outbound_writer);
+            let mut writer = crate::stats::maybe_wrap_writer(out_dn, outbound_writer);
+
+            // ---- per-user stats（对应 Go getLink default.go:161-185，email 非空挂接） ----
+            // uplink：Go 包 inboundLink.Writer（上行 pipe 入站写端）；Rust inbound 端
+            // 包装在生产入口（xray-core wiring），dispatch_link 仅持 outbound 端 →
+            // 包 outbound reader（同一数据流的读出端，连接生命周期内计数等价，
+            // 瞬时差 ≤ pipe 缓冲）。downlink：Go 包 outboundLink.Writer，同位。
+            let _online_guard = if !user_email.is_empty() {
+                if policy_stats.user_uplink {
+                    let up = get_or_register_counter_opt(
+                        stats.as_ref(),
+                        &format!("user>>>{user_email}>>>traffic>>>uplink"),
+                    );
+                    reader = crate::stats::maybe_wrap_reader(up, reader);
+                }
+                if policy_stats.user_downlink {
+                    let dn = get_or_register_counter_opt(
+                        stats.as_ref(),
+                        &format!("user>>>{user_email}>>>traffic>>>downlink"),
+                    );
+                    writer = crate::stats::maybe_wrap_writer(dn, writer);
+                }
+                // Go trackOnlineIP（default.go:224-229）：GetOrRegisterOnlineMap +
+                // AddIP；RemoveIP 由 guard 在连接 fut 结束时执行（引用计数归零）。
+                if policy_stats.user_online && !user_host.is_empty() {
+                    let om = stats.as_ref().and_then(|m| {
+                        xray_features::stats::get_or_register_online_map(
+                            m.as_ref(),
+                            &format!("user>>>{user_email}>>>online"),
+                        )
+                        .ok()
+                    });
+                    if let Some(om) = &om {
+                        om.add_ip(&user_host);
+                    }
+                    Some(OnlineIpGuard {
+                        om,
+                        ip: user_host,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
             // ---- UDP443 policy（bd g35，Go handler.go:220-228） ----
             // 仅 mux 启用的出站有条目（Go h.udp443 只在 MultiplexSettings.Enabled 时设置）。
@@ -1963,6 +2047,186 @@ mod tests {
         w.shutdown();
     }
 
+    // ---- per-user stats（cbnj，Go getLink default.go:161-185 + trackOnlineIP:224-229）----
+
+    #[tokio::test]
+    async fn dispatch_link_counts_per_user_traffic_and_online_ip() {
+        use xray_buf::multi::MultiBuffer;
+        use xray_common::net::address::Address;
+        use xray_common::net::destination::Destination;
+
+        /// 一次性 echo handler：读一段回写后关闭。
+        #[derive(Debug)]
+        struct EchoOnce;
+        impl DispatchHandler for EchoOnce {
+            fn tag(&self) -> &str {
+                "echo"
+            }
+            fn dispatch(
+                &self,
+                _dest: &Destination,
+                link: xray_transport::link::Link,
+            ) -> PinFuture<()> {
+                Box::pin(async move {
+                    let mut r = link.reader;
+                    let mut w = link.writer;
+                    if let Ok(mb) = r.read_multi_buffer().await {
+                        if !mb.is_empty() {
+                            let _ = w.write_multi_buffer(mb).await;
+                        }
+                    }
+                    w.shutdown();
+                })
+            }
+        }
+
+        let ohm = SimpleOhm::new();
+        ohm.set_default(Arc::new(EchoOnce));
+
+        let stats = Arc::new(xray_app_stats::Manager::new_running());
+        let mut d = DefaultDispatcher::new();
+        d.ohm = Some(Arc::new(ohm));
+        d.stats = Some(Arc::clone(&stats) as Arc<dyn xray_features::stats::Manager>);
+        // Go policy level stats：user{Uplink,Downlink,Online} 三开关全开
+        d.default_policy.stats.user_uplink = true;
+        d.default_policy.stats.user_downlink = true;
+        d.default_policy.stats.user_online = true;
+
+        let (up_r, up_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let (dn_r, dn_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let outbound = xray_transport::link::Link::new(Box::new(up_r), Box::new(dn_w));
+
+        let dest = Destination::new(
+            Address::new_domain("user.example.com".to_string()),
+            Port::new(443),
+            Network::TCP,
+        );
+        let access = AccessContext {
+            from: "203.0.113.7:4444".into(),
+            email: "alice@x.com".into(),
+            inbound_tag: "vless-in".into(),
+            level: 0,
+        };
+        d.dispatch_link(&dest, outbound, &SniffingRequest::default(), Some(access), None)
+            .expect("dispatch_link ok");
+
+        // 在线 IP：连接建立后 map 出现且 count=1（host 提取剥端口）
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let om = stats
+            .get_online_map("user>>>alice@x.com>>>online")
+            .expect("online map should be lazily registered");
+        assert_eq!(om.count(), 1, "source host 203.0.113.7 should be online");
+        let mut seen_ip = String::new();
+        om.for_each(&mut |ip, _| {
+            seen_ip = ip.to_string();
+            true
+        });
+        assert_eq!(seen_ip, "203.0.113.7", "port must be stripped from access.from");
+
+        // 流量：写上行 → echo 回读 → per-user counter 增长
+        let mut w: Box<dyn xray_buf::io::Writer> = Box::new(up_w);
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(b"user traffic probe");
+        w.write_multi_buffer(mb).await.unwrap();
+        let mut r: Box<dyn xray_buf::io::Reader> = Box::new(dn_r);
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
+            .await
+            .expect("timeout waiting echo")
+            .unwrap();
+        assert_eq!(resp.to_vec(), b"user traffic probe");
+
+        let up_ctr = stats
+            .get_counter("user>>>alice@x.com>>>traffic>>>uplink")
+            .expect("user uplink counter should be lazily registered");
+        let dn_ctr = stats
+            .get_counter("user>>>alice@x.com>>>traffic>>>downlink")
+            .expect("user downlink counter should be lazily registered");
+        assert!(up_ctr.value() > 0, "user uplink counted {} bytes", up_ctr.value());
+        assert!(dn_ctr.value() > 0, "user downlink counted {} bytes", dn_ctr.value());
+
+        // 连接结束 → guard remove_ip → 在线计数归零
+        w.shutdown();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(om.count(), 0, "online ip must be removed after connection ends");
+    }
+
+    #[tokio::test]
+    async fn dispatch_link_skips_per_user_stats_when_policy_off() {
+        use xray_buf::multi::MultiBuffer;
+        use xray_common::net::address::Address;
+        use xray_common::net::destination::Destination;
+
+        #[derive(Debug)]
+        struct EchoOnce;
+        impl DispatchHandler for EchoOnce {
+            fn tag(&self) -> &str {
+                "echo"
+            }
+            fn dispatch(
+                &self,
+                _dest: &Destination,
+                link: xray_transport::link::Link,
+            ) -> PinFuture<()> {
+                Box::pin(async move {
+                    let mut r = link.reader;
+                    let mut w = link.writer;
+                    if let Ok(mb) = r.read_multi_buffer().await {
+                        if !mb.is_empty() {
+                            let _ = w.write_multi_buffer(mb).await;
+                        }
+                    }
+                    w.shutdown();
+                })
+            }
+        }
+
+        let ohm = SimpleOhm::new();
+        ohm.set_default(Arc::new(EchoOnce));
+        let stats = Arc::new(xray_app_stats::Manager::new_running());
+        // 默认 policy stats 全 false：email 非空也不挂 per-user counter/online map
+        let mut d = DefaultDispatcher::new();
+        d.ohm = Some(Arc::new(ohm));
+        d.stats = Some(Arc::clone(&stats) as Arc<dyn xray_features::stats::Manager>);
+
+        let (up_r, up_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let (dn_r, dn_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let outbound = xray_transport::link::Link::new(Box::new(up_r), Box::new(dn_w));
+
+        let dest = Destination::new(
+            Address::new_domain("user.example.com".to_string()),
+            Port::new(443),
+            Network::TCP,
+        );
+        let access = AccessContext {
+            from: "198.51.100.9:5555".into(),
+            email: "bob@x.com".into(),
+            ..Default::default()
+        };
+        d.dispatch_link(&dest, outbound, &SniffingRequest::default(), Some(access), None)
+            .expect("dispatch_link ok");
+
+        let mut w: Box<dyn xray_buf::io::Writer> = Box::new(up_w);
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(b"gated probe");
+        w.write_multi_buffer(mb).await.unwrap();
+        let mut r: Box<dyn xray_buf::io::Reader> = Box::new(dn_r);
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
+            .await
+            .expect("timeout waiting echo")
+            .unwrap();
+        assert_eq!(resp.to_vec(), b"gated probe");
+
+        assert!(
+            stats.get_counter("user>>>bob@x.com>>>traffic>>>uplink").is_none(),
+            "policy off: user uplink counter must not be registered"
+        );
+        assert!(
+            stats.get_online_map("user>>>bob@x.com>>>online").is_none(),
+            "policy off: online map must not be registered"
+        );
+        w.shutdown();
+    }
+
     // ---- DialTaggedOutbound（bd kz1，Go tagged/taggedimpl）----
 
     /// 定向命中：dispatch_tagged("beta") 恰好派发到 beta，alpha 不被触碰；
@@ -2538,6 +2802,7 @@ mod tests {
             from: "1.2.3.4:1080".into(),
             email: "u@x.com".into(),
             inbound_tag: "socks-in".into(),
+            level: 0,
         };
         d.dispatch_link(&access_dest(), link, &SniffingRequest::default(), Some(access), None)
             .expect("dispatch_link ok");
@@ -2625,6 +2890,7 @@ mod tests {
             from: "1.2.3.4:1080".into(),
             email: String::new(),
             inbound_tag: "socks-in".into(),
+            level: 0,
         };
         let res = d.dispatch_link(&access_dest(), link, &SniffingRequest::default(), Some(access), None);
         assert!(res.is_err(), "no handler should be a sync error");

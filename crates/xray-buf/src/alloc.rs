@@ -12,7 +12,7 @@
 use bytes::BytesMut;
 use parking_lot::Mutex;
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// 默认缓冲区大小 (8KB)，对应 Go 的 `buf.Size`。
 pub const DEFAULT_SIZE: usize = 8192;
@@ -26,6 +26,23 @@ const TLS_MAX_PER_TIER: usize = 8;
 /// 全局池分片数量
 const SHARD_COUNT: usize = 8;
 
+/// 全局池每分片每层上限：超出直接丢弃，防高水位无限堆积。
+/// 8 分片 × 64 块：tier0 上限 1MB、tier3 上限 64MB。
+const SHARD_MAX_PER_TIER: usize = 64;
+
+/// 惰性收缩间隔（近似 Go sync.Pool 被 GC 周期性清池的节奏）。
+const SWEEP_INTERVAL_MS: u64 = 60_000;
+
+/// 上次惰性收缩时间（unix ms）。`fetch_max` 天然去重并发清扫。
+static LAST_SWEEP_MS: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0))
+}
+
 /// 全局池分片：每个分片包含4个层的 Vec<BytesMut>
 struct Shard {
     tiers: [Vec<BytesMut>; 4],
@@ -35,6 +52,23 @@ impl Shard {
     const fn new() -> Self {
         Self {
             tiers: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+        }
+    }
+}
+
+impl Shard {
+    /// 高水位回落收缩：距上次清扫超过 [`SWEEP_INTERVAL_MS`] 时，每层释放一半回系统。
+    ///
+    /// 近似 Go sync.Pool 被 GC 周期性清池的语义；减半而非全清，活动流量下不抖动。
+    /// `now` 由调用方传入（生产 `now_ms()`，测试可注入）。
+    fn maybe_sweep(&mut self, now: u64) {
+        let last = LAST_SWEEP_MS.fetch_max(now, Ordering::Relaxed);
+        if now.saturating_sub(last) < SWEEP_INTERVAL_MS {
+            return;
+        }
+        for tier in &mut self.tiers {
+            let keep = tier.len() / 2;
+            tier.truncate(keep);
         }
     }
 }
@@ -150,11 +184,16 @@ pub fn release(mut buf: BytesMut) {
         }
         let buf = buf.expect("is_none 已处理");
 
-        // 2. 尝试全局分片（无上限，但 Mutex 保护）
+        // 2. 尝试全局分片（每分片每层上限 [`SHARD_MAX_PER_TIER`]，超出丢弃；
+        // 拿锁顺带机会式惰性收缩，近似 Go sync.Pool 的 GC 清池）
         let shard_idx = next_shard();
         let mut shard = SHARDS[shard_idx].lock();
-        shard.tiers[tier].push(buf);
-        tracing::trace!(tier, shard = shard_idx, "缓冲池归还到分片");
+        shard.maybe_sweep(now_ms());
+        if shard.tiers[tier].len() < SHARD_MAX_PER_TIER {
+            shard.tiers[tier].push(buf);
+            tracing::trace!(tier, shard = shard_idx, "缓冲池归还到分片");
+        }
+        // 超上限：buf drop 归还系统——高水位由 sweep 周期回落
     }
     // 容量不匹配任何分层或超出，直接丢弃
 }
@@ -183,6 +222,9 @@ pub fn clear() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 串行化触碰全局池 static 的测试（clear/release 均是进程级共享状态）。
+    static POOL_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     #[test]
     fn test_select_tier() {
@@ -218,6 +260,7 @@ mod tests {
 
     #[test]
     fn test_release_and_reuse() {
+        let _g = POOL_TEST_LOCK.lock();
         clear();
         let buf = alloc(DEFAULT_SIZE);
         let cap = buf.capacity();
@@ -231,6 +274,7 @@ mod tests {
 
     #[test]
     fn test_tls_cache_limit() {
+        let _g = POOL_TEST_LOCK.lock();
         clear();
         for _ in 0..TLS_MAX_PER_TIER {
             release(alloc(DEFAULT_SIZE));
@@ -241,6 +285,7 @@ mod tests {
 
     #[test]
     fn test_clear_empties_pools() {
+        let _g = POOL_TEST_LOCK.lock();
         for _ in 0..5 {
             release(alloc(DEFAULT_SIZE));
         }
@@ -257,11 +302,58 @@ mod tests {
 
     #[test]
     fn test_multi_tier_operations() {
+        let _g = POOL_TEST_LOCK.lock();
         clear();
         release(alloc(1024));
         release(alloc(4096));
         release(alloc(16384));
         release(alloc(65536));
         clear();
+    }
+
+    /// 全局池总池化块数（tier0）。
+    fn shard_tier0_total() -> usize {
+        SHARDS.iter().map(|s| s.lock().tiers[0].len()).sum()
+    }
+
+    #[test]
+    fn test_shard_release_cap() {
+        let _g = POOL_TEST_LOCK.lock();
+        clear();
+        // 冻结 sweep（last=MAX-1 时 now-last 饱和为 0），否则真实墙钟会在塞池中途
+        // 触发减半，破坏钳制断言
+        LAST_SWEEP_MS.store(u64::MAX - 1, std::sync::atomic::Ordering::Relaxed);
+        // 归还数远超全局容量上限（TLS 吸收 TLS_MAX_PER_TIER 个后余量进分片）
+        let total = SHARD_MAX_PER_TIER * SHARD_COUNT + TLS_MAX_PER_TIER + 50;
+        let bufs: Vec<_> = (0..total).map(|_| alloc(1024)).collect();
+        for b in bufs {
+            release(b);
+        }
+        assert_eq!(
+            shard_tier0_total(),
+            SHARD_MAX_PER_TIER * SHARD_COUNT,
+            "全局池必须钳制在 分片数×每分片上限"
+        );
+        clear();
+    }
+
+    #[test]
+    fn test_maybe_sweep_halves_tiers() {
+        let _g = POOL_TEST_LOCK.lock();
+        clear();
+        LAST_SWEEP_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut shard = Shard::new();
+        for _ in 0..10 {
+            shard.tiers[2].push(BytesMut::with_capacity(TIER_SIZES[2]));
+        }
+        shard.maybe_sweep(SWEEP_INTERVAL_MS); // now - last(0) >= 间隔 → 触发
+        assert_eq!(shard.tiers[2].len(), 5, "sweep 必须把每层减半");
+        // 间隔内不重复触发：last 已被更新为 SWEEP_INTERVAL_MS
+        for _ in 0..5 {
+            shard.tiers[2].push(BytesMut::with_capacity(TIER_SIZES[2]));
+        }
+        shard.maybe_sweep(SWEEP_INTERVAL_MS * 2 - 1);
+        assert_eq!(shard.tiers[2].len(), 10, "间隔未到不得收缩");
+        LAST_SWEEP_MS.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }

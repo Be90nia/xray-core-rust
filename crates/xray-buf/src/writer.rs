@@ -5,7 +5,8 @@
 use crate::buffer::Buffer;
 use crate::io::{self, Result, Writer};
 use crate::multi::MultiBuffer;
-use std::future::Future;
+use std::future::{Future, poll_fn};
+use std::io::IoSlice;
 use std::pin::Pin;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
@@ -40,26 +41,74 @@ impl Writer for SequentialWriter {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
             let buffers = mb.into_buffers();
+            // 底层支持 vectored（裸 TCP sendmsg 等）时聚合一次写出；
+            // TLS 包装层等默认 is_write_vectored()==false 自动退回逐块顺序写。
+            let res = if self.inner.is_write_vectored() {
+                write_vectored_all(&mut self.inner, &buffers).await
+            } else {
+                write_sequential(&mut self.inner, &buffers).await
+            };
             for mut buf in buffers {
-                let data = buf.bytes();
-                if data.is_empty() {
-                    buf.release();
-                    continue;
-                }
-                match self.inner.write_all(data).await {
-                    Ok(()) => {
-                        tracing::trace!(bytes = data.len(), "SequentialWriter 写入");
-                        buf.release();
-                    }
-                    Err(e) => {
-                        buf.release();
-                        return Err(io::classify_io_error(e, false));
-                    }
-                }
+                buf.release();
             }
-            Ok(())
+            res
         })
     }
+}
+
+/// 逐块顺序写（原 [`SequentialWriter`] 行为）。
+async fn write_sequential<W: AsyncWrite + Unpin + ?Sized>(
+    w: &mut W,
+    buffers: &[Buffer],
+) -> Result<()> {
+    for buf in buffers {
+        let data = buf.bytes();
+        if data.is_empty() {
+            continue;
+        }
+        w.write_all(data)
+            .await
+            .map_err(|e| io::classify_io_error(e, false))?;
+    }
+    Ok(())
+}
+
+/// vectored 聚合写：把全部非空块收集为 iovec，尽量单次 `poll_write_vectored`
+/// 写出；部分写（返回值小于总量）时从断点继续。N×8KB 块从 N 次 syscall
+/// 收敛到 ~1 次。
+async fn write_vectored_all<W: AsyncWrite + Unpin + ?Sized>(
+    w: &mut W,
+    buffers: &[Buffer],
+) -> Result<()> {
+    let mut slices: Vec<IoSlice<'_>> = buffers
+        .iter()
+        .map(|b| IoSlice::new(b.bytes()))
+        // ponytail: Vec.remove(0) 前进——块数 ≤8，O(n²) 无关紧要
+        .filter(|s| !s.is_empty())
+        .collect();
+    while !slices.is_empty() {
+        let n = poll_fn(|cx| Pin::new(&mut *w).poll_write_vectored(cx, &slices))
+            .await
+            .map_err(|e| io::classify_io_error(e, false))?;
+        if n == 0 {
+            return Err(io::classify_io_error(
+                std::io::Error::new(std::io::ErrorKind::WriteZero, "write_vectored returned 0"),
+                false,
+            ));
+        }
+        let mut rem = n;
+        while rem > 0 && !slices.is_empty() {
+            let len = slices[0].len();
+            if len <= rem {
+                rem -= len;
+                slices.remove(0);
+            } else {
+                slices[0].advance(rem);
+                rem = 0;
+            }
+        }
+    }
+    Ok(())
 }
 
 // ========== BufferedWriter ==========
@@ -212,6 +261,7 @@ impl DiscardBytes {
 
 #[cfg(test)]
 mod tests {
+    use std::task::{Context, Poll};
     use super::*;
 
     #[tokio::test]
@@ -327,5 +377,111 @@ mod tests {
         let mut mb = MultiBuffer::new();
         mb.push(Buffer::new());
         writer.write_multi_buffer(mb).await.expect("write failed");
+    }
+
+    /// `is_write_vectored()==true` 的 mock：记录聚合结果与调用次数，
+    /// 可配置每次最多消费的字节数（模拟部分写）。
+    struct VectoredMock {
+        data: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        chunk: Option<usize>,
+        vectored_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl VectoredMock {
+        fn new(chunk: Option<usize>) -> (Self, Self) {
+            let data = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let writer_mock = Self { data: std::sync::Arc::clone(&data), chunk, vectored_calls: std::sync::Arc::clone(&calls) };
+            let probe = Self { data, chunk, vectored_calls: calls };
+            (writer_mock, probe)
+        }
+    }
+
+    impl AsyncWrite for VectoredMock {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.data.lock().expect("unpoisoned").extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            self.vectored_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let total: usize = bufs.iter().map(|s| s.len()).sum();
+            let n = self.chunk.map_or(total, |c| c.min(total));
+            let mut rem = n;
+            for s in bufs {
+                if rem == 0 {
+                    break;
+                }
+                let take = rem.min(s.len());
+                self.data.lock().expect("unpoisoned").extend_from_slice(&s[..take]);
+                rem -= take;
+            }
+            Poll::Ready(Ok(n))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sequential_writer_vectored_single_call() {
+        let (mock, probe) = VectoredMock::new(None);
+        let mut writer = SequentialWriter::new(mock);
+
+        let mut mb = MultiBuffer::new();
+        mb.push(Buffer::from_vec(b"aaa".to_vec()));
+        mb.push(Buffer::from_vec(b"bbb".to_vec()));
+        mb.push(Buffer::from_vec(b"cc".to_vec()));
+        writer.write_multi_buffer(mb).await.expect("write failed");
+
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(
+            *probe.data.lock().expect("unpoisoned"),
+            b"aaabbbcc".as_slice(),
+            "聚合写必须保序拼接全部块"
+        );
+        assert_eq!(
+            probe.vectored_calls.load(Relaxed),
+            1,
+            "3 块应单次 poll_write_vectored 写出"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sequential_writer_vectored_partial_writes() {
+        // 每次 writev 只消费 4 字节 → 9 字节需要 3 次（4+4+1）
+        let (mock, probe) = VectoredMock::new(Some(4));
+        let mut writer = SequentialWriter::new(mock);
+
+        let mut mb = MultiBuffer::new();
+        mb.push(Buffer::from_vec(b"aaa".to_vec()));
+        mb.push(Buffer::from_vec(b"bbb".to_vec()));
+        mb.push(Buffer::from_vec(b"ccc".to_vec()));
+        writer.write_multi_buffer(mb).await.expect("write failed");
+
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(
+            *probe.data.lock().expect("unpoisoned"),
+            b"aaabbbccc".as_slice(),
+            "部分写必须从断点续写且保序"
+        );
+        assert_eq!(probe.vectored_calls.load(Relaxed), 3);
     }
 }

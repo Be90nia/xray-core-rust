@@ -5,12 +5,15 @@
 //! nonce 达到全 0xFF（MaxNonce）时调用方应重新派生 AEAD（对应 Go `MaxNonce`）。
 
 use crate::error::{Result, VlessError};
-use aes_gcm::aead::{Aead as AeadCore, KeyInit, Payload};
+use aes_gcm::aead::{Aead as AeadCore, AeadInOut, KeyInit, Payload};
 use aes_gcm::Aes256Gcm;
 use chacha20poly1305::ChaCha20Poly1305;
 
 /// Nonce 字节长度（AES-GCM/ChaCha20-Poly1305 标准 12 字节）。
 pub const NONCE_LEN: usize = 12;
+
+/// GCM/Poly1305 认证标签长度。
+pub const TAG_LEN: usize = 16;
 
 /// MaxNonce：全 0xFF，对应 Go `MaxNonce = bytes.Repeat([]byte{255}, 12)`。
 ///
@@ -143,6 +146,64 @@ impl Aead {
         dst.extend_from_slice(&pt);
         Ok(())
     }
+
+    /// 原地加密（数据面热路径）：加密 `buf` 全部内容，返回认证 tag 由调用方追加。
+    ///
+    /// 对应 Go `AEAD.Seal` 的池化 in-place 形态；nonce 语义与 [`Aead::seal`]
+    /// 一致（`None` 时先 IncreaseNonce），但全程零堆分配。
+    ///
+    /// # Errors
+    /// 底层 AEAD 加密失败（罕见，多为密钥/nonce 异常）返回 [`VlessError::Other`]。
+    pub fn seal_in_place(
+        &mut self,
+        nonce: Option<&[u8; NONCE_LEN]>,
+        buf: &mut [u8],
+        aad: &[u8],
+    ) -> Result<[u8; TAG_LEN]> {
+        let used: [u8; NONCE_LEN] = match nonce {
+            Some(n) => *n,
+            None => {
+                self.increase_nonce();
+                self.nonce
+            }
+        };
+        let tag = match &self.kind {
+            AeadKind::Aes(a) => a.encrypt_inout_detached(&used.into(), aad, buf.into()),
+            AeadKind::ChaCha(c) => c.encrypt_inout_detached(&used.into(), aad, buf.into()),
+        }
+        .map_err(|e| VlessError::Other(format!("AEAD seal failed: {e}")))?;
+        let mut out = [0u8; TAG_LEN];
+        out.copy_from_slice(tag.as_slice());
+        Ok(out)
+    }
+
+    /// 原地解密（数据面热路径）：`buf` = 密文 || tag，认证成功后截断为明文。
+    ///
+    /// 对应 Go `AEAD.Open` 的池化 in-place 形态；nonce 语义与 [`Aead::open`]
+    /// 一致（`None` 时先 IncreaseNonce），但全程零堆分配。
+    ///
+    /// # Errors
+    /// 解密失败（密文损坏 / nonce 不匹配 / tag 校验失败）返回 [`VlessError::Other`]。
+    pub fn open_in_place(
+        &mut self,
+        nonce: Option<&[u8; NONCE_LEN]>,
+        buf: &mut Vec<u8>,
+        aad: &[u8],
+    ) -> Result<()> {
+        let used: [u8; NONCE_LEN] = match nonce {
+            Some(n) => *n,
+            None => {
+                self.increase_nonce();
+                self.nonce
+            }
+        };
+        match &self.kind {
+            AeadKind::Aes(a) => a.decrypt_in_place(&used.into(), aad, buf),
+            AeadKind::ChaCha(c) => c.decrypt_in_place(&used.into(), aad, buf),
+        }
+        .map_err(|e| VlessError::Other(format!("AEAD open failed: {e}")))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -245,5 +306,53 @@ mod tests {
         let mut ct = Vec::new();
         a.seal(&mut ct, None, b"compat", b"").unwrap();
         assert!(!ct.is_empty());
+    }
+
+    /// in-place 数据面 API round-trip：seal_in_place → open_in_place 字节级等价，
+    /// nonce 递增序列与 seal/open 一致。
+    #[test]
+    fn in_place_round_trip() {
+        for use_aes in [true, false] {
+            let mut a = Aead::new(b"ctx", b"k", use_aes);
+            let mut b = Aead::new(b"ctx", b"k", use_aes);
+            let mut buf = b"hello in-place".to_vec();
+            let tag = a.seal_in_place(None, &mut buf, b"aad").unwrap();
+            buf.extend_from_slice(&tag);
+            b.open_in_place(None, &mut buf, b"aad").unwrap();
+            assert_eq!(buf, b"hello in-place");
+            // 双端 nonce 同步递增到 1（首用递增语义对齐 Go）
+            let mut expect = [0u8; NONCE_LEN];
+            expect[NONCE_LEN - 1] = 1;
+            assert_eq!(a.nonce, expect);
+            assert_eq!(b.nonce, expect);
+        }
+    }
+
+    /// open_in_place 拒绝篡改密文。
+    #[test]
+    fn open_in_place_rejects_tampered() {
+        let mut a = Aead::new(b"ctx", b"k", true);
+        let mut b = Aead::new(b"ctx", b"k", true);
+        let mut buf = b"payload".to_vec();
+        let tag = a.seal_in_place(None, &mut buf, b"").unwrap();
+        buf.extend_from_slice(&tag);
+        buf[0] ^= 0x01;
+        assert!(b.open_in_place(None, &mut buf, b"").is_err());
+    }
+
+    /// in-place 与追加式 seal 产出相同密文（同一 nonce 显式指定时逐字节一致）。
+    #[test]
+    fn in_place_matches_appending_form() {
+        let nonce = [7u8; NONCE_LEN];
+        let mut a = Aead::new(b"ctx", b"k", true);
+        let mut b = Aead::new(b"ctx", b"k", true);
+
+        let mut appended = Vec::new();
+        a.seal(&mut appended, Some(&nonce), b"same bytes", b"h").unwrap();
+
+        let mut inplace = b"same bytes".to_vec();
+        let tag = b.seal_in_place(Some(&nonce), &mut inplace, b"h").unwrap();
+        inplace.extend_from_slice(&tag);
+        assert_eq!(appended, inplace);
     }
 }
