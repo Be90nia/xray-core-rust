@@ -139,6 +139,7 @@ async fn hysteria_quic_loopback_dial_auth_bidi_roundtrip() {
             MasqType::NotFound,
             validator,
             on_new_conn,
+            None,
         )
         .await
         .expect("factory listen should succeed");
@@ -176,6 +177,166 @@ async fn hysteria_quic_loopback_dial_auth_bidi_roundtrip() {
         .expect("server should receive framed request")
         .expect("channel not empty");
     assert_eq!(addr, "127.0.0.1:1");
+    let _ = listener.close().await;
+}
+
+/// UDP relay 数据面端到端（对应 Go server udpSessionManager → proxy UDP 分支）。
+///
+/// 真实 HysteriaClient::udp() 上行标准 wire（[4B session id BE][UdpMessage]）→
+/// server feed 路径按 id 建 session → on_new_udp_session 回调 → server 读（剥信封）→
+/// 分片重组 → echo 回写（InterConn::write 注入信封经 send_datagram）→ client 收回包。
+#[tokio::test]
+async fn hysteria_quic_loopback_udp_relay_roundtrip() {
+    use xray_proxy_hysteria::protocol::{Defragger, UdpMessage};
+    use xray_transport_hysteria::conn::InterConn;
+
+    ensure_crypto_provider();
+
+    let (cert_chain, key_der) = self_signed();
+    let server_tls = rustls::server::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, key_der)
+        .unwrap();
+    let factory = QuinnListenerFactory::new(Arc::new(server_tls));
+    let proto_cfg = Arc::new(ProtoConfig::default());
+    let quic_params = Arc::new(xray_proto::xray::transport::internet::QuicParams::default());
+    let validator: Option<Arc<dyn AuthValidator>> = Some(Arc::new(TestValidator));
+
+    let (udp_tx, mut udp_rx) = mpsc::unbounded_channel::<Arc<InterConn>>();
+    let on_new_udp: Arc<dyn Fn(Arc<InterConn>) + Send + Sync> = Arc::new(move |server_sess| {
+        let udp_tx = udp_tx.clone();
+        tokio::spawn(async move {
+            let _ = udp_tx.send(server_sess);
+        });
+    });
+    let on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync> = Arc::new(|_| {});
+
+    let listener = factory
+        .listen(
+            "127.0.0.1:0".parse().unwrap(),
+            proto_cfg,
+            quic_params,
+            MasqType::NotFound,
+            validator,
+            on_new_conn,
+            Some(on_new_udp),
+        )
+        .await
+        .expect("factory listen should succeed");
+    let server_addr: SocketAddr = listener.local_addr();
+
+    let client_tls = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerifier))
+        .with_no_client_auth();
+    let transport = Arc::new(
+        QuinnHysteriaTransport::new(client_tls, "0.0.0.0:0".parse().unwrap())
+            .expect("transport"),
+    );
+    let dest = DialDestination {
+        udp_addr: server_addr,
+        host: "localhost".into(),
+    };
+    let client_cfg = {
+        // 协议默认（Go RegisterProtocolConfigCreator：udp_idle_timeout=60）起步，
+        // prost Config::default() 的 0 在 Go 语义下 = 立即空闲超时
+        let mut c = xray_transport_hysteria::proto_config::default_config();
+        c.auth = "test-secret".into();
+        c
+    };
+    let client = HysteriaClient::new(
+        dest,
+        Arc::new(client_cfg),
+        Arc::new(xray_proto::xray::transport::internet::QuicParams::default()),
+        transport,
+    );
+    let client_sess = client.udp().await.expect("client udp session");
+
+    // 上行#1：单包。serialize 剥 4B session_id 字段 → InterConn::write 注入真实 id 信封。
+    let msg = UdpMessage {
+        session_id: 0,
+        packet_id: 0,
+        frag_id: 0,
+        frag_count: 1,
+        addr: "8.8.8.8:53".into(),
+        data: b"ping".to_vec(),
+    };
+    let mut wire = vec![0u8; msg.size()];
+    let n = msg.serialize(&mut wire);
+    assert_eq!(n, wire.len());
+    client_sess.write(&wire[4..n]).await.expect("client up write");
+
+    let server_sess = tokio::time::timeout(Duration::from_secs(10), udp_rx.recv())
+        .await
+        .expect("server should create udp session on first datagram")
+        .expect("channel not empty");
+    // server session id 来自 wire 前 4B（hysteria2 标准：session id 由发送方分配）
+    assert_eq!(server_sess.id(), client_sess.id(), "session id from wire header");
+
+    let mut buf = vec![0u8; 65535];
+    let rn = tokio::time::timeout(Duration::from_secs(10), server_sess.read(&mut buf))
+        .await
+        .expect("server read up")
+        .expect("server read ok");
+    // feed 剥了 4B 信封 → 补哑元对齐 8B 头布局
+    let mut full = Vec::with_capacity(4 + rn);
+    full.extend_from_slice(&[0u8; 4]);
+    full.extend_from_slice(&buf[..rn]);
+    let up = UdpMessage::parse(&full).expect("server parse up");
+    assert_eq!(up.addr, "8.8.8.8:53");
+    assert_eq!(up.data, b"ping");
+
+    // 回包：server echo（serialize 剥 4B → write 注入 server 侧信封）
+    let mut back_wire = vec![0u8; up.size()];
+    let bn = up.serialize(&mut back_wire);
+    server_sess.write(&back_wire[4..bn]).await.expect("server down write");
+
+    let dn = tokio::time::timeout(Duration::from_secs(10), client_sess.read(&mut buf))
+        .await
+        .expect("client read down")
+        .expect("client read ok");
+    let mut full2 = Vec::with_capacity(4 + dn);
+    full2.extend_from_slice(&[0u8; 4]);
+    full2.extend_from_slice(&buf[..dn]);
+    let back = UdpMessage::parse(&full2).expect("client parse down");
+    assert_eq!(back.addr, "8.8.8.8:53");
+    assert_eq!(back.data, b"ping");
+
+    // 上行#2：分片（frag_count=2）→ server 侧 Defragger 重组
+    let dfmsg = UdpMessage {
+        session_id: 0,
+        packet_id: 42,
+        frag_id: 0,
+        frag_count: 1,
+        addr: "1.1.1.1:443".into(),
+        data: vec![0x5Au8; 900],
+    };
+    let frags = xray_proxy_hysteria::protocol::frag_udp_message(&dfmsg, 512);
+    assert_eq!(frags.len(), 2, "should split into 2 fragments");
+    for f in &frags {
+        let mut fw = vec![0u8; f.size()];
+        let fn_ = f.serialize(&mut fw);
+        client_sess.write(&fw[4..fn_]).await.expect("frag write");
+    }
+    let mut server_df = Defragger::new();
+    let mut defragged = None;
+    for _ in 0..2 {
+        let fn2 = tokio::time::timeout(Duration::from_secs(10), server_sess.read(&mut buf))
+            .await
+            .expect("server read frag")
+            .expect("server read ok");
+        let mut full3 = Vec::with_capacity(4 + fn2);
+        full3.extend_from_slice(&[0u8; 4]);
+        full3.extend_from_slice(&buf[..fn2]);
+        let m = UdpMessage::parse(&full3).expect("server parse frag");
+        if let Some(done) = server_df.feed(&m) {
+            defragged = Some(done);
+        }
+    }
+    let done = defragged.expect("fragments reassembled");
+    assert_eq!(done.addr, "1.1.1.1:443");
+    assert_eq!(done.data, vec![0x5Au8; 900]);
+
     let _ = listener.close().await;
 }
 
