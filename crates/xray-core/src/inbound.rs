@@ -3003,7 +3003,11 @@ fn ss_cipher_from_str(s: &str) -> Option<SsCipherType> {
 /// 从 inbound entry.data（JSON）解析 hysteria inbound 配置。
 ///
 /// 返回 (HysteriaConfig, HysteriaListenerFactory)。
-/// JSON 格式：`{"auth":"...","server_name":"..."}`。
+/// JSON 格式：`{"version":2,"auth":"...","server_name":"..."}`。
+///
+/// `version` 字段对齐 Go `infra/conf/hysteria.go:39-48`：`version != 2` 直接报错
+/// （Go 端 `errors.New("version != 2")`）——Rust 端静默忽略会接受 v1 配置但走 v2
+/// 实现（连接握手/UDP 帧结构差异），互操作必坏。读取时强制 v2。
 fn parse_hysteria_inbound_config(
     data: &[u8],
     bind_addr: std::net::SocketAddr,
@@ -3011,16 +3015,28 @@ fn parse_hysteria_inbound_config(
 ) -> std::io::Result<(xray_proxy_hysteria::HysteriaConfig, Arc<dyn xray_transport_hysteria::hub::HysteriaListenerFactory>)> {
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("hysteria inbound settings JSON: {e}")))?;
+    // 强制 version == 2（Go 端 hysteria.go:46-48 行为镜像；缺省 = 2）
+    if let Some(ver) = v.get("version").and_then(|x| x.as_i64()) {
+        if ver != 2 {
+            return Err(std::io::Error::other(format!(
+                "hysteria version {ver} not supported (only version 2)"
+            )));
+        }
+    }
     let auth = v.get("auth").and_then(|x| x.as_str()).unwrap_or("").to_string();
     let server_name = v.get("server_name").and_then(|x| x.as_str()).unwrap_or("hysteria").to_string();
-    let config = xray_proxy_hysteria::HysteriaConfig::new(bind_addr.to_string(), auth)
-        .with_server_name(server_name);
     // 真实 quinn server adapter：自签证书（或配置 cert/key PEM），ALPN h3 由 listen() 设置
     let _ = rustls::crypto::ring::default_provider().install_default();
     let server_config = build_hysteria_tls_server_config(&v)?;
     // streamSettings.finalmask.quicParams → HysteriaConfig（brutal/CC/windows/keepAlive）
     let quic_params = xray_transport_hysteria::quic_params::parse_quic_params(finalmask_json)?
         .unwrap_or_else(xray_transport_hysteria::quic_params::default_hysteria_quic_params);
+    // 构造 inbound HysteriaConfig：server_addr = bind_addr（监听点）；
+    // server_name 在 v 缺省时用 hysteria 默认（= server_addr 的 host 段）。
+    let mut config = xray_proxy_hysteria::HysteriaConfig::new(bind_addr.to_string(), auth);
+    if !server_name.is_empty() && server_name != "hysteria" {
+        config = config.with_server_name(server_name);
+    }
     let config = config.with_quic_params(quic_params);
     // masquerade 嵌套对象（Go infra/conf transport_internet.go:498-549）：展开到
     // proto 扁平字段再 MasqType::from_config（Go hub.go:210-254 同构）

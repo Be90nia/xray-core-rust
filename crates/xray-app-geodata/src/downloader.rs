@@ -4,12 +4,12 @@
 //! HTTP fetch 与 dispatcher dial 全部留 trait 注入，避免绑定 hyper/reqwest。
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::config::GeodataAsset;
 use crate::error::GeodataError;
 use crate::swap::{Stage, Tx, clean, swap_all};
 
-/// 下载一个 asset 到本地 stage（temp 文件），返回 Stage。
 ///
 /// 对应 Go `downloader.downloadOne`。
 pub trait AssetDownloader: Send + Sync {
@@ -224,183 +224,76 @@ impl AssetDownloader for RealAssetDownloader {
     ) -> Result<(), GeodataError> {
         let parsed = self.parse_url(url)?;
 
-        if parsed.scheme == "https" {
-            // ponytail: HTTPS 暂未实现（TLS 握手需要外部 crate）。
-            // 上层可注入自己的 https-capable downloader 替换；不偷偷 fallback。
-            return Err(GeodataError::DownloadFailed {
-                url: url.to_string(),
-                reason: "https not supported by RealAssetDownloader; inject https-capable downloader".into(),
-            });
-        }
-
         use std::io::{Read, Write};
         use std::net::TcpStream;
         use std::time::Instant;
 
         let addr = format!("{}:{}", parsed.host, parsed.port);
-        let mut stream = TcpStream::connect(&addr).map_err(|e| {
+        let mut tcp = TcpStream::connect(&addr).map_err(|e| {
             GeodataError::DownloadFailed {
                 url: url.to_string(),
                 reason: format!("connect {addr}: {e}"),
             }
         })?;
-
-        stream.set_read_timeout(Some(self.timeout)).map_err(|e| {
+        tcp.set_read_timeout(Some(self.timeout)).map_err(|e| {
             GeodataError::DownloadFailed {
                 url: url.to_string(),
                 reason: format!("set_read_timeout: {e}"),
             }
         })?;
-        stream.set_write_timeout(Some(self.timeout)).map_err(|e| {
+        tcp.set_write_timeout(Some(self.timeout)).map_err(|e| {
             GeodataError::DownloadFailed {
                 url: url.to_string(),
                 reason: format!("set_write_timeout: {e}"),
             }
         })?;
 
-        // HTTP/1.1 GET，Connection: close 让 server 关连接终止 body。
         let req = format!(
             "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: xray-rust/0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n",
             path = parsed.path,
             host = parsed.host,
         );
-        stream.write_all(req.as_bytes()).map_err(|e| {
-            GeodataError::DownloadFailed {
-                url: url.to_string(),
-                reason: format!("write request: {e}"),
-            }
-        })?;
-
-        // 读 headers 到 \r\n\r\n。
-        let mut header_buf = Vec::with_capacity(512);
-        let mut byte = [0u8; 1];
-        let deadline = Instant::now() + self.timeout;
-        loop {
-            if Instant::now() > deadline {
-                return Err(GeodataError::IdleTimeout);
-            }
-            match stream.read(&mut byte) {
-                Ok(0) => break,
-                Ok(_) => {
-                    header_buf.push(byte[0]);
-                    if header_buf.ends_with(b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    return Err(GeodataError::IdleTimeout);
-                }
-                Err(e) => {
-                    return Err(GeodataError::DownloadFailed {
+        if parsed.scheme == "https" {
+            // pn8e: https 路径。rustls::Stream 仅借用 &mut conn + &mut tcp，故
+            // ClientConnection 须在 caller 栈上持有以延长 Stream 借用生命周期；
+            // https_handshake 内部用 `*conn = ClientConnection::new(...)` 重赋值。
+            // 用 ServerName::try_from 提前一次解析（失败也走同样错路径）。
+            let mut conn = rustls::ClientConnection::new(
+                Arc::new(
+                    rustls::ClientConfig::builder()
+                        .with_root_certificates(rustls::RootCertStore::empty())
+                        .with_no_client_auth(),
+                ),
+                rustls::pki_types::ServerName::try_from(parsed.host.clone()).map_err(|e| {
+                    GeodataError::DownloadFailed {
                         url: url.to_string(),
-                        reason: format!("read header: {e}"),
-                    });
-                }
-            }
-        }
-
-        let header_str = std::str::from_utf8(&header_buf).map_err(|e| {
-            GeodataError::DownloadFailed {
+                        reason: format!("invalid server name for SNI: {e}"),
+                    }
+                })?,
+            )
+            .map_err(|e| GeodataError::DownloadFailed {
                 url: url.to_string(),
-                reason: format!("invalid header utf-8: {e}"),
-            }
-        })?;
-
-        let mut lines = header_str.split("\r\n");
-        let status_line = lines.next().unwrap_or("");
-        // 解析 "HTTP/1.1 200 OK"
-        let mut status_parts = status_line.split_whitespace();
-        let _http_ver = status_parts.next();
-        let status_code: u16 = status_parts
-            .next()
-            .and_then(|s| s.parse().ok())
-            .ok_or_else(|| GeodataError::DownloadFailed {
-                url: url.to_string(),
-                reason: format!("invalid status line: {status_line}"),
+                reason: format!(
+                    "rustls ClientConnection (initial; will be overwritten by https_handshake): {e}"
+                ),
             })?;
-
-        // Content-Length（用于收齐 body 边界；缺则按 connection close 读到 EOF）
-        let mut content_length: Option<usize> = None;
-        for line in lines {
-            if line.is_empty() {
-                break;
-            }
-            if let Some((k, v)) = line.split_once(':') {
-                if k.trim().eq_ignore_ascii_case("content-length") {
-                    content_length = v.trim().parse().ok();
+            let mut tls = https_handshake(&mut conn, &mut tcp, &parsed.host, self.timeout)?;
+            tls.write_all(req.as_bytes()).map_err(|e| {
+                GeodataError::DownloadFailed {
+                    url: url.to_string(),
+                    reason: format!("write request (tls): {e}"),
                 }
-            }
-        }
-
-        if !(200..300).contains(&status_code) {
-            return Err(GeodataError::UnexpectedStatus(status_code));
-        }
-
-        // 把 body 写到 temp 文件
-        let mut out = std::fs::File::create(temp_path).map_err(|e| {
-            GeodataError::DownloadFailed {
-                url: url.to_string(),
-                reason: format!("create temp file: {e}"),
-            }
-        })?;
-
-        let mut total: usize = 0;
-        if let Some(len) = content_length {
-            let mut remaining = len;
-            let mut chunk = vec![0u8; 8192.min(len)];
-            while remaining > 0 {
-                let to_read = chunk.len().min(remaining);
-                match stream.read(&mut chunk[..to_read]) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        out.write_all(&chunk[..n])?;
-                        remaining -= n;
-                        total += n;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                    {
-                        return Err(GeodataError::IdleTimeout);
-                    }
-                    Err(e) => {
-                        return Err(GeodataError::DownloadFailed {
-                            url: url.to_string(),
-                            reason: format!("read body: {e}"),
-                        });
-                    }
-                }
-            }
+            })?;
+            read_http_body(tls, url, temp_path, Instant::now() + self.timeout)
         } else {
-            // 无 Content-Length：读到 EOF
-            let mut chunk = [0u8; 8192];
-            loop {
-                match stream.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        out.write_all(&chunk[..n])?;
-                        total += n;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                    {
-                        break;
-                    }
-                    Err(e) => {
-                        return Err(GeodataError::DownloadFailed {
-                            url: url.to_string(),
-                            reason: format!("read body: {e}"),
-                        });
-                    }
+            tcp.write_all(req.as_bytes()).map_err(|e| {
+                GeodataError::DownloadFailed {
+                    url: url.to_string(),
+                    reason: format!("write request: {e}"),
                 }
-            }
+            })?;
+            read_http_body(tcp, url, temp_path, Instant::now() + self.timeout)
         }
-
-        if total == 0 {
-            return Err(GeodataError::EmptyResponse(url.to_string()));
-        }
-        Ok(())
     }
 
     fn resolve_target(&self, file: &str) -> Result<PathBuf, GeodataError> {
@@ -410,6 +303,216 @@ impl AssetDownloader for RealAssetDownloader {
         Ok(self.asset_dir.join(file))
     }
 }
+/// 共享 HTTP/1.1 响应解析与 body 落盘逻辑。
+///
+/// 接收任意 `R: Read`：裸 TCP（http） 或 `rustls::Stream<...>`（https）。
+/// 解析状态行 + Content-Length，按协议规定读取 body 到 `temp_path`。
+fn read_http_body<R: std::io::Read>(
+    mut stream: R,
+    url: &str,
+    temp_path: &std::path::Path,
+    deadline: std::time::Instant,
+) -> Result<(), GeodataError> {
+    use std::io::Read;
+    use std::io::Write;
+
+    // 读 headers 到 \r\n\r\n。
+    let mut header_buf = Vec::with_capacity(512);
+    let mut byte = [0u8; 1];
+    loop {
+        if std::time::Instant::now() > deadline {
+            return Err(GeodataError::IdleTimeout);
+        }
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => {
+                header_buf.push(byte[0]);
+                if header_buf.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return Err(GeodataError::IdleTimeout);
+            }
+            Err(e) => {
+                return Err(GeodataError::DownloadFailed {
+                    url: url.to_string(),
+                    reason: format!("read header: {e}"),
+                });
+            }
+        }
+    }
+
+    let header_str = std::str::from_utf8(&header_buf).map_err(|e| {
+        GeodataError::DownloadFailed {
+            url: url.to_string(),
+            reason: format!("invalid header utf-8: {e}"),
+        }
+    })?;
+
+    let mut lines = header_str.split("\r\n");
+    let status_line = lines.next().unwrap_or("");
+    let mut status_parts = status_line.split_whitespace();
+    let _http_ver = status_parts.next();
+    let status_code: u16 = status_parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| GeodataError::DownloadFailed {
+            url: url.to_string(),
+            reason: format!("invalid status line: {status_line}"),
+        })?;
+
+    let mut content_length: Option<usize> = None;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("content-length") {
+                content_length = v.trim().parse().ok();
+            }
+        }
+    }
+
+    if !(200..300).contains(&status_code) {
+        return Err(GeodataError::UnexpectedStatus(status_code));
+    }
+
+    let mut out = std::fs::File::create(temp_path).map_err(|e| {
+        GeodataError::DownloadFailed {
+            url: url.to_string(),
+            reason: format!("create temp file: {e}"),
+        }
+    })?;
+
+    let mut total: usize = 0;
+    if let Some(len) = content_length {
+        let mut remaining = len;
+        let mut chunk = vec![0u8; 8192.min(len)];
+        while remaining > 0 {
+            let to_read = chunk.len().min(remaining);
+            match stream.read(&mut chunk[..to_read]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    out.write_all(&chunk[..n])?;
+                    remaining -= n;
+                    total += n;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    return Err(GeodataError::IdleTimeout);
+                }
+                Err(e) => {
+                    return Err(GeodataError::DownloadFailed {
+                        url: url.to_string(),
+                        reason: format!("read body: {e}"),
+                    });
+                }
+            }
+        }
+    } else {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    out.write_all(&chunk[..n])?;
+                    total += n;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    break;
+                }
+                Err(e) => {
+                    return Err(GeodataError::DownloadFailed {
+                        url: url.to_string(),
+                        reason: format!("read body: {e}"),
+                    });
+                }
+            }
+        }
+    }
+
+    if total == 0 {
+        return Err(GeodataError::EmptyResponse(url.to_string()));
+    }
+    Ok(())
+}
+
+/// rustls 0.23 同步 TLS 握手：吃 std TCP，包成 `rustls::Stream<ClientConnection, TcpStream>`。
+///
+/// 使用 webpki-roots 默认信任根（覆盖 GitHub 等常规 https 源）。SNI 取 host。
+/// 握手循环到 `is_handshaking=false` 为止（rustls 0.23 同步 API）。
+/// rustls 0.23 同步 TLS 握手：构造 ClientConnection + 同步握手 + 返回借用 conn/tcp 的 Stream。
+///
+/// lifetime 约束：caller 在 `https_handshake` 同一 scope 内持有 `conn`（栈上），
+/// `tcp` 来自 caller 拥有的 TcpStream（也需 caller 在 stream 使用期间存活）。
+/// 返回的 Stream 借用两者，caller 在该 scope 内消费完毕后 conn/tcp 顺序 drop。
+///
+/// 使用 webpki-roots 默认信任根（覆盖 GitHub 等常规 https 源）。SNI 取 host。
+fn https_handshake<'a>(
+    conn: &'a mut rustls::ClientConnection,
+    tcp: &'a mut std::net::TcpStream,
+    host: &str,
+    timeout: std::time::Duration,
+) -> Result<rustls::Stream<'a, rustls::ClientConnection, std::net::TcpStream>, GeodataError> {
+    use rustls::pki_types::ServerName;
+    use rustls::ClientConfig;
+    use std::io::Read;
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let server_name = ServerName::try_from(host.to_string()).map_err(|e| {
+        GeodataError::DownloadFailed {
+            url: host.to_string(),
+            reason: format!("invalid server name for SNI: {e}"),
+        }
+    })?;
+    *conn = rustls::ClientConnection::new(config, server_name).map_err(|e| {
+        GeodataError::DownloadFailed {
+            url: host.to_string(),
+            reason: format!("rustls ClientConnection::new: {e}"),
+        }
+    })?;
+
+    let deadline = std::time::Instant::now() + timeout;
+    let mut scratch = [0u8; 0];
+    while conn.is_handshaking() {
+        if std::time::Instant::now() > deadline {
+            return Err(GeodataError::IdleTimeout);
+        }
+        // 每次循环短命 Stream 让 borrow checker 通过。
+        let mut tls = rustls::Stream::new(&mut *conn, &mut *tcp);
+        match tls.read(&mut scratch) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => {
+                return Err(GeodataError::DownloadFailed {
+                    url: host.to_string(),
+                    reason: format!("rustls handshake: {e}"),
+                });
+            }
+        }
+    }
+
+    Ok(rustls::Stream::new(&mut *conn, &mut *tcp))
+}
+
 
 
 /// `GeodataReloader` 实现：调用全局 IP + 域名注册表的 reload。

@@ -52,10 +52,18 @@ pub async fn dial(dest: &Destination, settings: &StreamSettings) -> io::Result<B
         )
     })?;
 
-    // 2. DNS 解析（quinn 需 SocketAddr，不做域名解析）。
+    // fhsf：拨号外层 timeout 包装。quinn connect 内部超时仅握手阶段；DNS 解析 hang /
+    // 黑洞下 `connect_with(...).await` 永不返回——必须外层 tokio::time::timeout 兜底。
+    // 对齐 hysteria crate QuinnHysteriaTransport::dial_and_authenticate（同样包装）。
+    let dial_timeout = std::time::Duration::from_secs(16);
     let addr_str = format!("{}:{}", dest.address(), dest.port().value());
-    let socket_addr = tokio::net::lookup_host(&addr_str)
-        .await?
+    let socket_addr = tokio::time::timeout(dial_timeout, tokio::net::lookup_host(&addr_str))
+        .await
+        .map_err(|_| io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("quic DNS lookup timeout for {addr_str}"),
+        ))?
+        .map_err(|e| io::Error::other(format!("quic DNS resolution: {e}")))?
         .next()
         .ok_or_else(|| io::Error::other(format!("DNS resolution returned no addr for {addr_str}")))?;
 
@@ -67,13 +75,18 @@ pub async fn dial(dest: &Destination, settings: &StreamSettings) -> io::Result<B
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client));
     client_config.transport_config(Arc::new(qc.build_transport_config()));
 
-    // 4. Endpoint + connect。
+    // 4. Endpoint + connect（外层 timeout 覆盖 DNS+握手+鉴权整段）
     let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
         .map_err(|e| io::Error::other(format!("quinn bind: {e}")))?;
-    let conn = endpoint
+    let connecting = endpoint
         .connect_with(client_config, socket_addr, &sni)
-        .map_err(|e| io::Error::other(format!("quinn connect: {e}")))?
+        .map_err(|e| io::Error::other(format!("quinn connect initiate: {e}")))?;
+    let conn = tokio::time::timeout(dial_timeout, connecting)
         .await
+        .map_err(|_| io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("quic handshake timeout after {dial_timeout:?}"),
+        ))?
         .map_err(|e| io::Error::other(format!("quinn handshake: {e}")))?;
 
     let local = endpoint.local_addr().ok();

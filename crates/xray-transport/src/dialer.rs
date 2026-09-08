@@ -236,8 +236,26 @@ impl StreamSettings {
         if let Some(v) = obj.get("dialerProxy").and_then(|v| v.as_str()) {
             opts.dialer_proxy = v.to_string();
         }
+        // sockopt.interface → bind_if_index（Go `SocketConfig.Interface` 字段 21，
+        // JSON 键 `interface`/`Interface`，infra/conf/transport_sockopt.go:51；
+        // Go 各平台 apply*SocketOptions 通过 net.InterfaceByName 解析为 interface index
+        // 后填到 IP_BOUND_IF/SO_BINDTODEVICE/IP_UNICAST_IF 等 setsockopt。Rust 端
+        // 提前在 JSON 解析阶段做 name→index 解析，失败时 warn 并保留 bind_if_index=0
+        // 行为对齐 Go `errors.New("failed to get interface ...") -> 返回错` 的宽容
+        // 形态：返回的 Result 让调用方决定 warn 还是硬错；此处降级为 warn+忽略。
+        if let Some(v) = obj.get("interface").and_then(|v| v.as_str()) {
+            use crate::sockopt::resolve_interface_index;
+            match resolve_interface_index(v) {
+                Ok(idx) => opts.bind_if_index = idx,
+                Err(e) => tracing::warn!(
+                    target: "xray_transport",
+                    interface = v,
+                    error = %e,
+                    "failed to resolve interface name to index (Go sockopt rejects); ignoring sockopt.interface"
+                ),
+            }
+        }
         // Happy Eyeballs（bd 0ko，Go `SocketConfig.HappyEyeballs`）。
-        // 缺省字段取 Go UnmarshalJSON 缺省值（transport_internet.go:1021）。
         if let Some(he) = obj.get("happyEyeballs").and_then(|v| v.as_object()) {
             let mut cfg = HappyEyeballsConfig::default();
             if let Some(v) = he.get("prioritizeIPv6").and_then(|v| v.as_bool()) {
@@ -361,6 +379,7 @@ fn protocol_settings_key(protocol: &str) -> Option<&'static str> {
         "httpupgrade" => Some("httpupgradeSettings"),
         "splithttp" | "xhttp" => Some("splithttpSettings"),
         "quic" => Some("quicSettings"),
+        "hysteria" | "hysteria2" => Some("hysteriaSettings"),
         "domainsocket" => Some("dsSettings"),
         _ => None,
     }

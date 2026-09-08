@@ -148,10 +148,30 @@ impl IncrementalWorkerPicker {
     /// 内部选择逻辑：查找可用 Worker 或创建新 Worker。
     ///
     /// 对应 Go 版本 `pickInternal`。
+    ///
+    /// 防止 `drop(workers) → factory.create() → re-acquire` 期间的并发穿透：
+    /// 重新加锁后必须二次检查 find_available，否则 N 个并发任务会
+    /// 创建 N 个 Worker 而非共享 1 个（Go 源码也是同一约束，靠 mutex 串行化）。
     pub async fn pick_internal(&self) -> Option<Arc<ClientWorker>> {
-        let mut workers = self.workers.lock().await;
+        // 第一次加锁：找可用 Worker；找不到时 drop 锁再创建（避免长 factory.create 持锁）。
+        {
+            let mut workers = self.workers.lock().await;
+            if let Some(idx) = Self::find_available(&workers) {
+                let len = workers.len();
+                if idx != len - 1 {
+                    workers.swap(idx, len - 1);
+                }
+                return Some(workers[len - 1].clone());
+            }
+            // 清理已关闭的 Worker
+            workers.retain(|w| !w.is_closed());
+        } // 锁在这里 drop
 
-        // 查找可用 Worker（非 Full、非 Closed）
+        // 锁外创建（factory.create 可能耗时：DNS / TCP 拨号）。
+        let worker = self.factory.create().await;
+        let mut workers = self.workers.lock().await;
+        // 二次检查：并发穿透保护——其他任务可能在我们创建期间也
+        // 创建了 worker 并 push 进列表；此刻优先复用现有可用 worker。
         if let Some(idx) = Self::find_available(&workers) {
             let len = workers.len();
             if idx != len - 1 {
@@ -159,14 +179,7 @@ impl IncrementalWorkerPicker {
             }
             return Some(workers[len - 1].clone());
         }
-
-        // 清理已关闭的 Worker
-        workers.retain(|w| !w.is_closed());
-        drop(workers);
-
-        // 创建新 Worker
-        let worker = self.factory.create().await;
-        let mut workers = self.workers.lock().await;
+        // 真的没有可用 worker → push 本次创建的结果
         workers.push(worker.clone());
 
         // 首次创建 Worker 时标记清理已启动
@@ -875,6 +888,61 @@ mod tests {
         let worker = picker.pick_internal().await;
         assert!(worker.is_some());
         assert_eq!(picker.worker_count().await, 1);
+    }
+
+    /// 慢 factory：create 期间人为通知+等待——让并发 pick_internal 有窗口期
+    /// 进入 race 区域，验证二次检查生效。Notify 不可 clone，外层用 Arc 包装。
+    struct SlowFactory {
+        strategy: ClientStrategy,
+        create_started: Arc<tokio::sync::Notify>,
+        create_can_finish: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait::async_trait]
+    impl ClientWorkerFactory for SlowFactory {
+        async fn create(&self) -> Arc<ClientWorker> {
+            self.create_started.notify_waiters();
+            self.create_can_finish.notified().await;
+            DialingWorkerFactory::new(Arc::new(NopUnderlying), self.strategy.clone())
+                .create()
+                .await
+        }
+    }
+
+    /// 并发 pick_internal：N 个 task 同时调，期望 worker_count 远小于 N
+    /// （无二次检查 = N 个 worker，无 race 防护 = N；二次检查生效 = 1-2）。
+    #[tokio::test]
+    async fn test_incremental_picker_concurrent_pick_does_not_penetrate() {
+        let strategy = ClientStrategy::default();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let can_finish = Arc::new(tokio::sync::Notify::new());
+        let factory: Arc<dyn ClientWorkerFactory> = Arc::new(SlowFactory {
+            strategy,
+            create_started: Arc::clone(&started),
+            create_can_finish: Arc::clone(&can_finish),
+        });
+        let picker = Arc::new(IncrementalWorkerPicker::new(factory));
+
+        const N: usize = 4;
+        let mut handles = Vec::new();
+        for _ in 0..N {
+            let picker = Arc::clone(&picker);
+            handles.push(tokio::spawn(async move {
+                let _ = picker.pick_internal().await;
+            }));
+        }
+
+        // 等一小段时间让 N 个 task 全部阻塞在 SlowFactory::create 内。
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        can_finish.notify_waiters();
+        for h in handles {
+            let _ = h.await;
+        }
+        let count = picker.worker_count().await;
+        assert!(
+            count <= 2,
+            "concurrent pick_internal must not create > 2 workers (N={N}, got {count})"
+        );
+        assert!(count >= 1, "must have created at least 1 worker");
     }
 
     #[test]

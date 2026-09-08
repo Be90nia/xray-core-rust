@@ -5644,8 +5644,11 @@ version = "0.1.0"
 dependencies = [
  "parking_lot",
  "prost",
+ "rustls",
+ "rustls-pki-types",
  "thiserror 2.0.18",
  "tracing",
+ "webpki-roots 1.0.8",
  "xray-common",
  "xray-features",
  "xray-geodata",

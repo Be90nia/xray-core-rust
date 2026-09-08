@@ -172,16 +172,45 @@ pub struct VersionConfig {
     pub max: Option<String>,
 }
 
-/// Geodata 加载配置。
+/// Geodata 加载配置。对应 Go `infra/conf.GeodataConfig`（geodata.go:42-46）。
+///
+/// Go 字段：
+/// ```text
+/// type GeodataConfig struct {
+///     Cron     *string               `json:"cron"`
+///     Outbound string                `json:"outbound"`
+///     Assets   []*GeodataAssetConfig `json:"assets"`
+/// }
+/// ```
+///
+/// Rust 端 `assets` 序列化为对象数组（url/file），由装配层送入
+/// `xray_app_geodata::instance::GeodataConfig`（register.rs:691-703）。
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct GeodataConfig {
-    /// 国家代码匹配器（`regex` / `domain` / `ip`）。
+    /// 定时表达式（标准 cron 5 段格式；非空时按表达式自动 reload）。
+    /// 对应 Go `Cron *string`（geodata.go:43）；Rust 端为可空字符串，
+    /// 空 / 缺省 = 仅手动 reload，调度器不启动。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<String>,
-    /// 数据目录。
+    pub cron: Option<String>,
+    /// 用于下载 assets 的 outbound tag。对应 Go `Outbound string`（geodata.go:44）。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub dir: Option<String>,
+    pub outbound: Option<String>,
+    /// 待加载/定时更新的资源列表。对应 Go `Assets []*GeodataAssetConfig`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assets: Option<Vec<GeodataAssetConfig>>,
+}
+
+/// 单个 geodata 资源。对应 Go `infra/conf.GeodataAssetConfig`（geodata.go:13-16）。
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GeodataAssetConfig {
+    /// 下载 URL（http/https）。对应 Go `URL string`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// 本地文件名（`asset_dir` 下）。对应 Go `File string`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
 }
 
 /// API 配置。
@@ -344,5 +373,42 @@ mod tests {
         let out = serde_json::to_value(&c).unwrap();
         assert_eq!(out["min"], "1.8.0");
         assert_eq!(out["max"], "26.9.9");
+    }
+
+    /// geodata: Go 键 cron / outbound / assets（infra/conf/geodata.go:42-46）
+    /// + 序列化输出 Go 键 + 旧 Rust 字段（code/dir）不再识别。
+    #[test]
+    fn geodata_go_cron_outbound_assets_shape() {
+        let c: GeodataConfig = serde_json::from_value(serde_json::json!({
+            "cron": "0 */6 * * *",
+            "outbound": "direct",
+            "assets": [
+                {"url": "https://github.com/.../geoip.dat", "file": "geoip.dat"},
+                {"url": "https://github.com/.../geosite.dat", "file": "geosite.dat"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(c.cron.as_deref(), Some("0 */6 * * *"));
+        assert_eq!(c.outbound.as_deref(), Some("direct"));
+        let assets = c.assets.as_ref().expect("assets");
+        assert_eq!(assets.len(), 2);
+        assert_eq!(assets[0].url.as_deref(), Some("https://github.com/.../geoip.dat"));
+        assert_eq!(assets[0].file.as_deref(), Some("geoip.dat"));
+        assert_eq!(assets[1].file.as_deref(), Some("geosite.dat"));
+        // 序列化输出 Go 键。
+        let out = serde_json::to_value(&c).unwrap();
+        assert_eq!(out["cron"], "0 */6 * * *");
+        assert_eq!(out["outbound"], "direct");
+        assert_eq!(out["assets"][0]["url"], "https://github.com/.../geoip.dat");
+        assert_eq!(out["assets"][0]["file"], "geoip.dat");
+    }
+
+    /// geodata: 缺省 = None（仅手动 reload，调度器不启动）。
+    #[test]
+    fn geodata_default_is_all_none() {
+        let c: GeodataConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(c.cron.is_none());
+        assert!(c.outbound.is_none());
+        assert!(c.assets.is_none());
     }
 }

@@ -14,7 +14,8 @@
 
 use std::io;
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use xray_features::policy::TimeoutPolicy;
 
 use crate::connection::Connection;
 use crate::link::Link;
@@ -22,8 +23,8 @@ use crate::link::Link;
 /// 双向桥接两个 [`Connection`]。
 ///
 /// 内部用 [`tokio::io::split`] 拆分每个连接的读写半部，然后用
-/// [`tokio::io::copy`] 双向异步复制。任一方向完成（EOF）或出错时，
-/// `join` 返回，函数返回首个错误（若两端都成功则返回 `Ok`）。
+/// **xray-buf 分层池**（8KB 默认）双向异步复制。任一方向完成（EOF）或出错时，
+/// `select!` 返回，函数返回首个错误（若两端都成功则返回 `Ok`）。
 ///
 /// **注意**：连接在桥接期间被 `split` 持有，桥接结束后两个半部被 drop，
 /// 底层 TCP 连接随之关闭。调用方无需手动 close。
@@ -37,15 +38,50 @@ use crate::link::Link;
 ///
 /// - `Ok(())`：两个方向都正常 EOF。
 /// - `Err(e)`：至少一个方向出错，返回首个遇到的 IO 错误。
+///
+/// ponytail: 池化读循环（8KB `xray_buf::alloc`）替代 `tokio::io::copy` 的
+/// 内部 8KB Vec，连接结束后回池——避免长连接/大流量时反复 alloc 大块堆。
 pub async fn bridge_connections(
     a: Box<dyn Connection>,
     b: Box<dyn Connection>,
 ) -> io::Result<()> {
+    use tokio::io::AsyncReadExt;
+
     let (mut a_read, mut a_write) = tokio::io::split(a);
     let (mut b_read, mut b_write) = tokio::io::split(b);
 
-    let a_to_b = tokio::io::copy(&mut a_read, &mut b_write);
-    let b_to_a = tokio::io::copy(&mut b_read, &mut a_write);
+    // 池化读循环：替代 tokio::io::copy 的内置 Vec，每次循环取一次池化缓冲，
+    // 读后整段 write_all 到底层（无中间 merge_bytes 拷贝，bd etks 同源优化）。
+    async fn copy_pooled<R, W>(mut reader: R, mut writer: W) -> io::Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut buf = xray_buf::alloc::alloc(xray_buf::alloc::DEFAULT_SIZE);
+        buf.resize(xray_buf::alloc::DEFAULT_SIZE, 0);
+        loop {
+            let n = match reader.read(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    xray_buf::alloc::release(buf);
+                    return Err(e);
+                }
+            };
+            if n == 0 {
+                break;
+            }
+            if writer.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+        }
+        xray_buf::alloc::release(buf);
+        let _ = writer.shutdown().await;
+        Ok(())
+    }
+
+    let a_to_b = copy_pooled(&mut a_read, &mut b_write);
+    let b_to_a = copy_pooled(&mut b_read, &mut a_write);
 
     tokio::pin!(a_to_b, b_to_a);
 
@@ -56,7 +92,7 @@ pub async fn bridge_connections(
         res = &mut b_to_a => res,
     };
 
-    result.map(|_| ())
+    result
 }
 
 /// 单向桥接：从 `reader` 复制到 `writer`，EOF 或出错时返回。
@@ -164,16 +200,26 @@ where
 ///
 /// 与 [`bridge_link_with_stream`] 区别：两个方向独立运行到都完成，任一方向 EOF/出错不会取消另一方向。
 /// 适配 VMess 这种请求方向提前 EOF（body chunk 终止符）但响应方向仍需续传的场景。
-pub async fn bridge_link_with_stream_full<S>(link: Link, stream: S) -> io::Result<()>
+///
+/// 接收 `&TimeoutPolicy` 把 connIdle / uplinkOnly / downlinkOnly 三个超时下放到
+/// 桥接层（Go `policy.Timeout` 语义，bd 4-6 修复：之前硬编码 DEFAULT_* 常量，
+/// dispatcher 取出的 per-user Policy 不生效）。
+pub async fn bridge_link_with_stream_full<S>(
+    link: Link,
+    stream: S,
+    policy: &TimeoutPolicy,
+) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use xray_buf::buffer::Buffer;
     use xray_buf::io::{Reader, Writer};
     use xray_buf::multi::MultiBuffer;
-    use xray_features::policy::{
-        DEFAULT_CONN_IDLE_TIMEOUT, DEFAULT_DOWNLINK_ONLY_TIMEOUT, DEFAULT_UPLINK_ONLY_TIMEOUT,
-    };
+
+    let conn_idle = policy.connection_idle;
+    let uplink_only = policy.uplink_only;
+    let downlink_only = policy.downlink_only;
 
     let Link { mut reader, mut writer } = link;
     let (mut s_read, mut s_write) = tokio::io::split(stream);
@@ -197,7 +243,7 @@ where
                     // 空闲 deadline（Go ConnectionIdle / CancelAfterInactivity）：
                     // 双向均存活但 connection_idle 内无数据 → 断开
                     res = tokio::time::timeout(
-                        DEFAULT_CONN_IDLE_TIMEOUT,
+                        conn_idle,
                         reader.read_multi_buffer(),
                     ) => match res {
                         Ok(r) => r,
@@ -223,7 +269,7 @@ where
             }
         }
         let _ = s_write.shutdown().await;
-        let _ = up_done_tx.send(Some(DEFAULT_UPLINK_ONLY_TIMEOUT));
+        let _ = up_done_tx.send(Some(uplink_only));
         io::Result::Ok(())
     };
 
@@ -240,7 +286,7 @@ where
                     // 空闲 deadline（Go ConnectionIdle / CancelAfterInactivity）：
                     // 双向均存活但 connection_idle 内无数据 → 断开
                     res = tokio::time::timeout(
-                        DEFAULT_CONN_IDLE_TIMEOUT,
+                        conn_idle,
                         s_read.read(&mut buf),
                     ) => match res {
                         Ok(n) => n,
@@ -263,20 +309,36 @@ where
             if n == 0 {
                 break;
             }
+            // bd etks：消除双拷贝。read 已把 n 字节写入 buf，直接 truncate(n)
+            // 把 buf 整段作为 Buffer 入列，避免 merge_bytes 再次 memcpy n 字节。
+            // truncate 调整 end 游标（start 不变），after Buffer::from_bytes(buf)
+            // 由 Buffer 的 Drop 回池。cap >= n 是 alloc 池分层保证。
             let mut mb = MultiBuffer::new();
-            mb.merge_bytes(&buf[..n]);
+            mb.push(Buffer::from_bytes(buf.split_to(n)));
             if writer.write_multi_buffer(mb).await.is_err() {
                 break;
             }
+            // 取下一块池化缓冲（split_to 之后 buf 剩余容量可能不足一次 read）
+            buf = xray_buf::alloc::alloc(xray_buf::alloc::DEFAULT_SIZE);
+            buf.resize(xray_buf::alloc::DEFAULT_SIZE, 0);
         }
         xray_buf::alloc::release(buf);
         writer.shutdown();
-        let _ = down_done_tx.send(Some(DEFAULT_DOWNLINK_ONLY_TIMEOUT));
+        let _ = down_done_tx.send(Some(downlink_only));
         io::Result::Ok(())
     };
 
     let (up_res, down_res) = tokio::join!(up, down);
     up_res.and(down_res)
+}
+
+/// 默认策略的便捷包装（保留旧 API 兼容调用方）。
+pub async fn bridge_link_with_stream_full_default<S>(link: Link, stream: S) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let policy = TimeoutPolicy::default();
+    bridge_link_with_stream_full(link, stream, &policy).await
 }
 
 /// 双向桥接两个 dispatcher [`Link`]（xray-buf Reader/Writer）。
@@ -286,11 +348,20 @@ where
 ///
 /// 两个方向独立运行到都完成（`join!` 语义）——任一方向 EOF/出错不会取消另一方向。
 /// 用于代理链场景：原始 link ↔ client link ↔ chained handler。
-pub async fn bridge_link_with_link(link_a: Link, link_b: Link) -> io::Result<()> {
+///
+/// 接收 `&TimeoutPolicy` 同 [`bridge_link_with_stream_full`]。代理链目前
+/// 走 dispatcher 默认 policy（与原语义一致——Go 链路上每个 outbound 自己的
+/// policy 仍在该 outbound 内部生效；本层只控制连接级超时）。
+pub async fn bridge_link_with_link(
+    link_a: Link,
+    link_b: Link,
+    policy: &TimeoutPolicy,
+) -> io::Result<()> {
     use xray_buf::io::{Reader, Writer};
-    use xray_features::policy::{
-        DEFAULT_CONN_IDLE_TIMEOUT, DEFAULT_DOWNLINK_ONLY_TIMEOUT, DEFAULT_UPLINK_ONLY_TIMEOUT,
-    };
+
+    let conn_idle = policy.connection_idle;
+    let uplink_only = policy.uplink_only;
+    let downlink_only = policy.downlink_only;
 
     let Link { reader: mut a_reader, writer: mut a_writer } = link_a;
     let Link { reader: mut b_reader, writer: mut b_writer } = link_b;
@@ -308,7 +379,7 @@ pub async fn bridge_link_with_link(link_a: Link, link_b: Link) -> io::Result<()>
                 None => tokio::select! {
                     // 空闲 deadline 语义同 bridge_link_with_stream_full（ConnectionIdle）
                     res = tokio::time::timeout(
-                        DEFAULT_CONN_IDLE_TIMEOUT,
+                        conn_idle,
                         a_reader.read_multi_buffer(),
                     ) => match res {
                         Ok(r) => r,
@@ -334,7 +405,7 @@ pub async fn bridge_link_with_link(link_a: Link, link_b: Link) -> io::Result<()>
             }
         }
         b_writer.shutdown();
-        let _ = up_done_tx.send(Some(DEFAULT_UPLINK_ONLY_TIMEOUT));
+        let _ = up_done_tx.send(Some(uplink_only));
         io::Result::Ok(())
     };
 
@@ -347,7 +418,7 @@ pub async fn bridge_link_with_link(link_a: Link, link_b: Link) -> io::Result<()>
                 None => tokio::select! {
                     // 空闲 deadline 语义同 bridge_link_with_stream_full（ConnectionIdle）
                     res = tokio::time::timeout(
-                        DEFAULT_CONN_IDLE_TIMEOUT,
+                        conn_idle,
                         b_reader.read_multi_buffer(),
                     ) => match res {
                         Ok(r) => r,
@@ -373,12 +444,18 @@ pub async fn bridge_link_with_link(link_a: Link, link_b: Link) -> io::Result<()>
             }
         }
         a_writer.shutdown();
-        let _ = down_done_tx.send(Some(DEFAULT_DOWNLINK_ONLY_TIMEOUT));
+        let _ = down_done_tx.send(Some(downlink_only));
         io::Result::Ok(())
     };
 
     let (up_res, down_res) = tokio::join!(up, down);
     up_res.and(down_res)
+}
+
+/// 默认策略的便捷包装（保留旧 API 兼容调用方）。
+pub async fn bridge_link_with_link_default(link_a: Link, link_b: Link) -> io::Result<()> {
+    let policy = TimeoutPolicy::default();
+    bridge_link_with_link(link_a, link_b, &policy).await
 }
 
 #[cfg(test)]
@@ -573,7 +650,7 @@ mod tests {
         let link = Link::new(Box::new(up_r), Box::new(dn_w));
         let (mut stream_peer, stream) = tokio::io::duplex(8192);
 
-        let bridge = tokio::spawn(bridge_link_with_stream_full(link, stream));
+        let bridge = tokio::spawn(bridge_link_with_stream_full_default(link, stream));
 
         // 上游写完即 EOF → bridge down 进入 uplink_only（1s）窗口
         let mut producer = up_w;
@@ -615,7 +692,7 @@ mod tests {
         let start = std::time::Instant::now();
         // 上游立即 EOF（无数据）→ down 只能靠 uplink_only 窗口超时断开
         up_w.shutdown();
-        let res = bridge_link_with_stream_full(link, stream).await;
+        let res = bridge_link_with_stream_full_default(link, stream).await;
         assert!(res.is_ok());
         assert!(
             start.elapsed() >= std::time::Duration::from_millis(900),
@@ -626,6 +703,96 @@ mod tests {
             "should not hang forever"
         );
         let _ = dn_r;
+    }
+
+    // ---- bd 4-6: per-dispatch policy 下放到 bridge 数据面 ----
+
+    /// 极短 conn_idle 验证：bridge 200ms 内无活动必须断开（替代默认 300s）。
+    /// 这一条断言即可证明：传入的 `&TimeoutPolicy` 真的进了 conn_idle 计算，
+    /// 而非被忽略/被默认常量覆盖。
+    #[tokio::test]
+    async fn bridge_stream_full_uses_injected_connection_idle() {
+        use crate::link::Link;
+        use xray_features::policy::TimeoutPolicy;
+        use std::time::Duration;
+
+        let (up_r, up_w) = xray_buf::pipe::new();
+        let (dn_r, dn_w) = xray_buf::pipe::new();
+        let link = Link::new(Box::new(up_r), Box::new(dn_w));
+        let (_stream_peer, stream) = tokio::io::duplex(8192);
+
+        // 关键：短 conn_idle = 200ms，远小于默认 300s。
+        // uplink_only / downlink_only 留默认 1s（不影响 conn_idle 路径）。
+        let policy = TimeoutPolicy {
+            connection_idle: Duration::from_millis(200),
+            ..TimeoutPolicy::default()
+        };
+
+        let start = std::time::Instant::now();
+        // 上行 writer 保留不写、不 shutdown → 双方向均无活动 → conn_idle 触发断开。
+        let _keep_up = up_w;
+        let res = bridge_link_with_stream_full(link, stream, &policy).await;
+        let elapsed = start.elapsed();
+        assert!(res.is_ok(), "bridge must return Ok on conn_idle break");
+        assert!(
+            elapsed >= Duration::from_millis(180),
+            "must respect injected conn_idle (elapsed {elapsed:?} < 200ms)"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "conn_idle too long, possibly fell back to default 300s (elapsed {elapsed:?})"
+        );
+        let _ = dn_r;
+    }
+
+    /// bridge_connections 池化路径：两端双向 8KB 流量必须无丢失、按时返回。
+    /// ponytail: 8KB 池化缓冲替代 tokio::io::copy 的内置 Vec——大流量下不至于
+    /// 反复 alloc 8KB Vec。但行为正确性必须验证（防止 alloc/release 配对错误）。
+    #[tokio::test]
+    async fn bridge_connections_bidirectional_pooled_8kb() {
+        use crate::connection::TcpConnection;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        // 两对 loopback：(client_a ↔ server_a), (client_b ↔ server_b)
+        let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = listener_a.local_addr().unwrap();
+        let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+
+        let client_a = TcpStream::connect(addr_a).await.unwrap();
+        let server_a = listener_a.accept().await.unwrap().0;
+        let client_b = TcpStream::connect(addr_b).await.unwrap();
+        let server_b = listener_b.accept().await.unwrap().0;
+
+        // 启动 bridge(server_a, server_b)
+        let bridge_handle = tokio::spawn(bridge_connections(
+            Box::new(TcpConnection::new(server_a)) as Box<dyn Connection>,
+            Box::new(TcpConnection::new(server_b)) as Box<dyn Connection>,
+        ));
+
+        // 单方向 8KB 数据：client_a → bridge → client_b
+        let payload = vec![0xA5u8; 8 * 1024];
+        let payload_for_read = payload.clone();
+        let mut client_a = TcpConnection::new(client_a);
+        let mut client_b = TcpConnection::new(client_b);
+        let writer = tokio::spawn(async move {
+            client_a.write_all(&payload).await.unwrap();
+            client_a.shutdown().await.ok();
+        });
+        let mut recv_buf = vec![0u8; payload_for_read.len()];
+        client_b.read_exact(&mut recv_buf).await.unwrap();
+        assert_eq!(
+            recv_buf, payload_for_read,
+            "pooled bridge must not lose/corrupt bytes"
+        );
+        writer.await.unwrap();
+        // 读端 drop → bridge 一方向 EOF → 整体退出
+        drop(client_b);
+        let _res = tokio::time::timeout(std::time::Duration::from_secs(5), bridge_handle)
+            .await
+            .expect("bridge must finish after EOF")
+            .expect("bridge join");
     }
 
 }

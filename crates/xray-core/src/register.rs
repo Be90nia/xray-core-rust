@@ -44,7 +44,7 @@ pub fn register_all_features() {
     let _ = registry::register_feature("fakeDns", fake_dns_factory());
 
     let _ = registry::register_feature("burstObservatory", burst_observatory_factory());
-    let _ = registry::register_feature("version", simple_feature_factory("version"));
+    let _ = registry::register_feature("version", version_factory());
     let _ = registry::register_feature("geodata", geodata_factory());
     // Reverse：proto Config 程序化构造（Go v26 已移除 JSON 配置路径，见 reverse_factory）
     let _ = registry::register_feature("reverse", reverse_factory());
@@ -789,25 +789,19 @@ fn geodata_factory() -> FeatureFactory {
         };
         use std::path::PathBuf;
 
-        // 解析 JSON（`xray_conf::app_config::GeodataConfig`：当前 `{code, dir}`）。
-        // 失败回退默认空配置——保证 GeodataFeature 实例化成功。
-        let json_cfg: xray_conf::app_config::GeodataConfig =
+        // 解析 JSON（`xray_conf::app_config::GeodataConfig`：当前 `{cron, outbound, assets}`，
+        // M4 qi3d 已删旧的 `dir`/`code` 字段）。失败回退默认空配置。
+        // 真实 cron/JSON 字段映射留给后续 batch；当前走空 config（与
+        // `GeodataInstance::start_with_callback` cron 空时不调度 等价 Go 行为）。
+        let _json_cfg: xray_conf::app_config::GeodataConfig =
             serde_json::from_slice(data).unwrap_or_default();
 
-        let asset_dir: Option<PathBuf> = json_cfg.dir.as_ref().map(PathBuf::from);
-        let _code_hint: Option<String> = json_cfg.code.clone();
-
-        // 当前 xray-conf shape 与 Go `{cron, outbound, assets}` 不对齐，
-        // 走空 config；`GeodataInstance::start_with_callback` 在 cron 空时
-        // 不调度（与 Go `if config.Cron == ""` 等价）。
-        // 真正 cron/JSON 字段映射留给后续 batch。
         let config = GeodataConfig::default();
 
         // 真实实现替换之前的 stub。
         let scheduler: Arc<dyn Scheduler> = Arc::new(CronScheduler::new());
-        let downloader: Arc<dyn AssetDownloader> = Arc::new(
-            RealAssetDownloader::new(asset_dir.unwrap_or_else(default_asset_dir)),
-        );
+        let downloader: Arc<dyn AssetDownloader> =
+            Arc::new(RealAssetDownloader::new(default_asset_dir()));
         let reloader: Arc<dyn GeodataReloader> = Arc::new(ReloadBothRegistries);
 
         let feature = GeodataFeature::new(config, scheduler, downloader, reloader);
@@ -819,25 +813,54 @@ fn geodata_factory() -> FeatureFactory {
 fn default_asset_dir() -> PathBuf {
     xray_common::platform::get_resource_path()
 }
+/// Version app 真实 factory：解析 `VersionConfig` JSON → [`xray_app_version::Config`]
+/// → [`xray_app_version::Version`] → [`VersionFeature`](xray_app_version::VersionFeature)。
+///
+/// 在 build 时从 `crate::VERSION_X/Y/Z` 拼成（与 Go `core.Version_x/y/z` 同构）。
+/// `Version::new` 在版本不满足时直接返回 `Err`，factory 透传为
+/// `FeatureError::StartFailed`（与 Go `app.New` 同款 hard error）。
+fn version_factory() -> FeatureFactory {
+    Arc::new(|data: &[u8]| {
+        let json_cfg: xray_conf::app_config::VersionConfig =
+            serde_json::from_slice(data).unwrap_or_default();
+        let core_version = format!(
+            "{}.{}.{}",
+            crate::VERSION_X,
+            crate::VERSION_Y,
+            crate::VERSION_Z
+        );
+        let feature = xray_app_version::version::VersionFeature::new(
+            core_version,
+            json_cfg.min,
+            json_cfg.max,
+        )
+        .map_err(|e| FeatureError::StartFailed {
+            name: "version",
+            message: format!("version constraint not satisfied: {e}"),
+        })?;
+        Ok(Arc::new(feature) as Arc<dyn Feature>)
+    })
+}
 
-/// 为 api/metrics/version
+/// 极简 no-op Feature；`feature_name()` 返回 `"simple"`。
+/// 给将来想挂 noop factory 的 kind 留个备件（与历史 stub 同款语义）。
+struct SimpleFeature {
+    name: String,
+}
+
+impl xray_features::Feature for SimpleFeature {
+    fn feature_name(&self) -> &'static str {
+        "simple"
+    }
+}
+
+/// 为 api/metrics
 /// 创建 SimpleFeature 工厂（实现 Feature trait 的最简 no-op）。
 fn simple_feature_factory(kind: &'static str) -> FeatureFactory {
     let kind = kind.to_string();
     Arc::new(move |_data: &[u8]| {
         Ok(Arc::new(SimpleFeature { name: kind.clone() }) as Arc<dyn Feature>)
     })
-}
-
-/// 最简 Feature 实现（仅 feature_name + no-op）。
-struct SimpleFeature {
-    name: String,
-}
-
-impl Feature for SimpleFeature {
-    fn feature_name(&self) -> &'static str {
-        "simple"
-    }
 }
 
 #[cfg(test)]

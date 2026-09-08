@@ -144,7 +144,7 @@ impl LintStage for ValidationStage {
     }
 
     fn process(&self, cfg: &mut Config) -> Result<(), LintError> {
-        // 1. destOverride 未知协议（启用 sniffing 才校验）。
+        // 1. destOverride 未知协议（启用 sniffing 才校验）。Go 硬拒 → 这里也硬拒。
         for ib in &cfg.inbound_configs {
             let Some(sn) = ib.sniffing.as_ref() else { continue };
             if !sn.enabled {
@@ -152,39 +152,38 @@ impl LintStage for ValidationStage {
             }
             for d in &sn.dest_override.0 {
                 if !is_known_dest_override(d) {
-                    tracing::warn!(
-                        target: "xray_conf",
-                        inbound = %ib.tag,
-                        dest_override = %d,
-                        "unknown sniffing destOverride protocol (Go rejects at build time); accepted as-is and ignored",
-                    );
+                    return Err(LintError::Invalid(format!(
+                        "inbound '{}' sniffing.destOverride contains unknown protocol '{}' \
+                         (Go infra/conf/xray.go:65-79 switch rejects at build time)",
+                        ib.tag, d
+                    )));
                 }
             }
         }
 
-        // 2. xudpProxyUDP443 非法值。
+        // 2. xudpProxyUDP443 非法值。Go MuxConfig.Build 硬拒 → 这里也硬拒。
         for ob in &cfg.outbound_configs {
             let Some(mux) = ob.mux.as_ref() else { continue };
             if mux.xudp_proxy_udp_443.is_empty() {
                 continue; // 空串规范化为 reject（与 Go MuxConfig.Build 一致）
             }
             if !matches!(mux.xudp_proxy_udp_443.as_str(), "reject" | "allow" | "skip") {
-                tracing::warn!(
-                    target: "xray_conf",
-                    outbound = %ob.tag,
-                    value = %mux.xudp_proxy_udp_443,
-                    "unknown mux.xudpProxyUDP443 value (Go rejects at build time); ignoring udp443 policy",
-                );
+                return Err(LintError::Invalid(format!(
+                    "outbound '{}' mux.xudpProxyUDP443='{}' is invalid \
+                     (Go MuxConfig.Build rejects; allowed: reject|allow|skip)",
+                    ob.tag, mux.xudp_proxy_udp_443
+                )));
             }
         }
 
-        // 3. burstObservatory 启用但 pingConfig 缺失。
+        // 3. burstObservatory 启用但 pingConfig 缺失。Go 必拒 → 这里也必拒。
         if let Some(b) = cfg.burst_observatory.as_ref() {
             if b.ping_config.is_none() {
-                tracing::warn!(
-                    target: "xray_conf",
-                    "burstObservatory enabled but pingConfig missing (Go rejects at build time); feature will run without ping config",
-                );
+                return Err(LintError::Invalid(
+                    "burstObservatory enabled but pingConfig is missing \
+                     (Go BurstObservatoryConfig.Build rejects at build time)"
+                        .to_string(),
+                ));
             }
         }
 
@@ -442,7 +441,7 @@ mod tests {
     // ========== ValidationStage tests（2cq2）==========
 
     #[test]
-    fn validation_warns_on_unknown_dest_override() {
+    fn validation_rejects_unknown_dest_override() {
         let _g = TEST_LOCK.lock();
         clear_stages();
         register_builtin_stages();
@@ -454,7 +453,7 @@ mod tests {
                     enabled: true,
                     dest_override: crate::common::StringList(vec![
                         "http".into(),
-                        "bogus".into(), // 未知
+                        "bogus".into(), // 未知 → Go 硬拒
                     ]),
                     ..Default::default()
                 }),
@@ -462,8 +461,10 @@ mod tests {
             }],
             ..Default::default()
         };
-        // 验证阶段不应阻断配置加载（Go 硬错，Rust 仅警告；保生产兼容）。
-        post_process(&mut cfg).unwrap();
+        let err = post_process(&mut cfg).expect_err("unknown destOverride must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("bogus"), "expected error mentioning 'bogus', got: {msg}");
+        assert!(msg.contains("destOverride"), "expected error mentioning destOverride, got: {msg}");
     }
 
     #[test]
@@ -479,9 +480,8 @@ mod tests {
         // 大小写不敏感：Go switch 用 strings.ToLower
         assert!(is_known_dest_override("HTTP"));
     }
-
     #[test]
-    fn validation_warns_on_bad_xudp_proxy_udp443() {
+    fn validation_rejects_bad_xudp_proxy_udp443() {
         let _g = TEST_LOCK.lock();
         clear_stages();
         register_builtin_stages();
@@ -498,8 +498,12 @@ mod tests {
             }],
             ..Default::default()
         };
-        post_process(&mut cfg).unwrap();
+        let err = post_process(&mut cfg).expect_err("invalid xudpProxyUDP443 must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("xudpProxyUDP443"), "got: {msg}");
+        assert!(msg.contains("bogus"), "got: {msg}");
     }
+
 
     #[test]
     fn validation_silent_on_valid_xudp_proxy_udp443() {
@@ -523,17 +527,19 @@ mod tests {
      }
 
     #[test]
-    fn validation_warns_on_burst_missing_ping_config() {
+    fn validation_rejects_burst_missing_ping_config() {
         let _g = TEST_LOCK.lock();
         clear_stages();
         register_builtin_stages();
         let mut cfg = Config {
             burst_observatory: Some(crate::app_config::BurstObservatoryConfig {
                 subject_outbound: Some("p1".into()),
-                ping_config: None, // 缺失
+                ping_config: None, // 缺失 → Go 硬拒
             }),
             ..Default::default()
         };
-        post_process(&mut cfg).unwrap();
+        let err = post_process(&mut cfg).expect_err("burstObservatory w/o pingConfig must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("pingConfig"), "got: {msg}");
     }
 }

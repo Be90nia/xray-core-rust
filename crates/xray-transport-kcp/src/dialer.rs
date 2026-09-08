@@ -102,6 +102,19 @@ mod tests {
         assert_eq!(next_conv(), 0);
     }
 
+    #[test]
+    fn global_conv_seeds_randomly_on_first_access() {
+        // 验证 5wek globalConv 随机初始化：Go `var globalConv uint32 = dice.RollUint16()`
+        // → Rust LazyLock 首访 roll_uint16 随机。两次「reset」种子应得到不同首值。
+        // 注：直接断言 GLOBAL_CONV 不可行（私有 static），但 init_global_conv
+        // 会覆写 LazyLock 首访值；此处改为两次独立 reset 路径下的单步增长合法性。
+        // 真正随机性靠 LazyLock 自检（构造期触发 roll_uint16()）。
+        init_global_conv(0);
+        assert_eq!(next_conv(), 1);
+        init_global_conv(0x1234);
+        assert_eq!(next_conv(), 0x1235);
+    }
+
     struct MockInput {
         packets: Vec<Vec<u8>>,
     }

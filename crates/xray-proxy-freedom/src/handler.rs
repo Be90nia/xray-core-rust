@@ -8,7 +8,7 @@
 
 use xray_app_proxyman::outbound::proxy_outbound::{OutboundDialer, ProxyOutbound};
 use xray_app_proxyman::error::ProxymanError;
-use xray_transport::bridge::bridge_link_with_stream_full;
+use xray_transport::bridge::bridge_link_with_stream_full_default;
 use xray_transport::build_proxy_header;
 use xray_transport::link::Link;
 use std::net::SocketAddr;
@@ -296,7 +296,7 @@ impl ProxyOutbound for FreedomHandler {
             None => conn,
         };
 
-        bridge_link_with_stream_full(link, conn)
+        bridge_link_with_stream_full_default(link, conn)
             .await
             .map_err(|e| ProxymanError::OutboundProcessFailed(format!("bridge failed: {e}")))
     }

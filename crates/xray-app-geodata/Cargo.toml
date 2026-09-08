@@ -14,6 +14,13 @@ thiserror = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
 
+# pn8e: HTTPS downloader（GitHub raw 等常规 https 源自动更新）。
+# 默认开：rustls + webpki-roots 走 std TCP 同步握手。ponytail: 后续可加 custom
+# CA / pinned cert（Go GeodataConfig 暂未支持；纯 webpki 已覆盖 GitHub）。
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+webpki-roots = { workspace = true }
+
 [dev-dependencies]
 xray-geodata = { path = "../xray-geodata" }
 prost = { workspace = true }

@@ -84,7 +84,9 @@ impl AckList {
             timestamps: Vec::new(),
             numbers: Vec::new(),
             next_flush: Vec::new(),
-            flush_candidates: Vec::new(),
+            // 对齐 Go `NewAckList` 的 `make([]uint32, 0, 128)`：cap 恒 0 会让
+            // flush 中的 `len < cap` 条件永远成立但 push 反复 realloc，性能差。
+            flush_candidates: Vec::with_capacity(128),
             dirty: false,
             mss,
         }
@@ -181,6 +183,12 @@ impl AckList {
     #[must_use]
     pub fn pending_len(&self) -> usize {
         self.numbers.len()
+    }
+
+    /// flush_candidates 容量（对应 Go `cap(l.flushCandidates) = 128`）。
+    #[must_use]
+    pub fn flush_candidates_capacity(&self) -> usize {
+        self.flush_candidates.capacity()
     }
 }
 
@@ -540,8 +548,39 @@ mod tests {
         assert_eq!(out[1].number_list.len(), 20);
         assert_eq!(out[2].number_list.len(), 5);
     }
-
     // ============== ReceivingWorker ==============
+
+    #[test]
+    fn acklist_flush_candidates_collected_for_throttled_numbers() {
+        // 1eeu-kcp: 验证 flush_candidates 行为：throttle-only 数字进 candidates，
+        // candidates 在 dirty 末尾补足当前 seg 剩余容量（不更新 timestamp）。
+        // mss=1400 → limit clamp 到 ACK_NUMBER_LIMIT=128。
+        let mut a = AckList::new(1400);
+        a.add(1, 100);
+        let out1 = a.flush(1000, 200);
+        // 1 个立即 flush,seg 未满(1<128),末尾 dirty push 1 次
+        assert_eq!(out1.len(), 1);
+        assert_eq!(out1[0].number_list, vec![1]);
+
+        // 第二次 flush:1 仍 throttle,加 200 个新数字（next_flush=0 < current 全部立即 flush）
+        for i in 2..=201u32 { a.add(i, 100); }
+        let out2 = a.flush(1050, 200);
+        // 200 立即 flush:128 满→push seg1,剩 72;candidates 补 1→seg2=73;push
+        assert_eq!(out2.len(), 2);
+        assert_eq!(out2[0].number_list.len(), 128);
+        // seg2:72 立即 + 1 候选 = 73
+        assert_eq!(out2[1].number_list.len(), 73);
+        // 1 号在 seg2（candidates 补）
+        assert!(out2[1].number_list.contains(&1));
+    }
+
+    #[test]
+    fn acklist_flush_candidates_has_capacity_128() {
+        // 1eeu-kcp: 验证 Vec::with_capacity(128) 对齐 Go `make([]uint32, 0, 128)`。
+        // 直接断言 cap 而非行为,避开 throttle-only 路径的 dirty 边角条件。
+        let a = AckList::new(1400);
+        assert_eq!(a.flush_candidates_capacity(), 128);
+    }
 
     #[test]
     fn worker_process_segment_in_window() {
