@@ -38,6 +38,9 @@ const GLOBAL_ID_LEN: usize = 8;
 /// UDP recv 缓冲区大小（单包最大 65535 字节）。
 const RECV_BUF_SIZE: usize = 65535;
 
+/// UDP request pump 的 accum 缓冲上限（防 peer 灌爆内存）。
+const ACCUM_MAX_BYTES: usize = 2 * 1024 * 1024;
+
 /// UDP relay 策略（Go `Process` 的 `UDPOverride` + `defaultRule` 形态）。
 #[derive(Debug, Clone, Default)]
 pub struct UdpPolicy {
@@ -166,15 +169,17 @@ async fn pump_request(
             made_progress =
                 parse_and_send(sock, &mut accum, default_target, noises, policy, skip_noise).await?;
         }
-        // 读更多字节
+        // 019n：parse_and_send Ok(false) 但 accum 残留 = 协议层终止帧（Go xudp.go EOF）
+        if !accum.is_empty() { return Ok(()); }
         match reader.read_multi_buffer().await {
             Ok(mb) => {
-                if mb.is_empty() {
-                    return Ok(()); // EOF
-                }
+                if mb.is_empty() { return Ok(()); }
                 accum.extend_from_slice(&mb.to_vec());
+                if accum.len() > ACCUM_MAX_BYTES {
+                    return Err(io::Error::new(io::ErrorKind::OutOfMemory, format!("udp accum exceeded {ACCUM_MAX_BYTES} bytes")));
+                }
             }
-            Err(_) => return Ok(()), // 读错误视作 EOF
+            Err(_) => return Ok(()),
         }
     }
 }
@@ -245,6 +250,8 @@ async fn parse_and_send(
         }
         Ok(None) => Ok(false), // 流内干净结束，但 accum 可能有残留 → 等更多数据
         Err(PacketError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        // 019n：协议层终止帧
+        Err(PacketError::MetadataTooShort(_)) => Ok(false),
         Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
     }
 }
@@ -683,4 +690,33 @@ mod tests {
         assert_eq!(received, 1, "noise must be skipped for port 53 override, got {received}");
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), relay_task).await;
     }
+    /// 019n：终止帧 = body_len<MIN_META_LEN（Go xudp.go EOF）
+    #[tokio::test]
+    async fn udp_relay_terminator_frame_ends_session() {
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; RECV_BUF_SIZE];
+            if let Ok((n, peer)) = echo.recv_from(&mut buf).await { let _ = echo.send_to(&buf[..n], peer).await; }
+        });
+        let pipe_opt = xray_buf::pipe::PipeOption::default();
+        let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
+        let (_dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
+        let link = Link::new(Box::new(up_r) as Box<dyn Reader>, Box::new(dn_w) as Box<dyn Writer>);
+        let dest = udp_dest("127.0.0.1", echo_addr.port());
+        let relay_task = tokio::spawn(async move { relay(&dest, link).await });
+        let mut client_writer = Box::new(up_w) as Box<dyn Writer>;
+        let mut frame = Vec::new();
+        { let mut pw = PacketWriter::new(&mut frame, udp_dest("127.0.0.1", echo_addr.port()), [0x01u8; GLOBAL_ID_LEN]); pw.write_packet(b"ping").unwrap(); }
+        let mut mb = MultiBuffer::new(); mb.merge_bytes(&frame);
+        client_writer.write_multi_buffer(mb).await.unwrap();
+        let terminator = vec![0u8, 2u8, 0xAA, 0xBB];
+        let mut mb = MultiBuffer::new(); mb.merge_bytes(&terminator);
+        client_writer.write_multi_buffer(mb).await.unwrap();
+        drop(client_writer);
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), relay_task).await.expect("relay should end after terminator").expect("relay task panicked");
+        res.expect("relay should return Ok");
+        echo_task.abort();
+    }
+
 }
