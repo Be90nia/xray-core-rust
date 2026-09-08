@@ -106,7 +106,7 @@ mod tests {
         assert!(feature.close().is_ok());
         assert!(!feature.instance.is_active());
     }
-
+    #[test]
     fn log_feature_log_service_returns_service() {
         let cfg = LogConfig::default();
         let feature = LogFeature::new(cfg).unwrap();
