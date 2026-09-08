@@ -63,11 +63,19 @@ pub type Result<T> = std::result::Result<T, InteropError>;
 // -- Go binary path ----------------------------------------------------
 
 /// Resolve Go xray-core binary path.
-// Priority: env var XRAY_GO_BIN, else default E:\Projcet\Xray-core\xray.exe
+// Priority: env var XRAY_GO_BIN, else D:/Project/Xray-core/target/xray-go.exe
+// (d4v3: 旧机盘符 E:\Projcet 残留已移除; 也可用 D:/Project/Xray-core/target/release/xray.exe)
 pub fn go_xray_bin_path() -> PathBuf {
     std::env::var("XRAY_GO_BIN")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(r"E:\Projcet\Xray-core\xray.exe"))
+        .unwrap_or_else(|_| {
+            let d = PathBuf::from(r"D:\Project\Xray-core\target\xray-go.exe");
+            if d.exists() {
+                d
+            } else {
+                PathBuf::from(r"D:\Project\Xray-core\target\release\xray.exe")
+            }
+        })
 }
 
 // -- Go xray subprocess management -------------------------------------
