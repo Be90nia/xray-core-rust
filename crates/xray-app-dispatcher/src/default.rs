@@ -483,7 +483,7 @@ async fn sniff_connection(
         Err(_) => return Err(DispatcherError::SniffingTimeout),
     }
 
-    let payload = cr.cached_bytes();
+    let mut payload = cr.cached_bytes();
     if payload.is_empty() {
         return Ok((dest.clone(), None, None));
     }
@@ -492,28 +492,55 @@ async fn sniff_connection(
     // 构造嗅探器集合
     let mut sniffer = crate::sniffer::new_default_sniffer_set();
 
-    // FakeDns metadata sniff
+    // FakeDns metadata sniff（372t：IP 在池但反查失败时记 in_pool=true 让上层
+    // 走协议子集覆盖分支而非简单视为"非 fakedns 流量"——对应 Go default.go:322-343
+    // 在 fakedns pool 内即使 GetDomainFromFakeDNS 返回空也走 fakedns 协议语义，
     let mut metadata_domain = String::new();
     let mut metadata_protocol = String::new();
+    let mut fakedns_ip_in_pool = false;
     if let Some(engine) = fdns {
         if let Some(ip) = dest.address().ip() {
             let domain = engine.get_domain_from_fake_dns(&ip);
             if !domain.is_empty() {
                 metadata_domain = domain;
                 metadata_protocol = "fakedns".to_string();
+            } else if engine.is_ip_in_ip_pool(&ip) {
+                // IP 命中 fake 池但无 mapping（fakedns 重启/旧池），按 Go 语义
+                // 走 fakedns 协议分支但无 domain 提供 → 由 content sniff 兜底。
+                fakedns_ip_in_pool = true;
+                metadata_protocol = "fakedns".to_string();
             }
         }
     }
-
-    // Content sniff
-    let content_result = sniffer.sniff(&payload, network);
-
-    // 组合结果并判断是否覆盖
+    let _ = fakedns_ip_in_pool; // 372t: 已记 metadata_protocol, 上层 should_override 仍按 protocol_for_domain 走
+    // eu45：嗅探单次读+单次嗅探无 NeedMoreData 重试预算 → ClientHello 分段到达
+    // NeedMoreData 后 sniffer 集合已被缩减为 NotImplemented——每轮新建恢复完整集合）。
+    let content_result = {
+        let mut attempt: u8 = 0;
+        const NEED_MORE_MAX_ATTEMPTS: u8 = 2;
+        const NEED_MORE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+        loop {
+            let result = sniffer.sniff(&payload, network);
+            if !matches!(result, Err(DispatcherError::NeedMoreData)) || attempt >= NEED_MORE_MAX_ATTEMPTS {
+                break result;
+            }
+            // 读更多字节（200ms 等客户端发后续 TLS/QUIC 分段）
+            let more = tokio::time::timeout(NEED_MORE_RETRY_DELAY, cr.read_more()).await;
+            match more {
+                Ok(Ok(true)) => {
+                    // 重新拿 payload 引用（cached_bytes 返回新 Vec）
+                    payload = cr.cached_bytes();
+                }
+                Ok(Ok(false)) | Ok(Err(_)) | Err(_) => break result, // EOF/错误/超时
+            }
+            // 重建嗅探器集合（NeedMoreData 路径已把内部 sniffer 替换为 NotImplemented）
+            sniffer = crate::sniffer::new_default_sniffer_set();
+            attempt += 1;
+        }
+    };
     let dest_ip = dest.address().ip();
-
     match content_result {
         Ok(content) => {
-            // 有 content 结果
             if !metadata_domain.is_empty() {
                 // 两者都有 → CompositeSniffResult 语义
                 // protocol_for_domain 用 metadata 侧的 protocol
@@ -1301,6 +1328,29 @@ impl CachedReader {
         Ok(())
     }
 
+    /// 在已缓存的首包后追加读一包（need-more 重试用）。返回是否实际读到字节。
+    ///
+    /// 对应 Go `cachedReader.ReadMore`：sniffer 返回 `ErrProtoNeedMoreData` 时
+    /// 200ms×2 次重试预算，等客户端 ClientHello 后续分段到达。仅追加（不清空首包
+    /// 缓存）；cache 为空等价单次 read（不视作首包保护，由调用方自决）。
+    pub async fn read_more(&mut self) -> Result<bool, DispatcherError> {
+        let inner = self.inner.as_mut().ok_or_else(|| {
+            DispatcherError::Io("cached reader: no inner reader".into())
+        })?;
+        let mb = inner.read_multi_buffer().await.map_err(|e| {
+            DispatcherError::Io(format!("cached reader read_more: {e}"))
+        })?;
+        if mb.is_empty() {
+            return Ok(false);
+        }
+        if let Some(c) = self.cache.as_mut() {
+            c.merge(mb);
+        } else {
+            self.cache = Some(mb);
+        }
+        Ok(true)
+    }
+
     /// 取缓存的首包字节切片（用于 sniffing）。
     pub fn cached_bytes(&self) -> Vec<u8> {
         self.cache.as_ref().map_or(Vec::new(), |mb| mb.to_vec())
@@ -1329,7 +1379,10 @@ impl xray_buf::io::Reader for CachedReader {
 
 // ========== DialBridge：通用 Dial→Bridge adapter ==========
 
-use xray_transport::bridge::{bridge_link_with_link, bridge_link_with_stream_full};
+use xray_transport::bridge::{
+    bridge_link_with_link, bridge_link_with_link_default, bridge_link_with_stream_full,
+    bridge_link_with_stream_full_default,
+};
 use xray_transport::connection::Connection;
 
 /// 拨号闭包类型：dest → Box<dyn Connection>
@@ -1358,6 +1411,9 @@ pub struct DialBridge {
     ///
     /// 用 `RwLock` 包裹以支持注册后设置（Phase 1 注册 handler，Phase 2 设置代理链）。
     proxy_chain: std::sync::RwLock<ProxyChainConfig>,
+    /// 可选 policy：None 时 bridge 用 `TimeoutPolicy::default()`。
+    /// 由 dispatcher 在装配时通过 [`Self::with_policy`] 注入，按 user_level 查询。
+    policy: std::sync::RwLock<Option<xray_features::policy::TimeoutPolicy>>,
 }
 
 /// 代理链配置。
@@ -1378,7 +1434,23 @@ impl DialBridge {
                 chain_tag: None,
                 outbound_manager: None,
             }),
+            policy: std::sync::RwLock::new(None),
         }
+    }
+
+    /// 注入 per-dispatch 桥接 policy（bd 4-6：bridge 数据面超时接 policy）。
+    /// 用 `&self` 因为注册 handler 之后仍可能需要按 per-dispatch 设置。
+    pub fn with_policy(&self, p: xray_features::policy::TimeoutPolicy) {
+        *self.policy.write().expect("DialBridge policy lock poisoned") = Some(p);
+    }
+
+    /// 取当前 policy（无显式设置时用 default）。
+    fn current_policy(&self) -> xray_features::policy::TimeoutPolicy {
+        self.policy
+            .read()
+            .expect("DialBridge policy lock poisoned")
+            .clone()
+            .unwrap_or_default()
     }
 
     /// 设置代理链 tag 和出站管理器。
@@ -1441,10 +1513,11 @@ impl DispatchHandler for DialBridge {
         let dial = Arc::clone(&self.dial);
         let tag = self.tag.clone();
         let dest = dest.clone();
+        let policy = self.current_policy();
         Box::pin(async move {
             match dial(&dest).await {
                 Ok(remote) => {
-                    if let Err(e) = bridge_link_with_stream_full(link, remote).await {
+                    if let Err(e) = bridge_link_with_stream_full(link, remote, &policy).await {
                         tracing::warn!(tag = %tag, "bridge ended: {e}");
                     }
                 }
@@ -1473,6 +1546,8 @@ impl DialBridge {
     ) -> PinFuture<()> {
         let tag = self.tag.clone();
         let dest = dest.clone();
+        // 提前克隆 policy：避免 async move 持 &self 越界
+        let policy = self.current_policy();
 
         Box::pin(async move {
             let Some(ohm) = ohm else {
@@ -1511,11 +1586,10 @@ impl DialBridge {
                 let _ = chained_fut.await;
                 tracing::trace!(tag = %chained_tag, "chained handler dispatch done");
             });
-
             // 桥接原始 link ↔ client_link
             // link.reader → client_link.writer（上行）
             // client_link.reader → link.writer（下行）
-            if let Err(e) = bridge_link_with_link(link, client_link).await {
+            if let Err(e) = bridge_link_with_link(link, client_link, &policy).await {
                 tracing::warn!(tag = %tag, "proxy chain bridge ended: {e}");
             }
         })

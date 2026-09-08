@@ -479,28 +479,10 @@ pub fn can_splice_copy(state: &TrafficState, port: u16, is_udp: bool) -> SpliceD
 
     SpliceDecision::Splice
 }
-
-/// splice copy 实际执行（平台限制，留 TODO）。
-///
-/// Go 端 splice 用 `unsafe.Pointer` 提取 `tls.Conn` 的底层 raw TCP 连接，
-/// 绕过 TLS 加解密直接 `io.Copy`。Rust 端的 TLS 实现（rustls/openssl）
-/// 不暴露内部 raw stream，无法做等价的 unsafe 提取。
-///
-/// 当前实现：返回 `Err`，调用方应回退到正常的加解密双向 pump。
-///
-/// TODO: 当 transport 层支持 raw stream 提取后，在此实现 splice copy。
-#[allow(clippy::needless_pass_by_value)]
-pub fn splice_copy<'a>(
-    _reader: &'a mut (dyn tokio::io::AsyncRead + Unpin),
-    _writer: &'a mut (dyn tokio::io::AsyncWrite + Unpin),
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<u64>> + Send + 'a>> {
-    // ponytail: splice 需要底层 raw stream 提取，Rust TLS 不支持，留 TODO
-    Box::pin(async {
-        Err(std::io::Error::other(
-            "splice copy not yet implemented: requires raw stream extraction from TLS conn",
-        ))
-    })
-}
+// splice copy 实际数据搬运：生产路径已由 `VisionConn` 通过 `raw_tcp_clone`
+// （accept 层 dup / `Connection::raw_tcp_clone`）实装——见 vision_conn.rs::DIRECT
+// 帧切换读通道到 `raw_fallback: Option<TcpStream>`，TLS 半关闭走裸 TCP。
+// 本模块只保留 `can_splice_copy`（决策 + udp443 分流），不重复提供 IO stub。
 
 #[cfg(test)]
 mod tests {

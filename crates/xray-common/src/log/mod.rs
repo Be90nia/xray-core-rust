@@ -209,8 +209,12 @@ mod tests {
         }
     }
 
-    #[test]
+    /// 全局 `HANDLERS` 在两个测试间会互相污染（clear → register → log 中段
+    /// 被另一测试 clear 掉，断言长度失败）。用 mutex 串行化两测试。
+    static HANDLER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn test_register_and_log() {
+        let _guard = HANDLER_TEST_LOCK.lock().unwrap();
         clear_handlers();
 
         let handler = Arc::new(TestHandler::new());
@@ -236,6 +240,7 @@ mod tests {
 
     #[test]
     fn test_convenience_functions() {
+        let _guard = HANDLER_TEST_LOCK.lock().unwrap();
         clear_handlers();
 
         let handler = Arc::new(TestHandler::new());

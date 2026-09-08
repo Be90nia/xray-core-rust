@@ -189,11 +189,43 @@ impl Config {
                 Some(pl) => pl.0.iter().flat_map(|r| r.start..=r.end).collect(),
                 None => vec![],
             };
-            if ports.is_empty() {
+            // 6k4h：UDS/tun 协议可无端口（tun 用网络接口而非 socket，UDS 走 listen
+            // 域套接字路径）。Go xray.go:140-168 对 tun/ListenOn 域套接字分支豁免。
+            let listen_is_uds = ib
+                .listen
+                .as_ref()
+                .map(|a| {
+                    let d = a.0.as_str();
+                    d.starts_with('/') || d.starts_with('@')
+                })
+                .unwrap_or(false);
+            let portless_ok = ib.protocol.eq_ignore_ascii_case("tun") || listen_is_uds;
+            if ports.is_empty() && !portless_ok {
                 return Err(ConfError::Build {
                     what: "inbound.port",
-                    message: format!("inbound '{}' has no port", ib.tag),
+                    message: format!(
+                        "inbound '{}' has no port (UDS/tun: set 'listen' to a domain-socket path or protocol='tun')",
+                        ib.tag
+                    ),
                 });
+            }
+            if ports.is_empty() && portless_ok {
+                // UDS/tun 无端口 → 推一个占位 BuiltInbound（port=None, listen=Some），
+                // 上层 listener 会按 UDS/tun 形态接管（不依赖 port 字段）。
+                out.inbounds.push(BuiltInbound {
+                    entry: BuiltEntry {
+                        kind: ib.protocol.clone(),
+                        data: data.clone(),
+                    },
+                    tag: ib.tag.clone(),
+                    port: None,
+                    listen: ib.listen.as_ref().map(|a| a.0.clone()),
+                    stream_settings_json: ib.stream_settings.clone(),
+                    sniffing_json: ib.sniffing.as_ref().map(|s| {
+                        serde_json::to_value(s).unwrap_or(Value::Null)
+                    }),
+                });
+                continue;
             }
             for port in ports {
                 out.inbounds.push(BuiltInbound {
@@ -621,5 +653,69 @@ mod tests {
                 app.kind
             );
         }
+    }
+
+    /// 6k4h: UDS listen（域套接字路径）允许无 port（Go xray.go:140-168 豁免）。
+    #[test]
+    fn build_inbound_uds_path_no_port_ok() {
+        let json = r#"{
+            "inbounds": [
+                { "protocol": "vless", "tag": "uds-in", "listen": "/tmp/xray.sock" }
+            ],
+            "outbounds": [{ "protocol": "freedom", "tag": "direct" }]
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let built = cfg.build().expect("UDS inbound without port should build");
+        assert_eq!(built.inbounds.len(), 1);
+        let ib = &built.inbounds[0];
+        assert_eq!(ib.tag, "uds-in");
+        assert!(ib.port.is_none(), "UDS inbound should have port=None");
+        assert_eq!(ib.listen.as_deref(), Some("/tmp/xray.sock"));
+    }
+
+    /// 6k4h: `@`-prefixed abstract UDS 路径也允许无 port。
+    #[test]
+    fn build_inbound_abstract_uds_path_no_port_ok() {
+        let json = r#"{
+            "inbounds": [
+                { "protocol": "vless", "tag": "abs", "listen": "@xray" }
+            ],
+            "outbounds": [{ "protocol": "freedom", "tag": "direct" }]
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let built = cfg.build().expect("abstract UDS inbound should build");
+        assert!(built.inbounds[0].port.is_none());
+    }
+
+    /// 6k4h: protocol=tun 不需要 port（Go xray.go:140-143 豁免）。
+    #[test]
+    fn build_inbound_tun_no_port_ok() {
+        let json = r#"{
+            "inbounds": [
+                { "protocol": "tun", "tag": "tun0" }
+            ],
+            "outbounds": [{ "protocol": "freedom", "tag": "direct" }]
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let built = cfg.build().expect("tun inbound should build without port");
+        assert_eq!(built.inbounds[0].entry.kind, "tun");
+        assert!(built.inbounds[0].port.is_none());
+    }
+
+    /// 6k4h: 其它协议（vless）无 port 仍应硬报错（保持原行为）。
+    #[test]
+    fn build_inbound_no_port_no_uds_still_errors() {
+        let json = r#"{
+            "inbounds": [
+                { "protocol": "vless", "tag": "in", "listen": "0.0.0.0" }
+            ],
+            "outbounds": [{ "protocol": "freedom", "tag": "direct" }]
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let err = cfg.build().unwrap_err();
+        assert!(
+            err.to_string().contains("inbound.port"),
+            "unexpected error: {err}"
+        );
     }
 }

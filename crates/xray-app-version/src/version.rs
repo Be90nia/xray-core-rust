@@ -77,6 +77,41 @@ impl Version {
     }
 }
 
+/// Feature 包装：把版本检查服务暴露为 [`xray_features::Feature`]。
+///
+/// 对应 Go `app/version` 的 Feature 注册入口（Go `Version.Start()` 实际
+/// 无操作，故 Rust 端无 background task；构造时已校验版本区间）。
+pub struct VersionFeature {
+    /// 持有 `Version` 实例，便于外部查询 core/min/max。
+    pub version: Version,
+}
+
+impl VersionFeature {
+    /// 从 `coreVersion` + 选填 `minVersion`/`maxVersion` 构造。
+    ///
+    /// 缺省 coreVersion 退化为 `"0.0.0"`（与 Go xray.go:Version_x/y/z 缺省同款）。
+    pub fn new(
+        core_version: impl Into<String>,
+        min_version: Option<String>,
+        max_version: Option<String>,
+    ) -> Result<Self, VersionError> {
+        let config = Config {
+            core_version: core_version.into(),
+            min_version: min_version.unwrap_or_default(),
+            max_version: max_version.unwrap_or_default(),
+        };
+        Version::new(config).map(|v| Self { version: v })
+    }
+}
+
+impl xray_features::Feature for VersionFeature {
+    fn feature_name(&self) -> &'static str {
+        "version"
+    }
+    // 构造时已校验 core vs min/max 区间，`start` 无 background task 可启。
+    // 行为对齐 Go `Version.Start()`（空实现）。
+}
+
 /// 比较两个点分十进制版本字符串。
 ///
 /// 返回：

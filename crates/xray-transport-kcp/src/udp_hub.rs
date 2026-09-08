@@ -93,8 +93,9 @@ fn is_transient(e: &io::Error) -> bool {
 
 impl UdpHub for StdUdpHub {
     fn receive(&self) -> Option<(Vec<u8>, SocketAddr)> {
-        // ponytail: 单次最大 1500 字节（标准 MTU），KCP segment 上限 < 1500
-        let mut buf = [0u8; 1500];
+        // 对齐 Go 端 udp_hub 收包 buffer：基线 buf.Size=8192，但 KCP mss 默认 1350
+        // 加上 udpmask/TLS 包装后单包远大于 1500 MTU；任务票规格 2048 兼容 jumbo frame。
+        let mut buf = [0u8; 2048];
         loop {
             if self.closed.load(Ordering::Acquire) {
                 return None;
@@ -159,7 +160,8 @@ pub struct StdPacketInput {
 
 impl PacketInput for StdPacketInput {
     fn read_packet(&mut self) -> Option<Vec<u8>> {
-        let mut buf = [0u8; 1500];
+        // 对齐 receive 路径：2048 字节，覆盖 udpmask/TLS 包装后单 segment 长度。
+        let mut buf = [0u8; 2048];
         loop {
             if self.closed.load(Ordering::Acquire) {
                 return None;

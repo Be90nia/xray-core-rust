@@ -2119,10 +2119,18 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 
 /// 解析 hysteria outbound settings JSON → (server_addr, auth, server_name)。
 ///
-/// JSON 格式：`{"servers":[{"address":"...","port":443,"auth"|"password":"...",
-/// "serverName"|"sni":"..."}]}`。
+/// JSON 格式：`{"version":2,"servers":[{"address":"...","port":443,
+/// "auth"|"password":"...","serverName"|"sni":"..."}]}`。
+///
+/// `version` 字段对齐 Go `infra/conf/hysteria.go:13-31`：缺省 = 2，v1 硬报错。
 fn parse_hysteria_config(data: &[u8]) -> std::result::Result<(String, String, String), String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
+    // 强制 version == 2（Go 端 hysteria.go:20-22 行为镜像）
+    if let Some(ver) = v.get("version").and_then(|x| x.as_i64()) {
+        if ver != 2 {
+            return Err(format!("hysteria version {ver} not supported (only version 2)"));
+        }
+    }
     let servers = v.get("servers").and_then(|v| v.as_array())
         .ok_or_else(|| "missing servers array".to_string())?;
     let first = servers.first().ok_or_else(|| "servers array is empty".to_string())?;

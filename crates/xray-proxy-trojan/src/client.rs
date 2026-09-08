@@ -17,7 +17,7 @@ use xray_app_proxyman::error::ProxymanError;
 use xray_app_proxyman::outbound::proxy_outbound::{OutboundDialer, ProxyOutbound};
 use xray_common::net::network::Network as XrayNetwork;
 use xray_common::session::Session;
-use xray_transport::bridge::bridge_link_with_stream_full;
+use xray_transport::bridge::bridge_link_with_stream_full_default;
 use xray_transport::link::Link;
 
 use crate::config::MemoryAccount;
@@ -86,7 +86,7 @@ impl ProxyOutbound for TrojanClient {
         );
 
         // 4. 双向桥接：link.reader/writer ↔ server_conn
-        bridge_link_with_stream_full(link, server_conn)
+        bridge_link_with_stream_full_default(link, server_conn)
             .await
             .map_err(|e| ProxymanError::Other(format!("trojan bridge: {e}")))?;
 

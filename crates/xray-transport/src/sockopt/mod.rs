@@ -802,6 +802,39 @@ pub fn set_ip_recvorigdstaddr(_fd: i32) -> std::io::Result<()> {
         ))
     }
 }
+/// 把接口名解析为系统 `if_index`。对应 Go `net.InterfaceByName(name).Index`
+/// （transport/internet/sockopt_*.go 多处共用；ucad 票）。
+///
+/// Go 端在每个平台 `apply*SocketOptions` 内调 `InterfaceByName`；失败时
+/// `errors.New("failed to get interface ...")`.Base(err)` 启动期硬拒。
+/// Rust 端提前到 JSON 解析阶段（dialer.rs:246）以一次性解析、避免在
+/// accept/connect 高频路径上 syscall。
+#[cfg(unix)]
+pub fn resolve_interface_index(name: &str) -> std::io::Result<u32> {
+    // libc::if_nametoindex 跨 unix 平台（Linux/Darwin/FreeBSD），对齐 Go
+    // `net.InterfaceByName` 的常见实现。0 表示查找失败。
+    let idx = unsafe { libc::if_nametoindex(name.as_ptr() as *const libc::c_char) };
+    if idx == 0 {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("interface '{name}' not found"),
+        ))
+    } else {
+        Ok(idx)
+    }
+}
+
+/// Windows 平台 placeholder：当前通过 `customSockopt` 走 IP_UNICAST_IF 路径，
+/// 真实名字解析（GetAdaptersAddresses）后续 batch 接入。
+#[cfg(not(unix))]
+pub fn resolve_interface_index(name: &str) -> std::io::Result<u32> {
+    let _ = name;
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "interface name → index resolution not yet implemented on Windows; \
+         use raw interface index in customSockopt or unicastInterface workaround",
+    ))
+}
 
 #[cfg(test)]
 mod tests {
