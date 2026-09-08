@@ -1719,6 +1719,9 @@ struct RealityInboundConfig {
     max_diff: u32,
     fallback_dest: String,
     xver: u8,
+    /// fs0o：客户端版本门（字节序字典序比较；空 = 不限）。
+    min_client_ver: Vec<u8>,
+    max_client_ver: Vec<u8>,
 }
 
 fn parse_reality_config(
@@ -1782,6 +1785,21 @@ fn parse_reality_config(
         .and_then(|x| x.as_u64())
         .unwrap_or(0);
     let max_diff = (max_diff_ms / 1000) as u32;
+    let parse_ver = |s: &str| -> Vec<u8> {
+        s.split('.')
+            .filter_map(|p| p.trim().parse::<u8>().ok())
+            .collect()
+    };
+    let min_client_ver = json
+        .get("minClientVer")
+        .and_then(|x| x.as_str())
+        .map(&parse_ver)
+        .unwrap_or_default();
+    let max_client_ver = json
+        .get("maxClientVer")
+        .and_then(|x| x.as_str())
+        .map(&parse_ver)
+        .unwrap_or_default();
 
     Ok(RealityInboundConfig {
         server_private_key: key,
@@ -1789,6 +1807,8 @@ fn parse_reality_config(
         max_diff,
         fallback_dest,
         xver,
+        min_client_ver,
+        max_client_ver,
     })
 }
 
@@ -1848,8 +1868,10 @@ async fn serve_reality_vless(
         let max_diff = cfg.max_diff;
         let dest = cfg.fallback_dest.clone();
         let xver = cfg.xver;
+        let min_ver = cfg.min_client_ver.clone();
+        let max_ver = cfg.max_client_ver.clone();
         tokio::spawn(async move {
-            match server_tls(stream, &key, &ids, max_diff).await {
+            match server_tls(stream, &key, &ids, max_diff, &min_ver, &max_ver).await {
                 Ok(RealityServerOutcome::Verified(tls)) => {
                     if let Err(e) = xray_proxy_vless::handle_vless_connection(
                         tls,
@@ -4140,6 +4162,8 @@ mod tests {
             max_diff: 43200,
             fallback_dest: format!("127.0.0.1:{}", echo_addr.port()),
             xver: 0,
+            min_client_ver: Vec::new(),
+            max_client_ver: Vec::new(),
         };
         let rl = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let rl_addr = rl.local_addr().unwrap();

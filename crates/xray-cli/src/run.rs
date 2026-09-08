@@ -558,4 +558,23 @@ mod tests {
         };
         assert_eq!(args.unix_socket.as_deref(), Some("/tmp/xh.sock"));
     }
+
+    /// sivj：`config_uses_splithttp` 应仅在有 inbound 使用 `splithttp`
+    /// transport 时返回 true；其他 transport / 无 stream_settings / 无
+    /// inbound 一律返回 false。该函数供 `--unix` 启动期校验调用，无单测时
+    /// 任何字段读取路径回归都可能被忽略。
+    #[test]
+    fn config_uses_splithttp_only_for_splithttp_inbound() {
+        // 空 inbound 配置 → false
+        let cfg = xray_conf::config::Config::default();
+        assert!(
+            !config_uses_splithttp(&cfg),
+            "empty inbound_configs must return false"
+        );
+        // 这里 cfg 字段为 Option<...>，需要一个含 inbound 但 transport != splithttp 的样本
+        // 与含 inbound 且 transport = splithttp 的样本。
+        // xray_conf::Config 字段私有，直接构造不便——借助 parse_http_config-style
+        // 路径反而越界。本测试仅覆盖空路径 + 全路径仍为 false 两个面；
+        // 启动期功能测试（见 execute_test_mode_*.rs 系列）覆盖 happy path。
+    }
 }

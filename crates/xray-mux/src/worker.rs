@@ -278,14 +278,40 @@ impl ServerWorker {
         })?;
         let xmgr = &self.xudp_manager;
         let mut xudp = match xmgr.get(&global_id).await {
-            None => { let x = XUDP::new(global_id); xmgr.register(x.clone()).await; x }
+            None => {
+                // miss：首次见该 GlobalID，建新条目 → Active
+                let x = XUDP::new(global_id);
+                xmgr.register(x.clone()).await;
+                x
+            }
             Some(mut ex) => {
                 if ex.status == XudpStatus::Initializing {
                     warn!("XUDP conflict {:?}", global_id);
                     return Ok(());
                 }
+                if ex.status == XudpStatus::Active {
+                    // kgjo：hit Active → 把新数据写到旧 mux 输出，复用同 GlobalID 的上游会话
+                    // （Go `handleStatusNew` hit 路径：data → ex.mux.input/output 复用，保留 UDP 流身份）。
+                    // ex.mux 是 WeakSession：upgrade 失败 = 旧 session 已 Close/Expiring → 当作 miss 重建。
+                    if let Some(old_session) = ex.mux().and_then(|w| w.upgrade()) {
+                        if !data.is_empty() {
+                            // 借 session.output 把新包写进旧上行；保持 reader 沿用原 dispatcher。
+                            let mut guard = old_session.output().await;
+                            if let Some(writer) = guard.as_mut() {
+                                use xray_buf::multi::MultiBuffer;
+                                use xray_buf::buffer::Buffer;
+                                let _ = writer
+                                    .write_multi_buffer_impl(MultiBuffer::from_buffer(Buffer::from_vec(data)))
+                                    .await;
+                            }
+                        }
+                        return Ok(());
+                    }
+                    // 旧 mux 已不可用（被清理）→ 落回 miss 重建路径
+                }
+                // Expiring 或 hit-but-mux-stale：重置为 Initializing 后走新建路径
                 ex.status = XudpStatus::Initializing;
-                xmgr.register(ex.clone()).await; // Go 指针原地改状态的 Rust 等价
+                xmgr.register(ex.clone()).await;
                 ex
             }
         };
@@ -297,7 +323,6 @@ impl ServerWorker {
             }
         };
         // XUDP 恒为 Packet：直写（禁缓冲），New 帧内联 data 转发到 dispatch 目标
-        // （Go server.go:240 `link.Writer.WriteMultiBuffer(mb)`）。
         // ponytail: Go hit 路径（同 GlobalID 复用）把 data 写旧 mux output 保持
         // 旧 UDP 流；此处统一写新 session output——数据不丢，流身份不保留，
         // 需要流连续性时再复用 xudp.mux 的 input/output。
@@ -903,6 +928,62 @@ mod tests {
             let _ = req.close();
             let _ = task.await;
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), resp.read_multi_buffer()).await;
+        }
+
+        /// kgjo：同 GlobalID 重复 New 命中复用——不再调 dispatcher、不建新 session，
+        /// 新包数据写旧 session output 沿用同一上行流。
+        #[tokio::test]
+        async fn xudp_new_same_global_id_reuses_existing_session() {
+            use xray_xudp::GlobalIdInput;
+
+            let (_client, server, mut rx) = spawn_topology().await;
+
+            let input = GlobalIdInput {
+                source: "udp:10.0.0.99:6500".to_string(),
+                source_network: Network::UDP,
+                cone: true,
+            };
+            let gid = xray_xudp::global_id(&input);
+            assert_ne!(gid, [0u8; 8]);
+            // 手动驱动两次 XUDP New（同 gid）：模拟 Go 端同一 UDP 流被 mux 化
+            // 后 client 多个内层请求共享 GlobalID 的语义（XUDP 协议层）。
+            for (i, payload) in [b"req-1".as_slice(), b"req-2".as_slice()].iter().enumerate() {
+                let mut meta = FrameMetadata::new_session(100 + i as u16, udp_target());
+                meta.set_global_id(gid);
+                server
+                    .handle_xudp_new(&meta, payload.to_vec(), &Arc::new(AsyncMutex::new(None)), gid)
+                    .await
+                    .expect("handle_xudp_new");
+            }
+
+            // dispatcher 只该被调用一次（首次 New），第二次 hit 复用旧 mux
+            let (_dest, _w_down, mut up_r) =
+                tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+                    .await
+                    .expect("dispatch within timeout")
+                    .expect("channel open");
+            // 第二次不应再触发 dispatcher.recv（unbounded 单元素已消费）
+            assert!(
+                rx.try_recv().is_err(),
+                "second New must reuse, not re-dispatch"
+            );
+            // 旧上行读端：两条 payload 通过同一管道到达，pipe 在 read_multi_buffer
+            // 上一次性返回所有可读字节，故一次 read 就能拿到两个 payload 拼接。
+            // 验证关键：复用路径下 dispatcher 不被第二次调用（try_recv 已断言）。
+            let combined = read_all(&mut up_r).await;
+            assert_eq!(
+                combined,
+                b"req-1req-2",
+                "both packets arrive at the single upstream via reuse"
+            );
+
+            // XUDP entry 仍 Active（hit 路径不重置 status）
+            let entry = server
+                .xudp_manager
+                .get(&gid)
+                .await
+                .expect("XUDP entry persists");
+            assert_eq!(entry.status, XudpStatus::Active);
         }
     }
 }

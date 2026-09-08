@@ -176,6 +176,14 @@ pub fn write_address_port(buf: &mut Vec<u8>, addr: &SocksAddr) -> usize {
 /// 从字节切片解析 SOCKS5 addr+port。返回解析后的 [`SocksAddr`] + 消耗的字节数。
 ///
 /// 对应 Go `addrParser.ReadAddressPort`。
+///
+/// 81uq：domain 字符集校验——对齐 Go `isValidDomain`
+/// （`common/protocol/address.go:159-166`：仅 `0-9 a-z A-Z - . _`）。
+/// Rust 旧版仅 `str::from_utf8` 检查 UTF-8 但放过 `/`、`@`、`\x00` 等
+/// 非法字符——客户端用这些字符配合 ATYP=Domain 长度字段255可达
+/// "域名填满 + port 字节被吞"的错位帧。新增 charset 校验在解析阶段
+/// 直接拒绝（InvalidFrame），不再让不可信字节穿透到 DNS/连接层。
+#[must_use]
 pub fn parse_address_port(bytes: &[u8]) -> Result<(SocksAddr, usize)> {
     if bytes.is_empty() {
         return Err(SocksError::InvalidFrame("empty address buffer".into()));
@@ -221,7 +229,15 @@ pub fn parse_address_port(bytes: &[u8]) -> Result<(SocksAddr, usize)> {
                     bytes.len()
                 )));
             }
-            let domain = std::str::from_utf8(&bytes[offset..offset + len])
+            let domain_bytes = &bytes[offset..offset + len];
+            // 81uq：字符集校验，对齐 Go isValidDomain（仅 0-9 a-z A-Z - . _）。
+            // 见函数 doc。
+            if !is_valid_domain_bytes(domain_bytes) {
+                return Err(SocksError::InvalidFrame(format!(
+                    "invalid domain charset: {len} bytes at offset {offset}"
+                )));
+            }
+            let domain = std::str::from_utf8(domain_bytes)
                 .map_err(|e| SocksError::InvalidFrame(format!("domain utf8 error: {e}")))?
                 .to_string();
             offset += len;
@@ -243,6 +259,27 @@ pub fn parse_address_port(bytes: &[u8]) -> Result<(SocksAddr, usize)> {
     let port = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
     offset += 2;
     Ok((SocksAddr { host, port }, offset))
+}
+
+/// 81uq：domain 字节流是否仅含合法字符（ASCII：`0-9 a-z A-Z - . _`）。
+///
+/// 对齐 Go `isValidDomain`（`common/protocol/address.go:159-166`），
+/// 仅做字符集过滤——长度过滤在 `parse_address_port` 已通过 length byte
+/// 钳制在 `[0, 255]`。这里用字节直接比对避免分配 String 副本。
+///
+/// 返回 `false` 的常见情况：
+/// - 客户端用 ATYP=Domain + 含 `/`、`@`、`:`、` ` 的字节流伪装成"域名"
+/// - 含 `\` 或 `\0` 等 SOCKS5 解析上下文不该出现的字符
+#[must_use]
+pub fn is_valid_domain_bytes(bytes: &[u8]) -> bool {
+    bytes.iter().all(|&c| {
+        (c >= b'0' && c <= b'9')
+            || (c >= b'a' && c <= b'z')
+            || (c >= b'A' && c <= b'Z')
+            || c == b'-'
+            || c == b'.'
+            || c == b'_'
+    })
 }
 
 /// 编码 SOCKS5 UDP 包。对应 Go `EncodeUDPPacket`。
@@ -361,6 +398,41 @@ mod tests {
         let bytes = [ATYP_IPV4, 1, 2, 3, 4]; // 缺 port
         let err = parse_address_port(&bytes).unwrap_err();
         assert!(matches!(err, SocksError::InvalidFrame(_)));
+    }
+
+    /// 81uq：含 `/` / `@` / 空格等非法字符的 ATYP=Domain 帧必须被拒，
+    /// 而不是穿透到 DNS/连接层引发"错位端口 + 错位域名"下游故障。
+    /// 对齐 Go `isValidDomain`（`common/protocol/address.go:159-166`）：
+    /// 仅 `0-9 a-z A-Z - . _`。
+    #[test]
+    fn parse_rejects_invalid_domain_charset() {
+        // ATYP_DOMAIN + length=1 + 字节 0x2F ('/').
+        let bytes = [ATYP_DOMAIN, 1, b'/', 0, 80];
+        let err = parse_address_port(&bytes).unwrap_err();
+        assert!(matches!(err, SocksError::InvalidFrame(_)));
+        // 含 '@' 字符
+        let mut bytes = vec![ATYP_DOMAIN, 4, b'a', b'@', b'b', b'c', 0, 80];
+        let err = parse_address_port(&bytes).unwrap_err();
+        assert!(matches!(err, SocksError::InvalidFrame(_)));
+        // 含 '\\0' 字符（不在合法集）
+        let bytes = [ATYP_DOMAIN, 1, 0, 0, 80];
+        let err = parse_address_port(&bytes).unwrap_err();
+        assert!(matches!(err, SocksError::InvalidFrame(_)));
+    }
+
+    /// 81uq：合法字符域名（含 `_` `-` `.`）必须通过校验（round-trip）。
+    #[test]
+    fn parse_accepts_valid_domain_charset() {
+        let mut bytes = vec![ATYP_DOMAIN, 13];
+        bytes.extend_from_slice(b"a-b_c.d-e_f.g");
+        bytes.extend_from_slice(&443u16.to_be_bytes());
+        let (parsed, consumed) = parse_address_port(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        match parsed.host {
+            Host::Domain(d) => assert_eq!(d, "a-b_c.d-e_f.g"),
+            other => panic!("expected Domain, got {other:?}"),
+        }
+        assert_eq!(parsed.port, 443);
     }
 
     // ===== encode/decode UDP packet =====

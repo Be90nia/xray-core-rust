@@ -412,6 +412,13 @@ fn metrics_factory() -> FeatureFactory {
         };
 
         let config = xray_app_metrics::MetricsConfig::from_proto(&proto);
+        // c1mg：tag 与 listen 至少一项非空——两者皆空 metrics 永远不可达，配置错误。
+        if let Err(e) = config.validate() {
+            return Err(xray_features::FeatureError::StartFailed {
+                name: "metrics",
+                message: format!("{e}"),
+            });
+        }
         let feature = xray_app_metrics::MetricsFeature::new(config);
         Ok(Arc::new(feature) as Arc<dyn Feature>)
     })
@@ -1167,8 +1174,10 @@ mod tests {
     #[test]
     fn metrics_factory_returns_real_metrics_feature() {
         register_all_features();
-        let feat =
-            registry::create_feature("metrics", b"{}").expect("empty metrics config should build");
+        // c1mg：tag/listen 双空 fail-closed（Go infra/conf/metrics.go 同构）
+        assert!(registry::create_feature("metrics", b"{}").is_err());
+        let feat = registry::create_feature("metrics", br#"{"listen": "127.0.0.1:0"}"#)
+            .expect("metrics with listen should build");
         assert_eq!(feat.feature_name(), "metrics");
         assert_ne!(feat.feature_name(), "simple");
     }

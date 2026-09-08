@@ -30,7 +30,22 @@ impl MetricsConfig {
         out.listen = self.listen.clone();
         out
     }
+
+    /// 配置校验：tag 与 listen 至少一项非空。
+    ///
+    /// 对应 Go `app/metrics/config.go::Config` 无显式校验，但 `metrics.New` 依赖
+    /// `listen` 或 `outbound tag` 暴露端口——两者皆空即 metrics 永远不可达，视为
+    /// 配置错误。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.tag.is_empty() && self.listen.is_empty() {
+            return Err("metrics: tag and listen are both empty".to_string());
+        }
+        Ok(())
+    }
 }
+
+
+
 
 #[cfg(test)]
 mod tests {
@@ -88,4 +103,28 @@ mod tests {
         assert!(p.tag.is_empty());
         assert!(p.listen.is_empty());
     }
-}
+
+    #[test]
+    fn validate_both_empty_errors() {
+        let c = MetricsConfig::default();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_only_tag_ok() {
+        let c = MetricsConfig {
+            tag: "m".into(),
+            listen: String::new(),
+        };
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_only_listen_ok() {
+        let c = MetricsConfig {
+            tag: String::new(),
+            listen: "127.0.0.1:9090".into(),
+        };
+        assert!(c.validate().is_ok());
+    }
+ }

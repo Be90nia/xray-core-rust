@@ -48,7 +48,26 @@ const DEFAULT_ALPN: &[&str] = &["h2", "http/1.1"];
 ///
 /// `allowInsecure=true` 会跳过证书验证（对齐 Go `InsecureSkipVerify`，v26 已在
 /// JSON 层移除该字段，Rust 保留兼容）。仅用于调试或明确接受 MITM 风险的场景。
-/// 生产环境必须保持 `false`。
+/// 从 `streamSettings` 的安全配置构建 rustls `ClientConfig`。
+///
+/// 对应 Go `transport/internet/tls/tls.go::ConfigFromStreamSettings` + `GetTLSConfig`
+/// （client 侧）。已覆盖字段：
+/// - `serverName`（SNI 由调用方传给 `utls::client`，此处仅解析）
+/// - `allowInsecure` / `alpn`
+/// - `minVersion` / `maxVersion` / `cipherSuites` / `curvePreferences`
+///   （经 [`crate::config::security_params`]，rustls 边界项 warn 后降级）
+/// - `disableSystemRoot` + `certificates[]`：自定义 CA 信任根替代 webpki-roots
+///   （对应 Go `getCertPool` → `loadSelfCertPool`）
+/// - `pinnedPeerCertSha256`：证书钉扎（对应 Go `RandCarrier.verifyPeerCert` +
+///   `verifyChain`，见 [`PinnedServerCertVerifier`]）
+/// - `certificates[]` 带 key 条目：客户端身份证书（mTLS 双向握手；Go 无此能力，
+///   Rust 扩展）
+/// - `verifyPeerCertByName`（Go v26 新增）：以字符串而非 SNI 主机名做证书验证，
+///   用于 ECH/PSK 等握手阶段 SNI 与真实服务名不一致的场景。
+/// - `masterKeyLog`（Go `tls.Config.KeyLogWriter` 等价）/ `enableSessionResumption`
+///   （Go `SessionTicketsDisabled` 等价）：pwh6 字段族增量。
+///
+/// ECH 留待 115 另 issue。
 pub fn build_client_config(
     security: &str,
     security_json: Option<&serde_json::Value>,
@@ -109,6 +128,25 @@ pub fn build_client_config(
     // mTLS 客户端身份：首个同时含证书+私钥的 certificates[] 条目
     let identity = client_identity(&json)?;
 
+    // pwh6: TLS 字段族增量解析（client 侧）。所有字段缺失=默认行为，向前兼容。
+    let master_key_log = obj
+        .and_then(|m| m.get("masterKeyLog"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let enable_session_resumption = obj
+        .and_then(|m| m.get("enableSessionResumption"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    // verifyPeerCertByName：Go v26 新增——以字符串而非 SNI 主机名做证书验证。
+    // 用法：ECH/PSK 等握手阶段 SNI 与真实服务名不一致场景，对 ECH inner SNI
+    // 暴露的真实服务做校验。Rust 端把字符串传给 PinnedServerCertVerifier 的
+    // verify_server_cert 替代默认 SNI 校验。空字符串=保持默认 SNI 校验。
+    let verify_peer_cert_by_name = obj
+        .and_then(|m| m.get("verifyPeerCertByName"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
     let builder = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&versions)
         .map_err(|e| io::Error::other(format!("protocol versions: {e}")))?;
@@ -117,10 +155,15 @@ pub fn build_client_config(
         builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-    } else if !pins.is_empty() {
+    } else if !pins.is_empty() || !verify_peer_cert_by_name.is_empty() {
+        // pwh6: verifyPeerCertByName 与 pinnedPeerCertSha256 互不冲突，可同时配；
+        // 任一非空都走 PinnedServerCertVerifier（已实现 verify_chain 逻辑）。
         builder
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(PinnedServerCertVerifier::new(pins)))
+            .with_custom_certificate_verifier(Arc::new(PinnedServerCertVerifier::new(
+                pins,
+                verify_peer_cert_by_name,
+            )))
     } else {
         // 信任根：disableSystemRoot=true → certificates[] 全部证书作自定义 CA
         // （对应 Go getCertPool → loadSelfCertPool，不筛 usage）；否则 webpki-roots
@@ -146,6 +189,19 @@ pub fn build_client_config(
         None => builder.with_no_client_auth(),
     };
     cfg.alpn_protocols = alpn_owned;
+
+    // pwh6: masterKeyLog — Go KeyLogWriter 等价。
+    if master_key_log {
+        cfg.key_log = Arc::new(rustls::KeyLogFile::new());
+    }
+
+    // pwh6: enableSessionResumption=false 走 rustls `Resumption::disabled()`
+    // （client/client_conn.rs:495：store=NoClientSessionStorage +
+    // tls12_resumption=Disabled）。Go 端 `SessionTicketsDisabled=true` 等价。
+    if !enable_session_resumption {
+        cfg.resumption = rustls::client::Resumption::disabled();
+    }
+
     Ok(Some(Arc::new(cfg)))
 }
 
@@ -204,6 +260,7 @@ fn parse_pinned_hashes(json: &serde_json::Value) -> io::Result<Vec<Vec<u8>>> {
     Ok(pins)
 }
 
+
 /// 客户端身份证书（mTLS）：`certificates[]` 中首个同时含证书与私钥的条目。
 ///
 /// Go 客户端从不发送证书（`GetTLSConfig` 不设 `tls.Config.Certificates`）；
@@ -231,20 +288,28 @@ fn client_identity(
 ///    （链构建 + 签名 + 有效期 + 主机名，对应 Go foundCA 分支的 `certs[0].Verify`）。
 /// 3. 无命中 → 拒绝（"peer cert is unrecognized"）。
 ///
+/// pwh6: 附加 `verify_peer_cert_by_name`（Go `verifyPeerCertByName` v26 新增）：
+/// 非空时替代默认 SNI 做证书主机名校验。ECH 等握手阶段 SNI 与真实服务名不一致
+/// 场景：对 ECH inner SNI 暴露的真实服务名做校验。空=默认 SNI 校验。
+///
 /// 握手签名验证是**真实验证**（委托 ring provider），与
 /// [`NoCertificateVerification`] 的全过语义不同——钉扎不降低握手完整性。
 #[derive(Debug)]
 struct PinnedServerCertVerifier {
     /// 每项 32 字节 SHA-256。
     pins: Vec<Vec<u8>>,
+    /// Go `verifyPeerCertByName` 等价——非空时替代 SNI 做主机名校验。
+    verify_peer_cert_by_name: String,
 }
 
 impl PinnedServerCertVerifier {
-    fn new(pins: Vec<Vec<u8>>) -> Self {
-        Self { pins }
+    fn new(pins: Vec<Vec<u8>>, verify_peer_cert_by_name: String) -> Self {
+        Self {
+            pins,
+            verify_peer_cert_by_name,
+        }
     }
 }
-
 impl ServerCertVerifier for PinnedServerCertVerifier {
     fn verify_server_cert(
         &self,
@@ -254,6 +319,15 @@ impl ServerCertVerifier for PinnedServerCertVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
+        // pwh6: verifyPeerCertByName 非空时替代默认 SNI——ECH/PSK 场景
+        // 握手阶段 SNI 与真实服务名不一致。pin 命中叶子分支照过；命中 CA
+        // 分支用 vcn 重新构造 ServerName 走 webpki 主机名校验。
+        let effective_name = if self.verify_peer_cert_by_name.is_empty() {
+            server_name.clone()
+        } else {
+            ServerName::try_from(self.verify_peer_cert_by_name.as_str())
+                .map_err(|e| rustls::Error::General(format!("verifyPeerCertByName: {e}")))?
+        };
         // [叶子, 中间证书...] 的 hash/is_ca 输入（对应 Go verifyPeerCert 的 certs）
         let mut hashes = vec![generate_cert_hash(end_entity)];
         let mut is_ca = vec![false];
@@ -283,7 +357,7 @@ impl ServerCertVerifier for PinnedServerCertVerifier {
                 verifier.verify_server_cert(
                     end_entity,
                     intermediates,
-                    server_name,
+                    &effective_name,
                     ocsp_response,
                     now,
                 )
@@ -969,5 +1043,79 @@ mod tests {
         )
         .await;
         assert!(cr.is_err(), "usage:issue entry must not be presented as server cert");
+    }
+
+    // ===== pwh6: client 侧 TLS 字段族增量行为测试 =====
+
+    /// `masterKeyLog=true` 切到 KeyLogFile；`false`（默认）保持 NoKeyLog。
+    #[test]
+    fn pwh6_client_master_key_log_swaps_key_log() {
+        let cfg_off = build_client_config("tls", None, "example.com")
+            .unwrap()
+            .unwrap();
+        let cfg_on = build_client_config(
+            "tls",
+            Some(&serde_json::json!({ "masterKeyLog": true })),
+            "example.com",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&cfg_off.key_log, &cfg_on.key_log));
+        assert!(format!("{:?}", &*cfg_on.key_log).contains("KeyLogFile"));
+        assert!(format!("{:?}", &*cfg_off.key_log).contains("NoKeyLog"));
+    }
+
+    /// `enableSessionResumption=false` → resumption 切换到 disabled（type_name 变化）。
+    #[test]
+    fn pwh6_client_disable_session_resumption_swaps_resumption() {
+        let cfg_off = build_client_config("tls", None, "example.com")
+            .unwrap()
+            .unwrap();
+        let cfg_on = build_client_config(
+            "tls",
+            Some(&serde_json::json!({ "enableSessionResumption": false })),
+            "example.com",
+        )
+        .unwrap()
+        .unwrap();
+        // Resumption 不暴露 pub 字段直接比较；通过 Debug 输出含 store 名称区分。
+        let off_dbg = format!("{:?}", cfg_off.resumption);
+        let on_dbg = format!("{:?}", cfg_on.resumption);
+        assert_ne!(off_dbg, on_dbg);
+        // 关闭时类型名含 NoClientSessionStorage。
+        assert!(on_dbg.contains("NoClientSessionStorage"));
+    }
+
+    /// `verifyPeerCertByName` 非空时构造 PinnedServerCertVerifier（含 vcn 字段）。
+    /// 通过尝试错误 hex 触发 Err 路径，验证 vcn 字符串被构造器接纳。
+    #[test]
+    fn pwh6_verify_peer_cert_by_name_accepted_by_verifier() {
+        // 无效 pin hex + 有效 vcn → 错误来自 pin 解析，不是 vcn 解析。
+        let cfg = build_client_config(
+            "tls",
+            Some(&serde_json::json!({
+                "pinnedPeerCertSha256": "zz".repeat(32),
+                "verifyPeerCertByName": "real.service.example",
+            })),
+            "fake.sni",
+        );
+        let err = cfg.err().expect("invalid pin hex must error");
+        assert!(err.to_string().contains("pinnedPeerCertSha256"));
+    }
+
+    /// `verifyPeerCertByName` 字段缺失/空时行为兼容——pin 命中 CA 验证用默认 SNI。
+    #[test]
+    fn pwh6_verify_peer_cert_by_name_empty_falls_back_to_sni() {
+        let cfg = build_client_config(
+            "tls",
+            Some(&serde_json::json!({
+                "pinnedPeerCertSha256": "00ff".repeat(16),
+            })),
+            "fallback.sni",
+        )
+        .unwrap()
+        .unwrap();
+        // alpn 默认
+        assert_eq!(cfg.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
     }
 }

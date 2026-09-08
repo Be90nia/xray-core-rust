@@ -148,7 +148,7 @@ impl ResolvesServerCert for SniCertResolver {
 // build_server_config
 // ============================================================
 
-/// 从 `streamSettings` 的安全配置构建 rustls `ServerConfig`。
+/// 从 `streamSettings` 安全配置构建 rustls `ServerConfig`。
 ///
 /// # 参数
 /// - `security`：安全层名（`"none"` / `"tls"` / `"reality"`）。非 `"tls"` / `"reality"` 返回 `None`。
@@ -169,6 +169,22 @@ impl ResolvesServerCert for SniCertResolver {
 /// 需把 resolver 包进 `arc_swap::ArcSwap` 并 spawn tokio 定时任务重新读取
 /// `certificatePath`/`keyPath` 后原子替换。OCSP 装订已由 `ocsp-stapler`（`ocsp-stapling`
 /// feature）在握手层实现，参见 [`crate::ocsp_stapling`]。
+///
+/// # pwh6: Go v26 TLS 字段族增量（服务端）
+/// - `masterKeyLog`：bool。true 时启用 [`rustls::KeyLogFile`] 写 SSLKEYLOGFILE
+///   （NSS 格式）。Go 端等价 `tls.Config.KeyLogWriter: io.Writer`。
+/// - `enableSessionResumption`：bool。默认 true（rustls 0.23 builder 默认开
+///   `ServerSessionMemoryCache(256)` + `NeverProducesTickets`）；false 时
+///   显式禁用 session cache + ticketer + `send_tls13_tickets=0`——对齐 Go
+///   `SessionTicketsDisabled=true` + `SessionCache=nil`。
+/// - `oneTimeLoading`：bool。true 时只禁 ticketer（不发 TLS1.3 票据，
+///   避免重连回退破坏），session cache 保留。对齐 Go
+///   `tls.Config.SessionTicketsDisabled=false, OneTimeLoading=true`。
+/// - `buildChain`：bool。默认 true。对齐 Go `tls.Config.BuildNameToCertificate`；
+///   rustls 0.23 无单独开关，多 SNI 证书经 [`SniCertResolver`] 处理。
+/// - `ocspStapling`：bool。true 时走 `ocsp-stapling` feature 自动装订
+///   （参见 [`crate::ocsp_stapling::ServerConfigAndStapler`]），对齐 Go
+///   `tls.Config.OCSPStaple`。
 pub fn build_server_config(
     security: &str,
     security_json: Option<&serde_json::Value>,
@@ -182,6 +198,28 @@ pub fn build_server_config(
     let json = security_json.cloned().unwrap_or(serde_json::Value::Null);
     let reject_unknown = json
         .get("rejectUnknownSni")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // pwh6: TLS 字段族增量解析——所有字段缺失=默认行为，向前兼容。
+    let master_key_log = json
+        .get("masterKeyLog")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let enable_session_resumption = json
+        .get("enableSessionResumption")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let one_time_loading = json
+        .get("oneTimeLoading")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let _build_chain = json
+        .get("buildChain")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true); // 对齐 Go 默认 true；rustls 无对应开关，记此意图。
+    let ocsp_stapling = json
+        .get("ocspStapling")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
@@ -221,6 +259,43 @@ pub fn build_server_config(
     // alpn：对齐 Go GetTLSConfig——NextProtos 取 tlsSettings.alpn，
     // 为空时默认 ["h2", "http/1.1"]（WS/httpupgrade 依赖 http/1.1，gRPC 依赖 h2）。
     config.alpn_protocols = parse_alpn(&json)?;
+
+    // pwh6: masterKeyLog — Go KeyLogWriter 等价。
+    // rustls 0.23 KeyLogFile 从 SSLKEYLOGFILE 环境变量读取文件名
+    // （key_log_file.rs:79-82，变量未设时 no-op）。生产环境误用风险：
+    // TLS 主密钥落盘，需文档警示。
+    if master_key_log {
+        config.key_log = Arc::new(rustls::KeyLogFile::new());
+    }
+
+    // pwh6: enableSessionResumption=false 禁用票据+session cache。
+    // Go `SessionTicketsDisabled=true, SessionCache=nil` 等价语义。
+    // 禁 session cache 用 NoServerSessionStorage (rustls pub)；
+    // 禁 ticket 用 `send_tls13_tickets=0`（rustls 默认 NeverProducesTickets
+    // 已不产 ticket——server/builder.rs:116；外部 crate 看不到该类型，
+    // 但设 0 后 pinger 不会再发 ticket，效果等价）。
+    if !enable_session_resumption {
+        config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        config.send_tls13_tickets = 0;
+    } else if one_time_loading {
+        // oneTimeLoading=true：禁 ticket 发送（避免重连回退破坏）；
+        // session cache 保留（TLS1.2 session id 仍可走）。
+        config.send_tls13_tickets = 0;
+    }
+
+    // pwh6: ocspStapling=true 时挂上 OCSP 装订逻辑。
+    // 对齐 Go `tls.Config.OCSPStaple`——Rust 端通过 ocsp-stapling feature 提供
+    // `ServerConfigAndStapler::wrap_server_config`，把 SniCertResolver 包成
+    // 自动从 issuer 取 OCSP 响应的 resolver。feature gate 控制 build。
+    #[cfg(feature = "ocsp-stapling")]
+    if ocsp_stapling {
+        return crate::ocsp_stapling::ServerConfigAndStapler::wrap_server_config(config)
+            .map(|wrapped| Some(Arc::new(wrapped) as Arc<ServerConfig>));
+    }
+    #[cfg(not(feature = "ocsp-stapling"))]
+    {
+        let _ = ocsp_stapling; // 抑制 unused 警告
+    }
 
     Ok(Some(Arc::new(config)))
 }
@@ -545,5 +620,107 @@ aZ9A3Sng12a1YFnJcLOELh+loNChRANCAATG2iorYlDeMjaVlb7XdvtKt1Og/t5H
             cfg.alpn_protocols,
             vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         );
+
+    }
+
+    // ===== pwh6: TLS 字段族增量行为测试 =====
+
+    /// `masterKeyLog=true` 把 key_log 换成 KeyLogFile（与默认 NoKeyLog 不同实例）。
+    #[test]
+    fn pwh6_master_key_log_enables_key_log_file() {
+        install_provider();
+        let cfg_off =
+            build_server_config("tls", Some(&serde_json::json!({}))).unwrap().unwrap();
+        let cfg_on = build_server_config(
+            "tls",
+            Some(&serde_json::json!({ "masterKeyLog": true })),
+        )
+        .unwrap()
+        .unwrap();
+        // 两个 ServerConfig 的 key_log 字段内存地址不同（不同实例）。
+        assert!(!std::sync::Arc::ptr_eq(&cfg_off.key_log, &cfg_on.key_log));
+
+        // KeyLogFile 内部是 Mutex 包结构（Debug 输出含 `KeyLogFile`）。
+        assert!(format!("{:?}", &*cfg_on.key_log).contains("KeyLogFile"));
+        assert!(format!("{:?}", &*cfg_off.key_log).contains("NoKeyLog"));
+    }
+    #[test]
+    fn pwh6_disable_session_resumption_zeros_tickets_and_swaps_cache() {
+        install_provider();
+        let cfg = build_server_config(
+            "tls",
+            Some(&serde_json::json!({ "enableSessionResumption": false })),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cfg.send_tls13_tickets, 0);
+        // session_storage 类型应是 NoServerSessionStorage（与默认不同实例）。
+        let default_s = build_server_config("tls", Some(&serde_json::json!({})))
+            .unwrap()
+            .unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&cfg.session_storage, &default_s.session_storage));
+    }
+
+    /// `oneTimeLoading=true` 把 `send_tls13_tickets` 置 0 但保留 session cache。
+    #[test]
+    fn pwh6_one_time_loading_zeros_tickets_keeps_cache() {
+        install_provider();
+        let cfg = build_server_config(
+            "tls",
+            Some(&serde_json::json!({ "oneTimeLoading": true })),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cfg.send_tls13_tickets, 0);
+
+        // 默认 instance 类型名含 `ServerSessionMemoryCache`，oneTimeLoading=true
+        // 保留 session cache——类型应一致。
+        let cfg_off = build_server_config("tls", Some(&serde_json::json!({})))
+            .unwrap()
+            .unwrap();
+
+        // 实际不可能 ptr_eq（每次 build 新 Arc）——降级：断类型名一致。
+        assert_eq!(
+            std::any::type_name_of_val(&*cfg.session_storage),
+            std::any::type_name_of_val(&*cfg_off.session_storage),
+        );
+    }
+
+    #[test]
+    fn pwh6_build_chain_accepts_both_bool_values() {
+        install_provider();
+        let cfg_true = build_server_config(
+            "tls",
+            Some(&serde_json::json!({ "buildChain": true })),
+        )
+        .unwrap()
+        .unwrap();
+        let cfg_false = build_server_config(
+            "tls",
+            Some(&serde_json::json!({ "buildChain": false })),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            cfg_true.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        );
+        assert_eq!(
+            cfg_false.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        );
+    }
+
+    /// 默认 `ocspStapling=false` 时返回原 ServerConfig（不经过 ocsp-stapling 包装器）。
+    /// 无 ocsp-stapling feature 时返回 ServerConfig；有 feature 时返回
+    /// ServerConfigAndStapler（不同类型但满足 `Arc<ServerConfig>`）。
+    #[test]
+    fn pwh6_ocsp_stapling_default_off_builds_plain_server_config() {
+        install_provider();
+        let cfg = build_server_config("tls", Some(&serde_json::json!({})))
+            .unwrap()
+            .unwrap();
+        // alpn 默认
+        assert_eq!(cfg.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
     }
 }

@@ -1,12 +1,18 @@
 //! 静态 hosts 表。对应 Go `app/dns/hosts.go`。
 //!
-//! 业务核心独立可测，仅依赖 `xray_geodata::matcher::domain::DomainMatcher` trait。
+//! 业务核心独立可测，仅依赖 `xray_geodata::matcher::domain::{DomainMatcher,
+//! DomainRule, DomainType, MphDomainMatcher}`。
+//!
+//! ygxy：matcher 用 `MphDomainMatcher` + `DomainType::Domain` 规则构建——注册
+//! `example.com` 的条目应同时匹配 `example.com` / `foo.example.com` /
+//! `a.b.example.com`（后缀匹配，对齐 Go `MphDomainMatcher.Match` 的
+//! Domain 语义）。旧 `InMemoryMatcher` 仅 exact match 导致子域漏配。
 
 use std::net::IpAddr;
 
 use xray_common::net::address::Address;
 use xray_features::dns::DnsError as FeaturesDnsError;
-use xray_geodata::matcher::domain::DomainMatcher;
+use xray_geodata::matcher::domain::{DomainMatcher, DomainRule, MphDomainMatcher};
 
 use crate::config::IpOption;
 use crate::error::DnsError;
@@ -81,17 +87,22 @@ impl StaticHosts {
             responses.push(reps);
         }
 
-        // 构造 matcher。
-        // 当前实现：xray-geodata 未提供从多规则一次性构造 DomainMatcher 的 API，
-        // ponytail: 在内存里构造 `FullMatcher` 的聚合，单规则查表。
-        // TODO: 等 xray-geodata 暴露 `DomainRegistry::build_many` 或类似 API 后替换。
-        let matcher: Box<dyn DomainMatcher> = Box::new(InMemoryMatcher {
-            rules: mappings
-                .into_iter()
-                .enumerate()
-                .map(|(i, m)| (m.domain.to_lowercase(), i as u32))
-                .collect(),
-        });
+        // 构造 matcher：每个 hosts 条目用 `DomainType::Domain`（后缀匹配）
+        // 注册——注册 `example.com` 同时匹配 `example.com` / `foo.example.com`
+        // 等所有子域（对齐 Go `MphDomainMatcher.Match` 的 Domain 语义）。
+        // 旧 `InMemoryMatcher` 仅 exact match 导致子域漏配（ygxy）。
+        let rules: Vec<DomainRule> = mappings
+            .iter()
+            .enumerate()
+            .map(|(i, m)| DomainRule::domain(m.domain.to_lowercase(), i as u32))
+            .collect();
+        let matcher: Box<dyn DomainMatcher> = Box::new(
+            MphDomainMatcher::build(&rules).map_err(|e| {
+                DnsError::Features(FeaturesDnsError::Other(format!(
+                    "mph matcher build failed: {e}"
+                )))
+            })?,
+        );
 
         Ok(Self {
             responses,
@@ -100,8 +111,6 @@ impl StaticHosts {
     }
 
     /// 查询域名。对应 Go `(*StaticHosts).Lookup`（hosts.go:96-116）。
-    ///
-    /// 返回 `None` = 域名未记录；`Some(vec![])` = 记录存在但按 option 过滤后无 IP；
     /// `Some([Address::Domain(_)])` = 域名替换（递归 unwrap 最大 5 次防 A→B→A 环，
     /// 耗尽后返回尾域名，由上层走 nameservers 查询）。
     pub fn lookup(
@@ -233,23 +242,10 @@ fn filter_ip_entries(entries: &[&ResponseEntry], option: IpOption) -> Vec<Addres
     out
 }
 
-/// Hash 域名 matcher（O(1) exact match + 大小写不敏感）。
-///
-/// 对齐 Go 的 `MphDomainMatcher` 语义但简化为 exact match only
-///（hosts 表不支持 wildcard，对齐 Go `StaticHosts` 行为）。
-struct InMemoryMatcher {
-    rules: std::collections::HashMap<String, u32>,
-}
-
-impl DomainMatcher for InMemoryMatcher {
-    fn match_domain(&self, input: &str) -> Vec<u32> {
-        self.rules.get(input).copied().into_iter().collect()
-    }
-
-    fn match_any(&self, input: &str) -> bool {
-        self.rules.contains_key(input)
-    }
-}
+/// ygxy：hosts 表语义上"前缀键"= 子域匹配。`example.com` 条目同时匹配
+/// `example.com` / `foo.example.com` / `a.b.example.com`，由
+/// `MphDomainMatcher` 配合 `DomainType::Domain` 规则承担。删除旧的 exact-only
+/// `InMemoryMatcher`（见 commit 之前逻辑）。
 
 // Address 构造辅助。
 trait AddressExt {
@@ -404,5 +400,43 @@ mod tests {
         assert_eq!(alias.ips, vec![IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))]);
         // 非法 IP 行整体跳过
         assert!(mappings.iter().all(|m| m.domain != "skip.me"));
+    }
+
+    /// ygxy：hosts 表"前缀键"= 子域匹配。注册 `example.com` 应同时匹配
+    /// `example.com` / `foo.example.com` / `a.b.example.com`（对齐 Go
+    /// `MphDomainMatcher.Match` 的 Domain 语义）。旧 `InMemoryMatcher`
+    /// 仅 exact match 导致子域漏配。
+    #[test]
+    fn lookup_matches_subdomains_via_domain_rule() {
+        let h = StaticHosts::new(vec![mapping_ip("example.com", &["1.2.3.4"])]).unwrap();
+        for q in ["example.com", "foo.example.com", "a.b.example.com"] {
+            let out = h.lookup(q, IpOption::all()).unwrap().unwrap();
+            assert_eq!(out.len(), 1, "query {q} should match");
+            match &out[0] {
+                Address::IPv4(v) => assert_eq!(*v, Ipv4Addr::new(1, 2, 3, 4)),
+                other => panic!("expected IPv4 for {q}, got {other:?}"),
+            }
+        }
+        // 非子域（不同顶级域）仍应未命中。
+        let out = h.lookup("notexample.com", IpOption::all()).unwrap();
+        assert!(out.is_none(), "non-suffix must miss");
+    }
+
+    /// kzmx：hosts 命中但按 IP 族过滤后为空 → 返回 `Some(vec![])`（"命中但
+    /// 过滤空"），由 server 层据此短路 `EmptyResponse` 而非继续走
+    /// nameservers 上游查询（`xray-app-dns/src/server.rs:257-258` 路径）。
+    #[test]
+    fn lookup_returns_empty_when_filtered_out_by_ip_option() {
+        let h = StaticHosts::new(vec![mapping_ip("example.com", &["1.2.3.4"])]).unwrap();
+        // 仅 IPv6 启用但条目只有 IPv4 → 过滤后空。返回 `Ok(Some(vec![]))`
+        // 是 server 层短路 `EmptyResponse` 的信号（kzmx）。
+        let v6_only = IpOption {
+            ipv4_enable: false,
+            ipv6_enable: true,
+            fake_enable: true,
+        };
+        let out = h.lookup("example.com", v6_only).unwrap();
+        let addrs = out.expect("kzmx: matched entry must yield Some, not None (server短路 EmptyResponse)");
+        assert!(addrs.is_empty(), "kzmx: ipv6-only filter on ipv4-only entry must yield empty vec");
     }
 }
