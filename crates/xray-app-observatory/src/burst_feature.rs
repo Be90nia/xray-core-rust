@@ -39,8 +39,19 @@ impl BurstObservatoryFeature {
     /// 反序列化为 [`HealthPingConfig`] 后用 [`HealthPingSettings::from_config`]
     /// 归一化（默认值/最小约束）。
     pub fn new(subject_outbound: String, ping_config: Option<&serde_json::Value>) -> Self {
-        let hp_config = ping_config
-            .and_then(|v| serde_json::from_value::<HealthPingConfig>(v.clone()).ok());
+        // u7nu：parse 失败时整体丢弃 → warn 后回退默认；不让子字段类型偏差
+        // 致整段 pingConfig 静默弃用（如 Go `interval:"1m"` 字符串）。
+        let hp_config = ping_config.and_then(|v| {
+            match serde_json::from_value::<HealthPingConfig>(v.clone()) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(
+                        "BurstObservatoryFeature: pingConfig parse failed: {e}, falling back to defaults"
+                    );
+                    None
+                }
+            }
+        });
         let settings = HealthPingSettings::from_config(hp_config.as_ref());
         Self {
             observer: Arc::new(BurstObserver::new(settings)),
@@ -212,5 +223,15 @@ mod tests {
         f.init_dependencies(&xray_features::DepBag::new());
         let err = f.start().expect_err("no selector → no executor → StartFailed");
         assert!(matches!(err, FeatureError::StartFailed { .. }));
+    }
+    #[test]
+    fn new_with_unparseable_ping_config_falls_back_to_defaults() {
+        // u7nu：parse 失败必须 warn 而非静默——用 garbage 字符串强制 parse 失败。
+        let bad = serde_json::json!({"interval": "not-a-duration", "samplingCount": 5});
+        let f = BurstObservatoryFeature::new("out-a".into(), Some(&bad));
+        let s = f.observer.settings();
+        // 整段丢弃 → 走默认（DEFAULT_DESTINATION / DEFAULT_SAMPLING_COUNT=10）。
+        assert_eq!(s.sampling_count, crate::DEFAULT_SAMPLING_COUNT);
+        assert_eq!(s.destination, crate::DEFAULT_DESTINATION);
     }
 }

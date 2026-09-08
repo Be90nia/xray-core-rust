@@ -69,8 +69,7 @@ pub struct Client {
     pub final_query: bool,
     /// IP 选项。
     pub ip_option: IpOption,
-    /// 是否跟随系统偏好。
-    pub check_system: bool,
+
     /// 策略 ID（用于多策略路由）。
     pub policy_id: u32,
     /// ActPrior 标记。
@@ -178,7 +177,6 @@ impl Client {
             timeout,
             final_query: ns.final_query,
             ip_option,
-            check_system: matches!(ns.query_strategy, Some(QueryStrategy::UseSys)),
             policy_id: ns.policy_id,
             act_prior: ns.act_prior,
             act_unprior: ns.act_unprior,

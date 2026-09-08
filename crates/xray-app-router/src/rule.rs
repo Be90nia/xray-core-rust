@@ -127,10 +127,9 @@ pub fn build_condition(
     geo_loader: Option<&GeoDataLoader>,
 ) -> Result<Box<dyn Condition>, RouterError> {
     let mut chan = ConditionChan::new();
-
-    // Domain
     if !proto.domain.is_empty() {
-        let rules = parse_proto_domain_rules(&proto.domain, geo_loader);
+        // hn4i：parse_proto_domain_rules 现可返回 Err（fail-closed）。
+        let rules = parse_proto_domain_rules(&proto.domain, geo_loader)?;
         if !rules.is_empty() {
             chan.add(Box::new(DomainMatcherCondition::new(rules)?));
         }
@@ -260,7 +259,7 @@ fn proto_domain_type_to_matcher(v: i32) -> Option<DomainType> {
 fn parse_proto_domain_rules(
     proto_rules: &[xray_proto::xray::common::geodata::DomainRule],
     geo_loader: Option<&GeoDataLoader>,
-) -> Vec<MatcherDomainRule> {
+) -> Result<Vec<MatcherDomainRule>, RouterError> {
     use xray_proto::xray::common::geodata::domain_rule::Value as ProtoDV;
     let mut out: Vec<MatcherDomainRule> = Vec::new();
     for r in proto_rules {
@@ -273,26 +272,20 @@ fn parse_proto_domain_rules(
             }
             ProtoDV::Geosite(geosite_rule) => {
                 let Some(loader) = geo_loader else {
-                    tracing::warn!(
-                        target: "xray_router::rule",
-                        file = geosite_rule.file,
-                        code = geosite_rule.code,
-                        "geosite domain rule present but no geo_loader configured, skipping",
-                    );
-                    continue;
+                    // hn4i：fail-closed。无 loader → 配置错误，整条规则不能启用。
+                    return Err(RouterError::GeodataBuild(format!(
+                        "geosite rule present but no geo_loader configured: file={} code={}",
+                        geosite_rule.file, geosite_rule.code
+                    )));
                 };
                 match load_geosite_to_matcher_rules(geosite_rule, loader) {
                     Ok(rules) => out.extend(rules),
-                    Err(e) => tracing::warn!(
-                        target: "xray_router::rule",
-                        error = %e,
-                        "failed to load geosite rule, skipping",
-                    ),
+                    Err(e) => return Err(e),
                 }
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// 从 dat 文件加载 GeoSite 条目并转换为 matcher DomainRule 列表。
@@ -362,21 +355,18 @@ fn convert_proto_ip_rules(
             }
             ProtoIV::Geoip(geoip_rule) => {
                 let Some(loader) = geo_loader else {
-                    tracing::warn!(
-                        target: "xray_router::rule",
-                        file = geoip_rule.file,
-                        code = geoip_rule.code,
-                        "geoip rule present but no geo_loader configured, skipping",
-                    );
-                    continue;
+                    // hn4i：fail-closed（同 geosite）。无 loader 必须报错。
+                    return Err(RouterError::GeodataBuild(format!(
+                        "geoip rule present but no geo_loader configured: file={} code={}",
+                        geoip_rule.file, geoip_rule.code
+                    )));
                 };
                 match load_geoip_to_matcher_rules(geoip_rule, loader) {
                     Ok(rules) => out.extend(rules),
-                    Err(e) => tracing::warn!(
-                        target: "xray_router::rule",
-                        error = %e,
-                        "failed to load geoip rule, skipping",
-                    ),
+                    Err(e) => {
+                        // hn4i：fail-closed（同 geosite）。
+                        return Err(e);
+                    }
                 }
             }
         }

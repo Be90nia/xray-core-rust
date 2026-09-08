@@ -1710,9 +1710,9 @@ fn build_tls_acceptor(
 
 /// REALITY inbound 配置（从 `realitySettings` 解析）。
 ///
-/// 字段对齐 Go `infra/conf REALITYConfig`：privateKey（base64 RawURL，32B）、
-/// shortIds（hex 白名单）、dest/target（fallback 目标）、xver（PROXY protocol）、
-/// maxTimeDiff（timestamp 容差秒，Go 默认 43200=±12h）。
+/// maxTimeDiff（时间戳容差秒，**0 = 禁用时间窗校验**）。
+/// 来源：Go xtls/reality `tls.go:259` `config.MaxTimeDiff == 0 || time.Since(...).Abs() <= MaxTimeDiff`。
+#[derive(Debug)]
 struct RealityInboundConfig {
     server_private_key: [u8; 32],
     short_ids: Vec<[u8; 8]>,
@@ -1765,10 +1765,23 @@ fn parse_reality_config(
     };
 
     let xver = json.get("xver").and_then(|x| x.as_u64()).unwrap_or(0).min(2) as u8;
-    let max_diff = json
+    // mldsa65Seed：后量子签名未实现（cz5x）。配置在场即显式报错，
+    // 不静默忽略——避免运营者误以为 PQC 已生效。
+    if let Some(seed) = json.get("mldsa65Seed").and_then(|x| x.as_str()) {
+        if !seed.is_empty() {
+            return Err(std::io::Error::other(
+                "reality: mldsa65Seed configured but ML-DSA-65 signing is not implemented \
+                 in Rust (remove mldsa65Seed or use a Go server)",
+            ));
+        }
+    }
+    // maxTimeDiff：Go 默认 0（禁用），单位毫秒 → 转换为秒传给 verify。
+    // 缺省注入 43200（原 Rust 行为）会让 Go 兼容配置（无字段）的客户端被强制±12h 窗。
+    let max_diff_ms = json
         .get("maxTimeDiff")
         .and_then(|x| x.as_u64())
-        .unwrap_or(43200) as u32;
+        .unwrap_or(0);
+    let max_diff = (max_diff_ms / 1000) as u32;
 
     Ok(RealityInboundConfig {
         server_private_key: key,
@@ -3913,7 +3926,9 @@ mod tests {
             "shortIds": ["", "0123456789abcdef"],
             "target": "example.com:443",
             "xver": 1,
-            "maxTimeDiff": 300
+            // maxTimeDiff 单位毫秒（Go `time.Duration(c.MaxTimeDiff) * time.Millisecond`）。
+            // 30000 ms = 30s → 转秒后 30。
+            "maxTimeDiff": 30000
         });
         let settings = xray_transport::dialer::StreamSettings {
             security: "reality".to_string(),
@@ -3927,14 +3942,14 @@ mod tests {
         assert_eq!(cfg.short_ids[1][0], 0x01);
         assert_eq!(cfg.fallback_dest, "example.com:443");
         assert_eq!(cfg.xver, 1);
-        assert_eq!(cfg.max_diff, 300);
+        assert_eq!(cfg.max_diff, 30);
     }
 
     #[test]
     fn parse_reality_config_port_dest_and_defaults() {
         use base64::Engine as _;
         let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
-        // dest 为 int 端口 → localhost:port；缺省 xver=0/maxTimeDiff=43200/shortIds=[0u8;8]
+        // dest 为 int 端口 → localhost:port；缺省 xver=0/maxTimeDiff=0（Go 兼容：禁用时间窗）/shortIds=[0u8;8]
         let json = serde_json::json!({
             "privateKey": key_b64,
             "dest": 8443
@@ -3947,7 +3962,7 @@ mod tests {
         let cfg = parse_reality_config(&settings).unwrap();
         assert_eq!(cfg.fallback_dest, "localhost:8443");
         assert_eq!(cfg.xver, 0);
-        assert_eq!(cfg.max_diff, 43200);
+        assert_eq!(cfg.max_diff, 0);
         assert_eq!(cfg.short_ids, vec![[0u8; 8]]);
     }
 
@@ -3960,7 +3975,28 @@ mod tests {
         };
         assert!(parse_reality_config(&settings).is_err());
     }
-    use xray_app_dispatcher::default::SimpleOhm;
+
+    /// mldsa65 后未实现：JSON 端必须显式报错不静默忽略（cz5x）。
+    #[test]
+    fn parse_reality_config_rejects_mldsa65_seed() {
+        use base64::Engine as _;
+        let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let json = serde_json::json!({
+            "privateKey": key_b64,
+            "mldsa65Seed": "deadbeef00000000000000000000000000000000000000000000000000000000",
+        });
+        let settings = xray_transport::dialer::StreamSettings {
+            security: "reality".to_string(),
+            security_json: Some(json),
+            ..xray_transport::dialer::StreamSettings::tcp()
+        };
+        let err = parse_reality_config(&settings).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mldsa65") && msg.contains("not implemented"),
+            "expected mldsa65 not implemented error, got: {msg}"
+        );
+    }
     use xray_proxy_freedom::make_freedom_dial_fn;
     use xray_proxy_socks::protocol::{ATYP_DOMAIN, ATYP_IPV4};
 

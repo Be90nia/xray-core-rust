@@ -253,7 +253,8 @@ pub struct SessionPayload {
 /// # 参数
 /// - `plaintext_16`：[`decrypt_session_id`] 返回的 16 字节明文
 /// - `now_unix`：当前 Unix 时间戳（秒）
-/// - `max_diff`：允许的时间偏差（秒）
+/// - `max_diff`：允许的时间偏差（秒）。**`0` 表示禁用时间窗校验**（对齐 Go xtls/reality
+///   `tls.go:259` 的 `config.MaxTimeDiff == 0 || time.Since(...).Abs() <= MaxTimeDiff`）。
 /// - `short_ids`：服务端 short_id 白名单（每个 8 字节）
 pub fn verify_session_payload(
     plaintext_16: &[u8; 16],
@@ -273,17 +274,22 @@ pub fn verify_session_payload(
     short_id.copy_from_slice(&plaintext_16[8..16]);
 
     // timestamp 窗口校验（双向：防重放 + 防过期）
-    let diff = if now_unix >= timestamp {
-        now_unix - timestamp
-    } else {
-        timestamp - now_unix
-    };
-    if diff > max_diff {
-        return Err(RealityError::TimestampOutOfWindow {
-            actual: timestamp,
-            expected: now_unix,
-            max_diff,
-        });
+    //
+    // `max_diff == 0` → 禁用校验（Go `MaxTimeDiff == 0 || ...` 短路语义）。
+    // 注意：之前 `diff > 0` 会拒任何非零偏差，与 Go 缺省禁用语义颠倒。
+    if max_diff != 0 {
+        let diff = if now_unix >= timestamp {
+            now_unix - timestamp
+        } else {
+            timestamp - now_unix
+        };
+        if diff > max_diff {
+            return Err(RealityError::TimestampOutOfWindow {
+                actual: timestamp,
+                expected: now_unix,
+                max_diff,
+            });
+        }
     }
 
     // short_id 白名单校验
@@ -747,6 +753,20 @@ mod tests {
         let short_ids = vec![[0xaa; 8]];
         let err = verify_session_payload(&plaintext, 1_700_000_300, 120, &short_ids).unwrap_err();
         assert!(matches!(err, RealityError::TimestampOutOfWindow { .. }));
+    }
+
+    /// `max_diff == 0` 禁用时间窗校验（对齐 Go `MaxTimeDiff == 0 || ...` 短路语义）。
+    /// 之前 `diff > 0` 会拒任何非零偏差——颠倒语义。
+    #[test]
+    fn verify_session_payload_zero_max_diff_disables_window() {
+        let mut plaintext = [0u8; 16];
+        plaintext[0..3].copy_from_slice(&[1, 8, 1]);
+        plaintext[4..8].copy_from_slice(&1_700_000_000u32.to_be_bytes());
+        plaintext[8..16].copy_from_slice(&[0xaa; 8]);
+        let short_ids = vec![[0xaa; 8]];
+        // 客户端时间偏离 100000s（远超任何合理窗），但 max_diff=0 应放行
+        let payload = verify_session_payload(&plaintext, 1_700_100_000, 0, &short_ids).unwrap();
+        assert_eq!(payload.timestamp, 1_700_000_000);
     }
 
     #[test]

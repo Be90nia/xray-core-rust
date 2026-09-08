@@ -593,25 +593,36 @@ fn parse_routing_json_to_proto(
         }
     }
 
-    // 顶层 balancers → BalancingRule。strategy 取 `{"type":"..."}` 或裸字符串。
+    // 顶层 balancers → BalancingRule。strategy 取 `{"type":"..."}` 或裸字符串；
+    // strategy:{"type":"leastload", settings:{...}} 子对象 settings 经 JSON→proto 编码为
+    // TypedMessage（rttb：原实现整段丢弃→LeastLoad 调优参数全部回落默认）。
     if let Some(arr) = v.get("balancers").and_then(|b| b.as_array()) {
         for b in arr {
             let tag = b.get("tag").and_then(|x| x.as_str()).unwrap_or("");
             if tag.is_empty() {
                 continue;
             }
-            let strategy = match b.get("strategy") {
-                Some(serde_json::Value::String(s)) => s.clone(),
+            let (strategy, strategy_settings) = match b.get("strategy") {
+                Some(serde_json::Value::String(s)) => (s.clone(), None),
                 Some(serde_json::Value::Object(o)) => {
-                    o.get("type").and_then(|x| x.as_str()).unwrap_or("").to_string()
+                    let ty = o.get("type").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    let settings = o.get("settings").and_then(|v| {
+                        // leastload settings JSON → proto + TypedMessage.bytes
+                        if ty == "leastload" {
+                            leastload_settings_to_typed_message(v)
+                        } else {
+                            None
+                        }
+                    });
+                    (ty, settings)
                 }
-                _ => String::new(),
+                _ => (String::new(), None),
             };
             cfg.balancing_rule.push(BalancingRule {
                 tag: tag.to_string(),
                 outbound_selector: json_string_list(b.get("selector")),
                 strategy,
-                strategy_settings: None,
+                strategy_settings,
                 fallback_tag: b
                     .get("fallbackTag")
                     .and_then(|x| x.as_str())
@@ -620,9 +631,58 @@ fn parse_routing_json_to_proto(
             });
         }
     }
-
-    // TODO(rule_set): proto `RoutingRule` 无 rule_set 字段（proto 版本较早，
-    // 见 xray-app-router/src/rule_set.rs）。本地/远程 rule_set 需 proto 升级后接入。
+    // kfbd：顶层 `ruleSet` JSON 数组 → 显式校验 + 加载。proto 暂未升级支持
+    // RoutingRule.rule_set 引用字段（见 xray-app-router/src/rule_set.rs TODO），
+    // 故 Registry 不会被 Router 使用；但配置错误必须现在就暴露，不能等到
+    // 远端首次请求才发现错配。
+    if let Some(arr) = v.get("ruleSet").and_then(|x| x.as_array()) {
+        let mut registry = xray_app_router::RuleSetRegistry::new();
+        let mut seen_tags: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for rs in arr {
+            let tag = rs.get("tag").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            if tag.is_empty() {
+                return Err(WiringError::JsonParse("ruleSet entry missing tag".into()));
+            }
+            if !seen_tags.insert(tag.clone()) {
+                return Err(WiringError::JsonParse(format!("duplicate ruleSet tag '{tag}'")));
+            }
+            let r#type = rs.get("type").and_then(|x| x.as_str()).unwrap_or("");
+            let path = rs.get("path").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let url = rs.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let format = rs.get("format").and_then(|x| x.as_str()).unwrap_or("json");
+            let (rs_type, rs_format) = match (r#type, format) {
+                ("file", "json") | ("", "json") if !path.is_empty() => (
+                    xray_app_router::RuleSetType::File,
+                    xray_app_router::RuleSetFormat::Json,
+                ),
+                ("file", _) => {
+                    return Err(WiringError::JsonParse(format!(
+                        "ruleSet '{tag}': unsupported format '{format}', only 'json' is implemented"
+                    )));
+                }
+                ("remote", _) | ("", _) if !url.is_empty() => {
+                    return Err(WiringError::JsonParse(format!(
+                        "ruleSet '{tag}': remote rule_set download is not implemented (set type='file' and provide path)"
+                    )));
+                }
+                (other, _) => {
+                    return Err(WiringError::JsonParse(format!(
+                        "ruleSet '{tag}': unknown type '{other}', must be 'file' (path) or omit + provide path"
+                    )));
+                }
+            };
+            let cfg_rs = xray_app_router::RuleSetConfig {
+                tag: tag.clone(),
+                rule_set_type: rs_type,
+                format: rs_format,
+                path,
+                url,
+            };
+            registry
+                .load(&cfg_rs)
+                .map_err(|e| WiringError::JsonParse(format!("ruleSet '{tag}': {e}")))?;
+        }
+    }
 
     // 编码一次以验证 Config 结构合法（同 prost 语义）
     let _ = cfg.encode_to_vec();
@@ -728,22 +788,81 @@ fn json_str_iter<'a>(v: Option<&'a serde_json::Value>) -> Box<dyn Iterator<Item 
     }
 }
 
-/// 把 "1.2.3.0/24" 解析为 `CidrRule`（IPRule.custom 变体），不依赖 geoip.dat。
+/// 把 `"1.2.3.0/24"` 或裸 IP `"1.2.3.4"` 解析为 `CidrRule`。
+/// 裸 IP 自动取全前缀（IPv4=/32、IPv6=/128）。
+///
+/// tc33：原实现 `split_once('/')` 对裸 IP 返 None，整条规则静默丢失——
+/// `ipsExcluded: ["8.8.8.8"]` 仅 IP 字面就静默失效。
 fn parse_cidr_to_ip_rule(s: &str) -> Option<CidrRule> {
     use xray_proto::xray::common::geodata::{Cidr, CidrRule};
-    let (ip_part, bits_part) = s.split_once('/')?;
-    let bits: u32 = bits_part.parse().ok()?;
-    let ip_vec: Vec<u8> = if let Ok(v4) = ip_part.parse::<std::net::Ipv4Addr>() {
-        v4.octets().to_vec()
+    let (ip_part, prefix) = match s.split_once('/') {
+        Some((ip_s, bits_s)) => {
+            let bits: u32 = bits_s.parse().ok()?;
+            (ip_s, bits)
+        }
+        // tc33：裸 IP 自动全前缀（IPv4=/32、IPv6=/128）。
+        None => (s, 0),
+    };
+    let (ip_vec, full_prefix) = if let Ok(v4) = ip_part.parse::<std::net::Ipv4Addr>() {
+        (v4.octets().to_vec(), 32)
     } else if let Ok(v6) = ip_part.parse::<std::net::Ipv6Addr>() {
-        v6.octets().to_vec()
+        (v6.octets().to_vec(), 128)
     } else {
         return None;
     };
-    let prefix = bits.min(u32::from(u8::MAX));
+    let final_prefix = if prefix == 0 { full_prefix } else { prefix.min(u32::from(u8::MAX)) };
     Some(CidrRule {
-        cidr: Some(Cidr { ip: ip_vec, prefix }),
+        cidr: Some(Cidr { ip: ip_vec, prefix: final_prefix }),
         reverse_match: false,
+    })
+}
+/// rttb：JSON `strategy.settings`（leastload 调优参数）→ `StrategyLeastLoadConfig`
+/// proto bytes，再包成 `TypedMessage`。
+///
+/// JSON 字段命名对齐 Go `infra/conf/router.go`：`baselines`/`expectedNodes`/
+/// `maxRTT`/`tolerance`/`costs`（costs 子字段 `regexp`/`match`/`value`）。
+/// 编码失败 → `None`（消费端走默认，避免 hard-error 阻断整个 balancer）。
+fn leastload_settings_to_typed_message(v: &serde_json::Value) -> Option<xray_proto::xray::common::serial::TypedMessage> {
+    use prost::Message;
+    use xray_proto::xray::app::router::{StrategyLeastLoadConfig, StrategyWeight};
+    let obj = v.as_object()?;
+    let mut cfg = StrategyLeastLoadConfig::default();
+    if let Some(arr) = obj.get("baselines").and_then(|x| x.as_array()) {
+        cfg.baselines = arr
+            .iter()
+            .filter_map(|x| x.as_i64())
+            .collect();
+    }
+    // Go `expectedNodes` → proto `expected`
+    if let Some(n) = obj.get("expectedNodes").and_then(|x| x.as_i64()) {
+        cfg.expected = n as i32;
+    }
+    if let Some(n) = obj.get("maxRTT").and_then(|x| x.as_i64()) {
+        cfg.max_rtt = n;
+    }
+    if let Some(t) = obj.get("tolerance").and_then(|x| x.as_f64()) {
+        cfg.tolerance = t as f32;
+    }
+    if let Some(arr) = obj.get("costs").and_then(|x| x.as_array()) {
+        cfg.costs = arr
+            .iter()
+            .filter_map(|c| {
+                let o = c.as_object()?;
+                Some(StrategyWeight {
+                    regexp: o.get("regexp").and_then(|v| v.as_bool()).unwrap_or(false),
+                    r#match: o.get("match").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    value: o.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                })
+            })
+            .collect();
+    }
+    let mut buf = Vec::with_capacity(cfg.encoded_len());
+    if prost::Message::encode(&cfg, &mut buf).is_err() {
+        return None;
+    }
+    Some(xray_proto::xray::common::serial::TypedMessage {
+        r#type: "xray.app.router.StrategyLeastLoadConfig".to_string(),
+        value: buf,
     })
 }
 
@@ -804,11 +923,10 @@ mod tests {
         let r = Router::empty(Arc::new(NotImplementedSelector), None);
         let adapter = RouterAdapter::new(r);
         let dest = Destination::new(
-            Address::Domain("test.com".into()),
+            Address::Domain("test".to_string()),
             Port::new(80),
             Network::TCP,
         );
-        // empty router → pick_outbound_tag 返回 None
         assert!(adapter.pick_outbound_tag(&dest).is_none());
     }
 
@@ -890,7 +1008,6 @@ mod tests {
         // balancers → BalancingRule
         assert_eq!(cfg.balancing_rule.len(), 1);
         let br = &cfg.balancing_rule[0];
-        assert_eq!(br.tag, "bal");
         assert_eq!(br.outbound_selector, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(br.strategy, "random");
         assert_eq!(br.fallback_tag, "direct");
@@ -935,6 +1052,44 @@ mod tests {
 
         // attributes map
         assert_eq!(rule.attributes.get("sinkhole").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn parse_routing_json_leastload_settings_serializes_to_typed_message() {
+        // rttb：`strategy:{"type":"leastload", settings:{...}}` 必须把 settings
+        // 序列化为 TypedMessage，否则消费端 build_balancer 走 default，
+        // LeastLoad 调优参数全部静默回落。
+        use prost::Message;
+        let json = br#"{
+            "balancers":[{
+                "tag":"bl",
+                "selector":["a","b"],
+                "strategy":{
+                    "type":"leastload",
+                    "settings":{
+                        "baselines":[100,200,300],
+                        "expectedNodes":2,
+                        "maxRTT":500,
+                        "tolerance":0.5,
+                        "costs":[{"match":"a","value":1.5},{"match":"b","value":2.0}]
+                    }
+                }
+            }]
+        }"#;
+        let cfg = parse_routing_json_to_proto(json).expect("parse");
+        let br = &cfg.balancing_rule[0];
+        assert_eq!(br.strategy, "leastload");
+        let ts = br.strategy_settings.as_ref().expect("strategy_settings must be Some");
+        assert_eq!(ts.r#type, "xray.app.router.StrategyLeastLoadConfig");
+        let cfg_decoded = xray_proto::xray::app::router::StrategyLeastLoadConfig::decode(ts.value.as_slice())
+            .expect("decode");
+        assert_eq!(cfg_decoded.baselines, vec![100, 200, 300]);
+        assert_eq!(cfg_decoded.expected, 2);
+        assert_eq!(cfg_decoded.max_rtt, 500);
+        assert_eq!(cfg_decoded.costs.len(), 2);
+        assert_eq!(cfg_decoded.costs[0].r#match, "a");
+        assert!((cfg_decoded.costs[0].value - 1.5).abs() < 1e-5);
+
     }
 
     #[test]

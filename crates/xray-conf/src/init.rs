@@ -27,6 +27,7 @@ use crate::lint::{register_stage, LintError, LintStage};
 /// 在 `infra/conf` 包初始化时自动执行。
 pub fn register_builtin_stages() {
     register_stage(Arc::new(FakeDnsStage));
+    register_stage(Arc::new(ValidationStage));
 }
 
 /// FakeDNS 后处理阶段。对应 Go `infra/conf.fakeDNSPostProcessingStage`。
@@ -119,6 +120,87 @@ impl LintStage for FakeDnsStage {
 
         Ok(())
     }
+}
+
+/// Build 期校验：捕获三处 Go 硬错 Rust 静默的配置形态（2cq2）。
+///
+/// 1. `inbounds[].sniffing.destOverride[]` 含未知协议——Go `SniffingConfig.Build`
+///    对每个 protocol 做 `switch`，未知值 `errors.New("unknown protocol: ...")`
+///    启动期硬拒。Rust 当前切片仅透传字符串，下游 `should_override` 前缀匹配
+///    永远不命中（不会 crash 但永远不覆盖），等于静默丢配置。
+/// 2. `outbounds[].mux.xudpProxyUDP443` 非法值（不在 `{reject, allow, skip}`）—
+///    Go `MuxConfig.Build` 直接返回错误；Rust `Udp443Policy::from_mux` 返回 None
+///    并被 `tracing::warn` 忽略（outbound.rs:516-518），降级为无策略。
+/// 3. `burstObservatory` 启用但 `pingConfig` 缺失——Go `BurstObservatoryConfig.Build`
+///    必拒；Rust `burst_observatory_factory` 把 None 透传给 feature，启动后跑无
+///    配置的观测循环。
+///
+/// 阶段名 `Validation` 与 Go `RegisterConfigureFilePostProcessingStage` 命名风格一致。
+pub struct ValidationStage;
+
+impl LintStage for ValidationStage {
+    fn name(&self) -> &'static str {
+        "Validation"
+    }
+
+    fn process(&self, cfg: &mut Config) -> Result<(), LintError> {
+        // 1. destOverride 未知协议（启用 sniffing 才校验）。
+        for ib in &cfg.inbound_configs {
+            let Some(sn) = ib.sniffing.as_ref() else { continue };
+            if !sn.enabled {
+                continue;
+            }
+            for d in &sn.dest_override.0 {
+                if !is_known_dest_override(d) {
+                    tracing::warn!(
+                        target: "xray_conf",
+                        inbound = %ib.tag,
+                        dest_override = %d,
+                        "unknown sniffing destOverride protocol (Go rejects at build time); accepted as-is and ignored",
+                    );
+                }
+            }
+        }
+
+        // 2. xudpProxyUDP443 非法值。
+        for ob in &cfg.outbound_configs {
+            let Some(mux) = ob.mux.as_ref() else { continue };
+            if mux.xudp_proxy_udp_443.is_empty() {
+                continue; // 空串规范化为 reject（与 Go MuxConfig.Build 一致）
+            }
+            if !matches!(mux.xudp_proxy_udp_443.as_str(), "reject" | "allow" | "skip") {
+                tracing::warn!(
+                    target: "xray_conf",
+                    outbound = %ob.tag,
+                    value = %mux.xudp_proxy_udp_443,
+                    "unknown mux.xudpProxyUDP443 value (Go rejects at build time); ignoring udp443 policy",
+                );
+            }
+        }
+
+        // 3. burstObservatory 启用但 pingConfig 缺失。
+        if let Some(b) = cfg.burst_observatory.as_ref() {
+            if b.ping_config.is_none() {
+                tracing::warn!(
+                    target: "xray_conf",
+                    "burstObservatory enabled but pingConfig missing (Go rejects at build time); feature will run without ping config",
+                );
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// destOverride 已知协议集合（与 Go `infra/conf/xray.go:65-79` switch 对齐）。
+///
+/// 注意：`fakedns+others` 与 `fakedns` 都映射到 fakedns，是同一个嗅探协议的
+/// 两种触发写法，故两个都算合法。`https` / `ssl` 映射到 `tls`。
+fn is_known_dest_override(s: &str) -> bool {
+    matches!(
+        s.to_ascii_lowercase().as_str(),
+        "http" | "tls" | "https" | "ssl" | "quic" | "fakedns" | "fakedns+others"
+    )
 }
 
 /// 扫描 `cfg.dns.servers[]`：任一地址为 `"fakedns"`（domain family）即视为启用。
@@ -355,5 +437,103 @@ mod tests {
         };
         post_process(&mut cfg).unwrap();
         assert!(cfg.fake_dns.is_some());
+    }
+
+    // ========== ValidationStage tests（2cq2）==========
+
+    #[test]
+    fn validation_warns_on_unknown_dest_override() {
+        let _g = TEST_LOCK.lock();
+        clear_stages();
+        register_builtin_stages();
+        let mut cfg = Config {
+            inbound_configs: vec![crate::config::InboundDetourConfig {
+                protocol: "vless".into(),
+                tag: "in".into(),
+                sniffing: Some(crate::config::SniffingConfig {
+                    enabled: true,
+                    dest_override: crate::common::StringList(vec![
+                        "http".into(),
+                        "bogus".into(), // 未知
+                    ]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // 验证阶段不应阻断配置加载（Go 硬错，Rust 仅警告；保生产兼容）。
+        post_process(&mut cfg).unwrap();
+    }
+
+    #[test]
+    fn validation_accepts_all_known_dest_overrides() {
+        // http/tls/https/ssl/quic/fakedns/fakedns+others 都应通过。
+        for known in ["http", "tls", "https", "ssl", "quic", "fakedns", "fakedns+others"] {
+            assert!(
+                is_known_dest_override(known),
+                "destOverride protocol {known:?} must be accepted"
+            );
+        }
+        assert!(!is_known_dest_override("bogus"));
+        // 大小写不敏感：Go switch 用 strings.ToLower
+        assert!(is_known_dest_override("HTTP"));
+    }
+
+    #[test]
+    fn validation_warns_on_bad_xudp_proxy_udp443() {
+        let _g = TEST_LOCK.lock();
+        clear_stages();
+        register_builtin_stages();
+        let mut cfg = Config {
+            outbound_configs: vec![crate::config::OutboundDetourConfig {
+                protocol: "vless".into(),
+                tag: "ob".into(),
+                mux: Some(crate::config::MuxConfig {
+                    enabled: true,
+                    xudp_proxy_udp_443: "bogus".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        post_process(&mut cfg).unwrap();
+    }
+
+    #[test]
+    fn validation_silent_on_valid_xudp_proxy_udp443() {
+        let _g = TEST_LOCK.lock();
+        clear_stages();
+        register_builtin_stages();
+        let mut cfg = Config {
+            outbound_configs: vec![crate::config::OutboundDetourConfig {
+                protocol: "vless".into(),
+                tag: "ob".into(),
+                mux: Some(crate::config::MuxConfig {
+                    enabled: true,
+                    xudp_proxy_udp_443: "skip".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+             }],
+            ..Default::default()
+         };
+         post_process(&mut cfg).unwrap();
+     }
+
+    #[test]
+    fn validation_warns_on_burst_missing_ping_config() {
+        let _g = TEST_LOCK.lock();
+        clear_stages();
+        register_builtin_stages();
+        let mut cfg = Config {
+            burst_observatory: Some(crate::app_config::BurstObservatoryConfig {
+                subject_outbound: Some("p1".into()),
+                ping_config: None, // 缺失
+            }),
+            ..Default::default()
+        };
+        post_process(&mut cfg).unwrap();
     }
 }

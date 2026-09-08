@@ -255,18 +255,38 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
             let r=http::Response::builder().status(404).body(()).unwrap();
             let _=respond.send_response(r,true); continue;
         }
+        // lv34：gRPC 客户端必须发 application/grpc（gRPC wire spec §Content-Type），
+        // 否则 Go hub.go:104 直接 415 Unimplemented。
+        // 缺此校验=任意 content-type 一律 200，主动探测面与 Go 可区分。
+        let req_ct = req
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !req_ct.starts_with("application/grpc") {
+            let r = http::Response::builder().status(415).body(()).unwrap();
+            let _ = respond.send_response(r, true);
+            continue;
+        }
         if let Some(expected) = &expected_path {
             if req.uri().path() != expected {
-                let r=http::Response::builder().status(404).body(()).unwrap();
-                let _=respond.send_response(r,true); continue;
+                let r = http::Response::builder().status(404).body(()).unwrap();
+                let _ = respond.send_response(r, true);
+                continue;
             }
         }
-        let mut recv_body=req.into_body();
-        let mut send_resp=match respond.send_response(http::Response::builder().status(200)
-            // Go grpc-go 校验响应 content-type（缺失报 "malformed header: missing HTTP content-type"）
-            .header("content-type","application/grpc").body(()).unwrap(),false){Ok(s)=>s,Err(_)=>continue};
-        let (client,server)=tokio::io::duplex(64*1024);
-        let h2=handler.clone();
+        let mut recv_body = req.into_body();
+        let mut send_resp = match respond.send_response(
+            http::Response::builder().status(200)
+                // Go grpc-go 校验响应 content-type（缺失报 "malformed header: missing HTTP content-type"）
+                .header("content-type", "application/grpc").body(()).unwrap(),
+            false,
+        ) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let h2 = handler.clone();
         tokio::spawn(async move {
             let (mut rd,mut wr)=tokio::io::split(server);
             // Go grpc-gun server 语义对称（参考 dial_h2）：下行 DATA 必须是

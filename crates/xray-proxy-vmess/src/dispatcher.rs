@@ -248,22 +248,19 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>) -> DialFn {
             //    客户端发送具体 security 字节，服务端直接使用 → 两端 body 算法必一致。
             let security = resolve_security(config.security)
                 .map_err(|e| format!("vmess resolve security: {e}"))?;
-            // 3. 构造请求头（resolved security）+ body option bits
+            // 3. 构造请求头（resolved security）+ body option bits。
+            // rmgy：CHUNK_MASKING (0x04) / GLOBAL_PADDING (0x08) 的判定基于
+            // **resolved** security 而非 config.security。之前 config=Auto 路径
+            // `use_masking` 为 false（Auto 不在 matches 里），缺 Go AEAD 档常态
+            // 特征成 DPI 指纹差。Go client：Auto 落地 GCM/ChaCha 必然 0x04+0x08。
             let mut option = Bitmask::new(request_option::CHUNK_STREAM);
             let use_masking = matches!(
-                config.security,
+                security,
                 SecurityType::Aes128Gcm | SecurityType::Chacha20Poly1305
             );
             if use_masking {
                 option.set(request_option::CHUNK_MASKING);
-                if matches!(
-                    config.security,
-                    SecurityType::Aes128Gcm
-                        | SecurityType::Chacha20Poly1305
-                        | SecurityType::Auto
-                ) {
-                    option.set(request_option::GLOBAL_PADDING);
-                }
+                option.set(request_option::GLOBAL_PADDING);
             }
             let account = MemoryAccount::new(config.user_uuid.clone())
                 .with_security(security.clone());

@@ -309,12 +309,24 @@ fn reality_server_config(
         Some(port) => format!("localhost:{port}"),
         None => dest_raw.as_str().unwrap_or("localhost:443").to_string(),
     };
-
     let xver = json.get("xver").and_then(|x| x.as_u64()).unwrap_or(0).min(2) as u8;
-    let max_time_diff = json
+    // mldsa65Seed：后量子签名未实现（cz5x）。配置在场即显式报错，
+    // 不静默忽略——避免运营者误以为 PQC 已生效。
+    if let Some(seed) = json.get("mldsa65Seed").and_then(|x| x.as_str()) {
+        if !seed.is_empty() {
+            return Err(io::Error::other(
+                "reality: mldsa65Seed configured but ML-DSA-65 signing is not implemented \
+                 in Rust (remove mldsa65Seed or use a Go server)",
+            ));
+        }
+    }
+    // maxTimeDiff：Go 默认 0（禁用），单位毫秒 → 转换为秒传给 verify。
+    // 之前注入 43200 + 按秒解释 = 三重语义偏差（详见 docs/audit/crypto.md）。
+    let max_time_diff_ms = json
         .get("maxTimeDiff")
         .and_then(|x| x.as_u64())
-        .unwrap_or(43200) as u32;
+        .unwrap_or(0);
+    let max_time_diff = (max_time_diff_ms / 1000) as u32;
 
     Ok(Some(RealityServerConfig {
         private_key,

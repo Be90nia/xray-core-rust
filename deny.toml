@@ -1,16 +1,20 @@
-# cargo-deny 配置
+# cargo-deny 配置（0.20 schema）
 # 许可证和安全审计
 
 [advisories]
 db-path = "~/.cargo/advisory-db"
-vulnerability = "deny"
-unmaintained = "warn"
-unsound = "deny"
-yanked = "warn"
-notice = "warn"
+# RUSTSEC-2026-0002 + 0253（lru 双 unsound）：全仓零 `iter_mut/pop` 调用，
+# 当前实际暴露低；先 ignore 留档，后续小步升级 0.18.2+（n5yi）。
+ignore = [
+    "RUSTSEC-2026-0002", # lru 0.12.5 IterMut Stacked Borrows 违反
+    "RUSTSEC-2026-0253", # lru 0.12.5 pop() 非 panic-safe UAF
+    # 已知无修复 / 传递路径无替代
+    "RUSTSEC-2023-0071", # rsa 0.9 Marvin Attack
+    "RUSTSEC-2024-0436", # paste 1.0.15 (netlink→netconfig-rs)
+    "RUSTSEC-2025-0134", # rustls-pemfile unmaintained,迁移到 rustls-pki-types 内置 PEM
+]
 
 [licenses]
-unlicensed = "deny"
 allow = [
     "MIT",
     "Apache-2.0",
@@ -23,10 +27,12 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "0BSD",
+    # anytls → socks5-impl (GPL-3.0-or-later, 已既定引入)
+    "GPL-3.0-or-later",
+    # tokio-tungstenite → webpki-roots (CDLA-Permissive-2.0)
+    "CDLA-Permissive-2.0",
 ]
-default = "deny"
-copyleft = "warn"
-allow-osi-fsf-free = "neither"
+confidence-threshold = 0.8
 
 [[licenses.clarify]]
 name = "ring"
@@ -35,13 +41,19 @@ license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+# workspace path deps (crate 间引用全部走 `path = "../..."`) 在 deny 0.20 视为 wildcard。
+# 全部 `path` 约束是合法 workspace 模式，不可能带 patch 版本。设为 "allow"。
+wildcards = "allow"
 highlight = "all"
-skip = []
 skip-tree = []
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# 已既定 patch 段（rustls/tokio-rustls 来自 Watfaq fork；btls/tokio-btls/btls-sys 来自 0x676e67/btls）
+allow-git = [
+    "https://github.com/Watfaq/rustls",
+    "https://github.com/Watfaq/tokio-rustls",
+    "https://github.com/0x676e67/btls",
+]

@@ -48,11 +48,12 @@ impl ConnectionCloser for ListenerWriter {
 - 影响：Rust 每个已 ACK 但处于 rto/2(≥20ms) 节流窗内的 number 不会被捎带补发，丢包路径下对端 fast-retransmit 触发变慢（依赖 HandleFastAck 的冗余 ACK 减少）；同时留下永不执行的分支。
 - 修复：`Vec::with_capacity(128)` 即可恢复 Go 语义。
 
-### [P2] kcpSettings 零校验（mtu≥21 / tti∈[10,1000] / cwndMultiplier≥1，负数回绕）
-- 位置：`crates/xray-transport-kcp/src/register.rs:221-253`（`parse_kcp_config` 逐字段 `as_i64 → as u32` 直接赋值）
-- Go 对照：`infra/conf/transport_method.go:564-577`：`Mtu<21` / `tti<10||tti>1000` / `CwndMultiplier<1` / `GetSendingBufferSize()==0` 四条硬校验，违者启动报错；且 JSON number 解析阶段负数进不了 `*uint32`。
-- 影响：`mtu=0/-1`（回绕成 4294967295）等非法配置静默接受：`mss=mtu-18` 饱和为 0 → `Connection::write` 全部产出 0 长度段；`tti=1` 时 updater 每 1ms 空转 flush。行为与 Go 完全相反（Go fail-fast）。
-- 修复：parse 末尾补 Go 同款四条校验；`as u32` 前检查非负。
+### ~~[P2] kcpSettings 零校验（mtu≥21 / tti∈[10,1000] / cwndMultiplier≥1，负数回绕）~~ → **tslk 已修**
+- 位置：`crates/xray-transport-kcp/src/register.rs:217-360`（`parse_kcp_config` 全字段非数字/负数/范围检查）
+- Go 对照：`infra/conf/transport_method.go:562-573`：`Mtu<21` / `tti<10||tti>1000` / `CwndMultiplier<1` / `GetSendingBufferSize()==0` 四条硬校验，违者启动报错；JSON number 解析阶段负数进不了 `*uint32`。
+- 修：parse 末尾补 Go 同款四条校验；`as_i64() → as u32` 前检查非负（负数先于范围检查报错，避免回绕成 u32 大值绕过）。13 个新单测覆盖：mtu<21 / mtu<0 / tti<10 / tti>1000 / tti<0 / cwndMultiplier==0 / cwndMultiplier<0 / maxSendingWindow<mtu / uplink<0 / downlink<0 / maxSendingWindow<0 / 最小有效（mtu=21,tti=10,cwnd=1,sw=21）/ mtu 非数字。
+- 残留：参数已合法后派生公式（`config.rs:8-18`）的 Go 语义同款（`GetSendingBufferSize`/`GetSendingInFlightSize`），无新增；运行时 `mss=mtu-18` 饱和、`updater` 空转等问题随配置合法自动消失。
+- 验证：`xray-transport-kcp --lib` 161/161 PASS（含 13 tslk 新测）；`xray-conf --lib` 188/188 PASS（无回归）。
 
 ### [P2] UDP 收包缓冲 1500B 硬截断（Go 为 buf.Size=2048）
 - 位置：`crates/xray-transport-kcp/src/udp_hub.rs:97`（服务端 `recv_from` 缓冲）、`:162`（客户端 `StdPacketInput::read_packet` 同为 1500）

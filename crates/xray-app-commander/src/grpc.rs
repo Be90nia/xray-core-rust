@@ -60,12 +60,10 @@ use xray_proto::xray::core::app::observatory::command::observatory_service_serve
     ObservatoryService as ProtoObservatoryService, ObservatoryServiceServer,
 };
 
+use xray_common::net::port::Port;
+
 use crate::outbound::HandlerManager;
 use crate::server::OutboundHandlerRegistry;
-
-// ===========================================================================
-// OutboundRuntime（bd ze3：HandlerService 运行时注入）
-// ===========================================================================
 
 /// HandlerService 的 outbound 运行时注入 trait（bd ze3）。
 ///
@@ -767,7 +765,16 @@ impl ProtoObservatoryService for ObservatoryServiceImpl {
 ///
 /// 字段映射（proto command.proto:15-31）：InboundTag/Network/SourceIPs/TargetIPs/
 /// SourcePort/TargetPort/TargetDomain/Protocol/User/Attributes/LocalIPs/LocalPort/
-/// VlessRoute。
+/// r9h0：port 字段在 proto 层为 u32，但 Rust Port 仅接受 u16。超 u16::MAX 时
+/// warn 并 clamp 到 u16::MAX（保留连接行为，避免静默截断到错误端口如 70000→4464）。
+fn port_to_u16(raw: u32) -> Port {
+    if raw > u32::from(u16::MAX) {
+        tracing::warn!(port = raw, "port exceeds u16::MAX, clamping to 65535");
+        return Port::new(u16::MAX);
+    }
+    Port::new(raw as u16)
+}
+
 fn proto_routing_context_to_data(p: &prouter::RoutingContext) -> xray_app_router::context::RoutingData {
     use xray_app_router::context::RoutingData;
     use xray_common::net::network::Network;
@@ -798,13 +805,13 @@ fn proto_routing_context_to_data(p: &prouter::RoutingContext) -> xray_app_router
     RoutingData {
         target_ips: ips(&p.target_i_ps),
         target_domain: p.target_domain.clone(),
-        target_port: Port::new(p.target_port.clamp(0, u16::MAX as u32) as u16),
-        source_ips: ips(&p.source_i_ps),
-        source_port: Port::new(p.source_port.clamp(0, u16::MAX as u32) as u16),
-        local_ips: ips(&p.local_i_ps),
-        local_port: Port::new(p.local_port.clamp(0, u16::MAX as u32) as u16),
-        vless_route: Port::new(p.vless_route.clamp(0, u16::MAX as u32) as u16),
         network,
+        target_port: port_to_u16(p.target_port),
+        source_ips: ips(&p.source_i_ps),
+        source_port: port_to_u16(p.source_port),
+        local_ips: ips(&p.local_i_ps),
+        local_port: port_to_u16(p.local_port),
+        vless_route: port_to_u16(p.vless_route),
         user: p.user.clone(),
         attributes: p.attributes.clone(),
         inbound_tag: p.inbound_tag.clone(),
@@ -827,9 +834,6 @@ pub(crate) enum ListenSpec {
 /// 对应 Go `Commander.Start`（commander.go:78-90）：
 /// - `/path` 或 `@name` 前缀 → UnixAddr；
 /// - 其余 → TCP（`:port` 简写补 `0.0.0.0`）。
-/// 解析监听地址为 `SocketAddr`。
-///
-/// 支持 `"127.0.0.1:8080"`、`"0.0.0.0:8080"`、以及 `":8080"`（补 `0.0.0.0`）简写。
 pub(crate) fn parse_listen_addr(addr: &str) -> Result<SocketAddr, String> {
     let normalized = if addr.starts_with(':') {
         format!("0.0.0.0{addr}")

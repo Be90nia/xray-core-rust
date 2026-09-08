@@ -153,7 +153,7 @@ impl SystemDialer for DefaultSystemDialer {
             // 应用 sockopt（TCP_NODELAY + SO_KEEPALIVE）。
             let std_stream = stream.into_std()?;
             let socket = Socket2::from(std_stream);
-            apply_outbound_socket_options(&socket, sockopt)?;
+            apply_outbound_socket_options(&socket, sockopt, Some(dest_addr))?;
             // 转回 tokio TcpStream，包装为 Connection。
             let tokio_stream = TcpStream::from_std(socket.into())?;
             Ok(Box::new(crate::connection::TcpConnection::new(tokio_stream))

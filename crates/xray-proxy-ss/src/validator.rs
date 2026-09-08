@@ -100,10 +100,13 @@ struct ValidatorInner {
     users: Vec<MemoryUser>,
     behavior_seed: u64,
     behavior_fused: bool,
-    // ponytail: unbounded IV replay set; for high-traffic servers add TTL-based
-    // eviction. Keyed by user email so different users' IVs don't collide.
+    /// 已见 IV 表（按 email 分用户；容量封顶见 [`SEEN_IVS_CAP`]）。
     seen_ivs: std::collections::HashMap<String, std::collections::HashSet<Vec<u8>>>,
 }
+
+/// 每用户 seen-IV 表容量上限（洪泛防护；Go `iv_check` 未实现检查，此为
+/// Rust 加强项的内存硬顶，触顶清空该用户集合）。
+const SEEN_IVS_CAP: usize = 65536;
 
 impl Default for Validator {
     fn default() -> Self {
@@ -260,6 +263,11 @@ impl Validator {
             if iv_len_us <= bs.len() {
                 let iv = bs[..iv_len_us].to_vec();
                 let seen = inner.seen_ivs.entry(user.email.clone()).or_default();
+                // 容量封顶（Go 无 iv_check 实现，此为 Rust 加强项）：洪泛下
+                // 65536×16B≈1MB/用户硬上限，触顶清空重开而非 OOM。
+                if seen.len() >= SEEN_IVS_CAP {
+                    seen.clear();
+                }
                 if !seen.insert(iv) {
                     return Err(SsError::IvNotUnique);
                 }
@@ -564,6 +572,44 @@ mod tests {
             bs2.push(0);
         }
         v.get(&bs2, RequestCommand::Tcp).expect("second iv ok");
+    }
+
+    /// seen-IV 表触顶后清空重开：CAP 个新 IV 后重放首个 IV 不再被拒
+    /// （封顶换存活，防洪泛 OOM——Go 无 iv_check 实现，无 Go 语义可对齐）。
+    #[test]
+    fn iv_check_table_capped_and_reopens() {
+        use crate::config::{hkdf_sha1, Cipher};
+        let v = Validator::new();
+        v.add(make_user_iv_check("u@x.com", CipherType::Aes128Gcm, "pass"))
+            .expect("add");
+        let account = v.get_all()[0].account.clone();
+        let Cipher::Aead(ac) = &account.cipher else { panic!() };
+
+        let make_bs = |seed: u32| -> Vec<u8> {
+            let iv = seed.to_be_bytes().iter().copied().cycle().take(ac.iv_bytes as usize).collect::<Vec<u8>>();
+            let mut subkey = vec![0u8; ac.key_bytes as usize];
+            hkdf_sha1(&account.key, &iv, &mut subkey);
+            let aead = (ac.creator)(&subkey).expect("aead");
+            let sealed = aead
+                .seal(&vec![0u8; aead.nonce_size()], &[], &[0x03, 0x04])
+                .expect("seal");
+            let mut bs = iv;
+            bs.extend_from_slice(&sealed);
+            while bs.len() < 32 {
+                bs.push(0);
+            }
+            bs
+        };
+
+        // 灌满 CAP 个不同 IV（触顶在下一个 IV 插入时清空）。
+        for i in 0..SEEN_IVS_CAP as u32 {
+            v.get(&make_bs(i), RequestCommand::Tcp).expect("fill ok");
+        }
+        // 第 CAP+1 个 IV：触发清空后正常接受。
+        v.get(&make_bs(SEEN_IVS_CAP as u32), RequestCommand::Tcp)
+            .expect("cap+1 ok");
+        // 首个 IV 已被清空出表：重放放行（封顶语义）。
+        v.get(&make_bs(0), RequestCommand::Tcp).expect("evicted iv reusable");
     }
 }
 

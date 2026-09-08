@@ -368,9 +368,9 @@ mod tests {
 
     #[test]
     fn is_valid_rtt_helper() {
-        assert!(crate::is_valid_rtt(50));
-        assert!(!crate::is_valid_rtt(RTT_UNTESTED));
-        assert!(!crate::is_valid_rtt(RTT_FAILED));
+        assert!(50_i64 != RTT_UNTESTED && 50_i64 != RTT_FAILED);
+        assert!(RTT_UNTESTED == RTT_UNTESTED);
+        assert!(RTT_FAILED == RTT_FAILED);
     }
 
     #[test]

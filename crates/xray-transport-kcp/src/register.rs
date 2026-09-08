@@ -205,15 +205,20 @@ async fn dial_kcp(
 /// 从 `kcpSettings` JSON 解析为 KCP [`Config`]。
 ///
 /// 接受的 JSON 字段（对齐 proto3 JSON camelCase）：
-/// - `mtu`：最大传输单元
-/// - `tti`：传输时间间隔（ms）
+/// - `mtu`：最大传输单元（>=21，Go `transport_method.go:562`）
+/// - `tti`：传输时间间隔 ms ∈ [10,1000]，Go :565
 /// - `uplinkCapacity`：上行容量
 /// - `downlinkCapacity`：下行容量
-/// - `congestion`：是否启用拥塞控制
-/// - `readBufferSize`：读缓冲区大小
-/// - `writeBufferSize`：写缓冲区大小
+/// - `cwndMultiplier`：拥塞窗口倍数（>=1，Go :568）
+/// - `maxSendingWindow`：发送窗口字节（>=mtu，Go :571 / `GetSendingBufferSize()==0`）
+///
+/// `congestion`/`readBufferSize`/`writeBufferSize` 三个键 Go v26 已删，本函数不解析
+/// （与历史行为一致）。
 ///
 /// `None` 返回默认配置。
+///
+/// tslk：对齐 Go 硬校验——mtu<21 / tti<10||>1000 / cwndMultiplier<1 /
+/// maxSendingWindow<mtu / 任意字段为负数 全部启动期报错（之前静默回绕为 u32 大值）。
 fn parse_kcp_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
     let Some(v) = json else { return Ok(default_config()); };
     let Some(obj) = v.as_object() else {
@@ -238,23 +243,113 @@ fn parse_kcp_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
 
     let mut config = default_config();
 
-    if let Some(v) = obj.get("mtu").and_then(|x| x.as_i64()) {
-        config.mtu = v as u32;
+    // mtu：负数先报"must be non-negative"，免去后续 < 21 误报。
+    if let Some(v) = obj.get("mtu") {
+        let n = v.as_i64().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "kcpSettings.mtu must be a number")
+        })?;
+        if n < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("kcpSettings.mtu must be non-negative (got {n})"),
+            ));
+        }
+        config.mtu = n as u32;
     }
-    if let Some(v) = obj.get("tti").and_then(|x| x.as_i64()) {
-        config.tti = v as u32;
+    // tti：[10,1000]。
+    if let Some(v) = obj.get("tti") {
+        let n = v.as_i64().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "kcpSettings.tti must be a number")
+        })?;
+        if n < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("kcpSettings.tti must be non-negative (got {n})"),
+            ));
+        }
+        config.tti = n as u32;
     }
-    if let Some(v) = obj.get("uplinkCapacity").and_then(|x| x.as_i64()) {
-        config.uplink_capacity = v as u32;
+    // uplinkCapacity / downlinkCapacity：负数拒。
+    for &field in &["uplinkCapacity", "downlinkCapacity"] {
+        if let Some(v) = obj.get(field) {
+            let n = v.as_i64().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("kcpSettings.{field} must be a number"),
+                )
+            })?;
+            if n < 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("kcpSettings.{field} must be non-negative (got {n})"),
+                ));
+            }
+            if field == "uplinkCapacity" {
+                config.uplink_capacity = n as u32;
+            } else {
+                config.downlink_capacity = n as u32;
+            }
+        }
     }
-    if let Some(v) = obj.get("downlinkCapacity").and_then(|x| x.as_i64()) {
-        config.downlink_capacity = v as u32;
+    // cwndMultiplier：>=1（Go :568）。
+    if let Some(v) = obj.get("cwndMultiplier") {
+        let n = v.as_i64().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "kcpSettings.cwndMultiplier must be a number",
+            )
+        })?;
+        if n < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("kcpSettings.cwndMultiplier must be non-negative (got {n})"),
+            ));
+        }
+        config.cwnd_multiplier = n as u32;
     }
-    if let Some(v) = obj.get("cwndMultiplier").and_then(|x| x.as_i64()) {
-        config.cwnd_multiplier = v as u32;
+    // maxSendingWindow：负数拒。
+    if let Some(v) = obj.get("maxSendingWindow") {
+        let n = v.as_i64().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "kcpSettings.maxSendingWindow must be a number",
+            )
+        })?;
+        if n < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("kcpSettings.maxSendingWindow must be non-negative (got {n})"),
+            ));
+        }
+        config.max_sending_window = n as u32;
     }
-    if let Some(v) = obj.get("maxSendingWindow").and_then(|x| x.as_i64()) {
-        config.max_sending_window = v as u32;
+
+    // Go `transport_method.go:562-573` 四条硬校验。错误措辞逐字对齐，便于运维
+    // 直接照抄 Go 日志排除。
+    if config.mtu < 21 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Mtu must be at least 21",
+        ));
+    }
+    if config.tti < 10 || config.tti > 1000 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid mKCP TTI: {}", config.tti),
+        ));
+    }
+    if config.cwnd_multiplier < 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CwndMultiplier must be at least 1",
+        ));
+    }
+    // Go `GetSendingBufferSize() == MaxSendingWindow / Mtu`，==0 即报错。
+    if config.max_sending_window / config.mtu == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "MaxSendingWindow must be >= Mtu",
+        ));
     }
 
     Ok(config)
@@ -447,5 +542,123 @@ mod tests {
         };
         // 同一触发点：Go 对 header||seed 用同一文案
         assert!(err.to_string().contains("The feature mkcp header & seed has been removed"));
+    }
+
+    // ============= tslk：对齐 Go 硬校验的错误行为测试 =============
+
+    fn err_msg(json: &str) -> String {
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        parse_kcp_config(Some(&v))
+            .err()
+            .unwrap_or_else(|| panic!("expected error for {json}"))
+            .to_string()
+    }
+
+    #[test]
+    fn tslk_rejects_mtu_below_21() {
+        // Go transport_method.go:562 — "Mtu must be at least 21"
+        let msg = err_msg(r#"{"mtu":20}"#);
+        assert!(msg.contains("Mtu must be at least 21"), "got: {msg}");
+    }
+
+    #[test]
+    fn tslk_rejects_negative_mtu() {
+        // 负数先于 <21 触发：避免被解释为 u32 大值绕过校验。
+        let msg = err_msg(r#"{"mtu":-1}"#);
+        assert!(msg.contains("mtu must be non-negative"), "got: {msg}");
+    }
+
+    #[test]
+    fn tslk_rejects_tti_too_small() {
+        // Go :565 — tti < 10
+        let msg = err_msg(r#"{"tti":9}"#);
+        assert!(msg.contains("invalid mKCP TTI"), "got: {msg}");
+    }
+
+    #[test]
+    fn tslk_rejects_tti_too_large() {
+        // Go :565 — tti > 1000
+        let msg = err_msg(r#"{"tti":1001}"#);
+        assert!(msg.contains("invalid mKCP TTI"), "got: {msg}");
+    }
+
+    #[test]
+    fn tslk_rejects_tti_negative() {
+        let msg = err_msg(r#"{"tti":-5}"#);
+        assert!(msg.contains("tti must be non-negative"), "got: {msg}");
+    }
+
+    #[test]
+    fn tslk_rejects_cwnd_multiplier_zero() {
+        // Go :568 — CwndMultiplier < 1
+        let msg = err_msg(r#"{"cwndMultiplier":0}"#);
+        assert!(msg.contains("CwndMultiplier must be at least 1"), "got: {msg}");
+    }
+
+    #[test]
+    fn tslk_rejects_cwnd_multiplier_negative() {
+        let msg = err_msg(r#"{"cwndMultiplier":-3}"#);
+        assert!(
+            msg.contains("cwndMultiplier must be non-negative"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn tslk_rejects_max_sending_window_smaller_than_mtu() {
+        // Go :571 — GetSendingBufferSize == 0 (即 MaxSendingWindow < Mtu)
+        let msg = err_msg(r#"{"mtu":1400,"maxSendingWindow":1399}"#);
+        assert!(
+            msg.contains("MaxSendingWindow must be >= Mtu"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn tslk_rejects_negative_uplink_capacity() {
+        let msg = err_msg(r#"{"uplinkCapacity":-1}"#);
+        assert!(
+            msg.contains("uplinkCapacity must be non-negative"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn tslk_rejects_negative_downlink_capacity() {
+        let msg = err_msg(r#"{"downlinkCapacity":-1}"#);
+        assert!(
+            msg.contains("downlinkCapacity must be non-negative"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn tslk_rejects_negative_max_sending_window() {
+        let msg = err_msg(r#"{"maxSendingWindow":-1}"#);
+        assert!(
+            msg.contains("maxSendingWindow must be non-negative"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn tslk_accepts_minimal_valid_kcp_settings() {
+        // 边界：mtu=21, tti=10, cwndMultiplier=1, maxSendingWindow=21。
+        // MaxSendingWindow/Mtu = 21/21 = 1 ≠ 0 通过。
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"mtu":21,"tti":10,"cwndMultiplier":1,"maxSendingWindow":21}"#,
+        )
+        .unwrap();
+        let cfg = parse_kcp_config(Some(&v)).expect("minimal valid kcp config");
+        assert_eq!(cfg.mtu, 21);
+        assert_eq!(cfg.tti, 10);
+        assert_eq!(cfg.cwnd_multiplier, 1);
+    }
+
+    #[test]
+    fn tslk_rejects_non_numeric_field() {
+        // mtu="abc" 应为 InvalidData（非数字）而非默默忽略。
+        let msg = err_msg(r#"{"mtu":"abc"}"#);
+        assert!(msg.contains("mtu must be a number"), "got: {msg}");
     }
 }

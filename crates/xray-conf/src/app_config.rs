@@ -147,12 +147,29 @@ pub struct MetricsConfig {
 #[serde(default)]
 pub struct StatsConfig {}
 
-/// 版本声明。
+/// 版本声明（对应 Go `infra/conf/version.go:10-13` `VersionConfig`）。
+///
+/// Go 字段：
+/// ```text
+/// type VersionConfig struct {
+///     MinVersion string `json:"min"`
+///     MaxVersion string `json:"max"`
+/// }
+/// ```
+///
+/// Rust 端当前为死字段（仅 `Config.version: Option<VersionConfig>` 一处定义，
+/// xray-app-version 已实现但 Instance 装配未注册）——保留形状对齐 Go，等
+/// 后续 batch 接入 `xray_app_version::Version::new` 即可生效（`coreVersion`
+/// 取自 `core.Version_x/y/z`，`min/max` 为运行期约束）。
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct VersionConfig {
+    /// 最低支持的核心版本（含），Go `MinVersion`。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
+    pub min: Option<String>,
+    /// 最高支持的核心版本（含），Go `MaxVersion`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max: Option<String>,
 }
 
 /// Geodata 加载配置。
@@ -303,5 +320,29 @@ mod tests {
         let out = serde_json::to_value(&go).unwrap();
         assert_eq!(out["ipPool"], "198.18.0.0/15");
         assert_eq!(out["poolSize"], 65535);
+    }
+
+    /// version: Go 键 min/max（infra/conf/version.go:10-13）+ 序列化输出 Go 键。
+    #[test]
+    fn version_config_min_max_shape() {
+        // Go 形态 {"min": "...", "max": "..."} 双读正确。
+        let c: VersionConfig =
+            serde_json::from_value(serde_json::json!({"min": "1.8.0", "max": "26.9.9"}))
+                .unwrap();
+        assert_eq!(c.min.as_deref(), Some("1.8.0"));
+        assert_eq!(c.max.as_deref(), Some("26.9.9"));
+        // 只给 min / 只给 max 都应通过。
+        let only_min: VersionConfig =
+            serde_json::from_value(serde_json::json!({"min": "1.8.0"})).unwrap();
+        assert_eq!(only_min.min.as_deref(), Some("1.8.0"));
+        assert!(only_min.max.is_none());
+        let only_max: VersionConfig =
+            serde_json::from_value(serde_json::json!({"max": "26.9.9"})).unwrap();
+        assert!(only_max.min.is_none());
+        assert_eq!(only_max.max.as_deref(), Some("26.9.9"));
+        // 序列化输出 Go 主键（min/max），无 alias 泄漏。
+        let out = serde_json::to_value(&c).unwrap();
+        assert_eq!(out["min"], "1.8.0");
+        assert_eq!(out["max"], "26.9.9");
     }
 }

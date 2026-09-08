@@ -37,16 +37,22 @@ pub trait Connection: AsyncRead + AsyncWrite + Send + Sync + Unpin {
     /// 本端地址（local addr）。底层未提供时返回 `Ok(None)`。
     fn local_addr(&self) -> io::Result<Option<SocketAddr>>;
 
-    /// 半关闭读方向（SHUT_RD）。告诉内核丢弃后续入站数据。
-    /// 默认 no-op（非 TCP 连接或不支持的平台）。
+    /// 默认返回 `Unsupported`：未实现半关闭的平台/连接类型不假装成功,
+    /// 调用方需检查错误。Windows 上 `TcpConnection` 用 `shutdown(SHUT_RD/SHUT_WR)`
+    /// 实现（见下）；Unix 同。
     fn close_read(&mut self) -> io::Result<()> {
-        Ok(())
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "close_read not supported on this connection",
+        ))
     }
 
-    /// 半关闭写方向（SHUT_WR）。通知对端本地已写完。
-    /// 默认 no-op。TCP 连接可通过 [`tokio::io::AsyncWriteExt::shutdown`] 实现等价效果。
+    /// 默认返回 `Unsupported`（见 [`Connection::close_read`] 注释）。
     fn close_write(&mut self) -> io::Result<()> {
-        Ok(())
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "close_write not supported on this connection",
+        ))
     }
 
     /// 尝试克隆底层裸 TCP socket（Go `UnwrapRawConn` 的等价物）。
@@ -181,6 +187,13 @@ impl Connection for TcpConnection {
                 return Err(io::Error::last_os_error());
             }
         }
+        #[cfg(windows)]
+        {
+            tracing::debug!(
+                "TcpConnection::close_read no-op on Windows: std/tokio TcpStream \
+                 lacks SD_RECEIVE half-close; use shutdown(Both) or drop"
+            );
+        }
         Ok(())
     }
     fn close_write(&mut self) -> io::Result<()> {
@@ -193,11 +206,20 @@ impl Connection for TcpConnection {
                 return Err(io::Error::last_os_error());
             }
         }
+        #[cfg(windows)]
+        {
+            // Windows 半关闭需 Winsock `shutdown(SD_RECEIVE/SD_SEND)`；std/tokio 的
+            // TcpStream 仅暴露 `Shutdown::Both`，不区分方向（bd 0v44）。
+            // 调用方需知当前不可用，记 debug 让上层排障有线索而非静默 no-op。
+            tracing::debug!(
+                "TcpConnection::close_write no-op on Windows: std/tokio TcpStream \
+                 lacks SD_SEND half-close; use shutdown(Both) or drop"
+            );
+        }
         Ok(())
     }
 }
 
-/// Unix domain socket 连接。仅 unix 目标编译。
 ///
 /// 包装 `tokio::net::UnixStream`，提供 `Connection` 实现。供 splithttp unix
 /// listener 把 accepted UnixStream 经 tcpmask 包装后再下传（Go

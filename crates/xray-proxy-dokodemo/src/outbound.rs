@@ -66,8 +66,18 @@ impl DokodemoOutboundConfig {
     }
 
     /// 直接从地址/端口/网络类型构造。
+    ///
+    /// dixo：`network == Unix` 在 outbound 侧无对应 socket 类型，
+    /// Rust 端降级为 TCP（与 Go 行为一致）。在构造期记一条 warn，
+    /// 避免运维侧 Unix 拨号"配置有效却走 TCP"的静默语义偏差。
     #[must_use]
     pub fn new(address: Address, port: Port, network: Network) -> Self {
+        if matches!(network, Network::Unix) {
+            tracing::warn!(
+                "dokodemo outbound: unix network is unsupported; silently downgraded to tcp \
+                 (Go parity — Unix dial via this outbound is not implemented)"
+            );
+        }
         Self {
             address,
             port,
@@ -152,7 +162,6 @@ mod tests {
         };
         assert!(DokodemoOutboundConfig::from_config(&cfg).is_none());
     }
-
     #[test]
     fn destination_tcp() {
         let out = DokodemoOutboundConfig::new(
@@ -161,6 +170,22 @@ mod tests {
             Network::TCP,
         );
         let dest = out.destination();
-        assert_eq!(dest.port().value(), 443);
+        assert_eq!(dest.network(), Network::TCP);
+    }
+
+    /// dixo：Unix 网络 outbound 静默降级为 TCP；构造期应发 warn 但 destination 仍是 TCP。
+    #[test]
+    fn destination_unix_downgrades_to_tcp() {
+        let out = DokodemoOutboundConfig::new(
+            Address::from_ipv4_bytes([127, 0, 0, 1]),
+            Port::new(443),
+            Network::Unix,
+        );
+        let dest = out.destination();
+        assert_eq!(
+            dest.network(),
+            Network::TCP,
+            "Unix outbound must downgrade to TCP at destination build"
+        );
     }
 }

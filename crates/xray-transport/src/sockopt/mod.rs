@@ -392,8 +392,12 @@ impl Default for SocketOptions {
 /// - Darwin：TFO_CLIENT 位 / SO_REUSEPORT / IP_BOUND_IF / IPV6_BOUND_IF /
 ///   TCP_KEEPALIVE-KEEPINTVL
 /// - Windows：Winsock TCP_FASTOPEN=15 / IP_UNICAST_IF / IPV6_UNICAST_IF
-/// - CustomSockopt：Linux/Darwin/Windows 应用（FreeBSD 无），见 [`apply_custom_sockopt`]
-pub fn apply_outbound_socket_options(socket: &Socket, opts: &SocketOptions) -> std::io::Result<()> {
+/// 把 [`SocketOptions`] 应用到已建立的 [`Socket`]（TCP 专用）。
+pub fn apply_outbound_socket_options(
+    socket: &Socket,
+    opts: &SocketOptions,
+    dest: Option<std::net::SocketAddr>,
+) -> std::io::Result<()> {
     // TCP_NODELAY：跨平台通用。
     socket.set_nodelay(opts.tcp_nodelay)?;
     if opts.ipv6_only {
@@ -436,13 +440,14 @@ pub fn apply_outbound_socket_options(socket: &Socket, opts: &SocketOptions) -> s
     #[cfg(target_os = "macos")]
     {
         let fd = socket.as_raw_fd();
-        // Go 远端地址含 '.' 判定 v4（sockopt_windows.go:41 同款）——socket2::Socket
-        // 取 local_addr 不可得，依赖调用方后续若需 bind 自行判定；保守按 v4 走。
+        // Go sockopt.go:42 按目标地址判定 IPV6_BOUND_IF vs IP_BOUND_IF（bd 2fu2）。
+        // 未传 dest 时回落 false（行为同 Go 端 -1 默认）。
+        let dest_is_v6 = matches!(dest, Some(std::net::SocketAddr::V6(_)));
         darwin::DarwinSockOpt {
-            tcp_fast_open: if opts.tcp_fast_open { 1 } else { 0 },
+            tcp_fast_open: if opts.tcp_fast_open { 1 } else { -1 },
             reuse_port: opts.reuse_port,
             bind_if_index: opts.bind_if_index,
-            is_ipv6: false,
+            is_ipv6: dest_is_v6,
             tcp_keepalive_idle: opts.tcp_keepalive_idle.as_secs() as u32,
             tcp_keepalive_interval: opts.tcp_keepalive_interval.as_secs() as u32,
             inbound: false,
@@ -453,10 +458,13 @@ pub fn apply_outbound_socket_options(socket: &Socket, opts: &SocketOptions) -> s
     #[cfg(target_os = "windows")]
     {
         let s = socket.as_raw_socket();
+        // Go sockopt_windows.go:41 按目标地址判定 IP_UNICAST_IF vs IPV6_UNICAST_IF
+        // （bd 2fu2）。未传 dest 时回落 v4（保守对齐原行为）。
+        let dest_is_v4 = matches!(dest, Some(std::net::SocketAddr::V4(_)) | None);
         windows::WindowsSockOpt {
             tcp_fast_open: if opts.tcp_fast_open { 1 } else { -1 },
             bind_if_index: opts.bind_if_index,
-            is_ipv4: true,
+            is_ipv4: dest_is_v4,
         }
         .apply(s)?;
     }
@@ -814,7 +822,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let socket = socket2::Socket::from(stream.into_std().unwrap());
         let opts = SocketOptions::default();
-        let result = apply_outbound_socket_options(&socket, &opts);
+        let result = apply_outbound_socket_options(&socket, &opts, None);
         assert!(result.is_ok(), "apply_outbound_socket_options failed: {result:?}");
         // TCP_NODELAY 已设置
         assert_eq!(socket.nodelay().unwrap(), opts.tcp_nodelay);
@@ -850,7 +858,7 @@ mod tests {
         // tproxy 需要 root/CAP_NET_ADMIN，CI 上不启用。
         opts.tproxy = false;
         opts.reuse_port = false;
-        apply_outbound_socket_options(&socket, &opts).unwrap();
+        apply_outbound_socket_options(&socket, &opts, None).unwrap();
         // getsockopt 回读 TCP_FASTOPEN_CONNECT（Linux 30）：
         #[cfg(target_os = "linux")]
         {
@@ -890,7 +898,7 @@ mod tests {
         opts.tcp_congestion = Some("reno".to_string());
         // 关键：必须 Ok，不向调用方传播 EPERM/ENOPROTOOPT（按 Go 语义 setsockopt 失败
         // 会被传播；本测试只验「TFO=1 + 已建立连接」回环内不 EPERM）。
-        let res = apply_outbound_socket_options(&socket, &opts);
+        let res = apply_outbound_socket_options(&socket, &opts, None);
         assert!(res.is_ok(), "回环 socket 上 TFO + congestion 应 Ok：{res:?}");
         drop(socket);
         accept_task.await.unwrap();
@@ -909,7 +917,7 @@ mod tests {
         let socket = socket2::Socket::from(stream.into_std().unwrap());
         let mut opts = SocketOptions::default();
         opts.tproxy = true;
-        let res = apply_outbound_socket_options(&socket, &opts);
+        let res = apply_outbound_socket_options(&socket, &opts, None);
         // CI 无 root：EPERM（操作不允许）；root 环境 Ok。两者均符合 Go 语义。
         if let Err(e) = &res {
             assert_eq!(e.raw_os_error(), Some(libc::EPERM), "非 root 应 EPERM：{e:?}");
@@ -1061,7 +1069,7 @@ mod tests {
             r#type: "int".to_string(),
             ..Default::default()
         });
-        apply_outbound_socket_options(&socket, &opts).unwrap();
+        apply_outbound_socket_options(&socket, &opts, None).unwrap();
         assert!(socket.nodelay().unwrap(), "customSockopt int 应已设置 TCP_NODELAY");
 
         drop(socket);
@@ -1095,7 +1103,7 @@ mod tests {
             value: "1".to_string(),
             r#type: "int".to_string(),
         });
-        apply_outbound_socket_options(&socket, &opts).unwrap();
+        apply_outbound_socket_options(&socket, &opts, None).unwrap();
         assert!(!socket.nodelay().unwrap(), "system 不匹配应跳过");
 
         // opt 缺失 → "No opt!"。
@@ -1106,14 +1114,14 @@ mod tests {
             r#type: "int".to_string(),
             ..Default::default()
         });
-        let err = apply_outbound_socket_options(&socket, &opts).unwrap_err();
+        let err = apply_outbound_socket_options(&socket, &opts, None).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("No opt!"), "应报 No opt!：{err}");
 
         // 未知 type → "unknown CustomSockopt type"。
         opts.custom_sockopt[0].opt = "1".to_string();
         opts.custom_sockopt[0].r#type = "bogus".to_string();
-        let err = apply_outbound_socket_options(&socket, &opts).unwrap_err();
+        let err = apply_outbound_socket_options(&socket, &opts, None).unwrap_err();
         assert!(
             err.to_string().contains("unknown CustomSockopt type"),
             "应报 unknown type：{err}"

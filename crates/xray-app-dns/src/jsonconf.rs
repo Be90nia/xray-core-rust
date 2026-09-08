@@ -336,14 +336,23 @@ fn build_client(
     datadir: &std::path::Path,
     derived_policy_id: u32,
 ) -> Result<Client, DnsError> {
-    let url = build_server_url(&ns.address, ns.port);
-
+    // vj6b：域名地址（如 `dns.google`）需 bootstrap 解析为 IP，否则 `new_server`
+    // 拒绝并导致该 server 永久失败。解析失败则降级为原行为（跳过该 server）。
     let client_ip = parse_client_ip(ns.client_ip.as_deref())?;
     let client_ip = if client_ip.is_empty() {
         global_client_ip.to_vec()
     } else {
         validate_client_ip_len(client_ip.len())?;
         client_ip
+    };
+    let url = match bootstrap_resolve_host(&build_server_url(&ns.address, ns.port)) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            tracing::warn!(address = %ns.address, error = %e, "dns: bootstrap resolve failed");
+            return Err(DnsError::WireFormat(format!(
+                "nameserver host bootstrap resolve failed: {e}"
+            )));
+        }
     };
 
     // 6r0：expectedIPs/unexpectedIPs → IpRule（CIDR + geoip 展开）。
@@ -444,6 +453,68 @@ fn resolve_asset_dir() -> std::path::PathBuf {
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
+/// vj6b：DNS 上游地址若为域名（`https://dns.google/dns-query`），需 bootstrap 解析为 IP。
+/// 调用方拿到的是 URL（`scheme://host[:port][/path]` 形态）。
+///
+/// 行为：
+/// - host 已为 IP（含 IPv6 字面量）：原样返回
+/// - host 为域名：构造一次性 TokioResolver 同步阻塞解析（超时 4s），取首个 A/AAAA
+///   替换 host
+/// - 解析失败：返回错误（调用方降级跳过该 server）
+fn bootstrap_resolve_host(url: &str) -> Result<String, String> {
+    let (scheme_rest, path_tail) = match url.split_once("://") {
+        Some((sr, rest)) => (sr, rest),
+        None => return Ok(url.to_string()),
+    };
+    let (host_port_path, _) = path_tail.split_once('?').unwrap_or((path_tail, ""));
+    let (host_port, path) = match host_port_path.split_once('/') {
+        Some((hp, p)) => (hp, format!("/{p}")),
+        None => (host_port_path, String::new()),
+    };
+    // host_port 形如 `dns.google:443` 或 `1.2.3.4:853` 或 `[::1]:853`
+    let (raw_host, port_suffix) = if host_port.starts_with('[') {
+        // IPv6 literal
+        let end = host_port.find(']').ok_or("malformed ipv6 host")?;
+        (&host_port[1..end], Some(&host_port[end + 1..]))
+    } else if let Some(idx) = host_port.rfind(':') {
+        (&host_port[..idx], Some(&host_port[idx..]))
+    } else {
+    (host_port, None)
+    };
+
+    let resolver = hickory_resolver::TokioResolver::builder_tokio()
+        .map_err(|e| format!("resolver builder: {e}"))?
+        .build()
+        .map_err(|e| format!("resolver build: {e}"))?;
+    let target = format!("{raw_host}.");
+    let ips: Vec<IpAddr> = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(async {
+            use std::time::Duration;
+            match tokio::time::timeout(
+                Duration::from_secs(4),
+                resolver.lookup_ip(target),
+            )
+            .await
+            {
+                Ok(Ok(lk)) => lk.iter().collect(),
+                _ => Vec::new(),
+            }
+        }),
+        Err(_) => Vec::new(),
+    };
+    let Some(first) = ips.into_iter().next() else {
+        return Err(format!("bootstrap resolve failed for {raw_host}"));
+    };
+    let new_host_port = match (first, port_suffix) {
+        (IpAddr::V6(v6), Some(suffix)) => format!("[{v6}]{suffix}"),
+        (v6 @ IpAddr::V6(_), None) => format!("[{v6}]"),
+        (v4, _) => match port_suffix {
+            Some(s) => format!("{v4}{s}"),
+            None => v4.to_string(),
+        },
+    };
+    Ok(format!("{scheme_rest}://{new_host_port}{path}"))
+}
 /// 本地域 TLD + 无点域名规则（Go `localTLDsAndDotlessDomainsRules`，app/dns/config.go）。
 fn local_tlds_and_dotless_rules()
 -> Vec<(xray_geodata::matcher::domain::DomainType, &'static str)> {

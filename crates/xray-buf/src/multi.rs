@@ -96,17 +96,28 @@ impl MultiBuffer {
         let mut result = MultiBuffer::new();
         let mut remaining = n;
 
-        while remaining > 0 && !self.buffers.is_empty() {
-            let front = &mut self.buffers[0];
-            if front.len() <= remaining {
-                remaining -= front.len();
-                let buf = self.buffers.remove(0);
-                result.push(buf);
-            } else {
-                let partial = front.split_to(remaining);
-                result.push(partial);
-                remaining = 0;
+        // 第一遍：数清楚有多少个完整 buffer 可以被一次性 drain 走
+        // （O(k) 而非 O(n) 总成本，Vec::drain 一次性 memmove 余下元素）。
+        let mut full_take: usize = 0;
+        for buf in self.buffers.iter() {
+            if remaining <= buf.len() {
+                break;
             }
+            remaining -= buf.len();
+            full_take += 1;
+        }
+        if full_take > 0 {
+            let drained: Vec<Buffer> = self.buffers.drain(..full_take).collect();
+            for buf in drained {
+                result.push(buf);
+            }
+        }
+
+        // 第二遍：剩余部分（跨最后一个 buffer 的 partial）一次性 split_to。
+        if remaining > 0 && !self.buffers.is_empty() {
+            let front = &mut self.buffers[0];
+            let partial = front.split_to(remaining);
+            result.push(partial);
         }
 
         result
@@ -141,10 +152,6 @@ impl MultiBuffer {
     }
 
     /// 分割出总计约 `size` 字节的 MultiBuffer。
-    ///
-    /// 对应 Go 的 `SplitSize`。
-    /// 取出完整的 Buffer 直到总字节数接近 `size`。
-    /// 如果最后一个 Buffer 会超出 size，会被分割。
     pub fn split_size(&mut self, size: usize) -> MultiBuffer {
         if size == 0 {
             return MultiBuffer::new();
@@ -153,21 +160,32 @@ impl MultiBuffer {
         let mut result = MultiBuffer::new();
         let mut accumulated = 0usize;
 
-        while accumulated < size && !self.buffers.is_empty() {
-            let front = &mut self.buffers[0];
-            let buf_len = front.len();
-
-            if accumulated + buf_len <= size {
-                accumulated += buf_len;
-                result.push(self.buffers.remove(0));
-            } else {
-                let needed = size - accumulated;
-                let partial = front.split_to(needed);
-                result.push(partial);
-                accumulated = size;
+        // 第一遍：数清楚要完整取走的 buffer 数（Vec::drain 一次性 memmove 余下元素，
+        // 单次操作完成「前缀搬迁」而非 remove(0) 每次 O(n) 累计 O(n²)）。
+        let mut full_take: usize = 0;
+        for buf in self.buffers.iter() {
+            let buf_len = buf.len();
+            if accumulated + buf_len > size {
+                break;
+            }
+            accumulated += buf_len;
+            full_take += 1;
+        }
+        if full_take > 0 {
+            let drained: Vec<Buffer> = self.buffers.drain(..full_take).collect();
+            for buf in drained {
+                result.push(buf);
             }
         }
 
+        // 第二遍：累积未达 size 时跨最后一个 buffer 的 partial 切分。
+        if accumulated < size && !self.buffers.is_empty() {
+            let front = &mut self.buffers[0];
+            let needed = size - accumulated;
+            let partial = front.split_to(needed);
+            result.push(partial);
+            accumulated = size;
+        }
         result
     }
 
