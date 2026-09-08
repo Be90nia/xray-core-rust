@@ -194,10 +194,28 @@ pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
             let mut total = 0usize;
             let mut found_end = false;
             while !found_end && total < buf.len() {
-                let n = conn.read(&mut buf[total..])
-                    .await
-                    .map_err(|e| format!("http read response: {e}"))?;
+                let n = match conn.read(&mut buf[total..]).await {
+                    Ok(n) => n,
+                    // z9n4：读响应头失败的可观测日志。
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "xray.http.outbound",
+                            proxy = %format!("{}:{}", server_dest.address(), server_dest.port()),
+                            target = %host_port,
+                            error = %e,
+                            "http CONNECT proxy read response header failed"
+                        );
+                        return Err(format!("http read response: {e}"));
+                    }
+                };
                 if n == 0 {
+                    // z9n4：代理在响应前 EOF（连接 reset / 401 challenge 等场景）。
+                    tracing::warn!(
+                        target: "xray.http.outbound",
+                        proxy = %format!("{}:{}", server_dest.address(), server_dest.port()),
+                        target = %host_port,
+                        "http CONNECT proxy closed connection before response"
+                    );
                     return Err("http proxy closed connection before response".to_string());
                 }
                 total += n;
@@ -209,10 +227,6 @@ pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
                     }
                 }
             }
-            if !found_end {
-                return Err("http proxy response header too long or incomplete".to_string());
-            }
-
             // 5. 解析响应行（第一行：`HTTP/1.x STATUS_CODE ...`）
             let header_end = buf[..total]
                 .windows(4)

@@ -737,5 +737,26 @@ mod tests {
         assert_eq!(c2, seg2.byte_size());
         assert_eq!(s2.command(), Command::Ping);
         assert_eq!(s2.conversation(), 1);
+        assert_eq!(s2.conversation(), 1);
+    }
+
+    // k3kh 留账：Go parse 阈值 len(buf)<15（含 1B 最小 data）与发送端 0-data DataSegment
+    // 语义需一并理清才能改 14→15；当前维持与 Go 对端互通验证过的 14 偏移实现。
+    #[test]
+    fn k3kh_data_segment_zero_payload_accepted_by_rust_parse() {
+        // Rust 14 语义：data_len=0 段（body 14B）合法可解析——记录现状，
+        // 若未来对齐 Go 15 阈值，此测试与 flush 链需一起改。
+        let mut buf = vec![0u8; 18];
+        buf[0..2].copy_from_slice(&1u16.to_be_bytes());
+        buf[2] = Command::Data as u8;
+        buf[12..14].copy_from_slice(&0u16.to_be_bytes());
+        let (parsed, consumed) = read_segment(&buf).expect("ok");
+        assert_eq!(consumed, 18);
+        match parsed {
+            SegmentKind::Data(s) => {
+                assert!(s.payload.as_ref().unwrap().is_empty());
+            }
+            other => panic!("expected Data, got {other:?}"),
+        }
     }
 }

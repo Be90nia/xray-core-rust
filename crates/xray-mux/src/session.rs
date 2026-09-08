@@ -415,6 +415,12 @@ impl XUDP {
         self.mux = Some(Arc::downgrade(session));
     }
 
+    /// 借出关联会话的弱引用（kgjo：hit 复用路径升级旧 session）。
+    #[must_use]
+    pub fn mux(&self) -> Option<&WeakSession> {
+        self.mux.as_ref()
+    }
+
     /// 中断关联会话的输入，关闭输出。
     ///
     /// 对应 Go 版本 `XUDP.Interrupt()`，调用 mux.input.Interrupt()

@@ -264,6 +264,11 @@ struct RealityServerConfig {
     private_key: [u8; 32],
     short_ids: Vec<[u8; 8]>,
     max_time_diff: u32,
+    /// fs0o: 客户端 TLS legacy_version 最小版本门控（字节字典序）；
+    /// `Vec::new()`=不限制（兼容旧配置）。
+    min_client_ver: Vec<u8>,
+    /// fs0o: 客户端 TLS legacy_version 最大版本门控。
+    max_client_ver: Vec<u8>,
     fallback_dest: String,
     xver: u8,
 }
@@ -328,10 +333,40 @@ fn reality_server_config(
         .unwrap_or(0);
     let max_time_diff = (max_time_diff_ms / 1000) as u32;
 
+    // fs0o: 解析 minClientVer/maxClientVer（"26.3.27" → `[26, 3, 27]`）。
+    // 镜像 Go `infra/conf/transport_security.go` 103-130：split(".") → u8 数组。
+    let parse_version = |key: &str| -> io::Result<Vec<u8>> {
+        let Some(s) = json.get(key).and_then(|v| v.as_str()) else {
+            return Ok(Vec::new());
+        };
+        let mut v = Vec::new();
+        for (i, part) in s.split('.').enumerate() {
+            if i >= 3 {
+                return Err(io::Error::other(format!(
+                    "reality: invalid {key}: too many segments (max 3)"
+                )));
+            }
+            let n: u64 = part.parse().map_err(|e| {
+                io::Error::other(format!("reality: invalid {key} segment '{part}': {e}"))
+            })?;
+            if n > 255 {
+                return Err(io::Error::other(format!(
+                    "reality: {key} segment {n} > 255"
+                )));
+            }
+            v.push(n as u8);
+        }
+        Ok(v)
+    };
+    let min_client_ver = parse_version("minClientVer")?;
+    let max_client_ver = parse_version("maxClientVer")?;
+
     Ok(Some(RealityServerConfig {
         private_key,
         short_ids,
         max_time_diff,
+        min_client_ver,
+        max_client_ver,
         fallback_dest,
         xver,
     }))
@@ -353,7 +388,16 @@ async fn serve_reality_conn<S>(
 {
     use xray_reality::server::{server_tls, RealityServerOutcome};
 
-    match server_tls(stream, &rc.private_key, &rc.short_ids, rc.max_time_diff).await {
+    let outcome = server_tls(
+        stream,
+        &rc.private_key,
+        &rc.short_ids,
+        rc.max_time_diff,
+        &rc.min_client_ver,
+        &rc.max_client_ver,
+    )
+    .await;
+    match outcome {
         Ok(RealityServerOutcome::Verified(tls)) => serve_http_conn(tls, peer, ctx).await,
         Ok(RealityServerOutcome::Invalid { conn, record, reason }) => {
             tracing::debug!(error = ?reason, dest = %rc.fallback_dest, "splithttp reality fallback");
@@ -373,7 +417,6 @@ fn base64_url_decode(s: &str) -> io::Result<Vec<u8>> {
         .map_err(|e| io::Error::other(format!("reality: base64 privateKey: {e}")))
 }
 
-/// hex 字符串 → 8 字节 short_id。
 fn hex_decode_8(s: &str) -> Option<[u8; 8]> {
     if s.len() > 16 {
         return None;

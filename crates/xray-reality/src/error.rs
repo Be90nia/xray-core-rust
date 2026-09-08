@@ -107,6 +107,15 @@ pub enum RealityError {
     /// 无法获得 ServerHello 字节 → 签名路径暂缺（签名原语本身可用 `ml_dsa` crate）。
     #[error("REALITY: mldsa65 certificate signing not yet implemented in Rust")]
     Mldsa65NotImplemented,
+
+    /// fs0o: 客户端 TLS legacy_version 低于配置的 `min_client_ver`（Go
+    /// `MinClientVer=[26,3,27]` 即 Xray-core v26.3.27 版本门控）。
+    #[error("REALITY: client version too old")]
+    ClientVersionTooOld,
+
+    /// fs0o: 客户端 TLS legacy_version 高于配置的 `max_client_ver`。
+    #[error("REALITY: client version too new")]
+    ClientVersionTooNew,
 }
 
 /// REALITY crate 统一 Result 别名。

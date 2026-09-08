@@ -802,14 +802,51 @@ impl DefaultDispatcher {
         // Go: inbound downlink = inbound 读下行 = dn_r
         // Go: outbound uplink = outbound 读上行 = up_r
         // Go: outbound downlink = outbound 写下行 = dn_w
-        let inbound_uplink = inbound_tag
-            .and_then(|tag| get_or_register_counter_opt(self.stats.as_ref(), &format!("inbound>>>{tag}>>>traffic>>>uplink")));
-        let inbound_downlink = inbound_tag
-            .and_then(|tag| get_or_register_counter_opt(self.stats.as_ref(), &format!("inbound>>>{tag}>>>traffic>>>downlink")));
-        let outbound_uplink = outbound_tag
-            .and_then(|tag| get_or_register_counter_opt(self.stats.as_ref(), &format!("outbound>>>{tag}>>>traffic>>>uplink")));
-        let outbound_downlink = outbound_tag
-            .and_then(|tag| get_or_register_counter_opt(self.stats.as_ref(), &format!("outbound>>>{tag}>>>traffic>>>downlink")));
+        // oz1t：per-tag 计数受 policy.stats.user_uplink/user_downlink 门控——开关未开
+        // 不懒注册计数器（Go 等价 `policy.Stats.UserUplink/Downlink` 默认 false 即不计数）。
+        // 计数范围含协议 overhead：`mb.len()` 已包含 header+payload（payload 包内）；
+        // SizeStatWriter/Reader 累加 mb.len() = 用户上下行的完整字节数（Go SizeStatWriter
+        // 亦仅按 byte 数累加，overhead 由协议层封装时已含在 mb 中）。
+        let inbound_uplink = if policy.stats.user_uplink {
+            inbound_tag.and_then(|tag| {
+                get_or_register_counter_opt(
+                    self.stats.as_ref(),
+                    &format!("inbound>>>{tag}>>>traffic>>>uplink"),
+                )
+            })
+        } else {
+            None
+        };
+        let inbound_downlink = if policy.stats.user_downlink {
+            inbound_tag.and_then(|tag| {
+                get_or_register_counter_opt(
+                    self.stats.as_ref(),
+                    &format!("inbound>>>{tag}>>>traffic>>>downlink"),
+                )
+            })
+        } else {
+            None
+        };
+        let outbound_uplink = if policy.stats.user_uplink {
+            outbound_tag.and_then(|tag| {
+                get_or_register_counter_opt(
+                    self.stats.as_ref(),
+                    &format!("outbound>>>{tag}>>>traffic>>>uplink"),
+                )
+            })
+        } else {
+            None
+        };
+        let outbound_downlink = if policy.stats.user_downlink {
+            outbound_tag.and_then(|tag| {
+                get_or_register_counter_opt(
+                    self.stats.as_ref(),
+                    &format!("outbound>>>{tag}>>>traffic>>>downlink"),
+                )
+            })
+        } else {
+            None
+        };
 
         // 包装 link 端的 writer/reader
         // inbound 端：写上行（uplink）+ 读下行（downlink）
@@ -3153,8 +3190,131 @@ mod tests {
         let mut d = DefaultDispatcher::new();
         assert!(d.fdns.is_none());
         d.set_fdns(Some(Arc::new(FixedFakeDns)));
+        d.set_fdns(Some(Arc::new(FixedFakeDns)));
         assert!(d.fdns.is_some());
     }
 
+    /// oz1t：per-tag 计数器在 policy gate（stats.user_uplink/user_downlink）
+    /// 关闭时不懒注册、不包装——默认 Policy 默认 false → 计数器不存在。
+    #[tokio::test]
+    async fn dispatch_link_skips_per_tag_counters_when_policy_gate_off() {
+        let (stats, d) = build_oz1t_dispatcher(false);
+        let (up_w, dn_r) = drive_oz1t_traffic(&d, "gated.example.com", b"x").await;
+        drop(up_w);
+        drop(dn_r);
+        assert!(stats.get_counter("outbound>>>tag-out>>>traffic>>>uplink").is_none());
+        assert!(stats.get_counter("outbound>>>tag-out>>>traffic>>>downlink").is_none());
+    }
+
+    /// oz1t：policy gate 开启 → per-tag counter 正常懒注册并累计（含 overhead）。
+    #[tokio::test]
+    async fn dispatch_link_registers_per_tag_counters_when_policy_gate_on() {
+        let (stats, d) = build_oz1t_dispatcher(true);
+        let payload = b"with-overhead-12345";
+        let (up_w, mut dn_r) = drive_oz1t_traffic(&d, "gated2.example.com", payload).await;
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
+            .await
+            .expect("timeout")
+            .unwrap();
+        drop(up_w);
+        assert_eq!(resp.to_vec(), payload);
+        let up = stats
+            .get_counter("outbound>>>tag-out>>>traffic>>>uplink")
+            .expect("uplink counter");
+        let dn = stats
+            .get_counter("outbound>>>tag-out>>>traffic>>>downlink")
+            .expect("downlink counter");
+        assert!(up.value() >= payload.len() as i64, "uplink {} >= payload len", up.value());
+        assert!(dn.value() >= payload.len() as i64, "downlink {} >= payload len", dn.value());
+    }
+
+    /// oz1t 共享测试装置：构造带 EchoHandler + ResolvedRouter 的 dispatcher，
+    /// `gate_on=true` 时打开 default_policy 的 user_uplink/user_downlink 开关。
+    fn build_oz1t_dispatcher(gate_on: bool) -> (
+        Arc<xray_app_stats::Manager>,
+        DefaultDispatcher,
+    ) {
+        use std::pin::Pin;
+
+        #[derive(Debug)]
+        struct EchoHandler {
+            tag: &'static str,
+        }
+        impl DispatchHandler for EchoHandler {
+            fn tag(&self) -> &str {
+                self.tag
+            }
+            fn dispatch(
+                &self,
+                _dest: &Destination,
+                link: xray_transport::link::Link,
+            ) -> PinFuture<()> {
+                Box::pin(async move {
+                    let mut r = link.reader;
+                    let mut w = link.writer;
+                    if let Ok(mb) = r.read_multi_buffer().await {
+                        if !mb.is_empty() {
+                            let _ = w.write_multi_buffer(mb).await;
+                        }
+                    }
+                    w.shutdown();
+                })
+            }
+        }
+
+        #[derive(Debug)]
+        struct TagOutRouter;
+        impl RoutingRouter for TagOutRouter {
+            fn pick_route(&self, _ctx: &dyn RoutingContext) -> Result<Route, DispatcherError> {
+                Ok(Route::new("tag-out"))
+            }
+            fn pick_route_resolved<'a>(
+                &'a self,
+                _ctx: &'a dyn RoutingContext,
+            ) -> Pin<Box<dyn Future<Output = Result<Route, DispatcherError>> + Send + 'a>> {
+                Box::pin(async move { Ok(Route::new("tag-out")) })
+            }
+        }
+
+        let stats = Arc::new(xray_app_stats::Manager::new_running());
+        let mut d = DefaultDispatcher::new();
+        let mut ohm = SimpleOhm::new();
+        ohm.add("tag-out", Arc::new(EchoHandler { tag: "tag-out" }));
+        d.ohm = Some(Arc::new(ohm));
+        d.router = Some(Arc::new(TagOutRouter));
+        d.stats = Some(Arc::clone(&stats) as Arc<dyn xray_features::stats::Manager>);
+        if gate_on {
+            d.default_policy.stats.user_uplink = true;
+            d.default_policy.stats.user_downlink = true;
+        }
+        (stats, d)
+    }
+
+    /// oz1t 共享 helper：建链、写 payload、返回 writer/reader。
+    async fn drive_oz1t_traffic(
+        d: &DefaultDispatcher,
+        domain: &str,
+        payload: &[u8],
+    ) -> (
+        Box<dyn xray_buf::io::Writer>,
+        Box<dyn xray_buf::io::Reader>,
+    ) {
+        let (up_r, up_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let (dn_r, dn_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let outbound = xray_transport::link::Link::new(Box::new(up_r), Box::new(dn_w));
+        let dest = Destination::new(
+            xray_common::net::address::Address::new_domain(domain.to_string()),
+            xray_common::net::port::Port::new(443),
+            Network::TCP,
+        );
+        d.dispatch_link(&dest, outbound, &SniffingRequest::default(), None, None)
+            .expect("dispatch_link");
+        let mut w: Box<dyn xray_buf::io::Writer> = Box::new(up_w);
+        let mut mb = xray_buf::multi::MultiBuffer::new();
+        mb.merge_bytes(payload);
+        w.write_multi_buffer(mb).await.unwrap();
+        let r: Box<dyn xray_buf::io::Reader> = Box::new(dn_r);
+        (w, r)
+    }
 }
 

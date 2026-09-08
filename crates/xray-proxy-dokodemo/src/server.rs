@@ -76,7 +76,21 @@ impl DokodemoServer {
         local_port: Option<u16>,
         is_udp: bool,
     ) -> Option<Destination> {
-        // follow_redirect 优先：从 SO_ORIGINAL_DST 获取被 iptables REDIRECT 前的地址
+        // 3pbz：SO_ORIGINAL_DST 是 Linux-only（iptables REDIRECT 生态）。
+        // 非 Linux 平台虽 cfg 允许 `follow_redirect=true`，
+        // `get_original_dst` 永远返回 Err → silently 降级 fallback，
+        // 运维侧疑惑"配了 follow_redirect 怎么还是固定地址"。
+        // 启动期 / 首次分发时记 warn 让排障一目了然。
+        #[cfg(not(target_os = "linux"))]
+        if self.config.follow_redirect {
+            tracing::warn!(
+                target: "xray.dokodemo",
+                tag = %self.tag,
+                "follow_redirect is a no-op on this platform (Linux-only SO_ORIGINAL_DST); \
+                 inbound will silently fall back to rewrite_address"
+            );
+        }
+
         if self.config.follow_redirect {
             if let Some(fd) = fd {
                 if let Ok(addr) = xray_transport::sockopt::get_original_dst(fd) {

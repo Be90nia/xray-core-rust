@@ -17,7 +17,7 @@ use crate::listener::{ConnHandler as KcpConnHandler, Listener, UdpHub};
 use crate::connection::{ConnMetadata, Connection, ConnectionCloser, KcpConn};
 use crate::dialer::{KcpDialerFactory, PacketInput, next_conv};
 use crate::io::{KCPPacketReader, PacketReader as _};
-use crate::output::{SegmentWriter, SimpleSegmentWriter};
+use crate::output::{RetryableWriter, SegmentWriter, SimpleSegmentWriter};
 use xray_transport::finalmask::{parse_finalmask_udp_chain, CodecChain};
 
 use crate::udp_hub::{MaskedPacketInput, MaskedUdpHub, StdPacketInput, StdUdpHub};
@@ -153,7 +153,7 @@ async fn dial_kcp(
     let chain = parse_finalmask_udp_chain(settings.finalmask_json.as_ref())?;
 
     // 2. 解析目标地址（对齐 Go internet.DialSystem：Domain 也解析）
-    let dest_addr = resolve_dest_to_socket_addr(dest)?;
+    let dest_addr = resolve_dest_to_socket_addr(dest).await?;
 
     // 3. 创建 UDP socket + KcpDialerFactory（chain = None 时裸 segment，向后兼容）
     let factory = StdKcpDialerFactory { chain };
@@ -361,20 +361,32 @@ fn parse_kcp_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
 /// vnext address 惯以 Domain 承载）经系统 resolver 解析。
 /// ponytail: `ToSocketAddrs` 同步解析会占 runtime 线程；Go runtime 同样
 /// 线程池 getaddrinfo，DNS 热路径成瓶颈时再换异步 resolver。
-fn resolve_dest_to_socket_addr(
+/// ejom：把 `Destination` 异步解析为 `SocketAddr`。
+///
+/// 对齐 Go `DialKCP` 的 `internet.DialSystem`（net 系统拨号，域名/IP 字面量
+/// 均可解析）：IP 字面量直接 parse，Domain 经 `tokio::net::lookup_host` 异步解析。
+///
+/// 与旧 `ToSocketAddrs`（同步 getaddrinfo，会占 runtime 线程）相比，
+/// `lookup_host` 跑在 tokio reactor 线程池上，热路径 DNS 不再阻塞 worker。
+async fn resolve_dest_to_socket_addr(
     dest: &xray_common::net::destination::Destination,
 ) -> io::Result<SocketAddr> {
-    use std::net::ToSocketAddrs;
     let host = dest.address().to_string();
-    (host.as_str(), dest.port().value())
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("kcp dest resolved to no address: {host}"),
-            )
-        })
+    let port = dest.port().value();
+    // 1. IP 字面量快路径
+    if let Ok(addr) = format!("{host}:{port}").parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    // 2. 域名 → tokio 异步 DNS 解析
+    let mut addrs = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|e| io::Error::other(format!("kcp DNS resolve {host}: {e}")))?;
+    addrs.next().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("kcp dest resolved to no address: {host}"),
+        )
+    })
 }
 
 // ===== StdKcpDialerFactory =====
@@ -422,7 +434,9 @@ impl KcpDialerFactory for StdKcpDialerFactory {
             hub,
             chain: self.chain.clone(),
         };
-        let segment_writer: Arc<dyn SegmentWriter> = Arc::new(SimpleSegmentWriter::new(writer));
+        // k3kh：套 RetryableWriter（5×100ms 重试）对齐 Go `NewRetryableWriter`。
+        // 同步 sleep：上层在 KCP worker 同步 flush 上下文调用，等价 Go retry.Timed 语义。
+        let segment_writer: Arc<dyn SegmentWriter> = Arc::new(RetryableWriter::new(Arc::new(SimpleSegmentWriter::new(writer))));
 
         // 创建 Closer（共享 hub 关闭标志：conn drop → 置位 → 阻塞读退出）
         let closer: Arc<dyn ConnectionCloser> = Arc::new(StdUdpCloser { closed: closed_flag });
@@ -649,7 +663,7 @@ mod tests {
             r#"{"mtu":21,"tti":10,"cwndMultiplier":1,"maxSendingWindow":21}"#,
         )
         .unwrap();
-        let cfg = parse_kcp_config(Some(&v)).expect("minimal valid kcp config");
+        let cfg = parse_kcp_config(Some(&v)).expect("minimal valid kcp settings");
         assert_eq!(cfg.mtu, 21);
         assert_eq!(cfg.tti, 10);
         assert_eq!(cfg.cwnd_multiplier, 1);
@@ -661,4 +675,53 @@ mod tests {
         let msg = err_msg(r#"{"mtu":"abc"}"#);
         assert!(msg.contains("mtu must be a number"), "got: {msg}");
     }
+
+    // ===== ejom：kcp 异步 DNS 解析 =====
+
+    /// IP 字面量地址走快路径（不调 lookup_host）。
+    #[tokio::test]
+    async fn ejom_resolve_ipv4_literal_skips_dns() {
+        use xray_common::net::address::Address;
+        use xray_common::net::destination::Destination;
+        use xray_common::net::port::Port;
+        let dest = Destination::tcp(
+            Address::IPv4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            Port::new(14550),
+        );
+        let addr = resolve_dest_to_socket_addr(&dest).await.expect("resolve ok");
+        assert_eq!(addr.ip().to_string(), "127.0.0.1");
+        assert_eq!(addr.port(), 14550);
+    }
+
+    /// localhost 域名经 `tokio::net::lookup_host` 异步解析（环回 127.0.0.1 或 ::1）。
+    #[tokio::test]
+    async fn ejom_resolve_localhost_via_async_dns() {
+        use xray_common::net::address::Address;
+        use xray_common::net::destination::Destination;
+        use xray_common::net::port::Port;
+        let dest = Destination::tcp(
+            Address::Domain("localhost".to_string()),
+            Port::new(8080),
+        );
+        let addr = resolve_dest_to_socket_addr(&dest).await.expect("resolve ok");
+        // 接受 IPv4 或 IPv6 环回（系统 hosts 文件决定）
+        assert!(addr.ip().is_loopback(), "got non-loopback {addr}");
+        assert_eq!(addr.port(), 8080);
+    }
+
+    /// 未知域名解析失败 → 返回 io::Error。
+    #[tokio::test]
+    async fn ejom_resolve_unknown_domain_returns_err() {
+        use xray_common::net::address::Address;
+        use xray_common::net::destination::Destination;
+        use xray_common::net::port::Port;
+        // RFC 6761 保留 TLD，规定解析必须失败
+        let dest = Destination::tcp(
+            Address::Domain("nonexistent.invalid".to_string()),
+            Port::new(1),
+        );
+        let res = resolve_dest_to_socket_addr(&dest).await;
+        assert!(res.is_err(), "invalid TLD must fail to resolve");
+    }
+
 }

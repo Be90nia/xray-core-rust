@@ -11,6 +11,9 @@ use parking_lot::Mutex;
 use crate::config::{ObservationResult, ObservatoryConfig, ProbeResult};
 use crate::error::{at_error, ObservatoryError};
 use crate::status::StatusStore;
+// 3oad：探测方法（HTTP GET）从 burst healthping_settings 复用默认值——其口径
+// 已对齐 Go `healthping.go:147` `HttpMethod = "GET"`。
+use crate::burst::healthping_settings::DEFAULT_HTTP_METHOD;
 
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -897,11 +900,15 @@ impl HttpProbeExecutor {
         }
     }
 
-    /// 从 ObservatoryConfig 构造（使用 effective_probe_url 与默认方法）
+    /// 从 ObservatoryConfig 构造（使用 effective_probe_url，HTTP GET 探测）。
+    ///
+    /// 3oad：探测方法默认 GET（Go `newPingClient` 用 `newRequest("GET", url)`，
+    /// 不是 HEAD）。HEAD 不能跨 CDN 验证（部分 CDN 对 HEAD 返回 405/403），
+    /// 而 GET 是真实拉取语义。alive 由状态码判定（200-399 = alive）。
     pub fn from_config(config: &ObservatoryConfig) -> Self {
         Self::new(
             config.effective_probe_url().to_string(),
-            "HEAD".to_string(),
+            DEFAULT_HTTP_METHOD.to_string(),
             5_000,
         )
     }
@@ -1005,6 +1012,14 @@ impl HttpProbeExecutor {
         let response = String::from_utf8_lossy(&buf[..read_res]);
         if !response.starts_with("HTTP/1") {
             return Err(format!("invalid response: {}", response.lines().next().unwrap_or("")));
+        }
+
+        // 3oad：从状态行解析状态码（HTTP/1.1 200 OK\r\n → 200），判定 alive。
+        // Go `MeasureDelay` 仅以 HTTP 200-399 为 alive（healthping.go:175-179）。
+        let status_code = parse_http_status_code(&response)
+            .ok_or_else(|| format!("malformed status line: {}", response.lines().next().unwrap_or("")))?;
+        if !(200..400).contains(&status_code) {
+            return Err(format!("http status {status_code}"));
         }
 
         let total_delay = start.elapsed().as_millis() as i64;
@@ -1225,3 +1240,45 @@ fn parse_url_host_port(url: &str) -> Result<(String, u16, bool), String> {
     Ok((host, port, use_tls))
 }
 
+/// 3oad：从 HTTP 响应首行解析状态码（`HTTP/1.1 200 OK` → 200）。
+///
+/// 仅看第一行（响应头可能没读完，按 \r\n 切）；遇非数字 / 长度 < 12 / 切片越界
+/// 返回 None（上层报 malformed）。
+fn parse_http_status_code(response: &str) -> Option<u16> {
+    let first_line = response.split("\r\n").next()?;
+    // "HTTP/<ver> <code> <reason>"
+    let mut parts = first_line.split_ascii_whitespace();
+    let _proto = parts.next()?;
+    let code_str = parts.next()?;
+    code_str.parse::<u16>().ok()
+}
+
+#[cfg(test)]
+mod status_code_tests {
+    use super::parse_http_status_code;
+
+    #[test]
+    fn parses_200_ok() {
+        let r = "HTTP/1.1 200 OK\r\nServer: nginx\r\n\r\n";
+        assert_eq!(parse_http_status_code(r), Some(200));
+    }
+
+    #[test]
+    fn parses_204() {
+        let r = "HTTP/1.1 204 No Content\r\n";
+        assert_eq!(parse_http_status_code(r), Some(204));
+    }
+
+    #[test]
+    fn parses_404_alive_false_via_caller() {
+        let r = "HTTP/1.1 404 Not Found\r\n";
+        assert_eq!(parse_http_status_code(r), Some(404));
+    }
+
+    #[test]
+    fn returns_none_for_malformed() {
+        assert!(parse_http_status_code("garbage").is_none());
+        assert!(parse_http_status_code("HTTP/1.1 abc OK").is_none());
+        assert!(parse_http_status_code("").is_none());
+    }
+}

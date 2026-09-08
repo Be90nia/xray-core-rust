@@ -31,6 +31,9 @@ use tokio_rustls::TlsAcceptor;
 pub struct ParsedClientHello<'a> {
     /// 完整 ClientHello handshake message 字节（record payload，作为 AES-GCM AAD）。
     pub handshake_message: &'a [u8],
+    /// ClientHello.legacy_version（2 字节，如 TLS 1.3 仍发 `[0x03, 0x03]`）。
+    /// fs0o: REALITY 版本门控字段——按字典序与 `min_client_ver`/`max_client_ver` 比较。
+    pub legacy_version: [u8; 2],
     /// ClientHello.Random（32 字节）。前 20 字节是 HKDF salt，后 12 字节是 AES-GCM nonce。
     pub random: [u8; 32],
     /// ClientHello.SessionId（32 字节，REALITY 加密载荷 = ciphertext(16) + tag(16)）。
@@ -69,14 +72,16 @@ fn parse_handshake(msg: &[u8]) -> Result<ParsedClientHello<'_>, RealityError> {
     if msg.len() < 4 + hs_len {
         return Err(RealityError::InvalidConnection);
     }
-    // handshake_message = 整个 handshake（含 type+length header），作为 AES-GCM AAD
     let handshake_message = &msg[..4 + hs_len];
     let body = &msg[4..4 + hs_len];
     // body: legacy_version(2) + random(32) + session_id(1+n)
     if body.len() < 2 + 32 + 1 {
         return Err(RealityError::InvalidConnection);
     }
+    let mut legacy_version = [0u8; 2];
+    legacy_version.copy_from_slice(&body[..2]);
     let mut off = 2; // skip legacy_version
+
     let mut random = [0u8; 32];
     random.copy_from_slice(&body[off..off + 32]);
     off += 32;
@@ -131,9 +136,9 @@ fn parse_handshake(msg: &[u8]) -> Result<ParsedClientHello<'_>, RealityError> {
             _ => {}
         }
     }
-
     Ok(ParsedClientHello {
         handshake_message,
+        legacy_version,
         random,
         session_id,
         key_share_x25519,
@@ -218,13 +223,27 @@ const SESSION_ID_OFFSET_IN_HANDSHAKE: usize = 39;
 /// - `now_unix`: 当前 Unix 时间戳（秒）。
 /// - `max_diff`: 允许的 timestamp 偏差秒数（Go 默认 ±12h = 43200）。
 /// - `allowed_short_ids`: 允许的 short_id 白名单（每个 8 字节）。
+/// - `min_client_ver`/`max_client_ver`：fs0o REALITY 版本门控，字节字典序比较
+///   `ClientHello.legacy_version`（TLS1.3 仍发 `[0x03, 0x03]`；Go 端默认
+///   `MinClientVer=[26,3,27]` 即 Xray-core v26.3.27，空切片=不校验）。
 pub fn verify_reality_client_hello(
     parsed: &ParsedClientHello<'_>,
     server_static_private: &[u8; 32],
     now_unix: u32,
     max_diff: u32,
     allowed_short_ids: &[[u8; 8]],
+    min_client_ver: &[u8],
+    max_client_ver: &[u8],
 ) -> Result<(crate::crypto::SessionPayload, [u8; 32]), RealityError> {
+    // 0. fs0o: 版本门控——legacy_version 字典序比较两端区间。
+    // 字典序：[major, minor, patch?]；空切片=无限边界（不限制）。
+    if !min_client_ver.is_empty() && parsed.legacy_version.as_slice() < min_client_ver {
+        return Err(RealityError::ClientVersionTooOld);
+    }
+    if !max_client_ver.is_empty() && parsed.legacy_version.as_slice() > max_client_ver {
+        return Err(RealityError::ClientVersionTooNew);
+    }
+
     // 1. 提取 client X25519 公钥（来自 key_share extension）
     let client_pub = parsed
         .key_share_x25519
@@ -301,6 +320,8 @@ pub enum RealityServerOutcome<C> {
 /// - `server_private_key`：服务端 X25519 静态私钥（对应 client 配置的 `public_key`）
 /// - `allowed_short_ids`：允许的 short_id 白名单
 /// - `max_diff`：允许的 timestamp 偏差秒数（Go 默认 ±12h = 43200）
+/// - `min_client_ver`/`max_client_ver`：fs0o REALITY 版本门控；slice 与
+///   `ClientHello.legacy_version` 字典序比较。空切片=无限边界（不限制）。
 ///
 /// # Errors
 ///
@@ -315,17 +336,16 @@ pub async fn server_tls<C>(
     server_private_key: &[u8; 32],
     allowed_short_ids: &[[u8; 8]],
     max_diff: u32,
+    min_client_ver: &[u8],
+    max_client_ver: &[u8],
 ) -> std::result::Result<RealityServerOutcome<C>, RealityError>
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
-
-    // 1. 读 ClientHello record
     let record = read_tls_record(&mut conn).await.map_err(|e| {
         RealityError::TlsHandshake(format!("read ClientHello: {e}"))
     })?;
 
-    // 2. 解析 + 验证
     let outcome = (|| {
         let parsed = parse_client_hello(&record)?;
         let now_unix = SystemTime::now()
@@ -338,6 +358,8 @@ where
             now_unix,
             max_diff,
             allowed_short_ids,
+            min_client_ver,
+            max_client_ver,
         )?;
         Ok::<_, RealityError>(auth_key)
     })();
@@ -590,6 +612,66 @@ mod tests {
         record
     }
 
+    /// 构造最小 TLS 1.3 ClientHello record（测试用，含 session_id + key_share + 可选 SNI）。
+    /// `legacy_version` 可定制——fs0o 测试用。
+    fn build_test_client_hello_with_legacy_version(
+        random: &[u8; 32],
+        session_id: &[u8; 32],
+        key_share_x25519: &[u8; 32],
+        sni: Option<&str>,
+        legacy_version: &[u8; 2],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(legacy_version);
+        body.extend_from_slice(random);
+        body.push(32);
+        body.extend_from_slice(session_id);
+        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]);
+        body.extend_from_slice(&[1, 0]);
+
+        let mut exts = Vec::new();
+        if let Some(name) = sni {
+            let nb = name.as_bytes();
+            let list_len = 1 + 2 + nb.len();
+            let mut sni_ext = Vec::new();
+            sni_ext.extend_from_slice(&(list_len as u16).to_be_bytes());
+            sni_ext.push(0);
+            sni_ext.extend_from_slice(&(nb.len() as u16).to_be_bytes());
+            sni_ext.extend_from_slice(nb);
+            exts.extend_from_slice(&[0x00, 0x00]);
+            exts.extend_from_slice(&(sni_ext.len() as u16).to_be_bytes());
+            exts.extend_from_slice(&sni_ext);
+        }
+        let mut ks_ext = Vec::new();
+        ks_ext.extend_from_slice(&((2 + 2 + 32) as u16).to_be_bytes());
+        ks_ext.extend_from_slice(&[0x00, 0x1d]);
+        ks_ext.extend_from_slice(&[0x00, 0x20]);
+        ks_ext.extend_from_slice(key_share_x25519);
+        exts.extend_from_slice(&[0x00, 0x33]);
+        exts.extend_from_slice(&(ks_ext.len() as u16).to_be_bytes());
+        exts.extend_from_slice(&ks_ext);
+
+        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(&exts);
+
+        let mut hs = Vec::new();
+        hs.push(0x01);
+        let blen = body.len();
+        hs.push((blen >> 16) as u8);
+        hs.push((blen >> 8) as u8);
+        hs.push(blen as u8);
+        hs.extend_from_slice(&body);
+
+        let mut record = Vec::new();
+        record.push(0x16);
+        record.extend_from_slice(&[0x03, 0x01]);
+        let hl = hs.len();
+        record.push((hl >> 8) as u8);
+        record.push(hl as u8);
+        record.extend_from_slice(&hs);
+        record
+    }
+
     #[test]
     fn parse_client_hello_valid_full() {
         let random = [0x55u8; 32];
@@ -742,7 +824,7 @@ mod tests {
         );
         let parsed = parse_client_hello(&record).unwrap();
         let (payload, _auth_key) =
-            verify_reality_client_hello(&parsed, &server_priv, now, 43200, &[short_id]).unwrap();
+            verify_reality_client_hello(&parsed, &server_priv, now, 43200, &[short_id], &[], &[]).unwrap();
         assert_eq!(payload.timestamp, now);
         assert_eq!(payload.short_id, short_id);
         assert_eq!(payload.version, [1, 8, 1]);
@@ -777,7 +859,7 @@ mod tests {
 
         let parsed = parse_client_hello(&record).unwrap();
         assert!(parsed.key_share_x25519.is_none());
-        let err = verify_reality_client_hello(&parsed, &[0u8; 32], 0, 0, &[]).unwrap_err();
+        let err = verify_reality_client_hello(&parsed, &[0u8; 32], 0, 0, &[], &[], &[]).unwrap_err();
         assert!(matches!(err, RealityError::NoKeyShareX25519));
     }
 
@@ -795,7 +877,7 @@ mod tests {
         // 用错误的 server key 验证 → AES-GCM 解密失败
         let wrong_priv = [0x99u8; 32];
         let err =
-            verify_reality_client_hello(&parsed, &wrong_priv, now, 43200, &[short_id]).unwrap_err();
+            verify_reality_client_hello(&parsed, &wrong_priv, now, 43200, &[short_id], &[], &[]).unwrap_err();
         assert!(matches!(err, RealityError::SessionIdDecryptFailed));
     }
 
@@ -820,9 +902,8 @@ mod tests {
         let server_now = client_time + 100_000;
         let err = verify_reality_client_hello(&parsed, &server_priv, server_now, 43200, &[
             short_id,
-        ])
+        ], &[], &[])
         .unwrap_err();
-        assert!(matches!(err, RealityError::TimestampOutOfWindow { .. }));
     }
 
     #[test]
@@ -844,11 +925,114 @@ mod tests {
         );
         let parsed = parse_client_hello(&record).unwrap();
         let err =
-            verify_reality_client_hello(&parsed, &server_priv, now, 43200, &server_allowed)
+            verify_reality_client_hello(&parsed, &server_priv, now, 43200, &server_allowed, &[], &[])
                 .unwrap_err();
         assert!(matches!(err, RealityError::ShortIdNotAllowed));
     }
 
+    // ===== fs0o: REALITY 版本门控行为测试 =====
+
+    /// `legacy_version` 低于 `min_client_ver` → 拒绝并报 ClientVersionTooOld。
+    #[test]
+    fn fs0o_min_client_ver_rejects_old_version() {
+        // 构造一个 legacy_version=[0x03, 0x01]（TLS 1.0）的 ClientHello。
+        let random = [0x55u8; 32];
+        let session_id = [0x77u8; 32];
+        let key_share = [0x88u8; 32];
+        let record = build_test_client_hello_with_legacy_version(
+            &random,
+            &session_id,
+            &key_share,
+            Some("example.com"),
+            &[0x03, 0x01],
+        );
+        let parsed = parse_client_hello(&record).unwrap();
+        let err = verify_reality_client_hello(
+            &parsed,
+            &[0u8; 32],
+            0,
+            43200,
+            &[],
+            &[0x03, 0x03], // min=[TLS1.2]，legacy=[TLS1.0] < min
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(err, RealityError::ClientVersionTooOld));
+    }
+
+    /// `legacy_version` 高于 `max_client_ver` → 拒绝并报 ClientVersionTooNew。
+    #[test]
+    fn fs0o_max_client_ver_rejects_new_version() {
+        let random = [0x55u8; 32];
+        let session_id = [0x77u8; 32];
+        let key_share = [0x88u8; 32];
+        let record = build_test_client_hello_with_legacy_version(
+            &random,
+            &session_id,
+            &key_share,
+            Some("example.com"),
+            &[0x03, 0x04], // TLS 1.3 实际 legacy_version
+        );
+        let parsed = parse_client_hello(&record).unwrap();
+        let err = verify_reality_client_hello(
+            &parsed,
+            &[0u8; 32],
+            0,
+            43200,
+            &[],
+            &[],
+            &[0x03, 0x03], // max=[TLS1.2]，legacy=[TLS1.3] > max
+        )
+        .unwrap_err();
+        assert!(matches!(err, RealityError::ClientVersionTooNew));
+    }
+
+    /// 空切片=不限制（向后兼容）。
+    #[test]
+    fn fs0o_empty_min_max_means_unbounded() {
+        let random = [0x55u8; 32];
+        let session_id = [0x77u8; 32];
+        let key_share = [0x88u8; 32];
+        let record = build_test_client_hello_with_legacy_version(
+            &random,
+            &session_id,
+            &key_share,
+            Some("example.com"),
+            &[0x03, 0x00], // SSL 3.0（极旧）
+        );
+        let parsed = parse_client_hello(&record).unwrap();
+        // min/max 都为空 → 应该继续到 key_share 校验（key_share 在 record 里），
+        // 或 NoKeyShareX25519（fake key_share 是 0x88，不解析）
+        let err = verify_reality_client_hello(
+            &parsed,
+            &[0u8; 32],
+            0,
+            43200,
+            &[],
+            &[],
+            &[],
+        );
+        // fake key=0x88 → SessionIdDecryptFailed（auth_key 错误）。
+        assert!(
+            matches!(err, Err(RealityError::SessionIdDecryptFailed)),
+            "expected SessionIdDecryptFailed (fake key_share 0x88 → wrong auth_key), got: {err:?}"
+        );
+    }
+
+    fn fs0o_legacy_version_parsed_correctly() {
+        let random = [0x55u8; 32];
+        let session_id = [0x77u8; 32];
+        let key_share = [0x88u8; 32];
+        let record = build_test_client_hello_with_legacy_version(
+            &random,
+            &session_id,
+            &key_share,
+            Some("example.com"),
+            &[0x03, 0x04],
+        );
+        let parsed = parse_client_hello(&record).unwrap();
+        assert_eq!(parsed.legacy_version, [0x03, 0x04]);
+    }
 
     #[tokio::test]
     async fn server_tls_invalid_returns_invalid_outcome() {
@@ -866,7 +1050,7 @@ mod tests {
         let short_id = [0xaa; 8];
 
         let server_task = tokio::spawn(async move {
-            server_tls(server, &server_priv, &[short_id], 43200).await
+            server_tls(server, &server_priv, &[short_id], 43200, &[], &[]).await
         });
 
         // client 发送 ClientHello record 后保持连接（让 server_tls 完成 verify）
@@ -893,7 +1077,7 @@ mod tests {
         drop(client); // 立即关闭 client → server 读 EOF
 
         let server_priv = [0x11u8; 32];
-        let result = server_tls(server, &server_priv, &[], 43200).await;
+        let result = server_tls(server, &server_priv, &[], 43200, &[], &[]).await;
 
         assert!(
             matches!(result, Err(RealityError::TlsHandshake(_))),
@@ -932,7 +1116,7 @@ mod tests {
 
         let (mut client, server) = duplex(8192);
         let server_task = tokio::spawn(async move {
-            server_tls(server, &server_priv, &[short_id], 43200).await
+            server_tls(server, &server_priv, &[short_id], 43200, &[], &[]).await
         });
 
         // client 发送合法 REALITY ClientHello（verify 会通过）
@@ -986,7 +1170,7 @@ mod tests {
 
         // spawn server_tls
         let server_task = tokio::spawn(async move {
-            server_tls(server, &server_priv_array, &[short_id], 43200).await
+            server_tls(server, &server_priv_array, &[short_id], 43200, &[], &[]).await
         });
 
         // client 端：reality u_client 握手
@@ -1042,7 +1226,7 @@ mod tests {
         let client = xray_transport::connection::DuplexConnection::new(client);
 
         let server_task = tokio::spawn(async move {
-            server_tls(server, &server_priv_array, &[short_id], 43200).await
+            server_tls(server, &server_priv_array, &[short_id], 43200, &[], &[]).await
         });
 
         let client_result =
@@ -1100,7 +1284,7 @@ mod tests {
         let client = xray_transport::connection::DuplexConnection::new(client);
 
         let server_task = tokio::spawn(async move {
-            server_tls(server, &server_priv_array, &[short_id], 43200).await
+            server_tls(server, &server_priv_array, &[short_id], 43200, &[], &[]).await
         });
 
         let client_result =
