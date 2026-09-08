@@ -216,6 +216,16 @@ impl UploadQueue {
                             Ok(packet) => {
                                 if packet.seq == inner.next_seq {
                                     inner.current = Some(packet);
+                                } else if packet.seq < inner.next_seq {
+                                    // 4taf：迟到重复 packet（Go `seq < nextSeq` 静默丢弃自愈）。
+                                    // 之前无条件 push 入堆使头位永不就位，直到 max_packets
+                                    // 溢出拆会话（恶意客户端发 `seq=0` + 大流量即被打挂）。
+                                    tracing::trace!(
+                                        packet_seq = packet.seq,
+                                        next_seq = inner.next_seq,
+                                        "split upload_queue dropping stale packet"
+                                    );
+                                    drop(packet);
                                 } else {
                                     inner.heap.push(BySeq(Reverse(packet.seq), packet));
                                     if inner.heap.len() > inner.max_packets {
@@ -346,6 +356,28 @@ mod tests {
             }
             other => panic!("expected PacketQueueTooLarge, got {other:?}"),
         }
+    }
+
+    /// 4taf：迟到重复 packet（seq < nextSeq）静默丢弃自愈。
+    /// 之前会被 push 入堆 → 头位永不就位 → max_packets 溢出拆会话。
+    #[tokio::test]
+    async fn read_drops_stale_seq_does_not_poison_heap() {
+        let q = UploadQueue::new(2);
+        // 正常 seq=0
+        q.push(Packet::new(b"OK".to_vec(), 0)).await.unwrap();
+        let mut buf = [0u8; 32];
+        let n = q.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"OK");
+        // 现在 next_seq=1
+        // 1. 迟到重复：seq=0（已消费）→ 必须丢弃不入堆
+        q.push(Packet::new(b"STALE".to_vec(), 0)).await.unwrap();
+        // 2. 正常：seq=2（gap=1 客户端漏发，Rust 行为）
+        q.push(Packet::new(b"TWO".to_vec(), 2)).await.unwrap();
+        // seq=1 缺失 + heap 只有 seq=2 + closed → 触发 EOF
+        q.close().await;
+        // 再读应返回 0（gap，没匹配），且不触发 PacketQueueTooLarge
+        let n = q.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0);
     }
 
     #[tokio::test]

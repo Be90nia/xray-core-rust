@@ -32,8 +32,12 @@ pub struct XorConn<IO> {
     write_skip: usize,
     write_header: [u8; RECORD_HEADER_LEN],
     write_header_len: usize,
-    /// 已 XOR 未写完的密文残余 `(bytes, sent)`（部分写后 Pending 时产生）。
-    write_pending: Option<(Vec<u8>, usize)>,
+    /// 持久化密文缓冲（4ucv）。每次 poll_write 复用，clear + extend_from_slice
+    /// 替换原 `buf.to_vec()` 分配；Partial write Pending 时保留 `(sent, end)` 偏移，
+    /// 下次 poll_write/poll_read/poll_flush 续写，不再分配新 Vec。
+    write_buf: Vec<u8>,
+    /// Some = 有未写完密文残余，`0` = 已发偏移，`1` = 总长度（与 write_buf 对应）。
+    write_pending: Option<(usize, usize)>,
     read_ctr: Option<CtrXor>,
     /// Some = client 0-RTT：读侧 CTR 延迟建立，iv 取下行头 16B（透传时缓存于
     /// `read_iv`）。Go common.go:84-93。
@@ -63,6 +67,7 @@ where
             write_skip: out_skip,
             write_header: [0; RECORD_HEADER_LEN],
             write_header_len: 0,
+            write_buf: Vec::new(),
             write_pending: None,
             read_ctr: Some(read_ctr),
             deferred_read_key: None,
@@ -91,6 +96,7 @@ where
             write_skip: out_skip,
             write_header: [0; RECORD_HEADER_LEN],
             write_header_len: 0,
+            write_buf: Vec::new(),
             write_pending: None,
             read_skip: in_skip,
             read_header: [0; RECORD_HEADER_LEN],
@@ -101,32 +107,42 @@ where
     }
 
     /// Go `XorConn.Write` 的 XOR 状态机：header 段原地 XOR，body 透传。
-    fn xor_write(&mut self, data: &mut [u8]) {
+    ///
+    /// 拆 4 参数版本（不取 `&mut self`）——上层调用方经常同时借用其他字段
+    /// （如 write_buf），&mut self 会与这些借用冲突。状态字段（skip/header/
+    /// ctr）由调用方显式传入。
+    fn xor_write(
+        write_skip: &mut usize,
+        write_header: &mut [u8; RECORD_HEADER_LEN],
+        write_header_len: &mut usize,
+        write_ctr: &mut CtrXor,
+        data: &mut [u8],
+    ) {
         let mut pos = 0usize;
         loop {
             let avail = data.len() - pos;
-            if avail <= self.write_skip {
-                self.write_skip -= avail;
+            if avail <= *write_skip {
+                *write_skip -= avail;
                 return;
             }
-            pos += std::mem::take(&mut self.write_skip);
-            let need = RECORD_HEADER_LEN - self.write_header_len;
+            pos += std::mem::take(write_skip);
+            let need = RECORD_HEADER_LEN - *write_header_len;
             let rest = data.len() - pos;
             if rest < need {
                 // Go：OutHeader 缓存明文（XOR 前），随后才对 p 施加 XOR。
-                self.write_header[self.write_header_len..self.write_header_len + rest]
+                write_header[*write_header_len..*write_header_len + rest]
                     .copy_from_slice(&data[pos..]);
-                self.write_header_len += rest;
-                self.write_ctr.apply(&mut data[pos..]);
+                *write_header_len += rest;
+                write_ctr.apply(&mut data[pos..]);
                 return;
             }
             // Go Write 顺序：先 DecodeHeader（明文 header）后 XORKeyStream——
             // 读侧 XOR 即解密，解码必须在 XOR 之前（还原后才能看到 23/3/3 前缀）。
-            self.write_header[self.write_header_len..RECORD_HEADER_LEN]
+            write_header[*write_header_len..RECORD_HEADER_LEN]
                 .copy_from_slice(&data[pos..pos + need]);
-            self.write_skip = header_len_field(&self.write_header);
-            self.write_header_len = 0;
-            self.write_ctr.apply(&mut data[pos..pos + need]);
+            *write_skip = header_len_field(write_header);
+            *write_header_len = 0;
+            write_ctr.apply(&mut data[pos..pos + need]);
             pos += need;
         }
     }
@@ -186,9 +202,12 @@ where
     }
 
     /// 写出密文残余。Poll 语义与标准 AsyncWrite 一致。
+    ///
+    /// 4ucv：密文缓冲来自持久化 `write_buf`，下标偏移 (sent, end) 由 `write_pending`
+    /// 携带；发送完成后清空下标但不缩缓冲，下次 write 复用同一份容量。
     fn drain_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        while let Some((ct, sent)) = self.write_pending.as_mut() {
-            match Pin::new(&mut self.inner).poll_write(cx, &ct[*sent..]) {
+        while let Some((sent, end)) = self.write_pending {
+            match Pin::new(&mut self.inner).poll_write(cx, &self.write_buf[sent..end]) {
                 Poll::Ready(Ok(0)) => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::WriteZero,
@@ -196,9 +215,12 @@ where
                     )));
                 }
                 Poll::Ready(Ok(n)) => {
-                    *sent += n;
-                    if *sent == ct.len() {
+                    let new_sent = sent + n;
+                    if new_sent == end {
                         self.write_pending = None;
+                    } else {
+                        self.write_pending = Some((new_sent, end));
+                        return Poll::Pending;
                     }
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -261,16 +283,31 @@ where
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        // XOR 必须先于写入施加，且 CTR 状态推进不可回退，因此「接受即缓冲」：
-        // XOR 整段后尽力写，未写完的密文挂 write_pending，返回 Ok(len)（上层
-        // 视为已接受，不会重发同段明文 → 无双重 XOR）。残余由 poll_write 开头 /
-        // poll_read 开头（上层写完必转等响应）/ poll_flush / poll_shutdown 清写。
-        // ponytail: 每写一次一次分配；XOR 型 wrapper 必须先变换后写，无零分配写法。
-        let mut enc = buf.to_vec();
-        this.xor_write(&mut enc);
+        // 4ucv：复用持久化 write_buf 替换原 `buf.to_vec()` 分配。clear 保留容量，
+        // extend_from_slice 后原地 xor_write（XOR 状态机只读 write_skip/write_header
+        // 字段，与缓冲归属无关）。Pending 时 `(sent, end)` 偏移写 write_pending，
+        // 下次 drain_pending 续写同块内存，零额外分配。
+        // 先取出缓冲切片再调 xor_write——后者签名是 `&mut self`，与「同时持有
+        // write_buf 可变借用」冲突。end 也提前取出避免循环内 borrow 重复。
+        // 先把 clear+extend 走完，再调 xor_write（它要 &mut self 推进 skip/header
+        // 4ucv：复用持久化 write_buf 替换原 `buf.to_vec()` 分配。clear+extend 后
+        // xor_write 在独立作用域借用 self.xor_write 状态机，结束后回到 poll_write
+        // 循环（循环只借用 write_buf 切片与 inner，无 &mut self 冲突）。
+        let end = {
+            this.write_buf.clear();
+            this.write_buf.extend_from_slice(buf);
+            Self::xor_write(
+                &mut this.write_skip,
+                &mut this.write_header,
+                &mut this.write_header_len,
+                &mut this.write_ctr,
+                &mut this.write_buf,
+            );
+            this.write_buf.len()
+        };
         let mut sent = 0usize;
         loop {
-            match Pin::new(&mut this.inner).poll_write(cx, &enc[sent..]) {
+            match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf[sent..end]) {
                 Poll::Ready(Ok(0)) => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::WriteZero,
@@ -279,15 +316,16 @@ where
                 }
                 Poll::Ready(Ok(n)) => {
                     sent += n;
-                    if sent == enc.len() {
+                    if sent == end {
                         return Poll::Ready(Ok(buf.len()));
                     }
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 // 部分写/零写后 Pending：inner 已用当前 cx 注册写 waker，残余密文
-                // 由后续 poll_read / poll_flush / 下次 poll_write 清出。
+                // 由后续 poll_read / poll_flush / 下次 poll_write 清出。write_buf
+                // 保留内容（连同 xor 后的密文），只记下标偏移。
                 Poll::Pending => {
-                    this.write_pending = Some((enc[sent..].to_vec(), 0));
+                    this.write_pending = Some((sent, end));
                     return Poll::Ready(Ok(buf.len()));
                 }
             }
@@ -375,7 +413,13 @@ mod tests {
                 in_skip,
             );
             let mut out = plain.clone();
-            w.xor_write(&mut out);
+            XorConn::<tokio::io::DuplexStream>::xor_write(
+                &mut w.write_skip,
+                &mut w.write_header,
+                &mut w.write_header_len,
+                &mut w.write_ctr,
+                &mut out,
+            );
             assert_eq!(out, wire, "{name}: write side must match Go byte-for-byte");
 
             // 读侧：还原明文（DEFERRED = 从流头 16B 建立读 CTR）。
@@ -433,10 +477,28 @@ mod tests {
         );
         let mut wire_out = plain.clone();
         let (a, rest) = wire_out.split_at_mut(2);
-        w.xor_write(a);
+        XorConn::<tokio::io::DuplexStream>::xor_write(
+            &mut w.write_skip,
+            &mut w.write_header,
+            &mut w.write_header_len,
+            &mut w.write_ctr,
+            a,
+        );
         let (b, c) = rest.split_at_mut(7);
-        w.xor_write(b);
-        w.xor_write(c);
+        XorConn::<tokio::io::DuplexStream>::xor_write(
+            &mut w.write_skip,
+            &mut w.write_header,
+            &mut w.write_header_len,
+            &mut w.write_ctr,
+            b,
+        );
+        XorConn::<tokio::io::DuplexStream>::xor_write(
+            &mut w.write_skip,
+            &mut w.write_header,
+            &mut w.write_header_len,
+            &mut w.write_ctr,
+            c,
+        );
         assert_eq!(wire_out, wire, "split writes must match Go byte-for-byte");
 
         let mut r = XorConn::new(
@@ -534,5 +596,40 @@ mod tests {
         let mut got = vec![0u8; plain.len()];
         server.read_exact(&mut got).await.unwrap();
         assert_eq!(got, plain);
+    }
+
+    /// 4ucv：验证 write_buf 在连续多次 write 后容量稳定（不重新分配）。
+    /// 之前每次 poll_write 都 `buf.to_vec()` 新分配 → capacity 反复漂移。
+    /// 现持化缓冲，clear + extend_from_slice 不缩容。
+    #[tokio::test]
+    async fn write_buf_capacity_reused_across_writes() {
+        let (a, _b) = duplex(64 * 1024);
+        let mut w = XorConn::new(
+            a,
+            CtrXor::new(&KEY, &[0x11; 16]).unwrap(),
+            CtrXor::new(&KEY, &[0x22; 16]).unwrap(),
+            0,
+            0,
+        );
+        // 第一次 write 触发容量增长到 chunk_size。
+        let chunk = [0xABu8; 1024];
+        w.write_all(&chunk).await.unwrap();
+        let cap_after_first = w.write_buf.capacity();
+        assert!(cap_after_first >= 1024);
+        // 后续 N 次 write 必须保持容量不变（持化缓冲）。
+        for _ in 0..50 {
+            w.write_all(&chunk).await.unwrap();
+            assert_eq!(
+                w.write_buf.capacity(),
+                cap_after_first,
+                "write_buf capacity must be reused, not reallocated"
+            );
+        }
+        // 半写后 Pending → write_pending 偏移记录、write_buf 内容保留。
+        let small = [0xCDu8; 100];
+        w.write_all(&small).await.unwrap();
+        assert!(w.write_pending.is_none(), "small write completes inline");
+        assert_eq!(w.write_buf.len(), small.len());
+        assert_eq!(w.write_buf.capacity(), cap_after_first);
     }
 }

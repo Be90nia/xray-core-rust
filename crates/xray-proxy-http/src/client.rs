@@ -19,7 +19,6 @@ use xray_transport::dialer::{dial, StreamSettings};
 use xray_transport::sockopt::SocketOptions;
 
 use crate::config::Account;
-
 /// HTTP outbound 配置。
 #[derive(Debug, Clone)]
 pub struct HttpOutboundConfig {
@@ -31,6 +30,9 @@ pub struct HttpOutboundConfig {
     pub auth: Option<Account>,
     /// 可选 streamSettings（TLS/WS/...）。None 走 raw TCP。
     pub stream_settings: Option<StreamSettings>,
+    /// 6a5v：servers[0].headers 解析为 CONNECT 请求附加 header。
+    /// 保留插入序（HashMap 默认无序——这里改 Vec 保序）。
+    pub headers: Vec<(String, String)>,
 }
 
 impl HttpOutboundConfig {
@@ -42,6 +44,7 @@ impl HttpOutboundConfig {
             server_port,
             auth: None,
             stream_settings: None,
+            headers: Vec::new(),
         }
     }
 
@@ -59,13 +62,11 @@ impl HttpOutboundConfig {
         self
     }
 
-    /// 服务器 Destination（TCP）。
-    fn server_destination(&self) -> Destination {
-        Destination::new(
-            self.server_address.clone(),
-            self.server_port,
-            Network::TCP,
-        )
+    /// 6a5v：附加单个 header（builder 风格，重复 key 顺序追加）。
+    #[must_use]
+    pub fn with_header(mut self, key: String, value: String) -> Self {
+        self.headers.push((key, value));
+        self
     }
 }
 
@@ -107,9 +108,18 @@ pub fn parse_http_config(data: &[u8]) -> Result<HttpOutboundConfig, String> {
     if let Some(a) = auth {
         config = config.with_auth(a);
     }
+    // 6a5v：解析 servers[0].headers（HTTP header map），追加到 CONNECT 请求。
+    // 此前整段丢弃 → 伪装头/认证相关 header 静默无效。Go v26 outbound http
+    // 也消费此字段（http dialer → req.Header）。
+    if let Some(headers_v) = first.get("headers").and_then(|v| v.as_object()) {
+        for (k, v) in headers_v {
+            if let Some(v_str) = v.as_str() {
+                config = config.with_header(k.clone(), v_str.to_string());
+            }
+        }
+    }
     Ok(config)
 }
-
 /// 构造 HTTP CONNECT 的 DialFn 闭包。
 ///
 /// 闭包捕获 `Arc<HttpOutboundConfig>`，每次调用：
@@ -127,8 +137,22 @@ pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
         let target_host = dest.address().to_string();
         let target_port = dest.port().value();
         Box::pin(async move {
-            // 1. 拨号到 HTTP 代理服务器
-            let server_dest = config.server_destination();
+            // 拨号到上游 HTTP 代理
+            use xray_common::net::address::Address;
+            use xray_common::net::destination::Destination;
+            use xray_common::net::network::Network;
+            use xray_common::net::port::Port;
+            let server_addr = match &config.server_address {
+                Address::Domain(d) => d.clone(),
+                Address::IPv4(ip) => ip.to_string(),
+                Address::IPv6(ip) => ip.to_string(),
+            };
+            let server_port = config.server_port.value();
+            let server_dest = Destination::new(
+                config.server_address.clone(),
+                config.server_port,
+                Network::TCP,
+            );
             let sockopt = config.stream_settings.as_ref().map(|s| s.socket_options()).unwrap_or_default();
             let mut conn: Box<dyn Connection> = match &config.stream_settings {
                 Some(s) => dial(&server_dest, s, &sockopt)
@@ -138,6 +162,8 @@ pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
                     .await
                     .map_err(|e| format!("http dial proxy (tcp): {e}"))?,
             };
+            drop(server_addr);
+
 
             // 2. 构造 CONNECT 请求
             let host_port = format!("{target_host}:{target_port}");
@@ -145,11 +171,16 @@ pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
             if let Some(auth) = &config.auth {
                 // ponytail: base64 编码认证，用标准库（RFC 7617 Basic auth）
                 let credentials = format!("{}:{}", auth.username, auth.password);
+
+                // 简洁实现：用 base64 crate 或手工；此处借用 xray-tls 的 base64 实用函数
                 let encoded = base64_encode(&credentials);
                 request.push_str(&format!("Proxy-Authorization: Basic {encoded}\r\n"));
+                drop(credentials);
+            }
+            for (k, v) in &config.headers {
+                request.push_str(&format!("{k}: {v}\r\n"));
             }
             request.push_str("\r\n");
-
             // 3. 发送请求
             conn.write_all(request.as_bytes())
                 .await
@@ -194,15 +225,16 @@ pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
                 .unwrap_or(header_end);
             let first_line = std::str::from_utf8(&buf[..first_line_end])
                 .map_err(|e| format!("http response not UTF-8: {e}"))?;
-            // 检查状态码（200 = OK）
-            if !first_line.contains("200") {
-                return Err(format!("http CONNECT proxy returned: {first_line}"));
+            // 6a5v：状态码必须**严格等于 200**（第二字段），而非 contains("200")。
+            // contains 误判形如 "HTTP/1.1 2100 OK" 或 "HTTP/1.1 2000 ..." 这种首行
+            // 恰含 "200" 的非 200 响应 → 误建隧道。Go http.Header.Get("Status") 路径
+            // 按 HTTP/1.x SPEC 解析三位状态码。
+            let mut parts = first_line.split_ascii_whitespace();
+            let _version = parts.next();
+            let status = parts.next().unwrap_or("");
+            if status != "200" {
+                return Err(format!("http CONNECT proxy returned non-200: {first_line}"));
             }
-
-            // ponytail: 响应头剩余数据（如有）丢弃。
-            // HTTP CONNECT 隧道建立后，conn 双向透传——proxy 不再注入数据。
-
-            // 6. 返回连接（隧道已建立）
             Ok(conn)
         })
     })

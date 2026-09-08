@@ -15,7 +15,9 @@ use parking_lot::Mutex;
 /// 明文 salt 重放过滤器（线程共享，inbound handler 持有）。
 pub struct SaltReplayFilter {
     ttl: Duration,
-    pool: Mutex<HashMap<Box<[u8]>, Instant>>,
+    /// (上次全量清理时刻, salt 池)——sing `lastClean` 与 pool 同锁
+    /// （check 是 `&self`，可变状态必须在锁内）。
+    state: Mutex<(Instant, HashMap<Box<[u8]>, Instant>)>,
 }
 
 /// 生产 salt 重放窗口（对齐 sing `replay.NewSimple(60 * time.Second)`）。
@@ -27,7 +29,7 @@ impl SaltReplayFilter {
     pub fn new(ttl: Duration) -> Self {
         Self {
             ttl,
-            pool: Mutex::new(HashMap::new()),
+            state: Mutex::new((Instant::now(), HashMap::new())),
         }
     }
 
@@ -35,10 +37,12 @@ impl SaltReplayFilter {
     #[must_use]
     pub fn check(&self, salt: &[u8]) -> bool {
         let now = Instant::now();
-        let mut pool = self.pool.lock();
-        // ponytail: 阈值惰性清理（4096×32B ≈ 128KB 上限），sing 按时间轮询等价
-        if pool.len() >= 4096 {
+        let (last_clean, pool) = &mut *self.state.lock();
+        // sing SimpleFilter：清理周期（> TTL）到了才全表 retain 并重置
+        // lastClean；周期内的 check 只查表（池内存上限 = TTL × QPS，Go 同构）。
+        if now.duration_since(*last_clean) > self.ttl {
             pool.retain(|_, t| now.duration_since(*t) < self.ttl);
+            *last_clean = now;
         }
         let replayed = matches!(pool.get(salt), Some(t) if now.duration_since(*t) < self.ttl);
         if !replayed {
@@ -50,13 +54,13 @@ impl SaltReplayFilter {
     /// 当前池大小（测试用）。
     #[must_use]
     pub fn len(&self) -> usize {
-        self.pool.lock().len()
+        self.state.lock().1.len()
     }
 
     /// 池是否为空（测试用）。
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.pool.lock().is_empty()
+        self.state.lock().1.is_empty()
     }
 }
 

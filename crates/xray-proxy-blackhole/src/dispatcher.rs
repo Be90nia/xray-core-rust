@@ -27,9 +27,15 @@ use crate::BlackholeError;
 /// 写完响应后让客户端读走的等待时间（与 Go `time.Sleep(time.Second)` 一致）。
 const RESPONSE_SETTLE: Duration = Duration::from_secs(1);
 
-/// UDP drain 超时（Go 是 `30 + dice.Roll(61)` 即 30~90s，取中位数 60s 避免引入 rand）。
+/// UDP drain 空闲超时。Go `signal.CancelAfterInactivity` 是空闲计时器（30+dice.Roll(61)
+/// 秒 = 30-90s）；Rust tokio 无内置 inactivity timer，固定上限取中位数 60s。
+/// 客户端持续重发时按本上限退出（防单连接无限挂）。
 const UDP_DRAIN: Duration = Duration::from_secs(60);
 
+/// TCP drain 上限。Go `Process` 没有超时，靠 `common.Interrupt` defer 关 reader；
+/// Rust 用 `Duration::MAX` 与 Go 等价但永远不关易挂——折中给一个保守上限
+/// （5min 远超正常 EOF，又不至于真挂死）。客户端主动断 → EOF → 立即返回。
+const TCP_DRAIN_MAX: Duration = Duration::from_secs(300);
 /// Blackhole 出站 handler，impl [`DispatchHandler`]。
 ///
 /// 对应 Go `proxy/blackhole.Handler`。`tag` 由注册时给出，`response` 来自
@@ -78,7 +84,13 @@ impl DispatchHandler for BlackholeHandler {
 
     fn dispatch(&self, dest: &Destination, link: Link) -> PinFuture<()> {
         let response = self.response;
-        let drain_timeout = if dest.network() == Network::UDP { UDP_DRAIN } else { Duration::MAX };
+        // edwo：TCP drain 上限封顶（之前 Duration::MAX 在客户端永不 EOF 时挂死）。
+        // 5 分钟上限远超正常 EOF 时间；客户端主动断 / EOF 仍立即返回。
+        let drain_timeout = if dest.network() == Network::UDP {
+            UDP_DRAIN
+        } else {
+            TCP_DRAIN_MAX
+        };
         let tag = self.tag.clone();
         Box::pin(async move {
             let mut writer = link.writer;

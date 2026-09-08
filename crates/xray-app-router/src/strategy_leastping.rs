@@ -23,12 +23,20 @@ fn effective_rtt(s: &OutboundStatus) -> i64 {
 
 pub struct LeastPingStrategy {
     observer: Arc<dyn ObservationProvider>,
+    /// ga1k：候选 outbound tag 列表（来自 `BalancingRule.outbound_selector`）。
+    /// 必须过滤——否则观测结果中的其他出站（甚至 direct 等未注册 tag）都会被选中。
+    /// 与 Go `LeastPingStrategy.PickOutbound(strings []string)` 的 `outboundsList.contains(v.OutboundTag)` 一致。
+    candidates: Vec<String>,
 }
 
 impl LeastPingStrategy {
     /// 创建。
-    pub fn new(observer: Arc<dyn ObservationProvider>) -> Self {
-        Self { observer }
+    ///
+    /// `candidates` 为该 balancer 的候选 tag 列表（来自 `BalancingRule.outbound_selector`）。
+    /// Go 端 `PickOutbound(strings []string)` 把列表作为参数传入；Rust 端 trait
+    /// `pick_outbound()` 无参数，故在构造时注入。空 `candidates` = 不限制（fallback 到原始全观测遍历）。
+    pub fn new(observer: Arc<dyn ObservationProvider>, candidates: Vec<String>) -> Self {
+        Self { observer, candidates }
     }
 }
 
@@ -38,6 +46,11 @@ impl BalancingStrategy for LeastPingStrategy {
         let mut best_tag = String::new();
         let mut best_rtt: Option<i64> = None;
         for s in &obs.status {
+            // ga1k：必须在候选集中（Go `outboundsList.contains(v.OutboundTag)`），
+            // 候选为空 = 不限制（兼容旧调用方）。
+            if !self.candidates.is_empty() && !self.candidates.iter().any(|c| c == &s.outbound_tag) {
+                continue;
+            }
             // 仅考虑 alive 且有有效 delay（>0）
             if !s.alive || s.delay <= 0 {
                 continue;
@@ -89,7 +102,7 @@ mod tests {
                 status("c", true, 200),
             ],
         };
-        let s = LeastPingStrategy::new(Arc::new(FixedObs(obs)));
+        let s = LeastPingStrategy::new(Arc::new(FixedObs(obs)), vec![]);
         assert_eq!(s.pick_outbound().unwrap(), "b");
     }
 
@@ -123,7 +136,7 @@ mod tests {
                 status_with_hp("b", true, 100, 80),
             ],
         };
-        let s = LeastPingStrategy::new(Arc::new(FixedObs(obs)));
+        let s = LeastPingStrategy::new(Arc::new(FixedObs(obs)), vec![]);
         assert_eq!(s.pick_outbound().unwrap(), "b");
     }
 
@@ -133,18 +146,45 @@ mod tests {
         let obs = ObservationResult {
             status: vec![status("a", false, 10), status("b", true, 100)],
         };
-        let s = LeastPingStrategy::new(Arc::new(FixedObs(obs)));
+        let s = LeastPingStrategy::new(Arc::new(FixedObs(obs)), vec![]);
         assert_eq!(s.pick_outbound().unwrap(), "b");
     }
 
     #[test]
     fn test_no_alive_returns_error() {
         let obs = ObservationResult { status: vec![] };
-        let s = LeastPingStrategy::new(Arc::new(FixedObs(obs)));
+        let s = LeastPingStrategy::new(Arc::new(FixedObs(obs)), vec![]);
         assert!(matches!(s.pick_outbound(), Err(RouterError::EmptyBalancerResult)));
     }
 
     // 让 NotImplementedSelector 不被 dead_code 警告（上述测试不使用）。
+    #[test]
+    fn test_candidates_filter_excludes_non_selected() {
+        // ga1k：观测结果中包含候选集外的 tag（如 direct / 未注册 tag），
+        // 必须过滤——否则最低 delay 的非候选 tag 会被错选。
+        let obs = ObservationResult {
+            status: vec![
+                status("direct", true, 10), // 非候选，最低 delay
+                status("proxy-a", true, 50),
+                status("proxy-b", true, 100),
+            ],
+        };
+        let s = LeastPingStrategy::new(
+            Arc::new(FixedObs(obs)),
+            vec!["proxy-a".into(), "proxy-b".into()],
+        );
+        assert_eq!(s.pick_outbound().unwrap(), "proxy-a");
+    }
+
+    #[test]
+    fn test_candidates_empty_falls_back_to_all() {
+        // 向后兼容：候选为空 = 不限制（等价 Go 端无 selector 时的旧行为）。
+        let obs = ObservationResult {
+            status: vec![status("a", true, 50), status("b", true, 100)],
+        };
+        let s = LeastPingStrategy::new(Arc::new(FixedObs(obs)), vec![]);
+        assert_eq!(s.pick_outbound().unwrap(), "a");
+    }
     #[test]
     fn test_dummy_use_selector() {
         let _ = NotImplementedSelector;

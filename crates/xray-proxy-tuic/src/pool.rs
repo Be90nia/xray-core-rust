@@ -17,14 +17,18 @@
 //! - 池本身：[`Arc`] 持有，drop 时关闭所有连接
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, RwLock};
-use tokio::time::{sleep, Instant};
+use tokio::time::sleep;
 
 use crate::error::{Result, TuicError};
+
+/// 拨号超时兜底（对齐 dispatcher 拨号 30s；connector 自带超时时无感）。
+const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 连接池 key — 同一目标同一 TLS 参数共用连接。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -100,6 +104,10 @@ impl PooledConnection {
 #[derive(Clone)]
 pub struct QuinnConnectionPool {
     inner: Arc<Mutex<HashMap<PoolKey, PooledConnection>>>,
+    /// per-key 拨号锁（single-flight）：同 key 并发 get_or_connect 只有一个
+    /// leader 真正拨号，其余在锁上排队，拿到锁后 double-check 池直接复用，
+    /// 消除 N-1 条孤儿连接（票 5poj）。
+    dial_locks: Arc<Mutex<HashMap<PoolKey, Arc<Mutex<()>>>>>,
 }
 
 impl QuinnConnectionPool {
@@ -107,6 +115,7 @@ impl QuinnConnectionPool {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            dial_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -125,9 +134,27 @@ impl QuinnConnectionPool {
     ) -> Result<PooledConnection>
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<quinn::Connection>>,
+        Fut: Future<Output = Result<quinn::Connection>>,
     {
-        // 快速路径：读锁检查
+        self.get_or_connect_dial_timeout(key, connector, DIAL_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::get_or_connect`] 带可配置拨号超时（测试用小超时）。
+    ///
+    /// single-flight 语义：同 key 并发请求串行进入拨号临界区，非首个
+    /// 到达者在临界区内 double-check 池命中已拨好的连接直接复用。
+    pub(crate) async fn get_or_connect_dial_timeout<F, Fut>(
+        &self,
+        key: PoolKey,
+        connector: F,
+        dial_timeout: std::time::Duration,
+    ) -> Result<PooledConnection>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<quinn::Connection>>,
+    {
+        // 快速路径：池中已有活跃连接
         {
             let pool = self.inner.lock().await;
             if let Some(entry) = pool.get(&key) {
@@ -137,8 +164,32 @@ impl QuinnConnectionPool {
             }
         }
 
-        // 慢速路径：新建连接
-        let conn = connector().await?;
+        // 取/建 per-key 拨号锁（锁获取顺序恒为 dial_locks → key lock → inner）。
+        let key_lock = {
+            let mut locks = self.dial_locks.lock().await;
+            locks.entry(key.clone()).or_default().clone()
+        };
+        let _guard = key_lock.lock().await;
+
+        // double-check：leader 拨号期间同 key 连接可能已入池
+        {
+            let pool = self.inner.lock().await;
+            if let Some(entry) = pool.get(&key) {
+                if entry.is_alive().await {
+                    return Ok(entry.clone());
+                }
+            }
+        }
+
+        // 慢速路径：新建连接（兜底超时——connector 本身无时限时防无限挂起）
+        let conn = tokio::time::timeout(dial_timeout, connector())
+            .await
+            .map_err(|_| {
+                TuicError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "tuic pool dial timeout",
+                ))
+            })??;
         let pooled = PooledConnection {
             conn,
             created_at: Instant::now(),
@@ -214,7 +265,7 @@ impl ReconnectingConnection {
     ) -> Result<PooledConnection>
     where
         F: Fn() -> Fut + Clone,
-        Fut: std::future::Future<Output = Result<quinn::Connection>>,
+        Fut: Future<Output = Result<quinn::Connection>>,
     {
         let mut last_err = None;
         for attempt in 0..=self.max_retries {

@@ -178,6 +178,11 @@ impl DispatcherContext {
         self.source_ips = ips;
         self
     }
+    /// c10t：设置源端口。源端口解析来自 AccessContext.from `ip:port` 字段。
+    pub fn with_source_port(mut self, p: Port) -> Self {
+        self.source_port = p;
+        self
+    }
     pub fn with_inbound_tag(mut self, t: impl Into<String>) -> Self {
         self.inbound_tag = t.into();
         self
@@ -604,6 +609,16 @@ fn build_routing_context(
     ctx
 }
 
+/// 从 `from`（`ip:port`）解析源 IP。c10t：让 SourceIpMatcher 规则命中。
+fn parse_from_ip(from: &str) -> Option<IpAddr> {
+    from.rsplit_once(':').and_then(|(ip_s, _)| ip_s.parse().ok())
+}
+
+/// 从 `from`（`ip:port`）解析源端口。
+fn parse_from_port(from: &str) -> Option<u16> {
+    from.rsplit_once(':').and_then(|(_, p)| p.parse().ok())
+}
+
 /// 懒注册并取 counter（对应 Go `stats.Manager.GetCounter` 的 create-if-missing 语义）。
 ///
 /// Rust 端 [`xray_features::stats::Manager::get_counter`] 仅查询（miss 返回 None），
@@ -981,10 +996,22 @@ impl DefaultDispatcher {
             // 委托 xray_app_router::Router::pick_route_resolved（携带完整 RoutingContext）。
             else if let Some(r) = &router {
                 let mut ctx = build_routing_context(&final_dest, sniffed_protocol.as_deref());
-                // Go routing.Context 携带 inbound tag（InboundTagMatcher 依赖）：
-                // 从 access 上下文回填，否则 inboundTag 规则永不命中、恒落 default。
+                // Go routing.Context 携带 inbound tag / source / user（c10t）：
+                // InboundTagMatcher / SourceIpMatcher / UserMatcher 依赖这些字段；
+                // 此前只回填 inbound_tag，source/user 静默失效 → 对应规则永不命中。
                 if let Some(a) = &access {
                     ctx = ctx.with_inbound_tag(a.inbound_tag.as_str());
+                    // c10t：源地址解析（`from` 是 "ip:port" 形态）；取 IP 部分。
+                    if let Some(ip) = parse_from_ip(&a.from) {
+                        ctx = ctx.with_source_ips(vec![ip]);
+                    }
+                    // c10t：源端口解析；同字符串 split。
+                    if let Some(port) = parse_from_port(&a.from) {
+                        ctx = ctx.with_source_port(xray_common::net::port::Port::new(port));
+                    }
+                    if !a.email.is_empty() {
+                        ctx = ctx.with_user(a.email.as_str());
+                    }
                 }
                 // routeOnly（Go default.go:311-315）：路由用嗅探域名（route_target），
                 // 拨号保持 final_dest（原 dest）。

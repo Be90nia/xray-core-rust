@@ -82,6 +82,10 @@ pub struct VisionConn<C> {
     raw_fallback: Option<TcpStream>,
     /// server 模式注入的裸 TCP 克隆（accept 层 dup，DIRECT 前不启用）。
     raw_tcp: Option<TcpStream>,
+    /// poll_read 阶段 16KB 临时缓冲提升为堆字段，避免握手/首请求期高频
+    /// poll_read 时的 16KB 栈帧占用（栈帧不被编译器复用）。Vec 容量在
+    /// new/new_server 中按 16KB 预分配后稳态复用。
+    read_tmp: Vec<u8>,
 }
 
 impl<C> VisionConn<C>
@@ -112,6 +116,7 @@ where
             downlink_traffic: TrafficState::new(user_uuid.clone()),
             raw_fallback: None,
             raw_tcp: None,
+            read_tmp: Vec::with_capacity(16 * 1024),
         }
     }
 
@@ -137,6 +142,7 @@ where
             downlink_traffic: TrafficState::new(user_uuid.clone()),
             raw_fallback: None,
             raw_tcp: Some(raw_tcp),
+            read_tmp: Vec::with_capacity(16 * 1024),
         }
     }
 
@@ -191,18 +197,26 @@ where
                 }
                 return Pin::new(&mut this.inner).poll_read(cx, buf);
             }
-
-            // 3. padding 模式 → CommonConn read + unpadding
-            let mut tmp = [0u8; 16_384];
-            let mut rb = ReadBuf::new(&mut tmp);
+            // 3. padding 模式 → CommonConn read + unpadding。临时缓冲提升为
+            //    struct 字段（read_tmp）避免每 poll_read 16KB 栈帧；栈帧不被
+            //    编译器复用 → 握手/首请求期高频 poll_read 时栈占膨胀。
+            let read_tmp_len = this.read_tmp.len();
+            // 保留 read_tmp 容量（Vec::clear 不缩容），若历史残留更长则按需截断。
+            this.read_tmp.clear();
+            this.read_tmp.resize(16 * 1024, 0);
+            // ReadBuf::new 接收可变借用，poll_read 期间独占 read_tmp 切片。
+            // borrow 结束后 n = rb.filled().len() 可读回已填充字节。
+            let mut rb = ReadBuf::new(&mut this.read_tmp[..]);
             match Pin::new(&mut this.inner).poll_read(cx, &mut rb) {
                 Poll::Ready(Ok(())) => {
                     let n = rb.filled().len();
                     if n == 0 {
-                        return Poll::Ready(Ok(())); // EOF
+                        // EOF：恢复 read_tmp 长度，避免持续 alloc（清空）。
+                        this.read_tmp.truncate(read_tmp_len);
+                        return Poll::Ready(Ok(()));
                     }
                     let content =
-                        xtls_unpadding(&tmp[..n], &mut this.downlink_state, &this.user_uuid);
+                        xtls_unpadding(&this.read_tmp[..n], &mut this.downlink_state, &this.user_uuid);
                     let cmd = this.downlink_state.current_command;
                     // server 关闭下行 padding：END=只关 padding（继续读 TLS 层），
                     // DIRECT=splice——server 已 UnwrapRawConn，此后在裸 TCP 上

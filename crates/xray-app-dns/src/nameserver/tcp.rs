@@ -34,7 +34,7 @@ use crate::dnscommon::{
 };
 use crate::error::DnsError;
 use crate::nameserver::cached::{query_ip, CachedNameserver, QueryOutcome};
-use crate::nameserver::{NameServerConfig, Server};
+use crate::nameserver::{local, NameServerConfig, Server};
 
 /// TCP DNS 单次响应最大字节数（DNS over TCP 理论上限 65535；实际 rarely > 4096）。
 const TCP_RECV_MAX: usize = 65535;

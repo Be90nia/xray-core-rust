@@ -121,6 +121,8 @@ pub enum SsError {
 
     #[error("ss-2022 server packet clientSessionId mismatch")]
     Ss2022BadClientSessionId,
+    #[error("ss-2022 server session changed more than once during the last minute")]
+    Ss2022TooManyServerSessions,
     #[error("ss-2022 request salt mismatch")]
     Ss2022BadRequestSalt,
 }

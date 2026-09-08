@@ -14,13 +14,25 @@ use xray_proto::xray::proxy::blackhole::Config;
 
 use crate::BlackholeError;
 
-/// 预置 HTTP 403 响应字符串，与 Go 版本 `http403response` 字面量一一对应。
-pub const HTTP_403_RESPONSE: &str = "HTTP/1.1 403 Forbidden\r\n\
-    Connection: close\r\n\
-    Cache-Control: max-age=3600, public\r\n\
-    Content-Length: 0\r\n\
-    \r\n\
-    \r\n";
+/// 预置 HTTP 403 响应字符串，与 Go 版本 `http403response` 字面量**逐字节对齐**。
+///
+// 对应 Go `proxy/blackhole/config.go:9-15`：
+// ```go
+// const http403response = `HTTP/1.1 403 Forbidden
+// Connection: close
+// Cache-Control: max-age=3600, public
+// Content-Length: 0
+//
+//
+// `
+// ```
+// Go 用裸字符串字面量，行末是 **LF** 而非 CRLF（Rust 之前误写 \r\n）。
+pub const HTTP_403_RESPONSE: &str = "HTTP/1.1 403 Forbidden\n\
+    Connection: close\n\
+    Cache-Control: max-age=3600, public\n\
+    Content-Length: 0\n\
+    \n\
+    \n";
 
 /// Blackhole 响应配置：要么不响应，要么回写预置的 HTTP 403 报文。
 ///
@@ -153,19 +165,14 @@ mod tests {
 
     #[test]
     fn http_403_payload_matches_go_constant() {
-        // Go 字面量（注意结尾两行空行）：
-        //   "HTTP/1.1 403 Forbidden\r\n"
-        //   "Connection: close\r\n"
-        //   "Cache-Control: max-age=3600, public\r\n"
-        //   "Content-Length: 0\r\n"
-        //   "\r\n"
-        //   "\r\n"
-        let expected = "HTTP/1.1 403 Forbidden\r\n\
-            Connection: close\r\n\
-            Cache-Control: max-age=3600, public\r\n\
-            Content-Length: 0\r\n\
-            \r\n\
-            \r\n";
+        // edwo：Go `proxy/blackhole/config.go:9-15` 字面量用裸字符串 → 行末 LF（不是 CRLF）。
+        // 之前断言 CRLF 是误抄；该断言反向钉死了错误行为。
+        let expected = "HTTP/1.1 403 Forbidden\n\
+            Connection: close\n\
+            Cache-Control: max-age=3600, public\n\
+            Content-Length: 0\n\
+            \n\
+            \n";
         assert_eq!(HTTP_403_RESPONSE, expected);
     }
 

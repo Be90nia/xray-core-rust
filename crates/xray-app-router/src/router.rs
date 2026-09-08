@@ -154,12 +154,12 @@ impl Router {
         let rules = self.rules.read();
         for rule in rules.iter() {
             if let Some(tag) = rule.apply(ctx) {
-                if !tag.is_empty() {
-                    return Ok(Route {
-                        outbound_tag: tag,
-                        rule_tag: rule.rule_tag.clone(),
-                    });
-                }
+                // qrog：Go 行为——命中即中止，空 tag 即"交由上层走默认出站"。
+                // 此前 skip-and-continue 导致后续规则静默覆盖此意图。
+                return Ok(Route {
+                    outbound_tag: tag,
+                    rule_tag: rule.rule_tag.clone(),
+                });
             }
         }
         Err(RouterError::NoClue)
@@ -345,9 +345,10 @@ fn build_balancer(
             ohm.clone(),
         )),
         "leastping" => {
-            // 始终构建；observer 缺失时 pick_outbound 返回 EmptyBalancerResult。
             if let Some(obs) = observer {
-                Arc::new(crate::strategy_leastping::LeastPingStrategy::new(obs))
+                // ga1k：把 balancer 的 outbound_selector 作为候选列表注入策略，
+                // 与 Go `LeastPingStrategy.PickOutbound(strings []string)` 一致。
+                Arc::new(crate::strategy_leastping::LeastPingStrategy::new(obs, br.outbound_selector.clone()))
             } else {
                 Arc::new(StubLeastPingStrategy)
             }

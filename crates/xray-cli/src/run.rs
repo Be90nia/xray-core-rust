@@ -105,6 +105,25 @@ pub async fn execute(args: RunArgs) -> Result<()> {
         .build()
         .map_err(|e| CliError::StartFailed(format!("config build failed: {e}")))?;
 
+    // 91vi：`--unix` 启动期校验。splithttp UDS 监听尚未贯通 (M3B 域
+    // xray-transport-splithttp transport.rs UDS listener 仍在开发)。
+    // 配置无 splithttp transport inbound → 启动期明确报错；
+    // 有 → 路径透传留待 splithttp 接线后生效，warn 提醒。
+    #[cfg(unix)]
+    if let Some(uds_path) = &args.unix_socket {
+        if !config_uses_splithttp(&config) {
+            return Err(CliError::StartFailed(format!(
+                "--unix {uds_path} requires a splithttp (XHTTP) inbound in config; \
+                 currently no UDS listener consumes this flag — see Xray-core-rust-91vi"
+            )));
+        }
+        tracing::warn!(
+            unix_socket = %uds_path,
+            "--unix accepted but splithttp UDS listener is not yet wired through \
+             xray-core::start_full; flag is consumed at config-validation time only"
+        );
+    }
+
     // `-test` 模式：仅验证配置可加载 + build，不启动服务。对应 Go `main/run.go:85-88`。
     if args.test {
         println!("Configuration OK.");
@@ -129,6 +148,21 @@ pub async fn execute(args: RunArgs) -> Result<()> {
     }
     tracing::info!("xray instance shutdown");
     Ok(())
+}
+
+/// 检查 Config 中是否有 inbound 使用 splithttp (XHTTP) transport。
+///
+/// 用于 `--unix` 启动期校验：`--unix` 仅对 XHTTP inbound 有意义。
+/// 至少一个 inbound 的 streamSettings.network == "splithttp" 即返回 true。
+fn config_uses_splithttp(config: &xray_conf::config::Config) -> bool {
+    let inbounds = &config.inbound_configs;
+    inbounds.iter().any(|ib| {
+        ib.stream_settings
+            .as_ref()
+            .and_then(|ss| ss.get("network"))
+            .and_then(|v| v.as_str())
+            == Some("splithttp")
+    })
 }
 
 /// 等待 SIGINT (Ctrl-C) 或（unix）SIGTERM 信号。

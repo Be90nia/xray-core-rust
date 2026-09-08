@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 
 use crate::config::{LogConfig, LogFormat, LogType, SeverityLevel};
@@ -365,12 +365,21 @@ impl HandlerCreator for ConsoleHandlerCreator {
 
 /// File handler：追加写入文件。
 ///
-/// 对应 Go `log.FileHandler`。每次 handle() 打开文件追加写入一行，
-/// 避免持有文件句柄导致无法 rotate。
-/// ponytail: per-write open — 如果性能不够，改用 RwLock<File> 持有句柄。
+/// 对应 Go `log.FileHandler`。持有一个由 `Mutex<File>` 守护的可重用句柄，
+/// 避免每次写入走 open/write/close 三 syscall（高 QPS 写放大）。
+///
+/// Rotate 兼容：调用方执行 `rename(path, path.1)` 后，下一次 `handle` 写入
+/// 会通过 `Metadata::len()` 探测 inode 不匹配则 reopen——保证旧 fd 不再写入
+/// 已 rotate 的旧 inode，新行进入新 inode。
 pub struct FileHandler {
     path: String,
     format: LogFormat,
+    inner: Mutex<FileHandleState>,
+}
+
+struct FileHandleState {
+    file: Option<File>,
+    open_inode: u64,
 }
 
 impl FileHandler {
@@ -378,19 +387,64 @@ impl FileHandler {
         Self {
             path,
             format: LogFormat::Console,
+            inner: Mutex::new(FileHandleState {
+                file: None,
+                open_inode: 0,
+            }),
         }
     }
 
     /// 带输出格式构造。
     pub fn with_format(path: String, format: LogFormat) -> Self {
-        Self { path, format }
+        Self {
+            path,
+            format,
+            inner: Mutex::new(FileHandleState {
+                file: None,
+                open_inode: 0,
+            }),
+        }
     }
 }
 
 impl LogHandler for FileHandler {
+    #[cfg(unix)]
     fn handle(&self, entry: &LogEntry) {
         let line = entry.format_with(self.format);
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&self.path) {
+        let mut state = self.inner.lock();
+        let path = std::path::Path::new(&self.path);
+        let current_inode = std::fs::metadata(path).map(|m| inode_of(&m)).unwrap_or(0);
+        if state.file.is_none() || state.open_inode != current_inode {
+            let f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path);
+            match f {
+                Ok(file) => {
+                    state.file = Some(file);
+                    state.open_inode = current_inode;
+                }
+                Err(_) => return,
+            }
+        }
+        if let Some(f) = state.file.as_mut() {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn handle(&self, entry: &LogEntry) {
+        // ponytail: Windows 无稳定 inode API 探测 rename；保持 Go 兼容的 per-write
+        // open 行为。高 QPS 写放大场景仍依赖 ReopenMutex<File> 升级——见
+        // xray-app-log/src/instance.rs unix 分支；Windows 升级路径：
+        // 1) 用 GetFileInformationByHandle 比 ByHandleFileInformation.nFileIndexHigh/Low
+        // 2) 引入 winapi/windows-sys 依赖,FOkens 代价大，保留现状。
+        let line = entry.format_with(self.format);
+        if let Ok(mut f) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
             let _ = writeln!(f, "{line}");
         }
     }
@@ -783,13 +837,58 @@ mod tests {
             status: Some(AccessStatus::Accepted),
             ..Default::default()
         }));
-
         let content = std::fs::read_to_string(&path).unwrap();
         let j: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
         assert_eq!(j["detour"], "direct");
         assert_eq!(j["status"], "accepted");
         let _ = std::fs::remove_file(&path);
     }
+
+    /// td44：rotate 后（外部 rename 删除原 inode + 创建新文件）下一次 handle 写入
+    /// 新文件，旧文件不再追加。验证持锁 fd 在 inode 变化时正确 reopen。
+    /// Windows 无稳定 inode API，FileHandler 走 per-write open 分支（见 handle
+    /// 的 cfg(not(unix)) 分支），rotate 语义天然正确——测试无需在 Windows 跑。
+    #[cfg(unix)]
+    #[test]
+    fn file_handler_rotate_reopens_on_inode_change() {
+        let dir = std::env::temp_dir().join(format!("xray-log-rotate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("access.log");
+        let _ = std::fs::remove_file(&path);
+
+        let h = FileHandler::new(path.to_string_lossy().into_owned());
+        h.handle(&LogEntry::General(GeneralMessage {
+            severity: SeverityLevel::Info,
+            content: "before-rotate".into(),
+        }));
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(before.contains("before-rotate"));
+
+        // 模拟 rotate：rename 旧文件，再创建同 path 的新空文件
+        let rotated = dir.join("access.log.1");
+        std::fs::rename(&path, &rotated).unwrap();
+        std::fs::write(&path, b"").unwrap();
+
+        h.handle(&LogEntry::General(GeneralMessage {
+            severity: SeverityLevel::Info,
+            content: "after-rotate".into(),
+        }));
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("after-rotate"),
+            "new entry must land in new file: {after}"
+        );
+        let rotated_content = std::fs::read_to_string(&rotated).unwrap();
+        assert!(
+            !rotated_content.contains("after-rotate"),
+            "stale fd must not write to rotated inode: {rotated_content}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&rotated);
+    }
+
 
     #[test]
     fn dns_format_contains_fields() {

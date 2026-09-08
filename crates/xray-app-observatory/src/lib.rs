@@ -27,9 +27,11 @@ pub mod observer;
 pub mod status;
 pub use burst::{
     burst_observer::BurstObserver,
-    healthping_settings::{HealthPingConfig, HealthPingSettings},
+    healthping_settings::{
+        DEFAULT_DESTINATION, DEFAULT_HTTP_METHOD, DEFAULT_INTERVAL_NANOS, DEFAULT_SAMPLING_COUNT,
+        DEFAULT_TIMEOUT_NANOS, HealthPingConfig, HealthPingSettings, MIN_INTERVAL_NANOS,
+    },
     healthping_stats::{HealthPingRtts, HealthPingStats, PingRtt},
-    is_valid_rtt, RTT_FAILED, RTT_UNQUALIFIED, RTT_UNTESTED,
 };
 pub use command::{
     DefaultObservatoryService, NoopObservatoryServiceRegistrar, ObservationProvider,

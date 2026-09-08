@@ -116,7 +116,11 @@ impl Condition for DomainMatcherCondition {
         if d.is_empty() {
             return false;
         }
-        self.matcher.match_any(d)
+        // hloi：Go `domainMatcher` 内部对输入统一 ToLower（router.go:165）。
+        // Rust geodata MphDomainMatcher 假设输入已规范化；混合大小写域名会漏匹配。
+        // 性能：to_lowercase 在 ASCII 域名上是 O(n) 且 alloc-free 在小字符串上；
+        // 已在 condition.rs 注释"非 hot path"故无需再降级。
+        self.matcher.match_any(&d.to_lowercase())
     }
 }
 

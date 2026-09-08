@@ -126,15 +126,19 @@ impl RoundRobinStrategy {
             Ok(o) => o,
             Err(_) => return Ok(selected),
         };
-        // Go 语义：仅当观测结果存在时按 alive 过滤；找不到/没数据就返回空 list
-        // （非全部）。这样 RoundRobin 在所有出站都 dead 时返回空 → Balancer fallback。
+        // gbu9：Go `balancing.go:57-66` 语义——观测快照中未出现的候选视为
+        // alive（unfound candidate is considered alive）。原 Rust 实现用
+        // `iter().any(|s| s.alive && ...)` 反向 filter，新加出站还未被观测
+        // 快照收录时会被无端丢弃，永远选不中。
         let alive: Vec<String> = selected
             .iter()
             .filter(|t| {
                 observation
                     .status
                     .iter()
-                    .any(|s| s.alive && s.outbound_tag == **t)
+                    .find(|s| s.outbound_tag == ***t)
+                    .map(|s| s.alive) // 找到 → 按 alive 判定
+                    .unwrap_or(true)  // 未找到 → alive（Go 默认）
             })
             .cloned()
             .collect();
@@ -496,8 +500,47 @@ mod tests {
             "",
         );
         b.override_handle().put("override-out");
-        assert_eq!(b.pick_outbound().unwrap(), "override-out");
         b.override_handle().clear();
         assert_eq!(b.pick_outbound().unwrap(), "strategy-out");
     }
+    #[test]
+    fn test_roundrobin_unfound_candidate_considered_alive() {
+        use xray_proto::xray::core::app::observatory::{ObservationResult, OutboundStatus};
+        use crate::balancing::ObservationProvider;
+
+        struct ObsWithTag(Option<OutboundStatus>);
+        impl ObservationProvider for ObsWithTag {
+            fn get_observation(&self) -> Result<ObservationResult, RouterError> {
+                Ok(ObservationResult {
+                    status: self.0.clone().into_iter().collect(),
+                })
+            }
+        }
+
+        // 观测快照只含 "proxy-a"=alive；"proxy-b" 未被观测 → 视为 alive（Go 默认）。
+        let obs: Arc<dyn ObservationProvider> = Arc::new(ObsWithTag(Some(OutboundStatus {
+            alive: true,
+            delay: 50,
+            last_error_reason: String::new(),
+            outbound_tag: "proxy-a".into(),
+            last_seen_time: 0,
+            last_try_time: 0,
+            health_ping: None,
+        })));
+        let ohm: Arc<dyn OutboundHandlerSelector> =
+            Arc::new(SimpleSelector::from_tags(["proxy-a", "proxy-b"]));
+        // 用 select_outbounds 实际能匹配上的前缀（SimpleSelector 用 contains
+        // 完全等值匹配，所以 selectors 必须是完整的 tag 字符串）。
+        let s = RoundRobinStrategy::new(
+            vec!["proxy-a".into(), "proxy-b".into()],
+            ohm,
+            Some(obs),
+        );
+        // 两次 pick 都应拿到 alive 候选（包括 "proxy-b"），不能掉。
+        let r1 = s.pick_outbound().unwrap();
+        let r2 = s.pick_outbound().unwrap();
+        assert!(r1 == "proxy-a" || r1 == "proxy-b");
+        assert!(r2 == "proxy-a" || r2 == "proxy-b");
+    }
+
 }

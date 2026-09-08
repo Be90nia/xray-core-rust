@@ -750,6 +750,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
     }
 }
 /// [`SSStream::try_open_chunk`] 的返回态。
+#[derive(Debug)]
 pub enum ChunkOut {
     /// 缓冲数据不足，等待更多 wire 字节。
     NeedMore,
@@ -1079,6 +1080,93 @@ mod tests {
             let got = client.read_chunk().await.expect("read").expect("non-empty");
             assert_eq!(got, b"PING", "{:?}: roundtrip mismatch", ct);
         }
+    }
+
+    /// SS-2022 响应 rekey：echo salt 按字典序 **大于** 请求 salt 时拒绝
+    /// （sing protocol.go:380 `bytes.Compare(echo, request) > 0 → ErrBadRequestSalt`）。
+    #[test]
+    fn response_rekey_2022_rejects_greater_echo_salt() {
+        use crate::ss2022::CipherKind2022;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let kind = CipherKind2022::Aes128Gcm;
+        let psk = [7u8; 16];
+        let request_salt = [1u8; 16];
+        let mut echo_salt = request_salt;
+        echo_salt[0] = 2; // lexicographically greater
+        let resp_salt = [9u8; 16];
+
+        // server 侧构造响应 wire：resp_salt || AEAD(fixed: type=1|ts|echo|len=0)
+        let subkey = crate::ss2022::derive_session_subkey(&psk, &resp_salt, kind);
+        let server_aead = crate::ss2022::key::build_aead(kind, &subkey).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut fixed_plain = Vec::with_capacity(11 + 16);
+        fixed_plain.push(1u8);
+        fixed_plain.extend_from_slice(&now.to_be_bytes());
+        fixed_plain.extend_from_slice(&echo_salt);
+        fixed_plain.extend_from_slice(&0u16.to_be_bytes());
+        let sealed = server_aead.seal(&[0u8; 12], &[], &fixed_plain).unwrap();
+        let mut wire = resp_salt.to_vec();
+        wire.extend_from_slice(&sealed);
+
+        // client：占位 aead + mark rekey，直接驱动缓冲状态机
+        let client_aead =
+            crate::ss2022::key::build_aead(kind, &[0u8; 16]).unwrap();
+        let (client_half, _server_half) = duplex(64);
+        let mut stream =
+            SSStream::new_with_aead_and_nonce(client_half, client_aead, vec![0xFF; 12]);
+        stream.mark_response_rekey_2022(psk.to_vec(), kind, request_salt.to_vec());
+
+        let out = stream.drive_2022_rekey(&mut wire);
+        assert!(
+            matches!(&out, Err(SsError::Ss2022BadRequestSalt)),
+            "echo salt greater than request salt must be rejected, got {out:?}"
+        );
+    }
+
+    /// 对照：echo salt **等于** 请求 salt 时 rekey 正常完成（返回 var chunk 消息）。
+    #[test]
+    fn response_rekey_2022_accepts_equal_echo_salt() {
+        use crate::ss2022::CipherKind2022;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let kind = CipherKind2022::Aes128Gcm;
+        let psk = [7u8; 16];
+        let request_salt = [1u8; 16];
+        let resp_salt = [9u8; 16];
+
+        let subkey = crate::ss2022::derive_session_subkey(&psk, &resp_salt, kind);
+        let server_aead = crate::ss2022::key::build_aead(kind, &subkey).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut fixed_plain = Vec::with_capacity(11 + 16);
+        fixed_plain.push(1u8);
+        fixed_plain.extend_from_slice(&now.to_be_bytes());
+        fixed_plain.extend_from_slice(&request_salt);
+        fixed_plain.extend_from_slice(&0u16.to_be_bytes());
+        let sealed = server_aead.seal(&[0u8; 12], &[], &fixed_plain).unwrap();
+        let mut wire = resp_salt.to_vec();
+        wire.extend_from_slice(&sealed);
+
+        let client_aead =
+            crate::ss2022::key::build_aead(kind, &[0u8; 16]).unwrap();
+        let (client_half, _server_half) = duplex(64);
+        let mut stream =
+            SSStream::new_with_aead_and_nonce(client_half, client_aead, vec![0xFF; 12]);
+        stream.mark_response_rekey_2022(psk.to_vec(), kind, request_salt.to_vec());
+
+        // var_len=0 走 fast path：Fixed 完成后直接进 body loop（无 var chunk），
+        // 需要更多字节 → NeedMore 而非错误。
+        let out = stream.drive_2022_rekey(&mut wire);
+        assert!(
+            matches!(&out, Ok(ChunkOut::NeedMore)),
+            "equal echo salt must pass salt check, got {out:?}"
+        );
     }
 }
 

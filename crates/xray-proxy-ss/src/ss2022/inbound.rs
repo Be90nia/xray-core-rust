@@ -31,7 +31,8 @@ use xray_common::net::address::Address;
 use crate::error::{Result, SsError};
 use crate::protocol::addr_type;
 use crate::ss2022::key::{
-    derive_psk, derive_session_subkey, psk_from_base64, CipherKind2022,
+    decrypt_identity_header, derive_psk, derive_session_subkey, psk_from_base64, psk_identity,
+    CipherKind2022,
 };
 use crate::ss2022::replay::{SaltReplayFilter, REPLAY_WINDOW};
 use crate::stream::SSStream;
@@ -149,13 +150,16 @@ pub struct MultiUserInbound {
     psk: Vec<u8>,
     kind: CipherKind2022,
     /// 用户列表（Arc<Mutex> 支持动态增删）。
-    users: Arc<Mutex<Vec<Ss2022User>>>,
+    ///
+    /// 每项 = (user, psk_identity(user.psk))：identity 在用户装载/添加时
+    /// 预计算一次（blake3），EIH 匹配退化为 16B memcmp，消除每连接 ×
+    /// 用户数的哈希放大（对齐 Go `identityMap` 语义）。
+    users: Arc<Mutex<Vec<(Ss2022User, [u8; 16])>>>,
     /// 时间戳容忍窗口（秒）。
     timestamp_tolerance: u64,
     /// 明文 salt 重放过滤器（sing `replay.NewSimple(60s)` 语义，check 即注册）。
     replay: SaltReplayFilter,
 }
-
 impl MultiUserInbound {
     /// 创建多用户入站。
     ///
@@ -173,11 +177,16 @@ impl MultiUserInbound {
         let users = users
             .into_iter()
             .map(|u| {
-                Ok::<_, SsError>(Ss2022User {
-                    email: u.email,
-                    level: u.level,
-                    psk: derive_psk(&u.psk, kind)?,
-                })
+                let psk = derive_psk(&u.psk, kind)?;
+                let identity = psk_identity(&psk);
+                Ok::<_, SsError>((
+                    Ss2022User {
+                        email: u.email,
+                        level: u.level,
+                        psk,
+                    },
+                    identity,
+                ))
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
@@ -218,18 +227,22 @@ impl MultiUserInbound {
             return Err(SsError::EmptyEmail);
         }
         let psk = derive_psk(&user.psk, self.kind)?;
+        let identity = psk_identity(&psk);
         let mut users = self.users.lock();
-        if users.iter().any(|u| u.email == user.email) {
+        if users.iter().any(|(u, _)| u.email == user.email) {
             return Err(SsError::UserNotFoundByEmail(format!(
                 "User {} already exists",
                 user.email
             )));
         }
-        users.push(Ss2022User {
-            email: user.email,
-            level: user.level,
-            psk,
-        });
+        users.push((
+            Ss2022User {
+                email: user.email,
+                level: user.level,
+                psk,
+            },
+            identity,
+        ));
         Ok(())
     }
 
@@ -240,7 +253,7 @@ impl MultiUserInbound {
     pub fn remove_user(&self, email: &str) -> Result<()> {
         let mut users = self.users.lock();
         let len_before = users.len();
-        users.retain(|u| u.email != email);
+        users.retain(|(u, _)| u.email != email);
         if users.len() == len_before {
             return Err(SsError::UserNotFoundByEmail(email.to_string()));
         }
@@ -262,11 +275,10 @@ impl MultiUserInbound {
     /// 返回用户 (identity, psk) 表快照（UDP relay 的 EIH 用户识别）。
     #[must_use]
     pub fn udp_user_table(&self) -> Vec<([u8; 16], Vec<u8>)> {
-        use crate::ss2022::key::psk_identity;
         self.users
             .lock()
             .iter()
-            .map(|u| (psk_identity(&u.psk), u.psk.clone()))
+            .map(|(u, identity)| (*identity, u.psk.clone()))
             .collect()
     }
 
@@ -509,7 +521,7 @@ async fn read_ss2022_request_multi(
     mut conn: TcpStream,
     server_psk: &[u8],
     kind: CipherKind2022,
-    users: &[Ss2022User],
+    users: &[(Ss2022User, [u8; 16])],
     timestamp_tolerance: u64,
     replay: &SaltReplayFilter,
 ) -> Result<InboundResult> {
@@ -531,7 +543,6 @@ async fn read_ss2022_request_multi(
     let fixed_plain_len = 11;
     let fixed_wire_len = fixed_plain_len + tag_size;
 
-    use crate::ss2022::key::{decrypt_identity_header, psk_identity};
 
     let mut identity_wire = vec![0u8; crate::ss2022::key::IDENTITY_HEADER_LEN];
     conn.read_exact(&mut identity_wire).await?;
@@ -541,9 +552,7 @@ async fn read_ss2022_request_multi(
         Err(_) => return Err(SsError::Ss2022NoUserMatched),
     };
 
-    let matched = users
-        .iter()
-        .find(|u| psk_identity(&u.psk) == plaintext);
+    let matched = users.iter().find(|(_, identity)| identity == &plaintext);
 
     let Some(user) = matched else {
         return Err(SsError::Ss2022NoUserMatched);
@@ -555,6 +564,7 @@ async fn read_ss2022_request_multi(
 
 
     // 4. 命中用户：uPSK 派生 session subkey，解 fixed/variable header
+    let user = &user.0;
     let subkey = derive_session_subkey(&user.psk, &salt, kind);
     let aead = build_aead(kind, &subkey)?;
     let nonce = vec![0u8; aead.nonce_size()];

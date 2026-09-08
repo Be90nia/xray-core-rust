@@ -28,7 +28,6 @@
 //! 与 TCP EIH 的差异：UDP EIH 用 **raw iPSK** 直接作 ECB 密钥（TCP 用
 //! salt 派生的 identity subkey），且明文是与包头头的 XOR。
 
-use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -88,33 +87,70 @@ fn check_aead_kind(kind: CipherKind2022) -> Result<()> {
 // 重放窗口
 // ============================================================================
 
-/// packetId 重放窗口。
+/// packetId 重放窗口，sing `slidingwindow.go` 同构翻译：
+/// `last`（最高已见 counter）+ 128 块 × 64 bit ring，窗口宽 127×64=8128。
 ///
-/// ponytail: Go 用 64 槽 bitmap；这里用 BTreeSet 近似（重复 id 拒绝 + 容量
-/// 淘汰最小 id）。窗口边界外的极旧 id 重放可能重新接受，与 bitmap 语义相同。
-#[derive(Debug, Default)]
+/// Check 语义：超前（> last）接受；落后窗口（last-counter > 8128）**直接拒绝**
+/// （淘汰后旧 id 不可能重新接受，对齐 Go bitmap；此前 BTreeSet 淘汰最小 id
+/// 后旧 id 会重新放行，弱于 Go）；窗口内查 bit。
+#[derive(Debug)]
 pub struct SlidingWindow {
-    seen: BTreeSet<u64>,
+    last: u64,
+    ring: [u64; SW_RING_BLOCKS],
 }
 
-impl SlidingWindow {
-    /// id 未见过（可接受）返回 true。
-    #[must_use]
-    pub fn check(&self, id: u64) -> bool {
-        !self.seen.contains(&id)
-    }
-
-    /// 记录 id。
-    pub fn add(&mut self, id: u64) {
-        if self.seen.insert(id) && self.seen.len() > WINDOW_CAPACITY {
-            if let Some(&first) = self.seen.iter().next() {
-                self.seen.remove(&first);
-            }
+impl Default for SlidingWindow {
+    fn default() -> Self {
+        Self {
+            last: 0,
+            ring: [0u64; SW_RING_BLOCKS],
         }
     }
 }
 
-const WINDOW_CAPACITY: usize = 64;
+const SW_BLOCK_BIT_LOG: u64 = 6; // 1<<6 == 64 bits
+const SW_BLOCK_BITS: u64 = 1 << SW_BLOCK_BIT_LOG; // must be power of 2
+const SW_RING_BLOCKS: usize = 1 << 7; // must be power of 2
+const SW_BLOCK_MASK: u64 = (SW_RING_BLOCKS - 1) as u64;
+const SW_BIT_MASK: u64 = SW_BLOCK_BITS - 1;
+const SW_SIZE: u64 = ((SW_RING_BLOCKS - 1) as u64) * SW_BLOCK_BITS;
+
+impl SlidingWindow {
+    /// id 未见过（可接受）返回 true（sing `SlidingWindow.Check`）。
+    #[must_use]
+    pub fn check(&self, counter: u64) -> bool {
+        if counter > self.last {
+            return true; // ahead of window
+        }
+        if self.last - counter > SW_SIZE {
+            return false; // behind window
+        }
+        // In window. Check bit.
+        let block_index = (counter >> SW_BLOCK_BIT_LOG) & SW_BLOCK_MASK;
+        let bit_index = counter & SW_BIT_MASK;
+        (self.ring[block_index as usize] >> bit_index) & 1 == 0
+    }
+
+    /// 记录 id（sing `SlidingWindow.Add`；超前时推进 last 并清空跳过的块）。
+    pub fn add(&mut self, counter: u64) {
+        let block_index = counter >> SW_BLOCK_BIT_LOG;
+        if counter > self.last {
+            let mut last_block_index = self.last >> SW_BLOCK_BIT_LOG;
+            let mut diff = block_index - last_block_index;
+            if diff > SW_RING_BLOCKS as u64 {
+                diff = SW_RING_BLOCKS as u64;
+            }
+            for _ in 0..diff {
+                last_block_index = (last_block_index + 1) & SW_BLOCK_MASK;
+                self.ring[last_block_index as usize] = 0;
+            }
+            self.last = counter;
+        }
+        let block_index = block_index & SW_BLOCK_MASK;
+        let bit_index = counter & SW_BIT_MASK;
+        self.ring[block_index as usize] |= 1 << bit_index;
+    }
+}
 
 // ============================================================================
 // 内部：帧明文区解析/构造
@@ -242,6 +278,8 @@ struct RemoteState {
     remote_cipher: Option<Box<dyn AeadCipher + Send + Sync>>,
     last_remote_session_id: u64,
     last_remote_cipher: Option<Box<dyn AeadCipher + Send + Sync>>,
+    /// 上次 last 代收包/轮换的 unix 秒（sing `lastRemoteSeen`，轮换时限基准）。
+    last_remote_seen: i64,
     window: SlidingWindow,
     last_window: SlidingWindow,
 }
@@ -278,6 +316,7 @@ impl ClientUdpSession2022 {
                 remote_cipher: None,
                 last_remote_session_id: 0,
                 last_remote_cipher: None,
+                last_remote_seen: 0,
                 window: SlidingWindow::default(),
                 last_window: SlidingWindow::default(),
             }),
@@ -348,17 +387,25 @@ impl ClientUdpSession2022 {
         // 归属判断（sessionId=0 视为未知：0 是未初始化哨兵）
         let cur = session_id != 0 && session_id == st.remote_session_id;
         let lst = !cur && session_id != 0 && session_id == st.last_remote_session_id;
+        if lst {
+            // sing protocol.go:646：last 代收包刷新 lastRemoteSeen（轮换时限基准）
+            st.last_remote_seen = now_unix();
+        }
         if (cur && !st.window.check(packet_id)) || (lst && !st.last_window.check(packet_id)) {
             return Err(SsError::Ss2022PacketIdNotUnique);
         }
         if !cur && !lst {
-            // 新 server session：当前代降级为上一代后轮换
-            // ponytail: Go 额外限制 60s 内只允许切换一次 server session
-            // （ErrTooManyServerSessions）；这里保留两代轮换不做时限，
-            // 防 DoS 语义弱化，正常重绑定场景等价
+            // 新 server session：对齐 sing protocol.go:643-653——当前代降级为
+            // 上一代有 60s 时限（`now - lastRemoteSeen < 60` 拒绝轮换，防合法
+            // PSK 客户端无限速轮换 sessionId 定向挤出双代窗口）。
             if st.remote_session_id != 0 {
+                if now_unix() - st.last_remote_seen < 60 {
+                    return Err(SsError::Ss2022TooManyServerSessions);
+                }
                 st.last_remote_session_id = st.remote_session_id;
                 st.last_remote_cipher = st.remote_cipher.take();
+                st.last_window = std::mem::take(&mut st.window);
+                st.last_remote_seen = now_unix();
             }
             st.remote_session_id = session_id;
             let subkey = derive_session_subkey(last, &hdr[..8], self.kind);
@@ -693,6 +740,47 @@ mod tests {
         let (addr, port, p3) = client.decode(&f3).unwrap();
         assert_eq!(addr, Address::IPv4(std::net::Ipv4Addr::new(5, 6, 7, 8)));
         assert_eq!((port, p3), (99, b"c".to_vec()));
+    }
+
+    /// 窗口推进后 behind-window 的旧 id 必须拒绝（sing SlidingWindow.Check 语义；
+    /// 旧 BTreeSet 实现容量淘汰后旧 id 会重新放行，弱于 Go bitmap）。
+    #[test]
+    fn sliding_window_rejects_ids_behind_window() {
+        let mut w = SlidingWindow::default();
+        assert!(w.check(0)); // 首次可接受
+        w.add(0);
+        assert!(!w.check(0), "replay within window rejected");
+        // 大幅推进 last（跨整个 ring），旧块被清零
+        w.add(10000);
+        assert!(!w.check(0), "id 8128+ behind window must be rejected");
+        assert!(!w.check(1871), "just outside window (diff 8129) rejected");
+        assert!(w.check(5000), "inside window unseen id accepted");
+    }
+
+    /// server session 轮换 60s 限速（sing protocol.go:643-653
+    /// ErrTooManyServerSessions）：首包建代 + 一次轮换 free，第二次轮换拒绝。
+    #[test]
+    fn server_session_rebind_rate_limited_to_once_per_60s() {
+        let kind = CipherKind2022::Aes128Gcm;
+        let psk = psk16();
+        let client = ClientUdpSession2022::new(kind, vec![psk.clone()]).unwrap();
+        let mk_server = || {
+            ServerUdpSession2022::new(kind, psk.clone(), client.session_id()).unwrap()
+        };
+        let addr = Address::IPv4(std::net::Ipv4Addr::new(1, 2, 3, 4));
+        // 首包：建立当前代
+        let s1 = mk_server();
+        let f1 = s1.encode(&addr, 80, b"a").unwrap();
+        client.decode(&f1).unwrap();
+        // 第一次轮换：允许（sing lastRemoteSeen=0 初始）
+        let s2 = mk_server();
+        let f2 = s2.encode(&addr, 80, b"b").unwrap();
+        client.decode(&f2).unwrap();
+        // 第二次轮换（60s 内）：拒绝
+        let s3 = mk_server();
+        let f3 = s3.encode(&addr, 80, b"c").unwrap();
+        let err = client.decode(&f3).unwrap_err();
+        assert!(matches!(err, SsError::Ss2022TooManyServerSessions));
     }
 
     /// 包损坏（翻转密文体字节）解密失败。

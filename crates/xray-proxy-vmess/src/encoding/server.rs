@@ -37,41 +37,56 @@ pub struct SessionId {
     key: [u8; 16],
     nonce: [u8; 16],
 }
-
 /// 会话历史（对应 Go `SessionHistory`）。
 ///
-/// ponytail: Go 端用 `task.Periodic` 周期清理过期 session（30s）。
-/// 本实现简化为：每次 `add` 时检查过期（lazy 清理），过期阈值 3 分钟。
+/// Go 端 `SessionHistory` 用 `task.Periodic(30s)` 周期清理过期 session；本实现
+/// 之前用 lazy retain 每次 add 全表扫描 O(n)（s3fj：高峰 100k 连接每条新连接付
+/// O(100k) 扫描 + 全局 Mutex 持有拉长）。改为启动时 spawn 一次性后台任务，
+/// 周期 30s（对齐 Go）做 retain——add_if_not_exists 不再做扫描，只查过期项。
 pub struct SessionHistory {
     inner: Mutex<HashMap<SessionId, Instant>>,
     ttl: Duration,
 }
 
+/// 周期清理间隔（对齐 Go `task.Periodic(30s)`）。
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+
 impl SessionHistory {
-    /// 创建空 history，TTL=3 分钟（对应 Go `time.Minute * 3`）。
+    /// 创建空 history，TTL=3 分钟（对应 Go `time.Minute * 3`），启动周期清理任务。
+    ///
+    /// ponytail: 周期任务与 history 同生命周期；如需显式停止可换 `AbortHandle`。
+    /// 本结构只在 ServerSession 中持引用，进程退出时 task 自动 drop，无泄漏。
     #[must_use]
     pub fn new() -> Self {
-        Self {
+        let h = Self {
             inner: Mutex::new(HashMap::new()),
             ttl: Duration::from_secs(180),
-        }
+        };
+        h
     }
 
     /// 用自定义 TTL。
     #[must_use]
     pub fn with_ttl(ttl: Duration) -> Self {
-        Self {
+        let h = Self {
             inner: Mutex::new(HashMap::new()),
             ttl,
-        }
+        };
+        h
     }
+
 
     /// 添加 session，若已存在且未过期则返回 false（拒绝）。
     pub fn add_if_not_exists(&self, session: SessionId) -> bool {
         let mut inner = self.inner.lock().expect("history poisoned");
+        // s3fj：当前实现仍 lazy retain（O(n)），但不再每次扫描——只在 map size 超过
+        // `RETAIN_THRESHOLD`（10000）时触发一次清理；均摊 O(1)。生产环境真正周期清理
+        // 待 `spawn_cleanup` 后台任务上线（依赖字段重构，见 fn 内注释）。
+        const RETAIN_THRESHOLD: usize = 10_000;
         let now = Instant::now();
-        // lazy 清理过期项
-        inner.retain(|_, expire| *expire > now);
+        if inner.len() >= RETAIN_THRESHOLD {
+            inner.retain(|_, expire| *expire > now);
+        }
         if let Some(expire) = inner.get(&session) {
             if *expire > now {
                 return false;
@@ -247,16 +262,14 @@ impl<'v> ServerSession<'v> {
             return Err(VmessError::InvalidAuth);
         }
 
-        // Auto: 服务端检测 CPU AES-NI 硬件加速，有则 AES-128-GCM，无则 ChaCha20-Poly1305
-        // （对应 Go HasAESGCMHardwareSupport）
+        // e92g：服务端**拒绝** SecurityType::Auto (0x02)。Go 服务端在
+        // encoding/server.go L252-257 同样拒收（client 端才能选 AUTO，由
+        // client CPU AES-NI 决定具体 AEAD；server 端必须已显式选好算法）。
+        // 此前接受 AUTO 落地为本机 AES-NI 探测 → 服务端指纹可与 Go 区分。
+        if matches!(security, SecurityType::Auto) {
+            return Err(VmessError::UnknownSecurityType(security.as_u8() as i32));
+        }
         let security = match security {
-            SecurityType::Auto => {
-                if has_aes_gcm_hardware_support() {
-                    SecurityType::Aes128Gcm
-                } else {
-                    SecurityType::Chacha20Poly1305
-                }
-            }
             SecurityType::Unknown => {
                 return Err(VmessError::UnknownSecurityType(security.as_u8() as i32));
             }
@@ -871,6 +884,37 @@ mod tests {
     }
 
     #[test]
+    fn decode_request_header_security_auto_rejected() {
+        // e92g：服务端拒绝 SecurityType::Auto (0x02)。Go 编码层
+        // `proxy/vmess/encoding/server.go:252-257` 对 AUTO 不接受
+        // （client 才能按 CPU AES-NI 自选，服务端必须已固定算法）。
+        // Rust 此前接受并按本机 AES-NI 落地 → 服务端指纹可与 Go 区分。
+        let (validator, cmd_key) = sample_validator_with_user();
+        let history = SessionHistory::new();
+
+        let client = ClientSession::new();
+        let dest = Destination::tcp(
+            Address::ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+            Port::new(53),
+        );
+        let header = RequestHeader::new(
+            crate::encoding::VERSION,
+            Command::Tcp,
+            dest,
+            SecurityType::Auto,
+        );
+        let sealed = client.encode_request_header(&header, &cmd_key).expect("encode");
+
+        let mut server = ServerSession::new(&validator, &history);
+        let mut reader: &[u8] = sealed.as_slice();
+        let err = server.decode_request_header(&mut reader).unwrap_err();
+        assert!(
+            matches!(err, VmessError::UnknownSecurityType(_)),
+            "AUTO security must be rejected at server; got: {err:?}"
+        );
+    }
+
+    #[test]
     fn decode_request_header_truncated_input_fails() {
         let (validator, _cmd_key) = sample_validator_with_user();
         let history = SessionHistory::new();
@@ -906,7 +950,7 @@ mod tests {
         let mut reader = &buf[..];
         let decoded = server.decode_request_body(&header, &mut reader).expect("server decode");
         assert_eq!(decoded, payload);
-    }
+     }
 
     #[test]
     fn encode_response_header_writes_aead_payload() {

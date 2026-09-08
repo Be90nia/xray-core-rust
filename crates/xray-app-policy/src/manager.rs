@@ -56,7 +56,12 @@ impl PolicyManager for Manager {
     /// - level==1 强制 ConnectionIdle=600s（Go `default.go:18-20` 特判）
     fn policy_for_level(&self, level: u32) -> Policy {
         let mut p = self.levels.get(&level).cloned().unwrap_or_default();
-        if level == 1 {
+        // sol6：Go level-1 特判仅在用户未配置 ConnectionIdle 时生效——
+        // 原实现直接覆写，导致用户显式 7200s 被静默改回 600s。
+        // "用户未配置" = 走默认 Policy::default().timeout.connection_idle
+        // （300s，对应 Go SessionDefault.ConnectionIdle）。其他值即视为用户
+        // 显式覆盖，应保留。
+        if level == 1 && p.timeout.connection_idle == Policy::default().timeout.connection_idle {
             p.timeout.connection_idle = std::time::Duration::from_secs(600);
         }
         p
@@ -248,5 +253,30 @@ mod tests {
         let p = m.policy_for_level(0);
         assert_eq!(p.timeout.connection_idle, std::time::Duration::from_secs(300));
         assert_eq!(p.timeout.handshake, std::time::Duration::from_secs(60));
+    }
+    #[test]
+    fn manager_level_1_user_conn_idle_override_preserved() {
+        // sol6：用户显式配 ConnectionIdle=7200s 时，level-1 强制 600s 不能覆写。
+        // 仅在 ConnectionIdle 仍是 SessionDefault 值（300s）时才升级到 600s。
+        let cfg = Config {
+            level: {
+                let mut m = HashMap::new();
+                m.insert(1, ProtoPolicy {
+                    timeout: Some(PolicyTimeout {
+                        handshake: None,
+                        connection_idle: Some(Second { value: 7200 }),
+                        uplink_only: None,
+                        downlink_only: None,
+                    }),
+                    stats: None,
+                    buffer: None,
+                });
+                m
+            },
+            system: None,
+        };
+        let manager = Manager::new(cfg).unwrap();
+        let p = manager.policy_for_level(1);
+        assert_eq!(p.timeout.connection_idle, std::time::Duration::from_secs(7200));
     }
 }
