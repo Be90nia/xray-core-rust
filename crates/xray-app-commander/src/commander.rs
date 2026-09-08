@@ -472,7 +472,12 @@ impl Commander {
                 *self.grpc_task.lock() = Some(handle);
                 Ok(())
             }
-            // Unix domain socket listen 模式（Go commander.go:81-82）
+            // Unix domain socket listen 模式（Go commander.go:81-82）。
+            // tokio 的 UnixListener 仍仅 unix 平台（cfg_net_unix = unix+feature=net），
+            // 不暴露给 Windows——虽然 Win10 1803+ 底层有 AF_UNIX，但 tokio 不包装。
+            // 此处给 Windows 提供更明确的运行期提示，d0yi：明确指出要换 TCP 或
+            // 切到 WSL 监听 unix 路径（d0yi：之前是裸错"requires unix platform"
+            // 但没有任何 next-step 指引）。
             #[cfg(unix)]
             Some(Ok(grpc::ListenSpec::Unix(path))) => {
                 use tonic::codegen::tokio_stream::StreamExt as _;
@@ -498,12 +503,17 @@ impl Commander {
                 *self.grpc_task.lock() = Some(handle);
                 Ok(())
             }
-            // tokio UDS 仅 unix 平台；Windows 上 unix listen 明示不可用
+            // d0yi：Windows 走更明确的 next-step 指引——要么改 listen 为 TCP/pipe，
+            // 要么在 WSL 中跑 Rust server 监听 unix 路径；裸 cfg(unix) 拒绝没指引。
             #[cfg(not(unix))]
-            Some(Ok(grpc::ListenSpec::Unix(path))) => Err(CommanderError::InvalidListenAddr {
-                addr: path,
-                reason: "unix socket listen requires unix platform (tokio UDS unavailable on Windows)".into(),
-            }),
+            Some(Ok(grpc::ListenSpec::Unix(path))) => {
+                Err(CommanderError::InvalidListenAddr {
+                    addr: path,
+                    reason: "commander unix listen not supported on Windows: \
+                        tokio::net::UnixListener is unix-only. Use listen: 127.0.0.1:port \
+                        (TCP) or run inside WSL/Linux.".into(),
+                })
+            }
             Some(Err(reason)) => Err(CommanderError::InvalidListenAddr {
                 addr: self.listen.clone().unwrap_or_default(),
                 reason,

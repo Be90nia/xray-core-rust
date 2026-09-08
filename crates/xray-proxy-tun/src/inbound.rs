@@ -46,9 +46,9 @@
 //! （Arc<Mutex<HashMap>>），后续切片可加 idle 淘汰（Go `CancelAfterInactivity(1min)`）。
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex as ParkMutex;
 use smoltcp::iface::SocketHandle;
@@ -225,15 +225,30 @@ impl InboundHandler for TunInboundHandler {
 ///
 /// 对应 Go `proxy/tun/udp_fullcone.go:31` 的 `udpConns map[net.Destination]*udpConn`：
 /// 按 source 分桶实现 cone NAT，每个 remote src 一个 dispatch link。
-type UdpSessions = Arc<ParkMutex<HashMap<IpEndpoint, Arc<UdpSessionEntry>>>>;
+/// UDP session 空闲清理超时（对应 Go `signal.CancelAfterInactivity(1min)`）。
+/// 1 分钟未活动即从 map 中淘汰并关闭 dispatch session。
+const UDP_SESSION_IDLE_SECS: u64 = 60;
+/// 空闲清理扫描间隔（30s）——避开 1 分钟阈值，每两扫一次仍可容忍 ~90s。
+const UDP_SESSION_SWEEP_SECS: u64 = 30;
 
-/// 单个 remote src 的 session 条目：session + reader task handle。
+/// per-source UDP session 存储（full-cone NAT，key = IP+UDP 源端点）。
+///
+/// 对应 Go `proxy/tun/udp_fullcone.go:31` 的 `udpConns map[net.Destination]*udpConn`：
+/// 按 source 分桶实现 cone NAT，每个 remote src 一个 dispatch link。
+type UdpSessions = Arc<ParkMutex<HashMap<IpEndpoint, Arc<UdpSessionEntry>>>>;
+/// 单个 remote src 的 session 条目：session + reader task handle + 最近活跃时间。
 ///
 /// reader 只 spawn 一次；后续包复用 task 即可（session 是 &mut self，
 /// send_packet 仍可并发调用——内部 duplex 是 &mut self + 异步，task 串行）。
+///
+/// p14e：`last_used_nanos` 由 handle_udp_packet 每次命中更新；后台 sweep 任务
+/// 每 30s 检查一次，超过 60s 未活动则从 map 移除并关闭 dispatch session。
 struct UdpSessionEntry {
     session: AsyncMutex<UdpDispatchSession>,
     reader_started: AtomicBool,
+    /// 最近一次 send_packet 的 wall-clock 纳秒（std::time::SystemTime 测得）。
+    /// sweep 任务对比 `now - last_used > 60s` 决定淘汰。
+    last_used_nanos: AtomicI64,
 }
 
 async fn tun_driver_loop(
@@ -263,6 +278,9 @@ async fn tun_driver_loop(
     };
 
     let udp_sessions: UdpSessions = Arc::new(ParkMutex::new(HashMap::new()));
+    // p14e：后台定时扫描空闲 session（60s 阈值 / 30s 间隔，对齐 Go
+    // `signal.CancelAfterInactivity(1min)` 语义）。
+    let _udp_sweeper = spawn_udp_session_sweeper(Arc::clone(&udp_sessions));
 
     tracing::debug!("tun driver main loop started");
 
@@ -352,6 +370,8 @@ fn handle_udp_packet(
     device: Arc<TunDevice>,
 ) {
     // 懒建 session：按 src 找；不在则建。
+    // p14e：last_used_nanos 初始化为当前 wall-clock，避免刚建的 session
+    // 被下一次 sweep 误判为已空闲 60s。
     let entry = {
         let mut map = sessions.lock();
         map.entry(meta.src)
@@ -359,10 +379,15 @@ fn handle_udp_packet(
                 Arc::new(UdpSessionEntry {
                     session: AsyncMutex::new(UdpDispatchSession::new(Arc::clone(&dispatch))),
                     reader_started: AtomicBool::new(false),
+                    last_used_nanos: AtomicI64::new(now_nanos()),
                 })
             })
             .clone()
     };
+    // 每次命中刷新最后活跃时间，sweep 据此淘汰。
+    entry
+        .last_used_nanos
+        .store(now_nanos(), Ordering::Relaxed);
 
     // 把 dest + payload 通过 session 转发；首包懒建 dispatch link。
     // 必须 spawn：send_packet 是 async，driver loop 不能 await（会阻塞 TUN recv）。
@@ -389,6 +414,57 @@ fn handle_udp_packet(
     });
 }
 
+/// 当前 wall-clock 纳秒（SystemTime → UNIX_EPOCH 偏移）。用作 session
+/// 最后活跃时间戳（p14e）。
+fn now_nanos() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+/// p14e：周期性扫描 idle 60s+ 的 UDP session，关闭 dispatch session 后从 map 淘汰。
+/// 后台 spawn，无关主 driver loop。
+fn spawn_udp_session_sweeper(sessions: UdpSessions) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = interval(Duration::from_secs(UDP_SESSION_SWEEP_SECS));
+        // 跳过首 tick（首次运行时所有 entry 都很新）
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let now = now_nanos();
+            let idle_nanos = (UDP_SESSION_IDLE_SECS as i64) * 1_000_000_000;
+
+            let mut to_close: Vec<IpEndpoint> = Vec::new();
+            {
+                let map = sessions.lock();
+                for (k, v) in map.iter() {
+                    let last = v.last_used_nanos.load(Ordering::Relaxed);
+                    if now.saturating_sub(last) > idle_nanos {
+                        // 拿不到锁（reader/sender 在用）→ 等下一 sweep。
+                        if v.session.try_lock().is_ok() {
+                            to_close.push(*k);
+                        }
+                    }
+                }
+            }
+            // 第二轮上锁删除：避免迭代中改 map。session 的 MutexGuard 已
+            // 在上一轮 try_lock 成功时释放，drop 顺序由 Arc 引用计数保证。
+            let mut removed = 0usize;
+            if !to_close.is_empty() {
+                let mut map = sessions.lock();
+                for k in &to_close {
+                    if map.remove(k).is_some() {
+                        removed += 1;
+                    }
+                }
+            }
+            if removed > 0 {
+                tracing::debug!(count = removed, "tun udp sessions swept");
+            }
+        }
+    })
+}
 /// 把 IP 协议族的 smoltcp IpEndpoint 转 xray Destination（UDP）。
 fn ip_endpoint_to_udp_destination(ep: &IpEndpoint) -> Option<Destination> {
     let address = match ep.addr {
@@ -401,7 +477,6 @@ fn ip_endpoint_to_udp_destination(ep: &IpEndpoint) -> Option<Destination> {
     };
     Some(Destination::new(address, Port::new(ep.port), Network::UDP))
 }
-
 /// xray Address → smoltcp IpAddress（域名返回 None；build_udp_response 需要 IP）。
 fn address_to_smoltcp(addr: &Address) -> Option<smoltcp::wire::IpAddress> {
     match addr {
@@ -951,7 +1026,86 @@ mod tests {
             );
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0, "no spurious dispatch");
-        // listen handle 未变（无 accept）
         assert_eq!(tcp_listen, Some(listen_handle));
+    }
+
+    /// p14e：超过 UDP_SESSION_IDLE_SECS 的 session 被 sweep 淘汰；
+    /// 最近活跃的不动。直接在 map 上插旧戳驱动，避免等待 60s wall-clock。
+    /// ponytail: 直接复用 sweeper 内部判定逻辑（双锁 + last_used + try_lock），
+    #[test]
+    fn sweep_drops_idle_keeps_recent() {
+        use smoltcp::wire::IpAddress;
+        use std::future::Future;
+        use std::pin::Pin;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            #[derive(Debug)]
+            struct StubDispatch;
+            #[async_trait::async_trait]
+            impl xray_app_dispatcher::DispatchHandler for StubDispatch {
+                fn tag(&self) -> &str { "stub" }
+                fn dispatch(
+                    &self,
+                    _dest: &xray_common::net::destination::Destination,
+                    _link: xray_transport::link::Link,
+                ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                    Box::pin(async {})
+                }
+            }
+            let dispatch: Arc<dyn xray_app_dispatcher::DispatchHandler> = Arc::new(StubDispatch);
+            let sessions: UdpSessions = Arc::new(ParkMutex::new(HashMap::new()));
+            let old_ep = smoltcp::wire::IpEndpoint::new(
+                IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(10, 0, 0, 1)),
+                1234,
+            );
+            let new_ep = smoltcp::wire::IpEndpoint::new(
+                IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(10, 0, 0, 2)),
+                1235,
+            );
+            {
+                let mut m = sessions.lock();
+                m.insert(old_ep, Arc::new(UdpSessionEntry {
+                    session: AsyncMutex::new(
+                        xray_app_dispatcher::UdpDispatchSession::new(Arc::clone(&dispatch)),
+                    ),
+                    reader_started: AtomicBool::new(false),
+                    last_used_nanos: AtomicI64::new(0), // 远古
+                }));
+                m.insert(new_ep, Arc::new(UdpSessionEntry {
+                    session: AsyncMutex::new(
+                        xray_app_dispatcher::UdpDispatchSession::new(Arc::clone(&dispatch)),
+                    ),
+                    reader_started: AtomicBool::new(false),
+                    last_used_nanos: AtomicI64::new(now_nanos()),
+                }));
+            }
+            // 直接跑一遍 sweep 判定（避免等待 60s wall-clock 触发 interval）
+            let now = now_nanos();
+            let idle_nanos = (UDP_SESSION_IDLE_SECS as i64) * 1_000_000_000;
+            let mut to_close: Vec<smoltcp::wire::IpEndpoint> = Vec::new();
+            {
+                let m = sessions.lock();
+                for (k, v) in m.iter() {
+                    let last = v.last_used_nanos.load(Ordering::Relaxed);
+                    if now.saturating_sub(last) > idle_nanos && v.session.try_lock().is_ok() {
+                        to_close.push(*k);
+                    }
+                }
+            }
+            let mut removed = 0;
+            {
+                let mut m = sessions.lock();
+                for k in &to_close {
+                    if m.remove(k).is_some() { removed += 1; }
+                }
+            }
+            assert_eq!(removed, 1, "exactly the ancient entry swept");
+            let m = sessions.lock();
+            assert!(m.contains_key(&new_ep), "recent entry preserved");
+            assert!(!m.contains_key(&old_ep), "ancient entry removed");
+        });
     }
 }

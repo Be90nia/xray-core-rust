@@ -356,14 +356,47 @@ pub(crate) fn parse_splithttp_config(json: Option<&serde_json::Value>) -> io::Re
                 Some(s) => s.to_string(),
                 None => raw,
             };
-            // 镜像 Go transport_method.go:420-424 ASCII 校验。
-            // ponytail: roomSize >= 2^30 校验跳过——Rust 无 conf 层代理；
-            // 用户自己保证 table * length 足够大避免熵不足。
+            // 镜像 Go transport_method.go:420-424 ASCII + roomSize 校验。
+            // 281r：roomSize = len(table)^length 必须 < 2^30，否则 token 空间
+            // 过小致 entropy 不足被探测区分。len(table) 为 0 单独守——`table^0==1`
+            // 永远 < 2^30 但表示常量 ID 仍有问题，留给上层配置警告。
             if resolved.as_bytes().iter().any(|b| *b >= 0x80) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "splithttpSettings.sessionIDTable must contain only ASCII characters",
                 ));
+            }
+            // 281r：len(table)^length < 2^30 校验。Go 用 math.Pow(2,30)
+            // 直接乘；此处用 checked_mul 防溢出（O(log n) 累乘即够）。
+            if let Some(len_range) = obj.get("sessionIDLength").and_then(parse_range) {
+                let table_len = resolved.len() as u64;
+                if table_len > 0 && len_range.to > 0 {
+                    let mut room = 1u64;
+                    let mut overflowed = false;
+                    for _ in 0..len_range.to {
+                        if let Some(v) = room.checked_mul(table_len) {
+                            room = v;
+                        } else {
+                            overflowed = true;
+                            break;
+                        }
+                        // 早停：已达阈值即拒绝累乘
+                        if room >= (1u64 << 30) {
+                            overflowed = true;
+                            break;
+                        }
+                    }
+                    if overflowed || room >= (1u64 << 30) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "splithttpSettings sessionIDTable length {} ^ sessionIDLength.to {} \
+                                 must be < 2^30 (roomSize); reduce length or expand table",
+                                table_len, len_range.to
+                            ),
+                        ));
+                    }
+                }
             }
             resolved
         },
@@ -380,7 +413,6 @@ pub(crate) fn parse_splithttp_config(json: Option<&serde_json::Value>) -> io::Re
         },
         no_grpc_header: get_bool("noGRPCHeader"),
         no_sse_header: get_bool("noSSEHeader"),
-        sc_max_each_post_bytes: get_range("scMaxEachPostBytes"),
         sc_min_posts_interval_ms: get_range("scMinPostsIntervalMs"),
         sc_max_buffered_posts: get_i64("scMaxBufferedPosts"),
         sc_stream_up_server_secs: get_range("scStreamUpServerSecs"),
@@ -662,7 +694,20 @@ mod tests {
         assert!(msg.contains("sessionIDTable"), "unexpected msg: {msg}");
     }
 
-    /// sessionIDLength 合法 RangeConfig（from > 0）解析为 Some。
+    /// 281r：len(table)^length >= 2^30 拒绝配置。
+    /// 1 字符 table × 31 长度：1^31 = 1（合法）。
+    /// 2 字符 table × 31 长度：2^31 = 2G ≥ 2^30（拒绝）。
+    #[test]
+    fn parse_session_id_table_room_size_too_small_rejected() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"sessionIDTable":"ab","sessionIDLength":{"from":31,"to":31}}"#,
+        )
+        .unwrap();
+        let r = parse_splithttp_config(Some(&v));
+        assert!(r.is_err(), "2^31 should be rejected");
+        let msg = r.unwrap_err().to_string();
+        assert!(msg.contains("2^30"), "unexpected msg: {msg}");
+    }
     #[test]
     fn parse_session_id_length_valid_range() {
         let v: serde_json::Value =
