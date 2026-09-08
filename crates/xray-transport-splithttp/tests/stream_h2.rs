@@ -166,6 +166,7 @@ async fn dial_stream_up_via_h2_mock_server() {
         config.clone(),
         client_tls.into(),
         DialTarget { host: server_addr.ip().to_string(), port: server_addr.port(), sni: String::new() },
+        None,
     ));
 
     // 3. dial_stream_up
@@ -280,6 +281,7 @@ async fn dial_stream_one_via_h2_mock_server() {
         config.clone(),
         client_tls.into(),
         DialTarget { host: server_addr.ip().to_string(), port: server_addr.port(), sni: String::new() },
+        None,
     ));
 
     // 3. dial_stream_one

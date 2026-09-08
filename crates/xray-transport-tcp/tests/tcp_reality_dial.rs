@@ -32,7 +32,7 @@ async fn tcp_plus_reality_handshake_e2e() {
     let allowed_short_ids = vec![short_id];
     tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
-        let outcome = server_tls(tcp, &server_private_key, &allowed_short_ids, 43200)
+        let outcome = server_tls(tcp, &server_private_key, &allowed_short_ids, 43200, &[], &[])
             .await
             .expect("server_tls should not IO-error");
         match outcome {
