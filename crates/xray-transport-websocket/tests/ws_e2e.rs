@@ -74,13 +74,11 @@ async fn client_server_roundtrip_echo() {
     let bound = addr_rx.await.expect("server bound");
 
     let dest = local_dest(bound.port());
-    let opts = DialOptions {
-        config: &cfg,
-        destination: &dest,
-        early_data: None,
-        tls_config: None,
-        fingerprint: None,
-    };
+    let opts = DialOptions { config: &cfg,
+    destination: &dest,
+    early_data: None,
+    tls_config: None,
+    fingerprint: None, tls_server_name: None };
     let mut client = dial(opts).await.expect("dial");
 
     // 发 hello → 收 hello 回来
@@ -103,13 +101,11 @@ async fn large_payload_multi_frame_roundtrip() {
     let bound = addr_rx.await.expect("server bound");
 
     let dest = local_dest(bound.port());
-    let opts = DialOptions {
-        config: &cfg,
-        destination: &dest,
-        early_data: None,
-        tls_config: None,
-        fingerprint: None,
-    };
+    let opts = DialOptions { config: &cfg,
+    destination: &dest,
+    early_data: None,
+    tls_config: None,
+    fingerprint: None, tls_server_name: None };
     let mut client = dial(opts).await.expect("dial");
 
     // 构造 100 KiB 已知模式数据。
@@ -149,13 +145,11 @@ async fn early_data_delivered_to_server_first_read() {
     let bound = rx_bound.await.expect("server bound");
     let dest = local_dest(bound.port());
     let ed = b"early-payload".to_vec();
-    let opts = DialOptions {
-        config: &cfg,
-        destination: &dest,
-        early_data: Some(&ed),
-        tls_config: None,
-        fingerprint: None,
-    };
+    let opts = DialOptions { config: &cfg,
+    destination: &dest,
+    early_data: Some(&ed),
+    tls_config: None,
+    fingerprint: None, tls_server_name: None };
     let _client = dial(opts).await.expect("dial");
 
     let _ = tokio::time::timeout(Duration::from_secs(3), server_handle).await;
@@ -190,13 +184,11 @@ async fn server_rejects_wrong_path() {
         path: "/wrong".into(),
         ..Default::default()
     };
-    let opts = DialOptions {
-        config: &client_cfg,
-        destination: &dest,
-        early_data: None,
-        tls_config: None,
-        fingerprint: None,
-    };
+    let opts = DialOptions { config: &client_cfg,
+    destination: &dest,
+    early_data: None,
+    tls_config: None,
+    fingerprint: None, tls_server_name: None };
     let result = dial(opts).await;
     assert!(result.is_err(), "client dial should fail with 404");
 
@@ -232,13 +224,11 @@ async fn server_validates_custom_host_header() {
         host: "front.example.com".into(),
         ..Default::default()
     };
-    let opts = DialOptions {
-        config: &client_cfg,
-        destination: &dest,
-        early_data: None,
-        tls_config: None,
-        fingerprint: None,
-    };
+    let opts = DialOptions { config: &client_cfg,
+    destination: &dest,
+    early_data: None,
+    tls_config: None,
+    fingerprint: None, tls_server_name: None };
     let mut client = dial(opts).await.expect("dial should succeed with matching host");
 
     client.write_all(b"hello").await.expect("write");
@@ -273,13 +263,11 @@ async fn server_rejects_mismatched_host() {
         host: "wrong.com".into(),
         ..Default::default()
     };
-    let opts = DialOptions {
-        config: &client_cfg,
-        destination: &dest,
-        early_data: None,
-        tls_config: None,
-        fingerprint: None,
-    };
+    let opts = DialOptions { config: &client_cfg,
+    destination: &dest,
+    early_data: None,
+    tls_config: None,
+    fingerprint: None, tls_server_name: None };
     let result = dial(opts).await;
     assert!(result.is_err(), "mismatched host should be rejected");
 
