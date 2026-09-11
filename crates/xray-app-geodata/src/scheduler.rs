@@ -10,7 +10,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::GeodataError;
 use crate::instance::{ScheduleHandle, Scheduler};
@@ -45,6 +45,13 @@ impl CronScheduler {
         Err(GeodataError::InvalidCron(format!(
             "{expr}: no fire within 1 year"
         )))
+    }
+
+    /// 校验 cron 表达式（只解析，不计算触发时间）。
+    ///
+    /// 对应 Go `cron.ParseStandard`（infra/conf/geodata.go:52 Build 期校验）。
+    pub fn validate(expr: &str) -> Result<(), GeodataError> {
+        parse_cron(expr).map(|_| ())
     }
 
     /// 解析失败返回 `GeodataError::InvalidCron`。
@@ -182,6 +189,24 @@ fn current_minute_floor() -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(minute_floor)
 }
 
+/// days since 1970-01-01 → 公历 `(year, month, day)`。
+///
+/// Howard Hinnant `civil_from_days`（public domain 算法）。Go robfig/cron
+/// 按真日历匹配（geodata.go:43-47），day/month 字段必须用真日历而非
+/// 30 天月近似（bd issue Xray-core-rust-hxrn）。
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (y + i64::from(m <= 2), m, d)
+}
+
 /// 解析后的 cron 调度表（5 field: 分 时 日 月 周）。
 struct CronSchedule {
     minute: Field,
@@ -197,9 +222,9 @@ impl CronSchedule {
         let secs = dur.as_secs();
         let minute = ((secs / 60) % 60) as u32;
         let hour = ((secs / 3600) % 24) as u32;
-        let day = ((secs / 86400) % 31 + 1) as u32; // 近似（实际需要 civil_from_days）
-        let month = ((secs / 86400 / 30) % 12 + 1) as u32; // 近似
-        let weekday = ((secs / 86400 + 4) % 7) as u32; // 1970-01-01 是周四，+4 偏移
+        let days = (secs / 86400) as i64;
+        let (_, month, day) = civil_from_days(days);
+        let weekday = (days + 4).rem_euclid(7) as u32; // 1970-01-01 是周四，0=周日
         self.minute.contains(minute)
             && self.hour.contains(hour)
             && self.day.contains(day)
@@ -208,36 +233,42 @@ impl CronSchedule {
     }
 }
 
-/// 字段值集合（0..N）。
+/// 字段值集合：`lo..=hi` 的原始值映射到 0-based 位图。
+///
+/// `lo` 由 [`Field::new`] 持有——day/month 下界为 1，set/contains 必须用
+/// 同一偏移，否则错位 1（bd issue Xray-core-rust-hxrn 连带发现）。
 struct Field {
+    lo: u32,
     values: Vec<bool>,
 }
 
 impl Field {
-    fn new(size: usize) -> Self {
+    fn new(lo: u32, hi: u32) -> Self {
         Self {
-            values: vec![false; size],
+            lo,
+            values: vec![false; (hi - lo + 1) as usize],
         }
+    }
+
+    fn index(&self, v: u32) -> Option<usize> {
+        let i = v.checked_sub(self.lo)? as usize;
+        (i < self.values.len()).then_some(i)
     }
 
     fn contains(&self, v: u32) -> bool {
-        if (v as usize) < self.values.len() {
-            self.values[v as usize]
-        } else {
-            false
-        }
+        self.index(v).is_some_and(|i| self.values[i])
     }
 
     fn set(&mut self, v: u32) {
-        if (v as usize) < self.values.len() {
-            self.values[v as usize] = true;
+        if let Some(i) = self.index(v) {
+            self.values[i] = true;
         }
     }
 
-    fn set_step(&mut self, start: u32, step: u32, max_exclusive: usize) {
+    fn set_step(&mut self, start: u32, step: u32) {
         let mut v = start;
-        while (v as usize) < max_exclusive {
-            self.values[v as usize] = true;
+        while v >= self.lo && (v - self.lo) < self.values.len() as u32 {
+            self.values[(v - self.lo) as usize] = true;
             v += step;
         }
     }
@@ -272,8 +303,7 @@ fn parse_cron(expr: &str) -> Result<CronSchedule, GeodataError> {
 }
 
 fn parse_field(s: &str, lo: u32, hi: u32) -> Result<Field, GeodataError> {
-    let size = (hi - lo + 1) as usize;
-    let mut field = Field::new(size);
+    let mut field = Field::new(lo, hi);
     for part in s.split(',') {
         if let Some((start_s, step_s)) = part.split_once('/') {
             // */n or m-n/n or n
@@ -296,9 +326,9 @@ fn parse_field(s: &str, lo: u32, hi: u32) -> Result<Field, GeodataError> {
                 }
                 v
             };
-            field.set_step(start - lo, step, size);
+            field.set_step(start, step);
         } else if part == "*" {
-            field.set_step(0, 1, size);
+            field.set_step(lo, 1);
         } else {
             // 数字 或 数字-数字
             if let Some((a_s, b_s)) = part.split_once('-') {
@@ -314,7 +344,7 @@ fn parse_field(s: &str, lo: u32, hi: u32) -> Result<Field, GeodataError> {
                     )));
                 }
                 for v in a..=b {
-                    field.set(v - lo);
+                    field.set(v);
                 }
             } else {
                 let v: u32 = part
@@ -325,7 +355,7 @@ fn parse_field(s: &str, lo: u32, hi: u32) -> Result<Field, GeodataError> {
                         "value {v} out of range [{lo},{hi}]"
                     )));
                 }
-                field.set(v - lo);
+                field.set(v);
             }
         }
     }
@@ -363,6 +393,63 @@ mod tests {
         assert!(s.minute.contains(0));
         assert!(s.minute.contains(30));
         assert!(!s.minute.contains(15));
+    }
+
+    #[test]
+    fn civil_from_days_known_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(19723), (2024, 1, 1));
+        assert_eq!(civil_from_days(19782), (2024, 2, 29)); // 闰日
+        assert_eq!(civil_from_days(11016), (2000, 2, 29)); // 400 年闰
+        assert_eq!(civil_from_days(47541), (2100, 3, 1)); // 世纪非闰次日
+        assert_eq!(civil_from_days(20707), (2026, 9, 11));
+    }
+
+    /// 独立 oracle 对拍：朴素逐日推进（月份长度表 + 闰年规则）与
+    /// civil_from_days 在 ~130 年区间逐日一致。
+    #[test]
+    fn civil_from_days_matches_naive_calendar_oracle() {
+        fn is_leap(y: i64) -> bool {
+            (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+        }
+        fn days_in_month(y: i64, m: u32) -> u32 {
+            match m {
+                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+                4 | 6 | 9 | 11 => 30,
+                _ if is_leap(y) => 29,
+                _ => 28,
+            }
+        }
+        let (mut y, mut m, mut d) = (1970i64, 1u32, 1u32);
+        for days in 0..47_500i64 {
+            assert_eq!(civil_from_days(days), (y, m, d), "day offset {days}");
+            d += 1;
+            if d > days_in_month(y, m) {
+                d = 1;
+                m += 1;
+                if m > 12 {
+                    m = 1;
+                    y += 1;
+                }
+            }
+        }
+    }
+
+    /// bd issue Xray-core-rust-hxrn 反例：2026-09-11（周五）必须按真日历
+    /// 落在 day=11/month=9。旧 30 天月近似把它算成 month=7/day=31，
+    /// cron `0 0 11 9 *` 永不命中。
+    #[test]
+    fn cron_matches_real_calendar_dates() {
+        let t = |days: i64| UNIX_EPOCH + Duration::from_secs(days as u64 * 86400);
+        let s = parse_cron("0 0 11 9 *").unwrap();
+        assert!(s.matches(t(20707)), "2026-09-11 must match `0 0 11 9 *`");
+        assert!(!s.matches(t(20706)), "2026-09-10 must not match");
+        let fri = parse_cron("0 0 * * 5").unwrap();
+        assert!(fri.matches(t(20707)), "2026-09-11 is a Friday");
+        // 跨月边界：3 月 1 日命中 3 月字段，2 月末日不命中
+        let mar = parse_cron("0 0 1 3 *").unwrap();
+        assert!(mar.matches(t(20513)), "2026-03-01 must match `0 0 1 3 *`");
+        assert!(!mar.matches(t(20512)), "2026-02-28 must not match March");
     }
 
     #[test]

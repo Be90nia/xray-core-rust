@@ -11,13 +11,14 @@
 //!
 //! ## HTTP/1.1 格式
 //!
-//! 请求（手写，不引 http crate）：
+//! 请求（手写，不引 http crate），header 集合对齐 Go dialer.go:96-101：
 //! ```text
 //! GET <path> HTTP/1.1\r\n
 //! Host: <host>\r\n
+//! <custom-headers>\r\n
+//! <browser-masquerade-headers（UA 缺省/枚举值时注入）>\r\n
 //! Connection: Upgrade\r\n
 //! Upgrade: websocket\r\n
-//! <custom-headers>\r\n
 //! \r\n
 //! ```
 //!
@@ -26,32 +27,43 @@
 
 use crate::config::Config;
 use crate::error::{HttpUpgradeError, Result};
-
-/// 默认 User-Agent（与 Go `utils.TryDefaultHeadersWith(req.Header, "ws")` 一致）。
-pub const DEFAULT_USER_AGENT: &str = "ws";
+use xray_common::browser::{set_header, try_default_headers_with};
 
 /// 构造 HTTP/1.1 GET upgrade 请求字节流。
 ///
-/// - `host`：HTTP `Host` header 值（不可空，由调用方保证）。
-/// - `config`：提供 `normalized_path()` + `header` + `ed`。
+/// - `host`：HTTP `Host` header 值（不可空，由调用方保证，三级回退见
+///   `register.rs::dial_httpupgrade`）。
+/// - `config`：提供 `normalized_path()` + `header`。
 ///
 /// 返回完整请求字节（含末尾 `\r\n\r\n`）。
 ///
-/// 对应 Go `dialer.go::dialhttpUpgrade` 内构造 req + req.Write(conn) 的字节序列。
+/// header 顺序对齐 Go `dialer.go::dialhttpUpgrade`：自定义 header（AddHeader）
+/// → 浏览器伪装（`TryDefaultHeadersWith(header, "ws")`，"ws" 是 variant 名）
+/// → `Connection`/`Upgrade` Set 覆盖（dialer.go:96-101）。
 #[must_use]
 pub fn build_upgrade_request(host: &str, config: &Config) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(256);
+    // 1. 用户自定义 header（Go dialer.go:96-98 AddHeader 循环）。
+    let mut headers: Vec<(String, String)> = config
+        .header
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    // 2. 浏览器伪装（Go dialer.go:99）：UA 缺省 → Chrome 全套；UA 为浏览器
+    //    枚举值 → 对应伪装；其他自定义 UA → 原样保留。
+    try_default_headers_with(&mut headers, "ws");
+    // 3. Connection/Upgrade 最后 Set（Go dialer.go:100-101）：覆盖用户同名配置。
+    set_header(&mut headers, "Connection", "Upgrade");
+    set_header(&mut headers, "Upgrade", "websocket");
+
+    let mut buf = Vec::with_capacity(512);
     // 请求行
     buf.extend_from_slice(b"GET ");
     buf.extend_from_slice(config.normalized_path().as_bytes());
     buf.extend_from_slice(b" HTTP/1.1\r\n");
-    // 必需 header（Host 由调用方提供）
+    // Host 由调用方提供（配置/ServerName/拨号地址三级回退）
     write_header(&mut buf, "Host", host);
-    write_header(&mut buf, "Connection", "Upgrade");
-    write_header(&mut buf, "Upgrade", "websocket");
-    write_header(&mut buf, "User-Agent", DEFAULT_USER_AGENT);
-    // 自定义 header（按 HashMap 迭代顺序，与 Go map 一致——顺序对 HTTP 不重要）
-    for (key, value) in &config.header {
+    // 其余 header（对 HTTP 语义顺序无关；Go 侧经 req.Write 排序输出）
+    for (key, value) in &headers {
         write_header(&mut buf, key, value);
     }
     // 终止空行
@@ -169,7 +181,19 @@ mod tests {
         assert!(s.contains("Host: example.com\r\n"));
         assert!(s.contains("Connection: Upgrade\r\n"));
         assert!(s.contains("Upgrade: websocket\r\n"));
-        assert!(s.contains("User-Agent: ws\r\n"));
+        // 票 mzte：UA 不再是字面量 "ws"，而是 Chrome 伪装全套（Go dialer.go:99）。
+        assert!(
+            s.contains("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/")
+                && s.contains(" Safari/537.36\r\n"),
+            "UA must masquerade as Chrome"
+        );
+        assert!(s.contains("Sec-CH-UA: \""), "Sec-CH-UA GREASE brand present");
+        assert!(s.contains("Sec-Fetch-Mode: websocket\r\n"));
+        assert!(s.contains("Sec-Fetch-Dest: empty\r\n"));
+        assert!(s.contains("Sec-Fetch-Site: same-origin\r\n"));
+        assert!(s.contains("Cache-Control: no-cache\r\n"));
+        assert!(s.contains("Pragma: no-cache\r\n"));
+        assert!(s.contains("Accept: */*\r\n"));
         assert!(s.ends_with("\r\n\r\n"));
     }
 
@@ -190,6 +214,44 @@ mod tests {
         let s = std::str::from_utf8(&bytes).unwrap();
         assert!(s.contains("X-Token: abc\r\n"));
         assert!(s.contains("X-Real-Ip: 1.2.3.4\r\n"));
+    }
+
+    #[test]
+    fn custom_user_agent_is_preserved_without_masquerade() {
+        let mut cfg = make_config("/ws");
+        cfg.header.insert("User-Agent".into(), "my-agent/1.2".into());
+        let bytes = build_upgrade_request("example.com", &cfg);
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(s.contains("User-Agent: my-agent/1.2\r\n"));
+        assert!(!s.contains("Sec-Fetch-"), "no masquerade for custom UA");
+        assert!(!s.contains("Sec-CH-UA"));
+    }
+
+    #[test]
+    fn chrome_enum_user_agent_gets_full_masquerade() {
+        let mut cfg = make_config("/ws");
+        cfg.header.insert("User-Agent".into(), "chrome".into());
+        let bytes = build_upgrade_request("example.com", &cfg);
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            s.contains("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)"),
+            "enum value replaced by real Chrome UA"
+        );
+        assert!(s.contains("Sec-Fetch-Mode: websocket\r\n"));
+    }
+
+    #[test]
+    fn connection_and_upgrade_override_user_config() {
+        // Go dialer.go:100-101：Set 在伪装之后，覆盖用户同名配置。
+        let mut cfg = make_config("/ws");
+        cfg.header.insert("Connection".into(), "keep-alive".into());
+        cfg.header.insert("Upgrade".into(), "h2c".into());
+        let bytes = build_upgrade_request("example.com", &cfg);
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(!s.contains("keep-alive"), "user Connection overridden");
+        assert!(!s.contains("h2c"), "user Upgrade overridden");
+        assert!(s.matches("Connection: Upgrade\r\n").count() == 1);
+        assert!(s.matches("Upgrade: websocket\r\n").count() == 1);
     }
 
     #[test]

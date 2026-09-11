@@ -358,14 +358,20 @@ fn observatory_factory() -> FeatureFactory {
             serde_json::from_slice(data).unwrap_or_default();
 
         let config = xray_app_observatory::ObservatoryConfig {
-            subject_selector: json_cfg.subject_outbound.into_iter().collect(),
+            // z9ma：Go `subjectSelector` 数组优先，单值方言 `subjectOutbound`
+            // 兜底（数组键缺失时取其单值）。
+            subject_selector: json_cfg
+                .subject_selector
+                .clone()
+                .or_else(|| json_cfg.subject_outbound.clone().map(|s| vec![s]))
+                .unwrap_or_default(),
             probe_url: json_cfg.probe_url.unwrap_or_default(),
             probe_interval: json_cfg
                 .probe_interval
                 .as_deref()
                 .and_then(parse_go_duration_ms)
                 .unwrap_or(0),
-            enable_concurrency: false,
+            enable_concurrency: json_cfg.enable_concurrency.unwrap_or(false),
         };
 
         let feature = xray_app_observatory::ObservatoryFeature::new(config);
@@ -385,11 +391,17 @@ fn burst_observatory_factory() -> FeatureFactory {
         let json_cfg: xray_conf::app_config::BurstObservatoryConfig =
             serde_json::from_slice(data).unwrap_or_default();
 
-        let subject_outbound = json_cfg.subject_outbound.unwrap_or_default();
+        // z9ma：Go `subjectSelector` 数组优先，单值方言兜底（Go
+        // BurstObservatoryConfig 只有 SubjectSelector + pingConfig）。
+        let subject_selector = json_cfg
+            .subject_selector
+            .clone()
+            .or_else(|| json_cfg.subject_outbound.clone().map(|s| vec![s]))
+            .unwrap_or_default();
         let ping_config = json_cfg.ping_config.as_ref();
 
         let feature = xray_app_observatory::BurstObservatoryFeature::new(
-            subject_outbound,
+            subject_selector,
             ping_config,
         );
         Ok(Arc::new(feature) as Arc<dyn Feature>)
@@ -822,34 +834,31 @@ pub fn fake_dns_engine_bridge(
 /// Geodata app 真实 factory：解析 JSON → [`xray_app_geodata::GeodataConfig`]
 /// → [`GeodataFeature`](xray_app_geodata::GeodataFeature)。
 ///
-/// 对应 Go `app/geodata` 的 `init()` + `New(ctx, config)`。JSON 来自
-/// `xray-conf` 的 `GeodataConfig`（当前 shape 为 `{code, dir}`，**对齐 Go
-/// `{cron, outbound, assets}` 见 bd issue 待后续修复**）。本 batch 把
-/// `dir`（如设置）作为 asset dir hint，其余字段若空则构造空 `GeodataConfig`，
-/// 此时 `GeodataInstance.start_with_callback` 走 `if config.cron == ""` 早退
-/// 分支不调度（与 Go 等价）。
+/// 对应 Go `app/geodata` 的 `init()` + `New(ctx, config)`。JSON shape 对齐 Go
+/// `{cron, outbound, assets}`；映射时按 Go `infra/conf` Build() 语义校验
+/// （cron 非法 / asset url 非 https / asset file 本地缺失 → `StartFailed`，
+/// 由 instance 装配循环 warn+skip，即"告警"面）。cron 为空时
+/// `GeodataInstance.start_with_callback` 不调度（与 Go `if config.Cron == ""`
+/// 等价）。
 ///
-/// 之前此处返回 no-op `SimpleFeature`，`GeodataInstance` 从不实例化，
-/// cron 自动下载 + swap reload 全是死代码（bd issue Xray-core-rust-gpc）。
+/// 之前此处解析后弃用 `_json_cfg`（bd issue Xray-core-rust-xei2）；更早为
+/// no-op `SimpleFeature`（bd issue Xray-core-rust-gpc）。
 fn geodata_factory() -> FeatureFactory {
     Arc::new(|data: &[u8]| {
         use xray_app_geodata::{
-            CronScheduler, GeodataConfig, GeodataFeature, RealAssetDownloader,
+            CronScheduler, GeodataFeature, RealAssetDownloader,
             downloader::{AssetDownloader, GeodataReloader, ReloadBothRegistries},
             instance::Scheduler,
         };
-        use std::path::PathBuf;
 
-        // 解析 JSON（`xray_conf::app_config::GeodataConfig`：当前 `{cron, outbound, assets}`，
-        // M4 qi3d 已删旧的 `dir`/`code` 字段）。失败回退默认空配置。
-        // 真实 cron/JSON 字段映射留给后续 batch；当前走空 config（与
-        // `GeodataInstance::start_with_callback` cron 空时不调度 等价 Go 行为）。
-        let _json_cfg: xray_conf::app_config::GeodataConfig =
-            serde_json::from_slice(data).unwrap_or_default();
+        let json_cfg: xray_conf::app_config::GeodataConfig =
+            serde_json::from_slice(data).map_err(|e| FeatureError::StartFailed {
+                name: "geodata",
+                message: format!("invalid geodata config: {e}"),
+            })?;
 
-        let config = GeodataConfig::default();
+        let config = map_geodata_config(json_cfg)?;
 
-        // 真实实现替换之前的 stub。
         let scheduler: Arc<dyn Scheduler> = Arc::new(CronScheduler::new());
         let downloader: Arc<dyn AssetDownloader> =
             Arc::new(RealAssetDownloader::new(default_asset_dir()));
@@ -858,6 +867,48 @@ fn geodata_factory() -> FeatureFactory {
         let feature = GeodataFeature::new(config, scheduler, downloader, reloader);
         Ok(Arc::new(feature) as Arc<dyn Feature>)
     })
+}
+
+/// JSON 字段映射进运行时 [`xray_app_geodata::GeodataConfig`]，并按 Go
+/// `infra/conf/geodata.go:48-71` Build() 语义校验：cron 非法 / asset url
+/// 非 https / asset file 本地缺失 → 硬错（instance 装配循环 warn+skip）。
+/// cron 为空则原样放行（start 时不调度，与 Go `if config.Cron == ""` 等价）。
+fn map_geodata_config(
+    json_cfg: xray_conf::app_config::GeodataConfig,
+) -> Result<xray_app_geodata::GeodataConfig, FeatureError> {
+    let mut assets = Vec::new();
+    for a in json_cfg.assets.unwrap_or_default() {
+        let url = a.url.unwrap_or_default();
+        let file = a.file.unwrap_or_default();
+        let host = url.strip_prefix("https://").unwrap_or("");
+        if host.is_empty() || host.starts_with('/') {
+            return Err(FeatureError::StartFailed {
+                name: "geodata",
+                message: format!("invalid geodata asset url: {url}"),
+            });
+        }
+        if file.is_empty() || !default_asset_dir().join(&file).exists() {
+            return Err(FeatureError::StartFailed {
+                name: "geodata",
+                message: format!("invalid geodata asset file: {file}"),
+            });
+        }
+        assets.push(xray_app_geodata::GeodataAsset { url, file });
+    }
+    let config = xray_app_geodata::GeodataConfig {
+        cron: json_cfg.cron.unwrap_or_default(),
+        outbound: json_cfg.outbound.unwrap_or_default(),
+        assets,
+    };
+    if !config.cron.is_empty() {
+        xray_app_geodata::CronScheduler::validate(&config.cron).map_err(|e| {
+            FeatureError::StartFailed {
+                name: "geodata",
+                message: format!("invalid geodata cron: {e}"),
+            }
+        })?;
+    }
+    Ok(config)
 }
 
 /// 默认 asset 目录：`XRAY_LOCATION_ASSET` 或 std::env::temp_dir() + "xray-geodata"。
@@ -1013,6 +1064,82 @@ mod tests {
             "factory must return real GeodataFeature (was SimpleFeature name='simple' before fix)"
         );
     }
+
+    /// bd issue Xray-core-rust-xei2：JSON `{cron, outbound, assets}` 必须
+    /// 真正映射进运行时配置（此前解析后弃用 `_json_cfg`，恒 default 空值，
+    /// 自动更新静默永不发生）。
+    #[test]
+    fn geodata_mapping_captures_cron_outbound_assets() {
+        let dir = default_asset_dir();
+        std::fs::create_dir_all(&dir).expect("asset dir should create");
+        let asset_file = dir.join("xei2-test-geo.dat");
+        std::fs::write(&asset_file, b"test").expect("asset file should write");
+
+        let json: xray_conf::app_config::GeodataConfig = serde_json::from_str(
+            r#"{"cron":"0 0 11 9 *","outbound":"worker",
+                "assets":[{"url":"https://example.com/geoip.dat","file":"xei2-test-geo.dat"}]}"#,
+        )
+        .expect("json should parse");
+        let cfg = map_geodata_config(json).expect("valid config should map");
+        assert_eq!(cfg.cron, "0 0 11 9 *");
+        assert_eq!(cfg.outbound, "worker");
+        assert_eq!(cfg.assets.len(), 1);
+        assert_eq!(cfg.assets[0].url, "https://example.com/geoip.dat");
+        assert_eq!(cfg.assets[0].file, "xei2-test-geo.dat");
+
+        let _ = std::fs::remove_file(&asset_file);
+    }
+
+    /// cron 非法 → Build 期硬错，对齐 Go infra/conf `invalid geodata cron`。
+    #[test]
+    fn geodata_mapping_rejects_invalid_cron() {
+        let json: xray_conf::app_config::GeodataConfig =
+            serde_json::from_str(r#"{"cron":"not a cron"}"#).expect("json should parse");
+        let err = map_geodata_config(json).expect_err("invalid cron must fail");
+        assert!(
+            err.to_string().contains("invalid geodata cron"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// 资产校验对齐 Go GeodataAssetConfig.Build()：url 必须 https+host，
+    /// file 必须本地存在（StatAsset 语义）。
+    #[test]
+    fn geodata_mapping_rejects_bad_assets() {
+        let http_url: xray_conf::app_config::GeodataConfig = serde_json::from_str(
+            r#"{"assets":[{"url":"http://example.com/geoip.dat","file":"geoip.dat"}]}"#,
+        )
+        .expect("json should parse");
+        let err = map_geodata_config(http_url).expect_err("http url must fail");
+        assert!(err.to_string().contains("invalid geodata asset url"));
+
+        let missing_file: xray_conf::app_config::GeodataConfig = serde_json::from_str(
+            r#"{"assets":[{"url":"https://example.com/geoip.dat","file":"no-such-xei2.dat"}]}"#,
+        )
+        .expect("json should parse");
+        let err = map_geodata_config(missing_file).expect_err("missing file must fail");
+        assert!(err.to_string().contains("invalid geodata asset file"));
+    }
+
+    /// 工厂接线：合法配置建出真实 feature；非法 cron 在 create_feature 层硬错
+    /// （装配循环 warn+skip，即本票"告警"面）。调度触发计数链路由
+    /// xray-app-geodata feature/instance 测试覆盖（schedule_calls==1 +
+    /// 回调驱动 reload_count 递增），此处验证 cron 值原样到达映射。
+    #[test]
+    fn geodata_factory_builds_valid_and_rejects_invalid_cron() {
+        register_all_features();
+
+        let feat = registry::create_feature("geodata", br#"{"cron":"*/5 * * * *"}"#)
+            .expect("valid cron should build");
+        assert_eq!(feat.feature_name(), "geodata");
+
+        let err = match registry::create_feature("geodata", br#"{"cron":"nope"}"#) {
+            Ok(_) => panic!("invalid cron must fail at factory"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("invalid geodata cron"));
+    }
+
     #[test]
     fn app_stats_feature_counts_for_real() {
         use xray_features::stats::Manager as _;
@@ -1255,6 +1382,67 @@ mod tests {
         let feat = registry::create_feature("observatory", json)
             .expect("observatory config should build");
         assert_eq!(feat.feature_name(), "observatory");
+    }
+
+    /// bd z9ma：Go 标准键 `subjectSelector`（数组）+ `enableConcurrency` 经
+    /// factory 落进 ObservatoryConfig；单值方言 `subjectOutbound` 兜底。
+    #[test]
+    fn observatory_factory_parses_go_subject_selector_and_concurrency() {
+        use std::sync::Arc as StdArc;
+        use std::any::Any;
+        register_all_features();
+        let json = br#"{
+            "subjectSelector": ["proxy", "warp"],
+            "enableConcurrency": true,
+            "probeInterval": "30s"
+        }"#;
+        let feat = registry::create_feature("observatory", json)
+            .expect("observatory config should build");
+        let any_arc: StdArc<dyn Any + Send + Sync> = feat;
+        let f = StdArc::downcast::<xray_app_observatory::ObservatoryFeature>(any_arc)
+            .expect("feature is ObservatoryFeature");
+        let cfg = f.observer().config();
+        assert_eq!(
+            cfg.subject_selector,
+            vec!["proxy".to_string(), "warp".to_string()]
+        );
+        assert!(cfg.enable_concurrency);
+        assert_eq!(cfg.probe_interval, 30_000);
+
+        // 单值方言兜底：Go 数组键缺失时取 subjectOutbound 单值。
+        let feat2 = registry::create_feature("observatory", br#"{"subjectOutbound": "p1"}"#)
+            .expect("legacy dialect should build");
+        let any_arc2: StdArc<dyn Any + Send + Sync> = feat2;
+        let f2 = StdArc::downcast::<xray_app_observatory::ObservatoryFeature>(any_arc2)
+            .expect("feature is ObservatoryFeature");
+        assert_eq!(
+            f2.observer().config().subject_selector,
+            vec!["p1".to_string()]
+        );
+        assert!(!f2.observer().config().enable_concurrency);
+    }
+    /// bd z9ma：burst factory 同样消费 Go `subjectSelector` 数组（单值方言兜底）。
+    #[test]
+    fn burst_factory_parses_go_subject_selector() {
+        use std::sync::Arc as StdArc;
+        use std::any::Any;
+        register_all_features();
+        let json = br#"{
+            "subjectSelector": ["a", "b"],
+            "pingConfig": {"destination": "http://127.0.0.1:1/"}
+        }"#;
+        let feat = registry::create_feature("burstObservatory", json)
+            .expect("burst observatory config should build");
+        let any_arc: StdArc<dyn Any + Send + Sync> = feat;
+        let f = StdArc::downcast::<xray_app_observatory::BurstObservatoryFeature>(any_arc)
+            .expect("feature is BurstObservatoryFeature");
+        // start 走 selector 闭包——间接验证：非空 subject 不再是空 no-op。
+        // 直接断言内部列表不可行（私有字段），以 start 行为收口。
+        let err = f.start().expect_err("without executor injection start must fail");
+        assert!(
+            matches!(err, xray_features::FeatureError::StartFailed { name: "burstObservatory", .. }),
+            "non-empty selector must reach executor check, got: {err:?}"
+        );
     }
 
     /// bd f23r：factory 阶段不注入 IO——`init_dependencies` 接到

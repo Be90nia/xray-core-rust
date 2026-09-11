@@ -261,9 +261,12 @@ impl RoutingRouter for DispatchRouterBridge {
 ///
 /// 字段映射对齐 Go `session.SniffingRequest` 构建（`infra/conf.SniffingConfig` →
 /// destOverride / domainsExcluded / ipsExcluded / metadataOnly / routeOnly）。
-/// domainsExcluded/ipsExcluded 经 geodata rule_parser 编译为 typed matcher
-/// （bd fv1g：字面量 contains / CIDR 静默滤掉的旧实现已废）。解析失败或无
-/// sniffing 配置时返回 default（enabled=false，零行为变化）。
+/// destOverride 按 Go `SniffingConfig.Build`（infra/conf/xray.go:65-79）归一化：
+/// 小写化 + `https`/`ssl` → `tls`、`fakedns+others` → `fakedns`（va51①：别名
+/// 原样透传永不命中嗅探协议串）；未知值由 init.rs ValidationStage 硬拒，此处
+/// 透传保持零行为差。domainsExcluded/ipsExcluded 经 geodata rule_parser 编译为
+/// typed matcher（bd fv1g：字面量 contains / CIDR 静默滤掉的旧实现已废）。
+/// 解析失败或无 sniffing 配置时返回 default（enabled=false，零行为变化）。
 #[must_use]
 pub fn sniffing_request_from_json(v: Option<&serde_json::Value>) -> SniffingRequest {
     sniffing_request_from_json_in(v, &resolve_asset_dir())
@@ -285,10 +288,23 @@ fn sniffing_request_from_json_in(
         enabled: cfg.enabled,
         metadata_only: cfg.metadata_only,
         route_only: cfg.route_only,
-        override_destination_for_protocol: cfg.dest_override.0.clone(),
+        override_destination_for_protocol: normalize_dest_override(&cfg.dest_override.0),
         exclude_for_domain: build_domain_excluder(&cfg.domains_excluded.0, datadir),
         exclude_for_ip: build_ip_excluder(&cfg.ips_excluded.0, datadir),
     }
+}
+
+/// destOverride 别名归一化（va51①，对照 Go `infra/conf/xray.go:65-79` switch）。
+#[must_use]
+fn normalize_dest_override(protocols: &[String]) -> Vec<String> {
+    protocols
+        .iter()
+        .map(|p| match p.to_ascii_lowercase().as_str() {
+            "tls" | "https" | "ssl" => "tls".to_string(),
+            "fakedns" | "fakedns+others" => "fakedns".to_string(),
+            _ => p.clone(),
+        })
+        .collect()
 }
 
 /// proto `Domain.Type`（Substr=0/Regex=1/Domain=2/Full=3）→ matcher 层
@@ -1266,7 +1282,7 @@ fn parse_duration_ns(v: &serde_json::Value) -> Option<i64> {
     }
 }
 
-fn parse_go_duration_str(s: &str) -> Option<i64> {
+pub(crate) fn parse_go_duration_str(s: &str) -> Option<i64> {
     let neg = s.trim_start().starts_with('-');
     let s = s.trim().trim_start_matches(['-', '+']);
     let mut total: f64 = 0.0;
@@ -2133,6 +2149,21 @@ mod tests {
         assert!(!none.enabled);
         assert!(none.exclude_for_domain.is_none());
         assert!(none.exclude_for_ip.is_none());
+    }
+
+    /// va51①（Go infra/conf/xray.go:65-79）：destOverride 别名归一化——
+    /// https/ssl/TLS → tls，fakedns+others → fakedns，小写化；已知直通不变。
+    #[test]
+    fn sniffing_dest_override_aliases_normalized() {
+        let json = serde_json::json!({
+            "enabled": true,
+            "destOverride": ["https", "ssl", "TLS", "fakedns+others", "http", "quic"]
+        });
+        let req = sniffing_request_from_json_in(Some(&json), Path::new("/nonexistent"));
+        assert_eq!(
+            req.override_destination_for_protocol,
+            ["tls", "tls", "tls", "fakedns", "http", "quic"]
+        );
     }
 
     /// sm80①：wiring 层 inbound tag counter 受 ForSystem().Stats.Inbound*

@@ -129,10 +129,7 @@ pub fn build_client_config(
     let identity = client_identity(&json)?;
 
     // pwh6: TLS 字段族增量解析（client 侧）。所有字段缺失=默认行为，向前兼容。
-    let master_key_log = obj
-        .and_then(|m| m.get("masterKeyLog"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let master_key_log = crate::server_config::parse_master_key_log(&json);
     let enable_session_resumption = obj
         .and_then(|m| m.get("enableSessionResumption"))
         .and_then(|v| v.as_bool())
@@ -146,6 +143,19 @@ pub fn build_client_config(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+
+    // echSockopt（Go transport_security.go:318 `echSockopt`）：Go 唯一消费点是
+    // ECH DoH 查询链（ech.go QueryRecord→dnsQuery 的连接 sockopt）。Rust 该链路
+    // 未实现（DoH 形态 ECHConfigList 直接降级 invalid），此处识别 + 显式忽略提示。
+    if crate::ech::parse_ech_sockopt(&json).is_some()
+        && obj.and_then(|m| m.get("echConfigList")).and_then(|v| v.as_str())
+            .is_some_and(|s| s.contains("://"))
+    {
+        tracing::warn!(
+            target: "xray_tls::client_config",
+            "echSockopt is set but ECH DoH query is not implemented; sockopt ignored (ECH config will be invalid)"
+        );
+    }
 
     let builder = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&versions)
@@ -176,9 +186,29 @@ pub fn build_client_config(
     };
     cfg.alpn_protocols = alpn_owned;
 
-    // pwh6: masterKeyLog — Go KeyLogWriter 等价。
-    if master_key_log {
-        cfg.key_log = Arc::new(rustls::KeyLogFile::new());
+    // pwh6: masterKeyLog — Go KeyLogWriter（config.go:467-474）。string 路径
+    // 追加写 NSS 行；bool true（历史方言）走 SSLKEYLOGFILE env；打开失败
+    // 对齐 Go：warn 后继续（无 keylog）。
+    match master_key_log {
+        crate::server_config::MasterKeyLogSetting::Path(path) => {
+            match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                Ok(file) => {
+                    cfg.key_log = Arc::new(crate::server_config::KeyLogFileWriter(
+                        parking_lot::Mutex::new(file),
+                    ));
+                }
+                Err(e) => tracing::warn!(
+                    target: "xray_tls::client_config",
+                    error = %e,
+                    path = %path,
+                    "failed to open masterKeyLog as file; key log disabled"
+                ),
+            }
+        }
+        crate::server_config::MasterKeyLogSetting::EnvFile => {
+            cfg.key_log = Arc::new(rustls::KeyLogFile::new());
+        }
+        crate::server_config::MasterKeyLogSetting::Off => {}
     }
 
     // pwh6: enableSessionResumption=false 走 rustls `Resumption::disabled()`
@@ -1108,6 +1138,40 @@ mod tests {
         assert!(!std::sync::Arc::ptr_eq(&cfg_off.key_log, &cfg_on.key_log));
         assert!(format!("{:?}", &*cfg_on.key_log).contains("KeyLogFile"));
         assert!(format!("{:?}", &*cfg_off.key_log).contains("NoKeyLog"));
+    }
+
+    /// 票 8k4s①：client 侧 `masterKeyLog` string 路径 → KeyLogFileWriter 且
+    /// 文件被创建（bool true 方言仍走 KeyLogFile，见上一个测试）。
+    #[test]
+    fn pwh6_client_master_key_log_string_path_wires_writer() {
+        let path = std::env::temp_dir().join(format!(
+            "xray_tls_8k4s_client_{}.log",
+            std::process::id()
+        ));
+        let cfg = build_client_config(
+            "tls",
+            Some(&serde_json::json!({ "masterKeyLog": path.to_string_lossy() })),
+            "example.com",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(format!("{:?}", &*cfg.key_log).contains("KeyLogFileWriter"));
+        assert!(path.exists(), "Go O_CREATE: file must be created eagerly");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 票 8k4s③：`echSockopt` + DoH 形态 `echConfigList` → 配置构建不 panic
+    /// （降级 warn 路径；ECH config 本身仍会 resolve 成 invalid）。
+    #[test]
+    fn pwh6_client_ech_sockopt_with_doh_config_builds() {
+        let json = serde_json::json!({
+            "echConfigList": "https://1.1.1.1/dns-query",
+            "echSockopt": { "domainStrategy": "UseIP" }
+        });
+        let cfg = build_client_config("tls", Some(&json), "example.com")
+            .unwrap()
+            .unwrap();
+        assert!(format!("{:?}", &*cfg.key_log).contains("NoKeyLog"));
     }
 
     /// `enableSessionResumption=false` → resumption 切换到 disabled（type_name 变化）。

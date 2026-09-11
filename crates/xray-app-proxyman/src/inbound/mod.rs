@@ -325,7 +325,7 @@ impl InboundHandler for AlwaysOnInboundHandler {
     fn start(&self) -> PinFuture<Result<(), ProxymanError>> {
         let workers: Vec<Arc<dyn worker::Worker>> = self.workers.clone();
         Box::pin(async move {
-            for w in &workers {
+            for w in workers {
                 w.start().await?;
             }
             Ok(())

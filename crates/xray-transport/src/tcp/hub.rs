@@ -161,8 +161,9 @@ impl TcpHubListener {
 
 impl TransportListener for TcpHubListener {
     fn close(&self) -> io::Result<()> {
-        // 通知 accept 循环退出（打断 select! 中的 accept 等待）。
-        self.close_notify.notify_waiters();
+        // notify_one 存一个 permit：close 与 accept 循环重新注册 notified() 之间的
+        // 窗口内到达的 close 不会丢失（notify_waiters 只唤醒已注册 waiter）。
+        self.close_notify.notify_one();
         // ponytail: 底层 TcpListener 在 Arc drop 时关闭。
         // 如果需要立即释放端口，需在 DefaultListener 上加 close() 方法。
         Ok(())
@@ -170,6 +171,16 @@ impl TransportListener for TcpHubListener {
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
         self.inner.local_addr()
+    }
+}
+
+impl TransportListener for Arc<TcpHubListener> {
+    fn close(&self) -> io::Result<()> {
+        (**self).close()
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        (**self).local_addr()
     }
 }
 
@@ -208,6 +219,12 @@ pub async fn listen_tcp_impl(
     let mgr = crate::finalmask::build_tcpmask_manager_from_json(settings.finalmask_json.as_ref())?;
     let mgr = if mgr.tcpmasks.is_empty() { None } else { Some(mgr) };
     let listener = TcpHubListener::listen(addr, &sockopt, handler, auth, mgr).await?;
+    // Go hub.go ListenTCP：bind 后 `go l.keepAccepting()`——registry 契约要求
+    // TransportListenFn 内部 spawn accept 循环（listener_registry.rs:34；对齐
+    // ws/httpupgrade/kcp 同层实现）。listener 升 Arc 与循环共享；返回的 Box
+    // 经上方 Arc 转发 impl 仍可 close/local_addr（close → notify → 循环退出）。
+    let listener = Arc::new(listener);
+    let _accept_loop = listener.spawn_accept_loop();
     Ok(Box::new(listener) as Box<dyn TransportListener>)
 }
 
@@ -396,6 +413,67 @@ mod tests {
         let mut settings = crate::dialer::StreamSettings::tcp();
         settings.transport_json = Some(serde_json::json!({ "acceptProxyProtocol": "yes" }));
         assert!(!accept_proxy_protocol_from_tcp_settings(&settings));
+
+    }
+    /// 竞态窗回归锚（票 n8k8）：close 发生在 accept 循环注册 notified() 之前。
+    /// notify_one 存 permit，循环首次注册即被唤醒退出；旧 notify_waiters 语义下
+    /// 通知蒸发，循环 parked 在 accept() 永不退出——本测试必挂。
+    #[tokio::test]
+    async fn close_before_spawn_loop_exits_immediately() {
+        let handler: ConnHandler = Arc::new(|_| {});
+        let listener = Arc::new(
+            TcpHubListener::listen(
+                "127.0.0.1:0".parse().unwrap(),
+                &SocketOptions::default(),
+                handler,
+                None,
+                None,
+            )
+            .await
+            .expect("listen 失败"),
+        );
+        // 先 close 再 spawn：循环首次注册 notified() 时 close 已发生。
+        listener.close().expect("close 失败");
+        let handle = listener.spawn_accept_loop();
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("accept 循环必须在 pre-spawn close 后退出（permit 语义）")
+            .expect("循环 task panic");
+    }
+
+    /// close + drop 后端口释放，新连接被拒（票 n8k8 端口滞留修复的行为面）。
+    #[tokio::test]
+    async fn close_then_drop_rejects_new_connections() {
+        let handler: ConnHandler = Arc::new(|_| {});
+        let listener: Box<dyn TransportListener> = Box::new(
+            TcpHubListener::listen(
+                "127.0.0.1:0".parse().unwrap(),
+                &SocketOptions::default(),
+                handler,
+                None,
+                None,
+            )
+            .await
+            .expect("listen 失败"),
+        );
+        let addr = listener.local_addr().expect("local_addr 失败");
+        listener.close().expect("close 失败");
+        drop(listener); // socket 随最后一个 Arc 释放
+
+        // 循环 task 退出是异步的：轮询直至 connect 被拒。
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match tokio::net::TcpStream::connect(addr).await {
+                Err(_) => break,
+                Ok(_) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "close+drop 后端口仍接受连接"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
     }
 }
 

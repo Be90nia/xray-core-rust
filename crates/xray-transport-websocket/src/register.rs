@@ -163,8 +163,10 @@ struct WsTransportListener {
 
 impl TransportListener for WsTransportListener {
     fn close(&self) -> io::Result<()> {
-        // 通知 accept loop 退出。底层 TcpListener 在 WsListener drop 时关闭。
-        self.close_notify.notify_waiters();
+        // notify_one 存 permit：close 落在 accept 循环重新注册 notified() 的窗口内
+        // 也不丢失（notify_waiters 只唤醒已注册 waiter，会留下永久 accept 的僵尸）。
+        // 底层 TcpListener 在 WsListener drop 时关闭。
+        self.close_notify.notify_one();
         Ok(())
     }
 
@@ -800,5 +802,37 @@ mod tests {
         .expect("echo timeout")
         .expect("read ok");
         assert_eq!(&buf[..n], b"hello-ws-tcpmask");
+    }
+    /// close() 后 accept 循环退出、socket 释放，新连接被拒（票 n8k8/x6sp 行为面）。
+    /// notify_one 的 permit 保证 close 与循环重新注册 notified() 之间的窗口不丢通知；
+    /// pre-spawn close 竞态窗锚在 xray-transport tcp/hub.rs。
+    #[tokio::test]
+    async fn close_rejects_new_connections() {
+        let settings = StreamSettings {
+            protocol: "websocket".into(),
+            ..Default::default()
+        };
+        let handler: ConnHandler = Arc::new(|_| {});
+        let listener = listen_ws("127.0.0.1:0".parse().unwrap(), &settings, &handler)
+            .await
+            .expect("listen_ws");
+        let addr = listener.local_addr().expect("local_addr");
+
+        listener.close().expect("close");
+
+        // 循环退出 → WsListener drop 是异步的：轮询直至 connect 被拒。
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match tokio::net::TcpStream::connect(addr).await {
+                Err(_) => break,
+                Ok(_) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "close 后端口仍接受连接（close 通知丢失/循环未退出）"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
     }
 }

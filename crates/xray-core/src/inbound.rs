@@ -3570,8 +3570,9 @@ fn parse_loopback_config(data: &[u8]) -> std::io::Result<String> {
 
 /// 从 inbound entry.data（JSON）解析 tuic inbound 配置。
 ///
-/// JSON 格式：`{"uuid":"...","password":"...","serverName":"..."}`。
-/// uuid 必填，password 必填，serverName 默认 "tuic"。
+/// JSON 格式：`{"uuid":"...","password":"...","serverName":"...",
+/// "certificate":"<PEM>","certificateKey":"<PEM>"}`（票 ieik⑥：证书键接线，
+/// 缺省 rcgen 自签）。
 fn parse_tuic_inbound_config(
     data: &[u8],
     addr: &str,
@@ -3587,16 +3588,52 @@ fn parse_tuic_inbound_config(
     let server_name = v.get("serverName").and_then(|x| x.as_str()).unwrap_or("tuic").to_string();
     let bind_addr: std::net::SocketAddr = addr.parse()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("tuic parse addr: {e}")))?;
+    // 票 ieik⑥：certificate/certificateKey（PEM 内容）→ 真实证书；缺省 rcgen 自签
+    let cert_der = match v.get("certificate").and_then(|x| x.as_str()) {
+        Some(pem) => Some(tuic_pem_first_cert_der(pem)?),
+        None => None,
+    };
+    let key_der = match v.get("certificateKey").and_then(|x| x.as_str()) {
+        Some(pem) => Some(tuic_pem_key_der(pem)?),
+        None => None,
+    };
     let config = xray_proxy_tuic::TuicInboundConfig {
         listen: bind_addr,
         server_name,
         uuid,
         password: password.to_string(),
-        cert_der: None,
-        key_der: None,
+        cert_der,
+        key_der,
     };
     xray_proxy_tuic::TuicInboundHandler::new("", config)
         .map_err(|e| std::io::Error::other(format!("tuic inbound: {e}")))
+}
+
+/// PEM 文本 → 首张证书 DER（tuic inbound certificate 键）。
+fn tuic_pem_first_cert_der(pem: &str) -> std::io::Result<Vec<u8>> {
+    let mut rd = std::io::BufReader::new(pem.as_bytes());
+    let cert = rustls_pemfile::certs(&mut rd)
+        .next()
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "tuic certificate: no cert in PEM")
+        })?
+        .map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("tuic certificate PEM: {e}"))
+        })?;
+    Ok(cert.to_vec())
+}
+
+/// PEM 文本 → 私钥 DER（tuic inbound certificateKey 键；PKCS8/SEC1/RSA 皆可）。
+fn tuic_pem_key_der(pem: &str) -> std::io::Result<Vec<u8>> {
+    let mut rd = std::io::BufReader::new(pem.as_bytes());
+    rustls_pemfile::private_key(&mut rd)
+        .map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("tuic certificateKey PEM: {e}"))
+        })?
+        .map(|k| k.secret_der().to_vec())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "tuic certificateKey: no key in PEM")
+        })
 }
 
 /// TUN 配置占位设备——满足 StackOptions.tun 存在性校验。
@@ -5988,5 +6025,32 @@ mod tests {
         let validator = super::build_vmess_validator(&data).unwrap();
         use xray_proxy_vmess::Validator as VmessValidatorTrait;
         assert_eq!(VmessValidatorTrait::count(&*validator), 0);
+    }
+
+    /// 票 ieik⑥：certificate/certificateKey PEM → TuicInboundConfig cert/key DER。
+    /// rcgen 生成自签证书 → 解析出的 DER 能被 rustls 接受（build_server_config 路径）。
+    #[test]
+    fn tuic_inbound_pem_cert_key_parse() {
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["tuic.test".to_string()]).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "tuic.test");
+        let cert = params.self_signed(&key_pair).unwrap();
+        let cert_pem = cert.pem();
+        let key_pem = key_pair.serialize_pem();
+
+        let cert_der = super::tuic_pem_first_cert_der(&cert_pem).unwrap();
+        let key_der = super::tuic_pem_key_der(&key_pem).unwrap();
+        assert!(!cert_der.is_empty());
+        assert!(!key_der.is_empty());
+        // DER 能被 rustls 证书/私钥构造接受（TuicInboundConfig.build_server_config 用法）
+        let _ = rustls::pki_types::CertificateDer::from(cert_der);
+        let _ = rustls::pki_types::PrivatePkcs8KeyDer::from(key_der);
+
+        // 坏输入显式报错（不静默回落自签）
+        assert!(super::tuic_pem_first_cert_der("not a pem").is_err());
+        assert!(super::tuic_pem_key_der("not a pem").is_err());
     }
 }

@@ -268,8 +268,9 @@ fn build_ip_matcher(
 /// - `https://IP[:port][/path]` → DoH (默认 443, path 默认 /dns-query)
 /// - `quic://IP[:port]` → DoQ (默认 853，Go nameserver_quic.go:41)
 ///
-/// 仅接受 IP 地址（不含域名解析，避免 DNS 循环依赖）。
-/// server_name (TLS SNI) 取自 IP 字符串。
+/// 接受 IP 或域名：IP 直连；域名运行期解析（bd mcpo——经路由出站时由
+/// 路由系统解析，直连兜底每查询经 [`crate::dial::HostResolver`] 现解析）。
+/// server_name (TLS SNI) 取自 IP 字符串或域名本身。
 pub fn new_server(url: &str) -> Result<Box<dyn Server>, DnsError> {
     new_server_with_config(url, NameServerConfig::default()).map(|(server, _)| server)
 }
@@ -331,7 +332,11 @@ pub fn new_server_with_config(
     Ok((server, cfg))
 }
 
-/// 解析 DNS URL 的 host:port 部分。仅接受 IP（IPv4/IPv6），拒绝域名。
+/// 解析 DNS URL 的 host:port 部分（bd mcpo：域名返回 [`Address::Domain`]，
+/// 运行期解析——经路由出站时由路由系统/outbound 解析，直连兜底时每查询
+/// 经 [`crate::dial::HostResolver`] 现解析；弃启动期钉死 IP）。
+///
+/// server_name（TLS SNI）取 IP 字符串或域名本身。
 fn parse_dns_url_host(input: &str, default_port: u16) -> Result<(Address, u16, String), DnsError> {
     if let Ok(sa) = input.parse::<std::net::SocketAddr>() {
         let addr = match sa.ip() {
@@ -346,9 +351,21 @@ fn parse_dns_url_host(input: &str, default_port: u16) -> Result<(Address, u16, S
     if let Ok(v6) = input.parse::<std::net::Ipv6Addr>() {
         return Ok((Address::IPv6(v6), default_port, v6.to_string()));
     }
-    Err(DnsError::WireFormat(format!(
-        "new_server requires IP address, got: {input}"
-    )))
+    // 域名 + 显式端口（`dns.google:853` / `[dns.example.com]:853`）。
+    if let Some((host, port_str)) = input.rsplit_once(':') {
+        if !host.is_empty() && !host.contains(':') {
+            if let Ok(port) = port_str.parse::<u16>() {
+                let host = host.trim_start_matches('[').trim_end_matches(']');
+                return Ok((Address::Domain(host.to_string()), port, host.to_string()));
+            }
+        }
+    }
+    // 裸域名（默认端口）。
+    let host = input.trim();
+    if host.is_empty() {
+        return Err(DnsError::WireFormat("empty nameserver host".to_string()));
+    }
+    Ok((Address::Domain(host.to_string()), default_port, host.to_string()))
 }
 
 #[cfg(test)]
@@ -514,9 +531,29 @@ mod tests {
         assert!(new_server("foo://8.8.8.8").is_err());
     }
 
+    /// bd mcpo：域名 NS 接受（运行期解析，弃启动期钉死）。
     #[test]
-    fn new_server_rejects_domain_name() {
-        assert!(new_server("dns.google").is_err());
+    fn new_server_accepts_domain_name() {
+        let (server, cfg) = new_server_with_config(
+            "tls://dns.example.com",
+            NameServerConfig::default(),
+        )
+        .expect("domain nameserver should build");
+        assert!(cfg.address.as_domain().is_some());
+        assert_eq!(cfg.port, 853);
+        assert_eq!(server.name(), "DoT:dns.example.com:853");
+    }
+
+    /// 域名 + 显式端口形态。
+    #[test]
+    fn parse_domain_url_with_explicit_port() {
+        let (_, cfg) = new_server_with_config(
+            "https://dns.example.com:8443/dns-query",
+            NameServerConfig::default(),
+        )
+        .expect("domain nameserver with port should build");
+        assert_eq!(cfg.address.as_domain(), Some("dns.example.com"));
+        assert_eq!(cfg.port, 8443);
     }
 
     #[test]

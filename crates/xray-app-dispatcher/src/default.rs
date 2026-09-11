@@ -425,11 +425,16 @@ impl Debug for SniffingRequest {
 
 /// 判断 sniff 结果是否应覆盖原 destination
 ///
-/// 对应 Go `(*DefaultDispatcher).shouldOverride`。判定流程：
+/// 对应 Go `(*DefaultDispatcher).shouldOverride`（default.go:232-264）。判定流程：
 /// 1. domain 为空 → false
 /// 2. domain 命中 exclude_for_domain（config 层编译的 typed matcher）→ false
 /// 3. dest 是 IP 且命中 exclude_for_ip → false
-/// 4. protocol 命中 override_destination_for_protocol 列表（前缀匹配任一侧）→ true
+/// 4. 对每个配置协议 p：
+///    a. protocol 前缀互含（任一侧）→ true
+///    b. bk8l：p == "fakedns" 且原 dest IP 在 fake 池（映射可能丢失）且协议非
+///       bittorrent → true（"Using sniffer ... since the fake DNS missed"）
+///    c. bk8l：result 是 DNSThenOthers（fakedns+others），其原始协议是 p 的
+///       前缀子集（`SnifferIsProtoSubsetOf`）→ true
 ///
 /// # 参数
 /// - `result`: 嗅探结果
@@ -437,11 +442,17 @@ impl Debug for SniffingRequest {
 /// - `dest_address`: 原目的地地址（用于 exclude_for_ip 判断）
 /// - `protocol_for_domain`: 若 result 是 CompositeSniffResult，传 `Some(protocol_for_domain_result)`；
 ///   否则传 `None`，使用 `result.protocol()`
+/// - `dest_ip_in_fake_pool`: 原目的地 IP 是否落在 FakeDNS 池区间（由调用方经
+///   `FakeDnsEngine::is_ip_in_ip_pool` 判定后传入；Go 在本函数内查 fdns）
+/// - `protocol_subset_of`: DNSThenOthersSniffResult 的原始协议名（Go
+///   `IsProtoSubsetOf` 的 type-assert 等价；非该结果类型传 `None`）
 pub fn should_override(
     result: &dyn SniffResult,
     request: &SniffingRequest,
     dest_address: Option<IpAddr>,
     protocol_for_domain: Option<&str>,
+    dest_ip_in_fake_pool: bool,
+    protocol_subset_of: Option<&str>,
 ) -> bool {
     let domain = result.domain();
     if domain.is_empty() {
@@ -473,6 +484,17 @@ pub fn should_override(
         if protocol_string.starts_with(p.as_str()) || p.starts_with(protocol_string) {
             return true;
         }
+        // bk8l（Go default.go:251-255）：fake IP 在池但映射丢失时，内容嗅探出的
+        // 任意协议（bittorrent 除外）都按 fakedns 兜底改写，避免向失效假 IP 拨号
+        if dest_ip_in_fake_pool && p == "fakedns" && protocol_string != "bittorrent" {
+            return true;
+        }
+        // bk8l（Go default.go:256-260）：fakedns+others 结果按原始协议子集命中
+        if let Some(orig) = protocol_subset_of {
+            if p.starts_with(orig) {
+                return true;
+            }
+        }
     }
 
     false
@@ -492,7 +514,6 @@ async fn sniff_connection(
     dest: &xray_common::net::destination::Destination,
     req: &SniffingRequest,
     fdns: Option<&dyn crate::fakednssniffer::FakeDnsEngine>,
-    handshake_timeout: std::time::Duration,
 ) -> Result<
     (
         xray_common::net::destination::Destination,
@@ -501,9 +522,8 @@ async fn sniff_connection(
     ),
     DispatcherError,
 > {
-    // FakeDns metadata sniff（372t：IP 在池但反查失败时记 in_pool=true 让上层
-    // 走协议子集覆盖分支而非简单视为"非 fakedns 流量"——对应 Go default.go:322-343
-    // 在 fakedns pool 内即使 GetDomainFromFakeDNS 返回空也走 fakedns 协议语义，
+    // FakeDns metadata sniff：映射命中 → metadata_domain；仅 IP 在池（映射丢失，
+    // fakedns 重启/换池）→ fakedns_ip_in_pool 兜底标志（bk8l）。
     let mut metadata_domain = String::new();
     let mut metadata_protocol = String::new();
     let mut fakedns_ip_in_pool = false;
@@ -513,15 +533,11 @@ async fn sniff_connection(
             if !domain.is_empty() {
                 metadata_domain = domain;
                 metadata_protocol = "fakedns".to_string();
-            } else if engine.is_ip_in_ip_pool(&ip) {
-                // IP 命中 fake 池但无 mapping（fakedns 重启/旧池），按 Go 语义
-                // 走 fakedns 协议分支但无 domain 提供 → 由 content sniff 兜底。
-                fakedns_ip_in_pool = true;
-                metadata_protocol = "fakedns".to_string();
             }
+            // Go shouldOverride 每次都查 IsIPInIPPool，池内判定独立于映射命中
+            fakedns_ip_in_pool = engine.is_ip_in_ip_pool(&ip);
         }
     }
-    let _ = fakedns_ip_in_pool; // 372t: 已记 metadata_protocol, 上层 should_override 仍按 protocol_for_domain 走
 
     // m9si（Go default.go:384-388）：metadataOnly 时仅元数据嗅探（上方 fakedns
     // 反查，不读 payload），随后直接返回——内容嗅探不发生，target 不被 TLS 等
@@ -532,7 +548,14 @@ async fn sniff_connection(
             let meta_result =
                 crate::fakednssniffer::FakeDnsSniffResult::new(&metadata_domain);
             let dest_ip = dest.address().ip();
-            if should_override(&meta_result, req, dest_ip, Some(&metadata_protocol)) {
+            if should_override(
+                &meta_result,
+                req,
+                dest_ip,
+                Some(&metadata_protocol),
+                fakedns_ip_in_pool,
+                None,
+            ) {
                 let (new_dest, route_target) =
                     override_dest(dest, &metadata_domain, false)?;
                 return Ok((new_dest, Some(metadata_protocol), route_target));
@@ -541,52 +564,55 @@ async fn sniff_connection(
         return Ok((dest.clone(), None, None));
     }
 
-    // 读首包（带超时）
-    let read_result = tokio::time::timeout(
-        handshake_timeout,
-        cr.read_first(),
-    ).await;
-
-    match read_result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(e),
-        Err(_) => return Err(DispatcherError::SniffingTimeout),
-    }
-
-    let mut payload = cr.cached_bytes();
-    if payload.is_empty() {
-        return Ok((dest.clone(), None, None));
-    }
     let network = dest.network();
-
-    // 构造嗅探器集合
     let mut sniffer = crate::sniffer::new_default_sniffer_set();
 
-    // eu45：嗅探单次读+单次嗅探无 NeedMoreData 重试预算 → ClientHello 分段到达
-    // NeedMoreData 后 sniffer 集合已被缩减为 NotImplemented——每轮新建恢复完整集合）。
-    let content_result = {
-        let mut attempt: u8 = 0;
-        const NEED_MORE_MAX_ATTEMPTS: u8 = 2;
-        const NEED_MORE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+    // va51④ + ny1g（Go default.go:390-424）：嗅探预算 200ms 固定递减（脱离用户级
+    // 握手超时）；ErrNoClue / 空 payload 计入 totalAttempt（≥2 封顶 → 超时放弃），
+    // NeedMoreData 不计数（协议已命中，读到预算耗尽为止）。
+    let content_result: Result<Box<dyn SniffResult>, DispatcherError> = {
+        let mut cache_deadline = std::time::Duration::from_millis(200);
+        let mut total_attempt: u32 = 0;
+        let mut first_read = true;
         loop {
-            let result = sniffer.sniff(&payload, network);
-            if !matches!(result, Err(DispatcherError::NeedMoreData)) || attempt >= NEED_MORE_MAX_ATTEMPTS {
-                break result;
-            }
-            // 读更多字节（200ms 等客户端发后续 TLS/QUIC 分段）
-            let more = tokio::time::timeout(NEED_MORE_RETRY_DELAY, cr.read_more()).await;
-            match more {
-                Ok(Ok(true)) => {
-                    // 重新拿 payload 引用（cached_bytes 返回新 Vec）
-                    payload = cr.cached_bytes();
+            let caching_started = std::time::Instant::now();
+            let read_fut = async {
+                if first_read {
+                    cr.read_first().await.map(|_| true)
+                } else {
+                    cr.read_more().await
                 }
-                Ok(Ok(false)) | Ok(Err(_)) | Err(_) => break result, // EOF/错误/超时
+            };
+            match tokio::time::timeout(cache_deadline, read_fut).await {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => {
+                    break Err(DispatcherError::Io(
+                        "sniffing: stream ended before protocol identified".into(),
+                    ));
+                }
+                Ok(Err(e)) => break Err(e),
+                Err(_) => break Err(DispatcherError::SniffingTimeout),
             }
-            // 重建嗅探器集合（NeedMoreData 路径已把内部 sniffer 替换为 NotImplemented）
-            sniffer = crate::sniffer::new_default_sniffer_set();
-            attempt += 1;
+            cache_deadline = cache_deadline.saturating_sub(caching_started.elapsed());
+            first_read = false;
+
+            let payload = cr.cached_bytes();
+            if payload.is_empty() {
+                total_attempt += 1;
+            } else {
+                match sniffer.sniff(&payload, network) {
+                    Ok(result) => break Ok(result),
+                    Err(DispatcherError::NoClue) => total_attempt += 1,
+                    Err(DispatcherError::NeedMoreData) => {}
+                    Err(e) => break Err(e),
+                }
+            }
+            if total_attempt >= 2 || cache_deadline.is_zero() {
+                break Err(DispatcherError::SniffingTimeout);
+            }
         }
     };
+
     let dest_ip = dest.address().ip();
     match content_result {
         Ok(content) => {
@@ -597,16 +623,41 @@ async fn sniff_connection(
                     Box::new(crate::fakednssniffer::FakeDnsSniffResult::new(&metadata_domain)) as Box<dyn SniffResult>,
                     content,
                 );
-                if should_override(&composite, req, dest_ip, Some(&metadata_protocol)) {
+                if should_override(
+                    &composite,
+                    req,
+                    dest_ip,
+                    Some(&metadata_protocol),
+                    fakedns_ip_in_pool,
+                    None,
+                ) {
                     // fakedns 路径（Go default.go:311 判 protocol != "fakedns" 才走
                     // RouteOnly）：拨号必须跟域名（fake IP 不可直连）→ 按 false 传。
                     let (new_dest, route_target) =
                         override_dest(dest, &metadata_domain, false)?;
                     return Ok((new_dest, Some(metadata_protocol), route_target));
                 }
+            } else if fakedns_ip_in_pool {
+                // bk8l（Go newFakeDNSThenOthers）：IP 在 fake 池但映射丢失 → 内容
+                // 结果包成 fakedns+others（原始协议供 SnifferIsProtoSubsetOf 子集
+                // 匹配），避免向失效假 IP 拨号黑洞。
+                let wrapped = crate::fakednssniffer::DnsThenOthersSniffResult::new(
+                    content.domain(),
+                    content.protocol(),
+                );
+                if should_override(&wrapped, req, dest_ip, None, true, Some(content.protocol())) {
+                    // Go DispatchLink：isFakeIP（池内）时即使 routeOnly 也拨号跟域名
+                    let (new_dest, route_target) =
+                        override_dest(dest, wrapped.domain(), false)?;
+                    return Ok((
+                        new_dest,
+                        Some(wrapped.protocol().to_string()),
+                        route_target,
+                    ));
+                }
             } else {
                 // 仅 content 结果
-                if should_override(content.as_ref(), req, dest_ip, None) {
+                if should_override(content.as_ref(), req, dest_ip, None, false, None) {
                     let proto = content.protocol().to_string();
                     let domain = content.domain().to_string();
                     let (new_dest, route_target) =
@@ -619,7 +670,14 @@ async fn sniff_connection(
             // content sniff 失败，仅用 metadata
             if !metadata_domain.is_empty() {
                 let meta_result = crate::fakednssniffer::FakeDnsSniffResult::new(&metadata_domain);
-                if should_override(&meta_result, req, dest_ip, Some(&metadata_protocol)) {
+                if should_override(
+                    &meta_result,
+                    req,
+                    dest_ip,
+                    Some(&metadata_protocol),
+                    fakedns_ip_in_pool,
+                    None,
+                ) {
                     let (new_dest, route_target) =
                         override_dest(dest, &metadata_domain, false)?;
                     return Ok((new_dest, Some(metadata_protocol.clone()), route_target));
@@ -1068,7 +1126,6 @@ impl DefaultDispatcher {
             .map_or(self.default_policy.clone(), |pm| {
                 pm.policy_for_level(user_level)
             });
-        let handshake_timeout = policy.timeout.handshake;
         // per-user stats 上下文（Go getLink default.go:161-185）：email 非空才挂接。
         let user_email = access.as_ref().map_or(String::new(), |a| a.email.clone());
         let user_host = access
@@ -1090,7 +1147,7 @@ impl DefaultDispatcher {
             let mut cr = CachedReader::with_inner(outbound_reader);
             let (final_dest, sniffed_protocol, route_target) = if sniff_req.enabled {
                 match sniff_connection(
-                    &mut cr, &dest, &sniff_req, fdns.as_deref(), handshake_timeout,
+                    &mut cr, &dest, &sniff_req, fdns.as_deref(),
                 ).await {
                     Ok((d, proto, rt)) => (d, proto, rt),
                     Err(e) => {
@@ -1854,7 +1911,7 @@ mod tests {
     fn override_returns_false_when_domain_empty() {
         let r = make_sniff("http", "");
         let req = SniffingRequest::default();
-        assert!(!should_override(&r, &req, None, None));
+        assert!(!should_override(&r, &req, None, None, false, None));
     }
 
     #[test]
@@ -1864,7 +1921,7 @@ mod tests {
             exclude_for_domain: Some(Arc::new(|d: &str| d.contains("blocked"))),
             ..Default::default()
         };
-        assert!(!should_override(&r, &req, None, None));
+        assert!(!should_override(&r, &req, None, None, false, None));
     }
 
     #[test]
@@ -1874,7 +1931,7 @@ mod tests {
             exclude_for_ip: Some(Arc::new(|addr: IpAddr| addr == ip("1.2.3.4"))),
             ..Default::default()
         };
-        assert!(!should_override(&r, &req, Some(ip("1.2.3.4")), None));
+        assert!(!should_override(&r, &req, Some(ip("1.2.3.4")), None, false, None));
     }
 
     #[test]
@@ -1884,7 +1941,7 @@ mod tests {
             override_destination_for_protocol: vec!["http".to_string()],
             ..Default::default()
         };
-        assert!(!should_override(&r, &req, None, None));
+        assert!(!should_override(&r, &req, None, None, false, None));
     }
 
     #[test]
@@ -1894,7 +1951,7 @@ mod tests {
             override_destination_for_protocol: vec!["http".to_string()],
             ..Default::default()
         };
-        assert!(should_override(&r, &req, None, None));
+        assert!(should_override(&r, &req, None, None, false, None));
     }
 
     #[test]
@@ -1905,7 +1962,7 @@ mod tests {
             override_destination_for_protocol: vec!["http".to_string()],
             ..Default::default()
         };
-        assert!(should_override(&r, &req, None, None));
+        assert!(should_override(&r, &req, None, None, false, None));
     }
 
     #[test]
@@ -1916,7 +1973,7 @@ mod tests {
             ..Default::default()
         };
         // 传入 protocol_for_domain = "fakedns" 应命中
-        assert!(should_override(&r, &req, None, Some("fakedns")));
+        assert!(should_override(&r, &req, None, Some("fakedns"), false, None));
     }
 
     #[test]
@@ -1928,7 +1985,7 @@ mod tests {
             ..Default::default()
         };
         // dest = None 不命中 exclude_for_ip → 继续 protocol 检查 → true
-        assert!(should_override(&r, &req, None, None));
+        assert!(should_override(&r, &req, None, None, false, None));
     }
 
     #[test]
@@ -1940,7 +1997,7 @@ mod tests {
             override_destination_for_protocol: vec!["http".to_string()],
             ..Default::default()
         };
-        assert!(!should_override(&r, &req, None, None));
+        assert!(!should_override(&r, &req, None, None, false, None));
     }
 
     #[test]
@@ -1954,8 +2011,8 @@ mod tests {
             override_destination_for_protocol: vec!["http".to_string()],
             ..Default::default()
         };
-        assert!(!should_override(&r, &req, Some(ip("10.1.2.3")), None));
-        assert!(should_override(&r, &req, Some(ip("8.8.8.8")), None));
+        assert!(!should_override(&r, &req, Some(ip("10.1.2.3")), None, false, None));
+        assert!(should_override(&r, &req, Some(ip("8.8.8.8")), None, false, None));
     }
 
     #[test]
@@ -1968,9 +2025,41 @@ mod tests {
             override_destination_for_protocol: vec!["http".to_string()],
             ..Default::default()
         };
-        assert!(should_override(&r, &req, Some(ip("1.2.3.4")), None));
+        assert!(should_override(&r, &req, Some(ip("1.2.3.4")), None, false, None));
     }
 
+    /// bk8l（Go default.go:251-255 step2）：IP 在 fake 池、映射丢失，配置
+    /// destOverride=["fakedns"] 时任意内容协议（bittorrent 除外）兜底命中
+    #[test]
+    fn override_fakedns_fallback_hits_when_ip_in_pool() {
+        let r = make_sniff("tls", "example.com");
+        let req = SniffingRequest {
+            override_destination_for_protocol: vec!["fakedns".to_string()],
+            ..Default::default()
+        };
+        assert!(should_override(&r, &req, Some(ip("198.51.100.7")), None, true, None));
+        // 不在池 / 无池信息 → 不命中
+        assert!(!should_override(&r, &req, Some(ip("198.51.100.7")), None, false, None));
+        // bittorrent 例外（Go protocolString != "bittorrent" 门）
+        let bt = make_sniff("bittorrent", "");
+        assert!(!should_override(&bt, &req, Some(ip("198.51.100.7")), None, true, None));
+    }
+
+    /// bk8l（Go default.go:256-260 step3）：fakedns+others 结果按原始协议子集
+    /// 命中 destOverride=["tls"]（SnifferIsProtoSubsetOf 落地）
+    #[test]
+    fn override_proto_subset_of_original_hits() {
+        let wrapped = crate::fakednssniffer::DnsThenOthersSniffResult::new(
+            "example.com",
+            "tls",
+        );
+        let req = SniffingRequest {
+            override_destination_for_protocol: vec!["tls".to_string()],
+            ..Default::default()
+        };
+        // protocol "fakedns+others" 与 "tls" 无前缀关系 → 靠子集判定命中
+        assert!(should_override(&wrapped, &req, Some(ip("198.51.100.7")), None, true, Some("tls")));
+    }
     // ---- DefaultDispatcher ----
 
     #[test]
@@ -2947,6 +3036,19 @@ mod tests {
         }
     }
 
+    /// bk8l 测试引擎：203.0.113.9 在 fake 池区间但映射丢失（fakedns 重启语义）。
+    #[derive(Debug)]
+    struct PoolOnlyFakeDns;
+    impl crate::fakednssniffer::FakeDnsEngine for PoolOnlyFakeDns {
+        fn get_domain_from_fake_dns(&self, _addr: &IpAddr) -> String {
+            String::new()
+        }
+
+        fn is_ip_in_ip_pool(&self, addr: &IpAddr) -> bool {
+            *addr == IpAddr::from([203, 0, 113, 9])
+        }
+    }
+
     /// 记录首帧目标并回写（target = 改写后 dest）的 handler。
     #[derive(Debug)]
     struct FrameEchoHandler {
@@ -3480,7 +3582,7 @@ mod tests {
         );
 
         let (final_dest, proto, route_target) =
-            sniff_connection(&mut cr, &dest, &req, None, std::time::Duration::from_secs(1))
+            sniff_connection(&mut cr, &dest, &req, None)
                 .await
                 .expect("sniff ok");
 
@@ -3529,7 +3631,7 @@ mod tests {
         );
 
         let (final_dest, proto, route_target) =
-            sniff_connection(&mut cr, &dest, &req, None, std::time::Duration::from_secs(1))
+            sniff_connection(&mut cr, &dest, &req, None)
                 .await
                 .expect("sniff ok");
 
@@ -3574,15 +3676,10 @@ mod tests {
             Network::TCP,
         );
 
-        let (final_dest, proto, route_target) = sniff_connection(
-            &mut cr,
-            &dest,
-            &req,
-            Some(&FixedFakeDns),
-            std::time::Duration::from_secs(1),
-        )
-        .await
-        .expect("sniff ok");
+        let (final_dest, proto, route_target) =
+            sniff_connection(&mut cr, &dest, &req, Some(&FixedFakeDns))
+                .await
+                .expect("sniff ok");
 
         assert_eq!(
             final_dest.address().as_domain(),
@@ -3595,6 +3692,148 @@ mod tests {
             cr.cached_bytes().is_empty(),
             "payload must not be read under metadataOnly even with fakedns hit"
         );
+    }
+
+    /// ny1g（Go default.go:390-424）：HTTP 请求行与 Host 分属两个 TCP 段 →
+    /// 首轮 ErrNoClue 计入 totalAttempt 并重读，第二轮完成嗅探改写
+    /// （旧实现首轮即放弃按原 IP 路由）。
+    #[tokio::test]
+    async fn sniff_http_host_in_second_segment_retries() {
+        use xray_buf::io::Writer as _;
+        use xray_buf::multi::MultiBuffer;
+        use xray_common::net::address::Address;
+
+        let (r, mut w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let mut first = MultiBuffer::new();
+        first.merge_bytes(b"GET /path HTTP/1.1\r\n");
+        w.write_multi_buffer(first).await.unwrap();
+        let mut second = MultiBuffer::new();
+        second.merge_bytes(b"Host: late.example.com\r\n\r\n");
+        w.write_multi_buffer(second).await.unwrap();
+        w.shutdown();
+
+        let mut cr = CachedReader::with_inner(Box::new(r));
+        let req = SniffingRequest {
+            enabled: true,
+            override_destination_for_protocol: vec!["http".to_string()],
+            ..Default::default()
+        };
+        let dest = xray_common::net::destination::Destination::new(
+            Address::from_ipv4_bytes([1, 2, 3, 4]),
+            Port::new(80),
+            Network::TCP,
+        );
+
+        let (final_dest, proto, route_target) =
+            sniff_connection(&mut cr, &dest, &req, None).await.expect("sniff ok");
+
+        assert_eq!(
+            final_dest.address().as_domain(),
+            Some("late.example.com"),
+            "second-segment Host must be picked up after ErrNoClue retry",
+        );
+        assert_eq!(proto.as_deref(), Some("http1"));
+        assert!(route_target.is_none());
+    }
+
+    /// va51④（Go default.go:391）：嗅探预算 200ms 固定——慢首字节在预算耗尽后
+    /// 放弃（SniffingTimeout），不再借用用户级 60s 握手超时占住分发协程。
+    #[tokio::test]
+    async fn sniff_budget_is_fixed_200ms_not_handshake_timeout() {
+        use xray_common::net::address::Address;
+
+        // 永不出数据的 reader：read_first 挂到超时
+        struct SilentReader;
+        impl xray_buf::io::Reader for SilentReader {
+            fn read_multi_buffer(
+                &mut self,
+            ) -> Pin<Box<dyn Future<Output = Result<MultiBuffer, xray_buf::io::Error>> + Send + '_>>
+            {
+                Box::pin(async { loop { tokio::time::sleep(std::time::Duration::from_secs(3600)).await; } })
+            }
+        }
+
+        let mut cr = CachedReader::with_inner(Box::new(SilentReader));
+        let req = SniffingRequest {
+            enabled: true,
+            override_destination_for_protocol: vec!["tls".to_string()],
+            ..Default::default()
+        };
+        let dest = xray_common::net::destination::Destination::new(
+            Address::from_ipv4_bytes([1, 2, 3, 4]),
+            Port::new(443),
+            Network::TCP,
+        );
+
+        let started = std::time::Instant::now();
+        let result = sniff_connection(&mut cr, &dest, &req, None).await;
+        let elapsed = started.elapsed();
+
+        // 预算耗尽 → 放弃嗅探（既有契约：content 失败按原 dest 分发，Go
+        // contentErr 同语义），target 不被改写
+        let (final_dest, proto, route_target) = result.expect("sniff returns gracefully");
+        assert!(proto.is_none() && route_target.is_none());
+        assert_eq!(
+            final_dest.address().ip(),
+            Some(std::net::IpAddr::from([1, 2, 3, 4])),
+            "budget exhausted must keep original dest"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(200)
+                && elapsed < std::time::Duration::from_secs(5),
+            "sniff budget must be ~200ms fixed, got {elapsed:?} (was handshake timeout before va51④)"
+        );
+    }
+
+    /// bk8l（Go newFakeDNSThenOthers + DispatchLink isFakeIP 门）：IP 在 fake 池
+    /// 但映射丢失 → 内容嗅探包成 fakedns+others 命中 destOverride=[fakedns]，
+    /// 拨号改写跟域名（不向失效假 IP 黑洞），route_only 不生效。
+    #[tokio::test]
+    async fn sniff_fake_ip_pool_without_mapping_wraps_fakedns_others() {
+        use xray_buf::io::Writer as _;
+        use xray_buf::multi::MultiBuffer;
+        use xray_common::net::address::Address;
+
+        let mut payload = vec![0x16, 0x03, 0x01];
+        let hello = build_minimal_client_hello(b"recovered.example.com");
+        payload.extend_from_slice(&(hello.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&hello);
+
+        let (r, mut w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(&payload);
+        w.write_multi_buffer(mb).await.unwrap();
+        w.shutdown();
+
+        let mut cr = CachedReader::with_inner(Box::new(r));
+        let req = SniffingRequest {
+            enabled: true,
+            override_destination_for_protocol: vec!["fakedns".to_string()],
+            route_only: true, // Go：isFakeIP 时 routeOnly 不拦拨号改写
+            ..Default::default()
+        };
+        let dest = xray_common::net::destination::Destination::new(
+            Address::from_ipv4_bytes([203, 0, 113, 9]),
+            Port::new(443),
+            Network::TCP,
+        );
+
+        let (final_dest, proto, route_target) = sniff_connection(
+            &mut cr,
+            &dest,
+            &req,
+            Some(&PoolOnlyFakeDns),
+        )
+        .await
+        .expect("sniff ok");
+
+        assert_eq!(
+            final_dest.address().as_domain(),
+            Some("recovered.example.com"),
+            "dial target must follow sniffed domain when fake mapping is lost"
+        );
+        assert_eq!(proto.as_deref(), Some("fakedns+others"));
+        assert!(route_target.is_none(), "isFakeIP overrides route_only");
     }
 
     /// 路由指定的 outboundTag 不存在 → 关闭下行不落默认出站

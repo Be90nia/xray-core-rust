@@ -19,8 +19,8 @@ use crate::error::{Result, TuicError};
 use crate::protocol::command::{type_code, TOKEN_LEN};
 use crate::protocol::{Command, Packet};
 use crate::server::{
-    addr_to_socket_addr, read_command_from_stream, read_frame_from_recv, relay_to_tcp,
-    BiFrame, ReplySink, UdpAssocTable,
+    addr_to_socket_addr, handle_incoming_uni, read_authenticate, read_frame_from_recv,
+    relay_to_tcp, ReplySink, UdpAssocTable,
 };
 
 /// TUIC inbound 配置。
@@ -243,9 +243,9 @@ async fn handle_connection(
         conn.export_keying_material(&mut expected_token, expected_uuid.as_bytes(), password.as_bytes())
             .map_err(|_| TuicError::KeyingMaterialExport)?;
 
-    // accept_uni 读 Authenticate
+    // accept_uni 读 Authenticate（流式分段读——QUIC 流分片安全，票 ieik）
     let mut uni = conn.accept_uni().await?;
-    let cmd = read_command_from_stream(&mut uni, 64).await?;
+    let cmd = read_authenticate(&mut uni).await?;
     match cmd {
         Command::Authenticate {
             uuid_bytes,
@@ -276,22 +276,15 @@ async fn handle_connection(
                     Err(quinn::ConnectionError::ApplicationClosed(_)) => break,
                     Err(e) => return Err(e.into()),
                 };
-                handle_bi_frame(send_bi, recv_bi, dispatch.clone(), &mut udp_table).await;
+                handle_bi_frame(send_bi, recv_bi, dispatch.clone()).await;
             }
             uni = conn.accept_uni() => {
-                let mut uni = match uni {
+                let uni = match uni {
                     Ok(u) => u,
                     Err(quinn::ConnectionError::ApplicationClosed(_)) => break,
                     Err(e) => return Err(e.into()),
                 };
-                match read_command_from_stream(&mut uni, 64).await {
-                    Ok(Command::Heartbeat) => {}
-                    Ok(Command::Dissociate { assoc_id }) => {
-                        udp_table.dissociate(assoc_id);
-                    }
-                    Ok(_) => {}
-                    Err(e) => tracing::debug!("tuic inbound: uni stream read: {e:?}"),
-                }
+                handle_incoming_uni(uni, &conn, &mut udp_table, "tuic inbound").await;
             }
             dg = conn.read_datagram() => {
                 match dg {
@@ -328,59 +321,53 @@ fn handle_datagram(
     }
 }
 
-/// 处理一条 bi stream：Connect → dispatcher 生产路径 / mock 直连；Packet → UDP relay。
+/// 处理一条 bi stream：Connect → dispatcher 生产路径 / mock 直连。
+///
+/// spec：bi stream 只承载 Connect（Packet 走 uni/datagram，票 d1zr）。
 async fn handle_bi_frame(
     send_bi: quinn::SendStream,
     recv_bi: quinn::RecvStream,
     dispatch: Option<Arc<dyn xray_app_dispatcher::DispatchHandler>>,
-    udp_table: &mut UdpAssocTable,
 ) {
     match read_frame_from_recv(recv_bi, 256).await {
-        Ok((frame, recv_bi, initial_bytes)) => match frame {
-            BiFrame::Command(Command::Connect(addr)) => {
-                if let Some(handler) = dispatch {
-                    // 生产路径：构造 Destination + Link → dispatcher/router 分发。
-                    // initial_bytes 前置回 Link reader（read 一次读出 Connect+payload 的场景）。
-                    if let Some(dest) = tuic_addr_to_destination(&addr) {
-                        let link = xray_transport::link::Link::new(
-                            xray_buf::io::new_reader(InitialedReader::new(
-                                initial_bytes, recv_bi,
-                            )),
-                            xray_buf::io::new_writer(send_bi),
-                        );
-                        tokio::spawn(async move {
-                            let _ = handler.dispatch(&dest, link).await;
-                        });
-                    } else {
-                        tracing::warn!("tuic inbound: unsupported addr: {addr:?}");
-                    }
-                } else {
-                    // mock/直连路径（loopback 测试用）
-                    let Some(target) = addr_to_socket_addr(&addr) else {
-                        tracing::warn!("tuic inbound: addr not ip literal: {addr:?}");
-                        return;
-                    };
+        Ok((Command::Connect(addr), recv_bi, initial_bytes)) => {
+            if let Some(handler) = dispatch {
+                // 生产路径：构造 Destination + Link → dispatcher/router 分发。
+                // initial_bytes 前置回 Link reader（read 一次读出 Connect+payload 的场景）。
+                if let Some(dest) = tuic_addr_to_destination(&addr) {
+                    let link = xray_transport::link::Link::new(
+                        xray_buf::io::new_reader(InitialedReader::new(
+                            initial_bytes, recv_bi,
+                        )),
+                        xray_buf::io::new_writer(send_bi),
+                    );
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            relay_to_tcp(target, send_bi, recv_bi, initial_bytes).await
-                        {
-                            tracing::debug!("tuic relay {target}: {e:?}");
-                        }
+                        let _ = handler.dispatch(&dest, link).await;
                     });
+                } else {
+                    tracing::warn!("tuic inbound: unsupported addr: {addr:?}");
                 }
+            } else {
+                // mock/直连路径（loopback 测试用）
+                let Some(target) = addr_to_socket_addr(&addr) else {
+                    tracing::warn!("tuic inbound: addr not ip literal: {addr:?}");
+                    return;
+                };
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        relay_to_tcp(target, send_bi, recv_bi, initial_bytes).await
+                    {
+                        tracing::debug!("tuic relay {target}: {e:?}");
+                    }
+                });
             }
-            BiFrame::Command(Command::Heartbeat) => {}
-            BiFrame::Command(_) => {}
-            BiFrame::Packet(pkt) => {
-                // bi-stream 模式：路由进 assoc 会话（dispatch 模式域名透传）
-                udp_table.handle_packet(pkt, ReplySink::Bi(send_bi));
-            }
-        },
+        }
+        Ok((_, _, _)) => {}
         Err(e) => {
-            tracing::warn!("tuic inbound: failed to read frame: {e:?}");
+            // bi 收到 Packet（TYPE 0x02）等非 Connect 帧落此路径，忽略（spec，票 d1zr）
+            tracing::debug!("tuic inbound: bi frame skipped/invalid: {e:?}");
         }
     }
-
 }
 
 /// 前缀已读字节的 reader：先吐 `initial`，再透传内层流。

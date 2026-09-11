@@ -102,7 +102,7 @@ async fn listen_tcp(
     let ctx = build_context(config, local, handler);
     tracing::info!(%local, "listening TCP for XHTTP");
 
-    tokio::spawn(async move {
+    let accept_task = tokio::spawn(async move {
         loop {
             let (stream, peer) = match tcp.accept().await {
                 Ok(v) => v,
@@ -135,7 +135,11 @@ async fn listen_tcp(
             });
         }
     });
-    Ok(Box::new(SplithttpListener { local }))
+    Ok(Box::new(SplithttpListener {
+        local,
+        tcp_abort: Some(accept_task.abort_handle()),
+        h3_endpoint: None,
+    }))
 }
 
 /// 单个已 accept 的流：REALITY / TLS 包装 → h1+h2c HTTP 服务。
@@ -404,10 +408,12 @@ async fn listen_h3(
     let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
     let endpoint = quinn::Endpoint::server(server_config, addr)?;
     let local = endpoint.local_addr()?;
+    // endpoint clone 给 listener 句柄；本体 move 进 accept task。
     let ctx = build_context(config, local, handler);
     tracing::info!(%local, "listening QUIC for XHTTP/3");
 
-    tokio::spawn(async move {
+    let listener_endpoint = endpoint.clone();
+    let accept_task = tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             let ctx = Arc::clone(&ctx);
             tokio::spawn(async move {
@@ -419,7 +425,11 @@ async fn listen_h3(
             });
         }
     });
-    Ok(Box::new(SplithttpListener { local }))
+    Ok(Box::new(SplithttpListener {
+        local,
+        tcp_abort: None,
+        h3_endpoint: Some(listener_endpoint),
+    }))
 }
 
 /// 单个 QUIC 连接：h3 server handshake → accept 请求循环。
@@ -601,10 +611,12 @@ impl Connection for DuplexConn {
 }
 
 /// listener 句柄。对应 Go `Listener`（h3listener/listener 二选一）。
-// ponytail: close 目前仅日志——TCP/QUIC accept 任务持有 listener 所有权，
-// registry 层 close 语义需 AbortHandle/CancellationToken 改造（全仓通用课题）。
+/// 两条监听形态各持一个关闭句柄：TCP 分支 abort accept task（TcpListener drop
+/// 释放端口），H3 分支直接关 QUIC endpoint（对齐 Go tr.Close()）。
 struct SplithttpListener {
     local: SocketAddr,
+    tcp_abort: Option<tokio::task::AbortHandle>,
+    h3_endpoint: Option<quinn::Endpoint>,
 }
 
 impl TransportListener for SplithttpListener {
@@ -613,6 +625,12 @@ impl TransportListener for SplithttpListener {
     }
     fn close(&self) -> io::Result<()> {
         tracing::info!("splithttp listener close addr={}", self.local);
+        if let Some(task) = &self.tcp_abort {
+            task.abort();
+        }
+        if let Some(ep) = &self.h3_endpoint {
+            ep.close(quinn::VarInt::from_u32(0), b"listener closed");
+        }
         Ok(())
     }
 }
@@ -812,5 +830,79 @@ mod tests {
             0,
             "fallback conn must not reach dispatcher"
         );
+    }
+    /// TCP 分支：close() abort accept task → TcpListener drop → 端口释放
+    /// （票 4kjs 回归锚：修复前 close 仅日志，连接一直成功）。
+    #[tokio::test]
+    async fn close_rejects_new_tcp_connections() {
+        let (handler, _count) = greeting_handler();
+        let listener = listen_splithttp(
+            "127.0.0.1:0".parse().unwrap(),
+            &plain_settings(),
+            &SocketOptions::default(),
+            handler,
+        )
+        .await
+        .expect("listen");
+        let addr = listener.local_addr().unwrap();
+
+        listener.close().unwrap();
+
+        // abort → socket drop 是异步的：轮询直至 connect 被拒。
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match TcpStream::connect(addr).await {
+                Err(_) => break,
+                Ok(_) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "close 后端口仍接受连接（accept task 未终止）"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+
+    /// H3 分支：close() 关 QUIC endpoint → 新 QUIC 握手失败（对齐 Go tr.Close()）。
+    #[tokio::test]
+    async fn close_rejects_new_h3_connections() {
+        ensure_provider();
+        let (handler, _count) = greeting_handler();
+        let mut settings = plain_settings();
+        settings.security = "tls".into();
+        settings.security_json = Some(serde_json::json!({ "alpn": ["h3"] }));
+        let listener = listen_splithttp(
+            "127.0.0.1:0".parse().unwrap(),
+            &settings,
+            &SocketOptions::default(),
+            handler,
+        )
+        .await
+        .expect("listen h3");
+        let addr = listener.local_addr().unwrap();
+
+        listener.close().unwrap();
+
+        let client_tls = xray_tls::client_config::build_client_config(
+            "tls",
+            Some(&serde_json::json!({"allowInsecure": true, "alpn": ["h3"]})),
+            "127.0.0.1",
+        )
+        .unwrap()
+        .expect("client tls config");
+        let mut transport = quinn::TransportConfig::default();
+        transport
+            .max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(1_000))));
+        let mut quic_cfg = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap(),
+        ));
+        quic_cfg.transport_config(Arc::new(transport));
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(quic_cfg);
+
+        let result = endpoint.connect(addr, "127.0.0.1").unwrap().await;
+        assert!(result.is_err(), "post-close h3 connect must fail");
+        endpoint.close(0u32.into(), b"test done");
     }
 }

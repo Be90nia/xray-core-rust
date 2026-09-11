@@ -21,6 +21,7 @@ hickory-resolver.workspace = true
 ipnet = "2"
 xray-tls = { path = "../xray-tls" }
 xray-transport = { path = "../xray-transport" }
+xray-buf = { path = "../xray-buf" }
 tokio-rustls.workspace = true
 h2.workspace = true
 http.workspace = true

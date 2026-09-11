@@ -282,7 +282,10 @@ impl ClientWorker {
             return true;
         }
         let max_conc = self.strategy.max_concurrency;
-        max_conc > 0 && self.session_manager.count() >= max_conc as u16
+        // Go IsFull（client.go:298-312）用 sm.Size()=活跃会话数；count() 是
+        // 单调累计（含已关闭），错用会让 worker 提前饱和、复用退化为逐连接
+        // 拨号（bd 4uuo）。
+        max_conc > 0 && self.session_manager.active_count() >= max_conc as usize
     }
 
     /// 检查是否已关闭。
@@ -776,8 +779,8 @@ pub enum ClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use xray_buf::pipe;
-
     /// 回环 carrier 的测试 worker（carrier 管道两端都在 worker 内闭合）。
     fn loop_worker(strategy: ClientStrategy) -> Arc<ClientWorker> {
         let (r, w) = pipe::new();
@@ -1259,5 +1262,113 @@ mod tests {
         assert_eq!(u16::from_be_bytes([bytes[2], bytes[3]]), session.id());
         assert_eq!(bytes[4], 0x03, "status End");
         assert_eq!(bytes[5], 0x02, "option 必须是 0x02（OptionError）");
+    }
+
+    // ========== bd 4uuo：is_full 活跃数语义 + MaxConnection 滚动退役 ==========
+
+    /// 挂住的底层 handler：dispatch 阻塞在 carrier 读端直到中断，
+    /// 保证 worker 存活可复用（Nop 会立即断开 carrier）。
+    #[derive(Debug)]
+    struct HangingUnderlying;
+    impl xray_app_dispatcher::DispatchHandler for HangingUnderlying {
+        fn tag(&self) -> &str {
+            "hanging"
+        }
+        fn dispatch(
+            &self,
+            _dest: &Destination,
+            link: xray_transport::link::Link,
+        ) -> xray_app_dispatcher::default::PinFuture<()> {
+            Box::pin(async move {
+                let mut reader = BufferedReader::new(link.reader);
+                loop {
+                    match reader.read_multi_buffer().await {
+                        Ok(mb) if !mb.is_empty() => continue,
+                        _ => break,
+                    }
+                }
+            })
+        }
+    }
+
+    /// 包装工厂：统计 create 次数（carrier 建立数）。
+    struct CountingFactory {
+        inner: DialingWorkerFactory,
+        creates: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl ClientWorkerFactory for CountingFactory {
+        async fn create(&self) -> Arc<ClientWorker> {
+            self.creates.fetch_add(1, Ordering::Relaxed);
+            self.inner.create().await
+        }
+    }
+
+    /// 验收（bd 4uuo）：is_full 用活跃会话数（Go sm.Size()，client.go:298-312）。
+    /// 累计 8 次 allocate+close 后 worker 必须仍可复用；活跃满 8 才算满。
+    /// 旧实现错用累计 count：8 个累计会话后 is_full 恒真，复用退化为
+    /// 逐连接拨号（每连接新 TCP+TLS 握手）。
+    #[tokio::test]
+    async fn is_full_uses_active_sessions_not_cumulative_count() {
+        let strategy = ClientStrategy {
+            max_concurrency: 8,
+            max_connection: 0,
+        };
+        let worker = loop_worker(strategy.clone());
+        for _ in 0..8 {
+            let s = worker
+                .session_manager()
+                .allocate(&strategy)
+                .await
+                .expect("allocate below max_concurrency");
+            s.close().await;
+        }
+        assert_eq!(worker.session_count(), 8, "cumulative count keeps growing");
+        assert_eq!(worker.session_manager().active_count(), 0, "all closed");
+        assert!(
+            !worker.is_full(),
+            "8 allocate+close → active=0 → worker must stay reusable (bd 4uuo)"
+        );
+        let mut live = Vec::new();
+        for _ in 0..8 {
+            live.push(
+                worker
+                    .session_manager()
+                    .allocate(&strategy)
+                    .await
+                    .expect("active slot"),
+            );
+        }
+        assert!(worker.is_full(), "8 active sessions → full");
+    }
+
+    /// 验收（bd 4uuo）：12 条短连接（allocate+close 交替）应全程复用单条
+    /// carrier（create 计数恒 1）。旧实现累计 8 后 is_full → 每次新建 carrier。
+    #[tokio::test]
+    async fn twelve_short_lived_sessions_reuse_single_carrier() {
+        let strategy = ClientStrategy {
+            max_concurrency: 8,
+            max_connection: 0,
+        };
+        let creates = Arc::new(AtomicUsize::new(0));
+        let factory = Arc::new(CountingFactory {
+            inner: DialingWorkerFactory::new(Arc::new(HangingUnderlying), strategy.clone()),
+            creates: Arc::clone(&creates),
+        });
+        let picker = IncrementalWorkerPicker::new(factory);
+        for _ in 0..12 {
+            let worker = picker.pick_internal().await.expect("worker available");
+            let s = worker
+                .session_manager()
+                .allocate(&strategy)
+                .await
+                .expect("slot");
+            s.close().await;
+        }
+        assert_eq!(
+            creates.load(Ordering::Relaxed),
+            1,
+            "12 short-lived sessions must reuse one carrier (bd 4uuo)"
+        );
     }
 }

@@ -5631,6 +5631,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "uuid",
+ "xray-buf",
  "xray-common",
  "xray-features",
  "xray-geodata",
@@ -5694,9 +5695,13 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "xray-app-dispatcher",
+ "xray-buf",
  "xray-common",
  "xray-features",
  "xray-proto",
+ "xray-tls",
+ "xray-transport",
 ]
 
 [[package]]
@@ -6397,7 +6402,6 @@ dependencies = [
  "fnv",
  "futures-util",
  "hmac",
- "lru",
  "md-5",
  "parking_lot",
  "prost",

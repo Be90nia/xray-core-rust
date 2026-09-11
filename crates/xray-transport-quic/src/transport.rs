@@ -127,6 +127,8 @@ pub async fn listen(
         .map_err(|e| io::Error::other(format!("quinn bind: {e}")))?;
     let local = endpoint.local_addr()?;
 
+    // endpoint clone 给 listener 句柄；本体 move 进 accept task。
+    let listener_endpoint = endpoint.clone();
     tokio::spawn(async move {
         loop {
             let incoming = match endpoint.accept().await {
@@ -150,7 +152,10 @@ pub async fn listen(
         }
     });
 
-    Ok(Box::new(QuicListener { local }))
+    Ok(Box::new(QuicListener {
+        local,
+        endpoint: listener_endpoint,
+    }))
 }
 
 /// quinn (SendStream, RecvStream) + tokio DuplexStream 桥接的 Connection。
@@ -251,13 +256,18 @@ impl<E: Send + Sync + Unpin> Connection for QuicConn<E> {
     }
 }
 
+/// QUIC listener 句柄。endpoint clone 与 accept task 共享（quinn Endpoint 内部 Arc）。
 struct QuicListener {
     local: SocketAddr,
+    endpoint: quinn::Endpoint,
 }
 
 impl TransportListener for QuicListener {
     fn close(&self) -> io::Result<()> {
         tracing::info!("QUIC listener close addr={}", self.local);
+        // 立即关闭 QUIC 栈：accept 循环收到 None 退出，活跃连接全部断开，
+        // UDP socket 释放（对齐 Go hysteria/hub.go Close=listener+transport+pktConn）。
+        self.endpoint.close(quinn::VarInt::from_u32(0), b"listener closed");
         Ok(())
     }
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -267,4 +277,67 @@ impl TransportListener for QuicListener {
 
 fn io_err<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::other(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ensure_provider() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
+
+    /// quinn 客户端连指定地址（allowInsecure 跳过自签验证，1s idle timeout 快速失败）。
+    fn quinn_client_connect(addr: SocketAddr) -> quinn::Endpoint {
+        let client_tls = xray_tls::client_config::build_client_config(
+            "tls",
+            Some(&serde_json::json!({"allowInsecure": true})),
+            "127.0.0.1",
+        )
+        .unwrap()
+        .expect("client tls config");
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
+            1_000,
+        ))));
+        let mut quic_cfg = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap(),
+        ));
+        quic_cfg.transport_config(Arc::new(transport));
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(quic_cfg);
+        endpoint
+    }
+
+    /// close() 必须真实关闭 endpoint（票 4kjs 回归锚）：close 前可连通，close 后
+    /// 新 QUIC 握手失败。修复前 close() 仅日志，endpoint 永远存活，connect 一直成功。
+    #[tokio::test]
+    async fn close_rejects_new_connections() {
+        ensure_provider();
+        let settings = StreamSettings {
+            protocol: "quic".into(),
+            security: "tls".into(),
+            ..Default::default()
+        };
+        let handler: ConnHandler = Arc::new(|_| {});
+        let listener = listen("127.0.0.1:0".parse().unwrap(), &settings, handler)
+            .await
+            .expect("listen");
+        let addr = listener.local_addr().unwrap();
+
+        // close 前连通（证明服务活着，排除假阳性）。
+        let mut ep = quinn_client_connect(addr);
+        let pre = ep.connect(addr, "127.0.0.1").unwrap().await;
+        assert!(pre.is_ok(), "pre-close connect should succeed: {:?}", pre.err());
+
+        listener.close().unwrap();
+
+        // close 后新握手必须失败（server 不再回应 Initial）。
+        let post = ep.connect(addr, "127.0.0.1").unwrap().await;
+        assert!(post.is_err(), "post-close connect must fail");
+        ep.close(0u32.into(), b"test done");
+    }
 }

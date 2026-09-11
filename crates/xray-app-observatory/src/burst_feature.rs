@@ -24,21 +24,20 @@ use crate::observer::{HttpProbeExecutor, ProbeExecutor};
 /// Burst Observatory app Feature 实现。包装 [`BurstObserver`] + 调度 IO。
 pub struct BurstObservatoryFeature {
     observer: Arc<BurstObserver>,
-    /// subject_outbound 标签（Go `Config.SubjectSelector`）。
-    subject_outbound: String,
+    /// 受观察的 outbound tag 列表（Go `Config.SubjectSelector`）。
+    subject_selector: Vec<String>,
     /// 探测 executor，set_io 注入后 start 才启动循环。
     executor: Mutex<Option<Arc<dyn ProbeExecutor>>>,
 }
 
 impl BurstObservatoryFeature {
-    /// 从配置创建 BurstObservatoryFeature。
-    ///
-    /// `subject_outbound` 是 Go `Config.SubjectSelector[0]`（逗号分隔字符串
-    /// 的第一个 tag）——xray-conf 把它解析成单一字符串，本实装保持兼容。
+    /// `subject_selector` 对应 Go `Config.SubjectSelector`（数组，bd z9ma；
+    /// 此前是 `SubjectSelector[0]` 单值方言）。空列表 = 观测器 no-op
+    /// （与 Go burstobserver.go:69 一致）。
     /// `ping_config` 是 JSON Value（BurstObservatoryConfig.ping_config），
     /// 反序列化为 [`HealthPingConfig`] 后用 [`HealthPingSettings::from_config`]
     /// 归一化（默认值/最小约束）。
-    pub fn new(subject_outbound: String, ping_config: Option<&serde_json::Value>) -> Self {
+    pub fn new(subject_selector: Vec<String>, ping_config: Option<&serde_json::Value>) -> Self {
         // u7nu：parse 失败时整体丢弃 → warn 后回退默认；不让子字段类型偏差
         // 致整段 pingConfig 静默弃用（如 Go `interval:"1m"` 字符串）。
         let hp_config = ping_config.and_then(|v| {
@@ -55,7 +54,7 @@ impl BurstObservatoryFeature {
         let settings = HealthPingSettings::from_config(hp_config.as_ref());
         Self {
             observer: Arc::new(BurstObserver::new(settings)),
-            subject_outbound,
+            subject_selector,
             executor: Mutex::new(None),
         }
     }
@@ -82,16 +81,16 @@ impl Feature for BurstObservatoryFeature {
     /// - `SubjectSelector` 非空但未注入 executor → StartFailed（f23r 模式）。
     /// - 正常启动 → `BurstObserver::start_scheduler` 进入循环。
     fn start(&self) -> Result<()> {
-        if self.subject_outbound.is_empty() {
-            return Ok(()); // 与 Go observer.go:50 一致
+        if self.subject_selector.is_empty() {
+            return Ok(()); // 与 Go burstobserver.go:69/observer.go:50 一致
         }
 
         let executor = self.executor.lock().clone();
         match executor {
             Some(executor) => {
-                let subject = self.subject_outbound.clone();
+                let subject = self.subject_selector.clone();
                 let selector: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
-                    Arc::new(move || vec![subject.clone()]);
+                    Arc::new(move || subject.clone());
                 self.observer
                     .clone()
                     .start_scheduler(selector, executor);
@@ -112,8 +111,13 @@ impl Feature for BurstObservatoryFeature {
     /// bd 2umqf：装配阶段接线（对应 Go RequireFeatures 拿 outbound.Manager +
     /// dispatcher）。`outbound_selector` 到场（`init_dependencies` 二次注入，
     /// functions.rs bag2）时用 health ping settings 构造 [`HttpProbeExecutor`]
-    /// 注入——subject 非空时 `start` 不再 StartFailed。幂等：已注入跳过
-    /// （f23r 双阶段注入惯例，factory 阶段仍不注入）。
+    /// 直连兜底注入——subject 非空时 `start` 不再 StartFailed。
+    ///
+    /// soqc：**生产装配不走此兜底**——xray-core functions.rs 在 bag2 之前
+    /// `set_io` 注入 [`RealOutboundProbeExecutor`](crate::observer::RealOutboundProbeExecutor)
+    /// （经 outbound 拨号，对齐 Go ping.go:42 tagged.Dialer），已注入跳过保护
+    /// 使兜底不覆盖。幂等：已注入跳过（f23r 双阶段注入惯例，factory 阶段仍
+    /// 不注入）。
     fn init_dependencies(&self, deps: &xray_features::DepBag) {
         if deps.outbound_selector.is_none() || self.executor.lock().is_some() {
             return;
@@ -136,26 +140,26 @@ mod tests {
 
     #[test]
     fn new_empty_subject_noop() {
-        let f = BurstObservatoryFeature::new(String::new(), None);
+        let f = BurstObservatoryFeature::new(Vec::new(), None);
         assert!(f.start().is_ok(), "empty subject → noop");
     }
 
     #[test]
     fn start_without_executor_fails() {
-        let f = BurstObservatoryFeature::new("out-a".into(), None);
+        let f = BurstObservatoryFeature::new(vec!["out-a".to_string()], None);
         let err = f.start().expect_err("must fail without executor");
         assert!(matches!(err, FeatureError::StartFailed { .. }));
     }
 
     #[test]
     fn feature_name_is_burst_observatory() {
-        let f = BurstObservatoryFeature::new(String::new(), None);
+        let f = BurstObservatoryFeature::new(Vec::new(), None);
         assert_eq!(f.feature_name(), "burstObservatory");
     }
 
     #[tokio::test]
     async fn start_with_executor_runs_scheduler() {
-        let f = BurstObservatoryFeature::new("out-a".into(), None);
+        let f = BurstObservatoryFeature::new(vec!["out-a".to_string()], None);
         let executor: Arc<dyn ProbeExecutor> = Arc::new(
             FixedProbeExecutor::new().with_result("out-a", ProbeResult {
                 alive: true,
@@ -179,7 +183,7 @@ mod tests {
             "timeout": 3_000_000_000i64,
             "httpMethod": "GET",
         });
-        let f = BurstObservatoryFeature::new("out-a".into(), Some(&ping));
+        let f = BurstObservatoryFeature::new(vec!["out-a".to_string()], Some(&ping));
         let s = f.observer.settings();
         assert_eq!(s.destination, "https://custom.test/204");
         assert_eq!(s.interval, 15_000_000_000);
@@ -205,7 +209,7 @@ mod tests {
             "interval": 3_600_000_000_000i64,
             "timeout": 500_000_000i64,
         });
-        let f = BurstObservatoryFeature::new("out-a".into(), Some(&ping));
+        let f = BurstObservatoryFeature::new(vec!["out-a".to_string()], Some(&ping));
         f.start()
             .expect_err("without bag injection start must still fail");
 
@@ -219,7 +223,7 @@ mod tests {
 
     #[test]
     fn init_dependencies_without_selector_stays_unwired() {
-        let f = BurstObservatoryFeature::new("out-a".into(), None);
+        let f = BurstObservatoryFeature::new(vec!["out-a".to_string()], None);
         f.init_dependencies(&xray_features::DepBag::new());
         let err = f.start().expect_err("no selector → no executor → StartFailed");
         assert!(matches!(err, FeatureError::StartFailed { .. }));
@@ -228,7 +232,7 @@ mod tests {
     fn new_with_unparseable_ping_config_falls_back_to_defaults() {
         // u7nu：parse 失败必须 warn 而非静默——用 garbage 字符串强制 parse 失败。
         let bad = serde_json::json!({"interval": "not-a-duration", "samplingCount": 5});
-        let f = BurstObservatoryFeature::new("out-a".into(), Some(&bad));
+        let f = BurstObservatoryFeature::new(vec!["out-a".to_string()], Some(&bad));
         let s = f.observer.settings();
         // 整段丢弃 → 走默认（DEFAULT_DESTINATION / DEFAULT_SAMPLING_COUNT=10）。
         assert_eq!(s.sampling_count, crate::DEFAULT_SAMPLING_COUNT);

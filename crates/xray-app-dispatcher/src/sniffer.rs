@@ -85,56 +85,89 @@ impl Sniffer {
         payload: &[u8],
         network: Network,
     ) -> Result<Box<dyn SniffResult>, SniffError> {
-        let mut pending: Vec<Box<dyn ProtocolSniffer>> = Vec::new();
+        let mut pending: Vec<usize> = Vec::new();
+        let mut hit: Option<Box<dyn SniffResult>> = None;
+        let mut need_more = false;
 
-        for s in &self.sniffers {
+        for (i, s) in self.sniffers.iter().enumerate() {
             if s.metadata_only() || s.network() != network {
                 continue;
             }
             match s.sniff(payload) {
-                Ok(None) => {
-                    pending.push(Box::new(NotImplementedSniffer));
+                Ok(Some(result)) => {
+                    hit = Some(result);
+                    break;
+                }
+                // 非本协议（Go result==nil && err==nil）：本轮跳过，不保留
+                Ok(None) => {}
+                Err(SniffError::NoClue) => {
+                    // 无定论：可能后续分段命中，保留待重试（Go sniffer.go:67-69）
+                    pending.push(i);
                 }
                 Err(SniffError::NeedMoreData) => {
-                    self.sniffers = vec![Box::new(NotImplementedSniffer)];
-                    return Err(SniffError::NeedMoreData);
+                    // 协议命中但需更多数据：集合收缩到该探测器（Go sniffer.go:70-72）
+                    pending = vec![i];
+                    need_more = true;
+                    break;
                 }
-                Ok(Some(result)) => return Ok(result),
-                Err(_) => continue,
+                Err(_) => {}
             }
         }
 
-        if !pending.is_empty() {
-            self.sniffers = pending;
-            return Err(SniffError::NoClue);
+        if hit.is_none() {
+            Self::retain_at(&mut self.sniffers, &pending);
         }
 
+        if let Some(result) = hit {
+            return Ok(result);
+        }
+        if need_more {
+            return Err(SniffError::NeedMoreData);
+        }
+        if !pending.is_empty() {
+            return Err(SniffError::NoClue);
+        }
         Err(SniffError::UnknownContent)
     }
 
     pub fn sniff_metadata(&mut self) -> Result<Box<dyn SniffResult>, SniffError> {
-        let mut pending: Vec<Box<dyn ProtocolSniffer>> = Vec::new();
+        let mut pending: Vec<usize> = Vec::new();
+        let mut hit: Option<Box<dyn SniffResult>> = None;
 
-        for s in &self.sniffers {
+        for (i, s) in self.sniffers.iter().enumerate() {
             if !s.metadata_only() {
-                pending.push(Box::new(NotImplementedSniffer));
+                // 非 metadata 嗅探器保留给后续内容嗅探（Go sniffer.go:92-94）
+                pending.push(i);
                 continue;
             }
             match s.sniff(&[]) {
-                Ok(None) => {
-                    pending.push(Box::new(NotImplementedSniffer));
+                Ok(Some(result)) => {
+                    hit = Some(result);
+                    break;
                 }
-                Ok(Some(result)) => return Ok(result),
-                Err(_) => continue,
+                Err(SniffError::NoClue) => pending.push(i),
+                _ => {}
             }
         }
 
-        if !pending.is_empty() {
-            self.sniffers = pending;
-            return Err(SniffError::NoClue);
+        if hit.is_none() {
+            Self::retain_at(&mut self.sniffers, &pending);
         }
 
+        if let Some(result) = hit {
+            return Ok(result);
+        }
+        if !pending.is_empty() {
+            return Err(SniffError::NoClue);
+        }
         Err(SniffError::UnknownContent)
+    }
+
+    /// 按 pending 索引收缩探测器集合（Go sniffer.go:71,81）：pending 始终是
+    /// 真实探测器（索引升序，nth 跳过的中间项随迭代器丢弃）。
+    fn retain_at(sniffers: &mut Vec<Box<dyn ProtocolSniffer>>, indices: &[usize]) {
+        let mut it = std::mem::take(sniffers).into_iter();
+        *sniffers = indices.iter().filter_map(|&i| it.nth(i)).collect();
     }
 }
 
@@ -199,36 +232,10 @@ impl SniffResult for ProtoSniffResult {
     }
 }
 
-// ========== 占位嗅探器 ==========
-
-/// 未实现嗅探器占位
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NotImplementedSniffer;
-
-impl ProtocolSniffer for NotImplementedSniffer {
-    fn sniff(&self, _payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffError> {
-        Err(SniffError::UnknownContent)
-    }
-
-    fn network(&self) -> Network {
-        Network::TCP
-    }
-}
-
 // ========== HTTP 嗅探器 ==========
 
-/// HTTP 请求方法前缀
-const HTTP_METHODS: &[&[u8]] = &[
-    b"GET ",
-    b"POST ",
-    b"HEAD ",
-    b"PUT ",
-    b"DELETE ",
-    b"OPTIONS ",
-    b"CONNECT ",
-    b"PATCH ",
-    b"TRACE ",
-];
+/// HTTP 请求方法（Go http/sniff.go:42：小写、无尾空格；匹配大小写不敏感）
+const HTTP_METHODS: &[&str] = &["get", "post", "head", "put", "delete", "options", "connect"];
 
 /// HTTP 嗅探器（对应 Go http.SniffHTTP）
 ///
@@ -238,47 +245,88 @@ pub struct HttpSniffer;
 
 impl ProtocolSniffer for HttpSniffer {
     fn sniff(&self, payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffError> {
-        // 快速检查：payload 是否以 HTTP 方法开头
-        let is_http = HTTP_METHODS
-            .iter()
-            .any(|m| payload.len() >= m.len() && payload[..m.len()] == m[..]);
+        // Go beginWithHTTPMethod（http/sniff.go:47-59）：大小写不敏感前缀匹配；
+        // payload 短于方法名 → ErrNoClue（请求行可能分段到达，无定论）
+        let mut is_http = false;
+        for m in HTTP_METHODS {
+            let mb = m.as_bytes();
+            if payload.len() < mb.len() {
+                return Err(SniffError::NoClue);
+            }
+            if payload[..mb.len()].eq_ignore_ascii_case(mb) {
+                is_http = true;
+                break;
+            }
+        }
         if !is_http {
             return Ok(None);
         }
 
-        // 用 httparse 解析请求头
-        let mut headers = [httparse::EMPTY_HEADER; 16];
+        // 用 httparse 解析请求头（va51②：64 头容量，Go 全量扫描无上限，
+        // 16 头定长数组在现代浏览器请求规模下 TooManyHeaders 即放弃）
+        let mut headers = [httparse::EMPTY_HEADER; 64];
         let mut req = httparse::Request::new(&mut headers);
         match req.parse(payload) {
-            Ok(httparse::Status::Complete(_)) | Ok(httparse::Status::Partial) => {}
-            Err(_) => return Err(SniffError::UnknownContent),
+            Ok(httparse::Status::Complete(_)) => {}
+            // 头未到齐 / 畸形：Go 逐行扫描找不到 Host 即 ErrNoClue（可重试）
+            Ok(httparse::Status::Partial) | Err(_) => return Err(SniffError::NoClue),
         }
 
-        // 查找 Host 头
+        // ny1g：Host 头未到达 ≠ 放弃（Go http/sniff.go:116 Host 缺失即 ErrNoClue）
         let host = req
             .headers
             .iter()
             .find(|h| h.name.eq_ignore_ascii_case("host"));
-
         let Some(host_header) = host else {
-            return Err(SniffError::UnknownContent);
+            return Err(SniffError::NoClue);
         };
 
         let host_str = String::from_utf8_lossy(host_header.value);
-        // 去除端口部分
-        let domain = host_str.split(':').next().unwrap_or_default().to_string();
+        // va51③：Go ParseHost → net.SplitHostPort 括号感知（IPv6 字面量）
+        let Some(domain) = parse_host_header(host_str.trim()) else {
+            return Err(SniffError::UnknownContent);
+        };
 
         if domain.is_empty() {
             return Err(SniffError::UnknownContent);
         }
 
         Ok(Some(Box::new(ProtoSniffResult {
-            protocol: "http",
+            // va51⑤：Go SniffHeader.Protocol HTTP1 → "http1"
+            protocol: "http1",
             domain,
         })))
     }
     fn network(&self) -> Network {
         Network::TCP
+    }
+}
+
+/// 按 Go `net.SplitHostPort` + `ParseHost`（headers.go:66-84）语义拆 Host 头。
+///
+/// 括号感知：`[2001:db8::1]:443` → `2001:db8::1`；无端口视作"missing port"容错
+/// （host 原样保留）；非数字端口 / 多冒号（无括号）→ Go 硬错 → 返回 None。
+fn parse_host_header(host: &str) -> Option<String> {
+    if let Some(rest) = host.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let domain = &rest[..end];
+        match rest[end + 1..].strip_prefix(':') {
+            // 空端口等价 missing port（Go SplitHostPort 允许，ParseHost 用默认端口）
+            Some(port) if !port.is_empty() && !port.bytes().all(|b| b.is_ascii_digit()) => {
+                return None;
+            }
+            _ => {}
+        }
+        Some(domain.to_string())
+    } else {
+        match host.rsplit_once(':') {
+            None => Some(host.to_string()),
+            Some((h, port)) if port.is_empty() || port.bytes().all(|b| b.is_ascii_digit()) => {
+                Some(h.to_string())
+            }
+            // 非数字端口（Go strconv.Atoi 失败）或伪 IPv6 多冒号（Go too many colons）
+            Some(_) => None,
+        }
     }
 }
 // ========== TLS 嗅探器 ==========
@@ -303,8 +351,9 @@ impl ProtocolSniffer for TlsSniffer {
 /// `payload` 须包含完整 TLS record layer（content_type + version + length）。
 fn parse_tls_client_hello(payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffError> {
     // TLS record layer: content_type(1) + version(2) + length(2)
+    // ny1g：首读 <5B 无法判定是否 TLS → ErrNoClue（Go tls/sniff.go:132-134），可重试
     if payload.len() < 5 {
-        return Ok(None);
+        return Err(SniffError::NoClue);
     }
     if payload[0] != 0x16 {
         return Ok(None);
@@ -332,7 +381,8 @@ fn parse_client_hello_from_handshake(
 ) -> Result<Option<Box<dyn SniffResult>>, SniffError> {
     // Handshake: type(1) + length(3) + body
     if handshake.len() < 4 {
-        return Ok(None);
+        // ny1g：截断无定论 → ErrNoClue（Go ReadClientHello len<42 同类）
+        return Err(SniffError::NoClue);
     }
     if handshake[0] != 0x01 {
         return Ok(None);
@@ -353,26 +403,27 @@ fn parse_client_hello_from_handshake(
     offset += 32; // random
 
     if hello_body.len() <= offset {
-        return Ok(None);
+        // ny1g：截断 → ErrNoClue（Go ReadClientHello 截断同类）
+        return Err(SniffError::NoClue);
     }
     let session_id_len = hello_body[offset] as usize;
     offset += 1 + session_id_len;
 
     if hello_body.len() <= offset + 1 {
-        return Ok(None);
+        return Err(SniffError::NoClue);
     }
     let cipher_suites_len =
         u16::from_be_bytes([hello_body[offset], hello_body[offset + 1]]) as usize;
     offset += 2 + cipher_suites_len;
 
     if hello_body.len() <= offset {
-        return Ok(None);
+        return Err(SniffError::NoClue);
     }
     let compression_methods_len = hello_body[offset] as usize;
     offset += 1 + compression_methods_len;
 
     if hello_body.len() < offset + 2 {
-        return Ok(None);
+        return Err(SniffError::NoClue);
     }
     let extensions_len =
         u16::from_be_bytes([hello_body[offset], hello_body[offset + 1]]) as usize;
@@ -392,36 +443,43 @@ fn parse_client_hello_from_handshake(
         ext_offset += 4;
 
         if ext_type == 0x0000 {
-            // SNI extension: list_length(2) + name_type(1) + name_length(2) + name
-            if ext_len < 5 || ext_offset + 5 > extensions_end {
+            // SNI extension: server_name_list = list_length(2) + entry*
+            // entry = name_type(1) + name_length(2) + name
+            if ext_len < 2 || ext_offset + ext_len > extensions_end {
                 return Ok(None);
             }
-            let name_type = hello_body[ext_offset + 2];
-            if name_type != 0 {
-                return Ok(None);
+            // va51⑥：逐条目容错（Go tls/sniff.go:93-123）——首个 host_name
+            // 条目取值，非 host_name 条目跳过继续
+            let mut d = &hello_body[ext_offset + 2..ext_offset + ext_len];
+            while !d.is_empty() {
+                if d.len() < 3 {
+                    return Ok(None);
+                }
+                let name_type = d[0];
+                let name_len = u16::from_be_bytes([d[1], d[2]]) as usize;
+                d = &d[3..];
+                if d.len() < name_len {
+                    return Ok(None);
+                }
+                if name_type == 0 {
+                    let name = &d[..name_len];
+                    // va51⑥：名字含控制字符/空格 → QUIC 分段可能未到齐，
+                    // 重试（Go tls/sniff.go:104-111 b <= ' ' → NeedMoreData）
+                    if name.iter().any(|&b| b <= b' ') {
+                        return Err(SniffError::NeedMoreData);
+                    }
+                    // RFC 6066 §3：SNI 不得带尾点（Go errNotClientHello，永久放弃）
+                    if name.last() == Some(&b'.') {
+                        return Ok(None);
+                    }
+                    return Ok(Some(Box::new(ProtoSniffResult {
+                        protocol: "tls",
+                        domain: String::from_utf8_lossy(name).to_string(),
+                    })));
+                }
+                d = &d[name_len..];
             }
-            let name_len = u16::from_be_bytes([
-                hello_body[ext_offset + 3],
-                hello_body[ext_offset + 4],
-            ]) as usize;
-            let name_start = ext_offset + 5;
-            let name_end = name_start + name_len;
-            if name_end > extensions_end {
-                return Ok(None);
-            }
-            let domain = String::from_utf8_lossy(&hello_body[name_start..name_end]).to_string();
-
-            if domain.contains(' ') {
-                return Err(SniffError::NeedMoreData);
-            }
-            if domain.ends_with('.') {
-                return Ok(None);
-            }
-
-            return Ok(Some(Box::new(ProtoSniffResult {
-                protocol: "tls",
-                domain,
-            })));
+            return Ok(None);
         }
 
         ext_offset += ext_len;
@@ -926,7 +984,7 @@ mod tests {
         }
     }
 
-    /// 永远返回 NoClue 的嗅探器
+    /// 永远返回 Err(NoClue) 的嗅探器（ny1g：无定论进 pending 保留真实探测器）
     #[derive(Debug)]
     struct NoClueSniffer {
         network: Network,
@@ -934,7 +992,7 @@ mod tests {
 
     impl ProtocolSniffer for NoClueSniffer {
         fn sniff(&self, _payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffError> {
-            Ok(None)
+            Err(SniffError::NoClue)
         }
         fn network(&self) -> Network {
             self.network
@@ -1105,7 +1163,50 @@ mod tests {
     fn sniff_returns_unknown_when_all_fail() {
         let mut s = Sniffer::from_sniffers(vec![Box::new(HttpSniffer)]);
         let err = s.sniff(b"not-http", Network::TCP).unwrap_err();
+        // ny1g 新契约：Ok(None)=非本协议直接丢弃，全员无果 → UnknownContent
+        assert!(matches!(err, SniffError::UnknownContent));
+    }
+
+    /// ny1g：ErrNoClue 进 pending 后收缩保留的是真实探测器，第二轮重试可命中
+    /// （旧实现塞 NotImplementedSniffer 死占位，重试架构性不可能成功）
+    #[test]
+    fn sniff_noclue_pending_keeps_real_sniffer_for_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Debug)]
+        struct MatchOnSecondCall {
+            network: Network,
+            calls: AtomicUsize,
+        }
+        impl ProtocolSniffer for MatchOnSecondCall {
+            fn sniff(&self, _payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffError> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(SniffError::NoClue);
+                }
+                Ok(Some(Box::new(TestResult {
+                    protocol: "tls",
+                    domain: "retry.example.com",
+                })))
+            }
+            fn network(&self) -> Network {
+                self.network
+            }
+        }
+
+        let delayed = MatchOnSecondCall {
+            network: Network::TCP,
+            calls: AtomicUsize::new(0),
+        };
+        let mut s = Sniffer::from_sniffers(vec![
+            Box::new(HttpSniffer),
+            Box::new(delayed),
+        ]);
+        // 第一轮：HttpSniffer 对非 HTTP payload 丢弃（Ok(None)），delayed 报 NoClue
+        let err = s.sniff(b"not-http", Network::TCP).unwrap_err();
         assert!(matches!(err, SniffError::NoClue));
+        assert_eq!(s.len(), 1, "set shrinks to the pending real sniffer");
+        // 第二轮：同一探测器（非死占位）正常命中
+        let r = s.sniff(b"not-http", Network::TCP).expect("hit");
+        assert_eq!(r.domain(), "retry.example.com");
     }
 
     #[test]
@@ -1189,7 +1290,8 @@ mod tests {
     fn http_sniff_get_request() {
         let payload = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
         let result = HttpSniffer.sniff(payload).expect("ok").expect("some");
-        assert_eq!(result.protocol(), "http");
+        // va51⑤：Go SniffHeader.Protocol HTTP1 → "http1"
+        assert_eq!(result.protocol(), "http1");
         assert_eq!(result.domain(), "example.com");
     }
 
@@ -1197,8 +1299,63 @@ mod tests {
     fn http_sniff_post_request_with_port() {
         let payload = b"POST /api HTTP/1.1\r\nHost: api.example.com:8080\r\n\r\n";
         let result = HttpSniffer.sniff(payload).expect("ok").expect("some");
-        assert_eq!(result.protocol(), "http");
+        assert_eq!(result.protocol(), "http1");
         assert_eq!(result.domain(), "api.example.com");
+    }
+
+    /// ny1g：请求行先到、Host 分段在后 → NoClue（可重试），非永久放弃
+    #[test]
+    fn http_sniff_missing_host_returns_noclue() {
+        let result = HttpSniffer.sniff(b"GET / HTTP/1.1\r\n\r\n").unwrap_err();
+        assert!(matches!(result, SniffError::NoClue));
+    }
+
+    /// ny1g：payload 短于方法名（首读 2 字节 "GE"）→ NoClue
+    #[test]
+    fn http_sniff_short_first_read_returns_noclue() {
+        let result = HttpSniffer.sniff(b"GE").unwrap_err();
+        assert!(matches!(result, SniffError::NoClue));
+    }
+
+    /// va51②：>16 个头不再 TooManyHeaders 放弃
+    #[test]
+    fn http_sniff_more_than_16_headers() {
+        let mut payload = String::from("GET / HTTP/1.1\r\n");
+        for i in 0..24 {
+            payload.push_str(&format!("X-Pad-{i}: v\r\n"));
+        }
+        payload.push_str("Host: many.example.com\r\n\r\n");
+        let result = HttpSniffer.sniff(payload.as_bytes())
+            .expect("ok")
+            .expect("some");
+        assert_eq!(result.domain(), "many.example.com");
+    }
+
+    /// va51③：IPv6 字面量 Host 括号感知（Go net.SplitHostPort 语义）
+    #[test]
+    fn http_sniff_ipv6_literal_host() {
+        let r = HttpSniffer
+            .sniff(b"CONNECT / HTTP/1.1\r\nHost: [2001:db8::1]:443\r\n\r\n")
+            .expect("ok")
+            .expect("some");
+        assert_eq!(r.domain(), "2001:db8::1");
+
+        let r = HttpSniffer
+            .sniff(b"GET / HTTP/1.1\r\nHost: [::1]\r\n\r\n")
+            .expect("ok")
+            .expect("some");
+        assert_eq!(r.domain(), "::1");
+    }
+
+    /// va51③：多冒号伪 IPv6 / 非数字端口 → Go ParseHost 硬错，永久跳过
+    #[test]
+    fn http_sniff_malformed_host_rejected() {
+        let r = HttpSniffer.sniff(b"GET / HTTP/1.1\r\nHost: a:b:c\r\n\r\n").unwrap_err();
+        assert!(matches!(r, SniffError::UnknownContent));
+        let r = HttpSniffer
+            .sniff(b"GET / HTTP/1.1\r\nHost: example.com:notaport\r\n\r\n")
+            .unwrap_err();
+        assert!(matches!(r, SniffError::UnknownContent));
     }
 
     #[test]
@@ -1235,6 +1392,13 @@ mod tests {
         assert_eq!(result.domain(), "example.com");
     }
 
+    /// ny1g：TLS 首读 <5B 无法判定 → NoClue（可重试），非 Ok(None) 永久跳过
+    #[test]
+    fn tls_sniff_short_first_read_returns_noclue() {
+        let result = TlsSniffer.sniff(b"\x16\x03").unwrap_err();
+        assert!(matches!(result, SniffError::NoClue));
+    }
+
     #[test]
     fn tls_sniff_non_tls() {
         let result = TlsSniffer.sniff(b"not tls").expect("ok");
@@ -1247,6 +1411,85 @@ mod tests {
         payload.extend_from_slice(&[0u8; 10]); // 不够 record_len=32
         let result = TlsSniffer.sniff(&payload);
         assert!(matches!(result, Err(SniffError::NeedMoreData)));
+    }
+
+    /// va51⑥：首条目非 host_name 时跳过继续，第二个 host_name 条目命中
+    #[test]
+    fn tls_sniff_sni_skips_non_hostname_entries() {
+        let entries: Vec<(u8, &[u8])> = vec![
+            (1, b"1.2.3.4"), // name_type=1（非 host_name）
+            (0, b"second.example.com"),
+        ];
+        let result = TlsSniffer
+            .sniff(&wrap_record(&build_client_hello_with_sni_entries(&entries)))
+            .expect("ok")
+            .expect("some");
+        assert_eq!(result.domain(), "second.example.com");
+    }
+
+    /// va51⑥：SNI 名字含控制字符 → NeedMoreData（QUIC 分段未到齐语义）
+    #[test]
+    fn tls_sniff_sni_control_char_returns_need_more_data() {
+        let entries: Vec<(u8, &[u8])> = vec![(0, b"bad\x00name.example.com")];
+        let result = TlsSniffer
+            .sniff(&wrap_record(&build_client_hello_with_sni_entries(&entries)));
+        assert!(matches!(result, Err(SniffError::NeedMoreData)));
+    }
+
+    /// RFC 6066：尾点 SNI 非法 → 永久放弃（Go errNotClientHello）
+    #[test]
+    fn tls_sniff_sni_trailing_dot_rejected() {
+        let entries: Vec<(u8, &[u8])> = vec![(0, b"dot.example.com.")];
+        let result = TlsSniffer
+            .sniff(&wrap_record(&build_client_hello_with_sni_entries(&entries)))
+            .expect("ok");
+        assert!(result.is_none());
+    }
+
+    /// TLS record layer 包装（content_type + version + length）
+    fn wrap_record(handshake: &[u8]) -> Vec<u8> {
+        let mut payload = vec![0x16, 0x03, 0x01];
+        payload.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        payload.extend_from_slice(handshake);
+        payload
+    }
+
+    /// 构造含多条目 SNI extension 的 ClientHello（不含 record layer）
+    fn build_client_hello_with_sni_entries(entries: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut hello = Vec::new();
+        hello.push(0x01); // ClientHello
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]); // version TLS 1.2
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0x00); // session_id_len = 0
+        body.extend_from_slice(&[0x00, 0x02]); // cipher_suites_len = 2
+        body.extend_from_slice(&[0x00, 0x2f]);
+        body.push(0x01); // compression_methods_len = 1
+        body.push(0x00); // null compression
+
+        let mut sni_entries = Vec::new();
+        for (name_type, name) in entries {
+            sni_entries.push(*name_type);
+            sni_entries.extend_from_slice(&(name.len() as u16).to_be_bytes());
+            sni_entries.extend_from_slice(name);
+        }
+        let mut sni_data = Vec::new();
+        sni_data.extend_from_slice(&(sni_entries.len() as u16).to_be_bytes());
+        sni_data.extend_from_slice(&sni_entries);
+
+        let mut extensions = Vec::new();
+        extensions.extend_from_slice(&[0x00, 0x00]); // extension type SNI
+        extensions.extend_from_slice(&(sni_data.len() as u16).to_be_bytes());
+        extensions.extend_from_slice(&sni_data);
+
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+
+        let body_len = body.len() as u32;
+        hello.extend_from_slice(&body_len.to_be_bytes()[1..]);
+        hello.extend_from_slice(&body);
+        hello
     }
 
     /// 构造最小 TLS ClientHello（含 SNI）

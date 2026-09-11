@@ -562,14 +562,14 @@ impl Config {
     ///
     /// 对应 Go 26.7.28 `GetRequestHeader` → `utils.TryDefaultHeadersWith(header, "fetch")`：
     /// UA 未配置 → 整套 Chrome 伪装头；UA 为 chrome/firefox/safari/edge/curl/golang
-    /// → 对应伪装；其他自定义值 → 原样保留。见 [`crate::browser`]。
+    /// → 对应伪装；其他自定义值 → 原样保留。见 [`xray_common::browser`]。
     #[must_use]
     pub fn get_request_header(&self) -> Vec<(String, String)> {
         let mut headers: Vec<(String, String)> =
             self.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         // 对齐 Go 26.7.28 `GetRequestHeader`：UA 缺省时生成整套 Chrome 伪装头
         // （`utils.TryDefaultHeadersWith(header, "fetch")`），过 CDN bot 检测。
-        crate::browser::try_default_headers_with(&mut headers, "fetch");
+        xray_common::browser::try_default_headers_with(&mut headers, "fetch");
         headers
     }
 

@@ -782,14 +782,45 @@ fn build_protocol_handler(
                 udp_relay_mode: s.udp_relay_mode,
             };
             let dial_fn = xray_proxy_tuic::make_tuic_dial_fn_lazy(
-                s.server_addr,
-                s.server_name,
+                s.server_addr.clone(),
+                s.server_name.clone(),
                 s.uuid,
-                s.password,
+                s.password.clone(),
+                Arc::clone(&rustls_config),
+                options.clone(),
+            );
+            // TCP 走 DialBridge（targetStrategy/sendThrough 经 dial_fn 包装）；
+            // UDP 票 z9gp：XUDP 帧 ↔ TuicUdpAssoc（quic uni-stream / native datagram
+            // 按 udp_relay_mode），对齐 freedom/hysteria 出站 UDP 形态。
+            let dial_fn = match target_strategy {
+                Some(st) => wrap_dial_with_target_strategy(dial_fn, st, dns.cloned()),
+                None => dial_fn,
+            };
+            let dial_fn = match send_through {
+                Some(spec) => wrap_dial_with_send_through(dial_fn, spec.clone()),
+                None => dial_fn,
+            };
+            let tcp_bridge = Arc::new(DialBridge::new(ob.tag.clone(), dial_fn));
+            if let Some(pm) = policy_manager {
+                tcp_bridge
+                    .with_policy(xray_features::policy::PolicyManager::policy_for_level(pm, 0).timeout);
+            }
+            let udp_params = Arc::new(TuicUdpParams {
+                server_addr: s.server_addr,
+                server_name: s.server_name,
+                uuid: s.uuid,
+                password: s.password,
                 rustls_config,
                 options,
-            );
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
+            });
+            let dispatch = TuicUdpDispatch {
+                tag: ob.tag.clone(),
+                tcp: Arc::clone(&tcp_bridge),
+                params: udp_params,
+            };
+            let handler = Arc::new(dispatch) as Arc<dyn DispatchHandler>;
+            let bridge_ref = if proxy_chain_tag.is_some() { Some(tcp_bridge) } else { None };
+            Ok((handler, bridge_ref, proxy_chain_tag))
         }
         "wireguard" => {
             let config = parse_wireguard_config(&ob.entry.data)?;
@@ -895,7 +926,11 @@ impl MuxBridge {
     pub fn new(tag: impl Into<String>, concurrency: u32) -> (Self, UnderlyingSlot) {
         let strategy = ClientStrategy {
             max_concurrency: concurrency,
-            max_connection: 0,
+            // Go proxyman/outbound/handler.go:140,161 硬编码 MaxConnection=128：
+            // 累计连接达限后 is_closing → is_full → picker 另建 carrier（滚动
+            // 退役，存量会话排干后 monitor 回收旧 worker）。恒 0 会让单 carrier
+            // 累计会话无上限（bd 4uuo）。
+            max_connection: 128,
         };
         // 空槽构造：register Phase 2 拿到底层 handler 后 set_underlying。
         let slot: UnderlyingSlot = Arc::new(parking_lot::RwLock::new(None));
@@ -2175,6 +2210,214 @@ fn parse_hysteria_config(data: &[u8]) -> std::result::Result<(String, String, St
     Ok((format!("{address}:{port}"), auth.to_string(), server_name.to_string()))
 }
 
+// ============ TUIC UDP dispatch bridge（票 z9gp）============
+
+/// TUIC 全局 assoc_id 计数（spec：客户端为每个 UDP 关联任意分配 id）。
+static TUIC_ASSOC_ID: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(1);
+
+/// TUIC UDP relay 懒连接参数（TCP dial_fn 与 UDP 分支各自持连接；TUIC server
+/// 同端口多连接合法。ponytail: 与 TCP 共享连接池需重构 dial_fn 闭包捕获，
+/// UDP 场景占比低，暂独立）。
+struct TuicUdpParams {
+    server_addr: String,
+    server_name: String,
+    uuid: uuid::Uuid,
+    password: String,
+    rustls_config: Arc<rustls::ClientConfig>,
+    options: xray_proxy_tuic::TuicConnectOptions,
+}
+
+/// TUIC 出站 dispatch bridge：TCP 走 DialBridge，UDP 从 link 读 XUDP 帧 →
+/// [`xray_proxy_tuic::TuicUdpAssoc`] → 响应装 XUDP 帧写回（对应 Go tuic
+/// outbound 的 UDP relay；此此前 UDP 分派被 DialBridge 当 TCP 载荷静默发出）。
+struct TuicUdpDispatch {
+    tag: String,
+    tcp: Arc<DialBridge>,
+    params: Arc<TuicUdpParams>,
+}
+
+impl std::fmt::Debug for TuicUdpDispatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TuicUdpDispatch").field("tag", &self.tag).finish_non_exhaustive()
+    }
+}
+impl DispatchHandler for TuicUdpDispatch {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    fn dispatch(
+        &self,
+        dest: &Destination,
+        link: Link,
+    ) -> PinFuture<()> {
+        if dest.network() == xray_common::net::network::Network::UDP {
+            let params = Arc::clone(&self.params);
+            let tag = self.tag.clone();
+            let dest = dest.clone();
+            Box::pin(async move {
+                if let Err(e) = pump_tuic_udp(dest, link, params).await {
+                    tracing::warn!(tag = %tag, "tuic udp relay ended: {e}");
+                }
+            })
+        } else {
+            self.tcp.dispatch(dest, link)
+        }
+    }
+}
+
+/// TUIC UDP relay 主循环：lazy 连接 → dial_udp → XUDP 帧 ↔ TuicUdpAssoc。
+///
+/// TUIC UDP 是请求-响应语义（每包等回包，spec 响应 addr = 请求目标），
+/// 逐帧串行转发即可（DNS 类一问一答为主；多目标靠帧内 per-packet 地址）。
+async fn pump_tuic_udp(
+    dest: Destination,
+    link: Link,
+    params: Arc<TuicUdpParams>,
+) -> std::result::Result<(), String> {
+    use xray_xudp::packet::{PacketError, PacketReader, PacketWriter};
+
+    let client = xray_proxy_tuic::TuicClient::connect_with(
+        params.server_addr.as_str(),
+        &params.server_name,
+        params.uuid,
+        &params.password,
+        Arc::clone(&params.rustls_config),
+        params.options.clone(),
+        xray_proxy_tuic::QuinnConnectionPool::new(),
+    )
+    .await
+    .map_err(|e| format!("tuic udp connect: {e}"))?;
+    let client = Arc::new(client);
+    client.start_heartbeat(params.options.heartbeat);
+    let assoc = client.dial_udp(TUIC_ASSOC_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let mode = params.options.udp_relay_mode;
+
+    let Link { mut reader, mut writer } = link;
+    let default_addr = xray_proxy_tuic::dispatcher::dest_to_tuic_address(&dest)
+        .map_err(|e| format!("tuic udp dest: {e}"))?;
+    let global_id: [u8; 8] = rand::random();
+    let mut accum: Vec<u8> = Vec::new();
+    loop {
+        // 尽量消费 accum 里的完整 XUDP 帧
+        let mut made_progress = true;
+        while made_progress {
+            made_progress = match tuic_frame_relay(
+                &assoc, mode, &mut accum, &default_addr, &global_id, &mut writer,
+            )
+            .await
+            {
+                Ok(made) => made,
+                Err(e) => {
+                    tracing::debug!("tuic udp frame relay: {e}");
+                    return Ok(());
+                }
+            };
+        }
+        match reader.read_multi_buffer().await {
+            Ok(mb) => {
+                if mb.is_empty() {
+                    return Ok(()); // link EOF
+                }
+                accum.extend_from_slice(&mb.to_vec());
+                if accum.len() > 2 * 1024 * 1024 {
+                    return Err("tuic udp accum exceeded 2MiB".to_string());
+                }
+            }
+            Err(_) => return Ok(()),
+        }
+    }
+}
+
+/// 从 accum 前端解析一个 XUDP 帧 → TuicUdpAssoc 发送 → 响应装 XUDP 帧写回。
+///
+/// 返回 `true` 表示消费了一帧；accum 为空或帧不完整返回 `false`；
+/// 致命错误返回 `Err`。响应帧来源 = 请求目标（TUIC spec：server 回包
+/// addr 与请求目标一致）。
+#[allow(clippy::too_many_arguments)]
+async fn tuic_frame_relay(
+    assoc: &xray_proxy_tuic::TuicUdpAssoc,
+    mode: xray_proxy_tuic::UdpRelayMode,
+    accum: &mut Vec<u8>,
+    default_addr: &xray_proxy_tuic::Address,
+    global_id: &[u8; 8],
+    writer: &mut Box<dyn xray_buf::io::Writer>,
+) -> std::io::Result<bool> {
+    use xray_xudp::packet::{PacketError, PacketReader, PacketWriter};
+
+    if accum.is_empty() {
+        return Ok(false);
+    }
+    let (result, consumed) = {
+        let mut cursor = std::io::Cursor::new(&accum[..]);
+        let mut pr = PacketReader::new(&mut cursor);
+        (pr.read_packet(), cursor.position() as usize)
+    };
+    match result {
+        Ok(Some(pkt)) => {
+            accum.drain(..consumed);
+            let (data, udp_target) = pkt.into_parts();
+            let addr = match udp_target.as_ref() {
+                Some(d) => xray_proxy_tuic::dispatcher::dest_to_tuic_address(d)
+                    .map_err(std::io::Error::other)?,
+                None => default_addr.clone(),
+            };
+            let resp = match mode {
+                xray_proxy_tuic::UdpRelayMode::Native => {
+                    assoc.send_recv_native(addr.clone(), &data, None).await
+                }
+                xray_proxy_tuic::UdpRelayMode::Quic => {
+                    assoc.send_recv(addr.clone(), &data, None).await
+                }
+            }
+            .map_err(|e| std::io::Error::other(format!("tuic udp send_recv: {e}")))?;
+            // 响应帧来源 = 请求目标（dest 若被域名帧改写则用帧内目标）
+            let source = match udp_target {
+                Some(d) => d,
+                None => match default_addr {
+                    xray_proxy_tuic::Address::Ipv4(ip, port) => Destination::udp(
+                        xray_common::net::address::Address::IPv4(*ip),
+                        Port::new(*port),
+                    ),
+                    xray_proxy_tuic::Address::Ipv6(ip, port) => Destination::udp(
+                        xray_common::net::address::Address::IPv6(*ip),
+                        Port::new(*port),
+                    ),
+                    xray_proxy_tuic::Address::Domain(d, port) => Destination::udp(
+                        xray_common::net::address::Address::Domain(d.clone()),
+                        Port::new(*port),
+                    ),
+                    xray_proxy_tuic::Address::None => dest_default_udp(),
+                },
+            };
+            let mut frame = Vec::with_capacity(resp.len() + 64);
+            let mut pw = PacketWriter::new(&mut frame, source, *global_id);
+            pw.write_packet(&resp)
+                .map_err(std::io::Error::other)?;
+            drop(pw);
+            let mb = xray_buf::multi::MultiBuffer::from_buffer(
+                xray_buf::buffer::Buffer::from_vec(frame),
+            );
+            writer
+                .write_multi_buffer(mb)
+                .await
+                .map_err(std::io::Error::other)?;
+            Ok(true)
+        }
+        Ok(None) => Ok(false),
+        Err(PacketError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(PacketError::MetadataTooShort(_)) => Ok(false),
+        Err(e) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
+    }
+}
+
+fn dest_default_udp() -> Destination {
+    Destination::udp(
+        xray_common::net::address::Address::IPv4(std::net::Ipv4Addr::UNSPECIFIED),
+        Port::new(0),
+    )
+}
+
 /// tuic outbound 解析结果（官方 tuic-client relay 配置子集，bd 7p0）。
 ///
 /// 字段与默认值对齐 Itsusinn/tuic（官方 TUIC 实现后继）client config.rs。
@@ -2245,7 +2488,19 @@ fn parse_tuic_config(data: &[u8]) -> std::result::Result<TuicOutboundSettings, S
         .ok_or_else(|| format!(
             "invalid tuic udp_relay_mode: {udp_mode_name} (valid: native, quic)"
         ))?;
-    let heartbeat_secs = first.get("heartbeat").and_then(|v| v.as_u64()).unwrap_or(3);
+    // 票 ieik④：官方 heartbeat 是 Go duration 串（"3s"/"500ms"）；数字 = 秒
+    //（本仓方言兼容）。串解析失败显式报错而非静默回落 3s。
+    let heartbeat = match first.get("heartbeat") {
+        Some(serde_json::Value::String(s)) => {
+            crate::wiring::parse_go_duration_str(s)
+                .map(|ns| std::time::Duration::from_nanos(ns.max(0) as u64))
+                .ok_or_else(|| format!("invalid tuic heartbeat: {s}"))?
+        }
+        Some(v) if v.as_u64().is_some() => {
+            std::time::Duration::from_secs(v.as_u64().unwrap())
+        }
+        _ => std::time::Duration::from_secs(3),
+    };
     let insecure = first.get("insecure").and_then(|v| v.as_bool()).unwrap_or(false);
     let certificate = first.get("certificate").and_then(|v| v.as_str()).map(String::from);
     if let Some(fp) = first.get("fingerprint").and_then(|v| v.as_str()) {
@@ -2261,7 +2516,7 @@ fn parse_tuic_config(data: &[u8]) -> std::result::Result<TuicOutboundSettings, S
         alpn,
         reduce_rtt,
         udp_relay_mode,
-        heartbeat: std::time::Duration::from_secs(heartbeat_secs),
+        heartbeat,
         insecure,
         certificate,
     })
@@ -4741,5 +4996,116 @@ mod tests {
         .await;
         assert!(still_open.is_err(), "userLevel=0 default 300s must stay open in 3s window");
         task.abort();
+    }
+
+    /// 票 z9gp：tuic 出站 UDP dispatch（XUDP 帧 → TuicUdpAssoc → mock server
+    /// → UDP echo → 响应 XUDP 帧回 link）。修复前 UDP 分派被 DialBridge 当
+    /// TCP 载荷静默发出、响应永不回流。
+    #[tokio::test]
+    async fn tuic_udp_dispatch_relays_xudp_frames() {
+        use xray_buf::io::{Reader as _, Writer as _};
+        use xray_xudp::packet::{PacketReader, PacketWriter};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // 1. mock tuic server（客户端 insecure，免 trust store）
+        let uuid = uuid::Uuid::new_v4();
+        let (server, _cert) = xray_proxy_tuic::TuicMockServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            "localhost",
+            uuid,
+            "udp-e2e".to_string(),
+        )
+        .await
+        .expect("mock server bind");
+        let server_addr = server.local_addr();
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+
+        // 2. 真实目标 UDP echo
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let Ok((n, peer)) = echo.recv_from(&mut buf).await else {
+                    break;
+                };
+                if echo.send_to(&buf[..n], peer).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // 3. tuic outbound handler
+        let settings = format!(
+            r#"{{"servers":[{{"address":"{ip}","port":{port},"uuid":"{uuid}","password":"udp-e2e","insecure":true}}]}}"#,
+            ip = server_addr.ip(),
+            port = server_addr.port(),
+        );
+        let (handler, _, _) = try_build_handler(
+            &make_outbound("tuic", "tuic-udp", &settings),
+            None,
+            &mut Vec::new(),
+            None,
+            &std::collections::HashMap::new(),
+            None,
+        )
+        .expect("build tuic outbound");
+
+        // 4. UDP dispatch：link 双管道，XUDP 帧进 → 响应帧出
+        let echo_v4 = match echo_addr.ip() {
+            std::net::IpAddr::V4(v4) => v4,
+            std::net::IpAddr::V6(_) => panic!("expected v4 echo addr"),
+        };
+        let dest = Destination::udp(Address::IPv4(echo_v4), Port::new(echo_addr.port()));
+        let (up_r, mut up_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let (mut dn_r, dn_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let fut = handler.dispatch(
+            &dest,
+            Link::new(
+                Box::new(up_r) as Box<dyn xray_buf::io::Reader>,
+                Box::new(dn_w) as Box<dyn xray_buf::io::Writer>,
+            ),
+        );
+        tokio::spawn(fut);
+
+        // 5. 写 XUDP 请求帧
+        let mut frame = Vec::new();
+        {
+            let mut pw = PacketWriter::new(&mut frame, dest.clone(), [7u8; 8]);
+            pw.write_packet(b"tuic-udp-e2e").unwrap();
+        }
+        let mut mb = xray_buf::multi::MultiBuffer::new();
+        mb.push(xray_buf::buffer::Buffer::from_vec(frame));
+        up_w.write_multi_buffer(mb).await.unwrap();
+
+        // 6. 读响应帧（tuic server → UDP echo 回流）
+        let mut resp_bytes = Vec::new();
+        for _ in 0..100 {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                dn_r.read_multi_buffer(),
+            )
+            .await
+            {
+                Ok(Ok(mb2)) if !mb2.is_empty() => {
+                    resp_bytes.extend_from_slice(&mb2.to_vec());
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(e)) => panic!("read resp: {e}"),
+                Err(_) => continue,
+            }
+        }
+        assert!(!resp_bytes.is_empty(), "no udp response within timeout");
+        let mut cursor = std::io::Cursor::new(&resp_bytes[..]);
+        let mut pr = PacketReader::new(&mut cursor);
+        let pkt = pr
+            .read_packet()
+            .expect("parse resp xudp frame")
+            .expect("empty stream");
+        let (data, _src) = pkt.into_parts();
+        assert_eq!(data, b"tuic-udp-e2e");
     }
 }

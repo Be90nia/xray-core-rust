@@ -23,12 +23,14 @@ use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
 
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use uuid::Uuid;
 
 use crate::error::{Result, TuicError};
 use crate::protocol::address::Address;
 use crate::protocol::command::TOKEN_LEN;
+use crate::protocol::command::type_code;
+use crate::udp::UniRespRouter;
 
 /// 拥塞控制算法（官方 tuic-client `congestion_control`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -88,9 +90,9 @@ pub struct TuicConnectOptions {
     pub heartbeat: std::time::Duration,
     /// UDP relay 模式。
     ///
-    /// ponytail: outbound 生产路径 UDP 目前经 XUDP-over-TCP-relay 透明承载，
-    /// 本字段经解析校验后存储，供 [`crate::udp::TuicUdpAssoc`] 两种模式（native/quic）
-    /// 的调用方选择；独立 UDP 分支接入时生效。
+    /// 决定 [`TuicUdpAssoc::send_recv`]（quic uni-stream）与
+    /// [`TuicUdpAssoc::send_recv_native`]（QUIC DATAGRAM）哪个作为
+    /// dispatcher UDP 分支的承载方式。
     pub udp_relay_mode: UdpRelayMode,
 }
 
@@ -117,6 +119,8 @@ pub struct TuicClient {
     uuid: Uuid,
     /// 密码（认证用）。
     password: String,
+    /// quic 模式 UDP 响应路由（per-connection uni-stream pump）。
+    router: UniRespRouter,
 }
 
 /// TUIC TCP relay 流（双向，分两半）。
@@ -231,12 +235,17 @@ impl TuicClient {
 
         let multiplexed = MultiplexedConnection::new(pooled);
 
+        // quic 模式 UDP 响应 pump：server 每个响应新开 uni stream，
+        // 按 (assoc_id, pkt_id) 配对给等待中的请求（TUIC v5 SPEC uni-stream 模型）
+        let router = UniRespRouter::spawn(multiplexed.pooled.conn.clone());
+
         Ok(Self {
             multiplexed,
             pool,
             key,
             uuid,
             password: password.to_string(),
+            router,
         })
     }
 
@@ -264,14 +273,21 @@ impl TuicClient {
         ));
         let mut transport = quinn::TransportConfig::default();
         transport.datagram_receive_buffer_size(Some(8 * 1024));
-        // 拥塞控制：bbr → quinn BBR；cubic/new_reno → CUBIC（quinn 无内置 NewReno）
+        // 拥塞控制：bbr → quinn BBR；cubic → CUBIC；
+        // new_reno 显式降级 CUBIC（quinn 无内置 NewReno，不静默——票 ieik）
         match congestion_control {
             CongestionControl::Bbr => {
                 transport.congestion_controller_factory(Arc::new(
                     quinn_proto::congestion::BbrConfig::default(),
                 ));
             }
-            CongestionControl::Cubic | CongestionControl::NewReno => {
+            CongestionControl::Cubic => {
+                transport.congestion_controller_factory(Arc::new(
+                    quinn_proto::congestion::CubicConfig::default(),
+                ));
+            }
+            CongestionControl::NewReno => {
+                tracing::warn!("tuic: quinn has no NewReno, falling back to CUBIC");
                 transport.congestion_controller_factory(Arc::new(
                     quinn_proto::congestion::CubicConfig::default(),
                 ));
@@ -314,15 +330,13 @@ impl TuicClient {
         Ok(TuicConn { send, recv })
     }
 
-    /// 发送心跳（uni stream）。
+    /// 发送心跳（QUIC datagram——TUIC v5 SPEC：Heartbeat 经 datagram 承载，
+    /// 不占用 stream；mock server datagram 分支对非 PACKET 帧忽略）。
     pub async fn heartbeat(&self) -> Result<()> {
-        let mut uni = self.multiplexed.open_uni().await?;
-        let cmd = crate::protocol::Command::Heartbeat;
-        let mut buf = BytesMut::with_capacity(cmd.encoded_len());
-        cmd.write_to(&mut buf);
-        uni.write_all(&buf).await?;
-        let _ = uni.finish();
-        Ok(())
+        let mut buf = BytesMut::with_capacity(2);
+        buf.put_u8(crate::protocol::VERSION);
+        buf.put_u8(type_code::HEARTBEAT);
+        self.send_datagram(buf.freeze())
     }
 
     /// 启动周期心跳任务（bd eim）：TUIC v5 需要心跳维持 NAT 映射。
@@ -360,10 +374,15 @@ impl TuicClient {
     /// 分配 UDP 关联（assoc_id），返回 UDP relay 句柄。
     ///
     /// `assoc_id` 由调用方指定（客户端负责任意分配），同一关联内 UDP 包共用
-    /// 一个逻辑会话。后续调用 [`TuicUdpAssoc::send_recv`] 发送/接收 UDP 包。
+    /// 一个逻辑会话。后续调用 [`TuicUdpAssoc::send_recv`]（quic uni-stream 模式）
+    /// 或 [`TuicUdpAssoc::send_recv_native`]（native datagram 模式）收发 UDP 包。
     #[must_use]
     pub fn dial_udp(&self, assoc_id: u16) -> TuicUdpAssoc {
-        TuicUdpAssoc::new(self.multiplexed.pooled.conn.clone(), assoc_id)
+        TuicUdpAssoc::new(
+            self.multiplexed.pooled.conn.clone(),
+            assoc_id,
+            self.router.clone(),
+        )
     }
 
     /// 发送 QUIC DATAGRAM（native UDP 模式）。

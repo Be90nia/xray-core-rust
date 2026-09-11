@@ -10,8 +10,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Mutex;
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use parking_lot::RwLock;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -72,7 +77,11 @@ pub enum InboundConn {
 #[async_trait::async_trait]
 pub trait Worker: Send + Sync {
     /// 启动监听。
-    async fn start(&self) -> Result<(), ProxymanError>;
+    ///
+    /// 要求 `Arc<Self>`：accept/收包闭包须持有 worker 引用才能回调
+    /// `on_conn`/`on_packet`（对齐 Go `worker.go` 中 `tcpWorker.Start`
+    /// 直接访问 receiver 的形态；`&self` 无法安全升级为共享引用）。
+    async fn start(self: Arc<Self>) -> Result<(), ProxymanError>;
     /// 关闭监听。
     async fn close(&self) -> Result<(), ProxymanError>;
     /// 监听端口。
@@ -88,7 +97,12 @@ pub trait Worker: Send + Sync {
 #[allow(dead_code)] // uplink/downlink used by proxy implementations
 pub struct UdpSession {
     last_activity: AtomicI64,
-    writer: mpsc::Sender<Vec<u8>>,
+    /// 入方向（hub 收到的客户端包）。proxy 经 [`Self::recv`] 消费。
+    inbound_tx: mpsc::Sender<Vec<u8>>,
+    /// 入方向消费端；`Mutex` 为 `recv(&self)` 提供内部可变性。
+    inbound_rx: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
+    /// 出方向（proxy 回包）。worker 响应泵消费后 `hub.send_to(source)`。
+    outbound_tx: mpsc::Sender<Vec<u8>>,
     source: SocketAddr,
     local: SocketAddr,
     uplink: Option<Arc<dyn Counter>>,
@@ -97,17 +111,23 @@ pub struct UdpSession {
 }
 
 impl UdpSession {
-    /// 创建 UDP 会话，返回 `(Arc<Self>, Sender)`。
+    /// 创建 UDP 会话，返回 `(Arc<Self>, 出方向 Receiver)`。
     ///
-    /// 调用方保留 `Sender` 用于向 session 写入数据包（来自远端）。
-    /// `Reader` 留给 `ProxyInbound::process` 消费。
+    /// Go `udpConn` 双 channel 同构（worker.go）：
+    /// - 入方向：hub 收包 `push_inbound` 写入，proxy 经 `recv()` 消费；
+    /// - 出方向：proxy `write_packet` 写入，**返回的 Receiver** 由 worker
+    ///   响应泵消费后 `hub.send_to(source)` 回包（Go `for p := range conn.writing`）。
+    ///
+    /// 修复（audit ojcy）：旧实现 `(tx, _rx)` 将消费端随 new 返回即丢弃，
+    /// write_packet 恒失败且无人可达——收发端就此全断。
     pub fn new(
         source: SocketAddr,
         local: SocketAddr,
         uplink: Option<Arc<dyn Counter>>,
         downlink: Option<Arc<dyn Counter>>,
-    ) -> (Arc<Self>, mpsc::Sender<Vec<u8>>) {
-        let (tx, _rx) = mpsc::channel(256);
+    ) -> (Arc<Self>, mpsc::Receiver<Vec<u8>>) {
+        let (inbound_tx, inbound_rx) = mpsc::channel(256);
+        let (outbound_tx, outbound_rx) = mpsc::channel(256);
         let session = Arc::new(Self {
             last_activity: AtomicI64::new(
                 std::time::SystemTime::now()
@@ -115,14 +135,16 @@ impl UdpSession {
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0),
             ),
-            writer: tx.clone(),
+            inbound_tx,
+            inbound_rx: tokio::sync::Mutex::new(inbound_rx),
+            outbound_tx,
             source,
             local,
             uplink,
             downlink,
             inactive: AtomicBool::new(false),
         });
-        (session, tx)
+        (session, outbound_rx)
     }
 
     /// 更新最后活动时间戳。
@@ -159,16 +181,32 @@ impl UdpSession {
         self.local
     }
 
-    /// 向 session 写入数据包（来自远端响应）。
+    /// 入方向：hub 收到的客户端包入队（Go worker.go `conn.channel <- p`）。
     ///
-    /// channel 满时静默丢弃（与 Go `select { case c <- payload: default: }` 一致）。
-    pub fn write_packet(&self, data: Vec<u8>) {
+    /// channel 满时丢弃（与 Go `select { case c <- payload: default: }` 一致）。
+    pub fn push_inbound(&self, data: Vec<u8>) {
         if self.inactive.load(Ordering::Relaxed) {
             return;
         }
-        if self.writer.try_send(data).is_err() {
-            // ponytail: channel 满时丢弃，与 Go 行为一致
+        // ponytail: channel 满时丢弃，与 Go 行为一致
+        let _ = self.inbound_tx.try_send(data);
+    }
+
+    /// proxy 消费客户端包（Go `udpConn.Read`：`p := <-c.channel`）。
+    ///
+    /// 返回 `None` = 会话已关闭（所有入方向发送端丢弃）。
+    pub async fn recv(&self) -> Option<Vec<u8>> {
+        self.inbound_rx.lock().await.recv().await
+    }
+
+    /// 出方向：proxy 回包（Go `udpConn.Write`：`c.writing <- p`，阻塞语义）。
+    ///
+    /// 包由 worker 响应泵消费后经 `hub.send_to` 发回客户端。
+    pub async fn write_packet(&self, data: Vec<u8>) {
+        if self.inactive.load(Ordering::Relaxed) {
+            return;
         }
+        let _ = self.outbound_tx.send(data).await;
     }
 }
 
@@ -242,8 +280,19 @@ impl TcpWorker {
     }
 
     fn on_conn(self: &Arc<Self>, conn: Box<dyn Connection>) {
+        self.spawn_conn(conn, DEFAULT_CONN_IDLE_TIMEOUT);
+    }
+
+    /// 启动单连接处理。`idle_timeout` 为测试缝（生产取 policy 默认值）。
+    ///
+    /// 返回 JoinHandle 供测试等待连接任务结束；`on_conn` 生产路径丢弃之。
+    fn spawn_conn(
+        self: &Arc<Self>,
+        conn: Box<dyn Connection>,
+        idle_timeout: Duration,
+    ) -> tokio::task::JoinHandle<()> {
         if self.closed.load(Ordering::SeqCst) {
-            return;
+            return tokio::spawn(async {});
         }
 
         let tag = self.tag.clone();
@@ -268,19 +317,27 @@ impl TcpWorker {
                 Outbound::new().with_destination_override(gateway),
             );
 
-        // 创建不活动超时计时器（对应 Go CancelAfterInactivity）
-        // ActivityTimer::run 消费 &mut self，需 spawn 到独立 task，
-        // 主 task 通过 Done 信号检测超时。
-        let mut activity_timer = ActivityTimer::new(DEFAULT_CONN_IDLE_TIMEOUT);
-        let mut done_signal = activity_timer.done();
+        // 不活动计时器（Go CancelAfterInactivity）：Arc 共享——run 循环 task
+        // 与 IO 装饰器同时持引用，读写路径经装饰器持续 update_activity。
+        // （audit 95ar：旧实现 timer 为局部值，全文件无 update_activity 调用，
+        // 滑动窗口退化为固定总寿命——满速下载 300s 即被杀。）
+        let activity_timer = Arc::new(ActivityTimer::new(idle_timeout));
+        let mut done_signal = activity_timer.done_signal();
 
-        // spawn 计时器循环，超时后自动 cancel Done 信号
+        let timer_loop = Arc::clone(&activity_timer);
         tokio::spawn(async move {
-            activity_timer.run().await;
+            timer_loop.run().await;
+        });
+
+        // IO 活动装饰器：每次读/写就绪即重置空闲窗口（Go 代理 IO 循环 Update）。
+        // proxy 是黑盒 trait，活动信号在 Connection 层拦截——有 IO 即有活动。
+        let tracked: Box<dyn Connection> = Box::new(ActivityTrackingConn {
+            inner: conn,
+            timer: activity_timer,
         });
 
         tokio::spawn(async move {
-            let inbound_conn = InboundConn::Tcp(conn);
+            let inbound_conn = InboundConn::Tcp(tracked);
             tokio::select! {
                 result = proxy.process(Network::TCP, inbound_conn, session, dispatcher) => {
                     if let Err(e) = result {
@@ -290,49 +347,90 @@ impl TcpWorker {
                 }
                 _ = done_signal.wait() => {
                     // 不活动超时，连接被半关闭
-                    warn!(tag = %tag, timeout = ?DEFAULT_CONN_IDLE_TIMEOUT, "connection cancelled after inactivity");
+                    warn!(tag = %tag, timeout = ?idle_timeout, "connection cancelled after inactivity");
                 }
             }
-        });
+        })
+    }
+}
+
+/// IO 活动感知连接装饰器（audit 95ar）。
+///
+/// 委托内部连接并在每次读/写就绪时调用 `timer.update_activity()`，
+/// 对齐 Go `CancelAfterInactivity` + IO 路径持续 `Update` 的滑动窗口语义。
+struct ActivityTrackingConn {
+    inner: Box<dyn Connection>,
+    timer: Arc<ActivityTimer>,
+}
+
+impl AsyncRead for ActivityTrackingConn {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let res = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = res {
+            if !buf.filled().is_empty() {
+                this.timer.update_activity();
+            }
+        }
+        res
+    }
+}
+
+impl AsyncWrite for ActivityTrackingConn {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let res = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if res.is_ready() {
+            this.timer.update_activity();
+        }
+        res
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
+}
+
+impl Connection for ActivityTrackingConn {
+    fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+        self.inner.remote_addr()
+    }
+
+    fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+        self.inner.local_addr()
+    }
+
+    fn close_read(&mut self) -> io::Result<()> {
+        self.inner.close_read()
+    }
+
+    fn close_write(&mut self) -> io::Result<()> {
+        self.inner.close_write()
+    }
+
+    fn raw_tcp_clone(&self) -> Option<tokio::net::TcpStream> {
+        self.inner.raw_tcp_clone()
     }
 }
 
 #[async_trait::async_trait]
 impl Worker for TcpWorker {
-    async fn start(&self) -> Result<(), ProxymanError> {
-        // TcpWorker 必须通过 Arc<Self> 使用，以便 ConnHandler 闭包持有 Arc 引用。
-        // 此处通过 Arc<Self> 的弱引用避免循环：listener 持有 Weak<TcpWorker>，
-        // TcpWorker 持有 listener。close() 先 take listener，打破循环。
-        unreachable!("TcpWorker::start requires Arc<Self>, use start_arc()")
-    }
-
-    async fn close(&self) -> Result<(), ProxymanError> {
-        self.closed.store(true, Ordering::SeqCst);
-        self.close_notify.notify_waiters();
-
-        let listener = self
-            .listener
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-
-        if let Some(l) = listener {
-            l.close().map_err(|e| ProxymanError::CloseAllFailed(e.to_string()))?;
-        }
-
-        info!(tag = %self.tag, "TCP worker closed");
-        Ok(())
-    }
-
-    fn port(&self) -> u16 {
-        self.port
-    }
-}
-
-impl TcpWorker {
-    /// 启动 TCP 监听。要求 `Arc<Self>` 以便闭包持有引用。
-    pub async fn start_arc(self: &Arc<Self>) -> Result<(), ProxymanError> {
-        let this = Arc::clone(self);
+    async fn start(self: Arc<Self>) -> Result<(), ProxymanError> {
+        let this = Arc::clone(&self);
         let handler: ConnHandler = Arc::new(move |conn| {
             this.on_conn(conn);
         });
@@ -367,7 +465,30 @@ impl TcpWorker {
 
         Ok(())
     }
+
+    async fn close(&self) -> Result<(), ProxymanError> {
+        self.closed.store(true, Ordering::SeqCst);
+        self.close_notify.notify_waiters();
+
+        let listener = self
+            .listener
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+
+        if let Some(l) = listener {
+            l.close().map_err(|e| ProxymanError::CloseAllFailed(e.to_string()))?;
+        }
+
+        info!(tag = %self.tag, "TCP worker closed");
+        Ok(())
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
 }
+
 
 // ===== UdpWorker =====
 
@@ -386,7 +507,7 @@ pub struct UdpWorker {
     sniffing_request: SniffingRequest,
     uplink_counter: Option<Arc<dyn Counter>>,
     downlink_counter: Option<Arc<dyn Counter>>,
-    hub: Mutex<Option<UdpHub>>,
+    hub: Mutex<Option<Arc<UdpHub>>>,
     active_sessions: RwLock<HashMap<SocketAddr, Arc<UdpSession>>>,
     close_notify: Arc<Notify>,
     closed: AtomicBool,
@@ -447,30 +568,29 @@ impl UdpWorker {
 
         let source = packet.source;
 
-        // 查找已有 session
-        let sessions = self.active_sessions.read();
-        let existing = sessions.get(&source);
-        if let Some(session) = existing {
+        // 查找已有 session：入方向包入队（Go `conn.channel <- p`）
+        if let Some(session) = self.active_sessions.read().get(&source).cloned() {
             session.update_activity();
-            session.write_packet(packet.payload.clone());
+            session.push_inbound(packet.payload.clone());
             return;
         }
-        drop(sessions);
 
-        // 创建新 session
-        let local = local_addr;
-        let (session, _sender) = UdpSession::new(
+        // 创建新 session；outbound_rx 交给响应泵（audit ojcy：旧实现
+        // `_sender`/`_rx` 双双丢弃，收发两端全断，包进 channel 即消亡）。
+        let (session, outbound_rx) = UdpSession::new(
             source,
-            local,
+            local_addr,
             self.uplink_counter.clone(),
             self.downlink_counter.clone(),
         );
 
         // 写入首包
-        session.write_packet(packet.payload.clone());
+        session.push_inbound(packet.payload.clone());
 
         // 注册 session
-        self.active_sessions.write().insert(source, session.clone());
+        self.active_sessions
+            .write()
+            .insert(source, Arc::clone(&session));
 
         // spawn proxy.process()
         let tag = self.tag.clone();
@@ -495,12 +615,45 @@ impl UdpWorker {
                 Outbound::new().with_destination_override(gateway),
             );
 
+        let pump_session = Arc::clone(&session);
         tokio::spawn(async move {
             let inbound_conn = InboundConn::Udp(session);
             if let Err(e) = proxy.process(Network::UDP, inbound_conn, session_ctx, dispatcher).await {
                 warn!(tag = %tag, error = %e, "UDP proxy process failed");
             }
         });
+
+        // 响应泵（Go worker.go `for p := range conn.writing { hub.WriteTo }`）：
+        // proxy write_packet → 本循环 → hub.send_to(session.source) 回客户端。
+        let hub = self
+            .hub
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(Arc::clone);
+        if let Some(hub) = hub {
+            let close_notify = Arc::clone(&self.close_notify);
+            tokio::spawn(async move {
+                let mut outbound_rx = outbound_rx;
+                loop {
+                    tokio::select! {
+                        resp = outbound_rx.recv() => {
+                            match resp {
+                                Some(data) => {
+                                    if let Err(e) = hub.send_to(&data, pump_session.source()).await {
+                                        warn!(error = %e, "UDP hub send_to failed");
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
+                        _ = close_notify.notified() => {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
     }
 
     /// 清理空闲超过 policy timeout 的 UDP session。
@@ -531,8 +684,74 @@ impl UdpWorker {
 
 #[async_trait::async_trait]
 impl Worker for UdpWorker {
-    async fn start(&self) -> Result<(), ProxymanError> {
-        unreachable!("UdpWorker::start requires Arc<Self>, use start_arc()")
+    async fn start(self: Arc<Self>) -> Result<(), ProxymanError> {
+        let options: Vec<Box<dyn HubOption>> = vec![Box::new(Capacity(256))];
+        let hub = UdpHub::listen(self.address, &options, None)
+            .await
+            .map_err(|e| ProxymanError::ListenSocketFailed(e.to_string()))?;
+
+        let actual_port = hub
+            .local_addr()
+            .map(|a| a.port())
+            .unwrap_or(self.port);
+
+        info!(
+            tag = %self.tag,
+            address = %self.address,
+            port = actual_port,
+            "UDP worker started"
+        );
+
+        // split：收包 rx 由本 worker 消费，共享发送端（send_to/close/local_addr）
+        // 留在 Arc<UdpHub>——audit ojcy：旧实现 receive() 消费 hub 后 worker 不再
+        // 持有任何发送端，hub.WriteTo 回包通道不可达。
+        let (mut rx, hub) = hub.split();
+        let local_addr = hub.local_addr().unwrap_or(self.address);
+        *self.hub.lock().unwrap_or_else(|e| e.into_inner()) = Some(hub);
+
+        // Spawn recv loop
+        let close_notify = Arc::clone(&self.close_notify);
+        let this = Arc::clone(&self);
+
+        let recv_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    packet = rx.recv() => {
+                        match packet {
+                            Some(p) => {
+                                this.on_packet(&p, local_addr);
+                            }
+                            None => break,
+                        }
+                    }
+                    _ = close_notify.notified() => {
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Spawn cleanup task (every 60s)
+        let close_notify2 = Arc::clone(&self.close_notify);
+        let this2 = Arc::clone(&self);
+        let cleanup_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        this2.cleanup_inactive();
+                    }
+                    _ = close_notify2.notified() => {
+                        break;
+                    }
+                }
+            }
+        });
+
+        *self.recv_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(recv_handle);
+        *self.cleanup_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(cleanup_handle);
+
+        Ok(())
     }
 
     async fn close(&self) -> Result<(), ProxymanError> {
@@ -583,77 +802,6 @@ impl Worker for UdpWorker {
     }
 }
 
-impl UdpWorker {
-    /// 启动 UDP 监听。要求 `Arc<Self>` 以便闭包持有引用。
-    pub async fn start_arc(self: &Arc<Self>) -> Result<(), ProxymanError> {
-        let options: Vec<Box<dyn HubOption>> = vec![Box::new(Capacity(256))];
-        let hub = UdpHub::listen(self.address, &options, None)
-            .await
-            .map_err(|e| ProxymanError::ListenSocketFailed(e.to_string()))?;
-
-        let actual_port = hub
-            .local_addr()
-            .map(|a| a.port())
-            .unwrap_or(self.port);
-
-        info!(
-            tag = %self.tag,
-            address = %self.address,
-            port = actual_port,
-            "UDP worker started"
-        );
-
-        // UdpHub::receive() consumes self. Cache local_addr before calling receive().
-        let local_addr = hub.local_addr().unwrap_or(self.address);
-        let mut rx = hub.receive();
-        // Hub is consumed by receive(); store None (close() will abort recv_handle instead).
-        *self.hub.lock().unwrap_or_else(|e| e.into_inner()) = None;
-
-        // Spawn recv loop
-        let close_notify = Arc::clone(&self.close_notify);
-        let this = Arc::clone(self);
-
-        let recv_handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    packet = rx.recv() => {
-                        match packet {
-                            Some(p) => {
-                                this.on_packet(&p, local_addr);
-                            }
-                            None => break,
-                        }
-                    }
-                    _ = close_notify.notified() => {
-                        break;
-                    }
-                }
-            }
-        });
-
-        // Spawn cleanup task (every 60s)
-        let close_notify2 = Arc::clone(&self.close_notify);
-        let this2 = Arc::clone(self);
-        let cleanup_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        this2.cleanup_inactive();
-                    }
-                    _ = close_notify2.notified() => {
-                        break;
-                    }
-                }
-            }
-        });
-
-        *self.recv_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(recv_handle);
-        *self.cleanup_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(cleanup_handle);
-
-        Ok(())
-    }
-}
 
 // ===== DsWorker =====
 
@@ -686,7 +834,7 @@ impl DsWorker {
 
 #[async_trait::async_trait]
 impl Worker for DsWorker {
-    async fn start(&self) -> Result<(), ProxymanError> {
+    async fn start(self: Arc<Self>) -> Result<(), ProxymanError> {
         // ponytail: Unix domain socket not yet supported, stub
         Err(ProxymanError::ListenSocketFailed(
             "Unix domain socket not yet supported".to_string(),
@@ -705,6 +853,8 @@ impl Worker for DsWorker {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
 
     struct NoopProxy;
@@ -831,7 +981,7 @@ mod tests {
     #[tokio::test]
     async fn ds_worker_start_returns_error() {
         let worker = DsWorker::new("unix-in");
-        let result = worker.start().await;
+        let result = Arc::new(worker).start().await;
         assert!(result.is_err());
         match result {
             Err(ProxymanError::ListenSocketFailed(msg)) => {
@@ -853,7 +1003,7 @@ mod tests {
     fn udp_session_new_and_accessors() {
         let source: SocketAddr = "192.168.1.1:12345".parse().unwrap();
         let local: SocketAddr = "10.0.0.1:1080".parse().unwrap();
-        let (session, _tx) = UdpSession::new(source, local, None, None);
+        let (session, _out_rx) = UdpSession::new(source, local, None, None);
 
         assert_eq!(session.source(), source);
         assert_eq!(session.local(), local);
@@ -865,7 +1015,7 @@ mod tests {
     fn udp_session_inactive_transition() {
         let source: SocketAddr = "192.168.1.1:12345".parse().unwrap();
         let local: SocketAddr = "10.0.0.1:1080".parse().unwrap();
-        let (session, _tx) = UdpSession::new(source, local, None, None);
+        let (session, _out_rx) = UdpSession::new(source, local, None, None);
 
         assert!(!session.is_inactive());
         session.set_inactive();
@@ -876,7 +1026,7 @@ mod tests {
     fn udp_session_update_activity() {
         let source: SocketAddr = "192.168.1.1:12345".parse().unwrap();
         let local: SocketAddr = "10.0.0.1:1080".parse().unwrap();
-        let (session, _tx) = UdpSession::new(source, local, None, None);
+        let (session, _out_rx) = UdpSession::new(source, local, None, None);
 
         let before = session.last_activity_secs();
         session.update_activity();
@@ -884,25 +1034,43 @@ mod tests {
         assert!(after >= before);
     }
 
-    #[test]
-    fn udp_session_write_packet_active() {
+    /// 入方向：push_inbound 写入的包经 recv 可达消费端（audit ojcy）。
+    #[tokio::test]
+    async fn udp_session_inbound_reaches_consumer() {
         let source: SocketAddr = "192.168.1.1:12345".parse().unwrap();
         let local: SocketAddr = "10.0.0.1:1080".parse().unwrap();
-        let (session, _tx) = UdpSession::new(source, local, None, None);
+        let (session, _out_rx) = UdpSession::new(source, local, None, None);
 
-        // Should not panic when active
-        session.write_packet(vec![1, 2, 3]);
+        session.push_inbound(vec![1, 2, 3]);
+        assert_eq!(session.recv().await.as_deref(), Some(&[1, 2, 3][..]));
     }
 
-    #[test]
-    fn udp_session_write_packet_inactive_drops() {
+    /// 出方向：write_packet 写入的包经返回的 Receiver 可达（响应泵消费端）。
+    #[tokio::test]
+    async fn udp_session_outbound_reaches_receiver() {
         let source: SocketAddr = "192.168.1.1:12345".parse().unwrap();
         let local: SocketAddr = "10.0.0.1:1080".parse().unwrap();
-        let (session, _tx) = UdpSession::new(source, local, None, None);
+        let (session, mut out_rx) = UdpSession::new(source, local, None, None);
+
+        session.write_packet(vec![4, 5]).await;
+        assert_eq!(out_rx.recv().await.as_deref(), Some(&[4, 5][..]));
+    }
+
+    /// inactive 会话丢弃双向包（channel 中不应出现数据）。
+    #[tokio::test]
+    async fn udp_session_inactive_drops_packets() {
+        let source: SocketAddr = "192.168.1.1:12345".parse().unwrap();
+        let local: SocketAddr = "10.0.0.1:1080".parse().unwrap();
+        let (session, mut out_rx) = UdpSession::new(source, local, None, None);
 
         session.set_inactive();
-        // Should silently drop when inactive
-        session.write_packet(vec![1, 2, 3]);
+        session.push_inbound(vec![1]);
+        session.write_packet(vec![2]).await;
+
+        let in_got = tokio::time::timeout(Duration::from_millis(50), session.recv()).await;
+        let out_got = tokio::time::timeout(Duration::from_millis(50), out_rx.recv()).await;
+        assert!(in_got.is_err(), "inactive session must drop inbound packets");
+        assert!(out_got.is_err(), "inactive session must drop outbound packets");
     }
 
     #[test]
@@ -913,5 +1081,326 @@ mod tests {
         let (udp_session, _) = UdpSession::new(source, local, None, None);
         let _udp_conn = InboundConn::Udp(udp_session);
         // Tcp variant requires a real Connection impl, skip in unit test
+    }
+
+    // ===== 集成测试桩 =====
+
+    /// 最小 Connection 桩：包装 duplex 流（tests 专用）。
+    struct DuplexConn(tokio::io::DuplexStream);
+
+    impl AsyncRead for DuplexConn {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            Pin::new(&mut this.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for DuplexConn {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            Pin::new(&mut this.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            Pin::new(&mut this.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            Pin::new(&mut this.0).poll_shutdown(cx)
+        }
+    }
+
+    impl Connection for DuplexConn {
+        fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+            Ok(None)
+        }
+
+        fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+            Ok(None)
+        }
+    }
+
+    /// TCP 命中计数 proxy（audit 79ma：accept 打穿即 +1）。
+    struct HitProxy {
+        hits: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProxyInbound for HitProxy {
+        async fn process(
+            &self,
+            _network: Network,
+            _conn: InboundConn,
+            _session: Session,
+            _dispatcher: Arc<dyn Dispatcher>,
+        ) -> Result<(), ProxymanError> {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// UDP 回声 proxy：读首包 → 转发给测试断言 → write_packet 回 pong
+    /// （audit ojcy：入方向 recv + 出方向 write_packet 双路径打穿）。
+    struct UdpEchoProxy {
+        got: mpsc::Sender<Vec<u8>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProxyInbound for UdpEchoProxy {
+        async fn process(
+            &self,
+            network: Network,
+            conn: InboundConn,
+            _session: Session,
+            _dispatcher: Arc<dyn Dispatcher>,
+        ) -> Result<(), ProxymanError> {
+            if let (Network::UDP, InboundConn::Udp(s)) = (network, conn) {
+                if let Some(data) = s.recv().await {
+                    let _ = self.got.send(data).await;
+                    s.write_packet(b"pong".to_vec()).await;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// 挂起 proxy：通知 started 后永挂（idle 超时经 select 丢弃该 future）。
+    struct HangingProxy {
+        started: mpsc::Sender<()>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProxyInbound for HangingProxy {
+        async fn process(
+            &self,
+            _network: Network,
+            _conn: InboundConn,
+            _session: Session,
+            _dispatcher: Arc<dyn Dispatcher>,
+        ) -> Result<(), ProxymanError> {
+            let _ = self.started.send(()).await;
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    /// 持续读写的 proxy（echo 循环）——audit 95ar 正向：活跃连接不被杀。
+    struct EchoIoProxy;
+
+    #[async_trait::async_trait]
+    impl ProxyInbound for EchoIoProxy {
+        async fn process(
+            &self,
+            network: Network,
+            conn: InboundConn,
+            _session: Session,
+            _dispatcher: Arc<dyn Dispatcher>,
+        ) -> Result<(), ProxymanError> {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let (Network::TCP, InboundConn::Tcp(mut c)) = (network, conn) {
+                let mut buf = [0u8; 64];
+                while let Ok(n) = c.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    if c.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn tcp_worker_for_test(
+        proxy: Arc<dyn ProxyInbound>,
+        tag: &str,
+    ) -> Arc<TcpWorker> {
+        Arc::new(TcpWorker::new(
+            "127.0.0.1:0".parse().unwrap(),
+            0,
+            proxy,
+            StreamSettings::tcp(),
+            SocketOptions::default(),
+            false,
+            tag,
+            make_dispatcher(),
+            SniffingRequest::default(),
+            None,
+            None,
+        ))
+    }
+
+    fn udp_worker_for_test(
+        proxy: Arc<dyn ProxyInbound>,
+        tag: &str,
+    ) -> Arc<UdpWorker> {
+        Arc::new(UdpWorker::new(
+            proxy,
+            "127.0.0.1:0".parse().unwrap(),
+            0,
+            tag,
+            StreamSettings::tcp(),
+            SocketOptions::default(),
+            make_dispatcher(),
+            SniffingRequest::default(),
+            None,
+            None,
+        ))
+    }
+
+    // ===== audit 79ma：TcpWorker::start（trait）accept 打穿 =====
+
+    #[tokio::test]
+    async fn tcp_worker_start_accepts_and_dispatches() {
+        // listen_tcp 走 registry：需先注册 tcp TransportListenFn（幂等，忽略 AlreadyExists）。
+        let _ = xray_transport::tcp::register_tcp_transport();
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let worker = tcp_worker_for_test(
+            Arc::new(HitProxy { hits: Arc::clone(&hits) }),
+            "tcp-accept-test",
+        );
+
+        // 旧实现 trait start 为 unreachable!——start 即 panic；且 hub 不 spawn
+        // accept loop——bind 后永不 accept。此测试同时覆盖两条修复。
+        Arc::clone(&worker).start().await.expect("tcp worker start");
+
+        let addr = {
+            let listener = worker.listener.lock().unwrap_or_else(|e| e.into_inner());
+            listener
+                .as_ref()
+                .expect("listener stored after start")
+                .local_addr()
+                .expect("local_addr")
+        };
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        tokio::io::AsyncWriteExt::write_all(&mut client, b"ping")
+            .await
+            .expect("write");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while hits.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("proxy never hit — accept loop not spawned or handler not wired");
+    }
+
+    // ===== audit ojcy：UdpWorker 端到端（客户端包达 proxy + 回包达客户端）=====
+
+    #[tokio::test]
+    async fn udp_worker_start_delivers_and_replies() {
+        let (got_tx, mut got_rx) = mpsc::channel::<Vec<u8>>(8);
+        let worker = udp_worker_for_test(
+            Arc::new(UdpEchoProxy { got: got_tx }),
+            "udp-e2e",
+        );
+
+        Arc::clone(&worker).start().await.expect("udp worker start");
+
+        let hub_addr = {
+            let hub = worker.hub.lock().unwrap_or_else(|e| e.into_inner());
+            hub.as_ref()
+                .expect("hub stored after start")
+                .local_addr()
+                .expect("local_addr")
+        };
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        client.send_to(b"ping", hub_addr).await.expect("send");
+
+        // 入方向：hub → session → proxy 消费
+        let got = tokio::time::timeout(Duration::from_secs(2), got_rx.recv())
+            .await
+            .expect("client packet never reached proxy")
+            .expect("got channel closed");
+        assert_eq!(got.as_slice(), b"ping");
+
+        // 出方向：proxy write_packet → 响应泵 → hub.send_to → 客户端
+        let mut buf = [0u8; 16];
+        let (n, src) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .expect("no reply from worker")
+            .expect("recv_from");
+        assert_eq!(&buf[..n], b"pong");
+        assert_eq!(src, hub_addr);
+    }
+
+    // ===== audit 95ar：ActivityTimer 滑动窗口 =====
+
+    #[tokio::test]
+    async fn tcp_worker_idle_conn_cancelled_without_io() {
+        let (started_tx, mut started_rx) = mpsc::channel::<()>(1);
+        let worker = tcp_worker_for_test(
+            Arc::new(HangingProxy { started: started_tx }),
+            "idle-test",
+        );
+
+        let (_client, server) = tokio::io::duplex(64);
+        let handle = worker.spawn_conn(
+            Box::new(DuplexConn(server)),
+            Duration::from_millis(150),
+        );
+
+        started_rx.recv().await.expect("proxy never started");
+
+        // proxy 不做任何 IO → 空闲窗口到期 → done 分支 → 连接任务结束。
+        // 旧实现此路径 select 恒等 done_signal 且 timer 无人重置——行为相同；
+        // 本测试锁定"无 IO 被杀"语义在 spawn_conn 拆分后仍然成立。
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("idle connection was not cancelled")
+            .expect("task join");
+    }
+
+    #[tokio::test]
+    async fn tcp_worker_active_conn_survives_idle_window() {
+        let worker = tcp_worker_for_test(Arc::new(EchoIoProxy), "active-test");
+        let (mut client, server) = tokio::io::duplex(64);
+
+        let handle = worker.spawn_conn(
+            Box::new(DuplexConn(server)),
+            Duration::from_millis(100),
+        );
+
+        // 每 50ms 一轮 echo ×4 = 200ms+，两倍于 100ms 空闲窗口：
+        // 装饰器在读写路径持续 update_activity → 计时器永不到期。
+        // 旧实现（timer 无 update 接线）连接活不过 100ms——必挂。
+        for i in 0..4 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let msg = [b'x'; 8];
+            tokio::io::AsyncWriteExt::write_all(&mut client, &msg)
+                .await
+                .expect("write");
+            let mut echo = [0u8; 8];
+            tokio::io::AsyncReadExt::read_exact(&mut client, &mut echo)
+                .await
+                .unwrap_or_else(|e| panic!("echo #{i}: {e}"));
+            assert_eq!(&echo, &msg, "echo #{i}");
+        }
+
+        assert!(
+            !handle.is_finished(),
+            "active connection killed despite continuous IO"
+        );
+
+        drop(client); // EOF → proxy 退出 → 连接任务结束
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("conn task hang after EOF")
+            .expect("task join");
     }
 }
