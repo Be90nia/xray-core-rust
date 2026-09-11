@@ -8,11 +8,11 @@
 //! 2. socket 由 driver task 驱动——通过 WireGuard tunnel 与远端 peer 通信
 //! 3. 用户读写 socket 的数据被封装为 IP 包送入 smoltcp
 //!
-//! ## 当前限制（与 freedom 切片2 一致）
-//!
-//! `dial` 建立 socket 后立即返回——上层桥接（Link ↔ smoltcp socket）留待后续切片。
+//! 生产出站路径走 [`crate::dispatcher::make_wireguard_dial_fn`]（DialBridge）；
+//! 本 handler 仅作为 driver/netstack 的 lazy-init 容器（bd 7v0k⑤：原 stub
+//! `impl OutboundHandler`（dial 建 socket 后返 Ok 无数据流动的公共 API 陷阱）
+//! 已删除）。
 
-use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -20,8 +20,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use xray_common::net::address::Address;
 use xray_common::net::destination::Destination;
-use xray_common::session::Session;
-use xray_features::outbound::{OutboundError, OutboundHandler};
 
 use crate::config::DeviceConfig;
 use crate::driver::{bind_udp_socket, WgDriver, WgTransport, DialedUdp};
@@ -160,79 +158,6 @@ async fn resolve_endpoint_addr(
     .await
     .map_err(|e| WgError::InvalidEndpoint(format!("peer endpoint DNS resolve: {e}")))?;
     Ok(SocketAddr::new(ip, port))
-}
-
-#[async_trait]
-impl OutboundHandler for WireguardOutboundHandler {
-    fn tag(&self) -> &str {
-        &self.tag
-    }
-
-    /// 在 smoltcp 网栈上创建 socket，发起到 destination 的连接。
-    ///
-    /// 当前实现：建立 socket 后立即返回 Ok——实际的 Link 桥接待后续切片。
-    async fn dial(
-        &self,
-        destination: &Destination,
-        _session: &Session,
-    ) -> std::result::Result<(), OutboundError> {
-        // 解析目标 IP（Domain 暂不支持——DNS 留待接入上层）
-        let ip = match destination.address() {
-            Address::IPv4(v4) => IpAddr::V4(*v4),
-            Address::IPv6(v6) => IpAddr::V6(*v6),
-            Address::Domain(_) => {
-                return Err(OutboundError::ConnectionFailed(
-                    "wireguard outbound 暂不支持 Domain（DNS 解析由上层负责）".into(),
-                ));
-            }
-        };
-        let port = destination.port().value();
-
-        let mut stack = self.netstack.lock().await;
-        let handle = match destination.network() {
-            xray_common::net::network::Network::TCP => {
-                let handle = stack.add_tcp_socket();
-                let remote_addr = match ip {
-                    IpAddr::V4(v4) => smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_octets(v4.octets())),
-                    IpAddr::V6(v6) => smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from_octets(v6.octets())),
-                };
-                stack
-                    .tcp_connect(handle, remote_addr, port)
-                    .map_err(|e| OutboundError::ConnectionFailed(format!("smoltcp tcp_connect: {e}")))?;
-                tracing::debug!(tag = %self.tag, %ip, port, "wireguard outbound tcp_connect initiated");
-                handle
-            }
-            xray_common::net::network::Network::UDP => {
-                let handle = stack.add_udp_socket();
-                stack.with_udp_socket(handle, |s| {
-                    // ponytail: 简化——bind 到 0.0.0.0:0
-                    let _ = s.bind(0);
-                });
-                tracing::debug!(tag = %self.tag, %ip, port, "wireguard outbound udp socket created");
-                handle
-            }
-            xray_common::net::network::Network::Unix => {
-                return Err(OutboundError::ConnectionFailed(
-                    "wireguard outbound 不支持 Unix socket".into(),
-                ));
-            }
-        };
-        // 不立即移除 socket——保留在 smoltcp 网栈中，由 driver 后续处理
-        // 返回 socket handle 供上层桥接使用
-        tracing::debug!(tag = %self.tag, handle = ?handle, "wireguard outbound socket created and retained");
-        Ok(())
-    }
-
-    /// 可以处理 TCP/UDP 目标（IP 优先；Domain 暂不支持）。
-    fn can_handle(&self, destination: &Destination) -> bool {
-        matches!(
-            destination.address(),
-            Address::IPv4(_) | Address::IPv6(_)
-        ) && matches!(
-            destination.network(),
-            xray_common::net::network::Network::TCP | xray_common::net::network::Network::UDP
-        )
-    }
 }
 
 /// 从 DeviceConfig.endpoint 解析为 smoltcp IpCidr。

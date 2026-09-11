@@ -211,8 +211,8 @@ pub(crate) async fn handle_mux_inbound_link(link: Link, handler: Arc<dyn xray_ap
     let link_writer: Arc<tokio::sync::Mutex<Option<Box<dyn xray_buf::io::Writer>>>> =
         Arc::new(tokio::sync::Mutex::new(Some(link.writer)));
 
-    // 启动 keepalive + idle timeout
-    let (keepalive_h, idle_h) = worker.spawn_keepalive_and_idle_timeout(link_writer.clone());
+    // 启动 Go monitor 语义（60s 空载关 carrier，无 KeepAlive 帧）
+    let monitor_h = worker.spawn_monitor(link_writer.clone());
 
     // 主帧处理循环
     loop {
@@ -227,8 +227,7 @@ pub(crate) async fn handle_mux_inbound_link(link: Link, handler: Arc<dyn xray_ap
     }
 
     worker.close();
-    keepalive_h.abort();
-    idle_h.abort();
+    monitor_h.abort();
 }
 
 /// `SocksAddr` → `Destination`（`network` 指定 TCP/UDP）。
@@ -603,11 +602,15 @@ fn socketaddr_to_address(addr: SocketAddr) -> Address {
 /// 1. `original_dst`（Linux `SO_ORIGINAL_DST`，iptables REDIRECT 透明代理）
 /// 2. TLS 握手 SNI 覆盖 address（port 保持 rewrite 值，缺省 0；Go dokodemo.go:122-132，
 ///    仅在未被 original_dst 覆盖时）
-/// 3. predefined dest；三者皆无 → `None`（Go：dest 无效，dispatch 失败）
+///
+/// 两者皆缺 → `None`：调用方拒连（对齐 Go dokodemo.go:137
+/// `unable to get destination`）。FollowRedirect 分支**不回落 predefined
+/// dest**——transparent 场景 predefined 拿不到原始目标时静默转发固定地址，
+/// 排障方向被误导。
 ///
 /// `follow_redirect=false`：predefined dest 回填（address 缺省 → 本机回环、
 /// port 缺省 → 本地端口，Go dokodemo.go:86-100）+ `port_map`（:101-109）。
-/// 返回 `None` = 无有效目标（仅 follow_redirect 且 original/SNI/rewrite 皆缺时）。
+/// 返回 `None` = 无有效目标（仅 follow_redirect 且 original/SNI 皆缺时）。
 fn resolve_dokodemo_tcp_dest(
     opts: &DokodemoTcpOptions,
     local_ip: Option<std::net::IpAddr>,
@@ -615,53 +618,53 @@ fn resolve_dokodemo_tcp_dest(
     original_dst: Option<SocketAddr>,
     tls_sni: Option<&str>,
 ) -> Option<Destination> {
-    let mut dest = opts.dest.clone();
     if opts.follow_redirect {
-        let mut overridden = false;
         if let Some(orig) = original_dst {
-            dest = Some(Destination::tcp(socketaddr_to_address(orig), Port::new(orig.port())));
-            overridden = true;
+            return Some(Destination::tcp(
+                socketaddr_to_address(orig),
+                Port::new(orig.port()),
+            ));
         }
-        if !overridden {
-            if let Some(sni) = tls_sni.filter(|s| !s.is_empty()) {
-                let port = dest.as_ref().map_or(0, |d| d.port().value());
-                dest = Some(Destination::tcp(
-                    Address::Domain(sni.to_string()),
-                    Port::new(port),
-                ));
-            }
+        // SNI 覆盖 address；port 基底 = rewrite port（Go：dest.Port 初值不变）。
+        if let Some(sni) = tls_sni.filter(|s| !s.is_empty()) {
+            let port = opts.dest.as_ref().map_or(0, |d| d.port().value());
+            return Some(Destination::tcp(
+                Address::Domain(sni.to_string()),
+                Port::new(port),
+            ));
         }
-        dest
-    } else {
-        // rewrite 缺省回填（Go dokodemo.go:86-100）：address → 本机回环
-        // （依监听地址族选 v4/v6），port → 本地监听端口。
-        let mut d = dest.unwrap_or_else(|| {
-            Destination::tcp(loopback_addr(local_ip), Port::new(0))
-        });
-        if d.port().value() == 0 {
-            if let Some(lp) = local_port {
-                d = Destination::tcp(d.address().clone(), Port::new(lp));
-            }
-        }
-        // port_map：值 "host:port"，host/port 均可空（Go dokodemo.go:101-109，
-        // SplitHostPort 错误已在 parse 阶段校验，此处容错跳过）。
+        // 拿不到原始目标 → 拒连（Go dokodemo.go:137 unable to get destination）。
+        return None;
+    }
+    // follow_redirect=false：rewrite 缺省回填（Go dokodemo.go:86-100）：
+    // address → 本机回环（依监听地址族选 v4/v6），port → 本地监听端口。
+    let mut dest = opts
+        .dest
+        .clone()
+        .unwrap_or_else(|| Destination::tcp(loopback_addr(local_ip), Port::new(0)));
+    if dest.port().value() == 0 {
         if let Some(lp) = local_port {
-            if let Some(mapping) = opts.port_map.get(&lp.to_string()) {
-                if let Some((host, port_str)) = mapping.rsplit_once(':') {
-                    if !port_str.is_empty() {
-                        if let Ok(p) = port_str.parse::<u16>() {
-                            d = Destination::tcp(d.address().clone(), Port::new(p));
-                        }
+            dest = Destination::tcp(dest.address().clone(), Port::new(lp));
+        }
+    }
+    // port_map：值 "host:port"，host/port 均可空（Go dokodemo.go:101-109，
+    // SplitHostPort 错误已在 parse 阶段校验，此处容错跳过）。
+    if let Some(lp) = local_port {
+        if let Some(mapping) = opts.port_map.get(&lp.to_string()) {
+            if let Some((host, port_str)) = mapping.rsplit_once(':') {
+                if !port_str.is_empty() {
+                    if let Ok(p) = port_str.parse::<u16>() {
+                        dest = Destination::tcp(dest.address().clone(), Port::new(p));
                     }
-                    let host = host.trim_start_matches('[').trim_end_matches(']');
-                    if !host.is_empty() {
-                        d = Destination::tcp(parse_address_str(host), d.port());
-                    }
+                }
+                let host = host.trim_start_matches('[').trim_end_matches(']');
+                if !host.is_empty() {
+                    dest = Destination::tcp(parse_address_str(host), dest.port());
                 }
             }
         }
-        Some(d)
     }
+    Some(dest)
 }
 
 /// rewrite address 缺省时的本机回环地址（Go dokodemo.go:91-96：依监听
@@ -738,7 +741,7 @@ pub async fn serve_dokodemo(
                                 let _ = handler.dispatch(&dest, link).await;
                             }
                             None => tracing::warn!(
-                                "dokodemo: no valid destination (followRedirect without original dst/SNI/rewrite)"
+                                "dokodemo: no valid destination (followRedirect without original dst/SNI), rejecting connection (Go dokodemo.go:137)"
                             ),
                         }
                     }
@@ -757,7 +760,7 @@ pub async fn serve_dokodemo(
                         let _ = handler.dispatch(&dest, link).await;
                     }
                     None => tracing::warn!(
-                        "dokodemo: no valid destination (followRedirect without original dst/rewrite)"
+                        "dokodemo: no valid destination (followRedirect without original dst/SNI), rejecting connection (Go dokodemo.go:137)"
                     ),
                 }
             }
@@ -1734,6 +1737,8 @@ fn build_tls_acceptor(
 #[derive(Debug)]
 struct RealityInboundConfig {
     server_private_key: [u8; 32],
+    /// t38j：SNI 白名单（非空，parse 层硬错保证）；精确匹配，供 server_tls 前置门。
+    server_names: Vec<String>,
     short_ids: Vec<[u8; 8]>,
     max_diff: u32,
     fallback_dest: String,
@@ -1749,6 +1754,22 @@ fn parse_reality_config(
     let json = settings.security_json.as_ref().ok_or_else(|| {
         std::io::Error::other("reality inbound requires realitySettings")
     })?;
+    // t38j：serverNames 非空硬错（Go transport_security.go:94-96 `empty "serverNames"`
+    // 拒启）；白名单供 server_tls 做 SNI 前置门（xtls/reality tls.go:211）。
+    let mut server_names = Vec::new();
+    if let Some(arr) = json.get("serverNames").and_then(|x| x.as_array()) {
+        for v in arr {
+            let Some(name) = v.as_str() else {
+                return Err(std::io::Error::other(
+                    "reality: invalid serverNames entry (need string)",
+                ));
+            };
+            server_names.push(name.to_string());
+        }
+    }
+    if server_names.is_empty() {
+        return Err(std::io::Error::other("reality: empty \"serverNames\""));
+    }
     let key_str = json
         .get("privateKey")
         .and_then(|x| x.as_str())
@@ -1757,19 +1778,35 @@ fn parse_reality_config(
     let key = base64_url_decode(key_str)
         .and_then(|k| <[u8; 32]>::try_from(k).ok())
         .ok_or_else(|| std::io::Error::other("reality: invalid privateKey (need base64 32B)"))?;
-
-    let mut short_ids = Vec::new();
-    if let Some(arr) = json.get("shortIds").and_then(|x| x.as_array()) {
-        for sid in arr {
-            let Some(hex) = sid.as_str() else { continue };
-            if let Some(bytes) = hex_decode_8(hex) {
-                short_ids.push(bytes);
-            }
-        }
+    // 257w：shortIds 校验收紧对齐 Go transport_security.go:135-147——空数组拒启、
+    // 单项 >16 拒启、奇数长度/非法 hex 拒启（原实现右补零+失败 continue+空数组
+    // 默认全零放行，全部放宽于 Go）。合法项左对齐补零到 8 字节（Go hex.Decode
+    // 写入 make([]byte,8)；"" 解码为空 → 全零 short_id）。
+    let sid_arr = json
+        .get("shortIds")
+        .and_then(|x| x.as_array())
+        .ok_or_else(|| std::io::Error::other("reality: empty \"shortIds\""))?;
+    if sid_arr.is_empty() {
+        return Err(std::io::Error::other("reality: empty \"shortIds\""));
     }
-    // 无 shortIds：默认允许全零（Go REALITY 空配置兼容）
-    if short_ids.is_empty() {
-        short_ids.push([0u8; 8]);
+    let mut short_ids = Vec::with_capacity(sid_arr.len());
+    for (i, sid) in sid_arr.iter().enumerate() {
+        let Some(hex) = sid.as_str() else {
+            return Err(std::io::Error::other(format!(
+                "reality: invalid \"shortIds[{i}]\" (need hex string)"
+            )));
+        };
+        if hex.len() > 16 {
+            return Err(std::io::Error::other(format!(
+                "reality: too long \"shortIds[{i}]\": {hex}"
+            )));
+        }
+        let bytes = hex::decode(hex).map_err(|_| {
+            std::io::Error::other(format!("reality: invalid \"shortIds[{i}]\": {hex}"))
+        })?;
+        let mut id = [0u8; 8];
+        id[..bytes.len()].copy_from_slice(&bytes);
+        short_ids.push(id);
     }
 
     // dest/target：int（端口→localhost:port）或字符串 host:port
@@ -1822,6 +1859,7 @@ fn parse_reality_config(
 
     Ok(RealityInboundConfig {
         server_private_key: key,
+        server_names,
         short_ids,
         max_diff,
         fallback_dest,
@@ -1840,16 +1878,6 @@ fn base64_url_decode(s: &str) -> Option<Vec<u8>> {
         .decode(normalized)
         .ok()
         .or_else(|| base64::engine::general_purpose::STANDARD.decode(s).ok())
-}
-
-/// hex 字符串 → 8 字节 short_id。
-fn hex_decode_8(s: &str) -> Option<[u8; 8]> {
-    if s.len() > 16 {
-        return None;
-    }
-    let padded = format!("{s:0<16}");
-    let bytes = hex::decode(padded).ok()?;
-    bytes.try_into().ok()
 }
 
 /// VLESS + REALITY inbound：accept → server_tls 验证。
@@ -1883,6 +1911,7 @@ async fn serve_reality_vless(
         let validator = Arc::clone(&validator);
         let options = options.clone();
         let key = cfg.server_private_key;
+        let names = cfg.server_names.clone();
         let ids = cfg.short_ids.clone();
         let max_diff = cfg.max_diff;
         let dest = cfg.fallback_dest.clone();
@@ -1890,7 +1919,7 @@ async fn serve_reality_vless(
         let min_ver = cfg.min_client_ver.clone();
         let max_ver = cfg.max_client_ver.clone();
         tokio::spawn(async move {
-            match server_tls(stream, &key, &ids, max_diff, &min_ver, &max_ver).await {
+            match server_tls(stream, &key, &ids, max_diff, &min_ver, &max_ver, &names).await {
                 Ok(RealityServerOutcome::Verified(tls)) => {
                     if let Err(e) = xray_proxy_vless::handle_vless_connection(
                         tls,
@@ -2248,13 +2277,13 @@ async fn spawn_one_inbound(
             // TLS（streamSettings security=tls）：对应 Go tls.NewListener 包裹，
             // SNI 在 serve_dokodemo 内用于 follow_redirect 未覆盖时的 dest 改写。
             let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
-            // followRedirect 的 SO_ORIGINAL_DST 仅 Linux 可用；非 Linux 回落
-            // predefined dest（对齐 Go fakeudp_other.go 的平台差异处理方式）。
+            // followRedirect 的 SO_ORIGINAL_DST 仅 Linux 可用；非 Linux 拿不到
+            // 原始目标 → 连接被拒（Go dokodemo.go:137 unable to get destination）。
             #[cfg(not(target_os = "linux"))]
             if settings.follow_redirect {
                 tracing::warn!(
                     tag = %ib.tag,
-                    "dokodemo followRedirect requires Linux (SO_ORIGINAL_DST / UDP TPROXY); falling back to predefined dest"
+                    "dokodemo followRedirect requires Linux (SO_ORIGINAL_DST / UDP TPROXY); connections without original destination will be rejected"
                 );
             }
             let mut handles = Vec::new();
@@ -3476,35 +3505,19 @@ fn parse_anytls_tls_acceptor(
 
 /// 从 inbound entry.data（JSON）解析 wireguard inbound 配置。
 ///
-/// JSON 格式：`{"secretKey":"...","peers":[{"publicKey":"...","endpoint":"..."}]}`。
+/// 复用 outbound 侧 [`parse_wireguard_config`] 的归一化（Go
+/// infra/conf/wireguard.go inbound/outbound 共用 Build：base64/hex 密钥、
+/// allowedIPs 缺省全路由、address 缺省 bogon 双栈、PSK/keepAlive/level/email，
+/// bd ttni）；inbound 额外读 `port`（UDP 监听端口，缺省 51820）。
 fn parse_wireguard_inbound_config(data: &[u8]) -> std::io::Result<(DeviceConfig, u16)> {
+    let config = crate::outbound::parse_wireguard_config(data)
+        .map_err(|e| std::io::Error::other(format!("wireguard inbound settings: {e}")))?;
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("wireguard inbound settings JSON: {e}")))?;
-    let secret_key = v.get("secretKey").and_then(|x| x.as_str())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "wireguard: missing secretKey"))?
-        .to_string();
-    let mut peers = Vec::new();
-    if let Some(arr) = v.get("peers").and_then(|x| x.as_array()) {
-        for p in arr {
-            let public_key = p.get("publicKey").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let endpoint = p.get("endpoint").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            peers.push(xray_proxy_wireguard::PeerConfig {
-                public_key,
-                endpoint,
-                ..Default::default()
-            });
-        }
-    }
-    let endpoint = v.get("address").and_then(|x| x.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-        .unwrap_or_else(|| vec!["10.0.0.2/32".to_string()]);
-    let port = v.get("port").and_then(|x| x.as_u64()).unwrap_or(51820) as u16;
-    let config = DeviceConfig {
-        secret_key,
-        peers,
-        endpoint,
-        ..Default::default()
-    };
+    let port = v.get("port").and_then(|x| x.as_u64()).unwrap_or(51820);
+    let port = u16::try_from(port).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "wireguard inbound port out of u16 range")
+    })?;
     Ok((config, port))
 }
 
@@ -4250,6 +4263,48 @@ mod tests {
         assert_eq!(ib.server().users_count(), 1, "clients[] → 1 user");
     }
 
+    /// bd ttni：wireguard 入站复用 outbound 归一化——base64 密钥/PSK 归一为
+    /// hex、allowedIPs 保留、level/email 透传；归一化后密钥能走既有 Tunnel 链
+    /// （旧实现 hex-only，base64 secret 进 Tunnel 必然 decode 失败）。
+    #[test]
+    fn parse_wireguard_inbound_config_base64_keys_normalize() {
+        use base64::Engine as _;
+        let secret_b64 = base64::engine::general_purpose::STANDARD.encode([0x11u8; 32]);
+        let pub_b64 = base64::engine::general_purpose::STANDARD.encode([0x22u8; 32]);
+        let psk_b64 = base64::engine::general_purpose::STANDARD.encode([0x33u8; 32]);
+        let data = format!(
+            r#"{{"secretKey": "{}", "address": ["10.0.0.1/32"], "port": 51820,
+                "peers": [{{"publicKey": "{}", "preSharedKey": "{}",
+                "allowedIPs": ["10.0.0.2/32"], "endpoint": "203.0.113.9:51820",
+                "level": 2, "email": "u@wg"}}]}}"#,
+            secret_b64, pub_b64, psk_b64
+        );
+        let (config, port) = parse_wireguard_inbound_config(data.as_bytes()).unwrap();
+        assert_eq!(port, 51820);
+        assert_eq!(config.secret_key, "11".repeat(32), "base64 secret 归一化为 hex");
+        let peer = &config.peers[0];
+        assert_eq!(peer.public_key, "22".repeat(32));
+        assert_eq!(peer.pre_shared_key, "33".repeat(32), "PSK 归一化");
+        assert_eq!(peer.allowed_ips, vec!["10.0.0.2/32"], "allowedIPs 保留");
+        assert_eq!(peer.email, "u@wg");
+        assert_eq!(peer.level, 2);
+        // 归一化后的密钥必须能走既有 Tunnel 链（hex decode 成功）
+        xray_proxy_wireguard::Tunnel::from_config(&config, peer)
+            .expect("normalized keys feed the existing tunnel chain");
+    }
+
+    /// bd 7v0k③：peers 空允许解析（Go 官方空配置 + API 建户另票）。
+    #[test]
+    fn parse_wireguard_inbound_config_empty_peers_allowed() {
+        let secret = "aa".repeat(32);
+        let data = format!(r#"{{"secretKey": "{}"}}"#, secret);
+        let (config, port) = parse_wireguard_inbound_config(data.as_bytes()).unwrap();
+        assert!(config.peers.is_empty(), "空 peers 允许启动");
+        assert_eq!(port, 51820);
+        // address 缺省 → bogon 双栈（7v0k①）
+        assert_eq!(config.endpoint, vec!["10.0.0.1", "fd59:7153:2388:b5fd::1"]);
+    }
+
     /// ss2022 多用户：`users[]`（无 address → multi，Go shadowsocks.go:130）。
     #[test]
     fn parse_ss2022_inbound_config_users_alias_multi() {
@@ -4387,6 +4442,7 @@ mod tests {
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
         let json = serde_json::json!({
             "privateKey": key_b64,
+            "serverNames": ["example.com"],
             "shortIds": ["", "0123456789abcdef"],
             "target": "example.com:443",
             "xver": 1,
@@ -4401,6 +4457,7 @@ mod tests {
         };
         let cfg = parse_reality_config(&settings).unwrap();
         assert_eq!(cfg.server_private_key, key);
+        assert_eq!(cfg.server_names, vec!["example.com".to_string()]);
         assert_eq!(cfg.short_ids.len(), 2);
         assert_eq!(cfg.short_ids[0], [0u8; 8]);
         assert_eq!(cfg.short_ids[1][0], 0x01);
@@ -4413,9 +4470,12 @@ mod tests {
     fn parse_reality_config_port_dest_and_defaults() {
         use base64::Engine as _;
         let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
-        // dest 为 int 端口 → localhost:port；缺省 xver=0/maxTimeDiff=0（Go 兼容：禁用时间窗）/shortIds=[0u8;8]
+        // dest 为 int 端口 → localhost:port；缺省 xver=0/maxTimeDiff=0（Go 兼容：禁用时间窗）。
+        // 257w 后 serverNames/shortIds 均为必填（Go :94/:135 拒启），fixture 显式给出。
         let json = serde_json::json!({
             "privateKey": key_b64,
+            "serverNames": ["a.example.com"],
+            "shortIds": ["01"],
             "dest": 8443
         });
         let settings = xray_transport::dialer::StreamSettings {
@@ -4427,14 +4487,15 @@ mod tests {
         assert_eq!(cfg.fallback_dest, "localhost:8443");
         assert_eq!(cfg.xver, 0);
         assert_eq!(cfg.max_diff, 0);
-        assert_eq!(cfg.short_ids, vec![[0u8; 8]]);
+        // 左对齐补零（Go hex.Decode → make([]byte,8)）："01" → [0x01,0,...]
+        assert_eq!(cfg.short_ids, vec![[0x01, 0, 0, 0, 0, 0, 0, 0]]);
     }
 
     #[test]
     fn parse_reality_config_rejects_missing_key() {
         let settings = xray_transport::dialer::StreamSettings {
             security: "reality".to_string(),
-            security_json: Some(serde_json::json!({})),
+            security_json: Some(serde_json::json!({"serverNames": ["a.com"]})),
             ..xray_transport::dialer::StreamSettings::tcp()
         };
         assert!(parse_reality_config(&settings).is_err());
@@ -4447,6 +4508,8 @@ mod tests {
         let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
         let json = serde_json::json!({
             "privateKey": key_b64,
+            "serverNames": ["a.com"],
+            "shortIds": ["01"],
             "mldsa65Seed": "deadbeef00000000000000000000000000000000000000000000000000000000",
         });
         let settings = xray_transport::dialer::StreamSettings {
@@ -4460,6 +4523,62 @@ mod tests {
             msg.contains("mldsa65") && msg.contains("not implemented"),
             "expected mldsa65 not implemented error, got: {msg}"
         );
+    }
+
+    /// t38j：空/缺失 serverNames 拒启（Go transport_security.go:94-96）。
+    #[test]
+    fn parse_reality_config_rejects_empty_server_names() {
+        use base64::Engine as _;
+        let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
+        for names in [serde_json::json!([]), serde_json::json!("not-an-array")] {
+            let json = serde_json::json!({
+                "privateKey": key_b64,
+                "serverNames": names,
+                "shortIds": ["01"],
+            });
+            let settings = xray_transport::dialer::StreamSettings {
+                security: "reality".to_string(),
+                security_json: Some(json),
+                ..xray_transport::dialer::StreamSettings::tcp()
+            };
+            let err = parse_reality_config(&settings).unwrap_err();
+            assert!(
+                err.to_string().contains("serverNames"),
+                "expected empty serverNames error, got: {err}"
+            );
+        }
+    }
+
+    /// 257w：shortIds 三重硬错（Go transport_security.go:135-147）——空数组/
+    /// 过长/奇数或非法 hex 均拒启；非字符串项同拒。
+    #[test]
+    fn parse_reality_config_rejects_bad_short_ids() {
+        use base64::Engine as _;
+        let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let cases = [
+            serde_json::json!([]),                       // 空数组
+            serde_json::json!(["0123456789abcdef00"]),   // >16 字符
+            serde_json::json!(["abc"]),                  // 奇数长度
+            serde_json::json!(["zz"]),                   // 非法 hex
+            serde_json::json!([42]),                     // 非字符串项
+        ];
+        for short_ids in cases {
+            let json = serde_json::json!({
+                "privateKey": key_b64,
+                "serverNames": ["a.com"],
+                "shortIds": short_ids,
+            });
+            let settings = xray_transport::dialer::StreamSettings {
+                security: "reality".to_string(),
+                security_json: Some(json),
+                ..xray_transport::dialer::StreamSettings::tcp()
+            };
+            let err = parse_reality_config(&settings).unwrap_err();
+            assert!(
+                err.to_string().contains("shortIds"),
+                "expected shortIds error, got: {err}"
+            );
+        }
     }
     use xray_proxy_freedom::make_freedom_dial_fn;
     use xray_proxy_socks::protocol::{ATYP_DOMAIN, ATYP_IPV4};
@@ -4603,6 +4722,8 @@ mod tests {
         let short_id = [1u8, 2, 3, 4, 5, 6, 7, 8];
         let reality_cfg = RealityInboundConfig {
             server_private_key: server_secret.to_bytes(),
+            // 客户端 SNI=reality.local（下方 settings），白名单含它 → SNI 门放行。
+            server_names: vec!["reality.local".to_string()],
             short_ids: vec![short_id],
             max_diff: 43200,
             fallback_dest: format!("127.0.0.1:{}", echo_addr.port()),
@@ -4961,33 +5082,25 @@ mod tests {
     }
 
     #[test]
-    fn resolve_dokodemo_follow_redirect_falls_back_to_predefined() {
-        // 非 Linux / 非 REDIRECT 连接：无 original_dst、无 TLS → predefined
+    fn resolve_dokodemo_follow_redirect_rejects_without_original_dst() {
+        // 非 Linux / 非 REDIRECT 连接：无 original_dst、无 SNI → 拒连
+        // （对齐 Go dokodemo.go:137 unable to get destination；不回落 predefined）。
         let mut opts = tcp_opts();
         opts.follow_redirect = true;
-        let dest = super::resolve_dokodemo_tcp_dest(&opts, None, Some(80), None, None)
-            .unwrap();
-        assert_eq!(dest.port().value(), 80);
-        match dest.address() {
-            Address::IPv4(v4) => assert_eq!(v4.octets(), [10, 0, 0, 1]),
-            other => panic!("expected predefined IPv4, got {other:?}"),
-        }
+        assert!(
+            super::resolve_dokodemo_tcp_dest(&opts, None, Some(80), None, None).is_none(),
+            "followRedirect 拿不到原始目标必须拒连，不得回落 predefined dest"
+        );
     }
 
     #[test]
-    fn resolve_dokodemo_port_map_skipped_when_follow_redirect() {
-        // Go：portMap 分支在 !FollowRedirect 内，两者互斥
+    fn resolve_dokodemo_follow_redirect_skips_port_map_and_rejects() {
+        // Go：portMap 分支在 !FollowRedirect 内（互斥）；无 original dst/SNI → 拒连。
         let mut opts = tcp_opts();
         opts.follow_redirect = true;
         opts.port_map
             .insert("80".to_string(), "192.168.99.1:9090".to_string());
-        let dest = super::resolve_dokodemo_tcp_dest(&opts, None, Some(80), None, None)
-            .unwrap();
-        assert_eq!(dest.port().value(), 80);
-        match dest.address() {
-            Address::IPv4(v4) => assert_eq!(v4.octets(), [10, 0, 0, 1]),
-            other => panic!("expected predefined IPv4, got {other:?}"),
-        }
+        assert!(super::resolve_dokodemo_tcp_dest(&opts, None, Some(80), None, None).is_none());
     }
 
     /// dokodemo settings：address/port 可选（Go rewriteAddress/rewritePort 独立可选）。
@@ -5379,9 +5492,10 @@ mod tests {
         }
     }
 
-    /// i09 e2e：followRedirect 但无 NAT/非 Linux——回落 predefined dest。
+    /// i09 e2e：followRedirect 但无 NAT/非 Linux——拿不到原始目标 → 拒连
+    /// （Go dokodemo.go:137 unable to get destination；不回落 predefined dest）。
     #[tokio::test]
-    async fn dokodemo_follow_redirect_falls_back_to_predefined_e2e() {
+    async fn dokodemo_follow_redirect_rejects_without_original_dst_e2e() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let ohm = Arc::new(SimpleOhm::new());
@@ -5411,17 +5525,19 @@ mod tests {
             .await
             .unwrap();
         client.write_all(b"ping").await.unwrap();
-        let mut buf = [0u8; 2];
-        client.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"ok");
 
-        // 直连（无 iptables REDIRECT）：get_original_dst 失败/不可用 → predefined
-        let dest = capture.dest.lock().clone().expect("dest captured");
-        assert_eq!(dest.port().value(), 443);
-        match dest.address() {
-            Address::IPv4(v4) => assert_eq!(v4.octets(), [10, 0, 0, 1]),
-            other => panic!("expected predefined IPv4, got {other:?}"),
+        // 直连（无 iptables REDIRECT）：拿不到原始目标 → 拒连——dest 永不 dispatch，
+        // 连接被关闭（EOF），而非静默转发 predefined dest。
+        for _ in 0..50 {
+            if capture.dest.lock().is_some() {
+                panic!("followRedirect 无原始目标时不得 dispatch 到任何 dest");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+        let mut buf = [0u8; 2];
+        let n = client.read(&mut buf).await.unwrap_or(0);
+        assert_eq!(n, 0, "连接应被关闭（EOF），而非转发 predefined dest");
+        assert!(capture.dest.lock().is_none());
     }
 
     #[test]

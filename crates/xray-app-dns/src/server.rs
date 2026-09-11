@@ -329,9 +329,9 @@ async fn serial_query(
                     error = %e,
                     "failed to lookup ip in serial query mode",
                 );
-                if client.final_query {
-                    return Err(e);
-                }
+                // Go dns.go serialQuery（363-384）无 finalQuery 短路：finalQuery
+                // 只作用于 sortClients 的序列截断；查询失败仍记日志继续问下一
+                // 个（fallback）server，最后 mergeQueryErrors。
                 outcomes.push(Err(e));
             }
         }
@@ -929,6 +929,7 @@ mod tests {
                 domain: "example.com".to_string(),
                 ips: vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))],
                 proxied_domain: String::new(),
+                matcher_rules: Vec::new(),
             }],
         );
         let (ips, ttl) = svc.lookup_ip("example.com.", IpOption::all()).await.unwrap();
@@ -945,6 +946,7 @@ mod tests {
                 domain: "x.com".to_string(),
                 ips: vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))],
                 proxied_domain: String::new(),
+                matcher_rules: Vec::new(),
             }],
         );
         let (ips, ttl) = svc.lookup_ip("x.com", IpOption::all()).await.unwrap();
@@ -960,6 +962,7 @@ mod tests {
                 domain: "x.com".to_string(),
                 ips: vec![IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
                 proxied_domain: String::new(),
+                matcher_rules: Vec::new(),
             }],
         );
         let v6_only = IpOption {
@@ -1093,11 +1096,13 @@ mod tests {
                     domain: "a.com".to_string(),
                     ips: Vec::new(),
                     proxied_domain: "b.com".to_string(),
+                    matcher_rules: Vec::new(),
                 },
                 HostMapping {
                     domain: "b.com".to_string(),
                     ips: Vec::new(),
                     proxied_domain: "a.com".to_string(),
+                    matcher_rules: Vec::new(),
                 },
             ],
         );
@@ -1123,6 +1128,7 @@ mod tests {
             domain: "example.com".to_string(),
             ips: vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))],
             proxied_domain: String::new(),
+            matcher_rules: Vec::new(),
         }]);
         let (ips, ttl) = svc
             .lookup_ip("example.com", IpOption::all())
@@ -1139,6 +1145,7 @@ mod tests {
             domain: "blocked.com".to_string(),
             ips: Vec::new(),
             proxied_domain: "#3".to_string(),
+            matcher_rules: Vec::new(),
         }]);
         let err = svc
             .lookup_ip("blocked.com", IpOption::all())
@@ -1347,11 +1354,12 @@ mod tests {
         assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))]);
     }
 
-    /// Go dns.go: client.finalQuery 命中后即使失败也立刻返回该错误。
-    /// Rust 端 serial_query 行 302-304 等价语义。
+    /// Go dns.go serialQuery（363-384）：finalQuery 只截断候选序列
+    /// （sortClients），查询失败**不**短路——记日志继续问下一个 server，
+    /// 最后 mergeQueryErrors。
     #[tokio::test]
-    async fn serial_query_final_query_returns_its_error() {
-        // final_query client 失败 → 立即返回该错误（不进 merge_query_errors）。
+    async fn serial_query_final_query_failure_continues_to_fallback() {
+        // final_query client 失败 → 继续问后续 client；后续命中则成功返回。
         struct FailServer;
         impl Server for FailServer {
             fn name(&self) -> &str { "fail" }
@@ -1364,6 +1372,20 @@ mod tests {
                 Box::pin(async { Err(DnsError::RecordNotFound) })
             }
         }
+        struct HitServer;
+        impl Server for HitServer {
+            fn name(&self) -> &str { "fallback" }
+            fn is_disable_cache(&self) -> bool { false }
+            fn query_ip<'a>(
+                &'a self,
+                _d: &'a str,
+                _o: IpOption,
+            ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>> {
+                Box::pin(async {
+                    Ok((vec![IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4))], 60))
+                })
+            }
+        }
         let ns = NameServerConfig {
             tag: "final".into(),
             final_query: true,
@@ -1371,9 +1393,16 @@ mod tests {
         };
         let server: Box<dyn Server> = Box::new(FailServer);
         let final_client = Arc::new(Client::new(ns, IpOption::all(), server).unwrap());
-        let err = serial_query(&[final_client], "x.com", IpOption::all()).await.unwrap_err();
-        assert!(matches!(err, DnsError::RecordNotFound),
-            "final_query 命中即返回该 client 的错误，不走 merge");
+        let ns2 = NameServerConfig {
+            tag: "fallback".into(),
+            ..Default::default()
+        };
+        let server2: Box<dyn Server> = Box::new(HitServer);
+        let fallback_client = Arc::new(Client::new(ns2, IpOption::all(), server2).unwrap());
+        let (ips, _) = serial_query(&[final_client, fallback_client], "x.com", IpOption::all())
+            .await
+            .expect("finalQuery 失败后应继续问 fallback server");
+        assert_eq!(ips, vec![IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4))]);
     }
 
     // ---- WgTimeoutFix 族过滤回归：option 必须贯穿 service→client→nameserver ----
@@ -1525,6 +1554,7 @@ mod tests {
                 domain: "v6host.example".to_string(),
                 ips: vec!["2606:2800::6810:84e5".parse::<IpAddr>().unwrap()],
                 proxied_domain: String::new(),
+                matcher_rules: Vec::new(),
             }],
             QueryStrategy::UseIp4,
             false,

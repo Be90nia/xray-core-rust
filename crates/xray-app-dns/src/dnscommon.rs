@@ -308,10 +308,14 @@ pub fn parse_dns_response(
     let rcode = response_code_to_u16(msg.metadata.response_code);
     let truncated = msg.metadata.truncation;
 
-    // 仅提取预期类型的 A/AAAA 记录（其他类型如 MX/TXT 不进 IP cache）。
+    // 提取预期类型的 A/AAAA 记录进 IP cache；**所有** answer 的 TTL 都参与
+    // Expire 计算（Go dnscommon.go:212-227：先读 AnswerHeader 的 TTL 再 switch
+    // 记录类型）。TTL=0 提升 1s（Go dnscommon.go:221-223）。
     let mut ips: Vec<IpAddr> = Vec::new();
     let mut min_ttl: Option<u32> = None;
     for rec in &msg.answers {
+        let ttl = if rec.ttl == 0 { 1 } else { rec.ttl };
+        min_ttl = Some(min_ttl.map_or(ttl, |m| m.min(ttl)));
         if rec.record_type() != expected_type {
             continue;
         }
@@ -324,8 +328,6 @@ pub fn parse_dns_response(
             }
             _ => continue,
         }
-        let ttl = rec.ttl;
-        min_ttl = Some(min_ttl.map_or(ttl, |m| m.min(ttl)));
     }
 
     let ttl_secs = min_ttl.unwrap_or(0);
@@ -341,16 +343,20 @@ pub fn parse_dns_response(
 
 /// 将 ParsedResponse 转为 IpRecord。
 ///
-/// TTL 0 + RCode 0 + 空 ips 仍会生成记录（调用方用 IpRecord::get_ips 判断有效性）。
+/// TTL 兜底对齐 Go dnscommon.go:203-208 defer：无任何有效 TTL（空答案）时
+/// Expire = now + DefaultTTL（600s）。TTL=0 已在 parse 阶段提升为 1s。
 #[must_use]
 pub fn parsed_to_ip_record(parsed: &ParsedResponse, now: Instant) -> IpRecord {
-    let ttl = if parsed.ttl_secs > 0 {
-        Duration::from_secs(u64::from(parsed.ttl_secs))
-    } else {
-        // 默认 60 秒，避免 RCode 错误响应被缓存为永久过期。
-        Duration::from_secs(60)
-    };
-    ip_record(parsed.req_id, parsed.ips.clone(), ttl, parsed.rcode, now)
+    // Go features/dns DefaultTTL = 600（dns_feature.DefaultTTL）。
+    const DEFAULT_TTL_SECS: u32 = 600;
+    let ttl_secs = if parsed.ttl_secs > 0 { parsed.ttl_secs } else { DEFAULT_TTL_SECS };
+    ip_record(
+        parsed.req_id,
+        parsed.ips.clone(),
+        Duration::from_secs(u64::from(ttl_secs)),
+        parsed.rcode,
+        now,
+    )
 }
 
 /// 原子计数请求 ID 生成器。对应 Go `reqIDGen`（基于 atomic counter）。
@@ -457,5 +463,66 @@ mod tests {
         let now = Instant::now();
         let res = merge_records(IpOption::all(), None, None, now);
         assert!(matches!(res, Err(DnsError::RecordNotFound)));
+    }
+
+    /// 构造 DNS 响应字节（hickory builder）。
+    fn build_response(req_id: u16, answers: Vec<(RecordType, u32, Option<IpAddr>)>) -> Vec<u8> {
+        use hickory_proto::rr::Record;
+        use hickory_proto::rr::rdata::{A, AAAA};
+        let mut msg = Message::new(req_id, MessageType::Response, OpCode::Query);
+        for (rtype, ttl, ip) in answers {
+            let Some(ip) = ip else { continue };
+            let name = Name::parse("x.test.", None).unwrap();
+            let rdata = match ip {
+                IpAddr::V4(v4) => RData::A(A(v4)),
+                IpAddr::V6(v6) => RData::AAAA(AAAA(v6)),
+            };
+            msg.add_answer(Record::from_rdata(name, ttl, rdata));
+        }
+        msg.to_vec().unwrap()
+    }
+
+    #[test]
+    fn parse_response_lifts_ttl_zero_to_one() {
+        // 对齐 Go dnscommon.go:221-223：TTL=0 → 1s（此前兜底 60s，陈旧窗口放大 60 倍）。
+        let payload = build_response(
+            7,
+            vec![(RecordType::A, 0, Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))))],
+        );
+        let parsed = parse_dns_response(&payload, 7, RecordType::A, Instant::now()).unwrap();
+        assert_eq!(parsed.ttl_secs, 1);
+    }
+
+    #[test]
+    fn parse_response_non_matching_answer_ttl_still_counts() {
+        // 对齐 Go dnscommon.go:212-227：所有 answer 的 TTL 都参与 Expire 计算，
+        // A 查询里的 AAAA 记录 TTL=5 也应压低 min_ttl。
+        let payload = build_response(
+            8,
+            vec![
+                (RecordType::AAAA, 5, Some(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))),
+                (RecordType::A, 300, Some(IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2)))),
+            ],
+        );
+        let parsed = parse_dns_response(&payload, 8, RecordType::A, Instant::now()).unwrap();
+        assert_eq!(parsed.ips, vec![IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))]);
+        assert_eq!(parsed.ttl_secs, 5);
+    }
+
+    #[test]
+    fn parsed_to_ip_record_empty_answers_default_ttl_600() {
+        // 对齐 Go dnscommon.go:203-208 defer：无任何有效 TTL → DefaultTTL 600s
+        // （此前 60s）。
+        let now = Instant::now();
+        let parsed = ParsedResponse {
+            req_id: 9,
+            ips: vec![],
+            ttl_secs: 0,
+            rcode: rcode::NO_ERROR,
+            truncated: false,
+        };
+        let rec = parsed_to_ip_record(&parsed, now);
+        let remaining = rec.expire.checked_duration_since(now).unwrap();
+        assert_eq!(remaining, Duration::from_secs(600));
     }
 }

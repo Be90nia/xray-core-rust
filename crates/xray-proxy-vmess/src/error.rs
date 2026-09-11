@@ -72,9 +72,19 @@ pub enum VmessError {
     #[error("failed to read request header")]
     ReadRequestHeaderFailed,
 
-    /// AEAD header 解密失败。
-    #[error("AEAD read failed: {0}")]
-    AeadReadFailed(String),
+    /// AEAD header 解密失败（Go server.go:165 `OpenVMessAEADHeader` 失败）。
+    ///
+    /// `should_drain`/`bytes_read` 透传给 inbound 的 drainer（Go server.go:167-169：
+    /// shouldDrain 时按 AEAD 层精确已读字节数 AcknowledgeReceive）。
+    #[error("AEAD read failed: {msg} (should_drain: {should_drain}, bytes_read: {bytes_read})")]
+    AeadReadFailed {
+        /// 错误详情。
+        msg: String,
+        /// 是否应 drain（Go encrypt.go：解密失败 true，读流失败 false）。
+        should_drain: bool,
+        /// AEAD 层已读字节数（不含 auth_id 的 16B）。
+        bytes_read: usize,
+    },
 
     /// 用户无效。
     #[error("invalid user: {0}")]

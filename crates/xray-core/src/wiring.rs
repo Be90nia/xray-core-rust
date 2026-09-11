@@ -16,8 +16,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use xray_app_dispatcher::default::{
-    AccessContext, DefaultDispatcher, DispatcherContext, Route as DispRoute,
-    RoutingContext as DispRoutingContext, RoutingRouter, SimpleOhm, SniffingRequest,
+    AccessContext, DefaultDispatcher, DispatcherContext, ExcludeDomainMatcher,
+    ExcludeIpMatcher, Route as DispRoute, RoutingContext as DispRoutingContext,
+    RoutingRouter, SimpleOhm, SniffingRequest,
 };
 use xray_app_dispatcher::{maybe_wrap_reader, maybe_wrap_writer, DispatchHandler, DispatcherError};
 use xray_mux::client::MUX_COOL_ADDRESS;
@@ -30,6 +31,15 @@ use xray_common::net::address::Address;
 use xray_common::net::destination::Destination;
 use xray_common::net::port::Port;
 use xray_transport::link::Link;
+use std::net::IpAddr;
+use std::path::Path;
+use xray_geodata::loader::GeoDataLoader;
+use xray_geodata::matcher::domain::{self as geodata_domain, parse_domain as parse_geodata_domain};
+use xray_geodata::matcher::ip::{GeneralMultiIPMatcher, HeuristicIPMatcher, IPMatcher as GeoIpMatcher};
+use xray_geodata::matcher::{AnyMatcher, LinearAnyMatcher};
+use xray_geodata::pb::domain_rule::Value as DomainRuleValue;
+use xray_geodata::pb::ip_rule::Value as IpRuleValue;
+use xray_geodata::rule_parser::{parse_domain_rule, parse_ip_rules};
 
 use crate::router::DispatchRouter;
 
@@ -251,9 +261,20 @@ impl RoutingRouter for DispatchRouterBridge {
 ///
 /// 字段映射对齐 Go `session.SniffingRequest` 构建（`infra/conf.SniffingConfig` →
 /// destOverride / domainsExcluded / ipsExcluded / metadataOnly / routeOnly）。
-/// 解析失败或无 sniffing 配置时返回 default（enabled=false，零行为变化）。
+/// domainsExcluded/ipsExcluded 经 geodata rule_parser 编译为 typed matcher
+/// （bd fv1g：字面量 contains / CIDR 静默滤掉的旧实现已废）。解析失败或无
+/// sniffing 配置时返回 default（enabled=false，零行为变化）。
 #[must_use]
 pub fn sniffing_request_from_json(v: Option<&serde_json::Value>) -> SniffingRequest {
+    sniffing_request_from_json_in(v, &resolve_asset_dir())
+}
+
+/// 同 [`sniffing_request_from_json`]，geodata 资产目录显式给定
+/// （geoip:/geosite: 展开用；测试注入）。
+fn sniffing_request_from_json_in(
+    v: Option<&serde_json::Value>,
+    datadir: &Path,
+) -> SniffingRequest {
     let Some(cfg) = v
         .cloned()
         .and_then(|v| serde_json::from_value::<xray_conf::SniffingConfig>(v).ok())
@@ -265,14 +286,158 @@ pub fn sniffing_request_from_json(v: Option<&serde_json::Value>) -> SniffingRequ
         metadata_only: cfg.metadata_only,
         route_only: cfg.route_only,
         override_destination_for_protocol: cfg.dest_override.0.clone(),
-        exclude_for_domain: cfg.domains_excluded.0.clone(),
-        exclude_for_ip: cfg
-            .ips_excluded
-            .0
-            .iter()
-            .filter_map(|s| s.parse().ok())
-            .collect(),
+        exclude_for_domain: build_domain_excluder(&cfg.domains_excluded.0, datadir),
+        exclude_for_ip: build_ip_excluder(&cfg.ips_excluded.0, datadir),
     }
+}
+
+/// proto `Domain.Type`（Substr=0/Regex=1/Domain=2/Full=3）→ matcher 层
+/// `DomainType`（Full=0/Domain=1/Substr=2/Regex=3）。两套编号不同序
+/// （对照 xray-app-router `proto_domain_type_to_matcher`）。
+fn proto_domain_type_to_matcher(t: i32) -> Option<geodata_domain::DomainType> {
+    match t {
+        0 => Some(geodata_domain::DomainType::Substr),
+        1 => Some(geodata_domain::DomainType::Regex),
+        2 => Some(geodata_domain::DomainType::Domain),
+        3 => Some(geodata_domain::DomainType::Full),
+        _ => None,
+    }
+}
+
+/// 把 proto `Domain` 编译进 matcher（Full/Domain/Substr 值小写化、Regex 原样
+/// —— Go `parseDomain` 同语义）。
+fn add_proto_domain(
+    any: &mut LinearAnyMatcher,
+    rule_id: u32,
+    d: &xray_geodata::Domain,
+) -> Result<(), String> {
+    let Some(dt) = proto_domain_type_to_matcher(d.r#type) else {
+        return Err(format!("unknown domain type {}", d.r#type));
+    };
+    let m = parse_geodata_domain(&geodata_domain::DomainRule::new(
+        dt,
+        d.value.clone(),
+        rule_id,
+    ))
+    .map_err(|e| e.to_string())?;
+    any.add(m);
+    Ok(())
+}
+
+/// domainsExcluded → typed matcher（Go `proxyman.BuildSniffingRequest` →
+/// `DomainReg.BuildDomainMatcher` 等价物）。
+///
+/// 规则形态：full:/domain:/regexp:/keyword: 前缀，无前缀 = Substr，
+/// geosite:/ext: 经 loader 展开为域名列表。单条失败 `warn` 跳过（Go 为
+/// Build 期硬错；本函数签名无 Result 且调用方在票外，降级为可见告警，
+/// 不静默吞）。
+fn build_domain_excluder(rules: &[String], datadir: &Path) -> Option<Arc<ExcludeDomainMatcher>> {
+    if rules.is_empty() {
+        return None;
+    }
+    let loader = GeoDataLoader::new(datadir.to_path_buf());
+    let mut any = LinearAnyMatcher::new();
+    let mut added = 0u32;
+    for raw in rules {
+        let rule = match parse_domain_rule(raw, xray_geodata::geosite::DomainType::Substr, datadir)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(target: "xray_core",
+                    "sniffing domainsExcluded {raw:?} 解析失败，跳过: {e}");
+                continue;
+            }
+        };
+        match rule.value {
+            Some(DomainRuleValue::Custom(d)) => match add_proto_domain(&mut any, added + 1, &d) {
+                Ok(()) => added += 1,
+                Err(e) => tracing::warn!(target: "xray_core",
+                    "sniffing domainsExcluded {raw:?} 编译失败，跳过: {e}"),
+            },
+            Some(DomainRuleValue::Geosite(gs)) => {
+                let site = if gs.attrs.is_empty() {
+                    loader.load_site(&gs.file, &gs.code)
+                } else {
+                    loader.load_site_with_attrs(&gs.file, &gs.code, &gs.attrs)
+                };
+                let site = match site {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(target: "xray_core",
+                            "sniffing domainsExcluded {raw:?} 加载 {}:{} 失败，跳过: {e}",
+                            gs.file, gs.code);
+                        continue;
+                    }
+                };
+                for d in &site.domain {
+                    match add_proto_domain(&mut any, added + 1, d) {
+                        Ok(()) => added += 1,
+                        Err(e) => tracing::warn!(target: "xray_core",
+                            "sniffing geosite {}:{} 条目编译失败，跳过: {e}", gs.file, gs.code),
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    if added == 0 {
+        return None;
+    }
+    let any = Arc::new(any);
+    Some(Arc::new(move |domain: &str| any.match_any(domain)))
+}
+
+/// ipsExcluded → typed matcher（Go `IPReg.BuildIPMatcher` 等价物）。
+///
+/// 形态：CIDR（`10.0.0.0/8`，无 `/` 按单地址）与 `geoip:XX`（loader 展开为
+/// CIDR 列表），`!` 反向前缀由 rule_parser 转为 reverse_match。单条失败
+/// `warn` 跳过（理由同 [`build_domain_excluder`]）。
+fn build_ip_excluder(rules: &[String], datadir: &Path) -> Option<Arc<ExcludeIpMatcher>> {
+    if rules.is_empty() {
+        return None;
+    }
+    let loader = GeoDataLoader::new(datadir.to_path_buf());
+    let mut matchers: Vec<Box<dyn GeoIpMatcher>> = Vec::new();
+    for raw in rules {
+        let rule = match parse_ip_rules(std::slice::from_ref(raw), datadir) {
+            Ok(mut v) if v.len() == 1 => v.remove(0),
+            Ok(_) => continue,
+            Err(e) => {
+                tracing::warn!(target: "xray_core",
+                    "sniffing ipsExcluded {raw:?} 解析失败，跳过: {e}");
+                continue;
+            }
+        };
+        match rule.value {
+            Some(IpRuleValue::Custom(cr)) => {
+                if let Some(cidr) = cr.cidr {
+                    let mut m = HeuristicIPMatcher::from_cidrs(&[cidr]);
+                    if cr.reverse_match {
+                        m.set_reverse(true);
+                    }
+                    matchers.push(Box::new(m));
+                }
+            }
+            Some(IpRuleValue::Geoip(gr)) => match loader.load_ip(&gr.file, &gr.code) {
+                Ok(geoip) => {
+                    let mut m = HeuristicIPMatcher::from_cidrs(&geoip.cidr);
+                    if gr.reverse_match {
+                        m.set_reverse(true);
+                    }
+                    matchers.push(Box::new(m));
+                }
+                Err(e) => tracing::warn!(target: "xray_core",
+                    "sniffing ipsExcluded {raw:?} 加载 {}:{} 失败，跳过: {e}",
+                    gr.file, gr.code),
+            },
+            None => {}
+        }
+    }
+    if matchers.is_empty() {
+        return None;
+    }
+    let multi = Arc::new(GeneralMultiIPMatcher::new(matchers));
+    Some(Arc::new(move |ip: IpAddr| multi.match_ip(ip)))
 }
 
 /// Mux carrier 拦截装饰器：对应 Go proxyman always.go:89 `mux: mux.NewServer(ctx)`
@@ -620,19 +785,27 @@ fn parse_routing_json_to_proto_in(
         for r in arr {
             let outbound_tag = r.get("outboundTag").and_then(|x| x.as_str()).unwrap_or("");
             let balancer_tag = r.get("balancerTag").and_then(|x| x.as_str()).unwrap_or("");
-            let target_tag = if !balancer_tag.is_empty() {
-                Some(TargetTag::BalancingTag(balancer_tag.to_string()))
-            } else if !outbound_tag.is_empty() {
+            let target_tag = if !outbound_tag.is_empty() {
                 Some(TargetTag::Tag(outbound_tag.to_string()))
+            } else if !balancer_tag.is_empty() {
+                Some(TargetTag::BalancingTag(balancer_tag.to_string()))
             } else {
-                // 既无 outboundTag 也无 balancerTag：无法路由，跳过（与 Go 一致）
-                continue;
+                // 对齐 Go router.go:170-171：双 tag 缺失直接报错拒启
+                // （此前静默 continue 丢规则）。
+                return Err(WiringError::JsonParse(
+                    "neither outboundTag nor balancerTag is specified in routing rule".into(),
+                ));
             };
 
             // Domain 规则：Go 前缀语法（full:/domain:/regexp:/keyword:/geosite:/ext:，
             // 无前缀 = Substr），geosite 条目经 check_file 校验 geodata 资产可用性。
             let mut domains = Vec::new();
-            for d in json_str_iter(r.get("domain")) {
+            let domain_list: Vec<&str> = match r.get("domains").and_then(|x| x.as_array()) {
+                // Go router.go:182-188：`domains` 键存在时覆盖 `domain`。
+                Some(arr) => arr.iter().filter_map(|x| x.as_str()).collect(),
+                None => json_str_iter(r.get("domain")).collect(),
+            };
+            for d in domain_list {
                 let pb_rule = xray_geodata::rule_parser::parse_domain_rule(
                     d,
                     xray_geodata::geosite::DomainType::Substr,
@@ -684,30 +857,53 @@ fn parse_routing_json_to_proto_in(
                 ips.push(geodata_ip_rule_to_proto(p));
             }
 
+            // Go router.go:206-208：`sourceIP` 优先，缺省回退 `source`。
+            let source_key = if r.get("sourceIP").is_some() { "sourceIP" } else { "source" };
             let mut source_ips = Vec::new();
             for p in xray_geodata::rule_parser::parse_ip_rules(
-                &json_string_list(r.get("source")),
+                &json_string_list(r.get(source_key)),
                 datadir,
             )
-            .map_err(|e| WiringError::JsonParse(format!("routing rule source: {e}")))?
+            .map_err(|e| WiringError::JsonParse(format!("routing rule {source_key}: {e}")))?
             {
                 source_ips.push(geodata_ip_rule_to_proto(p));
             }
 
+            // Go router.go:222-232：localIP / localPort。
+            let mut local_ips = Vec::new();
+            for p in xray_geodata::rule_parser::parse_ip_rules(
+                &json_string_list(r.get("localIP")),
+                datadir,
+            )
+            .map_err(|e| WiringError::JsonParse(format!("routing rule localIP: {e}")))?
+            {
+                local_ips.push(geodata_ip_rule_to_proto(p));
+            }
+
+
             cfg.rule.push(RoutingRule {
                 target_tag,
-                rule_tag: String::new(),
+                rule_tag: r.get("ruleTag").and_then(|x| x.as_str()).unwrap_or("").to_string(),
                 domain: domains,
                 ip: ips,
                 source_ip: source_ips,
                 port_list: parse_port_list(r.get("port")),
                 source_port_list: parse_port_list(r.get("sourcePort")),
+                local_ip: local_ips,
+                local_port_list: parse_port_list(r.get("localPort")),
+                vless_route_list: parse_port_list(r.get("vlessRoute")),
                 networks: parse_networks(r.get("network")),
                 user_email: json_string_list(r.get("user")),
                 inbound_tag: json_string_list(r.get("inboundTag")),
                 protocol: json_string_list(r.get("protocol")),
                 process: json_string_list(r.get("process")),
-                attributes: parse_attributes(r.get("attributes")),
+                // 对齐 Go router.go:147 json 键 `attrs`（`attributes` 仅作
+                // Rust 旧方言别名保留）。
+                attributes: parse_attributes(
+                    if r.get("attrs").is_some() { r.get("attrs") } else { r.get("attributes") },
+                ),
+                // 对齐 Go router.go:264-270：webhook → WebhookConfig。
+                webhook: r.get("webhook").and_then(parse_webhook_config),
                 ..Default::default()
             });
         }
@@ -830,6 +1026,36 @@ fn parse_port_list(
                 to: u32::from(r.end),
             })
             .collect(),
+    })
+}
+
+/// `webhook` 字段 → proto `WebhookConfig`（对齐 Go router.go:126-130/264-270：
+/// `{url, deduplication, headers}`，url 为空则不构建）。
+fn parse_webhook_config(v: &serde_json::Value) -> Option<xray_proto::xray::app::router::WebhookConfig> {
+    let obj = v.as_object()?;
+    let url = obj.get("url").and_then(|x| x.as_str()).unwrap_or("");
+    if url.is_empty() {
+        return None;
+    }
+    let headers = obj
+        .get("headers")
+        .and_then(|x| x.as_object())
+        .map(|m| {
+            m.iter()
+                .map(|(k, val)| {
+                    let s = match val {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    (k.clone(), s)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(xray_proto::xray::app::router::WebhookConfig {
+        url: url.to_string(),
+        deduplication: obj.get("deduplication").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+        headers,
     })
 }
 
@@ -971,8 +1197,10 @@ fn geodata_domain_rule_to_proto(
 /// rttb：JSON `strategy.settings`（leastload 调优参数）→ `StrategyLeastLoadConfig`
 /// proto bytes，再包成 `TypedMessage`。
 ///
-/// JSON 字段命名对齐 Go `infra/conf/router.go`：`baselines`/`expectedNodes`/
-/// `maxRTT`/`tolerance`/`costs`（costs 子字段 `regexp`/`match`/`value`）。
+/// JSON 键对齐 Go `infra/conf/router_strategy.go:33-98`：`costs`/`baselines`/
+/// `expected`/`maxRTT`/`tolerance`（`expectedNodes` 为 Rust 旧方言别名保留）。
+/// `baselines`/`maxRTT` 接受 Go duration 字符串（`"400ms"`）或纳秒数字——
+/// 此前只认 `as_i64`，Go 文档式配置整体静默丢弃（cb0q）。
 /// 编码失败 → `None`（消费端走默认，避免 hard-error 阻断整个 balancer）。
 fn leastload_settings_to_typed_message(v: &serde_json::Value) -> Option<xray_proto::xray::common::serial::TypedMessage> {
     use prost::Message;
@@ -980,20 +1208,29 @@ fn leastload_settings_to_typed_message(v: &serde_json::Value) -> Option<xray_pro
     let obj = v.as_object()?;
     let mut cfg = StrategyLeastLoadConfig::default();
     if let Some(arr) = obj.get("baselines").and_then(|x| x.as_array()) {
+        // Go router_strategy.go:92-98：非正值跳过。
         cfg.baselines = arr
             .iter()
-            .filter_map(|x| x.as_i64())
+            .filter_map(parse_duration_ns)
+            .filter(|&ns| ns > 0)
             .collect();
     }
-    // Go `expectedNodes` → proto `expected`
-    if let Some(n) = obj.get("expectedNodes").and_then(|x| x.as_i64()) {
-        cfg.expected = n as i32;
+    // Go json 键 `expected`（router_strategy.go:39）；`expectedNodes` 为兼容别名。
+    if let Some(n) = obj
+        .get("expected")
+        .or_else(|| obj.get("expectedNodes"))
+        .and_then(|x| x.as_i64())
+    {
+        // Go router_strategy.go:85-87：负值归 0。
+        cfg.expected = n.clamp(0, i32::MAX as i64) as i32;
     }
-    if let Some(n) = obj.get("maxRTT").and_then(|x| x.as_i64()) {
-        cfg.max_rtt = n;
+    if let Some(ns) = obj.get("maxRTT").and_then(parse_duration_ns) {
+        // Go router_strategy.go:89-91：负值归 0。
+        cfg.max_rtt = ns.max(0);
     }
     if let Some(t) = obj.get("tolerance").and_then(|x| x.as_f64()) {
-        cfg.tolerance = t as f32;
+        // Go router_strategy.go:78-83：clamp 到 [0, 1]。
+        cfg.tolerance = t.clamp(0.0, 1.0) as f32;
     }
     if let Some(arr) = obj.get("costs").and_then(|x| x.as_array()) {
         cfg.costs = arr
@@ -1016,6 +1253,54 @@ fn leastload_settings_to_typed_message(v: &serde_json::Value) -> Option<xray_pro
         r#type: "xray.app.router.StrategyLeastLoadConfig".to_string(),
         value: buf,
     })
+}
+
+/// Go `cfgcommon/duration.Duration`：JSON 数字 = 纳秒，字符串 = Go duration
+/// 语法（`"300ms"` / `"1.5h"` / `"2h45m"`，支持 ns/us/ms/s/m/h；Go 的 `µs`
+/// 记为 `us`）。无法解析 → `None`。
+fn parse_duration_ns(v: &serde_json::Value) -> Option<i64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        serde_json::Value::String(s) => parse_go_duration_str(s),
+        _ => None,
+    }
+}
+
+fn parse_go_duration_str(s: &str) -> Option<i64> {
+    let neg = s.trim_start().starts_with('-');
+    let s = s.trim().trim_start_matches(['-', '+']);
+    let mut total: f64 = 0.0;
+    let mut rest = s;
+    while !rest.is_empty() {
+        let idx = rest.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(rest.len());
+        if idx == 0 {
+            return None;
+        }
+        let num: f64 = rest[..idx].parse().ok()?;
+        rest = &rest[idx..];
+        let (mult, next) = if let Some(r) = rest.strip_prefix("ns") {
+            (1.0, r)
+        } else if let Some(r) = rest.strip_prefix("us") {
+            (1e3, r)
+        } else if let Some(r) = rest.strip_prefix("ms") {
+            (1e6, r)
+        } else if let Some(r) = rest.strip_prefix('s') {
+            (1e9, r)
+        } else if let Some(r) = rest.strip_prefix('m') {
+            (6e10, r)
+        } else if let Some(r) = rest.strip_prefix('h') {
+            (3.6e12, r)
+        } else {
+            return None;
+        };
+        total += num * mult;
+        rest = next;
+    }
+    if s.is_empty() {
+        return None;
+    }
+    let v = total as i64;
+    Some(if neg { -v } else { v })
 }
 
 /// 接线错误。
@@ -1104,16 +1389,55 @@ mod tests {
     }
 
     #[test]
-    fn build_adapter_from_json_skips_rule_without_outbound_tag() {
+    fn parse_routing_json_missing_both_tags_errors() {
+        // 对齐 Go router.go:170-171：双 tag 缺失报错拒启（此前静默丢规则）。
         let json = br#"{"rules":[{"domain":["x.com"]}]}"#;
-        let adapter = build_router_adapter_from_json(json).expect("build adapter");
-        use xray_common::net::network::Network;
-        let dest = Destination::new(
-            Address::Domain("x.com".into()),
-            Port::new(80),
-            Network::TCP,
+        let err = build_router_adapter_from_json(json).unwrap_err();
+        assert!(
+            err.to_string().contains("neither outboundTag nor balancerTag"),
+            "unexpected error: {err}"
         );
-        assert!(adapter.pick_outbound_tag(&dest).is_none());
+    }
+
+    #[test]
+    fn parse_routing_json_covers_2wse_fields() {
+        // 对齐 Go infra/conf/router.go:132-273：ruleTag/localIP/localPort/
+        // vlessRoute/attrs/webhook/sourceIP 别名。
+        let json = br#"{
+            "rules": [{
+                "ruleTag": "rt1",
+                "outboundTag": "proxy",
+                "sourceIP": ["10.1.0.0/16"],
+                "localIP": ["127.0.0.0/8"],
+                "localPort": "8000-9000",
+                "vlessRoute": "100-200",
+                "attrs": {"env": "prod"},
+                "webhook": {"url": "http://127.0.0.1:9911/hook", "deduplication": 3,
+                            "headers": {"X-Test": "v"}}
+            }]
+        }"#;
+        let cfg = parse_routing_json_to_proto(json).expect("parse");
+        let rule = &cfg.rule[0];
+        assert_eq!(rule.rule_tag, "rt1");
+        assert_eq!(rule.local_ip.len(), 1, "localIP must parse");
+        assert!(rule.local_port_list.is_some(), "localPort must parse");
+        assert!(rule.vless_route_list.is_some(), "vlessRoute must parse");
+        assert_eq!(rule.attributes.get("env").map(String::as_str), Some("prod"),
+            "attrs 键必须被识别");
+        let wh = rule.webhook.as_ref().expect("webhook must build");
+        assert_eq!(wh.url, "http://127.0.0.1:9911/hook");
+        assert_eq!(wh.deduplication, 3);
+        assert_eq!(wh.headers.get("X-Test").map(String::as_str), Some("v"));
+        // sourceIP 别名（而非 source）落入 source_ip。
+        assert_eq!(rule.source_ip.len(), 1);
+    }
+
+    #[test]
+    fn parse_routing_json_attrs_alias_keeps_attributes_fallback() {
+        // attrs 优先；仅 attributes（旧方言）时仍回退可用，不破坏既有配置。
+        let json = br#"{"rules":[{"outboundTag":"p","attributes":{"a":"1"}}]}"#;
+        let cfg = parse_routing_json_to_proto(json).expect("parse");
+        assert_eq!(cfg.rule[0].attributes.get("a").map(String::as_str), Some("1"));
     }
 
     #[test]
@@ -1242,6 +1566,47 @@ mod tests {
         assert_eq!(cfg_decoded.costs[0].r#match, "a");
         assert!((cfg_decoded.costs[0].value - 1.5).abs() < 1e-5);
 
+    }
+
+    #[test]
+    fn parse_routing_json_leastload_official_keys_and_durations() {
+        // cb0q：Go 文档式 leastload settings——`expected` 键 + duration 字符串
+        // （"400ms"→4e5 纳秒），此前 expected 丢/baselines+maxRTT 字符串整体丢弃。
+        use prost::Message;
+        let json = br#"{
+            "balancers":[{
+                "tag":"bl",
+                "selector":["a"],
+                "strategy":{"type":"leastload","settings":{
+                    "expected":6,
+                    "baselines":["400ms","1s"],
+                    "maxRTT":"1000ms",
+                    "tolerance":1.5
+                }}
+            }]
+        }"#;
+        let cfg = parse_routing_json_to_proto(json).expect("parse");
+        let ts = cfg.balancing_rule[0].strategy_settings.as_ref().expect("settings");
+        let decoded = xray_proto::xray::app::router::StrategyLeastLoadConfig::decode(ts.value.as_slice())
+            .expect("decode");
+        assert_eq!(decoded.expected, 6, "官方 expected 键必须生效");
+        assert_eq!(decoded.baselines, vec![400_000_000, 1_000_000_000],
+            "duration 字符串必须转纳秒");
+        assert_eq!(decoded.max_rtt, 1_000_000_000);
+        // Go router_strategy.go:81-83：tolerance clamp 到 1。
+        assert!((decoded.tolerance - 1.0).abs() < 1e-5, "tolerance 必须 clamp 到 [0,1]");
+    }
+
+    #[test]
+    fn parse_duration_ns_go_syntax() {
+        // Go duration 语法（cfgcommon/duration）：数字=纳秒；字符串支持单位拼接。
+        assert_eq!(parse_duration_ns(&serde_json::json!(500)), Some(500));
+        assert_eq!(parse_duration_ns(&serde_json::json!("400ms")), Some(400_000_000));
+        assert_eq!(parse_duration_ns(&serde_json::json!("1s")), Some(1_000_000_000));
+        assert_eq!(parse_duration_ns(&serde_json::json!("2h45m")), Some(9_900_000_000_000));
+        assert_eq!(parse_duration_ns(&serde_json::json!("1.5h")), Some(5_400_000_000_000));
+        assert_eq!(parse_duration_ns(&serde_json::json!("junk")), None);
+        assert_eq!(parse_duration_ns(&serde_json::json!(true)), None);
     }
 
     #[test]
@@ -1676,6 +2041,98 @@ mod tests {
             &nodat,
         )
         .expect("plain rules must not require geodata assets");
+    }
+
+    // ---- sniffing_request_from_json（bd fv1g：domainsExcluded/ipsExcluded typed matcher）----
+
+    /// Go 官方样例形态（infra/conf/xray_test.go:163-165）：full:/domain:/regexp:/
+    /// 单 IP + CIDR，另加 keyword: 值小写化断言。纯 Custom 规则不触盘。
+    #[test]
+    fn sniffing_exclusions_four_forms_and_case_folding() {
+        let json = serde_json::json!({
+            "enabled": true,
+            "destOverride": ["http", "tls"],
+            "domainsExcluded": [
+                "full:api.example.com",
+                "domain:blocked.example",
+                "regexp:^test[0-9]+\\.internal$",
+                "keyword:ADS"
+            ],
+            "ipsExcluded": ["192.168.1.1", "2001:db8::/32"]
+        });
+        let req = sniffing_request_from_json_in(Some(&json), Path::new("/nonexistent"));
+        assert!(req.enabled);
+        let dom = req.exclude_for_domain.expect("domain matcher built");
+        // full: 精确匹配（非后缀）
+        assert!(dom("api.example.com"));
+        assert!(!dom("sub.api.example.com"));
+        // domain: 域名后缀（label 对齐，非子串）
+        assert!(dom("blocked.example"));
+        assert!(dom("www.blocked.example"));
+        assert!(!dom("blocked.example.com"));
+        assert!(!dom("xblocked.example"));
+        // regexp: 正则（Go 把 ToLower 后的输入交给 matcher）
+        assert!(dom("test42.internal"));
+        assert!(!dom("test-42.internal"));
+        // keyword: 子串；规则值 "ADS" 必须小写化为 "ads"（大小写混合断言）
+        assert!(dom("www.ads.example.com"));
+        assert!(!dom("example.org"));
+        // IP：单地址形态（无 / 前缀）
+        let ipm = req.exclude_for_ip.expect("ip matcher built");
+        assert!(ipm("192.168.1.1".parse().unwrap()));
+        assert!(!ipm("192.168.1.2".parse().unwrap()));
+        // IP：CIDR 形态（此前被静默滤掉）
+        assert!(ipm("2001:db8:aa::1".parse().unwrap()));
+        assert!(!ipm("2001:db9::1".parse().unwrap()));
+    }
+
+    /// geoip: 前缀经 loader 展开为 CIDR（Go ParseIPRules → matcher 同路径）。
+    #[test]
+    fn sniffing_ip_exclude_geoip_expansion() {
+        let dir = temp_asset_dir("sniff-geoip");
+        std::fs::write(dir.join("geoip.dat"), make_geoip_dat()).unwrap();
+        let json = serde_json::json!({
+            "enabled": true,
+            "ipsExcluded": ["geoip:private"]
+        });
+        let req = sniffing_request_from_json_in(Some(&json), &dir);
+        let ipm = req.exclude_for_ip.expect("geoip matcher built");
+        assert!(ipm("10.1.2.3".parse().unwrap()));
+        assert!(ipm("192.168.5.5".parse().unwrap()));
+        assert!(ipm("127.0.0.1".parse().unwrap()));
+        assert!(!ipm("8.8.8.8".parse().unwrap()));
+    }
+
+    /// 单条坏规则 warn 跳过、其余保留（Go 为 Build 期硬错；本函数签名无
+    /// Result 且调用方在票外，降级为可见告警，不静默吞、不整表作废）。
+    #[test]
+    fn sniffing_exclusions_bad_rule_skipped_others_kept() {
+        let json = serde_json::json!({
+            "enabled": true,
+            "domainsExcluded": ["full:good.example", "regexp:([bad"],
+            "ipsExcluded": ["not-an-ip", "10.0.0.0/8"]
+        });
+        let req = sniffing_request_from_json_in(Some(&json), Path::new("/nonexistent"));
+        let dom = req.exclude_for_domain.expect("good rule kept");
+        assert!(dom("good.example"));
+        assert!(!dom("anything-else"));
+        let ipm = req.exclude_for_ip.expect("good cidr kept");
+        assert!(ipm("10.1.2.3".parse().unwrap()));
+        assert!(!ipm("11.1.2.3".parse().unwrap()));
+    }
+
+    /// 无排除配置 → matcher 为 None（Go nil），enabled 等字段照常透传。
+    #[test]
+    fn sniffing_no_exclusions_yields_none_matchers() {
+        let json = serde_json::json!({ "enabled": true, "destOverride": ["http"] });
+        let req = sniffing_request_from_json_in(Some(&json), Path::new("/nonexistent"));
+        assert!(req.enabled);
+        assert!(req.exclude_for_domain.is_none());
+        assert!(req.exclude_for_ip.is_none());
+        let none = sniffing_request_from_json_in(None, Path::new("/nonexistent"));
+        assert!(!none.enabled);
+        assert!(none.exclude_for_domain.is_none());
+        assert!(none.exclude_for_ip.is_none());
     }
 
     /// sm80①：wiring 层 inbound tag counter 受 ForSystem().Stats.Inbound*

@@ -169,8 +169,10 @@ impl Client {
         Ok(Self {
             server,
             skip_fallback: ns.skip_fallback,
+            // Go dns.go:89-92/142-145：tag 空 → `xray.system.<uuid>`（全局唯一，
+            // 防用户配置碰撞后 IsOwnLink 误判环）；此前恒 "default"。
             tag: if ns.tag.is_empty() {
-                "default".to_string()
+                crate::config::generate_random_tag()
             } else {
                 ns.tag
             },
@@ -180,8 +182,10 @@ impl Client {
             policy_id: ns.policy_id,
             act_prior: ns.act_prior,
             act_unprior: ns.act_unprior,
-            expected_ips: build_ip_matcher(&ns.expected_ip_rules),
-            unexpected_ips: build_ip_matcher(&ns.unexpected_ip_rules),
+            // matcher 构建失败 → 启动报错（Go BuildIPMatcher 错误上抛，
+            // 此前静默 None 使 expectedIPs 过滤整体失效）。
+            expected_ips: build_ip_matcher(&ns.expected_ip_rules)?,
+            unexpected_ips: build_ip_matcher(&ns.unexpected_ip_rules)?,
         })
     }
 
@@ -247,21 +251,22 @@ impl Client {
     }
 }
 
-/// 从 IP 规则列表构建匹配器（空列表 → None）。对应 Go `geodata.IPReg.BuildIPMatcher`。
+/// 从 IP 规则列表构建匹配器。对应 Go `geodata.IPReg.BuildIPMatcher`：
+/// 规则列表为空 → None（无过滤）；构建失败 → 传播错误（启动报错）。
 fn build_ip_matcher(
     rules: &[xray_geodata::pb::IpRule],
-) -> Option<Box<dyn xray_geodata::matcher::ip::IPMatcher>> {
+) -> Result<Option<Box<dyn xray_geodata::matcher::ip::IPMatcher>>, DnsError> {
     if rules.is_empty() {
-        return None;
+        return Ok(None);
     }
-    match xray_geodata::matcher::ip::build_optimized_ip_matcher(rules) {
-        Ok(m) => Some(m),
-        Err(_) => None,
-    }
+    Ok(Some(
+        xray_geodata::matcher::ip::build_optimized_ip_matcher(rules)
+            .map_err(|e| DnsError::WireFormat(format!("build ip matcher: {e}")))?,
+    ))
 }
 /// - `tls://IP[:port]` → DoT (默认 853)
 /// - `https://IP[:port][/path]` → DoH (默认 443, path 默认 /dns-query)
-/// - `quic://IP[:port]` → DoQ (默认 854)
+/// - `quic://IP[:port]` → DoQ (默认 853，Go nameserver_quic.go:41)
 ///
 /// 仅接受 IP 地址（不含域名解析，避免 DNS 循环依赖）。
 /// server_name (TLS SNI) 取自 IP 字符串。
@@ -302,7 +307,8 @@ pub fn new_server_with_config(
         "" | "tcp" => 53u16,
         "tls" => 853,
         "https" | "h2c" => 443,
-        "quic" => 854,
+        // Go nameserver_quic.go:41：DoQ 缺省端口 853。
+        "quic" => 853,
         other => return Err(DnsError::WireFormat(format!("unknown DNS scheme: {other}"))),
     };
 

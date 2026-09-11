@@ -415,35 +415,37 @@ impl WgDriver {
     /// 单 peer：直接解封装。
     /// 多 peer：先查 addr_route 缓存，miss 时遍历所有 peer。
     fn decapsulate_incoming(&self, data: &[u8], src: SocketAddr) -> Option<(usize, Vec<Output>)> {
+        // Go bind.go:47-75 语义：endpoint 仅在包 MAC/解密验证成功后绑定——
+        // 伪源 UDP 包不得搅动 roaming 路由（bd 250w）。
         let table = self.peer_table.read();
         if table.peers.len() == 1 {
-            table.peers[0].set_endpoint(src);
-            *self.remote.lock() = Some(src);
-            return table
+            let outs = table
                 .peers[0]
                 .with_tunnel(|t| t.decapsulate(data))
-                .ok()
-                .map(|outs| (0, outs));
+                .ok()?;
+            table.peers[0].set_endpoint(src);
+            *self.remote.lock() = Some(src);
+            return Some((0, outs));
         }
         // 查缓存
         let cached = self.addr_route.lock().get(&src).copied();
         if let Some(idx) = cached {
             // 表可能已被 add/remove 热插改变——越界视为 miss
             if let Some(peer) = table.peers.get(idx) {
-                peer.set_endpoint(src);
                 if let Ok(outs) = peer.with_tunnel(|t| t.decapsulate(data)) {
+                    peer.set_endpoint(src);
                     if !outs.is_empty() {
                         return Some((idx, outs));
                     }
                 }
             }
         }
-        // 遍历所有 peer（WG MAC 验证确保只有正确 peer 产生输出）
+        // 遍历所有 peer（WG MAC 验证确保只有正确 peer 产生输出）；验证成功才绑定
         let mut matched: Option<(usize, Vec<Output>)> = None;
         for (idx, peer) in table.peers.iter().enumerate() {
-            peer.set_endpoint(src);
             if let Ok(outs) = peer.with_tunnel(|t| t.decapsulate(data)) {
                 if !outs.is_empty() {
+                    peer.set_endpoint(src);
                     matched = Some((idx, outs));
                     break;
                 }
@@ -980,6 +982,120 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    /// bd 250w：endpoint 仅在解密验证成功后绑定——伪源 UDP 包不得改写
+    /// roaming endpoint / remote（Go bind.go:47-75）。
+    #[tokio::test]
+    async fn spurious_packet_does_not_touch_single_peer_endpoint() {
+        let (sec_c, pub_c) = make_keypair(0x11);
+        let (sec_s, pub_s) = make_keypair(0x22);
+        let device = DeviceConfig { secret_key: sec_s, ..Default::default() };
+        let peer = shared_peer(
+            &device,
+            &PeerConfig { public_key: pub_c, ..Default::default() },
+            0,
+        )
+        .expect("peer");
+        let driver = make_multi_driver(vec![peer], vec![vec![]]);
+
+        let src: std::net::SocketAddr = "198.51.100.9:51820".parse().expect("addr");
+
+        // 垃圾包（非 WG 格式，MAC 验证必败）：endpoint 不得被绑定
+        let junk = vec![0xFFu8; 64];
+        assert!(driver.decapsulate_incoming(&junk, src).is_none());
+        assert_eq!(driver.peer(0).unwrap().endpoint(), None, "伪源包不得绑定 endpoint");
+        assert_eq!(*driver.remote.lock(), None);
+
+        // 有效握手 init（真 client key）→ decapsulate Ok → endpoint 绑定
+        let client_cfg = DeviceConfig {
+            secret_key: sec_c,
+            peers: vec![PeerConfig { public_key: pub_s, ..Default::default() }],
+            ..Default::default()
+        };
+        let mut client_tunnel =
+            crate::tunnel::Tunnel::from_config(&client_cfg, &client_cfg.peers[0]).expect("tunnel");
+        let outs = client_tunnel.encapsulate(&[]).expect("handshake init");
+        let init = outs
+            .iter()
+            .find_map(|o| match o {
+                Output::Network(wg) => Some(wg.clone()),
+                _ => None,
+            })
+            .expect("handshake init packet");
+        let (idx, _) = driver
+            .decapsulate_incoming(&init, src)
+            .expect("valid init decapsulates");
+        assert_eq!(idx, 0);
+        assert_eq!(
+            driver.peer(0).unwrap().endpoint(),
+            Some(src),
+            "解密验证成功后绑定 endpoint"
+        );
+        assert_eq!(*driver.remote.lock(), Some(src));
+    }
+
+    /// bd 250w 多 peer：伪源包遍历全部 peer 失败后不绑定任何 peer endpoint。
+    #[tokio::test]
+    async fn multi_peer_spurious_packet_binds_nothing() {
+        let (sec_s, pub_a) = make_keypair(0x11);
+        let (_, pub_b) = make_keypair(0x33);
+        let device = DeviceConfig { secret_key: sec_s, ..Default::default() };
+        let pa = shared_peer(
+            &device,
+            &PeerConfig { public_key: pub_a, ..Default::default() },
+            0,
+        )
+        .expect("peer a");
+        let pb = shared_peer(
+            &device,
+            &PeerConfig { public_key: pub_b, ..Default::default() },
+            1,
+        )
+        .expect("peer b");
+        let driver = make_multi_driver(vec![pa, pb], vec![vec![], vec![]]);
+        let bogus: std::net::SocketAddr = "198.51.100.9:4444".parse().expect("addr");
+        let junk = vec![0xFFu8; 64];
+        assert!(driver.decapsulate_incoming(&junk, bogus).is_none());
+        for i in 0..2 {
+            assert_eq!(driver.peer(i).unwrap().endpoint(), None, "伪源包不绑定任何 peer");
+        }
+    }
+
+    /// bd ttni：双用户下行各归各——route_outgoing 按 allowed_cidrs 命中
+    /// 各自 peer（解析丢弃 allowedIPs 时全发 peers[0] 的旧行为回归面）。
+    #[test]
+    fn route_outgoing_dispatches_by_allowed_cidrs() {
+        let (sec_s, pub_a) = make_keypair(0x11);
+        let (_, pub_b) = make_keypair(0x33);
+        let device = DeviceConfig { secret_key: sec_s, ..Default::default() };
+        let pa = shared_peer(
+            &device,
+            &PeerConfig { public_key: pub_a, allowed_ips: vec!["10.0.1.0/24".into()], ..Default::default() },
+            0,
+        )
+        .expect("peer a");
+        let pb = shared_peer(
+            &device,
+            &PeerConfig { public_key: pub_b, allowed_ips: vec!["10.0.2.0/24".into()], ..Default::default() },
+            1,
+        )
+        .expect("peer b");
+        let driver = make_multi_driver(vec![pa, pb], vec![vec![cidr_24(10, 0, 1)], vec![cidr_24(10, 0, 2)]]);
+
+        // 下行 IPv4 包：dst 10.0.1.7 → peer0；dst 10.0.2.9 → peer1
+        let pkt_for_a = make_ipv4_probe([10, 0, 1, 7]);
+        let pkt_for_b = make_ipv4_probe([10, 0, 2, 9]);
+        assert_eq!(driver.route_outgoing(&pkt_for_a), 0, "user a 下行归 peer a");
+        assert_eq!(driver.route_outgoing(&pkt_for_b), 1, "user b 下行归 peer b");
+    }
+
+    /// 20 字节 IPv4 头探针（version=4，dst = 最后 4 字节）。
+    fn make_ipv4_probe(dst: [u8; 4]) -> Vec<u8> {
+        let mut pkt = vec![0u8; 20];
+        pkt[0] = 0x40;
+        pkt[16..20].copy_from_slice(&dst);
+        pkt
     }
 }
 

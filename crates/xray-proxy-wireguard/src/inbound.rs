@@ -27,7 +27,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
-use xray_app_dispatcher::DispatchHandler;
+use xray_app_dispatcher::{AccessContext, DispatchHandler};
 use xray_buf::io::{new_reader, new_writer};
 use xray_common::net::address::Address;
 use xray_common::net::destination::Destination;
@@ -68,7 +68,8 @@ pub struct WireguardInboundHandler {
     /// dispatcher handler（TCP accept 后桥接到 outbound）。
     dispatch: Arc<dyn DispatchHandler>,
     /// 动态用户注册表（AddUser/RemoveUser，Go `users sync.Map` 等价物）。
-    registry: WgUserRegistry,
+    /// Arc 共享给 accept loop（dispatch 挂 per-user 上下文，bd ttni）。
+    registry: Arc<WgUserRegistry>,
 }
 
 impl WireguardInboundHandler {
@@ -89,11 +90,8 @@ impl WireguardInboundHandler {
         dispatch: Arc<dyn DispatchHandler>,
     ) -> Result<Self> {
         let tag = tag.into();
-        if config.peers.is_empty() {
-            return Err(crate::error::WgError::InvalidConfig(
-                "wireguard inbound requires at least one peer".into(),
-            ));
-        }
+        // bd 7v0k③：peers 空允许启动（Go 官方空配置 + API 建户；
+        // xray api inbound_user_add 载荷支持另票）
         // 创建所有配置的 peer session（multi-peer server 模式）
         let mut peers = Vec::with_capacity(config.peers.len());
         let mut allowed_cidrs = Vec::with_capacity(config.peers.len());
@@ -109,7 +107,7 @@ impl WireguardInboundHandler {
 
         // 动态用户注册表（同 driver 槽 Arc 共享，AddUser/RemoveUser 热插）
         let driver_slot: DriverSlot = Arc::new(ParkMutex::new(None));
-        let registry = WgUserRegistry::new(config.clone(), Arc::clone(&driver_slot))?;
+        let registry = Arc::new(WgUserRegistry::new(config.clone(), Arc::clone(&driver_slot))?);
 
         // 绑定监听 UDP
         let bind_addr = format!("0.0.0.0:{listen_port}");
@@ -167,13 +165,14 @@ impl WireguardInboundHandler {
             .ok_or_else(|| InboundError::Closed(self.tag.clone()))?;
 
         let netstack = Arc::clone(&self.netstack);
+        let registry = Arc::clone(&self.registry);
         let dispatch = Arc::clone(&self.dispatch);
 
         let handle = tokio::spawn(async move {
             // driver loop 与 accept loop 在同一 task 内 select! 并发
             tokio::select! {
                 _ = driver.main_loop() => {}
-                _ = wg_accept_loop(netstack, dispatch) => {}
+                _ = wg_accept_loop(netstack, registry, dispatch) => {}
             }
         });
         *self.join.lock() = Some(handle);
@@ -241,6 +240,7 @@ fn parse_local_cidrs(config: &DeviceConfig) -> Result<Vec<smoltcp::wire::IpCidr>
 /// 每条新连接 spawn duplex 中继 + dispatch。
 async fn wg_accept_loop(
     netstack: Arc<AsyncMutex<WgNetStack>>,
+    registry: Arc<WgUserRegistry>,
     dispatch: Arc<dyn DispatchHandler>,
 ) {
     let mut timer = interval(Duration::from_millis(ACCEPT_POLL_MS));
@@ -287,10 +287,24 @@ async fn wg_accept_loop(
             };
             tokio::spawn(relay.run());
 
-            // spawn dispatch（link → outbound）
+            // spawn dispatch（link → outbound），挂 per-user 上下文
+            // （Go server.go:352-364：GetUserByAddr(隧道内源) →
+            // session.Inbound{Source, User}；bd ttni）
+            let user = match &event.remote.addr {
+                smoltcp::wire::IpAddress::Ipv4(v4) => registry
+                    .get_user_by_addr(std::net::IpAddr::V4(std::net::Ipv4Addr::from(v4.octets()))),
+                smoltcp::wire::IpAddress::Ipv6(v6) => registry
+                    .get_user_by_addr(std::net::IpAddr::V6(std::net::Ipv6Addr::from(v6.octets()))),
+            };
+            let access = AccessContext {
+                from: event.remote.to_string(),
+                email: user.as_ref().map(|u| u.email.clone()).unwrap_or_default(),
+                level: user.as_ref().map_or(0, |u| u.level),
+                inbound_tag: String::new(),
+            };
             let dispatch = Arc::clone(&dispatch);
             tokio::spawn(async move {
-                dispatch.dispatch(&dest, link).await;
+                dispatch.dispatch_with_access(&dest, link, access).await;
             });
         }
     }
@@ -454,6 +468,17 @@ mod tests {
         (Arc::new(d), calls)
     }
 
+    /// 空 driver 槽的合法注册表（accept loop 直测用，无需真 driver）。
+    fn test_registry() -> Arc<WgUserRegistry> {
+        Arc::new(
+            WgUserRegistry::new(
+                DeviceConfig { secret_key: "aa".repeat(32), ..Default::default() },
+                Arc::new(ParkMutex::new(None)),
+            )
+            .expect("registry"),
+        )
+    }
+
     fn make_config(seed: u8) -> DeviceConfig {
         let (sec, pub_) = make_keypair(seed);
         DeviceConfig {
@@ -484,7 +509,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn construct_rejects_no_peers() {
+    async fn construct_allows_no_peers() {
+        // bd 7v0k③：peers 空允许启动（Go 官方空配置 + API 建户），旧实现拒绝
         let (dispatch, _) = make_dispatch();
         let (sec, _) = make_keypair(0x77);
         let cfg = DeviceConfig {
@@ -492,7 +518,8 @@ mod tests {
             ..Default::default()
         };
         let result = WireguardInboundHandler::new("test", &cfg, 0, dispatch).await;
-        assert!(result.is_err());
+        let handler = result.expect("empty peers must construct (Go empty config + API 建户)");
+        assert_eq!(handler.user_registry().users_count(), 0);
     }
 
     #[tokio::test]
@@ -531,20 +558,36 @@ mod tests {
     fn ip_endpoint_to_destination_none() {
         assert!(ip_endpoint_to_destination(&None).is_none());
     }
-    /// 测试用 DispatchHandler——记录 (dest, 请求 payload) 并回写固定响应。
+    /// 测试用 DispatchHandler——记录 (dest, 请求 payload) 并回写固定响应；
+    /// dispatch_with_access 额外捕获 access 上下文（bd ttni user 归属验证）。
     #[derive(Debug)]
     struct EchoDispatch {
         tag: String,
         response: Vec<u8>,
         seen: Arc<ParkMutex<Vec<(Destination, Vec<u8>)>>>,
+        access_seen: Arc<ParkMutex<Vec<AccessContext>>>,
     }
 
     impl EchoDispatch {
-        fn new(tag: &str, response: &[u8]) -> (Arc<Self>, Arc<ParkMutex<Vec<(Destination, Vec<u8>)>>>) {
+        fn new(
+            tag: &str,
+            response: &[u8],
+        ) -> (
+            Arc<Self>,
+            Arc<ParkMutex<Vec<(Destination, Vec<u8>)>>>,
+            Arc<ParkMutex<Vec<AccessContext>>>,
+        ) {
             let seen = Arc::new(ParkMutex::new(Vec::new()));
+            let access_seen = Arc::new(ParkMutex::new(Vec::new()));
             (
-                Arc::new(Self { tag: tag.into(), response: response.to_vec(), seen: Arc::clone(&seen) }),
+                Arc::new(Self {
+                    tag: tag.into(),
+                    response: response.to_vec(),
+                    seen: Arc::clone(&seen),
+                    access_seen: Arc::clone(&access_seen),
+                }),
                 seen,
+                access_seen,
             )
         }
     }
@@ -552,6 +595,15 @@ mod tests {
     impl DispatchHandler for EchoDispatch {
         fn tag(&self) -> &str {
             &self.tag
+        }
+        fn dispatch_with_access(
+            &self,
+            dest: &Destination,
+            link: Link,
+            access: AccessContext,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+            self.access_seen.lock().push(access);
+            self.dispatch(dest, link)
         }
         fn dispatch(
             &self,
@@ -587,7 +639,8 @@ mod tests {
         let netstack: Arc<AsyncMutex<WgNetStack>> =
             Arc::new(AsyncMutex::new(WgNetStack::new(&[local], 1420)));
         let (dispatch, calls) = make_dispatch();
-        tokio::spawn(wg_accept_loop(Arc::clone(&netstack), dispatch));
+        let registry = test_registry();
+        tokio::spawn(wg_accept_loop(Arc::clone(&netstack), registry, dispatch));
 
         // 隧道内 client 10.0.0.2:5555 → server 10.0.0.1:80 的 SYN
         {
@@ -648,18 +701,32 @@ mod tests {
             secret_key: sec_s,
             endpoint: vec!["10.0.0.1/32".into()],
             peers: vec![PeerConfig {
-                public_key: pub_c,
+                public_key: pub_c.clone(),
                 allowed_ips: vec!["10.0.0.2/32".into()], // 回程路由必需
                 ..Default::default()
             }],
             ..Default::default()
         };
-        let (dispatch, seen) = EchoDispatch::new("wg-e2e-out", b"echo:pong");
+        let (dispatch, seen, access_seen) = EchoDispatch::new("wg-e2e-out", b"echo:pong");
         let server = WireguardInboundHandler::new("wg-e2e", &server_cfg, udp_port, dispatch)
             .await
             .expect("server construct");
         server.start().await.expect("server start");
 
+        // bd ttni：AddUser（同公钥原位替换静态 peer）后，dispatch 携带
+        // per-user 上下文（Go server.go:352-364 GetUserByAddr → session.Inbound）
+        server
+            .user_registry()
+            .add_user(
+                "u@wg",
+                3,
+                PeerConfig {
+                    public_key: pub_c,
+                    allowed_ips: vec!["10.0.0.2/32".into()],
+                    ..Default::default()
+                },
+            )
+            .expect("add user");
         // client：单 peer WgDriver（driver_pair_handshake_with_multiple_workers 同骨架）
         let client_cfg = DeviceConfig {
             secret_key: sec_c,
@@ -731,6 +798,18 @@ mod tests {
         assert_eq!(dest.address(), &Address::IPv4("10.0.0.1".parse().unwrap()));
         assert_eq!(dest.port().value(), TUNNEL_TCP_PORT);
         assert_eq!(payload, b"ping");
+
+        // bd ttni：dispatch 携带的 user 上下文来自 GetUserByAddr(10.0.0.2)
+        let acc = access_seen.lock();
+        let ctx = acc.last().expect("dispatch_with_access captured");
+        assert_eq!(ctx.email, "u@wg", "user email 挂接");
+        assert_eq!(ctx.level, 3, "user level 挂接");
+        assert!(
+            ctx.from.starts_with("10.0.0.2"),
+            "from = 隧道内源地址，got {}",
+            ctx.from
+        );
+        assert_eq!(ctx.inbound_tag, "", "inbound_tag 由生产入口填充");
 
         server.close().await.expect("server close");
     }

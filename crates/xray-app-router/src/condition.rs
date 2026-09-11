@@ -287,17 +287,29 @@ enum UserPattern {
 impl UserMatcherCondition {
     /// 从 proto `user_email` 列表构造。
     ///
-    /// `regexp:` 前缀触发正则模式（编译失败返回错误）；其余走严格等值。
-    pub fn new(patterns: Vec<String>) -> Result<Self, regex::Error> {
+    /// 对齐 Go `NewUserMatcher`（condition.go:162-181）：空项跳过；`regexp:` 前缀
+    /// 仅在整串长度 > 7（前缀外至少 1 字符）时生效，编译失败的项**忽略**并保留
+    /// 其余项（Go "Items of users slice with an invalid regexp syntax are
+    /// ignored"）；`regexp:` 恰好无正文时按字面量处理。
+    #[must_use]
+    pub fn new(patterns: Vec<String>) -> Self {
         let mut parsed = Vec::with_capacity(patterns.len());
         for p in patterns {
-            if let Some(rest) = p.strip_prefix("regexp:") {
-                parsed.push(UserPattern::Regex(Regex::new(rest)?));
-            } else {
-                parsed.push(UserPattern::Literal(p));
+            if p.is_empty() {
+                continue;
             }
+            if p.len() > 7 {
+                if let Some(rest) = p.strip_prefix("regexp:") {
+                    // 坏正则项忽略（fail-open per item），不阻断启动。
+                    if let Ok(re) = Regex::new(rest) {
+                        parsed.push(UserPattern::Regex(re));
+                    }
+                    continue;
+                }
+            }
+            parsed.push(UserPattern::Literal(p));
         }
-        Ok(Self { patterns: parsed })
+        Self { patterns: parsed }
     }
 }
 
@@ -1028,12 +1040,13 @@ fn current_process_info() -> Option<ProcessInfo> {
 }
 
 impl ProcessNameMatcherCondition {
-    /// 从 proto `process` 列表构造。
-    ///
-    /// 解析规则（与 Go 一致）：
-    /// - `xray/` 前缀：去掉前缀后视为绝对路径
-    /// - `self/` 前缀：去掉前缀后视为进程名，同时 `match_xray_self=true`
-    /// - 其他：进程名
+    /// 从 proto `process` 列表构造。对齐 Go `NewProcessNameMatcher`
+    /// （condition.go:299-338）：
+    /// - 精确 `"self/"`：`match_xray_self = true`
+    /// - 精确 `"xray/"`：替换为当前可执行文件全路径（获取失败记日志并跳过该项）
+    /// - 其余项路径分隔符归一为 `/`（Go `filepath.ToSlash`）后三分：
+    ///   `/` 结尾 → 目录前缀集；含 `/` → 绝对路径集；否则进程名且裁掉 `.exe`
+    ///   后缀（Windows `curl.exe` 与配置 `curl` 互通）
     #[must_use]
     pub fn new(process: Vec<String>) -> Self {
         let mut process_names = Vec::new();
@@ -1041,15 +1054,28 @@ impl ProcessNameMatcherCondition {
         let mut folders = Vec::new();
         let mut match_xray_self = false;
         for p in process {
-            if let Some(rest) = p.strip_prefix("xray/") {
-                abs_paths.push(rest.to_string());
-            } else if let Some(rest) = p.strip_prefix("self/") {
-                process_names.push(rest.to_string());
+            if p == "self/" {
                 match_xray_self = true;
-            } else if p.ends_with('/') {
-                folders.push(p);
+                continue;
+            }
+            let mut name = p;
+            if name == "xray/" {
+                match std::env::current_exe() {
+                    Ok(path) => name = path.to_string_lossy().into_owned(),
+                    Err(e) => {
+                        // Go condition.go:311-315 获取失败记日志跳过该项。
+                        tracing::warn!(target: "xray_router", error = %e, "failed to get xray executable path");
+                        continue;
+                    }
+                }
+            }
+            let name = name.replace('\\', "/");
+            if name.ends_with('/') {
+                folders.push(name);
+            } else if name.contains('/') {
+                abs_paths.push(name);
             } else {
-                process_names.push(p);
+                process_names.push(name.strip_suffix(".exe").unwrap_or(&name).to_string());
             }
         }
         Self {
@@ -1061,7 +1087,12 @@ impl ProcessNameMatcherCondition {
     }
 
     /// 判断进程信息是否匹配配置。
+    ///
+    /// info 侧对齐 Go `FindProcess` 返回语义（find_process_windows.go:115-122）：
+    /// 进程名裁 `.exe` 后缀、exe 路径分隔符归一为 `/` 后再比较。
     fn matches_info(&self, info: &ProcessInfo) -> bool {
+        let name = info.name.strip_suffix(".exe").unwrap_or(&info.name);
+        let exe_path = info.exe_path.replace('\\', "/");
         // 匹配当前进程自身
         if self.match_xray_self {
             let current = current_process_info();
@@ -1072,15 +1103,15 @@ impl ProcessNameMatcherCondition {
             }
         }
         // 进程名字面匹配
-        if self.process_names.iter().any(|n| n == &info.name) {
+        if self.process_names.iter().any(|n| n == name) {
             return true;
         }
         // exe 绝对路径匹配
-        if self.abs_paths.iter().any(|p| p == &info.exe_path) {
+        if self.abs_paths.iter().any(|p| p == &exe_path) {
             return true;
         }
         // 目录前缀匹配
-        if self.folders.iter().any(|f| info.exe_path.starts_with(f.as_str())) {
+        if self.folders.iter().any(|f| exe_path.starts_with(f.as_str())) {
             return true;
         }
         false
@@ -1228,8 +1259,7 @@ mod tests {
         let m = UserMatcherCondition::new(vec![
             "admin@example.com".into(),
             "root@example.com".into(),
-        ])
-        .unwrap();
+        ]);
         let hit = RoutingData::new().with_user("admin@example.com");
         let hit2 = RoutingData::new().with_user("root@example.com");
         let miss = RoutingData::new().with_user("user@example.com");
@@ -1244,7 +1274,7 @@ mod tests {
     fn test_user_matcher_substring_must_miss() {
         // 子串不再命中：修复前的 bug 是 `u.contains(s)`，会把 "admin" 误匹配
         // "admin@example.com"。修复后严格等值，子串必须 miss。
-        let m = UserMatcherCondition::new(vec!["admin".into()]).unwrap();
+        let m = UserMatcherCondition::new(vec!["admin".into()]);
         let ctx = RoutingData::new().with_user("admin@example.com");
         assert!(
             !m.apply(&ctx),
@@ -1256,7 +1286,7 @@ mod tests {
 
     #[test]
     fn test_user_matcher_regex() {
-        let m = UserMatcherCondition::new(vec!["regexp:^admin@".into()]).unwrap();
+        let m = UserMatcherCondition::new(vec!["regexp:^admin@".into()]);
         let hit = RoutingData::new().with_user("admin@x.com");
         let miss = RoutingData::new().with_user("user@x.com");
         assert!(m.apply(&hit));
@@ -1265,7 +1295,7 @@ mod tests {
 
     #[test]
     fn test_user_matcher_empty_user() {
-        let m = UserMatcherCondition::new(vec!["x".into()]).unwrap();
+        let m = UserMatcherCondition::new(vec!["x".into()]);
         let empty = RoutingData::new();
         assert!(!m.apply(&empty));
     }
@@ -1275,7 +1305,31 @@ mod tests {
         // 历史 API 别名仍可用——编译期兜底（不验证 substring 行为，因为该类型已弃用）。
         #[allow(deprecated)]
         let _m: UserMatcherLenient =
-            UserMatcherCondition::new(vec!["x@example.com".into()]).unwrap();
+            UserMatcherCondition::new(vec!["x@example.com".into()]);
+    }
+
+    #[test]
+    fn test_user_matcher_bad_regexp_item_ignored() {
+        // 对齐 Go condition.go:171 "Items of users slice with an invalid regexp
+        // syntax are ignored"：坏正则项跳过，同列表其余项保留。
+        let m = UserMatcherCondition::new(vec![
+            "regexp:([bad".into(), // 编译失败 → 忽略
+            "admin".into(),        // 字面项保留
+        ]);
+        let hit = RoutingData::new().with_user("admin");
+        assert!(m.apply(&hit), "坏正则项不应阻断其余项匹配");
+        let miss = RoutingData::new().with_user("anything");
+        assert!(!m.apply(&miss));
+    }
+
+    #[test]
+    fn test_user_matcher_regexp_prefix_needs_nonempty_body() {
+        // Go len(user) > 7 门槛：恰好 "regexp:"（7 字符）按字面量处理，不空正则。
+        let m = UserMatcherCondition::new(vec!["regexp:".into()]);
+        let ctx = RoutingData::new().with_user("regexp:");
+        assert!(m.apply(&ctx), "'regexp:' 本体按字面量等值匹配");
+        let other = RoutingData::new().with_user("x");
+        assert!(!m.apply(&other), "字面量 'regexp:' 不应匹配任意串（空正则会全匹配）");
     }
 
     // ── InboundTagMatcher ──
@@ -1363,16 +1417,20 @@ mod tests {
 
     #[test]
     fn test_process_name_matcher_config_parsing() {
+        // 对齐 Go condition.go:304-331 合法形态：精确 "xray/"（→当前 exe 全路径）、
+        // 精确 "self/"（仅置 match_xray_self）、"/" 结尾 → 目录、裸名 → 裁 ".exe"。
         let m = ProcessNameMatcherCondition::new(vec![
             "plain".into(),
-            "xray/C:/xray.exe".into(),
-            "self/xray".into(),
+            "xray/".into(),
+            "self/".into(),
             "folder/".into(),
+            "curl.exe".into(),
         ]);
-        assert_eq!(m.process_names, vec!["plain".to_string(), "xray".to_string()]);
-        assert_eq!(m.abs_paths, vec!["C:/xray.exe".to_string()]);
+        assert_eq!(m.process_names, vec!["plain".to_string(), "curl".to_string()]);
         assert_eq!(m.folders, vec!["folder/".to_string()]);
-        assert!(m.match_xray_self);
+        assert!(m.match_xray_self, "self/ 必须只置 match_xray_self，不产生进程名");
+        assert_eq!(m.abs_paths.len(), 1, "xray/ 替换为当前可执行文件全路径");
+        assert!(m.abs_paths[0].contains('/'), "xray/ 产生的路径必须已 ToSlash 归一");
     }
 
     #[test]
@@ -1396,13 +1454,21 @@ mod tests {
 
     #[test]
     fn test_process_name_matcher_matches_info_by_abs_path() {
-        let m = ProcessNameMatcherCondition::new(vec!["xray/C:/xray.exe".into()]);
+        // Go 语义：无前缀且含分隔符 → 绝对路径集；info 侧 exe_path 反斜杠
+        // 由 matches_info 归一为 slash 后比对（find_process_windows.go:115-122）。
+        let m = ProcessNameMatcherCondition::new(vec!["C:/xray.exe".into()]);
         let info = ProcessInfo {
             name: "xray".to_string(),
             exe_path: "C:/xray.exe".to_string(),
             pid: 5678,
         };
         assert!(m.matches_info(&info));
+        let win_info = ProcessInfo {
+            name: "xray.exe".to_string(),
+            exe_path: "C:\\xray.exe".to_string(),
+            pid: 5679,
+        };
+        assert!(m.matches_info(&win_info), "Windows 原生路径 + .exe 进程名也须命中");
     }
 
     #[test]

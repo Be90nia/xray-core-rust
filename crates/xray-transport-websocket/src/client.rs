@@ -68,7 +68,13 @@ pub async fn dial(
     // TLS 自管时 URI 也必须用 ws://：tungstenite 的 uri_mode 按 scheme 判断，
     // wss + Connector::Plain 会报 "TLS support not compiled in"。
     let uri = build_request_uri(opts.config, opts.destination, false);
-    let request = build_request(&uri, opts.config, opts.early_data)?;
+    let request = build_request(
+        &uri,
+        opts.config,
+        opts.tls_server_name.as_deref(),
+        opts.destination,
+        opts.early_data,
+    )?;
 
     // ponytail: WebSocketConfig 默认 64 MiB max_message_size 足够代理流量。
     let ws_cfg = WebSocketConfig::default();
@@ -100,7 +106,15 @@ pub async fn dial(
         client_async_tls_with_config(request, stream, Some(ws_cfg), Some(Connector::Plain)).await?;
 
     // remote/local addr：地址不暴露；调用方需要时通过 dispatcher 注入。
-    Ok(WsConnection::from_stream(stream, None, None))
+    let mut conn = WsConnection::from_stream(stream, None, None);
+    // 客户端心跳（Go dialer.go:165 NewConnection(conn, _, _, HeartbeatPeriod)）：
+    // heartbeatPeriod > 0 时两侧都起 ping，防 NAT/CDN 长空闲掐断。
+    if opts.config.heartbeat_period > 0 {
+        conn.start_heartbeat(std::time::Duration::from_secs(
+            opts.config.heartbeat_period as u64,
+        ));
+    }
+    Ok(conn)
 }
 
 /// Owned 拨号参数：[`DialOptions`] 的 `'static` 版本，供 [`DelayDialConn`]
@@ -342,19 +356,32 @@ fn build_request_uri(cfg: &Config, dest: &Destination, use_tls: bool) -> String 
 }
 
 /// 构造自定义 WS Upgrade request：附加 user header + Host + early-data。
-fn build_request(uri: &str, cfg: &Config, ed: Option<&[u8]>) -> Result<WsRequest> {
+fn build_request(
+    uri: &str,
+    cfg: &Config,
+    tls_server_name: Option<&str>,
+    dest: &Destination,
+    ed: Option<&[u8]>,
+) -> Result<WsRequest> {
     let mut req = uri
         .into_client_request()
         .map_err(|e| WsError::HandshakeFailed(format!("invalid URI: {e}")))?;
 
-    // 1. Host header：Go 用 wsSettings.Host 覆盖（如果配置）。
-    if !cfg.host.is_empty() {
-        req.headers_mut().insert(
-            http::header::HOST,
-            HeaderValue::from_str(&cfg.host)
-                .map_err(|e| WsError::HandshakeFailed(format!("invalid host header: {e}")))?,
-        );
-    }
+    // 1. Host header 三级回退（Go dialer.go:144-150）：
+    //    wsSettings.Host → tlsSettings.serverName → dest address。
+    //    CDN 按 IP 拨号 + 对端校验 Host 时，缺 serverName 级会导致握手 404。
+    let host_header = if !cfg.host.is_empty() {
+        cfg.host.clone()
+    } else if let Some(sni) = tls_server_name.filter(|s| !s.is_empty()) {
+        sni.to_string()
+    } else {
+        dest.address().to_string()
+    };
+    req.headers_mut().insert(
+        http::header::HOST,
+        HeaderValue::from_str(&host_header)
+            .map_err(|e| WsError::HandshakeFailed(format!("invalid host header: {e}")))?,
+    );
 
     // 2. 用户自定义 header。
     for (k, v) in &cfg.header {
@@ -445,7 +472,7 @@ mod tests {
             host: "front.example.com".into(),
             ..Default::default()
         };
-        let req = build_request("ws://1.2.3.4/", &cfg, None).unwrap();
+        let req = build_request("ws://1.2.3.4/", &cfg, None, &dest("1.2.3.4", 80), None).unwrap();
         assert_eq!(req.headers().get("host").unwrap(), "front.example.com");
     }
 
@@ -453,7 +480,14 @@ mod tests {
     fn build_request_attaches_early_data_as_sec_websocket_protocol() {
         let cfg = Config::default();
         let ed = b"hello-ed";
-        let req = build_request("ws://example.com/", &cfg, Some(ed.as_slice())).unwrap();
+        let req = build_request(
+            "ws://example.com/",
+            &cfg,
+            None,
+            &dest("example.com", 80),
+            Some(ed.as_slice()),
+        )
+        .unwrap();
         let v = req
             .headers()
             .get("Sec-WebSocket-Protocol")
@@ -465,7 +499,8 @@ mod tests {
     #[test]
     fn build_request_empty_early_data_omits_header() {
         let cfg = Config::default();
-        let req = build_request("ws://example.com/", &cfg, Some(&[])).unwrap();
+        let req = build_request("ws://example.com/", &cfg, None, &dest("example.com", 80), Some(&[]))
+            .unwrap();
         assert!(req.headers().get("Sec-WebSocket-Protocol").is_none());
     }
 
@@ -474,9 +509,88 @@ mod tests {
         let mut cfg = Config::default();
         cfg.header.insert("X-Forwarded-For".into(), "10.0.0.1".into());
         cfg.header.insert("X-Custom".into(), "v".into());
-        let req = build_request("ws://example.com/", &cfg, None).unwrap();
+        let req = build_request("ws://example.com/", &cfg, None, &dest("example.com", 80), None)
+            .unwrap();
         assert_eq!(req.headers().get("x-forwarded-for").unwrap(), "10.0.0.1");
         assert_eq!(req.headers().get("x-custom").unwrap(), "v");
+    }
+
+    #[test]
+    fn build_request_host_fallback_chain_host_servername_dest() {
+        // 三级回退（Go dialer.go:144-150）：wsSettings.Host → tlsSettings.serverName
+        // → dest address。CDN 按 IP 拨号 + 对端校验 Host 依赖 serverName 级。
+        let d = dest("203.0.113.9", 443);
+
+        // 1) cfg.host 优先
+        let cfg = Config {
+            host: "front.example.com".into(),
+            ..Default::default()
+        };
+        let req = build_request("wss://203.0.113.9/", &cfg, Some("sni.example.com"), &d, None)
+            .unwrap();
+        assert_eq!(req.headers().get("host").unwrap(), "front.example.com");
+
+        // 2) host 空 → serverName
+        let cfg = Config::default();
+        let req = build_request("wss://203.0.113.9/", &cfg, Some("sni.example.com"), &d, None)
+            .unwrap();
+        assert_eq!(req.headers().get("host").unwrap(), "sni.example.com");
+
+        // 3) host/serverName 皆空 → dest address
+        let req = build_request("wss://203.0.113.9/", &cfg, None, &d, None).unwrap();
+        assert_eq!(req.headers().get("host").unwrap(), "203.0.113.9");
+    }
+
+    #[tokio::test]
+    async fn dial_starts_client_heartbeat_when_configured() {
+        // 真实 ws 握手（本地 listener + accept_async），dial 后心跳任务句柄存在。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    if let Ok(ws) = tokio_tungstenite::accept_async(stream).await {
+                        // 保活片刻让客户端完成 dial + 断言。
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        drop(ws);
+                    }
+                });
+            }
+        });
+
+        let d = dest("127.0.0.1", addr.port());
+        let cfg = Config {
+            heartbeat_period: 1,
+            ..Default::default()
+        };
+        let conn = dial(DialOptions {
+            config: &cfg,
+            destination: &d,
+            early_data: None,
+            tls_config: None,
+            tls_server_name: None,
+            fingerprint: None,
+        })
+        .await
+        .unwrap();
+        assert!(
+            conn.heartbeat_handle.is_some(),
+            "heartbeatPeriod>0 → 客户端心跳任务已启动"
+        );
+
+        // 对照：period=0 不启动。
+        let cfg = Config::default();
+        let conn = dial(DialOptions {
+            config: &cfg,
+            destination: &d,
+            early_data: None,
+            tls_config: None,
+            tls_server_name: None,
+            fingerprint: None,
+        })
+        .await
+        .unwrap();
+        assert!(conn.heartbeat_handle.is_none());
     }
 
     // -------------------------------------------------------------------

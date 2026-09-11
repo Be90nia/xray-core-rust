@@ -322,6 +322,10 @@ pub enum RealityServerOutcome<C> {
 /// - `max_diff`：允许的 timestamp 偏差秒数（Go 默认 ±12h = 43200）
 /// - `min_client_ver`/`max_client_ver`：fs0o REALITY 版本门控；slice 与
 ///   `ClientHello.legacy_version` 字典序比较。空切片=无限边界（不限制）。
+/// - `server_names`：SNI 白名单（精确匹配，对齐 Go `xtls/reality` tls.go:211/466
+///   `config.ServerNames[serverName]`：无 SNI 或不在白名单 → 前置失败走
+///   steal-oneself fallback）。空切片 = 门禁用（仅测试用低层 API；生产
+///   parse 层已强制非空白名单，Go transport_security.go:94-96 空 serverNames 拒启）。
 ///
 /// # Errors
 ///
@@ -338,6 +342,7 @@ pub async fn server_tls<C>(
     max_diff: u32,
     min_client_ver: &[u8],
     max_client_ver: &[u8],
+    server_names: &[String],
 ) -> std::result::Result<RealityServerOutcome<C>, RealityError>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -345,9 +350,18 @@ where
     let record = read_tls_record(&mut conn).await.map_err(|e| {
         RealityError::TlsHandshake(format!("read ClientHello: {e}"))
     })?;
-
     let outcome = (|| {
         let parsed = parse_client_hello(&record)?;
+        // t38j：SNI 白名单前置门。Go xtls/reality tls.go:211 `!config.ServerNames[
+        // serverName]` → break（steal-oneself fallback），在 short_id/timestamp
+        // 校验之前；精确匹配（map 查找），无 SNI 视为不匹配。
+        if !server_names.is_empty() {
+            let sni = parsed.server_name.as_deref().unwrap_or("");
+            if !server_names.iter().any(|n| n == sni) {
+                return Err(RealityError::InvalidServerName(sni.to_string()));
+            }
+        }
+
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as u32)
@@ -1050,7 +1064,7 @@ mod tests {
         let short_id = [0xaa; 8];
 
         let server_task = tokio::spawn(async move {
-            server_tls(server, &server_priv, &[short_id], 43200, &[], &[]).await
+            server_tls(server, &server_priv, &[short_id], 43200, &[], &[], &[]).await
         });
 
         // client 发送 ClientHello record 后保持连接（让 server_tls 完成 verify）
@@ -1069,6 +1083,71 @@ mod tests {
         }
     }
 
+    /// t38j：SNI 不在白名单 → 前置 Invalid（调用方 fallback_to_dest，
+    /// Go xtls/reality tls.go:211 break 语义），在 short_id/timestamp 校验之前。
+    #[tokio::test]
+    async fn server_tls_sni_mismatch_returns_invalid() {
+        use tokio::io::{AsyncWriteExt, duplex};
+
+        let random = [0x55u8; 32];
+        let session_id = [0x77u8; 32];
+        let key_share = [0x88u8; 32];
+        let record =
+            build_test_client_hello(&random, &session_id, &key_share, Some("example.com"));
+
+        let (mut client, server) = duplex(4096);
+        let server_priv = [0x11u8; 32];
+        let whitelist = vec!["other.com".to_string()];
+
+        let server_task = tokio::spawn(async move {
+            server_tls(server, &server_priv, &[[0xaa; 8]], 43200, &[], &[], &whitelist).await
+        });
+        client.write_all(&record).await.unwrap();
+
+        let outcome = server_task.await.unwrap().unwrap();
+        match outcome {
+            RealityServerOutcome::Invalid { reason, .. } => match reason {
+                RealityError::InvalidServerName(sni) => {
+                    assert_eq!(sni, "example.com");
+                }
+                other => panic!("expected InvalidServerName, got {other:?}"),
+            },
+            RealityServerOutcome::Verified(_) => panic!("expected Invalid, got Verified"),
+        }
+    }
+
+    /// t38j：无 SNI（ClientHello 不带 server_name extension）→ 视为不匹配。
+    #[tokio::test]
+    async fn server_tls_missing_sni_returns_invalid() {
+        use tokio::io::{AsyncWriteExt, duplex};
+
+        let random = [0x55u8; 32];
+        let session_id = [0x77u8; 32];
+        let key_share = [0x88u8; 32];
+        let record = build_test_client_hello(&random, &session_id, &key_share, None);
+
+        let (mut client, server) = duplex(4096);
+        let server_priv = [0x11u8; 32];
+        let whitelist = vec!["example.com".to_string()];
+
+        let server_task = tokio::spawn(async move {
+            server_tls(server, &server_priv, &[[0xaa; 8]], 43200, &[], &[], &whitelist).await
+        });
+        client.write_all(&record).await.unwrap();
+
+        let outcome = server_task.await.unwrap().unwrap();
+        assert!(
+            matches!(
+                outcome,
+                RealityServerOutcome::Invalid {
+                    reason: RealityError::InvalidServerName(_),
+                    ..
+                }
+            ),
+            "missing SNI must not pass the whitelist gate"
+        );
+    }
+
     #[tokio::test]
     async fn server_tls_eof_returns_tls_handshake_err() {
         use tokio::io::duplex;
@@ -1077,7 +1156,7 @@ mod tests {
         drop(client); // 立即关闭 client → server 读 EOF
 
         let server_priv = [0x11u8; 32];
-        let result = server_tls(server, &server_priv, &[], 43200, &[], &[]).await;
+        let result = server_tls(server, &server_priv, &[], 43200, &[], &[], &[]).await;
 
         assert!(
             matches!(result, Err(RealityError::TlsHandshake(_))),
@@ -1116,7 +1195,7 @@ mod tests {
 
         let (mut client, server) = duplex(8192);
         let server_task = tokio::spawn(async move {
-            server_tls(server, &server_priv, &[short_id], 43200, &[], &[]).await
+            server_tls(server, &server_priv, &[short_id], 43200, &[], &[], &[]).await
         });
 
         // client 发送合法 REALITY ClientHello（verify 会通过）
@@ -1170,7 +1249,7 @@ mod tests {
 
         // spawn server_tls
         let server_task = tokio::spawn(async move {
-            server_tls(server, &server_priv_array, &[short_id], 43200, &[], &[]).await
+            server_tls(server, &server_priv_array, &[short_id], 43200, &[], &[], &[]).await
         });
 
         // client 端：reality u_client 握手
@@ -1226,7 +1305,7 @@ mod tests {
         let client = xray_transport::connection::DuplexConnection::new(client);
 
         let server_task = tokio::spawn(async move {
-            server_tls(server, &server_priv_array, &[short_id], 43200, &[], &[]).await
+            server_tls(server, &server_priv_array, &[short_id], 43200, &[], &[], &[]).await
         });
 
         let client_result =
@@ -1284,7 +1363,7 @@ mod tests {
         let client = xray_transport::connection::DuplexConnection::new(client);
 
         let server_task = tokio::spawn(async move {
-            server_tls(server, &server_priv_array, &[short_id], 43200, &[], &[]).await
+            server_tls(server, &server_priv_array, &[short_id], 43200, &[], &[], &[]).await
         });
 
         let client_result =

@@ -15,9 +15,6 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-/// 默认会话空闲超时时间（300 秒）。
-pub const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-
 use tokio::sync::{watch, Mutex, RwLock};
 use tracing::debug;
 use xray_buf::reader::BufferedReader;
@@ -170,8 +167,6 @@ pub struct Session {
     uplink_bytes: AtomicU64,
     /// 下行字节数（服务端→客户端方向）。
     downlink_bytes: AtomicU64,
-    /// 最后活跃时间（收到数据或发送数据时更新）。
-    last_active: Mutex<Instant>,
 }
 
 impl Session {
@@ -193,7 +188,6 @@ impl Session {
             xudp: Mutex::new(None),
             uplink_bytes: AtomicU64::new(0),
             downlink_bytes: AtomicU64::new(0),
-            last_active: Mutex::new(Instant::now()),
         }
     }
 
@@ -354,21 +348,6 @@ impl Session {
         self.downlink_bytes.load(Ordering::Relaxed)
     }
 
-    // ========== 空闲超时 ==========
-
-    /// 更新最后活跃时间为当前时刻。
-    pub async fn touch_active(&self) {
-        let mut guard = self.last_active.lock().await;
-        *guard = Instant::now();
-    }
-
-    /// 检查会话是否已空闲超时。
-    ///
-    /// 返回 `true` 表示自上次活跃以来已超过 `timeout` 时长。
-    pub async fn is_idle_timeout(&self, timeout: Duration) -> bool {
-        let guard = self.last_active.lock().await;
-        guard.elapsed() > timeout
-    }
 }
 
 impl std::fmt::Debug for Session {
@@ -636,13 +615,6 @@ impl SessionManager {
         inner.sessions.clear();
     }
 
-    /// 获取所有活跃会话的克隆列表。
-    ///
-    /// 用于 KeepAlive 广播和空闲超时检查。
-    pub async fn active_sessions(&self) -> Vec<Arc<Session>> {
-        let inner = self.shared.inner.read().await;
-        inner.sessions.values().cloned().collect()
-    }
 }
 
 impl Default for SessionManager {
@@ -1258,28 +1230,6 @@ mod tests {
         assert_eq!(session.downlink_bytes(), 350);
     }
 
-    // ========== 空闲超时测试 ==========
-
-    #[tokio::test]
-    async fn test_session_not_idle_initially() {
-        let session = Session::new(1, TransferType::Stream);
-        assert!(!session.is_idle_timeout(SESSION_IDLE_TIMEOUT).await);
-    }
-
-    #[tokio::test]
-    async fn test_session_touch_active_updates_time() {
-        let session = Session::new(1, TransferType::Stream);
-        // 先等一小段时间
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        // touch_active 应重置活跃时间
-        session.touch_active().await;
-        assert!(!session.is_idle_timeout(Duration::from_millis(1)).await);
-    }
-
-    #[tokio::test]
-    async fn test_session_idle_timeout_constant() {
-        assert_eq!(SESSION_IDLE_TIMEOUT, Duration::from_secs(300));
-    }
 
     // ========== multi_thread runtime 锁迁移回归 ==========
 

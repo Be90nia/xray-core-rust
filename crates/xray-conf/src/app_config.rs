@@ -136,10 +136,14 @@ pub struct BurstObservatoryConfig {
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct MetricsConfig {
+    /// 对齐 Go infra/conf/metrics.go:9 `tag`（建 inbound handler 供路由暴露；
+    /// listen 形态不受影响）。此前 Go 键被静默忽略（hfwq）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
     /// Prometheus 监听地址（如 `"127.0.0.1:9100"`）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub listen: Option<String>,
-    /// 是否在 metrics 中包含 tag 标签。
+    /// Rust 扩展：是否在 metrics 中包含 tag 标签。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
 }

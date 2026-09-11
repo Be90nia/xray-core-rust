@@ -9,6 +9,7 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{LogConfig, LogFormat, LogType, SeverityLevel};
 use crate::error::{at_error, at_warning, LogError};
@@ -394,6 +395,15 @@ impl FileHandler {
         }
     }
 
+    /// 组装带前缀的输出行：Console 加 Go 风格时间戳，Json 原样。
+    fn timestamped_line(&self, entry: &LogEntry) -> String {
+        let body = entry.format_with(self.format);
+        match self.format {
+            LogFormat::Console => format!("{}{}", log_timestamp_prefix(), body),
+            LogFormat::Json => body,
+        }
+    }
+
     /// 带输出格式构造。
     pub fn with_format(path: String, format: LogFormat) -> Self {
         Self {
@@ -407,30 +417,58 @@ impl FileHandler {
     }
 }
 
-impl LogHandler for FileHandler {
-    #[cfg(unix)]
+
+/// Go `log.Ldate|Ltime|Lmicroseconds` 前缀（common/log/logger.go:147/157/176
+/// 三处输出均带）：`2006/01/02 15:04:05.000000 `。
+///
+/// std 无本地时区 API，用 UTC——事件排序/审计用途与 Go 本地时区等价。
+fn log_timestamp_prefix() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let micros = now.subsec_micros();
+    let (h, m, s) = ((secs / 3600) % 24, (secs % 3600) / 60, secs % 60);
+    // civil_from_days（Howard Hinnant 算法）：epoch 天数 → (y, m, d)。
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { yoe + era * 400 + 1 } else { yoe + era * 400 };
+    format!("{y:04}/{mo:02}/{d:02} {h:02}:{m:02}:{s:02}.{micros:06} ")
+}
+
+ impl LogHandler for FileHandler {
+     #[cfg(unix)]
     fn handle(&self, entry: &LogEntry) {
-        let line = entry.format_with(self.format);
-        let mut state = self.inner.lock();
-        let path = std::path::Path::new(&self.path);
-        let current_inode = std::fs::metadata(path).map(|m| inode_of(&m)).unwrap_or(0);
-        if state.file.is_none() || state.open_inode != current_inode {
-            let f = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path);
-            match f {
-                Ok(file) => {
-                    state.file = Some(file);
-                    state.open_inode = current_inode;
-                }
-                Err(_) => return,
-            }
-        }
-        if let Some(f) = state.file.as_mut() {
-            let _ = writeln!(f, "{line}");
-        }
-    }
+        // 4d7t：对齐 Go fileLogWriter（common/log/logger.go:176）——Console 行带
+        // 日期时间前缀（access.log 无时间戳则事件排序/审计不可用）。Json 行保持
+        // 纯 JSON（Rust 扩展格式，机器可读优先）。
+        let line = self.timestamped_line(entry);
+         let mut state = self.inner.lock();
+         let path = std::path::Path::new(&self.path);
+         let current_inode = std::fs::metadata(path).map(|m| inode_of(&m)).unwrap_or(0);
+         if state.file.is_none() || state.open_inode != current_inode {
+             let f = OpenOptions::new()
+                 .create(true)
+                 .append(true)
+                 .open(&self.path);
+             match f {
+                 Ok(file) => {
+                     state.file = Some(file);
+                     state.open_inode = current_inode;
+                 }
+                 Err(_) => return,
+             }
+         }
+         if let Some(f) = state.file.as_mut() {
+             let _ = writeln!(f, "{line}");
+         }
+     }
 
     #[cfg(not(unix))]
     fn handle(&self, entry: &LogEntry) {
@@ -439,7 +477,7 @@ impl LogHandler for FileHandler {
         // xray-app-log/src/instance.rs unix 分支；Windows 升级路径：
         // 1) 用 GetFileInformationByHandle 比 ByHandleFileInformation.nFileIndexHigh/Low
         // 2) 引入 winapi/windows-sys 依赖,FOkens 代价大，保留现状。
-        let line = entry.format_with(self.format);
+        let line = self.timestamped_line(entry);
         if let Ok(mut f) = OpenOptions::new()
             .create(true)
             .append(true)
@@ -449,6 +487,7 @@ impl LogHandler for FileHandler {
         }
     }
 }
+
 
 /// File handler creator。
 pub struct FileHandlerCreator;
@@ -841,6 +880,36 @@ mod tests {
         let j: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
         assert_eq!(j["detour"], "direct");
         assert_eq!(j["status"], "accepted");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 4d7t：FileHandler Console 行带 Go `Ldate|Ltime|Lmicroseconds` 风格时间戳
+    /// 前缀（`YYYY/MM/DD HH:MM:SS.ffffff `）；Json 行保持纯 JSON。
+    #[test]
+    fn file_handler_console_line_has_timestamp_prefix() {
+        let dir = std::env::temp_dir().join(format!("xray-log-ts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("access.log");
+        let _ = std::fs::remove_file(&path);
+
+        let h = FileHandler::with_format(path.to_string_lossy().into_owned(), LogFormat::Console);
+        h.handle(&LogEntry::Access(AccessMessage {
+            from: "1.1.1.1".into(),
+            to: "tcp:2.2.2.2:443".into(),
+            detour: "direct".into(),
+            status: Some(AccessStatus::Accepted),
+            ..Default::default()
+        }));
+        let content = std::fs::read_to_string(&path).unwrap();
+        // 前缀形如 `2026/09/12 08:09:10.123456 `：10 位日期 + 空格 + 15 位时间 + 空格。
+        let prefix = content.chars().take(27).collect::<String>();
+        let (date, rest) = prefix.split_once(' ').expect("date part");
+        assert_eq!(date.len(), 10, "date must be YYYY/MM/DD, got {date}");
+        assert_eq!(date.matches('/').count(), 2);
+        let (time, tail) = rest.split_once(' ').expect("time part");
+        assert_eq!(time.len(), 15, "time must be HH:MM:SS.ffffff, got {time}");
+        assert_eq!(tail, "", "timestamp prefix must end with a space");
+        assert!(content.contains("from 1.1.1.1"), "message body must follow prefix");
         let _ = std::fs::remove_file(&path);
     }
 

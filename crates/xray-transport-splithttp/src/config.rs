@@ -738,8 +738,13 @@ impl Config {
     /// 切片 A padding 简化：硬编码 `x_padding=0` 写入 Referer header
     /// （对齐 minidialer 默认行为）。切片 B 接入完整 XPadding 后由 padding 模块注入。
     ///
+    /// payload 按上行数据 placement 放置（Go config.go:330-350 FillPacketRequest）：
+    /// body/auto → 请求体；header → base64 分块写 `{key}-N` 头；cookie →
+    /// `{key}_N` cookie。分块大小采样 `normalized_uplink_chunk_size`
+    /// （Go config.go:64-96 GetRequestHeaderWithPayload/CookiesWithPayload）。
+    ///
     /// # Errors
-    /// - [`SplitHttpError::InvalidPlacement`]: session/seq/uplink_data placement 值非合法常量
+    /// - [`SplitHttpError::InvalidPlacement`]: session/seq placement 值非合法常量
     pub fn build_packet_request_meta(
         &self,
         base_uri: &str,
@@ -753,16 +758,52 @@ impl Config {
             self.apply_meta_to_uri(base_uri.to_string(), session_id, seq_str);
         headers.extend(meta_headers);
 
+        let mut cookies = meta_cookies;
+        let placement = self.normalized_uplink_data_placement().to_string();
+        let body = match placement.as_str() {
+            PLACEMENT_BODY | PLACEMENT_AUTO => Some(payload),
+            PLACEMENT_HEADER => {
+                headers.extend(self.uplink_payload_chunks(&payload, '-'));
+                None
+            }
+            PLACEMENT_COOKIE => {
+                cookies.extend(self.uplink_payload_chunks(&payload, '_'));
+                None
+            }
+            // 其余值对齐 Go：无 body 无 chunk（FillPacketRequest else 分支只处理
+            // header/cookie），payload 不上行。
+            _ => None,
+        };
+
         let mut meta = RequestMeta {
             method: self.normalized_uplink_http_method().to_string(),
             uri,
             headers,
-            cookies: meta_cookies,
-            body: Some(payload),
+            cookies,
+            body,
         };
         let xpad = self.build_xpadding_config(base_uri);
         apply_xpadding_to_request_meta(&mut meta, &xpad);
         Ok(meta)
+    }
+
+    /// payload base64 RawURL 编码后按 chunk 上限分块为 `{key}{sep}{i}` 序列
+    /// （Go config.go:64-96；header 用 `sep='-'`，cookie 用 `sep='_'`）。
+    fn uplink_payload_chunks(&self, payload: &[u8], sep: char) -> Vec<(String, String)> {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+        let key = &self.uplink_data_key;
+        let mut chunks = Vec::new();
+        let mut rest = encoded.as_str();
+        let mut i = 0u32;
+        while !rest.is_empty() {
+            // max(1)：防非法配置 chunk=0 时死循环（正常配置下 rand ≥64）。
+            let n = (self.normalized_uplink_chunk_size().rand().max(1) as usize).min(rest.len());
+            chunks.push((format!("{key}{sep}{i}"), rest[..n].to_string()));
+            rest = &rest[n..];
+            i += 1;
+        }
+        chunks
     }
 
     /// 构造 stream-up / stream-one / stream-down mode 的请求元数据。
@@ -1516,5 +1557,84 @@ mod tests {
         assert_eq!(cfg2.session_id_table, "HEX");
         assert_eq!(cfg2.session_id_length, Some(RangeConfig::new(16, 32)));
         // 整 struct round-trip 不要求相等（其他字段非覆盖项不必全一致），仅断言本字段。
+    }
+    /// yvf8：uplinkDataPlacement 客户端编码。header → `{key}-N` 分块 base64 头 +
+    /// 空 body；cookie → `{key}_N`；body/auto → payload 留 body（对齐 Go
+    /// config.go:330-350 FillPacketRequest + :64-96 分块编码）。
+    #[test]
+    fn build_packet_request_header_placement_chunks_payload() {
+        use base64::Engine as _;
+        // 96B → base64 128 字符，chunk 64 → 2 块。
+        let payload: Vec<u8> = (0..96u8).collect();
+        let cfg = Config {
+            uplink_data_placement: "header".into(),
+            uplink_data_key: "d".into(),
+            uplink_chunk_size: Some(RangeConfig::new(64, 64)),
+            ..Config::default()
+        };
+        let meta = cfg
+            .build_packet_request_meta("http://h/p", "sess", "0", payload.clone())
+            .unwrap();
+        assert!(meta.body.is_none(), "header placement → 无 body");
+        let mut chunks: Vec<(u32, &str)> = Vec::new();
+        for (k, v) in &meta.headers {
+            if let Some(idx) = k.strip_prefix("d-") {
+                chunks.push((idx.parse().unwrap(), v.as_str()));
+            }
+        }
+        chunks.sort_by_key(|(i, _)| *i);
+        assert_eq!(chunks.len(), 2, "128 字符应分 2 块");
+        let joined: String = chunks.iter().map(|(_, v)| *v).collect();
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&joined)
+            .unwrap();
+        assert_eq!(decoded, payload, "分块 join 后 base64 解码还原 payload");
+    }
+
+    #[test]
+    fn build_packet_request_cookie_placement_chunks_payload() {
+        use base64::Engine as _;
+        let payload: Vec<u8> = (0..96u8).collect();
+        let cfg = Config {
+            uplink_data_placement: "cookie".into(),
+            uplink_data_key: "d".into(),
+            uplink_chunk_size: Some(RangeConfig::new(64, 64)),
+            ..Config::default()
+        };
+        let meta = cfg
+            .build_packet_request_meta("http://h/p", "sess", "0", payload.clone())
+            .unwrap();
+        assert!(meta.body.is_none(), "cookie placement → 无 body");
+        let mut chunks: Vec<(u32, &str)> = Vec::new();
+        for (k, v) in &meta.cookies {
+            if let Some(idx) = k.strip_prefix("d_") {
+                chunks.push((idx.parse().unwrap(), v.as_str()));
+            }
+        }
+        chunks.sort_by_key(|(i, _)| *i);
+        assert_eq!(chunks.len(), 2);
+        let joined: String = chunks.iter().map(|(_, v)| *v).collect();
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&joined)
+            .unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn build_packet_request_body_and_auto_keep_payload_in_body() {
+        let payload = b"body-payload".to_vec();
+        for placement in ["body", "auto"] {
+            let cfg = Config {
+                uplink_data_placement: placement.into(),
+                uplink_data_key: "d".into(),
+                ..Config::default()
+            };
+            let meta = cfg
+                .build_packet_request_meta("http://h/p", "sess", "0", payload.clone())
+                .unwrap();
+            assert_eq!(meta.body.as_deref(), Some(payload.as_slice()));
+            assert!(!meta.headers.iter().any(|(k, _)| k.starts_with("d-")));
+            assert!(!meta.cookies.iter().any(|(k, _)| k.starts_with("d_")));
+        }
     }
 }

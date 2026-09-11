@@ -196,6 +196,8 @@ where
 #[derive(Clone)]
 struct RealityServerConfig {
     private_key: [u8; 32],
+    /// t38j：SNI 白名单（非空，parse 层硬错保证）；精确匹配，供 server_tls 前置门。
+    server_names: Vec<String>,
     short_ids: Vec<[u8; 8]>,
     max_time_diff: u32,
     /// fs0o: 客户端 TLS legacy_version 最小版本门控（字节字典序）；
@@ -222,20 +224,49 @@ fn reality_server_config(
         .ok_or_else(|| io::Error::other("reality: missing privateKey"))?;
     let private_key = <[u8; 32]>::try_from(base64_url_decode(key_str)?)
         .map_err(|_| io::Error::other("reality: privateKey must be 32 bytes"))?;
-
-    let mut short_ids = Vec::new();
-    if let Some(arr) = json.get("shortIds").and_then(|x| x.as_array()) {
-        for sid in arr {
-            if let Some(hex_str) = sid.as_str() {
-                if let Some(bytes) = hex_decode_8(hex_str) {
-                    short_ids.push(bytes);
-                }
-            }
+    // t38j：serverNames 非空硬错（Go transport_security.go:94-96），
+    // 与 xray-core inbound.rs 的 parse_reality_config 同语义（同族路径对齐）。
+    let mut server_names = Vec::new();
+    if let Some(arr) = json.get("serverNames").and_then(|x| x.as_array()) {
+        for v in arr {
+            let Some(name) = v.as_str() else {
+                return Err(io::Error::other(
+                    "reality: invalid serverNames entry (need string)",
+                ));
+            };
+            server_names.push(name.to_string());
         }
     }
-    // 无 shortIds：默认允许全零（Go REALITY 空配置兼容）
-    if short_ids.is_empty() {
-        short_ids.push([0u8; 8]);
+    if server_names.is_empty() {
+        return Err(io::Error::other("reality: empty \"serverNames\""));
+    }
+
+    // 257w 同族：shortIds 三重硬错对齐 Go transport_security.go:135-147
+    // （空数组/过长/奇数或非法 hex 拒启），合法项左对齐补零 8 字节。
+    let sid_arr = json
+        .get("shortIds")
+        .and_then(|x| x.as_array())
+        .ok_or_else(|| io::Error::other("reality: empty \"shortIds\""))?;
+    if sid_arr.is_empty() {
+        return Err(io::Error::other("reality: empty \"shortIds\""));
+    }
+    let mut short_ids = Vec::with_capacity(sid_arr.len());
+    for (i, sid) in sid_arr.iter().enumerate() {
+        let Some(hex) = sid.as_str() else {
+            return Err(io::Error::other(format!(
+                "reality: invalid \"shortIds[{i}]\" (need hex string)"
+            )));
+        };
+        if hex.len() > 16 {
+            return Err(io::Error::other(format!(
+                "reality: too long \"shortIds[{i}]\": {hex}"
+            )));
+        }
+        let bytes = hex::decode(hex)
+            .map_err(|_| io::Error::other(format!("reality: invalid \"shortIds[{i}]\": {hex}")))?;
+        let mut id = [0u8; 8];
+        id[..bytes.len()].copy_from_slice(&bytes);
+        short_ids.push(id);
     }
 
     // dest/target：int（端口→localhost:port）或字符串 host:port
@@ -297,6 +328,7 @@ fn reality_server_config(
 
     Ok(Some(RealityServerConfig {
         private_key,
+        server_names,
         short_ids,
         max_time_diff,
         min_client_ver,
@@ -329,6 +361,7 @@ async fn serve_reality_conn<S>(
         rc.max_time_diff,
         &rc.min_client_ver,
         &rc.max_client_ver,
+        &rc.server_names,
     )
     .await;
     match outcome {
@@ -351,14 +384,6 @@ fn base64_url_decode(s: &str) -> io::Result<Vec<u8>> {
         .map_err(|e| io::Error::other(format!("reality: base64 privateKey: {e}")))
 }
 
-fn hex_decode_8(s: &str) -> Option<[u8; 8]> {
-    if s.len() > 16 {
-        return None;
-    }
-    let padded = format!("{s:0<16}");
-    let bytes = hex::decode(padded).ok()?;
-    bytes.try_into().ok()
-}
 
 // ===== H3（Go hub.go:481-535：UDP + QUIC + http3.Server） =====
 
@@ -750,6 +775,8 @@ mod tests {
         settings.security_json = Some(serde_json::json!({
             "privateKey": base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .encode([7u8; 32]),
+            "serverNames": ["localhost"],
+            "shortIds": [""],
             "dest": format!("127.0.0.1:{}", fb_addr.port()),
             "xver": 0,
         }));

@@ -19,13 +19,11 @@ pub struct ParsedEndpoints {
     pub has_v6: bool,
 }
 
-/// 解析 `DeviceConfig.endpoint` 字段为 [`ParsedEndpoints`]。
-///
 /// 每个元素可以是：
 /// - 纯 IP（如 `"10.0.0.1"`）—— 直接 parse
-/// - CIDR（如 `"10.0.0.1/32"`）—— 取前缀地址，但要求掩码必须是 /32 (IPv4) 或 /128 (IPv6)
-///
-/// 对应 Go `parseEndpoints`。
+/// - CIDR（如 `"10.0.0.1/24"`）—— 收敛为地址本体（Go client.go:88-97
+///   `netip.ParsePrefix` 宽容接受任意合法掩码后取 `prefix.Addr()`；掩码仅做
+///   范围校验 v4 0..=32 / v6 0..=128，bd 7v0k②）
 pub fn parse_endpoints(config: &DeviceConfig) -> Result<ParsedEndpoints> {
     let mut addrs = Vec::with_capacity(config.endpoint.len());
     let mut has_v4 = false;
@@ -43,9 +41,9 @@ pub fn parse_endpoints(config: &DeviceConfig) -> Result<ParsedEndpoints> {
             let prefix_len: u32 = prefix_str
                 .parse()
                 .map_err(|_| WgError::InvalidEndpoint(str_addr.clone()))?;
-            // 与 Go 一致：interface 地址子网掩码必须是 /32 (v4) 或 /128 (v6)
-            let expected_bits = if addr.is_ipv4() { 32 } else { 128 };
-            if prefix_len != expected_bits {
+            // 掩码范围校验（wg-quick 习惯写法 10.0.0.2/24 收敛为地址本体）
+            let max_bits = if addr.is_ipv4() { 32 } else { 128 };
+            if prefix_len > max_bits {
                 return Err(WgError::InvalidSubnetMask(str_addr.clone()));
             }
             addr
@@ -199,15 +197,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_cidr_wrong_mask_rejected() {
-        let cfg = make_config(&["10.0.0.1/24"]);
-        let err = parse_endpoints(&cfg).unwrap_err();
-        assert!(matches!(err, WgError::InvalidSubnetMask(_)));
+    fn parse_cidr_wide_mask_converges_to_host_addr() {
+        // bd 7v0k②：wg-quick 习惯写法 10.0.0.2/24 Go 起 Rust 拒——现宽容收敛
+        let cfg = make_config(&["10.0.0.2/24", "fd00::1/64"]);
+        let parsed = parse_endpoints(&cfg).unwrap();
+        assert_eq!(parsed.addrs[0], IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        assert_eq!(
+            parsed.addrs[1],
+            IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1))
+        );
+        assert!(parsed.has_v4);
+        assert!(parsed.has_v6);
     }
 
     #[test]
-    fn parse_cidr_v6_wrong_mask_rejected() {
-        let cfg = make_config(&["fd00::1/64"]);
+    fn parse_cidr_out_of_range_mask_rejected() {
+        let cfg = make_config(&["10.0.0.1/33"]);
+        let err = parse_endpoints(&cfg).unwrap_err();
+        assert!(matches!(err, WgError::InvalidSubnetMask(_)));
+        let cfg = make_config(&["fd00::1/129"]);
         let err = parse_endpoints(&cfg).unwrap_err();
         assert!(matches!(err, WgError::InvalidSubnetMask(_)));
     }
@@ -274,6 +282,8 @@ mod tests {
                 endpoint: "1.2.3.4:51820".into(),
                 keep_alive: 25,
                 allowed_ips: vec!["0.0.0.0/0".into(), "::/0".into()],
+                level: 0,
+                email: String::new(),
             }],
             ..Default::default()
         };
@@ -297,6 +307,8 @@ mod tests {
                 endpoint: String::new(),       // 空，跳过
                 keep_alive: 0,                 // 0，跳过
                 allowed_ips: vec![],
+                level: 0,
+                email: String::new(),
             }],
             ..Default::default()
         };

@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
@@ -36,6 +37,12 @@ pub mod xmc;
 
 /// UDP 读缓冲区大小（对应 Go `finalmask.UDPSize = 4096`）。
 pub const UDP_SIZE: usize = 4096;
+
+/// PacketIoConn 收/发队列有界容量（票 b2og）。
+///
+/// UDP 语义：对端黑洞且本端 socket 发送缓冲长期满时，满载即丢弃并计数——
+/// 对齐内核 socket 缓冲满时的丢包行为，杜绝 unbounded 队列无界增长。
+const PACKET_QUEUE_CAP: usize = 128;
 
 /// `AsyncRead + AsyncWrite + Send + Unpin` 的组合 trait（用于 trait object）。
 ///
@@ -390,11 +397,14 @@ struct PacketIoConn {
     remote_addr: SocketAddr,
     /// 读队列：driver 收包推入；`poll_recv` 在 `Pending` 时注册 waker——
     /// 语义与 `Notify` + 每次 spawn 唤醒等价，但零辅助任务。
-    rx: Mutex<Option<mpsc::UnboundedReceiver<Vec<u8>>>>,
-    /// 写队列：`poll_write` 推入后单个 send worker 顺序 `send_to`——
-    /// 复用 worker 而非每包 spawn（每包 spawn 在高 PPS 下堆积一次性任务）。
-    /// FIFO 顺序也严格于原并发 spawn。
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    rx: Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
+    /// 写队列（有界，[`PACKET_QUEUE_CAP`]）：`poll_write` 推入后单个 send
+    /// worker 顺序 `send_to`——复用 worker 而非每包 spawn（每包 spawn 在高
+    /// PPS 下堆积一次性任务）。FIFO 顺序也严格于原并发 spawn。满载丢弃
+    /// （UDP 语义）不阻塞上层（票 b2og）。
+    tx: mpsc::Sender<Vec<u8>>,
+    /// 收/发两方向满载丢弃累计包数（票 b2og）。
+    dropped: Arc<AtomicU64>,
     /// recv loop handler；Drop 时 abort 取消。
     driver: Mutex<Option<JoinHandle<()>>>,
     /// send worker handler；Drop 时 abort 取消。
@@ -410,16 +420,24 @@ impl PacketIoConn {
         // 此前 Box::into_raw + Arc::from_raw 是 UB：Box 分配没有计数头，Arc::clone 在分配外
         // fetch_add、drop 按错误 layout dealloc → STATUS_HEAP_CORRUPTION(0xc0000374)。
         let inner: Arc<dyn UdpIo> = inner.into();
-        let (pkt_tx, pkt_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (snd_tx, mut snd_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (pkt_tx, pkt_rx) = mpsc::channel::<Vec<u8>>(PACKET_QUEUE_CAP);
+        let (snd_tx, mut snd_rx) = mpsc::channel::<Vec<u8>>(PACKET_QUEUE_CAP);
+        let dropped = Arc::new(AtomicU64::new(0));
         let driver_inner = Arc::clone(&inner);
+        let dropped_driver = Arc::clone(&dropped);
         let driver = tokio::spawn(async move {
             let mut buf = vec![0u8; UDP_SIZE];
             loop {
                 match driver_inner.recv_from(&mut buf).await {
                     Ok((n, _src)) => {
-                        if pkt_tx.send(buf[..n].to_vec()).is_err() {
-                            break; // 读端已 drop
+                        // 有界队列：读端消费不过来时丢新包（UDP 语义），计数可观测
+                        match pkt_tx.try_send(buf[..n].to_vec()) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                let total = dropped_driver.fetch_add(1, Ordering::Relaxed) + 1;
+                                tracing::debug!(dropped = total, "PacketIoConn recv queue full, packet dropped");
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => break, // 读端已 drop
                         }
                     }
                     Err(_) => break,
@@ -441,6 +459,7 @@ impl PacketIoConn {
             remote_addr,
             rx: Mutex::new(Some(pkt_rx)),
             tx: snd_tx,
+            dropped,
             driver: Mutex::new(Some(driver)),
             worker: Mutex::new(Some(worker)),
             leftover: Mutex::new(Vec::new()),
@@ -511,10 +530,19 @@ impl AsyncWrite for PacketIoConn {
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
         let n = buf.len();
-        // fire-and-forget：入队即 Ready；worker 异步发送。队列关闭仅在 conn 已
-        // 半亡（worker 被 abort）时发生，包静默丢弃与原 spawn-丢包语义一致。
-        if self.tx.send(buf.to_vec()).is_err() {
-            tracing::debug!("PacketIoConn send queue closed, packet dropped");
+        // fire-and-forget：入队即 Ready；worker 异步发送。队列有界（票 b2og）：
+        // 满 = 对端黑洞且 socket 缓冲长期满 → 丢包计数（UDP 语义），不阻塞上层。
+        // 队列关闭仅在 conn 已半亡（worker 被 abort）时发生，包静默丢弃与原
+        // spawn-丢包语义一致。
+        match self.tx.try_send(buf.to_vec()) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::debug!(dropped = total, "PacketIoConn send queue full, packet dropped");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!("PacketIoConn send queue closed, packet dropped");
+            }
         }
         std::task::Poll::Ready(Ok(n))
     }
@@ -2127,5 +2155,62 @@ mod tests {
             Ok(_) => panic!("expected unsupported tcp mask type error"),
         };
         assert!(err.contains("unsupported tcp mask type"), "got: {err}");
+    }
+
+    /// 票 b2og：PacketIoConn 发送队列有界——worker 卡死在 send_to（对端黑洞）
+    /// 时，持续 poll_write 不得无界堆积，超出容量的包必须被丢弃并计数。
+    #[tokio::test]
+    async fn packet_io_conn_bounded_send_queue_drops_when_send_to_blocked() {
+        use std::sync::atomic::AtomicUsize;
+        use std::task::{Context, Poll, Waker};
+
+        struct BlockedUdpIo {
+            received: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl UdpIo for BlockedUdpIo {
+            async fn send_to(&self, _buf: &[u8], _addr: SocketAddr) -> io::Result<usize> {
+                self.received.fetch_add(1, Ordering::Relaxed);
+                // 模拟对端黑洞：worker 卡死在首个 send_to 上，队列因此填满
+                std::future::pending::<io::Result<usize>>().await
+            }
+            async fn recv_from(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+                std::future::pending().await
+            }
+            fn local_addr(&self) -> io::Result<SocketAddr> {
+                Ok("127.0.0.1:0".parse().unwrap())
+            }
+        }
+
+        let received = Arc::new(AtomicUsize::new(0));
+        let mut conn = PacketIoConn::new(
+            Box::new(BlockedUdpIo { received: Arc::clone(&received) }),
+            "127.0.0.1:9".parse().unwrap(),
+        );
+        let mut cx = Context::from_waker(Waker::noop());
+        use tokio::io::AsyncWrite as _;
+        for i in 0..1000u32 {
+            let buf = [i as u8; 16];
+            match std::pin::Pin::new(&mut conn).poll_write(&mut cx, &buf) {
+                Poll::Ready(Ok(n)) => assert_eq!(n, 16, "fire-and-forget stays Ready"),
+                other => panic!("poll_write must never pend (UDP semantics), got {other:?}"),
+            }
+        }
+        // worker 有机会消费首个包并卡死在 send_to
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let dropped = conn.dropped.load(Ordering::Relaxed);
+        let consumed = received.load(Ordering::Relaxed);
+        assert!(consumed <= 1, "worker must be stuck on first send_to, got {consumed}");
+        assert!(
+            dropped >= (1000 - PACKET_QUEUE_CAP - 1) as u64,
+            "overflow packets must be dropped: expected >= {}, got {dropped}",
+            1000 - PACKET_QUEUE_CAP - 1
+        );
+        // 有界性：未丢弃的包 = 已消费 + 队列残留，总量不得超过容量
+        assert!(
+            (1000u64 - dropped) as usize <= PACKET_QUEUE_CAP + consumed,
+            "queued + in-flight must stay bounded by PACKET_QUEUE_CAP"
+        );
     }
 }

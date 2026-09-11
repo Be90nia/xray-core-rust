@@ -9,7 +9,9 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use futures_util::TryStreamExt;
@@ -18,7 +20,7 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::Frame;
 use hyper::{Method, Request, Response, StatusCode};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tokio_util::io::ReaderStream;
 
 use crate::config::{Config, PLACEMENT_AUTO, PLACEMENT_BODY, PLACEMENT_COOKIE, PLACEMENT_HEADER};
@@ -220,7 +222,6 @@ where
     let (upload_tx, upload_rx) = tokio::io::duplex(DUPLEX_BUF);
     // 下行管道：dispatcher → response body
     let (dl_tx, dl_rx) = tokio::io::duplex(DUPLEX_BUF);
-
     let has_session = !session_id.is_empty();
     if has_session {
         // stream-down: UploadQueue → upload_tx
@@ -231,7 +232,7 @@ where
         let sid = session_id.to_string();
         tokio::spawn(async move {
             forward_queue_to_writer(queue, upload_tx).await;
-            sessions.remove(&sid).await;
+            sessions.remove(&sid).await; // 兜底（幂等）：forward 正常结束也清
         });
     } else {
         // stream-one: request body → upload_tx
@@ -248,8 +249,14 @@ where
         });
     }
 
-    // 下行 body = ReaderStream(dl_rx) → StreamBody
-    let dl_stream = ReaderStream::new(dl_rx);
+    // 下行 body = ReaderStream(dl_rx) → StreamBody。
+    // guard 随响应 body 存活：GET 响应终结（流结束或 hyper drop body）即触发
+    // 会话删除——对齐 Go hub.go:352-353 `defer h.sessions.Delete(sessionId)`。
+    let guard = has_session.then(|| SessionDropGuard {
+        sessions: Arc::clone(&ctx.sessions),
+        sid: session_id.to_string(),
+    });
+    let dl_stream = ReaderStream::new(GuardedReader { inner: dl_rx, _guard: guard });
     let body = StreamBody::new(dl_stream.map_ok(Frame::data)).boxed();
 
     // 构造 ServerConn 并交给 dispatcher
@@ -292,6 +299,42 @@ async fn forward_queue_to_writer(queue: Arc<crate::UploadQueue>, mut writer: tok
         }
     }
     let _ = writer.shutdown().await;
+}
+
+/// GET 会话删除 guard：响应 body 终结（流结束 / hyper drop body，即客户端断开）
+/// 时删除会话。对齐 Go hub.go:352-353 `defer h.sessions.Delete(sessionId)`——
+/// 半开断连不再等 forward task 级联（最坏滞留至 dispatcher bridge 300s idle）。
+/// `SessionMap` 是 tokio Mutex，Drop 内 spawn 异步删除。
+struct SessionDropGuard {
+    sessions: Arc<SessionMap>,
+    sid: String,
+}
+
+impl Drop for SessionDropGuard {
+    fn drop(&mut self) {
+        let sessions = Arc::clone(&self.sessions);
+        let sid = std::mem::take(&mut self.sid);
+        tokio::spawn(async move {
+            sessions.remove(&sid).await;
+        });
+    }
+}
+
+/// 持有 [`SessionDropGuard`] 的 AsyncRead 包装：ReaderStream 消费完或被 drop 时，
+/// guard 随之 drop 并触发会话删除。
+struct GuardedReader<R> {
+    inner: R,
+    _guard: Option<SessionDropGuard>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for GuardedReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
 }
 
 /// 提取 packet-up payload（body / header / cookie / auto placement）。
@@ -715,5 +758,50 @@ mod tests {
         let merged = apply_cors_headers(resp, &cors);
         // 无效 header name 被跳过，不影响响应
         assert_eq!(merged.status(), StatusCode::OK);
+    }
+
+    struct NoopConnHandler;
+    impl HubConnHandler for NoopConnHandler {
+        fn add_conn(&self, _conn: ServerConn) {}
+    }
+
+    /// 票 ikzy：GET 响应 body drop（客户端断开 / 流结束）即删会话，
+    /// 对齐 Go hub.go:352-353 defer——不等 forward task 级联。
+    #[tokio::test]
+    async fn get_body_drop_removes_session_immediately() {
+        let ctx = HandlerContext {
+            config: Arc::new(Config::default()),
+            host: String::new(),
+            base_path: String::new(),
+            local_addr: "127.0.0.1:1".parse().unwrap(),
+            sessions: Arc::new(SessionMap::new()),
+            conn_handler: Arc::new(NoopConnHandler),
+            max_buffered_posts: 16,
+            sc_max_each_post_bytes: 1024 * 1024,
+        };
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp =
+            handle_stream_down(req, "127.0.0.1:2".parse().unwrap(), "sess-ikzy", &ctx).await;
+        assert!(
+            ctx.sessions.get("sess-ikzy").await.is_some(),
+            "GET must register session"
+        );
+
+        // 模拟 hyper 终结 GET：drop 响应（body → ReaderStream → GuardedReader → guard）
+        drop(resp);
+        for _ in 0..100 {
+            if ctx.sessions.get("sess-ikzy").await.is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            ctx.sessions.get("sess-ikzy").await.is_none(),
+            "GET body drop must remove session immediately (Go hub.go:352-353 defer)"
+        );
     }
 }

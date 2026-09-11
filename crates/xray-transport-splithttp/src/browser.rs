@@ -301,8 +301,38 @@ pub fn apply_masqueraded_headers(
     }
     let _ = ch_major;
 
-    // Context-specific（variant）。本票只实现 fetch；nav/ws 待 ws/httpupgrade 接入。
-    if variant == "fetch" {
+    // Context-specific（variant）。nav：浏览器导航场景（Go browser.go nav case，
+    // http CONNECT 出站在用）；fetch：splithttp/xhttp 场景。
+    if variant == "nav" {
+        if get_header(headers, "Cache-Control").is_none() {
+            if browser == "chrome" || browser == "edge" {
+                set_header(headers, "Cache-Control", "max-age=0");
+            }
+        }
+        set_header(headers, "Upgrade-Insecure-Requests", "1");
+        if get_header(headers, "Accept").is_none() {
+            if browser == "chrome" || browser == "edge" {
+                set_header(
+                    headers,
+                    "Accept",
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                );
+            } else if browser == "firefox" || browser == "safari" {
+                set_header(
+                    headers,
+                    "Accept",
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                );
+            }
+        }
+        set_header(headers, "Sec-Fetch-Site", "none");
+        set_header(headers, "Sec-Fetch-Mode", "navigate");
+        if browser != "safari" {
+            set_header(headers, "Sec-Fetch-User", "?1");
+        }
+        set_header(headers, "Sec-Fetch-Dest", "document");
+        set_header(headers, "Priority", "u=0, i");
+    } else if variant == "fetch" {
         set_header(headers, "Sec-Fetch-Mode", "cors");
         set_header(headers, "Sec-Fetch-Dest", "empty");
         set_header(headers, "Sec-Fetch-Site", "same-origin");

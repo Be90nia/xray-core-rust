@@ -104,6 +104,9 @@ pub struct StackOptions {
     pub idle_timeout: Duration,
     /// 设备名。JSON `"name"`，空/缺省 → `"xray0"`（Go infra/conf/tun.go:34-36）。
     pub name: String,
+    /// 设备描述。JSON `"desc"`，空/缺省 → `"Wintun"`（Go infra/conf/tun.go:16/49-51；
+    /// 此前 JSON 键被静默忽略，hfwq）。
+    pub desc: String,
     /// MTU。JSON `"mtu"`，0/缺省 → 1500（Go infra/conf/tun.go:37-39）。
     pub mtu: u32,
     /// 接口地址 CIDR 列表（如 `"10.0.0.1/24"`）。JSON `"gateway"`——Go 侧即接口地址
@@ -127,6 +130,7 @@ impl Default for StackOptions {
             // 与 Go 默认一致：30 秒空闲超时（Go 端在实际使用时由上层设置）。
             idle_timeout: Duration::from_secs(30),
             name: "xray0".to_string(),
+            desc: "Wintun".to_string(),
             mtu: 1500,
             gateway: Vec::new(),
             dns: Vec::new(),
@@ -151,6 +155,9 @@ impl StackOptions {
             .map_err(|e| TunError::InvalidConfig(format!("tun config: {e}")))?;
         if let Some(s) = v.get("name").and_then(|x| x.as_str()) {
             opts.name = s.to_string();
+        }
+        if let Some(s) = v.get("desc").and_then(|x| x.as_str()) {
+            opts.desc = s.to_string();
         }
         if let Some(n) = v.get("mtu").and_then(|x| x.as_u64()) {
             if n > u64::from(u16::MAX) {
@@ -183,6 +190,10 @@ impl StackOptions {
         }
         if opts.name.is_empty() {
             opts.name = "xray0".to_string();
+        }
+        // Go infra/conf/tun.go:49-51：desc 空归一化 "Wintun"。
+        if opts.desc.is_empty() {
+            opts.desc = "Wintun".to_string();
         }
         if opts.mtu == 0 {
             opts.mtu = 1500;
