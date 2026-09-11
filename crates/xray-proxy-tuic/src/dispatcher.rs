@@ -80,7 +80,7 @@ impl Connection for TuicConnection {
 }
 
 /// Destination → tuic protocol Address 转换。
-fn dest_to_tuic_address(dest: &Destination) -> Result<Address, String> {
+pub fn dest_to_tuic_address(dest: &Destination) -> Result<Address, String> {
     let port = dest.port().value();
     match dest.address() {
         XrayAddress::IPv4(ip) => Ok(Address::Ipv4(*ip, port)),

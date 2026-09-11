@@ -22,10 +22,11 @@ use std::time::{Duration, Instant};
 
 use hickory_proto::rr::RecordType;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use xray_common::net::address::Address;
+use xray_common::net::destination::Destination;
+use xray_common::net::port::Port;
 
 use crate::cache_controller::CacheController;
 use crate::config::IpOption;
@@ -43,8 +44,9 @@ const TCP_RECV_MAX: usize = 65535;
 pub struct TcpNameServer {
     /// 服务名。
     name: String,
-    /// 远端 DNS 服务器地址。
-    addr: SocketAddr,
+    /// 远端 DNS 服务器地址（IP 直连；域名运行期解析——bd mcpo：经路由出站
+    /// 时由路由系统解析，直连兜底每查询现解析）。
+    dest: Destination,
     /// 缓存控制器。
     cache: Arc<CacheController>,
     /// EDNS0 client subnet。
@@ -53,49 +55,44 @@ pub struct TcpNameServer {
     query_timeout: Duration,
     /// 请求 ID 生成器。
     id_gen: AtomicReqIdGen,
-    /// 连接池：复用 TCP 连接。
-    conn: tokio::sync::Mutex<Option<TcpStream>>,
+    /// 连接池：复用查询流（直连 TcpConnection 或经路由 Link 流）。
+    conn: tokio::sync::Mutex<Option<crate::dial::DnsStream>>,
+    /// 域名解析器（直连兜底路径）。
+    resolver: Arc<dyn crate::dial::HostResolver>,
 }
-
 impl TcpNameServer {
     /// 构造。
     #[must_use]
     pub fn new(
-        addr: SocketAddr,
+        dest: Destination,
         cache: Arc<CacheController>,
         client_ip: Vec<u8>,
         query_timeout: Duration,
+        resolver: Arc<dyn crate::dial::HostResolver>,
     ) -> Self {
-        let name = format!("TCP:{}", addr);
+        let name = format!("TCP:{}:{}", dest.address(), dest.port());
         Self {
             name,
-            addr,
+            dest,
             cache,
             client_ip,
             query_timeout,
             id_gen: AtomicReqIdGen::new(),
             conn: tokio::sync::Mutex::new(None),
+            resolver,
         }
     }
 
-    /// 从 `NameServerConfig` 构造。
+    /// 从 `NameServerConfig` 构造（地址接受 IP 或域名，bd mcpo）。
     pub fn from_config(ns: &NameServerConfig) -> Result<Box<dyn Server>, DnsError> {
-        let socket_addr = match &ns.address {
-            Address::IPv4(v) => SocketAddr::new(IpAddr::V4(*v), ns.port),
-            Address::IPv6(v) => SocketAddr::new(IpAddr::V6(*v), ns.port),
-            other => {
-                return Err(DnsError::WireFormat(format!(
-                    "tcp nameserver requires IP address, got: {other:?}"
-                )));
-            }
-        };
+        let dest = Destination::tcp(ns.address.clone(), Port::new(ns.port));
         let timeout_dur = if ns.timeout_ms > 0 {
             Duration::from_millis(u64::from(ns.timeout_ms))
         } else {
             Duration::from_millis(4000)
         };
         let cache = Arc::new(CacheController::new(
-            format!("TCP:{}", socket_addr),
+            format!("TCP:{}", dest),
             ns.disable_cache.unwrap_or(false),
             ns.serve_stale.unwrap_or(false),
             ns.serve_expired_ttl.unwrap_or(0),
@@ -103,25 +100,25 @@ impl TcpNameServer {
         ));
         cache.start_cleanup_task(crate::cache_controller::CLEANUP_INTERVAL);
         Ok(Box::new(Arc::new(Self::new(
-            socket_addr,
+            dest,
             cache,
             ns.client_ip.clone(),
             timeout_dur,
+            Arc::new(crate::dial::SystemHostResolver),
         ))))
     }
 
-    /// 建立 TCP 连接。
-    async fn connect(&self) -> Result<TcpStream, DnsError> {
-        timeout(self.query_timeout, TcpStream::connect(self.addr))
+    /// 建立查询流：共享 dialer 在场经路由出站（Go nameserver_tcp.go:43-47
+    /// dispatcher.Dispatch 语义）；缺席直连兜底（域名每查询现解析）。
+    async fn connect(&self) -> Result<crate::dial::DnsStream, DnsError> {
+        crate::dial::connect_stream(&self.dest, self.resolver.as_ref(), self.query_timeout, "tcp")
             .await
-            .map_err(|_| DnsError::WireFormat(format!("tcp connect timeout after {:?}", self.query_timeout)))?
-            .map_err(|e| DnsError::WireFormat(format!("tcp connect: {e}")))
     }
 
     /// 在已有连接上执行单次 TCP 查询。
     async fn try_query(
         &self,
-        stream: &mut TcpStream,
+        stream: &mut crate::dial::DnsStream,
         len_be: &[u8; 2],
         payload: &[u8],
         req_id: u16,
@@ -165,6 +162,16 @@ impl TcpNameServer {
         let len_be = u16::try_from(payload.len())
             .map_err(|_| DnsError::WireFormat("query too large for TCP".to_string()))?
             .to_be_bytes();
+
+        if self.dest.address().is_domain() {
+            // 域名 NS（bd mcpo）：每查询新建流——连接池会把旧解析钉死，
+            // 地址变更后新查询必须用新 IP。运行期解析在 connect() 内
+            // （经路由出站交路由系统；直连兜底每查询现解析）。
+            let mut stream = self.connect().await?;
+            return self
+                .try_query(&mut stream, &len_be, &payload, req_id, record_type)
+                .await;
+        }
 
         let mut conn_guard = self.conn.lock().await;
         if conn_guard.is_none() {
@@ -247,6 +254,15 @@ mod tests {
     use std::net::Ipv4Addr;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
+    use xray_transport::connection::TcpConnection;
+
+    /// 共享 dialer 槽是进程级全局：涉 dialer 的测试须串行。
+    static DIALER_SLOT_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    fn ip_dest(addr: SocketAddr) -> Destination {
+        Destination::tcp(Address::from(addr.ip()), Port::new(addr.port()))
+    }
+
 
     fn make_a_response(req_id: u16, fqdn: &str, ips: Vec<Ipv4Addr>, ttl: u32) -> Vec<u8> {
         let name = Name::parse(fqdn, None).unwrap();
@@ -291,13 +307,14 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_query_once_returns_a_record() {
+        let _slot = DIALER_SLOT_LOCK.lock();
         let (addr, _h) = spawn_mock_tcp_server("example.com.", vec![Ipv4Addr::new(10, 0, 0, 1)], 120).await;
-
         let ns = TcpNameServer::new(
-            addr,
+            ip_dest(addr),
             Arc::new(CacheController::new("test", true, false, 0, 0)),
             Vec::new(),
             Duration::from_secs(2),
+            Arc::new(crate::dial::SystemHostResolver),
         );
         let rec = ns.query_once("example.com.", RecordType::A).await.unwrap();
         assert_eq!(rec.ips.len(), 1);
@@ -307,13 +324,14 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_send_query_v4_only() {
+        let _slot = DIALER_SLOT_LOCK.lock();
         let (addr, _h) = spawn_mock_tcp_server("z.com.", vec![Ipv4Addr::new(8, 8, 8, 8)], 60).await;
-
         let ns = TcpNameServer::new(
-            addr,
+            ip_dest(addr),
             Arc::new(CacheController::new("test", true, false, 0, 0)),
             Vec::new(),
             Duration::from_secs(2),
+            Arc::new(crate::dial::SystemHostResolver),
         );
         let outcome = ns
             .send_query(
@@ -332,16 +350,18 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_query_timeout_records_error() {
+        let _slot = DIALER_SLOT_LOCK.lock();
         // 监听但永不 accept。
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         // 不 spawn accept task，让客户端 connect 成功但读永远等。
 
         let ns = TcpNameServer::new(
-            addr,
+            ip_dest(addr),
             Arc::new(CacheController::new("test", true, false, 0, 0)),
             Vec::new(),
             Duration::from_millis(100),
+            Arc::new(crate::dial::SystemHostResolver),
         );
         let outcome = ns
             .send_query(
@@ -356,5 +376,156 @@ mod tests {
         // TCP connect 成功（listener 在），但 read 等到 timeout。
         assert!(outcome.rec_v4.is_none());
         assert_eq!(outcome.errors.len(), 1);
+    }
+
+    /// 记录拨号目标的 mock dialer：真连 dest（TCP pump），验收"查询经路由出站"。
+    #[derive(Default)]
+    struct RecordingDialer {
+        recorded: parking_lot::Mutex<Vec<Destination>>,
+    }
+
+    impl crate::dial::QueryDialer for RecordingDialer {
+        fn dial_tcp(
+            &self,
+            dest: &Destination,
+        ) -> Pin<Box<dyn Future<Output = io::Result<crate::dial::DnsStream>> + Send + '_>> {
+            self.recorded.lock().push(dest.clone());
+            let dest = dest.clone();
+            Box::pin(async move {
+                let ip = dest.address().ip().expect("test dest is IP");
+                let sock =
+                    tokio::net::TcpStream::connect(SocketAddr::new(ip, dest.port().value())).await?;
+                Ok(Box::new(TcpConnection::new(sock)) as crate::dial::DnsStream)
+            })
+        }
+
+        fn dial_udp(
+            &self,
+            _dest: &Destination,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn crate::dial::UdpPacketSession>>> + Send + '_>>
+        {
+            Box::pin(async {
+                Err(io::Error::new(io::ErrorKind::Unsupported, "tcp test dialer"))
+            })
+        }
+    }
+
+    /// bd mcpo 验收②：dialer 注入后查询经路由出站——dialer 收到查询目标
+    /// （dest 原样传递），数据经 dialer 建立的链路往返。
+    #[tokio::test]
+    async fn tcp_query_routes_through_dialer() {
+        let _slot = DIALER_SLOT_LOCK.lock();
+        let (addr, _h) = spawn_mock_tcp_server("routed.com.", vec![Ipv4Addr::new(10, 0, 0, 9)], 60).await;
+
+        let dialer = Arc::new(RecordingDialer::default());
+        crate::dial::set_shared_dialer(Some(dialer.clone()));
+        let ns = TcpNameServer::new(
+            ip_dest(addr),
+            Arc::new(CacheController::new("test", true, false, 0, 0)),
+            Vec::new(),
+            Duration::from_secs(2),
+            Arc::new(crate::dial::SystemHostResolver),
+        );
+
+        let rec = ns.query_once("routed.com.", RecordType::A).await.unwrap();
+        crate::dial::set_shared_dialer(None);
+
+        assert_eq!(rec.ips, vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9))]);
+        let recorded = dialer.recorded.lock();
+        assert_eq!(recorded.len(), 1, "query must dial through the routing dialer");
+        assert_eq!(
+            recorded[0].address(),
+            &Address::from(addr.ip()),
+            "dialer must receive the query destination"
+        );
+        assert_eq!(recorded[0].port().value(), addr.port());
+    }
+
+    /// 地址切换解析器：先返回 IP_A 后返回 IP_B（模拟上游 NS 地址变更）。
+    struct SwitchResolver {
+        to_b: std::sync::atomic::AtomicBool,
+        addr_a: IpAddr,
+        addr_b: IpAddr,
+    }
+
+    impl crate::dial::HostResolver for SwitchResolver {
+        fn resolve(
+            &self,
+            _host: String,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Vec<IpAddr>>> + Send>> {
+            let target = if self.to_b.load(std::sync::atomic::Ordering::SeqCst) {
+                self.addr_b
+            } else {
+                self.addr_a
+            };
+            Box::pin(async move { Ok(vec![target]) })
+        }
+    }
+
+    /// bd mcpo 验收①：域名 NS 运行期解析——上游地址变更后，新查询用新 IP
+    /// （旧解析不残留：连接池按域名字段每查询新建流）。
+    #[tokio::test]
+    async fn tcp_domain_ns_resolves_at_query_time() {
+        let _slot = DIALER_SLOT_LOCK.lock();
+        // A/B 两个 mock server：同一端口、不同 loopback IP（模拟上游 NS 换 IP）。
+        let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener_a.local_addr().unwrap().port();
+        let listener_b = TcpListener::bind(("127.0.0.2", port)).await.unwrap();
+        let task_a = spawn_echo_server(listener_a, Ipv4Addr::new(10, 9, 0, 1));
+        let task_b = spawn_echo_server(listener_b, Ipv4Addr::new(10, 9, 0, 2));
+
+        let resolver = Arc::new(SwitchResolver {
+            to_b: std::sync::atomic::AtomicBool::new(false),
+            addr_a: IpAddr::from([127, 0, 0, 1]),
+            addr_b: IpAddr::from([127, 0, 0, 2]),
+        });
+        let dest = Destination::tcp(Address::Domain("var.example".to_string()), Port::new(port));
+        let ns = TcpNameServer::new(
+            dest,
+            Arc::new(CacheController::new("test", true, false, 0, 0)),
+            Vec::new(),
+            Duration::from_secs(2),
+            resolver.clone(),
+        );
+
+        // 第一次查询 → 解析到 A server，回 A 记录。
+        let r1 = ns.query_once("var.com.", RecordType::A).await.unwrap();
+        assert_eq!(r1.ips, vec![IpAddr::V4(Ipv4Addr::new(10, 9, 0, 1))]);
+
+        // 上游地址"变更"。
+        resolver
+            .to_b
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // 新查询 → 解析到 B server，回 B 记录（新 IP 生效）。
+        let r2 = ns.query_once("var.com.", RecordType::A).await.unwrap();
+        assert_eq!(
+            r2.ips,
+            vec![IpAddr::V4(Ipv4Addr::new(10, 9, 0, 2))],
+            "query after address change must use the new IP"
+        );
+        let _ = (task_a, task_b);
+    }
+
+    /// 在指定 listener 上 accept 一次并回 A 记录响应。
+    fn spawn_echo_server(
+        listener: TcpListener,
+        reply_ip: Ipv4Addr,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut len_buf = [0u8; 2];
+            use tokio::io::AsyncReadExt;
+            sock.read_exact(&mut len_buf).await.unwrap();
+            let plen = usize::from(u16::from_be_bytes(len_buf));
+            let mut buf = vec![0u8; plen];
+            sock.read_exact(&mut buf).await.unwrap();
+            let query_msg = Message::from_vec(&buf).unwrap();
+            let resp = make_a_response(query_msg.metadata.id, "var.com.", vec![reply_ip], 60);
+            let len = u16::try_from(resp.len()).unwrap().to_be_bytes();
+            use tokio::io::AsyncWriteExt;
+            sock.write_all(&len).await.unwrap();
+            sock.write_all(&resp).await.unwrap();
+        })
     }
 }

@@ -100,10 +100,16 @@ pub struct PolicyConfig {
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ObservatoryConfig {
-    /// 被探测的 outbound tag（可选，默认首个）。
-    /// Go json `subjectSelector` 是 tag 列表（语义不同，见 register.rs 消费）；此处为 Rust 单值方言。
+    /// Go json `subjectSelector` 数组（探测目标 tag 列表，bd z9ma）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject_selector: Option<Vec<String>>,
+    /// Rust 单值方言（历史遗留）：单 tag 时 `subjectOutbound`/`subject_outbound`
+    /// 与 Go 数组键并存，`subject_selector` 优先。
     #[serde(skip_serializing_if = "Option::is_none", alias = "subject_outbound")]
     pub subject_outbound: Option<String>,
+    /// 并发探测（Go json `enableConcurrency`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_concurrency: Option<bool>,
     /// 探测 URL。Go json 键为 `probeURL`（大写 URL）。
     #[serde(
         rename = "probeURL",
@@ -121,6 +127,11 @@ pub struct ObservatoryConfig {
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct BurstObservatoryConfig {
+    /// Go json `subjectSelector` 数组（bd z9ma；Go `BurstObservatoryConfig`
+    /// 只有 SubjectSelector + pingConfig，无 enableConcurrency 字段）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject_selector: Option<Vec<String>>,
+    /// Rust 单值方言（历史遗留），`subject_selector` 优先。
     #[serde(skip_serializing_if = "Option::is_none", alias = "subject_outbound")]
     pub subject_outbound: Option<String>,
     /// ping 探测配置。
@@ -398,6 +409,43 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(legacy.subject_outbound.as_deref(), Some("p1"));
+    }
+
+    /// bd z9ma：Go 标准键 `subjectSelector`（数组）+ `enableConcurrency` 解析；
+    /// 单值方言 `subjectOutbound` 兜底；序列化输出 Go 键。
+    #[test]
+    fn observatory_subject_selector_and_concurrency_go_keys() {
+        let go: ObservatoryConfig = serde_json::from_value(serde_json::json!({
+            "subjectSelector": ["proxy", "warp"], "enableConcurrency": true
+        }))
+        .unwrap();
+        assert_eq!(go.subject_selector.as_deref(), Some(&["proxy".to_string(), "warp".to_string()][..]));
+        assert_eq!(go.enable_concurrency, Some(true));
+        // 单值方言兜底：Go 数组键缺失时回落 subjectOutbound
+        let legacy: ObservatoryConfig = serde_json::from_value(serde_json::json!({
+            "subjectOutbound": "p1"
+        }))
+        .unwrap();
+        assert_eq!(legacy.subject_selector, None);
+        assert_eq!(legacy.subject_outbound.as_deref(), Some("p1"));
+        // 序列化主键 = Go 标准 camelCase
+        let out = serde_json::to_value(&go).unwrap();
+        assert!(out.get("subjectSelector").is_some());
+        assert!(out.get("enableConcurrency").is_some());
+    }
+
+    /// bd z9ma：burst 的 Go `subjectSelector` 数组（Go BurstObservatoryConfig
+    /// 无 enableConcurrency——不引入该方言字段）。
+    #[test]
+    fn burst_observatory_subject_selector_go_key() {
+        let go: BurstObservatoryConfig = serde_json::from_value(serde_json::json!({
+            "subjectSelector": ["a", "b"], "pingConfig": {"destination": "https://x"}
+        }))
+        .unwrap();
+        assert_eq!(
+            go.subject_selector.as_deref(),
+            Some(&["a".to_string(), "b".to_string()][..])
+        );
     }
 
     /// fakeDns：Go 键 ipPool/poolSize 生效 + 旧键兼容 + 序列化输出 Go 键。

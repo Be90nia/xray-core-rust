@@ -11,7 +11,7 @@
 //! - [`XUDPManager`]: UDP 会话管理器
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -124,6 +124,9 @@ pub(crate) struct SessionManagerShared {
     inner: RwLock<SessionManagerInner>,
     /// 计数器（原子操作，用于快速读取）。
     count: AtomicU16,
+    /// 活跃会话数镜像（`inner.sessions.len()` 的原子副本，锁内同点维护，
+    /// 供 `is_full` 等同步路径无锁读取——Go `sm.Size()` 语义）。
+    size: AtomicUsize,
     /// 关闭标志。
     closed_flag: AtomicBool,
 }
@@ -304,8 +307,8 @@ impl Session {
         // 从父管理器移除
         if let Some(shared) = self.parent.upgrade() {
             let mut inner = shared.inner.write().await;
-            if !inner.closed {
-                inner.sessions.remove(&self.id);
+            if !inner.closed && inner.sessions.remove(&self.id).is_some() {
+                shared.size.fetch_sub(1, Ordering::Release);
             }
         }
 
@@ -448,6 +451,7 @@ impl SessionManager {
                     closed: false,
                 }),
                 count: AtomicU16::new(0),
+                size: AtomicUsize::new(0),
                 closed_flag: AtomicBool::new(false),
             }),
         }
@@ -459,12 +463,21 @@ impl SessionManager {
         self.shared.closed_flag.load(Ordering::Acquire)
     }
 
-    /// 获取当前活跃会话数。
+
+    /// 获取当前活跃会话数（无锁原子读，Go `Size()` 等价）。
     pub async fn size(&self) -> usize {
-        let inner = self.shared.inner.read().await;
-        inner.sessions.len()
+        self.active_count()
     }
 
+    /// 当前活跃会话数（同步无锁）。
+    ///
+    /// 对应 Go `SessionManager.Size()`（session.go:40-45）=`len(sessions)`。
+    /// 与累计 [`Self::count`] 的区分是 bd 4uuo 修复核心：`is_full` 必须
+    /// 用活跃数，累计数会让 worker 提前饱和退化为逐连接拨号。
+    #[must_use]
+    pub fn active_count(&self) -> usize {
+        self.shared.size.load(Ordering::Acquire)
+    }
     /// 获取已分配的会话总数（包括已关闭的）。
     #[must_use]
     pub fn count(&self) -> u16 {
@@ -505,6 +518,7 @@ impl SessionManager {
         session.set_parent(Arc::downgrade(&self.shared));
         let session = Arc::new(session);
         inner.sessions.insert(session.id, Arc::clone(&session));
+        self.shared.size.fetch_add(1, Ordering::Release);
         Some(session)
     }
 
@@ -533,6 +547,7 @@ impl SessionManager {
         session.set_parent(Arc::downgrade(&self.shared));
         let session = Arc::new(session);
         inner.sessions.insert(session.id(), Arc::clone(&session));
+        self.shared.size.fetch_add(1, Ordering::Release);
         Some(session)
     }
 
@@ -544,7 +559,9 @@ impl SessionManager {
     pub async fn remove(&self, id: u16) {
         let mut inner = self.shared.inner.write().await;
         if !inner.closed {
-            inner.sessions.remove(&id);
+            if inner.sessions.remove(&id).is_some() {
+                self.shared.size.fetch_sub(1, Ordering::Release);
+            }
         }
     }
 
@@ -587,6 +604,7 @@ impl SessionManager {
         inner.closed = true;
         self.shared.closed_flag.store(true, Ordering::Release);
         inner.sessions.clear();
+        self.shared.size.store(0, Ordering::Release);
         true
     }
 
@@ -613,6 +631,7 @@ impl SessionManager {
         // 清理映射表
         let mut inner = self.shared.inner.write().await;
         inner.sessions.clear();
+        self.shared.size.store(0, Ordering::Release);
     }
 
 }

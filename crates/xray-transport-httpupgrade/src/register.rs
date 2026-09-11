@@ -17,7 +17,6 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use xray_common::net::destination::Destination;
 use xray_transport::connection::Connection;
@@ -100,12 +99,10 @@ async fn listen_httpupgrade(
     // Go hub.go:117-121 + 90-94）。
     let mut server = HttpUpgradeServer::new(config);
     server.trusted_x_forwarded_for = sockopt.trusted_x_forwarded_for.clone();
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = Arc::clone(&shutdown);
-
-    tokio::spawn(async move {
+    // accept task 的 abort 句柄：close() 直接取消 task，parked 在 accept() 上的
+    // 循环被确定性解除，TcpListener drop 即释放端口（对齐 Go hub.go Close()）。
+    let accept_task = tokio::spawn(async move {
         loop {
-            if shutdown_clone.load(Ordering::Relaxed) { break; }
             let (mut tcp, mut remote) = match listener.accept().await {
                 Ok(pair) => pair,
                 Err(e) => {
@@ -146,7 +143,8 @@ async fn listen_httpupgrade(
         }
     });
 
-    Ok(Box::new(HttpUpgradeListener { local, shutdown }) as Box<dyn TransportListener>)
+    Ok(Box::new(HttpUpgradeListener { local, abort: accept_task.abort_handle() })
+        as Box<dyn TransportListener>)
 }
 
 async fn do_handshake(
@@ -192,17 +190,42 @@ fn build_tls_server_config(
 /// HTTPUpgrade transport listener 句柄。
 struct HttpUpgradeListener {
     local: SocketAddr,
-    shutdown: Arc<AtomicBool>,
+    abort: tokio::task::AbortHandle,
 }
 
 impl TransportListener for HttpUpgradeListener {
     fn close(&self) -> io::Result<()> {
-        self.shutdown.store(true, Ordering::Relaxed);
+        // 取消 accept task：正在 accept()/握手 await 中的循环被打断，端口释放。
+        self.abort.abort();
         Ok(())
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
         Ok(self.local)
+    }
+}
+
+/// HTTP `Host` 三级回退（Go dialer.go:83-89）：
+/// `config.host` → `tlsSettings.serverName`（仅 TLS 配置时参与）→ 拨号地址。
+///
+/// CDN 按 IP 拨号且对端校验 Host 时（hub.go:57-59），缺 serverName 级会
+/// 404 unrecognized（票 gbgr）。
+#[must_use]
+fn resolve_upgrade_host(
+    config_host: &str,
+    tls_active: bool,
+    server_name: Option<&str>,
+    dest_address: &str,
+) -> String {
+    if !config_host.is_empty() {
+        config_host.to_string()
+    } else if tls_active {
+        server_name
+            .filter(|s| !s.is_empty())
+            .unwrap_or(dest_address)
+            .to_string()
+    } else {
+        dest_address.to_string()
     }
 }
 
@@ -220,23 +243,35 @@ async fn dial_httpupgrade(
 ) -> io::Result<Box<dyn Connection>> {
     let config = parse_httpupgrade_config(settings.transport_json.as_ref())?;
 
-    // Host: 配置优先，缺失用 dest 地址（与 Go `serverName = dest address` 一致）。
+    // Host 三级回退（Go dialer.go:83-89）：config.host → tlsSettings.serverName
+    // （仅 TLS 配置时参与）→ 拨号地址。CDN 按 IP 拨号 + 对端校验 Host 场景，
+    // 缺 serverName 级会导致 404 unrecognized（票 gbgr）。
     let default_sni = dest.address().to_string();
-    let host = if config.host.is_empty() {
-        default_sni.clone()
-    } else {
-        config.host.clone()
-    };
 
-    // 1. TCP 拨号
-    let tcp_conn = xray_transport::system_dialer::dial_system(dest, sockopt).await?;
-
-    // 2. 可选 TLS 包装
+    // 1. 可选 TLS 配置（先于 Host 回退：Go `tConfig != nil` 门槛需要它）。
     let mut tls_config = xray_tls::client_config::build_client_config(
         &settings.security,
         settings.security_json.as_ref(),
         &default_sni,
     )?;
+    // tlsSettings.serverName（可空：Go `tConfig.ServerName` 空则落第三级）。
+    let server_name = settings
+        .security_json
+        .as_ref()
+        .and_then(|v| v.get("serverName"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let host = resolve_upgrade_host(
+        &config.host,
+        tls_config.is_some(),
+        server_name.as_deref(),
+        &default_sni,
+    );
+
+    // 2. TCP 拨号
+    let tcp_conn = xray_transport::system_dialer::dial_system(dest, sockopt).await?;
+
     // Go httpupgrade/dialer.go：`tls.WithNextProto("http/1.1")`——upgrade 是
     // HTTP/1.1 语义，ALPN 含 "h2" 时 CDN 协商 h2 导致 upgrade 帧解析失败。
     if let Some(cfg) = tls_config.as_mut() {
@@ -246,13 +281,7 @@ async fn dial_httpupgrade(
     }
 
     // Go：SNI = tlsSettings.serverName（缺失用 dest）——与拨号目标解耦（CDN 场景）。
-    let sni = settings
-        .security_json
-        .as_ref()
-        .and_then(|v| v.get("serverName"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| default_sni.clone());
+    let sni = server_name.unwrap_or_else(|| default_sni.clone());
 
     let upgraded_conn: Box<dyn Connection> = if let Some(cfg) = tls_config {
         // 禁区: ws/httpupgrade 的 u_client 接线实测 VPS 15 节点 Connection reset (2026-09-06 run_full32 17/32), btls 与该类端点不兼容, 启用前须先解决 btls 层兼容性 — fingerprint_name 透传解析保留, 接线恒走 rustls。
@@ -709,5 +738,72 @@ mod tests {
             .expect("echo timeout")
             .expect("read ok");
         assert_eq!(&buf[..n], b"hello-hu-tcpmask");
+    }
+
+    #[test]
+    fn host_fallback_config_host_wins() {
+        assert_eq!(
+            resolve_upgrade_host("cdn.example.com", true, Some("sni.example.com"), "1.2.3.4"),
+            "cdn.example.com"
+        );
+    }
+
+    #[test]
+    fn host_fallback_server_name_only_with_tls() {
+        // 票 gbgr：host 未配 + TLS 时 serverName 参与回退（Go dialer.go:84-86）。
+        assert_eq!(
+            resolve_upgrade_host("", true, Some("sni.example.com"), "1.2.3.4"),
+            "sni.example.com"
+        );
+        // 无 TLS 配置：Go `tConfig != nil` 不成立，serverName 不参与。
+        assert_eq!(
+            resolve_upgrade_host("", false, Some("sni.example.com"), "1.2.3.4"),
+            "1.2.3.4"
+        );
+    }
+
+    #[test]
+    fn host_fallback_dest_address_is_last_resort() {
+        // serverName 缺失/空串：Go `tConfig.ServerName` 空则落 dest（dialer.go:87-89）。
+        assert_eq!(resolve_upgrade_host("", true, None, "1.2.3.4"), "1.2.3.4");
+        assert_eq!(resolve_upgrade_host("", true, Some(""), "1.2.3.4"), "1.2.3.4");
+        assert_eq!(resolve_upgrade_host("", false, None, "1.2.3.4"), "1.2.3.4");
+    }
+    /// close() 后 accept task 被 abort，端口释放、新连接被拒（票 x6sp 行为面：
+    /// 修复前 AtomicBool 无唤醒，parked 在 accept() 的循环永久挂起）。
+    #[tokio::test]
+    async fn close_rejects_new_connections() {
+        use std::time::Duration;
+        let settings = StreamSettings {
+            protocol: "httpupgrade".to_string(),
+            ..StreamSettings::tcp()
+        };
+        let handler: ConnHandler = Arc::new(|_| {});
+        let listener = listen_httpupgrade(
+            "127.0.0.1:0".parse().unwrap(),
+            &settings,
+            &SocketOptions::default(),
+            handler,
+        )
+        .await
+        .expect("listen_httpupgrade");
+        let addr = listener.local_addr().expect("local_addr");
+
+        listener.close().expect("close");
+
+        // abort → TcpListener drop 是异步的：轮询直至 connect 被拒。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match tokio::net::TcpStream::connect(addr).await {
+                Err(_) => break,
+                Ok(_) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "close 后端口仍接受连接（僵尸 listener 未解除）"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
     }
 }

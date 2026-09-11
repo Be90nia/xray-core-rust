@@ -141,7 +141,7 @@ impl ActivityTimer {
     ///
     /// 每次收到活动通知会重置超时计时。
     /// 此方法应在一个独立的 tokio 任务中运行。
-    pub async fn run(&mut self) {
+    pub async fn run(&self) {
         // Sliding window：每轮循环读当前 timeout（可被 set_timeout 重置），
         // 用 sleep_until 到 deadline。性能开销可忽略（每轮一次 sleep）。
         loop {
@@ -484,7 +484,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_activity_timer_timeout() {
-        let mut timer = ActivityTimer::new(Duration::from_millis(100));
+        let timer = ActivityTimer::new(Duration::from_millis(100));
         timer.run().await;
         assert!(timer.is_cancelled());
     }
@@ -514,7 +514,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_activity_timer_done_signal() {
-        let mut timer = ActivityTimer::new(Duration::from_millis(100));
+        let timer = ActivityTimer::new(Duration::from_millis(100));
         let mut done = timer.done();
 
         // spawn timer run，超时后 done 信号应触发

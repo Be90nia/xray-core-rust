@@ -24,6 +24,8 @@ use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
 use xray_common::net::address::Address;
+use xray_common::net::destination::Destination;
+use xray_common::net::port::Port;
 
 use crate::cache_controller::CacheController;
 use crate::config::IpOption;
@@ -41,8 +43,8 @@ const UDP_RECV_BUF: usize = 4096;
 pub struct UdpNameServer {
     /// 服务名（含地址，用于日志）。
     name: String,
-    /// 远端 DNS 服务器地址（已规范化为 SocketAddr）。
-    addr: SocketAddr,
+    /// 远端 DNS 服务器地址（IP 直连；域名运行期解析——bd mcpo）。
+    dest: Destination,
     /// 缓存控制器。
     cache: Arc<CacheController>,
     /// EDNS0 client subnet（空 Vec 表示不加）。
@@ -53,6 +55,8 @@ pub struct UdpNameServer {
     id_gen: AtomicReqIdGen,
     /// TCP fallback 缓冲区大小。
     tcp_recv_max: usize,
+    /// 域名解析器（直连兜底路径）。
+    resolver: Arc<dyn crate::dial::HostResolver>,
 }
 
 impl UdpNameServer {
@@ -61,27 +65,28 @@ impl UdpNameServer {
     /// `client_ip` 长度须为 0/4/16（EDNS0 subnet 规范）。
     #[must_use]
     pub fn new(
-        addr: SocketAddr,
+        dest: Destination,
         cache: Arc<CacheController>,
         client_ip: Vec<u8>,
         query_timeout: Duration,
+        resolver: Arc<dyn crate::dial::HostResolver>,
     ) -> Self {
-        let name = format!("UDP:{}", addr);
+        let name = format!("UDP:{}:{}", dest.address(), dest.port().value());
         Self {
             name,
-            addr,
+            dest,
             cache,
             client_ip,
             query_timeout,
             id_gen: AtomicReqIdGen::new(),
             tcp_recv_max: 65535,
+            resolver,
         }
     }
 
-
     /// 从 `NameServerConfig` 构造（Box<dyn Server> 形态）。
     ///
-    /// `ns.address` 必须能解析为 IP（域名地址会失败，调用方先做 DNS 查询）。
+    /// `ns.address` 接受 IP 或域名（bd mcpo：域名运行期解析）。
     pub fn from_config(ns: &NameServerConfig) -> Result<Box<dyn Server>, DnsError> {
         // Arc 包装：serveStale 后台 pull 需要共享句柄（Go interface 值共享语义）。
         Ok(Box::new(Arc::new(Self::from_config_bare(ns)?)))
@@ -91,29 +96,27 @@ impl UdpNameServer {
     /// （disable_cache/serve_stale/serve_expired_ttl/negative_ttl_secs）
     /// 流入 CacheController（Go nameserver.go NewServer 收全量 proto 语义）。
     fn from_config_bare(ns: &NameServerConfig) -> Result<Self, DnsError> {
-        let socket_addr = match &ns.address {
-            Address::IPv4(v) => SocketAddr::new(IpAddr::V4(*v), ns.port),
-            Address::IPv6(v) => SocketAddr::new(IpAddr::V6(*v), ns.port),
-            other => {
-                return Err(DnsError::WireFormat(format!(
-                    "udp nameserver requires IP address, got: {other:?}"
-                )));
-            }
-        };
+        let dest = Destination::udp(ns.address.clone(), Port::new(ns.port));
         let timeout = if ns.timeout_ms > 0 {
             Duration::from_millis(u64::from(ns.timeout_ms))
         } else {
             Duration::from_millis(4000)
         };
         let cache = Arc::new(CacheController::new(
-            format!("UDP:{}", socket_addr),
+            format!("UDP:{}", dest),
             ns.disable_cache.unwrap_or(false),
             ns.serve_stale.unwrap_or(false),
             ns.serve_expired_ttl.unwrap_or(0),
             ns.negative_ttl_secs.unwrap_or(0),
         ));
         cache.start_cleanup_task(crate::cache_controller::CLEANUP_INTERVAL);
-        Ok(Self::new(socket_addr, cache, ns.client_ip.clone(), timeout))
+        Ok(Self::new(
+            dest,
+            cache,
+            ns.client_ip.clone(),
+            timeout,
+            Arc::new(crate::dial::SystemHostResolver),
+        ))
     }
 
     /// 发送单次 DNS 查询并等待响应。
@@ -125,11 +128,49 @@ impl UdpNameServer {
         let req_id = self.id_gen.next_id();
         let wire = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
 
+        // 共享 dialer 在场：查询经路由出站（Go nameserver_udp.go:134
+        // udpServer.Dispatch 包粒度语义，XUDP 帧约定由 dialer 适配层处理）。
+        if let Some(dialer) = crate::dial::shared_dialer() {
+            let mut session = timeout(self.query_timeout, dialer.dial_udp(&self.dest))
+                .await
+                .map_err(|_| {
+                    DnsError::WireFormat(format!("udp dial timeout after {:?}", self.query_timeout))
+                })?
+                .map_err(|e| DnsError::WireFormat(format!("udp dial: {e}")))?;
+            timeout(self.query_timeout, session.send_packet(&self.dest, &wire))
+                .await
+                .map_err(|_| DnsError::WireFormat("udp dial send timeout".to_string()))?
+                .map_err(|e| DnsError::WireFormat(format!("udp dial send: {e}")))?;
+            let resp = timeout(self.query_timeout, session.recv_packet())
+                .await
+                .map_err(|_| {
+                    DnsError::WireFormat(format!(
+                        "udp dial recv timeout after {:?}",
+                        self.query_timeout
+                    ))
+                })?
+                .map_err(|e| DnsError::WireFormat(format!("udp dial recv: {e}")))?;
+            let Some(resp) = resp else {
+                return Err(DnsError::WireFormat("udp dial session closed".to_string()));
+            };
+            let now = Instant::now();
+            let parsed = parse_dns_response(&resp, req_id, record_type, now)?;
+            if parsed.truncated {
+                return self.tcp_fallback_query(fqdn, record_type).await;
+            }
+            return Ok(parsed_to_ip_record(&parsed, now));
+        }
+
+        // 直连兜底：IP 直发；域名每查询现解析（bd mcpo 运行期解析）。
+        let sock_addr = crate::dial::resolve_dest_addr(&self.dest, self.resolver.as_ref())
+            .await
+            .map_err(|e| DnsError::WireFormat(format!("udp resolve: {e}")))?;
+
         // 绑定任意本地端口。失败多为系统 fd 限制。
         let sock = UdpSocket::bind("0.0.0.0:0")
             .await
             .map_err(|e| DnsError::WireFormat(format!("udp bind: {e}")))?;
-        sock.send_to(&wire, self.addr)
+        sock.send_to(&wire, sock_addr)
             .await
             .map_err(|e| DnsError::WireFormat(format!("udp send: {e}")))?;
 
@@ -162,7 +203,6 @@ impl UdpNameServer {
         record_type: RecordType,
     ) -> Result<IpRecord, DnsError> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpStream;
 
         let req_id = self.id_gen.next_id();
         let payload = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
@@ -172,13 +212,10 @@ impl UdpNameServer {
             .map_err(|_| DnsError::WireFormat("query too large for TCP".into()))?
             .to_be_bytes();
 
-        let mut stream = timeout(self.query_timeout, TcpStream::connect(self.addr))
-            .await
-            .map_err(|_| DnsError::WireFormat(format!(
-                "tcp fallback connect timeout after {:?}",
-                self.query_timeout
-            )))?
-            .map_err(|e| DnsError::WireFormat(format!("tcp fallback connect: {e}")))?;
+        // 经路由出站或直连兜底（域名每查询现解析）——与 TCP NS 同一拨号路径。
+        let mut stream =
+            crate::dial::connect_stream(&self.dest, self.resolver.as_ref(), self.query_timeout, "udp-tcp-fallback")
+                .await?;
 
         timeout(self.query_timeout, stream.write_all(&len_be))
             .await
@@ -276,9 +313,16 @@ mod tests {
     use crate::config::IpOption;
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::{Name, RData, Record, RecordType};
+    use std::io;
     use std::net::Ipv4Addr;
     use std::str::FromStr;
 
+    /// 共享 dialer 槽是进程级全局：涉 dialer 的测试须串行。
+    static DIALER_SLOT_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    fn udp_dest(addr: SocketAddr) -> Destination {
+        Destination::udp(Address::from(addr.ip()), Port::new(addr.port()))
+    }
     /// 用 hickory 构造一个 DNS 响应 wire bytes（含 A 记录）。
     fn make_a_response(req_id: u16, fqdn: &str, ips: Vec<Ipv4Addr>, ttl: u32) -> Vec<u8> {
         let name = Name::parse(fqdn, None).unwrap();
@@ -310,16 +354,17 @@ mod tests {
         });
         (addr, handle)
     }
-
     #[tokio::test]
     async fn query_once_returns_parsed_a_record() {
+        let _slot = DIALER_SLOT_LOCK.lock();
         let (addr, _h) = spawn_mock_udp_server("example.com.", vec![Ipv4Addr::new(1, 2, 3, 4)], 60).await;
 
         let ns = UdpNameServer::new(
-            addr,
+            udp_dest(addr),
             Arc::new(CacheController::new("test", true, false, 0, 0)),
             Vec::new(),
             Duration::from_secs(2),
+            Arc::new(crate::dial::SystemHostResolver),
         );
         let rec = ns.query_once("example.com.", RecordType::A).await.unwrap();
         assert_eq!(rec.ips.len(), 1);
@@ -329,13 +374,15 @@ mod tests {
 
     #[tokio::test]
     async fn send_query_populates_rec_v4_only() {
+        let _slot = DIALER_SLOT_LOCK.lock();
         let (addr, _h) = spawn_mock_udp_server("x.com.", vec![Ipv4Addr::new(9, 9, 9, 9)], 30).await;
 
         let ns = UdpNameServer::new(
-            addr,
+            udp_dest(addr),
             Arc::new(CacheController::new("test", true, false, 0, 0)),
             Vec::new(),
             Duration::from_secs(2),
+            Arc::new(crate::dial::SystemHostResolver),
         );
         let outcome = ns
             .send_query("x.com.", IpOption {
@@ -351,6 +398,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_query_records_error_when_server_silent() {
+        let _slot = DIALER_SLOT_LOCK.lock();
         // 启 server 但不响应。
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = sock.local_addr().unwrap();
@@ -358,10 +406,11 @@ mod tests {
         drop(sock);
 
         let ns = UdpNameServer::new(
-            addr,
+            udp_dest(addr),
             Arc::new(CacheController::new("test", true, false, 0, 0)),
             Vec::new(),
             Duration::from_millis(100),
+            Arc::new(crate::dial::SystemHostResolver),
         );
         let outcome = ns
             .send_query("y.com.", IpOption {
@@ -395,17 +444,103 @@ mod tests {
         assert_eq!(server.cache.negative_ttl_secs, 15);
     }
 
+    /// bd mcpo：from_config 接受域名（运行期解析，弃启动期钉死）。
     #[test]
-    fn from_config_rejects_domain_address() {
+    fn from_config_accepts_domain_address() {
         let ns = NameServerConfig {
             address: Address::Domain("dns.example.com".to_string()),
             port: 53,
             ..Default::default()
         };
-        assert!(matches!(
-            UdpNameServer::from_config(&ns),
-            Err(DnsError::WireFormat(_))
-        ));
+        let server = UdpNameServer::from_config(&ns).unwrap();
+        assert_eq!(server.name(), "UDP:dns.example.com:53");
+    }
+
+    /// 记录拨号目标的 mock dialer：真连 dest（UDP echo），验收"查询经路由出站"。
+    #[derive(Default)]
+    struct RecordingUdpDialer {
+        recorded: parking_lot::Mutex<Vec<Destination>>,
+    }
+
+    impl crate::dial::QueryDialer for RecordingUdpDialer {
+        fn dial_tcp(
+            &self,
+            _dest: &Destination,
+        ) -> Pin<Box<dyn Future<Output = io::Result<crate::dial::DnsStream>> + Send + '_>> {
+            Box::pin(async {
+                Err(io::Error::new(io::ErrorKind::Unsupported, "udp test dialer"))
+            })
+        }
+
+        fn dial_udp(
+            &self,
+            dest: &Destination,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn crate::dial::UdpPacketSession>>> + Send + '_>>
+        {
+            self.recorded.lock().push(dest.clone());
+            let dest = dest.clone();
+            Box::pin(async move {
+                let ip = dest.address().ip().expect("test dest is IP");
+                let sock = UdpSocket::bind("0.0.0.0:0").await?;
+                sock.connect(SocketAddr::new(ip, dest.port().value())).await?;
+                Ok(Box::new(ConnectedUdpSession { sock }) as Box<dyn crate::dial::UdpPacketSession>)
+            })
+        }
+    }
+
+    /// 直连 UDP 会话（单包请求-响应）。
+    struct ConnectedUdpSession {
+        sock: UdpSocket,
+    }
+
+    impl crate::dial::UdpPacketSession for ConnectedUdpSession {
+        fn send_packet(
+            &mut self,
+            _dest: &Destination,
+            payload: &[u8],
+        ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            let sock = &self.sock;
+            let payload = payload.to_vec();
+            Box::pin(async move { sock.send(&payload).await.map(|_| ()) })
+        }
+
+        fn recv_packet(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Option<Vec<u8>>>> + Send + '_>> {
+            let sock = &self.sock;
+            Box::pin(async move {
+                let mut buf = vec![0u8; 4096];
+                let n = sock.recv(&mut buf).await?;
+                Ok(Some(buf[..n].to_vec()))
+            })
+        }
+    }
+
+    /// bd mcpo 验收②：UDP 查询经路由出站——dialer 收到查询目标，
+    /// 数据经 dialer 数据报会话往返。
+    #[tokio::test]
+    async fn udp_query_routes_through_dialer() {
+        let _slot = DIALER_SLOT_LOCK.lock();
+        let (addr, _h) = spawn_mock_udp_server("routed.com.", vec![Ipv4Addr::new(10, 0, 0, 8)], 60).await;
+
+        let dialer = Arc::new(RecordingUdpDialer::default());
+        crate::dial::set_shared_dialer(Some(dialer.clone()));
+        let ns = UdpNameServer::new(
+            udp_dest(addr),
+            Arc::new(CacheController::new("test", true, false, 0, 0)),
+            Vec::new(),
+            Duration::from_secs(2),
+            Arc::new(crate::dial::SystemHostResolver),
+        );
+
+        let rec = ns.query_once("routed.com.", RecordType::A).await.unwrap();
+        crate::dial::set_shared_dialer(None);
+
+        assert_eq!(rec.ips, vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 8))]);
+        let recorded = dialer.recorded.lock();
+        assert_eq!(recorded.len(), 1, "query must dial through the routing dialer");
+        assert_eq!(recorded[0].address(), &Address::from(addr.ip()));
+        assert_eq!(recorded[0].port().value(), addr.port());
     }
 
     #[test]

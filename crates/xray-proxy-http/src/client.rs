@@ -182,7 +182,7 @@ pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
             // Go client.go:226 补 `Proxy-Connection: Keep-Alive`（0w9l：原先
             // 两者皆缺，CONNECT 指纹与 Go 客户端可辨）。
             let mut headers = config.headers.clone();
-            xray_transport_splithttp::browser::try_default_headers_with(&mut headers, "nav");
+            xray_common::browser::try_default_headers_with(&mut headers, "nav");
             for (k, v) in &headers {
                 request.push_str(&format!("{k}: {v}\r\n"));
             }

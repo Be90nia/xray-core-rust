@@ -1,3 +1,4 @@
+pub mod browser;
 pub mod net;
 pub mod protocol;
 pub mod serial;

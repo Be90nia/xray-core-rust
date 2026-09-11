@@ -17,8 +17,8 @@ use aes::Aes128;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
+use xray_common::antireplay::{MapFilter, ReplayFilter};
 use xray_crypto::aead::{AeadCipher, Aes128Gcm};
-
 type HmacSha256 = Hmac<Sha256>;
 
 // ============================================================================
@@ -516,12 +516,11 @@ impl AuthIDDecoderItem {
 }
 
 /// AuthID 反重放 + 多用户解码器（对应 Go `AuthIDDecoderHolder`）。
-///
-/// 对齐 Go LRU-120 反重放 filter：`lru::LruCache<[u8;16], i64>` 存
-/// authID → createTime，容量 120，命中时检查时间戳防止重放。
+/// 服务端 AuthID 反重放 filter：Go `antireplay.NewMapFilter(120)` 同构双池
+/// 时间窗（120 秒换代，池无容量上限——旧条目不会被新连接挤出）。
 pub struct AuthIDDecoderHolder {
     items: Mutex<HashMap<[u8; 16], AuthIDDecoderItem>>,
-    replay_filter: Mutex<lru::LruCache<[u8; 16], i64>>,
+    replay_filter: Mutex<MapFilter<[u8; 16]>>,
 }
 
 /// AuthID 匹配结果。
@@ -543,9 +542,7 @@ impl AuthIDDecoderHolder {
     pub fn new() -> Self {
         Self {
             items: Mutex::new(HashMap::new()),
-            replay_filter: Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(120).expect("nonzero"),
-            )),
+            replay_filter: Mutex::new(MapFilter::new(120)),
         }
     }
 
@@ -600,12 +597,9 @@ impl AuthIDDecoderHolder {
             }
 
             let mut filter = self.replay_filter.lock().expect("replay poisoned");
-            if let Some(&cached_time) = filter.peek(auth_id) {
-                if cached_time >= t {
-                    return Err(AuthIDMatchError::Replay);
-                }
+            if !filter.check(auth_id) {
+                return Err(AuthIDMatchError::Replay);
             }
-            filter.put(*auth_id, t);
 
             return Ok(*key);
         }
@@ -823,26 +817,29 @@ mod tests {
     }
 
     #[test]
-    fn holder_lru_evicts_beyond_120() {
-        // Go 行为：LRU(120) 超过 120 自动淘汰最旧 entry
+    fn holder_no_capacity_eviction_beyond_120() {
+        // Go NewMapFilter(120) 双池无容量上限：>120 条新连接后旧 authID 重放
+        // 仍被拒（票 j46g——旧 LRU(120) 容量误读已修正）。
         let cmd_key = sample_cmd_key();
         let holder = AuthIDDecoderHolder::new();
         holder.add_user(cmd_key);
 
-        // 插入 121 个不同时间的 auth_id
-        let base = now_unix() - 60;
-        let mut first_auth = [0u8; 16];
-        for i in 0..121 {
+        // 时间戳全部落在 now±120 有效窗内（base=-100s，最大 +50s）。
+        let base = now_unix() - 100;
+        let first_auth = create_auth_id(&cmd_key, base).expect("create");
+        holder.match_auth_id(&first_auth).expect("first match");
+
+        // 150 条时间戳递增的新连接，超过 LRU 时代的 120 条容量。
+        for i in 1..=150i64 {
             let auth_id = create_auth_id(&cmd_key, base + i).expect("create");
-            if i == 0 { first_auth = auth_id; }
-            let _ = holder.match_auth_id(&auth_id);
+            holder.match_auth_id(&auth_id).expect("new connection must pass");
         }
 
-        // 第 0 个 auth_id 应已被 LRU 淘汰——重新提交应成功（非重放）
-        let result = holder.match_auth_id(&first_auth);
-        // auth_id 是加密的，同一个 auth_id 重提交时间戳不变，因 LRU 淘汰后无缓存记录
-        // 应该匹配成功（Ok）而不是 Replay 错误
-        assert!(result.is_ok(), "first auth_id should be evicted by LRU(120), got {:?}", result.err());
+        let err = holder.match_auth_id(&first_auth).unwrap_err();
+        assert!(
+            matches!(err, AuthIDMatchError::Replay),
+            "first authID must stay rejected after 150 new connections"
+        );
     }
 
     // === Seal/Open Header 完整往返测试 ===

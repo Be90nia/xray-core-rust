@@ -5,9 +5,9 @@
 //! 2. quinn Endpoint::server 监听，ALPN 协商 h3 + tuic
 //! 3. accept_uni → Authenticate 校验 token（export_keying_material）
 //! 4. accept_bi → Connect → tokio TCP dial 目标 → 双向 copy（true relay）
-//! 5. accept_bi → Packet / read_datagram → native datagram →
-//!    per-assoc UDP 会话表（bd 1ur/7ry）：assoc_id → 长生命周期出口，
-//!    响应按请求到达模式（bi-stream / datagram）回写；Dissociate 销毁会话
+//! 5. UDP Packet：quic 模式经 uni stream（spec 同模 open_uni 回包）、
+//!    native 模式经 QUIC DATAGRAM → per-assoc UDP 会话表（bd 1ur/7ry），
+//!    Dissociate 销毁会话
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use bytes::{BufMut, BytesMut};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use xray_app_dispatcher::{DispatchHandler, UdpDispatchSession};
@@ -27,6 +27,7 @@ use xray_common::net::port::Port;
 use crate::error::{Result, TuicError};
 use crate::protocol::command::{type_code, TOKEN_LEN};
 use crate::protocol::{Address, Command, Packet};
+use crate::udp::{quinn_read_exact_err, read_packet_payload};
 
 /// 自签证书产物（仅 mock 用）。
 struct TlsCert {
@@ -154,7 +155,7 @@ async fn handle_connection(
             .map_err(|_| TuicError::KeyingMaterialExport)?;
     // accept_uni 读 Authenticate
     let mut uni = conn.accept_uni().await?;
-    let cmd = read_command_from_stream(&mut uni, 64).await?;
+    let cmd = read_authenticate(&mut uni).await?;
     match cmd {
         crate::protocol::Command::Authenticate {
             uuid_bytes,
@@ -184,22 +185,15 @@ async fn handle_connection(
                     Err(quinn::ConnectionError::ApplicationClosed(_)) => break,
                     Err(e) => return Err(e.into()),
                 };
-                handle_bi_frame(send_bi, recv_bi, &mut udp_table).await;
+                handle_bi_frame(send_bi, recv_bi).await;
             }
             uni = conn.accept_uni() => {
-                let mut uni = match uni {
+                let uni = match uni {
                     Ok(u) => u,
                     Err(quinn::ConnectionError::ApplicationClosed(_)) => break,
                     Err(e) => return Err(e.into()),
                 };
-                match read_command_from_stream(&mut uni, 64).await {
-                    Ok(Command::Heartbeat) => {}
-                    Ok(Command::Dissociate { assoc_id }) => {
-                        udp_table.dissociate(assoc_id);
-                    }
-                    Ok(_) => {}
-                    Err(e) => tracing::debug!("tuic server: uni stream read: {e:?}"),
-                }
+                handle_incoming_uni(uni, &conn, &mut udp_table, "tuic server").await;
             }
             dg = conn.read_datagram() => {
                 match dg {
@@ -236,56 +230,109 @@ fn handle_datagram(
     }
 }
 
-/// 处理一条 bi stream：读 Connect/Packet 帧并 spawn relay。
-async fn handle_bi_frame(
-    send_bi: quinn::SendStream,
-    recv_bi: quinn::RecvStream,
-    udp_table: &mut UdpAssocTable,
-) {
+/// 处理一条 bi stream：读 Connect 帧并 spawn relay。
+///
+/// spec：bi stream 只承载 Connect（Packet 走 uni/datagram，票 d1zr）。
+async fn handle_bi_frame(send_bi: quinn::SendStream, recv_bi: quinn::RecvStream) {
     match read_frame_from_recv(recv_bi, 256).await {
-        Ok((frame, recv_bi, initial_bytes)) => match frame {
-            BiFrame::Command(Command::Connect(addr)) => {
-                let Some(target) = addr_to_socket_addr(&addr) else {
-                    tracing::warn!("tuic server: addr not ip literal: {addr:?}");
-                    return;
-                };
-                tokio::spawn(async move {
-                    if let Err(e) =
-                        relay_to_tcp(target, send_bi, recv_bi, initial_bytes).await
-                    {
-                        tracing::debug!("tuic relay {target}: {e:?}");
-                    }
-                });
-            }
-            BiFrame::Command(Command::Heartbeat) => {}
-            BiFrame::Command(_) => {}
-            BiFrame::Packet(pkt) => {
-                // bi-stream 模式：路由进 assoc 会话，响应由会话 task 写回本 stream
-                udp_table.handle_packet(pkt, ReplySink::Bi(send_bi));
-            }
-        },
+        Ok((Command::Connect(addr), recv_bi, initial_bytes)) => {
+            let Some(target) = addr_to_socket_addr(&addr) else {
+                tracing::warn!("tuic server: addr not ip literal: {addr:?}");
+                return;
+            };
+            tokio::spawn(async move {
+                if let Err(e) = relay_to_tcp(target, send_bi, recv_bi, initial_bytes).await {
+                    tracing::debug!("tuic relay {target}: {e:?}");
+                }
+            });
+        }
+        Ok((_, _, _)) => {}
         Err(e) => {
-            tracing::warn!("tuic server: failed to read connect: {e:?}");
+            // bi 收到 Packet（TYPE 0x02）等非 Connect 帧落此路径，忽略（spec，票 d1zr）
+            tracing::debug!("tuic server: bi frame skipped/invalid: {e:?}");
         }
     }
 }
 
-/// 从通用 AsyncRead 流读出 Command。
-pub(crate) async fn read_command_from_stream<S>(
-    stream: &mut S,
-    max_len: usize,
-) -> Result<crate::protocol::Command>
-where
-    S: AsyncReadExt + Unpin,
-{
-    let mut buf = vec![0u8; max_len];
-    let n = stream.read(&mut buf).await?;
-    if n == 0 {
-        return Err(TuicError::UnexpectedEof("command stream closed"));
+/// uni stream 中收到的帧：Command（Authenticate/Heartbeat/Dissociate）或 Packet。
+pub(crate) enum UniFrame {
+    Command(Command),
+    Packet(Packet),
+}
+
+/// 从 uni stream 流式读出一帧（`VER + TYPE` 后按类型分段 `read_exact`）。
+///
+/// QUIC 流单次 read 可能分片（票 ieik：Authenticate 半帧被旧单 read 解析
+/// 即 auth failed），故 PACKET 帧走 [`read_packet_payload`] 布局消费；
+/// 命令帧（Authenticate 50B / Dissociate 4B / Heartbeat 2B，均为固定短帧，
+/// 变长 Connect 只走 bi）循环累积到 [`Command::read_payload`] 可解析为止。
+pub(crate) async fn read_uni_frame(stream: &mut quinn::RecvStream) -> Result<UniFrame> {
+    let mut vt = [0u8; 2];
+    stream
+        .read_exact(&mut vt)
+        .await
+        .map_err(quinn_read_exact_err)?;
+    let mut vh: &[u8] = &vt;
+    let type_byte = crate::protocol::parse_header(&mut vh)?;
+    if type_byte == type_code::PACKET {
+        return read_packet_payload(stream).await.map(UniFrame::Packet);
     }
-    let mut cursor = &buf[..n];
-    let type_byte = crate::protocol::parse_header(&mut cursor)?;
-    crate::protocol::Command::read_payload(type_byte, &mut cursor)
+    let mut buf: Vec<u8> = Vec::with_capacity(64);
+    loop {
+        let mut cursor: &[u8] = &buf;
+        match Command::read_payload(type_byte, &mut cursor) {
+            Ok(cmd) => return Ok(UniFrame::Command(cmd)),
+            Err(TuicError::UnexpectedEof(_)) => {}
+            Err(e) => return Err(e),
+        }
+        let mut chunk = [0u8; 64];
+        let n = stream
+            .read(&mut chunk)
+            .await?
+            .ok_or_else(|| TuicError::UnexpectedEof("command stream closed"))?;
+        if n == 0 {
+            return Err(TuicError::UnexpectedEof("command stream closed"));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > 1024 {
+            return Err(TuicError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "uni command too long",
+            )));
+        }
+    }
+}
+
+/// 读首条 uni stream 的 Authenticate 帧（流式分段读，QUIC 分片安全）。
+pub(crate) async fn read_authenticate(stream: &mut quinn::RecvStream) -> Result<Command> {
+    match read_uni_frame(stream).await? {
+        UniFrame::Command(cmd) => Ok(cmd),
+        UniFrame::Packet(_) => Err(TuicError::Io(std::io::Error::other(
+            "first uni stream must be Authenticate",
+        ))),
+    }
+}
+
+/// 处理一条入向 uni stream：认证后的 Heartbeat/Dissociate 命令或
+/// quic 模式 Packet（spec：Packet 只经 uni stream，server 同模 open_uni 回包）。
+pub(crate) async fn handle_incoming_uni(
+    mut uni: quinn::RecvStream,
+    conn: &quinn::Connection,
+    udp_table: &mut UdpAssocTable,
+    ctx: &str,
+) {
+    match read_uni_frame(&mut uni).await {
+        Ok(UniFrame::Command(Command::Heartbeat)) => {}
+        Ok(UniFrame::Command(Command::Dissociate { assoc_id })) => {
+            udp_table.dissociate(assoc_id);
+        }
+        Ok(UniFrame::Command(_)) => {}
+        Ok(UniFrame::Packet(pkt)) => {
+            // 路由进 assoc 会话，响应由会话 task open_uni 回写（票 d1zr）
+            udp_table.handle_packet(pkt, ReplySink::Uni(conn.clone()));
+        }
+        Err(e) => tracing::debug!("{ctx}: uni stream read: {e:?}"),
+    }
 }
 
 
@@ -320,23 +367,17 @@ pub(crate) async fn relay_to_tcp(
     Ok(())
 }
 
-/// bi-stream 中收到的帧：Command 或 Packet。
-///
-/// Packet 的 TYPE 码（0x02）不在 [`Command::read_payload`] 支持范围内，
-/// 需要先检测 type_byte 分流。
-pub(crate) enum BiFrame {
-    Command(Command),
-    Packet(Packet),
-}
-
-/// 从 quinn RecvStream 读出 bi-stream 帧（Command 或 Packet），
-/// 返回 (帧, 已消费的 RecvStream, header 之后的剩余字节)。
+/// 从 quinn RecvStream 读出 bi-stream Connect 帧，
+/// 返回 (命令, 已消费的 RecvStream, header 之后的剩余字节)。
 ///
 /// 剩余字节留给 relay，避免 quinn 一次 read 把 header 和后续 payload 都读出。
+///
+/// spec：bi stream 只承载 Connect；Packet（TYPE 0x02）不经 bi（票 d1zr），
+/// 落入 [`Command::read_payload`] 的 UnknownCommandType 错误路径由调用方忽略。
 pub(crate) async fn read_frame_from_recv(
     mut stream: quinn::RecvStream,
     max_len: usize,
-) -> Result<(BiFrame, quinn::RecvStream, Vec<u8>)> {
+) -> Result<(Command, quinn::RecvStream, Vec<u8>)> {
     let mut buf = vec![0u8; max_len];
     let n = stream.read(&mut buf).await?.ok_or_else(|| {
         TuicError::Io(std::io::Error::new(
@@ -346,29 +387,25 @@ pub(crate) async fn read_frame_from_recv(
     })?;
     let mut cursor = &buf[..n];
     let type_byte = crate::protocol::parse_header(&mut cursor)?;
-    let (frame, remaining) = if type_byte == type_code::PACKET {
-        let pkt = Packet::read_payload(&mut cursor)?;
-        (BiFrame::Packet(pkt), cursor.to_vec())
-    } else {
-        let cmd = Command::read_payload(type_byte, &mut cursor)?;
-        (BiFrame::Command(cmd), cursor.to_vec())
-    };
-    Ok((frame, stream, remaining))
+    let cmd = Command::read_payload(type_byte, &mut cursor)?;
+    Ok((cmd, stream, cursor.to_vec()))
 }
 
 /// UDP assoc 会话空闲淘汰（对齐 Go `CancelAfterInactivity(1min)` 与 SS inbound 样板）。
 const UDP_ASSOC_IDLE: Duration = Duration::from_secs(60);
 
-/// 会话上行项：(目标, 负载, 回写目标)。
-type UdpAssocItem = (Destination, Vec<u8>, ReplySink);
+/// 会话上行项：(目标, 负载, 回写目标, 请求 pkt_id——响应帧原样回显，
+/// 客户端 quic 模式按 (assoc_id, pkt_id) 配对)。
+type UdpAssocItem = (Destination, Vec<u8>, ReplySink, u16);
 
 /// UDP 响应回写目标：与请求到达通道同模式（spec：server 按首包模式回写）。
 ///
 /// bi 模式下每请求独占一个 stream，响应写回最近一个请求的 stream
 /// （ponytail: 逐个请求-响应的客户端精确正确；同 assoc 流水线并发时最佳努力）。
 pub(crate) enum ReplySink {
-    Bi(quinn::SendStream),
     Dgram(quinn::Connection),
+    /// quic 模式：响应经 server 新开的 uni stream 回写（票 d1zr，spec 同模回包）。
+    Uni(quinn::Connection),
 }
 
 impl ReplySink {
@@ -379,12 +416,13 @@ impl ReplySink {
         out.put_u8(type_code::PACKET);
         pkt.write_payload(&mut out);
         match self {
-            ReplySink::Bi(s) => {
-                s.write_all(&out).await?;
-                let _ = s.finish();
-            }
             ReplySink::Dgram(c) => {
                 c.send_datagram(out.freeze()).map_err(TuicError::QuinnSendDatagram)?;
+            }
+            ReplySink::Uni(c) => {
+                let mut uni = c.open_uni().await?;
+                uni.write_all(&out).await?;
+                let _ = uni.finish();
             }
         }
         Ok(())
@@ -457,7 +495,8 @@ impl UdpAssocTable {
             return;
         };
         let assoc_id = pkt.assoc_id;
-        let item = (dest, pkt.data, sink);
+        let pkt_id = pkt.pkt_id;
+        let item = (dest, pkt.data, sink, pkt_id);
         let tx = self.sessions.entry(assoc_id).or_insert_with(|| {
             let (tx, rx) = tokio::sync::mpsc::channel(16);
             let dispatcher = self.dispatcher.clone();
@@ -501,6 +540,7 @@ async fn udp_assoc_direct(assoc_id: u16, mut rx: tokio::sync::mpsc::Receiver<Udp
         }
     };
     let mut sink: Option<ReplySink> = None;
+    let mut cur_pkt_id: u16 = 0;
     let mut resp_buf = vec![0u8; 65_536];
     let idle = tokio::time::sleep(UDP_ASSOC_IDLE);
     tokio::pin!(idle);
@@ -508,8 +548,9 @@ async fn udp_assoc_direct(assoc_id: u16, mut rx: tokio::sync::mpsc::Receiver<Udp
         tokio::select! {
             item = rx.recv() => {
                 match item {
-                    Some((dest, payload, s)) => {
+                    Some((dest, payload, s, pkt_id)) => {
                         sink = Some(s);
+                        cur_pkt_id = pkt_id;
                         if let Some(target) = resolve_udp_dest(&dest).await {
                             if let Err(e) = udp.send_to(&payload, target).await {
                                 tracing::debug!("tuic udp assoc {assoc_id} send: {e:?}");
@@ -528,7 +569,7 @@ async fn udp_assoc_direct(assoc_id: u16, mut rx: tokio::sync::mpsc::Receiver<Udp
                         if let Some(s) = sink.as_mut() {
                             let pkt = Packet::new(
                                 assoc_id,
-                                0,
+                                cur_pkt_id,
                                 socket_addr_to_tuic(peer),
                                 resp_buf[..n].to_vec(),
                             );
@@ -557,14 +598,16 @@ async fn udp_assoc_dispatch(
 ) {
     let mut session = UdpDispatchSession::new(dispatcher);
     let mut sink: Option<ReplySink> = None;
+    let mut cur_pkt_id: u16 = 0;
     let idle = tokio::time::sleep(UDP_ASSOC_IDLE);
     tokio::pin!(idle);
     loop {
         tokio::select! {
             item = rx.recv() => {
                 match item {
-                    Some((dest, payload, s)) => {
+                    Some((dest, payload, s, pkt_id)) => {
                         sink = Some(s);
+                        cur_pkt_id = pkt_id;
                         if let Err(e) = session.send_packet(&dest, &payload).await {
                             tracing::debug!("tuic udp assoc {assoc_id} dispatch send: {e:?}");
                             break;
@@ -580,7 +623,7 @@ async fn udp_assoc_dispatch(
                         if let Some(s) = sink.as_mut() {
                             let pkt = Packet::new(
                                 assoc_id,
-                                0,
+                                cur_pkt_id,
                                 dest_to_tuic_addr(&source),
                                 payload,
                             );
@@ -675,7 +718,9 @@ mod udp_assoc_tests {
     use crate::client::TuicClient;
     use crate::inbound::{TuicInboundConfig, TuicInboundHandler};
     use crate::pool::QuinnConnectionPool;
-    use crate::protocol::{Address, Command};
+    use crate::protocol::command::type_code;
+    use crate::protocol::{Address, Command, Packet};
+    use bytes::BufMut;
     use crate::server::TuicMockServer;
 
     /// 普通 UDP echo server。
@@ -944,6 +989,62 @@ mod udp_assoc_tests {
             2,
             "dissociate must destroy session; next packet re-establishes"
         );
+        client.close(0u32.into(), b"");
+    }
+
+    /// 票 d1zr：quic 模式 Packet 走 uni stream（spec uni-stream 模型）。
+    /// ① send_recv echo 成功 = 客户端 open_uni 发送 + server 同模 open_uni 回包；
+    /// ② 手动 bi-stream Packet 不再被 server 处理（bi 只承载 Connect）。
+    #[tokio::test]
+    async fn quic_mode_packet_goes_uni_stream() {
+        use crate::protocol::VERSION;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let echo_addr = start_udp_echo().await;
+        let (client, _server) = connect_mock("uni-packet").await;
+
+        // ① quic 模式 echo
+        let assoc = client.dial_udp(0x0A11);
+        let target = Address::Ipv4(Ipv4Addr::new(127, 0, 0, 1), echo_addr.port());
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            assoc.send_recv(target.clone(), b"uni ping", None),
+        )
+        .await
+        .expect("send_recv timed out")
+        .expect("send_recv failed");
+        assert_eq!(resp, b"uni ping");
+
+        // ② bi-stream Packet 被忽略（无响应 → 读端超时）
+        let pkt = Packet::new(0x0A11, 999, target, b"bi ping".to_vec());
+        let (mut send, mut recv) =
+            client.quinn_conn().open_bi().await.expect("open bi");
+        let mut buf = bytes::BytesMut::with_capacity(pkt.encoded_len() + 2);
+        buf.put_u8(VERSION);
+        buf.put_u8(type_code::PACKET);
+        pkt.write_payload(&mut buf);
+        use tokio::io::AsyncWriteExt as _;
+        send.write_all(&buf.freeze()).await.expect("write bi packet");
+        let _ = send.finish();
+        let r = tokio::time::timeout(
+            Duration::from_millis(800),
+            crate::udp::read_response_packet(&mut recv),
+        )
+        .await;
+        // 不被 relay 的观测 = 无合法响应：要么超时无数据，要么 server 忽略帧后
+        // 流被关闭（FinishedEarly）——两者都不是 UDP relay 回包
+        assert!(
+            matches!(r, Err(_) | Ok(Err(_))),
+            "bi-stream Packet must NOT be relayed (spec: bi carries Connect only), got {r:?}"
+        );
+        client.close(0u32.into(), b"");
+    }
+
+    /// 票 ieik②：Heartbeat 经 QUIC datagram 承载（spec），连接保持不挂。
+    #[tokio::test]
+    async fn heartbeat_goes_datagram() {
+        let (client, _server) = connect_mock("hb-dgram").await;
+        client.heartbeat().await.expect("heartbeat datagram send");
         client.close(0u32.into(), b"");
     }
 }

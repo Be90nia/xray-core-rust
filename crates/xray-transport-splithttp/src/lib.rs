@@ -27,7 +27,6 @@
 //! `ExtractMetaFromRequest`（`hub::meta::extract_meta`）+
 //! 实际 HTTP 拨号（H1/H2 + H3）+ SSE 流 + upload_queue + xmux 连接池骨架。
 
-pub mod browser;
 pub mod config;
 pub mod error;
 pub mod browser_client;

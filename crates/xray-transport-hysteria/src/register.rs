@@ -115,8 +115,14 @@ async fn listen_hysteria(
 
     let local = listener.local_addr();
 
-    // 3. spawn accept loop
-    tokio::spawn(async move {
+    // 3. spawn accept loop。listener 句柄持 endpoint（Arc clone）+ abort 句柄：
+    // close() 先 abort 本循环，再触发 HysteriaQuicListener::close()（ep.close 强杀
+    // QUIC 栈——factory.listen 内层的 accept 循环因此 accept None 退出，endpoint
+    // 全部 clone 归零，driver 停、UDP socket 关、端口释放。修复前 close() 仅日志，
+    // endpoint 永不释放成幽灵 inbound，对齐 Go hub.go Close=listener+tr.Close）。
+    let quic_listener = listener.clone();
+
+    let accept_task = tokio::spawn(async move {
         loop {
             let conn = match listener.accept().await {
                 Ok(c) => c,
@@ -129,7 +135,11 @@ async fn listen_hysteria(
         }
     });
 
-    Ok(Box::new(HysteriaTransportListener { local }))
+    Ok(Box::new(HysteriaTransportListener {
+        local,
+        listener: quic_listener,
+        abort: accept_task.abort_handle(),
+    }))
 }
 
 /// 单条 QUIC conn 内的 accept_bi 循环：把 client-initiated bi-stream 桥到 handler。
@@ -168,10 +178,12 @@ async fn accept_hysteria_conn(conn: Arc<dyn QuicConn>, handler: ConnHandler) {
 
 /// Hysteria transport listener 句柄。
 ///
-/// 仅记录 `local_addr`；QUIC endpoint 由 spawned accept task 持有，
-/// `close()` 不做实际关闭（task 退出时 endpoint drop 即关闭）。
+/// 持 QUIC endpoint（`HysteriaQuicListener` Arc clone）+ accept task abort 句柄；
+/// `close()` 二者皆触发，确定性释放端口。
 struct HysteriaTransportListener {
     local: SocketAddr,
+    listener: Arc<dyn HysteriaQuicListener>,
+    abort: tokio::task::AbortHandle,
 }
 
 impl TransportListener for HysteriaTransportListener {
@@ -181,6 +193,13 @@ impl TransportListener for HysteriaTransportListener {
 
     fn close(&self) -> io::Result<()> {
         tracing::info!("hysteria listener close addr={}", self.local);
+        self.abort.abort();
+        // trait close 是 async（内部 ep.close 同步生效）；TransportListener::close
+        // 是同步 fn，spawn 之。调用方均在 runtime 上下文（生产 instance close / 测试）。
+        let l = self.listener.clone();
+        tokio::spawn(async move {
+            let _ = l.close().await;
+        });
         Ok(())
     }
 }
@@ -414,5 +433,49 @@ mod tests {
         let cfg = parse_hysteria_config(Some(&v)).unwrap();
         assert_eq!(cfg.masq_type, "");
         assert_eq!(MasqType::from_config(&cfg).unwrap(), MasqType::NotFound);
+    }
+    /// close() abort accept task → endpoint drop，新 QUIC 握手失败
+    /// （票 4kjs 回归锚：修复前 close() 仅日志，endpoint 永远存活，connect 一直成功）。
+    #[tokio::test]
+    async fn close_rejects_new_connections() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+
+        let settings = StreamSettings {
+            protocol: "hysteria".into(),
+            security: "tls".into(),
+            ..Default::default()
+        };
+        let handler: ConnHandler = Arc::new(|_| {});
+        let listener = listen_hysteria("127.0.0.1:0".parse().unwrap(), settings, handler)
+            .await
+            .expect("listen_hysteria");
+        let addr = listener.local_addr().unwrap();
+
+        listener.close().unwrap();
+
+        // quinn 客户端（h3 ALPN + allowInsecure + 1s idle）连接必须失败。
+        let client_tls = xray_tls::client_config::build_client_config(
+            "tls",
+            Some(&serde_json::json!({"allowInsecure": true, "alpn": ["h3"]})),
+            "127.0.0.1",
+        )
+        .unwrap()
+        .expect("client tls config");
+        let mut transport = quinn::TransportConfig::default();
+        transport
+            .max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(1_000))));
+        let mut quic_cfg = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap(),
+        ));
+        quic_cfg.transport_config(Arc::new(transport));
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(quic_cfg);
+
+        let result = endpoint.connect(addr, "127.0.0.1").unwrap().await;
+        assert!(result.is_err(), "post-close connect must fail");
+        endpoint.close(0u32.into(), b"test done");
     }
 }

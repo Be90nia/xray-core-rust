@@ -287,24 +287,20 @@ impl ServerWorker {
                     return Ok(());
                 }
                 if ex.status == XudpStatus::Active {
-                    // kgjo：hit Active → 把新数据写到旧 mux 输出，复用同 GlobalID 的上游会话
-                    // （Go `handleStatusNew` hit 路径：data → ex.mux.input/output 复用，保留 UDP 流身份）。
-                    // ex.mux 是 WeakSession：upgrade 失败 = 旧 session 已 Close/Expiring → 当作 miss 重建。
+                    // zv9l：hit Active → 对齐 Go server.go:216-260——旧会话
+                    // detach 后以新 sessionID 重绑旧上游 I/O 注册并重泵。旧实现
+                    // 仅写旧 output 就 return：新 sessionID 从未注册，其后所有
+                    // Keep 帧查无此 ID 被静默丢（连 End 回帧都没有）。
+                    // upgrade 失败 = 旧 session 已 Close/Expiring → 重建。
                     if let Some(old_session) = ex.mux().and_then(|w| w.upgrade()) {
-                        if !data.is_empty() {
-                            // 借 session.output 把新包写进旧上行；保持 reader 沿用原 dispatcher。
-                            let mut guard = old_session.output().await;
-                            if let Some(writer) = guard.as_mut() {
-                                use xray_buf::multi::MultiBuffer;
-                                use xray_buf::buffer::Buffer;
-                                let _ = writer
-                                    .write_multi_buffer_impl(MultiBuffer::from_buffer(Buffer::from_vec(data)))
-                                    .await;
-                            }
+                        if self
+                            .xudp_hit_rebind(&old_session, meta, &data, &mut ex, link_writer)
+                            .await
+                        {
+                            return Ok(());
                         }
-                        return Ok(());
                     }
-                    // 旧 mux 已不可用（被清理）→ 落回 miss 重建路径
+                    // 旧 mux 已不可用或重绑失败 → 落回 miss 重建路径
                 }
                 // Expiring 或 hit-but-mux-stale：重置为 Initializing 后走新建路径
                 ex.status = XudpStatus::Initializing;
@@ -320,9 +316,8 @@ impl ServerWorker {
             }
         };
         // XUDP 恒为 Packet：直写（禁缓冲），New 帧内联 data 转发到 dispatch 目标
-        // ponytail: Go hit 路径（同 GlobalID 复用）把 data 写旧 mux output 保持
-        // 旧 UDP 流；此处统一写新 session output——数据不丢，流身份不保留，
-        // 需要流连续性时再复用 xudp.mux 的 input/output。
+        // ponytail: miss 路径建新上游；hit 路径复用旧上游（zv9l 已对齐 Go
+        // server.go:216-260），两条路径在此汇合收尾。
         let mut output = BufferedWriter::new(link.writer);
         output.set_buffered(false);
         if !data.is_empty() {
@@ -347,6 +342,62 @@ impl ServerWorker {
         let ow = link_writer.clone();
         tokio::spawn(async move { Self::handle_session_output(os, ow).await; });
         Ok(())
+    }
+
+
+    /// XUDP hit 复用路径（bd zv9l，对齐 Go server.go:216-260）。
+    ///
+    /// 旧会话 detach → 首包写旧上游 output → 旧 input/output 转移到新
+    /// sessionID 装配注册（manager.add + set_xudp + register）并重泵。
+    /// 返回 `false` = 旧链路不可复用（I/O 已空 / 首包写失败 / manager 已关），
+    /// 调用方落回 miss 重建路径（Go :221 写失败 → x.Interrupt 的等价分流）。
+    async fn xudp_hit_rebind(
+        &self,
+        old_session: &Arc<Session>,
+        meta: &FrameMetadata,
+        data: &[u8],
+        xudp: &mut XUDP,
+        link_writer: &Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>>,
+    ) -> bool {
+        // Go :216 x.Mux.Close(false)：detach 旧会话——旧 ID 从 manager 摘除、
+        // 旧泵任务退出（对客户端发旧 ID End 帧，Go handle 收尾同型）
+        old_session.close().await;
+        // Go :217-226 首包写旧上游 output（cone NAT 下同源多目标共享上游通道）
+        if !data.is_empty() {
+            let mut guard = old_session.output().await;
+            let Some(writer) = guard.as_mut() else {
+                return false;
+            };
+            if writer
+                .write_multi_buffer_impl(MultiBuffer::from_buffer(Buffer::from_vec(
+                    data.to_vec(),
+                )))
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+        // Go :247-254 重绑：旧 input/output 转移到新 sessionID
+        let input = old_session.input().await.take();
+        let output = old_session.output().await.take();
+        let (Some(input), Some(output)) = (input, output) else {
+            return false;
+        };
+        let session = Session::new(meta.session_id(), TransferType::Packet);
+        session.set_input(input).await;
+        session.set_output(output).await;
+        let Some(session) = self.session_manager.add(session).await else {
+            return false;
+        };
+        xudp.set_mux(&session);
+        xudp.status = XudpStatus::Active;
+        session.set_xudp(xudp.clone()).await;
+        self.xudp_manager.register(xudp.clone()).await;
+        let os = session.clone();
+        let ow = link_writer.clone();
+        tokio::spawn(async move { Self::handle_session_output(os, ow).await; });
+        true
     }
 
     /// Handle session output (upstream data back to mux).
@@ -1073,6 +1124,23 @@ mod tests {
                 .await
                 .expect("XUDP entry persists");
             assert_eq!(entry.status, XudpStatus::Active);
+
+            // zv9l 验收：hit 重绑后新 sessionID 必须注册进 manager，
+            // Keep（新 ID）数据必须到达复用的上游通道
+            assert!(
+                server.session_manager().get(101).await.is_some(),
+                "rebound session must be registered under new ID (bd zv9l)"
+            );
+            let keep_meta = FrameMetadata::new_session(101, udp_target());
+            server
+                .handle_status_keep(&keep_meta, b"keep-data".to_vec())
+                .await
+                .expect("keep frame processed");
+            let tail = read_all(&mut up_r).await;
+            assert_eq!(
+                tail, b"keep-data",
+                "Keep with new sessionID must reach the reused upstream (bd zv9l)"
+            );
         }
     }
 }

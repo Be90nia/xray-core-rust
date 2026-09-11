@@ -5,11 +5,13 @@
 //! 由本模块反序列化为强类型 [`DnsAppConfig`]，再经 [`DnsAppConfig::build`] 构造
 //! [`DnsServiceConfig`]（含真实 nameserver clients + 静态 hosts）。
 //!
-//! ## ponytail 限制
+//! ## bd mcpo 后的形态
 //!
-//! - nameserver `address` 为域名时（如 `"dns.google"`），[`new_server`] 仅接受 IP
-//!   地址（避免 DNS 引导循环）。域名地址会在 `build` 阶段被跳过并告警；升级路径：
-//!   接入 bootstrap resolver 后在此预解析为 IP。
+//! - nameserver `address` 接受域名（如 `"https://dns.google"`）：不再启动期
+//!   bootstrap 钉死 IP。经路由出站时由路由系统/outbound 解析；直连兜底每查询
+//!   经 `dial::HostResolver` 现解析（上游地址变更后新查询用新 IP）。
+//! - nameserver 构造失败（未知 scheme 等）→ `build` 返回错误（Go NewClient
+//!   失败 → 实例启动失败语义），不再跳过。
 //! - EDNS0 `clientIp` 经 `new_server_with_config` 全量透传到 Server 构造
 //!   （4ah3 接通；`new_server` 薄包装保留默认字段行为）。
 
@@ -163,47 +165,37 @@ impl DnsAppConfig {
                     id
                 }),
             };
-            match build_client(ns, &client_ip, base_ip_option, &datadir, policy_id) {
-                Ok(c) => {
-                    let client_idx = clients.len() as u16;
-                    clients.push(Arc::new(c));
-                    // localhost server 优先本地域（Go localTLDsAndDotlessDomainsRules）。
-                    let push_rule = |dt, value: &str, infos: &mut Vec<DomainMatcherInfo>, rules: &mut Vec<MatcherDomainRule>| {
-                        infos.push(DomainMatcherInfo { client_idx, domain_rule: value.to_string() });
-                        rules.push(MatcherDomainRule::new(dt, value, rules.len() as u32));
-                    };
-                    if ns.address.trim().eq_ignore_ascii_case("localhost") {
-                        for (dt, v) in local_tlds_and_dotless_rules() {
-                            push_rule(dt, &v, &mut matcher_infos, &mut all_rules);
-                        }
-                    }
-                    for s in ns.domains.iter().flatten() {
-                        match parse_ns_domain_rule(s, &datadir, &loader) {
-                            Ok(entries) => {
-                                for (dt, v) in entries {
-                                    matcher_infos.push(DomainMatcherInfo {
-                                        client_idx,
-                                        domain_rule: s.clone(),
-                                    });
-                                    all_rules.push(MatcherDomainRule::new(
-                                        dt,
-                                        v,
-                                        all_rules.len() as u32,
-                                    ));
-                                }
-                            }
-                            Err(e) => tracing::warn!(rule = %s, error = %e, "dns: skip bad domain rule"),
-                        }
-                    }
+            // Go nameserver.go:150-153：NewClient 失败（nameserver 构造/matcher
+            // 构建等）→ NewClient 返回错误 → dns app 整体启动失败，而非跳过。
+            let c = build_client(ns, &client_ip, base_ip_option, &datadir, policy_id)?;
+            let client_idx = clients.len() as u16;
+            clients.push(Arc::new(c));
+            // localhost server 优先本地域（Go localTLDsAndDotlessDomainsRules）。
+            let push_rule = |dt, value: &str, infos: &mut Vec<DomainMatcherInfo>, rules: &mut Vec<MatcherDomainRule>| {
+                infos.push(DomainMatcherInfo { client_idx, domain_rule: value.to_string() });
+                rules.push(MatcherDomainRule::new(dt, value, rules.len() as u32));
+            };
+            if ns.address.trim().eq_ignore_ascii_case("localhost") {
+                for (dt, v) in local_tlds_and_dotless_rules() {
+                    push_rule(dt, &v, &mut matcher_infos, &mut all_rules);
                 }
-                Err(e) => {
-                    // ponytail: 域名地址需 bootstrap 解析，new_server 暂不支持。
-                    // 跳过并告警，避免单个 server 阻断整个 dns feature。
-                    tracing::warn!(
-                        address = %ns.address,
-                        error = %e,
-                        "dns: skip unbuildable nameserver"
-                    );
+            }
+            for s in ns.domains.iter().flatten() {
+                match parse_ns_domain_rule(s, &datadir, &loader) {
+                    Ok(entries) => {
+                        for (dt, v) in entries {
+                            matcher_infos.push(DomainMatcherInfo {
+                                client_idx,
+                                domain_rule: s.clone(),
+                            });
+                            all_rules.push(MatcherDomainRule::new(
+                                dt,
+                                v,
+                                all_rules.len() as u32,
+                            ));
+                        }
+                    }
+                    Err(e) => tracing::warn!(rule = %s, error = %e, "dns: skip bad domain rule"),
                 }
             }
         }
@@ -339,8 +331,6 @@ fn build_client(
     datadir: &std::path::Path,
     derived_policy_id: u32,
 ) -> Result<Client, DnsError> {
-    // vj6b：域名地址（如 `dns.google`）需 bootstrap 解析为 IP，否则 `new_server`
-    // 拒绝并导致该 server 永久失败。解析失败则降级为原行为（跳过该 server）。
     let client_ip = parse_client_ip(ns.client_ip.as_deref())?;
     let client_ip = if client_ip.is_empty() {
         global_client_ip.to_vec()
@@ -348,15 +338,10 @@ fn build_client(
         validate_client_ip_len(client_ip.len())?;
         client_ip
     };
-    let url = match bootstrap_resolve_host(&build_server_url(&ns.address, ns.port)) {
-        Ok(resolved) => resolved,
-        Err(e) => {
-            tracing::warn!(address = %ns.address, error = %e, "dns: bootstrap resolve failed");
-            return Err(DnsError::WireFormat(format!(
-                "nameserver host bootstrap resolve failed: {e}"
-            )));
-        }
-    };
+    // bd mcpo：域名地址（如 `tls://dns.example.com`）不再启动期 bootstrap 钉死 IP，
+    // 直接把域名传给 nameserver——经路由出站时由路由系统解析，直连兜底每查询
+    // 现解析（上游地址变更后新查询用新 IP）。
+    let url = build_server_url(&ns.address, ns.port);
 
     // 6r0：expectedIPs/unexpectedIPs → IpRule（CIDR + geoip 展开）。
     // expectedIPs 为空时回填 expectIPs（Go dns.go:94-96，policy key 同读回填值）。
@@ -472,68 +457,6 @@ fn resolve_asset_dir() -> std::path::PathBuf {
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
-/// vj6b：DNS 上游地址若为域名（`https://dns.google/dns-query`），需 bootstrap 解析为 IP。
-/// 调用方拿到的是 URL（`scheme://host[:port][/path]` 形态）。
-///
-/// 行为：
-/// - host 已为 IP（含 IPv6 字面量）：原样返回
-/// - host 为域名：构造一次性 TokioResolver 同步阻塞解析（超时 4s），取首个 A/AAAA
-///   替换 host
-/// - 解析失败：返回错误（调用方降级跳过该 server）
-fn bootstrap_resolve_host(url: &str) -> Result<String, String> {
-    let (scheme_rest, path_tail) = match url.split_once("://") {
-        Some((sr, rest)) => (sr, rest),
-        None => return Ok(url.to_string()),
-    };
-    let (host_port_path, _) = path_tail.split_once('?').unwrap_or((path_tail, ""));
-    let (host_port, path) = match host_port_path.split_once('/') {
-        Some((hp, p)) => (hp, format!("/{p}")),
-        None => (host_port_path, String::new()),
-    };
-    // host_port 形如 `dns.google:443` 或 `1.2.3.4:853` 或 `[::1]:853`
-    let (raw_host, port_suffix) = if host_port.starts_with('[') {
-        // IPv6 literal
-        let end = host_port.find(']').ok_or("malformed ipv6 host")?;
-        (&host_port[1..end], Some(&host_port[end + 1..]))
-    } else if let Some(idx) = host_port.rfind(':') {
-        (&host_port[..idx], Some(&host_port[idx..]))
-    } else {
-    (host_port, None)
-    };
-
-    let resolver = hickory_resolver::TokioResolver::builder_tokio()
-        .map_err(|e| format!("resolver builder: {e}"))?
-        .build()
-        .map_err(|e| format!("resolver build: {e}"))?;
-    let target = format!("{raw_host}.");
-    let ips: Vec<IpAddr> = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => handle.block_on(async {
-            use std::time::Duration;
-            match tokio::time::timeout(
-                Duration::from_secs(4),
-                resolver.lookup_ip(target),
-            )
-            .await
-            {
-                Ok(Ok(lk)) => lk.iter().collect(),
-                _ => Vec::new(),
-            }
-        }),
-        Err(_) => Vec::new(),
-    };
-    let Some(first) = ips.into_iter().next() else {
-        return Err(format!("bootstrap resolve failed for {raw_host}"));
-    };
-    let new_host_port = match (first, port_suffix) {
-        (IpAddr::V6(v6), Some(suffix)) => format!("[{v6}]{suffix}"),
-        (v6 @ IpAddr::V6(_), None) => format!("[{v6}]"),
-        (v4, _) => match port_suffix {
-            Some(s) => format!("{v4}{s}"),
-            None => v4.to_string(),
-        },
-    };
-    Ok(format!("{scheme_rest}://{new_host_port}{path}"))
-}
 /// 本地域 TLD + 无点域名规则（Go `localTLDsAndDotlessDomainsRules`，app/dns/config.go）。
 fn local_tlds_and_dotless_rules()
 -> Vec<(xray_geodata::matcher::domain::DomainType, &'static str)> {
@@ -756,17 +679,27 @@ mod tests {
         // hosts lookup 走 StaticHosts::lookup，这里只验证不 panic。
     }
 
+    /// bd mcpo：域名 NS 运行期解析——域名地址 server 正常构造（不再跳过），
+    /// DoH 经 443 默认端口 + /dns-query 路径。
     #[test]
-    fn build_skips_domain_address_server() {
-        let json = r#"{"servers": [{"address": "dns.google"}]}"#;
+    fn build_accepts_domain_address_server() {
+        // workspace feature unification 可能同时启用 ring+aws-lc-rs 两个
+        // CryptoProvider，rustls 进程级自动裁决会 panic；测试显式安装 ring。
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let json = r#"{"servers": [{"address": "https://dns.google"}]}"#;
         let cfg: DnsAppConfig = serde_json::from_str(json).unwrap();
         let built = cfg.build().unwrap();
-        // 域名地址不可构造 → 跳过；clients 落空后同样触发 localhost 兜底注入
-        // （Go：New() 在 clients 循环之后判空注入）。
-        assert!(built.clients.len() <= 1);
-        if let Some(c) = built.clients.first() {
-            assert_eq!(c.server.name(), "localhost");
-        }
+        assert_eq!(built.clients.len(), 1, "domain nameserver must build");
+        assert!(built.clients[0].server.name().starts_with("DoH:"));
+    }
+
+    /// bd mcpo：bootstrap 失败语义对齐 Go——不可构造的 nameserver 使
+    /// build() 返回错误（Go NewClient 失败 → 实例启动失败），而非静默跳过。
+    #[test]
+    fn build_propagates_unbuildable_nameserver_error() {
+        let json = r#"{"servers": [{"address": "foo://8.8.8.8"}]}"#;
+        let cfg: DnsAppConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.build().is_err(), "unknown scheme must fail the build");
     }
 
     #[test]

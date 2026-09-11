@@ -199,6 +199,15 @@ where
             Poll::Ready(Err(e)) => return Poll::Ready(Err(io::Error::other(e))),
             Poll::Pending => return Poll::Pending,
         }
+        // 票 lwwz：`buf.to_vec()` 的全量拷贝是 tungstenite 0.26 Sink API 的结构性
+        // 成本，本 crate 侧无法消除（已核实 tungstenite-0.26.2 源码）：
+        // ① `start_send` 持有 `Message::Binary(Bytes)` 直到 flush 完成，`&[u8]`
+        //    必须转 owned——`Vec`→`Bytes` 接管分配、`BytesMut::freeze` 让出分配，
+        //    缓冲复用均不可行；
+        // ② tungstenite `format_into_buf`（frame/frame.rs）随后把 payload 再拷入
+        //    自身 out_buffer 并就地掩码——第 2 次拷贝在其内部，无从旁路。
+        // Go gorilla `WriteMessage` 仅 1 次拷入写缓冲+掩码，少的正是 ②；消除它
+        // 需要 fork tungstenite 暴露写缓冲直写 API（收益 µs 级，不做）。
         if let Err(e) = guard.start_send_unpin(Message::binary(buf.to_vec())) {
             return Poll::Ready(Err(io::Error::other(e)));
         }

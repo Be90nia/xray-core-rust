@@ -106,8 +106,13 @@ impl Feature for ObservatoryFeature {
             })
     }
 
-    /// 装配阶段依赖注入：若 bag 提供 `OutboundTagSelector` 则自动注入
-    /// [`RealOutboundSelector`] + [`HttpProbeExecutor::from_config`]。
+    /// 装配阶段依赖注入（兜底）：若 bag 提供 `OutboundTagSelector` 则注入
+    /// [`RealOutboundSelector`] + [`HttpProbeExecutor::from_config`] 直连探测。
+    ///
+    /// soqc：**生产装配不走此兜底**——xray-core functions.rs 在 bag2 之前
+    /// `set_io` 注入 [`RealOutboundProbeExecutor`]（经 dispatcher forced-tag
+    /// 拨号 + rustls 完整 HTTPS GET，对齐 Go observer.go:130-159），
+    /// "已 set_io 跳过"保护使本兜底不覆盖。
     ///
     /// 已有 IO（[`set_io`](Self::set_io) 显式调用过）不覆盖——便于测试 fixture
     /// 在构造后立即 `set_io` 的场景。

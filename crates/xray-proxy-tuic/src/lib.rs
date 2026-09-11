@@ -6,8 +6,9 @@
 //!
 //! - 完整协议层（Address + Header + 4 命令：Authenticate/Connect/Dissociate/Heartbeat）
 //! - TCP relay 客户端 + mock server，loopback 端到端测试通过
-//! - UDP relay（quic 模式：每包 bi-stream），[`udp::TuicUdpAssoc`] + mock server UDP 转发
-//! - HTTP/3 ALPN 协商（`h3` 伪装已启用；real-h3 帧封装未实现）
+//! - UDP relay（quic 模式：每包 uni-stream；native 模式：QUIC DATAGRAM），
+//!   [`udp::TuicUdpAssoc`] + mock server UDP 转发
+//! - HTTP/3 ALPN 伪装（握手 ALPN 同时 offer `h3` 与 `tuic`，官方伪装语义）
 //! - quinn 内置 QUIC（已就绪）+ rustls（watfaq fork）
 //!
 //! ## 后续待办
@@ -15,7 +16,6 @@
 //! - UDP 分片重组（FRAG_TOTAL/FRAG_ID/SIZE）
 //! - native 模式（QUIC DATAGRAM 传输 UDP 包）
 //! - 自定义 congestion controller（BBR/Brutal）
-//! - real-h3 HTTP/3 帧封装传输层
 
 pub mod client;
 pub mod dispatcher;
@@ -24,7 +24,6 @@ pub mod inbound;
 pub mod protocol;
 pub mod server;
 pub mod udp;
-pub mod h3;
 pub mod pool;
 
 pub use client::{CongestionControl, TuicClient, TuicConn, TuicConnectOptions, UdpRelayMode};
@@ -33,6 +32,5 @@ pub use protocol::{Address, Command, FragmentAssembler, Packet, TOKEN_LEN, VERSI
 pub use error::{Result, TuicError};
 pub use server::TuicMockServer;
 pub use udp::TuicUdpAssoc;
-pub use h3::H3TuicTransport;
 pub use pool::{MultiplexedConnection, PoolKey, QuinnConnectionPool, ReconnectingConnection};
 pub use inbound::{TuicInboundConfig, TuicInboundHandler};

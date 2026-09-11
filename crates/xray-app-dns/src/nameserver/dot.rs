@@ -27,6 +27,8 @@ use tokio::time::timeout;
 use tokio_rustls::rustls::ClientConfig;
 
 use xray_common::net::address::Address;
+use xray_common::net::destination::Destination;
+use xray_common::net::port::Port;
 use xray_tls::utls::client as tls_client;
 use xray_transport::connection::TcpConnection;
 
@@ -48,8 +50,8 @@ const DOT_RECV_MAX: usize = 65535;
 pub struct DotNameServer {
     /// 服务名。
     name: String,
-    /// 远端 DNS 服务器地址。
-    addr: SocketAddr,
+    /// 远端 DNS 服务器地址（IP 直连；域名运行期解析——bd mcpo）。
+    dest: Destination,
     /// TLS SNI（ServerName）。通常等于域名或 IP 字符串。
     server_name: String,
     /// TLS 客户端配置（含 root certs + ALPN）。
@@ -61,26 +63,31 @@ pub struct DotNameServer {
     query_timeout: Duration,
     /// 请求 ID 生成器。
     id_gen: AtomicReqIdGen,
-    /// 连接池：复用 TLS 连接。
-    conn: tokio::sync::Mutex<Option<xray_tls::utls::Conn<TcpConnection>>>,
+    /// 连接池：复用 TLS 连接（流形态：直连 TcpConnection 或经路由 Link 流）。
+    conn: tokio::sync::Mutex<Option<xray_tls::utls::Conn<Box<dyn xray_transport::connection::Connection>>>>,
+    /// 域名解析器（直连兜底路径）。
+    resolver: Arc<dyn crate::dial::HostResolver>,
 }
+
+/// 查询流类型别名：TLS 之下的字节流。
+type DotStream = Box<dyn xray_transport::connection::Connection>;
 
 impl DotNameServer {
     /// 构造。
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        addr: SocketAddr,
+        dest: Destination,
         server_name: String,
         tls_config: Arc<ClientConfig>,
         cache: Arc<CacheController>,
         client_ip: Vec<u8>,
         query_timeout: Duration,
     ) -> Self {
-        let name = format!("DoT:{}", addr);
+        let name = format!("DoT:{}:{}", dest.address(), dest.port());
         Self {
             name,
-            addr,
+            dest,
             server_name,
             tls_config,
             cache,
@@ -88,6 +95,7 @@ impl DotNameServer {
             query_timeout,
             id_gen: AtomicReqIdGen::new(),
             conn: tokio::sync::Mutex::new(None),
+            resolver: Arc::new(crate::dial::SystemHostResolver),
         }
     }
 
@@ -97,22 +105,14 @@ impl DotNameServer {
         server_name: String,
         tls_config: Arc<ClientConfig>,
     ) -> Result<Box<dyn Server>, DnsError> {
-        let socket_addr = match &ns.address {
-            Address::IPv4(v) => SocketAddr::new(IpAddr::V4(*v), ns.port),
-            Address::IPv6(v) => SocketAddr::new(IpAddr::V6(*v), ns.port),
-            other => {
-                return Err(DnsError::WireFormat(format!(
-                    "dot nameserver requires IP address, got: {other:?}"
-                )));
-            }
-        };
+        let dest = Destination::tcp(ns.address.clone(), Port::new(ns.port));
         let timeout_dur = if ns.timeout_ms > 0 {
             Duration::from_millis(u64::from(ns.timeout_ms))
         } else {
             Duration::from_millis(4000)
         };
         let cache = Arc::new(CacheController::new(
-            format!("DoT:{}", socket_addr),
+            format!("DoT:{}", dest),
             ns.disable_cache.unwrap_or(false),
             ns.serve_stale.unwrap_or(false),
             ns.serve_expired_ttl.unwrap_or(0),
@@ -120,7 +120,7 @@ impl DotNameServer {
         ));
         cache.start_cleanup_task(crate::cache_controller::CLEANUP_INTERVAL);
         Ok(Box::new(Arc::new(Self::new(
-            socket_addr,
+            dest,
             server_name,
             tls_config,
             cache,
@@ -129,16 +129,15 @@ impl DotNameServer {
         ))))
     }
 
-    /// 建立 DoT TLS 连接。
-    async fn connect_tls(&self) -> Result<xray_tls::utls::Conn<TcpConnection>, DnsError> {
-        let tcp = timeout(self.query_timeout, TcpStream::connect(self.addr))
-            .await
-            .map_err(|_| DnsError::WireFormat(format!("dot connect timeout after {:?}", self.query_timeout)))?
-            .map_err(|e| DnsError::WireFormat(format!("dot connect: {e}")))?;
+    /// 建立 DoT TLS 连接：经路由出站或直连兜底（域名每查询现解析）。
+    async fn connect_tls(&self) -> Result<xray_tls::utls::Conn<DotStream>, DnsError> {
+        let stream =
+            crate::dial::connect_stream(&self.dest, self.resolver.as_ref(), self.query_timeout, "dot")
+                .await?;
         let tls = timeout(
             self.query_timeout,
             tls_client(
-                TcpConnection::new(tcp),
+                stream,
                 &self.server_name,
                 Arc::clone(&self.tls_config),
             ),
@@ -152,7 +151,7 @@ impl DotNameServer {
     /// 在已有连接上执行单次 DoT 查询。
     async fn try_query(
         &self,
-        stream: &mut xray_tls::utls::Conn<TcpConnection>,
+        stream: &mut xray_tls::utls::Conn<DotStream>,
         len_be: &[u8; 2],
         payload: &[u8],
         req_id: u16,
@@ -285,6 +284,10 @@ mod tests {
     use tokio_rustls::TlsAcceptor;
     use xray_transport::connection::TcpConnection;
 
+    fn ip_dest(addr: SocketAddr) -> Destination {
+        Destination::tcp(Address::from(addr.ip()), Port::new(addr.port()))
+    }
+
     /// 确保 rustls CryptoProvider 在并行测试中只初始化一次
     fn ensure_crypto_provider() {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -388,7 +391,7 @@ mod tests {
             spawn_mock_dot_server("example.com.", vec![Ipv4Addr::new(10, 0, 0, 1)], 120).await;
 
         let ns = DotNameServer::new(
-            addr,
+            ip_dest(addr),
             "localhost".to_string(),
             tls_config,
             Arc::new(CacheController::new("test", true, false, 0, 0)),
@@ -407,7 +410,7 @@ mod tests {
             spawn_mock_dot_server("z.com.", vec![Ipv4Addr::new(8, 8, 8, 8)], 60).await;
 
         let ns = DotNameServer::new(
-            addr,
+            ip_dest(addr),
             "localhost".to_string(),
             tls_config,
             Arc::new(CacheController::new("test", true, false, 0, 0)),
@@ -455,7 +458,7 @@ mod tests {
         );
 
         let ns = DotNameServer::new(
-            addr,
+            ip_dest(addr),
             "localhost".to_string(),
             tls_config,
             Arc::new(CacheController::new("test", true, false, 0, 0)),

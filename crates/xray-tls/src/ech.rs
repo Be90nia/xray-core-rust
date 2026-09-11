@@ -391,6 +391,20 @@ pub fn parse_ech_config_list(json: &serde_json::Value) -> String {
         .to_string()
 }
 
+/// 解析 `tlsSettings.echSockopt`（Go `ECHSocketSettings *SocketConfig`，
+/// transport_security.go:318；proto `ech_socket_settings = 21`）。
+///
+/// Go 唯一消费点是 ECH DoH 查询链（`ech.go` QueryRecord→dnsQuery 的连接
+/// sockopt）；Rust 该链路未实现，此键当前被识别后显式忽略（见
+/// `client_config::build_client_config` 的 warn）。存在即返回 `Some`，
+/// 内容交由 sockopt 应用层解释。
+#[must_use]
+pub fn parse_ech_sockopt(json: &serde_json::Value) -> Option<&serde_json::Value> {
+    json.as_object()
+        .and_then(|m| m.get("echSockopt"))
+        .filter(|v| !v.is_null())
+}
+
 // ============================================================
 // ApplyEch trait + btls (BoringSSL) 客户端实装
 // ============================================================
@@ -725,6 +739,15 @@ mod tests {
             "aGVsbG8="
         );
         assert_eq!(parse_ech_config_list(&serde_json::json!({})), "");
+    }
+
+    /// 票 8k4s③：`echSockopt` 键识别——存在（非 null）返回 Some，缺失/null None。
+    #[test]
+    fn parse_ech_sockopt_presence() {
+        let present = serde_json::json!({ "echSockopt": { "domainStrategy": "UseIP" } });
+        assert!(parse_ech_sockopt(&present).is_some());
+        assert!(parse_ech_sockopt(&serde_json::json!({})).is_none());
+        assert!(parse_ech_sockopt(&serde_json::json!({ "echSockopt": null })).is_none());
     }
 
     // ---- ApplyEch btls 实装（真实 BoringSSL 调用）----

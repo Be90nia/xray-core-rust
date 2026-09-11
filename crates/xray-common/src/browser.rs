@@ -1,18 +1,23 @@
 //! 浏览器伪装默认请求头（对齐 Go `common/utils/browser.go`，xray-core v26.7.28）。
 //!
-//! Go `GetRequestHeader()` 在 UA 未配置时调用 `utils.TryDefaultHeadersWith(header, "fetch")`，
-//! 生成整套 Chrome 浏览器伪装头（UA + Sec-CH-UA GREASE + Sec-Fetch-* + Accept 系）。
-//! 这是 xhttp 流量通过 Cloudflare 等 CDN bot 检测的关键——缺省 `User-Agent: fetch`
-//! 是典型脚本特征，会被 WAF 拒绝（403）。
+//! Go 各传输的 `GetRequestHeader()` 在 UA 未配置时调用
+//! `utils.TryDefaultHeadersWith(header, variant)`，生成整套浏览器伪装头
+//! （UA + Sec-CH-UA GREASE + Sec-Fetch-* + Accept 系）。缺省脚本 UA 是
+//! 典型非浏览器特征，会被 CDN/WAF bot 检测拒绝（403）。
 //!
-//! variant 只实现 `fetch`（splithttp 全部请求）；`nav`/`ws` 由 ws/httpupgrade
-//! transport 需要时再补。
+//! 本模块原在 xray-transport-splithttp，因 ws/httpupgrade 出站同样需要
+//! （票 mzte/yz8n）且二者不能反向依赖 splithttp，下沉到 xray-common 共享。
+//!
+//! variant：`fetch`（splithttp/xhttp）、`nav`（http CONNECT 出站）、
+//! `ws`（websocket/httpupgrade 握手）。
 
 use rand::Rng;
 
 /// HTTP header 列表的 Set 语义：替换首个同名（大小写不敏感），否则追加。
-
-fn set_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
+///
+/// pub：httpupgrade `build_upgrade_request` 对 Connection/Upgrade 用同样的
+/// Set 语义（Go `req.Header.Set`，dialer.go:100-101）。
+pub fn set_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
     if let Some(slot) = headers
         .iter_mut()
         .find(|(k, _)| k.eq_ignore_ascii_case(name))
@@ -302,7 +307,7 @@ pub fn apply_masqueraded_headers(
     let _ = ch_major;
 
     // Context-specific（variant）。nav：浏览器导航场景（Go browser.go nav case，
-    // http CONNECT 出站在用）；fetch：splithttp/xhttp 场景。
+    // http CONNECT 出站在用）；fetch：splithttp/xhttp 场景；ws：WebSocket 握手。
     if variant == "nav" {
         if get_header(headers, "Cache-Control").is_none() {
             if browser == "chrome" || browser == "edge" {
@@ -347,6 +352,25 @@ pub fn apply_masqueraded_headers(
                 set_header(headers, "Priority", p);
             }
         }
+        if get_header(headers, "Cache-Control").is_none() {
+            set_header(headers, "Cache-Control", "no-cache");
+        }
+        if get_header(headers, "Pragma").is_none() {
+            set_header(headers, "Pragma", "no-cache");
+        }
+        if get_header(headers, "Accept").is_none() {
+            set_header(headers, "Accept", "*/*");
+        }
+    } else if variant == "ws" {
+        // ws：WebSocket 握手场景（Go browser.go:221-239）。
+        set_header(headers, "Sec-Fetch-Mode", "websocket");
+        if browser == "safari" {
+            // Safari 在此不遵循 web 标准（Go 原注释）。
+            set_header(headers, "Sec-Fetch-Dest", "websocket");
+        } else {
+            set_header(headers, "Sec-Fetch-Dest", "empty");
+        }
+        set_header(headers, "Sec-Fetch-Site", "same-origin");
         if get_header(headers, "Cache-Control").is_none() {
             set_header(headers, "Cache-Control", "no-cache");
         }
@@ -458,5 +482,45 @@ mod tests {
     fn curl_version_shape() {
         let v = curl_version();
         assert!(v.starts_with("8.") && v.ends_with(".0"), "got: {v}");
+    }
+
+    #[test]
+    fn ws_variant_sets_websocket_fetch_family() {
+        let mut h: Vec<(String, String)> = Vec::new();
+        try_default_headers_with(&mut h, "ws");
+        let ua = get(&h, "User-Agent").expect("UA must be set");
+        assert!(
+            ua.starts_with("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/")
+                && ua.ends_with(" Safari/537.36"),
+            "UA must masquerade as Chrome, got: {ua}"
+        );
+        assert_eq!(get(&h, "Sec-Fetch-Mode"), Some("websocket"));
+        assert_eq!(get(&h, "Sec-Fetch-Dest"), Some("empty"));
+        assert_eq!(get(&h, "Sec-Fetch-Site"), Some("same-origin"));
+        assert_eq!(get(&h, "Cache-Control"), Some("no-cache"));
+        assert_eq!(get(&h, "Pragma"), Some("no-cache"));
+        assert_eq!(get(&h, "Accept"), Some("*/*"));
+        let ch = get(&h, "Sec-CH-UA").expect("Sec-CH-UA must be set");
+        assert!(ch.contains("Google Chrome"), "got: {ch}");
+    }
+
+    #[test]
+    fn ws_variant_respects_existing_context_headers() {
+        let mut h = vec![
+            ("Cache-Control".to_string(), "max-age=3600".to_string()),
+            ("Accept".to_string(), "application/json".to_string()),
+        ];
+        try_default_headers_with(&mut h, "ws");
+        assert_eq!(get(&h, "Cache-Control"), Some("max-age=3600"));
+        assert_eq!(get(&h, "Accept"), Some("application/json"));
+        assert_eq!(get(&h, "Pragma"), Some("no-cache"), "only absent ones injected");
+    }
+
+    #[test]
+    fn set_header_replaces_case_insensitively() {
+        let mut h = vec![("connection".to_string(), "keep-alive".to_string())];
+        set_header(&mut h, "Connection", "Upgrade");
+        assert_eq!(h.len(), 1);
+        assert_eq!(get(&h, "Connection"), Some("Upgrade"));
     }
 }

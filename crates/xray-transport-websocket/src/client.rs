@@ -34,6 +34,7 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{client_async_tls_with_config, Connector, MaybeTlsStream};
 
+use xray_common::browser::try_default_headers_with;
 use xray_common::net::destination::Destination;
 
 use crate::config::Config;
@@ -355,7 +356,8 @@ fn build_request_uri(cfg: &Config, dest: &Destination, use_tls: bool) -> String 
     format!("{protocol}://{authority}{path}")
 }
 
-/// 构造自定义 WS Upgrade request：附加 user header + Host + early-data。
+/// 构造自定义 WS Upgrade request：Host 三级回退 + user header + 浏览器伪装头
+/// + early-data。
 fn build_request(
     uri: &str,
     cfg: &Config,
@@ -392,6 +394,33 @@ fn build_request(
         let value = HeaderValue::from_str(v)
             .map_err(|e| WsError::HandshakeFailed(format!("invalid header value for {k}: {e}")))?;
         req.headers_mut().insert(name, value);
+    }
+
+    // 2.5. 浏览器伪装（Go websocket/config.go:22-29 GetRequestHeader →
+    //      `TryDefaultHeadersWith(header, "ws")`，"ws" 是 variant 名）：
+    //      UA 缺省 → Chrome 全套；UA 为枚举值 → 对应伪装；其他 → 不动。
+    //      Host/Upgrade/Connection/Sec-WS-* 由 tungstenite 生成，伪装头
+    //      只叠加 UA/Sec-Fetch 族，不覆盖用户自定义（票 yz8n）。
+    let mut headers: Vec<(String, String)> = req
+        .headers()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str().to_string(),
+                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    try_default_headers_with(&mut headers, "ws");
+    let header_map = req.headers_mut();
+    header_map.clear();
+    for (k, v) in headers {
+        let name = k
+            .parse::<http::header::HeaderName>()
+            .map_err(|e| WsError::HandshakeFailed(format!("invalid header name {k:?}: {e}")))?;
+        let value = HeaderValue::from_str(&v)
+            .map_err(|e| WsError::HandshakeFailed(format!("invalid header value for {k}: {e}")))?;
+        header_map.insert(name, value);
     }
 
     // 3. Early data → Sec-WebSocket-Protocol header (base64 RawURL no padding)。
@@ -539,6 +568,43 @@ mod tests {
         // 3) host/serverName 皆空 → dest address
         let req = build_request("wss://203.0.113.9/", &cfg, None, &d, None).unwrap();
         assert_eq!(req.headers().get("host").unwrap(), "203.0.113.9");
+    }
+
+    #[test]
+    fn build_request_injects_chrome_masquerade_for_ws() {
+        // 票 yz8n：Go config.go:27 GetRequestHeader → TryDefaultHeadersWith(header, "ws")。
+        let cfg = Config::default();
+        let req = build_request("ws://example.com/", &cfg, None, &dest("example.com", 80), None)
+            .unwrap();
+        let ua = req.headers().get("user-agent").expect("UA must be set").to_str().unwrap();
+        assert!(
+            ua.starts_with("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/")
+                && ua.ends_with(" Safari/537.36"),
+            "UA must masquerade as Chrome, got: {ua}"
+        );
+        assert_eq!(req.headers().get("sec-fetch-mode").unwrap(), "websocket");
+        assert_eq!(req.headers().get("sec-fetch-dest").unwrap(), "empty");
+        assert_eq!(req.headers().get("sec-fetch-site").unwrap(), "same-origin");
+        assert_eq!(req.headers().get("cache-control").unwrap(), "no-cache");
+        assert_eq!(req.headers().get("pragma").unwrap(), "no-cache");
+        assert_eq!(req.headers().get("accept").unwrap(), "*/*");
+        assert!(req.headers().get("sec-ch-ua").is_some(), "CH-UA GREASE present");
+        // tungstenite 生成的基础握手头必须保留。
+        assert!(req.headers().get("sec-websocket-key").is_some());
+        assert_eq!(req.headers().get("upgrade").unwrap(), "websocket");
+        assert_eq!(req.headers().get("connection").unwrap(), "Upgrade");
+    }
+
+    #[test]
+    fn build_request_masquerade_keeps_custom_headers() {
+        let mut cfg = Config::default();
+        cfg.header.insert("User-Agent".into(), "my-agent/9".into());
+        cfg.header.insert("Accept".into(), "application/json".into());
+        let req = build_request("ws://example.com/", &cfg, None, &dest("example.com", 80), None)
+            .unwrap();
+        assert_eq!(req.headers().get("user-agent").unwrap(), "my-agent/9");
+        assert_eq!(req.headers().get("accept").unwrap(), "application/json");
+        assert!(req.headers().get("sec-fetch-mode").is_none(), "custom UA → no masquerade");
     }
 
     #[tokio::test]

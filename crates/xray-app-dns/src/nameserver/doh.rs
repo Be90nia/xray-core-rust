@@ -25,11 +25,12 @@ use h2::client;
 use h2::server;
 use http::header::CONTENT_TYPE;
 use http::{Method, Request, Response, StatusCode};
-use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::rustls::ClientConfig;
 
 use xray_common::net::address::Address;
+use xray_common::net::destination::Destination;
+use xray_common::net::port::Port;
 use xray_tls::utls::client as tls_client;
 use xray_transport::connection::TcpConnection;
 
@@ -54,8 +55,8 @@ const DEFAULT_DOH_PATH: &str = "/dns-query";
 pub struct DohNameServer {
     /// 服务名。
     name: String,
-    /// 远端 DNS 服务器地址。
-    addr: SocketAddr,
+    /// 远端 DNS 服务器地址（IP 直连；域名运行期解析——bd mcpo）。
+    dest: Destination,
     /// TLS SNI（ServerName）。
     server_name: String,
     /// TLS 客户端配置。
@@ -70,6 +71,8 @@ pub struct DohNameServer {
     query_timeout: Duration,
     /// 请求 ID 生成器。
     id_gen: AtomicReqIdGen,
+    /// 域名解析器（直连兜底路径）。
+    resolver: Arc<dyn crate::dial::HostResolver>,
 }
 
 impl DohNameServer {
@@ -77,7 +80,7 @@ impl DohNameServer {
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        addr: SocketAddr,
+        dest: Destination,
         server_name: String,
         tls_config: Arc<ClientConfig>,
         cache: Arc<CacheController>,
@@ -86,13 +89,13 @@ impl DohNameServer {
         plain_h2c: bool,
     ) -> Self {
         let name = if plain_h2c {
-            format!("DoH-h2c:{addr}")
+            format!("DoH-h2c:{}:{}", dest.address(), dest.port())
         } else {
-            format!("DoH:{addr}")
+            format!("DoH:{}:{}", dest.address(), dest.port())
         };
         Self {
             name,
-            addr,
+            dest,
             server_name,
             tls_config,
             plain_h2c,
@@ -100,6 +103,7 @@ impl DohNameServer {
             client_ip,
             query_timeout,
             id_gen: AtomicReqIdGen::new(),
+            resolver: Arc::new(crate::dial::SystemHostResolver),
         }
     }
 
@@ -109,22 +113,14 @@ impl DohNameServer {
         server_name: String,
         tls_config: Arc<ClientConfig>,
     ) -> Result<Box<dyn Server>, DnsError> {
-        let socket_addr = match &ns.address {
-            Address::IPv4(v) => SocketAddr::new(IpAddr::V4(*v), ns.port),
-            Address::IPv6(v) => SocketAddr::new(IpAddr::V6(*v), ns.port),
-            other => {
-                return Err(DnsError::WireFormat(format!(
-                    "doh nameserver requires IP address, got: {other:?}"
-                )));
-            }
-        };
+        let dest = Destination::tcp(ns.address.clone(), Port::new(ns.port));
         let timeout_dur = if ns.timeout_ms > 0 {
             Duration::from_millis(u64::from(ns.timeout_ms))
         } else {
             Duration::from_millis(4000)
         };
         let cache = Arc::new(CacheController::new(
-            format!("DoH:{}", socket_addr),
+            format!("DoH:{}", dest),
             ns.disable_cache.unwrap_or(false),
             ns.serve_stale.unwrap_or(false),
             ns.serve_expired_ttl.unwrap_or(0),
@@ -132,7 +128,7 @@ impl DohNameServer {
         ));
         cache.start_cleanup_task(crate::cache_controller::CLEANUP_INTERVAL);
         Ok(Box::new(Arc::new(Self::new(
-            socket_addr,
+            dest,
             server_name,
             tls_config,
             cache,
@@ -141,25 +137,16 @@ impl DohNameServer {
             false,
         ))))
     }
-
     /// h2c（明文 HTTP/2）构造。对应 Go `NewDoHNameServer(u, dispatcher, true, ...)`。
     pub fn from_config_h2c(ns: &NameServerConfig) -> Result<Box<dyn Server>, DnsError> {
-        let socket_addr = match &ns.address {
-            Address::IPv4(v) => SocketAddr::new(IpAddr::V4(*v), ns.port),
-            Address::IPv6(v) => SocketAddr::new(IpAddr::V6(*v), ns.port),
-            other => {
-                return Err(DnsError::WireFormat(format!(
-                    "doh-h2c nameserver requires IP address, got: {other:?}"
-                )));
-            }
-        };
+        let dest = Destination::tcp(ns.address.clone(), Port::new(ns.port));
         let timeout_dur = if ns.timeout_ms > 0 {
             Duration::from_millis(u64::from(ns.timeout_ms))
         } else {
             Duration::from_millis(4000)
         };
         let cache = Arc::new(CacheController::new(
-            format!("DoH-h2c:{socket_addr}"),
+            format!("DoH-h2c:{}", dest),
             ns.disable_cache.unwrap_or(false),
             ns.serve_stale.unwrap_or(false),
             ns.serve_expired_ttl.unwrap_or(0),
@@ -167,7 +154,7 @@ impl DohNameServer {
         ));
         cache.start_cleanup_task(crate::cache_controller::CLEANUP_INTERVAL);
         Ok(Box::new(Arc::new(Self::new(
-            socket_addr,
+            dest,
             String::new(),
             xray_tls::utls::default_client_config(),
             cache,
@@ -176,9 +163,6 @@ impl DohNameServer {
             true,
         ))))
     }
-
-
-
     /// 发送单次 DNS 查询（DoH），等待响应。
     async fn query_once(
         &self,
@@ -188,20 +172,15 @@ impl DohNameServer {
         let req_id = self.id_gen.next_id();
         let payload = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
 
-        // TCP connect。
-        let tcp = timeout(self.query_timeout, TcpStream::connect(self.addr))
-            .await
-            .map_err(|_| {
-                DnsError::WireFormat(format!(
-                    "doh connect timeout after {:?}",
-                    self.query_timeout
-                ))
-            })?
-            .map_err(|e| DnsError::WireFormat(format!("doh connect: {e}")))?;
+        // 经路由出站或直连兜底（域名每查询现解析）——Go dohnameserver.go:68
+        // dispatcher.Dispatch 语义。
+        let stream =
+            crate::dial::connect_stream(&self.dest, self.resolver.as_ref(), self.query_timeout, "doh")
+                .await?;
 
         // TLS 握手（h2c 明文跳过）+ HTTP/2 handshake。
         let (mut h2, h2_conn): (_, Pin<Box<dyn Future<Output = ()> + Send>>) = if self.plain_h2c {
-            let (h2, conn) = timeout(self.query_timeout, client::handshake(tcp))
+            let (h2, conn) = timeout(self.query_timeout, client::handshake(stream))
                 .await
                 .map_err(|_| DnsError::WireFormat("doh h2c handshake timeout".to_string()))?
                 .map_err(|e| DnsError::WireFormat(format!("doh h2c handshake: {e}")))?;
@@ -212,7 +191,7 @@ impl DohNameServer {
             let tls_stream = timeout(
                 self.query_timeout,
                 tls_client(
-                    TcpConnection::new(tcp),
+                    stream,
                     &self.server_name,
                     Arc::clone(&self.tls_config),
                 ),
@@ -369,6 +348,10 @@ mod tests {
     use tokio_rustls::TlsAcceptor;
     use xray_transport::connection::TcpConnection;
 
+    fn ip_dest(addr: SocketAddr) -> Destination {
+        Destination::tcp(Address::from(addr.ip()), Port::new(addr.port()))
+    }
+
     /// 确保 rustls CryptoProvider 在并行测试中只初始化一次
     fn ensure_crypto_provider() {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -486,7 +469,7 @@ mod tests {
             spawn_mock_doh_server("example.com.", vec![Ipv4Addr::new(10, 0, 0, 1)], 120).await;
 
         let ns = DohNameServer::new(
-            addr,
+            ip_dest(addr),
             "localhost".to_string(),
             tls_config,
             Arc::new(CacheController::new("test", true, false, 0, 0)),
@@ -506,7 +489,7 @@ mod tests {
             spawn_mock_doh_server("z.com.", vec![Ipv4Addr::new(8, 8, 8, 8)], 60).await;
 
         let ns = DohNameServer::new(
-            addr,
+            ip_dest(addr),
             "localhost".to_string(),
             tls_config,
             Arc::new(CacheController::new("test", true, false, 0, 0)),
@@ -587,7 +570,7 @@ mod tests {
         );
 
         let ns = DohNameServer::new(
-            addr,
+            ip_dest(addr),
             "localhost".to_string(),
             tls_config,
             Arc::new(CacheController::new("test", true, false, 0, 0)),

@@ -135,8 +135,8 @@ impl LintStage for FakeDnsStage {
 ///
 /// 1. `inbounds[].sniffing.destOverride[]` 含未知协议——Go `SniffingConfig.Build`
 ///    对每个 protocol 做 `switch`，未知值 `errors.New("unknown protocol: ...")`
-///    启动期硬拒。Rust 当前切片仅透传字符串，下游 `should_override` 前缀匹配
-///    永远不命中（不会 crash 但永远不覆盖），等于静默丢配置。
+///    启动期硬拒。Rust 已在 wiring.rs 归一化已知别名（https/ssl→tls 等，va51①），
+///    未知值仍由此处硬拒（wiring 归一化对未知值透传保持零行为差）。
 /// 2. `outbounds[].mux.xudpProxyUDP443` 非法值（不在 `{reject, allow, skip}`）—
 ///    Go `MuxConfig.Build` 直接返回错误；Rust `Udp443Policy::from_mux` 返回 None
 ///    并被 `tracing::warn` 忽略（outbound.rs:516-518），降级为无策略。
@@ -549,7 +549,8 @@ mod tests {
         register_builtin_stages();
         let mut cfg = Config {
             burst_observatory: Some(crate::app_config::BurstObservatoryConfig {
-                subject_outbound: Some("p1".into()),
+                subject_selector: Some(vec!["p1".into()]),
+                subject_outbound: None,
                 ping_config: None, // 缺失 → Go 硬拒
             }),
             ..Default::default()

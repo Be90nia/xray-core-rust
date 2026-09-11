@@ -25,8 +25,9 @@ use crate::inbound::spawn_inbounds;
 use crate::outbound::register_outbounds;
 use crate::router::DispatchRouter;
 use crate::register::{register_all_features, register_all_transports};
-use xray_app_dispatcher::default::SimpleOhm;
+use xray_app_dispatcher::default::{SimpleOhm, SniffingRequest};
 use xray_app_dispatcher::{DefaultDispatcher, OutboundHandlerManager};
+use xray_transport::link::Link;
 
 /// AccessLogSink → LogInstance 桥（bd 4uu）。
 ///
@@ -298,6 +299,16 @@ async fn start_full_dispatched(
     }
     let dispatcher = Arc::new(dispatcher);
 
+    // bd mcpo：DNS 查询出站接路由——dispatcher init 完成后把 DNS dialer 注入
+    // xray-app-dns 共享槽。对应 Go nameserver.go:41-78 NewServer 收
+    // routing.Dispatcher：TCP/DoH/UDP-classic 查询经 dispatcher 完整路由出站
+    // （可被规则代理，防污染拓扑下经代理转发）；域名 NS 的 dest 原样传递，
+    // 由路由/outbound 侧解析。xray-app-dns 不能反向依赖 xray-core，
+    // 比照 fakedns 9vu4 共享槽模式传递。
+    xray_app_dns::dial::set_shared_dialer(Some(Arc::new(DispatcherDnsDialer {
+        dispatcher: Arc::clone(&dispatcher),
+    })));
+
     // loopback 出站 sink 注入（票 rdcc，对应 Go loopback.go:46 DispatchLink 回注）：
     // 生产装配持 init 完成的 DefaultDispatcher 构造 sink；loopback outbound 命中
     // 路由后经 dispatch_link 回注 inboundTag 对应入站。此前恒传 None = 任何命中
@@ -314,6 +325,38 @@ async fn start_full_dispatched(
         instance.get_feature::<xray_app_dns::DnsService>(),
         policy_manager,
     )?;
+    // soqc：observatory/burst 探测执行体切 RealOutboundProbeExecutor——经
+    // dispatcher forced-tag 拨号 + rustls 完整 HTTPS GET（对齐 Go
+    // observer.go:130-159 tagged.Dialer + http.Client）。此前 init_dependencies
+    // 兜底注入的是直连 HttpProbeExecutor，所有 tag 探测结果 = 本机直连状况，
+    // balancer 消费即误判节点死活。先于 bag2 注入：feature 的"已 set_io 跳过"
+    // 保护使兜底不覆盖真 executor。
+    {
+        let obs_selector: Arc<dyn xray_app_observatory::OutboundSelector> = Arc::new(
+            xray_app_observatory::RealOutboundSelector::with_selector(Arc::new(
+                OhmTagSelector(Arc::clone(&ohm)),
+            )),
+        );
+        if let Some(f) = instance.get_feature::<xray_app_observatory::ObservatoryFeature>() {
+            let executor = xray_app_observatory::RealOutboundProbeExecutor::from_config(
+                f.observer().config(),
+                Arc::clone(&dispatcher),
+            );
+            f.set_io(obs_selector, Arc::new(executor));
+        }
+        if let Some(bf) = instance.get_feature::<xray_app_observatory::BurstObservatoryFeature>()
+        {
+            let s = bf.observer().settings();
+            let timeout_ms = (s.timeout / 1_000_000).max(1) as u64;
+            let executor = xray_app_observatory::RealOutboundProbeExecutor::new(
+                Arc::clone(&dispatcher),
+                s.destination.clone(),
+                s.http_method.clone(),
+                timeout_ms,
+            );
+            bf.set_io(Arc::new(executor));
+        }
+    }
     // 此次 init_dependencies 与 instance.new_from_built 里的第一次是幂等
     // 的（已 set_io 的 feature 跳过），允许双阶段注入。
     let ohm_selector: Arc<dyn xray_features::OutboundTagSelector> =
@@ -361,6 +404,122 @@ async fn start_full_dispatched(
         "Xray instance started via DefaultDispatcher (sniffing+stats+routing+accesslog)"
     );
     Ok((Arc::new(instance), ohm, handles))
+}
+
+// ========== DNS 查询拨号桥（bd mcpo）==========
+
+/// 生产 DNS 查询拨号器：把 [`xray_app_dns::dial::QueryDialer`] 语义桥到
+/// [`DefaultDispatcher`]（对应 Go DNS nameserver 持 routing.Dispatcher）。
+#[derive(Debug)]
+struct DispatcherDnsDialer {
+    dispatcher: Arc<DefaultDispatcher>,
+}
+
+impl xray_app_dns::dial::QueryDialer for DispatcherDnsDialer {
+    fn dial_tcp(
+        &self,
+        dest: &xray_common::net::destination::Destination,
+    ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<xray_app_dns::dial::DnsStream>> + Send + '_>>
+    {
+        // Go nameserver_tcp.go:43-47 / dohnameserver.go:68：dispatcher.Dispatch
+        // 完整路由链（无 forced tag，无 sniffing——DNS 查询目标即真实目标）。
+        let dispatcher = Arc::clone(&self.dispatcher);
+        let dest = dest.clone();
+        Box::pin(async move {
+            let link = dispatcher
+                .dispatch(&dest, &SniffingRequest::default(), None, None)
+                .map_err(|e| std::io::Error::other(format!("dns dispatch: {e}")))?;
+            let Link { reader, writer } = link;
+            Ok(Box::new(xray_app_dns::dial::LinkStream::new(reader, writer))
+                as xray_app_dns::dial::DnsStream)
+        })
+    }
+
+    fn dial_udp(
+        &self,
+        dest: &xray_common::net::destination::Destination,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = std::io::Result<Box<dyn xray_app_dns::dial::UdpPacketSession>>> + Send + '_>,
+    > {
+        // Go nameserver_udp.go:134 udpServer.Dispatch 包粒度语义：raw DNS 包
+        // 经 UdpDispatchSession 装 XUDP 帧 → dispatch_link 路由 → outbound
+        // （freedom 等）拆帧发出。
+        let session = xray_app_dispatcher::UdpDispatchSession::new(Arc::new(
+            DispatcherLinkHandler {
+                dispatcher: Arc::clone(&self.dispatcher),
+            },
+        ));
+        Box::pin(async move {
+            Ok(Box::new(DnsUdpSessionAdapter { session })
+                as Box<dyn xray_app_dns::dial::UdpPacketSession>)
+        })
+    }
+}
+
+/// UDP 帧消费 handler：把 UdpDispatchSession 建立的 link 交回
+/// dispatcher 完整路由链（等价生产 inbound 的 InboundDispatchHandler 路径）。
+struct DispatcherLinkHandler {
+    dispatcher: Arc<DefaultDispatcher>,
+}
+
+impl std::fmt::Debug for DispatcherLinkHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DispatcherLinkHandler")
+    }
+}
+
+impl xray_app_dispatcher::DispatchHandler for DispatcherLinkHandler {
+    fn tag(&self) -> &str {
+        "dns"
+    }
+
+    fn dispatch(
+        &self,
+        dest: &xray_common::net::destination::Destination,
+        link: xray_transport::link::Link,
+    ) -> xray_app_dispatcher::default::PinFuture<()> {
+        let r = self.dispatcher.dispatch_link(
+            dest,
+            link,
+            &SniffingRequest::default(),
+            None,
+            None,
+        );
+        Box::pin(async move {
+            if let Err(e) = r {
+                tracing::warn!(tag = "dns", error = %e, "dns udp dispatch link failed");
+            }
+        })
+    }
+}
+
+/// [`xray_app_dispatcher::UdpDispatchSession`] → [`xray_app_dns::dial::UdpPacketSession`]
+/// 适配（DNS 查询只需 payload，来源地址不校验——响应匹配靠 DNS query id）。
+struct DnsUdpSessionAdapter {
+    session: xray_app_dispatcher::UdpDispatchSession,
+}
+
+impl xray_app_dns::dial::UdpPacketSession for DnsUdpSessionAdapter {
+    fn send_packet(
+        &mut self,
+        dest: &xray_common::net::destination::Destination,
+        payload: &[u8],
+    ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>> {
+        let mut session = &mut self.session;
+        // 调用参引用生命周期短于返回 future 的 '_，clone 进 async move
+        let dest = dest.clone();
+        let payload = payload.to_vec();
+        Box::pin(async move { session.send_packet(&dest, &payload).await })
+    }
+
+    fn recv_packet(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<Option<Vec<u8>>>> + Send + '_>> {
+        let session = &mut self.session;
+        Box::pin(async move {
+            Ok(session.recv_packet().await?.map(|(_, payload)| payload))
+        })
+    }
 }
 
 /// 从序列化配置字节启动新实例（仅支持 JSON 格式）。
