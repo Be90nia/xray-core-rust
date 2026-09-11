@@ -187,8 +187,10 @@ async fn post_packet_returns_bad_status_on_500() {
     );
 }
 
+/// GET 分支 lazy 契约：非 200 不再从 `open_stream` 返回 `BadStatus`，
+/// dial 立即返回、读端呈现 EOF（对齐 Go `"unexpected status"` 分支）。
 #[tokio::test]
-async fn open_stream_returns_bad_status_on_non_200() {
+async fn open_stream_get_non_200_yields_eof() {
     ensure_crypto_provider();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -224,12 +226,14 @@ async fn open_stream_returns_bad_status_on_non_200() {
     ));
     let base_uri = format!("http://127.0.0.1:{}/", addr.port());
 
-    let result = client.open_stream(&base_uri, "sess", None).await;
-    let err = result.unwrap_err();
-    assert!(
-        matches!(err, SplitHttpError::BadStatus(404)),
-        "expected BadStatus(404), got {err:?}"
-    );
+    // lazy：open_stream 立即返回，非 200 在读端以 EOF 呈现
+    let (mut reader, _, _) = client
+        .open_stream(&base_uri, "sess", None)
+        .await
+        .expect("lazy GET must not fail dial");
+    let mut buf = [0u8; 16];
+    let n = reader.read(&mut buf).await.expect("read must not error");
+    assert_eq!(n, 0, "non-200 GET must surface as EOF, got {n} bytes");
 }
 
 // ===== tlsSettings.fingerprint 出站（btls u_client connector）端到端 =====
