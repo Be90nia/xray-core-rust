@@ -453,9 +453,9 @@ pub fn should_override(
 /// 嗅探连接首包，返回可能被覆盖的 destination。
 ///
 /// 对应 Go `(*DefaultDispatcher).sniffing` 方法。流程：
-/// 1. 从 CachedReader 读首包
-/// 2. 构造 Sniffer 集合并嗅探
-/// 3. 若有 FakeDnsEngine，先做 metadata sniff
+/// 1. 先做 FakeDns 元数据反查；metadataOnly 时据此早退（不读 payload，Go default.go:384-388）
+/// 2. 从 CachedReader 读首包
+/// 3. 构造 Sniffer 集合并嗅探
 /// 4. 若 should_override → 用 sniffed domain 覆盖 dest 的 IP 为域名
 async fn sniff_connection(
     cr: &mut CachedReader,
@@ -471,27 +471,6 @@ async fn sniff_connection(
     ),
     DispatcherError,
 > {
-    // 读首包（带超时）
-    let read_result = tokio::time::timeout(
-        handshake_timeout,
-        cr.read_first(),
-    ).await;
-
-    match read_result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(e),
-        Err(_) => return Err(DispatcherError::SniffingTimeout),
-    }
-
-    let mut payload = cr.cached_bytes();
-    if payload.is_empty() {
-        return Ok((dest.clone(), None, None));
-    }
-    let network = dest.network();
-
-    // 构造嗅探器集合
-    let mut sniffer = crate::sniffer::new_default_sniffer_set();
-
     // FakeDns metadata sniff（372t：IP 在池但反查失败时记 in_pool=true 让上层
     // 走协议子集覆盖分支而非简单视为"非 fakedns 流量"——对应 Go default.go:322-343
     // 在 fakedns pool 内即使 GetDomainFromFakeDNS 返回空也走 fakedns 协议语义，
@@ -513,6 +492,46 @@ async fn sniff_connection(
         }
     }
     let _ = fakedns_ip_in_pool; // 372t: 已记 metadata_protocol, 上层 should_override 仍按 protocol_for_domain 走
+
+    // m9si（Go default.go:384-388）：metadataOnly 时仅元数据嗅探（上方 fakedns
+    // 反查，不读 payload），随后直接返回——内容嗅探不发生，target 不被 TLS 等
+    // 内容域名改写；fakedns 命中时仍按 Go DispatchLink 对 metaresult 走
+    // shouldOverride 评估（fakedns 拨号必须跟域名 → route_only 传 false）。
+    if req.metadata_only {
+        if !metadata_domain.is_empty() {
+            let meta_result =
+                crate::fakednssniffer::FakeDnsSniffResult::new(&metadata_domain);
+            let dest_ip = dest.address().ip();
+            if should_override(&meta_result, req, dest_ip, Some(&metadata_protocol)) {
+                let (new_dest, route_target) =
+                    override_dest(dest, &metadata_domain, false)?;
+                return Ok((new_dest, Some(metadata_protocol), route_target));
+            }
+        }
+        return Ok((dest.clone(), None, None));
+    }
+
+    // 读首包（带超时）
+    let read_result = tokio::time::timeout(
+        handshake_timeout,
+        cr.read_first(),
+    ).await;
+
+    match read_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err(DispatcherError::SniffingTimeout),
+    }
+
+    let mut payload = cr.cached_bytes();
+    if payload.is_empty() {
+        return Ok((dest.clone(), None, None));
+    }
+    let network = dest.network();
+
+    // 构造嗅探器集合
+    let mut sniffer = crate::sniffer::new_default_sniffer_set();
+
     // eu45：嗅探单次读+单次嗅探无 NeedMoreData 重试预算 → ClientHello 分段到达
     // NeedMoreData 后 sniffer 集合已被缩减为 NotImplemented——每轮新建恢复完整集合）。
     let content_result = {
@@ -3202,6 +3221,156 @@ mod tests {
         assert!(ip_dest.lock().is_none(), "ip-tag must not be picked");
         let _ = dn_r;
         up_w.shutdown();
+    }
+
+    /// m9si（Go default.go:384-388）：metadataOnly=true 仅元数据嗅探——不读 payload，
+    /// TLS ClientHello 不触发改写，target 保持原 IP 且 metadata 通道为空。
+    #[tokio::test]
+    async fn sniff_metadata_only_true_skips_payload_and_keeps_target() {
+        use xray_buf::io::Writer as _;
+        use xray_buf::multi::MultiBuffer;
+        use xray_common::net::address::Address;
+
+        let mut payload = vec![0x16, 0x03, 0x01];
+        let hello = build_minimal_client_hello(b"sniffed.example.com");
+        payload.extend_from_slice(&(hello.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&hello);
+
+        let (r, mut w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(&payload);
+        w.write_multi_buffer(mb).await.unwrap();
+        w.shutdown();
+
+        let mut cr = CachedReader::with_inner(Box::new(r));
+        let req = SniffingRequest {
+            enabled: true,
+            metadata_only: true,
+            override_destination_for_protocol: vec!["tls".to_string()],
+            ..Default::default()
+        };
+        let dest = xray_common::net::destination::Destination::new(
+            Address::from_ipv4_bytes([1, 2, 3, 4]),
+            Port::new(443),
+            Network::TCP,
+        );
+
+        let (final_dest, proto, route_target) =
+            sniff_connection(&mut cr, &dest, &req, None, std::time::Duration::from_secs(1))
+                .await
+                .expect("sniff ok");
+
+        assert_eq!(
+            final_dest.address().ip(),
+            Some(std::net::IpAddr::from([1, 2, 3, 4])),
+            "metadataOnly must not rewrite target from TLS payload"
+        );
+        assert!(proto.is_none(), "no metadata domain without fakedns");
+        assert!(route_target.is_none());
+        assert!(
+            cr.cached_bytes().is_empty(),
+            "payload must not be read under metadataOnly"
+        );
+    }
+
+    /// 对照（Go default.go:390-424）：metadataOnly=false 行为不变——TLS payload
+    /// 嗅探命中 SNI 并按 destOverride 改写 target。
+    #[tokio::test]
+    async fn sniff_metadata_only_false_still_rewrites_target() {
+        use xray_buf::io::Writer as _;
+        use xray_buf::multi::MultiBuffer;
+        use xray_common::net::address::Address;
+
+        let mut payload = vec![0x16, 0x03, 0x01];
+        let hello = build_minimal_client_hello(b"sniffed.example.com");
+        payload.extend_from_slice(&(hello.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&hello);
+
+        let (r, mut w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(&payload);
+        w.write_multi_buffer(mb).await.unwrap();
+        w.shutdown();
+
+        let mut cr = CachedReader::with_inner(Box::new(r));
+        let req = SniffingRequest {
+            enabled: true,
+            override_destination_for_protocol: vec!["tls".to_string()],
+            ..Default::default()
+        };
+        let dest = xray_common::net::destination::Destination::new(
+            Address::from_ipv4_bytes([1, 2, 3, 4]),
+            Port::new(443),
+            Network::TCP,
+        );
+
+        let (final_dest, proto, route_target) =
+            sniff_connection(&mut cr, &dest, &req, None, std::time::Duration::from_secs(1))
+                .await
+                .expect("sniff ok");
+
+        assert_eq!(
+            final_dest.address().as_domain(),
+            Some("sniffed.example.com"),
+            "content sniff must still rewrite target when metadataOnly=false"
+        );
+        assert_eq!(proto.as_deref(), Some("tls"));
+        assert!(route_target.is_none());
+    }
+
+    /// m9si（Go default.go:384-388 + DispatchLink shouldOverride）：metadataOnly=true
+    /// 时 fakedns 反查命中（元数据）仍参与改写——元数据可用，内容嗅探跳过。
+    #[tokio::test]
+    async fn sniff_metadata_only_true_fakedns_hit_applies_metadata() {
+        use xray_buf::io::Writer as _;
+        use xray_buf::multi::MultiBuffer;
+        use xray_common::net::address::Address;
+
+        let mut payload = vec![0x16, 0x03, 0x01];
+        let hello = build_minimal_client_hello(b"other.example.com");
+        payload.extend_from_slice(&(hello.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&hello);
+
+        let (r, mut w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(&payload);
+        w.write_multi_buffer(mb).await.unwrap();
+        w.shutdown();
+
+        let mut cr = CachedReader::with_inner(Box::new(r));
+        let req = SniffingRequest {
+            enabled: true,
+            metadata_only: true,
+            override_destination_for_protocol: vec!["fakedns".to_string()],
+            ..Default::default()
+        };
+        let dest = xray_common::net::destination::Destination::new(
+            Address::from_ipv4_bytes([198, 51, 100, 7]),
+            Port::new(443),
+            Network::TCP,
+        );
+
+        let (final_dest, proto, route_target) = sniff_connection(
+            &mut cr,
+            &dest,
+            &req,
+            Some(&FixedFakeDns),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("sniff ok");
+
+        assert_eq!(
+            final_dest.address().as_domain(),
+            Some("sniffed.example.com"),
+            "fakedns metadata hit must still rewrite under metadataOnly"
+        );
+        assert_eq!(proto.as_deref(), Some("fakedns"));
+        assert!(route_target.is_none());
+        assert!(
+            cr.cached_bytes().is_empty(),
+            "payload must not be read under metadataOnly even with fakedns hit"
+        );
     }
 
     /// 路由指定的 outboundTag 不存在 → 关闭下行不落默认出站

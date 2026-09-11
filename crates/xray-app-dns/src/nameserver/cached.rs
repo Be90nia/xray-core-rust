@@ -26,6 +26,9 @@ use crate::error::DnsError;
 /// （默认 4s），此处取同量级值，防领导者异常挂起时等待者被无限拖住。
 const SF_WAIT_TIMEOUT: Duration = Duration::from_secs(4);
 
+/// 后台 pull 的兜底超时。对应 Go `pull` 的 `context.WithTimeout(..., 8s)`。
+const PULL_TIMEOUT: Duration = Duration::from_secs(8);
+
 type SfMap = tokio::sync::Mutex<
     std::collections::HashMap<(String, bool, bool), broadcast::Sender<QueryOutcome>>,
 >;
@@ -94,10 +97,13 @@ impl Clone for QueryOutcome {
 
 /// 缓存入口查询。对应 Go `queryIP(ctx, s, domain, option)`。
 ///
-/// 1. 若缓存启用且命中：返回 `(ips, ttl, Ok)` 或 stale 优化路径。
+/// 1. 若缓存启用且命中：返回 `(ips, ttl, Ok)`；过期且 `serveStale` 时走
+///    stale 优化路径（Go nameserver_cached.go:31-41：秒回旧 IP + `go pull` 续期）。
 /// 2. 否则调用 `fetch`（singleflight + pubsub）执行实际查询。
-pub async fn query_ip<S: CachedNameserver>(
-    server: &S,
+/// 3. 持有 `Arc<S>`（`'static`）：stale 路径需把服务器共享给后台 `pull` 任务
+///    （Go 的 interface 值天然可共享；Rust 须显式 Arc）。
+pub async fn query_ip<S: CachedNameserver + 'static>(
+    server: Arc<S>,
     domain: &str,
     option: IpOption,
 ) -> Result<(Vec<IpAddr>, u32), DnsError> {
@@ -113,13 +119,70 @@ pub async fn query_ip<S: CachedNameserver>(
                 Ok((ips, ttl)) if ttl > 0 => {
                     return Ok((ips, ttl as u32));
                 }
-                // 过期 / 错误：落到下方 fetch。
+                // 过期可服务：Go merge 对过期记录返回 `(ips, ttl<=0, nil)`——
+                // err 非 errRecordNotFound，serveStale 时秒回旧 IP 并后台刷新。
+                // Rust `get_ips` 把过期坍缩为 RecordNotFound，这里从原始记录恢复。
+                Err(DnsError::RecordNotFound) => {
+                    if let Some((ips, ttl)) = stale_result(&rec, option, now) {
+                        if cache.serve_stale
+                            && (cache.serve_expired_ttl_secs == 0
+                                || cache.serve_expired_ttl_secs < ttl)
+                        {
+                            pull(server, fqdn_owned.to_string(), option);
+                            return Ok((ips, 1));
+                        }
+                    }
+                }
+                // 其余（负缓存 / RCode 错误 / 无记录）：落到 fetch。
                 _ => {}
             }
         }
     }
 
-    fetch(server, fqdn_owned, option).await
+    fetch(server.as_ref(), fqdn_owned, option).await
+}
+
+/// serveStale 可服务的过期结果。对应 Go `merge` 的 `ttl<=0 且 err==nil` 情形：
+/// option 内每个启用的地址家族都必须有「rcode==NO_ERROR 且 ips 非空」的记录，
+/// 返回 `(合并 ips, 最小剩余 ttl)`（ttl 相对真实当前时间，可 <= 0）。
+fn stale_result(
+    rec: &crate::dnscommon::Record,
+    option: IpOption,
+    now: Instant,
+) -> Option<(Vec<IpAddr>, i32)> {
+    use crate::dnscommon::rcode;
+    let mut all_ips = Vec::new();
+    let mut ttl = i32::MAX;
+    for (enabled, r) in
+        [(option.ipv4_enable, rec.a.as_ref()), (option.ipv6_enable, rec.aaaa.as_ref())]
+    {
+        // 家族未启用 → 跳过；启用但无记录 → 不允许 stale（Go nil → errRecordNotFound）。
+        if !enabled {
+            continue;
+        }
+        let r = r?;
+        if r.rcode != rcode::NO_ERROR || r.ips.is_empty() {
+            return None;
+        }
+        ttl = ttl.min(raw_ttl_seconds(r.expire, now));
+        all_ips.extend(r.ips.iter().copied());
+    }
+    if all_ips.is_empty() {
+        return None;
+    }
+    Some((all_ips, ttl))
+}
+
+/// 真实剩余 TTL（秒，向上取整，过期时为负）。`ttl_seconds` 对过期钳 0，
+/// 而 Go `serveExpiredTTL < ttl` 闸门（nameserver_cached.go:35）需要负值语义。
+fn raw_ttl_seconds(expire: Instant, now: Instant) -> i32 {
+    match expire.checked_duration_since(now) {
+        Some(d) => d.as_secs_f64().ceil() as i32,
+        None => {
+            let overdue = now - expire;
+            -(overdue.as_secs_f64().ceil() as i32)
+        }
+    }
 }
 
 /// 实际查询 + 缓存写入。对应 Go `fetch` + `doFetch`。
@@ -206,7 +269,9 @@ pub async fn fetch<S: CachedNameserver>(
     Ok((ips, r_ttl))
 }
 
-/// 后台拉取（serveStale 路径）。对应 Go `pull`。
+/// 后台拉取（serveStale 路径）。对应 Go `pull`（nameserver_cached.go:45-49）：
+/// 8s 兜底超时；并发去重由 `fetch` 的 singleflight 天然承担（同 key 在途时
+/// 后续 pull 合并为等待者，不重复打上游）。
 ///
 /// ponytail: 用 `tokio::spawn` fire-and-forget。
 pub fn pull<S: CachedNameserver + 'static>(
@@ -215,7 +280,7 @@ pub fn pull<S: CachedNameserver + 'static>(
     option: IpOption,
 ) {
     tokio::spawn(async move {
-        let _ = fetch(server.as_ref(), &fqdn, option).await;
+        let _ = tokio::time::timeout(PULL_TIMEOUT, fetch(server.as_ref(), &fqdn, option)).await;
     });
 }
 
@@ -284,7 +349,7 @@ mod tests {
             rec_v4: Some(v4_record(60)),
             rec_v6: None,
         };
-        let (ips, ttl) = query_ip(&server, "example.com", v4_only_option()).await.unwrap();
+        let (ips, ttl) = query_ip(Arc::new(server), "example.com", v4_only_option()).await.unwrap();
         assert_eq!(ips.len(), 1);
         assert_eq!(ttl, 60);
     }
@@ -301,7 +366,7 @@ mod tests {
             rec_v4: None, // 不会被调用
             rec_v6: None,
         };
-        let (ips, ttl) = query_ip(&server, "example.com", v4_only_option()).await.unwrap();
+        let (ips, ttl) = query_ip(Arc::new(server), "example.com", v4_only_option()).await.unwrap();
         assert_eq!(ips.len(), 1);
         assert!(ttl > 0);
     }
@@ -316,8 +381,94 @@ mod tests {
             rec_v4: Some(v4_record(60)),
             rec_v6: None,
         };
-        let (ips, _ttl) = query_ip(&server, "example.com", v4_only_option()).await.unwrap();
+        let (ips, _ttl) = query_ip(Arc::new(server), "example.com", v4_only_option()).await.unwrap();
         assert_eq!(ips.len(), 1); // 来自 send_query 而非缓存
+    }
+
+    /// 过期但曾成功的记录 + serveStale → 秒回 `(ips, 1)` 且后台 pull 真实刷新缓存。
+    #[tokio::test]
+    async fn query_ip_serves_stale_and_background_pull_refreshes() {
+        struct CountingServer {
+            cache: Arc<CacheController>,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl CachedNameserver for CountingServer {
+            fn cache_controller(&self) -> &CacheController {
+                &self.cache
+            }
+            async fn send_query(&self, _fqdn: &str, _option: IpOption) -> QueryOutcome {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // 留出并发窗口，让重复 pull 进入 singleflight 等待者路径。
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                QueryOutcome { rec_v4: Some(v4_record(60)), rec_v6: None, errors: Vec::new() }
+            }
+        }
+
+        // serve_stale = true。
+        let cache = Arc::new(CacheController::new("test", false, true, 0, 0));
+        // 预置已过期记录（expire = now - 30s）。
+        let expired = ip_record(
+            1,
+            vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))],
+            Duration::from_secs(0),
+            0,
+            Instant::now() - Duration::from_secs(30),
+        );
+        cache.upsert("example.com.", true, expired);
+
+        let server = Arc::new(CountingServer {
+            cache: cache.clone(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        // 两个并发查询同时命中过期记录：都秒回旧 IP，pull 去重只打一次上游。
+        let (r1, r2) = tokio::join!(
+            query_ip(server.clone(), "example.com", v4_only_option()),
+            query_ip(server.clone(), "example.com", v4_only_option()),
+        );
+        let (ips1, ttl1) = r1.unwrap();
+        let (_, ttl2) = r2.unwrap();
+        assert_eq!(ips1, vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))], "must serve stale ips");
+        assert_eq!((ttl1, ttl2), (1, 1), "stale answer carries ttl=1");
+
+        // 后台 pull 被调用：等缓存被刷新为新鲜记录（fetch → upsert）。
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match cache.find_records("example.com.") {
+                Some(rec) if !rec.a.as_ref().is_some_and(|r| r.is_expired(Instant::now())) => break,
+                _ if Instant::now() >= deadline => panic!("background pull must refresh the cache"),
+                _ => tokio::time::sleep(Duration::from_millis(5)).await,
+            }
+        }
+        assert_eq!(
+            server.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "concurrent pulls must dedupe to one upstream query"
+        );
+    }
+
+    /// serveExpiredTTL 闸门：记录过期时长超出宽限 → 不服务 stale，落到 fetch。
+    #[tokio::test]
+    async fn query_ip_stale_gated_by_serve_expired_ttl() {
+        let cache = Arc::new(CacheController::new("test", false, true, 60, 0));
+        // 过期 120s（超出 60s 宽限）。
+        let expired = ip_record(
+            1,
+            vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))],
+            Duration::from_secs(0),
+            0,
+            Instant::now() - Duration::from_secs(120),
+        );
+        cache.upsert("example.com.", true, expired);
+
+        let server = StubServer {
+            cache,
+            rec_v4: Some(v4_record(60)),
+            rec_v6: None,
+        };
+        // Go: serveExpiredTTL(-60) < ttl(-120) 不成立 → 不走 stale，fetch 返回 1.2.3.4。
+        let (ips, _ttl) = query_ip(Arc::new(server), "example.com", v4_only_option()).await.unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
     }
 
     #[tokio::test]

@@ -25,6 +25,8 @@ use xray_transport_websocket::client::{dial, DialOptions};
 use xray_transport_websocket::config::Config;
 use xray_transport_websocket::server::WsListener;
 
+use xray_transport::connection::Connection;
+use xray_transport_websocket::client::{DialFactory, DelayDialConn};
 
 /// 拨号到本地 listener 的辅助：用 IP 127.0.0.1 + 端口。
 fn local_dest(port: u16) -> Destination {
@@ -270,6 +272,50 @@ async fn server_rejects_mismatched_host() {
     fingerprint: None, tls_server_name: None };
     let result = dial(opts).await;
     assert!(result.is_err(), "mismatched host should be rejected");
+
+    let _ = tokio::time::timeout(Duration::from_secs(3), server_handle).await;
+}
+
+/// delayDial 0-RTT 端到端：Ed>0 时拨号推迟到首次 Write，首包 ≤ Ed 以
+/// early data 进握手头（Sec-WebSocket-Protocol），服务端 first-read 即得。
+/// 对应 Go dialer.go:20-34（Dial 分支）+ 168-221（delayDialConn）。
+#[tokio::test]
+async fn delay_dial_early_data_zero_rtt_roundtrip() {
+    let cfg = Arc::new(Config::default());
+    let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let (addr_rx, server_handle) = spawn_echo_server(bind_addr, cfg.clone()).await;
+    let bound = addr_rx.await.expect("server bound");
+    let dest = local_dest(bound.port());
+
+    // delayDialConn 的拨号工厂：真实 WS 拨号，early data 走握手头。
+    let port = dest.port().value();
+    let factory: DialFactory = Arc::new(move |ed| {
+        Box::pin(async move {
+            let cfg = Config::default();
+            let dest = local_dest(port);
+            let conn = dial(DialOptions {
+                config: &cfg,
+                destination: &dest,
+                early_data: ed.as_deref(),
+                tls_config: None,
+                tls_server_name: None,
+                fingerprint: None,
+            })
+            .await
+            .map_err(std::io::Error::other)?;
+            Ok(Box::new(conn) as Box<dyn Connection>)
+        })
+    });
+
+    let mut client = DelayDialConn::new(2048, factory);
+    // 首写 ≤ Ed=2048：整包进握手头（0-RTT），echo 服务端 first-read 即得并回写。
+    client.write_all(b"early-payload").await.expect("write");
+    let mut buf = [0u8; 13];
+    tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut buf))
+        .await
+        .expect("echo timeout")
+        .expect("read echo");
+    assert_eq!(&buf, b"early-payload");
 
     let _ = tokio::time::timeout(Duration::from_secs(3), server_handle).await;
 }

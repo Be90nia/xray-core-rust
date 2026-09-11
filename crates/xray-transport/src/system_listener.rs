@@ -408,6 +408,54 @@ pub async fn listen_system(addr: SocketAddr, sockopt: SocketOptions) -> io::Resu
     Ok(listener)
 }
 
+/// inbound 裸 TCP listener：accept 时应用 inbound sockopt（bd e7le）。
+///
+/// 对应 Go `applyInboundSocketOptions` 的 per-accept 语义
+/// （system_listener.go:91-109；tokio/std 默认 nodelay=false，Go net.TCPConn
+/// 默认 NoDelay=true）。与 [`DefaultListener`] 的差异：本包装返回原生
+/// `(TcpStream, SocketAddr)` 元组（协议 serve 层 socks/mixed/vless/trojan/
+/// vmess/http/dokodemo/ss/dns 的裸 TCP 路径直接消费），不经 `Box<dyn Connection>`。
+pub struct InboundTcpListener {
+    inner: TokioTcpListener,
+    sockopt: SocketOptions,
+}
+
+impl InboundTcpListener {
+    /// 绑定 `addr`（`host:port` 字符串，与 `TcpListener::bind` 同形）。
+    ///
+    /// # Errors
+    /// bind 失败时返回 `io::Error`。
+    pub async fn bind(addr: &str, sockopt: SocketOptions) -> io::Result<Self> {
+        Ok(Self {
+            inner: TokioTcpListener::bind(addr).await?,
+            sockopt,
+        })
+    }
+
+    /// 监听器本地地址（serve 层日志 / local addr 兜底用）。
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    /// accept 一个连接并应用 inbound sockopt（TCP_NODELAY / keepalive 等）。
+    ///
+    /// sockopt 应用失败仅 debug log 不拒绝连接（与 [`DefaultListener::accept`]
+    /// 及 Go Log 级处理一致）。
+    ///
+    /// # Errors
+    /// accept 或 fd 往返转换失败时返回 `io::Error`。
+    pub async fn accept(&self) -> io::Result<(tokio::net::TcpStream, SocketAddr)> {
+        let (stream, peer) = self.inner.accept().await?;
+        // tokio TcpStream → std → socket2 应用 sockopt（DefaultListener 同款转换）。
+        let std_stream = stream.into_std()?;
+        let socket = Socket::from(std_stream);
+        if let Err(e) = apply_inbound_socket_options(&socket, &self.sockopt) {
+            tracing::debug!(error = %e, "failed to apply inbound socket options");
+        }
+        Ok((tokio::net::TcpStream::from_std(socket.into())?, peer))
+    }
+}
+
 // ===== Unix domain socket 监听（#[cfg(unix)]）=====
 
 /// Unix domain socket 连接。对应 Go `UnixConnWrapper`。
@@ -738,26 +786,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_listener_applies_sockopt_on_accept() {
-        // 验证 accept 后 TCP_NODELAY 被设置。
-        let sockopt = SocketOptions {
-            tcp_nodelay: true,
-            ..Default::default()
-        };
-        let listener = DefaultListener::bind("127.0.0.1:0".parse().unwrap(), sockopt)
-            .await
-            .unwrap();
+    async fn inbound_tcp_listener_sets_nodelay_on_accept() {
+        // bd e7le：accept 出的连接必须默认 TCP_NODELAY（SocketOptions::default
+        // tcp_nodelay=true），helper 层直接断言。
+        let listener =
+            InboundTcpListener::bind("127.0.0.1:0", SocketOptions::default())
+                .await
+                .unwrap();
         let addr = listener.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
-            let _ = listener.accept().await;
+            let (stream, _peer) = listener.accept().await.expect("accept 失败");
+            stream
         });
 
-        let client = TcpStream::connect(addr).await.unwrap();
-        // 服务端 accept 时会对 client 端的 socket 设置 TCP_NODELAY。
-        // 验证 client 端能正常 IO 即可（sockopt 在服务端侧应用）。
-        let _ = client;
-        server.await.unwrap();
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let stream = server.await.unwrap();
+        let sock = Socket::from(stream.into_std().unwrap());
+        assert!(
+            sock.nodelay().unwrap(),
+            "accepted inbound socket should have TCP_NODELAY set"
+        );
     }
 
     #[tokio::test]

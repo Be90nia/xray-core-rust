@@ -16,7 +16,16 @@
 //! `tls_config: Some(_)` 走 rustls + wss://；`None` 走明文 ws://。
 //! 拨 TCP 由 `tokio-tungstenite` 内部完成（用 URI 的 host:port）。
 
+use std::future::Future;
+use std::io;
+use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll, ready};
+
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::task::JoinHandle;
+use xray_transport::connection::Connection;
 
 use base64::Engine;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -92,6 +101,225 @@ pub async fn dial(
 
     // remote/local addr：地址不暴露；调用方需要时通过 dispatcher 注入。
     Ok(WsConnection::from_stream(stream, None, None))
+}
+
+/// Owned 拨号参数：[`DialOptions`] 的 `'static` 版本，供 [`DelayDialConn`]
+/// 的延迟拨号任务 spawn 使用（对应 Go `delayDialConn` 持有的 dest + streamSettings）。
+#[derive(Clone)]
+pub struct DialParams {
+    /// WS 配置（host/path/header/ed）。
+    pub config: Config,
+    /// 拨号目标（URI authority + TCP 连接地址）。
+    pub destination: Destination,
+    /// 可选 rustls `ClientConfig`（`Some` → `wss://`，`None` → `ws://`）。
+    pub tls_config: Option<Arc<rustls::ClientConfig>>,
+    /// TLS SNI（`tlsSettings.serverName`）。
+    pub tls_server_name: Option<String>,
+    /// `tlsSettings.fingerprint`（有意忽略，见 `dial` 内禁区注释）。
+    pub fingerprint: Option<String>,
+}
+
+/// 用 owned 参数拨号（内部组 [`DialOptions`] 调 [`dial`]）。
+pub async fn dial_with_params(
+    params: DialParams,
+    early_data: Option<Vec<u8>>,
+) -> Result<WsConnection<MaybeTlsStream<Box<dyn xray_transport::connection::Connection>>>> {
+    let DialParams {
+        config,
+        destination,
+        tls_config,
+        tls_server_name,
+        fingerprint,
+    } = params;
+    dial(DialOptions {
+        config: &config,
+        destination: &destination,
+        early_data: early_data.as_deref(),
+        tls_config,
+        tls_server_name,
+        fingerprint,
+    })
+    .await
+}
+
+/// 延迟拨号工厂：入参为本次握手要携带的 early data（`None` = 不带），
+/// 返回建立好的连接。由 register 层组装（含 finalmask 包装）。
+pub type DialFuture = Pin<
+    Box<dyn Future<Output = io::Result<Box<dyn xray_transport::connection::Connection>>> + Send>,
+>;
+pub type DialFactory = Arc<dyn Fn(Option<Vec<u8>>) -> DialFuture + Send + Sync>;
+
+/// Go `dialer.go:168-221 delayDialConn` 的等价物：`Ed > 0` 时真实拨号推迟到
+/// 首次 Write，首包 ≤ Ed 字节以 early data 进握手头（0-RTT，省 1 RTT）。
+///
+/// - 首次 `poll_write`：≤ Ed 整包交给工厂作 early data 并 spawn 拨号任务，
+///   `Pending` 到拨号完成；被握手吸收则 `Ready(Ok(len))`，超 Ed 则不带
+///   early data、原包落帧写（`dialer.go:178-198`）。
+/// - `poll_read`：未拨号时等待拨号完成（`dialed` channel 语义，`dialer.go:200-212`）。
+/// - 关闭/drop：abort 未完成的拨号任务（`cancel()` 语义，`dialer.go:214-221`）。
+pub struct DelayDialConn {
+    ed: u32,
+    factory: DialFactory,
+    joining: Option<JoinHandle<io::Result<Box<dyn xray_transport::connection::Connection>>>>,
+    conn: Option<Box<dyn xray_transport::connection::Connection>>,
+    /// 首写记账 `(首写长度, 是否被握手吸收)`，拨号完成时消费一次。
+    first_write: Option<(usize, bool)>,
+    closed: bool,
+}
+
+impl DelayDialConn {
+    /// `Ed` 容量上限与拨号工厂；真实拨号在首次 Write 才发生。
+    pub fn new(ed: u32, factory: DialFactory) -> Self {
+        Self {
+            ed,
+            factory,
+            joining: None,
+            conn: None,
+            first_write: None,
+            closed: false,
+        }
+    }
+
+    /// 驱动拨号任务到完成。无任务时 `Pending`（等首次 Write 触发）。
+    fn poll_dial(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.conn.is_some() {
+            return Poll::Ready(Ok(()));
+        }
+        let Some(handle) = self.joining.as_mut() else {
+            return Poll::Pending;
+        };
+        match Pin::new(handle).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => {
+                self.closed = true;
+                Poll::Ready(Err(io::Error::other(format!("dial task failed: {e}"))))
+            }
+            Poll::Ready(Ok(Err(e))) => {
+                // Go dialer.go:188-191：拨号失败即 Close。
+                self.closed = true;
+                Poll::Ready(Err(e))
+            }
+            Poll::Ready(Ok(Ok(conn))) => {
+                self.conn = Some(conn);
+                self.joining = None;
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+}
+
+impl AsyncRead for DelayDialConn {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        if this.closed {
+            // Go io.ErrClosedPipe。
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "connection closed",
+            )));
+        }
+        if this.conn.is_none() {
+            // 未拨号且无拨号任务：等首次 Write（Go dialer.go:204-210）。
+            ready!(this.poll_dial(cx))?;
+        }
+        Pin::new(this.conn.as_mut().expect("dial completed")).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for DelayDialConn {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = &mut *self;
+        if this.closed {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "connection closed",
+            )));
+        }
+        if this.conn.is_none() {
+            if this.joining.is_none() {
+                // 首写触发拨号：≤ Ed 整包进握手头，超 Ed 不带 early data。
+                let ed = if buf.len() <= this.ed as usize {
+                    Some(buf.to_vec())
+                } else {
+                    None
+                };
+                this.first_write = Some((buf.len(), ed.is_some()));
+                let factory = this.factory.clone();
+                this.joining = Some(tokio::spawn(async move { factory(ed).await }));
+            }
+            ready!(this.poll_dial(cx))?;
+            let (len, absorbed) = this
+                .first_write
+                .take()
+                .expect("recorded when dial was triggered");
+            if absorbed {
+                // 首包已编码进 Sec-WebSocket-Protocol 握手头，视为已消费。
+                return Poll::Ready(Ok(len));
+            }
+            // 超 Ed：原包照常走帧写（Go dialer.go:197 d.Conn.Write(b)）。
+        }
+        Pin::new(this.conn.as_mut().expect("dial completed")).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.conn.as_mut() {
+            Some(conn) => Pin::new(conn).poll_flush(cx),
+            // 未拨号：无缓冲数据可冲。
+            None => Poll::Ready(Ok(())),
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        if this.closed {
+            return Poll::Ready(Ok(()));
+        }
+        match this.conn.as_mut() {
+            Some(conn) => Pin::new(conn).poll_shutdown(cx),
+            // 未拨号：直接闭合并取消拨号任务（Go Close 的 cancel 分支）。
+            None => {
+                this.closed = true;
+                if let Some(handle) = this.joining.take() {
+                    handle.abort();
+                }
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+}
+
+impl Connection for DelayDialConn {
+    fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+        // 未拨号无对端（Go 未拨号时内嵌 net.Conn 为 nil）。
+        match &self.conn {
+            Some(c) => c.remote_addr(),
+            None => Ok(None),
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+        match &self.conn {
+            Some(c) => c.local_addr(),
+            None => Ok(None),
+        }
+    }
+}
+
+impl Drop for DelayDialConn {
+    fn drop(&mut self) {
+        // 拨号中途丢弃：abort 任务（Go cancel() 语义），不留孤儿连接。
+        if let Some(handle) = self.joining.take() {
+            handle.abort();
+        }
+    }
 }
 
 /// 构造 URI（`ws://` 或 `wss://` + authority + path）。
@@ -249,5 +477,137 @@ mod tests {
         let req = build_request("ws://example.com/", &cfg, None).unwrap();
         assert_eq!(req.headers().get("x-forwarded-for").unwrap(), "10.0.0.1");
         assert_eq!(req.headers().get("x-custom").unwrap(), "v");
+    }
+
+    // -------------------------------------------------------------------
+    // DelayDialConn：Go dialer.go:168-221 delayDialConn 语义
+    // -------------------------------------------------------------------
+
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use xray_transport::connection::DuplexConnection;
+
+    /// 工厂调用记录：每次收到的 early data（`None` = 超长未携带）。
+    type DialRecord = Arc<Mutex<Vec<Option<Vec<u8>>>>>;
+
+    /// 取当前记录快照（锁被毒化时按空处理，测试失败由断言报出）。
+    fn recorded(record: &DialRecord) -> Vec<Option<Vec<u8>>> {
+        record.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+    /// 记录 early data 的工厂：延迟 `delay` 后返回 duplex 客户端半边（一次性 take）。
+    fn recording_factory(
+        record: DialRecord,
+        delay: Duration,
+    ) -> (DialFactory, tokio::io::DuplexStream) {
+        let (client, server) = tokio::io::duplex(4096);
+        let client = Arc::new(Mutex::new(Some(client)));
+        let factory: DialFactory = Arc::new(move |ed| {
+            if let Ok(mut g) = record.lock() {
+                g.push(ed.clone());
+            }
+            let client = client.lock().ok().and_then(|mut g| g.take());
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                let client = client.expect("factory called at most once per duplex");
+                Ok(Box::new(DuplexConnection::new(client)) as Box<dyn Connection>)
+            })
+        });
+        (factory, server)
+    }
+    /// 首写前不拨号（Go Dial Ed>0 只建 delayDialConn 不拨号）。
+    #[tokio::test]
+    async fn delay_dial_defers_until_first_write() {
+        let record: DialRecord = Arc::default();
+        let (factory, _server) = recording_factory(record.clone(), Duration::ZERO);
+        drop(DelayDialConn::new(64, factory));
+        assert!(recorded(&record).is_empty(), "must not dial before first write");
+    }
+
+    /// 首写 ≤ Ed：整包进握手头，Write 即返回，帧上无数据。
+    #[tokio::test]
+    async fn delay_dial_first_write_within_ed_enters_handshake() {
+        let record: DialRecord = Arc::default();
+        let (factory, mut server) = recording_factory(record.clone(), Duration::ZERO);
+        let mut conn = DelayDialConn::new(64, factory);
+        let n = conn.write(b"hello-ed".as_slice()).await.unwrap();
+        assert_eq!(n, 8);
+        assert_eq!(recorded(&record), vec![Some(b"hello-ed".to_vec())]);
+        // early data 被握手吸收：对端读不到（没有帧写出）。
+        let mut buf = [0u8; 16];
+        let r = tokio::time::timeout(Duration::from_millis(50), server.read(&mut buf)).await;
+        assert!(
+            r.is_err(),
+            "early data must be absorbed by handshake, not written as frame"
+        );
+    }
+
+    /// 首写超 Ed：不带 early data，原包照常走帧写到对端。
+    #[tokio::test]
+    async fn delay_dial_first_write_over_ed_skips_early_data() {
+        let record: DialRecord = Arc::default();
+        let (factory, mut server) = recording_factory(record.clone(), Duration::ZERO);
+        let mut conn = DelayDialConn::new(4, factory);
+        let payload = [7u8; 10];
+        conn.write(&payload).await.unwrap();
+        assert_eq!(recorded(&record), vec![None]);
+        let mut buf = [0u8; 10];
+        server.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, payload);
+    }
+
+    /// Read 在未拨号时必须 Pending 且不触发拨号（Go dialer.go:204-210 select
+    /// dialed/ctx 语义）；拨号由首次 Write 触发后，Read 读到连接数据。
+    #[tokio::test]
+    async fn delay_dial_read_waits_for_dial_then_receives() {
+        use std::future::poll_fn;
+        use std::task::Poll;
+
+        let record: DialRecord = Arc::default();
+        let (factory, mut server) =
+            recording_factory(record.clone(), Duration::from_millis(30));
+        // 预先从对端半边塞数据：停在 duplex 缓冲，拨号完成后立即可读。
+        server.write_all(b"pong").await.unwrap();
+        let mut conn = DelayDialConn::new(64, factory);
+
+        // 未拨号时 Read：一次 poll 必须 Pending，且不得触发拨号。
+        poll_fn(|cx| {
+            let mut tmp = [0u8; 4];
+            let mut buf = tokio::io::ReadBuf::new(&mut tmp);
+            assert!(matches!(
+                Pin::new(&mut conn).poll_read(cx, &mut buf),
+                Poll::Pending
+            ));
+            Poll::Ready(())
+        })
+        .await;
+        assert!(
+            recorded(&record).is_empty(),
+            "read must not trigger dialing"
+        );
+
+        // 首写触发拨号（≤ Ed → 进握手头），完成后 Read 读到预填数据。
+        let n = conn.write(b"x".as_slice()).await.unwrap();
+        assert_eq!(n, 1);
+        let mut buf = [0u8; 4];
+        let rx = tokio::time::timeout(Duration::from_secs(2), conn.read(&mut buf))
+            .await
+            .expect("read must complete once dial finishes")
+            .unwrap();
+        assert_eq!(&buf[..rx], b"pong");
+        assert_eq!(recorded(&record), vec![Some(b"x".to_vec())]);
+    }
+
+    /// 未拨号 shutdown：不拨号、直接闭合，后续 Write 报 BrokenPipe（Go ErrClosedPipe）。
+    #[tokio::test]
+    async fn delay_dial_shutdown_before_dial_aborts_and_rejects_write() {
+        let record: DialRecord = Arc::default();
+        let (factory, _server) = recording_factory(record.clone(), Duration::ZERO);
+        let mut conn = DelayDialConn::new(64, factory);
+        conn.shutdown().await.unwrap();
+        assert!(recorded(&record).is_empty(), "shutdown must not dial");
+        let err = conn.write(b"x".as_slice()).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
     }
 }

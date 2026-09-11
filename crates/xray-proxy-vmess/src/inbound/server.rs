@@ -17,13 +17,13 @@ use xray_buf::io::{new_reader, new_writer};
 use xray_common::protocol::{Command, ResponseCommand, ResponseHeader, SecurityType};
 use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead};
 use xray_transport::link::Link;
+use xray_transport::system_listener::InboundTcpListener;
 use xray_common::net::destination::Destination;
 
 use crate::encoding::server::{ServerSession, SessionHistory};
 use crate::encoding::{generate_chacha20poly1305_key, ChunkNonceGenerator};
 use crate::encoding::body_chunk::{
-    ChunkNonce, ChunkNonceAdapter, PlainSizeParser, ShakeSizeParserAdapter, SizeParser,
-    make_authenticated_length_size_parser,
+    PlainSizeParser, ShakeSizeParserAdapter, SizeParser, make_authenticated_length_size_parser,
 };
 use crate::request_option;
 use crate::validator::TimedUserValidator;
@@ -82,6 +82,31 @@ impl AeadCipher for BodyCipher {
             BodyCipher::Chacha(c) => c.open(nonce, aad, ciphertext),
         }
     }
+
+    fn seal_into(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        plaintext: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), xray_crypto::aead::CryptoError> {
+        match self {
+            BodyCipher::Aes(c) => c.seal_into(nonce, aad, plaintext, out),
+            BodyCipher::Chacha(c) => c.seal_into(nonce, aad, plaintext, out),
+        }
+    }
+
+    fn open_in_place<'a>(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        ciphertext: &'a mut [u8],
+    ) -> Result<&'a mut [u8], xray_crypto::aead::CryptoError> {
+        match self {
+            BodyCipher::Aes(c) => c.open_in_place(nonce, aad, ciphertext),
+            BodyCipher::Chacha(c) => c.open_in_place(nonce, aad, ciphertext),
+        }
+    }
 }
 
 /// Pump 单次 read 缓冲（与 body_chunk `DEFAULT_PAYLOAD_SIZE` 对齐）。
@@ -108,7 +133,7 @@ const PUMP_BUF: usize = 8192;
 /// 仅支持 `Aes128Gcm` + `Chacha20Poly1305` + `PlainSizeParser`（默认 body 选项）。
 /// `AUTHENTICATED_LENGTH` / `CHUNK_MASKING` 选项 warn 后关闭连接（YAGNI）。
 pub async fn serve_vmess(
-    listener: TcpListener,
+    listener: InboundTcpListener,
     ohm: Arc<SimpleOhm>,
     validator: Arc<TimedUserValidator>,
     tls: Option<Arc<xray_transport::TlsAcceptor>>,
@@ -323,7 +348,9 @@ async fn pump_request_body<C, R>(
     C: AeadCipher + Send,
     R: AsyncRead + Unpin,
 {
-    let mut nonce_gen = ChunkNonceAdapter::new(&iv, 12);
+    let mut nonce_gen = ChunkNonceGenerator::new(&iv, 12);
+    let mut size_field = Vec::with_capacity(18);
+    let mut ciphertext = Vec::with_capacity(PUMP_BUF + 96);
     loop {
         // SHAKE128 流同步：先 next_padding_len 再 decode（与 body_chunk decode 一致）。
         let padding_size = if global_padding {
@@ -332,7 +359,7 @@ async fn pump_request_body<C, R>(
             0
         };
         let sb = size_parser.size_bytes();
-        let mut size_field = vec![0u8; sb];
+        size_field.resize(sb, 0);
         if stream_r.read_exact(&mut size_field).await.is_err() {
             break;
         }
@@ -341,15 +368,15 @@ async fn pump_request_body<C, R>(
             break;
         }
         let ciphertext_size = total_size.saturating_sub(padding_size);
-        let mut ciphertext = vec![0u8; total_size];
+        ciphertext.resize(total_size, 0);
         if stream_r.read_exact(&mut ciphertext).await.is_err() {
             break;
         }
-        let nonce = nonce_gen.next();
-        match cipher.open(&nonce, &[], &ciphertext[..ciphertext_size]) {
+        let nonce = nonce_gen.next_ref();
+        match cipher.open_in_place(nonce, &[], &mut ciphertext[..ciphertext_size]) {
             Ok(pt) if pt.is_empty() => break, // 终止 chunk：seal([]) → 解密为空
             Ok(pt) => {
-                if server_w.write_all(&pt).await.is_err() {
+                if server_w.write_all(pt).await.is_err() {
                     break;
                 }
             }
@@ -382,47 +409,40 @@ async fn pump_response_body<C, W>(
     C: AeadCipher + Send,
     W: AsyncWrite + Unpin,
 {
-    let mut nonce_gen = ChunkNonceAdapter::new(&iv, 12);
+    let mut nonce_gen = ChunkNonceGenerator::new(&iv, 12);
     let mut buf = [0u8; PUMP_BUF];
+    let mut chunk_buf = Vec::with_capacity(PUMP_BUF + 96);
     loop {
         match server_r.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => {
-                let nonce = nonce_gen.next();
-                let sealed = match cipher.seal(&nonce, &[], &buf[..n]) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::debug!(
-                            error = %e.to_string(),
-                            "vmess response body chunk seal failed"
-                        );
-                        break;
-                    }
-                };
+                // SHAKE128 流消费顺序：next_padding_len → encode（与 decode 侧对称）
                 let padding_size = if global_padding {
                     usize::from(size_parser.next_padding_len())
                 } else {
                     0
                 };
-                let encrypted_size = sealed.len();
-                let size_value =
-                    u16::try_from(encrypted_size + padding_size).unwrap_or(u16::MAX);
                 let sb = size_parser.size_bytes();
-                let mut size_field = vec![0u8; sb];
-                size_parser.encode(size_value, &mut size_field);
-                if stream_w.write_all(&size_field).await.is_err() {
-                    break;
-                }
-                if stream_w.write_all(&sealed).await.is_err() {
+                let nonce = nonce_gen.next_ref();
+                chunk_buf.clear();
+                chunk_buf.resize(sb, 0);
+                if let Err(e) = cipher.seal_into(nonce, &[], &buf[..n], &mut chunk_buf) {
+                    tracing::debug!(
+                        error = %e.to_string(),
+                        "vmess response body chunk seal failed"
+                    );
                     break;
                 }
                 if padding_size > 0 {
-                    let mut pad = vec![0u8; padding_size];
                     use rand::RngCore;
-                    rand::rng().fill_bytes(&mut pad);
-                    if stream_w.write_all(&pad).await.is_err() {
-                        break;
-                    }
+                    let start = chunk_buf.len();
+                    chunk_buf.resize(start + padding_size, 0);
+                    rand::rng().fill_bytes(&mut chunk_buf[start..]);
+                }
+                let size_value = u16::try_from(chunk_buf.len() - sb).unwrap_or(u16::MAX);
+                size_parser.encode(size_value, &mut chunk_buf[..sb]);
+                if stream_w.write_all(&chunk_buf).await.is_err() {
+                    break;
                 }
             }
             Err(e) => {
@@ -436,16 +456,16 @@ async fn pump_response_body<C, W>(
     }
     // 写终止 chunk：seal([]) → 仅 tag 字节，客户端 decode 看到 plaintext 为空即返回
     if !no_termination {
-        let nonce = nonce_gen.next();
-        if let Ok(sealed) = cipher.seal(&nonce, &[], &[]) {
-            let sb = size_parser.size_bytes();
-            let mut size_field = vec![0u8; sb];
+        let sb = size_parser.size_bytes();
+        let nonce = nonce_gen.next_ref();
+        chunk_buf.clear();
+        chunk_buf.resize(sb, 0);
+        if cipher.seal_into(nonce, &[], &[], &mut chunk_buf).is_ok() {
             size_parser.encode(
-                u16::try_from(sealed.len()).unwrap_or(u16::MAX),
-                &mut size_field,
+                u16::try_from(chunk_buf.len() - sb).unwrap_or(u16::MAX),
+                &mut chunk_buf[..sb],
             );
-            let _ = stream_w.write_all(&size_field).await;
-            let _ = stream_w.write_all(&sealed).await;
+            let _ = stream_w.write_all(&chunk_buf).await;
         }
     }
     let _ = stream_w.flush().await;
@@ -459,33 +479,34 @@ async fn pump_response_body<C, W>(
 async fn write_udp_chunk<W: AsyncWrite + Unpin>(
     stream_w: &mut W,
     cipher: &BodyCipher,
-    nonce_gen: &mut ChunkNonceAdapter,
+    nonce_gen: &mut ChunkNonceGenerator,
     sp: &mut (dyn SizeParser + Send),
     global_padding: bool,
     payload: &[u8],
+    chunk_buf: &mut Vec<u8>,
 ) -> std::io::Result<()> {
-    let nonce = nonce_gen.next();
-    let sealed = cipher
-        .seal(&nonce, &[], payload)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    // SHAKE128 流消费顺序：next_padding_len → encode（与 decode 侧对称）
     let padding_size = if global_padding {
         usize::from(sp.next_padding_len())
     } else {
         0
     };
-    let size_value = u16::try_from(sealed.len() + padding_size).unwrap_or(u16::MAX);
+    let nonce = nonce_gen.next_ref();
     let sb = sp.size_bytes();
-    let mut size_field = vec![0u8; sb];
-    sp.encode(size_value, &mut size_field);
-    stream_w.write_all(&size_field).await?;
-    stream_w.write_all(&sealed).await?;
+    chunk_buf.clear();
+    chunk_buf.resize(sb, 0);
+    cipher
+        .seal_into(nonce, &[], payload, chunk_buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     if padding_size > 0 {
         use rand::RngCore;
-        let mut pad = vec![0u8; padding_size];
-        rand::rng().fill_bytes(&mut pad);
-        stream_w.write_all(&pad).await?;
+        let start = chunk_buf.len();
+        chunk_buf.resize(start + padding_size, 0);
+        rand::rng().fill_bytes(&mut chunk_buf[start..]);
     }
-    Ok(())
+    let size_value = u16::try_from(chunk_buf.len() - sb).unwrap_or(u16::MAX);
+    sp.encode(size_value, &mut chunk_buf[..sb]);
+    stream_w.write_all(chunk_buf).await
 }
 
 /// VMess UDP 会话（Go 非 cone 语义）：chunk 边界即 UDP packet 边界。
@@ -521,7 +542,9 @@ where
     // up：解密 request chunk（与 pump_request_body 同构）→ channel 交 relay。
     let (up_tx, mut up_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
     let up = async move {
-        let mut nonce_gen = ChunkNonceAdapter::new(&req_iv, 12);
+        let mut nonce_gen = ChunkNonceGenerator::new(&req_iv, 12);
+        let mut size_field = Vec::with_capacity(18);
+        let mut ciphertext = Vec::with_capacity(PUMP_BUF + 96);
         loop {
             // padding → size → ciphertext → open
             let padding_size = if global_padding {
@@ -530,7 +553,7 @@ where
                 0
             };
             let sb = req_sp.size_bytes();
-            let mut size_field = vec![0u8; sb];
+            size_field.resize(sb, 0);
             if stream_r.read_exact(&mut size_field).await.is_err() {
                 break;
             }
@@ -539,17 +562,17 @@ where
                 break; // 终止 chunk
             }
             let ciphertext_size = total_size.saturating_sub(padding_size);
-            let mut ciphertext = vec![0u8; total_size];
+            ciphertext.resize(total_size, 0);
             if stream_r.read_exact(&mut ciphertext).await.is_err() {
                 break;
             }
-            let nonce = nonce_gen.next();
-            match req_cipher.open(&nonce, &[], &ciphertext[..ciphertext_size]) {
+            let nonce = nonce_gen.next_ref();
+            match req_cipher.open_in_place(nonce, &[], &mut ciphertext[..ciphertext_size]) {
                 // 空明文 chunk = 请求流终止（chunk writer Close 语义），不作为
                 // 数据报转发（dispatch 侧也会丢弃空 payload，转发即死锁）。
                 Ok(packet) if packet.is_empty() => break,
                 Ok(packet) => {
-                    if up_tx.send(packet).await.is_err() {
+                    if up_tx.send(packet.to_vec()).await.is_err() {
                         break; // relay 已退出
                     }
                 }
@@ -566,7 +589,8 @@ where
         // up 结束后仍保留收尾窗口：在途回包可能晚于终止 chunk 到达
         //（Go 由 CancelAfterInactivity(ConnectionIdle) 管理，此处取短窗口）。
         const UP_DONE_IDLE: std::time::Duration = std::time::Duration::from_millis(500);
-        let mut nonce_gen = ChunkNonceAdapter::new(&resp_iv, 12);
+        let mut nonce_gen = ChunkNonceGenerator::new(&resp_iv, 12);
+        let mut chunk_buf = Vec::with_capacity(PUMP_BUF + 96);
         let mut up_done = false;
         loop {
             let incoming = if up_done {
@@ -601,6 +625,7 @@ where
                 resp_sp.as_mut(),
                 global_padding,
                 &payload,
+                &mut chunk_buf,
             )
             .await
             .is_err()
@@ -619,6 +644,7 @@ where
                 resp_sp.as_mut(),
                 global_padding,
                 &[],
+                &mut chunk_buf,
             )
             .await;
         }
@@ -705,7 +731,10 @@ mod tests {
 
         // 3. validator + serve_vmess
         let (validator, cmd_key) = make_validator_with_user();
-        let vmess_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let vmess_listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        ).await.unwrap();
         let vmess_addr = vmess_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
@@ -772,7 +801,10 @@ mod tests {
 
         // 空 validator（无任何用户）
         let validator = Arc::new(TimedUserValidator::new());
-        let vmess_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let vmess_listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        ).await.unwrap();
         let vmess_addr = vmess_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
@@ -832,7 +864,10 @@ mod tests {
         // 2. serve_vmess（UDP 经 dispatch → freedom outbound 转发）
         let ohm = make_ohm_with_freedom();
         let (validator, cmd_key) = make_validator_with_user();
-        let vmess_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let vmess_listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        ).await.unwrap();
         let vmess_addr = vmess_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);

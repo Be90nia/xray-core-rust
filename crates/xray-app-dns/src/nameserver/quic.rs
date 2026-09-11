@@ -108,14 +108,14 @@ impl DoqNameServer {
             ns.negative_ttl_secs.unwrap_or(0),
         ));
         cache.start_cleanup_task(crate::cache_controller::CLEANUP_INTERVAL);
-        Ok(Box::new(Self::new(
+        Ok(Box::new(Arc::new(Self::new(
             socket_addr,
             server_name,
             tls_config,
             cache,
             ns.client_ip.clone(),
             timeout_dur,
-        )))
+        ))))
     }
 
     /// 从 rustls ClientConfig 构造 quinn ClientConfig（加 ALPN doq）。
@@ -238,9 +238,9 @@ impl CachedNameserver for DoqNameServer {
     }
 }
 
-impl Server for DoqNameServer {
+impl Server for Arc<DoqNameServer> {
     fn name(&self) -> &str {
-        &self.name
+        self.name.as_str()
     }
 
     fn is_disable_cache(&self) -> bool {
@@ -252,7 +252,7 @@ impl Server for DoqNameServer {
         domain: &'a str,
         option: IpOption,
     ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>> {
-        Box::pin(query_ip(self, domain, option))
+        Box::pin(query_ip(self.clone(), domain, option))
     }
 }
 

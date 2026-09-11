@@ -723,6 +723,11 @@ fn fake_dns_factory() -> FeatureFactory {
                 message: format!("parse FakeDnsConfig: {e}"),
             })?;
         let holder = build_fake_dns_holder(&cfg)?;
+        // bd 9vu4：DNS 侧 fakedns nameserver 与 dispatcher 嗅探共享同一引擎
+        // （Go nameserver.go:70-79 RequireFeatures 全局唯一 FakeDNSEngine）。
+        // xray-app-dns 不能反向依赖 xray-core，经 crate 级共享槽传递，
+        // DNS 侧查询时惰性取用（dns app 可能先于本 feature 构建）。
+        xray_app_dns::fakedns::set_shared_multi(Some(holder.clone()));
         Ok(Arc::new(FakeDnsFeature { holder }) as Arc<dyn Feature>)
     })
 }
@@ -1073,10 +1078,13 @@ mod tests {
         assert_eq!(snap.inbound.len(), 1, "unknown direction must not land");
     }
 
+    /// 共享槽是进程级全局：涉 fakeDns factory 的测试须串行。
+    static FAKEDNS_SLOT_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     #[test]
     fn fake_dns_factory_builds_working_engine() {
+        let _slot_guard = FAKEDNS_SLOT_LOCK.lock();
         register_all_features();
-
         let json = br#"{"ipPool":"198.18.0.0/15","poolSize":1024}"#;
         let feat = registry::create_feature("fakeDns", json).expect("fakeDns config should build");
         assert_eq!(feat.feature_name(), "fakeDns");
@@ -1094,6 +1102,61 @@ mod tests {
             engine.get_domain_from_fake_dns(ip).as_deref(),
             Some("example.com")
         );
+    }
+
+    /// bd 9vu4 验收：fakeDns factory 把引擎注册进共享槽，DNS 侧
+    /// `new_server_with_config("fakedns")` 与 dispatcher 侧（同一 `HolderMulti`
+    /// 的桥）互通——DNS 发的 fake IP 能被 dispatcher 引擎反查命中。
+    #[test]
+    fn fake_dns_factory_shares_engine_with_dns_side() {
+        register_all_features();
+
+        let json = br#"{"ipPool":"198.18.0.0/15","poolSize":1024}"#;
+        let _slot_guard = FAKEDNS_SLOT_LOCK.lock();
+        let feat = registry::create_feature("fakeDns", json).expect("fakeDns config should build");
+
+        // factory 必须把引擎写入共享槽。
+        let shared = xray_app_dns::fakedns::shared_multi().expect("factory must set shared slot");
+
+        // dispatcher 侧桥（functions.rs 同路径）。
+        let bridge = fake_dns_engine_bridge(shared.clone());
+
+        // DNS 侧 server：发的 fake IP 必须落在共享池 198.18.0.0/15。
+        let (server, _) = xray_app_dns::nameserver::new_server_with_config(
+            "fakedns",
+            xray_app_dns::nameserver::NameServerConfig::default(),
+        )
+        .expect("fakedns server should build");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (ips, _) = rt.block_on(async {
+            server
+                .query_ip("example.com", xray_app_dns::config::IpOption::all())
+                .await
+                .expect("fakedns query should succeed")
+        });
+        assert!(
+            shared.is_ip_in_pool(ips[0]),
+            "DNS-side fake IP must come from the shared pool, got {ips:?}"
+        );
+
+        // dispatcher 侧反查命中（嗅探闭环）。
+        assert_eq!(
+            bridge.get_domain_from_fake_dns(&ips[0]),
+            "example.com",
+            "dispatcher bridge must reverse-resolve the DNS-side fake IP"
+        );
+
+        // 引擎身份一致：共享槽里的就是 feature 持有的那个。
+        let any: Arc<dyn std::any::Any + Send + Sync> = feat;
+        let typed = any
+            .downcast::<FakeDnsFeature>()
+            .expect("feature should downcast to FakeDnsFeature");
+        assert!(Arc::ptr_eq(&typed.engine(), &shared), "engine identity must match");
+
+        xray_app_dns::fakedns::set_shared_multi(None);
     }
 
     #[test]

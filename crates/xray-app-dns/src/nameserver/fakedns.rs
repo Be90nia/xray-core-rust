@@ -59,6 +59,54 @@ impl FakeDnsEngine for HolderMulti {
     }
 }
 
+/// DNS 侧共享引擎（bd 9vu4）。对应 Go `nameserver.go:70-79` 经
+/// `RequireFeatures` 取到的全局唯一 `FakeDNSEngine`。
+///
+/// 查询时优先取 fakeDns app 经 [`crate::fakedns::set_shared_multi`] 注册的
+/// [`HolderMulti`]（与 dispatcher 嗅探同引擎同池）；无 fakeDns app 配置时
+/// 退回 `new_default` 兼容实例，保持旧行为。
+pub struct SharedFakeDnsEngine {
+    fallback: Holder,
+}
+
+impl SharedFakeDnsEngine {
+    /// 以兼容兜底实例构造。
+    #[must_use]
+    pub fn new(fallback: Holder) -> Self {
+        Self { fallback }
+    }
+}
+
+impl FakeDnsEngine for SharedFakeDnsEngine {
+    fn get_fake_ip_for_domain(&self, domain: &str) -> Vec<IpAddr> {
+        match crate::fakedns::shared_multi() {
+            Some(m) => HolderMulti::get_fake_ip_for_domain(&m, domain),
+            None => Holder::get_fake_ip_for_domain(&self.fallback, domain),
+        }
+    }
+
+    fn get_fake_ip_for_domain_3(&self, domain: &str, ipv4: bool, ipv6: bool) -> Vec<IpAddr> {
+        match crate::fakedns::shared_multi() {
+            Some(m) => HolderMulti::get_fake_ip_for_domain_3(&m, domain, ipv4, ipv6),
+            None => Holder::get_fake_ip_for_domain_3(&self.fallback, domain, ipv4, ipv6),
+        }
+    }
+
+    fn get_domain_from_fake_dns(&self, ip: IpAddr) -> Option<String> {
+        match crate::fakedns::shared_multi() {
+            Some(m) => HolderMulti::get_domain_from_fake_dns(&m, ip),
+            None => Holder::get_domain_from_fake_dns(&self.fallback, ip),
+        }
+    }
+
+    fn is_ip_in_pool(&self, ip: IpAddr) -> bool {
+        match crate::fakedns::shared_multi() {
+            Some(m) => HolderMulti::is_ip_in_pool(&m, ip),
+            None => Holder::is_ip_in_pool(&self.fallback, ip),
+        }
+    }
+}
+
 /// FakeDNS 名称服务器。对应 Go `FakeDNSServer`。
 pub struct FakeDnsServer<E: FakeDnsEngine> {
     engine: E,
@@ -164,5 +212,56 @@ mod tests {
         // 验证 trait object 可创建（编译期检查）。
         let h: Box<dyn FakeDnsEngine> = Box::new(Holder::new_default().unwrap());
         assert!(h.is_ip_in_pool(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))) == false);
+    }
+
+    /// 共享槽是进程级全局：两条 e2e 须串行（parking_lot TEST_LOCK 惯例）。
+    static SLOT_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// bd 9vu4 验收：DNS 侧 fakedns server 发的 fake IP 来自共享池
+    /// （fakeDns app 配置的 198.18.0.0/15，而非 new_default 的 240.0.0.0/4），
+    /// 且能被共享引擎（dispatcher 同引擎）反查命中。
+    #[tokio::test]
+    async fn factory_serves_shared_engine_and_reverse_resolves() {
+        let _slot_guard = SLOT_LOCK.lock();
+        let multi = std::sync::Arc::new(
+            HolderMulti::new(vec![FakeDnsPool {
+                ip_pool: "198.18.0.0/15".to_string(),
+                lru_size: 65535,
+            }])
+            .unwrap(),
+        );
+        crate::fakedns::set_shared_multi(Some(multi.clone()));
+
+        let (server, _) =
+            crate::nameserver::new_server_with_config("fakedns", Default::default()).unwrap();
+        let (ips, ttl) = server.query_ip("example.com", IpOption::all()).await.unwrap();
+
+        assert_eq!(ttl, 1);
+        assert!(
+            multi.is_ip_in_pool(ips[0]),
+            "must come from the shared 198.18.0.0/15 pool, got {ips:?}"
+        );
+        // dispatcher 侧同引擎反查命中。
+        assert_eq!(
+            multi.get_domain_from_fake_dns(ips[0]).as_deref(),
+            Some("example.com"),
+            "shared pool must reverse-resolve the DNS-side fake IP"
+        );
+
+        crate::fakedns::set_shared_multi(None);
+    }
+
+    /// 无 fakeDns app（共享槽空）时保持 `new_default` 兼容行为。
+    #[tokio::test]
+    async fn factory_falls_back_to_new_default_without_shared_engine() {
+        let _slot_guard = SLOT_LOCK.lock();
+        crate::fakedns::set_shared_multi(None);
+        let (server, _) =
+            crate::nameserver::new_server_with_config("fakedns", Default::default()).unwrap();
+        let (ips, _) = server.query_ip("example.com", IpOption::all()).await.unwrap();
+        assert!(
+            matches!(ips[0], IpAddr::V4(v) if (240..=255).contains(&v.octets()[0])),
+            "fallback must serve the default 240.0.0.0/4 pool, got {ips:?}"
+        );
     }
 }

@@ -30,6 +30,7 @@ use xray_common::net::destination::Destination;
 use xray_common::net::network::Network;
 use xray_common::net::port::Port;
 use xray_transport::link::Link;
+use xray_transport::system_listener::InboundTcpListener;
 
 use crate::encoding::server::{decode_request_header, encode_response_header};
 use crate::encoding::{empty_addons, VERSION};
@@ -80,7 +81,7 @@ pub struct VlessInboundOptions {
 /// # 错误
 /// accept 循环自身错误返回；单个连接错误只 log 不中断循环。
 pub async fn serve_vless(
-    listener: TcpListener,
+    listener: InboundTcpListener,
     ohm: Arc<SimpleOhm>,
     validator: Arc<dyn Validator>,
     tls: Option<Arc<xray_transport::TlsAcceptor>>,
@@ -758,7 +759,10 @@ mod tests {
 
         // 3. validator + serve_vless
         let (uuid, validator) = make_validator_with_user();
-        let vless_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let vless_listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        ).await.unwrap();
         let vless_addr = vless_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
@@ -807,7 +811,10 @@ mod tests {
 
         // 空 validator（无任何用户）
         let validator: Arc<dyn Validator> = Arc::new(MemoryValidator::new());
-        let vless_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let vless_listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        ).await.unwrap();
         let vless_addr = vless_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
@@ -898,7 +905,10 @@ mod tests {
             Arc::new(DialBridge::new("freedom", make_freedom_dial_fn()))
                 as Arc<dyn xray_app_dispatcher::DispatchHandler>,
         );
-        let vless_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let vless_listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        ).await.unwrap();
         let vless_addr = vless_listener.local_addr().unwrap();
         tokio::spawn(async move {
             let _ = serve_vless(vless_listener, ohm, validator, None, None, None).await;
@@ -978,7 +988,10 @@ mod tests {
             as Arc<dyn xray_app_dispatcher::DispatchHandler>);
 
         let (uuid, validator) = make_validator_with_user();
-        let vless_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let vless_listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        ).await.unwrap();
         let vless_addr = vless_listener.local_addr().unwrap();
         let validator: Arc<dyn Validator> = validator;
         tokio::spawn(async move {
@@ -1177,7 +1190,10 @@ mod tests {
 
         // 2. validator + serve_vless
         let (uuid, validator) = make_validator_with_user();
-        let vless_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let vless_listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        ).await.unwrap();
         let vless_addr = vless_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
@@ -1385,7 +1401,10 @@ mod tests {
         ohm.set_default(capture_for_ohm);
 
         let (uuid, validator) = make_validator_with_user();
-        let vless_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let vless_listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        ).await.unwrap();
         let vless_addr = vless_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
@@ -1456,7 +1475,10 @@ mod tests {
         ohm.set_default(capture_for_ohm);
 
         let (uuid, validator) = make_validator_with_user();
-        let vless_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let vless_listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        ).await.unwrap();
         let vless_addr = vless_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
@@ -1505,7 +1527,10 @@ mod tests {
         );
 
         let (uuid, validator) = make_validator_with_user();
-        let vless_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let vless_listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        ).await.unwrap();
         let vless_addr = vless_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);

@@ -119,14 +119,14 @@ impl DotNameServer {
             ns.negative_ttl_secs.unwrap_or(0),
         ));
         cache.start_cleanup_task(crate::cache_controller::CLEANUP_INTERVAL);
-        Ok(Box::new(Self::new(
+        Ok(Box::new(Arc::new(Self::new(
             socket_addr,
             server_name,
             tls_config,
             cache,
             ns.client_ip.clone(),
             timeout_dur,
-        )))
+        ))))
     }
 
     /// 建立 DoT TLS 连接。
@@ -242,9 +242,9 @@ impl CachedNameserver for DotNameServer {
     }
 }
 
-impl Server for DotNameServer {
+impl Server for Arc<DotNameServer> {
     fn name(&self) -> &str {
-        &self.name
+        self.name.as_str()
     }
 
     fn is_disable_cache(&self) -> bool {
@@ -256,7 +256,7 @@ impl Server for DotNameServer {
         domain: &'a str,
         option: IpOption,
     ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>> {
-        Box::pin(query_ip(self, domain, option))
+        Box::pin(query_ip(self.clone(), domain, option))
     }
 }
 

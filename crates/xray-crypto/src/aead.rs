@@ -34,7 +34,7 @@ use cfb_mode::{
     BufDecryptor as CfbDecryptor, BufEncryptor as CfbEncryptor,
 };
 use chacha20::ChaCha20;
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::aead::{Aead, AeadInOut, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, XChaCha20Poly1305};
 use ctr::Ctr128BE;
 use ring::aead::{
@@ -131,6 +131,26 @@ pub trait AeadCipher {
         aad: &[u8],
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, CryptoError>;
+
+    /// Like [`Self::open`] but decrypts `ciphertext` in place and returns
+    /// the plaintext sub-slice, avoiding intermediate allocations.
+    ///
+    /// `ciphertext` must include the authentication tag; on success the
+    /// returned slice borrows the decrypted prefix of the input buffer.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::open`].
+    fn open_in_place<'a>(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        ciphertext: &'a mut [u8],
+    ) -> Result<&'a mut [u8], CryptoError> {
+        let plaintext = self.open(nonce, aad, ciphertext)?;
+        ciphertext[..plaintext.len()].copy_from_slice(&plaintext);
+        Ok(&mut ciphertext[..plaintext.len()])
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -267,6 +287,30 @@ impl AeadCipher for Aes128Gcm {
             .map_err(|_| CryptoError::AuthenticationFailed)?;
         Ok(plaintext.to_vec())
     }
+
+    fn open_in_place<'a>(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        ciphertext: &'a mut [u8],
+    ) -> Result<&'a mut [u8], CryptoError> {
+        if nonce.len() != self.nonce_size() {
+            return Err(CryptoError::InvalidNonceLength {
+                expected: self.nonce_size(),
+                actual: nonce.len(),
+            });
+        }
+        let ring_nonce = Nonce::try_assume_unique_for_key(nonce)
+            .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
+        let pt_len = ciphertext
+            .len()
+            .checked_sub(self.tag_size())
+            .ok_or(CryptoError::AuthenticationFailed)?;
+        self.key
+            .open_in_place(ring_nonce, Aad::from(aad), ciphertext)
+            .map_err(|_| CryptoError::AuthenticationFailed)?;
+        Ok(&mut ciphertext[..pt_len])
+    }
 }
 
 /// AES-256-GCM authenticated cipher (ring backend).
@@ -400,6 +444,30 @@ impl AeadCipher for Aes256Gcm {
             .open_in_place(ring_nonce, ring_aad, &mut in_out)
             .map_err(|_| CryptoError::AuthenticationFailed)?;
         Ok(plaintext.to_vec())
+    }
+
+    fn open_in_place<'a>(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        ciphertext: &'a mut [u8],
+    ) -> Result<&'a mut [u8], CryptoError> {
+        if nonce.len() != self.nonce_size() {
+            return Err(CryptoError::InvalidNonceLength {
+                expected: self.nonce_size(),
+                actual: nonce.len(),
+            });
+        }
+        let ring_nonce = Nonce::try_assume_unique_for_key(nonce)
+            .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
+        let pt_len = ciphertext
+            .len()
+            .checked_sub(self.tag_size())
+            .ok_or(CryptoError::AuthenticationFailed)?;
+        self.key
+            .open_in_place(ring_nonce, Aad::from(aad), ciphertext)
+            .map_err(|_| CryptoError::AuthenticationFailed)?;
+        Ok(&mut ciphertext[..pt_len])
     }
 }
 
@@ -893,6 +961,73 @@ impl AeadCipher for ChaCha20Poly1305Aead {
             )
             .map_err(|e| CryptoError::EncryptionError(e.to_string()))
     }
+
+    fn seal_into(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        plaintext: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), CryptoError> {
+        if nonce.len() != self.nonce_size() {
+            return Err(CryptoError::InvalidNonceLength {
+                expected: self.nonce_size(),
+                actual: nonce.len(),
+            });
+        }
+        let nonce_arr: chacha20poly1305::Nonce = nonce
+            .try_into()
+            .map_err(|_| CryptoError::InvalidNonceLength {
+                expected: self.nonce_size(),
+                actual: nonce.len(),
+            })?;
+        let start = out.len();
+        out.extend_from_slice(plaintext);
+        match self
+            .inner
+            .encrypt_inout_detached(&nonce_arr, aad, (&mut out[start..]).into())
+        {
+            Ok(tag) => {
+                out.extend_from_slice(tag.as_ref());
+                Ok(())
+            }
+            Err(e) => {
+                out.truncate(start);
+                Err(CryptoError::EncryptionError(e.to_string()))
+            }
+        }
+    }
+
+    fn open_in_place<'a>(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        ciphertext: &'a mut [u8],
+    ) -> Result<&'a mut [u8], CryptoError> {
+        if nonce.len() != self.nonce_size() {
+            return Err(CryptoError::InvalidNonceLength {
+                expected: self.nonce_size(),
+                actual: nonce.len(),
+            });
+        }
+        let nonce_arr: chacha20poly1305::Nonce = nonce
+            .try_into()
+            .map_err(|_| CryptoError::InvalidNonceLength {
+                expected: self.nonce_size(),
+                actual: nonce.len(),
+            })?;
+        let ct_len = ciphertext
+            .len()
+            .checked_sub(self.tag_size())
+            .ok_or(CryptoError::AuthenticationFailed)?;
+        let (ct, tag) = ciphertext.split_at_mut(ct_len);
+        let tag_arr = chacha20poly1305::aead::Tag::<ChaCha20Poly1305>::try_from(&*tag)
+            .map_err(|_| CryptoError::AuthenticationFailed)?;
+        self.inner
+            .decrypt_inout_detached(&nonce_arr, aad, ct.into(), &tag_arr)
+            .map_err(|_| CryptoError::AuthenticationFailed)?;
+        Ok(ct)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1086,6 +1221,37 @@ mod tests {
             ]
             .concat();
             assert_eq!(out, expected);
+        }
+    }
+
+    /// open_in_place 必须与 open 产出相同明文（原地返回借用切片），
+    /// 且拒绝篡改密文（tag 校验失败）。VMess pump 数据面依赖此 API。
+    #[test]
+    fn open_in_place_matches_open_and_rejects_tamper() {
+        let key = [5u8; 32];
+        let nonce = [6u8; 24];
+        let aad = b"hdr";
+        let plaintext = b"vmess body chunk payload";
+        let ciphers: Vec<Box<dyn AeadCipher>> = vec![
+            Box::new(Aes128Gcm::new(&[5u8; 16]).expect("aes128")),
+            Box::new(Aes256Gcm::new(&key).expect("aes256")),
+            Box::new(ChaCha20Poly1305Aead::new(&key).expect("chacha")),
+        ];
+        for cipher in &ciphers {
+            let nonce = &nonce[..cipher.nonce_size()];
+            let sealed = cipher.seal(nonce, aad, plaintext).expect("seal");
+
+            let mut buf = sealed.clone();
+            buf.extend_from_slice(b"trailing-sentinel");
+            let opened = cipher
+                .open_in_place(nonce, aad, &mut buf[..sealed.len()])
+                .expect("open_in_place");
+            assert_eq!(opened, plaintext);
+            assert_eq!(&buf[sealed.len()..], b"trailing-sentinel");
+
+            let mut tampered = sealed.clone();
+            tampered[0] ^= 0x01;
+            assert!(cipher.open_in_place(nonce, aad, &mut tampered).is_err());
         }
     }
 

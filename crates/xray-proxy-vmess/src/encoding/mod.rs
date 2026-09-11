@@ -106,13 +106,20 @@ impl ChunkNonceGenerator {
     /// 生成下一个 nonce（自增 count）。
     #[must_use]
     pub fn next(&mut self) -> Vec<u8> {
+        self.next_ref().to_vec()
+    }
+
+    /// 生成下一个 nonce 并返回其借用（自增 count）——零分配变体，
+    /// pump 热路径用本变体消每 chunk 的 Vec。字节与 [`Self::next`] 一致。
+    #[must_use]
+    pub fn next_ref(&mut self) -> &[u8] {
         let bytes = self.count.to_be_bytes();
         if self.buffer.len() >= 2 {
             self.buffer[0] = bytes[0];
             self.buffer[1] = bytes[1];
         }
         self.count = self.count.wrapping_add(1);
-        self.buffer[..self.nonce_size].to_vec()
+        &self.buffer[..self.nonce_size]
     }
 
     /// 当前 count（不递增）。
@@ -386,6 +393,16 @@ mod tests {
         let mut g = ChunkNonceGenerator::new(&[0xAA; 16], 12);
         let n = g.next();
         assert_eq!(n.len(), 12);
+    }
+
+    /// next_ref（零分配变体）与 next 字节完全一致且同步推进 count。
+    #[test]
+    fn chunk_nonce_next_ref_matches_next() {
+        let mut a = ChunkNonceGenerator::new(&[0xAA; 16], 12);
+        let mut b = ChunkNonceGenerator::new(&[0xAA; 16], 12);
+        assert_eq!(a.next_ref(), b.next().as_slice());
+        assert_eq!(a.next_ref(), b.next().as_slice());
+        assert_eq!(a.current_count(), b.current_count());
     }
 
     #[test]
