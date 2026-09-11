@@ -6,25 +6,24 @@
 //! - `Subscribe` / `Unsubscribe` 管理订阅列表
 //! - `Start` 启动 broadcast goroutine；`Close` 关闭信号 + 清空订阅
 //!
-//! ## Rust 化简化（ponytail: 最小可工作）
+//! ## Rust 化实现（对齐 Go channel.go 形态，票 qx37）
 //!
-//! 取消内部 publisher mpsc + broadcast goroutine，**`publish` 直接同步遍历订阅者
-//! `try_send`**。等价语义：
-//! - non-blocking 模式：缓冲满则丢弃（Go spawn goroutine 重试 → 简化为丢弃）
-//! - blocking 模式：缓冲满则 spawn 后台 task `tx.send().await`
+//! `publish` 将消息写入**有界内部队列**（容量 = buffer_size），由 `start` 时
+//! spawn 的**单一 worker task** 逐条 fan-out 到订阅者：
+//! - blocking 模式：worker `send().await` 阻塞送达（Go `pub.broadcast`）
+//! - 非 blocking 模式：worker `try_send`，满即丢（Go default 分支）
 //!
-//! `start` / `close` 仅切换 `running` / `closed` 原子标志。
-//! `close` 同步 drop 所有 sender → 订阅者 `recv` 立即收到 `None`。
+//! 发布端 `try_send` 满即丢，绝不 per-message spawn——订阅者消费慢时堆积
+//! 以内部队列容量为上界（Go 内部 chan 同款语义）。
 //!
-//! 这是**等价于 Go 的最简实现**：Go 的 publisher mpsc + goroutine 仅为解耦
-//! publisher 与 subscriber 速度差，Rust 端用 try_send/spawn 达到同样效果。
+//! `close` drop 内部队列 sender（worker `recv` 返回 None 退出）+ 清空订阅。
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
-use xray_features::stats::{Channel as ChannelTrait, ChannelError, ChannelSubscriber};
+use xray_features::stats::{Channel as ChannelTrait, ChannelError, ChannelMessage, ChannelSubscriber};
 
 use crate::error::log_warning;
 
@@ -67,7 +66,11 @@ impl ChannelConfig {
 /// 每个 subscriber 由 unique ID 标识（用于 unsubscribe 查找）。
 pub struct StatsChannel {
     config: ChannelConfig,
-    subscribers: Mutex<Vec<(u64, mpsc::Sender<Arc<dyn std::any::Any + Send + Sync>>)>>,
+    /// 与 worker task 共享（Arc：闭包需 'static）。
+    subscribers: Arc<Mutex<Vec<(u64, mpsc::Sender<ChannelMessage>)>>>,
+    /// 单 worker fan-out 的发布入口。`start` 时创建，`close` 时 drop
+    /// （worker `recv` 返回 None 退出）。
+    worker_tx: Mutex<Option<mpsc::Sender<ChannelMessage>>>,
     next_id: AtomicU64,
     running: AtomicBool,
     closed: AtomicBool,
@@ -79,7 +82,8 @@ impl StatsChannel {
     pub fn new(config: ChannelConfig) -> Self {
         Self {
             config,
-            subscribers: Mutex::new(Vec::new()),
+            subscribers: Arc::new(Mutex::new(Vec::new())),
+            worker_tx: Mutex::new(None),
             next_id: AtomicU64::new(1),
             running: AtomicBool::new(false),
             closed: AtomicBool::new(true), // 初始未启动等价 closed=true
@@ -91,31 +95,51 @@ impl StatsChannel {
     pub fn with_defaults() -> Self {
         Self::new(ChannelConfig::default())
     }
+
+    /// 确保单 worker 已 spawn。惰性：`tokio::spawn` 需要 runtime 上下文，
+    /// 无 runtime 的同步调用方（如纯同步单测直接 `new` + `start`）跳过——
+    /// 此时 publish 的消息直接丢弃，与 Go channel 未 Start 不投递一致。
+    fn ensure_worker(&self) {
+        let mut worker = self.worker_tx.lock();
+        if worker.is_some() {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(self.config.effective_buffer());
+        let subscribers = Arc::clone(&self.subscribers);
+        let blocking = self.config.blocking;
+        rt.spawn(async move {
+            // 锁不跨 await：每条消息先快照订阅者列表再逐个投递。
+            while let Some(msg) = rx.recv().await {
+                let subs: Vec<mpsc::Sender<ChannelMessage>> = {
+                    subscribers.lock().iter().map(|(_, tx)| tx.clone()).collect()
+                };
+                for tx in subs {
+                    if blocking {
+                        let _ = tx.send(Arc::clone(&msg)).await;
+                    } else {
+                        // 非 blocking：满即丢（与 Go default 分支一致）
+                        let _ = tx.try_send(Arc::clone(&msg));
+                    }
+                }
+            }
+        });
+        *worker = Some(tx);
+    }
 }
 
 impl ChannelTrait for StatsChannel {
-    fn publish(&self, msg: Arc<dyn std::any::Any + Send + Sync>) {
+    fn publish(&self, msg: ChannelMessage) {
         if self.closed.load(Ordering::SeqCst) {
             return;
         }
-        let subs = self.subscribers.lock();
-        for (_, tx) in subs.iter() {
-            match tx.try_send(Arc::clone(&msg)) {
-                Ok(()) => (),
-                Err(mpsc::error::TrySendError::Full(m)) => {
-                    if self.config.blocking {
-                        // spawn 后台 task 等待重试（Go blocking 模式）
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            let _ = tx.send(m).await;
-                        });
-                    }
-                    // 非 blocking 模式直接丢弃
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    // subscriber drop 了，下次清理时移除（这里静默）
-                }
-            }
+        // 单 worker fan-out（Go channel.go broadcast goroutine）：发布端只入
+        // 有界内部队列，满即丢——绝不 per-message spawn（票 qx37）。
+        self.ensure_worker();
+        if let Some(tx) = self.worker_tx.lock().as_ref() {
+            let _ = tx.try_send(msg);
         }
     }
 
@@ -164,6 +188,8 @@ impl ChannelTrait for StatsChannel {
             // 已经在跑，幂等返回 Ok
             return Ok(());
         }
+        // 有 runtime 上下文则立即建 worker；无 runtime 由 publish 惰性补建
+        self.ensure_worker();
         Ok(())
     }
 
@@ -173,6 +199,8 @@ impl ChannelTrait for StatsChannel {
             return Ok(());
         }
         self.running.store(false, Ordering::SeqCst);
+        // 停止单 worker：drop 发布入口 → worker recv 返回 None 退出
+        self.worker_tx.lock().take();
         // drop 所有 sender → 订阅者 recv 收到 None
         let mut subs = self.subscribers.lock();
         subs.clear();
@@ -418,4 +446,71 @@ mod tests {
         assert_eq!(s1.id(), 1);
         assert_eq!(s2.id(), 2);
     }
+
+    /// 票 qx37：blocking 模式满载不堆积——订阅者不消费时连发 1000 条，
+    /// 发布端始终同步返回（try_send 满即丢，无 per-message spawn），
+    /// 订阅者最终收到的条数以内部队列容量为上界（≈3 条，绝非 1000）。
+    #[test]
+    fn blocking_full_load_bounded_no_task_pileup() {
+        let c = StatsChannel::new(ChannelConfig {
+            blocking: true,
+            buffer_size: 1,
+            ..ChannelConfig::default()
+        });
+        c.start().unwrap();
+        let mut sub = c.subscribe().unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for i in 0..1000_u32 {
+                c.publish(make_msg(i));
+                // 偶尔让 worker 前进，模拟真实发布节奏
+                if i % 50 == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            }
+            // drain：确认有界
+            let mut got = 0usize;
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv()).await {
+                    Ok(Some(_)) => got += 1,
+                    _ => break,
+                }
+            }
+            assert!(got >= 1, "at least the buffered messages must be delivered");
+            assert!(
+                got <= 5,
+                "bounded fan-out must not pile up 1000 messages, got {got}"
+            );
+        });
+    }
+
+    /// 票 qx37：close 后 worker 退出（worker_tx 清空），重启后 publish
+    /// 重建 worker 并恢复投递。
+    #[test]
+    fn close_stops_worker_and_restart_recreates_it() {
+        let c = StatsChannel::with_defaults();
+        c.start().unwrap();
+        c.close().unwrap();
+        assert!(c.worker_tx.lock().is_none(), "close must drop worker entry");
+
+        // 重启后恢复投递（worker 由 runtime 内的 publish 惰性重建）
+        c.start().unwrap();
+        let mut sub = c.subscribe().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            c.publish(make_msg(7_u32));
+            let m = tokio::time::timeout(std::time::Duration::from_millis(500), sub.recv())
+                .await
+                .expect("delivery after restart");
+            assert_eq!(m.unwrap().downcast_ref::<u32>(), Some(&7));
+        });
+    }
+
 }

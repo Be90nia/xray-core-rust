@@ -176,9 +176,7 @@ impl<'v> ServerSession<'v> {
                 }
                 OpenHeaderError::Io(io) => VmessError::Io(io),
                 OpenHeaderError::Crypto { msg, should_drain, bytes_read } => {
-                    VmessError::AeadReadFailed(format!(
-                        "msg={msg}, should_drain={should_drain}, bytes_read={bytes_read}"
-                    ))
+                    VmessError::AeadReadFailed { msg, should_drain, bytes_read }
                 }
             })?;
         let header = self.parse_decoded_header_payload(&opened.payload, &user)?;
@@ -535,7 +533,13 @@ impl<'v> ServerSession<'v> {
         let len_cipher = Aes128Gcm::new(&len_key)?;
         let decrypted_len = len_cipher
             .open(len_nonce, &auth_id, enc_len_bytes)
-            .map_err(|_| VmessError::AeadReadFailed("header length decrypt failed".into()))?;
+            .map_err(|e| VmessError::AeadReadFailed {
+                msg: e.to_string(),
+                // Go encrypt.go:95：length 解密失败 → shouldDrain；此时 AEAD 层
+                // 已读 26B（18B enc_len + 8B nonce，auth_id 16B 在 decode 层读）。
+                should_drain: true,
+                bytes_read: 26,
+            })?;
         if decrypted_len.len() < 2 {
             return Err(VmessError::ReadRequestHeaderFailed);
         }
@@ -556,7 +560,9 @@ impl<'v> ServerSession<'v> {
                     VmessError::Other(format!("cmd_key length mismatch: {n}"))
                 }
                 OpenHeaderError::Io(io) => VmessError::Io(io),
-                OpenHeaderError::Crypto { msg, .. } => VmessError::AeadReadFailed(msg),
+                OpenHeaderError::Crypto { msg, should_drain, bytes_read } => {
+                    VmessError::AeadReadFailed { msg, should_drain, bytes_read }
+                }
             })?;
 
         // 6. Parse payload (shared with sync version)
@@ -826,6 +832,46 @@ mod tests {
         assert_eq!(server.request_body_key, client.request_body_key);
         assert_eq!(server.request_body_iv, client.request_body_iv);
         assert_eq!(server.response_header, client.response_header);
+    }
+
+    #[tokio::test]
+    async fn decode_async_aead_failure_reports_exact_bytes_read() {
+        // 73fr：inbound drainer 需要 AEAD 内层精确已读字节数（Go server.go:165-169
+        // OpenVMessAEADHeader 回传 bytesRead）。损坏 payload tag → 错误携带
+        // should_drain=true 与 bytes_read == 26(enc_len+nonce) + payload_enc。
+        let (validator, cmd_key) = sample_validator_with_user();
+        let history = SessionHistory::new();
+
+        let client = ClientSession::new();
+        let dest = Destination::tcp(
+            Address::ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+            Port::new(53),
+        );
+        let header = RequestHeader::new(
+            crate::encoding::VERSION,
+            Command::Tcp,
+            dest,
+            SecurityType::Aes128Gcm,
+        );
+        let sealed = client.encode_request_header(&header, &cmd_key).expect("encode");
+
+        let mut stream = sealed.clone();
+        let last = stream.len() - 1;
+        stream[last] ^= 0xFF; // 破坏 payload AEAD tag
+
+        let mut server = ServerSession::new(&validator, &history);
+        let err = server
+            .decode_request_header_async(&mut &stream[..])
+            .await
+            .unwrap_err();
+        let VmessError::AeadReadFailed { should_drain, bytes_read, .. } = err else {
+            panic!("expected AeadReadFailed for corrupted payload");
+        };
+        assert!(should_drain);
+        // cursor 重放只含 prefix(18 enc_len + 8 nonce) + payload_enc，authID 16B
+        // 已在 decode 层读且不在 cursor 内：bytes_read = 26 + payload_enc
+        // = sealed.len() - 16。
+        assert_eq!(bytes_read, sealed.len() - 16);
     }
 
     #[test]

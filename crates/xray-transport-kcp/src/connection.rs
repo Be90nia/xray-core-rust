@@ -298,8 +298,12 @@ impl Connection {
 
     /// 关闭连接（对应 Go `Connection.Close`）。
     pub fn close(&self) -> Result<()> {
-        self.inner.data_input.notify_waiters();
-        self.inner.data_output.notify_waiters();
+        // permit 语义（票 eapf）：notify_waiters 只唤醒已注册 waiter 且不留
+        // permit——close 落在 poll_read 空读与 notified 注册之间时唤醒丢失，
+        // 挂起读要等 updater 下次 transition（数秒）才醒。notify_one 留存
+        // permit，此后注册的 waiter 立即通过。
+        self.inner.data_input.notify_one();
+        self.inner.data_output.notify_one();
 
         match self.state() {
             State::ReadyToClose | State::Terminating | State::Terminated => {
@@ -322,8 +326,9 @@ impl Connection {
 
     /// 终止连接：关闭底层 socket + 释放 workers（对应 Go `Connection.Terminate`）。
     pub fn terminate(&self) {
-        self.inner.data_input.notify_waiters();
-        self.inner.data_output.notify_waiters();
+        // 同 close()：permit 语义防唤醒丢失（票 eapf）
+        self.inner.data_input.notify_one();
+        self.inner.data_output.notify_one();
         self.inner.closer.close();
         self.inner.sending_worker.release();
         self.inner.receiving_worker.release();
@@ -423,8 +428,8 @@ impl Connection {
             && current.wrapping_sub(inner.last_incoming_time.load(Ordering::SeqCst)) >= STALE_TIMEOUT_MS
         {
             // 模拟 Go `c.Close()`：仅推进状态机（不调 close() 避免重复 notify）
-            inner.data_input.notify_waiters();
-            inner.data_output.notify_waiters();
+            inner.data_input.notify_one();
+            inner.data_output.notify_one();
             inner.state.store(State::ReadyToClose as i32, Ordering::SeqCst);
             inner.state_begin_time.store(current, Ordering::SeqCst);
             inner.receiving_worker.close_read();
@@ -451,8 +456,8 @@ impl Connection {
                 inner.state_begin_time.store(current, Ordering::SeqCst);
                 inner.receiving_worker.close_read();
                 inner.sending_worker.close_write();
-                inner.data_input.notify_waiters();
-                inner.data_output.notify_waiters();
+                inner.data_input.notify_one();
+                inner.data_output.notify_one();
                 inner.closer.close();
                 inner.sending_worker.release();
                 inner.receiving_worker.release();
@@ -1195,5 +1200,45 @@ mod tests {
             other => panic!("expected ready after window reopened, got {other:?}"),
         }
         assert!(!conn.inner.sending_worker.is_empty());
+    }
+
+    /// 票 eapf：close/terminate 的唤醒必须留 permit（notify_one）。
+    /// notify_waiters 不存 permit——无 waiter 时唤醒直接丢失，之后才挂起的
+    /// 读/写等不到 EOF 通知，只能等 updater 定时 transition（数秒延迟）。
+    #[tokio::test]
+    async fn close_wakeup_leaves_permit_for_late_waiter() {
+        let (conn, _) = make_connection(1);
+        conn.close().unwrap();
+        // 修复前：notify_waiters 在无 waiter 时执行 → permit 不存在 → 永久挂起
+        tokio::time::timeout(std::time::Duration::from_millis(500), conn.inner.data_input.notified())
+            .await
+            .expect("close must leave a wakeup permit on data_input (notify_one)");
+        tokio::time::timeout(std::time::Duration::from_millis(500), conn.inner.data_output.notified())
+            .await
+            .expect("close must leave a wakeup permit on data_output");
+    }
+
+    /// 票 eapf 验收：并发 close 竞态下挂起读必须及时醒来返回 ClosedConnection，
+    /// 而非等 flush_inner 定时 transition。
+    #[tokio::test]
+    async fn close_wakes_pending_reader_promptly() {
+        let (conn, _) = make_connection(1);
+        let conn = Arc::new(conn);
+        let mut kcp = KcpConn::new(conn.clone());
+        let reader = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt as _;
+            let mut buf = [0u8; 16];
+            kcp.read(&mut buf).await
+        });
+        // 先让 reader 挂起（waiter 注册完毕），close 再到
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        conn.close().unwrap();
+        let res = tokio::time::timeout(std::time::Duration::from_millis(300), reader)
+            .await
+            .expect("pending reader must wake promptly after close, not hang until next transition");
+        assert!(
+            res.expect("join").is_err(),
+            "read must fail with closed connection after close"
+        );
     }
 }

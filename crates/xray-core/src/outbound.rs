@@ -16,7 +16,7 @@
 //! - **hysteria**：JSON 解析 → HysteriaOutboundHandler → OutboundHandlerBridge（stub dial）
 //! - **anytls**：JSON 解析 → `AnytlsClient` → `make_anytls_dial_fn`
 //! - **tuic**：JSON 解析 → TuicClient → `make_tuic_dial_fn`
-//! - **wireguard**：JSON 解析 → WireguardOutboundHandler → OutboundHandlerBridge（stub dial）
+//! - **wireguard**：JSON 解析 → `make_wireguard_dial_fn`（DialBridge；隧道内 TCP/UDP）
 //! - **dns**：JSON 解析 → `DnsDispatchBridge`（拦截 DNS 查询并转发）
 //! - **loopback**：JSON 解析 → LoopbackHandler（直接 impl DispatchHandler）
 //! - **http**：JSON 解析 `servers[0]` → `HttpOutboundConfig` → `make_http_dial_fn`
@@ -152,9 +152,10 @@ pub fn register_outbounds(
     ohm: &SimpleOhm,
     loopback_sink: Option<Arc<dyn LoopbackSink>>,
     dns: Option<Arc<xray_app_dns::DnsService>>,
-    // sm80③：出站 DialBridge 的 session policy（connIdle/uplinkOnly/downlinkOnly），
-    // 装配层（functions.rs）从 policy manager 查 level 0 得出；None = SessionDefault。
-    bridge_policy: Option<&xray_features::policy::TimeoutPolicy>,
+    // sm80③/czwu：出站 DialBridge 的 session policy（connIdle/uplinkOnly/downlinkOnly）。
+    // 非 freedom 出站查 level 0；freedom 按 settings.userLevel 查档位
+    // （Go freedom.go:222-225 h.policy()）。None = SessionDefault。
+    policy_manager: Option<&dyn xray_features::policy::PolicyManager>,
 ) -> Result<()> {
     // Phase 1: 注册所有 handler，收集需要代理链的 DialBridge 引用
     let mut chain_bridges: Vec<(Arc<DialBridge>, String)> = Vec::new(); // (bridge, chain_tag)
@@ -177,7 +178,7 @@ pub fn register_outbounds(
             &mut mux_bridges,
             dns.as_ref(),
             &inbound_default_rules,
-            bridge_policy,
+            policy_manager,
         ) {
             Ok((handler, bridge_ref, proxy_chain_tag)) => {
                 // Go proxyman/outbound/outbound.go:109-111：首个注册成功者即默认
@@ -370,9 +371,9 @@ fn wrap_bridge(
     target_strategy: Option<DomainStrategy>,
     dns: Option<&Arc<xray_app_dns::DnsService>>,
     send_through: Option<&xray_transport::system_dialer::SendThroughSpec>,
-    // sm80③：装配时查好的 session policy（对应 Go freedom.go:393 sessionPolicy
-    // 驱动 bridge 数据面 connIdle/uplinkOnly/downlinkOnly）；None = SessionDefault。
-    bridge_policy: Option<&xray_features::policy::TimeoutPolicy>,
+    // sm80③/czwu：session policy（Go freedom.go:393）。非 freedom 出站固定
+    // level 0（出站无 per-outbound userLevel，仅 freedom settings 有）。
+    policy_manager: Option<&dyn xray_features::policy::PolicyManager>,
 ) -> std::result::Result<(Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>), BuildError> {
     let dial_fn = match target_strategy {
         Some(s) => wrap_dial_with_target_strategy(dial_fn, s, dns.cloned()),
@@ -384,8 +385,8 @@ fn wrap_bridge(
         None => dial_fn,
     };
     let bridge = Arc::new(DialBridge::new(tag, dial_fn));
-    if let Some(p) = bridge_policy {
-        bridge.with_policy(p.clone());
+    if let Some(pm) = policy_manager {
+        bridge.with_policy(xray_features::policy::PolicyManager::policy_for_level(pm, 0).timeout);
     }
     let handler = Arc::clone(&bridge) as Arc<dyn DispatchHandler>;
     let bridge_ref = if proxy_chain_tag.is_some() { Some(bridge) } else { None };
@@ -550,10 +551,8 @@ fn try_build_handler(
     loopback_sink: Option<Arc<dyn LoopbackSink>>,
     mux_bridges: &mut Vec<(Arc<MuxBridge>, Option<String>)>,
     dns: Option<&Arc<xray_app_dns::DnsService>>,
-    // 入站 tag → 默认 final rule 类型（freedom 默认规则按入站协议名推导，
-    // Go getDefaultFinalRule；API 单构建路径传空表 = 无默认规则）
     inbound_default_rules: &std::collections::HashMap<String, xray_proxy_freedom::DefaultRuleType>,
-    bridge_policy: Option<&xray_features::policy::TimeoutPolicy>,
+    policy_manager: Option<&dyn xray_features::policy::PolicyManager>,
 ) -> std::result::Result<(Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>), BuildError> {
     let (handler, bridge_ref, proxy_chain_tag) = build_protocol_handler(
         ob,
@@ -561,7 +560,7 @@ fn try_build_handler(
         mux_bridges,
         dns,
         inbound_default_rules,
-        bridge_policy,
+        policy_manager,
     )?;
     if ob.entry.kind != "mux" {
         if let Some(concurrency) = outbound_mux_concurrency(ob) {
@@ -623,8 +622,9 @@ fn build_protocol_handler(
     // 入站 tag → 默认 final rule 类型（freedom 默认规则按入站协议名推导，
     // Go getDefaultFinalRule；API 单构建路径传空表 = 无默认规则）
     inbound_default_rules: &std::collections::HashMap<String, xray_proxy_freedom::DefaultRuleType>,
-    // sm80③：装配时查好的 session policy（Go freedom.go:393），注入 DialBridge
-    bridge_policy: Option<&xray_features::policy::TimeoutPolicy>,
+    // sm80③/czwu：session policy manager（Go freedom.go:393/222-225）。
+    // freedom 按 settings.userLevel 查档位，其余协议固定 level 0。
+    policy_manager: Option<&dyn xray_features::policy::PolicyManager>,
 ) -> std::result::Result<(Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>), BuildError> {
     let proxy_chain_tag = parse_proxy_chain_tag(ob.proxy_settings_json.as_ref());
     // targetStrategy（bd bqm）：字符串 → 枚举；AsIs（无策略）不包装
@@ -641,6 +641,11 @@ fn build_protocol_handler(
             let config = parse_freedom_config(&ob.entry.data);
             let noises = config.noises.clone();
             let destination_override = config.destination_override.clone();
+            let domain_strategy = config.domain_strategy;
+            // czwu③：freedom settings.userLevel → 出站腿 policy 档位
+            // （Go freedom.go:222-225 policyManager.ForLevel(config.UserLevel)）
+            let bridge_policy = policy_manager
+                .map(|pm| xray_features::policy::PolicyManager::policy_for_level(pm, config.user_level).timeout);
             // finalRules 预构建（Go Handler.Init :206-219；构建失败的项跳过）
             let final_rules: Vec<xray_proxy_freedom::FinalRule> = config
                 .final_rules
@@ -669,6 +674,7 @@ fn build_protocol_handler(
             .with_noises(noises)
             .with_destination_override(destination_override)
             .with_final_rules(final_rules)
+            .with_domain_strategy(domain_strategy)
             .with_inbound_default_rules(inbound_default_rules.clone());
             if let Some(spec) = &send_through {
                 bridge = bridge.with_send_through(spec.clone());
@@ -681,13 +687,13 @@ fn build_protocol_handler(
             let config = parse_vless_config(&ob.entry.data)?;
             let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_vless::make_vless_dial_fn(Arc::new(config));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
         }
         "trojan" => {
             let config = parse_trojan_config(&ob.entry.data)?;
             let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_trojan::make_trojan_dial_fn(Arc::new(config));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
         }
         "blackhole" => {
             let response = parse_blackhole_response(&ob.entry.data);
@@ -708,7 +714,7 @@ fn build_protocol_handler(
                 ),
             });
             let dial_fn = xray_proxy_socks::make_socks_dial_fn(client);
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
         }
         "mux" => {
             let (concurrency, via_tag) = parse_mux_config(&ob.entry.data)?;
@@ -722,14 +728,14 @@ fn build_protocol_handler(
             let config = xray_proxy_vmess::parse_vmess_config(&ob.entry.data)?;
             let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_vmess::make_vmess_dial_fn(Arc::new(config));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
         }
         "shadowsocks" => {
             let config = xray_proxy_ss::parse_ss_config(&ob.entry.data)?;
             let config =
                 config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_ss::make_ss_dial_fn(Arc::new(config));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
         }
         "hysteria" => {
             let (server_addr, auth, server_name) = parse_hysteria_config(&ob.entry.data)?;
@@ -754,13 +760,13 @@ fn build_protocol_handler(
             ).map_err(|e| format!("hysteria transport: {e}"))?
                 .with_salamander(salamander);
             let dial_fn = xray_proxy_hysteria::make_hysteria_dial_fn(config, Arc::new(transport));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
         }
         "anytls" => {
             let config = parse_anytls_config(&ob.entry.data)?;
             let client = Arc::new(xray_proxy_anytls::AnytlsClient::new(config));
             let dial_fn = xray_proxy_anytls::make_anytls_dial_fn(client);
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
         }
         "tuic" => {
             let s = parse_tuic_config(&ob.entry.data)?;
@@ -783,7 +789,7 @@ fn build_protocol_handler(
                 rustls_config,
                 options,
             );
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
         }
         "wireguard" => {
             let config = parse_wireguard_config(&ob.entry.data)?;
@@ -816,7 +822,7 @@ fn build_protocol_handler(
                 });
             let dial_fn =
                 xray_proxy_wireguard::make_wireguard_dial_fn(config, dns.cloned(), system_dialer);
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
         }
         "dns" => {
             let handler = parse_dns_outbound_config(&ob.entry.data)?;
@@ -842,28 +848,28 @@ fn build_protocol_handler(
             let config = xray_proxy_http::parse_http_config(&ob.entry.data)?;
             let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_http::make_http_dial_fn(Arc::new(config));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
         }
         "naive" => {
             let config = parse_naive_config(&ob.entry.data)?;
             let dial_fn = xray_transport_naive::make_naive_dial_fn(config);
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
         }
         "dokodemo" => {
             let config = parse_dokodemo_config(&ob.entry.data)?;
             let dial_fn = xray_proxy_dokodemo::make_dokodemo_dial_fn(config);
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
         }
         #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
         "tun" => {
             let dial_fn = xray_proxy_tun::make_tun_dial_fn();
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
         }
         #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
         "tun" => {
             Err(BuildError::Unsupported("TUN outbound is only supported on Linux/Android/FreeBSD".to_string()))
         }
-        other => Err(BuildError::Unsupported(other.to_string())),
+        _ => Err(BuildError::Unsupported(ob.entry.kind.clone())),
     }
 }
 
@@ -1185,7 +1191,7 @@ fn parse_freedom_config(data: &[u8]) -> FreedomConfig {
         .map(parse_freedom_domain_strategy)
         .unwrap_or_default();
     let fragment = v.get("fragment").and_then(parse_freedom_fragment);
-    let noises = v
+    let noises: Vec<Noise> = v
         .get("noises")
         .and_then(|n| n.as_array())
         .map(|arr| arr.iter().filter_map(parse_freedom_noise).collect())
@@ -1195,6 +1201,8 @@ fn parse_freedom_config(data: &[u8]) -> FreedomConfig {
     let destination_override = v
         .get("destinationOverride")
         .and_then(xray_proxy_freedom::DestinationOverride::from_json);
+    // userLevel（Go infra/conf/freedom.go UserLevel json 键；czwu③ 出站 policy 档位）
+    let user_level = v.get("userLevel").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
     let proxy_protocol = v
         .get("proxyProtocol")
         .and_then(|p| p.as_u64())
@@ -1220,8 +1228,7 @@ fn parse_freedom_config(data: &[u8]) -> FreedomConfig {
         domain_strategy: domain_strategy as i32,
         destination_override,
         proxy_protocol,
-        fragment,
-        noises,
+        user_level,
         final_rules,
         ..Default::default()
     }
@@ -2363,7 +2370,7 @@ fn parse_wireguard_domain_strategy(
 /// `{"secretKey":"...","peers":[{"publicKey":"...","preSharedKey":"...","endpoint":"...",
 /// "keepAlive":25,"allowedIPs":["0.0.0.0/0"]}],"mtu":1420,"reserved":[2,5,1],
 /// "domainStrategy":"ForceIP"}`。
-fn parse_wireguard_config(data: &[u8]) -> std::result::Result<DeviceConfig, String> {
+pub(crate) fn parse_wireguard_config(data: &[u8]) -> std::result::Result<DeviceConfig, String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
     let secret_key = wg_get(&v, "secretKey", "secret_key").and_then(|x| x.as_str())
         .ok_or_else(|| "missing secretKey".to_string())?;
@@ -2388,23 +2395,37 @@ fn parse_wireguard_config(data: &[u8]) -> std::result::Result<DeviceConfig, Stri
                 .map(|n| u32::try_from(n).map_err(|_| "keepAlive out of u32 range".to_string()))
                 .transpose()?
                 .unwrap_or(0);
-            // Go wireguard.go:50-54 AllowedIPs；缺省由消费侧按全路由处理，不在此展开默认 CIDR。
-            let allowed_ips = wg_get(p, "allowedIPs", "allowed_ips")
-                .and_then(|x| x.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-                .unwrap_or_default();
+            // Go wireguard.go:50-54 AllowedIPs；缺省（字段缺失）→ 全路由
+            // 双栈（Go wireguard.go:53-55 AllowedIPs == nil → 0.0.0.0/0+::0/0，
+            // bd 7v0k①）。显式空数组尊重为空。
+            let allowed_ips = match wg_get(p, "allowedIPs", "allowed_ips").and_then(|x| x.as_array())
+            {
+                Some(a) => a.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
+                None => vec!["0.0.0.0/0".to_string(), "::0/0".to_string()],
+            };
+            // Go wireguard.go:24-25 per-user Level/Email（server 模式 users 载荷）
+            let level = wg_get(p, "level", "level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            let email = wg_get(p, "email", "email").and_then(|x| x.as_str()).unwrap_or("").to_string();
             peers.push(xray_proxy_wireguard::PeerConfig {
                 public_key,
                 endpoint: endpoint.to_string(),
                 pre_shared_key,
                 keep_alive,
                 allowed_ips,
+                level,
+                email,
             });
         }
     }
+    // Go wireguard.go:75-79：address 缺省 → bogon 双栈（bd 7v0k①）
     let endpoint = v.get("address").and_then(|x| x.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-        .unwrap_or_else(|| vec!["10.0.0.2/32".to_string()]);
+        .unwrap_or_else(|| {
+            vec![
+                "10.0.0.1".to_string(),
+                "fd59:7153:2388:b5fd::1".to_string(),
+            ]
+        });
     // Go wireguard.go:106-110：MTU 0 → 消费侧 effective_mtu() 回落 1420。
     let mtu = wg_get(&v, "mtu", "mtu").and_then(|x| x.as_i64())
         .map(|n| i32::try_from(n).map_err(|_| "mtu out of i32 range".to_string()))
@@ -3034,6 +3055,47 @@ mod tests {
         let err =
             parse_wireguard_config(base(r#""domainStrategy": "bogus""#).as_bytes()).unwrap_err();
         assert!(err.contains("unsupported domain strategy"), "got {err}");
+    }
+
+    #[test]
+    fn parse_wireguard_config_go_defaults_and_user_fields() {
+        // bd 7v0k①：address 缺省 → Go bogon 双栈（wireguard.go:75-79）；
+        // allowedIPs 缺省 → 全路由双栈（wireguard.go:53-55）；level/email 键
+        // 透传（wireguard.go:24-25，Go server users 载荷）。
+        let data = format!(
+            r#"{{"secretKey": "{}", "peers": [{{"publicKey": "{}", "endpoint": "e:1",
+                "level": 2, "email": "u@wg"}}]}}"#,
+            "aa".repeat(32),
+            "bb".repeat(32),
+        );
+        let config = parse_wireguard_config(data.as_bytes()).unwrap();
+        assert_eq!(
+            config.endpoint,
+            vec!["10.0.0.1", "fd59:7153:2388:b5fd::1"],
+            "address 缺省 = Go bogon 双栈"
+        );
+        assert_eq!(
+            config.peers[0].allowed_ips,
+            vec!["0.0.0.0/0", "::0/0"],
+            "allowedIPs 缺省 = 全路由双栈"
+        );
+        assert_eq!(config.peers[0].level, 2);
+        assert_eq!(config.peers[0].email, "u@wg");
+    }
+
+    #[test]
+    fn parse_wireguard_config_explicit_empty_allowedips_respected() {
+        // Go：显式空数组（非 nil）不展开缺省全路由
+        let data = format!(
+            r#"{{"secretKey": "{}", "peers": [{{"publicKey": "{}", "endpoint": "e:1", "allowedIPs": []}}]}}"#,
+            "aa".repeat(32),
+            "bb".repeat(32),
+        );
+        let config = parse_wireguard_config(data.as_bytes()).unwrap();
+        assert!(
+            config.peers[0].allowed_ips.is_empty(),
+            "显式空 allowedIPs 尊重为空"
+        );
     }
 
     #[test]
@@ -4563,5 +4625,121 @@ mod tests {
         assert_eq!(&acc[off + 2..off + 4], &0x2222u16.to_be_bytes());
         assert_eq!(l1, q1.len(), "frame1 length");
         assert_eq!(l2, q2.len(), "frame2 length");
+    }
+
+    /// bd czwu③：freedom settings.userLevel 决定出站 DialBridge policy 档位
+    /// （Go freedom.go:222-225 policyManager.ForLevel(config.UserLevel)）。
+    /// 行为断言：userLevel=3（connIdle=1s）的出站腿空载 ~1s 断连；
+    /// 对照 userLevel=0（SessionDefault 300s）同窗口不断。
+    #[tokio::test]
+    async fn freedom_user_level_drives_conn_idle() {
+        use std::collections::HashMap;
+        use xray_proto::xray::app::policy::policy::Timeout as PolicyTimeout;
+        let mut levels = HashMap::new();
+        levels.insert(
+            3u32,
+            xray_proto::xray::app::policy::Policy {
+                timeout: Some(PolicyTimeout {
+                    handshake: None,
+                    connection_idle: Some(xray_proto::xray::app::policy::Second { value: 1 }),
+                    uplink_only: None,
+                    downlink_only: None,
+                }),
+                stats: None,
+                buffer: None,
+            },
+        );
+        let feat = xray_app_policy::PolicyFeature::new(xray_proto::xray::app::policy::Config {
+            level: levels,
+            system: None,
+        })
+        .unwrap();
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = echo.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 256];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if sock.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let build = |settings: &str| {
+            try_build_handler(
+                &make_outbound("freedom", "direct", settings),
+                None,
+                &mut Vec::new(),
+                None,
+                &std::collections::HashMap::new(),
+                Some(&feat),
+            )
+            .unwrap()
+            .0
+        };
+        let dest = Destination::tcp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(echo_port));
+        let pipe_opt = xray_buf::pipe::PipeOption::default();
+        let new_link = || {
+            let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
+            let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
+            (
+                xray_transport::link::Link::new(
+                    Box::new(up_r) as Box<dyn xray_buf::io::Reader>,
+                    Box::new(dn_w) as Box<dyn xray_buf::io::Writer>,
+                ),
+                dn_r,
+            )
+        };
+
+        // userLevel=3 → connIdle=1s：空载出站腿 ~1s 后断（EOF）
+        let (link, mut dn_r) = new_link();
+        let handler = build(r#"{"userLevel":3}"#);
+        let task = tokio::spawn(handler.dispatch_with_access(
+            &dest,
+            link,
+            xray_app_dispatcher::AccessContext::default(),
+        ));
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match dn_r.read_multi_buffer().await {
+                    Ok(mb) if !mb.is_empty() => continue,
+                    _ => break,
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "userLevel=3 connIdle=1s must close idle outbound leg");
+        let _ = task.await;
+
+        // 对照 userLevel=0 → SessionDefault 300s：同窗口不断
+        let (link, mut dn_r) = new_link();
+        let handler = build("{}");
+        let task = tokio::spawn(handler.dispatch_with_access(
+            &dest,
+            link,
+            xray_app_dispatcher::AccessContext::default(),
+        ));
+        let still_open = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                match dn_r.read_multi_buffer().await {
+                    Ok(mb) if !mb.is_empty() => continue,
+                    _ => break,
+                }
+            }
+        })
+        .await;
+        assert!(still_open.is_err(), "userLevel=0 default 300s must stay open in 3s window");
+        task.abort();
     }
 }

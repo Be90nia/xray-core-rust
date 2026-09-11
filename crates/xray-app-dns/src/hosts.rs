@@ -24,12 +24,16 @@ use crate::error::DnsError;
 /// - 否则为重定向目标域名。
 #[derive(Debug, Clone)]
 pub struct HostMapping {
-    /// 匹配的源域名。
+    /// 匹配的源域名（`matcher_rules` 为空时按 Domain 后缀匹配注册）。
     pub domain: String,
     /// 匹配返回的 IP 列表（与 `proxied_domain` 互斥）。
     pub ips: Vec<IpAddr>,
     /// 重定向域名或 `#<rcode>`。
     pub proxied_domain: String,
+    /// 展开后的 matcher 规则（Go hosts key 全前缀语法：`full:`/`domain:`/
+    /// `regexp:`/`geosite:` 等，infra/conf/dns.go:254-266 ParseDomainRule）。
+    /// 空 = 无前缀 key，按 `domain` 字段走 Domain 后缀匹配（旧路径）。
+    pub matcher_rules: Vec<(xray_geodata::matcher::domain::DomainType, String)>,
 }
 
 /// 静态 hosts 表。对应 Go `StaticHosts`。
@@ -94,7 +98,17 @@ impl StaticHosts {
         let rules: Vec<DomainRule> = mappings
             .iter()
             .enumerate()
-            .map(|(i, m)| DomainRule::domain(m.domain.to_lowercase(), i as u32))
+            .flat_map(|(i, m)| {
+                if m.matcher_rules.is_empty() {
+                    // 无前缀 key：Domain 后缀匹配（example.com 匹配自身与全部子域）。
+                    vec![DomainRule::domain(m.domain.to_lowercase(), i as u32)]
+                } else {
+                    m.matcher_rules
+                        .iter()
+                        .map(|(dt, v)| DomainRule::new(*dt, v.clone(), i as u32))
+                        .collect()
+                }
+            })
             .collect();
         let matcher: Box<dyn DomainMatcher> = Box::new(
             MphDomainMatcher::build(&rules).map_err(|e| {
@@ -221,6 +235,7 @@ pub fn parse_system_hosts(content: &str) -> Vec<HostMapping> {
             domain,
             ips,
             proxied_domain: String::new(),
+            matcher_rules: Vec::new(),
         })
         .collect()
 }
@@ -274,6 +289,7 @@ mod tests {
             domain: domain.to_string(),
             ips,
             proxied_domain: String::new(),
+            matcher_rules: Vec::new(),
         }
     }
 
@@ -282,6 +298,7 @@ mod tests {
             domain: domain.to_string(),
             ips: Vec::new(),
             proxied_domain: target.to_string(),
+            matcher_rules: Vec::new(),
         }
     }
 
@@ -348,6 +365,7 @@ mod tests {
             domain: "blocked.com".to_string(),
             ips: Vec::new(),
             proxied_domain: "#3".to_string(), // NX_DOMAIN
+            matcher_rules: Vec::new(),
         }])
         .unwrap();
         match h.lookup("blocked.com", IpOption::all()) {

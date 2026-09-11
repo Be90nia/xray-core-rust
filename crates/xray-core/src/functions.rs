@@ -256,16 +256,15 @@ async fn start_full_dispatched(
         xray_features::policy::Policy::default(),
         None,
     );
-    // sm80③：出站 DialBridge 的 session policy（Go freedom.go:393 sessionPolicy
-    // 驱动 bridge connIdle/uplinkOnly/downlinkOnly）。装配时查 level 0（出站
-    // dispatch 签名无 user level，per-user 随 UDP dispatch 一并 deferred）。
+    // sm80③/czwu：出站 DialBridge 的 session policy manager（Go freedom.go:393
+    // sessionPolicy 驱动 bridge connIdle/uplinkOnly/downlinkOnly）。非 freedom
+    // 出站查 level 0；freedom 按 settings.userLevel 查档位（outbound.rs 内）。
     let pm_opt = instance.get_feature::<xray_app_policy::PolicyFeature>();
-    let bridge_policy = pm_opt
-        .as_ref()
-        .map(|pm| xray_features::policy::PolicyManager::policy_for_level(pm.as_ref(), 0).timeout);
-    if let Some(pm) = pm_opt {
-        dispatcher.set_policy_manager(pm);
+    if let Some(pm) = pm_opt.as_ref() {
+        dispatcher.set_policy_manager(Arc::clone(pm) as Arc<dyn xray_features::policy::PolicyManager>);
     }
+    let policy_manager: Option<&dyn xray_features::policy::PolicyManager> =
+        pm_opt.as_ref().map(|p| &**p as &dyn xray_features::policy::PolicyManager);
     dispatcher.stats = instance
         .get_feature::<crate::register::AppStatsFeature>()
         .map(|f| f as Arc<dyn xray_features::stats::Manager>);
@@ -313,7 +312,7 @@ async fn start_full_dispatched(
         &ohm,
         Some(loopback_sink),
         instance.get_feature::<xray_app_dns::DnsService>(),
-        bridge_policy.as_ref(),
+        policy_manager,
     )?;
     // 此次 init_dependencies 与 instance.new_from_built 里的第一次是幂等
     // 的（已 set_io 的 feature 跳过），允许双阶段注入。

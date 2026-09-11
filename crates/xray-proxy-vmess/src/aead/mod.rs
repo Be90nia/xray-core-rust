@@ -416,7 +416,7 @@ pub fn open_vmess_aead_header<R: std::io::Read>(
         ],
     );
     let len_nonce = &len_iv_full[..12];
-    let len_cipher = Aes128Gcm::new(&len_key).map_err(|e| OpenHeaderError::Crypto { msg: e.to_string(), should_drain: true, bytes_read: 0 })?;
+    let len_cipher = Aes128Gcm::new(&len_key).map_err(|e| OpenHeaderError::Crypto { msg: e.to_string(), should_drain: true, bytes_read })?;
     let decrypted_len_bytes = match len_cipher.open(len_nonce, auth_id, &encrypted_len) {
         Ok(v) => v,
         Err(e) => {
@@ -452,13 +452,15 @@ pub fn open_vmess_aead_header<R: std::io::Read>(
         ],
     );
     let payload_nonce = &payload_iv_full[..12];
-    let payload_cipher = Aes128Gcm::new(&payload_key).map_err(|e| OpenHeaderError::Crypto { msg: e.to_string(), should_drain: false, bytes_read: 0 })?;
+    let payload_cipher = Aes128Gcm::new(&payload_key).map_err(|e| OpenHeaderError::Crypto { msg: e.to_string(), should_drain: true, bytes_read })?;
     let payload = match payload_cipher.open(payload_nonce, auth_id, &encrypted_payload) {
         Ok(v) => v,
         Err(e) => {
             return Err(OpenHeaderError::Crypto {
                 msg: e.to_string(),
-                should_drain: false,
+                // Go encrypt.go:128：payload 解密失败也要求 drain（防 AEAD 失败
+                // 字节计数指纹）；读流失败（Io）才跳过（Go encrypt.go:112 false）。
+                should_drain: true,
                 bytes_read,
             });
         }
@@ -916,5 +918,28 @@ mod tests {
         let mut reader = &truncated[16..];
         let err = open_vmess_aead_header(&cmd_key, &auth_id, &mut reader).unwrap_err();
         assert!(matches!(err, OpenHeaderError::Io(_)));
+    }
+
+    #[test]
+    fn open_header_corrupted_payload_drains_with_exact_bytes_read() {
+        // kglv（Go encrypt.go:128）：payload 解密失败 → should_drain=true（读流
+        // 失败才是 false）。73fr（Go encrypt_test.go:45）：bytes_read == AEAD 层
+        // 精确已读 = 18(enc_len) + 8(nonce) + payload_enc，不含 authID 16B。
+        let cmd_key = sample_cmd_key();
+        let sealed = seal_vmess_aead_header(&cmd_key, b"payload_data", now_unix()).expect("seal");
+
+        let mut corrupted = sealed.clone();
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0xFF; // 破坏 payload AEAD tag（length 段保持完好）
+
+        let mut auth_id = [0u8; 16];
+        auth_id.copy_from_slice(&corrupted[..16]);
+        let mut reader: &[u8] = &corrupted[16..];
+        let err = open_vmess_aead_header(&cmd_key, &auth_id, &mut reader).unwrap_err();
+        let OpenHeaderError::Crypto { should_drain, bytes_read, .. } = err else {
+            panic!("expected Crypto error for corrupted payload tag");
+        };
+        assert!(should_drain, "payload decrypt failure must drain (Go encrypt.go:128)");
+        assert_eq!(bytes_read, sealed.len() - 16);
     }
 }

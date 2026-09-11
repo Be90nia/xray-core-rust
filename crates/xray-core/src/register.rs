@@ -406,9 +406,11 @@ fn metrics_factory() -> FeatureFactory {
         let json_cfg: xray_conf::app_config::MetricsConfig =
             serde_json::from_slice(data).unwrap_or_default();
 
+        // hfwq：Go metrics.go:8-11 tag 字段接线（listen 兼容形态；inbound
+        // handler 供路由暴露属架构接线，与 4qjw 同类设计先行票，此处只保字段不丢）。
         let proto = xray_proto::xray::app::metrics::Config {
-            tag: String::new(),
-            listen: json_cfg.listen.unwrap_or_default(),
+            tag: json_cfg.tag.clone().unwrap_or_default(),
+            listen: json_cfg.listen.clone().unwrap_or_default(),
         };
 
         let config = xray_app_metrics::MetricsConfig::from_proto(&proto);

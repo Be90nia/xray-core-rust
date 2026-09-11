@@ -110,10 +110,14 @@ fn parse_reality_config(json: Option<&serde_json::Value>) -> io::Result<RealityC
         .get("serverName")
         .and_then(|v| v.as_str())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "reality: missing serverName"))?;
-    let public_key_b64 = obj
-        .get("publicKey")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "reality: missing publicKey"))?;
+    // 257w：password 代 publicKey 别名（Go transport_security.go:190-192，
+    // password 非空时覆盖 publicKey）；缺省报错文案对齐 Go 用 "password" 字样。
+    let public_key_b64 = match obj.get("password").and_then(|v| v.as_str()) {
+        Some(p) if !p.is_empty() => p,
+        _ => obj.get("publicKey").and_then(|v| v.as_str()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "reality: empty password")
+        })?,
+    };
     let fingerprint = obj
         .get("fingerprint")
         .and_then(|v| v.as_str())
@@ -136,15 +140,92 @@ fn parse_reality_config(json: Option<&serde_json::Value>) -> io::Result<RealityC
             )
         })?
     };
+    // 257w：mldsa65Verify 配置期校验（Go transport_security.go:209-213，
+    // base64 RawURL 解码 + 1952B 公钥），配错即拒启而非静默忽略。
+    let mldsa65_verify = match obj.get("mldsa65Verify").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => {
+            let der = base64_url_decode(s).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("reality: invalid mldsa65Verify: {s}"),
+                )
+            })?;
+            if der.len() != 1952 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("reality: invalid mldsa65Verify: need 1952B public key, got {}B", der.len()),
+                ));
+            }
+            der
+        }
+        _ => Vec::new(),
+    };
+    // 257w：spiderX → SpiderY 行为参数（Go transport_security.go:214-242）。
+    // 默认 "/"；必须以 '/' 开头；query 参数 p/c/t/i/r（单值或 a-b 区间）写入
+    // spider_y[10] 对应槽位（解析失败取 0 对齐 Go `_, _ :=`），消费后从 query 剔除。
+    let spider_x_raw = obj.get("spiderX").and_then(|v| v.as_str()).unwrap_or("/");
+    if !spider_x_raw.starts_with('/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("reality: invalid spiderX: {spider_x_raw}"),
+        ));
+    }
+    let (spider_x, spider_y) = parse_spider_x(spider_x_raw);
 
     Ok(RealityConfig {
         fingerprint: fingerprint.to_string(),
         server_name: server_name.to_string(),
         public_key,
         short_id,
+        mldsa65_verify,
+        spider_x,
+        spider_y,
         ..Default::default()
     })
 }
+
+/// spiderX 路径+query 拆解：p/c/t/i/r → spider_y 槽位（0-1/2-3/4-5/6-7/8-9），
+/// 剩余 query 按原顺序保留在返回的 spider_x 中（Go 端经 url.Encode 重排序，
+/// 该字段目前仅 spider 爬行消费，Rust 端未实现爬行，保留原序足够）。
+fn parse_spider_x(raw: &str) -> (String, Vec<i64>) {
+    let mut spider_y = vec![0i64; 10];
+    let (path, query) = match raw.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => return (raw.to_string(), spider_y),
+    };
+    let param_slot = |k: &str| match k {
+        "p" => Some(0),
+        "c" => Some(2),
+        "t" => Some(4),
+        "i" => Some(6),
+        "r" => Some(8),
+        _ => None,
+    };
+    let mut kept = Vec::new();
+    for pair in query.split('&').filter(|s| !s.is_empty()) {
+        let Some((k, v)) = pair.split_once('=') else {
+            kept.push(pair);
+            continue;
+        };
+        match param_slot(k) {
+            Some(slot) if !v.is_empty() => {
+                let mut parts = v.splitn(2, '-');
+                let lo = parts.next().unwrap_or("").parse::<i64>().unwrap_or(0);
+                let hi = parts.next().map(|s| s.parse::<i64>().unwrap_or(0)).unwrap_or(lo);
+                spider_y[slot] = lo;
+                spider_y[slot + 1] = hi;
+            }
+            _ => kept.push(pair),
+        }
+    }
+    let spider_x = if kept.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{}", kept.join("&"))
+    };
+    (spider_x, spider_y)
+}
+
 
 /// base64 RawURL 解码（无 padding，兼容 std 变体）。对应 Go `base64.RawURLEncoding.DecodeString`。
 fn base64_url_decode(s: &str) -> Option<Vec<u8>> {
@@ -286,5 +367,100 @@ mod tests {
         assert_eq!(base64_url_decode(&std_enc).unwrap().len(), 32);
         // 非法 → None
         assert!(base64_url_decode("!!!not-base64!!!").is_none());
+    }
+    /// 257w：password 代 publicKey（Go transport_security.go:190-192）。
+    #[test]
+    fn parse_reality_config_password_alias() {
+        let raw = [0x11u8; 32];
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
+        // 仅 password
+        let json = serde_json::json!({"serverName": "a.com", "password": b64});
+        let cfg = parse_reality_config(Some(&json)).expect("password alias accepted");
+        assert_eq!(cfg.public_key, raw);
+        // password 在场时覆盖 publicKey（Go 语义：非空 password 直接赋给 PublicKey）
+        let raw2 = [0x22u8; 32];
+        let b64_2 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw2);
+        let json = serde_json::json!({
+            "serverName": "a.com",
+            "publicKey": b64,
+            "password": b64_2
+        });
+        let cfg = parse_reality_config(Some(&json)).expect("password overrides publicKey");
+        assert_eq!(cfg.public_key, raw2);
+        // 两者都缺 → 报 "password" 字样（Go :194 empty "password"）
+        let json = serde_json::json!({"serverName": "a.com"});
+        let err = parse_reality_config(Some(&json)).unwrap_err();
+        assert!(err.to_string().contains("password"), "got: {err}");
+    }
+
+    /// 257w：mldsa65Verify base64 + 1952B 校验（Go transport_security.go:209-213）。
+    #[test]
+    fn parse_reality_config_mldsa65_verify() {
+        // 合法 1952B
+        let der = vec![0x5Au8; 1952];
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&der);
+        let json = serde_json::json!({
+            "serverName": "a.com",
+            "publicKey": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]),
+            "mldsa65Verify": b64
+        });
+        let cfg = parse_reality_config(Some(&json)).expect("valid mldsa65Verify accepted");
+        assert_eq!(cfg.mldsa65_verify, der);
+        // 长度错（≠1952）→ 拒
+        let b64_short = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x5Au8; 32]);
+        let json = serde_json::json!({
+            "serverName": "a.com",
+            "publicKey": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]),
+            "mldsa65Verify": b64_short
+        });
+        let err = parse_reality_config(Some(&json)).unwrap_err();
+        assert!(err.to_string().contains("mldsa65Verify"), "got: {err}");
+        // 非 base64 → 拒
+        let json = serde_json::json!({
+            "serverName": "a.com",
+            "publicKey": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]),
+            "mldsa65Verify": "!!!not-base64!!!"
+        });
+        let err = parse_reality_config(Some(&json)).unwrap_err();
+        assert!(err.to_string().contains("mldsa65Verify"), "got: {err}");
+    }
+
+    /// 257w：spiderX 默认 "/"、'/' 前缀硬错、p/c/t/i/r → spider_y 槽位
+    /// （Go transport_security.go:214-242）。
+    #[test]
+    fn parse_reality_config_spider_x() {
+        let pub_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let mk = |spider: &str| {
+            serde_json::json!({
+                "serverName": "a.com",
+                "publicKey": pub_b64,
+                "spiderX": spider
+            })
+        };
+        // 缺省 → "/" 且 spider_y 全零
+        let cfg = parse_reality_config(Some(&serde_json::json!({
+            "serverName": "a.com", "publicKey": pub_b64
+        })))
+        .unwrap();
+        assert_eq!(cfg.spider_x, "/");
+        assert_eq!(cfg.spider_y, vec![0i64; 10]);
+        // 非 '/' 开头 → 拒
+        let err = parse_reality_config(Some(&mk("http://evil.com"))).unwrap_err();
+        assert!(err.to_string().contains("spiderX"), "got: {err}");
+        // 单值 → 区间两端同值；区间 → 两端；消费后 query 剔除
+        let cfg = parse_reality_config(Some(&mk("/x?g=1&p=5&t=10-20&r=3"))).unwrap();
+        assert_eq!(cfg.spider_y[0], 5);
+        assert_eq!(cfg.spider_y[1], 5); // 单值双槽同值
+        assert_eq!(cfg.spider_y[4], 10);
+        assert_eq!(cfg.spider_y[5], 20); // 区间
+        assert_eq!(cfg.spider_y[8], 3);
+        assert_eq!(cfg.spider_y[9], 3);
+        assert_eq!(cfg.spider_y[2], 0); // c 未配
+        assert_eq!(cfg.spider_x, "/x?g=1"); // p/t/r 已消费，未知参数 g 保留
+        // 非数值 → 0（Go `_, _ :=` 宽松语义）
+        let cfg = parse_reality_config(Some(&mk("/?p=abc"))).unwrap();
+        assert_eq!(cfg.spider_y[0], 0);
+        assert_eq!(cfg.spider_y[1], 0);
+        assert_eq!(cfg.spider_x, "/");
     }
 }

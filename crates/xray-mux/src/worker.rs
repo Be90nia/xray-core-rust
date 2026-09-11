@@ -1,13 +1,13 @@
 //! Mux 服务端
 //!
-//! 对应 Go 版本 `common/mux/server.go`，实现 Mux 服务端帧处理、KeepAlive 和空闲超时。
+//! 对应 Go 版本 `common/mux/server.go`，实现 Mux 服务端帧处理与空闲 monitor。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::watch;
 use tokio::time::Duration;
-use tracing::warn;
+use tracing::{debug, warn};
 use xray_buf::io::{Reader, Writer};
 use xray_buf::reader::BufferedReader;
 use xray_buf::writer::BufferedWriter;
@@ -21,8 +21,8 @@ use crate::writer::MuxWriter;
 use xray_buf::buffer::Buffer;
 use xray_buf::multi::MultiBuffer;
 
-/// 服务端 KeepAlive 间隔（60 秒）。
-pub const SERVER_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
+/// 服务端 monitor 间隔（60 秒，Go server.go:101 `time.NewTicker(60s)`）。
+pub const SERVER_MONITOR_INTERVAL: Duration = Duration::from_secs(60);
 
 #[async_trait::async_trait]
 pub trait Dispatcher: Send + Sync {
@@ -112,9 +112,12 @@ pub struct ServerWorker {
     dispatcher: Arc<dyn Dispatcher>,
     session_manager: Arc<SessionManager>,
     xudp_manager: Arc<XUDPManager>,
-    closed: AtomicBool,
+    closed: Arc<AtomicBool>,
     done_tx: watch::Sender<bool>,
     done_rx: watch::Receiver<bool>,
+    /// Reverse-mux：解析 New 帧的 source/local（Go `handleStatusNew` 的
+    /// `IsReverseMuxFromContext` 分支）。
+    read_source_and_local: bool,
 }
 
 impl ServerWorker {
@@ -129,9 +132,10 @@ impl ServerWorker {
             dispatcher,
             session_manager: Arc::new(SessionManager::new()),
             xudp_manager: Arc::new(xudp_manager),
-            closed: AtomicBool::new(false),
+            closed: Arc::new(AtomicBool::new(false)),
             done_tx,
             done_rx,
+            read_source_and_local: false,
         }
     }
 
@@ -143,6 +147,13 @@ impl ServerWorker {
     pub fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
         let _ = self.done_tx.send(true);
+    }
+
+    /// 启用 Reverse-mux New 帧的 source/local 解析（reverse BridgeWorker 用）。
+    #[must_use]
+    pub fn with_read_source_and_local(mut self) -> Self {
+        self.read_source_and_local = true;
+        self
     }
 
     #[must_use]
@@ -158,69 +169,50 @@ impl ServerWorker {
         self.done_rx.clone()
     }
 
-    /// 启动 KeepAlive 定时发送和空闲超时检查任务。
+    /// 启动 Go `ServerWorker.monitor`（server.go:122-140）等价任务。
     ///
-    /// 返回两个 JoinHandle：keepalive 任务和 idle_timeout 任务。
-    /// 调用方负责在适当时机 abort。
-    pub fn spawn_keepalive_and_idle_timeout(
+    /// Go 双端从不发送 KeepAlive 帧；monitor 每 60s 快照 size/count，tick 时
+    /// 「当前无会话 && 快照 size==0 && count 未变」→ 关闭整条 carrier
+    /// （done → 清理会话 + 丢弃 carrier 写端，Go :129-133）。返回 JoinHandle
+    /// 供调用方 abort。
+    pub fn spawn_monitor(
         &self,
         link_writer: Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>>,
-    ) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+    ) -> tokio::task::JoinHandle<()> {
         let session_manager = Arc::clone(&self.session_manager);
         let done_rx = self.done_rx.clone();
-        let lw_keepalive = link_writer.clone();
-
-        // KeepAlive 定时发送
-        let keepalive_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(SERVER_KEEPALIVE_INTERVAL);
-            let mut done = done_rx;
+        let done_tx = self.done_tx.clone();
+        let closed = Arc::clone(&self.closed);
+        tokio::spawn(async move {
+            // Go time.Ticker 首 tick 在 60s 后；interval_at 对齐
+            let mut ticker = tokio::time::interval_at(
+                tokio::time::Instant::now() + SERVER_MONITOR_INTERVAL,
+                SERVER_MONITOR_INTERVAL,
+            );
             loop {
+                // tick 前快照（Go :126-127，容忍 tick 间隙分配-释放竞态）
+                let check_size = session_manager.size().await;
+                let check_count = session_manager.count();
                 tokio::select! {
-                    _ = done.changed() => break,
-                    _ = interval.tick() => {
-                        // 向所有活跃 session 发送 KeepAlive 帧
-                        let sessions = session_manager.active_sessions().await;
-                        for session in sessions {
-                            if session.is_closed() { continue; }
-                            let meta = FrameMetadata::keep_alive(session.id());
-                            let mut vec = Vec::new();
-                            if meta.write_to(&mut vec).is_err() { continue; }
-                            let mb = MultiBuffer::from_buffer(Buffer::from_vec(vec));
-                            let mut wg = lw_keepalive.lock().await;
-                            if let Some(ref mut writer) = *wg {
-                                let _ = writer.write_multi_buffer(mb).await;
-                            }
+                    _ = crate::client::wait_done(done_rx.clone()) => {
+                        session_manager.close().await;
+                        link_writer.lock().await.take();
+                        return;
+                    }
+                    _ = ticker.tick() => {
+                        if session_manager
+                            .close_if_no_session_and_idle(check_size, check_count)
+                            .await
+                        {
+                            // Go done.Close()：置 closed + 广播 done（等价
+                            // ServerWorker::close；is_closed 观察原子标志）
+                            closed.store(true, Ordering::Relaxed);
+                            let _ = done_tx.send(true);
                         }
                     }
                 }
             }
-        });
-
-        let session_manager2 = Arc::clone(&self.session_manager);
-        let done_rx2 = self.done_rx.clone();
-
-        // 空闲超时检查
-        let idle_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            let mut done = done_rx2;
-            loop {
-                tokio::select! {
-                    _ = done.changed() => break,
-                    _ = interval.tick() => {
-                        let sessions = session_manager2.active_sessions().await;
-                        for session in sessions {
-                            if session.is_closed() { continue; }
-                            if session.is_idle_timeout(crate::session::SESSION_IDLE_TIMEOUT).await {
-                                warn!("session {} idle timeout, closing", session.id());
-                                session.close().await;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        (keepalive_handle, idle_handle)
+        })
     }
 
     /// Handle normal New frame (non-XUDP).
@@ -370,7 +362,7 @@ impl ServerWorker {
             Box::new(crate::writer::SharedWriter::new(Arc::clone(&link_writer))),
             session.transfer_type(),
         );
-        let mut done = session.done_receiver();
+        let done = session.done_receiver();
         loop {
             let mut input = session.input().await;
             let Some(reader) = input.as_mut() else { break };
@@ -393,7 +385,6 @@ impl ServerWorker {
             }
             let byte_count = mb.len() as u64;
             session.add_downlink_bytes(byte_count);
-            session.touch_active().await;
             if rw.write(mb).await.is_err() {
                 rw.set_error();
                 break;
@@ -416,8 +407,14 @@ impl ServerWorker {
         reader: &mut BufferedReader,
         link_writer: &Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>>,
     ) -> Result<bool, ServerError> {
-        // 1. 读 2B length（EOF 返 Ok(false) 表示干净关闭）
-        let len_buf = match Self::read_exact_async(reader, 2).await {
+        // 1. 读 2B length（EOF 返 Ok(false) 表示干净关闭）。select done：
+        // monitor 空闲关闭 carrier 后读循环立即退出（Go run() 帧间检查
+        // done 的等价），不挂在底层 I/O 上
+        let first_read = tokio::select! {
+            _ = crate::client::wait_done(self.done_rx.clone()) => return Ok(false),
+            r = Self::read_exact_async(reader, 2) => r,
+        };
+        let len_buf = match first_read {
             Ok(b) => b,
             Err(ServerError::InvalidFrame(msg)) if msg.starts_with("EOF") => return Ok(false),
             Err(e) => return Err(e),
@@ -432,8 +429,13 @@ impl ServerWorker {
         let mut full = Vec::with_capacity(2 + meta_len);
         full.extend_from_slice(&len_buf);
         full.extend_from_slice(&body);
-        let (meta, _) = FrameMetadata::read_from_bytes(&full)
-            .map_err(|e| ServerError::InvalidFrame(format!("parse meta: {:?}", e)))?;
+        let parse = if self.read_source_and_local {
+            FrameMetadata::read_from_bytes_with_source(&full)
+        } else {
+            FrameMetadata::read_from_bytes(&full)
+        };
+        let (meta, _) =
+            parse.map_err(|e| ServerError::InvalidFrame(format!("parse meta: {:?}", e)))?;
         // 4. 如有 data，读 data（2B size + payload）
         let data = if meta.has_data() {
             let size_buf = Self::read_exact_async(reader, 2).await?;
@@ -445,6 +447,16 @@ impl ServerWorker {
         // 5. 按 status 分发
         match meta.session_status() {
             SessionStatus::New => {
+                // Reverse-mux：Go handleStatusNew（:166-174）据 source/local
+                // 覆写 inbound ctx 供日志；Rust dispatcher 无 ctx 管道，先落日志
+                if let (Some(source), Some(local)) = (meta.source(), meta.local()) {
+                    debug!(
+                        session = meta.session_id(),
+                        source = %source,
+                        local = %local,
+                        "reverse mux inbound"
+                    );
+                }
                 if meta.is_udp_target() && meta.global_id().is_some() {
                     let gid = *meta.global_id().unwrap();
                     self.handle_xudp_new(&meta, data, link_writer, gid).await?;
@@ -475,9 +487,8 @@ impl ServerWorker {
             Some(s) => s,
             None => return Ok(()),
         };
-        // 更新流量统计和活跃时间
+        // 更新流量统计
         session.add_uplink_bytes(data_len);
-        session.touch_active().await;
         let mut guard = session.output().await;
         if let Some(ref mut writer) = *guard {
             let mb = MultiBuffer::from_buffer(Buffer::from_vec(data));
@@ -539,8 +550,77 @@ mod tests {
     }
 
     #[test]
-    fn test_server_keepalive_interval() {
-        assert_eq!(SERVER_KEEPALIVE_INTERVAL, Duration::from_secs(60));
+    fn test_server_monitor_interval() {
+        assert_eq!(SERVER_MONITOR_INTERVAL, Duration::from_secs(60));
+    }
+
+    /// 验收：空载 carrier 60s 关闭（Go monitor，server.go:122-140）。
+    /// 双端不发 KeepAlive；「无会话且 count 不变」→ 关整条 carrier。
+    #[tokio::test(start_paused = true)]
+    async fn monitor_closes_idle_empty_carrier_after_60s() {
+        let worker = Arc::new(ServerWorker::new(Arc::new(MockDispatcher)));
+        let (_r, w) = xray_buf::pipe::new();
+        let link_writer: Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>> =
+            Arc::new(tokio::sync::Mutex::new(Some(Box::new(w))));
+        let monitor = worker.spawn_monitor(Arc::clone(&link_writer));
+        // 先让 monitor 任务跑一轮注册 60s 定时器（此刻虚拟时间为 0），
+        // 否则 advance 之后注册的定时器落在未来，tick 永不触发
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(SERVER_MONITOR_INTERVAL + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(worker.is_closed(), "空载 60s 后 monitor 关闭整条 carrier");
+        assert!(worker.session_manager().is_closed());
+        assert!(
+            link_writer.lock().await.is_none(),
+            "carrier 写端被丢弃（Go Interrupt(link.Writer) 等价）"
+        );
+        monitor.abort();
+    }
+
+    /// 验收：长轮询 300s 不断 + count 变化窗口语义。活跃会话不被空闲杀
+    /// （Rust 旧 300s 会话杀已删）；会话结束后第一个周期因快照 count 失效
+    /// 不关闭，count 稳定后的周期才关（Go CloseIfNoSessionAndIdle）。
+    #[tokio::test(start_paused = true)]
+    async fn monitor_keeps_active_session_beyond_300s() {
+        let worker = Arc::new(ServerWorker::new(Arc::new(MockDispatcher)));
+        let (_r, w) = xray_buf::pipe::new();
+        let link_writer: Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>> =
+            Arc::new(tokio::sync::Mutex::new(Some(Box::new(w))));
+        let monitor = worker.spawn_monitor(Arc::clone(&link_writer));
+        // 先注册定时器再推进虚拟时间（同上）
+        tokio::task::yield_now().await;
+
+        let strategy = crate::session::ClientStrategy::default();
+        let session = worker
+            .session_manager()
+            .allocate(&strategy)
+            .await
+            .expect("allocate");
+
+        tokio::time::advance(Duration::from_secs(301)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(!session.is_closed(), "长轮询会话不得被空闲杀");
+        assert!(!worker.is_closed(), "有会话时 carrier 不得关闭");
+
+        session.close().await;
+        tokio::time::advance(SERVER_MONITOR_INTERVAL + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(
+            !worker.is_closed(),
+            "count 变化后的第一个周期不关闭（快照失效）"
+        );
+
+        tokio::time::advance(SERVER_MONITOR_INTERVAL + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(worker.is_closed(), "空载且 count 稳定后关闭整条 carrier");
+        monitor.abort();
     }
 
     #[test]
@@ -579,6 +659,7 @@ mod tests {
             "worker-owned cleanup task must reclaim expired entries"
         );
     }
+    #[tokio::test]
     async fn test_server_worker_close() {
         let worker = ServerWorker::new(Arc::new(MockDispatcher));
         worker.close();
@@ -610,20 +691,6 @@ mod tests {
         let _: &dyn std::error::Error = &err;
     }
 
-    #[test]
-    fn test_server_keepalive_interval_60s() {
-        assert_eq!(SERVER_KEEPALIVE_INTERVAL, Duration::from_secs(60));
-    }
-
-    #[tokio::test]
-    async fn test_session_manager_active_sessions() {
-        let worker = ServerWorker::new(Arc::new(MockDispatcher));
-        let sm = worker.session_manager();
-        assert_eq!(sm.active_sessions().await.len(), 0);
-        let strategy = crate::session::ClientStrategy::default();
-        let _s = sm.allocate(&strategy).await;
-        assert_eq!(sm.active_sessions().await.len(), 1);
-    }
 
     #[tokio::test]
     async fn test_dispatch_handler_adapter_creates_link() {
@@ -844,7 +911,7 @@ mod tests {
             let mut reader = BufferedReader::new(Box::new(s_read));
             let link_writer: Arc<AsyncMutex<Option<Box<dyn Writer>>>> =
                 Arc::new(AsyncMutex::new(Some(Box::new(s_write))));
-            let (ka, idle) = server.spawn_keepalive_and_idle_timeout(Arc::clone(&link_writer));
+            let monitor_h = server.spawn_monitor(Arc::clone(&link_writer));
             let frame_server = Arc::clone(&server);
             tokio::spawn(async move {
                 loop {
@@ -854,8 +921,7 @@ mod tests {
                     }
                 }
                 frame_server.close();
-                ka.abort();
-                idle.abort();
+                monitor_h.abort();
             });
             (client, server, rx)
         }

@@ -83,14 +83,15 @@ impl SocksClient {
         })?;
 
         // 1. method negotiation
-        let methods: Vec<u8> = if self.config.username.is_some() {
-            vec![AUTH_NOT_REQUIRED, AUTH_PASSWORD]
+        // Go protocol.go:443-447：按凭据有无二选一只发 1 个 method
+        //（带凭据 [05 01 02] / 无凭据 [05 01 00]；发两个 method 的
+        // [05 02 00 02] 是 DPI 可辨的 Rust 指纹，票 g6kn）。
+        let auth_method: u8 = if self.config.username.is_some() {
+            AUTH_PASSWORD
         } else {
-            vec![AUTH_NOT_REQUIRED]
+            AUTH_NOT_REQUIRED
         };
-        let mut buf = vec![SOCKS5_VERSION, methods.len() as u8];
-        buf.extend_from_slice(&methods);
-        stream.write_all(&buf).await?;
+        stream.write_all(&[SOCKS5_VERSION, 0x01, auth_method]).await?;
 
         let mut resp = [0u8; 2];
         stream.read_exact(&mut resp).await?;
@@ -336,6 +337,30 @@ mod tests {
         let target = SocksAddr::ipv4(std::net::Ipv4Addr::LOCALHOST, 80);
         let r = client.dial(&target).await;
         assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn dial_with_credentials_sends_single_method_0x02() {
+        // g6kn（Go protocol.go:443-447）：带凭据只发 1 个 method，首包字节
+        // 必须 [05 01 02]；此前发 [05 02 00 02]（nmethods=2）是 DPI 可辨指纹。
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let acceptor = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut first = [0u8; 3];
+            sock.read_exact(&mut first).await.unwrap();
+            first
+        });
+        let client = SocksClient::new(ClientConfig::new_with_auth(
+            server_addr.to_string(),
+            "user1",
+            "pass1",
+        ));
+        let target = SocksAddr::ipv4(std::net::Ipv4Addr::LOCALHOST, 80);
+        // server 不回 method 响应即断开 → dial Err 可忽略，断言点在首包字节
+        let _ = client.dial(&target).await;
+        let first = acceptor.await.unwrap();
+        assert_eq!(first, [SOCKS5_VERSION, 0x01, AUTH_PASSWORD]);
     }
 
     #[test]

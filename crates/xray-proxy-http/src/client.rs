@@ -177,9 +177,16 @@ pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
                 request.push_str(&format!("Proxy-Authorization: Basic {encoded}\r\n"));
                 drop(credentials);
             }
-            for (k, v) in &config.headers {
+            // Go client.go:223 `utils.TryDefaultHeadersWith(header, "nav")`：
+            // UA 缺省/枚举时补整套浏览器导航伪装头（不覆盖用户自定义头）；
+            // Go client.go:226 补 `Proxy-Connection: Keep-Alive`（0w9l：原先
+            // 两者皆缺，CONNECT 指纹与 Go 客户端可辨）。
+            let mut headers = config.headers.clone();
+            xray_transport_splithttp::browser::try_default_headers_with(&mut headers, "nav");
+            for (k, v) in &headers {
                 request.push_str(&format!("{k}: {v}\r\n"));
             }
+            request.push_str("Proxy-Connection: Keep-Alive\r\n");
             request.push_str("\r\n");
             // 3. 发送请求
             conn.write_all(request.as_bytes())
@@ -357,5 +364,56 @@ mod tests {
     fn parse_http_config_missing_servers_fails() {
         let result = parse_http_config(b"{}");
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn connect_request_carries_chrome_masquerade_and_proxy_connection() {
+        // 0w9l（Go client.go:223/226）：CONNECT 无 UA 时补整套 chrome 导航伪装头
+        //（TryDefaultHeadersWith "nav"）+ Proxy-Connection: Keep-Alive。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let inspector = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let mut req: Vec<u8> = Vec::new();
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                req.extend_from_slice(&buf[..n]);
+                if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8(req).unwrap()
+        });
+
+        let cfg = Arc::new(HttpOutboundConfig::new(
+            Address::ipv4(std::net::Ipv4Addr::LOCALHOST),
+            Port::new(port),
+        ));
+        let dial_fn = make_http_dial_fn(cfg);
+        let dest = Destination::tcp(Address::new_domain("target.example.com"), Port::new(443));
+        let _conn = dial_fn(&dest).await.expect("tunnel established");
+        drop(_conn);
+
+        let request = inspector.await.unwrap();
+        assert!(
+            request.starts_with("CONNECT target.example.com:443 HTTP/1.1\r\n"),
+            "bad request line: {request}"
+        );
+        assert!(request.contains("Proxy-Connection: Keep-Alive"), "{request}");
+        assert!(request.contains("Sec-Fetch-Mode: navigate"), "{request}");
+        assert!(request.contains("Sec-Fetch-Dest: document"), "{request}");
+        assert!(request.contains("Sec-Fetch-Site: none"), "{request}");
+        assert!(request.contains("Sec-Fetch-User: ?1"), "{request}");
+        assert!(request.contains("Upgrade-Insecure-Requests: 1"), "{request}");
+        assert!(request.contains("Priority: u=0, i"), "{request}");
+        let ua_line = request
+            .lines()
+            .find(|l| l.starts_with("User-Agent: "))
+            .expect("UA header must be present");
+        assert!(ua_line.contains("Chrome/"), "UA must masquerade as Chrome: {ua_line}");
     }
 }

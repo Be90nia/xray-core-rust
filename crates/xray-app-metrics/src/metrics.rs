@@ -423,23 +423,28 @@ impl MetricsHttpServer for TokioHttpServer {
         let listener = tokio::net::TcpListener::from_std(std_listener)
             .map_err(|e| MetricsError::ListenInvalid(format!("from_std: {e}")))?;
         let shutdown = self.inner.shutdown.clone();
-        let inner = self.inner.clone();
         let handle = tokio::spawn(async move {
+            // 每连接 task 由本 task 内的 JoinSet 持有：完成即收割（join_next 分支），
+            // 不再 push 到共享 Vec——否则句柄簿记随抓取次数线性增长（票 fu4y）。
+            let mut conn_tasks = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     biased;
                     _ = shutdown.notified() => break,
+                    Some(_) = conn_tasks.join_next(), if !conn_tasks.is_empty() => {}
                     accept = listener.accept() => {
                         let Ok((stream, _)) = accept else { continue; };
                         let stats = stats.clone();
                         let obs = obs.clone();
                         let shutdown = shutdown.clone();
-                        let h = tokio::spawn(serve_one(stream, stats, obs, shutdown));
-                        inner.join_handles.lock().push(h);
+                        conn_tasks.spawn(serve_one(stream, stats, obs, shutdown));
                     }
                 }
             }
+            // 关闭：等待残留连接任务退出
+            while conn_tasks.join_next().await.is_some() {}
         });
+        // 仅 accept-loop 自身的 handle 入共享簿记（shutdown 时等待其退出）
         self.inner.join_handles.lock().push(handle);
         Ok(())
     }
@@ -451,13 +456,15 @@ impl MetricsHttpServer for TokioHttpServer {
         obs: Option<Arc<dyn ObservationCollector>>,
     ) -> Result<(), MetricsError> {
         let shutdown = self.inner.shutdown.clone();
-        let inner = self.inner.clone();
         let listener = outbound.listener_clone();
         let handle = tokio::spawn(async move {
+            // 每连接 task 由本 task 内的 JoinSet 持有：完成即收割（票 fu4y）
+            let mut conn_tasks = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     biased;
                     _ = shutdown.notified() => break,
+                    Some(_) = conn_tasks.join_next(), if !conn_tasks.is_empty() => {}
                     conn = tokio::task::spawn_blocking({
                         let l = listener.clone();
                         move || l.accept()
@@ -467,11 +474,12 @@ impl MetricsHttpServer for TokioHttpServer {
                         let stats = stats.clone();
                         let obs = obs.clone();
                         let shutdown = shutdown.clone();
-                        let h = tokio::spawn(serve_boxed_conn(conn, stats, obs, shutdown));
-                        inner.join_handles.lock().push(h);
+                        conn_tasks.spawn(serve_boxed_conn(conn, stats, obs, shutdown));
                     }
                 }
             }
+            // 关闭：等待残留连接任务退出
+            while conn_tasks.join_next().await.is_some() {}
         });
         self.inner.join_handles.lock().push(handle);
         Ok(())
@@ -864,5 +872,45 @@ mod tests {
         let stats = StatsSnapshot::default();
         let out = format_prometheus(&stats, None);
         assert!(!out.contains("xray_observation_extra"));
+    }
+
+    /// 票 fu4y：Prometheus 抓取句柄不随连接数累积——每连接 task 由 JoinSet
+    /// 完成即收割，join_handles 只保留 accept-loop 自身（恒 ≤1）。
+    #[tokio::test]
+    async fn repeated_scrapes_do_not_accumulate_handles() {
+        // 先 bind 再释放，拿一个大概率空闲的端口
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let server = TokioHttpServer::new();
+        server
+            .start_http_listen(&addr.to_string(), Arc::new(ConstStats(1)), None)
+            .unwrap();
+
+        // 千次抓取（票验收口径）
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for _ in 0..1000 {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            s.write_all(b"GET /metrics HTTP/1.1\r\nHost: t\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buf = Vec::new();
+            let read = tokio::time::timeout(std::time::Duration::from_secs(5), s.read_to_end(&mut buf));
+            assert!(read.await.is_ok(), "scrape response must complete");
+            assert!(buf.starts_with(b"HTTP/1.1 200 OK"), "scrape must succeed");
+        }
+
+        // 所有连接 task 收割后：句柄簿记归零（只剩 accept-loop 1 个）
+        for _ in 0..200 {
+            if server.inner.join_handles.lock().len() <= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            server.inner.join_handles.lock().len() <= 1,
+            "per-connection JoinHandles must be reaped, not accumulated"
+        );
     }
 }

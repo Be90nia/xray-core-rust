@@ -188,9 +188,12 @@ fn parse_qname(bytes: &[u8], mut offset: usize) -> Result<(String, usize)> {
 #[must_use]
 pub fn build_dns_response(query_header: &DnsHeader, question: &DnsQuestion, rcode: u8) -> Vec<u8> {
     let mut buf = Vec::with_capacity(512);
-    // Header（12B）：ID 原样 + flags(QR=1 + RD 回显 + RCODE)
+    // Header（12B）：ID 原样 + flags(QR=1 + RD 回显 + AA + RA + RCODE)。
+    // AA+RA 对齐 Go proxy/dns/dns.go:400-407 rejectNonIPQuery 四标志。
     let flags = 0x8000 // QR=1 (response)
         | (query_header.flags & 0x0100) // 回显 RD
+        | 0x0400 // AA=1 (authoritative answer)
+        | 0x0080 // RA=1 (recursion available)
         | (rcode as u16 & 0x000F); // RCODE
     buf.extend_from_slice(&query_header.id.to_be_bytes());
     buf.extend_from_slice(&flags.to_be_bytes());
@@ -232,9 +235,10 @@ pub fn build_ip_response(
     ttl: u32,
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(512);
-    // Header（12B）
+    // Header（12B）。AA+RA 对齐 Go proxy/dns/dns.go:341-348 handleIPQuery 四标志。
     let flags = 0x8000 // QR=1 (response)
         | (query_header.flags & 0x0100) // 回显 RD
+        | 0x0400 // AA=1 (authoritative answer)
         | 0x0080 // RA=1 (recursion available)
         | 0; // RCODE=0 (NOERROR)
     buf.extend_from_slice(&query_header.id.to_be_bytes());
@@ -548,5 +552,30 @@ mod tests {
         assert!(resp_header.is_response());
         assert_eq!(resp_header.rcode(), 0);
         assert_eq!(resp_header.an_count, 0);
+    }
+    /// w3hn：DNS 响应头 AA+RA 标志对齐 Go proxy/dns/dns.go:341-348（handleIPQuery）
+    /// 与 :400-407（rejectNonIPQuery）四标志（QR+AA+RD+RA，0x8580 系）。
+    #[test]
+    fn dns_response_headers_set_aa_and_ra_flags() {
+        let query = make_dns_a_query("flags.com");
+        let (header, question) = parse_dns_query(&query).unwrap();
+
+        // Hijack（IP 应答）。
+        let ips: Vec<std::net::IpAddr> = vec!["1.2.3.4".parse().unwrap()];
+        let resp = build_ip_response(&header, &question, &ips, 60);
+        let flags = u16::from_be_bytes([resp[2], resp[3]]);
+        assert_eq!(flags & 0x8000, 0x8000, "QR=1");
+        assert_eq!(flags & 0x0400, 0x0400, "AA=1（Go Authoritative）");
+        assert_eq!(flags & 0x0100, 0x0100, "RD 回显");
+        assert_eq!(flags & 0x0080, 0x0080, "RA=1（Go RecursionAvailable）");
+
+        // Reject（REFUSED）。
+        let resp = build_dns_response(&header, &question, 5);
+        let flags = u16::from_be_bytes([resp[2], resp[3]]);
+        assert_eq!(flags & 0x8000, 0x8000, "QR=1");
+        assert_eq!(flags & 0x0400, 0x0400, "AA=1（Go Authoritative）");
+        assert_eq!(flags & 0x0100, 0x0100, "RD 回显");
+        assert_eq!(flags & 0x0080, 0x0080, "RA=1（Go RecursionAvailable）");
+        assert_eq!(flags & 0x000F, 5, "RCODE=REFUSED");
     }
 }

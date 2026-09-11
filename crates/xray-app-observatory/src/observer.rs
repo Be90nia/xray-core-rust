@@ -11,9 +11,8 @@ use parking_lot::Mutex;
 use crate::config::{ObservationResult, ObservatoryConfig, ProbeResult};
 use crate::error::{at_error, ObservatoryError};
 use crate::status::StatusStore;
-// 3oad：探测方法（HTTP GET）从 burst healthping_settings 复用默认值——其口径
-// 已对齐 Go `healthping.go:147` `HttpMethod = "GET"`。
-use crate::burst::healthping_settings::DEFAULT_HTTP_METHOD;
+// 4d7t：plain observatory 的 GET 语义不再从 burst healthping 借常量——
+// 两套判定口径在此分离（见 HttpProbeExecutor::check_status）。
 
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -880,8 +879,12 @@ impl OutboundSelector for RealOutboundSelector {
 }
 /// 基于 tokio::net::TcpStream 的 HTTP ProbeExecutor。
 ///
-/// 对应 Go `Observer.probe(outbound)`：建立 TCP 连接并发送 HTTP HEAD 请求。
-/// 不依赖 reqwest/hyper，仅用 tokio 原生 TCP。
+/// 两套语义（4d7t 分离）：
+/// - **plain observatory**（`from_config`）：GET + 收到合法 HTTP 状态行即
+///   alive——对齐 Go `observer.go:175-186`（仅请求失败判 dead，**不查状态码**；
+///   CDN 对 HEAD/非 2xx 返回 405/403 时节点仍应判活）。
+/// - **burst healthping**（`new`）：沿用配置的 method + 200-399 判 alive
+///   （Go `healthping.go:175-179`）。
 pub struct HttpProbeExecutor {
     /// 探测目标 URL（如 https://www.google.com/generate_204）
     url: String,
@@ -889,6 +892,9 @@ pub struct HttpProbeExecutor {
     method: String,
     /// 连接超时（毫秒）
     timeout_ms: u64,
+    /// true = 按状态码 200-399 判 alive（healthping 口径）；false = 收到合法
+    /// HTTP 响应即 alive（plain observatory 口径，Go observer.go）。
+    check_status: bool,
 }
 
 impl HttpProbeExecutor {
@@ -897,20 +903,22 @@ impl HttpProbeExecutor {
             url: url.into(),
             method: method.into(),
             timeout_ms,
+            check_status: true,
         }
     }
 
-    /// 从 ObservatoryConfig 构造（使用 effective_probe_url，HTTP GET 探测）。
+    /// 从 ObservatoryConfig 构造（plain observatory 语义）。
     ///
-    /// 3oad：探测方法默认 GET（Go `newPingClient` 用 `newRequest("GET", url)`，
-    /// 不是 HEAD）。HEAD 不能跨 CDN 验证（部分 CDN 对 HEAD 返回 405/403），
-    /// 而 GET 是真实拉取语义。alive 由状态码判定（200-399 = alive）。
+    /// 对齐 Go `observer.go:163/175`：默认 GET、**无状态码检查**——请求完成
+    /// 即 alive。此前误用 burst healthping 的 HEAD 常量 + 200-399 判定，
+    /// CDN 对 HEAD 返回 405/403 时全节点误判 dead。
     pub fn from_config(config: &ObservatoryConfig) -> Self {
-        Self::new(
-            config.effective_probe_url().to_string(),
-            DEFAULT_HTTP_METHOD.to_string(),
-            5_000,
-        )
+        Self {
+            url: config.effective_probe_url().to_string(),
+            method: "GET".to_string(),
+            timeout_ms: 5_000,
+            check_status: false,
+        }
     }
 }
 
@@ -1014,11 +1022,13 @@ impl HttpProbeExecutor {
             return Err(format!("invalid response: {}", response.lines().next().unwrap_or("")));
         }
 
-        // 3oad：从状态行解析状态码（HTTP/1.1 200 OK\r\n → 200），判定 alive。
-        // Go `MeasureDelay` 仅以 HTTP 200-399 为 alive（healthping.go:175-179）。
+        // 3oad：从状态行解析状态码（HTTP/1.1 200 OK\r\n → 200）。
+        // 4d7t：状态码判定仅 burst healthping 口径（Go healthping.go:175-179）；
+        // plain observatory 收到合法 HTTP 状态行即 alive（Go observer.go:175-186，
+        // CDN 对 HEAD/非 2xx 的 405/403 不应判死节点）。
         let status_code = parse_http_status_code(&response)
             .ok_or_else(|| format!("malformed status line: {}", response.lines().next().unwrap_or("")))?;
-        if !(200..400).contains(&status_code) {
+        if self.check_status && !(200..400).contains(&status_code) {
             return Err(format!("http status {status_code}"));
         }
 
@@ -1037,13 +1047,6 @@ impl HttpProbeExecutor {
 // "HTTP 响应头解析"层。
 
 /// 通过指定 outbound 拨号到探测 URL 的 [`ProbeExecutor`] 实现。
-///
-/// 持有 tag → `OutboundHandler` 映射（由装配阶段注入），每次 `probe`：
-/// 1. 用 `parse_url_host_port` 解 URL 得到 host:port + tls 标记；
-/// 2. 构造 `Destination { host:port, network=tcp }`；
-/// 3. 调 `handler.dial(&dest, &session)` 并计时；
-/// 4. dial 成功 → alive + delay=dial_ms；失败 → dead + reason。
-///
 /// 对应 Go `Observer.probe(outbound)` 的 outbound 拨号部分
 /// （observer.go:130-159，tagged.Dialer 路径）。
 pub struct RealOutboundProbeExecutor {

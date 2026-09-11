@@ -80,7 +80,10 @@ pub struct NameServerJson {
     /// 是否跳过 fallback。
     #[serde(rename = "skipFallback")]
     pub skip_fallback: bool,
-    /// 自定义超时（毫秒）；0 表示默认 4000ms。
+    /// 自定义超时（毫秒）；0 表示默认 4000ms。对应 Go `timeoutMs`
+    /// （infra/conf/dns.go:29；此前缺 rename，Go 键被静默丢弃恒 4000ms，
+    /// `timeout` 仅作 Rust 旧配置别名保留）。
+    #[serde(rename = "timeoutMs", alias = "timeout")]
     pub timeout: Option<u32>,
     /// 本 server 的查询策略覆写。
     #[serde(rename = "queryStrategy")]
@@ -234,7 +237,7 @@ impl DnsAppConfig {
             }
         };
 
-        let mut mappings = parse_hosts(&self.hosts)?;
+        let mut mappings = parse_hosts(&self.hosts, &datadir, &loader)?;
         // 98g：useSystemHosts → 系统 hosts 合并（对应 Go readSystemHosts）
         if self.use_system_hosts.unwrap_or(false) {
             mappings.extend(crate::hosts::read_system_hosts());
@@ -357,10 +360,14 @@ fn build_client(
 
     // 6r0：expectedIPs/unexpectedIPs → IpRule（CIDR + geoip 展开）。
     // expectedIPs 为空时回填 expectIPs（Go dns.go:94-96，policy key 同读回填值）。
-    let expected_ip_rules =
-        parse_ns_ip_rules(effective_expected_ips(ns), datadir)?;
-    let unexpected_ip_rules =
-        parse_ns_ip_rules(ns.unexpected_ips.as_deref().unwrap_or(&[]), datadir)?;
+    // Go infra/conf/dns.go:98-116："*" 哨兵剥离并推导 actPrior/actUnprior
+    // （此前 "*" 不剥离，混合列表变硬过滤且优先/降级语义丢失）。
+    let (expected_entries, star_prior) =
+        strip_star_sentinel(effective_expected_ips(ns));
+    let (unexpected_entries, star_unprior) =
+        strip_star_sentinel(ns.unexpected_ips.as_deref().unwrap_or(&[]));
+    let expected_ip_rules = parse_ns_ip_rules(&expected_entries, datadir)?;
+    let unexpected_ip_rules = parse_ns_ip_rules(&unexpected_entries, datadir)?;
 
     let ns_cfg = NameServerConfig {
         client_ip,
@@ -370,11 +377,9 @@ fn build_client(
         tag: ns.tag.clone().unwrap_or_default(),
         final_query: ns.final_query.unwrap_or(false),
         disable_cache: ns.disable_cache,
-        serve_stale: ns.serve_stale,
-        serve_expired_ttl: ns.serve_expired_ttl,
+        act_prior: ns.act_prior.unwrap_or(false) || star_prior,
+        act_unprior: ns.act_unprior.unwrap_or(false) || star_unprior,
         negative_ttl_secs: ns.negative_ttl_secs,
-        act_prior: ns.act_prior.unwrap_or(false),
-        act_unprior: ns.act_unprior.unwrap_or(false),
         policy_id: ns.policy_id.filter(|&v| v != 0).unwrap_or(derived_policy_id),
         expected_ip_rules,
         unexpected_ip_rules,
@@ -397,6 +402,20 @@ fn effective_expected_ips(ns: &NameServerJson) -> &[String] {
     } else {
         expected
     }
+}
+
+/// Go infra/conf/dns.go:98-116：列表中 `"*"` 哨兵剥离，返回（剥离后列表, 是否含 *）。
+fn strip_star_sentinel(list: &[String]) -> (Vec<String>, bool) {
+    let mut out = Vec::with_capacity(list.len());
+    let mut starred = false;
+    for s in list {
+        if s == "*" {
+            starred = true;
+        } else {
+            out.push(s.clone());
+        }
+    }
+    (out, starred)
 }
 
 /// 构造 policy 等价键。对应 Go `buildPolicyID` 的 key 段构造
@@ -532,24 +551,21 @@ fn local_tlds_and_dotless_rules()
     ]
 }
 
-/// 解析单条 nameserver domain 规则字符串（Go `ParseDomainRule(s, Domain_Substr)`）。
+/// 解析单条 domain 规则字符串。`default_type`：ns domains 用 Substr
+/// （Go `ParseDomainRule(s, Domain_Substr)`），hosts key 用 Full。
 ///
-/// 返回 `(DomainType, value)`；geosite 条目经 loader 展开为多条（此处返回首条，
-/// 展开型多规则由调用方聚合——见 `parse_ns_domain_rule` 内 geosite 分支）。
-fn parse_ns_domain_rule(
+/// 返回 `(DomainType, value)`；geosite 条目经 loader 展开为多条。
+fn parse_domain_rule_entries(
     s: &str,
+    default_type: xray_geodata::geosite::DomainType,
     datadir: &std::path::Path,
     loader: &xray_geodata::loader::GeoDataLoader,
 ) -> Result<Vec<(xray_geodata::matcher::domain::DomainType, String)>, DnsError> {
     use xray_geodata::matcher::domain::DomainType;
     use xray_geodata::pb::domain_rule::Value as DV;
 
-    let pb_rule = xray_geodata::rule_parser::parse_domain_rule(
-        s,
-        xray_geodata::geosite::DomainType::Substr,
-        datadir,
-    )
-    .map_err(|e| DnsError::Features(xray_features::dns::DnsError::Other(e.to_string())))?;
+    let pb_rule = xray_geodata::rule_parser::parse_domain_rule(s, default_type, datadir)
+        .map_err(|e| DnsError::Features(xray_features::dns::DnsError::Other(e.to_string())))?;
     let Some(value) = pb_rule.value else {
         return Ok(Vec::new());
     };
@@ -578,6 +594,24 @@ fn parse_ns_domain_rule(
                 .collect())
         }
     }
+}
+
+/// ns `domains` 条目（Go `ParseDomainRule(s, Domain_Substr)`）。
+fn parse_ns_domain_rule(
+    s: &str,
+    datadir: &std::path::Path,
+    loader: &xray_geodata::loader::GeoDataLoader,
+) -> Result<Vec<(xray_geodata::matcher::domain::DomainType, String)>, DnsError> {
+    parse_domain_rule_entries(s, xray_geodata::geosite::DomainType::Substr, datadir, loader)
+}
+
+/// hosts key（Go `ParseDomainRule(rule, Domain_Full)`，infra/conf/dns.go:258）。
+fn parse_hosts_key(
+    s: &str,
+    datadir: &std::path::Path,
+    loader: &xray_geodata::loader::GeoDataLoader,
+) -> Result<Vec<(xray_geodata::matcher::domain::DomainType, String)>, DnsError> {
+    parse_domain_rule_entries(s, xray_geodata::geosite::DomainType::Full, datadir, loader)
 }
 
 /// 解析 nameserver IP 规则字符串列表（CIDR / `!` 反向 / geoip 展开）。
@@ -622,35 +656,40 @@ fn parse_ns_ip_rules(
 
 /// 解析静态 hosts map 为 [`HostMapping`] 列表。
 ///
-/// key 可带类型前缀：`domain:` / `full:` 走精确匹配；其它前缀（`geosite:` / `regexp:`）
-/// 需 matcher 支持，当前跳过并告警。value 为 IP 字符串、IP 数组，或域名重定向字符串。
+/// 对齐 Go `HostsWrapper.Build`（infra/conf/dns.go:254-266）：key 全部走
+/// `geodata.ParseDomainRule(rule, Domain_Full)` —— 无前缀 = Full 精确匹配，
+/// `domain:`/`full:`/`regexp:`/`keyword:`/`geosite:`/`ext:` 全前缀均支持
+/// （此前仅 domain:/full:，其余前缀告警跳过 = 静默失效）。value 为 IP 字符串、
+/// IP 数组，或域名重定向字符串。
 fn parse_hosts(
     hosts: &serde_json::Map<String, serde_json::Value>,
+    datadir: &std::path::Path,
+    loader: &xray_geodata::loader::GeoDataLoader,
 ) -> Result<Vec<HostMapping>, DnsError> {
     let mut mappings = Vec::new();
     for (key, value) in hosts {
-        let domain = match key.split_once(':') {
-            Some(("domain" | "full", d)) => d.to_ascii_lowercase(),
-            Some(_) => {
-                tracing::warn!(key = %key, "dns hosts: skip non-exact matcher prefix");
+        let matcher_rules = match parse_hosts_key(key, datadir, loader) {
+            Ok(rules) => rules,
+            Err(e) => {
+                tracing::warn!(key = %key, error = %e, "dns hosts: skip bad rule key");
                 continue;
             }
-            None => key.to_ascii_lowercase(),
         };
-
         let (ips, proxied) = parse_host_value(value);
         if ips.is_empty() && proxied.is_empty() {
             tracing::warn!(key = %key, "dns hosts: skip entry with no IPs and no redirect");
             continue;
         }
         mappings.push(HostMapping {
-            domain,
+            domain: key.to_ascii_lowercase(),
             ips,
             proxied_domain: proxied,
+            matcher_rules,
         });
     }
     Ok(mappings)
 }
+
 
 /// 解析单个 host value：返回 (IP 列表, 域名重定向)。两者互斥（非 IP 串视为重定向）。
 fn parse_host_value(v: &serde_json::Value) -> (Vec<IpAddr>, String) {

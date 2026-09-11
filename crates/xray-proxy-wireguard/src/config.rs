@@ -97,7 +97,9 @@ impl DomainStrategy {
     }
 }
 
-/// 对端配置。对应 proto `xray.proxy.wireguard.PeerConfig`。
+/// 对端配置。对应 proto `xray.proxy.wireguard.PeerConfig` + Go `WireGuardPeerConfig`
+/// 的 `level`/`email`（wireguard.go:24-25：服务端形态经 `protocol.User` 供
+/// policy/stats 分级；proto 本体无此二字段，仅存于本配置层）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PeerConfig {
     /// 对端公钥（hex 64 字符）。
@@ -110,6 +112,10 @@ pub struct PeerConfig {
     pub keep_alive: u32,
     /// 允许的源 IP CIDR 列表。
     pub allowed_ips: Vec<String>,
+    /// 用户等级（per-user policy 分级）。对应 Go `WireGuardPeerConfig.Level`。
+    pub level: u32,
+    /// 用户邮箱标识（stats 计数键）。对应 Go `WireGuardPeerConfig.Email`。
+    pub email: String,
 }
 
 /// 设备配置。对应 proto `xray.proxy.wireguard.DeviceConfig`。
@@ -163,6 +169,9 @@ impl DeviceConfig {
                     endpoint: peer.endpoint,
                     keep_alive: peer.keep_alive,
                     allowed_ips: peer.allowed_ips,
+                    // proto 层无 level/email（Go 同样只存配置层）。
+                    level: 0,
+                    email: String::new(),
                 })
                 .collect(),
             mtu: p.mtu,
@@ -300,6 +309,8 @@ mod tests {
                 endpoint: "1.2.3.4:51820".into(),
                 keep_alive: 25,
                 allowed_ips: vec!["0.0.0.0/0".into(), "::/0".into()],
+                level: 0,
+                email: String::new(),
             }],
             mtu: 1280,
             num_workers: 4,

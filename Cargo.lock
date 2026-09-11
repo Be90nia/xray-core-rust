@@ -6180,6 +6180,7 @@ dependencies = [
  "xray-features",
  "xray-proto",
  "xray-transport",
+ "xray-transport-splithttp",
 ]
 
 [[package]]

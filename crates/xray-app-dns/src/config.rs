@@ -13,11 +13,11 @@ use crate::error::DnsError;
 
 /// DNS 查询策略。对应 Go `QueryStrategy` enum。
 ///
-/// proto 字段值（来自 `app/dns/config.proto`）：
 /// - `USE_IP = 0`：返回 IPv4 + IPv6
-/// - `USE_SYS = 4`：跟随系统偏好（业务层置 `check_system = true`）
 /// - `USE_IP4 = 1`：仅返回 IPv4
 /// - `USE_IP6 = 2`：仅返回 IPv6
+/// - `USE_SYS = 3`：跟随系统偏好（业务层置 `check_system = true`；
+///   值对齐 Go `app/dns/config.proto:36`，此前误写 4）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
 pub enum QueryStrategy {
@@ -39,7 +39,7 @@ impl QueryStrategy {
             Self::UseIp => 0,
             Self::UseIp4 => 1,
             Self::UseIp6 => 2,
-            Self::UseSys => 4,
+            Self::UseSys => 3,
         }
     }
 
@@ -50,7 +50,7 @@ impl QueryStrategy {
             0 => Some(Self::UseIp),
             1 => Some(Self::UseIp4),
             2 => Some(Self::UseIp6),
-            4 => Some(Self::UseSys),
+            3 => Some(Self::UseSys),
             _ => None,
         }
     }

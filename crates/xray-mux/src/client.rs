@@ -439,14 +439,17 @@ impl ClientWorker {
             First::Payload(mb) => {
                 if !mb.is_empty() {
                     session.add_uplink_bytes(mb.len() as u64);
-                    session.touch_active().await;
                 }
                 errored = writer.write(mb).await.is_err();
             }
             First::Probe => {
                 errored = writer.write(MultiBuffer::new()).await.is_err();
             }
-            First::Abort => {}
+            First::Abort => {
+                // Go fetchInput（client.go:276-279）：首包前读失败（含 EOF）→
+                // hasError=true，End 帧 option=0x02 传播线级异常
+                writer.set_error();
+            }
         }
 
         if !errored {
@@ -473,7 +476,6 @@ impl ClientWorker {
                     break;
                 }
                 session.add_uplink_bytes(mb.len() as u64);
-                session.touch_active().await;
                 if writer.write(mb).await.is_err() {
                     writer.set_error();
                     break;
@@ -542,7 +544,6 @@ impl ClientWorker {
             return false;
         }
         session.add_downlink_bytes(data.len() as u64);
-        session.touch_active().await;
         let mb = MultiBuffer::from_buffer(Buffer::from_vec(data));
         let write_failed = {
             let mut output = session.output().await;
@@ -1071,11 +1072,10 @@ mod tests {
                     let mut reader = BufferedReader::new(link.reader);
                     let writer: Arc<Mutex<Option<Box<dyn Writer>>>> =
                         Arc::new(Mutex::new(Some(link.writer)));
-                    let (ka, idle) = server.spawn_keepalive_and_idle_timeout(Arc::clone(&writer));
+                    let monitor_h = server.spawn_monitor(Arc::clone(&writer));
                     while matches!(server.process_frame(&mut reader, &writer).await, Ok(true)) {}
                     server.close();
-                    ka.abort();
-                    idle.abort();
+                    monitor_h.abort();
                 })
             }
         }
@@ -1161,7 +1161,7 @@ mod tests {
         let mut reader = BufferedReader::new(Box::new(s_read));
         let link_writer: Arc<Mutex<Option<Box<dyn Writer>>>> =
             Arc::new(Mutex::new(Some(Box::new(s_write))));
-        let (ka, idle) = server.spawn_keepalive_and_idle_timeout(Arc::clone(&link_writer));
+        let monitor_h = server.spawn_monitor(Arc::clone(&link_writer));
         let frame_server = Arc::clone(&server);
         tokio::spawn(async move {
             loop {
@@ -1171,8 +1171,7 @@ mod tests {
                 }
             }
             frame_server.close();
-            ka.abort();
-            idle.abort();
+            monitor_h.abort();
         });
 
         // 客户端 dispatch：reader 有写端但永不写数据 → 首包试探超时发空 New
@@ -1214,5 +1213,51 @@ mod tests {
         // 收尾：关写端 → End → dispatch 返回
         let _ = req_wr.close();
         assert!(dispatch_task.await.expect("join"), "dispatch accepted");
+    }
+
+    /// 验收：首包前 EOF → End 帧 option=0x02（Go fetchInput client.go:276-279
+    /// 的 hasError 传播）。旧实现 Abort 路径漏 set_error，End 帧 option=0x00，
+    /// 线级异常信号丢失。
+    #[tokio::test]
+    async fn fetch_input_first_packet_eof_sends_end_with_error_option() {
+        use crate::session::{ClientStrategy, SessionManager};
+
+        let (mut carrier_r, carrier_w) = pipe::new();
+        let link_writer: Arc<Mutex<Option<Box<dyn Writer>>>> =
+            Arc::new(Mutex::new(Some(Box::new(carrier_w))));
+        // session input：写端显式 close → 读端 Err(Eof)（首包读之前 EOF）。
+        // pipe 仅在显式 close() 时置 Closed，裸 drop 不会唤醒读端
+        let (input_r, input_w) = pipe::new();
+        let _ = input_w.close();
+
+        let manager = SessionManager::new();
+        let session = manager
+            .allocate(&ClientStrategy::default())
+            .await
+            .expect("allocate");
+        session.set_input(BufferedReader::new(Box::new(input_r))).await;
+
+        let dest = Destination::new(
+            xray_common::net::address::Address::new_domain("eof.internal".to_string()),
+            xray_common::net::port::Port::new(80),
+            Network::TCP,
+        );
+        ClientWorker::fetch_input(Arc::clone(&session), dest, Arc::clone(&link_writer), None)
+            .await;
+
+        // 对拍 End 帧原始字节：len(2B)=4 + id(2B) + status=0x03 + option=0x02
+        let mb = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            carrier_r.read_multi_buffer(),
+        )
+        .await
+        .expect("End frame within timeout")
+        .expect("read ok");
+        let bytes = mb.to_vec();
+        assert_eq!(bytes.len(), 6, "End 帧仅元数据：{:02X?}", bytes);
+        assert_eq!(&bytes[0..2], &[0x00, 0x04], "meta 长度 4");
+        assert_eq!(u16::from_be_bytes([bytes[2], bytes[3]]), session.id());
+        assert_eq!(bytes[4], 0x03, "status End");
+        assert_eq!(bytes[5], 0x02, "option 必须是 0x02（OptionError）");
     }
 }

@@ -560,6 +560,118 @@ async fn serve_hysteria_connection(
     }
 }
 
+/// h3-quinn Connection 包装：拦截 `close()`（no-op）。
+///
+/// h3 `server::Connection` Drop 时内部会 `close_connection(H3_NO_ERROR)` 立即
+/// 关闭 QUIC 连接，而 auth 完成后连接必须交给 raw QUIC 面（TCP request bidi
+/// stream / datagram）继续使用。此前以 `std::mem::forget` 防 drop 关连，代价
+/// 是 h3 + quinn 状态随每条认证连接永久泄漏（票 ijvn）；包装类型拦截 close
+/// 后，h3 server 可正常 drop 释放全部内部状态。
+struct AuthH3Conn {
+    inner: h3_quinn::Connection,
+}
+
+/// [`AuthH3Conn::opener`] 的配套 opener 包装（同样拦截 close）。
+struct AuthH3Opener {
+    inner: h3_quinn::OpenStreams,
+}
+
+type AuthH3SendStream =
+    <h3_quinn::Connection as h3::quic::OpenStreams<bytes::Bytes>>::SendStream;
+type AuthH3BidiStream =
+    <h3_quinn::Connection as h3::quic::OpenStreams<bytes::Bytes>>::BidiStream;
+type AuthH3RecvStream =
+    <h3_quinn::Connection as h3::quic::Connection<bytes::Bytes>>::RecvStream;
+
+impl AuthH3Conn {
+    fn new(conn: Connection) -> Self {
+        Self { inner: h3_quinn::Connection::new(conn) }
+    }
+}
+
+impl h3::quic::OpenStreams<bytes::Bytes> for AuthH3Conn {
+    type SendStream = AuthH3SendStream;
+    type BidiStream = AuthH3BidiStream;
+
+    fn poll_open_bidi(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Self::BidiStream, h3::quic::StreamErrorIncoming>> {
+        <h3_quinn::Connection as h3::quic::OpenStreams<bytes::Bytes>>::poll_open_bidi(
+            &mut self.inner, cx,
+        )
+    }
+
+    fn poll_open_send(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Self::SendStream, h3::quic::StreamErrorIncoming>> {
+        <h3_quinn::Connection as h3::quic::OpenStreams<bytes::Bytes>>::poll_open_send(
+            &mut self.inner, cx,
+        )
+    }
+
+    fn close(&mut self, _code: h3::error::Code, _reason: &[u8]) {
+        // no-op：h3 层终结不得关闭 QUIC 连接（见类型文档）
+    }
+}
+
+impl h3::quic::Connection<bytes::Bytes> for AuthH3Conn {
+    type RecvStream = AuthH3RecvStream;
+    type OpenStreams = AuthH3Opener;
+
+    fn poll_accept_bidi(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Self::BidiStream, h3::quic::ConnectionErrorIncoming>> {
+        <h3_quinn::Connection as h3::quic::Connection<bytes::Bytes>>::poll_accept_bidi(
+            &mut self.inner, cx,
+        )
+    }
+
+    fn poll_accept_recv(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Self::RecvStream, h3::quic::ConnectionErrorIncoming>> {
+        <h3_quinn::Connection as h3::quic::Connection<bytes::Bytes>>::poll_accept_recv(
+            &mut self.inner, cx,
+        )
+    }
+
+    fn opener(&self) -> Self::OpenStreams {
+        AuthH3Opener {
+            inner: <h3_quinn::Connection as h3::quic::Connection<bytes::Bytes>>::opener(&self.inner),
+        }
+    }
+}
+
+impl h3::quic::OpenStreams<bytes::Bytes> for AuthH3Opener {
+    type SendStream = AuthH3SendStream;
+    type BidiStream = AuthH3BidiStream;
+
+    fn poll_open_bidi(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Self::BidiStream, h3::quic::StreamErrorIncoming>> {
+        <h3_quinn::OpenStreams as h3::quic::OpenStreams<bytes::Bytes>>::poll_open_bidi(
+            &mut self.inner, cx,
+        )
+    }
+
+    fn poll_open_send(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Self::SendStream, h3::quic::StreamErrorIncoming>> {
+        <h3_quinn::OpenStreams as h3::quic::OpenStreams<bytes::Bytes>>::poll_open_send(
+            &mut self.inner, cx,
+        )
+    }
+
+    fn close(&mut self, _code: h3::error::Code, _reason: &[u8]) {
+        // no-op：h3 层终结不得关闭 QUIC 连接（见类型文档）
+    }
+}
+
 /// h3 请求处理：auth 判定 + masquerade 分发（对应 Go `httpHandler.ServeHTTP` hub.go:112-117）。
 ///
 /// 每个请求先过 AuthHTTP 判定（Go hub.go:44：POST + :authority=="hysteria" +
@@ -568,10 +680,11 @@ async fn serve_hysteria_connection(
 /// 不通过（非 auth 请求或密码错，Go hub.go:67 user==nil 时直接 false）→ masq handler
 /// 应答并继续循环（连接保持）。None 仅在 h3 层 accept 终结时返回。
 ///
-/// h3 server Connection 在函数内创建并使用。认证成功后，h3 server 的 Drop 会关闭
-/// QUIC 连接（H3_NO_ERROR）——用 `std::mem::forget` 防止，保持连接存活以接收 raw data stream。
-/// h3-quinn 的 incoming_bi 不会在认证结束后抢消费后续 bidi stream（stream::unfold 惰性，
-/// 不调 accept 则不 poll）。详见 listener_factory_accept_bi_echo_roundtrip 测试验证。
+/// h3 server Connection 在函数内创建，包装为 [`AuthH3Conn`] 拦截 Drop 引发的
+/// `close_connection(H3_NO_ERROR)`。auth 成功后移交 detached task 挂起持有，
+/// QUIC 连接关闭后回收（状态生命周期 = 连接生命周期，无 forget 永久泄漏，票 ijvn）。
+/// h3-quinn 的 incoming_bi 挂起期间不 poll，不会抢消费 raw bidi stream。
+/// 详见 listener_factory_accept_bi_echo_roundtrip 与 h3_server_drop_with_wrapper_keeps_conn_open 测试。
 async fn h3_auth(
     conn: &quinn::Connection,
     validator: &Option<Arc<dyn crate::hub::AuthValidator>>,
@@ -579,8 +692,8 @@ async fn h3_auth(
     masq: &Arc<dyn crate::hub::MasqueradeHandler>,
     static_auth: &str,
 ) -> Option<u64> {
-    let h3_server: h3::server::Connection<h3_quinn::Connection, bytes::Bytes> =
-        match h3::server::Connection::new(h3_quinn::Connection::new(conn.clone())).await {
+    let h3_server: h3::server::Connection<AuthH3Conn, bytes::Bytes> =
+        match h3::server::Connection::new(AuthH3Conn::new(conn.clone())).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::debug!(error = ?e, "h3 server init failed");
@@ -589,9 +702,10 @@ async fn h3_auth(
         };
     let mut h3_server = h3_server;
     /// wire 错误短路（须在 h3_server 绑定后定义，宏卫生）。
+    /// drop 时 AuthH3Conn 拦截 close；连接由调用方 serve_hysteria_connection
+    /// 的 `conn.close(0)` 收尾。
     macro_rules! bail {
         () => {{
-            std::mem::forget(h3_server);
             return None;
         }};
     }
@@ -666,7 +780,19 @@ async fn h3_auth(
                         }
                         Err(_) => bail!(),
                     }
-                    std::mem::forget(h3_server);
+                    // 票 ijvn：h3 server 不可在此立即 drop——内部 qpack/控制流
+                    // drop 会向对端发 STOP/RESET（对 qpack 流是协议违规，
+                    // client h3 driver 会因此关闭整条 QUIC 连接），也不可继续
+                    // poll accept（会抢 raw bidi stream）。移交 detached task
+                    // 挂起持有（不 poll），QUIC 连接完全关闭后随 task drop 回收
+                    // ——替代旧 `mem::forget`：h3 状态生命周期 = 连接生命周期，
+                    // 连接 churn 不再累积泄漏。
+                    let hold_conn = conn.clone();
+                    tokio::spawn(async move {
+                        let _held = h3_server;
+                        let _ = hold_conn.closed().await;
+                        // conn closed：对端不再消费流，此刻 drop 安全
+                    });
                     return Some(client_down);
                 }
 
@@ -1032,6 +1158,44 @@ mod tests {
         let server = server_task.await.unwrap();
 
         (client, server, server_endpoint)
+    }
+
+    /// 票 ijvn：auth 用 h3 server（AuthH3Conn 包装）drop 后连接必须存活
+    /// （close 被拦截，raw bidi 继续——替代旧 mem::forget 语义）。
+    /// 对照组用裸 h3_quinn Connection 证明 drop 确会关连：测试能抓到
+    /// close 未拦截的回归。
+    #[tokio::test]
+    async fn h3_server_drop_with_wrapper_keeps_conn_open() {
+        // —— 对照组：裸 h3_quinn drop 关连 ——
+        let (client, server, _ep) = make_loopback_conn_pair().await;
+        let h3: h3::server::Connection<h3_quinn::Connection, bytes::Bytes> =
+            h3::server::Connection::new(h3_quinn::Connection::new(server.inner().clone()))
+                .await
+                .unwrap();
+        drop(h3);
+        let result = server.inner().accept_bi().await;
+        assert!(result.is_err(), "bare h3 server drop must close the QUIC conn");
+        drop(client);
+
+        // —— 实验组：AuthH3Conn 包装 drop 不关连，raw bidi 可用 ——
+        let (client, server, _ep) = make_loopback_conn_pair().await;
+        let h3: h3::server::Connection<AuthH3Conn, bytes::Bytes> =
+            h3::server::Connection::new(AuthH3Conn::new(server.inner().clone()))
+                .await
+                .unwrap();
+        drop(h3);
+        let (mut send, mut recv) = client.inner().open_bi().await.unwrap();
+        use tokio::io::AsyncWriteExt;
+        send.write_all(b"hello").await.unwrap();
+        send.finish().unwrap();
+        let (_s, mut r) = tokio::time::timeout(std::time::Duration::from_secs(10), server.inner().accept_bi())
+            .await
+            .expect("wrapped h3 server drop must NOT close the QUIC conn")
+            .unwrap();
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 5];
+        r.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
     }
 
     #[tokio::test]

@@ -16,6 +16,9 @@ pub mod handler;
 pub mod inbound;
 pub mod udp;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use config::{
     Config, DestinationOverride, DomainStrategy, FinalRule, FinalRuleConfig, Fragment, Noise, Range,
     RuleAction, ALL_NETWORKS, DEFAULT_BLOCK_PRIVATE_CIDRS, DefaultRuleType,

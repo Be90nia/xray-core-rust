@@ -26,6 +26,7 @@ use crate::encoding::body_chunk::{
     PlainSizeParser, ShakeSizeParserAdapter, SizeParser, make_authenticated_length_size_parser,
 };
 use crate::request_option;
+use crate::error::VmessError;
 use crate::validator::TimedUserValidator;
 /// Duplex 缓冲大小（与 chunk payload 上限 8 KiB 对齐，留足一个 chunk 余量）。
 const DUPLEX_BUF: usize = 16_384;
@@ -223,7 +224,14 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
                 use xray_common::drain::{BehaviorSeedLimitedDrainer, Drainer as _};
                 let drainer =
                     BehaviorSeedLimitedDrainer::new(crate::validator::Validator::behavior_seed(validator.as_ref()) as i64, 16 + 38, 3266, 64);
-                drainer.acknowledge_receive(16); // auth_id 已读（AEAD 内部计数不可得，近似）
+                // Go server.go:137 drainConnection 恒 acknowledge buffer.Len()=16
+                //（auth_id）；解密失败分支（server.go:167-169）另 acknowledge
+                // OpenVMessAEADHeader 回传的 AEAD 层精确 bytesRead（73fr：原先
+                // 固定 16 近似，伪造头场景关闭前读取总量与 Go 可辨）。
+                drainer.acknowledge_receive(16);
+                if let VmessError::AeadReadFailed { should_drain: true, bytes_read, .. } = &e {
+                    drainer.acknowledge_receive(*bytes_read);
+                }
                 // drain 受同一 handshake deadline 限制（Go SetReadDeadline 覆盖
                 // decode+drain 总时长；原硬编码 4s 偏离 policy 缺省 60s）
                 let _ = tokio::time::timeout_at(handshake_deadline, drainer.drain(&mut stream_r)).await;

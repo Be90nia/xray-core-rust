@@ -21,6 +21,41 @@ use xray_transport::listener_registry::{ConnHandler, TransportListener};
 
 use crate::config::Config;
 
+/// gRPC :authority 判定（Go dial.go:147-153，票 0tnw）。
+///
+/// 三级回退：一级 `grpcSettings.Authority`；二级只看 tlsConfig 的 serverName
+///（Go `tlsConfig != nil` 即 security==tls——reality 下 tlsConfig 为 nil，
+/// reality serverName 不进 authority）；三级非 reality 且目标为域名。
+/// 全空时 Go `grpc.WithAuthority("")` 由 grpc-go 回退 endpoint host:port
+///（JoinHostPort 语义，IPv6 加方括号）。
+fn grpc_authority(cfg_authority: &str, settings: &StreamSettings, dest: &Destination) -> String {
+    let server_name = settings
+        .security_json
+        .as_ref()
+        .and_then(|v| v.get("serverName"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let authority = if !cfg_authority.is_empty() {
+        cfg_authority.to_string()
+    } else if settings.security == "tls" && !server_name.is_empty() {
+        server_name.to_string()
+    } else if settings.security != "reality" && dest.address().is_domain() {
+        dest.address().to_string()
+    } else {
+        String::new()
+    };
+    if authority.is_empty() {
+        let host = dest.address().to_string();
+        if host.contains(':') {
+            format!("[{host}]:{}", dest.port().value())
+        } else {
+            format!("{host}:{}", dest.port().value())
+        }
+    } else {
+        authority
+    }
+}
+
 pub async fn dial(dest: &Destination, settings: &StreamSettings) -> io::Result<Box<dyn Connection>> {
     let addr = format!("{}:{}", dest.address(), dest.port().value());
     // r7a9：拨号外层 timeout 包装。Go xray-core system_dialer 用 DefaultSystemDialer
@@ -39,8 +74,7 @@ pub async fn dial(dest: &Destination, settings: &StreamSettings) -> io::Result<B
     // 时补默认（Go `TunCustomName` 等价但上游 service_name 对 "/foo" 返回空串）。
     let path = normalize_grpc_path(&cfg);
 
-    // Go dial.go:156-164 三级回退：authority → tlsSettings.serverName →
-    // 非 reality 的域名目标；全空 = 不发 :authority（gRPC 默认行为）。
+    // Go dial.go:147-153 authority 三级判定（0tnw：grpc_authority）。
     let server_name = settings
         .security_json
         .as_ref()
@@ -48,15 +82,7 @@ pub async fn dial(dest: &Destination, settings: &StreamSettings) -> io::Result<B
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let authority = if !cfg.authority.is_empty() {
-        cfg.authority.clone()
-    } else if !server_name.is_empty() {
-        server_name.clone()
-    } else if settings.security != "reality" && dest.address().is_domain() {
-        dest.address().to_string()
-    } else {
-        String::new()
-    };
+    let authority = grpc_authority(&cfg.authority, settings, dest);
     // Go dial.go:190-202：UA 预设映射（golang → 不发 UA）。
     let user_agent = resolve_user_agent(&cfg.user_agent);
 
@@ -715,5 +741,44 @@ mod tests {
         .await;
         let got = rx.borrow().clone();
         assert_eq!(got, b"alphabetagamma", "multi-element MultiHunk must not truncate");
+    }
+
+    #[test]
+    fn grpc_authority_three_level_fallback() {
+        // 0tnw（Go dial.go:147-153）：二级只认 tlsConfig（reality 下为 nil，
+        // serverName 不进 authority）；全空 → grpc-go 回退 endpoint host:port。
+        use xray_common::net::address::Address;
+        use xray_common::net::port::Port;
+        let domain = Destination::tcp(Address::new_domain("example.com"), Port::new(443));
+        let ip = Destination::tcp(Address::ipv4(std::net::Ipv4Addr::new(1, 2, 3, 4)), Port::new(8443));
+
+        // 一级：显式 authority 恒优先
+        let tls = StreamSettings { security: "tls".into(), ..StreamSettings::tcp() };
+        assert_eq!(grpc_authority("explicit.com", &tls, &domain), "explicit.com");
+
+        // 二级：tls + serverName
+        let tls_sn = StreamSettings {
+            security: "tls".into(),
+            security_json: Some(serde_json::json!({"serverName": "tls.example.com"})),
+            ..StreamSettings::tcp()
+        };
+        assert_eq!(grpc_authority("", &tls_sn, &domain), "tls.example.com");
+        // 二级落空（tls 无 serverName）→ 三级域名
+        assert_eq!(grpc_authority("", &tls, &domain), "example.com");
+
+        // reality + serverName：tlsConfig=nil → 二级跳过；三级被 reality 门控 →
+        // endpoint host:port（原先错发 serverName，Go 对照 = host:port）
+        let reality = StreamSettings {
+            security: "reality".into(),
+            security_json: Some(serde_json::json!({"serverName": "real.example.com"})),
+            ..StreamSettings::tcp()
+        };
+        assert_eq!(grpc_authority("", &reality, &domain), "example.com:443");
+        assert_eq!(grpc_authority("", &reality, &ip), "1.2.3.4:8443");
+
+        // 无 security：域名走三级；IP 全空回退 host:port
+        let none = StreamSettings::tcp();
+        assert_eq!(grpc_authority("", &none, &domain), "example.com");
+        assert_eq!(grpc_authority("", &none, &ip), "1.2.3.4:8443");
     }
 }

@@ -245,6 +245,42 @@ fn read_target(data: &[u8]) -> Result<(Destination, usize), MuxError> {
     Ok((target, 1 + addr_consumed))
 }
 
+/// Reverse-mux source/local 写出（Go frame.go:88-99）。
+///
+/// local 嵌套于 source 网络有效时；Unix 网络视同无效跳过（Go 仅判
+/// TCP/UDP）。
+fn write_inbound_to_vec(buf: &mut Vec<u8>, source: &Destination, local: Option<&Destination>) {
+    if TargetNetwork::from_network(source.network()).is_none() {
+        return;
+    }
+    write_target_to_vec(buf, source);
+    if let Some(local) = local {
+        if TargetNetwork::from_network(local.network()).is_some() {
+            write_target_to_vec(buf, local);
+        }
+    }
+}
+
+/// 解析 Reverse-mux New 帧的 source/local（Go frame.go:167-213）。
+///
+/// 逐段可选：剩余字节耗尽或 network 字节为 0（padding，Go :174-175/:195-196）
+/// 即终止；心跳等空帧 target 后无内容（Go :170-171）。
+fn parse_source_and_local(meta: &mut FrameMetadata, data: &[u8]) -> Result<(), MuxError> {
+    let mut offset = 0;
+    if offset >= data.len() || data[offset] == 0 {
+        return Ok(());
+    }
+    let (source, consumed) = read_target(&data[offset..])?;
+    meta.source = Some(source);
+    offset += consumed;
+    if offset >= data.len() || data[offset] == 0 {
+        return Ok(());
+    }
+    let (local, _) = read_target(&data[offset..])?;
+    meta.local = Some(local);
+    Ok(())
+}
+
 // ========== 帧元数据 ==========
 
 /// Mux 帧元数据。
@@ -261,6 +297,10 @@ pub struct FrameMetadata {
     option: Bitmask,
     /// 目标地址，仅在 New 状态或 Keep+UDP 时存在。
     target: Option<Destination>,
+    /// Reverse-mux 入站源地址（Go `FrameMetadata.Inbound.Source`）。
+    source: Option<Destination>,
+    /// Reverse-mux 入站本地地址（Go `FrameMetadata.Inbound.Local`）。
+    local: Option<Destination>,
     /// 全局 ID，用于 UDP 会话的源追踪（8 字节）。
     global_id: Option<[u8; 8]>,
 }
@@ -279,6 +319,8 @@ impl FrameMetadata {
             option,
             target: None,
             global_id: None,
+            source: None,
+            local: None,
         }
     }
 
@@ -293,6 +335,8 @@ impl FrameMetadata {
             option,
             target: Some(target),
             global_id: None,
+            source: None,
+            local: None,
         }
     }
 
@@ -305,6 +349,8 @@ impl FrameMetadata {
             option: Bitmask::default(),
             target: None,
             global_id: None,
+            source: None,
+            local: None,
         }
     }
 
@@ -317,6 +363,8 @@ impl FrameMetadata {
             option: Bitmask::default(),
             target: None,
             global_id: None,
+            source: None,
+            local: None,
         }
     }
 
@@ -331,6 +379,8 @@ impl FrameMetadata {
             option,
             target: Some(target),
             global_id: None,
+            source: None,
+            local: None,
         }
     }
 
@@ -362,6 +412,27 @@ impl FrameMetadata {
     #[must_use]
     pub fn global_id(&self) -> Option<&[u8; 8]> {
         self.global_id.as_ref()
+    }
+
+    /// 获取 Reverse-mux 入站源地址。
+    #[must_use]
+    pub fn source(&self) -> Option<&Destination> {
+        self.source.as_ref()
+    }
+
+    /// 获取 Reverse-mux 入站本地地址。
+    #[must_use]
+    pub fn local(&self) -> Option<&Destination> {
+        self.local.as_ref()
+    }
+
+    /// 设置 Reverse-mux 入站源/本地地址（Go `NewWriter` 的 `inbound` 参数）。
+    ///
+    /// 设置后 New 帧写出 source/local（Go frame.go:87-99），与 GlobalID
+    /// 互斥（Go frame.go:100 else 分支）。
+    pub fn set_inbound(&mut self, source: Destination, local: Destination) {
+        self.source = Some(source);
+        self.local = Some(local);
     }
 
     /// 设置目标地址。
@@ -421,11 +492,15 @@ impl FrameMetadata {
 
         // 目标地址
         if self.session_status == SessionStatus::New {
-            if let Some(ref target) = self.target {
+            if let Some(target) = &self.target {
                 write_target_to_vec(&mut buf, target);
             }
-            if self.is_udp_target() {
-                if let Some(ref gid) = self.global_id {
+            if let Some(source) = &self.source {
+                // Go frame.go:87-99：Reverse-mux 场景写 source/local，
+                // 与 GlobalID 互斥（Go :100 else 分支）
+                write_inbound_to_vec(&mut buf, source, self.local.as_ref());
+            } else if self.is_udp_target() {
+                if let Some(gid) = &self.global_id {
                     buf.extend_from_slice(gid);
                 }
             }
@@ -460,6 +535,19 @@ impl FrameMetadata {
     ///
     /// 返回解析后的 `FrameMetadata` 和消耗的总字节数（含 length 字段）。
     pub fn read_from_bytes(data: &[u8]) -> Result<(Self, usize), MuxError> {
+        Self::read_from_bytes_impl(data, false)
+    }
+
+    /// 解析带 Reverse-mux source/local 的帧元数据（Go `Unmarshal` 的
+    /// `readSourceAndLocal=true`；仅 reverse-mux 对端会携带这些可选字段）。
+    pub fn read_from_bytes_with_source(data: &[u8]) -> Result<(Self, usize), MuxError> {
+        Self::read_from_bytes_impl(data, true)
+    }
+
+    fn read_from_bytes_impl(
+        data: &[u8],
+        read_source_and_local: bool,
+    ) -> Result<(Self, usize), MuxError> {
         if data.len() < 2 {
             return Err(MuxError::InsufficientData {
                 expected: 2,
@@ -485,7 +573,7 @@ impl FrameMetadata {
         }
 
         let body = &data[2..2 + meta_len];
-        let meta = Self::parse_body(body)?;
+        let meta = Self::parse_body(body, read_source_and_local)?;
 
         Ok((meta, 2 + meta_len))
     }
@@ -505,11 +593,11 @@ impl FrameMetadata {
         let mut body = vec![0u8; meta_len];
         reader.read_exact(&mut body)?;
 
-        Self::parse_body(&body)
+        Self::parse_body(&body, false)
     }
 
     /// 解析帧体（不含 length 前缀）。
-    fn parse_body(body: &[u8]) -> Result<Self, MuxError> {
+    fn parse_body(body: &[u8], read_source_and_local: bool) -> Result<Self, MuxError> {
         if body.len() < 4 {
             return Err(MuxError::InsufficientData {
                 expected: 4,
@@ -533,6 +621,8 @@ impl FrameMetadata {
             option,
             target: None,
             global_id: None,
+            source: None,
+            local: None,
         };
 
         let mut offset = 4;
@@ -543,6 +633,11 @@ impl FrameMetadata {
                 let (target, consumed) = read_target(&body[offset..])?;
                 meta.target = Some(target);
                 offset += consumed;
+            }
+            if read_source_and_local {
+                parse_source_and_local(&mut meta, &body[offset..])?;
+                // Go frame.go:212 提前返回：source/local 帧不再读 GlobalID
+                return Ok(meta);
             }
             // 解析 GlobalID（New + Data + UDP + 剩余>=8）
             if meta.has_data()
@@ -686,6 +781,74 @@ mod tests {
         assert!(parsed.is_udp_target());
         assert!(parsed.global_id().is_some());
         assert_eq!(*parsed.global_id().unwrap(), gid);
+    }
+
+    /// Reverse-mux New 帧样例：source+local 逐字节对拍 + 两种 flag 解析
+    /// （Go frame.go:87-99 写 / :167-213 读）。
+    #[test]
+    fn test_reverse_new_frame_source_local_parse() {
+        let source = Destination::tcp(Address::ipv4(Ipv4Addr::new(10, 0, 0, 1)), Port::new(5555));
+        let local = Destination::tcp(Address::ipv4(Ipv4Addr::new(127, 0, 0, 1)), Port::new(1080));
+        let mut meta = FrameMetadata::new_session(
+            7,
+            Destination::tcp(Address::ipv4(Ipv4Addr::new(1, 2, 3, 4)), Port::new(443)),
+        );
+        meta.set_inbound(source.clone(), local.clone());
+
+        let bytes = meta.to_bytes();
+        // 逐字节对拍：4B 头 + 每段 8B（net 1B + port 2B BE + addr family 1B +
+        // IPv4 4B）
+        assert_eq!(&bytes[2..4], &[0x00, 0x07]);
+        assert_eq!(bytes[4], 0x01); // status New
+        assert_eq!(bytes[5], 0x01); // option Data
+        // target
+        assert_eq!(bytes[6], 0x01); // net TCP
+        assert_eq!(&bytes[7..9], &[0x01, 0xBB]); // 443
+        assert_eq!(&bytes[9..14], &[0x01, 1, 2, 3, 4]);
+        // source
+        assert_eq!(bytes[14], 0x01); // net TCP
+        assert_eq!(&bytes[15..17], &[0x15, 0xB3]); // 5555
+        assert_eq!(&bytes[17..22], &[0x01, 10, 0, 0, 1]);
+        // local
+        assert_eq!(bytes[22], 0x01); // net TCP
+        assert_eq!(&bytes[23..25], &[0x04, 0x38]); // 1080
+        assert_eq!(&bytes[25..30], &[0x01, 127, 0, 0, 1]);
+
+        let (parsed, consumed) = FrameMetadata::read_from_bytes_with_source(&bytes)
+            .expect("parse should succeed");
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(parsed.source(), Some(&source));
+        assert_eq!(parsed.local(), Some(&local));
+        assert!(parsed.global_id().is_none(), "source 帧与 GlobalID 互斥");
+
+        // 不开 flag（普通 mux 路径）：不解析 source/local
+        let (plain, _) = FrameMetadata::read_from_bytes(&bytes).expect("parse should succeed");
+        assert!(plain.source().is_none());
+        assert!(plain.local().is_none());
+    }
+
+    /// Reverse-mux source 缺席变体：空尾帧（心跳，Go :170-171）与
+    /// padding 帧（network 字节 0，Go :174-175）。
+    #[test]
+    fn test_reverse_new_frame_without_source_variants() {
+        let meta = FrameMetadata::new(1, SessionStatus::New, Bitmask::default());
+        let bytes = meta.to_bytes();
+        let (parsed, _) = FrameMetadata::read_from_bytes_with_source(&bytes)
+            .expect("parse should succeed");
+        assert!(parsed.source().is_none());
+
+        let meta = FrameMetadata::new_session(
+            2,
+            Destination::tcp(Address::ipv4(Ipv4Addr::new(1, 2, 3, 4)), Port::new(443)),
+        );
+        let mut bytes = meta.to_bytes();
+        bytes.push(0x00); // padding
+        let len = u16::from_be_bytes([bytes[0], bytes[1]]) + 1;
+        bytes[0..2].copy_from_slice(&len.to_be_bytes());
+        let (parsed, consumed) = FrameMetadata::read_from_bytes_with_source(&bytes)
+            .expect("parse should succeed");
+        assert_eq!(consumed, bytes.len());
+        assert!(parsed.source().is_none());
     }
 
     #[test]

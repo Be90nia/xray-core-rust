@@ -378,7 +378,11 @@ pub type PinFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 // ========== 嗅探请求配置 ==========
 
 /// 嗅探请求配置（对应 Go `session.SniffingRequest`）
-#[derive(Debug, Clone, Default)]
+///
+/// 排除字段是 config 装配期编译好的 typed matcher（Go `proxyman.BuildSniffingRequest`
+/// → `geodata.DomainReg.BuildDomainMatcher` / `IPReg.BuildIPMatcher` 同构）：
+/// `None` = 无规则（Go nil），由 xray-core 的接线层经 geodata rule_parser 编译。
+#[derive(Clone, Default)]
 pub struct SniffingRequest {
     /// 是否启用嗅探
     pub enabled: bool,
@@ -386,12 +390,35 @@ pub struct SniffingRequest {
     pub metadata_only: bool,
     /// 仅对这些协议覆盖目的地
     pub override_destination_for_protocol: Vec<String>,
-    /// 排除这些域名（不覆盖）
-    pub exclude_for_domain: Vec<String>,
-    /// 排除这些 IP（不覆盖）
-    pub exclude_for_ip: Vec<IpAddr>,
+    /// 排除这些域名（不覆盖）。入参为小写化后的嗅探域名。
+    pub exclude_for_domain: Option<Arc<ExcludeDomainMatcher>>,
+    /// 排除这些 IP（不覆盖）。入参为原目的地 IP。
+    pub exclude_for_ip: Option<Arc<ExcludeIpMatcher>>,
     /// 仅路由（不改 target）
     pub route_only: bool,
+}
+
+/// domainsExcluded 编译产物：config 层按 full:/domain:/regexp:/keyword:/无前缀
+/// Substr（+ geosite: 展开）形态编译的域名排除判定，对应 Go `geodata.DomainMatcher`。
+pub type ExcludeDomainMatcher = dyn Fn(&str) -> bool + Send + Sync;
+
+/// ipsExcluded 编译产物（CIDR / geoip: 展开），对应 Go `geodata.IPMatcher`。
+pub type ExcludeIpMatcher = dyn Fn(IpAddr) -> bool + Send + Sync;
+
+impl Debug for SniffingRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SniffingRequest")
+            .field("enabled", &self.enabled)
+            .field("metadata_only", &self.metadata_only)
+            .field(
+                "override_destination_for_protocol",
+                &self.override_destination_for_protocol,
+            )
+            .field("exclude_for_domain", &self.exclude_for_domain.is_some())
+            .field("exclude_for_ip", &self.exclude_for_ip.is_some())
+            .field("route_only", &self.route_only)
+            .finish()
+    }
 }
 
 // ========== should_override 核心逻辑 ==========
@@ -400,7 +427,7 @@ pub struct SniffingRequest {
 ///
 /// 对应 Go `(*DefaultDispatcher).shouldOverride`。判定流程：
 /// 1. domain 为空 → false
-/// 2. domain 命中 exclude_for_domain（前缀小写匹配）→ false
+/// 2. domain 命中 exclude_for_domain（config 层编译的 typed matcher）→ false
 /// 3. dest 是 IP 且命中 exclude_for_ip → false
 /// 4. protocol 命中 override_destination_for_protocol 列表（前缀匹配任一侧）→ true
 ///
@@ -421,18 +448,21 @@ pub fn should_override(
         return false;
     }
 
-    // exclude_for_domain：小写前缀匹配（Go 用 matcher.MatchAny）
-    let domain_lower = domain.to_lowercase();
-    for excl in &request.exclude_for_domain {
-        if domain_lower.contains(excl.as_str()) {
+    // exclude_for_domain：config 层编译的 typed matcher
+    // （Go：request.ExcludeForDomain.MatchAny(strings.ToLower(domain))）
+    if let Some(m) = &request.exclude_for_domain {
+        if m(domain.to_lowercase().as_str()) {
             return false;
         }
     }
 
     // exclude_for_ip：仅当 dest 是 IP 且命中
+    // （Go：destination.Address.Family().IsIP() 门控 + request.ExcludeForIP.Match(ip)）
     if let Some(addr) = dest_address {
-        if request.exclude_for_ip.iter().any(|&ip| ip == addr) {
-            return false;
+        if let Some(m) = &request.exclude_for_ip {
+            if m(addr) {
+                return false;
+            }
         }
     }
 
@@ -1831,7 +1861,7 @@ mod tests {
     fn override_returns_false_when_excluded_by_domain() {
         let r = make_sniff("http", "blocked.example.com");
         let req = SniffingRequest {
-            exclude_for_domain: vec!["blocked".to_string()],
+            exclude_for_domain: Some(Arc::new(|d: &str| d.contains("blocked"))),
             ..Default::default()
         };
         assert!(!should_override(&r, &req, None, None));
@@ -1841,7 +1871,7 @@ mod tests {
     fn override_returns_false_when_excluded_by_ip() {
         let r = make_sniff("http", "example.com");
         let req = SniffingRequest {
-            exclude_for_ip: vec![ip("1.2.3.4")],
+            exclude_for_ip: Some(Arc::new(|addr: IpAddr| addr == ip("1.2.3.4"))),
             ..Default::default()
         };
         assert!(!should_override(&r, &req, Some(ip("1.2.3.4")), None));
@@ -1893,12 +1923,52 @@ mod tests {
     fn override_skips_ip_exclude_when_dest_is_not_ip() {
         let r = make_sniff("http", "example.com");
         let req = SniffingRequest {
-            exclude_for_ip: vec![ip("1.2.3.4")],
+            exclude_for_ip: Some(Arc::new(|addr: IpAddr| addr == ip("1.2.3.4"))),
             override_destination_for_protocol: vec!["http".to_string()],
             ..Default::default()
         };
         // dest = None 不命中 exclude_for_ip → 继续 protocol 检查 → true
         assert!(should_override(&r, &req, None, None));
+    }
+
+    #[test]
+    fn override_domain_exclude_is_case_insensitive() {
+        // fv1g：大小写混合嗅探域名经小写化后交给 matcher，同样命中排除
+        let r = make_sniff("http", "WWW.Blocked.Example.COM");
+        let req = SniffingRequest {
+            exclude_for_domain: Some(Arc::new(|d: &str| d.ends_with("blocked.example.com"))),
+            override_destination_for_protocol: vec!["http".to_string()],
+            ..Default::default()
+        };
+        assert!(!should_override(&r, &req, None, None));
+    }
+
+    #[test]
+    fn override_ip_exclude_supports_cidr_style_matcher() {
+        // fv1g：CIDR 型 IP 排除；命中 → 不覆盖，未命中 → 正常覆盖
+        let r = make_sniff("http", "example.com");
+        let req = SniffingRequest {
+            exclude_for_ip: Some(Arc::new(|addr: IpAddr| {
+                matches!(addr, IpAddr::V4(v4) if v4.octets()[0] == 10)
+            })),
+            override_destination_for_protocol: vec!["http".to_string()],
+            ..Default::default()
+        };
+        assert!(!should_override(&r, &req, Some(ip("10.1.2.3")), None));
+        assert!(should_override(&r, &req, Some(ip("8.8.8.8")), None));
+    }
+
+    #[test]
+    fn override_with_no_exclusions_still_overrides() {
+        // None = 无规则（Go nil），覆盖判定不受影响
+        let r = make_sniff("http", "example.com");
+        let req = SniffingRequest {
+            exclude_for_domain: None,
+            exclude_for_ip: None,
+            override_destination_for_protocol: vec!["http".to_string()],
+            ..Default::default()
+        };
+        assert!(should_override(&r, &req, Some(ip("1.2.3.4")), None));
     }
 
     // ---- DefaultDispatcher ----

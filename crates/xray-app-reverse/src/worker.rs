@@ -377,9 +377,10 @@ impl BridgeWorker {
         });
         *me.self_ref.write() = Some(Arc::downgrade(&me));
 
-        let server = Arc::new(ServerWorker::new(Arc::new(WeakBridgeDispatcher(
-            Arc::downgrade(&me),
-        ))));
+        let server = std::sync::Arc::new(
+            ServerWorker::new(std::sync::Arc::new(WeakBridgeDispatcher(Arc::downgrade(&me))))
+                .with_read_source_and_local(),
+        );
         *me.worker.write() = Some(Arc::clone(&server));
 
         let timer_server = Arc::clone(&server);
@@ -392,8 +393,7 @@ impl BridgeWorker {
         let mut reader = BufferedReader::new(carrier.reader);
         let link_writer: Arc<tokio::sync::Mutex<Option<Box<dyn IoWriter>>>> =
             Arc::new(tokio::sync::Mutex::new(Some(carrier.writer)));
-        let (keepalive_h, idle_h) =
-            server.spawn_keepalive_and_idle_timeout(Arc::clone(&link_writer));
+        let monitor_h = server.spawn_monitor(Arc::clone(&link_writer));
         let frame_server = Arc::clone(&server);
         tokio::spawn(async move {
             loop {
@@ -403,8 +403,7 @@ impl BridgeWorker {
                 }
             }
             frame_server.close();
-            keepalive_h.abort();
-            idle_h.abort();
+            monitor_h.abort();
         });
 
         Ok(me)
@@ -819,11 +818,12 @@ mod entity_tests {
                 tx,
                 keepers: std::sync::Arc::new(Mutex::new(Vec::new())),
             },
-        )));
+        ))
+        .with_read_source_and_local());
         let mut reader = xray_buf::reader::BufferedReader::new(Box::new(s_read));
         let link_writer: std::sync::Arc<tokio::sync::Mutex<Option<Box<dyn IoWriter>>>> =
             std::sync::Arc::new(tokio::sync::Mutex::new(Some(Box::new(s_write))));
-        let (ka, idle) = server.spawn_keepalive_and_idle_timeout(link_writer.clone());
+        let monitor_h = server.spawn_monitor(link_writer.clone());
         tokio::spawn(async move {
             loop {
                 match server.process_frame(&mut reader, &link_writer).await {
@@ -832,8 +832,7 @@ mod entity_tests {
                 }
             }
             server.close();
-            ka.abort();
-            idle.abort();
+            monitor_h.abort();
         });
         worker
     }

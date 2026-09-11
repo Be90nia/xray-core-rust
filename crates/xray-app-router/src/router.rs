@@ -326,10 +326,13 @@ pub(crate) fn ctx_hash_key(ctx: &dyn RoutingContext) -> u64 {
 /// 构建 Balancer。
 ///
 /// 对应 Go `BalancingRule.Build`（`app/router/config.go:121-165`）：
-/// - `random` / `""` / `roundrobin` 不依赖 observer
+/// - 策略名 `ToLower` 归一（Go config.go:122）
+/// - `""` 与 `random` 同走 RandomStrategy（Go config.go:153-161 fallthrough）
+/// - `roundrobin` 不依赖 observer
 /// - `leastping` / `leastload` 依赖 observer。无 observer 时**仍构建**，但
 ///   策略在 `pick_outbound` 时返回空 → `Balancer` 走 `fallback_tag`（与 Go
 ///   无 observatory 时返回空字符串 → fallback 的行为一致）。
+/// - 其余策略名报错（Go config.go:162-163 "unrecognized balancer type"）
 ///
 /// `strategy_settings`（TypedMessage 反序列化）当前不解析：LeastLoad 用
 /// `StrategyLeastLoadConfig::default()` 兜底（同 Go 缺省值）。
@@ -338,7 +341,7 @@ fn build_balancer(
     ohm: &Arc<dyn OutboundHandlerSelector>,
     observer: Option<Arc<dyn ObservationProvider>>,
 ) -> Result<Balancer, RouterError> {
-    let strategy: Arc<dyn BalancingStrategy> = match br.strategy.as_str() {
+    let strategy: Arc<dyn BalancingStrategy> = match br.strategy.to_ascii_lowercase().as_str() {
         // fallback 语义在 Balancer（Go balancing.go），策略不掺 fallback。
         "random" => Arc::new(crate::strategy_random::RandomStrategy::new(
             br.outbound_selector.clone(),
@@ -379,18 +382,19 @@ fn build_balancer(
                 Arc::new(StubLeastLoadStrategy)
             }
         }
-        "" | "roundrobin" => Arc::new(crate::balancing::RoundRobinStrategy::new(
+        "" => Arc::new(crate::strategy_random::RandomStrategy::new(
+            br.outbound_selector.clone(),
+            ohm.clone(),
+        )),
+        "roundrobin" => Arc::new(crate::balancing::RoundRobinStrategy::new(
             br.outbound_selector.clone(),
             ohm.clone(),
             observer.clone(),
         )),
-        other => {
-            tracing::warn!(target: "xray_router", strategy = %other, "unknown strategy, falling back to roundrobin");
-            Arc::new(crate::balancing::RoundRobinStrategy::new(
-                br.outbound_selector.clone(),
-                ohm.clone(),
-                observer.clone(),
-            ))
+        _other => {
+            // 对齐 Go config.go:162-163：未知策略拒绝启动（此前 warn 降级
+            // roundrobin 会把拼错的 "LeastLoad"/"Random" 静默变成轮询）。
+            return Err(RouterError::UnknownBalancerType);
         }
     };
 
@@ -816,6 +820,47 @@ mod tests {
         }
         assert!(!picks.contains("a"), "dead outbound a should not be picked");
         assert!(picks.iter().all(|t| t == "b" || t == "c"));
+    }
+
+    #[test]
+    fn test_build_balancer_empty_strategy_uses_random() {
+        // 对齐 Go config.go:153-161：策略空串 fallthrough 到 RandomStrategy。
+        // Random 单候选恒返回该候选，可确定性断言。
+        let mut cfg = Config::default();
+        cfg.balancing_rule = vec![balancing_rule_with("", "bl", "fb")];
+        cfg.rule = vec![simple_balance_rule("bl")];
+        // SimpleSelector 注册 "a"（与 balancing_rule_with 的 selector[0] 对齐），
+        // Random 从唯一存活候选恒取 "a"，可确定性断言。
+        let ohm = Arc::new(SimpleSelector::from_tags(["a"]));
+        let r = Router::init(&cfg, ohm, None, None).unwrap();
+        let ctx = RoutingData::new().with_target_domain("x.test");
+        for _ in 0..5 {
+            assert_eq!(r.pick_route(&ctx).unwrap().outbound_tag, "a");
+        }
+    }
+
+    #[test]
+    fn test_build_balancer_strategy_case_insensitive() {
+        // 对齐 Go config.go:122 strings.ToLower："LeastLoad" 不再落入 unknown。
+        let mut cfg = Config::default();
+        cfg.balancing_rule = vec![balancing_rule_with("LeastLoad", "bl", "fb")];
+        cfg.rule = vec![simple_balance_rule("bl")];
+        let ohm = Arc::new(SimpleSelector::from_tags(["a", "b", "c"]));
+        // 无 observer 时 leastload 仍构建并走 fallback（同 leastping 行为）。
+        let r = Router::init(&cfg, ohm, None, None).unwrap();
+        let ctx = RoutingData::new().with_target_domain("x.test");
+        assert_eq!(r.pick_route(&ctx).unwrap().outbound_tag, "fb");
+    }
+
+    #[test]
+    fn test_build_balancer_unknown_strategy_errors() {
+        // 对齐 Go config.go:162-163：未知策略拒绝启动（此前 warn 降级 roundrobin）。
+        let mut cfg = Config::default();
+        cfg.balancing_rule = vec![balancing_rule_with("noSuchStrategy", "bl", "fb")];
+        cfg.rule = vec![simple_balance_rule("bl")];
+        let ohm = Arc::new(SimpleSelector::from_tags(["a"]));
+        let r = Router::init(&cfg, ohm, None, None);
+        assert!(matches!(r, Err(RouterError::UnknownBalancerType)));
     }
 
     /// 验证 `Router::pick_route(ctx)` 传递 ctx 到 ConsistentHashing 策略：

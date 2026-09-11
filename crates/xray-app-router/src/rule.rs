@@ -178,9 +178,7 @@ pub fn build_condition(
 
     // User
     if !proto.user_email.is_empty() {
-        chan.add(Box::new(UserMatcherCondition::new(proto.user_email.clone()).map_err(|e| {
-            RouterError::GeodataBuild(e.to_string())
-        })?));
+        chan.add(Box::new(UserMatcherCondition::new(proto.user_email.clone())));
     }
 
     // Inbound tag

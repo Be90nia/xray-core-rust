@@ -62,7 +62,7 @@ fn test_mux_constants() {
     assert_eq!(MUX_COOL_ADDRESS, "v1.mux.cool");
     assert_eq!(xray_mux::client::MUX_COOL_PORT, 9527);
     assert_eq!(xray_mux::client::MAX_DISPATCH_RETRY, 16);
-    assert_eq!(xray_mux::worker::SERVER_KEEPALIVE_INTERVAL, std::time::Duration::from_secs(60));
+    assert_eq!(xray_mux::worker::SERVER_MONITOR_INTERVAL, std::time::Duration::from_secs(60));
 }
 
 // ========== SessionManager 集成 ==========

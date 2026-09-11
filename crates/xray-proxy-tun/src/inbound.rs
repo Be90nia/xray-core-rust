@@ -59,6 +59,7 @@ use smoltcp::iface::SocketHandle;
 use smoltcp::wire::IpEndpoint;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 use xray_app_dispatcher::{DispatchHandler, UdpDispatchSession};
@@ -241,19 +242,28 @@ const UDP_SESSION_SWEEP_SECS: u64 = 30;
 /// 对应 Go `proxy/tun/udp_fullcone.go:31` 的 `udpConns map[net.Destination]*udpConn`：
 /// 按 source 分桶实现 cone NAT，每个 remote src 一个 dispatch link。
 type UdpSessions = Arc<ParkMutex<HashMap<IpEndpoint, Arc<UdpSessionEntry>>>>;
-/// 单个 remote src 的 session 条目：session + reader task handle + 最近活跃时间。
+/// 单个 remote src 的 UDP 会话句柄（票 8gr6）。
 ///
-/// reader 只 spawn 一次；后续包复用 task 即可（session 是 &mut self，
-/// send_packet 仍可并发调用——内部 duplex 是 &mut self + 异步，task 串行）。
+/// 对应 Go `proxy/tun/udp_fullcone.go` 的 `*udpConn`：每条会话一个 owner task
+/// 独占 [`UdpDispatchSession`]（收发无互斥——reader 不再持锁跨 recv），map 里
+/// 只留非阻塞入队句柄。sweep 淘汰 = 从 map 移除 entry → cmd_tx 随 Arc 释放
+/// 而 drop → owner task 收到 channel 关闭自动退出 → session drop → dispatch
+/// duplex EOF，outbound 侧随之回收（Go `CancelAfterInactivity` 语义）。
 ///
-/// p14e：`last_used_nanos` 由 handle_udp_packet 每次命中更新；后台 sweep 任务
-/// 每 30s 检查一次，超过 60s 未活动则从 map 移除并关闭 dispatch session。
+/// p14e：`last_used_nanos` 由 handle_udp_packet 每次命中更新；sweep 任务每
+/// 30s 检查一次，超过 60s 未活动则淘汰。
 struct UdpSessionEntry {
-    session: AsyncMutex<UdpDispatchSession>,
-    reader_started: AtomicBool,
-    /// 最近一次 send_packet 的 wall-clock 纳秒（std::time::SystemTime 测得）。
+    /// 客户端包入队口（非阻塞；owner task 顺序消费转发 outbound）。
+    cmd_tx: mpsc::UnboundedSender<SessionCmd>,
+    /// 最近一次命中的 wall-clock 纳秒（std::time::SystemTime 测得）。
     /// sweep 任务对比 `now - last_used > 60s` 决定淘汰。
     last_used_nanos: AtomicI64,
+}
+
+/// owner task 的输入命令。
+enum SessionCmd {
+    /// 转发一个客户端数据报到 outbound。
+    Send { dest: Destination, payload: Vec<u8> },
 }
 
 async fn tun_driver_loop(
@@ -346,8 +356,8 @@ async fn tun_driver_loop(
 /// 单 UDP 数据报 → dispatch（full-cone NAT）。
 ///
 /// 对应 Go `udp_fullcone.go:HandlePacket`：按 src 懒建 `udpConn`，首次
-/// 确定 routing，后续包复用同一 session。响应回写由 [`UdpDispatchSession`]
-/// reader task 持续 recv 完成。
+/// 确定 routing，后续包复用同一 session。响应回写由 owner task 持续
+/// recv 完成（票 8gr6：channel 化，收发无互斥）。
 fn handle_udp_packet(
     sessions: &UdpSessions,
     meta: UdpPacketMeta,
@@ -355,16 +365,23 @@ fn handle_udp_packet(
     dispatch: Arc<dyn DispatchHandler>,
     device: Arc<TunDevice>,
 ) {
-    // 懒建 session：按 src 找；不在则建。
+    // 懒建 session：按 src 找；不在则建（含 owner task 一次性 spawn）。
     // p14e：last_used_nanos 初始化为当前 wall-clock，避免刚建的 session
     // 被下一次 sweep 误判为已空闲 60s。
     let entry = {
         let mut map = sessions.lock();
         map.entry(meta.src)
             .or_insert_with(|| {
+                let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+                spawn_udp_session_task(
+                    Arc::clone(&dispatch),
+                    cmd_rx,
+                    Arc::clone(&device),
+                    meta.src,
+                    meta.dst,
+                );
                 Arc::new(UdpSessionEntry {
-                    session: AsyncMutex::new(UdpDispatchSession::new(Arc::clone(&dispatch))),
-                    reader_started: AtomicBool::new(false),
+                    cmd_tx,
                     last_used_nanos: AtomicI64::new(now_nanos()),
                 })
             })
@@ -375,28 +392,15 @@ fn handle_udp_packet(
         .last_used_nanos
         .store(now_nanos(), Ordering::Relaxed);
 
-    // 把 dest + payload 通过 session 转发；首包懒建 dispatch link。
-    // 必须 spawn：send_packet 是 async，driver loop 不能 await（会阻塞 TUN recv）。
-    let dest = ip_endpoint_to_udp_destination(&meta.dst);
-    let Some(dest) = dest else {
+    // 非阻塞入队（票 8gr6）：对端不应答使 recv 挂死时，后续包照常入队送达，
+    // 不再与 reader 争锁排队。首包由 owner task 懒建 dispatch link。
+    let Some(dest) = ip_endpoint_to_udp_destination(&meta.dst) else {
         tracing::warn!(src = %meta.src, dst = %meta.dst, "udp: invalid destination, dropping");
         return;
     };
-
-    let meta_src = meta.src;
-    let meta_dst = meta.dst;
-    let payload = payload.to_vec();
-    let entry_clone = Arc::clone(&entry);
-    tokio::spawn(async move {
-        let mut s = entry_clone.session.lock().await;
-        if let Err(e) = s.send_packet(&dest, &payload).await {
-            tracing::warn!(error = %e, src = %meta_src, dst = %meta_dst, "udp: session.send_packet failed");
-            return;
-        }
-        drop(s);
-        // 首包懒启 reader task（仅一次）：session 是 &mut self，
-        // 不能跨 await 持锁，所以 reader task 拿 Arc<UdpSessionEntry>。
-        spawn_udp_session_reader_if_first(&entry_clone, Arc::clone(&device), meta_src, meta_dst);
+    let _ = entry.cmd_tx.send(SessionCmd::Send {
+        dest,
+        payload: payload.to_vec(),
     });
 }
 
@@ -409,7 +413,8 @@ fn now_nanos() -> i64 {
         .unwrap_or(0)
 }
 
-/// p14e：周期性扫描 idle 60s+ 的 UDP session，关闭 dispatch session 后从 map 淘汰。
+/// p14e：周期性扫描 idle 60s+ 的 UDP session 并从 map 淘汰（票 8gr6 重构：
+/// 无 try_lock 探测——owner task 独占 session，map 移除即可回收）。
 /// 后台 spawn，无关主 driver loop。
 fn spawn_udp_session_sweeper(sessions: UdpSessions) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -418,39 +423,38 @@ fn spawn_udp_session_sweeper(sessions: UdpSessions) -> JoinHandle<()> {
         tick.tick().await;
         loop {
             tick.tick().await;
-            let now = now_nanos();
-            let idle_nanos = (UDP_SESSION_IDLE_SECS as i64) * 1_000_000_000;
-
-            let mut to_close: Vec<IpEndpoint> = Vec::new();
-            {
-                let map = sessions.lock();
-                for (k, v) in map.iter() {
-                    let last = v.last_used_nanos.load(Ordering::Relaxed);
-                    if now.saturating_sub(last) > idle_nanos {
-                        // 拿不到锁（reader/sender 在用）→ 等下一 sweep。
-                        if v.session.try_lock().is_ok() {
-                            to_close.push(*k);
-                        }
-                    }
-                }
-            }
-            // 第二轮上锁删除：避免迭代中改 map。session 的 MutexGuard 已
-            // 在上一轮 try_lock 成功时释放，drop 顺序由 Arc 引用计数保证。
-            let mut removed = 0usize;
-            if !to_close.is_empty() {
-                let mut map = sessions.lock();
-                for k in &to_close {
-                    if map.remove(k).is_some() {
-                        removed += 1;
-                    }
-                }
-            }
-            if removed > 0 {
-                tracing::debug!(count = removed, "tun udp sessions swept");
-            }
+            sweep_udp_sessions(&sessions);
         }
     })
 }
+
+/// 单轮 idle 淘汰（票 8gr6）：owner task 独占 session，sweep 只需从 map 移除
+/// entry；cmd_tx 随 Arc 释放而 drop，owner task 收到 channel 关闭退出，
+/// session drop 触发 dispatch duplex EOF。
+fn sweep_udp_sessions(sessions: &UdpSessions) {
+    let now = now_nanos();
+    let idle_nanos = (UDP_SESSION_IDLE_SECS as i64) * 1_000_000_000;
+    let mut removed = 0usize;
+    {
+        let mut map = sessions.lock();
+        let expired: Vec<IpEndpoint> = map
+            .iter()
+            .filter(|(_, v)| {
+                now.saturating_sub(v.last_used_nanos.load(Ordering::Relaxed)) > idle_nanos
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        for k in &expired {
+            if map.remove(k).is_some() {
+                removed += 1;
+            }
+        }
+    }
+    if removed > 0 {
+        tracing::debug!(count = removed, "tun udp sessions swept");
+    }
+}
+
 /// 把 IP 协议族的 smoltcp IpEndpoint 转 xray Destination（UDP）。
 fn ip_endpoint_to_udp_destination(ep: &IpEndpoint) -> Option<Destination> {
     let address = match ep.addr {
@@ -476,39 +480,61 @@ fn address_to_smoltcp(addr: &Address) -> Option<smoltcp::wire::IpAddress> {
     }
 }
 
-/// 首包懒启 UDP session reader task（每个 remote src 仅一次）。
+/// 每 remote src 一个 owner task（票 8gr6，对齐 Go `udp_fullcone.go` 每 conn
+/// 独立 goroutine）。
 ///
-/// reader 持续 `recv_packet()`，把 outbound 响应装回 IP+UDP 包（src/dst 交换），
-/// 写回 TUN。session 关闭后 `recv_packet()` 返回 `Ok(None)` → task 退出。
-///
-/// # ponytail: 不主动清理 sessions map
-///
-/// Go 端用 `CancelAfterInactivity(1min)` 回收空闲 udpConn。本切片先用 Arc 永久持有，
-/// 后续切片加 idle 淘汰（需要把 sessions 从 ParkMutex<HashMap> 升到带 idle 跟踪的
-/// 数据结构）。
-fn spawn_udp_session_reader_if_first(
-    entry: &Arc<UdpSessionEntry>,
+/// task 独占 [`UdpDispatchSession`]，回包装帧后经 channel 交由写回 task 发往
+/// TUN；写回端退出（device 失败）时 abort 会话 task，session drop 关闭 duplex。
+fn spawn_udp_session_task(
+    dispatch: Arc<dyn DispatchHandler>,
+    cmd_rx: mpsc::UnboundedReceiver<SessionCmd>,
     device: Arc<TunDevice>,
     original_src: IpEndpoint,
     original_dst: IpEndpoint,
 ) {
-    // compare_exchange 保证仅一次 spawn
-    if entry
-        .reader_started
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return;
-    }
-
-    let entry = Arc::clone(entry);
+    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
+    let session =
+        tokio::spawn(run_udp_session(dispatch, cmd_rx, reply_tx, original_src, original_dst));
     tokio::spawn(async move {
-        loop {
-            let pkt = {
-                let mut s = entry.session.lock().await;
-                s.recv_packet().await
-            };
-            match pkt {
+        while let Some(reply) = reply_rx.recv().await {
+            if let Err(e) = device.send(&reply).await {
+                tracing::warn!(error = %e, "udp: write reply to tun failed");
+                break;
+            }
+        }
+        // 写回端退出（device 失败或会话结束）——终止会话 task
+        session.abort();
+    });
+}
+
+/// UDP 会话主循环（票 8gr6）：channel 驱动 send、`select!` 驱动 recv，
+/// 收发无互斥——对端不应答使 recv 挂起时 send 分支照常就绪。
+///
+/// `cmd_rx` 关闭（sweep 淘汰 / map 侧 drop）→ 返回；`recv_packet()` 返回
+/// `Ok(None)`（outbound 关闭）或 Err → 返回。session drop → duplex 关闭。
+async fn run_udp_session(
+    dispatch: Arc<dyn DispatchHandler>,
+    mut cmd_rx: mpsc::UnboundedReceiver<SessionCmd>,
+    reply_tx: mpsc::UnboundedSender<Vec<u8>>,
+    original_src: IpEndpoint,
+    original_dst: IpEndpoint,
+) {
+    let mut session = UdpDispatchSession::new(dispatch);
+    loop {
+        tokio::select! {
+            cmd = cmd_rx.recv() => match cmd {
+                Some(SessionCmd::Send { dest, payload }) => {
+                    if let Err(e) = session.send_packet(&dest, &payload).await {
+                        tracing::warn!(error = %e, src = %original_src, dst = %original_dst, "udp: session.send_packet failed");
+                        return;
+                    }
+                }
+                None => {
+                    tracing::debug!(src = %original_src, dst = %original_dst, "udp: session swept");
+                    return;
+                }
+            },
+            resp = session.recv_packet() => match resp {
                 Ok(Some((resp_src, payload))) => {
                     // resp_src 是 outbound 视角的来源（= 原 dst），构造 IP+UDP 回包
                     let resp_ip = address_to_smoltcp(resp_src.address());
@@ -523,9 +549,8 @@ fn spawn_udp_session_reader_if_first(
                         original_src.port,
                         &payload,
                     );
-                    if let Err(e) = device.send(&reply).await {
-                        tracing::warn!(error = %e, "udp: write reply to tun failed");
-                        return;
+                    if reply_tx.send(reply).is_err() {
+                        return; // 写回端已退出（device 失败）
                     }
                 }
                 Ok(None) => {
@@ -536,9 +561,9 @@ fn spawn_udp_session_reader_if_first(
                     tracing::warn!(error = %e, src = %original_src, dst = %original_dst, "udp: session.recv_packet failed");
                     return;
                 }
-            }
+            },
         }
-    });
+    }
 }
 
 fn handle_socket_events(
@@ -546,8 +571,6 @@ fn handle_socket_events(
     netstack: &Arc<AsyncMutex<TunNetStack>>,
     dispatch: &Arc<dyn DispatchHandler>,
 ) {
-    // TCP accept 检测（票 ipb5）：扫描全部惰性 listen socket，已 Established
-    // 的即完成 accept（check_tcp_accepts 内部已从 listen 缓存摘除）。
     for event in stack.check_tcp_accepts() {
         accept_tcp_connection(stack, netstack, event, dispatch);
     }
@@ -1101,83 +1124,161 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0, "no spurious dispatch");
     }
 
-    /// p14e：超过 UDP_SESSION_IDLE_SECS 的 session 被 sweep 淘汰；
-    /// 最近活跃的不动。直接在 map 上插旧戳驱动，避免等待 60s wall-clock。
-    /// ponytail: 直接复用 sweeper 内部判定逻辑（双锁 + last_used + try_lock），
-    #[test]
-    fn sweep_drops_idle_keeps_recent() {
-        use smoltcp::wire::IpAddress;
-        use std::future::Future;
-        use std::pin::Pin;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
-        rt.block_on(async {
-            #[derive(Debug)]
-            struct StubDispatch;
-            #[async_trait::async_trait]
-            impl xray_app_dispatcher::DispatchHandler for StubDispatch {
-                fn tag(&self) -> &str { "stub" }
-                fn dispatch(
-                    &self,
-                    _dest: &xray_common::net::destination::Destination,
-                    _link: xray_transport::link::Link,
-                ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-                    Box::pin(async {})
-                }
+    /// p14e/8gr6：超过 UDP_SESSION_IDLE_SECS 的 session 被 sweep 淘汰，最近
+    /// 活跃的不动；淘汰后 entry 的 cmd_tx 随 Arc 释放而 drop，owner task 收到
+    /// channel 关闭自动退出（会话回收闭环）。直接插旧戳驱动，不等 60s。
+    #[tokio::test]
+    async fn sweep_drops_idle_keeps_recent_and_owner_task_exits() {
+        #[derive(Debug)]
+        struct StubDispatch;
+        #[async_trait::async_trait]
+        impl DispatchHandler for StubDispatch {
+            fn tag(&self) -> &str {
+                "stub"
             }
-            let dispatch: Arc<dyn xray_app_dispatcher::DispatchHandler> = Arc::new(StubDispatch);
-            let sessions: UdpSessions = Arc::new(ParkMutex::new(HashMap::new()));
-            let old_ep = smoltcp::wire::IpEndpoint::new(
-                IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(10, 0, 0, 1)),
-                1234,
-            );
-            let new_ep = smoltcp::wire::IpEndpoint::new(
-                IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(10, 0, 0, 2)),
-                1235,
-            );
-            {
-                let mut m = sessions.lock();
-                m.insert(old_ep, Arc::new(UdpSessionEntry {
-                    session: AsyncMutex::new(
-                        xray_app_dispatcher::UdpDispatchSession::new(Arc::clone(&dispatch)),
-                    ),
-                    reader_started: AtomicBool::new(false),
-                    last_used_nanos: AtomicI64::new(0), // 远古
-                }));
-                m.insert(new_ep, Arc::new(UdpSessionEntry {
-                    session: AsyncMutex::new(
-                        xray_app_dispatcher::UdpDispatchSession::new(Arc::clone(&dispatch)),
-                    ),
-                    reader_started: AtomicBool::new(false),
-                    last_used_nanos: AtomicI64::new(now_nanos()),
-                }));
+            fn dispatch(
+                &self,
+                _dest: &Destination,
+                _link: Link,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(async {})
             }
-            // 直接跑一遍 sweep 判定（避免等待 60s wall-clock 触发 interval）
-            let now = now_nanos();
-            let idle_nanos = (UDP_SESSION_IDLE_SECS as i64) * 1_000_000_000;
-            let mut to_close: Vec<smoltcp::wire::IpEndpoint> = Vec::new();
-            {
-                let m = sessions.lock();
-                for (k, v) in m.iter() {
-                    let last = v.last_used_nanos.load(Ordering::Relaxed);
-                    if now.saturating_sub(last) > idle_nanos && v.session.try_lock().is_ok() {
-                        to_close.push(*k);
-                    }
-                }
-            }
-            let mut removed = 0;
-            {
-                let mut m = sessions.lock();
-                for k in &to_close {
-                    if m.remove(k).is_some() { removed += 1; }
-                }
-            }
-            assert_eq!(removed, 1, "exactly the ancient entry swept");
+        }
+        let dispatch: Arc<dyn DispatchHandler> = Arc::new(StubDispatch);
+        let sessions: UdpSessions = Arc::new(ParkMutex::new(HashMap::new()));
+
+        let old_ep = smoltcp::wire::IpEndpoint::new(
+            smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(10, 0, 0, 1)),
+            1234,
+        );
+        let new_ep = smoltcp::wire::IpEndpoint::new(
+            smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(10, 0, 0, 2)),
+            1235,
+        );
+
+        // idle entry 绑定一个真实 owner task，验证回收闭环
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (reply_tx, _reply_rx) = mpsc::unbounded_channel();
+        let owner = tokio::spawn(run_udp_session(
+            Arc::clone(&dispatch),
+            cmd_rx,
+            reply_tx,
+            old_ep,
+            smoltcp::wire::IpEndpoint::new(
+                smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(8, 8, 8, 8)),
+                53,
+            ),
+        ));
+        let (cmd_tx_new, _cmd_rx_new) = mpsc::unbounded_channel();
+        {
+            let mut m = sessions.lock();
+            m.insert(old_ep, Arc::new(UdpSessionEntry {
+                cmd_tx,
+                last_used_nanos: AtomicI64::new(0), // 远古
+            }));
+            m.insert(new_ep, Arc::new(UdpSessionEntry {
+                cmd_tx: cmd_tx_new,
+                last_used_nanos: AtomicI64::new(now_nanos()),
+            }));
+        }
+
+        sweep_udp_sessions(&sessions);
+
+        {
             let m = sessions.lock();
             assert!(m.contains_key(&new_ep), "recent entry preserved");
-            assert!(!m.contains_key(&old_ep), "ancient entry removed");
-        });
+            assert!(!m.contains_key(&old_ep), "idle entry swept");
+        }
+        // cmd_tx 已随 entry 释放 → owner task 必须退出（会话回收闭环）
+        tokio::time::timeout(Duration::from_millis(500), owner)
+            .await
+            .expect("owner task must exit after sweep (cmd_tx dropped)")
+            .expect("owner task join");
+    }
+
+    /// 票 8gr6 断言 1：对端不应答（recv 挂死）时，同 src 第二包必须在 1s 内
+    /// 送达 outbound——channel 化后 send 与 recv 无互斥，不再排队等锁。
+    #[tokio::test]
+    async fn udp_second_packet_reaches_outbound_while_recv_blackholed() {
+        use std::sync::atomic::AtomicUsize;
+
+        #[derive(Debug)]
+        struct BlackholeHandler {
+            req_bytes: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl DispatchHandler for BlackholeHandler {
+            fn tag(&self) -> &str {
+                "blackhole"
+            }
+            fn dispatch(
+                &self,
+                _dest: &Destination,
+                link: Link,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                let req_bytes = Arc::clone(&self.req_bytes);
+                Box::pin(async move {
+                    let mut reader = link.reader;
+                    // 黑洞不写响应，但必须显式持有写端：edition 2021 disjoint
+                    // capture 只捕获用到的 link.reader，link.writer 若不 move
+                    // 进 future 会在 dispatch() 返回时随临时值 drop → resp 半边
+                    // EOF → recv_packet Ok(None)，黑洞前提被破坏。
+                    let _writer = link.writer;
+                    loop {
+                        match reader.read_multi_buffer().await {
+                            Ok(mb) => {
+                                req_bytes.fetch_add(mb.len(), Ordering::Relaxed);
+                                if mb.is_empty() {
+                                    // EOF 兜底：避免空转烧 CPU
+                                    tokio::time::sleep(Duration::from_millis(1)).await;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                })
+            }
+        }
+
+        let req_bytes = Arc::new(AtomicUsize::new(0));
+        let dispatch: Arc<dyn DispatchHandler> =
+            Arc::new(BlackholeHandler { req_bytes: Arc::clone(&req_bytes) });
+
+        let src = smoltcp::wire::IpEndpoint::new(
+            smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(10, 0, 0, 2)),
+            12345,
+        );
+        let dst = smoltcp::wire::IpEndpoint::new(
+            smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(8, 8, 8, 8)),
+            53,
+        );
+        let dest = ip_endpoint_to_udp_destination(&dst).expect("udp dest");
+
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (reply_tx, _reply_rx) = mpsc::unbounded_channel();
+        let _owner = tokio::spawn(run_udp_session(dispatch, cmd_rx, reply_tx, src, dst));
+
+        let payload = vec![0xABu8; 100];
+        cmd_tx
+            .send(SessionCmd::Send { dest: dest.clone(), payload: payload.clone() })
+            .expect("send pkt1");
+        // 等首包 establish link 后再发第二包
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cmd_tx.send(SessionCmd::Send { dest, payload }).expect("send pkt2");
+
+        // 两帧合计保守下限：2 × (2B len + 100B payload) = 204；XUDP 帧头
+        // （meta 序列化）远小于 payload，单帧不可能达到 204。
+        const TWO_FRAMES_MIN: usize = 204;
+        let delivered = tokio::time::timeout(Duration::from_secs(1), async {
+            while req_bytes.load(Ordering::Relaxed) < TWO_FRAMES_MIN {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            delivered.is_ok(),
+            "second packet must reach outbound within 1s while recv is blackholed, got {} bytes",
+            req_bytes.load(Ordering::Relaxed)
+        );
     }
 }

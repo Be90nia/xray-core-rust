@@ -17,7 +17,8 @@
 //! - [`driver`] — UDP driver task（UdpSocket + Tunnel + smoltcp pump）
 //! - [`netstack`] — smoltcp userspace 网络栈（IP 包 ↔ TCP/UDP socket）
 //! - [`peer`] — peer 会话管理（Tunnel + endpoint + 握手状态）
-//! - [`outbound`] — [`WireguardOutboundHandler`] 实现 [`OutboundHandler`](xray_features::outbound::OutboundHandler)
+//! - [`outbound`] — [`WireguardOutboundHandler`]（driver/netstack lazy-init 容器；
+//!   生产 dial 走 [`dispatcher::make_wireguard_dial_fn`](crate::dispatcher::make_wireguard_dial_fn)）
 //! - [`inbound`] — [`WireguardInboundHandler`] 实现 [`InboundHandler`](xray_features::inbound::InboundHandler)
 //!
 //! 当前限制：dispatcher 桥接（smoltcp socket ↔ Xray router）留待后续切片。
