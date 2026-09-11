@@ -244,7 +244,13 @@ async fn vmess_multichunk_production_roundtrip_e2e() {
     validator
         .add(MemoryUser::new("alice@example.com", MemoryAccount::new(uuid)))
         .expect("add user");
-    let vmess_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind vmess");
+    let vmess_listener =
+        xray_transport::system_listener::InboundTcpListener::bind(
+            "127.0.0.1:0",
+            SocketOptions::default(),
+        )
+        .await
+        .expect("bind vmess");
     let vmess_addr = vmess_listener.local_addr().unwrap();
     let ohm2 = Arc::clone(&ohm);
     let validator2 = Arc::clone(&validator);

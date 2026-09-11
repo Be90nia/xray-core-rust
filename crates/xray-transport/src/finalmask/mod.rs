@@ -619,10 +619,16 @@ pub fn build_udpmask_manager(config: &FinalmaskConfig) -> io::Result<UdpmaskMana
 /// 从 `finalmask_json` 构造 [`UdpmaskManager`]（对应 Go `streamSettings.UdpmaskManager`）。
 ///
 /// JSON 形态与 `parse_finalmask_udp_chain` 一致：顶层为对象，`udp` 数组每项
-/// `{"type","settings"}`。支持的 mask 类型（与现有模块对齐）：
+/// `{"type","settings"}`。支持的 mask 类型（对齐 Go `infra/conf` `udpmaskLoader`）：
 ///
 /// - `mkcp-legacy` —— `mkcp-original` / `mkcp-aes128gcm` / `header-*`（KCP 原版）
 /// - `salamander` —— `SalamanderConfig{ password }`
+/// - `noise` —— `NoiseConfig{ reset, noise[] }`（周期重置 + 噪声包序列）
+/// - `sudoku` —— `SudokuConfig`（UDP/TCP 共用同一配置形态）
+/// - `xdns` —— `xdns::Config{ domains, resolvers }`（DNS-over-UDP 隧道）
+/// - `xicmp` —— `XicmpConfig{ ips, dgram }`（wrap 时仅允许最外层）
+/// - `realm` —— `realm::Config`（STUN/HTTP NAT 穿透，settings 从 `url` 解析）
+/// - `header-custom` —— `custom::Config`（自定义 UDP 头，`mode`=prefix/standalone）
 ///
 /// 未知 mask 类型返回 `InvalidInput`（不静默丢配置）。`None` 或空 `udp` 数组返回
 /// 空 manager（无 mask 行为不变）。
@@ -663,6 +669,19 @@ fn build_udpmask_entry(entry: &serde_json::Value) -> io::Result<Box<dyn Udpmask>
                 .unwrap_or("")
                 .to_string(),
         })),
+        "noise" => build_noise_config(&settings).map(|c| Box::new(c) as Box<dyn Udpmask>),
+        "sudoku" => Ok(Box::new(build_sudoku_config(&settings))),
+        "xdns" => build_xdns_config(&settings).map(|c| Box::new(c) as Box<dyn Udpmask>),
+        "xicmp" => build_xicmp_config(&settings).map(|c| Box::new(c) as Box<dyn Udpmask>),
+        "realm" => build_realm_config(&settings).map(|c| Box::new(c) as Box<dyn Udpmask>),
+        "header-custom" => {
+            let (udp, udp_standalone) = build_custom_udp(&settings)?;
+            Ok(Box::new(custom::Config {
+                udp,
+                udp_standalone,
+                ..custom::Config::default()
+            }))
+        }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("finalmask: unsupported udp mask type {other:?}"),
@@ -720,9 +739,13 @@ fn build_mkcp_legacy_udpmask(settings: &serde_json::Value) -> io::Result<Box<dyn
 
 /// 从 `finalmask_json` 构造 [`TcpmaskManager`]（对应 Go `streamSettings.TcpmaskManager`）。
 ///
-/// JSON 形态顶层对象 `tcp` 数组，每项 `{"type","settings"}`。当前支持：
+/// JSON 形态顶层对象 `tcp` 数组，每项 `{"type","settings"}`。支持（对齐 Go
+/// `infra/conf` `tcpmaskLoader`）：
 ///
 /// - `fragment` —— `FragmentConfig{ packets_from, packets_to, length, interval }`
+/// - `sudoku` —— `SudokuConfig`（与 UDP 同一配置形态）
+/// - `xmc` —— `xmc::Config`（Minecraft 握手伪装，profiles + password 派生 RSA）
+/// - `header-custom` —— `custom::Config`（自定义 TCP 序列 clients/servers/errors）
 ///
 /// 未知 mask 类型返回 `InvalidInput`。`None` / 缺失 `tcp` 键 / 空数组 → 空 manager。
 pub fn build_tcpmask_manager_from_json(
@@ -750,11 +773,580 @@ fn build_tcpmask_entry(entry: &serde_json::Value) -> io::Result<Box<dyn Tcpmask>
     let settings = obj.get("settings").cloned().unwrap_or(serde_json::Value::Null);
     match mask_type {
         "fragment" => build_fragment_config(&settings).map(|c| Box::new(c) as Box<dyn Tcpmask>),
+        "sudoku" => Ok(Box::new(build_sudoku_config(&settings))),
+        "xmc" => build_xmc_config(&settings).map(|c| Box::new(c) as Box<dyn Tcpmask>),
+        "header-custom" => build_custom_tcp(&settings).map(|tcp| {
+            Box::new(custom::Config {
+                tcp: Some(tcp),
+                ..custom::Config::default()
+            }) as Box<dyn Tcpmask>
+        }),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("finalmask: unsupported tcp mask type {other:?}"),
         )),
     }
+}
+
+// ===== JSON settings → 各 mask 模块 Config（对齐 Go `infra/conf/transport_finalmask.go`）=====
+
+fn mask_err(msg: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, msg.into())
+}
+
+fn json_str<'a>(v: &'a serde_json::Value, key: &str) -> &'a str {
+    v.get(key).and_then(|x| x.as_str()).unwrap_or("")
+}
+
+fn json_str_vec(v: &serde_json::Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+fn json_bool(v: &serde_json::Value, key: &str) -> bool {
+    v.get(key).and_then(|x| x.as_bool()).unwrap_or(false)
+}
+
+fn json_i64(v: &serde_json::Value, key: &str) -> i64 {
+    v.get(key).and_then(|x| x.as_i64()).unwrap_or(0)
+}
+
+/// Go `Int32Range`：接受整数 / `{from,to}` / `"a-b"` 字符串；from>to 时交换（ensureOrder）。
+fn json_range(v: &serde_json::Value, key: &str) -> io::Result<(i64, i64)> {
+    match v.get(key) {
+        Some(serde_json::Value::Object(o)) => {
+            let from = o.get("from").and_then(|x| x.as_i64()).unwrap_or(0);
+            let to = o.get("to").and_then(|x| x.as_i64()).unwrap_or(0);
+            Ok((from.min(to), from.max(to)))
+        }
+        Some(serde_json::Value::Number(n)) => {
+            let x = n.as_i64().ok_or_else(|| mask_err(format!("invalid integer range for {key:?}")))?;
+            Ok((x, x))
+        }
+        Some(serde_json::Value::String(s)) => parse_range_string(s),
+        None | Some(serde_json::Value::Null) => Ok((0, 0)),
+        Some(_) => Err(mask_err(format!("invalid range for {key:?}"))),
+    }
+}
+
+/// Go `ParseRangeString`："114-514" / "-114-514" / "114514" / ""→(0,0)；非法字符串报错。
+fn parse_range_string(s: &str) -> io::Result<(i64, i64)> {
+    let invalid = || mask_err(format!("invalid range string {s:?}"));
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok((0, 0));
+    }
+    let body = s.strip_prefix('-').unwrap_or(s);
+    let (first, second) = match body.split_once('-') {
+        None => {
+            let x: i64 = s.parse().map_err(|_| invalid())?;
+            return Ok((x, x));
+        }
+        Some((l, r)) => {
+            let l = if body.len() < s.len() { format!("-{l}") } else { l.to_string() };
+            (l, r.to_string())
+        }
+    };
+    let lo: i64 = first.parse().map_err(|_| invalid())?;
+    let hi: i64 = second.parse().map_err(|_| invalid())?;
+    Ok((lo.min(hi), lo.max(hi)))
+}
+
+/// Go `RandRange`：缺省 `{0,255}`；越界（越出 0..=255）报错（对齐 Go Build 校验）。
+fn json_rand_range(v: &serde_json::Value) -> io::Result<(i64, i64)> {
+    let (from, to) = if v.get("randRange").map_or(true, |x| x.is_null()) {
+        (0, 255)
+    } else {
+        json_range(v, "randRange")?
+    };
+    if !(0..=255).contains(&from) || !(0..=255).contains(&to) {
+        return Err(mask_err("invalid randRange"));
+    }
+    Ok((from, to))
+}
+
+/// Go `PraseByteSlice`：`""`/`"array"`=JSON 字节数组、`"str"`、`"hex"`、`"base64"`。
+fn parse_byte_slice(raw: Option<&serde_json::Value>, typ: &str) -> io::Result<Vec<u8>> {
+    match typ.to_ascii_lowercase().as_str() {
+        "" | "array" => match raw {
+            None => Ok(Vec::new()),
+            Some(serde_json::Value::Array(arr)) => arr
+                .iter()
+                .map(|x| {
+                    x.as_u64()
+                        .filter(|n| *n <= 255)
+                        .map(|n| n as u8)
+                        .ok_or_else(|| mask_err("packet byte must be 0-255"))
+                })
+                .collect(),
+            Some(_) => Err(mask_err("packet must be a JSON byte array for type array")),
+        },
+        "str" => Ok(raw.and_then(|x| x.as_str()).unwrap_or("").as_bytes().to_vec()),
+        "hex" => hex::decode(raw.and_then(|x| x.as_str()).unwrap_or(""))
+            .map_err(|e| mask_err(format!("invalid hex packet: {e}"))),
+        "base64" => {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(raw.and_then(|x| x.as_str()).unwrap_or(""))
+                .map_err(|e| mask_err(format!("invalid base64 packet: {e}")))
+        }
+        _ => Err(mask_err(format!("unknown type {typ:?}"))),
+    }
+}
+
+/// Go `validateCustomVarName`：空串放行；否则 `^[A-Za-z_][A-Za-z0-9_]*$`。
+fn validate_var_name(name: &str) -> io::Result<()> {
+    let ok = name.is_empty()
+        || (name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+    if ok {
+        Ok(())
+    } else {
+        Err(mask_err(format!("invalid variable name {name:?}")))
+    }
+}
+
+/// Go `validateCustomItemSpec`：packet/rand/reuse/transform 至多一种；全空时不得有 capture。
+fn validate_item_kinds(
+    packet_len: usize,
+    rand: i32,
+    reuse: &str,
+    has_transform: bool,
+    capture: &str,
+) -> io::Result<()> {
+    let kinds = usize::from(packet_len > 0)
+        + usize::from(rand > 0)
+        + usize::from(!reuse.is_empty())
+        + usize::from(has_transform);
+    if kinds > 1 || (kinds == 0 && !capture.is_empty()) {
+        return Err(mask_err("exactly one item kind must be set"));
+    }
+    Ok(())
+}
+
+/// Go `buildCustomTransform`。
+fn parse_expr(v: &serde_json::Value) -> io::Result<custom::Expr> {
+    let op = json_str(v, "op");
+    if op.is_empty() {
+        return Err(mask_err("transform op is required"));
+    }
+    let args = v
+        .get("args")
+        .and_then(|x| x.as_array())
+        .ok_or_else(|| mask_err("transform args are required"))?;
+    if args.is_empty() {
+        return Err(mask_err("transform args are required"));
+    }
+    Ok(custom::Expr {
+        op: op.to_string(),
+        args: args.iter().map(parse_expr_arg).collect::<io::Result<_>>()?,
+    })
+}
+
+/// Go `buildCustomTransformArg`：bytes/u64/reuse/metadata/transform 恰好一种。
+fn parse_expr_arg(v: &serde_json::Value) -> io::Result<custom::ExprArg> {
+    let bytes_raw = v.get("bytes").filter(|x| !x.is_null());
+    let has_bytes = match bytes_raw {
+        Some(serde_json::Value::Array(a)) => !a.is_empty(),
+        Some(serde_json::Value::String(s)) => !s.is_empty(),
+        Some(_) => true,
+        None => false,
+    };
+    let has_u64 = v.get("u64").map_or(false, |x| !x.is_null());
+    let reuse = json_str(v, "reuse");
+    let metadata = json_str(v, "metadata");
+    let transform = v.get("transform").filter(|x| !x.is_null());
+    let kinds = usize::from(has_bytes)
+        + usize::from(has_u64)
+        + usize::from(!reuse.is_empty())
+        + usize::from(!metadata.is_empty())
+        + usize::from(transform.is_some());
+    if kinds != 1 {
+        return Err(mask_err("transform arg must set exactly one value"));
+    }
+    if has_bytes {
+        return Ok(custom::ExprArg::Bytes(parse_byte_slice(bytes_raw, json_str(v, "type"))?));
+    }
+    if has_u64 {
+        let n = v
+            .get("u64")
+            .and_then(|x| x.as_u64())
+            .ok_or_else(|| mask_err("invalid u64 arg"))?;
+        return Ok(custom::ExprArg::U64(n));
+    }
+    if !reuse.is_empty() {
+        validate_var_name(reuse)?;
+        return Ok(custom::ExprArg::Var(reuse.to_string()));
+    }
+    if !metadata.is_empty() {
+        return Ok(custom::ExprArg::Metadata(metadata.to_string()));
+    }
+    Ok(custom::ExprArg::Expr(Box::new(parse_expr(
+        transform.expect("kinds==1 且前置分支未命中，transform 必为 Some"),
+    )?)))
+}
+
+/// Go `HeaderCustomTCP.Build` → `custom::TCPConfig`。
+fn build_custom_tcp(settings: &serde_json::Value) -> io::Result<custom::TCPConfig> {
+    Ok(custom::TCPConfig {
+        clients: parse_tcp_sequences(settings, "clients")?,
+        servers: parse_tcp_sequences(settings, "servers")?,
+        errors: parse_tcp_sequences(settings, "errors")?,
+    })
+}
+
+fn parse_tcp_sequences(
+    settings: &serde_json::Value,
+    key: &str,
+) -> io::Result<Vec<custom::TCPSequence>> {
+    let Some(rows) = settings.get(key).and_then(|x| x.as_array()) else {
+        return Ok(Vec::new());
+    };
+    rows.iter()
+        .map(|row| {
+            let items = row
+                .as_array()
+                .ok_or_else(|| mask_err(format!("header-custom: {key} row must be an array")))?;
+            Ok(custom::TCPSequence {
+                sequence: items.iter().map(parse_custom_tcp_item).collect::<io::Result<_>>()?,
+            })
+        })
+        .collect()
+}
+
+fn parse_custom_tcp_item(v: &serde_json::Value) -> io::Result<custom::TCPItem> {
+    let rand = json_i64(v, "rand") as i32;
+    let (rand_min, rand_max) = json_rand_range(v)?;
+    let packet = parse_byte_slice(v.get("packet"), json_str(v, "type"))?;
+    let save = json_str(v, "capture");
+    let reuse = json_str(v, "reuse");
+    validate_var_name(save)?;
+    validate_var_name(reuse)?;
+    let transform = v.get("transform").filter(|x| !x.is_null());
+    validate_item_kinds(packet.len(), rand, reuse, transform.is_some(), save)?;
+    let (delay_min, delay_max) = json_range(v, "delay")?;
+    Ok(custom::TCPItem {
+        delay_min,
+        delay_max,
+        rand,
+        rand_min: rand_min as u8,
+        rand_max: rand_max as u8,
+        packet,
+        save: save.to_string(),
+        var: reuse.to_string(),
+        expr: match transform {
+            Some(t) => Some(parse_expr(t)?),
+            None => None,
+        },
+    })
+}
+
+fn parse_custom_udp_item(v: &serde_json::Value) -> io::Result<custom::UDPItem> {
+    let rand = json_i64(v, "rand") as i32;
+    let (rand_min, rand_max) = json_rand_range(v)?;
+    let packet = parse_byte_slice(v.get("packet"), json_str(v, "type"))?;
+    let save = json_str(v, "capture");
+    let reuse = json_str(v, "reuse");
+    validate_var_name(save)?;
+    validate_var_name(reuse)?;
+    let transform = v.get("transform").filter(|x| !x.is_null());
+    validate_item_kinds(packet.len(), rand, reuse, transform.is_some(), save)?;
+    Ok(custom::UDPItem {
+        rand,
+        rand_min: rand_min as u8,
+        rand_max: rand_max as u8,
+        packet,
+        save: save.to_string(),
+        var: reuse.to_string(),
+        expr: match transform {
+            Some(t) => Some(parse_expr(t)?),
+            None => None,
+        },
+    })
+}
+
+/// Go `HeaderCustomUDP.Build` → `(prefix 形态, standalone 形态)`。
+fn build_custom_udp(
+    settings: &serde_json::Value,
+) -> io::Result<(Option<custom::UDPConfig>, Option<custom::UDPConfig>)> {
+    let mode = json_str(settings, "mode");
+    match mode {
+        "" | "prefix" | "standalone" => {}
+        other => return Err(mask_err(format!("unknown udp mode {other:?}"))),
+    }
+    let read_items = |key: &str| -> io::Result<Vec<custom::UDPItem>> {
+        match settings.get(key).and_then(|x| x.as_array()) {
+            None => Ok(Vec::new()),
+            Some(items) => items.iter().map(parse_custom_udp_item).collect(),
+        }
+    };
+    let cfg = custom::UDPConfig {
+        client: read_items("client")?,
+        server: read_items("server")?,
+    };
+    Ok(if mode == "standalone" {
+        (None, Some(cfg))
+    } else {
+        (Some(cfg), None)
+    })
+}
+
+/// Go `NoiseMask.Build` → `noise::NoiseConfig`。
+fn build_noise_config(settings: &serde_json::Value) -> io::Result<noise::NoiseConfig> {
+    let (reset_min, reset_max) = json_range(settings, "reset")?;
+    let empty: Vec<serde_json::Value> = Vec::new();
+    let mut items = Vec::new();
+    for item in settings.get("noise").and_then(|x| x.as_array()).unwrap_or(&empty) {
+        let (rand_min, rand_max) = json_range(item, "rand")?;
+        let packet = parse_byte_slice(item.get("packet"), json_str(item, "type"))?;
+        if !packet.is_empty() && rand_max > 0 {
+            return Err(mask_err("noise item: packet and rand are mutually exclusive"));
+        }
+        let (rand_range_min, rand_range_max) = json_rand_range(item)?;
+        let (delay_min, delay_max) = json_range(item, "delay")?;
+        items.push(noise::NoiseItem {
+            rand_min,
+            rand_max,
+            rand_range_min: rand_range_min as i32,
+            rand_range_max: rand_range_max as i32,
+            packet,
+            delay_min,
+            delay_max,
+        });
+    }
+    Ok(noise::NoiseConfig {
+        reset_min,
+        reset_max,
+        items,
+    })
+}
+
+/// Go `Sudoku.Build` → `sudoku::SudokuConfig`（新驼峰键优先，legacy 下划线键兜底）。
+fn build_sudoku_config(settings: &serde_json::Value) -> sudoku::SudokuConfig {
+    sudoku::SudokuConfig {
+        password: json_str(settings, "password").to_string(),
+        ascii: json_str(settings, "ascii").to_string(),
+        custom_table: {
+            let t = json_str(settings, "customTable");
+            if t.is_empty() {
+                json_str(settings, "custom_table").to_string()
+            } else {
+                t.to_string()
+            }
+        },
+        custom_tables: {
+            let t = json_str_vec(settings, "customTables");
+            if t.is_empty() {
+                json_str_vec(settings, "custom_tables")
+            } else {
+                t
+            }
+        },
+        padding_min: {
+            let p = json_i64(settings, "paddingMin").max(0) as u32;
+            if p == 0 {
+                json_i64(settings, "padding_min").max(0) as u32
+            } else {
+                p
+            }
+        },
+        padding_max: {
+            let p = json_i64(settings, "paddingMax").max(0) as u32;
+            if p == 0 {
+                json_i64(settings, "padding_max").max(0) as u32
+            } else {
+                p
+            }
+        },
+    }
+}
+
+/// Go `Xdns.Build` → `xdns::Config`（`domain` 已废弃；domains=server / resolvers=client）。
+fn build_xdns_config(settings: &serde_json::Value) -> io::Result<xdns::Config> {
+    if settings.get("domain").map_or(false, |x| !x.is_null()) {
+        return Err(mask_err(
+            "xdns: `domain` was removed; use domains(server) & resolvers(client)",
+        ));
+    }
+    let domains = json_str_vec(settings, "domains");
+    let resolvers = json_str_vec(settings, "resolvers");
+    if domains.is_empty() && resolvers.is_empty() {
+        return Err(mask_err("xdns: empty domains & empty resolvers"));
+    }
+    for r in &resolvers {
+        if !r.contains("+udp://") {
+            return Err(mask_err(format!("xdns: invalid resolver {r:?}")));
+        }
+    }
+    Ok(xdns::Config { domains, resolvers })
+}
+
+/// Go `Xicmp.Build` → `XicmpConfig`；「仅最外层」约束由 wrap 时 `level != 0` 校验（模块内）。
+fn build_xicmp_config(settings: &serde_json::Value) -> io::Result<xicmp::XicmpConfig> {
+    let ips = json_str_vec(settings, "ips");
+    for ip in &ips {
+        ip.parse::<std::net::IpAddr>()
+            .map_err(|e| mask_err(format!("xicmp: invalid ip {ip:?}: {e}")))?;
+    }
+    Ok(xicmp::XicmpConfig {
+        ips,
+        dgram: json_bool(settings, "dgram"),
+    })
+}
+
+/// Go `Realm.Build` → `realm::Config`（URL 形如 `realm://token@host:port/id`；
+/// scheme `realm`→https、`realm+http`→http；Rust 端 TLS 细节由 `use_tls` 简化承载）。
+fn build_realm_config(settings: &serde_json::Value) -> io::Result<realm::Config> {
+    let url = json_str(settings, "url");
+    let (raw_scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| mask_err(format!("realm: invalid url {url:?}")))?;
+    let scheme = match raw_scheme {
+        "realm" => "https",
+        "realm+http" => "http",
+        other => return Err(mask_err(format!("realm: invalid scheme {other:?}"))),
+    };
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a, p),
+        None => (rest, ""),
+    };
+    let (userinfo, hostport) = match authority.rsplit_once('@') {
+        Some((u, h)) => (u, h),
+        None => ("", authority),
+    };
+    let (host, port) = split_host_port(hostport)?;
+    if host.is_empty() {
+        return Err(mask_err("realm: invalid host"));
+    }
+    let port = match port {
+        Some(p) => p,
+        None if scheme == "http" => "80".to_string(),
+        None => "443".to_string(),
+    };
+    let token = percent_decode(userinfo)?;
+    if token.is_empty() {
+        return Err(mask_err("realm: invalid token"));
+    }
+    let id = percent_decode(path)?;
+    if id.is_empty() {
+        return Err(mask_err("realm: invalid id"));
+    }
+    let stun_servers = json_str_vec(settings, "stunServers");
+    if stun_servers.is_empty() {
+        return Err(mask_err("realm: empty stunServers"));
+    }
+    for s in &stun_servers {
+        let (h, p) = split_host_port(s)?;
+        if h.is_empty() || p.is_none() {
+            return Err(mask_err(format!("realm: invalid stunServer {s:?}")));
+        }
+    }
+    Ok(realm::Config {
+        scheme: scheme.to_string(),
+        host,
+        port,
+        token,
+        id,
+        stun_servers,
+        use_tls: scheme == "https",
+    })
+}
+
+/// `[v6]:port` / `host:port` / `host`（port 可缺省，调用方按需校验）。
+fn split_host_port(s: &str) -> io::Result<(String, Option<String>)> {
+    if let Some(rest) = s.strip_prefix('[') {
+        let (host, tail) = rest
+            .split_once(']')
+            .ok_or_else(|| mask_err(format!("missing ']' in {s:?}")))?;
+        return Ok((host.to_string(), tail.strip_prefix(':').map(str::to_string)));
+    }
+    Ok(match s.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() => (host.to_string(), Some(port.to_string())),
+        _ => (s.to_string(), None),
+    })
+}
+
+/// Go `url.PathUnescape`（%XX 解码，非法转义报错）。
+fn percent_decode(s: &str) -> io::Result<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes
+                .get(i + 1..i + 3)
+                .ok_or_else(|| mask_err(format!("invalid URL escape in {s:?}")))?;
+            let val = std::str::from_utf8(hex)
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+                .ok_or_else(|| mask_err(format!("invalid URL escape in {s:?}")))?;
+            out.push(val);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|e| mask_err(format!("invalid utf-8 in URL: {e}")))
+}
+
+/// Go `XMC.Build` → `xmc::Config`（RSA-1024 密钥从 password 确定性派生）。
+fn build_xmc_config(settings: &serde_json::Value) -> io::Result<xmc::Config> {
+    let profiles = settings
+        .get("profiles")
+        .and_then(|x| x.as_array())
+        .ok_or_else(|| mask_err("xmc: minecraft profiles are required"))?;
+    if profiles.is_empty() {
+        return Err(mask_err("xmc: minecraft profiles are required"));
+    }
+    let password = json_str(settings, "password");
+    if password.is_empty() {
+        return Err(mask_err("xmc: empty password"));
+    }
+    let mut usernames = Vec::with_capacity(profiles.len());
+    for p in profiles {
+        let username = json_str(p, "username");
+        let valid = (3..=16).contains(&username.len())
+            && username.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
+            return Err(mask_err(format!(
+                "invalid minecraft profile username: {username:?}"
+            )));
+        }
+        json_str(p, "uuid")
+            .parse::<uuid::Uuid>()
+            .map_err(|e| mask_err(format!("invalid minecraft profile UUID: {e}")))?;
+        if json_str(p, "texturesValue").is_empty() || json_str(p, "texturesSignature").is_empty() {
+            return Err(mask_err(format!(
+                "incomplete minecraft profile textures: {username:?}"
+            )));
+        }
+        usernames.push(username.to_string());
+    }
+    let private_key = xmc::derivation::derive_rsa_key(password)
+        .map_err(|e| mask_err(format!("derive minecraft rsa key: {e}")))?;
+    use rsa::pkcs1::EncodeRsaPrivateKey;
+    use rsa::pkcs8::EncodePublicKey;
+    let rsa_private_key = private_key
+        .to_pkcs1_der()
+        .map_err(|e| mask_err(format!("marshal minecraft rsa private key: {e}")))?
+        .as_bytes()
+        .to_vec();
+    let rsa_public_key = rsa::RsaPublicKey::from(&private_key)
+        .to_public_key_der()
+        .map_err(|e| mask_err(format!("marshal minecraft rsa public key: {e}")))?
+        .as_bytes()
+        .to_vec();
+    Ok(xmc::Config {
+        usernames,
+        password: password.to_string(),
+        rsa_private_key,
+        rsa_public_key,
+        hostname: json_str(settings, "hostname").to_string(),
+        padding_disabled: false,
+    })
 }
 
 fn build_fragment_config(settings: &serde_json::Value) -> io::Result<fragment::FragmentConfig> {
@@ -1323,5 +1915,217 @@ mod tests {
             let mut b = [0u8; 1];
             assert_eq!(conn.read(&mut b).await.expect("final read"), 0);
         });
+    }
+
+    // ===== JSON settings parse（build_*_entry 接线族，对齐 Go udpmask/tcpmaskLoader）=====
+
+    #[test]
+    fn parse_json_noise_config_fields() {
+        let settings = fm(
+            r#"{"reset":{"from":2,"to":5},
+                "noise":[{"rand":{"from":10,"to":20},"delay":3},
+                         {"packet":[1,2,3]}]}"#,
+        );
+        let cfg = build_noise_config(&settings).unwrap();
+        assert_eq!((cfg.reset_min, cfg.reset_max), (2, 5));
+        assert_eq!(cfg.items.len(), 2);
+        assert_eq!((cfg.items[0].rand_min, cfg.items[0].rand_max), (10, 20));
+        assert_eq!((cfg.items[0].delay_min, cfg.items[0].delay_max), (3, 3));
+        assert_eq!(cfg.items[0].rand_range_max, 255); // randRange 缺省 {0,255}
+        assert_eq!(cfg.items[1].packet, vec![1, 2, 3]);
+        // packet 与 rand>0 互斥（对齐 Go Build 校验）
+        let bad = fm(r#"{"noise":[{"rand":{"from":1,"to":9},"packet":[1]}]}"#);
+        assert!(build_noise_config(&bad).is_err());
+    }
+
+    #[test]
+    fn parse_json_sudoku_config_fields() {
+        let cfg = build_sudoku_config(&fm(
+            r#"{"password":"pw","ascii":"prefer_ascii",
+                "customTable":"xxppvvvv","paddingMax":80}"#,
+        ));
+        assert_eq!(cfg.password, "pw");
+        assert_eq!(cfg.ascii, "prefer_ascii");
+        assert_eq!(cfg.custom_table, "xxppvvvv");
+        assert_eq!(cfg.padding_max, 80);
+        // legacy 下划线键兜底（对齐 Go Sudoku）
+        let legacy = build_sudoku_config(&fm(
+            r#"{"custom_table":"xxppvvvv","custom_tables":["a","b"],"padding_min":10}"#,
+        ));
+        assert_eq!(legacy.custom_table, "xxppvvvv");
+        assert_eq!(legacy.custom_tables, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(legacy.padding_min, 10);
+    }
+
+    #[test]
+    fn parse_json_xdns_config_fields_and_validations() {
+        let cfg = build_xdns_config(&fm(
+            r#"{"domains":["t.example.com:txt"],"resolvers":["t.example.com+udp://1.1.1.1:53"]}"#,
+        ))
+        .unwrap();
+        assert_eq!(cfg.domains, vec!["t.example.com:txt".to_string()]);
+        assert_eq!(cfg.resolvers, vec!["t.example.com+udp://1.1.1.1:53".to_string()]);
+        // 已废弃 domain 键报错（对齐 Go PrintRemovedFeatureError）
+        assert!(build_xdns_config(&fm(r#"{"domain":"x.com"}"#)).is_err());
+        // 双空报错
+        assert!(build_xdns_config(&fm(r#"{}"#)).is_err());
+        // resolver 缺 +udp:// 报错
+        assert!(build_xdns_config(&fm(r#"{"resolvers":["udp://1.1.1.1:53"]}"#)).is_err());
+    }
+
+    #[test]
+    fn parse_json_xicmp_config_fields() {
+        let cfg = build_xicmp_config(&fm(r#"{"ips":["2001:db8::1","10.0.0.1"],"dgram":true}"#))
+            .unwrap();
+        assert_eq!(cfg.ips, vec!["2001:db8::1".to_string(), "10.0.0.1".to_string()]);
+        assert!(cfg.dgram);
+        assert!(build_xicmp_config(&fm(r#"{"ips":["not-an-ip"]}"#)).is_err());
+    }
+
+    #[test]
+    fn parse_json_realm_config_fields() {
+        let cfg = build_realm_config(&fm(
+            r#"{"url":"realm://secret%2Btok@stun.example.com:8443/peer-id",
+                "stunServers":["stun1.example.com:3478"]}"#,
+        ))
+        .unwrap();
+        assert_eq!(cfg.scheme, "https");
+        assert_eq!(cfg.host, "stun.example.com");
+        assert_eq!(cfg.port, "8443");
+        assert_eq!(cfg.token, "secret+tok"); // percent-decode
+        assert_eq!(cfg.id, "peer-id");
+        assert!(cfg.use_tls);
+        // realm+http 缺省端口 80
+        let http = build_realm_config(&fm(
+            r#"{"url":"realm+http://tok@h.example.com/p","stunServers":["s:1"]}"#,
+        ))
+        .unwrap();
+        assert_eq!((http.scheme.as_str(), http.port.as_str()), ("http", "80"));
+        assert!(!http.use_tls);
+        // 缺 stunServers 报错（对齐 Go）
+        assert!(build_realm_config(&fm(r#"{"url":"realm://t@h.com/id"}"#)).is_err());
+    }
+
+    #[test]
+    fn parse_json_xmc_config_fields() {
+        let cfg = build_xmc_config(&fm(
+            r#"{"hostname":"mc.example.com","password":"mc-pass",
+                "profiles":[{"username":"steve_1","uuid":"069a79f4-44e9-4726-a5be-fca90e38aaf5",
+                             "texturesValue":"v","texturesSignature":"s"}]}"#,
+        ))
+        .unwrap();
+        assert_eq!(cfg.usernames, vec!["steve_1".to_string()]);
+        assert_eq!(cfg.password, "mc-pass");
+        assert_eq!(cfg.hostname, "mc.example.com");
+        assert!(!cfg.rsa_private_key.is_empty());
+        assert!(!cfg.rsa_public_key.is_empty());
+        // 空 profiles / 非法用户名 / 非法 UUID 报错（对齐 Go XMC.Build）
+        assert!(build_xmc_config(&fm(r#"{"password":"p","profiles":[]}"#)).is_err());
+        assert!(build_xmc_config(&fm(
+            r#"{"profiles":[{"username":"x","uuid":"069a79f4-44e9-4726-a5be-fca90e38aaf5","texturesValue":"v","texturesSignature":"s"}]}"#
+        ))
+        .is_err());
+        assert!(build_xmc_config(&fm(
+            r#"{"password":"p","profiles":[{"username":"abc","uuid":"not-a-uuid","texturesValue":"v","texturesSignature":"s"}]}"#
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn parse_json_custom_tcp_config() {
+        let cfg = build_custom_tcp(&fm(
+            r#"{"clients":[
+                  [{"delay":{"from":1,"to":2},"packet":[1,2],"capture":"hello"},
+                   {"reuse":"hello"},
+                   {"packet":"aabb","type":"hex"}]
+                ],
+                "servers":[[{"transform":{"op":"concat","args":[{"bytes":[170]}]}}]]}"#,
+        ))
+        .unwrap();
+        assert_eq!(cfg.clients.len(), 1);
+        let seq = &cfg.clients[0].sequence;
+        assert_eq!(seq.len(), 3);
+        assert_eq!((seq[0].delay_min, seq[0].delay_max), (1, 2));
+        assert_eq!(seq[0].packet, vec![1, 2]);
+        assert_eq!(seq[0].save, "hello");
+        assert_eq!((seq[1].rand, seq[1].rand_min, seq[1].rand_max), (0, 0, 255));
+        assert_eq!(seq[1].var, "hello");
+        assert_eq!(seq[2].packet, vec![0xaa, 0xbb]);
+        // transform → Expr
+        let expr = cfg.servers[0].sequence[0].expr.as_ref().unwrap();
+        assert_eq!(expr.op, "concat");
+        assert!(matches!(&expr.args[0], custom::ExprArg::Bytes(b) if b == &vec![0xaa]));
+        // 两种 kind 并存报错（对齐 Go exactly one item kind）
+        assert!(build_custom_tcp(&fm(r#"{"clients":[[{"rand":1,"reuse":"v"}]]}"#)).is_err());
+        // 非法变量名报错
+        assert!(build_custom_tcp(&fm(r#"{"clients":[[{"packet":[1],"capture":"9bad"}]]}"#)).is_err());
+    }
+
+    #[test]
+    fn parse_json_custom_udp_config() {
+        // 默认 prefix 模式 → udp
+        let (udp, standalone) = build_custom_udp(&fm(
+            r#"{"client":[{"packet":[7,7],"capture":"m"}],"server":[{"rand":2}]}"#,
+        ))
+        .unwrap();
+        assert!(standalone.is_none());
+        let udp = udp.unwrap();
+        assert_eq!(udp.client.len(), 1);
+        assert_eq!(udp.client[0].packet, vec![7, 7]);
+        // standalone 模式 → udp_standalone
+        let (udp, standalone) =
+            build_custom_udp(&fm(r#"{"mode":"standalone","client":[]}"#)).unwrap();
+        assert!(udp.is_none());
+        assert!(standalone.is_some());
+        // 未知 mode 报错
+        assert!(build_custom_udp(&fm(r#"{"mode":"bogus"}"#)).is_err());
+    }
+
+    #[test]
+    fn build_udpmask_entry_wires_all_types() {
+        let json = fm(
+            r#"{"udp":[
+                {"type":"noise","settings":{"reset":{"from":1,"to":2}}},
+                {"type":"sudoku","settings":{"password":"p"}},
+                {"type":"xdns","settings":{"resolvers":["t.example.com+udp://1.1.1.1:53"]}},
+                {"type":"xicmp","settings":{"ips":["10.0.0.1"]}},
+                {"type":"realm","settings":{"url":"realm://t@h.example.com/i","stunServers":["s.example.com:3478"]}},
+                {"type":"header-custom","settings":{"client":[]}}
+            ]}"#,
+        );
+        let mgr = build_udpmask_manager_from_json(Some(&json)).unwrap();
+        assert_eq!(mgr.udpmasks.len(), 6);
+    }
+
+    #[test]
+    fn build_tcpmask_entry_wires_all_types() {
+        let json = fm(
+            r#"{"tcp":[
+                {"type":"fragment","settings":{}},
+                {"type":"sudoku","settings":{"password":"p"}},
+                {"type":"xmc","settings":{"password":"mc-pass","hostname":"h",
+                    "profiles":[{"username":"steve_1","uuid":"069a79f4-44e9-4726-a5be-fca90e38aaf5","texturesValue":"v","texturesSignature":"s"}]}},
+                {"type":"header-custom","settings":{"clients":[]}}
+            ]}"#,
+        );
+        let mgr = build_tcpmask_manager_from_json(Some(&json)).unwrap();
+        assert_eq!(mgr.tcpmasks.len(), 4);
+    }
+
+    #[test]
+    fn build_entries_unknown_type_still_errors() {
+        // xmc 仅 TCP、noise 仅 UDP（与 Go registry 一致）：错侧注册必须仍报 unsupported
+        let udp = fm(r#"{"udp":[{"type":"xmc"}]}"#);
+        let err = match build_udpmask_manager_from_json(Some(&udp)) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected unsupported udp mask type error"),
+        };
+        assert!(err.contains("unsupported udp mask type"), "got: {err}");
+        let tcp = fm(r#"{"tcp":[{"type":"noise"}]}"#);
+        let err = match build_tcpmask_manager_from_json(Some(&tcp)) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected unsupported tcp mask type error"),
+        };
+        assert!(err.contains("unsupported tcp mask type"), "got: {err}");
     }
 }

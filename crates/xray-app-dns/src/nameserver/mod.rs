@@ -285,8 +285,13 @@ pub fn new_server_with_config(
         return Ok((local::new_local_name_server()?, cfg));
     }
     if lower == "fakedns" {
+        // 9vu4：共享引擎 + `new_default` 兜底（Go nameserver.go:70-79
+        // RequireFeatures 全局唯一 FakeDNSEngine；无 fakeDns app 时保持兼容）。
         let holder = crate::fakedns::Holder::new_default()?;
-        return Ok((Box::new(fakedns::FakeDnsServer::new(holder)), cfg));
+        return Ok((
+            Box::new(fakedns::FakeDnsServer::new(fakedns::SharedFakeDnsEngine::new(holder))),
+            cfg,
+        ));
     }
 
     let (scheme_raw, rest) = url.split_once("://").unwrap_or(("", url));

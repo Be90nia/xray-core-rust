@@ -4,18 +4,41 @@
 //! - `lru` crate 提供 LRU（Go `cache.Lru`）
 //! - `ipnet` crate 提供 CIDR 解析（Go `net.IPNet`）
 //!
-//! **跳过范围**（IO 边界）：`init()` 全局 `RegisterConfig` —— Rust 无副作用全局。
+//! **跳过范围**（IO 边界）：`init()` 全局 `RegisterConfig` —— 改由
+//! [`set_shared_multi`] 显式注册共享引擎（见其文档）。
 
 use std::net::IpAddr;
+use std::sync::{Arc, LazyLock};
 
 use ipnet::IpNet;
 use lru::LruCache;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 #[cfg(test)]
 use xray_common::net::address::Address;
 
 use crate::error::DnsError;
+
+/// fakeDns app 注册的共享引擎槽（bd 9vu4）。
+///
+/// Go `nameserver.go:70-79` 经 `RequireFeatures` 取全局唯一 `FakeDNSEngine`，
+/// DNS 名 server 与 dispatcher 嗅探共享同实例同池。xray-app-dns 不能反向依赖
+/// xray-core，且 dns app 可能先于 fakeDns app 构建（config app 固定顺序），
+/// 故经 crate 级共享槽在查询时惰性取用，而非构造期注入。
+static SHARED_MULTI: LazyLock<RwLock<Option<Arc<HolderMulti>>>> =
+    LazyLock::new(|| RwLock::new(None));
+
+/// 注册/清除共享引擎。`fake_dns_factory`（xray-core）构建 `HolderMulti` 后
+/// 以 `Some` 写入；重复调用以最后一次为准。测试传 `None` 清除。
+pub fn set_shared_multi(holder: Option<Arc<HolderMulti>>) {
+    *SHARED_MULTI.write() = holder;
+}
+
+/// 取共享引擎。fakeDns app 已配置时为 `Some`，否则 `None`（调用方走兼容路径）。
+#[must_use]
+pub fn shared_multi() -> Option<Arc<HolderMulti>> {
+    SHARED_MULTI.read().clone()
+}
 
 /// Fake DNS 池配置。对应 Go proto `FakeDnsPool`。
 #[derive(Debug, Clone)]

@@ -131,7 +131,7 @@ impl DohNameServer {
             ns.negative_ttl_secs.unwrap_or(0),
         ));
         cache.start_cleanup_task(crate::cache_controller::CLEANUP_INTERVAL);
-        Ok(Box::new(Self::new(
+        Ok(Box::new(Arc::new(Self::new(
             socket_addr,
             server_name,
             tls_config,
@@ -139,7 +139,7 @@ impl DohNameServer {
             ns.client_ip.clone(),
             timeout_dur,
             false,
-        )))
+        ))))
     }
 
     /// h2c（明文 HTTP/2）构造。对应 Go `NewDoHNameServer(u, dispatcher, true, ...)`。
@@ -166,7 +166,7 @@ impl DohNameServer {
             ns.negative_ttl_secs.unwrap_or(0),
         ));
         cache.start_cleanup_task(crate::cache_controller::CLEANUP_INTERVAL);
-        Ok(Box::new(Self::new(
+        Ok(Box::new(Arc::new(Self::new(
             socket_addr,
             String::new(),
             xray_tls::utls::default_client_config(),
@@ -174,7 +174,7 @@ impl DohNameServer {
             ns.client_ip.clone(),
             timeout_dur,
             true,
-        )))
+        ))))
     }
 
 
@@ -325,9 +325,9 @@ impl CachedNameserver for DohNameServer {
     }
 }
 
-impl Server for DohNameServer {
+impl Server for Arc<DohNameServer> {
     fn name(&self) -> &str {
-        &self.name
+        self.name.as_str()
     }
 
     fn is_disable_cache(&self) -> bool {
@@ -339,7 +339,7 @@ impl Server for DohNameServer {
         domain: &'a str,
         option: IpOption,
     ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>> {
-        Box::pin(query_ip(self, domain, option))
+        Box::pin(query_ip(self.clone(), domain, option))
     }
 }
 

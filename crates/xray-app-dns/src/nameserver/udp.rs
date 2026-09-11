@@ -83,7 +83,8 @@ impl UdpNameServer {
     ///
     /// `ns.address` 必须能解析为 IP（域名地址会失败，调用方先做 DNS 查询）。
     pub fn from_config(ns: &NameServerConfig) -> Result<Box<dyn Server>, DnsError> {
-        Ok(Box::new(Self::from_config_bare(ns)?))
+        // Arc 包装：serveStale 后台 pull 需要共享句柄（Go interface 值共享语义）。
+        Ok(Box::new(Arc::new(Self::from_config_bare(ns)?)))
     }
 
     /// 从 `NameServerConfig` 构造具体类型。cache 4 字段
@@ -242,9 +243,9 @@ impl CachedNameserver for UdpNameServer {
     }
 }
 
-impl Server for UdpNameServer {
+impl Server for Arc<UdpNameServer> {
     fn name(&self) -> &str {
-        &self.name
+        self.name.as_str()
     }
 
     fn is_disable_cache(&self) -> bool {
@@ -256,7 +257,7 @@ impl Server for UdpNameServer {
         domain: &'a str,
         option: IpOption,
     ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>> {
-        Box::pin(query_ip(self, domain, option))
+        Box::pin(query_ip(self.clone(), domain, option))
     }
 }
 

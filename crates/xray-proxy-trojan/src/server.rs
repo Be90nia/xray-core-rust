@@ -39,6 +39,7 @@ use crate::protocol::{
 };
 use crate::validator::{MemoryUser, Validator};
 use xray_transport::link::Link;
+use xray_transport::system_listener::InboundTcpListener;
 
 
 /// 包装流，记录所有读取字节用于 fallback 回放。
@@ -380,7 +381,7 @@ where
 
 /// Trojan inbound entry point (aligns with `xray_core::inbound::serve_socks5`).
 pub async fn serve_trojan(
-    listener: TcpListener,
+    listener: InboundTcpListener,
     ohm: Arc<SimpleOhm>,
     users: HashMap<String, MemoryUser>,
     fallbacks: Option<Arc<FallbackPolicy>>,
@@ -848,7 +849,10 @@ mod tests {
         users.insert(user.key_hash(), user);
 
         // 4. 起 trojan inbound
-        let trojan_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let trojan_listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        ).await.unwrap();
         let trojan_addr = trojan_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         tokio::spawn(async move {
@@ -936,7 +940,10 @@ mod tests {
         let user = MemoryUser::new("udp-test@example.com", 0, account.clone());
         let mut users = HashMap::new();
         users.insert(user.key_hash(), user);
-        let trojan_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let trojan_listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        ).await.unwrap();
         let trojan_addr = trojan_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         tokio::spawn(async move {

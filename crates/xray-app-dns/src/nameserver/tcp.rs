@@ -102,12 +102,12 @@ impl TcpNameServer {
             ns.negative_ttl_secs.unwrap_or(0),
         ));
         cache.start_cleanup_task(crate::cache_controller::CLEANUP_INTERVAL);
-        Ok(Box::new(Self::new(
+        Ok(Box::new(Arc::new(Self::new(
             socket_addr,
             cache,
             ns.client_ip.clone(),
             timeout_dur,
-        )))
+        ))))
     }
 
     /// 建立 TCP 连接。
@@ -207,9 +207,9 @@ impl CachedNameserver for TcpNameServer {
     }
 }
 
-impl Server for TcpNameServer {
+impl Server for Arc<TcpNameServer> {
     fn name(&self) -> &str {
-        &self.name
+        self.name.as_str()
     }
 
     fn is_disable_cache(&self) -> bool {
@@ -221,10 +221,9 @@ impl Server for TcpNameServer {
         domain: &'a str,
         option: IpOption,
     ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>> {
-        Box::pin(query_ip(self, domain, option))
+        Box::pin(query_ip(self.clone(), domain, option))
     }
 }
-
 fn io_to_dns(e: io::Error) -> DnsError {
     DnsError::WireFormat(format!("tcp io: {e}"))
 }

@@ -474,6 +474,31 @@ impl AeadCipher for BodyCipher {
             BodyCipher::Chacha(c) => c.open(nonce, aad, ciphertext),
         }
     }
+
+    fn seal_into(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        plaintext: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), xray_crypto::aead::CryptoError> {
+        match self {
+            BodyCipher::Aes(c) => c.seal_into(nonce, aad, plaintext, out),
+            BodyCipher::Chacha(c) => c.seal_into(nonce, aad, plaintext, out),
+        }
+    }
+
+    fn open_in_place<'a>(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        ciphertext: &'a mut [u8],
+    ) -> Result<&'a mut [u8], xray_crypto::aead::CryptoError> {
+        match self {
+            BodyCipher::Aes(c) => c.open_in_place(nonce, aad, ciphertext),
+            BodyCipher::Chacha(c) => c.open_in_place(nonce, aad, ciphertext),
+        }
+    }
 }
 
 /// 按 resolved security 构造请求/响应 body cipher（同一算法，不同 key）。
@@ -516,6 +541,7 @@ where
 {
     let mut nonce_gen = ChunkNonceGenerator::new(&iv, 12);
     let mut buf = [0u8; PUMP_BUF];
+    let mut chunk_buf = Vec::with_capacity(PUMP_BUF + 96);
     loop {
         match server_r.read(&mut buf).await {
             Ok(0) => break,
@@ -527,6 +553,7 @@ where
                     &mut nonce_gen,
                     size_parser.as_mut(),
                     global_padding,
+                    &mut chunk_buf,
                 )
                 .await
                 .is_err()
@@ -548,6 +575,7 @@ where
         &mut nonce_gen,
         size_parser.as_mut(),
         global_padding,
+        &mut chunk_buf,
     )
     .await;
     let _ = stream_w.flush().await;
@@ -563,33 +591,36 @@ async fn write_one_chunk<W, C>(
     nonce_gen: &mut ChunkNonceGenerator,
     size_parser: &mut (dyn SizeParser + Send),
     global_padding: bool,
+    chunk_buf: &mut Vec<u8>,
 ) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin,
     C: AeadCipher,
 {
-    let nonce = nonce_gen.next();
-    let sealed = cipher
-        .seal(&nonce, &[], data)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    // SHAKE128 流消费顺序：next_padding_len → encode（与 decode 侧对称）
+    let sb = size_parser.size_bytes();
     let padding_size = if global_padding {
         usize::from(size_parser.next_padding_len())
     } else {
         0
     };
-    let size_value = u16::try_from(sealed.len() + padding_size).unwrap_or(u16::MAX);
-    let sb = size_parser.size_bytes();
-    let mut size_field = vec![0u8; sb];
-    size_parser.encode(size_value, &mut size_field);
-    writer.write_all(&size_field).await?;
-    writer.write_all(&sealed).await?;
+    // 零中间 Vec：sealed/padding 追加进复用的 chunk_buf，size_field 前缀
+    // 预留后回填，整 chunk 单次 write_all。
+    let nonce = nonce_gen.next_ref();
+    chunk_buf.clear();
+    chunk_buf.resize(sb, 0);
+    cipher
+        .seal_into(nonce, &[], data, chunk_buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     if padding_size > 0 {
         use rand::RngCore;
-        let mut pad = vec![0u8; padding_size];
-        rand::rng().fill_bytes(&mut pad);
-        writer.write_all(&pad).await?;
+        let start = chunk_buf.len();
+        chunk_buf.resize(start + padding_size, 0);
+        rand::rng().fill_bytes(&mut chunk_buf[start..]);
     }
-    Ok(())
+    let size_value = u16::try_from(chunk_buf.len() - sb).unwrap_or(u16::MAX);
+    size_parser.encode(size_value, &mut chunk_buf[..sb]);
+    writer.write_all(chunk_buf).await
 }
 
 /// 下行 pump：从 wire 读 VMess 响应 body chunk 流 → 解密为明文写入 duplex。
@@ -610,6 +641,8 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut nonce_gen = ChunkNonceGenerator::new(&iv, 12);
+    let mut size_field = Vec::with_capacity(18);
+    let mut ciphertext = Vec::with_capacity(PUMP_BUF + 96);
     loop {
         // SHAKE128 流消费顺序：next_padding_len → decode（与 encode 侧对称）
         let padding_size = if global_padding {
@@ -618,7 +651,7 @@ where
             0
         };
         let sb = size_parser.size_bytes();
-        let mut size_field = vec![0u8; sb];
+        size_field.resize(sb, 0);
         if stream_r.read_exact(&mut size_field).await.is_err() {
             break;
         }
@@ -626,16 +659,16 @@ where
         if total_size == 0 {
             break; // 兼容 Go AuthenticationReader 的 size==0 → EOF 语义
         }
-        let mut ciphertext = vec![0u8; usize::from(total_size)];
+        ciphertext.resize(usize::from(total_size), 0);
         if stream_r.read_exact(&mut ciphertext).await.is_err() {
             break;
         }
-        let ciphertext_only = &ciphertext[..ciphertext.len().saturating_sub(padding_size)];
-        let nonce = nonce_gen.next();
-        match cipher.open(&nonce, &[], ciphertext_only) {
+        let cipher_len = ciphertext.len().saturating_sub(padding_size);
+        let nonce = nonce_gen.next_ref();
+        match cipher.open_in_place(nonce, &[], &mut ciphertext[..cipher_len]) {
             Ok(pt) if pt.is_empty() => break, // 终止 chunk
             Ok(pt) => {
-                if server_w.write_all(&pt).await.is_err() {
+                if server_w.write_all(pt).await.is_err() {
                     break;
                 }
             }
@@ -860,6 +893,88 @@ mod tests {
         assert!(
             body_arrived.load(Ordering::SeqCst),
             "server must receive body without having sent the response header"
+        );
+    }
+
+    /// wire 字节对拍（判别器）：write_one_chunk 输出必须逐字节等于手工
+    /// 构成的 `[size_field || seal(data) || padding]`——零拷贝改写不得改 wire。
+    #[tokio::test]
+    async fn write_one_chunk_wire_parity() {
+        let cipher = Aes128Gcm::new(&[0x42u8; 16]).expect("cipher");
+        let mut nonce_gen = ChunkNonceGenerator::new(&[0xAAu8; 16], 12);
+        let mut sp = PlainSizeParser;
+        let mut chunk_buf = Vec::with_capacity(4096);
+        let mut out = Vec::new();
+        write_one_chunk(
+            &mut out,
+            b"hello wire",
+            &cipher,
+            &mut nonce_gen,
+            &mut sp,
+            false,
+            &mut chunk_buf,
+        )
+        .await
+        .expect("write chunk");
+        // 参考构成：分配式 seal + size_field 手工拼接
+        let mut ref_nonce = ChunkNonceGenerator::new(&[0xAAu8; 16], 12);
+        let sealed = cipher.seal(&ref_nonce.next(), &[], b"hello wire").expect("seal");
+        let mut expected = vec![0u8; 2];
+        sp.encode(u16::try_from(sealed.len()).expect("small"), &mut expected);
+        expected.extend_from_slice(&sealed);
+        assert_eq!(out, expected, "chunk wire bytes must match manual composition");
+    }
+
+    struct CountingWriter {
+        buf: Vec<u8>,
+        writes: usize,
+    }
+    impl AsyncWrite for CountingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.writes += 1;
+            self.buf.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// 『零中间 Vec + 合并单次写』结构断言：padding 开启时旧实现 3 次
+    /// write（size_field/sealed/padding 各一次），新实现必须每 chunk 1 次；
+    /// chunk_buf 跨 chunk 复用不扩容（零中间分配的结构性代理断言）。
+    #[tokio::test]
+    async fn write_one_chunk_single_write_and_buffer_reuse() {
+        let cipher = Aes128Gcm::new(&[0x42u8; 16]).expect("cipher");
+        let mut nonce_gen = ChunkNonceGenerator::new(&[0xAAu8; 16], 12);
+        let mut sp = ShakeSizeParserAdapter::new(&[0x11u8; 16]);
+        let cap = PUMP_BUF + 96;
+        let mut chunk_buf = Vec::with_capacity(cap);
+        let mut w = CountingWriter { buf: Vec::new(), writes: 0 };
+        for _ in 0..2 {
+            write_one_chunk(
+                &mut w,
+                b"payload bytes for one chunk",
+                &cipher,
+                &mut nonce_gen,
+                &mut sp,
+                true,
+                &mut chunk_buf,
+            )
+            .await
+            .expect("write chunk");
+        }
+        assert_eq!(w.writes, 2, "each chunk must be one write_all (old impl: 3)");
+        assert!(
+            chunk_buf.capacity() <= cap,
+            "chunk_buf must be reused without growth"
         );
     }
 }

@@ -32,7 +32,7 @@ use xray_transport::listener_registry::{
     register_transport_listener,
 };
 use xray_transport::sockopt::SocketOptions;
-use crate::client::{DialOptions, dial};
+use crate::client::{DialFactory, DialOptions, DialParams, DelayDialConn, dial, dial_with_params};
 use crate::config::Config;
 
 /// 注册 WebSocket transport dialer。
@@ -193,23 +193,43 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
         }
     }
 
+    let tls_server_name = security_str(settings, "serverName");
+    let fingerprint = security_str(settings, "fingerprint");
+
+    // Go dialer.go:24-33 + 168-221 delayDialConn：Ed > 0 时拨号推迟到首次
+    // Write，首包 ≤ Ed 以 early data 进握手头（0-RTT），Read 阻塞至拨号完成。
+    if config.ed > 0 {
+        let ed = config.ed;
+        let params = DialParams {
+            config,
+            destination: dest.clone(),
+            tls_config,
+            tls_server_name,
+            fingerprint,
+        };
+        let settings = settings.clone();
+        let factory: DialFactory = Arc::new(move |ed_bytes| {
+            let params = params.clone();
+            let settings = settings.clone();
+            Box::pin(async move {
+                let conn = dial_with_params(params, ed_bytes)
+                    .await
+                    .map_err(io::Error::other)?;
+                // Tcpmask（Go websocket/dialer.go:56-63 WrapConnClient）：
+                // 真实连接建立时应用，delayDialConn 包在最外层。
+                xray_transport::finalmask::wrap_conn_client_from_settings(&settings, Box::new(conn))
+            })
+        });
+        return Ok(Box::new(DelayDialConn::new(ed, factory)));
+    }
+
     let conn = dial(DialOptions {
         config: &config,
         destination: dest,
         early_data: None,
         tls_config,
-        tls_server_name: settings
-            .security_json
-            .as_ref()
-            .and_then(|v| v.get("serverName"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        fingerprint: settings
-            .security_json
-            .as_ref()
-            .and_then(|v| v.get("fingerprint"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
+        tls_server_name,
+        fingerprint,
     })
     .await
     .map_err(|e| io::Error::other(e))?;
@@ -217,6 +237,16 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
     // Tcpmask（Go websocket/dialer.go:56-63：`TcpmaskManager.WrapConnClient`，
     // security 包装之后链式应用 finalmask_json.tcp[]）。
     xray_transport::finalmask::wrap_conn_client_from_settings(settings, Box::new(conn))
+}
+
+/// security_json 顶层字符串字段提取（serverName / fingerprint）。
+fn security_str(settings: &StreamSettings, key: &str) -> Option<String> {
+    settings
+        .security_json
+        .as_ref()
+        .and_then(|v| v.get(key))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// 从 path 提取 `?ed=N` 早期数据参数。
@@ -688,7 +718,30 @@ mod tests {
         assert_eq!(f("/w%zz?ed=2048"), ("/w%zz?ed=2048".to_string(), None));
     }
 
+    /// ed>0 走 delayDial（Go dialer.go:24-32）：dial_ws 立即返回成功且不拨号。
+    #[tokio::test]
+    async fn dial_ws_with_ed_defers_dialing() {
+        use xray_common::net::address::Address;
+        use xray_common::net::network::Network;
+        use xray_common::net::port::Port;
+
+        // 127.0.0.1:1 不可达：立即拨号会 Err；delayDial 首写前必须成功返回。
+        let settings = StreamSettings {
+            transport_json: Some(serde_json::json!({"path": "/ws?ed=2048"})),
+            ..Default::default()
+        };
+        let dest = Destination::new(
+            Address::new_domain("127.0.0.1"),
+            Port::new(1),
+            Network::TCP,
+        );
+        let conn = dial_ws(&dest, &settings)
+            .await
+            .expect("delayDial must return without dialing");
+        drop(conn);
+    }
     /// Tcpmask round-trip（o54c，Go websocket/dialer.go:56-63 + hub.go:132-134）：
+
     /// dial 与 hub 双端配置 fragment mask 后 e2e echo 收发。
     #[tokio::test]
     async fn ws_dial_hub_tcpmask_roundtrip() {
