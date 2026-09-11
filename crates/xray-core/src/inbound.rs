@@ -188,8 +188,10 @@ pub fn is_mux_destination(dest: &Destination) -> bool {
 
 /// 处理 mux.cool 入站连接：创建 ServerWorker，循环读帧，为每个子 session dispatch。
 ///
-/// 对应 Go `mux.Server.OnTransport(link.Reader, link.Writer)`。
-async fn handle_mux_inbound_link(link: Link, handler: Arc<dyn xray_app_dispatcher::DispatchHandler>) {
+/// 对应 Go `mux.Server.OnTransport(link.Reader, link.Writer)`。socks/http 在
+/// 协议层内联调用；wiring 的 [`crate::wiring::MuxCarrierHandler`] 装饰器对
+/// 其余 inbound（vless/trojan/ss/…）统一按 destination 判定调用。
+pub(crate) async fn handle_mux_inbound_link(link: Link, handler: Arc<dyn xray_app_dispatcher::DispatchHandler>) {
     use xray_buf::reader::BufferedReader;
     use xray_buf::writer::BufferedWriter;
     use xray_mux::worker::{DispatchHandlerAdapter, ServerWorker};
@@ -1640,16 +1642,22 @@ pub async fn spawn_inbounds(
         // 方案 B：生产链经 DefaultDispatcher（sniffing + stats + routing）。
         // 每个 inbound 一份 ohm 快照，default 替换为携带该 inbound sniffing 配置
         // 与 tag 的 wrapper；master ohm 的 default 保持真实出站（避免递归）。
+        // wrapper 外再包 MuxCarrierHandler（Go always.go:89 mux.NewServer 装饰器）：
+        // v1.mux.cool carrier 由 mux ServerWorker 接管，子会话回 wrapper。
         let per_ohm = dispatcher
             .as_ref()
             .map(|d| {
                 let snap = Arc::new(ohm.snapshot());
                 let sniff =
                     crate::wiring::sniffing_request_from_json(ib.sniffing_json.as_ref());
-                snap.set_default(Arc::new(crate::wiring::InboundDispatchHandler::new(
-                    Arc::clone(d),
-                    sniff,
-                    &ib.tag,
+                let inbound_handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
+                    Arc::new(crate::wiring::InboundDispatchHandler::new(
+                        Arc::clone(d),
+                        sniff,
+                        &ib.tag,
+                    ));
+                snap.set_default(Arc::new(crate::wiring::MuxCarrierHandler::new(
+                    inbound_handler,
                 )));
                 snap
             })

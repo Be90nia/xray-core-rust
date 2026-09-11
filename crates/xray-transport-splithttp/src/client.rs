@@ -137,10 +137,12 @@ pub struct BtlsDial {
     pub port: u16,
     /// TLS SNI（tlsSettings.serverName，空回退 dest host）。
     pub sni: String,
-    /// rustls ClientConfig（u_client 的语义参数；btls 清单内指纹握手用 btls
     /// 自建 config，清单外指纹由 u_client 回退此 config 走 rustls）。
     pub config: Arc<RustlsClientConfig>,
     pub fingerprint: Fingerprint,
+    /// `tlsSettings` 原文（pz6c）：btls 指纹握手后回接证书验证用
+    /// （allowInsecure/pinned/vcn 语义，见 `xray_tls::client_config::build_server_cert_verifier`）。
+    pub security_json: Option<serde_json::Value>,
 }
 
 /// [`SplitConnector`] 的统一 response 流。满足 hyper-util legacy Client 的
@@ -189,6 +191,7 @@ impl TowerService<Uri> for SplitConnector {
                         dial.config.clone(),
                         dial.fingerprint,
                         None,
+                        dial.security_json.as_ref(),
                     )
                     .await?;
                     // ALPN 协商结果决定 hyper 的 HTTP 版本（浏览器预设 [h2, http/1.1]）。
@@ -311,6 +314,7 @@ impl DefaultDialerClient {
         tls_config: RustlsClientConfig,
         dial: DialTarget,
         fingerprint: Option<Fingerprint>,
+        security_json: Option<serde_json::Value>,
     ) -> Self {
         // SNI 用 tlsSettings.serverName（Go WithDestination 等价：空回退 dest.host）。
         let sni = if dial.sni.is_empty() { dial.host.clone() } else { dial.sni };
@@ -323,6 +327,7 @@ impl DefaultDialerClient {
                 sni,
                 config: Arc::new(tls_config),
                 fingerprint: fp,
+                security_json,
             })
         } else {
             let mut builder = HttpsConnectorBuilder::new()

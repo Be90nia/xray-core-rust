@@ -502,6 +502,9 @@ pub async fn u_client<S>(
     config: Arc<ClientConfig>,
     fingerprint: Fingerprint,
     ech_config_list: Option<&str>,
+    // btls 回接验证（pz6c）：`tlsSettings` 原文，内部构建服务端证书验证器
+    // （allowInsecure/pinned/vcn/用户根，语义同 rustls 路径）。
+    security_json: Option<&serde_json::Value>,
 ) -> io::Result<UConn<S>>
 where
     S: Connection + Unpin,
@@ -511,7 +514,17 @@ where
         match result {
             Ok(_) => {
                 debug!(target: "xray_tls::utls", ?fingerprint, server_name, "u_client: 尝试 btls 指纹伪装");
-                match crate::btls_client::BtlsConn::connect(stream, server_name, fingerprint, ech_config_list).await {
+                match crate::btls_client::BtlsConn::connect(
+                    stream,
+                    server_name,
+                    fingerprint,
+                    ech_config_list,
+                    // 回接证书验证（pz6c）：allowInsecure=true → None 跳过；
+                    // 否则 webpki/pinned verifier 对 btls peer 链做链+主机名验证。
+                    crate::client_config::build_server_cert_verifier(security_json)?,
+                )
+                .await
+                {
                     Ok(btls_conn) => {
                         return Ok(UConn { inner: UConnInner::Btls(btls_conn), fingerprint });
                     }
@@ -635,22 +648,33 @@ mod tests {
         assert_eq!(buf, b"hello-from-tls\n");
     }
 
-    /// 测试 u_client rustls fallback 路径（非 btls 指纹）。
+    /// 测试 u_client btls 路径 `allowInsecure=true`（verifier=None）连自签 server。
+    ///
+    /// 注：本测试原名 `u_client_falls_back_to_standard_rustls`——pz6c 修正：
+    /// Random 指纹实际映射 Chrome 133 走 btls（connector_for_fingerprint 对
+    /// 全清单返回 Some，rustls fallback 分支已随"清单外指纹硬错"裁决成为
+    /// 死代码），修复后自签证书必须经 allowInsecure 显式放行。
     #[tokio::test]
-    async fn u_client_falls_back_to_standard_rustls() {
-        let (addr, cert_der) = spawn_test_server(b"u-fallback-ok\n").await;
-        let config = trusted_config(cert_der);
+    async fn u_client_btls_accepts_with_allow_insecure() {
+        let (addr, _cert_der) = spawn_test_server(b"u-insecure-ok\n").await;
 
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        // Random 指纹不在 btls 支持列表，走 rustls fallback
-        let mut u = u_client(TcpConnection::new(tcp), "localhost", config, Fingerprint::Random, None)
-            .await
-            .expect("fallback ok");
+        let insecure_json = serde_json::json!({ "allowInsecure": true });
+        let mut u = u_client(
+            TcpConnection::new(tcp),
+            "localhost",
+            default_client_config(),
+            Fingerprint::Random,
+            None,
+            Some(&insecure_json),
+        )
+        .await
+        .expect("allowInsecure must accept self-signed cert");
         assert_eq!(u.fingerprint, Fingerprint::Random);
 
         let mut buf = Vec::new();
         u.read_to_end(&mut buf).await.expect("read ok");
-        assert_eq!(buf, b"u-fallback-ok\n");
+        assert_eq!(buf, b"u-insecure-ok\n");
     }
 
     #[tokio::test]
@@ -699,6 +723,8 @@ mod tests {
             "cloudflare.com",
             Fingerprint::Chrome,
             None,
+            // 真实服务器：走完整验证（cloudflare 证书合法，webpki-roots 应过）
+            crate::client_config::build_server_cert_verifier(None).unwrap(),
         )
         .await
         .expect("btls Chrome 133 握手成功");
@@ -729,6 +755,7 @@ mod tests {
             "localhost",
             Fingerprint::Chrome,
             None,
+            None, // 自签证书诊断：跳过验证
         )
         .await;
 
@@ -795,6 +822,7 @@ mod tests {
                     server.trim_end_matches(":443"),
                     *fp,
                     None,
+                    crate::client_config::build_server_cert_verifier(None).unwrap(),
                 )
                 .await
                 {
@@ -824,6 +852,112 @@ mod tests {
         assert_eq!(
             fail, 0,
             "{fail} 个指纹握手失败（{ok} 成功），见上方详情"
+        );
+    }
+    // ============================================================
+    // btls 回接证书验证（pz6c）：指纹路径不得等价 InsecureSkipVerify=true
+    // ============================================================
+
+    /// btls 指纹客户端 + 默认 webpki verifier：自签证书必须被拒
+    /// （修复前该路径恒成功——零验证）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn btls_client_rejects_untrusted_cert() {
+        let (addr, _cert_der) = spawn_test_server(b"never-read\n").await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        let result = crate::btls_client::BtlsConn::connect(
+            TcpConnection::new(tcp),
+            "localhost",
+            Fingerprint::HelloChrome133,
+            None,
+            crate::client_config::build_server_cert_verifier(None).unwrap(),
+        )
+        .await;
+
+        let err = match result {
+            Ok(_) => panic!("self-signed cert must be rejected without allowInsecure"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("certificate verification failed"),
+            "expected verification error, got: {err}"
+        );
+    }
+
+    /// btls 指纹客户端 + verifier=None（allowInsecure=true 等价）：连接成功且可读数据。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn btls_client_accepts_without_verifier() {
+        let (addr, _cert_der) = spawn_test_server(b"btls-insecure-ok\n").await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        let mut conn = crate::btls_client::BtlsConn::connect(
+            TcpConnection::new(tcp),
+            "localhost",
+            Fingerprint::HelloChrome133,
+            None,
+            None,
+        )
+        .await
+        .expect("allowInsecure (verifier=None) must accept");
+
+        let mut buf = Vec::new();
+        conn.read_to_end(&mut buf).await.expect("read ok");
+        assert_eq!(buf, b"btls-insecure-ok\n");
+    }
+
+    /// btls 指纹客户端 + 生产 pinnedPeerCertSha256 配置：pin 命中必须通过
+    /// （verifier 走 PinnedServerCertVerifier，与 rustls 路径同源）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn btls_client_accepts_pinned_cert() {
+        let (addr, cert_der) = spawn_test_server(b"btls-pinned-ok\n").await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        let pin_hex = crate::pin::generate_cert_hash_hex(&cert_der);
+        let pinned_json = serde_json::json!({ "pinnedPeerCertSha256": pin_hex });
+        let verifier = crate::client_config::build_server_cert_verifier(Some(&pinned_json))
+            .unwrap()
+            .expect("pinned config yields a verifier");
+
+        let mut conn = crate::btls_client::BtlsConn::connect(
+            TcpConnection::new(tcp),
+            "localhost",
+            Fingerprint::HelloChrome133,
+            None,
+            Some(verifier),
+        )
+        .await
+        .expect("pinned cert must be accepted");
+
+        let mut buf = Vec::new();
+        conn.read_to_end(&mut buf).await.expect("read ok");
+        assert_eq!(buf, b"btls-pinned-ok\n");
+    }
+
+    /// 端到端（生产入口）：tcp/grpc/splithttp register 共用的 u_client，
+    /// 配置指纹 + 默认安全配置（无 allowInsecure）连自签 server 必须被拒
+    /// （修复前该路径恒成功——零验证，等价 InsecureSkipVerify=true）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn u_client_btls_fingerprint_rejects_untrusted_cert() {
+        let (addr, _cert_der) = spawn_test_server(b"never-read\n").await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        let result = u_client(
+            TcpConnection::new(tcp),
+            "localhost",
+            default_client_config(),
+            Fingerprint::HelloChrome133,
+            None,
+            None, // 无 allowInsecure → 默认全验证
+        )
+        .await;
+
+        let err = match result {
+            Ok(_) => panic!("u_client must reject untrusted cert by default"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("certificate verification failed"),
+            "expected verification error, got: {err}"
         );
     }
 }

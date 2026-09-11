@@ -165,21 +165,7 @@ pub fn build_client_config(
                 verify_peer_cert_by_name,
             )))
     } else {
-        // 信任根：disableSystemRoot=true → certificates[] 全部证书作自定义 CA
-        // （对应 Go getCertPool → loadSelfCertPool，不筛 usage）；否则 webpki-roots
-        // （Go 用系统根，Rust 沿用既有 webpki-roots 决策）。
-        let roots = if obj
-            .and_then(|m| m.get("disableSystemRoot"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            custom_root_store(&json)?
-        } else {
-            let mut store = RootCertStore::empty();
-            store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            store
-        };
-        builder.with_root_certificates(roots)
+        builder.with_root_certificates(verifier_roots(&json)?)
     };
 
     let mut cfg = match identity {
@@ -203,6 +189,65 @@ pub fn build_client_config(
     }
 
     Ok(Some(Arc::new(cfg)))
+}
+
+/// 客户端验证器信任根选择：`disableSystemRoot=true` → `certificates[]` 全部
+/// 证书作自定义 CA（对应 Go `loadSelfCertPool`，不筛 usage）；否则 webpki-roots
+/// （Go 用系统根，Rust 沿用既有 webpki-roots 决策）。
+fn verifier_roots(json: &serde_json::Value) -> io::Result<RootCertStore> {
+    let disable = json
+        .as_object()
+        .and_then(|m| m.get("disableSystemRoot"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if disable {
+        custom_root_store(json)
+    } else {
+        let mut store = RootCertStore::empty();
+        store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Ok(store)
+    }
+}
+
+/// 按安全配置构建**服务端证书验证器**（btls 指纹路径回接验证用，pz6c）。
+///
+/// 对应 Go `copyConfig`（tls.go:149-161）把验证语义透传进 utls.Config：uTLS
+/// 非 insecure 时握手执行完整链验证。返回 `None` = `allowInsecure=true`
+/// （跳过验证，等价 Go `InsecureSkipVerify`）；`Some` 按序命中 pinned/vcn
+/// 自定义验证器或 webpki（用户根 / webpki-roots）验证器，与
+/// [`build_client_config`] 的 rustls 路径同语义。
+///
+/// # 参数
+/// - `security_json`：`tlsSettings` JSON；`None` 按 `{}`（默认全验证）。
+pub fn build_server_cert_verifier(
+    security_json: Option<&serde_json::Value>,
+) -> io::Result<Option<Arc<dyn ServerCertVerifier>>> {
+    let json = security_json.cloned().unwrap_or(serde_json::Value::Null);
+    let allow_insecure = json
+        .as_object()
+        .and_then(|m| m.get("allowInsecure"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if allow_insecure {
+        return Ok(None);
+    }
+    let pins = parse_pinned_hashes(&json)?;
+    let verify_peer_cert_by_name = json
+        .as_object()
+        .and_then(|m| m.get("verifyPeerCertByName"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if !pins.is_empty() || !verify_peer_cert_by_name.is_empty() {
+        return Ok(Some(Arc::new(PinnedServerCertVerifier::new(
+            pins,
+            verify_peer_cert_by_name,
+        ))));
+    }
+    let verifier = WebPkiServerVerifier::builder(Arc::new(verifier_roots(&json)?))
+        .build()
+        .map_err(|e| io::Error::other(format!("webpki verifier: {e}")))?;
+    Ok(Some(verifier))
 }
 
 /// `disableSystemRoot=true` 时的信任根：`certificates[]` 全部条目的证书

@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use thiserror::Error;
-use xray_app_dispatcher::default::DispatchHandler;
+use xray_app_dispatcher::default::{DispatchHandler, SniffingRequest};
 use xray_common::net::destination::Destination;
 use xray_common::session::Session;
 use xray_features::inbound::{InboundError, InboundHandler};
@@ -107,6 +107,7 @@ pub trait LoopbackSink: Send + Sync + Debug {
         &self,
         inbound_tag: String,
         destination: xray_common::net::destination::Destination,
+        sniffing: SniffingRequest,
         link: xray_transport::link::Link,
     ) -> LoopbackFuture<Result<(), LoopbackError>>;
 }
@@ -120,7 +121,10 @@ pub trait LoopbackSink: Send + Sync + Debug {
 pub struct LoopbackHandler {
     tag: String,
     inbound_tag: String,
-    /// dispatcher 注入点；None 时 dispatch 仅 log + drop link（测试桩语义）。
+    /// Go loopback.go:18 `sniffingRequest`：init 时由 config.Sniffing 构建
+    /// （loopback.go:56-62），重分发时注入；未配置 = default（不嗅探）。
+    sniffing: SniffingRequest,
+    /// dispatcher 注入点；None 时 dispatch 显式报错（装配缺失，见 dispatch 文档）。
     sink: Option<Arc<dyn LoopbackSink>>,
 }
 
@@ -130,6 +134,7 @@ impl Debug for LoopbackHandler {
             .field("tag", &self.tag)
             .field("inbound_tag", &self.inbound_tag)
             .field("has_sink", &self.sink.is_some())
+            .field("sniffing_enabled", &self.sniffing.enabled)
             .finish()
     }
 }
@@ -144,6 +149,7 @@ impl LoopbackHandler {
         Self {
             tag: tag.into(),
             inbound_tag: config.inbound_tag,
+            sniffing: SniffingRequest::default(),
             sink: None,
         }
     }
@@ -154,6 +160,7 @@ impl LoopbackHandler {
         Self {
             tag: tag.into(),
             inbound_tag: inbound_tag.into(),
+            sniffing: SniffingRequest::default(),
             sink: None,
         }
     }
@@ -162,6 +169,14 @@ impl LoopbackHandler {
     #[must_use]
     pub fn with_sink(mut self, sink: Arc<dyn LoopbackSink>) -> Self {
         self.sink = Some(sink);
+        self
+    }
+
+    /// 附加嗅探请求（对应 Go `Loopback.init` loopback.go:56-62：config.Sniffing
+    /// 启用时 BuildSniffingRequest 注入重分发，否则零值）。
+    #[must_use]
+    pub fn with_sniffing_request(mut self, sniffing: SniffingRequest) -> Self {
+        self.sniffing = sniffing;
         self
     }
 
@@ -193,8 +208,9 @@ impl DispatchHandler for LoopbackHandler {
     /// 2. 构造新的 Content / Inbound session（Go 端逻辑）
     /// 3. 调 `dispatcherInstance.DispatchLink(ctx, target, link)`
     ///
-    /// 切片2 简化：session/ctx 改造留切片3，本方法直接调 sink.dispatch_loopback。
-    /// sink 为 None 时仅 log + drop link（测试桩）。
+    /// 本方法直接调 sink.dispatch_loopback（sniffing 一并透传，对齐
+    /// Go loopback.go:32-36 content.SniffingRequest 注入重分发）。
+    /// sink 为 None = 生产装配缺失，显式报错丢弃（防静默黑洞，票 rdcc）。
     fn dispatch(
         &self,
         _dest: &xray_common::net::destination::Destination,
@@ -202,19 +218,23 @@ impl DispatchHandler for LoopbackHandler {
     ) -> LoopbackFuture<()> {
         let sink = self.sink.clone();
         let inbound_tag = self.inbound_tag.clone();
+        let sniffing = self.sniffing.clone();
         let dest = _dest.clone();
         Box::pin(async move {
             match sink {
                 Some(s) => {
-                    if let Err(e) = s.dispatch_loopback(inbound_tag.clone(), dest, link).await {
+                    if let Err(e) =
+                        s.dispatch_loopback(inbound_tag.clone(), dest, sniffing, link).await
+                    {
                         tracing::warn!(inbound_tag = %inbound_tag, error = %e, "loopback dispatch failed");
                     }
                 }
                 None => {
-                    // ponytail: 切片2 stub —— sink 未注入时仅 log，真正回环留切片3。
-                    tracing::info!(
+                    // 装配缺失（生产 xray-core functions.rs 应注入 DispatcherLoopbackSink）；
+                    // 连接无处可去，显式 error 防静默黑洞（票 rdcc）。
+                    tracing::error!(
                         inbound_tag = %inbound_tag,
-                        "loopback dispatch: link received (sink not injected, 切片2 stub)"
+                        "loopback outbound dispatched without sink: dropping connection (assembly missing DispatcherLoopbackSink)"
                     );
                     drop(link);
                 }
@@ -252,7 +272,12 @@ impl OutboundHandler for LoopbackHandler {
                 let (r, _w) = xray_buf::pipe::new();
                 let (_r2, w2) = xray_buf::pipe::new();
                 let link = xray_transport::link::Link::new(Box::new(r), Box::new(w2));
-                s.dispatch_loopback(self.inbound_tag.clone(), _destination.clone(), link)
+                s.dispatch_loopback(
+                    self.inbound_tag.clone(),
+                    _destination.clone(),
+                    self.sniffing.clone(),
+                    link,
+                )
                     .await
                     .map_err(|e| OutboundError::ConnectionFailed(e.to_string()))
             }
@@ -376,6 +401,7 @@ mod tests {
             &self,
             inbound_tag: String,
             _destination: xray_common::net::destination::Destination,
+            _sniffing: SniffingRequest,
             _link: xray_transport::link::Link,
         ) -> LoopbackFuture<std::result::Result<(), LoopbackError>> {
             let calls = self.calls.clone();
@@ -421,6 +447,52 @@ mod tests {
         // dispatch 返回 future，await 不应 panic。
         h.dispatch(&dummy_dest(), link).await;
         // 到达这里即视为测试桩语义正常。
+    }
+
+    /// 记录 sink 收到的 sniffing.enabled（透传验证，票 rdcc）。
+    #[derive(Debug, Default)]
+    struct SniffCaptureSink {
+        enabled: std::sync::Arc<parking_lot::Mutex<Vec<bool>>>,
+    }
+
+    impl LoopbackSink for SniffCaptureSink {
+        fn dispatch_loopback(
+            &self,
+            _inbound_tag: String,
+            _destination: xray_common::net::destination::Destination,
+            sniffing: SniffingRequest,
+            _link: xray_transport::link::Link,
+        ) -> LoopbackFuture<std::result::Result<(), LoopbackError>> {
+            let enabled = self.enabled.clone();
+            Box::pin(async move {
+                enabled.lock().push(sniffing.enabled);
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_dispatch_passes_sniffing_to_sink() {
+        // 默认构造：sniffing disabled 透传（Go loopback.go:56-62 未配置 = 零值）。
+        let sink = SniffCaptureSink::default();
+        let enabled = sink.enabled.clone();
+        let h = LoopbackHandler::with_inbound_tag("lb", "in")
+            .with_sink(std::sync::Arc::new(sink));
+        h.dispatch(&dummy_dest(), pipe_link()).await;
+        assert_eq!(enabled.lock().clone(), [false]);
+
+        // with_sniffing_request：配置的请求透传给 sink（Go loopback.go:34）。
+        let sink = SniffCaptureSink::default();
+        let enabled = sink.enabled.clone();
+        let req = SniffingRequest {
+            enabled: true,
+            ..Default::default()
+        };
+        let h = LoopbackHandler::with_inbound_tag("lb", "in")
+            .with_sniffing_request(req)
+            .with_sink(std::sync::Arc::new(sink));
+        h.dispatch(&dummy_dest(), pipe_link()).await;
+        assert_eq!(enabled.lock().clone(), [true]);
     }
 
     #[tokio::test]

@@ -162,12 +162,7 @@ async fn dial_stream_up_via_h2_mock_server() {
         ..Default::default()
     });
     let client_tls = make_client_tls(cert_der);
-    let client = Arc::new(DefaultDialerClient::new(
-        config.clone(),
-        client_tls.into(),
-        DialTarget { host: server_addr.ip().to_string(), port: server_addr.port(), sni: String::new() },
-        None,
-    ));
+    let client = Arc::new(DefaultDialerClient::new(config.clone(), client_tls.into(), DialTarget { host: server_addr.ip().to_string(), port: server_addr.port(), sni: String::new() }, None, None));
 
     // 3. dial_stream_up
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -277,12 +272,7 @@ async fn dial_stream_one_via_h2_mock_server() {
         ..Default::default()
     });
     let client_tls = make_client_tls(cert_der);
-    let client = Arc::new(DefaultDialerClient::new(
-        config.clone(),
-        client_tls.into(),
-        DialTarget { host: server_addr.ip().to_string(), port: server_addr.port(), sni: String::new() },
-        None,
-    ));
+    let client = Arc::new(DefaultDialerClient::new(config.clone(), client_tls.into(), DialTarget { host: server_addr.ip().to_string(), port: server_addr.port(), sni: String::new() }, None, None));
 
     // 3. dial_stream_one
     let session_id = String::new(); // stream-one session_id 空

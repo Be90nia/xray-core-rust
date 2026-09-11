@@ -14,7 +14,7 @@
 //! 单线程驱动：inbound handler task 在持锁期间依次执行 ingest_rx → poll → drain_tx。
 //! smoltcp Interface 不是 Sync，必须由 driver task 单点驱动。
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
@@ -52,6 +52,11 @@ pub struct TunNetStack {
     sockets: SocketSet<'static>,
     /// ICMP socket handle（用于自动回复 echo request）。
     icmp_handle: SocketHandle,
+    /// 惰性 TCP listen socket 缓存（票 ipb5）：key = SYN 的 dst (addr, port)。
+    ///
+    /// smoltcp 无通配端口监听（`listen(0)==Err(Unaddressable)`），须按实际包 dst
+    /// 逐个注册。accept 后条目即摘除（socket 已转为连接 socket），下个 SYN 重建。
+    tcp_listens: HashMap<IpEndpoint, SocketHandle>,
 }
 
 impl TunNetStack {
@@ -73,29 +78,28 @@ impl TunNetStack {
             }
         });
 
-        // 配置默认路由：IPv4/IPv6 默认路由指向 interface 地址（对应 Go stackGVisor 的
-        // defaultRoute）。smoltcp 对非本地 dest 包走默认路由，没有路由则 drop。
-        // ponytail: 用 interface 自己作 gateway——smoltcp 对 TUN medium 直连模式
-        // 只需要存在一条默认路由，gateway 字段不影响
-        let has_v4 = local_addrs
-            .iter()
-            .any(|c| matches!(c, IpCidr::Ipv4(_)));
-        let has_v6 = local_addrs
-            .iter()
-            .any(|c| matches!(c, IpCidr::Ipv6(_)));
+        // 默认路由 + AnyIP（票 ipb5）：TUN 截获的包 dst 是真实目标地址（公网 IP），
+        // 不是本机接口地址。smoltcp `process_ipv4/ipv6` 在 `any_ip=false` 时直接丢弃
+        // 此类包；`any_ip=true` 时仅当 `routes.lookup(dst)` 返回**本机地址**才放行——
+        // 因此默认路由的 gateway 必须指向本机地址（对应 Go gVisor netstack 的
+        // NIC 全收行为），出站方向 smoltcp 据此找到下一跳（TUN medium 无 ARP）。
+        let v4_local = local_addrs.iter().find_map(|c| match c {
+            IpCidr::Ipv4(c) => Some(c.address()),
+            _ => None,
+        });
+        let v6_local = local_addrs.iter().find_map(|c| match c {
+            IpCidr::Ipv6(c) => Some(c.address()),
+            _ => None,
+        });
         iface.routes_mut().update(|routes| {
-            if has_v4 {
-                // IPv4 默认路由：用 0.0.0.0 作 gateway（TUN medium 无 ARP）
-                let _ = routes.push(smoltcp::iface::Route::new_ipv4_gateway(
-                    Ipv4Address::new(0, 0, 0, 0),
-                ));
+            if let Some(v4) = v4_local {
+                let _ = routes.push(smoltcp::iface::Route::new_ipv4_gateway(v4));
             }
-            if has_v6 {
-                let _ = routes.push(smoltcp::iface::Route::new_ipv6_gateway(
-                    Ipv6Address::new(0, 0, 0, 0, 0, 0, 0, 0),
-                ));
+            if let Some(v6) = v6_local {
+                let _ = routes.push(smoltcp::iface::Route::new_ipv6_gateway(v6));
             }
         });
+        iface.set_any_ip(true);
 
 let mut stack = Self {
 iface,
@@ -103,6 +107,7 @@ device,
 // ponytail: SocketSet 用 Vec 作 backing storage，'static bound 由 alloc 满足
             sockets: SocketSet::new(Vec::new()),
             icmp_handle: SocketHandle::default(),
+            tcp_listens: HashMap::new(),
 };
 
         // 自动创建 ICMP socket 并绑定到 ident 0——smoltcp 收到 ICMP echo request 时
@@ -267,28 +272,33 @@ device,
         socket.connect(self.iface.context(), (remote, port), 0)
     }
 
-    /// TCP 监听（server side）。对应 Go `tcp.NewForwarder` 的 listen 语义。
+    /// TCP 惰性监听（票 ipb5）。对应 Go `tcp.NewForwarder(stack, 0, 65535)` 的
+    /// 通配端口语义——smoltcp 无此能力（`listen(0)==Err(Unaddressable)`），
+    /// 改为在 IP 层解析 SYN 的 dst 后按具体 (addr, port) 注册。
     ///
-    /// 把 socket 置为 Listen 状态，接受任意源地址的连接。
-    /// 后续用 [`Self::tcp_accept`] 检查是否有新连接进入。
-    ///
-    /// # 参数
-    ///
-    /// - `handle`：TCP socket handle（必须处于 Closed 状态）
-    /// - `port`：监听端口
+    /// 缓存命中且 socket 仍处 Listen → 复用；未命中/已失效 → 新建 listen socket
+    /// 并入缓存。accept（[`Self::check_tcp_accepts`]）后条目摘除，同 dst 的新
+    /// SYN 自动重建。
     ///
     /// # 错误
     ///
-    /// - [`TunError::TcpListenFailed`]：socket 状态非法或地址不可用
-    pub fn tcp_listen(
-        &mut self,
-        handle: SocketHandle,
-        port: u16,
-    ) -> Result<(), crate::error::TunError> {
+    /// - [`TunError::TcpListenFailed`]：port=0（smoltcp 拒绝）或 socket 状态非法
+    pub fn ensure_tcp_listen(&mut self, dst: IpEndpoint) -> Result<(), crate::error::TunError> {
+        if let Some(&handle) = self.tcp_listens.get(&dst) {
+            let state = self.sockets.get_mut::<tcp::Socket<'static>>(handle).state();
+            if state == tcp::State::Listen {
+                return Ok(());
+            }
+            // 占用（已 accept）或已失效：摘除后重建
+            self.tcp_listens.remove(&dst);
+        }
+        let handle = self.add_tcp_socket();
         let socket = self.sockets.get_mut::<tcp::Socket<'static>>(handle);
         socket
-            .listen(port)
-            .map_err(|e| crate::error::TunError::TcpListenFailed(format!("{e:?}")))
+            .listen(dst)
+            .map_err(|e| crate::error::TunError::TcpListenFailed(format!("{e:?}")))?;
+        self.tcp_listens.insert(dst, handle);
+        Ok(())
     }
 
     /// UDP 绑定（server side）。对应 Go `udp.NewForwarder` 的 bind 语义。
@@ -315,35 +325,37 @@ device,
             .map_err(|e| crate::error::TunError::UdpBindFailed(format!("{e:?}")))
     }
 
-    /// 检测 TCP socket 是否有新连接已 accept（状态从 Listen 转为 Established）。
+    /// 检查所有惰性 listen socket 是否有新连接已 accept（票 ipb5）。
     ///
-    /// 对应 Go `tcp.NewForwarder` 的 callback：上层创建一个 Listen socket，
-    /// poll 后用此方法检测是否有连接进入。检测后 socket 已处于 Established 状态，
-    /// 可直接用 `with_tcp_socket` 读写。
-    ///
-    /// # 参数
-    ///
-    /// - `handle`：处于 Listen 状态的 TCP socket handle
+    /// 对应 Go `tcp.NewForwarder` 的 callback：poll 后扫描缓存，状态进入
+    /// Established 的 socket 即完成 accept。返回的 socket 已从 listen 缓存摘除
+    /// （转为连接 socket，由上层 relay 持有），可继续用 `with_tcp_socket` 读写。
     ///
     /// # 返回
     ///
-    /// - `Some(TcpAcceptEvent)`：连接已 accept，包含 remote endpoint
-    /// - `None`：socket 仍处于 Listen 或其他非 Established 状态
+    /// - `Vec<TcpAcceptEvent>`：本轮全部新 accept 的连接（可为空）
     #[must_use]
-    pub fn check_tcp_accept(&mut self, handle: SocketHandle) -> Option<TcpAcceptEvent> {
-        let socket = self.sockets.get_mut::<tcp::Socket<'static>>(handle);
-        match socket.state() {
-            tcp::State::Established => {
-                let local = socket.local_endpoint();
-                let remote = socket.remote_endpoint()?;
-                Some(TcpAcceptEvent {
-                    handle,
-                    local,
-                    remote,
-                })
+    pub fn check_tcp_accepts(&mut self) -> Vec<TcpAcceptEvent> {
+        let mut events = Vec::new();
+        let handles: Vec<SocketHandle> = self.tcp_listens.values().copied().collect();
+        for handle in handles {
+            let socket = self.sockets.get_mut::<tcp::Socket<'static>>(handle);
+            if socket.state() != tcp::State::Established {
+                continue;
             }
-            _ => None,
+            let local = socket.local_endpoint();
+            let Some(remote) = socket.remote_endpoint() else {
+                continue;
+            };
+            // accept 完成：从 listen 缓存摘除（同 dst 的下一个 SYN 会重建 listen）
+            self.tcp_listens.retain(|_, h| *h != handle);
+            events.push(TcpAcceptEvent {
+                handle,
+                local,
+                remote,
+            });
         }
+        events
     }
 
     /// 从 UDP socket 读取一个数据报（如果存在）。
@@ -418,8 +430,8 @@ device,
 /// smoltcp 在 Listen socket 的 SYN-RCVD → ESTABLISHED 转换时完成 accept，
 /// `accept()` 返回 remote endpoint。
 ///
-/// 简化策略：上层创建多个 Listen socket（端口池），每次 poll 后检查哪个 socket
-/// 从 Listen 变成 Established——那个 socket 即是一个新接受的连接。
+/// 策略（bd ipb5）：listen socket 按 SYN dst 惰性注册（[`TunNetStack::ensure_tcp_listen`]），
+/// 每次 poll 后 [`TunNetStack::check_tcp_accepts`] 扫描缓存，发现 Established 即 accept。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpAcceptEvent {
     /// 已接受的 socket handle。
@@ -581,8 +593,8 @@ pub struct UdpPacketMeta {
 ///（`iface/interface/udp.rs:481`）——无法"接收任意端口的 UDP"。TUN 的语义是
 /// 截获所有进站 UDP，必须在 IP 层解析。
 ///
-/// TCP 也存在同样限制（`socket/tcp.rs:863`），但 TCP 切片后续处理（需 SO_ORIGINAL_DST
-/// 等价方案或 gVisor 风格的 stack 改造）。当前切片仅修 UDP。
+/// TCP 的同款限制（`listen(0)==Err(Unaddressable)`）由 [`parse_tcp_syn_dst`] +
+/// [`TunNetStack::ensure_tcp_listen`] 以同思路解决（票 ipb5）。
 ///
 /// # 返回
 ///
@@ -647,6 +659,60 @@ pub fn parse_udp_packet(pkt: &[u8]) -> Option<(UdpPacketMeta, &[u8])> {
         }
         _ => None,
     }
+}
+
+/// 从原始 IP 包解析 TCP SYN 的 dst endpoint（票 ipb5）。
+///
+/// 对应 UDP 路径的 [`parse_udp_packet`]：smoltcp 无通配端口监听，须先在 IP 层
+/// 识别 SYN、取 dst (addr, port)，交 [`TunNetStack::ensure_tcp_listen`] 惰性注册。
+/// 仅纯 SYN（SYN 置位、ACK 清零）触发注册——三次握手的 ACK/数据段交给既有
+/// socket 处理。
+///
+/// # 返回
+///
+/// - `Some(IpEndpoint)`：TCP SYN 包的 dst endpoint
+/// - `None`：非 TCP 包 / 非 SYN / 包太短 / 解析错
+#[must_use]
+pub fn parse_tcp_syn_dst(pkt: &[u8]) -> Option<IpEndpoint> {
+    if pkt.is_empty() {
+        return None;
+    }
+    let version = pkt[0] >> 4;
+    match version {
+        4 => {
+            let packet = Ipv4Packet::new_checked(pkt).ok()?;
+            let repr = Ipv4Repr::parse(&packet, &smoltcp::phy::ChecksumCapabilities::ignored()).ok()?;
+            if repr.next_header != IpProtocol::Tcp {
+                return None;
+            }
+            parse_syn_dst_from_tcp_header(&pkt[packet.header_len() as usize..], repr.dst_addr.into())
+        }
+        6 => {
+            let packet = Ipv6Packet::new_checked(pkt).ok()?;
+            let repr = Ipv6Repr::parse(&packet).ok()?;
+            if repr.next_header != IpProtocol::Tcp {
+                return None;
+            }
+            parse_syn_dst_from_tcp_header(&pkt[packet.header_len() as usize..], repr.dst_addr.into())
+        }
+        _ => None,
+    }
+}
+
+/// TCP 头（裸字节）→ SYN 判定 + dst endpoint。`dst_addr` 来自 IP 头。
+fn parse_syn_dst_from_tcp_header(tcp: &[u8], dst_addr: IpAddress) -> Option<IpEndpoint> {
+    // TCP 头固定 20 字节（data offset 高 4 位 = 5，TUN 场景无 TCP 选项时不短于 20；
+    // SYN 包带选项时 data offset > 5，头仍以 20 字节固定字段解析）
+    if tcp.len() < 20 {
+        return None;
+    }
+    // flags 字节（低 9 位标志中的低 8 位在此）：bit1=SYN bit4=ACK
+    let flags = tcp[13];
+    if flags & 0x02 == 0 || flags & 0x10 != 0 {
+        return None;
+    }
+    let dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
+    Some(IpEndpoint::new(dst_addr, dst_port))
 }
 
 
@@ -806,33 +872,35 @@ mod tests {
     }
 
     #[test]
-    fn tcp_listen_succeeds_on_closed_socket() {
+    fn ensure_tcp_listen_creates_then_reuses() {
         let mut stack = make_stack();
-        let handle = stack.add_tcp_socket();
-        // Closed 状态下 listen 应成功
-        let result = stack.tcp_listen(handle, 8080);
-        assert!(result.is_ok(), "tcp_listen failed: {:?}", result.err());
+        let dst = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(93, 184, 216, 34)), 443);
+        stack.ensure_tcp_listen(dst).expect("first ensure creates listen");
+        assert_eq!(stack.tcp_listens.len(), 1, "one cached listen");
+        let first = stack.tcp_listens[&dst];
+        stack.ensure_tcp_listen(dst).expect("second ensure reuses");
+        assert_eq!(stack.tcp_listens.len(), 1, "still one cached listen");
+        assert_eq!(stack.tcp_listens[&dst], first, "same handle reused");
     }
 
     #[test]
-    fn tcp_listen_fails_on_already_listening() {
+    fn ensure_tcp_listen_rejects_port_zero() {
+        // smoltcp listen(0) == Err(Unaddressable)，无通配端口监听（票 ipb5）
         let mut stack = make_stack();
-        let handle = stack.add_tcp_socket();
-        stack.tcp_listen(handle, 8080).expect("first listen");
-        // 再次 listen 应失败（状态非法）
-        let result = stack.tcp_listen(handle, 9090);
-        assert!(result.is_err(), "re-listen should fail");
+        let dst = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(1, 2, 3, 4)), 0);
+        let result = stack.ensure_tcp_listen(dst);
+        assert!(result.is_err(), "port 0 must be rejected");
+        assert!(stack.tcp_listens.is_empty(), "failed ensure must not cache");
     }
 
     #[test]
-    fn check_tcp_accept_returns_none_when_listening() {
-        // Listen 状态下 check_tcp_accept 应返回 None（无连接）
+    fn check_tcp_accepts_empty_when_listening() {
+        // Listen 状态（无连接）下 check_tcp_accepts 应返回空
         let mut stack = make_stack();
-        let handle = stack.add_tcp_socket();
-        stack.tcp_listen(handle, 8080).expect("listen");
+        let dst = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(1, 2, 3, 4)), 443);
+        stack.ensure_tcp_listen(dst).expect("listen");
         stack.poll(Instant::now());
-        let event = stack.check_tcp_accept(handle);
-        assert!(event.is_none());
+        assert!(stack.check_tcp_accepts().is_empty());
     }
 
     #[test]
@@ -973,4 +1041,94 @@ mod tests {
         assert_eq!(meta.dst.port, 33333);
         assert_eq!(payload, b"v6-payload");
     }
+
+    // ===== parse_tcp_syn_dst（bd ipb5） =====
+
+    /// 构造测试用 IPv4+TCP 包（无校验和——VirtualDevice caps 全 ignored）。
+    fn make_ipv4_tcp_packet(
+        src_ip: [u8; 4], src_port: u16, dst_ip: [u8; 4], dst_port: u16,
+        seq: u32, ack: u32, flags: u8,
+    ) -> Vec<u8> {
+        let total = 20 + 20;
+        let mut pkt = vec![0u8; total];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 6; // TCP
+        pkt[12..16].copy_from_slice(&src_ip);
+        pkt[16..20].copy_from_slice(&dst_ip);
+        let tcp = &mut pkt[20..];
+        tcp[0..2].copy_from_slice(&src_port.to_be_bytes());
+        tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
+        tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+        tcp[8..12].copy_from_slice(&ack.to_be_bytes());
+        tcp[12] = 5 << 4; // data offset = 5（20 字节头）
+        tcp[13] = flags;
+        tcp[14..16].copy_from_slice(&0xFFFFu16.to_be_bytes()); // window
+        pkt
+    }
+
+    /// 构造测试用 IPv6+TCP 包（无扩展头）。
+    fn make_ipv6_tcp_packet(
+        src: Ipv6Address, src_port: u16, dst: Ipv6Address, dst_port: u16, flags: u8,
+    ) -> Vec<u8> {
+        let mut pkt = vec![0u8; 40 + 20];
+        pkt[0] = 0x60; // version 6
+        pkt[4..6].copy_from_slice(&20u16.to_be_bytes()); // payload len
+        pkt[6] = 6; // next header = TCP
+        pkt[7] = 64; // hop limit
+        pkt[8..24].copy_from_slice(&src.octets());
+        pkt[24..40].copy_from_slice(&dst.octets());
+        let tcp = &mut pkt[40..];
+        tcp[0..2].copy_from_slice(&src_port.to_be_bytes());
+        tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
+        tcp[12] = 5 << 4;
+        tcp[13] = flags;
+        pkt
+    }
+
+    #[test]
+    fn parse_tcp_syn_dst_ipv4_extracts_dst() {
+        let pkt = make_ipv4_tcp_packet(
+            [10, 0, 0, 2], 40000, [93, 184, 216, 34], 443,
+            1000, 0, 0x02, // SYN
+        );
+        let dst = parse_tcp_syn_dst(&pkt).expect("parse SYN");
+        assert_eq!(dst.addr, IpAddress::Ipv4(Ipv4Address::new(93, 184, 216, 34)));
+        assert_eq!(dst.port, 443);
+    }
+
+    #[test]
+    fn parse_tcp_syn_dst_ipv6_extracts_dst() {
+        let s6 = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+        let d6 = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let pkt = make_ipv6_tcp_packet(s6, 40000, d6, 8080, 0x02);
+        let dst = parse_tcp_syn_dst(&pkt).expect("parse SYN v6");
+        assert_eq!(dst.addr, IpAddress::Ipv6(d6));
+        assert_eq!(dst.port, 8080);
+    }
+
+    #[test]
+    fn parse_tcp_syn_dst_returns_none_for_ack_and_synack() {
+        // 纯 ACK（0x10）与 SYN-ACK（0x12）都不触发注册
+        let ack = make_ipv4_tcp_packet([10, 0, 0, 2], 40000, [1, 2, 3, 4], 443, 1001, 2000, 0x10);
+        assert!(parse_tcp_syn_dst(&ack).is_none());
+        let synack = make_ipv4_tcp_packet([10, 0, 0, 2], 40000, [1, 2, 3, 4], 443, 1000, 2000, 0x12);
+        assert!(parse_tcp_syn_dst(&synack).is_none());
+    }
+
+    #[test]
+    fn parse_tcp_syn_dst_returns_none_for_udp() {
+        let pkt = make_ipv4_udp_packet([10, 0, 0, 2], 12345, [8, 8, 8, 8], 53, b"hello");
+        assert!(parse_tcp_syn_dst(&pkt).is_none());
+    }
+
+    #[test]
+    fn parse_tcp_syn_dst_returns_none_for_truncated() {
+        // TCP 头被截断到 < 20 字节
+        let mut pkt = make_ipv4_tcp_packet([10, 0, 0, 2], 40000, [1, 2, 3, 4], 443, 1000, 0, 0x02);
+        pkt.truncate(30); // IP 头 20 + TCP 头 10
+        assert!(parse_tcp_syn_dst(&pkt).is_none());
+    }
 }
+

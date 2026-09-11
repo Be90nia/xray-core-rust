@@ -247,27 +247,6 @@ async fn start_full_dispatched(
         }
     }
 
-    // DNS service 同步注入出站（bd bqm）：targetStrategy 域名解析经此生效
-    // （对应 Go 全局 internet.dnsClient 由 app/dns 初始化）。
-    register_outbounds(
-        built,
-        &ohm,
-        None,
-        instance.get_feature::<xray_app_dns::DnsService>(),
-    )?;
-
-    // 装配阶段依赖二次注入（bd f23r）：register_outbounds 后 ohm 就绪，
-    // 把 SimpleOhm 包成 OutboundTagSelector 桥到 DepBag，再次调所有
-    // feature 的 init_dependencies——本次能拿到 ohm 的 tag 列表。
-    // 此次 init_dependencies 与 instance.new_from_built 里的第一次是幂等
-    // 的（已 set_io 的 feature 跳过），允许双阶段注入。
-    let ohm_selector: Arc<dyn xray_features::OutboundTagSelector> =
-        Arc::new(OhmTagSelector(Arc::clone(&ohm)));
-    let bag2 = xray_features::DepBag::new().with_outbound_selector(ohm_selector);
-    for feat in instance.features() {
-        feat.init_dependencies(&bag2);
-    }
-
     // DefaultDispatcher 装配（对应 Go dispatcher.Init(ohm, router, pm, sm)）
     let mut dispatcher = DefaultDispatcher::new();
     dispatcher.init(
@@ -313,6 +292,33 @@ async fn start_full_dispatched(
     }
     let dispatcher = Arc::new(dispatcher);
 
+    // loopback 出站 sink 注入（票 rdcc，对应 Go loopback.go:46 DispatchLink 回注）：
+    // 生产装配持 init 完成的 DefaultDispatcher 构造 sink；loopback outbound 命中
+    // 路由后经 dispatch_link 回注 inboundTag 对应入站。此前恒传 None = 任何命中
+    // loopback 的连接在 handler 侧静默 drop（黑洞）。
+    let loopback_sink: Arc<dyn xray_proxy_loopback::LoopbackSink> = Arc::new(
+        crate::outbound::DispatcherLoopbackSink::new(Arc::clone(&dispatcher)),
+    );
+    // DNS service 同步注入出站（bd bqm）：targetStrategy 域名解析经此生效
+    // （对应 Go 全局 internet.dnsClient 由 app/dns 初始化）。
+    register_outbounds(
+        built,
+        &ohm,
+        Some(loopback_sink),
+        instance.get_feature::<xray_app_dns::DnsService>(),
+    )?;
+
+    // 装配阶段依赖二次注入（bd f23r）：register_outbounds 后 ohm 就绪，
+    // 把 SimpleOhm 包成 OutboundTagSelector 桥到 DepBag，再次调所有
+    // feature 的 init_dependencies——本次能拿到 ohm 的 tag 列表。
+    // 此次 init_dependencies 与 instance.new_from_built 里的第一次是幂等
+    // 的（已 set_io 的 feature 跳过），允许双阶段注入。
+    let ohm_selector: Arc<dyn xray_features::OutboundTagSelector> =
+        Arc::new(OhmTagSelector(Arc::clone(&ohm)));
+    let bag2 = xray_features::DepBag::new().with_outbound_selector(ohm_selector);
+    for feat in instance.features() {
+        feat.init_dependencies(&bag2);
+    }
     // Commander（api）真注入（bd ze3/bg7）：HandlerService 操作生产 SimpleOhm
     //（proto config → try_build_handler 复用静态注册构建路径），
     // LoggerService 接 DefaultLogService（LogInstance::restart）。
@@ -2248,16 +2254,14 @@ mod tests {
         rec
     }
 
-    /// sniffing e2e：TLS ClientHello SNI 被嗅探 → dest 覆写为域名 → domainSuffix
-    /// 路由规则命中 tagged socks outbound → 上游收到域名 CONNECT。
-    #[tokio::test]
-    async fn integration_sniffing_tls_sni_routes_by_sniffed_domain() {
-        use parking_lot::Mutex;
 
-        // 1. fake 上游 SOCKS5 server：记录 CONNECT 目标
+    /// fake 上游 SOCKS5 server：记录首个 CONNECT 目标地址（域名或 IP 字面），
+    /// 回 CONNECT 成功后丢弃后续流量。返回 (监听端口, 目标记录槽)。
+    async fn spawn_fake_socks_upstream() -> (u16, Arc<parking_lot::Mutex<Option<String>>>) {
         let up_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let up_port = up_listener.local_addr().unwrap().port();
-        let target: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let target: Arc<parking_lot::Mutex<Option<String>>> =
+            Arc::new(parking_lot::Mutex::new(None));
         let t = Arc::clone(&target);
         tokio::spawn(async move {
             let (mut sock, _) = match up_listener.accept().await {
@@ -2308,6 +2312,14 @@ mod tests {
                 }
             }
         });
+        (up_port, target)
+    }
+    /// sniffing e2e：TLS ClientHello SNI 被嗅探 → dest 覆写为域名 → domainSuffix
+    /// 路由规则命中 tagged socks outbound → 上游收到域名 CONNECT。
+    #[tokio::test]
+    async fn integration_sniffing_tls_sni_routes_by_sniffed_domain() {
+        // 1. fake 上游 SOCKS5 server：记录 CONNECT 目标
+        let (up_port, target) = spawn_fake_socks_upstream().await;
 
         // 2. 配置：socks inbound（sniffing: tls）+ freedom default + socks tagged + routing
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2387,6 +2399,180 @@ mod tests {
             Some("www.sniff-test.example"),
             "SNI 应被嗅探并覆写 dest，路由命中 via-sni（上游收到域名 CONNECT）"
         );
+        for h in handles.iter() {
+            h.abort();
+        }
+    }
+
+    /// geoip:private 屏蔽 e2e（rs3e）：routing `{"ip":["geoip:private"],
+    /// "outboundTag":"block"}` 命中私网目标 → blackhole 拦截。判别器用规则序
+    /// first-match-wins：10.0.0.1 若 geoip 规则失效（如静默丢规则）会落到下一条
+    /// 10.0.0.0/8 CIDR 规则被上游记录——断言上游从未收到 10.0.0.1、
+    /// 而 203.0.113.7（TEST-NET-3）按第三条 CIDR 规则正常到达上游。
+    #[tokio::test]
+    async fn integration_routing_geoip_private_blocks() {
+        // 1. fake 上游 SOCKS5 server
+        let (up_port, target) = spawn_fake_socks_upstream().await;
+
+        // 2. geoip.dat（PRIVATE 条目）写入路由构建实际读取的资产目录。
+        //    get_resource_path 与 build_adapter 同源（同一缓存值）；文件已存在时
+        //    不覆盖，尊重环境真实 geoip 资产（v2fly geoip.dat 自带 private）。
+        let asset_dir = xray_common::platform::get_resource_path();
+        std::fs::create_dir_all(&asset_dir).expect("create asset dir");
+        let geoip_path = asset_dir.join("geoip.dat");
+        if !geoip_path.exists() {
+            use prost::Message;
+            use xray_proto::xray::common::geodata::{Cidr, GeoIp, GeoIpList};
+            let private = GeoIp {
+                code: "PRIVATE".into(),
+                cidr: vec![
+                    Cidr { ip: vec![10, 0, 0, 0], prefix: 8 },
+                    Cidr { ip: vec![192, 168, 0, 0], prefix: 16 },
+                    Cidr { ip: vec![127, 0, 0, 0], prefix: 8 },
+                ],
+                reverse_match: false,
+            };
+            std::fs::write(
+                &geoip_path,
+                GeoIpList { entry: vec![private] }.encode_to_vec(),
+            )
+            .expect("write test geoip.dat");
+        }
+
+        // 3. 配置：socks inbound + freedom default + blackhole + tagged socks + routing
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let mut cfg = BuiltConfig::default();
+        cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry { kind: "socks".into(), data: vec![] },
+            tag: "socks-in".into(),
+            port: Some(socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
+            tag: "direct".into(), // i=0 → default
+            send_through: None, stream_settings_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
+        });
+        cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry {
+                kind: "blackhole".into(),
+                data: br#"{"response":{"type":"http"}}"#.to_vec(),
+            },
+            tag: "block".into(),
+            send_through: None, stream_settings_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
+        });
+        cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry {
+                kind: "socks".into(),
+                data: format!(
+                    r#"{{"servers":[{{"address":"127.0.0.1","port":{up_port}}}]}}"#
+                )
+                .into_bytes(),
+            },
+            tag: "via-up".into(),
+            send_through: None, stream_settings_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
+        });
+        cfg.apps.push(BuiltEntry {
+            kind: "routing".into(),
+            data: br#"{"domainStrategy":"AsIs","rules":[
+                {"type":"field","ip":["geoip:private"],"outboundTag":"block"},
+                {"type":"field","ip":["10.0.0.0/8"],"outboundTag":"via-up"},
+                {"type":"field","ip":["203.0.113.0/24"],"outboundTag":"via-up"}
+            ]}"#.to_vec(),
+        });
+
+        // wiring 层直连二分：同一 JSON 经 build_router_adapter 后 IP dest 应
+        // 命中 block（区分 wiring 解析/展开 vs dispatcher ctx 传递）。
+        let adapter = crate::wiring::build_router_adapter_from_json(&cfg.apps[0].data)
+            .expect("adapter build with geoip rule");
+        let probe_dest = xray_common::net::destination::Destination::new(
+            xray_common::net::address::Address::IPv4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+            xray_common::net::port::Port::new(80),
+            xray_common::net::network::Network::TCP,
+        );
+        assert_eq!(
+            adapter.pick_outbound_tag(&probe_dest).as_deref(),
+            Some("block"),
+            "wiring 层：10.0.0.1 应命中 geoip:private → block"
+        );
+
+
+        let (inst, _, handles) = start_full(&cfg).await.expect("geoip routing start");
+        assert!(inst.is_running());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 4. 对照组：公网 TEST-NET-3 目标 → 第三条 CIDR 规则 → via-up，路由栈通
+        let mut client = TcpStream::connect(format!("127.0.0.1:{socks_port}"))
+            .await
+            .expect("connect socks");
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [0x05, 0x00]);
+        let mut req = vec![0x05, 0x01, 0x00, 0x01];
+        req.extend_from_slice(&[203, 0, 113, 7]);
+        req.extend_from_slice(&443u16.to_be_bytes());
+        client.write_all(&req).await.unwrap();
+        let mut cr = [0u8; 10];
+        client.read_exact(&mut cr).await.unwrap();
+        assert_eq!(cr[1], 0x00, "公网目标应按 CIDR 规则到达上游");
+        for _ in 0..100 {
+            if target.lock().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            target.lock().as_deref(),
+            Some("203.0.113.7"),
+            "CIDR 规则应把 203.0.113.7 路由到上游"
+        );
+
+        // 5. 私网目标 → geoip:private → block（blackhole http403）。判别器：
+        //    geoip 规则若失效，10.0.0.1 会落 10.0.0.0/8 CIDR 规则到上游。
+        let mut blocked_client = TcpStream::connect(format!("127.0.0.1:{socks_port}"))
+            .await
+            .expect("connect socks (blocked)");
+        blocked_client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut resp2 = [0u8; 2];
+        blocked_client.read_exact(&mut resp2).await.unwrap();
+        assert_eq!(resp2, [0x05, 0x00]);
+        let mut req2 = vec![0x05, 0x01, 0x00, 0x01];
+        req2.extend_from_slice(&[10, 0, 0, 1]);
+        req2.extend_from_slice(&80u16.to_be_bytes());
+        blocked_client.write_all(&req2).await.unwrap();
+        let mut cr2 = [0u8; 10];
+        blocked_client.read_exact(&mut cr2).await.unwrap();
+        // socks 语义（server.rs:282）：dispatch 成功即回 0x00，不等 outbound 数据。
+        // 强信号判别：blackhole 配 response http → 命中 block 的客户端在 0x00 后
+        // 收到 "HTTP/1.1 403"；放行场景（via-up 丢流量 / freedom 直连）永远无 403。
+        let mut probe = [0u8; 256];
+        let mut got_403 = false;
+        if let Ok(r) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            blocked_client.read(&mut probe),
+        )
+        .await
+        {
+            let body = String::from_utf8_lossy(&probe[..r.unwrap_or(0)]);
+            got_403 = body.contains("403") || body.contains("Forbidden");
+        }
+        assert!(got_403, "geoip:private 目标应被 block 出站拦下并回 HTTP 403");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_ne!(
+            target.lock().as_deref(),
+            Some("10.0.0.1"),
+            "geoip 规则失效时 10.0.0.1 会落到 CIDR 规则被上游记录——不得放行"
+        );
+
         for h in handles.iter() {
             h.abort();
         }
@@ -3080,6 +3266,137 @@ mod tests {
         echo_task.abort();
     }
 
+    /// 出站级 mux TCP 经 vless 入站终止（bd raw0）：MuxBridge carrier（目标
+    /// v1.mux.cool）经 vless 出站 → vless 入站 decode 后按 destination dispatch
+    /// → MuxCarrierHandler（Go always.go:89 mux.NewServer 装饰器语义）交
+    /// ServerWorker 解帧 → 子会话 → freedom → TCP echo。多会话复用单 carrier。
+    #[tokio::test]
+    async fn integration_outbound_mux_tcp_via_vless_inbound() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // 1. TCP echo server
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = echo_listener.accept().await else { break };
+                let (mut r, mut w) = sock.into_split();
+                tokio::spawn(async move {
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+
+        // 2. carrier 计数 forwarder：client mux worker → server vless 的每条
+        //    TCP 连接在此过路计数（复用断言的观测点）
+        let fwd_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fwd_port = fwd_listener.local_addr().unwrap().port();
+        let carrier_count = Arc::new(AtomicUsize::new(0));
+        let server_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_port = server_probe.local_addr().unwrap().port();
+        drop(server_probe);
+        let count = Arc::clone(&carrier_count);
+        let fwd_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut down, _)) = fwd_listener.accept().await else { break };
+                count.fetch_add(1, Ordering::SeqCst);
+                let Ok(mut up) = TcpStream::connect(("127.0.0.1", server_port)).await else { break };
+                let _ = tokio::io::copy_bidirectional(&mut down, &mut up).await;
+            }
+        });
+
+        // 3. 服务端：vless inbound（carrier 按 v1.mux.cool dest 终止 mux）+ freedom
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry { kind: "vless".into(),
+                data: br#"{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}"#.to_vec() },
+            tag: "vless-in".into(), port: Some(server_port), listen: Some("127.0.0.1".into()),
+            stream_settings_json: None, sniffing_json: None,
+        });
+        server_cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
+            tag: "direct".into(),
+            send_through: None, stream_settings_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
+        });
+        let (_si, _so, sh) = start_full(&server_cfg).await.expect("vless server");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 4. 客户端：socks inbound + vless outbound（出站级 mux.enabled，concurrency 8）
+        let client_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_port = client_probe.local_addr().unwrap().port();
+        drop(client_probe);
+        let mut client_cfg = BuiltConfig::default();
+        client_cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry { kind: "socks".into(), data: br#"{"auth":"noauth"}"#.to_vec() },
+            tag: "socks-in".into(),
+            port: Some(client_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        client_cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry {
+                kind: "vless".into(),
+                data: format!(r#"{{"vnext":[{{"address":"127.0.0.1","port":{fwd_port},"users":[{{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"}}]}}]}}"#).into_bytes(),
+            },
+            tag: "proxy".into(),
+            send_through: None, stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: Some(serde_json::json!({"enabled": true, "concurrency": 8})),
+            target_strategy: None,
+        });
+        let (_ci, _co, ch) = start_full(&client_cfg).await.expect("socks+vless+mux client");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 5. 3 个并发客户端连接 → mux 出站（首个 dispatch bootstrap worker，
+        //    后续全部复用同一 worker/carrier）
+        let echo_ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
+        let mut handles = Vec::new();
+        for i in 0..3 {
+            let payload = format!("vless-mux-echo-{i}");
+            handles.push(tokio::spawn(async move {
+                let mut c = TcpStream::connect(("127.0.0.1", client_port))
+                    .await
+                    .expect("connect client socks");
+                c.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+                let mut m = [0u8; 2];
+                c.read_exact(&mut m).await.unwrap();
+                assert_eq!(m, [0x05, 0x00], "NoAuth method selected");
+                let mut req = vec![0x05, 0x01, 0x00, 0x01];
+                req.extend_from_slice(&echo_ip);
+                req.extend_from_slice(&echo_addr.port().to_be_bytes());
+                c.write_all(&req).await.unwrap();
+                let mut rep = [0u8; 10];
+                c.read_exact(&mut rep).await.unwrap();
+                assert_eq!(rep[1], 0x00, "socks connect via vless mux carrier success");
+                c.write_all(payload.as_bytes()).await.unwrap();
+                let mut buf = vec![0u8; payload.len()];
+                c.read_exact(&mut buf).await.unwrap();
+                assert_eq!(buf, payload.as_bytes(), "echo roundtrip via vless mux carrier");
+            }));
+        }
+        for h in handles {
+            h.await.expect("client task join");
+        }
+
+        // 6. 复用断言：3 个会话只建立 1 条 carrier TCP 连接
+        assert_eq!(
+            carrier_count.load(Ordering::SeqCst),
+            1,
+            "3 mux sessions must reuse a single vless carrier connection"
+        );
+
+        for h in sh.iter().chain(ch.iter()) {
+            h.abort();
+        }
+        fwd_task.abort();
+        echo_task.abort();
+    }
+
     /// 出站级 mux UDP 数据报端到端（XUDP GlobalID 路径）。
     ///
     /// socks UDP relay → dispatcher UDP relay（dispatch_with_access）→
@@ -3201,5 +3518,94 @@ mod tests {
             h.abort();
         }
         echo_task.abort();
+    }
+
+    /// 票 rdcc e2e：loopback outbound 生产 sink 注入。
+    ///
+    /// 拓扑：client → in-echo (dokodemo) →路由[inboundTag=in-echo]→ loopback-out
+    /// （inboundTag=in-main + sniffing routeOnly）→回注 in-main (dokodemo)
+    /// →default freedom → echo server。
+    /// 修复前 sink=None：连接在 LoopbackHandler 静默 drop，客户端读超时。
+    #[tokio::test]
+    async fn integration_loopback_outbound_reinjects_to_inbound() {
+        // 1. echo server（最终目标）
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = echo_listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        // 2. 两个 dokodemo 入站端口
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let main_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let dokodemo_dest = format!(r#"{{"address":"127.0.0.1","port":{}}}"#, echo_addr.port());
+        let mut cfg = BuiltConfig::default();
+        for (tag, port) in [("in-echo", first_port), ("in-main", main_port)] {
+            cfg.inbounds.push(BuiltInbound {
+                entry: BuiltEntry { kind: "dokodemo".into(), data: dokodemo_dest.clone().into_bytes() },
+                tag: tag.into(),
+                port: Some(port),
+                listen: Some("127.0.0.1".into()),
+                stream_settings_json: None,
+                sniffing_json: None,
+            });
+        }
+        // freedom 必须首个注册（register_outbounds 以首个成功者为 default，
+        // 对齐 Go proxyman/outbound:109-111）：loopback 若为 default，回注后
+        // 无规则命中会再次选中 loopback-out → 无限回环（stack overflow 实证）。
+        cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
+            tag: "default".into(),
+            send_through: None, stream_settings_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
+        });
+        // loopback outbound：回注 in-main；sniffing routeOnly（Go loopback.go:56-62 透传）。
+        cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry {
+                kind: "loopback".into(),
+                data: br#"{"inboundTag":"in-main","sniffing":{"enabled":true,"destOverride":["http","tls"],"routeOnly":true}}"#.to_vec(),
+            },
+            tag: "loopback-out".into(),
+            send_through: None, stream_settings_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
+        });
+        cfg.apps.push(BuiltEntry {
+            kind: "xray.app.router".into(),
+            data: br#"{"domainStrategy":"AsIs","rules":[{"type":"field","inboundTag":["in-echo"],"outboundTag":"loopback-out"}]}"#.to_vec(),
+        });
+
+        let (inst, _ohm, handles) = start_full(&cfg).await.expect("loopback config start");
+        assert!(inst.is_running());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 3. 连 in-echo：数据应经 loopback 回注 in-main 后到 echo 并回写。
+        let mut client = TcpStream::connect(format!("127.0.0.1:{first_port}")).await.unwrap();
+        let payload = b"loopback reinject!";
+        client.write_all(payload).await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got)).await {
+            Ok(Ok(_)) => assert_eq!(got, payload, "loopback must reinject to in-main inbound"),
+            Ok(Err(e)) => panic!("loopback reinject read error: {e}"),
+            Err(_) => panic!("timeout: loopback reinject dropped (production sink not wired?)"),
+        }
+        for h in handles.iter() {
+            h.abort();
+        }
     }
 }

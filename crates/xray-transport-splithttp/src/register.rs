@@ -223,6 +223,7 @@ async fn dial_splithttp(
                 rustls_config,
                 dial_target,
                 fingerprint,
+                settings.security_json.clone(),
             ));
             dialer::dial(client, config, scheme, &host, has_reality)
                 .await

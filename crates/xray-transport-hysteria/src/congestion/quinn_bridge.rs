@@ -19,6 +19,7 @@
 //!   样本积累（MIN_SAMPLE_COUNT=50）略慢，方向正确。
 
 use std::sync::Arc;
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use parking_lot::Mutex;
@@ -28,8 +29,8 @@ use super::bbr::{BbrSender, DefaultClock, Profile};
 use super::bbr::Clock as _;
 use super::brutal::BrutalSender;
 use super::types::{
-    AckedPacketInfo, ByteCount, CongestionControl, LostPacketInfo, MonoTime, RttStatsProvider,
-    INITIAL_PACKET_SIZE,
+    AckedPacketInfo, ByteCount, CongestionControl, LostPacketInfo, MonoTime, PacketNumber,
+    RttStatsProvider, INITIAL_PACKET_SIZE,
 };
 use super::utils::CongestionSetter;
 use crate::error::HysteriaError;
@@ -72,12 +73,115 @@ impl RttStatsProvider for SharedRtt {
     // ponytail: 若 BBR 需要更精细的 latest 样本，改 quinn fork 暴露字段。
 }
 
+/// 未确认包簿：按发送序记录 (pn, bytes)，把 quinn 的聚合 ack/loss 字节冲销成真实
+/// pn 列表（pv70：修复前合成 pn=0，BBR sampler 键位错位致 sent_packets 无界增长）。
+/// 放在 CCState（共享 slot）而非 adapter 本地——clone_box（path migration）后冲销不错位。
+struct SentBook {
+    queue: VecDeque<(PacketNumber, ByteCount)>,
+    total_bytes: ByteCount,
+}
+
+/// 簿字节上限：正常路径簿 ≈ in-flight（BDP 有界）；超限说明冲销失效，丢最老防 OOM。
+const MAX_BOOK_BYTES: ByteCount = 64 * 1024 * 1024;
+
+impl SentBook {
+    fn new() -> Self {
+        Self { queue: VecDeque::new(), total_bytes: 0 }
+    }
+
+    fn push(&mut self, pn: PacketNumber, bytes: ByteCount) {
+        if bytes == 0 {
+            return; // 0 字节条目会让 drain 的整包粒度判断打转
+        }
+        self.queue.push_back((pn, bytes));
+        self.total_bytes += bytes;
+        while self.total_bytes > MAX_BOOK_BYTES {
+            match self.queue.pop_front() {
+                Some((_, sz)) => self.total_bytes -= sz,
+                None => {
+                    self.total_bytes = 0;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// 从队首冲销 ≤`bytes` 的条目 → 真实 acked 列表（各条 bytes_acked 之和守恒于
+    /// 聚合值）。簿空（migration 交叉等异常）时退化为合成 pn=0 保字节记账。
+    fn drain_ack(&mut self, mut bytes: ByteCount, receive_time_ns: MonoTime) -> Vec<AckedPacketInfo> {
+        let mut acked = Vec::new();
+        while bytes > 0 {
+            match self.queue.pop_front() {
+                Some((pn, sz)) => {
+                    self.total_bytes -= sz;
+                    let take = sz.min(bytes);
+                    acked.push(AckedPacketInfo {
+                        packet_number: pn,
+                        bytes_acked: take,
+                        receive_time_ns,
+                    });
+                    if take < sz {
+                        // 整包粒度外的残量留队首（罕见：双 path 事件交叉）。
+                        self.queue.push_front((pn, sz - take));
+                        self.total_bytes += sz - take;
+                        bytes = 0;
+                    } else {
+                        bytes -= sz;
+                    }
+                }
+                None => {
+                    acked.push(AckedPacketInfo {
+                        packet_number: 0,
+                        bytes_acked: bytes,
+                        receive_time_ns,
+                    });
+                    bytes = 0;
+                }
+            }
+        }
+        acked
+    }
+
+    /// 从队尾冲销 ≤`bytes` 的条目 → 真实 lost 列表。与 [`SentBook::drain_ack`]
+    /// 分吃两端、不重叠；sampler 端 sent_packets 依总字节守恒全清（聚合近似语义）。
+    fn drain_lost(&mut self, mut bytes: ByteCount) -> Vec<LostPacketInfo> {
+        let mut lost = Vec::new();
+        while bytes > 0 {
+            match self.queue.pop_back() {
+                Some((pn, sz)) => {
+                    self.total_bytes -= sz;
+                    let take = sz.min(bytes);
+                    lost.push(LostPacketInfo { packet_number: pn, bytes_lost: take });
+                    if take < sz {
+                        self.queue.push_back((pn, sz - take));
+                        self.total_bytes += sz - take;
+                        bytes = 0;
+                    } else {
+                        bytes -= sz;
+                    }
+                }
+                None => {
+                    lost.push(LostPacketInfo { packet_number: 0, bytes_lost: bytes });
+                    bytes = 0;
+                }
+            }
+        }
+        lost
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+}
+
 /// 每连接 CC 状态：auth 前 fallback（quinn CUBIC），auth 后 active（hysteria 算法）。
 struct CCState {
     active: Option<Box<dyn CongestionControl>>,
     fallback: Box<dyn Controller>,
     /// 近似 in-flight 字节（on_sent 累加 / ack·loss 扣减），供 hysteria 事件用。
     in_flight: ByteCount,
+    /// 未确认包簿（pv70）：真实 pn 冲销聚合 ack/loss 字节。
+    book: SentBook,
 }
 
 /// CC 槽位：跨 [`QuinnCCAdapter`] clone 共享（quinn clone_box 走 path migration 时保持
@@ -127,6 +231,7 @@ impl CCState {
             // 固定值，真实连接必然先经 factory build，不会出现在数据路径上。
             fallback: Box::new(PlaceholderController),
             in_flight: 0,
+            book: SentBook::new(),
         }
     }
 }
@@ -182,6 +287,7 @@ impl Controller for QuinnCCAdapter {
     fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
         let mut st = self.slot.state.lock();
         st.in_flight += bytes as ByteCount;
+        st.book.push(last_packet_number as i64, bytes as ByteCount);
         let in_flight = st.in_flight;
         match &mut st.active {
             Some(cc) => {
@@ -210,16 +316,11 @@ impl Controller for QuinnCCAdapter {
         let mut st = self.slot.state.lock();
         let prior = st.in_flight;
         st.in_flight = (st.in_flight - bytes as ByteCount).max(0);
+        let t = mono_of(now);
+        // 聚合 ack 字节 → 真实 pn 列表（pv70）；fallback 期也冲销，保持簿对齐。
+        let acked = st.book.drain_ack(bytes as ByteCount, t);
         match &mut st.active {
-            Some(cc) => {
-                let t = mono_of(now);
-                let acked = [AckedPacketInfo {
-                    packet_number: 0,
-                    bytes_acked: bytes as i64,
-                    receive_time_ns: t,
-                }];
-                cc.on_congestion_event_ex(prior, t, &acked, &[]);
-            }
+            Some(cc) => cc.on_congestion_event_ex(prior, t, &acked, &[]),
             None => st.fallback.on_ack(now, sent, bytes, app_limited, rtt),
         }
     }
@@ -234,12 +335,11 @@ impl Controller for QuinnCCAdapter {
         let mut st = self.slot.state.lock();
         st.in_flight = (st.in_flight - lost_bytes as ByteCount).max(0);
         let in_flight = st.in_flight;
+        let t = mono_of(now);
+        // 聚合 lost 字节 → 真实 pn 列表（pv70）。
+        let lost = st.book.drain_lost(lost_bytes as ByteCount);
         match &mut st.active {
-            Some(cc) => {
-                let t = mono_of(now);
-                let lost = [LostPacketInfo { packet_number: 0, bytes_lost: lost_bytes as i64 }];
-                cc.on_congestion_event_ex(in_flight, t, &[], &lost);
-            }
+            Some(cc) => cc.on_congestion_event_ex(in_flight, t, &[], &lost),
             None => st.fallback.on_congestion_event(now, sent, is_persistent_congestion, lost_bytes),
         }
     }
@@ -447,6 +547,12 @@ mod tests {
         let now = Instant::now();
         adapter.on_sent(now, 1200, 1);
         adapter.on_congestion_event(now, now, false, 600);
+        // 簿随事件冲销：1200 入簿，600 partial-loss 后残量留队尾。
+        {
+            let st = slot.state.lock();
+            assert_eq!(st.book.queue.len(), 1);
+            assert_eq!(st.book.total_bytes, 600);
+        }
         adapter.on_mtu_update(1400);
         assert_eq!(adapter.window(), 10_240);
 
@@ -459,6 +565,88 @@ mod tests {
             std::time::Duration::from_millis(50),
         );
         assert_eq!(cloned.window(), 200_000);
+    }
+
+    #[test]
+    fn bbr_loss_events_drain_sent_book() {
+        use quinn_proto::congestion::Controller as _;
+
+        // pv70 回归：修复前合成 pn=0 永不命中 sampler 键，sent_packets 恒增长；
+        // 修复后聚合 lost 字节按真实 pn 冲销，全丢后簿必须清空。
+        let slot = Arc::new(HysteriaCCSlot::new());
+        apply_bbr(&slot, Profile::Standard);
+        let mut adapter = QuinnCCAdapter { slot: Arc::clone(&slot) };
+        let now = Instant::now();
+
+        adapter.on_sent(now, 1200, 1);
+        adapter.on_sent(now, 1200, 2);
+        adapter.on_sent(now, 1200, 3);
+        assert_eq!(slot.state.lock().book.queue.len(), 3);
+
+        // 丢 1 包（1200B）→ 簿剩 2 条；其余 2 包（2400B）也丢 → 簿空。
+        adapter.on_congestion_event(now, now, false, 1200);
+        assert_eq!(slot.state.lock().book.queue.len(), 2);
+        adapter.on_congestion_event(now, now, false, 2400);
+
+        let st = slot.state.lock();
+        assert!(st.book.is_empty(), "sent book must drain to empty (was unbounded)");
+        assert_eq!(st.in_flight, 0);
+    }
+
+    #[test]
+    fn sent_book_shared_across_clone_box() {
+        use quinn_proto::congestion::Controller as _;
+
+        // 簿在 CCState（共享 slot）：migration clone 后另一 adapter 事件照常冲销。
+        let slot = Arc::new(HysteriaCCSlot::new());
+        apply_bbr(&slot, Profile::Standard);
+        let mut a = QuinnCCAdapter { slot: Arc::clone(&slot) };
+        let mut b = QuinnCCAdapter { slot: Arc::clone(&slot) };
+        let now = Instant::now();
+
+        a.on_sent(now, 1200, 7);
+        b.on_congestion_event(now, now, false, 1200);
+        assert!(slot.state.lock().book.is_empty(), "clone must see the same book");
+    }
+
+    #[test]
+    fn sent_book_synthesizes_pn0_when_empty_and_caps_bytes() {
+        let mut book = SentBook::new();
+        // 簿空：退化为合成 pn=0 单条，字节守恒（旧行为兜底）。
+        let acked = book.drain_ack(2400, 42);
+        assert_eq!(acked.len(), 1);
+        assert_eq!(acked[0].packet_number, 0);
+        assert_eq!(acked[0].bytes_acked, 2400);
+
+        // 超上限丢最老：total_bytes 封顶，防 OOM。
+        for pn in 0..100_000u64 {
+            book.push(pn as i64, 1200);
+        }
+        assert!(book.total_bytes <= MAX_BOOK_BYTES);
+        assert!(book.queue.len() < 100_000);
+    }
+
+    #[test]
+    fn sent_book_ack_bytes_conserved_in_pn_list() {
+        let mut book = SentBook::new();
+        book.push(1, 1200);
+        book.push(2, 800);
+        // 聚合 2000B → 两条真实 pn，各带自身字节，总和守恒。
+        let acked = book.drain_ack(2000, 7);
+        assert_eq!(acked.len(), 2);
+        assert_eq!(acked[0].packet_number, 1);
+        assert_eq!(acked[0].bytes_acked, 1200);
+        assert_eq!(acked[1].packet_number, 2);
+        assert_eq!(acked[1].bytes_acked, 800);
+        assert!(book.is_empty());
+
+        // loss 同理：从队尾冲销，与 ack 分吃两端不重叠。
+        book.push(3, 1200);
+        book.push(4, 1200);
+        let lost = book.drain_lost(1200);
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].packet_number, 4);
+        assert_eq!(book.total_bytes, 1200);
     }
 
     #[test]

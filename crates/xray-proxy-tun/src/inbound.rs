@@ -8,10 +8,14 @@
 //! 2. 从 TUN 设备 recv IP 包 → smoltcp netstack
 //! 3. smoltcp 把入站 TCP/UDP 流通过 dispatcher 注入本地
 //!
-//! ## TCP 连接流
+//! ## TCP 连接流（bd ipb5：SYN 惰性注册）
 //!
-//! 创建 Listen socket → poll 后检查 Established → 通知上层 dispatcher。
-//! 对应 Go `tcp.NewForwarder(r.CreateEndpoint() → handler.HandleConnection)`。
+//! smoltcp 无通配端口监听（`listen(0)==Err(Unaddressable)`，对应 Go
+//! `tcp.NewForwarder(gstack, 0, 65535)` 的 port0=通配）。改为仿 UDP 路径在 IP 层
+//! 识别：收到 TCP SYN 时用 [`parse_tcp_syn_dst`] 解出 dst (addr, port)，
+//! `TunNetStack::ensure_tcp_listen` 按 dst 惰性建 listen socket 并缓存（同 dst
+//! 复用，accept 后摘除）→ smoltcp 完成 SYN-ACK/握手 → poll 后检查 Established
+//! → 通知上层 dispatcher。
 //!
 //! ## UDP 数据报流
 //!
@@ -70,7 +74,8 @@ use crate::config::{StackOptions, Tun};
 use crate::device::TunDevice;
 use crate::error::Result;
 use crate::netstack::{
-    build_udp_response, parse_udp_packet, TunNetStack, UdpPacketMeta,
+    build_udp_response, parse_tcp_syn_dst, parse_udp_packet, TcpAcceptEvent, TunNetStack,
+    UdpPacketMeta,
 };
 
 /// TUN 设备接收缓冲。
@@ -259,27 +264,9 @@ async fn tun_driver_loop(
     let mut timer = interval(POLL_INTERVAL);
     let mut recv_buf = vec![0u8; TUN_RECV_BUF_SIZE];
 
-    // 初始化：仅创建 TCP Listen socket（TCP 后续切片处理 destination 提取）。
-    // UDP 走 IP+UDP 头解析路径，不创建 smoltcp UDP socket。
-    // 对应 Go stackGVisor.Start() 中 tcp.NewForwarder。
-    // ponytail: 单端口监听（TUN 入站通常由 iptables/nftables 重定向到 TUN，
-    // 实际 dest 地址在 IP 包头中，不依赖 listen 端口）
-    // TODO: 多端口监听由上层配置注入
-    let mut tcp_listen_handle = {
-        let mut stack = netstack.lock().await;
-        let handle = stack.add_tcp_socket();
-        if let Err(e) = stack.tcp_listen(handle, 0) {
-            // listen 0 表示由 smoltcp 自动选端口；失败则记录但不中断
-            tracing::warn!(error = %e, "tcp listen failed, inbound TCP disabled");
-        } else {
-            tracing::debug!(?handle, "tcp listen socket created");
-        }
-        Some(handle)
-    };
-
+    // UDP 走 IP+UDP 头解析路径；TCP 走 SYN 惰性注册路径（票 ipb5，见主循环），
+    // 均不预先创建 smoltcp socket。
     let udp_sessions: UdpSessions = Arc::new(ParkMutex::new(HashMap::new()));
-    // p14e：后台定时扫描空闲 session（60s 阈值 / 30s 间隔，对齐 Go
-    // `signal.CancelAfterInactivity(1min)` 语义）。
     let _udp_sweeper = spawn_udp_session_sweeper(Arc::clone(&udp_sessions));
 
     tracing::debug!("tun driver main loop started");
@@ -308,17 +295,21 @@ async fn tun_driver_loop(
                         }
 
                         let mut stack = netstack.lock().await;
+                        // TCP SYN → 惰性注册 listen socket（票 ipb5）。必须发生在
+                        // ingest 之前，本次 poll 才能为该 SYN 生成 SYN-ACK。
+                        // 注册失败（port=0 等，几乎不可能）→ 丢弃该 SYN，连接建不起来，
+                        // 不静默吞掉：error 日志可见。
+                        if let Some(dst) = parse_tcp_syn_dst(pkt) {
+                            if let Err(e) = stack.ensure_tcp_listen(dst) {
+                                tracing::error!(error = %e, dst = ?dst, "tcp lazy listen failed, dropping SYN");
+                            }
+                        }
                         stack.ingest_rx(pkt.to_vec());
                         stack.poll(smoltcp::time::Instant::now());
                         // 处理 ICMP echo request 并自动回复
                         stack.process_icmp_echo();
                         // 检测 TCP accept 事件
-                        handle_socket_events(
-                            &mut stack,
-                            &netstack,
-                            &mut tcp_listen_handle,
-                            &dispatch,
-                        );
+                        handle_socket_events(&mut stack, &netstack, &dispatch);
                         // drain tx 并写回 TUN
                         let tx_pkts = stack.drain_tx();
                         drop(stack); // 释放锁再 await
@@ -341,12 +332,7 @@ async fn tun_driver_loop(
                     // 处理 ICMP echo request 并自动回复
                     stack.process_icmp_echo();
                     // 检测 TCP accept 事件
-                    handle_socket_events(
-                        &mut stack,
-                        &netstack,
-                        &mut tcp_listen_handle,
-                        &dispatch,
-                    );
+                    handle_socket_events(&mut stack, &netstack, &dispatch);
                     stack.drain_tx()
                 };
                 for pkt in tx_pkts {
@@ -558,21 +544,22 @@ fn spawn_udp_session_reader_if_first(
 fn handle_socket_events(
     stack: &mut TunNetStack,
     netstack: &Arc<AsyncMutex<TunNetStack>>,
-    tcp_listen_handle: &mut Option<SocketHandle>,
     dispatch: &Arc<dyn DispatchHandler>,
 ) {
-    // TCP accept 检测
-    let Some(handle) = *tcp_listen_handle else { return };
-    let Some(event) = stack.check_tcp_accept(handle) else { return };
-
-    // accept 后该 socket 进入 Established，作为连接 socket；
-    // 新建一个 listen socket 接受下一个连接。
-    let new_listen = stack.add_tcp_socket();
-    if let Err(e) = stack.tcp_listen(new_listen, 0) {
-        tracing::warn!(error = %e, "tcp re-listen failed");
+    // TCP accept 检测（票 ipb5）：扫描全部惰性 listen socket，已 Established
+    // 的即完成 accept（check_tcp_accepts 内部已从 listen 缓存摘除）。
+    for event in stack.check_tcp_accepts() {
+        accept_tcp_connection(stack, netstack, event, dispatch);
     }
-    *tcp_listen_handle = Some(new_listen);
+}
 
+/// 单个已 accept 的 TCP 连接 → 建桥 dispatch（票 ipb5，原 handle_socket_events 主体）。
+fn accept_tcp_connection(
+    stack: &mut TunNetStack,
+    netstack: &Arc<AsyncMutex<TunNetStack>>,
+    event: TcpAcceptEvent,
+    dispatch: &Arc<dyn DispatchHandler>,
+) {
     // 从 local endpoint 构建 destination
     let dest = match ip_endpoint_to_destination(&event.local) {
         Some(d) => d,
@@ -989,44 +976,129 @@ mod tests {
         pkt
     }
 
-    /// 端到端 dispatch 路径：构造 netstack + listen socket，模拟 TCP accept
-    /// （手动让 socket 进入 Established），验证 handle_socket_events 触发 dispatch。
+    /// 构造测试用 IPv4+TCP 包（无校验和——VirtualDevice caps 全 ignored）。
+    fn make_test_ipv4_tcp_packet(
+        src_ip: [u8; 4], src_port: u16, dst_ip: [u8; 4], dst_port: u16,
+        seq: u32, ack: u32, flags: u8,
+    ) -> Vec<u8> {
+        let total = 20 + 20;
+        let mut pkt = vec![0u8; total];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 6; // TCP
+        pkt[12..16].copy_from_slice(&src_ip);
+        pkt[16..20].copy_from_slice(&dst_ip);
+        let tcp = &mut pkt[20..];
+        tcp[0..2].copy_from_slice(&src_port.to_be_bytes());
+        tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
+        tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+        tcp[8..12].copy_from_slice(&ack.to_be_bytes());
+        tcp[12] = 5 << 4;
+        tcp[13] = flags;
+        tcp[14..16].copy_from_slice(&0xFFFFu16.to_be_bytes());
+        pkt
+    }
+
+    /// 端到端 TCP dispatch 路径（bd ipb5 acceptance）：
+    /// 真驱动 smoltcp 三次握手——SYN（dst=公网 IP:443）→ 惰性 listen 注册 →
+    /// SYN-ACK（从 TX 读 ISN）→ ACK → Established → handle_socket_events →
+    /// dispatch 收到的 destination 与 SYN 的 dst 一致。
     #[tokio::test]
-    async fn handle_socket_events_triggers_dispatch() {
-        use crate::netstack::TunNetStack;
+    async fn tcp_syn_handshake_triggers_dispatch_with_real_destination() {
+        use std::sync::Mutex;
         use smoltcp::wire::{IpCidr, IpAddress, Ipv4Address};
+
+        #[derive(Debug)]
+        struct CaptureHandler(Arc<Mutex<Option<Destination>>>);
+        impl DispatchHandler for CaptureHandler {
+            fn tag(&self) -> &str { "capture" }
+            fn dispatch(
+                &self,
+                dest: &Destination,
+                _link: Link,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+                *self.0.lock().expect("lock") = Some(dest.clone());
+                Box::pin(async {})
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(None::<Destination>));
+        let handler: Arc<dyn DispatchHandler> = Arc::new(CaptureHandler(Arc::clone(&captured)));
 
         let local = IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)), 24);
         let netstack: Arc<AsyncMutex<TunNetStack>> =
             Arc::new(AsyncMutex::new(TunNetStack::new(&[local], 1500)));
 
-        // 创建 listen socket
-        let listen_handle = {
-            let mut stack = netstack.lock().await;
-            let h = stack.add_tcp_socket();
-            // listen 0 不绑端口（测试环境不依赖真实端口）；忽略错误
-            let _ = stack.tcp_listen(h, 0);
-            h
-        };
+        // TUN 真实形态：SYN 的 dst 是公网 IP（非本机接口地址），依赖 AnyIP 放行
+        let syn = make_test_ipv4_tcp_packet(
+            [10, 0, 0, 2], 40000, [93, 184, 216, 34], 443,
+            1000, 0, 0x02, // SYN
+        );
 
-        let (dispatch_concrete, calls) = make_dispatch();
-        let dispatch: Arc<dyn DispatchHandler> = dispatch_concrete;
-        let mut tcp_listen = Some(listen_handle);
-
-        // 直接驱动 smoltcp：没有真实 TUN 流量，socket 不会进入 Established，
-        // 所以 check_tcp_accept 返回 None——验证 handle_socket_events 不 panic、
-        // 不误触发 dispatch。
         {
             let mut stack = netstack.lock().await;
-            handle_socket_events(
-                &mut stack,
-                &netstack,
-                &mut tcp_listen,
-                &dispatch,
+            // ① SYN → 惰性注册（与 driver loop 顺序一致：ensure 先于 ingest）
+            let dst = parse_tcp_syn_dst(&syn).expect("parse SYN dst");
+            stack.ensure_tcp_listen(dst).expect("lazy listen");
+            stack.ingest_rx(syn);
+            stack.poll(smoltcp::time::Instant::now());
+
+            // ② 从 TX 读 SYN-ACK 的 seq（smoltcp ISN，测试无法预知）
+            let tx = stack.drain_tx();
+            let synack_seq = tx
+                .iter()
+                .find(|p| p.len() >= 34 && p[9] == 6 && (p[20 + 13] & 0x12) == 0x12)
+                .map(|p| u32::from_be_bytes([p[20 + 4], p[20 + 5], p[20 + 6], p[20 + 7]]))
+                .expect("SYN-ACK must be emitted for lazy-listened SYN");
+
+            // ③ ACK 完成握手 → socket Established
+            let ack = make_test_ipv4_tcp_packet(
+                [10, 0, 0, 2], 40000, [93, 184, 216, 34], 443,
+                1001, synack_seq.wrapping_add(1), 0x10, // ACK
             );
+            stack.ingest_rx(ack);
+            stack.poll(smoltcp::time::Instant::now());
+            let _ = stack.drain_tx();
+
+            // ④ accept → dispatch
+            handle_socket_events(&mut stack, &netstack, &handler);
+        }
+
+        // dispatch 在 spawn 的 task 里执行，current-thread runtime 需让出让其跑完
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // dispatch 同步捕获（CaptureHandler.dispatch 立即写 captured）
+        let dest = captured
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("dispatch must be triggered by handshake");
+        assert_eq!(
+            dest.address(),
+            &Address::IPv4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
+            "dest must come from SYN dst, not interface address"
+        );
+        assert_eq!(dest.port().value(), 443);
+        assert_eq!(dest.network(), Network::TCP);
+    }
+
+    /// 无 listen 注册（无 SYN）时 handle_socket_events 不误触发 dispatch。
+    #[tokio::test]
+    async fn handle_socket_events_no_listen_no_dispatch() {
+        let local = smoltcp::wire::IpCidr::new(
+            smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(10, 0, 0, 1)),
+            24,
+        );
+        let netstack: Arc<AsyncMutex<TunNetStack>> =
+            Arc::new(AsyncMutex::new(TunNetStack::new(&[local], 1500)));
+        let (dispatch, calls) = make_dispatch();
+
+        {
+            let mut stack = netstack.lock().await;
+            handle_socket_events(&mut stack, &netstack, &(dispatch as Arc<dyn DispatchHandler>));
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0, "no spurious dispatch");
-        assert_eq!(tcp_listen, Some(listen_handle));
     }
 
     /// p14e：超过 UDP_SESSION_IDLE_SECS 的 session 被 sweep 淘汰；

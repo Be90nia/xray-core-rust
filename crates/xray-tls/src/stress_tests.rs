@@ -170,6 +170,7 @@ async fn duplex_btls_512k_bulk_stress() {
             "localhost",
             Fingerprint::HelloChrome133,
             None,
+            None, // 内存 duplex + 自签 server：跳过验证（压测握手吞吐，非验证行为）
         ),
     );
     let payload: Vec<u8> = (0u8..=255).cycle().take(512 * 1024).collect();
