@@ -374,10 +374,29 @@ impl InboundDispatchHandler {
     }
 
     /// 懒注册并取该 inbound 的方向 counter。
+    ///
+    /// sm80①：受 `ForSystem().Stats.Inbound{Uplink,Downlink}` 门控（Go
+    /// proxyman/inbound/always.go:26,34——tag 计数与 per-user 计数的门不同，
+    /// 后者才用 `ForLevel().Stats.User*`）。门关时不懒注册，默认全 false 不计数。
     fn inbound_counter(
         &self,
         direction: &str,
     ) -> Option<Arc<dyn xray_features::stats::Counter>> {
+        let sys = self
+            .dispatcher
+            .policy_manager
+            .as_ref()
+            .map_or_else(xray_features::policy::SystemStats::default, |pm| {
+                pm.for_system()
+            });
+        let enabled = match direction {
+            "uplink" => sys.inbound_uplink,
+            "downlink" => sys.inbound_downlink,
+            _ => false,
+        };
+        if !enabled {
+            return None;
+        }
         self.dispatcher.stats.as_ref().and_then(|m| {
             xray_features::stats::get_or_register_counter(
                 m.as_ref(),
@@ -1657,5 +1676,42 @@ mod tests {
             &nodat,
         )
         .expect("plain rules must not require geodata assets");
+    }
+
+    /// sm80①：wiring 层 inbound tag counter 受 ForSystem().Stats.Inbound*
+    /// 门控（Go proxyman/inbound/always.go:26,34）——默认（无 policy manager）
+    /// 不注册；mock 开启 inbound 两门后按方向注册。
+    #[test]
+    fn inbound_counter_gated_by_for_system() {
+        struct InboundOnPm;
+        impl xray_features::policy::PolicyManager for InboundOnPm {
+            fn policy_for_level(&self, _level: u32) -> xray_features::policy::Policy {
+                xray_features::policy::Policy::default()
+            }
+            fn for_system(&self) -> xray_features::policy::SystemStats {
+                xray_features::policy::SystemStats {
+                    inbound_uplink: true,
+                    inbound_downlink: true,
+                    ..Default::default()
+                }
+            }
+        }
+
+        let stats = Arc::new(xray_app_stats::Manager::new_running());
+        let mut d = DefaultDispatcher::new();
+        d.stats = Some(stats);
+        // 默认（无 pm）：两方向都不注册
+        let h = InboundDispatchHandler::new(Arc::new(d), SniffingRequest::default(), "gated-in");
+        assert!(h.inbound_counter("uplink").is_none(), "default: inbound counter must be gated off");
+        assert!(h.inbound_counter("downlink").is_none(), "default: inbound counter must be gated off");
+
+        // 开启 inbound 两门：按方向注册
+        let stats = Arc::new(xray_app_stats::Manager::new_running());
+        let mut d = DefaultDispatcher::new();
+        d.stats = Some(stats);
+        d.set_policy_manager(Arc::new(InboundOnPm));
+        let h = InboundDispatchHandler::new(Arc::new(d), SniffingRequest::default(), "gated-in");
+        assert!(h.inbound_counter("uplink").is_some(), "inbound_uplink on: counter must register");
+        assert!(h.inbound_counter("downlink").is_some(), "inbound_downlink on: counter must register");
     }
 }

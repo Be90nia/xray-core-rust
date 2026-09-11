@@ -33,11 +33,12 @@ pub const DEFAULT_UPLINK_ONLY_TIMEOUT: Duration = Duration::from_secs(1);
 /// 剩余存活窗口。
 pub const DEFAULT_DOWNLINK_ONLY_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Default per-connection pipe buffer limit (512 KiB).
+/// Fallback per-connection pipe buffer limit (512 KiB).
 ///
-/// 对应 Go `defaultBufferSize`（512*1024，`XRAY_BUFSIZE` env 可调——此处不读 env，
-/// 需要时在装配层读后覆盖 policy）。
-/// 与 `BufferPolicy.connection` 同类型 `i32`。
+/// 对应 Go `defaultBufferSize` 的 GOARCH「其他」分支（x86_64 等）。
+/// `XRAY_BUFSIZE` env 桥接已实现：[`BufferPolicy::default`] 经
+/// [`default_buffer_connection_from_env`] 消费 env（Go policy.go:86-116
+/// `defaultBufferSize atomic` + `reloadEnvSettings` 的 init 等价物）。
 pub const DEFAULT_BUFFER_CONNECTION: i32 = 512 * 1024;
 
 /// Default buffer write size.
@@ -141,11 +142,28 @@ pub struct BufferPolicy {
 impl Default for BufferPolicy {
     fn default() -> Self {
         Self {
-            connection: DEFAULT_BUFFER_CONNECTION,
+            connection: *DEFAULT_BUFFER_CONNECTION_FROM_ENV,
             write: DEFAULT_BUFFER_WRITE,
         }
     }
 }
+
+/// env 原始串 → MiB 整数；缺失/非数字 → None（Go `GetValueAsInt`：
+/// 解析失败回退「未设置」语义，走 GOARCH 分支）。
+#[must_use]
+fn parse_xray_bufsize(raw: Option<&str>) -> Option<i64> {
+    raw.and_then(|v| v.trim().parse::<i64>().ok())
+}
+
+/// `XRAY_BUFSIZE` → SessionDefault per-connection buffer，进程级一次读取缓存
+///（对齐 Go `defaultBufferSize atomic.Int32` init 时填充；Rust 无 SIGHUP
+/// reload 机制，进程生命周期内取一次值）。
+static DEFAULT_BUFFER_CONNECTION_FROM_ENV: std::sync::LazyLock<i32> =
+    std::sync::LazyLock::new(|| {
+        default_buffer_connection_from_env(parse_xray_bufsize(
+            std::env::var("XRAY_BUFSIZE").ok().as_deref(),
+        ))
+    });
 
 /// System-level policy.
 ///
@@ -408,6 +426,32 @@ mod tests {
             assert_eq!(sys.buffer.connection, default_buffer_connection_from_env(None));
             assert_eq!(sys.buffer.connection, 512 * 1024);
         }
+    }
+
+    /// XRAY_BUFSIZE 原始串解析：有效整数/空白容忍/非数字与缺失回退 None
+    ///（Go GetValueAsInt 解析失败 = 未设置语义）。
+    #[test]
+    fn test_parse_xray_bufsize_env_raw() {
+        assert_eq!(parse_xray_bufsize(Some("4")), Some(4));
+        assert_eq!(parse_xray_bufsize(Some(" 2 ")), Some(2));
+        assert_eq!(parse_xray_bufsize(Some("-3")), Some(-3));
+        assert_eq!(parse_xray_bufsize(Some("abc")), None, "非数字必须回退未设置");
+        assert_eq!(parse_xray_bufsize(Some("")), None);
+        assert_eq!(parse_xray_bufsize(None), None);
+    }
+
+    /// env 桥接端到端：BufferPolicy::default().connection 必须等于
+    /// `default_buffer_connection_from_env(parse(env))`（sm80⑤ 接线：
+    /// 此前 default 恒 512 KiB，XRAY_BUFSIZE 零消费）。
+    /// 不 set_var：LazyLock 进程级缓存 + 测试并行会互相污染。
+    #[test]
+    fn test_buffer_policy_default_follows_env_bridge() {
+        let env = parse_xray_bufsize(std::env::var("XRAY_BUFSIZE").ok().as_deref());
+        assert_eq!(
+            BufferPolicy::default().connection,
+            default_buffer_connection_from_env(env),
+            "BufferPolicy::default must consume XRAY_BUFSIZE via env bridge"
+        );
     }
 
     // ====== ivst: VMessClosing 行为 + ZeroBuffer 行为单测 ======

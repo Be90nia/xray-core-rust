@@ -59,6 +59,10 @@ pub struct VlessInboundOptions {
     /// （1-RTT / 0-RTT ticket）。handler 级共享（`Arc`），所有连接共用
     /// Sessions/replay 防护状态。
     pub decryption: Option<Arc<crate::encryption::ServerInstance>>,
+    /// 握手限时（sm80④：装配层传 `policy_for_level(level).timeout.handshake`，
+    /// 对齐 Go inbound.go:281-284 SetReadDeadline(policy)）。None = 既有兜底
+    /// （产品 SessionDefault 60s；cfg(test) 100ms）。
+    pub handshake_timeout: Option<std::time::Duration>,
 }
 
 /// VLESS inbound 服务入口。
@@ -248,10 +252,13 @@ where
 
     // 握手限时（Go inbound.go:281-284：SetReadDeadline(policy 或 SessionDefault
     // 60s) 在 ENC 握手之后、首包读之前设置；deadline 覆盖首包预读 + decode 总
-    // 时长，decode 成功或 fallback 时解除）。vless crate 不持 policy manager，
-    // 用 SessionDefault 60s 兜底（同 xray-core handshake_timeout_for 无 policy 分支）。
-    let handshake_deadline =
-        tokio::time::Instant::now() + handshake_timeout();
+    // 时长，decode 成功或 fallback 时解除）。sm80④：优先用装配层注入的 policy
+    // 握手超时；未注入时维持 crate 兜底（同 handshake_timeout_for 无 policy 分支）。
+    let handshake_deadline = tokio::time::Instant::now()
+        + options
+            .as_ref()
+            .and_then(|o| o.handshake_timeout)
+            .unwrap_or_else(handshake_timeout);
 
     // 无 fallback 策略：维持原直连路径（不做 first 预读；deadline 由
     // handle_connection 内部建立，语义同上）
@@ -656,10 +663,12 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
     let mut stream = stream;
 
     // 握手限时（Go inbound.go:281-284：decode 前 SetReadDeadline(policy 或
-    // SessionDefault 60s)，覆盖整个 decode 阶段；vless crate 不持 policy
-    // manager，用 SessionDefault 60s 兜底）
-    let handshake_deadline =
-        tokio::time::Instant::now() + handshake_timeout();
+    // SessionDefault 60s)，覆盖整个 decode 阶段；sm80④ 起装配层可注入）。
+    let handshake_deadline = tokio::time::Instant::now()
+        + options
+            .as_ref()
+            .and_then(|o| o.handshake_timeout)
+            .unwrap_or_else(handshake_timeout);
 
     // 1. decode VLESS request header（isfb=false，全部从 stream 读）
     let mut first: Option<Vec<u8>> = None;
@@ -1487,6 +1496,7 @@ mod tests {
             reverse_registry: None,
             reverse_ohm: None,
             decryption: None,
+            handshake_timeout: None,
         };
         tokio::spawn(async move {
             let _ = serve_vless(
@@ -1548,6 +1558,7 @@ mod tests {
             reverse_registry: Some(Arc::clone(&registry)),
             reverse_ohm: Some(Arc::clone(&ohm_clone)),
             decryption: None,
+            handshake_timeout: None,
         };
         tokio::spawn(async move {
             let _ = serve_vless(

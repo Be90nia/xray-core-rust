@@ -137,6 +137,9 @@ pub async fn serve_vmess(
     ohm: Arc<SimpleOhm>,
     validator: Arc<TimedUserValidator>,
     tls: Option<Arc<xray_transport::TlsAcceptor>>,
+    // sm80④：装配层传 policy_for_level(level).timeout.handshake（Go
+    // server.go::Process SetReadDeadline(policy)）；测试可传短值。
+    handshake_timeout: std::time::Duration,
 ) -> std::io::Result<()> {
     // Go VMess inbound 无 detour 字段（未知 JSON 字段被忽略）：流量一律走默认出站 handler。
     let handler = ohm
@@ -166,12 +169,12 @@ pub async fn serve_vmess(
         tokio::spawn(async move {
             let result = if let Some(acc) = tls {
                 match acc.accept(stream).await {
-                    Ok(tls_stream) => handle_connection(tls_stream, &handler, &validator, &history, false).await,
+                    Ok(tls_stream) => handle_connection(tls_stream, &handler, &validator, &history, false, handshake_timeout).await,
                     Err(e) => { tracing::warn!(error = %e, "vmess TLS accept failed"); return; }
                 }
             } else {
                 // Go：裸 TCP/Unix 连接认证失败时 drain 防时序指纹；TLS 连接不 drain
-                handle_connection(stream, &handler, &validator, &history, true).await
+                handle_connection(stream, &handler, &validator, &history, true, handshake_timeout).await
             };
             if let Err(e) = result {
                 // Go vmess inbound.go:250：拒绝 AtInfo + RemoteAddr。
@@ -187,15 +190,16 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
     validator: &Arc<TimedUserValidator>,
     history: &Arc<SessionHistory>,
     is_drain: bool,
+    // sm80④：policy Timeouts.Handshake（Go server.go::Process SetReadDeadline）
+    handshake_timeout: std::time::Duration,
 ) -> std::io::Result<()> {
     let (mut stream_r, mut stream_w) = tokio::io::split(stream);
 
     // 1. decode VMess 请求头（async：先读 16B auth_id → AEAD 解密 → 解析）
     let mut session = ServerSession::new(validator, history);
-    // Go `server.go::Process`：conn.SetReadDeadline(SessionDefault().Timeouts.Handshake
-    // = 60s) 一次性覆盖 decode 与 drain 总时长（绝对 deadline 语义）。
-    let handshake_deadline =
-        tokio::time::Instant::now() + xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT;
+    // Go `server.go::Process`：conn.SetReadDeadline(Timeouts.Handshake) 一次性
+    // 覆盖 decode 与 drain 总时长（绝对 deadline 语义）。sm80④ 起由装配层注入。
+    let handshake_deadline = tokio::time::Instant::now() + handshake_timeout;
     let decoded = match tokio::time::timeout_at(
         handshake_deadline,
         session.decode_request_header_async(&mut stream_r),
@@ -739,7 +743,7 @@ mod tests {
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
         tokio::spawn(async move {
-            let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None).await;
+            let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT).await;
         });
 
         // 4. VMess client：connect → encode header → decode response header → echo round-trip
@@ -809,7 +813,7 @@ mod tests {
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
         tokio::spawn(async move {
-            let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None).await;
+            let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT).await;
         });
 
         // client 用未注册的随机 UUID
@@ -872,7 +876,7 @@ mod tests {
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
         tokio::spawn(async move {
-            let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None).await;
+            let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT).await;
         });
 
         // 3. client：UDP command header 指向 echo
@@ -921,7 +925,7 @@ mod tests {
         // 对端只写 8 字节（不足 16B auth_id）后沉默 → decode 在 60s deadline 终止
         let (mut client, server) = tokio::io::duplex(64);
         let server_task = tokio::spawn(async move {
-            handle_connection(server, &handler, &validator, &history, true).await
+            handle_connection(server, &handler, &validator, &history, true, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT).await
         });
         client.write_all(&[0u8; 8]).await.unwrap();
 

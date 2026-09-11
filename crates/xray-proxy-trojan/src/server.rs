@@ -139,6 +139,8 @@ impl InboundHandler for TrojanServer {
         let tag = self.tag.clone();
         let validator = self.validator.clone();
         let fallbacks = self.fallbacks.clone();
+        // sm80④：独立 Handler 路径无装配层注入，SessionDefault 60s 兜底。
+        let handshake_timeout = xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT;
         let listener_clone = Arc::clone(&listener);
         let handle = tokio::spawn(async move {
             loop {
@@ -152,7 +154,7 @@ impl InboundHandler for TrojanServer {
                                 inner: stream,
                                 buf: Vec::with_capacity(256),
                             };
-                            match trojan_server_handshake(&mut recorder, &validator).await {
+                            match trojan_server_handshake(&mut recorder, &validator, handshake_timeout).await {
                                 Ok((network, addr, port, user)) => {
                                     debug!(
                                         tag = %tag,
@@ -228,15 +230,17 @@ impl InboundHandler for TrojanServer {
 pub async fn trojan_server_handshake<S>(
     stream: &mut S,
     validator: &Validator,
+    // sm80④：policy Timeouts.Handshake（Go server.go::Process SetReadDeadline）
+    handshake_timeout: std::time::Duration,
 ) -> crate::Result<(Network, Address, u16, MemoryUser)>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin + Send,
 {
-    // Go `server.go::Process`：conn.SetReadDeadline(SessionDefault().Timeouts.Handshake
-    // = 60s) 限制整段握手读取；超时按握手失败处理（防静默连接占位，
-    // 对齐 nginx client_header_timeout 语义，见 features/policy/policy.go:125-133）。
+    // Go `server.go::Process`：SetReadDeadline(Timeouts.Handshake) 限制整段握手
+    // 读取；超时按握手失败处理（防静默连接占位，对齐 nginx client_header_timeout
+    // 语义，见 features/policy/policy.go:125-133）。sm80④ 起由装配层注入。
     tokio::time::timeout(
-        xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT,
+        handshake_timeout,
         trojan_server_handshake_inner(stream, validator),
     )
     .await
@@ -386,6 +390,8 @@ pub async fn serve_trojan(
     users: HashMap<String, MemoryUser>,
     fallbacks: Option<Arc<FallbackPolicy>>,
     tls: Option<Arc<xray_transport::TlsAcceptor>>,
+    // sm80④：装配层传 policy_for_level(level).timeout.handshake；测试可传短值。
+    handshake_timeout: std::time::Duration,
 ) -> std::io::Result<()> {
     let handler = ohm
         .get_default_handler()
@@ -433,7 +439,7 @@ pub async fn serve_trojan(
                             inner: tls_stream,
                             buf: Vec::with_capacity(256),
                         };
-                        handle_trojan_connection(recorder, validator, handler, fb_policy, peer, local, name, alpn).await;
+                        handle_trojan_connection(recorder, validator, handler, fb_policy, peer, local, name, alpn, handshake_timeout).await;
                     }
                     Err(e) => warn!(error = %e, "trojan TLS accept failed"),
                 }
@@ -442,7 +448,7 @@ pub async fn serve_trojan(
                     inner: stream,
                     buf: Vec::with_capacity(256),
                 };
-                handle_trojan_connection(recorder, validator, handler, fb_policy, peer, local, String::new(), String::new()).await;
+                handle_trojan_connection(recorder, validator, handler, fb_policy, peer, local, String::new(), String::new(), handshake_timeout).await;
             }
         });
     }
@@ -462,9 +468,11 @@ pub async fn serve_trojan_conn<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
     local: std::net::SocketAddr,
     tls_name: String,
     tls_alpn: String,
+    // sm80④：policy Timeouts.Handshake
+    handshake_timeout: std::time::Duration,
 ) {
     let recorder = RecordingStream { inner: stream, buf: Vec::with_capacity(256) };
-    handle_trojan_connection(recorder, validator, handler, fb_policy, peer, local, tls_name, tls_alpn).await;
+    handle_trojan_connection(recorder, validator, handler, fb_policy, peer, local, tls_name, tls_alpn, handshake_timeout).await;
 }
 
 /// 处理单个 Trojan 连接：handshake → dispatch / fallback。
@@ -477,8 +485,9 @@ async fn handle_trojan_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     local: std::net::SocketAddr,
     tls_name: String,
     tls_alpn: String,
+    handshake_timeout: std::time::Duration,
 ) {
-    match trojan_server_handshake(&mut recorder, &validator).await {
+    match trojan_server_handshake(&mut recorder, &validator, handshake_timeout).await {
         Ok((network, addr, port, user)) => {
             if matches!(network, Network::Udp) {
                 debug!(peer = %peer, user = %user.email, "trojan UDP relay start");
@@ -631,7 +640,7 @@ mod tests {
         let mut buf = header.clone();
         buf.extend_from_slice(b"payload data");
         let mut cursor = std::io::Cursor::new(buf);
-        let result = trojan_server_handshake(&mut cursor, &validator).await;
+        let result = trojan_server_handshake(&mut cursor, &validator, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT).await;
         assert!(result.is_ok());
         let (network, addr, port, user) = result.unwrap();
         assert_eq!(network, Network::Tcp);
@@ -659,7 +668,7 @@ mod tests {
         header.extend_from_slice(&CRLF);
 
         let mut cursor = std::io::Cursor::new(header);
-        let result = trojan_server_handshake(&mut cursor, &validator).await;
+        let result = trojan_server_handshake(&mut cursor, &validator, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT).await;
         assert!(result.is_err());
     }
 
@@ -672,7 +681,7 @@ mod tests {
         let (_silent_client, mut server) = tokio::io::duplex(64);
 
         let started = std::time::Instant::now();
-        let result = trojan_server_handshake(&mut server, &validator).await;
+        let result = trojan_server_handshake(&mut server, &validator, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT).await;
         assert!(
             matches!(result, Err(crate::TrojanError::HandshakeTimeout)),
             "silent client must hit handshake timeout, got {result:?}"
@@ -699,7 +708,7 @@ mod tests {
         header.extend_from_slice(&CRLF);
 
         let mut cursor = std::io::Cursor::new(header);
-        let result = trojan_server_handshake(&mut cursor, &validator).await;
+        let result = trojan_server_handshake(&mut cursor, &validator, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT).await;
         assert!(result.is_ok());
         let (_, addr, port, _) = result.unwrap();
         match addr {
@@ -724,7 +733,7 @@ mod tests {
         header.extend_from_slice(&CRLF);
 
         let mut cursor = std::io::Cursor::new(header);
-        let result = trojan_server_handshake(&mut cursor, &validator).await;
+        let result = trojan_server_handshake(&mut cursor, &validator, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT).await;
         assert!(result.is_ok());
         let (_, addr, _, _) = result.unwrap();
         match addr {
@@ -739,7 +748,7 @@ mod tests {
         // 只提供 10 字节（不够 56）
         let short = vec![0u8; 10];
         let mut cursor = std::io::Cursor::new(short);
-        let result = trojan_server_handshake(&mut cursor, &validator).await;
+        let result = trojan_server_handshake(&mut cursor, &validator, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT).await;
         assert!(result.is_err());
     }
 
@@ -751,7 +760,7 @@ mod tests {
         header.extend_from_slice(&key);
         // 缺少 CRLF + CMD + addr
         let mut cursor = std::io::Cursor::new(header);
-        let result = trojan_server_handshake(&mut cursor, &validator).await;
+        let result = trojan_server_handshake(&mut cursor, &validator, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT).await;
         assert!(result.is_err());
     }
 
@@ -763,7 +772,7 @@ mod tests {
         header.extend_from_slice(&key);
         header.extend_from_slice(b"XX"); // 不是 CRLF
         let mut cursor = std::io::Cursor::new(header);
-        let result = trojan_server_handshake(&mut cursor, &validator).await;
+        let result = trojan_server_handshake(&mut cursor, &validator, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT).await;
         assert!(result.is_err());
     }
 
@@ -777,7 +786,7 @@ mod tests {
         header.push(COMMAND_TCP);
         header.push(0x05); // 未知 ATYP
         let mut cursor = std::io::Cursor::new(header);
-        let result = trojan_server_handshake(&mut cursor, &validator).await;
+        let result = trojan_server_handshake(&mut cursor, &validator, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT).await;
         assert!(result.is_err());
     }
 
@@ -856,7 +865,7 @@ mod tests {
         let trojan_addr = trojan_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         tokio::spawn(async move {
-            let _ = serve_trojan(trojan_listener, ohm_clone, users, None, None).await;
+            let _ = serve_trojan(trojan_listener, ohm_clone, users, None, None, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT).await;
         });
 
         // 5. trojan client：构造 header + payload
@@ -947,7 +956,7 @@ mod tests {
         let trojan_addr = trojan_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         tokio::spawn(async move {
-            let _ = serve_trojan(trojan_listener, ohm_clone, users, None, None).await;
+            let _ = serve_trojan(trojan_listener, ohm_clone, users, None, None, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT).await;
         });
 
         // 4. client：UDP 模式 header + 一帧指向 echo server
