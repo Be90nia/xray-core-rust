@@ -14,7 +14,7 @@ use tokio::io::{AsyncRead as AsyncReadTrait, AsyncReadExt, AsyncWrite as AsyncWr
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::debug;
 
-use crate::client::{DefaultDialerClient, DialTarget, ReqBody, make_stream_body};
+use crate::client::{DefaultDialerClient, DialTarget, ReqBody, hyper_err_to_io, make_stream_body};
 use crate::config::Config;
 use crate::connection::SplitConn;
 use crate::error::{Result, SplitHttpError};
@@ -22,10 +22,10 @@ use crate::h3_client::H3Conn;
 
 /// 统一上传连接类型（packet-up / stream-up / stream-one mode 共用）。
 ///
-/// reader=下载流（`BodyDataStream` 适配后的类型擦除），writer=上传 pipe 写端。
+/// reader=下载流（[`crate::client::DefaultDialerClient::open_stream`] 返回的
+/// 类型擦除 reader），writer=上传 pipe 写端。
 ///
-/// 用 `Box<dyn AsyncRead + Send + Unpin>` 避免复杂的具体类型名（`BodyDataStream` +
-/// `MapErr` + `StreamReader` 嵌套过长）。
+/// 用 `Box<dyn AsyncRead + Send + Unpin>` 避免复杂的具体类型名。
 pub type PacketUpConn = SplitConn<Box<dyn AsyncReadTrait + Send + Unpin>, DuplexStream>;
 
 
@@ -61,14 +61,8 @@ pub async fn dial_packet_up(
     sc_max_each_post_bytes: usize,
     sc_min_posts_interval_ms: u64,
 ) -> Result<PacketUpConn> {
-    // 1. GET 下载流（stream-down）
-    let (download_body, remote, local) = client.open_stream(&base_uri, &session_id, None).await?;
-
-    // BodyDataStream<Incoming> → Stream<Item=io::Result<Bytes>> → AsyncRead
-    // 用 map_err 把 hyper::Error 转 io::Error，再 StreamReader 把 Stream 转 AsyncRead
-    let download_stream = download_body.map_err(map_hyper_err_to_io);
-    let download_reader: Box<dyn AsyncReadTrait + Send + Unpin> =
-        Box::new(StreamReader::new(download_stream));
+    // 1. GET 下载流（stream-down，lazy reader——POST 上传任务见下）
+    let (download_reader, remote, local) = client.open_stream(&base_uri, &session_id, None).await?;
 
     // 2. 创建上传 pipe（buffer 略大于 max_post 以吸收短期 burst）
     let pipe_buf = sc_max_each_post_bytes.saturating_mul(2).max(8192);
@@ -110,11 +104,6 @@ pub async fn dial_packet_up(
     Ok(SplitConn::new(download_reader, pipe_client, remote, local))
 }
 
-/// `hyper::Error` → `std::io::Error` 转换函数指针（供 `TryStreamExt::map_err` 使用）。
-fn map_hyper_err_to_io(e: hyper::Error) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-}
-
 
 /// stream-up mode 拨号：POST streaming body 上传 + 独立 GET 下载。
 ///
@@ -146,10 +135,7 @@ pub async fn dial_stream_up(
         .await?;
 
     // 3. 独立 GET 下载流
-    let (download_body, _, _) = client.open_stream(&base_uri, &session_id, None).await?;
-    let download_stream = download_body.map_err(map_hyper_err_to_io);
-    let download_reader: Box<dyn AsyncReadTrait + Send + Unpin> =
-        Box::new(StreamReader::new(download_stream));
+    let (download_reader, _, _) = client.open_stream(&base_uri, &session_id, None).await?;
 
     Ok(SplitConn::new(download_reader, pipe_client, remote, local))
 }
@@ -188,7 +174,7 @@ pub async fn dial_stream_one(
     })?;
 
     // 3. 响应流作为下载流
-    let response_stream = response_body.map_err(map_hyper_err_to_io);
+    let response_stream = response_body.map_err(hyper_err_to_io);
     let download_reader: Box<dyn AsyncReadTrait + Send + Unpin> =
         Box::new(StreamReader::new(response_stream));
 
@@ -583,7 +569,7 @@ where
         return Err(SplitHttpError::BadStatus(resp.status().as_u16()));
     }
     let resp_body = resp.into_body();
-    let download_stream = http_body_util::BodyDataStream::new(resp_body).map_err(map_hyper_err_to_io);
+    let download_stream = http_body_util::BodyDataStream::new(resp_body).map_err(hyper_err_to_io);
     let download_reader: Box<dyn AsyncReadTrait + Send + Unpin> =
         Box::new(StreamReader::new(download_stream));
 

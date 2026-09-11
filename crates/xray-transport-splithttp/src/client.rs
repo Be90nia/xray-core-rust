@@ -16,8 +16,9 @@
 //!
 //! # 不实现（留后续切片）
 //!
-//! - `WaitReadCloser` 异步等待机制（Go 用来同步 GotConn 与响应到达）→ ponytail
-//!   简化：直接 await response（hyper 已内部处理）
+//! - `WaitReadCloser` 异步等待机制（Go 用来同步 GotConn 与响应到达）→ GET 分支以
+//!   [`Self::open_stream`] 的 lazy reader 等价实现（同步 await 响应头会在 Go 26.9.9
+//!   hub `SetFlushNext` 语义下与上传侧形成环形死锁，见 `spawn_h2_lazy_reader`）。
 //! - `browser_dialer` 路径 → 切片 b7f 独立任务
 //! - HTTP/3 / QUIC → 切片 G（可选）
 //! - xmux 多路复用 → 切片 E
@@ -44,6 +45,11 @@ use hyper_util::client::legacy::connect::dns::Name as DnsName;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::ClientConfig as RustlsClientConfig;
 use rustls::pki_types::ServerName;
+use tokio::io::AsyncRead as AsyncReadTrait;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::io::StreamReader;
+use tracing::debug;
 use tower_service::Service as TowerService;
 pub use xray_tls::fingerprint::Fingerprint;
 use xray_tls::utls::{ConnInterface, UConn};
@@ -284,7 +290,7 @@ pub struct DefaultDialerClient {
     /// hyper-util 客户端（含连接池 + TLS）。
     pub client: HyperClient,
     /// 连接是否已关闭（任何 IO 错误后置 true，等价 Go `closed` 字段）。
-    closed: AtomicBool,
+    closed: Arc<AtomicBool>,
 }
 
 impl DefaultDialerClient {
@@ -343,7 +349,7 @@ impl DefaultDialerClient {
         Self {
             config,
             client,
-            closed: AtomicBool::new(false),
+            closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -406,24 +412,42 @@ impl DefaultDialerClient {
     /// - `body = None` → GET（stream-down，下载流）
     /// - `body = Some` → POST/PUT/etc.（一次性 body 上传，等响应）
     ///
-    /// 返回 `(下载流, remote_addr, local_addr)`。`remote/local_addr` 来自 hyper-util
-    /// [`HttpInfo`]（GotConn 等价物），获取失败返回 `0.0.0.0:0` 占位（不致命，仅日志用）。
+    /// 返回 `(下载流, remote_addr, local_addr)`。
     ///
     /// **streaming body** 请用 [`Self::open_stream_uploading`]。
     ///
+    /// GET 分支（`body = None`）**发出即返回**（lazy reader，对齐 Go gotConn+
+    /// `WaitReadCloser` 语义）；`remote/local_addr` 仅 POST 分支可得 `HttpInfo`
+    ///（GotConn 等价物），GET 分支恒为 `0.0.0.0:0` 占位（不致命，仅日志用）。
+    ///
     /// # Errors
-    /// - [`SplitHttpError::Hyper`]：拨号 / TLS / HTTP 协议错误
-    /// - [`SplitHttpError::BadStatus`]：非 200 响应
+    /// - [`SplitHttpError::Hyper`]：拨号 / TLS / HTTP 协议错误（POST 分支同步报；
+    ///   GET 分支读端以 EOF/`io::Error` 呈现）
+    /// - [`SplitHttpError::BadStatus`]：非 200 响应（仅 POST 分支；GET 分支非 200
+    ///   记日志 + 读端 EOF，对齐 Go `"unexpected status"` 分支）
     pub async fn open_stream(
         &self,
         base_uri: &str,
         session_id: &str,
         body: Option<Vec<u8>>,
-    ) -> Result<(BodyDataStream<hyper::body::Incoming>, SocketAddr, SocketAddr)> {
+    ) -> Result<(Box<dyn AsyncReadTrait + Send + Unpin>, SocketAddr, SocketAddr)> {
+        let is_get = body.is_none();
         let meta = self
             .config
             .build_stream_request_meta(base_uri, session_id, body)?;
         let req = Self::build_request(meta)?;
+
+        if is_get {
+            // stream-down GET：发出即返回。server 端（Go 26.9.9 hub `SetFlushNext`）
+            // 把 GET 响应头缓冲到首块下行数据，而下行数据依赖上传侧到达；
+            // packet-up/stream-up 的 POST 上传任务在 GET 返回后才 spawn——旧实现
+            // 同步 `request().await` 等响应头会环形死锁，dial 挂到外层超时。
+            let reader = spawn_h2_lazy_reader(self.closed.clone(), self.client.clone(), req);
+            let placeholder = SocketAddr::from(([0, 0, 0, 0], 0));
+            return Ok((reader, placeholder, placeholder));
+        }
+
+        // body = Some（一次性 POST）：对齐 Go `PostPacket`，同步等响应。
         let resp = self.client.request(req).await.map_err(|e| {
             self.closed.store(true, Ordering::Relaxed);
             SplitHttpError::Hyper(e.to_string())
@@ -450,8 +474,8 @@ impl DefaultDialerClient {
             .map(HttpInfo::local_addr)
             .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
 
-        let stream = BodyDataStream::new(resp.into_body());
-        Ok((stream, remote, local))
+        let stream = BodyDataStream::new(resp.into_body()).map_err(hyper_err_to_io);
+        Ok((Box::new(StreamReader::new(stream)), remote, local))
     }
 
     /// 打开 streaming 上传流（stream-up / stream-one mode）。
@@ -568,6 +592,54 @@ impl DefaultDialerClient {
         }
         Ok(())
     }
+}
+
+/// `hyper::Error` → `std::io::Error`（h2 body 流转发用）。
+pub(crate) fn hyper_err_to_io(e: hyper::Error) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+}
+
+/// stream-down GET 的 lazy 读端（对齐 Go `WaitReadCloser` 语义，与 h3
+/// `spawn_h3_lazy_reader` 同构）。
+///
+/// dial 调用方不被响应头阻塞：spawn 的后台任务持有响应 future——200 则把 body
+/// 块转发进 channel；非 200 仅记日志并结束（读端 EOF，对齐 Go `"unexpected
+/// status"` 分支）；请求错误则 `closed` 置位 + EOF。
+fn spawn_h2_lazy_reader(
+    closed: Arc<AtomicBool>,
+    mut client: HyperClient,
+    req: Request<ReqBody>,
+) -> Box<dyn AsyncReadTrait + Send + Unpin> {
+    let (tx, rx) = mpsc::channel::<std::io::Result<Bytes>>(8);
+    tokio::spawn(async move {
+        match client.request(req).await {
+            Ok(resp) if resp.status() == StatusCode::OK => {
+                let mut chunks = BodyDataStream::new(resp.into_body()).map_err(hyper_err_to_io);
+                loop {
+                    match chunks.try_next().await {
+                        Ok(Some(chunk)) => {
+                            if tx.send(Ok(chunk)).await.is_err() {
+                                return; // 接收端 drop，结束
+                            }
+                        }
+                        Ok(None) => return,
+                        Err(e) => {
+                            let _ = tx.send(Err(e)).await;
+                            return;
+                        }
+                    }
+                }
+            }
+            Ok(resp) => {
+                debug!(target: "splithttp", status = %resp.status(), "unexpected GET status");
+            }
+            Err(e) => {
+                closed.store(true, Ordering::Relaxed);
+                debug!(target: "splithttp", error = %e, "GET request failed");
+            }
+        }
+    });
+    Box::new(StreamReader::new(ReceiverStream::new(rx)))
 }
 
 #[cfg(test)]

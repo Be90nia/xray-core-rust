@@ -58,10 +58,10 @@ async fn dial_splithttp(
     let config = parse_splithttp_config(settings.transport_json.as_ref())?;
     let config = Arc::new(config);
     let default_sni = dest.address().to_string();
-    // ponytail: 域名前置部署下，SNI 用 tlsSettings.serverName（CF 选 tunnel/zone），
-    // 但 :authority（h2 伪头 = Host 头语义）必须等于 dial 的 dest——实测：
-    // CF argo 隧道 + cdn 都只对 :authority=dest 响应（Python h2 GET 0.25s），
-    // 对 :authority=config.host（sg-argo/cdn_sg）始终 8s+ 超时。
+    // ponytail: 域名前置部署下，SNI 用 tlsSettings.serverName（CF 选 tunnel/zone）；
+    // :authority 拼接为 {host}:{dest.port}，对齐 Go requestURL。早先「:authority
+    // 必须等于裸 dest」的实测结论已被抓包 A/B 证伪——Go 侧 :authority=dest:443
+    // 同样 PASS（880KB e2e），CDN 接受带端口后缀的 :authority。
     let host = if config.host.is_empty() {
         format!("{}:{}", dest.address(), dest.port())
     } else {
