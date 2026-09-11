@@ -5814,7 +5814,6 @@ name = "xray-buf"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "nix 0.31.3",
  "parking_lot",
  "thiserror 2.0.18",
  "tokio",
