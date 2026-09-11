@@ -12,6 +12,7 @@
 //! （VLESS 路由 ID 当前 dispatcher 路径未填充）。
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use xray_app_dispatcher::default::{
@@ -19,6 +20,7 @@ use xray_app_dispatcher::default::{
     RoutingContext as DispRoutingContext, RoutingRouter, SimpleOhm, SniffingRequest,
 };
 use xray_app_dispatcher::{maybe_wrap_reader, maybe_wrap_writer, DispatchHandler, DispatcherError};
+use xray_mux::client::MUX_COOL_ADDRESS;
 use xray_proto::xray::common::geodata::CidrRule;
 use xray_app_router::balancing::{NotImplementedSelector, ObservationProvider, OutboundHandlerSelector};
 use xray_app_router::context::RoutingData as RouterRoutingData;
@@ -273,6 +275,82 @@ pub fn sniffing_request_from_json(v: Option<&serde_json::Value>) -> SniffingRequ
     }
 }
 
+/// Mux carrier 拦截装饰器：对应 Go proxyman always.go:89 `mux: mux.NewServer(ctx)`
+/// ——每个 inbound worker 的 dispatcher 统一被 mux.Server 装饰。
+///
+/// destination 为 `v1.mux.cool` 的 carrier 由 mux `ServerWorker` 接管解帧，
+/// 子会话再经 inner dispatch；其余 destination 原样透传。判定仅按域名（与
+/// Go mux.Server 一致，不校验端口：vless Mux command 的 port 恒 0，socks
+/// CONNECT 载 carrier 才带 9527）。socks/http 已在各自协议层拦截，此处覆盖
+/// vless/trojan/ss 等其余 inbound（bd raw0：vless 入站 mux 曾用臆造 0xFF
+/// 首字节判别，真实帧必拒）。
+pub struct MuxCarrierHandler {
+    inner: Arc<dyn DispatchHandler>,
+}
+
+impl MuxCarrierHandler {
+    /// 包装生产 inbound dispatch handler（通常为 [`InboundDispatchHandler`]）。
+    #[must_use]
+    pub fn new(inner: Arc<dyn DispatchHandler>) -> Self {
+        Self { inner }
+    }
+
+    fn intercept(
+        &self,
+        dest: &Destination,
+        link: Link,
+        access: Option<AccessContext>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        if is_mux_carrier(dest) {
+            tokio::spawn(crate::inbound::handle_mux_inbound_link(
+                link,
+                Arc::clone(&self.inner),
+            ));
+            return Box::pin(std::future::ready(()));
+        }
+        match access {
+            Some(a) => self.inner.dispatch_with_access(dest, link, a),
+            None => self.inner.dispatch(dest, link),
+        }
+    }
+}
+
+/// mux.cool 信令地址判定（仅按域名，对齐 Go mux.Server.Dispatch）。
+fn is_mux_carrier(dest: &Destination) -> bool {
+    matches!(dest.address(), Address::Domain(d) if d == MUX_COOL_ADDRESS)
+}
+
+impl std::fmt::Debug for MuxCarrierHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MuxCarrierHandler")
+            .field("tag", &self.inner.tag())
+            .finish()
+    }
+}
+
+impl DispatchHandler for MuxCarrierHandler {
+    fn tag(&self) -> &str {
+        self.inner.tag()
+    }
+
+    fn dispatch(
+        &self,
+        dest: &Destination,
+        link: Link,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        self.intercept(dest, link, None)
+    }
+
+    fn dispatch_with_access(
+        &self,
+        dest: &Destination,
+        link: Link,
+        access: AccessContext,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        self.intercept(dest, link, Some(access))
+    }
+}
+
 /// 生产 default handler：经 [`DefaultDispatcher::dispatch_link`] 分发。
 ///
 /// 对应 Go inbound → `dispatcher.Dispatch` 入口。每个 inbound 一个实例：
@@ -478,23 +556,36 @@ fn build_adapter(
     Ok(Arc::new(RouterAdapter::new(router)))
 }
 
-/// JSON → proto `Config` 转换：覆盖 `RoutingRule` 全部标量字段——
-/// domain(ip/Suffix/Keyword/Regex)、ip、source、port、sourcePort、network、protocol、
-/// user、inboundTag、attributes、process，以及顶层 `domainStrategy`、`balancers`。
-/// 引擎 `xray_app_router::rule::build_condition` 已支持全集，瓶颈纯在此解析器。
+/// JSON → proto `Config` 转换（Go `infra/conf/router.go` `parseFieldRule` +
+/// `geodata.ParseDomainRules/ParseIPRules` 的等价物）：覆盖 `RoutingRule` 全部
+/// 标量字段——domain（Go 前缀语法 full:/domain:/regexp:/keyword:/geosite:/ext:，
+/// 无前缀 = Substr；另保留 Rust 扩展别名键 domainSuffix/domainKeyword/domainRegex）、
+/// ip / source（CIDR / geoip: / ext-ip: / `!` 反向）、port、sourcePort、network、
+/// protocol、user、inboundTag、attributes、process，以及顶层 `domainStrategy`、
+/// `balancers`。
+///
+/// 对齐 Go 语义：规则解析失败（未知前缀形态 / 非法 CIDR / geoip.dat 缺失或
+/// 缺 code）返回 Err，由调用方拒启（Go Build 失败即拒绝启动），不再静默丢规则。
 ///
 /// `rule_set` 依赖 proto 更新（当前 `RoutingRule` 无该字段，见
 /// `xray-app-router/src/rule_set.rs`），暂以 TODO 标记，待 proto 升级后接入。
 fn parse_routing_json_to_proto(
     json: &[u8],
 ) -> Result<xray_proto::xray::app::router::Config, WiringError> {
+    parse_routing_json_to_proto_in(json, &resolve_asset_dir())
+}
+
+/// 同 [`parse_routing_json_to_proto`]，geodata 资产目录显式给定（测试注入用）。
+fn parse_routing_json_to_proto_in(
+    json: &[u8],
+    datadir: &std::path::Path,
+) -> Result<xray_proto::xray::app::router::Config, WiringError> {
     use prost::Message;
     use xray_proto::xray::app::router::routing_rule::TargetTag;
     use xray_proto::xray::app::router::{BalancingRule, RoutingRule};
-    use xray_proto::xray::common::geodata::{Domain, DomainRule, IpRule};
+    use xray_proto::xray::common::geodata::{Domain, DomainRule};
     use xray_proto::xray::common::geodata::domain::Type as DT;
     use xray_proto::xray::common::geodata::domain_rule::Value as DV;
-    use xray_proto::xray::common::geodata::ip_rule::Value as IV;
 
     let v: serde_json::Value =
         serde_json::from_slice(json).map_err(|e| WiringError::JsonParse(e.to_string()))?;
@@ -519,16 +610,19 @@ fn parse_routing_json_to_proto(
                 continue;
             };
 
-            // Domain 规则：Full / Domain(suffix) / Substr(keyword) / Regex
+            // Domain 规则：Go 前缀语法（full:/domain:/regexp:/keyword:/geosite:/ext:，
+            // 无前缀 = Substr），geosite 条目经 check_file 校验 geodata 资产可用性。
             let mut domains = Vec::new();
             for d in json_str_iter(r.get("domain")) {
-                domains.push(DomainRule {
-                    value: Some(DV::Custom(Domain {
-                        r#type: DT::Full as i32,
-                        value: d.to_string(),
-                        attribute: vec![],
-                    })),
-                });
+                let pb_rule = xray_geodata::rule_parser::parse_domain_rule(
+                    d,
+                    xray_geodata::geosite::DomainType::Substr,
+                    datadir,
+                )
+                .map_err(|e| {
+                    WiringError::JsonParse(format!("routing rule domain '{d}': {e}"))
+                })?;
+                domains.push(geodata_domain_rule_to_proto(pb_rule));
             }
             for d in json_str_iter(r.get("domainSuffix")) {
                 domains.push(DomainRule {
@@ -558,20 +652,27 @@ fn parse_routing_json_to_proto(
                 });
             }
 
-            // 目标 IP（CIDR）
+            // 目标 / 源 IP：Go `geodata.ParseIPRules` 等价（CIDR / geoip: / ext-ip: /
+            // `!` 反向）。解析失败硬错——旧实现 geoip:/非法 CIDR 静默跳过（安全
+            // 屏蔽规则失效的根因）。
             let mut ips = Vec::new();
-            for ip_str in json_str_iter(r.get("ip")) {
-                if let Some(custom) = parse_cidr_to_ip_rule(ip_str) {
-                    ips.push(IpRule { value: Some(IV::Custom(custom)) });
-                }
+            for p in xray_geodata::rule_parser::parse_ip_rules(
+                &json_string_list(r.get("ip")),
+                datadir,
+            )
+            .map_err(|e| WiringError::JsonParse(format!("routing rule ip: {e}")))?
+            {
+                ips.push(geodata_ip_rule_to_proto(p));
             }
 
-            // 源 IP（CIDR）
             let mut source_ips = Vec::new();
-            for ip_str in json_str_iter(r.get("source")) {
-                if let Some(custom) = parse_cidr_to_ip_rule(ip_str) {
-                    source_ips.push(IpRule { value: Some(IV::Custom(custom)) });
-                }
+            for p in xray_geodata::rule_parser::parse_ip_rules(
+                &json_string_list(r.get("source")),
+                datadir,
+            )
+            .map_err(|e| WiringError::JsonParse(format!("routing rule source: {e}")))?
+            {
+                source_ips.push(geodata_ip_rule_to_proto(p));
             }
 
             cfg.rule.push(RoutingRule {
@@ -788,34 +889,66 @@ fn json_str_iter<'a>(v: Option<&'a serde_json::Value>) -> Box<dyn Iterator<Item 
     }
 }
 
-/// 把 `"1.2.3.0/24"` 或裸 IP `"1.2.3.4"` 解析为 `CidrRule`。
-/// 裸 IP 自动取全前缀（IPv4=/32、IPv6=/128）。
-///
-/// tc33：原实现 `split_once('/')` 对裸 IP 返 None，整条规则静默丢失——
-/// `ipsExcluded: ["8.8.8.8"]` 仅 IP 字面就静默失效。
-fn parse_cidr_to_ip_rule(s: &str) -> Option<CidrRule> {
-    use xray_proto::xray::common::geodata::{Cidr, CidrRule};
-    let (ip_part, prefix) = match s.split_once('/') {
-        Some((ip_s, bits_s)) => {
-            let bits: u32 = bits_s.parse().ok()?;
-            (ip_s, bits)
-        }
-        // tc33：裸 IP 自动全前缀（IPv4=/32、IPv6=/128）。
-        None => (s, 0),
-    };
-    let (ip_vec, full_prefix) = if let Ok(v4) = ip_part.parse::<std::net::Ipv4Addr>() {
-        (v4.octets().to_vec(), 32)
-    } else if let Ok(v6) = ip_part.parse::<std::net::Ipv6Addr>() {
-        (v6.octets().to_vec(), 128)
-    } else {
-        return None;
-    };
-    let final_prefix = if prefix == 0 { full_prefix } else { prefix.min(u32::from(u8::MAX)) };
-    Some(CidrRule {
-        cidr: Some(Cidr { ip: ip_vec, prefix: final_prefix }),
-        reverse_match: false,
-    })
+/// `xray_geodata::pb`（crate 自建 proto）→ `xray_proto`（Go 同源 proto）字段级
+/// 转换。两 crate 各自生成同名类型，与 `xray-app-router/src/rule.rs` 的
+/// `convert_proto_ip_rules` 互为逆向方向。
+fn geodata_ip_rule_to_proto(
+    r: xray_geodata::pb::IpRule,
+) -> xray_proto::xray::common::geodata::IpRule {
+    use xray_geodata::pb::ip_rule::Value as GV;
+    use xray_proto::xray::common::geodata::ip_rule::Value as PV;
+    let value = r.value.map(|v| match v {
+        GV::Geoip(g) => PV::Geoip(xray_proto::xray::common::geodata::GeoIpRule {
+            file: g.file,
+            code: g.code,
+            reverse_match: g.reverse_match,
+        }),
+        GV::Custom(c) => PV::Custom(xray_proto::xray::common::geodata::CidrRule {
+            cidr: c.cidr.map(|cc| xray_proto::xray::common::geodata::Cidr {
+                ip: cc.ip,
+                prefix: cc.prefix,
+            }),
+            reverse_match: c.reverse_match,
+        }),
+    });
+    xray_proto::xray::common::geodata::IpRule { value }
 }
+
+/// 同 [`geodata_ip_rule_to_proto`]，Domain 方向（geosite 引用 / 自定义匹配型）。
+fn geodata_domain_rule_to_proto(
+    r: xray_geodata::pb::DomainRule,
+) -> xray_proto::xray::common::geodata::DomainRule {
+    use xray_geodata::pb::domain_rule::Value as GV;
+    use xray_proto::xray::common::geodata::domain_rule::Value as PV;
+    let value = r.value.map(|v| match v {
+        GV::Geosite(g) => PV::Geosite(xray_proto::xray::common::geodata::GeoSiteRule {
+            file: g.file,
+            code: g.code,
+            attrs: g.attrs,
+        }),
+        GV::Custom(d) => PV::Custom(xray_proto::xray::common::geodata::Domain {
+            r#type: d.r#type,
+            value: d.value,
+            attribute: d
+                .attribute
+                .into_iter()
+                .map(|a| xray_proto::xray::common::geodata::domain::Attribute {
+                    key: a.key,
+                    typed_value: a.typed_value.map(|t| match t {
+                        xray_geodata::pb::domain::attribute::TypedValue::BoolValue(b) => {
+                            xray_proto::xray::common::geodata::domain::attribute::TypedValue::BoolValue(b)
+                        }
+                        xray_geodata::pb::domain::attribute::TypedValue::IntValue(i) => {
+                            xray_proto::xray::common::geodata::domain::attribute::TypedValue::IntValue(i)
+                        }
+                    }),
+                })
+                .collect(),
+        }),
+    });
+    xray_proto::xray::common::geodata::DomainRule { value }
+}
+
 /// rttb：JSON `strategy.settings`（leastload 调优参数）→ `StrategyLeastLoadConfig`
 /// proto bytes，再包成 `TypedMessage`。
 ///
@@ -1338,5 +1471,191 @@ mod tests {
         let mut plain = DispatcherContext::new().with_target_port(Port::new(443));
         plain.target_ips = vec![std::net::IpAddr::from([1, 2, 3, 4])];
         assert!(<RouterAdapter as RoutingRouter>::pick_route(&adapter, &plain).is_err());
+    }
+
+    // ---- 路由 JSON Go 前缀语法（rs3e）----
+
+    /// 伪造 geoip.dat（GeoIpList protobuf，与 xray-app-router 测试同配方）。
+    fn make_geoip_dat() -> Vec<u8> {
+        use prost::Message;
+        use xray_proto::xray::common::geodata::{Cidr, GeoIp, GeoIpList};
+        let private = GeoIp {
+            code: "PRIVATE".into(),
+            cidr: vec![
+                Cidr { ip: vec![10, 0, 0, 0], prefix: 8 },
+                Cidr { ip: vec![192, 168, 0, 0], prefix: 16 },
+                Cidr { ip: vec![127, 0, 0, 0], prefix: 8 },
+            ],
+            reverse_match: false,
+        };
+        let cn = GeoIp {
+            code: "CN".into(),
+            cidr: vec![Cidr { ip: vec![1, 2, 3, 0], prefix: 24 }],
+            reverse_match: false,
+        };
+        GeoIpList { entry: vec![private, cn] }.encode_to_vec()
+    }
+
+    /// 伪造 geosite.dat（GeoSiteList protobuf，code CN）。
+    fn make_geosite_dat() -> Vec<u8> {
+        use prost::Message;
+        use xray_proto::xray::common::geodata::{Domain, GeoSite, GeoSiteList};
+        let cn = GeoSite {
+            code: "CN".into(),
+            domain: vec![
+                Domain { r#type: 2, value: "baidu.com".into(), attribute: vec![] },
+                Domain { r#type: 3, value: "example.cn".into(), attribute: vec![] },
+            ],
+        };
+        GeoSiteList { entry: vec![cn] }.encode_to_vec()
+    }
+
+    /// 独立临时资产目录（进程级唯一，测试间互不干扰）。
+    fn temp_asset_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("xray-wiring-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp asset dir");
+        dir
+    }
+
+    /// Go 官方样例前缀形态逐项断言 proto 字段（Go 对照 infra/conf/router.go
+    /// `parseFieldRule` → `geodata.ParseDomainRules(s, Domain_Substr)` /
+    /// `ParseIPRules`）：full:/domain:/regexp:/keyword:/geosite:/无前缀=Substr、
+    /// CIDR/geoip:/ext-ip:/`!` 反向，以及 Rust 别名键兼容。
+    #[test]
+    fn parse_routing_json_go_prefix_forms() {
+        use xray_proto::xray::common::geodata::domain_rule::Value as DV;
+        use xray_proto::xray::common::geodata::ip_rule::Value as IV;
+
+        let dir = temp_asset_dir("prefix-forms");
+        std::fs::write(dir.join("geoip.dat"), make_geoip_dat()).unwrap();
+        std::fs::write(dir.join("geosite.dat"), make_geosite_dat()).unwrap();
+
+        let json = br#"{
+            "rules": [{
+                "outboundTag": "proxy",
+                "domain": ["full:example.com", "domain:x.example.com",
+                           "regexp:^mail\\.example\\.com$", "keyword:ads",
+                           "geosite:cn", "plain.example.com"],
+                "domainSuffix": ["alias-suffix.example"],
+                "domainKeyword": ["alias-keyword"],
+                "domainRegex": ["^alias-regex$"],
+                "ip": ["geoip:private", "10.0.0.0/8", "ext-ip:geoip.dat:cn"],
+                "source": ["!192.168.0.0/16"]
+            }]
+        }"#;
+        let cfg = parse_routing_json_to_proto_in(json, &dir).expect("parse");
+
+        assert_eq!(cfg.rule.len(), 1);
+        let rule = &cfg.rule[0];
+
+        // domain：6 条 Go 形态 + 3 条 Rust 别名
+        assert_eq!(rule.domain.len(), 9);
+        let custom = |i: usize| match rule.domain[i].value.as_ref() {
+            Some(DV::Custom(c)) => c,
+            _ => panic!("domain[{i}] expected custom"),
+        };
+        assert_eq!(custom(0).r#type, 3, "full: → Full");
+        assert_eq!(custom(0).value, "example.com");
+        assert_eq!(custom(1).r#type, 2, "domain: → Domain(suffix)");
+        assert_eq!(custom(1).value, "x.example.com");
+        assert_eq!(custom(2).r#type, 1, "regexp: → Regex");
+        assert_eq!(custom(2).value, r"^mail\.example\.com$");
+        assert_eq!(custom(3).r#type, 0, "keyword: → Substr");
+        assert_eq!(custom(3).value, "ads");
+        match rule.domain[4].value.as_ref() {
+            Some(DV::Geosite(g)) => {
+                assert_eq!(g.file, "geosite.dat");
+                assert_eq!(g.code, "CN", "geosite code 转大写");
+            }
+            _ => panic!("domain[4] expected geosite reference"),
+        }
+        assert_eq!(custom(5).r#type, 0, "无前缀 → Substr（Go 默认）");
+        assert_eq!(custom(5).value, "plain.example.com");
+        assert_eq!(custom(6).r#type, 2, "domainSuffix 别名 → Domain");
+        assert_eq!(custom(7).r#type, 0, "domainKeyword 别名 → Substr");
+        assert_eq!(custom(8).r#type, 1, "domainRegex 别名 → Regex");
+
+        // ip：geoip 引用 / CIDR / ext-ip
+        assert_eq!(rule.ip.len(), 3);
+        match rule.ip[0].value.as_ref() {
+            Some(IV::Geoip(g)) => {
+                assert_eq!(g.file, "geoip.dat");
+                assert_eq!(g.code, "PRIVATE");
+                assert!(!g.reverse_match);
+            }
+            _ => panic!("ip[0] expected geoip reference"),
+        }
+        match rule.ip[1].value.as_ref() {
+            Some(IV::Custom(c)) => {
+                let cidr = c.cidr.as_ref().expect("cidr");
+                assert_eq!(cidr.ip, vec![10, 0, 0, 0]);
+                assert_eq!(cidr.prefix, 8);
+                assert!(!c.reverse_match);
+            }
+            _ => panic!("ip[1] expected custom CIDR"),
+        }
+        match rule.ip[2].value.as_ref() {
+            Some(IV::Geoip(g)) => assert_eq!(g.code, "CN", "ext-ip:file:code"),
+            _ => panic!("ip[2] expected ext-ip geoip reference"),
+        }
+
+        // source：`!` 反向 CIDR
+        assert_eq!(rule.source_ip.len(), 1);
+        match rule.source_ip[0].value.as_ref() {
+            Some(IV::Custom(c)) => {
+                assert_eq!(c.cidr.as_ref().expect("cidr").prefix, 16);
+                assert!(c.reverse_match, "! 前缀 → reverse_match");
+            }
+            _ => panic!("source expected custom CIDR"),
+        }
+    }
+
+    /// 解析失败必须硬错（对齐 Go Build 拒启）——旧实现对 geoip:/非法 CIDR
+    /// 静默 continue，屏蔽类安全规则整条蒸发。
+    #[test]
+    fn parse_routing_json_bad_rules_hard_error() {
+        let dir = temp_asset_dir("hard-error");
+        std::fs::write(dir.join("geoip.dat"), make_geoip_dat()).unwrap();
+        std::fs::write(dir.join("geosite.dat"), make_geosite_dat()).unwrap();
+
+        // geoip: code 不存在
+        let err = parse_routing_json_to_proto_in(
+            br#"{"rules":[{"outboundTag":"b","ip":["geoip:nonexistent"]}]}"#,
+            &dir,
+        )
+        .unwrap_err();
+        assert!(matches!(err, WiringError::JsonParse(_)), "{err:?}");
+
+        // 非法 IP 字面（旧实现静默 skip 的形态）
+        let err = parse_routing_json_to_proto_in(
+            br#"{"rules":[{"outboundTag":"b","ip":["300.1.2.3"]}]}"#,
+            &dir,
+        )
+        .unwrap_err();
+        assert!(matches!(err, WiringError::JsonParse(_)), "{err:?}");
+
+        // geosite: code 不存在
+        let err = parse_routing_json_to_proto_in(
+            br#"{"rules":[{"outboundTag":"b","domain":["geosite:nonexistent"]}]}"#,
+            &dir,
+        )
+        .unwrap_err();
+        assert!(matches!(err, WiringError::JsonParse(_)), "{err:?}");
+
+        // geoip.dat 整体缺失 → 拒启（Go：Build 期 load 失败即拒启）
+        let nodat = temp_asset_dir("hard-error-nodat");
+        let err = parse_routing_json_to_proto_in(
+            br#"{"rules":[{"outboundTag":"b","ip":["geoip:private"]}]}"#,
+            &nodat,
+        )
+        .unwrap_err();
+        assert!(matches!(err, WiringError::JsonParse(_)), "{err:?}");
+
+        // 对照：无前缀 domain 与纯 CIDR 不需要 geodata 资产
+        parse_routing_json_to_proto_in(
+            br#"{"rules":[{"outboundTag":"b","domain":["ok.example"],"ip":["1.2.3.4"]}]}"#,
+            &nodat,
+        )
+        .expect("plain rules must not require geodata assets");
     }
 }

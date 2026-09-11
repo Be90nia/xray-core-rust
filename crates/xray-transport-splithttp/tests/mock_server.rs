@@ -108,12 +108,7 @@ async fn dial_packet_up_end_to_end_via_mock_http1_server() {
         ..Default::default()
     });
     let tls_config = make_tls_config();
-    let client = Arc::new(DefaultDialerClient::new(
-        config,
-        tls_config,
-        DialTarget { host: "127.0.0.1".into(), port: server_addr.port(), sni: String::new() },
-        None,
-    ));
+    let client = Arc::new(DefaultDialerClient::new(config, tls_config, DialTarget { host: "127.0.0.1".into(), port: server_addr.port(), sni: String::new() }, None, None));
 
     let base_uri = format!("http://127.0.0.1:{}/", server_addr.port());
     let session_id = "test-session-1".to_string();
@@ -171,12 +166,7 @@ async fn post_packet_returns_bad_status_on_500() {
 
     let config = Arc::new(Config::default());
     let tls_config = make_tls_config();
-    let client = Arc::new(DefaultDialerClient::new(
-        config,
-        tls_config,
-        DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() },
-        None,
-    ));
+    let client = Arc::new(DefaultDialerClient::new(config, tls_config, DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() }, None, None));
     let base_uri = format!("http://127.0.0.1:{}/", addr.port());
 
     let result = client.post_packet(&base_uri, "sess", "0", b"x".to_vec()).await;
@@ -218,12 +208,7 @@ async fn open_stream_get_non_200_yields_eof() {
 
     let config = Arc::new(Config::default());
     let tls_config = make_tls_config();
-    let client = Arc::new(DefaultDialerClient::new(
-        config,
-        tls_config,
-        DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() },
-        None,
-    ));
+    let client = Arc::new(DefaultDialerClient::new(config, tls_config, DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() }, None, None));
     let base_uri = format!("http://127.0.0.1:{}/", addr.port());
 
     // lazy：open_stream 立即返回，非 200 在读端以 EOF 呈现
@@ -322,12 +307,7 @@ async fn fingerprint_btls_end_to_end_http1() {
         path: "/".into(),
         ..Default::default()
     });
-    let client = Arc::new(DefaultDialerClient::new(
-        config,
-        make_tls_config(),
-        DialTarget { host: "127.0.0.1".into(), port, sni: String::new() },
-        Some(Fingerprint::Chrome),
-    ));
+    let client = Arc::new(DefaultDialerClient::new(config, make_tls_config(), DialTarget { host: "127.0.0.1".into(), port, sni: String::new() }, Some(Fingerprint::Chrome), None));
 
     let mut conn = dial_packet_up(
         client,
@@ -357,12 +337,7 @@ async fn fingerprint_btls_end_to_end_http2() {
         path: "/".into(),
         ..Default::default()
     });
-    let client = Arc::new(DefaultDialerClient::new(
-        config,
-        make_tls_config(),
-        DialTarget { host: "127.0.0.1".into(), port, sni: String::new() },
-        Some(Fingerprint::Chrome),
-    ));
+    let client = Arc::new(DefaultDialerClient::new(config, make_tls_config(), DialTarget { host: "127.0.0.1".into(), port, sni: String::new() }, Some(Fingerprint::Chrome), None));
 
     let mut conn = dial_packet_up(
         client,

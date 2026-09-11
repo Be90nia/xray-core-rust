@@ -21,7 +21,10 @@ use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp;
 use smoltcp::socket::udp;
 use smoltcp::time::Instant;
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address};
+use smoltcp::wire::{
+    HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpProtocol, Ipv4Address, Ipv4Packet,
+    Ipv6Address, Ipv6Packet, TcpPacket,
+};
 
 /// smoltcp 协议栈 poll 一次处理的最大 RX 包数。
 const POLL_RX_BUDGET: usize = 64;
@@ -31,6 +34,11 @@ const SOCKET_BUF_SIZE: usize = 64 * 1024;
 
 /// UDP socket metadata 槽位数。
 const UDP_META_SLOTS: usize = 32;
+
+/// 惰性监听表容量上限（SYN 扫描防护）。
+///
+/// # ponytail: 每 slot ~128KB 缓冲，512 上限最坏 ~64MB；出现端口扫描型内存压力再收紧。
+const MAX_PENDING_LISTENS: usize = 512;
 
 /// WireGuard 用的 smoltcp 网络栈。
 ///
@@ -45,8 +53,14 @@ pub struct WgNetStack {
     /// # ponytail: 顺序分配 32768..=60767，绕回前不重用；同远端旧连接仍开着的
     /// 精确 tuple 复用需 28000 并发连接，超出代理场景——瓶颈出现再做空闲端口扫描。
     next_ephemeral: u16,
+    /// SYN 驱动的惰性 listen socket (handle, 监听 tuple)。
+    ///
+    /// smoltcp `listen` 对 port 0 恒报 Unaddressable，无通配监听语义；Go gVisor 用
+    /// `tcp.NewForwarder` 对每个 SYN 走 per-request accept。Rust 等价物：`ingest_rx`
+    /// 嗅探隧道内 TCP SYN，按目标 (addr, port) 惰性建听；accept 后同 tuple 补位
+    /// （[`Self::drain_accepted`]）。不变量：同 tuple 至多一个 pending 监听。
+    listening: Vec<(SocketHandle, IpEndpoint)>,
 }
-
 impl WgNetStack {
     /// 构造网栈。
     ///
@@ -89,11 +103,19 @@ impl WgNetStack {
             // ponytail: SocketSet 用 Vec 作 backing storage，'static bound 由 alloc 满足
             sockets: SocketSet::new(Vec::new()),
             next_ephemeral: 0,
+            listening: Vec::new(),
         }
     }
 
     /// 投递一个解密后的 IP 包到 RX FIFO。driver 在 decapsulate 后调用。
+    ///
+    /// 先嗅探 TCP SYN：smoltcp 没有通配监听（listen 对 port 0 恒报 Unaddressable），
+    /// 必须在包入栈前按目标 tuple 建好精确监听，poll 时 SYN 才有归宿——
+    /// 对应 Go `tcp.NewForwarder` 的 per-request accept（tun.go:56）。
     pub fn ingest_rx(&mut self, pkt: Vec<u8>) {
+        if let Some((addr, port)) = sniff_tcp_syn(&pkt) {
+            self.ensure_listen(IpEndpoint { addr, port });
+        }
         self.device.rx_queue.push_back(pkt);
     }
 
@@ -177,36 +199,67 @@ impl WgNetStack {
         let socket = self.sockets.get_mut::<tcp::Socket<'static>>(handle);
         socket.connect(self.iface.context(), (remote, port), local)
     }
-    /// TCP 监听（server side）。对应 Go `tcp.NewForwarder` 的 listen 语义。
+
+    /// 惰性建立精确 tuple 的 TCP 监听（幂等）。
     ///
-    /// 把 socket 置为 Listen 状态，接受任意源地址的连接。
-    /// 后续用 [`Self::check_tcp_accept`] 检查是否有新连接进入。
-    pub fn tcp_listen(&mut self, handle: SocketHandle, port: u16) -> Result<(), crate::error::WgError> {
-        let socket = self.sockets.get_mut::<tcp::Socket<'static>>(handle);
-        socket
-            .listen(port)
-            .map_err(|e| crate::error::WgError::NetStack(format!("tcp listen: {e:?}")))
+    /// 目标端口为 0、同 tuple 已有 pending 监听、目标地址不属于本接口、或监听表
+    /// 已达 [`MAX_PENDING_LISTENS`] 上限时跳过（SYN 由客户端重传兜底）。
+    fn ensure_listen(&mut self, local: IpEndpoint) {
+        if local.port == 0
+            || self.listening.iter().any(|(_, ep)| *ep == local)
+            || !self.iface.has_ip_addr(local.addr)
+            || self.listening.len() >= MAX_PENDING_LISTENS
+        {
+            return;
+        }
+        self.open_listen(local);
     }
 
-    /// 检测 TCP socket 是否有新连接已 accept（状态从 Listen 转为 Established）。
-    ///
-    /// 与 [`TunNetStack::check_tcp_accept`](xray_proxy_tun::netstack::TunNetStack::check_tcp_accept)
-    /// 语义相同：上层创建 Listen socket，poll 后检测 Established。
-    #[must_use]
-    pub fn check_tcp_accept(&mut self, handle: SocketHandle) -> Option<TcpAcceptEvent> {
-        let socket = self.sockets.get_mut::<tcp::Socket<'static>>(handle);
-        match socket.state() {
-            tcp::State::Established => {
-                let local = socket.local_endpoint();
-                let remote = socket.remote_endpoint()?;
-                Some(TcpAcceptEvent {
-                    handle,
-                    local,
-                    remote,
-                })
+    /// 创建并注册一个 listen socket；失败即回收 socket。
+    fn open_listen(&mut self, local: IpEndpoint) {
+        let handle = self.add_tcp_socket();
+        let result = self.with_tcp_socket(handle, |s| {
+            s.listen(local)
+                .map_err(|e| crate::error::WgError::NetStack(format!("tcp listen {local}: {e:?}")))
+        });
+        match result {
+            Ok(()) => self.listening.push((handle, local)),
+            Err(e) => {
+                tracing::warn!(error = %e, "wg lazy tcp listen failed");
+                self.remove_socket(handle);
             }
-            _ => None,
         }
+    }
+
+    /// 取出全部已 accept（监听 → Established）的连接，并为同 tuple 立即补位新监听。
+    ///
+    /// accept loop 每 tick 调用一次。补位让下一条到同端口的连接无需等 SYN 重传。
+    #[must_use]
+    pub fn drain_accepted(&mut self) -> Vec<TcpAcceptEvent> {
+        let mut events = Vec::new();
+        let mut i = 0;
+        while i < self.listening.len() {
+            let (handle, local) = self.listening[i];
+            let socket = self.sockets.get_mut::<tcp::Socket<'static>>(handle);
+            if socket.state() != tcp::State::Established {
+                i += 1;
+                continue;
+            }
+            let remote = socket.remote_endpoint();
+            // 该 socket 已转为连接 socket，从监听表移除
+            self.listening.swap_remove(i);
+            match remote {
+                Some(remote) => events.push(TcpAcceptEvent {
+                    handle,
+                    local: Some(local),
+                    remote,
+                }),
+                // Established 却无对端 tuple 理论不可达；防御性回收
+                None => self.remove_socket(handle),
+            }
+            self.open_listen(local);
+        }
+        events
     }
 
     /// smoltcp Interface 借用（高级用法——路由表修改等）。
@@ -216,12 +269,41 @@ impl WgNetStack {
     }
 }
 
+/// 从解密后的 IP 包嗅探 TCP SYN（不含 ACK），返回目标 (addr, port)。
+///
+/// 只认 v4/v6 定长头 + TCP 定长头；非首分片与带扩展头的包直接跳过
+/// （smoltcp 本身不重组分片，这类包无论如何进不了 TCP 层）。
+fn sniff_tcp_syn(pkt: &[u8]) -> Option<(IpAddress, u16)> {
+    let (dst_addr, payload) = match pkt.first()? >> 4 {
+        4 => {
+            let v4 = Ipv4Packet::new_checked(pkt).ok()?;
+            if v4.more_frags() || v4.frag_offset() != 0 || v4.next_header() != IpProtocol::Tcp {
+                return None;
+            }
+            (IpAddress::Ipv4(v4.dst_addr()), v4.payload())
+        }
+        6 => {
+            let v6 = Ipv6Packet::new_checked(pkt).ok()?;
+            if v6.next_header() != IpProtocol::Tcp {
+                return None;
+            }
+            (IpAddress::Ipv6(v6.dst_addr()), v6.payload())
+        }
+        _ => return None,
+    };
+    let tcp = TcpPacket::new_checked(payload).ok()?;
+    if !tcp.syn() || tcp.ack() {
+        return None;
+    }
+    Some((dst_addr, tcp.dst_port()))
+}
+
 // ===== 事件检测：poll 后检查 socket 状态变化 =====
 
 /// TCP socket 的状态事件（poll 后检测）。
 ///
-/// 与 `xray_proxy_tun::netstack::TcpAcceptEvent` 语义相同——
-/// smoltcp 在 Listen socket 的 SYN-RCVD → ESTABLISHED 转换时完成 accept。
+/// 由 SYN 驱动的惰性监听在 SYN-RCVD → ESTABLISHED 转换时产生，
+/// [`WgNetStack::drain_accepted`] 批量取出。与 tun crate 的同名事件语义相同。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpAcceptEvent {
     /// 已接受的 socket handle。
@@ -353,6 +435,52 @@ pub fn to_smoltcp_v6(addr: std::net::Ipv6Addr) -> Ipv6Address {
     Ipv6Address::from_octets(addr.octets())
 }
 
+/// 隧道内 IP/TCP 测试包构造。
+///
+/// RX 侧不校验 checksum（VirtualDevice capabilities 仅 Tx），测试包可零校验和。
+#[cfg(test)]
+pub(crate) mod test_packets {
+    use smoltcp::wire::{Ipv4Packet, TcpPacket};
+
+    pub const TCP_SYN: u8 = 0x02;
+    pub const TCP_ACK: u8 = 0x10;
+
+    /// 构造 IPv4 + TCP 定长头包（无 payload）。
+    pub fn make_tcp_packet(
+        src: ([u8; 4], u16),
+        dst: ([u8; 4], u16),
+        flags: u8,
+        seq: u32,
+        ack: u32,
+    ) -> Vec<u8> {
+        let mut pkt = vec![0u8; 40];
+        pkt[0] = 0x45; // version=4, IHL=5
+        pkt[2..4].copy_from_slice(&40u16.to_be_bytes()); // total length
+        pkt[8] = 64; // TTL
+        pkt[9] = 6; // protocol = TCP
+        pkt[12..16].copy_from_slice(&src.0);
+        pkt[16..20].copy_from_slice(&dst.0);
+        pkt[20..22].copy_from_slice(&src.1.to_be_bytes());
+        pkt[22..24].copy_from_slice(&dst.1.to_be_bytes());
+        pkt[24..28].copy_from_slice(&seq.to_be_bytes());
+        pkt[28..32].copy_from_slice(&ack.to_be_bytes());
+        pkt[32] = 0x50; // data offset = 5 words
+        pkt[33] = flags;
+        pkt[34..36].copy_from_slice(&65535u16.to_be_bytes());
+        pkt
+    }
+
+    /// 提取 IPv4+TCP 包的 seq（SYN-ACK ISN 用）；非 TCP 包返回 None。
+    pub fn tcp_seq_number(pkt: &[u8]) -> Option<u32> {
+        let v4 = Ipv4Packet::new_checked(pkt).ok()?;
+        if v4.next_header() != smoltcp::wire::IpProtocol::Tcp {
+            return None;
+        }
+        let tcp = TcpPacket::new_checked(v4.payload()).ok()?;
+        Some(tcp.seq_number().0 as u32)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,5 +556,91 @@ mod tests {
         pkt[16..20].copy_from_slice(&[10, 0, 0, 2]); // dst
         pkt[20] = 8; // ICMP type = Echo Request
         pkt
+    }
+
+    // ===== SYN 驱动惰性监听（inbound TCP 修复核心）=====
+
+    /// listen(0) 恒被 smoltcp 拒绝（Unaddressable）——旧 accept loop 启动即
+    /// listen(0)，失败后 warn-continue 等价于 inbound TCP 永久关闭。
+    /// 此断言钉死根因，防止任何路径再把 port 0 当通配监听用。
+    #[test]
+    fn listen_zero_port_is_rejected_by_smoltcp() {
+        let mut stack = make_stack();
+        let h = stack.add_tcp_socket();
+        let err = stack
+            .with_tcp_socket(h, |s| s.listen(0u16).map(|_| ()).err())
+            .expect("listen(0) must be rejected");
+        assert!(matches!(err, tcp::ListenError::Unaddressable));
+    }
+
+    /// SYN 入栈即按目标 tuple 惰性建听；完成三次握手后 drain 出 accept 事件，
+    /// 同 tuple 补位监听就位。
+    #[test]
+    fn syn_creates_lazy_listen_and_completes_handshake() {
+        use crate::netstack::test_packets::{make_tcp_packet, tcp_seq_number, TCP_ACK, TCP_SYN};
+
+        let mut stack = make_stack(); // 本端 10.0.0.2/32
+        stack.ingest_rx(make_tcp_packet(
+            ([10, 0, 0, 1], 5555),
+            ([10, 0, 0, 2], 443),
+            TCP_SYN,
+            1000,
+            0,
+        ));
+        stack.poll(Instant::now());
+
+        // 监听在 SYN 入栈前建好 → SYN 有归宿，SYN-ACK 已生成
+        let server_seq = stack
+            .drain_tx()
+            .iter()
+            .find_map(|p| tcp_seq_number(p))
+            .expect("SYN-ACK with seq");
+
+        stack.ingest_rx(make_tcp_packet(
+            ([10, 0, 0, 1], 5555),
+            ([10, 0, 0, 2], 443),
+            TCP_ACK,
+            1001,
+            server_seq + 1,
+        ));
+        stack.poll(Instant::now());
+
+        let events = stack.drain_accepted();
+        assert_eq!(events.len(), 1, "exactly one accepted connection");
+        let local = events[0].local.expect("local endpoint");
+        assert_eq!(local.port, 443);
+        assert_eq!(local.addr, IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 2)));
+        assert_eq!(events[0].remote.port, 5555);
+        assert_eq!(stack.listening.len(), 1, "同 tuple 补位监听已就位");
+    }
+
+    /// 同 tuple 的 SYN 重传不产生重复监听（幂等）。
+    #[test]
+    fn syn_retransmit_creates_single_listen() {
+        use crate::netstack::test_packets::{make_tcp_packet, TCP_SYN};
+
+        let mut stack = make_stack();
+        let syn = make_tcp_packet(([10, 0, 0, 1], 5555), ([10, 0, 0, 2], 443), TCP_SYN, 1000, 0);
+        stack.ingest_rx(syn.clone());
+        stack.ingest_rx(syn);
+        assert_eq!(stack.listening.len(), 1, "retransmitted SYN must not duplicate listen");
+    }
+
+    /// 非 SYN 的 TCP 包不建监听。
+    #[test]
+    fn non_syn_tcp_creates_no_listen() {
+        use crate::netstack::test_packets::{make_tcp_packet, TCP_ACK};
+
+        let mut stack = make_stack();
+        stack.ingest_rx(make_tcp_packet(
+            ([10, 0, 0, 1], 5555),
+            ([10, 0, 0, 2], 443),
+            TCP_ACK,
+            1001,
+            1000,
+        ));
+        stack.poll(Instant::now());
+        assert!(stack.listening.is_empty());
+        assert!(stack.drain_accepted().is_empty());
     }
 }

@@ -8,13 +8,15 @@
 //! 支持命令分派：
 //! - TCP：核心路径（Vision 包装 + dispatch）
 //! - UDP：长度前缀包 ↔ UdpDispatchSession 桥接（XUDP 帧约定）
-//! - Mux：识别首字节 0xFF，启用 feature 时转交 mux server（具体协议由 `xray-mux` 接管）
+//! - Mux：按请求目的地原样 dispatch（`v1.mux.cool`），mux carrier 拦截在生产
+//!   dispatcher 装饰器（Go proxyman always.go 语义，见 xray-core wiring）
 //! - Rvs：Portal 反向代理，启用 feature 时查 reverse_registry 派发
 //!
 //! 对应 Go 语义：
 //! - TCP：`inbound.go::Process` → `dispatch.DispatchLink(ctx, dest, link)`
 //! - UDP：同上，dest.Network = UDP + link 包 LengthPacketReader/Writer 包装
-//! - Mux：`inbound.go:180 isMuxAndNotXUDP` + `dispatch.DispatchLink`（mux server 作为 outbound）
+//! - Mux：`inbound.go:633 dispatch.DispatchLink(request.Destination())`（按目的地
+//!   原样 dispatch；carrier 拦截在 dispatcher 装饰器，对应 Go mux.Server）
 //! - Rvs：`inbound.go:625-630` → `Reverse.NewMux`（本批次仅注册表查找 + 转发，完整 worker 在其他 issue）
 
 use std::sync::Arc;
@@ -34,10 +36,7 @@ use crate::encoding::{empty_addons, VERSION};
 use crate::encryption::vision_conn::VisionConn;
 use crate::validator::Validator;
 /// VLESS inbound 协议族接入选项（feature flags）。
-
 /// 对应 Go `proxy/vless/inbound/inbound.go::Handler` 的可选特性：
-/// - `enable_mux`：是否由本 inbound 接管 `command=Mux` 的多路复用流量（首字节
-///   `0xFF` 即 VLESS Mux framing）。`false` 时维持 warn+close。
 /// - `enable_reverse`：是否由本 inbound 接管 `command=Rvs`（Portal 反向代理）。
 ///   `false` 时维持 warn+close。
 /// - `reverse_registry`：启用 Reverse 时必填；Portal 注册表（domain → PortalConfig）。
@@ -45,8 +44,6 @@ use crate::validator::Validator;
 /// 默认全 false（`Default::default()`），与既有行为一致（warn 跳过非 TCP 命令）。
 #[derive(Clone, Default)]
 pub struct VlessInboundOptions {
-    /// 启用 Mux 协议识别（仅识别首字节 0xFF；完整 mux server 协议不在本批次范围）。
-    pub enable_mux: bool,
     /// 启用 Reverse 协议接入（需要 `reverse_registry` + `reverse_ohm` 配合：
     /// inbound 经 `reverse_registry` 查 `PortalConfig.tag`，再由 `reverse_ohm`
     /// 解析到 `PortalOutbound` handler 派发；Go `inbound.go:625-630` 的 `GetReverse`+
@@ -96,7 +93,6 @@ pub async fn serve_vless(
 
     tracing::info!(
         addr = %listener.local_addr()?,
-        mux = options.as_ref().map(|o| o.enable_mux).unwrap_or(false),
         reverse = options.as_ref().map(|o| o.enable_reverse).unwrap_or(false),
         "vless inbound listening"
     );
@@ -155,10 +151,6 @@ pub async fn serve_vless(
     }
 }
 
-/// Mux framing 协议首字节（VLESS mux server 在 mux 帧首字节用 `0xFF` 标识）。
-///
-/// 对应 Go `common/mux` 包首字节判别。
-const MUX_FRAME_FIRST_BYTE: u8 = 0xFF;
 
 /// 前缀已读字节的 reader：先吐 `initial`，再透传内层流（与 tuic inbound 同模式）。
 struct InitialedReader<R> {
@@ -390,7 +382,8 @@ fn vision_uuid_bytes(
 ///
 /// - TCP：响应头 → vision 包装（可选） → split → dispatch
 /// - UDP：响应头 → [`handle_udp_relay`] 长度前缀包循环 → UdpDispatchSession 桥接
-/// - Mux：响应头 → [`handle_mux_relay`] 检测首字节 0xFF（其余 warn+close）
+/// - Mux：响应头 → [`handle_mux_relay`] 按请求目的地 dispatch（mux carrier
+///   拦截在 dispatcher 装饰器）
 /// - Rvs：响应头 → [`handle_reverse_relay`] 反向代理派发
 async fn finish_vless_dispatch<R, W>(
     reader: R,
@@ -421,7 +414,7 @@ where
             handle_udp_relay(reader, write_half, &decoded, handler).await
         }
         VlessCommand::Mux => {
-            handle_mux_relay(reader, write_half, &decoded, handler, options.as_ref(), &access).await
+            handle_mux_relay(reader, write_half, &decoded, handler, &access).await
         }
         VlessCommand::Rvs => {
             handle_reverse_relay(reader, write_half, &decoded, handler, options.as_ref()).await
@@ -532,60 +525,32 @@ where
     }
 }
 
-/// Mux 命令 relay：识别首字节 0xFF 后转交 dispatcher。
+/// Mux 命令 relay：按请求目的地原样 dispatch（Go `inbound.go:633`）。
 ///
-/// 对应 Go `vless/inbound/inbound.go::isMuxAndNotXUDP` + `dispatch.DispatchLink`。
-/// 本批次非目标：完整 mux server 协议（由 `xray-mux` 接管）。当前实现仅识别
-/// 首字节 `0xFF`，命中则 dispatch 到 mux server 出口（路由须配置 mux 出站）；
-/// 未命中则维持原 warn+close 行为。
+/// 对应 Go `vless/inbound/inbound.go`：Mux command 与 TCP 同构地
+/// `dispatch.DispatchLink(request.Destination(), link)`，目的地固定为
+/// `v1.mux.cool`（decode 时由 `VlessCommand::fixed_domain` 补齐，port 恒
+/// None → 0）。Go 不做任何帧字节探测、无 enable 开关——carrier 拦截按
+/// destination 地址在生产 dispatcher 装饰器完成（Go proxyman always.go:89
+/// `mux: mux.NewServer(ctx)`；Rust 对应 xray-core wiring 的 `MuxCarrierHandler`）。
 async fn handle_mux_relay<R, W>(
-    mut reader: R,
+    reader: R,
     writer: W,
     decoded: &crate::encoding::server::DecodedRequest,
     handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,
-    options: Option<&VlessInboundOptions>,
     access: &xray_app_dispatcher::AccessContext,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    use tokio::io::AsyncReadExt;
-
-    // feature flag 未启用：维持 warn+close
-    let enabled = options.map(|o| o.enable_mux).unwrap_or(false);
-    if !enabled {
-        tracing::warn!(
-            command = ?decoded.command,
-            "vless Mux command received but enable_mux=false, closing"
-        );
-        return Ok(());
-    }
-
-    // 探测首字节：peek 1 byte 不消费（Mux framing 首字节为 0xFF）
-    let mut probe = [0u8; 1];
-    let n = reader.read(&mut probe).await?;
-    if n == 0 {
-        return Ok(()); // 客户端未发数据
-    }
-    if probe[0] != MUX_FRAME_FIRST_BYTE {
-        tracing::warn!(
-            first_byte = probe[0],
-            "vless Mux command but first byte != 0xFF, not a mux frame"
-        );
-        return Ok(());
-    }
-
-    // 命中 mux framing：回灌首字节 → 构造 mux link → dispatch
-    let reader = InitialedReader::new(probe.to_vec(), reader);
+    let address = decoded
+        .address
+        .clone()
+        .ok_or_else(|| std::io::Error::other("vless decode: missing address for Mux command"))?;
+    let dest = Destination::new(address, Port::new(decoded.port.unwrap_or(0)), Network::TCP);
     let stream = tokio::io::join(reader, writer);
     let (rh, wh) = tokio::io::split(stream);
-    // mux 命令的 destination 固定为 `v1.mux.cool`，由 mux server 解析真实子流目标
-    let dest = Destination::new(
-        xray_common::net::address::Address::Domain("v1.mux.cool".to_string()),
-        Port::new(0),
-        Network::TCP,
-    );
     let link = Link::new(new_reader(rh), new_writer(wh));
     let _ = handler.dispatch_with_access(&dest, link, access.clone()).await;
     Ok(())
@@ -1347,78 +1312,75 @@ mod tests {
         assert_eq!(n, 0, "connection should be closed after handshake timeout");
     }
 
-    /// VLESS Mux command + enable_mux=true + 首字节 0xFF：dispatch 应被调用一次，
-    /// dest 固定为 v1.mux.cool。
-    #[tokio::test]
-    async fn vless_inbound_mux_first_byte_ff_dispatches() {
-        let capture = std::sync::Arc::new(CaptureDispatchHandler::new());
-        let called = std::sync::Arc::clone(&capture.called);
-        let dest_seen = std::sync::Arc::clone(&capture.dest_seen);
-        let capture_for_ohm: Arc<dyn xray_app_dispatcher::DispatchHandler> = capture.clone();
-        let ohm = Arc::new(SimpleOhm::new());
-        ohm.set_default(capture_for_ohm);
-
-        let (uuid, validator) = make_validator_with_user();
-        let vless_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let vless_addr = vless_listener.local_addr().unwrap();
-        let ohm_clone = Arc::clone(&ohm);
-        let validator_clone = Arc::clone(&validator);
-        let opts = VlessInboundOptions {
-            enable_mux: true,
-            enable_reverse: false,
-            reverse_registry: None,
-            reverse_ohm: None,
-            decryption: None,
-        };
-        tokio::spawn(async move {
-            let _ = serve_vless(
-                vless_listener, ohm_clone, validator_clone, None, None, Some(opts),
-            )
-            .await;
-        });
-
-        // client：Mux command → 响应头 → 0xFF 探测字节
-        let mut client = tokio::net::TcpStream::connect(vless_addr).await.unwrap();
-        let addons = empty_addons();
-        encode_request_header(
-            &mut client,
-            VERSION,
-            &uuid,
-            VlessCommand::Mux,
-            None,
-            None,
-            &addons,
-        )
-        .await
-        .unwrap();
-        let _resp = decode_response_header(&mut client, VERSION).await.unwrap();
-        client.write_all(&[MUX_FRAME_FIRST_BYTE]).await.unwrap();
-        client.write_all(b"\x00\x00\x00\x00\x00\x00").await.unwrap(); // mux 帧剩余字节
-
-        // 等 dispatch 触发（带 timeout 防止挂住）
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            for _ in 0..30 {
-                if *called.lock() > 0 {
-                    return;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .expect("dispatch should be called within 3s");
-
-        assert_eq!(*called.lock(), 1, "Mux 0xFF should trigger exactly one dispatch");
-        let dest = dest_seen.lock().clone().expect("dest should be captured");
-        let addr = dest.address().as_domain().expect("mux dest should be domain");
-        assert_eq!(addr, "v1.mux.cool", "Mux dest should be v1.mux.cool");
+    /// 捕获 Mux dispatch 的 FrameCapture：dest + 透传字节。
+    #[derive(Debug)]
+    struct FrameCapture {
+        called: std::sync::Arc<parking_lot::Mutex<u32>>,
+        dest_seen:
+            std::sync::Arc<parking_lot::Mutex<Option<xray_common::net::destination::Destination>>>,
+        payload: std::sync::Arc<parking_lot::Mutex<Vec<u8>>>,
     }
 
-    /// VLESS Mux command + enable_mux=true + 首字节 ≠ 0xFF：dispatch 不应被调用。
+    impl FrameCapture {
+        fn new() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                called: std::sync::Arc::new(parking_lot::Mutex::new(0)),
+                dest_seen: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+                payload: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            })
+        }
+    }
+
+    impl xray_app_dispatcher::DispatchHandler for FrameCapture {
+        fn tag(&self) -> &str {
+            "mux-capture"
+        }
+        fn dispatch(
+            &self,
+            dest: &xray_common::net::destination::Destination,
+            link: xray_transport::link::Link,
+        ) -> xray_app_dispatcher::default::PinFuture<()> {
+            let called = std::sync::Arc::clone(&self.called);
+            let dest_seen = std::sync::Arc::clone(&self.dest_seen);
+            let payload = std::sync::Arc::clone(&self.payload);
+            let dest = dest.clone();
+            Box::pin(async move {
+                *called.lock() += 1;
+                *dest_seen.lock() = Some(dest);
+                let mut reader = link.reader;
+                // read_multi_buffer 为非阻塞语义（Go buf.ReadMultiBuffer 同款）：
+                // 数据未到时返回空 MultiBuffer，轮询直到首帧到达。
+                let bytes = loop {
+                    match reader.read_multi_buffer().await {
+                        Ok(mb) => {
+                            let bytes = mb.to_vec();
+                            if !bytes.is_empty() {
+                                break bytes;
+                            }
+                        }
+                        Err(_) => break Vec::new(),
+                    }
+                };
+                *payload.lock() = bytes;
+            })
+        }
+    }
+
+    /// VLESS Mux command 载真实 mux New 帧（bd raw0）：dispatch 按请求目的地
+    /// 触发（v1.mux.cool，Mux command 的 port 恒 None → 0），帧字节原样透传。
+    ///
+    /// New 帧线格式（xray-mux frame.rs）：2B len(BE) + 2B session + 1B status
+    /// （New=0x01）+ 1B option + 1B network（TCP=0x01）+ 2B port(BE) + 1B addr
+    /// len + addr。首字节 = metalen 高位（0x00，合法帧 metalen≤512）——旧实现
+    /// 臆造 0xFF 首字节判别，真实 mux client 的 carrier 在此必被拒。
     #[tokio::test]
-    async fn vless_inbound_mux_first_byte_not_ff_skips() {
-        let capture = std::sync::Arc::new(CaptureDispatchHandler::new());
+    async fn vless_inbound_mux_command_dispatches_real_new_frame() {
+        let capture = FrameCapture::new();
         let called = std::sync::Arc::clone(&capture.called);
-        let capture_for_ohm: Arc<dyn xray_app_dispatcher::DispatchHandler> = capture.clone();
+        let dest_seen = std::sync::Arc::clone(&capture.dest_seen);
+        let payload = std::sync::Arc::clone(&capture.payload);
+        let capture_for_ohm: Arc<dyn xray_app_dispatcher::DispatchHandler> =
+            capture.clone();
         let ohm = Arc::new(SimpleOhm::new());
         ohm.set_default(capture_for_ohm);
 
@@ -1427,20 +1389,26 @@ mod tests {
         let vless_addr = vless_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
-        let opts = VlessInboundOptions {
-            enable_mux: true,
-            enable_reverse: false,
-            reverse_registry: None,
-            reverse_ohm: None,
-            decryption: None,
-        };
         tokio::spawn(async move {
             let _ = serve_vless(
-                vless_listener, ohm_clone, validator_clone, None, None, Some(opts),
+                vless_listener, ohm_clone, validator_clone, None, None, None,
             )
             .await;
         });
 
+        // 真实 mux New 帧：new session 1 → TCP 127.0.0.1:8080
+        let new_frame: &[u8] = &[
+            0x00, 0x0C, // metalen = 12
+            0x00, 0x01, // session = 1
+            0x01, // status = New
+            0x00, // option = 0
+            0x01, // network = TCP
+            0x1F, 0x90, // port = 8080
+            0x04, // addr type = IPv4
+            127, 0, 0, 1,
+        ];
+
+        // client：Mux command（无 addr/port，decode 补 v1.mux.cool）→ 响应头 → New 帧
         let mut client = tokio::net::TcpStream::connect(vless_addr).await.unwrap();
         encode_request_header(
             &mut client, VERSION, &uuid, VlessCommand::Mux, None, None, &empty_addons(),
@@ -1448,15 +1416,32 @@ mod tests {
         .await
         .unwrap();
         let _resp = decode_response_header(&mut client, VERSION).await.unwrap();
-        client.write_all(&[0x42]).await.unwrap(); // 不是 0xFF
-        client.write_all(b"junk").await.unwrap();
+        client.write_all(new_frame).await.unwrap();
 
-        // 等 1s 确保 dispatch 不会被触发
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // called 在 payload 读取前置位；等帧字节落盘再断言（防竞态）。
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if !payload.lock().is_empty() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("frame bytes should arrive within 3s");
+
+        assert_eq!(*called.lock(), 1, "Mux command must dispatch exactly once");
+        let dest = dest_seen.lock().clone().expect("dest should be captured");
         assert_eq!(
-            *called.lock(),
-            0,
-            "Mux with first byte != 0xFF should NOT trigger dispatch"
+            dest.address().as_domain(),
+            Some("v1.mux.cool"),
+            "Mux dest should be v1.mux.cool"
+        );
+        assert_eq!(dest.port().value(), 0, "Mux command carries no port");
+        assert_eq!(
+            &*payload.lock(),
+            new_frame,
+            "New frame bytes must pass through verbatim"
         );
     }
 
@@ -1476,7 +1461,6 @@ mod tests {
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
         let opts = VlessInboundOptions {
-            enable_mux: false,
             enable_reverse: false,
             reverse_registry: None,
             reverse_ohm: None,
@@ -1535,7 +1519,6 @@ mod tests {
             .unwrap();
 
         let opts = VlessInboundOptions {
-            enable_mux: false,
             enable_reverse: true,
             reverse_registry: Some(Arc::clone(&registry)),
             reverse_ohm: Some(Arc::clone(&ohm_clone)),

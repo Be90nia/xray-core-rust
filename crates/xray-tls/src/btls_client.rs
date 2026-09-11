@@ -23,14 +23,17 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use btls::ssl::{KeyShare, SslConnector, SslMethod};
+use btls::ssl::{KeyShare, SslConnector, SslMethod, SslRef};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_btls::SslStream as TokioSslStream;
 use tracing::debug;
 use xray_transport::connection::Connection;
 
+use rustls::client::danger::ServerCertVerifier;
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use crate::fingerprint::Fingerprint;
 
 // ============================================================
@@ -1044,16 +1047,20 @@ pub struct BtlsConn<S> {
 impl<S: Connection + Unpin> BtlsConn<S> {
     /// 创建 btls uTLS 连接（完成握手）。
     ///
-    /// 步骤：构建 connector → 配置指纹 + ECH → 创建 SslStream → 异步握手。
-    ///
-    /// `ech_config_list`（`tlsSettings.echConfigList` 原文）非空时在握手前
-    /// `SSL_set1_ech_config_list`（对应 Go `ApplyECH` client 分支；resolve
-    /// 失败自动降级 invalid config 使握手失败，不静默明文）。
+    /// # 参数
+    /// - `verifier`：rustls 服务端证书验证器。`Some(v)` 时握手成功后对 btls
+    ///   拿到的 peer 证书链做**回接验证**（链 + 主机名，对齐 Go uTLS 非
+    ///   `InsecureSkipVerify` 时的完整验证，tls.go `copyConfig`）；`None` =
+    ///   跳过（`allowInsecure=true` 等价）。`allowInsecure`/pinned/vcn 语义由
+    ///   调用方传入的 verifier 编码（`build_client_config` 产物直接取
+    ///   `ClientConfig.verifier`）。REALITY 路径（`from_parts`）自管 HMAC，
+    ///   不经此参数。
     pub async fn connect(
         stream: S,
         server_name: &str,
         fingerprint: Fingerprint,
         ech_config_list: Option<&str>,
+        verifier: Option<Arc<dyn ServerCertVerifier>>,
     ) -> io::Result<Self> {
         use crate::ech::ApplyEch;
 
@@ -1097,7 +1104,6 @@ impl<S: Connection + Unpin> BtlsConn<S> {
             ech = ech_config_list.is_some(),
             "btls uTLS 握手开始"
         );
-
         let tls_stream = TokioSslStream::new(ssl, stream)
             .map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -1105,6 +1111,12 @@ impl<S: Connection + Unpin> BtlsConn<S> {
         let mut pinned = Box::pin(tls_stream);
         pinned.as_mut().connect().await
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e.to_string()))?;
+
+        // 回接验证：btls 全程 set_verify(NONE)（保 ClientHello 指纹不被
+        // 验证回调影响），握手成功后用 rustls verifier 验 peer 链。
+        if let Some(v) = verifier.as_deref() {
+            verify_peer_certs(pinned.ssl(), server_name, v)?;
+        }
 
         debug!(
             target: "xray_tls::btls",
@@ -1119,7 +1131,6 @@ impl<S: Connection + Unpin> BtlsConn<S> {
             server_name: server_name.to_string(),
         })
     }
-
     /// 从已握手 stream 组装（[`crate::btls_reality::connect_reality`] 用）。
     pub(crate) fn from_parts(
         stream: Pin<Box<TokioSslStream<S>>>,
@@ -1128,6 +1139,39 @@ impl<S: Connection + Unpin> BtlsConn<S> {
     ) -> Self {
         Self { stream, fingerprint, server_name: server_name.to_string() }
     }
+}
+
+/// btls 握手后证书回接验证：peer 链转 DER 喂给 rustls `ServerCertVerifier`。
+///
+/// 客户端侧 `peer_cert_chain()` 含叶子（btls 文档注），布局与 rustls
+/// `verify_server_cert(end_entity, intermediates)` 一致。
+fn verify_peer_certs(
+    ssl: &SslRef,
+    server_name: &str,
+    verifier: &dyn ServerCertVerifier,
+) -> io::Result<()> {
+    let chain = ssl
+        .peer_cert_chain()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "btls: server sent no certificate"))?;
+    let mut ders: Vec<CertificateDer<'static>> = Vec::with_capacity(chain.len());
+    for cert in chain.iter() {
+        let der = cert.to_der().map_err(|e| io::Error::other(e.to_string()))?;
+        ders.push(CertificateDer::from(der));
+    }
+    let Some((end_entity, intermediates)) = ders.split_first() else {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "btls: empty peer certificate chain"));
+    };
+    let name: ServerName<'static> = ServerName::try_from(server_name.to_string())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid server name: {e}")))?;
+    verifier
+        .verify_server_cert(end_entity, intermediates, &name, &[], UnixTime::now())
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("btls certificate verification failed for {server_name}: {e}"),
+            )
+        })
+        .map(|_| ())
 }
 
 /// 指纹是否被 btls 支持（REALITY u_client 路径选择的预检）。

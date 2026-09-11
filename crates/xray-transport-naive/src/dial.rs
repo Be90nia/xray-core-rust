@@ -60,10 +60,21 @@ pub async fn dial_naive(
     let tcp = dial_system(&server_dest, &SocketOptions::default())
         .await
         .map_err(|e| format!("naive tcp dial {}: {e}", config.host))?;
-    let tls = BtlsConn::connect(tcp, &config.sni, config.fingerprint.clone(), None)
-        .await
-        .map_err(|e| format!("naive tls handshake (sni={}): {e}", config.sni))?;
-
+    // 回接证书验证（Xray-core-rust-pz6c）：naive 连接真实公网站点，默认完整
+    // 链+主机名验证（webpki-roots，对应 naiveproxy/Go 标准行为）；naive 的
+    // 鉴权在 Proxy-Authorization，不构成跳过 TLS 验证的理由。
+    let tls = BtlsConn::connect(
+        tcp,
+        &config.sni,
+        config.fingerprint.clone(),
+        None, // ECH（naive 不用）
+        // 回接证书验证（pz6c）：webpki-roots 全验证，allowInsecure 无入口
+        Some(xray_tls::client_config::build_server_cert_verifier(None)
+            .map_err(|e| format!("build verifier: {e}"))?
+            .expect("default config yields a verifier")),
+    )
+    .await
+    .map_err(|e| format!("naive tls handshake (sni={}): {e}", config.sni))?;
     let (mut sender, conn) = http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
         .await
         .map_err(|e| format!("naive h2 handshake: {e}"))?;

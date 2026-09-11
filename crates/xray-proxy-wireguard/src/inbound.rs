@@ -11,7 +11,7 @@
 //! ## TCP 连接流
 //!
 //! driver task 驱动 WG 协议 + netstack poll；accept loop（与 driver 同 task，
-//! `select!` 并发）创建 Listen socket → poll 后检查 Established → 通知 dispatcher。
+//! `select!` 并发）poll 后 drain 已 Established 的惰性监听连接 → 通知 dispatcher。
 //! 对应 Go `tcp.NewForwarder(r.CreateEndpoint() → handler.HandleConnection)`。
 //! 中继模式与 `xray-proxy-tun/src/inbound.rs::TunTcpRelay` 一致。
 
@@ -233,28 +233,17 @@ fn parse_local_cidrs(config: &DeviceConfig) -> Result<Vec<smoltcp::wire::IpCidr>
         .collect()
 }
 
-/// accept loop——周期性检查 TCP listen socket 是否有新连接，dispatch 到 outbound。
+/// accept loop——周期性 poll 网栈并 drain 已建立的惰性监听连接，dispatch 到 outbound。
 ///
-/// 与 `xray-proxy-tun/src/inbound.rs::tun_driver_loop` 中 handle_socket_events 部分
-/// 对称：创建 Listen socket → check_tcp_accept → 新建 relay + dispatch。
+/// 监听 socket 不在启动时预建：netstack 在嗅探到隧道内 TCP SYN 时按目标 tuple
+/// 惰性建立（smoltcp 无通配监听语义，对应 Go `tcp.NewForwarder` 的 per-request
+/// accept）。本 loop 只负责 poll → [`WgNetStack::drain_accepted`] →
+/// 每条新连接 spawn duplex 中继 + dispatch。
 async fn wg_accept_loop(
     netstack: Arc<AsyncMutex<WgNetStack>>,
     dispatch: Arc<dyn DispatchHandler>,
 ) {
     let mut timer = interval(Duration::from_millis(ACCEPT_POLL_MS));
-
-    // 初始化：创建 TCP Listen socket（端口 0 = smoltcp 自动选端口）
-    let mut tcp_listen_handle = {
-        let mut stack = netstack.lock().await;
-        let handle = stack.add_tcp_socket();
-        if let Err(e) = stack.tcp_listen(handle, 0) {
-            tracing::warn!(error = %e, "wg tcp listen failed, inbound TCP disabled");
-        } else {
-            tracing::debug!(?handle, "wg tcp listen socket created");
-        }
-        handle
-    };
-
     tracing::debug!("wg accept loop started");
 
     loop {
@@ -262,16 +251,8 @@ async fn wg_accept_loop(
         let mut stack = netstack.lock().await;
         stack.poll(smoltcp::time::Instant::now());
 
-        if let Some(event) = stack.check_tcp_accept(tcp_listen_handle) {
-            // accept 后该 socket 进入 Established，作为连接 socket；
-            // 新建一个 listen socket 接受下一个连接。
-            let new_listen = stack.add_tcp_socket();
-            if let Err(e) = stack.tcp_listen(new_listen, 0) {
-                tracing::warn!(error = %e, "wg tcp re-listen failed");
-            }
-            tcp_listen_handle = new_listen;
-
-            // 从 local endpoint 构建 destination
+        for event in stack.drain_accepted() {
+            // 从 local endpoint 构建 destination（隧道内目标）
             let dest = match ip_endpoint_to_destination(&event.local) {
                 Some(d) => d,
                 None => {
@@ -429,6 +410,8 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::AtomicU32;
     use crate::config::PeerConfig;
+    use crate::driver::WgDriver;
+    use xray_buf::multi::MultiBuffer;
 
     fn make_keypair(seed: u8) -> (String, String) {
         use boringtun::x25519::{PublicKey, StaticSecret};
@@ -548,58 +531,208 @@ mod tests {
     fn ip_endpoint_to_destination_none() {
         assert!(ip_endpoint_to_destination(&None).is_none());
     }
+    /// 测试用 DispatchHandler——记录 (dest, 请求 payload) 并回写固定响应。
+    #[derive(Debug)]
+    struct EchoDispatch {
+        tag: String,
+        response: Vec<u8>,
+        seen: Arc<ParkMutex<Vec<(Destination, Vec<u8>)>>>,
+    }
 
-    /// 验证 tcp_listen 成功 + check_tcp_accept 在无连接时返回 None。
-    ///
-    /// smoltcp listen(0) 会返回 Unaddressable（port 0 = ephemeral），
-    /// 用非零端口验证 listen 设施正确。与 tun inbound 测试对称。
-    #[tokio::test]
-    async fn tcp_listen_and_check_accept_no_connection() {
-        use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
-
-        let local = IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)), 24);
-        let netstack: Arc<AsyncMutex<WgNetStack>> =
-            Arc::new(AsyncMutex::new(WgNetStack::new(&[local], 1420)));
-
-        // listen on non-zero port should succeed
-        let listen_handle = {
-            let mut stack = netstack.lock().await;
-            let h = stack.add_tcp_socket();
-            stack.tcp_listen(h, 443).expect("listen on 443");
-            h
-        };
-
-        // poll 后检查——没有真实流量，不会 Established
-        {
-            let mut stack = netstack.lock().await;
-            stack.poll(smoltcp::time::Instant::now());
-            assert!(stack.check_tcp_accept(listen_handle).is_none());
+    impl EchoDispatch {
+        fn new(tag: &str, response: &[u8]) -> (Arc<Self>, Arc<ParkMutex<Vec<(Destination, Vec<u8>)>>>) {
+            let seen = Arc::new(ParkMutex::new(Vec::new()));
+            (
+                Arc::new(Self { tag: tag.into(), response: response.to_vec(), seen: Arc::clone(&seen) }),
+                seen,
+            )
         }
     }
 
-    /// 验证 accept loop 路径在 listen 失败时不 panic（端口 0 被 smoltcp 拒绝），
-    /// check_tcp_accept 返回 None——与 tun inbound handle_socket_events_triggers_dispatch 对称。
+    impl DispatchHandler for EchoDispatch {
+        fn tag(&self) -> &str {
+            &self.tag
+        }
+        fn dispatch(
+            &self,
+            dest: &Destination,
+            link: Link,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+            let response = self.response.clone();
+            let seen = Arc::clone(&self.seen);
+            let dest = dest.clone();
+            Box::pin(async move {
+                let mut r = link.reader;
+                let mut w = link.writer;
+                let mb = match r.read_multi_buffer().await {
+                    Ok(mb) if !mb.is_empty() => mb,
+                    _ => return,
+                };
+                seen.lock().push((dest.clone(), mb.to_vec()));
+                let mut resp = MultiBuffer::new();
+                resp.merge_bytes(&response);
+                let _ = w.write_multi_buffer(resp).await;
+            })
+        }
+    }
+
+    /// accept loop 接线：SYN 驱动惰性建听 → 三次握手 → drain → dispatch 被调用。
     #[tokio::test]
-    async fn accept_loop_port0_rejected_no_panic() {
-        use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
+    async fn accept_loop_lazy_listen_dispatches_syn() {
+        use crate::netstack::test_packets::{make_tcp_packet, tcp_seq_number, TCP_ACK, TCP_SYN};
+        use smoltcp::time::Instant;
+        use smoltcp::wire::{IpCidr, IpAddress, Ipv4Address};
 
         let local = IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)), 24);
         let netstack: Arc<AsyncMutex<WgNetStack>> =
             Arc::new(AsyncMutex::new(WgNetStack::new(&[local], 1420)));
+        let (dispatch, calls) = make_dispatch();
+        tokio::spawn(wg_accept_loop(Arc::clone(&netstack), dispatch));
 
-        // listen 0 = smoltcp 拒绝（port 0 = ephemeral），accept loop 会 warn 并继续
-        let listen_handle = {
+        // 隧道内 client 10.0.0.2:5555 → server 10.0.0.1:80 的 SYN
+        {
             let mut stack = netstack.lock().await;
-            let h = stack.add_tcp_socket();
-            let _ = stack.tcp_listen(h, 0); // 忽略错误，与 production 一致
+            stack.ingest_rx(make_tcp_packet(([10, 0, 0, 2], 5555), ([10, 0, 0, 1], 80), TCP_SYN, 1000, 0));
+            stack.poll(Instant::now());
+        }
+
+        // 无 driver 时 tx_queue 由测试侧 drain——取 SYN-ACK 的 ISN
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let server_seq = loop {
+            let seq = {
+                let mut stack = netstack.lock().await;
+                stack.drain_tx().iter().find_map(|p| tcp_seq_number(p))
+            };
+            if let Some(seq) = seq {
+                break seq;
+            }
+            assert!(std::time::Instant::now() < deadline, "no SYN-ACK within 5s");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        {
+            let mut stack = netstack.lock().await;
+            stack.ingest_rx(make_tcp_packet(
+                ([10, 0, 0, 2], 5555),
+                ([10, 0, 0, 1], 80),
+                TCP_ACK,
+                1001,
+                server_seq + 1,
+            ));
+            stack.poll(Instant::now());
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while calls.load(Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline, "no dispatch within 5s");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// 端到端：真 WG client（WgDriver）经 UDP loopback 隧道内 TCP 连 Rust wg
+    /// server inbound，请求数据 echo 往返。无 Go 标准客户端环境，以
+    /// boringtun Rust↔Rust 全隧道（真 noise 握手 + 真加密 IP 包）替代。
+    #[tokio::test]
+    async fn tunnel_tcp_end_to_end_echoes() {
+        use smoltcp::time::Instant;
+        use smoltcp::wire::{IpCidr, IpAddress, Ipv4Address};
+        use std::net::SocketAddr;
+
+        const TUNNEL_TCP_PORT: u16 = 8080;
+        let (sec_c, pub_c) = make_keypair(0x11);
+        let (sec_s, pub_s) = make_keypair(0x22);
+        let udp_port = free_port().await;
+
+        // server：生产 inbound handler（new_multi driver + wg_accept_loop）
+        let server_cfg = DeviceConfig {
+            secret_key: sec_s,
+            endpoint: vec!["10.0.0.1/32".into()],
+            peers: vec![PeerConfig {
+                public_key: pub_c,
+                allowed_ips: vec!["10.0.0.2/32".into()], // 回程路由必需
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (dispatch, seen) = EchoDispatch::new("wg-e2e-out", b"echo:pong");
+        let server = WireguardInboundHandler::new("wg-e2e", &server_cfg, udp_port, dispatch)
+            .await
+            .expect("server construct");
+        server.start().await.expect("server start");
+
+        // client：单 peer WgDriver（driver_pair_handshake_with_multiple_workers 同骨架）
+        let client_cfg = DeviceConfig {
+            secret_key: sec_c,
+            endpoint: vec!["10.0.0.2/32".into()],
+            peers: vec![PeerConfig {
+                public_key: pub_s,
+                endpoint: format!("127.0.0.1:{udp_port}"),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let client_peer = shared_peer(&client_cfg, &client_cfg.peers[0], 0).expect("client peer");
+        let client_sock = bind_udp_socket("127.0.0.1:0").await.expect("client bind");
+        let client_ns = Arc::new(AsyncMutex::new(WgNetStack::new(
+            &[IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 2)), 32)],
+            1420,
+        )));
+        let client = Arc::new(WgDriver::new(client_peer, client_sock, Arc::clone(&client_ns)));
+        client.set_remote(SocketAddr::from(([127, 0, 0, 1], udp_port)));
+        tokio::spawn(Arc::clone(&client).main_loop());
+
+        // 隧道内 TCP connect 10.0.0.1:8080
+        let handle = {
+            let mut s = client_ns.lock().await;
+            let h = s.add_tcp_socket();
+            s.tcp_connect(
+                h,
+                IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)),
+                TUNNEL_TCP_PORT,
+            )
+            .expect("tcp connect");
             h
         };
 
-        // check_tcp_accept 不 panic，返回 None（socket 仍 Closed）
-        {
-            let mut stack = netstack.lock().await;
-            stack.poll(smoltcp::time::Instant::now());
-            assert!(stack.check_tcp_accept(listen_handle).is_none());
+        // 驱动 client 侧 TCP：发 ping，收 echo
+        let mut sent = false;
+        let mut got: Vec<u8> = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !got.starts_with(b"echo:pong") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "tcp echo not received in 15s; got={got:?}"
+            );
+            {
+                let mut s = client_ns.lock().await;
+                s.poll(Instant::now());
+                s.with_tcp_socket(handle, |sock| {
+                    if sock.may_send() && !sent {
+                        let _ = sock.send_slice(b"ping");
+                        sent = true;
+                    }
+                    let mut buf = [0u8; 64];
+                    let n = sock.recv_slice(&mut buf).unwrap_or(0);
+                    got.extend_from_slice(&buf[..n]);
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
+
+        // server 侧记录：destination = 隧道内目标，payload = 请求
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while seen.lock().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "dispatch not recorded in 5s");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let s = seen.lock();
+        let (dest, payload) = &s[0];
+        assert_eq!(dest.network(), Network::TCP);
+        assert_eq!(dest.address(), &Address::IPv4("10.0.0.1".parse().unwrap()));
+        assert_eq!(dest.port().value(), TUNNEL_TCP_PORT);
+        assert_eq!(payload, b"ping");
+
+        server.close().await.expect("server close");
     }
 }
+

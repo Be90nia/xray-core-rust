@@ -699,6 +699,7 @@ mod tests {
             tls.into(),
             DialTarget { host: "h".into(), port: 0, sni: String::new() },
             None,
+            None,
         ));
         let result = dial(client, config, "http", "h", false).await;
         let err = match result {

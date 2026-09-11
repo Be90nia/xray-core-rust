@@ -58,20 +58,16 @@ use xray_proxy_wireguard::{DeviceConfig, DomainStrategy as WgDomainStrategy};
 ///
 /// `DefaultDispatcher` 定义在 `xray-app-dispatcher`，`LoopbackSink` trait 在 `xray-proxy-loopback`，
 /// 两者有循环依赖不能直接 impl。此 wrapper 在 `xray-core` 层桥接。
+/// 由生产装配（functions.rs register_outbounds 调用点）构造注入（票 rdcc）。
 #[derive(Debug)]
-struct DispatcherLoopbackSink {
+pub(crate) struct DispatcherLoopbackSink {
     inner: Arc<DefaultDispatcher>,
-    /// Go loopback.go:56-62 `init` 构建的 SniffingRequest；None → default
-    /// （enabled=false，重分发不嗅探，等价 Go 零值 SniffingRequest）。
-    sniffing: Option<SniffingRequest>,
 }
 
 impl DispatcherLoopbackSink {
-    /// 附加 loopback 配置解析出的嗅探请求（对应 Go `Loopback.init`，loopback.go:56-62）。
-    #[must_use]
-    fn with_sniffing(mut self, sniffing: SniffingRequest) -> Self {
-        self.sniffing = Some(sniffing);
-        self
+    /// `inner`：生产 DefaultDispatcher（init 完成后 Arc 化）。
+    pub(crate) fn new(inner: Arc<DefaultDispatcher>) -> Self {
+        Self { inner }
     }
 }
 
@@ -80,11 +76,17 @@ impl LoopbackSink for DispatcherLoopbackSink {
         &self,
         inbound_tag: String,
         destination: xray_common::net::destination::Destination,
+        sniffing: SniffingRequest,
         link: xray_transport::link::Link,
     ) -> LoopbackFuture<std::result::Result<(), LoopbackError>> {
-        // Go loopback.go:32-36：content.SniffingRequest = l.sniffingRequest 注入重分发。
-        let sniffing = self.sniffing.clone().unwrap_or_default();
-        match self.inner.dispatch_link(&destination, link, &sniffing, None, None) {
+        // Go loopback.go:32-36：content.SniffingRequest = l.sniffingRequest 注入重分发；
+        // loopback.go:37-44：新 Inbound{Tag: l.inboundTag} 进 ctx——Rust 经
+        // access.inbound_tag 供 inboundTag 路由规则匹配（from/email 留空）。
+        let access = Some(xray_app_dispatcher::AccessContext {
+            inbound_tag,
+            ..Default::default()
+        });
+        match self.inner.dispatch_link(&destination, link, &sniffing, access, None) {
             Ok(()) => Box::pin(async { Ok(()) }),
             Err(e) => Box::pin(async move {
                 Err(LoopbackError::DispatchFailed(e.to_string()))
@@ -804,15 +806,14 @@ fn build_protocol_handler(
             Ok((Arc::new(bridge) as Arc<dyn DispatchHandler>, None, None))
         }
         "loopback" => {
-            // Go loopback.go:56-62：sniffing 经 BuildSniffingRequest 注入重分发。
-            // TODO(loopback-sniffing): LoopbackSink trait（xray-proxy-loopback，非本批
-            // 文件域）签名无 sniffing 参数，且 functions.rs 装配 sink 当前传 None；
-            // 请求已由 parse_loopback_config 构建就绪，sink 装配接
-            // DispatcherLoopbackSink::with_sniffing 后即端到端生效。
-            let (inbound_tag, _sniffing) = parse_loopback_config(&ob.entry.data)?;
+            // Go loopback.go:56-62：sniffing 经 BuildSniffingRequest 注入重分发；
+            // sink 由生产装配注入（functions.rs），per-handler sniffing 透传到
+            // DispatcherLoopbackSink → dispatch_link。
+            let (inbound_tag, sniffing) = parse_loopback_config(&ob.entry.data)?;
             let handler = xray_proxy_loopback::LoopbackHandler::with_inbound_tag(
                 ob.tag.clone(), inbound_tag,
-            );
+            )
+            .with_sniffing_request(sniffing);
             let handler = match loopback_sink {
                 Some(sink) => handler.with_sink(sink),
                 None => handler,
@@ -2570,22 +2571,6 @@ mod tests {
         assert!(sniffing.route_only);
     }
 
-    #[test]
-    fn loopback_sink_with_sniffing_carries_request() {
-        let req = SniffingRequest {
-            enabled: true,
-            override_destination_for_protocol: vec!["tls".to_string()],
-            ..Default::default()
-        };
-        let sink = DispatcherLoopbackSink {
-            inner: Arc::new(DefaultDispatcher::new()),
-            sniffing: None,
-        }
-        .with_sniffing(req);
-        let carried = sink.sniffing.as_ref().expect("with_sniffing 应附加请求");
-        assert!(carried.enabled);
-        assert_eq!(carried.override_destination_for_protocol, ["tls"]);
-    }
 
     #[test]
     fn register_freedom_sets_default_and_tagged() {

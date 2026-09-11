@@ -42,6 +42,7 @@ impl LoopbackSink for CaptureSink {
         &self,
         inbound_tag: String,
         destination: Destination,
+        _sniffing: xray_app_dispatcher::default::SniffingRequest,
         link: xray_transport::link::Link,
     ) -> LoopbackFuture<std::result::Result<(), xray_proxy_loopback::LoopbackError>> {
         let captured = Arc::clone(&self.received);

@@ -101,7 +101,8 @@ async fn wrap_security(
             if !fp_name.is_empty() {
                 let fp = xray_tls::fingerprint::get_fingerprint(fp_name)
                     .map_err(|e| io::Error::other(format!("invalid fingerprint: {e}")))?;
-                let tls_conn = xray_tls::utls::u_client(conn, &sni, cfg, fp, ech).await?;
+                let tls_conn =
+                    xray_tls::utls::u_client(conn, &sni, cfg, fp, ech, settings.security_json.as_ref()).await?;
                 Ok(Box::new(tls_conn))
             } else if ech.is_some() {
                 // Go 端 ECH 不依赖 fingerprint（stdlib 原生）；Rust 端 ECH 仅 btls 可用，
@@ -110,9 +111,15 @@ async fn wrap_security(
                     target: "xray_transport_tcp",
                     "ECH enabled without fingerprint; using default Chrome fingerprint via btls"
                 );
-                let tls_conn =
-                    xray_tls::utls::u_client(conn, &sni, cfg, xray_tls::fingerprint::Fingerprint::Chrome, ech)
-                        .await?;
+                let tls_conn = xray_tls::utls::u_client(
+                    conn,
+                    &sni,
+                    cfg,
+                    xray_tls::fingerprint::Fingerprint::Chrome,
+                    ech,
+                    settings.security_json.as_ref(),
+                )
+                .await?;
                 Ok(Box::new(tls_conn))
             } else {
                 let tls_conn = xray_tls::utls::client(conn, &sni, cfg).await?;

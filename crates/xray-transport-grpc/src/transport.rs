@@ -79,7 +79,7 @@ pub async fn dial(dest: &Destination, settings: &StreamSettings) -> io::Result<B
             let fp = xray_tls::fingerprint::get_fingerprint(fp_name).map_err(|e| {
                 io::Error::new(io::ErrorKind::InvalidInput, format!("invalid fingerprint: {e}"))
             })?;
-            Box::new(xray_tls::utls::u_client(tcp_conn, &sni, tls_cfg, fp, None).await.map_err(io_err)?)
+            Box::new(xray_tls::utls::u_client(tcp_conn, &sni, tls_cfg, fp, None, settings.security_json.as_ref()).await.map_err(io_err)?)
         } else {
             Box::new(xray_tls::utls::client(tcp_conn, &sni, tls_cfg).await.map_err(io_err)?)
         };

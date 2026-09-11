@@ -302,4 +302,35 @@ mod tests {
         assert!(!st.is_app_limited);
         assert_eq!(st.total_bytes_sent, 100);
     }
+
+    #[test]
+    fn real_packet_numbers_drain_sent_packets_but_synthetic_pn0_never_matches() {
+        // pv70 根因对照：quinn 适配层修复前合成 pn=0（键位错位），sampler 状态
+        // 恒增长；喂真实 pn 列表（SentBook 冲销产出）必须逐条删除。
+        let mut s = BandwidthSampler::new(10);
+        s.on_packet_sent(100, 1, 1200, 1200, true);
+        s.on_packet_sent(110, 2, 1200, 2400, true);
+        s.on_packet_sent(120, 3, 1200, 3600, true);
+        assert_eq!(s.sent_packets.len(), 3);
+
+        // 修复前 adapter 行为：聚合事件合成 pn=0 → 永不命中，sent_packets 恒增长。
+        let synthetic = [AckedPacketInfo {
+            packet_number: 0,
+            bytes_acked: 2400,
+            receive_time_ns: 200,
+        }];
+        s.on_congestion_event(200, &synthetic, &[], Bandwidth(0), INF_BANDWIDTH, 0);
+        assert_eq!(s.sent_packets.len(), 3, "synthetic pn=0 never matches: unbounded growth");
+
+        // 修复后：真实 pn 列表（ack 队首 2 包）+ loss（队尾 1 包）→ 全清。
+        let acked = [
+            AckedPacketInfo { packet_number: 1, bytes_acked: 1200, receive_time_ns: 300 },
+            AckedPacketInfo { packet_number: 2, bytes_acked: 1200, receive_time_ns: 300 },
+        ];
+        let lost = [LostPacketInfo { packet_number: 3, bytes_lost: 1200 }];
+        s.on_congestion_event(300, &acked, &lost, Bandwidth(0), INF_BANDWIDTH, 0);
+        assert!(s.sent_packets.is_empty(), "real pns must drain sampler state");
+        assert_eq!(s.total_bytes_acked(), 2400);
+        assert_eq!(s.total_bytes_lost(), 1200);
+    }
 }
