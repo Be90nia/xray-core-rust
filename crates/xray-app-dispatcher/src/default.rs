@@ -1043,7 +1043,7 @@ impl DefaultDispatcher {
                 let tag = forced_tag.clone().unwrap_or_default();
                 match ohm.get_handler(&tag) {
                     Some(h) => {
-                        tracing::info!(tag = %tag, "taking platform initialized detour for [%final_dest]");
+                        tracing::debug!(tag = %tag, "taking platform initialized detour for [%final_dest]");
                         (Some(h), false)
                     }
                     None => {

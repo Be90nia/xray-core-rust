@@ -235,16 +235,66 @@ pub struct ApiConfig {
 // FakeDNS
 // =========================================================================
 
-/// FakeDNS 配置。
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// FakeDNS 单池元素。对应 Go `FakeDNSPoolElementConfig {ipPool, poolSize}`。
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub struct FakeDnsConfig {
+pub struct FakeDnsPoolElement {
     /// IP 池（CIDR，如 `"198.18.0.0/15"`）。Go json `ipPool`（Rust 方言 `ip_pool` 别名保留）。
     #[serde(skip_serializing_if = "Option::is_none", alias = "ip_pool")]
     pub ip_pool: Option<String>,
     /// 池大小。Go json `poolSize`（Rust 方言 `pool_size` 别名保留）。
     #[serde(skip_serializing_if = "Option::is_none", alias = "pool_size")]
     pub pool_size: Option<u32>,
+}
+
+/// FakeDNS 配置。对应 Go `FakeDNSConfig`：单池对象或池数组二选一
+///（Go `UnmarshalJSON`：先试单池，失败试数组；`MarshalJSON` 反向）。
+#[derive(Debug, Default, Clone)]
+pub struct FakeDnsConfig {
+    /// 单池形态字段（Go `pool`）。
+    pub ip_pool: Option<String>,
+    /// 单池形态字段（Go `pool.LRUSize`）。
+    pub pool_size: Option<u32>,
+    /// 多池形态（Go `pools`）。JSON 呈现为池数组；与单池字段互斥。
+    pub pools: Option<Vec<FakeDnsPoolElement>>,
+}
+
+impl Serialize for FakeDnsConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Go MarshalJSON：pools 在场 → 数组；否则单池对象。
+        if let Some(pools) = &self.pools {
+            return pools.serialize(serializer);
+        }
+        FakeDnsPoolElement {
+            ip_pool: self.ip_pool.clone(),
+            pool_size: self.pool_size,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for FakeDnsConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Go UnmarshalJSON（fakedns.go:36-48）：先试单池对象，失败试池数组。
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Single(FakeDnsPoolElement),
+            Multi(Vec<FakeDnsPoolElement>),
+        }
+        match Repr::deserialize(deserializer)? {
+            Repr::Single(e) => Ok(Self {
+                ip_pool: e.ip_pool,
+                pool_size: e.pool_size,
+                pools: None,
+            }),
+            Repr::Multi(v) => Ok(Self {
+                ip_pool: None,
+                pool_size: None,
+                pools: Some(v),
+            }),
+        }
+    }
 }
 
 // 保持 serde_json::Value 作为 re-export，供 BurstObservatoryConfig::ping_config 等使用
@@ -348,6 +398,40 @@ mod tests {
         assert_eq!(legacy.pool_size, Some(12345));
         let out = serde_json::to_value(&go).unwrap();
         assert_eq!(out["ipPool"], "198.18.0.0/15");
+        assert_eq!(out["poolSize"], 65535);
+    }
+
+    /// bd qigp：Go `pools[]` 数组形态（fakedns.go UnmarshalJSON 分支二）。
+    #[test]
+    fn fakedns_multi_pools_parse_and_roundtrip() {
+        // 数组形态解析。
+        let cfg: FakeDnsConfig = serde_json::from_value(serde_json::json!([
+            {"ipPool": "198.18.0.0/15", "poolSize": 32768},
+            {"ipPool": "fc00::/18", "poolSize": 32768}
+        ]))
+        .unwrap();
+        let pools = cfg.pools.clone().expect("array form fills pools");
+        assert_eq!(pools.len(), 2);
+        assert_eq!(pools[0].ip_pool.as_deref(), Some("198.18.0.0/15"));
+        assert_eq!(pools[1].pool_size, Some(32768));
+        assert!(cfg.ip_pool.is_none());
+        // 序列化回数组（Go MarshalJSON pools 分支）。
+        let out = serde_json::to_value(&cfg).unwrap();
+        assert!(out.is_array());
+        assert_eq!(out[0]["ipPool"], "198.18.0.0/15");
+        assert_eq!(out[1]["ipPool"], "fc00::/18");
+    }
+
+    /// bd qigp：单池形态不受多池支持影响（对象 → 对象）。
+    #[test]
+    fn fakedns_single_pool_still_object() {
+        let cfg: FakeDnsConfig = serde_json::from_value(serde_json::json!({
+            "ipPool": "198.18.0.0/15", "poolSize": 65535
+        }))
+        .unwrap();
+        assert!(cfg.pools.is_none());
+        let out = serde_json::to_value(&cfg).unwrap();
+        assert!(out.is_object());
         assert_eq!(out["poolSize"], 65535);
     }
 

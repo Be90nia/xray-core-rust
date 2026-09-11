@@ -81,23 +81,32 @@ impl LintStage for FakeDnsStage {
         };
 
         // 3. FakeDNS 已配置 → 不覆盖；未配置 → 按 IPv4/6 开关填默认池。
+        // Go fakedns.go:94-118：双开 = pools[198.18.0.0/15 + fc00::/18] 各
+        // 32768（两池）；单开 = 单池 65535。
         if cfg.fake_dns.is_none() {
-            use crate::app_config::FakeDnsConfig;
-            // Rust 占位 fake_dns 当前仅 ip_pool + pool_size（单池），
-            // 故 IPv4+IPv6 双开时优先记 IPv4 池；与 Go 多池语义略有差异。
-            // 注：Go FakeDNSConfig 同时有 pool[] 和 pools[] 两字段；
-            // Rust 当前切片 1 的强类型仅 ip_pool（单 CIDR）+ pool_size，
-            // 多池语义待后续 batch 扩展 FakeDnsConfig 时再对齐。
-            let ip_pool = if ipv4 {
-                "198.18.0.0/15"
-            } else {
-                // IPv6 default（对应 Go `dns.FakeIPv6Pool`）。
-                "fc00::/18"
+            use crate::app_config::{FakeDnsConfig, FakeDnsPoolElement};
+            let v4 = || FakeDnsPoolElement {
+                ip_pool: Some("198.18.0.0/15".into()),
+                pool_size: Some(32768),
             };
-            let pool_size = if ipv4 && ipv6 { 32768 } else { 65535 };
-            cfg.fake_dns = Some(FakeDnsConfig {
-                ip_pool: Some(ip_pool.into()),
-                pool_size: Some(pool_size),
+            let v6 = || FakeDnsPoolElement {
+                ip_pool: Some("fc00::/18".into()),
+                pool_size: Some(32768),
+            };
+            let single = |pool: &str| FakeDnsConfig {
+                ip_pool: Some(pool.into()),
+                pool_size: Some(65535),
+                pools: None,
+            };
+            cfg.fake_dns = Some(match (ipv4, ipv6) {
+                (true, true) => FakeDnsConfig {
+                    ip_pool: None,
+                    pool_size: None,
+                    pools: Some(vec![v4(), v6()]),
+                },
+                (false, true) => single("fc00::/18"),
+                (true, false) => single("198.18.0.0/15"),
+                (false, false) => FakeDnsConfig::default(),
             });
         }
 
@@ -285,8 +294,14 @@ mod tests {
         };
         post_process(&mut cfg).unwrap();
         let fd = cfg.fake_dns.expect("fake_dns should be auto-filled");
-        assert_eq!(fd.ip_pool.as_deref(), Some("198.18.0.0/15"));
-        assert_eq!(fd.pool_size, Some(32768)); // 双开 = 32768
+        // Go fakedns.go:97-107：IPv4+IPv6 双开 = pools 两池各 32768。
+        let pools = fd.pools.expect("dual-stack default fills pools[]");
+        assert_eq!(pools.len(), 2);
+        assert_eq!(pools[0].ip_pool.as_deref(), Some("198.18.0.0/15"));
+        assert_eq!(pools[0].pool_size, Some(32768));
+        assert_eq!(pools[1].ip_pool.as_deref(), Some("fc00::/18"));
+        assert_eq!(pools[1].pool_size, Some(32768));
+        assert!(fd.ip_pool.is_none(), "dual-stack uses pools[], not single pool");
     }
 
     #[test]
@@ -337,6 +352,7 @@ mod tests {
             fake_dns: Some(crate::app_config::FakeDnsConfig {
                 ip_pool: Some("198.18.0.0/16".into()),
                 pool_size: Some(12345),
+                pools: None,
             }),
             ..Default::default()
         };

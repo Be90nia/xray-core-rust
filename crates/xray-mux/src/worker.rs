@@ -120,10 +120,15 @@ pub struct ServerWorker {
 impl ServerWorker {
     pub fn new(dispatcher: Arc<dyn Dispatcher>) -> Self {
         let (done_tx, done_rx) = watch::channel(false);
+        // bd lahx：接线常驻清理（Go common/mux/session.go:235-252 init goroutine
+        // 每分钟清 Expiring 条目并 Interrupt）。task 句柄由 XUDPManager 持有，
+        // Drop（worker 释放）时 abort——不泄漏。
+        let mut xudp_manager = XUDPManager::new();
+        xudp_manager.start_cleanup();
         Self {
             dispatcher,
             session_manager: Arc::new(SessionManager::new()),
-            xudp_manager: Arc::new(XUDPManager::new()),
+            xudp_manager: Arc::new(xudp_manager),
             closed: AtomicBool::new(false),
             done_tx,
             done_rx,
@@ -555,7 +560,25 @@ mod tests {
         assert_eq!(worker.active_connections().await, 0);
     }
 
-    #[tokio::test]
+    /// bd lahx：ServerWorker 构造即接线 XUDP 常驻清理任务（Go init goroutine
+    /// 语义），Expiring 过期条目被周期回收。
+    #[tokio::test(start_paused = true)]
+    async fn server_worker_wires_xudp_periodic_cleanup() {
+        let worker = Arc::new(ServerWorker::new(Arc::new(MockDispatcher)));
+        let mut xudp = crate::session::XUDP::new([9u8; 8]);
+        xudp.status = crate::session::XudpStatus::Expiring;
+        xudp.expire = std::time::Instant::now() - Duration::from_secs(1);
+        worker.xudp_manager.register(xudp).await;
+
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            worker.xudp_manager.len().await,
+            0,
+            "worker-owned cleanup task must reclaim expired entries"
+        );
+    }
     async fn test_server_worker_close() {
         let worker = ServerWorker::new(Arc::new(MockDispatcher));
         worker.close();

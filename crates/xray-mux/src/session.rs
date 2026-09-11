@@ -1124,6 +1124,34 @@ mod tests {
         assert!(manager.get(&[3u8; 8]).await.is_some());
     }
 
+    /// bd lahx：`start_cleanup` 常驻任务到期回收 Expiring 条目——对应 Go
+    /// `XUDPManager` init goroutine（session.go:235-252）每分钟扫描。
+    #[tokio::test(start_paused = true)]
+    async fn test_xudp_manager_start_cleanup_reclaims_expired() {
+        let mut manager = XUDPManager::new();
+
+        // 已过期 Expiring（应被回收）+ 未过期 Expiring（应保留）。
+        let mut expired = XUDP::new([7u8; 8]);
+        expired.status = XudpStatus::Expiring;
+        expired.expire = Instant::now() - Duration::from_secs(1);
+        manager.register(expired).await;
+        let mut alive = XUDP::new([8u8; 8]);
+        alive.status = XudpStatus::Expiring;
+        alive.expire = Instant::now() + Duration::from_secs(3600);
+        manager.register(alive).await;
+        assert_eq!(manager.len().await, 2);
+
+        manager.start_cleanup();
+        // 快进 61s 让 interval tick 触发清理（首个 tick 立即 + 已过 pause 时钟）。
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(manager.len().await, 1, "expired entry reclaimed by periodic task");
+        assert!(manager.get(&[7u8; 8]).await.is_none());
+        assert!(manager.get(&[8u8; 8]).await.is_some());
+    }
+
     // ========== Session.Close 自动从管理器移除 ==========
 
     #[tokio::test]

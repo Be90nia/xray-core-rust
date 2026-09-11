@@ -647,33 +647,58 @@ impl xray_app_metrics::StatsCollector for AppStatsFeature {
 
 /// Commander (api) 真实 factory：解析 JSON `ApiConfig` → [`Commander`]。
 ///
-/// 对应 Go `app/commander` 的 `init()` + `New(ctx, config)`。`xray-conf` 把 `api`
-/// 配置序列化为 [`ApiConfig`](xray_conf::app_config::ApiConfig) JSON 字节；本 factory
-/// 反序列化后构造 [`Commander`]（携带 listen 地址），其 `Feature::start` 在 listen
-/// 地址启动 tonic gRPC server（注册 HandlerService：add/remove/list outbound）。
-///
-/// services 列表中的 `HandlerService` / `ReflectionService` 记录到 Commander 的
-/// service 容器（供编排校验）；listen 为空时走 outbound 模式（transport 全链路待接入）。
+/// 对应 Go `infra/conf/api.go APIConfig.Build`：tag 必填（空 → 硬错）；
+/// `services` 按大小写不敏感匹配六服务名（reflectionservice/handlerservice/
+/// loggerservice/statsservice/observatoryservice/routingservice），未知名
+/// warn 忽略。声明的 marker 经 [`Commander::add_service`] 记录，
+/// `Feature::start` 按声明集门控实际 gRPC 暴露面（bd dnw3）。
 fn commander_factory() -> FeatureFactory {
+    use xray_app_commander::{
+        api_services, DeclaredServiceMarker, HandlerServiceMarker, ReflectionService,
+    };
     Arc::new(|data: &[u8]| {
-        let cfg: xray_conf::app_config::ApiConfig = serde_json::from_slice(data).unwrap_or_default();
-        let tag = cfg.tag.clone().filter(|t| !t.is_empty()).unwrap_or_else(|| "api".to_string());
-        let mut commander = xray_app_commander::Commander::new(tag, cfg.listen.clone());
-        // 记录声明的 service（编排/诊断用）。实际 gRPC service 由 Feature::start 固定注册。
+        let cfg: xray_conf::app_config::ApiConfig =
+            serde_json::from_slice(data).unwrap_or_default();
+        // Go api.go:23-25：`API tag can't be empty.`（Build 硬错）。
+        let tag = cfg.tag.clone().unwrap_or_default();
+        if tag.is_empty() {
+            return Err(FeatureError::StartFailed {
+                name: "api",
+                message: "API tag can't be empty.".to_string(),
+            });
+        }
+        let commander = xray_app_commander::Commander::new(tag, cfg.listen.clone());
         if let Some(services) = &cfg.services {
             for svc in services {
-                let marker: Option<std::sync::Arc<dyn xray_app_commander::Service>> = match svc.as_str() {
-                    "HandlerService" => Some(std::sync::Arc::new(
-                        xray_app_commander::HandlerServiceMarker,
-                    )),
-                    "ReflectionService" => Some(std::sync::Arc::new(
-                        xray_app_commander::ReflectionService::new(),
-                    )),
-                    other => {
-                        tracing::warn!(service = %other, "commander: unknown api service, ignored");
-                        None
-                    }
-                };
+                // Go api.go:29-42：strings.ToLower 后六分支匹配。
+                let marker: Option<std::sync::Arc<dyn xray_app_commander::Service>> =
+                    match svc.to_ascii_lowercase().as_str() {
+                        "reflectionservice" => Some(std::sync::Arc::new(
+                            ReflectionService::new(),
+                        )),
+                        "handlerservice" => {
+                            Some(std::sync::Arc::new(HandlerServiceMarker))
+                        }
+                        "loggerservice" => Some(std::sync::Arc::new(
+                            DeclaredServiceMarker::new("LoggerService", api_services::LOGGER),
+                        )),
+                        "statsservice" => Some(std::sync::Arc::new(
+                            DeclaredServiceMarker::new("StatsService", api_services::STATS),
+                        )),
+                        "observatoryservice" => Some(std::sync::Arc::new(
+                            DeclaredServiceMarker::new(
+                                "ObservatoryService",
+                                api_services::OBSERVATORY,
+                            ),
+                        )),
+                        "routingservice" => Some(std::sync::Arc::new(
+                            DeclaredServiceMarker::new("RoutingService", api_services::ROUTING),
+                        )),
+                        other => {
+                            tracing::warn!(service = %other, "commander: unknown api service, ignored");
+                            None
+                        }
+                    };
                 if let Some(m) = marker {
                     commander.add_service(m);
                 }
@@ -683,11 +708,13 @@ fn commander_factory() -> FeatureFactory {
     })
 }
 
-/// FakeDNS app 真实 factory：解析 `ipPool`/`poolSize` JSON → 初始化 [`Holder`]。
+/// FakeDNS app 真实 factory：解析 `ipPool`/`poolSize` 或 `pools[]` JSON →
+/// 初始化 [`HolderMulti`]。
 ///
-/// 对应 Go `app/dns/fakedns` 的 `init()` + `New(ctx, config)`。
-/// 缺省池 `240.0.0.0/4` + LRU 65535（Go `FakeIPv4Pool` 同值）。
-/// dispatcher 嗅探注入经 [`FakeDnsFeature::engine`] 取引擎视图。
+/// 对应 Go `app/dns/fakedns` 的 `init()` + `New(ctx, config)`：配置层永远
+/// 产出 `FakeDnsPoolMulti`（单池 = 一元素池），查询语义 = 扇出全部池
+///（`IsIPInIPPool` any / `GetFakeIPForDomain` concat / 反查 first-match，
+/// Go fake.go:141-182，bd qigp）。
 fn fake_dns_factory() -> FeatureFactory {
     Arc::new(|data: &[u8]| {
         let cfg: xray_conf::app_config::FakeDnsConfig =
@@ -700,31 +727,48 @@ fn fake_dns_factory() -> FeatureFactory {
     })
 }
 
-/// FakeDnsConfig → 已初始化 Holder。缺省池 `240.0.0.0/4` + LRU 65535
-/// （Go `FakeIPv4Pool` 同值）。
-fn build_fake_dns_holder(cfg: &xray_conf::app_config::FakeDnsConfig) -> Result<Arc<xray_app_dns::fakedns::Holder>, FeatureError> {
-    let pool = xray_app_dns::fakedns::FakeDnsPool {
-        ip_pool: cfg
-            .ip_pool
-            .clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "240.0.0.0/4".to_string()),
-        lru_size: u64::from(cfg.pool_size.unwrap_or(65535)),
+/// FakeDnsConfig → 已初始化 HolderMulti。单池缺省 `240.0.0.0/4` + LRU 65535。
+fn build_fake_dns_holder(
+    cfg: &xray_conf::app_config::FakeDnsConfig,
+) -> Result<Arc<xray_app_dns::fakedns::HolderMulti>, FeatureError> {
+    let element_to_pool = |e: &xray_conf::app_config::FakeDnsPoolElement| {
+        xray_app_dns::fakedns::FakeDnsPool {
+            ip_pool: e
+                .ip_pool
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "240.0.0.0/4".to_string()),
+            lru_size: u64::from(e.pool_size.unwrap_or(65535)),
+        }
     };
-    let mut holder = xray_app_dns::fakedns::Holder::with_config(pool);
-    holder.initialize().map_err(|e| FeatureError::StartFailed {
-        name: "fakeDns",
-        message: format!("initialize fake dns pool: {e}"),
+    let pools: Vec<xray_app_dns::fakedns::FakeDnsPool> = if let Some(pools) = &cfg.pools {
+        pools.iter().map(element_to_pool).collect()
+    } else {
+        // 单池形态（含全空 → 缺省池）。
+        vec![xray_app_dns::fakedns::FakeDnsPool {
+            ip_pool: cfg
+                .ip_pool
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "240.0.0.0/4".to_string()),
+            lru_size: u64::from(cfg.pool_size.unwrap_or(65535)),
+        }]
+    };
+    let multi = xray_app_dns::fakedns::HolderMulti::new(pools).map_err(|e| {
+        FeatureError::StartFailed {
+            name: "fakeDns",
+            message: format!("initialize fake dns pools: {e}"),
+        }
     })?;
-    Ok(Arc::new(holder))
+    Ok(Arc::new(multi))
 }
 
-/// FakeDNS Feature：持有真实 [`Holder`]（LRU 域名↔Fake IP 双向映射引擎）。
+/// FakeDNS Feature：持有真实 [`HolderMulti`]（多池 LRU 域名↔Fake IP 引擎）。
 ///
 /// pub 供装配层（functions.rs）`instance.get_feature::<FakeDnsFeature>()` 取出，
 /// 经 [`fake_dns_engine_bridge`] 注入 dispatcher（对应 Go dispatcher.fdns）。
 pub struct FakeDnsFeature {
-    holder: Arc<xray_app_dns::fakedns::Holder>,
+    holder: Arc<xray_app_dns::fakedns::HolderMulti>,
 }
 
 impl Feature for FakeDnsFeature {
@@ -734,19 +778,19 @@ impl Feature for FakeDnsFeature {
 }
 
 impl FakeDnsFeature {
-    /// 引擎视图：DNS app / dispatcher 嗅探共用同一 Holder。
+    /// 引擎视图：DNS app / dispatcher 嗅探共用同一 HolderMulti。
     #[must_use]
-    pub fn engine(&self) -> Arc<xray_app_dns::fakedns::Holder> {
+    pub fn engine(&self) -> Arc<xray_app_dns::fakedns::HolderMulti> {
         Arc::clone(&self.holder)
     }
 }
 
-/// [`Holder`] → dispatcher `FakeDnsEngine` 适配（嗅探阶段反查 fake IP 域名）。
+/// [`HolderMulti`] → dispatcher `FakeDnsEngine` 适配（嗅探阶段反查 fake IP 域名）。
 ///
 /// dispatcher crate 定义独立 trait 避免反向依赖；xray-app-dns 的引擎 trait 签名
 /// 不同（`IpAddr -> Option<String>`），在此桥接为 dispatcher 形态
 /// （`&IpAddr -> String`，无匹配返回空串）。
-pub struct FakeDnsEngineBridge(Arc<xray_app_dns::fakedns::Holder>);
+pub struct FakeDnsEngineBridge(Arc<xray_app_dns::fakedns::HolderMulti>);
 
 impl std::fmt::Debug for FakeDnsEngineBridge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -764,7 +808,7 @@ impl xray_app_dispatcher::fakednssniffer::FakeDnsEngine for FakeDnsEngineBridge 
 /// 从 fakeDns Feature 引擎构造 dispatcher 侧引擎桥。
 #[must_use]
 pub fn fake_dns_engine_bridge(
-    holder: Arc<xray_app_dns::fakedns::Holder>,
+    holder: Arc<xray_app_dns::fakedns::HolderMulti>,
 ) -> Arc<dyn xray_app_dispatcher::fakednssniffer::FakeDnsEngine> {
     Arc::new(FakeDnsEngineBridge(holder))
 }

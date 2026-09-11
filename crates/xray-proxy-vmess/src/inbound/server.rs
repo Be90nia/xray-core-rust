@@ -132,7 +132,7 @@ pub async fn serve_vmess(
                 continue;
             }
         };
-        let _ = peer;
+
 
         let handler = Arc::clone(&handler);
         let validator = Arc::clone(&validator);
@@ -149,7 +149,8 @@ pub async fn serve_vmess(
                 handle_connection(stream, &handler, &validator, &history, true).await
             };
             if let Err(e) = result {
-                tracing::info!(error = %e, "vmess connection ended with error");
+                // Go vmess inbound.go:250：拒绝 AtInfo + RemoteAddr。
+                tracing::info!(peer = %peer, error = %e, "vmess connection ended with error");
             }
         });
     }

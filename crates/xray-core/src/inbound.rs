@@ -99,7 +99,8 @@ pub async fn serve_socks5(
             if let Err(e) =
                 handle_connection(stream, peer, &config, &handler, handshake_timeout).await
             {
-                tracing::debug!(error = %e, "socks5 connection ended with error");
+                // Go proxyman/worker.go:124：连接结束错误统一 LogInfo("connection ends")。
+                tracing::info!(peer = %peer, error = %e, "socks5 connection ended with error");
             }
         });
 
@@ -1882,7 +1883,8 @@ async fn serve_reality_vless(
                     )
                     .await
                     {
-                        tracing::debug!(error = %e, "reality vless connection ended with error");
+                        // Go vless inbound.go:522：拒绝 AtInfo + RemoteAddr。
+                        tracing::info!(peer = %peer, error = %e, "reality vless connection ended with error");
                     }
                 }
                 Ok(RealityServerOutcome::Invalid { conn, record, reason }) => {
@@ -2077,7 +2079,8 @@ async fn spawn_one_inbound(
                             conn, &handler, &validator, fallbacks, peer, local,
                             String::new(), String::new(), Some(options), None,
                         ).await {
-                            tracing::debug!(error = %e, "vless transport connection ended with error");
+                            // Go vless inbound.go:522：拒绝 AtInfo + RemoteAddr。
+                            tracing::info!(peer = %peer, error = %e, "vless transport connection ended with error");
                         }
                     });
                 });
@@ -2169,10 +2172,12 @@ async fn spawn_one_inbound(
                     let validator = Arc::clone(&validator);
                     let history = Arc::clone(&history);
                     tokio::spawn(async move {
+                        let (peer, _local) = transport_conn_addrs(conn.as_ref(), bind_addr);
                         if let Err(e) = xray_proxy_vmess::handle_vmess_connection(
                             conn, &handler, &validator, &history, is_drain,
                         ).await {
-                            tracing::debug!(error = %e, "vmess transport connection ended with error");
+                            // Go vmess inbound.go:250：拒绝 AtInfo + RemoteAddr。
+                            tracing::info!(peer = %peer, error = %e, "vmess transport connection ended with error");
                         }
                     });
                 });

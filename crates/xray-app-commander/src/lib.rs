@@ -36,8 +36,8 @@ pub mod outbound;
 pub mod server;
 // Re-export 主要公共类型
 pub use commander::{
-    Commander, Config, GrpcServerRegistrar, HandlerServiceMarker, NoopRegistrar,
-    ReflectionService, Service, TypedMessageConfig,
+    api_services, Commander, Config, DeclaredServiceMarker, GrpcServerRegistrar,
+    HandlerServiceMarker, NoopRegistrar, ReflectionService, Service, TypedMessageConfig,
 };
 pub use error::CommanderError;
 pub use grpc::{LoggerServiceImpl, OutboundRuntime};

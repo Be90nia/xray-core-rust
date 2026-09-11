@@ -23,7 +23,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use xray_app_dispatcher::default::SimpleOhm;
 use xray_app_dispatcher::OutboundHandlerManager;
 use xray_buf::io::{new_reader, new_writer};
@@ -153,7 +153,7 @@ impl InboundHandler for TrojanServer {
                             };
                             match trojan_server_handshake(&mut recorder, &validator).await {
                                 Ok((network, addr, port, user)) => {
-                                    info!(
+                                    debug!(
                                         tag = %tag,
                                         peer = %peer,
                                         network = ?network,
@@ -480,14 +480,14 @@ async fn handle_trojan_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     match trojan_server_handshake(&mut recorder, &validator).await {
         Ok((network, addr, port, user)) => {
             if matches!(network, Network::Udp) {
-                info!(peer = %peer, user = %user.email, "trojan UDP relay start");
+                debug!(peer = %peer, user = %user.email, "trojan UDP relay start");
                 handle_trojan_udp_relay(recorder.inner, handler).await;
                 return;
             }
             let dest = Destination::new(addr, Port::new(port), CommonNetwork::TCP);
             let (read_half, write_half) = tokio::io::split(recorder.inner);
             let link = Link::new(new_reader(read_half), new_writer(write_half));
-            info!(peer = %peer, user = %user.email, dest = %dest, "trojan dispatching");
+            debug!(peer = %peer, user = %user.email, dest = %dest, "trojan dispatching");
             // per-user stats（Go trojan/inbound 认证后 ctx 带 user 语义）：
             // from=客户端源地址，email/level=认证用户。
             let access = xray_app_dispatcher::AccessContext {

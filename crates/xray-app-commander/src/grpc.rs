@@ -940,16 +940,13 @@ impl tonic::transport::server::Connected for CommanderStream {
 /// 构建已注册 command service 的 tonic `Router`。
 ///
 /// 返回的 `Router` 可 `.serve(addr)` 或 `.serve_with_incoming(..)` 启动。
-/// HandlerService 始终注册；proxyman / outbound runtime / logger / stats / routing /
-/// observatory 仅在注入（`Some`）时注册。
-///
-/// **gRPC reflection opt-in**：仅当 [`commander::ReflectionService`] 通过
-/// [`Commander::add_service`] 注册（即上层 `ApiConfig.services` 含
-/// `"ReflectionService"`）时才注册 v1 + v1alpha——对应 Go `infra/conf/api.go:30`
-/// `"reflectionservice"` 关键字的 opt-in 语义。未声明时整个 gRPC server 不暴露
-/// reflection，避免 grpcurl 匿名枚举全部 command service。
+/// 所有服务（handler / logger / stats / routing / observatory / reflection）
+/// 均按 `enable_*` + 后端注入（`Some`）双条件注册——对应 Go
+/// `Commander.Start` 只注册 `config.Service`（`ApiConfig.services`）列举的
+/// 服务，未声明不暴露（bd dnw3）。
 pub(crate) fn build_router(
     registry: Arc<OutboundHandlerRegistry>,
+    enable_handler: bool,
     enable_reflection: bool,
     proxyman: Option<Arc<dyn xray_app_proxyman::command::HandlerService>>,
     outbound_runtime: Option<Arc<dyn OutboundRuntime>>,
@@ -965,20 +962,24 @@ pub(crate) fn build_router(
     if let Some(rt) = outbound_runtime {
         handler_impl = handler_impl.with_outbound_runtime(rt);
     }
-    let mut server = Server::builder().add_service(HandlerServiceServer::new(handler_impl));
-    if let Some(svc) = logger {
-        server = server.add_service(LoggerServiceServer::new(LoggerServiceImpl::new(svc)));
-    }
-    if let Some(svc) = stats {
-        server = server.add_service(StatsServiceServer::new(StatsServiceImpl::new(svc)));
-    }
-    if let Some(svc) = routing {
-        server = server.add_service(RoutingServiceServer::new(RoutingServiceImpl::new(svc)));
-    }
-    if let Some(svc) = observatory {
-        server =
-            server.add_service(ObservatoryServiceServer::new(ObservatoryServiceImpl::new(svc)));
-    }
+    // bd dnw3：HandlerService 与其余服务同样按声明门控（Go Commander.Start
+    // 只注册 config.Service 列举的服务）。tonic 0.14 `Server::add_service`
+    // 为 `&mut self -> Router`，故首个服务经 `add_optional_service` 起链。
+    let mut builder = Server::builder();
+    let mut server = builder
+        .add_optional_service(enable_handler.then(|| HandlerServiceServer::new(handler_impl)));
+    server = server.add_optional_service(
+        logger.map(|svc| LoggerServiceServer::new(LoggerServiceImpl::new(svc))),
+    );
+    server = server.add_optional_service(
+        stats.map(|svc| StatsServiceServer::new(StatsServiceImpl::new(svc))),
+    );
+    server = server.add_optional_service(
+        routing.map(|svc| RoutingServiceServer::new(RoutingServiceImpl::new(svc))),
+    );
+    server = server.add_optional_service(
+        observatory.map(|svc| ObservatoryServiceServer::new(ObservatoryServiceImpl::new(svc))),
+    );
     // reflection opt-in：仅当用户显式注册 ReflectionService 时启用（Go
     // `infra/conf/api.go:30` 的 `"reflectionservice"` 关键字语义）。
     if enable_reflection {

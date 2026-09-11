@@ -284,11 +284,15 @@ pub(crate) fn build_hysteria_transport_config(
         t.keep_alive_interval(Some(Duration::from_millis(qc.keep_alive_period_ms)));
     }
     if qc.enable_datagrams {
-        // 对齐 Go MaxDatagramFrameSize=1200（config.go:24）：quinn 的 TP 取值即
-        // 此 buffer（transport_parameters.rs:170），广告 8192 会使 quic-go 对端
-        // 按 ~1286B 分片、quinn 实收仅首片 → 对齐 1200 后 Go 按 ≤1191 分片互通。
-        // ponytail: 1200 也压低本地收包排队上限（一次 ~1 个 datagram），泵常读可接受。
-        t.datagram_receive_buffer_size(Some(1200));
+        // 参数化（rjo9）：取 QuicConfig.max_datagram_frame_size——from_params 与
+        // default_for_hysteria 均取 crate::config::MaxDatagramFrameSize，对齐 Go
+        // transport/internet/hysteria/config.go:24 const=1200（Go 不透出用户配置面，
+        // 此处同——proto 无该字段）。注意 quinn 中该值同时是 TP 广告
+        // （transport_parameters.rs:170 取 min(x,65535)）与本地收包队列预算
+        // （datagrams.rs 超预算丢最旧），二者耦合不可分离：抬高会抬高 TP 使
+        // quic-go 对端按超尺寸分片、超过单 QUIC 包上限而丢包（实测 8192 不通、
+        // 1200 通）——默认必须保持 1200。
+        t.datagram_receive_buffer_size(Some(qc.max_datagram_frame_size as usize));
     }
     if qc.max_incoming_streams >= 0 {
         t.max_concurrent_bidi_streams(quinn::VarInt::try_from(qc.max_incoming_streams as u64).unwrap_or(quinn::VarInt::MAX));
@@ -949,6 +953,29 @@ mod tests {
         assert_eq!(receive_windows(&qc), (8_388_608, 20_971_520));
         assert!(!qc.disable_path_mtu_discovery);
         assert_eq!(qc.keep_alive_period_ms, 0, "Go keep-alive 默认关闭（dialer.go:113-115 注释）");
+    }
+
+    /// rjo9：datagram 接收缓冲随 QuicConfig.max_datagram_frame_size 参数化；
+    /// 默认 = Go config.go:24 const 1200（Go 无用户配置面，quinn 中 TP 广告与
+    /// 本地队列预算同旋钮耦合，抬高会破坏 quic-go 对端互通——见 builder 注释）。
+    #[test]
+    fn transport_config_datagram_buffer_follows_config() {
+        // 默认（Go const 1200）：TransportConfig Debug 输出含 datagram_receive_buffer_size: Some(1200)
+        let qc = QuicConfig::default_for_hysteria();
+        let (t, _) = build_hysteria_transport_config(&qc);
+        assert!(
+            format!("{t:?}").contains("datagram_receive_buffer_size: Some(1200)"),
+            "默认必须对齐 Go MaxDatagramFrameSize=1200，实际: {t:?}"
+        );
+
+        // 参数化：自定义值直通 builder
+        let mut qc2 = qc.clone();
+        qc2.max_datagram_frame_size = 1500;
+        let (t2, _) = build_hysteria_transport_config(&qc2);
+        assert!(
+            format!("{t2:?}").contains("datagram_receive_buffer_size: Some(1500)"),
+            "自定义值应直通，实际: {t2:?}"
+        );
     }
 
     /// 辅助：构造一对 QuinnQuicConn 对接（loopback）。
