@@ -256,7 +256,14 @@ async fn start_full_dispatched(
         xray_features::policy::Policy::default(),
         None,
     );
-    if let Some(pm) = instance.get_feature::<xray_app_policy::PolicyFeature>() {
+    // sm80③：出站 DialBridge 的 session policy（Go freedom.go:393 sessionPolicy
+    // 驱动 bridge connIdle/uplinkOnly/downlinkOnly）。装配时查 level 0（出站
+    // dispatch 签名无 user level，per-user 随 UDP dispatch 一并 deferred）。
+    let pm_opt = instance.get_feature::<xray_app_policy::PolicyFeature>();
+    let bridge_policy = pm_opt
+        .as_ref()
+        .map(|pm| xray_features::policy::PolicyManager::policy_for_level(pm.as_ref(), 0).timeout);
+    if let Some(pm) = pm_opt {
         dispatcher.set_policy_manager(pm);
     }
     dispatcher.stats = instance
@@ -306,11 +313,8 @@ async fn start_full_dispatched(
         &ohm,
         Some(loopback_sink),
         instance.get_feature::<xray_app_dns::DnsService>(),
+        bridge_policy.as_ref(),
     )?;
-
-    // 装配阶段依赖二次注入（bd f23r）：register_outbounds 后 ohm 就绪，
-    // 把 SimpleOhm 包成 OutboundTagSelector 桥到 DepBag，再次调所有
-    // feature 的 init_dependencies——本次能拿到 ohm 的 tag 列表。
     // 此次 init_dependencies 与 instance.new_from_built 里的第一次是幂等
     // 的（已 set_io 的 feature 跳过），允许双阶段注入。
     let ohm_selector: Arc<dyn xray_features::OutboundTagSelector> =
@@ -2606,8 +2610,14 @@ mod tests {
         let socks_port = probe.local_addr().unwrap().port();
         drop(probe);
 
-        // 2. 无 routing app：验证无 router 路径也有 sniffing+counter 管线
+        // 无 routing app：验证无 router 路径也有 sniffing+counter 管线。
+        // sm80①：tag counter 受 ForSystem().Stats 四门门控（默认关）——本测试
+        // 显式开满四门（Go testing 场景同款：stats 查询前先配 policy system）。
         let mut cfg = BuiltConfig::default();
+        cfg.apps.push(BuiltEntry {
+            kind: "policy".into(),
+            data: br#"{"system": {"statsInboundUplink": true, "statsInboundDownlink": true, "statsOutboundUplink": true, "statsOutboundDownlink": true}}"#.to_vec(),
+        });
         cfg.inbounds.push(BuiltInbound {
             entry: BuiltEntry { kind: "socks".into(), data: vec![] },
             tag: "socks-in".into(),

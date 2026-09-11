@@ -848,51 +848,57 @@ impl DefaultDispatcher {
         // Go: inbound downlink = inbound 读下行 = dn_r
         // Go: outbound uplink = outbound 读上行 = up_r
         // Go: outbound downlink = outbound 写下行 = dn_w
-        // oz1t：per-tag 计数受 policy.stats.user_uplink/user_downlink 门控——开关未开
-        // 不懒注册计数器（Go 等价 `policy.Stats.UserUplink/Downlink` 默认 false 即不计数）。
-        // 计数范围含协议 overhead：`mb.len()` 已包含 header+payload（payload 包内）；
-        // SizeStatWriter/Reader 累加 mb.len() = 用户上下行的完整字节数（Go SizeStatWriter
-        // 亦仅按 byte 数累加，overhead 由协议层封装时已含在 mb 中）。
-        let inbound_uplink = if policy.stats.user_uplink {
-            inbound_tag.and_then(|tag| {
-                get_or_register_counter_opt(
-                    self.stats.as_ref(),
-                    &format!("inbound>>>{tag}>>>traffic>>>uplink"),
-                )
-            })
-        } else {
-            None
-        };
-        let inbound_downlink = if policy.stats.user_downlink {
-            inbound_tag.and_then(|tag| {
-                get_or_register_counter_opt(
-                    self.stats.as_ref(),
-                    &format!("inbound>>>{tag}>>>traffic>>>downlink"),
-                )
-            })
-        } else {
-            None
-        };
-        let outbound_uplink = if policy.stats.user_uplink {
-            outbound_tag.and_then(|tag| {
-                get_or_register_counter_opt(
-                    self.stats.as_ref(),
-                    &format!("outbound>>>{tag}>>>traffic>>>uplink"),
-                )
-            })
-        } else {
-            None
-        };
-        let outbound_downlink = if policy.stats.user_downlink {
-            outbound_tag.and_then(|tag| {
-                get_or_register_counter_opt(
-                    self.stats.as_ref(),
-                    &format!("outbound>>>{tag}>>>traffic>>>downlink"),
-                )
-            })
-        } else {
-            None
-        };
+        // sm80①（原 oz1t 误用 per-user 门）：per-tag 计数受 `ForSystem().Stats`
+        // 四门门控（Go proxyman/inbound/always.go:26,34 + outbound/handler.go:39,47），
+        // 默认全 false 不计数；`UserUplink/Downlink` 只门控 user>>>email 计数
+        // （Go default.go:162-166）。计数范围含协议 overhead：`mb.len()` 已含
+        // header+payload，SizeStatWriter/Reader 累加语义与 Go 一致。
+        let sys = self
+            .policy_manager
+            .as_ref()
+            .map_or_else(xray_features::policy::SystemStats::default, |pm| {
+                pm.for_system()
+            });
+        let inbound_uplink = if sys.inbound_uplink {
+             inbound_tag.and_then(|tag| {
+                 get_or_register_counter_opt(
+                     self.stats.as_ref(),
+                     &format!("inbound>>>{tag}>>>traffic>>>uplink"),
+                 )
+             })
+         } else {
+             None
+         };
+        let inbound_downlink = if sys.inbound_downlink {
+             inbound_tag.and_then(|tag| {
+                 get_or_register_counter_opt(
+                     self.stats.as_ref(),
+                     &format!("inbound>>>{tag}>>>traffic>>>downlink"),
+                 )
+             })
+         } else {
+             None
+         };
+        let outbound_uplink = if sys.outbound_uplink {
+             outbound_tag.and_then(|tag| {
+                 get_or_register_counter_opt(
+                     self.stats.as_ref(),
+                     &format!("outbound>>>{tag}>>>traffic>>>uplink"),
+                 )
+             })
+         } else {
+             None
+         };
+        let outbound_downlink = if sys.outbound_downlink {
+             outbound_tag.and_then(|tag| {
+                 get_or_register_counter_opt(
+                     self.stats.as_ref(),
+                     &format!("outbound>>>{tag}>>>traffic>>>downlink"),
+                 )
+             })
+         } else {
+             None
+         };
 
         // 包装 link 端的 writer/reader
         // inbound 端：写上行（uplink）+ 读下行（downlink）
@@ -1038,6 +1044,14 @@ impl DefaultDispatcher {
         let user_host = access
             .as_ref()
             .map_or(String::new(), |a| source_host(&a.from).to_string());
+        // sm80①：outbound tag counter 门控（Go proxyman/outbound/handler.go:39,47
+        // ForSystem().Stats.Outbound{Uplink,Downlink}），spawn 前取快照进 async。
+        let sys_stats = self
+            .policy_manager
+            .as_ref()
+            .map_or_else(xray_features::policy::SystemStats::default, |pm| {
+                pm.for_system()
+            });
         let policy_stats = policy.stats.clone();
         let outbound_reader = outbound.reader;
         let outbound_writer = outbound.writer;
@@ -1163,14 +1177,23 @@ impl DefaultDispatcher {
             // outbound counter（对应 Go routedDispatch 的 getStatCounter，按命中 tag 懒注册）：
             // uplink = outbound 读上行（reader），downlink = outbound 写下行（writer）
             let out_tag = handler.tag().to_string();
-            let out_up = get_or_register_counter_opt(
-                stats.as_ref(),
-                &format!("outbound>>>{out_tag}>>>traffic>>>uplink"),
-            );
-            let out_dn = get_or_register_counter_opt(
-                stats.as_ref(),
-                &format!("outbound>>>{out_tag}>>>traffic>>>downlink"),
-            );
+            // sm80①：同 dispatch()，outbound tag counter 受 ForSystem 门控（默认关）。
+            let out_up = if sys_stats.outbound_uplink {
+                get_or_register_counter_opt(
+                    stats.as_ref(),
+                    &format!("outbound>>>{out_tag}>>>traffic>>>uplink"),
+                )
+            } else {
+                None
+            };
+            let out_dn = if sys_stats.outbound_downlink {
+                get_or_register_counter_opt(
+                    stats.as_ref(),
+                    &format!("outbound>>>{out_tag}>>>traffic>>>downlink"),
+                )
+            } else {
+                None
+            };
 
             // CachedReader 始终包装 outbound_reader，sniffing 时回放缓存首包
             let mut reader: Box<dyn xray_buf::io::Reader> =
@@ -1710,6 +1733,40 @@ mod tests {
     use super::*;
     use crate::sniffer::SniffResult;
     use xray_common::net::network::Network;
+
+    /// sm80① 测试 mock：`for_system` 四门全开（tag counter 门控路径）。
+    #[derive(Debug)]
+    struct SystemStatsAllOnPolicyManager;
+    impl xray_features::policy::PolicyManager for SystemStatsAllOnPolicyManager {
+        fn policy_for_level(&self, _level: u32) -> xray_features::policy::Policy {
+            xray_features::policy::Policy::default()
+        }
+        fn for_system(&self) -> xray_features::policy::SystemStats {
+            xray_features::policy::SystemStats {
+                inbound_uplink: true,
+                inbound_downlink: true,
+                outbound_uplink: true,
+                outbound_downlink: true,
+                ..Default::default()
+            }
+        }
+    }
+
+    /// sm80① 测试 mock：仅 outbound 两门开（验证门是逐方向的）。
+    #[derive(Debug)]
+    struct OutboundOnlyPolicyManager;
+    impl xray_features::policy::PolicyManager for OutboundOnlyPolicyManager {
+        fn policy_for_level(&self, _level: u32) -> xray_features::policy::Policy {
+            xray_features::policy::Policy::default()
+        }
+        fn for_system(&self) -> xray_features::policy::SystemStats {
+            xray_features::policy::SystemStats {
+                outbound_uplink: true,
+                outbound_downlink: true,
+                ..Default::default()
+            }
+        }
+    }
     use xray_common::net::address::Address;
 
     /// 测试用 SniffResult
@@ -2161,6 +2218,9 @@ mod tests {
         d.ohm = Some(Arc::new(ohm));
         d.router = Some(Arc::new(ResolvedRouter));
         d.stats = Some(Arc::clone(&stats) as Arc<dyn xray_features::stats::Manager>);
+        // sm80①：outbound tag counter 受 ForSystem 门控——开启后本测试的
+        // 懒注册断言才成立。
+        d.set_policy_manager(Arc::new(SystemStatsAllOnPolicyManager));
 
         let (up_r, up_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
         let (dn_r, dn_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
@@ -2382,6 +2442,100 @@ mod tests {
             "policy off: online map must not be registered"
         );
         w.shutdown();
+    }
+
+    /// sm80①：outbound tag counter 受 ForSystem().Stats 门控——
+    /// 默认（无 policy manager，SystemStats 全 false）流量走完也不注册计数器；
+    /// mock 开启 outbound 两门后按方向计数。
+    #[tokio::test]
+    async fn dispatch_link_tag_counters_default_off_until_for_system_enabled() {
+        use xray_buf::multi::MultiBuffer;
+        use xray_common::net::address::Address;
+        use xray_common::net::destination::Destination;
+
+        #[derive(Debug)]
+        struct EchoOnce;
+        impl DispatchHandler for EchoOnce {
+            fn tag(&self) -> &str {
+                "echo"
+            }
+            fn dispatch(
+                &self,
+                _dest: &Destination,
+                link: xray_transport::link::Link,
+            ) -> PinFuture<()> {
+                Box::pin(async move {
+                    let mut r = link.reader;
+                    let mut w = link.writer;
+                    if let Ok(mb) = r.read_multi_buffer().await {
+                        if !mb.is_empty() {
+                            let _ = w.write_multi_buffer(mb).await;
+                        }
+                    }
+                    w.shutdown();
+                })
+            }
+        }
+
+        async fn run_echo_traffic(d: &DefaultDispatcher) {
+            let (up_r, up_w) =
+                xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+            let (dn_r, dn_w) =
+                xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+            let outbound = xray_transport::link::Link::new(Box::new(up_r), Box::new(dn_w));
+            let dest = Destination::new(
+                Address::new_domain("gated.example.com".to_string()),
+                Port::new(443),
+                Network::TCP,
+            );
+            d.dispatch_link(&dest, outbound, &SniffingRequest::default(), None, None)
+                .expect("dispatch_link ok");
+            let mut w: Box<dyn xray_buf::io::Writer> = Box::new(up_w);
+            let mut mb = MultiBuffer::new();
+            mb.merge_bytes(b"tag counter probe");
+            w.write_multi_buffer(mb).await.unwrap();
+            let mut r: Box<dyn xray_buf::io::Reader> = Box::new(dn_r);
+            let resp = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
+                .await
+                .expect("timeout waiting echo")
+                .unwrap();
+            assert_eq!(resp.to_vec(), b"tag counter probe");
+        }
+
+        // 场景 A：默认（无 pm）不计数。
+        let stats = Arc::new(xray_app_stats::Manager::new_running());
+        let mut d = DefaultDispatcher::new();
+        let ohm = SimpleOhm::new();
+        ohm.set_default(Arc::new(EchoOnce));
+        d.ohm = Some(Arc::new(ohm));
+        d.stats = Some(Arc::clone(&stats) as Arc<dyn xray_features::stats::Manager>);
+        run_echo_traffic(&d).await;
+        assert!(
+            stats.get_counter("outbound>>>echo>>>traffic>>>uplink").is_none(),
+            "ForSystem default false: tag counter must NOT be registered"
+        );
+        assert!(
+            stats.get_counter("outbound>>>echo>>>traffic>>>downlink").is_none(),
+            "ForSystem default false: tag counter must NOT be registered"
+        );
+
+        // 场景 B：OutboundOnly mock 开启 outbound 两门 → 按方向计数。
+        let stats = Arc::new(xray_app_stats::Manager::new_running());
+        let mut d = DefaultDispatcher::new();
+        let ohm = SimpleOhm::new();
+        ohm.set_default(Arc::new(EchoOnce));
+        d.ohm = Some(Arc::new(ohm));
+        d.stats = Some(Arc::clone(&stats) as Arc<dyn xray_features::stats::Manager>);
+        d.set_policy_manager(Arc::new(OutboundOnlyPolicyManager));
+        run_echo_traffic(&d).await;
+        let up = stats
+            .get_counter("outbound>>>echo>>>traffic>>>uplink")
+            .expect("outbound_uplink enabled: counter must be registered");
+        let dn = stats
+            .get_counter("outbound>>>echo>>>traffic>>>downlink")
+            .expect("outbound_downlink enabled: counter must be registered");
+        assert!(up.value() > 0, "uplink counted {} bytes", up.value());
+        assert!(dn.value() > 0, "downlink counted {} bytes", dn.value());
     }
 
     // ---- DialTaggedOutbound（bd kz1，Go tagged/taggedimpl）----
@@ -3472,7 +3626,8 @@ mod tests {
     }
 
     /// oz1t 共享测试装置：构造带 EchoHandler + ResolvedRouter 的 dispatcher，
-    /// `gate_on=true` 时打开 default_policy 的 user_uplink/user_downlink 开关。
+    /// `gate_on=true` 时经 ForSystem 门开启 tag counter（sm80①：per-tag 计数
+    /// 门 = ForSystem().Stats，原 oz1t 直改 default_policy.user_* 是错误的门）。
     fn build_oz1t_dispatcher(gate_on: bool) -> (
         Arc<xray_app_stats::Manager>,
         DefaultDispatcher,
@@ -3527,8 +3682,7 @@ mod tests {
         d.router = Some(Arc::new(TagOutRouter));
         d.stats = Some(Arc::clone(&stats) as Arc<dyn xray_features::stats::Manager>);
         if gate_on {
-            d.default_policy.stats.user_uplink = true;
-            d.default_policy.stats.user_downlink = true;
+            d.set_policy_manager(Arc::new(SystemStatsAllOnPolicyManager));
         }
         (stats, d)
     }
@@ -3558,6 +3712,59 @@ mod tests {
         w.write_multi_buffer(mb).await.unwrap();
         let r: Box<dyn xray_buf::io::Reader> = Box::new(dn_r);
         (w, r)
+    }
+
+    /// sm80③：DialBridge.with_policy 注入的 TimeoutPolicy 驱动 bridge 数据面——
+    /// 静默远端 + 注入 connection_idle=100ms，bridge 必须在短窗内结束
+    /// （无注入时 SessionDefault 300s，外层 5s 守卫必然超时 panic）。
+    /// 证明装配层 `policy_for_level(level).timeout` 注入真实生效。
+    #[tokio::test]
+    async fn dial_bridge_with_policy_drives_conn_idle() {
+        use xray_common::net::address::Address;
+        use xray_common::net::destination::Destination;
+        use xray_common::net::port::Port;
+
+        // dial 返回静默 duplex server 端；client 端 forget 保活防 EOF 提前结束。
+        let dial: DialFn = Arc::new(move |_dest: &Destination| {
+            Box::pin(async move {
+                let (client, server) = tokio::io::duplex(4096);
+                std::mem::forget(client);
+                let conn = Box::new(xray_transport::connection::DuplexConnection::new(server))
+                    as Box<dyn Connection>;
+                Ok(conn)
+            })
+        });
+        let bridge = DialBridge::new("policy-bridge", dial);
+        let mut policy = xray_features::policy::TimeoutPolicy::default();
+        policy.connection_idle = std::time::Duration::from_millis(100);
+        policy.uplink_only = std::time::Duration::from_millis(100);
+        policy.downlink_only = std::time::Duration::from_millis(100);
+        bridge.with_policy(policy);
+
+        let (up_r, up_w) =
+            xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let (dn_r, dn_w) =
+            xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        drop(up_w); // 上行无数据：conn_idle 从 bridge 启动起计
+        drop(dn_r);
+        let link = xray_transport::link::Link::new(
+            Box::new(up_r) as Box<dyn xray_buf::io::Reader>,
+            Box::new(dn_w) as Box<dyn xray_buf::io::Writer>,
+        );
+        let dest = Destination::new(
+            Address::new_domain("idle.example.com".to_string()),
+            Port::new(443),
+            Network::TCP,
+        );
+        let started = std::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(5), bridge.dispatch(&dest, link))
+            .await
+            .expect("bridge must end on injected conn_idle (100ms), not SessionDefault 300s");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "bridge must honor injected 100ms idle, elapsed {:?}",
+            started.elapsed()
+        );
     }
 }
 

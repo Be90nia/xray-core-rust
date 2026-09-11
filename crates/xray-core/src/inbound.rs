@@ -1045,13 +1045,14 @@ async fn ss_legacy_pipeline<C>(
     ib: std::sync::Arc<xray_proxy_ss::inbound::SsInbound>,
     handler: std::sync::Arc<dyn DispatchHandler>,
     stream: C,
+    // sm80④：policy Timeouts.Handshake（Go SessionDefault 60s 同源；装配层注入）
+    handshake_timeout: std::time::Duration,
 ) where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    // 首包读超时（Go SessionDefault Timeouts.Handshake=60s 同源）：静默连接
-    // 占位防护；transport 分支共用本函数，一并覆盖。
+    // 首包读超时：静默连接占位防护；transport 分支共用本函数，一并覆盖。
     let handshake =
-        match tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, ib.handle_conn(stream)).await {
+        match tokio::time::timeout(handshake_timeout, ib.handle_conn(stream)).await {
             Ok(r) => r.map(|(header, ss_stream)| (header.address, header.port, ss_stream)),
             Err(_) => {
                 tracing::debug!("ss legacy inbound handshake timeout");
@@ -1076,6 +1077,8 @@ pub async fn serve_ss(
     listener: InboundTcpListener,
     ohm: Arc<SimpleOhm>,
     inbound: SsInboundMode,
+    // sm80④：policy Timeouts.Handshake（legacy 与 ss2022 TCP 握手共用）
+    handshake_timeout: std::time::Duration,
 ) -> std::io::Result<()> {
     let handler = ohm
         .get_default_handler()
@@ -1139,10 +1142,10 @@ pub async fn serve_ss(
         tokio::spawn(async move {
             match mode {
                 SsInboundMode::Legacy(ib) => {
-                    ss_legacy_pipeline(ib, handler, stream).await;
+                    ss_legacy_pipeline(ib, handler, stream, handshake_timeout).await;
                 }
                 SsInboundMode::Ss2022(ib) => {
-                    let handshake = tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, ib.handle_conn(stream)).await;
+                    let handshake = tokio::time::timeout(handshake_timeout, ib.handle_conn(stream)).await;
                     let handshake = match handshake {
                         Ok(r) => r
                             .map(|resp| (resp.address, resp.port, resp.stream))
@@ -2078,6 +2081,8 @@ async fn spawn_one_inbound(
             let decryption = build_vless_decryption(&ib.entry.data)?;
             let options = VlessInboundOptions {
                 decryption: decryption.clone(),
+                // sm80④：policy Timeouts.Handshake 下传（Go inbound.go:281-284）
+                handshake_timeout: Some(handshake_timeout_for(&policy, 0)),
                 ..Default::default()
             };
             let settings = xray_transport::dialer::StreamSettings::from_json(
@@ -2156,6 +2161,7 @@ async fn spawn_one_inbound(
                     std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("parse addr: {e}"))
                 })?;
                 tracing::info!(tag = %ib.tag, addr = %addr, network = %settings.protocol, security = %settings.security, users = validator.get_key_count(), "trojan transport inbound listening");
+                let hs_timeout = handshake_timeout_for(&policy, 0);
                 let on_conn: xray_transport::listener_registry::ConnHandler = Arc::new(move |conn| {
                     let validator = Arc::clone(&validator);
                     let handler = Arc::clone(&handler);
@@ -2165,6 +2171,7 @@ async fn spawn_one_inbound(
                         xray_proxy_trojan::serve_trojan_conn(
                             conn, validator, handler, fb_policy, peer, local,
                             String::new(), String::new(),
+                            hs_timeout,
                         ).await;
                     });
                 });
@@ -2174,7 +2181,7 @@ async fn spawn_one_inbound(
                 let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone()).await?;
                 tracing::info!(tag = %ib.tag, addr = %addr, users = users.len(), tls = tls.is_some(), "trojan inbound listening");
                 Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                    serve_trojan(listener, ohm, users, fallbacks, tls).await
+                    serve_trojan(listener, ohm, users, fallbacks, tls, handshake_timeout_for(&policy, 0)).await
                 })))
             }
         }
@@ -2195,6 +2202,7 @@ async fn spawn_one_inbound(
                     std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("parse addr: {e}"))
                 })?;
                 tracing::info!(tag = %ib.tag, addr = %addr, network = %settings.protocol, security = %settings.security, "vmess transport inbound listening");
+                let hs_timeout = handshake_timeout_for(&policy, 0);
                 let on_conn: xray_transport::listener_registry::ConnHandler = Arc::new(move |conn| {
                     let handler = Arc::clone(&handler);
                     let validator = Arc::clone(&validator);
@@ -2203,6 +2211,7 @@ async fn spawn_one_inbound(
                         let (peer, _local) = transport_conn_addrs(conn.as_ref(), bind_addr);
                         if let Err(e) = xray_proxy_vmess::handle_vmess_connection(
                             conn, &handler, &validator, &history, is_drain,
+                            hs_timeout,
                         ).await {
                             // Go vmess inbound.go:250：拒绝 AtInfo + RemoteAddr。
                             tracing::info!(peer = %peer, error = %e, "vmess transport connection ended with error");
@@ -2215,7 +2224,7 @@ async fn spawn_one_inbound(
                 let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone()).await?;
                 tracing::info!(tag = %ib.tag, addr = %addr, tls = tls.is_some(), "vmess inbound listening");
                 Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                    serve_vmess(listener, ohm, validator, tls).await
+                    serve_vmess(listener, ohm, validator, tls, handshake_timeout_for(&policy, 0)).await
                 })))
             }
         }
@@ -2318,8 +2327,9 @@ async fn spawn_one_inbound(
                     let on_conn: xray_transport::listener_registry::ConnHandler = Arc::new(move |conn| {
                         let ib = Arc::clone(&ss_ib);
                         let handler = Arc::clone(&handler);
+                        let hs_timeout = handshake_timeout_for(&policy, 0);
                         tokio::spawn(async move {
-                            ss_legacy_pipeline(ib, handler, conn).await;
+                            ss_legacy_pipeline(ib, handler, conn, hs_timeout).await;
                         });
                     });
                     return spawn_transport_listener_inbound(&ib.tag, bind_addr, settings, shutdown_token, on_conn).await;
@@ -2330,7 +2340,7 @@ async fn spawn_one_inbound(
             let inbound = parse_ss_inbound_config(&ib.entry.data)?;
             tracing::info!(tag = %ib.tag, addr = %addr, "shadowsocks inbound listening");
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                serve_ss(listener, ohm, inbound).await
+                serve_ss(listener, ohm, inbound, handshake_timeout_for(&policy, 0)).await
             })))
         }
         // hysteria inbound：HysteriaInboundHandler impl InboundHandler（rxw：接 dispatcher）
@@ -2685,8 +2695,9 @@ async fn spawn_unix_inbound(
                     Arc::new(move |conn| {
                         let handler = Arc::clone(&handler);
                         let inbound = Arc::clone(&inbound);
+                        let hs_timeout = handshake_timeout_for(&policy, 0);
                         tokio::spawn(async move {
-                            ss_legacy_pipeline(inbound, handler, conn).await;
+                            ss_legacy_pipeline(inbound, handler, conn, hs_timeout).await;
                         });
                     })
                 }))

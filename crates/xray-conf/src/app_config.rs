@@ -47,9 +47,11 @@ pub struct PolicyLevel {
     /// Go json `connIdle`（Rust 方言 `conn_idle` 别名保留）。
     #[serde(skip_serializing_if = "Option::is_none", alias = "conn_idle")]
     pub conn_idle: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Go json `uplinkOnly`（官方键；Rust 方言 `uplink` 保留）。
+    #[serde(skip_serializing_if = "Option::is_none", alias = "uplinkOnly")]
     pub uplink: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Go json `downlinkOnly`（官方键；Rust 方言 `downlink` 保留）。
+    #[serde(skip_serializing_if = "Option::is_none", alias = "downlinkOnly")]
     pub downlink: Option<u32>,
     /// Per-connection 缓冲，KB 单位；负值（如 -1）= 无限制。
     /// Go 语义见 infra/conf/policy.go:42-50（×1024 转字节，负值 → proto -1）。
@@ -324,6 +326,19 @@ mod tests {
         let sys = c.system.as_ref().unwrap();
         assert_eq!(sys.stats_inbound_uplink, Some(true));
         assert_eq!(sys.stats_outbound_downlink, Some(true));
+    }
+
+    /// 官方 uplinkOnly/downlinkOnly 键（Go infra/conf/policy.go:7-16）必须解析；
+    /// 36v8：此前无 alias 被静默丢弃，连接不按上/下行超时关闭。
+    #[test]
+    fn policy_official_uplink_downlink_only_keys() {
+        let c: PolicyConfig = serde_json::from_value(serde_json::json!({
+            "levels": {"0": {"uplinkOnly": 30, "downlinkOnly": 60}}
+        }))
+        .unwrap();
+        let l = &c.levels["0"];
+        assert_eq!(l.uplink, Some(30), "uplinkOnly must map to uplink");
+        assert_eq!(l.downlink, Some(60), "downlinkOnly must map to downlink");
     }
 
     /// 旧 Rust snake_case 方言键仍可解析（alias 双读）。

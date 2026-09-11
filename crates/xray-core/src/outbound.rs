@@ -152,6 +152,9 @@ pub fn register_outbounds(
     ohm: &SimpleOhm,
     loopback_sink: Option<Arc<dyn LoopbackSink>>,
     dns: Option<Arc<xray_app_dns::DnsService>>,
+    // sm80③：出站 DialBridge 的 session policy（connIdle/uplinkOnly/downlinkOnly），
+    // 装配层（functions.rs）从 policy manager 查 level 0 得出；None = SessionDefault。
+    bridge_policy: Option<&xray_features::policy::TimeoutPolicy>,
 ) -> Result<()> {
     // Phase 1: 注册所有 handler，收集需要代理链的 DialBridge 引用
     let mut chain_bridges: Vec<(Arc<DialBridge>, String)> = Vec::new(); // (bridge, chain_tag)
@@ -174,6 +177,7 @@ pub fn register_outbounds(
             &mut mux_bridges,
             dns.as_ref(),
             &inbound_default_rules,
+            bridge_policy,
         ) {
             Ok((handler, bridge_ref, proxy_chain_tag)) => {
                 // Go proxyman/outbound/outbound.go:109-111：首个注册成功者即默认
@@ -366,6 +370,9 @@ fn wrap_bridge(
     target_strategy: Option<DomainStrategy>,
     dns: Option<&Arc<xray_app_dns::DnsService>>,
     send_through: Option<&xray_transport::system_dialer::SendThroughSpec>,
+    // sm80③：装配时查好的 session policy（对应 Go freedom.go:393 sessionPolicy
+    // 驱动 bridge 数据面 connIdle/uplinkOnly/downlinkOnly）；None = SessionDefault。
+    bridge_policy: Option<&xray_features::policy::TimeoutPolicy>,
 ) -> std::result::Result<(Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>), BuildError> {
     let dial_fn = match target_strategy {
         Some(s) => wrap_dial_with_target_strategy(dial_fn, s, dns.cloned()),
@@ -377,6 +384,9 @@ fn wrap_bridge(
         None => dial_fn,
     };
     let bridge = Arc::new(DialBridge::new(tag, dial_fn));
+    if let Some(p) = bridge_policy {
+        bridge.with_policy(p.clone());
+    }
     let handler = Arc::clone(&bridge) as Arc<dyn DispatchHandler>;
     let bridge_ref = if proxy_chain_tag.is_some() { Some(bridge) } else { None };
     Ok((handler, bridge_ref, proxy_chain_tag.clone()))
@@ -398,6 +408,7 @@ pub fn build_single_outbound(
         &mut mux_bridges,
         None,
         &std::collections::HashMap::new(),
+        None, // sm80③：API 单构建路径无 policy manager，SessionDefault 兜底
     )?;
     Ok(handler)
 }
@@ -542,6 +553,7 @@ fn try_build_handler(
     // 入站 tag → 默认 final rule 类型（freedom 默认规则按入站协议名推导，
     // Go getDefaultFinalRule；API 单构建路径传空表 = 无默认规则）
     inbound_default_rules: &std::collections::HashMap<String, xray_proxy_freedom::DefaultRuleType>,
+    bridge_policy: Option<&xray_features::policy::TimeoutPolicy>,
 ) -> std::result::Result<(Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>), BuildError> {
     let (handler, bridge_ref, proxy_chain_tag) = build_protocol_handler(
         ob,
@@ -549,6 +561,7 @@ fn try_build_handler(
         mux_bridges,
         dns,
         inbound_default_rules,
+        bridge_policy,
     )?;
     if ob.entry.kind != "mux" {
         if let Some(concurrency) = outbound_mux_concurrency(ob) {
@@ -610,6 +623,8 @@ fn build_protocol_handler(
     // 入站 tag → 默认 final rule 类型（freedom 默认规则按入站协议名推导，
     // Go getDefaultFinalRule；API 单构建路径传空表 = 无默认规则）
     inbound_default_rules: &std::collections::HashMap<String, xray_proxy_freedom::DefaultRuleType>,
+    // sm80③：装配时查好的 session policy（Go freedom.go:393），注入 DialBridge
+    bridge_policy: Option<&xray_features::policy::TimeoutPolicy>,
 ) -> std::result::Result<(Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>), BuildError> {
     let proxy_chain_tag = parse_proxy_chain_tag(ob.proxy_settings_json.as_ref());
     // targetStrategy（bd bqm）：字符串 → 枚举；AsIs（无策略）不包装
@@ -645,6 +660,9 @@ fn build_protocol_handler(
             // TCP 走 DialBridge（fragment/override/proxyProtocol 经 DialFn 消费），UDP 走
             // FreedomDispatchBridge（noises + override + finalRules + 入站默认规则）
             let tcp_bridge = Arc::new(DialBridge::new(ob.tag.clone(), dial_fn));
+            if let Some(p) = bridge_policy {
+                tcp_bridge.with_policy(p.clone());
+            }
             let mut bridge = xray_proxy_freedom::FreedomDispatchBridge::from_bridge(
                 Arc::clone(&tcp_bridge),
             )
@@ -663,13 +681,13 @@ fn build_protocol_handler(
             let config = parse_vless_config(&ob.entry.data)?;
             let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_vless::make_vless_dial_fn(Arc::new(config));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
         }
         "trojan" => {
             let config = parse_trojan_config(&ob.entry.data)?;
             let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_trojan::make_trojan_dial_fn(Arc::new(config));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
         }
         "blackhole" => {
             let response = parse_blackhole_response(&ob.entry.data);
@@ -690,7 +708,7 @@ fn build_protocol_handler(
                 ),
             });
             let dial_fn = xray_proxy_socks::make_socks_dial_fn(client);
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
         }
         "mux" => {
             let (concurrency, via_tag) = parse_mux_config(&ob.entry.data)?;
@@ -704,14 +722,14 @@ fn build_protocol_handler(
             let config = xray_proxy_vmess::parse_vmess_config(&ob.entry.data)?;
             let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_vmess::make_vmess_dial_fn(Arc::new(config));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
         }
         "shadowsocks" => {
             let config = xray_proxy_ss::parse_ss_config(&ob.entry.data)?;
             let config =
                 config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_ss::make_ss_dial_fn(Arc::new(config));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
         }
         "hysteria" => {
             let (server_addr, auth, server_name) = parse_hysteria_config(&ob.entry.data)?;
@@ -736,13 +754,13 @@ fn build_protocol_handler(
             ).map_err(|e| format!("hysteria transport: {e}"))?
                 .with_salamander(salamander);
             let dial_fn = xray_proxy_hysteria::make_hysteria_dial_fn(config, Arc::new(transport));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
         }
         "anytls" => {
             let config = parse_anytls_config(&ob.entry.data)?;
             let client = Arc::new(xray_proxy_anytls::AnytlsClient::new(config));
             let dial_fn = xray_proxy_anytls::make_anytls_dial_fn(client);
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
         }
         "tuic" => {
             let s = parse_tuic_config(&ob.entry.data)?;
@@ -765,7 +783,7 @@ fn build_protocol_handler(
                 rustls_config,
                 options,
             );
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
         }
         "wireguard" => {
             let config = parse_wireguard_config(&ob.entry.data)?;
@@ -798,7 +816,7 @@ fn build_protocol_handler(
                 });
             let dial_fn =
                 xray_proxy_wireguard::make_wireguard_dial_fn(config, dns.cloned(), system_dialer);
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
         }
         "dns" => {
             let handler = parse_dns_outbound_config(&ob.entry.data)?;
@@ -824,22 +842,22 @@ fn build_protocol_handler(
             let config = xray_proxy_http::parse_http_config(&ob.entry.data)?;
             let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_http::make_http_dial_fn(Arc::new(config));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
         }
         "naive" => {
             let config = parse_naive_config(&ob.entry.data)?;
             let dial_fn = xray_transport_naive::make_naive_dial_fn(config);
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
         }
         "dokodemo" => {
             let config = parse_dokodemo_config(&ob.entry.data)?;
             let dial_fn = xray_proxy_dokodemo::make_dokodemo_dial_fn(config);
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
         }
         #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
         "tun" => {
             let dial_fn = xray_proxy_tun::make_tun_dial_fn();
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref())
+            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), bridge_policy)
         }
         #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
         "tun" => {
@@ -2520,7 +2538,7 @@ mod tests {
         cfg.outbounds.push(make_outbound("freedom", "proxy", "{}"));
         cfg.outbounds.push(make_outbound("freedom", "direct", "{}"));
         let ohm = SimpleOhm::new();
-        register_outbounds(&cfg, &ohm, None, None).unwrap();
+        register_outbounds(&cfg, &ohm, None, None, None).unwrap();
         let d = ohm.get_default_handler().expect("default handler set");
         assert_eq!(d.tag(), "proxy", "首个 outbound 应保持为默认出站");
     }
@@ -2578,7 +2596,7 @@ mod tests {
         built.outbounds.push(make_outbound("freedom", "direct", "{}"));
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None).unwrap();
 
         assert!(ohm.get_default_handler().is_some(), "freedom should be default");
         assert!(ohm.get_handler("direct").is_some(), "freedom should be tagged");
@@ -2591,7 +2609,7 @@ mod tests {
         built.outbounds.push(make_outbound("freedom", "direct", "{}"));
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None).unwrap();
 
         // 第一个设为 default，"direct" 也设为 default（覆盖）
         assert!(ohm.get_default_handler().is_some());
@@ -2640,6 +2658,7 @@ mod tests {
             &mut Vec::new(),
             None,
             &std::collections::HashMap::new(),
+            None,
         )
         .expect("build freedom handler");
 
@@ -2722,7 +2741,7 @@ mod tests {
         built.outbounds.push(make_outbound("vless", "vless-out", settings));
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None).unwrap();
 
         assert!(ohm.get_handler("vless-out").is_some(), "vless should be registered");
     }
@@ -2769,7 +2788,7 @@ mod tests {
         built.outbounds.push(make_outbound("trojan", "trojan-out", settings));
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None).unwrap();
 
         assert!(ohm.get_handler("trojan-out").is_some(), "trojan should be registered");
     }
@@ -2781,7 +2800,7 @@ mod tests {
         built.outbounds.push(make_outbound("dokodemo", "dokodemo-out", settings));
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None).unwrap();
 
         assert!(ohm.get_handler("dokodemo-out").is_some(), "dokodemo should be registered");
     }
@@ -2793,7 +2812,7 @@ mod tests {
         built.outbounds.push(make_outbound("tun", "tun-out", "{}"));
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None).unwrap();
 
         assert!(ohm.get_handler("tun-out").is_some(), "tun should be registered");
     }
@@ -2808,7 +2827,7 @@ mod tests {
         built.outbounds.push(make_outbound("tun", "tun-out", "{}"));
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None).unwrap();
 
         assert!(
             ohm.get_handler("tun-out").is_none(),
@@ -2829,7 +2848,7 @@ mod tests {
         built.outbounds.push(make_outbound("vless", "bad-vless", settings));
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None).unwrap();
 
         assert!(
             ohm.get_handler("bad-vless").is_none(),
@@ -2841,7 +2860,7 @@ mod tests {
     fn register_empty_outbounds_noop() {
         let built = BuiltConfig::default();
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None).unwrap();
         assert!(ohm.get_default_handler().is_none());
     }
 
@@ -3161,7 +3180,7 @@ mod tests {
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("blackhole", "bh", "{}"));
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None).unwrap();
         assert!(ohm.get_handler("bh").is_some(), "blackhole should register");
     }
 
@@ -3172,7 +3191,7 @@ mod tests {
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("blackhole", "bh-http", settings));
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None).unwrap();
         assert!(ohm.get_handler("bh-http").is_some());
     }
 
@@ -3182,7 +3201,7 @@ mod tests {
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("socks", "socks-out", settings));
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None).unwrap();
         assert!(ohm.get_handler("socks-out").is_some(), "socks outbound should register");
     }
 
@@ -3192,7 +3211,7 @@ mod tests {
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("socks", "socks-auth", settings));
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None).unwrap();
         assert!(ohm.get_handler("socks-auth").is_some());
     }
 
@@ -3202,7 +3221,7 @@ mod tests {
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("mux", "mux-out", settings));
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None).unwrap();
         assert!(ohm.get_handler("mux-out").is_some(), "mux outbound should register");
     }
 
@@ -3211,7 +3230,7 @@ mod tests {
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("mux", "mux-default", "{}"));
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None).unwrap();
         assert!(ohm.get_handler("mux-default").is_some());
     }
 
@@ -3274,6 +3293,7 @@ mod tests {
             &mut Vec::new(),
             None,
             &std::collections::HashMap::new(),
+            None,
         )
         .expect("build muxed freedom handler");
         assert_eq!(handler.tag(), "muxed", "wrapper keeps outbound tag");
@@ -3298,6 +3318,7 @@ mod tests {
             &mut Vec::new(),
             None,
             &std::collections::HashMap::new(),
+            None,
         )
         .expect("build plain freedom handler");
         assert!(
@@ -3411,7 +3432,7 @@ mod tests {
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("socks", "bad-socks", "{}"));
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None).unwrap();
         assert!(ohm.get_handler("bad-socks").is_none());
     }
 
@@ -3447,7 +3468,7 @@ mod tests {
         built.outbounds.push(ob);
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None).unwrap();
 
         assert!(ohm.get_handler("proxy-out").is_some(), "proxy-out should be registered");
         assert!(ohm.get_handler("chain-out").is_some(), "chain-out should be registered");
@@ -3801,7 +3822,7 @@ mod tests {
         let built = cfg.build().unwrap();
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, Some(hosts_dns_service())).unwrap();
+        register_outbounds(&built, &ohm, None, Some(hosts_dns_service()), None).unwrap();
         let handler = ohm.get_handler("out").expect("outbound registered");
 
         // inbound 侧 link：pipe 双向
@@ -3839,7 +3860,7 @@ mod tests {
         .build()
         .unwrap();
         let ohm2 = SimpleOhm::new();
-        register_outbounds(&plain, &ohm2, None, Some(hosts_dns_service())).unwrap();
+        register_outbounds(&plain, &ohm2, None, Some(hosts_dns_service()), None).unwrap();
         let h2 = ohm2.get_handler("plain").unwrap();
         let (up_r2, mut up_w2) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
         let (mut dn_r2, dn_w2) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
@@ -3982,7 +4003,7 @@ mod tests {
             let built = cfg.build().unwrap();
 
             let ohm = SimpleOhm::new();
-            register_outbounds(&built, &ohm, None, None).unwrap();
+            register_outbounds(&built, &ohm, None, None, None).unwrap();
             let handler = ohm.get_handler("trojan-out").expect("trojan-out registered");
 
             let (up_r, mut up_w) =
