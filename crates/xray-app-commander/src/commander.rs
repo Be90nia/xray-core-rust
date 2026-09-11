@@ -184,6 +184,54 @@ impl Service for HandlerServiceMarker {
     }
 }
 
+/// Go `infra/conf/api.go:29-42` 认可的六服务名 type_url 集合。
+///
+/// `ApiConfig.services` 声明的服务决定 [`Commander`] `Feature::start` 实际暴露的
+/// gRPC service 面（Go `Commander.Start` 只注册 `config.Service` 列举的服务，
+/// 未声明 = 不暴露）。
+pub mod api_services {
+    /// HandlerService（Go `handlerservice.Config`）。
+    pub const HANDLER: &str = super::HandlerServiceMarker::TYPE_URL;
+    /// ReflectionService（Go `commander.ReflectionConfig`）。
+    pub const REFLECTION: &str = super::ReflectionService::TYPE_URL;
+    /// LoggerService（Go `log/command.Config`）。
+    pub const LOGGER: &str = "xray.app.log.command.Config";
+    /// StatsService（Go `stats/command.Config`）。
+    pub const STATS: &str = "xray.app.stats.command.Config";
+    /// RoutingService（Go `router/command.Config`）。
+    pub const ROUTING: &str = "xray.app.router.command.Config";
+    /// ObservatoryService（Go `core/app/observatory/command.Config`）。
+    pub const OBSERVATORY: &str = "xray.core.app.observatory.command.Config";
+}
+
+/// 配置声明的 command service marker（Logger/Stats/Routing/Observatory）。
+///
+/// 对应 Go `serial.ToTypedMessage(&xxx.Config{})` 的 TypedMessage 条目。实际
+/// gRPC 实现由装配层注入后端（`set_*_service`），marker 仅记录配置声明，
+/// 供 `serve_grpc` 门控实际暴露面。
+#[derive(Debug, Clone, Copy)]
+pub struct DeclaredServiceMarker {
+    name: &'static str,
+    type_url: &'static str,
+}
+
+impl DeclaredServiceMarker {
+    /// 用服务名 + type_url 构造。
+    #[must_use]
+    pub fn new(name: &'static str, type_url: &'static str) -> Self {
+        Self { name, type_url }
+    }
+}
+
+impl Service for DeclaredServiceMarker {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn type_url(&self) -> &str {
+        self.type_url
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Commander
 // ---------------------------------------------------------------------------
@@ -204,12 +252,14 @@ pub struct Commander {
     handler_registry: Arc<OutboundHandlerRegistry>,
     /// gRPC server 后台 task 的 JoinHandle（listen 模式启动后持有，close 时 abort）。
     grpc_task: Mutex<Option<JoinHandle<()>>>,
-    /// 可选的 StatsService gRPC 后端（注入后注册到 tonic server）。
-    stats_service: Option<Arc<dyn xray_app_stats::command::StatsService>>,
-    /// 可选的 RoutingService gRPC 后端（注入后注册到 tonic server）。
-    routing_service: Option<Arc<xray_app_router::command::RoutingService>>,
-    /// 可选的 ObservatoryService gRPC 后端（注入后注册到 tonic server）。
-    observatory_service: Option<Arc<dyn xray_app_observatory::command::ObservatoryService>>,
+    /// 可选的 StatsService gRPC 后端（注入后、且 `services` 声明了 StatsService
+    /// 时注册到 tonic server）。`RwLock` 支持上层在 `Arc<Commander>` 上注入。
+    stats_service: RwLock<Option<Arc<dyn xray_app_stats::command::StatsService>>>,
+    /// 可选的 RoutingService gRPC 后端（注入后、且声明时注册到 tonic server）。
+    routing_service: RwLock<Option<Arc<xray_app_router::command::RoutingService>>>,
+    /// 可选的 ObservatoryService gRPC 后端（注入后、且声明时注册到 tonic server）。
+    observatory_service:
+        RwLock<Option<Arc<dyn xray_app_observatory::command::ObservatoryService>>>,
     /// 生产 outbound 运行时（bd ze3）：HandlerService 操作真实 SimpleOhm。
     /// `RwLock` 支持上层在 `Arc<Commander>` 上注入（get_feature 后 set）。
     outbound_runtime: RwLock<Option<Arc<dyn crate::grpc::OutboundRuntime>>>,
@@ -240,9 +290,9 @@ impl Commander {
             outbound_registrar: None,
             handler_registry: Arc::new(OutboundHandlerRegistry::new()),
             grpc_task: Mutex::new(None),
-            stats_service: None,
-            routing_service: None,
-            observatory_service: None,
+            stats_service: RwLock::new(None),
+            routing_service: RwLock::new(None),
+            observatory_service: RwLock::new(None),
             outbound_runtime: RwLock::new(None),
             logger_service: RwLock::new(None),
             dispatch_registrar: RwLock::new(None),
@@ -280,29 +330,25 @@ impl Commander {
         self.outbound_registrar = Some(registrar);
     }
 
-    /// 注入 StatsService gRPC 后端（`start` 时注册到 tonic server）。
-    pub fn set_stats_service(
-        &mut self,
-        service: Arc<dyn xray_app_stats::command::StatsService>,
-    ) {
-        self.stats_service = Some(service);
+    /// 注入 StatsService gRPC 后端。`&self`（内部 RwLock）：上层在
+    /// `Arc<Commander>` 上注入；仅当 `services` 声明 StatsService 时实际暴露。
+    pub fn set_stats_service(&self, service: Arc<dyn xray_app_stats::command::StatsService>) {
+        *self.stats_service.write() = Some(service);
     }
 
-    /// 注入 RoutingService gRPC 后端（`start` 时注册到 tonic server）。
-    pub fn set_routing_service(
-        &mut self,
-        service: Arc<xray_app_router::command::RoutingService>,
-    ) {
-        self.routing_service = Some(service);
+    /// 注入 RoutingService gRPC 后端。`&self`（内部 RwLock）。
+    pub fn set_routing_service(&self, service: Arc<xray_app_router::command::RoutingService>) {
+        *self.routing_service.write() = Some(service);
     }
 
-    /// 注入 ObservatoryService gRPC 后端（`start` 时注册到 tonic server）。
+    /// 注入 ObservatoryService gRPC 后端。`&self`（内部 RwLock）。
     pub fn set_observatory_service(
-        &mut self,
+        &self,
         service: Arc<dyn xray_app_observatory::command::ObservatoryService>,
     ) {
-        self.observatory_service = Some(service);
+        *self.observatory_service.write() = Some(service);
     }
+
 
 
     /// 注入生产 outbound 运行时（bd ze3）。`&self`（内部 RwLock）：
@@ -442,22 +488,47 @@ impl Commander {
     ///
     /// **必须在 tokio runtime 上下文中调用**（`Feature::start` 已保证）。
     fn serve_grpc(&self) -> Result<(), CommanderError> {
-        // reflection opt-in：仅当用户显式 add_service(ReflectionService) 时启用。
-        // 对应 Go `infra/conf/api.go:30` `"reflectionservice"` 关键字语义——
-        // 未声明时整个 gRPC server 不暴露 reflection（grpcurl 不可枚举）。
-        let enable_reflection = self
-            .services()
-            .iter()
-            .any(|s| s.type_url() == ReflectionService::TYPE_URL);
+        // bd dnw3：services 声明集 = 暴露面 allowlist。对应 Go
+        // `Commander.Start`（commander.go:67-69）只注册 `config.Service`
+        // 列举的服务——未声明不暴露（Go infra/conf/api.go `Services []string`
+        // 六服务名 → TypedMessage 列表）。后端注入（Some）与声明（marker）
+        // 双条件同时满足才注册。
+        let declared = |url: &str| self.services().iter().any(|s| s.type_url() == url);
+        let enable_reflection = declared(api_services::REFLECTION);
+        let enable_handler = declared(api_services::HANDLER);
+        let logger = declared(api_services::LOGGER)
+            .then(|| self.logger_service.read().clone())
+            .flatten();
+        let stats = declared(api_services::STATS)
+            .then(|| self.stats_service.read().clone())
+            .flatten();
+        let routing = declared(api_services::ROUTING)
+            .then(|| self.routing_service.read().clone())
+            .flatten();
+        let observatory = declared(api_services::OBSERVATORY)
+            .then(|| self.observatory_service.read().clone())
+            .flatten();
+        if !enable_handler
+            && logger.is_none()
+            && stats.is_none()
+            && routing.is_none()
+            && observatory.is_none()
+            && !enable_reflection
+        {
+            tracing::warn!(
+                "commander gRPC server exposes no services (services list empty or undeclared)"
+            );
+        }
         let router = grpc::build_router(
             Arc::clone(&self.handler_registry),
+            enable_handler,
             enable_reflection,
             self.handler_service.read().clone(),
             self.outbound_runtime.read().clone(),
-            self.logger_service.read().clone(),
-            self.stats_service.clone(),
-            self.routing_service.clone(),
-            self.observatory_service.clone(),
+            logger,
+            stats,
+            routing,
+            observatory,
         );
 
         match self.listen.as_deref().map(grpc::parse_listen_spec) {
@@ -989,7 +1060,13 @@ mod tests {
         let counter = stats_mgr.register_counter("unit>>>test>>>counter").unwrap();
         counter.add(42);
         assert_eq!(counter.value(), 42, "local counter incremented");
-        let mut commander = Commander::new("api", None);
+        // bd dnw3：stats 后端仅在 services 声明 StatsService 时暴露——
+        // 模拟 factory 解析 `services: ["StatsService"]` 后 add_service。
+        let commander = Commander::new("api", None);
+        assert!(commander.add_service(Arc::new(DeclaredServiceMarker::new(
+            "StatsService",
+            api_services::STATS,
+        ))));
         commander.set_dispatch_registrar(Arc::new(crate::server::SimpleOhmDispatchRegistrar(
             Arc::clone(&ohm),
         )));
@@ -1067,5 +1144,121 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_millis(50), fut.as_mut()).await;
         assert_eq!(listener.pending(), 1, "conn delivered to listener");
         drop(fut);
+    }
+
+    // ===== bd dnw3：services 声明集门控实际暴露面（Go api.go/Commander.Start）=====
+
+    /// 预留一个临时本地端口（bind :0 后立即释放）。
+    async fn reserve_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    fn stats_backend(value: i64) -> Arc<dyn xray_app_stats::command::StatsService> {
+        use xray_features::stats::Manager as _;
+        let mgr = Arc::new(xray_app_stats::Manager::new_running());
+        let counter = mgr.register_counter("unit>>>gate>>>counter").unwrap();
+        counter.add(value);
+        let _: i64 = counter.value();
+        Arc::new(xray_app_stats::command::DefaultStatsService::new(mgr))
+    }
+
+
+    /// 声明 StatsService + 注入后端 → GetStats 返回真实计数（API 可达）。
+    #[tokio::test]
+    async fn listen_mode_exposes_declared_stats_service() {
+        use xray_features::Feature as _;
+        use xray_proto::xray::app::stats::command::stats_service_client::StatsServiceClient;
+        use xray_proto::xray::app::stats::command::GetStatsRequest;
+
+        let port = reserve_port().await;
+        let commander = Commander::new("api", Some(format!("127.0.0.1:{port}")));
+        assert!(commander.add_service(Arc::new(DeclaredServiceMarker::new(
+            "StatsService",
+            api_services::STATS,
+        ))));
+        commander.set_stats_service(stats_backend(42));
+        commander.start().expect("commander start (listen mode)");
+
+        let mut client = StatsServiceClient::connect(format!("http://127.0.0.1:{port}"))
+            .await
+            .expect("dial commander api");
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.get_stats(GetStatsRequest {
+                name: "unit>>>gate>>>counter".into(),
+                reset: false,
+            }),
+        )
+        .await
+        .expect("no timeout")
+        .expect("GetStats ok (declared + backend present)")
+        .into_inner();
+        assert_eq!(resp.stat.expect("stat").value, 42);
+        commander.close().unwrap();
+    }
+
+    /// 后端在场但未声明 StatsService → 服务不暴露（UNIMPLEMENTED）。
+    /// 对应 Go：`services` 列表不含 statsservice 时 config.Service 无该条目。
+    #[tokio::test]
+    async fn listen_mode_hides_undeclared_stats_service() {
+        use xray_features::Feature as _;
+        use xray_proto::xray::app::stats::command::stats_service_client::StatsServiceClient;
+        use xray_proto::xray::app::stats::command::GetStatsRequest;
+
+        let port = reserve_port().await;
+        let commander = Commander::new("api", Some(format!("127.0.0.1:{port}")));
+        // 只声明 HandlerService；stats 后端注入但不声明。
+        assert!(commander.add_service(Arc::new(HandlerServiceMarker)));
+        commander.set_stats_service(stats_backend(7));
+        commander.start().expect("commander start (listen mode)");
+
+        let mut client = StatsServiceClient::connect(format!("http://127.0.0.1:{port}"))
+            .await
+            .expect("dial commander api");
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.get_stats(GetStatsRequest {
+                name: "unit>>>gate>>>counter".into(),
+                reset: false,
+            }),
+        )
+        .await
+        .expect("no timeout")
+        .expect_err("undeclared service must be unimplemented");
+        assert_eq!(err.code(), tonic::Code::Unimplemented, "got: {err:?}");
+        commander.close().unwrap();
+    }
+
+    /// 声明 StatsService 但后端未注入 → 同样不暴露（无后端可注册）。
+    #[tokio::test]
+    async fn listen_mode_declared_without_backend_not_exposed() {
+        use xray_features::Feature as _;
+        use xray_proto::xray::app::stats::command::stats_service_client::StatsServiceClient;
+        use xray_proto::xray::app::stats::command::GetStatsRequest;
+
+        let port = reserve_port().await;
+        let commander = Commander::new("api", Some(format!("127.0.0.1:{port}")));
+        assert!(commander.add_service(Arc::new(DeclaredServiceMarker::new(
+            "StatsService",
+            api_services::STATS,
+        ))));
+        commander.start().expect("commander start (listen mode)");
+
+        let mut client = StatsServiceClient::connect(format!("http://127.0.0.1:{port}"))
+            .await
+            .expect("dial commander api");
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.get_stats(GetStatsRequest {
+                name: "unit>>>gate>>>counter".into(),
+                reset: false,
+            }),
+        )
+        .await
+        .expect("no timeout")
+        .expect_err("declared-but-backendless service must be unimplemented");
+        assert_eq!(err.code(), tonic::Code::Unimplemented, "got: {err:?}");
+        commander.close().unwrap();
     }
 }

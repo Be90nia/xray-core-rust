@@ -44,6 +44,9 @@ pub struct SSStream<C> {
     /// 已解密待交付的请求首段明文（SS-2022 variable chunk 尾部 payload，
     /// 对应 sing `serverConn` reader 的 cached 语义）。
     plain_prefix: Vec<u8>,
+    /// 写路径复用缓冲：单 chunk（sealed_size+sealed_payload）拼此缓冲单次写出，
+    /// 避免每 chunk 两个中间 Vec + 两次 write（size 段 ~18B 单独成包）。
+    write_buf: Vec<u8>,
 }
 
 /// SS-2022 响应头分阶段解析（读侧 lazy rekey，缓冲版）。
@@ -124,6 +127,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             tag_size,
             response_rekey: None,
             response_rekey_2022: None,
+            write_buf: Vec::new(),
             pending_payload: None,
             pending_server_2022: None,
             plain_prefix: Vec::new(),
@@ -181,6 +185,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             pending_payload: None,
             pending_server_2022: None,
             plain_prefix: Vec::new(),
+            write_buf: Vec::new(),
         }
     }
 
@@ -253,24 +258,28 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
 
     /// 写单个（已保证 ≤ 块上限的）chunk。
     async fn write_single_chunk(&mut self, plaintext: &[u8]) -> Result<()> {
-        // seal size chunk
+        // seal size chunk → seal payload chunk，两段拼同一复用缓冲，
+        // 单次 write_all 写出（字节序列与两次独立写完全一致：
+        // [sealed_size][sealed_payload]，nonce 推进次序不变）。
         increment_nonce_bytes(&mut self.write_nonce);
         let plain_size = u16::try_from(plaintext.len())
             .map_err(|_| SsError::InsufficientData(plaintext.len()))?;
-        let sealed_size = self
-            .write_aead
-            .seal(&self.write_nonce, &[], &plain_size.to_be_bytes())
+        self.write_buf.clear();
+        self.write_aead
+            .seal_into(
+                &self.write_nonce,
+                &[],
+                &plain_size.to_be_bytes(),
+                &mut self.write_buf,
+            )
             .map_err(|e| SsError::AeadSeal(e.to_string()))?;
 
-        // seal payload chunk
         increment_nonce_bytes(&mut self.write_nonce);
-        let sealed_payload = self
-            .write_aead
-            .seal(&self.write_nonce, &[], plaintext)
+        self.write_aead
+            .seal_into(&self.write_nonce, &[], plaintext, &mut self.write_buf)
             .map_err(|e| SsError::AeadSeal(e.to_string()))?;
 
-        self.inner.write_all(&sealed_size).await?;
-        self.inner.write_all(&sealed_payload).await?;
+        self.inner.write_all(&self.write_buf).await?;
         Ok(())
     }
 
@@ -334,6 +343,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             pending_payload: None,
             pending_server_2022: None,
             plain_prefix: Vec::new(),
+            write_buf: Vec::new(),
         }
     }
 
@@ -1167,6 +1177,57 @@ mod tests {
             matches!(&out, Ok(ChunkOut::NeedMore)),
             "equal echo salt must pass salt check, got {out:?}"
         );
+    }
+
+    /// write_chunk wire 字节序列断言：每 chunk wire 必须精确等于
+    /// `[seal(nonce_i, size_be)][seal(nonce_i+1, payload)]` 的独立推导拼接，
+    /// nonce 从 `[0xFF;n]` 起 LE increment 推进、跨 chunk 连续。
+    /// 写路径做"合并单次写/复用缓冲"优化时此序列不得改变（sing 对端兼容）。
+    #[tokio::test]
+    async fn write_chunk_wire_bytes_exact() {
+        use tokio::io::AsyncReadExt;
+
+        let account = make_account(CipherType::Aes128Gcm, "wire-bytes");
+        let iv = random_iv(&account);
+        let (client_half, mut peer) = tokio::io::duplex(128 * 1024);
+        let mut stream = SSStream::new_client(client_half, &account, &iv).expect("client");
+
+        // 小 chunk（1 块）+ 大 payload（8174+8174+3652 = 3 块），共 4 chunk。
+        let small = b"exact wire bytes check payload";
+        let big = vec![0xEEu8; 20_000];
+        stream.write_chunk(small).await.expect("write small");
+        stream.write_chunk(&big).await.expect("write big");
+        stream.flush().await.expect("flush");
+        drop(stream);
+
+        let mut wire = Vec::new();
+        peer.read_to_end(&mut wire).await.expect("read wire");
+
+        // 独立推导 expected：aead 独立实例，nonce 手动推进。
+        let aead = account
+            .cipher
+            .create_aead(&account.key, &iv)
+            .expect("aead")
+            .expect("aead");
+        let tag_size = aead.tag_size();
+        let max_payload = 8192 - tag_size - 2;
+        let mut nonce = vec![0xFFu8; 12];
+        let mut expected = Vec::new();
+        for part in [small.as_slice(), big.as_slice()] {
+            for chunk in part.chunks(max_payload) {
+                increment_nonce_bytes(&mut nonce);
+                let sealed_size = aead
+                    .seal(&nonce, &[], &(chunk.len() as u16).to_be_bytes())
+                    .expect("size seal");
+                increment_nonce_bytes(&mut nonce);
+                let sealed_payload = aead.seal(&nonce, &[], chunk).expect("payload seal");
+                expected.extend_from_slice(&sealed_size);
+                expected.extend_from_slice(&sealed_payload);
+            }
+        }
+
+        assert_eq!(wire.len(), expected.len(), "wire length mismatch");
+        assert_eq!(wire, expected, "write_chunk wire bytes must be byte-exact");
     }
 }
 

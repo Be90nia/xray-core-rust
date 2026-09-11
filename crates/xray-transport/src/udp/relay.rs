@@ -30,9 +30,13 @@ use tokio::task::JoinHandle;
 /// UDP 接收缓冲（单包最大 64 KiB）。
 const RECV_BUF: usize = 65_535;
 
-/// Per-dest 空闲超时（Go `signal.CancelAfterInactivity(1 * time.Minute)` 等价）。
+/// Per-dest 空闲超时。
 ///
-/// ponytail: hardcode 60s，未暴露 policy 配置化入口（与 issue Non-goals 一致）。
+/// 对齐 Go `transport/internet/udp/dispatcher.go:102`：
+/// `signal.CancelAfterInactivity(ctx, entry.terminate, time.Minute)` —— Go 硬编码
+/// 60s，**不读 policy**（ConnectionIdle 在 Go 全库唯一消费者是 wireguard
+/// client.go:175；singbridge 是另一处硬编码 300s）。故保持 60s 不接 policy——
+/// 接 policy 属 Go 没有的行为差异。需自定义时用 [`UdpRelay::with_idle_timeout`]。
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 单个目标地址的 UDP 中继会话：连接到 `dest` 的 socket + reader task + timer task。
@@ -358,5 +362,13 @@ mod tests {
 
         echo_running.store(false, Ordering::Relaxed);
         relay.close().await;
+    }
+
+    #[test]
+    fn default_idle_timeout_matches_go() {
+        // Go udp/dispatcher.go:102 硬编码 time.Minute（非 policy）——见
+        // DEFAULT_IDLE_TIMEOUT 文档。钉住 60s：防止被"接 policy 300s"的
+        // 错误前提改动（Go 无此行为）。
+        assert_eq!(DEFAULT_IDLE_TIMEOUT, Duration::from_secs(60));
     }
 }

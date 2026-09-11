@@ -4,10 +4,11 @@
 //! - **isH3 判定**（hub.go:469）：`tlsSettings.alpn == ["h3"]` → UDP + QUIC + h3 server
 //! - **TCP**（hub.go:536-545）：accept → 可选 TLS（hub.go:553-556）/ REALITY（hub.go:558-560）
 //!   → hyper auto（h1 + h2c，hub.go:565-567）→ [`crate::hub::handler::handle_request`]
-//! - **unix**：[`listen_splithttp_unix`]（hub.go:472-480，`port == 0` 分支）
+//! - **unix**（hub.go:472-480 `port == 0` → `ListenUnix`）：不支持——Rust 生产入口
+//!   `listen_splithttp` 只分 h3/TCP，`SocketAddr` 无法承载 unix 路径。
 //!
 //! Go 的 `requestHandler.ServeHTTP` 与传输无关（同一 handler 服务 h1/h2/h3 三路），
-//! 本文件把 hub handler 接到三种监听形态上。
+//! 本文件把 hub handler 接到 h3/TCP 两种监听形态上。
 
 use std::io;
 use std::net::SocketAddr;
@@ -83,73 +84,6 @@ pub async fn listen_splithttp(
         )
         .await
     }
-}
-
-/// Unix domain socket 监听。对应 Go hub.go:472-480（`port == net.Port(0)` 分支）。
-///
-/// Go 由 `ListenXH` 的 port==0 触发（address.Domain() 即 socket 路径）；Rust
-/// `TransportListenFn` 的 `SocketAddr` 无法承载 unix 路径，故独立入口（与
-/// `xray_transport::system_listener::listen_unix_system` 同模式）。h1/h2c/TLS/REALITY
-/// 与 TCP 分支完全一致（Go hub.go:551-560 对 tcp/unix 统一包装）。
-#[cfg(unix)]
-pub async fn listen_splithttp_unix(
-    path: &str,
-    settings: &StreamSettings,
-    _sockopt: &SocketOptions,
-    handler: ConnHandler,
-) -> io::Result<Box<dyn TransportListener>> {
-    let config = Arc::new(crate::register::parse_splithttp_config(
-        settings.transport_json.as_ref(),
-    )?);
-    let tls_cfg = xray_tls::server_config::build_server_config(
-        &settings.security,
-        settings.security_json.as_ref(),
-    )?;
-    let reality = reality_server_config(&settings.security, settings.security_json.as_ref())?;
-
-    let listener = tokio::net::UnixListener::bind(path)?;
-    // ponytail: SocketAddr 无法表达 unix 地址，元数据用 UNSPECIFIED 占位；
-    // 接入 dispatcher 元数据时如需真实路径，扩 HandlerContext 字段。
-    let placeholder = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
-    // Tcpmask（Go hub.go:547-549：!isH3 && TcpmaskManager != nil → WrapListener，对
-    // tcp/unix 统一生效）。unix 路径 wrap 改为 per-conn（accept 后用 wrap_conn_server_into_connection
-    // 包装为 Box<dyn Connection>，与 TCP 分支一致）。
-    let tcpmask = Some(Arc::new(
-        xray_transport::finalmask::build_tcpmask_manager_from_json(
-            settings.finalmask_json.as_ref(),
-        )?,
-    ));
-    let ctx = build_context(&config, placeholder, handler);
-    tracing::info!(path, "listening UNIX domain socket for XHTTP");
-
-    tokio::spawn(async move {
-        loop {
-            let stream = match listener.accept().await {
-                Ok((s, _)) => s,
-                Err(_) => continue,
-            };
-            let conn: Box<dyn xray_transport::connection::Connection> = match tcpmask.as_ref() {
-                Some(mgr) => {
-                    let raw = Box::new(xray_transport::connection::UnixConnection::new(stream));
-                    match xray_transport::finalmask::wrap_conn_server_into_connection(mgr, raw) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::debug!(error = %e, "XHTTP unix tcpmask wrap failed");
-                            continue;
-                        }
-                    }
-                }
-                None => Box::new(xray_transport::connection::UnixConnection::new(stream)),
-            };
-            let ctx = Arc::clone(&ctx);
-            let tls = tls_cfg.clone();
-            let rc = reality.clone();
-            tokio::spawn(async move {
-                handle_accepted_stream(conn, placeholder, placeholder, tls, rc, ctx).await;
-            });
-        }
-    });
-    Ok(Box::new(SplithttpListener { local: placeholder }))
 }
 
 async fn listen_tcp(
@@ -851,32 +785,5 @@ mod tests {
             0,
             "fallback conn must not reach dispatcher"
         );
-    }
-
-    /// unix socket listen（Go hub.go:472-480 port==0 分支）。仅 unix 目标编译。
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn unix_listen_serves_h1() {
-        let path = std::env::temp_dir()
-            .join(format!("xh-unix-{}.sock", uuid::Uuid::new_v4()))
-            .to_string_lossy()
-            .into_owned();
-        let (handler, count) = greeting_handler();
-        let listener = listen_splithttp_unix(&path, &plain_settings(), &SocketOptions::default(), handler)
-            .await
-            .expect("unix listen");
-
-        let mut s = tokio::net::UnixStream::connect(&path).await.expect("unix connect");
-        s.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
-        let mut resp = Vec::new();
-        s.read_to_end(&mut resp).await.unwrap();
-        let text = String::from_utf8_lossy(&resp);
-        assert!(text.contains("200"), "unix h1 status missing: {text}");
-        assert!(text.contains("hello-from-server"), "unix h1 body missing: {text}");
-        assert_eq!(count.load(Ordering::SeqCst), 1);
-        let _ = std::fs::remove_file(&path);
-        drop(listener);
     }
 }

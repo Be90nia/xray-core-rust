@@ -276,6 +276,7 @@ mod lint_tests {
                 cfg.fake_dns = Some(FakeDnsConfig {
                     ip_pool: Some("198.18.0.0/15".into()),
                     pool_size: Some(65535),
+                    pools: None,
                 });
                 Ok(())
             }

@@ -31,6 +31,45 @@ use clap::Args;
 use crate::error::{CliError, Result};
 use crate::version::print_version;
 
+/// 初始化全局 tracing subscriber（幂等：已存在全局 subscriber 时静默跳过）。
+///
+/// 优先级：`RUST_LOG`（开发覆盖，例 `RUST_LOG=xray_tls=debug`）> `default_directive`。
+/// 9tk4：`default_directive` 由配置 `log.loglevel` 推导（见 [`loglevel_directive`]），
+/// 使直连 tracing 日志受 loglevel 单一事实源门控；工具子命令传固定 "info"。
+pub fn init_tracing(default_directive: &str) {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let _ = fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(default_directive)),
+        )
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
+/// 配置 `log.loglevel` → tracing EnvFilter 指令。
+///
+/// 对齐 Go `infra/conf/log.go`：默认（未配置）= warning → `warn`；
+/// `none` 关闭两路日志（Go 同设 error/access 为 None）→ `off`。
+/// 与 xray-core `register.rs build_log_config` 的 loglevel 分支保持同口径。
+fn loglevel_directive(config: &xray_conf::config::Config) -> &'static str {
+    match config
+        .log
+        .as_ref()
+        .and_then(|l| l.loglevel.as_deref())
+        .map(str::to_lowercase)
+        .as_deref()
+    {
+        Some("debug") => "debug",
+        Some("info") => "info",
+        Some("error") => "error",
+        Some("none") => "off",
+        // "warning" 及其余非法值：Go infra/conf/log.go 同样回退 Warning。
+        _ => "warn",
+    }
+}
+
 /// `xray run` 命令参数。对应 Go `run.go` 的 flag 定义。
 #[derive(Args, Debug, Clone, Default)]
 pub struct RunArgs {
@@ -104,6 +143,11 @@ pub async fn execute(args: RunArgs) -> Result<()> {
     let built = config
         .build()
         .map_err(|e| CliError::StartFailed(format!("config build failed: {e}")))?;
+
+    // 9tk4：tracing 过滤器由配置 loglevel 推导（RUST_LOG 仍可覆盖），使直连
+    // tracing 日志与 Go loglevel 单一事实源对齐；未配 log 节时默认 warn，
+    // 对齐 Go infra/conf/log.go 默认 Warning（此前固定 "info" 绕过 loglevel）。
+    init_tracing(loglevel_directive(&config));
 
     // 91vi：`--unix` 启动期校验。splithttp UDS 监听尚未贯通 (M3B 域
     // xray-transport-splithttp transport.rs UDS listener 仍在开发)。

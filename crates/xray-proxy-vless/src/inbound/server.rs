@@ -148,7 +148,8 @@ pub async fn serve_vless(
                 .await
             };
             if let Err(e) = result {
-                tracing::info!(error = %e, "vless connection ended with error");
+                // Go vless inbound.go:522：拒绝 AtInfo + RemoteAddr。
+                tracing::info!(peer = %peer, error = %e, "vless connection ended with error");
             }
         });
     }

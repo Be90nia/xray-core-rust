@@ -8,4 +8,3 @@ pub mod readv;
 pub mod alloc;
 pub mod timeout;
 pub mod pipe;
-pub mod splice;

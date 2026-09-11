@@ -5,6 +5,7 @@
 //! 每个 worker 持有一个 transport listener（TCP/UDP/Unix），accept 后构造
 //! `Session` 并调用 `ProxyInbound::process()` 交给具体代理协议处理。
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -386,7 +387,7 @@ pub struct UdpWorker {
     uplink_counter: Option<Arc<dyn Counter>>,
     downlink_counter: Option<Arc<dyn Counter>>,
     hub: Mutex<Option<UdpHub>>,
-    active_sessions: RwLock<Vec<Arc<UdpSession>>>,
+    active_sessions: RwLock<HashMap<SocketAddr, Arc<UdpSession>>>,
     close_notify: Arc<Notify>,
     closed: AtomicBool,
     recv_handle: Mutex<Option<JoinHandle<()>>>,
@@ -431,7 +432,7 @@ impl UdpWorker {
             uplink_counter,
             downlink_counter,
             hub: Mutex::new(None),
-            active_sessions: RwLock::new(Vec::new()),
+            active_sessions: RwLock::new(HashMap::new()),
             close_notify: Arc::new(Notify::new()),
             closed: AtomicBool::new(false),
             recv_handle: Mutex::new(None),
@@ -448,7 +449,7 @@ impl UdpWorker {
 
         // 查找已有 session
         let sessions = self.active_sessions.read();
-        let existing = sessions.iter().find(|s| s.source() == source);
+        let existing = sessions.get(&source);
         if let Some(session) = existing {
             session.update_activity();
             session.write_packet(packet.payload.clone());
@@ -469,7 +470,7 @@ impl UdpWorker {
         session.write_packet(packet.payload.clone());
 
         // 注册 session
-        self.active_sessions.write().push(session.clone());
+        self.active_sessions.write().insert(source, session.clone());
 
         // spawn proxy.process()
         let tag = self.tag.clone();
@@ -512,7 +513,7 @@ impl UdpWorker {
         let mut sessions = self.active_sessions.write();
         let before = sessions.len();
         let timeout_secs = DEFAULT_CONN_IDLE_TIMEOUT.as_secs() as i64;
-        sessions.retain(|s| {
+        sessions.retain(|_addr, s| {
             let idle_secs = now - s.last_activity_secs();
             if idle_secs > timeout_secs {
                 s.set_inactive();
@@ -569,7 +570,7 @@ impl Worker for UdpWorker {
 
         // Mark all sessions inactive
         let sessions = self.active_sessions.read();
-        for s in sessions.iter() {
+        for s in sessions.values() {
             s.set_inactive();
         }
 

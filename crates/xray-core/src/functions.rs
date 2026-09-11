@@ -324,6 +324,15 @@ async fn start_full_dispatched(
         if let Some(log_feature) = instance.get_feature::<xray_app_log::LogFeature>() {
             commander.set_logger_service(log_feature.log_service());
         }
+        // bd dnw3：StatsService 后端接 AppStatsFeature（essential 注入必在场，
+        // 对应 Go statsServer 经 RequireFeatures 拿 stats.Manager）；是否实际
+        // 暴露仍由 `api.services` 声明集门控。
+        if let Some(stats) = instance.get_feature::<crate::register::AppStatsFeature>() {
+            let manager = Arc::clone(stats.manager());
+            commander.set_stats_service(Arc::new(
+                xray_app_stats::command::DefaultStatsService::new(manager),
+            ));
+        }
     }
 
     // 先 start features（LogInstance 等 handler 就绪）再起 inbound listener——

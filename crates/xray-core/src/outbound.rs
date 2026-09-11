@@ -1344,7 +1344,7 @@ fn wrap_dial_with_target_strategy(
                 Ok(ips) => {
                     // Go handler.go:202：dice.Roll 随机选一个
                     let ip = ips[rand::rng().random_range(0..ips.len())];
-                    tracing::info!(target = %domain, resolved = %ip, "target strategy resolved");
+                    tracing::debug!(target = %domain, resolved = %ip, "target strategy resolved");
                     let resolved = Destination::new(Address::from(ip), dest.port(), dest.network());
                     inner(&resolved).await
                 }

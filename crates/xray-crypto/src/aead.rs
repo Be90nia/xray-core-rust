@@ -95,6 +95,25 @@ pub trait AeadCipher {
         aad: &[u8],
         plaintext: &[u8],
     ) -> Result<Vec<u8>, CryptoError>;
+    /// Like [`Self::seal`] but appends the sealed output (ciphertext+tag)
+    /// to `out` instead of returning a new Vec.
+    ///
+    /// Backends that can encrypt in place override this to avoid the
+    /// intermediate allocation; the default falls back to [`Self::seal`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::seal`].
+    fn seal_into(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        plaintext: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), CryptoError> {
+        out.extend_from_slice(&self.seal(nonce, aad, plaintext)?);
+        Ok(())
+    }
 
     /// Decrypts and verifies `ciphertext` with `nonce` and `aad`.
     ///
@@ -196,10 +215,34 @@ impl AeadCipher for Aes128Gcm {
         let mut in_out = plaintext.to_vec();
         self.key
             .seal_in_place_append_tag(ring_nonce, ring_aad, &mut in_out)
-            .map_err(|_| {
-                CryptoError::EncryptionError("seal failed".into())
-            })?;
+            .map_err(|_| CryptoError::EncryptionError("seal failed".into()))?;
         Ok(in_out)
+    }
+
+    fn seal_into(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        plaintext: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), CryptoError> {
+        if nonce.len() != self.nonce_size() {
+            return Err(CryptoError::InvalidNonceLength {
+                expected: self.nonce_size(),
+                actual: nonce.len(),
+            });
+        }
+        let ring_nonce = Nonce::try_assume_unique_for_key(nonce)
+            .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
+        let ring_aad = Aad::from(aad);
+        let start = out.len();
+        out.extend_from_slice(plaintext);
+        let tag = self
+            .key
+            .seal_in_place_separate_tag(ring_nonce, ring_aad, &mut out[start..])
+            .map_err(|_| CryptoError::EncryptionError("seal failed".into()))?;
+        out.extend_from_slice(tag.as_ref());
+        Ok(())
     }
 
     fn open(
@@ -308,6 +351,32 @@ impl AeadCipher for Aes256Gcm {
                 CryptoError::EncryptionError("seal failed".into())
             })?;
         Ok(in_out)
+    }
+
+    fn seal_into(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        plaintext: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), CryptoError> {
+        if nonce.len() != self.nonce_size() {
+            return Err(CryptoError::InvalidNonceLength {
+                expected: self.nonce_size(),
+                actual: nonce.len(),
+            });
+        }
+        let ring_nonce = Nonce::try_assume_unique_for_key(nonce)
+            .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
+        let ring_aad = Aad::from(aad);
+        let start = out.len();
+        out.extend_from_slice(plaintext);
+        let tag = self
+            .key
+            .seal_in_place_separate_tag(ring_nonce, ring_aad, &mut out[start..])
+            .map_err(|_| CryptoError::EncryptionError("seal failed".into()))?;
+        out.extend_from_slice(tag.as_ref());
+        Ok(())
     }
 
     fn open(
@@ -984,6 +1053,40 @@ mod tests {
         let decrypted =
             cipher.open(&nonce, aad, &ciphertext).expect("open should work");
         assert_eq!(plaintext.as_slice(), decrypted.as_slice());
+    }
+
+    /// seal_into 必须产生与 seal 完全一致的字节，且支持向非空 out 追加
+    ///（SS chunk 写路径依赖：size 段+payload 段拼同一缓冲单次写出）。
+    #[test]
+    fn seal_into_matches_seal_and_appends() {
+        let key = [3u8; 32];
+        let nonce = [4u8; 24];
+        let aad = b"";
+        let ciphers: Vec<Box<dyn AeadCipher>> = vec![
+            Box::new(Aes128Gcm::new(&[3u8; 16]).expect("aes128")),
+            Box::new(Aes256Gcm::new(&key).expect("aes256")),
+            Box::new(ChaCha20Poly1305Aead::new(&key).expect("chacha")),
+            Box::new(XChaCha20Poly1305Aead::new(&key).expect("xchacha")),
+        ];
+        for cipher in &ciphers {
+            let n = cipher.nonce_size();
+            let nonce = &nonce[..n];
+            let part1 = b"first segment";
+            let part2 = b"second segment payload";
+            let mut out = Vec::new();
+            cipher
+                .seal_into(nonce, aad, part1, &mut out)
+                .expect("seal_into 1");
+            cipher
+                .seal_into(nonce, aad, part2, &mut out)
+                .expect("seal_into 2");
+            let expected = [
+                cipher.seal(nonce, aad, part1).expect("seal 1"),
+                cipher.seal(nonce, aad, part2).expect("seal 2"),
+            ]
+            .concat();
+            assert_eq!(out, expected);
+        }
     }
 
     #[test]

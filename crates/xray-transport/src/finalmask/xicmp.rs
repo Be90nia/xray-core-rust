@@ -28,6 +28,8 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use rand::RngCore;
 use tokio::sync::{mpsc, Mutex as TokioMutex};
+use tokio::task::JoinHandle;
+
 
 use super::{UdpIo, Udpmask, UDP_SIZE};
 
@@ -239,9 +241,11 @@ fn addr_is_v4(addr: &SocketAddr) -> bool {
 
 struct XicmpShared {
     /// 后台 recv 任务投递的 raw ICMP 包（已 type-filtered）。
-    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    ///
+    /// bounded（容量 [`RECV_CHANNEL_CAP`]）——对端洪水时 recv 任务阻塞在 send 上，
+    /// 由内核 socket 缓冲吸收/丢弃，用户态不无界积压（对齐 Go 无缓冲 readCh）。
+    rx: mpsc::Receiver<Vec<u8>>,
 }
-
 /// xICMP passthrough 连接（对应 Go `xicmpConnClient` / `xicmpConnServer`）。
 ///
 /// 内部封装 `Arc<dyn IcmpRawSocket>` + 后台 recv 任务 + 模式特有状态：
@@ -254,6 +258,9 @@ pub struct XicmpPassthroughConn {
     client_state: Option<Mutex<XicmpClientState>>,
     server_state: Option<Mutex<XicmpServerState>>,
     closed: Mutex<bool>,
+    /// 后台 recv 任务句柄；Drop 时 abort（对应 Go `Close()` 关闭 icmp4/icmp6 使
+    /// 阻塞中的 recv goroutine 立即退出——否则任务要等下一个包到达才发现退出）。
+    recv_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,24 +289,8 @@ struct XicmpServerRecord {
 impl XicmpPassthroughConn {
     /// 构造客户端连接。`raw` 由调用方注入（生产走 Linux socket，测试走 mock）。
     pub fn new_client(client_id: [u8; 8], id: u16, raw: Arc<dyn IcmpRawSocket>) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let raw_for_task = raw.clone();
-        // 后台 recv 任务：循环 raw.recv → type-filter（仅 echo reply）→ 投 tx
-        // 类型过滤在后台 task 内完成，应用层 recv_from 拿到的都是 echo reply 包。
-        tokio::spawn(async move {
-            loop {
-                let pkt = match raw_for_task.recv().await {
-                    Ok(p) => p,
-                    Err(_) => return,
-                };
-                // 仅 echo reply 类型通过：v4 type=0、v6 type=129
-                if pkt.len() >= 8 && (pkt[0] == ICMP_ECHO_REPLY_V4 || pkt[0] == ICMP_ECHO_REPLY_V6) {
-                    if tx.send(pkt).is_err() {
-                        return;
-                    }
-                }
-            }
-        });
+        // client 仅放行 echo reply（v4 type=0 / v6 type=129）
+        let (rx, task) = spawn_recv_task(raw.clone(), true);
         Self {
             mode: XicmpMode::Client,
             raw,
@@ -311,27 +302,14 @@ impl XicmpPassthroughConn {
             })),
             server_state: None,
             closed: Mutex::new(false),
+            recv_task: Mutex::new(Some(task)),
         }
     }
 
     /// 构造服务端连接。
     pub fn new_server(raw: Arc<dyn IcmpRawSocket>) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let raw_for_task = raw.clone();
-        // 后台 recv 任务：仅 echo request 类型通过
-        tokio::spawn(async move {
-            loop {
-                let pkt = match raw_for_task.recv().await {
-                    Ok(p) => p,
-                    Err(_) => return,
-                };
-                if pkt.len() >= 8 && (pkt[0] == ICMP_ECHO_V4 || pkt[0] == ICMP_ECHO_V6) {
-                    if tx.send(pkt).is_err() {
-                        return;
-                    }
-                }
-            }
-        });
+        // server 仅放行 echo request（v4 type=8 / v6 type=128）
+        let (rx, task) = spawn_recv_task(raw.clone(), false);
         Self {
             mode: XicmpMode::Server,
             raw,
@@ -341,8 +319,57 @@ impl XicmpPassthroughConn {
                 rec: HashMap::new(),
             })),
             closed: Mutex::new(false),
+            recv_task: Mutex::new(Some(task)),
         }
     }
+
+}
+
+
+/// spawn 后台 recv 任务：循环 `raw.recv()` → type-filter → 投 bounded channel。
+///
+/// 类型过滤在任务内完成（client 仅 echo reply / server 仅 echo request），应用层
+/// `recv_from` 拿到的都是过滤后的包。`send().await` 阻塞式发送（满时 park），
+/// 语义对齐 Go `select { case readCh <- p; case <-closedCh }`（Go 无缓冲 channel
+/// 发送阻塞 + 内核缓冲蓄洪，见 [`RECV_CHANNEL_CAP`]）；接收端 drop 后 send 返回
+/// Err，任务退出。
+fn spawn_recv_task(
+    raw: Arc<dyn IcmpRawSocket>,
+    is_client: bool,
+) -> (mpsc::Receiver<Vec<u8>>, JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(RECV_CHANNEL_CAP);
+    let task = tokio::spawn(async move {
+        loop {
+            let pkt = match raw.recv().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            let pass = if is_client {
+                pkt[0] == ICMP_ECHO_REPLY_V4 || pkt[0] == ICMP_ECHO_REPLY_V6
+            } else {
+                pkt[0] == ICMP_ECHO_V4 || pkt[0] == ICMP_ECHO_V6
+            };
+            if pkt.len() >= 8 && pass {
+                if tx.send(pkt).await.is_err() {
+                    return; // 接收端已 drop（连接关闭）
+                }
+            }
+        }
+    });
+    (rx, task)
+}
+
+impl Drop for XicmpPassthroughConn {
+    fn drop(&mut self) {
+        // 对应 Go Close() 关闭 icmp4/icmp6：立即终止阻塞中的 recv 任务，
+        // 不等下一个包到达。abort 对已完成的任务是 no-op。
+        if let Some(handle) = self.recv_task.lock().take() {
+            handle.abort();
+        }
+    }
+}
+
+impl XicmpPassthroughConn {
 
     fn is_closed(&self) -> bool {
         *self.closed.lock()
@@ -680,6 +707,16 @@ pub fn parse_echo_packet(packet: &[u8]) -> Option<(u16, u16, &[u8])> {
 /// 最大 payload 大小限制（对应 Go `len(p)+16 > finalmask.UDPSize`）。
 pub const MAX_PAYLOAD: usize = UDP_SIZE.saturating_sub(16);
 
+/// recv 任务 → 应用层通道容量。
+///
+/// Go `readCh` 是**无缓冲** channel（client.go:83 `make(chan packet)`）：应用层停读时
+/// recv goroutine 阻塞在 channel 发送上，洪水由内核 socket 缓冲（Linux 默认
+/// SO_RCVBUF ~212KB）吸收、溢出由内核丢弃——用户态永不无界积压。
+/// Rust 侧对齐此语义：bounded channel + 阻塞式 `send().await`（满时 recv 任务
+/// park，等价 Go 阻塞发送，Err=Closed 即退出）。32 包容量仅吸收调度延迟突发
+/// （MTU 1500 下 ~48KB；jumbo 64KB 极端 ~2MB），内核缓冲才是真正的蓄洪/丢弃层。
+const RECV_CHANNEL_CAP: usize = 32;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -847,13 +884,13 @@ mod tests {
     }
 
 
-
-    use parking_lot::Mutex as TestMutex;
     /// mock raw ICMP socket：记录 send 字节、预设 recv 队列。
     /// 用于单测跑通 XicmpPassthroughConn 的 send_to/recv_from 全链路。
+    /// `recv_polls` 计数 recv() 轮询次数——观测后台 recv 任务是否已退出。
     struct MockIcmpRawSocket {
         sent: TestMutex<Vec<Vec<u8>>>,
         recv_queue: TestMutex<VecDeque<Vec<u8>>>,
+        recv_polls: std::sync::atomic::AtomicU64,
     }
 
     impl MockIcmpRawSocket {
@@ -861,7 +898,12 @@ mod tests {
             Self {
                 sent: TestMutex::new(Vec::new()),
                 recv_queue: TestMutex::new(seed_recv.into()),
+                recv_polls: std::sync::atomic::AtomicU64::new(0),
             }
+        }
+
+        fn recv_polls(&self) -> u64 {
+            self.recv_polls.load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 
@@ -875,6 +917,7 @@ mod tests {
             // 模拟生产 raw socket 的语义：阻塞到有包。空队列 → 短 sleep 重试。
             // 对应 Linux 实现：AsyncFd readable().await + libc::read 阻塞。
             loop {
+                self.recv_polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if let Some(p) = self.recv_queue.lock().pop_front() {
                     return Ok(p);
                 }
@@ -882,6 +925,25 @@ mod tests {
             }
         }
     }
+
+    /// 等 mock recv 队列长度稳定（50ms 窗口不变）——后台 recv 任务已消费完它能消费的。
+    async fn wait_queue_stable(mock: &MockIcmpRawSocket) -> usize {
+        let mut prev = usize::MAX;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let cur = mock.recv_queue.lock().len();
+            if cur == prev {
+                return cur;
+            }
+            prev = cur;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if std::time::Instant::now() > deadline {
+                return mock.recv_queue.lock().len();
+            }
+        }
+    }
+
+    use parking_lot::Mutex as TestMutex;
 
     #[tokio::test]
     async fn passthrough_client_send_to_marshal_echo_request() {
@@ -1047,5 +1109,53 @@ mod tests {
         } else {
             // 非 Windows：编译期 cfg 跳过此 case
         }
+    }
+
+    #[tokio::test]
+    async fn passthrough_flood_is_bounded_and_task_exits_on_drop() {
+        // v9yx：对端洪水时用户态积压必须有界（对齐 Go 无缓冲 readCh + 内核缓冲丢弃），
+        // 且连接 drop 后 recv 任务立即退出（对齐 Go Close() 关闭 icmp conn）。
+        let client_id = [0x66u8; 8];
+        let id = 0xbeef;
+
+        // server-style 合法回包（garbage 8B 前缀 + payload；id 匹配、seq 就近）
+        let mut data = vec![0x99u8; 8];
+        data.extend_from_slice(b"flood");
+        let reply = marshal_echo(ICMP_ECHO_REPLY_V4, id, 1, &data);
+
+        let total = 100usize;
+        let mock = Arc::new(MockIcmpRawSocket::new(vec![reply; total]));
+        let conn = XicmpPassthroughConn::new_client(client_id, id, mock.clone());
+
+        // 全程不读 recv_from：recv 任务最多吞 cap+1 包（cap 在队列 + 1 个在
+        // parked send future 手里）后阻塞，其余留在 mock 队列——旧 unbounded
+        // 实现会全部吞光（settled=0）。
+        let settled = wait_queue_stable(&mock).await;
+        assert!(
+            settled >= total - RECV_CHANNEL_CAP - 1,
+            "未读时积压必须有界（≤cap+1 包），实际剩余 {settled}/{total}"
+        );
+
+        drop(conn);
+        // recv 任务随 Drop abort 立即停止轮询（旧实现滞留到下一个包到达）
+        let p1 = mock.recv_polls();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let p2 = mock.recv_polls();
+        assert_eq!(p1, p2, "drop 后 recv 任务应已退出（polls 不再增长）");
+    }
+
+    #[tokio::test]
+    async fn passthrough_task_exits_on_drop_without_pending_packets() {
+        // v9yx 后半：空队列（任务停在 recv 轮询）时 drop 连接，任务也立即退出，
+        // 不得滞留等下一个包。
+        let mock = Arc::new(MockIcmpRawSocket::new(vec![]));
+        let conn = XicmpPassthroughConn::new_client([0u8; 8], 0x1234, mock.clone());
+        // 让任务先跑进 recv 轮询循环
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(conn);
+        let p1 = mock.recv_polls();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let p2 = mock.recv_polls();
+        assert_eq!(p1, p2, "空队列下 drop 后 recv 任务应退出");
     }
 }

@@ -399,6 +399,9 @@ struct PacketIoConn {
     driver: Mutex<Option<JoinHandle<()>>>,
     /// send worker handler；Drop 时 abort 取消。
     worker: Mutex<Option<JoinHandle<()>>>,
+    /// 上一次 poll_read 装不下而被截断的包尾字节（回填队首，下次 poll_read 先发）。
+    /// AsyncRead 是字节流契约：静默丢字节会损坏上层流（如 KCP 段错位）。
+    leftover: Mutex<Vec<u8>>,
 }
 
 impl PacketIoConn {
@@ -440,6 +443,7 @@ impl PacketIoConn {
             tx: snd_tx,
             driver: Mutex::new(Some(driver)),
             worker: Mutex::new(Some(worker)),
+            leftover: Mutex::new(Vec::new()),
         }
     }
 }
@@ -461,6 +465,17 @@ impl AsyncRead for PacketIoConn {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
+        // 先排空上次超长包的剩余字节（回填队首）：AsyncRead 是字节流契约，
+        // 丢字节 = 静默损坏上层流（KCP 段错位）。
+        {
+            let mut leftover = self.leftover.lock();
+            if !leftover.is_empty() {
+                let n = leftover.len().min(buf.remaining());
+                buf.put_slice(&leftover[..n]);
+                leftover.drain(..n);
+                return std::task::Poll::Ready(Ok(()));
+            }
+        }
         let mut rx = self.rx.lock();
         let Some(recv) = rx.as_mut() else {
             // driver 已退出且队列排空：EOF（0 字节 Ready 读），上层据此断链而非挂死。
@@ -470,7 +485,14 @@ impl AsyncRead for PacketIoConn {
             std::task::Poll::Ready(Some(pkt)) => {
                 let n = pkt.len().min(buf.remaining());
                 buf.put_slice(&pkt[..n]);
-                // ponytail: 超长包丢弃剩余字节——简化不缓存；KCP 段长恒 < 1500 包足够。
+                if n < pkt.len() {
+                    // 超长包剩余字节回填队首（7xia）：读缓冲装不下的部分留到下次
+                    // poll_read 先发——Go 无此桥接层（kcp 直接以 mtu 级缓冲读
+                    // PacketConn 恒不截断），按 AsyncRead 流契约保留全部字节，
+                    // 不静默丢弃。driver 层 recv_from(buf=UDP_SIZE) 的 UDP 截断
+                    // 与 Go ReadFrom 截断语义一致（保留）。
+                    *self.leftover.lock() = pkt[n..].to_vec();
+                }
                 std::task::Poll::Ready(Ok(()))
             }
             std::task::Poll::Ready(None) => {
@@ -1237,6 +1259,69 @@ mod tests {
             .expect("server read timeout")
             .expect("server read ok");
             assert_eq!(&read_buf[..n], b"client-connection-payload");
+        });
+    }
+
+    /// mock UdpIo：recv_from 只吐一个预设包，随后 Err 关闭 driver（触发 EOF）。
+    struct MockSinglePacketUdpIo {
+        packet: Vec<u8>,
+        addr: SocketAddr,
+        delivered: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl UdpIo for MockSinglePacketUdpIo {
+        async fn send_to(&self, buf: &[u8], _addr: SocketAddr) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+        async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            if !self.delivered.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                let n = self.packet.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.packet[..n]);
+                Ok((n, self.addr))
+            } else {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "mock closed"))
+            }
+        }
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(self.addr)
+        }
+    }
+
+    /// 7xia：读缓冲小于包大小时，剩余字节必须回填队首，字节流零丢失。
+    /// （旧实现静默丢弃剩余字节——AsyncRead 流契约违约。）
+    #[test]
+    fn packet_io_conn_small_read_buffer_no_byte_loss() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            use tokio::io::AsyncReadExt;
+            let packet: Vec<u8> = (0..100u8).collect();
+            let udpio = Box::new(MockSinglePacketUdpIo {
+                packet: packet.clone(),
+                addr: "127.0.0.1:9000".parse().unwrap(),
+                delivered: std::sync::atomic::AtomicBool::new(false),
+            });
+            let mut conn = wrap_packet_conn_client_into_connection(
+                udpio,
+                "127.0.0.1:9000".parse().unwrap(),
+            )
+            .expect("wrap");
+
+            // 10 字节小缓冲分 10 次读：100 字节必须全部按序到达
+            let mut got = Vec::new();
+            for _ in 0..10 {
+                let mut chunk = [0u8; 10];
+                conn.read_exact(&mut chunk).await.expect("read_exact");
+                got.extend_from_slice(&chunk);
+            }
+            assert_eq!(got, packet, "小缓冲读不得丢字节（剩余字节回填队首）");
+
+            // 包消费完后 driver 因 Err 退出 → 队列关闭 → EOF
+            let mut b = [0u8; 1];
+            assert_eq!(conn.read(&mut b).await.expect("final read"), 0);
         });
     }
 }
