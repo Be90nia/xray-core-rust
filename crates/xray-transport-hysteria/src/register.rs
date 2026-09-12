@@ -3,27 +3,27 @@
 //! dialer: 完整拨号流程——解析配置 → TLS → QuinnHysteriaTransport → HysteriaClient → HysteriaConn。
 //! listener: TLS ServerConfig → QuinnListenerFactory → accept loop → HysteriaConn。
 
-use std::future::Future;
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
+use std::{future::Future, io, net::SocketAddr, pin::Pin, sync::Arc};
 
-use xray_transport::connection::Connection;
-use xray_transport::dialer::{StreamSettings, TransportDialFn, register_transport_dialer};
-use xray_transport::listener_registry::{
-    ConnHandler, TransportListener, TransportListenFn, register_transport_listener,
-};
-use xray_transport::sockopt::SocketOptions;
-
-use crate::conn::{HysteriaConn, InterStreamConn, QuicConn, QuicStream};
-use crate::dialer::{DialDestination, HysteriaClient};
-use crate::hysteria_transport::QuinnHysteriaTransport;
-use crate::proto_config::Config;
-use crate::PROTOCOL_NAME;
-use crate::hub::{HysteriaListenerFactory, HysteriaQuicListener, MasqType};
-use crate::quinn_adapter::{QuinnListenerFactory, QuinnQuicStream};
 use xray_proto::xray::transport::internet::QuicParams;
+use xray_transport::{
+    connection::Connection,
+    dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
+    listener_registry::{
+        ConnHandler, TransportListenFn, TransportListener, register_transport_listener,
+    },
+    sockopt::SocketOptions,
+};
+
+use crate::{
+    PROTOCOL_NAME,
+    conn::{HysteriaConn, InterStreamConn, QuicConn, QuicStream},
+    dialer::{DialDestination, HysteriaClient},
+    hub::{HysteriaListenerFactory, HysteriaQuicListener, MasqType},
+    hysteria_transport::QuinnHysteriaTransport,
+    proto_config::Config,
+    quinn_adapter::{QuinnListenerFactory, QuinnQuicStream},
+};
 
 /// 注册 Hysteria transport dialer。
 ///
@@ -49,8 +49,8 @@ pub fn register_dialer() -> io::Result<()> {
 /// 监听流程：
 /// 1. 从 `streamSettings.security` 构建 TLS `ServerConfig`
 /// 2. 创建 `QuinnListenerFactory` → `factory.listen()` 得到 `HysteriaQuicListener`
-/// 3. spawn accept 循环：每条 QUIC conn → `accept_bi` 取 client-initiated bi-stream
-///    → `QuinnQuicStream` → `InterStreamConn`（server 模式）→ `HysteriaConn` → handler
+/// 3. spawn accept 循环：每条 QUIC conn → `accept_bi` 取 client-initiated bi-stream →
+///    `QuinnQuicStream` → `InterStreamConn`（server 模式）→ `HysteriaConn` → handler
 ///
 /// 幂等：重复注册的 `AlreadyExists` 被忽略。
 pub fn register_listener() -> io::Result<()> {
@@ -64,7 +64,8 @@ pub fn register_listener() -> io::Result<()> {
 /// 监听 + spawn accept 循环。
 ///
 /// 同 gRPC 模式：返回的 `TransportListener` 仅记录 `local_addr`，
-/// 实际 QUIC endpoint 由 spawned accept task 持有；task 退出（accept 失败）时 endpoint drop 即关闭。
+/// 实际 QUIC endpoint 由 spawned accept task 持有；task 退出（accept 失败）时 endpoint drop
+/// 即关闭。
 async fn listen_hysteria(
     addr: SocketAddr,
     settings: StreamSettings,
@@ -101,15 +102,7 @@ async fn listen_hysteria(
     // factory.listen 内部用 config.auth 兜底（Go hub.go:63-64 config.Auth 对比）
     let on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync> = Arc::new(|_| {});
     let listener = factory
-        .listen(
-            addr,
-            config,
-            quic_params,
-            masq,
-            None,
-            on_new_conn,
-            None,
-        )
+        .listen(addr, config, quic_params, masq, None, on_new_conn, None)
         .await
         .map_err(|e| io::Error::other(format!("hysteria listen bind failed: {e}")))?;
 
@@ -158,14 +151,13 @@ async fn accept_hysteria_conn(conn: Arc<dyn QuicConn>, handler: ConnHandler) {
             Ok(s) => s,
             Err(_) => break,
         };
-        let stream: Arc<dyn QuicStream> =
-            Arc::new(QuinnQuicStream::new(send, recv, local, remote));
+        let stream: Arc<dyn QuicStream> = Arc::new(QuinnQuicStream::new(send, recv, local, remote));
         let frame_type = match crate::conn::read_varint_stream(&*stream).await {
             Ok(value) => value,
             Err(_) => {
                 let _ = stream.cancel_read(0x101);
                 continue;
-            }
+            },
         };
         if frame_type != crate::config::FrameTypeTCPRequest {
             let _ = stream.cancel_read(0x101);
@@ -227,45 +219,36 @@ async fn dial_hysteria(
                 io::ErrorKind::InvalidInput,
                 "hysteria requires TLS (streamSettings.security must be \"tls\" or \"reality\")",
             ));
-        }
+        },
     };
 
     // 3. 构造 dest（hysteria 用 UDP，需从 TCP dest 转换）
     let dest_addr = resolve_dest_to_socket_addr(dest)?;
-    let dial_dest = DialDestination {
-        udp_addr: dest_addr,
-        host: default_sni.clone(),
-    };
+    let dial_dest = DialDestination { udp_addr: dest_addr, host: default_sni.clone() };
     // 4. 创建 transport + client
     let bind_addr: SocketAddr = "0.0.0.0:0".parse().map_err(|e: std::net::AddrParseError| {
         io::Error::other(format!("invalid bind addr: {e}"))
     })?;
     // salamander UDP 混淆（Go hysteria/dialer.go:170-175：`UdpmaskManager.
     // WrapPacketConnClient` 包装 pktConn 后再交给 quic.Transport.DialEarly）。
-    let transport = QuinnHysteriaTransport::new(tls_client_config, bind_addr)?
-        .with_salamander(crate::salamander_socket::parse_salamander_obfs(
-            settings.finalmask_json.as_ref(),
-        )?);
+    let transport = QuinnHysteriaTransport::new(tls_client_config, bind_addr)?.with_salamander(
+        crate::salamander_socket::parse_salamander_obfs(settings.finalmask_json.as_ref())?,
+    );
     let quic_params = Arc::new(
         crate::quic_params::parse_quic_params(settings.finalmask_json.as_ref())?
             .unwrap_or_else(crate::quic_params::default_hysteria_quic_params),
     );
-    let client = HysteriaClient::new(
-        dial_dest,
-        Arc::new(config),
-        quic_params,
-        Arc::new(transport),
-    );
+    let client = HysteriaClient::new(dial_dest, Arc::new(config), quic_params, Arc::new(transport));
     let target_addr = match dest.address() {
         xray_common::net::address::Address::Domain(host) => {
             xray_common::net::address::Address::new_domain(host)
-        }
+        },
         xray_common::net::address::Address::IPv4(ip) => {
             xray_common::net::address::Address::IPv4(*ip)
-        }
+        },
         xray_common::net::address::Address::IPv6(ip) => {
             xray_common::net::address::Address::IPv6(*ip)
-        }
+        },
     };
     let conn = client
         .tcp(&target_addr, dest.port())
@@ -280,14 +263,16 @@ async fn dial_hysteria(
 /// 接受的 JSON 字段：
 /// - `auth`：鉴权 token
 /// - `masqType`：伪装类型（proto3 JSON camelCase 兼容）
-/// - `masquerade`：伪装配置嵌套对象（Go 用户配置形态，infra/conf
-///   transport_internet.go:498-510 `Masquerade` struct → :542-549 展开为 proto 扁平字段）
+/// - `masquerade`：伪装配置嵌套对象（Go 用户配置形态，infra/conf transport_internet.go:498-510
+///   `Masquerade` struct → :542-549 展开为 proto 扁平字段）
 /// - `udpIdleTimeout`：UDP 空闲超时（秒）
 /// - `version`：协议版本
 ///
 /// `None` 返回默认配置。
 fn parse_hysteria_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
-    let Some(v) = json else { return Ok(crate::proto_config::default_config()); };
+    let Some(v) = json else {
+        return Ok(crate::proto_config::default_config());
+    };
     let Some(obj) = v.as_object() else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -295,32 +280,12 @@ fn parse_hysteria_config(json: Option<&serde_json::Value>) -> io::Result<Config>
         ));
     };
 
-    let auth = obj
-        .get("auth")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    let masq_type = obj
-        .get("masqType")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    let udp_idle_timeout = obj
-        .get("udpIdleTimeout")
-        .and_then(|x| x.as_i64())
-        .unwrap_or(60);
-    let version = obj
-        .get("version")
-        .and_then(|x| x.as_i64())
-        .unwrap_or(0) as i32;
+    let auth = obj.get("auth").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let masq_type = obj.get("masqType").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let udp_idle_timeout = obj.get("udpIdleTimeout").and_then(|x| x.as_i64()).unwrap_or(60);
+    let version = obj.get("version").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
 
-    let mut config = Config {
-        auth,
-        masq_type,
-        udp_idle_timeout,
-        version,
-        ..Config::default()
-    };
+    let mut config = Config { auth, masq_type, udp_idle_timeout, version, ..Config::default() };
     if let Some(m) = obj.get("masquerade") {
         crate::proto_config::apply_masquerade_json(&mut config, m)?;
     }
@@ -342,7 +307,7 @@ fn resolve_dest_to_socket_addr(
                 io::ErrorKind::InvalidInput,
                 "hysteria requires IP address destination (domain not supported yet, needs DNS resolution)",
             ));
-        }
+        },
     };
     Ok(SocketAddr::new(ip, dest.port().value()))
 }
@@ -366,10 +331,9 @@ mod tests {
 
     #[test]
     fn parse_hysteria_config_basic_fields() {
-        let v: serde_json::Value = serde_json::from_str(
-            r#"{"auth":"my-token","udpIdleTimeout":120,"version":2}"#,
-        )
-        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"auth":"my-token","udpIdleTimeout":120,"version":2}"#)
+                .unwrap();
         let cfg = parse_hysteria_config(Some(&v)).unwrap();
         assert_eq!(cfg.auth, "my-token");
         assert_eq!(cfg.udp_idle_timeout, 120);
@@ -388,17 +352,13 @@ mod tests {
     /// + 542-549 展开）。四类形态各验一遍 + `MasqType::from_config` 回读等价。
     #[test]
     fn parse_hysteria_config_masquerade_object() {
-        let v: serde_json::Value = serde_json::from_str(
-            r#"{"auth":"t","masquerade":{"type":"file","dir":"/var/www"}}"#,
-        )
-        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"auth":"t","masquerade":{"type":"file","dir":"/var/www"}}"#)
+                .unwrap();
         let cfg = parse_hysteria_config(Some(&v)).unwrap();
         assert_eq!(cfg.masq_type, "file");
         assert_eq!(cfg.masq_file, "/var/www");
-        assert_eq!(
-            MasqType::from_config(&cfg).unwrap(),
-            MasqType::File("/var/www".into())
-        );
+        assert_eq!(MasqType::from_config(&cfg).unwrap(), MasqType::File("/var/www".into()));
 
         let v: serde_json::Value = serde_json::from_str(
             r#"{"masquerade":{"type":"proxy","url":"https://e.com","rewriteHost":true,"insecure":true}}"#,
@@ -465,8 +425,7 @@ mod tests {
         .unwrap()
         .expect("client tls config");
         let mut transport = quinn::TransportConfig::default();
-        transport
-            .max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(1_000))));
+        transport.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(1_000))));
         let mut quic_cfg = quinn::ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap(),
         ));

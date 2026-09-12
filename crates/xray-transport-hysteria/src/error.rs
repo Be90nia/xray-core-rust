@@ -78,8 +78,7 @@ mod tests {
 
     #[test]
     fn from_io_error_conversion() {
-        let err: HysteriaError =
-            io::Error::new(io::ErrorKind::UnexpectedEof, "eof").into();
+        let err: HysteriaError = io::Error::new(io::ErrorKind::UnexpectedEof, "eof").into();
         assert!(matches!(err, HysteriaError::Io(_)));
     }
 

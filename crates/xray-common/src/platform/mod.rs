@@ -4,6 +4,7 @@
 
 pub mod env;
 pub mod filesystem;
+pub mod splice;
 
 use std::sync::LazyLock;
 use std::path::PathBuf;

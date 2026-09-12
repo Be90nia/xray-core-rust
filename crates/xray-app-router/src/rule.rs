@@ -127,6 +127,11 @@ pub fn build_condition(
     geo_loader: Option<&GeoDataLoader>,
 ) -> Result<Box<dyn Condition>, RouterError> {
     let mut chan = ConditionChan::new();
+
+    // LocalOS（Go a12801c1：BuildCondition 首个条件，运行时 OS 恒定 → 构造期解析）
+    if !proto.local_os.is_empty() {
+        chan.add(Box::new(LocalOsMatcherCondition::new(&proto.local_os)));
+    }
     if !proto.domain.is_empty() {
         // hn4i：parse_proto_domain_rules 现可返回 Err（fail-closed）。
         let rules = parse_proto_domain_rules(&proto.domain, geo_loader)?;

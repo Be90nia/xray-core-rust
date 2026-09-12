@@ -17,8 +17,8 @@ pub mod packet_queue;
 pub mod ringbuffer;
 pub mod windowed_filter;
 
-pub use bbr_sender::BbrSender;
 pub use bandwidth::Bandwidth;
+pub use bbr_sender::BbrSender;
 pub use clock::{Clock, DefaultClock};
 
 /// BBR Profile（对应 Go `type Profile string`）。

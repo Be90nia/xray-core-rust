@@ -60,7 +60,10 @@ pub fn derive_session_subkey(psk: &[u8], salt: &[u8], kind: CipherKind2022) -> V
 /// 从 subkey 构造 SS-2022 AEAD cipher。
 ///
 /// 对应 sing `Method.constructor`：3 种 2022 cipher 之一。
-pub(crate) fn build_aead(kind: CipherKind2022, subkey: &[u8]) -> Result<Box<dyn xray_crypto::aead::AeadCipher + Send + Sync>> {
+pub(crate) fn build_aead(
+    kind: CipherKind2022,
+    subkey: &[u8],
+) -> Result<Box<dyn xray_crypto::aead::AeadCipher + Send + Sync>> {
     use xray_crypto::aead::{Aes128Gcm, Aes256Gcm, ChaCha20Poly1305Aead};
     match kind {
         CipherKind2022::Aes128Gcm => Ok(Box::new(Aes128Gcm::new(subkey)?)),
@@ -75,7 +78,8 @@ const IDENTITY_CTX: &str = "shadowsocks 2022 identity subkey";
 /// EIH 固定长度（16 字节 AES block）。
 pub const IDENTITY_HEADER_LEN: usize = 16;
 
-/// SIP023 EIH：identity subkey = blake3::derive_key("shadowsocks 2022 identity subkey", iPSK||salt)[..key_size]。
+/// SIP023 EIH：identity subkey = blake3::derive_key("shadowsocks 2022 identity subkey",
+/// iPSK||salt)[..key_size]。
 pub fn derive_identity_subkey(ipsk: &[u8], salt: &[u8], kind: CipherKind2022) -> Vec<u8> {
     let mut material = Vec::with_capacity(ipsk.len() + salt.len());
     material.extend_from_slice(ipsk);
@@ -91,19 +95,35 @@ pub fn psk_identity(psk: &[u8]) -> [u8; IDENTITY_HEADER_LEN] {
 }
 
 /// 加密 EIH：AES-ECB 单块（SIP023 TCP identity_header）。
-pub fn encrypt_identity_header(ipsk: &[u8], next_psk: &[u8], salt: &[u8], kind: CipherKind2022) -> Result<[u8; IDENTITY_HEADER_LEN]> {
+pub fn encrypt_identity_header(
+    ipsk: &[u8],
+    next_psk: &[u8],
+    salt: &[u8],
+    kind: CipherKind2022,
+) -> Result<[u8; IDENTITY_HEADER_LEN]> {
     let plaintext = psk_identity(next_psk);
     ecb_block(kind, &derive_identity_subkey(ipsk, salt, kind), &plaintext, true)
 }
 
 /// 解密 EIH：AES-ECB 单块。返回 16B 明文（下一层 PSK 的 hash 前 16 字节）。
-pub fn decrypt_identity_header(ipsk: &[u8], header: &[u8], salt: &[u8], kind: CipherKind2022) -> Result<[u8; IDENTITY_HEADER_LEN]> {
-    let block: [u8; IDENTITY_HEADER_LEN] = header.try_into().map_err(|_| SsError::InsufficientData(header.len()))?;
+pub fn decrypt_identity_header(
+    ipsk: &[u8],
+    header: &[u8],
+    salt: &[u8],
+    kind: CipherKind2022,
+) -> Result<[u8; IDENTITY_HEADER_LEN]> {
+    let block: [u8; IDENTITY_HEADER_LEN] =
+        header.try_into().map_err(|_| SsError::InsufficientData(header.len()))?;
     ecb_block(kind, &derive_identity_subkey(ipsk, salt, kind), &block, false)
 }
 
 /// AES-ECB 单块加/解密。128 cipher 用 AES-128，256/chacha 用 AES-256。
-pub fn ecb_block(kind: CipherKind2022, key: &[u8], block: &[u8; 16], encrypt: bool) -> Result<[u8; 16]> {
+pub fn ecb_block(
+    kind: CipherKind2022,
+    key: &[u8],
+    block: &[u8; 16],
+    encrypt: bool,
+) -> Result<[u8; 16]> {
     use aes::cipher::{Array, BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
     let mut buf = *block;
     let enc = |buf: &mut [u8; 16]| -> Result<()> {
@@ -114,28 +134,28 @@ pub fn ecb_block(kind: CipherKind2022, key: &[u8], block: &[u8; 16], encrypt: bo
                 let mut b: Array<u8, _> = (*buf).into();
                 aes::Aes128::new(&arr).encrypt_block(&mut b);
                 *buf = b.into();
-            }
+            },
             (CipherKind2022::Aes128Gcm, false) => {
                 let k: [u8; 16] = key[..16].try_into().unwrap();
                 let arr: Array<u8, _> = k.into();
                 let mut b: Array<u8, _> = (*buf).into();
                 aes::Aes128::new(&arr).decrypt_block(&mut b);
                 *buf = b.into();
-            }
+            },
             (_, true) => {
                 let k: [u8; 32] = key[..32].try_into().unwrap();
                 let arr: Array<u8, _> = k.into();
                 let mut b: Array<u8, _> = (*buf).into();
                 aes::Aes256::new(&arr).encrypt_block(&mut b);
                 *buf = b.into();
-            }
+            },
             (_, false) => {
                 let k: [u8; 32] = key[..32].try_into().unwrap();
                 let arr: Array<u8, _> = k.into();
                 let mut b: Array<u8, _> = (*buf).into();
                 aes::Aes256::new(&arr).decrypt_block(&mut b);
                 *buf = b.into();
-            }
+            },
         }
         Ok(())
     };
@@ -162,11 +182,7 @@ pub fn derive_psk(psk: &[u8], kind: CipherKind2022) -> Result<Vec<u8>> {
         h.update(psk);
         Ok(h.finalize()[..want].to_vec())
     } else {
-        Err(SsError::InvalidPassword(format!(
-            "PSK length {} < key_size {}",
-            psk.len(),
-            want
-        )))
+        Err(SsError::InvalidPassword(format!("PSK length {} < key_size {}", psk.len(), want)))
     }
 }
 

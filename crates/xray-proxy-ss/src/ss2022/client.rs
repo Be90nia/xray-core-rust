@@ -16,14 +16,15 @@
 //! 10. read_chunk 循环读响应
 
 use std::time::{SystemTime, UNIX_EPOCH};
+
 use tokio::net::TcpStream;
 use xray_crypto::aead::{AeadCipher, Aes128Gcm, Aes256Gcm, ChaCha20Poly1305Aead};
 
-use crate::error::{Result, SsError};
-use crate::ss2022::key::{
-    derive_psk, derive_session_subkey, psk_from_base64, CipherKind2022,
+use crate::{
+    error::{Result, SsError},
+    ss2022::key::{CipherKind2022, derive_psk, derive_session_subkey, psk_from_base64},
+    stream::SSStream,
 };
-use crate::stream::SSStream;
 
 /// SS-2022 TCP client。
 #[derive(Debug)]
@@ -44,13 +45,7 @@ impl Client2022 {
     pub fn new(cipher: &str, psk_b64: &str, host: &str, port: u16) -> Result<Self> {
         let kind = CipherKind2022::from_name(cipher)?;
         let psk = derive_psk(&psk_from_base64(psk_b64)?, kind)?;
-        Ok(Self {
-            psk,
-            identity_psk: None,
-            kind,
-            server_host: host.to_string(),
-            server_port: port,
-        })
+        Ok(Self { psk, identity_psk: None, kind, server_host: host.to_string(), server_port: port })
     }
 
     /// 设置 server 主 PSK（iPSK）启用多用户 EIH（SIP023）。
@@ -66,9 +61,7 @@ impl Client2022 {
         match self.kind {
             CipherKind2022::Aes128Gcm => Ok(Box::new(Aes128Gcm::new(subkey)?)),
             CipherKind2022::Aes256Gcm => Ok(Box::new(Aes256Gcm::new(subkey)?)),
-            CipherKind2022::ChaCha20Poly1305 => {
-                Ok(Box::new(ChaCha20Poly1305Aead::new(subkey)?))
-            }
+            CipherKind2022::ChaCha20Poly1305 => Ok(Box::new(ChaCha20Poly1305Aead::new(subkey)?)),
         }
     }
 
@@ -144,9 +137,8 @@ impl Client2022 {
         fixed.push(0u8); // headerType=0 client
         fixed.extend_from_slice(&timestamp.to_be_bytes());
         fixed.extend_from_slice(&(variable_len as u16).to_be_bytes());
-        let sealed_fixed = aead
-            .seal(&nonce, &[], &fixed)
-            .map_err(|e| SsError::AeadSeal(e.to_string()))?;
+        let sealed_fixed =
+            aead.seal(&nonce, &[], &fixed).map_err(|e| SsError::AeadSeal(e.to_string()))?;
         increment_nonce(&mut nonce); // [0;12] → [1,0,...]
 
         // 手动 seal variable-header-chunk: addr+port + paddingLen_BE_u16 + padding
@@ -159,9 +151,8 @@ impl Client2022 {
         for _ in 0..padding_len {
             var.push(rand::random::<u8>());
         }
-        let sealed_var = aead
-            .seal(&nonce, &[], &var)
-            .map_err(|e| SsError::AeadSeal(e.to_string()))?;
+        let sealed_var =
+            aead.seal(&nonce, &[], &var).map_err(|e| SsError::AeadSeal(e.to_string()))?;
         increment_nonce(&mut nonce); // [1,0,...] → [2,0,...]
 
         // 合并发送 salt [+ EIH] + sealed_fixed + sealed_var（一次性，避免分次写导致 DPI 识别）
@@ -188,7 +179,6 @@ impl Client2022 {
 
         Ok(stream)
     }
-
 }
 
 /// LE increment（byte[0]++，进位），对应 Go `increaseNonce`。
@@ -262,5 +252,35 @@ mod tests {
         let mut bad_nonce = nonce.clone();
         bad_nonce[0] = 1;
         assert!(aead.open(&bad_nonce, b"", &sealed).is_err());
+    }
+
+    /// Go 2776ea6d 对照：dial 建连后早退（此处目标域名超长触发
+    /// InvalidRemoteAddress）时，到服务器的连接必须被关闭——Rust 以所有权
+    /// RAII 等价 Go `defer connection.Close()`。server accept 后应读到 EOF。
+    #[tokio::test]
+    async fn dial_target_on_early_return_closes_server_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let conn = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let (mut server_sock, _) = listener.accept().await.expect("accept");
+
+        let client = Client2022::new(
+            "2022-blake3-aes-256-gcm",
+            "swzPBNUUnCN6/Ply/V90cKtGbQdNf/UK6v1UjIRAsdQ=",
+            "example.com",
+            8388,
+        )
+        .expect("client");
+
+        // 256+ 字节域名 → u8 长度装不下 → 早退（写 header 之前）。
+        let oversize_domain = "a".repeat(300);
+        let result = client.dial_target_on(conn, &oversize_domain, 443).await;
+        assert!(result.is_err(), "oversize domain must fail handshake");
+
+        // 连接已被关闭：server 读到 EOF（Go defer connection.Close() 语义）。
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 16];
+        let n = server_sock.read(&mut buf).await.expect("read after early return");
+        assert_eq!(n, 0, "server must observe EOF (conn closed) after early return");
     }
 }

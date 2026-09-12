@@ -252,6 +252,10 @@ fn verifier_roots(json: &serde_json::Value) -> io::Result<RootCertStore> {
 pub fn build_server_cert_verifier(
     security_json: Option<&serde_json::Value>,
 ) -> io::Result<Option<Arc<dyn ServerCertVerifier>>> {
+    // ring provider 安装幂等（同 build_client_config:78）：workspace feature
+    // unification 同启 ring+aws-lc-rs 时 rustls 无法自动选定 provider，
+    // naive/btls 路径只经本函数装配 rustls 验证器 → 进程级 panic。
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let json = security_json.cloned().unwrap_or(serde_json::Value::Null);
     let allow_insecure = json
         .as_object()

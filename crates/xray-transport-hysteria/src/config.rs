@@ -52,8 +52,7 @@ pub const UDP_MESSAGE_CHAN_SIZE: usize = 1024;
 pub const IDLE_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Padding 字符表（对应 Go `paddingChars`）。
-const PADDING_CHARS: &[u8] =
-    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+const PADDING_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
 // ===== Padding 范围（lazy 常量，对应 Go 包级 `var`） =====
 
@@ -117,10 +116,7 @@ impl LazyPadding {
     /// 包裹一个 Padding 值。
     #[must_use]
     pub const fn new(value: Padding) -> Self {
-        Self {
-            inner: OnceLock::new(),
-            value,
-        }
+        Self { inner: OnceLock::new(), value }
     }
 
     /// 取出内部 Padding 值（拷贝）。

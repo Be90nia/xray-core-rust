@@ -63,24 +63,50 @@ impl EnvFlag {
         self.get_value().and_then(|v| v.parse().ok())
     }
 }
-/// USE_READV 环境标志（Go `xray.buf.readv`，alt `XRAY_BUF_READV`）。
-static USE_READV_FLAG: LazyLock<EnvFlag> =
-    LazyLock::new(|| EnvFlag::new("xray.buf.readv"));
-
-/// 获取 USE_READV 标志的值。
+/// `xray.buf.readv`（alt `XRAY_BUF_READV`）— readv 聚合读闸门。
 ///
-/// 对应 Go 版本 `platform.UseReadV`：`xray.buf.readv`（或 `XRAY_BUF_READV`）
-/// 设为真值时返回 `true`，未设置默认 `false`。
+/// 对齐 Go `readv_reader.go:153-163`（与 freedom splice 同形三态）：
+/// 未设置 / `"auto"` / `"enable"` → 启用；其余禁用。
+///
+/// 当前无生产调用方——readv 闸门实际在 `xray-buf::readv::use_readv`
+/// （xray-buf 不依赖 xray-common，走本地实现）；本 binding 保留 Go
+/// `platform.UseReadV`（common/platform/platform.go:16）等价入口。
+#[must_use]
 pub fn use_readv() -> bool {
-    USE_READV_FLAG.get_value_as_bool()
+    let raw = std::env::var_os("xray.buf.readv")
+        .or_else(|| std::env::var_os("XRAY_BUF_READV"))
+        .map(|v| v.to_string_lossy().into_owned());
+    parse_enabled_env(raw.as_deref())
 }
 
-/// `xray.buf.splice`（alt `XRAY_BUF_SPLICE`）— freedom splice(2) zero-copy.
+/// `xray.buf.splice`（alt `XRAY_BUF_SPLICE`）— freedom splice(2) zero-copy 闸门。
 ///
-/// 对应 Go `platform.UseFreedomSplice`（common/platform/platform.go:17）。
+/// 对应 Go `platform.UseFreedomSplice`（common/platform/platform.go:17）+
+/// `reloadEnvSettings`（proxy/freedom/freedom.go:41-51）。语义见
+/// [`parse_enabled_env`]。刻意不走 [`EnvFlag`]：其 `get_value` 把空串过滤为
+/// 未设置，而 Go 对 `xray.buf.splice=""` 的语义是禁用（LookupEnv 命中空串 →
+/// switch 落空）。
+#[must_use]
 pub fn use_splice() -> bool {
-    static FLAG: LazyLock<EnvFlag> = LazyLock::new(|| EnvFlag::new("xray.buf.splice"));
-    FLAG.get_value_as_bool()
+    let raw = std::env::var_os("xray.buf.splice")
+        .or_else(|| std::env::var_os("XRAY_BUF_SPLICE"))
+        .map(|v| v.to_string_lossy().into_owned());
+    parse_enabled_env(raw.as_deref())
+}
+
+/// Go 三态启用语义的纯函数形式（freedom.go:45-48 `reloadEnvSettings` 与
+/// readv_reader.go:153-163 同形）。
+///
+/// `None` = 环境变量未设置（Go 的 defaultFlagValue 哨兵）→ 启用；
+/// `Some("auto" | "enable")` → 启用；其余一律禁用（大小写敏感，对齐 Go
+/// switch 精确匹配，无 trim/小写化，`"true"`/`"1"` 也禁用）。非 UTF-8 值经
+/// to_string_lossy 变成非匹配串 → 禁用，与 Go 逐字节比较一致。
+#[must_use]
+pub fn parse_enabled_env(value: Option<&str>) -> bool {
+    match value {
+        None => true,
+        Some(s) => matches!(s, "auto" | "enable"),
+    }
 }
 
 /// `xray.vmess.padding`（alt `XRAY_VMESS_PADDING`）— VMess outbound 全局 padding 开关。
@@ -185,6 +211,18 @@ mod tests {
     #[test]
     fn test_use_splice_returns_bool() {
         let _val: bool = use_splice();
+    }
+
+    #[test]
+    fn test_parse_enabled_env_go_semantics() {
+        // freedom.go:45-48 / readv_reader.go:153-163 同形：未设置/auto/enable → 启用。
+        assert!(parse_enabled_env(None), "未设置 = Go 缺省开");
+        assert!(parse_enabled_env(Some("auto")));
+        assert!(parse_enabled_env(Some("enable")));
+        // 禁用侧：Go switch 精确匹配，"true"/"1" 也禁用，大小写敏感不 trim。
+        for off in ["", "disable", "true", "1", "on", "yes", "AUTO", "Enable", " default "] {
+            assert!(!parse_enabled_env(Some(off)), "env={off:?} 应禁用");
+        }
     }
 
     #[test]

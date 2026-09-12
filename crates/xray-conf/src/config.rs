@@ -20,7 +20,7 @@ use crate::common::{Address, PortList, StringList};
 /// 顶层 Xray 配置，对应 Go `infra/conf.Config`。
 ///
 /// 所有字段均可选（`#[serde(default)]`）；未知字段默认忽略以兼容前向兼容。
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// 日志配置。

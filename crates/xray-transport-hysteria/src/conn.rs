@@ -9,17 +9,21 @@
 //! 上层（quinn adapter）实现此 trait。hysteria 内部独立可测的部分是
 //! InterConn 状态机 + UdpSessionManager 的 id 分配 + 清理逻辑。
 
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use parking_lot::Mutex;
-use tokio::sync::{mpsc, Mutex as TokioMutex};
+use tokio::sync::{Mutex as TokioMutex, mpsc};
 
-use crate::config::{IDLE_CLEANUP_INTERVAL, TcpRequestPadding, UDP_MESSAGE_CHAN_SIZE};
-use crate::error::Result;
+use crate::{
+    config::{IDLE_CLEANUP_INTERVAL, TcpRequestPadding, UDP_MESSAGE_CHAN_SIZE},
+    error::Result,
+};
 
 /// Encode a QUIC varint.
 #[must_use]
@@ -29,12 +33,7 @@ pub fn encode_varint(v: u64) -> Vec<u8> {
     } else if v < (1 << 14) {
         vec![((v >> 8) as u8) | 0b0100_0000, v as u8]
     } else if v < (1 << 30) {
-        vec![
-            ((v >> 24) as u8) | 0b1000_0000,
-            (v >> 16) as u8,
-            (v >> 8) as u8,
-            v as u8,
-        ]
+        vec![((v >> 24) as u8) | 0b1000_0000, (v >> 16) as u8, (v >> 8) as u8, v as u8]
     } else {
         vec![
             ((v >> 56) as u8) | 0b1100_0000,
@@ -71,7 +70,10 @@ async fn read_exact_stream(stream: &dyn QuicStream, mut buf: &mut [u8]) -> io::R
     while !buf.is_empty() {
         let n = stream.read(buf).await?;
         if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "hysteria: stream closed mid-frame"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "hysteria: stream closed mid-frame",
+            ));
         }
         buf = &mut buf[n..];
     }
@@ -127,9 +129,7 @@ pub(crate) async fn read_varint_exact_stream(stream: &dyn QuicStream) -> io::Res
 ///
 /// Format: status(1B) + varint(msg_len<=2048) + msg + varint(pad_len<=4096) + pad.
 /// status==1 is dial failure; msg is returned to the caller as an error.
-pub(crate) async fn read_tcp_response_stream(
-    stream: &dyn QuicStream,
-) -> io::Result<()> {
+pub(crate) async fn read_tcp_response_stream(stream: &dyn QuicStream) -> io::Result<()> {
     use std::convert::TryFrom;
     const MAX_MSG: u64 = 2048;
     const MAX_PAD: u64 = 4096;
@@ -160,9 +160,7 @@ pub(crate) async fn read_tcp_response_stream(
     }
     if status[0] != 0 {
         let msg_str = String::from_utf8_lossy(&msg).into_owned();
-        return Err(io::Error::other(format!(
-            "hysteria tcp dial rejected by server: {msg_str}"
-        )));
+        return Err(io::Error::other(format!("hysteria tcp dial rejected by server: {msg_str}")));
     }
     Ok(())
 }
@@ -200,7 +198,9 @@ pub trait QuicStream: Send + Sync + std::fmt::Debug {
     fn cancel_read(&self, code: u64);
 
     /// 关闭（对应 Go `stream.Close()`）。
-    fn close(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>;
+    fn close(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>;
 
     /// 本地地址。
     fn local_addr(&self) -> SocketAddr;
@@ -208,7 +208,6 @@ pub trait QuicStream: Send + Sync + std::fmt::Debug {
     /// 远端地址。
     fn remote_addr(&self) -> SocketAddr;
 }
-
 
 /// QUIC conn 抽象（对应 Go `*quic.Conn`）。
 pub trait QuicConn: Send + Sync {
@@ -221,9 +220,7 @@ pub trait QuicConn: Send + Sync {
     /// 接收 datagram（对应 Go `conn.ReceiveDatagram`）。
     fn receive_datagram(
         &self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = std::io::Result<Vec<u8>>> + Send>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<u8>>> + Send>>;
 
     /// 关闭（对应 Go `conn.CloseWithError`）。
     fn close_with_error(&self, code: u64, reason: &str);
@@ -257,13 +254,13 @@ pub struct InterStreamConn {
 
 impl InterStreamConn {
     /// 构造（对应 Go `interConn{}` 字面量）。
-    pub fn new(stream: Arc<dyn QuicStream>, local: SocketAddr, remote: SocketAddr, client: bool) -> Self {
-        Self {
-            stream,
-            local,
-            remote,
-            client_first: Mutex::new(client),
-        }
+    pub fn new(
+        stream: Arc<dyn QuicStream>,
+        local: SocketAddr,
+        remote: SocketAddr,
+        client: bool,
+    ) -> Self {
+        Self { stream, local, remote, client_first: Mutex::new(client) }
     }
 
     /// 读（对应 Go `Read`）。
@@ -321,11 +318,17 @@ impl InterStreamConn {
 pub struct HysteriaConn {
     inner: Arc<InterStreamConn>,
     /// 缓存进行中的 read future。
-    read_state: parking_lot::Mutex<Option<Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<u8>>> + Send>>>>,
+    read_state: parking_lot::Mutex<
+        Option<Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<u8>>> + Send>>>,
+    >,
     /// 缓存进行中的 write future。
-    write_state: parking_lot::Mutex<Option<Pin<Box<dyn std::future::Future<Output = std::io::Result<usize>> + Send>>>>,
+    write_state: parking_lot::Mutex<
+        Option<Pin<Box<dyn std::future::Future<Output = std::io::Result<usize>> + Send>>>,
+    >,
     /// 缓存进行中的 close future。
-    close_state: parking_lot::Mutex<Option<Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>>>,
+    close_state: parking_lot::Mutex<
+        Option<Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>>,
+    >,
 }
 
 impl HysteriaConn {
@@ -391,10 +394,10 @@ impl tokio::io::AsyncRead for HysteriaConn {
                             buf.put_slice(&data);
                             std::task::Poll::Ready(Ok(()))
                         }
-                    }
+                    },
                     Err(e) => std::task::Poll::Ready(Err(e)),
                 }
-            }
+            },
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
@@ -411,9 +414,7 @@ impl tokio::io::AsyncWrite for HysteriaConn {
             let inner = Arc::clone(&self.inner);
             let data = buf.to_vec();
             let buf_len = buf.len();
-            *state = Some(Box::pin(async move {
-                inner.write(&data).await
-            }));
+            *state = Some(Box::pin(async move { inner.write(&data).await }));
             // ponytail: 记录原始 buf 长度，因为 write 可能返回不同长度
             // 但我们无法在 future 完成前知道实际写了多少，所以用 buf_len 作为回退
             let _ = buf_len;
@@ -424,7 +425,7 @@ impl tokio::io::AsyncWrite for HysteriaConn {
             std::task::Poll::Ready(result) => {
                 *state = None;
                 std::task::Poll::Ready(result)
-            }
+            },
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
@@ -444,9 +445,7 @@ impl tokio::io::AsyncWrite for HysteriaConn {
         let mut state = self.close_state.lock();
         if state.is_none() {
             let inner = Arc::clone(&self.inner);
-            *state = Some(Box::pin(async move {
-                inner.close().await
-            }));
+            *state = Some(Box::pin(async move { inner.close().await }));
         }
 
         let fut = state.as_mut().unwrap();
@@ -454,7 +453,7 @@ impl tokio::io::AsyncWrite for HysteriaConn {
             std::task::Poll::Ready(result) => {
                 *state = None;
                 std::task::Poll::Ready(result)
-            }
+            },
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
@@ -469,7 +468,6 @@ impl xray_transport::connection::Connection for HysteriaConn {
         Ok(Some(self.inner.local_addr()))
     }
 }
-
 
 /// UDP session 抽象（对应 Go `InterConn`）。
 ///
@@ -487,7 +485,18 @@ pub struct InterConn {
     /// 是否已关闭。
     closed: Mutex<bool>,
     /// 写回调（QUIC conn.SendDatagram）。
-    write_fn: Mutex<Option<Arc<dyn Fn(&[u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>> + Send + Sync>>>,
+    write_fn: Mutex<
+        Option<
+            Arc<
+                dyn Fn(
+                        &[u8],
+                    ) -> std::pin::Pin<
+                        Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>,
+                    > + Send
+                    + Sync,
+            >,
+        >,
+    >,
     /// 关闭回调（清理 UdpSessionManager 中的 entry）。
     close_fn: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
@@ -535,14 +544,15 @@ impl InterConn {
     /// 从 channel 取一个 datagram，前 4 字节是 session id（写时已注入），
     /// 读时剥除。返回有效 payload 长度。
     pub async fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let data = self.recv_rx.lock().await.recv().await.ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed")
-        })?;
+        let data = self
+            .recv_rx
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed"))?;
         if buf.len() < data.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "short buffer",
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "short buffer"));
         }
         buf[..data.len()].copy_from_slice(&data);
         self.touch();
@@ -554,10 +564,7 @@ impl InterConn {
     /// 注入 4 字节大端 session id 前缀，调 write_fn。
     pub async fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
         if *self.closed.lock() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "closed",
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed"));
         }
         let mut payload = Vec::with_capacity(4 + buf.len());
         payload.extend_from_slice(&self.id.to_be_bytes());
@@ -688,7 +695,12 @@ impl UdpSessionManager {
     }
 
     /// 启动后台清理 + recv 任务（对应 Go `go udpSM.clean(); go udpSM.run()`）。
-    pub async fn start(self: &Arc<Self>, conn: Arc<dyn QuicConn>, local: SocketAddr, remote: SocketAddr) {
+    pub async fn start(
+        self: &Arc<Self>,
+        conn: Arc<dyn QuicConn>,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) {
         let inner = Arc::clone(&self.inner);
         {
             let mut g = self.inner.lock().await;
@@ -755,7 +767,12 @@ impl UdpSessionManager {
     /// 创建一个新 UDP session（对应 Go `udpSessionManager.udp()`）。
     ///
     /// 仅 client 端使用（生成新 id）。server 端在 `feed` 路径自动创建。
-    pub async fn create_session(self: &Arc<Self>, conn: Arc<dyn QuicConn>, local: SocketAddr, remote: SocketAddr) -> Result<Arc<InterConn>> {
+    pub async fn create_session(
+        self: &Arc<Self>,
+        conn: Arc<dyn QuicConn>,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> Result<Arc<InterConn>> {
         let mut g = self.inner.lock().await;
         if g.closed {
             return Err(crate::error::HysteriaError::ConnectionClosed);
@@ -843,22 +860,28 @@ mod tests {
         fn send_datagram<'a>(
             &'a self,
             data: &'a [u8],
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>> {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>>
+        {
             self.sent.lock().push(data.to_vec());
             Box::pin(async { Ok(()) })
         }
+
         fn receive_datagram(
             &self,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<u8>>> + Send>> {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<u8>>> + Send>>
+        {
             Box::pin(async {
                 std::future::pending::<()>().await;
                 unreachable!()
             })
         }
+
         fn close_with_error(&self, _code: u64, _reason: &str) {}
+
         fn local_addr(&self) -> SocketAddr {
             self.local
         }
+
         fn remote_addr(&self) -> SocketAddr {
             self.remote
         }
@@ -903,23 +926,35 @@ mod tests {
             fn read<'a>(
                 &'a self,
                 _buf: &'a mut [u8],
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<usize>> + Send + 'a>> {
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = std::io::Result<usize>> + Send + 'a>,
+            > {
                 Box::pin(async { Ok(0) })
             }
+
             fn write<'a>(
                 &'a self,
                 buf: &'a [u8],
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<usize>> + Send + 'a>> {
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = std::io::Result<usize>> + Send + 'a>,
+            > {
                 let len = buf.len();
                 Box::pin(async move { Ok(len) })
             }
+
             fn cancel_read(&self, _code: u64) {}
-            fn close(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>> {
+
+            fn close(
+                &self,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>
+            {
                 Box::pin(async { Ok(()) })
             }
+
             fn local_addr(&self) -> SocketAddr {
                 self.local
             }
+
             fn remote_addr(&self) -> SocketAddr {
                 self.remote
             }
@@ -982,7 +1017,8 @@ mod tests {
     async fn udp_session_manager_create_assigns_incrementing_ids() {
         let local: SocketAddr = "127.0.0.1:80".parse().unwrap();
         let remote: SocketAddr = "127.0.0.1:443".parse().unwrap();
-        let conn: Arc<dyn QuicConn> = Arc::new(NoopConn { local, remote, sent: parking_lot::Mutex::new(Vec::new()) });
+        let conn: Arc<dyn QuicConn> =
+            Arc::new(NoopConn { local, remote, sent: parking_lot::Mutex::new(Vec::new()) });
         let mgr = UdpSessionManager::new(Duration::from_secs(60), None);
         let s1 = mgr.create_session(Arc::clone(&conn), local, remote).await.unwrap();
         let s2 = mgr.create_session(Arc::clone(&conn), local, remote).await.unwrap();
@@ -1000,9 +1036,12 @@ mod tests {
         let noop = Arc::new(NoopConn { local, remote, sent: parking_lot::Mutex::new(Vec::new()) });
         let conn: Arc<dyn QuicConn> = Arc::clone(&noop) as Arc<dyn QuicConn>;
         let (tx, mut rx) = mpsc::unbounded_channel::<Arc<InterConn>>();
-        let mgr = UdpSessionManager::new(Duration::from_secs(60), Some(Arc::new(move |s| {
-            let _ = tx.send(s);
-        })));
+        let mgr = UdpSessionManager::new(
+            Duration::from_secs(60),
+            Some(Arc::new(move |s| {
+                let _ = tx.send(s);
+            })),
+        );
         mgr.start(Arc::clone(&conn), local, remote).await;
 
         // 模拟 client 上行 datagram：[id=7 BE][body...]

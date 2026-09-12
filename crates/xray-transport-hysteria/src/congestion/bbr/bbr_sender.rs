@@ -4,18 +4,24 @@
 //! 状态机内部简化（标记 TODO：完整 STARTUP/DRAIN/PROBE_BW/PROBE_RTT 状态转换
 //! 等真正需要运行 hysteria 时补全；quinn 集成可改用 quinn-proto 自带 BBR）。
 
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
-use super::super::pacer::Pacer;
-use super::super::types::{
-    AckedPacketInfo, ByteCount, CongestionControl, LostPacketInfo, MonoTime, PacketNumber,
-    RttStatsProvider, INITIAL_PACKET_SIZE,
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
 };
-use super::bandwidth::{Bandwidth, INF_BANDWIDTH};
-use super::bandwidth_sampler::{BandwidthSampler, INF_RTT};
-use super::clock::Clock;
-use super::Profile;
+
+use super::{
+    super::{
+        pacer::Pacer,
+        types::{
+            AckedPacketInfo, ByteCount, CongestionControl, INITIAL_PACKET_SIZE, LostPacketInfo,
+            MonoTime, PacketNumber, RttStatsProvider,
+        },
+    },
+    Profile,
+    bandwidth::{Bandwidth, INF_BANDWIDTH},
+    bandwidth_sampler::{BandwidthSampler, INF_RTT},
+    clock::Clock,
+};
 
 // ===== 算法常量（对应 Go `const` 块） =====
 
@@ -203,7 +209,11 @@ impl std::fmt::Debug for BbrSender {
 
 impl BbrSender {
     /// 构造（对应 Go `NewBbrSender`）。
-    pub fn new(clock: Arc<dyn Clock>, initial_max_datagram_size: ByteCount, profile: Profile) -> Self {
+    pub fn new(
+        clock: Arc<dyn Clock>,
+        initial_max_datagram_size: ByteCount,
+        profile: Profile,
+    ) -> Self {
         let initial_cwnd = INITIAL_CONGESTION_WINDOW_PACKETS * initial_max_datagram_size;
         let max_cwnd = 100 * initial_max_datagram_size; // ponytail: MaxCongestionWindowPackets = 100
         let min_cwnd = min_congestion_window_for_max_datagram_size(initial_max_datagram_size);
@@ -274,11 +284,7 @@ impl BbrSender {
         // 同步初始 (rate, gain) 到 pacer 闭包
         *bw_state.lock().unwrap() = (inner.pacing_rate, inner.pacing_gain);
 
-        Self {
-            inner: Mutex::new(inner),
-            pacer,
-            clock,
-        }
+        Self { inner: Mutex::new(inner), pacer, clock }
         // bw_state 在 drop 时释放（pacer 闭包持有副本）
         // ponytail: bw_state 局部变量没保留到 struct，pacer 闭包是唯一持有者。
     }
@@ -300,9 +306,9 @@ impl BbrSender {
         if cfg.enable_overestimate_avoidance {
             inner.sampler.enable_overestimate_avoidance();
         }
-        inner
-            .sampler
-            .set_reduce_extra_acked_on_bandwidth_increase(cfg.reduce_extra_acked_on_bandwidth_increase);
+        inner.sampler.set_reduce_extra_acked_on_bandwidth_increase(
+            cfg.reduce_extra_acked_on_bandwidth_increase,
+        );
     }
 
     /// 当前模式。
@@ -365,9 +371,13 @@ impl CongestionControl for BbrSender {
         if bytes_in_flight == 0 {
             inner.exiting_quiescence = true;
         }
-        inner
-            .sampler
-            .on_packet_sent(sent_time, packet_number, bytes, bytes_in_flight, is_retransmittable);
+        inner.sampler.on_packet_sent(
+            sent_time,
+            packet_number,
+            bytes,
+            bytes_in_flight,
+            is_retransmittable,
+        );
     }
 
     fn on_packet_acked(
@@ -421,10 +431,7 @@ impl CongestionControl for BbrSender {
 
     fn set_max_datagram_size(&mut self, size: ByteCount) {
         let mut inner = self.inner.lock().unwrap();
-        assert!(
-            size >= inner.max_datagram_size,
-            "BBR cannot decrease max datagram size"
-        );
+        assert!(size >= inner.max_datagram_size, "BBR cannot decrease max datagram size");
         let old_mds = inner.max_datagram_size;
         let old_min_cwnd = inner.min_congestion_window;
         let old_initial_cwnd = inner.initial_congestion_window;
@@ -432,8 +439,7 @@ impl CongestionControl for BbrSender {
         inner.max_datagram_size = size;
         inner.initial_congestion_window =
             scale_byte_window(inner.initial_congestion_window, old_mds, size);
-        inner.max_congestion_window =
-            scale_byte_window(inner.max_congestion_window, old_mds, size);
+        inner.max_congestion_window = scale_byte_window(inner.max_congestion_window, old_mds, size);
         inner.min_congestion_window = min_congestion_window_for_max_datagram_size(size);
         inner.cwnd_to_calculate_min_pacing_rate =
             scale_byte_window(inner.cwnd_to_calculate_min_pacing_rate, old_mds, size);
@@ -453,9 +459,8 @@ impl CongestionControl for BbrSender {
                 .congestion_window
                 .clamp(inner.min_congestion_window, inner.max_congestion_window);
         }
-        inner.recovery_window = inner
-            .recovery_window
-            .clamp(inner.min_congestion_window, inner.max_congestion_window);
+        inner.recovery_window =
+            inner.recovery_window.clamp(inner.min_congestion_window, inner.max_congestion_window);
 
         drop(inner);
         self.pacer.set_max_datagram_size(size);
@@ -485,15 +490,10 @@ impl CongestionControl for BbrSender {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::congestion::bbr::DefaultClock;
-    use crate::congestion::types::test_support::MockRttStats;
+    use crate::congestion::{bbr::DefaultClock, types::test_support::MockRttStats};
 
     fn make_sender() -> BbrSender {
-        BbrSender::new(
-            Arc::new(DefaultClock::new()),
-            INITIAL_PACKET_SIZE,
-            Profile::Standard,
-        )
+        BbrSender::new(Arc::new(DefaultClock::new()), INITIAL_PACKET_SIZE, Profile::Standard)
     }
 
     #[test]
@@ -569,11 +569,8 @@ mod tests {
     fn on_congestion_event_ex_updates_bytes_in_flight() {
         let mut s = make_sender();
         s.on_packet_sent(100, 1200, 1, 1200, true);
-        let acked = vec![AckedPacketInfo {
-            packet_number: 1,
-            bytes_acked: 1200,
-            receive_time_ns: 200,
-        }];
+        let acked =
+            vec![AckedPacketInfo { packet_number: 1, bytes_acked: 1200, receive_time_ns: 200 }];
         s.on_congestion_event_ex(1200, 200, &acked, &[]);
         let inner = s.inner.lock().unwrap();
         assert_eq!(inner.bytes_in_flight, 0);
@@ -629,10 +626,7 @@ mod tests {
 
     #[test]
     fn recovery_states_distinct() {
-        assert_ne!(
-            BbrRecoveryState::NotInRecovery,
-            BbrRecoveryState::Conservation
-        );
+        assert_ne!(BbrRecoveryState::NotInRecovery, BbrRecoveryState::Conservation);
         assert_ne!(BbrRecoveryState::Conservation, BbrRecoveryState::Growth);
     }
 

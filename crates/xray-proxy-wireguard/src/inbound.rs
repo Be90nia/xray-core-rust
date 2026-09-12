@@ -301,6 +301,7 @@ async fn wg_accept_loop(
                 email: user.as_ref().map(|u| u.email.clone()).unwrap_or_default(),
                 level: user.as_ref().map_or(0, |u| u.level),
                 inbound_tag: String::new(),
+                allowed_network: None,
             };
             let dispatch = Arc::clone(&dispatch);
             tokio::spawn(async move {

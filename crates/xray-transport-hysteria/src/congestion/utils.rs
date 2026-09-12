@@ -8,9 +8,11 @@
 
 use std::sync::Arc;
 
-use super::bbr::{BbrSender, Profile};
-use super::brutal::BrutalSender;
-use super::types::CongestionControl;
+use super::{
+    bbr::{BbrSender, Profile},
+    brutal::BrutalSender,
+    types::CongestionControl,
+};
 
 pub const TYPE_BBR: &str = "bbr";
 pub const TYPE_RENO: &str = "reno";
@@ -57,9 +59,13 @@ pub fn use_bbr<S: CongestionSetter + ?Sized>(
     setter.set_congestion_control(sender);
 }
 
-/// 创建 BrutalSender 并应用到 setter（对应 Go `UseBrutal`）。
-pub fn use_brutal<S: CongestionSetter + ?Sized>(setter: &S, tx_bps: u64) {
-    let sender = Box::new(BrutalSender::new(tx_bps));
+/// 创建 BrutalSender 并应用到 setter（对应 Go `UseBrutal(conn, tx, disableLossCompensation)`）。
+pub fn use_brutal<S: CongestionSetter + ?Sized>(
+    setter: &S,
+    tx_bps: u64,
+    disable_loss_compensation: bool,
+) {
+    let sender = Box::new(BrutalSender::new(tx_bps, disable_loss_compensation));
     setter.set_congestion_control(sender);
 }
 
@@ -84,8 +90,9 @@ pub fn use_configured<S: CongestionSetter + ?Sized>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Mutex;
+
+    use super::*;
 
     /// 测试用 setter：记录最后一次 set 的 cc 指针。
     struct TestSetter {
@@ -94,9 +101,7 @@ mod tests {
 
     impl TestSetter {
         fn new() -> Self {
-            Self {
-                last_set: Mutex::new(None),
-            }
+            Self { last_set: Mutex::new(None) }
         }
 
         fn was_set(&self) -> bool {
@@ -142,9 +147,8 @@ mod tests {
     #[test]
     fn use_bbr_applies_cc_to_setter() {
         let setter = TestSetter::new();
-        let clock: Arc<dyn super::super::bbr::Clock> = Arc::new(
-            crate::congestion::bbr::DefaultClock::new(),
-        );
+        let clock: Arc<dyn super::super::bbr::Clock> =
+            Arc::new(crate::congestion::bbr::DefaultClock::new());
         use_bbr(&setter, clock, crate::congestion::types::INITIAL_PACKET_SIZE, Profile::Standard);
         assert!(setter.was_set());
     }
@@ -152,16 +156,15 @@ mod tests {
     #[test]
     fn use_brutal_applies_cc_to_setter() {
         let setter = TestSetter::new();
-        use_brutal(&setter, 1_000_000);
+        use_brutal(&setter, 1_000_000, false);
         assert!(setter.was_set());
     }
 
     #[test]
     fn use_configured_reno_no_op() {
         let setter = TestSetter::new();
-        let clock: Arc<dyn super::super::bbr::Clock> = Arc::new(
-            crate::congestion::bbr::DefaultClock::new(),
-        );
+        let clock: Arc<dyn super::super::bbr::Clock> =
+            Arc::new(crate::congestion::bbr::DefaultClock::new());
         use_configured(&setter, "reno", "standard", clock, 1200).unwrap();
         assert!(!setter.was_set()); // reno → no op
     }
@@ -169,9 +172,8 @@ mod tests {
     #[test]
     fn use_configured_default_applies_bbr() {
         let setter = TestSetter::new();
-        let clock: Arc<dyn super::super::bbr::Clock> = Arc::new(
-            crate::congestion::bbr::DefaultClock::new(),
-        );
+        let clock: Arc<dyn super::super::bbr::Clock> =
+            Arc::new(crate::congestion::bbr::DefaultClock::new());
         use_configured(&setter, "", "standard", clock, 1200).unwrap();
         assert!(setter.was_set());
     }
@@ -179,9 +181,8 @@ mod tests {
     #[test]
     fn use_configured_invalid_profile_errors() {
         let setter = TestSetter::new();
-        let clock: Arc<dyn super::super::bbr::Clock> = Arc::new(
-            crate::congestion::bbr::DefaultClock::new(),
-        );
+        let clock: Arc<dyn super::super::bbr::Clock> =
+            Arc::new(crate::congestion::bbr::DefaultClock::new());
         assert!(use_configured(&setter, "bbr", "weird", clock, 1200).is_err());
     }
 }

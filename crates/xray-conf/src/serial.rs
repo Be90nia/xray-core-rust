@@ -501,6 +501,11 @@ mod tests {
 
     #[test]
     fn build_config_builds_merged_config() {
+        // build() 现在自举运行 lint 注册表（bd 5x41）；lint.rs 并行测试会注册
+        // Boom 等 junk 阶段，故持 TEST_LOCK 并重置注册表，只留内置阶段。
+        let _g = crate::lint::tests::TEST_LOCK.lock();
+        crate::lint::clear_stages();
+        crate::init::register_builtin_stages();
         let p1 = write_temp(
             "build_1.json",
             r#"{ "inbounds": [{ "protocol": "vless", "port": 443, "tag": "in" }] }"#,

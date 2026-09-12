@@ -16,30 +16,35 @@
 //! `tls_config: Some(_)` 走 rustls + wss://；`None` 走明文 ws://。
 //! 拨 TCP 由 `tokio-tungstenite` 内部完成（用 URI 的 host:port）。
 
-use std::future::Future;
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll, ready};
-
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::task::JoinHandle;
-use xray_transport::connection::Connection;
+use std::{
+    future::Future,
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll, ready},
+};
 
 use base64::Engine;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::handshake::client::Request as WsRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use tokio_tungstenite::{client_async_tls_with_config, Connector, MaybeTlsStream};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    task::JoinHandle,
+};
+use tokio_tungstenite::{
+    Connector, MaybeTlsStream, client_async_tls_with_config,
+    tungstenite::{
+        client::IntoClientRequest, handshake::client::Request as WsRequest, http::HeaderValue,
+        protocol::WebSocketConfig,
+    },
+};
+use xray_common::{browser::try_default_headers_with, net::destination::Destination};
+use xray_transport::connection::Connection;
 
-use xray_common::browser::try_default_headers_with;
-use xray_common::net::destination::Destination;
-
-use crate::config::Config;
-use crate::error::{Result, WsError};
-use crate::ws_bridge::WsConnection;
+use crate::{
+    config::Config,
+    error::{Result, WsError},
+    ws_bridge::WsConnection,
+};
 
 /// 拨号参数（与 Go `dialWebSocket` 入参对齐）。
 pub struct DialOptions<'a> {
@@ -93,11 +98,13 @@ pub async fn dial(
             let sni = opts.tls_server_name.as_deref().unwrap_or(host.as_str());
             let inner = Box::new(xray_transport::connection::TcpConnection::new(tcp))
                 as Box<dyn xray_transport::connection::Connection>;
-            // 禁区: ws/httpupgrade 的 u_client 接线实测 VPS 15 节点 Connection reset (2026-09-06 run_full32 17/32), btls 与该类端点不兼容, 启用前须先解决 btls 层兼容性 — fingerprint 被有意忽略, 恒走 rustls。
+            // 禁区: ws/httpupgrade 的 u_client 接线实测 VPS 15 节点 Connection reset (2026-09-06
+            // run_full32 17/32), btls 与该类端点不兼容, 启用前须先解决 btls 层兼容性 — fingerprint
+            // 被有意忽略, 恒走 rustls。
             let tls_stream: Box<dyn xray_transport::connection::Connection> =
                 Box::new(xray_tls::utls::client(inner, sni, cfg).await?);
             Box::new(tls_stream)
-        }
+        },
         None => Box::new(xray_transport::connection::TcpConnection::new(tcp)),
     };
 
@@ -111,9 +118,7 @@ pub async fn dial(
     // 客户端心跳（Go dialer.go:165 NewConnection(conn, _, _, HeartbeatPeriod)）：
     // heartbeatPeriod > 0 时两侧都起 ping，防 NAT/CDN 长空闲掐断。
     if opts.config.heartbeat_period > 0 {
-        conn.start_heartbeat(std::time::Duration::from_secs(
-            opts.config.heartbeat_period as u64,
-        ));
+        conn.start_heartbeat(std::time::Duration::from_secs(opts.config.heartbeat_period as u64));
     }
     Ok(conn)
 }
@@ -139,13 +144,7 @@ pub async fn dial_with_params(
     params: DialParams,
     early_data: Option<Vec<u8>>,
 ) -> Result<WsConnection<MaybeTlsStream<Box<dyn xray_transport::connection::Connection>>>> {
-    let DialParams {
-        config,
-        destination,
-        tls_config,
-        tls_server_name,
-        fingerprint,
-    } = params;
+    let DialParams { config, destination, tls_config, tls_server_name, fingerprint } = params;
     dial(DialOptions {
         config: &config,
         destination: &destination,
@@ -167,9 +166,9 @@ pub type DialFactory = Arc<dyn Fn(Option<Vec<u8>>) -> DialFuture + Send + Sync>;
 /// Go `dialer.go:168-221 delayDialConn` 的等价物：`Ed > 0` 时真实拨号推迟到
 /// 首次 Write，首包 ≤ Ed 字节以 early data 进握手头（0-RTT，省 1 RTT）。
 ///
-/// - 首次 `poll_write`：≤ Ed 整包交给工厂作 early data 并 spawn 拨号任务，
-///   `Pending` 到拨号完成；被握手吸收则 `Ready(Ok(len))`，超 Ed 则不带
-///   early data、原包落帧写（`dialer.go:178-198`）。
+/// - 首次 `poll_write`：≤ Ed 整包交给工厂作 early data 并 spawn 拨号任务， `Pending`
+///   到拨号完成；被握手吸收则 `Ready(Ok(len))`，超 Ed 则不带 early
+///   data、原包落帧写（`dialer.go:178-198`）。
 /// - `poll_read`：未拨号时等待拨号完成（`dialed` channel 语义，`dialer.go:200-212`）。
 /// - 关闭/drop：abort 未完成的拨号任务（`cancel()` 语义，`dialer.go:214-221`）。
 pub struct DelayDialConn {
@@ -185,14 +184,7 @@ pub struct DelayDialConn {
 impl DelayDialConn {
     /// `Ed` 容量上限与拨号工厂；真实拨号在首次 Write 才发生。
     pub fn new(ed: u32, factory: DialFactory) -> Self {
-        Self {
-            ed,
-            factory,
-            joining: None,
-            conn: None,
-            first_write: None,
-            closed: false,
-        }
+        Self { ed, factory, joining: None, conn: None, first_write: None, closed: false }
     }
 
     /// 驱动拨号任务到完成。无任务时 `Pending`（等首次 Write 触发）。
@@ -208,17 +200,17 @@ impl DelayDialConn {
             Poll::Ready(Err(e)) => {
                 self.closed = true;
                 Poll::Ready(Err(io::Error::other(format!("dial task failed: {e}"))))
-            }
+            },
             Poll::Ready(Ok(Err(e))) => {
                 // Go dialer.go:188-191：拨号失败即 Close。
                 self.closed = true;
                 Poll::Ready(Err(e))
-            }
+            },
             Poll::Ready(Ok(Ok(conn))) => {
                 self.conn = Some(conn);
                 self.joining = None;
                 Poll::Ready(Ok(()))
-            }
+            },
         }
     }
 }
@@ -261,20 +253,14 @@ impl AsyncWrite for DelayDialConn {
         if this.conn.is_none() {
             if this.joining.is_none() {
                 // 首写触发拨号：≤ Ed 整包进握手头，超 Ed 不带 early data。
-                let ed = if buf.len() <= this.ed as usize {
-                    Some(buf.to_vec())
-                } else {
-                    None
-                };
+                let ed = if buf.len() <= this.ed as usize { Some(buf.to_vec()) } else { None };
                 this.first_write = Some((buf.len(), ed.is_some()));
                 let factory = this.factory.clone();
                 this.joining = Some(tokio::spawn(async move { factory(ed).await }));
             }
             ready!(this.poll_dial(cx))?;
-            let (len, absorbed) = this
-                .first_write
-                .take()
-                .expect("recorded when dial was triggered");
+            let (len, absorbed) =
+                this.first_write.take().expect("recorded when dial was triggered");
             if absorbed {
                 // 首包已编码进 Sec-WebSocket-Protocol 握手头，视为已消费。
                 return Poll::Ready(Ok(len));
@@ -306,7 +292,7 @@ impl AsyncWrite for DelayDialConn {
                     handle.abort();
                 }
                 Poll::Ready(Ok(()))
-            }
+            },
         }
     }
 }
@@ -347,11 +333,7 @@ fn build_request_uri(cfg: &Config, dest: &Destination, use_tls: bool) -> String 
     // Host header 用 cfg.host（在 build_request 中设置，CDN/SNI 场景使用）。
     let port = dest.port().value();
     let needs_explicit_port = !(port == 80 && !use_tls) && !(port == 443 && use_tls);
-    let authority = if needs_explicit_port {
-        format!("{host}:{port}")
-    } else {
-        host
-    };
+    let authority = if needs_explicit_port { format!("{host}:{port}") } else { host };
     let path = cfg.normalized_path();
     format!("{protocol}://{authority}{path}")
 }
@@ -369,9 +351,8 @@ fn build_request(
         .into_client_request()
         .map_err(|e| WsError::HandshakeFailed(format!("invalid URI: {e}")))?;
 
-    // 1. Host header 三级回退（Go dialer.go:144-150）：
-    //    wsSettings.Host → tlsSettings.serverName → dest address。
-    //    CDN 按 IP 拨号 + 对端校验 Host 时，缺 serverName 级会导致握手 404。
+    // 1. Host header 三级回退（Go dialer.go:144-150）： wsSettings.Host → tlsSettings.serverName →
+    //    dest address。 CDN 按 IP 拨号 + 对端校验 Host 时，缺 serverName 级会导致握手 404。
     let host_header = if !cfg.host.is_empty() {
         cfg.host.clone()
     } else if let Some(sni) = tls_server_name.filter(|s| !s.is_empty()) {
@@ -404,12 +385,7 @@ fn build_request(
     let mut headers: Vec<(String, String)> = req
         .headers()
         .iter()
-        .map(|(k, v)| {
-            (
-                k.as_str().to_string(),
-                String::from_utf8_lossy(v.as_bytes()).into_owned(),
-            )
-        })
+        .map(|(k, v)| (k.as_str().to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned()))
         .collect();
     try_default_headers_with(&mut headers, "ws");
     let header_map = req.headers_mut();
@@ -423,8 +399,8 @@ fn build_request(
         header_map.insert(name, value);
     }
 
-    // 3. Early data → Sec-WebSocket-Protocol header (base64 RawURL no padding)。
-    //    对齐 Go：header.Set("Sec-WebSocket-Protocol", base64.RawURLEncoding.EncodeToString(ed))
+    // 3. Early data → Sec-WebSocket-Protocol header (base64 RawURL no padding)。 对齐
+    //    Go：header.Set("Sec-WebSocket-Protocol", base64.RawURLEncoding.EncodeToString(ed))
     if let Some(data) = ed {
         if !data.is_empty() {
             // ponytail: 用 RawURLEncoding（无 padding）匹配 v2ray/xray 协议约定。
@@ -442,11 +418,11 @@ fn build_request(
 
 #[cfg(test)]
 mod tests {
+    use xray_common::net::{
+        address::Address, destination::Destination, network::Network, port::Port,
+    };
+
     use super::*;
-    use xray_common::net::address::Address;
-    use xray_common::net::destination::Destination;
-    use xray_common::net::network::Network;
-    use xray_common::net::port::Port;
 
     fn dest(host: &str, port: u16) -> Destination {
         Destination::new(Address::new_domain(host), Port::new(port), Network::TCP)
@@ -455,11 +431,8 @@ mod tests {
     #[test]
     fn uri_uses_destination_address_not_config_host() {
         // URI authority 用 dest 地址（cfg.host 仅作为 Host header）。
-        let cfg = Config {
-            host: "cdn.example.com".into(),
-            path: "/ws".into(),
-            ..Default::default()
-        };
+        let cfg =
+            Config { host: "cdn.example.com".into(), path: "/ws".into(), ..Default::default() };
         let d = dest("1.2.3.4", 443);
         assert_eq!(build_request_uri(&cfg, &d, true), "wss://1.2.3.4/ws");
     }
@@ -487,20 +460,14 @@ mod tests {
 
     #[test]
     fn uri_path_normalized_prepends_slash() {
-        let cfg = Config {
-            path: "api".into(),
-            ..Default::default()
-        };
+        let cfg = Config { path: "api".into(), ..Default::default() };
         let d = dest("example.com", 80);
         assert_eq!(build_request_uri(&cfg, &d, false), "ws://example.com/api");
     }
 
     #[test]
     fn build_request_sets_host_header() {
-        let cfg = Config {
-            host: "front.example.com".into(),
-            ..Default::default()
-        };
+        let cfg = Config { host: "front.example.com".into(), ..Default::default() };
         let req = build_request("ws://1.2.3.4/", &cfg, None, &dest("1.2.3.4", 80), None).unwrap();
         assert_eq!(req.headers().get("host").unwrap(), "front.example.com");
     }
@@ -517,10 +484,7 @@ mod tests {
             Some(ed.as_slice()),
         )
         .unwrap();
-        let v = req
-            .headers()
-            .get("Sec-WebSocket-Protocol")
-            .expect("header should be set");
+        let v = req.headers().get("Sec-WebSocket-Protocol").expect("header should be set");
         // base64 URL_SAFE_NO_PAD("hello-ed") = "aGVsbG8tZWQ"
         assert_eq!(v.to_str().unwrap(), "aGVsbG8tZWQ");
     }
@@ -528,8 +492,9 @@ mod tests {
     #[test]
     fn build_request_empty_early_data_omits_header() {
         let cfg = Config::default();
-        let req = build_request("ws://example.com/", &cfg, None, &dest("example.com", 80), Some(&[]))
-            .unwrap();
+        let req =
+            build_request("ws://example.com/", &cfg, None, &dest("example.com", 80), Some(&[]))
+                .unwrap();
         assert!(req.headers().get("Sec-WebSocket-Protocol").is_none());
     }
 
@@ -538,8 +503,8 @@ mod tests {
         let mut cfg = Config::default();
         cfg.header.insert("X-Forwarded-For".into(), "10.0.0.1".into());
         cfg.header.insert("X-Custom".into(), "v".into());
-        let req = build_request("ws://example.com/", &cfg, None, &dest("example.com", 80), None)
-            .unwrap();
+        let req =
+            build_request("ws://example.com/", &cfg, None, &dest("example.com", 80), None).unwrap();
         assert_eq!(req.headers().get("x-forwarded-for").unwrap(), "10.0.0.1");
         assert_eq!(req.headers().get("x-custom").unwrap(), "v");
     }
@@ -551,18 +516,15 @@ mod tests {
         let d = dest("203.0.113.9", 443);
 
         // 1) cfg.host 优先
-        let cfg = Config {
-            host: "front.example.com".into(),
-            ..Default::default()
-        };
-        let req = build_request("wss://203.0.113.9/", &cfg, Some("sni.example.com"), &d, None)
-            .unwrap();
+        let cfg = Config { host: "front.example.com".into(), ..Default::default() };
+        let req =
+            build_request("wss://203.0.113.9/", &cfg, Some("sni.example.com"), &d, None).unwrap();
         assert_eq!(req.headers().get("host").unwrap(), "front.example.com");
 
         // 2) host 空 → serverName
         let cfg = Config::default();
-        let req = build_request("wss://203.0.113.9/", &cfg, Some("sni.example.com"), &d, None)
-            .unwrap();
+        let req =
+            build_request("wss://203.0.113.9/", &cfg, Some("sni.example.com"), &d, None).unwrap();
         assert_eq!(req.headers().get("host").unwrap(), "sni.example.com");
 
         // 3) host/serverName 皆空 → dest address
@@ -574,8 +536,8 @@ mod tests {
     fn build_request_injects_chrome_masquerade_for_ws() {
         // 票 yz8n：Go config.go:27 GetRequestHeader → TryDefaultHeadersWith(header, "ws")。
         let cfg = Config::default();
-        let req = build_request("ws://example.com/", &cfg, None, &dest("example.com", 80), None)
-            .unwrap();
+        let req =
+            build_request("ws://example.com/", &cfg, None, &dest("example.com", 80), None).unwrap();
         let ua = req.headers().get("user-agent").expect("UA must be set").to_str().unwrap();
         assert!(
             ua.starts_with("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/")
@@ -600,8 +562,8 @@ mod tests {
         let mut cfg = Config::default();
         cfg.header.insert("User-Agent".into(), "my-agent/9".into());
         cfg.header.insert("Accept".into(), "application/json".into());
-        let req = build_request("ws://example.com/", &cfg, None, &dest("example.com", 80), None)
-            .unwrap();
+        let req =
+            build_request("ws://example.com/", &cfg, None, &dest("example.com", 80), None).unwrap();
         assert_eq!(req.headers().get("user-agent").unwrap(), "my-agent/9");
         assert_eq!(req.headers().get("accept").unwrap(), "application/json");
         assert!(req.headers().get("sec-fetch-mode").is_none(), "custom UA → no masquerade");
@@ -625,10 +587,7 @@ mod tests {
         });
 
         let d = dest("127.0.0.1", addr.port());
-        let cfg = Config {
-            heartbeat_period: 1,
-            ..Default::default()
-        };
+        let cfg = Config { heartbeat_period: 1, ..Default::default() };
         let conn = dial(DialOptions {
             config: &cfg,
             destination: &d,
@@ -639,10 +598,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(
-            conn.heartbeat_handle.is_some(),
-            "heartbeatPeriod>0 → 客户端心跳任务已启动"
-        );
+        assert!(conn.heartbeat_handle.is_some(), "heartbeatPeriod>0 → 客户端心跳任务已启动");
 
         // 对照：period=0 不启动。
         let cfg = Config::default();
@@ -663,10 +619,9 @@ mod tests {
     // DelayDialConn：Go dialer.go:168-221 delayDialConn 语义
     // -------------------------------------------------------------------
 
-    use std::sync::Mutex;
-    use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use std::{sync::Mutex, time::Duration};
 
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use xray_transport::connection::DuplexConnection;
 
     /// 工厂调用记录：每次收到的 early data（`None` = 超长未携带）。
@@ -705,6 +660,17 @@ mod tests {
         assert!(recorded(&record).is_empty(), "must not dial before first write");
     }
 
+    /// Go cd4ce973：未拨号时 LocalAddr/RemoteAddr 不得 panic（Go 修复 nil 内嵌
+    /// 接口的方法提升 panic；Rust 侧契约 = 返回 Ok(None)）。
+    #[tokio::test]
+    async fn delay_dial_addr_before_dial_returns_none_not_panic() {
+        let record: DialRecord = Arc::default();
+        let (factory, _server) = recording_factory(record.clone(), Duration::from_secs(30));
+        let conn = DelayDialConn::new(64, factory);
+        assert_eq!(conn.local_addr().unwrap(), None, "undialed local_addr → None");
+        assert_eq!(conn.remote_addr().unwrap(), None, "undialed remote_addr → None");
+    }
+
     /// 首写 ≤ Ed：整包进握手头，Write 即返回，帧上无数据。
     #[tokio::test]
     async fn delay_dial_first_write_within_ed_enters_handshake() {
@@ -717,10 +683,7 @@ mod tests {
         // early data 被握手吸收：对端读不到（没有帧写出）。
         let mut buf = [0u8; 16];
         let r = tokio::time::timeout(Duration::from_millis(50), server.read(&mut buf)).await;
-        assert!(
-            r.is_err(),
-            "early data must be absorbed by handshake, not written as frame"
-        );
+        assert!(r.is_err(), "early data must be absorbed by handshake, not written as frame");
     }
 
     /// 首写超 Ed：不带 early data，原包照常走帧写到对端。
@@ -741,12 +704,10 @@ mod tests {
     /// dialed/ctx 语义）；拨号由首次 Write 触发后，Read 读到连接数据。
     #[tokio::test]
     async fn delay_dial_read_waits_for_dial_then_receives() {
-        use std::future::poll_fn;
-        use std::task::Poll;
+        use std::{future::poll_fn, task::Poll};
 
         let record: DialRecord = Arc::default();
-        let (factory, mut server) =
-            recording_factory(record.clone(), Duration::from_millis(30));
+        let (factory, mut server) = recording_factory(record.clone(), Duration::from_millis(30));
         // 预先从对端半边塞数据：停在 duplex 缓冲，拨号完成后立即可读。
         server.write_all(b"pong").await.unwrap();
         let mut conn = DelayDialConn::new(64, factory);
@@ -755,17 +716,11 @@ mod tests {
         poll_fn(|cx| {
             let mut tmp = [0u8; 4];
             let mut buf = tokio::io::ReadBuf::new(&mut tmp);
-            assert!(matches!(
-                Pin::new(&mut conn).poll_read(cx, &mut buf),
-                Poll::Pending
-            ));
+            assert!(matches!(Pin::new(&mut conn).poll_read(cx, &mut buf), Poll::Pending));
             Poll::Ready(())
         })
         .await;
-        assert!(
-            recorded(&record).is_empty(),
-            "read must not trigger dialing"
-        );
+        assert!(recorded(&record).is_empty(), "read must not trigger dialing");
 
         // 首写触发拨号（≤ Ed → 进握手头），完成后 Read 读到预填数据。
         let n = conn.write(b"x".as_slice()).await.unwrap();

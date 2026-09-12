@@ -11,7 +11,7 @@ use thiserror::Error;
 use xray_buf::io::{self, Writer};
 use xray_proto::xray::proxy::blackhole::Config;
 
-use crate::response::{get_internal_response, ResponseConfig};
+use crate::response::{ResponseConfig, get_internal_response};
 
 /// Blackhole 处理器错误。
 #[derive(Debug, Error)]
@@ -57,18 +57,18 @@ impl Handler {
 
     /// 暴露内部响应配置，便于测试与上层 adapter 复用。
     pub fn response(&self) -> ResponseConfig {
-        self.response
+        self.response.clone()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::response::HTTP_403_RESPONSE;
-    use std::future::Future;
-    use std::pin::Pin;
+    use std::{future::Future, pin::Pin};
+
     use xray_buf::multi::MultiBuffer;
-    use xray_proto::xray::common::serial::TypedMessage;
+
+    use super::*;
+    use crate::response::{HTTP_403_RESPONSE, proto_response};
 
     struct CollectWriter {
         chunks: Vec<MultiBuffer>,
@@ -77,6 +77,7 @@ mod tests {
         fn new() -> Self {
             Self { chunks: Vec::new() }
         }
+
         fn collected_bytes(&self) -> Vec<u8> {
             let mut out = Vec::new();
             for mb in &self.chunks {
@@ -97,18 +98,13 @@ mod tests {
         }
     }
 
-    fn cfg_with_response(type_url: Option<&str>) -> Config {
-        Config {
-            response: type_url.map(|s| TypedMessage {
-                r#type: s.to_string(),
-                value: Vec::new(),
-            }),
-        }
+    fn cfg_with_type(ty: &str) -> Config {
+        Config { response: Some(proto_response(ty.to_string(), Vec::new())) }
     }
 
     #[tokio::test]
     async fn handler_none_response_writes_zero() {
-        let h = Handler::new(cfg_with_response(None)).unwrap();
+        let h = Handler::new(Config { response: None }).unwrap();
         let mut w = CollectWriter::new();
         let n = h.process(&mut w).await.unwrap();
         assert_eq!(n, 0);
@@ -117,21 +113,34 @@ mod tests {
 
     #[tokio::test]
     async fn handler_http_response_writes_payload() {
-        let h = Handler::new(cfg_with_response(Some("xray.proxy.blackhole.HTTPResponse")))
-            .unwrap();
+        let h = Handler::new(cfg_with_type("http")).unwrap();
         let mut w = CollectWriter::new();
         let n = h.process(&mut w).await.unwrap();
         assert_eq!(n as usize, HTTP_403_RESPONSE.len());
         assert_eq!(w.collected_bytes(), HTTP_403_RESPONSE.as_bytes());
     }
 
+    #[tokio::test]
+    async fn handler_custom_response_writes_payload_verbatim() {
+        // Go 01a034be TestBlackholeCustomResponse：custom 原样回写（golden 字节断言）。
+        let payload: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+        let h = Handler::new(Config {
+            response: Some(proto_response("custom".into(), payload.clone())),
+        })
+        .unwrap();
+        let mut w = CollectWriter::new();
+        let n = h.process(&mut w).await.unwrap();
+        assert_eq!(n as usize, payload.len());
+        assert_eq!(w.collected_bytes(), payload);
+    }
+
     #[test]
     fn handler_rejects_unknown_response_type() {
-        let result = Handler::new(cfg_with_response(Some("xray.proxy.blackhole.Bogus")));
+        let result = Handler::new(cfg_with_type("bogus"));
         match result {
             Err(BlackholeError::UnknownResponseType(s)) => {
-                assert_eq!(s, "xray.proxy.blackhole.Bogus");
-            }
+                assert_eq!(s, "bogus");
+            },
             Err(other) => panic!("expected UnknownResponseType, got {other:?}"),
             Ok(_) => panic!("expected UnknownResponseType, got Ok"),
         }
@@ -145,8 +154,7 @@ mod tests {
 
     #[tokio::test]
     async fn handler_explicit_none_type_also_writes_zero() {
-        let h = Handler::new(cfg_with_response(Some("xray.proxy.blackhole.NoneResponse")))
-            .unwrap();
+        let h = Handler::new(cfg_with_type("none")).unwrap();
         let mut w = CollectWriter::new();
         let n = h.process(&mut w).await.unwrap();
         assert_eq!(n, 0);

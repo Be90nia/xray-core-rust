@@ -1,6 +1,6 @@
 """本地双向互操作矩阵: Rust client<->Go server 与 Go client<->Rust server.
 6 协议 x 2 方向 = 12 测. 验收口径与 run_full32 一致: curl(YouTube marker, >5000B).
-Go client 26.7.28 无 allowInsecure -> pinnedPeerCertSha256; Rust client 用 allowInsecure.
+Go/Rust client 均用 pinnedPeerCertSha256（5x41: allowInsecure 配置期硬错）。
 """
 import subprocess, time, os, json, sys, base64, hashlib
 
@@ -19,7 +19,8 @@ WORK = 'D:/tmp/interop_mx'
 os.makedirs(WORK, exist_ok=True)
 
 def tls_cli(rust_client):
-    return {'allowInsecure': True} if rust_client else {'pinnedPeerCertSha256': PIN}
+    # bd 5x41: allowInsecure 已在配置期硬错，双向统一走证书 pin。
+    return {'pinnedPeerCertSha256': PIN}
 
 def tls_srv():
     return {'certificates': [{'certificateFile': CERT, 'keyFile': KEY}]}

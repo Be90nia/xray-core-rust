@@ -39,18 +39,16 @@ impl Clock for DefaultClock {
         // 因 Clock trait 是 &self，无法缓存 base，所以用静态 OnceCell 作基准。
         use std::sync::OnceLock;
         static GLOBAL_BASE: OnceLock<Instant> = OnceLock::new();
-        let base = self.base.unwrap_or_else(|| {
-            *GLOBAL_BASE.get_or_init(Instant::now)
-        });
+        let base = self.base.unwrap_or_else(|| *GLOBAL_BASE.get_or_init(Instant::now));
         Instant::now().saturating_duration_since(base).as_nanos() as u64
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{thread::sleep, time::Duration};
+
     use super::*;
-    use std::thread::sleep;
-    use std::time::Duration;
 
     #[test]
     fn default_clock_returns_monotonic_increasing() {

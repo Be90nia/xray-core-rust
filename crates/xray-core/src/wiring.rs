@@ -486,6 +486,7 @@ impl MuxCarrierHandler {
             tokio::spawn(crate::inbound::handle_mux_inbound_link(
                 link,
                 Arc::clone(&self.inner),
+                access.as_ref().and_then(|a| a.allowed_network),
             ));
             return Box::pin(std::future::ready(()));
         }
@@ -913,6 +914,8 @@ fn parse_routing_json_to_proto_in(
                 inbound_tag: json_string_list(r.get("inboundTag")),
                 protocol: json_string_list(r.get("protocol")),
                 process: json_string_list(r.get("process")),
+                // Go a12801c1：`localOS` → local_os（匹配 runtime.GOOS）。
+                local_os: json_string_list(r.get("localOS")),
                 // 对齐 Go router.go:147 json 键 `attrs`（`attributes` 仅作
                 // Rust 旧方言别名保留）。
                 attributes: parse_attributes(
@@ -1544,6 +1547,28 @@ mod tests {
 
         // attributes map
         assert_eq!(rule.attributes.get("sinkhole").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn parse_routing_json_local_os_goos_match() {
+        // Go a12801c1：`localOS` → proto local_os；匹配链以 runtime.GOOS 断言。
+        let os = std::env::consts::OS;
+        let json = format!(r#"{{"rules":[{{"outboundTag":"direct","localOS":["{os}"]}}]}}"#);
+        let cfg = parse_routing_json_to_proto(json.as_bytes()).expect("parse");
+        assert_eq!(cfg.rule[0].local_os, vec![os.to_string()]);
+        let cond = xray_app_router::rule::build_condition(&cfg.rule[0], None).unwrap();
+        assert!(
+            cond.apply(&xray_app_router::context::RoutingData::new()),
+            "本机 OS {os} 必须命中"
+        );
+
+        // 他 OS 名：规则仍合法（Go BuildCondition 同样构造恒假 matcher，配置可启动，
+        // 仅规则永不命中）——不做编译期剔除。
+        let wrong = if os == "windows" { "darwin" } else { "windows" };
+        let json2 = format!(r#"{{"rules":[{{"outboundTag":"direct","localOS":["{wrong}"]}}]}}"#);
+        let cfg2 = parse_routing_json_to_proto(json2.as_bytes()).expect("parse other os");
+        let cond2 = xray_app_router::rule::build_condition(&cfg2.rule[0], None).unwrap();
+        assert!(!cond2.apply(&xray_app_router::context::RoutingData::new()));
     }
 
     #[test]

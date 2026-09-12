@@ -13,19 +13,19 @@
 //! 返回 [`HysteriaError::ConnectionClosed`] stub）。等上层（quinn/h3/rustls
 //! adapter）接入后，trait 实现注入即可激活。
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use parking_lot::Mutex;
-use xray_common::net::address::Address;
-use xray_common::net::port::Port;
+use xray_common::net::{address::Address, port::Port};
 use xray_proto::xray::transport::internet::{QuicParams, UdpHop as ProtoUdpHop};
 
-use crate::config::{Status, TcpRequestPadding};
-use crate::conn::{InterStreamConn, QuicConn, QuicStream, UdpSessionManager};
-use crate::context::DatagramFromContext;
-use crate::error::{HysteriaError, Result};
-use crate::proto_config::Config;
+use crate::{
+    config::{Status, TcpRequestPadding},
+    conn::{InterStreamConn, QuicConn, QuicStream, UdpSessionManager},
+    context::DatagramFromContext,
+    error::{HysteriaError, Result},
+    proto_config::Config,
+};
 
 /// 写入 TCPRequest 的地址部分；首包 frame type 由 `InterStreamConn` 自动添加。
 fn write_tcp_request_body(addr: &str) -> Vec<u8> {
@@ -63,6 +63,8 @@ pub struct QuicConfig {
     pub brutal_up: u64,
     /// BBR profile（对应 QuicParams.bbr_profile）。
     pub bbr_profile: String,
+    /// Brutal 关闭丢泡补偿（Go v2.12.2 QuicParams.brutalDisableLossCompensation）。
+    pub brutal_disable_loss_compensation: bool,
 }
 
 impl QuicConfig {
@@ -107,6 +109,7 @@ impl QuicConfig {
             congestion: p.congestion.clone(),
             brutal_up: p.brutal_up,
             bbr_profile: p.bbr_profile.clone(),
+            brutal_disable_loss_compensation: p.brutal_disable_loss_compensation,
         }
     }
 
@@ -164,9 +167,7 @@ pub trait HysteriaDialerFactory: Send + Sync {
         dest: &DialDestination,
         config: &Config,
         quic_params: &QuicParams,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Arc<InterStreamConn>>> + Send>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Arc<InterStreamConn>>> + Send>>;
 
     /// Dial UDP-style session（对应 Go `Dial` with datagram=true）。
     fn dial_udp(
@@ -244,7 +245,7 @@ impl HysteriaClient {
         match self.status() {
             Status::Active => return Ok(()),
             Status::Inactive => self.close(),
-            Status::Null => {}
+            Status::Null => {},
         }
         let quic_config = QuicConfig::from_params(&self.quic_params);
         let conn = self
@@ -266,45 +267,24 @@ impl HysteriaClient {
     /// `InterStreamConn` 写入 frame type，地址体由本函数唯一生成。
     pub async fn tcp(&self, addr: &Address, port: Port) -> Result<Arc<InterStreamConn>> {
         self.ensure_connected().await?;
-        let conn = self
-            .conn
-            .lock()
-            .clone()
-            .ok_or(HysteriaError::ConnectionClosed)?;
-        let stream = self
-            .transport
-            .open_stream(&conn)
-            .await
-            .map_err(HysteriaError::Io)?;
-        let isc = Arc::new(InterStreamConn::new(
-            stream,
-            conn.local_addr(),
-            conn.remote_addr(),
-            true,
-        ));
+        let conn = self.conn.lock().clone().ok_or(HysteriaError::ConnectionClosed)?;
+        let stream = self.transport.open_stream(&conn).await.map_err(HysteriaError::Io)?;
+        let isc =
+            Arc::new(InterStreamConn::new(stream, conn.local_addr(), conn.remote_addr(), true));
         let addr = format!("{}:{}", addr, port.value());
-        isc.write(&write_tcp_request_body(&addr))
-            .await
-            .map_err(HysteriaError::Io)?;
+        isc.write(&write_tcp_request_body(&addr)).await.map_err(HysteriaError::Io)?;
         // 读取服务端 TCPResponse 帧（status + msg + padding）。官方 apernet/hysteria v2
         // 服务端写入此帧，客户端必须消费后再透传流量；否则响应帧泄漏到代理字节流，
         // 首个 TLS 握手失败 (SEC_E_INVALID_TOKEN / HTTP/0.9 when not allowed)。
-        crate::conn::read_tcp_response_stream(&*isc.stream)
-            .await
-            .map_err(HysteriaError::Io)?;
+        crate::conn::read_tcp_response_stream(&*isc.stream).await.map_err(HysteriaError::Io)?;
         Ok(isc)
     }
 
     /// 建立 UDP session（对应 Go `client.udp()`）。
 
-
     pub async fn udp(&self) -> Result<Arc<crate::conn::InterConn>> {
         self.ensure_connected().await?;
-        let conn = self
-            .conn
-            .lock()
-            .clone()
-            .ok_or(HysteriaError::ConnectionClosed)?;
+        let conn = self.conn.lock().clone().ok_or(HysteriaError::ConnectionClosed)?;
         let local = conn.local_addr();
         let remote = conn.remote_addr();
         // ponytail: parking_lot guard 不能跨 await 持有（!Send）。
@@ -348,10 +328,7 @@ impl std::fmt::Debug for ClientManager {
 
 impl ClientManager {
     pub fn new(transport: Arc<dyn HysteriaTransport>) -> Self {
-        Self {
-            clients: Mutex::new(std::collections::HashMap::new()),
-            transport,
-        }
+        Self { clients: Mutex::new(std::collections::HashMap::new()), transport }
     }
 
     /// 取或建 client（对应 Go `Dial` 中 clientManager.m 查找逻辑）。
@@ -366,12 +343,8 @@ impl ClientManager {
         if let Some(c) = g.get(&key) {
             return Arc::clone(c);
         }
-        let client = Arc::new(HysteriaClient::new(
-            dest,
-            config,
-            quic_params,
-            Arc::clone(&self.transport),
-        ));
+        let client =
+            Arc::new(HysteriaClient::new(dest, config, quic_params, Arc::clone(&self.transport)));
         g.insert(key, Arc::clone(&client));
         client
     }
@@ -407,7 +380,8 @@ impl HysteriaDialerFactory for StubDialerFactory {
         _dest: &DialDestination,
         _config: &Config,
         _quic_params: &QuicParams,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Arc<InterStreamConn>>> + Send>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Arc<InterStreamConn>>> + Send>>
+    {
         Box::pin(async { Err(HysteriaError::ConnectionClosed) })
     }
 
@@ -416,7 +390,9 @@ impl HysteriaDialerFactory for StubDialerFactory {
         _dest: &DialDestination,
         _config: &Config,
         _quic_params: &QuicParams,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Arc<crate::conn::InterConn>>> + Send>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Arc<crate::conn::InterConn>>> + Send>,
+    > {
         Box::pin(async { Err(HysteriaError::ConnectionClosed) })
     }
 }
@@ -480,7 +456,8 @@ mod tests {
         let config = Arc::new(crate::proto_config::default_config());
         let qp = Arc::new(QuicParams::default());
 
-        let r = tokio::runtime::Runtime::new().unwrap().block_on(factory.dial_tcp(&dest, &config, &qp));
+        let r =
+            tokio::runtime::Runtime::new().unwrap().block_on(factory.dial_tcp(&dest, &config, &qp));
         assert!(matches!(r, Err(HysteriaError::ConnectionClosed)));
     }
 
@@ -498,25 +475,16 @@ mod tests {
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = std::io::Result<Arc<dyn QuicConn>>> + Send>,
             > {
-                Box::pin(async {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "stub",
-                    ))
-                })
+                Box::pin(async { Err(std::io::Error::new(std::io::ErrorKind::Other, "stub")) })
             }
+
             fn open_stream(
                 &self,
                 _conn: &Arc<dyn QuicConn>,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = std::io::Result<Arc<dyn QuicStream>>> + Send>,
             > {
-                Box::pin(async {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "stub",
-                    ))
-                })
+                Box::pin(async { Err(std::io::Error::new(std::io::ErrorKind::Other, "stub")) })
             }
         }
         let dest = DialDestination {
@@ -545,19 +513,16 @@ mod tests {
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = std::io::Result<Arc<dyn QuicConn>>> + Send>,
             > {
-                Box::pin(async {
-                    Err(std::io::Error::new(std::io::ErrorKind::Other, ""))
-                })
+                Box::pin(async { Err(std::io::Error::new(std::io::ErrorKind::Other, "")) })
             }
+
             fn open_stream(
                 &self,
                 _: &Arc<dyn QuicConn>,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = std::io::Result<Arc<dyn QuicStream>>> + Send>,
             > {
-                Box::pin(async {
-                    Err(std::io::Error::new(std::io::ErrorKind::Other, ""))
-                })
+                Box::pin(async { Err(std::io::Error::new(std::io::ErrorKind::Other, "")) })
             }
         }
         let mgr = ClientManager::new(Arc::new(NoopTransport));

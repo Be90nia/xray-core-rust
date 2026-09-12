@@ -26,7 +26,7 @@
 //! | `keep_alive` | 心跳间隔（秒），0=禁用 |
 //! | `allowed_ips` | 允许的源 IP CIDR 列表 |
 
-use crate::error::Result;
+use crate::error::{Result, WgError};
 
 /// DNS 解析策略。对应 Go `DeviceConfig_DomainStrategy` 枚举。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -139,6 +139,13 @@ pub struct DeviceConfig {
     pub is_client: bool,
     /// 强制 userspace TUN。
     pub no_kernel_tun: bool,
+    /// 隧道内 DNS 服务器（Go c7e569b0 `remoteDNS` → DeviceConfig.DNS）。
+    ///
+    /// 语义（Go client.go:112-123）：
+    /// - 空 → 默认 Cloudflare 四址（`TUNNEL_DNS_SERVERS`）
+    /// - `["local"]` → 走本地 app DNS（`DnsService`），不走隧道
+    /// - 其余 → 逐项 IP 字面量，作为隧道内 DNS 查询目标
+    pub dns: Vec<String>,
 }
 
 impl DeviceConfig {
@@ -180,6 +187,7 @@ impl DeviceConfig {
             domain_strategy: DomainStrategy::from_proto_value(p.domain_strategy),
             is_client: p.is_client,
             no_kernel_tun: p.no_kernel_tun,
+            dns: p.dns,
         })
     }
 
@@ -206,8 +214,43 @@ impl DeviceConfig {
             domain_strategy: self.domain_strategy.to_proto_value(),
             is_client: self.is_client,
             no_kernel_tun: self.no_kernel_tun,
+            dns: self.dns.clone(),
         }
     }
+
+    /// 解析 `dns` 字段语义（Go client.go:112-123，c7e569b0）。
+    ///
+    /// - 空 → [`DnsConfig::Default`]（Cloudflare 四址）
+    /// - `["local"]` → [`DnsConfig::Local`]（本地 app DNS）
+    /// - 其余 → [`DnsConfig::Servers`]（非法 IP 字面量报错；Go 侧
+    ///   `netip.MustParseAddr` 直接 panic，Rust 侧返回错误更合理）
+    pub fn resolve_dns(&self) -> Result<DnsConfig> {
+        match self.dns.as_slice() {
+            [] => Ok(DnsConfig::Default),
+            [s] if s == "local" => Ok(DnsConfig::Local),
+            entries => {
+                let mut servers = Vec::with_capacity(entries.len());
+                for e in entries {
+                    let ip: std::net::IpAddr = e.parse().map_err(|_| {
+                        WgError::InvalidConfig(format!("remoteDNS: invalid IP: {e}"))
+                    })?;
+                    servers.push(ip);
+                }
+                Ok(DnsConfig::Servers(servers))
+            }
+        }
+    }
+}
+
+/// `remoteDNS` 解析结果（Go client.go `local` 标志 + `dnses` 列表的 Rust 形态）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsConfig {
+    /// 未配置 → Cloudflare 默认四址。
+    Default,
+    /// `["local"]` → 目标域名走本地 app DnsService（不经隧道）。
+    Local,
+    /// 显式服务器列表（隧道内查询目标）。
+    Servers(Vec<std::net::IpAddr>),
 }
 
 #[cfg(test)]
@@ -318,10 +361,34 @@ mod tests {
             domain_strategy: DomainStrategy::ForceIp46,
             is_client: true,
             no_kernel_tun: false,
+            dns: vec!["1.1.1.1".into(), "8.8.8.8".into()],
         };
         let proto = cfg.to_proto();
         let cfg2 = DeviceConfig::from_proto(proto).unwrap();
         assert_eq!(cfg, cfg2);
+    }
+
+    #[test]
+    fn resolve_dns_semantics() {
+        // Go client.go:112-123：空 → 默认；["local"] → 本地 app DNS；其余按 IP 解析。
+        let mut cfg = DeviceConfig::default();
+        assert_eq!(cfg.resolve_dns().unwrap(), DnsConfig::Default);
+
+        cfg.dns = vec!["local".into()];
+        assert_eq!(cfg.resolve_dns().unwrap(), DnsConfig::Local);
+
+        cfg.dns = vec!["1.1.1.1".into(), "2606:4700:4700::1111".into()];
+        assert_eq!(
+            cfg.resolve_dns().unwrap(),
+            DnsConfig::Servers(vec![
+                "1.1.1.1".parse().unwrap(),
+                "2606:4700:4700::1111".parse().unwrap(),
+            ])
+        );
+
+        cfg.dns = vec!["dns.google".into()];
+        let err = cfg.resolve_dns().unwrap_err();
+        assert!(err.to_string().contains("invalid IP"), "{err}");
     }
 
     #[test]

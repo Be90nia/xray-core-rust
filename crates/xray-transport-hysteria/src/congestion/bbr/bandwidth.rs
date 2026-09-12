@@ -16,7 +16,6 @@ pub struct Bandwidth(pub u64);
 impl Bandwidth {
     /// 1 bit/s（对应 Go `BitsPerSecond Bandwidth = 1`）。
     pub const BITS_PER_SECOND: Self = Self(1);
-
     /// 1 byte/s = 8 bits/s（对应 Go `BytesPerSecond = 8 * BitsPerSecond`）。
     pub const BYTES_PER_SECOND: Self = Self(8);
 
@@ -34,11 +33,7 @@ impl Bandwidth {
         let sec_equiv = (bytes_u as u128 * 1_000_000_000) / ns;
         // bits/s = bytes/s * 8
         let bps = sec_equiv * (Self::BYTES_PER_SECOND.0 as u128);
-        if bps > u64::MAX as u128 {
-            INF_BANDWIDTH
-        } else {
-            Self(bps as u64)
-        }
+        if bps > u64::MAX as u128 { INF_BANDWIDTH } else { Self(bps as u64) }
     }
 
     /// 原始值（bits/s）。
@@ -56,6 +51,7 @@ impl Bandwidth {
 
 impl std::ops::Mul<u64> for Bandwidth {
     type Output = Self;
+
     fn mul(self, rhs: u64) -> Self {
         Self(self.0.saturating_mul(rhs))
     }
@@ -63,12 +59,9 @@ impl std::ops::Mul<u64> for Bandwidth {
 
 impl std::ops::Div<u64> for Bandwidth {
     type Output = Self;
+
     fn div(self, rhs: u64) -> Self {
-        if rhs == 0 {
-            INF_BANDWIDTH
-        } else {
-            Self(self.0 / rhs)
-        }
+        if rhs == 0 { INF_BANDWIDTH } else { Self(self.0 / rhs) }
     }
 }
 

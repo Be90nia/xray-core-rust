@@ -12,7 +12,7 @@ use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use xray_app_dispatcher::default::SimpleOhm;
 use xray_app_dispatcher::OutboundHandlerManager;
-use xray_buf::io::{new_reader, new_writer};
+use xray_buf::io::{new_reader, new_readv_reader, new_writer};
 use xray_common::net::address::Address;
 use xray_common::net::destination::Destination;
 use xray_common::net::network::Network;
@@ -75,6 +75,7 @@ pub async fn serve_socks5(
     ohm: Arc<SimpleOhm>,
     config: Arc<ServerConfig>,
     handshake_timeout: Option<std::time::Duration>,
+    udp_idle: std::time::Duration,
 ) -> std::io::Result<()> {
     let handler = ohm
         .get_default_handler()
@@ -98,7 +99,7 @@ pub async fn serve_socks5(
         let config = Arc::clone(&config);
         tokio::spawn(async move {
             if let Err(e) =
-                handle_connection(stream, peer, &config, &handler, handshake_timeout).await
+                handle_connection(stream, peer, &config, &handler, handshake_timeout, udp_idle).await
             {
                 // Go proxyman/worker.go:124：连接结束错误统一 LogInfo("connection ends")。
                 tracing::info!(peer = %peer, error = %e, "socks5 connection ended with error");
@@ -118,6 +119,7 @@ async fn handle_connection<S>(
     config: &ServerConfig,
     handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,
     handshake_timeout: Option<std::time::Duration>,
+    udp_idle: std::time::Duration,
 ) -> std::io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -148,7 +150,7 @@ where
             // handler 是 &Arc 引用，spawn 的 future 需 'static —— spawn 前 clone
             let udp_handler = Arc::clone(handler);
             let relay = tokio::spawn(async move {
-                let _ = handle_udp_associate(relay_socket, udp_handler).await;
+                let _ = handle_udp_associate(relay_socket, udp_handler, udp_idle).await;
             });
             // SOCKS5 UDP ASSOCIATE 语义：TCP 控制连接存在期间 relay 有效。
             // 读到 EOF/错误（客户端关闭控制连接）即终止 relay。
@@ -163,12 +165,15 @@ where
             // 3. 拆 TcpStream → (read, write) → Link
             // ponytail: tokio::io::split 返回的 ReadHalf/WriteHalf 是 'static + Send,
             // new_reader/new_writer 接受 AsyncRead/AsyncWrite + Unpin + Send + 'static.
+            // 本函数泛型（第二调用方传 Box<dyn Connection>），无法 into_split 接
+            // readv（bd 2o9l）——socks 独立入站保持顺序读；mixed/http/dokodemo
+            // 的具体 TcpStream 路径已接 new_readv_reader。
             let (read_half, write_half) = tokio::io::split(stream);
             let link = Link::new(new_reader(read_half), new_writer(write_half));
             // 4. dispatch（zx7: mux.cool dest 转给 mux ServerWorker）
             if is_mux_destination(&dest) {
                 tracing::info!("socks: mux.cool destination detected, spawning mux inbound handler");
-                tokio::spawn(handle_mux_inbound_link(link, Arc::clone(handler)));
+                tokio::spawn(handle_mux_inbound_link(link, Arc::clone(handler), None));
                 return Ok(());
             }
             // access log（bd 4uu）：from=客户端源地址（对应 Go socks server ctx
@@ -198,13 +203,22 @@ pub fn is_mux_destination(dest: &Destination) -> bool {
 /// 对应 Go `mux.Server.OnTransport(link.Reader, link.Writer)`。socks/http 在
 /// 协议层内联调用；wiring 的 [`crate::wiring::MuxCarrierHandler`] 装饰器对
 /// 其余 inbound（vless/trojan/ss/…）统一按 destination 判定调用。
-pub(crate) async fn handle_mux_inbound_link(link: Link, handler: Arc<dyn xray_app_dispatcher::DispatchHandler>) {
+/// `allowed_network`：入站会话允许的网络（Go `ContextWithAllowedNetwork` →
+/// server.go:189-192 消费）；Some 时 New 帧网络不匹配 → 错误 → 整条 carrier 拆除。
+pub(crate) async fn handle_mux_inbound_link(
+    link: Link,
+    handler: Arc<dyn xray_app_dispatcher::DispatchHandler>,
+    allowed_network: Option<Network>,
+) {
     use xray_buf::reader::BufferedReader;
     use xray_buf::writer::BufferedWriter;
-    use xray_mux::worker::{DispatchHandlerAdapter, ServerWorker};
 
+    use xray_mux::worker::{DispatchHandlerAdapter, ServerWorker};
     let adapter = Arc::new(DispatchHandlerAdapter::new(handler));
-    let worker = ServerWorker::new(adapter);
+    let worker = match allowed_network {
+        Some(net) => ServerWorker::new(adapter).with_allowed_network(net),
+        None => ServerWorker::new(adapter),
+    };
 
     // 包装 link reader/writer 为 BufferedReader/BufferedWriter
     let mut reader = BufferedReader::new(link.reader);
@@ -264,14 +278,23 @@ fn destination_to_socks_addr(dest: &Destination) -> SocksAddr {
 async fn handle_udp_associate(
     relay_socket: UdpSocket,
     handler: Arc<dyn DispatchHandler>,
+    idle: std::time::Duration,
 ) -> std::io::Result<()> {
     let mut session = UdpDispatchSession::new(handler);
     let mut buf = [0u8; 65535];
     // 最近一个客户端地址：响应可能晚于请求到达，跨循环迭代记忆
     let mut last_client: Option<SocketAddr> = None;
+    // UDP associate 空闲时限（Go server.go:171-175 `tempUDPConn.SetTimeout(
+    // plcy.Timeouts.ConnectionIdle)`）：任一方向有活动即续期。
+    let mut idle_deadline = tokio::time::Instant::now() + idle;
     loop {
         tokio::select! {
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                tracing::debug!(?idle, "socks udp relay idle timeout");
+                return Ok(());
+            }
             v = relay_socket.recv_from(&mut buf) => {
+                idle_deadline = tokio::time::Instant::now() + idle;
                 let (n, client) = match v {
                     Ok(v) => v,
                     Err(e) => {
@@ -294,6 +317,7 @@ async fn handle_udp_associate(
                 }
             }
             r = session.recv_packet() => {
+                idle_deadline = tokio::time::Instant::now() + idle;
                 let (source, payload) = match r {
                     Ok(Some(v)) => v,
                     Ok(None) => return Ok(()), // outbound 关闭，会话结束
@@ -362,10 +386,11 @@ async fn serve_mixed(
                 match hs {
                     Ok(SocksRequest::TcpConnect(addr)) => {
                         let dest = socks_addr_to_destination(&addr, Network::TCP);
-                        let (read_half, write_half) = tokio::io::split(stream);
-                        let link = Link::new(new_reader(read_half), new_writer(write_half));
+                        // plain TCP：readv 多缓冲聚合读（bd 2o9l，Go NewReader readv 分支）
+                        let (read_half, write_half) = stream.into_split();
+                        let link = Link::new(new_readv_reader(read_half), new_writer(write_half));
                         if is_mux_destination(&dest) {
-                            tokio::spawn(handle_mux_inbound_link(link, handler));
+                            tokio::spawn(handle_mux_inbound_link(link, handler, None));
                         } else {
                             let _ = handler.dispatch(&dest, link).await;
                         }
@@ -391,10 +416,11 @@ async fn serve_mixed(
                     handle_plain_http(stream, hs, Arc::clone(&handler)).await;
                 } else {
                     let dest = hs.dest;
-                    let (read_half, write_half) = tokio::io::split(stream);
-                    let link = Link::new(new_reader(read_half), new_writer(write_half));
+                    // plain TCP：readv 多缓冲聚合读（bd 2o9l，Go NewReader readv 分支）
+                    let (read_half, write_half) = stream.into_split();
+                    let link = Link::new(new_readv_reader(read_half), new_writer(write_half));
                     if is_mux_destination(&dest) {
-                        tokio::spawn(handle_mux_inbound_link(link, handler));
+                        tokio::spawn(handle_mux_inbound_link(link, handler, None));
                     } else {
                         let _ = handler.dispatch(&dest, link).await;
                     }
@@ -463,12 +489,13 @@ pub async fn serve_http(
             }
             // 3. CONNECT：拆 stream → Link → dispatch
             let dest = hs.dest;
-            let (read_half, write_half) = tokio::io::split(stream);
-            let link = Link::new(new_reader(read_half), new_writer(write_half));
+            // plain TCP：readv 多缓冲聚合读（bd 2o9l，Go NewReader readv 分支）
+            let (read_half, write_half) = stream.into_split();
+            let link = Link::new(new_readv_reader(read_half), new_writer(write_half));
             // zx7: mux.cool dest 转给 mux ServerWorker（stub）
             if is_mux_destination(&dest) {
                 tracing::info!("http: mux.cool destination detected, spawning mux inbound handler");
-                tokio::spawn(handle_mux_inbound_link(link, handler));
+                tokio::spawn(handle_mux_inbound_link(link, handler, None));
                 return;
             }
             let _ = handler.dispatch(&dest, link).await;
@@ -755,8 +782,9 @@ pub async fn serve_dokodemo(
             } else {
                 match resolve_dokodemo_tcp_dest(&opts, local_ip, local_port, original_dst, None) {
                     Some(dest) => {
-                        let (read_half, write_half) = tokio::io::split(stream);
-                        let link = Link::new(new_reader(read_half), new_writer(write_half));
+                        // plain TCP（非 TLS 分支）：readv 多缓冲聚合读（bd 2o9l，Go NewReader readv 分支）
+                        let (read_half, write_half) = stream.into_split();
+                        let link = Link::new(new_readv_reader(read_half), new_writer(write_half));
                         let _ = handler.dispatch(&dest, link).await;
                     }
                     None => tracing::warn!(
@@ -2084,9 +2112,15 @@ async fn spawn_one_inbound(
             let config = Arc::new(parse_socks_server_config(&ib.entry.data)?);
             // 握手限时（Go proxy/socks：SetReadDeadline(policy().Timeouts.Handshake)）
             let handshake_timeout = Some(handshake_timeout_for(&policy, config.user_level));
+            // UDP associate 空闲时限（Go server.go:171-175 `SetTimeout(
+            // plcy.Timeouts.ConnectionIdle)`，ForLevel 按 userLevel 查档）。
+            let udp_idle = policy
+                .as_ref()
+                .map(|pm| pm.policy_for_level(config.user_level).timeout.connection_idle)
+                .unwrap_or(xray_features::policy::TimeoutPolicy::default().connection_idle);
             tracing::info!(tag = %ib.tag, addr = %addr, auth = ?config.auth_type, udp = config.udp_enabled, "socks5 inbound listening");
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                serve_socks5(listener, ohm, config, handshake_timeout).await
+                serve_socks5(listener, ohm, config, handshake_timeout, udp_idle).await
             })))
         }
         "mixed" => {
@@ -2108,7 +2142,7 @@ async fn spawn_one_inbound(
             // ENC decryption（Go inbound.go:104-114 handler.decryption）：settings
             // 级 "mlkem768x25519plus.*" 字符串 → handler 级共享 ServerInstance。
             let decryption = build_vless_decryption(&ib.entry.data)?;
-            let options = VlessInboundOptions {
+            let mut options = VlessInboundOptions {
                 decryption: decryption.clone(),
                 // sm80④：policy Timeouts.Handshake 下传（Go inbound.go:281-284）
                 handshake_timeout: Some(handshake_timeout_for(&policy, 0)),
@@ -2117,6 +2151,10 @@ async fn spawn_one_inbound(
             let settings = xray_transport::dialer::StreamSettings::from_json(
                 ib.stream_settings_json.as_ref(),
             );
+            // splithttp 入站 AllowedNetwork（Go proxyman inbound.go:177-179）
+            if settings.protocol == "splithttp" {
+                options.allowed_network = Some(Network::UDP);
+            }
             if is_transport_listener_protocol(&settings.protocol) {
                 // transport 分支（ws/grpc/kcp/httpupgrade/splithttp）：listener_registry
                 // 承载监听，TLS/security 在 transport hub 内部终结——勿再叠
@@ -4659,7 +4697,7 @@ mod tests {
         let config = Arc::new(ServerConfig::default());
         let ohm_clone = Arc::clone(&ohm);
         tokio::spawn(async move {
-            let _ = serve_socks5(socks_listener, ohm_clone, config, None).await;
+            let _ = serve_socks5(socks_listener, ohm_clone, config, None, std::time::Duration::from_secs(300)).await;
         });
 
         // 4. SOCKS5 client：连 socks5 → handshake → 请求 echo server → 写数据 → 读 echo
@@ -4890,7 +4928,7 @@ mod tests {
         let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
             Arc::new(MarkerUdpDispatch { marker: b"via-dispatch" });
         tokio::spawn(async move {
-            let _ = handle_udp_associate(relay, handler).await;
+            let _ = handle_udp_associate(relay, handler, std::time::Duration::from_secs(300)).await;
         });
 
         // 客户端 → relay socket：SOCKS5 UDP 请求帧（目标仅作路由地址，不打真实包）
@@ -4915,6 +4953,81 @@ mod tests {
         .unwrap();
         let (_src, payload) = decode_udp_packet(&rbuf[..n]).unwrap();
         assert_eq!(payload, b"via-dispatch");
+    }
+
+    /// UDP associate 空闲时限（Go server.go:171-175 SetTimeout(ConnectionIdle)）：
+    /// 静默 relay 在 idle 到期后自行退出（task 结束）；活动续期——每次收发包
+    /// 重置 deadline，持续活动下不退出。
+    #[tokio::test]
+    async fn socks_udp_associate_idle_timeout_expires_silent_relay() {
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
+            Arc::new(MarkerUdpDispatch { marker: b"idle" });
+        let task = tokio::spawn(async move {
+            let _ = handle_udp_associate(relay, handler, std::time::Duration::from_millis(150)).await;
+        });
+        // 不发任何包：150ms 空闲后 relay 必须退出
+        tokio::time::timeout(std::time::Duration::from_secs(3), task)
+            .await
+            .expect("silent relay must exit on idle timeout")
+            .ok();
+    }
+
+    /// 留存 link 的 dispatch（完成但不关链路）：UdpDispatchSession 的会话
+    /// 持续存活（对齐慢速真实上游），recv_packet 永不就绪，relay 只被
+    /// recv_from 活动 / idle 超时驱动。
+    struct KeepLinkDispatch {
+        keepers: Arc<parking_lot::Mutex<Vec<Link>>>,
+    }
+    impl std::fmt::Debug for KeepLinkDispatch {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("KeepLinkDispatch")
+        }
+    }
+    impl xray_app_dispatcher::DispatchHandler for KeepLinkDispatch {
+        fn tag(&self) -> &str {
+            "keep-link"
+        }
+        fn dispatch(
+            &self,
+            _dest: &Destination,
+            link: Link,
+        ) -> xray_app_dispatcher::default::PinFuture<()> {
+            self.keepers.lock().push(link);
+            Box::pin(async move {})
+        }
+    }
+
+    /// 活动续期：每 60ms 一包（短于 150ms idle），relay 在 >400ms 观察窗内
+    /// 保持存活；停发后再在 idle 内退出。
+    #[tokio::test]
+    async fn socks_udp_associate_idle_timeout_renews_on_activity() {
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
+            Arc::new(KeepLinkDispatch { keepers: Arc::new(parking_lot::Mutex::new(Vec::new())) });
+        let task = tokio::spawn(async move {
+            let _ = handle_udp_associate(relay, handler, std::time::Duration::from_millis(150)).await;
+        });
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = SocksAddr {
+            host: Host::Ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+            port: 53,
+        };
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < std::time::Duration::from_millis(400) {
+            let _ = client.send_to(&encode_udp_packet(&target, b"ping"), relay_addr).await;
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        }
+        assert!(
+            !task.is_finished(),
+            "active relay must survive beyond one idle window"
+        );
+        // 停发：idle 内退出
+        tokio::time::timeout(std::time::Duration::from_secs(3), task)
+            .await
+            .expect("relay must exit after activity stops")
+            .ok();
     }
 
     /// b2e：dokodemo UDP inbound 经 dispatcher（固定 dest）。
@@ -5340,6 +5453,7 @@ mod tests {
             ohm,
             config,
             Some(std::time::Duration::from_millis(120)),
+            std::time::Duration::from_secs(300),
         ));
 
         // 客户端连接后不发任何字节：超时到期 → 服务端断开 → EOF。

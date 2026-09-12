@@ -118,6 +118,10 @@ pub struct ServerWorker {
     /// Reverse-mux：解析 New 帧的 source/local（Go `handleStatusNew` 的
     /// `IsReverseMuxFromContext` 分支）。
     read_source_and_local: bool,
+    /// 允许的网络类型（Go `session.AllowedNetworkFromContext` 消费，
+    /// common/mux/server.go:189-192）：Some(net) 时 New 帧目标网络不匹配 →
+    /// 错误 → run 退出拆整条 carrier。
+    allowed_network: Option<xray_common::net::network::Network>,
 }
 
 impl ServerWorker {
@@ -136,6 +140,7 @@ impl ServerWorker {
             done_tx,
             done_rx,
             read_source_and_local: false,
+            allowed_network: None,
         }
     }
 
@@ -153,6 +158,13 @@ impl ServerWorker {
     #[must_use]
     pub fn with_read_source_and_local(mut self) -> Self {
         self.read_source_and_local = true;
+        self
+    }
+
+    /// 设置允许的网络类型（Go `ContextWithAllowedNetwork` + server 消费）。
+    #[must_use]
+    pub fn with_allowed_network(mut self, network: xray_common::net::network::Network) -> Self {
+        self.allowed_network = Some(network);
         self
     }
 
@@ -507,6 +519,18 @@ impl ServerWorker {
                         local = %local,
                         "reverse mux inbound"
                     );
+                }
+                // Go server.go:189-192：AllowedNetwork 非未知时 New 帧目标
+                // 网络不匹配 → 错误 → handleFrame/run 错误传播拆整条 carrier。
+                if let Some(allowed) = self.allowed_network {
+                    if let Some(target) = meta.target() {
+                        if target.network() != allowed {
+                            return Err(ServerError::InvalidFrame(format!(
+                                "unexpected network {} (allowed {allowed:?})",
+                                target.network()
+                            )));
+                        }
+                    }
                 }
                 if meta.is_udp_target() && meta.global_id().is_some() {
                     let gid = *meta.global_id().unwrap();
@@ -907,6 +931,69 @@ mod tests {
 
             let got = read_payload(&mut pay).await;
             assert_eq!(got, b"GET /");
+        }
+
+        /// AllowedNetwork 校验（Go common/mux/server.go:189-192）：allowed=UDP
+        /// 时收到 TCP 目标 New 帧 → process_frame 返回 Err（调用方 run 循环
+        /// 等价物 break → 整条 carrier 连接拆除）。vless XRV+mux / splithttp
+        /// 入站注入 UDP 允许网络后，子会话恒应为 UDP。
+        #[tokio::test]
+        async fn allowed_network_rejects_mismatched_new_frame() {
+            let meta = FrameMetadata::new_session(10, tcp_dest());
+            let frame = new_frame_with_data(meta, b"unexpected-tcp");
+
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let dispatcher = CaptureDispatcher {
+                tx,
+                keepers: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            };
+            let server = Arc::new(
+                ServerWorker::new(Arc::new(dispatcher))
+                    .with_allowed_network(Network::UDP),
+            );
+            let (_lw_r, lw_w) = pipe::new();
+            let link_writer: Arc<AsyncMutex<Option<Box<dyn Writer>>>> =
+                Arc::new(AsyncMutex::new(Some(Box::new(lw_w))));
+            let mut reader = BufferedReader::new(xray_buf::io::new_reader(
+                std::io::Cursor::new(frame),
+            ));
+
+            let res = server.process_frame(&mut reader, &link_writer).await;
+            assert!(res.is_err(), "TCP New frame must be rejected under allowed=UDP");
+        }
+
+        /// 对照：allowed=UDP 时 UDP 目标 New 帧正常放行。
+        #[tokio::test]
+        async fn allowed_network_udp_accepts_udp_new_frame() {
+            let meta = FrameMetadata::new_session(11, udp_dest());
+            let frame = new_frame_with_data(meta, b"udp-ok");
+
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let dispatcher = CaptureDispatcher {
+                tx,
+                keepers: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            };
+            let server = Arc::new(
+                ServerWorker::new(Arc::new(dispatcher))
+                    .with_allowed_network(Network::UDP),
+            );
+            let (_lw_r, lw_w) = pipe::new();
+            let link_writer: Arc<AsyncMutex<Option<Box<dyn Writer>>>> =
+                Arc::new(AsyncMutex::new(Some(Box::new(lw_w))));
+            let mut reader = BufferedReader::new(xray_buf::io::new_reader(
+                std::io::Cursor::new(frame),
+            ));
+
+            let ok = server
+                .process_frame(&mut reader, &link_writer)
+                .await
+                .expect("UDP frame must pass allowed=UDP gate");
+            assert!(ok);
+            let (dest, _pay) = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("dispatch captured")
+                .expect("channel open");
+            assert_eq!(dest.network(), Network::UDP);
         }
     }
 

@@ -13,10 +13,9 @@
 use tokio::net::TcpStream;
 use xray_common::net::address::Address;
 
-use crate::config::MemoryAccount;
-use crate::error::Result;
-use crate::protocol::write_address_port_ss;
-use crate::stream::SSStream;
+use crate::{
+    config::MemoryAccount, error::Result, protocol::write_address_port_ss, stream::SSStream,
+};
 
 /// SS 出站客户端配置。
 #[derive(Clone)]
@@ -42,11 +41,7 @@ impl Client {
     /// 创建客户端。
     #[must_use]
     pub fn new(account: MemoryAccount, server_host: String, server_port: u16) -> Self {
-        Self {
-            account,
-            server_host,
-            server_port,
-        }
+        Self { account, server_host, server_port }
     }
 
     /// 连接到 SS 服务端：TCP connect → 写随机 IV → 构造 SSStream。
@@ -168,9 +163,10 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
+
     use super::*;
     use crate::config::CipherType;
-    use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
 
     fn make_account(ct: CipherType, password: &str) -> MemoryAccount {
         let p = ProtoAccount {

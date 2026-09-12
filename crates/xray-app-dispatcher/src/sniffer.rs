@@ -518,20 +518,66 @@ impl ProtocolSniffer for BittorrentSniffer {
 
 // ========== QUIC 嗅探器 ==========
 
+/// QUIC 版本规格（Go `quicVersionSpec`，common/protocol/quic/sniff.go:35-40）
+struct QuicVersionSpec {
+    ver: u32,
+    /// Initial 包的 packet type 期望值（`(type_byte & 0x30) >> 4`）
+    type_initial: u8,
+    initial_salt: &'static [u8; 20],
+    /// HP/key/iv 派生标签前缀（v1/draft29 用 "quic"，v2 用 "quicv2"，sniff.go:155-158）
+    label_prefix: &'static [u8],
+}
+
 /// QUIC v1 salt (RFC 9001 Section 5.2)
-const QUIC_SALT_V1: &[u8] = &[
-    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c,
-    0xad, 0xcc, 0xbb, 0x7f, 0x0a,
-];
+const QUIC_V1: QuicVersionSpec = QuicVersionSpec {
+    ver: 0x0000_0001,
+    type_initial: 0b00,
+    initial_salt: &[
+        0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c,
+        0xad, 0xcc, 0xbb, 0x7f, 0x0a,
+    ],
+    label_prefix: b"quic",
+};
 
 /// QUIC draft-29 salt
-const QUIC_SALT_DRAFT29: &[u8] = &[
-    0xaf, 0xbf, 0xec, 0x28, 0x99, 0x93, 0xd2, 0x4c, 0x9e, 0x97, 0x86, 0xf1, 0x9c, 0x61, 0x11,
-    0xe0, 0x43, 0x90, 0xa8, 0x99,
-];
+const QUIC_DRAFT29: QuicVersionSpec = QuicVersionSpec {
+    ver: 0xff00_001d,
+    type_initial: 0b00,
+    initial_salt: &[
+        0xaf, 0xbf, 0xec, 0x28, 0x99, 0x93, 0xd2, 0x4c, 0x9e, 0x97, 0x86, 0xf1, 0x9c, 0x61, 0x11,
+        0xe0, 0x43, 0x90, 0xa8, 0x99,
+    ],
+    label_prefix: b"quic",
+};
 
-const QUIC_VERSION_V1: u32 = 0x0000_0001;
-const QUIC_VERSION_DRAFT29: u32 = 0xff00_001d;
+/// QUIC v2（RFC 9369：独立版本号、Initial type=0b01、独立 salt 与 "quicv2" 标签前缀；
+/// Go d9c54026 "Sniffing: Support QUICv2"，sniff.go:55-60）
+const QUIC_V2: QuicVersionSpec = QuicVersionSpec {
+    ver: 0x6b33_43cf,
+    type_initial: 0b01,
+    initial_salt: &[
+        0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d,
+        0xcb, 0xf9, 0xbd, 0x2e, 0xd9,
+    ],
+    label_prefix: b"quicv2",
+};
+
+/// crypto data 缓冲上限（Go sniff.go:76 `buf.NewWithSize(32767)` 固定容量）
+const QUIC_CRYPTO_BUF_MAX: usize = 32767;
+
+fn quic_version_spec(ver: u32) -> Option<&'static QuicVersionSpec> {
+    [&QUIC_V1, &QUIC_DRAFT29, &QUIC_V2]
+        .into_iter()
+        .find(|s| s.ver == ver)
+}
+
+/// 拼接版本标签前缀与后缀（" hp"/" key"/" iv"；前缀最长 "quicv2"=6，后缀最长 4，总长 ≤10）
+fn versioned_label(prefix: &[u8], suffix: &[u8]) -> ([u8; 10], usize) {
+    let mut out = [0u8; 10];
+    out[..prefix.len()].copy_from_slice(prefix);
+    out[prefix.len()..prefix.len() + suffix.len()].copy_from_slice(suffix);
+    (out, prefix.len() + suffix.len())
+}
 
 /// QUIC 嗅探器（对应 Go quic.SniffQUIC）
 ///
@@ -620,7 +666,9 @@ fn sniff_quic(mut payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffE
         return Ok(None);
     }
 
-    let mut crypto_data = Vec::new();
+    // Go sniff.go:74-77：单块固定 cryptoDataBuf（32767）跨包复用，帧数据原地写入
+    let mut crypto_data = vec![0u8; QUIC_CRYPTO_BUF_MAX];
+    let mut crypto_len = 0usize;
 
     while !payload.is_empty() {
         let type_byte = payload[0];
@@ -634,12 +682,12 @@ fn sniff_quic(mut payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffE
         }
         let version = u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]);
 
-        if version != QUIC_VERSION_V1 && version != QUIC_VERSION_DRAFT29 {
+        let Some(spec) = quic_version_spec(version) else {
             return Ok(None);
-        }
+        };
 
         let packet_type = (type_byte & 0x30) >> 4;
-        let is_initial = packet_type == 0x0;
+        let is_initial = packet_type == spec.type_initial;
 
         // dest_conn_id
         let dcid_len = payload[5] as usize;
@@ -691,11 +739,7 @@ fn sniff_quic(mut payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffE
         }
 
         // ---- 解密 Initial 包 ----
-        let salt = if version == QUIC_VERSION_V1 {
-            QUIC_SALT_V1
-        } else {
-            QUIC_SALT_DRAFT29
-        };
+        let salt = spec.initial_salt;
 
         // HKDF-Extract: initial_secret = HMAC-SHA256(salt, dest_conn_id)
         // (RFC 9001 §5.2；ring 不暴露 PRK 原始字节，故用 hmac 手算 extract 得到原始 32 字节 PRK)
@@ -707,9 +751,10 @@ fn sniff_quic(mut payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffE
         let mut client_in_secret = [0u8; 32];
         hkdf_expand_label(&initial_secret_bytes, b"client in", &[], &mut client_in_secret)?;
 
-        // hp key
+        // hp key（v2 用 "quicv2 hp" 标签，Go sniff.go:158）
         let mut hp_key_bytes = [0u8; 16];
-        hkdf_expand_label(&client_in_secret, b"quic hp", &[], &mut hp_key_bytes)?;
+        let (hp_label, hp_label_len) = versioned_label(spec.label_prefix, b" hp");
+        hkdf_expand_label(&client_in_secret, &hp_label[..hp_label_len], &[], &mut hp_key_bytes)?;
 
         // header protection key
         let hp_key = ring::aead::quic::HeaderProtectionKey::new(
@@ -740,11 +785,13 @@ fn sniff_quic(mut payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffE
             }
         }
 
-        // AES-128-GCM 密钥和 IV
+        // AES-128-GCM 密钥和 IV（v2 用 "quicv2 key"/"quicv2 iv"，Go sniff.go:175-176）
         let mut key_bytes = [0u8; 16];
-        hkdf_expand_label(&client_in_secret, b"quic key", &[], &mut key_bytes)?;
+        let (key_label, key_label_len) = versioned_label(spec.label_prefix, b" key");
+        hkdf_expand_label(&client_in_secret, &key_label[..key_label_len], &[], &mut key_bytes)?;
         let mut iv_bytes = [0u8; 12];
-        hkdf_expand_label(&client_in_secret, b"quic iv", &[], &mut iv_bytes)?;
+        let (iv_label, iv_label_len) = versioned_label(spec.label_prefix, b" iv");
+        hkdf_expand_label(&client_in_secret, &iv_label[..iv_label_len], &[], &mut iv_bytes)?;
 
         let quic_key = ring::aead::LessSafeKey::new(
             ring::aead::UnboundKey::new(&ring::aead::AES_128_GCM, &key_bytes)
@@ -824,11 +871,15 @@ fn sniff_quic(mut payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffE
                         break;
                     }
 
-                    // 写入 crypto_data 缓冲区
+                    // 写入固定 crypto_data 缓冲区（Go sniff.go:242-252）
                     let write_start = offset_val as usize;
                     let write_end = write_start + length as usize;
-                    if crypto_data.len() < write_end {
-                        crypto_data.resize(write_end, 0);
+                    if write_end > QUIC_CRYPTO_BUF_MAX {
+                        // Go sniff.go:244-246：超出固定容量 → io.ErrShortBuffer，放弃嗅探
+                        return Ok(None);
+                    }
+                    if crypto_len < write_end {
+                        crypto_len = write_end;
                     }
                     crypto_data[write_start..write_end].copy_from_slice(&decrypted[frame_offset..end]);
                     frame_offset = end;
@@ -850,8 +901,8 @@ fn sniff_quic(mut payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffE
         }
 
         // 尝试从 crypto_data 解析 TLS ClientHello
-        if !crypto_data.is_empty() {
-            if let Ok(Some(result)) = parse_client_hello_from_handshake(&crypto_data) {
+        if crypto_len > 0 {
+            if let Ok(Some(result)) = parse_client_hello_from_handshake(&crypto_data[..crypto_len]) {
                 return Ok(Some(Box::new(ProtoSniffResult {
                     protocol: "quic",
                     domain: result.domain().to_string(),
@@ -867,59 +918,67 @@ fn sniff_quic(mut payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffE
 }
 // ========== UTP 嗅探器 ==========
 
-/// UTP 嗅探器（对应 Go bittorrent.SniffUTP）
+/// UTP 嗅探器（对应 Go bittorrent.SniffUTP，bittorrent.go:34-81）
 ///
-/// 匹配 uTP v1 头部：type(高4位 0-4) + version(低4位=1)。
-/// 并遍历 extension chain 验证格式合法性。
+/// 仅识别 uTP v1 **ST_SYN**（type=4, version=1，b[0]==0x41）：
+/// timestamp_difference 必须为 0（新连接），extension chain 仅允许
+/// selective ack（1，长度 ≥4 且 4 的倍数）与 extension bits（2，长度=8），
+/// 且 extension 必须恰好耗尽整个 ST_SYN 载荷。
+/// Go 9b373e39 "Sniffer: Fix SniffUTP()"：旧实现放过任意 type/坏 extension。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct UtpSniffer;
 
 impl ProtocolSniffer for UtpSniffer {
     fn sniff(&self, payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffError> {
         if payload.len() < 20 {
+            // Go bittorrent.go:35-37：common.ErrNoClue（保留待重试）
+            return Err(SniffError::NoClue);
+        }
+
+        // type 4 (ST_SYN), version 1（bittorrent.go:39-42）
+        if payload[0] != 0x41 {
             return Ok(None);
         }
 
-        let type_and_version = payload[0];
-        let utp_type = (type_and_version >> 4) & 0x0F;
-        let version = type_and_version & 0x0F;
-
-        // uTP v1: version 必须为 1，type 必须在 0-4 范围内
-        if version != 1 || utp_type > 4 {
+        // timestamp_difference 在新连接中恒为 0（bittorrent.go:44-47）
+        if u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]) != 0 {
             return Ok(None);
         }
 
-        // extension byte: 必须为 0 或 1
-        let extension = payload[1];
-        if extension > 1 {
-            return Ok(None);
-        }
-
-        // 遍历 extension chain
-        let mut ext_offset = 1; // 从 extension byte 开始
-        let mut current_ext = extension;
-        while current_ext == 1 {
-            // ST_DATA (type 0) 或 ST_FIN (type 1) 等数据包有 extension chain
-            if payload.len() < ext_offset + 2 + 4 {
+        // 遍历 extension chain（bittorrent.go:49-73）
+        let mut extension = payload[1];
+        let mut offset = 20usize;
+        while extension != 0 {
+            if payload.len() < offset + 2 {
                 return Ok(None);
             }
-            let next_ext = payload[ext_offset + 1];
-            let _len = u16::from_be_bytes([payload[ext_offset + 2], payload[ext_offset + 3]]);
-            ext_offset += 2 + _len as usize;
-            current_ext = next_ext;
-
-            if ext_offset >= payload.len() {
+            let length = payload[offset + 1] as usize;
+            match extension {
+                1 => {
+                    // selective ack
+                    if length < 4 || length % 4 != 0 {
+                        return Ok(None);
+                    }
+                }
+                2 => {
+                    // extension bits：固定 8 字节（µTorrent 在 ST_SYN 发送）
+                    if length != 8 {
+                        return Ok(None);
+                    }
+                }
+                _ => return Ok(None),
+            }
+            if payload.len() < offset + 2 + length {
                 return Ok(None);
             }
+            extension = payload[offset];
+            offset += 2 + length;
         }
 
-        // 验证 timestamp 微秒在合理范围（24小时内）
-        // uTP timestamp: 从头部偏移 2 字节后读取 u32 (big-endian)
-        // Go 实现检查 timestamp 差值在 24h 内，这里简化：只检查头部格式合法
-        if payload.len() < 6 {
+        // extension 必须恰好耗尽 ST_SYN 载荷（bittorrent.go:75-78）
+        if payload.len() != offset {
             return Ok(None);
         }
-        let _timestamp = u32::from_be_bytes([payload[2], payload[3], payload[4], payload[5]]);
 
         Ok(Some(Box::new(ProtoSniffResult {
             protocol: "bittorrent",
@@ -1552,38 +1611,111 @@ mod tests {
 
     // ---------- UTP 嗅探器测试 ----------
 
+    /// 构造 BEP 29 固定 20 字节 uTP 头（Go bittorrent_test.go utpPacket）
+    fn utp_packet(packet_type: u8, extension: u8, ts_diff: u32, payload: &[u8]) -> Vec<u8> {
+        let mut b = vec![0u8; 20];
+        b[0] = packet_type << 4 | 1;
+        b[1] = extension;
+        b[2..4].copy_from_slice(&0x4a3f_u16.to_be_bytes()); // connection_id
+        b[4..8].copy_from_slice(&0x8c3a91d2_u32.to_be_bytes()); // timestamp_microseconds
+        b[8..12].copy_from_slice(&ts_diff.to_be_bytes()); // timestamp_difference
+        b[12..16].copy_from_slice(&0x0010_0000_u32.to_be_bytes()); // wnd_size
+        b[16..18].copy_from_slice(&0x71ee_u16.to_be_bytes()); // seq_nr
+        b[18..20].copy_from_slice(&0x0000_u16.to_be_bytes()); // ack_nr
+        b.extend_from_slice(payload);
+        b
+    }
+
+    /// Go bittorrent_test.go TestSniffUTP 用例表（9b373e39 修复后语义）。
+    /// Ok(Some) = 命中；Ok(None) = errNotBittorrent；Err(NoClue) = common.ErrNoClue。
     #[test]
-    fn utp_sniff_valid_header() {
-        // uTP ST_DATA (type=0, version=1) => byte = 0x01
-        let mut payload = vec![0x01, 0x00]; // type=0, ver=1, ext=0
-        payload.extend_from_slice(&[0u8; 18]); // 补足 20 字节
-        let result = UtpSniffer.sniff(&payload).expect("ok").expect("some");
-        assert_eq!(result.protocol(), "bittorrent");
+    fn utp_sniff_go_case_table() {
+        let wrong_version = {
+            let mut p = utp_packet(4, 0, 0, &[]);
+            p[0] = 4 << 4 | 2;
+            p
+        };
+        let cases: Vec<(&str, Vec<u8>, usize)> = vec![
+            // 2 = Ok(Some) 命中；1 = Ok(None)；0 = Err(NoClue)
+            ("syn", utp_packet(4, 0, 0, &[]), 2),
+            (
+                "syn with selective ack",
+                {
+                    let mut p = utp_packet(4, 1, 0, &[]);
+                    p.extend_from_slice(&[0, 4, 0xff, 0x00, 0xff, 0x00]);
+                    p
+                },
+                2,
+            ),
+            (
+                "syn with extension bits",
+                {
+                    let mut p = utp_packet(4, 2, 0, &[]);
+                    p.extend_from_slice(&[0, 8, 1, 2, 3, 4, 5, 6, 7, 8]);
+                    p
+                },
+                2,
+            ),
+            (
+                "extension bits with wrong length",
+                {
+                    let mut p = utp_packet(4, 2, 0, &[]);
+                    p.extend_from_slice(&[0, 4, 1, 2, 3, 4]);
+                    p
+                },
+                1,
+            ),
+            ("syn with nonzero timestamp_difference", utp_packet(4, 0, 0x1234, &[]), 1),
+            ("syn with trailing payload", utp_packet(4, 0, 0, b"x"), 1),
+            // txid 0x4100、无 EDNS0：与 uTP 头部撞形的最坏 DNS 查询
+            (
+                "dns query",
+                vec![
+                    0x41, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+                    b'a', 0x02, b'c', b'o', 0x00, 0x00, 0x01, 0x00, 0x01,
+                ],
+                1,
+            ),
+            ("established connection packets", utp_packet(0, 0, 0x5678, b"xyz"), 1),
+            ("state", utp_packet(2, 0, 0x5678, &[]), 1),
+            ("fin", utp_packet(1, 0, 0x5678, &[]), 1),
+            ("wrong version", wrong_version, 1),
+            ("unknown packet type", utp_packet(5, 0, 0, &[]), 1),
+            ("unknown extension", utp_packet(4, 3, 0, &[]), 1),
+            (
+                "extension chain past the datagram",
+                utp_packet(4, 1, 0, &[0, 8, 0xff]),
+                1,
+            ),
+            (
+                "selective ack not in multiples of 4",
+                {
+                    let mut p = utp_packet(4, 1, 0, &[]);
+                    p.extend_from_slice(&[0, 3, 0xff, 0x00, 0xff]);
+                    p
+                },
+                1,
+            ),
+        ];
+
+        for (name, payload, expect) in cases {
+            let result = UtpSniffer.sniff(&payload);
+            match expect {
+                2 => {
+                    let r = result.expect(&format!("{name}: no error")).expect(&format!("{name}: some"));
+                    assert_eq!(r.protocol(), "bittorrent", "{name}");
+                }
+                1 => assert!(result.expect(&format!("{name}: no error")).is_none(), "{name}"),
+                _ => assert!(matches!(result, Err(SniffError::NoClue)), "{name}"),
+            }
+        }
     }
 
     #[test]
-    fn utp_sniff_fin_packet() {
-        // ST_FIN (type=1, version=1) => byte = 0x11
-        let mut payload = vec![0x11, 0x00];
-        payload.extend_from_slice(&[0u8; 18]);
-        let result = UtpSniffer.sniff(&payload).expect("ok").expect("some");
-        assert_eq!(result.protocol(), "bittorrent");
-    }
-
-    #[test]
-    fn utp_sniff_invalid_version() {
-        let mut payload = vec![0x02, 0x00]; // version=2, invalid
-        payload.extend_from_slice(&[0u8; 18]);
-        let result = UtpSniffer.sniff(&payload).expect("ok");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn utp_sniff_invalid_type() {
-        let mut payload = vec![0x51, 0x00]; // type=5, invalid
-        payload.extend_from_slice(&[0u8; 18]);
-        let result = UtpSniffer.sniff(&payload).expect("ok");
-        assert!(result.is_none());
+    fn utp_sniff_shorter_than_header_is_noclue() {
+        // Go bittorrent_test.go:53：<20 字节 → common.ErrNoClue
+        let payload = &utp_packet(4, 0, 0, &[])[..19];
+        assert!(matches!(UtpSniffer.sniff(payload), Err(SniffError::NoClue)));
     }
 
     // ---------- QUIC 嗅探器测试 ----------
@@ -1619,32 +1751,39 @@ mod tests {
         }
     }
 
-    /// 构造一个真实可解密的 QUIC v1 Initial 包（含给定 SNI 的 ClientHello）。
+    /// 测试用 DCID（密钥派生与包头封装必须一致）
+    const TEST_DCID: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+
+    /// 按 RFC 9001 §5 派生 Initial 密钥材料（key/iv/hp；v2 用独立 salt 与 "quicv2" 标签）
+    fn derive_initial_keys(
+        spec: &'static QuicVersionSpec,
+    ) -> ([u8; 16], [u8; 12], [u8; 16]) {
+        use ring::hmac;
+
+        let salt_key = hmac::Key::new(hmac::HMAC_SHA256, spec.initial_salt);
+        let prk = hmac::sign(&salt_key, &TEST_DCID);
+        let mut client_in = [0u8; 32];
+        hkdf_expand_label(prk.as_ref(), b"client in", &[], &mut client_in).unwrap();
+        let (key_label, kl) = versioned_label(spec.label_prefix, b" key");
+        let mut key_bytes = [0u8; 16];
+        hkdf_expand_label(&client_in, &key_label[..kl], &[], &mut key_bytes).unwrap();
+        let (iv_label, il) = versioned_label(spec.label_prefix, b" iv");
+        let mut iv_bytes = [0u8; 12];
+        hkdf_expand_label(&client_in, &iv_label[..il], &[], &mut iv_bytes).unwrap();
+        let (hp_label, hl) = versioned_label(spec.label_prefix, b" hp");
+        let mut hp_bytes = [0u8; 16];
+        hkdf_expand_label(&client_in, &hp_label[..hl], &[], &mut hp_bytes).unwrap();
+        (key_bytes, iv_bytes, hp_bytes)
+    }
+
+    /// 构造一个真实可解密的 QUIC Initial 包（含给定 SNI 的 ClientHello）。
     ///
     /// 完整复刻 RFC 9001 §5 的 Initial 密钥派生 + AES-128-GCM 加密 + header protection，
     /// 用于验证 `sniff_quic` 的解密、帧解析与 ClientHello 提取是否与标准客户端互通。
-    fn build_quic_initial_packet(sni: &[u8]) -> Vec<u8> {
-        use ring::aead;
-        use ring::hmac;
+    fn build_quic_initial_packet(spec: &'static QuicVersionSpec, sni: &[u8]) -> Vec<u8> {
+        let (key_bytes, iv_bytes, hp_bytes) = derive_initial_keys(spec);
 
-        let dcid: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
-        let scid: [u8; 4] = [0xA, 0xB, 0xC, 0xD];
-        let pn: u32 = 2; // packet number
-        let pn_length: usize = 4;
-
-        // 1. 初始密钥派生（与 sniff_quic 内部对称：PRK = HMAC-SHA256(salt, dcid)）
-        let salt_key = hmac::Key::new(hmac::HMAC_SHA256, QUIC_SALT_V1);
-        let prk = hmac::sign(&salt_key, &dcid);
-        let mut client_in = [0u8; 32];
-        hkdf_expand_label(prk.as_ref(), b"client in", &[], &mut client_in).unwrap();
-        let mut key_bytes = [0u8; 16];
-        hkdf_expand_label(&client_in, b"quic key", &[], &mut key_bytes).unwrap();
-        let mut iv_bytes = [0u8; 12];
-        hkdf_expand_label(&client_in, b"quic iv", &[], &mut iv_bytes).unwrap();
-        let mut hp_bytes = [0u8; 16];
-        hkdf_expand_label(&client_in, b"quic hp", &[], &mut hp_bytes).unwrap();
-
-        // 2. ClientHello -> CRYPTO 帧 -> 明文（末尾补 PADDING 至 128 字节）
+        // ClientHello -> CRYPTO 帧 -> 明文（末尾补 PADDING 至 128 字节）
         let crypto = build_minimal_client_hello(sni);
         let mut crypto_frame = vec![0x06]; // CRYPTO
         crypto_frame.extend_from_slice(&encode_quic_varint(0)); // offset = 0
@@ -1654,15 +1793,31 @@ mod tests {
         while plaintext.len() < 128 {
             plaintext.push(0x00); // PADDING
         }
+        build_quic_initial_from_plaintext(spec, &key_bytes, &iv_bytes, &hp_bytes, &plaintext)
+    }
+
+    /// 用给定密钥材料把任意明文封装为可解密的 QUIC Initial 包（加密 + header protection）。
+    fn build_quic_initial_from_plaintext(
+        spec: &'static QuicVersionSpec,
+        key_bytes: &[u8; 16],
+        iv_bytes: &[u8; 12],
+        hp_bytes: &[u8; 16],
+        plaintext: &[u8],
+    ) -> Vec<u8> {
+        use ring::aead;
+
+        let scid: [u8; 4] = [0xA, 0xB, 0xC, 0xD];
+        let pn: u32 = 2; // packet number
+        let pn_length: usize = 4;
 
         // 3. 构造未加掩 header（含 packet number）
         let ciphertext_len = plaintext.len() + 16; // + AEAD tag
         let length_val = (pn_length + ciphertext_len) as u64;
         let mut header = Vec::new();
-        header.push(0xC0 | ((pn_length - 1) as u8 & 0x03)); // Long | Initial | (pn_len-1)
-        header.extend_from_slice(&QUIC_VERSION_V1.to_be_bytes());
-        header.push(dcid.len() as u8);
-        header.extend_from_slice(&dcid);
+        header.push(0xC0 | (spec.type_initial << 4) | ((pn_length - 1) as u8 & 0x03)); // Long | type | (pn_len-1)
+        header.extend_from_slice(&spec.ver.to_be_bytes());
+        header.push(TEST_DCID.len() as u8);
+        header.extend_from_slice(&TEST_DCID);
         header.push(scid.len() as u8);
         header.extend_from_slice(&scid);
         header.extend_from_slice(&encode_quic_varint(0)); // token length = 0
@@ -1672,8 +1827,8 @@ mod tests {
 
         // 4. AEAD 加密（AAD = 未加掩 header）
         let key =
-            aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_128_GCM, &key_bytes).unwrap());
-        let mut nonce_bytes = iv_bytes;
+            aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_128_GCM, key_bytes).unwrap());
+        let mut nonce_bytes = *iv_bytes;
         let pn_be = pn.to_be_bytes();
         for i in 0..pn_length {
             nonce_bytes[12 - pn_length + i] ^= pn_be[i];
@@ -1693,7 +1848,7 @@ mod tests {
 
         // 5. Header protection
         let hp_key =
-            aead::quic::HeaderProtectionKey::new(&aead::quic::AES_128, &hp_bytes).unwrap();
+            aead::quic::HeaderProtectionKey::new(&aead::quic::AES_128, hp_bytes).unwrap();
         // PN 字段位于 header 末尾（helper 的 hdr_len 含 PN）；
         // HP sample 从 PN 偏移 +4 起取（RFC 9001 §5.4.2），与 sniff_quic 内部偏移一致。
         let pn_offset = hdr_len - pn_length;
@@ -1709,12 +1864,59 @@ mod tests {
 
     #[test]
     fn quic_sniff_initial_packet_extracts_sni() {
-        let packet = build_quic_initial_packet(b"www.example.com");
+        let packet = build_quic_initial_packet(&QUIC_V1, b"www.example.com");
         let result = QuicSniffer
             .sniff(&packet)
             .expect("sniff should succeed")
             .expect("should extract a result");
         assert_eq!(result.protocol(), "quic");
         assert_eq!(result.domain(), "www.example.com");
+    }
+
+    /// Go TestSniffQUICv2（d9c54026）等价构造：v2 Initial 长头（type=0b01）、
+    /// 独立 salt 与 "quicv2" key/iv/hp 标签派生，解密后提取 SNI。
+    #[test]
+    fn quic_sniff_v2_initial_packet_extracts_sni() {
+        let packet = build_quic_initial_packet(&QUIC_V2, b"test.example.com");
+        let result = QuicSniffer
+            .sniff(&packet)
+            .expect("sniff should succeed")
+            .expect("should extract a result");
+        assert_eq!(result.protocol(), "quic");
+        assert_eq!(result.domain(), "test.example.com");
+    }
+
+    /// Go sniff.go:244-246：CRYPTO 帧 offset+length 超过固定 cryptoDataBuf
+    /// 容量 32767 → io.ErrShortBuffer → 放弃嗅探（Rust 对应 Ok(None)）。
+    #[test]
+    fn quic_sniff_crypto_offset_exceeds_32767_gives_up() {
+        let (key_bytes, iv_bytes, hp_bytes) = derive_initial_keys(&QUIC_V1);
+
+        // CRYPTO 帧：offset=65535（4 字节 varint），length=1 → offset+length=65536 > 32767
+        let mut plaintext = vec![0x06];
+        plaintext.extend_from_slice(&encode_quic_varint(65535));
+        plaintext.extend_from_slice(&encode_quic_varint(1));
+        plaintext.push(0x41); // 1 字节 crypto data（长度字段合法，end 不超解密明文）
+        while plaintext.len() < 128 {
+            plaintext.push(0x00); // PADDING
+        }
+        let packet =
+            build_quic_initial_from_plaintext(&QUIC_V1, &key_bytes, &iv_bytes, &hp_bytes, &plaintext);
+        let result = QuicSniffer.sniff(&packet).expect("no hard error");
+        assert!(result.is_none(), "crypto offset+length 超限必须放弃嗅探");
+
+        // 对照：同构包 offset=0 不超限 → 不触发放弃路径（ClientHello 不完整 → NeedMoreData）
+        let mut plaintext_ok = vec![0x06, 0x00];
+        plaintext_ok.extend_from_slice(&encode_quic_varint(1));
+        plaintext_ok.push(0x41);
+        while plaintext_ok.len() < 128 {
+            plaintext_ok.push(0x00);
+        }
+        let packet_ok =
+            build_quic_initial_from_plaintext(&QUIC_V1, &key_bytes, &iv_bytes, &hp_bytes, &plaintext_ok);
+        assert!(matches!(
+            QuicSniffer.sniff(&packet_ok),
+            Err(SniffError::NeedMoreData)
+        ));
     }
 }

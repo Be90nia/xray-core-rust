@@ -25,17 +25,17 @@
 //!
 //! 不在本切片：TcpmaskManager / PROXY protocol 解析 / X-Forwarded-For / 多 path 路由。
 
+pub mod client;
 pub mod config;
 pub mod error;
 pub mod handshake;
-pub mod client;
+pub mod register;
 pub mod server;
 pub mod ws_bridge;
-pub mod register;
 // 顶层 re-export。
 pub use config::Config;
 pub use error::{Result, WsError};
 pub use handshake::{Opcode, WS_GUID, compute_accept_key, generate_client_key_for_testing};
-pub use ws_bridge::WsConnection;
-pub use server::{AcceptedConn, WsListener};
 pub use register::{register_dialer, register_listener};
+pub use server::{AcceptedConn, WsListener};
+pub use ws_bridge::WsConnection;

@@ -9,12 +9,14 @@
 
 use std::sync::Mutex;
 
-use crc::{Crc, CRC_64_ECMA_182};
+use crc::{CRC_64_ECMA_182, Crc};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-use crate::config::{Cipher, MemoryAccount};
-use crate::error::{Result, SsError};
+use crate::{
+    config::{Cipher, MemoryAccount},
+    error::{Result, SsError},
+};
 
 /// CRC64-ECMA 实现。
 const CRC64_ECMA: Crc<u64> = Crc::<u64>::new(&CRC_64_ECMA_182);
@@ -44,11 +46,7 @@ impl MemoryUser {
     /// 创建新用户。
     #[must_use]
     pub fn new(email: impl Into<String>, account: MemoryAccount) -> Self {
-        Self {
-            email: email.into(),
-            level: 0,
-            account,
-        }
+        Self { email: email.into(), level: 0, account }
     }
 
     /// 设置等级（builder 风格）。
@@ -171,10 +169,7 @@ impl Validator {
         }
         let mut inner = self.inner.lock().expect("validator mutex poisoned");
         let lower = email.to_ascii_lowercase();
-        let idx = inner
-            .users
-            .iter()
-            .position(|u| u.email.to_ascii_lowercase() == lower);
+        let idx = inner.users.iter().position(|u| u.email.to_ascii_lowercase() == lower);
         let Some(idx) = idx else {
             return Err(SsError::UserNotFoundByEmail(email.to_string()));
         };
@@ -193,11 +188,7 @@ impl Validator {
         }
         let inner = self.inner.lock().expect("validator mutex poisoned");
         let lower = email.to_ascii_lowercase();
-        inner
-            .users
-            .iter()
-            .find(|u| u.email.to_ascii_lowercase() == lower)
-            .cloned()
+        inner.users.iter().find(|u| u.email.to_ascii_lowercase() == lower).cloned()
     }
 
     /// 获取所有用户副本。
@@ -240,7 +231,7 @@ impl Validator {
                         Ok((iv_len, aead, ret)) => {
                             found = Some((user.clone(), iv_len, Some(aead), ret));
                             break;
-                        }
+                        },
                         Err(_) => continue,
                     }
                 } else {
@@ -274,12 +265,7 @@ impl Validator {
             }
         }
 
-        Ok(GetResult {
-            user,
-            aead,
-            ret,
-            iv_len,
-        })
+        Ok(GetResult { user, aead, ret, iv_len })
     }
 
     /// 获取 behavior seed，对应 Go `GetBehaviorSeed`。
@@ -318,20 +304,20 @@ fn try_match_aead(
 
     let ret = match command {
         RequestCommand::Tcp => {
-            // Go: data[4+nonce_size] 切片；ret = aead.open(data[:0], data[4:4+nonce_size], bs[iv_len:iv_len+18])
-            // 即 nonce=data[4:4+nonce_size]（也即 data 从 4 开始的 nonce_size 字节，全 0）
-            // 我们等价用 zero_nonce
+            // Go: data[4+nonce_size] 切片；ret = aead.open(data[:0], data[4:4+nonce_size],
+            // bs[iv_len:iv_len+18]) 即 nonce=data[4:4+nonce_size]（也即 data 从 4
+            // 开始的 nonce_size 字节，全 0） 我们等价用 zero_nonce
             let end = iv_len + 18;
             if bs.len() < end {
                 return Err(SsError::InsufficientData(bs.len()));
             }
             aead.open(&zero_nonce, &[], &bs[iv_len..end])?
-        }
+        },
         RequestCommand::Udp => {
             // Go: data[8192-nonce_size:8192] 作为 nonce
             // 全 0
             aead.open(&zero_nonce, &[], &bs[iv_len..])?
-        }
+        },
     };
     // 重新创建 aead（因为上面消耗了 aead，但 InnerAead 没有 Clone；
     // 实际上 Go 是返回同一个 aead，Rust 这边业务上需要重新构造）
@@ -346,9 +332,10 @@ fn try_match_aead(
 
 #[cfg(test)]
 mod tests {
+    use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
+
     use super::*;
     use crate::config::CipherType;
-    use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
 
     fn make_account(ct: CipherType, password: &str) -> MemoryAccount {
         let p = ProtoAccount {
@@ -369,11 +356,9 @@ mod tests {
     fn add_user_increases_count() {
         let v = Validator::new();
         assert_eq!(v.count(), 0);
-        v.add(make_user("u1@x.com", CipherType::Aes128Gcm, "p1"))
-            .expect("add");
+        v.add(make_user("u1@x.com", CipherType::Aes128Gcm, "p1")).expect("add");
         assert_eq!(v.count(), 1);
-        v.add(make_user("u2@x.com", CipherType::Aes256Gcm, "p2"))
-            .expect("add");
+        v.add(make_user("u2@x.com", CipherType::Aes256Gcm, "p2")).expect("add");
         assert_eq!(v.count(), 2);
     }
 
@@ -384,8 +369,7 @@ mod tests {
     #[test]
     fn del_removes_user() {
         let v = Validator::new();
-        v.add(make_user("u1@x.com", CipherType::Aes128Gcm, "p1"))
-            .expect("add");
+        v.add(make_user("u1@x.com", CipherType::Aes128Gcm, "p1")).expect("add");
         v.del("u1@x.com").expect("del");
         assert_eq!(v.count(), 0);
     }
@@ -393,8 +377,7 @@ mod tests {
     #[test]
     fn del_case_insensitive() {
         let v = Validator::new();
-        v.add(make_user("U1@X.com", CipherType::Aes128Gcm, "p1"))
-            .expect("add");
+        v.add(make_user("U1@X.com", CipherType::Aes128Gcm, "p1")).expect("add");
         v.del("u1@x.com").expect("del");
         assert_eq!(v.count(), 0);
     }
@@ -409,8 +392,7 @@ mod tests {
     #[test]
     fn del_unknown_email_errors() {
         let v = Validator::new();
-        v.add(make_user("u1@x.com", CipherType::Aes128Gcm, "p1"))
-            .expect("add");
+        v.add(make_user("u1@x.com", CipherType::Aes128Gcm, "p1")).expect("add");
         let err = v.del("nobody@x.com").unwrap_err();
         assert!(matches!(err, SsError::UserNotFoundByEmail(_)));
     }
@@ -418,8 +400,7 @@ mod tests {
     #[test]
     fn get_by_email_returns_user() {
         let v = Validator::new();
-        v.add(make_user("u1@x.com", CipherType::Aes128Gcm, "p1"))
-            .expect("add");
+        v.add(make_user("u1@x.com", CipherType::Aes128Gcm, "p1")).expect("add");
         let u = v.get_by_email("u1@x.com").expect("found");
         assert_eq!(u.email, "u1@x.com");
     }
@@ -433,18 +414,15 @@ mod tests {
     #[test]
     fn get_by_email_missing_returns_none() {
         let v = Validator::new();
-        v.add(make_user("u1@x.com", CipherType::Aes128Gcm, "p1"))
-            .expect("add");
+        v.add(make_user("u1@x.com", CipherType::Aes128Gcm, "p1")).expect("add");
         assert!(v.get_by_email("nobody@x.com").is_none());
     }
 
     #[test]
     fn get_all_returns_all_users() {
         let v = Validator::new();
-        v.add(make_user("u1@x.com", CipherType::Aes128Gcm, "p1"))
-            .expect("add");
-        v.add(make_user("u2@x.com", CipherType::Aes256Gcm, "p2"))
-            .expect("add");
+        v.add(make_user("u1@x.com", CipherType::Aes128Gcm, "p1")).expect("add");
+        v.add(make_user("u2@x.com", CipherType::Aes256Gcm, "p2")).expect("add");
         let all = v.get_all();
         assert_eq!(all.len(), 2);
     }
@@ -454,13 +432,11 @@ mod tests {
     #[test]
     fn behavior_seed_deterministic_after_add() {
         let v1 = Validator::new();
-        v1.add(make_user("u@x.com", CipherType::Aes128Gcm, "password"))
-            .expect("add");
+        v1.add(make_user("u@x.com", CipherType::Aes128Gcm, "password")).expect("add");
         let s1 = v1.behavior_seed();
 
         let v2 = Validator::new();
-        v2.add(make_user("u@x.com", CipherType::Aes128Gcm, "password"))
-            .expect("add");
+        v2.add(make_user("u@x.com", CipherType::Aes128Gcm, "password")).expect("add");
         let s2 = v2.behavior_seed();
         assert_eq!(s1, s2);
     }
@@ -468,13 +444,11 @@ mod tests {
     #[test]
     fn behavior_seed_differs_on_different_user() {
         let v1 = Validator::new();
-        v1.add(make_user("u1@x.com", CipherType::Aes128Gcm, "password1"))
-            .expect("add");
+        v1.add(make_user("u1@x.com", CipherType::Aes128Gcm, "password1")).expect("add");
         let s1 = v1.behavior_seed();
 
         let v2 = Validator::new();
-        v2.add(make_user("u2@x.com", CipherType::Aes128Gcm, "password2"))
-            .expect("add");
+        v2.add(make_user("u2@x.com", CipherType::Aes128Gcm, "password2")).expect("add");
         let s2 = v2.behavior_seed();
         assert_ne!(s1, s2);
     }
@@ -487,7 +461,7 @@ mod tests {
 
     /// 构造能通过 `try_match_aead` 的有效 `bs`（IV + AEAD-sealed 2B plaintext）。
     fn make_valid_bs(account: &MemoryAccount) -> Vec<u8> {
-        use crate::config::{hkdf_sha1, Cipher};
+        use crate::config::{Cipher, hkdf_sha1};
         let Cipher::Aead(ac) = &account.cipher else {
             panic!("need AEAD cipher");
         };
@@ -520,8 +494,7 @@ mod tests {
     #[test]
     fn iv_check_rejects_duplicate_iv() {
         let v = Validator::new();
-        v.add(make_user_iv_check("u@x.com", CipherType::Aes128Gcm, "pass"))
-            .expect("add");
+        v.add(make_user_iv_check("u@x.com", CipherType::Aes128Gcm, "pass")).expect("add");
         let account = v.get_all()[0].account.clone();
         let bs = make_valid_bs(&account);
 
@@ -535,8 +508,7 @@ mod tests {
     #[test]
     fn iv_check_disabled_allows_duplicate() {
         let v = Validator::new();
-        v.add(make_user("u@x.com", CipherType::Aes128Gcm, "pass"))
-            .expect("add");
+        v.add(make_user("u@x.com", CipherType::Aes128Gcm, "pass")).expect("add");
         let account = v.get_all()[0].account.clone();
         let bs = make_valid_bs(&account);
 
@@ -547,10 +519,9 @@ mod tests {
 
     #[test]
     fn iv_check_allows_different_iv() {
-        use crate::config::{hkdf_sha1, Cipher};
+        use crate::config::{Cipher, hkdf_sha1};
         let v = Validator::new();
-        v.add(make_user_iv_check("u@x.com", CipherType::Aes128Gcm, "pass"))
-            .expect("add");
+        v.add(make_user_iv_check("u@x.com", CipherType::Aes128Gcm, "pass")).expect("add");
         let account = v.get_all()[0].account.clone();
 
         // First IV.
@@ -563,9 +534,8 @@ mod tests {
         let mut subkey2 = vec![0u8; ac.key_bytes as usize];
         hkdf_sha1(&account.key, &iv2, &mut subkey2);
         let aead2 = (ac.creator)(&subkey2).expect("aead2");
-        let sealed2 = aead2
-            .seal(&vec![0u8; aead2.nonce_size()], &[], &[0x03, 0x04])
-            .expect("seal2");
+        let sealed2 =
+            aead2.seal(&vec![0u8; aead2.nonce_size()], &[], &[0x03, 0x04]).expect("seal2");
         let mut bs2 = iv2;
         bs2.extend_from_slice(&sealed2);
         while bs2.len() < 32 {
@@ -578,21 +548,25 @@ mod tests {
     /// （封顶换存活，防洪泛 OOM——Go 无 iv_check 实现，无 Go 语义可对齐）。
     #[test]
     fn iv_check_table_capped_and_reopens() {
-        use crate::config::{hkdf_sha1, Cipher};
+        use crate::config::{Cipher, hkdf_sha1};
         let v = Validator::new();
-        v.add(make_user_iv_check("u@x.com", CipherType::Aes128Gcm, "pass"))
-            .expect("add");
+        v.add(make_user_iv_check("u@x.com", CipherType::Aes128Gcm, "pass")).expect("add");
         let account = v.get_all()[0].account.clone();
         let Cipher::Aead(ac) = &account.cipher else { panic!() };
 
         let make_bs = |seed: u32| -> Vec<u8> {
-            let iv = seed.to_be_bytes().iter().copied().cycle().take(ac.iv_bytes as usize).collect::<Vec<u8>>();
+            let iv = seed
+                .to_be_bytes()
+                .iter()
+                .copied()
+                .cycle()
+                .take(ac.iv_bytes as usize)
+                .collect::<Vec<u8>>();
             let mut subkey = vec![0u8; ac.key_bytes as usize];
             hkdf_sha1(&account.key, &iv, &mut subkey);
             let aead = (ac.creator)(&subkey).expect("aead");
-            let sealed = aead
-                .seal(&vec![0u8; aead.nonce_size()], &[], &[0x03, 0x04])
-                .expect("seal");
+            let sealed =
+                aead.seal(&vec![0u8; aead.nonce_size()], &[], &[0x03, 0x04]).expect("seal");
             let mut bs = iv;
             bs.extend_from_slice(&sealed);
             while bs.len() < 32 {
@@ -606,8 +580,7 @@ mod tests {
             v.get(&make_bs(i), RequestCommand::Tcp).expect("fill ok");
         }
         // 第 CAP+1 个 IV：触发清空后正常接受。
-        v.get(&make_bs(SEEN_IVS_CAP as u32), RequestCommand::Tcp)
-            .expect("cap+1 ok");
+        v.get(&make_bs(SEEN_IVS_CAP as u32), RequestCommand::Tcp).expect("cap+1 ok");
         // 首个 IV 已被清空出表：重放放行（封顶语义）。
         v.get(&make_bs(0), RequestCommand::Tcp).expect("evicted iv reusable");
     }
@@ -615,9 +588,10 @@ mod tests {
 
 #[cfg(test)]
 mod fixed_behavior_seed_tests {
+    use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
+
     use super::*;
     use crate::config::CipherType;
-    use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
 
     fn make_account(ct: CipherType, password: &str) -> MemoryAccount {
         let p = ProtoAccount {

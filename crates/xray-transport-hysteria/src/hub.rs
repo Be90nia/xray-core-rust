@@ -11,17 +11,17 @@
 //!
 //! Rust 端用 trait 抽象以上依赖。本模块仅定义 trait + 编排框架。
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use parking_lot::Mutex;
 use xray_proto::xray::transport::internet::QuicParams;
 
-use crate::conn::{InterConn, InterStreamConn, QuicConn, QuicStream};
-use crate::context::ContextValues;
-use crate::error::{HysteriaError, Result};
-use crate::proto_config::Config;
+use crate::{
+    conn::{InterConn, InterStreamConn, QuicConn, QuicStream},
+    context::ContextValues,
+    error::{HysteriaError, Result},
+    proto_config::Config,
+};
 
 /// Masquerade 类型（对应 Go `config.MasqType`，4 种 + 默认 404）。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,17 +31,9 @@ pub enum MasqType {
     /// 静态文件服务（对应 Go `"file"`，配置 `MasqFile` 路径）。
     File(String),
     /// 反向代理（对应 Go `"proxy"`，配置 `MasqUrl` + `MasqUrlRewriteHost` + `MasqUrlInsecure`）。
-    Proxy {
-        url: String,
-        rewrite_host: bool,
-        insecure: bool,
-    },
+    Proxy { url: String, rewrite_host: bool, insecure: bool },
     /// 静态字符串响应（对应 Go `"string"`，配置 `MasqString` + Headers + StatusCode）。
-    String {
-        body: String,
-        headers: HashMap<String, String>,
-        status_code: u16,
-    },
+    String { body: String, headers: HashMap<String, String>, status_code: u16 },
 }
 
 impl MasqType {
@@ -69,7 +61,7 @@ impl MasqType {
     }
 
     /// 把 masquerade 运行时值写回 proto Config 的 masq 8 字段
-    ///（[`Self::from_config`] 的对偶，to_proto 方向）。
+    /// （[`Self::from_config`] 的对偶，to_proto 方向）。
     ///
     /// 归一化语义（与 from_config 的解析默认一致）：
     /// - NotFound → `masq_type = ""`（Go 默认分支，hub.go:212）
@@ -81,23 +73,23 @@ impl MasqType {
         match self {
             Self::NotFound => {
                 config.masq_type = String::new();
-            }
+            },
             Self::File(dir) => {
                 config.masq_type = "file".into();
                 config.masq_file = dir.clone();
-            }
+            },
             Self::Proxy { url, rewrite_host, insecure } => {
                 config.masq_type = "proxy".into();
                 config.masq_url = url.clone();
                 config.masq_url_rewrite_host = *rewrite_host;
                 config.masq_url_insecure = *insecure;
-            }
+            },
             Self::String { body, headers, status_code } => {
                 config.masq_type = "string".into();
                 config.masq_string = body.clone();
                 config.masq_string_headers = headers.clone();
                 config.masq_string_status_code = i32::from(*status_code);
-            }
+            },
         }
     }
 
@@ -111,13 +103,11 @@ impl MasqType {
             // 503 类兜底响应（任务授权 "proxy 503 类"），url/rewrite_host/insecure
             // 暂不消费（ponytail: 接入 hyper 反代时再扩展）。
             Self::Proxy { .. } => std::sync::Arc::new(ProxyMasqHandler),
-            Self::String { body, headers, status_code } => {
-                std::sync::Arc::new(StringMasqHandler {
-                    body: body.clone(),
-                    headers: headers.clone(),
-                    status_code: *status_code,
-                })
-            }
+            Self::String { body, headers, status_code } => std::sync::Arc::new(StringMasqHandler {
+                body: body.clone(),
+                headers: headers.clone(),
+                status_code: *status_code,
+            }),
         }
     }
 }
@@ -134,9 +124,7 @@ pub trait MasqueradeHandler: Send + Sync {
         path: &str,
         headers: &HashMap<String, String>,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = (u16, HashMap<String, String>, Vec<u8>)> + Send,
-        >,
+        Box<dyn std::future::Future<Output = (u16, HashMap<String, String>, Vec<u8>)> + Send>,
     >;
 }
 
@@ -200,11 +188,8 @@ fn resolve_masq_file(
         match comp {
             "" | "." => continue,
             ".." => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "path traversal",
-                ))
-            }
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "path traversal"));
+            },
             c => full.push(c),
         }
     }
@@ -212,10 +197,7 @@ fn resolve_masq_file(
         full.push("index.html");
     }
     if !full.starts_with(root) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "outside root",
-        ));
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "outside root"));
     }
     Ok(full)
 }
@@ -269,17 +251,22 @@ impl MasqueradeHandler for FileMasqHandler {
             match tokio::fs::read(&resolved).await {
                 Ok(bytes) => (
                     200,
-                    HashMap::from([(
-                        "Content-Type".to_string(),
-                        masq_content_type(&resolved),
-                    )]),
+                    HashMap::from([("Content-Type".to_string(), masq_content_type(&resolved))]),
                     if method == "HEAD" { Vec::new() } else { bytes },
                 ),
                 Err(_) => {
                     // HEAD 不写 body（Go net/http HEAD 短路）
                     let (s, h, _) = go_not_found();
-                    (s, h, if method == "HEAD" { Vec::new() } else { b"404 page not found\n".to_vec() })
-                }
+                    (
+                        s,
+                        h,
+                        if method == "HEAD" {
+                            Vec::new()
+                        } else {
+                            b"404 page not found\n".to_vec()
+                        },
+                    )
+                },
             }
         })
     }
@@ -300,9 +287,7 @@ impl MasqueradeHandler for StringMasqHandler {
         _path: &str,
         _headers: &HashMap<String, String>,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = (u16, HashMap<String, String>, Vec<u8>)> + Send,
-        >,
+        Box<dyn std::future::Future<Output = (u16, HashMap<String, String>, Vec<u8>)> + Send>,
     > {
         let body = self.body.clone();
         let headers = self.headers.clone();
@@ -327,14 +312,15 @@ impl MasqueradeHandler for ProxyMasqHandler {
         _path: &str,
         _headers: &HashMap<String, String>,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = (u16, HashMap<String, String>, Vec<u8>)> + Send,
-        >,
+        Box<dyn std::future::Future<Output = (u16, HashMap<String, String>, Vec<u8>)> + Send>,
     > {
         Box::pin(async {
             (
                 503,
-                HashMap::from([("Content-Type".to_string(), "text/plain; charset=utf-8".to_string())]),
+                HashMap::from([(
+                    "Content-Type".to_string(),
+                    "text/plain; charset=utf-8".to_string(),
+                )]),
                 b"Service Unavailable".to_vec(),
             )
         })
@@ -407,7 +393,9 @@ pub trait HysteriaRequestHandler: Send + Sync {
 /// QUIC listener 抽象（对应 Go `*quic.Listener` + `quic.Transport`）。
 pub trait HysteriaQuicListener: Send + Sync {
     /// 接受下一个 QUIC conn（对应 Go `listener.Accept(ctx)`）。
-    fn accept(&self) -> std::pin::Pin<
+    fn accept(
+        &self,
+    ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = std::io::Result<Arc<dyn QuicConn>>> + Send>,
     >;
 
@@ -415,7 +403,9 @@ pub trait HysteriaQuicListener: Send + Sync {
     fn local_addr(&self) -> SocketAddr;
 
     /// 关闭（对应 Go `listener.Close()`）。
-    fn close(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>;
+    fn close(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>;
 }
 
 /// Listener 工厂 trait（对应 Go `Listen` 函数）。
@@ -432,7 +422,9 @@ pub trait HysteriaListenerFactory: Send + Sync {
         // auth 后每个新 UDP session（4B session id 首包触发，对应 Go udpSessionManager.addConn）。
         // None = 不启用 UDP 数据面。
         on_new_udp_session: Option<Arc<dyn Fn(Arc<InterConn>) + Send + Sync>>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Arc<dyn HysteriaQuicListener>>> + Send>>;
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Arc<dyn HysteriaQuicListener>>> + Send>,
+    >;
 }
 
 /// Hysteria Listener（对应 Go `*Listener`）。
@@ -532,7 +524,9 @@ impl HysteriaListenerFactory for StubListenerFactory {
         _validator: Option<Arc<dyn AuthValidator>>,
         _on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync>,
         _on_new_udp_session: Option<Arc<dyn Fn(Arc<InterConn>) + Send + Sync>>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Arc<dyn HysteriaQuicListener>>> + Send>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Arc<dyn HysteriaQuicListener>>> + Send>,
+    > {
         Box::pin(async { Err(HysteriaError::ConnectionClosed) })
     }
 }
@@ -578,15 +572,11 @@ mod tests {
         let c = make_config("proxy");
         let m = MasqType::from_config(&c).unwrap();
         match m {
-            MasqType::Proxy {
-                url,
-                rewrite_host,
-                insecure,
-            } => {
+            MasqType::Proxy { url, rewrite_host, insecure } => {
                 assert_eq!(url, "https://example.com");
                 assert!(rewrite_host);
                 assert!(!insecure);
-            }
+            },
             _ => panic!("expected Proxy"),
         }
     }
@@ -596,15 +586,11 @@ mod tests {
         let c = make_config("string");
         let m = MasqType::from_config(&c).unwrap();
         match m {
-            MasqType::String {
-                body,
-                headers,
-                status_code,
-            } => {
+            MasqType::String { body, headers, status_code } => {
                 assert_eq!(body, "hello");
                 assert_eq!(headers.get("X-Custom"), Some(&"value".to_string()));
                 assert_eq!(status_code, 201);
-            }
+            },
             _ => panic!("expected String"),
         }
     }
@@ -668,17 +654,15 @@ mod tests {
         let cfg = Arc::new(Config::default());
         let qp = Arc::new(QuicParams::default());
         let on_new: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync> = Arc::new(|_| {});
-        let r = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(factory.listen(
-                "127.0.0.1:0".parse().unwrap(),
-                cfg,
-                qp,
-                MasqType::NotFound,
-                None,
-                on_new,
-                None,
-            ));
+        let r = tokio::runtime::Runtime::new().unwrap().block_on(factory.listen(
+            "127.0.0.1:0".parse().unwrap(),
+            cfg,
+            qp,
+            MasqType::NotFound,
+            None,
+            on_new,
+            None,
+        ));
         assert!(matches!(r, Err(HysteriaError::ConnectionClosed)));
     }
 
@@ -724,15 +708,12 @@ mod tests {
         let n = MasqType::NotFound.build_handler();
         let (status, _, body) = n.serve("GET", "/", &HashMap::new()).await;
         assert_eq!((status, body.as_slice()), (404, &b"404 page not found\n"[..]));
-        let p = MasqType::Proxy { url: "https://e.com".into(), rewrite_host: false, insecure: false }
-            .build_handler();
+        let p =
+            MasqType::Proxy { url: "https://e.com".into(), rewrite_host: false, insecure: false }
+                .build_handler();
         assert_eq!(p.serve("GET", "/", &HashMap::new()).await.0, 503);
-        let s = MasqType::String {
-            body: "ok".into(),
-            headers: HashMap::new(),
-            status_code: 200,
-        }
-        .build_handler();
+        let s = MasqType::String { body: "ok".into(), headers: HashMap::new(), status_code: 200 }
+            .build_handler();
         let (status, _, body) = s.serve("GET", "/", &HashMap::new()).await;
         assert_eq!((status, body.as_slice()), (200, &b"ok"[..]));
     }

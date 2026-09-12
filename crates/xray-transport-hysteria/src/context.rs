@@ -54,8 +54,9 @@ pub trait ContextWithValidator {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use parking_lot::RwLock;
+
+    use super::*;
 
     /// 测试用 context 载体：可变字段用 RwLock 保护。
     struct TestCtx {
@@ -65,10 +66,7 @@ mod tests {
 
     impl TestCtx {
         fn new() -> Arc<Self> {
-            Arc::new(Self {
-                datagram: RwLock::new(false),
-                auth: RwLock::new(None),
-            })
+            Arc::new(Self { datagram: RwLock::new(false), auth: RwLock::new(None) })
         }
     }
 

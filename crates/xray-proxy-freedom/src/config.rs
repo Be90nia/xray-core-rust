@@ -845,72 +845,45 @@ pub fn is_blocked_by_rules(
         .is_some_and(|r| r.action == RuleAction::Block)
 }
 
-/// 域名目标是否需要在 finalRule 匹配前先解析为 IP。
+/// finalRule Block 预检的域名解析（Go v26.9.9 `Process` :294-329，#6058）。
 ///
-/// 对应 Go `shouldResolveDomainBeforeFinalRules`（freedom.go:171-183）：
-/// 非域名恒 false；首条规则是「全放行」（Allow + 网络匹配 + 无端口 + 无 IP 限制）
-/// 时跳过解析（显式逃生门）；否则有默认规则或有配置规则即需要先解析——
-/// 默认 blockPrivate 防内网回连必须作用于解析后的 IP。
-#[must_use]
-pub fn should_resolve_domain_before_final_rules(
-    dest: &Destination,
-    rules: &[FinalRule],
-    default_rule: Option<&FinalRule>,
-) -> bool {
-    if !dest.address().is_domain() {
-        return false;
-    }
-    if let Some(first) = rules.first() {
-        let explicit_allow_all = first.action == RuleAction::Allow
-            && first.match_network(network_index(dest.network()))
-            && first.port.is_none()
-            && first.ip.is_none();
-        if explicit_allow_all {
-            return false;
-        }
-    }
-    default_rule.is_some() || !rules.is_empty()
-}
-
-/// finalRule 匹配前的域名解析（Go `Process` :282-311）。
-///
-/// 有策略（Use\*/Force\*）→ [`lookup_for_ip`] 按家族过滤随机选一；
-/// AsIs → 系统 resolver 解析，v4 优先（Go CheckRoutes → "ip4" 先查）。
-/// ponytail: Go CheckRoutes 的默认路由探测无等价物，假设双栈 v4 优先。
+/// 返回全部候选 IP 供逐 IP 匹配（Go :304-329 任一 IP 命中 Block 即阻断）；
+/// 空表 = 解析失败/无结果，调用方按「无法预检」继续拨号（Go :298-299/:315-318
+/// 记日志继续，dial 层可再解析）。仅 `ForceIP` 策略解析失败返回 Err（Go
+/// :300-302 断链重试）。
 ///
 /// # Errors
-/// 系统解析失败 / 空结果时返回错误，由调用方按 ForceIP 语义裁决断链或降级。
-pub async fn resolve_domain_for_rules(
+/// 仅 `strategy.force_ip()` 且 `LookupForIP` 失败时返回错误。
+pub async fn resolve_ips_for_rules(
     domain: &str,
     port: u16,
     strategy: xray_transport::sockopt::DomainStrategy,
-) -> std::io::Result<IpAddr> {
+) -> std::io::Result<Vec<IpAddr>> {
     if strategy.has_strategy() {
-        use rand::seq::IndexedRandom;
-        let ips = xray_transport::system_dialer::lookup_for_ip(domain, strategy, None).await?;
-        if let Some(ip) = ips.choose(&mut rand::rng()) {
-            return Ok(*ip);
+        return match xray_transport::system_dialer::lookup_for_ip(domain, strategy, None).await {
+            Ok(ips) => Ok(ips),
+            Err(e) => {
+                if strategy.force_ip() {
+                    Err(e)
+                } else {
+                    tracing::debug!(domain, error = %e, "freedom: LookupForIP failed, skip finalRule pre-check");
+                    Ok(Vec::new())
+                }
+            }
+        };
+    }
+    // Go :315-318：系统 resolver（AsIs）；失败记日志、空表继续
+    match tokio::net::lookup_host((domain, port)).await {
+        Ok(addrs) => Ok(addrs.map(|sa| sa.ip()).collect()),
+        Err(e) => {
+            tracing::debug!(domain, error = %e, "freedom: system resolve failed, skip finalRule pre-check");
+            Ok(Vec::new())
         }
     }
-    // ponytail: 单次 lookup_host 拿全量家族（Go 分两次查询 "ip4"/"ip6"，等价）
-    let addrs: Vec<std::net::SocketAddr> =
-        tokio::net::lookup_host((domain, port)).await?.collect();
-    let (v4, v6): (Vec<&std::net::SocketAddr>, Vec<&std::net::SocketAddr>) =
-        addrs.iter().partition(|a| a.is_ipv4());
-    let pick = |cands: &[&std::net::SocketAddr]| -> Option<IpAddr> {
-        use rand::seq::IndexedRandom;
-        cands.choose(&mut rand::rng()).map(|sa| sa.ip())
-    };
-    // v4 优先（Go "ip4" 先查），v4 空用 v6
-    pick(&v4).or_else(|| pick(&v6)).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("failed to get IP address for domain {domain}"),
-        )
-    })
 }
 
-/// 目标地址替换为解析出的 IP（端口/网络保留）。Go `dialDest.Address = net.IPAddress(ip)`。
+/// 目标地址替换为解析出的 IP（端口/网络保留）。finalRule 逐 IP 预检
+/// （dispatcher/handler）与 UDP 逐帧改写（udp.rs）共用。
 #[must_use]
 pub fn destination_with_ip(dest: &Destination, ip: IpAddr) -> Destination {
     let address = match ip {

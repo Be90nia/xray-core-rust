@@ -340,6 +340,11 @@ pub struct AccessContext {
     pub inbound_tag: String,
     /// 认证用户策略层级（对应 Go `user.Level`，用于 per-user policy 查询）。
     pub level: u32,
+    /// 允许的网络类型（Go `session.ContextWithAllowedNetwork`，context.go:152-154）：
+    /// vless XRV+mux 命令（Go inbound.go:607-609）与 splithttp 入站
+    /// （Go proxyman inbound.go:177-179）注入，mux 服务端 worker 消费校验
+    /// （Go common/mux/server.go:189-192）。
+    pub allowed_network: Option<xray_common::net::network::Network>,
 }
 
 /// 一次 access 记录（对应 Go `log.AccessMessage` 最终形态）。
@@ -2482,6 +2487,7 @@ mod tests {
             email: "alice@x.com".into(),
             inbound_tag: "vless-in".into(),
             level: 0,
+            allowed_network: None,
         };
         d.dispatch_link(&dest, outbound, &SniffingRequest::default(), Some(access), None)
             .expect("dispatch_link ok");
@@ -3286,6 +3292,7 @@ mod tests {
             email: "u@x.com".into(),
             inbound_tag: "socks-in".into(),
             level: 0,
+            allowed_network: None,
         };
         d.dispatch_link(&access_dest(), link, &SniffingRequest::default(), Some(access), None)
             .expect("dispatch_link ok");
@@ -3374,6 +3381,7 @@ mod tests {
             email: String::new(),
             inbound_tag: "socks-in".into(),
             level: 0,
+            allowed_network: None,
         };
         let res = d.dispatch_link(&access_dest(), link, &SniffingRequest::default(), Some(access), None);
         assert!(res.is_err(), "no handler should be a sync error");

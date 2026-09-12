@@ -146,6 +146,20 @@ pub fn new_reader(r: impl AsyncRead + Unpin + Send + 'static) -> Box<dyn Reader>
     Box::new(crate::reader::SingleReader::new(r))
 }
 
+/// 将 TCP 读半部包装为 Reader，按 `xray.buf.readv` 闸门选择实现。
+///
+/// 对应 Go `buf.NewReader` 的 readv 分支（io.go:124-140）：TCP socket + env 启用
+/// → [`crate::readv::ReadVReader`]（scatter-gather 聚合读）；env 禁用 →
+/// [`SingleReader`]（顺序读）。
+#[must_use]
+pub fn new_readv_reader(r: tokio::net::tcp::OwnedReadHalf) -> Box<dyn Reader> {
+    if crate::readv::use_readv() {
+        Box::new(crate::readv::ReadVReader::new(r))
+    } else {
+        Box::new(crate::reader::SingleReader::new(r))
+    }
+}
+
 /// 将 tokio AsyncRead 包装为 UDP 包语义的 Reader
 ///
 /// 对应 Go 的 `buf.NewPacketReader(io.Reader)`，使用 PacketReader 实现。

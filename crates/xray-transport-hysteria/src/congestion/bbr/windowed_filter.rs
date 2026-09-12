@@ -40,11 +40,7 @@ where
 {
     /// 构造（对应 Go `NewWindowedFilter`）。
     pub fn new(window_length: T, comparator: Comparator<V>) -> Self {
-        Self {
-            window_length,
-            estimates: [Entry::default(); 3],
-            comparator,
-        }
+        Self { window_length, estimates: [Entry::default(); 3], comparator }
     }
 
     /// 修改窗口长度（对应 Go `SetWindowLength`）。
@@ -97,18 +93,12 @@ where
 
         let cmp_new_to_second = (self.comparator)(&new_sample, &self.estimates[1].sample);
         if cmp_new_to_second >= 0 {
-            self.estimates[1] = Entry {
-                sample: new_sample,
-                time: new_time,
-            };
+            self.estimates[1] = Entry { sample: new_sample, time: new_time };
             self.estimates[2] = self.estimates[1];
         } else {
             let cmp_new_to_third = (self.comparator)(&new_sample, &self.estimates[2].sample);
             if cmp_new_to_third >= 0 {
-                self.estimates[2] = Entry {
-                    sample: new_sample,
-                    time: new_time,
-                };
+                self.estimates[2] = Entry { sample: new_sample, time: new_time };
             }
         }
 
@@ -117,10 +107,7 @@ where
         if best_age > self.window_length {
             self.estimates[0] = self.estimates[1];
             self.estimates[1] = self.estimates[2];
-            self.estimates[2] = Entry {
-                sample: new_sample,
-                time: new_time,
-            };
+            self.estimates[2] = Entry { sample: new_sample, time: new_time };
             // 可能再次过期
             let best_age2 = new_time - self.estimates[0].time;
             if best_age2 > self.window_length {
@@ -135,10 +122,7 @@ where
         if self.estimates[1].sample == self.estimates[0].sample
             && (new_time - self.estimates[1].time) > quarter(self.window_length)
         {
-            self.estimates[1] = Entry {
-                sample: new_sample,
-                time: new_time,
-            };
+            self.estimates[1] = Entry { sample: new_sample, time: new_time };
             self.estimates[2] = self.estimates[1];
             return;
         }
@@ -147,19 +131,13 @@ where
         if self.estimates[2].sample == self.estimates[1].sample
             && (new_time - self.estimates[2].time) > half(self.window_length)
         {
-            self.estimates[2] = Entry {
-                sample: new_sample,
-                time: new_time,
-            };
+            self.estimates[2] = Entry { sample: new_sample, time: new_time };
         }
     }
 
     /// Reset 所有估计为新样本（对应 Go `Reset`）。
     pub fn reset(&mut self, new_sample: V, new_time: T) {
-        let e = Entry {
-            sample: new_sample,
-            time: new_time,
-        };
+        let e = Entry { sample: new_sample, time: new_time };
         self.estimates[2] = e;
         self.estimates[1] = e;
         self.estimates[0] = e;

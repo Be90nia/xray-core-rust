@@ -9,25 +9,29 @@
 //! Rust 侧 quinn 0.11 的对应注入点是 `Endpoint::new_with_abstract_socket`：
 //! 本模块 [`SalamanderSocket`] 实现 `quinn::AsyncUdpSocket`，收发两个方向都过 XOR：
 //! - 发送 `try_send`：`salt || XOR(contents)` 后 `try_send_to`
-//! - 接收 `poll_recv`：`recv_from` → 剥 salt + XOR 回明文 → 写入 quinn 缓冲；
-//!   长度 ≤ salt 的短包丢弃继续读（对齐 Go `headerManagerConn.ReadFrom` 的
-//!   drop-and-continue 语义，finalmask.go:134-137）
+//! - 接收 `poll_recv`：`recv_from` → 剥 salt + XOR 回明文 → 写入 quinn 缓冲； 长度 ≤ salt
+//!   的短包丢弃继续读（对齐 Go `headerManagerConn.ReadFrom` 的 drop-and-continue
+//!   语义，finalmask.go:134-137）
 //!
 //! GSO/GRO/ECN 不透传：`max_transmit_segments`/`max_receive_segments` 保持默认 1，
 //! quinn 不会构造多段 Transmit；`may_fragment()==true` 使 quinn 关闭路径 MTU 探测
 //! （salamander 每包 +8B salt，不探测更稳妥）。XOR 本体复用
 //! `xray_transport::finalmask::salamander::SalamanderObfuscator`（非重写）。
 
-use std::io;
-use std::io::IoSliceMut;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    io,
+    io::IoSliceMut,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use parking_lot::Mutex;
-use quinn::udp::{RecvMeta, Transmit};
-use quinn::{AsyncUdpSocket, UdpPoller};
+use quinn::{
+    AsyncUdpSocket, UdpPoller,
+    udp::{RecvMeta, Transmit},
+};
 use tokio::net::UdpSocket;
 use xray_transport::finalmask::salamander::SalamanderObfuscator;
 
@@ -61,7 +65,10 @@ impl SalamanderSocket {
     /// bind UDP socket 并包装 salamander 混淆器。
     ///
     /// 必须在 tokio runtime 上下文内调用（`UdpSocket::bind` 注册 reactor）。
-    pub async fn bind(obfs: Arc<SalamanderObfuscator>, bind_addr: SocketAddr) -> io::Result<Arc<Self>> {
+    pub async fn bind(
+        obfs: Arc<SalamanderObfuscator>,
+        bind_addr: SocketAddr,
+    ) -> io::Result<Arc<Self>> {
         Ok(Arc::new(Self {
             io: Arc::new(UdpSocket::bind(bind_addr).await?),
             obfs,
@@ -105,10 +112,7 @@ fn endpoint_with_socket(
 
 impl AsyncUdpSocket for SalamanderSocket {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        Box::pin(WritablePoller {
-            io: self.io.clone(),
-            fut: None,
-        })
+        Box::pin(WritablePoller { io: self.io.clone(), fut: None })
     }
 
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
@@ -135,7 +139,7 @@ impl AsyncUdpSocket for SalamanderSocket {
         loop {
             // 就绪注册（WouldBlock 时挂 waker，Pending 返回）
             match self.io.poll_recv_ready(cx) {
-                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Ok(())) => {},
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
@@ -150,17 +154,13 @@ impl AsyncUdpSocket for SalamanderSocket {
             };
             match decoded {
                 Ok((payload, addr)) if payload > 0 => {
-                    meta[0] = RecvMeta {
-                        addr,
-                        len: payload,
-                        stride: payload,
-                        ecn: None,
-                        dst_ip: None,
-                    };
+                    meta[0] =
+                        RecvMeta { addr, len: payload, stride: payload, ecn: None, dst_ip: None };
                     return Poll::Ready(Ok(1));
-                }
-                Ok(_) => continue, // Short packet (≤ salt) dropped, keep reading
-                Err(_) => continue, // WouldBlock → hang waker; other IO errors retry same as quinn tokio impl
+                },
+                Ok(_) => continue,  // Short packet (≤ salt) dropped, keep reading
+                Err(_) => continue, /* WouldBlock → hang waker; other IO errors retry same as
+                                      * quinn tokio impl */
             }
         }
     }
@@ -208,8 +208,8 @@ impl std::fmt::Debug for WritablePoller {
 /// - 无 `finalmask` / 无 `udp` 数组 / 空数组 → `Ok(None)`（不包装，行为不变）
 /// - `salamander` + `settings.password`（≥4 字节）→ `Some(obfuscator)`
 /// - 其它 mask type：报错（不静默丢配置，与 `parse_finalmask_udp_chain` 策略一致）
-/// - `settings.packetSize`：Go 侧切换 Gecko 分片模式（transport_internet.go:1761），
-///   hysteria QUIC 路径未实现 → 报错
+/// - `settings.packetSize`：Go 侧切换 Gecko 分片模式（transport_internet.go:1761）， hysteria QUIC
+///   路径未实现 → 报错
 ///
 /// # Errors
 /// `InvalidInput`：未知 type / Gecko 配置 / 多条 salamander / PSK 过短。
@@ -271,7 +271,8 @@ mod tests {
 
     #[tokio::test]
     async fn try_send_wraps_salt_and_xor() {
-        let sock = SalamanderSocket::bind(test_obfs(), "127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let sock =
+            SalamanderSocket::bind(test_obfs(), "127.0.0.1:0".parse().unwrap()).await.unwrap();
         let peer = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).await.unwrap();
         let plain = b"plaintext quic packet";
 
@@ -311,7 +312,8 @@ mod tests {
 
     #[tokio::test]
     async fn poll_recv_unwraps_inbound() {
-        let sock = SalamanderSocket::bind(test_obfs(), "127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let sock =
+            SalamanderSocket::bind(test_obfs(), "127.0.0.1:0".parse().unwrap()).await.unwrap();
         let peer = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).await.unwrap();
 
         // 对端用 salamander 加密后发来
@@ -341,7 +343,8 @@ mod tests {
 
     #[tokio::test]
     async fn poll_recv_drops_short_packet_then_recovers() {
-        let sock = SalamanderSocket::bind(test_obfs(), "127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let sock =
+            SalamanderSocket::bind(test_obfs(), "127.0.0.1:0".parse().unwrap()).await.unwrap();
         let peer = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).await.unwrap();
         let dst = sock.local_addr().unwrap();
 
@@ -352,10 +355,7 @@ mod tests {
         let mut iovs = [IoSliceMut::new(&mut buf)];
         let mut metas = [RecvMeta::default()];
         let mut cx = noop_cx();
-        assert!(matches!(
-            sock.poll_recv(&mut cx, &mut iovs, &mut metas),
-            Poll::Pending
-        ));
+        assert!(matches!(sock.poll_recv(&mut cx, &mut iovs, &mut metas), Poll::Pending));
 
         // 随后好包正常恢复
         let plain = b"good packet after drop";
@@ -402,10 +402,9 @@ mod tests {
             serde_json::from_str(r#"{"udp":[{"type":"noise","settings":{}}]}"#).unwrap();
         assert!(parse_salamander_obfs(Some(&v)).is_err());
         // PSK 过短（< 4 字节）
-        let v: serde_json::Value = serde_json::from_str(
-            r#"{"udp":[{"type":"salamander","settings":{"password":"ab"}}]}"#,
-        )
-        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"udp":[{"type":"salamander","settings":{"password":"ab"}}]}"#)
+                .unwrap();
         assert!(parse_salamander_obfs(Some(&v)).is_err());
         // Gecko 模式未实现
         let v: serde_json::Value = serde_json::from_str(

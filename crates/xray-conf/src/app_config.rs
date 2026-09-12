@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 /// 日志配置，对应 Go `infra/conf.LogConfig`（json 字段：loglevel/access/error/
 /// dnsLog/maskAddress；`format` 为 Rust 扩展——Go v26.6.1 无此字段）。
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct LogConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -39,7 +39,7 @@ pub struct LogConfig {
 // =========================================================================
 
 /// 单个级别的策略限制。
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct PolicyLevel {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -68,7 +68,7 @@ pub struct PolicyLevel {
 }
 
 /// 系统级策略。
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct PolicySystem {
     #[serde(skip_serializing_if = "Option::is_none", alias = "stats_inbound_uplink")]
@@ -82,7 +82,7 @@ pub struct PolicySystem {
 }
 
 /// 策略配置，对应 Go `infra/conf.PolicyConfig`。
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PolicyConfig {
     /// 级别 → 策略。key 是数字字符串（`"0"`..`"9"`）。
@@ -97,7 +97,7 @@ pub struct PolicyConfig {
 // =========================================================================
 
 /// 观测器配置，对应 Go `infra/conf.ObservatoryConfig`。
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ObservatoryConfig {
     /// Go json `subjectSelector` 数组（探测目标 tag 列表，bd z9ma）。
@@ -124,7 +124,7 @@ pub struct ObservatoryConfig {
 }
 
 /// 突发观测器配置。
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct BurstObservatoryConfig {
     /// Go json `subjectSelector` 数组（bd z9ma；Go `BurstObservatoryConfig`
@@ -144,7 +144,7 @@ pub struct BurstObservatoryConfig {
 // =========================================================================
 
 /// Metrics 配置。
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct MetricsConfig {
     /// 对齐 Go infra/conf/metrics.go:9 `tag`（建 inbound handler 供路由暴露；
@@ -160,7 +160,7 @@ pub struct MetricsConfig {
 }
 
 /// Stats 配置（空 — 存在即启用）。
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StatsConfig {}
 
@@ -178,7 +178,7 @@ pub struct StatsConfig {}
 /// xray-app-version 已实现但 Instance 装配未注册）——保留形状对齐 Go，等
 /// 后续 batch 接入 `xray_app_version::Version::new` 即可生效（`coreVersion`
 /// 取自 `core.Version_x/y/z`，`min/max` 为运行期约束）。
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct VersionConfig {
     /// 最低支持的核心版本（含），Go `MinVersion`。
@@ -202,7 +202,7 @@ pub struct VersionConfig {
 ///
 /// Rust 端 `assets` 序列化为对象数组（url/file），由装配层送入
 /// `xray_app_geodata::instance::GeodataConfig`（register.rs:691-703）。
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct GeodataConfig {
     /// 定时表达式（标准 cron 5 段格式；非空时按表达式自动 reload）。
@@ -231,7 +231,7 @@ pub struct GeodataAssetConfig {
 }
 
 /// API 配置。
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ApiConfig {
     /// API handler tag。

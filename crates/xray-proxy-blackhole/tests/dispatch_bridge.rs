@@ -12,29 +12,24 @@
 
 #![cfg(test)]
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
 use xray_app_dispatcher::default::{DefaultDispatcher, SimpleOhm, SniffingRequest};
+use xray_buf::{
+    io::{Reader, Writer},
+    multi::MultiBuffer,
+};
+use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
 use xray_features::inbound::InboundHandler as _;
-use xray_buf::io::{Reader, Writer};
-use xray_buf::multi::MultiBuffer;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
-use xray_proxy_blackhole::{make_blackhole_handler, BlackholeInboundHandler, ResponseConfig};
-use xray_proto::xray::common::serial::TypedMessage;
 use xray_proto::xray::proxy::blackhole::Config;
+use xray_proxy_blackhole::{BlackholeInboundHandler, ResponseConfig, make_blackhole_handler};
 
 fn make_dest() -> Destination {
-    Destination::new(
-        Address::Domain("blackhole.test".into()),
-        Port::new(80),
-        Network::TCP,
-    )
+    Destination::new(Address::Domain("blackhole.test".into()), Port::new(80), Network::TCP)
 }
 
 #[tokio::test]
@@ -43,9 +38,9 @@ async fn blackhole_dispatch_returns_http_403_then_drains() {
 
     // 1. 构造黑黑黑 blackhole outbound handler（Http403 响应）
     let cfg = Config {
-        response: Some(TypedMessage {
-            r#type: "xray.proxy.blackhole.HTTPResponse".into(),
-            value: Vec::new(),
+        response: Some(xray_proto::xray::proxy::blackhole::Response {
+            r#type: "http".into(),
+            custom_response_data: Vec::new(),
         }),
     };
     let blackhole = make_blackhole_handler("bh-out", cfg).expect("handler");
@@ -65,11 +60,7 @@ async fn blackhole_dispatch_returns_http_403_then_drains() {
 
     let mut mb = MultiBuffer::new();
     mb.merge_bytes(b"GET / HTTP/1.1");
-    inbound
-        .writer
-        .write_multi_buffer(mb)
-        .await
-        .expect("inbound write should succeed");
+    inbound.writer.write_multi_buffer(mb).await.expect("inbound write should succeed");
     let resp = tokio::time::timeout(Duration::from_secs(3), inbound.reader.read_multi_buffer())
         .await
         .expect("response should arrive within 3s")
@@ -90,10 +81,11 @@ async fn blackhole_inbound_silently_drops_tcp_connection() {
 
     let port = handler.port();
     assert!(port > 0, "blackhole inbound must have bound a port");
-    let mut conn = tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(("127.0.0.1", port)))
-        .await
-        .expect("connect timed out")
-        .expect("connect should succeed");
+    let mut conn =
+        tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(("127.0.0.1", port)))
+            .await
+            .expect("connect timed out")
+            .expect("connect should succeed");
 
     conn.write_all(b"hello blackhole\n").await.ok();
 
@@ -102,9 +94,9 @@ async fn blackhole_inbound_silently_drops_tcp_connection() {
     let read_result =
         tokio::time::timeout(Duration::from_secs(2), conn.read_to_end(&mut buf)).await;
     match read_result {
-        Ok(Ok(0)) => {}
+        Ok(Ok(0)) => {},
         Ok(Ok(_)) => panic!("blackhole should EOF, got {} bytes: {:?}", buf.len(), buf),
-        Ok(Err(_)) => {}
+        Ok(Err(_)) => {},
         Err(_) => panic!("blackhole close should not hang 2s"),
     }
     handler.close().await.expect("close");

@@ -1,7 +1,7 @@
 //! gRPC RoutingService — 接入 Router 的管理 RPC。
 //!
 //! 翻译自 `app/router/command/`。7 个 RPC 方法委托给 [`Router`]。
-//! subscribe_routing_stats 需要 gRPC streaming 框架，暂未接入。
+//! `subscribe_routing_stats` 的 channel 订阅与流式转发由 commander gRPC 层实现。
 //!
 //! # 架构
 //!
@@ -53,6 +53,18 @@ impl RoutingService {
         router
             .get_balancer(tag)
             .map(|_| ())
+            .ok_or_else(|| RouterError::BalancerNotFound(tag.to_string()))
+    }
+
+    /// 获取平衡器覆盖目标（对应 Go `routingServer.GetBalancerInfo` 之 override
+    /// 字段，即 `Router.GetOverrideTarget`，balancing.go:162-166）。
+    ///
+    /// 返回当前 override 值（空字符串 = 无覆盖，Go 同返回空串）。
+    pub fn get_override_target(&self, tag: &str) -> Result<String, RouterError> {
+        let router = self.router()?;
+        router
+            .get_balancer(tag)
+            .map(|b| b.get_override_target())
             .ok_or_else(|| RouterError::BalancerNotFound(tag.to_string()))
     }
 
@@ -114,7 +126,6 @@ impl RoutingService {
         let balancer = router
             .get_balancer(balancer_tag)
             .ok_or_else(|| RouterError::BalancerNotFound(balancer_tag.to_string()))?;
-        use crate::balancing::OutboundHandlerSelector;
         let selects = router.ohm();
         let tags: Vec<String> = balancer.selectors().to_vec();
         selects
@@ -122,35 +133,6 @@ impl RoutingService {
             .map_err(|e| RouterError::Other(format!("select_outbounds: {e}")))
     }
 
-    /// 订阅路由统计（对应 Go `routingServer.SubscribeRoutingStats`）。
-    ///
-    /// 当前架构下 router 不直接持有 `xray_features::stats::Manager`
-    /// （channel 由 `xray-app-stats::AppStatsFeature` 维护，dispatcher
-    /// 写入，gRPC 端从 channel 读）。本握手层面只校验 field selectors 合法
-    /// 并返回订阅句柄所用 channel 的就绪状态——gRPC 端补全 stream 接收。
-    ///
-    /// `field_selectors` 为空 = 全量；非空时校验每个 selector 是 Go 端识别的
-    /// 字段（inbound / outbound / user / ip / port / domain）。
-    pub fn subscribe_routing_stats(
-        &self,
-        field_selectors: Vec<String>,
-    ) -> Result<(), RouterError> {
-        // router 必须已配置（与其它管理 RPC 一致）。
-        self.router()?;
-        if field_selectors.is_empty() {
-            // 全选语义：field selectors 为空 = 全量订阅
-            return Ok(());
-        }
-        let allowed = ["inbound", "outbound", "user", "ip", "port", "domain"];
-        for s in &field_selectors {
-            if !allowed.iter().any(|a| a == s) {
-                return Err(RouterError::Other(format!(
-                    "unknown field selector: {s}"
-                )));
-            }
-        }
-        Ok(())
-    }
 }
 #[cfg(test)]
 mod tests {
@@ -230,19 +212,4 @@ mod tests {
         assert!(s.get_principle_target("missing").is_err());
     }
 
-    /// subscribe_routing_stats: 空 selector 全量通过；未知 selector 拒绝；合法 selector 全过。
-    #[test]
-    fn subscribe_routing_stats_validates_selectors() {
-        use crate::balancing::{NotImplementedSelector, OutboundHandlerSelector};
-        let ohm: Arc<dyn OutboundHandlerSelector> = Arc::new(NotImplementedSelector);
-        let router = Router::empty(ohm, None);
-        let s = RoutingService::with_router(router);
-        assert!(s.subscribe_routing_stats(vec![]).is_ok());
-        assert!(s
-            .subscribe_routing_stats(vec!["inbound".into(), "outbound".into()])
-            .is_ok());
-        assert!(s
-            .subscribe_routing_stats(vec!["not_a_field".into()])
-            .is_err());
-    }
 }

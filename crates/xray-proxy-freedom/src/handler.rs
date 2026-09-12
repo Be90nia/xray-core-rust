@@ -15,18 +15,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use async_trait::async_trait;
 use xray_common::net::destination::Destination;
-use xray_common::net::address::Address;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
 use xray_common::session::Session;
 use xray_features::outbound::{OutboundError, OutboundHandler};
 use xray_transport::sockopt::SocketOptions;
 use xray_transport::system_dialer::dial_system;
 
-use crate::config::{
-    Config, DomainStrategy, FinalRule, DefaultRuleType, RuleAction,
-    get_default_rule_type,
-};
+use crate::config::{Config, FinalRule, DefaultRuleType, RuleAction, get_default_rule_type};
 use crate::fragment::FragmentConnection;
 
 /// Freedom 出站 Handler。
@@ -67,57 +61,44 @@ impl FreedomHandler {
         self
     }
 
-    /// 解析域名为 IP 地址。
+    /// dial 前预检：命中 Block 规则则返回该规则。
     ///
-    /// `dial_system` 不支持 Domain（socket2 需要具体 IP），所以所有策略
-    /// 都需要在此解析域名。AsIs 策略接受任意 IP 族，UseIP* 按 strategy 过滤。
-    async fn resolve_domain(
+    /// IP 目标直接匹配（Go :331-337）；域名目标仅在可能命中时解析（Go :294-295
+    /// `defaultRule != nil || len(finalRules) > 0`），任一解析 IP 命中 Block 即阻断
+    /// （Go :304-329）。解析仅服务预检——拨号目标保持原样（域名保留，#6058），
+    /// 实际解析由拨号层按 SocketOptions.domain_strategy 完成。
+    async fn check_blocked_resolved(
         &self,
-        domain: &str,
-        port: u16,
-        strategy: DomainStrategy,
-    ) -> Result<Destination, OutboundError> {
-        let addr = format!("{domain}:{port}");
-        let lookup_result = tokio::net::lookup_host(&addr)
-            .await
-            .map_err(|e| OutboundError::ConnectionFailed(
-                format!("DNS resolution failed for {domain}: {e}")
-            ))?;
-
-        let filtered: Vec<_> = lookup_result
-            .filter(|addr| {
-                if strategy.prefer_ipv4() && !strategy.has_fallback() {
-                    addr.is_ipv4()
-                } else if strategy.prefer_ipv6() && !strategy.has_fallback() {
-                    addr.is_ipv6()
-                } else {
-                    true
-                }
-            })
-            .collect();
-
-        if filtered.is_empty() {
-            return Err(OutboundError::ConnectionFailed(
-                format!("DNS resolution returned no matching addresses for {domain} (strategy: {strategy:?})")
-            ));
+        dest: &Destination,
+        session: &Session,
+    ) -> Result<Option<FinalRule>, OutboundError> {
+        let default_rule = self.resolve_default_rule(session);
+        if !dest.address().is_domain() {
+            return Ok(self
+                .match_final_rule(dest, default_rule.as_ref())
+                .filter(|r| r.action == RuleAction::Block));
         }
-
-        // 46: prefer IPv4，fallback IPv6；64: prefer IPv6，fallback IPv4
-        // （Go LookupForIP 的 Resolve fallback——v4/v6 任一家族空时用另一族结果）
-        let selected = match strategy {
-            s if s.prefer_ipv4() => filtered.iter().find(|a| a.is_ipv4()).or_else(|| filtered.first()),
-            s if s.prefer_ipv6() => filtered.iter().find(|a| a.is_ipv6()).or_else(|| filtered.first()),
-            _ => filtered.first(),
-        };
-
-        let socket_addr = *selected.expect("filtered is non-empty");
-
-        let address = match socket_addr {
-            std::net::SocketAddr::V4(v4) => Address::IPv4(*v4.ip()),
-            std::net::SocketAddr::V6(v6) => Address::IPv6(*v6.ip()),
-        };
-
-        Ok(Destination::new(address, Port::new(socket_addr.port()), Network::TCP))
+        if default_rule.is_none() && self.final_rules.is_empty() {
+            return Ok(None);
+        }
+        let strategy =
+            xray_transport::sockopt::DomainStrategy::from_i32(self.config.domain_strategy);
+        match crate::config::resolve_ips_for_rules(
+            dest.address().as_domain().unwrap_or_default(),
+            dest.port().value(),
+            strategy,
+        )
+        .await
+        {
+            Ok(ips) => Ok(ips.iter().find_map(|ip| {
+                let ip_dest = crate::config::destination_with_ip(dest, *ip);
+                self.match_final_rule(&ip_dest, default_rule.as_ref())
+                    .filter(|r| r.action == RuleAction::Block)
+            })),
+            Err(e) => Err(OutboundError::ConnectionFailed(format!(
+                "freedom: ForceIP domain resolve failed: {e}"
+            ))),
+        }
     }
 
     /// 决定当前连接的默认规则。
@@ -140,16 +121,6 @@ impl FreedomHandler {
         crate::config::match_final_rules(&self.final_rules, default_rule, dest)
     }
 
-    /// 若目标被 Block 规则命中，返回该规则（dial 前调用）。
-    fn check_blocked(&self, dest: &Destination, session: &Session) -> Option<FinalRule> {
-        let default_rule = self.resolve_default_rule(session);
-        let rule = self.match_final_rule(dest, default_rule.as_ref())?;
-        if rule.action == RuleAction::Block {
-            Some(rule)
-        } else {
-            None
-        }
-    }
 
     /// 黑洞处理：阻塞读取上游数据并丢弃，最多等待 `block_delay`，然后关闭下游。
     ///
@@ -169,33 +140,18 @@ impl OutboundHandler for FreedomHandler {
 
     /// 通过 [`dial_system`] 拨号到 `destination`。
     ///
-    /// 切片2 限制：`destination` 必须是 IP 地址（IPv4/IPv6），Domain 返回
-    /// [`OutboundError::ConnectionFailed`]（DNS 解析留切片3 接入 LookupForIP）。
-    ///
-    /// **注意**：当前拨号建立的 Connection 在 dial 返回后 drop——这是切片2 的
-    /// 验证性实现，仅证明 dial_system 端到端可用。真正的桥接（Connection ↔ Link）
-    /// 留切片3。
+    /// 目标可为 IP 或域名（域名按 domainStrategy 在拨号层解析，Go :296-300）；
+    /// finalRule Block 预检命中 → [`OutboundError::ConnectionFailed`]。
     async fn dial(
         &self,
         destination: &Destination,
-        _session: &Session,
+        session: &Session,
     ) -> Result<(), OutboundError> {
-        let strategy = DomainStrategy::from_i32(self.config.domain_strategy);
-
-        let effective_dest = match destination.address() {
-            Address::IPv4(_) | Address::IPv6(_) => destination.clone(),
-            Address::Domain(domain) => {
-                // dial_system 不支持 Domain（socket2 需要具体 IP），
-                // 所有策略都需解析域名。AsIs 接受任意 IP 族。
-                self.resolve_domain(domain, destination.port().value(), strategy).await?
-            }
-        };
-
-        // FinalRule：dial 前检查私有 IP 阻断（对应 Go matchFinalRule Block 分支）。
-        if let Some(_rule) = self.check_blocked(&effective_dest, _session) {
+        // FinalRule 预检：解析仅服务 Block 判定，不改写拨号目标（#6058）。
+        if self.check_blocked_resolved(destination, session).await?.is_some() {
             tracing::info!(
                 tag = %self.tag,
-                dest = ?effective_dest,
+                dest = ?destination,
                 "freedom: connection blocked by final rule"
             );
             return Err(OutboundError::ConnectionFailed(
@@ -203,15 +159,17 @@ impl OutboundHandler for FreedomHandler {
             ));
         }
 
-        let sockopt = SocketOptions::default();
-        let _conn = dial_system(&effective_dest, &sockopt)
+        // 拨号恒用原始目标（#6058）：域名保留，解析下沉拨号层。
+        let sockopt = SocketOptions {
+            domain_strategy: xray_transport::sockopt::DomainStrategy::from_i32(
+                self.config.domain_strategy,
+            ),
+            ..SocketOptions::default()
+        };
+        let _conn = dial_system(destination, &sockopt)
             .await
             .map_err(|e| OutboundError::ConnectionFailed(format!("dial_system failed: {e}")))?;
-        tracing::debug!(
-            tag = %self.tag,
-            strategy = ?strategy,
-            "freedom dial succeeded"
-        );
+        tracing::debug!(tag = %self.tag, "freedom dial succeeded");
         Ok(())
     }
 
@@ -235,23 +193,18 @@ impl ProxyOutbound for FreedomHandler {
         let dest = session.destination()
             .ok_or_else(|| ProxymanError::Other("freedom: no destination in session".to_string()))?;
 
-        let strategy = DomainStrategy::from_i32(self.config.domain_strategy);
-
-        let effective_dest = match dest.address() {
-            Address::IPv4(_) | Address::IPv6(_) => dest.clone(),
-            Address::Domain(domain) => {
-                self.resolve_domain(domain, dest.port().value(), strategy).await
-                    .map_err(|e| ProxymanError::OutboundProcessFailed(e.to_string()))?
-            }
-        };
-
-        // FinalRule：dial 前检查阻断规则。命中 Block → 黑洞（blockDelay + drain），
-        // 不拨号（对应 Go matchFinalRule Block 分支）。
-        if let Some(rule) = self.check_blocked(&effective_dest, session) {
+        // FinalRule 预检：命中 Block → 黑洞（blockDelay + drain），不拨号
+        // （对应 Go matchFinalRule Block 分支）。解析仅服务预检，不改写拨号目标。
+        if let Some(rule) = self
+            .check_blocked_resolved(&dest, session)
+            .await
+            .map_err(|e| ProxymanError::OutboundProcessFailed(e.to_string()))?
+        {
             return self.blackhole(link, &rule).await;
         }
 
-        let mut conn = dialer.dial(&effective_dest).await
+        // 拨号恒用原始目标（#6058：Go :339 dialer.Dial(destination)，域名由 dialer 解析）。
+        let mut conn = dialer.dial(&dest).await
             .map_err(|e| ProxymanError::OutboundProcessFailed(format!("freedom dial failed: {e}")))?;
 
         // PROXY protocol：在拨号连接上写入 PROXY header（v1/v2）。
@@ -306,6 +259,7 @@ impl ProxyOutbound for FreedomHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xray_common::net::address::Address;
     use xray_common::net::network::Network;
     use xray_common::net::port::Port;
     use tokio::io::AsyncWriteExt;
@@ -371,19 +325,27 @@ mod tests {
         server_task.await.unwrap();
     }
 
-
     #[tokio::test]
-    async fn dial_to_domain_with_asis_resolves_and_dials() {
-        // AsIs 策略：解析域名后拨号。
-        // 用 localhost 域名测试，加超时防止 DNS 卡住。
+    async fn dial_to_domain_resolves_at_dial_layer_and_dials() {
+        // #6058：域名目标 handler 不再预解析，由 dial_system 按 domainStrategy
+        // 解析（FakeDns 脚本确定性返回 127.0.0.1）→ 连接本地监听成功。
+        use crate::test_support::{install, uninstall, FakeDns, FAKE_DNS_LOCK};
+        let _g = FAKE_DNS_LOCK.lock();
+        let fake = FakeDns::ips(vec![vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)]]);
+        install(&fake);
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server_task = tokio::spawn(async move {
             let _ = listener.accept().await;
         });
 
-        let h = FreedomHandler::new("test", Config::default());
-        let dest = make_domain_dest("localhost", addr.port());
+        let config = Config {
+            domain_strategy: crate::config::DomainStrategy::UseIPv4 as i32,
+            ..Default::default()
+        };
+        let h = FreedomHandler::new("test", config);
+        let dest = make_domain_dest("dualstack.test", addr.port());
         let session = Session::new();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -392,13 +354,11 @@ mod tests {
 
         match result {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => panic!("dial with AsIs failed: {e}"),
-            Err(_) => {
-                // DNS 超时——环境问题，不算测试失败
-                eprintln!("SKIP: localhost DNS resolution timed out");
-            }
+            Ok(Err(e)) => panic!("dial via dial-layer resolution failed: {e}"),
+            Err(_) => eprintln!("SKIP: dial timed out"),
         }
 
+        uninstall();
         server_task.abort();
     }
 
@@ -451,5 +411,118 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         // 服务器 task 应该已经完成或即将完成
         let _ = server_task.await;
+    }
+
+    /// #6058 预检：域名经策略解析命中 Block（10.0.0.0/8）→ dial 报阻断，不拨号。
+    #[tokio::test]
+    async fn dial_blocked_when_domain_resolves_to_blocked_ip() {
+        use crate::test_support::{install, uninstall, FakeDns, FAKE_DNS_LOCK};
+        let _g = FAKE_DNS_LOCK.lock();
+        let fake = FakeDns::ips(vec![vec![std::net::IpAddr::V4("10.0.0.1".parse().unwrap())]]);
+        install(&fake);
+
+        let rule = crate::config::FinalRuleConfig::from_json(
+            &serde_json::json!({"action": "block", "ip": ["10.0.0.0/8"]}),
+        )
+        .unwrap();
+        let config = Config {
+            domain_strategy: crate::config::DomainStrategy::UseIPv4 as i32,
+            final_rules: vec![rule],
+            ..Default::default()
+        };
+        let h = FreedomHandler::new("test", config);
+        let dest = make_domain_dest("intranet.test", 80);
+        let session = Session::new();
+        let err = h.dial(&dest, &session).await.expect_err("blocked domain must not dial");
+        assert!(err.to_string().contains("blocked by final rule"), "got: {err}");
+        uninstall();
+    }
+
+    /// #6058：无规则（defaultRule=nil + finalRules 空）→ 域名不做预检解析
+    /// （FakeDns 仅被拨号层查询 1 次），拨号正常（Go :294-295 条件门控）。
+    #[tokio::test]
+    async fn dial_domain_without_rules_skips_precheck_resolution() {
+        use crate::test_support::{install, uninstall, FakeDns, FAKE_DNS_LOCK};
+        let _g = FAKE_DNS_LOCK.lock();
+        let fake = FakeDns::ips(vec![vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)]]);
+        install(&fake);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let config = Config {
+            domain_strategy: crate::config::DomainStrategy::UseIPv4 as i32,
+            ..Default::default()
+        };
+        let h = FreedomHandler::new("test", config);
+        let dest = make_domain_dest("localhost", addr.port());
+        let session = Session::new();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            h.dial(&dest, &session),
+        )
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("dial should succeed: {e}"),
+            Err(_) => eprintln!("SKIP: dial timed out"),
+        }
+        assert_eq!(
+            fake.query_count(),
+            1,
+            "only the dial layer may resolve; no pre-check without rules"
+        );
+        uninstall();
+        server_task.abort();
+    }
+
+    /// #6058：有规则（非 Block）→ 预检解析发生（FakeDns 共 2 次：预检+拨号层），
+    /// 未命中 Block → 拨号照常成功。
+    #[tokio::test]
+    async fn dial_domain_with_rules_prechecks_then_dials() {
+        use crate::test_support::{install, uninstall, FakeDns, FAKE_DNS_LOCK};
+        let _g = FAKE_DNS_LOCK.lock();
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let fake = FakeDns::ips(vec![vec![ip], vec![ip]]);
+        install(&fake);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let rule = crate::config::FinalRuleConfig::from_json(
+            &serde_json::json!({"action": "allow", "port": "53"}),
+        )
+        .unwrap();
+        let config = Config {
+            domain_strategy: crate::config::DomainStrategy::UseIPv4 as i32,
+            final_rules: vec![rule],
+            ..Default::default()
+        };
+        let h = FreedomHandler::new("test", config);
+        let dest = make_domain_dest("localhost", addr.port());
+        let session = Session::new();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            h.dial(&dest, &session),
+        )
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("dial should succeed: {e}"),
+            Err(_) => eprintln!("SKIP: dial timed out"),
+        }
+        assert_eq!(
+            fake.query_count(),
+            2,
+            "pre-check (rules present) + dial layer each resolve once"
+        );
+        uninstall();
+        server_task.abort();
     }
 }

@@ -18,12 +18,12 @@ use xray_proto::xray::app::proxyman::command::{
     RemoveOutboundRequest, RemoveUserOperation,
 };
 use xray_proto::xray::app::router::command::{
-    AddRuleRequest, GetBalancerInfoRequest, ListRuleRequest, OverrideBalancerTargetRequest,
-    RemoveRuleRequest,
+    AddRuleRequest, GetBalancerInfoRequest, GetBalancerInfoResponse, ListRuleRequest,
+    OverrideBalancerTargetRequest, RemoveRuleRequest,
 };
 use xray_proto::xray::app::stats::command::{
-    GetAllOnlineUsersRequest, GetStatsRequest, GetUsersStatsRequest, QueryStatsRequest,
-    SysStatsRequest,
+    GetAllOnlineUsersRequest, GetStatsOnlineIpListResponse, GetStatsRequest,
+    GetUsersStatsRequest, GetUsersStatsResponse, QueryStatsRequest, SysStatsRequest,
 };
 use xray_proto::xray::common::serial::TypedMessage;
 use xray_proto::xray::core::{InboundHandlerConfig, OutboundHandlerConfig};
@@ -50,7 +50,9 @@ fn load_config(arg: &str) -> Result<Vec<u8>, CliError> {
 ///
 /// 对应 Go `serial.DecodeJSONConfig` + `InboundConfigs.Build()` 的简化版：
 /// 解析 JSON 配置 → 提取 inbounds → 转为 proto `InboundHandlerConfig`。
-fn build_inbound_configs(json_data: &[u8]) -> Result<Vec<InboundHandlerConfig>, CliError> {
+pub(crate) fn build_inbound_configs(
+    json_data: &[u8],
+) -> Result<Vec<InboundHandlerConfig>, CliError> {
     let config: serde_json::Value = serde_json::from_slice(json_data)
         .map_err(|e| CliError::InvalidArgument(format!("failed to parse JSON config: {e}")))?;
 
@@ -73,7 +75,7 @@ fn build_inbound_configs(json_data: &[u8]) -> Result<Vec<InboundHandlerConfig>, 
 
         // receiver_settings：inbound 的 streamSettings + port + listen 等
         let receiver_settings = build_typed_message(
-            "xray.app.proxyman.inbound",
+            "xray.app.proxyman.ReceiverConfig",
             Some(&serde_json::Value::Object({
                 let mut map = serde_json::Map::new();
                 if let Some(v) = ib.get("port") { map.insert("port".into(), v.clone()); }
@@ -95,7 +97,9 @@ fn build_inbound_configs(json_data: &[u8]) -> Result<Vec<InboundHandlerConfig>, 
 }
 
 /// 从 JSON 配置文件构建出站 HandlerConfig 列表。
-fn build_outbound_configs(json_data: &[u8]) -> Result<Vec<OutboundHandlerConfig>, CliError> {
+pub(crate) fn build_outbound_configs(
+    json_data: &[u8],
+) -> Result<Vec<OutboundHandlerConfig>, CliError> {
     let config: serde_json::Value = serde_json::from_slice(json_data)
         .map_err(|e| CliError::InvalidArgument(format!("failed to parse JSON config: {e}")))?;
 
@@ -115,7 +119,7 @@ fn build_outbound_configs(json_data: &[u8]) -> Result<Vec<OutboundHandlerConfig>
 
         let proxy_settings = build_typed_message(protocol, ob.get("settings"));
         let sender_settings = build_typed_message(
-            "xray.app.proxyman.outbound",
+            "xray.app.proxyman.SenderConfig",
             Some(&serde_json::Value::Object({
                 let mut map = serde_json::Map::new();
                 if let Some(v) = ob.get("sendThrough") { map.insert("sendThrough".into(), v.clone()); }
@@ -136,13 +140,23 @@ fn build_outbound_configs(json_data: &[u8]) -> Result<Vec<OutboundHandlerConfig>
     Ok(result)
 }
 
-/// 构建 TypedMessage：type_url 为协议名对应的全限定类型，value 为 JSON 编码。
+ /// 构建 TypedMessage：type_url 为协议名对应的全限定类型，value 为 JSON 编码。
+///
+/// 协议名 → Go 注册类型名（conf 注 reflect，已用 v26.9.9 `convert pb` golden
+/// 实测）：`dokodemo-door` 的包名是 `dokodemo`；其余协议名与包名一致。
+fn go_proxy_type_url(protocol: &str) -> String {
+    let pkg = match protocol {
+        "dokodemo-door" => "dokodemo",
+        other => other,
+    };
+    format!("xray.proxy.{pkg}.Config")
+}
+
 fn build_typed_message(type_name: &str, settings: Option<&serde_json::Value>) -> TypedMessage {
-    // Go 端 type_url 格式为 "xray.proxy.PROTOCOL.Config" 或 "xray.app.proxyman.inbound.Config"
     let type_url = if type_name.contains('.') {
         type_name.to_string()
     } else {
-        format!("xray.proxy.{type_name}.Config")
+        go_proxy_type_url(type_name)
     };
 
     let value = settings
@@ -171,6 +185,90 @@ fn build_rule_typed_message(json_data: &[u8]) -> Result<TypedMessage, CliError> 
 fn print_response<T: std::fmt::Debug>(resp: &T, _json_output: bool) {
     // ponytail: proto 消息无 serde derive，用 Debug 格式输出；后续可加 prost serde feature 改进
     println!("{resp:#?}");
+}
+
+/// 输出 protojson 风格 JSON（Go `showJSONResponse`，shared.go:111-121）。
+/// Go 端 4 空格缩进 + 不转义 HTML；serde_json 为 2 空格缩进（纯格式差异）。
+fn print_json_value(v: &serde_json::Value) {
+    println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
+}
+
+/// [`GetBalancerInfoResponse`] → protojson 形态（camelCase、空字段省略）。
+/// `{"balancer":{"override":{"target":…},"principleTarget":{"tag":[…]}}}`。
+fn balancer_info_json(resp: &GetBalancerInfoResponse) -> serde_json::Value {
+    let mut root = serde_json::Map::new();
+    if let Some(bal) = &resp.balancer {
+        let mut b = serde_json::Map::new();
+        if let Some(ov) = &bal.r#override {
+            b.insert("override".into(), serde_json::json!({ "target": ov.target }));
+        }
+        if let Some(pt) = &bal.principle_target {
+            b.insert("principleTarget".into(), serde_json::json!({ "tag": pt.tag }));
+        }
+        root.insert("balancer".into(), serde_json::Value::Object(b));
+    }
+    serde_json::Value::Object(root)
+}
+
+/// [`GetStatsOnlineIpListResponse`] → protojson：`{"name":…,"ips":{"ip":ts}}`。
+fn online_ip_list_json(resp: &GetStatsOnlineIpListResponse) -> serde_json::Value {
+    let mut root = serde_json::Map::new();
+    if !resp.name.is_empty() {
+        root.insert("name".into(), serde_json::Value::String(resp.name.clone()));
+    }
+    if !resp.ips.is_empty() {
+        root.insert(
+            "ips".into(),
+            serde_json::to_value(&resp.ips).unwrap_or_default(),
+        );
+    }
+    serde_json::Value::Object(root)
+}
+
+/// [`GetUsersStatsResponse`] → protojson（camelCase；traffic 缺省省略）。
+fn users_stats_json(resp: &GetUsersStatsResponse) -> serde_json::Value {
+    let users: Vec<serde_json::Value> = resp
+        .users
+        .iter()
+        .map(|u| {
+            let mut m = serde_json::Map::new();
+            m.insert("email".into(), serde_json::Value::String(u.email.clone()));
+            if !u.ips.is_empty() {
+                m.insert(
+                    "ips".into(),
+                    serde_json::Value::Array(
+                        u.ips.iter()
+                            .map(|e| serde_json::json!({ "ip": e.ip, "lastSeen": e.last_seen }))
+                            .collect(),
+                    ),
+                );
+            }
+            if let Some(t) = &u.traffic {
+                m.insert(
+                    "traffic".into(),
+                    serde_json::json!({ "uplink": t.uplink, "downlink": t.downlink }),
+                );
+            }
+            serde_json::Value::Object(m)
+        })
+        .collect();
+    serde_json::json!({ "users": users })
+}
+
+/// Go `showBalancerInfo`（balancer_info.go:64-82）表格输出（--json 缺省路径）。
+fn show_balancer_info_table(bal: &xray_proto::xray::app::router::command::BalancerMsg) {
+    let mut sb = String::new();
+    if let Some(ov) = &bal.r#override {
+        sb.push_str("  - Selecting Override:\n");
+        sb.push_str(&format!("    1   {}\n", ov.target));
+    }
+    sb.push_str("  - Selects:\n");
+    if let Some(pt) = &bal.principle_target {
+        for t in &pt.tag {
+            sb.push_str(&format!("    1   {t}\n"));
+        }
+    }
+    print!("{sb}");
 }
 
 // ---------------------------------------------------------------------------
@@ -532,9 +630,17 @@ pub async fn execute_balancer_info(args: &BalancerInfoArgs) -> Result<(), CliErr
     let resp = routing
         .get_balancer_info(req)
         .await
-        .map_err(|e| CliError::ApiRequestFailed(format!("failed to get balancer info: {e}")))?;
-
-    print_response(&resp.into_inner(), args.api.json);
+        .map_err(|e| CliError::ApiRequestFailed(format!("failed to get balancer info: {e}")))?
+        .into_inner();
+ 
+    // Go balancer_info.go:56-61：--json 消费 → 纯 JSON；缺省 → 表格。
+    if args.api.json {
+        print_json_value(&balancer_info_json(&resp));
+    } else {
+        show_balancer_info_table(
+            &resp.balancer.unwrap_or_default(),
+        );
+    }
     Ok(())
 }
 
@@ -652,7 +758,8 @@ pub async fn execute_online_ip_list(args: &OnlineIpListArgs) -> Result<(), CliEr
             .get_users_stats(req)
             .await
             .map_err(|e| CliError::ApiRequestFailed(format!("failed to get users stats: {e}")))?;
-        print_response(&resp.into_inner(), args.api.json);
+        // Go stats_online_ip_list.go:63-73：-all 分支恒 showJSONResponse。
+        print_json_value(&users_stats_json(&resp.into_inner()));
     } else {
         let email = args
             .email
@@ -669,7 +776,8 @@ pub async fn execute_online_ip_list(args: &OnlineIpListArgs) -> Result<(), CliEr
             .map_err(|e| {
                 CliError::ApiRequestFailed(format!("failed to get online ip list: {e}"))
             })?;
-        print_response(&resp.into_inner(), args.api.json);
+        // Go stats_online_ip_list.go:76-85：-email 分支恒 showJSONResponse。
+        print_json_value(&online_ip_list_json(&resp.into_inner()));
     }
     Ok(())
 }
@@ -837,5 +945,87 @@ mod tests {
             }),
         };
         assert!(extract_users_from_inbound(&ib).is_empty());
+    }
+
+    // ===== --json 输出形态（Go showJSONResponse / balancer_info.go:56-61）=====
+
+    #[test]
+    fn balancer_info_json_reports_override_and_principle() {
+        use xray_proto::xray::app::router::command::{
+            BalancerMsg, OverrideInfo, PrincipleTargetInfo,
+        };
+        let resp = GetBalancerInfoResponse {
+            balancer: Some(BalancerMsg {
+                r#override: Some(OverrideInfo {
+                    target: "out-direct".into(),
+                }),
+                principle_target: Some(PrincipleTargetInfo {
+                    tag: vec!["out-a".into(), "out-b".into()],
+                }),
+            }),
+        };
+        let v = balancer_info_json(&resp);
+        assert_eq!(
+            v["balancer"]["override"]["target"],
+            serde_json::json!("out-direct")
+        );
+        assert_eq!(
+            v["balancer"]["principleTarget"]["tag"],
+            serde_json::json!(["out-a", "out-b"])
+        );
+    }
+
+    #[test]
+    fn balancer_info_json_omits_empty_balancer() {
+        let v = balancer_info_json(&GetBalancerInfoResponse { balancer: None });
+        assert_eq!(v, serde_json::json!({}));
+    }
+
+    #[test]
+    fn online_ip_list_json_maps_ips_table() {
+        let mut ips = std::collections::HashMap::new();
+        ips.insert("1.2.3.4".to_string(), 1700000000i64);
+        let resp = GetStatsOnlineIpListResponse {
+            name: "user>>>a@x>>>online".into(),
+            ips,
+        };
+        let v = online_ip_list_json(&resp);
+        assert_eq!(v["name"], serde_json::json!("user>>>a@x>>>online"));
+        assert_eq!(v["ips"]["1.2.3.4"], serde_json::json!(1700000000i64));
+    }
+
+    #[test]
+    fn users_stats_json_emits_camel_case_entries() {
+        let resp = GetUsersStatsResponse {
+            users: vec![xray_proto::xray::app::stats::command::UserStat {
+                email: "u@x".into(),
+                ips: vec![xray_proto::xray::app::stats::command::OnlineIpEntry {
+                    ip: "::1".into(),
+                    last_seen: 42,
+                }],
+                traffic: Some(xray_proto::xray::app::stats::command::TrafficUserStat {
+                    uplink: 1,
+                    downlink: 2,
+                }),
+            }],
+        };
+        let v = users_stats_json(&resp);
+        assert_eq!(v["users"][0]["email"], serde_json::json!("u@x"));
+        assert_eq!(v["users"][0]["ips"][0]["lastSeen"], serde_json::json!(42));
+        assert_eq!(v["users"][0]["traffic"]["uplink"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn users_stats_json_omits_absent_traffic() {
+        let resp = GetUsersStatsResponse {
+            users: vec![xray_proto::xray::app::stats::command::UserStat {
+                email: "u@x".into(),
+                ips: vec![],
+                traffic: None,
+            }],
+        };
+        let v = users_stats_json(&resp);
+        assert!(v["users"][0].get("traffic").is_none());
+        assert!(v["users"][0].get("ips").is_none());
     }
 }

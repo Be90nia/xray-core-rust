@@ -12,7 +12,7 @@
 //! - `xray run` — 运行（默认）
 //! - `xray version` — 版本信息
 //! - `xray uuid` — 生成 UUID
-//! - `xray api <sub>` — API 命令（22 个子命令）
+//! - `xray api <sub>` — API 命令（23 个子命令，Go main/commands/all/api/api.go）
 //! - `xray tls <sub>` — TLS 工具
 //! - `xray convert <sub>` — 格式转换
 //! - `xray x25519`（别名 curve25519）/ `wg` / `mldsa65` / `mlkem768` / `vlessenc` — 密钥生成
@@ -60,11 +60,11 @@ enum ApiCommand {
     RemoveOutbound(RemoveOutboundArgs),
 
     /// Add a routing rule.
-    #[command(alias = "adr")]
+    #[command(alias = "adrules")]
     AddRule(AddRuleArgs),
 
     /// Remove a routing rule.
-    #[command(alias = "rmr")]
+    #[command(alias = "rmrules")]
     RemoveRule(RemoveRuleArgs),
 
     /// List all inbounds.
@@ -76,22 +76,22 @@ enum ApiCommand {
     ListOutbounds(ListOutboundsArgs),
 
     /// List all routing rules.
-    #[command(alias = "lsr")]
+    #[command(alias = "lsrules")]
     ListRules(ListRulesArgs),
 
     /// Get stats by name.
     Stats(StatsArgs),
 
     /// Query stats by pattern.
-    #[command(alias = "qs")]
+    #[command(alias = "statsquery")]
     StatsQuery(StatsQueryArgs),
 
     /// Get system stats.
-    #[command(alias = "ss")]
+    #[command(alias = "statssys")]
     SysStats(SysStatsArgs),
 
     /// Restart logger.
-    #[command(alias = "rl")]
+    #[command(alias = "restartlogger")]
     RestartLogger(RestartLoggerArgs),
 
     /// Add a user to an inbound.
@@ -103,11 +103,11 @@ enum ApiCommand {
     RemoveUser(RemoveUserArgs),
 
     /// Get inbound user info.
-    #[command(alias = "iu")]
+    #[command(alias = "inbounduser")]
     InboundUser(InboundUserArgs),
 
     /// Get inbound user count.
-    #[command(alias = "iuc")]
+    #[command(alias = "inboundusercount")]
     InboundUserCount(InboundUserCountArgs),
 
     /// Get balancer info.
@@ -123,15 +123,15 @@ enum ApiCommand {
     SourceIpBlock(SourceIpBlockArgs),
 
     /// Get online stats for a user.
-    #[command(alias = "so")]
+    #[command(alias = "statsonline")]
     StatsOnline(StatsOnlineArgs),
 
     /// Get online IP list.
-    #[command(alias = "oil")]
+    #[command(alias = "statsonlineiplist")]
     OnlineIpList(OnlineIpListArgs),
 
     /// Get all online users.
-    #[command(alias = "ou")]
+    #[command(alias = "statsgetallonlineusers")]
     OnlineUsers(OnlineUsersArgs),
 }
 

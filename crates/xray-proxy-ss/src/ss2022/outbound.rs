@@ -9,9 +9,7 @@ use std::io;
 use tokio::net::TcpStream;
 use xray_common::net::address::Address;
 
-use crate::error::Result;
-use crate::ss2022::client::Client2022;
-use crate::stream::SSStream;
+use crate::{error::Result, ss2022::client::Client2022, stream::SSStream};
 
 /// SS-2022 出站适配器：持有 [`Client2022`]（负责 TCP 拨号 + SS-2022 加密）。
 ///
@@ -43,20 +41,13 @@ impl Ss2022Outbound {
     /// - TCP 连接失败
     /// - AEAD 初始化/加密失败
     /// - 地址编码失败
-    pub async fn process(
-        &self,
-        addr: &Address,
-        port: u16,
-    ) -> io::Result<SSStream<TcpStream>> {
+    pub async fn process(&self, addr: &Address, port: u16) -> io::Result<SSStream<TcpStream>> {
         let addr_str = match addr {
             Address::IPv4(v4) => v4.to_string(),
             Address::IPv6(v6) => v6.to_string(),
             Address::Domain(d) => d.clone(),
         };
-        self.client
-            .dial_target(&addr_str, port)
-            .await
-            .map_err(|e| io::Error::other(e.to_string()))
+        self.client.dial_target(&addr_str, port).await.map_err(|e| io::Error::other(e.to_string()))
     }
 
     /// 返回内部 [`Client2022`] 引用。
@@ -68,9 +59,7 @@ impl Ss2022Outbound {
 
 impl std::fmt::Debug for Ss2022Outbound {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Ss2022Outbound")
-            .field("client", &self.client)
-            .finish()
+        f.debug_struct("Ss2022Outbound").field("client", &self.client).finish()
     }
 }
 
@@ -87,10 +76,7 @@ pub struct UdpOverTcpConfig {
 
 impl Default for UdpOverTcpConfig {
     fn default() -> Self {
-        Self {
-            enabled: false,
-            version: 0,
-        }
+        Self { enabled: false, version: 0 }
     }
 }
 

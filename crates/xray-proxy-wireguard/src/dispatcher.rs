@@ -16,6 +16,7 @@
 //!
 //! # ponytail: 轮询式桥接，延迟 ~5ms 量级。waker 驱动优化留待吞吐量瓶颈时。
 
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -475,6 +476,8 @@ pub fn make_wireguard_dial_fn(
     let dns_clone = dns.clone();
     // interface 地址族（Go parseEndpoints 的 hasIPv4/hasIPv6）——约束 DNS 解析族
     let (has_v4, has_v6) = endpoint_families(&config);
+    // 域名解析 TTL 缓存（Go Handler.cache，c7e569b0；endpoint 与目标域名共享）。
+    let dns_cache = Arc::new(TtlDnsCache::default());
 
     Arc::new(move |dest: &Destination| {
         let dest = dest.clone();
@@ -482,6 +485,7 @@ pub fn make_wireguard_dial_fn(
         let dns = dns_clone.clone();
         let system_dialer = system_dialer.clone();
         let handler_cell = Arc::clone(&handler);
+        let dns_cache = Arc::clone(&dns_cache);
 
         Box::pin(async move {
             // lazy init WireguardOutboundHandler（含 driver task）
@@ -492,6 +496,7 @@ pub fn make_wireguard_dial_fn(
                         &config,
                         dns.as_ref(),
                         system_dialer.as_ref().cloned(),
+                        Some(Arc::clone(&dns_cache)),
                     )
                     .await
                 })
@@ -500,12 +505,22 @@ pub fn make_wireguard_dial_fn(
 
             let netstack = handler.netstack();
 
-            // 域名目标 → 隧道内 DNS（Go client.go:351-360 resolveRemote →
-            // tnet.LookupHost：查询经 WG 隧道加密发出，解析出口 = WG server 侧，
-            // 不泄漏本机 :53；bd p06j）
+            // 域名目标 → 缓存（Go Handler.cache TTL 内随机取一）→ 未命中按
+            // remoteDNS 模式解析（["local"] = 本地 app DNS；其余 = 隧道内 DNS，
+            // 服务器列表来自 remoteDNS 或默认四址）→ 写回缓存（Go resolveDomain
+            // client.go:388-446，c7e569b0）。
             let dest = match dest.address() {
                 Address::Domain(domain) => {
-                    let ip = resolve_domain_in_tunnel(netstack, domain, has_v4, has_v6).await?;
+                    let ip = resolve_dest_ip_cached(
+                        domain,
+                        netstack,
+                        has_v4,
+                        has_v6,
+                        &config,
+                        dns.as_ref(),
+                        &dns_cache,
+                    )
+                    .await?;
                     let addr = match ip {
                         std::net::IpAddr::V4(v4) => Address::IPv4(v4),
                         std::net::IpAddr::V6(v6) => Address::IPv6(v6),
@@ -514,7 +529,6 @@ pub fn make_wireguard_dial_fn(
                 }
                 _ => dest,
             };
-
 
             match dest.network() {
                 Network::TCP => {
@@ -579,6 +593,42 @@ pub fn make_wireguard_dial_fn(
     })
 }
 
+/// 目标域名解析（缓存包装）。Go `resolveRemote`/`resolveDomain`（client.go:379-446，
+/// c7e569b0）：TTL 内命中随机取一；未命中按 remoteDNS 模式解析后写回。
+async fn resolve_dest_ip_cached(
+    domain: &str,
+    netstack: &Arc<AsyncMutex<WgNetStack>>,
+    has_v4: bool,
+    has_v6: bool,
+    config: &DeviceConfig,
+    dns: Option<&Arc<DnsService>>,
+    cache: &TtlDnsCache,
+) -> Result<std::net::IpAddr, String> {
+    if let Some(ip) = cache.get(domain) {
+        return Ok(ip);
+    }
+    let (ips, ttl) = match config.resolve_dns() {
+        Ok(crate::config::DnsConfig::Local) => {
+            // Go resolveRemote 的 local 分支：走 app DNS（h.dns.LookupIP），
+            // 不经隧道。app DNS 不暴露记录 TTL → 缺省 300（Go netstack 默认）。
+            let d = dns.ok_or_else(|| {
+                "wireguard outbound: remoteDNS=local requires dns service".to_string()
+            })?;
+            let ip = resolve_dest_domain(domain, config.domain_strategy, has_v4, has_v6, d).await?;
+            (vec![ip], DEFAULT_DNS_TTL_SECS)
+        }
+        Ok(crate::config::DnsConfig::Default) => {
+            resolve_domain_in_tunnel(netstack, domain, has_v4, has_v6, &TUNNEL_DNS_SERVERS).await?
+        }
+        Ok(crate::config::DnsConfig::Servers(servers)) => {
+            resolve_domain_in_tunnel(netstack, domain, has_v4, has_v6, &servers).await?
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    cache.put(domain, ips, ttl);
+    cache.get(domain).ok_or_else(|| "wireguard outbound: dns cache write failed".to_string())
+}
+
 /// 中继类型（统一 spawn 模板用）。
 enum UdpOrTcpRelay {
     Tcp(TcpRelay),
@@ -641,8 +691,8 @@ pub(crate) fn endpoint_families(config: &DeviceConfig) -> (bool, bool) {
     (has_v4, has_v6)
 }
 
-/// Go client.go:88-97 CreateNetTUN 的硬编码 dnsServers——隧道内 DNS 查询目标
-/// （bd p06j）。
+/// Go client.go:88-97 CreateNetTUN 的默认 dnsServers（c7e569b0 后为 `remoteDNS`
+/// 未配置时的默认值，client.go:113-115）——隧道内 DNS 查询目标（bd p06j）。
 const TUNNEL_DNS_SERVERS: [std::net::IpAddr; 4] = [
     std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)),
     std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 0, 0, 1)),
@@ -650,22 +700,70 @@ const TUNNEL_DNS_SERVERS: [std::net::IpAddr; 4] = [
     std::net::IpAddr::V6(std::net::Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1001)),
 ];
 
+/// DNS 记录缺省 TTL（Go netstack.go `ttl := uint32(300)`，c7e569b0）。
+pub(crate) const DEFAULT_DNS_TTL_SECS: u32 = 300;
+
+/// 域名解析 TTL 缓存（Go `Handler.cache` + `resolveDomain`，client.go:53-56,
+/// 388-446，c7e569b0）。键 = 域名，值 =（策略过滤后的 IP 列表，过期时刻）。
+///
+/// `ponytail`: 无清理循环——条目惰性删除（get 过期即删），生命周期 = dial_fn
+/// （单出站一个），泄漏上界 = 域名数；Go 侧同为 TODO cache cleanup loop。
+#[derive(Default)]
+pub(crate) struct TtlDnsCache {
+    map: parking_lot::Mutex<HashMap<String, TtlCacheEntry>>,
+}
+
+struct TtlCacheEntry {
+    ips: Vec<std::net::IpAddr>,
+    expires_at: std::time::Instant,
+}
+
+impl TtlDnsCache {
+    /// 命中未过期条目 → 随机取一 IP（Go `dice.Roll(len(entry.got))`）；过期条目
+    /// 删除并返回 None（Go client.go:399-406）。
+    pub(crate) fn get(&self, host: &str) -> Option<std::net::IpAddr> {
+        use rand::Rng;
+        let mut map = self.map.lock();
+        if let Some(e) = map.get(host) {
+            if std::time::Instant::now() < e.expires_at {
+                let idx = rand::thread_rng().gen_range(0..e.ips.len());
+                return Some(e.ips[idx]);
+            }
+            map.remove(host);
+        }
+        None
+    }
+
+    /// 写回缓存（`ttl_secs` 秒有效）；空列表不缓存（Go 只在 len(got)>0 后写）。
+    pub(crate) fn put(&self, host: &str, ips: Vec<std::net::IpAddr>, ttl_secs: u32) {
+        if ips.is_empty() {
+            return;
+        }
+        self.map.lock().insert(
+            host.to_string(),
+            TtlCacheEntry {
+                ips,
+                expires_at: std::time::Instant::now() + Duration::from_secs(u64::from(ttl_secs)),
+            },
+        );
+    }
+}
+
 /// 隧道内 DNS 单 server 查询超时。
 const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 隧道内域名解析（Go client.go:351-360 `resolveRemote` → `tnet.LookupHost`）。
-///
-/// 在 smoltcp 栈内开临时 UDP socket，向 Go 同款硬编码 dnsServers 发 DNS 查询：
-/// 包经 WG 隧道加密发出，解析出口 = WG server 侧，本机 :53 零泄漏（bd p06j）。
 /// 接口地址族约束查询类型（v4-only 栈只发 A）；双栈 A/AAAA 各查合并后按族过滤。
-/// 取舍：不做缓存、不走本地 DnsService（Go resolveRemote 同样绕过 app/dns）、
-/// TC 截断响应不重试 TCP（公共 DNS A/AAAA 答案极少超 1400 MTU）。
+/// 返回（可用 IP 列表，记录最小 TTL 秒）——c7e569b0 的 TTL 遵循。
+/// 取舍：不走本地 DnsService（Go resolveRemote 同样绕过 app/dns）、TC 截断
+/// 响应不重试 TCP（公共 DNS A/AAAA 答案极少超 1400 MTU）。
 pub(crate) async fn resolve_domain_in_tunnel(
     netstack: &Arc<AsyncMutex<WgNetStack>>,
     domain: &str,
     has_v4: bool,
     has_v6: bool,
-) -> Result<std::net::IpAddr, String> {
+    servers: &[std::net::IpAddr],
+) -> Result<(Vec<std::net::IpAddr>, u32), String> {
     use rand::Rng;
     if !has_v4 && !has_v6 {
         return Err("wireguard outbound: interface has no address family for tunnel DNS".into());
@@ -686,10 +784,11 @@ pub(crate) async fn resolve_domain_in_tunnel(
 
     let mut last_err = String::from("wireguard tunnel dns: no query attempted");
     let mut found: Vec<std::net::IpAddr> = Vec::new();
+    let mut best_ttl = DEFAULT_DNS_TTL_SECS;
     'qtypes: for want_a in qtypes {
         let req_id: u16 = rand::thread_rng().random();
         let query = dns_build_query(domain, want_a, req_id)?;
-        for server in TUNNEL_DNS_SERVERS.iter().filter(|ip| ip.is_ipv4() == want_a) {
+        for server in servers.iter().filter(|ip| ip.is_ipv4() == want_a) {
             let target = smoltcp::wire::IpEndpoint::new(
                 match server {
                     std::net::IpAddr::V4(v4) => {
@@ -723,8 +822,9 @@ pub(crate) async fn resolve_domain_in_tunnel(
                 };
                 if let Some((data, _from)) = received {
                     match dns_parse_ips(&data, req_id) {
-                        Ok(ips) if !ips.is_empty() => {
+                        Ok((ips, ttl)) if !ips.is_empty() => {
                             found = ips;
+                            best_ttl = ttl;
                             break 'qtypes;
                         }
                         Ok(_) => {} // rcode 错误 / 截断空答——换下一 server
@@ -748,8 +848,7 @@ pub(crate) async fn resolve_domain_in_tunnel(
     if usable.is_empty() {
         return Err(last_err);
     }
-    let idx = rand::thread_rng().gen_range(0..usable.len());
-    Ok(usable[idx])
+    Ok((usable, best_ttl))
 }
 
 /// 构造 DNS 查询（RFC 1035）：单 question，`want_a` 选 A / AAAA，RD=1。
@@ -775,9 +874,10 @@ fn dns_build_query(name: &str, want_a: bool, req_id: u16) -> Result<Vec<u8>, Str
     Ok(buf)
 }
 
-/// 解析 DNS 响应：提取全部 A/AAAA 记录。`req_id` 不匹配报错；rcode!=0 或
-/// 无答案返回空（调用方换 server）。
-fn dns_parse_ips(payload: &[u8], req_id: u16) -> Result<Vec<std::net::IpAddr>, String> {
+/// 解析 DNS 响应：提取全部 A/AAAA 记录 + 记录最小 TTL（Go netstack.go
+/// LookupContextHost：`ttl := uint32(300)` 起步，逐记录 `min(ttl, h.TTL)`，
+/// c7e569b0）。`req_id` 不匹配报错；rcode!=0 或无答案返回空（调用方换 server）。
+fn dns_parse_ips(payload: &[u8], req_id: u16) -> Result<(Vec<std::net::IpAddr>, u32), String> {
     if payload.len() < 12 {
         return Err("wireguard tunnel dns: short response".into());
     }
@@ -785,7 +885,7 @@ fn dns_parse_ips(payload: &[u8], req_id: u16) -> Result<Vec<std::net::IpAddr>, S
         return Err("wireguard tunnel dns: req id mismatch".into());
     }
     if payload[3] & 0x0F != 0 {
-        return Ok(Vec::new()); // 非 NOERROR
+        return Ok((Vec::new(), DEFAULT_DNS_TTL_SECS)); // 非 NOERROR
     }
     let qdcount = u16::from_be_bytes([payload[4], payload[5]]);
     let ancount = u16::from_be_bytes([payload[6], payload[7]]);
@@ -795,34 +895,45 @@ fn dns_parse_ips(payload: &[u8], req_id: u16) -> Result<Vec<std::net::IpAddr>, S
         pos += 4; // qtype + qclass
     }
     let mut ips = Vec::new();
+    let mut ttl = DEFAULT_DNS_TTL_SECS;
     for _ in 0..ancount {
         dns_skip_name(payload, &mut pos)?;
         if pos + 10 > payload.len() {
             break;
         }
         let rtype = u16::from_be_bytes([payload[pos], payload[pos + 1]]);
+        let record_ttl = u32::from_be_bytes([
+            payload[pos + 2],
+            payload[pos + 3],
+            payload[pos + 4],
+            payload[pos + 5],
+        ]);
         let rdlength = usize::from(u16::from_be_bytes([payload[pos + 8], payload[pos + 9]]));
         pos += 10;
         if pos + rdlength > payload.len() {
             break;
         }
         match (rtype, rdlength) {
-            (1, 4) => ips.push(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-                payload[pos],
-                payload[pos + 1],
-                payload[pos + 2],
-                payload[pos + 3],
-            ))),
+            (1, 4) => {
+                ips.push(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    payload[pos],
+                    payload[pos + 1],
+                    payload[pos + 2],
+                    payload[pos + 3],
+                )));
+                ttl = ttl.min(record_ttl);
+            }
             (28, 16) => {
                 let mut o = [0u8; 16];
                 o.copy_from_slice(&payload[pos..pos + 16]);
                 ips.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(o)));
+                ttl = ttl.min(record_ttl);
             }
             _ => {}
         }
         pos += rdlength;
     }
-    Ok(ips)
+    Ok((ips, ttl))
 }
 
 /// 跳过 name 字段（标签序列或 `0xC0` 压缩指针，RFC 1035 §4.1.4）。
@@ -951,7 +1062,14 @@ mod tests {
         let netstack = Arc::new(AsyncMutex::new(WgNetStack::new(&[udp_ip_cidr()], 1420)));
         let ns_for_resolver = Arc::clone(&netstack);
         let resolver = tokio::spawn(async move {
-            resolve_domain_in_tunnel(&ns_for_resolver, "example.invalid", true, false).await
+            resolve_domain_in_tunnel(
+                &ns_for_resolver,
+                "example.invalid",
+                true,
+                false,
+                &TUNNEL_DNS_SERVERS,
+            )
+            .await
         });
 
         // 驱动栈：捕获查询（dst 1.1.1.1:53）→ 构造响应 → ingest 回栈
@@ -991,14 +1109,30 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
-        let ip = resolver
+        let (ips, ttl) = resolver
             .await
             .expect("resolver task")
             .expect("tunnel dns resolves");
         assert_eq!(
-            ip,
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34))
+            ips,
+            vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34))]
         );
+        assert_eq!(ttl, DEFAULT_DNS_TTL_SECS);
+    }
+
+    #[test]
+    fn ttl_dns_cache_hit_and_expiry() {
+        // Go Handler.cache（c7e569b0）：TTL 内随机取一，过期即删重查。
+        let cache = TtlDnsCache::default();
+        let a = std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4));
+        let b = std::net::IpAddr::V4(std::net::Ipv4Addr::new(5, 6, 7, 8));
+        cache.put("h.test", vec![a, b], 60);
+        let hit = cache.get("h.test").expect("must hit within ttl");
+        assert!(hit == a || hit == b);
+        assert!(cache.get("missing.test").is_none());
+        // ttl=0 → 立即过期
+        cache.put("h.test", vec![a], 0);
+        assert!(cache.get("h.test").is_none(), "过期条目必须被删除");
     }
 
     /// 复制查询报文改头为 NOERROR 响应，追加一条指针压缩的 A answer。

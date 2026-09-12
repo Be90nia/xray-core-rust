@@ -45,7 +45,7 @@ impl WireguardOutboundHandler {
         config: &DeviceConfig,
         dns: Option<&Arc<xray_app_dns::DnsService>>,
     ) -> Result<Self> {
-        Self::new_with_dialer(tag, config, dns, None).await
+        Self::new_with_dialer(tag, config, dns, None, None).await
     }
 
     /// 从 DeviceConfig 构造出站 Handler，WG 自身 UDP 可经 system dialer 出站。
@@ -65,6 +65,8 @@ impl WireguardOutboundHandler {
         config: &DeviceConfig,
         dns: Option<&Arc<xray_app_dns::DnsService>>,
         system_dialer: Option<xray_app_dispatcher::default::DialFn>,
+        // c7e569b0：endpoint 域名解析 TTL 缓存（Go Handler.cache）。None = 不缓存。
+        dns_cache: Option<Arc<crate::dispatcher::TtlDnsCache>>,
     ) -> Result<Self> {
         let tag = tag.into();
         if config.peers.is_empty() {
@@ -76,9 +78,19 @@ impl WireguardOutboundHandler {
         let peer: SharedPeer = shared_peer(config, peer_cfg, 0)?;
 
         // 远端 endpoint（IP:port；域名经 DNS 解析——Go client.go:298-329）
-        let remote_addr = resolve_endpoint_addr(&peer_cfg.endpoint, config, dns).await?;
+        let remote_addr =
+            resolve_endpoint_addr(&peer_cfg.endpoint, config, dns, dns_cache.as_deref()).await?;
 
-        // WG UDP 传输：system dialer（代理链，Go netBindClient.connectTo）或直连 socket
+        // WG UDP 传输：system dialer（代理链，Go netBindClient.connectTo）或直连 socket。
+        // Go 7d214f8b：Process 入口 `dialer.SetOutboundGateway(ctx, ob)` → sendThrough
+        // （ob.Gateway）对 WG 自身 UDP 生效。Rust 等价：本 handler 的惰性初始化运行
+        // 在外层 wrap_dial_with_send_through 的 DIAL_SRC scope 内，此处读取快照并
+        // 应用到 WG 传输 socket（代理链分支同 Go dialer.go:233——dialer_proxy 存在
+        // 时不消费源地址，链式 dispatch 天然忽略 DIAL_SRC）。
+        let src_ip = xray_transport::system_dialer::DIAL_SRC
+            .try_with(|v| *v)
+            .ok()
+            .flatten();
         let transport = match &system_dialer {
             Some(dialer) => {
                 let addr = match remote_addr.ip() {
@@ -90,12 +102,34 @@ impl WireguardOutboundHandler {
                     xray_common::net::port::Port::new(remote_addr.port()),
                     xray_common::net::network::Network::UDP,
                 );
-                WgTransport::Dialed(Arc::new(DialedUdp::new(Arc::clone(dialer), dest)))
+                // DialedUdp 实际拨号发生在 driver task 上下文（scope 外）——把
+                // sendThrough 源地址重新包进 DIAL_SRC scope（dial_system 绑定源 IP）。
+                let dialer: xray_app_dispatcher::default::DialFn = match src_ip {
+                    Some(ip) => {
+                        let inner = Arc::clone(dialer);
+                        Arc::new(move |dest: &Destination| {
+                            let inner = Arc::clone(&inner);
+                            let dest = dest.clone();
+                            Box::pin(async move {
+                                xray_transport::system_dialer::DIAL_SRC
+                                    .scope(Some(ip), inner(&dest))
+                                    .await
+                            })
+                        })
+                    }
+                    None => Arc::clone(dialer),
+                };
+                WgTransport::Dialed(Arc::new(DialedUdp::new(dialer, dest)))
             }
             None => {
-                // 绑定本地 UDP（与远端同族）
-                let bind_addr = if remote_addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
-                WgTransport::Direct(bind_udp_socket(bind_addr).await?)
+                // 绑定本地 UDP：sendThrough 源地址（与远端同族时）优先，否则通配。
+                let bind_addr = match src_ip {
+                    Some(ip) if ip.is_ipv4() && remote_addr.is_ipv4() => format!("{ip}:0"),
+                    Some(ip) if ip.is_ipv6() && !remote_addr.is_ipv4() => format!("[{ip}]:0"),
+                    _ if remote_addr.is_ipv4() => "0.0.0.0:0".to_string(),
+                    _ => "[::]:0".to_string(),
+                };
+                WgTransport::Direct(bind_udp_socket(&bind_addr).await?)
             }
         };
 
@@ -126,11 +160,13 @@ impl WireguardOutboundHandler {
 /// 解析 peer endpoint（`host:port`）。
 ///
 /// IP 直连；域名经 `dns` + WireGuard `domainStrategy` 解析（Go `client.go:298-329`
-/// 的 createIPCRequest endpoint 分支，dice.Roll 随机选 IP）。
+/// 的 createIPCRequest endpoint 分支 / `resolveLocal`，dice.Roll 随机选 IP），
+/// 结果进 TTL 缓存（Go `Handler.cache`，c7e569b0；缓存键 = endpoint host）。
 async fn resolve_endpoint_addr(
     endpoint: &str,
     config: &DeviceConfig,
     dns: Option<&Arc<xray_app_dns::DnsService>>,
+    dns_cache: Option<&crate::dispatcher::TtlDnsCache>,
 ) -> Result<SocketAddr> {
     if let Ok(addr) = crate::peer::parse_endpoint_addr(endpoint) {
         return Ok(addr);
@@ -147,6 +183,11 @@ async fn resolve_endpoint_addr(
             "peer endpoint is domain but no DNS service: {endpoint}"
         )));
     };
+    if let Some(cache) = dns_cache {
+        if let Some(ip) = cache.get(host) {
+            return Ok(SocketAddr::new(ip, port));
+        }
+    }
     let (has_v4, has_v6) = crate::dispatcher::endpoint_families(config);
     let ip = crate::dispatcher::resolve_dest_domain(
         host,
@@ -157,6 +198,10 @@ async fn resolve_endpoint_addr(
     )
     .await
     .map_err(|e| WgError::InvalidEndpoint(format!("peer endpoint DNS resolve: {e}")))?;
+    // 本地 app DNS 不暴露记录 TTL → 缺省 300（Go netstack 默认，c7e569b0）。
+    if let Some(cache) = dns_cache {
+        cache.put(host, vec![ip], crate::dispatcher::DEFAULT_DNS_TTL_SECS);
+    }
     Ok(SocketAddr::new(ip, port))
 }
 
