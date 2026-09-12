@@ -25,6 +25,7 @@ pub use imp::{bridge_with, plan, splice_copy};
 
 mod imp {
     use std::io;
+    use std::net::SocketAddr;
     use std::os::unix::io::AsRawFd;
     use tokio::net::TcpStream;
 
@@ -96,7 +97,7 @@ mod imp {
                     n if n < 0 => {
                         let err = io::Error::last_os_error();
                         if is_eagain(&err) {
-                            from.readable().await?;
+                            from.readable().await?; let _ = from.try_read(&mut []);
                         } else {
                             return Err(err);
                         }
@@ -110,14 +111,14 @@ mod imp {
                     n if n < 0 => {
                         let err = io::Error::last_os_error();
                         if is_eagain(&err) {
-                            to.writable().await?;
+                            to.writable().await?; let _ = to.try_write(&mut []);
                         } else {
                             return Err(err);
                         }
                     }
                     // pending>0 且 pipe 读端非阻塞：0 不可达。万一命中（内核态
                     // 异常），大声报错终止而非静默原地空转。
-                    0 => {
+                    _ => {
                         return Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             "splice: pipe underflow (pending>0 but drain returned 0)",
@@ -159,6 +160,8 @@ mod imp {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod tests {
+    use std::net::SocketAddr;
+    use std::io;
     use super::imp::{bridge_with, plan, splice_copy};
     use crate::connection::{Connection, TcpConnection};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -178,24 +181,37 @@ mod tests {
     /// 泵运行在 dup 出的独立 handle 上，原 socket 留给 IO 半部。
     #[tokio::test]
     async fn splice_copy_moves_payload_kernel_side() {
-        let (client, server) = loopback_pair().await;
-        let client_for_pump = crate::connection::dup_tcp_stream(&client).unwrap();
+        // 双腿拓扑：泵桥接两条独立回环连接的服务端腿（sa_RX -> sb_TX）。
+        // 单对 socket 自泵 = 输出回灌输入（TX 经内核回到本对 RX），拓扑上
+        // 必然自循环——splice 泵的最小合法通路必须两条独立腿。
+        let (a, sa) = loopback_pair().await;
+        let (b, sb) = loopback_pair().await;
+        let sa_for_pump = crate::connection::dup_tcp_stream(&sa).unwrap();
+        let sb_for_pump = crate::connection::dup_tcp_stream(&sb).unwrap();
         // 256KiB > PIPE_CAP(64KiB)，强制多轮 fill/drain
         let payload: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+        let expect = payload.clone();
 
         let pump = tokio::spawn(async move {
-            splice_copy(&client_for_pump, &server).await.unwrap();
+            splice_copy(&sa_for_pump, &sb_for_pump).await.unwrap()
         });
 
-        let mut echo = vec![0u8; payload.len()];
+        // A 端独立任务写满并关写端（EOF 驱动泵退出）；B 端 read_exact 逐字节校验。
+        let writer = tokio::spawn(async move {
+            let (_ar, mut aw) = a.into_split();
+            aw.write_all(&payload).await.unwrap();
+            aw.shutdown().await.unwrap();
+        });
+
+        let mut got = vec![0u8; expect.len()];
         {
-            let (mut r, mut w) = client.into_split();
-            w.write_all(&payload).await.unwrap();
-            r.read_exact(&mut echo).await.unwrap();
-            w.shutdown().await.unwrap();
+            let (mut br, _bw) = tokio::io::split(b);
+            br.read_exact(&mut got).await.unwrap();
         }
-        pump.await.unwrap();
-        assert_eq!(echo, payload);
+        writer.await.unwrap();
+        let moved = pump.await.unwrap();
+        assert_eq!(got, expect, "内容逐字节一致");
+        assert_eq!(moved, expect.len() as u64, "泵计数应等于载荷");
     }
 
     /// 双向桥 + 闸门全绿：两端各写各读，内容互达。
@@ -204,17 +220,17 @@ mod tests {
         let (c1, s1) = loopback_pair().await;
         let (c2, s2) = loopback_pair().await;
 
-        let bridge = tokio::spawn(async move { bridge_with(c1, c2).await.unwrap() });
+        let bridge = tokio::spawn(async move { bridge_with(s1, s2).await.unwrap() });
 
         let left = tokio::spawn(async move {
-            let (mut r, mut w) = tokio::io::split(s1);
+            let (mut r, mut w) = tokio::io::split(c1);
             w.write_all(b"ping-from-left").await.unwrap();
             let mut buf = [0u8; 14];
             r.read_exact(&mut buf).await.unwrap();
             assert_eq!(&buf, b"pong-from-righ");
         });
         let right = tokio::spawn(async move {
-            let (mut r, mut w) = tokio::io::split(s2);
+            let (mut r, mut w) = tokio::io::split(c2);
             let mut buf = [0u8; 14];
             r.read_exact(&mut buf).await.unwrap();
             assert_eq!(&buf, b"ping-from-left");
@@ -277,6 +293,12 @@ mod tests {
             }
         }
         impl Connection for TlsLookalike {
+            fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+                self.0.peer_addr().map(Some)
+            }
+            fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+                self.0.local_addr().map(Some)
+            }
             // raw_tcp_clone 穿透（TLS 包装层的真实形态），但 is_raw_tcp 保持
             // 默认 false —— splice 准入必须拒绝。
             fn raw_tcp_clone(&self) -> Option<TcpStream> {

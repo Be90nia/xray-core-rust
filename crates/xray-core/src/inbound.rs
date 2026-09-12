@@ -2616,6 +2616,10 @@ async fn spawn_unix_inbound(
             "socks" => {
                 let config = Arc::new(parse_socks_server_config(&ib.entry.data)?);
                 let handshake_timeout = Some(handshake_timeout_for(&policy, config.user_level));
+                let udp_idle = policy
+                    .as_ref()
+                    .map(|pm| pm.policy_for_level(config.user_level).timeout.connection_idle)
+                    .unwrap_or(xray_features::policy::TimeoutPolicy::default().connection_idle);
                 Box::pin(serve_unix_listener(listener, {
                     let handler = Arc::clone(&handler);
                     Arc::new(move |conn| {
@@ -2630,6 +2634,7 @@ async fn spawn_unix_inbound(
                                 &config,
                                 &handler,
                                 handshake_timeout,
+                                udp_idle,
                             )
                             .await
                             {
@@ -2688,6 +2693,7 @@ async fn spawn_unix_inbound(
                 // security 已 gate 为 none → 与裸 TCP 分支同为 drain 语义。
                 let is_drain = !settings.is_tls();
                 tracing::info!(tag = %ib.tag, "vmess (uds) inbound listening");
+                let hs_timeout = handshake_timeout_for(&policy, 0);
                 Box::pin(serve_unix_listener(listener, {
                     let handler = Arc::clone(&handler);
                     Arc::new(move |conn| {
@@ -2699,6 +2705,7 @@ async fn spawn_unix_inbound(
                                 transport_conn_addrs(conn.as_ref(), unspecified);
                             if let Err(e) = xray_proxy_vmess::handle_vmess_connection(
                                 conn, &handler, &validator, &history, is_drain,
+                                hs_timeout,
                             )
                             .await
                             {
@@ -2725,6 +2732,7 @@ async fn spawn_unix_inbound(
                     }
                 }
                 tracing::info!(tag = %ib.tag, "trojan (uds) inbound listening");
+                let hs_timeout = handshake_timeout_for(&policy, 0);
                 Box::pin(serve_unix_listener(listener, {
                     let handler = Arc::clone(&handler);
                     Arc::new(move |conn| {
@@ -2737,6 +2745,7 @@ async fn spawn_unix_inbound(
                             xray_proxy_trojan::serve_trojan_conn(
                                 conn, validator, handler, fallbacks, peer, local,
                                 String::new(), String::new(),
+                                hs_timeout,
                             )
                             .await;
                         });
@@ -2745,7 +2754,7 @@ async fn spawn_unix_inbound(
             }
             "shadowsocks" => {
                 let inbound = match parse_ss_inbound_config(&ib.entry.data)? {
-                    SsInboundMode::Legacy(ss_ib) => Arc::new(ss_ib),
+                    SsInboundMode::Legacy(ss_ib) => ss_ib,
                     _ => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::Unsupported,
@@ -2929,9 +2938,9 @@ fn apply_unix_abstract_padding(dest: &str) -> String {
         const UNIX_PATH_MAX: usize = 108;
         if let Some(stripped) = dest.strip_prefix("@@") {
             let mut buf = [0u8; UNIX_PATH_MAX];
-            let src = stripped.as_bytes();
-            let copy_len = src.len().min(UNIX_PATH_MAX);
-            buf[..copy_len].copy_from_slice(&src[..copy_len]);
+            let src = &dest.as_bytes()[1..]; // Go trojan.go:196 Dest[1:]: 跳过首个 @，保留第二个
+            let copy_len = src.len().min(UNIX_PATH_MAX - 1);
+            buf[1..1 + copy_len].copy_from_slice(&src[..copy_len]);
             // NUL 字节在 Rust String 中合法（`\0` 是 valid char），Linux 拨号时按
             // 首个 NUL 截断 abstract namespace path。
             return String::from_utf8_lossy(&buf).into_owned();

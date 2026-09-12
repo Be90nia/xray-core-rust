@@ -442,6 +442,12 @@ fn log_timestamp_prefix() -> String {
     format!("{y:04}/{mo:02}/{d:02} {h:02}:{m:02}:{s:02}.{micros:06} ")
 }
 
+#[cfg(unix)]
+fn inode_of(md: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    md.ino()
+}
+
  impl LogHandler for FileHandler {
      #[cfg(unix)]
     fn handle(&self, entry: &LogEntry) {

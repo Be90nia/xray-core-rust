@@ -6,7 +6,15 @@
 //! ponytail: Go 用 `net.PacketConn`，Rust 端用 [`PacketConn`] trait 抽象，
 //! 上层（quinn adapter）注入 `tokio::net::UdpSocket` 或 `std::net::UdpSocket` 适配。
 
-use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
@@ -28,7 +36,7 @@ pub const PACKET_QUEUE_SIZE: usize = 1024;
 /// 单个 UDP 数据包（对应 Go `udpPacket`）。
 #[derive(Debug)]
 struct UdpPacket {
-    /// 数据（可能为空，配合 err 使用）。
+    /// 数据（池化 buf，随包 move，由消费端 read_from 归还池；err 包为空）。
     buf: Vec<u8>,
     /// 有效字节数。
     n: usize,
@@ -38,20 +46,47 @@ struct UdpPacket {
     err: Option<std::io::Error>,
 }
 
+/// 池化 buf 复用（对应 Go `udphop` 包级 `sync.Pool`）。
+///
+/// recv_loop 与 read_from 消费端共享：buf 随 [`UdpPacket`] 零拷贝流转，
+/// 消费端拷出数据后归还（对齐 Go `ReadFrom` 的 `pool.Put`）。
+#[derive(Default)]
+struct BufPool {
+    bufs: Mutex<VecDeque<Vec<u8>>>,
+    /// 池空时的新分配次数（供测试断言复用）。
+    allocs: AtomicUsize,
+}
+
+impl BufPool {
+    /// 取 buf（Go `pool.Get`）：优先复用，池空才分配。
+    fn get(&self) -> Vec<u8> {
+        if let Some(buf) = self.bufs.lock().pop_front() {
+            return buf;
+        }
+        self.allocs.fetch_add(1, Ordering::Relaxed);
+        vec![0u8; UDP_BUFFER_SIZE]
+    }
+
+    /// 归还 buf（Go `pool.Put`），超量直接丢弃防无界滞留。
+    fn put(&self, buf: Vec<u8>) {
+        let mut bufs = self.bufs.lock();
+        if bufs.len() < PACKET_QUEUE_SIZE {
+            bufs.push_back(buf);
+        }
+    }
+}
+
 // ponytail: 不引入 async_trait crate。改用 `Box<dyn Future>` + 手写 trait。
 
 /// 接收一个 UDP 包的 future 类型。
-pub type RecvFuture = std::pin::Pin<
-    Box<dyn std::future::Future<Output = std::io::Result<(usize, SocketAddr)>> + Send>,
->;
+pub type RecvFuture =
+    std::pin::Pin<Box<dyn Future<Output = std::io::Result<(usize, SocketAddr)>> + Send>>;
 
 /// 发送一个 UDP 包的 future 类型。
-pub type SendFuture =
-    std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<usize>> + Send>>;
+pub type SendFuture = std::pin::Pin<Box<dyn Future<Output = std::io::Result<usize>> + Send>>;
 
 /// 关闭的 future 类型。
-pub type CloseFuture =
-    std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>;
+pub type CloseFuture = std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>;
 
 /// `net.PacketConn` 的异步抽象（对应 Go `net.PacketConn`）。
 ///
@@ -61,21 +96,17 @@ pub trait PacketConn: Send + Sync {
     fn recv_from<'a>(
         &'a self,
         buf: &'a mut [u8],
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = std::io::Result<(usize, SocketAddr)>> + Send + 'a>,
-    >;
+    ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<(usize, SocketAddr)>> + Send + 'a>>;
 
     /// 发送数据包到指定地址。
     fn send_to<'a>(
         &'a self,
         buf: &'a [u8],
         addr: SocketAddr,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<usize>> + Send + 'a>>;
+    ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<usize>> + Send + 'a>>;
 
     /// 关闭。
-    fn close(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>;
+    fn close(&self) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>;
 
     /// 本地地址。
     fn local_addr(&self) -> std::io::Result<SocketAddr>;
@@ -87,9 +118,9 @@ pub trait PacketConn: Send + Sync {
 pub type ListenUdpFunc = Arc<
     dyn Fn(
             &SocketAddr,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = std::io::Result<Arc<dyn PacketConn>>> + Send>,
-        > + Send
+        )
+            -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<Arc<dyn PacketConn>>> + Send>>
+        + Send
         + Sync,
 >;
 
@@ -103,6 +134,8 @@ pub struct UdpHopPacketConn {
     /// 接收 channel。
     recv_rx: tokio::sync::Mutex<mpsc::Receiver<UdpPacket>>,
     recv_tx: mpsc::Sender<UdpPacket>,
+    /// 池化 buf（recv_loop 与 read_from 共享，对应 Go 包级 sync.Pool）。
+    pool: Arc<BufPool>,
     /// hop 任务句柄（spawn 时由调用方持有；Drop 时 abort）。
     hop_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// recv 任务句柄（每 hop 启动一个）。
@@ -179,6 +212,7 @@ impl UdpHopPacketConn {
         }
 
         let (recv_tx, recv_rx) = mpsc::channel(PACKET_QUEUE_SIZE);
+        let pool = Arc::new(BufPool::default());
 
         let inner = Arc::new(Mutex::new(UdpHopInner {
             addrs,
@@ -195,21 +229,24 @@ impl UdpHopPacketConn {
         // spawn recv loop on initial current_conn
         let recv_tx_clone = recv_tx.clone();
         let conn_for_recv = Arc::clone(&current_conn);
+        let pool_for_recv = Arc::clone(&pool);
         let recv_handle = tokio::spawn(async move {
-            recv_loop(conn_for_recv, recv_tx_clone).await;
+            recv_loop(conn_for_recv, recv_tx_clone, pool_for_recv).await;
         });
 
         // spawn hop loop
         let hop_inner = Arc::clone(&inner);
         let hop_recv_tx = recv_tx.clone();
+        let pool_for_hop = Arc::clone(&pool);
         let hop_handle = tokio::spawn(async move {
-            hop_loop(hop_inner, hop_recv_tx).await;
+            hop_loop(hop_inner, hop_recv_tx, pool_for_hop).await;
         });
 
         Ok(Arc::new(Self {
             inner,
             recv_rx: tokio::sync::Mutex::new(recv_rx),
             recv_tx,
+            pool,
             hop_handle: tokio::sync::Mutex::new(Some(hop_handle)),
             recv_handles: tokio::sync::Mutex::new(vec![recv_handle]),
         }))
@@ -227,14 +264,17 @@ impl UdpHopPacketConn {
             .await
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed"))?;
 
-        if let Some(err) = pkt.err {
+        let UdpPacket { buf: pkt_buf, n, addr, err } = pkt;
+        if let Some(err) = err {
             return Err(err);
         }
-        if buf.len() < pkt.n {
+        if buf.len() < n {
             return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "short buffer"));
         }
-        buf[..pkt.n].copy_from_slice(&pkt.buf[..pkt.n]);
-        Ok((pkt.n, pkt.addr.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap())))
+        buf[..n].copy_from_slice(&pkt_buf[..n]);
+        // buf 归还池，供 recv_loop 复用（对齐 Go ReadFrom 的 pool.Put）。
+        self.pool.put(pkt_buf);
+        Ok((n, addr.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap())))
     }
 
     /// 发送到当前活跃 addr（对应 Go `WriteTo`）。
@@ -306,31 +346,31 @@ impl UdpHopPacketConn {
 }
 
 /// recv 循环（对应 Go `recvLoop`）。
-async fn recv_loop(conn: Arc<dyn PacketConn>, tx: mpsc::Sender<UdpPacket>) {
-    let mut pool: VecDeque<Vec<u8>> = VecDeque::new();
+///
+/// buf 从池 Get，直接 recv 进池 buf（无草稿拷贝），成功后随包 move 出去，
+/// 由消费端 read_from 归还池（对齐 Go `pool.Get`/`pool.Put`）。
+async fn recv_loop(conn: Arc<dyn PacketConn>, tx: mpsc::Sender<UdpPacket>, pool: Arc<BufPool>) {
     loop {
-        let buf = pool.pop_front().unwrap_or_else(|| vec![0u8; UDP_BUFFER_SIZE]);
-        match conn
-            .recv_from(
-                &mut {
-                    let mut b = buf.clone();
-                    b
-                }
-                .as_mut_slice(),
-            )
-            .await
-        {
+        let mut buf = pool.get();
+        // 先绑定再 match：scrutinee 临时 future 持有 &mut buf，会延长借用跨过 match 臂。
+        let res = conn.recv_from(buf.as_mut_slice()).await;
+        match res {
             Ok((n, addr)) => {
-                let pkt = UdpPacket { buf: buf.clone(), n, addr: Some(addr), err: None };
-                if tx.try_send(pkt).is_err() {
-                    // 队列满，丢弃；pool 已用完 buf，重新 push
-                    pool.push_back(buf);
+                // buf 所有权零拷贝移入 packet（Go: readCh <- packet{p: p[:n]}）。
+                let pkt = UdpPacket { buf, n, addr: Some(addr), err: None };
+                match tx.try_send(pkt) {
+                    Ok(()) => {},
+                    // 队列满：丢弃包，buf 归还池（Go 侧 channel 阻塞背压，此处丢弃防堆积）。
+                    Err(mpsc::error::TrySendError::Full(pkt)) => pool.put(pkt.buf),
+                    // channel 关闭（conn 已 drop）：退出循环（Go: closeCh 分支）。
+                    Err(mpsc::error::TrySendError::Closed(_)) => return,
                 }
-                // ponytail: 不真正归还原 buf（已 move 到 packet）
             },
             Err(e) => {
                 let kind = e.kind();
                 if matches!(kind, std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) {
+                    // buf 未消费，归还池（Go: pool.Put(p[:cap(p))] 后 continue）。
+                    pool.put(buf);
                     let _ =
                         tx.try_send(UdpPacket { buf: Vec::new(), n: 0, addr: None, err: Some(e) });
                     continue;
@@ -342,11 +382,15 @@ async fn recv_loop(conn: Arc<dyn PacketConn>, tx: mpsc::Sender<UdpPacket>) {
 }
 
 /// hop 循环（对应 Go `hopLoop`）。
-async fn hop_loop(inner: Arc<Mutex<UdpHopInner>>, recv_tx: mpsc::Sender<UdpPacket>) {
+async fn hop_loop(
+    inner: Arc<Mutex<UdpHopInner>>,
+    recv_tx: mpsc::Sender<UdpPacket>,
+    pool: Arc<BufPool>,
+) {
     loop {
         let interval = next_hop_interval(&inner);
         tokio::time::sleep(interval).await;
-        if !hop_once(&inner, &recv_tx).await {
+        if !hop_once(&inner, &recv_tx, &pool).await {
             return;
         }
     }
@@ -363,7 +407,11 @@ fn next_hop_interval(inner: &Arc<Mutex<UdpHopInner>>) -> Duration {
 }
 
 /// 执行一次 hop。返回 false 表示已关闭，循环应退出。
-async fn hop_once(inner: &Arc<Mutex<UdpHopInner>>, recv_tx: &mpsc::Sender<UdpPacket>) -> bool {
+async fn hop_once(
+    inner: &Arc<Mutex<UdpHopInner>>,
+    recv_tx: &mpsc::Sender<UdpPacket>,
+    pool: &Arc<BufPool>,
+) -> bool {
     let (new_addr_index, target_addr, listen_fn) = {
         let mut g = inner.lock();
         if g.closed {
@@ -397,8 +445,9 @@ async fn hop_once(inner: &Arc<Mutex<UdpHopInner>>, recv_tx: &mpsc::Sender<UdpPac
     // spawn new recv loop
     let tx = recv_tx.clone();
     let conn_for_recv = Arc::clone(&new_conn);
+    let pool_for_recv = Arc::clone(pool);
     tokio::spawn(async move {
-        recv_loop(conn_for_recv, tx).await;
+        recv_loop(conn_for_recv, tx, pool_for_recv).await;
     });
 
     let _ = new_addr_index;
@@ -485,6 +534,85 @@ mod tests {
         }
     }
 
-    // ponytail: 不测 UdpHopPacketConn::new 真实路径（需要 tokio runtime +
-    // mock PacketConn + 网络）。这部分等 quinn adapter 集成时再补 E2E 测试。
+    /// 恒定产包的 mock PacketConn。
+    struct MockRecvConn {
+        payload_len: usize,
+        addr: SocketAddr,
+    }
+
+    impl PacketConn for MockRecvConn {
+        fn recv_from<'a>(
+            &'a self,
+            buf: &'a mut [u8],
+        ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<(usize, SocketAddr)>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                // 让出调度模拟真实到达节奏，避免 recv_loop 空转抢占消费端。
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                buf[..self.payload_len].fill(0xAB);
+                Ok((self.payload_len, self.addr))
+            })
+        }
+
+        fn send_to<'a>(
+            &'a self,
+            buf: &'a [u8],
+            _addr: SocketAddr,
+        ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<usize>> + Send + 'a>> {
+            Box::pin(async move { Ok(buf.len()) })
+        }
+
+        fn close(&self) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            Ok(self.addr)
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_loop_recycles_bufs_to_pool() {
+        let addr: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+        let conn = UdpHopPacketConn::new(
+            vec![addr],
+            MIN_HOP_INTERVAL,
+            MIN_HOP_INTERVAL,
+            Arc::new(|_| Box::pin(async { unreachable!() })),
+            Arc::new(MockRecvConn { payload_len: 16, addr }),
+            0,
+        )
+        .await
+        .expect("new");
+
+        let mut buf = [0u8; UDP_BUFFER_SIZE];
+        for _ in 0..8 {
+            let (n, from) = conn.read_from(&mut buf).await.expect("read_from");
+            assert_eq!(n, 16);
+            assert_eq!(from, addr);
+            assert!(buf[..n].iter().all(|&b| b == 0xAB));
+        }
+
+        // 回池断言：消费端归还后池非空。
+        let pooled = conn.pool.bufs.lock().len();
+        assert!(pooled >= 1, "pool should hold recycled bufs, got {pooled}");
+        // 复用断言：8 包只允许 ≤2 次池外新分配（首包 + 至多一个在途 buf）。
+        let allocs = conn.pool.allocs.load(Ordering::Relaxed);
+        assert!(allocs <= 2, "8 packets should reuse pooled bufs, allocs={allocs}");
+
+        conn.close().await.ok();
+    }
+
+    #[test]
+    fn buf_pool_get_put_reuses() {
+        let pool = BufPool::default();
+        let b = pool.get();
+        assert_eq!(b.len(), UDP_BUFFER_SIZE);
+        assert_eq!(pool.allocs.load(Ordering::Relaxed), 1);
+        pool.put(b);
+        let b2 = pool.get();
+        assert_eq!(pool.allocs.load(Ordering::Relaxed), 1, "must reuse instead of realloc");
+        pool.put(b2);
+        assert_eq!(pool.bufs.lock().len(), 1);
+    }
 }

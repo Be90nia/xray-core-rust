@@ -206,6 +206,7 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
             tls_config,
             tls_server_name,
             fingerprint,
+            security_json: settings.security_json.clone(),
         };
         let settings = settings.clone();
         let factory: DialFactory = Arc::new(move |ed_bytes| {
@@ -228,6 +229,7 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
         tls_config,
         tls_server_name,
         fingerprint,
+        security_json: settings.security_json.clone(),
     })
     .await
     .map_err(|e| io::Error::other(e))?;
