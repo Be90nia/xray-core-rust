@@ -31,4 +31,6 @@ message DeviceConfig {
   DomainStrategy domain_strategy = 7;
   bool is_client = 8;
   bool no_kernel_tun = 9;
+  // Go c7e569b0: remoteDNS（隧道内 DNS 服务器；["local"]=走本地 app DNS）。
+  repeated string DNS = 10;
 }

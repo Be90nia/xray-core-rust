@@ -11,30 +11,23 @@
 //! 测试用 `tokio::io::{AsyncReadExt, AsyncWriteExt}` 直接读写 `WsConnection`，
 //! 验证 `Connection` trait + `AsyncRead/AsyncWrite` supertrait 链路。
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::oneshot;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
-
-use xray_transport_websocket::client::{dial, DialOptions};
-use xray_transport_websocket::config::Config;
-use xray_transport_websocket::server::WsListener;
-
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::oneshot,
+};
+use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
 use xray_transport::connection::Connection;
-use xray_transport_websocket::client::{DialFactory, DelayDialConn};
+use xray_transport_websocket::{
+    client::{DelayDialConn, DialFactory, DialOptions, dial},
+    config::Config,
+    server::WsListener,
+};
 
 /// 拨号到本地 listener 的辅助：用 IP 127.0.0.1 + 端口。
 fn local_dest(port: u16) -> Destination {
-    Destination::new(
-        Address::new_domain("127.0.0.1"),
-        Port::new(port),
-        Network::TCP,
-    )
+    Destination::new(Address::new_domain("127.0.0.1"), Port::new(port), Network::TCP)
 }
 
 /// 起一个 echo 服务端：accept 后把读到的字节原样写回，循环直到客户端断开。
@@ -61,7 +54,7 @@ async fn spawn_echo_server(
                     if conn.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
-                }
+                },
             }
         }
     });
@@ -76,11 +69,14 @@ async fn client_server_roundtrip_echo() {
     let bound = addr_rx.await.expect("server bound");
 
     let dest = local_dest(bound.port());
-    let opts = DialOptions { config: &cfg,
-    destination: &dest,
-    early_data: None,
-    tls_config: None,
-    fingerprint: None, tls_server_name: None };
+    let opts = DialOptions {
+        config: &cfg,
+        destination: &dest,
+        early_data: None,
+        tls_config: None,
+        fingerprint: None,
+        tls_server_name: None,
+    };
     let mut client = dial(opts).await.expect("dial");
 
     // 发 hello → 收 hello 回来
@@ -103,11 +99,14 @@ async fn large_payload_multi_frame_roundtrip() {
     let bound = addr_rx.await.expect("server bound");
 
     let dest = local_dest(bound.port());
-    let opts = DialOptions { config: &cfg,
-    destination: &dest,
-    early_data: None,
-    tls_config: None,
-    fingerprint: None, tls_server_name: None };
+    let opts = DialOptions {
+        config: &cfg,
+        destination: &dest,
+        early_data: None,
+        tls_config: None,
+        fingerprint: None,
+        tls_server_name: None,
+    };
     let mut client = dial(opts).await.expect("dial");
 
     // 构造 100 KiB 已知模式数据。
@@ -147,11 +146,14 @@ async fn early_data_delivered_to_server_first_read() {
     let bound = rx_bound.await.expect("server bound");
     let dest = local_dest(bound.port());
     let ed = b"early-payload".to_vec();
-    let opts = DialOptions { config: &cfg,
-    destination: &dest,
-    early_data: Some(&ed),
-    tls_config: None,
-    fingerprint: None, tls_server_name: None };
+    let opts = DialOptions {
+        config: &cfg,
+        destination: &dest,
+        early_data: Some(&ed),
+        tls_config: None,
+        fingerprint: None,
+        tls_server_name: None,
+    };
     let _client = dial(opts).await.expect("dial");
 
     let _ = tokio::time::timeout(Duration::from_secs(3), server_handle).await;
@@ -160,10 +162,7 @@ async fn early_data_delivered_to_server_first_read() {
 #[tokio::test]
 async fn server_rejects_wrong_path() {
     // 服务端期望 path=/ws，客户端拨 /wrong → 服务端拒绝握手，accept 返回 Err。
-    let server_cfg = Arc::new(Config {
-        path: "/ws".into(),
-        ..Default::default()
-    });
+    let server_cfg = Arc::new(Config { path: "/ws".into(), ..Default::default() });
     let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
 
     let (tx_bound, rx_bound) = oneshot::channel();
@@ -173,24 +172,21 @@ async fn server_rejects_wrong_path() {
         let _ = tx_bound.send(bound);
         // 错误 path 应导致 accept 返回 Err。
         let result = listener.accept().await;
-        assert!(
-            result.is_err(),
-            "expected accept to fail on wrong path"
-        );
+        assert!(result.is_err(), "expected accept to fail on wrong path");
     });
 
     let bound = rx_bound.await.expect("server bound");
     let dest = local_dest(bound.port());
     // 客户端用错误 path。
-    let client_cfg = Config {
-        path: "/wrong".into(),
-        ..Default::default()
+    let client_cfg = Config { path: "/wrong".into(), ..Default::default() };
+    let opts = DialOptions {
+        config: &client_cfg,
+        destination: &dest,
+        early_data: None,
+        tls_config: None,
+        fingerprint: None,
+        tls_server_name: None,
     };
-    let opts = DialOptions { config: &client_cfg,
-    destination: &dest,
-    early_data: None,
-    tls_config: None,
-    fingerprint: None, tls_server_name: None };
     let result = dial(opts).await;
     assert!(result.is_err(), "client dial should fail with 404");
 
@@ -201,10 +197,7 @@ async fn server_rejects_wrong_path() {
 async fn server_validates_custom_host_header() {
     // 服务端期望 host=front.example.com，客户端发该 host → 接受。
     // 同时校验：地址用 127.0.0.1，但 host 是 CDN 域名（典型反向代理场景）。
-    let server_cfg = Arc::new(Config {
-        host: "front.example.com".into(),
-        ..Default::default()
-    });
+    let server_cfg = Arc::new(Config { host: "front.example.com".into(), ..Default::default() });
     let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
 
     let (tx_bound, rx_bound) = oneshot::channel();
@@ -222,15 +215,15 @@ async fn server_validates_custom_host_header() {
 
     let bound = rx_bound.await.expect("server bound");
     let dest = local_dest(bound.port());
-    let client_cfg = Config {
-        host: "front.example.com".into(),
-        ..Default::default()
+    let client_cfg = Config { host: "front.example.com".into(), ..Default::default() };
+    let opts = DialOptions {
+        config: &client_cfg,
+        destination: &dest,
+        early_data: None,
+        tls_config: None,
+        fingerprint: None,
+        tls_server_name: None,
     };
-    let opts = DialOptions { config: &client_cfg,
-    destination: &dest,
-    early_data: None,
-    tls_config: None,
-    fingerprint: None, tls_server_name: None };
     let mut client = dial(opts).await.expect("dial should succeed with matching host");
 
     client.write_all(b"hello").await.expect("write");
@@ -245,10 +238,7 @@ async fn server_validates_custom_host_header() {
 #[tokio::test]
 async fn server_rejects_mismatched_host() {
     // 服务端期望 host=expected.com，客户端发不同 host → 服务端拒绝。
-    let server_cfg = Arc::new(Config {
-        host: "expected.com".into(),
-        ..Default::default()
-    });
+    let server_cfg = Arc::new(Config { host: "expected.com".into(), ..Default::default() });
     let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
 
     let (tx_bound, rx_bound) = oneshot::channel();
@@ -261,15 +251,15 @@ async fn server_rejects_mismatched_host() {
 
     let bound = rx_bound.await.expect("server bound");
     let dest = local_dest(bound.port());
-    let client_cfg = Config {
-        host: "wrong.com".into(),
-        ..Default::default()
+    let client_cfg = Config { host: "wrong.com".into(), ..Default::default() };
+    let opts = DialOptions {
+        config: &client_cfg,
+        destination: &dest,
+        early_data: None,
+        tls_config: None,
+        fingerprint: None,
+        tls_server_name: None,
     };
-    let opts = DialOptions { config: &client_cfg,
-    destination: &dest,
-    early_data: None,
-    tls_config: None,
-    fingerprint: None, tls_server_name: None };
     let result = dial(opts).await;
     assert!(result.is_err(), "mismatched host should be rejected");
 

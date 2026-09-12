@@ -15,27 +15,33 @@
 //! 3. 构造 AEAD，nonce [0;12]
 //! 4. open fixed-header-chunk：headerType + timestamp_BE_u64 + variableLen_BE_u16
 //! 5. 验证 headerType（0=client）+ timestamp（防重放）
-//! 6. open variable-header-chunk：addr+port + paddingLen + padding（尾部含客户端首段 payload，先于 body 交付）
+//! 6. open variable-header-chunk：addr+port + paddingLen + padding（尾部含客户端首段 payload，先于
+//!    body 交付）
 //! 7. 构造 SSStream 继续读写 body（下行首写自动发 sing writeResponse 响应头）
 
-use std::io;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    io,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use parking_lot::Mutex;
-use tokio::io::AsyncReadExt;
-use tokio::net::TcpStream;
-use xray_crypto::aead::{AeadCipher, Aes128Gcm, Aes256Gcm, ChaCha20Poly1305Aead};
+use tokio::{io::AsyncReadExt, net::TcpStream};
 use xray_common::net::address::Address;
+use xray_crypto::aead::{AeadCipher, Aes128Gcm, Aes256Gcm, ChaCha20Poly1305Aead};
 
-use crate::error::{Result, SsError};
-use crate::protocol::addr_type;
-use crate::ss2022::key::{
-    decrypt_identity_header, derive_psk, derive_session_subkey, psk_from_base64, psk_identity,
-    CipherKind2022,
+use crate::{
+    error::{Result, SsError},
+    protocol::addr_type,
+    ss2022::{
+        key::{
+            CipherKind2022, decrypt_identity_header, derive_psk, derive_session_subkey,
+            psk_from_base64, psk_identity,
+        },
+        replay::{REPLAY_WINDOW, SaltReplayFilter},
+    },
+    stream::SSStream,
 };
-use crate::ss2022::replay::{SaltReplayFilter, REPLAY_WINDOW};
-use crate::stream::SSStream;
 
 // ============================================================================
 // 公共类型
@@ -105,15 +111,10 @@ impl Ss2022Inbound {
     /// # Errors
     /// - 透传 AEAD、IO、协议解析错误。
     pub async fn handle_conn(&self, conn: TcpStream) -> io::Result<InboundResult> {
-        let result = read_ss2022_request(
-            conn,
-            &self.psk,
-            self.kind,
-            self.timestamp_tolerance,
-            &self.replay,
-        )
-            .await
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        let result =
+            read_ss2022_request(conn, &self.psk, self.kind, self.timestamp_tolerance, &self.replay)
+                .await
+                .map_err(|e| io::Error::other(e.to_string()))?;
         Ok(InboundResult {
             address: result.0,
             port: result.1,
@@ -167,11 +168,7 @@ impl MultiUserInbound {
     /// - [`SsError::InvalidCipherName`]：cipher 不支持。
     /// - [`SsError::InvalidPassword`]：PSK base64 解码失败或长度不匹配。
     /// - [`SsError::Ss2022MissingKey`]：server PSK 为空。
-    pub fn new(
-        cipher: &str,
-        server_psk_b64: &str,
-        users: Vec<Ss2022User>,
-    ) -> Result<Self> {
+    pub fn new(cipher: &str, server_psk_b64: &str, users: Vec<Ss2022User>) -> Result<Self> {
         let kind = CipherKind2022::from_name(cipher)?;
         let psk = derive_psk(&psk_from_base64(server_psk_b64)?, kind)?;
         let users = users
@@ -179,14 +176,7 @@ impl MultiUserInbound {
             .map(|u| {
                 let psk = derive_psk(&u.psk, kind)?;
                 let identity = psk_identity(&psk);
-                Ok::<_, SsError>((
-                    Ss2022User {
-                        email: u.email,
-                        level: u.level,
-                        psk,
-                    },
-                    identity,
-                ))
+                Ok::<_, SsError>((Ss2022User { email: u.email, level: u.level, psk }, identity))
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
@@ -213,8 +203,8 @@ impl MultiUserInbound {
             self.timestamp_tolerance,
             &self.replay,
         )
-            .await
-            .map_err(|e| io::Error::other(e.to_string()))
+        .await
+        .map_err(|e| io::Error::other(e.to_string()))
     }
 
     /// 添加用户（对应 Go `AddUser`）。
@@ -235,14 +225,7 @@ impl MultiUserInbound {
                 user.email
             )));
         }
-        users.push((
-            Ss2022User {
-                email: user.email,
-                level: user.level,
-                psk,
-            },
-            identity,
-        ));
+        users.push((Ss2022User { email: user.email, level: user.level, psk }, identity));
         Ok(())
     }
 
@@ -275,11 +258,7 @@ impl MultiUserInbound {
     /// 返回用户 (identity, psk) 表快照（UDP relay 的 EIH 用户识别）。
     #[must_use]
     pub fn udp_user_table(&self) -> Vec<([u8; 16], Vec<u8>)> {
-        self.users
-            .lock()
-            .iter()
-            .map(|(u, identity)| (*identity, u.psk.clone()))
-            .collect()
+        self.users.lock().iter().map(|(u, identity)| (*identity, u.psk.clone())).collect()
     }
 
     /// 当前用户数。
@@ -342,12 +321,7 @@ impl RelayInbound {
             return Err(SsError::Ss2022UnsupportedMethod(cipher.to_string()));
         }
         let psk = derive_psk(&psk_from_base64(server_psk_b64)?, kind)?;
-        Ok(Self {
-            psk,
-            kind,
-            destinations,
-            timestamp_tolerance: 30,
-        })
+        Ok(Self { psk, kind, destinations, timestamp_tolerance: 30 })
     }
 
     /// 处理中继入站 TCP 连接（SIP022 relay，对齐 sing-shadowsocks relay.go）：
@@ -402,9 +376,7 @@ fn build_aead(kind: CipherKind2022, subkey: &[u8]) -> Result<Box<dyn AeadCipher 
     match kind {
         CipherKind2022::Aes128Gcm => Ok(Box::new(Aes128Gcm::new(subkey)?)),
         CipherKind2022::Aes256Gcm => Ok(Box::new(Aes256Gcm::new(subkey)?)),
-        CipherKind2022::ChaCha20Poly1305 => {
-            Ok(Box::new(ChaCha20Poly1305Aead::new(subkey)?))
-        }
+        CipherKind2022::ChaCha20Poly1305 => Ok(Box::new(ChaCha20Poly1305Aead::new(subkey)?)),
     }
 }
 
@@ -453,9 +425,8 @@ async fn read_ss2022_request(
     let mut nonce = vec![0u8; aead.nonce_size()];
 
     // open fixed-header
-    let fixed_plain = aead
-        .open(&nonce, &[], &fixed_wire)
-        .map_err(|e| SsError::AeadOpen(e.to_string()))?;
+    let fixed_plain =
+        aead.open(&nonce, &[], &fixed_wire).map_err(|e| SsError::AeadOpen(e.to_string()))?;
     increment_nonce(&mut nonce);
 
     if fixed_plain.len() < fixed_plain_len {
@@ -469,8 +440,14 @@ async fn read_ss2022_request(
     }
 
     let timestamp = u64::from_be_bytes([
-        fixed_plain[1], fixed_plain[2], fixed_plain[3], fixed_plain[4],
-        fixed_plain[5], fixed_plain[6], fixed_plain[7], fixed_plain[8],
+        fixed_plain[1],
+        fixed_plain[2],
+        fixed_plain[3],
+        fixed_plain[4],
+        fixed_plain[5],
+        fixed_plain[6],
+        fixed_plain[7],
+        fixed_plain[8],
     ]);
 
     check_timestamp(timestamp, timestamp_tolerance)?;
@@ -483,9 +460,8 @@ async fn read_ss2022_request(
     let mut variable_wire = vec![0u8; variable_wire_len];
     conn.read_exact(&mut variable_wire).await?;
 
-    let variable_plain = aead
-        .open(&nonce, &[], &variable_wire)
-        .map_err(|e| SsError::AeadOpen(e.to_string()))?;
+    let variable_plain =
+        aead.open(&nonce, &[], &variable_wire).map_err(|e| SsError::AeadOpen(e.to_string()))?;
     increment_nonce(&mut nonce);
 
     // 6. 解析 variable-header：addr+port + paddingLen + padding [+ 首段 payload]
@@ -543,7 +519,6 @@ async fn read_ss2022_request_multi(
     let fixed_plain_len = 11;
     let fixed_wire_len = fixed_plain_len + tag_size;
 
-
     let mut identity_wire = vec![0u8; crate::ss2022::key::IDENTITY_HEADER_LEN];
     conn.read_exact(&mut identity_wire).await?;
 
@@ -562,16 +537,14 @@ async fn read_ss2022_request_multi(
     let mut fixed_wire = vec![0u8; fixed_wire_len];
     conn.read_exact(&mut fixed_wire).await?;
 
-
     // 4. 命中用户：uPSK 派生 session subkey，解 fixed/variable header
     let user = &user.0;
     let subkey = derive_session_subkey(&user.psk, &salt, kind);
     let aead = build_aead(kind, &subkey)?;
     let nonce = vec![0u8; aead.nonce_size()];
 
-    let fixed_plain = aead
-        .open(&nonce, &[], &fixed_wire)
-        .map_err(|e| SsError::AeadOpen(e.to_string()))?;
+    let fixed_plain =
+        aead.open(&nonce, &[], &fixed_wire).map_err(|e| SsError::AeadOpen(e.to_string()))?;
     if fixed_plain.len() < fixed_plain_len {
         return Err(SsError::InsufficientData(fixed_plain.len()));
     }
@@ -579,8 +552,14 @@ async fn read_ss2022_request_multi(
         return Err(SsError::Ss2022InvalidHeaderType(fixed_plain[0]));
     }
     let timestamp = u64::from_be_bytes([
-        fixed_plain[1], fixed_plain[2], fixed_plain[3], fixed_plain[4],
-        fixed_plain[5], fixed_plain[6], fixed_plain[7], fixed_plain[8],
+        fixed_plain[1],
+        fixed_plain[2],
+        fixed_plain[3],
+        fixed_plain[4],
+        fixed_plain[5],
+        fixed_plain[6],
+        fixed_plain[7],
+        fixed_plain[8],
     ]);
     check_timestamp(timestamp, timestamp_tolerance)?;
 
@@ -592,9 +571,8 @@ async fn read_ss2022_request_multi(
     let mut variable_wire = vec![0u8; variable_wire_len];
     conn.read_exact(&mut variable_wire).await?;
 
-    let variable_plain = aead
-        .open(&nonce, &[], &variable_wire)
-        .map_err(|e| SsError::AeadOpen(e.to_string()))?;
+    let variable_plain =
+        aead.open(&nonce, &[], &variable_wire).map_err(|e| SsError::AeadOpen(e.to_string()))?;
     increment_nonce(&mut nonce);
 
     // 6. 解析 variable-header：addr+port + paddingLen + padding [+ 首段 payload]
@@ -618,12 +596,7 @@ async fn read_ss2022_request_multi(
     // 下行首写时发 sing writeResponse 响应头（新 salt + echo request salt）
     stream.mark_server_response_2022(user.psk.clone(), kind, salt);
 
-    Ok(InboundResult {
-        address,
-        port,
-        stream,
-        user_email: user.email.clone(),
-    })
+    Ok(InboundResult { address, port, stream, user_email: user.email.clone() })
 }
 
 /// 验证时间戳：与当前时间差在 tolerance 内。
@@ -665,7 +638,7 @@ fn parse_variable_header(buf: &[u8]) -> Result<(Address, u16, usize)> {
             );
             offset += 4;
             Address::IPv4(ip)
-        }
+        },
         addr_type::DOMAIN => {
             if buf.len() < offset + 1 {
                 return Err(SsError::InsufficientData(buf.len()));
@@ -679,7 +652,7 @@ fn parse_variable_header(buf: &[u8]) -> Result<(Address, u16, usize)> {
                 .map_err(|_| SsError::InvalidRemoteAddress)?;
             offset += domain_len;
             Address::Domain(domain)
-        }
+        },
         addr_type::IPV6 => {
             if buf.len() < offset + 16 {
                 return Err(SsError::InsufficientData(buf.len()));
@@ -688,7 +661,7 @@ fn parse_variable_header(buf: &[u8]) -> Result<(Address, u16, usize)> {
             octets.copy_from_slice(&buf[offset..offset + 16]);
             offset += 16;
             Address::IPv6(std::net::Ipv6Addr::from(octets))
-        }
+        },
         _ => return Err(SsError::InvalidRemoteAddress),
     };
 
@@ -700,17 +673,15 @@ fn parse_variable_header(buf: &[u8]) -> Result<(Address, u16, usize)> {
     Ok((address, port, offset + 2))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     /// 构造固定 salt 的 SS-2022 请求 wire：salt || [EIH] || sealed_fixed || sealed_var。
     ///
     /// 镜像 [`crate::ss2022::client::Client2022::dial_target_on`] 的 header 构造，
     /// salt 由调用方固定以供重放测试；`first_payload` 走 variable chunk 尾部
-    ///（Go DialEarlyConn 首写 / sing writeRequest(payload) 语义）。
+    /// （Go DialEarlyConn 首写 / sing writeRequest(payload) 语义）。
     fn build_request_wire(
         kind: CipherKind2022,
         salt: &[u8],
@@ -759,9 +730,10 @@ mod tests {
     /// 各自 body 用各自 uPSK 派生的 AEAD 上下文独立解密。
     #[tokio::test]
     async fn multi_user_two_clients_roundtrip() {
-        use crate::ss2022::client::Client2022;
         use base64::Engine as _;
         use tokio::io::AsyncWriteExt;
+
+        use crate::ss2022::client::Client2022;
 
         let server_psk = [0x11u8; 32];
         let alice_psk = [0x22u8; 32];
@@ -773,16 +745,8 @@ mod tests {
                 "2022-blake3-aes-256-gcm",
                 &b64(&server_psk),
                 vec![
-                    Ss2022User {
-                        email: "alice".into(),
-                        level: 0,
-                        psk: alice_psk.to_vec(),
-                    },
-                    Ss2022User {
-                        email: "bob".into(),
-                        level: 0,
-                        psk: bob_psk.to_vec(),
-                    },
+                    Ss2022User { email: "alice".into(), level: 0, psk: alice_psk.to_vec() },
+                    Ss2022User { email: "bob".into(), level: 0, psk: bob_psk.to_vec() },
                 ],
             )
             .unwrap(),
@@ -796,29 +760,17 @@ mod tests {
                 let mut result = inbound.handle_conn(conn).await.unwrap();
                 assert_eq!(result.user_email, email, "EIH must identify the right user");
                 let payload = vec![fill; 64];
-                let got = result
-                    .stream
-                    .read_chunk()
-                    .await
-                    .unwrap()
-                    .expect("body chunk");
-                assert_eq!(
-                    got, payload,
-                    "{email} body must decrypt with its own PSK context"
-                );
+                let got = result.stream.read_chunk().await.unwrap().expect("body chunk");
+                assert_eq!(got, payload, "{email} body must decrypt with its own PSK context");
             }
         });
 
         for (psk, fill) in [(&alice_psk, 0x77u8), (&bob_psk, 0x88u8)] {
-            let client = Client2022::new(
-                "2022-blake3-aes-256-gcm",
-                &b64(psk),
-                "127.0.0.1",
-                addr.port(),
-            )
-            .unwrap()
-            .with_identity(&b64(&server_psk))
-            .unwrap();
+            let client =
+                Client2022::new("2022-blake3-aes-256-gcm", &b64(psk), "127.0.0.1", addr.port())
+                    .unwrap()
+                    .with_identity(&b64(&server_psk))
+                    .unwrap();
             let mut stream = client.dial_target("example.com", 443).await.unwrap();
             stream.write_chunk(&vec![fill; 64]).await.unwrap();
             stream.flush().await.unwrap();
@@ -839,12 +791,10 @@ mod tests {
 
         let psk = [0x11u8; 32];
         let b64 = base64::engine::general_purpose::STANDARD.encode(psk);
-        let inbound = std::sync::Arc::new(
-            Ss2022Inbound::new("2022-blake3-aes-256-gcm", &b64, "u1").unwrap(),
-        );
-        let listener = std::sync::Arc::new(
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
-        );
+        let inbound =
+            std::sync::Arc::new(Ss2022Inbound::new("2022-blake3-aes-256-gcm", &b64, "u1").unwrap());
+        let listener =
+            std::sync::Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
         let addr = listener.local_addr().unwrap();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -856,13 +806,7 @@ mod tests {
             }
         });
 
-        let wire = build_request_wire(
-            CipherKind2022::Aes256Gcm,
-            &[0xAAu8; 32],
-            None,
-            &psk,
-            &[],
-        );
+        let wire = build_request_wire(CipherKind2022::Aes256Gcm, &[0xAAu8; 32], None, &psk, &[]);
         let mut c1 = tokio::net::TcpStream::connect(addr).await.unwrap();
         c1.write_all(&wire).await.unwrap();
         let mut c2 = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -870,12 +814,7 @@ mod tests {
 
         let r1 = rx.recv().await.unwrap().expect("first use of salt must pass");
         assert_eq!(r1.address, Address::Domain("example.com".to_string()));
-        let err = rx
-            .recv()
-            .await
-            .unwrap()
-            .err()
-            .expect("replayed salt must be rejected");
+        let err = rx.recv().await.unwrap().err().expect("replayed salt must be rejected");
         assert!(
             err.to_string().contains("salt not unique"),
             "expected salt-not-unique, got: {err}"
@@ -896,17 +835,12 @@ mod tests {
             MultiUserInbound::new(
                 "2022-blake3-aes-256-gcm",
                 &b64(&server_psk),
-                vec![Ss2022User {
-                    email: "alice".into(),
-                    level: 0,
-                    psk: user_psk.to_vec(),
-                }],
+                vec![Ss2022User { email: "alice".into(), level: 0, psk: user_psk.to_vec() }],
             )
             .unwrap(),
         );
-        let listener = std::sync::Arc::new(
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
-        );
+        let listener =
+            std::sync::Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
         let addr = listener.local_addr().unwrap();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -932,12 +866,7 @@ mod tests {
 
         let r1 = rx.recv().await.unwrap().expect("first use of salt must pass");
         assert_eq!(r1.user_email, "alice");
-        let err = rx
-            .recv()
-            .await
-            .unwrap()
-            .err()
-            .expect("replayed salt must be rejected");
+        let err = rx.recv().await.unwrap().err().expect("replayed salt must be rejected");
         assert!(
             err.to_string().contains("salt not unique"),
             "expected salt-not-unique, got: {err}"
@@ -947,8 +876,9 @@ mod tests {
     /// SIP023 EIH 端到端：Client2022(with_identity) 写 EIH → MultiUserInbound 匹配对应用户。
     #[tokio::test]
     async fn multi_user_eih_roundtrip() {
-        use crate::ss2022::client::Client2022;
         use base64::Engine as _;
+
+        use crate::ss2022::client::Client2022;
 
         let server_psk = [0x11u8; 32];
         let user_psk = [0x22u8; 32];
@@ -958,11 +888,7 @@ mod tests {
         let inbound = MultiUserInbound::new(
             "2022-blake3-aes-256-gcm",
             &server_psk_b64,
-            vec![Ss2022User {
-                email: "alice".into(),
-                level: 0,
-                psk: user_psk.to_vec(),
-            }],
+            vec![Ss2022User { email: "alice".into(), level: 0, psk: user_psk.to_vec() }],
         )
         .unwrap();
 
@@ -973,15 +899,11 @@ mod tests {
             inbound.handle_conn(conn).await
         });
 
-        let client = Client2022::new(
-            "2022-blake3-aes-256-gcm",
-            &user_psk_b64,
-            "127.0.0.1",
-            addr.port(),
-        )
-        .unwrap()
-        .with_identity(&server_psk_b64)
-        .unwrap();
+        let client =
+            Client2022::new("2022-blake3-aes-256-gcm", &user_psk_b64, "127.0.0.1", addr.port())
+                .unwrap()
+                .with_identity(&server_psk_b64)
+                .unwrap();
         let mut stream = client.dial_target("example.com", 443).await.unwrap();
 
         let result = server.await.unwrap().unwrap();
@@ -993,8 +915,9 @@ mod tests {
     /// EIH 错误用户：user PSK 不在白名单 → NoUserMatched。
     #[tokio::test]
     async fn multi_user_eih_rejects_unknown_user() {
-        use crate::ss2022::client::Client2022;
         use base64::Engine as _;
+
+        use crate::ss2022::client::Client2022;
 
         let server_psk = [0x11u8; 32];
         let other_psk = [0x33u8; 32];
@@ -1004,11 +927,7 @@ mod tests {
         let inbound = MultiUserInbound::new(
             "2022-blake3-aes-256-gcm",
             &server_psk_b64,
-            vec![Ss2022User {
-                email: "alice".into(),
-                level: 0,
-                psk: [0x22u8; 32].to_vec(),
-            }],
+            vec![Ss2022User { email: "alice".into(), level: 0, psk: [0x22u8; 32].to_vec() }],
         )
         .unwrap();
 
@@ -1019,15 +938,11 @@ mod tests {
             inbound.handle_conn(conn).await
         });
 
-        let client = Client2022::new(
-            "2022-blake3-aes-256-gcm",
-            &other_psk_b64,
-            "127.0.0.1",
-            addr.port(),
-        )
-        .unwrap()
-        .with_identity(&server_psk_b64)
-        .unwrap();
+        let client =
+            Client2022::new("2022-blake3-aes-256-gcm", &other_psk_b64, "127.0.0.1", addr.port())
+                .unwrap()
+                .with_identity(&server_psk_b64)
+                .unwrap();
         let _ = client.dial_target("example.com", 443).await;
 
         let result = server.await.unwrap();
@@ -1039,9 +954,10 @@ mod tests {
     /// destination Ss2022Inbound 用 dest PSK 解密 → echo（sing writeResponse 响应头）→ 原路回包。
     #[tokio::test]
     async fn relay_tunnel_roundtrip() {
-        use crate::ss2022::client::Client2022;
         use base64::Engine as _;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        use crate::ss2022::client::Client2022;
 
         // 0. 真实 echo 目标
         let echo_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1094,8 +1010,7 @@ mod tests {
                     let sealed_fixed = resp_aead.seal(&nonce, &[], &fixed).unwrap();
                     increment_nonce(&mut nonce);
                     let sealed_var = resp_aead.seal(&nonce, &[], &p).unwrap();
-                    let mut out =
-                        Vec::with_capacity(32 + sealed_fixed.len() + sealed_var.len());
+                    let mut out = Vec::with_capacity(32 + sealed_fixed.len() + sealed_var.len());
                     out.extend_from_slice(&[0u8; 32]); // resp_salt
                     out.extend_from_slice(&sealed_fixed);
                     out.extend_from_slice(&sealed_var);
@@ -1130,12 +1045,19 @@ mod tests {
                 let relay = std::sync::Arc::clone(&relay);
                 tokio::spawn(async move {
                     let Ok((_addr, _port, salt, client)) = relay.handle_conn_relay(conn).await
-                    else { return };
+                    else {
+                        return;
+                    };
                     // 原样桥：salt 回灌 + 双向 copy
-                    let Ok(mut upstream) = tokio::net::TcpStream::connect(
-                        (std::net::Ipv4Addr::LOCALHOST, dest_port),
-                    ).await else { return };
-                    if upstream.write_all(&salt).await.is_err() { return; }
+                    let Ok(mut upstream) =
+                        tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, dest_port))
+                            .await
+                    else {
+                        return;
+                    };
+                    if upstream.write_all(&salt).await.is_err() {
+                        return;
+                    }
                     let (mut cr, mut cw) = client.into_split();
                     let (mut ur, mut uw) = upstream.into_split();
                     let up = tokio::io::copy(&mut cr, &mut uw);
@@ -1146,15 +1068,11 @@ mod tests {
         });
 
         // 3. client：dest PSK 加密 + relay server PSK 的 EIH
-        let client = Client2022::new(
-            "2022-blake3-aes-256-gcm",
-            &dest_psk_b64,
-            "127.0.0.1",
-            relay_port,
-        )
-        .unwrap()
-        .with_identity(&server_psk_b64)
-        .unwrap();
+        let client =
+            Client2022::new("2022-blake3-aes-256-gcm", &dest_psk_b64, "127.0.0.1", relay_port)
+                .unwrap()
+                .with_identity(&server_psk_b64)
+                .unwrap();
         // 看门狗：wire 任一侧失配时快速失败而非无限挂起（挂起测试回归防护）
         let roundtrip = async {
             let mut stream = client.dial_target("127.0.0.1", echo_port).await.unwrap();
@@ -1171,15 +1089,15 @@ mod tests {
                     Ok(crate::stream::ChunkOut::Message(p)) => {
                         assert_eq!(p, payload, "relay e2e roundtrip");
                         return;
-                    }
+                    },
                     Ok(crate::stream::ChunkOut::End) => {
                         panic!("stream ended before echo response");
-                    }
+                    },
                     Ok(crate::stream::ChunkOut::NeedMore) => {
                         let n = stream.get_mut().read(&mut down_buf).await.unwrap();
                         assert!(n > 0, "EOF before echo response");
                         pending.extend_from_slice(&down_buf[..n]);
-                    }
+                    },
                     Err(e) => panic!("try_open_chunk: {e}"),
                 }
             }
@@ -1194,8 +1112,7 @@ mod tests {
         // 入站 build_aead 与 client.rs 对称：chacha20 用 blake3 派生的 32B subkey 直接构造。
         let psk = [0x11u8; 32];
         let salt = [0x22u8; 32];
-        let subkey =
-            derive_session_subkey(&psk, &salt, CipherKind2022::ChaCha20Poly1305);
+        let subkey = derive_session_subkey(&psk, &salt, CipherKind2022::ChaCha20Poly1305);
         assert_eq!(subkey.len(), 32);
 
         let aead =
@@ -1250,8 +1167,7 @@ mod tests {
             r.stream.flush().await.unwrap();
         });
 
-        let wire =
-            build_request_wire(CipherKind2022::Aes128Gcm, &salt, None, &psk, b"GET / one");
+        let wire = build_request_wire(CipherKind2022::Aes128Gcm, &salt, None, &psk, b"GET / one");
         let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
         c.write_all(&wire).await.unwrap();
 
@@ -1281,10 +1197,8 @@ mod tests {
         assert_eq!(fixed.len(), 1 + 8 + 16 + 2, "响应 fixed chunk 明文长度");
         assert_eq!(fixed[0], 1, "HeaderTypeServer");
         let epoch = u64::from_be_bytes(fixed[1..9].try_into().unwrap());
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         assert!(now.abs_diff(epoch) <= 30, "epoch within ±30s");
         assert_eq!(&fixed[9..25], &salt, "echo 必须回显请求 salt");
         let payload_len = u16::from_be_bytes([fixed[25], fixed[26]]) as usize;

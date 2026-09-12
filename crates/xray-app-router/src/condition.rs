@@ -326,6 +326,34 @@ impl Condition for UserMatcherCondition {
     }
 }
 
+// ── LocalOSMatcher ───────────────────────────────────────────
+
+/// 本机 OS 匹配器（Go a12801c1 `LocalOSMatcher`，condition.go:397-415）。
+///
+/// 运行期间 OS 不变，构造时即解析结果（`matched` 缓存），`apply` 恒返缓存值。
+/// 候选名与 `std::env::consts::OS`（= Go `runtime.GOOS`）大小写不敏感比较：
+/// Windows=`windows` / Linux=`linux` / macOS=`macos`。
+pub struct LocalOsMatcherCondition {
+    matched: bool,
+}
+
+impl LocalOsMatcherCondition {
+    /// 从 proto `local_os` 列表构造。对齐 Go `NewLocalOSMatcher`：
+    /// `slices.ContainsFunc(names, EqualFold(runtime.GOOS))`。
+    #[must_use]
+    pub fn new(names: &[String]) -> Self {
+        Self {
+            matched: names.iter().any(|n| n.eq_ignore_ascii_case(std::env::consts::OS)),
+        }
+    }
+}
+
+impl Condition for LocalOsMatcherCondition {
+    fn apply(&self, _ctx: &dyn RoutingContext) -> bool {
+        self.matched
+    }
+}
+
 // ── InboundTagMatcher ────────────────────────────────────────
 
 /// 入站 tag 匹配器（任一相等）。
@@ -1437,6 +1465,32 @@ mod tests {
     fn test_process_name_matcher_apply_no_source_returns_false() {
         // 无源 IP 时 find_process 无法查找，apply 返回 false
         let m = ProcessNameMatcherCondition::new(vec!["x".into()]);
+        let ctx = RoutingData::new();
+        assert!(!m.apply(&ctx));
+    }
+
+    #[test]
+    fn test_local_os_matcher_matches_runtime_goos() {
+        // Go a12801c1 condition_test.go TestLocalOSMatcher：候选含 runtime.GOOS → true
+        let m = LocalOsMatcherCondition::new(&[std::env::consts::OS.to_string(), "other".into()]);
+        let ctx = RoutingData::new();
+        assert!(m.apply(&ctx));
+    }
+
+    #[test]
+    fn test_local_os_matcher_case_insensitive() {
+        // Go strings.EqualFold：大小写不敏感（"Windows"/"LINUX" 等文档写法均可）
+        let upper = std::env::consts::OS.to_uppercase();
+        let m = LocalOsMatcherCondition::new(&[upper.clone()]);
+        let ctx = RoutingData::new();
+        assert!(m.apply(&ctx), "候选 {upper} 须命中本机 OS {}", std::env::consts::OS);
+    }
+
+    #[test]
+    fn test_local_os_matcher_other_os_misses() {
+        // 其余 OS 名不命中（缓存于构造期，apply 恒 false）
+        let wrong = if std::env::consts::OS == "windows" { "darwin" } else { "windows" };
+        let m = LocalOsMatcherCondition::new(&[wrong.to_string()]);
         let ctx = RoutingData::new();
         assert!(!m.apply(&ctx));
     }

@@ -6,10 +6,7 @@
 //! ponytail: Go 用 `net.PacketConn`，Rust 端用 [`PacketConn`] trait 抽象，
 //! 上层（quinn adapter）注入 `tokio::net::UdpSocket` 或 `std::net::UdpSocket` 适配。
 
-use std::collections::VecDeque;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::Duration};
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
@@ -44,13 +41,17 @@ struct UdpPacket {
 // ponytail: 不引入 async_trait crate。改用 `Box<dyn Future>` + 手写 trait。
 
 /// 接收一个 UDP 包的 future 类型。
-pub type RecvFuture = std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<(usize, SocketAddr)>> + Send>>;
+pub type RecvFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = std::io::Result<(usize, SocketAddr)>> + Send>,
+>;
 
 /// 发送一个 UDP 包的 future 类型。
-pub type SendFuture = std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<usize>> + Send>>;
+pub type SendFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<usize>> + Send>>;
 
 /// 关闭的 future 类型。
-pub type CloseFuture = std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>;
+pub type CloseFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>;
 
 /// `net.PacketConn` 的异步抽象（对应 Go `net.PacketConn`）。
 ///
@@ -60,7 +61,9 @@ pub trait PacketConn: Send + Sync {
     fn recv_from<'a>(
         &'a self,
         buf: &'a mut [u8],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<(usize, SocketAddr)>> + Send + 'a>>;
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::io::Result<(usize, SocketAddr)>> + Send + 'a>,
+    >;
 
     /// 发送数据包到指定地址。
     fn send_to<'a>(
@@ -70,7 +73,9 @@ pub trait PacketConn: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<usize>> + Send + 'a>>;
 
     /// 关闭。
-    fn close(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>;
+    fn close(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>;
 
     /// 本地地址。
     fn local_addr(&self) -> std::io::Result<SocketAddr>;
@@ -80,8 +85,11 @@ pub trait PacketConn: Send + Sync {
 ///
 /// 上层注入。Go 端调 `internet.DialSystem(ctx, udp_dst)`。
 pub type ListenUdpFunc = Arc<
-    dyn Fn(&SocketAddr) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Arc<dyn PacketConn>>> + Send>>
-        + Send
+    dyn Fn(
+            &SocketAddr,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = std::io::Result<Arc<dyn PacketConn>>> + Send>,
+        > + Send
         + Sync,
 >;
 
@@ -147,16 +155,10 @@ impl UdpHopPacketConn {
         if addrs.is_empty() {
             return Err(HysteriaError::InvalidUdpHop("len(addrs) == 0".into()));
         }
-        let hop_min = if hop_interval_min.is_zero() {
-            DEFAULT_HOP_INTERVAL
-        } else {
-            hop_interval_min
-        };
-        let hop_max = if hop_interval_max.is_zero() {
-            DEFAULT_HOP_INTERVAL
-        } else {
-            hop_interval_max
-        };
+        let hop_min =
+            if hop_interval_min.is_zero() { DEFAULT_HOP_INTERVAL } else { hop_interval_min };
+        let hop_max =
+            if hop_interval_max.is_zero() { DEFAULT_HOP_INTERVAL } else { hop_interval_max };
         if hop_min < MIN_HOP_INTERVAL {
             return Err(HysteriaError::InvalidUdpHop(format!(
                 "hopIntervalMin {:?} < {:?}",
@@ -229,10 +231,7 @@ impl UdpHopPacketConn {
             return Err(err);
         }
         if buf.len() < pkt.n {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "short buffer",
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "short buffer"));
         }
         buf[..pkt.n].copy_from_slice(&pkt.buf[..pkt.n]);
         Ok((pkt.n, pkt.addr.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap())))
@@ -242,10 +241,7 @@ impl UdpHopPacketConn {
     pub async fn write_to(&self, buf: &[u8]) -> std::io::Result<usize> {
         let inner = self.inner.lock();
         if inner.closed {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "closed",
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "closed"));
         }
         let conn = inner
             .current_conn
@@ -276,11 +272,8 @@ impl UdpHopPacketConn {
         if let Some(prev) = inner.prev_conn.take() {
             let _ = prev.close().await;
         }
-        let result = if let Some(cur) = inner.current_conn.take() {
-            cur.close().await
-        } else {
-            Ok(())
-        };
+        let result =
+            if let Some(cur) = inner.current_conn.take() { cur.close().await } else { Ok(()) };
         inner.addrs.clear();
         drop(inner);
 
@@ -317,34 +310,33 @@ async fn recv_loop(conn: Arc<dyn PacketConn>, tx: mpsc::Sender<UdpPacket>) {
     let mut pool: VecDeque<Vec<u8>> = VecDeque::new();
     loop {
         let buf = pool.pop_front().unwrap_or_else(|| vec![0u8; UDP_BUFFER_SIZE]);
-        match conn.recv_from(&mut { let mut b = buf.clone(); b }.as_mut_slice()).await {
+        match conn
+            .recv_from(
+                &mut {
+                    let mut b = buf.clone();
+                    b
+                }
+                .as_mut_slice(),
+            )
+            .await
+        {
             Ok((n, addr)) => {
-                let pkt = UdpPacket {
-                    buf: buf.clone(),
-                    n,
-                    addr: Some(addr),
-                    err: None,
-                };
+                let pkt = UdpPacket { buf: buf.clone(), n, addr: Some(addr), err: None };
                 if tx.try_send(pkt).is_err() {
                     // 队列满，丢弃；pool 已用完 buf，重新 push
                     pool.push_back(buf);
                 }
                 // ponytail: 不真正归还原 buf（已 move 到 packet）
-            }
+            },
             Err(e) => {
                 let kind = e.kind();
                 if matches!(kind, std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) {
-                    let _ = tx
-                        .try_send(UdpPacket {
-                            buf: Vec::new(),
-                            n: 0,
-                            addr: None,
-                            err: Some(e),
-                        });
+                    let _ =
+                        tx.try_send(UdpPacket { buf: Vec::new(), n: 0, addr: None, err: Some(e) });
                     continue;
                 }
                 return;
-            }
+            },
         }
     }
 }
@@ -423,16 +415,14 @@ fn drop_helpers(_tx: &mpsc::Sender<UdpPacket>) {
 /// 构造 `Vec<SocketAddr>`（对应 Go `ToAddrs(ip, ports)`）。
 #[must_use]
 pub fn to_addrs(ip: std::net::IpAddr, ports: &[u32]) -> Vec<SocketAddr> {
-    ports
-        .iter()
-        .map(|&p| SocketAddr::new(ip, p as u16))
-        .collect()
+    ports.iter().map(|&p| SocketAddr::new(ip, p as u16)).collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+
+    use super::*;
 
     #[test]
     fn to_addrs_basic() {
@@ -491,11 +481,7 @@ mod tests {
         }));
         for _ in 0..50 {
             let i = next_hop_interval(&inner);
-            assert!(
-                i >= Duration::from_secs(10) && i <= Duration::from_secs(20),
-                "got {:?}",
-                i
-            );
+            assert!(i >= Duration::from_secs(10) && i <= Duration::from_secs(20), "got {:?}", i);
         }
     }
 

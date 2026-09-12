@@ -457,6 +457,7 @@ mod tests {
             vless_route_list: None,
             process: vec![],
             webhook: None,
+            local_os: vec![],
         }
     }
 

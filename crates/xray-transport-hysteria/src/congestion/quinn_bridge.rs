@@ -6,9 +6,9 @@
 //!
 //! - [`QuinnCCFactory`] 预装进 TransportConfig，每连接 build 出 [`QuinnCCAdapter`]；
 //! - 初始委托 quinn 内建 CUBIC（对应 Go 未切换前的 quic-go 默认）；
-//! - auth 握手后调 [`apply_negotiated`]（对应 Go dialer.go:229-243 / hub.go:75-86 的
-//!   congestion switch），把 BrutalSender/BbrSender 装进 [`HysteriaCCSlot`]，
-//!   [`QuinnCCAdapter`] 即刻切到真实算法。
+//! - auth 握手后调 [`apply_negotiated`]（对应 Go dialer.go:229-243 / hub.go:75-86 的 congestion
+//!   switch），把 BrutalSender/BbrSender 装进 [`HysteriaCCSlot`]， [`QuinnCCAdapter`]
+//!   即刻切到真实算法。
 //!
 //! ## 与 Go 的差异
 //!
@@ -18,21 +18,20 @@
 //!   `OnCongestionEventEx` 携带逐包列表：BrutalSender 的 ack/loss 计数按「批」计，
 //!   样本积累（MIN_SAMPLE_COUNT=50）略慢，方向正确。
 
-use std::sync::Arc;
-use std::collections::VecDeque;
-use std::time::Instant;
+use std::{collections::VecDeque, sync::Arc, time::Instant};
 
 use parking_lot::Mutex;
-
 use quinn_proto::congestion::Controller;
-use super::bbr::{BbrSender, DefaultClock, Profile};
-use super::bbr::Clock as _;
-use super::brutal::BrutalSender;
-use super::types::{
-    AckedPacketInfo, ByteCount, CongestionControl, LostPacketInfo, MonoTime, PacketNumber,
-    RttStatsProvider, INITIAL_PACKET_SIZE,
+
+use super::{
+    bbr::{BbrSender, Clock as _, DefaultClock, Profile},
+    brutal::BrutalSender,
+    types::{
+        AckedPacketInfo, ByteCount, CongestionControl, INITIAL_PACKET_SIZE, LostPacketInfo,
+        MonoTime, PacketNumber, RttStatsProvider,
+    },
+    utils::CongestionSetter,
 };
-use super::utils::CongestionSetter;
 use crate::error::HysteriaError;
 
 /// 把 quinn 事件时间映射到 hysteria MonoTime 域（DefaultClock 的全局基准）。
@@ -66,6 +65,7 @@ impl RttStatsProvider for SharedRtt {
     fn smoothed_rtt(&self) -> std::time::Duration {
         std::time::Duration::from_nanos(*self.smoothed_ns.lock())
     }
+
     fn min_rtt(&self) -> std::time::Duration {
         std::time::Duration::from_nanos(*self.min_ns.lock())
     }
@@ -101,14 +101,18 @@ impl SentBook {
                 None => {
                     self.total_bytes = 0;
                     break;
-                }
+                },
             }
         }
     }
 
     /// 从队首冲销 ≤`bytes` 的条目 → 真实 acked 列表（各条 bytes_acked 之和守恒于
     /// 聚合值）。簿空（migration 交叉等异常）时退化为合成 pn=0 保字节记账。
-    fn drain_ack(&mut self, mut bytes: ByteCount, receive_time_ns: MonoTime) -> Vec<AckedPacketInfo> {
+    fn drain_ack(
+        &mut self,
+        mut bytes: ByteCount,
+        receive_time_ns: MonoTime,
+    ) -> Vec<AckedPacketInfo> {
         let mut acked = Vec::new();
         while bytes > 0 {
             match self.queue.pop_front() {
@@ -128,7 +132,7 @@ impl SentBook {
                     } else {
                         bytes -= sz;
                     }
-                }
+                },
                 None => {
                     acked.push(AckedPacketInfo {
                         packet_number: 0,
@@ -136,7 +140,7 @@ impl SentBook {
                         receive_time_ns,
                     });
                     bytes = 0;
-                }
+                },
             }
         }
         acked
@@ -159,11 +163,11 @@ impl SentBook {
                     } else {
                         bytes -= sz;
                     }
-                }
+                },
                 None => {
                     lost.push(LostPacketInfo { packet_number: 0, bytes_lost: bytes });
                     bytes = 0;
-                }
+                },
             }
         }
         lost
@@ -239,17 +243,29 @@ impl CCState {
 /// 占位 Controller（factory build 前的空槽）。
 struct PlaceholderController;
 impl Controller for PlaceholderController {
-    fn on_congestion_event(&mut self, _now: Instant, _sent: Instant, _is_persistent: bool, _lost: u64) {}
+    fn on_congestion_event(
+        &mut self,
+        _now: Instant,
+        _sent: Instant,
+        _is_persistent: bool,
+        _lost: u64,
+    ) {
+    }
+
     fn on_mtu_update(&mut self, _new_mtu: u16) {}
+
     fn window(&self) -> u64 {
         1452
     }
+
     fn clone_box(&self) -> Box<dyn Controller> {
         Box::new(PlaceholderController)
     }
+
     fn initial_window(&self) -> u64 {
         1452
     }
+
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
         self
     }
@@ -298,7 +314,7 @@ impl Controller for QuinnCCAdapter {
                     bytes as i64,
                     true,
                 );
-            }
+            },
             None => st.fallback.on_sent(now, bytes, last_packet_number),
         }
     }
@@ -340,7 +356,9 @@ impl Controller for QuinnCCAdapter {
         let lost = st.book.drain_lost(lost_bytes as ByteCount);
         match &mut st.active {
             Some(cc) => cc.on_congestion_event_ex(in_flight, t, &[], &lost),
-            None => st.fallback.on_congestion_event(now, sent, is_persistent_congestion, lost_bytes),
+            None => {
+                st.fallback.on_congestion_event(now, sent, is_persistent_congestion, lost_bytes)
+            },
         }
     }
 
@@ -385,6 +403,7 @@ impl RttStatsProvider for SharedRttHandle {
     fn smoothed_rtt(&self) -> std::time::Duration {
         self.0.smoothed_rtt()
     }
+
     fn min_rtt(&self) -> std::time::Duration {
         self.0.min_rtt()
     }
@@ -397,9 +416,9 @@ pub fn apply_bbr(slot: &HysteriaCCSlot, profile: Profile) {
     slot.set_congestion_control(Box::new(sender));
 }
 
-/// 应用 Brutal（对应 Go `UseBrutal`）。
-pub fn apply_brutal(slot: &HysteriaCCSlot, tx_bps: u64) {
-    let mut sender = BrutalSender::new(tx_bps);
+/// 应用 Brutal（对应 Go `UseBrutal(conn, tx, disableLossCompensation)`）。
+pub fn apply_brutal(slot: &HysteriaCCSlot, tx_bps: u64, disable_loss_compensation: bool) {
+    let mut sender = BrutalSender::new(tx_bps, disable_loss_compensation);
     sender.set_rtt_stats_provider(Box::new(SharedRttHandle(Arc::clone(&slot.rtt))));
     slot.set_congestion_control(Box::new(sender));
 }
@@ -419,25 +438,26 @@ pub fn apply_negotiated(
     bbr_profile: &str,
     brutal_up: u64,
     down: u64,
+    disable_loss_compensation: bool,
 ) -> crate::Result<()> {
     match congestion.to_ascii_lowercase().as_str() {
         "reno" => Ok(()),
         "bbr" => {
             apply_bbr(slot, Profile::parse(bbr_profile)?);
             Ok(())
-        }
+        },
         "" | "brutal" => {
             if brutal_up == 0 || down == 0 {
                 apply_bbr(slot, Profile::parse(bbr_profile)?);
             } else {
-                apply_brutal(slot, brutal_up.min(down));
+                apply_brutal(slot, brutal_up.min(down), disable_loss_compensation);
             }
             Ok(())
-        }
+        },
         "force-brutal" => {
-            apply_brutal(slot, brutal_up);
+            apply_brutal(slot, brutal_up, disable_loss_compensation);
             Ok(())
-        }
+        },
         other => Err(HysteriaError::UnsupportedCongestionType(other.to_string())),
     }
 }
@@ -454,7 +474,6 @@ pub fn install_swappable_cc(t: &mut quinn::TransportConfig) -> Arc<HysteriaCCSlo
 mod tests {
     use super::*;
 
-
     #[test]
     fn slot_swaps_window_to_brutal_semantics() {
         use quinn_proto::congestion::Controller as _;
@@ -465,14 +484,14 @@ mod tests {
         assert_eq!(adapter.window(), 1452);
 
         // 切到 Brutal(1 MB/s)：无 RTT 样本时窗口回落 10240（brutal.rs 语义）。
-        apply_brutal(&adapter.slot, 1_000_000);
+        apply_brutal(&adapter.slot, 1_000_000, false);
         assert_eq!(adapter.window(), 10_240);
 
         // RTT 喂样后窗口 = 2×bps×rtt（100ms RTT，ack_rate=1 → 200_000 字节）。
-        adapter.slot.rtt.update(
-            std::time::Duration::from_millis(100),
-            std::time::Duration::from_millis(100),
-        );
+        adapter
+            .slot
+            .rtt
+            .update(std::time::Duration::from_millis(100), std::time::Duration::from_millis(100));
         assert_eq!(adapter.window(), 200_000);
     }
 
@@ -480,12 +499,12 @@ mod tests {
     fn apply_negotiated_matches_go_switch() {
         // bbr：active 存在。
         let slot = HysteriaCCSlot::new();
-        apply_negotiated(&slot, "bbr", "standard", 0, 0).unwrap();
+        apply_negotiated(&slot, "bbr", "standard", 0, 0, false).unwrap();
         assert!(slot.state.lock().active.is_some());
 
         // reno：不切换。
         let slot = HysteriaCCSlot::new();
-        apply_negotiated(&slot, "reno", "", 999, 999).unwrap();
+        apply_negotiated(&slot, "reno", "", 999, 999, false).unwrap();
         assert!(slot.state.lock().active.is_none());
 
         // 行为断言（Box<dyn CongestionControl> 不可 downcast）：
@@ -495,25 +514,25 @@ mod tests {
 
         // ""+双边非 0 → Brutal(min(500,800)=500)：10s RTT → 2×500×10 = 10000。
         let slot = HysteriaCCSlot::new();
-        apply_negotiated(&slot, "", "standard", 500, 800).unwrap();
+        apply_negotiated(&slot, "", "standard", 500, 800, false).unwrap();
         slot.rtt.update(RTT10S, RTT10S);
         assert_eq!(slot.current_window(), 10_000, "min(up=500, down=800) = 500");
 
         // up=0 → BBR：初始窗口 38400。
         let slot = HysteriaCCSlot::new();
-        apply_negotiated(&slot, "brutal", "standard", 0, 800).unwrap();
+        apply_negotiated(&slot, "brutal", "standard", 0, 800, false).unwrap();
         assert_eq!(slot.current_window(), 38_400, "up=0 must fall back to BBR");
 
         // force-brutal：直接 up=1234，不看 down：10s RTT → 2×1234×10 = 24680。
         let slot = HysteriaCCSlot::new();
-        apply_negotiated(&slot, "force-brutal", "", 1234, 0).unwrap();
+        apply_negotiated(&slot, "force-brutal", "", 1234, 0, false).unwrap();
         slot.rtt.update(RTT10S, RTT10S);
         assert_eq!(slot.current_window(), 24_680);
 
         // 未知值 → Err（Go panic 的安全化）。
-        assert!(apply_negotiated(&HysteriaCCSlot::new(), "vegas", "", 1, 1).is_err());
+        assert!(apply_negotiated(&HysteriaCCSlot::new(), "vegas", "", 1, 1, false).is_err());
         // 非法 profile → Err。
-        assert!(apply_negotiated(&HysteriaCCSlot::new(), "bbr", "turbo", 1, 1).is_err());
+        assert!(apply_negotiated(&HysteriaCCSlot::new(), "bbr", "turbo", 1, 1, false).is_err());
     }
 
     #[test]
@@ -529,7 +548,7 @@ mod tests {
         assert_eq!(adapter.window(), 12_000);
 
         // 切 Brutal 后窗口立即变为 Brutal 语义。
-        apply_brutal(&adapter.slot, 100_000);
+        apply_brutal(&adapter.slot, 100_000, false);
         assert_eq!(adapter.window(), 10_240);
     }
 
@@ -541,7 +560,7 @@ mod tests {
         let factory: Arc<QuinnCCFactory> = Arc::new(QuinnCCFactory { slot: Arc::clone(&slot) });
         quinn_proto::congestion::ControllerFactory::build(factory, Instant::now(), 1200);
         let mut adapter = QuinnCCAdapter { slot: Arc::clone(&slot) };
-        apply_brutal(&slot, 1_000_000);
+        apply_brutal(&slot, 1_000_000, false);
 
         // 事件不 panic、swap 后窗口仍为 Brutal 语义。
         let now = Instant::now();
@@ -558,12 +577,9 @@ mod tests {
 
         // clone_box 共享 slot：切换对 clone 生效（path migration 语义）。
         let mut cloned = adapter.clone_box();
-        apply_brutal(&slot, 2_000_000);
+        apply_brutal(&slot, 2_000_000, false);
         // 2MB/s 无 RTT → 仍是 10240 floor；喂 RTT 后 = 2×2MB/s×50ms。
-        slot.rtt.update(
-            std::time::Duration::from_millis(50),
-            std::time::Duration::from_millis(50),
-        );
+        slot.rtt.update(std::time::Duration::from_millis(50), std::time::Duration::from_millis(50));
         assert_eq!(cloned.window(), 200_000);
     }
 
@@ -653,7 +669,7 @@ mod tests {
     fn install_swappable_cc_returns_live_slot() {
         let mut t = quinn::TransportConfig::default();
         let slot = install_swappable_cc(&mut t);
-        apply_brutal(&slot, 42);
+        apply_brutal(&slot, 42, false);
         assert!(slot.state.lock().active.is_some());
     }
 }

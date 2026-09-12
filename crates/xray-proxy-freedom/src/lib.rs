@@ -29,4 +29,5 @@ pub use handler::FreedomHandler;
 pub use dispatcher::FreedomDispatchBridge;
 pub use dispatcher::make_dial_fn as make_freedom_dial_fn;
 pub use dispatcher::make_dial_fn_with_config as make_freedom_dial_fn_with_config;
+pub use dispatcher::make_dial_fn_with_sockopt as make_freedom_dial_fn_with_sockopt;
 pub use inbound::FreedomInboundHandler;

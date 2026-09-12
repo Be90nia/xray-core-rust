@@ -26,7 +26,8 @@ MODE = {'random': 2, 'xorpub': 1, 'native': 0}
 
 
 def tls_cli(rust_client):
-    return {'allowInsecure': True} if rust_client else {'pinnedPeerCertSha256': PIN}
+    # bd 5x41: allowInsecure 已在配置期硬错，双向统一走证书 pin。
+    return {'pinnedPeerCertSha256': PIN}
 
 
 def tls_srv():

@@ -11,10 +11,7 @@ pub type Config = ProtoConfig;
 /// 默认配置（对应 Go `init()` 中 `&Config{ UdpIdleTimeout: 60 }`）。
 #[must_use]
 pub fn default_config() -> Config {
-    Config {
-        udp_idle_timeout: 60,
-        ..Config::default()
-    }
+    Config { udp_idle_timeout: 60, ..Config::default() }
 }
 
 /// 把用户 JSON `masquerade` 嵌套对象展开到 proto Config 扁平字段。
@@ -40,12 +37,8 @@ pub fn apply_masquerade_json(
     config.masq_type = get_str("type").to_string();
     config.masq_file = get_str("dir").to_string();
     config.masq_url = get_str("url").to_string();
-    config.masq_url_rewrite_host = m
-        .get("rewriteHost")
-        .and_then(|x| x.as_bool())
-        .unwrap_or(false);
-    config.masq_url_insecure =
-        m.get("insecure").and_then(|x| x.as_bool()).unwrap_or(false);
+    config.masq_url_rewrite_host = m.get("rewriteHost").and_then(|x| x.as_bool()).unwrap_or(false);
+    config.masq_url_insecure = m.get("insecure").and_then(|x| x.as_bool()).unwrap_or(false);
     config.masq_string = get_str("content").to_string();
     if let Some(h) = m.get("headers") {
         let Some(hm) = h.as_object() else {
@@ -59,10 +52,8 @@ pub fn apply_masquerade_json(
             .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
             .collect();
     }
-    config.masq_string_status_code = m
-        .get("statusCode")
-        .and_then(|x| x.as_i64())
-        .unwrap_or(0) as i32;
+    config.masq_string_status_code =
+        m.get("statusCode").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
     Ok(())
 }
 
@@ -97,8 +88,9 @@ impl ConfigExt for Config {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::HashMap;
+
+    use super::*;
 
     #[test]
     fn default_config_has_udp_idle_timeout_60() {
@@ -139,6 +131,7 @@ mod tests {
             masq_file: "/var/www".into(),
             masq_url: "https://masq.example.com".into(),
             masq_url_rewrite_host: true,
+            masq_url_x_forwarded: false,
             masq_url_insecure: false,
             masq_string: "hello".into(),
             masq_string_headers: HashMap::from([
@@ -161,16 +154,9 @@ mod tests {
             ..Config::default()
         };
         let cases: Vec<(Config, MasqType)> = vec![
+            (Config { masq_type: String::new(), ..direct.clone() }, MasqType::NotFound),
             (
-                Config { masq_type: String::new(), ..direct.clone() },
-                MasqType::NotFound,
-            ),
-            (
-                Config {
-                    masq_type: "file".into(),
-                    masq_file: "/var/www".into(),
-                    ..direct.clone()
-                },
+                Config { masq_type: "file".into(), masq_file: "/var/www".into(), ..direct.clone() },
                 MasqType::File("/var/www".into()),
             ),
             (
@@ -218,7 +204,6 @@ mod tests {
             assert_eq!(out.masq_string_status_code, src.masq_string_status_code);
         }
     }
-
 
     #[test]
     fn transport_config_direct_fields_documented_consumers() {

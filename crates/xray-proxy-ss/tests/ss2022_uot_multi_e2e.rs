@@ -13,20 +13,19 @@
 //! （dispatcher.rs `Network::UDP` 注释；Go shadowsocks_2022 无 uot 消费点），
 //! 因此本测试同时证明 uot 字段在场不改变多用户 UDP wire 行为。
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use base64::Engine as _;
 use tokio::net::UdpSocket;
-
 use xray_app_dispatcher::UdpDispatchSession;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::port::Port;
-
-use xray_proxy_ss::dispatcher::{make_ss_dial_fn, parse_ss_config};
-use xray_proxy_ss::ss2022::key::{psk_identity, CipherKind2022};
-use xray_proxy_ss::ss2022::packet::{server_decode_header, ServerUdpSession2022};
+use xray_common::net::{address::Address, destination::Destination, port::Port};
+use xray_proxy_ss::{
+    dispatcher::{make_ss_dial_fn, parse_ss_config},
+    ss2022::{
+        key::{CipherKind2022, psk_identity},
+        packet::{ServerUdpSession2022, server_decode_header},
+    },
+};
 
 const KIND: CipherKind2022 = CipherKind2022::Aes256Gcm;
 /// 32B iPSK / uPSK（对齐 harness 的可读 ASCII PSK 风格）。
@@ -48,7 +47,8 @@ async fn spawn_multi_user_udp_server(sock: UdpSocket) {
             let Ok(hdr) = server_decode_header(KIND, &ipsk, &users, &buf[..n]) else {
                 continue;
             };
-            let Ok(session) = ServerUdpSession2022::new(KIND, hdr.aead_psk.to_vec(), hdr.session_id)
+            let Ok(session) =
+                ServerUdpSession2022::new(KIND, hdr.aead_psk.to_vec(), hdr.session_id)
             else {
                 continue;
             };
@@ -101,12 +101,11 @@ async fn ss2022_uot_multi_user_udp_dispatch_roundtrip() {
     assert_eq!(ss2022.identity_psk_b64.as_deref(), Some(b64(IPSK).as_str()));
 
     // ===== 3. dispatcher UDP 会话（XUDP 帧 ↔ 2022 会话帧 pump）=====
-    let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> = Arc::new(
-        xray_app_dispatcher::default::DialBridge::new(
+    let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
+        Arc::new(xray_app_dispatcher::default::DialBridge::new(
             "ss2022-uot-out",
             make_ss_dial_fn(Arc::clone(&cfg)),
-        ),
-    );
+        ));
     let mut session = UdpDispatchSession::new(handler);
 
     // ===== 4. 发 UDP 包（DNS 查询形态）→ echo 回包 roundtrip =====

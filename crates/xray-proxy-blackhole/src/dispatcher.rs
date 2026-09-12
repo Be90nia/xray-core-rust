@@ -12,17 +12,17 @@
 //!
 //! [`DispatchHandler`]: xray_app_dispatcher::default::DispatchHandler
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use xray_app_dispatcher::default::{DispatchHandler, PinFuture};
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
+use xray_common::net::{destination::Destination, network::Network};
 use xray_proto::xray::proxy::blackhole::Config;
 use xray_transport::link::Link;
 
-use crate::response::{get_internal_response, ResponseConfig};
-use crate::BlackholeError;
+use crate::{
+    BlackholeError,
+    response::{ResponseConfig, get_internal_response},
+};
 
 /// 写完响应后让客户端读走的等待时间（与 Go `time.Sleep(time.Second)` 一致）。
 const RESPONSE_SETTLE: Duration = Duration::from_secs(1);
@@ -50,10 +50,7 @@ impl BlackholeHandler {
     ///
     /// 对应 Go `New(ctx, config)`——`ctx` 未使用故省略。
     pub fn new(tag: impl Into<String>, config: Config) -> Result<Self, BlackholeError> {
-        Ok(Self {
-            tag: tag.into(),
-            response: get_internal_response(&config)?,
-        })
+        Ok(Self { tag: tag.into(), response: get_internal_response(&config)? })
     }
 
     /// 用显式 [`ResponseConfig`] 构造（测试 / 上层 adapter 复用）。
@@ -64,7 +61,7 @@ impl BlackholeHandler {
 
     /// 暴露响应配置（测试用）。
     pub fn response(&self) -> ResponseConfig {
-        self.response
+        self.response.clone()
     }
 }
 
@@ -83,21 +80,17 @@ impl DispatchHandler for BlackholeHandler {
     }
 
     fn dispatch(&self, dest: &Destination, link: Link) -> PinFuture<()> {
-        let response = self.response;
+        let response = self.response.clone();
         // edwo：TCP drain 上限封顶（之前 Duration::MAX 在客户端永不 EOF 时挂死）。
         // 5 分钟上限远超正常 EOF 时间；客户端主动断 / EOF 仍立即返回。
-        let drain_timeout = if dest.network() == Network::UDP {
-            UDP_DRAIN
-        } else {
-            TCP_DRAIN_MAX
-        };
+        let drain_timeout = if dest.network() == Network::UDP { UDP_DRAIN } else { TCP_DRAIN_MAX };
         let tag = self.tag.clone();
         Box::pin(async move {
             let mut writer = link.writer;
             let mut reader = link.reader;
 
             // 1. 写预置响应（若有）
-            if response != ResponseConfig::None {
+            if !response.is_empty() {
                 if let Err(e) = response.write_to(&mut writer).await {
                     tracing::warn!(tag = %tag, "blackhole write response: {e}");
                 }
@@ -109,7 +102,7 @@ impl DispatchHandler for BlackholeHandler {
             // 2. drain reader（Go Process 里 buf.Copy(link.Reader, buf.Discard)）
             loop {
                 match tokio::time::timeout(drain_timeout, reader.read_multi_buffer()).await {
-                    Ok(Ok(_)) => {} // drain 一帧
+                    Ok(Ok(_)) => {}, // drain 一帧
                     Ok(Err(_)) | Err(_) => break,
                 }
             }
@@ -129,13 +122,18 @@ pub fn make_blackhole_handler(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Instant,
+    };
+
+    use xray_buf::{
+        io::{self, Reader, Writer},
+        multi::MultiBuffer,
+    };
+    use xray_common::net::{address::Address, port::Port};
+
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Instant;
-    use xray_buf::io::{self, Reader, Writer};
-    use xray_buf::multi::MultiBuffer;
-    use xray_common::net::address::Address;
-    use xray_common::net::port::Port;
 
     /// 立即返回错误的 reader（模拟 EOF / 已关闭）。
     struct EofReader;
@@ -154,7 +152,8 @@ mod tests {
         fn write_multi_buffer<'a>(
             &'a mut self,
             mb: MultiBuffer,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send + 'a>> {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send + 'a>>
+        {
             let n = mb.iter().map(|b| b.bytes().len()).sum::<usize>();
             self.0.fetch_add(n, Ordering::Relaxed);
             Box::pin(async { Ok(()) })
@@ -169,7 +168,8 @@ mod tests {
     async fn none_response_with_eof_reader_returns_fast() {
         // None response → 不写、不 sleep；EOF reader → drain 立即 break
         let handler = BlackholeHandler::with_response("bh", ResponseConfig::None);
-        let link = Link::new(Box::new(EofReader), Box::new(CountingWriter(Arc::new(AtomicUsize::new(0)))));
+        let link =
+            Link::new(Box::new(EofReader), Box::new(CountingWriter(Arc::new(AtomicUsize::new(0)))));
         let start = Instant::now();
         handler.dispatch(&tcp_dest(), link).await;
         assert!(
@@ -203,12 +203,10 @@ mod tests {
     async fn udp_dest_eof_reader_still_returns_fast() {
         // UDP dest 用 60s 超时——但 EOF reader 立即 break，不等超时
         let handler = BlackholeHandler::with_response("bh", ResponseConfig::None);
-        let dest = Destination::new(
-            Address::new_domain("example.com"),
-            Port::new(443),
-            Network::UDP,
-        );
-        let link = Link::new(Box::new(EofReader), Box::new(CountingWriter(Arc::new(AtomicUsize::new(0)))));
+        let dest =
+            Destination::new(Address::new_domain("example.com"), Port::new(443), Network::UDP);
+        let link =
+            Link::new(Box::new(EofReader), Box::new(CountingWriter(Arc::new(AtomicUsize::new(0)))));
         let start = Instant::now();
         handler.dispatch(&dest, link).await;
         assert!(
@@ -226,40 +224,25 @@ mod tests {
     }
 
     #[test]
-    fn new_from_config_accepts_explicit_none_type() {
-        use xray_proto::xray::common::serial::TypedMessage;
-        let config = Config {
-            response: Some(TypedMessage {
-                r#type: "xray.proxy.blackhole.NoneResponse".into(),
-                value: Vec::new(),
-            }),
-        };
+    fn new_from_config_accepts_empty_type() {
+        let config =
+            Config { response: Some(crate::response::proto_response(String::new(), Vec::new())) };
         let h = BlackholeHandler::new("bh", config).unwrap();
         assert_eq!(h.response(), ResponseConfig::None);
     }
 
     #[test]
     fn new_from_config_accepts_http_response_type() {
-        use xray_proto::xray::common::serial::TypedMessage;
-        let config = Config {
-            response: Some(TypedMessage {
-                r#type: "xray.proxy.blackhole.HTTPResponse".into(),
-                value: Vec::new(),
-            }),
-        };
+        let config =
+            Config { response: Some(crate::response::proto_response("http".into(), Vec::new())) };
         let h = BlackholeHandler::new("bh", config).unwrap();
         assert_eq!(h.response(), ResponseConfig::Http403);
     }
 
     #[test]
     fn new_rejects_unknown_response_type() {
-        use xray_proto::xray::common::serial::TypedMessage;
-        let config = Config {
-            response: Some(TypedMessage {
-                r#type: "xray.proxy.blackhole.Bogus".into(),
-                value: Vec::new(),
-            }),
-        };
+        let config =
+            Config { response: Some(crate::response::proto_response("bogus".into(), Vec::new())) };
         let r = BlackholeHandler::new("bh", config);
         assert!(matches!(r, Err(BlackholeError::UnknownResponseType(_))));
     }

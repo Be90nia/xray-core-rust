@@ -31,6 +31,7 @@ pub mod stat;
 pub mod listener_registry;
 pub mod fallback;
 pub mod retry;
+pub mod splice;
 
 // 以下模块依赖 Phase 4+ 才会出现的 features（dns/outbound/policy 等），当前为 stub。
 pub mod sockopt;
@@ -47,9 +48,8 @@ pub mod browser_dialer;
 pub mod tagged;
 pub mod memory_settings;
 pub mod proxy_protocol;
-
 // 顶层 re-export。
-pub use bridge::{bridge_connections, copy_one_way};
+pub use bridge::{bridge_connections, bridge_connections_with_splice, copy_one_way};
 pub use proxy_protocol::{build_proxy_header, read_proxy_protocol};
 
 /// TLS acceptor for inbound connections.

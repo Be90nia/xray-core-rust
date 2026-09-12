@@ -11,19 +11,21 @@
 //! Go 端 `addrParser` 用 `WithAddressTypeParser(b & 0x0F)` 提取类型低 4 位
 //! （兼容 SS 实现把额外位编入 addr byte 的情况）。
 //!
-//! - **TCP**：先写随机 IV，再用 AEAD chunk 加密首帧（addr + port）
-//!   wire format：`[IV][sealed_size_chunk(18B)][sealed_payload_chunk]`
+//! - **TCP**：先写随机 IV，再用 AEAD chunk 加密首帧（addr + port） wire
+//!   format：`[IV][sealed_size_chunk(18B)][sealed_payload_chunk]`
 //!   - `sealed_size_chunk` = `aead.seal(nonce=[0;n], [], BE(plain_size))`
-//!   - `sealed_payload_chunk` = `aead.seal(nonce=[1,0,...], [], addr+port)`
-//!     nonce 序列与 Go `GenerateAEADNonceWithSize(n)` 行为一致（首帧 increment → [0;n]）
-//!     后续 body chunk 由真实流式 client/server 处理（需共享 nonce 状态）
+//!   - `sealed_payload_chunk` = `aead.seal(nonce=[1,0,...], [], addr+port)` nonce 序列与 Go
+//!     `GenerateAEADNonceWithSize(n)` 行为一致（首帧 increment → [0;n]） 后续 body chunk 由真实流式
+//!     client/server 处理（需共享 nonce 状态）
 //! - **UDP**：每个包自包含 IV + 加密(addr + payload)，一次性 nonce 全 0
 
 use xray_common::net::address::Address;
 
-use crate::config::MemoryAccount;
-use crate::error::{Result, SsError};
-use crate::validator::{MemoryUser, RequestCommand, Validator};
+use crate::{
+    config::MemoryAccount,
+    error::{Result, SsError},
+    validator::{MemoryUser, RequestCommand, Validator},
+};
 
 // ============================================================================
 // 地址类型字节 + SS 地址编解码
@@ -52,18 +54,18 @@ pub fn write_address_port_ss(out: &mut Vec<u8>, addr: &Address, port: u16) {
         Address::IPv4(v4) => {
             out.push(addr_type::IPV4);
             out.extend_from_slice(&v4.octets());
-        }
+        },
         Address::Domain(domain) => {
             out.push(addr_type::DOMAIN);
             let bytes = domain.as_bytes();
             let len = u8::try_from(bytes.len()).unwrap_or(255);
             out.push(len);
             out.extend_from_slice(&bytes[..len as usize]);
-        }
+        },
         Address::IPv6(v6) => {
             out.push(addr_type::IPV6);
             out.extend_from_slice(&v6.octets());
-        }
+        },
     }
     out.extend_from_slice(&port.to_be_bytes());
 }
@@ -89,7 +91,7 @@ pub fn read_address_port_ss(buf: &[u8]) -> Result<(Address, u16, usize)> {
             let mut ip = [0u8; 4];
             ip.copy_from_slice(&buf[pos..pos + 4]);
             (Address::IPv4(std::net::Ipv4Addr::from(ip)), 4)
-        }
+        },
         addr_type::DOMAIN => {
             if buf.len() < pos + 1 {
                 return Err(SsError::InsufficientData(buf.len()));
@@ -103,7 +105,7 @@ pub fn read_address_port_ss(buf: &[u8]) -> Result<(Address, u16, usize)> {
                 .map_err(|_| SsError::InvalidRemoteAddress)?;
             // consumed = len 字节长度（pos 后续在外层 pos += consumed 统一加）
             (Address::Domain(domain), len)
-        }
+        },
         addr_type::IPV6 => {
             if buf.len() < pos + 16 {
                 return Err(SsError::InsufficientData(buf.len()));
@@ -111,7 +113,7 @@ pub fn read_address_port_ss(buf: &[u8]) -> Result<(Address, u16, usize)> {
             let mut ip = [0u8; 16];
             ip.copy_from_slice(&buf[pos..pos + 16]);
             (Address::IPv6(std::net::Ipv6Addr::from(ip)), 16)
-        }
+        },
         _ => return Err(SsError::InvalidRemoteAddress),
     };
     pos += consumed;
@@ -196,7 +198,10 @@ pub fn encode_udp_packet(
 /// # Errors
 /// - [`SsError::UserNotFound`]：未匹配到用户。
 /// - 透传 AEAD / cipher 错误。
-pub fn decode_udp_packet(validator: &Validator, payload: &[u8]) -> Result<(RequestHeader, Vec<u8>)> {
+pub fn decode_udp_packet(
+    validator: &Validator,
+    payload: &[u8],
+) -> Result<(RequestHeader, Vec<u8>)> {
     let r = validator.get(payload, RequestCommand::Udp)?;
 
     // 取得 plaintext（去掉 IV 部分）
@@ -259,10 +264,10 @@ const fn size_chunk_wire_len(tag_size: usize) -> usize {
 ///
 /// wire format（对应 Go `WriteTCPRequest` + `AuthenticationWriter.seal`）：
 /// 1. 随机 IV（长度 = `cipher.iv_size()`）
-/// 2. sealed_size_chunk：`aead.seal(nonce=[0;n], [], BE(data_len + tag_size))`
-///    plaintext = `(addr+port.len + overhead) BE u16`，密文 2 字节 + 16B tag = 18B
-/// 3. sealed_payload_chunk：`aead.seal(nonce=[1,0,...], [], addr+port)`
-///    nonce 第二次 increment（首帧从 [0xFF;n] increment → [0;n]，再 → [1,0,...]）
+/// 2. sealed_size_chunk：`aead.seal(nonce=[0;n], [], BE(data_len + tag_size))` plaintext =
+///    `(addr+port.len + overhead) BE u16`，密文 2 字节 + 16B tag = 18B
+/// 3. sealed_payload_chunk：`aead.seal(nonce=[1,0,...], [], addr+port)` nonce 第二次
+///    increment（首帧从 [0xFF;n] increment → [0;n]，再 → [1,0,...]）
 ///
 /// # Errors
 /// - [`SsError::InsufficientData`]：None cipher 不支持 AEAD TCP（仅 AEAD 走此函数）。
@@ -285,10 +290,7 @@ pub fn encode_tcp_request_header(
     out.extend_from_slice(&iv);
 
     // 2. 派生 subkey + aead 实例（HKDF-SHA1）
-    let aead = account
-        .cipher
-        .create_aead(&account.key, &iv)?
-        .ok_or(SsError::UnsupportedCipher)?;
+    let aead = account.cipher.create_aead(&account.key, &iv)?.ok_or(SsError::UnsupportedCipher)?;
     let nonce_size = aead.nonce_size();
     let tag_size = aead.tag_size();
 
@@ -308,9 +310,8 @@ pub fn encode_tcp_request_header(
     // 5. seal payload chunk：plaintext = addr+port，nonce=[1,0,...]（increment once）
     let mut next_nonce = vec![0u8; nonce_size];
     next_nonce[0] = 1;
-    let sealed_payload = aead
-        .seal(&next_nonce, &[], &header_buf)
-        .map_err(|e| SsError::AeadSeal(e.to_string()))?;
+    let sealed_payload =
+        aead.seal(&next_nonce, &[], &header_buf).map_err(|e| SsError::AeadSeal(e.to_string()))?;
     out.extend_from_slice(&sealed_payload);
 
     Ok(out)
@@ -329,10 +330,7 @@ pub fn encode_tcp_request_header(
 /// - [`SsError::UserNotFound`]：validator 未匹配到用户。
 /// - [`SsError::InsufficientData`]：buf 不足以容纳 IV + size chunk + payload chunk。
 /// - 透传 AEAD open 错误。
-pub fn decode_tcp_request_header(
-    validator: &Validator,
-    buf: &[u8],
-) -> Result<RequestHeader> {
+pub fn decode_tcp_request_header(validator: &Validator, buf: &[u8]) -> Result<RequestHeader> {
     // validator.Get 内部用 zero nonce 尝试解 size chunk（18B）匹配 user
     let r = validator.get(buf, RequestCommand::Tcp)?;
     let user = r.user;
@@ -376,13 +374,7 @@ pub fn decode_tcp_request_header(
         .map_err(|e| SsError::AeadOpen(e.to_string()))?;
 
     let (address, port, _) = read_address_port_ss(&plaintext)?;
-    Ok(RequestHeader {
-        version: crate::VERSION,
-        user,
-        command: RequestCommand::Tcp,
-        address,
-        port,
-    })
+    Ok(RequestHeader { version: crate::VERSION, user, command: RequestCommand::Tcp, address, port })
 }
 
 // ============================================================================
@@ -391,10 +383,10 @@ pub fn decode_tcp_request_header(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::config::CipherType;
-    use crate::validator::Validator;
     use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
+
+    use super::*;
+    use crate::{config::CipherType, validator::Validator};
 
     fn make_account(ct: CipherType, password: &str) -> MemoryAccount {
         let p = ProtoAccount {
@@ -508,9 +500,7 @@ mod tests {
     fn udp_roundtrip(ct: CipherType) {
         let account = make_account(ct, "password");
         let validator = Validator::new();
-        validator
-            .add(crate::validator::MemoryUser::new("u@x.com", account.clone()))
-            .expect("add");
+        validator.add(crate::validator::MemoryUser::new("u@x.com", account.clone())).expect("add");
 
         let addr = Address::Domain("example.com".to_string());
         let payload = b"hello shadowsocks udp payload";
@@ -546,9 +536,7 @@ mod tests {
     fn udp_with_ipv4_address() {
         let account = make_account(CipherType::Aes128Gcm, "password");
         let validator = Validator::new();
-        validator
-            .add(crate::validator::MemoryUser::new("u@x.com", account.clone()))
-            .expect("add");
+        validator.add(crate::validator::MemoryUser::new("u@x.com", account.clone())).expect("add");
 
         let addr = Address::IPv4(std::net::Ipv4Addr::new(8, 8, 8, 8));
         let encoded = encode_udp_packet(&account, &addr, 53, b"query").expect("encode");
@@ -561,9 +549,7 @@ mod tests {
     fn udp_with_ipv6_address() {
         let account = make_account(CipherType::Aes256Gcm, "password");
         let validator = Validator::new();
-        validator
-            .add(crate::validator::MemoryUser::new("u@x.com", account.clone()))
-            .expect("add");
+        validator.add(crate::validator::MemoryUser::new("u@x.com", account.clone())).expect("add");
 
         let addr = Address::IPv6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
         let encoded = encode_udp_packet(&account, &addr, 443, b"ipv6 test").expect("encode");
@@ -592,9 +578,7 @@ mod tests {
         // validator 里只有另一个用户
         let account2 = make_account(CipherType::Aes128Gcm, "password2");
         let validator = Validator::new();
-        validator
-            .add(crate::validator::MemoryUser::new("u2@x.com", account2))
-            .expect("add");
+        validator.add(crate::validator::MemoryUser::new("u2@x.com", account2)).expect("add");
         let err = decode_udp_packet(&validator, &encoded).unwrap_err();
         // 匹配失败 → UserNotFound
         assert!(matches!(err, SsError::UserNotFound));
@@ -605,9 +589,7 @@ mod tests {
     fn tcp_roundtrip(ct: CipherType, addr: Address, port: u16) {
         let account = make_account(ct, "password");
         let validator = Validator::new();
-        validator
-            .add(crate::validator::MemoryUser::new("u@x.com", account.clone()))
-            .expect("add");
+        validator.add(crate::validator::MemoryUser::new("u@x.com", account.clone())).expect("add");
 
         let encoded = encode_tcp_request_header(&account, &addr, port).expect("encode");
         // wire format: IV(iv_size) + sealed_size_chunk(2 + tag) + sealed_payload(addr_len + tag)
@@ -620,8 +602,11 @@ mod tests {
         };
         let expected_min = iv_size + (2 + tag_size) + (addr_len + 2 /*port*/ + tag_size);
         assert_eq!(
-            encoded.len(), expected_min,
-            "wire len mismatch: got {} expected {}", encoded.len(), expected_min
+            encoded.len(),
+            expected_min,
+            "wire len mismatch: got {} expected {}",
+            encoded.len(),
+            expected_min
         );
 
         let header = decode_tcp_request_header(&validator, &encoded).expect("decode");
@@ -633,11 +618,7 @@ mod tests {
 
     #[test]
     fn tcp_aes_128_domain_roundtrip() {
-        tcp_roundtrip(
-            CipherType::Aes128Gcm,
-            Address::Domain("example.com".to_string()),
-            443,
-        );
+        tcp_roundtrip(CipherType::Aes128Gcm, Address::Domain("example.com".to_string()), 443);
     }
 
     #[test]
@@ -660,11 +641,7 @@ mod tests {
 
     #[test]
     fn tcp_xchacha20_domain_roundtrip() {
-        tcp_roundtrip(
-            CipherType::XChaCha20Poly1305,
-            Address::Domain("x.com".to_string()),
-            80,
-        );
+        tcp_roundtrip(CipherType::XChaCha20Poly1305, Address::Domain("x.com".to_string()), 80);
     }
 
     #[test]
@@ -676,14 +653,10 @@ mod tests {
         // validator 里是另一个用户
         let account2 = make_account(CipherType::Aes128Gcm, "password2");
         let validator = Validator::new();
-        validator
-            .add(crate::validator::MemoryUser::new("u2@x.com", account2))
-            .expect("add");
+        validator.add(crate::validator::MemoryUser::new("u2@x.com", account2)).expect("add");
         let err = decode_tcp_request_header(&validator, &encoded).unwrap_err();
         assert!(matches!(err, SsError::UserNotFound));
     }
-
-
 
     // ---- RequestHeader ----
 

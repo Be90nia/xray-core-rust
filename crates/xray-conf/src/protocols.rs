@@ -1157,6 +1157,9 @@ pub struct BlackholeSettings {
 pub struct BlackholeResponseConfig {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub r#type: Option<String>,
+    /// Go infra/conf/blackhole.go:9 `customResponseData`：base64 标准编码。
+    #[serde(rename = "customResponseData", skip_serializing_if = "Option::is_none")]
+    pub custom_response_data: Option<String>,
 }
 
 /// Loopback 出站 settings。对应 Go `LoopbackConfig`（infra/conf/loopback.go:9-12）。

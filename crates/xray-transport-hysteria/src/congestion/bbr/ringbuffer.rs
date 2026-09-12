@@ -24,9 +24,7 @@ impl<T> RingBuffer<T> {
 
     /// 预分配容量（对应 Go `Init`）。
     pub fn with_capacity(size: usize) -> Self {
-        Self {
-            inner: VecDeque::with_capacity(size),
-        }
+        Self { inner: VecDeque::with_capacity(size) }
     }
 
     /// 长度（对应 Go `Len`）。
@@ -50,23 +48,17 @@ impl<T> RingBuffer<T> {
     ///
     /// 调用前应检查 `is_empty()`。
     pub fn pop_front(&mut self) -> T {
-        self.inner
-            .pop_front()
-            .expect("RingBuffer::pop_front on empty queue")
+        self.inner.pop_front().expect("RingBuffer::pop_front on empty queue")
     }
 
     /// 头部引用（对应 Go `Front`）。空时 panic。
     pub fn front(&self) -> &T {
-        self.inner
-            .front()
-            .expect("RingBuffer::front on empty queue")
+        self.inner.front().expect("RingBuffer::front on empty queue")
     }
 
     /// 头部可变引用。
     pub fn front_mut(&mut self) -> &mut T {
-        self.inner
-            .front_mut()
-            .expect("RingBuffer::front_mut on empty queue")
+        self.inner.front_mut().expect("RingBuffer::front_mut on empty queue")
     }
 
     /// 尾部引用（对应 Go `Back`）。空时 panic。
@@ -76,16 +68,12 @@ impl<T> RingBuffer<T> {
 
     /// 偏移引用（对应 Go `Offset`）。越界 panic。
     pub fn offset(&self, index: usize) -> &T {
-        self.inner
-            .get(index)
-            .expect("RingBuffer::offset index out of range")
+        self.inner.get(index).expect("RingBuffer::offset index out of range")
     }
 
     /// 偏移可变引用。
     pub fn offset_mut(&mut self, index: usize) -> &mut T {
-        self.inner
-            .get_mut(index)
-            .expect("RingBuffer::offset_mut index out of range")
+        self.inner.get_mut(index).expect("RingBuffer::offset_mut index out of range")
     }
 
     /// 清空（对应 Go `Clear`）。

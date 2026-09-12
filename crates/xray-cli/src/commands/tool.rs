@@ -10,6 +10,10 @@
 use clap::{Args, Subcommand};
 
 use crate::error::CliError;
+use crate::commands::api_exec::{build_inbound_configs, build_outbound_configs};
+use prost::Message as _;
+use xray_proto::xray::common::serial::TypedMessage;
+use xray_proto::xray::core::Config as ProtoConfig;
 
 // ---------------------------------------------------------------------------
 // uuid 命令
@@ -204,9 +208,9 @@ pub enum ConvertCommand {
 /// `xray convert json` - protobuf 转 JSON。
 #[derive(Args, Debug, Clone)]
 pub struct ConvertJsonArgs {
-    /// 注入类型名称。
-    #[arg(short, long = "type")]
-    pub inject_type: String,
+    /// 注入类型信息（`_TypedMessage_` 键；Go json.go:42-44 可选 bool）。
+    #[arg(short, long = "type", default_value_t = false)]
+    pub inject_type: bool,
     /// 输入文件路径（protobuf 二进制）。
     pub input: String,
 }
@@ -220,9 +224,9 @@ pub struct ConvertPbArgs {
     /// 启用调试输出。
     #[arg(short, long = "debug", default_value_t = false)]
     pub debug: bool,
-    /// 注入类型名称。
-    #[arg(short, long = "type")]
-    pub inject_type: String,
+    /// 调试输出注入类型信息（Go protobuf.go:52-53 可选 bool）。
+    #[arg(short, long = "type", default_value_t = false)]
+    pub inject_type: bool,
     /// 输入 JSON 文件路径列表。
     #[arg(required = true)]
     pub inputs: Vec<String>,
@@ -262,13 +266,12 @@ pub async fn execute_tls(cmd: &TlsCommand) -> Result<(), CliError> {
 
 /// convert 子命令 execute。
 ///
-/// 两条路径（对应 Go `main/commands/all/convert/{json,protobuf}.go`）：
-/// - `convert json <file>`：读 TypedMessage JSON (`{"type":..., "value":...}`)，
-///   把 base64 `value` 解码为字节并以 `"<base64>"` 形式输出（无 proto 注册表
-///   无法做结构化解码——ponytail 限制）。
-/// - `convert pb [-debug] [-type] <files...>`：合并多文件配置（merge override）
-///   后序列化为 JSON。`-debug` 等价 `-dump` 输出；`-outpbfile` 因需要
-///   `core.Config` proto 编码（详见 `xray_conf::serial` Non-goals）暂未实现。
+/// - `convert json [-type] <file>`：TypedMessage → JSON，`-type` 注入
+///   `_TypedMessage_` 键（Go reflect/marshal.go:42-44）。无 proto 注册表无法
+///   GetInstance 结构化解码，输出 TypedMessage 原样（type + base64 value）。
+/// - `convert pb [-debug] [-outpbfile f] <files...>`：合并多文件配置后，
+///   `-debug` 输出 JSON（Go protobuf.go:81-88）；`-outpbfile` 写
+///   `xray.core.Config` proto 原始字节（Go protobuf.go:90-105 proto.Marshal）。
 pub fn execute_convert(cmd: &ConvertCommand) -> Result<(), CliError> {
     match cmd {
         ConvertCommand::Json(args) => execute_convert_json(args),
@@ -277,61 +280,39 @@ pub fn execute_convert(cmd: &ConvertCommand) -> Result<(), CliError> {
 }
 
 fn execute_convert_json(args: &ConvertJsonArgs) -> Result<(), CliError> {
-    let raw = read_input(&args.input)?;
-    let mut tm: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| {
-        CliError::ConfigLoadFailed(format!("not a TypedMessage JSON: {e}"))
-    })?;
-    if args.inject_type.is_empty() {
-        // 默认走"裸值"路径（无 type 注入）：保留 value 字段。
-        // 极简：把 value 字节 base64 解码后回写为 hex 形式便于阅读
-        // （无 proto 注册表场景）。type 字段（若有）原样保留。
-        if let Some(obj) = tm.as_object_mut() {
-            if let Some(val) = obj.get("value") {
-                if let Some(b64) = val.as_str() {
-                    if let Ok(bytes) = base64_decode(b64) {
-                        obj.insert(
-                            "value_hex".into(),
-                            serde_json::Value::String(hex_encode(&bytes)),
-                        );
-                    }
-                }
-            }
-        }
-    }
-    let pretty = serde_json::to_string_pretty(&tm)
-        .map_err(|e| CliError::ConfigLoadFailed(format!("marshal TypedMessage: {e}")))?;
-    println!("{pretty}");
+    print!("{}", convert_json_output(args)?);
     Ok(())
 }
 
-fn execute_convert_pb(args: &ConvertPbArgs) -> Result<(), CliError> {
-    if !args.inject_type.is_empty() && !args.debug {
-        // 仅 `-type` 无 `-debug` → 同 debug 路径但保留 type 信息（对 JSON 已无意义，
-        // 仅按 Go 语义保留语义占位）。
+/// `convert json` 核心：返回输出文本（测试可捕获）。
+///
+/// Go json.go:40-69：TypedMessage JSON → MarshalToJson；`-t` 注入
+/// `_TypedMessage_`（Go reflect/marshal.go:42-44）。差异：Go 端经 proto 注册表
+/// GetInstance 把 value 解码为结构化字段；本端无注册表，保留 type + base64
+/// value 原样输出。
+fn convert_json_output(args: &ConvertJsonArgs) -> Result<String, CliError> {
+    let raw = read_input(&args.input)?;
+    let tm: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| {
+        CliError::ConfigLoadFailed(format!("failed to unmarshal config: {e}"))
+    })?;
+    let obj = tm
+        .as_object()
+        .ok_or_else(|| CliError::ConfigLoadFailed("not a TypedMessage JSON".into()))?;
+    let type_url = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let value = obj.get("value").and_then(|v| v.as_str()).unwrap_or("");
+    let mut out = serde_json::Map::new();
+    out.insert("type".into(), serde_json::Value::String(type_url.into()));
+    out.insert("value".into(), serde_json::Value::String(value.into()));
+    if args.inject_type {
+        out.insert(
+            "_TypedMessage_".into(),
+            serde_json::Value::String(type_url.into()),
+        );
     }
-    let paths: Vec<std::path::PathBuf> =
-        args.inputs.iter().map(std::path::PathBuf::from).collect();
-    if args.debug {
-        // -debug：合并配置 → 序列化为 JSON 输出（对应 Go MarshalToJson +
-        // JSONMarshalWithoutEscape，protobuf.go:81-88）。
-        let merged = xray_conf::merge_config_from_files(&paths).map_err(|e| {
-            CliError::ConfigLoadFailed(format!("merge config: {e}"))
-        })?;
-        print!("{merged}");
-        Ok(())
-    } else if args.out.is_some() {
-        // -outpbfile：需要把 Config 序列化为 `core.Config` proto——超出当前
-        // xray-conf 切片（serial.rs Non-goals 段落明确）。Fail-fast 告知用户。
-        Err(CliError::Unimplemented {
-            what: "convert pb -outpbfile: JSON→proto encoding requires core.Config proto \
-                   registry (see xray_conf::serial non-goals; use `convert pb -debug` instead)",
-        })
-    } else {
-        Err(CliError::InvalidArgument(
-            "-debug or -outpbfile required for convert pb".into(),
-        ))
-    }
+    serde_json::to_string_pretty(&serde_json::Value::Object(out))
+        .map_err(|e| CliError::ConfigLoadFailed(format!("marshal TypedMessage: {e}")))
 }
+
 
 /// 从文件或 `stdin:` 读取全部字节。
 fn read_input(spec: &str) -> Result<Vec<u8>, CliError> {
@@ -346,25 +327,105 @@ fn read_input(spec: &str) -> Result<Vec<u8>, CliError> {
     }
 }
 
-fn base64_decode(s: &str) -> Result<Vec<u8>, CliError> {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD
-        .decode(s)
-        .map_err(|e| CliError::InvalidArgument(format!("base64 decode: {e}")))
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
+/// `convert pb` 执行（Go protobuf.go:43-106）。
+fn execute_convert_pb(args: &ConvertPbArgs) -> Result<(), CliError> {
+    // Go protobuf.go:61-70：-o 扩展名须为 pb/protobuf/无扩展名；无 -o 且非
+    // -debug → fatal "-outpbfile not specified"。
+    if let Some(out) = &args.out {
+        let ext = std::path::Path::new(out)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if !ext.is_empty() && ext != "pb" && ext != "protobuf" {
+            return Err(CliError::InvalidArgument(
+                "-outpbfile followed by a possible original config.".into(),
+            ));
+        }
+    } else if !args.debug {
+        return Err(CliError::InvalidArgument("-outpbfile not specified".into()));
     }
-    s
+    if args.inputs.is_empty() {
+        return Err(CliError::InvalidArgument(format!(
+            "invalid config list length: {}",
+            args.inputs.len()
+        )));
+    }
+
+    let paths: Vec<std::path::PathBuf> =
+        args.inputs.iter().map(std::path::PathBuf::from).collect();
+    let merged = xray_conf::merge_config_from_files(&paths)
+        .map_err(|e| CliError::ConfigLoadFailed(format!("failed to load config: {e}")))?;
+
+    if args.debug {
+        // Go protobuf.go:81-88：MarshalToJson dump（-debug 优先于 -o，不写文件）。
+        // `-type` 的 "_TypedMessage_" 注入仅作用于 TypedMessage 节点；本端 dump
+        // 是合并后的原始配置 JSON，无注入点（Go 注入 proto 结构内嵌 TM 字段）。
+        print!("{merged}");
+        return Ok(());
+    }
+
+    let out = args.out.as_deref().expect("out/debug checked above");
+    // Go protobuf.go:64（Println 字面量尾空格 + 分隔空格 = 双空格）。
+    println!("Output ProtoBuf file is  {out}");
+    let config: serde_json::Value = serde_json::from_str(&merged)
+        .map_err(|e| CliError::ConfigLoadFailed(format!("parse merged config: {e}")))?;
+    let bytes = json_config_to_proto_config(&config).encode_to_vec();
+    std::fs::write(out, bytes)?;
+    Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// tls hash / cert / ping 实现（对应 Go main/commands/all/tls/{hash,cert,ping}.go）
-// ---------------------------------------------------------------------------
+/// 合并后的配置 JSON → `xray.core.Config` proto（Go `conf.Config.Build` 容器层）。
+///
+/// App 顺序对齐 Go infra/conf/xray.go:528-651：fakedns 最前，log 恒在（缺省
+/// `{}`），dispatcher / proxyman Inbound/Outbound 恒在（空 Config），其后
+/// api/metrics/stats/routing/dns/policy/reverse/observatory/burstObservatory/
+/// geodata 按存在性追加。
+///
+/// # ponytail: TypedMessage.value 载荷沿用本仓 gRPC 栈方言（JSON 字节，与 api
+/// add-inbound 路径一致）；Go 为 proto.Marshal(settings proto)——需 per-app
+/// conf Build() 移植（xray-conf serial Non-goals），出现 .pb 消费方时再补。
+fn json_config_to_proto_config(config: &serde_json::Value) -> ProtoConfig {
+    fn tm(url: &str, v: Option<&serde_json::Value>) -> Option<TypedMessage> {
+        v.map(|v| TypedMessage {
+            r#type: url.into(),
+            value: serde_json::to_vec(v).unwrap_or_default(),
+        })
+    }
+    let empty = serde_json::Value::Object(serde_json::Map::new());
+    let mut app: Vec<TypedMessage> = Vec::new();
+    let mut add = |m: Option<TypedMessage>| {
+        app.extend(m);
+    };
+    add(tm("xray.app.dns.fakedns.FakeDnsConfig", config.get("fakedns")));
+    add(tm("xray.app.log.Config", Some(config.get("log").unwrap_or(&empty))));
+    add(tm("xray.app.dispatcher.Config", Some(&empty)));
+    add(tm("xray.app.proxyman.InboundConfig", Some(&empty)));
+    add(tm("xray.app.proxyman.OutboundConfig", Some(&empty)));
+    add(tm("xray.app.commander.Config", config.get("api")));
+    add(tm("xray.app.metrics.Config", config.get("metrics")));
+    add(tm("xray.app.stats.Config", config.get("stats")));
+    add(tm("xray.app.router.Config", config.get("routing")));
+    add(tm("xray.app.dns.Config", config.get("dns")));
+    add(tm("xray.app.policy.Config", config.get("policy")));
+    add(tm("xray.app.reverse.Config", config.get("reverse")));
+    add(tm("xray.app.observatory.Config", config.get("observatory")));
+    add(tm(
+        "xray.app.observatory.burst.Config",
+        config.get("burstObservatory"),
+    ));
+    add(tm("xray.app.geodata.Config", config.get("geodata")));
+    drop(add);
 
+    let raw = serde_json::to_vec(config).unwrap_or_default();
+    let inbound = build_inbound_configs(&raw).unwrap_or_default();
+    let outbound = build_outbound_configs(&raw).unwrap_or_default();
+    ProtoConfig {
+        inbound,
+        outbound,
+        app,
+        extension: Vec::new(),
+    }
+}
 /// `xray tls hash` 核心：读 cert 文件 → 解析 PEM/DER → 输出 SHA-256 hex 表格。
 ///
 /// 对应 Go `main/commands/all/tls/hash.go::executeHash`：
@@ -1064,5 +1125,268 @@ mod tls_ping_tests {
     fn ping_args_invalid_ip_string_fails_parse() {
         assert!("not.an.ip".parse::<std::net::IpAddr>().is_err());
         assert!("999.999.999.999".parse::<std::net::IpAddr>().is_err());
+    }
+}
+
+#[cfg(test)]
+mod convert_tests {
+
+    use super::*;
+
+    fn write_temp(dir: &tempfile::TempDir, name: &str, content: &str) -> String {
+        let p = dir.path().join(name);
+        std::fs::write(&p, content).unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    /// 真 golden 对拍：解码 Go v26.9.9 `xray convert pb` 对同一 config.json
+    /// 产出的原始字节（fixture 由 Go 基线实际生成，见 mix_go.pb），
+    /// 断言容器字段语义一致（tag / ReceiverConfig / SenderConfig / app 序列）。
+    /// value 载荷方言差异（Go=proto settings，Rust=JSON 字节）不在此断言。
+    #[test]
+    fn convert_pb_decodes_real_go_golden_container() {
+        use prost::Message as _;
+
+        let golden = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/commands/testdata/go_golden_mix.pb"
+        ));
+        let decoded = ProtoConfig::decode(golden.as_slice()).unwrap();
+
+        assert_eq!(decoded.inbound.len(), 1);
+        assert_eq!(decoded.inbound[0].tag, "in-1");
+        assert_eq!(
+            decoded.inbound[0]
+                .receiver_settings
+                .as_ref()
+                .unwrap()
+                .r#type,
+            "xray.app.proxyman.ReceiverConfig"
+        );
+        assert_eq!(
+            decoded.inbound[0].proxy_settings.as_ref().unwrap().r#type,
+            "xray.proxy.dokodemo.Config"
+        );
+
+        assert_eq!(decoded.outbound.len(), 1);
+        assert_eq!(decoded.outbound[0].tag, "out-1");
+        assert_eq!(
+            decoded.outbound[0]
+                .sender_settings
+                .as_ref()
+                .unwrap()
+                .r#type,
+            "xray.app.proxyman.SenderConfig"
+        );
+        assert_eq!(
+            decoded.outbound[0].proxy_settings.as_ref().unwrap().r#type,
+            "xray.proxy.freedom.Config"
+        );
+
+        let urls: Vec<&str> = decoded.app.iter().map(|t| t.r#type.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "xray.app.log.Config",
+                "xray.app.dispatcher.Config",
+                "xray.app.proxyman.InboundConfig",
+                "xray.app.proxyman.OutboundConfig",
+                "xray.app.router.Config",
+            ]
+        );
+    }
+
+    /// 我们对同一 config 的产出与 Go golden 在容器字段（tag + app type_url
+    /// 序列）上一致；value 载荷为既定方言差异（见 json_config_to_proto_config）。
+    #[test]
+    fn convert_pb_container_fields_match_go_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = write_temp(
+            &dir,
+            "config.json",
+            r#"{
+                "log": {"loglevel": "warning"},
+                "inbounds": [{"tag": "in-1", "protocol": "dokodemo-door",
+                              "settings": {"address": "127.0.0.1"}}],
+                "outbounds": [{"tag": "out-1", "protocol": "freedom", "settings": {}}],
+                "routing": {"domainStrategy": "AsIs"}
+            }"#,
+        );
+        let out_path = dir.path().join("mix.pb");
+        let args = ConvertPbArgs {
+            out: Some(out_path.to_string_lossy().into_owned()),
+            debug: false,
+            inject_type: false,
+            inputs: vec![cfg],
+        };
+        execute_convert_pb(&args).unwrap();
+        let bytes = std::fs::read(&out_path).unwrap();
+        let ours = ProtoConfig::decode(bytes.as_slice()).unwrap();
+
+        let golden = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/commands/testdata/go_golden_mix.pb"
+        ));
+        let go = ProtoConfig::decode(golden.as_slice()).unwrap();
+
+        let tags: Vec<String> = ours.inbound.iter().map(|i| i.tag.clone()).collect();
+        let go_tags: Vec<String> = go.inbound.iter().map(|i| i.tag.clone()).collect();
+        assert_eq!(tags, go_tags);
+
+        let urls: Vec<String> = ours.app.iter().map(|t| t.r#type.clone()).collect();
+        let go_urls: Vec<String> = go.app.iter().map(|t| t.r#type.clone()).collect();
+        assert_eq!(urls, go_urls);
+    }
+
+
+    /// convert json -t：注入 `_TypedMessage_`（Go reflect/marshal.go:42-44）。
+    #[test]
+    fn convert_json_type_flag_injects_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_temp(
+            &dir,
+            "tmsg.json",
+            r#"{"type":"xray.proxy.shadowsocks.Account","value":"CgMxMTEQBg=="}"#,
+        );
+        let args = ConvertJsonArgs { inject_type: true, input };
+        let out = convert_json_output(&args).unwrap();
+        assert!(out.contains("\"_TypedMessage_\""), "got: {out}");
+        assert!(out.contains("xray.proxy.shadowsocks.Account"));
+        assert!(out.contains("CgMxMTEQBg=="));
+    }
+
+    /// convert json 不带 -t：无 `_TypedMessage_` 键（此前误为必填 String，缺省报
+    /// missing required——bd jo0j ①）。
+    #[test]
+    fn convert_json_without_flag_omits_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_temp(
+            &dir,
+            "tmsg.json",
+            r#"{"type":"xray.proxy.shadowsocks.Account","value":"CgMxMTEQBg=="}"#,
+        );
+        let args = ConvertJsonArgs { inject_type: false, input };
+        let out = convert_json_output(&args).unwrap();
+        assert!(!out.contains("_TypedMessage_"), "got: {out}");
+        assert!(out.contains("\"value\": \"CgMxMTEQBg==\""));
+    }
+
+    /// convert pb -outpbfile：写 `xray.core.Config` proto 原始字节，golden 字段对拍。
+    #[test]
+    fn convert_pb_writes_proto_bytes_golden_fields() {
+        use prost::Message as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = write_temp(
+            &dir,
+            "config.json",
+            r#"{
+                "log": {"loglevel": "warning"},
+                "inbounds": [{"tag": "in-1", "protocol": "dokodemo-door",
+                              "settings": {"address": "127.0.0.1"}}],
+                "outbounds": [{"tag": "out-1", "protocol": "freedom", "settings": {}}],
+                "routing": {"domainStrategy": "AsIs"}
+            }"#,
+        );
+        let out_path = dir.path().join("mix.pb");
+        let args = ConvertPbArgs {
+            out: Some(out_path.to_string_lossy().into_owned()),
+            debug: false,
+            inject_type: false,
+            inputs: vec![cfg],
+        };
+        execute_convert_pb(&args).unwrap();
+
+        let bytes = std::fs::read(&out_path).unwrap();
+        assert!(!bytes.is_empty());
+        // 自产 fixture 字段对拍：容器必须可 decode 且字段保真。
+        let decoded = ProtoConfig::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded.inbound.len(), 1);
+        assert_eq!(decoded.inbound[0].tag, "in-1");
+        assert!(decoded.inbound[0].proxy_settings.is_some());
+        assert!(decoded.inbound[0].receiver_settings.is_some());
+        assert_eq!(decoded.outbound.len(), 1);
+        assert_eq!(decoded.outbound[0].tag, "out-1");
+
+        // app 顺序对齐 Go infra/conf/xray.go:528-651：log 第一，
+        // dispatcher/proxyman 常驻，routing 按存在性。
+        let urls: Vec<&str> = decoded.app.iter().map(|t| t.r#type.as_str()).collect();
+        assert_eq!(urls.first(), Some(&"xray.app.log.Config"));
+        assert!(urls.contains(&"xray.app.dispatcher.Config"));
+        assert!(urls.contains(&"xray.app.proxyman.InboundConfig"));
+        assert!(urls.contains(&"xray.app.proxyman.OutboundConfig"));
+        assert!(urls.contains(&"xray.app.router.Config"));
+    }
+
+    /// convert pb 多文件 merge override（tag 覆盖语义）。
+    #[test]
+    fn convert_pb_merges_multiple_configs() {
+        let dir = tempfile::tempdir().unwrap();
+        let c1 = write_temp(
+            &dir,
+            "c1.json",
+            r#"{"inbounds":[{"tag":"in-1","protocol":"dokodemo-door","settings":{}}],"outbounds":[]}"#,
+        );
+        let c2 = write_temp(&dir, "c2.json", r#"{"log":{"loglevel":"none"}}"#);
+        let out_path = dir.path().join("mix.pb");
+        let args = ConvertPbArgs {
+            out: Some(out_path.to_string_lossy().into_owned()),
+            debug: false,
+            inject_type: false,
+            inputs: vec![c1, c2],
+        };
+        execute_convert_pb(&args).unwrap();
+        let bytes = std::fs::read(&out_path).unwrap();
+        let decoded = ProtoConfig::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded.inbound.len(), 1);
+        assert_eq!(decoded.inbound[0].tag, "in-1");
+    }
+
+    /// -debug 优先于 -o：只打印 JSON，不落盘（Go protobuf.go:81-88 return）。
+    #[test]
+    fn convert_pb_debug_takes_precedence_over_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = write_temp(&dir, "config.json", r#"{"inbounds":[],"outbounds":[]}"#);
+        let out_path = dir.path().join("never.pb");
+        let args = ConvertPbArgs {
+            out: Some(out_path.to_string_lossy().into_owned()),
+            debug: true,
+            inject_type: false,
+            inputs: vec![cfg],
+        };
+        execute_convert_pb(&args).unwrap();
+        assert!(!out_path.exists());
+    }
+
+    /// 无 -o 且非 -debug → Go "-outpbfile not specified" 硬错。
+    #[test]
+    fn convert_pb_requires_out_or_debug() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = write_temp(&dir, "config.json", r#"{"inbounds":[],"outbounds":[]}"#);
+        let args = ConvertPbArgs {
+            out: None,
+            debug: false,
+            inject_type: false,
+            inputs: vec![cfg],
+        };
+        let err = execute_convert_pb(&args).unwrap_err();
+        assert!(err.to_string().contains("-outpbfile not specified"));
+    }
+
+    /// -o 非法扩展名 → Go "-outpbfile followed by a possible original config."。
+    #[test]
+    fn convert_pb_rejects_non_pb_out_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = write_temp(&dir, "config.json", r#"{"inbounds":[],"outbounds":[]}"#);
+        let args = ConvertPbArgs {
+            out: Some(dir.path().join("out.json").to_string_lossy().into_owned()),
+            debug: false,
+            inject_type: false,
+            inputs: vec![cfg],
+        };
+        let err = execute_convert_pb(&args).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("-outpbfile followed by a possible original config."));
     }
 }

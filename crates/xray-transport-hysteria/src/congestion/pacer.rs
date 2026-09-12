@@ -83,9 +83,7 @@ impl Pacer {
         }
         // diff = 1e9 * (max_datagram_size - budget)
         let diff = 1_000_000_000_u64
-            .saturating_mul(
-                (inner.max_datagram_size - inner.budget_at_last_sent).max(0) as u64,
-            );
+            .saturating_mul((inner.max_datagram_size - inner.budget_at_last_sent).max(0) as u64);
         let bw = (self.get_bandwidth)().max(1) as u64;
         let mut d = diff / bw;
         if diff % bw != 0 {
@@ -116,11 +114,7 @@ fn budget_at(
     let budget = inner.budget_at_last_sent.saturating_add(delta);
     let cap = max_burst_size(inner, get_bandwidth);
     // ponytail: 防溢出，对应 Go `if budget < 0` 分支。
-    if budget > cap {
-        cap
-    } else {
-        budget
-    }
+    if budget > cap { cap } else { budget }
 }
 
 fn max_burst_size(inner: &PacerInner, get_bandwidth: &dyn Fn() -> ByteCount) -> ByteCount {

@@ -8,8 +8,10 @@
 //!
 //! 内部用 RingBuffer<entryWrapper<T>>。
 
-use super::super::types::{PacketNumber, INVALID_PACKET_NUMBER};
-use super::ringbuffer::RingBuffer;
+use super::{
+    super::types::{INVALID_PACKET_NUMBER, PacketNumber},
+    ringbuffer::RingBuffer,
+};
 
 /// 单条目包装（对应 Go `entryWrapper[T]`）。
 #[derive(Copy, Clone, Debug, Default)]
@@ -78,10 +80,7 @@ impl<T: Copy + Default> PacketNumberIndexedQueue<T> {
         }
 
         if self.is_empty() {
-            self.entries.push_back(EntryWrapper {
-                present: true,
-                entry,
-            });
+            self.entries.push_back(EntryWrapper { present: true, entry });
             self.number_of_present_entries = 1;
             self.first_packet = packet_number;
             return true;
@@ -99,10 +98,7 @@ impl<T: Copy + Default> PacketNumberIndexedQueue<T> {
             self.entries.push_back(EntryWrapper::default());
         }
 
-        self.entries.push_back(EntryWrapper {
-            present: true,
-            entry,
-        });
+        self.entries.push_back(EntryWrapper { present: true, entry });
         self.number_of_present_entries += 1;
         true
     }
@@ -111,11 +107,7 @@ impl<T: Copy + Default> PacketNumberIndexedQueue<T> {
     #[must_use]
     pub fn get_entry(&self, packet_number: PacketNumber) -> Option<&T> {
         let ew = self.get_entry_wrapper(packet_number)?;
-        if ew.present {
-            Some(&ew.entry)
-        } else {
-            None
-        }
+        if ew.present { Some(&ew.entry) } else { None }
     }
 
     /// 取条目可变引用。
@@ -129,11 +121,7 @@ impl<T: Copy + Default> PacketNumberIndexedQueue<T> {
         // 安全路径：再次通过 offset_mut 拿可变引用
         let offset = (packet_number - self.first_packet) as usize;
         let ew_mut = self.entries.offset_mut(offset);
-        if ew_mut.present {
-            Some(&mut ew_mut.entry)
-        } else {
-            None
-        }
+        if ew_mut.present { Some(&mut ew_mut.entry) } else { None }
     }
 
     /// 删除条目（对应 Go `Remove`）。可选回调 f。

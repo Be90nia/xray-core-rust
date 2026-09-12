@@ -775,8 +775,8 @@ tonic-build = "0.14"
 | `io.go` | `io.rs` | Reader/Writer trait | `tokio::io` + 自定义 trait | ~500 |
 | `reader.go` | `reader.rs` | BufferedReader | `BufReader<BytesMut>` | ~300 |
 | `writer.go` | `writer.rs` | BufferedWriter | `BufWriter<BytesMut>` | ~300 |
-| `readv_*.go` | `readv.rs` | scatter-gather IO (平台特定) | `socket2` + `readv`/`writev` | ~400 |
-| `readv_reader.go` | `alloc.rs` | 分配策略 | `bytes::BytesMut` 池化 | ~200 |
+| `readv_*.go` | `readv.rs` | scatter-gather IO | tokio `try_read_vectored`（readv/WSARecv）+ `AllocStrategy` | ~480 |
+| `readv_reader.go` | `readv.rs` | ReadVReader + 分配策略 | 池化 Buffer + `AllocStrategy`（Go allocStrategy 对齐） | （同上） |
 | — | `timeout.rs` | 超时读取 | `tokio::time::timeout` | ~200 |
 
 **核心 crate 依赖**：

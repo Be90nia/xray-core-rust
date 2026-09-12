@@ -568,6 +568,12 @@ fn try_build_handler(
             if outbound_mux_udp443_skip(ob) {
                 mux_bridge = mux_bridge.with_udp443_skip();
             }
+            // xudpConcurrency 三态消费（Go NewHandler :143-164）
+            match outbound_xudp_mode(ob) {
+                XudpMode::Direct => mux_bridge.udp_direct = true,
+                XudpMode::Manager(n) => mux_bridge.attach_xudp_manager(n),
+                XudpMode::Carrier => {}
+            }
             mux_bridge.set_underlying(Arc::clone(&handler));
             return Ok((
                 Arc::new(mux_bridge) as Arc<dyn DispatchHandler>,
@@ -593,6 +599,35 @@ fn outbound_mux_concurrency(ob: &BuiltOutbound) -> Option<u32> {
     } else {
         cfg.concurrency as u32
     })
+}
+
+/// xudpConcurrency 三态（Go `NewHandler` :143-164）：
+/// - `< 0`：Direct——UDP 直发底层出站（Go `ClientManager{Enabled:false}`）
+/// - `== 0`/缺省：Carrier——UDP 并入常规 mux 载体（GlobalID XUDP 帧）
+/// - `> 0`：Manager(n)——UDP 走独立并发=n 的 worker 管理器
+/// mux 未启用（不包装 MuxBridge）时无消费点，等同 Carrier。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XudpMode {
+    Carrier,
+    Direct,
+    Manager(u32),
+}
+
+fn outbound_xudp_mode(ob: &BuiltOutbound) -> XudpMode {
+    let Some(v) = ob.mux_json.as_ref() else {
+        return XudpMode::Carrier;
+    };
+    let Ok(cfg) = serde_json::from_value::<xray_conf::MuxConfig>(v.clone()) else {
+        return XudpMode::Carrier;
+    };
+    if !cfg.enabled {
+        return XudpMode::Carrier;
+    }
+    match cfg.xudp_concurrency {
+        n if n < 0 => XudpMode::Direct,
+        0 => XudpMode::Carrier,
+        n => XudpMode::Manager(u32::try_from(n).unwrap_or(8)),
+    }
 }
 
 /// 出站级 UDP443 skip 旁路开关（Go `NewHandler` :167 `h.udp443` +
@@ -646,13 +681,40 @@ fn build_protocol_handler(
             // （Go freedom.go:222-225 policyManager.ForLevel(config.UserLevel)）
             let bridge_policy = policy_manager
                 .map(|pm| xray_features::policy::PolicyManager::policy_for_level(pm, config.user_level).timeout);
-            // finalRules 预构建（Go Handler.Init :206-219；构建失败的项跳过）
-            let final_rules: Vec<xray_proxy_freedom::FinalRule> = config
-                .final_rules
-                .iter()
-                .filter_map(|rc| xray_proxy_freedom::FinalRule::build(rc).ok())
-                .collect();
-            let dial_fn = xray_proxy_freedom::make_freedom_dial_fn_with_config(config);
+            // #6742（Go freedom.go:193-198 Init 早退 + :263-265 defaultRule=nil）：
+            // dialerProxy（sockopt.dialerProxy，含 transportLayer 注入）或 proxy_chain
+            // （proxySettings.tag）时 freedom 非最终出站——finalRules 不构建（配了则
+            // warn），入站默认规则不注入（TCP/UDP 的 defaultRule 恒 None）。
+            let stream_dialer_proxy = ob
+                .stream_settings_json
+                .as_ref()
+                .and_then(|v| v.get("sockopt"))
+                .and_then(|v| v.get("dialerProxy"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let uses_dialer_proxy = proxy_chain_tag.is_some() || !stream_dialer_proxy.is_empty();
+            // finalRules 预构建（Go Handler.Init :199-207；构建失败的项跳过）
+            let final_rules: Vec<xray_proxy_freedom::FinalRule> = if uses_dialer_proxy {
+                if !config.final_rules.is_empty() {
+                    tracing::warn!(
+                        tag = %ob.tag,
+                        "The \"finalRules\" setting is ignored when \"sockopt.dialerProxy\" is set, since freedom is not the final outbound."
+                    );
+                }
+                Vec::new()
+            } else {
+                config
+                    .final_rules
+                    .iter()
+                    .filter_map(|rc| xray_proxy_freedom::FinalRule::build(rc).ok())
+                    .collect()
+            };
+            // sockopt.dialerProxy 下沉拨号层（Go freedom.go:58 + dialer.go:270-279 redirect）
+            let dial_fn = xray_proxy_freedom::make_freedom_dial_fn_with_sockopt(
+                config,
+                stream_dialer_proxy,
+            );
             let dial_fn = match target_strategy {
                 Some(s) => wrap_dial_with_target_strategy(dial_fn, s, dns.cloned()),
                 None => dial_fn,
@@ -674,8 +736,10 @@ fn build_protocol_handler(
             .with_noises(noises)
             .with_destination_override(destination_override)
             .with_final_rules(final_rules)
-            .with_domain_strategy(domain_strategy)
-            .with_inbound_default_rules(inbound_default_rules.clone());
+            .with_domain_strategy(domain_strategy);
+            if !uses_dialer_proxy {
+                bridge = bridge.with_inbound_default_rules(inbound_default_rules.clone());
+            }
             if let Some(spec) = &send_through {
                 bridge = bridge.with_send_through(spec.clone());
             }
@@ -696,7 +760,7 @@ fn build_protocol_handler(
             wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
         }
         "blackhole" => {
-            let response = parse_blackhole_response(&ob.entry.data);
+            let response = parse_blackhole_response(&ob.entry.data)?;
             let handler = Arc::new(xray_proxy_blackhole::BlackholeHandler::with_response(
                 ob.tag.clone(),
                 response,
@@ -918,6 +982,12 @@ pub struct MuxBridge {
     slot: UnderlyingSlot,
     /// UDP/443 skip 旁路（Go handler.go:226-228 `case "skip": goto out`）。
     udp443_skip: bool,
+    /// xudpConcurrency < 0：UDP 全量直发底层出站（Go `ClientManager{Enabled:false}`）。
+    udp_direct: bool,
+    /// xudpConcurrency > 0：UDP 独立 worker 管理器（Go `h.xudp` 独立
+    /// ClientManager，并发账本独立于 TCP 载体）。None = UDP 并入常规载体
+    /// （Go `h.xudp = nil`）。
+    xudp_picker: Option<Arc<IncrementalWorkerPicker>>,
 }
 
 impl MuxBridge {
@@ -933,6 +1003,7 @@ impl MuxBridge {
             max_connection: 128,
         };
         // 空槽构造：register Phase 2 拿到底层 handler 后 set_underlying。
+
         let slot: UnderlyingSlot = Arc::new(parking_lot::RwLock::new(None));
         let factory = Arc::new(DialingWorkerFactory::with_slot(Arc::clone(&slot), strategy));
         let picker = Arc::new(IncrementalWorkerPicker::new(factory));
@@ -942,6 +1013,8 @@ impl MuxBridge {
                 picker,
                 slot: Arc::clone(&slot),
                 udp443_skip: false,
+                udp_direct: false,
+                xudp_picker: None,
             },
             slot,
         )
@@ -964,6 +1037,17 @@ impl MuxBridge {
     pub fn with_udp443_skip(mut self) -> Self {
         self.udp443_skip = true;
         self
+    }
+
+    /// 挂独立 UDP worker 管理器（xudpConcurrency > 0）：与 TCP 载体共用底层
+    /// slot 拨号，但并发账本独立（Go `h.xudp` 独立 ClientManager/Picker）。
+    pub(crate) fn attach_xudp_manager(&mut self, concurrency: u32) {
+        let strategy = ClientStrategy {
+            max_concurrency: concurrency,
+            max_connection: 128,
+        };
+        let factory = Arc::new(DialingWorkerFactory::with_slot(Arc::clone(&self.slot), strategy));
+        self.xudp_picker = Some(Arc::new(IncrementalWorkerPicker::new(factory)));
     }
 }
 
@@ -1010,11 +1094,11 @@ impl DispatchHandler for MuxBridge {
         link: Link,
         access: xray_app_dispatcher::default::AccessContext,
     ) -> PinFuture<()> {
-        // UDP/443 skip 旁路（Go handler.go:226-228 `case "skip": goto out`）：
-        // 绕过 mux 会话直发底层出站。Reject 已由 dispatcher 按 tag 处理。
-        if self.udp443_skip
-            && dest.network() == xray_common::net::network::Network::UDP
-            && dest.port().value() == 443
+        // UDP 直发旁路：xudpConcurrency < 0（Go `ClientManager{Enabled:false}`）
+        // 全量 UDP 直发；UDP/443 skip（Go handler.go:226-228 `case "skip"`）
+        // 仅 443 端口。底层未注册时回退 mux 载体。Reject 已由 dispatcher 按 tag 处理。
+        if dest.network() == xray_common::net::network::Network::UDP
+            && (self.udp_direct || (self.udp443_skip && dest.port().value() == 443))
         {
             let underlying = self.slot.read().clone();
             if let Some(u) = underlying {
@@ -1026,7 +1110,11 @@ impl DispatchHandler for MuxBridge {
         }
         let dest = dest.clone();
         let tag = self.tag.clone();
-        let picker = Arc::clone(&self.picker);
+        // xudpConcurrency > 0：UDP 走独立管理器（Go `h.xudp`）；否则并入 TCP 载体。
+        let picker = match &self.xudp_picker {
+            Some(p) => Arc::clone(p),
+            None => Arc::clone(&self.picker),
+        };
         let input = xray_xudp::GlobalIdInput {
             source: format!("udp:{}", access.from),
             source_network: xray_common::net::network::Network::UDP,
@@ -1455,21 +1543,33 @@ fn parse_freedom_noise(v: &serde_json::Value) -> Option<Noise> {
 
 /// 解析 blackhole outbound settings JSON → ResponseConfig。
 ///
-/// JSON 格式（Go `proxy/blackhole/config.go`）：
+/// JSON 格式（Go `infra/conf/blackhole.go`）：
 /// - `{}` 或无 `response` → None
 /// - `{ "response": { "type": "none" } }` → None
 /// - `{ "response": { "type": "http" } }` → Http403
-fn parse_blackhole_response(data: &[u8]) -> xray_proxy_blackhole::ResponseConfig {
+/// - `{ "response": { "type": "custom", "customResponseData": "<base64>" } }` → Custom
+///   （Go :38-42：base64 标准解码，失败即 Build 硬错）
+fn parse_blackhole_response(
+    data: &[u8],
+) -> std::result::Result<xray_proxy_blackhole::ResponseConfig, String> {
+    use base64::Engine as _;
     use xray_proxy_blackhole::ResponseConfig;
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(data) else {
-        return ResponseConfig::None;
+        return Ok(ResponseConfig::None);
     };
     let Some(resp) = v.get("response") else {
-        return ResponseConfig::None;
+        return Ok(ResponseConfig::None);
     };
     match resp.get("type").and_then(|t| t.as_str()) {
-        Some("http") => ResponseConfig::Http403,
-        _ => ResponseConfig::None,
+        Some("http") => Ok(ResponseConfig::Http403),
+        Some("custom") => {
+            let raw = resp.get("customResponseData").and_then(|d| d.as_str()).unwrap_or("");
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(raw)
+                .map_err(|e| format!("failed to decode custom response data: {e}"))?;
+            Ok(ResponseConfig::Custom(bytes))
+        }
+        _ => Ok(ResponseConfig::None),
     }
 }
 
@@ -2705,6 +2805,11 @@ pub(crate) fn parse_wireguard_config(data: &[u8]) -> std::result::Result<DeviceC
     let domain_strategy = parse_wireguard_domain_strategy(
         wg_get(&v, "domainStrategy", "domain_strategy").and_then(|x| x.as_str()),
     )?;
+    // Go c7e569b0：`remoteDNS`（隧道内 DNS 服务器列表；["local"] = 走本地 app DNS）。
+    let dns = wg_get(&v, "remoteDNS", "remote_dns")
+        .and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<String>>())
+        .unwrap_or_default();
     Ok(DeviceConfig {
         secret_key,
         peers,
@@ -2712,6 +2817,7 @@ pub(crate) fn parse_wireguard_config(data: &[u8]) -> std::result::Result<DeviceC
         mtu,
         reserved,
         domain_strategy,
+        dns,
         ..Default::default()
     })
 }
@@ -3339,6 +3445,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_wireguard_config_remote_dns_passthrough() {
+        // Go c7e569b0：`remoteDNS` → DeviceConfig.dns（infra/conf wireguard.go:69,145）。
+        let secret = "aa".repeat(32);
+        let pub_key = "bb".repeat(32);
+        let data = format!(
+            r#"{{"secretKey": "{}", "peers": [{{"publicKey": "{}", "endpoint": "e:1"}}],
+                "remoteDNS": ["local"]}}"#,
+            secret, pub_key
+        );
+        let config = parse_wireguard_config(data.as_bytes()).unwrap();
+        assert_eq!(config.dns, vec!["local".to_string()]);
+
+        // 缺省 → 空（消费侧 resolve_dns 回落 Cloudflare 默认四址）。
+        let data2 = format!(
+            r#"{{"secretKey": "{}", "peers": [{{"publicKey": "{}", "endpoint": "e:1"}}]}}"#,
+            secret, pub_key
+        );
+        let config2 = parse_wireguard_config(data2.as_bytes()).unwrap();
+        assert!(config2.dns.is_empty());
+    }
+
+    #[test]
     fn parse_wireguard_config_explicit_empty_allowedips_respected() {
         // Go：显式空数组（非 nil）不展开缺省全路由
         let data = format!(
@@ -3593,6 +3721,131 @@ mod tests {
             super::outbound_mux_concurrency(&ob(Some(json!({"enabled": true, "concurrency": 16})))),
             Some(16)
         );
+    }
+
+    /// xudpConcurrency 三态解析（Go NewHandler :143-164）。
+    #[test]
+    fn outbound_xudp_mode_tri_state_like_go_new_handler() {
+        use super::{XudpMode, outbound_xudp_mode};
+        use serde_json::json;
+        let ob = |mux: Option<serde_json::Value>| BuiltOutbound {
+            mux_json: mux,
+            ..make_outbound("freedom", "m", "{}")
+        };
+        // -1 → Direct（UDP 直发，Go ClientManager{Enabled:false}）
+        assert_eq!(
+            outbound_xudp_mode(&ob(Some(json!({"enabled": true, "xudpConcurrency": -1})))),
+            XudpMode::Direct
+        );
+        // 0 / 缺省 → Carrier（并入常规 mux 载体，Go h.xudp = nil）
+        assert_eq!(
+            outbound_xudp_mode(&ob(Some(json!({"enabled": true, "xudpConcurrency": 0})))),
+            XudpMode::Carrier
+        );
+        assert_eq!(
+            outbound_xudp_mode(&ob(Some(json!({"enabled": true})))),
+            XudpMode::Carrier
+        );
+        // >0 → Manager(n)（独立管理器）
+        assert_eq!(
+            outbound_xudp_mode(&ob(Some(json!({"enabled": true, "xudpConcurrency": 4})))),
+            XudpMode::Manager(4)
+        );
+        // mux 未启用 → 不包装，无消费点，等同 Carrier
+        assert_eq!(
+            outbound_xudp_mode(&ob(Some(json!({"enabled": false, "xudpConcurrency": -1})))),
+            XudpMode::Carrier
+        );
+        assert_eq!(outbound_xudp_mode(&ob(None)), XudpMode::Carrier);
+    }
+
+    /// Direct 行为（xudpConcurrency=-1）：UDP dispatch_with_access 绕过 mux
+    /// 载体直发底层出站（Go ClientManager{Enabled:false}）。
+    #[tokio::test]
+    async fn mux_bridge_xudp_direct_sends_udp_straight_to_underlying() {
+        use xray_buf::io::Reader as _;
+        use tokio::io::AsyncWriteExt as _;
+
+        #[derive(Debug)]
+        struct CaptureUnderlying {
+            captured: Arc<parking_lot::Mutex<Vec<u8>>>,
+        }
+        impl DispatchHandler for CaptureUnderlying {
+            fn tag(&self) -> &str {
+                "capture-direct"
+            }
+            fn dispatch(&self, _dest: &Destination, link: Link) -> PinFuture<()> {
+                let captured = Arc::clone(&self.captured);
+                Box::pin(async move {
+                    let mut r = xray_buf::reader::BufferedReader::new(link.reader);
+                    loop {
+                        match r.read_multi_buffer().await {
+                            Ok(mb) if !mb.is_empty() => {
+                                let mut c = captured.lock();
+                                for b in mb.iter() {
+                                    c.extend_from_slice(b.bytes());
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                })
+            }
+        }
+
+        let (mut bridge, _slot) = MuxBridge::new("mux-direct", 4);
+        let captured: Arc<parking_lot::Mutex<Vec<u8>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        bridge.set_underlying(Arc::new(CaptureUnderlying {
+            captured: Arc::clone(&captured),
+        }));
+        bridge.udp_direct = true;
+        let bridge = Arc::new(bridge);
+
+        let (mut child, child_server) = tokio::io::duplex(64 * 1024);
+        let (sr, sw) = tokio::io::split(child_server);
+        let link = Link::new(xray_buf::io::new_reader(sr), xray_buf::io::new_writer(sw));
+        child.write_all(b"raw-udp-probe").await.unwrap();
+
+        let dest = Destination::new(
+            Address::ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+            Port::new(53),
+            xray_common::net::network::Network::UDP,
+        );
+        let access = xray_app_dispatcher::default::AccessContext {
+            from: "10.0.0.9:5555".to_string(),
+            ..Default::default()
+        };
+        let task = tokio::spawn(bridge.dispatch_with_access(&dest, link, access));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !captured.lock().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("direct UDP bytes reach underlying within timeout");
+        let snap = captured.lock().clone();
+        assert_eq!(
+            &snap[..],
+            b"raw-udp-probe",
+            "xudpConcurrency=-1 must bypass mux (no New frame meta prefix)"
+        );
+        task.abort();
+    }
+
+    /// Manager 行为（xudpConcurrency>0）：UDP 走独立 picker（并发账本独立
+    /// 于 TCP 载体 picker，二者均经同一 slot 拨号，Go h.xudp 独立 ClientManager）。
+    #[test]
+    fn mux_bridge_xudp_manager_attaches_independent_picker() {
+        let (mut bridge, _slot) = MuxBridge::new("mux-mgr", 4);
+        assert!(bridge.xudp_picker.is_none(), "default is carrier mode");
+        bridge.attach_xudp_manager(6);
+        let p = bridge.xudp_picker.as_ref().expect("manager picker attached");
+        // 独立 picker 与 TCP 载体 picker 不同实例
+        assert!(!Arc::ptr_eq(p, &bridge.picker), "xudp picker must be independent");
     }
 
     /// 包装行为：mux enabled 的 freedom 出站构建出 MuxBridge（tag 不变、
@@ -4377,6 +4630,96 @@ mod tests {
         }
     }
 
+    /// e2e（mcq5/#6742）：freedom 配 finalRules block-all + 链式出站
+    /// （① proxySettings.tag 直配 ② transportLayer 注入 sockopt.dialerProxy）→
+    /// finalRules 不生效（freedom 非最终出站，Go freedom.go:193-198 Init 早退 +
+    /// :263-265 defaultRule=nil），流量经链路正常到达目标。
+    #[tokio::test]
+    async fn freedom_final_rules_ignored_when_chained_via_dialer_proxy() {
+        use xray_buf::multi::MultiBuffer;
+
+        for use_transport_layer in [false, true] {
+            let echo_port = spawn_echo().await;
+            let (socks_port, recorded) = spawn_socks5_recorder().await;
+
+            let (proxy_json, stream_json) = if use_transport_layer {
+                (
+                    r#", "proxySettings": {"tag": "socks-out", "transportLayer": true}"#.to_string(),
+                    String::new(),
+                )
+            } else {
+                (
+                    r#", "proxySettings": {"tag": "socks-out"}"#.to_string(),
+                    String::new(),
+                )
+            };
+            let json = format!(
+                r#"{{"outbounds": [
+                    {{"protocol": "freedom", "tag": "freedom-out",
+                      "settings": {{"finalRules": [{{"action": "block"}}]}}{proxy_json}{stream_json}}},
+                    {{"protocol": "socks", "tag": "socks-out",
+                      "settings": {{"servers": [{{"address": "127.0.0.1", "port": {socks_port}}}]}}}}
+                ]}}"#
+            );
+            let cfg = xray_conf::Config::from_json_str(&json).unwrap();
+            let built = cfg.build().unwrap();
+
+            let ohm = SimpleOhm::new();
+            register_outbounds(&built, &ohm, None, None, None).unwrap();
+            let handler = ohm.get_handler("freedom-out").expect("freedom-out registered");
+
+            let (up_r, mut up_w) =
+                xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+            let (mut dn_r, dn_w) =
+                xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+            let link = xray_transport::link::Link::new(
+                Box::new(up_r) as Box<dyn xray_buf::io::Reader>,
+                Box::new(dn_w) as Box<dyn xray_buf::io::Writer>,
+            );
+            let dest = Destination::new(
+                Address::from_ipv4_bytes([127, 0, 0, 1]),
+                Port::new(echo_port),
+                Network::TCP,
+            );
+            let fut = handler.dispatch(&dest, link);
+            tokio::spawn(async move {
+                let _ = fut.await;
+            });
+
+            let payload = b"freedom-chain-e2e";
+            let mut mb = MultiBuffer::new();
+            mb.merge_bytes(payload);
+            up_w.write_multi_buffer(mb).await.unwrap();
+
+            let mut acc: Vec<u8> = Vec::new();
+            let echoed = loop {
+                if acc.windows(payload.len()).any(|w| w == payload) {
+                    break true;
+                }
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    dn_r.read_multi_buffer(),
+                )
+                .await
+                {
+                    Ok(Ok(chunk)) => acc.extend_from_slice(&chunk.to_vec()),
+                    _ => break false,
+                }
+            };
+            assert!(
+                echoed,
+                "transportLayer={use_transport_layer}: payload should echo via chain despite block-all finalRules"
+            );
+
+            // 「经链路而非直连」判别：socks5 服务器必须见到 CONNECT → echo 端口
+            let rec = recorded.lock().expect("lock");
+            assert!(
+                rec.iter().any(|(_, p)| *p == echo_port),
+                "transportLayer={use_transport_layer}: socks outbound should see CONNECT to echo:{echo_port}, got {rec:?}"
+            );
+        }
+    }
+ 
     // ========== DnsDispatchBridge e2e（bd 8hl） ==========
 
     /// 构造最小 DNS 查询（Header + Question）。

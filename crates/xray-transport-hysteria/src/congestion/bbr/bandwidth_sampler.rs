@@ -5,8 +5,10 @@
 
 use std::time::Duration;
 
-use super::super::types::{AckedPacketInfo, ByteCount, LostPacketInfo, MonoTime, PacketNumber};
-use super::bandwidth::{Bandwidth, INF_BANDWIDTH};
+use super::{
+    super::types::{AckedPacketInfo, ByteCount, LostPacketInfo, MonoTime, PacketNumber},
+    bandwidth::{Bandwidth, INF_BANDWIDTH},
+};
 
 /// 发送时刻状态（对应 Go `sendTimeState`）。
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -53,10 +55,7 @@ impl BandwidthSample {
     /// 默认值（send_rate = INF，对应 Go `newBandwidthSample`）。
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            send_rate: INF_BANDWIDTH,
-            ..Self::default()
-        }
+        Self { send_rate: INF_BANDWIDTH, ..Self::default() }
     }
 }
 
@@ -248,15 +247,9 @@ mod tests {
         s.on_packet_sent(100, 1, 1000, 1000, true);
         s.on_packet_sent(200, 2, 2000, 3000, true);
 
-        let acked = vec![AckedPacketInfo {
-            packet_number: 1,
-            bytes_acked: 1000,
-            receive_time_ns: 500,
-        }];
-        let lost = vec![LostPacketInfo {
-            packet_number: 2,
-            bytes_lost: 2000,
-        }];
+        let acked =
+            vec![AckedPacketInfo { packet_number: 1, bytes_acked: 1000, receive_time_ns: 500 }];
+        let lost = vec![LostPacketInfo { packet_number: 2, bytes_lost: 2000 }];
 
         let sample = s.on_congestion_event(500, &acked, &lost, Bandwidth(0), INF_BANDWIDTH, 0);
         assert_eq!(s.total_bytes_acked(), 1000);
@@ -314,11 +307,8 @@ mod tests {
         assert_eq!(s.sent_packets.len(), 3);
 
         // 修复前 adapter 行为：聚合事件合成 pn=0 → 永不命中，sent_packets 恒增长。
-        let synthetic = [AckedPacketInfo {
-            packet_number: 0,
-            bytes_acked: 2400,
-            receive_time_ns: 200,
-        }];
+        let synthetic =
+            [AckedPacketInfo { packet_number: 0, bytes_acked: 2400, receive_time_ns: 200 }];
         s.on_congestion_event(200, &synthetic, &[], Bandwidth(0), INF_BANDWIDTH, 0);
         assert_eq!(s.sent_packets.len(), 3, "synthetic pn=0 never matches: unbounded growth");
 

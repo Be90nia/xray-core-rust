@@ -14,7 +14,9 @@
 //!   （`DefaultLogService` → `LogInstance::restart`）。
 //! - **StatsService**：委托领域 `xray_app_stats::command::StatsService`，proto ↔ domain 翻译。
 //! - **RoutingService**：委托领域 `xray_app_router::command::RoutingService`；
-//!   `SubscribeRoutingStats`/`TestRoute`/`AddRule` 需完整 context/config，返回 `UNIMPLEMENTED`。
+//!   TestRoute 支持 FieldSelectors 投影，GetBalancerInfo 返回 override/principle，
+//!   SubscribeRoutingStats 订阅 routingStats channel（未注入时按 Go 生产形态报
+//!   "Routing statistics not enabled."）。
 //! - **ObservatoryService**：委托领域 `xray_app_observatory::command::ObservatoryService`。
 
 use std::collections::HashMap;
@@ -64,6 +66,7 @@ use xray_common::net::port::Port;
 
 use crate::outbound::HandlerManager;
 use crate::server::OutboundHandlerRegistry;
+use xray_app_stats::Channel as StatsChannelOps;
 
 /// HandlerService 的 outbound 运行时注入 trait（bd ze3）。
 ///
@@ -576,12 +579,22 @@ impl ProtoStatsService for StatsServiceImpl {
 #[derive(Clone)]
 pub struct RoutingServiceImpl {
     service: Arc<xray_app_router::command::RoutingService>,
+    /// Go `routingServer.routingStats`（stats.Channel）。生产装配恒 None
+    /// （Go command.go:145 `NewRoutingServer(router, nil)`），测试/嵌入可注入。
+    routing_stats: Option<Arc<xray_app_stats::StatsChannel>>,
 }
 
 impl RoutingServiceImpl {
     #[must_use]
     pub fn new(service: Arc<xray_app_router::command::RoutingService>) -> Self {
-        Self { service }
+        Self { service, routing_stats: None }
+    }
+
+    /// 注入 routingStats channel（Go `NewRoutingServer` 第二参；测试/嵌入用）。
+    #[must_use]
+    pub fn with_routing_stats(mut self, stats: Arc<xray_app_stats::StatsChannel>) -> Self {
+        self.routing_stats = Some(stats);
+        self
     }
 }
 
@@ -598,19 +611,47 @@ fn router_status(e: xray_app_router::error::RouterError) -> Status {
 
 #[async_trait]
 impl ProtoRoutingService for RoutingServiceImpl {
-    // SubscribeRoutingStats 是 server-streaming RPC。返回 UNIMPLEMENTED 时此类型
-    // 实例不会被构造，仅需满足 `Stream + Send + 'static` 约束。
     type SubscribeRoutingStatsStream =
         tonic::codegen::tokio_stream::wrappers::ReceiverStream<
             std::result::Result<prouter::RoutingContext, Status>,
         >;
 
+    /// Go routingServer.SubscribeRoutingStats（command.go:107-135）：
+    /// 订阅 routingStats channel，逐条投影 FieldSelectors 后流式下发。
+    /// 无 channel 时返回 "Routing statistics not enabled."（生产形态）。
     async fn subscribe_routing_stats(
         &self,
-        _request: Request<prouter::SubscribeRoutingStatsRequest>,
+        request: Request<prouter::SubscribeRoutingStatsRequest>,
     ) -> Result<Response<Self::SubscribeRoutingStatsStream>, Status> {
-        Err(Status::unimplemented(
-            "SubscribeRoutingStats requires gRPC streaming framework",
+        let Some(stats) = &self.routing_stats else {
+            return Err(Status::unknown("Routing statistics not enabled."));
+        };
+        let selectors = request.into_inner().field_selectors;
+        let mut sub = stats
+            .subscribe()
+            .map_err(|e| Status::internal(format!("subscribe routing stats: {e}")))?;
+        let (tx, rx) = tokio::sync::mpsc::channel::<
+            std::result::Result<prouter::RoutingContext, Status>,
+        >(16);
+        // 发布契约：channel 消息为 Arc<xray_proto RoutingContext>（Go 端为
+        // routing.Route；本仓路由发布方尚未接线，此处固定消息类型）。
+        tokio::spawn(async move {
+            while let Some(msg) = sub.recv().await {
+                let Some(rc) = msg.downcast_ref::<prouter::RoutingContext>() else {
+                    let _ = tx
+                        .send(Err(Status::unknown("Upstream sent malformed statistics.")))
+                        .await;
+                    return;
+                };
+                let out =
+                    project_routing_context(&selectors, rc, Some(&rc.outbound_tag));
+                if tx.send(Ok(out)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Response::new(
+            tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(rx),
         ))
     }
 
@@ -619,18 +660,22 @@ impl ProtoRoutingService for RoutingServiceImpl {
         request: Request<prouter::TestRouteRequest>,
     ) -> Result<Response<prouter::RoutingContext>, Status> {
         // Go routingServer.TestRoute（command.go:92-105）：
-        // RoutingContext 必填 → PickRoute → 返回 RoutingContext{OutboundTag}。
-        // PublishResult（stats channel 发布）无对应 wiring，忽略（明示）。
+        // RoutingContext 必填 → PickRoute → AsProtobufMessage(FieldSelectors)(route)。
         let req = request.into_inner();
-        let pctx = req.routing_context.ok_or_else(|| {
-            Status::invalid_argument("Invalid routing request: RoutingContext is required")
-        })?;
+        let pctx = req
+            .routing_context
+            .ok_or_else(|| Status::invalid_argument("Invalid routing request."))?;
         let data = proto_routing_context_to_data(&pctx);
         let route = self.service.test_route(&data).map_err(router_status)?;
-        // ponytail: FieldSelectors 投影未实现（Go AsProtobufMessage 选择器）——
-        // 返回完整 RoutingContext（OutboundTag 填充，其余字段回显请求）。
-        let mut out = pctx;
-        out.outbound_tag = route.outbound_tag;
+        // PublishResult：命中路由发布到 routingStats channel（Go 发 routing.Route
+        // 本体；这里发全量 RoutingContext，订阅方各自投影）。
+        if req.publish_result {
+            if let Some(stats) = &self.routing_stats {
+                let full = project_routing_context(&[], &pctx, Some(&route.outbound_tag));
+                stats.publish(Arc::new(full));
+            }
+        }
+        let out = project_routing_context(&req.field_selectors, &pctx, Some(&route.outbound_tag));
         Ok(Response::new(out))
     }
 
@@ -638,15 +683,25 @@ impl ProtoRoutingService for RoutingServiceImpl {
         &self,
         request: Request<prouter::GetBalancerInfoRequest>,
     ) -> Result<Response<prouter::GetBalancerInfoResponse>, Status> {
-        let tag = request.into_inner().tag.to_string();
-        self.service.get_balancer_info(&tag).map_err(router_status)?;
-        // ponytail: 领域 get_balancer_info 仅验证 tag 存在性，不返回 override/principle 数据；
-        // 待 Router 暴露 balancer 详情后补全。
+        // Go routingServer.GetBalancerInfo（command.go:21-47）：override 错误上抛，
+        // principle 错误仅记日志（字段留空）。
+        let tag = request.into_inner().tag;
+        let override_target = self
+            .service
+            .get_override_target(&tag)
+            .map_err(router_status)?;
+        let mut balancer = prouter::BalancerMsg {
+            r#override: Some(prouter::OverrideInfo { target: override_target }),
+            principle_target: None,
+        };
+        match self.service.get_principle_target(&tag) {
+            Ok(tags) => {
+                balancer.principle_target = Some(prouter::PrincipleTargetInfo { tag: tags });
+            }
+            Err(e) => tracing::info!(error = %e, "unable to obtain principle target"),
+        }
         Ok(Response::new(prouter::GetBalancerInfoResponse {
-            balancer: Some(prouter::BalancerMsg {
-                r#override: None,
-                principle_target: None,
-            }),
+            balancer: Some(balancer),
         }))
     }
 
@@ -778,7 +833,6 @@ fn port_to_u16(raw: u32) -> Port {
 fn proto_routing_context_to_data(p: &prouter::RoutingContext) -> xray_app_router::context::RoutingData {
     use xray_app_router::context::RoutingData;
     use xray_common::net::network::Network;
-    use xray_common::net::port::Port;
 
     let ips = |raw: &[Vec<u8>]| -> Vec<std::net::IpAddr> {
         raw.iter()
@@ -818,6 +872,65 @@ fn proto_routing_context_to_data(p: &prouter::RoutingContext) -> xray_app_router
         protocol: p.protocol.clone(),
         skip_dns_resolve: false,
     }
+}
+
+/// Go `AsProtobufMessage`（router/command/config.go:64-103）：按 FieldSelectors
+/// 前缀匹配投影 RoutingContext 字段。selectors 空 = 全量；未识别的 selector
+/// 静默忽略（Go map 前缀匹配语义）。`outbound_tag` 为 PickRoute 命中的出站
+/// tag（Go `route.GetOutboundTag()`）；仅 "outbound" 前缀命中时写入。
+fn project_routing_context(
+    selectors: &[String],
+    ctx: &prouter::RoutingContext,
+    outbound_tag: Option<&str>,
+) -> prouter::RoutingContext {
+    let want =
+        |field: &str| selectors.is_empty() || selectors.iter().any(|s| field.starts_with(s.as_str()));
+    let mut m = prouter::RoutingContext::default();
+    if want("inbound") {
+        m.inbound_tag = ctx.inbound_tag.clone();
+    }
+    if want("network") {
+        m.network = ctx.network;
+    }
+    if want("ip_source") {
+        m.source_i_ps = ctx.source_i_ps.clone();
+    }
+    if want("ip_target") {
+        m.target_i_ps = ctx.target_i_ps.clone();
+    }
+    if want("ip_local") {
+        m.local_i_ps = ctx.local_i_ps.clone();
+    }
+    if want("port_source") {
+        m.source_port = ctx.source_port;
+    }
+    if want("port_target") {
+        m.target_port = ctx.target_port;
+    }
+    if want("port_local") {
+        m.local_port = ctx.local_port;
+    }
+    if want("domain") {
+        m.target_domain = ctx.target_domain.clone();
+    }
+    if want("protocol") {
+        m.protocol = ctx.protocol.clone();
+    }
+    if want("user") {
+        m.user = ctx.user.clone();
+    }
+    if want("attributes") {
+        m.attributes = ctx.attributes.clone();
+    }
+    if want("outbound_group") {
+        m.outbound_group_tags = ctx.outbound_group_tags.clone();
+    }
+    if want("outbound") {
+        if let Some(tag) = outbound_tag {
+            m.outbound_tag = tag.to_string();
+        }
+    }
+    m
 }
 
 /// 监听规格（Go `Commander.Start` commander.go:78-99 的 listen 分派）。
@@ -1101,7 +1214,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routing_subscribe_unimplemented() {
+    async fn routing_subscribe_without_channel_unknown() {
+        // Go 生产装配 NewRoutingServer(router, nil)（command.go:145）→
+        // "Routing statistics not enabled."（command.go:108-110）。
         let svc = RoutingServiceImpl::new(Arc::new(
             xray_app_router::command::RoutingService::new(),
         ));
@@ -1112,8 +1227,202 @@ mod tests {
                 },
             ))
             .await;
-        assert!(resp.is_err());
-        assert_eq!(resp.unwrap_err().code(), tonic::Code::Unimplemented);
+        let err = resp.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unknown);
+        assert_eq!(err.message(), "Routing statistics not enabled.");
+    }
+
+    #[tokio::test]
+    async fn routing_subscribe_streams_projected_context() {
+        use futures::StreamExt;
+        use xray_app_router::balancing::OutboundHandlerSelector;
+
+        struct NopSelector;
+        impl OutboundHandlerSelector for NopSelector {
+            fn select_outbounds(
+                &self,
+                selectors: &[String],
+            ) -> Result<Vec<String>, xray_app_router::error::RouterError> {
+                Ok(selectors.to_vec())
+            }
+        }
+
+        let router =
+            xray_app_router::router::Router::empty(Arc::new(NopSelector), None);
+        let ch = Arc::new(xray_app_stats::StatsChannel::with_defaults());
+        ch.start().unwrap();
+        let svc = RoutingServiceImpl::new(Arc::new(
+            xray_app_router::command::RoutingService::with_router(router),
+        ))
+        .with_routing_stats(ch.clone());
+
+        let mut stream = svc
+            .subscribe_routing_stats(Request::new(
+                prouter::SubscribeRoutingStatsRequest {
+                    field_selectors: vec!["outbound".into()],
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // 发布全量消息；订阅方应仅收到 "outbound" 前缀投影的字段。
+        ch.publish(Arc::new(prouter::RoutingContext {
+            inbound_tag: "in-1".into(),
+            outbound_tag: "direct".into(),
+            ..Default::default()
+        }));
+
+        let item = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .expect("stream not ended")
+            .expect("stream item ok");
+        assert_eq!(item.outbound_tag, "direct");
+        assert_eq!(item.inbound_tag, "");
+    }
+
+    #[tokio::test]
+    async fn routing_get_balancer_info_reports_override_and_principle() {
+        use xray_app_router::balancing::OutboundHandlerSelector;
+
+        struct NopSelector;
+        impl OutboundHandlerSelector for NopSelector {
+            fn select_outbounds(
+                &self,
+                selectors: &[String],
+            ) -> Result<Vec<String>, xray_app_router::error::RouterError> {
+                Ok(selectors.to_vec())
+            }
+        }
+
+        // 带 balancing_rule 的 Router（Go command.go:21-47 走 BalancerOverrider /
+        // BalancerPrincipleTarget 断言）。
+        let mut config = xray_proto::xray::app::router::Config::default();
+        config.balancing_rule.push(xray_proto::xray::app::router::BalancingRule {
+            tag: "bal-1".into(),
+            outbound_selector: vec!["out-".into()],
+            ..Default::default()
+        });
+        let router = xray_app_router::router::Router::init(
+            &config,
+            Arc::new(NopSelector),
+            None,
+            None,
+        )
+        .unwrap();
+        let svc = RoutingServiceImpl::new(Arc::new(
+            xray_app_router::command::RoutingService::with_router(router),
+        ));
+
+        svc.override_balancer_target(Request::new(prouter::OverrideBalancerTargetRequest {
+            balancer_tag: "bal-1".into(),
+            target: "out-direct".into(),
+        }))
+        .await
+        .unwrap();
+
+        let resp = svc
+            .get_balancer_info(Request::new(prouter::GetBalancerInfoRequest {
+                tag: "bal-1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let bal = resp.balancer.expect("balancer present");
+        assert_eq!(bal.r#override.expect("override").target, "out-direct");
+        // NopSelector 原样返回 selectors → principle target = selector 列表
+        assert_eq!(
+            bal.principle_target.expect("principle").tag,
+            vec!["out-".to_string()]
+        );
+
+        // 未知 tag → NotFound（Go errors.New("cannot find tag")）
+        let err = svc
+            .get_balancer_info(Request::new(prouter::GetBalancerInfoRequest {
+                tag: "missing".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn routing_test_route_applies_field_selectors() {
+        use prost::Message as _;
+        use xray_proto::xray::app::router::RoutingRule;
+        use xray_proto::xray::common::serial::TypedMessage;
+        use xray_app_router::balancing::OutboundHandlerSelector;
+
+        struct NopSelector;
+        impl OutboundHandlerSelector for NopSelector {
+            fn select_outbounds(
+                &self,
+                selectors: &[String],
+            ) -> Result<Vec<String>, xray_app_router::error::RouterError> {
+                Ok(selectors.to_vec())
+            }
+        }
+
+        let router =
+            xray_app_router::router::Router::empty(Arc::new(NopSelector), None);
+        let svc = RoutingServiceImpl::new(Arc::new(
+            xray_app_router::command::RoutingService::with_router(router),
+        ));
+
+        let mut rule = RoutingRule::default();
+        rule.rule_tag = "rule-1".into();
+        rule.networks = vec![2]; // TCP
+        rule.target_tag = Some(xray_proto::xray::app::router::routing_rule::TargetTag::Tag(
+            "direct".into(),
+        ));
+        svc.add_rule(Request::new(prouter::AddRuleRequest {
+            config: Some(TypedMessage {
+                r#type: "xray.app.router.RoutingRule".into(),
+                value: rule.encode_to_vec(),
+            }),
+            should_append: true,
+        }))
+        .await
+        .unwrap();
+
+        let pctx = prouter::RoutingContext {
+            inbound_tag: "in-1".into(),
+            network: 2,
+            source_port: 1234,
+            target_domain: "example.com".into(),
+            ..Default::default()
+        };
+
+        // selectors 空 → 全量回显 + 命中 outbound_tag（Go config.go:85 全选）
+        let resp = svc
+            .test_route(Request::new(prouter::TestRouteRequest {
+                routing_context: Some(pctx.clone()),
+                field_selectors: vec![],
+                publish_result: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.outbound_tag, "direct");
+        assert_eq!(resp.inbound_tag, "in-1");
+        assert_eq!(resp.source_port, 1234);
+        assert_eq!(resp.target_domain, "example.com");
+
+        // selectors = ["outbound"] → 仅 outbound_tag（前缀匹配 outbound_group/outbound）
+        let resp = svc
+            .test_route(Request::new(prouter::TestRouteRequest {
+                routing_context: Some(pctx),
+                field_selectors: vec!["outbound".into()],
+                publish_result: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.outbound_tag, "direct");
+        assert_eq!(resp.inbound_tag, "");
+        assert_eq!(resp.source_port, 0);
+        assert_eq!(resp.target_domain, "");
     }
 
     // ===== bd pa7 / 7iqw =====

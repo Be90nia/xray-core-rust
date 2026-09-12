@@ -56,6 +56,10 @@ message RoutingRule {
 
   repeated string process = 21;
   WebhookConfig webhook = 22;
+
+  // List of operating systems for matching the one Xray itself is running on
+  // (Go a12801c1: localOS, runtime.GOOS; Windows=windows / Linux=linux / darwin=macos)。
+  repeated string local_os = 23;
 }
 
 message WebhookConfig {

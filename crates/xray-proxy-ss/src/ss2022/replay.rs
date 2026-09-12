@@ -7,8 +7,10 @@
 //! 与 sing 的差异：过期项按池大小阈值惰性清理（sing 按 lastClean 轮询），
 //! 对外语义一致：TTL 内同 salt 必拒。
 
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use parking_lot::Mutex;
 
@@ -27,10 +29,7 @@ impl SaltReplayFilter {
     /// 创建过滤器（生产用 `Duration::from_secs(60)`，对齐 sing）。
     #[must_use]
     pub fn new(ttl: Duration) -> Self {
-        Self {
-            ttl,
-            state: Mutex::new((Instant::now(), HashMap::new())),
-        }
+        Self { ttl, state: Mutex::new((Instant::now(), HashMap::new())) }
     }
 
     /// 检查 salt 是否为新值。`true` = 新（已注册），`false` = TTL 内重放。

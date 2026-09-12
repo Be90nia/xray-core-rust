@@ -41,6 +41,13 @@ pub fn make_dial_fn() -> DialFn {
 ///
 /// 不会 panic；错误以 `Err(String)` 返回。
 pub fn make_dial_fn_with_config(config: Config) -> DialFn {
+    make_dial_fn_with_sockopt(config, String::new())
+}
+
+/// 同 [`make_dial_fn_with_config`]，另将 `sockopt.dialerProxy` 注入拨号层
+/// `SocketOptions`（Go freedom.go:58 + dialer.go:270-279 redirect：freedom 经
+/// 指定出站拨号，非最终出站）。仅 xray-core 装配路径使用。
+pub fn make_dial_fn_with_sockopt(config: Config, dialer_proxy: String) -> DialFn {
     let fragment = config.fragment;
     let destination_override = config.destination_override;
     let proxy_protocol = config.proxy_protocol;
@@ -52,12 +59,14 @@ pub fn make_dial_fn_with_config(config: Config) -> DialFn {
         let dest = dest.clone();
         let fragment = fragment.clone();
         let destination_override = destination_override.clone();
+        let dialer_proxy = dialer_proxy.clone();
         Box::pin(async move {
             // destinationOverride 改写（Go :269-279；isValidAddress 排除 AnyIP）
             let dial_dest =
                 crate::config::apply_destination_override(&dest, destination_override.as_ref());
             let sockopt = SocketOptions {
                 domain_strategy,
+                dialer_proxy,
                 ..SocketOptions::default()
             };
             // Go :281 retry.ExponentialBackoff(5, 100)：dial 瞬时失败指数退避重试
@@ -156,8 +165,8 @@ pub struct FreedomDispatchBridge {
     final_rules: Vec<crate::config::FinalRule>,
     /// 入站 tag → 默认规则类型（xray-core 装配注入）。
     inbound_rules: Arc<HashMap<String, crate::config::DefaultRuleType>>,
-    /// domainStrategy（proto i32， freedom Config 平行值域）。TCP dispatch 域名
-    /// 先解析后匹配 finalRule（bd 6x5o）+ UDP 逐帧域名解析（bd czwu）共用。
+    /// domainStrategy（proto i32， freedom Config 平行值域）。TCP finalRule
+    /// Block 预检解析（#6058）+ UDP 逐帧域名解析（bd czwu）共用。
     domain_strategy: i32,
 }
 
@@ -306,57 +315,66 @@ impl DispatchHandler for FreedomDispatchBridge {
                 }
             })
         } else {
-            // TCP：域名先解析、finalRule Block 检查在解析后的目标上匹配
-            // （bd 6x5o，Go :282-339：HasStrategy→LookupForIP / asis+hasRules→
-            // 系统解析，dialDest 替换为 IP 后 matchFinalRule → Block 黑洞不拨号）。
+            // TCP（#6058，Go v26.9.9 freedom.go:282-346）：拨号恒用原始目标
+            // （域名保留），域名解析只服务 finalRules Block 预检，解析出的 IP
+            // 不改写拨号目标；目标域名的实际解析下沉拨号层（dial_fn 注入
+            // SocketOptions.domain_strategy → dial_system）。预检条件
+            // defaultRule!=nil || len(finalRules)>0（Go :294-295）。
             let tag = self.tag.clone();
             let final_rules = self.final_rules.clone();
-            let mut check_dest =
+            let check_dest =
                 crate::config::apply_destination_override(dest, self.destination_override.as_ref());
             let domain_strategy =
                 xray_transport::sockopt::DomainStrategy::from_i32(self.domain_strategy);
+            let has_precheck_rules = default_rule.is_some() || !final_rules.is_empty();
             let src = access.from.parse::<SocketAddr>().ok();
             let tcp = Arc::clone(&self.tcp);
             Box::pin(async move {
-                if let Some(domain) = check_dest.address().as_domain().map(str::to_string) {
-                    let should_resolve = crate::config::should_resolve_domain_before_final_rules(
-                        &check_dest,
-                        &final_rules,
-                        default_rule.as_ref(),
-                    );
-                    if should_resolve || domain_strategy.has_strategy() {
-                        match crate::config::resolve_domain_for_rules(
+                let blocked = if check_dest.address().is_domain() {
+                    if has_precheck_rules {
+                        // Go :294-329：解析全部候选 IP，任一命中 Block → 黑洞
+                        let domain =
+                            check_dest.address().as_domain().unwrap_or_default().to_string();
+                        match crate::config::resolve_ips_for_rules(
                             &domain,
                             check_dest.port().value(),
                             domain_strategy,
                         )
                         .await
                         {
-                            Ok(ip) => {
-                                check_dest = crate::config::destination_with_ip(&check_dest, ip);
-                            }
+                            Ok(ips) => ips.iter().find_map(|ip| {
+                                let ip_dest =
+                                    crate::config::destination_with_ip(&check_dest, *ip);
+                                crate::config::match_final_rules(
+                                    &final_rules,
+                                    default_rule.as_ref(),
+                                    &ip_dest,
+                                )
+                                .filter(|r| r.action == crate::config::RuleAction::Block)
+                            }),
                             Err(e) => {
-                                // Go :293-295：Lookup 失败 + ForceIP/shouldResolve → 断链；
-                                // 否则降级保留域名（dial 层系统解析，Go :296-300 吞错继续）
-                                if domain_strategy.force_ip() || should_resolve {
-                                    tracing::warn!(
-                                        tag = %tag,
-                                        domain = %domain,
-                                        "freedom: domain resolve failed, aborting: {e}"
-                                    );
-                                    link.writer.shutdown();
-                                    return;
-                                }
+                                // Go :300-302：仅 ForceIP 解析失败到达此处 → 断链
+                                tracing::warn!(
+                                    tag = %tag,
+                                    domain = %domain,
+                                    "freedom: ForceIP domain resolve failed, aborting: {e}"
+                                );
+                                link.writer.shutdown();
+                                return;
                             }
                         }
+                    } else {
+                        None
                     }
-                }
-                let blocked = crate::config::match_final_rules(
-                    &final_rules,
-                    default_rule.as_ref(),
-                    &check_dest,
-                )
-                .filter(|r| r.action == crate::config::RuleAction::Block);
+                } else {
+                    // IP 目标直接匹配（Go :331-337，不受预检条件门控）
+                    crate::config::match_final_rules(
+                        &final_rules,
+                        default_rule.as_ref(),
+                        &check_dest,
+                    )
+                    .filter(|r| r.action == crate::config::RuleAction::Block)
+                };
                 if let Some(rule) = blocked {
                     crate::config::blackhole_link(link, &tag, &rule).await;
                     return;
@@ -1041,5 +1059,118 @@ mod tests {
         );
         // dial_system 单次连接尝试自身可耗 ~2s（Happy Eyeballs/连接选项），5 次上界放宽
         assert!(elapsed < std::time::Duration::from_secs(30), "{elapsed:?}");
+    }
+
+    /// #6058 验收：域名目标 + finalRules 非 Block → 拨号目标保持域名
+    /// （mock dialer 捕获），预检解析发生（FakeDns 1 次）但不改写拨号目标。
+    #[tokio::test]
+    async fn tcp_domain_dest_dials_original_domain_when_not_blocked() {
+        use crate::test_support::{install, uninstall, FakeDns, FAKE_DNS_LOCK};
+        let _g = FAKE_DNS_LOCK.lock();
+        let fake = FakeDns::ips(vec![vec![std::net::IpAddr::V4("93.184.216.34".parse().unwrap())]]);
+        install(&fake);
+
+        let captured: Arc<parking_lot::Mutex<Vec<Destination>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let captured_dial = Arc::clone(&captured);
+        let dial: DialFn = Arc::new(move |dest: &Destination| {
+            let d = dest.clone();
+            let cap = Arc::clone(&captured_dial);
+            Box::pin(async move {
+                cap.lock().push(d);
+                Err("mock dial: capture only".to_string())
+            })
+        });
+        // 非 Block 规则（allow 53 端口，不命中测试目标）→ 预检照跑、不改写、放行拨号
+        let rule = crate::config::FinalRuleConfig::from_json(
+            &serde_json::json!({"action": "allow", "port": "53"}),
+        )
+        .unwrap();
+        let bridge = FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new(
+            "freedom-out",
+            dial,
+        )))
+        // 策略路径让预检解析走 FakeDns（AsIs 走系统 resolver，FakeDns 不可见）
+        .with_domain_strategy(crate::config::DomainStrategy::UseIP as i32)
+        .with_final_rules(vec![crate::config::FinalRule::build(&rule).unwrap()]);
+
+        let dest = Destination::new(
+            Address::Domain("example.test".into()),
+            Port::new(8080),
+            Network::TCP,
+        );
+        let pipe_opt = xray_buf::pipe::PipeOption::default();
+        let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
+        let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
+        let link = xray_transport::link::Link::new(
+            Box::new(up_r) as Box<dyn Reader>,
+            Box::new(dn_w) as Box<dyn Writer>,
+        );
+        let _ = bridge.dispatch(&dest, link).await;
+
+        let g = captured.lock();
+        assert_eq!(g.len(), 1, "mock dialer must be invoked exactly once");
+        let dialed = &g[0];
+        assert!(
+            dialed.address().is_domain(),
+            "dial target must keep the domain, got {:?}",
+            dialed.address()
+        );
+        assert_eq!(dialed.address().as_domain(), Some("example.test"));
+        assert_eq!(dialed.port().value(), 8080);
+        assert_eq!(fake.query_count(), 1, "pre-check resolution must run exactly once");
+        drop(g);
+        uninstall();
+        drop((up_w, dn_r));
+    }
+
+    /// #6058：无规则（defaultRule=nil + finalRules 空）→ 域名不做预检解析
+    /// （FakeDns 0 次），拨号目标保持域名（Go :294-295 条件门控）。
+    #[tokio::test]
+    async fn tcp_domain_dest_without_rules_skips_precheck_resolution() {
+        use crate::test_support::{install, uninstall, FakeDns, FAKE_DNS_LOCK};
+        let _g = FAKE_DNS_LOCK.lock();
+        let fake = FakeDns::ips(vec![]);
+        install(&fake);
+
+        let captured: Arc<parking_lot::Mutex<Vec<Destination>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let captured_dial = Arc::clone(&captured);
+        let dial: DialFn = Arc::new(move |dest: &Destination| {
+            let d = dest.clone();
+            let cap = Arc::clone(&captured_dial);
+            Box::pin(async move {
+                cap.lock().push(d);
+                Err("mock dial: capture only".to_string())
+            })
+        });
+        // 无 final_rules、无 inbound_rules → 无预检（Go :294-295）
+        let bridge = FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new(
+            "freedom-out",
+            dial,
+        )));
+
+        let dest = Destination::new(
+            Address::Domain("noregex.test".into()),
+            Port::new(9090),
+            Network::TCP,
+        );
+        let pipe_opt = xray_buf::pipe::PipeOption::default();
+        let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
+        let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
+        let link = xray_transport::link::Link::new(
+            Box::new(up_r) as Box<dyn Reader>,
+            Box::new(dn_w) as Box<dyn Writer>,
+        );
+        let _ = bridge.dispatch(&dest, link).await;
+
+        let g = captured.lock();
+        assert_eq!(g.len(), 1, "mock dialer must be invoked");
+        assert!(g[0].address().is_domain(), "dial target must keep the domain");
+        assert_eq!(g[0].address().as_domain(), Some("noregex.test"));
+        assert_eq!(fake.query_count(), 0, "no resolution without rules");
+        drop(g);
+        uninstall();
+        drop((up_w, dn_r));
     }
 }

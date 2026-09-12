@@ -149,8 +149,9 @@ pub trait CongestionControl: Send + Sync {
 pub(crate) mod test_support {
     //! 测试辅助：mock RTT 提供方。
 
-    use super::*;
     use std::sync::Mutex;
+
+    use super::*;
 
     /// Mock RTT 提供方，可设置固定的 smoothed_rtt。
     pub struct MockRttStats {
@@ -159,9 +160,7 @@ pub(crate) mod test_support {
 
     impl MockRttStats {
         pub fn new(rtt: Duration) -> Self {
-            Self {
-                rtt: Mutex::new(rtt),
-            }
+            Self { rtt: Mutex::new(rtt) }
         }
 
         pub fn set(&self, rtt: Duration) {

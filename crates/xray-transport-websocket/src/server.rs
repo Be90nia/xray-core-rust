@@ -16,23 +16,31 @@
 //!    - 回写 `Sec-WebSocket-Protocol` 响应头（必须回写客户端才认）
 //! 4. 把握手完成的 `WebSocketStream` + early data 包装为 `WsConnWithEarlyData`
 
-use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use base64::Engine;
-use tokio::net::TcpListener as TokioTcpListener;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_tungstenite::accept_hdr_async;
-use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-use tokio_tungstenite::tungstenite::http::{HeaderMap, StatusCode};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::TcpListener as TokioTcpListener,
+};
+use tokio_tungstenite::{
+    accept_hdr_async,
+    tungstenite::{
+        handshake::server::{Request, Response},
+        http::{HeaderMap, StatusCode},
+    },
+};
+use xray_transport::{connection::Connection, read_proxy_protocol};
 
-use xray_transport::connection::Connection;
-use xray_transport::read_proxy_protocol;
-
-use crate::config::Config;
-use crate::error::{Result, WsError};
-use crate::ws_bridge::WsConnection;
+use crate::{
+    config::Config,
+    error::{Result, WsError},
+    ws_bridge::WsConnection,
+};
 
 /// 服务端 accept 出的连接 + 服务端从 `Sec-WebSocket-Protocol` 解出的 early data。
 ///
@@ -68,24 +76,18 @@ impl WsListener {
     /// 对应 Go 多个 requestHandler 共享一个 listener（Go 实际是单 path/server）。
     pub async fn bind_multi(addr: SocketAddr, configs: Vec<Arc<Config>>) -> Result<Self> {
         if configs.is_empty() {
-            return Err(WsError::InvalidUpgradeRequest {
-                reason: "no WS configs provided".into(),
-            });
+            return Err(WsError::InvalidUpgradeRequest { reason: "no WS configs provided".into() });
         }
-        let listener = TokioTcpListener::bind(addr)
-            .await
-            .map_err(WsError::Io)?;
+        let listener = TokioTcpListener::bind(addr).await.map_err(WsError::Io)?;
         Ok(Self { listener, configs })
     }
 
     /// 本地地址。
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.listener
-            .local_addr()
-            .map_err(WsError::Io)
+        self.listener.local_addr().map_err(WsError::Io)
     }
 
-/// 接受一条新连接，完成 WS 握手 + 校验 host/path + 提取 early data。
+    /// 接受一条新连接，完成 WS 握手 + 校验 host/path + 提取 early data。
     ///
     /// **不支持 TLS**：明文 ws:// only。TLS 场景请用 [`accept_tls`](Self::accept_tls)。
     pub async fn accept(&self) -> Result<AcceptedConn> {
@@ -151,10 +153,8 @@ impl WsListener {
         let callback = move |req: &Request, resp: Response| {
             let headers = req.headers();
             let req_path = req.uri().path();
-            let req_host = headers
-                .get(http::header::HOST)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
+            let req_host =
+                headers.get(http::header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
 
             // 1. 多 path 路由：找到匹配的 config（host 空放行/非空严格匹配 + path 严格匹配）。
             let matched = configs_cb.iter().position(|c| {
@@ -176,10 +176,10 @@ impl WsListener {
             // 2. Early data 提取：Sec-WebSocket-Protocol (base64 RawURL no pad)。
             let mut response = resp;
             if let Some(ed_header) = extract_early_data(headers) {
-                if let Ok(val) = tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&ed_header.raw) {
-                    response
-                        .headers_mut()
-                        .insert("Sec-WebSocket-Protocol", val);
+                if let Ok(val) =
+                    tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&ed_header.raw)
+                {
+                    response.headers_mut().insert("Sec-WebSocket-Protocol", val);
                 }
                 if let Ok(mut guard) = ed_cb.lock() {
                     *guard = ed_header.bytes;
@@ -200,23 +200,16 @@ impl WsListener {
             .await
             .map_err(|e| WsError::HandshakeFailed(format!("accept_hdr_async: {e}")))?;
 
-        let early_data = early_data_slot
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_default();
+        let early_data = early_data_slot.lock().map(|g| g.clone()).unwrap_or_default();
         let xff_ip = xff_slot.lock().ok().and_then(|mut g| g.take());
         let matched_idx = matched_idx_slot.lock().ok().and_then(|mut g| g.take());
 
         // 4. Remote 决定：XFF 覆盖（port=0，对齐 Go forwardedAddrs[0]）。
-        let final_remote = xff_ip
-            .map(|ip| SocketAddr::new(ip, 0))
-            .unwrap_or(remote);
+        let final_remote = xff_ip.map(|ip| SocketAddr::new(ip, 0)).unwrap_or(remote);
 
         // 5. 匹配 config 的 heartbeat_period 启动 ping。
-        let heartbeat_secs = matched_idx
-            .and_then(|i| configs.get(i))
-            .map(|c| c.heartbeat_period)
-            .unwrap_or(0);
+        let heartbeat_secs =
+            matched_idx.and_then(|i| configs.get(i)).map(|c| c.heartbeat_period).unwrap_or(0);
 
         let mut conn = WsConnection::from_stream(ws_stream, Some(final_remote), local);
         if heartbeat_secs > 0 {
@@ -250,22 +243,21 @@ fn extract_early_data(headers: &HeaderMap) -> Option<EarlyDataHeader> {
         return None;
     }
     // 兼容 Go replacer：标准 base64 → RawURL。
-    let normalized: String = raw.chars().map(|c| match c {
-        '+' => '-',
-        '/' => '_',
-        '=' => '\0', // 移除 padding
-        _ => c,
-    }).filter(|c| *c != '\0').collect();
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(&normalized)
-        .ok()?;
+    let normalized: String = raw
+        .chars()
+        .map(|c| match c {
+            '+' => '-',
+            '/' => '_',
+            '=' => '\0', // 移除 padding
+            _ => c,
+        })
+        .filter(|c| *c != '\0')
+        .collect();
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&normalized).ok()?;
     if bytes.is_empty() {
         return None;
     }
-    Some(EarlyDataHeader {
-        raw: raw.to_string(),
-        bytes,
-    })
+    Some(EarlyDataHeader { raw: raw.to_string(), bytes })
 }
 
 /// 从 `X-Forwarded-For` header 提取首个 IP（最原始客户端）。
@@ -278,7 +270,6 @@ fn extract_xff(headers: &HeaderMap) -> Option<IpAddr> {
     first.parse::<IpAddr>().ok()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,7 +277,9 @@ mod tests {
     /// 确保 rustls CryptoProvider 在并行测试中只初始化一次
     fn ensure_crypto_provider() {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| { let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default(); });
+        ONCE.call_once(|| {
+            let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        });
     }
 
     #[test]
@@ -332,8 +325,7 @@ mod tests {
     async fn accept_tls_completes_ws_handshake() {
         ensure_crypto_provider();
         // 1. 自签证书
-        let cert_params =
-            rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         let key_pair = rcgen::KeyPair::generate().unwrap();
         let cert = cert_params.self_signed(&key_pair).unwrap();
         let cert_der = cert.der().to_vec();
@@ -343,18 +335,13 @@ mod tests {
         let key = rustls::pki_types::PrivateKeyDer::try_from(key_der).unwrap();
         let server_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(
-                vec![rustls::pki_types::CertificateDer::from(cert_der.clone())],
-                key,
-            )
+            .with_single_cert(vec![rustls::pki_types::CertificateDer::from(cert_der.clone())], key)
             .unwrap();
         let tls_config = std::sync::Arc::new(server_config);
 
         // 3. 启动 WsListener + accept_tls
         let ws_config = std::sync::Arc::new(crate::config::Config::default());
-        let listener = WsListener::bind("127.0.0.1:0".parse().unwrap(), ws_config)
-            .await
-            .unwrap();
+        let listener = WsListener::bind("127.0.0.1:0".parse().unwrap(), ws_config).await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let server_handle = tokio::spawn(async move {
@@ -365,9 +352,7 @@ mod tests {
         // 4. 客户端：TCP + TLS + WS connect
         // 构造信任自签证书的 client config
         let mut root_store = rustls::RootCertStore::empty();
-        root_store
-            .add(rustls::pki_types::CertificateDer::from(cert_der))
-            .unwrap();
+        root_store.add(rustls::pki_types::CertificateDer::from(cert_der)).unwrap();
         let client_config = std::sync::Arc::new(
             rustls::ClientConfig::builder()
                 .with_root_certificates(root_store)
@@ -378,10 +363,7 @@ mod tests {
         // ponytail: 直接用 tokio-rustls 手动 TLS 后 tungstenite client_handshake
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let connector = tokio_rustls::TlsConnector::from(client_config);
-        let tls_stream = connector
-            .connect("localhost".try_into().unwrap(), tcp)
-            .await
-            .unwrap();
+        let tls_stream = connector.connect("localhost".try_into().unwrap(), tcp).await.unwrap();
 
         // WS 客户端握手
         use tokio_tungstenite::client_async;
@@ -399,7 +381,10 @@ mod tests {
 
         // 5. 服务端 accept_tls 完成
         let accepted = server_handle.await.unwrap().unwrap();
-        assert_eq!(accepted.remote.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+        assert_eq!(
+            accepted.remote.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
+        );
     }
 
     // --- extract_xff 单元测试 ---
@@ -415,10 +400,7 @@ mod tests {
     #[test]
     fn extract_xff_chain_takes_first() {
         let mut h = HeaderMap::new();
-        h.insert(
-            "X-Forwarded-For",
-            "1.2.3.4, 5.6.7.8, 9.10.11.12".parse().unwrap(),
-        );
+        h.insert("X-Forwarded-For", "1.2.3.4, 5.6.7.8, 9.10.11.12".parse().unwrap());
         let ip = extract_xff(&h).expect("parsed");
         assert_eq!(ip, IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)));
     }
@@ -448,21 +430,12 @@ mod tests {
 
     #[tokio::test]
     async fn bind_multi_routes_by_path_and_rejects_unknown() {
-        use tokio_tungstenite::client_async;
-        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::{client_async, tungstenite::client::IntoClientRequest};
 
-        let cfg1 = Arc::new(Config {
-            path: "/foo".into(),
-            ..Default::default()
-        });
-        let cfg2 = Arc::new(Config {
-            path: "/bar".into(),
-            ..Default::default()
-        });
+        let cfg1 = Arc::new(Config { path: "/foo".into(), ..Default::default() });
+        let cfg2 = Arc::new(Config { path: "/bar".into(), ..Default::default() });
         let listener = Arc::new(
-            WsListener::bind_multi("127.0.0.1:0".parse().unwrap(), vec![cfg1, cfg2])
-                .await
-                .unwrap(),
+            WsListener::bind_multi("127.0.0.1:0".parse().unwrap(), vec![cfg1, cfg2]).await.unwrap(),
         );
         let addr = listener.local_addr().unwrap();
 
@@ -470,9 +443,7 @@ mod tests {
         let l1 = Arc::clone(&listener);
         let s1 = tokio::spawn(async move { l1.accept().await });
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let req = format!("ws://127.0.0.1:{}/foo", addr.port())
-            .into_client_request()
-            .unwrap();
+        let req = format!("ws://127.0.0.1:{}/foo", addr.port()).into_client_request().unwrap();
         let (_ws, _resp) = client_async(req, tcp).await.expect("/foo should match");
         let _ = s1.await.unwrap().unwrap();
 
@@ -480,9 +451,7 @@ mod tests {
         let l2 = Arc::clone(&listener);
         let s2 = tokio::spawn(async move { l2.accept().await });
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let req = format!("ws://127.0.0.1:{}/bar", addr.port())
-            .into_client_request()
-            .unwrap();
+        let req = format!("ws://127.0.0.1:{}/bar", addr.port()).into_client_request().unwrap();
         let (_ws, _resp) = client_async(req, tcp).await.expect("/bar should match");
         let _ = s2.await.unwrap().unwrap();
 
@@ -490,9 +459,7 @@ mod tests {
         let l3 = Arc::clone(&listener);
         let s3 = tokio::spawn(async move { l3.accept().await });
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let req = format!("ws://127.0.0.1:{}/baz", addr.port())
-            .into_client_request()
-            .unwrap();
+        let req = format!("ws://127.0.0.1:{}/baz", addr.port()).into_client_request().unwrap();
         let result = client_async(req, tcp).await;
         assert!(result.is_err(), "/baz should not match");
         assert!(s3.await.unwrap().is_err(), "server accept should fail too");
@@ -502,33 +469,23 @@ mod tests {
 
     #[tokio::test]
     async fn xff_header_overrides_remote_addr() {
-        use tokio_tungstenite::client_async;
-        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::{client_async, tungstenite::client::IntoClientRequest};
 
         let cfg = Arc::new(Config::default());
-        let listener = Arc::new(
-            WsListener::bind("127.0.0.1:0".parse().unwrap(), cfg)
-                .await
-                .unwrap(),
-        );
+        let listener =
+            Arc::new(WsListener::bind("127.0.0.1:0".parse().unwrap(), cfg).await.unwrap());
         let addr = listener.local_addr().unwrap();
 
         let l = Arc::clone(&listener);
         let server = tokio::spawn(async move { l.accept().await });
 
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut req = format!("ws://127.0.0.1:{}/", addr.port())
-            .into_client_request()
-            .unwrap();
-        req.headers_mut()
-            .insert("X-Forwarded-For", "203.0.113.5".parse().unwrap());
+        let mut req = format!("ws://127.0.0.1:{}/", addr.port()).into_client_request().unwrap();
+        req.headers_mut().insert("X-Forwarded-For", "203.0.113.5".parse().unwrap());
         let (_ws, _resp) = client_async(req, tcp).await.unwrap();
 
         let accepted = server.await.unwrap().unwrap();
-        assert_eq!(
-            accepted.remote.ip(),
-            "203.0.113.5".parse::<IpAddr>().unwrap()
-        );
+        assert_eq!(accepted.remote.ip(), "203.0.113.5".parse::<IpAddr>().unwrap());
         assert_eq!(accepted.remote.port(), 0, "XFF override sets port to 0");
     }
 }

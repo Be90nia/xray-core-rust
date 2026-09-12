@@ -16,24 +16,22 @@
 //!
 //! 进程启动时调用一次 [`register_dialer`]；幂等——重复注册的 `AlreadyExists` 被忽略。
 
-use std::future::Future;
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
+use std::{future::Future, io, net::SocketAddr, pin::Pin, sync::Arc};
 
 use xray_common::net::destination::Destination;
-use xray_transport::connection::Connection;
-use xray_transport::dialer::{
-    StreamSettings, TransportDialFn, register_transport_dialer,
+use xray_transport::{
+    connection::Connection,
+    dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
+    listener_registry::{
+        ConnHandler, TransportListenFn, TransportListener, register_transport_listener,
+    },
+    sockopt::SocketOptions,
 };
-use xray_transport::listener_registry::{
-    ConnHandler, TransportListenFn, TransportListener,
-    register_transport_listener,
+
+use crate::{
+    client::{DelayDialConn, DialFactory, DialOptions, DialParams, dial, dial_with_params},
+    config::Config,
 };
-use xray_transport::sockopt::SocketOptions;
-use crate::client::{DialFactory, DialOptions, DialParams, DelayDialConn, dial, dial_with_params};
-use crate::config::Config;
 
 /// 注册 WebSocket transport dialer。
 ///
@@ -87,8 +85,7 @@ async fn listen_ws(
         .await
         .map_err(|e| io::Error::other(e))?;
 
-    let local_addr = ws_listener.local_addr()
-        .map_err(|e| io::Error::other(e))?;
+    let local_addr = ws_listener.local_addr().map_err(|e| io::Error::other(e))?;
 
     let close_notify = Arc::new(tokio::sync::Notify::new());
     let close_notify_clone = close_notify.clone();
@@ -98,16 +95,17 @@ async fn listen_ws(
 
     // Tcpmask（Go websocket/hub.go:132-134：`TcpmaskManager.WrapListener` →
     // 每条 accept conn 过 `WrapConnServer` 再进 handler；空 manager = 恒等）。
-    let tcpmask = Arc::new(
-        xray_transport::finalmask::build_tcpmask_manager_from_json(
-            settings.finalmask_json.as_ref(),
-        )?,
-    );
+    let tcpmask = Arc::new(xray_transport::finalmask::build_tcpmask_manager_from_json(
+        settings.finalmask_json.as_ref(),
+    )?);
 
     // spawn accept loop。
     let handler = handler.clone();
     let tls_config = if use_tls {
-        xray_tls::server_config::build_server_config(&settings.security, settings.security_json.as_ref())?
+        xray_tls::server_config::build_server_config(
+            &settings.security,
+            settings.security_json.as_ref(),
+        )?
     } else {
         None
     };
@@ -214,9 +212,7 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
             let params = params.clone();
             let settings = settings.clone();
             Box::pin(async move {
-                let conn = dial_with_params(params, ed_bytes)
-                    .await
-                    .map_err(io::Error::other)?;
+                let conn = dial_with_params(params, ed_bytes).await.map_err(io::Error::other)?;
                 // Tcpmask（Go websocket/dialer.go:56-63 WrapConnClient）：
                 // 真实连接建立时应用，delayDialConn 包在最外层。
                 xray_transport::finalmask::wrap_conn_client_from_settings(&settings, Box::new(conn))
@@ -269,8 +265,8 @@ fn security_str(settings: &StreamSettings, key: &str) -> Option<String> {
 ///
 /// 语义逐条对齐 httpupgrade 的 [`xray_transport_httpupgrade::config::extract_ed_from_path`]：
 /// - **提取门**：首个 `ed` query 值为非空字符串才提取（`?ed=`、`?ed` 或首值空 → 整体不动）。
-/// - **数值**：`strconv.Atoi` 语法错误 → 0（溢出时 Go 返回钳制值且错误被忽略）；
-///   `uint32(Ed)` 截断低 32 位，负数回绕。
+/// - **数值**：`strconv.Atoi` 语法错误 → 0（溢出时 Go 返回钳制值且错误被忽略）； `uint32(Ed)`
+///   截断低 32 位，负数回绕。
 /// - **删除**：提取触发时删除**全部** `ed` 参数（即使 Atoi 失败）。
 /// - **重编码**：剩余参数按 Go `Values.Encode()`——键稳定排序、`QueryEscape`。
 /// - **fragment**：`#` 后内容不参与解析，结果原样回接。
@@ -316,10 +312,8 @@ fn extract_ed_from_path(path: &str) -> (String, Option<u32>) {
     let mut out = base.to_string();
     if !pairs.is_empty() {
         pairs.sort_by(|a, b| a.0.cmp(&b.0)); // 稳定排序：同键多值保持插入序
-        let encoded: Vec<String> = pairs
-            .iter()
-            .map(|(k, v)| format!("{}={}", query_escape(k), query_escape(v)))
-            .collect();
+        let encoded: Vec<String> =
+            pairs.iter().map(|(k, v)| format!("{}={}", query_escape(k), query_escape(v))).collect();
         out.push('?');
         out.push_str(&encoded.join("&"));
     }
@@ -359,7 +353,7 @@ fn query_unescape(s: &str) -> Option<String> {
             b'+' => {
                 out.push(b' ');
                 i += 1;
-            }
+            },
             b'%' => {
                 if i + 2 >= b.len() {
                     return None;
@@ -368,11 +362,11 @@ fn query_unescape(s: &str) -> Option<String> {
                 let lo = hex_val(b[i + 2])?;
                 out.push(hi << 4 | lo);
                 i += 3;
-            }
+            },
             c => {
                 out.push(c);
                 i += 1;
-            }
+            },
         }
     }
     Some(String::from_utf8_lossy(&out).into_owned())
@@ -385,7 +379,7 @@ fn query_escape(s: &str) -> String {
         match c {
             b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(c as char)
-            }
+            },
             b' ' => out.push('+'),
             _ => out.push_str(&format!("%{c:02X}")),
         }
@@ -429,21 +423,17 @@ fn hex_val(c: u8) -> Option<u8> {
 ///
 /// `None` 或非 object 返回 [`Config::default`]。
 fn parse_ws_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
-    let Some(v) = json else { return Ok(Config::default()); };
+    let Some(v) = json else {
+        return Ok(Config::default());
+    };
     let Some(obj) = v.as_object() else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "wsSettings must be a JSON object",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "wsSettings must be a JSON object"));
     };
 
     let mut host = obj.get("host").and_then(|x| x.as_str()).unwrap_or("").to_string();
     let mut path = obj.get("path").and_then(|x| x.as_str()).unwrap_or("").to_string();
     let mut ed = obj.get("ed").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-    let heartbeat_period = obj
-        .get("heartbeatPeriod")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(0) as u32;
+    let heartbeat_period = obj.get("heartbeatPeriod").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
 
     // Go `infra/conf/transport_internet.go::WebSocketConfig.Build`：
     // path 中 `?ed=N` 提取为 Ed 字段并从 path 删除（其余 query 参数保留）。
@@ -457,33 +447,22 @@ fn parse_ws_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
         .or_else(|| parse_headers(obj.get("headers")))
         .unwrap_or_default();
 
-    if let Some(host_key) = header
-        .keys()
-        .find(|k| k.eq_ignore_ascii_case("host"))
-        .cloned()
-    {
+    if let Some(host_key) = header.keys().find(|k| k.eq_ignore_ascii_case("host")).cloned() {
         let v = header.remove(&host_key).unwrap_or_default();
         if host.is_empty() {
             host = v;
         }
     }
-    let accept_proxy_protocol = obj
-        .get("acceptProxyProtocol")
-        .and_then(|x| x.as_bool())
-        .unwrap_or(false);
+    let accept_proxy_protocol =
+        obj.get("acceptProxyProtocol").and_then(|x| x.as_bool()).unwrap_or(false);
 
-    Ok(Config {
-        host,
-        path,
-        header,
-        accept_proxy_protocol,
-        ed,
-        heartbeat_period,
-    })
+    Ok(Config { host, path, header, accept_proxy_protocol, ed, heartbeat_period })
 }
 
 /// 把 JSON 子对象解析为 `HashMap<String, String>`。非 object 或缺失返回 `None`。
-fn parse_headers(v: Option<&serde_json::Value>) -> Option<std::collections::HashMap<String, String>> {
+fn parse_headers(
+    v: Option<&serde_json::Value>,
+) -> Option<std::collections::HashMap<String, String>> {
     let obj = v?.as_object()?;
     let mut map = std::collections::HashMap::with_capacity(obj.len());
     for (k, val) in obj {
@@ -530,8 +509,7 @@ mod tests {
 
     #[test]
     fn parse_ws_config_accepts_header_singular() {
-        let v: serde_json::Value =
-            serde_json::from_str(r#"{"header":{"X-Custom":"v"}}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(r#"{"header":{"X-Custom":"v"}}"#).unwrap();
         let cfg = parse_ws_config(Some(&v)).unwrap();
         assert_eq!(cfg.header.get("X-Custom").unwrap(), "v");
     }
@@ -539,10 +517,9 @@ mod tests {
     #[test]
     fn parse_ws_config_header_preferred_over_headers() {
         // 同时给两种 key：header（proto）优先于 headers（用户）。
-        let v: serde_json::Value = serde_json::from_str(
-            r#"{"header":{"K":"from-proto"},"headers":{"K":"from-user"}}"#,
-        )
-        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"header":{"K":"from-proto"},"headers":{"K":"from-user"}}"#)
+                .unwrap();
         let cfg = parse_ws_config(Some(&v)).unwrap();
         assert_eq!(cfg.header.get("K").unwrap(), "from-proto");
     }
@@ -588,10 +565,8 @@ mod tests {
     /// Go 兼容：headers 里的 host 提升为 Host 字段并从 headers 删除。
     #[test]
     fn parse_ws_config_headers_host_promotion() {
-        let v: serde_json::Value = serde_json::from_str(
-            r#"{"headers":{"Host":"h.example.com","X-Foo":"1"}}"#,
-        )
-        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"headers":{"Host":"h.example.com","X-Foo":"1"}}"#).unwrap();
         let cfg = parse_ws_config(Some(&v)).unwrap();
         assert_eq!(cfg.host, "h.example.com");
         assert!(!cfg.header.contains_key("Host"));
@@ -605,7 +580,8 @@ mod tests {
     /// 键排序：剩余参数按字母序拼成 early data，ed=2048 提取后 path="/ws?x=1&y=2"。
     #[test]
     fn extract_ed_key_sort() {
-        let v: serde_json::Value = serde_json::from_str(r#"{"path":"/ws?y=2&ed=2048&x=1"}"#).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"path":"/ws?y=2&ed=2048&x=1"}"#).unwrap();
         let cfg = parse_ws_config(Some(&v)).unwrap();
         assert_eq!(cfg.path, "/ws?x=1&y=2");
         assert_eq!(cfg.ed, 2048);
@@ -615,8 +591,7 @@ mod tests {
     #[test]
     fn extract_ed_atoi_clamps_overflow() {
         // 4294967297 = 2^32 + 1 → 截断后为 1
-        let v: serde_json::Value =
-            serde_json::from_str(r#"{"path":"/ws?ed=4294967297"}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(r#"{"path":"/ws?ed=4294967297"}"#).unwrap();
         let cfg = parse_ws_config(Some(&v)).unwrap();
         assert_eq!(cfg.ed, 1);
         assert_eq!(cfg.path, "/ws");
@@ -702,14 +677,8 @@ mod tests {
         // 负数 → uint32 回绕
         assert_eq!(f("/ws?ed=-1"), ("/ws".to_string(), Some(u32::MAX)));
         // 溢出钳制
-        assert_eq!(
-            f("/ws?ed=99999999999999999999"),
-            ("/ws".to_string(), Some(u32::MAX))
-        );
-        assert_eq!(
-            f("/ws?ed=-99999999999999999999"),
-            ("/ws".to_string(), Some(0))
-        );
+        assert_eq!(f("/ws?ed=99999999999999999999"), ("/ws".to_string(), Some(u32::MAX)));
+        assert_eq!(f("/ws?ed=-99999999999999999999"), ("/ws".to_string(), Some(0)));
         // u32 范围内截断低 32 位
         assert_eq!(f("/ws?ed=4294967297"), ("/ws".to_string(), Some(1)));
         // 剩余按键排序 + QueryEscape
@@ -723,23 +692,15 @@ mod tests {
     /// ed>0 走 delayDial（Go dialer.go:24-32）：dial_ws 立即返回成功且不拨号。
     #[tokio::test]
     async fn dial_ws_with_ed_defers_dialing() {
-        use xray_common::net::address::Address;
-        use xray_common::net::network::Network;
-        use xray_common::net::port::Port;
+        use xray_common::net::{address::Address, network::Network, port::Port};
 
         // 127.0.0.1:1 不可达：立即拨号会 Err；delayDial 首写前必须成功返回。
         let settings = StreamSettings {
             transport_json: Some(serde_json::json!({"path": "/ws?ed=2048"})),
             ..Default::default()
         };
-        let dest = Destination::new(
-            Address::new_domain("127.0.0.1"),
-            Port::new(1),
-            Network::TCP,
-        );
-        let conn = dial_ws(&dest, &settings)
-            .await
-            .expect("delayDial must return without dialing");
+        let dest = Destination::new(Address::new_domain("127.0.0.1"), Port::new(1), Network::TCP);
+        let conn = dial_ws(&dest, &settings).await.expect("delayDial must return without dialing");
         drop(conn);
     }
     /// Tcpmask round-trip（o54c，Go websocket/dialer.go:56-63 + hub.go:132-134）：
@@ -748,9 +709,7 @@ mod tests {
     #[tokio::test]
     async fn ws_dial_hub_tcpmask_roundtrip() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use xray_common::net::address::Address;
-        use xray_common::net::network::Network;
-        use xray_common::net::port::Port;
+        use xray_common::net::{address::Address, network::Network, port::Port};
 
         let finalmask = serde_json::json!({
             "tcp": [{"type": "fragment", "settings": {
@@ -775,7 +734,7 @@ mod tests {
                             if conn.write_all(&buf[..n]).await.is_err() {
                                 break;
                             }
-                        }
+                        },
                     }
                 }
             });
@@ -794,13 +753,10 @@ mod tests {
 
         conn.write_all(b"hello-ws-tcpmask").await.expect("write");
         let mut buf = vec![0u8; 64];
-        let n = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            conn.read(&mut buf),
-        )
-        .await
-        .expect("echo timeout")
-        .expect("read ok");
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), conn.read(&mut buf))
+            .await
+            .expect("echo timeout")
+            .expect("read ok");
         assert_eq!(&buf[..n], b"hello-ws-tcpmask");
     }
     /// close() 后 accept 循环退出、socket 释放，新连接被拒（票 n8k8/x6sp 行为面）。
@@ -808,10 +764,7 @@ mod tests {
     /// pre-spawn close 竞态窗锚在 xray-transport tcp/hub.rs。
     #[tokio::test]
     async fn close_rejects_new_connections() {
-        let settings = StreamSettings {
-            protocol: "websocket".into(),
-            ..Default::default()
-        };
+        let settings = StreamSettings { protocol: "websocket".into(), ..Default::default() };
         let handler: ConnHandler = Arc::new(|_| {});
         let listener = listen_ws("127.0.0.1:0".parse().unwrap(), &settings, &handler)
             .await
@@ -831,7 +784,7 @@ mod tests {
                         "close 后端口仍接受连接（close 通知丢失/循环未退出）"
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
+                },
             }
         }
     }

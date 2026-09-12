@@ -11,20 +11,22 @@
 //! 3. 期望 status=233（StatusAuthOK）；Response Headers 含 `Hysteria-UDP`/`Hysteria-CC-RX`
 //! 4. 返回 `Arc<dyn QuicConn>`（QuinnQuicConn），后续 `open_stream` 直接用 quinn open_bi
 //!
-//! 参考：librarian 调研 hyproxy/hysteria 1.x 协议 + Xray Go `transport/internet/hysteria/dialer.go`。
+//! 参考：librarian 调研 hyproxy/hysteria 1.x 协议 + Xray Go
+//! `transport/internet/hysteria/dialer.go`。
 
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
+use std::{io, net::SocketAddr, pin::Pin, sync::Arc};
 
-use quinn::crypto::rustls::QuicClientConfig;
-use quinn::{ClientConfig as QuinnClientConfig, Connection as QuinnConnection, Endpoint};
-
-use crate::conn::{QuicConn, QuicStream};
-use crate::dialer::{DialDestination, HysteriaTransport, QuicConfig};
-use crate::quinn_adapter::{QuinnQuicConn, QuinnQuicStream};
+use quinn::{
+    ClientConfig as QuinnClientConfig, Connection as QuinnConnection, Endpoint,
+    crypto::rustls::QuicClientConfig,
+};
 use xray_transport::finalmask::salamander::SalamanderObfuscator;
+
+use crate::{
+    conn::{QuicConn, QuicStream},
+    dialer::{DialDestination, HysteriaTransport, QuicConfig},
+    quinn_adapter::{QuinnQuicConn, QuinnQuicStream},
+};
 
 /// Hysteria auth URL（POST 目标）。
 const AUTH_URL: &str = "https://hysteria/auth";
@@ -62,10 +64,7 @@ impl QuinnHysteriaTransport {
 
     /// 注入 salamander UDP 混淆（builder 风格，None = 不包装）。
     #[must_use]
-    pub fn with_salamander(
-        mut self,
-        obfs: Option<Arc<SalamanderObfuscator>>,
-    ) -> Self {
+    pub fn with_salamander(mut self, obfs: Option<Arc<SalamanderObfuscator>>) -> Self {
         self.salamander = obfs;
         self
     }
@@ -98,7 +97,7 @@ impl HysteriaTransport for QuinnHysteriaTransport {
                     crate::salamander_socket::SalamanderSocket::bind(obfs.clone(), bind_addr)
                         .await?
                         .client_endpoint()?
-                }
+                },
                 None => Endpoint::client(bind_addr)
                     .map_err(|e| io::Error::other(format!("quinn endpoint: {e}")))?,
             };
@@ -111,7 +110,8 @@ impl HysteriaTransport for QuinnHysteriaTransport {
                 .await
                 .map_err(|e| io::Error::other(format!("quinn connect: {e}")))?;
 
-            // 3. h3 client 发 POST /auth，返回保活项（driver + SendRequest）防止 h3 关闭 QUIC 连接。
+            // 3. h3 client 发 POST /auth，返回保活项（driver + SendRequest）防止 h3 关闭 QUIC
+            //    连接。
             let h3_keepalive = authenticate_via_h3(&conn, &auth_token, brutal_down_bps).await?;
 
             // 3.5 CC 协商（Go dialer.go:229-243 switch）：
@@ -122,6 +122,7 @@ impl HysteriaTransport for QuinnHysteriaTransport {
                 &quic_cfg.bbr_profile,
                 quic_cfg.brutal_up,
                 h3_keepalive.cc_rx_down,
+                quic_cfg.brutal_disable_loss_compensation,
             ) {
                 tracing::warn!(error = %e, "hysteria congestion negotiation failed, keeping default");
             }
@@ -167,8 +168,8 @@ impl HysteriaTransport for QuinnHysteriaTransport {
 /// `H3_NO_ERROR` 关闭整条 QUIC 连接。hysteria 认证后要用同一条 QUIC 连接开 raw bidi
 /// stream，因此这里：
 /// 1. spawn 后台 task 持续 `poll_close` 驱动 h3 连接；
-/// 2. 额外 clone 一份 `SendRequest`（sender_count 由 2 减到 1，不触发关闭），与
-///    driver task 的 JoinHandle 一同返回给调用方保活，直到 conn drop。
+/// 2. 额外 clone 一份 `SendRequest`（sender_count 由 2 减到 1，不触发关闭），与 driver task 的
+///    JoinHandle 一同返回给调用方保活，直到 conn drop。
 async fn authenticate_via_h3(
     conn: &QuinnConnection,
     auth_token: &str,
@@ -194,10 +195,7 @@ async fn authenticate_via_h3(
         .send_request(req)
         .await
         .map_err(|e| io::Error::other(format!("h3 send_request: {e}")))?;
-    stream
-        .finish()
-        .await
-        .map_err(|e| io::Error::other(format!("h3 stream finish: {e}")))?;
+    stream.finish().await.map_err(|e| io::Error::other(format!("h3 stream finish: {e}")))?;
 
     let resp = stream
         .recv_response()
@@ -225,13 +223,7 @@ async fn authenticate_via_h3(
         .headers()
         .get("Hysteria-CC-RX")
         .and_then(|v| v.to_str().ok())
-        .map(|s| {
-            if s.eq_ignore_ascii_case("auto") {
-                0
-            } else {
-                s.parse::<u64>().unwrap_or(0)
-            }
-        })
+        .map(|s| if s.eq_ignore_ascii_case("auto") { 0 } else { s.parse::<u64>().unwrap_or(0) })
         .unwrap_or(0);
     // drop request stream（sender_count 仍由 send_req 维持）
     drop(stream);
@@ -245,12 +237,7 @@ async fn authenticate_via_h3(
     });
     let send_req_keepalive = send_req.clone();
 
-    Ok(H3Keepalive {
-        driver_task,
-        send_req: send_req_keepalive,
-        udp_enabled,
-        cc_rx_down,
-    })
+    Ok(H3Keepalive { driver_task, send_req: send_req_keepalive, udp_enabled, cc_rx_down })
 }
 
 /// h3 auth 保活项 + 协商结果。
@@ -285,7 +272,9 @@ mod tests {
     /// 确保 rustls CryptoProvider 在并行测试中只初始化一次
     fn ensure_crypto_provider() {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
+        ONCE.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
     }
 
     #[test]

@@ -3,23 +3,22 @@
 //! 覆盖：
 //! 1. `register_dialer()` 后 `get_transport_dialer("ws")` / `"websocket"` 都返回 Some。
 //! 2. 重复 `register_dialer()` 不报错（幂等）。
-//! 3. e2e：本地起 tokio-tungstenite accept_async server → register →
-//!    `dial_with_settings("ws", dest, sockopt, settings)` 能拨上、能收发字节。
+//! 3. e2e：本地起 tokio-tungstenite accept_async server → register → `dial_with_settings("ws",
+//!    dest, sockopt, settings)` 能拨上、能收发字节。
 
-use std::net::Ipv4Addr;
-use std::time::Duration;
+use std::{net::Ipv4Addr, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
 use tokio_tungstenite::tungstenite::Message;
-
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
-use xray_transport::dialer::{StreamSettings, dial_with_settings, get_transport_dialer};
-use xray_transport::sockopt::SocketOptions;
+use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
+use xray_transport::{
+    dialer::{StreamSettings, dial_with_settings, get_transport_dialer},
+    sockopt::SocketOptions,
+};
 use xray_transport_websocket::register_dialer;
 
 /// `register_dialer()` 后两个协议名都应能在全局表查到。
@@ -27,10 +26,7 @@ use xray_transport_websocket::register_dialer;
 fn register_dialer_makes_ws_and_websocket_resolvable() {
     register_dialer().expect("register_dialer should succeed");
     assert!(get_transport_dialer("ws").is_some(), "ws dialer should be registered");
-    assert!(
-        get_transport_dialer("websocket").is_some(),
-        "websocket dialer should be registered"
-    );
+    assert!(get_transport_dialer("websocket").is_some(), "websocket dialer should be registered");
 }
 
 /// 重复 `register_dialer()` 不应 panic 或返回 Err。
@@ -60,23 +56,17 @@ async fn e2e_dial_with_settings_ws_roundtrip() {
                     if ws.send(Message::binary(b)).await.is_err() {
                         break;
                     }
-                }
+                },
                 Message::Close(_) | Message::Ping(_) | Message::Pong(_) => break,
-                _ => {}
+                _ => {},
             }
         }
     });
 
     // 2. 构造 StreamSettings：protocol=ws，无 TLS，无 wsSettings（用默认）。
-    let dest = Destination::new(
-        Address::IPv4(Ipv4Addr::LOCALHOST),
-        Port::new(addr.port()),
-        Network::TCP,
-    );
-    let settings = StreamSettings {
-        protocol: "ws".into(),
-        ..StreamSettings::tcp()
-    };
+    let dest =
+        Destination::new(Address::IPv4(Ipv4Addr::LOCALHOST), Port::new(addr.port()), Network::TCP);
+    let settings = StreamSettings { protocol: "ws".into(), ..StreamSettings::tcp() };
     let sockopt = SocketOptions::default();
 
     // 3. 拨号。
@@ -116,15 +106,9 @@ async fn e2e_alias_websocket_protocol_dials() {
         // 接受即关闭——只验证握手成功。
     });
 
-    let dest = Destination::new(
-        Address::IPv4(Ipv4Addr::LOCALHOST),
-        Port::new(addr.port()),
-        Network::TCP,
-    );
-    let settings = StreamSettings {
-        protocol: "websocket".into(),
-        ..StreamSettings::tcp()
-    };
+    let dest =
+        Destination::new(Address::IPv4(Ipv4Addr::LOCALHOST), Port::new(addr.port()), Network::TCP);
+    let settings = StreamSettings { protocol: "websocket".into(), ..StreamSettings::tcp() };
     let sockopt = SocketOptions::default();
 
     let result = tokio::time::timeout(
@@ -133,11 +117,7 @@ async fn e2e_alias_websocket_protocol_dials() {
     )
     .await
     .expect("dial should not time out");
-    assert!(
-        result.is_ok(),
-        "dial via alias websocket should succeed: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "dial via alias websocket should succeed: {:?}", result.err());
 
     let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
 }

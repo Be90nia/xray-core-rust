@@ -28,17 +28,19 @@
 //! 与 TCP EIH 的差异：UDP EIH 用 **raw iPSK** 直接作 ECB 密钥（TCP 用
 //! salt 派生的 identity subkey），且明文是与包头头的 XOR。
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use parking_lot::Mutex;
 use xray_common::net::address::Address;
 use xray_crypto::aead::{AeadCipher, Aes128Gcm, Aes256Gcm};
 
-use crate::error::{Result, SsError};
-use crate::protocol::{read_address_port_ss, write_address_port_ss};
-use crate::ss2022::key::{
-    derive_psk, derive_session_subkey, ecb_block, psk_identity, CipherKind2022,
+use crate::{
+    error::{Result, SsError},
+    protocol::{read_address_port_ss, write_address_port_ss},
+    ss2022::key::{CipherKind2022, derive_psk, derive_session_subkey, ecb_block, psk_identity},
 };
 
 /// client 帧类型字节。
@@ -56,21 +58,16 @@ const PACKET_HEADER_LEN: usize = 16;
 const MIN_PLAINTEXT: usize = 1 + 8 + 2 + 7;
 
 fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
 fn build_aead(kind: CipherKind2022, key: &[u8]) -> Result<Box<dyn AeadCipher + Send + Sync>> {
     match kind {
         CipherKind2022::Aes128Gcm => Ok(Box::new(Aes128Gcm::new(key)?)),
         CipherKind2022::Aes256Gcm => Ok(Box::new(Aes256Gcm::new(key)?)),
-        CipherKind2022::ChaCha20Poly1305 => {
-            Err(SsError::Ss2022UnsupportedMethod(
-                "chacha20-poly1305 UDP uses 24B nonce variant, unsupported".to_string(),
-            ))
-        }
+        CipherKind2022::ChaCha20Poly1305 => Err(SsError::Ss2022UnsupportedMethod(
+            "chacha20-poly1305 UDP uses 24B nonce variant, unsupported".to_string(),
+        )),
     }
 }
 
@@ -101,10 +98,7 @@ pub struct SlidingWindow {
 
 impl Default for SlidingWindow {
     fn default() -> Self {
-        Self {
-            last: 0,
-            ring: [0u64; SW_RING_BLOCKS],
-        }
+        Self { last: 0, ring: [0u64; SW_RING_BLOCKS] }
     }
 }
 
@@ -295,16 +289,11 @@ impl ClientUdpSession2022 {
         if psk_list.is_empty() {
             return Err(SsError::Ss2022MissingKey);
         }
-        let psk_list: Vec<Vec<u8>> = psk_list
-            .into_iter()
-            .map(|p| derive_psk(&p, kind))
-            .collect::<Result<Vec<_>>>()?;
+        let psk_list: Vec<Vec<u8>> =
+            psk_list.into_iter().map(|p| derive_psk(&p, kind)).collect::<Result<Vec<_>>>()?;
         let session_id = rand::random::<u64>();
-        let subkey = derive_session_subkey(
-            &psk_list[psk_list.len() - 1],
-            &session_id.to_be_bytes(),
-            kind,
-        );
+        let subkey =
+            derive_session_subkey(&psk_list[psk_list.len() - 1], &session_id.to_be_bytes(), kind);
         Ok(Self {
             kind,
             cipher: build_aead(kind, &subkey)?,
@@ -335,10 +324,7 @@ impl ClientUdpSession2022 {
     /// - [`SsError::AeadSeal`]：AEAD 加密失败。
     pub fn encode(&self, addr: &Address, port: u16, payload: &[u8]) -> Result<Vec<u8>> {
         // atomic fetch_add 溢出 wrap：u64::MAX + 1 → 0（首包 id=0）
-        let packet_id = self
-            .packet_id
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
+        let packet_id = self.packet_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         let hdr = pk_header(self.session_id, packet_id);
 
         let plain = build_client_plaintext(addr, port, payload);
@@ -365,6 +351,7 @@ impl ClientUdpSession2022 {
         frame.append(&mut out);
         Ok(frame)
     }
+
     /// 解码一个 server → client UDP 帧，返回 (来源地址, 端口, payload)。
     ///
     /// 服务端 remote session 最多保留两代（server 重绑定后旧会话仍可收尾包）。
@@ -411,11 +398,8 @@ impl ClientUdpSession2022 {
             let subkey = derive_session_subkey(last, &hdr[..8], self.kind);
             st.remote_cipher = Some(build_aead(self.kind, &subkey)?);
         }
-        let cipher = if lst {
-            st.last_remote_cipher.as_deref()
-        } else {
-            st.remote_cipher.as_deref()
-        };
+        let cipher =
+            if lst { st.last_remote_cipher.as_deref() } else { st.remote_cipher.as_deref() };
         let Some(cipher) = cipher else {
             return Err(SsError::AeadOpen("remote cipher missing".into()));
         };
@@ -496,13 +480,7 @@ pub fn server_decode_header<'a>(
         psk.as_slice()
     };
 
-    Ok(DecodedClientHeader {
-        session_id,
-        packet_id,
-        hdr,
-        eih_len,
-        aead_psk,
-    })
+    Ok(DecodedClientHeader { session_id, packet_id, hdr, eih_len, aead_psk })
 }
 
 /// SS-2022 UDP server 会话（per client sessionId 的 NAT entry，
@@ -615,19 +593,17 @@ mod tests {
         let psk = psk16();
         let client = ClientUdpSession2022::new(kind, vec![psk.clone()]).unwrap();
 
-        let frame = client
-            .encode(&Address::Domain("example.com".into()), 443, b"hello udp")
-            .unwrap();
+        let frame =
+            client.encode(&Address::Domain("example.com".into()), 443, b"hello udp").unwrap();
         let hdr = server_decode_header(kind, &psk, &[], &frame).unwrap();
         assert_eq!(hdr.session_id, client.session_id());
         assert_eq!(hdr.packet_id, 0); // 首包 id=0
         assert_eq!(hdr.eih_len, 0);
 
-        let session = ServerUdpSession2022::new(kind, hdr.aead_psk.to_vec(), hdr.session_id)
-            .unwrap();
-        let (addr, port, payload) = session
-            .decode_body(&hdr.hdr, hdr.packet_id, &frame[16 + hdr.eih_len..])
-            .unwrap();
+        let session =
+            ServerUdpSession2022::new(kind, hdr.aead_psk.to_vec(), hdr.session_id).unwrap();
+        let (addr, port, payload) =
+            session.decode_body(&hdr.hdr, hdr.packet_id, &frame[16 + hdr.eih_len..]).unwrap();
         assert_eq!(addr, Address::Domain("example.com".into()));
         assert_eq!(port, 443);
         assert_eq!(payload, b"hello udp");
@@ -649,11 +625,10 @@ mod tests {
         assert_eq!(hdr.eih_len, 16);
         assert_eq!(hdr.session_id, client.session_id());
 
-        let session = ServerUdpSession2022::new(kind, hdr.aead_psk.to_vec(), hdr.session_id)
-            .unwrap();
-        let (addr, port, payload) = session
-            .decode_body(&hdr.hdr, hdr.packet_id, &frame[16 + hdr.eih_len..])
-            .unwrap();
+        let session =
+            ServerUdpSession2022::new(kind, hdr.aead_psk.to_vec(), hdr.session_id).unwrap();
+        let (addr, port, payload) =
+            session.decode_body(&hdr.hdr, hdr.packet_id, &frame[16 + hdr.eih_len..]).unwrap();
         assert_eq!(addr, Address::IPv4(std::net::Ipv4Addr::new(192, 168, 1, 1)));
         assert_eq!(port, 53);
         assert_eq!(payload, b"dns-q");
@@ -666,10 +641,12 @@ mod tests {
         let ipsk = psk16();
         let upsk = psk16b();
         let client = ClientUdpSession2022::new(kind, vec![ipsk.clone(), upsk]).unwrap();
-        let frame = client
-            .encode(&Address::IPv4(std::net::Ipv4Addr::new(1, 1, 1, 1)), 80, b"x")
-            .unwrap();
-        let wrong = vec![(psk_identity(&(100..116u8).collect::<Vec<u8>>()), (100..116u8).collect::<Vec<u8>>())];
+        let frame =
+            client.encode(&Address::IPv4(std::net::Ipv4Addr::new(1, 1, 1, 1)), 80, b"x").unwrap();
+        let wrong = vec![(
+            psk_identity(&(100..116u8).collect::<Vec<u8>>()),
+            (100..116u8).collect::<Vec<u8>>(),
+        )];
         let err = server_decode_header(kind, &ipsk, &wrong, &frame).unwrap_err();
         assert!(matches!(err, SsError::Ss2022NoUserMatched));
     }
@@ -682,9 +659,8 @@ mod tests {
         let client = ClientUdpSession2022::new(kind, vec![psk.clone()]).unwrap();
         let server = ServerUdpSession2022::new(kind, psk, client.session_id()).unwrap();
 
-        let frame = server
-            .encode(&Address::IPv6(std::net::Ipv6Addr::LOCALHOST), 853, b"resp")
-            .unwrap();
+        let frame =
+            server.encode(&Address::IPv6(std::net::Ipv6Addr::LOCALHOST), 853, b"resp").unwrap();
         let (addr, port, payload) = client.decode(&frame).unwrap();
         assert!(matches!(addr, Address::IPv6(_)));
         assert_eq!(port, 853);
@@ -698,7 +674,8 @@ mod tests {
         let psk = psk16();
         let client = ClientUdpSession2022::new(kind, vec![psk.clone()]).unwrap();
         let server = ServerUdpSession2022::new(kind, psk, 0xdead).unwrap();
-        let frame = server.encode(&Address::IPv4(std::net::Ipv4Addr::new(8, 8, 8, 8)), 53, b"r").unwrap();
+        let frame =
+            server.encode(&Address::IPv4(std::net::Ipv4Addr::new(8, 8, 8, 8)), 53, b"r").unwrap();
         let err = client.decode(&frame).unwrap_err();
         assert!(matches!(err, SsError::Ss2022BadClientSessionId));
     }
@@ -709,10 +686,11 @@ mod tests {
         let kind = CipherKind2022::Aes128Gcm;
         let psk = psk16();
         let client = ClientUdpSession2022::new(kind, vec![psk.clone()]).unwrap();
-        let frame = client.encode(&Address::IPv4(std::net::Ipv4Addr::new(9, 9, 9, 9)), 80, b"p").unwrap();
+        let frame =
+            client.encode(&Address::IPv4(std::net::Ipv4Addr::new(9, 9, 9, 9)), 80, b"p").unwrap();
         let hdr = server_decode_header(kind, &psk, &[], &frame).unwrap();
-        let session = ServerUdpSession2022::new(kind, hdr.aead_psk.to_vec(), hdr.session_id)
-            .unwrap();
+        let session =
+            ServerUdpSession2022::new(kind, hdr.aead_psk.to_vec(), hdr.session_id).unwrap();
         let body = &frame[16 + hdr.eih_len..];
         assert!(session.decode_body(&hdr.hdr, hdr.packet_id, body).is_ok());
         let err = session.decode_body(&hdr.hdr, hdr.packet_id, body).unwrap_err();
@@ -764,9 +742,8 @@ mod tests {
         let kind = CipherKind2022::Aes128Gcm;
         let psk = psk16();
         let client = ClientUdpSession2022::new(kind, vec![psk.clone()]).unwrap();
-        let mk_server = || {
-            ServerUdpSession2022::new(kind, psk.clone(), client.session_id()).unwrap()
-        };
+        let mk_server =
+            || ServerUdpSession2022::new(kind, psk.clone(), client.session_id()).unwrap();
         let addr = Address::IPv4(std::net::Ipv4Addr::new(1, 2, 3, 4));
         // 首包：建立当前代
         let s1 = mk_server();
@@ -790,7 +767,8 @@ mod tests {
         let psk = psk16();
         let client = ClientUdpSession2022::new(kind, vec![psk.clone()]).unwrap();
         let server = ServerUdpSession2022::new(kind, psk, client.session_id()).unwrap();
-        let mut frame = server.encode(&Address::IPv4(std::net::Ipv4Addr::new(1, 1, 1, 1)), 80, b"zz").unwrap();
+        let mut frame =
+            server.encode(&Address::IPv4(std::net::Ipv4Addr::new(1, 1, 1, 1)), 80, b"zz").unwrap();
         let last = frame.len() - 1;
         frame[last] ^= 0xff;
         assert!(client.decode(&frame).is_err());
@@ -818,11 +796,10 @@ mod tests {
         let payload = vec![7u8; 64];
         let frame = client.encode(&Address::Domain("dns.example".into()), 53, &payload).unwrap();
         let hdr = server_decode_header(kind, &psk, &[], &frame).unwrap();
-        let session = ServerUdpSession2022::new(kind, hdr.aead_psk.to_vec(), hdr.session_id)
-            .unwrap();
-        let (_, port, out) = session
-            .decode_body(&hdr.hdr, hdr.packet_id, &frame[16 + hdr.eih_len..])
-            .unwrap();
+        let session =
+            ServerUdpSession2022::new(kind, hdr.aead_psk.to_vec(), hdr.session_id).unwrap();
+        let (_, port, out) =
+            session.decode_body(&hdr.hdr, hdr.packet_id, &frame[16 + hdr.eih_len..]).unwrap();
         assert_eq!(port, 53);
         assert_eq!(out, payload);
     }
@@ -832,6 +809,7 @@ mod tests {
     #[tokio::test]
     async fn udp_socket_roundtrip_e2e() {
         use std::net::SocketAddr;
+
         use tokio::net::UdpSocket;
 
         let kind = CipherKind2022::Aes256Gcm;
@@ -853,9 +831,8 @@ mod tests {
             let hdr = server_decode_header(kind, &ipsk, &users, &buf[..n]).unwrap();
             let session =
                 ServerUdpSession2022::new(kind, hdr.aead_psk.to_vec(), hdr.session_id).unwrap();
-            let (addr, port, payload) = session
-                .decode_body(&hdr.hdr, hdr.packet_id, &buf[16 + hdr.eih_len..n])
-                .unwrap();
+            let (addr, port, payload) =
+                session.decode_body(&hdr.hdr, hdr.packet_id, &buf[16 + hdr.eih_len..n]).unwrap();
             // echo 回包（来源 = 解出的目标）
             let enc = session.encode(&addr, port, &payload).unwrap();
             server_sock.send_to(&enc, peer).await.unwrap();
@@ -863,19 +840,15 @@ mod tests {
 
         // client 侧：发帧 → 收回包 → decode
         let payload = b"ss2022 udp e2e payload".to_vec();
-        let frame = client
-            .encode(&Address::Domain("echo.local".into()), 5353, &payload)
-            .unwrap();
+        let frame = client.encode(&Address::Domain("echo.local".into()), 5353, &payload).unwrap();
         client_sock.send(&frame).await.unwrap();
 
         let mut rbuf = vec![0u8; 65_535];
-        let n = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            client_sock.recv(&mut rbuf),
-        )
-        .await
-        .expect("recv timeout")
-        .expect("recv");
+        let n =
+            tokio::time::timeout(std::time::Duration::from_secs(5), client_sock.recv(&mut rbuf))
+                .await
+                .expect("recv timeout")
+                .expect("recv");
         let (addr, port, echoed) = client.decode(&rbuf[..n]).unwrap();
         assert_eq!(addr, Address::Domain("echo.local".into()));
         assert_eq!(port, 5353);

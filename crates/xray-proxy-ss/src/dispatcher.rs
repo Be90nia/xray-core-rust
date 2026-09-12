@@ -13,29 +13,32 @@
 //! [`DialBridge`]: xray_app_dispatcher::default::DialBridge
 //! [`DialFn`]: xray_app_dispatcher::default::DialFn
 
-use std::io;
-use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    io,
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
-use tokio::net::{TcpStream, UdpSocket};
-use tokio::task::JoinHandle;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf},
+    net::{TcpStream, UdpSocket},
+    task::JoinHandle,
+};
 use xray_app_dispatcher::default::DialFn;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
+use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
 use xray_transport::connection::Connection;
 use xray_xudp::packet::{PacketError, PacketReader, PacketWriter};
 
-use crate::client::Client;
-use crate::config::MemoryAccount;
-use crate::ss2022::UdpOverTcpConfig;
-use crate::protocol::{decode_udp_packet, encode_udp_packet};
-use crate::stream::SSStream;
-use crate::validator::{MemoryUser, Validator};
+use crate::{
+    client::Client,
+    config::MemoryAccount,
+    protocol::{decode_udp_packet, encode_udp_packet},
+    ss2022::UdpOverTcpConfig,
+    stream::SSStream,
+    validator::{MemoryUser, Validator},
+};
 
 /// SS duplex 缓冲（与 hysteria/tuic 一致：64 KiB）。
 const DUPLEX_BUF_SIZE: usize = 64 * 1024;
@@ -63,10 +66,7 @@ impl SsConnection {
     pub fn new(stream: SSStream<Box<dyn Connection>>) -> Self {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
         let pump = tokio::spawn(pump_ss_stream(stream, server_io));
-        Self {
-            inner: client_io,
-            _pump: pump,
-        }
+        Self { inner: client_io, _pump: pump }
     }
 }
 
@@ -76,10 +76,7 @@ impl SsConnection {
     fn new_udp(sock: UdpSocket, account: MemoryAccount, default_dest: Destination) -> Self {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
         let pump = tokio::spawn(pump_ss_udp(sock, account, server_io, default_dest));
-        Self {
-            inner: client_io,
-            _pump: pump,
-        }
+        Self { inner: client_io, _pump: pump }
     }
 }
 
@@ -89,10 +86,7 @@ impl SsConnection {
     fn new_udp_2022(sock: UdpSocket, params: Ss2022DialParams, default_dest: Destination) -> Self {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
         let pump = tokio::spawn(pump_ss2022_udp(sock, params, server_io, default_dest));
-        Self {
-            inner: client_io,
-            _pump: pump,
-        }
+        Self { inner: client_io, _pump: pump }
     }
 }
 
@@ -128,6 +122,7 @@ impl Connection for SsConnection {
     fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(None)
     }
+
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(None)
     }
@@ -136,8 +131,8 @@ impl Connection for SsConnection {
 /// 双向 pump：在 `SSStream`（加密 chunk 流）与 `DuplexStream`（明文 IO）之间桥接。
 ///
 /// - up：read duplex（8KB）→ `write_chunk` → flush（明文 → 密文 chunk）
-/// - down：底层单次 read（cancel-safe）→ `pending` 缓冲 → `try_open_chunk`
-///   完整解帧（nonce 只在整帧解出时推进，select! 取消不损流状态）
+/// - down：底层单次 read（cancel-safe）→ `pending` 缓冲 → `try_open_chunk` 完整解帧（nonce
+///   只在整帧解出时推进，select! 取消不损流状态）
 ///
 /// `SSStream` 的 `write_chunk`/`read_chunk` 共享单一 nonce 计数器且均需 `&mut self`，
 /// 不可并发持有（也无法像 hysteria 那样 `split` 成独立读写半）。故采用 `select!` 串行
@@ -159,17 +154,17 @@ async fn pump_ss_stream(mut stream: SSStream<Box<dyn Connection>>, server_io: Du
                         return;
                     }
                     let _ = wr.flush().await;
-                }
+                },
                 Ok(crate::stream::ChunkOut::NeedMore) => break,
                 Ok(crate::stream::ChunkOut::End) => {
                     // 0 长度 chunk = 流结束标记
                     let _ = wr.shutdown().await;
                     return;
-                }
+                },
                 Err(e) => {
                     tracing::debug!("ss pump down decode error: {e}");
                     return;
-                }
+                },
             }
         }
         tokio::select! {
@@ -261,7 +256,10 @@ impl SsOutboundConfig {
 
     /// 设置 streamSettings（builder 风格）。
     #[must_use]
-    pub fn with_stream_settings(mut self, settings: Option<xray_transport::dialer::StreamSettings>) -> Self {
+    pub fn with_stream_settings(
+        mut self,
+        settings: Option<xray_transport::dialer::StreamSettings>,
+    ) -> Self {
         self.stream_settings = settings;
         self
     }
@@ -297,16 +295,15 @@ impl SsOutboundConfig {
 
 /// 解析 SS outbound settings JSON → SsOutboundConfig。
 ///
-/// JSON 格式：`{ "servers": [{ "address": "...", "port": 8388, "method": "aes-256-gcm", "password": "..." }] }`
+/// JSON 格式：`{ "servers": [{ "address": "...", "port": 8388, "method": "aes-256-gcm", "password":
+/// "..." }] }`
 pub fn parse_ss_config(data: &[u8]) -> Result<SsOutboundConfig, String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
     let servers = v
         .get("servers")
         .and_then(|v| v.as_array())
         .ok_or_else(|| "missing servers array".to_string())?;
-    let first = servers
-        .first()
-        .ok_or_else(|| "servers array is empty".to_string())?;
+    let first = servers.first().ok_or_else(|| "servers array is empty".to_string())?;
     let address = first
         .get("address")
         .and_then(|v| v.as_str())
@@ -332,10 +329,7 @@ pub fn parse_ss_config(data: &[u8]) -> Result<SsOutboundConfig, String> {
         // uot/uotVersion → UdpOverTcpConfig（Go shadowsocks.go:243-244，零值 false/0）。
         let uot_cfg = UdpOverTcpConfig {
             enabled: first.get("uot").and_then(|v| v.as_bool()).unwrap_or(false),
-            version: first
-                .get("uotVersion")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0) as u32,
+            version: first.get("uotVersion").and_then(|v| v.as_i64()).unwrap_or(0) as u32,
         };
         let (psk_b64, identity_psk_b64) = match password.split(':').collect::<Vec<_>>()[..] {
             [u] => (u.to_string(), None),
@@ -344,25 +338,22 @@ pub fn parse_ss_config(data: &[u8]) -> Result<SsOutboundConfig, String> {
         };
         // account 占位：2022 拨号路径读 ss2022 参数，不读 account；cipher 字段用
         // 任意 AEAD（None 已被 Go 上游 v26.7.28 删除）。
-        let placeholder = MemoryAccount::from_proto(&xray_proto::xray::proxy::shadowsocks::Account {
-            password: psk_b64.clone(),
-            cipher_type: crate::config::CipherType::Aes128Gcm.as_i32(),
-            iv_check: false,
-        })
-        .map_err(|e| format!("ss2022 account placeholder: {e}"))?;
-        return Ok(SsOutboundConfig::new(
-            placeholder,
-            Address::Domain(address.to_string()),
-            port,
-        )
-        .with_level(level)
-        .with_email(email)
-        .with_udp_over_tcp(uot_cfg)
-        .with_ss2022(Ss2022DialParams {
-            method: method.to_string(),
-            psk_b64,
-            identity_psk_b64,
-        }));
+        let placeholder =
+            MemoryAccount::from_proto(&xray_proto::xray::proxy::shadowsocks::Account {
+                password: psk_b64.clone(),
+                cipher_type: crate::config::CipherType::Aes128Gcm.as_i32(),
+                iv_check: false,
+            })
+            .map_err(|e| format!("ss2022 account placeholder: {e}"))?;
+        return Ok(SsOutboundConfig::new(placeholder, Address::Domain(address.to_string()), port)
+            .with_level(level)
+            .with_email(email)
+            .with_udp_over_tcp(uot_cfg)
+            .with_ss2022(Ss2022DialParams {
+                method: method.to_string(),
+                psk_b64,
+                identity_psk_b64,
+            }));
     }
     let cipher_type = crate::config::CipherType::from_name(method)
         .ok_or_else(|| format!("unsupported cipher: {method}"))?;
@@ -372,8 +363,8 @@ pub fn parse_ss_config(data: &[u8]) -> Result<SsOutboundConfig, String> {
         cipher_type: cipher_type.as_i32(),
         iv_check: false,
     };
-    let account = MemoryAccount::from_proto(&proto_account)
-        .map_err(|e| format!("ss account: {e}"))?;
+    let account =
+        MemoryAccount::from_proto(&proto_account).map_err(|e| format!("ss account: {e}"))?;
     // 可选字段：level / email（对应 Go infra/conf outbound server）。
     let level = first.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let email = first.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -436,7 +427,7 @@ pub fn make_ss_dial_fn(config: Arc<SsOutboundConfig>) -> DialFn {
                                 .map_err(|e| format!("ss dial server (tcp): {e}"))?;
                             tcp.set_nodelay(true).ok();
                             Box::new(xray_transport::connection::TcpConnection::new(tcp))
-                        }
+                        },
                     };
 
                     // 2. 在该连接上跑 SS 协议握手 + 拨 target
@@ -464,7 +455,6 @@ pub fn make_ss_dial_fn(config: Arc<SsOutboundConfig>) -> DialFn {
                             .map_err(|e| format!("ss2022 dial: {e}"))?;
                         stream
                     } else {
-
                         let client = Client::new(config.account.clone(), host, config.server_port);
                         client
                             .dial_target_for_proxy_on(conn, &target_addr, target_port)
@@ -472,7 +462,7 @@ pub fn make_ss_dial_fn(config: Arc<SsOutboundConfig>) -> DialFn {
                             .map_err(|e| format!("ss dial: {e}"))?
                     };
                     Ok(Box::new(SsConnection::new(stream)) as Box<dyn Connection>)
-                }
+                },
                 // UDP：dial SS 服务器的 UDP 端口（Go internet dialer 的 network
                 // 跟随 dest）。legacy：每数据报独立 [salt][AEAD(addr+port+payload)]；
                 // 2022：per-connection 会话帧（sessionId/packetId + EIH），均非
@@ -482,19 +472,13 @@ pub fn make_ss_dial_fn(config: Arc<SsOutboundConfig>) -> DialFn {
                         .await
                         .map_err(|e| format!("ss udp dial: {e}"))?;
                     let local = if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
-                    let sock = UdpSocket::bind(local)
-                        .await
-                        .map_err(|e| format!("ss udp bind: {e}"))?;
-                    sock.connect(server)
-                        .await
-                        .map_err(|e| format!("ss udp connect: {e}"))?;
+                    let sock =
+                        UdpSocket::bind(local).await.map_err(|e| format!("ss udp bind: {e}"))?;
+                    sock.connect(server).await.map_err(|e| format!("ss udp connect: {e}"))?;
                     let default_dest = Destination::udp(target_addr, Port::new(target_port));
                     if let Some(p) = &config.ss2022 {
-                        Ok(Box::new(SsConnection::new_udp_2022(
-                            sock,
-                            p.clone(),
-                            default_dest,
-                        )) as Box<dyn Connection>)
+                        Ok(Box::new(SsConnection::new_udp_2022(sock, p.clone(), default_dest))
+                            as Box<dyn Connection>)
                     } else {
                         Ok(Box::new(SsConnection::new_udp(
                             sock,
@@ -502,7 +486,7 @@ pub fn make_ss_dial_fn(config: Arc<SsOutboundConfig>) -> DialFn {
                             default_dest,
                         )) as Box<dyn Connection>)
                     }
-                }
+                },
                 Network::Unix => Err("ss outbound does not support unix network".to_string()),
             }
         })
@@ -526,11 +510,10 @@ async fn resolve_server(addr: &Address, port: u16) -> io::Result<SocketAddr> {
 /// 对应 Go `shadowsocks` outbound UDP 分支（与 hysteria `pump_hysteria_udp` /
 /// freedom `pump_request`/`pump_response` 同构）：
 ///
-/// - up：XUDP 帧 → [`encode_udp_packet`]（每数据报独立 salt + AEAD
-///   addr+port+payload）→ `sock.send`（已 connect SS 服务器）。帧内
-///   per-packet target 缺省用 `default_dest`。
-/// - down：`sock.recv` → [`decode_udp_packet`]（单用户 validator）→ 解出
-///   (来源, payload) → XUDP 帧写回 duplex。
+/// - up：XUDP 帧 → [`encode_udp_packet`]（每数据报独立 salt + AEAD addr+port+payload）→
+///   `sock.send`（已 connect SS 服务器）。帧内 per-packet target 缺省用 `default_dest`。
+/// - down：`sock.recv` → [`decode_udp_packet`]（单用户 validator）→ 解出 (来源, payload) → XUDP
+///   帧写回 duplex。
 async fn pump_ss_udp(
     sock: UdpSocket,
     account: MemoryAccount,
@@ -557,7 +540,7 @@ async fn pump_ss_udp(
                     Err(e) => {
                         tracing::debug!("ss udp up forward error: {e}");
                         return;
-                    }
+                    },
                 }
             }
             match rd.read(&mut buf).await {
@@ -566,7 +549,7 @@ async fn pump_ss_udp(
                 Err(e) => {
                     tracing::debug!("ss udp up read error: {e}");
                     return;
-                }
+                },
             }
         }
     };
@@ -581,7 +564,7 @@ async fn pump_ss_udp(
                 Err(e) => {
                     tracing::debug!("ss udp down recv error: {e}");
                     break;
-                }
+                },
             };
             // 解码失败跳过（Go DecodeUDPPacket 失败丢弃该包）
             let Ok((header, payload)) = decode_udp_packet(&validator, &rbuf[..n]) else {
@@ -613,18 +596,19 @@ async fn pump_ss_udp(
 /// 对应 Go `shadowsocks_2022` outbound 的 `DialPacketConn` + `CopyPacketConn`
 /// （非 UoT 时 connection 是 connected UDP socket，per-packet 会话帧）：
 ///
-/// - up：XUDP 帧 → [`ClientUdpSession2022::encode`]（单会话 sessionId +
-///   递增 packetId + EIH + session subkey AEAD）→ `sock.send`。
-/// - down：`sock.recv` → [`ClientUdpSession2022::decode`] → (来源, payload)
-///   → XUDP 帧写回 duplex。
+/// - up：XUDP 帧 → [`ClientUdpSession2022::encode`]（单会话 sessionId + 递增 packetId + EIH +
+///   session subkey AEAD）→ `sock.send`。
+/// - down：`sock.recv` → [`ClientUdpSession2022::decode`] → (来源, payload) → XUDP 帧写回 duplex。
 async fn pump_ss2022_udp(
     sock: UdpSocket,
     params: Ss2022DialParams,
     server_io: DuplexStream,
     default_dest: Destination,
 ) {
-    use crate::ss2022::key::{psk_from_base64, CipherKind2022};
-    use crate::ss2022::packet::ClientUdpSession2022;
+    use crate::ss2022::{
+        key::{CipherKind2022, psk_from_base64},
+        packet::ClientUdpSession2022,
+    };
 
     let kind = CipherKind2022::from_name(&params.method);
     let session = match kind.map_err(|e| e.to_string()).and_then(|kind| {
@@ -639,7 +623,7 @@ async fn pump_ss2022_udp(
         Err(e) => {
             tracing::debug!("ss2022 udp session init: {e}");
             return;
-        }
+        },
     };
 
     let sock = Arc::new(sock);
@@ -659,7 +643,7 @@ async fn pump_ss2022_udp(
                     Err(e) => {
                         tracing::debug!("ss2022 udp up forward error: {e}");
                         return;
-                    }
+                    },
                 }
             }
             match rd.read(&mut buf).await {
@@ -668,7 +652,7 @@ async fn pump_ss2022_udp(
                 Err(e) => {
                     tracing::debug!("ss2022 udp up read error: {e}");
                     return;
-                }
+                },
             }
         }
     };
@@ -683,7 +667,7 @@ async fn pump_ss2022_udp(
                 Err(e) => {
                     tracing::debug!("ss2022 udp down recv error: {e}");
                     break;
-                }
+                },
             };
             // 解码失败跳过（Go ReadPacket 失败丢弃该包）
             let Ok((addr, port, payload)) = session.decode(&rbuf[..n]) else {
@@ -738,7 +722,7 @@ async fn parse_and_send_2022(
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
             sock.send(&enc).await?;
             Ok(true)
-        }
+        },
         Ok(None) => Ok(false), // 帧不完整，等更多数据
         Err(PacketError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
         Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
@@ -773,7 +757,7 @@ async fn parse_and_send(
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
             sock.send(&enc).await?;
             Ok(true)
-        }
+        },
         Ok(None) => Ok(false), // 帧不完整，等更多数据
         Err(PacketError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
         Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
@@ -782,9 +766,10 @@ async fn parse_and_send(
 
 #[cfg(test)]
 mod tests {
+    use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
+
     use super::*;
     use crate::config::CipherType;
-    use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
 
     fn make_account() -> MemoryAccount {
         let p = ProtoAccount {
@@ -797,11 +782,7 @@ mod tests {
 
     #[test]
     fn config_construction() {
-        let cfg = SsOutboundConfig::new(
-            make_account(),
-            Address::new_domain("example.com"),
-            8388,
-        );
+        let cfg = SsOutboundConfig::new(make_account(), Address::new_domain("example.com"), 8388);
         assert_eq!(cfg.server_port, 8388);
     }
 
@@ -907,11 +888,15 @@ mod tests {
     /// inbound 的 `read_chunk` 会 AEAD open 失败而 panic。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ss_connection_pump_roundtrips_through_inbound_echo() {
-        use crate::inbound::SsInbound;
         use std::net::{IpAddr, SocketAddr};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::{TcpListener, TcpStream};
+
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::{TcpListener, TcpStream},
+        };
         use xray_common::net::address::Address;
+
+        use crate::inbound::SsInbound;
 
         // 1. echo server
         let echo_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
@@ -956,7 +941,8 @@ mod tests {
             .expect("connect inbound");
         let stream = client
             .dial_target_for_proxy_on(
-                Box::new(xray_transport::connection::TcpConnection::new(tcp)) as Box<dyn Connection>,
+                Box::new(xray_transport::connection::TcpConnection::new(tcp))
+                    as Box<dyn Connection>,
                 &Address::IPv4(echo_v4),
                 echo_addr.port(),
             )
@@ -984,6 +970,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ss_udp_dial_fn_roundtrips_through_udp_echo() {
         use std::time::Duration;
+
         use xray_app_dispatcher::UdpDispatchSession;
 
         // 1. fake SS UDP 服务器：decode（匹配用户）→ echo → encode 回来源
@@ -991,21 +978,16 @@ mod tests {
         let server_addr = server.local_addr().unwrap();
         let srv_account = make_account();
         let validator = Validator::new();
-        validator
-            .add(MemoryUser::new("srv", srv_account.clone()))
-            .expect("add user");
+        validator.add(MemoryUser::new("srv", srv_account.clone())).expect("add user");
         tokio::spawn(async move {
             let mut b = [0u8; 65_535];
             while let Ok((n, from)) = server.recv_from(&mut b).await {
                 let Ok((header, payload)) = decode_udp_packet(&validator, &b[..n]) else {
                     continue;
                 };
-                let Ok(enc) = encode_udp_packet(
-                    &srv_account,
-                    &header.address,
-                    header.port,
-                    &payload,
-                ) else {
+                let Ok(enc) =
+                    encode_udp_packet(&srv_account, &header.address, header.port, &payload)
+                else {
                     continue;
                 };
                 let _ = server.send_to(&enc, from).await;
@@ -1018,19 +1000,15 @@ mod tests {
             Address::IPv4(std::net::Ipv4Addr::LOCALHOST),
             server_addr.port(),
         ));
-        let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> = Arc::new(
-            xray_app_dispatcher::default::DialBridge::new(
+        let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
+            Arc::new(xray_app_dispatcher::default::DialBridge::new(
                 "ss-udp-out",
                 make_ss_dial_fn(Arc::clone(&cfg)),
-            ),
-        );
+            ));
         let mut session = UdpDispatchSession::new(handler);
 
         // 3. 经 dispatch 会话发 UDP 包，收回包（来源 = 请求目标）
-        let dest = Destination::udp(
-            Address::IPv4(std::net::Ipv4Addr::LOCALHOST),
-            Port::new(9),
-        );
+        let dest = Destination::udp(Address::IPv4(std::net::Ipv4Addr::LOCALHOST), Port::new(9));
         let payload = b"ss-udp-outbound-e2e";
         session.send_packet(&dest, payload).await.expect("send");
 

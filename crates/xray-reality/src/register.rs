@@ -163,7 +163,8 @@ fn parse_reality_config(json: Option<&serde_json::Value>) -> io::Result<RealityC
     // 257w：spiderX → SpiderY 行为参数（Go transport_security.go:214-242）。
     // 默认 "/"；必须以 '/' 开头；query 参数 p/c/t/i/r（单值或 a-b 区间）写入
     // spider_y[10] 对应槽位（解析失败取 0 对齐 Go `_, _ :=`），消费后从 query 剔除。
-    let spider_x_raw = obj.get("spiderX").and_then(|v| v.as_str()).unwrap_or("/");
+    // Go transport_security.go:214-242：空串同缺失归一 "/"（uriclient.py 产物 spiderX=""）。
+    let spider_x_raw = obj.get("spiderX").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("/");
     if !spider_x_raw.starts_with('/') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

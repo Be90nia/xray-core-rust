@@ -10,9 +10,7 @@ use std::io;
 use tokio::net::TcpStream;
 use xray_common::net::address::Address;
 
-use crate::client::Client;
-use crate::config::MemoryAccount;
-use crate::stream::SSStream;
+use crate::{client::Client, config::MemoryAccount, stream::SSStream};
 
 /// SS 出站适配器：持有 [`Client`]（负责 TCP 拨号 + SS 加密），
 /// [`process`](Self::process) 把目标地址包装为 SS 加密流。
@@ -32,9 +30,7 @@ impl SsOutbound {
     /// * `server_port` - SS 服务端端口
     #[must_use]
     pub fn new(account: MemoryAccount, server_host: String, server_port: u16) -> Self {
-        Self {
-            client: Client::new(account, server_host, server_port),
-        }
+        Self { client: Client::new(account, server_host, server_port) }
     }
 
     /// 从已构造的 [`Client`] 创建适配器（复用 dialer 配置 / 测试场景）。
@@ -51,15 +47,8 @@ impl SsOutbound {
     /// # Errors
     /// 返回 [`io::Error`]（`ErrorKind::Other`）当 TCP 连接失败、
     /// AEAD 初始化失败或写首帧失败。错误信息携带原始 [`crate::error::SsError`] 描述。
-    pub async fn process(
-        &self,
-        addr: &Address,
-        port: u16,
-    ) -> io::Result<SSStream<TcpStream>> {
-        self.client
-            .dial_target(addr, port)
-            .await
-            .map_err(|e| io::Error::other(e.to_string()))
+    pub async fn process(&self, addr: &Address, port: u16) -> io::Result<SSStream<TcpStream>> {
+        self.client.dial_target(addr, port).await.map_err(|e| io::Error::other(e.to_string()))
     }
 
     /// 返回内部 [`Client`] 引用（供 dispatcher 复用账户配置 / 测试断言）。
@@ -71,17 +60,16 @@ impl SsOutbound {
 
 impl std::fmt::Debug for SsOutbound {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SsOutbound")
-            .field("client", &self.client)
-            .finish()
+        f.debug_struct("SsOutbound").field("client", &self.client).finish()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
+
     use super::*;
     use crate::config::CipherType;
-    use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
 
     /// 构造 AES-128-GCM 测试账户。
     fn make_account() -> MemoryAccount {
@@ -129,22 +117,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn outbound_process_to_dead_port_returns_io_error() {
         // 绑定并立即 drop，确保端口已释放（多数 OS 会拒绝连接）
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind temp listener");
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind temp listener");
         let dead_port = listener.local_addr().unwrap().port();
         drop(listener);
 
         let ob = SsOutbound::new(make_account(), "127.0.0.1".to_string(), dead_port);
-        let result = ob
-            .process(&Address::IPv4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 1)
-            .await;
-        assert!(
-            result.is_err(),
-            "process to dead SS server port should return io::Error"
-        );
+        let result = ob.process(&Address::IPv4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 1).await;
+        assert!(result.is_err(), "process to dead SS server port should return io::Error");
         // 不用 unwrap_err()：Ok 类型 SSStream 未实现 Debug
-        let err = match result { Err(e) => e, Ok(_) => unreachable!("expected error") };
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => unreachable!("expected error"),
+        };
         assert_eq!(err.kind(), io::ErrorKind::Other, "SS error wrapped as Other");
     }
 }

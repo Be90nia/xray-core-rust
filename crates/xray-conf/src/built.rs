@@ -119,6 +119,17 @@ impl Config {
     ///   PrintRemovedFeatureError）或顶层 `reverse` 字段（`xray.go:569-571`）。
     /// - [`ConfError::Build`]：JSON 字段序列化失败（极少见，因字段已成功解析）。
     pub fn build(&self) -> Result<BuiltConfig> {
+        // bd 5x41/1c4z：三级严格度硬错的执行点。Go 在 decode 后、Build 前跑
+        // `PostProcessConfigureFile`（allowInsecure / 已移除 transport / hysteria
+        // version 等硬错都在该链触发）。Rust 的 lint 注册表此前仅测试调用
+        // （生产死代码），而 build() 是所有配置的唯一生产 funnel（xray-cli
+        // run.rs `load_first_config` → `Config::build`），故在此自举内置阶段
+        // （register_stage 同名覆盖，幂等）并执行。阶段回调需要 `&mut Config`
+        // （FakeDNS 默认池填充），而 build(&self) 不可变：在克隆体上校验，
+        // 填充不回写——除新增硬错外，生产行为与既有完全一致。
+        crate::init::register_builtin_stages();
+        crate::lint::post_process(&mut self.clone())?;
+
         // Go xray.go:532-536：Build 第一步注入 env，先于后续 env:VAR 值展开。
         // SAFETY: build_config 在进程启动早期、工作线程/异步 runtime 创建之前
         // 单次调用，与 Go os.Setenv（xray.go:534）语义对齐；无并发 env 访问窗口。
@@ -546,7 +557,7 @@ mod tests {
     fn build_fakedns_and_burst_observatory_camel_case() {
         let json = r#"{
             "fakeDns": { "pools": [] },
-            "burstObservatory": { "subjectSelector": ["p1"] }
+            "burstObservatory": { "subjectSelector": ["p1"], "pingConfig": { "destination": "https://x" } }
         }"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
         let built = cfg.build().unwrap();

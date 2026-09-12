@@ -9,28 +9,30 @@
 //! 协议常量与 Go 端一致。
 
 pub mod client;
+pub mod config;
+pub mod dispatcher;
+pub mod error;
 pub mod inbound;
 pub mod outbound;
-pub mod config;
-pub mod error;
 pub mod protocol;
 pub mod server;
+pub mod ss2022;
 pub mod stream;
 pub mod validator;
-pub mod dispatcher;
-pub mod ss2022;
 
 pub use config::{AeadCipher, Cipher, CipherType, InnerAead, MemoryAccount};
+pub use dispatcher::{
+    Ss2022DialParams, SsConnection, SsOutboundConfig, make_ss_dial_fn, parse_ss_config,
+};
 pub use error::{Result, SsError};
-pub use validator::Validator;
 pub use inbound::SsInbound;
 pub use outbound::SsOutbound;
-pub use dispatcher::{make_ss_dial_fn, parse_ss_config, Ss2022DialParams, SsConnection, SsOutboundConfig};
 pub use ss2022::{
-    Client2022, CipherKind2022, InboundResult, MultiUserInbound, RelayDestination,
-    RelayInbound, Ss2022Inbound, Ss2022Outbound, Ss2022OutboundConfig, Ss2022User,
-    UdpOverTcpConfig, derive_session_subkey, psk_from_base64,
+    CipherKind2022, Client2022, InboundResult, MultiUserInbound, RelayDestination, RelayInbound,
+    Ss2022Inbound, Ss2022Outbound, Ss2022OutboundConfig, Ss2022User, UdpOverTcpConfig,
+    derive_session_subkey, psk_from_base64,
 };
+pub use validator::Validator;
 
 /// Shadowsocks 协议版本，对应 Go `protocol.Version`。
 pub const VERSION: u8 = 1;

@@ -5,20 +5,21 @@
 //!
 //! # 当前实现范围
 //!
-//! 完整翻译 Go 版本的响应配置（`ResponseConfig`、`NoneResponse`、`HTTPResponse`）
-//! 与 `Handler::new`。`Handler::process` 接受任意 [`xray_buf::io::Writer`]，写出预设响应。
+//! 完整翻译 Go 版本的响应配置（`ResponseConfig`：none / http / custom 自定义数据，
+//! 对应 Go 01a034be）与 `Handler::new`。`Handler::process` 接受任意
+//! [`xray_buf::io::Writer`]，写出预设响应。
 //!
 //! Go 版本 `Process` 还涉及 `transport.Link`/`internet.Dialer`/`session`/`signal` 的交互，
 //! 这些类型在 Rust 端尚未实现（dev-plan "动态分层" 原则）。等 `xray-transport` 提供
 //! 等价的 `Link` 与 `Dialer` 后，可在 `Handler` 之上加一层 adapter 对接 `OutboundHandler` trait.
 
-pub mod response;
-pub mod handler;
 pub mod dispatcher;
+pub mod handler;
 pub mod inbound;
+pub mod response;
 
+pub use dispatcher::{BlackholeHandler, make_blackhole_handler};
 pub use handler::{BlackholeError, Handler};
-pub use response::{get_internal_response, ResponseConfig};
-pub use dispatcher::{make_blackhole_handler, BlackholeHandler};
 pub use inbound::BlackholeInboundHandler;
-pub use xray_proto::xray::proxy::blackhole::Config;
+pub use response::{ResponseConfig, get_internal_response, proto_response};
+pub use xray_proto::xray::proxy::blackhole::{Config, Response};

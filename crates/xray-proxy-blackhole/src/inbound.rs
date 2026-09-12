@@ -32,7 +32,11 @@ pub struct BlackholeInboundHandler {
 
 impl BlackholeInboundHandler {
     /// 构造 Blackhole 入站处理器。
-    pub fn new(tag: impl Into<String>, response: ResponseConfig, listen_addr: impl Into<String>) -> Self {
+    pub fn new(
+        tag: impl Into<String>,
+        response: ResponseConfig,
+        listen_addr: impl Into<String>,
+    ) -> Self {
         Self {
             tag: tag.into(),
             response,
@@ -56,11 +60,9 @@ impl InboundHandler for BlackholeInboundHandler {
         let listener = TcpListener::bind(&self.listen_addr)
             .await
             .map_err(|e| InboundError::ListenError(e.to_string()))?;
-        let port = listener.local_addr()
-            .map(|a| a.port())
-            .unwrap_or(0);
+        let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
         self.cached_port.store(port, Ordering::SeqCst);
-        let response = self.response;
+        let response = self.response.clone();
         let tag = self.tag.clone();
         // spawn accept 循环
         tokio::spawn(async move {
@@ -70,23 +72,38 @@ impl InboundHandler for BlackholeInboundHandler {
                     Err(e) => {
                         tracing::warn!(tag = %tag, error = %e, "blackhole inbound accept failed");
                         continue;
-                    }
+                    },
                 };
+                let response = response.clone();
                 tokio::spawn(async move {
-                    match response {
+                    match &response {
                         ResponseConfig::None => {
                             // 静默关闭：直接 drop 连接
                             drop(stream);
-                        }
+                        },
                         ResponseConfig::Http403 => {
                             // 写 HTTP 403 后关闭
                             use tokio::io::AsyncWriteExt;
                             let mut stream = stream;
-                            if let Err(e) = stream.write_all(crate::response::HTTP_403_RESPONSE.as_bytes()).await {
+                            if let Err(e) = stream
+                                .write_all(crate::response::HTTP_403_RESPONSE.as_bytes())
+                                .await
+                            {
                                 tracing::debug!(error = %e, "blackhole inbound write 403 failed");
                             }
                             let _ = stream.shutdown().await;
-                        }
+                        },
+                        ResponseConfig::Custom(data) => {
+                            // Go 01a034be：custom 原样回写后关闭
+                            use tokio::io::AsyncWriteExt;
+                            let mut stream = stream;
+                            if !data.is_empty() {
+                                if let Err(e) = stream.write_all(&data).await {
+                                    tracing::debug!(error = %e, "blackhole inbound write custom failed");
+                                }
+                            }
+                            let _ = stream.shutdown().await;
+                        },
                     }
                 });
             }
@@ -113,9 +130,9 @@ impl InboundHandler for BlackholeInboundHandler {
 
 #[cfg(test)]
 mod tests {
+    use tokio::{io::AsyncReadExt, net::TcpStream};
+
     use super::*;
-    use tokio::io::AsyncReadExt;
-    use tokio::net::TcpStream;
 
     #[tokio::test]
     async fn blackhole_inbound_none_response_drops_immediately() {
@@ -127,10 +144,10 @@ mod tests {
         let mut conn = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
         // 连接应被立即关闭（读返回 0）
         let mut buf = [0u8; 64];
-        let n = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            conn.read(&mut buf),
-        ).await.unwrap().unwrap();
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), conn.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(n, 0, "blackhole none response should close immediately");
 
         handler.close().await.unwrap();
@@ -138,16 +155,17 @@ mod tests {
 
     #[tokio::test]
     async fn blackhole_inbound_http403_writes_response() {
-        let handler = BlackholeInboundHandler::new("bh-http", ResponseConfig::Http403, "127.0.0.1:0");
+        let handler =
+            BlackholeInboundHandler::new("bh-http", ResponseConfig::Http403, "127.0.0.1:0");
         handler.start().await.unwrap();
         let port = handler.port();
 
         let mut conn = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
         let mut buf = vec![0u8; 1024];
-        let n = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            conn.read(&mut buf),
-        ).await.unwrap().unwrap();
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), conn.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
         assert!(n > 0, "should receive HTTP 403 response");
         let resp = String::from_utf8_lossy(&buf[..n]);
         assert!(resp.starts_with("HTTP/1.1 403"), "response should be HTTP 403");

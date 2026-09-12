@@ -9,11 +9,13 @@ use std::io;
 
 use tokio::net::TcpStream;
 
-use crate::config::MemoryAccount;
-use crate::protocol::RequestHeader;
-use crate::server::{read_request, Server};
-use crate::stream::SSStream;
-use crate::validator::{MemoryUser, Validator};
+use crate::{
+    config::MemoryAccount,
+    protocol::RequestHeader,
+    server::{Server, read_request},
+    stream::SSStream,
+    validator::{MemoryUser, Validator},
+};
 
 /// SS 入站适配器：持有 [`Server`]（负责 SS 协议解析 + 用户验证），
 /// [`handle_conn`](Self::handle_conn) 解析入站连接并返回目标头 + 加密流。
@@ -42,9 +44,7 @@ impl SsInbound {
     #[must_use]
     pub fn with_users(users: Vec<MemoryUser>) -> Self {
         assert!(!users.is_empty(), "SS inbound 至少需要一个用户");
-        Self {
-            server: Server::with_users(users),
-        }
+        Self { server: Server::with_users(users) }
     }
 
     /// 从已构造的 [`Server`] 创建适配器（复用 processor 配置）。
@@ -69,10 +69,7 @@ impl SsInbound {
     /// 返回 [`io::Error`]（`ErrorKind::Other`）当：
     /// - validator 无用户配置
     /// - SS 协议解析失败（IV/首帧读取、AEAD 初始化、地址解析）
-    pub async fn handle_conn<C>(
-        &self,
-        conn: C,
-    ) -> io::Result<(RequestHeader, SSStream<C>)>
+    pub async fn handle_conn<C>(&self, conn: C) -> io::Result<(RequestHeader, SSStream<C>)>
     where
         C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     {
@@ -100,19 +97,17 @@ impl SsInbound {
 
 impl std::fmt::Debug for SsInbound {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SsInbound")
-            .field("users_count", &self.server.users_count())
-            .finish()
+        f.debug_struct("SsInbound").field("users_count", &self.server.users_count()).finish()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use tokio::{io::AsyncWriteExt, net::TcpListener};
+    use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
+
     use super::*;
     use crate::config::CipherType;
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
-    use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
 
     /// 构造 AES-128-GCM 测试账户。
     fn make_account() -> MemoryAccount {
@@ -152,10 +147,7 @@ mod tests {
         let ib = SsInbound::new(make_account(), "u@ss.local");
         let s = format!("{ib:?}");
         assert!(s.contains("SsInbound"), "debug should include struct name");
-        assert!(
-            s.contains("users_count: 1"),
-            "debug should expose user count"
-        );
+        assert!(s.contains("users_count: 1"), "debug should expose user count");
     }
 
     /// 客户端发送垃圾数据：`read_request` 应在 IV 读取或 AEAD 解密阶段失败。
@@ -163,9 +155,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn inbound_handle_conn_rejects_garbage() {
         let ib = SsInbound::new(make_account(), "u@ss.local");
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test listener");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test listener");
         let listener_addr = listener.local_addr().unwrap();
 
         let ib_arc = std::sync::Arc::new(ib);
@@ -182,12 +172,12 @@ mod tests {
         drop(bad);
 
         let result = server_handle.await.expect("server task join");
-        assert!(
-            result.is_err(),
-            "garbage input should fail SS handshake with io::Error"
-        );
+        assert!(result.is_err(), "garbage input should fail SS handshake with io::Error");
         // 不用 unwrap_err()：Ok 类型 (RequestHeader, SSStream) 中 SSStream 未实现 Debug
-        let err = match result { Err(e) => e, Ok(_) => unreachable!("expected error") };
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => unreachable!("expected error"),
+        };
         assert_eq!(err.kind(), io::ErrorKind::Other, "SS error wrapped as Other");
     }
 }

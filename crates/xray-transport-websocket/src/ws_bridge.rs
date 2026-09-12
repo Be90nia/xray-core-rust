@@ -19,20 +19,22 @@
 //! 切片2 不做消息大小限制（依赖 tungstenite `max_message_size`）；调用方应通过
 //! `WebSocketConfig::max_message_size` 配置上限，避免恶意大帧 OOM。
 
-use std::collections::VecDeque;
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    collections::VecDeque,
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
-use tokio::sync::Mutex;
 use futures_util::{SinkExt, StreamExt};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::task::JoinHandle;
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::Message;
-
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    sync::Mutex,
+    task::JoinHandle,
+};
+use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 use xray_transport::connection::Connection;
 
 /// 桥接 WebSocket 帧流为字节流。
@@ -61,10 +63,8 @@ pub struct WsConnection<S> {
 //   SplitSink<WebSocketStream<S>, Message> -- Sink<Message>
 // 使用 `futures_util::stream::SplitStream` / `sink::SplitSink` 类型。
 // 为保持本 crate 不暴露内部类型，用泛型参数让 WsConnection 兼容任何 split 后的形态。
-pub(crate) type SplitStreamOwned<S> =
-    futures_util::stream::SplitStream<WebSocketStream<S>>;
-pub(crate) type SplitSinkOwned<S> =
-    futures_util::stream::SplitSink<WebSocketStream<S>, Message>;
+pub(crate) type SplitStreamOwned<S> = futures_util::stream::SplitStream<WebSocketStream<S>>;
+pub(crate) type SplitSinkOwned<S> = futures_util::stream::SplitSink<WebSocketStream<S>, Message>;
 
 impl<S> WsConnection<S> {
     /// 用 split 后的两半 + 地址构造。
@@ -141,33 +141,33 @@ where
                             self.read_buf.extend(&data[n..]);
                         }
                         return Poll::Ready(Ok(()));
-                    }
+                    },
                     Ok(Message::Ping(_) | Message::Pong(_)) => {
                         // tungstenite 自动回 Pong；控制帧对字节流透明。
                         continue;
-                    }
+                    },
                     Ok(Message::Close(_)) => {
                         // 对端关闭：返回 EOF（Ok + 0 bytes）。
                         return Poll::Ready(Ok(()));
-                    }
+                    },
                     Ok(Message::Text(_)) => {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "websocket text frame not supported (binary only)",
                         )));
-                    }
+                    },
                     Ok(Message::Frame(_)) => {
                         // 不该出现：tungstenite 已解码为高层 Message。
                         continue;
-                    }
+                    },
                     Err(e) => {
                         return Poll::Ready(Err(io::Error::other(e)));
-                    }
+                    },
                 },
                 Poll::Ready(None) => {
                     // 流结束 = EOF
                     return Poll::Ready(Ok(()));
-                }
+                },
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -191,11 +191,12 @@ where
             Err(_) => {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
-            }
+            },
         };
-        // 2. poll_ready → start_send → poll_flush（SinkExt _unpin 方法通过 DerefMut 调用到 SplitKit）。
+        // 2. poll_ready → start_send → poll_flush（SinkExt _unpin 方法通过 DerefMut 调用到
+        //    SplitKit）。
         match guard.poll_ready_unpin(cx) {
-            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Ok(())) => {},
             Poll::Ready(Err(e)) => return Poll::Ready(Err(io::Error::other(e))),
             Poll::Pending => return Poll::Pending,
         }
@@ -226,7 +227,7 @@ where
             Err(_) => {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
-            }
+            },
         };
         guard.poll_flush_unpin(cx).map_err(io::Error::other)
     }
@@ -238,7 +239,7 @@ where
             Err(_) => {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
-            }
+            },
         };
         // 发 Close 帧再关 sink（对齐 Go connection.Close 行为）。
         // ponytail: tungstenite Sink::close 自动发 Close frame。
@@ -250,6 +251,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> Connection for WsConnectio
     fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(self.remote)
     }
+
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(self.local)
     }
@@ -312,6 +314,7 @@ mod tests {
     #[tokio::test]
     async fn start_heartbeat_sends_ping_frames_to_peer() {
         use std::time::Duration;
+
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
         // 1. TCP pair。

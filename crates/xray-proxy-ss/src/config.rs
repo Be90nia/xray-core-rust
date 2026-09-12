@@ -74,10 +74,10 @@ impl CipherType {
             "aes-256-gcm" | "aead_aes_256_gcm" => Some(Self::Aes256Gcm),
             "chacha20-poly1305" | "aead_chacha20_poly1305" | "chacha20-ietf-poly1305" => {
                 Some(Self::ChaCha20Poly1305)
-            }
+            },
             "xchacha20-poly1305" | "aead_xchacha20_poly1305" | "xchacha20-ietf-poly1305" => {
                 Some(Self::XChaCha20Poly1305)
-            }
+            },
             _ => None,
         }
     }
@@ -141,16 +141,12 @@ impl Cipher {
     /// - [`SsError::InvalidCipherType`]：cipher 类型未知。
     pub fn from_type(ct: CipherType) -> Result<Self> {
         Ok(match ct {
-            CipherType::Aes128Gcm => Self::Aead(AeadCipher {
-                key_bytes: 16,
-                iv_bytes: 16,
-                creator: create_aes_128_gcm,
-            }),
-            CipherType::Aes256Gcm => Self::Aead(AeadCipher {
-                key_bytes: 32,
-                iv_bytes: 32,
-                creator: create_aes_256_gcm,
-            }),
+            CipherType::Aes128Gcm => {
+                Self::Aead(AeadCipher { key_bytes: 16, iv_bytes: 16, creator: create_aes_128_gcm })
+            },
+            CipherType::Aes256Gcm => {
+                Self::Aead(AeadCipher { key_bytes: 32, iv_bytes: 32, creator: create_aes_256_gcm })
+            },
             CipherType::ChaCha20Poly1305 => Self::Aead(AeadCipher {
                 key_bytes: 32,
                 iv_bytes: 32,
@@ -196,10 +192,9 @@ impl Cipher {
             Self::Aead(c) => {
                 let mut subkey = vec![0u8; c.key_bytes as usize];
                 hkdf_sha1(key, iv, &mut subkey);
-                let aead = (c.creator)(&subkey)
-                    .map_err(|e| SsError::AesGcmInit(e.to_string()))?;
+                let aead = (c.creator)(&subkey).map_err(|e| SsError::AesGcmInit(e.to_string()))?;
                 Ok(Some(aead))
-            }
+            },
         }
     }
 
@@ -290,8 +285,7 @@ pub fn password_to_cipher_key(password: &[u8], key_size: usize) -> Vec<u8> {
 /// info 固定为 `b"ss-subkey"`（来自 Go 端常量）。
 pub fn hkdf_sha1(secret: &[u8], salt: &[u8], out: &mut [u8]) {
     let hk = Hkdf::<Sha1>::new(Some(salt), secret);
-    hk.expand(crate::SS_SUBKEY, out)
-        .expect("hkdf expand should not fail for valid output size");
+    hk.expand(crate::SS_SUBKEY, out).expect("hkdf expand should not fail for valid output size");
 }
 
 // ============================================================================
@@ -358,19 +352,12 @@ mod tests {
     use super::*;
 
     fn sample_proto(ct: CipherType, password: &str) -> ProtoAccount {
-        ProtoAccount {
-            password: password.to_string(),
-            cipher_type: ct.as_i32(),
-            iv_check: false,
-        }
+        ProtoAccount { password: password.to_string(), cipher_type: ct.as_i32(), iv_check: false }
     }
 
     #[test]
     fn cipher_type_roundtrip() {
-        for ct in [
-            CipherType::XChaCha20Poly1305,
-        ] {
-        }
+        for ct in [CipherType::XChaCha20Poly1305] {}
     }
 
     #[test]
@@ -599,14 +586,9 @@ mod tests {
         assert_eq!(acc.key.len(), 32);
     }
 
-
     #[test]
     fn memory_account_from_proto_invalid_cipher() {
-        let p = ProtoAccount {
-            password: "p".to_string(),
-            cipher_type: 99,
-            iv_check: false,
-        };
+        let p = ProtoAccount { password: "p".to_string(), cipher_type: 99, iv_check: false };
         let err = MemoryAccount::from_proto(&p).unwrap_err();
         assert!(matches!(err, SsError::InvalidCipherType(99)));
     }
@@ -710,9 +692,18 @@ mod tests {
         assert_eq!(CipherType::from_name("aes-128-gcm"), Some(CipherType::Aes128Gcm));
         assert_eq!(CipherType::from_name("aead_aes_128_gcm"), Some(CipherType::Aes128Gcm));
         assert_eq!(CipherType::from_name("aead_aes_256_gcm"), Some(CipherType::Aes256Gcm));
-        assert_eq!(CipherType::from_name("aead_chacha20_poly1305"), Some(CipherType::ChaCha20Poly1305));
-        assert_eq!(CipherType::from_name("xchacha20-ietf-poly1305"), Some(CipherType::XChaCha20Poly1305));
-        assert_eq!(CipherType::from_name("XCHACHA20-POLY1305"), Some(CipherType::XChaCha20Poly1305));
+        assert_eq!(
+            CipherType::from_name("aead_chacha20_poly1305"),
+            Some(CipherType::ChaCha20Poly1305)
+        );
+        assert_eq!(
+            CipherType::from_name("xchacha20-ietf-poly1305"),
+            Some(CipherType::XChaCha20Poly1305)
+        );
+        assert_eq!(
+            CipherType::from_name("XCHACHA20-POLY1305"),
+            Some(CipherType::XChaCha20Poly1305)
+        );
         assert_eq!(CipherType::from_name("2022-blake3-aes-128-gcm"), None);
     }
 }

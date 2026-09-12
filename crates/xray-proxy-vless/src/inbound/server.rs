@@ -63,8 +63,10 @@ pub struct VlessInboundOptions {
     /// 对齐 Go inbound.go:281-284 SetReadDeadline(policy)）。None = 既有兜底
     /// （产品 SessionDefault 60s；cfg(test) 100ms）。
     pub handshake_timeout: Option<std::time::Duration>,
+    /// 入站会话允许的网络（Go proxyman inbound.go:177-179：splithttp 传输
+    /// 入站注入 `AllowedNetwork=UDP`）。None = 不限制。
+    pub allowed_network: Option<Network>,
 }
-
 /// VLESS inbound 服务入口。
 ///
 /// 绑定 `listener` 监听，每个连接 spawn 独立 task：
@@ -413,7 +415,18 @@ where
         .await
         .map_err(|e| std::io::Error::other(format!("vless encode response: {e}")))?;
 
-    // 2. 按 command 分派
+    // 2. AllowedNetwork 注入（Go inbound.go:607-609 + proxyman inbound.go:177-179）：
+    // splithttp 传输入站 → 恒 UDP；XRV flow + Mux 命令 → UDP。mux 服务端
+    // worker 据此校验子会话网络（common/mux/server.go:189-192）。
+    let mut access = access;
+    if let Some(net) = options.as_ref().and_then(|o| o.allowed_network) {
+        access.allowed_network = Some(net);
+    }
+    if decoded.command == VlessCommand::Mux && decoded.addons.flow == crate::FLOW_XRV {
+        access.allowed_network = Some(Network::UDP);
+    }
+
+    // 3. 按 command 分派
     match decoded.command {
         VlessCommand::Tcp => {
             finish_tcp_dispatch(reader, write_half, &decoded, handler, raw_tcp, &access).await
@@ -1497,6 +1510,7 @@ mod tests {
             reverse_ohm: None,
             decryption: None,
             handshake_timeout: None,
+            allowed_network: None,
         };
         tokio::spawn(async move {
             let _ = serve_vless(
@@ -1559,6 +1573,7 @@ mod tests {
             reverse_ohm: Some(Arc::clone(&ohm_clone)),
             decryption: None,
             handshake_timeout: None,
+            allowed_network: None,
         };
         tokio::spawn(async move {
             let _ = serve_vless(

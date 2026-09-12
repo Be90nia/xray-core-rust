@@ -64,7 +64,46 @@ pub trait Connection: AsyncRead + AsyncWrite + Send + Sync + Unpin {
     fn raw_tcp_clone(&self) -> Option<TcpStream> {
         None
     }
+
+    /// 是否为**无包装层的裸 TCP 连接**（Go `IsRAWTransportWithoutSecurity` 等价物，
+    /// proxy.go:802-809：proxyproto.Conn / net.TCPConn / UnixConnWrapper 三型）。
+    ///
+    /// splice(2) 零拷贝桥接的准入信号。与 [`Connection::raw_tcp_clone`] 的区别：
+    /// 后者为 vision splice 穿透 TLS 等安全层克隆内层 socket（返回 `Some` 不能
+    /// 证明连接本身是裸 TCP）；本方法默认 `false`，仅具体裸 TCP 类型覆写为
+    /// `true`——TLS/REALITY/fragment 等包装层不覆写即天然拒绝。
+    fn is_raw_tcp(&self) -> bool {
+        false
+    }
+
+    /// 下行多缓冲聚合读的 poll 钩子（bd 2o9l，对应 Go ReadVReader 的
+    /// `syscall.RawConn` 通道）。TCP 实现覆写为真 readv——一次系统调用
+    /// （Unix `readv(2)` / Windows `WSARecv`）把数据分散填入多个 iovec；
+    /// 默认实现顺序读入首个非空缓冲，行为等价 Go `NewReader` 无
+    /// `syscall.Conn` 时退回 `SingleReader`（common/buf/io.go:124-145）。
+    ///
+    /// # 参数
+    ///
+    /// - `bufs`：各缓冲的可写区（由 [`xray_buf::readv::buffer_iovecs`] 构建），
+    ///   返回字节数由调用方按序分发（[`xray_buf::readv::distribute`]）。
+    fn poll_read_multi(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &mut [io::IoSliceMut<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let dst: &mut [u8] = match bufs.iter_mut().find(|b| !b.is_empty()) {
+            Some(b) => &mut **b,
+            None => return Poll::Ready(Ok(0)),
+        };
+        if dst.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let mut rb = ReadBuf::new(dst);
+        std::task::ready!(Pin::new(self).poll_read(cx, &mut rb))?;
+        Poll::Ready(Ok(rb.filled().len()))
+    }
 }
+
 
 
 /// 复制 `tokio::net::TcpStream` 底层 socket 为独立 handle（vision splice 用）。
@@ -176,6 +215,26 @@ impl Connection for TcpConnection {
     }
     fn raw_tcp_clone(&self) -> Option<TcpStream> {
         dup_tcp_stream(&self.inner)
+    }
+    /// 真 scatter-gather 读（bd 2o9l，Go ReadVReader rawConn 分支的 Rust 等价）：
+    /// readiness + `try_read_vectored`。`WouldBlock` 时 readiness 已被 tokio 消费，
+    /// 重新 poll_read_ready 注册 waker，不空转。
+    fn poll_read_multi(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &mut [io::IoSliceMut<'_>],
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            std::task::ready!(self.inner.poll_read_ready(cx))?;
+            match self.inner.try_read_vectored(bufs) {
+                Ok(n) => return Poll::Ready(Ok(n)),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+    }
+    fn is_raw_tcp(&self) -> bool {
+        true
     }
     fn close_read(&mut self) -> io::Result<()> {
         #[cfg(unix)]
@@ -391,6 +450,19 @@ impl Connection for Box<dyn Connection> {
     fn raw_tcp_clone(&self) -> Option<TcpStream> {
         // 穿透 Box 转发到内层具体连接（vision splice 依赖此链路）。
         (**self).raw_tcp_clone()
+    }
+
+    fn is_raw_tcp(&self) -> bool {
+        // Box 透传：内层是裸 TCP（如 TcpConnection）时保持 splice 准入信号。
+        (**self).is_raw_tcp()
+    }
+
+    fn poll_read_multi(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &mut [io::IoSliceMut<'_>],
+    ) -> Poll<io::Result<usize>> {
+        (**self).poll_read_multi(cx, bufs)
     }
 }
 

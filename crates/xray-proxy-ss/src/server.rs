@@ -5,14 +5,15 @@
 //!
 //! [`read_request`] 提供单用户场景的 TCP 首帧读取 + SSStream 构造。
 
-use crate::config::MemoryAccount;
-use crate::error::Result;
-use crate::protocol::{read_address_port_ss, RequestHeader};
-use crate::stream::SSStream;
-use crate::validator::{MemoryUser, RequestCommand, Validator};
+use tokio::{io::AsyncReadExt, net::TcpStream};
 
-use tokio::io::AsyncReadExt;
-use tokio::net::TcpStream;
+use crate::{
+    config::MemoryAccount,
+    error::Result,
+    protocol::{RequestHeader, read_address_port_ss},
+    stream::SSStream,
+    validator::{MemoryUser, RequestCommand, Validator},
+};
 
 /// 入站处理器接口。
 pub trait InboundProcessor: Send + Sync {
@@ -26,7 +27,8 @@ pub trait InboundProcessor: Send + Sync {
     ///
     /// # Errors
     /// - 透传解码错误。
-    fn handle_udp(&self, validator: &Validator, payload: &[u8]) -> Result<(RequestHeader, Vec<u8>)>;
+    fn handle_udp(&self, validator: &Validator, payload: &[u8])
+    -> Result<(RequestHeader, Vec<u8>)>;
 }
 
 /// No-op 处理器：直接调 protocol 函数。
@@ -37,7 +39,11 @@ impl InboundProcessor for NoopInboundProcessor {
         crate::protocol::decode_tcp_request_header(validator, buf)
     }
 
-    fn handle_udp(&self, validator: &Validator, payload: &[u8]) -> Result<(RequestHeader, Vec<u8>)> {
+    fn handle_udp(
+        &self,
+        validator: &Validator,
+        payload: &[u8],
+    ) -> Result<(RequestHeader, Vec<u8>)> {
         crate::protocol::decode_udp_packet(validator, payload)
     }
 }
@@ -63,10 +69,7 @@ impl Server {
     /// 创建服务器。
     #[must_use]
     pub fn new(validator: Validator, processor: std::sync::Arc<dyn InboundProcessor>) -> Self {
-        Self {
-            validator,
-            processor,
-        }
+        Self { validator, processor }
     }
 
     /// 从用户列表创建服务器（用 NoopInboundProcessor）。
@@ -193,7 +196,7 @@ where
             // Go 对应分支同样以 FullReader 排空——但 conn 已移动，无法回收。
             // 该错误为 AEAD 构造（key/nonce 长度），不依赖网络输入，直接透传。
             return Err(e);
-        }
+        },
     };
 
     // 读首帧（addr+port）
@@ -203,11 +206,11 @@ where
             let e = crate::error::SsError::ReadInitial("EOF reading first frame".to_string());
             let mut conn = stream.into_inner();
             return Err(bail(&drainer, &mut conn, e).await);
-        }
+        },
         Err(e) => {
             let mut conn = stream.into_inner();
             return Err(bail(&drainer, &mut conn, e).await);
-        }
+        },
     };
 
     let (address, port, _) = match read_address_port_ss(&first_frame) {
@@ -215,7 +218,7 @@ where
         Err(e) => {
             let mut conn = stream.into_inner();
             return Err(bail(&drainer, &mut conn, e).await);
-        }
+        },
     };
 
     let header = RequestHeader {
@@ -233,15 +236,16 @@ where
         .begin_server_response(account)
         .await
         .map_err(|e| crate::error::SsError::Io(e.to_string()))?;
- 
+
     Ok((header, stream))
 }
 
 #[cfg(test)]
 mod tests {
+    use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
+
     use super::*;
     use crate::config::{CipherType, MemoryAccount};
-    use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
 
     fn make_account(ct: CipherType, password: &str) -> MemoryAccount {
         let p = ProtoAccount {
@@ -255,14 +259,8 @@ mod tests {
     #[test]
     fn server_with_users_initial_count() {
         let users = vec![
-            MemoryUser::new(
-                "u1@x.com",
-                make_account(CipherType::Aes128Gcm, "p1"),
-            ),
-            MemoryUser::new(
-                "u2@x.com",
-                make_account(CipherType::Aes256Gcm, "p2"),
-            ),
+            MemoryUser::new("u1@x.com", make_account(CipherType::Aes128Gcm, "p1")),
+            MemoryUser::new("u2@x.com", make_account(CipherType::Aes256Gcm, "p2")),
         ];
         let server = Server::with_users(users);
         assert_eq!(server.users_count(), 2);
@@ -274,10 +272,7 @@ mod tests {
         assert_eq!(server.users_count(), 0);
 
         server
-            .add_user(MemoryUser::new(
-                "u@x.com",
-                make_account(CipherType::Aes128Gcm, "p"),
-            ))
+            .add_user(MemoryUser::new("u@x.com", make_account(CipherType::Aes128Gcm, "p")))
             .expect("add");
         assert_eq!(server.users_count(), 1);
 
@@ -302,8 +297,8 @@ mod tests {
         let server = Server::with_users(vec![MemoryUser::new("u@x.com", account.clone())]);
 
         let addr = xray_common::net::address::Address::Domain("example.com".to_string());
-        let encoded =
-            crate::protocol::encode_udp_packet(&account, &addr, 443, b"test payload").expect("encode");
+        let encoded = crate::protocol::encode_udp_packet(&account, &addr, 443, b"test payload")
+            .expect("encode");
 
         let (header, data) = server.handle_udp(&encoded).expect("handle");
         assert_eq!(header.address, addr);
@@ -315,9 +310,10 @@ mod tests {
 
     #[tokio::test]
     async fn client_server_loopback_aes_128() {
-        use crate::client::Client;
         use tokio::net::TcpListener;
         use xray_common::net::address::Address;
+
+        use crate::client::Client;
 
         let account = make_account(CipherType::Aes128Gcm, "loopback-pw");
 
@@ -327,9 +323,8 @@ mod tests {
         let server_account = account.clone();
         let server_handle = tokio::spawn(async move {
             let (conn, _) = listener.accept().await.expect("accept");
-            let (header, mut stream) = read_request(conn, &server_account, "u@x.com", 0)
-                .await
-                .expect("read_request");
+            let (header, mut stream) =
+                read_request(conn, &server_account, "u@x.com", 0).await.expect("read_request");
 
             // 读 body chunk
             let body = stream.read_chunk().await.expect("read body").expect("body");
@@ -365,9 +360,10 @@ mod tests {
 
     #[tokio::test]
     async fn client_server_loopback_aes_256() {
-        use crate::client::Client;
         use tokio::net::TcpListener;
         use xray_common::net::address::Address;
+
+        use crate::client::Client;
 
         let account = make_account(CipherType::Aes256Gcm, "aes256-loopback");
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -375,9 +371,8 @@ mod tests {
         let server_account = account.clone();
         let server_handle = tokio::spawn(async move {
             let (conn, _) = listener.accept().await.expect("accept");
-            let (_h, mut stream) = read_request(conn, &server_account, "u@x.com", 0)
-                .await
-                .expect("read_request");
+            let (_h, mut stream) =
+                read_request(conn, &server_account, "u@x.com", 0).await.expect("read_request");
             let body = stream.read_chunk().await.expect("read").expect("body");
             stream.write_chunk(b"resp").await.expect("write");
             stream.flush().await.expect("flush");

@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::lint::{register_stage, LintError, LintStage};
+use xray_common::errors::{print_non_removal_deprecated_feature_warning, removed_feature_message};
 /// Go 等价物：`func init() { RegisterConfigureFilePostProcessingStage("FakeDNS", ...) }`
 /// 在 `infra/conf` 包初始化时自动执行。
 pub fn register_builtin_stages() {
@@ -196,6 +197,22 @@ impl LintStage for ValidationStage {
             }
         }
 
+        // 4. 三级严格度硬错（bd 5x41/1c4z，Go v26.9.9 feature_errors.go:9-31）：
+        //    streamSettings.network 已移除/弃用 transport + tlsSettings.allowInsecure
+        //    硬错 + hysteria version != 2 三处硬错。
+        for ib in &cfg.inbound_configs {
+            check_hysteria_protocol_version("inbound", &ib.tag, &ib.protocol, ib.settings.as_ref())?;
+            if let Some(ss) = ib.stream_settings.as_ref() {
+                check_stream_strictness("inbound", &ib.tag, ss)?;
+            }
+        }
+        for ob in &cfg.outbound_configs {
+            check_hysteria_protocol_version("outbound", &ob.tag, &ob.protocol, ob.settings.as_ref())?;
+            if let Some(ss) = ob.stream_settings.as_ref() {
+                check_stream_strictness("outbound", &ob.tag, ss)?;
+            }
+        }
+
         Ok(())
     }
 }
@@ -209,6 +226,99 @@ fn is_known_dest_override(s: &str) -> bool {
         s.to_ascii_lowercase().as_str(),
         "http" | "tls" | "https" | "ssl" | "quic" | "fakedns" | "fakedns+others"
     )
+}
+
+/// streamSettings 三级严格度。对应 Go `infra/conf/transport_internet.go:16-42`
+/// （TransportProtocol.Build 的 removed/deprecated 分支）、`transport_security.go:361-363`
+/// （allowInsecure 硬错）、`transport_method.go:759-762`（hysteria transport version）。
+fn check_stream_strictness(kind: &str, tag: &str, ss: &serde_json::Value) -> Result<(), LintError> {
+    // 1) network：已移除 → 硬错；弃用未移除 → warn 继续（文案逐字对齐 Go）。
+    let net = ss.get("network").and_then(|v| v.as_str()).unwrap_or("");
+    match net.to_ascii_lowercase().as_str() {
+        "http" | "h2" | "h3" => {
+            return Err(LintError::Invalid(format!(
+                "{kind} '{tag}' streamSettings.network=\"{net}\": {}",
+                removed_feature_message(
+                    "HTTP transport (without header padding, etc.)",
+                    "XHTTP stream-one H2 & H3"
+                )
+            )));
+        }
+        "grpc" => print_non_removal_deprecated_feature_warning(
+            "gRPC transport (with unnecessary costs, etc.)",
+            "XHTTP stream-up H2",
+        ),
+        "ws" | "websocket" => print_non_removal_deprecated_feature_warning(
+            "WebSocket transport (with ALPN http/1.1, etc.)",
+            "XHTTP H2 & H3",
+        ),
+        "httpupgrade" => print_non_removal_deprecated_feature_warning(
+            "HTTPUpgrade transport (with ALPN http/1.1, etc.)",
+            "XHTTP H2 & H3",
+        ),
+        _ => {}
+    }
+
+    // 2) allowInsecure：tls security 下硬错。pinnedPeerCertSha256 /
+    //    verifyPeerCertByName 不受影响（运行时继续支持，Go transport_security.go:364-389）。
+    let is_tls = ss
+        .get("security")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("tls"));
+    if is_tls
+        && ss
+            .get("tlsSettings")
+            .and_then(|t| t.get("allowInsecure"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    {
+        return Err(LintError::Invalid(format!(
+            "{kind} '{tag}': {}",
+            removed_feature_message(
+                "\"allowInsecure\"",
+                "\"pinnedPeerCertSha256\"(pcs) and \"verifyPeerCertByName\"(vcn)"
+            )
+        )));
+    }
+
+    // 3) hysteria transport（hysteriaSettings）：显式 version != 2 → 硬错。
+    if net.eq_ignore_ascii_case("hysteria") {
+        check_hysteria_version(kind, tag, "hysteriaSettings", ss.get("hysteriaSettings"))?;
+    }
+    Ok(())
+}
+
+/// 协议级 hysteria settings 的 version 门。对应 Go `conf/hysteria.go:19-22`
+/// （客户端）/ `:45-48`（服务端）。settings 无 `version` 字段时跳过——Rust 方言
+/// （出站 `servers[]` 形态 / 入站 `auth+cert` 形态）不携带 version，属 Go 不存在的
+/// 扩展形态，不可按 Go 的"缺省 = 0 != 2"语义拒绝。
+fn check_hysteria_protocol_version(
+    kind: &str,
+    tag: &str,
+    protocol: &str,
+    settings: Option<&serde_json::Value>,
+) -> Result<(), LintError> {
+    if protocol.eq_ignore_ascii_case("hysteria") {
+        return check_hysteria_version(kind, tag, "settings", settings);
+    }
+    Ok(())
+}
+
+fn check_hysteria_version(
+    kind: &str,
+    tag: &str,
+    field: &str,
+    settings: Option<&serde_json::Value>,
+) -> Result<(), LintError> {
+    if let Some(ver) = settings.and_then(|s| s.get("version")).and_then(|v| v.as_i64()) {
+        if ver != 2 {
+            return Err(LintError::Invalid(format!(
+                "{kind} '{tag}' {field}.version={ver}: version != 2 \
+                 (Go hysteria Build requires version == 2)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// 扫描 `cfg.dns.servers[]`：任一地址为 `"fakedns"`（domain family）即视为启用。
@@ -558,5 +668,253 @@ mod tests {
         let err = post_process(&mut cfg).expect_err("burstObservatory w/o pingConfig must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("pingConfig"), "got: {msg}");
+    }
+    // ========== 三级严格度硬错（bd 5x41/1c4z，Go v26.9.9）==========
+
+    #[test]
+    fn strictness_rejects_allow_insecure_tls_settings() {
+        let _g = TEST_LOCK.lock();
+        clear_stages();
+        register_builtin_stages();
+        // 入站与出站的 streamSettings 都要拒；security 大小写不敏感。
+        let cases = [
+            ("inbound", Config {
+                inbound_configs: vec![crate::config::InboundDetourConfig {
+                    protocol: "vless".into(),
+                    tag: "in".into(),
+                    stream_settings: Some(json!({
+                        "network": "tcp", "security": "tls",
+                        "tlsSettings": {"allowInsecure": true}
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ("outbound", Config {
+                outbound_configs: vec![crate::config::OutboundDetourConfig {
+                    protocol: "vless".into(),
+                    tag: "ob".into(),
+                    stream_settings: Some(json!({
+                        "network": "ws", "security": "TLS",
+                        "tlsSettings": {"allowInsecure": true, "serverName": "x"}
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        ];
+        for (kind, mut cfg) in cases {
+            let err = post_process(&mut cfg)
+                .err()
+                .unwrap_or_else(|| panic!("{kind}: allowInsecure must be rejected"));
+            let msg = err.to_string();
+            assert!(msg.contains("allowInsecure"), "{kind}: got: {msg}");
+            assert!(msg.contains("removed"), "{kind}: got: {msg}");
+        }
+    }
+
+    #[test]
+    fn strictness_allows_pinned_peer_cert_sha256() {
+        let _g = TEST_LOCK.lock();
+        clear_stages();
+        register_builtin_stages();
+        // Go transport_security.go:364-378：pinned 迁移路径必须保持可用。
+        let mut cfg = Config {
+            outbound_configs: vec![crate::config::OutboundDetourConfig {
+                protocol: "vless".into(),
+                tag: "ob".into(),
+                stream_settings: Some(json!({
+                    "network": "tcp", "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "pinnedPeerCertSha256": format!(
+                            "{}:{}",
+                            "ab".repeat(16),
+                            "cd".repeat(16)
+                        )
+                    }
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        post_process(&mut cfg).expect("pinnedPeerCertSha256 must stay allowed");
+    }
+
+    #[test]
+    fn strictness_rejects_removed_http_transports() {
+        let _g = TEST_LOCK.lock();
+        clear_stages();
+        register_builtin_stages();
+        // Go transport_internet.go:33-34：h2/h3/http 已移除；大小写不敏感。
+        for net in ["http", "h2", "h3", "H2"] {
+            let mut cfg = Config {
+                outbound_configs: vec![crate::config::OutboundDetourConfig {
+                    protocol: "vless".into(),
+                    tag: "ob".into(),
+                    stream_settings: Some(json!({ "network": net })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let err = post_process(&mut cfg)
+                .err()
+                .unwrap_or_else(|| panic!("network {net:?} must be rejected"));
+            let msg = err.to_string();
+            assert!(msg.contains("removed"), "network {net:?}: got: {msg}");
+            assert!(msg.contains("ob"), "network {net:?}: tag missing: {msg}");
+        }
+    }
+
+    #[test]
+    fn strictness_allows_deprecated_transports_with_warning() {
+        let _g = TEST_LOCK.lock();
+        clear_stages();
+        register_builtin_stages();
+        // Go transport_internet.go:25-31：grpc/ws/httpupgrade 弃用但未移除 → 仅告警。
+        for net in ["grpc", "ws", "websocket", "httpupgrade"] {
+            let mut cfg = Config {
+                inbound_configs: vec![crate::config::InboundDetourConfig {
+                    protocol: "vless".into(),
+                    tag: "in".into(),
+                    stream_settings: Some(json!({ "network": net })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            post_process(&mut cfg)
+                .unwrap_or_else(|e| panic!("deprecated transport {net:?} must only warn: {e}"));
+        }
+    }
+
+    #[test]
+    fn strictness_rejects_hysteria_client_version_not_2() {
+        let _g = TEST_LOCK.lock();
+        clear_stages();
+        register_builtin_stages();
+        // Go conf/hysteria.go:19-22（客户端）。
+        let mut cfg = Config {
+            outbound_configs: vec![crate::config::OutboundDetourConfig {
+                protocol: "hysteria".into(),
+                tag: "hy".into(),
+                settings: Some(json!({"version": 1, "address": "127.0.0.1", "port": 443})),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let err = post_process(&mut cfg)
+            .err()
+            .expect("hysteria client version != 2 must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("version"), "got: {msg}");
+        assert!(msg.contains("version != 2"), "got: {msg}");
+    }
+
+    #[test]
+    fn strictness_allows_hysteria_version_2_and_rust_dialect() {
+        let _g = TEST_LOCK.lock();
+        clear_stages();
+        register_builtin_stages();
+        // Go 平铺形态 version=2 → Ok。
+        let mut cfg = Config {
+            outbound_configs: vec![crate::config::OutboundDetourConfig {
+                protocol: "hysteria".into(),
+                tag: "hy".into(),
+                settings: Some(json!({"version": 2, "address": "127.0.0.1", "port": 443})),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        post_process(&mut cfg).expect("hysteria version=2 must pass");
+        // Rust 方言 servers 形态（无 version）：Go 的"缺省=0!=2"语义不适用于
+        // Go 不存在的扩展形态。
+        let mut cfg = Config {
+            outbound_configs: vec![crate::config::OutboundDetourConfig {
+                protocol: "hysteria".into(),
+                tag: "hy".into(),
+                settings: Some(
+                    json!({"servers": [{"address": "127.0.0.1", "port": 443, "auth": "t"}]}),
+                ),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        post_process(&mut cfg).expect("Rust servers-form (no version) must pass");
+    }
+
+    #[test]
+    fn strictness_rejects_hysteria_server_version_not_2() {
+        let _g = TEST_LOCK.lock();
+        clear_stages();
+        register_builtin_stages();
+        // Go conf/hysteria.go:45-48（服务端）。
+        let mut cfg = Config {
+            inbound_configs: vec![crate::config::InboundDetourConfig {
+                protocol: "hysteria".into(),
+                tag: "hy-in".into(),
+                settings: Some(json!({"version": 3, "users": [{"auth": "t"}]})),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let err = post_process(&mut cfg)
+            .err()
+            .expect("hysteria server version != 2 must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("version"), "got: {msg}");
+    }
+
+    #[test]
+    fn strictness_rejects_hysteria_transport_version_not_2() {
+        let _g = TEST_LOCK.lock();
+        clear_stages();
+        register_builtin_stages();
+        // Go transport_method.go:759-762（streamSettings.hysteriaSettings）。
+        let mut cfg = Config {
+            inbound_configs: vec![crate::config::InboundDetourConfig {
+                protocol: "hysteria".into(),
+                tag: "hy-in".into(),
+                stream_settings: Some(json!({
+                    "network": "hysteria", "security": "tls",
+                    "hysteriaSettings": {"version": 0, "auth": "t"}
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let err = post_process(&mut cfg)
+            .err()
+            .expect("hysteriaSettings version != 2 must be rejected");
+        assert!(err.to_string().contains("version"), "got: {err}");
+        // version=2 正例。
+        cfg.inbound_configs[0].stream_settings = Some(json!({
+            "network": "hysteria", "security": "tls",
+            "hysteriaSettings": {"version": 2, "auth": "t"}
+        }));
+        post_process(&mut cfg).expect("hysteriaSettings version=2 must pass");
+    }
+
+    #[test]
+    fn build_fires_lint_even_with_empty_registry() {
+        let _g = TEST_LOCK.lock();
+        // 清空注册表后直接 build：证明 build() 自举内置阶段（生产 funnel），
+        // 不依赖调用方先 register_builtin_stages。
+        clear_stages();
+        let cfg = Config {
+            outbound_configs: vec![crate::config::OutboundDetourConfig {
+                protocol: "vless".into(),
+                tag: "ob".into(),
+                stream_settings: Some(json!({
+                    "network": "tcp", "security": "tls",
+                    "tlsSettings": {"allowInsecure": true}
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let err = cfg.build().err().expect("build must reject allowInsecure");
+        let msg = err.to_string();
+        assert!(msg.contains("allowInsecure"), "got: {msg}");
+        assert!(msg.contains("removed"), "got: {msg}");
     }
 }

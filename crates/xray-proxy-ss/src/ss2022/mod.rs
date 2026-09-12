@@ -6,17 +6,14 @@
 pub mod client;
 pub mod inbound;
 pub mod key;
-pub mod packet;
 pub mod outbound;
+pub mod packet;
 pub mod replay;
 
 pub use client::Client2022;
 pub use inbound::{
-    InboundResult, MultiUserInbound, RelayDestination, RelayInbound, Ss2022Inbound,
-    Ss2022User,
+    InboundResult, MultiUserInbound, RelayDestination, RelayInbound, Ss2022Inbound, Ss2022User,
 };
-pub use key::{derive_psk, psk_from_base64, CipherKind2022, derive_session_subkey};
-pub use packet::{
-    ClientUdpSession2022, DecodedClientHeader, ServerUdpSession2022, SlidingWindow,
-};
+pub use key::{CipherKind2022, derive_psk, derive_session_subkey, psk_from_base64};
 pub use outbound::{Ss2022Outbound, Ss2022OutboundConfig, UdpOverTcpConfig};
+pub use packet::{ClientUdpSession2022, DecodedClientHeader, ServerUdpSession2022, SlidingWindow};

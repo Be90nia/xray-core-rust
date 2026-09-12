@@ -23,7 +23,6 @@ pub fn default_hysteria_quic_params() -> QuicParams {
 }
 
 /// 从 `streamSettings.finalmask` JSON 解析 `quicParams`。
-///
 pub fn parse_quic_params(
     finalmask_json: Option<&serde_json::Value>,
 ) -> io::Result<Option<QuicParams>> {
@@ -44,7 +43,7 @@ pub fn parse_quic_params(
         .to_ascii_lowercase();
     match bbr_profile.as_str() {
         "" => bbr_profile = "standard".into(),
-        "conservative" | "standard" | "aggressive" => {}
+        "conservative" | "standard" | "aggressive" => {},
         _ => return Err(invalid("unknown bbr profile")),
     }
 
@@ -53,7 +52,9 @@ pub fn parse_quic_params(
         match obj.get(k) {
             None | Some(serde_json::Value::Null) => Ok(0),
             Some(serde_json::Value::String(s)) => parse_bandwidth_bps(s),
-            Some(_) => Err(invalid(format!("quicParams: {k} must be a bandwidth string like \"100 mbps\""))),
+            Some(_) => Err(invalid(format!(
+                "quicParams: {k} must be a bandwidth string like \"100 mbps\""
+            ))),
         }
     };
     let brutal_up = bw("brutalUp")?;
@@ -72,14 +73,14 @@ pub fn parse_quic_params(
         .unwrap_or("")
         .to_ascii_lowercase();
     match congestion.as_str() {
-        "" | "brutal" | "reno" | "bbr" => {}
-        "force-brutal" if brutal_up > 0 => {}
+        "" | "brutal" | "reno" | "bbr" => {},
+        "force-brutal" if brutal_up > 0 => {},
         "force-brutal" => return Err(invalid("force-brutal requires up")),
         _ => {
             return Err(invalid(format!(
                 "unknown congestion control: {congestion}, valid values: reno, bbr, brutal, force-brutal"
-            )))
-        }
+            )));
+        },
     }
 
     // udpHop（Go :2191-2192 校验 + :2227-2231 转换）
@@ -136,6 +137,10 @@ pub fn parse_quic_params(
         bbr_profile,
         brutal_up,
         brutal_down,
+        brutal_disable_loss_compensation: obj
+            .get("brutalDisableLossCompensation")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
         udp_hop: Some(hop),
         init_stream_receive_window: get_u64("initStreamReceiveWindow"),
         max_stream_receive_window: get_u64("maxStreamReceiveWindow"),
@@ -148,6 +153,11 @@ pub fn parse_quic_params(
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
         max_incoming_streams,
+        // quinn 无 ChromeParrot/GSO/StatelessReset 等价旋钮（登记不动：Go v2.12.2
+        // quic-go 内部特性，quinn 侧无消费点）。
+        disable_chrome_parrot: false,
+        disable_gso: false,
+        disable_stateless_reset: false,
     }))
 }
 
@@ -156,9 +166,7 @@ fn parse_bandwidth_bps(s: &str) -> io::Result<u64> {
     if s.is_empty() {
         return Ok(0);
     }
-    let idx = s
-        .find(|c: char| !c.is_ascii_digit() && c != '.')
-        .unwrap_or(s.len());
+    let idx = s.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(s.len());
     let val: f64 = s[..idx]
         .parse()
         .map_err(|_| invalid(format!("quicParams: invalid bandwidth value {s:?}")))?;
@@ -187,7 +195,7 @@ fn parse_port_list(v: &serde_json::Value) -> io::Result<Vec<u32>> {
         serde_json::Value::Number(n) => {
             let p = n.as_u64().ok_or_else(|| invalid("invalid port"))? as u32;
             push_range(p, p)?;
-        }
+        },
         serde_json::Value::String(s) => {
             for part in s.split(',') {
                 let part = part.trim();
@@ -203,7 +211,7 @@ fn parse_port_list(v: &serde_json::Value) -> io::Result<Vec<u32>> {
                     push_range(p, p)?;
                 }
             }
-        }
+        },
         _ => return Err(invalid("invalid port")),
     }
     Ok(out)
@@ -214,15 +222,13 @@ fn parse_int32_range(v: &serde_json::Value) -> io::Result<(i64, i64)> {
         serde_json::Value::Number(n) => {
             let n = n.as_i64().ok_or_else(|| invalid("invalid interval"))?;
             (n, n)
-        }
+        },
         serde_json::Value::String(s) => {
-            let (a, b) = s
-                .split_once('-')
-                .ok_or_else(|| invalid("invalid interval"))?;
+            let (a, b) = s.split_once('-').ok_or_else(|| invalid("invalid interval"))?;
             let from: i64 = a.trim().parse().map_err(|_| invalid("invalid interval"))?;
             let to: i64 = b.trim().parse().map_err(|_| invalid("invalid interval"))?;
             (from, to)
-        }
+        },
         _ => return Err(invalid("invalid interval")),
     };
     // Go Int32Range.ensureOrder（common.go:332-338）
@@ -284,8 +290,7 @@ mod tests {
 
     #[test]
     fn parse_full_fields() {
-        let v = fm(
-            r#"{"quicParams":{
+        let v = fm(r#"{"quicParams":{
                 "congestion": "brutal",
                 "bbrProfile": "aggressive",
                 "brutalUp": "100 mbps",
@@ -300,8 +305,7 @@ mod tests {
                 "disablePathMTUDiscovery": true,
                 "maxIncomingStreams": 64,
                 "debug": true
-            }}"#,
-        );
+            }}"#);
         let p = parse_quic_params(Some(&v)).unwrap().unwrap();
         assert_eq!(p.congestion, "brutal");
         assert_eq!(p.bbr_profile, "aggressive");
@@ -394,8 +398,7 @@ mod tests {
     #[test]
     fn validation_boundary_values_pass() {
         // 边界值全部合法：65536 / 16384 / [4,120] / [2,60] / 8 / interval 5。
-        let v = fm(
-            r#"{"quicParams":{
+        let v = fm(r#"{"quicParams":{
                 "congestion":"force-brutal",
                 "brutalUp":"512 kbps",
                 "udpHop":{"interval":5},
@@ -403,8 +406,7 @@ mod tests {
                 "maxIdleTimeout":4,
                 "keepAlivePeriod":2,
                 "maxIncomingStreams":8
-            }}"#,
-        );
+            }}"#);
         let p = parse_quic_params(Some(&v)).unwrap().unwrap();
         assert_eq!(p.brutal_up, 65_536);
         assert_eq!(p.max_idle_timeout, 4);
