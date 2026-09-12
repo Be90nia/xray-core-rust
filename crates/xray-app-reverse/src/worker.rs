@@ -349,6 +349,21 @@ impl xray_mux::worker::Dispatcher for WeakBridgeDispatcher {
             })?;
         me.as_ref().dispatch(dest).await
     }
+
+    async fn dispatch_inbound(
+        &self,
+        dest: Destination,
+        source: Option<Destination>,
+        local: Option<Destination>,
+    ) -> Result<MuxLink, xray_mux::worker::DispatchError> {
+        let me = self
+            .0
+            .upgrade()
+            .ok_or_else(|| {
+                xray_mux::worker::DispatchError::NoRoute("bridge worker dropped".to_string())
+            })?;
+        me.as_ref().dispatch_inbound(dest, source, local).await
+    }
 }
 
 impl BridgeWorker {
@@ -553,6 +568,7 @@ impl xray_mux::worker::Dispatcher for BridgeWorker {
                 "bridge worker not initialized".into(),
             ));
         };
+
         let (up_r, up_w) = pipe::new_with_option(control_pipe_option());
         let (dn_r, dn_w) = pipe::new_with_option(control_pipe_option());
         // up_w 随控制流任务存活（Go Link{Writer: uplinkWriter} 被 goroutine 持有），
@@ -564,6 +580,49 @@ impl xray_mux::worker::Dispatcher for BridgeWorker {
         Ok(MuxLink {
             reader: Box::new(up_r),
             writer: Box::new(dn_w),
+        })
+    }
+    /// Reverse-mux 带帧内 source/local 的 dispatch（txno④；Go server.go:166-174
+    /// 覆写 ctx inbound 后 Dispatch 等价）。管道对自建（与
+    /// [`xray_mux::worker::DispatchHandlerAdapter`] 同拓扑）：
+    /// mux 会话 ↔ (read_a/write_b)，dispatcher link ↔ (read_b/write_a)，
+    /// 帧内元数据以 "ip:port" 形态进 [`AccessContext`]。
+    async fn dispatch_inbound(
+        &self,
+        dest: Destination,
+        source: Option<Destination>,
+        local: Option<Destination>,
+    ) -> Result<MuxLink, xray_mux::worker::DispatchError> {
+        if crate::bridge::is_internal_domain(dest.address().as_domain()) {
+            // 控制流无 inbound 元数据语义
+            return self.dispatch(dest).await;
+        }
+        let tag = self.tag.clone();
+        let (read_a, write_a) = pipe::new_with_option(control_pipe_option());
+        let (read_b, write_b) = pipe::new_with_option(control_pipe_option());
+        let transport_link = TransportLink::new(Box::new(read_b), Box::new(write_a));
+        let dispatcher = Arc::clone(&self.dispatcher);
+        tokio::spawn(async move {
+            if let Err(e) = dispatcher
+                .dispatch_link_inbound(
+                    &dest,
+                    transport_link,
+                    Some(tag.as_str()),
+                    source.as_ref(),
+                    local.as_ref(),
+                )
+                .await
+            {
+                tracing::info!(
+                    target: "xray_app_reverse",
+                    error = %e,
+                    "reverse bridge inbound dispatch failed"
+                );
+            }
+        });
+        Ok(MuxLink {
+            reader: Box::new(read_a),
+            writer: Box::new(write_b),
         })
     }
 }

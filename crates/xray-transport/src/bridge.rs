@@ -537,6 +537,103 @@ where
     bridge_link_with_stream_full(link, stream, &policy).await
 }
 
+/// 下行 splice 快路径桥（txno-splice；Go freedom responseDone 的
+/// `proxy.CopyRawConnIfExist` splice 分支等价物，freedom.go:428-436）。
+///
+/// 上行保持既有用户态泵（Go `buf.Copy(input, writer)`——上行源是 dispatcher
+/// 管道，本就不可 splice）；下行改走内核零拷贝：出站裸 socket → pipe → 入站
+/// 裸 socket（Go `tc.ReadFrom(readerConn)`，proxy.go:768）。调用方须先用
+/// [`xray_common::platform::splice::bridge_splice_admission`] 准入（env + 平台
+/// + CanSpliceCopy 信号 + 双端 raw）；本函数不重复判定。
+///
+/// 平台：splice(2)/pipe2 仅 Linux/Android 编译；其余平台调用方
+/// （DialBridge）在准入判定处已被平台闸门拦截，永不抵达本函数。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub async fn bridge_link_with_stream_downlink_splice<S>(
+    link: Link,
+    stream: S,
+    write_raw: std::sync::Arc<tokio::net::TcpStream>,
+    policy: &TimeoutPolicy,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Connection,
+{
+    use tokio::io::AsyncWriteExt;
+    use xray_buf::io::{Reader, Writer};
+
+    let conn_idle = policy.connection_idle;
+    let uplink_only = policy.uplink_only;
+    let downlink_only = policy.downlink_only;
+
+    // 准入已要求出站 raw；克隆失败（理论不可达）时下行退化为立即结束，
+    // 上行照常泵完（连接可用性不受影响）。
+    let down_from = stream.raw_tcp_clone();
+    let Link { mut reader, mut writer } = link;
+    let (rd_lock, wr_lock) = BiLockHalf::new(stream);
+    let mut s_write = BiWrite(wr_lock);
+    drop(rd_lock); // 下行走 splice，读半部不再需要
+
+    let (up_done_tx, _up_done_rx) = tokio::sync::watch::channel(None::<std::time::Duration>);
+    let (down_done_tx, down_done_rx) = tokio::sync::watch::channel(None::<std::time::Duration>);
+
+    // 上行 = Go buf.Copy(input, writer)（freedom.go:421）：link.reader → 出站，
+    // ConnectionIdle 空闲窗 + 下行结束后的 UplinkOnly 半关闭窗，语义同
+    // [`bridge_link_with_stream_full`] 的上行。
+    let up = async move {
+        let mut down_done = down_done_rx;
+        let mut window: Option<std::time::Duration> = None;
+        loop {
+            let mb = match window {
+                None => tokio::select! {
+                    res = tokio::time::timeout(conn_idle, reader.read_multi_buffer()) => {
+                        match res {
+                            Ok(r) => r,
+                            Err(_) => break,
+                        }
+                    }
+                    _ = down_done.changed() => {
+                        window = *down_done.borrow();
+                        continue;
+                    }
+                },
+                Some(d) => match tokio::time::timeout(d, reader.read_multi_buffer()).await {
+                    Ok(r) => r,
+                    Err(_) => break,
+                },
+            };
+            match mb {
+                Ok(mb) if !mb.is_empty() => {
+                    if write_all_mb(&mut s_write, &mb).await.is_err() {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        let _ = s_write.shutdown().await;
+        let _ = up_done_tx.send(Some(uplink_only));
+        io::Result::Ok(())
+    };
+
+    // 下行 = Go tc.ReadFrom(readerConn)（proxy.go:768）：出站裸 socket 经内核
+    // pipe splice 进入站裸 socket，直到对端 EOF/错误。Go 在进入 splice 时把
+    // 双端 timer 提到 24h（proxy.go:764-767）——即下行无空闲超时，EOF 即终。
+    let down = async move {
+        let res = match down_from {
+            Some(from) => crate::splice::splice_copy(&from, &write_raw)
+                .await
+                .map(|_| ()),
+            None => Ok(()),
+        };
+        writer.shutdown();
+        let _ = down_done_tx.send(Some(downlink_only));
+        res
+    };
+
+    let (up_res, down_res) = tokio::join!(up, down);
+    up_res.and(down_res)
+}
+
 /// 双向桥接两个 dispatcher [`Link`]（xray-buf Reader/Writer）。
 ///
 /// 上行：`link_a.reader` → `link_b.writer`。

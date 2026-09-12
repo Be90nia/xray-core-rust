@@ -379,9 +379,23 @@ impl DispatchHandler for FreedomDispatchBridge {
                     crate::config::blackhole_link(link, &tag, &rule).await;
                     return;
                 }
-                // PROXY protocol 源注入 task-local：DialFn 闭包在本 future 轮询期间执行
-                // （DialBridge::dispatch 不另起 task），scope 覆盖 dial + 头写入。
-                PROXY_PROTO_SRC.scope(src, tcp.dispatch(&check_dest, link)).await;
+                // txno-splice：入站 splice 元数据作用域（Go `session.Inbound.Conn`
+                // 经 ctx 抵达 CopyRawConnIfExist，freedom.go:431-435）。零值
+                // Default（can=0/raw=None）= 准入恒 false，对现状零影响；
+                // DialBridge 桥接判定处经 [`INBOUND_SPLICE::try_with`] 消费。
+                let splice_meta = xray_app_dispatcher::InboundSpliceMeta {
+                    can_splice_copy: access.can_splice_copy,
+                    raw: access.conn,
+                };
+                PROXY_PROTO_SRC
+                    .scope(
+                        src,
+                        xray_app_dispatcher::INBOUND_SPLICE.scope(
+                            splice_meta,
+                            tcp.dispatch(&check_dest, link),
+                        ),
+                    )
+                    .await;
             })
         }
     }

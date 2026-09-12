@@ -170,3 +170,161 @@ async fn reverse_yamux_bridge_to_portal_echo_full_chain() {
     drop(bridge);
     // 不等 portal_task 完成——关闭后 driver 自然 EOF
 }
+
+/// txno④：mux reverse portal 写侧 source/local 端到端（生产类装配）。
+///
+/// 拓扑（全内存 carrier，无网络栈）：
+/// ```text
+/// 用户 conn + AccessContext{from, local}
+///   → PortalOutbound.handle_connection（portal 写侧，解析 from/local）
+///   → mux ClientWorker New 帧（携带 source/local）
+///   → carrier 管道对
+///   → BridgeWorker（bridge 侧 ServerWorker，with_read_source_and_local）
+///   → LinkDispatch::dispatch_link_inbound（记录）
+/// ```
+/// 断言对端收到与入站 ctx 一致的**非空** source/local——此前该通道缺失，
+/// 帧内恒无元数据。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reverse_portal_dispatch_carries_source_local_to_bridge() {
+    use async_trait::async_trait;
+    use parking_lot::Mutex as StdMutex;
+    use xray_app_dispatcher::AccessContext;
+    use xray_app_reverse::{
+        BridgeWorker, LinkDispatch, PortalOutbound, PortalWorker, ReverseError, StaticMuxPicker,
+    };
+    use xray_buf::io::Writer as _;
+    use xray_buf::pipe;
+    use xray_mux::client::{ClientWorker, Link as MuxLink};
+    use xray_mux::session::ClientStrategy;
+    use xray_transport::link::Link as TransportLink;
+
+    const DOMAIN: &str = "portal.example.com";
+
+    /// 记录 bridge 侧收到的 (source, local)；carrier 槽在装配时预置
+    /// （BridgeWorker::new 经 [`LinkDispatch::dispatch`] 取走 carrier link）。
+    #[derive(Default)]
+    struct RecordingDispatch {
+        inbound: StdMutex<Vec<(String, String)>>,
+        carrier: StdMutex<Option<TransportLink>>,
+    }
+
+    #[async_trait]
+    impl LinkDispatch for RecordingDispatch {
+        async fn dispatch(
+            &self,
+            _dest: &Destination,
+            _inbound_tag: Option<&str>,
+        ) -> Result<TransportLink, ReverseError> {
+            self.carrier
+                .lock()
+                .take()
+                .ok_or(ReverseError::NoWorkerAvailable)
+        }
+
+        async fn dispatch_link(
+            &self,
+            _dest: &Destination,
+            _link: TransportLink,
+            _inbound_tag: Option<&str>,
+        ) -> Result<(), ReverseError> {
+            Ok(())
+        }
+
+        async fn dispatch_link_inbound(
+            &self,
+            _dest: &Destination,
+            _link: TransportLink,
+            _inbound_tag: Option<&str>,
+            source: Option<&Destination>,
+            local: Option<&Destination>,
+        ) -> Result<(), ReverseError> {
+            let fmt = |d: Option<&Destination>| {
+                d.map(|x| format!("{}:{}", x.address(), x.port().value()))
+                    .unwrap_or_default()
+            };
+            self.inbound.lock().push((fmt(source), fmt(local)));
+            Ok(())
+        }
+    }
+
+    // ---- carrier：两对管道接通 portal ClientWorker ↔ bridge frame loop ----
+    // pair1 (bridge→portal)：s_write → c_read；pair2 (portal→bridge)：c_write → s_read
+    let (c_read, s_write) = pipe::new();
+    let (s_read, c_write) = pipe::new();
+    let client = ClientWorker::new(
+        MuxLink {
+            reader: Box::new(c_read),
+            writer: Box::new(c_write),
+        },
+        ClientStrategy::default(),
+    );
+    let picker: Arc<StaticMuxPicker<Arc<PortalWorker>>> = Arc::new(StaticMuxPicker::new());
+    let portal_worker = PortalWorker::new(client).expect("portal worker");
+    picker.add_worker(portal_worker);
+    let portal = PortalOutbound::new("portal_out".into(), picker, DOMAIN.into());
+
+    // ---- bridge 侧：BridgeWorker 挂 carrier 另一半 ----
+    let recorder = Arc::new(RecordingDispatch {
+        inbound: StdMutex::new(Vec::new()),
+        carrier: StdMutex::new(Some(TransportLink::new(
+            Box::new(s_read),
+            Box::new(s_write),
+        ))),
+    });
+    let _bridge = BridgeWorker::new(DOMAIN, "bridge-tag", recorder.clone())
+        .await
+        .expect("bridge worker");
+
+    // ---- 用户连接：access 带 from/local，经 portal 派发进 carrier ----
+    let user_dest = Destination::new(
+        Address::ipv4(std::net::Ipv4Addr::new(9, 9, 9, 9)),
+        Port::new(5201),
+        Network::TCP,
+    );
+    let (u_r, mut u_w) = pipe::new();
+    let (resp_r, resp_w) = pipe::new();
+    let access = AccessContext {
+        from: "203.0.113.7:5555".into(),
+        local: "198.51.100.1:443".into(),
+        ..Default::default()
+    };
+    portal
+        .handle_connection(
+            &user_dest,
+            TransportLink::new(Box::new(u_r), Box::new(resp_w)),
+            &access,
+        )
+        .await
+        .expect("portal handle_connection");
+
+    // 写点上行数据：确保用户子会话的 New 帧尽快发出
+    u_w.write_multi_buffer(MultiBuffer::from_buffer(xray_buf::buffer::Buffer::from_vec(
+        b"hello-bridge".to_vec(),
+    )))
+    .await
+    .expect("write uplink");
+
+    // ---- 断言：bridge 侧收到真实非空 source/local ----
+    let got = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = recorder.inbound.lock().clone();
+            if let Some(entry) =
+                snapshot.into_iter().find(|(s, l)| !s.is_empty() && !l.is_empty())
+            {
+                return entry;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("bridge side must receive source/local within timeout");
+    assert_eq!(
+        got,
+        (
+            "203.0.113.7:5555".to_string(),
+            "198.51.100.1:443".to_string()
+        )
+    );
+
+    let _ = resp_r;
+}

@@ -322,11 +322,14 @@ where
             }
         };
         // per-user stats 上下文（Go inbound.go Process 认证后 ctx 带 user）：
-        // from=客户端源地址，email/level=认证用户。
+        // from=客户端源地址，email/level=认证用户。local=入站本地地址
+        // （Go session.Inbound.Local；txno④ reverse mux portal 写侧随 New
+        // 帧下发 source/local 的 Local 来源）。
         let access = xray_app_dispatcher::AccessContext {
             from: peer.to_string(),
             email: decoded.user.as_ref().map_or(String::new(), |u| u.email.clone()),
             level: decoded.user.as_ref().map_or(0, |u| u.level),
+            local: local.to_string(),
             ..Default::default()
         };
         return finish_vless_dispatch(

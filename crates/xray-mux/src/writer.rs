@@ -33,6 +33,10 @@ pub struct MuxWriter {
     has_error: bool,
     transfer_type: TransferType,
     global_id: Option<[u8; 8]>,
+    /// Reverse-mux 入站元数据（Go `Writer.inbound *session.Inbound`，
+    /// writer.go:23）。New 帧写出 source/local（Go frame.go:87-99），与
+    /// GlobalID 互斥（frame.go:100 else 分支）。txno④ portal 写侧消费。
+    inbound: Option<(Destination, Destination)>,
 }
 
 impl MuxWriter {
@@ -55,7 +59,16 @@ impl MuxWriter {
             has_error: false,
             transfer_type,
             global_id,
+            inbound: None,
         }
+    }
+
+    /// 携带 Reverse-mux 入站 source/local（Go `NewWriter(..., inbound)` 的
+    /// inbound 参数；client.go:268-271 仅 `IsReverseMuxFromContext` 时传入）。
+    #[must_use]
+    pub fn with_inbound(mut self, source: Destination, local: Destination) -> Self {
+        self.inbound = Some((source, local));
+        self
     }
 
     /// 创建新的响应写入器（服务端从 carrier 写到客户端方向）。
@@ -72,6 +85,7 @@ impl MuxWriter {
             has_error: false,
             transfer_type,
             global_id: None,
+            inbound: None,
         }
     }
 
@@ -89,16 +103,24 @@ impl MuxWriter {
             SessionStatus::New
         };
         let mut meta = FrameMetadata::new(self.id, status, Bitmask::default());
-        if let Some(ref dest) = self.dest {
+        if let Some(dest) = &self.dest {
             meta.set_target(dest.clone());
         }
         if let Some(gid) = self.global_id {
             meta.set_global_id(gid);
         }
+        // Reverse-mux：New 帧携带 source/local（Go frame.go:87-99 写出；
+        // Keep 帧不带——Go Writer 的 inbound 虽挂在每帧 meta 上，但 WriteTo
+        // 仅 SessionStatusNew 分支序列化它）。
+        if status == SessionStatus::New {
+            if let Some((source, local)) = &self.inbound {
+                meta.set_inbound(source.clone(), local.clone());
+            }
+        }
         meta
     }
+
     /// 仅写入元数据帧
-    ///
     /// 小于缓冲区半容量的数据帧会被 `BufferedWriter` 滞留——每次写入后
     /// `flush()`，避免首包/小包滞留 carrier 队列（Go 等价 `buf.Writer` 直透）。
     async fn write_meta_only(&mut self) -> Result<(), MuxError> {
