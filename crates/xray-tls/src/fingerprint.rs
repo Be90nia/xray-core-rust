@@ -4,9 +4,9 @@
 //! `GetFingerprint` 函数。
 //!
 //! # 现状
-//! **握手走标准 rustls**。`Fingerprint` enum 现在作为标记传递——`u_client` 工厂
-//! 当前 fallback 到标准 rustls 握手（fingerprint 仅作 log），真实 uTLS ClientHello 指纹
-//! 伪装待 REALITY 任务再评估 watfaq-rustls git 依赖。
+//! `Fingerprint` 由 [`get_fingerprint`](crate::fingerprint::get_fingerprint) 解析后，
+//! 经 `utls::u_client` 走 btls（BoringSSL）真实 uTLS ClientHello 指纹握手；
+//! 清单外指纹硬错（见 `btls_client::connector_for_fingerprint`）。
 //!
 //! 本模块翻译「配置层指纹名 → 内部枚举」的纯路由逻辑，让上层
 //! （dispatcher/dns/router/proxyman）能基于 `Fingerprint` 类型工作。

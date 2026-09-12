@@ -8,8 +8,9 @@
 //! 走标准 [`rustls`] 0.23 + [`tokio_rustls`] 0.26：
 //! - [`client`]：标准客户端握手，返回 [`Conn`]
 //! - [`server`]：标准服务端握手，返回 [`ServerConn`]
-//! - [`u_client`]：fallback 到标准 rustls，返回携带 `Fingerprint` 标记的 [`UConn`]
-//!   （真实 uTLS ClientHello 指纹伪装待 REALITY 任务再评估 watfaq-rustls git 依赖）
+//! - [`u_client`]：btls（BoringSSL）真实浏览器指纹握手，返回携带 `Fingerprint`
+//!   标记的 [`UConn`]；清单外指纹硬错（不静默回退）。ALPN 覆盖变体见
+//!   [`u_client_with_alpn`]（ws/httpupgrade WebsocketHandshakeContext 语义）
 //!
 //! 工厂函数 async——握手在工厂内部完成；返回的 Conn/UConn 已是已握手连接。
 //!
@@ -502,19 +503,40 @@ pub async fn u_client<S>(
     config: Arc<ClientConfig>,
     fingerprint: Fingerprint,
     ech_config_list: Option<&str>,
-    // btls 回接验证（pz6c）：`tlsSettings` 原文，内部构建服务端证书验证器
-    // （allowInsecure/pinned/vcn/用户根，语义同 rustls 路径）。
     security_json: Option<&serde_json::Value>,
 ) -> io::Result<UConn<S>>
 where
     S: Connection + Unpin,
 {
+    u_client_with_alpn(stream, server_name, config, fingerprint, ech_config_list, security_json, None).await
+}
+
+/// [`u_client`] 的 ALPN 覆盖版（ws/httpupgrade 出站接线用，md5i）。
+///
+/// 对应 Go `tls.UClient` + `UConn.WebsocketHandshakeContext`（websocket/
+/// httpupgrade dialer 共用，tls.go:98-133）：指纹模板的其余 ClientHello 形态
+/// 保持，仅把 ALPN 扩展重写为 `alpn`；`None` = 保持模板 ALPN。
+pub async fn u_client_with_alpn<S>(
+    stream: S,
+    server_name: &str,
+    config: Arc<ClientConfig>,
+    fingerprint: Fingerprint,
+    ech_config_list: Option<&str>,
+    // btls 回接验证（pz6c）：`tlsSettings` 原文，内部构建服务端证书验证器
+    // （allowInsecure/pinned/vcn/用户根，语义同 rustls 路径）。
+    security_json: Option<&serde_json::Value>,
+    alpn: Option<&[Vec<u8>]>,
+) -> io::Result<UConn<S>>
+where
+    S: Connection + Unpin,
+{
+    let alpn_wire = alpn.map(|a| encode_alpn_wire(&a));
     // 尝试 btls（真实指纹）
     if let Some(result) = crate::btls_client::connector_for_fingerprint(&fingerprint) {
         match result {
             Ok(_) => {
                 debug!(target: "xray_tls::utls", ?fingerprint, server_name, "u_client: 尝试 btls 指纹伪装");
-                match crate::btls_client::BtlsConn::connect(
+                match crate::btls_client::BtlsConn::connect_with_alpn(
                     stream,
                     server_name,
                     fingerprint,
@@ -522,6 +544,7 @@ where
                     // 回接证书验证（pz6c）：allowInsecure=true → None 跳过；
                     // 否则 webpki/pinned verifier 对 btls peer 链做链+主机名验证。
                     crate::client_config::build_server_cert_verifier(security_json)?,
+                    alpn_wire.as_deref(),
                 )
                 .await
                 {
@@ -542,7 +565,6 @@ where
             }
         }
     }
-
     // rustls fallback：无 ECH 能力（rustls 无该 feature），配置了 ECH 时 warn。
     if let Some(list) = ech_config_list {
         tracing::warn!(
@@ -554,6 +576,40 @@ where
     debug!(target: "xray_tls::utls", ?fingerprint, server_name, "u_client: rustls fallback");
     let inner = client(stream, server_name, config).await?;
     Ok(UConn { inner: UConnInner::Rustls(inner), fingerprint })
+}
+
+
+/// ALPN 协议列表 → openssl wire 格式（每项前缀单字节长度）。
+fn encode_alpn_wire(protocols: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(protocols.iter().map(|p| p.len() + 1).sum());
+    for p in protocols {
+        out.push(p.len() as u8);
+        out.extend_from_slice(p);
+    }
+    out
+}
+
+/// ws/httpupgrade 出站的握手 ALPN（Go `WebsocketHandshakeContext` +
+/// `WithNextProto("http/1.1")` 语义，tls.go:98-104 + config.go:506-511）。
+///
+/// 用户 `tlsSettings.alpn` 恰为 `["h2","http/1.1"]`（伪装场景）→ 原样保留；
+/// 其余情形（未配置 / 其他组合）→ 强制 `["http/1.1"]`（upgrade 是 HTTP/1.1
+/// 语义，h2 协商会令 h1 upgrade 帧解析失败）。
+#[must_use]
+pub fn websocket_handshake_alpn(security_json: Option<&serde_json::Value>) -> Vec<Vec<u8>> {
+    let user: Option<Vec<Vec<u8>>> = security_json
+        .and_then(|j| j.get("alpn"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str().map(|x| x.as_bytes().to_vec()))
+                .collect()
+        });
+    let h2_h1 = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    match user {
+        Some(a) if a == h2_h1 => a,
+        _ => vec![b"http/1.1".to_vec()],
+    }
 }
 
 /// 默认 `ClientConfig`：使用 webpki-roots 系统 root + ring provider。
@@ -675,6 +731,44 @@ mod tests {
         let mut buf = Vec::new();
         u.read_to_end(&mut buf).await.expect("read ok");
         assert_eq!(buf, b"u-insecure-ok\n");
+    }
+
+    /// md5i：websocket_handshake_alpn —— Go `WebsocketHandshakeContext` +
+    /// `WithNextProto("http/1.1")` 的 ALPN 解析语义。
+    #[test]
+    fn websocket_handshake_alpn_forces_h1_unless_h2_camouflage() {
+        // 未配置 → 强制 http/1.1（WithNextProto 缺省）
+        assert_eq!(
+            websocket_handshake_alpn(None),
+            vec![b"http/1.1".to_vec()]
+        );
+        assert_eq!(
+            websocket_handshake_alpn(Some(&serde_json::json!({}))),
+            vec![b"http/1.1".to_vec()]
+        );
+        // 伪装组合 ["h2","http/1.1"] → 原样保留
+        assert_eq!(
+            websocket_handshake_alpn(Some(&serde_json::json!({"alpn": ["h2", "http/1.1"]}))),
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+        // 其他组合（如仅 ["h2"]）→ Go 强制回 http/1.1
+        assert_eq!(
+            websocket_handshake_alpn(Some(&serde_json::json!({"alpn": ["h2"]}))),
+            vec![b"http/1.1".to_vec()]
+        );
+    }
+
+    /// md5i：encode_alpn_wire —— openssl wire 格式（每项单字节长度前缀）。
+    #[test]
+    fn encode_alpn_wire_prepends_lengths() {
+        assert_eq!(
+            encode_alpn_wire(&[b"http/1.1".to_vec()]),
+            b"\x08http/1.1".to_vec()
+        );
+        assert_eq!(
+            encode_alpn_wire(&[b"h2".to_vec(), b"http/1.1".to_vec()]),
+            b"\x02h2\x08http/1.1".to_vec()
+        );
     }
 
     #[tokio::test]

@@ -59,9 +59,12 @@ pub struct DialOptions<'a> {
     /// TLS SNI（`tlsSettings.serverName`）。None 用 destination 地址。
     /// Go：拨号目标（dest）与 SNI 解耦（CDN/argo 场景 SNI/Host 是配置域名）。
     pub tls_server_name: Option<String>,
-    /// tlsSettings.fingerprint。字段保留但接线禁用：配置被有意忽略（恒走
-    /// 标准 rustls），原因见 `dial` 内历史禁区注释。
+    /// tlsSettings.fingerprint。接线（md5i）：解析成功（含缺省 → Go
+    /// `GetFingerprint("")` 默认 chrome）即走 btls uTLS + ALPN http/1.1 重写；
+    /// 非法指纹名 → Go `GetFingerprint` nil 语义 → 标准 rustls。
     pub fingerprint: Option<String>,
+    /// `tlsSettings` 原文（证书验证 verifier 构建 + ALPN 伪装解析用）。
+    pub security_json: Option<serde_json::Value>,
 }
 
 /// 完成 WS 握手并返回字节流包装。
@@ -95,15 +98,36 @@ pub async fn dial(
     tcp.set_nodelay(true).ok();
     let stream: Box<dyn xray_transport::connection::Connection> = match opts.tls_config {
         Some(cfg) => {
+            // Go dialer.go:79-99：fingerprint 解析成功即走 tls.UClient +
+            // WebsocketHandshakeContext（指纹名缺省 → chrome 默认；非法名 →
+            // GetFingerprint nil → 标准 TLS）。md5i 接线：btls 真实指纹 + ALPN
+            // 重写 http/1.1（2026-09-06 回归根因 = chrome 模板 ALPN h2 被 CDN
+            // 协商，h1 upgrade 帧解析失败；ALPN 修复见 connect_with_alpn）。
             let sni = opts.tls_server_name.as_deref().unwrap_or(host.as_str());
             let inner = Box::new(xray_transport::connection::TcpConnection::new(tcp))
                 as Box<dyn xray_transport::connection::Connection>;
-            // 禁区: ws/httpupgrade 的 u_client 接线实测 VPS 15 节点 Connection reset (2026-09-06
-            // run_full32 17/32), btls 与该类端点不兼容, 启用前须先解决 btls 层兼容性 — fingerprint
-            // 被有意忽略, 恒走 rustls。
             let tls_stream: Box<dyn xray_transport::connection::Connection> =
-                Box::new(xray_tls::utls::client(inner, sni, cfg).await?);
-            Box::new(tls_stream)
+                match xray_tls::fingerprint::get_fingerprint(
+                    opts.fingerprint.as_deref().unwrap_or(""),
+                ) {
+                    Ok(fp) => {
+                        let alpn =
+                            xray_tls::utls::websocket_handshake_alpn(opts.security_json.as_ref());
+                        Box::new(xray_tls::utls::u_client_with_alpn(
+                            inner,
+                            sni,
+                            cfg,
+                            fp,
+                            None,
+                            opts.security_json.as_ref(),
+                            Some(&alpn),
+                        )
+                        .await?) as Box<dyn xray_transport::connection::Connection>
+                    }
+                    Err(_) => Box::new(xray_tls::utls::client(inner, sni, cfg).await?)
+                        as Box<dyn xray_transport::connection::Connection>,
+                };
+            tls_stream
         },
         None => Box::new(xray_transport::connection::TcpConnection::new(tcp)),
     };
@@ -135,8 +159,10 @@ pub struct DialParams {
     pub tls_config: Option<Arc<rustls::ClientConfig>>,
     /// TLS SNI（`tlsSettings.serverName`）。
     pub tls_server_name: Option<String>,
-    /// `tlsSettings.fingerprint`（有意忽略，见 `dial` 内禁区注释）。
+    /// `tlsSettings.fingerprint`（接线语义同 [`DialOptions::fingerprint`]）。
     pub fingerprint: Option<String>,
+    /// `tlsSettings` 原文（verifier 构建 + ALPN 伪装解析）。
+    pub security_json: Option<serde_json::Value>,
 }
 
 /// 用 owned 参数拨号（内部组 [`DialOptions`] 调 [`dial`]）。
@@ -144,7 +170,8 @@ pub async fn dial_with_params(
     params: DialParams,
     early_data: Option<Vec<u8>>,
 ) -> Result<WsConnection<MaybeTlsStream<Box<dyn xray_transport::connection::Connection>>>> {
-    let DialParams { config, destination, tls_config, tls_server_name, fingerprint } = params;
+    let DialParams { config, destination, tls_config, tls_server_name, fingerprint, security_json } =
+        params;
     dial(DialOptions {
         config: &config,
         destination: &destination,
@@ -152,6 +179,7 @@ pub async fn dial_with_params(
         tls_config,
         tls_server_name,
         fingerprint,
+        security_json,
     })
     .await
 }
@@ -595,6 +623,7 @@ mod tests {
             tls_config: None,
             tls_server_name: None,
             fingerprint: None,
+            security_json: None,
         })
         .await
         .unwrap();
@@ -609,6 +638,7 @@ mod tests {
             tls_config: None,
             tls_server_name: None,
             fingerprint: None,
+            security_json: None,
         })
         .await
         .unwrap();
@@ -618,6 +648,140 @@ mod tests {
     // -------------------------------------------------------------------
     // DelayDialConn：Go dialer.go:168-221 delayDialConn 语义
     // -------------------------------------------------------------------
+
+    // -------------------------------------------------------------------
+    // md5i：fingerprint 接线 — ws TLS 出站 btls 真实指纹 + ALPN 重写
+    // -------------------------------------------------------------------
+
+    use tokio::io::AsyncReadExt as _;
+
+    /// 抓取拨号发来的首个 TLS record（ClientHello）；收满 record 或 EOF 即止。
+    async fn capture_client_hello(listener: tokio::net::TcpListener) -> Vec<u8> {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut chunk))
+                .await
+                .expect("hello read timeout")
+                .unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.len() > 5 && buf[0] == 0x16 {
+                let want = 5 + (usize::from(buf[3]) << 8) + usize::from(buf[4]);
+                if buf.len() >= want {
+                    break;
+                }
+            }
+        }
+        buf
+    }
+
+    async fn hello_for(fingerprint: Option<&str>, alpn: Option<Vec<&str>>) -> Vec<u8> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let d = dest("127.0.0.1", listener.local_addr().unwrap().port());
+        let server = tokio::spawn(capture_client_hello(listener));
+
+        let mut sec = serde_json::json!({});
+        if let Some(fp) = fingerprint {
+            sec["fingerprint"] = serde_json::Value::String(fp.into());
+        }
+        if let Some(alpn) = alpn.as_deref() {
+            sec["alpn"] = serde_json::json!(alpn);
+        }
+        let tls_config = xray_tls::client_config::build_client_config(
+            "tls",
+            Some(&sec),
+            "localhost",
+        )
+        .unwrap()
+        .unwrap();
+        let result = dial(DialOptions {
+            config: &Config::default(),
+            destination: &d,
+            early_data: None,
+            tls_config: Some(tls_config),
+            tls_server_name: Some("localhost".into()),
+            fingerprint: fingerprint.map(String::from),
+            security_json: Some(sec),
+        })
+        .await;
+        assert!(result.is_err(), "capture server drops conn → dial must fail");
+        server.await.unwrap()
+    }
+
+
+    /// 最小 ClientHello 解析：提取 cipher_suites 段（GREASE 判别用）。
+    /// 返回 `(cipher 字节, cipher 数量)`；结构异常返回 None。
+    fn parse_cipher_suites(hello: &[u8]) -> Option<(&[u8], usize)> {
+        if hello.len() < 44 || hello[0] != 0x16 || hello[5] != 0x01 {
+            return None;
+        }
+        let mut c = 43; // record(5) + hs type/len(4) + version(2) + random(32)
+        c += 1 + usize::from(hello[c]); // session_id
+        if c + 3 > hello.len() {
+            return None;
+        }
+        let len = (usize::from(hello[c]) << 8) + usize::from(hello[c + 1]);
+        let suites = hello.get(c + 2..c + 2 + len)?;
+        Some((suites, len / 2))
+    }
+
+    /// chrome 判别：cipher 数量多且含 GREASE（BoringSSL 每连接随机取值，
+    /// 形如 0xXaXa）；rustls 默认 6 cipher 且无 GREASE。
+    fn is_btls_chrome_hello(hello: &[u8]) -> bool {
+        let Some((suites, n)) = parse_cipher_suites(hello) else {
+            return false;
+        };
+        n >= 12
+            && suites
+                .chunks_exact(2)
+                .any(|c| c[0] == c[1] && (c[0] & 0x0f) == 0x0a)
+    }
+
+    /// md5i 验收：ws 出站 fingerprint=chrome → btls 真实 chrome ClientHello
+    /// （多 cipher + GREASE，rustls 从不发送），且用户未配 alpn 时 ALPN 重写为
+    /// 仅 http/1.1（Go `WebsocketHandshakeContext` 语义）。
+    #[tokio::test]
+    async fn dial_tls_fingerprint_chrome_sends_btls_hello_with_h1_alpn() {
+        let hello = hello_for(Some("chrome"), None).await;
+        assert_eq!(hello[0], 0x16, "TLS handshake record");
+        assert!(is_btls_chrome_hello(&hello), "not a btls chrome hello");
+        let mut h1_wire = vec![0x00, 0x09, 0x08];
+        h1_wire.extend_from_slice(b"http/1.1");
+        assert!(
+            hello.windows(h1_wire.len()).any(|w| w == h1_wire.as_slice()),
+            "ALPN must be http/1.1-only"
+        );
+        assert!(
+            !hello.windows(4).any(|w| w == [0x02, b'h', b'2', 0x08]),
+            "h2 must not be offered on ws"
+        );
+    }
+
+    /// 伪装组合：用户 alpn 恰为 ["h2","http/1.1"] → 原样保留（Go 语义）。
+    #[tokio::test]
+    async fn dial_tls_chrome_keeps_h2_h1_alpn_when_configured() {
+        let hello = hello_for(Some("chrome"), Some(vec!["h2", "http/1.1"])).await;
+        assert!(is_btls_chrome_hello(&hello));
+        assert!(
+            hello.windows(4).any(|w| w == [0x02, b'h', b'2', 0x08]),
+            "configured h2+http/1.1 camouflage ALPN must survive"
+        );
+    }
+
+    /// 非法指纹名 → Go GetFingerprint nil 语义 → 标准 rustls（6 cipher 无 GREASE）。
+    #[tokio::test]
+    async fn dial_tls_invalid_fingerprint_falls_back_to_rustls_hello() {
+        let hello = hello_for(Some("nosuchfingerprint"), None).await;
+        assert_eq!(hello[0], 0x16);
+        let (_, n) = parse_cipher_suites(&hello).expect("parseable rustls hello");
+        assert!(n <= 16, "rustls hello must have a small cipher set, got {n}");
+        assert!(!is_btls_chrome_hello(&hello));
+    }
+
 
     use std::{sync::Mutex, time::Duration};
 

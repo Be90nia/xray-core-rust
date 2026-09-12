@@ -284,12 +284,35 @@ async fn dial_httpupgrade(
     let sni = server_name.unwrap_or_else(|| default_sni.clone());
 
     let upgraded_conn: Box<dyn Connection> = if let Some(cfg) = tls_config {
-        // 禁区: ws/httpupgrade 的 u_client 接线实测 VPS 15 节点 Connection reset (2026-09-06 run_full32 17/32), btls 与该类端点不兼容, 启用前须先解决 btls 层兼容性 — fingerprint_name 透传解析保留, 接线恒走 rustls。
-        let _register_passthrough = fingerprint_name(settings);
-        let tls_conn = xray_tls::utls::client(tcp_conn, &sni, cfg)
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("TLS handshake failed: {e}")))?;
-        Box::new(tls_conn)
+        // Go httpupgrade/dialer.go:68-77：fingerprint 解析成功（缺省 → chrome
+        // 默认）即 UClient + WebsocketHandshakeContext（btls 真实指纹 + ALPN
+        // http/1.1 重写）；非法指纹名 → GetFingerprint nil → 标准 TLS。
+        // md5i 接线（2026-09-06 回归根因 = chrome 模板 ALPN h2 被 CDN 协商，
+        // h1 upgrade 帧解析失败；ALPN 重写见 connect_with_alpn）。
+        match xray_tls::fingerprint::get_fingerprint(fingerprint_name(settings)) {
+            Ok(fp) => {
+                let alpn =
+                    xray_tls::utls::websocket_handshake_alpn(settings.security_json.as_ref());
+                let tls_conn = xray_tls::utls::u_client_with_alpn(
+                    tcp_conn,
+                    &sni,
+                    cfg,
+                    fp,
+                    None,
+                    settings.security_json.as_ref(),
+                    Some(&alpn),
+                )
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("TLS handshake failed: {e}")))?;
+                Box::new(tls_conn) as Box<dyn Connection>
+            }
+            Err(_) => {
+                let tls_conn = xray_tls::utls::client(tcp_conn, &sni, cfg)
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("TLS handshake failed: {e}")))?;
+                Box::new(tls_conn) as Box<dyn Connection>
+            }
+        }
     } else {
         tcp_conn
     };
@@ -589,6 +612,79 @@ mod tests {
         // 验证 Connection 可用
         assert!(conn.remote_addr().is_ok());
         server.await.unwrap();
+    }
+
+    /// md5i 验收：httpupgrade 出站 fingerprint=chrome → btls 真实 chrome
+    /// ClientHello（多 cipher + GREASE，rustls 从不发送），ALPN 仅 http/1.1
+    /// （Go `WebsocketHandshakeContext` 语义）。
+    #[tokio::test]
+    async fn dial_tls_fingerprint_chrome_sends_btls_hello_with_h1_alpn() {
+        use xray_common::net::address::Address;
+        use xray_common::net::network::Network;
+        use xray_common::net::port::Port;
+        use std::net::Ipv4Addr;
+        use tokio::io::AsyncReadExt;
+        use std::time::Duration;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk))
+                    .await
+                    .expect("hello read timeout")
+                    .unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > 5 && buf[0] == 0x16 {
+                    let want = 5 + (usize::from(buf[3]) << 8) + usize::from(buf[4]);
+                    if buf.len() >= want {
+                        break;
+                    }
+                }
+            }
+            buf
+        });
+
+        let dest = Destination::new(
+            Address::IPv4(Ipv4Addr::LOCALHOST),
+            Port::new(addr.port()),
+            Network::TCP,
+        );
+        let settings = StreamSettings {
+            protocol: "httpupgrade".to_string(),
+            transport_json: Some(serde_json::json!({"path":"/hu"})),
+            security: "tls".to_string(),
+            security_json: Some(serde_json::json!({"fingerprint": "chrome"})),
+            ..StreamSettings::tcp()
+        };
+        let result = dial_httpupgrade(&dest, &SocketOptions::default(), &settings).await;
+        assert!(result.is_err(), "capture server drops conn → dial must fail");
+
+        let hello = server.await.unwrap();
+        assert_eq!(hello[0], 0x16, "TLS handshake record");
+        let mut c = 43usize;
+        c += 1 + usize::from(hello[c]); // session_id
+        let len = (usize::from(hello[c]) << 8) + usize::from(hello[c + 1]);
+        let suites = &hello[c + 2..c + 2 + len];
+        assert!(len / 2 >= 12, "chrome hello must carry many ciphers");
+        assert!(
+            suites
+                .chunks_exact(2)
+                .any(|s| s[0] == s[1] && (s[0] & 0x0f) == 0x0a),
+            "GREASE cipher absent → not a btls chrome hello"
+        );
+        let mut h1_wire = vec![0x00, 0x09, 0x08];
+        h1_wire.extend_from_slice(b"http/1.1");
+        assert!(
+            hello.windows(h1_wire.len()).any(|w| w == h1_wire.as_slice()),
+            "ALPN must be http/1.1-only"
+        );
     }
 
     /// `?ed=` 端到端往返：path 提取 ed → 客户端 0-RTT（101 前先写 early data）→

@@ -1062,6 +1062,22 @@ impl<S: Connection + Unpin> BtlsConn<S> {
         ech_config_list: Option<&str>,
         verifier: Option<Arc<dyn ServerCertVerifier>>,
     ) -> io::Result<Self> {
+        Self::connect_with_alpn(stream, server_name, fingerprint, ech_config_list, verifier, None).await
+    }
+
+    /// [`connect`] 的 ALPN 覆盖版（ws/httpupgrade 出站接线用，md5i）。
+    ///
+    /// 对应 Go `UConn.WebsocketHandshakeContext`（tls.go:98-133）：保持指纹模板
+    /// 其余 ClientHello 形态，仅把 ALPN 扩展重写为 `alpn_wire`（openssl wire
+    /// 格式，如 `b"\x08http/1.1"`）；`None` = 保持模板 ALPN（原行为）。
+    pub async fn connect_with_alpn(
+        stream: S,
+        server_name: &str,
+        fingerprint: Fingerprint,
+        ech_config_list: Option<&str>,
+        verifier: Option<Arc<dyn ServerCertVerifier>>,
+        alpn_wire: Option<&[u8]>,
+    ) -> io::Result<Self> {
         use crate::ech::ApplyEch;
 
         let fp_config = match connector_for_fingerprint(&fingerprint) {
@@ -1090,6 +1106,12 @@ impl<S: Connection + Unpin> BtlsConn<S> {
             .map_err(|e| io::Error::other(e.to_string()))?;
         if !fp_config.alps.is_empty() {
             ssl.add_application_settings(fp_config.alps)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+        }
+        // ALPN 覆盖（md5i ws/httpupgrade）：SSL_set_alpn_protos 覆盖连接器
+        // 模板的 ALPN（BoringSSL per-SSL 优先于 per-CTX）。指纹其余形态不变。
+        if let Some(alpn) = alpn_wire {
+            ssl.set_alpn_protos(alpn)
                 .map_err(|e| io::Error::other(e.to_string()))?;
         }
         // ECH（加密 ClientHello）：握手前设置 config list

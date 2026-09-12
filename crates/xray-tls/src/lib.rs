@@ -16,8 +16,8 @@
 //!
 //! ## IO 边界与实现状态
 //! - `utls`：标准 rustls 包装的 `Conn`/`UConn`，async 工厂 `client`/`server`/`u_client`
-//!   - `u_client` 当前 fallback 到标准 rustls 握手（`Fingerprint` 仅作 log）
-//!   - 真实 uTLS ClientHello 指纹伪装待 REALITY 任务再评估 watfaq-rustls git 依赖
+//!   - `u_client` 走 btls（BoringSSL）真实浏览器指纹握手；清单外指纹硬错
+//!   - `u_client_with_alpn`：ALPN 覆盖版（ws/httpupgrade，WebsocketHandshakeContext 语义）
 //! - `grpc`：`GrpcUtlsCredentials` trait + 工厂函数（返回标准 rustls fallback）
 //!
 //! ## 后续工作
