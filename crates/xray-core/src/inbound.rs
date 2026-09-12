@@ -109,6 +109,51 @@ pub async fn serve_socks5(
     }
 }
 
+
+/// 入站连接元数据提取（txno④ + txno-splice）。
+///
+/// 对应 Go `session.Inbound` 的三块元数据：`Conn`（raw fd，session.go:52-53）、
+/// `Local`（本地地址）、`CanSpliceCopy`（raw 传输判定，socks server.go:69/73-75）。
+/// [`handle_connection`] 泛型于具体流类型（TCP `TcpStream` / UDS
+/// `Box<dyn Connection>`），本 trait 把「是否裸 TCP / 能否 dup / 本地地址」
+/// 抹平成统一入口。
+trait InboundConnMeta {
+    /// 裸 TCP 时返回 dup 克隆（Go `session.Inbound.Conn`）；非 raw 返回 `None`。
+    fn splice_raw_clone(&self) -> Option<TcpStream>;
+    /// 入站本地地址（Go `session.Inbound.Local`）。
+    fn inbound_local(&self) -> Option<SocketAddr>;
+    /// 是否裸 TCP（Go `proxy.IsRAWTransportWithoutSecurity`，proxy.go:802-809）。
+    fn is_raw_inbound(&self) -> bool;
+}
+
+impl InboundConnMeta for TcpStream {
+    fn splice_raw_clone(&self) -> Option<TcpStream> {
+        xray_transport::connection::dup_tcp_stream(self)
+    }
+    fn inbound_local(&self) -> Option<SocketAddr> {
+        self.local_addr().ok()
+    }
+    fn is_raw_inbound(&self) -> bool {
+        true
+    }
+}
+
+impl InboundConnMeta for Box<dyn xray_transport::connection::Connection> {
+    fn splice_raw_clone(&self) -> Option<TcpStream> {
+        // Connection::is_raw_tcp 缺省 false：TLS/包装层天然拒绝，与 Go 同
+        if self.is_raw_tcp() {
+            self.raw_tcp_clone()
+        } else {
+            None
+        }
+    }
+    fn inbound_local(&self) -> Option<SocketAddr> {
+        self.local_addr().ok().flatten()
+    }
+    fn is_raw_inbound(&self) -> bool {
+        self.is_raw_tcp()
+    }
+}
 /// 处理单个 SOCKS 连接：handshake → dispatch（TCP CONNECT）或 UDP relay。
 ///
 /// 泛型流：TcpStream（TCP 监听）与 UDS `Box<dyn Connection>`（vodx unix
@@ -122,7 +167,7 @@ async fn handle_connection<S>(
     udp_idle: std::time::Duration,
 ) -> std::io::Result<()>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static + InboundConnMeta,
 {
     // 1. SOCKS 握手（兼容 4/4a/5）；受握手限时约束（Go proxy/socks/server.go
     // Process: SetReadDeadline(policy().Timeouts.Handshake)，超时断开；仅覆盖
@@ -162,6 +207,33 @@ where
         SocksRequest::TcpConnect(addr) => {
             // 2. SocksAddr → Destination
             let dest = socks_addr_to_destination(&addr, Network::TCP);
+            // access log（bd 4uu）：from=客户端源地址（对应 Go socks server ctx
+            // ContextWithAccessMessage{From: conn.RemoteAddr()}）；email 留空（无认证），
+            // inbound_tag 由 InboundDispatchHandler 补齐。
+            // txno：local=入站本地地址（Go session.Inbound.Local，④ portal 写侧）；
+            // conn/can_splice_copy=splice 元数据（Go socks server.go:69 `2` + :73-75
+            // 非 raw 翻 3 + :154-156 握手完成翻 1——dispatch 时点即已 1，Go
+            // inbound.Conn 同点挂接）。raw fd 在 split 前取出（dup 克隆）。
+            let access = {
+                let (conn, can) = if stream.is_raw_inbound() {
+                    (
+                        stream.splice_raw_clone().map(Arc::new),
+                        xray_common::platform::splice::CAN_SPLICE_COPY_YES,
+                    )
+                } else {
+                    (None, xray_common::platform::splice::CAN_SPLICE_COPY_NEVER)
+                };
+                xray_app_dispatcher::AccessContext {
+                    from: peer.to_string(),
+                    local: stream
+                        .inbound_local()
+                        .map(|a| a.to_string())
+                        .unwrap_or_default(),
+                    conn,
+                    can_splice_copy: can,
+                    ..Default::default()
+                }
+            };
             // 3. 拆 TcpStream → (read, write) → Link
             // ponytail: tokio::io::split 返回的 ReadHalf/WriteHalf 是 'static + Send,
             // new_reader/new_writer 接受 AsyncRead/AsyncWrite + Unpin + Send + 'static.
@@ -176,13 +248,6 @@ where
                 tokio::spawn(handle_mux_inbound_link(link, Arc::clone(handler), None));
                 return Ok(());
             }
-            // access log（bd 4uu）：from=客户端源地址（对应 Go socks server ctx
-            // ContextWithAccessMessage{From: conn.RemoteAddr()}）；email 留空（无认证），
-            // inbound_tag 由 InboundDispatchHandler 补齐。
-            let access = xray_app_dispatcher::AccessContext {
-                from: peer.to_string(),
-                ..Default::default()
-            };
             let _ = handler.dispatch_with_access(&dest, link, access).await;
             Ok(())
         }

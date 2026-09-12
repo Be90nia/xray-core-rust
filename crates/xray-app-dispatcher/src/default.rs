@@ -325,7 +325,8 @@ pub trait DispatchHandler: Send + Sync + Debug {
     }
 }
 
-/// 入站连接的 access 上下文（对应 Go ctx 中的 `log.AccessMessage`，协议层填充）。
+/// 入站连接的 access 上下文（对应 Go ctx 中的 `log.AccessMessage` + `session.Inbound`，
+/// 协议层填充）。
 ///
 /// `inbound_tag` 由生产入口（InboundDispatchHandler）填充，协议层只需给
 /// `from`（客户端源地址）、`email`（认证用户，无认证协议留空）与 `level`
@@ -345,6 +346,19 @@ pub struct AccessContext {
     /// （Go proxyman inbound.go:177-179）注入，mux 服务端 worker 消费校验
     /// （Go common/mux/server.go:189-192）。
     pub allowed_network: Option<xray_common::net::network::Network>,
+    /// 入站本地地址（Go `session.Inbound.Local`，如 `1.1.1.1:443`）。
+    ///
+    /// txno④：reverse mux portal 写侧随 New 帧下发 source/local（Go
+    /// client.go:268-271 writer 携带 inbound）。空串 = 未提供。
+    pub local: String,
+    /// txno-splice：入站侧在 dispatch 前 `dup` 出的裸连接；`None` = 非 raw
+    /// 传输或未提供（与 Go nil 等价）。[InboundDispatchHandler] 与 outbound
+    /// 间经本字段携带「raw fd 可用性」，freedom 出站桥接判定处消费。
+    /// `Arc` 共享（Go `net.Conn` 即指针语义；TcpStream 非 Clone）。
+    pub conn: Option<Arc<tokio::net::TcpStream>>,
+    /// splice copy 决策信号（Go `session.Inbound.CanSpliceCopy`，session.go:75-77）：
+    /// 1=可，2=处理后可行，3=不可，0=未挂信号（零值 → splice 天然不启用）。
+    pub can_splice_copy: i32,
 }
 
 /// 一次 access 记录（对应 Go `log.AccessMessage` 最终形态）。
@@ -1548,6 +1562,35 @@ pub struct DialBridge {
     /// 可选 policy：None 时 bridge 用 `TimeoutPolicy::default()`。
     /// 由 dispatcher 在装配时通过 [`Self::with_policy`] 注入，按 user_level 查询。
     policy: std::sync::RwLock<Option<xray_features::policy::TimeoutPolicy>>,
+    /// splice 出站信号（Go `ob.CanSpliceCopy = 1`，freedom.go:260 唯一置 1 点）。
+    ///
+    /// 仅 freedom 装配置 true（xray-core outbound.rs freedom 分支）；代理链
+    /// 激活时本标志不生效（Go 链上后续出站 CanSpliceCopy=2/3 天然拒绝）。
+    splice_outbound: std::sync::atomic::AtomicBool,
+    /// 最近一次 dispatch 的 splice 准入结果（[`Self::splice_admitted`] 读；
+    /// Arc 便于 dispatch future（'static）捕获落盘）。
+    splice_admitted: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// 入站 splice 元数据的 dispatch 作用域通道（txno-splice）。
+///
+/// 对应 Go `session.InboundFromContext(ctx).Conn`——入站 raw fd 经 dispatcher
+/// ctx 抵达出站桥接判定点。生产链：入站协议层把 `dup` 克隆 + CanSpliceCopy
+/// 放进 [`AccessContext`] → freedom 出站（[`crate::AccessContext`] 消费者）
+/// 在 `tcp.dispatch` 外层 `.scope(...)` → [`DialBridge::dispatch`] 桥接判定处
+/// `try_with` 读取。模式与 freedom 的 `PROXY_PROTO_SRC` task-local 一致。
+#[derive(Debug, Clone, Default)]
+pub struct InboundSpliceMeta {
+    /// Go `session.Inbound.CanSpliceCopy`（1=可）。
+    pub can_splice_copy: i32,
+    /// 入站裸 TCP 克隆（Go `session.Inbound.Conn`，Arc 共享——TcpStream 非
+    /// Clone，且 Go `net.Conn` 本就是指针语义）。
+    pub raw: Option<Arc<tokio::net::TcpStream>>,
+}
+
+tokio::task_local! {
+    /// 当前 dispatch 的入站 splice 元数据；未 scope 时为 `None`。
+    pub static INBOUND_SPLICE: InboundSpliceMeta;
 }
 
 /// 代理链配置。
@@ -1569,7 +1612,26 @@ impl DialBridge {
                 outbound_manager: None,
             }),
             policy: std::sync::RwLock::new(None),
+            splice_outbound: std::sync::atomic::AtomicBool::new(false),
+            splice_admitted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// 最近一次 dispatch 的 splice 准入结果（Go `CopyRawConn splice` debug
+    /// 日志的可观测对应物；并发 dispatch 下为最后完成者，测试/诊断用）。
+    #[must_use]
+    pub fn splice_admitted(&self) -> bool {
+        self.splice_admitted
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 标记本桥为 splice 出站（Go `ob.CanSpliceCopy = 1`，freedom.go:260）。
+    ///
+    /// 仅 freedom 装配调用（xray-core outbound.rs freedom 分支）。用 `&self`
+    /// 因为 handler 注册后才能到达协议分支。
+    pub fn set_splice_outbound(&self, enabled: bool) {
+        self.splice_outbound
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 注入 per-dispatch 桥接 policy（bd 4-6：bridge 数据面超时接 policy）。
@@ -1648,9 +1710,49 @@ impl DispatchHandler for DialBridge {
         let tag = self.tag.clone();
         let dest = dest.clone();
         let policy = self.current_policy();
+        let splice_out =
+            self.splice_outbound.load(std::sync::atomic::Ordering::Relaxed);
+        let splice_admitted = Arc::clone(&self.splice_admitted);
         Box::pin(async move {
             match dial(&dest).await {
                 Ok(remote) => {
+                    // splice 快路径判定（txno-splice，Go freedom.go:428-436 +
+                    // proxy.go:718-751 的等价判定点）：入站元数据经
+                    // [`INBOUND_SPLICE`] 抵达，出站信号 = splice_out（freedom
+                    // 装配唯一置位点）。判定跨平台照跑（Windows 由平台闸门
+                    // 恒 false），准入了才走零拷贝泵，其余一律回退既有桥。
+                    let inbound = INBOUND_SPLICE
+                        .try_with(Clone::clone)
+                        .unwrap_or_default();
+                    let admitted = splice_out
+                        && xray_common::platform::splice::bridge_splice_admission(
+                            inbound.can_splice_copy,
+                            xray_common::platform::splice::CAN_SPLICE_COPY_YES,
+                            inbound.raw.is_some(),
+                            remote.is_raw_tcp(),
+                        );
+                    splice_admitted.store(admitted, std::sync::atomic::Ordering::Relaxed);
+                    tracing::debug!(
+                        admitted,
+                        inbound_can = inbound.can_splice_copy,
+                        inbound_raw = inbound.raw.is_some(),
+                        outbound_raw = remote.is_raw_tcp(),
+                        "dial bridge splice admission"
+                    );
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    if admitted {
+                        if let Some(inbound_raw) = inbound.raw {
+                            if let Err(e) = xray_transport::bridge::bridge_link_with_stream_downlink_splice(
+                                    link, remote, inbound_raw, &policy,
+                                )
+                                .await
+                            {
+                                tracing::warn!(tag = %tag, "splice bridge ended: {e}");
+                            }
+                            return;
+                        }
+                    }
+                    let _ = &inbound; // 非 Linux：元数据仅参与判定日志
                     if let Err(e) = bridge_link_with_stream_full(link, remote, &policy).await {
                         tracing::warn!(tag = %tag, "bridge ended: {e}");
                     }
@@ -2488,6 +2590,7 @@ mod tests {
             inbound_tag: "vless-in".into(),
             level: 0,
             allowed_network: None,
+            ..Default::default()
         };
         d.dispatch_link(&dest, outbound, &SniffingRequest::default(), Some(access), None)
             .expect("dispatch_link ok");
@@ -3293,6 +3396,7 @@ mod tests {
             inbound_tag: "socks-in".into(),
             level: 0,
             allowed_network: None,
+            ..Default::default()
         };
         d.dispatch_link(&access_dest(), link, &SniffingRequest::default(), Some(access), None)
             .expect("dispatch_link ok");
@@ -3382,6 +3486,7 @@ mod tests {
             inbound_tag: "socks-in".into(),
             level: 0,
             allowed_network: None,
+            ..Default::default()
         };
         let res = d.dispatch_link(&access_dest(), link, &SniffingRequest::default(), Some(access), None);
         assert!(res.is_err(), "no handler should be a sync error");
@@ -4083,5 +4188,142 @@ mod tests {
             started.elapsed()
         );
     }
+    /// txno-splice：DialBridge 桥接判定点的 splice 路径（平台/环境感知断言）。
+    ///
+    /// 复刻生产装配：freedom 出站置 `set_splice_outbound(true)`，入站元数据经
+    /// `INBOUND_SPLICE` scope（freedom `PROXY_PROTO_SRC` 同模式），出站为真裸
+    /// TCP。断言随 [`xray_common::platform::splice::splice_allowed`] 的真实
+    /// 判定分叉：
+    /// - **准入了**（Linux/Android + `XRAY_BUF_SPLICE=1`，容器床跑法）：
+    ///   下行零拷贝直达入站 raw fd——**绕过 link.writer 正是 splice 的语义**
+    ///   （Go responseDone 直写 inbound.Conn）——echo 必须从入站 raw conn 读到，
+    ///   且 `splice_admitted()==true`；
+    /// - **未准入**（Windows/macOS 平台闸门，或 env 未开）：回退既有泵，
+    ///   echo 经 link.writer 流通，`splice_admitted()==false`。
+    ///
+    /// 激活路径跑法（容器床）：`XRAY_BUF_SPLICE=1 cargo test -p
+    /// xray-app-dispatcher --lib dialbridge`。
+    #[tokio::test]
+    async fn dialbridge_splice_gated_falls_back_and_flows() {
+        use std::net::SocketAddr;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // echo server（出站目标）
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 64];
+                    while let Ok(n) = sock.read(&mut buf).await {
+                        if n == 0 || sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        // dial → 真裸 TCP（outbound_raw = true，信号面全绿）
+        let dial: DialFn = Arc::new(move |_dest: &Destination| {
+            Box::pin(async move {
+                let stream = tokio::net::TcpStream::connect(echo_addr)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(Box::new(xray_transport::connection::TcpConnection::new(stream))
+                    as Box<dyn Connection>)
+            })
+        });
+        let bridge = DialBridge::new("splice-freedom", dial);
+        // 入站元数据：can=1 + raw fd（dup 克隆，跨平台可用；原件保活供
+        // splice 激活路径读回下行数据——dup 与原件同 socket）
+        let mut in_raw = tokio::net::TcpStream::connect(echo_addr).await.unwrap();
+        let meta = InboundSpliceMeta {
+            can_splice_copy: xray_common::platform::splice::CAN_SPLICE_COPY_YES,
+            raw: Some(Arc::new(
+                xray_transport::connection::dup_tcp_stream(&in_raw).unwrap(),
+            )),
+        };
+        // Go freedom.go:260 唯一置 1 点（xray-core outbound.rs freedom 分支同款）
+        bridge.set_splice_outbound(true);
+        // 判定交叉断言基准（含 env+平台闸门，与 DialBridge 内部同输入）
+        let expected_admitted = xray_common::platform::splice::bridge_splice_admission(
+            meta.can_splice_copy,
+            xray_common::platform::splice::CAN_SPLICE_COPY_YES,
+            meta.raw.is_some(),
+            true,
+        );
+
+        let (up_r, up_w) = xray_buf::pipe::new();
+        let (dn_r, dn_w) = xray_buf::pipe::new();
+        let link = xray_transport::link::Link::new(
+            Box::new(up_r) as Box<dyn xray_buf::io::Reader>,
+            Box::new(dn_w) as Box<dyn xray_buf::io::Writer>,
+        );
+        let dest = Destination::new(
+            Address::new_domain("splice.example.com".to_string()),
+            Port::new(443),
+            Network::TCP,
+        );
+
+        // freedom scope 模式：INBOUND_SPLICE.scope(meta, dial_bridge.dispatch(...))
+        let dispatch_task = tokio::spawn(INBOUND_SPLICE.scope(meta, bridge.dispatch(&dest, link)));
+        let mut up_w = up_w;
+        let writer_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let mut mb = MultiBuffer::new();
+            mb.merge_bytes(b"ping-splice");
+            up_w.write_multi_buffer(mb).await.unwrap();
+        });
+        writer_task.await.unwrap();
+
+        // 等判定落盘（dial + 判定在 bridge 数据面前完成）
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let admitted = bridge.splice_admitted();
+        assert_eq!(
+            admitted, expected_admitted,
+            "DialBridge 判定必须与 bridge_splice_admission 基准一致"
+        );
+        if admitted {
+            // splice 激活：下行直达入站 raw fd（绕过 link.writer）
+            let mut echo_buf = [0u8; 11];
+            tokio::time::timeout(std::time::Duration::from_secs(5), in_raw.read_exact(&mut echo_buf))
+                .await
+                .expect("splice 下行必须在超时内抵达入站 raw conn")
+                .expect("read raw");
+            assert_eq!(&echo_buf, b"ping-splice", "splice 路径下行必须直达入站 raw conn");
+            // link.writer 方向不得再收到数据（splice 绕行语义）
+            let mut dn_r = dn_r;
+            let leaked = tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                dn_r.read_multi_buffer(),
+            )
+            .await;
+            assert!(leaked.is_err(), "splice 激活时 link.writer 不应承载下行");
+        } else {
+            // 回退泵：echo 经 link.writer 双向流通
+            let mut dn_r = dn_r;
+            let resp = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                dn_r.read_multi_buffer(),
+            )
+            .await
+            .expect("echo within timeout")
+            .expect("read ok");
+            let mut out = Vec::new();
+            for b in resp.iter() {
+                out.extend_from_slice(b.bytes());
+            }
+            assert_eq!(out, b"ping-splice", "回退泵必须双向流通");
+        }
+
+        // 收尾：拆 pipe → 桥结束（up_w 已随 writer_task 结束而 drop）
+        let _ = in_raw.shutdown().await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), dispatch_task).await;
+    }
 }
+
 

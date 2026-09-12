@@ -730,6 +730,9 @@ fn build_protocol_handler(
             if let Some(p) = bridge_policy {
                 tcp_bridge.with_policy(p.clone());
             }
+            // txno-splice：freedom 是 Go `ob.CanSpliceCopy = 1`（freedom.go:260）
+            // 的唯一置 1 点——DialBridge 桥接判定处据此放行 splice 快路径准入。
+            tcp_bridge.set_splice_outbound(true);
             let mut bridge = xray_proxy_freedom::FreedomDispatchBridge::from_bridge(
                 Arc::clone(&tcp_bridge),
             )
@@ -1127,7 +1130,7 @@ impl DispatchHandler for MuxBridge {
                 return;
             };
             let inner = xray_mux::client::Link { reader: link.reader, writer: link.writer };
-            if !worker.dispatch_with_source(&dest, inner, Some(&input)).await {
+            if !worker.dispatch_with_source(&dest, inner, Some(&input), None).await {
                 tracing::warn!(tag = %tag, "mux dispatch: worker full, dropping link");
             }
         })

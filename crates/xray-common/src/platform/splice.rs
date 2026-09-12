@@ -46,14 +46,68 @@ pub fn signals_allow_splice(inbound_can: i32, outbounds_can: &[i32]) -> bool {
 pub fn splice_allowed(inbound_can: i32, outbounds_can: &[i32]) -> bool {
     platform_supported() && use_splice() && signals_allow_splice(inbound_can, outbounds_can)
 }
+/// 信号 + 双端裸 TCP 真值（不含 env/平台，跨平台可测）。
+///
+/// Go `CopyRawConnIfExist`（proxy.go:718-751）的准入核心：
+/// - CanSpliceCopy：inbound == 1 且 outbound == 1（0/2/3 均回退，proxy.go:746-750）；
+/// - 双端 raw TCP（freedom.go:428 `IsRAWTransportWithoutSecurity(conn)` +
+///   `inbound.Conn != nil`，freedom.go:433-435）。
+#[must_use]
+pub fn splice_raw_gate(
+    inbound_can: i32,
+    outbound_can: i32,
+    inbound_raw: bool,
+    outbound_raw: bool,
+) -> bool {
+    signals_allow_splice(inbound_can, &[outbound_can]) && inbound_raw && outbound_raw
+}
+
+/// 生产 bridge splice 准入总闸门（环境 + 平台 + [`splice_raw_gate`]）。
+///
+/// 消费点：`DialBridge::dispatch` 桥接判定处（Go freedom responseDone 调
+/// `CopyRawConnIfExist` 的等价位置）。Windows/macOS 恒 false（泵未编译），
+/// 但判定本身照跑——准入门控日志/断言即本函数的返回值。
+#[must_use]
+pub fn bridge_splice_admission(
+    inbound_can: i32,
+    outbound_can: i32,
+    inbound_raw: bool,
+    outbound_raw: bool,
+) -> bool {
+    platform_supported() && use_splice() && splice_raw_gate(inbound_can, outbound_can, inbound_raw, outbound_raw)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn test_splice_raw_gate_truth_table() {
+        // 双端信号 + 双端 raw 的完整真值表（Go proxy.go:746-750 + freedom.go:428-435）
+        assert!(splice_raw_gate(1, 1, true, true));
+        // 任一端非 raw → 拒（包装层穿透克隆也不行，IsRAWTransportWithoutSecurity）
+        assert!(!splice_raw_gate(1, 1, false, true));
+        assert!(!splice_raw_gate(1, 1, true, false));
+        assert!(!splice_raw_gate(1, 1, false, false));
+        // 信号不足 → 拒（零值 0 / vless 2 / 3）
+        assert!(!splice_raw_gate(0, 1, true, true));
+        assert!(!splice_raw_gate(1, 0, true, true));
+        assert!(!splice_raw_gate(2, 1, true, true));
+        assert!(!splice_raw_gate(1, 3, true, true));
+        assert!(!splice_raw_gate(3, 1, true, true));
+    }
+
+    #[test]
+    fn test_bridge_admission_platform_gate() {
+        // 信号/真值全绿时：非 Linux/Android 平台总闸门恒关（泵未编译）；
+        // Linux/Android 上由 env 闸门决定（CI 容器内覆盖实测）。
+        if !platform_supported() {
+            assert!(!bridge_splice_admission(1, 1, true, true));
+        }
+    }
+
+    #[test]
     fn test_signals_allow_splice() {
-        assert!(signals_allow_splice(1, &[]), "无出站链（freedom 本身）");
         assert!(signals_allow_splice(1, &[1]));
         assert!(signals_allow_splice(1, &[1, 1]), "代理链全 freedom");
         // 非 freedom 出站 = Go 零值 0 → 不启用

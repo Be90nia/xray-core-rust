@@ -349,7 +349,7 @@ impl ClientWorker {
     /// New 帧不带 GlobalID——服务端按普通 packet 路径处理（Go ctx 无
     /// inbound/cone 时 `xudp.GetGlobalID` 返回零值的等价）。
     pub async fn dispatch(&self, dest: &Destination, link: Link) -> bool {
-        self.dispatch_with_source(dest, link, None).await
+        self.dispatch_with_source(dest, link, None, None).await
     }
 
     /// 带入站源信息的调度（Go client.go:271 `xudp.GetGlobalID(ctx)`）。
@@ -358,11 +358,16 @@ impl ClientWorker {
     /// GlobalID 随 New 帧下发，服务端按 GlobalID 复用 XUDP 会话（cone NAT 下
     /// 同源多目标共享单条 UDP 通道）。计算为零值（非 UDP 源等）或 `input`
     /// 为 None 时不带 GlobalID（兼容）。
+    ///
+    /// `inbound`：Reverse-mux 入站 (source, local)（txno④，Go client.go:268-271
+    /// `IsReverseMuxFromContext` 时 `NewWriter(..., inbound)`）；`Some` 时 New
+    /// 帧携带 source/local，与 GlobalID 互斥（Go frame.go:87-100）。
     pub async fn dispatch_with_source(
         &self,
         dest: &Destination,
         link: Link,
         input: Option<&xray_xudp::GlobalIdInput>,
+        inbound: Option<(Destination, Destination)>,
     ) -> bool {
         if self.is_full() {
             return false;
@@ -373,7 +378,7 @@ impl ClientWorker {
         session.set_input(BufferedReader::new(link.reader)).await;
         session.set_output(BufferedWriter::new(link.writer)).await;
 
-        let global_id = if dest.network() == Network::UDP {
+        let global_id = if dest.network() == Network::UDP && inbound.is_none() {
             input.map(xray_xudp::global_id).filter(|g| *g != [0u8; 8])
         } else {
             None
@@ -382,7 +387,7 @@ impl ClientWorker {
         let s = Arc::clone(&session);
         let writer_slot = Arc::clone(&self.link_writer);
         let target = dest.clone();
-        tokio::spawn(async move { Self::fetch_input(s, target, writer_slot, global_id).await });
+        tokio::spawn(async move { Self::fetch_input(s, target, writer_slot, global_id, inbound).await });
 
         wait_done(session.done_receiver()).await;
         true
@@ -400,6 +405,7 @@ impl ClientWorker {
         dest: Destination,
         link_writer: Arc<Mutex<Option<Box<dyn Writer>>>>,
         global_id: Option<[u8; 8]>,
+        inbound: Option<(Destination, Destination)>,
     ) {
         let transfer_type = if dest.network() == Network::UDP {
             TransferType::Packet
@@ -413,6 +419,9 @@ impl ClientWorker {
             transfer_type,
             global_id,
         );
+        if let Some((source, local)) = inbound {
+            writer = writer.with_inbound(source, local);
+        }
 
         let done = session.done_receiver();
         // Go writeFirstPayload：CopyOnceTimeout(100ms)。超时 → 写空
@@ -1245,7 +1254,7 @@ mod tests {
             xray_common::net::port::Port::new(80),
             Network::TCP,
         );
-        ClientWorker::fetch_input(Arc::clone(&session), dest, Arc::clone(&link_writer), None)
+        ClientWorker::fetch_input(Arc::clone(&session), dest, Arc::clone(&link_writer), None, None)
             .await;
 
         // 对拍 End 帧原始字节：len(2B)=4 + id(2B) + status=0x03 + option=0x02

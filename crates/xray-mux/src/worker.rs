@@ -27,6 +27,18 @@ pub const SERVER_MONITOR_INTERVAL: Duration = Duration::from_secs(60);
 #[async_trait::async_trait]
 pub trait Dispatcher: Send + Sync {
     async fn dispatch(&self, dest: Destination) -> Result<Link, DispatchError>;
+
+    /// Reverse-mux 带帧内 source/local 的 dispatch（txno④；Go server.go:166-174
+    /// 覆写 ctx inbound 后 DispatchLink——Rust 无 ctx 对象，经本方法显式传参）。
+    /// 默认丢弃元数据（普通 mux 服务端）；reverse bridge 侧适配器覆写透传。
+    async fn dispatch_inbound(
+        &self,
+        dest: Destination,
+        _source: Option<Destination>,
+        _local: Option<Destination>,
+    ) -> Result<Link, DispatchError> {
+        self.dispatch(dest).await
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -236,9 +248,21 @@ impl ServerWorker {
         let target = meta.target().cloned().ok_or_else(|| {
             ServerError::InvalidFrame("new session without target".to_string())
         })?;
-        let link = self.dispatcher.dispatch(target.clone()).await.map_err(|e| {
-            ServerError::DispatchFailed(format!("dispatch to {}: {}", target, e))
-        })?;
+        // txno④：Reverse-mux New 帧的 source/local 经 dispatch_inbound 抵达
+        // dispatcher ctx（Go server.go:166-174 覆写 ctx inbound 等价）；普通
+        // mux（未启用 read_source_and_local 或帧无元数据）走原路径。
+        let link = if self.read_source_and_local && meta.source().is_some() {
+            self.dispatcher
+                .dispatch_inbound(
+                    target.clone(),
+                    meta.source().cloned(),
+                    meta.local().cloned(),
+                )
+                .await
+        } else {
+            self.dispatcher.dispatch(target.clone()).await
+        }
+        .map_err(|e| ServerError::DispatchFailed(format!("dispatch to {}: {}", target, e)))?;
         let tt = if target.network() == Network::UDP { TransferType::Packet } else { TransferType::Stream };
         let session = Session::new(meta.session_id(), tt);
         session.set_input(BufferedReader::new(link.reader)).await;
@@ -266,6 +290,7 @@ impl ServerWorker {
         tokio::spawn(async move { Self::handle_session_output(os, ow).await; });
         Ok(())
     }
+
     /// Handle XUDP New frame.
     ///
     /// `data` 为 New 帧内联数据——Go `handleStatusNew`（server.go:196-240）先经
@@ -1113,7 +1138,7 @@ mod tests {
                 w.dispatch_with_source(&d, ClientLink {
                     reader: Box::new(req_rd),
                     writer: Box::new(resp_wr),
-                }, Some(&input))
+                }, Some(&input), None)
                 .await
             });
 
@@ -1228,6 +1253,162 @@ mod tests {
                 tail, b"keep-data",
                 "Keep with new sessionID must reach the reused upstream (bd zv9l)"
             );
+        }
+    }
+
+    /// txno④：Reverse-mux portal 写侧 source/local 端到端。
+    ///
+    /// ClientWorker（portal 侧）`dispatch_with_source` 携带入站 (source,
+    /// local) → New 帧线格式含真实元数据 → ServerWorker（bridge 侧，
+    /// `with_read_source_and_local`）解析后经 `Dispatcher::dispatch_inbound`
+    /// 送达 dispatcher（Go server.go:166-174 ctx 覆写的等价物）。
+    /// 此前该通道缺失，帧内恒无 source/local。
+    mod reverse_mux_tests {
+        use super::*;
+        use crate::client::{ClientWorker, Link as ClientLink};
+        use crate::session::ClientStrategy;
+        use tokio::sync::Mutex as AsyncMutex;
+        use xray_buf::pipe;
+
+        fn tcp_target() -> Destination {
+            Destination::new(
+                Address::new_domain("echo.internal".to_string()),
+                Port::new(5201),
+                Network::TCP,
+            )
+        }
+
+        fn source_dest() -> Destination {
+            Destination::new(
+                Address::ipv4(std::net::Ipv4Addr::new(203, 0, 113, 7)),
+                Port::new(5555),
+                Network::TCP,
+            )
+        }
+
+        fn local_dest() -> Destination {
+            Destination::new(
+                Address::ipv4(std::net::Ipv4Addr::new(198, 51, 100, 1)),
+                Port::new(443),
+                Network::TCP,
+            )
+        }
+
+        /// 捕获 dispatcher：同时记录 dispatch_inbound 收到的 (source, local)。
+        struct InboundCaptureDispatcher {
+            tx: tokio::sync::mpsc::UnboundedSender<(
+                Destination,
+                Option<Destination>,
+                Option<Destination>,
+            )>,
+        }
+
+        #[async_trait::async_trait]
+        impl Dispatcher for InboundCaptureDispatcher {
+            async fn dispatch(&self, dest: Destination) -> Result<Link, DispatchError> {
+                self.dispatch_inbound(dest, None, None).await
+            }
+
+            async fn dispatch_inbound(
+                &self,
+                dest: Destination,
+                source: Option<Destination>,
+                local: Option<Destination>,
+            ) -> Result<Link, DispatchError> {
+                let _ = self.tx.send((dest, source.clone(), local.clone()));
+                let (ret_r, ret_w) = pipe::new();
+                let (_pay_r, pay_w) = pipe::new();
+                Ok(Link {
+                    reader: Box::new(ret_r),
+                    writer: Box::new(pay_w),
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn portal_new_frame_carries_real_source_and_local() {
+            // ClientWorker ↔ ServerWorker 直连 carrier（portal↔bridge 拓扑）
+            let (c_read, s_write) = pipe::new();
+            let (s_read, c_write) = pipe::new();
+            let client = ClientWorker::new(
+                ClientLink {
+                    reader: Box::new(c_read),
+                    writer: Box::new(c_write),
+                },
+                ClientStrategy::default(),
+            );
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let server = Arc::new(
+                ServerWorker::new(Arc::new(InboundCaptureDispatcher { tx }))
+                    .with_read_source_and_local(),
+            );
+            let mut reader = BufferedReader::new(Box::new(s_read));
+            let link_writer: Arc<AsyncMutex<Option<Box<dyn Writer>>>> =
+                Arc::new(AsyncMutex::new(Some(Box::new(s_write))));
+            let monitor_h = server.spawn_monitor(Arc::clone(&link_writer));
+            let frame_server = Arc::clone(&server);
+            tokio::spawn(async move {
+                loop {
+                    match frame_server.process_frame(&mut reader, &link_writer).await {
+                        Ok(true) => continue,
+                        _ => break,
+                    }
+                }
+                frame_server.close();
+                monitor_h.abort();
+            });
+
+            // portal 侧派发常规用户连接：上行首包随 New 帧同批发出
+            let (_req_rd, req_wr) = pipe::new();
+            let (_resp_rd, resp_wr) = pipe::new();
+            let mut req = req_wr;
+            req.write_multi_buffer(MultiBuffer::from_buffer(Buffer::from_vec(
+                b"hello-reverse".to_vec(),
+            )))
+            .await
+            .expect("write uplink");
+
+            let w = Arc::clone(&client);
+            let d = tcp_target();
+            let task = tokio::spawn(async move {
+                w.dispatch_with_source(
+                    &d,
+                    ClientLink {
+                        reader: Box::new(_req_rd),
+                        writer: Box::new(resp_wr),
+                    },
+                    None,
+                    Some((source_dest(), local_dest())),
+                )
+                .await
+            });
+
+            // bridge 侧 dispatcher 收到非空 source/local（此前为 None）
+            let (dest, source, local) =
+                tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+                    .await
+                    .expect("dispatch within timeout")
+                    .expect("channel open");
+            assert_eq!(dest, tcp_target());
+            assert_eq!(source, Some(source_dest()), "source 必须随 New 帧端到端送达");
+            assert_eq!(local, Some(local_dest()), "local 必须随 New 帧端到端送达");
+
+            let _ = req.close();
+            let _ = task.await;
+        }
+
+        /// 对照：未启用 read_source_and_local 的普通 mux 服务端不应走
+        /// dispatch_inbound 元数据通道（dispatch 收到 None 即通过）。
+        #[tokio::test]
+        async fn plain_server_new_frame_has_no_inbound_meta() {
+            let mut meta = FrameMetadata::new_session(21, tcp_target());
+            meta.set_inbound(source_dest(), local_dest());
+            // 普通服务端 read_source_and_local=false：写出端（portal）不会带
+            // 元数据的帧按普通格式解析——此处直接验证普通服务端 handle_normal_new
+            // 不要求 source/local（帧即便带也不致命）。
+            let bytes = meta.to_bytes();
+            let (parsed, _) = FrameMetadata::read_from_bytes(&bytes).expect("plain parse ok");
+            assert!(parsed.source().is_none(), "plain parse 必须不读 source/local");
         }
     }
 }

@@ -12,7 +12,10 @@ use std::sync::Arc;
 
 use xray_app_dispatcher::DispatchHandler;
 use xray_app_dispatcher::default::SimpleOhm;
+use xray_common::net::address::Address;
 use xray_common::net::destination::Destination;
+use xray_common::net::network::Network;
+use xray_common::net::port::Port;
 use xray_mux::client::{ClientWorker, Link as MuxLink};
 use xray_mux::session::ClientStrategy;
 use xray_transport::link::Link as TransportLink;
@@ -133,10 +136,16 @@ impl PortalOutbound {
     }
 
     /// 对应 Go `Portal.HandleConnection`（portal.go:67-101）。
+    ///
+    /// `access`：入站 ctx（txno④，Go client.go:268-271 `IsReverseMuxFromContext`
+    /// 时 `NewWriter(..., inbound)` 携带 inbound 的等价通道）——常规连接经
+    /// carrier 下发 New 帧时把 `from`/`local` 作为 source/local 写出（二者均可
+    /// 解析才携带，空值/缺省行为与改造前一致）。
     pub async fn handle_connection(
         &self,
         dest: &Destination,
         link: TransportLink,
+        access: &xray_app_dispatcher::AccessContext,
     ) -> Result<(), ReverseError> {
         if is_domain(dest.address().as_domain(), &self.domain) {
             // 反向 carrier：在链路上起 mux client + portal worker
@@ -166,20 +175,49 @@ impl PortalOutbound {
         // ClientWorker::dispatch 统一等待 → spawn 等价。
         let worker = self.picker.pick_available()?;
         let d = dest.clone();
+        let inbound = reverse_mux_inbound(access);
         tokio::spawn(async move {
             worker
                 .client()
-                .dispatch(
+                .dispatch_with_source(
                     &d,
                     MuxLink {
                         reader: link.reader,
                         writer: link.writer,
                     },
+                    None,
+                    inbound,
                 )
                 .await;
         });
         Ok(())
     }
+}
+
+/// 入站 ctx → Reverse-mux (source, local)（txno④）。
+///
+/// `from`/`local` 均可解析为 `ip:port` 才返回 `Some`；任一缺失（空串、
+/// 域名形态、解析失败）返回 `None`——New 帧退回无元数据形态（与改造前
+/// 线格式兼容）。网络恒 TCP（portal 写侧承载的是入站 TCP 会话元数据；
+/// Go inbound.Source 由 TCP conn RemoteAddr 构造，frame.go:88 同判）。
+fn reverse_mux_inbound(
+    access: &xray_app_dispatcher::AccessContext,
+) -> Option<(Destination, Destination)> {
+    let source = parse_ip_destination(access.from.as_str())?;
+    let local = parse_ip_destination(access.local.as_str())?;
+    Some((source, local))
+}
+
+/// `"ip:port"` → TCP [`Destination`]（Go net.TCPDestination(addr, port)）。
+///
+/// 域名形态/空串/解析失败 → `None`（New 帧退回无元数据形态）。
+fn parse_ip_destination(s: &str) -> Option<Destination> {
+    let addr: std::net::SocketAddr = s.parse().ok()?;
+    let address = match addr.ip() {
+        std::net::IpAddr::V4(v4) => Address::IPv4(v4),
+        std::net::IpAddr::V6(v6) => Address::IPv6(v6),
+    };
+    Some(Destination::new(address, Port::new(addr.port()), Network::TCP))
 }
 
 impl DispatchHandler for PortalOutbound {
@@ -200,7 +238,10 @@ impl DispatchHandler for PortalOutbound {
         let dest = dest.clone();
         Box::pin(async move {
             let outbound = PortalOutbound { tag, picker, domain };
-            if let Err(e) = outbound.handle_connection(&dest, link).await {
+            if let Err(e) = outbound
+                .handle_connection(&dest, link, &xray_app_dispatcher::AccessContext::default())
+                .await
+            {
                 tracing::info!(
                     target: "xray_app_reverse",
                     error = %e,

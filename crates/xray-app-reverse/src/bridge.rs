@@ -154,6 +154,21 @@ pub trait LinkDispatch: Send + Sync {
         link: xray_transport::link::Link,
         inbound_tag: Option<&str>,
     ) -> Result<(), ReverseError>;
+
+    /// Reverse-mux bridge 侧带帧内 source/local 的消费式 dispatch（txno④；
+    /// Go server.go:166-174 覆写 ctx inbound 的 Source/Local 后 DispatchLink）。
+    /// 默认丢弃元数据等价 [`Self::dispatch_link`]。
+    async fn dispatch_link_inbound(
+        &self,
+        dest: &Destination,
+        link: xray_transport::link::Link,
+        inbound_tag: Option<&str>,
+        source: Option<&Destination>,
+        local: Option<&Destination>,
+    ) -> Result<(), ReverseError> {
+        let _ = (source, local);
+        self.dispatch_link(dest, link, inbound_tag).await
+    }
 }
 
 /// 生产适配器：`DefaultDispatcher` → [`LinkDispatch`]。
@@ -189,6 +204,39 @@ impl LinkDispatch for DefaultDispatcherAdapter {
                 &xray_app_dispatcher::default::SniffingRequest::default(),
                 inbound_tag.map(|tag| xray_app_dispatcher::default::AccessContext {
                     inbound_tag: tag.to_string(),
+                    ..Default::default()
+                }),
+                None,
+            )
+            .map_err(|e| ReverseError::CreateBridgeWorker(e.to_string()))
+    }
+
+    async fn dispatch_link_inbound(
+        &self,
+        dest: &Destination,
+        link: xray_transport::link::Link,
+        inbound_tag: Option<&str>,
+        source: Option<&Destination>,
+        local: Option<&Destination>,
+    ) -> Result<(), ReverseError> {
+        // AccessContext.from/local 为 "ip:port" 形态（与入站协议层 peer 一致；
+        // SourceIpMatcher/Access log 依赖该形态——Destination Display 的
+        // "network:addr:port" 形态会让 dispatcher 的 parse_from_ip 失效）。
+        // Go server.go:166-174：reverse 帧内 Source/Local 覆写 ctx inbound——
+        // bridge 侧本地出站（路由规则/Access 日志）看到真实客户端源。
+        let meta = |d: Option<&Destination>| {
+            d.map(|x| format!("{}:{}", x.address(), x.port().value()))
+                .unwrap_or_default()
+        };
+        self.0
+            .dispatch_link(
+                dest,
+                link,
+                &xray_app_dispatcher::default::SniffingRequest::default(),
+                Some(xray_app_dispatcher::default::AccessContext {
+                    inbound_tag: inbound_tag.unwrap_or_default().to_string(),
+                    from: meta(source),
+                    local: meta(local),
                     ..Default::default()
                 }),
                 None,
