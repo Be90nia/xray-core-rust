@@ -828,12 +828,28 @@ mod tests {
             .expect("dial_httpupgrade");
 
         conn.write_all(b"hello-hu-tcpmask").await.expect("write");
-        let mut buf = vec![0u8; 64];
-        let n = tokio::time::timeout(Duration::from_secs(5), conn.read(&mut buf))
-            .await
-            .expect("echo timeout")
-            .expect("read ok");
-        assert_eq!(&buf[..n], b"hello-hu-tcpmask");
+        // tcpmask 分片 + echo 按 chunk 回写：单次 read 可能只拿到一个分片
+        // （8-16B），TCP 拆段即红（CI ubuntu 首跑实证）。循环读满 17 字节，
+        // 总预算 5s；产品无问题（分片本来就不保证整段一次到达）。
+        let payload = b"hello-hu-tcpmask";
+        let mut got = Vec::with_capacity(payload.len());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while got.len() < payload.len() {
+            let mut buf = [0u8; 64];
+            let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let n = tokio::time::timeout(budget, conn.read(&mut buf))
+                .await
+                .expect("echo timeout")
+                .expect("read ok");
+            assert!(
+                n > 0,
+                "echo closed early at {}/{} bytes",
+                got.len(),
+                payload.len()
+            );
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(&got, payload);
     }
 
     #[test]

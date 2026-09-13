@@ -893,13 +893,29 @@ mod tests {
             Some(socket2::Protocol::TCP),
         )
         .unwrap();
+        // TFO：TCP_FASTOPEN_CONNECT 为 Linux 4.11+ 专属（macOS 客户端走
+        // connectx，setsockopt TCP_FASTOPEN 在客户端 socket 上 EINVAL——CI
+        // macos 首跑实证）；TFO 断言段收敛 cfg(target_os = "linux")，macOS
+        // 分支只验 congestion + 普通 apply Ok。
         let mut opts = SocketOptions::default();
-        opts.tcp_fast_open = true;
+        #[cfg(target_os = "linux")]
+        {
+            opts.tcp_fast_open = true;
+        }
+        // congestion 算法名平台差异（macOS 新版可能移除 reno）：统一 cubic，
+        // 内核不可用时 ENOENT 容忍跳过。
         opts.tcp_congestion = Some("cubic".to_string());
         // tproxy 需要 root/CAP_NET_ADMIN，CI 上不启用。
         opts.tproxy = false;
         opts.reuse_port = false;
-        apply_outbound_socket_options(&socket, &opts, None).unwrap();
+        let res = apply_outbound_socket_options(&socket, &opts, None);
+        if let Err(e) = &res {
+            if e.raw_os_error() == Some(libc::ENOENT) {
+                eprintln!("skip: congestion algorithm unavailable: {e}");
+                return;
+            }
+        }
+        res.expect("apply (tfo+congestion) should Ok");
         socket.connect(&socket2::SockAddr::from(addr)).expect("connect after apply");
         // getsockopt 回读 TCP_FASTOPEN_CONNECT（Linux 30）：
         #[cfg(target_os = "linux")]
@@ -941,13 +957,24 @@ mod tests {
             Some(socket2::Protocol::TCP),
         )
         .unwrap();
+        // 同 ①：TFO 断言段收敛 cfg(target_os = "linux")，macOS 分支只验
+        // congestion + 普通 apply Ok（cubic，ENOENT 容忍跳过）。
         let mut opts = SocketOptions::default();
-        opts.tcp_fast_open = true;
-        opts.tcp_congestion = Some("reno".to_string());
+        #[cfg(target_os = "linux")]
+        {
+            opts.tcp_fast_open = true;
+        }
+        opts.tcp_congestion = Some("cubic".to_string());
         // 关键：必须 Ok，不向调用方传播 EPERM/ENOPROTOOPT（按 Go 语义 setsockopt 失败
         // 会被传播；本测试只验「TFO=1 + 已建立连接」回环内不 EPERM）。
         let res = apply_outbound_socket_options(&socket, &opts, None);
-        assert!(res.is_ok(), "回环 socket 上 TFO + congestion 应 Ok：{res:?}");
+        if let Err(e) = &res {
+            if e.raw_os_error() == Some(libc::ENOENT) {
+                eprintln!("skip: congestion algorithm unavailable: {e}");
+                return;
+            }
+        }
+        res.expect("apply (congestion) should Ok");
         socket.connect(&socket2::SockAddr::from(addr)).expect("connect after apply");
         drop(socket);
         accept_task.await.unwrap();
