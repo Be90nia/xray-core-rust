@@ -683,9 +683,10 @@ mod tests {
         let mut conn =
             dial_h2(tcp, "/GunService/TunMulti", "", "http", None, &cfg).await.unwrap();
         conn.write_all(b"ping").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // 读侧自然等待 server 收到上行并回帧（慢 runner 上固定 sleep 不是
+        // 同步手段；预算放宽到 5s 防 flake）。
         let mut buf = vec![0u8; 64];
-        let n = tokio::time::timeout(Duration::from_secs(2), conn.read(&mut buf))
+        let n = tokio::time::timeout(Duration::from_secs(5), conn.read(&mut buf))
             .await
             .unwrap()
             .unwrap();

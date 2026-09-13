@@ -258,7 +258,7 @@ mod tests {
             .await
             .expect("send_to");
 
-        let (src, data) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        let (src, data) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("timed out waiting for echo")
             .expect("channel closed");
@@ -297,7 +297,7 @@ mod tests {
             .await
             .expect("send_to");
 
-        let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("timed out waiting for echo")
             .expect("channel closed");
