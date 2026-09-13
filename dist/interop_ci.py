@@ -201,8 +201,23 @@ def run_one(idx, proto, server_bin, client_bin, tag, work, dry=False):
     procs = []
     bs, err, flag = 0, '', 'FAIL'
     try:
+        # vless_vision_tls 取证：macOS arm 上偶发 client 端握手提前断（server
+        # rustls 报 tls handshake eof），RUST_LOG=trace 全量留痕（s/c log 随
+        # 失败工件上传）。
+        env = {**os.environ, "RUST_LOG": "trace"} if proto == "vless_vision_tls" else None
         slog = open(os.path.join(work, 's%d.log' % idx), 'wb')
-        ps = subprocess.Popen([server_bin, 'run', '-c', scp], stdout=slog, stderr=subprocess.STDOUT)
+        ps = subprocess.Popen([server_bin, 'run', '-c', scp], stdout=slog,
+                              stderr=subprocess.STDOUT, env=env)
+        slog.close()
+        procs.append(ps)
+        if not wait_port(P, 15):
+            err = 'server 未监听 %d (15s)' % P
+        else:
+            clog = open(os.path.join(work, 'c%d.log' % idx), 'wb')
+            pc = subprocess.Popen([client_bin, 'run', '-c', ccp], stdout=clog,
+                                  stderr=subprocess.STDOUT, env=env)
+            clog.close()
+            procs.append(pc)
         slog.close()
         procs.append(ps)
         if not wait_port(P, 15):
