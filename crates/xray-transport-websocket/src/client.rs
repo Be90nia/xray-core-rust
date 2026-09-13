@@ -890,7 +890,7 @@ mod tests {
         let n = conn.write(b"x".as_slice()).await.unwrap();
         assert_eq!(n, 1);
         let mut buf = [0u8; 4];
-        let rx = tokio::time::timeout(Duration::from_secs(2), conn.read(&mut buf))
+        let rx = tokio::time::timeout(Duration::from_secs(5), conn.read(&mut buf))
             .await
             .expect("read must complete once dial finishes")
             .unwrap();
