@@ -1,0 +1,72 @@
+# 互通 CI: macOS 双架构真机 + Ubuntu 跑 Rust<->Rust 全矩阵与 Go 基线交叉
+# 销账: TUN/BSD/Darwin P4 波 (macOS workspace 全量编译即 darwin 编译烂账防线)
+
+name: Interop
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, dev]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  interop:
+    name: Interop (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-13, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # xray-proto build.rs 走 prost-build compile_protos, 需要 protoc
+      - name: Install protoc
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+          else
+            brew install protobuf
+          fi
+
+      # macOS 上 workspace 全量编译本身即 darwin 编译烂账防线
+      - name: Workspace lib tests
+        run: cargo test --workspace --lib
+
+      - name: Build release binary
+        run: cargo build --release --bin xray
+
+      # Go 基线 = 官方 release 二进制 (禁 git clone 全仓构建)
+      - name: Download Go baseline (xray-core v26.9.9)
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS:$(uname -m)" in
+            macOS:arm64)   asset=Xray-macos-arm64-v8a.zip ;;
+            macOS:x86_64)  asset=Xray-macos-64.zip ;;
+            Linux:x86_64)  asset=Xray-linux-64.zip ;;
+            Linux:aarch64) asset=Xray-linux-arm64-v8a.zip ;;
+            *) echo "unsupported platform: $RUNNER_OS $(uname -m)"; exit 1 ;;
+          esac
+          curl -fsSL -o /tmp/xray-go.zip \
+            "https://github.com/XTLS/Xray-core/releases/download/v26.9.9/$asset"
+          mkdir -p tools/xray-go
+          unzip -o /tmp/xray-go.zip -d tools/xray-go xray
+          chmod +x tools/xray-go/xray
+          tools/xray-go/xray version
+
+      - name: Interop tests (Rust<->Rust 12 + Go->Rust 3)
+        run: python3 dist/interop_ci.py --rust target/release/xray --go tools/xray-go/xray
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-logs-${{ matrix.os }}
+          path: target/interop_ci/
+          if-no-files-found: ignore
