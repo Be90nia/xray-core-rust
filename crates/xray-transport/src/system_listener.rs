@@ -548,6 +548,7 @@ impl UnixListener {
     /// FileLocker 获取失败 / bind 失败 / 权限设置失败 / abstract 名超长时返回 `io::Error`。
     pub async fn bind(addr: &str, sockopt: SocketOptions) -> io::Result<Self> {
         match parse_unix_addr(addr)? {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             UnixAddrSpec::Abstract(name) => {
                 // abstract socket 在独立命名空间，无锁、无文件、无权限设置。
                 let inner = TokioUnixListener::from_std(bind_abstract_unix(&name)?)?;
@@ -557,6 +558,15 @@ impl UnixListener {
                     controllers: Vec::new(),
                     _locker: None,
                 })
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            UnixAddrSpec::Abstract(_) => {
+                // parse_unix_addr 非 Linux/Android 不产出 Abstract（'@' 前缀已报
+                // InvalidInput）；防御分支仅为匹配完备（CI macos 首跑 E0425 暴露）。
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "abstract socket (@) is only supported on Linux/Android",
+                ))
             }
             UnixAddrSpec::Path(socket_path, perm) => {
                 // normal unix domain socket needs lock
