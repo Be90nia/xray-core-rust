@@ -199,6 +199,7 @@ mod tests {
     /// （与 Go 测试同语义）。校验在 env 读取之前完成，并行安全。
     #[test]
     fn stat_asset_rejects_invalid_path() {
+        // 平台无关词法违规：守卫必须在路径解析前拒绝。
         for file in [
             "",
             ".",
@@ -209,10 +210,6 @@ mod tests {
             "nested//geoip.dat",
             "/geoip.dat",
             "/tmp/geoip.dat",
-            r"C:\geoip.dat",
-            r"C:geoip.dat",
-            r"\\server\share\geoip.dat",
-            r"nested\..\geoip.dat",
         ] {
             let err = stat_asset(file)
                 .err()
@@ -226,6 +223,38 @@ mod tests {
         let abs = unique_dir("abs").join("geoip.dat");
         let err = stat_asset(abs.to_str().unwrap()).unwrap_err();
         assert!(err.to_string().contains("must stay in asset directory"));
+
+        // Windows 盘符/UNC/反斜杠词法形态：守卫必须在解析前拒绝（Go 同语义）。
+        #[cfg(windows)]
+        for file in [
+            r"C:\geoip.dat",
+            r"C:geoip.dat",
+            r"\\server\share\geoip.dat",
+            r"nested\..\geoip.dat",
+        ] {
+            let err = stat_asset(file)
+                .err()
+                .unwrap_or_else(|| panic!("expected error for {file:?}"));
+            assert!(
+                err.to_string().contains("must stay in asset directory"),
+                "guard must reject {file:?} before resolution, got: {err}"
+            );
+        }
+
+        // POSIX：反斜杠是合法文件名字符，同输入是合法相对路径 → 守卫放行，
+        // 文件不存在仅要求报错（stat 兜底）。CI ubuntu 首跑实证语义分歧。
+        #[cfg(not(windows))]
+        for file in [
+            r"C:\geoip.dat",
+            r"C:geoip.dat",
+            r"\\server\share\geoip.dat",
+            r"nested\..\geoip.dat",
+        ] {
+            assert!(
+                stat_asset(file).is_err(),
+                "posix: legal relative name must fall through to stat error: {file:?}"
+            );
+        }
 
         // Windows 合法相对路径、文件不存在：仅要求报错（stat 兜底）
         assert!(stat_asset(r"nested\geoip.dat").is_err());

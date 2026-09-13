@@ -251,7 +251,7 @@ mod tests {
     use crate::config::IpOption;
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::{Name, RData, Record, RecordType};
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
     use xray_transport::connection::TcpConnection;
@@ -467,17 +467,23 @@ mod tests {
     #[tokio::test]
     async fn tcp_domain_ns_resolves_at_query_time() {
         let _slot = DIALER_SLOT_LOCK.lock();
-        // A/B 两个 mock server：同一端口、不同 loopback IP（模拟上游 NS 换 IP）。
+        // A/B 两个 mock server：同一端口、不同 loopback 地址（模拟上游 NS 换 IP）。
+        // B 用 v6 ::1——127.0.0.2 仅 Linux 隐式可用（macOS lo0 默认只有
+        // 127.0.0.1，bind 报 AddrNotAvailable code 49，CI 首跑实证）；
+        // v4/v6 双栈回环全平台齐备，保持"同端口异地址"可区分性，
+        // 不依赖特定单播 IP。
         let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener_a.local_addr().unwrap().port();
-        let listener_b = TcpListener::bind(("127.0.0.2", port)).await.unwrap();
+        let listener_b = TcpListener::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port))
+            .await
+            .unwrap();
         let task_a = spawn_echo_server(listener_a, Ipv4Addr::new(10, 9, 0, 1));
         let task_b = spawn_echo_server(listener_b, Ipv4Addr::new(10, 9, 0, 2));
 
         let resolver = Arc::new(SwitchResolver {
             to_b: std::sync::atomic::AtomicBool::new(false),
-            addr_a: IpAddr::from([127, 0, 0, 1]),
-            addr_b: IpAddr::from([127, 0, 0, 2]),
+            addr_a: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            addr_b: IpAddr::V6(Ipv6Addr::LOCALHOST),
         });
         let dest = Destination::tcp(Address::Domain("var.example".to_string()), Port::new(port));
         let ns = TcpNameServer::new(
