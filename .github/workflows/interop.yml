@@ -47,16 +47,24 @@ jobs:
           cargo fetch
           rev=$(awk '/^name = "btls-sys"/{f=1;next} f&&/^source/{print;exit}' Cargo.lock \
             | sed 's/.*#\([0-9a-f]\{40\}\)".*/\1/')
-          patches_dir=$(ls -d "$HOME"/.cargo/git/checkouts/btls-*/"${rev:0:7}"*/btls-sys/patches | head -1)
+          btls_co=$(ls -d "$HOME"/.cargo/git/checkouts/btls-*/"${rev:0:7}"* | head -1)
+          patches_dir="$btls_co/btls-sys/patches"
+          # boringssl pin 从 btls 仓 tree 的 submodule gitlink 动态取
+          # （btls rev 变更自动跟随；首版误用 btls rev fetch 即 CI "not our ref" 根因）
+          bssl_rev=$(git -C "$btls_co" ls-tree HEAD btls-sys/deps/boringssl | awk '{print $3}')
           bssl="$RUNNER_TEMP/boringssl"
           git init -q "$bssl"
           git -C "$bssl" remote add origin https://github.com/google/boringssl.git
-          git -C "$bssl" fetch -q --depth 1 origin "$rev"
+          git -C "$bssl" fetch -q --depth 1 origin "$bssl_rev"
           git -C "$bssl" checkout -q FETCH_HEAD
           git -C "$bssl" apply -v --whitespace=fix "$patches_dir/boring-pq.patch"
           git -C "$bssl" apply -v --whitespace=fix "$patches_dir/boringssl.patch"
           git -C "$bssl" apply -v --whitespace=fix "$patches_dir/boringssl-loongarch.patch"
           git -C "$bssl" apply -v --whitespace=fix "$patches_dir/boringssl-windows.patch"
+          # REALITY 补丁集（btls-sys 0.5.6 不含 SSL_set_reality_rewrite_cb /
+          # SSL_get_x25519_key_share_private，xray-tls btls_reality.rs FFI 需要；
+          # 复用 tools/setup_boringssl_reality.py 的锚点式补丁逻辑）
+          python3 -c "import sys, pathlib; sys.path.insert(0, 'tools'); from setup_boringssl_reality import apply_reality_patches; apply_reality_patches(pathlib.Path('$RUNNER_TEMP/boringssl'))"
           echo "BORING_BSSL_ASSUME_PATCHED=1" >> "$GITHUB_ENV"
           echo "BORING_BSSL_SOURCE_PATH=$bssl" >> "$GITHUB_ENV"
 
