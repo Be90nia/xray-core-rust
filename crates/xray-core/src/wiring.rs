@@ -647,8 +647,14 @@ impl InboundDispatchHandler {
             // writeCounter.Add 等价）：下行直达 raw fd 绕过下方 dn_r 包装。
             a.splice_down_in = self.inbound_counter("downlink");
         }
-        let reader = maybe_wrap_reader(self.inbound_counter("downlink"), link.reader);
-        let writer = maybe_wrap_writer(self.inbound_counter("uplink"), link.writer);
+        // 本 link 由 socks 层以客户端 socket 双半部构造：reader 承载客户端
+        // →远端（uplink）字节流，writer 承载远端→客户端（downlink）字节流，
+        // 计数器必须按真实流向挂接（此前挂反：Linux splice 下行绕过 writer
+        // 致 uplink 计数恒 0，Windows 全泵路径因四端全 >0 而掩盖互换）。
+        // Go 对照：inbound uplink = conn ReadCounter（读客户端字节），
+        // inbound downlink = conn WriteCounter（写客户端字节）。
+        let reader = maybe_wrap_reader(self.inbound_counter("uplink"), link.reader);
+        let writer = maybe_wrap_writer(self.inbound_counter("downlink"), link.writer);
         let link = Link::new(reader, writer);
         // dispatch_link 内部 spawn（sniffing → routing → access log → outbound counter → handler），
         // 此处仅同步返回。
