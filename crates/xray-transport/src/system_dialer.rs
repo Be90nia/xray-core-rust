@@ -876,6 +876,13 @@ mod tests {
         });
         let dest = localhost_dest(addr.port());
         let sockopt = SocketOptions::default();
+        // macOS/FreeBSD lo0 默认只配 127.0.0.1（127/8 全段仅 Linux 隐式可用，
+        // bind 127.0.0.2 AddrNotAvailable）——平台感知退化 127.0.0.1，断言跟随
+        // （与 freedom UDP sendThrough 同族修法）；Linux 保留 127.0.0.2 的
+        // 区分度（未生效时 OS 默认源是 127.0.0.1）。
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        let src: IpAddr = "127.0.0.1".parse().unwrap();
+        #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
         let src: IpAddr = "127.0.0.2".parse().unwrap();
         let conn = DIAL_SRC
             .scope(Some(src), dial_system(&dest, &sockopt))
