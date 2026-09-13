@@ -754,12 +754,28 @@ mod tests {
         let mut conn = dial_ws(&dest, &settings).await.expect("dial_ws");
 
         conn.write_all(b"hello-ws-tcpmask").await.expect("write");
-        let mut buf = vec![0u8; 64];
-        let n = tokio::time::timeout(std::time::Duration::from_secs(5), conn.read(&mut buf))
-            .await
-            .expect("echo timeout")
-            .expect("read ok");
-        assert_eq!(&buf[..n], b"hello-ws-tcpmask");
+        // tcpmask 分片 + echo 按 chunk 回写：单次 read 可能只拿到一个分片
+        // （8-16B），TCP 拆段即红（与 httpupgrade 同款 flaky，CI ubuntu 实证）。
+        // 循环读满 16 字节，总预算 5s。
+        let payload = b"hello-ws-tcpmask";
+        let mut got = Vec::with_capacity(payload.len());
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while got.len() < payload.len() {
+            let mut buf = [0u8; 64];
+            let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let n = tokio::time::timeout(budget, conn.read(&mut buf))
+                .await
+                .expect("echo timeout")
+                .expect("read ok");
+            assert!(
+                n > 0,
+                "echo closed early at {}/{} bytes",
+                got.len(),
+                payload.len()
+            );
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(&got, payload);
     }
     /// close() 后 accept 循环退出、socket 释放，新连接被拒（票 n8k8/x6sp 行为面）。
     /// notify_one 的 permit 保证 close 与循环重新注册 notified() 之间的窗口不丢通知；
