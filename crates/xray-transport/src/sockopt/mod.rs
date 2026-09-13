@@ -883,8 +883,16 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let accept_task = tokio::spawn(async move { let _ = listener.accept().await; });
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let socket = socket2::Socket::from(stream.into_std().unwrap());
+        // 生产语义：先 apply 再 connect。TCP_FASTOPEN_CONNECT 在 ESTABLISHED
+        // socket 上新内核（6.8+）返回 EINVAL（CI ubuntu 首跑实证）——socket2
+        // 建未连接 socket → apply → connect，对齐 apply_outbound_socket_options
+        // 的真实调用顺序（dial 前套选项）。
+        let socket = socket2::Socket::new(
+            socket2::Domain::for_address(addr),
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .unwrap();
         let mut opts = SocketOptions::default();
         opts.tcp_fast_open = true;
         opts.tcp_congestion = Some("cubic".to_string());
@@ -892,6 +900,7 @@ mod tests {
         opts.tproxy = false;
         opts.reuse_port = false;
         apply_outbound_socket_options(&socket, &opts, None).unwrap();
+        socket.connect(&socket2::SockAddr::from(addr)).expect("connect after apply");
         // getsockopt 回读 TCP_FASTOPEN_CONNECT（Linux 30）：
         #[cfg(target_os = "linux")]
         {
@@ -924,8 +933,14 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let accept_task = tokio::spawn(async move { let _ = listener.accept().await; });
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let socket = socket2::Socket::from(stream.into_std().unwrap());
+        // 同上：未连接 socket → apply → connect（ESTABLISHED 后设
+        // TCP_FASTOPEN_CONNECT 新内核 EINVAL，CI ubuntu 首跑实证）。
+        let socket = socket2::Socket::new(
+            socket2::Domain::for_address(addr),
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .unwrap();
         let mut opts = SocketOptions::default();
         opts.tcp_fast_open = true;
         opts.tcp_congestion = Some("reno".to_string());
@@ -933,6 +948,7 @@ mod tests {
         // 会被传播；本测试只验「TFO=1 + 已建立连接」回环内不 EPERM）。
         let res = apply_outbound_socket_options(&socket, &opts, None);
         assert!(res.is_ok(), "回环 socket 上 TFO + congestion 应 Ok：{res:?}");
+        socket.connect(&socket2::SockAddr::from(addr)).expect("connect after apply");
         drop(socket);
         accept_task.await.unwrap();
     }

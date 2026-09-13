@@ -1012,10 +1012,20 @@ mod tests {
     async fn udp_associate_binds_configured_address() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        // macOS/FreeBSD lo0 默认只配 127.0.0.1（无 127/8 全段）：bind 127.0.0.9
+        // 报 AddrNotAvailable → 握手失败 → 客户端 early eof（CI macos 首跑实证，
+        // 生产 server.rs:256-258 bind 的正是配置地址）。平台感知选配置地址，
+        // "relay bind 配置地址 + BND.ADDR 回显"语义不变。
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        let configured: [u8; 4] = [127, 0, 0, 1];
+        #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+        let configured: [u8; 4] = [127, 0, 0, 9];
         let config = ServerConfig {
             udp_enabled: true,
             address: Some(xray_proto::xray::common::net::IpOrDomain {
-                address: Some(xray_proto::xray::common::net::ip_or_domain::Address::Ip(vec![127, 0, 0, 9])),
+                address: Some(xray_proto::xray::common::net::ip_or_domain::Address::Ip(
+                    configured.to_vec(),
+                )),
             }),
             ..Default::default()
         };
@@ -1034,14 +1044,14 @@ mod tests {
         client.read_exact(&mut reply).await.unwrap();
         assert_eq!(reply[1], STATUS_SUCCESS);
         // BND.ADDR = 配置的 address IP（Go protocol.go:199-205）
-        assert_eq!(&reply[4..8], &[127, 0, 0, 9], "BND.ADDR must be the configured address");
+        assert_eq!(&reply[4..8], &configured, "BND.ADDR must be the configured address");
 
         match server.await.unwrap().unwrap() {
             SocksRequest::UdpAssociate(relay_addr, socket) => {
-                assert_eq!(relay_addr.host, Host::Ipv4(std::net::Ipv4Addr::new(127, 0, 0, 9)));
+                assert_eq!(relay_addr.host, Host::Ipv4(std::net::Ipv4Addr::from(configured)));
                 assert_eq!(
                     socket.local_addr().unwrap().ip(),
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 9))
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::from(configured))
                 );
             }
             other => panic!("expected UdpAssociate, got {other:?}"),
