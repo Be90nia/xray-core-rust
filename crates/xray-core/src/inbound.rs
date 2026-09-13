@@ -806,11 +806,19 @@ pub async fn serve_dokodemo(
 
             // follow_redirect：Linux 下从 accept 的 fd 查 SO_ORIGINAL_DST。
             // Go 由 TPROXY listener 在 transport 层写入 session ctx（Go dokodemo.go
-            // L113-121），Rust 在此直接 getsockopt；非 REDIRECT 连接返回 Err → 回落。
+            // L113-121），普通 listener 不查——无 ctx 即拒连。Rust 直连 socket 上
+            // getsockopt 在内核 conntrack 跟踪回环/直连流量时"成功"返回 current dst
+            // == 本端地址（未 NAT ⇒ original == current），恰为 listener 端口，
+            // 会把普通连接误判成透明代理流量（CI ubuntu 首跑实证：dispatch 到
+            // 127.0.0.1:<ephemeral>）。过滤 original == 本端地址：与 Go 普通
+            // listener 无 OriginalDest 的可观测行为等价；真实 REDIRECT 的
+            // original ≠ 本端不受影响。
             #[cfg(target_os = "linux")]
             let original_dst = if opts.follow_redirect {
                 use std::os::fd::AsRawFd;
-                xray_transport::sockopt::get_original_dst(stream.as_raw_fd()).ok()
+                xray_transport::sockopt::get_original_dst(stream.as_raw_fd())
+                    .ok()
+                    .filter(|orig| Some(*orig) != stream.local_addr().ok())
             } else {
                 None
             };

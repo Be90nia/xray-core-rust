@@ -554,6 +554,10 @@ pub async fn bridge_link_with_stream_downlink_splice<S>(
     stream: S,
     write_raw: std::sync::Arc<tokio::net::TcpStream>,
     policy: &TimeoutPolicy,
+    down_counters: (
+        Option<Arc<dyn xray_features::stats::Counter>>,
+        Option<Arc<dyn xray_features::stats::Counter>>,
+    ),
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Connection,
@@ -620,14 +624,26 @@ where
     // 双端 timer 提到 24h（proxy.go:764-767）——即下行无空闲超时，EOF 即终。
     let down = async move {
         let res = match down_from {
-            Some(from) => crate::splice::splice_copy(&from, &write_raw)
-                .await
-                .map(|_| ()),
-            None => Ok(()),
+            Some(from) => crate::splice::splice_copy(&from, &write_raw).await,
+            None => Ok(0),
         };
+        // Go proxy.go:761-766：splice 直达 raw fd 绕过 link 端 SizeStat 包装，
+        // 字节数必须在泵处回填两级 downlink 计数器（readCounter=出站 /
+        // writeCounter=入站），否则 Linux splice 路径 per-tag 流量统计恒 0。
+        if let Ok(n) = res {
+            if n > 0 {
+                let n = i64::try_from(n).unwrap_or(i64::MAX);
+                if let Some(c) = down_counters.0.as_ref() {
+                    c.add(n);
+                }
+                if let Some(c) = down_counters.1.as_ref() {
+                    c.add(n);
+                }
+            }
+        }
         writer.shutdown();
         let _ = down_done_tx.send(Some(downlink_only));
-        res
+        res.map(|_| ())
     };
 
     let (up_res, down_res) = tokio::join!(up, down);

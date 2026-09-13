@@ -641,6 +641,12 @@ impl InboundDispatchHandler {
         link: Link,
         access: Option<AccessContext>,
     ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        let mut access = access;
+        if let Some(a) = access.as_mut() {
+            // splice 下行入站计数器随 access 抵达 splice 泵（Go proxy.go:765
+            // writeCounter.Add 等价）：下行直达 raw fd 绕过下方 dn_r 包装。
+            a.splice_down_in = self.inbound_counter("downlink");
+        }
         let reader = maybe_wrap_reader(self.inbound_counter("downlink"), link.reader);
         let writer = maybe_wrap_writer(self.inbound_counter("uplink"), link.writer);
         let link = Link::new(reader, writer);
