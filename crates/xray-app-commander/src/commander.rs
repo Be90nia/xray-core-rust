@@ -1154,6 +1154,35 @@ mod tests {
         l.local_addr().unwrap().port()
     }
 
+    /// 带 deadline 退避重试的 dial。
+    ///
+    /// [`Commander::start`] 的 TCP listen 模式在 `tokio::spawn` 的任务里才
+    /// bind（commander.rs start→grpc::ListenSpec::Tcp 分支），spawn 返回 ≠
+    /// listener 就绪；POSIX 调度下测试立即 dial 会 Connection refused
+    /// （CI macos+ubuntu 首跑实证，Windows 碰巧绿）。禁 sleep 固定等待，
+    /// deadline 内指数退避重试。
+    async fn dial_with_retry<T, F, Fut>(mut connect: F, what: &'static str) -> T
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, tonic::transport::Error>>,
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut backoff = std::time::Duration::from_millis(50);
+        loop {
+            match connect().await {
+                Ok(client) => return client,
+                Err(e) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{what}: dial deadline exceeded (server never accepted): {e}"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(std::time::Duration::from_millis(500));
+                }
+            }
+        }
+    }
+
     fn stats_backend(value: i64) -> Arc<dyn xray_app_stats::command::StatsService> {
         use xray_features::stats::Manager as _;
         let mgr = Arc::new(xray_app_stats::Manager::new_running());
@@ -1179,10 +1208,11 @@ mod tests {
         ))));
         commander.set_stats_service(stats_backend(42));
         commander.start().expect("commander start (listen mode)");
-
-        let mut client = StatsServiceClient::connect(format!("http://127.0.0.1:{port}"))
-            .await
-            .expect("dial commander api");
+        let mut client = dial_with_retry(
+            || StatsServiceClient::connect(format!("http://127.0.0.1:{port}")),
+            "dial commander api",
+        )
+        .await;
         let resp = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             client.get_stats(GetStatsRequest {
@@ -1213,9 +1243,11 @@ mod tests {
         commander.set_stats_service(stats_backend(7));
         commander.start().expect("commander start (listen mode)");
 
-        let mut client = StatsServiceClient::connect(format!("http://127.0.0.1:{port}"))
-            .await
-            .expect("dial commander api");
+        let mut client = dial_with_retry(
+            || StatsServiceClient::connect(format!("http://127.0.0.1:{port}")),
+            "dial commander api",
+        )
+        .await;
         let err = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             client.get_stats(GetStatsRequest {
@@ -1245,9 +1277,11 @@ mod tests {
         ))));
         commander.start().expect("commander start (listen mode)");
 
-        let mut client = StatsServiceClient::connect(format!("http://127.0.0.1:{port}"))
-            .await
-            .expect("dial commander api");
+        let mut client = dial_with_retry(
+            || StatsServiceClient::connect(format!("http://127.0.0.1:{port}")),
+            "dial commander api",
+        )
+        .await;
         let err = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             client.get_stats(GetStatsRequest {
