@@ -7,7 +7,7 @@ btls-sys 走 BORING_BSSL_SOURCE_PATH + BORING_BSSL_ASSUME_PATCHED=1 构建时
 1. 定位 cargo git checkout 里的 btls-sys（deps/boringssl + patches/）
 2. rm -rf target/boringssl-patched && 复制 vendor boringssl
 3. git init + 按 btls-sys build/main.rs 相同顺序应用 patch：
-   boring-pq → 0001..0010（非 fips）→ boringssl-loongarch
+   boring-pq → boringssl → loongarch → windows（btls ab7f522 补丁集）
 4. 应用 REALITY patch 集（HANDOFF_FINAL_PUSH.md §6.1，7 步）：
    - SSL_get_x25519_key_share_private（ssl.h + ssl_lib.cc）
    - SSL_set_reality_rewrite_cb 全局回调（ssl.h + ssl_lib.cc）
@@ -22,6 +22,7 @@ btls-sys 走 BORING_BSSL_SOURCE_PATH + BORING_BSSL_ASSUME_PATCHED=1 构建时
 """
 
 import argparse
+import re
 import shutil
 import subprocess
 import sys
@@ -30,17 +31,9 @@ from pathlib import Path
 # 与 btls-sys build/main.rs ensure_patches_applied 非 fips 顺序一致
 BTLS_BASE_PATCHES = [
     "boring-pq.patch",
-    "0001-boringssl-ffdhe.patch",
-    "0002-boringssl-legacy-ciphers.patch",
-    "0003-boringssl-tls-options.patch",
-    "0004-boringssl-extension-order.patch",
-    "0005-record-size-limit.patch",
-    "0006-delegated-credentials.patch",
-    "0007-boringssl-cipher-preferences.patch",
-    "0008-boringssl-sigalgs.patch",
-    "0009-boringssl-zstd-cert-compression.patch",
-    "0010-boringssl-build-compat.patch",
+    "boringssl.patch",
     "boringssl-loongarch.patch",
+    "boringssl-windows.patch",
 ]
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -56,12 +49,10 @@ OPENSSL_EXPORT int SSL_get_x25519_key_share_private(const SSL *ssl,
 
 REALITY_SSL_LIB_IMPL = """
 int SSL_get_x25519_key_share_private(const SSL *ssl, uint8_t out_priv[32]) {
-  const auto *ssl_impl = FromOpaque(ssl);
-  if (ssl_impl == nullptr || ssl_impl->s3 == nullptr ||
-      ssl_impl->s3->hs == nullptr) {
+  if (ssl == nullptr || ssl->s3 == nullptr || ssl->s3->hs == nullptr) {
     return 0;
   }
-  const SSL_HANDSHAKE *hs = ssl_impl->s3->hs.get();
+  const SSL_HANDSHAKE *hs = ssl->s3->hs.get();
   for (const auto &share : hs->key_shares) {
     if (share->GroupID() == SSL_GROUP_X25519) {
       // |SerializePrivateKey| is logically const (raw 32-byte scalar for
@@ -94,25 +85,24 @@ void SSL_set_reality_rewrite_cb(int (*cb)(SSL *ssl, uint8_t *msg, size_t msg_len
 }
 
 namespace bssl {
-bool ssl_reality_rewrite_maybe(SSLImpl *ssl, Array<uint8_t> *msg) {
+bool ssl_reality_rewrite_maybe(SSL *ssl, Array<uint8_t> *msg) {
   if (g_reality_rewrite_cb == nullptr || (*msg).empty() ||
       (*msg)[0] != SSL3_MT_CLIENT_HELLO) {
     return true;
   }
-  return g_reality_rewrite_cb(reinterpret_cast<SSL *>(ssl), (*msg).data(),
-                              (*msg).size()) != 0;
+  return g_reality_rewrite_cb(ssl, (*msg).data(), (*msg).size()) != 0;
 }
 }  // namespace bssl
 """
 
 # handshake.cc / handshake_client.cc：finish_message 后、add_message 前注入
-HANDSHAKE_CBB_OLD = """bool ssl_add_message_cbb(SSLImpl *ssl, CBB *cbb) {
+HANDSHAKE_CBB_OLD = """bool ssl_add_message_cbb(SSL *ssl, CBB *cbb) {
   Array<uint8_t> msg;
   if (!ssl->method->finish_message(ssl, cbb, &msg) ||
       !ssl->method->add_message(ssl, std::move(msg))) {
 """
 
-HANDSHAKE_CBB_NEW = """bool ssl_add_message_cbb(SSLImpl *ssl, CBB *cbb) {
+HANDSHAKE_CBB_NEW = """bool ssl_add_message_cbb(SSL *ssl, CBB *cbb) {
   Array<uint8_t> msg;
   if (!ssl->method->finish_message(ssl, cbb, &msg) ||
       !ssl_reality_rewrite_maybe(ssl, &msg) ||
@@ -123,8 +113,8 @@ CLIENT_HELLO_OLD = """      !ssl->method->finish_message(ssl, cbb.get(), &msg)) 
     return false;
   }
 
-  return ssl->method->add_message(ssl, std::move(msg));
-}
+  // Now that the length prefixes have been computed, fill in the placeholder
+  // PSK binder.
 """
 
 CLIENT_HELLO_NEW = """      !ssl->method->finish_message(ssl, cbb.get(), &msg)) {
@@ -134,8 +124,9 @@ CLIENT_HELLO_NEW = """      !ssl->method->finish_message(ssl, cbb.get(), &msg)) 
   if (!ssl_reality_rewrite_maybe(ssl, &msg)) {
     return false;
   }
-  return ssl->method->add_message(ssl, std::move(msg));
-}
+
+  // Now that the length prefixes have been computed, fill in the placeholder
+  // PSK binder.
 """
 
 # tls13_client.cc：删 session_id 回显（服务端 v26.3.27+ 拒绝明文 sid 回显）
@@ -149,7 +140,11 @@ TLS13_SID_CMP_OLD = """      Span<const uint8_t>(out->session_id) != expected_se
 
 
 def find_btls_sys() -> Path:
-    """定位 cargo git checkout 的 btls-sys 目录（deps/boringssl 在其下）。"""
+    """定位 cargo git checkout 的 btls-sys 目录（deps/boringssl 在其下）。
+
+    多个 rev 共存时优先选 Cargo.lock 锁定的 rev——误选其他 checkout 会拿到
+    错误的 boringssl pin 与不匹配的 patch 集。
+    """
     base = Path.home() / ".cargo" / "git" / "checkouts"
     candidates = []
     for btls_dir in base.glob("btls-*"):
@@ -159,6 +154,19 @@ def find_btls_sys() -> Path:
                 candidates.append(candidate)
     if not candidates:
         raise SystemExit("btls-sys checkout not found under " + str(base))
+    locked = None
+    lock = REPO_ROOT / "Cargo.lock"
+    if lock.exists():
+        m = re.search(r'name = "btls-sys"[\s\S]{0,200}?source = "git\+[^"]+#([0-9a-f]{40})"',
+                      lock.read_text(encoding="utf-8"))
+        if m:
+            locked = m.group(1)[:7]
+    if locked:
+        for c in candidates:
+            if c.parent.name.startswith(locked):
+                print(f"using Cargo.lock-pinned checkout: {c}")
+                return c
+        raise SystemExit(f"Cargo.lock pins btls-sys {locked} but no populated checkout found")
     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     print(f"multiple checkouts found, using newest: {candidates[0]}")
     return candidates[0]
@@ -246,9 +254,9 @@ def apply_reality_patches(dest: Path) -> None:
     internal_h = dest / "ssl" / "internal.h"
     text = internal_h.read_text(encoding="utf-8")
     if "ssl_reality_rewrite_maybe" not in text:
-        anchor = "bool ssl_add_message_cbb(SSLImpl *ssl, CBB *cbb);\n"
+        anchor = "bool ssl_add_message_cbb(SSL *ssl, CBB *cbb);\n"
         text = insert_after(
-            text, anchor, "\nbool ssl_reality_rewrite_maybe(SSLImpl *ssl, Array<uint8_t> *msg);\n"
+            text, anchor, "\nbool ssl_reality_rewrite_maybe(SSL *ssl, Array<uint8_t> *msg);\n"
         )
         internal_h.write_text(text, encoding="utf-8", newline="\n")
         print("applied reality patch: internal.h")
