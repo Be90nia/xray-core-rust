@@ -34,6 +34,32 @@ jobs:
             brew install protobuf
           fi
 
+      # btls-sys 在干净环境走其内部 submodule 流程会产出 unpatched libcrypto
+      # (rust-lld: undefined symbol SSL_set_reality_rewrite_cb /
+      #  SSL_get_x25519_key_share_private)。Docker 床实证配方: 预取 boringssl
+      # 固定 rev (Cargo.lock 内 btls-sys git rev 对应的 submodule pin) +
+      # 按 build/main.rs ensure_patches_applied 同序预打补丁, 再用
+      # ASSUME_PATCHED+SOURCE_PATH 让 btls-sys 直接消费已补丁源码。
+      - name: Prepare patched boringssl for btls-sys
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fetch
+          rev=$(awk '/^name = "btls-sys"/{f=1;next} f&&/^source/{print;exit}' Cargo.lock \
+            | sed 's/.*#\([0-9a-f]\{40\}\)".*/\1/')
+          patches_dir=$(ls -d "$HOME"/.cargo/git/checkouts/btls-*/"${rev:0:7}"*/btls-sys/patches | head -1)
+          bssl="$RUNNER_TEMP/boringssl"
+          git init -q "$bssl"
+          git -C "$bssl" remote add origin https://github.com/google/boringssl.git
+          git -C "$bssl" fetch -q --depth 1 origin "$rev"
+          git -C "$bssl" checkout -q FETCH_HEAD
+          git -C "$bssl" apply -v --whitespace=fix "$patches_dir/boring-pq.patch"
+          git -C "$bssl" apply -v --whitespace=fix "$patches_dir/boringssl.patch"
+          git -C "$bssl" apply -v --whitespace=fix "$patches_dir/boringssl-loongarch.patch"
+          git -C "$bssl" apply -v --whitespace=fix "$patches_dir/boringssl-windows.patch"
+          echo "BORING_BSSL_ASSUME_PATCHED=1" >> "$GITHUB_ENV"
+          echo "BORING_BSSL_SOURCE_PATH=$bssl" >> "$GITHUB_ENV"
+
       # macOS 上 workspace 全量编译本身即 darwin 编译烂账防线
       - name: Workspace lib tests
         run: cargo test --workspace --lib

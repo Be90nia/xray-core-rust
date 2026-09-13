@@ -444,7 +444,7 @@ pub fn apply_outbound_socket_options(
         // 未传 dest 时回落 false（行为同 Go 端 -1 默认）。
         let dest_is_v6 = matches!(dest, Some(std::net::SocketAddr::V6(_)));
         darwin::DarwinSockOpt {
-            tcp_fast_open: if opts.tcp_fast_open { 1 } else { -1 },
+            tcp_fast_open: if opts.tcp_fast_open { 1 } else { 0 },
             reuse_port: opts.reuse_port,
             bind_if_index: opts.bind_if_index,
             is_ipv6: dest_is_v6,
