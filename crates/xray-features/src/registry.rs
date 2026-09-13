@@ -107,6 +107,10 @@ pub(crate) fn clear_registry_for_test() {
 mod tests {
     use super::*;
 
+    /// 全局 registry 为进程级共享状态，测试并行时 clear 会互删注册，
+    /// 用锁串行化（同 transport crate TEST_LOCK 惯例）。
+    static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     /// 测试桩 Feature。
     struct StubFeature {
         tag: &'static str,
@@ -133,7 +137,7 @@ mod tests {
 
     #[test]
     fn register_and_create_roundtrip() {
-        clear_registry_for_test();
+        let _g = TEST_LOCK.lock();
         let factory: FeatureFactory = Arc::new(stub_factory);
         register_feature("type.googleapis.com/test.Stub", factory);
 
@@ -145,6 +149,7 @@ mod tests {
 
     #[test]
     fn create_unregistered_returns_not_found() {
+        let _g = TEST_LOCK.lock();
         clear_registry_for_test();
         let err = create_feature("type.googleapis.com/test.Missing", b"").err().unwrap();
         assert!(matches!(err, FeatureError::NotFound { .. }));
@@ -152,8 +157,8 @@ mod tests {
         assert!(msg.contains("test.Missing"));
     }
 
-    #[test]
     fn register_overrides_previous() {
+        let _g = TEST_LOCK.lock();
         clear_registry_for_test();
         let f1: FeatureFactory = Arc::new(|_| {
             Ok(Arc::new(StubFeature { tag: "v1" }) as Arc<dyn Feature>)
@@ -170,6 +175,7 @@ mod tests {
 
     #[test]
     fn factory_decode_error_propagates() {
+        let _g = TEST_LOCK.lock();
         clear_registry_for_test();
         let factory: FeatureFactory = Arc::new(stub_factory);
         register_feature("type.googleapis.com/test.DecodeErr", factory);
