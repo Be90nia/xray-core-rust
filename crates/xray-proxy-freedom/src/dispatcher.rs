@@ -568,10 +568,17 @@ mod tests {
             }
         });
 
-        // 2. FreedomDispatchBridge + sendThrough=127.0.0.2
+        // 2. FreedomDispatchBridge + sendThrough 指定源。127.0.0.2 仅 Linux
+        // 隐式可用（macOS/FreeBSD lo0 默认只配 127.0.0.1，bind 报
+        // AddrNotAvailable → 源 None，CI macos 首跑实证），退化 127.0.0.1，
+        // 断言跟随（测的是 sendThrough bind 生效，不测特定地址）。
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        let send_through: IpAddr = "127.0.0.1".parse().unwrap();
+        #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+        let send_through: IpAddr = "127.0.0.2".parse().unwrap();
         let tcp_bridge = Arc::new(DialBridge::new("freedom-via", make_dial_fn()));
         let bridge = FreedomDispatchBridge::from_bridge(tcp_bridge)
-            .with_send_through(SendThroughSpec::Fixed("127.0.0.2".parse().unwrap()));
+            .with_send_through(SendThroughSpec::Fixed(send_through));
         let ohm = SimpleOhm::new();
         ohm.set_default(Arc::new(bridge));
         let mut dispatcher = DefaultDispatcher::new();
@@ -591,19 +598,22 @@ mod tests {
         let mut frame = Vec::new();
         {
             let mut pw = PacketWriter::new(&mut frame, dest.clone(), [0x33; 8]);
-            pw.write_packet(b"via-127.0.0.2").unwrap();
+            pw.write_packet(b"via-send-through").unwrap();
         }
         let mut mb = MultiBuffer::new();
         mb.merge_bytes(&frame);
         w.write_multi_buffer(mb).await.unwrap();
 
         // 等 echo 记录 peer（轮询 3s）
-        let expected: IpAddr = "127.0.0.2".parse().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while peer_ip.lock().is_none() && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert_eq!(*peer_ip.lock(), Some(expected), "UDP 源 IP 应为 sendThrough 指定的 127.0.0.2");
+        assert_eq!(
+            *peer_ip.lock(),
+            Some(send_through),
+            "UDP 源 IP 应为 sendThrough 指定的 {send_through}"
+        );
         echo_task.abort();
     }
 

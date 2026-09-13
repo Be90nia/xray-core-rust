@@ -624,24 +624,21 @@ where
     // pipe splice 进入站裸 socket，直到对端 EOF/错误。Go 在进入 splice 时把
     // 双端 timer 提到 24h（proxy.go:764-767）——即下行无空闲超时，EOF 即终。
     let down = async move {
+        // Go proxy.go:760-766：splice 直达 raw fd 绕过 link 端 SizeStat 包装，
+        // 经 splice_copy_counted 每 chunk 实时回填两级 downlink 计数器
+        // （readCounter=出站 / writeCounter=入站），否则 Linux splice 路径
+        // per-tag 流量统计恒 0（CI 首跑实证）。
+        let counters = match (
+            down_counters.0.as_deref(),
+            down_counters.1.as_deref(),
+        ) {
+            (Some(o), Some(i)) => Some((o, i)),
+            _ => None,
+        };
         let res = match down_from {
-            Some(from) => crate::splice::splice_copy(&from, &write_raw).await,
+            Some(from) => crate::splice::splice_copy_counted(&from, &write_raw, counters).await,
             None => Ok(0),
         };
-        // Go proxy.go:761-766：splice 直达 raw fd 绕过 link 端 SizeStat 包装，
-        // 字节数必须在泵处回填两级 downlink 计数器（readCounter=出站 /
-        // writeCounter=入站），否则 Linux splice 路径 per-tag 流量统计恒 0。
-        if let Ok(n) = res {
-            if n > 0 {
-                let n = i64::try_from(n).unwrap_or(i64::MAX);
-                if let Some(c) = down_counters.0.as_ref() {
-                    c.add(n);
-                }
-                if let Some(c) = down_counters.1.as_ref() {
-                    c.add(n);
-                }
-            }
-        }
         writer.shutdown();
         let _ = down_done_tx.send(Some(downlink_only));
         res.map(|_| ())

@@ -21,7 +21,7 @@
 
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
-pub use imp::{bridge_with, plan, splice_copy};
+pub use imp::{bridge_with, plan, splice_copy, splice_copy_counted};
 
 mod imp {
     use std::io;
@@ -62,6 +62,21 @@ mod imp {
     /// 必有空间，fill 返回 0 只能是 `from` EOF；`pending > 0` 时 pipe 必有
     /// 数据，drain 不会因空 pipe 假 EAGAIN。任一端 IO 错误原样上抛。
     pub async fn splice_copy(from: &TcpStream, to: &TcpStream) -> io::Result<u64> {
+        splice_copy_counted(from, to, None).await
+    }
+
+    /// [`splice_copy`] + per-chunk 实时计数（Go proxy.go:760-766 等价：
+    /// `tc.ReadFrom` 每轮回填 readCounter/writeCounter，连接存活期计数即时
+    /// 可见，无需等 EOF）。`counters` = (出站 downlink，入站 downlink)——
+    /// chunk 自 `from`（远端）读出并写入 `to`（客户端），同字节数双向计数。
+    pub async fn splice_copy_counted(
+        from: &TcpStream,
+        to: &TcpStream,
+        counters: Option<(
+            &dyn xray_features::stats::Counter,
+            &dyn xray_features::stats::Counter,
+        )>,
+    ) -> io::Result<u64> {
         let mut fds: [libc::c_int; 2] = [0; 2];
         // O_NONBLOCK：socket 侧本就非阻塞；pipe 侧非阻塞使满/空均 EAGAIN，
         // 交由下方 readiness 等待，绝不阻塞 executor 线程。
@@ -92,6 +107,12 @@ mod imp {
                     n if n > 0 => {
                         pending += n as usize;
                         total += n as u64;
+                        // Go proxy.go:762/765：chunk 即回填，连接存活期计数实时。
+                        if let Some((out_c, in_c)) = counters {
+                            let n64 = n as i64;
+                            out_c.add(n64);
+                            in_c.add(n64);
+                        }
                     }
                     0 => eof = true,
                     n if n < 0 => {
