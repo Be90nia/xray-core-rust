@@ -331,7 +331,7 @@ pub trait DispatchHandler: Send + Sync + Debug {
 /// `inbound_tag` 由生产入口（InboundDispatchHandler）填充，协议层只需给
 /// `from`（客户端源地址）、`email`（认证用户，无认证协议留空）与 `level`
 /// （用户策略层级，对应 Go `session.Inbound.User.Level`，默认 0）。
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct AccessContext {
     /// 客户端源地址（如 `1.2.3.4:1080`）。
     pub from: String,
@@ -359,6 +359,31 @@ pub struct AccessContext {
     /// splice copy 决策信号（Go `session.Inbound.CanSpliceCopy`，session.go:75-77）：
     /// 1=可，2=处理后可行，3=不可，0=未挂信号（零值 → splice 天然不启用）。
     pub can_splice_copy: i32,
+    /// splice 下行出站计数器（Go proxy.go:761-762 `readCounter.Add(w)` 等价）：
+    /// 下行 splice 泵直达 raw fd，绕过 link 端 SizeStat 包装；per-tag
+    /// `outbound>>>tag>>>traffic>>>downlink` 由 dispatch_link 随 access 回填
+    /// 到泵处计数，否则 Linux splice 路径流量统计恒 0（CI 首跑实证）。
+    pub splice_down_out: Option<Arc<dyn xray_features::stats::Counter>>,
+    /// splice 下行入站计数器（Go proxy.go:764-765 `writeCounter.Add(w)` 等价）：
+    /// `inbound>>>tag>>>traffic>>>downlink`，由 InboundDispatchHandler 回填。
+    pub splice_down_in: Option<Arc<dyn xray_features::stats::Counter>>,
+}
+
+impl std::fmt::Debug for AccessContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccessContext")
+            .field("from", &self.from)
+            .field("email", &self.email)
+            .field("inbound_tag", &self.inbound_tag)
+            .field("level", &self.level)
+            .field("allowed_network", &self.allowed_network)
+            .field("local", &self.local)
+            .field("conn", &self.conn)
+            .field("can_splice_copy", &self.can_splice_copy)
+            .field("splice_down_out", &self.splice_down_out.is_some())
+            .field("splice_down_in", &self.splice_down_in.is_some())
+            .finish()
+    }
 }
 
 /// 一次 access 记录（对应 Go `log.AccessMessage` 最终形态）。
@@ -1304,7 +1329,7 @@ impl DefaultDispatcher {
             // CachedReader 始终包装 outbound_reader，sniffing 时回放缓存首包
             let mut reader: Box<dyn xray_buf::io::Reader> =
                 crate::stats::maybe_wrap_reader(out_up, Box::new(cr));
-            let mut writer = crate::stats::maybe_wrap_writer(out_dn, outbound_writer);
+            let mut writer = crate::stats::maybe_wrap_writer(out_dn.clone(), outbound_writer);
 
             // ---- per-user stats（对应 Go getLink default.go:161-185，email 非空挂接） ----
             // uplink：Go 包 inboundLink.Writer（上行 pipe 入站写端）；Rust inbound 端
@@ -1390,6 +1415,13 @@ impl DefaultDispatcher {
             };
             let final_link = xray_transport::link::Link::new(reader, writer);
 
+            // splice 下行出站计数器随 access 抵达 splice 泵（Go proxy.go:762
+            // readCounter.Add 等价）：下行直达 raw fd 绕过 link.writer 的
+            // SizeStat 包装，必须在泵回填，否则 Linux splice 路径统计恒 0。
+            let mut access = access;
+            if let Some(a) = access.as_mut() {
+                a.splice_down_out = out_dn.clone();
+            }
             let fut = handler.dispatch_with_access(&final_dest, final_link, access.unwrap_or_default());
             let _ = fut.await;
         };
@@ -1579,13 +1611,29 @@ pub struct DialBridge {
 /// 放进 [`AccessContext`] → freedom 出站（[`crate::AccessContext`] 消费者）
 /// 在 `tcp.dispatch` 外层 `.scope(...)` → [`DialBridge::dispatch`] 桥接判定处
 /// `try_with` 读取。模式与 freedom 的 `PROXY_PROTO_SRC` task-local 一致。
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct InboundSpliceMeta {
     /// Go `session.Inbound.CanSpliceCopy`（1=可）。
     pub can_splice_copy: i32,
     /// 入站裸 TCP 克隆（Go `session.Inbound.Conn`，Arc 共享——TcpStream 非
     /// Clone，且 Go `net.Conn` 本就是指针语义）。
     pub raw: Option<Arc<tokio::net::TcpStream>>,
+    /// splice 下行出/入站计数器（Go proxy.go:761-765，随 access 自
+    /// [`AccessContext`] 复制）；泵回填 splice 字节，语义见
+    /// [`AccessContext.splice_down_out`]。
+    pub down_out: Option<Arc<dyn xray_features::stats::Counter>>,
+    pub down_in: Option<Arc<dyn xray_features::stats::Counter>>,
+}
+
+impl std::fmt::Debug for InboundSpliceMeta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InboundSpliceMeta")
+            .field("can_splice_copy", &self.can_splice_copy)
+            .field("raw", &self.raw.is_some())
+            .field("down_out", &self.down_out.is_some())
+            .field("down_in", &self.down_in.is_some())
+            .finish()
+    }
 }
 
 tokio::task_local! {
@@ -1744,6 +1792,7 @@ impl DispatchHandler for DialBridge {
                         if let Some(inbound_raw) = inbound.raw {
                             if let Err(e) = xray_transport::bridge::bridge_link_with_stream_downlink_splice(
                                     link, remote, inbound_raw, &policy,
+                                    (inbound.down_out.clone(), inbound.down_in.clone()),
                                 )
                                 .await
                             {
@@ -4246,6 +4295,7 @@ mod tests {
             raw: Some(Arc::new(
                 xray_transport::connection::dup_tcp_stream(&in_raw).unwrap(),
             )),
+            ..Default::default()
         };
         // Go freedom.go:260 唯一置 1 点（xray-core outbound.rs freedom 分支同款）
         bridge.set_splice_outbound(true);

@@ -386,6 +386,8 @@ impl DispatchHandler for FreedomDispatchBridge {
                 let splice_meta = xray_app_dispatcher::InboundSpliceMeta {
                     can_splice_copy: access.can_splice_copy,
                     raw: access.conn,
+                    down_out: access.splice_down_out.clone(),
+                    down_in: access.splice_down_in.clone(),
                 };
                 PROXY_PROTO_SRC
                     .scope(
