@@ -555,8 +555,8 @@ pub async fn bridge_link_with_stream_downlink_splice<S>(
     write_raw: std::sync::Arc<tokio::net::TcpStream>,
     policy: &TimeoutPolicy,
     down_counters: (
-        Option<Arc<dyn xray_features::stats::Counter>>,
-        Option<Arc<dyn xray_features::stats::Counter>>,
+        Option<std::sync::Arc<dyn xray_features::stats::Counter>>,
+        Option<std::sync::Arc<dyn xray_features::stats::Counter>>,
     ),
 ) -> io::Result<()>
 where

@@ -3032,9 +3032,16 @@ mod tests {
             sock.write_all(&buf[..n]).await.unwrap();
         });
 
-        // 2. freedom outbound + sendThrough=127.0.0.2
+        // 2. freedom outbound + sendThrough
+        // macOS/FreeBSD 默认只配 127.0.0.1（无 127/8 全段），源 IP 退化为
+        // 127.0.0.1；Linux/Windows 用 127.0.0.2 证伪"未生效源=默认源"。
+        let send_through_ip = if cfg!(any(target_os = "macos", target_os = "freebsd")) {
+            "127.0.0.1"
+        } else {
+            "127.0.0.2"
+        };
         let ob = BuiltOutbound {
-            send_through: Some("127.0.0.2".to_string()),
+            send_through: Some(send_through_ip.to_string()),
             ..make_outbound("freedom", "via-test", "{}")
         };
         let (handler, _, _) = try_build_handler(
@@ -3070,8 +3077,8 @@ mod tests {
         accept_task.await.unwrap();
         assert_eq!(
             *peer_ip.lock(),
-            Some("127.0.0.2".parse().unwrap()),
-            "连接源 IP 应为 sendThrough 指定的 127.0.0.2"
+            Some(send_through_ip.parse().unwrap()),
+            "连接源 IP 应为 sendThrough 指定的源"
         );
     }
 
