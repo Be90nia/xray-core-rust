@@ -562,6 +562,7 @@ pub async fn bridge_link_with_stream_downlink_splice<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Connection,
 {
+    use std::sync::Arc;
     use tokio::io::AsyncWriteExt;
     use xray_buf::io::{Reader, Writer};
 

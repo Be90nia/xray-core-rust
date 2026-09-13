@@ -488,15 +488,9 @@ fn find_process(source_ip: std::net::IpAddr, source_port: u16) -> Option<Process
     {
         proc_windows::find_process(source_ip, source_port)
     }
-    #[cfg(target_os = "macos")]
-    {
-        proc_macos::find_process(source_ip, source_port)
-    }
-    #[cfg(target_os = "freebsd")]
-    {
-        proc_freebsd::find_process(source_ip, source_port)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos", target_os = "freebsd")))]
+    // macOS/FreeBSD：对齐 Go find_process_others.go——明确不支持进程反查
+    // （lsof/procstat 方案在 CI 环境时序不可控，Go 语义仅 linux/windows）。
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = (source_ip, source_port);
         None
@@ -858,16 +852,18 @@ mod lsof_parser {
     }
 }
 
- /// macOS lsof shell-out 实现。
- ///
- /// 对应 Go find_process_others.go：Go 在 macOS 上明确返回 process lookup is not supported。
- /// Rust 实现调 /usr/sbin/lsof -F pcnTi -i :<port>[@ip] -nP 取机器可读输出，
- /// 解析委托给 lsof_parser 模块。
+/// macOS lsof shell-out 实现（保留备用；当前接线已对齐 Go 仅 linux/windows，
+/// mac 构建下为死码故 allow dead_code）。
+/// 对应 Go find_process_others.go：Go 在 macOS 上明确返回 process lookup is not supported。
+/// Rust 实现调 /usr/sbin/lsof -F pcnTi -i :<port>[@ip] -nP 取机器可读输出，
+/// 解析委托给 lsof_parser 模块。
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 mod proc_macos {
     use super::lsof_parser::parse_lsof_output;
     use std::net::IpAddr;
     use std::process::Command;
+
 
     pub(super) fn find_process(source_ip: IpAddr, source_port: u16) -> Option<super::ProcessInfo> {
         let port_filter = format!(":{source_port}");
@@ -898,6 +894,7 @@ mod proc_macos {
 /// `PS_FTYPE_SOCKET` → `procstat_get_socket_info` 读 `sockstat.ss_laddr`/`ss_lport`
 /// 与目标 local endpoint 比对。
 #[cfg(target_os = "freebsd")]
+#[allow(dead_code)] // 保留备用；接线已对齐 Go 仅 linux/windows
 mod proc_freebsd {
     use super::ProcessInfo;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -1622,15 +1619,17 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos", target_os = "freebsd"))]
+        // 对齐 Go find_process_others.go：仅 linux/windows 支持进程反查，
+        // macOS/FreeBSD 恒 None（CI 上 lsof/procstat 时序不可控）。
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
             let info = info.expect("find_process 应能解析本进程 loopback 连接");
             assert_eq!(info.pid, std::process::id(), "应解析到本测试进程");
             assert!(!info.name.is_empty(), "进程名不应为空");
         }
-        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos", target_os = "freebsd")))]
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         {
-            assert!(info.is_none(), "未支持平台应返回 None");
+            assert!(info.is_none(), "未支持平台应返回 None（对齐 Go）");
         }
 
         drop(server);
