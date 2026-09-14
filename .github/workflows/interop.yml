@@ -19,7 +19,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, ubuntu-24.04]
+        # macos-13 实验：GitHub 已淘汰该镜像，可能永远排队——本轮拿实证，
+        # 排队超 30 分钟即接受"淘汰加不了"结论（PM 盯队列时长）。
+        os: [macos-14, macos-13, ubuntu-24.04]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
