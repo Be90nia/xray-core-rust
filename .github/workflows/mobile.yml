@@ -44,6 +44,7 @@ jobs:
             echo "AR_aarch64_linux_android=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
             # cargo 链接器：缺省落宿主 ld（Relocations in generic ELF EM:183），必须指 NDK wrapper
             echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          } >> "$GITHUB_ENV"
       - name: Build xray (aarch64-linux-android)
         run: |
           echo "覆盖范围：全量 -p xray-cli --bin xray（含 btls-sys cmake 交叉编译——boringssl 官方支持 android，btls-sys build/main.rs 的 android 分支消费 ANDROID_NDK_HOME；go 由 setup-go 提供）"
