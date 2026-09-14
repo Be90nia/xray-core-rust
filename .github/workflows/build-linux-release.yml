@@ -15,7 +15,12 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake nasm protobuf-compiler pkg-config libssl-dev
+          sudo apt-get install -y cmake nasm pkg-config libssl-dev unzip
+          # apt 的 protobuf-compiler 太旧（3.12）不支持 proto3 optional，下载新版 protoc 二进制替代
+          curl -fsSL -o /tmp/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v36.1/protoc-36.1-linux-x86_64.zip
+          sudo unzip -o /tmp/protoc.zip -d /usr/local
+          rm /tmp/protoc.zip
+          /usr/local/bin/protoc --version
       - name: Cache cargo
         uses: actions/cache@v4
         with:
