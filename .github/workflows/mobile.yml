@@ -44,7 +44,33 @@ jobs:
             echo "AR_aarch64_linux_android=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
             # cargo 链接器：缺省落宿主 ld（Relocations in generic ELF EM:183），必须指 NDK wrapper
             echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
-          } >> "$GITHUB_ENV"
+      # REALITY 补丁的 boringssl 供给（与 interop.yml 同配方）：btls-sys 0.5.6
+      # 的补丁集不含 SSL_set_reality_rewrite_cb/SSL_get_x25519_key_share_private
+      # （xray-tls btls_reality.rs FFI 需要）。btls-sys build/main.rs 的 android
+      # 分支正常消费 BORING_BSSL_SOURCE_PATH（get_boringssl_source_path 在平台
+      # 分支之前返回），cmake 用 NDK toolchain 编我们已补丁的源码树。
+      - name: Prepare patched boringssl for btls-sys
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fetch
+          rev=$(awk '/^name = "btls-sys"/{f=1;next} f&&/^source/{print;exit}' Cargo.lock \
+            | sed 's/.*#\([0-9a-f]\{40\}\)".*/\1/')
+          btls_co=$(ls -d "$HOME"/.cargo/git/checkouts/btls-*/"${rev:0:7}"* | head -1)
+          patches_dir="$btls_co/btls-sys/patches"
+          bssl_rev=$(git -C "$btls_co" ls-tree HEAD btls-sys/deps/boringssl | awk '{print $3}')
+          bssl="$RUNNER_TEMP/boringssl"
+          git init -q "$bssl"
+          git -C "$bssl" remote add origin https://github.com/google/boringssl.git
+          git -C "$bssl" fetch -q --depth 1 origin "$bssl_rev"
+          git -C "$bssl" checkout -q FETCH_HEAD
+          git -C "$bssl" apply -v --whitespace=fix "$patches_dir/boring-pq.patch"
+          git -C "$bssl" apply -v --whitespace=fix "$patches_dir/boringssl.patch"
+          git -C "$bssl" apply -v --whitespace=fix "$patches_dir/boringssl-loongarch.patch"
+          git -C "$bssl" apply -v --whitespace=fix "$patches_dir/boringssl-windows.patch"
+          python3 -c "import sys, pathlib; sys.path.insert(0, 'tools'); from setup_boringssl_reality import apply_reality_patches; apply_reality_patches(pathlib.Path('$RUNNER_TEMP/boringssl'))"
+          echo "BORING_BSSL_ASSUME_PATCHED=1" >> "$GITHUB_ENV"
+          echo "BORING_BSSL_SOURCE_PATH=$bssl" >> "$GITHUB_ENV"
       - name: Build xray (aarch64-linux-android)
         run: |
           echo "覆盖范围：workspace 全量 --bin xray（含 btls-sys cmake 交叉编译——boringssl 官方支持 android，btls-sys build/main.rs android 分支消费 ANDROID_NDK_HOME）。xray-proxy-tun 已源码级门控：android 上 tun_rs 依赖不编译、走 device_stub（VpnService 宿主注入）"
