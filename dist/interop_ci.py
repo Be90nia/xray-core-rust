@@ -218,27 +218,23 @@ def run_one(idx, proto, server_bin, client_bin, tag, work, dry=False):
                                   stderr=subprocess.STDOUT, env=env)
             clog.close()
             procs.append(pc)
-        slog.close()
-        procs.append(ps)
-        if not wait_port(P, 15):
-            err = 'server 未监听 %d (15s)' % P
-        else:
-            clog = open(os.path.join(work, 'c%d.log' % idx), 'wb')
-            pc = subprocess.Popen([client_bin, 'run', '-c', ccp], stdout=clog, stderr=subprocess.STDOUT)
-            clog.close()
-            procs.append(pc)
-            wait_port(S, 15)
-            bp = os.path.join(work, 'b%d.body' % idx)
-            try:
-                r = subprocess.run(['curl', '-sS', '--max-time', '15', '-x', 'socks5h://127.0.0.1:%d' % S,
-                                    'https://www.youtube.com/', '-o', bp, '-w', 'HTTP:%{http_code}'],
-                                   capture_output=True, text=True, timeout=20)
-                bs = os.path.getsize(bp) if os.path.exists(bp) else 0
-                marker = b'YouTube' in open(bp, 'rb').read(200000) if bs else False
-                flag = 'PASS' if (bs > 5000 and marker) else 'FAIL'
-                err = r.stderr.strip()[:60]
-            except Exception as e:
-                flag, bs, err = 'FAIL', 0, str(e)[:60]
+            if pc.poll() is not None:
+                # client 启动即死（如端口被残留进程占用 EADDRINUSE）——立即
+                # FAIL 并带日志尾，杜绝"残留旧实例代答导致假 PASS/模糊失败"。
+                err = 'client 启动即退出，详见 c%d.log' % idx
+            else:
+                wait_port(S, 15)
+                bp = os.path.join(work, 'b%d.body' % idx)
+                try:
+                    r = subprocess.run(['curl', '-sS', '--max-time', '15', '-x', 'socks5h://127.0.0.1:%d' % S,
+                                        'https://www.youtube.com/', '-o', bp, '-w', 'HTTP:%{http_code}'],
+                                       capture_output=True, text=True, timeout=20)
+                    bs = os.path.getsize(bp) if os.path.exists(bp) else 0
+                    marker = b'YouTube' in open(bp, 'rb').read(200000) if bs else False
+                    flag = 'PASS' if (bs > 5000 and marker) else 'FAIL'
+                    err = r.stderr.strip()[:60]
+                except Exception as e:
+                    flag, bs, err = 'FAIL', 0, str(e)[:60]
     finally:
         stop(procs)
         kill_bins(server_bin, client_bin)

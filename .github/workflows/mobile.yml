@@ -45,8 +45,8 @@ jobs:
           } >> "$GITHUB_ENV"
       - name: Build xray (aarch64-linux-android)
         run: |
-          echo "覆盖范围：全量 -p xray-core --bin xray（含 btls-sys cmake 交叉编译——boringssl 官方支持 android，btls-sys build/main.rs 的 android 分支消费 ANDROID_NDK_HOME；go 由 setup-go 提供）"
-          cargo build --target aarch64-linux-android -p xray-core --bin xray
+          echo "覆盖范围：全量 -p xray-cli --bin xray（含 btls-sys cmake 交叉编译——boringssl 官方支持 android，btls-sys build/main.rs 的 android 分支消费 ANDROID_NDK_HOME；go 由 setup-go 提供）"
+          cargo build --target aarch64-linux-android -p xray-cli --bin xray
 
   ios:
     name: iOS aarch64 check gate
