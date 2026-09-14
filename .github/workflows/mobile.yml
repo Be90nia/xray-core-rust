@@ -48,7 +48,7 @@ jobs:
       - name: Build xray (aarch64-linux-android, exclude xray-proxy-tun)
         run: |
           echo "覆盖范围：-p xray-cli --bin xray 排除 xray-proxy-tun（tun_rs 无 android target API：DeviceBuilder/Layer/if_index 未导出，与 iOS 同因；Android 生态 VpnService 由宿主 App 注入流量）——含 btls-sys cmake 交叉编译（boringssl 官方支持 android，btls-sys build/main.rs android 分支消费 ANDROID_NDK_HOME）"
-          cargo build --target aarch64-linux-android -p xray-cli --bin xray --exclude xray-proxy-tun
+          cargo build --workspace --exclude xray-proxy-tun --bin xray --target aarch64-linux-android
 
   ios:
     name: iOS aarch64 check gate
