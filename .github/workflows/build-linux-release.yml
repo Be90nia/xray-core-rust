@@ -21,14 +21,16 @@ jobs:
           sudo unzip -o /tmp/protoc.zip -d /usr/local
           rm /tmp/protoc.zip
           /usr/local/bin/protoc --version
-      - name: Cache cargo
+      # 只 cache registry/git（不要 cache target——btls-sys 编译产出必须在每次 run 重做
+      # 否则命中脏 cache 会链接到 unpatched libcrypto 缺 SSL_get_x25519_key_share_private /
+      # SSL_set_reality_rewrite_cb 符号；版本字段 v3 让之前的 cache 全部 miss）
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-v3-${{ hashFiles('**/Cargo.lock') }}
       - name: Build release
         run: cargo build --release -p xray-cli --target x86_64-unknown-linux-gnu
       - name: Verify binary
