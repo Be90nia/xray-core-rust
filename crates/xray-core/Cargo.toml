@@ -83,3 +83,7 @@ x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 # macOS/Windows 不编译（需 wintun.dll/utun 权限，用户可手动加回）
 [target.'cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))'.dependencies]
 xray-proxy-tun = { path = "../xray-proxy-tun" }
+
+# DNS UDP recvmmsg 批收（bd yblz）——仅 Linux gnu：musl/uclibc 的 libc 未导出 recvmmsg 函数。
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = "0.2"

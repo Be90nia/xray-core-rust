@@ -264,6 +264,9 @@ pub(crate) fn build_hysteria_transport_config(
     qc: &QuicConfig,
 ) -> (quinn::TransportConfig, std::sync::Arc<crate::congestion::quinn_bridge::HysteriaCCSlot>) {
     let mut t = quinn::TransportConfig::default();
+    // u9um：initial_rtt 333ms→100ms（RFC 9002 内部参数）——跨太 161ms 链路避免首次
+    // 丢包后 PTO 重传等待过久；仅影响本地重传计时，wire-format 不变。
+    t.initial_rtt(Duration::from_millis(100));
     if qc.max_idle_timeout_ms > 0 {
         if let Ok(v) = quinn::VarInt::try_from(qc.max_idle_timeout_ms) {
             t.max_idle_timeout(Some(quinn::IdleTimeout::from(v)));
@@ -271,6 +274,9 @@ pub(crate) fn build_hysteria_transport_config(
     }
     if qc.keep_alive_period_ms > 0 {
         t.keep_alive_interval(Some(Duration::from_millis(qc.keep_alive_period_ms)));
+    } else {
+        // u9um：无显式配置时默认 15s 保活探测（NAT 表 30-60s 过期，15s 间隔可续表项）。
+        t.keep_alive_interval(Some(Duration::from_secs(15)));
     }
     if qc.enable_datagrams {
         // 参数化（rjo9）：取 QuicConfig.max_datagram_frame_size——from_params 与
@@ -296,6 +302,11 @@ pub(crate) fn build_hysteria_transport_config(
     if let Ok(v) = quinn::VarInt::try_from(conn_win) {
         t.receive_window(v);
     }
+    // u9um：MTU 发现上界 1452→1500（默认 1452 为 IPv6 安全假设；1500 覆盖标准以太网
+    // MTU，探测失败仍会黑洞回退 1200，无不可修复风险）。放 disable 检查前，禁用配置仍覆盖。
+    let mut mtu_cfg = quinn::MtuDiscoveryConfig::default();
+    mtu_cfg.upper_bound(1500);
+    t.mtu_discovery_config(Some(mtu_cfg));
     // 禁用路径 MTU 探测（Go dialer.go:92 / hub.go:271；Windows 上 Go 恒 false，仅显式配置生效）
     if qc.disable_path_mtu_discovery {
         t.mtu_discovery_config(None);

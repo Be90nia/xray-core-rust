@@ -272,7 +272,8 @@ async fn tun_driver_loop(
     dispatch: Arc<dyn DispatchHandler>,
 ) {
     let mut timer = interval(POLL_INTERVAL);
-    let mut recv_buf = vec![0u8; TUN_RECV_BUF_SIZE];
+    // 读侧批量缓冲（票 ukh8）：Linux 一次 syscall 出一批，其他平台单包。
+    let mut rx = RxPackets::new(&device);
 
     // UDP 走 IP+UDP 头解析路径；TCP 走 SYN 惰性注册路径（票 ipb5，见主循环），
     // 均不预先创建 smoltcp socket。
@@ -283,48 +284,47 @@ async fn tun_driver_loop(
 
     loop {
         tokio::select! {
-            // 从 TUN 设备读取 IP 包
-            result = device.recv(&mut recv_buf) => {
+            // 从 TUN 设备读取 IP 包（Linux：一次 syscall 读一批 GRO 拆分段）
+            result = rx.recv(&device) => {
                 match result {
-                    Ok(n) => {
-                        if n == 0 { continue; }
-                        let pkt = &recv_buf[..n];
+                    Ok(count) => {
+                        for i in 0..count {
+                            let pkt = rx.packet(i);
 
-                        // 先尝试按 UDP 解析：能解出 4 元组就 bypass smoltcp，
-                        // 避免 smoltcp 对未 bind 端口发 ICMP port unreachable。
-                        // ponytail: 直接判字节，省一次 smoltcp poll 锁。
-                        if let Some((meta, payload)) = parse_udp_packet(pkt) {
-                            handle_udp_packet(
-                                &udp_sessions,
-                                meta,
-                                payload,
-                                Arc::clone(&dispatch),
-                                Arc::clone(&device),
-                            );
-                            continue;
-                        }
-
-                        let mut stack = netstack.lock().await;
-                        // TCP SYN → 惰性注册 listen socket（票 ipb5）。必须发生在
-                        // ingest 之前，本次 poll 才能为该 SYN 生成 SYN-ACK。
-                        // 注册失败（port=0 等，几乎不可能）→ 丢弃该 SYN，连接建不起来，
-                        // 不静默吞掉：error 日志可见。
-                        if let Some(dst) = parse_tcp_syn_dst(pkt) {
-                            if let Err(e) = stack.ensure_tcp_listen(dst) {
-                                tracing::error!(error = %e, dst = ?dst, "tcp lazy listen failed, dropping SYN");
+                            // 先尝试按 UDP 解析：能解出 4 元组就 bypass smoltcp，
+                            // 避免 smoltcp 对未 bind 端口发 ICMP port unreachable。
+                            // ponytail: 直接判字节，省一次 smoltcp poll 锁。
+                            if let Some((meta, payload)) = parse_udp_packet(pkt) {
+                                handle_udp_packet(
+                                    &udp_sessions,
+                                    meta,
+                                    payload,
+                                    Arc::clone(&dispatch),
+                                    Arc::clone(&device),
+                                );
+                                continue;
                             }
-                        }
-                        stack.ingest_rx(pkt.to_vec());
-                        stack.poll(smoltcp::time::Instant::now());
-                        // 处理 ICMP echo request 并自动回复
-                        stack.process_icmp_echo();
-                        // 检测 TCP accept 事件
-                        handle_socket_events(&mut stack, &netstack, &dispatch);
-                        // drain tx 并写回 TUN
-                        let tx_pkts = stack.drain_tx();
-                        drop(stack); // 释放锁再 await
-                        for pkt in tx_pkts {
-                            let _ = device.send(&pkt).await;
+
+                            let mut stack = netstack.lock().await;
+                            // TCP SYN → 惰性注册 listen socket（票 ipb5）。必须发生在
+                            // ingest 之前，本次 poll 才能为该 SYN 生成 SYN-ACK。
+                            // 注册失败（port=0 等，几乎不可能）→ 丢弃该 SYN，连接建不起来，
+                            // 不静默吞掉：error 日志可见。
+                            if let Some(dst) = parse_tcp_syn_dst(pkt) {
+                                if let Err(e) = stack.ensure_tcp_listen(dst) {
+                                    tracing::error!(error = %e, dst = ?dst, "tcp lazy listen failed, dropping SYN");
+                                }
+                            }
+                            stack.ingest_rx(pkt.to_vec());
+                            stack.poll(smoltcp::time::Instant::now());
+                            // 处理 ICMP echo request 并自动回复
+                            stack.process_icmp_echo();
+                            // 检测 TCP accept 事件
+                            handle_socket_events(&mut stack, &netstack, &dispatch);
+                            // drain tx 并写回 TUN
+                            let tx_pkts = stack.drain_tx();
+                            drop(stack); // 释放锁再 await
+                            write_tx_back(&device, tx_pkts).await;
                         }
                     }
                     Err(e) => {
@@ -345,10 +345,93 @@ async fn tun_driver_loop(
                     handle_socket_events(&mut stack, &netstack, &dispatch);
                     stack.drain_tx()
                 };
-                for pkt in tx_pkts {
-                    let _ = device.send(&pkt).await;
-                }
+                write_tx_back(&device, tx_pkts).await;
             }
+        }
+    }
+}
+
+/// TUN 读侧缓冲与批量读取（票 ukh8 平台收敛点）。
+///
+/// Linux：设备以 offload/vnet_hdr 创建——一次 syscall 读出内核 GRO 聚合
+/// 大包并拆成 ≤MTU 的段（64KiB 聚合 ≈ 44 个 1500MTU 包，缓冲按
+/// IDEAL_BATCH_SIZE 预留）；vnet_hdr 协商失败时 tun-rs 内部退化为单包读。
+/// 其他平台：单包 recv，行为与改动前一致。
+struct RxPackets {
+    #[cfg(target_os = "linux")]
+    original: Box<[u8]>,
+    #[cfg(target_os = "linux")]
+    bufs: Vec<Vec<u8>>,
+    #[cfg(target_os = "linux")]
+    sizes: Vec<usize>,
+    #[cfg(not(target_os = "linux"))]
+    buf: Vec<u8>,
+    #[cfg(not(target_os = "linux"))]
+    len: usize,
+}
+
+impl RxPackets {
+    fn new(device: &TunDevice) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            Self {
+                original: vec![0u8; tun_rs::VIRTIO_NET_HDR_LEN + 65535].into_boxed_slice(),
+                bufs: vec![vec![0u8; device.mtu() as usize]; tun_rs::IDEAL_BATCH_SIZE],
+                sizes: vec![0; tun_rs::IDEAL_BATCH_SIZE],
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = device;
+            Self {
+                buf: vec![0u8; TUN_RECV_BUF_SIZE],
+                len: 0,
+            }
+        }
+    }
+
+    /// 读一批包，返回包数（非 Linux 恒 0 或 1）。
+    async fn recv(&mut self, device: &TunDevice) -> std::io::Result<usize> {
+        #[cfg(target_os = "linux")]
+        {
+            device
+                .recv_batch(&mut self.original, &mut self.bufs, &mut self.sizes)
+                .await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let n = device.recv(&mut self.buf).await?;
+            self.len = n;
+            Ok(usize::from(n != 0))
+        }
+    }
+
+    /// 第 i 个包（i < 上次 recv 返回值）。
+    fn packet(&self, i: usize) -> &[u8] {
+        #[cfg(target_os = "linux")]
+        {
+            &self.bufs[i][..self.sizes[i]]
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = i;
+            &self.buf[..self.len]
+        }
+    }
+}
+
+/// tx 队列写回 TUN（票 ukh8 平台收敛点）：Linux 走 GRO 批量写（同流
+/// TCP/UDP 小包合并后减少 write syscall 次数），其他平台逐包写。
+/// 回写失败静默忽略——与改动前行为一致（TCP 由内核重传兜底）。
+async fn write_tx_back(device: &TunDevice, tx_pkts: Vec<Vec<u8>>) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = device.send_batch(tx_pkts).await;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        for pkt in tx_pkts {
+            let _ = device.send(&pkt).await;
         }
     }
 }

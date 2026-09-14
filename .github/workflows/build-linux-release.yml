@@ -64,6 +64,13 @@ jobs:
         run: cargo build --release -p xray-cli --target x86_64-unknown-linux-gnu
       - name: Verify binary
         run: file target/x86_64-unknown-linux-gnu/release/xray
+      # bd m1t5：发行 feature 闭包下 REALITY 生产 TLS 冒烟门——server_tls
+      # (build_server_config) + u_client 完整握手；rustls 双 CryptoProvider
+      # unification 时裸 builder() panic 由生产侧 install_default 兜底
+      # （bd rknm），此处 panic 即回归。feature unification 与 profile 无关，
+      # debug 等价覆盖且不额外吃 30min 预算。
+      - name: REALITY TLS smoke test
+        run: cargo test -p xray-reality --test reality_tls_smoke
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

@@ -618,6 +618,7 @@ pub fn websocket_handshake_alpn(security_json: Option<&serde_json::Value>) -> Ve
 /// 返回的 config 可在多次 `client()`/`u_client()` 调用间复用（`Arc` clone 廉价）。
 #[must_use]
 pub fn default_client_config() -> Arc<ClientConfig> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     Arc::new(
@@ -639,6 +640,7 @@ mod tests {
 
     /// 测试用 TLS server：自签证书 + 单条消息回显。
     async fn spawn_test_server(msg: &'static [u8]) -> (std::net::SocketAddr, Vec<u8>) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         // 自签证书
         let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         let key_pair = rcgen::KeyPair::generate().unwrap();
@@ -680,6 +682,7 @@ mod tests {
     }
 
     fn trusted_config(cert_der: Vec<u8>) -> Arc<ClientConfig> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
         root_store
             .add(rustls_pki_types::CertificateDer::from(cert_der))

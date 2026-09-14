@@ -124,6 +124,8 @@ pub fn build_server_config_with_stapling(
     key_pem: &[u8],
     config: &OcspStaplerConfig,
 ) -> Result<ServerConfigAndStapler, TlsError> {
+    // 裸 ServerConfig::builder() 在 rustls 双 CryptoProvider feature 下 panic；幂等安装
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let ckey = load_certified_key(certs_pem, key_pem)?;
     let ckey = Arc::new(ckey);
 
