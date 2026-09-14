@@ -45,10 +45,10 @@ jobs:
             # cargo 链接器：缺省落宿主 ld（Relocations in generic ELF EM:183），必须指 NDK wrapper
             echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
           } >> "$GITHUB_ENV"
-      - name: Build xray (aarch64-linux-android, exclude xray-proxy-tun)
+      - name: Build xray (aarch64-linux-android)
         run: |
-          echo "覆盖范围：-p xray-cli --bin xray 排除 xray-proxy-tun（tun_rs 无 android target API：DeviceBuilder/Layer/if_index 未导出，与 iOS 同因；Android 生态 VpnService 由宿主 App 注入流量）——含 btls-sys cmake 交叉编译（boringssl 官方支持 android，btls-sys build/main.rs android 分支消费 ANDROID_NDK_HOME）"
-          cargo build --workspace --exclude xray-proxy-tun --bin xray --target aarch64-linux-android
+          echo "覆盖范围：workspace 全量 --bin xray（含 btls-sys cmake 交叉编译——boringssl 官方支持 android，btls-sys build/main.rs android 分支消费 ANDROID_NDK_HOME）。xray-proxy-tun 已源码级门控：android 上 tun_rs 依赖不编译、走 device_stub（VpnService 宿主注入）"
+          cargo build --workspace --bin xray --target aarch64-linux-android
 
   ios:
     name: iOS aarch64 check gate
@@ -65,7 +65,7 @@ jobs:
           go-version: stable
       - name: Install protoc
         run: brew install protobuf
-      - name: Check workspace (aarch64-apple-ios, exclude xray-proxy-tun)
+      - name: Check workspace (aarch64-apple-ios)
         run: |
-          echo "覆盖范围：workspace 全量 check --target aarch64-apple-ios，排除 xray-proxy-tun——tun_rs 无 iOS target（DeviceBuilder/Layer/if_index 未导出），iOS 平台本无 tun fd（生态=NEPacketTunnelProvider 由宿主 App 注入流量），xray-proxy-tun 在 iOS 不可实现；btls-sys cmake 走 ios 分支编 boringssl，macos-14 自带 iOS SDK；check 不产 iOS 可执行，仅编译门"
-          cargo check --workspace --exclude xray-proxy-tun --target aarch64-apple-ios
+          echo "覆盖范围：workspace 全量 check（btls-sys cmake 走 ios 分支编 boringssl，macos-14 自带 iOS SDK；check 不产 iOS 可执行，仅编译门）。xray-proxy-tun 已源码级门控：ios 上 tun_rs 依赖不编译、走 device_stub（NEPacketTunnelProvider 宿主注入）"
+          cargo check --workspace --target aarch64-apple-ios
