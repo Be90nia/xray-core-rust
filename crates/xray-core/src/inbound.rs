@@ -1841,6 +1841,12 @@ struct DnsUdpRecvBatch {
     /// recvmmsg 消息向量（msg_len 为内核写回的各包实际长度）。
     msgs: Box<[libc::mmsghdr]>,
 }
+// SAFETY: msgs 的 msg_name/msg_iov 与 iovs 的 iov_base 均指向本结构自身
+// Box 固定的堆缓冲（构造后不移动），无别名可变访问；整批仅在收包 task
+// 内使用，不跨线程共享。裸指针使类型默认 !Send，但所有权语义实为
+// 自包含——跨 .await 持有（handle_packet）不产生数据竞争。
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+unsafe impl Send for DnsUdpRecvBatch {}
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 impl DnsUdpRecvBatch {
