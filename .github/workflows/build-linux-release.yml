@@ -1,0 +1,36 @@
+name: build-linux-release
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-linux-release.yml'
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake nasm protobuf-compiler pkg-config libssl-dev
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build release
+        run: cargo build --release -p xray-cli --target x86_64-unknown-linux-gnu
+      - name: Verify binary
+        run: file target/x86_64-unknown-linux-gnu/release/xray
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-linux-gnu
+          path: target/x86_64-unknown-linux-gnu/release/xray
+          retention-days: 1
