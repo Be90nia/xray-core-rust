@@ -21,16 +21,45 @@ jobs:
           sudo unzip -o /tmp/protoc.zip -d /usr/local
           rm /tmp/protoc.zip
           /usr/local/bin/protoc --version
+
+      # btls-sys 在干净环境走其内部 submodule 流程会产出 unpatched libcrypto
+      # (rust-lld: undefined symbol SSL_set_reality_rewrite_cb /
+      #  SSL_get_x25519_key_share_private)。Docker 床实证配方 (复用 interop.yml):
+      # 预取 boringssl 固定 rev (Cargo.lock 内 btls-sys git rev 对应的 submodule pin) +
+      # 按 build/main.rs ensure_patches_applied 同序预打补丁, 再用
+      # ASSUME_PATCHED+SOURCE_PATH 让 btls-sys 直接消费已补丁源码。
+      - name: Prepare patched boringssl for btls-sys
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fetch
+          rev=$(awk '/^name = "btls-sys"/{f=1;next} f&&/^source/{print;exit}' Cargo.lock \
+            | sed 's/.*#\([0-9a-f]\{40\}\)".*/\1/')
+          btls_co=$(ls -d "$HOME"/.cargo/git/checkouts/btls-*/"${rev:0:7}"* | head -1)
+          patches_dir="$btls_co/btls-sys/patches"
+          bssl_rev=$(git -C "$btls_co" ls-tree HEAD btls-sys/deps/boringssl | awk '{print $3}')
+          bssl="$RUNNER_TEMP/boringssl"
+          git init -q "$bssl"
+          git -C "$bssl" remote add origin https://github.com/google/boringssl.git
+          git -C "$bssl" fetch -q --depth 1 origin "$bssl_rev"
+          git -C "$bssl" checkout -q FETCH_HEAD
+          git -C "$bssl" apply -v --whitespace=fix "$patches_dir/boring-pq.patch"
+          git -C "$bssl" apply -v --whitespace=fix "$patches_dir/boringssl.patch"
+          git -C "$bssl" apply -v --whitespace=fix "$patches_dir/boringssl-loongarch.patch"
+          git -C "$bssl" apply -v --whitespace=fix "$patches_dir/boringssl-windows.patch"
+          python3 -c "import sys, pathlib; sys.path.insert(0, 'tools'); from setup_boringssl_reality import apply_reality_patches; apply_reality_patches(pathlib.Path('$RUNNER_TEMP/boringssl'))"
+          echo "BORING_BSSL_ASSUME_PATCHED=1" >> "$GITHUB_ENV"
+          echo "BORING_BSSL_SOURCE_PATH=$bssl" >> "$GITHUB_ENV"
+
       # 只 cache registry/git（不要 cache target——btls-sys 编译产出必须在每次 run 重做
-      # 否则命中脏 cache 会链接到 unpatched libcrypto 缺 SSL_get_x25519_key_share_private /
-      # SSL_set_reality_rewrite_cb 符号；版本字段 v3 让之前的 cache 全部 miss）
+      # 否则命中脏 cache 会链接到 unpatched libcrypto）
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-registry-v3-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-v4-${{ hashFiles('**/Cargo.lock') }}
       - name: Build release
         run: cargo build --release -p xray-cli --target x86_64-unknown-linux-gnu
       - name: Verify binary
