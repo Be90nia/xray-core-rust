@@ -29,15 +29,15 @@ pub mod outbound;
 // android/ios 走 stub（移动端由宿主 App 注入流量，见 device_stub.rs）。
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod device;
+// stub 必须占用同一 `crate::device` 路径：inbound.rs 等下游
+// `use crate::device::TunDevice` 无需平台分支。
 #[cfg(any(target_os = "android", target_os = "ios"))]
-pub mod device_stub;
+#[path = "device_stub.rs"]
+pub mod device;
 
 // 顶层 re-export。
 pub use config::{Stack, StackOptions, Tun, score};
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub use device::TunDevice;
-#[cfg(any(target_os = "android", target_os = "ios"))]
-pub use device_stub::TunDevice;
 pub use inbound::TunInboundHandler;
 pub use netstack::{TcpAcceptEvent, TunNetStack, UdpRecvEvent};
 pub use error::{Result, TunError};
