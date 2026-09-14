@@ -21,15 +21,23 @@
 //! TCP/UDP/ICMP 包处理 + UDP fullcone NAT。
 
 pub mod config;
-pub mod device;
 pub mod error;
 pub mod netstack;
 pub mod inbound;
 pub mod outbound;
+// TUN 设备实现按平台门控：windows/macos/linux/bsd 走 tun_rs 真实现，
+// android/ios 走 stub（移动端由宿主 App 注入流量，见 device_stub.rs）。
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub mod device;
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub mod device_stub;
 
 // 顶层 re-export。
 pub use config::{Stack, StackOptions, Tun, score};
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub use device::TunDevice;
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub use device_stub::TunDevice;
 pub use inbound::TunInboundHandler;
 pub use netstack::{TcpAcceptEvent, TunNetStack, UdpRecvEvent};
 pub use error::{Result, TunError};
