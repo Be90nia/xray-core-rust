@@ -206,3 +206,9 @@ tokio-rustls = { git = "https://github.com/Watfaq/tokio-rustls.git", branch = "w
 # fork 的 AssumePeerMaxDatagramFrameSize。vendor 自 0.11.16，REBASE 注释见
 # vendor/quinn-proto/src/connection/datagrams.rs max_size()。
 quinn-proto = { path = "vendor/quinn-proto" }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
