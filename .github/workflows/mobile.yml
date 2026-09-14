@@ -1,0 +1,69 @@
+# 移动端编译门：Android (aarch64) 真编译 + iOS (aarch64) workspace check。
+# btls-sys 变数：build/main.rs 有 android/ios 分支消费 ANDROID_NDK_HOME 与
+# 平台 cflag，boringssl 对双平台官方支持；若 CI 证明 btls-sys 交叉短期攻不下，
+# 下一版降级为 workspace check --exclude btls 依赖闭包并在 job 里 echo 覆盖范围。
+
+name: Mobile Gates
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, main, dev]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  android:
+    name: Android aarch64 build gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      # boringssl 的 cmake 配置需要 go（生成测试清单/部分源码）
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27c
+          add-to-path: false
+      - name: Install protoc
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      - name: Set NDK cross env
+        run: |
+          {
+            echo "ANDROID_NDK_HOME=${{ steps.ndk.outputs.ndk-path }}"
+            echo "CC_aarch64_linux_android=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+            echo "CXX_aarch64_linux_android=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
+            echo "AR_aarch64_linux_android=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+          } >> "$GITHUB_ENV"
+      - name: Build xray (aarch64-linux-android)
+        run: |
+          echo "覆盖范围：全量 -p xray-core --bin xray（含 btls-sys cmake 交叉编译——boringssl 官方支持 android，btls-sys build/main.rs 的 android 分支消费 ANDROID_NDK_HOME；go 由 setup-go 提供）"
+          cargo build --target aarch64-linux-android -p xray-core --bin xray
+
+  ios:
+    name: iOS aarch64 check gate
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      # boringssl cmake 需要 go（macos-14 镜像缺省无 go）
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Install protoc
+        run: brew install protobuf
+      - name: Check workspace (aarch64-apple-ios)
+        run: |
+          echo "覆盖范围：workspace 全量 check --target aarch64-apple-ios（btls-sys cmake 走 ios 分支编 boringssl，macos-14 自带 iOS SDK；check 不产 iOS 可执行，仅编译门）"
+          cargo check --workspace --target aarch64-apple-ios
