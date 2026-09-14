@@ -11,6 +11,9 @@ use tun_rs::AsyncDevice;
 use tun_rs::DeviceBuilder;
 use tun_rs::Layer;
 
+#[cfg(target_os = "linux")]
+use tun_rs::{GROTable, VIRTIO_NET_HDR_LEN};
+
 use crate::config::Tun;
 use crate::error::{Result, TunError};
 
@@ -20,6 +23,7 @@ use crate::error::{Result, TunError};
 pub struct TunDevice {
     dev: AsyncDevice,
     name: String,
+    mtu: u16,
 }
 
 impl TunDevice {
@@ -42,11 +46,21 @@ impl TunDevice {
             .layer(Layer::L3)
             .ipv4(ipv4_addr, ipv4_prefix, None)
             .mtu(mtu)
+            .with(|b| {
+                // 票 ukh8：Linux 开 vnet_hdr offload——批量读写
+                // （recv_multiple/send_multiple）的内核前提。协商失败时
+                // tun-rs 自动退化为 vnet_hdr=false（见 send/recv_batch）。
+                #[cfg(target_os = "linux")]
+                b.offload(true);
+                #[cfg(not(target_os = "linux"))]
+                let _ = b;
+            })
             .build_async()
             .map_err(|e| TunError::DeviceCreateFailed(format!("{e}")))?;
         Ok(Self {
             dev,
             name: name_str,
+            mtu,
         })
     }
 
@@ -65,8 +79,18 @@ impl TunDevice {
     }
 
     /// 异步发送 IP 包。
+    ///
+    /// Linux（vnet_hdr 已开）：自动垫 virtio 头后走批量写路径——内核按带
+    /// vnet 头解析写入数据，裸写会把前 12 字节当头吞掉。其余平台为裸 write。
     pub async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
-        self.dev.send(buf).await
+        #[cfg(target_os = "linux")]
+        {
+            self.send_batch([buf.to_vec()]).await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.dev.send(buf).await
+        }
     }
 
     /// 非阻塞发送 IP 包。ring buffer 满时返回 `Err(WouldBlock)`。
@@ -74,6 +98,54 @@ impl TunDevice {
     /// 对应 Go `tun_windows.go::WritePacket`（223-247，`AllocateSendPacket → SendPacket`）。
     pub fn try_send(&self, buf: &[u8]) -> std::io::Result<usize> {
         self.dev.try_send(buf)
+    }
+
+    /// 设备 MTU（Linux 批量读侧按此分配拆分段缓冲）。
+    pub fn mtu(&self) -> u16 {
+        self.mtu
+    }
+
+    /// Linux 批量读：一次 syscall 读出内核 GRO 聚合大包并拆成 ≤MTU 的段，
+    /// 返回实际包数；vnet_hdr 未协商时 tun-rs 内部退化为单包读（返回 0 或 1）。
+    ///
+    /// - `original_buffer`：GSO 聚合包落点，建议 `VIRTIO_NET_HDR_LEN + 65535`
+    /// - `bufs`/`sizes`：等长；`bufs[i]` ≥ MTU，包数据写入 `bufs[i][..sizes[i]]`
+    #[cfg(target_os = "linux")]
+    pub async fn recv_batch(
+        &self,
+        original_buffer: &mut [u8],
+        bufs: &mut [Vec<u8>],
+        sizes: &mut [usize],
+    ) -> std::io::Result<usize> {
+        self.dev.recv_multiple(original_buffer, bufs, sizes, 0).await
+    }
+
+    /// Linux 批量写：GRO 合并同流 TCP/UDP 小包后尽量少的 write 次数发出；
+    /// 未合并的包由 tun-rs 自动补零 vnet 头。vnet_hdr 未协商时退化为逐包写
+    /// （垫头空间被跳过），两种协商结果下写出的都是纯 IP 包。
+    #[cfg(target_os = "linux")]
+    pub async fn send_batch<I>(&self, pkts: I) -> std::io::Result<usize>
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
+        // vnet_hdr 布局：每包前垫 VIRTIO_NET_HDR_LEN 字节供 GRO 写头；
+        // offset=VIRTIO_NET_HDR_LEN 在 vnet 开/关两个分支下语义均正确。
+        let mut bufs: Vec<Vec<u8>> = pkts
+            .into_iter()
+            .map(|p| {
+                let mut b = vec![0u8; VIRTIO_NET_HDR_LEN + p.len()];
+                b[VIRTIO_NET_HDR_LEN..].copy_from_slice(&p);
+                b
+            })
+            .collect();
+        if bufs.is_empty() {
+            return Ok(0);
+        }
+        // ponytail: GROTable 每批现造（3 个小 Vec 分配），profile 说贵再复用
+        let mut gro = GROTable::default();
+        self.dev
+            .send_multiple(&mut gro, &mut bufs, VIRTIO_NET_HDR_LEN)
+            .await
     }
 }
 
@@ -179,18 +251,34 @@ mod tests {
         packet[9] = 17; // protocol = UDP
         // checksum/src/dst 留 0——内核不会处理这个包但 TUN 设备能接受
 
-        // try_send 非阻塞：应返回 Ok(20)（对应 Go tun_windows.go:232-246 AllocateSendPacket+SendPacket）
+        // Linux（offload/vnet_hdr 设备）：裸写会被内核把前 VIRTIO_NET_HDR_LEN
+        // 字节当 vnet 头解析——走垫头的批量写路径；非 Linux 保持裸 try_send。
+        // 返回字节数：vnet 协商成功时含头（n = pkt.len() + 12），失败/其他平台
+        // 为裸包长——两种协商结果都应 ≥ 包长。
+        #[cfg(target_os = "linux")]
+        let n = dev
+            .send_batch([packet.clone()])
+            .await
+            .expect("send_batch should succeed on open device");
+        #[cfg(not(target_os = "linux"))]
         let n = dev.try_send(&packet).expect("try_send should succeed on open device");
-        assert_eq!(n, packet.len(), "try_send should write all bytes");
+        assert!(
+            n >= packet.len(),
+            "write should accept the whole packet (Linux vnet_hdr adds header bytes)"
+        );
 
         // try_recv 非阻塞：空队列时 WouldBlock（对应 Go tun_windows.go:253-256 windows.ERROR_NO_MORE_ITEMS）
         let mut buf = vec![0u8; 1500];
         match dev.try_recv(&mut buf) {
+            // 如果有回流（罕见，需路由配置），验证 magic byte；
+            // Linux vnet_hdr 设备读出带 virtio 头数据，不做包格式断言。
+            #[cfg(not(target_os = "linux"))]
             Ok(n) => {
-                // 如果有回流（罕见，需路由配置），验证 magic byte
                 assert_eq!(buf[0] >> 4, 4, "received packet must be IPv4 (version 4)");
                 assert!(n >= 20, "minimum IPv4 header is 20 bytes, got {n}");
             }
+            #[cfg(target_os = "linux")]
+            Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // 期望路径：无路由 → 内核不发回流包
             }

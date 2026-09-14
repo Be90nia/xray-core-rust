@@ -1682,31 +1682,9 @@ pub async fn serve_dns(
     tcp: InboundTcpListener,
     inbound: Arc<DnsInbound>,
 ) -> std::io::Result<()> {
-    // UDP task
+    // UDP task：Linux gnu 走 recvmmsg 批收（bd yblz），其余平台 recv_from 单收。
     let udp_inbound = Arc::clone(&inbound);
-    let udp_handle = tokio::spawn(async move {
-        let mut buf = [0u8; 1500];
-        loop {
-            match udp.recv_from(&mut buf).await {
-                Ok((len, peer)) => {
-                    match udp_inbound.handle_packet(&buf[..len]).await {
-                        Ok(Some(resp)) => {
-                            if let Err(e) = udp.send_to(&resp, peer).await {
-                                tracing::debug!(error = %e, "dns udp send failed");
-                            }
-                        }
-                        Ok(None) => {} // Drop: 不响应
-                        Err(e) => {
-                            tracing::debug!(error = %e, "dns udp handle_packet failed");
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "dns udp recv failed");
-                }
-            }
-        }
-    });
+    let udp_handle = tokio::spawn(dns_udp_recv_loop(udp, udp_inbound));
     // TCP accept loop
     let tcp_inbound = Arc::clone(&inbound);
     let tcp_handle = tokio::spawn(async move {
@@ -1734,6 +1712,199 @@ pub async fn serve_dns(
         r = tcp_handle => {
             r.map_err(|e| std::io::Error::other(format!("dns tcp task: {e}")))
         }
+    }
+}
+
+/// DNS 单批 recvmmsg 上限（msgvec 长度）：足够摊薄 syscall 开销且有界。
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const DNS_UDP_RECV_BATCH: usize = 16;
+
+/// DNS UDP 单包缓冲（常规 MTU；超长 query 由 MSG_TRUNC 检出丢弃）。
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const DNS_UDP_PACKET_BUF: usize = 1500;
+
+/// DNS UDP 收包循环（Linux gnu）：`recvmmsg(2)` 一次 syscall 批量收多 query。
+///
+/// bd yblz：单 socket 多 client query 在内核排队时，批收把 N 次 recv_from
+/// 合并为一次 syscall，降低 DNS p99。缓冲组预分配一次循环复用（无
+/// per-query 分配）。非阻塞 + MSG_DONTWAIT：收空（WouldBlock）回
+/// [`dns_udp_recv_loop`] 外圈 `readable()` 等新就绪。musl/uclibc 的 libc
+/// 未导出 recvmmsg 函数，走下方 recv_from 回退版。
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+async fn dns_udp_recv_loop(udp: UdpSocket, inbound: Arc<DnsInbound>) {
+    use std::os::fd::AsRawFd;
+
+    let mut batch = DnsUdpRecvBatch::new();
+    let fd = udp.as_raw_fd();
+    loop {
+        if let Err(e) = udp.readable().await {
+            tracing::warn!(error = %e, "dns udp readable failed");
+            return;
+        }
+        loop {
+            // namelen 是内核写回字段，每轮还原容量，否则下轮长地址被截断。
+            for m in batch.msgs.iter_mut() {
+                m.msg_hdr.msg_namelen =
+                    std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            }
+            // SAFETY: fd 在 udp 存活期内有效；msgs 的 msg_name/msg_iov 指向
+            // batch 的固定堆地址（Box 构造后不移动），各缓冲容量已预填。
+            let n = unsafe {
+                libc::recvmmsg(
+                    fd,
+                    batch.msgs.as_mut_ptr(),
+                    DNS_UDP_RECV_BATCH as libc::c_uint,
+                    libc::MSG_DONTWAIT,
+                    std::ptr::null_mut(),
+                )
+            };
+            if n < 0 {
+                let e = std::io::Error::last_os_error();
+                match e.kind() {
+                    std::io::ErrorKind::WouldBlock => break, // 本轮收空
+                    std::io::ErrorKind::Interrupted => continue,
+                    _ => {
+                        tracing::warn!(error = %e, "dns udp recvmmsg failed");
+                        return;
+                    }
+                }
+            }
+            let n = usize::try_from(n).unwrap_or_default();
+            for i in 0..n {
+                // MSG_TRUNC：query 超过单包缓冲被截断，报文不完整，丢弃。
+                if (batch.msgs[i].msg_hdr.msg_flags & libc::MSG_TRUNC) != 0 {
+                    tracing::debug!("dns udp query too large, dropped");
+                    continue;
+                }
+                let Some(peer) = sockaddr_storage_to_addr(&batch.addrs[i]) else {
+                    continue;
+                };
+                let len = usize::try_from(batch.msgs[i].msg_len).unwrap_or_default();
+                let packet = &batch.bufs[i][..len];
+                match inbound.handle_packet(packet).await {
+                    Ok(Some(resp)) => {
+                        if let Err(e) = udp.send_to(&resp, peer).await {
+                            tracing::debug!(error = %e, "dns udp send failed");
+                        }
+                    }
+                    Ok(None) => {} // Drop: 不响应
+                    Err(e) => {
+                        tracing::debug!(error = %e, "dns udp handle_packet failed");
+                    }
+                }
+            }
+            if n < DNS_UDP_RECV_BATCH {
+                break; // 未收满，回外圈等新就绪
+            }
+        }
+    }
+}
+
+/// DNS UDP 收包循环（非 Linux gnu 平台）：`recv_from` 单包收。
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+async fn dns_udp_recv_loop(udp: UdpSocket, inbound: Arc<DnsInbound>) {
+    let mut buf = [0u8; 1500];
+    loop {
+        match udp.recv_from(&mut buf).await {
+            Ok((len, peer)) => {
+                match inbound.handle_packet(&buf[..len]).await {
+                    Ok(Some(resp)) => {
+                        if let Err(e) = udp.send_to(&resp, peer).await {
+                            tracing::debug!(error = %e, "dns udp send failed");
+                        }
+                    }
+                    Ok(None) => {} // Drop: 不响应
+                    Err(e) => {
+                        tracing::debug!(error = %e, "dns udp handle_packet failed");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "dns udp recv failed");
+            }
+        }
+    }
+}
+
+/// recvmmsg 批收缓冲组：预分配一次循环复用。
+///
+/// Box 固定堆地址后填充 msg_name/msg_iov 自引用指针；构造后整体不移动。
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+struct DnsUdpRecvBatch {
+    /// 各 slot 收包数据缓冲。
+    bufs: Box<[[u8; DNS_UDP_PACKET_BUF]]>,
+    /// 各 slot 发送方地址（内核写回）。
+    addrs: Box<[libc::sockaddr_storage]>,
+    /// iovec 数组：仅经 msg_hdr.msg_iov 指针间接访问。
+    #[allow(dead_code)]
+    iovs: Box<[libc::iovec]>,
+    /// recvmmsg 消息向量（msg_len 为内核写回的各包实际长度）。
+    msgs: Box<[libc::mmsghdr]>,
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+impl DnsUdpRecvBatch {
+    /// 零值分配，地址固定后填充自引用指针。
+    fn new() -> Self {
+        // SAFETY: sockaddr_storage/mmsghdr 是 POD，全零为合法待填充状态
+        // （msg_control 恒 null = 不取 ancillary，与 recv_from 语义一致）。
+        let mut bufs: Box<[[u8; DNS_UDP_PACKET_BUF]]> =
+            vec![[0u8; DNS_UDP_PACKET_BUF]; DNS_UDP_RECV_BATCH].into_boxed_slice();
+        let mut addrs: Box<[libc::sockaddr_storage]> =
+            vec![unsafe { std::mem::zeroed() }; DNS_UDP_RECV_BATCH].into_boxed_slice();
+        let mut iovs: Box<[libc::iovec]> = vec![
+            libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            };
+            DNS_UDP_RECV_BATCH
+        ]
+        .into_boxed_slice();
+        let mut msgs: Box<[libc::mmsghdr]> =
+            vec![unsafe { std::mem::zeroed() }; DNS_UDP_RECV_BATCH].into_boxed_slice();
+
+        for i in 0..DNS_UDP_RECV_BATCH {
+            iovs[i].iov_base = bufs[i].as_mut_ptr().cast();
+            iovs[i].iov_len = DNS_UDP_PACKET_BUF;
+            msgs[i].msg_hdr.msg_name = std::ptr::addr_of_mut!(addrs[i]).cast();
+            msgs[i].msg_hdr.msg_namelen =
+                std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            msgs[i].msg_hdr.msg_iov = std::ptr::addr_of_mut!(iovs[i]);
+            msgs[i].msg_hdr.msg_iovlen = 1;
+        }
+        Self {
+            bufs,
+            addrs,
+            iovs,
+            msgs,
+        }
+    }
+}
+
+/// 解析内核写回的 `sockaddr_storage` 为 `SocketAddr`（按 ss_family 判别）。
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn sockaddr_storage_to_addr(ss: &libc::sockaddr_storage) -> Option<std::net::SocketAddr> {
+    match ss.ss_family as libc::c_int {
+        libc::AF_INET => {
+            // SAFETY: ss_family == AF_INET 保证布局为 sockaddr_in。
+            let a = unsafe { &*(ss as *const libc::sockaddr_storage).cast::<libc::sockaddr_in>() };
+            Some(std::net::SocketAddr::from(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::from(u32::from_be(a.sin_addr.s_addr)),
+                u16::from_be(a.sin_port),
+            )))
+        }
+        libc::AF_INET6 => {
+            // SAFETY: ss_family == AF_INET6 保证布局为 sockaddr_in6。
+            let a =
+                unsafe { &*(ss as *const libc::sockaddr_storage).cast::<libc::sockaddr_in6>() };
+            Some(std::net::SocketAddr::from(std::net::SocketAddrV6::new(
+                std::net::Ipv6Addr::from(a.sin6_addr.s6_addr),
+                u16::from_be(a.sin6_port),
+                a.sin6_flowinfo,
+                a.sin6_scope_id,
+            )))
+        }
+        _ => None,
     }
 }
 
