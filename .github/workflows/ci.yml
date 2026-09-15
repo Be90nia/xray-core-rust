@@ -11,6 +11,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # 覆盖 .cargo/config.toml 的 target-cpu=native（bd hxy3）：CI 产物必须保持
+  # 通用 target 生成（用户老机器 SIGILL 防线），交叉编译 job 不受 native 污染。
+  # RUSTFLAGS env 存在时完全覆盖 build.rustflags（cargo 语义：二选一）。
+  RUSTFLAGS: ""
 
 jobs:
   # 格式检查
