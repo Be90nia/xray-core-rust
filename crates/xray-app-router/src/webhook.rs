@@ -373,8 +373,8 @@ async fn tcp_connect(host: &str, port: u16, timeout: Duration) -> Result<TcpStre
 fn tls_connector() -> Result<TlsConnector, RouterError> {
     use std::sync::LazyLock;
     static CONNECTOR: LazyLock<Result<TlsConnector, String>> = LazyLock::new(|| {
-        // rustls ring crypto provider：test 并发场景下 `install_default` 多次返回 Ok(()) 即可
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        // rustls ring provider 经 xray-common 集中入口幂等安装（bd jrh7）。
+        xray_common::ensure_default_crypto_provider();
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let cfg = ClientConfig::builder()

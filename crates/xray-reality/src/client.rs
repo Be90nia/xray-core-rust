@@ -397,7 +397,7 @@ where
     let reality = WatfaqRealityConfig::new(pk, config.short_id.clone())
         .map_err(|e| RealityError::WatfaqConfig(e.to_string()))?;
     let roots = RootCertStore::from_iter(TLS_SERVER_ROOTS.iter().cloned());
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    xray_common::ensure_default_crypto_provider();
     let tls_config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_reality(reality)

@@ -73,9 +73,9 @@ pub fn build_client_config(
     security_json: Option<&serde_json::Value>,
     server_name: &str,
 ) -> io::Result<Option<Arc<ClientConfig>>> {
-    // ring provider 安装幂等：进程内首次安装生效，后续 no-op。
+    // ring provider 经 xray-common 集中入口幂等安装（bd jrh7）。
     // ponytail: 放在函数入口确保调用方不必显式 install。
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    xray_common::ensure_default_crypto_provider();
 
     if !matches!(security, "tls" | "reality") {
         return Ok(None);
@@ -252,10 +252,10 @@ fn verifier_roots(json: &serde_json::Value) -> io::Result<RootCertStore> {
 pub fn build_server_cert_verifier(
     security_json: Option<&serde_json::Value>,
 ) -> io::Result<Option<Arc<dyn ServerCertVerifier>>> {
-    // ring provider 安装幂等（同 build_client_config:78）：workspace feature
-    // unification 同启 ring+aws-lc-rs 时 rustls 无法自动选定 provider，
+    // ring provider 经集中入口安装（同 build_client_config:78）：workspace
+    // feature unification 同启 ring+aws-lc-rs 时 rustls 无法自动选定 provider，
     // naive/btls 路径只经本函数装配 rustls 验证器 → 进程级 panic。
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    xray_common::ensure_default_crypto_provider();
     let json = security_json.cloned().unwrap_or(serde_json::Value::Null);
     let allow_insecure = json
         .as_object()

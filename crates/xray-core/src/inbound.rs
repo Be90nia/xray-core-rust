@@ -3672,7 +3672,7 @@ fn parse_hysteria_inbound_config(
     let auth = v.get("auth").and_then(|x| x.as_str()).unwrap_or("").to_string();
     let server_name = v.get("server_name").and_then(|x| x.as_str()).unwrap_or("hysteria").to_string();
     // 真实 quinn server adapter：自签证书（或配置 cert/key PEM），ALPN h3 由 listen() 设置
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    xray_common::ensure_default_crypto_provider();
     let server_config = build_hysteria_tls_server_config(&v)?;
     // streamSettings.finalmask.quicParams → HysteriaConfig（brutal/CC/windows/keepAlive）
     let quic_params = xray_transport_hysteria::quic_params::parse_quic_params(finalmask_json)?
@@ -3775,7 +3775,7 @@ fn parse_anytls_tls_acceptor(
         (cert_pem, key_pem)
     } else {
         // ponytail: 无证书配置时用自签名证书（仅测试场景）
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        xray_common::ensure_default_crypto_provider();
         let key_pair = rcgen::KeyPair::generate()
             .map_err(|e| std::io::Error::other(format!("rcgen keypair: {e}")))?;
         let params = rcgen::CertificateParams::new(vec!["localhost".into()])

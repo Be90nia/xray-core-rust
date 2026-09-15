@@ -807,7 +807,7 @@ fn build_protocol_handler(
         "hysteria" => {
             let (server_addr, auth, server_name) = parse_hysteria_config(&ob.entry.data)?;
             let config = HysteriaConfig::new(&server_addr, &auth).with_server_name(&server_name);
-            let _ = rustls::crypto::ring::default_provider().install_default();
+            xray_common::ensure_default_crypto_provider();
             let tls_config = rustls::ClientConfig::builder()
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoVerifier))
@@ -2190,7 +2190,7 @@ fn parse_anytls_config(data: &[u8]) -> std::result::Result<xray_proxy_anytls::Cl
         .and_then(|v| v.as_str())
         .unwrap_or_default();
     // 构造 rustls ClientConfig
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    xray_common::ensure_default_crypto_provider();
     let tls_config = if insecure {
         rustls::ClientConfig::builder()
             .dangerous()
@@ -2635,7 +2635,7 @@ fn build_tuic_rustls_config(
     insecure: bool,
     certificate: Option<&str>,
 ) -> std::result::Result<Arc<rustls::ClientConfig>, String> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    xray_common::ensure_default_crypto_provider();
     let mut config = if insecure {
         rustls::ClientConfig::builder()
             .dangerous()

@@ -58,8 +58,8 @@ pub fn generate_self_signed_cert(sni: &str) -> Result<(Vec<u8>, Vec<u8>)> {
 /// - 私钥 DER 解析失败 / ServerConfig 构建失败 → [`RealityError::CertGenerate`]
 pub fn build_server_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> Result<ServerConfig> {
     // rustls 双 CryptoProvider feature unification 时裸 builder() 会 panic；
-    // install_default 幂等（已装返回 Err，忽略）。参考 xray-proxy-tuic server.rs 样板。
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    // 经 xray-common 集中入口幂等安装（bd jrh7）。
+    xray_common::ensure_default_crypto_provider();
     let key = PrivateKeyDer::try_from(key_der)
         .map_err(|e| RealityError::CertGenerate(format!("private key der: {e}")))?;
     let config = ServerConfig::builder()

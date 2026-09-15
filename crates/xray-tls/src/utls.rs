@@ -618,7 +618,7 @@ pub fn websocket_handshake_alpn(security_json: Option<&serde_json::Value>) -> Ve
 /// 返回的 config 可在多次 `client()`/`u_client()` 调用间复用（`Arc` clone 廉价）。
 #[must_use]
 pub fn default_client_config() -> Arc<ClientConfig> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    xray_common::ensure_default_crypto_provider();
     let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     Arc::new(
