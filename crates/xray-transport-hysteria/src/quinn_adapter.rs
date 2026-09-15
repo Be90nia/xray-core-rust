@@ -274,10 +274,9 @@ pub(crate) fn build_hysteria_transport_config(
     }
     if qc.keep_alive_period_ms > 0 {
         t.keep_alive_interval(Some(Duration::from_millis(qc.keep_alive_period_ms)));
-    } else {
-        // u9um：无显式配置时默认 15s 保活探测（NAT 表 30-60s 过期，15s 间隔可续表项）。
-        t.keep_alive_interval(Some(Duration::from_secs(15)));
     }
+    // 缺省 disabled（Go parity：dialer.go:111-113 KeepAlivePeriod 仅来自用户配置，
+    // 注释内默认 10s 是死代码；bd c1qh 回滚 u9um 的 15s 有意偏离。NAT 场景用户显式配 keepAlivePeriod 找回）。
     if qc.enable_datagrams {
         // 参数化（rjo9）：取 QuicConfig.max_datagram_frame_size——from_params 与
         // default_for_hysteria 均取 crate::config::MaxDatagramFrameSize，对齐 Go
