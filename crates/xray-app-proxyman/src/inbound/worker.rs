@@ -335,8 +335,10 @@ impl TcpWorker {
             inner: conn,
             timer: activity_timer,
         });
-
-        tokio::spawn(async move {
+        // bd mvsc：task 挂 worker 生命周期信号（同构响应泵 close_notify 先例），
+        // worker close 唤醒后连接 task 随 select 退出——无孤儿。
+        let close_notify = Arc::clone(&self.close_notify);
+        let handle = tokio::spawn(async move {
             let inbound_conn = InboundConn::Tcp(tracked);
             tokio::select! {
                 result = proxy.process(Network::TCP, inbound_conn, session, dispatcher) => {
@@ -349,8 +351,12 @@ impl TcpWorker {
                     // 不活动超时，连接被半关闭
                     warn!(tag = %tag, timeout = ?idle_timeout, "connection cancelled after inactivity");
                 }
+                _ = close_notify.notified() => {
+                    // worker close：结构化收尾
+                }
             }
-        })
+        });
+        handle
     }
 }
 
@@ -616,10 +622,19 @@ impl UdpWorker {
             );
 
         let pump_session = Arc::clone(&session);
+        // bd mvsc：process task 挂 close_notify，worker close 时随 select 退出
+        let close_notify = Arc::clone(&self.close_notify);
         tokio::spawn(async move {
             let inbound_conn = InboundConn::Udp(session);
-            if let Err(e) = proxy.process(Network::UDP, inbound_conn, session_ctx, dispatcher).await {
-                warn!(tag = %tag, error = %e, "UDP proxy process failed");
+            tokio::select! {
+                r = proxy.process(Network::UDP, inbound_conn, session_ctx, dispatcher) => {
+                    if let Err(e) = r {
+                        warn!(tag = %tag, error = %e, "UDP proxy process failed");
+                    }
+                }
+                _ = close_notify.notified() => {
+                    // worker close：结构化收尾
+                }
             }
         });
 
@@ -1402,5 +1417,87 @@ mod tests {
             .await
             .expect("conn task hang after EOF")
             .expect("task join");
+    }
+
+    /// mvsc 探针：future 持有的 drop 标记——task 被 abort（future drop）时置位。
+    struct DropProbe(Arc<AtomicBool>);
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// 挂起 proxy：把 probe clone 进 process future；被 abort 时 probe 置位。
+    struct ProbeHangingProxy {
+        started: mpsc::Sender<()>,
+        probe: Arc<AtomicBool>,
+    }
+    #[async_trait::async_trait]
+    impl ProxyInbound for ProbeHangingProxy {
+        async fn process(
+            &self,
+            _network: Network,
+            _conn: InboundConn,
+            _session: Session,
+            _dispatcher: Arc<dyn Dispatcher>,
+        ) -> Result<(), ProxymanError> {
+            let _probe = DropProbe(Arc::clone(&self.probe));
+            let _ = self.started.send(()).await;
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    /// mvsc：TcpWorker close 必须结构化收尾——abort 全部在途连接 task，
+    /// 不允许 fire-and-forget 孤儿存活。修复前 close 只关 listener → 红。
+    #[tokio::test]
+    async fn tcp_worker_close_aborts_conn_tasks() {
+        let (started_tx, mut started_rx) = mpsc::channel::<()>(1);
+        let probe = Arc::new(AtomicBool::new(false));
+        let worker = tcp_worker_for_test(
+            Arc::new(ProbeHangingProxy {
+                started: started_tx,
+                probe: Arc::clone(&probe),
+            }),
+            "tcp-close-abort",
+        );
+        let (_client, server) = tokio::io::duplex(64);
+        worker.spawn_conn(Box::new(DuplexConn(server)), Duration::from_secs(60));
+        started_rx.recv().await.expect("conn task started");
+
+        worker.close().await.expect("close ok");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            probe.load(std::sync::atomic::Ordering::SeqCst),
+            "conn task must be aborted by worker close (orphan task)"
+        );
+    }
+
+    /// mvsc：UdpWorker close 必须 abort 全部 per-session task（process/响应泵）。
+    #[tokio::test]
+    async fn udp_worker_close_aborts_session_tasks() {
+        let (started_tx, mut started_rx) = mpsc::channel::<()>(1);
+        let probe = Arc::new(AtomicBool::new(false));
+        let worker = udp_worker_for_test(
+            Arc::new(ProbeHangingProxy {
+                started: started_tx,
+                probe: Arc::clone(&probe),
+            }),
+            "udp-close-abort",
+        );
+        let packet = UdpPacket {
+            payload: vec![1, 2, 3],
+            source: "127.0.0.1:5555".parse().unwrap(),
+            target: None,
+        };
+        worker.on_packet(&packet, "127.0.0.1:5555".parse().unwrap());
+        started_rx.recv().await.expect("session task started");
+
+        worker.close().await.expect("close ok");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            probe.load(std::sync::atomic::Ordering::SeqCst),
+            "session task must be aborted by worker close (orphan task)"
+        );
     }
 }

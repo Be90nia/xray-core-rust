@@ -837,6 +837,22 @@ impl Drop for OnlineIpGuard {
     }
 }
 
+/// 后台 task 共享收口：完成即收割（`try_join_next`），宿主 drop 时
+/// JoinSet drop abort 全部在途 task——结构化并发，杜绝孤儿（bd mvsc；
+/// 模式参照 xray-app-metrics metrics.rs `conn_tasks`）。
+type BackgroundTasks = Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>;
+
+/// 把后台 task 收进共享 JoinSet。spawn 动作本身瞬时入队后即结束，
+/// 业务 future 由 JoinSet 持有；入队前收割已完成句柄，簿记不随连接数涨。
+fn spawn_tracked(set: &BackgroundTasks, task: impl Future<Output = ()> + Send + 'static) {
+    let set = Arc::clone(set);
+    tokio::spawn(async move {
+        let mut set = set.lock().await;
+        while set.try_join_next().is_some() {}
+        set.spawn(task);
+    });
+}
+
 // ========== DefaultDispatcher ==========
 
 /// 默认分发器
@@ -863,6 +879,9 @@ pub struct DefaultDispatcher {
     ///
     /// None = 不记 access log（等价 Go ctx 无 AccessMessage → 不 Record）。
     pub access_sink: Option<Arc<dyn AccessLogSink>>,
+    /// 后台 dispatch task 收口（bd mvsc）：dispatch_link spawn 的处理 task
+    /// 全部入 set，宿主 drop 时 JoinSet abort 在途 task。
+    background_tasks: BackgroundTasks,
 }
 
 impl Debug for DefaultDispatcher {
@@ -897,6 +916,7 @@ impl DefaultDispatcher {
             policy_manager: None,
             udp443_policies: std::sync::Arc::new(HashMap::new()),
             access_sink: None,
+            background_tasks: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
         }
     }
 
@@ -1426,7 +1446,7 @@ impl DefaultDispatcher {
             let _ = fut.await;
         };
 
-        tokio::spawn(fut);
+        spawn_tracked(&self.background_tasks, fut);
         Ok(())
     }
 }
@@ -1602,6 +1622,9 @@ pub struct DialBridge {
     /// 最近一次 dispatch 的 splice 准入结果（[`Self::splice_admitted`] 读；
     /// Arc 便于 dispatch future（'static）捕获落盘）。
     splice_admitted: Arc<std::sync::atomic::AtomicBool>,
+    /// chained dispatch task 收口（bd mvsc）：bridge drop 时 JoinSet abort
+    /// 在途 chained task，杜绝 fire-and-forget 孤儿。
+    background_tasks: BackgroundTasks,
 }
 
 /// 入站 splice 元数据的 dispatch 作用域通道（txno-splice）。
@@ -1662,6 +1685,7 @@ impl DialBridge {
             policy: std::sync::RwLock::new(None),
             splice_outbound: std::sync::atomic::AtomicBool::new(false),
             splice_admitted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            background_tasks: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
         }
     }
 
@@ -1833,6 +1857,8 @@ impl DialBridge {
         let dest = dest.clone();
         // 提前克隆 policy：避免 async move 持 &self 越界
         let policy = self.current_policy();
+        // 提前抓 set 引用：chained task 收进 bridge 的 JoinSet（bd mvsc）
+        let background_tasks = Arc::clone(&self.background_tasks);
 
         Box::pin(async move {
             let Some(ohm) = ohm else {
@@ -1867,10 +1893,13 @@ impl DialBridge {
             // spawn chained handler dispatch
             let chained_tag = chained_handler.tag().to_string();
             let chained_fut = chained_handler.dispatch(&dest, chained_link);
-            tokio::spawn(async move {
+            spawn_tracked(&background_tasks, async move {
                 let _ = chained_fut.await;
                 tracing::trace!(tag = %chained_tag, "chained handler dispatch done");
             });
+            // 立即释放 set 引用：否则本 future 持 Arc 到桥接结束，
+            // bridge drop 时 JoinSet 计数不归零、chained task 无法被 abort。
+            drop(background_tasks);
             // 桥接原始 link ↔ client_link
             // link.reader → client_link.writer（上行）
             // client_link.reader → link.writer（下行）
@@ -2443,6 +2472,87 @@ mod tests {
 
         assert_eq!(resp.to_vec(), b"e2e dispatch bridge");
         w.shutdown(); // 关闭触发 bridge 结束
+    }
+
+    /// mvsc：bridge drop 后 chained dispatch task 必须随共享 JoinSet 结构化
+    /// 收尾（abort），不允许 fire-and-forget 孤儿存活。修复前 tokio::spawn
+    /// 孤儿在 bridge 释放后仍被唤醒跑到 done=true → 红。
+    #[tokio::test]
+    async fn chained_dispatch_task_dies_with_bridge() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        #[derive(Debug)]
+        struct HangingHandler {
+            started: Arc<AtomicBool>,
+            release: Arc<tokio::sync::Notify>,
+            done: Arc<AtomicBool>,
+        }
+        impl DispatchHandler for HangingHandler {
+            fn tag(&self) -> &str {
+                "hanging-chain"
+            }
+            fn dispatch(
+                &self,
+                _dest: &Destination,
+                _link: xray_transport::link::Link,
+            ) -> PinFuture<()> {
+                let started = Arc::clone(&self.started);
+                let release = Arc::clone(&self.release);
+                let done = Arc::clone(&self.done);
+                Box::pin(async move {
+                    started.store(true, Ordering::SeqCst);
+                    release.notified().await;
+                    done.store(true, Ordering::SeqCst);
+                })
+            }
+        }
+
+        let started = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let chained = Arc::new(HangingHandler {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+            done: Arc::clone(&done),
+        });
+        let ohm = SimpleOhm::new();
+        ohm.add("hanging-chain", chained);
+        let dial: DialFn = Arc::new(|_dest: &Destination| {
+            Box::pin(async { Err("unused: chain never dials".to_string()) })
+        });
+        let bridge = Arc::new(DialBridge::new("bridge-under-test", dial));
+        bridge.set_proxy_chain("hanging-chain", Arc::new(ohm));
+
+        let dest = Destination::new(
+            Address::from_ipv4_bytes([127, 0, 0, 1]),
+            Port::new(1),
+            Network::TCP,
+        );
+        let (up_r, _up_w) = xray_buf::pipe::new();
+        let (_dn_r, dn_w) = xray_buf::pipe::new();
+        let link = xray_transport::link::Link::new(
+            Box::new(up_r) as Box<dyn xray_buf::io::Reader>,
+            Box::new(dn_w) as Box<dyn xray_buf::io::Writer>,
+        );
+        let dispatch_fut = bridge.dispatch(&dest, link);
+        tokio::spawn(dispatch_fut);
+
+        // chained task 已启动并挂起在 release
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(started.load(Ordering::SeqCst), "chained task must have started");
+
+        // 释放全部 bridge 持有者（ohm 已 move 进 bridge.proxy_chain）
+        drop(bridge);
+
+        // 修复后：chained task 已随 JoinSet drop 被 abort，唤醒无人应答；
+        // 修复前：孤儿 task 被唤醒并把 done 置 true（红）。
+        release.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "chained task must not survive bridge drop (orphan task)"
+        );
     }
 
     use xray_features::stats::Manager as _;
