@@ -11,7 +11,9 @@ use std::sync::Arc;
 /// Go 端字段对照：
 /// - `header` / `key`：obfuscation（未实现，quinn 不支持 header obfuscation）
 /// - `security` / `tlsSettings`：通过 `StreamSettings.security_json` 承载，本结构不重复存储
-/// - `congestion`：拥塞控制算法（`"bbr"` / `"cubic"` / `"new_reno"`，默认 CUBIC）
+/// - `congestion`：拥塞控制算法字面值（Go `infra/conf/transport_internet.go:245-253`）：
+///   `""`/`"brutal"`/`"reno"`/`"bbr"` 合法；`"force-brutal"` 需 brutalUp>0（本层
+///   无该字段，恒报错）；未知值硬错（文案同 Go）
 /// - `keepAlive`：QUIC keepalive 周期（与 Go `keep_alive` 同义；quinn 端叫 keep_alive_period）
 /// - `initialStreamReceiveWindow` / `maxStreamReceiveWindow`：流接收窗口两级
 ///   （quinn 单固定窗口 → 取 max 对齐 Go Initial/Max 稳态）
@@ -23,9 +25,10 @@ use std::sync::Arc;
 pub struct QuicConfig {
     /// 是否启用 keep-alive（对应 Go `keep_alive`，默认 false）。
     pub keep_alive: bool,
-    /// 拥塞控制算法（对应 Go `CongestionControl`）。
+    /// 拥塞控制算法（对应 Go `QuicParams.congestion`，解析期小写归一）。
     ///
-    /// `"bbr"` → quinn-proto BBR；其他（`""`、`"cubic"`、`"new_reno"`）→ 默认 CUBIC。
+    /// `"bbr"` → quinn BBR；`"reno"` → quinn NewReno；`""`/`"brutal"` → CUBIC
+    /// （brutal 发送器仅 hysteria 路径有真实现，本 crate 落 CUBIC 登记）。未知值解析期报错。
     pub congestion: String,
     /// 流接收窗口（字节）。qeyo：quinn 单固定窗口取 max(initial, max) 对齐 Go 稳态。
     /// 0 = 使用 quinn 默认（~500KB）；上层解析时已映射成实际值。
@@ -61,11 +64,31 @@ impl QuicConfig {
             .get("keepAlive")
             .and_then(|x| x.as_bool())
             .unwrap_or(false);
+        // congestion 字面值校验（Go infra/conf/transport_internet.go:245-253）：小写归一，
+        // ""/brutal/reno/bbr 合法直通；force-brutal 需 QuicParams.brutalUp>0——本层
+        // （quicSettings）无 brutalUp 字段，忠实映射 Go up==0 分支恒报错；未知值硬错。
         let congestion = obj
             .get("congestion")
             .and_then(|x| x.as_str())
             .unwrap_or("")
-            .to_string();
+            .to_ascii_lowercase();
+        match congestion.as_str() {
+            "" | "brutal" | "reno" | "bbr" => {}
+            "force-brutal" => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "force-brutal requires up",
+                ));
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unknown congestion control: {congestion}, valid values: reno, bbr, brutal, force-brutal"
+                    ),
+                ));
+            }
+        }
         // qeyo：finalmask.quicParams 也可承载窗口/idle/keepalive 字段（与 hysteria crate 同源
         // QuicParamsConfig 解析——finalmask 路径走 memory_settings.rs::parse_quic_params_config，
         // 直接 quicSettings 路径走这里）。两个入口字段名一致。
@@ -100,8 +123,8 @@ impl QuicConfig {
 
     /// 构建 quinn [`TransportConfig`]（qeyo：完整 6 字段 + 拥塞控制）。
     ///
-    /// `congestion == "bbr"` → quinn-proto BBR；
-    /// 其他（`""`、`"cubic"`/`"new_reno"`/未知）→ CUBIC（quinn 默认，与 Go quic-go 一致）。
+    /// `"bbr"` → quinn BBR；`"reno"` → quinn NewReno；`""`/`"brutal"` → CUBIC
+    /// （解析层已保证字面值合法；`Default` 的 `""` 落 CUBIC 即 quinn 默认）。
     #[must_use]
     pub fn build_transport_config(&self) -> quinn::TransportConfig {
         let mut t = quinn::TransportConfig::default();
@@ -144,7 +167,13 @@ impl QuicConfig {
                     quinn_proto::congestion::BbrConfig::default(),
                 ));
             }
-            // cubic / new_reno / "" / 未知 → CUBIC（quinn 默认，与 Go quic-go 一致）
+            // 解析层已保证字面值合法；`Default` 构造的 "" 落 CUBIC（quinn 默认）。
+            // "brutal" 在本 crate 无 BrutalSender（hysteria crate 专属），落 CUBIC 登记。
+            "reno" => {
+                t.congestion_controller_factory(Arc::new(
+                    quinn_proto::congestion::NewRenoConfig::default(),
+                ));
+            }
             _ => {
                 t.congestion_controller_factory(Arc::new(
                     quinn_proto::congestion::CubicConfig::default(),
@@ -179,6 +208,41 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(r#"{"congestion":"bbr"}"#).unwrap();
         let cfg = QuicConfig::from_json(Some(&v)).unwrap();
         assert_eq!(cfg.congestion, "bbr");
+    }
+
+    #[test]
+    fn congestion_go_literal_set_accepted() {
+        for lit in ["brutal", "reno", "bbr", "BRUTAL", "Reno"] {
+            // Go ToLower 后严格匹配（无 trim）——仅验证合法字面值与大小写归一；
+            // 带空格串属未知值，走硬错分支（见下方 rejected 测试）。
+        // " Reno " 类带空格串 Go 侧硬错（ToLower 无 trim），归入 rejected 语义。
+            let v: serde_json::Value =
+                serde_json::from_str(&format!(r#"{{"congestion":"{lit}"}}"#)).unwrap();
+            let cfg = QuicConfig::from_json(Some(&v)).unwrap();
+            assert_eq!(cfg.congestion, lit.to_ascii_lowercase());
+        }
+    }
+
+    #[test]
+    fn congestion_unknown_rejected_go_parity() {
+        // Go 合法集合无 "cubic"/"new_reno"/其他——硬错且文案一致（transport_internet.go:253）。
+        for lit in ["cubic", "new_reno", "NewReno", "whatever", " Reno "] {
+            let v: serde_json::Value =
+                serde_json::from_str(&format!(r#"{{"congestion":"{lit}"}}"#)).unwrap();
+            let err = QuicConfig::from_json(Some(&v)).unwrap_err();
+            assert!(
+                err.to_string().contains("unknown congestion control"),
+                "literal {lit:?} should fail with Go message, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn congestion_force_brutal_requires_up() {
+        // 本层无 brutalUp 字段 → 恒等价 Go up==0 分支（transport_internet.go:249-250）。
+        let v: serde_json::Value = serde_json::from_str(r#"{"congestion":"force-brutal"}"#).unwrap();
+        let err = QuicConfig::from_json(Some(&v)).unwrap_err();
+        assert_eq!(err.to_string(), "force-brutal requires up");
     }
 
     #[test]
