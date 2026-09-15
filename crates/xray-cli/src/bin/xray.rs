@@ -182,6 +182,13 @@ enum Command {
     },
 }
 
+// bd uf2p: mimalloc 全局分配器（feature 默认开；--no-default-features 回退
+// 系统分配器）。proxy 小对象密集分配场景公开基准 +5-15%。
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     // 9tk4：tracing subscriber 不再在此急切初始化（此前固定 EnvFilter "info"
