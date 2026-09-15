@@ -183,8 +183,8 @@ fn test_multi_frame_mixed_stream() {
     // 第一帧：New 帧
     let p1 = reader.read_packet().expect("read1").expect("some");
     assert_eq!(p1.data(), b"new_frame_data", "first packet should be New frame data");
-    // New 帧的 udp_target 为 None
-    assert!(p1.udp_target().is_none(), "New frame should not have udp_target");
+    // New 帧的 udp_target 携带真实来源（b2e 中央 dispatcher 语义，6a3210d）
+    assert_eq!(p1.udp_target(), Some(&dest), "New frame should carry udp_target since b2e");
 
     // 第二帧：Keep 帧
     let p2 = reader.read_packet().expect("read2").expect("some");
@@ -301,15 +301,16 @@ fn test_keep_alive_frames_skipped() {
     assert!(reader.read_packet().expect("eof").is_none(), "stream should end");
 }
 
-/// 测试大数据包（接近但不超过最大限制）的 Write→Read 往返
+/// 测试大数据包（不超过 Go parity 上限）的 Write→Read 往返
 #[test]
 fn test_large_packet_write_read() {
     let dest = ipv4_dest("192.168.100.1", 5000);
     let global_id = test_global_id();
 
-    // 构造接近 u16 数据长度上限的数据（write_packet 使用 u16 编码数据长度）
-    // 使用较大数据验证大包处理能力
-    let large_size = 60000; // 60KB，接近 u16 上限 65535
+    // Go `common/xudp/xudp.go:100`：`length+666 > buf.Size(8192) → continue`，
+    // 应用层 packet 上限 = 8192-666 = 7526；超限帧静默丢弃（u5ni 对齐，原 2MB 上限
+    // 会使帧 length 字段 u16 截断损坏）。7526 是合法边界。
+    let large_size = 7526;
     let large_data: Vec<u8> = vec![0xAB; large_size];
 
     let mut buf = Vec::new();
