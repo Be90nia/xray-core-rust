@@ -15,6 +15,7 @@ use std::future::Future;
 use std::io::{ErrorKind, IoSliceMut};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::LazyLock;
 
 use tokio::net::tcp::OwnedReadHalf;
 
@@ -24,7 +25,9 @@ use crate::multi::MultiBuffer;
 
 // ========== env 闸门（Go readv_reader.go:147-163） ==========
 
-static USE_READV: AtomicBool = AtomicBool::new(true);
+/// `xray.buf.readv` 解析结果缓存。LazyLock 首调读 env（未设 → true = Go 缺省开），
+/// 热路径零 env 查询；`reload_env_settings` 显式刷新。
+static USE_READV: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(parse_readv_env()));
 
 /// 读取 `xray.buf.readv` 环境闸门当前值。
 ///
@@ -36,12 +39,18 @@ pub fn use_readv() -> bool {
 }
 
 /// 重新解析 env 闸门。对应 Go `reloadEnvSettings`（经 platform.RegisterEnvReload
-/// 注册；我们无注册机制，进程启动后环境变更需显式调用）。
+/// 注册；我们无注册机制，进程启动后环境变更需显式调用）。LazyLock 首调已
+/// 保证启动正确性（bd xag3③），本函数是显式刷新口。
 pub fn reload_env_settings() {
+    USE_READV.store(parse_readv_env(), Ordering::Relaxed);
+}
+
+/// 读 env 并按三态语义解析 `xray.buf.readv`（原名优先，alt 兜底）。
+fn parse_readv_env() -> bool {
     let v = std::env::var("xray.buf.readv")
         .or_else(|_| std::env::var("XRAY_BUF_READV"))
         .ok();
-    USE_READV.store(parse_readv_flag(v.as_deref()), Ordering::Relaxed);
+    parse_readv_flag(v.as_deref())
 }
 
 /// Go readv_reader.go:154-160 的 switch 翻译：env 未设置 / auto / enable → 启用。
@@ -98,6 +107,9 @@ impl AllocStrategy {
     }
 
     /// 分配 `current` 个池化空 Buffer。对应 Go `Alloc()`。
+    ///
+    /// Vec 版（bd fwhh）：`xray-transport/src/bridge.rs` 兼容路径仍在用；
+    /// `ReadVReader` 热路径已切零分配栈数组，勿新增调用方。
     #[must_use]
     pub fn alloc(&self) -> Vec<Buffer> {
         (0..self.current).map(|_| Buffer::new()).collect()
@@ -106,7 +118,7 @@ impl AllocStrategy {
 
 // ========== iovec 构建 + 字节分发（对应 Go posixReader.Init / readMulti 尾部循环） ==========
 
-/// 把每个 Buffer 的可写区拼成 `read_vectored` 的 iovec 数组。
+/// 把每个 Buffer 的可写区拼成 `read_vectored` 的 iovec 数组（堆分配版）。
 ///
 /// 返回 `(slices, lens)`：`lens[i]` 是第 i 个 iovec 的长度（分发起始容量），
 /// 供 [`distribute`] 按序分配读取到的字节数。Buffer 内存由池提供（8KB 分层），
@@ -142,10 +154,64 @@ pub fn distribute(n: usize, bufs: &mut Vec<Buffer>, lens: &[usize]) -> MultiBuff
     mb
 }
 
-/// 全部缓冲释放回池（EOF / 错误路径）。对应 Go `ReleaseMulti`。
-fn release_all(bufs: &mut Vec<Buffer>) {
-    for mut b in std::mem::take(bufs) {
-        b.release();
+// ========== 零分配 readv 路径（bd fwhh：ReadVReader 每读 4 alloc → ~1） ==========
+
+/// readv 单次 read 的最大 iovec 数（= [`AllocStrategy`] 上界，Go readv_reader.go:34）。
+const MAX_READV: usize = 8;
+
+/// 栈上 iovec 批：`read_vectored` 切片与容量表，零堆分配构建。
+struct IovecBatch<'a> {
+    slices: [IoSliceMut<'a>; MAX_READV],
+    lens: [usize; MAX_READV],
+    n: usize,
+}
+
+impl<'a> IovecBatch<'a> {
+    /// 从已填缓冲槽构建 iovec。`bufs[i]`（i < n_bufs）由调用方保证已填。
+    fn build(bufs: &'a mut [Option<Buffer>; MAX_READV], n_bufs: usize) -> Self {
+        // IoSliceMut::new 非 const fn：运行时 from_fn 填空切片，命中槽位时覆盖
+        let mut slices = std::array::from_fn(|_| IoSliceMut::new(&mut []));
+        let mut lens = [0usize; MAX_READV];
+        for (i, slot) in bufs.iter_mut().enumerate().take(n_bufs) {
+            let Some(buf) = slot.as_mut() else { continue };
+            let w = buf.writable_bytes();
+            lens[i] = w.len();
+            slices[i] = IoSliceMut::new(w);
+        }
+        Self { slices, lens, n: n_bufs }
+    }
+}
+
+/// 数组版 distribute：n 字节按 iovec 容量切进各槽（语义同 [`distribute`]），
+/// 消费全部槽位；唯一保留分配 = MultiBuffer 内部 `Vec::with_capacity`。
+fn distribute_slots(
+    n: usize,
+    bufs: &mut [Option<Buffer>; MAX_READV],
+    lens: &[usize; MAX_READV],
+    n_bufs: usize,
+) -> MultiBuffer {
+    let mut remaining = n;
+    let mut mb = MultiBuffer::with_capacity(n_bufs);
+    for (i, slot) in bufs.iter_mut().enumerate().take(n_bufs) {
+        let Some(mut buf) = slot.take() else { continue };
+        if remaining == 0 {
+            buf.release();
+            continue;
+        }
+        let take = remaining.min(lens[i]);
+        buf.advance_write(take);
+        remaining -= take;
+        mb.push(buf);
+    }
+    mb
+}
+
+/// 数组版 release_all：全部槽位释放回池（EOF / 错误路径）。
+fn release_slots(bufs: &mut [Option<Buffer>; MAX_READV]) {
+    for slot in bufs.iter_mut() {
+        if let Some(mut b) = slot.take() {
+            b.release();
+        }
     }
 }
 
@@ -193,25 +259,40 @@ impl ReadVReader {
     }
 
     /// 对应 Go `ReadVReader.ReadMultiBuffer`（readv_reader.go:124-145）。
+    ///
+    /// 零分配路径（bd fwhh）：缓冲槽与 iovec 批都在栈上（`[Option<Buffer>; 8]` +
+    /// `IovecBatch`），每读唯一堆分配 = 返回值 MultiBuffer 内部 Vec。
     pub async fn read_multi(&mut self) -> Result<MultiBuffer> {
         // Go 以 current==1 分流：单缓冲读（填满才扩容）vs 多缓冲 readv（按实填数调整）。
         // 分支判定在入口取快照，读后按各自分支调整一次（对齐 Go :127-129 / :143）。
         let single = self.alloc.current() == 1;
+        let n_bufs = (self.alloc.current() as usize).min(MAX_READV);
 
-        let mut bufs = self.alloc.alloc();
-        let (mut slices, lens) = buffer_iovecs(&mut bufs);
-        let n = self.read_vectored_ready(&mut slices).await.map_err(|e| {
-            release_all(&mut bufs);
-            io::classify_io_error(e, true)
-        })?;
+        // 栈上构建：填缓冲槽 → 拼 iovec（对应 Go posixReader.Init 直写 bs[nBuf].v）。
+        let mut bufs: [Option<Buffer>; MAX_READV] = std::array::from_fn(|_| None);
+        for slot in bufs.iter_mut().take(n_bufs) {
+            *slot = Some(Buffer::new());
+        }
+        let mut batch = IovecBatch::build(&mut bufs, n_bufs);
+
+        let read = self.read_vectored_ready(&mut batch.slices[..batch.n]).await;
+        // lens/n 是纯数据，先拷出结束 batch 对 bufs 的借用，错误/EOF 路径才能释放槽位。
+        let (lens, n_iov) = (batch.lens, batch.n);
+        let n = match read {
+            Ok(n) => n,
+            Err(e) => {
+                release_slots(&mut bufs);
+                return Err(io::classify_io_error(e, true));
+            }
+        };
 
         if n == 0 {
             // 对应 Go `nBytes == 0 → io.EOF`；本 crate 约定：空 MultiBuffer 表示 EOF。
-            release_all(&mut bufs);
+            release_slots(&mut bufs);
             return Ok(MultiBuffer::new());
         }
 
-        let mb = distribute(n, &mut bufs, &lens);
+        let mb = distribute_slots(n, &mut bufs, &lens, n_iov);
         if single {
             // Go :127-129：单缓冲读填满（IsFull）→ Adjust(1) → 扩到 2，下次起用 readv。
             if n >= lens[0] {
@@ -445,5 +526,120 @@ mod tests {
             got.extend_from_slice(&mb.to_vec());
         }
         assert_eq!(got, b"hello readv gate".repeat(4));
+    }
+    /// bd xag3③：use_readv 缓存 + reload 行为等价三态（env 进程全局，串行化）。
+    #[test]
+    fn use_readv_cached_env_three_states() {
+        let _guard = ENV_LOCK.lock();
+
+        const NAME: &str = "xray.buf.readv";
+        const ALT: &str = "XRAY_BUF_READV";
+        let saved_name = std::env::var_os(NAME);
+        let saved_alt = std::env::var_os(ALT);
+        struct Restore(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.0.take() {
+                        Some(v) => std::env::set_var(NAME, v),
+                        None => std::env::remove_var(NAME),
+                    }
+                    match self.1.take() {
+                        Some(v) => std::env::set_var(ALT, v),
+                        None => std::env::remove_var(ALT),
+                    }
+                }
+                super::reload_env_settings();
+            }
+        }
+        unsafe {
+            std::env::remove_var(NAME);
+            std::env::remove_var(ALT);
+        }
+        let _restore = Restore(saved_name, saved_alt);
+
+        // ① 不设 → Go 缺省开
+        reload_env_settings();
+        assert!(use_readv(), "未设置应启用（Go 缺省）");
+
+        // ② 显式启用值
+        for on in ["auto", "enable"] {
+            unsafe { std::env::set_var(NAME, on) };
+            reload_env_settings();
+            assert!(use_readv(), "env={on:?} 应启用");
+        }
+
+        // ③ 非法值禁用（readv 走 var()：非 UTF-8 与空串同落禁用侧）
+        for off in ["disable", "true", "1", ""] {
+            unsafe { std::env::set_var(NAME, off) };
+            reload_env_settings();
+            assert!(!use_readv(), "env={off:?} 应禁用");
+        }
+
+        // ④ 缓存语义：env 变更不 reload 不生效
+        unsafe { std::env::set_var(NAME, "auto") };
+        assert!(!use_readv(), "不 reload 不应翻转（缓存生效）");
+        reload_env_settings();
+        assert!(use_readv(), "reload 后应翻转");
+
+        // ⑤ alt 名兜底 + 原名优先
+        unsafe {
+            std::env::remove_var(NAME);
+            std::env::set_var(ALT, "enable");
+        }
+        reload_env_settings();
+        assert!(use_readv(), "alt 名应兜底");
+        unsafe { std::env::set_var(NAME, "disable") };
+        reload_env_settings();
+        assert!(!use_readv(), "原名命中时优先于 alt");
+    }
+    /// bd fwhh：数组版 distribute 与 Vec 版同语义（字节守恒 + 尾部空槽释放）。
+    #[test]
+    fn distribute_slots_byte_conservation_and_release() {
+        let mut lens = [0usize; MAX_READV];
+        let fill = |bufs: &mut [Option<Buffer>; MAX_READV], n_bufs: usize, lens: &mut [usize; MAX_READV]| {
+            for slot in bufs.iter_mut().take(n_bufs) {
+                *slot = Some(Buffer::new());
+            }
+            for (i, slot) in bufs.iter().enumerate().take(n_bufs) {
+                lens[i] = slot.as_ref().map(|b| b.capacity()).unwrap_or(0);
+            }
+        };
+
+        // 恰好 2.5 个缓冲的量
+        let mut bufs: [Option<Buffer>; MAX_READV] = std::array::from_fn(|_| None);
+        fill(&mut bufs, 4, &mut lens);
+        let cap = lens[0];
+        let n = cap * 2 + cap / 2;
+        let mb = distribute_slots(n, &mut bufs, &lens, 4);
+        assert_eq!(mb.len(), n);
+        assert_eq!(mb.buffer_count(), 3);
+        assert!(bufs.iter().all(|s| s.is_none()), "全部槽位被消费（尾部释放）");
+
+        // n=0：全部释放，空 MultiBuffer
+        let mut bufs: [Option<Buffer>; MAX_READV] = std::array::from_fn(|_| None);
+        fill(&mut bufs, 2, &mut lens);
+        let mb = distribute_slots(0, &mut bufs, &lens, 2);
+        assert!(mb.is_empty());
+        assert!(bufs.iter().all(|s| s.is_none()));
+    }
+
+    /// bd fwhh：IovecBatch::build 的 lens 与 Vec 版 buffer_iovecs 一致。
+    #[test]
+    fn iovec_batch_build_matches_vec_version() {
+        let mut slots: [Option<Buffer>; MAX_READV] = std::array::from_fn(|_| None);
+        for slot in slots.iter_mut().take(3) {
+            *slot = Some(Buffer::new());
+        }
+        let mut bufs: Vec<Buffer> = slots.iter_mut().take(3).map(|s| s.take().unwrap()).collect();
+        let (_, vec_lens) = buffer_iovecs(&mut bufs);
+
+        for slot in slots.iter_mut().take(3) {
+            *slot = Some(Buffer::new());
+        }
+        let batch = IovecBatch::build(&mut slots, 3);
+        assert_eq!(batch.n, 3);
+        assert_eq!(&batch.lens[..3], &vec_lens[..]);
+        assert_eq!(&batch.lens[3..], &[0; MAX_READV - 3]);
     }
 }
