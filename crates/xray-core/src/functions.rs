@@ -277,7 +277,8 @@ async fn start_full_dispatched(
         }
     }
     // per-tag UDP443 策略（bd g35）：mux JSON → dispatch_link 前置检查
-    dispatcher.udp443_policies = crate::outbound::parse_udp443_policies(&built.outbounds);
+    dispatcher.udp443_policies =
+        std::sync::Arc::new(crate::outbound::parse_udp443_policies(&built.outbounds));
     // FakeDNS 注入（对应 Go dispatcher.fdns，嗅探阶段反查 fake IP 域名）：
     // fakeDns app 存在时 engine() → dispatcher.set_fdns。
     if let Some(f) = instance.get_feature::<crate::register::FakeDnsFeature>() {
