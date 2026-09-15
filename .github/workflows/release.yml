@@ -6,6 +6,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # 覆盖 .cargo/config.toml 的 target-cpu=native（bd hxy3）：发行产物给公网
+  # 用户下载，必须通用 target 生成（老机器 SIGILL 防线）；RUSTFLAGS env 完全
+  # 覆盖 build.rustflags（cargo 语义）。
+  RUSTFLAGS: ""
 
 jobs:
   build:

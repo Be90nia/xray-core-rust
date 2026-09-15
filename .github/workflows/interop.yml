@@ -10,6 +10,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # 覆盖 .cargo/config.toml 的 target-cpu=native（bd hxy3）：交叉/发行构建保持
+  # 通用 target 生成；RUSTFLAGS env 完全覆盖 build.rustflags（cargo 语义）。
+  RUSTFLAGS: ""
 
 jobs:
   interop:
@@ -36,39 +39,9 @@ jobs:
             brew install protobuf
           fi
 
-      # btls-sys 在干净环境走其内部 submodule 流程会产出 unpatched libcrypto
-      # (rust-lld: undefined symbol SSL_set_reality_rewrite_cb /
-      #  SSL_get_x25519_key_share_private)。Docker 床实证配方: 预取 boringssl
-      # 固定 rev (Cargo.lock 内 btls-sys git rev 对应的 submodule pin) +
-      # 按 build/main.rs ensure_patches_applied 同序预打补丁, 再用
-      # ASSUME_PATCHED+SOURCE_PATH 让 btls-sys 直接消费已补丁源码。
-      - name: Prepare patched boringssl for btls-sys
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo fetch
-          rev=$(awk '/^name = "btls-sys"/{f=1;next} f&&/^source/{print;exit}' Cargo.lock \
-            | sed 's/.*#\([0-9a-f]\{40\}\)".*/\1/')
-          btls_co=$(ls -d "$HOME"/.cargo/git/checkouts/btls-*/"${rev:0:7}"* | head -1)
-          patches_dir="$btls_co/btls-sys/patches"
-          # boringssl pin 从 btls 仓 tree 的 submodule gitlink 动态取
-          # （btls rev 变更自动跟随；首版误用 btls rev fetch 即 CI "not our ref" 根因）
-          bssl_rev=$(git -C "$btls_co" ls-tree HEAD btls-sys/deps/boringssl | awk '{print $3}')
-          bssl="$RUNNER_TEMP/boringssl"
-          git init -q "$bssl"
-          git -C "$bssl" remote add origin https://github.com/google/boringssl.git
-          git -C "$bssl" fetch -q --depth 1 origin "$bssl_rev"
-          git -C "$bssl" checkout -q FETCH_HEAD
-          git -C "$bssl" apply -v --whitespace=fix "$patches_dir/boring-pq.patch"
-          git -C "$bssl" apply -v --whitespace=fix "$patches_dir/boringssl.patch"
-          git -C "$bssl" apply -v --whitespace=fix "$patches_dir/boringssl-loongarch.patch"
-          git -C "$bssl" apply -v --whitespace=fix "$patches_dir/boringssl-windows.patch"
-          # REALITY 补丁集（btls-sys 0.5.6 不含 SSL_set_reality_rewrite_cb /
-          # SSL_get_x25519_key_share_private，xray-tls btls_reality.rs FFI 需要；
-          # 复用 tools/setup_boringssl_reality.py 的锚点式补丁逻辑）
-          python3 -c "import sys, pathlib; sys.path.insert(0, 'tools'); from setup_boringssl_reality import apply_reality_patches; apply_reality_patches(pathlib.Path('$RUNNER_TEMP/boringssl'))"
-          echo "BORING_BSSL_ASSUME_PATCHED=1" >> "$GITHUB_ENV"
-          echo "BORING_BSSL_SOURCE_PATH=$bssl" >> "$GITHUB_ENV"
+      # btls-sys 在干净环境走其内部 submodule 流程会产出 unpatched libcrypto，
+      # 配方统一收编为 composite action（bd kumd，与 build-linux-release/mobile 同源）
+      - uses: ./.github/actions/setup-boringssl
 
       # macOS 上 workspace 全量编译本身即 darwin 编译烂账防线
       - name: Workspace lib tests
