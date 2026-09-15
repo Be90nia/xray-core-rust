@@ -114,7 +114,7 @@ impl TuicInboundHandler {
 
     /// 构建 Quinn server 配置（TLS + transport）。
     fn build_server_config(&self) -> Result<quinn::ServerConfig> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        xray_common::ensure_default_crypto_provider();
 
         let (cert_der, key_der) = if let (Some(c), Some(k)) =
             (&self.config.cert_der, &self.config.key_der)
