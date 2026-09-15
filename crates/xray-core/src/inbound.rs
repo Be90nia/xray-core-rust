@@ -2199,6 +2199,8 @@ async fn serve_reality_vless(
         tokio::spawn(async move {
             match server_tls(stream, &key, &ids, max_diff, &min_ver, &max_ver, &names).await {
                 Ok(RealityServerOutcome::Verified(tls)) => {
+                    // [DEBUG-8sum-rm] 临时计量：env XRAY_DEBUG_READMETER=1 启用
+                    let tls = crate::readmeter_debug::wrap_readmeter(tls);
                     if let Err(e) = xray_proxy_vless::handle_vless_connection(
                         tls,
                         &handler,
