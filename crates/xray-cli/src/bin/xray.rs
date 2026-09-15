@@ -195,6 +195,9 @@ async fn main() -> std::process::ExitCode {
     // 完全绕过 loglevel 配置）。`run` 路径在配置解析后按 `log.loglevel`
     // 推导过滤器（见 run::execute → run::init_tracing）；其余工具子命令
     // 维持原 info 默认。RUST_LOG 仍可覆盖（例:RUST_LOG=xray_tls=debug）。
+    // bd xag3③：env 热路径闸门启动期显式解析一次（对齐 Go reloadEnvSettings；
+    // LazyLock 首调兜底，此处为显式语义锚点）。
+    xray_common::platform::env::reload_env_settings();
     let cli = Cli::parse();
     // v4 兼容：无子命令时默认 run
     let command = cli.command.unwrap_or(Command::Run(RunArgs::default()));
