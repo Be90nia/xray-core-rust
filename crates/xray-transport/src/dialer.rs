@@ -167,7 +167,8 @@ impl StreamSettings {
     /// `acceptProxyProtocol` / `reusePort` /
     /// `v6only` / `dialerProxy` / `happyEyeballs` / `domainStrategy` /
     /// `addressPortStrategy` / `trustedXForwardedFor` / `tcpWindowClamp` / `tcpMaxSeg` /
-    /// `penetrate` / `tcpUserTimeout`（毫秒）/ `customSockopt`。
+    /// `penetrate` / `tcpUserTimeout`（毫秒）/ `customSockopt` / `receiveBufferSize`
+    /// （本仓库 opt-in，Go 无此字段）。
     /// 缺省字段用 [`SocketOptions::default`]。Go `interface`（接口名字符串）JSON 暂不
     /// 解析（[`SocketOptions::bind_if_index`](crate::sockopt::SocketOptions) 字段已备，
     /// 尚无 JSON 入口）。
@@ -215,6 +216,12 @@ impl StreamSettings {
         }
         if let Some(v) = obj.get("tcpUserTimeout").and_then(|v| v.as_i64()) {
             opts.tcp_user_timeout = v as i32;
+        }
+        // receiveBufferSize（SO_RCVBUF 字节；本仓库 opt-in 扩展，Go `SocketConfig`
+        // 无此字段——JSON 命名对齐 Go camelCase 风格）。0=不设置（默认，内核
+        // DRC 自动调节）。见 [`SocketOptions::receive_buffer_size`]。
+        if let Some(v) = obj.get("receiveBufferSize").and_then(|v| v.as_i64()) {
+            opts.receive_buffer_size = v as i32;
         }
         // tproxy（Go `SocketConfig.TProxy` JSON 是字符串枚举：transport_sockopt.go:48，
         // Build() :85-93 仅 "tproxy"/"redirect"（大小写不敏感）启用，其余静默 Off；
@@ -783,6 +790,7 @@ mod transport_cache_tests {
             "tcpWindowClamp": 65536,
             "tcpMaxSeg": 1200,
             "tcpUserTimeout": 10000,
+            "receiveBufferSize": 1048576,
             "penetrate": true,
             "customSockopt": [
                 { "system": "linux", "network": "tcp", "level": "6",
@@ -794,6 +802,8 @@ mod transport_cache_tests {
         assert_eq!(o.tcp_window_clamp, 65536);
         assert_eq!(o.tcp_max_seg, 1200);
         assert_eq!(o.tcp_user_timeout, 10000);
+        // receiveBufferSize（本仓库 opt-in 扩展）。
+        assert_eq!(o.receive_buffer_size, 1048576);
         assert!(o.penetrate);
         // customSockopt 列表逐条 roundtrip（Go CustomSockoptConfig 六字段）。
         assert_eq!(o.custom_sockopt.len(), 2);
@@ -813,6 +823,7 @@ mod transport_cache_tests {
         assert_eq!(d.tcp_window_clamp, 0);
         assert_eq!(d.tcp_max_seg, 0);
         assert_eq!(d.tcp_user_timeout, 0);
+        assert_eq!(d.receive_buffer_size, 0);
         assert!(!d.penetrate);
         assert!(d.custom_sockopt.is_empty());
     }

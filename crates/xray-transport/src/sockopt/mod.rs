@@ -290,6 +290,14 @@ pub struct SocketOptions {
     /// （字段 17，JSON `tcpMaxSeg`）。仅 Linux 应用（sockopt_linux.go:58-62）。
     /// `0`=不设置。
     pub tcp_max_seg: i32,
+    /// SO_RCVBUF 接收缓冲（字节）。JSON `receiveBufferSize`。`0`=不设置（默认，
+    /// 内核 DRC 自动调节）。**Go `SocketConfig` 无此字段**（v26.9.9 config.proto
+    /// 全字段核对），本仓库 opt-in 运维扩展：显式设置即锁定该 socket 的内核接收
+    /// 窗自动调节（Linux `SOCK_RCVBUF_LOCK`，通告窗上限=值×2 字节记账），用于高
+    /// BDP 链路下转发应用消费过快致 rcvbuf 恒空、DRC 无扩窗信号的窗死锁。
+    /// 超过 `net.core.rmem_max` 的值被内核静默钳制。inbound（accept 后 per-conn）
+    /// 与 outbound（拨号前）同字段生效。
+    pub receive_buffer_size: i32,
     /// splithttp 拨号时下载连接继承本 sockopt。对应 Go `SocketConfig.Penetrate`
     /// （字段 18，JSON `penetrate`；消费点 splithttp/dialer.go:387）。
     pub penetrate: bool,
@@ -372,6 +380,7 @@ impl Default for SocketOptions {
             tcp_window_clamp: 0,
             tcp_user_timeout: 0,
             tcp_max_seg: 0,
+            receive_buffer_size: 0,
             penetrate: false,
             custom_sockopt: Vec::new(),
         }
@@ -402,6 +411,12 @@ pub fn apply_outbound_socket_options(
     socket.set_nodelay(opts.tcp_nodelay)?;
     if opts.ipv6_only {
         socket.set_only_v6(true)?;
+    }
+    // SO_RCVBUF（opt-in，`receiveBufferSize`）：accept/dial 路径共用；显式值锁定
+    // 内核接收窗自动调节（Linux SOCK_RCVBUF_LOCK）。socket2 跨平台（unix SO_RCVBUF /
+    // Winsock SO_RCVBUF），0=跳过。
+    if opts.receive_buffer_size > 0 {
+        socket.set_recv_buffer_size(opts.receive_buffer_size as usize)?;
     }
     // SO_KEEPALIVE + TCP_KEEPIDLE/TCP_KEEPINTVL（Go KeepAliveConfig 语义，见
     // [`set_keepalive_config`]）。Darwin 平台 keepalive 走 darwin 模块自带逻辑。
@@ -492,6 +507,11 @@ pub fn apply_inbound_socket_options(socket: &Socket, opts: &SocketOptions) -> st
         socket.set_only_v6(true)?;
     }
     set_keepalive_config(socket, opts)?;
+    // SO_RCVBUF（opt-in，`receiveBufferSize`）：per-accept 设置——Linux accept 出的
+    // 连接不继承 listener 的 SO_RCVBUF 锁定语义，必须在连接 socket 上显式设。
+    if opts.receive_buffer_size > 0 {
+        socket.set_recv_buffer_size(opts.receive_buffer_size as usize)?;
+    }
 
     #[cfg(target_os = "linux")]
     {
@@ -1041,6 +1061,44 @@ mod tests {
 
         drop(socket);
         accept_task.await.unwrap();
+    }
+
+    /// SO_RCVBUF 生效路径（bd o93t）：显式 `receive_buffer_size` 真实 setsockopt
+    /// 并回读放大；默认 0 不触碰 socket（回读=内核默认）。未连接 TCP socket 即可
+    /// 验证（SO_RCVBUF 是 socket 层选项，与连接状态无关）。
+    #[test]
+    fn receive_buffer_size_applies_and_defaults_off() {
+        let make = || {
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+                .unwrap()
+        };
+        let rcvbuf = |s: &socket2::Socket| s.recv_buffer_size().unwrap();
+        let plain = make();
+        let default_rcv = rcvbuf(&plain);
+
+        // 1MiB：即使被 Linux `net.core.rmem_max`（默认 208KB）钳制，回读仍须
+        // 大于默认窗；Windows 回读=原值。
+        let opts = SocketOptions { receive_buffer_size: 1 << 20, ..Default::default() };
+        let tuned = make();
+        apply_inbound_socket_options(&tuned, &opts).unwrap();
+        assert!(
+            rcvbuf(&tuned) > default_rcv,
+            "inbound 显式 receiveBufferSize 必须放大 SO_RCVBUF: got={} default={default_rcv}",
+            rcvbuf(&tuned)
+        );
+
+        let out = make();
+        apply_outbound_socket_options(&out, &opts, None).unwrap();
+        assert!(
+            rcvbuf(&out) > default_rcv,
+            "outbound 同字段必须生效: got={} default={default_rcv}",
+            rcvbuf(&out)
+        );
+
+        // 默认 0：不设置（apply 全程在 default SocketOptions 上无副作用通过）。
+        let off = make();
+        apply_inbound_socket_options(&off, &SocketOptions::default()).unwrap();
+        assert_eq!(rcvbuf(&off), default_rcv, "默认 0 不应触碰 SO_RCVBUF");
     }
 
     // ===== DomainStrategy / AddressPortStrategy（bd 5y8，Go config.go:13-26）=====
