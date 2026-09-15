@@ -870,7 +870,7 @@ mod tests {
 
         /// New 帧 + 内联 data 的线格式（meta + 2B size + payload）。
         fn new_frame_with_data(meta: FrameMetadata, payload: &[u8]) -> Vec<u8> {
-            let mut buf = meta.to_bytes();
+            let mut buf = meta.to_bytes().unwrap();
             buf.extend_from_slice(&serial::write_uint16(payload.len() as u16));
             buf.extend_from_slice(payload);
             buf
@@ -1406,7 +1406,7 @@ mod tests {
             // 普通服务端 read_source_and_local=false：写出端（portal）不会带
             // 元数据的帧按普通格式解析——此处直接验证普通服务端 handle_normal_new
             // 不要求 source/local（帧即便带也不致命）。
-            let bytes = meta.to_bytes();
+            let bytes = meta.to_bytes().unwrap();
             let (parsed, _) = FrameMetadata::read_from_bytes(&bytes).expect("plain parse ok");
             assert!(parsed.source().is_none(), "plain parse 必须不读 source/local");
         }

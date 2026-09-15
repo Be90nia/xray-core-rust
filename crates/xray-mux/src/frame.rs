@@ -24,6 +24,7 @@ use std::io::{self, Read, Write};
 
 use xray_buf::buffer::Buffer;
 use xray_common::bitmask::Bitmask;
+use xray_common::net::address::Address;
 use xray_common::net::destination::Destination;
 use xray_common::net::network::Network;
 use xray_common::protocol::address_parser::{AddressParser, AddressSerializer};
@@ -210,16 +211,31 @@ impl From<io::Error> for MuxError {
 
 /// 将目标地址写入 Vec<u8>（线格式：network + port + address）。
 ///
-/// 使用 Buffer 进行 AddressSerializer 写入，然后将结果追加到 buf。
-fn write_target_to_vec(buf: &mut Vec<u8>, target: &Destination) {
+/// 域名超长（>255，u8 len 前缀装不下）报错——修复前 addr_buf(32B) 会
+/// 静默截断域名，写出 len 与数据不符的坏帧（bd n43f desync 根源）。
+fn write_target_to_vec(buf: &mut Vec<u8>, target: &Destination) -> Result<(), MuxError> {
     let net = TargetNetwork::from_network(target.network())
         .expect("target network must be TCP or UDP for mux frames");
     buf.push(net.to_byte());
 
-    // 使用 Buffer 进行地址序列化
-    let mut addr_buf = Buffer::with_capacity(32);
+    // 按地址实际线格式精确预分配，杜绝 Buffer 截断：
+    // port(2) + type(1) + [IPv4 4 | IPv6 16 | len(1)+domain]
+    let addr_wire_len = match target.address() {
+        Address::IPv4(_) => 4,
+        Address::IPv6(_) => 16,
+        Address::Domain(d) => {
+            if d.len() > 255 {
+                return Err(MuxError::MetadataTooLong(
+                    4 + 3 + d.len(),
+                ));
+            }
+            1 + d.len()
+        }
+    };
+    let mut addr_buf = Buffer::with_capacity(2 + 1 + addr_wire_len);
     AddressSerializer::write_port_address(&mut addr_buf, target.port(), target.address());
     buf.extend_from_slice(addr_buf.bytes());
+    Ok(())
 }
 
 /// 从字节切片读取目标地址（线格式：network + port + address）。
@@ -249,16 +265,21 @@ fn read_target(data: &[u8]) -> Result<(Destination, usize), MuxError> {
 ///
 /// local 嵌套于 source 网络有效时；Unix 网络视同无效跳过（Go 仅判
 /// TCP/UDP）。
-fn write_inbound_to_vec(buf: &mut Vec<u8>, source: &Destination, local: Option<&Destination>) {
+fn write_inbound_to_vec(
+    buf: &mut Vec<u8>,
+    source: &Destination,
+    local: Option<&Destination>,
+) -> Result<(), MuxError> {
     if TargetNetwork::from_network(source.network()).is_none() {
-        return;
+        return Ok(());
     }
-    write_target_to_vec(buf, source);
+    write_target_to_vec(buf, source)?;
     if let Some(local) = local {
         if TargetNetwork::from_network(local.network()).is_some() {
-            write_target_to_vec(buf, local);
+            write_target_to_vec(buf, local)?;
         }
     }
+    Ok(())
 }
 
 /// 解析 Reverse-mux New 帧的 source/local（Go frame.go:167-213）。
@@ -474,9 +495,12 @@ impl FrameMetadata {
 
     /// 将帧元数据序列化为字节向量（线格式）。
     ///
-    /// 线格式：`length(2B) + session_id(2B) + status(1B) + option(1B) + [target...]`
-    #[must_use]
-    pub fn to_bytes(&self) -> Vec<u8> {
+    /// 线格式：`length(2B) + session_id(2B) + status(1B) + option(1B) + [target...]`。
+    ///
+    /// 总长超过 [`MAX_METADATA_LEN`] 报错（对齐 Go frame.go:119-121 读侧
+    /// 512 硬顶）：写出超长帧对端必拒收并永久 desync，本端必须早失败
+    /// 而非静默饱和 length 字段（bd n43f）。
+    pub fn to_bytes(&self) -> Result<Vec<u8>, MuxError> {
         let mut buf = Vec::with_capacity(64);
         // 预留 2 字节 length
         buf.extend_from_slice(&[0u8; 2]);
@@ -493,38 +517,39 @@ impl FrameMetadata {
         // 目标地址
         if self.session_status == SessionStatus::New {
             if let Some(target) = &self.target {
-                write_target_to_vec(&mut buf, target);
+                write_target_to_vec(&mut buf, target)?;
             }
             if let Some(source) = &self.source {
                 // Go frame.go:87-99：Reverse-mux 场景写 source/local，
                 // 与 GlobalID 互斥（Go :100 else 分支）
-                write_inbound_to_vec(&mut buf, source, self.local.as_ref());
+                write_inbound_to_vec(&mut buf, source, self.local.as_ref())?;
             } else if self.is_udp_target() {
                 if let Some(gid) = &self.global_id {
                     buf.extend_from_slice(gid);
                 }
             }
         } else if self.session_status == SessionStatus::Keep {
-            if let Some(ref target) = self.target {
+            if let Some(target) = &self.target {
                 if target.network() == Network::UDP {
-                    write_target_to_vec(&mut buf, target);
+                    write_target_to_vec(&mut buf, target)?;
                 }
             }
         }
 
-        // 回填 length（length 字段后的所有内容长度）
+        // 回填 length（length 字段后的所有内容长度）。
+        // 512 检查通过则 content_len ≤ 512 < u16::MAX，转换无截断。
         let content_len = buf.len() - 2;
-        let len_bytes = serial::write_uint16(
-            content_len.try_into().unwrap_or(u16::MAX),
-        );
-        buf[0..2].copy_from_slice(&len_bytes);
+        if content_len > MAX_METADATA_LEN {
+            return Err(MuxError::MetadataTooLong(content_len));
+        }
+        buf[0..2].copy_from_slice(&serial::write_uint16(content_len as u16));
 
-        buf
+        Ok(buf)
     }
 
     /// 将帧元数据写入 `Write` trait 对象。
     pub fn write_to(&self, writer: &mut impl Write) -> Result<(), MuxError> {
-        let bytes = self.to_bytes();
+        let bytes = self.to_bytes()?;
         writer.write_all(&bytes)?;
         Ok(())
     }
@@ -728,7 +753,7 @@ mod tests {
         );
         let meta = FrameMetadata::new_session(42, target);
 
-        let bytes = meta.to_bytes();
+        let bytes = meta.to_bytes().unwrap();
         let (parsed, consumed) = FrameMetadata::read_from_bytes(&bytes)
             .expect("parse should succeed");
 
@@ -751,7 +776,7 @@ mod tests {
         );
         let meta = FrameMetadata::new_session(100, target);
 
-        let bytes = meta.to_bytes();
+        let bytes = meta.to_bytes().unwrap();
         let (parsed, consumed) = FrameMetadata::read_from_bytes(&bytes)
             .expect("parse should succeed");
 
@@ -774,7 +799,7 @@ mod tests {
         let gid = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
         meta.set_global_id(gid);
 
-        let bytes = meta.to_bytes();
+        let bytes = meta.to_bytes().unwrap();
         let (parsed, _) = FrameMetadata::read_from_bytes(&bytes)
             .expect("parse should succeed");
 
@@ -795,7 +820,7 @@ mod tests {
         );
         meta.set_inbound(source.clone(), local.clone());
 
-        let bytes = meta.to_bytes();
+        let bytes = meta.to_bytes().unwrap();
         // 逐字节对拍：4B 头 + 每段 8B（net 1B + port 2B BE + addr family 1B +
         // IPv4 4B）
         assert_eq!(&bytes[2..4], &[0x00, 0x07]);
@@ -832,7 +857,7 @@ mod tests {
     #[test]
     fn test_reverse_new_frame_without_source_variants() {
         let meta = FrameMetadata::new(1, SessionStatus::New, Bitmask::default());
-        let bytes = meta.to_bytes();
+        let bytes = meta.to_bytes().unwrap();
         let (parsed, _) = FrameMetadata::read_from_bytes_with_source(&bytes)
             .expect("parse should succeed");
         assert!(parsed.source().is_none());
@@ -841,7 +866,7 @@ mod tests {
             2,
             Destination::tcp(Address::ipv4(Ipv4Addr::new(1, 2, 3, 4)), Port::new(443)),
         );
-        let mut bytes = meta.to_bytes();
+        let mut bytes = meta.to_bytes().unwrap();
         bytes.push(0x00); // padding
         let len = u16::from_be_bytes([bytes[0], bytes[1]]) + 1;
         bytes[0..2].copy_from_slice(&len.to_be_bytes());
@@ -855,7 +880,7 @@ mod tests {
     fn test_end_frame_roundtrip() {
         let meta = FrameMetadata::end_session(42);
 
-        let bytes = meta.to_bytes();
+        let bytes = meta.to_bytes().unwrap();
         let (parsed, consumed) = FrameMetadata::read_from_bytes(&bytes)
             .expect("parse should succeed");
 
@@ -870,7 +895,7 @@ mod tests {
     fn test_keepalive_frame_roundtrip() {
         let meta = FrameMetadata::keep_alive(999);
 
-        let bytes = meta.to_bytes();
+        let bytes = meta.to_bytes().unwrap();
         let (parsed, _) = FrameMetadata::read_from_bytes(&bytes)
             .expect("parse should succeed");
 
@@ -887,7 +912,7 @@ mod tests {
         );
         let meta = FrameMetadata::keep_with_udp_target(55, target);
 
-        let bytes = meta.to_bytes();
+        let bytes = meta.to_bytes().unwrap();
         let (parsed, _) = FrameMetadata::read_from_bytes(&bytes)
             .expect("parse should succeed");
 
@@ -924,7 +949,7 @@ mod tests {
     #[test]
     fn test_max_session_id() {
         let meta = FrameMetadata::end_session(u16::MAX);
-        let bytes = meta.to_bytes();
+        let bytes = meta.to_bytes().unwrap();
         let (parsed, _) = FrameMetadata::read_from_bytes(&bytes)
             .expect("parse should succeed");
         assert_eq!(parsed.session_id(), u16::MAX);
@@ -937,7 +962,7 @@ mod tests {
         assert!(meta.has_error());
         assert!(!meta.has_data());
 
-        let bytes = meta.to_bytes();
+        let bytes = meta.to_bytes().unwrap();
         let (parsed, _) = FrameMetadata::read_from_bytes(&bytes)
             .expect("parse should succeed");
         assert!(parsed.has_error());
@@ -995,7 +1020,7 @@ mod tests {
             Port::new(80),
         );
         let meta = FrameMetadata::new_session(1, target);
-        let bytes = meta.to_bytes();
+        let bytes = meta.to_bytes().unwrap();
 
         // length 字段 (2B): body 长度 = 4(固定) + 1(network) + 2(port) + 1(type) + 4(ipv4) = 12
         let expected_len = 12u16;
@@ -1021,5 +1046,63 @@ mod tests {
 
         // IPv4 octets
         assert_eq!(&bytes[10..14], &[127, 0, 0, 1]);
+    }
+
+    /// F5/n43f：超长 meta 的 to_bytes 必须显式报错（对齐 Go frame.go:119-121
+    /// 读侧 512 硬顶策略）。修复前：addr_buf(32B) 静默截断域名写出坏帧
+    /// （domain len 与数据不符 → 对端 desync），body 永远 < 512 检查不到。
+    #[test]
+    fn test_to_bytes_oversized_meta_errors() {
+        // 域名 >255：u8 len 前缀装不下，write_target_to_vec 直接报错
+        //（值为单地址贡献 4+3+len，允许 < 512）。
+        let source = Destination::tcp(Address::new_domain("a".repeat(300)), Port::new(443));
+        let local = Destination::tcp(Address::new_domain("b".repeat(300)), Port::new(8080));
+        let mut meta = FrameMetadata::new_session(
+            1,
+            Destination::tcp(Address::new_domain("example.com"), Port::new(80)),
+        );
+        meta.set_inbound(source, local);
+        let err = meta.to_bytes().expect_err("oversized meta must error");
+        assert!(
+            matches!(err, MuxError::MetadataTooLong(_)),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// 各段合法（≤255B）但帧总量 >512：对齐 Go 读侧 512 硬顶，
+    /// 写路径早失败避免对端拒收 desync（审计 518B 场景）。
+    #[test]
+    fn test_to_bytes_total_over_512_errors() {
+        let source = Destination::tcp(Address::new_domain("a".repeat(255)), Port::new(443));
+        let local = Destination::tcp(Address::new_domain("b".repeat(255)), Port::new(8080));
+        let mut meta = FrameMetadata::new_session(
+            1,
+            Destination::tcp(Address::new_domain("example.com"), Port::new(80)),
+        );
+        meta.set_inbound(source, local);
+        let err = meta.to_bytes().expect_err("total >512 must error");
+        assert!(
+            matches!(err, MuxError::MetadataTooLong(n) if n > MAX_METADATA_LEN),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// 域名 255B 边界：单 source 帧合法（body < 512）必须照常完整写出，
+    /// 防止超长修复误伤合法 reverse-mux 流量。
+    #[test]
+    fn test_to_bytes_domain_255_boundary_ok() {
+        let source = Destination::tcp(Address::new_domain("a".repeat(255)), Port::new(443));
+        let local = Destination::tcp(Address::ipv4(Ipv4Addr::LOCALHOST), Port::new(1));
+        let mut meta = FrameMetadata::new_session(
+            1,
+            Destination::tcp(Address::new_domain("example.com"), Port::new(80)),
+        );
+        meta.set_inbound(source, local);
+        let bytes = meta.to_bytes().expect("255B domain + v4 local is legal");
+        assert_eq!(
+            u16::from_be_bytes([bytes[0], bytes[1]]) as usize,
+            bytes.len() - 2,
+            "length field must match body exactly (no truncation)"
+        );
     }
 }

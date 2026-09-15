@@ -132,7 +132,7 @@ fn test_frame_metadata_roundtrip_new_session() {
         Network::TCP,
     );
     let meta = FrameMetadata::new_session(42, dest);
-    let bytes = meta.to_bytes();
+    let bytes = meta.to_bytes().unwrap();
     let (parsed, _) = FrameMetadata::read_from_bytes(&bytes).unwrap();
     assert_eq!(parsed.session_id(), 42);
     assert_eq!(parsed.session_status(), SessionStatus::New);
@@ -142,7 +142,7 @@ fn test_frame_metadata_roundtrip_new_session() {
 #[test]
 fn test_frame_metadata_roundtrip_end_session() {
     let meta = FrameMetadata::end_session(7);
-    let bytes = meta.to_bytes();
+    let bytes = meta.to_bytes().unwrap();
     let (parsed, _) = FrameMetadata::read_from_bytes(&bytes).unwrap();
     assert_eq!(parsed.session_id(), 7);
     assert_eq!(parsed.session_status(), SessionStatus::End);
@@ -151,7 +151,7 @@ fn test_frame_metadata_roundtrip_end_session() {
 #[test]
 fn test_frame_metadata_roundtrip_keep_alive() {
     let meta = FrameMetadata::keep_alive(99);
-    let bytes = meta.to_bytes();
+    let bytes = meta.to_bytes().unwrap();
     let (parsed, _) = FrameMetadata::read_from_bytes(&bytes).unwrap();
     assert_eq!(parsed.session_id(), 99);
     assert_eq!(parsed.session_status(), SessionStatus::KeepAlive);
@@ -165,7 +165,7 @@ fn test_frame_metadata_udp_target() {
         Network::UDP,
     );
     let meta = FrameMetadata::new_session(10, dest);
-    let bytes = meta.to_bytes();
+    let bytes = meta.to_bytes().unwrap();
     let (parsed, _) = FrameMetadata::read_from_bytes(&bytes).unwrap();
     assert_eq!(parsed.session_id(), 10);
     assert!(parsed.is_udp_target());
