@@ -13,8 +13,6 @@
 //! 客户端发的数据流向 outbound（→ 目标服务器），目标服务器的响应流向 inbound（→ 客户端）。
 
 use std::io;
-use std::pin::Pin;
-use std::task::{ready, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use xray_features::policy::TimeoutPolicy;
@@ -212,14 +210,54 @@ where
     result
 }
 
-/// 逐 Buffer 写出 MultiBuffer（零拷贝，Buffer Drop 自动回池）。
+/// 逐 MultiBuffer 聚合写出（零拷贝，Buffer Drop 自动回池）。
 ///
-/// 替代 `mb.to_vec()` 的整段拷贝分配。
+/// vectored 写半部（y1yx）：`is_write_vectored` 为真时把 mb 内全部 Buffer
+/// 组 IoSlice 栈数组（每批 ≤8，对齐 Go readv 上界）经 `write_all_vectored`
+/// 单/少次 syscall 摊销；非 vectored 半部（TLS/wrapper 等）降级逐 Buffer
+/// `write_all`。两条路径均零数据拷贝、零堆分配。
 async fn write_all_mb<W>(w: &mut W, mb: &xray_buf::multi::MultiBuffer) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     use tokio::io::AsyncWriteExt;
+
+    /// 单批 iovec 数量上界（对齐 Go `allocStrategy` 的 readv 最大缓冲数）。
+    const VECTORED_BATCH: usize = 8;
+
+    if w.is_write_vectored() {
+        let mut iter = mb.iter().filter(|b| !b.bytes().is_empty());
+        loop {
+            let mut slices = [io::IoSlice::new(&[]); VECTORED_BATCH];
+            let mut n = 0;
+            while n < VECTORED_BATCH {
+                match iter.next() {
+                    Some(b) => {
+                        slices[n] = io::IoSlice::new(b.bytes());
+                        n += 1;
+                    }
+                    None => break,
+                }
+            }
+            if n == 0 {
+                break;
+            }
+            // 推进循环写尽整批（tokio write_vectored 是单次 attempt，可能部分写）。
+            let mut pending: &mut [io::IoSlice<'_>] = &mut slices[..n];
+            while !pending.is_empty() {
+                let written = w.write_vectored(pending).await?;
+                if written == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write_vectored returned 0",
+                    ));
+                }
+                io::IoSlice::advance_slices(&mut pending, written);
+            }
+        }
+        return Ok(());
+    }
+
     for b in mb.iter() {
         let bytes = b.bytes();
         if !bytes.is_empty() {
@@ -229,179 +267,20 @@ where
     Ok(())
 }
 
-/// 轮转锁半部——futures-util 0.3.32 起 `BiLock` 私有化，自研 poll 级等价物。
-/// guard 仅在单次 poll 调用内取还（Pending 即释放并注册 waker），不跨 await
-/// 持有，因此不会阻塞另一方向的 poll。
-struct BiLockHalf<T> {
-    state: std::sync::Arc<parking_lot::Mutex<LockState<T>>>,
-}
 
-enum LockState<T> {
-    Free(T),
-    Locked(Option<std::task::Waker>),
-}
-
-impl<T> BiLockHalf<T> {
-    fn new(inner: T) -> (Self, Self) {
-        let state = std::sync::Arc::new(parking_lot::Mutex::new(LockState::Free(inner)));
-        (
-            Self {
-                state: std::sync::Arc::clone(&state),
-            },
-            Self { state },
-        )
-    }
-
-    fn poll_lock(&self, cx: &mut std::task::Context<'_>) -> Poll<LockGuard<'_, T>> {
-        let mut s = self.state.lock();
-        match std::mem::replace(&mut *s, LockState::Locked(None)) {
-            LockState::Free(inner) => {
-                *s = LockState::Locked(None);
-                Poll::Ready(LockGuard {
-                    state: &self.state,
-                    inner: Some(inner),
-                })
-            }
-            LockState::Locked(_) => {
-                // Pending 后按 future 契约不会再 poll 本半部，覆盖式注册安全。
-                *s = LockState::Locked(Some(cx.waker().clone()));
-                Poll::Pending
-            }
-        }
-    }
-}
-
-struct LockGuard<'a, T> {
-    state: &'a parking_lot::Mutex<LockState<T>>,
-    inner: Option<T>,
-}
-
-impl<T> Drop for LockGuard<'_, T> {
-    fn drop(&mut self) {
-        let inner = self.inner.take().expect("LockGuard double-drop");
-        let waker = match &*self.state.lock() {
-            LockState::Locked(w) => w.clone(),
-            LockState::Free(_) => None,
-        };
-        *self.state.lock() = LockState::Free(inner);
-        if let Some(w) = waker {
-            w.wake();
-        }
-    }
-}
-
-impl<T> std::ops::Deref for LockGuard<'_, T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        self.inner.as_ref().expect("LockGuard double-drop")
-    }
-}
-
-impl<T> std::ops::DerefMut for LockGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        self.inner.as_mut().expect("LockGuard double-drop")
-    }
-}
-
-/// 拆分读半部：不实现 tokio `AsyncRead`（其无 vectored 钩子），仅暴露
-/// [`Self::read_multi`] 聚合读——经 [`Connection::poll_read_multi`]（TCP 覆写为
-/// 真 readv，bd 2o9l）。
-struct BiRead<T>(BiLockHalf<T>);
-
-impl<T: Connection> BiRead<T> {
-    /// 下行多缓冲聚合读。对应 Go `ReadVReader.ReadMultiBuffer`（readv_reader.go:124-145）：
-    /// TCP 源一次系统调用把数据分散填入 ≤8 个池化 Buffer；非 TCP 源（TLS/duplex）
-    /// 走 [`Connection::poll_read_multi`] 默认实现顺序填首缓冲，策略自动收敛回 1-2，
-    /// 等价 Go 无 `syscall.Conn` → `SingleReader` 的降级。
-    ///
-    /// 扩容语义对齐 Go `allocStrategy`：单缓冲填满 → 2；多缓冲按实填数翻倍/收敛，上界 8。
-    async fn read_multi(
-        &mut self,
-        alloc: &mut xray_buf::readv::AllocStrategy,
-    ) -> io::Result<xray_buf::multi::MultiBuffer> {
-        let single = alloc.current() == 1;
-        let mut bufs = alloc.alloc();
-        let (mut slices, lens) = xray_buf::readv::buffer_iovecs(&mut bufs);
-        let n = std::future::poll_fn(|cx| {
-            let mut guard = ready!(self.0.poll_lock(cx));
-            Pin::new(&mut *guard).poll_read_multi(cx, &mut slices)
-        })
-        .await;
-        let n = match n {
-            Ok(n) => n,
-            Err(e) => {
-                drop(bufs); // Buffer Drop 自动回池
-                return Err(e);
-            }
-        };
-        if n == 0 {
-            drop(bufs); // EOF：空 MultiBuffer
-            return Ok(xray_buf::multi::MultiBuffer::new());
-        }
-        let mb = xray_buf::readv::distribute(n, &mut bufs, &lens);
-        if single {
-            if n >= lens[0] {
-                alloc.adjust(1); // Go IsFull → Adjust(1) → 2
-            }
-        } else {
-            alloc.adjust(mb.buffer_count() as u32); // Go :143
-        }
-        Ok(mb)
-    }
-}
-
-/// 拆分写半部：转发 [`AsyncWrite`]（guard 逐 poll 取还）。`is_write_vectored`
-/// 保守 false（无法同步取锁查询；调用方 write_all 路径均走 poll_write，无影响）。
-struct BiWrite<T>(BiLockHalf<T>);
-
-impl<T: AsyncWrite + Unpin> AsyncWrite for BiWrite<T> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        let mut guard = ready!(this.0.poll_lock(cx));
-        Pin::new(&mut *guard).poll_write(cx, buf)
-    }
-
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        bufs: &[io::IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        let mut guard = ready!(this.0.poll_lock(cx));
-        Pin::new(&mut *guard).poll_write_vectored(cx, bufs)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        false
-    }
-
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        let mut guard = ready!(this.0.poll_lock(cx));
-        Pin::new(&mut *guard).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        let mut guard = ready!(this.0.poll_lock(cx));
-        Pin::new(&mut *guard).poll_shutdown(cx)
-    }
-}
-
-/// 双向桥接 dispatcher [`Link`] 与 AsyncRead+AsyncWrite stream（`join!` 语义）。
+/// 双向桥接 dispatcher [`Link`] 与 AsyncRead+AsyncWrite stream。
 ///
 /// 与 [`bridge_link_with_stream`] 区别：两个方向独立运行到都完成，任一方向 EOF/出错不会取消另一方向。
 /// 适配 VMess 这种请求方向提前 EOF（body chunk 终止符）但响应方向仍需续传的场景。
+///
+/// **8sum 解耦（方案 A）**：每方向 reader（只读）与 writer（只写）拆为独立
+/// async block，经 bounded mpsc（64 条 MultiBuffer ≈ 512KiB，对齐 Go
+/// `defaultBufferSize`）解耦背压——writer 写背压时 reader 继续排空接收侧
+/// （串行泵「读 8KB→写→循环」两腿锁步曾致服务端 TCP 接收窗不增长、全链
+/// 1 窗/RTT 步进，up 3.1 vs Go 19.8 Mbps）。级联退出：任一 writer 死 →
+/// mpsc rx drop → 对应 reader `send` 失败退出 → done watch 把 half_window
+/// 传给对向腿，无静默半断；写错误只关本向写半部，绝不 shutdown 对向
+/// （50074b2 教训：瞬时写错 shutdown link.writer = 下行永久断）。
 ///
 /// 接收 `&TimeoutPolicy` 把 connIdle / uplinkOnly / downlinkOnly 三个超时下放到
 /// 桥接层（Go `policy.Timeout` 语义，bd 4-6 修复：之前硬编码 DEFAULT_* 常量，
@@ -412,31 +291,44 @@ pub async fn bridge_link_with_stream_full<S>(
     policy: &TimeoutPolicy,
 ) -> io::Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Connection,
+    S: AsyncRead + AsyncWrite + Unpin + Connection + 'static,
 {
     use tokio::io::AsyncWriteExt;
-    use xray_buf::io::{Reader, Writer};
+    use tokio::time::timeout;
+    use xray_buf::io::{new_reader, Reader, Writer};
 
     let conn_idle = policy.connection_idle;
     let uplink_only = policy.uplink_only;
     let downlink_only = policy.downlink_only;
 
     let Link { mut reader, mut writer } = link;
-    // 自研轮转锁拆分（非 tokio::io::split——其半部不转发 vectored 钩子）：
-    // BiRead 经 Connection::poll_read_multi 保住 TCP 源的真 readv 通道（bd 2o9l）。
-    let (rd_lock, wr_lock) = BiLockHalf::new(stream);
-    let mut s_read = BiRead(rd_lock);
-    let mut s_write = BiWrite(wr_lock);
+    // tokio::io::split（out_f1 33Mbps 实证拓扑，无锁）。自研 BiLock 轮转锁在
+    // join! 固定轮询顺序下被 up 大流量系统性抢占（50074b2 同源塌陷：VPS 实测
+    // up 1.58Mbps + strace「突发排空→恰 1 RTT 停顿」锁步签名），已整体删除。
+    // WriteHalf 转发 poll_write_vectored/is_write_vectored（y1yx 聚合写保持）；
+    // 下行顺序读（readv 重接属 bd 2o9l 专项，勿混入本票）。
+    let (s_read, mut s_write) = tokio::io::split(stream);
+    let mut s_read = new_reader(s_read);
+
+    // 512KiB bounded mpsc ×2：容量按条目计（Go pipe 按字节软限，这里
+    // 64 条 × 1-8 buffer × 8KiB，常态 ≥512KiB，只影响内存上限不影响正确性）。
+    const PIPE_BUF_CAP: usize = 64;
+    let (up_tx, mut up_rx) =
+        tokio::sync::mpsc::channel::<xray_buf::multi::MultiBuffer>(PIPE_BUF_CAP);
+    let (down_tx, mut down_rx) =
+        tokio::sync::mpsc::channel::<xray_buf::multi::MultiBuffer>(PIPE_BUF_CAP);
 
     // 半关闭限窗（对应 Go policy Timeout.UplinkOnly/DownlinkOnly，proxy 层
-    // `defer timer.SetTimeout(...)` 语义）：一方向结束后，另一方向在窗口内
-    // 无新数据则断开，防止单方向停滞连接永久挂起。窗口按 activity 重置
-    // （读到新数据即续窗），与 Go CancelAfterInactivity + UpdateActivity 一致。
-    // up 结束 → down 剩余窗口 = uplink_only；down 结束 → up 剩余窗口 = downlink_only。
+    // `defer timer.SetTimeout(...)` 语义）：一方向读侧结束后，另一方向在窗口
+    // 内无新数据则断开，防止单方向停滞连接永久挂起。窗口按 activity 重置
+    // （读到新数据即续窗）。up 读侧结束 → down 剩余窗口 = uplink_only；
+    // down 读侧结束 → up 剩余窗口 = downlink_only。
     let (up_done_tx, up_done_rx) = tokio::sync::watch::channel(None::<std::time::Duration>);
     let (down_done_tx, down_done_rx) = tokio::sync::watch::channel(None::<std::time::Duration>);
 
-    let up = async move {
+    // 上行 reader：link.reader → up_tx。超时语义与串行版逐行等价：
+    // conn_idle 双向存活空闲断开；对向读侧结束后本向仅剩 half_window 宽限。
+    let up_reader = async move {
         let mut down_done = down_done_rx;
         let mut window: Option<std::time::Duration> = None;
         loop {
@@ -444,12 +336,8 @@ where
             // 只可能处于 Pending（poll 到 Ready 的分支必被采用），无数据丢失。
             let mb = match window {
                 None => tokio::select! {
-                    // 空闲 deadline（Go ConnectionIdle / CancelAfterInactivity）：
-                    // 双向均存活但 connection_idle 内无数据 → 断开
-                    res = tokio::time::timeout(
-                        conn_idle,
-                        reader.read_multi_buffer(),
-                    ) => match res {
+                    // 空闲 deadline（Go ConnectionIdle / CancelAfterInactivity）
+                    res = timeout(conn_idle, reader.read_multi_buffer()) => match res {
                         Ok(r) => r,
                         Err(_) => break,
                     },
@@ -458,43 +346,48 @@ where
                         continue;
                     }
                 },
-                Some(d) => match tokio::time::timeout(d, reader.read_multi_buffer()).await {
+                Some(d) => match timeout(d, reader.read_multi_buffer()).await {
                     Ok(r) => r,
                     Err(_) => break, // downlink_only 窗口内无数据
                 },
             };
             match mb {
                 Ok(mb) if !mb.is_empty() => {
-                    if write_all_mb(&mut s_write, &mb).await.is_err() {
+                    // channel 满阻塞在此（不抢对向时间片）；writer task 已死时
+                    // send 立即 Err → 本向级联退出，绝不静默吞数据。
+                    if up_tx.send(mb).await.is_err() {
                         break;
                     }
                 }
                 _ => break,
             }
         }
-        let _ = s_write.shutdown().await;
         let _ = up_done_tx.send(Some(uplink_only));
         io::Result::Ok(())
     };
-
-
-    let down = async move {
+    // 上行 writer：up_rx → stream 写半部聚合写（vectored 批写，y1yx）。只写不读。
+    let up_writer = async move {
+        while let Some(mb) = up_rx.recv().await {
+            if write_all_mb(&mut s_write, &mb).await.is_err() {
+                break;
+            }
+        }
+        // 无条件 shutdown（EOF 排空收尾与写错误收尾同路径），只关本向写半部。
+        // 级联：本 task 退出即 drop up_rx → 上行 reader send 失败 → up_done
+        // 传播 half_window，对向不静默半断。
+        let _ = s_write.shutdown().await;
+        io::Result::Ok(())
+    };
+    // 下行 reader：xray_buf 顺序读（池化 Buffer，对应 Go 无 vectored 源的
+    // SingleReader 路径）→ down_tx。超时同构上行。
+    let down_reader = async move {
         let mut up_done = up_done_rx;
         let mut window: Option<std::time::Duration> = None;
-        // 下行 = Go buf.Copy(link.Writer, buf.NewReader(conn))：readv 多缓冲聚合读
-        // （对应 ReadVReader；TCP 源一次系统调用填 ≤8 池化缓冲，非 vectored 源自动
-        // 降级为顺序填首缓冲）。读 future 每轮重建 cancel-safe 同上行：聚合仅在
-        // 单次 poll 内完成"系统调用 + Ready 返回"，Pending 丢弃无字节消费。
-        let mut alloc = xray_buf::readv::AllocStrategy::new();
         loop {
             let mb = match window {
                 None => tokio::select! {
-                    // 空闲 deadline（Go ConnectionIdle / CancelAfterInactivity）：
-                    // 双向均存活但 connection_idle 内无数据 → 断开
-                    res = tokio::time::timeout(
-                        conn_idle,
-                        s_read.read_multi(&mut alloc),
-                    ) => match res {
+                    // 空闲 deadline（Go ConnectionIdle / CancelAfterInactivity）
+                    res = timeout(conn_idle, s_read.read_multi_buffer()) => match res {
                         Ok(r) => r,
                         Err(_) => break,
                     },
@@ -503,35 +396,46 @@ where
                         continue;
                     }
                 },
-                Some(d) => {
-                    match tokio::time::timeout(d, s_read.read_multi(&mut alloc)).await {
-                        Ok(r) => r,
-                        Err(_) => break, // uplink_only 窗口内无数据
-                    }
-                }
+                Some(d) => match timeout(d, s_read.read_multi_buffer()).await {
+                    Ok(r) => r,
+                    Err(_) => break, // uplink_only 窗口内无数据
+                },
             };
             match mb {
                 Ok(mb) if !mb.is_empty() => {
-                    if writer.write_multi_buffer(mb).await.is_err() {
+                    if down_tx.send(mb).await.is_err() {
                         break;
                     }
                 }
                 _ => break, // EOF / 读错误
             }
         }
-        writer.shutdown();
         let _ = down_done_tx.send(Some(downlink_only));
         io::Result::Ok(())
     };
 
-    let (up_res, down_res) = tokio::join!(up, down);
-    up_res.and(down_res)
+    // 下行 writer：down_rx → link.writer（xray_buf Writer 管线，自带池化）。
+    let down_writer = async move {
+        while let Some(mb) = down_rx.recv().await {
+            if writer.write_multi_buffer(mb).await.is_err() {
+                break;
+            }
+        }
+        // 桥结束确保下游 reader 收到 EOF；同样只关本向，不碰 stream 写半部。
+        writer.shutdown();
+        io::Result::Ok(())
+    };
+
+    // join! 语义：四块被并发轮询（读等待不阻塞写推进），全部完成后返回。
+    let (up_r, up_w, down_r, down_w) =
+        tokio::join!(up_reader, up_writer, down_reader, down_writer);
+    up_r.and(up_w).and(down_r).and(down_w)
 }
 
 /// 默认策略的便捷包装（保留旧 API 兼容调用方）。
 pub async fn bridge_link_with_stream_full_default<S>(link: Link, stream: S) -> io::Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Connection,
+    S: AsyncRead + AsyncWrite + Unpin + Connection + 'static,
 {
     let policy = TimeoutPolicy::default();
     bridge_link_with_stream_full(link, stream, &policy).await
@@ -574,10 +478,7 @@ where
     // 上行照常泵完（连接可用性不受影响）。
     let down_from = stream.raw_tcp_clone();
     let Link { mut reader, mut writer } = link;
-    let (rd_lock, wr_lock) = BiLockHalf::new(stream);
-    let mut s_write = BiWrite(wr_lock);
-    drop(rd_lock); // 下行走 splice，读半部不再需要
-
+    let (_s_read, mut s_write) = tokio::io::split(stream); // 下行走 splice，读半部不再需要
     let (up_done_tx, _up_done_rx) = tokio::sync::watch::channel(None::<std::time::Duration>);
     let (down_done_tx, down_done_rx) = tokio::sync::watch::channel(None::<std::time::Duration>);
 
@@ -770,6 +671,8 @@ mod tests {
     use super::*;
     use crate::connection::TcpConnection;
     use std::net::SocketAddr;
+    use std::pin::Pin;
+    use std::task::Poll;
     use tokio::net::{TcpListener, TcpStream};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1206,6 +1109,275 @@ mod tests {
             .await
             .expect("bridge must finish after EOF")
             .expect("bridge join");
+    }
+
+    // ---- 8sum 方案 A：解耦泵回归门 + 瞬时写错不断向 + vectored 写（y1yx）----
+
+    /// 解耦回归门（HANDOFF `bridge_stream_full_uplink_survives_slow_remote` 重建）：
+    /// stream 对端永不读（duplex 8192 缓冲即背压），上游写 64KB + shutdown。
+    /// 解耦版 up reader 把数据吸进 512KiB mpsc 后照常读到 EOF → up_done →
+    /// down 腿 uplink_only 窗口耗尽收尾 → dn_r 读到关闭；串行泵会卡在
+    /// 写 duplex 的锁步里永远读不到上游 EOF，dn_r 5s 内等不到关闭。
+    #[tokio::test]
+    async fn bridge_stream_full_uplink_survives_slow_remote() {
+        use crate::link::Link;
+        use xray_buf::io::{Reader, Writer};
+        use xray_buf::multi::MultiBuffer;
+
+        let (up_r, mut up_w) = xray_buf::pipe::new();
+        let (dn_r, dn_w) = xray_buf::pipe::new();
+        let link = Link::new(Box::new(up_r), Box::new(dn_w));
+        let (_peer, stream) = tokio::io::duplex(8192);
+
+        let bridge = tokio::spawn(bridge_link_with_stream_full_default(
+            link,
+            Box::new(DuplexConnection::new(stream)) as Box<dyn Connection>,
+        ));
+
+        // 64KB = 8 × duplex 缓冲：解耦后被 mpsc（64×8KiB）全量吸收
+        for _ in 0..8 {
+            let mut mb = MultiBuffer::new();
+            mb.merge_bytes(&vec![0x5Au8; 8 * 1024]);
+            up_w.write_multi_buffer(mb).await.unwrap();
+        }
+        up_w.shutdown();
+
+        // 上游 EOF 传播 + half-close 窗口耗尽 → bridge 收尾 → dn_r 关闭。
+        let mut consumer = dn_r;
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match consumer.read_multi_buffer().await {
+                    Ok(mb) if !mb.is_empty() => continue,
+                    _ => return,
+                }
+            }
+        })
+        .await
+        .expect("bridge must close dn_r after upstream EOF + window expiry (decoupled)");
+        drop(res);
+        // 对端不读，up_writer 停在写背压——由 abort 收尾，非本测试断言对象。
+        bridge.abort();
+    }
+
+    /// 瞬时写错误不永久断向（验收 5；50074b2 头号嫌疑回归门）：上行 writer 写
+    /// stream 恒错时仅上行收敛，下行数据照常送达 link.writer，桥在有限时间
+    /// 整体退出——绝不 shutdown 对向（写错 shutdown link.writer = 下行永久断）。
+    #[tokio::test]
+    async fn bridge_stream_full_up_write_err_keeps_downlink() {
+        use crate::link::Link;
+        use std::pin::Pin;
+        use std::task::Poll;
+        use xray_buf::io::{Reader, Writer};
+
+        /// 写半恒错的 mock：读半转发真 duplex（下行数据源）。
+        struct UpWriteErrConn(tokio::io::DuplexStream);
+        impl tokio::io::AsyncRead for UpWriteErrConn {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.0).poll_read(cx, buf)
+            }
+        }
+        impl tokio::io::AsyncWrite for UpWriteErrConn {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "transient write err",
+                )))
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl Connection for UpWriteErrConn {
+            fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+            fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+        }
+
+        let (up_r, mut up_w) = xray_buf::pipe::new();
+        let (mut dn_r, dn_w) = xray_buf::pipe::new();
+        let link = Link::new(Box::new(up_r), Box::new(dn_w));
+        let (mut peer, stream) = tokio::io::duplex(8192);
+
+        let bridge = tokio::spawn(bridge_link_with_stream_full_default(
+            link,
+            Box::new(UpWriteErrConn(stream)) as Box<dyn Connection>,
+        ));
+
+        // 上行数据触发 up_writer 写错 → 仅上行收敛
+        let mut mb = xray_buf::multi::MultiBuffer::new();
+        mb.merge_bytes(b"req");
+        up_w.write_multi_buffer(mb).await.unwrap();
+        up_w.shutdown();
+
+        // 下行不受写错影响：窗口内送达 link.writer
+        use tokio::io::AsyncWriteExt;
+        peer.write_all(b"resp").await.unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), dn_r.read_multi_buffer())
+            .await
+            .expect("downlink must survive up-write error (no cross-direction shutdown)")
+            .unwrap();
+        assert_eq!(got.to_vec(), b"resp");
+
+        // 全桥有限时间收敛（half-close 窗口耗尽后退出，不挂死）
+        drop(peer);
+        drop(up_w);
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), bridge)
+            .await
+            .expect("bridge must finish after window expiry")
+            .expect("bridge join");
+        assert!(res.is_ok());
+    }
+
+    /// 对称回归门：下行 writer 写 link.writer 恒错时仅下行收敛，上行数据
+    /// 照常送达 stream，桥有限时间退出。
+    #[tokio::test]
+    async fn bridge_stream_full_down_write_err_keeps_uplink() {
+        use crate::link::Link;
+        use std::pin::Pin;
+        use xray_buf::io::{Error as BufError, Result as BufResult, Writer};
+        use xray_buf::multi::MultiBuffer;
+
+        /// 写恒错的 mock link.writer。
+        struct ErrLinkWriter;
+        impl Writer for ErrLinkWriter {
+            fn write_multi_buffer(
+                &mut self,
+                _mb: MultiBuffer,
+            ) -> Pin<Box<dyn Future<Output = BufResult<()>> + Send + '_>> {
+                Box::pin(async {
+                    Err(BufError::WriteError("link writer broken".into()))
+                })
+            }
+        }
+
+        let (up_r, mut up_w) = xray_buf::pipe::new();
+        let (dn_r, dn_w) = xray_buf::pipe::new();
+        let link = Link::new(Box::new(up_r), Box::new(ErrLinkWriter));
+        let (mut peer, stream) = tokio::io::duplex(8192);
+
+        let bridge = tokio::spawn(bridge_link_with_stream_full_default(
+            link,
+            Box::new(DuplexConnection::new(stream)) as Box<dyn Connection>,
+        ));
+        let _ = dn_r; // 下行已断，仅防 unused
+
+        // 下行数据触发 down_writer 写错 → 仅下行收敛
+        use tokio::io::AsyncWriteExt;
+        peer.write_all(b"resp").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 上行不受写错影响：数据照常穿过桥抵达 stream 对端
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(b"req");
+        up_w.write_multi_buffer(mb).await.unwrap();
+        up_w.shutdown();
+
+        let mut got = vec![0u8; 3];
+        tokio::time::timeout(std::time::Duration::from_secs(2), peer.read_exact(&mut got))
+            .await
+            .expect("uplink must survive down-write error")
+            .unwrap();
+        assert_eq!(&got, b"req");
+
+        // 全桥有限时间收敛
+        drop(peer);
+        drop(up_w);
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), bridge)
+            .await
+            .expect("bridge must finish")
+            .expect("bridge join");
+        assert!(res.is_ok());
+    }
+
+    /// `write_all_mb` vectored 批写（y1yx）：vectored mock 聚合 3 buffer 为
+    /// 1 次 `poll_write_vectored`（生产经 tokio WriteHalf 透传到 TCP writev）。
+    #[tokio::test]
+    async fn write_all_mb_vectored_batch_write() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use parking_lot::Mutex;
+
+        struct VectoredMock {
+            sink: Arc<Mutex<Vec<u8>>>,
+            vectored_calls: Arc<AtomicUsize>,
+        }
+        impl tokio::io::AsyncWrite for VectoredMock {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.sink.lock().extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_write_vectored(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                bufs: &[io::IoSlice<'_>],
+            ) -> Poll<io::Result<usize>> {
+                self.vectored_calls.fetch_add(1, Ordering::SeqCst);
+                let mut sink = self.sink.lock();
+                let mut total = 0;
+                for b in bufs {
+                    sink.extend_from_slice(b);
+                    total += b.len();
+                }
+                Poll::Ready(Ok(total))
+            }
+            fn is_write_vectored(&self) -> bool {
+                true
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut s_write = VectoredMock { sink: Arc::clone(&sink), vectored_calls: Arc::clone(&calls) };
+        assert!(s_write.is_write_vectored());
+
+        let mb = xray_buf::multi::MultiBuffer::from_buffers(vec![
+            xray_buf::buffer::Buffer::from_vec(b"abc".to_vec()),
+            xray_buf::buffer::Buffer::from_vec(b"def".to_vec()),
+            xray_buf::buffer::Buffer::from_vec(b"ghi".to_vec()),
+        ]);
+        write_all_mb(&mut s_write, &mb).await.unwrap();
+        assert_eq!(*sink.lock(), b"abcdefghi");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "3 buffers must aggregate into a single poll_write_vectored"
+        );
     }
 
 }
