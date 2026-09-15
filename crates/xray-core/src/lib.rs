@@ -45,6 +45,8 @@ pub mod router;
 pub mod inbound;
 pub mod wiring;
 pub mod version;
+// [DEBUG-8sum-rm] 临时读侧计量（bd 8sum instrumentation，交付后删除）
+pub mod readmeter_debug;
 
 // 顶层 re-export：常用类型直接从 crate 根访问。
 pub use instance::Instance;
