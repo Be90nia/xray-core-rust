@@ -28,7 +28,10 @@ const OPT_DATA: u8 = 1;
 const NETWORK_UDP: u8 = 2;
 const MIN_META_LEN: usize = 4;
 const GLOBAL_ID_LEN: usize = 8;
-const MAX_DATA_LEN: usize = 2_097_152 - 666;
+/// Go `common/xudp/xudp.go:100`：`length+666 > buf.Size(8192) → continue`，等价上限
+/// `8192-666 = 7526`。超限帧静默跳过（Go 同语义）；且 7526 < u16::MAX 保证帧
+/// length 字段（`data.len() as u16`）不截断。
+const MAX_DATA_LEN: usize = 8_192 - 666;
 
 /// XUDP 帧编解码错误
 #[derive(thiserror::Error, Debug)]
@@ -678,6 +681,32 @@ mod tests {
         let mut reader = PacketReader::new(Cursor::new(buf));
         let pkt = reader.read_packet().expect("read").expect("some");
         assert_eq!(pkt.data(), b"data");
+    }
+
+    // ── Go parity：MAX_DATA_LEN = buf.Size - 666 = 7526（xudp.go:100）──────
+
+    #[test]
+    fn max_data_len_matches_go_baseline() {
+        // Go: `length+666 > buf.Size(8192) → continue`，等价上限 8192-666。
+        assert_eq!(MAX_DATA_LEN, 7_526);
+    }
+
+    #[test]
+    fn test_oversized_packet_skipped_go_parity() {
+        let dest = ipv4_dest("127.0.0.1", 80);
+        let mut buf = Vec::new();
+        let boundary = vec![0xAB_u8; MAX_DATA_LEN];
+        let oversized = vec![0xCD_u8; MAX_DATA_LEN + 1];
+        {
+            let mut writer = PacketWriter::new(&mut buf, dest.clone(), test_global_id());
+            writer.write_packet(&oversized).expect("oversized silently skipped");
+            writer.write_packet(&boundary).expect("boundary written");
+        }
+
+        let mut reader = PacketReader::new(Cursor::new(buf));
+        let pkt = reader.read_packet().expect("read").expect("some");
+        assert_eq!(pkt.data().len(), MAX_DATA_LEN, "7526 通过；7527 静默跳过（Go continue 同语义）");
+        assert!(reader.read_packet().expect("eof").is_none());
     }
 
     // ── 错误场景 ─────────────────────────────────────────────────
