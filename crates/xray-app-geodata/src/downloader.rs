@@ -464,7 +464,7 @@ fn https_handshake<'a>(
     use rustls::ClientConfig;
     use std::io::Read;
 
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    xray_common::ensure_default_crypto_provider();
 
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());

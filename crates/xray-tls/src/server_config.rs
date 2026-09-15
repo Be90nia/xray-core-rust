@@ -188,7 +188,7 @@ pub fn build_server_config(
     security: &str,
     security_json: Option<&serde_json::Value>,
 ) -> io::Result<Option<Arc<ServerConfig>>> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    xray_common::ensure_default_crypto_provider();
 
     if !matches!(security, "tls" | "reality") {
         return Ok(None);

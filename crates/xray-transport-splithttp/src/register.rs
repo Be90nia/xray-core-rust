@@ -108,7 +108,7 @@ async fn dial_splithttp(
         None => {
             // No TLS → build a minimal rustls config (won't be used for actual TLS,
             // but DefaultDialerClient::new requires one).
-            let _ = rustls::crypto::ring::default_provider().install_default();
+            xray_common::ensure_default_crypto_provider();
             rustls::ClientConfig::builder()
                 .with_root_certificates(rustls::RootCertStore::empty())
                 .with_no_client_auth()
