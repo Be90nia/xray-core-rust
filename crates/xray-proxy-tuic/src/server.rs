@@ -67,7 +67,7 @@ impl TuicMockServer {
         uuid: Uuid,
         password: String,
     ) -> Result<(Self, Vec<u8>)> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        xray_common::ensure_default_crypto_provider();
 
         let tls = gen_self_signed(server_name).map_err(|e| {
             TuicError::Io(std::io::Error::other(format!("rcgen self-signed failed: {e}")))

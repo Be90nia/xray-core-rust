@@ -18,6 +18,7 @@ quinn-proto = { workspace = true }
 bytes = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
+parking_lot = { workspace = true }
 rcgen = "0.13"
 
 xray-features = { path = "../xray-features" }
@@ -27,5 +28,4 @@ async-trait = { workspace = true }
 [dev-dependencies]
 xray-proxy-freedom = { path = "../xray-proxy-freedom" }
 tokio = { workspace = true, features = ["full", "test-util"] }
-parking_lot = { workspace = true }
 rcgen = "0.13"
