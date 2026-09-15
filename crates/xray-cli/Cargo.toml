@@ -36,6 +36,13 @@ rustls-pki-types = "1"
 # 预授权引入 RustCrypto 官方 crate
 ml-kem = "0.3"
 ml-dsa = { version = "0.1", default-features = false, features = ["alloc"] }
+# bd uf2p: mimalloc 全局分配器。feature 默认开启（发行构建零参数吃到收益）；
+# A/B 回退用 --no-default-features。仅影响 xray bin，lib/测试不受影响。
+mimalloc = { version = "0.1", optional = true }
+
+[features]
+default = ["mimalloc"]
+mimalloc = ["dep:mimalloc"]
 
 [dev-dependencies]
 tempfile = "3"
