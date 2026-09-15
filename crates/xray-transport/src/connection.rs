@@ -158,11 +158,27 @@ impl TcpConnection {
     pub fn new(stream: TcpStream) -> Self {
         Self { inner: stream }
     }
-
     /// 拆出底层 `TcpStream`。
     #[must_use]
     pub fn into_inner(self) -> TcpStream {
         self.inner
+    }
+
+    /// Windows 半关闭：借 raw SOCKET 的 std 视图调 `shutdown(SD_RECEIVE/SD_SEND)`。
+    ///
+    /// std 将 `Shutdown::Read/Write` 映射为 Winsock `SD_RECEIVE/SD_SEND`——
+    /// Go `net.TCPConn.CloseRead/CloseWrite` 在 Windows 走的就是同款 syscall。
+    /// tokio 句柄只暴露 `Shutdown::Both` 方向语义，故不经 tokio（bd 09c4）。
+    #[cfg(windows)]
+    fn winsock_shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
+        use std::os::windows::io::{AsRawSocket, FromRawSocket};
+        let raw = self.inner.as_raw_socket();
+        // SAFETY: raw SOCKET 由 self.inner 持有且调用期间有效；ManuallyDrop
+        // 包裹的 std 视图不接管所有权，drop 不会关闭原 handle
+        // （dup_tcp_stream 同款惯例）。
+        let view =
+            std::mem::ManuallyDrop::new(unsafe { std::net::TcpStream::from_raw_socket(raw) });
+        view.shutdown(how)
     }
 }
 
@@ -233,9 +249,6 @@ impl Connection for TcpConnection {
             }
         }
     }
-    fn is_raw_tcp(&self) -> bool {
-        true
-    }
     fn close_read(&mut self) -> io::Result<()> {
         #[cfg(unix)]
         {
@@ -247,12 +260,7 @@ impl Connection for TcpConnection {
             }
         }
         #[cfg(windows)]
-        {
-            tracing::debug!(
-                "TcpConnection::close_read no-op on Windows: std/tokio TcpStream \
-                 lacks SD_RECEIVE half-close; use shutdown(Both) or drop"
-            );
-        }
+        self.winsock_shutdown(std::net::Shutdown::Read)?;
         Ok(())
     }
     fn close_write(&mut self) -> io::Result<()> {
@@ -266,15 +274,7 @@ impl Connection for TcpConnection {
             }
         }
         #[cfg(windows)]
-        {
-            // Windows 半关闭需 Winsock `shutdown(SD_RECEIVE/SD_SEND)`；std/tokio 的
-            // TcpStream 仅暴露 `Shutdown::Both`，不区分方向（bd 0v44）。
-            // 调用方需知当前不可用，记 debug 让上层排障有线索而非静默 no-op。
-            tracing::debug!(
-                "TcpConnection::close_write no-op on Windows: std/tokio TcpStream \
-                 lacks SD_SEND half-close; use shutdown(Both) or drop"
-            );
-        }
+        self.winsock_shutdown(std::net::Shutdown::Write)?;
         Ok(())
     }
 }
@@ -584,5 +584,51 @@ mod tests {
         let n2 = reader.read(&mut buf).await.unwrap();
         assert_eq!(n2, 20); // inner 的 20 字节
         assert_eq!(&buf[..20], &(0u8..20).collect::<Vec<_>>());
+    }
+    /// bd 09c4：close_write 必须让对端读到 EOF（FIN），close_read 之后对端
+    /// 新写入的数据不得再被本端读出——Windows 静默 no-op 在此必红。
+    #[tokio::test]
+    async fn tcp_half_close_directional_semantics() {
+        use std::time::Duration;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpConnection::new(tokio::net::TcpStream::connect(addr).await.unwrap());
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut server = stream;
+
+        // close_write：对端读端必须看到 EOF，本端读方向不受影响。
+        client.close_write().expect("close_write must succeed");
+        let mut eof_buf = [0u8; 8];
+        let n = tokio::time::timeout(Duration::from_secs(5), server.read(&mut eof_buf))
+            .await
+            .expect("close_write: peer must observe EOF within 5s (Windows no-op stalls here)");
+        assert_eq!(n.unwrap(), 0, "close_write: peer must see EOF");
+        server.write_all(b"resp").await.unwrap();
+        let mut buf = [0u8; 4];
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .expect("read after close_write must still work")
+            .unwrap();
+        assert_eq!(&buf[..n], b"resp");
+
+        // close_read：对端之后写入的数据不得再被本端读出。
+        client.close_read().expect("close_read must succeed");
+        let _ = server.write_all(b"late").await; // Windows 侧对端可能收 RST，不 assert
+        let mut late = [0u8; 4];
+        match tokio::time::timeout(Duration::from_secs(5), client.read(&mut late)).await {
+            Err(_) => panic!("close_read: neither EOF nor error — half-close is a silent no-op"),
+            Ok(Ok(0)) => {} // unix SHUT_RD → EOF
+            Ok(Ok(n)) => {
+                panic!("close_read: still read {n} bytes of new peer data: {:?}", &late[..n])
+            }
+            Ok(Err(e)) => {
+                // Windows SD_RECEIVE → WSAESHUTDOWN；非 WouldBlock 即真实半关闭。
+                assert_ne!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "unexpected WouldBlock: {e}"
+                );
+            }
+        }
     }
 }
