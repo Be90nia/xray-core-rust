@@ -131,7 +131,8 @@ impl ClientManager {
 /// 不可用时通过 Factory 创建新 Worker。
 pub struct IncrementalWorkerPicker {
     factory: Arc<dyn ClientWorkerFactory>,
-    workers: Mutex<Vec<Arc<ClientWorker>>>,
+    /// Arc 化：周期清理 task 持 `Weak` 引用，picker drop 后 task 自行退出（无孤儿）。
+    workers: Arc<Mutex<Vec<Arc<ClientWorker>>>>,
     cleanup_started: AtomicBool,
 }
 
@@ -140,7 +141,7 @@ impl IncrementalWorkerPicker {
     pub fn new(factory: Arc<dyn ClientWorkerFactory>) -> Self {
         Self {
             factory,
-            workers: Mutex::new(Vec::new()),
+            workers: Arc::new(Mutex::new(Vec::new())),
             cleanup_started: AtomicBool::new(false),
         }
     }
@@ -181,10 +182,17 @@ impl IncrementalWorkerPicker {
         }
         // 真的没有可用 worker → push 本次创建的结果
         workers.push(worker.clone());
-
-        // 首次创建 Worker 时标记清理已启动
-        // 完整实现应使用 tokio::spawn 启动周期清理任务
-        self.cleanup_started.store(true, Ordering::Relaxed);
+        // 首次创建 Worker 时启动周期清理任务（Go client.go:109-122
+        // `cleanupTask` Periodic 30s，PICKER_CLEANUP_INTERVAL 对齐）。
+        // compare_exchange 保证仅 spawn 一次；修复前只 store 无 reader
+        // ——cleanup_started 是死代码，关闭 Worker 永不清理（bd me7k）。
+        if self
+            .cleanup_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.spawn_cleanup_task();
+        }
 
         Some(worker)
     }
@@ -203,6 +211,30 @@ impl IncrementalWorkerPicker {
         if removed > 0 {
             debug!("cleaned up {} closed workers", removed);
         }
+    }
+
+    /// 启动周期清理任务（Go client.go:109-122 `cleanupTask.Start()`）。
+    ///
+    /// task 持 `Weak` 引用 workers 列表：picker drop 后 `upgrade()` 失败，
+    /// task 随即退出——清理任务生命周期不超过 picker 自身，无孤儿 task。
+    fn spawn_cleanup_task(&self) {
+        let workers = Arc::downgrade(&self.workers);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(PICKER_CLEANUP_INTERVAL).await;
+                let Some(workers) = workers.upgrade() else {
+                    return; // picker 已 drop，无需再清理
+                };
+                let mut list = workers.lock().await;
+                let before = list.len();
+                list.retain(|w| !w.is_closed());
+                let removed = before - list.len();
+                drop(list);
+                if removed > 0 {
+                    debug!("periodic cleanup removed {removed} closed workers");
+                }
+            }
+        });
     }
 
     /// 获取 Worker 数量。
@@ -901,6 +933,33 @@ mod tests {
         let worker = picker.pick_internal().await;
         assert!(worker.is_some());
         assert_eq!(picker.worker_count().await, 1);
+    }
+    /// F2/me7k：首次创建 Worker 后必须启动周期清理任务——关闭的 Worker 被
+    /// 周期任务移除（对齐 Go client.go:109-122 `cleanupTask` 30s Periodic）。
+    /// 修复前 cleanup_started 只 store 不 spawn，关闭 Worker 永留列表 → 红。
+    #[tokio::test(start_paused = true)]
+    async fn test_periodic_cleanup_removes_closed_workers() {
+        let strategy = ClientStrategy::default();
+        let factory = Arc::new(DialingWorkerFactory::new(Arc::new(NopUnderlying), strategy));
+        let picker = Arc::new(IncrementalWorkerPicker::new(factory));
+        let worker = picker.pick_internal().await.expect("worker created");
+        assert_eq!(picker.worker_count().await, 1);
+        worker.close();
+        assert!(worker.is_closed());
+        // start_paused：虚拟时钟直接跳过一个清理周期（30s），唤醒清理 task；
+        // 再以 1ms 步进等它执行完 retain。
+        tokio::time::sleep(PICKER_CLEANUP_INTERVAL + std::time::Duration::from_millis(1)).await;
+        for _ in 0..100 {
+            if picker.worker_count().await == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            picker.worker_count().await,
+            0,
+            "closed worker must be removed by periodic cleanup"
+        );
     }
 
     /// 慢 factory：create 期间人为通知+等待——让并发 pick_internal 有窗口期
