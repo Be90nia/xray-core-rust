@@ -412,160 +412,126 @@ pub async fn bridge_link_with_stream_full<S>(
     policy: &TimeoutPolicy,
 ) -> io::Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Connection + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Connection,
 {
-    // [8sum-fix] Go getLink 等价 pipe 解耦泵：每方向拆两个泵（conn 侧 → pipe、
-    // pipe → 对端 conn 侧），中间 512KiB 有界 pipe 吸收两腿速度差。
-    //
-    // 根因（bd 8sum）：原串行泵（读 link.reader → 写 stream → 循环）把服务端
-    // 两条腿锁步耦合——出站写背压阻塞 TLS 腿消费，服务端 TCP 接收窗口不增长，
-    // 全链 1 窗口/RTT 步进（VPS netem 161ms 实测：串行 3.1Mbps → 解耦 33Mbps，
-    // Go 同床 19.8Mbps；readmeter 显示串行版读间隔 max≈1 RTT、每窗一排空）。
-    // Go 无此问题：inbound/outbound 两侧各由独立 goroutine 经 512KiB pipe 拷贝
-    // （dispatcher getLink + buf.Copy）。
-    use xray_buf::io::new_writer;
-    use xray_buf::pipe::PipeOption;
+    use tokio::io::AsyncWriteExt;
+    use xray_buf::io::{Reader, Writer};
 
     let conn_idle = policy.connection_idle;
     let uplink_only = policy.uplink_only;
     let downlink_only = policy.downlink_only;
-    // ponytail: pipe limit 暂取 Go defaultBufferSize（512KiB）；policy.buffer
-    // 接线待 TimeoutPolicy 携带 BufferPolicy 后下沉。
-    let opt = PipeOption {
-        limit: 512 * 1024,
-        ..PipeOption::default()
-    };
-    let (up_r, up_w) = xray_buf::pipe::new_with_option(opt);
-    let (dn_r, dn_w) = xray_buf::pipe::new_with_option(opt);
 
     let Link { mut reader, mut writer } = link;
-    // 自研轮转锁拆分（非 tokio::io::split——保住下行 TCP 源的 readv 聚合读，bd 2o9l）。
+    // 自研轮转锁拆分（非 tokio::io::split——其半部不转发 vectored 钩子）：
+    // BiRead 经 Connection::poll_read_multi 保住 TCP 源的真 readv 通道（bd 2o9l）。
     let (rd_lock, wr_lock) = BiLockHalf::new(stream);
-    let s_read = BiRead(rd_lock);
-    let s_write = BiWrite(wr_lock);
+    let mut s_read = BiRead(rd_lock);
+    let mut s_write = BiWrite(wr_lock);
 
-    // 内层泵（哑拷贝，pipe EOF 即收尾）：up → 出站写半部；down → link.writer。
-    // 出站写端异常退出时 interrupt pipe 读端，反压外层泵立刻收尾（不死锁）。
-    tokio::spawn(pump_pipe_to_writer(up_r, new_writer(s_write)));
-    tokio::spawn(pump_pipe_to_writer(dn_r, writer));
-
-    // 外层泵：conn 侧 Reader → pipe 写端。超时/半关闭语义（conn_idle 双向存活
-    // 空闲 + 对向结束后 half_window 宽限，join 语义）与原串行版逐行等价。
+    // 半关闭限窗（对应 Go policy Timeout.UplinkOnly/DownlinkOnly，proxy 层
+    // `defer timer.SetTimeout(...)` 语义）：一方向结束后，另一方向在窗口内
+    // 无新数据则断开，防止单方向停滞连接永久挂起。窗口按 activity 重置
+    // （读到新数据即续窗），与 Go CancelAfterInactivity + UpdateActivity 一致。
+    // up 结束 → down 剩余窗口 = uplink_only；down 结束 → up 剩余窗口 = downlink_only。
     let (up_done_tx, up_done_rx) = tokio::sync::watch::channel(None::<std::time::Duration>);
     let (down_done_tx, down_done_rx) = tokio::sync::watch::channel(None::<std::time::Duration>);
-    let up = pump_reader_to_pipe(reader, up_w, conn_idle, down_done_rx, up_done_tx, uplink_only);
-    let down = pump_reader_to_pipe(
-        BiReadReader::new(s_read),
-        dn_w,
-        conn_idle,
-        up_done_rx,
-        down_done_tx,
-        downlink_only,
-    );
-    let _ = tokio::join!(up, down);
-    io::Result::Ok(())
-}
 
-/// [`BiRead`] → `xray_buf::io::Reader` 适配：下行 conn 侧保留 readv 聚合读
-/// （对应 Go ReadVReader；非 TCP 源 read_multi 内部自动降级顺序读）。
-struct BiReadReader<T: Connection> {
-    inner: BiRead<T>,
-    alloc: xray_buf::readv::AllocStrategy,
-}
-
-impl<T: Connection> BiReadReader<T> {
-    fn new(inner: BiRead<T>) -> Self {
-        Self {
-            inner,
-            alloc: xray_buf::readv::AllocStrategy::new(),
-        }
-    }
-}
-
-impl<T: Connection> xray_buf::io::Reader for BiReadReader<T> {
-    fn read_multi_buffer(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = xray_buf::io::Result<xray_buf::multi::MultiBuffer>> + Send + '_>>
-    {
-        Box::pin(async {
-            self.inner
-                .read_multi(&mut self.alloc)
-                .await
-                .map_err(|e| xray_buf::io::classify_io_error(e, true))
-        })
-    }
-}
-
-/// 外层泵：conn 侧 Reader → pipe 写端。超时语义与串行版一致：
-/// conn_idle 双向存活空闲断开；对向结束后本向仅剩 half_window 宽限。
-#[allow(clippy::too_many_arguments)]
-async fn pump_reader_to_pipe<R, W>(
-    mut reader: R,
-    mut w: W,
-    conn_idle: std::time::Duration,
-    mut other_done: tokio::sync::watch::Receiver<Option<std::time::Duration>>,
-    my_done: tokio::sync::watch::Sender<Option<std::time::Duration>>,
-    half_window: std::time::Duration,
-) where
-    R: xray_buf::io::Reader,
-    W: xray_buf::io::Writer,
-{
-    let mut window: Option<std::time::Duration> = None;
-    loop {
-        let mb = match window {
-            None => tokio::select! {
-                res = tokio::time::timeout(conn_idle, reader.read_multi_buffer()) => match res {
-                    Ok(r) => r,
-                    Err(_) => break,
+    let up = async move {
+        let mut down_done = down_done_rx;
+        let mut window: Option<std::time::Duration> = None;
+        loop {
+            // 读 future 每轮重建是 cancel-safe 的：select!/timeout 丢弃的 future
+            // 只可能处于 Pending（poll 到 Ready 的分支必被采用），无数据丢失。
+            let mb = match window {
+                None => tokio::select! {
+                    // 空闲 deadline（Go ConnectionIdle / CancelAfterInactivity）：
+                    // 双向均存活但 connection_idle 内无数据 → 断开
+                    res = tokio::time::timeout(
+                        conn_idle,
+                        reader.read_multi_buffer(),
+                    ) => match res {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    },
+                    _ = down_done.changed() => {
+                        window = *down_done.borrow();
+                        continue;
+                    }
                 },
-                _ = other_done.changed() => {
-                    window = *other_done.borrow();
-                    continue;
+                Some(d) => match tokio::time::timeout(d, reader.read_multi_buffer()).await {
+                    Ok(r) => r,
+                    Err(_) => break, // downlink_only 窗口内无数据
+                },
+            };
+            match mb {
+                Ok(mb) if !mb.is_empty() => {
+                    if write_all_mb(&mut s_write, &mb).await.is_err() {
+                        break;
+                    }
                 }
-            },
-            Some(d) => match tokio::time::timeout(d, reader.read_multi_buffer()).await {
-                Ok(r) => r,
-                Err(_) => break,
-            },
-        };
-        match mb {
-            Ok(mb) if !mb.is_empty() => {
-                if w.write_multi_buffer(mb).await.is_err() {
-                    break;
-                }
+                _ => break,
             }
-            _ => break, // EOF / 读错误
         }
-    }
-    w.shutdown();
-    let _ = my_done.send(Some(half_window));
-}
+        let _ = s_write.shutdown().await;
+        let _ = up_done_tx.send(Some(uplink_only));
+        io::Result::Ok(())
+    };
 
-/// 内层泵：pipe 读端 → conn 侧 Writer。哑拷贝，EOF/错误即收尾。
-async fn pump_pipe_to_writer<W>(mut r: xray_buf::pipe::Reader, mut w: W)
-where
-    W: xray_buf::io::Writer,
-{
-    loop {
-        match r.read_multi_buffer().await {
-            Ok(mb) if !mb.is_empty() => {
-                if w.write_multi_buffer(mb).await.is_err() {
-                    break;
+
+    let down = async move {
+        let mut up_done = up_done_rx;
+        let mut window: Option<std::time::Duration> = None;
+        // 下行 = Go buf.Copy(link.Writer, buf.NewReader(conn))：readv 多缓冲聚合读
+        // （对应 ReadVReader；TCP 源一次系统调用填 ≤8 池化缓冲，非 vectored 源自动
+        // 降级为顺序填首缓冲）。读 future 每轮重建 cancel-safe 同上行：聚合仅在
+        // 单次 poll 内完成"系统调用 + Ready 返回"，Pending 丢弃无字节消费。
+        let mut alloc = xray_buf::readv::AllocStrategy::new();
+        loop {
+            let mb = match window {
+                None => tokio::select! {
+                    // 空闲 deadline（Go ConnectionIdle / CancelAfterInactivity）：
+                    // 双向均存活但 connection_idle 内无数据 → 断开
+                    res = tokio::time::timeout(
+                        conn_idle,
+                        s_read.read_multi(&mut alloc),
+                    ) => match res {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    },
+                    _ = up_done.changed() => {
+                        window = *up_done.borrow();
+                        continue;
+                    }
+                },
+                Some(d) => {
+                    match tokio::time::timeout(d, s_read.read_multi(&mut alloc)).await {
+                        Ok(r) => r,
+                        Err(_) => break, // uplink_only 窗口内无数据
+                    }
                 }
+            };
+            match mb {
+                Ok(mb) if !mb.is_empty() => {
+                    if writer.write_multi_buffer(mb).await.is_err() {
+                        break;
+                    }
+                }
+                _ => break, // EOF / 读错误
             }
-            _ => break,
         }
-    }
-    w.shutdown();
-    // 出站写端异常退出时，反压关闭 pipe 读端（Errord），外层泵的下一次写
-    // 立刻失败收尾，避免 512KiB 缓冲吃满后外层永久阻塞。
-    r.interrupt();
+        writer.shutdown();
+        let _ = down_done_tx.send(Some(downlink_only));
+        io::Result::Ok(())
+    };
+
+    let (up_res, down_res) = tokio::join!(up, down);
+    up_res.and(down_res)
 }
 
 /// 默认策略的便捷包装（保留旧 API 兼容调用方）。
 pub async fn bridge_link_with_stream_full_default<S>(link: Link, stream: S) -> io::Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Connection + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Connection,
 {
     let policy = TimeoutPolicy::default();
     bridge_link_with_stream_full(link, stream, &policy).await
@@ -1240,118 +1206,6 @@ mod tests {
             .await
             .expect("bridge must finish after EOF")
             .expect("bridge join");
-    }
-
-    // ---- [8sum-fix] pipe 解耦泵行为回归门 ----
-
-    /// 解耦泵核心行为：对端读得慢时，上行仍能把数据持续灌入（512KiB pipe 吸收
-    /// 速度差）、无丢失地到达对端。bd 8sum 根因回归门——原串行泵会被对端写
-    /// 背压锁步阻塞（服务端 TCP 接收窗口不增长 → 1 窗口/RTT）。
-    #[tokio::test]
-    async fn bridge_stream_full_uplink_survives_slow_remote() {
-        use crate::link::Link;
-        use tokio::io::AsyncReadExt;
-        use xray_buf::io::Writer as _;
-
-        let (up_r, mut up_w) = xray_buf::pipe::new();
-        let (dn_r, dn_w) = xray_buf::pipe::new();
-        let link = Link::new(Box::new(up_r), Box::new(dn_w));
-
-        // 真 loopback TCP 对（生产语义；duplex 的半关闭语义与 TCP 不同）。
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut peer = listener.accept().await.unwrap().0;
-        peer.set_nodelay(true).ok();
-
-        tokio::spawn(bridge_link_with_stream_full_default(
-            link,
-            Box::new(crate::connection::TcpConnection::new(client))
-                as Box<dyn Connection>,
-        ));
-
-        // 上游灌 768KiB（> pipe 512KiB）：必须全部穿过。
-        let total: usize = 768 * 1024;
-        let chunk = vec![0x5Au8; 8192];
-        let writer = tokio::spawn(async move {
-            for i in 0..(total / chunk.len()) {
-                let mut mb = xray_buf::multi::MultiBuffer::new();
-                mb.merge_bytes(&chunk);
-                if let Err(e) = up_w.write_multi_buffer(mb).await {
-                    let kb = i * 8;
-                    eprintln!("[8sum-diag] pipe write #{i} ({kb}KB) err: {e:?}");
-                    break;
-                }
-            }
-            // 不 shutdown：保持上游打开，纯测解耦推进（关闭次序由 drop 用例覆盖）。
-        });
-
-        // 慢对端：每 5ms 才读 16KiB。数据完整性断言即覆盖解耦语义：
-        // 锁步/死锁/丢字节都会导致 read_exact 超时或内容不符。
-        let mut received = vec![0u8; total];
-        let mut off = 0;
-        while off < total {
-            let want = (16 * 1024).min(total - off);
-            let n = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                peer.read(&mut received[off..off + want]),
-            )
-            .await
-            .expect("slow-remote transfer must not stall (lock-step regression)")
-            .expect("peer read");
-            assert!(n > 0, "unexpected EOF at {off}");
-            off += n;
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        assert!(received.iter().all(|&b| b == 0x5A), "payload must be intact");
-        writer.await.unwrap();
-        let _ = dn_r;
-    }
-
-    /// 对端中途断开：内层泵出错退出必须反压关闭 pipe（interrupt），外层泵随写
-    /// 错误收尾，bridge 在有限时间内结束——512KiB 缓冲不得把外层泵永久卡死。
-    /// #[ignore]（bd 8sum 遗留）：对端 reset 后内层泵的 interrupt 反压路径
-    /// 在慢速 feeder 下偶发 >60s 不收敛，待 pipe close/dispatch 语义专项排查；
-    /// 非阻塞主路径回归（survives_slow_remote 已覆盖解耦推进语义）。
-    #[tokio::test]
-    #[ignore = "bd 8sum: remote-drop interrupt path intermittently stalls >60s; needs dedicated pipe-close investigation"]
-    async fn bridge_stream_full_remote_drop_unblocks_uplink() {
-        use crate::link::Link;
-        use tokio::io::AsyncReadExt;
-        use xray_buf::io::Writer as _;
-
-        let (up_r, mut up_w) = xray_buf::pipe::new();
-        let (dn_r, dn_w) = xray_buf::pipe::new();
-        let link = Link::new(Box::new(up_r), Box::new(dn_w));
-        let (mut peer, stream) = tokio::io::duplex(64 * 1024);
-
-        let bridge = tokio::spawn(bridge_link_with_stream_full_default(
-            link,
-            Box::new(DuplexConnection::new(stream)) as Box<dyn Connection>,
-        ));
-
-        // 持续灌数据（忽略 pipe 关闭错误），对端读一轮后断开。
-        let feeder = tokio::spawn(async move {
-            let chunk = vec![0x5Bu8; 8192];
-            loop {
-                let mut mb = xray_buf::multi::MultiBuffer::new();
-                mb.merge_bytes(&chunk);
-                if up_w.write_multi_buffer(mb).await.is_err() {
-                    break;
-                }
-            }
-        });
-
-        let mut buf = vec![0u8; 16 * 1024];
-        let _ = peer.read(&mut buf).await; // 读一小块后 drop（对端消失）
-        drop(peer);
-
-        tokio::time::timeout(std::time::Duration::from_secs(10), bridge)
-            .await
-            .expect("bridge must finish after remote drop (no deadlock on full pipe)")
-            .expect("join");
-        feeder.await.ok();
-        let _ = dn_r;
     }
 
 }
