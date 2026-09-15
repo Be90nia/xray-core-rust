@@ -2,6 +2,7 @@
 //!
 //! 对应 Go 版本 `platform.NewEnvFlag`，提供环境变量读取和类型转换。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, OnceLock};
 
 /// 环境标志，首次访问时从环境变量读取值并缓存。
@@ -86,12 +87,31 @@ pub fn use_readv() -> bool {
 /// [`parse_enabled_env`]。刻意不走 [`EnvFlag`]：其 `get_value` 把空串过滤为
 /// 未设置，而 Go 对 `xray.buf.splice=""` 的语义是禁用（LookupEnv 命中空串 →
 /// switch 落空）。
+///
+/// 缓存语义（bd 1n90/xag3②）：LazyLock 首调解析一次，热路径只做 atomic
+/// load（零 env 查询/零分配）。环境变更需显式 [`reload_env_settings`] 刷新，
+/// 对齐 Go reloadEnvSettings。
 #[must_use]
 pub fn use_splice() -> bool {
+    SPLICE_FLAG.load(Ordering::Relaxed)
+}
+
+/// `xray.buf.splice` 解析结果缓存。首调读 env，之后热路径零查询。
+static SPLICE_FLAG: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(parse_splice_env()));
+
+/// 读 env 并按 Go 三态语义解析 `xray.buf.splice`（原名优先，alt 兜底）。
+fn parse_splice_env() -> bool {
     let raw = std::env::var_os("xray.buf.splice")
         .or_else(|| std::env::var_os("XRAY_BUF_SPLICE"))
         .map(|v| v.to_string_lossy().into_owned());
     parse_enabled_env(raw.as_deref())
+}
+
+/// 重新解析 `xray.buf.splice` 闸门。对应 Go `reloadEnvSettings`
+/// （freedom.go:41-51，经 platform.RegisterEnvReload 注册；我们无注册机制，
+/// 进程启动后环境变更需显式调用）。生产接线：bin 启动早期调一次。
+pub fn reload_env_settings() {
+    SPLICE_FLAG.store(parse_splice_env(), Ordering::Relaxed);
 }
 
 /// Go 三态启用语义的纯函数形式（freedom.go:45-48 `reloadEnvSettings` 与
@@ -253,5 +273,76 @@ mod tests {
     #[test]
     fn test_tun_fd_raw_returns_option() {
         let _val: Option<String> = tun_fd_raw();
+    }
+    // -------- bd 1n90/xag3②：use_splice 缓存 + reload 行为等价三态 --------
+
+    /// env 是进程全局：三态测试串行化（惯例同 xray-conf common.rs ENV_LOCK）。
+    static SPLICE_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    #[test]
+    fn use_splice_cached_env_three_states() {
+        let _g = SPLICE_ENV_LOCK.lock();
+
+        const NAME: &str = "xray.buf.splice";
+        const ALT: &str = "XRAY_BUF_SPLICE";
+        let saved_name = std::env::var_os(NAME);
+        let saved_alt = std::env::var_os(ALT);
+        struct Restore(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.0.take() {
+                        Some(v) => std::env::set_var(NAME, v),
+                        None => std::env::remove_var(NAME),
+                    }
+                    match self.1.take() {
+                        Some(v) => std::env::set_var(ALT, v),
+                        None => std::env::remove_var(ALT),
+                    }
+                }
+                // 按恢复后的 env 重解析，不把测试态泄漏给后续测试
+                super::reload_env_settings();
+            }
+        }
+        unsafe {
+            std::env::remove_var(NAME);
+            std::env::remove_var(ALT);
+        }
+        let _restore = Restore(saved_name, saved_alt);
+
+        // ① 不设 → Go 缺省开（freedom.go defaultFlagValue）
+        reload_env_settings();
+        assert!(use_splice(), "未设置应启用（Go 缺省）");
+
+        // ② 显式启用值（精确匹配）
+        for on in ["auto", "enable"] {
+            unsafe { std::env::set_var(NAME, on) };
+            reload_env_settings();
+            assert!(use_splice(), "env={on:?} 应启用");
+        }
+
+        // ③ 非法值一律禁用（大小写敏感，空串 = LookupEnv 命中 switch 落空）
+        for off in ["disable", "true", "1", "", "AUTO", "Enable"] {
+            unsafe { std::env::set_var(NAME, off) };
+            reload_env_settings();
+            assert!(!use_splice(), "env={off:?} 应禁用");
+        }
+
+        // ④ 缓存语义：env 变更不 reload 不生效（热路径零 env 查询的行为证据）
+        unsafe { std::env::set_var(NAME, "auto") };
+        assert!(!use_splice(), "不 reload 不应翻转（缓存生效）");
+        reload_env_settings();
+        assert!(use_splice(), "reload 后应翻转");
+
+        // ⑤ alt 名兜底 + 原名优先
+        unsafe {
+            std::env::remove_var(NAME);
+            std::env::set_var(ALT, "auto");
+        }
+        reload_env_settings();
+        assert!(use_splice(), "alt 名应兜底");
+        unsafe { std::env::set_var(NAME, "disable") };
+        reload_env_settings();
+        assert!(!use_splice(), "原名命中时优先于 alt");
     }
 }
