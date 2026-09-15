@@ -858,7 +858,7 @@ pub struct DefaultDispatcher {
     ///
     /// 对应 Go `Handler.udp443`（`senderSettings.MultiplexSettings.XudpProxyUDP443`，
     /// 仅 mux enabled 时构建）。tag 无条目 = mux 未启用，不做 UDP443 检查。
-    pub udp443_policies: HashMap<String, Udp443Policy>,
+    pub udp443_policies: std::sync::Arc<HashMap<String, Udp443Policy>>,
     /// Access 日志 sink（对应 Go dispatcher `log.Record(accessMessage)`，bd 4uu）。
     ///
     /// None = 不记 access log（等价 Go ctx 无 AccessMessage → 不 Record）。
@@ -895,7 +895,7 @@ impl DefaultDispatcher {
             stats: None,
             fdns: None,
             policy_manager: None,
-            udp443_policies: HashMap::new(),
+            udp443_policies: std::sync::Arc::new(HashMap::new()),
             access_sink: None,
         }
     }
@@ -1158,7 +1158,7 @@ impl DefaultDispatcher {
         let router = self.router.clone();
         let fdns = self.fdns.clone();
         let stats = self.stats.clone();
-        let udp443_policies = self.udp443_policies.clone();
+        let udp443_policies = self.udp443_policies.clone(); // Arc 浅拷贝（bd xag3①）
         let ohm = Arc::clone(ohm);
         let access_sink = self.access_sink.clone();
         // per-user policy 层级（Go d.policy.ForLevel(user.Level)，default.go:162）：
@@ -3110,7 +3110,7 @@ mod tests {
         let mut d = DefaultDispatcher::new();
         d.ohm = Some(std::sync::Arc::new(ohm));
         if let Some(p) = policy {
-            d.udp443_policies.insert("udp-out".to_string(), p);
+            std::sync::Arc::make_mut(&mut d.udp443_policies).insert("udp-out".to_string(), p);
         }
         (d, called)
     }
