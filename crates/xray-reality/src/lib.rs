@@ -1,35 +1,30 @@
 //! # xray-reality
 //!
-//! REALITY TLS 伪装协议的配置层与签名占位。翻译自 Go
+//! REALITY TLS 伪装协议：配置、协议算法与完整握手 IO。翻译自 Go
 //! `transport/internet/reality/`（reality.go + config.go）。
 //!
-//! ## 本 crate 范围（业务核心独立可测）
+//! ## 模块
 //! - [`config`]：[`RealityConfig`] strong-typed + [`from_proto`](RealityConfig::from_proto)
 //!   + [`ShortId`] / [`LimitFallback`]
-//! - [`error`]：统一 [`RealityError`] 枚举
-//! - [`util`]：[`open_key_log_writer`] + [`get_path_locked`]
-//! - [`client`]：[`UConnState`] + [`u_client`](client::u_client) 工厂占位
-//! - [`server`]：[`server`](server::server) 工厂占位
+//! - [`crypto`]：协议算法（session_id 编码、ECDH auth_key 派生、AES-GCM 加密、
+//!   HMAC-SHA512 证书验证），独立可测
+//! - [`client`]：[`u_client`](client::u_client) 工厂——btls 浏览器指纹主路径
+//!   （`xray_tls::btls_reality::connect_reality`）+ watfaq-rustls fallback（指纹不被
+//!   btls 支持时走标准 rustls ClientHello）
+//! - [`server`]：[`server_tls`](server::server_tls)——读 ClientHello record → REALITY
+//!   验证 → rustls 伪造证书握手；验证失败返回
+//!   [`RealityServerOutcome::Invalid`](server::RealityServerOutcome::Invalid) 供调用方 fallback
+//! - [`mitm`]：REALITY 证书生成（Go init() 进程级静态模板 + per-connection HMAC 尾部）
+//! - [`register`]：transport dialer 注册（tcp/splithttp 的 `security=reality` 生产接线）
+//! - [`error`] / [`util`]
 //!
-//! ## 未实现（IO 边界，留 trait + TODO）
-//! 以下部分依赖 uTLS 字节级 ClientHello 控制、`xtls/reality` 库等，**本会话不翻译**：
-//! - 实际 uTLS 握手（[`client::u_client`] / [`server::server`] 返回
-//!   [`RealityError::UtlsRequired`]）
-//! - 字节级 ClientHello 伪装（SessionId 注入到 `hello.Raw`、HandshakeState 访问）
-//!   — **协议算法**（session_id 编码、ECDH auth_key 派生、AES-GCM 加密、HMAC-SHA512 证书验证）
-//!   已提取到 [`crypto`] 模块独立实现。握手层注入等接入 watfaq-rustls（见 n9e ADR 4.2/4.3）。
-//! - `VerifyPeerCertificate` 回调（Go 端通过 reflect+unsafe hack 读 utls 内部字段，
-//!   Rust 端需要 TLS 库暴露同等 API）
-//! - mldsa65 后量子签名验证（依赖 `circl/sign/mldsa65`）
-//! - http2 spider crawler（fallback 模式：路径收集 + RandBetween delays）
+//! ## 已知缺口
+//! - mldsa65 后量子证书签名：rustls `ResolvesServerCert::resolve()` 拿不到 ServerHello
+//!   字节（见 [`mitm::generate_reality_ed25519_cert_mldsa65`]；后继票 tvky）
+//! - http2 spider 爬行（fallback 探测路径；`spider_x` 已解析保留，爬行未实现）
+//! - btls 全指纹 e2e 矩阵 `#[ignore]`（btls transcript mismatch，待 fork 注入 API）
 //!
-//! ## 为什么不直接翻译
-//! Rust 生态目前**没有** `github.com/refraction-networking/utls` 的成熟等价品
-//! （需要字节级 ClientHello 控制、GREASE、扩展顺序、TLS 1.3 key_share 调整等），
-//! 也没有 `github.com/xtls/reality` 的服务端状态机等价品。与 `xray-tls` 的
-//! uTLS 占位策略一致：业务核心翻译完成，IO 边界等生态成熟或自研后再接。
-//!
-//! 参考：Go 版本位于 `E:\Projcet\Xray-core\transport\internet\reality\`。
+//! 参考：Go 基准位于 `D:/Project/Xray-core/transport/internet/reality/`。
 
 pub mod client;
 pub mod config;
