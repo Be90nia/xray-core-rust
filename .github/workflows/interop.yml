@@ -30,6 +30,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # btls 全量重编（6090b54 删 target cache 后每 run 冷构建）+ Go 二进制会
+      # 吃满 runner 14GB 磁盘（run 35044431842 实锤 No space left on device）
+      - name: Free up disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
       # xray-proto build.rs 走 prost-build compile_protos, 需要 protoc
       - name: Install protoc
         run: |
