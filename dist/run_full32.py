@@ -30,7 +30,7 @@ def test(idx, uri, url):
     time.sleep(0.2)
     p = subprocess.Popen([BIN,'run','-c',cp], stdout=open(lp,'wb'), stderr=open(lp+'.err','wb'))
     time.sleep(2.5)
-    code = subprocess.run(['curl','-sS','--max-time','12','-x',f'socks5h://127.0.0.1:{sp}', url, '-o', bp, '-w','HTTP:%{http_code}'], capture_output=True, text=True, timeout=15)
+    code = subprocess.run(['curl','-sS','--max-time','12','-x',f'socks5h://127.0.0.1:{sp}', url, '-o', bp, '-w','HTTP:%{http_code}'], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=15)
     bs = os.path.getsize(bp)
     with open(bp,'rb') as f: body = f.read()
     net = ob.get('streamSettings',{}).get('network','tcp')
