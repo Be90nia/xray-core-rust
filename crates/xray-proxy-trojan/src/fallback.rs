@@ -115,8 +115,32 @@ impl SniNode {
                 return Some(f);
             }
         }
-        // 通配 SNI
+        // Go server.go:388-398：多规则或无默认规则时（len(napfb) > 1 ||
+        // napfb[""] == nil），SNI 精确 miss → contains 子串最长匹配。u88f。
+        let name_count = self.exact.len() + usize::from(self.wildcard.is_some());
+        if (name_count > 1 || self.wildcard.is_none())
+            && !sni.is_empty()
+            && !self.exact.contains_key(sni)
+        {
+            if let Some(f) = self.fuzzy_longest_match(sni, alpn, path) {
+                return Some(f);
+            }
+        }
+        // 通配 SNI（Go server.go:400-402：napfb[name] == nil → name = ""）
         self.wildcard.as_ref().and_then(|a| a.get(alpn, path))
+    }
+
+    /// contains 子串最长匹配：客户端 SNI 包含某规则 name（如配置
+    /// "example.com" 命中 "sub.example.com"），取最长 name 的规则。
+    /// 对应 Go server.go:390-396 的 `strings.Contains(name, n) && len(n) > len(match)`。
+    fn fuzzy_longest_match(&self, sni: &str, alpn: &str, path: &str) -> Option<&Fallback> {
+        let mut matched: Option<&String> = None;
+        for n in self.exact.keys() {
+            if sni.contains(n.as_str()) && matched.map_or(true, |m| n.len() > m.len()) {
+                matched = Some(n);
+            }
+        }
+        self.exact.get(matched?).and_then(|a| a.get(alpn, path))
     }
 }
 
@@ -170,8 +194,14 @@ impl FallbackPolicy {
     }
 
     /// 查找 fallback：SNI → ALPN → Path，每级精确优先回退通配。
+    ///
+    /// 查询侧 lowercase 对齐 Go `server.go:385-386`
+    /// `name = strings.ToLower(name); alpn = strings.ToLower(alpn)`
+    /// （SNI RFC 6066 不区分大小写；恶意大写 SNI 不得绕过精确规则）。
     #[must_use]
     pub fn decide(&self, sni: &str, alpn: &str, path: &str) -> Option<&Fallback> {
+        let sni = &sni.to_lowercase();
+        let alpn = &alpn.to_lowercase();
         self.root.get(sni, alpn, path)
     }
 }
@@ -231,5 +261,47 @@ mod tests {
     fn empty_policy_returns_none() {
         let policy = FallbackPolicy::default();
         assert!(policy.decide("a.com", "h2", "/").is_none());
+    }
+
+    // ==== u88f：Go server.go:385-398 lowercase + 模糊 contains 匹配契约 ====
+
+    /// 查询侧 lowercase：恶意大写 SNI 不得绕过精确规则（Go server.go:385-386）。
+    #[test]
+    fn sni_lowercase_matches_case_insensitively() {
+        let policy = FallbackPolicy::from_list(&[
+            fb("", "", "", "default"),
+            fb("a.com", "", "", "a.com"),
+        ]);
+        assert_eq!(policy.decide("A.COM", "", "").unwrap().dest, "a.com");
+        assert_eq!(policy.decide("a.Com", "", "").unwrap().dest, "a.com");
+    }
+
+    /// 模糊 contains 匹配：多规则配置下子域命中主域规则（Go server.go:388-398）。
+    /// 修复前：SNI "sub.example.com" 精确 miss → 直落通配，专用规则静默降级。
+    #[test]
+    fn sni_fuzzy_contains_matches_subdomain() {
+        let policy = FallbackPolicy::from_list(&[
+            fb("", "", "", "default"),
+            fb("example.com", "", "", "example.com"),
+            fb("other.org", "", "", "other.org"),
+        ]);
+        assert_eq!(
+            policy.decide("sub.example.com", "", "").unwrap().dest,
+            "example.com"
+        );
+    }
+
+    /// 模糊匹配取最长 contains 命中（Go server.go:392-394 `len(n) > len(match)`）。
+    #[test]
+    fn sni_fuzzy_longest_match_wins() {
+        let policy = FallbackPolicy::from_list(&[
+            fb("", "", "", "default"),
+            fb("example.com", "", "", "example.com"),
+            fb("a.example.com", "", "", "a.example.com"),
+        ]);
+        assert_eq!(
+            policy.decide("x.a.example.com", "", "").unwrap().dest,
+            "a.example.com"
+        );
     }
 }
