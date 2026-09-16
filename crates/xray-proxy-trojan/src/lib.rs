@@ -26,13 +26,15 @@ pub mod server;
 pub mod validator;
 
 pub use config::{
-    hex_sha224, hex_string, Account, ClientConfig, MemoryAccount, ServerConfig, ACCOUNT_TYPE_URL,
-    HEX_KEY_LEN,
+    hex_sha224, hex_string, md5_key, Account, ClientConfig, MemoryAccount, ServerConfig,
+    ACCOUNT_TYPE_URL, HEX_KEY_LEN,
 };
 pub use error::{Result, TrojanError};
 pub use protocol::{
-    addr_type, parse_request_header, parse_udp_packet, read_address_port, write_address_port,
-    write_request_header, write_udp_packet, Network, COMMAND_TCP, COMMAND_UDP, CRLF, MAX_LENGTH,
+    addr_type, is_v1_hex_prefix, parse_request_header, parse_request_header_v2, parse_udp_packet,
+    read_address_port, write_address_port, write_request_header, write_request_header_v2,
+    write_udp_packet, Network, COMMAND_TCP, COMMAND_UDP, CRLF, MAX_LENGTH, MD5_KEY_LEN,
+    V2_VERSION,
 };
 pub use validator::{MemoryUser, Validator};
 pub use server::{serve_trojan, serve_trojan_conn, TrojanServer, trojan_server_handshake};
