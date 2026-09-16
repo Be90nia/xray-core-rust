@@ -1748,6 +1748,112 @@ mod tests {
         for h in sh.iter().chain(ch.iter()) { h.abort(); }
     }
 
+    /// 8i4c：双 start_full 全栈链 + testseed 配置流转。server clients 带
+    /// `testseed`、client users 带不同值的 `testseed`（两侧独立本地参数，
+    /// 不上 wire）——生产装配路径（parse_vless_config / build_vless_validator
+    /// → MemoryAccount → VisionConn padding）接通后链路照常，echo 完整。
+    #[tokio::test]
+    async fn integration_vless_vision_testseed_to_echo() {
+        let (cert_pem, key_pem) = xray_tls::certificate::generate_self_signed_cert(&["localhost"])
+            .expect("generate self-signed cert");
+
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = echo_listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 16_384];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => { if sock.write_all(&buf[..n]).await.is_err() { break; } }
+                }
+            }
+        });
+
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let vless_port = probe.local_addr().unwrap().port(); drop(probe);
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_port = probe.local_addr().unwrap().port(); drop(probe);
+
+        let server_tls = format!(r#"{{"network":"tcp","security":"tls","tlsSettings":{{"certificates":[{{"certificate":[{:?}],"key":[{:?}]}}]}}}}"#, cert_pem, key_pem);
+        let client_tls = r#"{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true,"serverName":"localhost"}}"#;
+
+        // server：clients[].testseed = [7,8,9,10]（下行 padding 参数）。
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry { kind: "vless".into(),
+                data: br#"{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision","testseed":[7,8,9,10]}]}"#.to_vec() },
+            tag: "vless-seed-in".into(), port: Some(vless_port), listen: Some("127.0.0.1".into()),
+            stream_settings_json: Some(serde_json::from_str(&server_tls).unwrap()), sniffing_json: None,
+        });
+        server_cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
+            tag: "direct".into(), send_through: None, stream_settings_json: None,
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
+        });
+        let (_si, _so, sh) = start_full(&server_cfg).await.expect("seed server");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // client：users[].testseed = [77,88,99,111]（上行 padding 参数，与服务端不同值）。
+        let mut client_cfg = BuiltConfig::default();
+        client_cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry { kind: "socks".into(), data: vec![] },
+            tag: "socks-in".into(), port: Some(socks_port), listen: Some("127.0.0.1".into()),
+            stream_settings_json: None, sniffing_json: None,
+        });
+        client_cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry { kind: "vless".into(),
+                data: format!(r#"{{"vnext":[{{"address":"127.0.0.1","port":{vless_port},"users":[{{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none","flow":"xtls-rprx-vision","testseed":[77,88,99,111]}}]}}]}}"#).into_bytes() },
+            tag: "proxy".into(), send_through: None,
+            stream_settings_json: Some(serde_json::from_str(client_tls).unwrap()),
+            proxy_settings_json: None, mux_json: None, target_strategy: None,
+        });
+        let (_ci, _co, ch) = start_full(&client_cfg).await.expect("seed client");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut client = TcpStream::connect(format!("127.0.0.1:{socks_port}")).await.unwrap();
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut resp = [0u8; 2]; client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [0x05, 0x00]);
+        let ip = match echo_addr.ip() { std::net::IpAddr::V4(v) => v.octets(), _ => unreachable!() };
+        let mut req = vec![0x05, 0x01, 0x00, 0x01];
+        req.extend_from_slice(&ip); req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        client.write_all(&req).await.unwrap();
+        let mut cr = [0u8; 10]; client.read_exact(&mut cr).await.unwrap();
+        assert_eq!(cr[1], 0x00, "testseed chain CONNECT");
+
+        // 伪 ClientHello 触发双端 filter（vision 链路标准驱动形态）+ 64KB 完整性。
+        let mut hello = vec![0x16u8, 0x03, 0x03, 0x00, 0x2b];
+        hello.extend_from_slice(&[0x01, 0x00, 0x00, 0x27, 0x03, 0x03]);
+        hello.extend_from_slice(&[0xAB; 32]);
+        hello.extend_from_slice(&[0x00, 0x00, 0x13, 0x01, 0x00, 0x00]);
+        client.write_all(&hello).await.unwrap();
+        let mut echoed = vec![0u8; hello.len()];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(echoed, hello, "ClientHello echo with testseed config");
+
+        let payload: Vec<u8> = (0u8..=255).cycle().take(64 * 1024).collect();
+        let expect = payload.clone();
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+        let up = tokio::spawn(async move {
+            let mut off = 0usize;
+            while off < expect.len() {
+                let n = (expect.len() - off).min(8192);
+                client_w.write_all(&expect[off..off + n]).await.unwrap();
+                off += n;
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        });
+        let mut got = vec![0u8; payload.len()];
+        tokio::time::timeout(std::time::Duration::from_secs(30), client_r.read_exact(&mut got))
+            .await
+            .expect("testseed echo 64KB no timeout")
+            .unwrap();
+        up.await.unwrap();
+        assert_eq!(got, payload, "64KB integrity through testseed-configured chain");
+        for h in sh.iter().chain(ch.iter()) { h.abort(); }
+    }
+
     /// [三层组合最小复现·实验I] VisionConn(padding) ↔ xray-tls rustls ↔ 真 TCP
     /// 回环。server = accept 层 dup 克隆 + 内层 split→join→new_server（对齐
     /// inbound/server.rs:408-418）+ 外层 split 双 task 经有界 channel echo；

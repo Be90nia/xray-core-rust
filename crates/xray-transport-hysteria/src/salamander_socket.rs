@@ -34,12 +34,73 @@ use quinn::{
 };
 use tokio::net::UdpSocket;
 use xray_transport::finalmask::salamander::SalamanderObfuscator;
+use xray_transport::finalmask::salamander_gecko::GeckoConfig;
 
 /// 单个 wire datagram 缓冲上限：QUIC `max_udp_payload_size` 上限 64KiB + salt。
 const MAX_WIRE_DATAGRAM: usize = 64 * 1024 + 8;
 
 /// salamander salt 长度（对齐 Go `smSaltLen`；仅用于短包判定文档）。
 const SALT_LEN: usize = 8;
+
+/// Hysteria QUIC 路径的 UDP 混淆配置（对应 Go `udpmaskManager` 包裹的 mask，
+/// 当前支持 salamander 与其 Gecko 分片子模式）。
+#[derive(Clone)]
+pub enum UdpObfs {
+    /// Salamander XOR（对应 Go `salamander.Config`）。
+    Salamander(Arc<SalamanderObfuscator>),
+    /// Gecko 分片模式（对应 Go `salamander.GeckoConfig`，`packetSize` 配置切换）。
+    Gecko(GeckoConfig),
+}
+
+/// 手动 Debug（`SalamanderObfuscator` 未实现 Debug；只打印变体名与 Gecko 参数）。
+impl std::fmt::Debug for UdpObfs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UdpObfs::Salamander(_) => f.write_str("Salamander(..)"),
+            UdpObfs::Gecko(cfg) => f.debug_tuple("Gecko").field(cfg).finish(),
+        }
+    }
+}
+
+impl UdpObfs {
+    /// client 侧构造 quinn endpoint（socket 已包混淆，等价 `Endpoint::client`）。
+    ///
+    /// # Errors
+    /// socket bind 失败 / 混淆参数非法（Gecko 的 PSK 与分片参数在 bind 时校验）。
+    pub async fn client_endpoint(&self, bind_addr: SocketAddr) -> io::Result<quinn::Endpoint> {
+        match self {
+            UdpObfs::Salamander(obfs) => {
+                SalamanderSocket::bind(obfs.clone(), bind_addr).await?.client_endpoint()
+            },
+            UdpObfs::Gecko(cfg) => {
+                crate::gecko_socket::GeckoSocket::bind(cfg, bind_addr).await?.client_endpoint()
+            },
+        }
+    }
+
+    /// server 侧构造 quinn endpoint（socket 已包混淆，等价 `Endpoint::server`）。
+    ///
+    /// # Errors
+    /// 同 [`UdpObfs::client_endpoint`]。
+    pub async fn server_endpoint(
+        &self,
+        server_config: quinn::ServerConfig,
+        bind_addr: SocketAddr,
+    ) -> io::Result<quinn::Endpoint> {
+        match self {
+            UdpObfs::Salamander(obfs) => {
+                SalamanderSocket::bind(obfs.clone(), bind_addr)
+                    .await?
+                    .server_endpoint(server_config)
+            },
+            UdpObfs::Gecko(cfg) => {
+                crate::gecko_socket::GeckoSocket::bind(cfg, bind_addr)
+                    .await?
+                    .server_endpoint(server_config)
+            },
+        }
+    }
+}
 
 /// 包 salamander XOR 的 quinn UDP socket。
 ///
@@ -95,10 +156,11 @@ impl SalamanderSocket {
     }
 }
 
-/// `new_with_abstract_socket` 公共路径（client/server 唯一差别是 `server_config`）。
-fn endpoint_with_socket(
+/// `new_with_abstract_socket` 公共路径（client/server 唯一差别是 `server_config`；
+/// salamander / gecko 两种包装 socket 共用）。
+pub(crate) fn endpoint_with_socket<S: AsyncUdpSocket>(
     server_config: Option<quinn::ServerConfig>,
-    socket: Arc<SalamanderSocket>,
+    socket: Arc<S>,
 ) -> io::Result<quinn::Endpoint> {
     let runtime = quinn::default_runtime()
         .ok_or_else(|| io::Error::other("no async runtime found for quinn endpoint"))?;
@@ -112,7 +174,7 @@ fn endpoint_with_socket(
 
 impl AsyncUdpSocket for SalamanderSocket {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        Box::pin(WritablePoller { io: self.io.clone(), fut: None })
+        Box::pin(WritablePoller::new(self.io.clone()))
     }
 
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
@@ -172,9 +234,15 @@ impl AsyncUdpSocket for SalamanderSocket {
 
 /// 写就绪 poller——逐字复刻 quinn 私有 `UdpPollHelper`（runtime.rs:105-154）：
 /// 首次 poll 创建 `writable()` future，Ready 后丢弃、下次 poll 重建。
-struct WritablePoller {
+pub(crate) struct WritablePoller {
     io: Arc<UdpSocket>,
     fut: Option<Pin<Box<dyn Future<Output = io::Result<()>> + Send + Sync>>>,
+}
+
+impl WritablePoller {
+    pub(crate) fn new(io: Arc<UdpSocket>) -> Self {
+        Self { io, fut: None }
+    }
 }
 
 impl UdpPoller for WritablePoller {
@@ -199,28 +267,27 @@ impl std::fmt::Debug for WritablePoller {
     }
 }
 
-/// 从 `streamSettings.finalmask` JSON 提取 salamander 混淆器（hysteria UDP 路径）。
+/// 从 `streamSettings.finalmask` JSON 提取 UDP 混淆配置（hysteria QUIC 路径）。
 ///
 /// 对应 Go `infra/conf`：`finalmask.udp[]` 每项 `{"type", "settings"}`，
-/// `type == "salamander"` → `salamander.Config{Password}` → 包装 UDP socket
-/// （memory_settings.go:70-80 `Udpmasks` → dialer.go:170 `c.udpmaskManager != nil`）。
+/// `type == "salamander"` → `Salamander.Build()`（transport_finalmask.go:638-652）：
+/// `settings.packetSize` 缺省/`To == 0` → [`UdpObfs::Salamander`]；
+/// `To > 0` → Gecko 分片模式 [`UdpObfs::Gecko`]（校验 `From > 0 && To <= 2048`）。
 ///
 /// - 无 `finalmask` / 无 `udp` 数组 / 空数组 → `Ok(None)`（不包装，行为不变）
-/// - `salamander` + `settings.password`（≥4 字节）→ `Some(obfuscator)`
+/// - `settings.password`（≥4 字节，两种模式同要求）提前构造校验
 /// - 其它 mask type：报错（不静默丢配置，与 `parse_finalmask_udp_chain` 策略一致）
-/// - `settings.packetSize`：Go 侧切换 Gecko 分片模式（transport_internet.go:1761）， hysteria QUIC
-///   路径未实现 → 报错
 ///
 /// # Errors
-/// `InvalidInput`：未知 type / Gecko 配置 / 多条 salamander / PSK 过短。
-pub fn parse_salamander_obfs(
+/// `InvalidInput`：未知 type / packetSize 非法 / 多条目 / PSK 过短。
+pub fn parse_udp_obfs(
     finalmask_json: Option<&serde_json::Value>,
-) -> io::Result<Option<Arc<SalamanderObfuscator>>> {
+) -> io::Result<Option<UdpObfs>> {
     let Some(v) = finalmask_json else { return Ok(None) };
     let Some(udp) = v.get("udp").and_then(|u| u.as_array()) else {
         return Ok(None);
     };
-    let mut result: Option<Arc<SalamanderObfuscator>> = None;
+    let mut result: Option<UdpObfs> = None;
     for entry in udp {
         let ty = entry.get("type").and_then(|t| t.as_str()).unwrap_or_default();
         if ty != "salamander" {
@@ -233,28 +300,91 @@ pub fn parse_salamander_obfs(
             ));
         }
         let settings = entry.get("settings").cloned().unwrap_or_default();
-        if settings.get("packetSize").is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "hysteria finalmask: salamander gecko mode (packetSize) unsupported",
-            ));
-        }
         let password = settings.get("password").and_then(|p| p.as_str()).unwrap_or_default();
+        // PSK 校验（Go Build 两种模式共享 SalamanderObfuscator 前置条件 ≥4B）
         let obfs = SalamanderObfuscator::new(password.as_bytes()).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("hysteria finalmask salamander: {e}"),
             )
         })?;
+        let kind = match packet_size_range(settings.get("packetSize"))? {
+            // Go transport_finalmask.go:639：`To > 0` 才切 Gecko；To <= 0（含缺省/""）
+            // 短路回 plain salamander，不做区间校验
+            Some((from, to)) if to > 0 => {
+                // Go transport_finalmask.go:640-642
+                if from <= 0 || to > 2048 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "hysteria finalmask: gecko: invalid min/max packet size",
+                    ));
+                }
+                UdpObfs::Gecko(GeckoConfig {
+                    password: password.to_owned(),
+                    min_packet_size: from as u32,
+                    max_packet_size: to as u32,
+                })
+            },
+            _ => UdpObfs::Salamander(Arc::new(obfs)),
+        };
         if result.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "hysteria finalmask: multiple salamander entries unsupported",
             ));
         }
-        result = Some(Arc::new(obfs));
+        result = Some(kind);
     }
     Ok(result)
+}
+
+/// Go `Int32Range`（common.go:316-341 + ParseRangeString）：仅接受整数或
+/// `"a-b"` 字符串（支持负数 / `""`→(0,0)）；`{from,to}` 对象**不是** Int32Range
+/// 合法形态（Go 直接报错）；from>to 时交换（ensureOrder）。
+///
+/// 缺失 → `Ok(None)`（= 不启用 Gecko）。非法 → `InvalidInput`。
+fn packet_size_range(v: Option<&serde_json::Value>) -> io::Result<Option<(i64, i64)>> {
+    let Some(v) = v else { return Ok(None) };
+    let (left, right) = if let Some(n) = v.as_i64() {
+        (n, n)
+    } else if let Some(s) = v.as_str() {
+        parse_range_string(s)?
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "hysteria finalmask: invalid packetSize, expected integer or \"from-to\" string",
+        ));
+    };
+    Ok(Some((left.min(right), left.max(right))))
+}
+
+/// Go `ParseRangeString`（common.go:355-380）：`"114"`→(114,114)、`""`→(0,0)、
+/// `"114-514"`/`"-114-514"`/`"-1919--810"`；非法字符串报错。
+fn parse_range_string(s: &str) -> io::Result<(i64, i64)> {
+    if let Ok(n) = s.parse::<i64>() {
+        return Ok((n, n));
+    }
+    if s.is_empty() {
+        return Ok((0, 0));
+    }
+    // 处理 "-114-514" / "-1919--810"（首个负号属于左值）
+    let (l, r) = match s.strip_prefix('-') {
+        Some(rest) => match rest.split_once('-') {
+            Some((a, b)) => (format!("-{a}"), b.to_owned()),
+            None => return Err(invalid_range(s)),
+        },
+        None => match s.split_once('-') {
+            Some((a, b)) => (a.to_owned(), b.to_owned()),
+            None => return Err(invalid_range(s)),
+        },
+    };
+    let left = l.parse::<i64>().map_err(|_| invalid_range(s))?;
+    let right = r.parse::<i64>().map_err(|_| invalid_range(s))?;
+    Ok((left, right))
+}
+
+fn invalid_range(s: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, format!("invalid range string: {s}"))
 }
 
 #[cfg(test)]
@@ -378,45 +508,99 @@ mod tests {
     }
 
     #[test]
-    fn parse_salamander_none_cases() {
-        assert!(parse_salamander_obfs(None).unwrap().is_none());
+    fn parse_udp_obfs_none_cases() {
+        assert!(parse_udp_obfs(None).unwrap().is_none());
         let v: serde_json::Value = serde_json::from_str(r#"{"tcp":[]}"#).unwrap();
-        assert!(parse_salamander_obfs(Some(&v)).unwrap().is_none());
+        assert!(parse_udp_obfs(Some(&v)).unwrap().is_none());
         let v: serde_json::Value = serde_json::from_str(r#"{"udp":[]}"#).unwrap();
-        assert!(parse_salamander_obfs(Some(&v)).unwrap().is_none());
+        assert!(parse_udp_obfs(Some(&v)).unwrap().is_none());
     }
 
     #[test]
-    fn parse_salamander_found() {
+    fn parse_udp_obfs_plain_salamander() {
         let v: serde_json::Value = serde_json::from_str(
             r#"{"udp":[{"type":"salamander","settings":{"password":"obfs-secret-1"}}]}"#,
         )
         .unwrap();
-        assert!(parse_salamander_obfs(Some(&v)).unwrap().is_some());
+        assert!(matches!(parse_udp_obfs(Some(&v)).unwrap(), Some(UdpObfs::Salamander(_))));
+        // packetSize To==0 的各形态 → 仍是 plain salamander（Go Build 同语义）
+        for ps in ["0", "\"0\"", "\"\""] {
+            let v: serde_json::Value = serde_json::from_str(&format!(
+                r#"{{"udp":[{{"type":"salamander","settings":{{"password":"obfs-secret-1","packetSize":{ps}}}}}]}}"#
+            ))
+            .unwrap();
+            assert!(matches!(parse_udp_obfs(Some(&v)).unwrap(), Some(UdpObfs::Salamander(_))), "ps={ps}");
+        }
     }
 
     #[test]
-    fn parse_salamander_rejects_bad_config() {
+    fn parse_udp_obfs_gecko_mode() {
+        // 字符串区间形态（Go Int32Range 唯一字符串路径）
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"udp":[{"type":"salamander","settings":{"password":"obfs-secret-1","packetSize":"512-1200"}}]}"#,
+        )
+        .unwrap();
+        match parse_udp_obfs(Some(&v)).unwrap() {
+            Some(UdpObfs::Gecko(cfg)) => {
+                assert_eq!(cfg.password, "obfs-secret-1");
+                assert_eq!((cfg.min_packet_size, cfg.max_packet_size), (512, 1200));
+            },
+            other => panic!("expected gecko, got {other:?}"),
+        }
+        // 整数形态 → from=to
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"udp":[{"type":"salamander","settings":{"password":"obfs-secret-1","packetSize":1500}}]}"#,
+        )
+        .unwrap();
+        match parse_udp_obfs(Some(&v)).unwrap() {
+            Some(UdpObfs::Gecko(cfg)) => {
+                assert_eq!((cfg.min_packet_size, cfg.max_packet_size), (1500, 1500));
+            },
+            other => panic!("expected gecko, got {other:?}"),
+        }
+        // from>to 交换（Go ensureOrder）
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"udp":[{"type":"salamander","settings":{"password":"obfs-secret-1","packetSize":"1200-512"}}]}"#,
+        )
+        .unwrap();
+        match parse_udp_obfs(Some(&v)).unwrap() {
+            Some(UdpObfs::Gecko(cfg)) => {
+                assert_eq!((cfg.min_packet_size, cfg.max_packet_size), (512, 1200));
+            },
+            other => panic!("expected gecko, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_udp_obfs_rejects_bad_config() {
         // 未知 type
         let v: serde_json::Value =
             serde_json::from_str(r#"{"udp":[{"type":"noise","settings":{}}]}"#).unwrap();
-        assert!(parse_salamander_obfs(Some(&v)).is_err());
+        assert!(parse_udp_obfs(Some(&v)).is_err());
         // PSK 过短（< 4 字节）
         let v: serde_json::Value =
             serde_json::from_str(r#"{"udp":[{"type":"salamander","settings":{"password":"ab"}}]}"#)
                 .unwrap();
-        assert!(parse_salamander_obfs(Some(&v)).is_err());
-        // Gecko 模式未实现
+        assert!(parse_udp_obfs(Some(&v)).is_err());
+        // packetSize 对象形态：Go Int32Range 只收整数/字符串，对象直接报错
         let v: serde_json::Value = serde_json::from_str(
             r#"{"udp":[{"type":"salamander","settings":{"password":"obfs-secret-1","packetSize":{"from":512,"to":1200}}}]}"#,
         )
         .unwrap();
-        assert!(parse_salamander_obfs(Some(&v)).is_err());
+        assert!(parse_udp_obfs(Some(&v)).is_err());
+        // Gecko 区间非法：From <= 0 / To > 2048（Go transport_finalmask.go:640）
+        for ps in ["\"0-1200\"", "\"-512-1200\"", "\"512-2049\"", "\"512-4096\""] {
+            let v: serde_json::Value = serde_json::from_str(&format!(
+                r#"{{"udp":[{{"type":"salamander","settings":{{"password":"obfs-secret-1","packetSize":{ps}}}}}]}}"#
+            ))
+            .unwrap();
+            assert!(parse_udp_obfs(Some(&v)).is_err(), "ps={ps}");
+        }
         // 多条 salamander
         let v: serde_json::Value = serde_json::from_str(
             r#"{"udp":[{"type":"salamander","settings":{"password":"obfs-secret-1"}},{"type":"salamander","settings":{"password":"obfs-secret-2"}}]}"#,
         )
         .unwrap();
-        assert!(parse_salamander_obfs(Some(&v)).is_err());
+        assert!(parse_udp_obfs(Some(&v)).is_err());
     }
 }
