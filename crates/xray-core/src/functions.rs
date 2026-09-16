@@ -827,6 +827,170 @@ mod tests {
             h.abort();
         }
     }
+
+    /// splice 生产激活 e2e（txno-splice 收口）：双 start_full 全栈链——
+    /// client 实例（socks 入站 + socks 出站）→ server 实例（socks 入站 +
+    /// freedom 出站）→ echo。server 侧 DialBridge 准入四件套（平台 + env +
+    /// 双端 raw + freedom splice_out）在 Linux 全绿时，下行经内核 splice
+    /// 直达 server 入站 raw fd（绕过 link.writer，Go tc.ReadFrom 语义）。
+    ///
+    /// 断言随 [`xray_common::platform::splice::bridge_splice_admission`]
+    /// 真实判定分叉（同输入：socks 裸入站 can=1/raw、freedom 裸出站）：
+    /// - 准入（Linux/Android 且 env 开，缺省开）：echo 完整 + 期间
+    ///   [`xray_app_dispatcher::SPLICE_ADMISSIONS`] 增量 ≥1；
+    /// - 未准入（Windows/macOS 或 env 关）：echo 仍必须完整（回退泵全链
+    ///   可用），增量 ==0（未准入不得计入激活）。
+    #[tokio::test]
+    async fn integration_splice_admitted_two_stack_echo() {
+        use xray_app_dispatcher::SPLICE_ADMISSIONS;
+        use xray_common::platform::splice::bridge_splice_admission;
+
+        // 1. echo server
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = echo_listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 16_384];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        // 2. 端口分配：server socks / client socks
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        // 3. server 实例：socks 入站（裸 TCP → can=1 + raw dup）+ freedom 出站
+        //    （splice 准入点在本实例 DialBridge，xray-core outbound.rs:735 唯一置位）
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry { kind: "socks".into(), data: vec![] },
+            tag: "socks-in".into(),
+            port: Some(server_socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        server_cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry {
+                kind: "freedom".into(),
+                data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec(),
+            },
+            tag: "direct".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
+        });
+        let (_si, _so, sh) = start_full(&server_cfg).await.expect("server start_full");
+
+        // 4. client 实例：socks 入站 + socks 出站（非 freedom → 不置
+        //    splice_outbound，本实例准入恒 false，不污染激活计数）
+        let mut client_cfg = BuiltConfig::default();
+        client_cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry { kind: "socks".into(), data: vec![] },
+            tag: "socks-in".into(),
+            port: Some(client_socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        client_cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry {
+                kind: "socks".into(),
+                data: format!(
+                    r#"{{"servers":[{{"address":"127.0.0.1","port":{server_socks_port}}}]}}"#
+                )
+                .into_bytes(),
+            },
+            tag: "relay".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
+        });
+        let (_ci, _co, ch) = start_full(&client_cfg).await.expect("client start_full");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 判定基准（与 server DialBridge 同输入）+ 激活计数基线
+        let expected_admitted = bridge_splice_admission(
+            xray_common::platform::splice::CAN_SPLICE_COPY_YES,
+            xray_common::platform::splice::CAN_SPLICE_COPY_YES,
+            true,
+            true,
+        );
+        let admissions_before = SPLICE_ADMISSIONS.load(Ordering::Relaxed);
+
+        // 5. SOCKS5 握手（对 client 实例）→ CONNECT echo
+        let mut client = TcpStream::connect(format!("127.0.0.1:{client_socks_port}"))
+            .await
+            .expect("connect client socks");
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [0x05, 0x00], "client socks no-auth");
+        let ipv4 = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
+        let mut req = vec![0x05, 0x01, 0x00, 0x01];
+        req.extend_from_slice(&ipv4);
+        req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        client.write_all(&req).await.unwrap();
+        let mut connect_resp = [0u8; 10];
+        client.read_exact(&mut connect_resp).await.unwrap();
+        assert_eq!(connect_resp[1], 0x00, "CONNECT through both stacks");
+
+        // 6. 128KB echo（全双工 + 分块写，防 Windows loopback 发送停滞——
+        // integration_vless_vision 同款驱动形态）
+        let payload: Vec<u8> = (0u8..=255).cycle().take(128 * 1024).collect();
+        let expect = payload.clone();
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+        let up = tokio::spawn(async move {
+            let mut off = 0usize;
+            while off < expect.len() {
+                let n = (expect.len() - off).min(8192);
+                client_w.write_all(&expect[off..off + n]).await.unwrap();
+                off += n;
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        });
+        let mut got = vec![0u8; payload.len()];
+        tokio::time::timeout(std::time::Duration::from_secs(30), client_r.read_exact(&mut got))
+            .await
+            .expect("two-stack echo no timeout")
+            .unwrap();
+        up.await.unwrap();
+        assert_eq!(got, payload, "128KB integrity through two full stacks");
+
+        // 7. 激活分叉断言
+        let admissions = SPLICE_ADMISSIONS.load(Ordering::Relaxed) - admissions_before;
+        if expected_admitted {
+            assert!(
+                admissions >= 1,
+                "splice 准入成立但激活计数未增（增量 {admissions}）"
+            );
+        } else {
+            assert_eq!(admissions, 0, "未准入不得计入 splice 激活");
+        }
+
+        for h in sh.iter().chain(ch.iter()) {
+            h.abort();
+        }
+    }
     /// Access log e2e（bd 4uu）：log 配置块（access 文件）→ socks → freedom 全链路，
     /// dispatch 后 access log 记录 from/to/detour（Go default.go:488-502 对齐）。
     #[tokio::test]

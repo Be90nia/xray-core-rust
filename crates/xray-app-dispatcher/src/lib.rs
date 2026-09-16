@@ -37,7 +37,7 @@ pub use config::{Config, SessionConfig};
 pub use default::{
     AccessContext, AccessLogEntry, AccessLogSink, CachedReader, DefaultDispatcher, DialBridge,
     DispatchHandler, DispatcherContext, InboundSpliceMeta, INBOUND_SPLICE,
-    OutboundHandlerManager, RoutingContext, RoutingRouter, SimpleOhm,
+    OutboundHandlerManager, RoutingContext, RoutingRouter, SimpleOhm, SPLICE_ADMISSIONS,
 };
 pub use error::DispatcherError;
 pub use udp_session::UdpDispatchSession;
