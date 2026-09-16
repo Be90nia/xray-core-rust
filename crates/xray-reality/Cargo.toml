@@ -34,6 +34,9 @@ base64 = "0.22"
 hex = "0.4"
 serde_json = { workspace = true }
 rcgen = "0.13"
+# tvky (REALITY 10.0)：ML-DSA-65 后量子签名——服务端 mldsa65Seed → 公钥派生 +
+# 客户端 mldsa65Verify 验签；与 xray-cli 同一 crate（RustCrypto ml-dsa 0.1）
+ml-dsa = { version = "0.1", default-features = false, features = ["alloc"] }
 
 
 [dev-dependencies]
