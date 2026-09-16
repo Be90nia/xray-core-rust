@@ -105,6 +105,20 @@ impl Ipv4Cidr {
         };
         (ip_val & mask) == (self.addr & mask)
     }
+
+    /// CIDR 覆盖的 inclusive 地址区间 [start, end]。
+    fn range(&self) -> (u32, u32) {
+        if self.prefix == 0 {
+            return (0, u32::MAX);
+        }
+        let mask = if self.prefix >= 32 {
+            !0u32
+        } else {
+            !0u32 << (32 - self.prefix)
+        };
+        let base = self.addr & mask;
+        (base, base | !mask)
+    }
 }
 
 /// IPv6 CIDR 范围。
@@ -135,20 +149,55 @@ impl Ipv6Cidr {
         };
         (ip_val & mask) == (self.addr & mask)
     }
+
+    /// CIDR 覆盖的 inclusive 地址区间 [start, end]。
+    fn range(&self) -> (u128, u128) {
+        if self.prefix == 0 {
+            return (0, u128::MAX);
+        }
+        let mask = if self.prefix >= 128 {
+            !0u128
+        } else {
+            !0u128 << (128 - self.prefix)
+        };
+        let base = self.addr & mask;
+        (base, base | !mask)
+    }
 }
 
 // ── IPSet ───────────────────────────────────────────────────────
 
 /// 基于 CIDR 前缀列表的 IP 集合。
 ///
+/// 内部存储为排序合并不相交的地址区间，`contains` 走二分查找
+/// （O(log n)，GeoIP 千级 CIDR 下替代线性扫描）。
+///
 /// `max4`/`max6` 记录最大前缀位数，用于启发式优化判断：
 /// - `0xff` 表示无条目
 /// - `0xfe` 表示包含 /0（匹配所有）
 pub struct IPSet {
-    ipv4_ranges: Vec<Ipv4Cidr>,
-    ipv6_ranges: Vec<Ipv6Cidr>,
+    ipv4_ranges: Vec<(u32, u32)>,
+    ipv6_ranges: Vec<(u128, u128)>,
     max4: u8,
     max6: u8,
+}
+
+/// 合并排序区间中的重叠项，输出升序不相交区间。
+/// （相邻不合并：不影响二分正确性，只少一次边界运算。）
+fn merge_sorted_ranges<T: Copy + Ord>(mut ranges: Vec<(T, T)>) -> Vec<(T, T)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(T, T)> = Vec::with_capacity(ranges.len());
+    for (s, e) in ranges {
+        match merged.last_mut() {
+            Some(last) if s <= last.1 => {
+                if e > last.1 {
+                    last.1 = e;
+                }
+            }
+            _ => merged.push((s, e)),
+        }
+    }
+    merged
 }
 
 impl IPSet {
@@ -184,7 +233,7 @@ impl IPSet {
                 {
                     max4 = prefix;
                 }
-                ipv4_ranges.push(net);
+                ipv4_ranges.push(net.range());
             } else if cidr.ip.len() == 16 {
                 let bytes: [u8; 16] =
                     cidr.ip[..16].try_into().unwrap_or([0; 16]);
@@ -199,14 +248,16 @@ impl IPSet {
                 {
                     max6 = prefix;
                 }
-                ipv6_ranges.push(net);
+                ipv6_ranges.push(net.range());
             }
         }
 
-        ipv4_ranges.sort_by_key(|n| n.prefix);
-        ipv6_ranges.sort_by_key(|n| n.prefix);
-
-        Self { ipv4_ranges, ipv6_ranges, max4, max6 }
+        Self {
+            ipv4_ranges: merge_sorted_ranges(ipv4_ranges),
+            ipv6_ranges: merge_sorted_ranges(ipv6_ranges),
+            max4,
+            max6,
+        }
     }
 
     /// 判断 IPv4 地址是否在集合内。
@@ -214,7 +265,9 @@ impl IPSet {
     pub fn contains_v4(&self, ip: Ipv4Addr) -> bool {
         if self.max4 == IPV4_NO_ENTRIES { return false; }
         if self.max4 == IPV4_MATCH_ALL { return true; }
-        self.ipv4_ranges.iter().any(|net| net.contains(ip))
+        let v = u32::from_be_bytes(ip.octets());
+        let idx = self.ipv4_ranges.partition_point(|&(_, e)| e < v);
+        self.ipv4_ranges.get(idx).is_some_and(|&(s, _)| s <= v)
     }
 
     /// 判断 IPv6 地址是否在集合内。
@@ -222,7 +275,9 @@ impl IPSet {
     pub fn contains_v6(&self, ip: Ipv6Addr) -> bool {
         if self.max6 == IPV6_NO_ENTRIES { return false; }
         if self.max6 == IPV6_MATCH_ALL { return true; }
-        self.ipv6_ranges.iter().any(|net| net.contains(ip))
+        let v = u128::from_be_bytes(ip.octets());
+        let idx = self.ipv6_ranges.partition_point(|&(_, e)| e < v);
+        self.ipv6_ranges.get(idx).is_some_and(|&(s, _)| s <= v)
     }
 
     /// 判断 IP 地址是否在集合内。
@@ -912,6 +967,221 @@ mod tests {
         assert!(matcher.match_ip(IpAddr::from([10, 0, 0, 1])));
         assert!(matcher.match_ip(IpAddr::from([192, 168, 1, 1])));
         assert!(!matcher.match_ip(IpAddr::from([8, 8, 8, 8])));
+    }
+
+    // ── IPSet 语义契约（6nxp：区间化/前缀查找必须与线性扫描逐点一致）──
+
+    /// xorshift64 伪随机源：固定种子，无外部 rand 依赖。
+    fn xorshift64(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    /// 独立参考：直接掩码计算 CIDR 的 [start, end] inclusive 区间。
+    fn v4_range_ref(addr: Ipv4Addr, prefix: u8) -> (u32, u32) {
+        let a = u32::from_be_bytes(addr.octets());
+        if prefix == 0 {
+            return (0, u32::MAX);
+        }
+        let mask = if prefix >= 32 {
+            u32::MAX
+        } else {
+            u32::MAX << (32 - prefix)
+        };
+        let base = a & mask;
+        (base, base | !mask)
+    }
+
+    fn v6_range_ref(addr: Ipv6Addr, prefix: u8) -> (u128, u128) {
+        let a = u128::from_be_bytes(addr.octets());
+        if prefix == 0 {
+            return (0, u128::MAX);
+        }
+        let mask = if prefix >= 128 {
+            u128::MAX
+        } else {
+            u128::MAX << (128 - prefix)
+        };
+        let base = a & mask;
+        (base, base | !mask)
+    }
+
+    #[test]
+    fn ipset_random_cidrs_match_linear_reference_v4() {
+        let mut rng: u64 = 0x6e78_7070;
+        let mut raws: Vec<(Ipv4Addr, u8)> = Vec::new();
+        let mut ref_nets: Vec<Ipv4Cidr> = Vec::new();
+        let mut cidrs: Vec<Cidr> = Vec::new();
+        for _ in 0..300 {
+            let raw = xorshift64(&mut rng) as u32;
+            let prefix = (xorshift64(&mut rng) % 33) as u8;
+            let addr = Ipv4Addr::from(raw);
+            raws.push((addr, prefix));
+            ref_nets.push(Ipv4Cidr::new(addr, prefix));
+            cidrs.push(Cidr::new(addr.octets().to_vec(), prefix as u32));
+        }
+        let ipset = IPSet::from_cidrs(&cidrs);
+
+        for i in 0..4000u32 {
+            let pick = raws[(xorshift64(&mut rng) % raws.len() as u64) as usize];
+            let ip_raw: u32 = match i % 4 {
+                // 区间 base（命中点）/ end（右边界）/ base+1（左邻界）
+                0 => v4_range_ref(pick.0, pick.1).0,
+                1 => v4_range_ref(pick.0, pick.1).1,
+                2 => v4_range_ref(pick.0, pick.1).0.wrapping_add(1),
+                _ => xorshift64(&mut rng) as u32,
+            };
+            let ip = Ipv4Addr::from(ip_raw);
+            let want = ref_nets.iter().any(|n| n.contains(ip));
+            assert_eq!(ipset.contains_v4(ip), want, "mismatch at {ip}");
+        }
+    }
+
+    #[test]
+    fn ipset_random_cidrs_match_linear_reference_v6() {
+        let mut rng: u64 = 0x6e78_7226;
+        let mut raws: Vec<(Ipv6Addr, u8)> = Vec::new();
+        let mut ref_nets: Vec<Ipv6Cidr> = Vec::new();
+        let mut cidrs: Vec<Cidr> = Vec::new();
+        for _ in 0..300 {
+            let hi = xorshift64(&mut rng);
+            let lo = xorshift64(&mut rng);
+            let prefix = (xorshift64(&mut rng) % 129) as u8;
+            let addr = Ipv6Addr::from(((hi as u128) << 64) | lo as u128);
+            raws.push((addr, prefix));
+            ref_nets.push(Ipv6Cidr::new(addr, prefix));
+            cidrs.push(Cidr::new(addr.octets().to_vec(), prefix as u32));
+        }
+        let ipset = IPSet::from_cidrs(&cidrs);
+
+        for i in 0..4000u32 {
+            let pick = raws[(xorshift64(&mut rng) % raws.len() as u64) as usize];
+            let ip_raw: u128 = match i % 4 {
+                0 => v6_range_ref(pick.0, pick.1).0,
+                1 => v6_range_ref(pick.0, pick.1).1,
+                2 => v6_range_ref(pick.0, pick.1).0.wrapping_add(1),
+                _ => {
+                    let hi = xorshift64(&mut rng);
+                    let lo = xorshift64(&mut rng);
+                    ((hi as u128) << 64) | lo as u128
+                }
+            };
+            let ip = Ipv6Addr::from(ip_raw);
+            let want = ref_nets.iter().any(|n| n.contains(ip));
+            assert_eq!(ipset.contains_v6(ip), want, "mismatch at {ip}");
+        }
+    }
+
+    #[test]
+    fn ipset_prefix0_matches_all_v4_and_v6() {
+        let cidrs = vec![
+            Cidr::new(vec![0, 0, 0, 0], 0),
+            Cidr::new(Ipv6Addr::UNSPECIFIED.octets().to_vec(), 0),
+        ];
+        let ipset = IPSet::from_cidrs(&cidrs);
+        assert!(ipset.contains_v4(Ipv4Addr::new(1, 2, 3, 4)));
+        assert!(ipset.contains_v4(Ipv4Addr::new(255, 255, 255, 255)));
+        assert!(ipset.contains_v6(Ipv6Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn ipset_host_route_exact_and_neighbor() {
+        let cidrs = vec![Cidr::new(vec![10, 0, 0, 1], 32)];
+        let ipset = IPSet::from_cidrs(&cidrs);
+        assert!(ipset.contains_v4(Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(!ipset.contains_v4(Ipv4Addr::new(10, 0, 0, 0)));
+        assert!(!ipset.contains_v4(Ipv4Addr::new(10, 0, 0, 2)));
+
+        let cidrs6 = vec![Cidr::new(Ipv6Addr::LOCALHOST.octets().to_vec(), 128)];
+        let ipset6 = IPSet::from_cidrs(&cidrs6);
+        assert!(ipset6.contains_v6(Ipv6Addr::LOCALHOST));
+        let neighbor = Ipv6Addr::from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        assert!(!ipset6.contains_v6(neighbor));
+    }
+
+    #[test]
+    fn ipset_overlapping_prefixes_union_semantics() {
+        // 10.0.0.0/8 与 10.128.0.0/9 嵌套重叠：并集语义不受区间合并影响
+        let cidrs = vec![
+            Cidr::new(vec![10, 0, 0, 0], 8),
+            Cidr::new(vec![10, 128, 0, 0], 9),
+        ];
+        let ipset = IPSet::from_cidrs(&cidrs);
+        assert!(ipset.contains_v4(Ipv4Addr::new(10, 0, 0, 0)));
+        assert!(ipset.contains_v4(Ipv4Addr::new(10, 127, 255, 255)));
+        assert!(ipset.contains_v4(Ipv4Addr::new(10, 128, 0, 0)));
+        assert!(ipset.contains_v4(Ipv4Addr::new(10, 255, 255, 255)));
+        assert!(!ipset.contains_v4(Ipv4Addr::new(9, 255, 255, 255)));
+        assert!(!ipset.contains_v4(Ipv4Addr::new(11, 0, 0, 0)));
+    }
+
+    #[test]
+    fn ipset_adjacent_ranges_boundary() {
+        // 10.0.0.0/8 与 11.0.0.0/8 相邻不相交：两侧边界全命中，外部 miss
+        let cidrs = vec![
+            Cidr::new(vec![11, 0, 0, 0], 8),
+            Cidr::new(vec![10, 0, 0, 0], 8),
+        ];
+        let ipset = IPSet::from_cidrs(&cidrs);
+        assert!(ipset.contains_v4(Ipv4Addr::new(10, 255, 255, 255)));
+        assert!(ipset.contains_v4(Ipv4Addr::new(11, 0, 0, 0)));
+        assert!(!ipset.contains_v4(Ipv4Addr::new(12, 0, 0, 0)));
+        assert!(!ipset.contains_v4(Ipv4Addr::new(9, 255, 255, 255)));
+    }
+
+    #[test]
+    fn ipset_v4_v6_families_isolated() {
+        let v4_only = IPSet::from_cidrs(&[Cidr::new(vec![127, 0, 0, 0], 8)]);
+        assert!(v4_only.is_empty_v6());
+        assert!(!v4_only.contains_v6(Ipv6Addr::LOCALHOST));
+
+        let v6_only = IPSet::from_cidrs(&[Cidr::new(
+            Ipv6Addr::LOCALHOST.octets().to_vec(),
+            128,
+        )]);
+        assert!(v6_only.is_empty_v4());
+        assert!(!v6_only.contains_v4(Ipv4Addr::new(127, 0, 0, 1)));
+    }
+
+    #[test]
+    fn ipset_duplicate_cidrs() {
+        let cidrs = vec![
+            Cidr::new(vec![192, 168, 0, 0], 16),
+            Cidr::new(vec![192, 168, 0, 0], 16),
+        ];
+        let ipset = IPSet::from_cidrs(&cidrs);
+        assert!(ipset.contains_v4(Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(!ipset.contains_v4(Ipv4Addr::new(192, 169, 0, 0)));
+    }
+
+    #[test]
+    fn ipset_ranges_sorted_disjoint_invariant() {
+        let mut rng: u64 = 0x1234_5678;
+        let mut cidrs = Vec::new();
+        for _ in 0..200 {
+            let raw = xorshift64(&mut rng) as u32;
+            let prefix = (xorshift64(&mut rng) % 33) as u8;
+            cidrs.push(Cidr::new(
+                Ipv4Addr::from(raw).octets().to_vec(),
+                prefix as u32,
+            ));
+        }
+        let ipset = IPSet::from_cidrs(&cidrs);
+        for w in ipset.ipv4_ranges.windows(2) {
+            assert!(
+                w[0].1 < w[1].0,
+                "ranges must be sorted and disjoint: {:?} then {:?}",
+                w[0], w[1]
+            );
+        }
+        assert!(
+            ipset.ipv6_ranges.windows(2).all(|w| w[0].1 < w[1].0),
+            "ipv6 ranges must be sorted and disjoint"
+        );
     }
 }
 

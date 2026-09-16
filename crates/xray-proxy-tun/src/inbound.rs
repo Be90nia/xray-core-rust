@@ -288,9 +288,11 @@ async fn tun_driver_loop(
             result = rx.recv(&device) => {
                 match result {
                     Ok(count) => {
+                        // 票 fnlv：UDP 无锁预分流（bypass 语义不变），TCP 包收切片
+                        // 进单次临界区——批量读的 syscall 摊销不再被逐包锁拆碎。
+                        let mut tcp_pkts: Vec<&[u8]> = Vec::new();
                         for i in 0..count {
                             let pkt = rx.packet(i);
-
                             // 先尝试按 UDP 解析：能解出 4 元组就 bypass smoltcp，
                             // 避免 smoltcp 对未 bind 端口发 ICMP port unreachable。
                             // ponytail: 直接判字节，省一次 smoltcp poll 锁。
@@ -302,30 +304,22 @@ async fn tun_driver_loop(
                                     Arc::clone(&dispatch),
                                     Arc::clone(&device),
                                 );
-                                continue;
+                            } else {
+                                tcp_pkts.push(pkt);
                             }
-
-                            let mut stack = netstack.lock().await;
-                            // TCP SYN → 惰性注册 listen socket（票 ipb5）。必须发生在
-                            // ingest 之前，本次 poll 才能为该 SYN 生成 SYN-ACK。
-                            // 注册失败（port=0 等，几乎不可能）→ 丢弃该 SYN，连接建不起来，
-                            // 不静默吞掉：error 日志可见。
-                            if let Some(dst) = parse_tcp_syn_dst(pkt) {
-                                if let Err(e) = stack.ensure_tcp_listen(dst) {
-                                    tracing::error!(error = %e, dst = ?dst, "tcp lazy listen failed, dropping SYN");
-                                }
-                            }
-                            stack.ingest_rx(pkt.to_vec());
-                            stack.poll(smoltcp::time::Instant::now());
-                            // 处理 ICMP echo request 并自动回复
-                            stack.process_icmp_echo();
-                            // 检测 TCP accept 事件
-                            handle_socket_events(&mut stack, &netstack, &dispatch);
-                            // drain tx 并写回 TUN
-                            let tx_pkts = stack.drain_tx();
-                            drop(stack); // 释放锁再 await
-                            write_tx_back(&device, tx_pkts).await;
                         }
+
+                        // 唯一临界区：整批 TCP ingest + 批尾一次 poll/accept/drain。
+                        // drive_stack_batch 是同步 fn——锁内无 await 由编译器保证。
+                        let (accepted, tx_pkts) = {
+                            let mut stack = netstack.lock().await;
+                            drive_stack_batch(&mut stack, &tcp_pkts)
+                        };
+
+                        // 锁外：accept 建桥（tokio::spawn 不再发生在临界区内）+
+                        // 批聚合单次写回 TUN。
+                        dispatch_accepted(&netstack, accepted, &dispatch).await;
+                        write_tx_back(&device, tx_pkts).await;
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "tun recv error");
@@ -334,17 +328,17 @@ async fn tun_driver_loop(
                     }
                 }
             }
-            // 每 100ms 触发：poll + drain_tx
+            // 每 100ms 触发：poll + drain_tx（票 fnlv：spawn 移出临界区）
             _ = timer.tick() => {
-                let tx_pkts: Vec<Vec<u8>> = {
+                let (accepted, tx_pkts) = {
                     let mut stack = netstack.lock().await;
                     stack.poll(smoltcp::time::Instant::now());
                     // 处理 ICMP echo request 并自动回复
                     stack.process_icmp_echo();
-                    // 检测 TCP accept 事件
-                    handle_socket_events(&mut stack, &netstack, &dispatch);
-                    stack.drain_tx()
+                    // 只收集 accept 事件，建桥 spawn 在锁外进行
+                    (stack.check_tcp_accepts(), stack.drain_tx())
                 };
+                dispatch_accepted(&netstack, accepted, &dispatch).await;
                 write_tx_back(&device, tx_pkts).await;
             }
         }
@@ -649,19 +643,51 @@ async fn run_udp_session(
     }
 }
 
-fn handle_socket_events(
+/// 票 fnlv：整批 TCP 包的单次栈驱动临界区（同步 fn——锁内无 await 由
+/// 编译器保证）。顺序：逐包 ensure_listen（票 ipb5，必须先于 ingest）+ ingest，
+/// 批尾统一 poll + ICMP + accept 收集 + drain——批量读 syscall 的摊销不再被
+/// 逐包 poll/drain 拆碎，netstack 锁获取次数从每包 1 次降为每批 1 次。
+/// smoltcp `poll` 内部循环消化 rx_queue 全部 pending 段（POLL_RX_BUDGET），
+/// 一次批尾 poll 与逐包 poll 的状态机结果等价。
+/// 返回 (accept 事件, TX 批)——建桥 spawn 与写回 TUN 都在锁外进行。
+fn drive_stack_batch(
     stack: &mut TunNetStack,
+    pkts: &[&[u8]],
+) -> (Vec<TcpAcceptEvent>, Vec<Vec<u8>>) {
+    for pkt in pkts {
+        // TCP SYN → 惰性注册 listen socket（票 ipb5）。必须发生在
+        // ingest 之前，poll 才能为该 SYN 生成 SYN-ACK。
+        // 注册失败（port=0 等，几乎不可能）→ 丢弃该 SYN，连接建不起来，
+        // 不静默吞掉：error 日志可见。
+        if let Some(dst) = parse_tcp_syn_dst(pkt) {
+            if let Err(e) = stack.ensure_tcp_listen(dst) {
+                tracing::error!(error = %e, dst = ?dst, "tcp lazy listen failed, dropping SYN");
+            }
+        }
+        stack.ingest_rx(pkt.to_vec());
+    }
+    stack.poll(smoltcp::time::Instant::now());
+    // 处理 ICMP echo request 并自动回复
+    stack.process_icmp_echo();
+    // 只收集 accept 事件（状态机转移在锁内完成）；建桥 spawn 锁外
+    (stack.check_tcp_accepts(), stack.drain_tx())
+}
+
+/// 票 fnlv：锁外消费 accept 事件——每个新连接建桥 dispatch。
+/// `tokio::spawn` 不再发生在 netstack 临界区内。
+async fn dispatch_accepted(
     netstack: &Arc<AsyncMutex<TunNetStack>>,
+    events: Vec<TcpAcceptEvent>,
     dispatch: &Arc<dyn DispatchHandler>,
 ) {
-    for event in stack.check_tcp_accepts() {
-        accept_tcp_connection(stack, netstack, event, dispatch);
+    for event in events {
+        accept_tcp_connection(netstack, event, dispatch).await;
     }
 }
 
 /// 单个已 accept 的 TCP 连接 → 建桥 dispatch（票 ipb5，原 handle_socket_events 主体）。
-fn accept_tcp_connection(
-    stack: &mut TunNetStack,
+/// 锁外调用：dest 解析失败的罕见分支重取锁摘除 socket，不持有调用方临界区。
+async fn accept_tcp_connection(
     netstack: &Arc<AsyncMutex<TunNetStack>>,
     event: TcpAcceptEvent,
     dispatch: &Arc<dyn DispatchHandler>,
@@ -674,7 +700,7 @@ fn accept_tcp_connection(
                 remote = %event.remote,
                 "tcp accept: no local endpoint, dropping connection"
             );
-            stack.remove_socket(event.handle);
+            netstack.lock().await.remove_socket(event.handle);
             return;
         }
     };
@@ -1167,8 +1193,10 @@ mod tests {
             stack.poll(smoltcp::time::Instant::now());
             let _ = stack.drain_tx();
 
-            // ④ accept → dispatch
-            handle_socket_events(&mut stack, &netstack, &handler);
+            // ④ accept → dispatch（票 fnlv：锁内收集事件，锁外建桥）
+            let accepted = stack.check_tcp_accepts();
+            drop(stack);
+            dispatch_accepted(&netstack, accepted, &(handler as Arc<dyn DispatchHandler>)).await;
         }
 
         // dispatch 在 spawn 的 task 里执行，current-thread runtime 需让出让其跑完
@@ -1202,7 +1230,9 @@ mod tests {
 
         {
             let mut stack = netstack.lock().await;
-            handle_socket_events(&mut stack, &netstack, &(dispatch as Arc<dyn DispatchHandler>));
+            let accepted = stack.check_tcp_accepts();
+            drop(stack);
+            dispatch_accepted(&netstack, accepted, &(dispatch as Arc<dyn DispatchHandler>)).await;
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0, "no spurious dispatch");
     }
@@ -1363,5 +1393,169 @@ mod tests {
             "second packet must reach outbound within 1s while recv is blackholed, got {} bytes",
             req_bytes.load(Ordering::Relaxed)
         );
+    }
+
+    /// 票 fnlv 契约 1：整批单临界区语义等价——[SYN, ACK] 同批（或分批）drive
+    /// 完成三次握手，accept 事件由批尾统一收集；批驱动（锁内）期间 dispatch
+    /// 零触发，建桥 spawn 只发生在锁外 dispatch_accepted。
+    #[tokio::test]
+    async fn batch_drive_completes_handshake_and_defers_spawn_out_of_lock() {
+        use std::sync::Mutex;
+        use smoltcp::wire::{IpCidr, IpAddress, Ipv4Address};
+
+        #[derive(Debug)]
+        struct CaptureHandler(Arc<Mutex<Option<Destination>>>);
+        impl DispatchHandler for CaptureHandler {
+            fn tag(&self) -> &str { "capture" }
+            fn dispatch(
+                &self,
+                dest: &Destination,
+                _link: Link,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+                *self.0.lock().expect("lock") = Some(dest.clone());
+                Box::pin(async {})
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(None::<Destination>));
+        let handler: Arc<dyn DispatchHandler> = Arc::new(CaptureHandler(Arc::clone(&captured)));
+
+        let local = IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)), 24);
+        let netstack: Arc<AsyncMutex<TunNetStack>> =
+            Arc::new(AsyncMutex::new(TunNetStack::new(&[local], 1500)));
+
+        // 批 1：SYN 单包批 → 批尾一次 poll 出 SYN-ACK（GRO 批读聚合形态）
+        let syn = make_test_ipv4_tcp_packet(
+            [10, 0, 0, 2], 40000, [93, 184, 216, 34], 443,
+            1000, 0, 0x02, // SYN
+        );
+        let (accepted1, tx) = {
+            let mut stack = netstack.lock().await;
+            drive_stack_batch(&mut stack, &[&syn])
+        };
+        assert!(accepted1.is_empty(), "SYN alone must not accept");
+        let synack_seq = tx
+            .iter()
+            .find(|p| p.len() >= 34 && p[9] == 6 && (p[20 + 13] & 0x12) == 0x12)
+            .map(|p| u32::from_be_bytes([p[20 + 4], p[20 + 5], p[20 + 6], p[20 + 7]]))
+            .expect("SYN-ACK must be emitted at batch end");
+        assert_eq!(captured.lock().expect("lock").is_some(), false, "no dispatch inside critical section");
+
+        // 批 2：ACK 完成握手 → accept 事件批尾收集
+        let ack = make_test_ipv4_tcp_packet(
+            [10, 0, 0, 2], 40000, [93, 184, 216, 34], 443,
+            1001, synack_seq.wrapping_add(1), 0x10, // ACK
+        );
+        let (accepted2, _) = {
+            let mut stack = netstack.lock().await;
+            drive_stack_batch(&mut stack, &[&ack])
+        };
+        assert_eq!(accepted2.len(), 1, "accept collected once per batch");
+
+        // 锁外建桥 → dispatch 收到 SYN 的 dst（与真实 driver loop 两段式一致）
+        dispatch_accepted(&netstack, accepted2, &handler).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let dest = captured.lock().expect("lock").clone().expect("dispatch must fire from lock-external bridge");
+        assert_eq!(dest.address(), &Address::IPv4(std::net::Ipv4Addr::new(93, 184, 216, 34)));
+        assert_eq!(dest.port().value(), 443);
+        assert_eq!(dest.network(), Network::TCP);
+    }
+
+    /// 票 fnlv 契约 2：拆分后各锁职责单一 + 并发无死锁（带 deadline）——
+    /// driver 批驱动（poll+drain）与 TunTcpRelay 轮询（send/recv）并发抢同一
+    /// netstack 锁，用户数据经 relay 进 socket、被 driver 排进 TX 的完整一轮
+    /// 必须在 deadline 内完成；持锁跨 await 或锁序颠倒都会撞死 deadline。
+    #[tokio::test]
+    async fn concurrent_batch_drive_and_relay_no_deadlock() {
+        use smoltcp::wire::{IpCidr, IpAddress, Ipv4Address};
+
+        let local = IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)), 24);
+        let netstack: Arc<AsyncMutex<TunNetStack>> =
+            Arc::new(AsyncMutex::new(TunNetStack::new(&[local], 1500)));
+
+        // 真实握手造一条 Established 连接：SYN 批 → ACK 批 → accept
+        let syn = make_test_ipv4_tcp_packet(
+            [10, 0, 0, 2], 40000, [93, 184, 216, 34], 443,
+            1000, 0, 0x02,
+        );
+        let synack_seq = {
+            let mut stack = netstack.lock().await;
+            let (_, tx) = drive_stack_batch(&mut stack, &[&syn]);
+            tx.iter()
+                .find(|p| p.len() >= 34 && p[9] == 6 && (p[20 + 13] & 0x12) == 0x12)
+                .map(|p| u32::from_be_bytes([p[20 + 4], p[20 + 5], p[20 + 6], p[20 + 7]]))
+                .expect("SYN-ACK")
+        };
+        let ack = make_test_ipv4_tcp_packet(
+            [10, 0, 0, 2], 40000, [93, 184, 216, 34], 443,
+            1001, synack_seq.wrapping_add(1), 0x10,
+        );
+        let (accepted, _) = {
+            let mut stack = netstack.lock().await;
+            drive_stack_batch(&mut stack, &[&ack])
+        };
+        assert_eq!(accepted.len(), 1);
+        let handle = accepted[0].handle;
+
+        // 与真实 driver loop 同形态建 relay（duplex 两端 + 同一把锁）
+        let (client_to_relay, relay_from_client) = tokio::io::duplex(DUPLEX_BUF);
+        let (relay_to_client, mut client_from_relay) = tokio::io::duplex(DUPLEX_BUF);
+        let relay = TunTcpRelay {
+            from_client: relay_from_client,
+            to_client: relay_to_client,
+            netstack: Arc::clone(&netstack),
+            handle,
+        };
+        tokio::spawn(relay.run());
+        // 消费端保活：relay_to_client 的对端不被 drop → relay 收方向不 EOF
+        let _relay_sink = tokio::spawn(async move {
+            let mut sink = vec![0u8; 64];
+            while let Ok(n) = client_from_relay.read(&mut sink).await {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+
+        // driver 侧：循环批驱动（锁内 poll+drain），检到 payload 包置位。
+        // 空批 drive = 纯 timer tick 形态，与 relay 轮询交错抢锁。
+        let tx_has_payload = Arc::new(AtomicBool::new(false));
+        let driver = {
+            let netstack = Arc::clone(&netstack);
+            let tx_has_payload = Arc::clone(&tx_has_payload);
+            tokio::spawn(async move {
+                let empty: Vec<&[u8]> = Vec::new();
+                for _ in 0..500 {
+                    let (accepted, tx) = {
+                        let mut stack = netstack.lock().await;
+                        drive_stack_batch(&mut stack, &empty)
+                    };
+                    debug_assert!(accepted.is_empty());
+                    if tx.iter().any(|p| p.len() > 40) {
+                        tx_has_payload.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+        };
+
+        // 用户数据经 relay 写入 smoltcp socket（relay.send_to_smoltcp 抢锁）
+        let mut user = client_to_relay;
+        user.write_all(b"ping").await.expect("write to relay");
+        user.flush().await.expect("flush to relay");
+
+        // deadline 内用户数据必须被 driver 从 socket 排进 TX（无死锁证明）
+        let completed = tokio::time::timeout(Duration::from_secs(5), async {
+            while !tx_has_payload.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            completed.is_ok(),
+            "deadlock suspected: relay→socket data never reached TX within 5s"
+        );
+        driver.await.expect("driver task join");
     }
 }
