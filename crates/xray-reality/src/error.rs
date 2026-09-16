@@ -56,13 +56,6 @@ pub enum RealityError {
     #[error("failed to open master key log at {path}: {reason}")]
     OpenKeyLog { path: String, reason: String },
 
-    /// uTLS Rust 端未实现——预留变体。
-    ///
-    /// 当前 `xray-reality` 不引入真实 uTLS 握手（Rust 生态无 uTLS 等价品，
-    /// 见 [`crate`] 顶部文档说明）。实际握手等生态成熟或自研后再接。
-    #[error("uTLS-based REALITY handshake not yet implemented in Rust")]
-    UtlsRequired,
-
     /// watfaq-rustls `RealityConfig` 构建失败（short_id 过长或内部加密错误）。
     #[error("REALITY: watfaq RealityConfig build failed: {0}")]
     WatfaqConfig(String),
@@ -158,11 +151,5 @@ mod tests {
         let s = e.to_string();
         assert!(s.contains("/tmp/x.keylog"));
         assert!(s.contains("permission denied"));
-    }
-
-    #[test]
-    fn utls_required_has_explanatory_message() {
-        let s = RealityError::UtlsRequired.to_string();
-        assert!(s.contains("not yet implemented"));
     }
 }

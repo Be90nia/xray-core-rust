@@ -2,24 +2,13 @@
 //!
 //! 翻译自 Go `transport/internet/reality/reality.go` 的 `Server`/`Conn` 部分。
 //!
-//! # 切片进度
-//! - **切片1**（已完成）：client.rs 接入 watfaq-rustls RealityConfig。
-//! - **切片2**（本切片）：纯逻辑验证层——[`parse_client_hello`] 字节解析 +
-//!   [`crate::crypto::decrypt_session_id`] + [`crate::crypto::verify_session_payload`]。
-//! - **切片3a**（本切片）：[`verify_reality_client_hello`] 组合（ECDH+HKDF+AES-GCM 解密+校验）。
-//! - **切片3b-i**（已完成）：[`read_tls_record`] + [`PrefixedReader`] IO 基础设施。
-//! - **切片3b-iii**（本切片）：[`encode_proxy_header`] PROXY protocol v1/v2 + [`fallback_to_dest`] 转发。
-//! - **切片3b-ii**（待办）：rustls 服务端伪造证书 + MITM。
-//!
 //! # 为什么 ClientHello 手动解析
 //! Go 借助 `tls.Server` 读 ClientHello。Rust rustls 的 `server::Acceptor` 不直接暴露
 //! session_id / Random / key_share（TLS 内部字段）。本实现手动解析 TLS record 字节，
 //! 仅提取 REALITY 验证需要的字段，参考 Go `common/protocol/tls/sniff.go::ReadClientHello`。
 
-use crate::config::RealityConfig;
 use crate::error::RealityError;
 use crate::mitm::{build_server_config, generate_reality_ed25519_cert};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -284,14 +273,6 @@ pub fn verify_reality_client_hello(
     let payload =
         crate::crypto::verify_session_payload(&plaintext, now_unix, max_diff, allowed_short_ids)?;
     Ok((payload, auth_key))
-}
-
-/// 创建 REALITY 服务端连接（IO 层，切片3 待实现）。
-///
-/// 当前返回 [`RealityError::UtlsRequired`]。完整实现需：peek ClientHello record →
-/// [`parse_client_hello`] → 验证 → 成功走 rustls 服务端伪造证书 + VLESS；失败 fallback 到 dest。
-pub fn server<C>(_inner: C, _config: RealityConfig) -> Result<(), RealityError> {
-    Err(RealityError::UtlsRequired)
 }
 
 /// [`server_tls`] 的返回：REALITY 验证成功返回 TLS 连接，失败返回原连接 + 已读 record 供 fallback。
@@ -766,13 +747,6 @@ mod tests {
             parse_client_hello(&record).unwrap_err(),
             RealityError::InvalidConnection
         ));
-    }
-
-    #[test]
-    fn server_stub_returns_utls_required() {
-        let cfg = RealityConfig::default();
-        let err = server::<()>((), cfg).unwrap_err();
-        assert!(matches!(err, RealityError::UtlsRequired));
     }
 
     /// 构造完整 REALITY ClientHello record（含真实加密 session_id），测试 verify 用。
