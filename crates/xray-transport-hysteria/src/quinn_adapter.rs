@@ -24,7 +24,7 @@ use std::{
 
 use quinn::{Connection, RecvStream, SendStream, VarInt};
 use tokio::sync::Mutex;
-use xray_transport::finalmask::salamander::SalamanderObfuscator;
+use crate::salamander_socket::UdpObfs;
 
 use crate::conn::{QuicConn, QuicStream};
 
@@ -384,21 +384,21 @@ impl HysteriaQuicListener for QuinnQuicListener {
 /// 经 `on_new_conn` 回调投递给上层。对应 Go `Listen()` + `http3.Server.ServeQUICConn`。
 pub struct QuinnListenerFactory {
     rustls_server_config: Arc<rustls::ServerConfig>,
-    /// salamander UDP 混淆（对应 Go hub 侧 `UdpmaskManager.WrapPacketConnServer`，None =
-    /// 不包装）。
-    salamander: Option<Arc<SalamanderObfuscator>>,
+    /// UDP 混淆（salamander / gecko，对应 Go hub 侧 `UdpmaskManager.
+    /// WrapPacketConnServer`，None = 不包装）。
+    obfs: Option<UdpObfs>,
 }
 
 impl QuinnListenerFactory {
     #[must_use]
     pub fn new(rustls_server_config: Arc<rustls::ServerConfig>) -> Self {
-        Self { rustls_server_config, salamander: None }
+        Self { rustls_server_config, obfs: None }
     }
 
-    /// 注入 salamander UDP 混淆（builder 风格，None = 不包装）。
+    /// 注入 UDP 混淆（salamander / gecko；builder 风格，None = 不包装）。
     #[must_use]
-    pub fn with_salamander(mut self, obfs: Option<Arc<SalamanderObfuscator>>) -> Self {
-        self.salamander = obfs;
+    pub fn with_obfs(mut self, obfs: Option<UdpObfs>) -> Self {
+        self.obfs = obfs;
         self
     }
 }
@@ -423,7 +423,7 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
         // 对称）
         let mut rustls_config = (*self.rustls_server_config).clone();
         rustls_config.alpn_protocols = vec![b"h3".to_vec()];
-        let salamander = self.salamander.clone();
+        let obfs = self.obfs.clone();
         // masq handler（对应 Go hub.go:210-254 listen 时 switch masqType 构造）+
         // 静态 auth token（Go hub.go:63-64 validator 缺席时 config.Auth 对比）
         let masq_handler = masq.build_handler();
@@ -441,22 +441,16 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
             // 模板 transport config（endpoint 级兜底；每连接 accept_with 时覆盖）。
             let (template_tc, _unused_slot) = build_hysteria_transport_config(&qc);
             template.transport_config(Arc::new(template_tc));
-            // salamander：UDP socket 包 XOR 后经 abstract socket 交给 quinn
-            // （对应 Go hub 侧 pktConn 包装后再 quic.Transport.Listen）
-            let endpoint = match &salamander {
-                Some(obfs) => {
-                    crate::salamander_socket::SalamanderSocket::bind(obfs.clone(), bind_addr)
-                        .await
-                        .map_err(|e| {
-                            crate::error::HysteriaError::Io(io::Error::other(format!(
-                                "salamander bind: {e}"
-                            )))
-                        })?
-                        .server_endpoint(template.clone())
-                        .map_err(|e| {
-                            crate::error::HysteriaError::Io(io::Error::other(format!("bind: {e}")))
-                        })?
-                },
+            // obfs：UDP socket 包混淆（salamander XOR / gecko 分片）后经 abstract
+            // socket 交给 quinn（对应 Go hub 侧 pktConn 包装后再 quic.Transport.Listen）
+            let endpoint = match &obfs {
+                Some(kind) => kind.server_endpoint(template.clone(), bind_addr).await.map_err(
+                    |e| {
+                        crate::error::HysteriaError::Io(io::Error::other(format!(
+                            "obfs bind: {e}"
+                        )))
+                    },
+                )?,
                 None => quinn::Endpoint::server(template.clone(), bind_addr).map_err(|e| {
                     crate::error::HysteriaError::Io(io::Error::other(format!("bind: {e}")))
                 })?,
@@ -1431,12 +1425,10 @@ mod tests {
     async fn listener_factory_salamander_obfs_roundtrip() {
         use std::sync::Arc;
 
-        use xray_transport::finalmask::salamander::SalamanderObfuscator;
-
         use crate::{
             dialer::{DialDestination, HysteriaTransport},
             hysteria_transport::QuinnHysteriaTransport,
-            salamander_socket::parse_salamander_obfs,
+            salamander_socket::{UdpObfs, parse_udp_obfs},
         };
 
         ensure_crypto_provider();
@@ -1446,8 +1438,8 @@ mod tests {
             r#"{"udp":[{"type":"salamander","settings":{"password":"obfs-secret-1"}}]}"#,
         )
         .unwrap();
-        let obfs: Option<Arc<SalamanderObfuscator>> = parse_salamander_obfs(Some(&fm)).unwrap();
-        assert!(obfs.is_some(), "salamander entry must produce an obfuscator");
+        let obfs: Option<UdpObfs> = parse_udp_obfs(Some(&fm)).unwrap();
+        assert!(obfs.is_some(), "salamander entry must produce an obfs config");
 
         // 自签证书
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -1460,7 +1452,7 @@ mod tests {
             .unwrap();
 
         // server: 带 salamander 的 QuinnListenerFactory
-        let factory = QuinnListenerFactory::new(Arc::new(server_tls)).with_salamander(obfs.clone());
+        let factory = QuinnListenerFactory::new(Arc::new(server_tls)).with_obfs(obfs.clone());
         let proto_config = Arc::new(crate::proto_config::Config::default());
         let quic_params = Arc::new(xray_proto::xray::transport::internet::QuicParams::default());
         struct ObfsValidator;
@@ -1503,7 +1495,7 @@ mod tests {
         let transport = Arc::new(
             QuinnHysteriaTransport::new(client_tls, "0.0.0.0:0".parse().unwrap())
                 .expect("transport")
-                .with_salamander(obfs),
+                .with_obfs(obfs),
         );
 
         // dial + auth——QUIC 握手本身就在 salamander XOR 内完成
@@ -1537,6 +1529,123 @@ mod tests {
         let mut got = vec![0u8; payload.len()];
         isc.read(&mut got).await.expect("client read echo");
         assert_eq!(&got, payload, "echo roundtrip through salamander-obfuscated QUIC");
+
+        let _ = listener.close().await;
+    }
+
+    /// 集成测试：Gecko 分片混淆（bd a9r8）——与 salamander e2e 同一床，
+    /// 配置带 `packetSize` 切 Gecko 模式。QUIC Initial（长头）在 wire 上拆成
+    /// 2-8 个分片帧，服务端重组后完成握手 → h3 auth → bidi echo。
+    #[tokio::test]
+    async fn listener_factory_gecko_obfs_roundtrip() {
+        use std::sync::Arc;
+
+        use crate::{
+            dialer::{DialDestination, HysteriaTransport},
+            hysteria_transport::QuinnHysteriaTransport,
+            salamander_socket::{UdpObfs, parse_udp_obfs},
+        };
+
+        ensure_crypto_provider();
+
+        // finalmask JSON → gecko 配置（packetSize 字符串区间，Go Int32Range 形态）
+        let fm: serde_json::Value = serde_json::from_str(
+            r#"{"udp":[{"type":"salamander","settings":{"password":"obfs-secret-1","packetSize":"512-1200"}}]}"#,
+        )
+        .unwrap();
+        let obfs = parse_udp_obfs(Some(&fm)).unwrap();
+        assert!(
+            matches!(obfs, Some(UdpObfs::Gecko(_))),
+            "packetSize must select gecko mode"
+        );
+
+        // 自签证书
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+        let server_tls = rustls::server::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.into()], key_der)
+            .unwrap();
+
+        let factory = QuinnListenerFactory::new(Arc::new(server_tls)).with_obfs(obfs.clone());
+        let proto_config = Arc::new(crate::proto_config::Config::default());
+        let quic_params = Arc::new(xray_proto::xray::transport::internet::QuicParams::default());
+        struct GeckoValidator;
+        impl crate::hub::AuthValidator for GeckoValidator {
+            fn validate(&self, auth: &str) -> Option<String> {
+                if auth == "obfs-secret" { Some("user".into()) } else { None }
+            }
+
+            fn count(&self) -> usize {
+                1
+            }
+        }
+        let validator: Option<Arc<dyn crate::hub::AuthValidator>> =
+            Some(Arc::new(GeckoValidator));
+
+        let (stream_tx, mut stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Arc<InterStreamConn>>();
+        let on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync> = Arc::new(move |s| {
+            let _ = stream_tx.send(s);
+        });
+
+        let listener = factory
+            .listen(
+                "127.0.0.1:0".parse().unwrap(),
+                proto_config,
+                quic_params,
+                crate::hub::MasqType::NotFound,
+                validator,
+                on_new_conn,
+                None,
+            )
+            .await
+            .expect("listen with gecko should succeed");
+        let server_addr = listener.local_addr();
+
+        let client_tls = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        let transport = Arc::new(
+            QuinnHysteriaTransport::new(client_tls, "0.0.0.0:0".parse().unwrap())
+                .expect("transport")
+                .with_obfs(obfs),
+        );
+
+        // dial + auth——QUIC 握手包（长头）在 gecko 分片内完成
+        let dest = DialDestination { udp_addr: server_addr, host: "localhost".into() };
+        let qc = crate::dialer::QuicConfig::default_for_hysteria();
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            transport.dial_and_authenticate(&dest, &qc, "obfs-secret", 0),
+        )
+        .await
+        .expect("dial+auth should not hang under gecko")
+        .expect("dial + auth through gecko should succeed");
+
+        // bidi stream echo（握手后短头包透传 + 长头路径均被行使）
+        let stream = transport.open_stream(&conn).await.expect("open_stream");
+        let isc =
+            Arc::new(InterStreamConn::new(stream, conn.local_addr(), conn.remote_addr(), true));
+        let payload = b"gecko obfs echo!";
+        isc.write(payload).await.expect("client write");
+
+        let server_isc = tokio::time::timeout(std::time::Duration::from_secs(10), stream_rx.recv())
+            .await
+            .expect("server should receive stream via on_new_conn")
+            .expect("channel not empty");
+
+        let mut buf = vec![0u8; payload.len()];
+        server_isc.read(&mut buf).await.expect("server read");
+        assert_eq!(&buf, payload);
+        server_isc.write(&buf).await.expect("server echo write");
+
+        let mut got = vec![0u8; payload.len()];
+        isc.read(&mut got).await.expect("client read echo");
+        assert_eq!(&got, payload, "echo roundtrip through gecko-obfuscated QUIC");
 
         let _ = listener.close().await;
     }

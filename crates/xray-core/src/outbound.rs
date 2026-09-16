@@ -813,7 +813,7 @@ fn build_protocol_handler(
                 .with_custom_certificate_verifier(Arc::new(NoVerifier))
                 .with_no_client_auth();
             let stream_settings = xray_transport::dialer::StreamSettings::from_json(ob.stream_settings_json.as_ref());
-            let salamander = xray_transport_hysteria::salamander_socket::parse_salamander_obfs(
+            let obfs = xray_transport_hysteria::salamander_socket::parse_udp_obfs(
                 stream_settings.finalmask_json.as_ref(),
             ).map_err(|e| format!("hysteria finalmask: {e}"))?;
             // streamSettings.finalmask.quicParams → HysteriaConfig（brutal/CC/windows/keepAlive）
@@ -825,7 +825,7 @@ fn build_protocol_handler(
             let transport = xray_transport_hysteria::hysteria_transport::QuinnHysteriaTransport::new(
                 tls_config, "0.0.0.0:0".parse().map_err(|e| format!("bind addr: {e}"))?,
             ).map_err(|e| format!("hysteria transport: {e}"))?
-                .with_salamander(salamander);
+                .with_obfs(obfs);
             let dial_fn = xray_proxy_hysteria::make_hysteria_dial_fn(config, Arc::new(transport));
             wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
         }
@@ -1216,6 +1216,24 @@ fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutboundConfig, S
         .to_string();
     let level = user.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let email = user.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    // testseed/testpre（Go infra/conf/vless.go:296-321）：simplified 顶层形式读
+    // settings 顶层字段；标准 vnext 形式读 user json。Rust 统一为 user 字段
+    // 优先、顶层回退（两分支各自语义等价覆盖）。
+    let testseed = user
+        .get("testseed")
+        .or_else(|| v.get("testseed"))
+        .and_then(|s| s.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_u64().map(|n| n as u32))
+                .collect::<Vec<u32>>()
+        })
+        .unwrap_or_default();
+    let testpre = user
+        .get("testpre")
+        .or_else(|| v.get("testpre"))
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0) as u32;
     Ok(VlessOutboundConfig::new(
         uuid,
         Address::Domain(address.to_string()),
@@ -1223,7 +1241,9 @@ fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutboundConfig, S
     )
     .with_flow(flow)
     .with_encryption(encryption.clone())
-    .with_encryption_params(xray_proxy_vless::encryption::parse_client_encryption(&encryption)))
+    .with_encryption_params(xray_proxy_vless::encryption::parse_client_encryption(&encryption))
+    .with_testseed(testseed)
+    .with_testpre(testpre))
 }
 
 /// 解析 trojan outbound settings JSON → TrojanOutboundConfig。
@@ -3271,6 +3291,45 @@ mod tests {
             Address::Domain(d) => assert_eq!(d, "server.example.com"),
             other => panic!("expected Domain, got {other:?}"),
         }
+    }
+
+    /// 8i4c：testseed/testpre 解析。标准 vnext 形式 user 级优先；扁平形式读
+    /// settings 顶层（Go vless.go:296-321 两分支等价覆盖）。
+    #[test]
+    fn parse_vless_config_testseed_testpre() {
+        // 标准 vnext：user 级 testseed + user 级 testpre。
+        let vnext = r#"{
+            "vnext": [{
+                "address": "s.example.com",
+                "port": 443,
+                "users": [{ "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+                            "testseed": [7,8,9,10], "testpre": 3 }]
+            }]
+        }"#;
+        let config = parse_vless_config(vnext.as_bytes()).unwrap();
+        assert_eq!(config.testseed, vec![7, 8, 9, 10]);
+        assert_eq!(config.testpre, 3);
+
+        // 扁平形式：顶层 testseed/testpre（simplified 分支）。
+        let flat = r#"{
+            "address": "flat.example.com",
+            "port": 443,
+            "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+            "testseed": [900,500,900,256],
+            "testpre": 2
+        }"#;
+        let config = parse_vless_config(flat.as_bytes()).unwrap();
+        assert_eq!(config.testseed, vec![900, 500, 900, 256]);
+        assert_eq!(config.testpre, 2);
+
+        // 缺省：空 seed + testpre=0（运行时兜底默认，对齐 Go len<4 分支）。
+        let bare = r#"{
+            "vnext": [{ "address": "b.example.com", "port": 443,
+                        "users": [{ "id": "b831381d-6324-4d53-ad4f-8cda48b30811" }] }]
+        }"#;
+        let config = parse_vless_config(bare.as_bytes()).unwrap();
+        assert!(config.testseed.is_empty());
+        assert_eq!(config.testpre, 0);
     }
 
     #[test]

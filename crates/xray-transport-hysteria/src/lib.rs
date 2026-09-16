@@ -43,6 +43,7 @@ pub mod conn;
 pub mod context;
 pub mod dialer;
 pub mod error;
+pub mod gecko_socket;
 pub mod hub;
 pub mod hysteria_transport;
 pub mod proto_config;

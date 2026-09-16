@@ -20,7 +20,7 @@ use quinn::{
     ClientConfig as QuinnClientConfig, Connection as QuinnConnection, Endpoint,
     crypto::rustls::QuicClientConfig,
 };
-use xray_transport::finalmask::salamander::SalamanderObfuscator;
+use crate::salamander_socket::UdpObfs;
 
 use crate::{
     conn::{QuicConn, QuicStream},
@@ -40,8 +40,8 @@ const AUTH_PADDING_MAX: usize = 2048;
 pub struct QuinnHysteriaTransport {
     client_config: QuinnClientConfig,
     bind_addr: SocketAddr,
-    /// salamander UDP 混淆（对应 Go dialer.go:170 `udpmaskManager`，None = 不包装）。
-    salamander: Option<Arc<SalamanderObfuscator>>,
+    /// UDP 混淆（salamander / gecko，对应 Go dialer.go:170 `udpmaskManager`，None = 不包装）。
+    obfs: Option<UdpObfs>,
 }
 
 impl QuinnHysteriaTransport {
@@ -58,14 +58,14 @@ impl QuinnHysteriaTransport {
         Ok(Self {
             client_config: QuinnClientConfig::new(Arc::new(quic)),
             bind_addr,
-            salamander: None,
+            obfs: None,
         })
     }
 
-    /// 注入 salamander UDP 混淆（builder 风格，None = 不包装）。
+    /// 注入 UDP 混淆（salamander / gecko；builder 风格，None = 不包装）。
     #[must_use]
-    pub fn with_salamander(mut self, obfs: Option<Arc<SalamanderObfuscator>>) -> Self {
-        self.salamander = obfs;
+    pub fn with_obfs(mut self, obfs: Option<UdpObfs>) -> Self {
+        self.obfs = obfs;
         self
     }
 }
@@ -84,20 +84,16 @@ impl HysteriaTransport for QuinnHysteriaTransport {
         let bind_addr = self.bind_addr;
         let auth_token = auth_token.to_string();
         let quic_cfg = quic_config.clone();
-        let salamander = self.salamander.clone();
+        let obfs = self.obfs.clone();
         Box::pin(async move {
             // 1. quinn endpoint（transport config 含可热切换 CC factory，auth 后协商）
             let (transport_cfg, cc_slot) =
                 crate::quinn_adapter::build_hysteria_transport_config(&quic_cfg);
             client_config.transport_config(Arc::new(transport_cfg));
-            // salamander：UDP socket 包 XOR 后经 abstract socket 交给 quinn
-            // （对应 Go dialer.go:170-179 pktConn 包装后再建 quic.Transport）
-            let mut endpoint = match &salamander {
-                Some(obfs) => {
-                    crate::salamander_socket::SalamanderSocket::bind(obfs.clone(), bind_addr)
-                        .await?
-                        .client_endpoint()?
-                },
+            // obfs：UDP socket 包混淆（salamander XOR / gecko 分片）后经 abstract
+            // socket 交给 quinn（对应 Go dialer.go:170-179 pktConn 包装后再建 quic.Transport）
+            let mut endpoint = match &obfs {
+                Some(kind) => kind.client_endpoint(bind_addr).await?,
                 None => Endpoint::client(bind_addr)
                     .map_err(|e| io::Error::other(format!("quinn endpoint: {e}")))?,
             };

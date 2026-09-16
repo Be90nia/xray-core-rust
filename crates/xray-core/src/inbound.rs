@@ -3123,16 +3123,42 @@ fn build_vless_validator(data: &[u8]) -> std::io::Result<std::sync::Arc<dyn Vles
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("vless inbound settings JSON: {e}")))?;
     let validator = VlessMemoryValidator::new();
+    // settings 级 testseed（Go VLessInboundConfig.Testseed，json `testseed`）。
+    let cfg_testseed: Vec<u32> = v
+        .get("testseed")
+        .and_then(|s| s.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_u64().map(|n| n as u32))
+                .collect::<Vec<u32>>()
+        })
+        .unwrap_or_default();
+    fn user_testseed(c: &serde_json::Value) -> Vec<u32> {
+        c.get("testseed")
+            .and_then(|s| s.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_u64().map(|n| n as u32))
+                    .collect::<Vec<u32>>()
+            })
+            .unwrap_or_default()
+    }
     if let Some(clients) = v.get("clients").and_then(|c| c.as_array()) {
         for c in clients {
             let id = c.get("id").and_then(|x| x.as_str()).unwrap_or("");
             let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let level = c.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
             let flow = c.get("flow").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            // user 级 testseed 不足 4 个 → settings 级覆盖（Go vless.go:80-82）。
+            let mut testseed = user_testseed(c);
+            if testseed.len() < 4 {
+                testseed = cfg_testseed.clone();
+            }
             let proto = VlessProtoAccount {
                 id: id.to_string(),
                 flow,
                 encryption: "none".to_string(),
+                testseed,
                 ..Default::default()
             };
             let account = VlessMemoryAccount::from_proto_account(&proto)
@@ -3705,10 +3731,11 @@ fn parse_hysteria_inbound_config(
     } else {
         config
     };
-    // salamander UDP 混淆：streamSettings.finalmask.udp[]（对应 Go UdpmaskManager）
-    let salamander = xray_transport_hysteria::salamander_socket::parse_salamander_obfs(finalmask_json)?;
+    // UDP 混淆 salamander/gecko：streamSettings.finalmask.udp[]（对应 Go UdpmaskManager，
+    // settings.packetSize 切 Gecko 分片模式）
+    let obfs = xray_transport_hysteria::salamander_socket::parse_udp_obfs(finalmask_json)?;
     let factory: Arc<dyn xray_transport_hysteria::hub::HysteriaListenerFactory> =
-        Arc::new(QuinnListenerFactory::new(Arc::new(server_config)).with_salamander(salamander));
+        Arc::new(QuinnListenerFactory::new(Arc::new(server_config)).with_obfs(obfs));
     Ok((config, factory))
 }
 
@@ -6006,6 +6033,38 @@ mod tests {
         assert!(VlessValidatorTrait::get(&*validator, &b).is_some());
         let bad = xray_common::uuid::UUID::parse("d342d11e-d424-4583-b36e-524ab1f0afa4").expect("uuid bad");
         assert!(VlessValidatorTrait::get(&*validator, &bad).is_none());
+    }
+
+    /// 8i4c：testseed 两级流转（Go vless.go:80-82）——user 级 ≥4 个生效；
+    /// 不足 4 个（含缺省）时 settings 级覆盖；两侧都缺 → 空（运行时兜底默认）。
+    #[test]
+    fn build_vless_validator_testseed_user_over_settings_fallback() {
+        let ua = "b831381d-6324-4d53-ad4f-8cda48b30811";
+        let ub = "66ad4540-b58c-4ad2-9926-ea63445a9b57";
+        let uc = "d342d11e-d424-4583-b36e-524ab1f0afa4";
+        let settings = serde_json::json!({
+            "clients": [
+                { "id": ua, "testseed": [1, 2, 3, 4, 5] },   // user 级 ≥4 → 原样
+                { "id": ub, "testseed": [9] },               // user 级 <4 → settings 级覆盖
+                { "id": uc },                                 // user 级缺省 → settings 级覆盖
+            ],
+            "testseed": [7, 8, 9, 10],
+            "decryption": "none",
+        });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let validator = super::build_vless_validator(&data).unwrap();
+        use xray_proxy_vless::Validator as VlessValidatorTrait;
+        let seed_of = |id: &str| {
+            let uuid = xray_common::uuid::UUID::parse(id).unwrap();
+            VlessValidatorTrait::get(&*validator, &uuid)
+                .expect("user registered")
+                .account
+                .testseed
+                .clone()
+        };
+        assert_eq!(seed_of(ua), vec![1, 2, 3, 4, 5], "user-level seed wins when >= 4");
+        assert_eq!(seed_of(ub), vec![7, 8, 9, 10], "short user seed overridden by settings");
+        assert_eq!(seed_of(uc), vec![7, 8, 9, 10], "missing user seed falls back to settings");
     }
 
     #[test]

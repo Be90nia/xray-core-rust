@@ -83,11 +83,12 @@ async fn listen_hysteria(
         )
     })?;
 
-    // salamander UDP 混淆（Go hysteria/hub.go:301-306：`UdpmaskManager.
+    // UDP 混淆 salamander/gecko（Go hysteria/hub.go:301-306：`UdpmaskManager.
     // WrapPacketConnServer` 包装 pktConn 后再交给 quic.Transport.Listen；
-    // Rust 经 quinn AsyncUdpSocket 注入，finalmask_json.udp[].salamander 配置）。
-    let factory = QuinnListenerFactory::new(tls_cfg).with_salamander(
-        crate::salamander_socket::parse_salamander_obfs(settings.finalmask_json.as_ref())?,
+    // Rust 经 quinn AsyncUdpSocket 注入，finalmask_json.udp[].salamander 配置，
+    // settings.packetSize 切 Gecko 分片模式）。
+    let factory = QuinnListenerFactory::new(tls_cfg).with_obfs(
+        crate::salamander_socket::parse_udp_obfs(settings.finalmask_json.as_ref())?,
     );
     let config = Arc::new(parse_hysteria_config(settings.transport_json.as_ref())?);
     let quic_params = Arc::new(
@@ -229,10 +230,10 @@ async fn dial_hysteria(
     let bind_addr: SocketAddr = "0.0.0.0:0".parse().map_err(|e: std::net::AddrParseError| {
         io::Error::other(format!("invalid bind addr: {e}"))
     })?;
-    // salamander UDP 混淆（Go hysteria/dialer.go:170-175：`UdpmaskManager.
+    // UDP 混淆 salamander/gecko（Go hysteria/dialer.go:170-175：`UdpmaskManager.
     // WrapPacketConnClient` 包装 pktConn 后再交给 quic.Transport.DialEarly）。
-    let transport = QuinnHysteriaTransport::new(tls_client_config, bind_addr)?.with_salamander(
-        crate::salamander_socket::parse_salamander_obfs(settings.finalmask_json.as_ref())?,
+    let transport = QuinnHysteriaTransport::new(tls_client_config, bind_addr)?.with_obfs(
+        crate::salamander_socket::parse_udp_obfs(settings.finalmask_json.as_ref())?,
     );
     let quic_params = Arc::new(
         crate::quic_params::parse_quic_params(settings.finalmask_json.as_ref())?
