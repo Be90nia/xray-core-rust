@@ -249,6 +249,11 @@ impl Connection for TcpConnection {
             }
         }
     }
+    /// 裸 TCP 连接保持 splice 准入信号（fb0e7ba 引入；fc9050c 误删致 Linux
+    /// splice 准入 outbound_raw 恒 false——此处恢复）。
+    fn is_raw_tcp(&self) -> bool {
+        true
+    }
     fn close_read(&mut self) -> io::Result<()> {
         #[cfg(unix)]
         {
