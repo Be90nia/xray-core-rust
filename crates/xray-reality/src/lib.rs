@@ -19,8 +19,10 @@
 //! - [`error`] / [`util`]
 //!
 //! ## 已知缺口
-//! - mldsa65 后量子证书签名：rustls `ResolvesServerCert::resolve()` 拿不到 ServerHello
-//!   字节（见 [`mitm::generate_reality_ed25519_cert_mldsa65`]；后继票 tvky）
+//! - mldsa65 后量子证书**签名生成**：rustls `ResolvesServerCert::resolve()` 拿不到
+//!   ServerHello 字节（见 [`mitm::generate_reality_ed25519_cert_mldsa65`]）。tvky
+//!   已落地：X25519MLKEM768 hybrid KX（服务端 key_share 解析）+ mldsa65 公钥派生
+//!   + 客户端验签原语；签名生成仍 stub。
 //! - http2 spider 爬行（fallback 探测路径；`spider_x` 已解析保留，爬行未实现）
 //! - btls 全指纹 e2e 矩阵 `#[ignore]`（btls transcript mismatch，待 fork 注入 API）
 //!
@@ -43,5 +45,7 @@ pub use util::{get_path_locked, open_key_log_writer};
 
 pub use crypto::{
     AEAD_NONCE_LEN, AUTH_KEY_LEN, HKDF_INFO, HKDF_SALT_LEN, SESSION_ID_LEN,
-    derive_auth_key, encode_session_id, encrypt_session_id, verify_reality_certificate,
+    MLDSA65_PUBKEY_LEN, MLDSA65_SEED_LEN, MLDSA65_SIG_LEN,
+    derive_auth_key, derive_mldsa65_pubkey, encode_session_id, encrypt_session_id,
+    verify_mldsa65_signature, verify_reality_certificate,
 };

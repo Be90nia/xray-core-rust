@@ -101,6 +101,14 @@ pub enum RealityError {
     #[error("REALITY: mldsa65 certificate signing not yet implemented in Rust")]
     Mldsa65NotImplemented,
 
+    /// ML-DSA-65 验签失败（公钥/签名解码失败，多为脏数据或长度错）。
+    /// tvky：与 `Mldsa65NotImplemented` 不同——验签原语已可用，仅签名生成
+    /// 因拿不到 ServerHello 字节受限。客户端若配 `mldsa65Verify` 且服务端
+    /// 未带 mldsa65 扩展，Go 端会回退到标准 x509 验证（仍会失败），Rust 端
+    /// 当前回退路径也未实现。
+    #[error("REALITY: mldsa65 signature decode failed")]
+    Mldsa65VerifyFailed,
+
     /// fs0o: 客户端 TLS legacy_version 低于配置的 `min_client_ver`（Go
     /// `MinClientVer=[26,3,27]` 即 Xray-core v26.3.27 版本门控）。
     #[error("REALITY: client version too old")]
