@@ -55,3 +55,7 @@ pub use proxy_protocol::{build_proxy_header, read_proxy_protocol};
 /// TLS acceptor for inbound connections.
 /// Re-exported so proxy crates don't need a direct `tokio-rustls` dependency.
 pub use tokio_rustls::TlsAcceptor;
+/// Re-exported so proxy crates can inspect negotiated TLS parameters (e.g.
+/// `ServerConnection::protocol_version` for VLESS XRV outer-TLS1.3 gating)
+/// without a direct `rustls` dependency.
+pub use rustls;

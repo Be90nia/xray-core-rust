@@ -2199,6 +2199,12 @@ async fn serve_reality_vless(
         tokio::spawn(async move {
             match server_tls(stream, &key, &ids, max_diff, &min_ver, &max_ver, &names).await {
                 Ok(RealityServerOutcome::Verified(tls)) => {
+                    // lwep（Go inbound.go:577-579）：REALITY 验证通过即 rustls TLS1.3，
+                    // XRV 的外层 TLS1.3 门恒真。
+                    let mut options = options;
+                    if let Some(o) = options.as_mut() {
+                        o.outer_tls13 = true;
+                    }
                     if let Err(e) = xray_proxy_vless::handle_vless_connection(
                         tls,
                         &handler,
