@@ -1664,6 +1664,14 @@ tokio::task_local! {
     pub static INBOUND_SPLICE: InboundSpliceMeta;
 }
 
+/// splice 准入激活累计（txno-splice 生产观测：零拷贝下行快路径接管连接数）。
+///
+/// [`DialBridge::dispatch`] 桥接判定每准入一连接 +1；Windows/macOS（平台闸门）
+/// 与未准入连接恒不增。e2e 以增量断言激活路径真实接管
+/// （xray-core `integration_splice_admitted_two_stack_echo`）。
+pub static SPLICE_ADMISSIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// 代理链配置。
 struct ProxyChainConfig {
     /// 代理链目标 tag（对应 Go `senderSettings.ProxySettings.Tag`）。
@@ -1804,6 +1812,9 @@ impl DispatchHandler for DialBridge {
                             remote.is_raw_tcp(),
                         );
                     splice_admitted.store(admitted, std::sync::atomic::Ordering::Relaxed);
+                    if admitted {
+                        SPLICE_ADMISSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     tracing::debug!(
                         admitted,
                         inbound_can = inbound.can_splice_copy,
@@ -4353,15 +4364,16 @@ mod tests {
     /// `INBOUND_SPLICE` scope（freedom `PROXY_PROTO_SRC` 同模式），出站为真裸
     /// TCP。断言随 [`xray_common::platform::splice::splice_allowed`] 的真实
     /// 判定分叉：
-    /// - **准入了**（Linux/Android + `XRAY_BUF_SPLICE=1`，容器床跑法）：
+    /// - **准入了**（Linux/Android 且 env 开——缺省不设即开，容器床跑法）：
     ///   下行零拷贝直达入站 raw fd——**绕过 link.writer 正是 splice 的语义**
     ///   （Go responseDone 直写 inbound.Conn）——echo 必须从入站 raw conn 读到，
     ///   且 `splice_admitted()==true`；
     /// - **未准入**（Windows/macOS 平台闸门，或 env 未开）：回退既有泵，
     ///   echo 经 link.writer 流通，`splice_admitted()==false`。
     ///
-    /// 激活路径跑法（容器床）：`XRAY_BUF_SPLICE=1 cargo test -p
-    /// xray-app-dispatcher --lib dialbridge`。
+    /// 激活路径跑法（容器床）：env 不设（三态缺省开）或 `XRAY_BUF_SPLICE=enable
+    /// cargo test -p xray-app-dispatcher --lib dialbridge`。注意 `=1` 是
+    /// **关闭**值（parse_enabled_env 精确匹配 auto|enable，其余一律禁用）。
     #[tokio::test]
     async fn dialbridge_splice_gated_falls_back_and_flows() {
         use std::net::SocketAddr;
