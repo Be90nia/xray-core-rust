@@ -377,6 +377,18 @@ mod tests {
 
     static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
+    /// cfg.build() 走 lint 后处理 stages + 进程 env 注入；与 lint::tests::TEST_LOCK
+    /// 共用一把串行化所有 build() 测试——bd 5x41 同族，CI run 35087312070
+    /// macOS 并行下未持锁的 built.rs::build_apps_have_correct_kinds 踩到
+    /// registry 残留 Boom 阶段炸 "rejected by postprocessing stage boom: kaboom"。
+    /// 锁内重置注册表并装回内置 stages（serial.rs:502 先例），单测试一行收编。
+    fn registry_lock() -> parking_lot::MutexGuard<'static, ()> {
+        let g = crate::lint::tests::TEST_LOCK.lock();
+        crate::lint::clear_stages();
+        crate::init::register_builtin_stages();
+        g
+    }
+
     const MINIMAL_CONFIG: &str = r#"{
         "inbounds": [
             {
@@ -399,9 +411,10 @@ mod tests {
 
     #[test]
     fn build_injects_env_vars() {
-        // Go xray.go:532-536：Build 第一步把 env 逐 key os.Setenv 注入进程环境，
-        // 使后续 env:VAR 值展开（PostProcessConfigureFile）能读到配置注入的变量。
+        // 锁序：先 ENV 后 TEST（与其它测试一致 TEST→ENV/单锁无嵌套；此处 ENV 优先
+        // 因 env 注入在 build 内读，TEST 锁期间 registry 重置不影响 env 行为）。
         let _g = ENV_LOCK.lock();
+        let _r = registry_lock();
         let probe = "XRAY_CONF_BUILD_ENV_PROBE";
         unsafe { std::env::remove_var(probe) };
 
@@ -416,6 +429,7 @@ mod tests {
 
     #[test]
     fn build_minimal_config_counts() {
+        let _g = registry_lock();
         let cfg = Config::from_json_str(MINIMAL_CONFIG).expect("parse");
         let built = cfg.build().expect("build");
         // log + routing = 2 apps
@@ -426,6 +440,7 @@ mod tests {
 
     #[test]
     fn build_apps_have_correct_kinds() {
+        let _g = registry_lock();
         let cfg = Config::from_json_str(MINIMAL_CONFIG).unwrap();
         let built = cfg.build().unwrap();
         let kinds: Vec<&str> = built.apps.iter().map(|a| a.kind.as_str()).collect();
@@ -437,6 +452,7 @@ mod tests {
 
     #[test]
     fn build_apps_data_is_json_bytes() {
+        let _g = registry_lock();
         let cfg = Config::from_json_str(MINIMAL_CONFIG).unwrap();
         let built = cfg.build().unwrap();
         let log_entry = built.apps.iter().find(|a| a.kind == "log").unwrap();
@@ -446,6 +462,7 @@ mod tests {
 
     #[test]
     fn build_inbound_preserves_tag_and_protocol() {
+        let _g = registry_lock();
         let cfg = Config::from_json_str(MINIMAL_CONFIG).unwrap();
         let built = cfg.build().unwrap();
         let ib = &built.inbounds[0];
@@ -462,6 +479,7 @@ mod tests {
 
     #[test]
     fn build_outbound_preserves_tag_and_protocol() {
+        let _g = registry_lock();
         let cfg = Config::from_json_str(MINIMAL_CONFIG).unwrap();
         let built = cfg.build().unwrap();
         let direct = built
@@ -485,6 +503,7 @@ mod tests {
 
     #[test]
     fn build_outbound_target_strategy_passthrough() {
+        let _g = registry_lock();
         let json = r#"{
             "outbounds": [
                 { "protocol": "freedom", "tag": "direct", "targetStrategy": "UseIP" },
@@ -499,6 +518,7 @@ mod tests {
 
     #[test]
     fn build_outbound_target_strategy_invalid_rejected() {
+        let _g = registry_lock();
         // Go infra/conf/xray.go:280-281：非法值 Build 硬报错。
         let json = r#"{
             "outbounds": [
@@ -515,6 +535,7 @@ mod tests {
 
     #[test]
     fn build_empty_config() {
+        let _g = registry_lock();
         let cfg: Config = serde_json::from_str("{}").unwrap();
         let built = cfg.build().unwrap();
         assert_eq!(built.app_count(), 0);
@@ -524,6 +545,7 @@ mod tests {
 
     #[test]
     fn build_deprecated_transport_errors() {
+        let _g = registry_lock();
         let json = r#"{ "transport": { "http": { "path": "/x" } } }"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
         let err = cfg.build().unwrap_err();
@@ -539,6 +561,7 @@ mod tests {
 
     #[test]
     fn build_reverse_config_errors() {
+        let _g = registry_lock();
         // Go infra/conf/xray.go: `c.Reverse != nil` → PrintRemovedFeatureError。
         let json = r#"{ "reverse": { "bridges": [ { "tag": "b", "domain": "test.example.com" } ] } }"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
@@ -555,6 +578,7 @@ mod tests {
 
     #[test]
     fn build_fakedns_and_burst_observatory_camel_case() {
+        let _g = registry_lock();
         let json = r#"{
             "fakeDns": { "pools": [] },
             "burstObservatory": { "subjectSelector": ["p1"], "pingConfig": { "destination": "https://x" } }
@@ -571,6 +595,7 @@ mod tests {
     /// transportLayer=true → tag 注入 sockopt.dialerProxy，proxySettings 清空。
     #[test]
     fn build_transport_layer_proxy_injects_dialer_proxy() {
+        let _g = registry_lock();
         let json = r#"{
             "outbounds": [
                 {
@@ -594,6 +619,7 @@ mod tests {
     /// transportLayer=true 且无 streamSettings → 创建 sockopt 容器。
     #[test]
     fn build_transport_layer_proxy_without_stream_settings() {
+        let _g = registry_lock();
         let json = r#"{
             "outbounds": [
                 {
@@ -615,6 +641,7 @@ mod tests {
     /// transportLayer 缺省（false）→ 原样保留（应用层链路，Go xray.go:328）。
     #[test]
     fn build_plain_proxy_settings_passthrough() {
+        let _g = registry_lock();
         let json = r#"{
             "outbounds": [
                 {
@@ -635,6 +662,7 @@ mod tests {
     /// proxySettings.tag 与 sockopt.dialerProxy 同时设置 → 冲突报错（Go xray.go:248-250）。
     #[test]
     fn build_tag_conflicts_with_dialer_proxy_errors() {
+        let _g = registry_lock();
         let json = r#"{
             "outbounds": [
                 {
@@ -654,6 +682,7 @@ mod tests {
 
     #[test]
     fn built_entry_data_roundtrips_through_serde_json() {
+        let _g = registry_lock();
         // 验证 data 字段确实是合法 JSON 字节
         let cfg = Config::from_json_str(MINIMAL_CONFIG).unwrap();
         let built = cfg.build().unwrap();
@@ -669,6 +698,7 @@ mod tests {
     /// 6k4h: UDS listen（域套接字路径）允许无 port（Go xray.go:140-168 豁免）。
     #[test]
     fn build_inbound_uds_path_no_port_ok() {
+        let _g = registry_lock();
         let json = r#"{
             "inbounds": [
                 { "protocol": "vless", "tag": "uds-in", "listen": "/tmp/xray.sock" }
@@ -687,6 +717,7 @@ mod tests {
     /// 6k4h: `@`-prefixed abstract UDS 路径也允许无 port。
     #[test]
     fn build_inbound_abstract_uds_path_no_port_ok() {
+        let _g = registry_lock();
         let json = r#"{
             "inbounds": [
                 { "protocol": "vless", "tag": "abs", "listen": "@xray" }
@@ -701,6 +732,7 @@ mod tests {
     /// 6k4h: protocol=tun 不需要 port（Go xray.go:140-143 豁免）。
     #[test]
     fn build_inbound_tun_no_port_ok() {
+        let _g = registry_lock();
         let json = r#"{
             "inbounds": [
                 { "protocol": "tun", "tag": "tun0" }
@@ -716,6 +748,7 @@ mod tests {
     /// 6k4h: 其它协议（vless）无 port 仍应硬报错（保持原行为）。
     #[test]
     fn build_inbound_no_port_no_uds_still_errors() {
+        let _g = registry_lock();
         let json = r#"{
             "inbounds": [
                 { "protocol": "vless", "tag": "in", "listen": "0.0.0.0" }
