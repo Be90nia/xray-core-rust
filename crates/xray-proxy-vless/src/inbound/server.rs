@@ -538,15 +538,20 @@ where
 
     // flow=xtls-rprx-vision：join 读写半流 → VisionConn 包装（uuid 用解码用户）
     // → 重新 split；非 vision 同样 join+split（零开销适配器，统一类型）。
+    // testseed：服务端用**本端账号**的 padding 参数（对应 Go EncodeBodyAddons →
+    // NewVisionWriter(account.Testseed)——下行 seed 取服务端账户配置，不上 wire）。
+    let seed: &[u32] = decoded
+        .user
+        .as_ref()
+        .map_or(&[][..], |u| u.account.testseed.as_slice());
     let stream: Box<dyn VlessStream> = match (vision_uuid, raw_tcp) {
-        (Some(uuid), Some(raw)) => Box::new(VisionConn::new_server(
-            tokio::io::join(reader, write_half),
-            uuid,
-            raw,
-        )),
-        (Some(uuid), None) => {
-            Box::new(VisionConn::new(tokio::io::join(reader, write_half), uuid))
-        }
+        (Some(uuid), Some(raw)) => Box::new(
+            VisionConn::new_server(tokio::io::join(reader, write_half), uuid, raw)
+                .with_padding_seed(seed),
+        ),
+        (Some(uuid), None) => Box::new(
+            VisionConn::new(tokio::io::join(reader, write_half), uuid).with_padding_seed(seed),
+        ),
         (None, _) => Box::new(tokio::io::join(reader, write_half)),
     };
     let (rh, wh) = tokio::io::split(stream);
@@ -804,11 +809,11 @@ mod tests {
 
     /// 构造测试用 validator + 已注册用户的 UUID。
     fn make_validator_with_user() -> (UUID, Arc<dyn Validator>) {
-        make_validator_with_user_flow("")
+        make_validator_with_user_flow("", &[])
     }
 
     /// 同上，但账号 `flow` 可指定（lwep 五臂校验测试需要 XRV 账号）。
-    fn make_validator_with_user_flow(flow: &str) -> (UUID, Arc<dyn Validator>) {
+    fn make_validator_with_user_flow(flow: &str, testseed: &[u32]) -> (UUID, Arc<dyn Validator>) {
         let uuid = UUID::new();
         let user = MemoryUser {
             level: 0,
@@ -817,6 +822,7 @@ mod tests {
                 &xray_proto::xray::proxy::vless::Account {
                     id: uuid.to_string(),
                     flow: flow.to_string(),
+                    testseed: testseed.to_vec(),
                     ..Default::default()
                 },
             )
@@ -1060,10 +1066,10 @@ mod tests {
             other => panic!("expected auth rejection, got {other:?}"),
         }
     }
-
     async fn spawn_vless_proxy_with_echo(
         outer_tls13: bool,
         account_flow: &str,
+        server_seed: &[u32],
     ) -> (std::net::SocketAddr, u16, UUID) {
         let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_port = echo_listener.local_addr().unwrap().port();
@@ -1085,8 +1091,7 @@ mod tests {
         let ohm = Arc::new(SimpleOhm::new());
         ohm.set_default(Arc::new(DialBridge::new("freedom", make_freedom_dial_fn()))
             as Arc<dyn xray_app_dispatcher::DispatchHandler>);
-
-        let (uuid, validator) = make_validator_with_user_flow(account_flow);
+        let (uuid, validator) = make_validator_with_user_flow(account_flow, server_seed);
         let vless_listener = InboundTcpListener::bind(
             "127.0.0.1:0",
             xray_transport::sockopt::SocketOptions::default(),
@@ -1116,8 +1121,8 @@ mod tests {
     async fn vless_inbound_pads_downlink_when_flow_xrv() {
         use crate::encryption::vision::COMMAND_PADDING_CONTINUE;
         use tokio::time::{timeout, Duration};
-
-        let (vless_addr, echo_port, uuid) = spawn_vless_proxy_with_echo(true, crate::FLOW_XRV).await;
+        let (vless_addr, echo_port, uuid) =
+            spawn_vless_proxy_with_echo(true, crate::FLOW_XRV, &[]).await;
 
         let mut client = tokio::net::TcpStream::connect(vless_addr).await.unwrap();
         let mut addons = empty_addons();
@@ -1161,8 +1166,8 @@ mod tests {
     async fn vless_vision_e2e_client_and_server_roundtrip() {
         use crate::dispatcher::{make_dial_fn, VlessOutboundConfig};
         use tokio::time::{timeout, Duration};
-
-        let (vless_addr, echo_port, uuid) = spawn_vless_proxy_with_echo(true, crate::FLOW_XRV).await;
+        let (vless_addr, echo_port, uuid) =
+            spawn_vless_proxy_with_echo(true, crate::FLOW_XRV, &[]).await;
 
         let cfg = Arc::new(
             VlessOutboundConfig::new(
@@ -1187,13 +1192,130 @@ mod tests {
         assert_eq!(&got, payload);
     }
 
+    /// 8i4c：testseed 有无 × 双端组合 e2e。testseed 是**本地 padding 参数**
+    ///（Go EncodeBodyAddons → NewVisionWriter(account.Testseed)，不上 wire、
+    /// 无协商）——任意组合下 wire 帧格式不变，双向 echo 都必须照常成功。
+    #[tokio::test]
+    async fn vless_testseed_combinations_e2e_wire_unchanged() {
+        use crate::dispatcher::{make_dial_fn, VlessOutboundConfig};
+        use tokio::time::{timeout, Duration};
+
+        const SEED: &[u32] = &[7, 8, 9, 10];
+        // (client_seed, server_seed)：同 seed / 仅客户端 / 仅服务端（全无为既有 e2e 覆盖）。
+        for (client_seed, server_seed, label) in [
+            (SEED, SEED, "both"),
+            (SEED, &[][..], "client-only"),
+            (&[][..], SEED, "server-only"),
+        ] {
+            let (vless_addr, echo_port, uuid) =
+                spawn_vless_proxy_with_echo(true, crate::FLOW_XRV, server_seed).await;
+            let cfg = Arc::new(
+                VlessOutboundConfig::new(
+                    uuid,
+                    Address::from_ipv4_bytes([127, 0, 0, 1]),
+                    Port::new(vless_addr.port()),
+                )
+                .with_flow(crate::FLOW_XRV)
+                .with_testseed(client_seed.to_vec()),
+            );
+            let dial = make_dial_fn(cfg);
+            let dest =
+                Destination::tcp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(echo_port));
+            let mut conn = dial(&dest).await.unwrap_or_else(|e| panic!("{label}: dial {e}"));
+            let payload = format!("{label}: testseed combo roundtrip");
+            conn.write_all(payload.as_bytes()).await.unwrap();
+            conn.flush().await.unwrap();
+            let mut got = vec![0u8; payload.len()];
+            timeout(Duration::from_secs(10), conn.read_exact(&mut got))
+                .await
+                .unwrap_or_else(|_| panic!("{label}: echo timeout"))
+                .unwrap();
+            assert_eq!(&got, payload.as_bytes(), "{label}: echo mismatch");
+        }
+    }
+
+    /// 8i4c：testpre=2 预连接 e2e。worker 预拨 2 条裸 TCP 挂池，首次 dial 应
+    /// 命中池中连接（免 TCP 握手）照常走请求头 + echo；后续 dial miss 直拨 +
+    /// worker 补货循环。全链路 roundtrip 不受预连接影响。
+    #[tokio::test]
+    async fn vless_testpre_preconnect_e2e_roundtrip() {
+        use crate::dispatcher::{make_dial_fn, VlessOutboundConfig};
+        use tokio::time::{timeout, Duration};
+
+        // 多连接 echo（testpre worker 会预拨 + 补货，单 accept 不够）。
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = echo_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if sock.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        // vless server（flow 空）：装配同 spawn_vless_proxy_with_echo，独立起。
+        let ohm = Arc::new(SimpleOhm::new());
+        ohm.set_default(Arc::new(DialBridge::new("freedom", make_freedom_dial_fn()))
+            as Arc<dyn xray_app_dispatcher::DispatchHandler>);
+        let (uuid, validator) = make_validator_with_user_flow("", &[]);
+        let vless_listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        )
+        .await
+        .unwrap();
+        let vless_addr = vless_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = serve_vless(vless_listener, ohm, validator, None, None, None).await;
+        });
+
+        let cfg = Arc::new(
+            VlessOutboundConfig::new(
+                uuid,
+                Address::from_ipv4_bytes([127, 0, 0, 1]),
+                Port::new(vless_addr.port()),
+            )
+            .with_testpre(2),
+        );
+        let dial = make_dial_fn(cfg);
+        let dest = Destination::tcp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(echo_port));
+
+        // 等 worker 预拨 2 条入池（0ms + 200ms 节奏 + 余量）。
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        // 3 次拨号：命中池 ×2 → miss 直拨（worker 同时补货）。全部 echo 成功。
+        for i in 0..3 {
+            let mut conn = dial(&dest)
+                .await
+                .unwrap_or_else(|e| panic!("dial {i} through preconnect path: {e}"));
+            let payload = format!("preconnect roundtrip {i}");
+            conn.write_all(payload.as_bytes()).await.unwrap();
+            conn.flush().await.unwrap();
+            let mut got = vec![0u8; payload.len()];
+            timeout(Duration::from_secs(10), conn.read_exact(&mut got))
+                .await
+                .unwrap_or_else(|_| panic!("dial {i}: echo timeout"))
+                .unwrap();
+            assert_eq!(&got, payload.as_bytes(), "dial {i}: echo mismatch");
+        }
+    }
+
     /// 回归：flow 为空时 make_dial_fn 返回裸连接（无 Vision 包装），链路照常。
     #[tokio::test]
     async fn vless_no_flow_e2e_make_dial_fn_roundtrip() {
         use crate::dispatcher::{make_dial_fn, VlessOutboundConfig};
         use tokio::time::{timeout, Duration};
-
-        let (vless_addr, echo_port, uuid) = spawn_vless_proxy_with_echo(true, "").await;
+        let (vless_addr, echo_port, uuid) = spawn_vless_proxy_with_echo(true, "", &[]).await;
 
         let cfg = Arc::new(VlessOutboundConfig::new(
             uuid,
@@ -1700,7 +1822,7 @@ mod tests {
     /// 恶意 flow 公共断言：服务端校验失败必须断连且不发响应头（客户端读到 EOF）。
     async fn assert_flow_rejected(flow: &str, command: VlessCommand, outer_tls13: bool, account_flow: &str) {
         let (vless_addr, _echo_port, uuid) =
-            spawn_vless_proxy_with_echo(outer_tls13, account_flow).await;
+            spawn_vless_proxy_with_echo(outer_tls13, account_flow, &[]).await;
         let mut client = tokio::net::TcpStream::connect(vless_addr).await.unwrap();
         let mut addons = empty_addons();
         addons.flow = flow.to_string();
@@ -1732,8 +1854,7 @@ mod tests {
     async fn vless_inbound_rejects_unknown_flow() {
         // 恶意客户端手写 wire：encode_header_addons 对非 XRV flow 写空 addons
         //（Go EncodeHeaderAddons 同语义，addons.go:18-34），合法编码器发不出
-        // 未知 flow——必须手工构造 proto addons（field1=flow）模拟恶意输入。
-        let (vless_addr, _echo_port, uuid) = spawn_vless_proxy_with_echo(true, "").await;
+        let (vless_addr, _echo_port, uuid) = spawn_vless_proxy_with_echo(true, "", &[]).await;
         let mut client = tokio::net::TcpStream::connect(vless_addr).await.unwrap();
         let flow = b"xtls-rprx-doom";
         let mut addons_proto = Vec::new();

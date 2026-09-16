@@ -35,6 +35,21 @@ const BUF_SIZE: i32 = 8192;
 /// Vision 默认 padding seed（对齐 Go `NewVisionWriter` testseed 默认值）。
 pub const DEFAULT_PADDING_SEED: [u32; 4] = [900, 500, 900, 256];
 
+/// 账户级 testseed 归一化（对齐 Go `NewVisionWriter`：`len(testseed) < 4` 时
+/// 用默认值 `[900, 500, 900, 256]` 兜底；≥4 时只取前 4 个，Go 只索引 `[0..3]`）。
+///
+/// 对应 Go `proxy/vless/infra/conf` 的 `testseed` 字段：账户本地配置，**不上
+/// wire**——client 上行 padding 用自己账号的 seed，server 下行 padding 用服务端
+/// 账号的 seed，两侧独立无需协商。
+#[must_use]
+pub fn normalize_padding_seed(seed: &[u32]) -> [u32; 4] {
+    if seed.len() < 4 {
+        DEFAULT_PADDING_SEED
+    } else {
+        [seed[0], seed[1], seed[2], seed[3]]
+    }
+}
+
 /// TLS 1.3 cipher suite 名称查询（对齐 Go `Tls13CipherSuiteDic`）。
 ///
 /// 返回 `None` 表示未知 cipher。`TLS_AES_128_CCM_8_SHA256` 不触发 splice（Go 语义）。
@@ -488,6 +503,8 @@ pub fn can_splice_copy(state: &TrafficState, port: u16, is_udp: bool) -> SpliceD
 mod tests {
     use super::*;
     use rand::rng;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
 
     #[test]
     fn padding_basic_format_with_uuid() {
@@ -846,5 +863,49 @@ mod tests {
         assert_eq!(SpliceDecision::Splice, SpliceDecision::Splice);
         assert_ne!(SpliceDecision::Splice, SpliceDecision::NoSplice);
         assert_ne!(SpliceDecision::Splice, SpliceDecision::Pending);
+    }
+
+    #[test]
+    fn normalize_padding_seed_fallback_and_truncate() {
+        // 空 / 不足 4 → 默认（Go NewVisionWriter len<4 兜底）
+        assert_eq!(normalize_padding_seed(&[]), DEFAULT_PADDING_SEED);
+        assert_eq!(normalize_padding_seed(&[1, 2, 3]), DEFAULT_PADDING_SEED);
+        // 恰 4 → 原样；超 4 → 前 4（Go 只索引 [0..3]）
+        assert_eq!(normalize_padding_seed(&[7, 8, 9, 10]), [7, 8, 9, 10]);
+        assert_eq!(normalize_padding_seed(&[7, 8, 9, 10, 99]), [7, 8, 9, 10]);
+    }
+
+    /// testseed 注入只改 padding 长度分布，不改帧格式：固定 rng 下
+    /// 逐字节断言 `[uuid][command][content_len][padding_len][content][padding]`。
+    #[test]
+    fn xtls_padding_seed_changes_pad_len_not_frame_layout() {
+        let uuid = vec![0xABu8; 16];
+        let content = [0x11u8; 4];
+        // 同一 rng 状态分别以默认 seed 与自定义 seed 编码（对齐 Go XtlsPadding 公式）
+        let mk = |seed: &[u32; 4]| {
+            let mut rng = StdRng::from_seed([42u8; 32]);
+            let mut u = Some(uuid.clone());
+            xtls_padding(Some(&content), COMMAND_PADDING_CONTINUE, &mut u, true, seed, &mut rng)
+        };
+        let with_default = mk(&DEFAULT_PADDING_SEED);
+        let with_custom = mk(&[10, 20, 30, 40]);
+
+        for block in [&with_default, &with_custom] {
+            // 帧头逐字节：uuid(16) + command(1) + content_len(2)=4 + padding_len(2)
+            assert_eq!(&block[..16], &[0xABu8; 16], "uuid prefix");
+            assert_eq!(block[16], COMMAND_PADDING_CONTINUE);
+            assert_eq!(&block[17..19], &[0x00, 0x04], "content_len BE");
+            let pad_len = u16::from_be_bytes([block[19], block[20]]) as usize;
+            assert_eq!(block.len(), 16 + 1 + 2 + 2 + 4 + pad_len, "total layout");
+            // content 原样在 padding 前
+            assert_eq!(&block[21..25], &content);
+            assert!(block[25..].iter().all(|&b| b == 0), "zero padding");
+        }
+        // long_padding：pad = rng(20) + 30 - 4 ≥ 26（seed[1]=20, seed[2]=30）
+        let pad_custom = u16::from_be_bytes([with_custom[19], with_custom[20]]) as usize;
+        assert!(pad_custom >= 26, "custom long pad {pad_custom} should be >= 30-4");
+        // seed 不同 → 长度分布不同（自定义 seed 长基准 30 vs 默认 900，此处必不同）
+        let pad_default = u16::from_be_bytes([with_default[19], with_default[20]]) as usize;
+        assert_ne!(pad_default, pad_custom, "different seeds → different pad length");
     }
 }

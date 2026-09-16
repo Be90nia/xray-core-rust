@@ -74,6 +74,8 @@ pub struct VisionConn<C> {
     uplink_padding: bool,
     downlink_padding: bool,
     rng: StdRng,
+    /// 账户级 padding seed（testseed，归一化后 4 元素；上/下行 padding 共用）。
+    padding_seed: [u32; 4],
     /// uplink TLS 过滤状态（检测 TLS 1.3 → enable_xtls → splice）。
     uplink_traffic: TrafficState,
     /// downlink TLS 过滤状态（检测服务器 TLS 1.3 → enable_xtls → splice）。
@@ -118,6 +120,7 @@ where
             uplink_padding: true,
             downlink_padding: true,
             rng: StdRng::from_os_rng(),
+            padding_seed: DEFAULT_PADDING_SEED,
             uplink_traffic: TrafficState::new(user_uuid.clone()),
             downlink_traffic: TrafficState::new(user_uuid.clone()),
             raw_fallback: None,
@@ -125,6 +128,16 @@ where
             read_tmp: Vec::with_capacity(16 * 1024),
             splice_armed: false,
         }
+    }
+
+    /// 注入账户级 padding seed（对应 Go `MemoryAccount.Testseed`，经
+    /// `normalize_padding_seed` 归一化：<4 用默认兜底，≥4 取前 4）。
+    ///
+    /// 不调用时走 [`DEFAULT_PADDING_SEED`]，与 Go `len(testseed)<4` 兜底一致。
+    #[must_use]
+    pub fn with_padding_seed(mut self, seed: &[u32]) -> Self {
+        self.padding_seed = crate::encryption::vision::normalize_padding_seed(seed);
+        self
     }
 
     /// server 模式构造（vision splice）：accept 层在 TLS accept 消费 socket 前
@@ -145,6 +158,7 @@ where
             uplink_padding: true,
             downlink_padding: true,
             rng: StdRng::from_os_rng(),
+            padding_seed: DEFAULT_PADDING_SEED,
             uplink_traffic: TrafficState::new(user_uuid.clone()),
             downlink_traffic: TrafficState::new(user_uuid.clone()),
             raw_fallback: None,
@@ -164,7 +178,7 @@ where
             COMMAND_PADDING_CONTINUE,
             &mut self.uplink_uuid_pending,
             true,
-            &DEFAULT_PADDING_SEED,
+            &self.padding_seed,
             &mut self.rng,
         );
         self.inner.write_all(&padded).await?;
@@ -351,7 +365,7 @@ where
                 command,
                 &mut this.uplink_uuid_pending,
                 false,
-                &DEFAULT_PADDING_SEED,
+                &this.padding_seed,
                 &mut this.rng,
             );
             this.uplink_write_pending = Some((padded, 0, n));

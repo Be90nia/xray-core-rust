@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use crate::encryption::vision_conn::VisionConn;
 use xray_app_dispatcher::default::DialFn;
@@ -61,6 +61,11 @@ pub struct VlessOutboundConfig {
     pub level: u32,
     /// 用户 email（stats 系统标识用）。
     pub email: String,
+    /// 账户级 Vision padding seed（对应 Go `MemoryAccount.Testseed`，json `testseed`）。
+    /// 本地配置不上 wire；空/不足 4 元素时运行时用默认 `[900,500,900,256]` 兜底。
+    pub testseed: Vec<u32>,
+    /// 预连接数（对应 Go `Handler.testpre`，json `testpre`）。0 = 关闭。
+    pub testpre: u32,
 }
 
 impl VlessOutboundConfig {
@@ -76,6 +81,8 @@ impl VlessOutboundConfig {
             encryption: "none".to_string(),
             enc_params: None,
             level: 0,
+            testseed: Vec::new(),
+            testpre: 0,
             email: String::new(),
         }
     }
@@ -113,6 +120,20 @@ impl VlessOutboundConfig {
         self.enc_params = params;
         self
     }
+
+    /// 设置账户级 testseed（builder 风格，对应 Go outbound user `testseed`）。
+    #[must_use]
+    pub fn with_testseed(mut self, seed: Vec<u32>) -> Self {
+        self.testseed = seed;
+        self
+    }
+
+    /// 设置预连接数 testpre（builder 风格，对应 Go outbound settings `testpre`）。
+    #[must_use]
+    pub fn with_testpre(mut self, count: u32) -> Self {
+        self.testpre = count;
+        self
+    }
     /// 设置用户 level（builder 风格）。
     #[must_use]
     pub fn with_level(mut self, level: u32) -> Self {
@@ -139,6 +160,91 @@ impl VlessOutboundConfig {
 /// Handshake=60s（infra/conf/policy.go:130）。服务端黑洞（accept 后不读不回）
 /// 时 handshake 内 read_exact 永久 Pending，60s 后本条拨号报错回收，不悬挂。
 const ENC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// testpre 预连接池（对应 Go `outbound.Handler.preConns chan *ConnExpire`）。
+///
+/// 持有已拨到 VLESS 服务器、**尚未写请求头**的裸连接；消费方照常走 ENC 握手 +
+/// 请求头（Go 语义：预连接只省 TCP dial，协议握手每条照做）。条目超过
+/// [`Self::ttl`] 丢弃（Go `ConnExpire` 2 分钟 TODO 缺省）。
+struct PreConns {
+    max: usize,
+    ttl: Duration,
+    inner: parking_lot::Mutex<std::collections::VecDeque<(Box<dyn Connection>, Instant)>>,
+}
+
+impl PreConns {
+    fn new(max: u32, ttl: Duration) -> Self {
+        Self {
+            max: max as usize,
+            ttl,
+            inner: parking_lot::Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    /// 入池；池满丢弃（Go：goroutine 阻塞在带缓冲 chan，等价容量上限语义）。
+    fn push(&self, conn: Box<dyn Connection>) {
+        let mut q = self.inner.lock();
+        if q.len() >= self.max {
+            return;
+        }
+        q.push_back((conn, Instant::now()));
+    }
+
+    /// 取一条未过期预连接；过期条目按序丢弃。
+    fn pop(&self) -> Option<Box<dyn Connection>> {
+        let mut q = self.inner.lock();
+        let now = Instant::now();
+        while let Some((conn, at)) = q.pop_front() {
+            if now.duration_since(at) <= self.ttl {
+                return Some(conn);
+            }
+        }
+        None
+    }
+
+    #[cfg(test)]
+    fn queued(&self) -> usize {
+        self.inner.lock().len()
+    }
+}
+
+/// testpre 预拨号 worker（对应 Go `initpre.Do` 起的 `testpre` 个 goroutine）：
+/// 循环拨服务器 → 入池 → sleep 200ms（Go TODO: customize & randomize）。拨号
+/// 失败记日志重试（Go LogWarning + continue）。任务随 handler 存活（Go 同为
+/// 无退出循环），进程退出由 runtime 回收。
+fn spawn_preconn_workers(config: Arc<VlessOutboundConfig>, pool: Arc<PreConns>, count: u32) {
+    for _ in 0..count {
+        let config = Arc::clone(&config);
+        let pool = Arc::clone(&pool);
+        tokio::spawn(async move {
+            loop {
+                match dial_server_conn(&config).await {
+                    Ok(conn) => pool.push(conn),
+                    Err(e) => tracing::debug!(error = %e, "vless pre-connect failed"),
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        });
+    }
+}
+
+/// 仅拨到 VLESS 服务器（transport 层），不含 ENC/请求头/vision 包装。
+async fn dial_server_conn(config: &VlessOutboundConfig) -> Result<Box<dyn Connection>, String> {
+    let server_dest = config.server_destination();
+    let sockopt = config
+        .stream_settings
+        .as_ref()
+        .map(|s| s.socket_options())
+        .unwrap_or_default();
+    match &config.stream_settings {
+        Some(s) => dial(&server_dest, s, &sockopt)
+            .await
+            .map_err(|e| format!("vless dial server ({}): {e}", s.protocol)),
+        None => xray_transport::system_dialer::dial_system(&server_dest, &sockopt)
+            .await
+            .map_err(|e| format!("vless dial server (tcp): {e}")),
+    }
+}
 
 type EstablishFn =
     Arc<dyn Fn(&Destination) -> Pin<Box<dyn Future<Output = Result<Box<dyn Connection>, String>> + Send>>
@@ -180,15 +286,31 @@ pub fn make_dial_fn_with_handshake_timeout(
         });
     let establish: EstablishFn = {
         let config = Arc::clone(&config);
+        // testpre 预连接（Go `testpre > 0 && reverse == nil`；本 dispatcher 是
+        // 普通 outbound 路径，reverse 是独立 outbound 不经此处）。首次拨号时
+        // 才起 worker（对齐 Go initpre.Do 惰性初始化）。
+        let pre_conns = (config.testpre > 0).then(|| {
+            Arc::new(PreConns::new(config.testpre, Duration::from_secs(120)))
+        });
+        let preconn_once = Arc::new(std::sync::Once::new());
         Arc::new(move |dest: &Destination| {
             let config = Arc::clone(&config);
             let enc_client = enc_client.clone();
+            let pre_conns = pre_conns.clone();
+            let preconn_once = Arc::clone(&preconn_once);
             let target_addr = dest.address().clone();
             let target_port = dest.port();
             Box::pin(async move {
+                if let Some(pool) = pre_conns.as_ref() {
+                    let pool = Arc::clone(pool);
+                    let cfg = Arc::clone(&config);
+                    let count = cfg.testpre;
+                    preconn_once.call_once(move || spawn_preconn_workers(cfg, pool, count));
+                }
                 establish_conn(
                     config,
                     enc_client,
+                    pre_conns,
                     target_addr,
                     target_port,
                     handshake_timeout,
@@ -216,24 +338,17 @@ pub fn make_dial_fn_with_handshake_timeout(
 async fn establish_conn(
     config: Arc<VlessOutboundConfig>,
     enc_client: Option<Arc<crate::encryption::ClientInstance>>,
+    pre_conns: Option<Arc<PreConns>>,
     target_addr: Address,
     target_port: Port,
     handshake_timeout: std::time::Duration,
 ) -> Result<Box<dyn Connection>, String> {
-    // 1. dial VLESS server：有 streamSettings 走 transport dialer（ws/grpc/...），否则裸 TCP。
-    let server_dest = config.server_destination();
-    let sockopt = config
-        .stream_settings
-        .as_ref()
-        .map(|s| s.socket_options())
-        .unwrap_or_default();
-    let mut conn: Box<dyn Connection> = match &config.stream_settings {
-        Some(s) => dial(&server_dest, s, &sockopt)
-            .await
-            .map_err(|e| format!("vless dial server ({}): {e}", s.protocol))?,
-        None => xray_transport::system_dialer::dial_system(&server_dest, &sockopt)
-            .await
-            .map_err(|e| format!("vless dial server (tcp): {e}"))?,
+    // 1. 取连接：testpre 池命中（免 TCP 握手）→ 用预连接；miss 正常拨
+    //    （Go 消费端阻塞等池，Rust 直拨更快且不会死锁）。有 streamSettings 走
+    //    transport dialer（ws/grpc/...），否则裸 TCP。
+    let mut conn: Box<dyn Connection> = match pre_conns.as_ref().and_then(|p| p.pop()) {
+        Some(c) => c,
+        None => dial_server_conn(&config).await?,
     };
 
     // 2a. VLESS ENC 握手（仅当 config.enc_params 已注入时执行）。
@@ -281,7 +396,9 @@ async fn establish_conn(
     //    ENC(mlkem768)+vision 组合走 CommonConn，见 bd 4lf/byo。
     if config.flow == crate::FLOW_XRV && config.encryption == "none" {
         let uuid_bytes = config.user_uuid.as_bytes().to_vec();
-        let mut vision = VisionConn::new(conn, uuid_bytes);
+        // testseed：账户本地 padding 参数注入（对应 Go EncodeBodyAddons →
+        // NewVisionWriter(account.Testseed)；不上 wire，len<4 时 builder 内兜底默认）。
+        let mut vision = VisionConn::new(conn, uuid_bytes).with_padding_seed(&config.testseed);
         // Go 行为：postRequest 等 500ms 拿首块 client data,若拿不到就手动
         // 发一个空 content 的 padding 块（mb[0]=nil → VisionWriter 强制
         // XtlsPadding(None, CommandPaddingContinue) → 首块只有 uuid + 随机
@@ -872,5 +989,63 @@ mod tests {
             .expect_err("second rejection must surface");
         assert!(is_ticket_rejected(&err));
         assert_eq!(dials.load(Ordering::SeqCst), 2, "只重试一次");
+    }
+
+    /// PreConns 池语义：FIFO、容量上限丢弃、TTL 过期丢弃（Go preConns chan +
+    /// ConnExpire 等价）。连接用空壳 stub——池操作不触碰 IO。
+    #[test]
+    fn preconn_pool_fifo_cap_and_ttl() {
+        struct NopConn;
+        impl AsyncRead for NopConn {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+        }
+        impl AsyncWrite for NopConn {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl Connection for NopConn {
+            fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+            fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+        }
+        let mk = || Box::new(NopConn) as Box<dyn Connection>;
+
+        // 容量上限：max=2 时第 3 条入池被丢弃。
+        let pool = PreConns::new(2, Duration::from_secs(120));
+        pool.push(mk());
+        pool.push(mk());
+        assert_eq!(pool.queued(), 2, "push beyond cap must be dropped");
+
+        // FIFO：先入先出，全部可取。
+        assert!(pool.pop().is_some());
+        assert!(pool.pop().is_some());
+        assert!(pool.pop().is_none(), "empty pool returns None");
+
+        // TTL：极短 ttl 下入池条目立即过期。
+        let short = PreConns::new(2, Duration::from_millis(1));
+        short.push(mk());
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(short.pop().is_none(), "expired entry must be skipped");
+        assert_eq!(short.queued(), 0, "expired entry removed from queue");
     }
 }
