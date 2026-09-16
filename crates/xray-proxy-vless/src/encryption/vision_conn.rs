@@ -238,7 +238,7 @@ where
                         this.read_tmp.truncate(read_tmp_len);
                         return Poll::Ready(Ok(()));
                     }
-                    let content =
+                    let mut content =
                         xtls_unpadding(&this.read_tmp[..n], &mut this.downlink_state, &this.user_uuid);
                     let cmd = this.downlink_state.current_command;
                     // server 关闭下行 padding：END=只关 padding（继续读 TLS 层），
@@ -262,6 +262,30 @@ where
                                     .raw_tcp
                                     .take()
                                     .or_else(|| this.inner.inner_raw_tcp_clone());
+                            }
+                            // txno-splice 修复（Interop r2 vless_vision_tls 停摆
+                            // 定罪，CI run 35056488359）：切换前回收 inner TLS 层
+                            // 已解密残余——TLS 流单次 recv 可能过读吞入「DIRECT
+                            // 记录之后」的字节，其中已完整解密的部分在此 drain
+                            // 拼到 direct 流头部（对齐 Go CommonConn.Read 的
+                            // c.input 残余自持语义，encryption/common.go:80-143）。
+                            // Pending=无更多已解密数据，正常终止；Err=对端已切
+                            // 裸流后的记录解析噪声，预期吞掉不传播；Ok(0)=EOF。
+                            loop {
+                                let mut rb = ReadBuf::new(&mut this.read_tmp[..]);
+                                match Pin::new(&mut this.inner).poll_read(cx, &mut rb) {
+                                    Poll::Ready(Ok(())) => {
+                                        let filled = rb.filled();
+                                        if filled.is_empty() {
+                                            break;
+                                        }
+                                        content.extend_from_slice(filled);
+                                        if filled.len() < this.read_tmp.len() {
+                                            break; // 短读=已取尽当前缓冲
+                                        }
+                                    }
+                                    _ => break,
+                                }
                             }
                         }
                     }
@@ -844,6 +868,106 @@ mod tests {
         let mut raw = [0u8; 16];
         peer.inner_conn_mut().read_exact(&mut raw).await.unwrap();
         assert_eq!(&raw, b"raw-after-splice");
+    }
+
+    /// SslStream 语义替身：模拟外层 TLS 流的「过读 + opaque 缓冲」——单次
+    /// 底层 recv 把「DIRECT 记录 + 其后裸字节」一起吞进内部缓冲，但只吐出
+    /// 第一段（DIRECT 记录明文）。`drainable=false`=真实 SslStream 现状
+    /// （裸尾滞留 opaque 永不浮现，DIRECT 切换即丢失）；`drainable=true`
+    /// =修复验收形态（残余可经后续 poll 回收，VisionConn 切换前的 drain
+    /// 循环负责拼到 direct 流头部）。
+    struct SslSwallowMock {
+        first: Vec<u8>,
+        swallowed: Vec<u8>,
+        delivered: bool,
+        drainable: bool,
+    }
+    impl AsyncRead for SslSwallowMock {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if !this.delivered {
+                this.delivered = true;
+                let n = this.first.len().min(buf.remaining());
+                buf.put_slice(&this.first[..n]);
+                return Poll::Ready(Ok(()));
+            }
+            if this.drainable && !this.swallowed.is_empty() {
+                let n = this.swallowed.len().min(buf.remaining());
+                buf.put_slice(&this.swallowed[..n]);
+                this.swallowed.clear();
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Pending
+        }
+    }
+    impl AsyncWrite for SslSwallowMock {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl InnerRawClone for SslSwallowMock {}
+
+    /// txno-splice 机制实锤（Interop r2 vless_vision_tls 停摆定罪，CI run
+    /// 35056488359）：DIRECT 外层记录与其后裸字节在同一次 recv 合流时，
+    /// SslStream 过读把裸尾吞进 opaque 缓冲，VisionConn 切 raw dup 后裸尾
+    /// 永久不可达——上层（curl 的端到端 TLS）流截断/悬死。契约：切换前
+    /// 必须把 inner 已解密残余 drain 拼到 direct 流头部（修复于
+    /// `AsyncRead for VisionConn` DIRECT 切换分支）。`drainable=true`=
+    /// 修复验收形态（残余可经 poll 回收）；修复前实测红 2.02s
+    /// （Elapsed 悬死，取证记录见 docs/impl-nevn-splice-2026-09-16.md）。
+    #[tokio::test]
+    async fn direct_switch_coalesced_trailing_bytes_survive() {
+        let uuid = vec![0xABu8; 16];
+        let app = build_tls_app_data(b"hello-direct");
+        let frame = xtls_padding(
+            Some(&app),
+            COMMAND_PADDING_DIRECT,
+            &mut Some(uuid.clone()),
+            false,
+            &DEFAULT_PADDING_SEED,
+            &mut StdRng::from_os_rng(),
+        );
+        let trailing = b"COALESCED-RAW-TAIL".to_vec();
+        let (_raw_peer, raw_own) = make_std_tcp_pair();
+        let mut rx = VisionConn::new_server(
+            SslSwallowMock {
+                first: frame,
+                swallowed: trailing.clone(),
+                delivered: false,
+                drainable: true,
+            },
+            uuid,
+            raw_own,
+        );
+        rx.downlink_traffic.enable_xtls = true;
+
+        // 读 #1：DIRECT 帧 content 正常解出（基线，必须绿）
+        let mut got = vec![0u8; app.len()];
+        rx.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, app, "DIRECT content must decode");
+
+        // 读 #2（契约本体）：同次 recv 合流的裸尾必须交付上层。
+        // 当前实现：裸尾滞留 SslStream opaque 缓冲，读悬死 → 超时红。
+        let mut tail = vec![0u8; trailing.len()];
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx.read_exact(&mut tail))
+            .await
+            .expect("coalesced trailing bytes must be delivered to the caller")
+            .unwrap();
+        assert_eq!(&tail, &trailing, "coalesced raw tail must survive the switch");
     }
 }
 

@@ -240,6 +240,10 @@ mod lint_tests {
 
     #[test]
     fn registered_stages_are_sorted() {
+        // 与同模块其它 registry 测试同锁——本测试曾漏锁，CI macOS 并行下
+        // clear+注册 Boom 与 built.rs 的 cfg.build() 测试竞态（bd 5x41 同族，
+        // CI run 35087312070 Workspace lib 步实证）。
+        let _g = TEST_LOCK.lock();
         super::clear_stages();
         // 注册乱序 → 应按字典序返回
         super::register_stage(Arc::new(CounterB {
