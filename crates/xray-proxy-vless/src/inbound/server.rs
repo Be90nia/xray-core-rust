@@ -66,6 +66,10 @@ pub struct VlessInboundOptions {
     /// 入站会话允许的网络（Go proxyman inbound.go:177-179：splithttp 传输
     /// 入站注入 `AllowedNetwork=UDP`）。None = 不限制。
     pub allowed_network: Option<Network>,
+    /// 外层传输是否 TLS 1.3 / REALITY 直连（Go inbound.go:571-581：XRV flow 只许
+    /// 跑在直连 TLS1.3/REALITY 上，transport 解包流或 TLS1.2 拒绝）。装配层注入：
+    /// serve_vless TLS 分支查 rustls 协商版本，REALITY Verified 恒 true，其余 false。
+    pub outer_tls13: bool,
 }
 /// VLESS inbound 服务入口。
 ///
@@ -132,6 +136,12 @@ pub async fn serve_vless(
                             .alpn_protocol()
                             .map(|p| String::from_utf8_lossy(p).into_owned())
                             .unwrap_or_default();
+                        // lwep（Go inbound.go:571-574）：XRV 校验需要外层 TLS 版本。
+                        let mut options = options;
+                        if let Some(o) = options.as_mut() {
+                            o.outer_tls13 = conn.protocol_version()
+                                == Some(xray_transport::rustls::ProtocolVersion::TLSv1_3);
+                        }
                         handle_connection_with_fallback(
                             tls_stream, &handler, &validator, fallbacks, peer, local, name, alpn,
                             options, raw_tcp,
@@ -377,6 +387,54 @@ where
 trait VlessStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> VlessStream for T {}
 
+/// Go `inbound.go:552-598` flow 五臂校验（bd lwep）。
+///
+/// 注入在响应头写出之前——失败即断连（Go return error 语义），**不走 fallback、
+/// 不发响应头**：已认证的 VLESS 客户端发畸形 flow ≠ 非 VLESS 流量。
+///
+/// # Errors
+///
+/// 任一臂命中即 `Err`（拒绝路径 O(1)，无分配密集操作，防 DoS）。
+fn validate_flow(
+    flow: &str,
+    account_flow: &str,
+    command: crate::encoding::VlessCommand,
+    outer_tls13: bool,
+) -> std::io::Result<()> {
+    if flow == crate::FLOW_XRV {
+        if account_flow != crate::FLOW_XRV {
+            // Go inbound.go:588-590：账号 flow 与请求 flow 不匹配。
+            return Err(std::io::Error::other(format!(
+                "account is not able to use the flow {flow}"
+            )));
+        }
+        if command == crate::encoding::VlessCommand::Udp {
+            // Go inbound.go:557-558：XRV 不支持 UDP 命令。
+            return Err(std::io::Error::other(format!("{flow} doesn't support UDP")));
+        }
+        // Go inbound.go:571-581：XRV 只许跑在直连 TLS1.3（tls.Conn 非 1.3 拒）/
+        // REALITY（恒 1.3）；transport 解包流无外层 TLS1.3，同臂拒绝。
+        if !outer_tls13 {
+            return Err(std::io::Error::other(
+                "failed to use xtls-rprx-vision: outer transport is not TLS 1.3 (XTLS only supports TLS and REALITY directly for now)",
+            ));
+        }
+    } else if flow.is_empty() {
+        // Go inbound.go:591-595：空 flow + XRV 账号 + TCP 拒（TLS-in-TLS 特征暴露）。
+        // ponytail: Go 的 isMuxAndNotXUDP mux 分支未实现——仅覆盖 command==TCP，
+        // mux 维持放行防误伤 XUDP-mux 合法流；mux 首帧解析落地时补齐。
+        if account_flow == crate::FLOW_XRV && command == crate::encoding::VlessCommand::Tcp {
+            return Err(std::io::Error::other(
+                "account is rejected since the client flow is empty. Note that the pure TLS proxy has certain TLS in TLS characters.",
+            ));
+        }
+    } else {
+        // Go inbound.go:596-598：未知 flow 拒（Go v26.9.9 枚举全集 = {"", XRV}）。
+        return Err(std::io::Error::other(format!("unknown request flow {flow}")));
+    }
+    Ok(())
+}
+
 /// Vision 首块 padding 携带的 uuid bytes（解码用户的账号 UUID，对齐 Go
 /// `request.User` 的 `ID.UUID()`）。非 vision flow 返回 `None`。
 fn vision_uuid_bytes(
@@ -413,7 +471,16 @@ where
 {
     use crate::encoding::VlessCommand;
 
+    // 0. flow 五臂校验（Go inbound.go:552-598，bd lwep）：必须在响应头之前——
+    // 失败断连不发响应头（validate_flow doc）。
+    validate_flow(
+        &decoded.addons.flow,
+        decoded.user.as_ref().map_or("", |u| u.account.flow.as_str()),
+        decoded.command,
+        options.as_ref().map_or(false, |o| o.outer_tls13),
+    )?;
     // 1. 发送响应头（version + empty addons）
+
     encode_response_header(&mut write_half, VERSION, &empty_addons())
         .await
         .map_err(|e| std::io::Error::other(format!("vless encode response: {e}")))?;
@@ -737,6 +804,11 @@ mod tests {
 
     /// 构造测试用 validator + 已注册用户的 UUID。
     fn make_validator_with_user() -> (UUID, Arc<dyn Validator>) {
+        make_validator_with_user_flow("")
+    }
+
+    /// 同上，但账号 `flow` 可指定（lwep 五臂校验测试需要 XRV 账号）。
+    fn make_validator_with_user_flow(flow: &str) -> (UUID, Arc<dyn Validator>) {
         let uuid = UUID::new();
         let user = MemoryUser {
             level: 0,
@@ -744,6 +816,7 @@ mod tests {
             account: MemoryAccount::from_proto_account(
                 &xray_proto::xray::proxy::vless::Account {
                     id: uuid.to_string(),
+                    flow: flow.to_string(),
                     ..Default::default()
                 },
             )
@@ -988,9 +1061,10 @@ mod tests {
         }
     }
 
-    /// 公共 harness：echo server + freedom dispatch + serve_vless（注册一个用户）。
-    /// 返回 (vless 监听地址, echo 端口, 用户 UUID)。
-    async fn spawn_vless_proxy_with_echo() -> (std::net::SocketAddr, u16, UUID) {
+    async fn spawn_vless_proxy_with_echo(
+        outer_tls13: bool,
+        account_flow: &str,
+    ) -> (std::net::SocketAddr, u16, UUID) {
         let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_port = echo_listener.local_addr().unwrap().port();
         tokio::spawn(async move {
@@ -1012,15 +1086,25 @@ mod tests {
         ohm.set_default(Arc::new(DialBridge::new("freedom", make_freedom_dial_fn()))
             as Arc<dyn xray_app_dispatcher::DispatchHandler>);
 
-        let (uuid, validator) = make_validator_with_user();
+        let (uuid, validator) = make_validator_with_user_flow(account_flow);
         let vless_listener = InboundTcpListener::bind(
             "127.0.0.1:0",
             xray_transport::sockopt::SocketOptions::default(),
         ).await.unwrap();
         let vless_addr = vless_listener.local_addr().unwrap();
-        let validator: Arc<dyn Validator> = validator;
         tokio::spawn(async move {
-            let _ = serve_vless(vless_listener, ohm, validator, None, None, None).await;
+            let _ = serve_vless(
+                vless_listener,
+                ohm,
+                validator,
+                None,
+                None,
+                Some(VlessInboundOptions {
+                    outer_tls13,
+                    ..Default::default()
+                }),
+            )
+            .await;
         });
         (vless_addr, echo_port, uuid)
     }
@@ -1033,7 +1117,7 @@ mod tests {
         use crate::encryption::vision::COMMAND_PADDING_CONTINUE;
         use tokio::time::{timeout, Duration};
 
-        let (vless_addr, echo_port, uuid) = spawn_vless_proxy_with_echo().await;
+        let (vless_addr, echo_port, uuid) = spawn_vless_proxy_with_echo(true, crate::FLOW_XRV).await;
 
         let mut client = tokio::net::TcpStream::connect(vless_addr).await.unwrap();
         let mut addons = empty_addons();
@@ -1078,7 +1162,7 @@ mod tests {
         use crate::dispatcher::{make_dial_fn, VlessOutboundConfig};
         use tokio::time::{timeout, Duration};
 
-        let (vless_addr, echo_port, uuid) = spawn_vless_proxy_with_echo().await;
+        let (vless_addr, echo_port, uuid) = spawn_vless_proxy_with_echo(true, crate::FLOW_XRV).await;
 
         let cfg = Arc::new(
             VlessOutboundConfig::new(
@@ -1109,7 +1193,7 @@ mod tests {
         use crate::dispatcher::{make_dial_fn, VlessOutboundConfig};
         use tokio::time::{timeout, Duration};
 
-        let (vless_addr, echo_port, uuid) = spawn_vless_proxy_with_echo().await;
+        let (vless_addr, echo_port, uuid) = spawn_vless_proxy_with_echo(true, "").await;
 
         let cfg = Arc::new(VlessOutboundConfig::new(
             uuid,
@@ -1512,6 +1596,7 @@ mod tests {
             reverse_registry: None,
             reverse_ohm: None,
             decryption: None,
+            outer_tls13: false,
             handshake_timeout: None,
             allowed_network: None,
         };
@@ -1576,6 +1661,7 @@ mod tests {
             reverse_ohm: Some(Arc::clone(&ohm_clone)),
             decryption: None,
             handshake_timeout: None,
+            outer_tls13: false,
             allowed_network: None,
         };
         tokio::spawn(async move {
@@ -1607,5 +1693,97 @@ mod tests {
             Err(_) => {}    // timeout：也行
             Ok(Err(_)) => {}
         }
+    }
+
+    // ==== lwep：Go inbound.go:552-598 flow 五臂契约（恶意输入必拒）====
+
+    /// 恶意 flow 公共断言：服务端校验失败必须断连且不发响应头（客户端读到 EOF）。
+    async fn assert_flow_rejected(flow: &str, command: VlessCommand, outer_tls13: bool, account_flow: &str) {
+        let (vless_addr, _echo_port, uuid) =
+            spawn_vless_proxy_with_echo(outer_tls13, account_flow).await;
+        let mut client = tokio::net::TcpStream::connect(vless_addr).await.unwrap();
+        let mut addons = empty_addons();
+        addons.flow = flow.to_string();
+        encode_request_header(
+            &mut client,
+            VERSION,
+            &uuid,
+            command,
+            Some(&Address::from_ipv4_bytes([127, 0, 0, 1])),
+            Some(80),
+            &addons,
+        )
+        .await
+        .unwrap();
+        let mut probe = [0u8; 1];
+        // 拒绝 = 连接终止且无响应头：FIN（Ok(0)）或 RST（ConnectionReset/Aborted）。
+        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut probe))
+            .await
+            .expect("server must close promptly on invalid flow")
+        {
+            Ok(0) => {}
+            Ok(n) => panic!("server sent unexpected bytes before closing: {n} bytes"),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted) => {}
+            Err(e) => panic!("unexpected io error: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn vless_inbound_rejects_unknown_flow() {
+        // 恶意客户端手写 wire：encode_header_addons 对非 XRV flow 写空 addons
+        //（Go EncodeHeaderAddons 同语义，addons.go:18-34），合法编码器发不出
+        // 未知 flow——必须手工构造 proto addons（field1=flow）模拟恶意输入。
+        let (vless_addr, _echo_port, uuid) = spawn_vless_proxy_with_echo(true, "").await;
+        let mut client = tokio::net::TcpStream::connect(vless_addr).await.unwrap();
+        let flow = b"xtls-rprx-doom";
+        let mut addons_proto = Vec::new();
+        addons_proto.push(0x0A); // field 1 (flow), wire type 2 (string)
+        addons_proto.push(flow.len() as u8);
+        addons_proto.extend_from_slice(flow);
+        let mut wire = Vec::new();
+        wire.push(VERSION);
+        wire.extend_from_slice(uuid.as_bytes());
+        wire.push(addons_proto.len() as u8);
+        wire.extend_from_slice(&addons_proto);
+        wire.push(1); // VlessCommand::Tcp
+        wire.extend_from_slice(&80u16.to_be_bytes());
+        wire.push(4); // IPv4
+        wire.extend_from_slice(&[127, 0, 0, 1]);
+        client.write_all(&wire).await.unwrap();
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut probe))
+            .await
+            .expect("server must close promptly on unknown flow")
+        {
+            Ok(0) => {}
+            Ok(n) => panic!("server sent unexpected bytes before closing: {n} bytes"),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted) => {}
+            Err(e) => panic!("unexpected io error: {e}"),
+        }
+    }
+
+
+    /// 臂（Go inbound.go:557-558）：XRV + UDP 命令拒。
+    #[tokio::test]
+    async fn vless_inbound_rejects_xrv_udp_command() {
+        assert_flow_rejected(crate::FLOW_XRV, VlessCommand::Udp, true, crate::FLOW_XRV).await;
+    }
+
+    /// 臂（Go inbound.go:588-590）：请求 flow=XRV 但账号 flow 非 XRV 拒。
+    #[tokio::test]
+    async fn vless_inbound_rejects_xrv_account_mismatch() {
+        assert_flow_rejected(crate::FLOW_XRV, VlessCommand::Tcp, true, "").await;
+    }
+
+    /// 臂（Go inbound.go:591-595）：空 flow + XRV 账号 + TCP 拒（TLS-in-TLS 特征）。
+    #[tokio::test]
+    async fn vless_inbound_rejects_empty_flow_xrv_account_tcp() {
+        assert_flow_rejected("", VlessCommand::Tcp, true, crate::FLOW_XRV).await;
+    }
+
+    /// 臂（Go inbound.go:571-581）：XRV 但外层非 TLS1.3 直连（裸 TCP 床）拒。
+    #[tokio::test]
+    async fn vless_inbound_rejects_xrv_without_outer_tls13() {
+        assert_flow_rejected(crate::FLOW_XRV, VlessCommand::Tcp, false, crate::FLOW_XRV).await;
     }
 }
