@@ -17,6 +17,55 @@ use tun_rs::{GROTable, VIRTIO_NET_HDR_LEN};
 use crate::config::Tun;
 use crate::error::{Result, TunError};
 
+/// vnet_hdr 垫头缓冲 free list（票 0qef）：每包垫头 `Vec` 从池里取、发完回收，
+/// 消除热路径每包一次 `vec![0u8; header + len]` 堆分配。
+///
+/// 平台无关（`header_len` 参数化）：Linux 侧传 `VIRTIO_NET_HDR_LEN`；
+/// 契约测试在任意平台可跑。tun-rs `send_multiple` 以 `&mut [B]` 借用不消耗
+/// 缓冲（GRO 合并仅原地 `buf_extend_from_slice`），发送后可安全回收。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod hdr_free_list {
+    /// 回收上限：GRO 单批典型 ≤64 包（64KiB/MTU），256 覆盖突发批，内存上限
+    /// ~380KB（MTU 包）。
+    // ponytail: 固定计数上限，不做 LRU/分代；profile 说命中率低再调
+    pub(super) const HDR_FREE_MAX: usize = 256;
+
+    pub(super) struct HdrFreeList {
+        header_len: usize,
+        free: Vec<Vec<u8>>,
+    }
+
+    impl HdrFreeList {
+        pub(super) fn new(header_len: usize) -> Self {
+            Self {
+                header_len,
+                free: Vec::new(),
+            }
+        }
+
+        /// 取一缓冲写入 `pkt`：前 `header_len` 字节 vnet 头占位（全零）+ 包数据。
+        pub(super) fn pack(&mut self, pkt: &[u8]) -> Vec<u8> {
+            let need = self.header_len + pkt.len();
+            let mut b = self.free.pop().unwrap_or_default();
+            b.resize(need, 0);
+            // resize 只零填扩展段；复用缓冲头区可能残留 GRO 改写数据，
+            // 必须显式清零（对齐改前 `vec![0u8; ..]` 的全零头行为）。
+            b[..self.header_len].fill(0);
+            b[self.header_len..].copy_from_slice(pkt);
+            b
+        }
+
+        /// 回收已发送缓冲；超上限即丢弃（防突发大批次撑爆内存）。
+        pub(super) fn recycle(&mut self, bufs: impl IntoIterator<Item = Vec<u8>>) {
+            for b in bufs {
+                if self.free.len() < HDR_FREE_MAX {
+                    self.free.push(b);
+                }
+            }
+        }
+    }
+}
+
 /// 平台 TUN 设备，包装 `tun_rs::AsyncDevice`。
 ///
 /// 同时实现 [`Tun`] trait（设备元数据）+ 提供 `recv`/`send`（IP 包 IO）。
@@ -24,6 +73,9 @@ pub struct TunDevice {
     dev: AsyncDevice,
     name: String,
     mtu: u16,
+    /// 票 0qef：`send`/`send_batch` 垫头缓冲池（仅 Linux 批量路径使用）。
+    #[cfg(target_os = "linux")]
+    send_free: parking_lot::Mutex<hdr_free_list::HdrFreeList>,
 }
 
 impl TunDevice {
@@ -61,6 +113,10 @@ impl TunDevice {
             dev,
             name: name_str,
             mtu,
+            #[cfg(target_os = "linux")]
+            send_free: parking_lot::Mutex::new(hdr_free_list::HdrFreeList::new(
+                VIRTIO_NET_HDR_LEN,
+            )),
         })
     }
 
@@ -85,7 +141,17 @@ impl TunDevice {
     pub async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
         #[cfg(target_os = "linux")]
         {
-            self.send_batch([buf.to_vec()]).await
+            // 票 g545：不再 `to_vec()` 中转（每包 1 alloc）——free list 直接垫头，
+            // 1 次拷贝、0 新堆分配；单元素数组走 send_multiple 保持 vnet 开/关
+            // 两分支语义（与 send_batch 同路径）。
+            let mut pkt = [self.send_free.lock().pack(buf)];
+            let mut gro = GROTable::default();
+            let sent = self
+                .dev
+                .send_multiple(&mut gro, &mut pkt, VIRTIO_NET_HDR_LEN)
+                .await;
+            self.send_free.lock().recycle(pkt);
+            sent
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -128,24 +194,24 @@ impl TunDevice {
     where
         I: IntoIterator<Item = Vec<u8>>,
     {
-        // vnet_hdr 布局：每包前垫 VIRTIO_NET_HDR_LEN 字节供 GRO 写头；
-        // offset=VIRTIO_NET_HDR_LEN 在 vnet 开/关两个分支下语义均正确。
-        let mut bufs: Vec<Vec<u8>> = pkts
-            .into_iter()
-            .map(|p| {
-                let mut b = vec![0u8; VIRTIO_NET_HDR_LEN + p.len()];
-                b[VIRTIO_NET_HDR_LEN..].copy_from_slice(&p);
-                b
-            })
-            .collect();
+        // 票 0qef：垫头缓冲走 free list 复用，锁不跨 await（打包/回收分段拿锁）。
+        let mut bufs: Vec<Vec<u8>> = {
+            let mut free = self.send_free.lock();
+            pkts.into_iter().map(|p| free.pack(&p)).collect()
+        };
         if bufs.is_empty() {
             return Ok(0);
         }
+        // vnet_hdr 布局：每包前垫 VIRTIO_NET_HDR_LEN 字节供 GRO 写头；
+        // offset=VIRTIO_NET_HDR_LEN 在 vnet 开/关两个分支下语义均正确。
         // ponytail: GROTable 每批现造（3 个小 Vec 分配），profile 说贵再复用
         let mut gro = GROTable::default();
-        self.dev
+        let sent = self
+            .dev
             .send_multiple(&mut gro, &mut bufs, VIRTIO_NET_HDR_LEN)
-            .await
+            .await;
+        self.send_free.lock().recycle(bufs);
+        sent
     }
 }
 
@@ -310,5 +376,69 @@ mod trait_tests {
         // 类型层面的编译时验证：AsyncDevice::try_recv/try_send 存在并返回 io::Result<usize>。
         // 此处不实际调用——TunDevice 内部持有 AsyncDevice 实例但 trait 暴露 recv/send。
         // ponytail: 编译期检查，无需运行时。
+    }
+}
+
+/// 票 0qef/g545 契约测试：垫头 free list 的布局/复用/上限行为。
+/// 平台无关（HdrFreeList 不依赖 tun_rs），Windows 本地可跑。
+#[cfg(test)]
+mod free_list_tests {
+    use super::hdr_free_list::{HdrFreeList, HDR_FREE_MAX};
+
+    const HDR: usize = 12; // == Linux VIRTIO_NET_HDR_LEN，平台无关测试用字面值
+
+    #[test]
+    fn pack_writes_zero_header_then_payload() {
+        let mut fl = HdrFreeList::new(HDR);
+        let pkt = [7u8; 5];
+        let b = fl.pack(&pkt);
+        assert_eq!(b.len(), HDR + 5, "缓冲长 = 头 + 包");
+        assert!(b[..HDR].iter().all(|&x| x == 0), "vnet 头占位必须全零");
+        assert_eq!(&b[HDR..], &pkt[..], "包数据必须原样跟在头后");
+    }
+
+    #[test]
+    fn recycled_buffer_is_reused_without_new_alloc() {
+        let mut fl = HdrFreeList::new(HDR);
+        let b1 = fl.pack(&[1u8; 100]);
+        let ptr1 = b1.as_ptr();
+        fl.recycle([b1]);
+        let b2 = fl.pack(&[2u8; 100]);
+        assert_eq!(
+            b2.as_ptr(),
+            ptr1,
+            "回收缓冲必须被复用（同指针 = 零新堆分配）"
+        );
+        assert_eq!(b2.len(), HDR + 100);
+    }
+
+    #[test]
+    fn recycle_drops_buffers_over_cap() {
+        let mut fl = HdrFreeList::new(HDR);
+        for i in 0..HDR_FREE_MAX {
+            fl.recycle([vec![0u8; HDR + i]]);
+        }
+        // 池满后再回收 → 丢弃；pack 必须拿不到刚丢弃的缓冲（LIFO 命中池内旧缓冲）
+        let dropped = vec![0u8; HDR + 64];
+        let dropped_ptr = dropped.as_ptr();
+        fl.recycle([dropped]);
+        let b = fl.pack(&[1u8; 64]);
+        assert_ne!(
+            b.as_ptr(),
+            dropped_ptr,
+            "池满后回收必须被丢弃，不得复用"
+        );
+    }
+
+    #[test]
+    fn reuse_after_gro_growth_resets_len_and_header() {
+        // GRO 合并会在发送侧把缓冲撑大（最长 ~64KiB）；复用时必须收缩 len
+        // 且头区清零——对应 pack 的 resize + fill(0)。
+        let mut fl = HdrFreeList::new(HDR);
+        fl.recycle([vec![9u8; HDR + 60000]]);
+        let b = fl.pack(&[1u8; 1400]);
+        assert_eq!(b.len(), HDR + 1400);
+        assert!(b[..HDR].iter().all(|&x| x == 0), "复用后头区必须清零");
+        assert_eq!(&b[HDR..], &[1u8; 1400][..]);
     }
 }

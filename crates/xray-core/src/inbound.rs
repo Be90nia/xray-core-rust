@@ -12,7 +12,7 @@ use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use xray_app_dispatcher::default::SimpleOhm;
 use xray_app_dispatcher::OutboundHandlerManager;
-use xray_buf::io::{new_reader, new_readv_reader, new_writer};
+use xray_buf::io::{new_reader, new_readv_reader, new_writer, Reader, Writer};
 use xray_common::net::address::Address;
 use xray_common::net::destination::Destination;
 use xray_common::net::network::Network;
@@ -124,6 +124,12 @@ trait InboundConnMeta {
     fn inbound_local(&self) -> Option<SocketAddr>;
     /// 是否裸 TCP（Go `proxy.IsRAWTransportWithoutSecurity`，proxy.go:802-809）。
     fn is_raw_inbound(&self) -> bool;
+    /// 消费流拆为 (Reader, Writer)，按流类型分发（对应 Go `buf.NewReader`
+    /// io.go:113-145 的类型分派）：裸 TCP 走 readv 聚合读（syscall.Conn →
+    /// ReadVReader 分支，env 闸门 `xray.buf.readv` 关时工厂内部自动退回顺序
+    /// 读）；非 TCP 流（UDS `Box<dyn Connection>`，无 syscall.Conn）退回顺序读
+    /// （SingleReader 分支，行为与历史一致）。
+    fn into_link_io(self) -> (Box<dyn Reader>, Box<dyn Writer>);
 }
 
 impl InboundConnMeta for TcpStream {
@@ -135,6 +141,10 @@ impl InboundConnMeta for TcpStream {
     }
     fn is_raw_inbound(&self) -> bool {
         true
+    }
+    fn into_link_io(self) -> (Box<dyn Reader>, Box<dyn Writer>) {
+        let (rd, wr) = self.into_split();
+        (new_readv_reader(rd), new_writer(wr))
     }
 }
 
@@ -152,6 +162,10 @@ impl InboundConnMeta for Box<dyn xray_transport::connection::Connection> {
     }
     fn is_raw_inbound(&self) -> bool {
         self.is_raw_tcp()
+    }
+    fn into_link_io(self) -> (Box<dyn Reader>, Box<dyn Writer>) {
+        let (rd, wr) = tokio::io::split(self);
+        (new_reader(rd), new_writer(wr))
     }
 }
 /// 处理单个 SOCKS 连接：handshake → dispatch（TCP CONNECT）或 UDP relay。
@@ -234,14 +248,12 @@ where
                     ..Default::default()
                 }
             };
-            // 3. 拆 TcpStream → (read, write) → Link
-            // ponytail: tokio::io::split 返回的 ReadHalf/WriteHalf 是 'static + Send,
-            // new_reader/new_writer 接受 AsyncRead/AsyncWrite + Unpin + Send + 'static.
-            // 本函数泛型（第二调用方传 Box<dyn Connection>），无法 into_split 接
-            // readv（bd 2o9l）——socks 独立入站保持顺序读；mixed/http/dokodemo
-            // 的具体 TcpStream 路径已接 new_readv_reader。
-            let (read_half, write_half) = tokio::io::split(stream);
-            let link = Link::new(new_reader(read_half), new_writer(write_half));
+            // 3. 拆流 → Link：按流类型分发（InboundConnMeta::into_link_io）——
+            // 裸 TCP 接 readv 聚合读（bd 4vkp，对齐 Go NewReader syscall.Conn
+            // 分支）；UDS Box<dyn Connection> 退回顺序读；env 闸门
+            // xray.buf.readv 关时工厂内部退回顺序读（行为同前）。
+            let (reader, writer) = stream.into_link_io();
+            let link = Link::new(reader, writer);
             // 4. dispatch（zx7: mux.cool dest 转给 mux ServerWorker）
             if is_mux_destination(&dest) {
                 tracing::info!("socks: mux.cool destination detected, spawning mux inbound handler");
@@ -5028,6 +5040,86 @@ mod tests {
         let mut got = vec![0u8; payload.len()];
         client.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, payload, "should receive echo through proxy");
+    }
+
+    /// 4vkp：socks 独立入站 TCP 裸流接 readv（InboundConnMeta::into_link_io
+    /// TcpStream 分支）。单缓冲阶段（current=1）读满 8KB 扩到 2 后，一次
+    /// read_multi_buffer 把剩余 16KB 聚合进 2 个缓冲——对齐 Go NewReader
+    /// syscall.Conn → ReadVReader 分支。若回退 new_reader（顺序读），第二读
+    /// 只能拿单缓冲 8KB，第二组断言失败。
+    #[tokio::test]
+    async fn socks_tcp_inbound_reader_aggregates_payload_single_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            // 3 个满缓冲：首读必读满 8192 → IsFull 扩容分支确定性触发
+            s.write_all(&vec![0xABu8; 8192 * 3]).await.unwrap();
+            s.shutdown().await.unwrap();
+        });
+
+        let (sock, _) = listener.accept().await.unwrap();
+        let (mut reader, _writer) = sock.into_link_io();
+
+        let mb = tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_multi_buffer())
+            .await
+            .expect("read timeout")
+            .expect("read ok");
+        assert_eq!(mb.len(), 8192, "首读（current=1）单缓冲");
+
+        let mb = tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_multi_buffer())
+            .await
+            .expect("read timeout")
+            .expect("read ok");
+        assert_eq!(mb.len(), 16 * 1024, "第二读应单次 readv 聚合 2 缓冲");
+        assert_eq!(mb.buffer_count(), 2);
+
+        let mb = tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_multi_buffer())
+            .await
+            .expect("read timeout")
+            .expect("read ok");
+        assert!(mb.is_empty(), "对端 shutdown → EOF 空 MultiBuffer");
+        client.await.unwrap();
+    }
+
+    /// 4vkp：分片到达边界不回归——残片先到时 reader 立即短读返回已到达字节
+    /// （不等满缓冲），后续分片按到达序完整重组（readv 短读语义）。
+    #[tokio::test]
+    async fn socks_tcp_inbound_reader_fragmented_arrival_boundary() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            s.write_all(b"HEADA").await.unwrap();
+            s.flush().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            s.write_all(b"YLOAD-BYTES").await.unwrap();
+            s.shutdown().await.unwrap();
+        });
+
+        let (sock, _) = listener.accept().await.unwrap();
+        let (mut reader, _writer) = sock.into_link_io();
+
+        let mb = tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_multi_buffer())
+            .await
+            .expect("read timeout")
+            .expect("read ok");
+        assert_eq!(mb.to_vec(), b"HEADA", "残片短读：只返回已到达字节");
+
+        let mb = tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_multi_buffer())
+            .await
+            .expect("read timeout")
+            .expect("read ok");
+        assert_eq!(mb.to_vec(), b"YLOAD-BYTES", "后续分片按序完整到达");
+
+        let mb = tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_multi_buffer())
+            .await
+            .expect("read timeout")
+            .expect("read ok");
+        assert!(mb.is_empty(), "EOF 空 MultiBuffer");
+        client.await.unwrap();
     }
 
     /// 端到端：VLESS client（tcp+reality 出站）→ serve_reality_vless → freedom → echo。

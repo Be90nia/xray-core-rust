@@ -1380,4 +1380,149 @@ mod tests {
         );
     }
 
+    /// `write_all_mb` 非 vectored 回退（y1yx）：`is_write_vectored=false` 的
+    /// 底层（TLS wrapper 等）逐 Buffer `write_all`，空 Buffer 不产生 syscall，
+    /// 字节序不变。
+    #[tokio::test]
+    async fn write_all_mb_non_vectored_fallback_per_buffer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use parking_lot::Mutex;
+
+        struct NonVectoredMock {
+            sink: Arc<Mutex<Vec<u8>>>,
+            write_calls: Arc<AtomicUsize>,
+        }
+        impl tokio::io::AsyncWrite for NonVectoredMock {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.write_calls.fetch_add(1, Ordering::SeqCst);
+                self.sink.lock().extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut s_write =
+            NonVectoredMock { sink: Arc::clone(&sink), write_calls: Arc::clone(&calls) };
+        assert!(!s_write.is_write_vectored());
+
+        let mb = xray_buf::multi::MultiBuffer::from_buffers(vec![
+            xray_buf::buffer::Buffer::from_vec(b"abc".to_vec()),
+            xray_buf::buffer::Buffer::from_vec(Vec::new()),
+            xray_buf::buffer::Buffer::from_vec(b"def".to_vec()),
+            xray_buf::buffer::Buffer::from_vec(b"ghi".to_vec()),
+        ]);
+        write_all_mb(&mut s_write, &mb).await.unwrap();
+        assert_eq!(*sink.lock(), b"abcdefghi");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "non-vectored fallback: one write per non-empty buffer, empty skipped"
+        );
+    }
+
+    /// 生产 split 形态透传（y1yx）：`bridge_link_with_stream_full` 经
+    /// `tokio::io::split` 后以 `WriteHalf` 为 W——split 时缓存 inner 的
+    /// `is_write_vectored`（tokio split.rs:36），`poll_write_vectored` 真透传，
+    /// vectored 聚合在生产接线不退化为逐段写。
+    #[tokio::test]
+    async fn write_all_mb_via_split_writehalf_forwards_vectored() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use parking_lot::Mutex;
+
+        struct VectoredMock {
+            sink: Arc<Mutex<Vec<u8>>>,
+            vectored_calls: Arc<AtomicUsize>,
+        }
+        impl tokio::io::AsyncWrite for VectoredMock {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.sink.lock().extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_write_vectored(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                bufs: &[io::IoSlice<'_>],
+            ) -> Poll<io::Result<usize>> {
+                self.vectored_calls.fetch_add(1, Ordering::SeqCst);
+                let mut sink = self.sink.lock();
+                let mut total = 0;
+                for b in bufs {
+                    sink.extend_from_slice(b);
+                    total += b.len();
+                }
+                Poll::Ready(Ok(total))
+            }
+            fn is_write_vectored(&self) -> bool {
+                true
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        // split 要求 AsyncRead；此测试只写不读，EOF 桩即可。
+        impl tokio::io::AsyncRead for VectoredMock {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = VectoredMock { sink: Arc::clone(&sink), vectored_calls: Arc::clone(&calls) };
+        let (_s_read, mut s_write) = tokio::io::split(mock);
+        assert!(
+            s_write.is_write_vectored(),
+            "WriteHalf must cache inner is_write_vectored at split time"
+        );
+
+        let mb = xray_buf::multi::MultiBuffer::from_buffers(vec![
+            xray_buf::buffer::Buffer::from_vec(b"abc".to_vec()),
+            xray_buf::buffer::Buffer::from_vec(b"def".to_vec()),
+            xray_buf::buffer::Buffer::from_vec(b"ghi".to_vec()),
+        ]);
+        write_all_mb(&mut s_write, &mb).await.unwrap();
+        assert_eq!(*sink.lock(), b"abcdefghi");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "vectored aggregation must survive the split(WriteHalf) indirection"
+        );
+    }
+
 }
