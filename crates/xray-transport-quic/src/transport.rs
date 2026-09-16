@@ -75,9 +75,15 @@ pub async fn dial(dest: &Destination, settings: &StreamSettings) -> io::Result<B
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client));
     client_config.transport_config(Arc::new(qc.build_transport_config()));
 
-    // 4. Endpoint + connect（外层 timeout 覆盖 DNS+握手+鉴权整段）
-    let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
-        .map_err(|e| io::Error::other(format!("quinn bind: {e}")))?;
+    // 4. Endpoint + connect（外层 timeout 覆盖 DNS+握手+鉴权整段）。
+    // GSO 默认开（quinn-udp 构造期探测 UDP_SEGMENT，内核不支持自动回退单段）；
+    // disableGSO=true 时经 NoGsoSocket 钳单段（见 udp_gso 模块 doc）。
+    let endpoint = crate::udp_gso::make_endpoint(
+        None,
+        "0.0.0.0:0".parse().unwrap(),
+        qc.disable_gso,
+    )
+    .map_err(|e| io::Error::other(format!("quinn bind: {e}")))?;
     let connecting = endpoint
         .connect_with(client_config, socket_addr, &sni)
         .map_err(|e| io::Error::other(format!("quinn connect initiate: {e}")))?;
@@ -122,8 +128,8 @@ pub async fn listen(
         .map_err(|e| io::Error::other(format!("rustls→quic server: {e}")))?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
     server_config.transport_config(Arc::new(qc.build_transport_config()));
-
-    let endpoint = quinn::Endpoint::server(server_config, addr)
+    // 同 dial：GSO 默认开，disableGSO=true 走 NoGsoSocket 单段路径。
+    let endpoint = crate::udp_gso::make_endpoint(Some(server_config), addr, qc.disable_gso)
         .map_err(|e| io::Error::other(format!("quinn bind: {e}")))?;
     let local = endpoint.local_addr()?;
 
@@ -339,5 +345,72 @@ mod tests {
         let post = ep.connect(addr, "127.0.0.1").unwrap().await;
         assert!(post.is_err(), "post-close connect must fail");
         ep.close(0u32.into(), b"test done");
+    }
+
+    /// echo 回显 handler：读到什么写回什么，EOF/错误即退。
+    fn echo_handler() -> ConnHandler {
+        Arc::new(|conn| {
+            tokio::spawn(async move {
+                let mut conn = conn;
+                let mut buf = vec![0u8; 16 * 1024];
+                loop {
+                    match conn.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if conn.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        })
+    }
+
+    /// GSO 开关 × 分段边界端到端：listen 全链路消费 quicSettings.disableGSO
+    /// （JSON → QuicConfig → make_endpoint 接线证明），客户端发 128 KiB
+    /// （>64 段 × ~1452B，quinn 多段 Transmit / UDP_SEGMENT 内核分段的
+    /// 边界场景，sing-box #4222 类错分段在此暴露）回环 echo 校验字节完整。
+    async fn echo_roundtrip_with(disable_gso: bool) {
+        ensure_provider();
+        let settings = StreamSettings {
+            protocol: "quic".into(),
+            security: "tls".into(),
+            transport_json: Some(serde_json::json!({ "disableGSO": disable_gso })),
+            ..Default::default()
+        };
+        let listener = listen("127.0.0.1:0".parse().unwrap(), &settings, echo_handler())
+            .await
+            .expect("listen");
+        let addr = listener.local_addr().unwrap();
+
+        let ep = quinn_client_connect(addr);
+        let payload: Vec<u8> = (0..(128 * 1024)).map(|i| i as u8).collect();
+        let work = async {
+            let conn = ep.connect(addr, "127.0.0.1").unwrap().await.unwrap();
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            send.write_all(&payload).await.unwrap();
+            send.finish().unwrap();
+            let mut echoed = vec![0u8; payload.len()];
+            recv.read_exact(&mut echoed).await.unwrap();
+            echoed
+        };
+        let echoed = tokio::time::timeout(std::time::Duration::from_secs(10), work)
+            .await
+            .expect("echo roundtrip within 10s");
+        assert_eq!(echoed, payload, "128 KiB echo must be byte-exact");
+        ep.close(0u32.into(), b"test done");
+    }
+
+    /// 禁用 GSO（NoGsoSocket 单段路径）链路仍通、分段边界正确。
+    #[tokio::test]
+    async fn echo_roundtrip_gso_disabled() {
+        echo_roundtrip_with(true).await;
+    }
+
+    /// 默认路径（Linux GSO 开，非 Linux 单段）回归保护：接线不得破坏现状。
+    #[tokio::test]
+    async fn echo_roundtrip_gso_default() {
+        echo_roundtrip_with(false).await;
     }
 }

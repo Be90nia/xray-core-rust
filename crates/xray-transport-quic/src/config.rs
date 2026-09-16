@@ -43,6 +43,8 @@ pub struct QuicConfig {
     pub disable_path_mtu_discovery: bool,
     /// 最大并发入站双向流（-1 = 不设上限 → quinn::VarInt::MAX）。
     pub max_incoming_streams: i64,
+    /// true 禁用 UDP 发送 GSO（Go `QuicParams.disableGSO`，默认 false = 启用）。
+    pub disable_gso: bool,
 }
 
 impl QuicConfig {
@@ -118,6 +120,7 @@ impl QuicConfig {
             keep_alive_period_ms: keep_period_ms,
             disable_path_mtu_discovery: get_bool("disablePathMtuDiscovery"),
             max_incoming_streams: get_i64("maxIncomingStreams"),
+            disable_gso: get_bool("disableGSO"),
         })
     }
 
@@ -259,6 +262,17 @@ mod tests {
         let cfg = QuicConfig::from_json(Some(&v)).unwrap();
         assert!(!cfg.keep_alive);
         assert!(cfg.congestion.is_empty());
+    }
+
+    #[test]
+    fn disable_gso_parsed() {
+        // Go QuicParams.disableGSO（config.proto:81）：缺省 false = GSO 启用。
+        let v: serde_json::Value = serde_json::from_str(r#"{"disableGSO":true}"#).unwrap();
+        let cfg = QuicConfig::from_json(Some(&v)).unwrap();
+        assert!(cfg.disable_gso);
+        let v: serde_json::Value = serde_json::from_str(r#"{}"#).unwrap();
+        let cfg = QuicConfig::from_json(Some(&v)).unwrap();
+        assert!(!cfg.disable_gso);
     }
 
     #[test]
