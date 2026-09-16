@@ -14,5 +14,6 @@
 pub mod config;
 pub mod register;
 pub mod transport;
+mod udp_gso;
 
 pub use config::QuicConfig;
