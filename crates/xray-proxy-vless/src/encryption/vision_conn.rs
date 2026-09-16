@@ -86,6 +86,12 @@ pub struct VisionConn<C> {
     /// poll_read 时的 16KB 栈帧占用（栈帧不被编译器复用）。Vec 容量在
     /// new/new_server 中按 16KB 预分配后稳态复用。
     read_tmp: Vec<u8>,
+    /// 写侧 DIRECT 已判定、待「当前 write 完成」才激活 raw_fallback 的挂起标志。
+    /// 对齐 Go f926ee4a（issue #4878）：激活提前于 in-flight 写时，第二个
+    /// writer（splice 泵/half-close）会与安全层写并发触碰同一 TCP fd →
+    /// SSL out-of-order。判定时仅置位；poll_write 把 pending 帧写完返回
+    /// Ok 时经 [`Self::arm_splice_raw`] 真正启用。
+    splice_armed: bool,
 }
 
 impl<C> VisionConn<C>
@@ -117,6 +123,7 @@ where
             raw_fallback: None,
             raw_tcp: None,
             read_tmp: Vec::with_capacity(16 * 1024),
+            splice_armed: false,
         }
     }
 
@@ -143,6 +150,7 @@ where
             raw_fallback: None,
             raw_tcp: Some(raw_tcp),
             read_tmp: Vec::with_capacity(16 * 1024),
+            splice_armed: false,
         }
     }
 
@@ -163,6 +171,7 @@ where
         Ok(())
     }
 }
+
 
 impl<C> AsyncRead for VisionConn<C>
 where
@@ -274,6 +283,7 @@ where
             // 1. 先写完 pending padded
             if let Some((padded, sent, orig_len)) = this.uplink_write_pending.take() {
                 if sent >= padded.len() {
+                    this.arm_splice_raw();
                     return Poll::Ready(Ok(orig_len));
                 }
                 match Pin::new(&mut this.inner).poll_write(cx, &padded[sent..]) {
@@ -289,6 +299,7 @@ where
                     Poll::Ready(Ok(n)) => {
                         let new_sent = sent + n;
                         if new_sent >= padded.len() {
+                            this.arm_splice_raw();
                             return Poll::Ready(Ok(orig_len));
                         }
                         this.uplink_write_pending = Some((padded, new_sent, orig_len));
@@ -346,10 +357,11 @@ where
             this.uplink_write_pending = Some((padded, 0, n));
             if command == COMMAND_PADDING_DIRECT {
                 this.uplink_padding = false;
-                if this.raw_fallback.is_none() {
-                    this.raw_fallback =
-                        this.raw_tcp.take().or_else(|| this.inner.inner_raw_tcp_clone());
-                }
+                // 只置挂起标志，不立即启用 raw 通道（对齐 Go f926ee4a）：
+                // 激活推迟到 pending 帧写完的 arm_splice_raw——若在此提前
+                // 启用，in-flight 写期间 poll_flush/poll_shutdown 会走 raw，
+                // 半关闭/并发写与安全层写竞态同一 TCP fd（issue #4878）。
+                this.splice_armed = true;
             }
             // continue → 步骤 1 写 pending
         }
@@ -362,7 +374,6 @@ where
         }
         Pin::new(&mut this.inner).poll_flush(cx)
     }
-
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         if let Some(raw) = this.raw_fallback.as_mut() {
@@ -371,6 +382,22 @@ where
             return Pin::new(raw).poll_shutdown(cx);
         }
         Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
+}
+
+impl<C: InnerRawClone> VisionConn<C> {
+    /// 写侧 splice 激活收口：pending DIRECT 帧完整写入底层后才调用。
+    /// 对齐 Go f926ee4a "Enable splice only after this write has completed"
+    /// （proxy.go WriteMultiBuffer 尾段）：激活只允许发生在 in-flight 写
+    /// 完成之后，防第二个 writer 并发触碰同一 TCP fd（issue #4878）。
+    fn arm_splice_raw(&mut self) {
+        if self.splice_armed {
+            self.splice_armed = false;
+            if self.raw_fallback.is_none() {
+                self.raw_fallback =
+                    self.raw_tcp.take().or_else(|| self.inner.inner_raw_tcp_clone());
+            }
+        }
     }
 }
 
@@ -719,5 +746,91 @@ mod tests {
         server.read_exact(&mut raw).await.unwrap();
         assert_eq!(&raw, b"raw-upstream");
     }
+    /// 造 std 回环 socket 对并转 tokio（#[test] 无 runtime 场景用）。
+    fn make_std_tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let c = std::net::TcpStream::connect(addr).unwrap();
+        let (s, _) = listener.accept().unwrap();
+        let mut pair = [(c, true), (s, false)];
+        for (stream, _) in pair.iter_mut() {
+            stream.set_nonblocking(true).unwrap();
+        }
+        let [c, s] = pair;
+        (
+            tokio::net::TcpStream::from_std(c.0).unwrap(),
+            tokio::net::TcpStream::from_std(s.0).unwrap(),
+        )
+    }
+
+    /// 6odi（Go f926ee4a / issue #4878）：DIRECT 帧仍 in-flight 时，写侧
+    /// splice 通道不得激活——poll_shutdown 探针必须走 inner，raw 腿零触碰。
+    /// 激活只允许发生在 pending 帧完整写入之后。
+    #[tokio::test]
+    async fn splice_activation_deferred_until_write_completes() {
+        let (raw_peer, raw_own) = make_std_tcp_pair();
+        let (inner, _inner_peer) = tokio::io::duplex(1);
+        let key = b"united-key".to_vec();
+        let mut server = VisionConn::new_server(
+            CommonConn::new(inner, Aead::new(b"ctx", &key, true), Aead::new(b"ctx", &key, true), true, key.clone()),
+            vec![0xABu8; 16],
+            raw_own,
+        );
+        // 白盒置位（生产由读侧 xtls_filter_tls 检测 ServerHello 置位）
+        server.downlink_traffic.enable_xtls = true;
+        let app = build_tls_app_data(b"GET / HTTP/1.1\r\n\r\n");
+
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        // 首次 poll_write：判 DIRECT → 置 armed → pending 帧写 inner 撞 1 字节
+        // duplex 背压 → Pending 返回。此刻帧 in-flight。
+        let poll = Pin::new(&mut server).poll_write(&mut cx, &app);
+        assert!(matches!(poll, Poll::Pending), "expected in-flight Pending, got {poll:?}");
+        // 判定已完成但写未完成：raw 通道必须仍未激活（f926ee4a 契约本体）
+        assert!(server.splice_armed, "DIRECT judged but not armed");
+        assert!(server.raw_fallback.is_none(), "raw must stay unactivated while write in-flight");
+        // 探针：in-flight 期间 half-close 必须走 inner；激活提前则此处会
+        // shutdown raw → 对端读到 EOF → 红票
+        let poll = Pin::new(&mut server).poll_shutdown(&mut cx);
+        assert!(matches!(poll, Poll::Ready(Ok(()))), "shutdown via inner should be ready");
+        let mut probe = [0u8; 1];
+        match raw_peer.try_read(&mut probe) {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Ok(0) => panic!("raw peer saw EOF: shutdown leaked to raw while write in-flight"),
+            other => panic!("raw peer unexpectedly readable while write in-flight: {other:?}"),
+        }
+    }
+
+    /// 6odi 写序契约：DIRECT 帧完整写完的那一刻 raw 通道才激活，其后写全走
+    /// raw 直传明文（判定期零激活 → 写完激活 → raw 明文可收）。
+    #[tokio::test]
+    async fn splice_raw_write_only_after_direct_completes() {
+        let ((mut c, _c2), (s, s2)) = make_tcp_pair().await;
+        let key = b"united-key".to_vec();
+        let mut server = VisionConn::new_server(
+            CommonConn::new(s, Aead::new(b"ctx", &key, true), Aead::new(b"ctx", &key, true), true, key.clone()),
+            vec![0xABu8; 16],
+            s2,
+        );
+        server.downlink_traffic.enable_xtls = true;
+        assert!(server.raw_fallback.is_none(), "pre-judgement must not activate raw");
+        let app = build_tls_app_data(b"GET / HTTP/1.1\r\n\r\n");
+        server.write_all(&app).await.unwrap();
+        server.flush().await.unwrap();
+        // 写完成点激活（armed 已消费）
+        assert!(!server.splice_armed, "armed flag consumed at write completion");
+        assert!(server.raw_fallback.is_some(), "raw activated right after write completes");
+        // 其后写全走 raw：对端先用 CommonConn 解密收 DIRECT 帧（dup 克隆
+        // 共对端，帧经 inner TLS 层），再切裸 socket 直收 raw 明文
+        let mut peer = CommonConn::new(c, Aead::new(b"ctx", &key, true), Aead::new(b"ctx", &key, true), true, key.clone());
+        let mut frame = vec![0u8; 16 + 5 + app.len()];
+        peer.read_exact(&mut frame).await.unwrap();
+        assert_eq!(frame[16], COMMAND_PADDING_DIRECT, "frame went through inner");
+        server.write_all(b"raw-after-splice").await.unwrap();
+        server.flush().await.unwrap();
+        let mut raw = [0u8; 16];
+        peer.inner_conn_mut().read_exact(&mut raw).await.unwrap();
+        assert_eq!(&raw, b"raw-after-splice");
+    }
 }
+
 
