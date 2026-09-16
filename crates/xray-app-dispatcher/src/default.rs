@@ -4440,9 +4440,15 @@ mod tests {
         });
         writer_task.await.unwrap();
 
-        // 等判定落盘（dial + 判定在 bridge 数据面前完成）
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let admitted = bridge.splice_admitted();
+        // 等判定落盘：轮询收敛到基准值（加固：慢 runner/并行负载下 dial 完成
+        // 可能晚于固定 sleep，读 AtomicBool 初始值假红。本测试 CI 假红的真根因
+        // 是 fc9050c 误删 TcpConnection::is_raw_tcp 覆写，已恢复）。5s 预算上限。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut admitted = bridge.splice_admitted();
+        while admitted != expected_admitted && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            admitted = bridge.splice_admitted();
+        }
         assert_eq!(
             admitted, expected_admitted,
             "DialBridge 判定必须与 bridge_splice_admission 基准一致"

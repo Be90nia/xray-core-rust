@@ -173,3 +173,46 @@ cmd /c "D:\tmp\buildenv.bat cargo test -p xray-app-dispatcher --lib"
   禁区（feature 分支域），待 8sum 方案 A 稳定后另开票迁移。
 - readv env 非法值语义与 splice 有既有差异（var() 非 UTF-8→未设 vs
   var_os lossy→禁用），本次行为保持未统一（改即越红线）。
+
+## 7. PM 打回修复轮（CI run 35045051104 Linux 假红定罪与修复）
+
+### 定罪（推翻打回假设）
+
+- 打回假设「env LazyLock 缓存致 set 不生效」**不成立**：全仓 grep
+  set_var/remove_var `xray.buf.splice`/`XRAY_BUF_SPLICE`/`xray.buf.readv`
+  零匹配（本批三态测试自带 ENV_LOCK+reload 正确适配）；且测试基准与
+  DialBridge 内部调**同一** `bridge_splice_admission`、同一 static——同
+  进程同刻不可能一真一假。
+- 真根因：**fc9050c（09-16 01:00，bd 09c4 Windows 半关闭票）误删**
+  `TcpConnection::is_raw_tcp()->true` 覆写（-3 行，git show 实锤）。因果
+  链：Linux 上基准 expected=true（outbound_raw 硬编码 true）vs 内部
+  `remote.is_raw_tcp()`=false → admitted=false；macOS 平台门恒 false 双
+  false 恒绿（解释 Linux-only）。**这是生产语义回归**（Linux splice 准入
+  被 outbound_raw 全拒，splice 生产激活失效），非仅测试问题。
+- 该测试引入于 fb0e7ba（09-12 架构收尾轮），非 D-2 触发；CI 红在
+  1991f5a（含 fc9050c）。
+
+### 修复（2 文件）
+
+- `crates/xray-transport/src/connection.rs`：恢复 TcpConnection
+  `is_raw_tcp()->true` 覆写（原位置 poll_read_multi 与 close_read 之间，
+  注明误删史）。
+- `crates/xray-app-dispatcher/src/default.rs`（测试）：固定 sleep(100ms)
+  改轮询收敛到基准值（10ms 步进、5s 预算，防慢 runner 假红加固），断言
+  原文不动。
+
+### 双侧验证
+
+```
+Linux Docker 床（rust:1-bookworm，platform_supported=true 路径）：
+  cargo test -p xray-app-dispatcher --lib
+  test default::tests::dialbridge_splice_gated_falls_back_and_flows ... ok
+  test result: ok. 129 passed; 0 failed
+Windows buildenv：
+  cargo test -p xray-transport --lib → 520 passed; 0 failed
+  cargo test -p xray-app-dispatcher --lib → 129 passed; 0 failed
+```
+
+### 同病排查
+
+全仓唯一 splice 判定交叉断言即本测试；set_var 依赖同病零个。
