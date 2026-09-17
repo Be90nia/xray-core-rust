@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 xray-common = { path = "../xray-common" }
 xray-transport = { path = "../xray-transport" }
+xray-transport-quic = { path = "../xray-transport-quic" }
 xray-app-dispatcher = { path = "../xray-app-dispatcher" }
 thiserror = { workspace = true }
 tokio = { workspace = true }

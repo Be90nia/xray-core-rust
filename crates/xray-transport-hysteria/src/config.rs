@@ -197,12 +197,15 @@ mod tests {
     fn padding_char_distribution_covers_alphabet() {
         // 大量样本下应该出现所有字符（避免模偏置灾难）。
         let p = Padding::new(0, 4000);
-        let s = p.generate();
+        // ponytail: 至少看到 50 个不同字符（共 62 个）即视为分布正常；
+        // 多轮采样消除「随机长度恰好很小」的单样本偶现（实测单轮 0.1% 概率塌）。
         let mut seen = std::collections::HashSet::new();
-        for c in s.chars() {
-            seen.insert(c);
+        for _ in 0..32 {
+            let s = p.generate();
+            for c in s.chars() {
+                seen.insert(c);
+            }
         }
-        // ponytail: 至少看到 50 个不同字符（共 62 个）即视为分布正常。
         assert!(
             seen.len() >= 50,
             "padding char distribution skewed: only {} distinct chars",

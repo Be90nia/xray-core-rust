@@ -10,6 +10,7 @@ xray-buf = { path = "../xray-buf" }
 xray-common = { path = "../xray-common" }
 xray-proto = { path = "../xray-proto" }
 xray-transport = { path = "../xray-transport" }
+xray-transport-quic = { path = "../xray-transport-quic" }
 xray-tls = { path = "../xray-tls" }
 thiserror = { workspace = true }
 tokio = { workspace = true }

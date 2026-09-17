@@ -11,6 +11,7 @@ use std::sync::Arc;
 use super::{
     bbr::{BbrSender, Profile},
     brutal::BrutalSender,
+    error::{CongestionError, Result},
     types::CongestionControl,
 };
 
@@ -20,18 +21,18 @@ pub const TYPE_RENO: &str = "reno";
 /// 规范化 congestion 类型字符串（对应 Go `NormalizeType`）。
 ///
 /// 空串 / "bbr" → `"bbr"`；"reno" → `"reno"`；其他 → Err。
-pub fn normalize_type(s: &str) -> crate::Result<String> {
+pub fn normalize_type(s: &str) -> Result<String> {
     match s.to_ascii_lowercase().as_str() {
         "" | "bbr" => Ok(TYPE_BBR.into()),
         "reno" => Ok(TYPE_RENO.into()),
-        other => Err(crate::HysteriaError::UnsupportedCongestionType(other.into())),
+        other => Err(CongestionError::UnsupportedCongestionType(other.into())),
     }
 }
 
 /// 规范化 BBR profile（对应 Go `NormalizeBBRProfile`）。
 ///
 /// 通过 [`Profile::parse`] 解析，返回 `&'static str`。
-pub fn normalize_bbr_profile(s: &str) -> crate::Result<&'static str> {
+pub fn normalize_bbr_profile(s: &str) -> Result<&'static str> {
     Profile::parse(s).map(|p| p.as_str())
 }
 
@@ -48,7 +49,7 @@ pub trait CongestionSetter: Send + Sync {
 /// 创建 BBR 发送器并应用到 setter（对应 Go `UseBBR`）。
 ///
 /// `initial_packet_size` 由 `GetInitialPacketSize(remote_addr)` 决定；
-/// Rust 端简化为由调用方传入（默认 [`crate::congestion::types::INITIAL_PACKET_SIZE`]）。
+/// Rust 端简化为由调用方传入（默认 [`crate::congestion_swappable::types::INITIAL_PACKET_SIZE`]）。
 pub fn use_bbr<S: CongestionSetter + ?Sized>(
     setter: &S,
     clock: Arc<dyn super::bbr::Clock>,
@@ -79,7 +80,7 @@ pub fn use_configured<S: CongestionSetter + ?Sized>(
     bbr_profile: &str,
     clock: Arc<dyn super::bbr::Clock>,
     initial_packet_size: i64,
-) -> crate::Result<()> {
+) -> Result<()> {
     if congestion_type.eq_ignore_ascii_case(TYPE_RENO) {
         return Ok(());
     }
@@ -148,8 +149,8 @@ mod tests {
     fn use_bbr_applies_cc_to_setter() {
         let setter = TestSetter::new();
         let clock: Arc<dyn super::super::bbr::Clock> =
-            Arc::new(crate::congestion::bbr::DefaultClock::new());
-        use_bbr(&setter, clock, crate::congestion::types::INITIAL_PACKET_SIZE, Profile::Standard);
+            Arc::new(crate::congestion_swappable::bbr::DefaultClock::new());
+        use_bbr(&setter, clock, crate::congestion_swappable::types::INITIAL_PACKET_SIZE, Profile::Standard);
         assert!(setter.was_set());
     }
 
@@ -164,7 +165,7 @@ mod tests {
     fn use_configured_reno_no_op() {
         let setter = TestSetter::new();
         let clock: Arc<dyn super::super::bbr::Clock> =
-            Arc::new(crate::congestion::bbr::DefaultClock::new());
+            Arc::new(crate::congestion_swappable::bbr::DefaultClock::new());
         use_configured(&setter, "reno", "standard", clock, 1200).unwrap();
         assert!(!setter.was_set()); // reno → no op
     }
@@ -173,7 +174,7 @@ mod tests {
     fn use_configured_default_applies_bbr() {
         let setter = TestSetter::new();
         let clock: Arc<dyn super::super::bbr::Clock> =
-            Arc::new(crate::congestion::bbr::DefaultClock::new());
+            Arc::new(crate::congestion_swappable::bbr::DefaultClock::new());
         use_configured(&setter, "", "standard", clock, 1200).unwrap();
         assert!(setter.was_set());
     }
@@ -182,7 +183,7 @@ mod tests {
     fn use_configured_invalid_profile_errors() {
         let setter = TestSetter::new();
         let clock: Arc<dyn super::super::bbr::Clock> =
-            Arc::new(crate::congestion::bbr::DefaultClock::new());
+            Arc::new(crate::congestion_swappable::bbr::DefaultClock::new());
         assert!(use_configured(&setter, "bbr", "weird", clock, 1200).is_err());
     }
 }

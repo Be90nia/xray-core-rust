@@ -17,3 +17,5 @@ quinn = { workspace = true }
 quinn-proto = { workspace = true }
 rustls = { workspace = true }
 bytes = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }

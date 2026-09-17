@@ -847,6 +847,7 @@ fn build_protocol_handler(
                 congestion_control: s.congestion_control,
                 heartbeat: s.heartbeat,
                 udp_relay_mode: s.udp_relay_mode,
+                brutal_up_bps: s.brutal_up_bps,
             };
             let dial_fn = xray_proxy_tuic::make_tuic_dial_fn_lazy(
                 s.server_addr.clone(),
@@ -2552,6 +2553,8 @@ struct TuicOutboundSettings {
     password: String,
     /// 拥塞控制（官方默认 bbr）。
     congestion_control: xray_proxy_tuic::CongestionControl,
+    /// Brutal 上行带宽（bps）；仅 hysteria_brutal 消费，0 = 未配置（解析层拒绝）。
+    brutal_up_bps: u64,
     /// ALPN 列表；空 → 默认 ["h3","tuic"]。
     alpn: Vec<Vec<u8>>,
     /// 0-RTT（官方名 zero_rtt_handshake；quinn 经会话恢复自动 0-RTT）。
@@ -2596,8 +2599,14 @@ fn parse_tuic_config(data: &[u8]) -> std::result::Result<TuicOutboundSettings, S
     let congestion_name = first.get("congestion_control").and_then(|v| v.as_str()).unwrap_or("bbr");
     let congestion_control = xray_proxy_tuic::CongestionControl::from_name(congestion_name)
         .ok_or_else(|| format!(
-            "invalid tuic congestion_control: {congestion_name} (valid: bbr, cubic, new_reno)"
+            "invalid tuic congestion_control: {congestion_name} (valid: bbr, cubic, new_reno, hysteria_bbr, hysteria_brutal)"
         ))?;
+    // s8ti：hysteria_brutal 带宽必须显式配置（TUIC 协议无 Hysteria-CC-RX/TX 协商，
+    // 带宽只能本地配置；未配置=0 在 crate 层会回落 BBR，这里 parse 时直接拒绝更明确）。
+    let brutal_up_bps = first.get("brutal_up_bps").and_then(|v| v.as_u64()).unwrap_or(0);
+    if congestion_control == xray_proxy_tuic::CongestionControl::HysteriaBrutal && brutal_up_bps == 0 {
+        return Err("tuic congestion_control=hysteria_brutal requires brutal_up_bps (> 0)".into());
+    }
     let alpn: Vec<Vec<u8>> = first.get("alpn").and_then(|v| v.as_array())
         .map(|arr| arr.iter()
             .filter_map(|x| x.as_str().map(|s| s.as_bytes().to_vec()))
@@ -2636,6 +2645,7 @@ fn parse_tuic_config(data: &[u8]) -> std::result::Result<TuicOutboundSettings, S
         uuid,
         password: password.to_string(),
         congestion_control,
+        brutal_up_bps,
         alpn,
         reduce_rtt,
         udp_relay_mode,
@@ -4175,6 +4185,28 @@ mod tests {
     fn parse_tuic_config_invalid_values_rejected() {
         assert!(parse_tuic_config(tuic_json(r#","udp_relay_mode":"udp""#).as_bytes()).is_err());
         assert!(parse_tuic_config(tuic_json(r#","congestion_control":"bbrv3""#).as_bytes()).is_err());
+    }
+
+    /// s8ti：hysteria_bbr / hysteria_brutal 变体解析；brutal 必须显式带 brutal_up_bps。
+    #[test]
+    fn parse_tuic_config_hysteria_cc_variants() {
+        let json = tuic_json(r#","congestion_control":"hysteria_bbr""#);
+        let s = parse_tuic_config(json.as_bytes()).unwrap();
+        assert_eq!(s.congestion_control, xray_proxy_tuic::CongestionControl::HysteriaBbr);
+        assert_eq!(s.brutal_up_bps, 0);
+
+        let json = tuic_json(r#","congestion_control":"hysteria_brutal","brutal_up_bps":10485760"#);
+        let s = parse_tuic_config(json.as_bytes()).unwrap();
+        assert_eq!(s.congestion_control, xray_proxy_tuic::CongestionControl::HysteriaBrutal);
+        assert_eq!(s.brutal_up_bps, 10_485_760);
+
+        // hysteria_brutal 无带宽 → 解析期拒绝（crate 层的 0 回落 BBR 只保护编程构造路径）。
+        let json = tuic_json(r#","congestion_control":"hysteria_brutal""#);
+        assert!(parse_tuic_config(json.as_bytes()).is_err());
+        // 既有三臂不受 brutal_up_bps 影响（配了也忽略）。
+        let json = tuic_json(r#","congestion_control":"bbr","brutal_up_bps":10485760"#);
+        let s = parse_tuic_config(json.as_bytes()).unwrap();
+        assert_eq!(s.congestion_control, xray_proxy_tuic::CongestionControl::Bbr);
     }
 
     /// fingerprint（uTLS 指纹）rustls 不支持——解析不报错，仅告警忽略。

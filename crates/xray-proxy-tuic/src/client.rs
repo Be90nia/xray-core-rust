@@ -33,6 +33,10 @@ use crate::protocol::command::type_code;
 use crate::udp::UniRespRouter;
 
 /// 拥塞控制算法（官方 tuic-client `congestion_control`）。
+///
+/// `Bbr`/`Cubic`/`NewReno` 为 quinn 内建实现；`HysteriaBbr`/`HysteriaBrutal`
+/// 为 hysteria 翻译版算法（s8ti），经共享 [`HysteriaCCSlot`](xray_transport_quic::congestion_swappable::HysteriaCCSlot)
+/// 通道预装 TransportConfig，建链即生效。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CongestionControl {
     /// BBR（官方默认，Itsusinn/tuic config.rs `CongestionControl::Bbr`）。
@@ -42,6 +46,14 @@ pub enum CongestionControl {
     Cubic,
     /// New Reno——quinn 无内置实现，构建时回落 CUBIC。
     NewReno,
+    /// hysteria 翻译版 BBR（quic-go 完整状态机：bandwidth sampler + windowed filter）。
+    HysteriaBbr,
+    /// hysteria Brutal 固定带宽发送器（窗口 = 2×bps×rtt）。
+    ///
+    /// TUIC v5 协议无 Hysteria-CC-RX/TX 协商头，带宽只能本地配置
+    /// （[`TuicConnectOptions::brutal_up_bps`]）；未配置（0）时回落 BBR，
+    /// 对齐 hysteria `min(up, down)=0` 语义。
+    HysteriaBrutal,
 }
 
 impl CongestionControl {
@@ -52,6 +64,8 @@ impl CongestionControl {
             "bbr" => Some(Self::Bbr),
             "cubic" => Some(Self::Cubic),
             "new_reno" | "newreno" => Some(Self::NewReno),
+            "hysteria_bbr" => Some(Self::HysteriaBbr),
+            "hysteria_brutal" => Some(Self::HysteriaBrutal),
             _ => None,
         }
     }
@@ -94,6 +108,9 @@ pub struct TuicConnectOptions {
     /// [`TuicUdpAssoc::send_recv_native`]（QUIC DATAGRAM）哪个作为
     /// dispatcher UDP 分支的承载方式。
     pub udp_relay_mode: UdpRelayMode,
+    /// Brutal 上行带宽（bps）。仅 [`CongestionControl::HysteriaBrutal`] 消费；
+    /// 0（默认）= 未配置 → 回落 BBR。
+    pub brutal_up_bps: u64,
 }
 
 impl Default for TuicConnectOptions {
@@ -102,6 +119,7 @@ impl Default for TuicConnectOptions {
             congestion_control: CongestionControl::Bbr,
             heartbeat: std::time::Duration::from_secs(3),
             udp_relay_mode: UdpRelayMode::Native,
+            brutal_up_bps: 0,
         }
     }
 }
@@ -197,6 +215,7 @@ impl TuicClient {
 
         // 获取或新建连接
         let congestion_control = options.congestion_control;
+        let brutal_up_bps = options.brutal_up_bps;
         let pooled = reconnect
             .get_or_reconnect(|| {
                 let rustls_config = rustls_config.clone();
@@ -207,6 +226,7 @@ impl TuicClient {
                         &server_name,
                         rustls_config,
                         congestion_control,
+                        brutal_up_bps,
                     )
                     .await
                 }
@@ -255,6 +275,7 @@ impl TuicClient {
         server_name: &str,
         rustls_config: Arc<rustls::ClientConfig>,
         congestion_control: CongestionControl,
+        brutal_up_bps: u64,
     ) -> Result<quinn::Connection> {
         // TUIC v5 要求 ALPN；仅在未配置时用默认 [h3, tuic]，用户 alpn 不覆盖（bd 7p0）
         let mut rustls_config = (*rustls_config).clone();
@@ -273,26 +294,7 @@ impl TuicClient {
         ));
         let mut transport = quinn::TransportConfig::default();
         transport.datagram_receive_buffer_size(Some(8 * 1024));
-        // 拥塞控制：bbr → quinn BBR；cubic → CUBIC；
-        // new_reno 显式降级 CUBIC（quinn 无内置 NewReno，不静默——票 ieik）
-        match congestion_control {
-            CongestionControl::Bbr => {
-                transport.congestion_controller_factory(Arc::new(
-                    quinn_proto::congestion::BbrConfig::default(),
-                ));
-            }
-            CongestionControl::Cubic => {
-                transport.congestion_controller_factory(Arc::new(
-                    quinn_proto::congestion::CubicConfig::default(),
-                ));
-            }
-            CongestionControl::NewReno => {
-                tracing::warn!("tuic: quinn has no NewReno, falling back to CUBIC");
-                transport.congestion_controller_factory(Arc::new(
-                    quinn_proto::congestion::CubicConfig::default(),
-                ));
-            }
-        }
+        apply_congestion_to_transport(&mut transport, congestion_control, brutal_up_bps);
         let mut quinn_client_cfg = quinn_client_cfg;
         quinn_client_cfg.transport_config(Arc::new(transport));
 
@@ -405,6 +407,67 @@ pub(crate) fn resolve_first(addr: impl ToSocketAddrs) -> Result<SocketAddr> {
         .map_err(Into::into)
 }
 
+/// 把 CC 配置预装进 TransportConfig（s8ti）。
+///
+/// - `Bbr`/`Cubic`/`NewReno`：quinn 内建工厂直装（与 s8ti 前行为逐字节一致：
+///   bbr → BBR、cubic → CUBIC、new_reno 显式降级 CUBIC 不静默——票 ieik），
+///   返回 `None`；
+/// - `HysteriaBbr`/`HysteriaBrutal`：装可热切换共享槽
+///   [`HysteriaCCSlot`](xray_transport_quic::congestion_swappable::HysteriaCCSlot)
+///   并预载算法——TUIC 协议无 Hysteria-CC-RX/TX 协商头，无 auth 后热切换事件，
+///   建链前预载即最终算法；返回 `Some(slot)` 供测试/遥测探针。
+///
+/// Brutal 带宽 `brutal_up_bps` 未配置（0）时回落 BBR，对齐 hysteria
+/// `min(up, down)=0` 时选 BBR 的协商语义。Brutal 窗口 = 2×bps×rtt：
+/// 回环/亚毫秒 RTT 下带宽必须 MB/s 级，否则窗口被钳到 1 MTU（见
+/// congestion_swappable::quinn_bridge 契约测试）。
+fn apply_congestion_to_transport(
+    transport: &mut quinn::TransportConfig,
+    congestion_control: CongestionControl,
+    brutal_up_bps: u64,
+) -> Option<Arc<xray_transport_quic::congestion_swappable::HysteriaCCSlot>> {
+    use xray_transport_quic::congestion_swappable as cc;
+
+    match congestion_control {
+        // —— 既有三臂：quinn 内建，零行为变化 ——
+        CongestionControl::Bbr => {
+            transport.congestion_controller_factory(Arc::new(
+                quinn_proto::congestion::BbrConfig::default(),
+            ));
+            None
+        }
+        CongestionControl::Cubic => {
+            transport.congestion_controller_factory(Arc::new(
+                quinn_proto::congestion::CubicConfig::default(),
+            ));
+            None
+        }
+        CongestionControl::NewReno => {
+            tracing::warn!("tuic: quinn has no NewReno, falling back to CUBIC");
+            transport.congestion_controller_factory(Arc::new(
+                quinn_proto::congestion::CubicConfig::default(),
+            ));
+            None
+        }
+        // —— s8ti：hysteria 翻译版算法经共享槽预装 ——
+        CongestionControl::HysteriaBbr => {
+            let slot = cc::install_swappable_cc(transport);
+            cc::apply_bbr(&slot, cc::bbr::Profile::Standard);
+            Some(slot)
+        }
+        CongestionControl::HysteriaBrutal => {
+            let slot = cc::install_swappable_cc(transport);
+            if brutal_up_bps == 0 {
+                tracing::warn!("tuic: hysteria_brutal without brutal_up_bps, falling back to BBR");
+                cc::apply_bbr(&slot, cc::bbr::Profile::Standard);
+            } else {
+                cc::apply_brutal(&slot, brutal_up_bps, false);
+            }
+            Some(slot)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,5 +498,54 @@ mod tests {
         assert_eq!(UdpRelayMode::from_name("native"), Some(UdpRelayMode::Native));
         assert_eq!(UdpRelayMode::from_name("QUIC"), Some(UdpRelayMode::Quic));
         assert_eq!(UdpRelayMode::from_name("udp"), None);
+    }
+
+    #[test]
+    fn congestion_control_from_name_hysteria_variants() {
+        assert_eq!(CongestionControl::from_name("hysteria_bbr"), Some(CongestionControl::HysteriaBbr));
+        assert_eq!(
+            CongestionControl::from_name("HYSTERIA_BRUTAL"),
+            Some(CongestionControl::HysteriaBrutal)
+        );
+        // 既有名不受影响；默认仍是官方 Bbr。
+        assert_eq!(CongestionControl::default(), CongestionControl::Bbr);
+    }
+
+    /// s8ti 契约 1：hysteria CC 配置 → TransportConfig 预装共享槽并预载算法。
+    #[test]
+    fn hysteria_cc_preloads_swappable_slot() {
+        let mut t = quinn::TransportConfig::default();
+        let slot = apply_congestion_to_transport(&mut t, CongestionControl::HysteriaBbr, 0)
+            .expect("hysteria_bbr must install the swappable slot");
+        assert!(slot.has_active(), "BBR must be preloaded before connect");
+
+        let mut t = quinn::TransportConfig::default();
+        let slot =
+            apply_congestion_to_transport(&mut t, CongestionControl::HysteriaBrutal, 10_000_000)
+                .expect("hysteria_brutal must install the swappable slot");
+        assert!(slot.has_active(), "Brutal must be preloaded before connect");
+    }
+
+    /// s8ti 契约 1b：Brutal 未配置带宽（0）→ 预载回落为 BBR（仍有 active），
+    /// 对齐 hysteria min(up, down)=0 语义。
+    #[test]
+    fn hysteria_brutal_without_bandwidth_falls_back_to_bbr() {
+        let mut t = quinn::TransportConfig::default();
+        let slot = apply_congestion_to_transport(&mut t, CongestionControl::HysteriaBrutal, 0)
+            .expect("slot must be installed even when falling back");
+        assert!(slot.has_active());
+    }
+
+    /// s8ti 契约 2：未配置路径不变性——既有三臂走 quinn 内建工厂，
+    /// 不装共享槽（返回 None），行为与 s8ti 前逐字节一致。
+    #[test]
+    fn builtin_cc_paths_do_not_install_swappable_slot() {
+        for cc in [CongestionControl::Bbr, CongestionControl::Cubic, CongestionControl::NewReno] {
+            let mut t = quinn::TransportConfig::default();
+            assert!(
+                apply_congestion_to_transport(&mut t, cc, 0).is_none(),
+                "{cc:?} must keep the quinn built-in factory"
+            );
+        }
     }
 }

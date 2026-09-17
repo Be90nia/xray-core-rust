@@ -15,7 +15,9 @@
 //!
 //! - UDP 分片重组（FRAG_TOTAL/FRAG_ID/SIZE）
 //! - native 模式（QUIC DATAGRAM 传输 UDP 包）
-//! - 自定义 congestion controller（BBR/Brutal）
+//! - 自定义 congestion controller（BBR/Brutal）——s8ti 已落地：
+//!   `congestion_control=hysteria_bbr/hysteria_brutal`（+`brutal_up_bps`）经
+//!   xray-transport-quic 共享 HysteriaCCSlot 通道预装；quinn 内建三臂默认不变
 
 pub mod client;
 pub mod dispatcher;

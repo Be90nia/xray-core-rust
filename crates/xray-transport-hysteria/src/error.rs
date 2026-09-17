@@ -27,14 +27,6 @@ pub enum HysteriaError {
     #[error("auth failed code {0}")]
     AuthFailed(u16),
 
-    /// 不支持的拥塞控制类型。
-    #[error("unsupported congestion type: {0}")]
-    UnsupportedCongestionType(String),
-
-    /// 不支持的 BBR profile。
-    #[error("unsupported BBR profile: {0}")]
-    UnsupportedBbrProfile(String),
-
     /// 连接已关闭。
     #[error("connection closed")]
     ConnectionClosed,
@@ -65,14 +57,6 @@ mod tests {
             "unknown masq type: foo"
         );
         assert_eq!(HysteriaError::AuthFailed(403).to_string(), "auth failed code 403");
-        assert_eq!(
-            HysteriaError::UnsupportedCongestionType("cubic".into()).to_string(),
-            "unsupported congestion type: cubic"
-        );
-        assert_eq!(
-            HysteriaError::UnsupportedBbrProfile("weird".into()).to_string(),
-            "unsupported BBR profile: weird"
-        );
         assert_eq!(HysteriaError::ConnectionClosed.to_string(), "connection closed");
     }
 

@@ -490,7 +490,7 @@ impl CongestionControl for BbrSender {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::congestion::{bbr::DefaultClock, types::test_support::MockRttStats};
+    use crate::congestion_swappable::{bbr::DefaultClock, types::test_support::MockRttStats};
 
     fn make_sender() -> BbrSender {
         BbrSender::new(Arc::new(DefaultClock::new()), INITIAL_PACKET_SIZE, Profile::Standard)
