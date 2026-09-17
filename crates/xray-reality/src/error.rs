@@ -92,20 +92,12 @@ pub enum RealityError {
     #[error("REALITY: mldsa65_seed length is {actual}, expected 32")]
     InvalidMldsa65SeedLen { actual: usize },
 
-    /// ML-DSA-65 后量子证书签名未实现。
-    ///
-    /// Go（XTLS/REALITY handshake_server_tls13.go）在握手函数内部生成证书，
-    /// 先拿到 ServerHello 原始字节再把 mldsa65 签名写入 cert[126:]；Rust 端
-    /// rustls `ResolvesServerCert::resolve()` 只暴露 ClientHello，证书选定前
-    /// 无法获得 ServerHello 字节 → 签名路径暂缺（签名原语本身可用 `ml_dsa` crate）。
-    #[error("REALITY: mldsa65 certificate signing not yet implemented in Rust")]
-    Mldsa65NotImplemented,
-
     /// ML-DSA-65 验签失败（公钥/签名解码失败，多为脏数据或长度错）。
-    /// tvky：与 `Mldsa65NotImplemented` 不同——验签原语已可用，仅签名生成
-    /// 因拿不到 ServerHello 字节受限。客户端若配 `mldsa65Verify` 且服务端
-    /// 未带 mldsa65 扩展，Go 端会回退到标准 x509 验证（仍会失败），Rust 端
-    /// 当前回退路径也未实现。
+    /// tvky：验签原语对接 RustCrypto ml-dsa（与 xray-cli 同 crate）。
+    /// cm97：签名生成端（[`crate::mitm`]）与客户端 btls ServerHello 捕获
+    /// 验签链路已落地；客户端配 `mldsa65Verify` 而服务端未带 mldsa65 扩展时，
+    /// Go 端回退标准 x509 验证（必败断连），Rust 端以
+    /// [`RealityError::RealCertificateReceived`] 等价断连。
     #[error("REALITY: mldsa65 signature decode failed")]
     Mldsa65VerifyFailed,
 

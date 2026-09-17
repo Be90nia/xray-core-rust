@@ -78,6 +78,11 @@ OPENSSL_EXPORT void SSL_set_reality_rewrite_cb(
     int (*cb)(SSL *ssl, uint8_t *msg, size_t msg_len));
 """
 
+REALITY_SERVER_HELLO_SSL_H_DECL = """
+OPENSSL_EXPORT void SSL_set_reality_server_hello_cb(
+    int (*cb)(SSL *ssl, const uint8_t *msg, size_t msg_len));
+"""
+
 REALITY_REWRITE_SSL_LIB_IMPL = """
 int (*g_reality_rewrite_cb)(SSL *ssl, uint8_t *msg, size_t msg_len) = nullptr;
 void SSL_set_reality_rewrite_cb(int (*cb)(SSL *ssl, uint8_t *msg, size_t msg_len)) {
@@ -91,6 +96,23 @@ bool ssl_reality_rewrite_maybe(SSL *ssl, Array<uint8_t> *msg) {
     return true;
   }
   return g_reality_rewrite_cb(ssl, (*msg).data(), (*msg).size()) != 0;
+}
+}  // namespace bssl
+"""
+
+REALITY_SERVER_HELLO_SSL_LIB_IMPL = """
+int (*g_reality_server_hello_cb)(SSL *ssl, const uint8_t *msg, size_t msg_len) = nullptr;
+void SSL_set_reality_server_hello_cb(
+    int (*cb)(SSL *ssl, const uint8_t *msg, size_t msg_len)) {
+  g_reality_server_hello_cb = cb;
+}
+
+namespace bssl {
+bool ssl_reality_server_hello_maybe(SSL *ssl, const SSLMessage &msg) {
+  if (g_reality_server_hello_cb == nullptr || CBS_len(&msg.raw) == 0) {
+    return true;
+  }
+  return g_reality_server_hello_cb(ssl, CBS_data(&msg.raw), CBS_len(&msg.raw)) != 0;
 }
 }  // namespace bssl
 """
@@ -133,6 +155,24 @@ CLIENT_HELLO_NEW = """      !ssl->method->finish_message(ssl, cbb.get(), &msg)) 
 TLS13_SID_DECL_OLD = """  Span<const uint8_t> expected_session_id =
       SSL_is_dtls(hs->ssl) ? Span<const uint8_t>() : Span(hs->session_id);
 
+"""
+
+# TLS 1.3 客户端 ServerHello 处理：key schedule 前挂 ServerHello 捕获
+# （与 ClientHello patch 同型——transcript 计入前窗口，拿到线上原始字节；
+#  HRR 走 do_read_hello_retry_request 独立路径，不会触发本挂点）
+TLS13_SH_HOOK_OLD = """  if (!tls13_advance_key_schedule(hs, shared_secret) ||  //
+      !ssl_hash_message(hs, msg) ||                      //
+      !tls13_derive_handshake_secrets(hs)) {
+    return ssl_hs_error;
+  }
+"""
+
+TLS13_SH_HOOK_NEW = """  if (!ssl_reality_server_hello_maybe(ssl, msg) ||
+      !tls13_advance_key_schedule(hs, shared_secret) ||  //
+      !ssl_hash_message(hs, msg) ||                      //
+      !tls13_derive_handshake_secrets(hs)) {
+    return ssl_hs_error;
+  }
 """
 
 TLS13_SID_CMP_OLD = """      Span<const uint8_t>(out->session_id) != expected_session_id ||
@@ -212,6 +252,8 @@ def apply_reality_patches(dest: Path) -> None:
         add.append(REALITY_SSL_H_DECL)
     if "SSL_set_reality_rewrite_cb" not in text:
         add.append(REALITY_REWRITE_SSL_H_DECL)
+    if "SSL_set_reality_server_hello_cb" not in text:
+        add.append(REALITY_SERVER_HELLO_SSL_H_DECL)
     if add:
         anchor = (
             "OPENSSL_EXPORT int SSL_set1_client_key_shares(SSL *ssl,\n"
@@ -232,6 +274,8 @@ def apply_reality_patches(dest: Path) -> None:
         add.append(REALITY_SSL_LIB_IMPL)
     if "SSL_set_reality_rewrite_cb" not in text:
         add.append(REALITY_REWRITE_SSL_LIB_IMPL)
+    if "SSL_set_reality_server_hello_cb" not in text:
+        add.append(REALITY_SERVER_HELLO_SSL_LIB_IMPL)
     if add:
         anchor = (
             "int SSL_set1_client_key_shares(SSL *ssl, const uint16_t *group_ids,\n"
@@ -253,11 +297,22 @@ def apply_reality_patches(dest: Path) -> None:
     # ---- 4. internal.h 声明 ----
     internal_h = dest / "ssl" / "internal.h"
     text = internal_h.read_text(encoding="utf-8")
+    changed = False
     if "ssl_reality_rewrite_maybe" not in text:
         anchor = "bool ssl_add_message_cbb(SSL *ssl, CBB *cbb);\n"
         text = insert_after(
             text, anchor, "\nbool ssl_reality_rewrite_maybe(SSL *ssl, Array<uint8_t> *msg);\n"
         )
+        changed = True
+    if "ssl_reality_server_hello_maybe" not in text:
+        anchor = "bool ssl_reality_rewrite_maybe(SSL *ssl, Array<uint8_t> *msg);\n"
+        text = insert_after(
+            text, anchor,
+            "\n// REALITY (cert PQC): ServerHello 捕获（tls13_client.cc key schedule 前）。\n"
+            "bool ssl_reality_server_hello_maybe(SSL *ssl, const SSLMessage &msg);\n",
+        )
+        changed = True
+    if changed:
         internal_h.write_text(text, encoding="utf-8", newline="\n")
         print("applied reality patch: internal.h")
     else:
@@ -283,7 +338,7 @@ def apply_reality_patches(dest: Path) -> None:
     else:
         print("reality patch already present: handshake_client.cc (skip)")
 
-    # ---- 7. tls13_client.cc 删 session_id 回显 ----
+    # ---- 7. tls13_client.cc 删 session_id 回显 + ServerHello 捕获挂点 ----
     tls13_cc = dest / "ssl" / "tls13_client.cc"
     text = tls13_cc.read_text(encoding="utf-8")
     if "expected_session_id" in text:
@@ -296,7 +351,15 @@ def apply_reality_patches(dest: Path) -> None:
         tls13_cc.write_text(text, encoding="utf-8", newline="\n")
         print("applied reality patch: tls13_client.cc (session_id echo removed)")
     else:
-        print("reality patch already present: tls13_client.cc (skip)")
+        print("reality patch already present: tls13_client.cc (session_id echo removed, skip)")
+
+    # ---- 8. tls13_client.cc ServerHello 捕获挂点（transcript 计入前）----
+    if "ssl_reality_server_hello_maybe" not in text:
+        text = replace_exact(text, TLS13_SH_HOOK_OLD, TLS13_SH_HOOK_NEW, "tls13_client.cc SH hook")
+        tls13_cc.write_text(text, encoding="utf-8", newline="\n")
+        print("applied reality patch: tls13_client.cc (server hello hook)")
+    else:
+        print("reality patch already present: tls13_client.cc (server hello hook, skip)")
 
 
 def main() -> None:

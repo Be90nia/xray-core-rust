@@ -19,10 +19,12 @@
 //! - [`error`] / [`util`]
 //!
 //! ## 已知缺口
-//! - mldsa65 后量子证书**签名生成**：rustls `ResolvesServerCert::resolve()` 拿不到
-//!   ServerHello 字节（见 [`mitm::generate_reality_ed25519_cert_mldsa65`]）。tvky
-//!   已落地：X25519MLKEM768 hybrid KX（服务端 key_share 解析）+ mldsa65 公钥派生
-//!   + 客户端验签原语；签名生成仍 stub。
+//! - mldsa65 后量子证书签名的**服务端生产接线**：签名原语已实现
+//!   （[`mitm::generate_reality_ed25519_cert_mldsa65`]，契约测试覆盖），客户端
+//!   btls ServerHello 捕获 + 验签链路已落地（cm97）；但 rustls
+//!   `ResolvesServerCert::resolve()` 拿不到 ServerHello 字节（btls 无 server
+//!   acceptor），`server_tls` 生产路径仍下发标准 cert。tvky 已落地：
+//!   X25519MLKEM768 hybrid KX（服务端 key_share 解析）+ mldsa65 公钥派生。
 //! - http2 spider 爬行（fallback 探测路径；`spider_x` 已解析保留，爬行未实现）
 //! - btls 全指纹 e2e 矩阵 `#[ignore]`（btls transcript mismatch，待 fork 注入 API）
 //!

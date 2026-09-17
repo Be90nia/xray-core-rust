@@ -157,15 +157,30 @@ struct BtlsRealityHooks {
     server_pub: [u8; 32],
     /// 客户端 short_id（≤8 字节）。
     short_id: Vec<u8>,
+    /// 客户端 mldsa65 验签公钥（`mldsa65Verify`，1952B；空 = 不做 PQC 验证）。
+    mldsa65_verify: Vec<u8>,
     /// rewrite 时派生的 auth_key（verify 阶段复用）。
     auth_key: Mutex<Option<[u8; 32]>>,
+    /// 最终发出的 ClientHello handshake message（transcript 回调窗口缓存；
+    /// HRR 重发时覆盖为最后一次，对齐 Go `Hello.Raw`）。
+    client_hello_raw: Mutex<Option<Vec<u8>>>,
+    /// 收到的 ServerHello handshake message（BoringSSL 入站捕获，cm97；
+    /// 对齐 Go `HandshakeState.ServerHello.Raw`）。
+    server_hello_raw: Mutex<Option<Vec<u8>>>,
 }
 
 impl BtlsRealityHooks {
     fn new(config: &RealityConfig) -> Result<Self, RealityError> {
         let mut server_pub = [0u8; 32];
         server_pub.copy_from_slice(&config.public_key);
-        Ok(Self { server_pub, short_id: config.short_id.clone(), auth_key: Mutex::new(None) })
+        Ok(Self {
+            server_pub,
+            short_id: config.short_id.clone(),
+            mldsa65_verify: config.mldsa65_verify.clone(),
+            auth_key: Mutex::new(None),
+            client_hello_raw: Mutex::new(None),
+            server_hello_raw: Mutex::new(None),
+        })
     }
 }
 
@@ -278,9 +293,19 @@ impl RealityHooks for BtlsRealityHooks {
 
         msg[SID_OFF..SID_OFF + 32].copy_from_slice(&sid);
         *self.auth_key.lock() = Some(auth_key);
+        // 缓存最终发出的 ClientHello（HRR 重发覆盖），verify 阶段拼 mldsa65 消息
+        *self.client_hello_raw.lock() = Some(msg.to_vec());
         Ok(())
     }
-    /// 握手后验证证书：末尾 64 字节须为 HMAC-SHA512(auth_key, ed25519 pubkey)。
+
+    /// ServerHello 入站捕获（cm97）：缓存原始 handshake message 供 verify
+    /// 阶段拼 mldsa65 签名消息（对齐 Go `h.Write(ServerHello.Raw)`）。
+    fn on_server_hello(&self, msg: &[u8]) -> io::Result<()> {
+        *self.server_hello_raw.lock() = Some(msg.to_vec());
+        Ok(())
+    }
+    /// 握手后验证证书：末尾 64 字节须为 HMAC-SHA512(auth_key, ed25519 pubkey)；
+    /// 配置 `mldsa65Verify` 时追加 PQC 扩展验签（cm97）。
     ///
     /// 对应 Go `UConn.VerifyPeerCertificate`；失败 = 真证书/被转发 → 断连。
     fn verify_handshake(&self, ssl: &SslRef) -> io::Result<()> {
@@ -293,23 +318,71 @@ impl RealityHooks for BtlsRealityHooks {
             .ok_or_else(|| io::Error::other("REALITY: server sent no certificate"))?;
         let der = x509_to_der(&cert)
             .ok_or_else(|| io::Error::other("REALITY: failed to encode peer certificate"))?;
-        let Some(pub_key) = extract_ed25519_pubkey(&der) else {
-            return Err(io::Error::other(
-                "REALITY: received real certificate (potential MITM or redirection)",
+        let ch_raw = self.client_hello_raw.lock().clone();
+        let sh_raw = self.server_hello_raw.lock().clone();
+        verify_reality_cert_full(
+            &der,
+            &auth_key,
+            &self.mldsa65_verify,
+            ch_raw.as_deref(),
+            sh_raw.as_deref(),
+        )
+        .map_err(io::Error::other)
+    }
+}
+
+/// REALITY 证书完整验证（标准 HMAC 尾 + 可选 mldsa65 PQC 扩展验签）。
+///
+/// 对应 Go `UConn.VerifyPeerCertificate` 全部分支：
+/// 1. `HMAC(auth_key, pub)` == cert 末尾 64B（两种模板都必须）；
+/// 2. 配置 `mldsa65Verify` 时：cert 必须带 OID 0.0 扩展（服务端 mldsa65 变体
+///    模板标记），`HMAC(auth, pub‖CH.Raw‖SH.Raw)` 的 ML-DSA-65 验签必须通过。
+///    Go 端此分支失败会落 x509 fallback（对自签 REALITY cert 必败 → 断连），
+///    Rust 无 x509 fallback，直接返回错误——语义等价。
+///
+/// 提纯自 [`BtlsRealityHooks::verify_handshake`]（`SslRef` 不可 mock），
+/// 契约测试直接驱动本函数。
+fn verify_reality_cert_full(
+    cert_der: &[u8],
+    auth_key: &[u8; 32],
+    mldsa65_verify: &[u8],
+    client_hello_raw: Option<&[u8]>,
+    server_hello_raw: Option<&[u8]>,
+) -> Result<(), RealityError> {
+    let Some(pub_key) = extract_ed25519_pubkey(cert_der) else {
+        return Err(RealityError::RealCertificateReceived);
+    };
+    if cert_der.len() < 64 {
+        return Err(RealityError::RealCertificateReceived);
+    }
+    let sig = &cert_der[cert_der.len() - 64..];
+    let ok = crypto::verify_reality_certificate(auth_key, &pub_key, sig).unwrap_or(false);
+    if !ok {
+        return Err(RealityError::RealCertificateReceived);
+    }
+    // Go: if len(c.Config.Mldsa65Verify) > 0 { ... }
+    if !mldsa65_verify.is_empty() {
+        let (Some(ch_raw), Some(sh_raw)) = (client_hello_raw, server_hello_raw) else {
+            // btls 路径两个捕获点恒先于 verify 触发；缺失 = 栈行为异常
+            return Err(RealityError::TlsHandshake(
+                "REALITY: ClientHello/ServerHello not captured for mldsa65 verification".into(),
             ));
         };
-        if der.len() < 64 {
-            return Err(io::Error::other("REALITY: certificate too short"));
+        // Go: if len(certs[0].Extensions) > 0 —— 无扩展 = 服务端未签 mldsa65 →
+        // x509 fallback 必败 → 断连
+        let (off, len) = crate::util::find_oid_0_0_extension(cert_der).ok_or(
+            RealityError::RealCertificateReceived,
+        )?;
+        let ext_sig = &cert_der[off..off + len];
+        let msg =
+            crypto::hmac_reality_message(auth_key, &pub_key, ch_raw, sh_raw)?;
+        let verified =
+            crypto::verify_mldsa65_signature(mldsa65_verify, &msg, ext_sig).unwrap_or(false);
+        if !verified {
+            return Err(RealityError::RealCertificateReceived);
         }
-        let sig = &der[der.len() - 64..];
-        let ok = crypto::verify_reality_certificate(&auth_key, &pub_key, sig).unwrap_or(false);
-        if !ok {
-            return Err(io::Error::other(
-                "REALITY: received real certificate (potential MITM or redirection)",
-            ));
-        }
-        Ok(())
     }
+    Ok(())
 }
 
 /// 证书 DER 编码（[`xray_tls::btls_reality::x509_to_der`] 转发）。
@@ -517,5 +590,87 @@ mod tests {
         let sig = &cert_der[cert_der.len() - 64..];
         let ok = crypto::verify_reality_certificate(&auth_key, &pub_key, sig).unwrap();
         assert!(ok, "REALITY cert HMAC should verify");
+    }
+
+    /// cm97 契约：完整验证链——mldsa65 服务端 cert（mitm 生成）→ 客户端
+    /// verify_reality_cert_full 通过（捕获 CH/SH 来自真实回调用）。
+    #[test]
+    fn verify_full_mldsa65_cert_roundtrip() {
+        let auth_key = [0x42u8; 32];
+        let seed = [0x07u8; 32];
+        let ch = [0x11u8; 256];
+        let sh = [0x22u8; 90];
+        let (cert_der, _) =
+            crate::mitm::generate_reality_ed25519_cert_mldsa65(&auth_key, &ch, &sh, &seed)
+                .unwrap();
+        let pubkey_1952 = crypto::derive_mldsa65_pubkey(&seed).unwrap();
+
+        verify_reality_cert_full(
+            &cert_der,
+            &auth_key,
+            &pubkey_1952,
+            Some(&ch),
+            Some(&sh),
+        )
+        .expect("mldsa65 signed cert must verify");
+    }
+
+    /// mldsa65Verify 配置 + 标准cert（无 OID 0.0 扩展）→ 拒绝（Go 语义：
+    /// Extensions 空 → x509 fallback 必败断连）。
+    #[test]
+    fn verify_full_rejects_standard_cert_when_mldsa65_configured() {
+        let auth_key = [0x42u8; 32];
+        let seed = [0x07u8; 32];
+        let (std_cert, _) = crate::mitm::generate_reality_ed25519_cert(&auth_key).unwrap();
+        let pubkey_1952 = crypto::derive_mldsa65_pubkey(&seed).unwrap();
+        let err = verify_reality_cert_full(
+            &std_cert,
+            &auth_key,
+            &pubkey_1952,
+            Some(&[0x11u8; 256]),
+            Some(&[0x22u8; 90]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, RealityError::RealCertificateReceived));
+    }
+
+    /// 篡改 ServerHello → mldsa65 验签失败（签名覆盖 CH‖SH 上下文）。
+    #[test]
+    fn verify_full_rejects_tampered_server_hello() {
+        let auth_key = [0x42u8; 32];
+        let seed = [0x07u8; 32];
+        let (cert_der, _) = crate::mitm::generate_reality_ed25519_cert_mldsa65(
+            &auth_key,
+            &[0x11u8; 256],
+            &[0x22u8; 90],
+            &seed,
+        )
+        .unwrap();
+        let pubkey_1952 = crypto::derive_mldsa65_pubkey(&seed).unwrap();
+        let err = verify_reality_cert_full(
+            &cert_der,
+            &auth_key,
+            &pubkey_1952,
+            Some(&[0x11u8; 256]),
+            Some(&[0x99u8; 90]), // SH 被替换
+        )
+        .unwrap_err();
+        assert!(matches!(err, RealityError::RealCertificateReceived));
+    }
+
+    /// mldsa65 未配置 + 标准 cert → 通过（非 PQC 链路现状兼容）；
+    /// mldsa65 配置但捕获缺失 → 显式错误（栈异常，不静默放行）。
+    #[test]
+    fn verify_full_without_mldsa65_and_missing_capture() {
+        let auth_key = [0x42u8; 32];
+        let (std_cert, _) = crate::mitm::generate_reality_ed25519_cert(&auth_key).unwrap();
+        // 未配置 mldsa65Verify：CH/SH 缺失不影响
+        verify_reality_cert_full(&std_cert, &auth_key, &[], None, None)
+            .expect("standard path must stay compatible");
+        // 配置了 mldsa65Verify 但捕获缺失：显式 TlsHandshake 错误
+        let pubkey_1952 = vec![0xabu8; crypto::MLDSA65_PUBKEY_LEN];
+        let err = verify_reality_cert_full(&std_cert, &auth_key, &pubkey_1952, None, None)
+            .unwrap_err();
+        assert!(matches!(err, RealityError::TlsHandshake(_)));
     }
 }
