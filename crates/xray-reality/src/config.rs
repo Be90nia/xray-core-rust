@@ -358,8 +358,8 @@ mod tests {
         p.mldsa65_seed = vec![0xaa; 32];
         let cfg = RealityConfig::from_proto(&p).unwrap();
         assert_eq!(cfg.mldsa65_seed, Some(vec![0xaa; 32]));
-        // mldsa65_key 留 None（等接入 circl/sign/mldsa65）
-        assert!(cfg.mldsa65_key.is_none());
+        // tvky(c77319e)：seed 已接入 ML-DSA-65 派生（derive_mldsa65_pubkey），key 非空
+        assert!(cfg.mldsa65_key.is_some());
     }
 
     /// Go `(*[32]byte)(c.Mldsa65Seed)`：长度 ≠ 32 直接失败
