@@ -37,7 +37,14 @@ runs:
         python3 -c "import sys, pathlib; sys.path.insert(0, 'tools'); from setup_boringssl_reality import apply_reality_patches; apply_reality_patches(pathlib.Path('$RUNNER_TEMP/boringssl'))"
         echo "BORING_BSSL_ASSUME_PATCHED=1" >> "$GITHUB_ENV"
         echo "BORING_BSSL_SOURCE_PATH=$bssl" >> "$GITHUB_ENV"
-        # rust-cache 命中旧 btls-sys cmake build（无新符号）→ 强制清掉已构建产物让 cargo 重建
+        # rust-cache 命中旧 btls-sys cmake build（无新符号）→ 强制清掉已构建产物让 cargo 重建。
+        # 必须同时清 .fingerprint/btls-sys-*：btls-sys build/main.rs emit_rerun_if_changed
+        # 只 emit `cargo:rerun-if-changed=patches`，不跟踪 BORING_BSSL_SOURCE_PATH 下 include/openssl/ssl.h
+        # ——setup_boringssl_reality.py 重新 patch 后 cargo 看 fingerprint 命中旧 source 跳过
+        # build script 重跑，bindgen 不重跑、bindings.rs 用旧版（缺 server_hello_cb）、ssl.lib 用旧版
+        # → release 链接 LNK2019 SSL_set_reality_server_hello_cb。b56719e 只清 build/ 不够，
+        # fingerprint 还在 cargo 不 rerun build script。
         for td in "${CARGO_TARGET_DIR:-target}" "."; do
           find "$GITHUB_WORKSPACE/$td/build/btls-sys-*" -mindepth 1 -delete 2>/dev/null || true
+          find "$GITHUB_WORKSPACE/$td/.fingerprint/btls-sys-*" -mindepth 1 -delete 2>/dev/null || true
         done
