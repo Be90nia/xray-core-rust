@@ -872,35 +872,36 @@ mod tests {
     async fn proxy_protocol_header_written_when_source_available() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        // 同步 barrier：服务端读完 PROXY header 行后通知测试线程写 payload——
+        // 消除「macOS loopback 把 header 与 payload 分两段送达、单次 read 只
+        // 见头→rest 为空→不回显→5s 超时」竞态。
+        let (header_ready_tx, header_ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
             let (mut sock, _) = listener.accept().await.unwrap();
-            // macOS loopback may deliver PROXY header 与 payload 在独立 TCP 段
-            // （Linux 常合并），单次 read 只见头时丢负载 → 修法=读到 \r\n
-            // 把 PROXY header 完整消费完，再回显之后所有收到的字节。
-            let mut buf = Vec::with_capacity(512);
-            let mut tmp = [0u8; 256];
-            let mut header_end: Option<usize> = None;
-            while header_end.is_none() {
-                let n = match sock.read(&mut tmp).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => n,
-                };
-                buf.extend_from_slice(&tmp[..n]);
-                if let Some(idx) = buf.windows(2).position(|w| w == b"\r\n") {
-                    header_end = Some(idx + 2);
+            let mut header = Vec::with_capacity(64);
+            loop {
+                let mut one = [0u8; 1];
+                let n = sock.read(&mut one).await.unwrap_or(0);
+                if n == 0 {
+                    panic!("server: conn closed before PROXY header terminator");
+                }
+                header.push(one[0]);
+                if header.ends_with(b"\r\n") {
+                    break;
                 }
             }
             assert!(
-                buf.starts_with(b"PROXY "),
+                header.starts_with(b"PROXY "),
                 "first bytes must be PROXY header, got: {:?}",
-                String::from_utf8_lossy(&buf)
+                String::from_utf8_lossy(&header)
             );
-            if let Some(end) = header_end {
-                let rest = &buf[end..];
-                if !rest.is_empty() {
-                    let _ = sock.write_all(rest).await;
-                }
+            // 通知测试线程：header 已消费完，可安全写 payload
+            let _ = header_ready_tx.send(());
+            // 等 payload 全部到达后再回显（payload 长度固定 20B；read_exact 等满）
+            let mut payload = [0u8; 20];
+            if sock.read_exact(&mut payload).await.is_ok() {
+                let _ = sock.write_all(&payload).await;
             }
         });
 
@@ -932,6 +933,11 @@ mod tests {
         };
         let task = tokio::spawn(bridge.dispatch_with_access(&dest, link, access));
 
+        // 等服务端确认 header 已读完 → 再写 payload（payload 经 bridge → conn
+        // → 服务端 read_exact 收齐）。
+        header_ready_rx
+            .await
+            .expect("server did not signal PROXY header ready");
         let mut w = Box::new(up_w) as Box<dyn Writer>;
         let mut mb = MultiBuffer::new();
         mb.merge_bytes(b"payload-after-header");
@@ -945,6 +951,7 @@ mod tests {
         assert_eq!(resp.to_vec(), b"payload-after-header");
         w.shutdown();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+        let _ = server.await;
     }
 
     /// bd 2yj2：domainStrategy=UseIPv4 注入 sockopt → dial_system 经
