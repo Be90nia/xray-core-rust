@@ -263,30 +263,30 @@ where
                                     .take()
                                     .or_else(|| this.inner.inner_raw_tcp_clone());
                             }
-                            // txno-splice 修复（Interop r2 vless_vision_tls 停摆
-                            // 定罪，CI run 35056488359）：切换前回收 inner TLS 层
-                            // 已解密残余——TLS 流单次 recv 可能过读吞入「DIRECT
-                            // 记录之后」的字节，其中已完整解密的部分在此 drain
-                            // 拼到 direct 流头部（对齐 Go CommonConn.Read 的
-                            // c.input 残余自持语义，encryption/common.go:80-143）。
-                            // Pending=无更多已解密数据，正常终止；Err=对端已切
-                            // 裸流后的记录解析噪声，预期吞掉不传播；Ok(0)=EOF。
-                            loop {
-                                let mut rb = ReadBuf::new(&mut this.read_tmp[..]);
-                                match Pin::new(&mut this.inner).poll_read(cx, &mut rb) {
-                                    Poll::Ready(Ok(())) => {
-                                        let filled = rb.filled();
-                                        if filled.is_empty() {
-                                            break;
-                                        }
-                                        content.extend_from_slice(filled);
-                                        if filled.len() < this.read_tmp.len() {
-                                            break; // 短读=已取尽当前缓冲
-                                        }
-                                    }
-                                    _ => break,
-                                }
-                            }
+                            // 切换后**禁止再读 inner**（txno-splice 终版语义，
+                            // 取代 dbe9f49 的 drain 循环）：DIRECT 是对端安全层
+                            // 的最后一条隧道记录（其 writer 同步切裸流），TCP 字
+                            // 节流全序保证此帧之前的字节已按序交付，inner 的
+                            // received_plaintext 此刻必空。此后 inner 上的任何额
+                            // 外 poll_read 都是对 socket 的一次 recv：把对端已切
+                            // 裸流的端到端明文字节拉进 rustls deframer——
+                            // - 完整记录：用隧道密钥解密 → DecryptError → 字节
+                            //   被 TLS 层吞掉（静默数据丢失）；
+                            // - 半条记录：Pending 滞留 opaque 缓冲，切 raw dup
+                            //   后该前缀永久不可达（字节流断裂）。
+                            // dbe9f49 的 drain 恰好制造第一种丢失（其 Err 吞掉
+                            // 分支），且对真实 TLS 层永远回收不到东西（DIRECT
+                            // 帧之后不存在可解密记录）。Go 无此坑：crypto/tls
+                            // readFromUntil 按当前记录精确读取不过读，且
+                            // UnwrapRawConn 前经 unsafe 反射抓私有 input/
+                            // rawInput 清空（inbound.go:583-586 + proxy.go
+                            // L259-270）。rustls 无公开 API 触达 deframer 内部
+                            // 缓冲，唯一安全解 = DIRECT 帧交付后封读 inner。
+                            // 已知残余边界（读侧过读窗口）：若对端 raw 字节与
+                            // DIRECT 帧同段合流、在同一次 recv 进入 deframer，
+                            // 该尾段仍不可达——需 record-framer 级改造（对齐 Go
+                            // readFromUntil 精确读形态）方可根治，概率远低于
+                            // 写侧激活竞态（本轮 macOS #08 实测定罪为写侧）。
                         }
                     }
                     if !content.is_empty() {
@@ -321,8 +321,15 @@ where
             // 1. 先写完 pending padded
             if let Some((padded, sent, orig_len)) = this.uplink_write_pending.take() {
                 if sent >= padded.len() {
-                    this.arm_splice_raw();
-                    return Poll::Ready(Ok(orig_len));
+                    // 帧已写完：过激活闸门（inner flush 确认）再 arm raw
+                    match this.poll_arm_gate(cx) {
+                        Poll::Ready(Ok(())) => return Poll::Ready(Ok(orig_len)),
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => {
+                            this.uplink_write_pending = Some((padded, sent, orig_len));
+                            return Poll::Pending;
+                        }
+                    }
                 }
                 match Pin::new(&mut this.inner).poll_write(cx, &padded[sent..]) {
                     // Ok(0)（非空 buf）= 底层无法再接受数据；裸 Pending 无 waker
@@ -337,8 +344,18 @@ where
                     Poll::Ready(Ok(n)) => {
                         let new_sent = sent + n;
                         if new_sent >= padded.len() {
-                            this.arm_splice_raw();
-                            return Poll::Ready(Ok(orig_len));
+                            // 帧写完：过激活闸门（inner flush 确认）再 arm raw。
+                            // inner 可能刚以 BufWriter 语义返回 Ok（密文尾巴滞
+                            // 留 sendable_tls），flush Pending 则挂回 pending 帧
+                            // 等下一轮（waker 已由 inner poll_flush 注册）。
+                            match this.poll_arm_gate(cx) {
+                                Poll::Ready(Ok(())) => return Poll::Ready(Ok(orig_len)),
+                                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                                Poll::Pending => {
+                                    this.uplink_write_pending = Some((padded, new_sent, orig_len));
+                                    return Poll::Pending;
+                                }
+                            }
                         }
                         this.uplink_write_pending = Some((padded, new_sent, orig_len));
                         // 底层 Ready，continue 循环继续写剩余 padded（避免无 wakeup 的 Pending）
@@ -423,7 +440,37 @@ where
     }
 }
 
-impl<C: InnerRawClone> VisionConn<C> {
+impl<C> VisionConn<C>
+where
+    C: InnerRawClone + AsyncWrite + Unpin,
+{
+    /// 写侧 splice 激活闸门：DIRECT 帧写完 → 先确认 inner 安全层密文全部
+    /// 落 socket → 才 arm raw。返回 `Ready(Ok(()))` = 已（或无需）激活。
+    ///
+    /// 为什么必须 flush：tokio-rustls 的 `poll_write` 是 BufWriter 语义
+    /// （common/mod.rs poll_write 的 `(n, true) => Poll::Ready(Ok(n))` 分支）
+    /// ——`Ok(len)` 只保证密文进入内部 sendable_tls 缓冲，write_io 撞
+    /// WouldBlock 时尾巴仍滞留缓冲。若看到 Ok(len) 就 arm raw：
+    /// - 尾巴滞留时激活后 `poll_flush`/`poll_shutdown` 已改道 raw_fallback，
+    ///   TLS 记录尾巴**永久出不去**——对端 deframer 停在半条记录上永久
+    ///   Pending（双方零 error 静默停摆，macOS Interop #08 r2 实测形态）；
+    /// - 尾巴随后被下一次 inner 写带出时，后续 raw 字节已先上线——线序
+    ///   颠倒，对端把 raw 明文当隧道 TLS 记录解析 → DecryptError 级联。
+    /// Go 无此坑：crypto/tls.Conn.Write 从不虚报写完。
+    fn poll_arm_gate(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if !self.splice_armed {
+            return Poll::Ready(Ok(()));
+        }
+        match Pin::new(&mut self.inner).poll_flush(cx) {
+            Poll::Ready(Ok(())) => {
+                self.arm_splice_raw();
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
     /// 写侧 splice 激活收口：pending DIRECT 帧完整写入底层后才调用。
     /// 对齐 Go f926ee4a "Enable splice only after this write has completed"
     /// （proxy.go WriteMultiBuffer 尾段）：激活只允许发生在 in-flight 写
@@ -872,15 +919,14 @@ mod tests {
 
     /// SslStream 语义替身：模拟外层 TLS 流的「过读 + opaque 缓冲」——单次
     /// 底层 recv 把「DIRECT 记录 + 其后裸字节」一起吞进内部缓冲，但只吐出
-    /// 第一段（DIRECT 记录明文）。`drainable=false`=真实 SslStream 现状
-    /// （裸尾滞留 opaque 永不浮现，DIRECT 切换即丢失）；`drainable=true`
-    /// =修复验收形态（残余可经后续 poll 回收，VisionConn 切换前的 drain
-    /// 循环负责拼到 direct 流头部）。
+    /// 第一段（DIRECT 记录明文）。真实 SslStream/rustls 现状：裸尾滞留
+    /// opaque 缓冲永不浮现，DIRECT 切换后不可再从 inner 回收。`reads` 记
+    /// 录 poll_read 调用次数，用于断言「DIRECT 帧交付后封读 inner」契约。
     struct SslSwallowMock {
         first: Vec<u8>,
         swallowed: Vec<u8>,
         delivered: bool,
-        drainable: bool,
+        reads: usize,
     }
     impl AsyncRead for SslSwallowMock {
         fn poll_read(
@@ -889,13 +935,14 @@ mod tests {
             buf: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
             let this = self.get_mut();
+            this.reads += 1;
             if !this.delivered {
                 this.delivered = true;
                 let n = this.first.len().min(buf.remaining());
                 buf.put_slice(&this.first[..n]);
                 return Poll::Ready(Ok(()));
             }
-            if this.drainable && !this.swallowed.is_empty() {
+            if !this.swallowed.is_empty() {
                 let n = this.swallowed.len().min(buf.remaining());
                 buf.put_slice(&this.swallowed[..n]);
                 this.swallowed.clear();
@@ -921,16 +968,16 @@ mod tests {
     }
     impl InnerRawClone for SslSwallowMock {}
 
-    /// txno-splice 机制实锤（Interop r2 vless_vision_tls 停摆定罪，CI run
-    /// 35056488359）：DIRECT 外层记录与其后裸字节在同一次 recv 合流时，
-    /// SslStream 过读把裸尾吞进 opaque 缓冲，VisionConn 切 raw dup 后裸尾
-    /// 永久不可达——上层（curl 的端到端 TLS）流截断/悬死。契约：切换前
-    /// 必须把 inner 已解密残余 drain 拼到 direct 流头部（修复于
-    /// `AsyncRead for VisionConn` DIRECT 切换分支）。`drainable=true`=
-    /// 修复验收形态（残余可经 poll 回收）；修复前实测红 2.02s
-    /// （Elapsed 悬死，取证记录见 docs/impl-nevn-splice-2026-09-16.md）。
+    /// txno-splice 终版读侧契约（macOS Interop #08 r2 定罪链，取代
+    /// dbe9f49 的 drain 契约）：DIRECT 帧交付后 VisionConn **不得再读
+    /// inner**。对端 writer 在 DIRECT 帧后已切裸流，inner（TLS 层）此后的
+    /// 每次 recv 都会把端到端明文拉进 deframer：完整记录被 DecryptError
+    /// 吞掉（dbe9f49 drain 的 Err 分支恰在制造这种静默丢失），半条记录
+    /// 滞留 opaque 缓冲切 raw dup 后永久不可达。两种都是字节流断裂。
+    /// 契约本体 = 读计数实锤：DIRECT 帧消费后 inner poll_read 次数停在
+    /// 消费该帧的那一次，后续数据必须全部经 raw 通道。
     #[tokio::test]
-    async fn direct_switch_coalesced_trailing_bytes_survive() {
+    async fn direct_switch_never_reads_inner_again() {
         let uuid = vec![0xABu8; 16];
         let app = build_tls_app_data(b"hello-direct");
         let frame = xtls_padding(
@@ -941,33 +988,132 @@ mod tests {
             &DEFAULT_PADDING_SEED,
             &mut StdRng::from_os_rng(),
         );
-        let trailing = b"COALESCED-RAW-TAIL".to_vec();
         let (_raw_peer, raw_own) = make_std_tcp_pair();
         let mut rx = VisionConn::new_server(
             SslSwallowMock {
                 first: frame,
-                swallowed: trailing.clone(),
+                swallowed: b"COALESCED-RAW-TAIL".to_vec(),
                 delivered: false,
-                drainable: true,
+                reads: 0,
             },
             uuid,
             raw_own,
         );
         rx.downlink_traffic.enable_xtls = true;
 
-        // 读 #1：DIRECT 帧 content 正常解出（基线，必须绿）
+        // 读 #1：DIRECT 帧 content 正常解出（基线）
         let mut got = vec![0u8; app.len()];
         rx.read_exact(&mut got).await.unwrap();
         assert_eq!(got, app, "DIRECT content must decode");
 
-        // 读 #2（契约本体）：同次 recv 合流的裸尾必须交付上层。
-        // 当前实现：裸尾滞留 SslStream opaque 缓冲，读悬死 → 超时红。
-        let mut tail = vec![0u8; trailing.len()];
+        // 契约本体：DIRECT 帧交付后不得再读 inner（防把裸流字节拉进
+        // deframer 被 DecryptError 吞掉/滞留）。读计数必须停在 1。
+        assert_eq!(
+            rx.inner.reads, 1,
+            "inner must never be polled again after the DIRECT frame is delivered"
+        );
+
+        // raw 通道接管：对端裸发明文必须直达 caller，且 inner 读计数不动
+        let (mut raw_peer, mut raw_own2) = make_std_tcp_pair();
+        rx.raw_fallback = Some(raw_own2);
+        raw_peer.write_all(b"raw-downlink").await.unwrap();
+        let mut tail = [0u8; 12];
         tokio::time::timeout(std::time::Duration::from_secs(2), rx.read_exact(&mut tail))
             .await
-            .expect("coalesced trailing bytes must be delivered to the caller")
+            .expect("raw downlink bytes must flow after the switch")
             .unwrap();
-        assert_eq!(&tail, &trailing, "coalesced raw tail must survive the switch");
+        assert_eq!(&tail, b"raw-downlink");
+        assert_eq!(
+            rx.inner.reads, 1,
+            "raw-path reads must not touch the inner TLS layer"
+        );
+    }
+
+    /// 写侧激活闸门实锤（macOS Interop #08 r2 定罪，本轮修复本体）：
+    /// tokio-rustls `poll_write` 是 BufWriter 语义——`Ok(len)` 只代表密文
+    /// 进入内部 sendable_tls 缓冲，write_io 撞 WouldBlock 时尾巴滞留缓冲
+    /// （common/mod.rs poll_write 的 `(n, true) => Ok(n)` 分支）。旧实现见
+    /// Ok(len) 即 arm raw：激活后 poll_flush/poll_shutdown 改道 raw，TLS
+    /// 记录尾巴**永久出不去** → 对端 deframer 停在半条记录上永久 Pending
+    /// （双方零 error 静默停摆，run 35207920919 c8/s8 形态）；或尾巴被
+    /// 下次 inner 写带出时后续 raw 字节已先上线（线序颠倒 → DecryptError
+    /// 级联 → curl "HTTP2 framing layer"）。契约：DIRECT 帧写完后，raw
+    /// 通道必须等 inner flush Ready 才激活；flush Pending 期间 poll_write
+    /// 不得虚报写完成、raw_fallback 必须保持 None。
+    struct DeferredFlushMock {
+        flush_polls: usize,
+    }
+    impl AsyncRead for DeferredFlushMock {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+    impl AsyncWrite for DeferredFlushMock {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            // BufWriter 语义：无条件虚报「全部写完」（尾巴留在内部缓冲）
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            this.flush_polls += 1;
+            if this.flush_polls == 1 {
+                Poll::Pending // write_io 撞 WouldBlock，尾巴滞留
+            } else {
+                Poll::Ready(Ok(())) // 尾巴落 socket
+            }
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl InnerRawClone for DeferredFlushMock {
+        fn inner_raw_tcp_clone(&self) -> Option<TcpStream> {
+            Some(make_std_tcp_pair().1)
+        }
+    }
+
+    #[tokio::test]
+    async fn splice_raw_activation_waits_for_inner_flush() {
+        let mock = DeferredFlushMock { flush_polls: 0 };
+        let mut client = VisionConn::new(mock, vec![0xABu8; 16]);
+        // 白盒置位（生产由读侧 xtls_filter_tls 检测 ServerHello 置位）
+        client.downlink_traffic.enable_xtls = true;
+        let app = build_tls_app_data(b"GET / HTTP/1.1\r\n\r\n");
+
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        // poll_write #1：判 DIRECT → 帧写入 inner（虚报 Ok）→ 激活闸门
+        // flush #1 Pending → poll_write 必须返回 Pending，raw 保持未激活
+        let poll = Pin::new(&mut client).poll_write(&mut cx, &app);
+        assert!(
+            matches!(poll, Poll::Pending),
+            "must not report write completion while inner flush pending, got {poll:?}"
+        );
+        assert!(client.splice_armed, "gate engaged");
+        assert!(
+            client.raw_fallback.is_none(),
+            "raw must stay unactivated while inner flush pending"
+        );
+
+        // poll_write #2（桥重试）：闸门 flush #2 Ready → arm raw → 写完成
+        let poll = Pin::new(&mut client).poll_write(&mut cx, &app);
+        assert!(
+            matches!(poll, Poll::Ready(Ok(n)) if n == app.len()),
+            "write completes only after inner flush, got {poll:?}"
+        );
+        assert!(!client.splice_armed, "armed flag consumed");
+        assert!(
+            client.raw_fallback.is_some(),
+            "raw activates exactly after inner flush completes"
+        );
+        assert_eq!(client.inner.flush_polls, 2, "gate drove exactly two flush polls");
     }
 }
 
