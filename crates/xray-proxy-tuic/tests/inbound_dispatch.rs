@@ -77,6 +77,8 @@ async fn tuic_inbound_dispatches_via_router() {
             password: password.to_string(),
             cert_der: None,
             key_der: None,
+            congestion_control: None,
+            brutal_up_bps: 0,
         },
     )
     .unwrap()

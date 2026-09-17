@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use xray_features::inbound::{InboundError, InboundHandler};
 
+use crate::client::{CongestionControl, apply_congestion_to_transport};
 use crate::error::{Result, TuicError};
 use crate::protocol::command::{type_code, TOKEN_LEN};
 use crate::protocol::{Command, Packet};
@@ -38,6 +39,12 @@ pub struct TuicInboundConfig {
     pub cert_der: Option<Vec<u8>>,
     /// 私钥 DER（None 则自动生成）。
     pub key_der: Option<Vec<u8>>,
+    /// 拥塞控制（None = 不预装，quinn 默认 CUBIC——官方 tuic-server 缺省
+    /// `congestion_control: "cubic"`，行为等价零变化）。
+    pub congestion_control: Option<CongestionControl>,
+    /// Brutal 上行带宽（bps）；仅 [`CongestionControl::HysteriaBrutal`] 消费，
+    /// 0 = 未配置（crate 层回落 BBR，解析层显式拒绝）。
+    pub brutal_up_bps: u64,
 }
 
 /// 自签证书产物。
@@ -144,6 +151,11 @@ impl TuicInboundHandler {
 
         let mut transport = quinn::TransportConfig::default();
         transport.datagram_receive_buffer_size(Some(8 * 1024));
+        // 服务端 CC 预装（对称 outbound 侧）：TUIC v5 无 Hysteria-CC 协商头，
+        // 无 auth 后热切换事件，建链前预装即最终算法。
+        if let Some(cc) = self.config.congestion_control {
+            apply_congestion_to_transport(&mut transport, cc, self.config.brutal_up_bps);
+        }
         let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_server_cfg));
 
         server_cfg.transport_config(Arc::new(transport));
@@ -415,5 +427,71 @@ fn tuic_addr_to_destination(addr: &crate::protocol::Address) -> Option<xray_comm
         crate::protocol::Address::None => return None,
     };
     Some(Destination::new(addr, Port::new(port), Network::TCP))
+}
+
+#[cfg(test)]
+mod cc_tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn make_handler(cc: Option<CongestionControl>, brutal_up_bps: u64) -> TuicInboundHandler {
+        TuicInboundHandler::new(
+            "cc-test",
+            TuicInboundConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                server_name: "localhost".to_string(),
+                uuid: Uuid::new_v4(),
+                password: "cc-test".to_string(),
+                cert_der: None,
+                key_der: None,
+                congestion_control: cc,
+                brutal_up_bps,
+            },
+        )
+        .unwrap()
+    }
+
+    /// 票 7ykg 契约：服务端预装走共享槽——Hysteria* 算法 slot.has_active()
+    /// （预装即最终算法，TUIC 无 auth 后热切换事件）；quinn 内建三臂返回 None。
+    /// apply 层契约与 outbound 侧同源（同一 pub(crate) 函数）。
+    #[test]
+    fn inbound_congestion_preload_contract() {
+        use crate::client::apply_congestion_to_transport;
+
+        let mut t = quinn::TransportConfig::default();
+        let slot = apply_congestion_to_transport(&mut t, CongestionControl::HysteriaBbr, 0)
+            .expect("server-side hysteria_bbr must install the swappable slot");
+        assert!(slot.has_active(), "BBR must be preloaded before accept");
+
+        let mut t = quinn::TransportConfig::default();
+        let slot =
+            apply_congestion_to_transport(&mut t, CongestionControl::HysteriaBrutal, 10_000_000)
+                .expect("server-side hysteria_brutal must install the swappable slot");
+        assert!(slot.has_active(), "Brutal must be preloaded before accept");
+
+        let mut t = quinn::TransportConfig::default();
+        assert!(
+            apply_congestion_to_transport(&mut t, CongestionControl::Bbr, 0).is_none(),
+            "quinn builtin arms must not install the swappable slot"
+        );
+    }
+
+    /// 票 7ykg 契约：未配置（None）= 零行为变化——不预装 factory，
+    /// quinn 默认 CUBIC（官方 tuic-server 缺省），build_server_config 照常构建。
+    #[test]
+    fn build_server_config_without_cc_unchanged() {
+        assert!(make_handler(None, 0).build_server_config().is_ok());
+    }
+
+    /// 带 CC 配置的 build_server_config 照常构建（e2e 真建链见 server.rs）。
+    #[test]
+    fn build_server_config_with_cc_builds() {
+        assert!(make_handler(Some(CongestionControl::HysteriaBbr), 0).build_server_config().is_ok());
+        assert!(
+            make_handler(Some(CongestionControl::HysteriaBrutal), 10_000_000)
+                .build_server_config()
+                .is_ok()
+        );
+    }
 }
 

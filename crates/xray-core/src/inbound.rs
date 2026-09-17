@@ -3913,12 +3913,42 @@ fn parse_loopback_config(data: &[u8]) -> std::io::Result<String> {
 /// 从 inbound entry.data（JSON）解析 tuic inbound 配置。
 ///
 /// JSON 格式：`{"uuid":"...","password":"...","serverName":"...",
-/// "certificate":"<PEM>","certificateKey":"<PEM>"}`（票 ieik⑥：证书键接线，
-/// 缺省 rcgen 自签）。
+/// "certificate":"<PEM>","certificateKey":"<PEM>",
+/// "congestion_control":"cubic","brutal_up_bps":10485760}`（票 ieik⑥：证书键接线，
+/// 缺省 rcgen 自签；票 7ykg：CC 配置面，对称 s8ti outbound）。
 fn parse_tuic_inbound_config(
     data: &[u8],
     addr: &str,
 ) -> std::io::Result<xray_proxy_tuic::TuicInboundHandler> {
+    let s = parse_tuic_inbound_settings(data, addr)?;
+    let config = xray_proxy_tuic::TuicInboundConfig {
+        listen: s.bind_addr,
+        server_name: s.server_name,
+        uuid: s.uuid,
+        password: s.password,
+        cert_der: s.cert_der,
+        key_der: s.key_der,
+        congestion_control: s.congestion_control,
+        brutal_up_bps: s.brutal_up_bps,
+    };
+    xray_proxy_tuic::TuicInboundHandler::new("", config)
+        .map_err(|e| std::io::Error::other(format!("tuic inbound: {e}")))
+}
+
+/// tuic inbound 解析结果（对称 outbound `TuicOutboundSettings`，测试可断言）。
+struct TuicInboundSettings {
+    bind_addr: std::net::SocketAddr,
+    server_name: String,
+    uuid: uuid::Uuid,
+    password: String,
+    cert_der: Option<Vec<u8>>,
+    key_der: Option<Vec<u8>>,
+    /// None = 未配置（crate 层不预装，quinn 默认 CUBIC，零行为变化）。
+    congestion_control: Option<xray_proxy_tuic::CongestionControl>,
+    brutal_up_bps: u64,
+}
+
+fn parse_tuic_inbound_settings(data: &[u8], addr: &str) -> std::io::Result<TuicInboundSettings> {
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("tuic inbound settings JSON: {e}")))?;
     let uuid_str = v.get("uuid").and_then(|x| x.as_str())
@@ -3939,16 +3969,36 @@ fn parse_tuic_inbound_config(
         Some(pem) => Some(tuic_pem_key_der(pem)?),
         None => None,
     };
-    let config = xray_proxy_tuic::TuicInboundConfig {
-        listen: bind_addr,
+    // 票 7ykg：服务端 CC（对称 s8ti outbound 解析）。官方 tuic-server 缺省 "cubic"，
+    // 白名单与带宽校验同 outbound。
+    let congestion_name = v.get("congestion_control").and_then(|x| x.as_str()).unwrap_or("cubic");
+    let congestion_control = xray_proxy_tuic::CongestionControl::from_name(congestion_name)
+        .map(Some)
+        .ok_or_else(|| std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "invalid tuic inbound congestion_control: {congestion_name} (valid: bbr, cubic, new_reno, hysteria_bbr, hysteria_brutal)"
+            ),
+        ))?;
+    let brutal_up_bps = v.get("brutal_up_bps").and_then(|x| x.as_u64()).unwrap_or(0);
+    if congestion_control == Some(xray_proxy_tuic::CongestionControl::HysteriaBrutal)
+        && brutal_up_bps == 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "tuic inbound congestion_control=hysteria_brutal requires brutal_up_bps (> 0)",
+        ));
+    }
+    Ok(TuicInboundSettings {
+        bind_addr,
         server_name,
         uuid,
         password: password.to_string(),
         cert_der,
         key_der,
-    };
-    xray_proxy_tuic::TuicInboundHandler::new("", config)
-        .map_err(|e| std::io::Error::other(format!("tuic inbound: {e}")))
+        congestion_control,
+        brutal_up_bps,
+    })
 }
 
 /// PEM 文本 → 首张证书 DER（tuic inbound certificate 键）。
@@ -6555,6 +6605,68 @@ mod tests {
         let validator = super::build_vmess_validator(&data).unwrap();
         use xray_proxy_vmess::Validator as VmessValidatorTrait;
         assert_eq!(VmessValidatorTrait::count(&*validator), 0);
+    }
+
+    const TUIC_INBOUND_TEST_UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
+
+    fn tuic_inbound_json(extra: &str) -> String {
+        format!(r#"{{"uuid":"{TUIC_INBOUND_TEST_UUID}","password":"pw"{extra}}}"#)
+    }
+
+    /// 票 7ykg：官方 tuic-server 缺省 congestion_control="cubic"（服务端形态，
+    /// 对称 outbound 侧官方 tuic-client 缺省 bbr）。
+    #[test]
+    fn parse_tuic_inbound_settings_defaults_official_server() {
+        let s = super::parse_tuic_inbound_settings(
+            tuic_inbound_json("").as_bytes(),
+            "127.0.0.1:8443",
+        )
+        .unwrap();
+        assert_eq!(
+            s.congestion_control,
+            Some(xray_proxy_tuic::CongestionControl::Cubic)
+        );
+        assert_eq!(s.brutal_up_bps, 0);
+        assert_eq!(s.server_name, "tuic");
+    }
+
+    #[test]
+    fn parse_tuic_inbound_settings_invalid_cc_rejected() {
+        let json = tuic_inbound_json(r#","congestion_control":"bbrv3""#);
+        assert!(super::parse_tuic_inbound_settings(json.as_bytes(), "127.0.0.1:8443").is_err());
+    }
+
+    /// 票 7ykg：hysteria 变体解析；brutal 必须显式带 brutal_up_bps（对称 s8ti outbound）。
+    #[test]
+    fn parse_tuic_inbound_settings_hysteria_cc_variants() {
+        let json = tuic_inbound_json(r#","congestion_control":"hysteria_bbr""#);
+        let s = super::parse_tuic_inbound_settings(json.as_bytes(), "127.0.0.1:8443").unwrap();
+        assert_eq!(
+            s.congestion_control,
+            Some(xray_proxy_tuic::CongestionControl::HysteriaBbr)
+        );
+        assert_eq!(s.brutal_up_bps, 0);
+
+        let json = tuic_inbound_json(
+            r#","congestion_control":"hysteria_brutal","brutal_up_bps":10485760"#,
+        );
+        let s = super::parse_tuic_inbound_settings(json.as_bytes(), "127.0.0.1:8443").unwrap();
+        assert_eq!(
+            s.congestion_control,
+            Some(xray_proxy_tuic::CongestionControl::HysteriaBrutal)
+        );
+        assert_eq!(s.brutal_up_bps, 10_485_760);
+
+        // hysteria_brutal 无带宽 → 解析期拒绝（crate 层的 0 回落 BBR 只保护编程构造路径）。
+        let json = tuic_inbound_json(r#","congestion_control":"hysteria_brutal""#);
+        assert!(super::parse_tuic_inbound_settings(json.as_bytes(), "127.0.0.1:8443").is_err());
+        // 既有三臂不受 brutal_up_bps 影响（配了也忽略）。
+        let json = tuic_inbound_json(r#","congestion_control":"bbr","brutal_up_bps":10485760"#);
+        let s = super::parse_tuic_inbound_settings(json.as_bytes(), "127.0.0.1:8443").unwrap();
+        assert_eq!(
+            s.congestion_control,
+            Some(xray_proxy_tuic::CongestionControl::Bbr)
+        );
     }
 
     /// 票 ieik⑥：certificate/certificateKey PEM → TuicInboundConfig cert/key DER。
