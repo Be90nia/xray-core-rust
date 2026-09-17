@@ -42,9 +42,10 @@ runs:
         # 只 emit `cargo:rerun-if-changed=patches`，不跟踪 BORING_BSSL_SOURCE_PATH 下 include/openssl/ssl.h
         # ——setup_boringssl_reality.py 重新 patch 后 cargo 看 fingerprint 命中旧 source 跳过
         # build script 重跑，bindgen 不重跑、bindings.rs 用旧版（缺 server_hello_cb）、ssl.lib 用旧版
-        # → release 链接 LNK2019 SSL_set_reality_server_hello_cb。b56719e 只清 build/ 不够，
-        # fingerprint 还在 cargo 不 rerun build script。
+        # → release 链接 LNK2019 SSL_set_reality_server_hello_cb。
+        # 路径含 /*/：cargo target layout 是 target/{debug,release,incremental,...}/build/btls-sys-*，
+        # b56719e 写 `target/build/btls-sys-*` 缺 profile 子目录，find 匹配 0 个静默吞掉——bug。
         for td in "${CARGO_TARGET_DIR:-target}" "."; do
-          find "$GITHUB_WORKSPACE/$td/build/btls-sys-*" -mindepth 1 -delete 2>/dev/null || true
-          find "$GITHUB_WORKSPACE/$td/.fingerprint/btls-sys-*" -mindepth 1 -delete 2>/dev/null || true
+          find "$GITHUB_WORKSPACE/$td"/*/build/btls-sys-* -mindepth 1 -delete 2>/dev/null || true
+          find "$GITHUB_WORKSPACE/$td"/*/.fingerprint/btls-sys-* -mindepth 1 -delete 2>/dev/null || true
         done
