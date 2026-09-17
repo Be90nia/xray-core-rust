@@ -6358,6 +6358,7 @@ dependencies = [
  "xray-features",
  "xray-proxy-freedom",
  "xray-transport",
+ "xray-transport-quic",
 ]
 
 [[package]]
@@ -6634,6 +6635,7 @@ dependencies = [
  "xray-proto",
  "xray-tls",
  "xray-transport",
+ "xray-transport-quic",
 ]
 
 [[package]]
@@ -6681,10 +6683,12 @@ name = "xray-transport-quic"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "parking_lot",
  "quinn",
  "quinn-proto",
  "rustls",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "xray-buf",

@@ -248,7 +248,7 @@ impl CongestionControl for BrutalSender {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::congestion::types::test_support::MockRttStats;
+    use crate::congestion_swappable::types::test_support::MockRttStats;
 
     #[test]
     fn new_brutal_initial_state() {

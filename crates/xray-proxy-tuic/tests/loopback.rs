@@ -113,6 +113,69 @@ async fn loopback_echo_works() {
     client.close(0u32.into(), b"");
 }
 
+/// s8ti：congestion_control=hysteria_brutal 客户端真实建链——共享槽预装后
+/// QUIC 握手 + 认证 + bi relay 数据面正常。CC 是每端本地行为，服务端默认
+/// CUBIC 与之互操作无影响（wire-format 不变）。带宽必须 MB/s 级：Brutal 窗口
+/// = 2×bps×rtt，回环亚毫秒 RTT 下小带宽会把窗口钳到 1 MTU 致发送停滞
+/// （语义钉死见 xray-transport-quic congestion_swappable::quinn_bridge 契约测试）。
+#[tokio::test]
+async fn loopback_echo_works_with_hysteria_brutal() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let echo_addr = start_echo_server().await;
+    let uuid = Uuid::new_v4();
+    let password = "hysteria-brutal-loopback";
+    let (server, cert_der) = TuicMockServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        "localhost",
+        uuid,
+        password.to_string(),
+    )
+    .await
+    .expect("mock server bind");
+    let server_addr = server.local_addr();
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let client_cfg = make_client_config(&cert_der);
+    let options = xray_proxy_tuic::TuicConnectOptions {
+        congestion_control: xray_proxy_tuic::CongestionControl::HysteriaBrutal,
+        brutal_up_bps: 10_000_000, // 10 MB/s：回环亚毫秒 RTT 下窗口不被钳 1 MTU
+        ..xray_proxy_tuic::TuicConnectOptions::default()
+    };
+    let client = tokio::time::timeout(
+        Duration::from_secs(10),
+        TuicClient::connect_with(
+            server_addr,
+            "localhost",
+            uuid,
+            password,
+            client_cfg,
+            options,
+            QuinnConnectionPool::new(),
+        ),
+    )
+    .await
+    .expect("connect timed out")
+    .expect("connect failed");
+
+    let target = Address::Ipv4(Ipv4Addr::new(127, 0, 0, 1), echo_addr.port());
+    let conn = tokio::time::timeout(Duration::from_secs(10), client.dial(target))
+        .await
+        .expect("dial timed out")
+        .expect("dial failed");
+
+    let (mut send, mut recv) = conn.into_split();
+    let payload = b"hello tuic via hysteria brutal!";
+    send.write_all(payload).await.expect("write_all");
+    let mut got = vec![0u8; payload.len()];
+    recv.read_exact(&mut got).await.expect("read_exact");
+    assert_eq!(&got, payload);
+
+    client.close(0u32.into(), b"");
+}
+
 /// 8hb/eim：auth 后 uni Heartbeat 与 bi relay 并存。
 ///
 /// 服务端 select! 循环必须持续 accept_uni（Heartbeat/Dissociate），同时 bi

@@ -37,12 +37,12 @@ impl Profile {
     ///
     /// 空串 / "standard" → Standard；"conservative" → Conservative；
     /// "aggressive" → Aggressive；其他 → Err。
-    pub fn parse(s: &str) -> crate::Result<Self> {
+    pub fn parse(s: &str) -> super::error::Result<Self> {
         match s.to_ascii_lowercase().as_str() {
             "" | "standard" => Ok(Self::Standard),
             "conservative" => Ok(Self::Conservative),
             "aggressive" => Ok(Self::Aggressive),
-            other => Err(crate::HysteriaError::UnsupportedBbrProfile(other.into())),
+            other => Err(super::error::CongestionError::UnsupportedBbrProfile(other.into())),
         }
     }
 

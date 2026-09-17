@@ -32,7 +32,7 @@ use super::{
     },
     utils::CongestionSetter,
 };
-use crate::error::HysteriaError;
+use super::error::{CongestionError, Result};
 
 /// 把 quinn 事件时间映射到 hysteria MonoTime 域（DefaultClock 的全局基准）。
 ///
@@ -210,6 +210,12 @@ impl HysteriaCCSlot {
             Some(cc) => cc.congestion_window().max(0) as u64,
             None => st.fallback.window(),
         }
+    }
+
+    /// 是否已装载 active 算法（auth 协商/预载后为 true；跨 crate 消费方探针）。
+    #[must_use]
+    pub fn has_active(&self) -> bool {
+        self.state.lock().active.is_some()
     }
 }
 
@@ -439,7 +445,7 @@ pub fn apply_negotiated(
     brutal_up: u64,
     down: u64,
     disable_loss_compensation: bool,
-) -> crate::Result<()> {
+) -> Result<()> {
     match congestion.to_ascii_lowercase().as_str() {
         "reno" => Ok(()),
         "bbr" => {
@@ -458,7 +464,7 @@ pub fn apply_negotiated(
             apply_brutal(slot, brutal_up, disable_loss_compensation);
             Ok(())
         },
-        other => Err(HysteriaError::UnsupportedCongestionType(other.to_string())),
+        other => Err(CongestionError::UnsupportedCongestionType(other.to_string())),
     }
 }
 
@@ -493,6 +499,24 @@ mod tests {
             .rtt
             .update(std::time::Duration::from_millis(100), std::time::Duration::from_millis(100));
         assert_eq!(adapter.window(), 200_000);
+    }
+
+    /// s8ti 契约：亚毫秒 RTT 钳窗口语义——回环/床测必须 MB/s 级带宽。
+    ///
+    /// Brutal 窗口 = 2×bps×rtt（Go quic-go 同数学）：10 MB/s × 1ms 回环 RTT
+    /// → 20_000 B ≫ 1 MTU（1200B），数据面正常；若带宽过小（KB/s 级）×亚毫秒
+    /// RTT，窗口数学值低于 1 MTU 被钳底 → quinn 发送停滞。TUIC 经共享槽接入
+    /// Brutal 时配置带宽必须遵守此量级（同 hysteria_transport.rs 床测注释）。
+    #[test]
+    fn brutal_window_with_mbps_bandwidth_at_submillisecond_rtt_exceeds_mtu() {
+        let slot = HysteriaCCSlot::new();
+        assert!(!slot.has_active(), "fresh slot must be fallback-only");
+        apply_brutal(&slot, 10_000_000, false); // 10 MB/s
+        assert!(slot.has_active());
+        slot.rtt
+            .update(std::time::Duration::from_millis(1), std::time::Duration::from_millis(1));
+        // 数学：2 × 10_000_000 bps × 0.001 s = 20_000 字节 ≫ 1 MTU。
+        assert_eq!(slot.current_window(), 20_000);
     }
 
     #[test]

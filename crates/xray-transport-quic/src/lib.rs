@@ -11,6 +11,7 @@
 //! 配置仅消费 TLS 层（[`xray_tls::client_config`] / [`xray_tls::server_config`]），
 //! quicSettings 的 KeepAlive / 拥塞控制等参数留 follow-up。
 
+pub mod congestion_swappable;
 pub mod config;
 pub mod register;
 pub mod transport;

@@ -38,7 +38,7 @@
 //! 直接复用 quinn QUIC 栈。不含 transport（dial+auth）和 congestion controller 适配。
 
 pub mod config;
-pub mod congestion;
+pub use xray_transport_quic::congestion_swappable as congestion;
 pub mod conn;
 pub mod context;
 pub mod dialer;

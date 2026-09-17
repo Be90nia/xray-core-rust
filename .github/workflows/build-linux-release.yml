@@ -50,9 +50,9 @@ jobs:
           cargo install cargo-pgo --locked
       - name: PGO build (instrument -> workload -> optimize)
         run: |
-          cargo pgo build --release -p xray-cli --target x86_64-unknown-linux-gnu
+          cargo pgo build -- -p xray-cli --target x86_64-unknown-linux-gnu
           python3 tools/pgo_workload.py --xray target/x86_64-unknown-linux-gnu/release/xray --duration 30
-          cargo pgo optimize --release -p xray-cli --target x86_64-unknown-linux-gnu
+          cargo pgo optimize -- -p xray-cli --target x86_64-unknown-linux-gnu
       - name: Verify binary
         run: file target/x86_64-unknown-linux-gnu/release/xray
       # bd m1t5：发行 feature 闭包下 REALITY 生产 TLS 冒烟门——server_tls
