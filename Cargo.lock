@@ -6484,6 +6484,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "ml-dsa",
  "parking_lot",
  "prost",
  "rcgen 0.13.2",
