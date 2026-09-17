@@ -94,7 +94,8 @@ pub struct VisionConn<C> {
     /// SSL out-of-order。判定时仅置位；poll_write 把 pending 帧写完返回
     /// Ok 时经 [`Self::arm_splice_raw`] 真正启用。
     splice_armed: bool,
-    /// 诊断用角色标记（new=client / new_server=server），仅进 trace 日志。
+    /// 角色标记（new=client / new_server=server），预留诊断。
+    #[allow(dead_code)]
     is_server: bool,
     /// raw 写入起步闸：arm 后首个 raw 写延迟 RAW_WRITE_ARM_DELAY，等对端
     /// 读完 DIRECT 帧（其 rustls 的同 recv 过读会把紧随的 raw 字节当隧道
@@ -232,11 +233,7 @@ where
             //    上发的明文 TLS records 当外层密文解密 → 永远解不开。
             if !this.downlink_padding {
                 if let Some(raw) = this.raw_fallback.as_mut() {
-                    let poll = Pin::new(raw).poll_read(cx, buf);
-                    if let Poll::Ready(Ok(())) = poll {
-                        tracing::trace!(target: "splice08", role = this.is_server, raw_read = buf.filled().len(), "raw read");
-                    }
-                    return poll;
+                    return Pin::new(raw).poll_read(cx, buf);
                 }
                 return Pin::new(&mut this.inner).poll_read(cx, buf);
             }
@@ -254,12 +251,10 @@ where
                 Poll::Ready(Ok(())) => {
                     let n = rb.filled().len();
                     if n == 0 {
-                        tracing::trace!(target: "splice08", role = this.is_server, "inner EOF");
                         // EOF：恢复 read_tmp 长度，避免持续 alloc（清空）。
                         this.read_tmp.truncate(read_tmp_len);
                         return Poll::Ready(Ok(()));
                     }
-                    tracing::trace!(target: "splice08", role = this.is_server, inner_read = n, "padding read");
                     let mut content =
                         xtls_unpadding(&this.read_tmp[..n], &mut this.downlink_state, &this.user_uuid);
                     let cmd = this.downlink_state.current_command;
@@ -276,17 +271,14 @@ where
                         && cmd != 0;
                     if frames_done {
                         if cmd == COMMAND_PADDING_END as i32 {
-                            tracing::trace!(target: "splice08", role = this.is_server, frame = "END", content = content.len(), "frame_done");
                             this.downlink_padding = false;
                         } else if cmd == COMMAND_PADDING_DIRECT as i32 {
-                            tracing::trace!(target: "splice08", role = this.is_server, frame = "DIRECT", content = content.len(), inner_had_raw = this.raw_fallback.is_some(), "frame_done -> raw switch");
                             this.downlink_padding = false;
                             if this.raw_fallback.is_none() {
                                 this.raw_fallback = this
                                     .raw_tcp
                                     .take()
                                     .or_else(|| this.inner.inner_raw_tcp_clone());
-                                tracing::trace!(target: "splice08", role = this.is_server, raw_obtained = this.raw_fallback.is_some(), "raw fd cloned");
                             }
                             // 切换后**禁止再读 inner**（txno-splice 终版语义，
                             // 取代 dbe9f49 的 drain 循环）：DIRECT 是对端安全层
@@ -326,7 +318,9 @@ where
                     // content 空（纯 padding 块）或已存 pending → continue
                 }
                 Poll::Ready(Err(e)) => {
-                    tracing::warn!(target: "splice08", role = this.is_server, error = %e, "inner read error");
+                    // 结构化观测：TLS 层 fatal（如对端安全层误解 raw 流的
+                    // BadRecordMac）是 splice 边界问题的第一现场。
+                    tracing::warn!(error = %e, "vision inner read error");
                     return Poll::Ready(Err(e));
                 }
                 Poll::Pending => return Poll::Pending,
@@ -405,7 +399,6 @@ where
                         if sleep.as_mut().poll(cx).is_pending() {
                             return Poll::Pending;
                         }
-                        tracing::trace!(target: "splice08", role = this.is_server, "raw write gate open");
                         this.raw_write_gate = None;
                     }
                     return Pin::new(raw).poll_write(cx, buf);
@@ -447,7 +440,6 @@ where
             );
             this.uplink_write_pending = Some((padded, 0, n));
             if command == COMMAND_PADDING_DIRECT {
-                tracing::trace!(target: "splice08", role = this.is_server, write_bytes = n, "uplink DIRECT judged");
                 this.uplink_padding = false;
                 // 只置挂起标志，不立即启用 raw 通道（对齐 Go f926ee4a）：
                 // 激活推迟到 pending 帧写完的 arm_splice_raw——若在此提前
@@ -500,18 +492,11 @@ where
         }
         match Pin::new(&mut self.inner).poll_flush(cx) {
             Poll::Ready(Ok(())) => {
-                tracing::trace!(target: "splice08", role = self.is_server, "gate flushed -> raw armed");
                 self.arm_splice_raw();
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(Err(e)) => {
-                tracing::warn!(target: "splice08", role = self.is_server, error = %e, "gate flush error");
-                Poll::Ready(Err(e))
-            }
-            Poll::Pending => {
-                tracing::trace!(target: "splice08", role = self.is_server, "gate flush pending");
-                Poll::Pending
-            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
         }
     }
 
@@ -523,7 +508,6 @@ where
         if self.splice_armed {
             self.splice_armed = false;
             self.raw_write_gate = Some(Box::pin(tokio::time::sleep(RAW_WRITE_ARM_DELAY)));
-            tracing::trace!(target: "splice08", role = self.is_server, "arm_splice_raw");
             if self.raw_fallback.is_none() {
                 self.raw_fallback =
                     self.raw_tcp.take().or_else(|| self.inner.inner_raw_tcp_clone());
