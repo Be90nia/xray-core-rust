@@ -159,7 +159,15 @@ pub fn generate_reality_ed25519_cert(auth_key: &[u8]) -> Result<(Vec<u8>, Vec<u8
 ///
 /// Rust 端阻塞点：rustls `ResolvesServerCert::resolve()` 只暴露 ClientHello，
 /// 证书选定前拿不到 ServerHello 原始字节（Go 在自家 TLS 栈握手函数内生成证书，
-/// 无此约束）。签名原语本身已可用（`ml_dsa` crate，见 xray-cli `gen_mldsa65`）。
+/// 无此约束）。tvky 状态：
+/// - ✅ mldsa65 公钥派生（[`crate::crypto::derive_mldsa65_pubkey`]，1952 字节）
+/// - ✅ 客户端 mldsa65 验签原语（[`crate::crypto::verify_mldsa65_signature`]）
+/// - ⛔ 端到端签名生成（受 rustls ServerHello 字节不可见约束）
+///
+/// 当前 `from_proto` 派生 mldsa65 公钥后**仍下发标准 REALITY cert**
+/// （HMAC-SHA512 尾部 + 无 mldsa65 扩展），与 Go 端非 PQC 客户端互通；
+/// 仅当 Go 客户端显式配置 `Mldsa65Verify` 时该 cert 会被拒（Go 端回退到
+/// 标准 x509 验证失败）——此场景需等待 ServerHello 捕获实现。
 ///
 /// # Errors
 ///

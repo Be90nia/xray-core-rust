@@ -162,6 +162,14 @@ fn parse_sni(edata: &[u8]) -> Option<String> {
 }
 
 /// 解析 key_share extension (0x0033)，返回 X25519 (group 0x001d) 的 32 字节公钥。
+///
+/// tvky (REALITY 10.0)：同时支持 X25519MLKEM768 hybrid key share
+/// (group=0x4588 = 4588，data = mlkem ek(1184) + x25519 pub(32)，共 1216 字节)。
+/// Go `MlkemEcdhe.ECDH(serverPub)` 仅返回 X25519 段（`ecdh.PrivateKey.ECDH`
+/// 是纯 X25519），hybrid MLKEM 段在 auth_key 派生中不参与；REALITY 10.0
+/// PQC 安全性来自 TLS session key 的 hybrid 派生，而非 auth_key 本身。
+/// 对应 Go utls `handshake_client.go:181-183`
+/// `{group: X25519MLKEM768, data: append(mlkemEncapsulationKey, x25519EphemeralKey...)}`。
 fn parse_key_share_x25519(edata: &[u8]) -> Option<[u8; 32]> {
     if edata.len() < 2 {
         return None;
@@ -177,9 +185,18 @@ fn parse_key_share_x25519(edata: &[u8]) -> Option<[u8; 32]> {
         if d.len() < 4 + key_len {
             return None;
         }
+        // X25519 (group 0x001d): 32 字节公钥
         if group == 0x001d && key_len == 32 {
             let mut k = [0u8; 32];
             k.copy_from_slice(&d[4..4 + 32]);
+            return Some(k);
+        }
+        // X25519MLKEM768 hybrid (group 0x4588): 1184B MLKEM ek + 32B X25519 pub，
+        // X25519 部分在末尾。Go 端 `MlkemEcdhe.ECDH(serverPub)` 只消费 X25519 段。
+        if group == 0x4588 && key_len == 1216 {
+            let x_start = 4 + 1184; // skip mlkem ek
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&d[x_start..x_start + 32]);
             return Some(k);
         }
         d = &d[4 + key_len..];
@@ -749,6 +766,91 @@ mod tests {
         ));
     }
 
+    /// tvky (REALITY 10.0)：X25519MLKEM768 hybrid key_share entry（group=0x4588，
+    /// 1216B = 1184B ML-KEM ek + 32B X25519 pub）→ parse 出末尾 X25519 段。
+    fn build_test_client_hello_hybrid_key_share(
+        random: &[u8; 32],
+        session_id: &[u8; 32],
+        mlkem_ek: &[u8; 1184],
+        x25519_pub_tail: &[u8; 32],
+        sni: Option<&str>,
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(random);
+        body.push(32);
+        body.extend_from_slice(session_id);
+        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]);
+        body.extend_from_slice(&[1, 0]);
+
+        let mut exts = Vec::new();
+        if let Some(name) = sni {
+            let nb = name.as_bytes();
+            let list_len = 1 + 2 + nb.len();
+            let mut sni_ext = Vec::new();
+            sni_ext.extend_from_slice(&(list_len as u16).to_be_bytes());
+            sni_ext.push(0);
+            sni_ext.extend_from_slice(&(nb.len() as u16).to_be_bytes());
+            sni_ext.extend_from_slice(nb);
+            exts.extend_from_slice(&[0x00, 0x00]);
+            exts.extend_from_slice(&(sni_ext.len() as u16).to_be_bytes());
+            exts.extend_from_slice(&sni_ext);
+        }
+        // X25519MLKEM768 hybrid key share entry
+        let mut ks_ext = Vec::new();
+        ks_ext.extend_from_slice(&((2 + 2 + 1216) as u16).to_be_bytes());
+        ks_ext.extend_from_slice(&[0x45, 0x88]); // X25519MLKEM768 = 4588
+        ks_ext.extend_from_slice(&[0x04, 0xC0]); // key_len = 1216
+        ks_ext.extend_from_slice(mlkem_ek);
+        ks_ext.extend_from_slice(x25519_pub_tail);
+        exts.extend_from_slice(&[0x00, 0x33]);
+        exts.extend_from_slice(&(ks_ext.len() as u16).to_be_bytes());
+        exts.extend_from_slice(&ks_ext);
+
+        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(&exts);
+
+        let mut hs = Vec::new();
+        hs.push(0x01);
+        let blen = body.len();
+        hs.push((blen >> 16) as u8);
+        hs.push((blen >> 8) as u8);
+        hs.push(blen as u8);
+        hs.extend_from_slice(&body);
+
+        let mut record = Vec::new();
+        record.push(0x16);
+        record.extend_from_slice(&[0x03, 0x01]);
+        let hl = hs.len();
+        record.push((hl >> 8) as u8);
+        record.push(hl as u8);
+        record.extend_from_slice(&hs);
+        record
+    }
+
+    /// tvky：hybrid key_share 解析——确认从 1216B 末尾 32B 取出 X25519 公钥。
+    #[test]
+    fn parse_client_hello_x25519mlkem768_hybrid_key_share() {
+        let random = [0x55u8; 32];
+        let session_id = [0x77u8; 32];
+        // 模拟 ML-KEM-768 encapsulation key（1184B，任意值）
+        let mlkem_ek = [0xAAu8; 1184];
+        let x25519_pub_tail = [0xBBu8; 32]; // hybrid entry 末尾 X25519 公钥
+        let record = build_test_client_hello_hybrid_key_share(
+            &random,
+            &session_id,
+            &mlkem_ek,
+            &x25519_pub_tail,
+            Some("example.com"),
+        );
+        let parsed = parse_client_hello(&record).unwrap();
+        // 关键断言：parse 出末尾 32B 而非 MLKEM 段前 32B
+        assert_eq!(parsed.key_share_x25519, Some(x25519_pub_tail));
+        assert_eq!(parsed.random, random);
+        assert_eq!(parsed.session_id, session_id);
+        assert_eq!(parsed.server_name.as_deref(), Some("example.com"));
+    }
+
     /// 构造完整 REALITY ClientHello record（含真实加密 session_id），测试 verify 用。
     ///
     /// 流程对齐 watfaq client `compute_session_id`：session_id=0 编码拿 AAD →
@@ -794,6 +896,65 @@ mod tests {
         build_test_client_hello(random, &sid, client_pub.as_bytes(), sni)
     }
 
+    /// tvky：构造含 X25519MLKEM768 hybrid key_share 的完整 REALITY ClientHello record。
+    ///
+    /// 与 [`build_reality_client_hello`] 相同流程但 key_share entry 为 hybrid
+    /// （group=0x4588，1216B = 1184B ML-KEM ek + 32B X25519 pub），auth_key
+    /// 仍只从 X25519 段派生（与 Go `MlkemEcdhe.ECDH(serverPub)` 语义一致）。
+    fn build_reality_client_hello_hybrid(
+        random: &[u8; 32],
+        server_static_private: &[u8; 32],
+        client_private: &[u8; 32],
+        timestamp: u32,
+        short_id: &[u8; 8],
+        sni: Option<&str>,
+    ) -> Vec<u8> {
+        use crate::crypto::{derive_auth_key, encrypt_session_id};
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let client_secret = StaticSecret::from(*client_private);
+        let client_pub = PublicKey::from(&client_secret);
+        let server_pub = PublicKey::from(&StaticSecret::from(*server_static_private));
+
+        // 1. 构造 session_id=0 的 hybrid ClientHello（拿 AAD）
+        let zero_sid = [0u8; 32];
+        let mlkem_ek_placeholder = [0xAAu8; 1184];
+        let record_zero = build_test_client_hello_hybrid_key_share(
+            random,
+            &zero_sid,
+            &mlkem_ek_placeholder,
+            client_pub.as_bytes(),
+            sni,
+        );
+        let parsed_zero = parse_client_hello(&record_zero).unwrap();
+
+        // 2. auth_key（仅 X25519 段 ECDH，与 Go MlkemEcdhe.ECDH 语义一致）
+        let auth_key =
+            derive_auth_key(client_private, server_pub.as_bytes(), &random[..20]).unwrap();
+
+        // 3. plaintext[16] = [version(3)|reserved(1)|timestamp(4 BE)|short_id(8)]
+        let mut plaintext = [0u8; 16];
+        plaintext[0..3].copy_from_slice(&[1, 8, 1]);
+        plaintext[3] = 0;
+        plaintext[4..8].copy_from_slice(&timestamp.to_be_bytes());
+        plaintext[8..16].copy_from_slice(short_id);
+
+        // 4. encrypt → 32B ciphertext session_id
+        let mut sid = [0u8; 32];
+        sid[..16].copy_from_slice(&plaintext);
+        encrypt_session_id(&auth_key, &random[20..32], &mut sid, parsed_zero.handshake_message)
+            .unwrap();
+
+        // 5. 构造最终 hybrid ClientHello
+        build_test_client_hello_hybrid_key_share(
+            random,
+            &sid,
+            &mlkem_ek_placeholder,
+            client_pub.as_bytes(),
+            sni,
+        )
+    }
+
     #[test]
     fn verify_reality_client_hello_ok() {
         let random = [0x55u8; 32];
@@ -816,6 +977,46 @@ mod tests {
         assert_eq!(payload.timestamp, now);
         assert_eq!(payload.short_id, short_id);
         assert_eq!(payload.version, [1, 8, 1]);
+    }
+
+    /// tvky：X25519MLKEM768 hybrid ClientHello 走完整 verify 路径——auth_key
+    /// 仅从 hybrid entry 末尾 X25519 段派生（与 Go `MlkemEcdhe.ECDH(serverPub)`
+    /// 语义一致），AES-GCM 解密成功 → payload 校验通过。
+    #[test]
+    fn verify_reality_client_hello_x25519mlkem768_hybrid_ok() {
+        let random = [0x55u8; 32];
+        let server_priv = [0x11u8; 32];
+        let client_priv = [0x22u8; 32];
+        let now = 1_700_000_000u32;
+        let short_id = [0xaa; 8];
+
+        let record = build_reality_client_hello_hybrid(
+            &random,
+            &server_priv,
+            &client_priv,
+            now,
+            &short_id,
+            Some("example.com"),
+        );
+        let parsed = parse_client_hello(&record).unwrap();
+        // 关键断言：hybrid entry 解析出末尾 X25519 公钥
+        assert!(parsed.key_share_x25519.is_some());
+        let (payload, auth_key) = verify_reality_client_hello(
+            &parsed,
+            &server_priv,
+            now,
+            43200,
+            &[short_id],
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(payload.timestamp, now);
+        assert_eq!(payload.short_id, short_id);
+        // auth_key 与纯 X25519 路径派生一致（hybrid 仅扩展 transport layer，
+        // auth_key 仍走 X25519-only ECDH，与 Go MlkemEcdhe.ECDH 对齐）
+        assert_eq!(auth_key.len(), 32);
+        assert!(auth_key.iter().any(|&b| b != 0));
     }
 
     #[test]

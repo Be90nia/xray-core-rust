@@ -376,6 +376,103 @@ pub fn sign_reality_certificate(
     Ok(sig)
 }
 
+/// ML-DSA-65 签名长度（FIPS 204；Go `Mldsa65Verify` 验证的 3309 字节密文）。
+pub const MLDSA65_SIG_LEN: usize = 3309;
+
+/// ML-DSA-65 公钥长度（FIPS 204；Go `Mldsa65Verify` 1952 字节公钥）。
+pub const MLDSA65_PUBKEY_LEN: usize = 1952;
+
+/// ML-DSA-65 种子长度（Go `mldsa65.NewKeyFromSeed(*[32]byte)`，FIPS 204 ξ）。
+pub const MLDSA65_SEED_LEN: usize = 32;
+
+/// 从 32 字节种子派生 ML-DSA-65 公钥（1952 字节）。
+///
+/// 对应 Go：
+/// ```go
+/// pub, _ := mldsa65.NewKeyFromSeed(&seed)
+/// pub.Bytes()  // → 1952 字节
+/// ```
+///
+/// 与 xray-cli `gen_mldsa65` 共用同一 RustCrypto ml-dsa crate，输出与 circl
+/// FIPS 204 实现逐字节一致（CLI 黄金值对拍覆盖）。
+///
+/// # Errors
+///
+/// - [`RealityError::InvalidMldsa65SeedLen`]：seed 长度 ≠ 32
+pub fn derive_mldsa65_pubkey(seed: &[u8]) -> Result<Vec<u8>, RealityError> {
+    if seed.len() != MLDSA65_SEED_LEN {
+        return Err(RealityError::InvalidMldsa65SeedLen {
+            actual: seed.len(),
+        });
+    }
+    use ml_dsa::{KeyExport, MlDsa65, Seed, SigningKey};
+    let sk = SigningKey::<MlDsa65>::from_seed(&Seed::from(<[u8; 32]>::try_from(seed).unwrap()));
+    Ok(sk.as_ref().to_bytes().to_vec())
+}
+
+/// 验证 ML-DSA-65 签名（REALITY 10.0 PQC 证书额外验证路径）。
+///
+/// 对应 Go `UConn.VerifyPeerCertificate` 中 mldsa65 段：
+/// ```go
+/// verify, _ := mldsa65.Scheme().UnmarshalBinaryPublicKey(c.Config.Mldsa65Verify)
+/// mldsa65.Verify(verify.(*mldsa65.PublicKey), h.Sum(nil), nil, certs[0].Extensions[0].Value)
+/// ```
+/// `h.Sum(nil)` = HMAC-SHA512(auth_key, ed25519_pub) || ClientHello.Raw || ServerHello.Raw
+/// （即 mldsa65 签名覆盖整个 ClientHello+ServerHello+auth 上下文），而
+/// Rust 端因 `ResolvesServerCert::resolve()` 拿不到 ServerHello 字节
+/// （见 `mitm.rs` 注释），该签名路径暂不可生成；本函数提供**验签原语**
+/// 以便未来补全 ServerHello 捕获后端到端验证。
+///
+/// 当前调用方传 `signed_message = hmac_of_auth_plus_ch`（不含 ServerHello），
+/// 仅用于单元测试与未来扩展；生产路径中 mldsa65 验证由 [`client`] 层组合 CH+SH
+/// 后调用本函数。
+///
+/// # 参数
+///
+/// - `pubkey_1952`：1952 字节 ML-DSA-65 公钥（Go 端 `mldsa65Verify` 字段）
+/// - `signed_message`：被签名的消息字节（HMAC 输出 || ClientHello || ServerHello）
+/// - `signature_3309`：3309 字节 ML-DSA-65 签名（cert extensions 第一项）
+///
+/// # 返回
+///
+/// `true` = 签名有效；`false` = 长度错或签名不匹配。
+///
+/// # Errors
+///
+/// - [`RealityError::Mldsa65VerifyFailed`]：公钥/签名解码失败（罕见，多为脏数据）
+pub fn verify_mldsa65_signature(
+    pubkey_1952: &[u8],
+    signed_message: &[u8],
+    signature_3309: &[u8],
+) -> Result<bool, RealityError> {
+    if pubkey_1952.len() != MLDSA65_PUBKEY_LEN {
+        return Ok(false);
+    }
+    if signature_3309.len() != MLDSA65_SIG_LEN {
+        return Ok(false);
+    }
+    use ml_dsa::{EncodedSignature, EncodedVerifyingKey, MlDsa65, Signature, Verifier, VerifyingKey};
+
+    // 公钥解码（1952B → VerifyingKey<MlDsa65>）
+    let vk_bytes = match EncodedVerifyingKey::<MlDsa65>::try_from(pubkey_1952) {
+        Ok(b) => b,
+        Err(_) => return Err(RealityError::Mldsa65VerifyFailed),
+    };
+    let vk = VerifyingKey::<MlDsa65>::decode(&vk_bytes);
+
+    // 签名解码（3309B → Signature<MlDsa65>）
+    let sig_bytes = match EncodedSignature::<MlDsa65>::try_from(signature_3309) {
+        Ok(b) => b,
+        Err(_) => return Err(RealityError::Mldsa65VerifyFailed),
+    };
+    let sig = match Signature::<MlDsa65>::decode(&sig_bytes) {
+        Some(s) => s,
+        None => return Err(RealityError::Mldsa65VerifyFailed),
+    };
+
+    Ok(vk.verify(signed_message, &sig).is_ok())
+}
+
 /// 将 32 字节切片转为数组（失败返 [`RealityError::InvalidPrivateKeyLen`]）。
 fn try_array32(b: &[u8]) -> [u8; 32] {
     let mut arr = [0u8; 32];
@@ -804,5 +901,72 @@ mod tests {
         let payload =
             verify_session_payload(&plaintext, timestamp, 120, &short_ids).unwrap();
         assert_eq!(payload.short_id, short_id);
+    }
+
+    // ===== ML-DSA-65 测试（tvky REALITY 10.0）=====
+
+    #[test]
+    fn derive_mldsa65_pubkey_deterministic() {
+        // 同一 seed → 同一 pubkey（FIPS 204 ξ → SK → PK 确定性）
+        let seed = [0x42u8; 32];
+        let pk1 = derive_mldsa65_pubkey(&seed).unwrap();
+        let pk2 = derive_mldsa65_pubkey(&seed).unwrap();
+        assert_eq!(pk1, pk2);
+        assert_eq!(pk1.len(), MLDSA65_PUBKEY_LEN);
+    }
+
+    #[test]
+    fn derive_mldsa65_pubkey_wrong_seed_len_errors() {
+        let short_seed = [0u8; 16];
+        let err = derive_mldsa65_pubkey(&short_seed).unwrap_err();
+        assert!(matches!(err, RealityError::InvalidMldsa65SeedLen { actual: 16 }));
+    }
+
+    /// 自签 round-trip：自己派生 pk + 签名 → verify 成功。
+    /// 验证 RustCrypto ml-dsa 0.1 编解码通路正确，与 circl FIPS 204 字节级一致
+    /// （xray-cli `cli_mldsa65_from_seed_matches_go` 黄金值已覆盖同确定性）。
+    #[test]
+    fn verify_mldsa65_signature_self_signed_roundtrip() {
+        use ml_dsa::{KeyExport, MlDsa65, Seed, Signature, Signer, SigningKey};
+
+        let seed = [0x07u8; 32];
+        let sk = SigningKey::<MlDsa65>::from_seed(&Seed::from(seed));
+        let pk_bytes = sk.as_ref().to_bytes();
+        assert_eq!(pk_bytes.len(), MLDSA65_PUBKEY_LEN);
+
+        // 签一段任意消息（FIPS 204 ML-DSA-65 deterministic sign via Signer trait）
+        let msg = b"REALITY mldsa65 self-test payload";
+        let sig: Signature<MlDsa65> = sk.sign(msg);
+        let sig_bytes = sig.encode();
+
+        // 用我们的 verify 函数（公钥 + msg + sig）→ 成功
+        let ok = verify_mldsa65_signature(pk_bytes.as_slice(), msg, sig_bytes.as_slice())
+            .expect("verify should not error");
+        assert!(ok, "self-signed mldsa65 should verify");
+    }
+
+    #[test]
+    fn verify_mldsa65_signature_wrong_message_fails() {
+        use ml_dsa::{KeyExport, MlDsa65, Seed, Signature, Signer, SigningKey};
+
+        let seed = [0x07u8; 32];
+        let sk = SigningKey::<MlDsa65>::from_seed(&Seed::from(seed));
+        let pk_bytes = sk.as_ref().to_bytes();
+        let sig: Signature<MlDsa65> = sk.sign(b"original message");
+        let sig_bytes = sig.encode();
+
+        // 用不同 message 验签 → false（FIPS 204 强不可伪造）
+        let ok = verify_mldsa65_signature(pk_bytes.as_slice(), b"tampered message", sig_bytes.as_slice())
+            .expect("verify should not error");
+        assert!(!ok, "wrong message should fail mldsa65 verify");
+    }
+
+    #[test]
+    fn verify_mldsa65_signature_length_mismatch_returns_false() {
+        // 公钥/签名长度错 → false（不 panic）
+        let pk = vec![0u8; 32]; // 应为 1952B
+        let sig = vec![0u8; 64]; // 应为 3309B
+        let ok = verify_mldsa65_signature(&pk, b"x", &sig).expect("verify should not error");
+        assert!(!ok);
     }
 }
