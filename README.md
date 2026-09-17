@@ -1,3 +1,5 @@
+**部署调优入口**：高 RTT / 跨洋链路 sockopt 指南（`sockopt.receiveBufferSize` 运维配方与床实测数据）→ [docs/guide-highrtt-sockopt.md](docs/guide-highrtt-sockopt.md)
+
 # Nerd Fonts
 
 This is an archived font from the Nerd Fonts release v3.5.0.

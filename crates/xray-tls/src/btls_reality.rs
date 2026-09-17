@@ -28,6 +28,11 @@ unsafe extern "C" {
     fn SSL_set_reality_rewrite_cb(
         cb: Option<unsafe extern "C" fn(ssl: *mut btls_sys::SSL, msg: *mut u8, msg_len: usize) -> i32>,
     );
+    fn SSL_set_reality_server_hello_cb(
+        cb: Option<
+            unsafe extern "C" fn(ssl: *mut btls_sys::SSL, msg: *const u8, msg_len: usize) -> i32,
+        >,
+    );
 }
 
 use std::collections::HashMap;
@@ -75,6 +80,16 @@ pub trait RealityHooks: Send + Sync {
         ))
     }
 
+    /// ServerHello 入站捕获：由 BoringSSL `ssl_reality_server_hello_maybe`
+    /// 在 TLS 1.3 客户端 ServerHello 处理路径（key schedule / transcript 计入
+    /// 前）调用（SSL_set_reality_server_hello_cb 全局回调，cm97）。`msg` =
+    /// 完整 handshake message（type(1)+len(3)+body，无 record 头），对应 Go
+    /// `HandshakeState.ServerHello.Raw`；HRR 走独立路径不会触发本回调。
+    /// 默认忽略（非 PQC 客户端无需捕获）。
+    fn on_server_hello(&self, _msg: &[u8]) -> io::Result<()> {
+        Ok(())
+    }
+
     /// 握手完成后回调：证书 HMAC 验证（对应 Go `UConn.VerifyPeerCertificate`）。
     /// 实现里持有 auth_key/pub_key,失败 = 真证书/被转发 → 断连。
     /// 默认实现返回 Ok(由调用方决定是否严格要求)。
@@ -103,6 +118,7 @@ pub fn x25519_key_share_private_raw(ssl: *mut btls_sys::SSL) -> Option<[u8; 32]>
 static REALITY_HOOKS: parking_lot::Mutex<Option<HashMap<usize, Arc<dyn RealityHooks>>>> =
     parking_lot::Mutex::new(None);
 static TRAMPOLINE_INSTALLED: std::sync::Once = std::sync::Once::new();
+static SERVER_HELLO_TRAMPOLINE_INSTALLED: std::sync::Once = std::sync::Once::new();
 
 extern "C" fn reality_rewrite_trampoline(
     ssl: *mut btls_sys::SSL,
@@ -122,11 +138,33 @@ extern "C" fn reality_rewrite_trampoline(
     }
 }
 
+extern "C" fn reality_server_hello_trampoline(
+    ssl: *mut btls_sys::SSL,
+    msg: *const u8,
+    msg_len: usize,
+) -> i32 {
+    let hooks = REALITY_HOOKS
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&(ssl as usize)).cloned());
+    let Some(hooks) = hooks else { return 1 };
+    // SAFETY: msg/len 由 BoringSSL 在 ServerHello 处理路径内提供，握手窗口内
+    // 有效；本回调只读（捕获不改写）。
+    let buf = unsafe { std::slice::from_raw_parts(msg, msg_len) };
+    match hooks.on_server_hello(buf) {
+        Ok(()) => 1,
+        Err(_e) => 0,
+    }
+}
+
 
 /// 注册 per-SSL hooks 并安装全局 trampoline（幂等）。
 pub fn register_reality_hooks(ssl_key: usize, hooks: Arc<dyn RealityHooks>) {
     TRAMPOLINE_INSTALLED.call_once(|| unsafe {
         SSL_set_reality_rewrite_cb(Some(reality_rewrite_trampoline));
+    });
+    SERVER_HELLO_TRAMPOLINE_INSTALLED.call_once(|| unsafe {
+        SSL_set_reality_server_hello_cb(Some(reality_server_hello_trampoline));
     });
     REALITY_HOOKS
         .lock()
@@ -329,6 +367,8 @@ mod tests {
     #[derive(Default)]
     struct ProbeHooks {
         calls: std::sync::atomic::AtomicUsize,
+        sh_calls: std::sync::atomic::AtomicUsize,
+        sh_last: parking_lot::Mutex<Vec<u8>>,
     }
     impl RealityHooks for ProbeHooks {
         fn rewrite_client_hello(&self, _ssl: &SslRef, _record: &mut [u8]) -> io::Result<()> {
@@ -336,6 +376,11 @@ mod tests {
         }
         fn rewrite_client_hello_msg(&self, _ssl: RealitySslPtr, _msg: &mut [u8]) -> io::Result<()> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn on_server_hello(&self, msg: &[u8]) -> io::Result<()> {
+            self.sh_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.sh_last.lock() = msg.to_vec();
             Ok(())
         }
     }
@@ -395,6 +440,30 @@ mod tests {
         drop(guard);
         assert_eq!(reality_rewrite_trampoline(ssl, msg.as_mut_ptr(), msg.len()), 1);
         assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// ServerHello trampoline 同型派发：注册命中且字节原样到达 hooks，
+    /// 注销后同地址调用放行（返回 1，不 panic）。
+    #[test]
+    fn server_hello_trampoline_dispatches_and_captures() {
+        let key = 0xdddd_usize;
+        let probe = Arc::new(ProbeHooks::default());
+        let guard = RealityHooksGuard::register(key, &(Arc::clone(&probe) as Arc<dyn RealityHooks>));
+        let ssl = key as RealitySslPtr;
+        // 模拟 ServerHello handshake message：type=2 + len(3)=4 + body
+        let sh = [2u8, 0, 0, 4, 0xaa, 0xbb, 0xcc, 0xdd];
+        assert_eq!(
+            reality_server_hello_trampoline(ssl, sh.as_ptr(), sh.len()),
+            1
+        );
+        assert_eq!(probe.sh_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(*probe.sh_last.lock(), sh);
+        drop(guard);
+        assert_eq!(
+            reality_server_hello_trampoline(ssl, sh.as_ptr(), sh.len()),
+            1
+        );
+        assert_eq!(probe.sh_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// connect_reality 提前失败（`?` 路径）后注册表不得残留该 hooks 实例。

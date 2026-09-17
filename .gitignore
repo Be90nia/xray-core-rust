@@ -60,3 +60,4 @@ dist/interop_run/
 # 工作台交接文档(本地维护,不入库)
 HANDOFF.md
 docs/
+# 例外: docs/guide-highrtt-sockopt.md 运维部署指南, git add -f 一次性入库随发行物分发(bd c35a); 已跟踪文件不受上述规则影响, 其余 docs/ 照旧忽略

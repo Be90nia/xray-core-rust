@@ -12,8 +12,9 @@
 //!   重算 HMAC 比对，通过即 Verified；
 //! - 配置 `Mldsa65Key` 时 Go 换用带 3309 字节保留扩展（OID 0.0）的变体模板，
 //!   并把 `HMAC-SHA512(AuthKey, pub‖ClientHello‖ServerHello)` 的 ML-DSA-65
-//!   签名写入 `cert[126:]` 固定偏移——Rust 端签名路径 stub（见
-//!   [`generate_reality_ed25519_cert_mldsa65`]）。
+//!   签名写入 `cert[126:]` 固定偏移——Rust 端已实现
+//!   （[`generate_reality_ed25519_cert_mldsa65`]，偏移动态定位）；生产接线
+//!   受 rustls 证书选定时机限制，见该函数文档。
 //!
 //! 注意：Go REALITY 服务端**不会**从 dest 获取或重签证书——dest 仅在 auth
 //! 失败后作 fallback 透明转发（客户端与真实 dest 直接完成 TLS，DPI 在该路径
@@ -72,6 +73,12 @@ pub fn build_server_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> Result<Server
 /// 进程级固定 REALITY 证书模板（对应 Go `init()` 的 `ed25519Priv` + `signedCert`）。
 struct DummyCert {
     cert_der: Vec<u8>,
+    /// mldsa65 变体模板（Go `signedCertMldsa65`：同密钥自签 + OID 0.0 的
+    /// 3309B 保留扩展）。cm97：签名路径的宿主证书。
+    cert_der_mldsa65: Vec<u8>,
+    /// 变体模板中扩展 value 区起始偏移（Go 硬编码 `cert[126:]` 的等价物；
+    /// rcgen 与 Go x509 的 DER 布局不同，必须动态定位）。
+    mldsa65_ext_value_off: usize,
     key_der: Vec<u8>,
     public_key_raw: [u8; 32],
 }
@@ -89,17 +96,39 @@ static DUMMY_CERT: LazyLock<DummyCert> =
 fn build_dummy_cert() -> Result<DummyCert> {
     use rcgen::{CertificateParams, DistinguishedName, KeyPair, PKCS_ED25519, SerialNumber};
 
-    let mut params = CertificateParams::default();
-    params.distinguished_name = DistinguishedName::new(); // 清空默认 CN（Go: 空 pkix.Name）
-    // Go serial=0 经 yasna 编码为 `02 00`（INTEGER 内容 0 字节）＝非法定长 DER，
-    // BoringSSL 客户端解析 Certificate 直接 DECODE_ERROR（Go 自家 x509 容忍空
-    // INTEGER 故无此问题）。固定 serial=1 保持模板确定性且 DER 合法。
-    params.serial_number = Some(SerialNumber::from_slice(&[1]));
+    let make_params = || {
+        let mut params = CertificateParams::default();
+        params.distinguished_name = DistinguishedName::new(); // 清空默认 CN（Go: 空 pkix.Name）
+        // Go serial=0 经 yasna 编码为 `02 00`（INTEGER 内容 0 字节）＝非法定长 DER，
+        // BoringSSL 客户端解析 Certificate 直接 DECODE_ERROR（Go 自家 x509 容忍空
+        // INTEGER 故无此问题）。固定 serial=1 保持模板确定性且 DER 合法。
+        params.serial_number = Some(SerialNumber::from_slice(&[1]));
+        params
+    };
     let key_pair = KeyPair::generate_for(&PKCS_ED25519)
         .map_err(|e| RealityError::CertGenerate(format!("rcgen Ed25519 keypair: {e}")))?;
-    let cert = params
+    let cert = make_params()
         .self_signed(&key_pair)
         .map_err(|e| RealityError::CertGenerate(format!("rcgen self_signed: {e}")))?;
+
+    // mldsa65 变体模板（Go signedCertMldsa65 等价）：同密钥自签 + 单个
+    // OID 0.0 扩展，value 预留 3309B 全零（握手时原位覆盖为 ML-DSA-65 签名）。
+    let mut params_mldsa65 = make_params();
+    params_mldsa65.custom_extensions = vec![rcgen::CustomExtension::from_oid_content(
+        &[0, 0],
+        vec![0u8; MLDSA65_SIGNATURE_LEN],
+    )];
+    let cert_mldsa65 = params_mldsa65
+        .self_signed(&key_pair)
+        .map_err(|e| RealityError::CertGenerate(format!("rcgen self_signed mldsa65: {e}")))?;
+    let cert_der_mldsa65 = cert_mldsa65.der().to_vec();
+    let mldsa65_ext_value_off = crate::util::find_oid_0_0_extension(&cert_der_mldsa65)
+        .map(|(off, len)| {
+            assert_eq!(len, MLDSA65_SIGNATURE_LEN, "mldsa65 extension value length");
+            off
+        })
+        .ok_or_else(|| RealityError::CertGenerate("mldsa65 extension not found in template".into()))?;
+
     let public_key_raw: [u8; 32] = key_pair
         .public_key_raw()
         .try_into()
@@ -107,6 +136,8 @@ fn build_dummy_cert() -> Result<DummyCert> {
 
     Ok(DummyCert {
         cert_der: cert.der().to_vec(),
+        cert_der_mldsa65,
+        mldsa65_ext_value_off,
         key_der: key_pair.serialize_der(),
         public_key_raw,
     })
@@ -150,34 +181,65 @@ pub fn generate_reality_ed25519_cert(auth_key: &[u8]) -> Result<(Vec<u8>, Vec<u8
     Ok((cert_der, dummy.key_der.clone()))
 }
 
-/// ML-DSA-65 变体证书 + 签名路径 stub（未实现）。
+/// ML-DSA-65 变体证书 + 签名（Go `handshake()` pickCertificate 块 mldsa65
+/// 分支的 Rust 等价，cm97）。
 ///
 /// Go（handshake_server_tls13.go）：配置 `Mldsa65Key` 时换用带 3309 字节保留
 /// 扩展（OID 0.0）的模板证书；HMAC 覆盖后继续
 /// `h.Write(clientHello.original); h.Write(hello.original)`，把
 /// `HMAC-SHA512(AuthKey, pub‖CH‖SH)` 的 ML-DSA-65 签名写入 `cert[126:]`。
+/// Rust 侧差异仅在偏移获取方式：rcgen 与 Go x509 的 DER 布局不同，签名写入
+/// 点由模板构建期动态定位（[`DummyCert::mldsa65_ext_value_off`]），语义一致。
 ///
-/// Rust 端阻塞点：rustls `ResolvesServerCert::resolve()` 只暴露 ClientHello，
-/// 证书选定前拿不到 ServerHello 原始字节（Go 在自家 TLS 栈握手函数内生成证书，
-/// 无此约束）。tvky 状态：
-/// - ✅ mldsa65 公钥派生（[`crate::crypto::derive_mldsa65_pubkey`]，1952 字节）
-/// - ✅ 客户端 mldsa65 验签原语（[`crate::crypto::verify_mldsa65_signature`]）
-/// - ⛔ 端到端签名生成（受 rustls ServerHello 字节不可见约束）
+/// # 参数
 ///
-/// 当前 `from_proto` 派生 mldsa65 公钥后**仍下发标准 REALITY cert**
-/// （HMAC-SHA512 尾部 + 无 mldsa65 扩展），与 Go 端非 PQC 客户端互通；
-/// 仅当 Go 客户端显式配置 `Mldsa65Verify` 时该 cert 会被拒（Go 端回退到
-/// 标准 x509 验证失败）——此场景需等待 ServerHello 捕获实现。
+/// - `auth_key`：HKDF-SHA256 派生的认证密钥
+/// - `client_hello_raw`：客户端 ClientHello 完整 handshake message
+///   （type(1)+len(3)+body，对齐 Go `hs.clientHello.original`）
+/// - `server_hello_raw`：服务端 ServerHello 完整 handshake message（对齐 Go
+///   `hs.hello.original`）
+/// - `mldsa65_seed`：ML-DSA-65 种子（Go `mldsa65Seed`，32 字节）
 ///
 /// # Errors
 ///
-/// - 恒返回 [`RealityError::Mldsa65NotImplemented`]
+/// - HMAC 计算失败 → [`RealityError::EmptySharedKey`]
+/// - seed 长度 ≠ 32 → [`RealityError::InvalidMldsa65SeedLen`]
+///
+/// # 生产接线边界
+///
+/// rustls `ResolvesServerCert::resolve()` 只暴露 ClientHello，证书选定前
+/// 拿不到 ServerHello 原始字节（Go 在自家 TLS 栈握手函数内生成证书，无此
+/// 约束；btls 无 server acceptor）。本函数可签可验（契约测试覆盖），但
+/// `server_tls` 生产路径暂无调用点；客户端侧的完整链路（btls ServerHello
+/// 捕获 + 验签）已落地（[`crate::client`]）。
 pub fn generate_reality_ed25519_cert_mldsa65(
-    _auth_key: &[u8],
-    _client_hello_raw: &[u8],
-    _server_hello_raw: &[u8],
+    auth_key: &[u8],
+    client_hello_raw: &[u8],
+    server_hello_raw: &[u8],
+    mldsa65_seed: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>)> {
-    Err(RealityError::Mldsa65NotImplemented)
+    let dummy = &*DUMMY_CERT;
+
+    let mut cert_der = dummy.cert_der_mldsa65.clone();
+    // Go: h := hmac.New(sha512.New, c.AuthKey); h.Write(ed25519Priv[32:]);
+    //     h.Sum(cert[:len(cert)-64])
+    let hmac_sig = crate::crypto::sign_reality_certificate(auth_key, &dummy.public_key_raw)?;
+    let len = cert_der.len();
+    cert_der[len - 64..].copy_from_slice(&hmac_sig);
+
+    // Go: h.Write(clientHello.original); h.Write(hello.original);
+    //     mldsa65.SignTo(key, h.Sum(nil), nil, false, cert[126:])
+    let msg = crate::crypto::hmac_reality_message(
+        auth_key,
+        &dummy.public_key_raw,
+        client_hello_raw,
+        server_hello_raw,
+    )?;
+    let sig = crate::crypto::sign_mldsa65_signature(mldsa65_seed, &msg)?;
+    let off = dummy.mldsa65_ext_value_off;
+    cert_der[off..off + sig.len()].copy_from_slice(&sig);
+
+    Ok((cert_der, dummy.key_der.clone()))
 }
 
 #[cfg(test)]
@@ -304,12 +366,62 @@ mod tests {
         );
     }
 
-    /// mldsa65 签名路径 stub：rustls 证书选定前拿不到 ServerHello 字节 → NotImplemented。
+    /// cm97 契约：mldsa65 变体证书签名/验签全链 roundtrip（对齐 Go
+    /// handshake_server_tls13.go 签名端 + reality.go VerifyPeerCertificate
+    /// 验证端）。篡改任一输入必须验签失败。
     #[test]
-    fn mldsa65_cert_signing_stub_not_implemented() {
-        let err = generate_reality_ed25519_cert_mldsa65(&[0x42u8; 32], &[1, 2, 3], &[4, 5, 6])
-            .unwrap_err();
-        assert!(matches!(err, RealityError::Mldsa65NotImplemented));
+    fn mldsa65_cert_sign_verify_roundtrip() {
+        let auth_key = [0x42u8; 32];
+        let seed = [0x07u8; 32];
+        let ch = [0x11u8; 256];
+        let sh = [0x22u8; 90];
+
+        let (cert_der, key_der) =
+            generate_reality_ed25519_cert_mldsa65(&auth_key, &ch, &sh, &seed).unwrap();
+        assert!(!key_der.is_empty());
+        assert_eq!(cert_der[0], 0x30, "cert_der should start with SEQUENCE tag");
+
+        // 标准 REALITY HMAC 尾仍在（两种模板都必须写，Go 同）
+        let pub_key = DUMMY_CERT.public_key_raw;
+        let hmac_sig = crate::crypto::sign_reality_certificate(&auth_key, &pub_key).unwrap();
+        let n = cert_der.len();
+        assert_eq!(&cert_der[n - 64..], &hmac_sig, "HMAC tail must be present");
+
+        // 客户端视角：定位扩展 → 重算滚动 HMAC → mldsa65 验签
+        let (off, sig_len) =
+            crate::util::find_oid_0_0_extension(&cert_der).expect("OID 0.0 extension present");
+        assert_eq!(sig_len, crate::crypto::MLDSA65_SIG_LEN);
+        let sig = &cert_der[off..off + sig_len];
+        let msg = crate::crypto::hmac_reality_message(&auth_key, &pub_key, &ch, &sh).unwrap();
+        let pubkey_1952 = crate::crypto::derive_mldsa65_pubkey(&seed).unwrap();
+        let ok = crate::crypto::verify_mldsa65_signature(&pubkey_1952, &msg, sig).unwrap();
+        assert!(ok, "roundtrip sign→verify must hold");
+
+        // 篡改 ServerHello → 验签失败（签名覆盖 CH‖SH 上下文）
+        let sh_bad = [0x23u8; 90];
+        let msg_bad =
+            crate::crypto::hmac_reality_message(&auth_key, &pub_key, &ch, &sh_bad).unwrap();
+        let bad =
+            crate::crypto::verify_mldsa65_signature(&pubkey_1952, &msg_bad, sig).unwrap();
+        assert!(!bad, "tampered ServerHello must fail verification");
+    }
+
+    /// 变体模板与标准模板同密钥同布局（除扩展外逐字节一致不可期——rcgen
+    /// 布局由扩展插入改变——但公钥/HMAC 尾语义必须一致）。
+    #[test]
+    fn mldsa65_template_shares_key_with_standard() {
+        let auth_key = [0x42u8; 32];
+        let (std_cert, _) = generate_reality_ed25519_cert(&auth_key).unwrap();
+        let (var_cert, var_key) =
+            generate_reality_ed25519_cert_mldsa65(&auth_key, &[1u8; 8], &[2u8; 8], &[0x07u8; 32])
+                .unwrap();
+        let (_, std_key2) = generate_reality_ed25519_cert(&auth_key).unwrap();
+        assert_eq!(var_key, std_key2, "both templates use the process-static key");
+        assert!(var_cert.len() > std_cert.len(), "variant carries the 3309B extension");
+        assert!(
+            crate::util::find_oid_0_0_extension(&std_cert).is_none(),
+            "standard template must not carry OID 0.0 extension"
+        );
     }
 
     #[test]

@@ -205,19 +205,22 @@ impl RealityConfig {
             // tvky (REALITY 10.0)：派生 ML-DSA-65 公钥并填充 `mldsa65_key`
             // —— 对齐 Go `_, key := mldsa65.NewKeyFromSeed(...) → config.Mldsa65Key`。
             // 公钥本身已可用（RustCrypto ml-dsa 0.1 与 circl FIPS 204 字节级一致，
-            // xray-cli 黄金值覆盖）。当前 cert 签名生成路径仍 stub（rustls
-            // `ResolvesServerCert::resolve()` 拿不到 ServerHello 字节，写入
-            // cert[126:] 受限），但 mldsa65_key 已就位便于：
-            //   1. 后续补全 ServerHello 捕获后端到端签名
+            // xray-cli 黄金值覆盖）。cm97：签名原语已实现
+            // （crate::mitm::generate_reality_ed25519_cert_mldsa65），生产接线
+            // 仍受 rustls 证书选定时机限制（见下方 warn）。mldsa65_key 已就位便于：
+            //   1. 后续补全生产 ServerHello 捕获后端到端签名
             //   2. 对外暴露公钥供诊断/管理通道
             // 长度已在校验段断言（`actual: p.mldsa65_seed.len()`），此调用不会 Err。
             cfg.mldsa65_key = Some(crate::crypto::derive_mldsa65_pubkey(&p.mldsa65_seed)?);
-            // 签名路径 stub（crate::mitm::generate_reality_ed25519_cert_mldsa65）：
-            // rustls 证书选定前拿不到 ServerHello 字节。非 PQC 客户端不受影响
-            // （Go 端 mldsa65 变体证书同样携带标准 HMAC 尾部，向后兼容）。
+            // cm97 现状：签名原语 + 客户端 btls 捕获/验签链路已落地；服务端
+            // rustls 路径 `ResolvesServerCert::resolve()` 证书选定前拿不到
+            // ServerHello 字节（btls 无 server acceptor），仍下发标准 REALITY
+            // cert（HMAC-SHA512 尾部 + 无 mldsa65 扩展）。非 PQC 客户端不受
+            // 影响；配 mldsa65Verify 的客户端对该 cert 会按 Go 语义断连。
             tracing::warn!(
-                "REALITY: mldsa65_seed configured but ML-DSA-65 cert signing is \
-                 not yet implemented; serving standard REALITY cert (HMAC-SHA512 only)"
+                "REALITY: mldsa65_seed configured but the rustls server path \
+                 cannot sign certs with ServerHello captured (ResolvesServerCert \
+                 sees ClientHello only); serving standard REALITY cert (HMAC-SHA512 only)"
             );
         }
         if let Some(lf) = &p.limit_fallback_upload {

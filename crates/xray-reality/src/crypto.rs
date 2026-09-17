@@ -376,6 +376,59 @@ pub fn sign_reality_certificate(
     Ok(sig)
 }
 
+/// REALITY mldsa65 签名消息：`HMAC-SHA512(auth_key, pub ‖ ClientHello.Raw ‖
+/// ServerHello.Raw)`（64 字节）。
+///
+/// 对应 Go 服务端（handshake_server_tls13.go）签名端的滚动 hash：
+/// ```go
+/// h := hmac.New(sha512.New, c.AuthKey); h.Write(ed25519Priv[32:])
+/// h.Sum(cert[:len(cert)-64])          // 标准 REALITY HMAC 尾（Sum 不改状态）
+/// h.Write(hs.clientHello.original); h.Write(hs.hello.original)
+/// mldsa65.SignTo(key, h.Sum(nil), ...) // = 本函数输出
+/// ```
+/// 同时是 Go 客户端（reality.go `VerifyPeerCertificate`）`h.Write(Hello.Raw);
+/// h.Write(ServerHello.Raw); h.Sum(nil)` 的重算结果——两侧逐字节一致。
+///
+/// # Errors
+///
+/// - [`RealityError::EmptySharedKey`]：auth_key 为空
+pub fn hmac_reality_message(
+    auth_key: &[u8],
+    cert_pub_key_ed25519: &[u8],
+    client_hello_raw: &[u8],
+    server_hello_raw: &[u8],
+) -> Result<[u8; 64], RealityError> {
+    let mut mac = HmacSha512::new_from_slice(auth_key)
+        .map_err(|_| RealityError::EmptySharedKey)?;
+    mac.update(cert_pub_key_ed25519);
+    mac.update(client_hello_raw);
+    mac.update(server_hello_raw);
+    let out = mac.finalize().into_bytes();
+    let mut msg = [0u8; 64];
+    msg.copy_from_slice(&out);
+    Ok(msg)
+}
+
+/// ML-DSA-65 签名（hedged，FIPS 204；与 Go circl `mldsa65.SignTo` 互验）。
+///
+/// seed → `SigningKey::from_seed`（同 [`derive_mldsa65_pubkey`] 的确定性
+/// 派生），输出 3309 字节编码签名（[`MLDSA65_SIG_LEN`]）。
+///
+/// # Errors
+///
+/// - [`RealityError::InvalidMldsa65SeedLen`]：seed 长度 ≠ 32
+pub fn sign_mldsa65_signature(seed: &[u8], message: &[u8]) -> Result<Vec<u8>, RealityError> {
+    if seed.len() != MLDSA65_SEED_LEN {
+        return Err(RealityError::InvalidMldsa65SeedLen {
+            actual: seed.len(),
+        });
+    }
+    use ml_dsa::{EncodedSignature, MlDsa65, Seed, Signer, SigningKey};
+    let sk = SigningKey::<MlDsa65>::from_seed(&Seed::from(<[u8; 32]>::try_from(seed).unwrap()));
+    let encoded: EncodedSignature<MlDsa65> = sk.sign(message).encode();
+    Ok(encoded.as_slice().to_vec())
+}
+
 /// ML-DSA-65 签名长度（FIPS 204；Go `Mldsa65Verify` 验证的 3309 字节密文）。
 pub const MLDSA65_SIG_LEN: usize = 3309;
 
@@ -418,14 +471,9 @@ pub fn derive_mldsa65_pubkey(seed: &[u8]) -> Result<Vec<u8>, RealityError> {
 /// mldsa65.Verify(verify.(*mldsa65.PublicKey), h.Sum(nil), nil, certs[0].Extensions[0].Value)
 /// ```
 /// `h.Sum(nil)` = HMAC-SHA512(auth_key, ed25519_pub) || ClientHello.Raw || ServerHello.Raw
-/// （即 mldsa65 签名覆盖整个 ClientHello+ServerHello+auth 上下文），而
-/// Rust 端因 `ResolvesServerCert::resolve()` 拿不到 ServerHello 字节
-/// （见 `mitm.rs` 注释），该签名路径暂不可生成；本函数提供**验签原语**
-/// 以便未来补全 ServerHello 捕获后端到端验证。
-///
-/// 当前调用方传 `signed_message = hmac_of_auth_plus_ch`（不含 ServerHello），
-/// 仅用于单元测试与未来扩展；生产路径中 mldsa65 验证由 [`client`] 层组合 CH+SH
-/// 后调用本函数。
+/// （即 mldsa65 签名覆盖整个 ClientHello+ServerHello+auth 上下文），由
+/// [`crypto::hmac_reality_message`] 组装；服务端对应生成端见
+/// [`crypto::sign_mldsa65_signature`] + `mitm::generate_reality_ed25519_cert_mldsa65`。
 ///
 /// # 参数
 ///
