@@ -37,3 +37,7 @@ runs:
         python3 -c "import sys, pathlib; sys.path.insert(0, 'tools'); from setup_boringssl_reality import apply_reality_patches; apply_reality_patches(pathlib.Path('$RUNNER_TEMP/boringssl'))"
         echo "BORING_BSSL_ASSUME_PATCHED=1" >> "$GITHUB_ENV"
         echo "BORING_BSSL_SOURCE_PATH=$bssl" >> "$GITHUB_ENV"
+        # rust-cache 命中旧 btls-sys cmake build（无新符号）→ 强制清掉已构建产物让 cargo 重建
+        for td in "${CARGO_TARGET_DIR:-target}" "."; do
+          find "$GITHUB_WORKSPACE/$td/build/btls-sys-*" -mindepth 1 -delete 2>/dev/null || true
+        done
