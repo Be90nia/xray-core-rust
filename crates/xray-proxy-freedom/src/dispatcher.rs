@@ -873,19 +873,32 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
             let (mut sock, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 256];
-            let n = sock.read(&mut buf).await.unwrap();
-            let text = String::from_utf8_lossy(&buf[..n]).to_string();
+            // macOS loopback may deliver PROXY header 与 payload 在独立 TCP 段
+            // （Linux 常合并），单次 read 只见头时丢负载 → 修法=读到 \r\n
+            // 把 PROXY header 完整消费完，再回显之后所有收到的字节。
+            let mut buf = Vec::with_capacity(512);
+            let mut tmp = [0u8; 256];
+            let mut header_end: Option<usize> = None;
+            while header_end.is_none() {
+                let n = match sock.read(&mut tmp).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(idx) = buf.windows(2).position(|w| w == b"\r\n") {
+                    header_end = Some(idx + 2);
+                }
+            }
             assert!(
-                text.starts_with("PROXY "),
-                "first bytes must be PROXY header, got: {text:?}"
+                buf.starts_with(b"PROXY "),
+                "first bytes must be PROXY header, got: {:?}",
+                String::from_utf8_lossy(&buf)
             );
-            // 头之后回显剩余负载
-            if let Some(idx) = text.find("\r\n") {
-                let rest = &buf[idx + 2..n];
+            if let Some(end) = header_end {
+                let rest = &buf[end..];
                 if !rest.is_empty() {
-                    use tokio::io::AsyncWriteExt;
                     let _ = sock.write_all(rest).await;
                 }
             }
