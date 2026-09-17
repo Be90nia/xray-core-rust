@@ -574,6 +574,25 @@ mod tests {
     /// 127.0.0.0/8）——回环 echo 会被黑洞。Go 语义下配置 finalRules 先于默认
     /// 规则匹配（matchFinalRule），显式 allow 即逃生门。
     const FREEDOM_ALLOW_ALL_SETTINGS: &[u8] = br#"{"finalRules":[{"action":"allow"}]}"#;
+
+    /// 探测端口 TOCTOU 加固：`bind(:0)`→drop→InstanceStart 之间并行测试
+    /// 可能抢占同端口（os error 98，run 35218583839 ubuntu Workspace lib
+    /// 步实测）——EADDRINUSE 时换端口重试至多 5 次。
+    async fn start_full_retrying_eaddrinuse(
+        build: impl Fn(u16) -> BuiltConfig,
+    ) -> (u16, Vec<tokio::task::JoinHandle<()>>) {
+        for _ in 0..5 {
+            let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+            match start_full(&build(port)).await {
+                Ok((_, _, handles)) => return (port, handles),
+                Err(e) if format!("{e:?}").contains("in use") => continue,
+                Err(e) => panic!("instance start: {e:?}"),
+            }
+        }
+        panic!("instance start: EADDRINUSE persisted across 5 port retries");
+    }
     /// 测试用 Feature：记录 start 次数。
     struct SharedCounterFeature {
         counter: StdArc<AtomicUsize>,
@@ -2401,40 +2420,44 @@ mod tests {
             }
         });
 
-        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let socks_server_port = probe.local_addr().unwrap().port(); drop(probe);
-        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let socks_client_port = probe.local_addr().unwrap().port(); drop(probe);
-
-        // 1. server: SOCKS inbound + Freedom outbound
-        let mut server_cfg = BuiltConfig::default();
-        server_cfg.inbounds.push(BuiltInbound {
-            entry: BuiltEntry { kind: "socks".into(), data: vec![] },
-            tag: "socks-in".into(), port: Some(socks_server_port), listen: Some("127.0.0.1".into()),
-            stream_settings_json: None, sniffing_json: None,
-        });
-        server_cfg.outbounds.push(BuiltOutbound {
-            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
-            tag: "direct".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
-        });
-        let (_, _, sh) = start_full(&server_cfg).await.expect("socks server");
+        // 1. server: SOCKS inbound + Freedom outbound。
+        //    端口探测存在 TOCTOU：bind(:0)→drop→InstanceStart 之间并行测试
+        //    可能抢占同端口（os error 98，run 35218583839 ubuntu 实测）——
+        //    EADDRINUSE 时换端口重试。
+        let (socks_server_port, sh) = start_full_retrying_eaddrinuse(|port| {
+            let mut server_cfg = BuiltConfig::default();
+            server_cfg.inbounds.push(BuiltInbound {
+                entry: BuiltEntry { kind: "socks".into(), data: vec![] },
+                tag: "socks-in".into(), port: Some(port), listen: Some("127.0.0.1".into()),
+                stream_settings_json: None, sniffing_json: None,
+            });
+            server_cfg.outbounds.push(BuiltOutbound {
+                entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
+                tag: "direct".into(), send_through: None, stream_settings_json: None,
+                proxy_settings_json: None, mux_json: None, target_strategy: None,
+            });
+            server_cfg
+        })
+        .await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // 2. client: SOCKS inbound + SOCKS outbound (→ socks_server_port)
-        let mut client_cfg = BuiltConfig::default();
-        client_cfg.inbounds.push(BuiltInbound {
-            entry: BuiltEntry { kind: "socks".into(), data: vec![] },
-            tag: "socks-in".into(), port: Some(socks_client_port), listen: Some("127.0.0.1".into()),
-            stream_settings_json: None, sniffing_json: None,
-        });
-        client_cfg.outbounds.push(BuiltOutbound {
-            entry: BuiltEntry { kind: "socks".into(),
-                data: format!(r#"{{"servers":[{{"address":"127.0.0.1","port":{socks_server_port}}}]}}"#).into_bytes() },
-            tag: "proxy".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
-        });
-        let (_, _, ch) = start_full(&client_cfg).await.expect("socks client");
+        let (socks_client_port, ch) = start_full_retrying_eaddrinuse(|port| {
+            let mut client_cfg = BuiltConfig::default();
+            client_cfg.inbounds.push(BuiltInbound {
+                entry: BuiltEntry { kind: "socks".into(), data: vec![] },
+                tag: "socks-in".into(), port: Some(port), listen: Some("127.0.0.1".into()),
+                stream_settings_json: None, sniffing_json: None,
+            });
+            client_cfg.outbounds.push(BuiltOutbound {
+                entry: BuiltEntry { kind: "socks".into(),
+                    data: format!(r#"{{"servers":[{{"address":"127.0.0.1","port":{socks_server_port}}}]}}"#).into_bytes() },
+                tag: "proxy".into(), send_through: None, stream_settings_json: None,
+                proxy_settings_json: None, mux_json: None, target_strategy: None,
+            });
+            client_cfg
+        })
+        .await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // 3. SOCKS5 → socks_client → socks_server → freedom → echo
