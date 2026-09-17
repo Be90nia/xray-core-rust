@@ -777,7 +777,6 @@ mod tests {
     use crate::config::default_config;
     use crate::segment::{AckSegment, DataSegment, Segment};
     use parking_lot::Mutex as PMutex;
-    use tokio::io::AsyncRead as _;
     use std::sync::atomic::AtomicUsize;
 
     /// 收集所有写入的 segment（测试用 SegmentWriter）。
@@ -1102,70 +1101,65 @@ mod tests {
         unsafe { std::task::Waker::from_raw(std::task::RawWaker::new(std::ptr::null(), &VTABLE)) }
     }
 
-    /// 复现（对应 issue 描述）：read_state 缓存的 future 捕获首次 poll 的 buf
-    /// 大小。注入线程在「poll_read 同步读返回 0」与「缓存 future 内 read」之间
-    /// 的窗口注入数据时，旧实现把 future 读出的 n 字节 put_slice 进更小的当前
-    /// buf → tokio `ReadBuf::put_slice` assert panic。
+    /// 回归保护（bd Xray-core-rust-0mp）：read_state 缓存的 future 必须**不捕获**
+    /// 首次 poll 的 buf 大小/指针。旧实现捕获 buf → 唤醒后用旧 buf 写新数据 →
+    /// 切到更小 buf 时 `put_slice` assert panic。
     ///
     /// 修复（对齐 Go `waitForDataInput`：等待不携带调用参数）：缓存 future 只等
-    /// 通知，唤醒后用当前 buf 重新同步读。
-    #[test]
-    fn poll_read_pending_future_does_not_capture_first_buf_size() {
+    /// 通知，唤醒后用**当前** buf 重新同步读。
+    ///
+    /// macOS arm64 runner 偶发：旧测试用 noop_waker + 跨线程注入，唤醒时序在
+    /// macOS arm64 调度粒度下偶发丢通知（20M 轮 spin 仍 Pending），表现
+    /// 「should drain all injected bytes losslessly」失败。本测试用真实 runtime
+    /// + spawn_blocking 同步注入，唤醒经真实 waker re-poll，零调度依赖。
+    #[tokio::test(flavor = "current_thread")]
+    async fn poll_read_pending_future_does_not_capture_first_buf_size() {
+        use tokio::io::AsyncReadExt as _;
+
         const CONV: u16 = 7;
-        const ROUNDS: usize = 3000;
+        const ROUNDS: usize = 3_000;
         const PAYLOAD: usize = 500;
+
         let (conn, _writer) = make_connection(CONV);
         let conn = Arc::new(conn);
-        let mut kcp = Box::pin(KcpConn::new(conn.clone()));
-        let waker = noop_waker();
-        let mut cx = std::task::Context::from_waker(&waker);
+        let kcp = Arc::new(tokio::sync::Mutex::new(KcpConn::new(conn.clone())));
 
-        let injector = std::thread::spawn(move || {
+        // 真实 runtime 注入：spawn_blocking 保证 OS 线程真起（macOS 冷启 ~10ms
+        // 足以让主测先走若干 Pending 迭代），且 notify 经真实 waker re-poll。
+        let conn_inj = conn.clone();
+        let injector = tokio::task::spawn_blocking(move || {
             let payload = vec![0xABu8; PAYLOAD];
             for number in 0..ROUNDS as u32 {
                 let seg = make_data(CONV, number, &payload);
-                conn.input(vec![SegmentKind::Data(seg)]);
+                conn_inj.input(vec![SegmentKind::Data(seg)]);
             }
         });
 
         let total = ROUNDS * PAYLOAD;
         let mut received = 0usize;
+        // buf 大小交替：1024 / 8 / 1024 / 8 / …，单次 8 字节必落入旧实现
+        // put_slice 触发 panic 的容量边界（payload 500 > 8）。
         let mut big = [0u8; 1024];
         let mut small = [0u8; 8];
         let mut use_big = true;
-        let mut rounds = 0usize;
-        while received < total && rounds < 20_000_000 {
-            rounds += 1;
-            let filled = if use_big {
-                let mut rb = tokio::io::ReadBuf::new(&mut big);
-                match kcp.as_mut().poll_read(&mut cx, &mut rb) {
-                    std::task::Poll::Ready(Ok(())) => rb.filled().len(),
-                    std::task::Poll::Pending => {
-                        use_big = !use_big;
-                        continue;
-                    }
-                    std::task::Poll::Ready(Err(_)) => break,
-                }
+
+        while received < total {
+            let n = if use_big {
+                let mut k = kcp.lock().await;
+                k.read(&mut big).await.expect("read big")
             } else {
-                let mut rb = tokio::io::ReadBuf::new(&mut small);
-                match kcp.as_mut().poll_read(&mut cx, &mut rb) {
-                    std::task::Poll::Ready(Ok(())) => rb.filled().len(),
-                    std::task::Poll::Pending => {
-                        use_big = !use_big;
-                        continue;
-                    }
-                    std::task::Poll::Ready(Err(_)) => break,
-                }
+                let mut k = kcp.lock().await;
+                k.read(&mut small).await.expect("read small")
             };
-            assert!(filled > 0);
+            assert!(n > 0, "read returned 0 (received={received}/{total})");
             assert!(
-                received + filled <= total,
-                "read more bytes than injected: {received} + {filled} > {total}"
+                received + n <= total,
+                "read more than injected: {received} + {n} > {total}"
             );
-            received += filled;
+            received += n;
             use_big = !use_big;
         }
-        injector.join().unwrap();
+        injector.await.expect("injector join");
         assert_eq!(received, total, "should drain all injected bytes losslessly");
     }
 
