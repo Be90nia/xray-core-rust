@@ -96,7 +96,17 @@ pub struct VisionConn<C> {
     splice_armed: bool,
     /// 诊断用角色标记（new=client / new_server=server），仅进 trace 日志。
     is_server: bool,
+    /// raw 写入起步闸：arm 后首个 raw 写延迟 RAW_WRITE_ARM_DELAY，等对端
+    /// 读完 DIRECT 帧（其 rustls 的同 recv 过读会把紧随的 raw 字节当隧道
+    /// 记录解密 → BadRecordMac fatal alert → 双端皆死，macOS #08 实测）。
+    /// 定时器到期后清 None，后续 raw 写零开销。
+    raw_write_gate: Option<Pin<Box<tokio::time::Sleep>>>,
 }
+
+/// raw 起步闸延迟：覆盖对端「收 DIRECT 帧 → 处理 → 切 raw 读」的调度
+/// 延迟。实测恶性窗口 ~1.5ms（loopback 合流），50ms=30x 余量；每次
+/// splice 切换仅首个上游写承担一次，对吞吐无影响。
+const RAW_WRITE_ARM_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 impl<C> VisionConn<C>
 where
@@ -130,6 +140,7 @@ where
             read_tmp: Vec::with_capacity(16 * 1024),
             splice_armed: false,
             is_server: false,
+            raw_write_gate: None,
         }
     }
 
@@ -169,6 +180,7 @@ where
             read_tmp: Vec::with_capacity(16 * 1024),
             splice_armed: false,
             is_server: true,
+            raw_write_gate: None,
         }
     }
 
@@ -388,6 +400,14 @@ where
             //    写 inner 会把 caller 的 TLS records 当明文再加密一层）。
             if !this.uplink_padding {
                 if let Some(raw) = this.raw_fallback.as_mut() {
+                    // raw 起步闸：等对端消费 DIRECT 帧（见 raw_write_gate 注释）。
+                    if let Some(sleep) = this.raw_write_gate.as_mut() {
+                        if sleep.as_mut().poll(cx).is_pending() {
+                            return Poll::Pending;
+                        }
+                        tracing::trace!(target: "splice08", role = this.is_server, "raw write gate open");
+                        this.raw_write_gate = None;
+                    }
                     return Pin::new(raw).poll_write(cx, buf);
                 }
                 return Pin::new(&mut this.inner).poll_write(cx, buf);
@@ -502,6 +522,7 @@ where
     fn arm_splice_raw(&mut self) {
         if self.splice_armed {
             self.splice_armed = false;
+            self.raw_write_gate = Some(Box::pin(tokio::time::sleep(RAW_WRITE_ARM_DELAY)));
             tracing::trace!(target: "splice08", role = self.is_server, "arm_splice_raw");
             if self.raw_fallback.is_none() {
                 self.raw_fallback =
