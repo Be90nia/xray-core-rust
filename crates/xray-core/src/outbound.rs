@@ -831,7 +831,14 @@ fn build_protocol_handler(
         }
         "anytls" => {
             let config = parse_anytls_config(&ob.entry.data)?;
-            let client = Arc::new(xray_proxy_anytls::AnytlsClient::new(config));
+            // streamSettings.sockopt → dial_system（mark/dialerProxy/happyEyeballs/
+            // domainStrategy，bd n65u）；network/security 段由 anytls 协议自持
+            // TLS，不消费。
+            let sockopt = xray_transport::dialer::StreamSettings::from_json(
+                ob.stream_settings_json.as_ref(),
+            )
+            .socket_options();
+            let client = Arc::new(xray_proxy_anytls::AnytlsClient::new(config.with_sockopt(sockopt)));
             let dial_fn = xray_proxy_anytls::make_anytls_dial_fn(client);
             wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
         }

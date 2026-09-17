@@ -6107,6 +6107,7 @@ version = "0.1.0"
 dependencies = [
  "anytls",
  "async-trait",
+ "parking_lot",
  "rcgen 0.13.2",
  "rustls",
  "sha2 0.10.9",

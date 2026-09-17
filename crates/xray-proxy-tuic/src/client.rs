@@ -421,7 +421,8 @@ pub(crate) fn resolve_first(addr: impl ToSocketAddrs) -> Result<SocketAddr> {
 /// `min(up, down)=0` 时选 BBR 的协商语义。Brutal 窗口 = 2×bps×rtt：
 /// 回环/亚毫秒 RTT 下带宽必须 MB/s 级，否则窗口被钳到 1 MTU（见
 /// congestion_swappable::quinn_bridge 契约测试）。
-fn apply_congestion_to_transport(
+/// 服务端对称复用（inbound `build_server_config`），见 crate::inbound。
+pub(crate) fn apply_congestion_to_transport(
     transport: &mut quinn::TransportConfig,
     congestion_control: CongestionControl,
     brutal_up_bps: u64,

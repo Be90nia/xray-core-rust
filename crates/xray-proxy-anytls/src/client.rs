@@ -23,8 +23,36 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
 use tokio_rustls::TlsConnector;
 
+use xray_common::net::address::Address;
+use xray_common::net::destination::Destination;
+use xray_common::net::port::Port;
+use xray_transport::sockopt::SocketOptions;
+
 use crate::error::Result;
 use crate::socks::SocksAddr;
+
+/// `host:port` → Destination：IP 字面量直取，其余按域名（解析下沉 dial_system）。
+/// IPv6 需 `[..]:port` 形态（同原 `TcpStream::connect` 接受格式）。
+fn server_destination(server_addr: &str) -> std::io::Result<Destination> {
+    let (host, port) = server_addr.rsplit_once(':').ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("anytls server_addr missing port: {server_addr}"),
+        )
+    })?;
+    let port: u16 = port.parse().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("anytls server_addr bad port: {port}"),
+        )
+    })?;
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    let address = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => Address::from(ip),
+        Err(_) => Address::new_domain(host),
+    };
+    Ok(Destination::tcp(address, Port::new(port)))
+}
 
 /// anytls duplex 缓冲（64 KiB）。
 const DUPLEX_BUF_SIZE: usize = 64 * 1024;
@@ -46,6 +74,9 @@ pub struct ClientConfig {
     pub idle_timeout: Duration,
     /// 最少保留空闲会话数（预热）。
     pub min_idle_sessions: usize,
+    /// 拨号 sockopt（mark/dialerProxy/happyEyeballs/domainStrategy 等）。
+    /// 经 `dial_system` 生效；对齐 anytls-go 可注入 `SystemDialer` 语义。
+    pub sockopt: SocketOptions,
 }
 
 impl ClientConfig {
@@ -65,7 +96,15 @@ impl ClientConfig {
             idle_check_interval: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(60),
             min_idle_sessions: 0,
+            sockopt: SocketOptions::default(),
         }
+    }
+
+    /// 指定拨号 sockopt（builder 风格，xray-core 装配处注入）。
+    #[must_use]
+    pub fn with_sockopt(mut self, sockopt: SocketOptions) -> Self {
+        self.sockopt = sockopt;
+        self
     }
 }
 
@@ -87,14 +126,19 @@ impl AnytlsClient {
         // dial_out：会话池 miss 时被调用，建立到 server 的 TLS 连接。
         // 协议要求（protocol.md Authentication）：TLS 握手完成后必须立即发送认证帧
         // `sha256(password) || padding0_len(BE u16) || padding0`，不发则 server 拒识/挂起。
+        // 拨号经 dial_system：多 IP 域名 Happy Eyeballs + sockopt（mark/dialerProxy/
+        // domainStrategy 等）生效，对齐 anytls-go 可注入 SystemDialer 语义（bd n65u）。
         let dial_padding = padding.clone();
+        let dial_sockopt = config.sockopt.clone();
         let dial_out: DialOutFunc = Box::new(move || {
             let server_addr = server_addr.clone();
             let sni = sni.clone();
             let tls_config = tls_config.clone();
             let padding = dial_padding.clone();
+            let sockopt = dial_sockopt.clone();
             Box::pin(async move {
-                let tcp = tokio::net::TcpStream::connect(&server_addr).await?;
+                let dest = server_destination(&server_addr)?;
+                let tcp = xray_transport::system_dialer::dial_system(&dest, &sockopt).await?;
                 let connector = TlsConnector::from(tls_config);
                 let server_name =
                     rustls::pki_types::ServerName::try_from(sni.clone())
@@ -295,5 +339,26 @@ mod tests {
         assert_eq!(frame.len(), 34);
         assert_eq!(&frame[..32], &sha);
         assert_eq!(&frame[32..34], &[0x00, 0x00]);
+    }
+
+    #[test]
+    fn server_destination_parses_ip_domain_ipv6() {
+        // IPv4 字面量直取
+        let dest = server_destination("127.0.0.1:8443").unwrap();
+        assert_eq!(dest.port().value(), 8443);
+        assert!(!dest.address().is_domain());
+
+        // 域名保留给 dial_system 解析
+        let dest = server_destination("proxy.example.com:443").unwrap();
+        assert!(dest.address().is_domain());
+
+        // IPv6 括号形态（同 TcpStream::connect 接受格式）
+        let dest = server_destination("[::1]:9000").unwrap();
+        assert_eq!(dest.port().value(), 9000);
+        assert!(!dest.address().is_domain());
+
+        // 坏端口 / 缺端口显式报错
+        assert!(server_destination("host:notaport").is_err());
+        assert!(server_destination("host_without_port").is_err());
     }
 }

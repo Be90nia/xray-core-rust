@@ -715,7 +715,7 @@ mod udp_assoc_tests {
     use xray_common::net::port::Port;
     use xray_transport::link::Link;
 
-    use crate::client::TuicClient;
+    use crate::client::{CongestionControl, TuicClient};
     use crate::inbound::{TuicInboundConfig, TuicInboundHandler};
     use crate::pool::QuinnConnectionPool;
     use crate::protocol::command::type_code;
@@ -821,6 +821,7 @@ mod udp_assoc_tests {
     async fn connect_inbound(
         handler: Arc<dyn DispatchHandler>,
         password: &str,
+        congestion_control: Option<CongestionControl>,
     ) -> TuicClient {
         let uuid = Uuid::new_v4();
         let inbound = TuicInboundHandler::new(
@@ -832,6 +833,8 @@ mod udp_assoc_tests {
                 password: password.to_string(),
                 cert_der: None,
                 key_der: None,
+                congestion_control,
+                brutal_up_bps: 0,
             },
         )
         .unwrap()
@@ -911,6 +914,7 @@ mod udp_assoc_tests {
         let client = connect_inbound(
             Arc::new(CaptureHandler(std::sync::Arc::clone(&store))),
             "domain-dest",
+            None,
         )
         .await;
 
@@ -949,6 +953,7 @@ mod udp_assoc_tests {
         let client = connect_inbound(
             Arc::new(CaptureHandler(std::sync::Arc::clone(&store))),
             "dissociate",
+            None,
         )
         .await;
 
@@ -1045,6 +1050,28 @@ mod udp_assoc_tests {
     async fn heartbeat_goes_datagram() {
         let (client, _server) = connect_mock("hb-dgram").await;
         client.heartbeat().await.expect("heartbeat datagram send");
+        client.close(0u32.into(), b"");
+    }
+
+    /// 票 7ykg：服务端带 hysteria_bbr CC 配置真建链——CC 预装经共享槽
+    /// [`HysteriaCCSlot`]，不得破坏 QUIC 握手 / Authenticate / bi-stream relay。
+    #[tokio::test]
+    async fn inbound_with_hysteria_bbr_cc_connects_and_relays() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let store = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let client = connect_inbound(
+            Arc::new(CaptureHandler(std::sync::Arc::clone(&store))),
+            "cc-e2e",
+            Some(CongestionControl::HysteriaBbr),
+        )
+        .await;
+
+        // bi stream Connect → 写数据（服务端 dispatch 消费）= relay 链路活
+        let mut conn = client
+            .dial(Address::Domain("cc-e2e.invalid".to_string(), 443))
+            .await
+            .expect("dial over hysteria_bbr server");
+        conn.send.write_all(b"ping").await.expect("write over relay");
         client.close(0u32.into(), b"");
     }
 }
