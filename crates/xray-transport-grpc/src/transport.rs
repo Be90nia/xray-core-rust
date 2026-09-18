@@ -625,7 +625,9 @@ mod tests {
 
     #[test]
     fn resolve_user_agent_presets() {
-        assert_eq!(resolve_user_agent(""), resolve_user_agent("chrome"));
+        // build_user_agent 按日轮换版本，两次调用可能落不同 Chrome 版本——
+        // 断言形制（空串等价 chrome 默认）而非整串相等。
+        assert!(resolve_user_agent("").unwrap().contains("Chrome/"));
         // H8：动态版本（Chrome 144 起按日轮换），断言形制而非固定版本。
         let chrome = resolve_user_agent("chrome").unwrap();
         assert!(
@@ -766,12 +768,15 @@ mod tests {
         let (resp, _stream) = send_req.send_request(req, true).unwrap();
         assert_eq!(resp.await.unwrap().status(), 200);
 
-        // 错误 path → 404（Go gRPC 框架未知 method 语义）。
+        // 错误 path → 200 + grpc-status:12（Trailers-Only，对齐 Go hub.go:88-92
+        // 未知 method 返回 Unimplemented 而非 HTTP 404）。
         let mut send_req = connect().await;
         let req = Request::builder().method("POST").uri("/Other/Tun")
             .header("content-type", "application/grpc").body(()).unwrap();
         let (resp, _stream) = send_req.send_request(req, true).unwrap();
-        assert_eq!(resp.await.unwrap().status(), 404);
+        let resp = resp.await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("grpc-status").map(|v| v.to_str().unwrap()), Some("12"));
     }
 
     #[tokio::test]

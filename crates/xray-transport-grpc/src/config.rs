@@ -240,8 +240,9 @@ fn path_segment_unescaped(b: u8) -> bool {
         b,
         b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
             | b'-' | b'.' | b'_' | b'~'
-            // §2.2 reserved，segment 模式保留（仅 /;,? 转义）
-            | b'$' | b'&' | b'+' | b':' | b';' | b'=' | b'@'
+            // §2.2 reserved，segment 模式保留（Go url.go:148 仅 /;,? 转义）。
+            // 注意 ';' 属于转义集（Go: saves / ; ,）——不在此处。
+            | b'$' | b'&' | b'+' | b':' | b'=' | b'@'
     )
 }
 
@@ -274,8 +275,8 @@ mod tests {
     /// 原样比对 → Unimplemented。
     #[test]
     fn path_escape_keeps_go_segment_reserved_chars() {
-        assert_eq!(path_escape("a$b&c+d:e;f=g@h"), "a$b&c+d:e;f=g@h");
-        // 仅 / ; , ? 与非 ASCII 被转义（Go shouldEscape segment 分支）。
+        assert_eq!(path_escape("a$b&c+d:e=f=g@h"), "a$b&c+d:e=f=g@h");
+        // 仅 / ; , ? 与非 ASCII 被转义（Go shouldEscape segment 分支，url.go:148）。
         assert_eq!(path_escape("a/b"), "a%2Fb");
         assert_eq!(path_escape("a;b,c?d"), "a%3Bb%2Cc%3Fd");
         // 空格仍转义（Go 尽力而为之外的字节全部 %XX）。
