@@ -29,9 +29,11 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::Arc,
+    sync::atomic::{AtomicU64, Ordering},
     task::{Context, Poll},
 };
 
+use bytes::Bytes;
 use parking_lot::Mutex;
 use quinn::{
     AsyncUdpSocket, UdpPoller,
@@ -51,8 +53,10 @@ const SEND_QUEUE_CAP: usize = 128;
 /// 经 [`quinn::Endpoint::new_with_abstract_socket`] 注入；构造用 [`GeckoSocket::bind`]。
 pub struct GeckoSocket {
     io: Arc<UdpSocket>,
-    send_tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
-    recv_rx: Mutex<mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>>,
+    send_tx: mpsc::Sender<(Bytes, SocketAddr)>,
+    recv_rx: Mutex<mpsc::Receiver<(Bytes, SocketAddr)>>,
+    /// 收/发两方向队列满载丢弃累计包数（对齐 finalmask PacketIoConn 先例）。
+    dropped: Arc<AtomicU64>,
     /// drop 时唤醒接收 driver 退出（sender 归零 → `changed()` 返回 Err）。
     _closed_tx: watch::Sender<()>,
 }
@@ -74,14 +78,17 @@ impl GeckoSocket {
         let io = Arc::new(UdpSocket::bind(bind_addr).await?);
         let conn = Arc::new(GeckoConn::new(config, Box::new(io.clone()))?);
 
-        let (send_tx, send_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(SEND_QUEUE_CAP);
-        let (recv_tx, recv_rx) = mpsc::unbounded_channel::<(Vec<u8>, SocketAddr)>();
+        let (send_tx, send_rx) = mpsc::channel::<(Bytes, SocketAddr)>(SEND_QUEUE_CAP);
+        // 收向同样有界：读端消费不过来时丢新包（内核 UDP 缓冲满即丢的同语义），
+        // 计数可观测，杜绝 unbounded 无背压增长（bd cf0r）。
+        let (recv_tx, recv_rx) = mpsc::channel::<(Bytes, SocketAddr)>(SEND_QUEUE_CAP);
         let (closed_tx, closed_rx) = watch::channel(());
+        let dropped = Arc::new(AtomicU64::new(0));
 
         spawn_send_driver(conn.clone(), send_rx);
-        spawn_recv_driver(conn, recv_tx, closed_rx);
+        spawn_recv_driver(conn, recv_tx, closed_rx, Arc::clone(&dropped));
 
-        Ok(Arc::new(Self { io, send_tx, recv_rx: Mutex::new(recv_rx), _closed_tx: closed_tx }))
+        Ok(Arc::new(Self { io, send_tx, recv_rx: Mutex::new(recv_rx), dropped, _closed_tx: closed_tx }))
     }
 
     /// 构造注入 quinn 用的 endpoint（client 侧，`server_config = None`）。
@@ -101,7 +108,7 @@ impl GeckoSocket {
 /// 发送 driver：GeckoConn::send_to 变换（长头分片/短头透传 + XOR）后写 socket。
 ///
 /// 所有 `GeckoSocket` clone drop → send_tx 归零 → `recv()` 返回 None → 退出。
-fn spawn_send_driver(conn: Arc<GeckoConn>, mut send_rx: mpsc::Receiver<(Vec<u8>, SocketAddr)>) {
+fn spawn_send_driver(conn: Arc<GeckoConn>, mut send_rx: mpsc::Receiver<(Bytes, SocketAddr)>) {
     tokio::spawn(async move {
         while let Some((buf, addr)) = send_rx.recv().await {
             // 发送失败（socket 已死）只丢当前包；后续包同样失败，QUIC 按丢包处理
@@ -117,8 +124,9 @@ fn spawn_send_driver(conn: Arc<GeckoConn>, mut send_rx: mpsc::Receiver<(Vec<u8>,
 /// 接收端归零（channel send 失败）。
 fn spawn_recv_driver(
     conn: Arc<GeckoConn>,
-    recv_tx: mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>,
+    recv_tx: mpsc::Sender<(Bytes, SocketAddr)>,
     mut closed_rx: watch::Receiver<()>,
+    dropped: Arc<AtomicU64>,
 ) {
     tokio::spawn(async move {
         let mut buf = vec![0u8; UDP_SIZE];
@@ -128,8 +136,16 @@ fn spawn_recv_driver(
                 _ = closed_rx.changed() => break,
                 res = conn.recv_from(&mut buf) => match res {
                     Ok((n, addr)) => {
-                        if recv_tx.send((buf[..n].to_vec(), addr)).is_err() {
-                            break;
+                        let pkt = Bytes::copy_from_slice(&buf[..n]);
+                        match recv_tx.try_send((pkt, addr)) {
+                            Ok(()) => {},
+                            // 读端消费不过来：丢新包（UDP 语义）+ 计数（cf0r 对齐
+                            // finalmask PacketIoConn 有界+丢弃先例）
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                let total = dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                                tracing::debug!(dropped = total, "gecko recv queue full, packet dropped");
+                            },
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
                         }
                     },
                     Err(_) => break,
@@ -153,10 +169,14 @@ impl AsyncUdpSocket for GeckoSocket {
                 "gecko socket: multi-segment (GSO) transmit unsupported",
             ));
         }
-        match self.send_tx.try_send((transmit.contents.to_vec(), transmit.destination)) {
+        match self.send_tx.try_send((Bytes::copy_from_slice(transmit.contents), transmit.destination)) {
             Ok(()) => Ok(()),
-            // 队列满：丢包（UDP 缓冲满即丢的内核语义；QUIC 重传兜底）
-            Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+            // 队列满：丢包（UDP 缓冲满即丢的内核语义；QUIC 重传兜底）+ 计数
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::debug!(dropped = total, "gecko send queue full, packet dropped");
+                Ok(())
+            },
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 Err(io::Error::other("gecko socket: send driver stopped"))
             },

@@ -101,12 +101,13 @@ pub enum RealityError {
     #[error("REALITY: mldsa65 signature decode failed")]
     Mldsa65VerifyFailed,
 
-    /// fs0o: 客户端 TLS legacy_version 低于配置的 `min_client_ver`（Go
-    /// `MinClientVer=[26,3,27]` 即 Xray-core v26.3.27 版本门控）。
+    /// fs0o/ft0g: 解密 payload 的 ClientVer 低于配置的 `min_client_ver`（Go
+    /// `MinClientVer=[26,3,27]` 即 Xray-core v26.3.27 版本门控，
+    /// xtls/reality tls.go:259-267）。
     #[error("REALITY: client version too old")]
     ClientVersionTooOld,
 
-    /// fs0o: 客户端 TLS legacy_version 高于配置的 `max_client_ver`。
+    /// fs0o/ft0g: 解密 payload 的 ClientVer 高于配置的 `max_client_ver`。
     #[error("REALITY: client version too new")]
     ClientVersionTooNew,
 }

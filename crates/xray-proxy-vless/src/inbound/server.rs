@@ -1234,9 +1234,9 @@ mod tests {
         }
     }
 
-    /// 8i4c：testpre=2 预连接 e2e。worker 预拨 2 条裸 TCP 挂池，首次 dial 应
-    /// 命中池中连接（免 TCP 握手）照常走请求头 + echo；后续 dial miss 直拨 +
-    /// worker 补货循环。全链路 roundtrip 不受预连接影响。
+    /// 8i4c：testpre=2 预连接 e2e。worker 预拨挂池（池满阻塞等消费，Go
+    /// unbuffered 语义，空闲零新拨号），dial 经池取连接（池空则等 worker
+    /// 交付）照常走请求头 + echo；全链路 roundtrip 不受预连接影响。
     #[tokio::test]
     async fn vless_testpre_preconnect_e2e_roundtrip() {
         use crate::dispatcher::{make_dial_fn, VlessOutboundConfig};
@@ -1293,7 +1293,8 @@ mod tests {
         // 等 worker 预拨 2 条入池（0ms + 200ms 节奏 + 余量）。
         tokio::time::sleep(Duration::from_millis(600)).await;
 
-        // 3 次拨号：命中池 ×2 → miss 直拨（worker 同时补货）。全部 echo 成功。
+        // 3 次拨号全部经池：缓冲命中或等 worker 阻塞 send 秒交付；worker
+        // 消费后 sleep 200ms 再补货。全部 echo 成功。
         for i in 0..3 {
             let mut conn = dial(&dest)
                 .await

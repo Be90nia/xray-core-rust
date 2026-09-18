@@ -492,9 +492,10 @@ async fn handle_udp_session(
                     }
                     Ok(None) => break, // outbound 关闭
                     Err(e) => {
-                        // 坏帧跳过（与 tuic/SS relay 一致）
+                        // qyn8：recv 错误结束会话（Go read 错误语义），
+                        // continue 与滞留坏帧构成忙旋
                         tracing::debug!(error = %e, remote = %sess.remote_addr(), "hysteria udp dispatch recv");
-                        continue;
+                        break;
                     }
                 }
             }

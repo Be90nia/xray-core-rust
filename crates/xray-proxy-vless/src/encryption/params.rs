@@ -32,7 +32,9 @@ pub struct ClientEncParams {
 /// 校验 + 解析客户端 encryption 字符串。
 ///
 /// 返回 `Some(_)` 仅当字符串是合法 `mlkem768x25519plus.*` 格式；
-/// 返回 `None` 时调用方按 `encryption == "none"` 处理（不报错，向下兼容 Go）。
+/// `""`/`"none"` 返回 `None`（明文）。畸形非空非 none 串也返回 `None`，
+/// 但调用方（xray-core outbound parse_vless_config）必须对该情况启动硬错
+/// （Go infra/conf/vless.go:355-360 unsupported encryption），禁静默降级明文。
 pub fn parse_client_encryption(raw: &str) -> Option<ClientEncParams> {
     if raw.is_empty() || raw == "none" {
         return None;

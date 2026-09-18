@@ -399,8 +399,10 @@ async fn handle_udp_associate(
                     Ok(Some(v)) => v,
                     Ok(None) => return Ok(()), // outbound 关闭，会话结束
                     Err(e) => {
+                        // qyn8：recv 错误结束会话（对齐 Go read 错误语义与
+                        // trojan/tun 先例）；continue 会与滞留坏帧构成忙旋
                         tracing::debug!(error = %e, "socks udp dispatch recv failed");
-                        continue;
+                        return Ok(());
                     }
                 };
                 let Some(client) = last_client else { continue };
@@ -1052,8 +1054,10 @@ async fn dokodemo_peer_relay(
                     }
                     Ok(None) => return, // outbound 关闭，会话结束
                     Err(e) => {
+                        // qyn8：recv 错误结束会话（Go read 错误语义），
+                        // continue 与滞留坏帧构成忙旋
                         tracing::debug!(error = %e, "dokodemo udp dispatch recv failed");
-                        continue;
+                        return;
                     }
                 }
             }
@@ -1478,8 +1482,10 @@ async fn ss_udp_client_relay(
                     }
                     Ok(None) => break, // outbound 关闭，会话结束
                     Err(e) => {
+                        // qyn8：recv 错误结束会话（Go read 错误语义），
+                        // continue 与滞留坏帧构成忙旋
                         tracing::debug!(error = %e, "ss udp dispatch recv failed");
-                        continue; // 坏帧跳过（与 SOCKS relay 一致）
+                        break;
                     }
                 }
             }
@@ -2099,21 +2105,50 @@ fn parse_reality_config(
         short_ids.push(id);
     }
 
-    // dest/target：int（端口→localhost:port）或字符串 host:port
+    // dest/target：int（端口→localhost:port，Go uint16 边界）或字符串 host:port；
+    // 缺省 localhost:443（Go conf 层 Dest==nil 跳过整块 target 配置，Rust 无
+    // nil 表示——登记差异）。
     let dest_raw = json
         .get("target")
         .or_else(|| json.get("dest"))
         .cloned()
         .unwrap_or(serde_json::Value::Null);
     let fallback_dest = match dest_raw.as_u64() {
-        Some(port) => format!("localhost:{port}"),
-        None => dest_raw
-            .as_str()
-            .unwrap_or("localhost:443")
-            .to_string(),
+        Some(port @ 0..=65_535) => format!("localhost:{port}"),
+        Some(_) => {
+            return Err(std::io::Error::other(
+                "reality: invalid numeric \"target\" (need uint16 port)",
+            ));
+        }
+        None => match dest_raw {
+            serde_json::Value::String(s) => s,
+            serde_json::Value::Null => "localhost:443".to_string(),
+            _ => {
+                return Err(std::io::Error::other(format!(
+                    "reality: invalid \"target\": {dest_raw}"
+                )));
+            }
+        },
     };
 
-    let xver = json.get("xver").and_then(|x| x.as_u64()).unwrap_or(0).min(2) as u8;
+    // xver（Go transport_security.go:84-86）：仅 0/1/2；负数/非整数/越界
+    // 一律拒启，不钳制。
+    let xver = match json.get("xver") {
+        None | Some(serde_json::Value::Null) => 0u8,
+        Some(x) => match x.as_u64() {
+            Some(n @ 0..=2) => n as u8,
+            Some(_) => {
+                return Err(std::io::Error::other(
+                    "reality: invalid PROXY protocol version, \"xver\" only accepts 0, 1, 2",
+                ));
+            }
+            None => {
+                return Err(std::io::Error::other(
+                    "reality: invalid \"xver\" (need unsigned integer)",
+                ));
+            }
+        },
+    };
     // mldsa65Seed：后量子签名未实现（cz5x）。配置在场即显式报错，
     // 不静默忽略——避免运营者误以为 PQC 已生效。
     if let Some(seed) = json.get("mldsa65Seed").and_then(|x| x.as_str()) {
@@ -2346,6 +2381,8 @@ async fn spawn_one_inbound(
             "TUN inbound is only supported on Linux/Android/FreeBSD",
         ));
     }
+    // sockopt 数值/类型启动期硬错（Go 解码期语义；tcp/unix 监听分支共用）。
+    xray_transport::dialer::StreamSettings::validate_sockopt_json(ib.stream_settings_json.as_ref())?;
 
     let listen = ib.listen.as_deref().unwrap_or("0.0.0.0");
     // vodx：unix 路径监听（Go system_listener.go:118 UnixAddr 分支）走 UDS
@@ -2430,7 +2467,7 @@ async fn spawn_one_inbound(
                 let handler = ohm.get_default_handler().ok_or_else(|| {
                     std::io::Error::other("no default outbound handler registered")
                 })?;
-                let fallbacks = build_vless_fallbacks(&ib.entry.data);
+                let fallbacks = build_vless_fallbacks(&ib.entry.data)?;
                 let bind_addr: SocketAddr = addr.parse().map_err(|e| {
                     std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("parse addr: {e}"))
                 })?;
@@ -2465,7 +2502,7 @@ async fn spawn_one_inbound(
                 } else {
                     let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
                     // VLESS fallbacks：Go napfb（name→alpn→path→dest+xver）
-                    let fallbacks = build_vless_fallbacks(&ib.entry.data);
+                    let fallbacks = build_vless_fallbacks(&ib.entry.data)?;
                     tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_uuid_count(), tls = tls.is_some(), fallbacks = fallbacks.as_ref().map_or(0, |f| f.len()), enc = decryption.is_some(), "vless inbound listening");
                     Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                         serve_vless(listener, ohm, validator, tls, fallbacks, Some(options)).await
@@ -2923,7 +2960,7 @@ async fn spawn_unix_inbound(
                     decryption: decryption.clone(),
                     ..Default::default()
                 };
-                let fallbacks = build_vless_fallbacks(&ib.entry.data);
+                let fallbacks = build_vless_fallbacks(&ib.entry.data)?;
                 tracing::info!(
                     tag = %ib.tag,
                     users = validator.get_uuid_count(),
@@ -3093,9 +3130,11 @@ fn parse_socks_server_config(data: &[u8]) -> std::io::Result<ServerConfig> {
     if v.get("auth").and_then(|x| x.as_str()) == Some("password") {
         cfg.auth_type = xray_proxy_socks::config::AuthType::Password;
     }
+    // accounts 在场则覆盖 users（Go socks.go:54-56 `if v.Accounts != nil`——
+    // 与 Go 相反的旧优先级 users→accounts 已修正）。
     if let Some(users) = v
-        .get("users")
-        .or_else(|| v.get("accounts"))
+        .get("accounts")
+        .or_else(|| v.get("users"))
         .and_then(|x| x.as_array())
     {
         for u in users {
@@ -3135,6 +3174,14 @@ fn build_vless_validator(data: &[u8]) -> std::io::Result<std::sync::Arc<dyn Vles
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("vless inbound settings JSON: {e}")))?;
     let validator = VlessMemoryValidator::new();
+    // settings 级 flow 校验（Go infra/conf/vless.go:57-73 XRV）：仅空 /
+    // xtls-rprx-vision 合法，非法值整 inbound 拒启；空值作为 client 缺省继承。
+    let settings_flow = v.get("flow").and_then(|x| x.as_str()).unwrap_or("");
+    if !settings_flow.is_empty() && settings_flow != xray_proxy_vless::FLOW_XRV {
+        return Err(std::io::Error::other(format!(
+            "VLESS \"settings.flow\" doesn't support \"{settings_flow}\" in this version"
+        )));
+    }
     // settings 级 testseed（Go VLessInboundConfig.Testseed，json `testseed`）。
     let cfg_testseed: Vec<u32> = v
         .get("testseed")
@@ -3160,7 +3207,17 @@ fn build_vless_validator(data: &[u8]) -> std::io::Result<std::sync::Arc<dyn Vles
             let id = c.get("id").and_then(|x| x.as_str()).unwrap_or("");
             let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let level = c.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-            let flow = c.get("flow").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            // client 级 flow（Go vless.go:71-78）：空则继承 settings.flow，
+            // 非空非法拒启（vision 静默降级根除）。
+            let flow = match c.get("flow").and_then(|x| x.as_str()).unwrap_or("") {
+                "" => settings_flow.to_string(),
+                f if f == xray_proxy_vless::FLOW_XRV => f.to_string(),
+                f => {
+                    return Err(std::io::Error::other(format!(
+                        "VLESS users: \"flow\" doesn't support \"{f}\" in this version"
+                    )));
+                }
+            };
             // user 级 testseed 不足 4 个 → settings 级覆盖（Go vless.go:80-82）。
             let mut testseed = user_testseed(c);
             if testseed.len() < 4 {
@@ -3187,27 +3244,39 @@ fn build_vless_validator(data: &[u8]) -> std::io::Result<std::sync::Arc<dyn Vles
 
 /// 解析 settings.decryption → handler 级共享 ENC 解密实例（Go inbound.go:104-114）。
 ///
-/// `"none"`/缺省 → `None`（无 ENC 层）；`"mlkem768x25519plus.<mode>.<seconds>s.<keys>"` →
+/// `"none"` → `None`（无 ENC 层）；`"mlkem768x25519plus.<mode>.<seconds>s.<keys>"` →
 /// 初始化 [`xray_proxy_vless::encryption::ServerInstance`]（私钥 32B=X25519 /
-/// 64B=ML-KEM-768 seed）。非法非 none 值报错（Go conf 层 Build 同为 error）。
+/// 64B=ML-KEM-768 seed）。缺省/空串/非法非 none 值拒启（Go vless.go:152-159
+/// conf 层 Build 同为 error）；ENC 启用时 fallbacks 在场互斥拒启。
 fn build_vless_decryption(
     data: &[u8],
 ) -> std::io::Result<Option<std::sync::Arc<xray_proxy_vless::encryption::ServerInstance>>> {
     use xray_proxy_vless::encryption::{parse_server_decryption, ServerInstance as EncServerInstance};
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("vless inbound settings JSON: {e}")))?;
-    let raw = v
-        .get("decryption")
-        .and_then(|d| d.as_str())
-        .unwrap_or("none");
+    let raw = v.get("decryption").and_then(|d| d.as_str()).unwrap_or("");
     let Some(p) = parse_server_decryption(raw) else {
-        if raw != "none" && !raw.is_empty() {
+        if raw.is_empty() {
+            // Go vless.go:155-157：decryption 缺省/空串拒启——必须显式 "none"，
+            // 不再 unwrap_or("none") 静默兜底。
+            return Err(std::io::Error::other(
+                "VLESS settings: please add/set \"decryption\":\"none\" to every settings",
+            ));
+        }
+        if raw != "none" {
             return Err(std::io::Error::other(format!(
                 "VLESS settings: unsupported \"decryption\": {raw}"
             )));
         }
         return Ok(None);
     };
+    // Go vless.go:161-163：ENC 解密启用时 fallbacks 互斥（字段在场即拒，
+    // 对齐 Go c.Fallbacks != nil）。
+    if v.get("fallbacks").is_some() {
+        return Err(std::io::Error::other(
+            "VLESS settings: \"fallbacks\" can not be used together with \"decryption\"",
+        ));
+    }
     let mut inst = EncServerInstance::new();
     let key_count = p.keys.len();
     inst
@@ -3352,25 +3421,101 @@ fn looks_like_host_port(s: &str) -> bool {
 
 /// 从 inbound entry.data（JSON）解析 VLESS `fallbacks` 数组 → FallbackPolicy。
 ///
-/// JSON 格式（Go `infra/conf/vless.go` VLessInboundFallback）：
-/// `{"fallbacks":[{"name":"sni","alpn":"h2","path":"/api","dest":"127.0.0.1:80","xver":0}]}`
-/// 空数组或缺失返回 None（维持无 fallback 的直连路径）。
-fn build_vless_fallbacks(data: &[u8]) -> Option<std::sync::Arc<xray_proxy_vless::FallbackPolicy>> {
-    let v: serde_json::Value = serde_json::from_slice(data).ok()?;
-    let fbs = v.get("fallbacks")?.as_array()?;
+/// 对齐 Go `infra/conf/vless.go:170-211`（VLessInboundFallback 消费段）：
+/// - `dest` 数字（uint16 范围）→ `"localhost:N"`；字符串原样；
+/// - `path` 必须为空或以 `/` 开头；
+/// - type 推导（serve-ws-none → serve；`/`/`@` 前缀 → unix；纯数字 →
+///   localhost:N；host:port → tcp）失败（含 dest 缺失）→ 拒启；
+/// - `xver` 仅 0/1/2，负数/非整数/越界一律拒启，不钳制；
+/// - unix / serve 目标本构建运行面未实现（恒 TcpStream 拨号）→ 显式拒启。
+///
+/// 空数组或字段缺失返回 `Ok(None)`（维持无 fallback 的直连路径）。
+fn build_vless_fallbacks(
+    data: &[u8],
+) -> std::io::Result<Option<std::sync::Arc<xray_proxy_vless::FallbackPolicy>>> {
+    let v: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| std::io::Error::other(format!("vless inbound settings JSON: {e}")))?;
+    let Some(fbs) = v.get("fallbacks").and_then(|f| f.as_array()) else {
+        return Ok(None);
+    };
     let mut policy = xray_proxy_vless::FallbackPolicy::new();
-    for fb in fbs {
+    for (i, fb) in fbs.iter().enumerate() {
         let name = fb.get("name").and_then(|x| x.as_str()).unwrap_or("");
         let alpn = fb.get("alpn").and_then(|x| x.as_str()).unwrap_or("");
         let path = fb.get("path").and_then(|x| x.as_str()).unwrap_or("");
-        let Some(dest) = fb.get("dest").and_then(|x| x.as_str()) else {
-            tracing::warn!("vless fallback entry missing dest, skipped");
-            continue;
+        if !path.is_empty() && !path.starts_with('/') {
+            return Err(std::io::Error::other(
+                "VLESS fallbacks: \"path\" must be empty or start with \"/\"",
+            ));
+        }
+        // xver（Go vless.go:209-211 + uint64 解码期硬错）。
+        let xver = match fb.get("xver") {
+            None | Some(serde_json::Value::Null) => 0u8,
+            Some(x) => match x.as_u64() {
+                Some(n @ 0..=2) => n as u8,
+                Some(_) => {
+                    return Err(std::io::Error::other(
+                        "VLESS fallbacks: invalid PROXY protocol version, \"xver\" only accepts 0, 1, 2",
+                    ));
+                }
+                None => {
+                    return Err(std::io::Error::other(format!(
+                        "VLESS fallbacks[{i}]: invalid \"xver\" (need unsigned integer)"
+                    )));
+                }
+            },
         };
-        let xver = fb.get("xver").and_then(|x| x.as_u64()).unwrap_or(0).min(2) as u8;
+        // dest（Go vless.go:170-183 json.RawMessage 数字优先）。
+        let mut dest = match fb.get("dest") {
+            Some(serde_json::Value::Number(n)) => match n.as_u64() {
+                Some(port @ 0..=65_535) => format!("localhost:{port}"),
+                _ => {
+                    return Err(std::io::Error::other(format!(
+                        "VLESS fallbacks[{i}]: invalid numeric \"dest\" (need uint16 port)"
+                    )));
+                }
+            },
+            Some(serde_json::Value::String(s)) => s.clone(),
+            None | Some(serde_json::Value::Null) => String::new(),
+            Some(other) => {
+                return Err(std::io::Error::other(format!(
+                    "VLESS fallbacks[{i}]: invalid \"dest\": {other}"
+                )));
+            }
+        };
+        // type 推导（Go vless.go:186-202）；Rust 运行面仅支持 tcp。
+        let mut fb_type = fb.get("type").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        if fb_type.is_empty() && !dest.is_empty() {
+            if dest == "serve-ws-none" {
+                fb_type = "serve".into();
+            } else if dest.starts_with('/') || dest.starts_with('@') {
+                fb_type = "unix".into();
+            } else {
+                if dest.parse::<i64>().is_ok() {
+                    dest = format!("localhost:{dest}");
+                }
+                if looks_like_host_port(&dest) {
+                    fb_type = "tcp".into();
+                }
+            }
+        }
+        if fb_type.is_empty() || dest.is_empty() {
+            return Err(std::io::Error::other(
+                "VLESS fallbacks: please fill in a valid value for every \"dest\"",
+            ));
+        }
+        if fb_type != "tcp" {
+            return Err(std::io::Error::other(format!(
+                "VLESS fallbacks[{i}]: fallback type \"{fb_type}\" is not supported by this build (only \"tcp\")"
+            )));
+        }
         policy.add(name, alpn, path, xray_proxy_vless::FallbackDest::new(dest, xver));
     }
-    if policy.is_empty() { None } else { Some(std::sync::Arc::new(policy)) }
+    if policy.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(std::sync::Arc::new(policy)))
+    }
 }
 /// 从 inbound entry.data（JSON）解析 http inbound 配置 → HttpServerConfig。
 ///
@@ -4314,6 +4459,21 @@ mod tests {
                     use tokio::io::AsyncWriteExt as _;
                     self.w.lock().await.write(buf).await
                 })
+            }
+            // 代 FixBehavior 补：QuicStream trait 新增 poll_write（bd HysteriaConn
+            // 零分配路径）后 mock 未跟上。tokio Mutex try_lock 是同步 API，
+            // 满足“锁内无 await”的 trait 约束；被占即 Pending。
+            fn poll_write(
+                &self,
+                cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                use tokio::io::AsyncWrite as _;
+                let mut w = match self.w.try_lock() {
+                    Ok(w) => w,
+                    Err(_) => return std::task::Poll::Pending,
+                };
+                std::pin::Pin::new(&mut *w).poll_write(cx, buf)
             }
             fn cancel_read(&self, _code: u64) {}
             fn close(&self) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> {
@@ -6215,6 +6375,181 @@ mod tests {
         let err = super::build_vless_validator(bad);
         assert!(err.is_err(), "invalid JSON should error");
     }
+
+    /// 3hsv①：decryption 缺省/空串拒启（Go vless.go:155-157），不再
+    /// unwrap_or("none") 静默兜底。
+    #[test]
+    fn vless_decryption_missing_or_empty_rejected() {
+        for json in [br#"{}"#.as_slice(), br#"{"decryption":""}"#] {
+            let err = super::build_vless_decryption(json).err().expect("must reject");
+            assert!(
+                err.to_string().contains("please add/set"),
+                "expected empty-decryption hard error, got: {err}"
+            );
+        }
+    }
+
+    /// 3hsv①：decryption="none" 与 fallbacks 共存合法；ENC 解密启用时与
+    /// fallbacks 互斥（Go vless.go:161-163）。
+    #[tokio::test]
+    async fn vless_decryption_fallbacks_mutual_exclusion() {
+        use base64::Engine as _;
+        let keys = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let enc = format!(r#"{{"decryption":"mlkem768x25519plus.native.1000s.{keys}"}}"#);
+        // ENC + 无 fallbacks → 合法（初始化成功）。
+        assert!(super::build_vless_decryption(enc.as_bytes()).is_ok());
+        // ENC + fallbacks 在场 → 拒启。
+        let enc_fb = format!(r#"{{"decryption":"mlkem768x25519plus.native.1000s.{keys}","fallbacks":[]}}"#);
+        let err = super::build_vless_decryption(enc_fb.as_bytes()).err().expect("must reject");
+        assert!(
+            err.to_string().contains("can not be used together"),
+            "expected mutual-exclusion hard error, got: {err}"
+        );
+        // none + fallbacks → 合法。
+        let ok = br#"{"decryption":"none","fallbacks":[]}"#;
+        assert!(super::build_vless_decryption(ok).is_ok());
+    }
+
+    /// 3hsv②：settings.flow 非法值拒启（Go vless.go:57-66）。
+    #[test]
+    fn vless_settings_flow_invalid_rejected() {
+        let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+        let json = format!(r#"{{"clients":[{{"id":"{uuid}"}}],"flow":"xtls-rprx-vision-44"}}"#);
+        let err = super::build_vless_validator(json.as_bytes()).err().expect("must reject");
+        assert!(
+            err.to_string().contains("settings.flow"),
+            "expected settings.flow hard error, got: {err}"
+        );
+    }
+
+    /// 3hsv②：client flow 为空时继承 settings.flow；非空非法拒启
+    /// （Go vless.go:71-78）。
+    #[test]
+    fn vless_client_flow_inherits_settings_and_validates() {
+        use xray_proxy_vless::Validator as VlessValidatorTrait;
+        let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+        // 空 client flow + settings.flow=vision → 继承 vision。
+        let json = format!(r#"{{"clients":[{{"id":"{uuid}"}}],"flow":"xtls-rprx-vision","decryption":"none"}}"#);
+        let validator = super::build_vless_validator(json.as_bytes()).unwrap();
+        let u = xray_common::uuid::UUID::parse(uuid).unwrap();
+        let user = VlessValidatorTrait::get(&*validator, &u).expect("user registered");
+        assert_eq!(user.account.flow, "xtls-rprx-vision", "client inherits settings.flow");
+        // client flow 非法 → 拒启。
+        let bad = format!(r#"{{"clients":[{{"id":"{uuid}","flow":"xtls-rprx-direct"}}]}}"#);
+        let err = super::build_vless_validator(bad.as_bytes()).err().expect("must reject");
+        assert!(
+            err.to_string().contains("\"flow\" doesn't support"),
+            "expected client flow hard error, got: {err}"
+        );
+    }
+
+    /// 3hsv③：fallbacks 数字 dest → localhost:N（Go vless.go:177-179）。
+    #[test]
+    fn vless_fallbacks_numeric_dest_maps_to_localhost() {
+        let json = br#"{"decryption":"none","fallbacks":[{"dest":8080}]}"#;
+        let policy = super::build_vless_fallbacks(json).unwrap().expect("policy built");
+        let d = policy.find("", "", "").expect("default entry");
+        assert_eq!(d.dest, "localhost:8080");
+        assert_eq!(d.xver, 0);
+    }
+
+    /// 3hsv③：dest 缺失/无法推导 type → 拒启（Go vless.go:206-208）；
+    /// 合法 host:port 通过。
+    #[test]
+    fn vless_fallbacks_missing_dest_rejected_valid_tcp_ok() {
+        let bad = br#"{"decryption":"none","fallbacks":[{"alpn":"h2"}]}"#;
+        let err = super::build_vless_fallbacks(bad).err().expect("must reject");
+        assert!(
+            err.to_string().contains("please fill in a valid value"),
+            "expected missing-dest hard error, got: {err}"
+        );
+        let ok = br#"{"decryption":"none","fallbacks":[{"dest":"127.0.0.1:80","xver":1}]}"#;
+        let policy = super::build_vless_fallbacks(ok).unwrap().expect("policy built");
+        let d = policy.find("", "", "").unwrap();
+        assert_eq!(d.dest, "127.0.0.1:80");
+        assert_eq!(d.xver, 1);
+    }
+
+    /// 3hsv③：xver 非法值/负数/非整数一律拒启不钳制（Go vless.go:209-211 +
+    /// uint64 解码期硬错）。
+    #[test]
+    fn vless_fallbacks_xver_invalid_rejected() {
+        let cases: Vec<serde_json::Value> = vec![
+            serde_json::json!({"dest":"127.0.0.1:80","xver":3}),
+            serde_json::json!({"dest":"127.0.0.1:80","xver":-1}),
+            serde_json::json!({"dest":"127.0.0.1:80","xver":"1"}),
+        ];
+        for fb in cases {
+            let json = serde_json::json!({"decryption":"none","fallbacks":[fb]});
+            let data = serde_json::to_vec(&json).unwrap();
+            let err = super::build_vless_fallbacks(&data).err().expect("must reject");
+            assert!(
+                err.to_string().contains("xver"),
+                "expected xver hard error, got: {err}"
+            );
+        }
+    }
+
+    /// 3hsv③：unix / serve（serve-ws-none）目标本构建运行面未实现 → 显式
+    /// 拒启（此前静默放过、运行期 TcpStream 拨号必炸）。
+    #[test]
+    fn vless_fallbacks_unsupported_type_rejected() {
+        let cases = [
+            r#"{"decryption":"none","fallbacks":[{"dest":"/run/xray.sock"}]}"#,
+            r#"{"decryption":"none","fallbacks":[{"dest":"serve-ws-none"}]}"#,
+        ];
+        for json in cases {
+            let err = super::build_vless_fallbacks(json.as_bytes()).err().expect("must reject");
+            assert!(
+                err.to_string().contains("not supported"),
+                "expected unsupported-type hard error, got: {err}"
+            );
+        }
+    }
+
+    /// REALITY 同型：xver >2/负数拒启不钳制（Go transport_security.go:84-86）。
+    #[test]
+    fn parse_reality_config_rejects_bad_xver_and_port_dest() {
+        use base64::Engine as _;
+        let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let mk = |extra: serde_json::Value| {
+            let mut json = serde_json::json!({
+                "privateKey": key_b64,
+                "serverNames": ["a.com"],
+                "shortIds": ["01"],
+            });
+            if let (Some(o), Some(e)) = (json.as_object_mut(), extra.as_object()) {
+                o.extend(e.clone());
+            }
+            xray_transport::dialer::StreamSettings {
+                security: "reality".to_string(),
+                security_json: Some(json),
+                ..Default::default()
+            }
+        };
+        for extra in [
+            serde_json::json!({"xver": 3}),
+            serde_json::json!({"xver": -1}),
+            serde_json::json!({"dest": 70_000}),
+        ] {
+            let err = super::parse_reality_config(&mk(extra)).err().expect("must reject");
+            assert!(
+                err.to_string().contains("xver") || err.to_string().contains("target"),
+                "expected xver/target hard error, got: {err}"
+            );
+        }
+    }
+
+    /// uasr③：accounts 在场覆盖 users（Go socks.go:54-56），旧实现优先级
+    /// 相反。
+    #[test]
+    fn parse_socks_server_config_accounts_override_users() {
+        let json = br#"{"users":[{"user":"alice","pass":"p1"}],"accounts":[{"user":"bob","pass":"p2"}]}"#;
+        let cfg = super::parse_socks_server_config(json).unwrap();
+        assert!(cfg.has_account("bob", "p2"), "accounts must win");
+        assert!(!cfg.has_account("alice", "p1"), "users must be overridden");
+    }
+
 
     #[test]
     fn build_trojan_users_parses_clients_json() {

@@ -57,6 +57,8 @@ pub struct UdpNameServer {
     tcp_recv_max: usize,
     /// 域名解析器（直连兜底路径）。
     resolver: Arc<dyn crate::dial::HostResolver>,
+    /// `+local`：强制直连（绕过共享 dialer，Go Local mode nil dispatcher）。
+    force_local: bool,
 }
 
 impl UdpNameServer {
@@ -81,7 +83,15 @@ impl UdpNameServer {
             id_gen: AtomicReqIdGen::new(),
             tcp_recv_max: 65535,
             resolver,
+            force_local: false,
         }
+    }
+
+    /// 标记 `+local`（强制直连，绕过共享 dialer；bd wmdn②）。
+    #[must_use]
+    pub fn force_local(mut self, v: bool) -> Self {
+        self.force_local = v;
+        self
     }
 
     /// 从 `NameServerConfig` 构造（Box<dyn Server> 形态）。
@@ -116,7 +126,8 @@ impl UdpNameServer {
             ns.client_ip.clone(),
             timeout,
             Arc::new(crate::dial::SystemHostResolver),
-        ))
+        )
+        .force_local(ns.force_local))
     }
 
     /// 发送单次 DNS 查询并等待响应。
@@ -130,7 +141,10 @@ impl UdpNameServer {
 
         // 共享 dialer 在场：查询经路由出站（Go nameserver_udp.go:134
         // udpServer.Dispatch 包粒度语义，XUDP 帧约定由 dialer 适配层处理）。
-        if let Some(dialer) = crate::dial::shared_dialer() {
+        // `+local`（force_local）绕过 dialer 强制直连——Go Local mode nil
+        // dispatcher 语义，防 DNS 查询经路由进 proxy（bd wmdn②）。
+        let dialer = if self.force_local { None } else { crate::dial::shared_dialer() };
+        if let Some(dialer) = dialer {
             let mut session = timeout(self.query_timeout, dialer.dial_udp(&self.dest))
                 .await
                 .map_err(|_| {
@@ -213,9 +227,14 @@ impl UdpNameServer {
             .to_be_bytes();
 
         // 经路由出站或直连兜底（域名每查询现解析）——与 TCP NS 同一拨号路径。
-        let mut stream =
-            crate::dial::connect_stream(&self.dest, self.resolver.as_ref(), self.query_timeout, "udp-tcp-fallback")
-                .await?;
+        let mut stream = crate::dial::connect_stream(
+            &self.dest,
+            self.resolver.as_ref(),
+            self.query_timeout,
+            "udp-tcp-fallback",
+            self.force_local,
+        )
+        .await?;
 
         timeout(self.query_timeout, stream.write_all(&len_be))
             .await

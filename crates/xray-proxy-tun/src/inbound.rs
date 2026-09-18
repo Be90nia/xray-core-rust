@@ -49,6 +49,7 @@
 //! 按 source 分桶天然 cone NAT。session 生命周期由 inbound handler 持有
 //! （Arc<Mutex<HashMap>>），后续切片可加 idle 淘汰（Go `CancelAfterInactivity(1min)`）。
 use async_trait::async_trait;
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
@@ -263,7 +264,7 @@ struct UdpSessionEntry {
 /// owner task 的输入命令。
 enum SessionCmd {
     /// 转发一个客户端数据报到 outbound。
-    Send { dest: Destination, payload: Vec<u8> },
+    Send { dest: Destination, payload: Bytes },
 }
 
 async fn tun_driver_loop(
@@ -290,7 +291,10 @@ async fn tun_driver_loop(
                     Ok(count) => {
                         // 票 fnlv：UDP 无锁预分流（bypass 语义不变），TCP 包收切片
                         // 进单次临界区——批量读的 syscall 摊销不再被逐包锁拆碎。
-                        let mut tcp_pkts: Vec<&[u8]> = Vec::new();
+                        // 票 6dfy：owned 物化（alloc+memcpy）在临界区外完成，
+                        // 锁内 ingest 只做 move——smoltcp ingest_rx 要求 owned
+                        // Vec，借用视图无法进 rx queue。
+                        let mut tcp_pkts: Vec<Vec<u8>> = Vec::new();
                         for i in 0..count {
                             let pkt = rx.packet(i);
                             // 先尝试按 UDP 解析：能解出 4 元组就 bypass smoltcp，
@@ -305,7 +309,7 @@ async fn tun_driver_loop(
                                     Arc::clone(&device),
                                 );
                             } else {
-                                tcp_pkts.push(pkt);
+                                tcp_pkts.push(pkt.to_vec());
                             }
                         }
 
@@ -313,7 +317,7 @@ async fn tun_driver_loop(
                         // drive_stack_batch 是同步 fn——锁内无 await 由编译器保证。
                         let (accepted, tx_pkts) = {
                             let mut stack = netstack.lock().await;
-                            drive_stack_batch(&mut stack, &tcp_pkts)
+                            drive_stack_batch(&mut stack, tcp_pkts)
                         };
 
                         // 锁外：accept 建桥（tokio::spawn 不再发生在临界区内）+
@@ -477,7 +481,7 @@ fn handle_udp_packet(
     };
     let _ = entry.cmd_tx.send(SessionCmd::Send {
         dest,
-        payload: payload.to_vec(),
+        payload: Bytes::copy_from_slice(payload),
     });
 }
 
@@ -650,21 +654,23 @@ async fn run_udp_session(
 /// smoltcp `poll` 内部循环消化 rx_queue 全部 pending 段（POLL_RX_BUDGET），
 /// 一次批尾 poll 与逐包 poll 的状态机结果等价。
 /// 返回 (accept 事件, TX 批)——建桥 spawn 与写回 TUN 都在锁外进行。
+/// 消费 owned 批（票 6dfy）：alloc+copy 已由调用方在临界区外完成，
+/// 锁内 ingest 逐包 move 进 smoltcp rx queue。
 fn drive_stack_batch(
     stack: &mut TunNetStack,
-    pkts: &[&[u8]],
+    pkts: Vec<Vec<u8>>,
 ) -> (Vec<TcpAcceptEvent>, Vec<Vec<u8>>) {
     for pkt in pkts {
         // TCP SYN → 惰性注册 listen socket（票 ipb5）。必须发生在
         // ingest 之前，poll 才能为该 SYN 生成 SYN-ACK。
         // 注册失败（port=0 等，几乎不可能）→ 丢弃该 SYN，连接建不起来，
         // 不静默吞掉：error 日志可见。
-        if let Some(dst) = parse_tcp_syn_dst(pkt) {
+        if let Some(dst) = parse_tcp_syn_dst(&pkt) {
             if let Err(e) = stack.ensure_tcp_listen(dst) {
                 tracing::error!(error = %e, dst = ?dst, "tcp lazy listen failed, dropping SYN");
             }
         }
-        stack.ingest_rx(pkt.to_vec());
+        stack.ingest_rx(pkt);
     }
     stack.poll(smoltcp::time::Instant::now());
     // 处理 ICMP echo request 并自动回复
@@ -1371,7 +1377,7 @@ mod tests {
         let (reply_tx, _reply_rx) = mpsc::unbounded_channel();
         let _owner = tokio::spawn(run_udp_session(dispatch, cmd_rx, reply_tx, src, dst));
 
-        let payload = vec![0xABu8; 100];
+        let payload = bytes::Bytes::from(vec![0xABu8; 100]);
         cmd_tx
             .send(SessionCmd::Send { dest: dest.clone(), payload: payload.clone() })
             .expect("send pkt1");
@@ -1431,7 +1437,7 @@ mod tests {
         );
         let (accepted1, tx) = {
             let mut stack = netstack.lock().await;
-            drive_stack_batch(&mut stack, &[&syn])
+            drive_stack_batch(&mut stack, vec![syn.to_vec()])
         };
         assert!(accepted1.is_empty(), "SYN alone must not accept");
         let synack_seq = tx
@@ -1448,7 +1454,7 @@ mod tests {
         );
         let (accepted2, _) = {
             let mut stack = netstack.lock().await;
-            drive_stack_batch(&mut stack, &[&ack])
+            drive_stack_batch(&mut stack, vec![ack.to_vec()])
         };
         assert_eq!(accepted2.len(), 1, "accept collected once per batch");
 
@@ -1480,7 +1486,7 @@ mod tests {
         );
         let synack_seq = {
             let mut stack = netstack.lock().await;
-            let (_, tx) = drive_stack_batch(&mut stack, &[&syn]);
+            let (_, tx) = drive_stack_batch(&mut stack, vec![syn.to_vec()]);
             tx.iter()
                 .find(|p| p.len() >= 34 && p[9] == 6 && (p[20 + 13] & 0x12) == 0x12)
                 .map(|p| u32::from_be_bytes([p[20 + 4], p[20 + 5], p[20 + 6], p[20 + 7]]))
@@ -1492,7 +1498,7 @@ mod tests {
         );
         let (accepted, _) = {
             let mut stack = netstack.lock().await;
-            drive_stack_batch(&mut stack, &[&ack])
+            drive_stack_batch(&mut stack, vec![ack.to_vec()])
         };
         assert_eq!(accepted.len(), 1);
         let handle = accepted[0].handle;
@@ -1524,11 +1530,11 @@ mod tests {
             let netstack = Arc::clone(&netstack);
             let tx_has_payload = Arc::clone(&tx_has_payload);
             tokio::spawn(async move {
-                let empty: Vec<&[u8]> = Vec::new();
+                let empty: Vec<Vec<u8>> = Vec::new();
                 for _ in 0..500 {
                     let (accepted, tx) = {
                         let mut stack = netstack.lock().await;
-                        drive_stack_batch(&mut stack, &empty)
+                        drive_stack_batch(&mut stack, empty.clone())
                     };
                     debug_assert!(accepted.is_empty());
                     if tx.iter().any(|p| p.len() > 40) {

@@ -67,10 +67,12 @@ pub fn register_dialer() -> io::Result<()> {
 ///
 /// 幂等：重复调用忽略 `AlreadyExists`。
 pub fn register_listener() -> io::Result<()> {
-    let listen_fn: TransportListenFn = Arc::new(move |addr, settings, _sockopt, handler| {
+    let listen_fn: TransportListenFn = Arc::new(move |addr, settings, sockopt, handler| {
         let settings = settings.clone();
         let handler = handler.clone();
-        Box::pin(async move { listen_grpc(addr, &settings, handler).await })
+        // H13：XFF 信任名单（Go hub.go:78-80 socketSettings 透传）。
+        let trusted = sockopt.trusted_x_forwarded_for.clone();
+        Box::pin(async move { listen_grpc(addr, &settings, handler, trusted).await })
     });
     let _ = register_transport_listener("grpc", listen_fn.clone());
     let _ = register_transport_listener("h2", listen_fn.clone());
@@ -82,8 +84,8 @@ pub fn register_listener() -> io::Result<()> {
 ///
 /// 当前返回 `Unsupported`：HTTP/2 server 监听依赖 h2/tonic 集成。
 /// 配置解析已执行，确保错误前的路径可测。
-async fn listen_grpc(addr: SocketAddr, settings: &StreamSettings, handler: ConnHandler) -> io::Result<Box<dyn TransportListener>> {
-    crate::transport::listen(addr, settings, handler).await
+async fn listen_grpc(addr: SocketAddr, settings: &StreamSettings, handler: ConnHandler, trusted: Vec<String>) -> io::Result<Box<dyn TransportListener>> {
+    crate::transport::listen(addr, settings, handler, trusted).await
 }
 
 /// 实际拨号：解析 grpcSettings → tls config → 调用 client 建立连接。
@@ -278,7 +280,7 @@ mod tests {
                 }
             });
         });
-        let listener = listen_grpc("127.0.0.1:0".parse().unwrap(), &settings, handler)
+        let listener = listen_grpc("127.0.0.1:0".parse().unwrap(), &settings, handler, Vec::new())
             .await
             .expect("listen_grpc");
         let addr = listener.local_addr().expect("local_addr");

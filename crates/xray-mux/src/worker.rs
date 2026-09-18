@@ -452,13 +452,18 @@ impl ServerWorker {
         );
         let done = session.done_receiver();
         loop {
-            let mut input = session.input().await;
-            let Some(reader) = input.as_mut() else { break };
-            // select session done：Session::close 需先拿 input 锁才能中断，
-            // 持锁阻塞读期间必须可被 done 打断，否则与 close 互相等待死锁
-            let read = tokio::select! {
-                r = reader.read_multi_buffer() => Some(r),
-                _ = crate::client::wait_done(done.clone()) => None,
+            // huk7：guard 作用域收窄到读分支（仿 client.rs fetch_input first 块）
+            // ——read 返回后先 drop input 锁再写 carrier。否则 carrier 停滞时
+            // write 永久 pending 持锁，Session::close 拿不到 input 锁做 interrupt，
+            // monitor→close 关停链挂死、link_writer 不释放、泵泄漏。读分支本身
+            // 的 select done 防线保持：持锁阻塞读期间必须可被 done 打断。
+            let read = {
+                let mut input = session.input().await;
+                let Some(reader) = input.as_mut() else { break };
+                tokio::select! {
+                    r = reader.read_multi_buffer() => Some(r),
+                    _ = crate::client::wait_done(done.clone()) => None,
+                }
             };
             let mb = match read {
                 Some(Ok(mb)) => mb,
@@ -815,6 +820,50 @@ mod tests {
         let dest = Destination::new(Address::new_domain("example.com".to_string()), Port::new(443), Network::TCP);
         let result = adapter.dispatch(dest).await;
         assert!(result.is_ok(), "adapter should return a link");
+    }
+
+    /// huk7 回归：carrier 写停滞（write 永久 pending）时 `Session::close`
+    /// 必须能完成。修复前输出泵持 session input 锁跨 `rw.write().await`，
+    /// close 拿不到 input 锁做 interrupt → monitor 关停链挂死。
+    #[tokio::test]
+    async fn server_output_pump_close_not_blocked_by_stalled_carrier() {
+        #[derive(Debug)]
+        struct StalledWriter;
+        impl xray_buf::io::Writer for StalledWriter {
+            fn write_multi_buffer<'a>(
+                &'a mut self,
+                _mb: MultiBuffer,
+            ) -> std::pin::Pin<Box<dyn Future<Output = xray_buf::io::Result<()>> + Send + 'a>>
+            {
+                Box::pin(std::future::pending())
+            }
+        }
+
+        let session = Arc::new(Session::new(1u16, TransferType::Packet));
+        // 预填 1 字节：泵读到非空 mb 走进写分支，卡在 StalledWriter.write
+        let (input_r, mut input_w) = xray_buf::pipe::new();
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(&b"x".to_vec());
+        use xray_buf::io::Writer as _;
+        input_w.write_multi_buffer(mb).await.unwrap();
+        session
+            .set_input(BufferedReader::new(Box::new(input_r)))
+            .await;
+
+        let link_writer: Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>> =
+            Arc::new(tokio::sync::Mutex::new(Some(Box::new(StalledWriter))));
+        tokio::spawn(ServerWorker::handle_session_output(
+            Arc::clone(&session),
+            link_writer,
+        ));
+        // 等泵进入写 pending（修复前此处泵仍持 input 锁）
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let closed = tokio::time::timeout(Duration::from_secs(2), session.close()).await;
+        assert!(
+            closed.is_ok(),
+            "session.close() must not be blocked by a stalled carrier write (huk7)"
+        );
     }
 
     // ===== bd 6z8：XUDP gate 触发 + New 帧内联 data 转发 + 首帧即时送达 =====

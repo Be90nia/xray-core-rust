@@ -831,7 +831,18 @@ fn parse_routing_json_to_proto_in(
             let mut domains = Vec::new();
             let domain_list: Vec<&str> = match r.get("domains").and_then(|x| x.as_array()) {
                 // Go router.go:182-188：`domains` 键存在时覆盖 `domain`。
-                Some(arr) => arr.iter().filter_map(|x| x.as_str()).collect(),
+                // 非字符串项硬错（Go StringList 解码期拒启 / rule_parser.go
+                // 逐条失败即拒），不再 filter_map 静默丢弃。
+                Some(arr) => arr
+                    .iter()
+                    .map(|x| {
+                        x.as_str().ok_or_else(|| {
+                            WiringError::JsonParse(format!(
+                                "routing rule domain entry is not a string: {x}"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<&str>, WiringError>>()?,
                 None => json_str_iter(r.get("domain")).collect(),
             };
             for d in domain_list {
@@ -916,15 +927,25 @@ fn parse_routing_json_to_proto_in(
                 domain: domains,
                 ip: ips,
                 source_ip: source_ips,
-                port_list: parse_port_list(r.get("port")),
-                source_port_list: parse_port_list(r.get("sourcePort")),
+                port_list: parse_port_list(r.get("port"))?,
+                source_port_list: parse_port_list(r.get("sourcePort"))?,
                 local_ip: local_ips,
-                local_port_list: parse_port_list(r.get("localPort")),
-                vless_route_list: parse_port_list(r.get("vlessRoute")),
-                networks: parse_networks(r.get("network")),
+                local_port_list: parse_port_list(r.get("localPort"))?,
+                vless_route_list: parse_port_list(r.get("vlessRoute"))?,
+                networks: parse_networks(r.get("network"))
+                    .map_err(|e| WiringError::JsonParse(format!("routing rule network: {e}")))?,
                 user_email: json_string_list(r.get("user")),
-                inbound_tag: json_string_list(r.get("inboundTag")),
-                protocol: json_string_list(r.get("protocol")),
+                // Go NewInboundTagMatcher/NewProtocolMatcher 构造器
+                // （condition.go:207-215/:237-245）过滤空串——空串条目在
+                // Rust 匹配器里前缀恒真，必须剔除。
+                inbound_tag: json_string_list(r.get("inboundTag"))
+                    .into_iter()
+                    .filter(|t| !t.is_empty())
+                    .collect(),
+                protocol: json_string_list(r.get("protocol"))
+                    .into_iter()
+                    .filter(|p| !p.is_empty())
+                    .collect(),
                 process: json_string_list(r.get("process")),
                 // Go a12801c1：`localOS` → local_os（匹配 runtime.GOOS）。
                 local_os: json_string_list(r.get("localOS")),
@@ -947,9 +968,10 @@ fn parse_routing_json_to_proto_in(
         for b in arr {
             let tag = b.get("tag").and_then(|x| x.as_str()).unwrap_or("");
             if tag.is_empty() {
-                continue;
+                // Go router.go:30-32：空 tag 拒启，不再 continue 跳过。
+                return Err(WiringError::JsonParse("empty balancer tag".into()));
             }
-            let (strategy, strategy_settings) = match b.get("strategy") {
+            let (mut strategy, strategy_settings) = match b.get("strategy") {
                 Some(serde_json::Value::String(s)) => (s.clone(), None),
                 Some(serde_json::Value::Object(o)) => {
                     let ty = o.get("type").and_then(|x| x.as_str()).unwrap_or("").to_string();
@@ -965,9 +987,25 @@ fn parse_routing_json_to_proto_in(
                 }
                 _ => (String::new(), None),
             };
+            // Go router.go:35-41：ToLower；""→random；仅 4 个合法值，未知拒启。
+            strategy = strategy.to_ascii_lowercase();
+            match strategy.as_str() {
+                "" => strategy = "random".to_string(),
+                "random" | "leastload" | "leastping" | "roundrobin" => {}
+                other => {
+                    return Err(WiringError::JsonParse(format!(
+                        "unknown balancing strategy: {other}"
+                    )));
+                }
+            }
+            let selectors = json_string_list(b.get("selector"));
+            if selectors.is_empty() {
+                // Go router.go:33-35：空 selector 列表拒启。
+                return Err(WiringError::JsonParse("empty selector list".into()));
+            }
             cfg.balancing_rule.push(BalancingRule {
                 tag: tag.to_string(),
-                outbound_selector: json_string_list(b.get("selector")),
+                outbound_selector: selectors,
                 strategy,
                 strategy_settings,
                 fallback_tag: b
@@ -1039,16 +1077,24 @@ fn parse_routing_json_to_proto_in(
 /// JSON 端口字段（number / `"80,443,1000-2000"` / 混合数组）→ proto `PortList`。
 ///
 /// 复用 `xray_conf::PortList` 的多态反序列化（与 Go `infra/conf.PortList` 等价）。
+/// 解析失败硬错（Go router.go:236-238 解码期拒启）——返回 `None` 会使规则
+/// 端口约束静默失效（匹配所有端口）。
 fn parse_port_list(
     v: Option<&serde_json::Value>,
-) -> Option<xray_proto::xray::common::net::PortList> {
+) -> Result<Option<xray_proto::xray::common::net::PortList>, WiringError> {
     use xray_proto::xray::common::net::{PortList as ProtoPortList, PortRange as ProtoPortRange};
-    let v = v?;
-    let conf: xray_conf::PortList = serde_json::from_value(v.clone()).ok()?;
-    if conf.is_empty() {
-        return None;
+    let Some(v) = v else {
+        return Ok(None);
+    };
+    if v.is_null() {
+        return Ok(None);
     }
-    Some(ProtoPortList {
+    let conf: xray_conf::PortList = serde_json::from_value(v.clone())
+        .map_err(|e| WiringError::JsonParse(format!("routing port list: {e}")))?;
+    if conf.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(ProtoPortList {
         range: conf
             .0
             .iter()
@@ -1057,7 +1103,7 @@ fn parse_port_list(
                 to: u32::from(r.end),
             })
             .collect(),
-    })
+    }))
 }
 
 /// `webhook` 字段 → proto `WebhookConfig`（对齐 Go router.go:126-130/264-270：
@@ -1091,14 +1137,20 @@ fn parse_webhook_config(v: &serde_json::Value) -> Option<xray_proto::xray::app::
 }
 
 /// network 字段（`"tcp,udp"` 或字符串数组）→ proto `Network` i32 列表。
-fn parse_networks(v: Option<&serde_json::Value>) -> Vec<i32> {
+///
+/// 未知 token 启动硬错：Go Network.Build（infra/conf/common.go:81-92）保留
+/// Network_Unknown → matcher 永不命中（规则 fail-closed）；Rust 若静默丢
+/// token 会得到空列表 → 不加 network 条件 → 规则变全网络匹配（fail-open，
+/// 屏蔽规则断网/分流规则劫持全部流量）。硬错较 Go 更严且与同文件 ip/domain
+/// 路径对称。
+fn parse_networks(v: Option<&serde_json::Value>) -> Result<Vec<i32>, String> {
     use xray_proto::xray::common::net::Network;
     json_str_tokens(v).into_iter()
-        .filter_map(|s| match s.to_ascii_lowercase().as_str() {
-            "tcp" => Some(Network::Tcp as i32),
-            "udp" => Some(Network::Udp as i32),
-            "unix" => Some(Network::Unix as i32),
-            _ => None,
+        .map(|s| match s.to_ascii_lowercase().as_str() {
+            "tcp" => Ok(Network::Tcp as i32),
+            "udp" => Ok(Network::Udp as i32),
+            "unix" => Ok(Network::Unix as i32),
+            other => Err(format!("unknown network token '{other}'")),
         })
         .collect()
 }
@@ -2094,6 +2146,124 @@ mod tests {
             &nodat,
         )
         .expect("plain rules must not require geodata assets");
+    }
+
+    /// vrll⑤：routing 端口字段解析失败硬错（Go router.go:236-238 解码期拒启）
+    /// ——旧实现 `.ok()?` 吞错 → None → 规则端口约束静默失效。
+    #[test]
+    fn parse_port_list_invalid_rejected_valid_ok() {
+        // 非法：字符串 "abc" / 对象形态。
+        for bad in [
+            serde_json::json!("abc"),
+            serde_json::json!({"port": 80}),
+        ] {
+            let err = super::parse_port_list(Some(&bad)).err().expect("must reject");
+            assert!(matches!(err, WiringError::JsonParse(_)), "{err:?}");
+        }
+        // 合法：数字 / "80,443-53" 混合 / 缺失与 null → None。
+        assert!(super::parse_port_list(None).unwrap().is_none());
+        assert!(super::parse_port_list(Some(&serde_json::Value::Null)).unwrap().is_none());
+        let ok = super::parse_port_list(Some(&serde_json::json!("80,443"))).unwrap().expect("ports");
+        assert_eq!(ok.range.len(), 2);
+    }
+
+    /// vrll⑤ + uasr②：balancer 空 tag / 空 selector / 未知 strategy 硬错
+    /// （Go router.go:30-41）；合法 balancer 通过且 strategy 规范化 random。
+    #[test]
+    fn balancer_config_hard_errors_and_normalization() {
+        let dir = temp_asset_dir("balancer-hard");
+        // 空 tag。
+        let err = parse_routing_json_to_proto_in(
+            br#"{"balancers":[{"selector":["a"]}],"rules":[{"balancerTag":"x","outboundTag":""}]}"#,
+            &dir,
+        )
+        .err()
+        .expect("empty tag must reject");
+        assert!(err.to_string().contains("empty balancer tag"), "{err:?}");
+        // 空 selector 列表。
+        let err = parse_routing_json_to_proto_in(
+            br#"{"balancers":[{"tag":"bl","selector":[]}]}"#,
+            &dir,
+        )
+        .err()
+        .expect("empty selector must reject");
+        assert!(err.to_string().contains("empty selector list"), "{err:?}");
+        // 未知 strategy。
+        let err = parse_routing_json_to_proto_in(
+            br#"{"balancers":[{"tag":"bl","selector":["a"],"strategy":{"type":"diceroll"}}]}"#,
+            &dir,
+        )
+        .err()
+        .expect("unknown strategy must reject");
+        assert!(err.to_string().contains("unknown balancing strategy"), "{err:?}");
+        // 合法 + 空缺省 strategy 规范化为 random。
+        let cfg = parse_routing_json_to_proto_in(
+            br#"{"balancers":[{"tag":"bl","selector":["a"]}]}"#,
+            &dir,
+        )
+        .expect("valid balancer");
+        assert_eq!(cfg.balancing_rule.len(), 1);
+        assert_eq!(cfg.balancing_rule[0].strategy, "random");
+    }
+
+    /// 补票②：rules JSON domain 数组非字符串项硬错（Go StringList 解码期
+    /// 拒启 / rule_parser 逐条失败即拒），不再 filter_map 静默丢弃。
+    #[test]
+    fn routing_domain_non_string_entry_rejected() {
+        let dir = temp_asset_dir("domain-nonstring");
+        let err = parse_routing_json_to_proto_in(
+            br#"{"rules":[{"outboundTag":"b","domains":["ok.example",123]}]}"#,
+            &dir,
+        )
+        .err()
+        .expect("must reject");
+        assert!(
+            err.to_string().contains("domain entry is not a string"),
+            "{err:?}"
+        );
+    }
+
+    /// 补票①：inboundTag / protocol 空串条目过滤（Go condition.go:207-215 /
+    /// :237-245 构造器语义——空串在 Rust 匹配器里前缀恒真）。
+    #[test]
+    fn routing_empty_string_tags_filtered() {
+        let dir = temp_asset_dir("empty-tag-filter");
+        let cfg = parse_routing_json_to_proto_in(
+            br#"{"rules":[{"outboundTag":"b","inboundTag":["in-1","","in-2"],"protocol":["","http"]}]}"#,
+            &dir,
+        )
+        .expect("empty strings filtered, not fatal");
+        assert_eq!(cfg.rule.len(), 1);
+        assert_eq!(cfg.rule[0].inbound_tag, vec!["in-1".to_string(), "in-2".to_string()]);
+        assert_eq!(cfg.rule[0].protocol, vec!["http".to_string()]);
+    }
+
+    /// 回归（bd yqm9）：未知 network token 硬错拒启。静默丢 token 会得到空
+    /// 列表 → 不加 network 条件 → 规则变全网络匹配（fail-open：屏蔽规则断网/
+    /// 分流规则劫持全部流量）。Go Network.Build（infra/conf/common.go:81-92）
+    /// fail-closed（Unknown 永不命中），Rust 以启动硬错呈现，与同文件 ip/domain
+    /// 硬错路径对称。
+    #[test]
+    fn parse_routing_json_unknown_network_token_hard_error() {
+        let err = build_router_adapter_from_json(
+            br#"{"rules":[{"outboundTag":"b","network":"tpc"}]}"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown network token 'tpc'"),
+            "unexpected error: {err}"
+        );
+
+        // 正常 token（大小写混合、逗号串）不受影响。
+        use xray_proto::xray::common::net::Network;
+        let cfg = parse_routing_json_to_proto(
+            br#"{"rules":[{"outboundTag":"b","network":"TCP,udp"}]}"#,
+        )
+        .expect("valid tokens must pass");
+        assert_eq!(
+            cfg.rule[0].networks,
+            vec![Network::Tcp as i32, Network::Udp as i32]
+        );
     }
 
     // ---- sniffing_request_from_json（bd fv1g：domainsExcluded/ipsExcluded typed matcher）----

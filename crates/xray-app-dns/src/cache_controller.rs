@@ -36,7 +36,9 @@ pub struct CacheController {
     pub serve_stale: bool,
     /// 过期数据可服务的负 TTL（Go `serveExpiredTTL` 存为 `-int32(原值)`）。
     pub serve_expired_ttl_secs: i32,
-    /// 负缓存 TTL（秒）。0 = 禁用。对应 Go cache 无显式字段，由 caller 用空 IpRecord + TTL 实现。
+    /// 负缓存 TTL（秒）。0 = 禁用。Go cache 无显式字段——当前 NXDOMAIN 按
+    /// 响应 TTL 走正缓存 upsert（`fetch` 只写真实响应），本字段暂无行为
+    /// 消费方，保留 config 透传面（jsonconf `negativeTtlSecs`）。
     pub negative_ttl_secs: u32,
     ips: RwLock<HashMap<String, Arc<Record>>>,
     /// 缓存生命周期峰值，用于收缩阈值计算。
@@ -293,20 +295,6 @@ pub fn upsert(&self, fqdn: &str, is_v4: bool, record: IpRecord) {
     #[must_use]
     pub const fn option_enables(option: IpOption) -> (bool, bool) {
         (option.ipv4_enable, option.ipv6_enable)
-    }
-
-    /// 写入负缓存条目（空 IP + short TTL）。
-    pub fn upsert_negative(&self, fqdn: &str, is_v4: bool, now: Instant) {
-        if self.negative_ttl_secs == 0 {
-            return;
-        }
-        let rec = IpRecord {
-            req_id: 0,
-            ips: Vec::new(),
-            expire: now + Duration::from_secs(self.negative_ttl_secs as u64),
-            rcode: 3, // NXDOMAIN
-        };
-        self.upsert(fqdn, is_v4, rec);
     }
 }
 

@@ -67,6 +67,8 @@ pub struct DotNameServer {
     conn: tokio::sync::Mutex<Option<xray_tls::utls::Conn<Box<dyn xray_transport::connection::Connection>>>>,
     /// 域名解析器（直连兜底路径）。
     resolver: Arc<dyn crate::dial::HostResolver>,
+    /// `+local`：强制直连（绕过共享 dialer，Go Local mode nil dispatcher）。
+    force_local: bool,
 }
 
 /// 查询流类型别名：TLS 之下的字节流。
@@ -96,7 +98,15 @@ impl DotNameServer {
             id_gen: AtomicReqIdGen::new(),
             conn: tokio::sync::Mutex::new(None),
             resolver: Arc::new(crate::dial::SystemHostResolver),
+            force_local: false,
         }
+    }
+
+    /// 标记 `+local`（强制直连，绕过共享 dialer；bd wmdn②）。
+    #[must_use]
+    pub fn force_local(mut self, v: bool) -> Self {
+        self.force_local = v;
+        self
     }
 
     /// 从 `NameServerConfig` 构造。调用方提供 `server_name`（TLS SNI）和 `tls_config`。
@@ -119,21 +129,22 @@ impl DotNameServer {
             ns.negative_ttl_secs.unwrap_or(0),
         ));
         cache.start_cleanup_task(crate::cache_controller::CLEANUP_INTERVAL);
-        Ok(Box::new(Arc::new(Self::new(
-            dest,
-            server_name,
-            tls_config,
-            cache,
-            ns.client_ip.clone(),
-            timeout_dur,
-        ))))
+        Ok(Box::new(Arc::new(
+            Self::new(dest, server_name, tls_config, cache, ns.client_ip.clone(), timeout_dur)
+                .force_local(ns.force_local),
+        )))
     }
 
     /// 建立 DoT TLS 连接：经路由出站或直连兜底（域名每查询现解析）。
     async fn connect_tls(&self) -> Result<xray_tls::utls::Conn<DotStream>, DnsError> {
-        let stream =
-            crate::dial::connect_stream(&self.dest, self.resolver.as_ref(), self.query_timeout, "dot")
-                .await?;
+        let stream = crate::dial::connect_stream(
+            &self.dest,
+            self.resolver.as_ref(),
+            self.query_timeout,
+            "dot",
+            self.force_local,
+        )
+        .await?;
         let tls = timeout(
             self.query_timeout,
             tls_client(

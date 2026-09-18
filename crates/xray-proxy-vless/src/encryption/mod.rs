@@ -70,28 +70,36 @@ pub trait EncryptionConn: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 
 /// 自动重试以该子串识别（单向错误通道里 `io::ErrorKind` 不够区分）。
 pub(crate) const TICKET_REJECTED_MSG: &str = "vless enc 0-RTT ticket rejected";
 
-/// 0-RTT 缓存（pfs_key/ticket/expire）。独立类型 + `Arc` 共享：握手产物
+/// 0-RTT 缓存条目（pfs_key/ticket/expire）。
+#[derive(Debug, Default, Clone)]
+struct ZeroRttEntry {
+    pfs_key: Option<Vec<u8>>,
+    ticket: Option<[u8; 16]>,
+    expire: Option<Instant>,
+}
+
+/// 0-RTT 缓存。独立类型 + `Arc` 共享：握手产物
 /// [`CommonConn`](common_conn::CommonConn) 持同一 handle，票据失效时由连接读
 /// 路径直接清空（对齐 Go `c.Client = i` 的反向引用，client.go:119），无需回经
 /// 握手调用方。
+///
+/// bd（可选优化项）：三字段合并为单 `RwLock`——clear() 原先要串拿三把写锁，
+/// 快照读（handshake 0-RTT 路径）原先要分别 clone 三把读锁；合锁后各为一次。
+/// 热度=每连接握手一次，无 sharding 必要。
 #[derive(Debug, Default)]
 pub struct ZeroRttCache {
-    pfs_key: RwLock<Option<Vec<u8>>>,
-    ticket: RwLock<Option<[u8; 16]>>,
-    expire: RwLock<Option<Instant>>,
+    entry: RwLock<ZeroRttEntry>,
 }
 
 impl ZeroRttCache {
     /// `pfs_key` 是否等于当前缓存（0-RTT 失效判定：`united_key` 前 64B 比对）。
     pub(crate) fn matches_pfs_key(&self, pfs_key: &[u8]) -> bool {
-        self.pfs_key.read().as_deref() == Some(pfs_key)
+        self.entry.read().pfs_key.as_deref() == Some(pfs_key)
     }
 
     /// 清空全部缓存（失效后下条连接回到 1-RTT 慢路径）。
     pub(crate) fn clear(&self) {
-        *self.pfs_key.write() = None;
-        *self.ticket.write() = None;
-        *self.expire.write() = None;
+        *self.entry.write() = ZeroRttEntry::default();
     }
 }
 
@@ -367,12 +375,12 @@ impl ClientInstance {
         //      AEAD context = server 首发的 16B 随机数（CommonConn 首次读时建立，
         //      Go common.go:84-93）。
         if self.seconds > 0 {
-            // 显式 clone 出 Option → owned 后再 let-chain；parking_lot RwLockReadGuard
-            // !Send，let-chain 会让守卫跨 await 持有 → future !Send。
-            let pk_opt = self.cache.pfs_key.read().clone();
-            let tk_opt = self.cache.ticket.read().clone();
-            let ex_opt = self.cache.expire.read().clone();
-            if let (Some(pfs_key), Some(ticket), Some(expire)) = (pk_opt, tk_opt, ex_opt) {
+            // 单锁快照 clone（合锁后一次读锁拿全三字段；parking_lot 守卫 !Send，
+            // 必须在 await 前 clone 出 owned——let-chain 禁止）。
+            let snap = self.cache.entry.read().clone();
+            if let (Some(pfs_key), Some(ticket), Some(expire)) =
+                (snap.pfs_key, snap.ticket, snap.expire)
+            {
                 if Instant::now() < expire && pfs_key.len() == 64 {
                     let iv_and_relays_len = 16 + self.relays_length;
                     let mut pre_write = vec![0u8; iv_and_relays_len + 18 + 32];
@@ -550,9 +558,12 @@ impl ClientInstance {
             let ticket16: [u8; 16] = ticket_pt[..16].try_into()
                 .map_err(|_| VlessError::Other("ticket plaintext not 16 bytes".into()))?;
             let expire = Instant::now() + std::time::Duration::from_secs(server_seconds as u64);
-            *self.cache.pfs_key.write() = Some(pfs_key);
-            *self.cache.ticket.write() = Some(ticket16);
-            *self.cache.expire.write() = Some(expire);
+            // 单写锁原子更新三字段（原三把写锁各自持放，读者可观察到中间态）
+            *self.cache.entry.write() = ZeroRttEntry {
+                pfs_key: Some(pfs_key),
+                ticket: Some(ticket16),
+                expire: Some(expire),
+            };
             tracing::debug!(
                 "vless enc: 0-RTT credentials cached (pfs_key 64B + ticket, expires in {}s)",
                 server_seconds
@@ -688,6 +699,12 @@ pub struct ServerInstance {
     padding_gaps: Vec<common::PaddingTriple>,
     /// 0-RTT 会话存储（跨连接共享；对齐 Go `ServerInstance` 的
     /// Lasts/Tickets/Sessions/Closed RWLock 字段）。
+    ///
+    /// bd（可选优化项裁决）：单把 `parking_lot::Mutex` 保留未做分桶 sharding——
+    /// 锁内无 await（编译器可证），命中频率 = 每连接 0-RTT 握手一次（非每包），
+    /// 锁内最重操作是两次 AES key schedule（微秒级）。升级路径：会话数上万或
+    /// 握手 QPS 成为瓶颈时，按 `ticket[0..2]` 前 2 字节分片成 N 个
+    /// `Mutex<SessionStore>`（`parking_lot` 无公平性需求，N=4 起步）。
     sessions: std::sync::Arc<parking_lot::Mutex<SessionStore>>,
 }
 
@@ -1002,7 +1019,8 @@ impl ServerInstance {
             rng.fill_bytes(&mut ticket);
             // Go server.go:271-277：协商有效期秒数（to==0 → from×rand[50,100)/100，
             // 否则 rand[from,to)），编码进 ticket 前 2B（client Open 后 DecodeLength
-            // 得 seconds 并设 Expire）。seconds=0 时 ticket 保持随机（client 不缓存）。
+            // 得 seconds 并设 Expire）。Go 无条件 copy（seconds=0 → 0x0000，client
+            // 因 seconds>0 才缓存而不使用）；跳过编码会让 client 解出随机 TTL。
             use rand::Rng as _;
             let seconds: u64 = if self.seconds_to == 0 {
                 u64::from(self.seconds_from) * rng.random_range(50u64..100) / 100
@@ -1012,6 +1030,9 @@ impl ServerInstance {
             } else {
                 rng.random_range(u64::from(self.seconds_from)..u64::from(self.seconds_to))
             };
+            // Go server.go:277 无条件 EncodeLength 写前 2B（2B 大端，common.go:196-198；
+            // >65535 截断与 Go 一致）。
+            ticket[0..2].copy_from_slice(&(seconds as u16).to_be_bytes());
             // Go server.go:278-284：seconds>0 时 ticket+pfsKey 入会话库
             // （Lasts 预期过期分钟 / Tickets FIFO / Sessions map）。
             if seconds > 0 {
@@ -1506,13 +1527,49 @@ mod tests {
             if !matches!((c_res, s_res), (Ok(_), Ok(_))) {
                 continue;
             }
-            let pfs = client.cache.pfs_key.read().clone();
-            let tk = client.cache.ticket.read();
-            let ex = client.cache.expire.read();
-            assert_eq!(pfs.as_ref().map(Vec::len), Some(64), "缓存 pfs_key 64B");
-            assert!(tk.is_some(), "缓存 ticket");
-            assert!(ex.is_some(), "缓存 expire");
-            assert!(*tk.as_ref().unwrap() != [0u8; 16], "ticket 非全零");
+            let snap = client.cache.entry.read().clone();
+            assert_eq!(snap.pfs_key.as_ref().map(Vec::len), Some(64), "缓存 pfs_key 64B");
+            assert!(snap.ticket.is_some(), "缓存 ticket");
+            assert!(snap.expire.is_some(), "缓存 expire");
+            assert!(*snap.ticket.as_ref().unwrap() != [0u8; 16], "ticket 非全零");
+            return;
+        }
+        panic!("1-RTT handshake failed after 32 attempts");
+    }
+
+    /// 回归（bd xeoj）：server 必须 EncodeLength 编码 seconds 进 ticket 前 2B
+    /// （Go server.go:277）。from==to=1 时唯一合法 seconds=1 → client 解出
+    /// expire≈now+1s。未编码时 client 解出随机 u16（TTL 0..65535s 随机），
+    /// 本断言以 ~99.996% 概率失败。
+    #[tokio::test]
+    async fn server_encodes_seconds_into_ticket_front2() {
+        use rand_core::RngCore;
+
+        let mut rng = rand::rng();
+        let mut x_priv = [0u8; 32];
+        rng.fill_bytes(&mut x_priv);
+        let secret = x25519_dalek::StaticSecret::from(x_priv);
+        let x_pub = x25519_dalek::PublicKey::from(&secret).to_bytes();
+        let client_pkeys = vec![x_pub.to_vec()];
+        let server_skeys = vec![x_priv.to_vec()];
+
+        for _ in 0..32 {
+            let mut client = ClientInstance::new();
+            client.init(client_pkeys.clone(), 0, 1, "").unwrap();
+            let mut server = ServerInstance::new();
+            server.init(server_skeys.clone(), 0, 1, 1, "").unwrap();
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let (c_res, s_res) = tokio::join!(client.handshake(client_io), server.handshake(server_io));
+            if !matches!((c_res, s_res), (Ok(_), Ok(_))) {
+                continue;
+            }
+            let ex = client.cache.entry.read().expire.expect("seconds=1 → client 必缓存");
+            let ttl = ex.duration_since(std::time::Instant::now());
+            assert!(
+                ttl >= std::time::Duration::from_millis(200)
+                    && ttl <= std::time::Duration::from_secs(3),
+                "client 解出的 seconds 必须≈1（实测 ttl={ttl:?}）——ticket 前 2B 未编码或编码错"
+            );
             return;
         }
         panic!("1-RTT handshake failed after 32 attempts");
@@ -1556,9 +1613,10 @@ mod tests {
             }
             established.expect("1-RTT handshake failed after 32 attempts")
         };
-        let cached_pfs = client.cache.pfs_key.read().clone().expect("pfs cached");
-        let cached_ticket = *client.cache.ticket.read().as_ref().expect("ticket cached");
-        assert!(client.cache.expire.read().is_some());
+        let snap = client.cache.entry.read().clone();
+        let cached_pfs = snap.pfs_key.expect("pfs cached");
+        let cached_ticket = snap.ticket.expect("ticket cached");
+        assert!(snap.expire.is_some());
 
         // --- 第二连：0-RTT。client handshake 恒成功（不等响应直接返回）；
         //     手动验收侧 X25519 highest bit ~50% 失败 → 整连重试。 ---
@@ -1727,7 +1785,7 @@ mod tests {
                 64,
                 "会话缓存 pfs_key(64B)"
             );
-            assert!(client.cache.expire.read().is_some(), "client 已缓存凭据");
+            assert!(client.cache.entry.read().expire.is_some(), "client 已缓存凭据");
             established = true;
             break;
         }
@@ -1789,7 +1847,7 @@ mod tests {
 
         // 连接 2：手动构造 0-RTT 首包（同 client 缓存 ticket + 新 ephemeral），
         // 先提交一次（会话命中），再原样重放。
-        let cached_ticket = *client.cache.ticket.read().as_ref().expect("ticket cached");
+        let cached_ticket = *client.cache.entry.read().ticket.as_ref().expect("ticket cached");
         let first_flight = build_zero_rtt_first_flight(&client_pkeys[0], &cached_ticket);
         {
             let (mut fake_c, fake_s) = tokio::io::duplex(64 * 1024);
@@ -1847,7 +1905,7 @@ mod tests {
         fresh_server.init(server_skeys.clone(), 0, 600, 600, "").unwrap();
 
         // 手动构造 0-RTT 首包（ticket 在 fresh_server 会话库中不存在）
-        let cached_ticket = *client.cache.ticket.read().as_ref().expect("ticket cached");
+        let cached_ticket = *client.cache.entry.read().ticket.as_ref().expect("ticket cached");
         let first_flight = build_zero_rtt_first_flight(&client_pkeys[0], &cached_ticket);
 
         let (mut fake_c, fake_s) = tokio::io::duplex(64 * 1024);
@@ -1936,9 +1994,11 @@ mod tests {
         // client 有缓存（手动填充）但 server seconds=0
         let mut client = ClientInstance::new();
         client.init(client_pkeys.clone(), 0, 600, "").unwrap();
-        *client.cache.pfs_key.write() = Some(vec![0xAA; 64]);
-        *client.cache.ticket.write() = Some([0xBB; 16]);
-        *client.cache.expire.write() = Some(Instant::now() + std::time::Duration::from_secs(60));
+        *client.cache.entry.write() = ZeroRttEntry {
+            pfs_key: Some(vec![0xAA; 64]),
+            ticket: Some([0xBB; 16]),
+            expire: Some(Instant::now() + std::time::Duration::from_secs(60)),
+        };
         let mut server = ServerInstance::new();
         server.init(server_skeys.clone(), 0, 0, 0, "").unwrap();
 
@@ -2034,8 +2094,9 @@ mod tests {
             }
             established.expect("1-RTT handshake failed after 32 attempts")
         };
-        let cached_pfs = client.cache.pfs_key.read().clone().expect("pfs cached");
-        assert!(client.cache.ticket.read().is_some(), "ticket 已缓存");
+        let snap = client.cache.entry.read().clone();
+        let cached_pfs = snap.pfs_key.expect("pfs cached");
+        assert!(snap.ticket.is_some(), "ticket 已缓存");
 
         // --- 第二连：0-RTT。server 侧 miss（会话清失）回噪声：
         //     16B（被当 server random）+ 5B 非法 record header + 尾部随机。 ---
@@ -2065,12 +2126,10 @@ mod tests {
             );
 
             // 三缓存清空 → 下条连接回 1-RTT 慢路径
-            assert!(
-                client.cache.pfs_key.read().is_none(),
-                "pfs_key 缓存应已清空"
-            );
-            assert!(client.cache.ticket.read().is_none(), "ticket 缓存应已清空");
-            assert!(client.cache.expire.read().is_none(), "expire 缓存应已清空");
+            let snap = client.cache.entry.read().clone();
+            assert!(snap.pfs_key.is_none(), "pfs_key 缓存应已清空");
+            assert!(snap.ticket.is_none(), "ticket 缓存应已清空");
+            assert!(snap.expire.is_none(), "expire 缓存应已清空");
             let _ = cached_pfs; // united_key 前缀即此值（0-RTT 构造注入）
             return;
         }

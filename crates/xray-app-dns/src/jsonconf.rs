@@ -181,21 +181,24 @@ impl DnsAppConfig {
                 }
             }
             for s in ns.domains.iter().flatten() {
-                match parse_ns_domain_rule(s, &datadir, &loader) {
-                    Ok(entries) => {
-                        for (dt, v) in entries {
-                            matcher_infos.push(DomainMatcherInfo {
-                                client_idx,
-                                domain_rule: s.clone(),
-                            });
-                            all_rules.push(MatcherDomainRule::new(
-                                dt,
-                                v,
-                                all_rules.len() as u32,
-                            ));
-                        }
-                    }
-                    Err(e) => tracing::warn!(rule = %s, error = %e, "dns: skip bad domain rule"),
+                // Go infra/conf/dns.go:89-92 ParseDomainRules 失败 → 整体报错
+                // 启动失败。修复前 warn+skip 静默丢规则 → domain 限定失效，
+                // server 退化全域名 fallback（bd wmdn③）。
+                let entries = parse_ns_domain_rule(s, &datadir, &loader).map_err(|e| {
+                    DnsError::Features(xray_features::dns::DnsError::Other(format!(
+                        "parse dns domain rule {s}: {e}"
+                    )))
+                })?;
+                for (dt, v) in entries {
+                    matcher_infos.push(DomainMatcherInfo {
+                        client_idx,
+                        domain_rule: s.clone(),
+                    });
+                    all_rules.push(MatcherDomainRule::new(
+                        dt,
+                        v,
+                        all_rules.len() as u32,
+                    ));
                 }
             }
         }
@@ -591,13 +594,13 @@ fn parse_hosts(
 ) -> Result<Vec<HostMapping>, DnsError> {
     let mut mappings = Vec::new();
     for (key, value) in hosts {
-        let matcher_rules = match parse_hosts_key(key, datadir, loader) {
-            Ok(rules) => rules,
-            Err(e) => {
-                tracing::warn!(key = %key, error = %e, "dns hosts: skip bad rule key");
-                continue;
-            }
-        };
+        // Go infra/conf/dns.go:258-261/444-447 hosts key 解析失败 → 整体报错
+        // 启动失败。修复前 warn+skip 静默丢映射（bd wmdn③）。
+        let matcher_rules = parse_hosts_key(key, datadir, loader).map_err(|e| {
+            DnsError::Features(xray_features::dns::DnsError::Other(format!(
+                "parse dns hosts key {key}: {e}"
+            )))
+        })?;
         let (ips, proxied) = parse_host_value(value);
         if ips.is_empty() && proxied.is_empty() {
             tracing::warn!(key = %key, "dns hosts: skip entry with no IPs and no redirect");
@@ -700,6 +703,30 @@ mod tests {
         let json = r#"{"servers": [{"address": "foo://8.8.8.8"}]}"#;
         let cfg: DnsAppConfig = serde_json::from_str(json).unwrap();
         assert!(cfg.build().is_err(), "unknown scheme must fail the build");
+    }
+
+    /// bd wmdn③ 回归：nameserver domains 规则解析失败 → 启动硬错（Go
+    /// infra/conf/dns.go:89-92），不再 warn+skip 静默丢规则。
+    #[test]
+    fn build_hard_fails_on_bad_nameserver_domain_rule() {
+        // 不存在的 geosite code → parse_ns_domain_rule 必败。
+        let json = r#"{
+            "servers": [{"address": "8.8.8.8", "domains": ["geosite:zz-no-such-code-xyz"]}]
+        }"#;
+        let cfg: DnsAppConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.build().is_err(), "bad domains rule must fail the build");
+    }
+
+    /// bd wmdn③ 回归：hosts key 解析失败 → 启动硬错（Go
+    /// infra/conf/dns.go:258-261/444-447），不再 warn+skip 静默丢映射。
+    #[test]
+    fn build_hard_fails_on_bad_hosts_key() {
+        let json = r#"{
+            "servers": [{"address": "8.8.8.8"}],
+            "hosts": {"geosite:zz-no-such-code-xyz": "1.2.3.4"}
+        }"#;
+        let cfg: DnsAppConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.build().is_err(), "bad hosts key must fail the build");
     }
 
     #[test]

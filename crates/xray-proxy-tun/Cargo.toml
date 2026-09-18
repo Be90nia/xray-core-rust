@@ -9,6 +9,7 @@ rust-version.workspace = true
 xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
 thiserror = { workspace = true }
+bytes = { workspace = true }
 xray-transport = { path = "../xray-transport" }
 xray-app-dispatcher = { path = "../xray-app-dispatcher" }
 xray-buf = { path = "../xray-buf" }

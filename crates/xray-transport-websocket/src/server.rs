@@ -62,6 +62,10 @@ pub struct AcceptedConn {
 pub struct WsListener {
     listener: TokioTcpListener,
     configs: Vec<Arc<Config>>,
+    /// 可信 XFF header 名单（来自 `sockopt.trustedXForwardedFor`，listener 级，
+    /// 对齐 Go `socketSettings.TrustedXForwardedFor`）。空 = 永不采纳 XFF
+    /// （默认不信任，防伪造；Go hub.go:63-68）。
+    pub trusted_x_forwarded_for: Vec<String>,
 }
 
 impl WsListener {
@@ -79,7 +83,7 @@ impl WsListener {
             return Err(WsError::InvalidUpgradeRequest { reason: "no WS configs provided".into() });
         }
         let listener = TokioTcpListener::bind(addr).await.map_err(WsError::Io)?;
-        Ok(Self { listener, configs })
+        Ok(Self { listener, configs, trusted_x_forwarded_for: Vec::new() })
     }
 
     /// 本地地址。
@@ -94,7 +98,7 @@ impl WsListener {
         let (mut tcp, remote) = self.listener.accept().await.map_err(WsError::Io)?;
         let local = tcp.local_addr().ok();
         let remote = self.parse_proxy_protocol(&mut tcp, remote).await?;
-        Self::ws_handshake(tcp, remote, local, &self.configs).await
+        Self::ws_handshake(tcp, remote, local, &self.configs, &self.trusted_x_forwarded_for).await
     }
 
     /// 接受一条新连接，先做 TLS 握手再 WS 握手。
@@ -114,7 +118,14 @@ impl WsListener {
             .accept(tcp)
             .await
             .map_err(|e| WsError::HandshakeFailed(format!("tls accept: {e}")))?;
-        Self::ws_handshake(tls_stream, remote, local, &self.configs).await
+        Self::ws_handshake(
+            tls_stream,
+            remote,
+            local,
+            &self.configs,
+            &self.trusted_x_forwarded_for,
+        )
+        .await
     }
 
     /// 解析 PROXY protocol（如果启用），返回真实客户端地址。
@@ -133,12 +144,14 @@ impl WsListener {
     /// 在已建立的流上做 WS 握手 + 多 path 路由 + early data + XFF + 心跳 ping。
     ///
     /// 多 path：在 `configs` 中按 (host, path) 匹配，找到的 config 决定 heartbeat_period。
-    /// XFF：从 `X-Forwarded-For` header 提取首个 IP 覆盖 remote（port=0，对齐 Go）。
+    /// XFF：仅当 `trusted` 名单 header 命中时从 `X-Forwarded-For` 提取首个 IP 覆盖
+    /// remote（port=0，对齐 Go ApplyTrustedXForwardedFor）。
     async fn ws_handshake<S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static>(
         stream: S,
         remote: SocketAddr,
         local: Option<SocketAddr>,
         configs: &[Arc<Config>],
+        trusted: &[String],
     ) -> Result<AcceptedConn> {
         let configs_arc: Arc<[Arc<Config>]> = Arc::from(configs);
         let early_data_slot: Arc<std::sync::Mutex<Vec<u8>>> = Arc::default();
@@ -156,9 +169,11 @@ impl WsListener {
             let req_host =
                 headers.get(http::header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
 
-            // 1. 多 path 路由：找到匹配的 config（host 空放行/非空严格匹配 + path 严格匹配）。
+            // 1. 多 path 路由：找到匹配的 config（host 空放行/非空 Go IsValidHTTPHost
+            //    精确匹配（lowercase+剥端口，H2 对齐 internet.go:8-16）+ path 严格匹配）。
             let matched = configs_cb.iter().position(|c| {
-                let host_ok = c.host.is_empty() || c.host == req_host;
+                let host_ok = c.host.is_empty()
+                    || xray_common::protocol::http::is_valid_http_host(req_host, &c.host);
                 let path_ok = req_path == c.normalized_path();
                 host_ok && path_ok
             });
@@ -186,8 +201,9 @@ impl WsListener {
                 }
             }
 
-            // 3. X-Forwarded-For 提取（对应 Go hub.go: ParseXForwardedFor）。
-            if let Some(ip) = extract_xff(headers) {
+            // 3. X-Forwarded-For 信任门控提取（对应 Go hub.go:63-68
+            //    ApplyTrustedXForwardedFor：默认不信任，名单命中才采纳）。
+            if let Some(ip) = extract_xff_trusted(headers, trusted) {
                 if let Ok(mut guard) = xff_cb.lock() {
                     *guard = Some(ip);
                 }
@@ -196,8 +212,13 @@ impl WsListener {
             Ok(response)
         };
 
-        let ws_stream = accept_hdr_async(stream, callback)
+        // H14：握手全程 4s 超时（Go hub.go:27-33 Upgrader HandshakeTimeout: 4s；
+        // 慢速/半开连接不再无限占用 accept 并发）。
+        let ws_stream = tokio::time::timeout(Duration::from_secs(4), accept_hdr_async(stream, callback))
             .await
+            .map_err(|_| {
+                WsError::HandshakeFailed("websocket handshake timeout (4s)".into())
+            })?
             .map_err(|e| WsError::HandshakeFailed(format!("accept_hdr_async: {e}")))?;
 
         let early_data = early_data_slot.lock().map(|g| g.clone()).unwrap_or_default();
@@ -260,14 +281,30 @@ fn extract_early_data(headers: &HeaderMap) -> Option<EarlyDataHeader> {
     Some(EarlyDataHeader { raw: raw.to_string(), bytes })
 }
 
-/// 从 `X-Forwarded-For` header 提取首个 IP（最原始客户端）。
+/// 按信任门控从 `X-Forwarded-For` header 提取首个 IP（最原始客户端）。
 ///
-/// 对应 Go `common/protocol/http.ParseXForwardedFor`：取逗号分隔列表的第一个，
-/// trim 空白后解析为 IP。无效或缺失返回 None。
-fn extract_xff(headers: &HeaderMap) -> Option<IpAddr> {
+/// 对齐 Go `hub.go:63-68` + `common/protocol/http/headers.go::ApplyTrustedXForwardedFor`：
+/// **仅当** `sockopt.trustedXForwardedFor` 名单中任一 header 在请求中出现时才采纳
+/// XFF 首段（H1 修复：此前无条件信任，客户端可伪造源 IP）。其余情况一律 `None`
+/// （调用方保持真实连接地址），并按 Go 语义打 warning：
+/// - 无名单（默认不信任）→ "not configured" warning
+/// - 有名单但名单 header 均不在场 → "potentially forged" warning
+fn extract_xff_trusted(headers: &HeaderMap, trusted: &[String]) -> Option<IpAddr> {
     let val = headers.get("X-Forwarded-For")?.to_str().ok()?;
-    let first = val.split(',').next()?.trim();
-    first.parse::<IpAddr>().ok()
+    if trusted.iter().any(|t| headers.contains_key(t.as_str())) {
+        let first = val.split(',').next()?.trim();
+        return first.parse::<IpAddr>().ok();
+    }
+    if trusted.is_empty() {
+        tracing::warn!(
+            xff = val,
+            "received \"X-Forwarded-For\" but \"sockopt.trustedXForwardedFor\" is not configured; \
+             ignoring it and using the real remote address"
+        );
+    } else {
+        tracing::warn!(xff = val, "ignored potentially forged \"X-Forwarded-For\"");
+    }
+    None
 }
 
 #[cfg(test)]
@@ -319,6 +356,47 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("Sec-WebSocket-Protocol", "@@@invalid".parse().unwrap());
         assert!(extract_early_data(&h).is_none());
+    }
+
+    // ===== H1：XFF 信任门控（对齐 Go ApplyTrustedXForwardedFor）=====
+
+    fn hmap(kv: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in kv {
+            let name = http::header::HeaderName::from_lowercase(k.to_ascii_lowercase().as_bytes())
+                .unwrap();
+            h.insert(name, v.parse().unwrap());
+        }
+        h
+    }
+
+    /// H1 回归：无 trusted 名单（默认）→ XFF 一律不采纳（此前无条件信任可伪造源 IP）。
+    #[test]
+    fn xff_rejected_by_default_without_trusted_list() {
+        let h = hmap(&[("X-Forwarded-For", "1.2.3.4, 10.0.0.1")]);
+        assert!(extract_xff_trusted(&h, &[]).is_none());
+    }
+
+    /// 名单命中 → 采纳首段 IP。
+    #[test]
+    fn xff_adopted_when_trusted_header_present() {
+        let h = hmap(&[("X-Forwarded-For", "1.2.3.4, 10.0.0.1"), ("X-Real-IP", "x")]);
+        let ip = extract_xff_trusted(&h, &["X-Real-IP".to_string()]).unwrap();
+        assert_eq!(ip.to_string(), "1.2.3.4");
+    }
+
+    /// 有名单但名单 header 不在场 → 不采纳。
+    #[test]
+    fn xff_rejected_when_trusted_header_absent() {
+        let h = hmap(&[("X-Forwarded-For", "1.2.3.4")]);
+        assert!(extract_xff_trusted(&h, &["X-Real-IP".to_string()]).is_none());
+    }
+
+    /// XFF 缺失 → None（无告警路径）。
+    #[test]
+    fn xff_missing_returns_none() {
+        let h = hmap(&[("X-Real-IP", "x")]);
+        assert!(extract_xff_trusted(&h, &["X-Real-IP".to_string()]).is_none());
     }
 
     #[tokio::test]
@@ -385,45 +463,6 @@ mod tests {
             accepted.remote.ip(),
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
         );
-    }
-
-    // --- extract_xff 单元测试 ---
-
-    #[test]
-    fn extract_xff_single_ipv4() {
-        let mut h = HeaderMap::new();
-        h.insert("X-Forwarded-For", "203.0.113.5".parse().unwrap());
-        let ip = extract_xff(&h).expect("parsed");
-        assert_eq!(ip, IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 5)));
-    }
-
-    #[test]
-    fn extract_xff_chain_takes_first() {
-        let mut h = HeaderMap::new();
-        h.insert("X-Forwarded-For", "1.2.3.4, 5.6.7.8, 9.10.11.12".parse().unwrap());
-        let ip = extract_xff(&h).expect("parsed");
-        assert_eq!(ip, IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)));
-    }
-
-    #[test]
-    fn extract_xff_ipv6() {
-        let mut h = HeaderMap::new();
-        h.insert("X-Forwarded-For", "2001:db8::1".parse().unwrap());
-        let ip = extract_xff(&h).expect("parsed");
-        assert!(matches!(ip, IpAddr::V6(_)));
-    }
-
-    #[test]
-    fn extract_xff_missing_returns_none() {
-        let h = HeaderMap::new();
-        assert!(extract_xff(&h).is_none());
-    }
-
-    #[test]
-    fn extract_xff_invalid_returns_none() {
-        let mut h = HeaderMap::new();
-        h.insert("X-Forwarded-For", "not-an-ip".parse().unwrap());
-        assert!(extract_xff(&h).is_none());
     }
 
     // --- 多 path 路由 E2E ---

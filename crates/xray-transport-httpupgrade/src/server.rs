@@ -61,25 +61,37 @@ impl HttpUpgradeServer {
     where
         IO: AsyncRead + AsyncWrite + Unpin,
     {
-        // 1. 读请求直到 \r\n\r\n（用 1KB chunk 读，能正确捕获后续 payload）
+        // 1. 读请求直到 \r\n\r\n（用 1KB chunk 读，能正确捕获后续 payload）。
+        // H14：整段握手读 4s 超时（Go hub.go:39-41 SetReadDeadline(+4s) +
+        // LimitReader(12288)——慢速/半开连接不再无限占用 accept 并发）。
         let mut buf: Vec<u8> = Vec::with_capacity(READ_INITIAL_CAPACITY);
         let mut chunk = [0u8; 1024];
-        loop {
-            if buf.len() >= READ_MAX_CAPACITY {
-                return Err(crate::error::HttpUpgradeError::InvalidHttpFormat(format!(
-                    "request header exceeds max {} bytes",
-                    READ_MAX_CAPACITY
-                )));
+        let read_all = tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                if buf.len() >= READ_MAX_CAPACITY {
+                    return Err(crate::error::HttpUpgradeError::InvalidHttpFormat(format!(
+                        "request header exceeds max {} bytes",
+                        READ_MAX_CAPACITY
+                    )));
+                }
+                let n = io.read(&mut chunk).await?;
+                if n == 0 {
+                    return Err(crate::error::HttpUpgradeError::InvalidHttpFormat(
+                        "EOF before \\r\\n\\r\\n terminator".into(),
+                    ));
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if find_header_end(&buf).is_some() {
+                    return Ok(());
+                }
             }
-            let n = io.read(&mut chunk).await?;
-            if n == 0 {
+        });
+        match read_all.await {
+            Ok(r) => r?,
+            Err(_) => {
                 return Err(crate::error::HttpUpgradeError::InvalidHttpFormat(
-                    "EOF before \\r\\n\\r\\n terminator".into(),
+                    "handshake read timeout (4s, Go SetReadDeadline)".into(),
                 ));
-            }
-            buf.extend_from_slice(&chunk[..n]);
-            if find_header_end(&buf).is_some() {
-                break;
             }
         }
 

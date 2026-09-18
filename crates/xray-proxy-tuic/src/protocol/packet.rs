@@ -23,7 +23,7 @@
 //! 当 UDP 负载超过 QUIC datagram MTU（约 1200B）时需要分片。
 //! 接收端用 [`FragmentAssembler`]（per-assoc, per-pkt_id 缓存）按
 //! `frag_id` 升序拼接为完整 UDP 负载，详见其文档。
-use bytes::{Buf, BufMut};
+use bytes::{Buf, BufMut, Bytes};
 
 use super::address::Address;
 use crate::error::{Result, TuicError};
@@ -44,14 +44,15 @@ pub struct Packet {
     pub frag_id: u8,
     /// 目标地址（响应方向时为 server 实际出口地址）。
     pub addr: Address,
-    /// 负载数据。
-    pub data: Vec<u8>,
+    /// 负载数据。`Bytes` 所有权转移（bd：per-packet to_vec 消除——分片路径
+    /// `slice` 零拷贝，解析路径 `Bytes::from(Vec)` 零拷贝）。
+    pub data: Bytes,
 }
 
 impl Packet {
     /// 构造非分片 Packet（最常见路径）。
     #[must_use]
-    pub fn new(assoc_id: u16, pkt_id: u16, addr: Address, data: Vec<u8>) -> Self {
+    pub fn new(assoc_id: u16, pkt_id: u16, addr: Address, data: Bytes) -> Self {
         Self {
             assoc_id,
             pkt_id,
@@ -114,13 +115,14 @@ impl Packet {
         }
         let mut data = vec![0u8; size];
         buf.copy_to_slice(&mut data);
+        // Vec → Bytes 零拷贝（所有权 move，非 copy_from_slice）
         Ok(Self {
             assoc_id,
             pkt_id,
             frag_total,
             frag_id,
             addr,
-            data,
+            data: Bytes::from(data),
         })
     }
 }
@@ -145,7 +147,7 @@ pub struct FragmentAssembler {
     /// 当前重组的 pkt_id。
     pkt_id: u16,
     /// 已收到的分片槽（None = 未到）。
-    frags: Vec<Option<Vec<u8>>>,
+    frags: Vec<Option<Bytes>>,
     /// 已收到分片数。
     received: u8,
     /// 首个分片的 addr（spec：非首片 ADDR=0xff None）。
@@ -196,7 +198,7 @@ impl FragmentAssembler {
             self.received = self.received.saturating_add(1);
         }
         if self.received == pkt.frag_total {
-            // 全部到齐：按 frag_id 升序拼接
+            // 全部到齐：按 frag_id 升序拼接（extend 各分片 → Bytes 零拷贝包装）
             let mut data = Vec::new();
             for frag in &self.frags {
                 if let Some(f) = frag {
@@ -213,7 +215,7 @@ impl FragmentAssembler {
                 frag_total: 1,
                 frag_id: 0,
                 addr,
-                data,
+                data: Bytes::from(data),
             };
             // 重置
             self.frags.clear();
@@ -253,7 +255,7 @@ mod tests {
             0x1234,
             0x0001,
             Address::Ipv4(Ipv4Addr::new(8, 8, 8, 8), 53),
-            b"query-dns".to_vec(),
+            Bytes::from_static(b"query-dns"),
         );
         roundtrip(&pkt);
     }
@@ -264,21 +266,21 @@ mod tests {
             0x5678,
             0x0002,
             Address::Domain("example.com".into(), 443),
-            vec![0u8; 100],
+            Bytes::from(vec![0u8; 100]),
         );
         roundtrip(&pkt);
     }
 
     #[test]
     fn packet_roundtrip_empty_data() {
-        let pkt = Packet::new(0xffff, 0, Address::None, Vec::new());
+        let pkt = Packet::new(0xffff, 0, Address::None, Bytes::new());
         roundtrip(&pkt);
     }
 
     #[test]
     fn packet_roundtrip_none_addr() {
         // 响应方向常用 None 地址（server 拒绝或无需指定源）
-        let pkt = Packet::new(1, 1, Address::None, b"resp".to_vec());
+        let pkt = Packet::new(1, 1, Address::None, Bytes::from_static(b"resp"));
         roundtrip(&pkt);
     }
 
@@ -288,7 +290,7 @@ mod tests {
             1,
             2,
             Address::Ipv4(Ipv4Addr::LOCALHOST, 8080),
-            vec![0xab; 50],
+            Bytes::from(vec![0xab; 50]),
         );
         // VER+TYPE(2) + ASSOC(2) + PKT(2) + FRAG_TOTAL(1) + FRAG_ID(1) + SIZE(2)
         // + ADDR(1+4+2=7) + DATA(50) = 67
@@ -333,7 +335,7 @@ mod tests {
             } else {
                 Address::None
             },
-            data,
+            data: Bytes::from(data),
         }
     }
 
@@ -359,7 +361,7 @@ mod tests {
         assert_eq!(r.frag_id, 0);
         assert_eq!(r.pkt_id, 42);
         assert_eq!(r.assoc_id, 1);
-        assert_eq!(r.data, b"AAABBBCCC");
+        assert_eq!(&r.data[..], b"AAABBBCCC");
         // 首片 addr 应保留
         assert_eq!(
             r.addr,
@@ -378,7 +380,7 @@ mod tests {
         assert!(asm.feed(f0).unwrap().is_none());
         let r = asm.feed(f1).unwrap().expect("3rd should complete");
         // 拼接顺序必须按 frag_id 升序
-        assert_eq!(r.data, b"AAABBBCCC");
+        assert_eq!(&r.data[..], b"AAABBBCCC");
     }
 
     #[test]
@@ -390,7 +392,7 @@ mod tests {
         // 重复 f0 应被忽略（received 不递增）
         assert!(asm.feed(f0).unwrap().is_none());
         let r = asm.feed(f1).unwrap().expect("2nd unique should complete");
-        assert_eq!(r.data, b"XY");
+        assert_eq!(&r.data[..], b"XY");
     }
 
     #[test]
@@ -413,7 +415,7 @@ mod tests {
         let g1 = make_frag(1, 99, 1, 2, b"D".to_vec());
         let r = asm.feed(g1).unwrap().expect("2nd pkt complete");
         assert_eq!(r.pkt_id, 99);
-        assert_eq!(r.data, b"BD");
+        assert_eq!(&r.data[..], b"BD");
     }
 
     #[test]

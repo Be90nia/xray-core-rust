@@ -160,6 +160,49 @@ impl StreamSettings {
         matches!(self.security.as_str(), "tls" | "reality")
     }
 
+    /// 启动期 sockopt 数值校验（对齐 Go 解码期硬错）。
+    ///
+    /// Go `SocketConfig.Build`（infra/conf/transport_sockopt.go:70-84）对
+    /// `tcpFastOpen` 非 bool/数字类型硬错；int32 字段越界在 `json.Unmarshal`
+    /// 解码期即报错。Rust 此前 `as i32`/`as u32` 静默回绕、非法类型静默忽略，
+    /// 此处在装配期对齐为拒启。
+    pub fn validate_sockopt_json(v: Option<&serde_json::Value>) -> std::io::Result<()> {
+        const I32_MIN: i64 = i32::MIN as i64;
+        const I32_MAX: i64 = i32::MAX as i64;
+        let Some(obj) = v.and_then(|v| v.as_object()) else {
+            return Ok(());
+        };
+        if let Some(tfo) = obj.get("tcpFastOpen") {
+            if tfo.as_bool().is_none() && tfo.as_i64().is_none() {
+                return Err(std::io::Error::other(
+                    "sockopt.tcpFastOpen: only boolean and integer value is acceptable",
+                ));
+            }
+        }
+        // int32 数值字段越界（Go json.Unmarshal 硬错；Rust 此前 as i32 回绕）。
+        for key in [
+            "mark",
+            "tcpWindowClamp",
+            "tcpMaxSeg",
+            "tcpUserTimeout",
+            "receiveBufferSize",
+            "tcpKeepAliveInterval",
+            "tcpKeepAliveIdle",
+        ] {
+            if let Some(raw) = obj.get(key) {
+                match raw.as_i64() {
+                    Some(n) if (I32_MIN..=I32_MAX).contains(&n) => {}
+                    _ => {
+                        return Err(std::io::Error::other(format!(
+                            "sockopt.{key}: integer value out of int32 range"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// 从 `sockopt_json` 解析 SocketOptions（对应 Go `SocketConfig`）。
     ///
     /// 支持字段：`mark` / `tcpFastOpen` / `tcpKeepAliveInterval`（秒）/
@@ -181,10 +224,11 @@ impl StreamSettings {
         if let Some(v) = obj.get("mark").and_then(|v| v.as_u64()) {
             opts.mark = v as u32;
         }
-        // Go TFO 是 interface{}：JSON 常写 true/false 或 0/1。
+        // Go TFO 是 interface{}（transport_sockopt.go:71-84）：bool true→256 /
+        // false→-1；数字=queue 长度（>0 启用，0/负 禁用）。Rust bool 字段仅保留
+        // 开/关语义；非法类型由 [`validate_sockopt_json`] 启动期硬错。
         if let Some(v) = obj.get("tcpFastOpen") {
-            let on = v.as_bool().unwrap_or_else(|| v.as_i64() == Some(1));
-            opts.tcp_fast_open = on;
+            opts.tcp_fast_open = v.as_bool().unwrap_or_else(|| v.as_i64().is_some_and(|n| n > 0));
         }
         if let Some(v) = obj.get("tcpKeepAliveInterval").and_then(|v| v.as_u64()) {
             opts.tcp_keepalive_interval = std::time::Duration::from_secs(v);
@@ -672,6 +716,54 @@ mod transport_cache_tests {
         let mut s = StreamSettings::tcp();
         s.sockopt_json = Some(serde_json::json!({ "tcpFastOpen": 1 }));
         assert!(s.socket_options().tcp_fast_open);
+    }
+
+    /// uasr⑥：tcpFastOpen 数字=queue 长度语义（Go transport_sockopt.go:71-84）：
+    /// 任意正数启用（256 不再被 ==1 误判禁用）、0/负数禁用。
+    #[test]
+    fn socket_options_tfo_numeric_queue_length() {
+        for on in [256, 65_535, 2] {
+            let mut s = StreamSettings::tcp();
+            s.sockopt_json = Some(serde_json::json!({ "tcpFastOpen": on }));
+            assert!(s.socket_options().tcp_fast_open, "tfo={on} must enable");
+        }
+        for off in [0, -1, -65_535] {
+            let mut s = StreamSettings::tcp();
+            s.sockopt_json = Some(serde_json::json!({ "tcpFastOpen": off }));
+            assert!(!s.socket_options().tcp_fast_open, "tfo={off} must disable");
+        }
+    }
+
+    /// uasr⑤⑥：sockopt 启动期校验——非法 tfo 类型 / int32 越界硬错，
+    /// 合法配置通过（Go 解码期硬错对齐）。
+    #[test]
+    fn validate_sockopt_json_hard_errors_and_ok() {
+        use super::StreamSettings;
+        // 字符串 tfo → 拒（Go :82 "only boolean and integer value is acceptable"）。
+        let err = StreamSettings::validate_sockopt_json(Some(&serde_json::json!({"tcpFastOpen": "yes"})))
+            .err()
+            .expect("string tfo must reject");
+        assert!(err.to_string().contains("tcpFastOpen"), "{err}");
+        // int32 越界 → 拒。
+        for key in ["mark", "tcpWindowClamp", "tcpMaxSeg", "tcpUserTimeout", "receiveBufferSize"] {
+            let obj = serde_json::json!({ key: 9_000_000_000i64 });
+            let err = StreamSettings::validate_sockopt_json(Some(&obj)).err().expect("must reject");
+            assert!(err.to_string().contains(key), "key={key} err={err}");
+        }
+        // 合法：边界值 + 全字段。
+        let ok = serde_json::json!({
+            "mark": 255,
+            "tcpWindowClamp": -1,
+            "tcpMaxSeg": 536,
+            "tcpUserTimeout": 30_000,
+            "receiveBufferSize": 1_048_576,
+            "tcpKeepAliveInterval": 30,
+            "tcpFastOpen": 65_535
+        });
+        assert!(StreamSettings::validate_sockopt_json(Some(&ok)).is_ok());
+        // 缺省/null。
+        assert!(StreamSettings::validate_sockopt_json(None).is_ok());
+        assert!(StreamSettings::validate_sockopt_json(Some(&serde_json::Value::Null)).is_ok());
     }
 
     /// tproxy 双类型解析（Go transport_sockopt.go:48/:85-93 字符串枚举 +

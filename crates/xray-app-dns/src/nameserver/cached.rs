@@ -115,26 +115,28 @@ pub async fn query_ip<S: CachedNameserver + 'static>(
     if !cache.disable_cache {
         if let Some(rec) = cache.find_records(fqdn_owned) {
             let now = Instant::now();
-            match merge_records(option, rec.a.as_ref(), rec.aaaa.as_ref(), now) {
-                Ok((ips, ttl)) if ttl > 0 => {
-                    return Ok((ips, ttl as u32));
+            let (ips, ttl, err) = merge_records(option, rec.a.as_ref(), rec.aaaa.as_ref(), now);
+            // Go nameserver_cached.go:27-32：err 非 RecordNotFound 且 ttl>0
+            // 即 cache HIT——含负缓存（rcode/空答案）在 TTL 内直接返回，不打
+            // 上游（修复前落 fetch，负缓存每次完整上游 RTT，bd wmdn①）。
+            if !matches!(err, Some(DnsError::RecordNotFound)) {
+                if ttl > 0 {
+                    return match err {
+                        None => Ok((ips, ttl as u32)),
+                        Some(e) => Err(e),
+                    };
                 }
                 // 过期可服务：Go merge 对过期记录返回 `(ips, ttl<=0, nil)`——
-                // err 非 errRecordNotFound，serveStale 时秒回旧 IP 并后台刷新。
-                // Rust `get_ips` 把过期坍缩为 RecordNotFound，这里从原始记录恢复。
-                Err(DnsError::RecordNotFound) => {
-                    if let Some((ips, ttl)) = stale_result(&rec, option, now) {
-                        if cache.serve_stale
-                            && (cache.serve_expired_ttl_secs == 0
-                                || cache.serve_expired_ttl_secs < ttl)
-                        {
-                            pull(server, fqdn_owned.to_string(), option);
-                            return Ok((ips, 1));
-                        }
+                // serveStale 时秒回旧 IP 并后台刷新。
+                if cache.serve_stale
+                    && (cache.serve_expired_ttl_secs == 0
+                        || cache.serve_expired_ttl_secs < ttl)
+                {
+                    if let Some((sips, _)) = stale_result(&rec, option, now) {
+                        pull(server, fqdn_owned.to_string(), option);
+                        return Ok((sips, 1));
                     }
                 }
-                // 其余（负缓存 / RCode 错误 / 无记录）：落到 fetch。
-                _ => {}
             }
         }
     }
@@ -236,7 +238,9 @@ pub async fn fetch<S: CachedNameserver>(
     };
     let now = Instant::now();
 
-    // 缓存结果。
+    // 缓存结果。仅写入上游真实响应（含 NXDOMAIN 的 rcode=3 记录，TTL 取响应
+    // TTL）；上游超时/失败（rec=None）不写任何缓存——Go 从不缓存失败，修复前
+    // upsert_negative 把失败伪造成 rcode=3 负缓存（bd rofg②）。
     if let Some(rec) = outcome.rec_v4.clone() {
         let _ = cache.tx.send(crate::cache_controller::CacheEvent::Record {
             domain: fqdn.to_string(),
@@ -244,8 +248,6 @@ pub async fn fetch<S: CachedNameserver>(
             record: rec.clone(),
         });
         cache.upsert(fqdn, true, rec);
-    } else if option.ipv4_enable {
-        cache.upsert_negative(fqdn, true, now);
     }
     if let Some(rec) = outcome.rec_v6.clone() {
         let _ = cache.tx.send(crate::cache_controller::CacheEvent::Record {
@@ -254,16 +256,17 @@ pub async fn fetch<S: CachedNameserver>(
             record: rec.clone(),
         });
         cache.upsert(fqdn, false, rec);
-    } else if option.ipv6_enable {
-        cache.upsert_negative(fqdn, false, now);
     }
 
-    let (ips, ttl) = merge_records(
+    let (ips, ttl, err) = merge_records(
         option,
         outcome.rec_v4.as_ref(),
         outcome.rec_v6.as_ref(),
         now,
-    )?;
+    );
+    if let Some(e) = err {
+        return Err(e);
+    }
 
     let r_ttl: u32 = if ttl > 0 { ttl as u32 } else { 1 };
     Ok((ips, r_ttl))
@@ -469,6 +472,69 @@ mod tests {
         // Go: serveExpiredTTL(-60) < ttl(-120) 不成立 → 不走 stale，fetch 返回 1.2.3.4。
         let (ips, _ttl) = query_ip(Arc::new(server), "example.com", v4_only_option()).await.unwrap();
         assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
+    }
+
+    /// bd wmdn① 回归：负缓存（rcode=3 空答案）TTL 内命中——query_ip 直接
+    /// 返回 RCodeError，**不打上游**。修复前 merge 错误落 `_ => {}` 进 fetch，
+    /// 负缓存每次完整上游 RTT（Go nameserver_cached.go:27-32 TTL 内零查询）。
+    #[tokio::test]
+    async fn negative_cache_hit_within_ttl_skips_upstream() {
+        use crate::dnscommon::rcode;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingServer {
+            cache: Arc<CacheController>,
+            calls: AtomicUsize,
+        }
+        impl CachedNameserver for CountingServer {
+            fn cache_controller(&self) -> &CacheController {
+                &self.cache
+            }
+            async fn send_query(&self, _fqdn: &str, _option: IpOption) -> QueryOutcome {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                QueryOutcome { rec_v4: Some(v4_record(60)), rec_v6: None, errors: Vec::new() }
+            }
+        }
+
+        let cache = Arc::new(CacheController::new("test", false, false, 0, 0));
+        // 预填负缓存：rcode=3、空 IP、TTL 60s。
+        let neg = ip_record(1, vec![], Duration::from_secs(60), rcode::NX_DOMAIN, Instant::now());
+        cache.upsert("neg.example.com.", true, neg);
+
+        let server = Arc::new(CountingServer {
+            cache: cache.clone(),
+            calls: AtomicUsize::new(0),
+        });
+        let err = query_ip(server.clone(), "neg.example.com", v4_only_option())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DnsError::RCodeError(3)), "应直接返回负缓存 rcode 错误");
+        assert_eq!(server.calls.load(Ordering::SeqCst), 0, "TTL 内负缓存命中不得打上游");
+    }
+
+    /// bd rofg② 回归：上游失败（rec=None + errors 非空）不写 rcode=3 负缓存
+    /// （Go 从不缓存失败）。修复前 fetch 的 `else if` 兜底把失败伪造成负缓存。
+    #[tokio::test]
+    async fn upstream_failure_not_cached_as_negative() {
+        struct FailServer {
+            cache: Arc<CacheController>,
+        }
+        impl CachedNameserver for FailServer {
+            fn cache_controller(&self) -> &CacheController {
+                &self.cache
+            }
+            async fn send_query(&self, _fqdn: &str, _option: IpOption) -> QueryOutcome {
+                QueryOutcome { rec_v4: None, rec_v6: None, errors: vec![DnsError::SystemResolve("upstream timeout".into())] }
+            }
+        }
+
+        let cache = Arc::new(CacheController::new("test", false, false, 0, 0));
+        let server = FailServer { cache: cache.clone() };
+        let err = fetch(&server, "fail.example.com.", v4_only_option()).await.unwrap_err();
+        // 单家族 + rec=None → merge_records 立即返回 RecordNotFound（Go 同：
+        // getIPs(nil) = errRecordNotFound）。
+        assert!(matches!(err, DnsError::RecordNotFound), "上游失败应返回 RecordNotFound");
+        assert!(cache.is_empty(), "上游失败不得写任何缓存");
     }
 
     #[tokio::test]

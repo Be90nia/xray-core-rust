@@ -254,22 +254,28 @@ pub(crate) async fn resolve_dest_addr(
 /// 建立查询用 TCP 流：共享 dialer 在场经路由出站（Go nameserver.go:41-78
 /// 查询 ctx 带路由语义）；缺席直连兜底（域名每查询现解析）。
 ///
+/// `force_local`（`+local` server）绕过共享 dialer 强制直连——Go Local mode
+/// 传 nil dispatcher 的等价语义（bd wmdn②）。
+///
 /// `what` 用于错误消息前缀（"tcp"/"doh"/"dot"/"udp-tcp-fallback"）。
 pub(crate) async fn connect_stream(
     dest: &Destination,
     resolver: &dyn HostResolver,
     query_timeout: Duration,
     what: &str,
+    force_local: bool,
 ) -> Result<DnsStream, crate::error::DnsError> {
-    if let Some(dialer) = shared_dialer() {
-        return tokio::time::timeout(query_timeout, dialer.dial_tcp(dest))
-            .await
-            .map_err(|_| {
-                crate::error::DnsError::WireFormat(format!(
-                    "{what} dial timeout after {query_timeout:?}"
-                ))
-            })?
-            .map_err(|e| crate::error::DnsError::WireFormat(format!("{what} dial: {e}")));
+    if !force_local {
+        if let Some(dialer) = shared_dialer() {
+            return tokio::time::timeout(query_timeout, dialer.dial_tcp(dest))
+                .await
+                .map_err(|_| {
+                    crate::error::DnsError::WireFormat(format!(
+                        "{what} dial timeout after {query_timeout:?}"
+                    ))
+                })?
+                .map_err(|e| crate::error::DnsError::WireFormat(format!("{what} dial: {e}")));
+        }
     }
     let sock_addr = resolve_dest_addr(dest, resolver)
         .await
@@ -288,8 +294,69 @@ pub(crate) async fn connect_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use xray_common::net::address::Address;
+    use xray_common::net::port::Port;
     use xray_transport::link::Link;
+
+    /// 共享 dialer 槽是进程级全局：涉槽测试须串行（udp.rs DIALER_SLOT_LOCK 同款）。
+    static DIALER_SLOT_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// 记录调用次数的 dialer：任何拨号都计数并返回错误（走不到真流）。
+    struct MarkingDialer {
+        calls: AtomicUsize,
+    }
+    impl QueryDialer for MarkingDialer {
+        fn dial_tcp(
+            &self,
+            _dest: &Destination,
+        ) -> Pin<Box<dyn Future<Output = io::Result<DnsStream>> + Send + '_>> {
+            Box::pin(async {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::other("dialer invoked"))
+            })
+        }
+        fn dial_udp(
+            &self,
+            _dest: &Destination,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn UdpPacketSession>>> + Send + '_>>
+        {
+            Box::pin(async {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::other("dialer invoked"))
+            })
+        }
+    }
+
+    /// bd wmdn② 回归：共享 dialer 在场时，`force_local=true` 的查询绕过
+    /// dialer 强制直连（Go nameserver.go:51-61 Local mode 传 nil dispatcher）；
+    /// `force_local=false` 仍走 dialer。
+    #[tokio::test]
+    async fn connect_stream_force_local_bypasses_shared_dialer() {
+        let _slot = DIALER_SLOT_LOCK.lock();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dest = Destination::tcp(Address::from(addr.ip()), Port::new(addr.port()));
+
+        let dialer = Arc::new(MarkingDialer { calls: AtomicUsize::new(0) });
+        set_shared_dialer(Some(dialer.clone() as Arc<dyn QueryDialer>));
+
+        // force_local=true：直连 listener 成功，dialer 不被调用。
+        let resolver = SystemHostResolver;
+        let stream = connect_stream(&dest, &resolver, Duration::from_secs(2), "tcp", true)
+            .await
+            .expect("force_local 应直连（IP 目标无需解析）");
+        drop(stream);
+        assert_eq!(dialer.calls.load(Ordering::SeqCst), 0, "force_local 不得走共享 dialer");
+
+        // force_local=false：走共享 dialer（此处 dialer 报错即证据）。
+        let r = connect_stream(&dest, &resolver, Duration::from_secs(2), "tcp", false).await;
+        assert!(r.is_err(), "共享 dialer 返回错误 → connect_stream 失败");
+        assert_eq!(dialer.calls.load(Ordering::SeqCst), 1, "非 local 应走共享 dialer");
+
+        set_shared_dialer(None);
+    }
 
     /// duplex 管道 → Link → LinkStream 字节 roundtrip。
     #[tokio::test]

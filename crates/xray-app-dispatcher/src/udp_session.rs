@@ -132,7 +132,13 @@ impl UdpDispatchSession {
                     Ok(None) => {} // 帧不完整，等更多数据
                     Err(PacketError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {}
                     Err(e) => {
-                        return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+                        // qyn8：协议解析错误先 drain 已消费的坏帧字节再报错。
+                        // 解析错误发生时 cursor 至少消费了 2B 长度头，不 drain
+                        // 则坏帧永久滞留 accum，容忍型调用方 continue 即在同一
+                        // 字节上无限 Err（同步忙旋 100% CPU）。传输层错误不经
+                        // 此路径（resp.read 的 io Err 由下方 `?` 直接传播）。
+                        inner.accum.drain(..consumed);
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
                     }
                 }
             }
@@ -334,6 +340,50 @@ mod tests {
         let mut session = UdpDispatchSession::new(Arc::new(EchoHandler));
         let r = tokio::time::timeout(std::time::Duration::from_millis(50), session.recv_packet())
             .await;
-        assert!(r.is_err(), "recv_packet should pend before first send");
+        assert!(r.is_err(), "recv before send must pend");
+    }
+
+    /// qyn8：只写坏帧且保持写端打开的 handler。
+    #[derive(Debug)]
+    struct BadFrameHandler;
+
+    impl DispatchHandler for BadFrameHandler {
+        fn tag(&self) -> &str {
+            "badframe"
+        }
+
+        fn dispatch(&self, _dest: &Destination, link: Link) -> crate::default::PinFuture<()> {
+            Box::pin(async move {
+                use xray_buf::io::Writer;
+                let mut out = xray_buf::multi::MultiBuffer::new();
+                // 坏帧：长度头声明 body_len=3 < MIN_META_LEN(4) → MetadataTooShort
+                out.merge_bytes(&vec![0x00u8, 0x03]);
+                let mut writer = link.writer;
+                let _ = writer.write_multi_buffer(out).await;
+                // 保持写端打开：EOF 会把忙旋误判成正常关会话
+                std::future::pending::<()>().await;
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn bad_frame_errs_once_then_blocks() {
+        // qyn8 回归：坏帧 → recv_packet Err；Err 分支 drain 坏帧后 accum 前进，
+        // 下一次 recv 阻塞等新数据。修复前坏帧滞留 accum，重解析同一字节无限
+        // Err（调用方 continue 即同步忙旋 100% CPU）。
+        let mut session = UdpDispatchSession::new(Arc::new(BadFrameHandler));
+        let dest = udp_dest([8, 8, 4, 4], 53);
+        session.send_packet(&dest, b"ping").await.expect("send failed");
+
+        let err = session.recv_packet().await.expect_err("bad frame must err");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let spin =
+            tokio::time::timeout(std::time::Duration::from_millis(150), session.recv_packet())
+                .await;
+        assert!(
+            spin.is_err(),
+            "recv_packet must block after draining bad frame (busy-spin regression)"
+        );
     }
 }

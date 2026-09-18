@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::time::Duration;
 
 use crate::error::{Result, TuicError};
@@ -122,7 +122,8 @@ impl UniRespRouter {
                 .map_err(|_| TuicError::UnexpectedEof("udp resp router dropped"))
         };
         match tokio::time::timeout(timeout, recv).await {
-            Ok(Ok(resp)) => Ok(resp.data),
+            // Bytes → Vec：read_payload 产的 VEC-kind Bytes 唯一引用时零拷贝归还
+            Ok(Ok(resp)) => Ok(resp.data.into()),
             Ok(Err(e)) => Err(e),
             Err(_) => {
                 waiters.lock().unwrap_or_else(|p| p.into_inner()).remove(&key);
@@ -180,7 +181,7 @@ impl TuicUdpAssoc {
         timeout: Option<Duration>,
     ) -> Result<Vec<u8>> {
         let pkt_id = self.pkt_id.fetch_add(1, Ordering::Relaxed);
-        let pkt = Packet::new(self.assoc_id, pkt_id, target, data.to_vec());
+        let pkt = Packet::new(self.assoc_id, pkt_id, target, Bytes::copy_from_slice(data));
         let to = timeout.unwrap_or(DEFAULT_UDP_TIMEOUT);
         self.router.send_and_wait(&self.conn, &pkt, to).await
     }
@@ -200,6 +201,8 @@ impl TuicUdpAssoc {
                 "native datagram mode not negotiated".into(),
             ));
         };
+        // 一次 owned 化，分片走 Bytes::slice 零拷贝（原每片 chunk.to_vec 各拷一次）
+        let data = Bytes::copy_from_slice(data);
         for pkt in build_native_fragments(self.assoc_id, pkt_id, target, data, frag_payload)? {
             self.conn
                 .send_datagram(UniRespRouter::encode_frame(&pkt).freeze())
@@ -251,7 +254,8 @@ impl TuicUdpAssoc {
                 .unwrap_or_else(|p| p.into_inner())
                 .feed(pkt)?;
             if let Some(full) = complete {
-                return Ok(full.data);
+                // Bytes → Vec：assembler 拼接产的 VEC-kind 唯一引用时零拷贝归还
+                return Ok(full.data.into());
             }
         }
     }
@@ -269,21 +273,16 @@ impl TuicUdpAssoc {
 ///
 /// spec（TUIC v5）：单包直接 FRAG_TOTAL=1；超长切 FRAG_TOTAL 片，同 pkt_id、
 /// FRAG_ID 0-based，**仅首片携带目标 Address**，后续片 addr=None（wire 编码
-/// `0xff`）——接收方按首片地址路由。
+/// `0xff`）——接收方按首片地址路由。分片为 `Bytes::slice` 零拷贝视图。
 fn build_native_fragments(
     assoc_id: u16,
     pkt_id: u16,
     target: &Address,
-    data: &[u8],
+    data: Bytes,
     frag_payload: usize,
 ) -> Result<Vec<Packet>> {
     if data.len() <= frag_payload {
-        return Ok(vec![Packet::new(
-            assoc_id,
-            pkt_id,
-            target.clone(),
-            data.to_vec(),
-        )]);
+        return Ok(vec![Packet::new(assoc_id, pkt_id, target.clone(), data)]);
     }
     if data.len() > MAX_PACKET_PAYLOAD {
         return Err(TuicError::PacketTooLarge(data.len()));
@@ -292,10 +291,9 @@ fn build_native_fragments(
     let Ok(frag_total) = u8::try_from(frag_total) else {
         return Err(TuicError::PacketTooLarge(data.len()));
     };
-    Ok(data
-        .chunks(frag_payload)
-        .enumerate()
-        .map(|(i, chunk)| Packet {
+    let mut frags = Vec::with_capacity(frag_total as usize);
+    for (i, chunk) in data.chunks(frag_payload).enumerate() {
+        frags.push(Packet {
             assoc_id,
             pkt_id,
             frag_total,
@@ -306,9 +304,11 @@ fn build_native_fragments(
             } else {
                 Address::None
             },
-            data: chunk.to_vec(),
-        })
-        .collect())
+            // slice 借用 data 产出共享视图，零拷贝；data 在循环结束后 drop
+            data: data.slice_ref(chunk),
+        });
+    }
+    Ok(frags)
 }
 
 /// 从 uni stream 读出一个完整 Packet 帧（含 VER+TYPE 头）。
@@ -392,7 +392,7 @@ pub(crate) async fn read_packet_payload(recv: &mut quinn::RecvStream) -> Result<
         }
         _ => return Err(TuicError::InvalidAddress("unknown atyp")),
     };
-    // DATA
+    // DATA（Vec → Bytes 零拷贝所有权转移）
     let mut data = vec![0u8; size];
     recv.read_exact(&mut data).await.map_err(quinn_read_exact_err)?;
     Ok(Packet {
@@ -401,7 +401,7 @@ pub(crate) async fn read_packet_payload(recv: &mut quinn::RecvStream) -> Result<
         frag_total,
         frag_id,
         addr,
-        data,
+        data: Bytes::from(data),
     })
 }
 
@@ -424,9 +424,9 @@ mod tests {
     #[test]
     fn native_fragments_only_first_carries_address() {
         let target = Address::Ipv4(Ipv4Addr::new(192, 0, 2, 1), 8080);
-        let data = vec![7u8; 100];
+        let data = Bytes::from(vec![7u8; 100]);
         let frags =
-            build_native_fragments(0x1234, 0x5678, &target, &data, 30).expect("fragments");
+            build_native_fragments(0x1234, 0x5678, &target, data, 30).expect("fragments");
         assert_eq!(frags.len(), 4, "ceil(100/30) = 4 片");
         for (i, f) in frags.iter().enumerate() {
             assert_eq!(f.assoc_id, 0x1234);
@@ -449,11 +449,13 @@ mod tests {
     #[test]
     fn native_single_packet_keeps_address() {
         let target = Address::Ipv4(Ipv4Addr::new(192, 0, 2, 1), 8080);
-        let frags = build_native_fragments(1, 2, &target, b"hello", 64).expect("fragments");
+        let frags =
+            build_native_fragments(1, 2, &target, Bytes::from_static(b"hello"), 64)
+                .expect("fragments");
         assert_eq!(frags.len(), 1);
         assert_eq!(frags[0].frag_total, 1);
         assert_eq!(frags[0].frag_id, 0);
         assert_eq!(frags[0].addr, target);
-        assert_eq!(frags[0].data, b"hello");
+        assert_eq!(&frags[0].data[..], b"hello");
     }
 }

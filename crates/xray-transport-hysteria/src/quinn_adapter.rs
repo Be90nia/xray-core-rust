@@ -20,8 +20,10 @@ use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::Arc,
+    task::Context,
 };
 
+use bytes::Bytes;
 use quinn::{Connection, RecvStream, SendStream, VarInt};
 use tokio::sync::Mutex;
 use crate::salamander_socket::UdpObfs;
@@ -33,7 +35,7 @@ use crate::conn::{QuicConn, QuicStream};
 /// quinn 的 bi stream 拆成 `SendStream` + `RecvStream` 两个独立半边，
 /// 我们组合起来对应 hysteria 的单一 `QuicStream` 抽象。
 pub struct QuinnQuicStream {
-    send: Mutex<SendStream>,
+    send: parking_lot::Mutex<SendStream>,
     recv: Mutex<RecvStream>,
     local: SocketAddr,
     remote: SocketAddr,
@@ -52,7 +54,7 @@ impl QuinnQuicStream {
     /// 构造。地址字段由调用方从 [`quinn::Connection`] 取后传入。
     #[must_use]
     pub fn new(send: SendStream, recv: RecvStream, local: SocketAddr, remote: SocketAddr) -> Self {
-        Self { send: Mutex::new(send), recv: Mutex::new(recv), local, remote }
+        Self { send: parking_lot::Mutex::new(send), recv: Mutex::new(recv), local, remote }
     }
 }
 
@@ -79,17 +81,32 @@ impl QuicStream for QuinnQuicStream {
         &'a self,
         buf: &'a [u8],
     ) -> Pin<Box<dyn std::future::Future<Output = io::Result<usize>> + Send + 'a>> {
-        Box::pin(async move {
-            let mut send = self.send.lock().await;
-            match send.write(buf).await {
-                Ok(n) => Ok(n),
-                Err(quinn::WriteError::Stopped(code)) => Err(io::Error::new(
+        // 每轮 poll 短暂持同步锁（锁内无 await）——quinn poll_write 拷数据进
+        // 发送缓冲后立即返回，锁不跨 Pending。
+        Box::pin(std::future::poll_fn(move |cx| self.poll_write(cx, buf)))
+    }
+
+    fn poll_write(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        // 直通 quinn 原生 poll_write（固有方法，返回 WriteError 需手动映射——
+        // 错误分类与原 async write 一致），单次拷入发送缓冲，零 Vec 装箱（bd）
+        let mut send = self.send.lock();
+        match SendStream::poll_write(Pin::new(&mut *send), cx, buf) {
+            std::task::Poll::Ready(Ok(n)) => std::task::Poll::Ready(Ok(n)),
+            std::task::Poll::Ready(Err(quinn::WriteError::Stopped(code))) => {
+                std::task::Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::ConnectionReset,
                     format!("stream stopped: {code}"),
-                )),
-                Err(e) => Err(io::Error::other(format!("quinn write: {e}"))),
-            }
-        })
+                )))
+            },
+            std::task::Poll::Ready(Err(e)) => {
+                std::task::Poll::Ready(Err(io::Error::other(format!("quinn write: {e}"))))
+            },
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
     }
 
     fn cancel_read(&self, code: u64) {
@@ -181,34 +198,28 @@ impl QuinnQuicConn {
 }
 
 impl QuicConn for QuinnQuicConn {
-    fn send_datagram<'a>(
-        &'a self,
-        data: &'a [u8],
-    ) -> Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send + 'a>> {
+    fn send_datagram(
+        &self,
+        data: Bytes,
+    ) -> Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send>> {
+        // owned Bytes + Connection clone（内部 Arc）直入 quinn（impl Into<Bytes>），
+        // 免 copy_from_slice（bd）
+        let conn = self.conn.clone();
         Box::pin(async move {
-            self.conn
-                .send_datagram(bytes::Bytes::copy_from_slice(data))
+            conn.send_datagram(data)
                 .map_err(|e| io::Error::other(format!("quinn send_datagram: {e}")))
         })
     }
 
     fn receive_datagram(
         &self,
-    ) -> Pin<Box<dyn std::future::Future<Output = io::Result<Vec<u8>>> + Send>> {
-        // ponytail: trait 签名不带 'a（返回 Future + Send），所以 future 不能借用 self
-        // 需要 Arc<Connection>——但我们只持 &self。改用 raw pointer + unsafe 不安全
-        // 实际方案：trait 签名可能设计有问题，应该带 'a
-        // 暂时方案：用 spawn + channel，但太复杂
-        // 改方案：trait 修正为带 'a
-        // 但 trait 修改影响范围大，先用 Arc 克隆
-        // 实际上 quinn::Connection 内部是 Arc，clone 廉价
+    ) -> Pin<Box<dyn std::future::Future<Output = io::Result<Bytes>> + Send>> {
+        // quinn::Connection 内部是 Arc，clone 廉价
         let conn = self.conn.clone();
         Box::pin(async move {
-            let data = conn
-                .read_datagram()
+            conn.read_datagram()
                 .await
-                .map_err(|e| io::Error::other(format!("quinn read_datagram: {e}")))?;
-            Ok(data.to_vec())
+                .map_err(|e| io::Error::other(format!("quinn read_datagram: {e}")))
         })
     }
 
@@ -1249,23 +1260,23 @@ mod tests {
         let (client, server, _ep) = make_loopback_conn_pair().await;
 
         // client → server datagram
-        client.send_datagram(b"hello hysteria").await.expect("send");
+        client.send_datagram(Bytes::from_static(b"hello hysteria")).await.expect("send");
 
         let received = server.receive_datagram().await.expect("recv");
-        assert_eq!(received, b"hello hysteria");
+        assert_eq!(&received[..], b"hello hysteria");
     }
 
     #[tokio::test]
     async fn datagram_both_directions() {
         let (client, server, _ep) = make_loopback_conn_pair().await;
 
-        client.send_datagram(b"c2s").await.unwrap();
+        client.send_datagram(Bytes::from_static(b"c2s")).await.unwrap();
         let s_recv = server.receive_datagram().await.unwrap();
-        assert_eq!(s_recv, b"c2s");
+        assert_eq!(&s_recv[..], b"c2s");
 
-        server.send_datagram(b"s2c").await.unwrap();
+        server.send_datagram(Bytes::from_static(b"s2c")).await.unwrap();
         let c_recv = client.receive_datagram().await.unwrap();
-        assert_eq!(c_recv, b"s2c");
+        assert_eq!(&c_recv[..], b"s2c");
     }
 
     #[tokio::test]

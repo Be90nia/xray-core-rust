@@ -23,9 +23,12 @@ use hyper::{Method, Request, Response, StatusCode};
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tokio_util::io::ReaderStream;
 
-use crate::config::{Config, PLACEMENT_AUTO, PLACEMENT_BODY, PLACEMENT_COOKIE, PLACEMENT_HEADER};
+use crate::config::{
+    Config, PLACEMENT_AUTO, PLACEMENT_BODY, PLACEMENT_COOKIE, PLACEMENT_HEADER,
+    PLACEMENT_QUERY_IN_HEADER,
+};
 use crate::upload_queue::Packet;
-use crate::xpadding::{is_padding_valid, PADDING_METHOD_REPEAT_X};
+use crate::xpadding::{generate_padding, is_padding_valid, PADDING_METHOD_REPEAT_X};
 
 use super::meta::extract_meta;
 use super::{HubConnHandler, ServerConn, SessionMap};
@@ -87,14 +90,15 @@ where
     B: hyper::body::Body<Data = Bytes> + Send + Unpin + BodyExt + 'static,
     B::Error: Send + Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    // 1. Host 验证
+    // 1. Host 验证（H2：Go internet.IsValidHTTPHost internet.go:8-16——lowercase +
+    //    剥端口 + 精确匹配；此前双向 contains 是子串匹配可绕过）。
     if !ctx.host.is_empty() {
         let req_host = req
             .headers()
             .get("host")
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default();
-        if !req_host.contains(&ctx.host) && !ctx.host.contains(req_host) {
+        if !xray_common::protocol::http::is_valid_http_host(req_host, &ctx.host) {
             return status_response(StatusCode::NOT_FOUND);
         }
     }
@@ -105,7 +109,25 @@ where
         return status_response(StatusCode::NOT_FOUND);
     }
 
-    // 3. OPTIONS → CORS preflight（CORS header 由 handle_request 统一追加）
+    // 3. 校验通过：Go hub.go:110-131 在 CORS 之后、分发之前注入 X-Padding——
+    //    之后所有响应（OPTIONS 200 / padding 400 / 分发结果）都带。
+    let resp = dispatch_validated(req, peer_addr, ctx).await;
+    apply_xpadding_to_response(resp, ctx)
+}
+
+/// 通过 host/path 校验后的分发。对应 Go `ServeHTTP` 的 OPTIONS / padding 校验 /
+/// uplink-downlink 分发段。
+async fn dispatch_validated<B>(
+    req: Request<B>,
+    peer_addr: SocketAddr,
+    ctx: &HandlerContext,
+) -> Response<BoxBody<Bytes, io::Error>>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + Unpin + BodyExt + 'static,
+    B::Error: Send + Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    // OPTIONS → CORS preflight（CORS header 由 handle_request 统一追加；
+    // Go 在 padding 校验之前放行，padding 注入已在外层完成）。
     if req.method() == Method::OPTIONS {
         return status_response(StatusCode::OK);
     }
@@ -113,10 +135,22 @@ where
     // 4. 提取 session + seq
     let meta = extract_meta(&req, &ctx.config, &ctx.base_path);
 
-    // 5. Padding 校验（仅检查 Referer header 的 x_padding，非 obfs mode）
-    if !validate_padding(&req, ctx) {
+    // 5. Padding 提取 + 校验（Go hub.go:141-148 + xpadding.go IsPaddingValid：
+    //    缺失/空/超长一律 400，无豁免分支——H3b 修复）。
+    let padding_value = extract_padding_value(&req, ctx);
+    let range = ctx.config.get_normalized_x_padding_bytes();
+    let method =
+        if ctx.config.x_padding_obfs_mode { ctx.config.x_padding_method.as_str() } else { PADDING_METHOD_REPEAT_X };
+    if !is_padding_valid(&padding_value, range.from, range.to, method) {
         return status_response(StatusCode::BAD_REQUEST);
     }
+    // Go hub.go:217 `obfsPaddingAccepted := h.config.XPaddingObfsMode && paddingValue != ""`
+    let obfs_padding_accepted = ctx.config.x_padding_obfs_mode && !padding_value.is_empty();
+    let has_referer = req
+        .headers()
+        .get("Referer")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| !s.is_empty());
 
     // 6. 分发
     let is_uplink = match *req.method() {
@@ -126,7 +160,8 @@ where
 
     if is_uplink && !meta.session_id.is_empty() {
         if meta.seq_str.is_empty() {
-            handle_stream_up(req, &meta.session_id, ctx).await
+            handle_stream_up(req, &meta.session_id, ctx, has_referer, obfs_padding_accepted)
+                .await
         } else {
             handle_packet_up(req, &meta.session_id, &meta.seq_str, ctx).await
         }
@@ -135,6 +170,88 @@ where
     } else {
         status_response(StatusCode::METHOD_NOT_ALLOWED)
     }
+}
+
+/// 从请求提取 padding 值。对应 Go `Config.ExtractXPaddingFromRequest`
+/// （xpadding.go:244-317）：
+/// - obfs 模式：cookie(key) → header/queryInHeader → URL query(key)
+/// - 非 obfs：Referer 非空取其 query 的 `x_padding`；否则取请求 URL query 的
+///   `x_padding`（H3b：此前无 Referer / 无 padding 直接放行，与 Go 相反）。
+fn extract_padding_value<B>(req: &Request<B>, ctx: &HandlerContext) -> String
+where
+    B: hyper::body::Body<Data = Bytes>,
+{
+    if !ctx.config.x_padding_obfs_mode {
+        let referer = req.headers().get("Referer").and_then(|v| v.to_str().ok());
+        match referer {
+            Some(r) if !r.is_empty() => return extract_query_value(r, "x_padding"),
+            _ => {
+                let url = req.uri().to_string();
+                return extract_query_value(&url, "x_padding");
+            }
+        }
+    }
+    extract_obfs_padding(req.headers(), req.uri(), ctx.config.as_ref())
+}
+
+/// 响应侧 X-Padding 注入。对应 Go `hub.go:110-131` +
+/// `ApplyXPaddingToResponse`（xpadding.go:230-242）：每个通过 host/path 校验的
+/// 响应都带（非 obfs 固定 `X-Padding` header placement；obfs 按配置 placement）。
+fn apply_xpadding_to_response(
+    mut resp: Response<BoxBody<Bytes, io::Error>>,
+    ctx: &HandlerContext,
+) -> Response<BoxBody<Bytes, io::Error>> {
+    let range = ctx.config.get_normalized_x_padding_bytes();
+    let length = range.rand();
+    let (placement, key, header) = if ctx.config.x_padding_obfs_mode {
+        let placement = if ctx.config.x_padding_placement.is_empty() {
+            PLACEMENT_QUERY_IN_HEADER
+        } else {
+            ctx.config.x_padding_placement.as_str()
+        };
+        let key =
+            if ctx.config.x_padding_key.is_empty() { "x_padding" } else { ctx.config.x_padding_key.as_str() };
+        let header = if ctx.config.x_padding_header.is_empty() {
+            "Referer"
+        } else {
+            ctx.config.x_padding_header.as_str()
+        };
+        (placement, key, header)
+    } else {
+        // Go hub.go:124-130 非 obfs 固定 header placement + "X-Padding"。
+        (PLACEMENT_HEADER, "x_padding", "X-Padding")
+    };
+    let method =
+        if ctx.config.x_padding_obfs_mode { ctx.config.x_padding_method.as_str() } else { PADDING_METHOD_REPEAT_X };
+    let padding = generate_padding(method, length);
+    if length <= 0 || padding.is_empty() {
+        return resp;
+    }
+    let h = resp.headers_mut();
+    match placement {
+        PLACEMENT_HEADER => {
+            if let (Ok(name), Ok(val)) = (header.parse::<http::HeaderName>(), padding.parse()) {
+                h.insert(name, val);
+            }
+        }
+        // Go ApplyXPaddingToHeader queryInHeader 分支：RawURL 服务端未设置 →
+        // url.Parse("") 得空 URL → u.RawQuery=key=padding → u.String() = "?key=padding"。
+        PLACEMENT_QUERY_IN_HEADER => {
+            let val = format!("?{key}={padding}");
+            if let (Ok(name), Ok(val)) = (header.parse::<http::HeaderName>(), val.parse()) {
+                h.insert(name, val);
+            }
+        }
+        PLACEMENT_COOKIE => {
+            let val = format!("{key}={padding}; Path=/");
+            if let Ok(val) = val.parse() {
+                h.insert(http::header::SET_COOKIE, val);
+            }
+        }
+        // query placement：Go 响应侧 switch 无该分支（恒无操作）。
+        _ => {}
+    }
+    resp
 }
 
 async fn handle_packet_up<B>(
@@ -178,6 +295,8 @@ async fn handle_stream_up<B>(
     req: Request<B>,
     session_id: &str,
     ctx: &HandlerContext,
+    has_referer: bool,
+    obfs_padding_accepted: bool,
 ) -> Response<BoxBody<Bytes, io::Error>>
 where
     B: hyper::body::Body<Data = Bytes> + Send + Unpin + BodyExt + 'static,
@@ -200,7 +319,33 @@ where
         queue.close().await;
     });
 
-    let mut resp = status_response(StatusCode::OK);
+    // H3c：服务端 X 填充流（Go hub.go:219-232——Referer 非空或 obfs padding 被
+    // 接受时，每 `scStreamUpServerSecs.rand()` 秒向下行写 `rand()` 个 'X'）。
+    // 无填充条件时 tx 立即 drop → body 空流（行为同旧实现）。
+    let sc_secs = ctx.config.normalized_sc_stream_up_server_secs();
+    let (tx, rx) = tokio::sync::mpsc::channel::<io::Result<Frame<Bytes>>>(4);
+    if (has_referer || obfs_padding_accepted) && sc_secs.to > 0 {
+        let range = ctx.config.get_normalized_x_padding_bytes();
+        tokio::spawn(async move {
+            loop {
+                let n = range.rand().max(0) as usize;
+                if tx.send(Ok(Frame::data(Bytes::from(vec![b'X'; n])))).await.is_err() {
+                    break;
+                }
+                let secs = sc_secs.rand();
+                if secs > 0 {
+                    tokio::time::sleep(std::time::Duration::from_secs(secs as u64)).await;
+                }
+            }
+        });
+    }
+    let fill_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let body = StreamBody::new(fill_stream).boxed();
+
+    let mut resp = Response::builder()
+        .status(StatusCode::OK)
+        .body(body)
+        .unwrap_or_else(|_| status_response(StatusCode::INTERNAL_SERVER_ERROR));
     resp.headers_mut()
         .insert("X-Accel-Buffering", "no".parse().unwrap());
     resp.headers_mut()
@@ -409,37 +554,6 @@ fn extract_cookie_payload(headers: &HeaderMap, key: &str) -> Vec<u8> {
     } else {
         base64url_decode(&encoded).unwrap_or_default()
     }
-}
-
-/// 校验 padding。obfs 模式对齐 Go hub.go:141-148：按 XPaddingPlacement 提取
-/// （cookie → header/queryInHeader → query），空值或长度不合法一律 400；
-/// 非 obfs 保持既有 Referer/x_padding query 宽松校验（历史行为，客户端不
-/// 强制带 padding）。
-fn validate_padding<B>(req: &Request<B>, ctx: &HandlerContext) -> bool
-where
-    B: hyper::body::Body<Data = Bytes> + Send + Unpin + BodyExt + 'static,
-    B::Error: Send + Into<Box<dyn std::error::Error + Send + Sync>>,
-{
-    let range = ctx.config.get_normalized_x_padding_bytes();
-    if ctx.config.x_padding_obfs_mode {
-        let padding = extract_obfs_padding(req.headers(), req.uri(), ctx.config.as_ref());
-        return is_padding_valid(&padding, range.from, range.to, &ctx.config.x_padding_method);
-    }
-    let referer = match req.headers().get("Referer").and_then(|v| v.to_str().ok()) {
-        Some(r) => r,
-        None => return true, // 无 Referer 不校验
-    };
-    // 提取 x_padding query value
-    let padding_val = extract_query_value(referer, "x_padding");
-    if padding_val.is_empty() {
-        return true; // 无 padding 不校验
-    }
-    is_padding_valid(
-        &padding_val,
-        range.from,
-        range.to,
-        PADDING_METHOD_REPEAT_X,
-    )
 }
 
 /// obfs 模式 padding 提取。对应 Go `Config.ExtractXPaddingFromRequest` obfs
@@ -763,6 +877,105 @@ mod tests {
     struct NoopConnHandler;
     impl HubConnHandler for NoopConnHandler {
         fn add_conn(&self, _conn: ServerConn) {}
+    }
+
+    fn make_ctx(host: &str) -> HandlerContext {
+        HandlerContext {
+            config: Arc::new(Config::default()),
+            host: host.into(),
+            base_path: String::new(),
+            local_addr: "127.0.0.1:1".parse().unwrap(),
+            sessions: Arc::new(SessionMap::new()),
+            conn_handler: Arc::new(NoopConnHandler),
+            max_buffered_posts: 16,
+            sc_max_each_post_bytes: 1024 * 1024,
+        }
+    }
+
+    fn plain_request(
+        method: Method,
+        uri: &str,
+        host: &str,
+        referer: Option<String>,
+    ) -> Request<Full<Bytes>> {
+        let mut b = Request::builder().method(method).uri(uri).header("Host", host);
+        if let Some(r) = referer {
+            b = b.header("Referer", r);
+        }
+        b.body(Full::new(Bytes::new())).unwrap()
+    }
+
+    // ===== H2：Host 校验（Go IsValidHTTPHost 精确匹配语义）=====
+
+    /// H2 回归：双向 contains 子串匹配下 `notevil.example.com` 绕过
+    /// `evil.example.com` 拦截；精确匹配后必须 404。旧实现此测试失败。
+    #[tokio::test]
+    async fn h2_substring_host_bypass_blocked() {
+        let ctx = make_ctx("evil.example.com");
+        let req = plain_request(Method::OPTIONS, "/x", "notevil.example.com", None);
+        let resp = dispatch_request(req, "127.0.0.1:2".parse().unwrap(), &ctx).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "substring host must NOT pass");
+    }
+
+    /// H2 回归：带端口/大小写 Host 过闸（Go lowercase + SplitHostPort 剥端口）。
+    /// 旧实现 `c.host == req_host` 对 `Example.com:8443` 误 404。
+    #[tokio::test]
+    async fn h2_host_with_port_and_case_passes() {
+        let ctx = make_ctx("example.com");
+        let req = plain_request(Method::OPTIONS, "/x", "Example.com:8443", None);
+        let resp = dispatch_request(req, "127.0.0.1:2".parse().unwrap(), &ctx).await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND, "port/case variants must pass host gate");
+    }
+
+    // ===== H3：X-Padding 三重偏离 =====
+
+    /// H3a 回归：通过 host/path 校验的响应必带 X-Padding（Go hub.go:110-131 每
+    /// 响应注入；旧实现响应永无 padding——JA4H 级指纹）。OPTIONS 200 也带。
+    #[tokio::test]
+    async fn h3a_response_carries_x_padding_header() {
+        let ctx = make_ctx("");
+        let req = plain_request(Method::OPTIONS, "/x", "h", None);
+        let resp = dispatch_request(req, "127.0.0.1:2".parse().unwrap(), &ctx).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let pad = resp.headers().get("X-Padding").expect("X-Padding must be present");
+        let n = pad.to_str().unwrap().len();
+        let range = ctx.config.get_normalized_x_padding_bytes();
+        assert!(
+            n >= range.from as usize && n <= range.to as usize,
+            "padding len {n} must be within [{}, {}]", range.from, range.to
+        );
+    }
+
+    /// H3b 回归：非 obfs 无 Referer 且 URL 无 x_padding → 400（Go
+    /// IsPaddingValid 空值即 false；旧实现放行裸请求直达业务层）。
+    #[tokio::test]
+    async fn h3b_missing_padding_rejected() {
+        let ctx = make_ctx("");
+        // OPTIONS 在 padding 校验之前放行（Go 同），用 GET 验证 padding 门。
+        let req = Request::builder().method(Method::GET).uri("/x").header("Host", "h")
+            .body(Full::new(Bytes::new())).unwrap();
+        let resp = dispatch_request(req, "127.0.0.1:2".parse().unwrap(), &ctx).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "missing padding must be 400");
+    }
+
+    /// H3b 对照：Referer 携带合法长度 padding → 通过 padding 门（进到分发层，
+    /// 非 400）。
+    #[tokio::test]
+    async fn h3b_valid_referer_padding_passes() {
+        let ctx = make_ctx("");
+        let referer = format!("https://ref.example/page?x_padding={}", "X".repeat(200));
+        let req = plain_request(Method::GET, "/x", "h", Some(referer));
+        let resp = dispatch_request(req, "127.0.0.1:2".parse().unwrap(), &ctx).await;
+        assert_ne!(resp.status(), StatusCode::BAD_REQUEST, "valid padding must pass gate");
+    }
+
+    /// H3b 边界：Referer 存在但无 x_padding 参数 → 空值 → 400（Go 无豁免）。
+    #[tokio::test]
+    async fn h3b_referer_without_padding_rejected() {
+        let ctx = make_ctx("");
+        let req = plain_request(Method::GET, "/x", "h", Some("https://ref.example/page".into()));
+        let resp = dispatch_request(req, "127.0.0.1:2".parse().unwrap(), &ctx).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     /// 票 ikzy：GET 响应 body drop（客户端断开 / 流结束）即删会话，

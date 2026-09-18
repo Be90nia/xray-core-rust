@@ -76,6 +76,9 @@ pub struct Client {
     pub act_prior: bool,
     /// ActUnprior 标记。
     pub act_unprior: bool,
+    /// per-client `queryStrategy=USE_SYS`（Go `Client.checkSystem`）——查询时
+    /// 按系统路由可达性钳制族选项，而非 AND 静态 `ip_option`（bd rofg③）。
+    pub check_system: bool,
 }
 
 /// 单个 NameServer 的 proto 配置（手写等价 Go `NameServer` proto message）。
@@ -111,6 +114,11 @@ pub struct NameServerConfig {
     pub negative_ttl_secs: Option<u32>,
     /// 查询策略覆写（None 表示跟随全局）。
     pub query_strategy: Option<QueryStrategy>,
+    /// `+local` 后缀标记：强制直连拨号（绕过共享 dialer）。对应 Go
+    /// nameserver.go:51-61 传 nil dispatcher 的 Local mode——防 DNS 查询经
+    /// 路由进 proxy（防回环/防污染）。修复前后缀被剥后与 remote 共用
+    /// dialer，语义丢失（bd wmdn②）。
+    pub force_local: bool,
     /// 策略 ID。
     pub policy_id: u32,
     /// 期望 IP 规则（CIDR / geoip）。对应 Go `ExpectedIp`。
@@ -136,6 +144,7 @@ impl Default for NameServerConfig {
             serve_expired_ttl: None,
             negative_ttl_secs: None,
             query_strategy: None,
+            force_local: false,
             policy_id: 0,
             expected_ip_rules: Vec::new(),
             unexpected_ip_rules: Vec::new(),
@@ -182,6 +191,8 @@ impl Client {
             policy_id: ns.policy_id,
             act_prior: ns.act_prior,
             act_unprior: ns.act_unprior,
+            // Go nameserver.go:145 `checkSystem := ns.QueryStrategy == QueryStrategy_USE_SYS`。
+            check_system: matches!(ns.query_strategy, Some(QueryStrategy::UseSys)),
             // matcher 构建失败 → 启动报错（Go BuildIPMatcher 错误上抛，
             // 此前静默 None 使 expectedIPs 过滤整体失效）。
             expected_ips: build_ip_matcher(&ns.expected_ip_rules)?,
@@ -199,10 +210,21 @@ impl Client {
         domain: &'a str,
         option: IpOption,
     ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>> {
-        let option = IpOption {
-            ipv4_enable: option.ipv4_enable && self.ip_option.ipv4_enable,
-            ipv6_enable: option.ipv6_enable && self.ip_option.ipv6_enable,
-            ..option
+        // Go nameserver.go:168-176：per-client UseSys → 按系统路由可达性钳制；
+        // 其余策略 → 与 client 静态 ip_option AND。
+        let option = if self.check_system {
+            let (support_v4, support_v6) = crate::server::check_routes();
+            IpOption {
+                ipv4_enable: option.ipv4_enable && support_v4,
+                ipv6_enable: option.ipv6_enable && support_v6,
+                ..option
+            }
+        } else {
+            IpOption {
+                ipv4_enable: option.ipv4_enable && self.ip_option.ipv4_enable,
+                ipv6_enable: option.ipv6_enable && self.ip_option.ipv6_enable,
+                ..option
+            }
         };
         if !option.ipv4_enable && !option.ipv6_enable {
             return Box::pin(async { Err(DnsError::EmptyResponse) });
@@ -301,8 +323,12 @@ pub fn new_server_with_config(
     }
 
     let (scheme_raw, rest) = url.split_once("://").unwrap_or(("", url));
-    // "+local" 后缀（Go 经 dispatcher vs 直连）：Rust DNS 拨号均直连，语义等价 → 剥后缀
+    // "+local" 后缀：Go 传 nil dispatcher 强制直连（nameserver.go:51-61）。
+    // 标记进 cfg 流入各 server，拨号时绕过共享 dialer——修复前后缀被剥后
+    // 与 remote 共用 dialer，可经路由进 proxy（bd wmdn②）。
+    let force_local = scheme_raw.ends_with("+local");
     let scheme = scheme_raw.strip_suffix("+local").unwrap_or(scheme_raw);
+    cfg.force_local = force_local;
 
     let default_port = match scheme {
         "" | "tcp" => 53u16,
