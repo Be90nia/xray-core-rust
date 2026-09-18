@@ -80,7 +80,9 @@ pub enum RealityError {
     #[error("REALITY: short_id not in whitelist")]
     ShortIdNotAllowed,
 
-    /// key_share extension 缺失或不含 X25519 (group 0x001d) 条目——无法完成 REALITY 验证。
+    /// key_share extension 缺失或不含合格 X25519MLKEM768 组合（sb6g 对齐 Go
+    /// tls.go:233-235：纯 X25519 单 share、MLKEM 顺序颠倒、重复 MLKEM entry
+    /// 均视为 outdated/strange ClientHello reject→forward）。
     #[error("REALITY: key_share extension missing or no X25519 entry")]
     NoKeyShareX25519,
 
@@ -110,6 +112,12 @@ pub enum RealityError {
     /// fs0o/ft0g: 解密 payload 的 ClientVer 高于配置的 `max_client_ver`。
     #[error("REALITY: client version too new")]
     ClientVersionTooNew,
+
+    /// 49i9：客户端配了 `mldsa65Verify` 但所选指纹走 watfaq-rustls fallback——
+    /// 该栈没有 mldsa65 证书扩展验签钩子，静默跳过 = fail-open。配置期已拒
+    /// （register.rs），此变体兜底 `UConnState` 字面构造等绕过路径，防降级为明文验证。
+    #[error("REALITY: mldsa65Verify requires a btls-supported fingerprint (watfaq-rustls fallback path cannot verify mldsa65)")]
+    Mldsa65VerifyNeedsBtlsFingerprint,
 }
 
 /// REALITY crate 统一 Result 别名。

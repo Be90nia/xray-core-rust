@@ -132,7 +132,8 @@ pub fn make_dial_fn(config: Arc<TrojanOutboundConfig>) -> DialFn {
                 network,
                 &target_addr,
                 target_port,
-            );
+            )
+            .map_err(|e| format!("trojan write header: {e}"))?;
 
             // 3. 写头到连接
             conn.write_all(&header)
@@ -189,7 +190,8 @@ impl AsyncWrite for TrojanUdpFramedConn {
         // 2. 构造新帧并整帧写出
         let chunk = &buf[..buf.len().min(crate::protocol::MAX_LENGTH)];
         this.wpending = Vec::with_capacity(chunk.len() + 32);
-        crate::protocol::write_udp_packet(&mut this.wpending, &this.addr, this.port, chunk);
+        crate::protocol::write_udp_packet(&mut this.wpending, &this.addr, this.port, chunk)
+            .map_err(|e| io::Error::other(format!("trojan udp: {e}")))?;
         this.wpos = 0;
         while this.wpos < this.wpending.len() {
             let n = std::task::ready!(
@@ -332,7 +334,7 @@ mod tests {
 
         // server 回一帧 → framed.read 剥帧得 payload
         let mut resp = Vec::new();
-        crate::protocol::write_udp_packet(&mut resp, &addr, 53, b"answer-payload");
+        crate::protocol::write_udp_packet(&mut resp, &addr, 53, b"answer-payload").unwrap();
         server_side.write_all(&resp).await.unwrap();
         let mut out = vec![0u8; 128];
         let rn = framed.read(&mut out).await.unwrap();

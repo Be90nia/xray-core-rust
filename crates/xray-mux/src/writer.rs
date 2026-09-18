@@ -11,7 +11,6 @@ use xray_buf::writer::BufferedWriter;
 use xray_buf::io::{self as buf_io, Writer};
 use xray_common::bitmask::Bitmask;
 use xray_common::net::destination::Destination;
-use xray_common::serial;
 
 use crate::frame::{FrameMetadata, MuxError, SessionStatus, OPTION_DATA, OPTION_ERROR};
 use crate::session::TransferType;
@@ -218,10 +217,24 @@ async fn write_meta_with_frame(
     data: MultiBuffer,
 ) -> Result<(), MuxError> {
     let data_len = data.len() as u16;
-    let mut vec = Vec::new();
-    meta.write_to(&mut vec).map_err(|e| MuxError::Io(format!("meta: {:?}", e)))?;
-    vec.extend_from_slice(&serial::write_uint16(data_len));
-    let frame = Buffer::from_vec(vec);
+    // 直序进池化 Buffer（wfx8-3，对齐 Go FrameMetadata.WriteTo(buf.Buffer) 直写
+    // 形态）：免每数据帧一次 Vec 分配 + Buffer::from_vec 的二次拷贝。to_bytes
+    // 内部的既有分配不在本票范围。
+    let meta_bytes = meta
+        .to_bytes()
+        .map_err(|e| MuxError::Io(format!("meta: {:?}", e)))?;
+    let mut frame = Buffer::new();
+    {
+        let spare = frame.writable_bytes();
+        let n = meta_bytes.len() + 2;
+        assert!(
+            n <= spare.len(),
+            "mux meta + length exceeds buffer writable capacity"
+        );
+        spare[..meta_bytes.len()].copy_from_slice(&meta_bytes);
+        spare[meta_bytes.len()..n].copy_from_slice(&data_len.to_be_bytes());
+        frame.advance_write(n);
+    }
     let mut mb = MultiBuffer::with_capacity(data.buffer_count() + 1);
     mb.push(frame);
     for buf in data.into_buffers() { mb.push(buf); }

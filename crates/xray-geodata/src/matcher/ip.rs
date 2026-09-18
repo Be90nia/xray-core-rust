@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;
 
-use crate::pb::{self, Cidr, GeoIpRule, IpRule};
+use crate::pb::{self, Cidr, IpRule};
 
 // ── 常量 ────────────────────────────────────────────────────────
 
@@ -229,8 +229,11 @@ impl IPSet {
                 if prefix == 0 {
                     max4 = IPV4_MATCH_ALL;
                 } else if max4 != IPV4_MATCH_ALL
-                    && (prefix < max4 || max4 == IPV4_NO_ENTRIES)
+                    && (prefix > max4 || max4 == IPV4_NO_ENTRIES)
                 {
+                    // 存**最细**前缀（Go BuildIPSet：`b > max4`，ip_matcher.go:922）。
+                    // 启发式桶门控要求全部前缀 ≤24，即最细 ≤24；存最小（最粗）
+                    // 会让含 /32 的 geo 集合误开桶记忆化（bd 5dzf）。
                     max4 = prefix;
                 }
                 ipv4_ranges.push(net.range());
@@ -244,7 +247,7 @@ impl IPSet {
                 if prefix == 0 {
                     max6 = IPV6_MATCH_ALL;
                 } else if max6 != IPV6_MATCH_ALL
-                    && (prefix < max6 || max6 == IPV6_NO_ENTRIES)
+                    && (prefix > max6 || max6 == IPV6_NO_ENTRIES)
                 {
                     max6 = prefix;
                 }
@@ -380,11 +383,14 @@ impl HeuristicIPMatcher {
         }
     }
 
+    // 桶记忆化正确性前提：集合内全部前缀 ≤ 桶宽（/24、/64）。max4/max6 存
+    // 最细前缀（from_cidrs），NO_ENTRIES(0xff)/MATCH_ALL(0xfe) 均 >24/64 自然
+    // 排除——与 Go AnyMatch 门控 `m.ipset.max4 <= 24` 逐字对齐（ip_matcher.go:149）。
     fn heuristic_v4(&self) -> bool {
-        self.ipset.max4() <= 24 && self.ipset.max4() != IPV4_NO_ENTRIES
+        self.ipset.max4() <= 24
     }
     fn heuristic_v6(&self) -> bool {
-        self.ipset.max6() <= 64 && self.ipset.max6() != IPV6_NO_ENTRIES
+        self.ipset.max6() <= 64
     }
 
     /// 获取内部 IPSet 的引用。
@@ -586,29 +592,6 @@ impl IPSetFactory {
         Self { cache: Mutex::new(HashMap::new()) }
     }
 
-    /// 从 GeoIP 规则获取或创建 IPSet。
-    ///
-    /// 先计算缓存 key，若命中则返回克隆，否则创建后缓存。
-    pub fn get_or_create_from_geoip_rules(
-        &self,
-        rules: &[GeoIpRule],
-    ) -> IPSet {
-        let key = build_geoip_rules_key(rules);
-        {
-            let cache = self.cache.lock().expect("IPSetFactory lock poisoned");
-            if let Some(ipset) = cache.get(&key) {
-                return ipset.clone();
-            }
-        }
-        let cidrs = collect_cidrs_from_rules(rules);
-        let ipset = IPSet::from_cidrs(&cidrs);
-        {
-            let mut cache = self.cache.lock().expect("IPSetFactory lock poisoned");
-            cache.insert(key, ipset.clone());
-        }
-        ipset
-    }
-
     /// 从 CIDR 列表创建 IPSet 并缓存。
     pub fn create_from_cidrs(&self, key: &str, cidrs: &[Cidr]) -> IPSet {
         {
@@ -628,30 +611,6 @@ impl IPSetFactory {
 
 impl Default for IPSetFactory {
     fn default() -> Self { Self::new() }
-}
-
-/// 构建 GeoIP 规则缓存 key。
-///
-/// 按 File+Code 排序去重，拼接为 "file:code,file:code" 格式。
-fn build_geoip_rules_key(rules: &[GeoIpRule]) -> String {
-    let mut pairs: Vec<(String, String)> = rules
-        .iter()
-        .map(|r| (r.file.clone(), r.code.clone()))
-        .collect();
-    pairs.sort();
-    pairs.dedup();
-    pairs
-        .iter()
-        .map(|(f, c)| format!("{f}:{c}"))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// 从 GeoIP 规则列表收集所有 CIDR。
-fn collect_cidrs_from_rules(_rules: &[GeoIpRule]) -> Vec<Cidr> {
-    // GeoIpRule 只有 file/code/reverse_match，
-    // 实际使用中需要从外部 GeoIP 数据加载 CIDR
-    Vec::new()
 }
 
 // ── 构建优化匹配器 ─────────────────────────────────────────────
@@ -802,7 +761,8 @@ mod tests {
         let ipset = IPSet::from_cidrs(&cidrs);
         assert!(!ipset.is_empty_v4());
         assert!(ipset.is_empty_v6());
-        assert_eq!(ipset.max4(), 8);
+        // max4 存最细前缀（/16 与 /8 之最细 = 16），供桶门控 max<=24 判定。
+        assert_eq!(ipset.max4(), 16);
 
         assert!(ipset.contains_v4(Ipv4Addr::new(192, 168, 1, 1)));
         assert!(ipset.contains_v4(Ipv4Addr::new(10, 0, 0, 1)));
@@ -913,6 +873,29 @@ mod tests {
         let matcher = HeuristicIPMatcher::from_cidrs(&[]);
         assert!(!matcher.match_ip(IpAddr::from([192, 168, 1, 1])));
         assert!(!matcher.any_match(&[IpAddr::from([10, 0, 0, 1])]));
+    }
+
+    /// 5dzf 回归：集合含 /32（最细前缀 > 24）时必须禁用桶记忆化。
+    ///
+    /// 旧实现 max4 存最小（最粗）前缀 /8 ≤ 24 → 启发式误开：同一 /24 桶内
+    /// 首个未命中 IP 会把后续 IP 短路成同结果——any_match([1.2.3.4, 1.2.3.5])
+    /// 漏判、matches([1.2.3.5, 1.2.3.4]) 误判。
+    #[test]
+    fn heuristic_bucket_memoization_disabled_with_fine_prefix() {
+        let cidrs = vec![
+            Cidr::new(vec![10, 0, 0, 0], 8),
+            Cidr::new(vec![1, 2, 3, 5], 32),
+        ];
+        let matcher = HeuristicIPMatcher::from_cidrs(&cidrs);
+        let miss_first = [IpAddr::from([1, 2, 3, 4]), IpAddr::from([1, 2, 3, 5])];
+        let hit_first = [IpAddr::from([1, 2, 3, 5]), IpAddr::from([1, 2, 3, 4])];
+        // 同桶内首失后有命中 → any_match 必须真
+        assert!(matcher.any_match(&miss_first));
+        // 同桶内首中后有未命中 → matches 必须假、any_match 仍真
+        assert!(!matcher.matches(&hit_first));
+        assert!(matcher.any_match(&hit_first));
+        // 修正后门控关闭：filter_ips 等价逐 IP 线性匹配
+        assert_eq!(matcher.filter_ips(&miss_first), vec![IpAddr::from([1, 2, 3, 5])]);
     }
 
     // ── IPSetFactory 测试 ────────────────────────────────────

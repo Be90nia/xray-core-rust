@@ -130,6 +130,19 @@ fn parse_reality_config(json: Option<&serde_json::Value>) -> io::Result<RealityC
             format!("reality: invalid publicKey base64: {public_key_b64}"),
         )
     })?;
+    // 49i9：X25519 publicKey 必须 32B——非 32B 会话 fallback 路径 panic / btls
+    // 主路径永不匹配。Go 端 UClient 握手期硬错（reality.go：ecdh.X25519()
+    // .NewPublicKey(config.PublicKey) err → "REALITY: publicKey == nil"），
+    // 此处前置到配置期拒启（fail-fast，语义同向）。
+    if public_key.len() != crate::config::X25519_KEY_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "reality: invalid publicKey: need 32B X25519 key, got {}B",
+                public_key.len()
+            ),
+        ));
+    }
     let short_id = if short_id_str.is_empty() {
         Vec::new()
     } else {
@@ -160,6 +173,27 @@ fn parse_reality_config(json: Option<&serde_json::Value>) -> io::Result<RealityC
         }
         _ => Vec::new(),
     };
+    // 49i9：mldsa65Verify 只有 btls 主路径能验签（BtlsRealityHooks 捕获
+    // CH/SH 拼 mldsa65 消息）；watfaq-rustls fallback 无验签钩子，该组合
+    // 静默跳过验签 = fail-open。Go 端全指纹走 utls 均验签（fail-closed），
+    // 故配置期直接拒绝组合——比运行时静默降级影响小（取舍：改 watfaq fork
+    // 补验签钩子成本远超配置期拒绝，且该组合本就不可用）。
+    if !mldsa65_verify.is_empty() {
+        let fp = xray_tls::fingerprint::get_fingerprint(fingerprint).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("reality: unknown fingerprint: {fingerprint}"),
+            )
+        })?;
+        if !xray_tls::btls_client::fingerprint_supported(&fp) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "reality: mldsa65Verify requires a btls-supported fingerprint, got \"{fingerprint}\" (watfaq-rustls fallback path cannot verify mldsa65)"
+                ),
+            ));
+        }
+    }
     // 257w：spiderX → SpiderY 行为参数（Go transport_security.go:214-242）。
     // 默认 "/"；必须以 '/' 开头；query 参数 p/c/t/i/r（单值或 a-b 区间）写入
     // spider_y[10] 对应槽位（解析失败取 0 对齐 Go `_, _ :=`），消费后从 query 剔除。
@@ -424,6 +458,74 @@ mod tests {
         });
         let err = parse_reality_config(Some(&json)).unwrap_err();
         assert!(err.to_string().contains("mldsa65Verify"), "got: {err}");
+    }
+
+    /// 49i9：非 32B publicKey 配置期拒启（Go UClient 握手期硬错
+    /// "REALITY: publicKey == nil" 的 fail-fast 前置）。
+    #[test]
+    fn parse_reality_config_rejects_non_32b_public_key() {
+        // 31B → 拒
+        let json = serde_json::json!({
+            "serverName": "a.com",
+            "publicKey": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 31]),
+        });
+        let err = parse_reality_config(Some(&json)).unwrap_err();
+        assert!(
+            err.to_string().contains("need 32B X25519 key, got 31B"),
+            "got: {err}"
+        );
+        // 33B → 拒
+        let json = serde_json::json!({
+            "serverName": "a.com",
+            "publicKey": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 33]),
+        });
+        let err = parse_reality_config(Some(&json)).unwrap_err();
+        assert!(err.to_string().contains("got 33B"), "got: {err}");
+        // password 别名路径同样校验
+        let json = serde_json::json!({
+            "serverName": "a.com",
+            "password": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 16]),
+        });
+        let err = parse_reality_config(Some(&json)).unwrap_err();
+        assert!(err.to_string().contains("got 16B"), "got: {err}");
+    }
+
+    /// 49i9：mldsa65Verify + 非 btls 指纹（watfaq-rustls fallback，无验签钩子）
+    /// 组合配置期拒启——堵 fail-open（Go 全指纹走 utls 均验签）。
+    ///
+    /// 注：`unsafe` 是唯一 get_fingerprint 认识但 btls 清单外的预设
+    /// （connector_for_fingerprint → Some(Err) → fingerprint_supported=false，
+    /// u_client 走 watfaq fallback）；randomizednoalpn 等现已被 btls 就近映射覆盖。
+    #[test]
+    fn parse_reality_config_rejects_mldsa65_with_fallback_fingerprint() {
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x5Au8; 1952]);
+        let json = serde_json::json!({
+            "serverName": "a.com",
+            "publicKey": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]),
+            "fingerprint": "unsafe", // btls 清单外 → fallback 路径
+            "mldsa65Verify": b64
+        });
+        let err = parse_reality_config(Some(&json)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("mldsa65Verify"), "got: {msg}");
+        assert!(msg.contains("unsafe"), "got: {msg}");
+        // 未知指纹名同样拒（无法保证验签能力）
+        let json = serde_json::json!({
+            "serverName": "a.com",
+            "publicKey": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]),
+            "fingerprint": "!!!unknown!!!",
+            "mldsa65Verify": b64
+        });
+        let err = parse_reality_config(Some(&json)).unwrap_err();
+        assert!(err.to_string().contains("unknown fingerprint"), "got: {err}");
+        // 对照：chrome（btls 支持）+ mldsa65Verify → 接受（既有测试覆盖，这里直证）
+        let json = serde_json::json!({
+            "serverName": "a.com",
+            "publicKey": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]),
+            "fingerprint": "chrome",
+            "mldsa65Verify": b64
+        });
+        parse_reality_config(Some(&json)).expect("chrome + mldsa65Verify accepted");
     }
 
     /// 257w：spiderX 默认 "/"、'/' 前缀硬错、p/c/t/i/r → spider_y 槽位

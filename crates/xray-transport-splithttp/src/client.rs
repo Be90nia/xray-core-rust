@@ -852,9 +852,11 @@ mod tests {
 
     // Windows loopback 上 h2 crate 偶发在 RST 帧刷出前断连（客户端见 EOF 而非
     // REFUSED_STREAM——EOF 按 Go canRetryError 语义不可重放，实现正确、mock 有
-    // 竞态），忽略防红灯；503 对照测试锁定"HTTP 错误不重放"，重放资格判定
-    // is_packet_replayable 与 Go shouldRetryRequest 逐分支对齐（见其文档）。
-    #[ignore = "mock RST flush race on Windows loopback; predicate + no-replay control covered by post_packet_http_error_does_not_replay"]
+    // 竞态），Windows 上忽略防红灯；503 对照测试锁定"HTTP 错误不重放"，重放
+    // 资格判定 is_packet_replayable 与 Go shouldRetryRequest 逐分支对齐（见其
+    // 文档）。iq1o⑨：ignore 收窄为 Windows-only——Linux/macOS 激活正向重放
+    // 回归守卫。
+    #[cfg_attr(windows, ignore = "mock RST flush race on Windows loopback; predicate + no-replay control covered by post_packet_http_error_does_not_replay")]
     #[tokio::test]
     async fn post_packet_replays_after_h2_stream_error() {
         // workspace feature unification 可能双 CryptoProvider 并存，

@@ -104,19 +104,28 @@ pub mod addr_type {
 }
 
 /// 把 `addr + port`（SOCKS5 格式）追加到 `out`，对应 Go `addrParser.WriteAddressPort`。
-pub fn write_address_port(out: &mut Vec<u8>, addr: &Address, port: u16) {
+///
+/// # Errors
+/// 域名超过 255 字节 → [`TrojanError::WriteAddress`]（对齐 Go
+/// `writeAddress` 的 `isDomainTooLong → "Super long domain is not supported"`
+/// 硬错；Rust 旧版截断前 255 字节会发出自洽但不可解析的畸形地址，iq1o⑩）。
+pub fn write_address_port(out: &mut Vec<u8>, addr: &Address, port: u16) -> Result<()> {
     match addr {
         Address::IPv4(v4) => {
             out.push(addr_type::IPV4);
             out.extend_from_slice(&v4.octets());
         }
         Address::Domain(domain) => {
-            out.push(addr_type::DOMAIN);
             let bytes = domain.as_bytes();
-            // 与 SS 一致：长度超过 255 截断（域名实际不会超）
-            let len = u8::try_from(bytes.len()).unwrap_or(255) as usize;
-            out.push(len as u8);
-            out.extend_from_slice(&bytes[..len]);
+            let Ok(len) = u8::try_from(bytes.len()) else {
+                return Err(TrojanError::WriteAddress(format!(
+                    "super long domain is not supported: {len_} bytes",
+                    len_ = bytes.len()
+                )));
+            };
+            out.push(addr_type::DOMAIN);
+            out.push(len);
+            out.extend_from_slice(bytes);
         }
         Address::IPv6(v6) => {
             out.push(addr_type::IPV6);
@@ -124,6 +133,7 @@ pub fn write_address_port(out: &mut Vec<u8>, addr: &Address, port: u16) {
         }
     }
     out.extend_from_slice(&port.to_be_bytes());
+    Ok(())
 }
 
 /// 从 `buf` 起始位置读 `addr + port`，返回 `(addr, port, consumed)`。
@@ -186,19 +196,20 @@ pub fn read_address_port(buf: &[u8]) -> Result<(Address, u16, usize)> {
 /// 对应 Go `ConnWriter.writeHeader`。`payload` 由调用方在调用此函数后另行写入。
 ///
 /// # Errors
-/// 仅在 `out.extend_from_slice` 失败时返回 [`TrojanError::WriteHeader`]（实际 Vec 不会失败）。
+/// 地址编码失败（域名超 255 字节）→ [`TrojanError::WriteAddress`]。
 pub fn write_request_header(
     out: &mut Vec<u8>,
     account: &MemoryAccount,
     network: Network,
     addr: &Address,
     port: u16,
-) {
+) -> Result<()> {
     out.extend_from_slice(&account.key);
     out.extend_from_slice(&CRLF);
     out.push(network.to_command());
-    write_address_port(out, addr, port);
+    write_address_port(out, addr, port)?;
     out.extend_from_slice(&CRLF);
+    Ok(())
 }
 
 // ============================================================================
@@ -219,15 +230,18 @@ pub const fn is_v1_hex_prefix(b: u8) -> bool {
 ///
 /// 草案无独立 cmd 字节（仅 TCP CONNECT 语义）且无尾部 CRLF——与 v1 不同，
 /// 见模块文档「trojan v2 草案」节。
+///
+/// # Errors
+/// 地址编码失败（域名超 255 字节）→ [`TrojanError::WriteAddress`]。
 pub fn write_request_header_v2(
     out: &mut Vec<u8>,
     key: &[u8; MD5_KEY_LEN],
     addr: &Address,
     port: u16,
-) {
+) -> Result<()> {
     out.push(V2_VERSION);
     out.extend_from_slice(key);
-    write_address_port(out, addr, port);
+    write_address_port(out, addr, port)
 }
 
 /// 解析 trojan v2 草案请求头：返回 `(addr, port, consumed)`，网络恒为 TCP。
@@ -311,6 +325,9 @@ pub fn parse_request_header(buf: &[u8]) -> Result<(Network, Address, u16, usize)
 ///
 /// 对应 Go `PacketWriter.writePacket`。返回写入的总字节数。
 ///
+/// # Errors
+/// 地址编码失败（域名超 255 字节）→ [`TrojanError::WriteAddress`]。
+///
 /// # 注意
 /// 调用方应保证 `payload.len() <= MAX_LENGTH`（与 Go 端一致，不在此强制）。
 pub fn write_udp_packet(
@@ -318,14 +335,14 @@ pub fn write_udp_packet(
     addr: &Address,
     port: u16,
     payload: &[u8],
-) -> usize {
+) -> Result<usize> {
     let start = out.len();
-    write_address_port(out, addr, port);
+    write_address_port(out, addr, port)?;
     let len = u16::try_from(payload.len()).unwrap_or(u16::MAX);
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(&CRLF);
     out.extend_from_slice(payload);
-    out.len() - start
+    Ok(out.len() - start)
 }
 
 /// 解析 UDP 单包：返回 `(addr, port, payload_slice, consumed)`。
@@ -432,7 +449,7 @@ mod tests {
     fn test_write_read_ipv4_port() {
         let mut out = Vec::new();
         let addr = Address::IPv4(Ipv4Addr::new(127, 0, 0, 1));
-        write_address_port(&mut out, &addr, 1234);
+        write_address_port(&mut out, &addr, 1234).expect("encode");
         // type(1) + 4 bytes + port(2) = 7
         assert_eq!(out.len(), 7);
         assert_eq!(out[0], addr_type::IPV4);
@@ -446,7 +463,7 @@ mod tests {
     fn test_write_read_ipv6_port() {
         let mut out = Vec::new();
         let addr = Address::IPv6(Ipv6Addr::LOCALHOST);
-        write_address_port(&mut out, &addr, 443);
+        write_address_port(&mut out, &addr, 443).expect("encode");
         // type(1) + 16 bytes + port(2) = 19
         assert_eq!(out.len(), 19);
         assert_eq!(out[0], addr_type::IPV6);
@@ -460,7 +477,7 @@ mod tests {
     fn test_write_read_domain_port() {
         let mut out = Vec::new();
         let addr = Address::Domain("example.com".into());
-        write_address_port(&mut out, &addr, 8080);
+        write_address_port(&mut out, &addr, 8080).expect("encode");
         // type(1) + len(1) + 11 bytes + port(2) = 15
         assert_eq!(out.len(), 15);
         assert_eq!(out[0], addr_type::DOMAIN);
@@ -476,6 +493,28 @@ mod tests {
             read_address_port(&[0x99]),
             Err(TrojanError::InvalidRemoteAddress)
         ));
+    }
+
+    /// iq1o⑩ 回归：域名 > 255 字节必须硬错（对齐 Go `writeAddress` 的
+    /// isDomainTooLong），不得截断前 255 字节发出畸形地址。
+    #[test]
+    fn test_write_address_rejects_domain_over_255() {
+        let mut out = Vec::new();
+        let addr = Address::Domain("d".repeat(256));
+        assert!(matches!(
+            write_address_port(&mut out, &addr, 443),
+            Err(TrojanError::WriteAddress(_))
+        ));
+        assert!(out.is_empty(), "failed encode must not leave partial bytes");
+
+        // 边界：恰好 255 字节合法
+        let mut out = Vec::new();
+        let addr = Address::Domain("d".repeat(255));
+        write_address_port(&mut out, &addr, 443).expect("255-byte domain is legal");
+        assert_eq!(out[0], addr_type::DOMAIN);
+        assert_eq!(out[1] as usize, 255);
+        let (a, _, _) = read_address_port(&out).expect("parse");
+        assert_eq!(a, addr);
     }
 
     #[test]
@@ -511,7 +550,7 @@ mod tests {
 
         // 写：header + payload
         let mut buf = Vec::new();
-        write_request_header(&mut buf, &account(), Network::Tcp, &addr, port);
+        write_request_header(&mut buf, &account(), Network::Tcp, &addr, port).expect("encode");
         buf.extend_from_slice(payload);
 
         // 读：header
@@ -531,7 +570,7 @@ mod tests {
         // 即便走 TCP 帧格式，command=UDP 时 network=Udp（对应 Go: cmd 字段决定）
         let addr = Address::IPv4(Ipv4Addr::new(127, 0, 0, 1));
         let mut buf = Vec::new();
-        write_request_header(&mut buf, &account(), Network::Udp, &addr, 53);
+        write_request_header(&mut buf, &account(), Network::Udp, &addr, 53).expect("encode");
         let (net, _, _, _) = parse_request_header(&buf).expect("parse");
         assert_eq!(net, Network::Udp);
     }
@@ -541,7 +580,7 @@ mod tests {
         // 少 1 字节 key 应失败
         let addr = Address::IPv4(Ipv4Addr::new(127, 0, 0, 1));
         let mut buf = Vec::new();
-        write_request_header(&mut buf, &account(), Network::Tcp, &addr, 80);
+        write_request_header(&mut buf, &account(), Network::Tcp, &addr, 80).expect("encode");
         buf.truncate(crate::config::HEX_KEY_LEN - 1);
         assert!(parse_request_header(&buf).is_err());
     }
@@ -557,7 +596,7 @@ mod tests {
         let port = 1234;
 
         let mut buf = Vec::new();
-        let n = write_udp_packet(&mut buf, &addr, port, payload);
+        let n = write_udp_packet(&mut buf, &addr, port, payload).expect("encode");
         assert!(n > 0);
 
         let (parsed_addr, parsed_port, parsed_payload, consumed) =
@@ -573,7 +612,7 @@ mod tests {
         let addr = Address::IPv4(Ipv4Addr::new(127, 0, 0, 1));
         // 构造一个 length 字段 = MAX_LENGTH + 1 的恶意包
         let mut buf = Vec::new();
-        write_address_port(&mut buf, &addr, 1234);
+        write_address_port(&mut buf, &addr, 1234).expect("encode");
         let oversize = (MAX_LENGTH + 1) as u16;
         buf.extend_from_slice(&oversize.to_be_bytes());
         buf.extend_from_slice(&CRLF);
@@ -589,7 +628,7 @@ mod tests {
         let addr = Address::IPv4(Ipv4Addr::new(127, 0, 0, 1));
         // 写完整包，然后截断 payload
         let mut buf = Vec::new();
-        write_udp_packet(&mut buf, &addr, 1234, b"hello world");
+        write_udp_packet(&mut buf, &addr, 1234, b"hello world").expect("encode");
         buf.truncate(buf.len() - 3); // 截掉最后 3 字节 payload
         assert!(matches!(
             parse_udp_packet(&buf),
@@ -602,7 +641,7 @@ mod tests {
         let payload = b"udp over domain";
         let addr = Address::Domain("trojan.example.com".into());
         let mut buf = Vec::new();
-        write_udp_packet(&mut buf, &addr, 443, payload);
+        write_udp_packet(&mut buf, &addr, 443, payload).expect("encode");
         let (a, p, pp, _) = parse_udp_packet(&buf).expect("parse");
         assert_eq!(a, addr);
         assert_eq!(p, 443);
@@ -617,7 +656,7 @@ mod tests {
     fn test_v2_header_ipv4_wire_format() {
         let mut out = Vec::new();
         let addr = Address::IPv4(Ipv4Addr::new(127, 0, 0, 1));
-        write_request_header_v2(&mut out, &[0xAA; MD5_KEY_LEN], &addr, 8080);
+        write_request_header_v2(&mut out, &[0xAA; MD5_KEY_LEN], &addr, 8080).expect("encode");
         // 逐字节：0x02 + 16B md5 + ATYP(0x01) + 4B IP + 2B BE port，无 CRLF
         assert_eq!(out.len(), 1 + 16 + 1 + 4 + 2);
         assert_eq!(out[0], 0x02);
@@ -636,7 +675,7 @@ mod tests {
     fn test_v2_header_domain_wire_format() {
         let mut out = Vec::new();
         let addr = Address::Domain("example.com".into());
-        write_request_header_v2(&mut out, &[0x11; MD5_KEY_LEN], &addr, 443);
+        write_request_header_v2(&mut out, &[0x11; MD5_KEY_LEN], &addr, 443).expect("encode");
         // 0x02 + 16B md5 + ATYP(0x03) + len(11) + domain + 2B BE port
         assert_eq!(out.len(), 1 + 16 + 1 + 1 + 11 + 2);
         assert_eq!(out[17], addr_type::DOMAIN);
@@ -654,7 +693,7 @@ mod tests {
     fn test_v2_header_ipv6_wire_format() {
         let mut out = Vec::new();
         let addr = Address::IPv6(Ipv6Addr::LOCALHOST);
-        write_request_header_v2(&mut out, &[0x22; MD5_KEY_LEN], &addr, 9);
+        write_request_header_v2(&mut out, &[0x22; MD5_KEY_LEN], &addr, 9).expect("encode");
         assert_eq!(out.len(), 1 + 16 + 1 + 16 + 2);
         assert_eq!(out[17], addr_type::IPV6);
 

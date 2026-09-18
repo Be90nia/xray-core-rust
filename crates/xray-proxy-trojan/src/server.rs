@@ -630,7 +630,16 @@ where
                 match r {
                     Ok(Some((source, payload))) => {
                         let mut packet = Vec::with_capacity(payload.len() + 32);
-                        write_udp_packet(&mut packet, source.address(), source.port().value(), &payload);
+                        if write_udp_packet(
+                            &mut packet,
+                            source.address(),
+                            source.port().value(),
+                            &payload,
+                        )
+                        .is_err()
+                        {
+                            break;
+                        }
                         if write_half.write_all(&packet).await.is_err() {
                             break;
                         }
@@ -923,7 +932,8 @@ mod tests {
             TrojanNetwork::Tcp,
             &dest_addr,
             echo_addr.port(),
-        );
+        )
+        .unwrap();
         let payload = b"hello trojan proxy!";
         header.extend_from_slice(payload);
         client.write_all(&header).await.unwrap();
@@ -1014,9 +1024,10 @@ mod tests {
             TrojanNetwork::Udp,
             &dest_addr,
             echo_addr.port(),
-        );
+        )
+        .unwrap();
         let payload = b"udp via dispatch";
-        write_udp_packet(&mut req, &dest_addr, echo_addr.port(), payload);
+        write_udp_packet(&mut req, &dest_addr, echo_addr.port(), payload).unwrap();
         client.write_all(&req).await.unwrap();
 
         // 5. 读回包帧（echo 经 freedom XUDP 回来）

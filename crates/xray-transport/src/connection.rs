@@ -84,8 +84,8 @@ pub trait Connection: AsyncRead + AsyncWrite + Send + Sync + Unpin {
     ///
     /// # 参数
     ///
-    /// - `bufs`：各缓冲的可写区（由 [`xray_buf::readv::buffer_iovecs`] 构建），
-    ///   返回字节数由调用方按序分发（[`xray_buf::readv::distribute`]）。
+    /// - `bufs`：各缓冲的可写区（TCP 实现经 `xray_buf::readv` 的零分配
+    ///   IovecBatch 栈数组路径构建）。
     fn poll_read_multi(
         &mut self,
         cx: &mut Context<'_>,

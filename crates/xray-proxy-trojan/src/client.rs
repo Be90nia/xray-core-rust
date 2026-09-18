@@ -70,7 +70,8 @@ impl ProxyOutbound for TrojanClient {
             network,
             dest.address(),
             dest.port().value(),
-        );
+        )
+        .map_err(|e| ProxymanError::Other(format!("trojan write header: {e}")))?;
 
         // 3. 写请求头到服务器连接
         server_conn
@@ -118,7 +119,7 @@ mod tests {
         );
 
         let mut header = Vec::new();
-        write_request_header(&mut header, &account, TrojanNetwork::Tcp, dest.address(), 80);
+        write_request_header(&mut header, &account, TrojanNetwork::Tcp, dest.address(), 80).unwrap();
 
         // 验证 header 格式：56字节key + CRLF + cmd + addr + CRLF
         assert!(header.len() > 56 + 2 + 1 + 1 + 2 + 2, "header too short: {}", header.len());
@@ -136,7 +137,7 @@ mod tests {
         );
 
         let mut header = Vec::new();
-        write_request_header(&mut header, &account, TrojanNetwork::Udp, dest.address(), 53);
+        write_request_header(&mut header, &account, TrojanNetwork::Udp, dest.address(), 53).unwrap();
 
         assert_eq!(header[58], 3, "COMMAND_UDP byte");
     }

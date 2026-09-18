@@ -705,7 +705,7 @@ mod udp_assoc_tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UdpSocket;
     use uuid::Uuid;
 
@@ -817,6 +817,31 @@ mod udp_assoc_tests {
                 use xray_buf::io::Reader;
                 let mut reader = link.reader;
                 while reader.read_multi_buffer().await.is_ok() {}
+            })
+        }
+    }
+
+    /// relay echo：link 数据原样写回（iq1o⑦：bi-stream relay 双向通路观测）。
+    #[derive(Debug)]
+    struct EchoHandler;
+
+    impl DispatchHandler for EchoHandler {
+        fn tag(&self) -> &str {
+            "echo"
+        }
+        fn dispatch(&self, _dest: &Destination, link: Link) -> PinFuture<()> {
+            Box::pin(async move {
+                use xray_buf::io::{Reader, Writer};
+                let mut reader = link.reader;
+                let mut writer = link.writer;
+                while let Ok(mb) = reader.read_multi_buffer().await {
+                    if mb.is_empty() {
+                        continue;
+                    }
+                    if writer.write_multi_buffer(mb).await.is_err() {
+                        break;
+                    }
+                }
             })
         }
     }
@@ -1056,25 +1081,32 @@ mod udp_assoc_tests {
         client.close(0u32.into(), b"");
     }
 
-    /// 票 7ykg：服务端带 hysteria_bbr CC 配置真建链——CC 预装经共享槽
+    /// 票 7ykg + iq1o⑦：服务端带 hysteria_bbr CC 配置真建链——CC 预装经共享槽
     /// [`HysteriaCCSlot`]，不得破坏 QUIC 握手 / Authenticate / bi-stream relay。
+    /// 原"名为 relays 实则零 relay 断言"（store 建而未读）→ EchoHandler 原样
+    /// 回写 + 客户端读回断言（对齐 928-935 的 timeout+expect+assert 形态）。
     #[tokio::test]
     async fn inbound_with_hysteria_bbr_cc_connects_and_relays() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let store = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
         let client = connect_inbound(
-            Arc::new(CaptureHandler(std::sync::Arc::clone(&store))),
+            Arc::new(EchoHandler),
             "cc-e2e",
             Some(CongestionControl::HysteriaBbr),
         )
         .await;
 
-        // bi stream Connect → 写数据（服务端 dispatch 消费）= relay 链路活
+        // bi stream Connect → 写数据 → dispatch echo 回来 = relay 双向活
         let mut conn = client
             .dial(Address::Domain("cc-e2e.invalid".to_string(), 443))
             .await
             .expect("dial over hysteria_bbr server");
         conn.send.write_all(b"ping").await.expect("write over relay");
+        let mut echoed = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(10), conn.recv.read_exact(&mut echoed))
+            .await
+            .expect("relay echo timed out")
+            .expect("read relay echo failed");
+        assert_eq!(echoed, *b"ping", "relay must carry payload back over bi stream");
         client.close(0u32.into(), b"");
     }
 }
