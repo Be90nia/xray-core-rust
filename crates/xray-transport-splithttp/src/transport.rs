@@ -672,6 +672,10 @@ mod tests {
 
     /// h1 客户端接入（stream-one）：明文 HTTP/1.1 GET → 200 + 下行数据。
     /// 验证 hyper auto 的 h1 兼容（Go hub.go:566 SetHTTP1(true)）。
+    ///
+    /// padding：Go 服务端对空 padding 恒 400（hub.go:141-148 + IsPaddingValid ""
+    /// → false 无豁免），真实客户端恒携带 `?x_padding=`（FillStreamRequest，默认
+    /// range 100..1000）——裸请求须同样携带，否则测的是 Go 会拒的非协议行为。
     #[tokio::test]
     async fn h1_client_stream_one_roundtrip() {
         let (handler, count) = greeting_handler();
@@ -686,9 +690,16 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let mut tcp = TcpStream::connect(addr).await.expect("connect");
-        tcp.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
+        // 100 个 'X'：默认 xPaddingBytes range 100..1000 的下界（repeat-x 按字节计长）。
+        tcp.write_all(
+            format!(
+                "GET /?x_padding={} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+                "X".repeat(100)
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
         let mut resp = Vec::new();
         tcp.read_to_end(&mut resp).await.unwrap();
         let text = String::from_utf8_lossy(&resp);
@@ -744,7 +755,9 @@ mod tests {
 
         let req = http::Request::builder()
             .method("GET")
-            .uri("/")
+            // padding：Go 服务端对空 padding 恒 400（IsPaddingValid），真实客户端
+            // （FillStreamRequest）恒携带；与 h1 roundtrip 同理。
+            .uri(format!("/?x_padding={}", "X".repeat(100)))
             .header("host", format!("127.0.0.1:{}", addr.port()))
             .body(())
             .unwrap();

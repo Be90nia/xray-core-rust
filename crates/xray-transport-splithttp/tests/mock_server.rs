@@ -16,7 +16,7 @@ use tokio::net::TcpListener;
 use webpki_roots::TLS_SERVER_ROOTS;
 
 use xray_transport_splithttp::client::{DefaultDialerClient, DialTarget, Fingerprint};
-use xray_transport_splithttp::config::Config;
+use xray_transport_splithttp::config::{Config, RangeConfig};
 use xray_transport_splithttp::dialer::dial_packet_up;
 use xray_transport_splithttp::error::SplitHttpError;
 
@@ -113,7 +113,7 @@ async fn dial_packet_up_end_to_end_via_mock_http1_server() {
     let base_uri = format!("http://127.0.0.1:{}/", server_addr.port());
     let session_id = "test-session-1".to_string();
 
-    let conn = dial_packet_up(client, base_uri, session_id, 1024, 0).await.unwrap();
+    let conn = dial_packet_up(client, base_uri, session_id, 1024, RangeConfig::new(0, 0)).await.unwrap();
 
     let mut conn = conn;
     let mut read_buf = vec![0u8; download_payload.len()];
@@ -307,14 +307,16 @@ async fn fingerprint_btls_end_to_end_http1() {
         path: "/".into(),
         ..Default::default()
     });
-    let client = Arc::new(DefaultDialerClient::new(config, make_tls_config(), DialTarget { host: "127.0.0.1".into(), port, sni: String::new() }, Some(Fingerprint::Chrome), None));
+    // mock 自签证书：走 crate 自身 allowInsecure 语义跳过 btls 证书验证
+    // （本测试对象是指纹握手 + ALPN roundtrip，不是证书链）。
+    let client = Arc::new(DefaultDialerClient::new(config, make_tls_config(), DialTarget { host: "127.0.0.1".into(), port, sni: String::new() }, Some(Fingerprint::Chrome), Some(serde_json::json!({"allowInsecure": true}))));
 
     let mut conn = dial_packet_up(
         client,
         format!("https://127.0.0.1:{port}/"),
         "fp-sess".into(),
         1024,
-        0,
+        RangeConfig::new(0, 0),
     )
     .await
     .unwrap();
@@ -337,14 +339,14 @@ async fn fingerprint_btls_end_to_end_http2() {
         path: "/".into(),
         ..Default::default()
     });
-    let client = Arc::new(DefaultDialerClient::new(config, make_tls_config(), DialTarget { host: "127.0.0.1".into(), port, sni: String::new() }, Some(Fingerprint::Chrome), None));
+    let client = Arc::new(DefaultDialerClient::new(config, make_tls_config(), DialTarget { host: "127.0.0.1".into(), port, sni: String::new() }, Some(Fingerprint::Chrome), Some(serde_json::json!({"allowInsecure": true}))));
 
     let mut conn = dial_packet_up(
         client,
         format!("https://127.0.0.1:{port}/"),
         "fp-sess".into(),
         1024,
-        0,
+        RangeConfig::new(0, 0),
     )
     .await
     .unwrap();

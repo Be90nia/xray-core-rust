@@ -15,7 +15,7 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::AsyncReadExt;
 use tokio::net::UdpSocket;
 
-use xray_transport_splithttp::config::Config;
+use xray_transport_splithttp::config::{Config, RangeConfig};
 use xray_transport_splithttp::dialer::{build_request_url, dial_h3_packet_up};
 use xray_transport_splithttp::h3_client::H3Conn;
 
@@ -173,7 +173,7 @@ async fn dial_h3_packet_up_end_to_end() {
         &config.normalized_query(),
     );
     let sc_max = 1_000_000usize;
-    let mut conn = dial_h3_packet_up(h3_conn, base_uri, session_id, sc_max, 0)
+    let mut conn = dial_h3_packet_up(h3_conn, base_uri, session_id, sc_max, RangeConfig::new(0, 0))
         .await
         .expect("dial_h3_packet_up");
 
