@@ -39,9 +39,8 @@ use hyper::body::Frame;
 use http_body_util::{BodyDataStream, BodyExt, Full, StreamBody};
 use http_body_util::combinators::BoxBody;
 use hyper_rustls::{FixedServerNameResolver, HttpsConnector, HttpsConnectorBuilder, MaybeHttpsStream};
-use hyper_util::client::legacy::connect::{Connected, Connection as HttpConnection, HttpConnector, HttpInfo};
+use hyper_util::client::legacy::connect::{Connected, Connection as HttpConnection, HttpInfo};
 use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::dns::Name as DnsName;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::ClientConfig as RustlsClientConfig;
 use rustls::pki_types::ServerName;
@@ -74,35 +73,73 @@ pub struct DialTarget {
     pub sni: String,
 }
 
-/// 忽略 URI host、恒解析 `DialTarget` 的 DNS resolver（hyper-util Service 语义）。
-#[derive(Debug, Clone)]
-pub struct DestResolver {
+/// 忽略 URI host、恒拨 `DialTarget` 的 TCP connector（hyper-util Service 语义）。
+///
+/// 为什么不能用 [`hyper_util::client::legacy::connect::HttpConnector`] + 自定义
+/// resolver：hyper-util legacy client 只把 `scheme://authority/` 传给 connector
+/// （client.rs `domain_as_uri`，path/端口信息不保真），而 `HttpConnector` 对
+/// IP 字面量 host 直接跳过 resolver 拨 URI 默认端口（http.rs
+/// `SocketAddrs::try_parse`）——register.rs 的 base_uri 按 Go H10 语义恒为裸
+/// host（`http://127.0.0.1/xh/`），结果 TCP 恒拨 `:80`/`:443`。Go 侧无此问题：
+/// `dialContext` 闭包显式拨 `dest`，URL 仅作 Host 头。此 connector 对齐 Go：
+/// 恒拨 `(dial.host, dial.port)`，URI 完全不参与寻址。
+#[derive(Clone)]
+pub struct DestTcpConnector {
     host: std::sync::Arc<str>,
     port: u16,
 }
 
-impl TowerService<DnsName> for DestResolver {
-    type Response = std::vec::IntoIter<SocketAddr>;
-    type Error = std::io::Error;
-    type Future = std::pin::Pin<
-        Box<dyn Future<Output = std::io::Result<std::vec::IntoIter<SocketAddr>>> + Send>,
-    >;
+impl TowerService<Uri> for DestTcpConnector {
+    type Response = DestTcpStream;
+    type Error = io::Error;
+    type Future = Pin<Box<dyn Future<Output = io::Result<DestTcpStream>> + Send>>;
 
-    fn poll_ready(
-        &mut self,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         std::task::Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, _name: DnsName) -> Self::Future {
+    fn call(&mut self, _uri: Uri) -> Self::Future {
         let host = std::sync::Arc::clone(&self.host);
         let port = self.port;
         Box::pin(async move {
-            tokio::net::lookup_host((host.as_ref(), port))
-                .await
-                .map(|it| it.collect::<Vec<_>>().into_iter())
+            let tcp = tokio::net::TcpStream::connect((host.as_ref(), port)).await?;
+            tcp.set_nodelay(true).ok();
+            Ok(DestTcpStream(TokioIo::new(tcp)))
         })
+    }
+}
+
+/// [`DestTcpConnector`] 的连接类型：tokio TCP 流 + legacy `Connection` 元数据
+/// （HttpInfo 供 `open_stream` 的 remote/local addr 使用，对齐 HttpConnector 行为）。
+pub struct DestTcpStream(TokioIo<tokio::net::TcpStream>);
+
+impl hyper::rt::Read for DestTcpStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+    }
+}
+
+impl hyper::rt::Write for DestTcpStream {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+    }
+}
+
+impl HttpConnection for DestTcpStream {
+    fn connected(&self) -> Connected {
+        // 无 HttpInfo（hyper-util 私有构造）：open_stream 的 remote/local addr
+        // 走 0.0.0.0:0 占位——仅日志用途，Go 侧同样非关键（GotConn 日志）。
+        Connected::new()
     }
 }
 
@@ -120,12 +157,13 @@ pub type HyperClient = Client<SplitConnector, ReqBody>;
 
 /// 出站 connector（[`TowerService`] for `Uri`）。
 ///
-/// - [`SplitConnector::Rustls`]：hyper-rustls 现有路径（fingerprint 空），原样转发。
+/// - [`SplitConnector::Rustls`]：hyper-rustls 现有路径（fingerprint 空），TCP 由
+///   [`DestTcpConnector`] 恒拨 dest，TLS 由 hyper-rustls 完成。
 /// - [`SplitConnector::Btls`]：fingerprint 非空，TCP 后用 `xray_tls::utls::u_client`
 ///   完成 btls 真实浏览器指纹握手（对应 Go splithttp `dialContext` 的 `tls.UClient`）。
 #[derive(Clone)]
 pub enum SplitConnector {
-    Rustls(HttpsConnector<HttpConnector<DestResolver>>),
+    Rustls(HttpsConnector<DestTcpConnector>),
     Btls(BtlsDial),
 }
 
@@ -151,7 +189,7 @@ pub struct BtlsDial {
 ///   的 ALPN/HttpInfo 元数据）。
 /// - Btls 分支 `UConn` 只实现 tokio traits，用 `TokioIo` 桥接。
 pub enum SplitStream {
-    Rustls(MaybeHttpsStream<TokioIo<tokio::net::TcpStream>>),
+    Rustls(MaybeHttpsStream<DestTcpStream>),
     Btls {
         io: TokioIo<UConn<TcpConnection>>,
         /// ALPN 协商出 `h2` 时 hyper 须走 HTTP/2（`Connected::negotiated_h2`）。
@@ -332,16 +370,15 @@ impl DefaultDialerClient {
             let mut builder = HttpsConnectorBuilder::new()
                 .with_tls_config(tls_config)
                 .https_or_http();
-            // 1) 锁定 TCP 拨号到 dest；忽略 URI authority（Go dialContext 语义）。
-            let mut http = HttpConnector::new_with_resolver(DestResolver {
-                host: std::sync::Arc::from(dial.host.as_str()),
-                port: dial.port,
-            });
-            http.enforce_http(false);
+            // TLS SNI 用 tlsSettings.serverName（不参与 TCP 寻址——TCP 恒拨 dest，
+            // 见 [`DestTcpConnector`] 文档）。
             if let Ok(sn) = ServerName::try_from(sni) {
                 builder = builder.with_server_name_resolver(FixedServerNameResolver::new(sn));
             }
-            let https = builder.enable_http1().enable_http2().wrap_connector(http);
+            let https = builder.enable_http1().enable_http2().wrap_connector(DestTcpConnector {
+                host: std::sync::Arc::from(dial.host.as_str()),
+                port: dial.port,
+            });
             SplitConnector::Rustls(https)
         };
         // （hyper-util 默认值，等价 Go http.Transport.IdleConnTimeout）。pool_timer
@@ -817,46 +854,43 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_millis(300), conn.accept()).await;
     }
 
-    /// h2 mock：等请求到达后显式回 REFUSED_STREAM（Go `canRetryError`
-    /// StreamError 分支——服务端明示"本流未处理"，唯一可重放的流级错误）。
-    async fn mock_h2_refused(
+    /// h2 mock（单连接两流）：流 1 回 REFUSED_STREAM（Go `canRetryError`
+    /// StreamError 分支——服务端明示"本流未处理"，唯一可重放的流级错误），
+    /// 同一连接上的流 2（即重放请求）回 200。
+    ///
+    /// 为什么重放必须落在同一条连接：Go x/net/http2 Transport 对 REFUSED_STREAM
+    /// 的重试走 `roundTrip` 循环重新 `connForRequest`——被拒连接并未死亡，健康
+    /// 连接直接复用。旧 mock 在 send_reset 后立即 drop 连接，hyper-util 池把
+    /// 重放请求派发给"已 idle 但对端已关"的连接 1，竞争连接关闭即得
+    /// `Err(SendRequest)`（CI Linux/macOS 确定性挂，Windows 因 RST 刷出竞态
+    /// 挂 ignore）——那是 mock 的非协议行为，不是客户端缺陷。连接保活后三个
+    /// 平台行为一致且确定性。
+    async fn mock_h2_refuse_then_ok(
         listener: &tokio::net::TcpListener,
         tls: std::sync::Arc<tokio_rustls::TlsAcceptor>,
     ) {
-        let (tcp, _) = listener.accept().await.expect("mock conn1 accept");
+        let (tcp, _) = listener.accept().await.expect("mock conn accept");
         let tls_stream = tls.accept(tcp).await.expect("mock tls accept");
         let mut conn = h2::server::handshake(tls_stream).await.expect("mock h2 handshake");
         if let Some(Ok((_req, mut respond))) = conn.accept().await {
             respond.send_reset(h2::Reason::REFUSED_STREAM);
-            drain_h2_conn(&mut conn).await;
+            // 保活等待重放流（同连接流 2）→ 200。
+            if let Some(Ok((_req2, mut respond2))) = conn.accept().await {
+                let resp = http::Response::builder()
+                    .status(StatusCode::OK)
+                    .body(())
+                    .unwrap();
+                let _ = respond2.send_response(resp, true);
+                drain_h2_conn(&mut conn).await;
+                return;
+            }
         }
+        panic!("mock expected 2 streams on one connection (refused + replay)");
     }
 
-    /// h2 mock：200 空响应（重放目标连接）。
-    async fn mock_h2_ok(
-        listener: &tokio::net::TcpListener,
-        tls: std::sync::Arc<tokio_rustls::TlsAcceptor>,
-    ) {
-        let (tcp, _) = listener.accept().await.expect("mock conn2 accept");
-        let tls_stream = tls.accept(tcp).await.expect("mock tls accept");
-        let mut conn = h2::server::handshake(tls_stream).await.expect("mock h2 handshake");
-        if let Some(Ok((_req, mut respond))) = conn.accept().await {
-            let resp = http::Response::builder()
-                .status(StatusCode::OK)
-                .body(())
-                .unwrap();
-            let _ = respond.send_response(resp, true);
-            drain_h2_conn(&mut conn).await;
-        }
-    }
-
-    // Windows loopback 上 h2 crate 偶发在 RST 帧刷出前断连（客户端见 EOF 而非
-    // REFUSED_STREAM——EOF 按 Go canRetryError 语义不可重放，实现正确、mock 有
-    // 竞态），Windows 上忽略防红灯；503 对照测试锁定"HTTP 错误不重放"，重放
-    // 资格判定 is_packet_replayable 与 Go shouldRetryRequest 逐分支对齐（见其
-    // 文档）。iq1o⑨：ignore 收窄为 Windows-only——Linux/macOS 激活正向重放
-    // 回归守卫。
-    #[cfg_attr(windows, ignore = "mock RST flush race on Windows loopback; predicate + no-replay control covered by post_packet_http_error_does_not_replay")]
+    // 503 对照测试锁定"HTTP 错误不重放"，重放资格判定 is_packet_replayable 与
+    // Go shouldRetryRequest 逐分支对齐（见其文档）。本测试原 Windows ignore
+    // （mock RST 刷出竞态）已随 mock 重构移除：连接不再关闭，无竞态窗口。
     #[tokio::test]
     async fn post_packet_replays_after_h2_stream_error() {
         // workspace feature unification 可能双 CryptoProvider 并存，
@@ -869,13 +903,11 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
-        // 同一 listener 串行 accept：conn 1 = REFUSED_STREAM（可重放流错误），
-        // conn 2 = 重放命中（200）。
+        // 单连接串行两流：流 1 = REFUSED_STREAM（可重放流错误），流 2 = 重放命中（200）。
         let l = listener;
         let tls2 = std::sync::Arc::clone(&tls);
         let server = tokio::spawn(async move {
-            mock_h2_refused(&l, tls2).await;
-            mock_h2_ok(&l, tls).await;
+            mock_h2_refuse_then_ok(&l, tls2).await;
         });
 
         let config = Arc::new(Config::default());

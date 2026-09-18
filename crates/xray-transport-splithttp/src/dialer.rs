@@ -311,7 +311,6 @@ pub async fn dial(
         &config.normalized_path(),
         &config.normalized_query(),
     );
-
     debug!(target: "splithttp", %mode, %base_uri, "dial dispatch");
 
     match mode.as_str() {
