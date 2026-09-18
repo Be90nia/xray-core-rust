@@ -230,7 +230,9 @@ struct BrowserUA {
     user_agent: &'static str,
 }
 
-fn build_user_agent(browser: &str) -> String {
+/// 按浏览器名生成动态版本 UA（H8：grpc 与 ws/xhttp 共享同一实现，
+/// 避免同进程 UA 版本自相矛盾）。
+pub fn build_user_agent(browser: &str) -> String {
     match browser {
         "chrome" => {
             let v = chrome_version();

@@ -671,9 +671,13 @@ fn build_protocol_handler(
         .filter(|s| s.has_strategy());
     // sendThrough（bd 7zc）：outbound 顶层字段 → 源地址规格（Go xray.go:287-301）
     let send_through = parse_send_through(&ob.send_through)?;
+    // sockopt 数值/类型启动期硬错（Go 解码期语义）。
+    xray_transport::dialer::StreamSettings::validate_sockopt_json(ob.stream_settings_json.as_ref())
+        .map_err(|e| BuildError::Parse(e.to_string()))?;
     match ob.entry.kind.as_str() {
         "freedom" => {
-            let config = parse_freedom_config(&ob.entry.data);
+            let config = parse_freedom_config(&ob.entry.data)
+                .map_err(|e| BuildError::Parse(e.to_string()))?;
             let noises = config.noises.clone();
             let destination_override = config.destination_override.clone();
             let domain_strategy = config.domain_strategy;
@@ -1222,6 +1226,13 @@ fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutboundConfig, S
         .and_then(|v| v.as_str())
         .unwrap_or("none")
         .to_string();
+    // Go infra/conf/vless.go:355-360：非空且非 none 的 encryption 解析失败 =
+    // 启动硬错（拼错 mlkem 串静默降级明文是机密性回退）。空串/none 走明文
+    // 通过（Rust 缺字段 unwrap_or("none")，较 Go 的空串硬错宽松，存量配置兼容）。
+    let enc_params = xray_proxy_vless::encryption::parse_client_encryption(&encryption);
+    if enc_params.is_none() && !encryption.is_empty() && encryption != "none" {
+        return Err(format!(r#"VLESS users: unsupported "encryption": {encryption}"#));
+    }
     let level = user.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let email = user.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
     // testseed/testpre（Go infra/conf/vless.go:296-321）：simplified 顶层形式读
@@ -1249,7 +1260,7 @@ fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutboundConfig, S
     )
     .with_flow(flow)
     .with_encryption(encryption.clone())
-    .with_encryption_params(xray_proxy_vless::encryption::parse_client_encryption(&encryption))
+    .with_encryption_params(enc_params)
     .with_testseed(testseed)
     .with_testpre(testpre))
 }
@@ -1328,22 +1339,30 @@ fn parse_trojan_config(data: &[u8]) -> std::result::Result<TrojanOutboundConfig,
 /// 对应 Go `proxy/freedom/freedom.go` Config 字段。JSON 格式：
 /// `{ "domainStrategy": "AsIs", "fragment": {...}, "noises": [...] }`
 ///
-/// 解析失败或缺省返回 `Config::default()`（不阻断 freedom 注册）。
-fn parse_freedom_config(data: &[u8]) -> FreedomConfig {
+/// JSON 解析失败 / domainStrategy 未知值 / finalRules 单条非法 → 硬错
+/// （对齐 Go `FreedomConfig.Build` 解码期拒启），空 settings 走缺省。
+fn parse_freedom_config(data: &[u8]) -> std::io::Result<FreedomConfig> {
     use xray_proxy_freedom::{DomainStrategy, Fragment, Noise};
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(data) else {
-        return FreedomConfig::default();
-    };
+    if data.iter().all(|b| b.is_ascii_whitespace()) {
+        return Ok(FreedomConfig::default());
+    }
+    let v: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| std::io::Error::other(format!("freedom settings JSON: {e}")))?;
     // 单数 noise 字段已移除（Go infra/conf/freedom.go:145-147）。
     // Rust 保留现行为：warn + 忽略该字段（仅解析 noises 复数形式）。
     if let Some(w) = freedom_noise_removed_warning(&v) {
         xray_common::log::warning(w);
     }
-    let domain_strategy = v
-        .get("domainStrategy")
+    // targetStrategy 非空则优先（Go freedom.go:62-64），否则回退 domainStrategy。
+    let strategy_raw = v
+        .get("targetStrategy")
         .and_then(|s| s.as_str())
-        .map(parse_freedom_domain_strategy)
-        .unwrap_or_default();
+        .filter(|s| !s.is_empty())
+        .or_else(|| v.get("domainStrategy").and_then(|s| s.as_str()));
+    let domain_strategy = match strategy_raw {
+        Some(s) => parse_freedom_domain_strategy(s)?,
+        None => DomainStrategy::AsIs,
+    };
     let fragment = v.get("fragment").and_then(parse_freedom_fragment);
     let noises: Vec<Noise> = v
         .get("noises")
@@ -1361,31 +1380,26 @@ fn parse_freedom_config(data: &[u8]) -> FreedomConfig {
         .get("proxyProtocol")
         .and_then(|p| p.as_u64())
         .unwrap_or(0) as u32;
-    let final_rules: Vec<xray_proxy_freedom::FinalRuleConfig> = v
-        .get("finalRules")
-        .and_then(|r| r.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|rv| {
-                    match xray_proxy_freedom::FinalRuleConfig::from_json(rv) {
-                        Ok(c) => Some(c),
-                        Err(e) => {
-                            xray_common::log::warning(format!("freedom finalRule ignored: {e}"));
-                            None
-                        }
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    FreedomConfig {
+    // finalRules：单条非法整出站拒启（Go freedom.go:186-191 `r.Build() 失败
+    // 即 return nil, err`），不再逐条 warn+丢弃。
+    let final_rules: Vec<xray_proxy_freedom::FinalRuleConfig> = match v.get("finalRules").and_then(|r| r.as_array()) {
+        Some(arr) => arr
+            .iter()
+            .map(|rv| {
+                xray_proxy_freedom::FinalRuleConfig::from_json(rv)
+                    .map_err(|e| std::io::Error::other(format!("freedom finalRule: {e}")))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        None => Vec::new(),
+    };
+    Ok(FreedomConfig {
         domain_strategy: domain_strategy as i32,
         destination_override,
         proxy_protocol,
         user_level,
         final_rules,
         ..Default::default()
-    }
+    })
 }
 
 /// freedom 单数 `noise` 字段已移除（Go infra/conf/freedom.go:145-147，
@@ -1407,16 +1421,30 @@ pub(crate) fn trojan_flow_removed_warning(user: &serde_json::Value) -> Option<St
         .then(|| xray_common::errors::removed_feature_message("Flow for Trojan", ""))
 }
 
-/// 把 domainStrategy 字符串映射为枚举值。
-fn parse_freedom_domain_strategy(s: &str) -> DomainStrategy {
-    match s {
-        "UseIP" => DomainStrategy::UseIP,
-        "UseIPv4" => DomainStrategy::UseIPv4,
-        "UseIPv6" => DomainStrategy::UseIPv6,
-        "UseIPv4v6" => DomainStrategy::UseIPv4v6,
-        "UseIPv6v4" => DomainStrategy::UseIPv6v4,
-        _ => DomainStrategy::AsIs,
-    }
+/// 把 domainStrategy 字符串映射为枚举值（Go freedom.go:65-88：ToLower +
+/// 11 值全谱含 forceip 族，未知值硬错；错误信息保留原始大小写）。
+fn parse_freedom_domain_strategy(
+    s: &str,
+) -> std::io::Result<xray_proxy_freedom::DomainStrategy> {
+    use xray_proxy_freedom::DomainStrategy;
+    Ok(match s.to_ascii_lowercase().as_str() {
+        "asis" | "" => DomainStrategy::AsIs,
+        "useip" => DomainStrategy::UseIP,
+        "useipv4" => DomainStrategy::UseIPv4,
+        "useipv6" => DomainStrategy::UseIPv6,
+        "useipv4v6" => DomainStrategy::UseIPv4v6,
+        "useipv6v4" => DomainStrategy::UseIPv6v4,
+        "forceip" => DomainStrategy::ForceIP,
+        "forceipv4" => DomainStrategy::ForceIPv4,
+        "forceipv6" => DomainStrategy::ForceIPv6,
+        "forceipv4v6" => DomainStrategy::ForceIPv4v6,
+        "forceipv6v4" => DomainStrategy::ForceIPv6v4,
+        _ => {
+            return Err(std::io::Error::other(format!(
+                "unsupported domain strategy: {s}"
+            )));
+        }
+    })
 }
 
 /// `targetStrategy` 字符串 → 枚举（大小写不敏感）。
@@ -3310,6 +3338,47 @@ mod tests {
         }
     }
 
+    /// 回归（bd s3xx）：非空且非 none 的 encryption 解析失败必须启动硬错
+    /// （Go infra/conf/vless.go:355-360），禁静默降级明文；""/"none"/缺字段
+    /// 明文通过；合法 mlkem 串不受影响。
+    #[test]
+    fn parse_vless_config_encryption_mismatch_hard_error() {
+        let mk = |enc: &str| {
+            format!(
+                r#"{{
+                    "vnext": [{{
+                        "address": "s.example.com",
+                        "port": 443,
+                        "users": [{{ "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+                                    "encryption": "{enc}" }}]
+                    }}]
+                }}"#
+            )
+        };
+
+        // 拼错 mode（nativ ≠ native）→ 拒启，错误含 Go 原文前缀。
+        let err = parse_vless_config(mk("mlkem768x25519plus.nativ.0rtt.AAAA").as_bytes())
+            .unwrap_err();
+        assert!(
+            err.contains(r#"unsupported "encryption""#) && err.contains("nativ"),
+            "拼错 mode 必须拒启，got: {err}"
+        );
+
+        // 非法 rtt / 畸形 key 段同样拒启。
+        assert!(parse_vless_config(mk("mlkem768x25519plus.native.5rtt.AAAA").as_bytes()).is_err());
+        assert!(parse_vless_config(mk("mlkem768x25519plus.native.0rtt.!!!not-base64!").as_bytes())
+            .is_err());
+
+        // none / 显式空串 / 缺字段 → 明文通过。
+        assert!(parse_vless_config(mk("none").as_bytes()).is_ok());
+        assert!(parse_vless_config(mk("").as_bytes()).is_ok());
+
+        // 合法 mlkem 串（32B base64url X25519 ek）→ Ok 且 params 已挂载。
+        let ok = mk("mlkem768x25519plus.native.0rtt.GS1D3kYFox-0dmcTK1u-2LaiSB-iM_Kve8N4bT--DhE");
+        let config = parse_vless_config(ok.as_bytes()).expect("合法 mlkem 串必须通过");
+        assert!(config.enc_params.is_some(), "合法串应挂载 enc_params");
+    }
+
     /// 8i4c：testseed/testpre 解析。标准 vnext 形式 user 级优先；扁平形式读
     /// settings 顶层（Go vless.go:296-321 两分支等价覆盖）。
     #[test]
@@ -3599,7 +3668,7 @@ mod tests {
                 {"action": "block", "network": "tcp,udp", "port": "53", "ip": ["10.0.0.0/8"]}
             ]
         }"#;
-        let cfg = parse_freedom_config(json.as_bytes());
+        let cfg = parse_freedom_config(json.as_bytes()).expect("valid freedom settings");
         let ov = cfg.destination_override.expect("override parsed");
         let server = ov.server.expect("server set");
         assert_eq!(server.port, 1080);
@@ -3609,6 +3678,62 @@ mod tests {
         assert_eq!(rule.action, xray_proxy_freedom::RuleAction::Block);
         assert!(rule.apply(2, 53, Some("10.1.2.3".parse().unwrap())));
         assert!(!rule.apply(2, 53, Some("8.8.8.8".parse().unwrap())));
+    }
+
+    /// vrll①：domainStrategy ToLower + forceip 族全谱（Go freedom.go:65-88）。
+    #[test]
+    fn parse_freedom_domain_strategy_full_spectrum() {
+        use xray_proxy_freedom::DomainStrategy as DS;
+        let cases = [
+            ("AsIs", DS::AsIs),
+            ("asis", DS::AsIs),
+            ("UseIP", DS::UseIP),
+            ("useipv4", DS::UseIPv4),
+            ("UseIPv6", DS::UseIPv6),
+            ("forceip", DS::ForceIP),
+            ("ForceIPv4", DS::ForceIPv4),
+            ("forceipv6", DS::ForceIPv6),
+            ("ForceIPv4v6", DS::ForceIPv4v6),
+            ("forceipv6v4", DS::ForceIPv6v4),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(parse_freedom_domain_strategy(raw).unwrap(), want, "case {raw}");
+        }
+        // 未知值拒启，错误信息保留原始大小写（Go :88）。
+        let err = parse_freedom_domain_strategy("UseIPv3").err().expect("must reject");
+        assert!(
+            err.to_string().contains("unsupported domain strategy: UseIPv3"),
+            "got: {err}"
+        );
+    }
+
+    /// vrll①：targetStrategy 非空优先于 domainStrategy（Go freedom.go:62-64）。
+    #[test]
+    fn parse_freedom_config_target_strategy_priority() {
+        let json = br#"{"domainStrategy":"UseIP","targetStrategy":"ForceIPv4"}"#;
+        let cfg = parse_freedom_config(json).unwrap();
+        assert_eq!(cfg.domain_strategy, 7, "targetStrategy must win");
+        // targetStrategy 空串 → 回退 domainStrategy。
+        let json2 = br#"{"domainStrategy":"UseIP","targetStrategy":""}"#;
+        let cfg2 = parse_freedom_config(json2).unwrap();
+        assert_eq!(cfg2.domain_strategy, 1);
+    }
+
+    /// vrll①③：settings JSON 坏 / 未知 strategy / finalRules 单条非法 →
+    /// 整出站拒启，不再静默 default / 逐条丢弃。
+    #[test]
+    fn parse_freedom_config_hard_errors() {
+        assert!(parse_freedom_config(b"{bad json").is_err(), "broken JSON rejected");
+        assert!(parse_freedom_config(b"").unwrap().domain_strategy == 0, "empty settings default");
+        let unknown = br#"{"domainStrategy":"UseIPv3"}"#;
+        assert!(parse_freedom_config(unknown).is_err(), "unknown strategy rejected");
+        // finalRules：一条合法 + 一条非法 → 整体 Err（Go freedom.go:186-191）。
+        let mixed = br#"{"finalRules":[
+            {"action":"block","port":"53"},
+            {"action":"nope","port":"443"}
+        ]}"#;
+        let err = parse_freedom_config(mixed).err().expect("must reject");
+        assert!(err.to_string().contains("finalRule"), "got: {err}");
     }
 
     #[test]

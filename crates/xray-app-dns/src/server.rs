@@ -212,7 +212,8 @@ impl DnsService {
         domain: &str,
         option: IpOption,
     ) -> Result<(Vec<IpAddr>, u32), DnsError> {
-        let domain = domain.trim_end_matches('.');
+        // Go dns.go:216 TrimSuffix(domain, ".")——只剥一个尾点（"a.." 保留内层点）。
+        let domain = domain.strip_suffix('.').unwrap_or(domain);
         if domain.is_empty() {
             return Err(DnsError::Features(FeaturesDnsError::Other(
                 "empty domain name".to_string(),
@@ -406,41 +407,34 @@ async fn parallel_query(
 
     let domain_owned = domain.to_string();
     let mut set: JoinSet<(usize, Result<(Vec<IpAddr>, u32), DnsError>)> = JoinSet::new();
-    let mut spawned = 0usize;
+
+    // 每个 client 的结果（Pending=未到，Success/Failure=已到）；raw_errs 与
+    // outcomes 索引对齐，尾部 merge_query_errors 走 errRNF 优先级
+    // （Go dns.go:339-361 mergeQueryErrors）。初始化前移：FakeDNS 同步写
+    // 结果需要在 spawn 循环内落到 outcomes 上。
+    let mut outcomes: Vec<ClientOutcome> =
+        (0..clients.len()).map(|_| ClientOutcome::Pending).collect();
+    let mut raw_errs: Vec<Result<(Vec<IpAddr>, u32), DnsError>> =
+        (0..clients.len()).map(|_| Err(DnsError::EmptyResponse)).collect();
 
     for (i, client) in clients.iter().enumerate() {
         if !option.fake_enable && client.server.name().eq_ignore_ascii_case("FakeDNS") {
+            // Go dns.go:456-459 asyncQueryAll：FakeDNS 不发查询，但同步写入
+            // ErrEmptyResponse 结果（pending 归零）。跳过不写会让该下标永久
+            // Pending，组内成功结果永不消费（bd 5vfd）。
+            outcomes[i] = ClientOutcome::Failure;
             continue;
         }
         let c = Arc::clone(client);
         let d = domain_owned.clone();
         set.spawn(async move { (i, c.query_ip(&d, option).await) });
-        spawned += 1;
     }
 
-    if spawned == 0 {
-        return Err(DnsError::EmptyResponse);
-    }
-
-    // 每个 client 的结果（Pending=未到，Success/Failure=已到）。
-    let mut outcomes: Vec<ClientOutcome> =
-        (0..clients.len()).map(|_| ClientOutcome::Pending).collect();
-    // raw_errs 与 outcomes 索引对齐：存每个 client 的原始错误。
-    // 尾部 merge_query_errors 走 errRNF 优先级（Go dns.go:339-361 mergeQueryErrors）。
-    let mut raw_errs: Vec<Result<(Vec<IpAddr>, u32), DnsError>> =
-        (0..clients.len()).map(|_| Err(DnsError::EmptyResponse)).collect();
-    // 对齐 Go dns.go:412-437：每收到一个结果，从 next_group 起连续推进内层
-    // 检查循环——某组结果已全部收齐时立即判断（race/推进下一组），不等新结果；
-    // JoinSet 排空（join_next 返回 None）即所有结果到齐，退出循环聚合错误。
-    // 旧实现 None 时 continue 自旋，且组推进后先 join_next 才检查下一组，
-    // 「下一组结果先到」的场景会挂死。
     let mut next_group = 0usize;
     while let Some(joined) = set.join_next().await {
         let (idx, outcome) = match joined {
             Ok(v) => v,
-            // 任务 panic（JoinError）：该 client 结果永不到达，JoinSet 排空后由
-            // merge_query_errors 兜底（Go asyncQueryAll 保证每 client 至少一条结果，
-            // panic 属异常路径）。
+            // 任务 panic（JoinError）：下标不可得，由排空后的兜底统一归类。
             Err(_) => continue,
         };
         match &outcome {
@@ -458,36 +452,66 @@ async fn parallel_query(
             }
         }
 
-        // 内层组推进（Go dns.go:418-437 的 `for nextGroup < len(groups)`）。
-        while next_group < groups.len() {
-            let g = groups[next_group];
-            // 组内 race：任一成功立即返回（minimum rtt）。
-            if let Some((ips, ttl)) = group_success(&outcomes, g) {
-                set.abort_all();
-                return Ok((ips, ttl));
-            }
-            // 组内仍有查询未返回：等待下一个结果。
-            if group_pending(&outcomes, g) {
-                break;
-            }
-            // 组内全部到齐且全部失败 → per-server 决策日志后推进下一组
-            // （Go dns.go:430 `LogInfoInner` "failed to lookup ip in parallel query mode"）。
-            for j in g.start..=g.end {
-                if let (ClientOutcome::Failure, Err(e)) = (&outcomes[j], &raw_errs[j]) {
-                    tracing::info!(
-                        target: "xray.dns",
-                        server = %clients[j].server.name(),
-                        domain = %domain_owned,
-                        error = %e,
-                        "failed to lookup ip in parallel query mode",
-                    );
-                }
-            }
-            next_group += 1;
+        // 对齐 Go dns.go:412-437：每收到一个结果立即连续推进组检查。
+        if let Some(r) =
+            advance_groups(&outcomes, &raw_errs, &groups, clients, &domain_owned, &mut next_group)
+        {
+            set.abort_all();
+            return Ok(r);
         }
     }
 
+    // JoinSet 排空后仍 Pending 的下标 = 任务 panic/abort（JoinError 分支拿不到
+    // 下标）。视为完成（失败）：Go asyncQueryAll 保证每 client 至少一条结果，
+    // 否则组内 pending 永真、组内成功永不消费（bd 5vfd）。
+    for (_idx, o) in outcomes.iter_mut().enumerate() {
+        if matches!(o, ClientOutcome::Pending) {
+            *o = ClientOutcome::Failure;
+        }
+    }
+    if let Some(r) =
+        advance_groups(&outcomes, &raw_errs, &groups, clients, &domain_owned, &mut next_group)
+    {
+        return Ok(r);
+    }
+
     Err(merge_query_errors(domain, &raw_errs).expect_err("parallel_query raw_errs are all Err"))
+}
+
+/// 组推进检查（Go dns.go:418-437 的 `for nextGroup < len(groups)`）：从
+/// `next_group` 起连续判断——组内任一已收结果成功即返回（组内 race minimum
+/// rtt）；组内仍有未返回查询则停；组内全部到齐且全失败则记 per-server 日志
+/// 后推进下一组。
+fn advance_groups(
+    outcomes: &[ClientOutcome],
+    raw_errs: &[Result<(Vec<IpAddr>, u32), DnsError>],
+    groups: &[Group],
+    clients: &[Arc<Client>],
+    domain: &str,
+    next_group: &mut usize,
+) -> Option<(Vec<IpAddr>, u32)> {
+    while *next_group < groups.len() {
+        let g = groups[*next_group];
+        if let Some((ips, ttl)) = group_success(outcomes, g) {
+            return Some((ips, ttl));
+        }
+        if group_pending(outcomes, g) {
+            break;
+        }
+        for j in g.start..=g.end {
+            if let (ClientOutcome::Failure, Err(e)) = (&outcomes[j], &raw_errs[j]) {
+                tracing::info!(
+                    target: "xray.dns",
+                    server = %clients[j].server.name(),
+                    domain = %domain,
+                    error = %e,
+                    "failed to lookup ip in parallel query mode",
+                );
+            }
+        }
+        *next_group += 1;
+    }
+    None
 }
 
 /// 组内任一已收结果成功 → 返回 (ips, ttl)（Go dns.go:419-426 组内 race）。
@@ -1235,6 +1259,65 @@ mod tests {
         assert_eq!(ips, vec![success_ip], "组间串行：前组全败 → 后组成功");
     }
 
+    /// bd 5vfd 回归：enableParallelQuery 下 [FakeDNS, 真 server] 同组。
+    /// Go asyncQueryAll（dns.go:456-459）对 FakeDNS 同步写入 err 结果——
+    /// 组内 pending 归零，真 server 的成功可被消费。修复前 FakeDNS 被
+    /// continue 跳过、对应下标永久 Pending → 组内成功永不吞不出，整次解析
+    /// 返回 Err（Go 同配置返回成功）。
+    #[tokio::test]
+    async fn parallel_query_fakedns_same_group_does_not_swallow_success() {
+        use crate::fakedns::Holder;
+        use crate::nameserver::fakedns::FakeDnsServer;
+
+        let ns = NameServerConfig { tag: "fake".into(), ..Default::default() };
+        let fake: Box<dyn Server> = Box::new(FakeDnsServer::new(Holder::new_default().unwrap()));
+        let fake_client = Arc::new(Client::new(ns, IpOption::all(), fake).unwrap());
+        let real = make_client_with_ips(
+            "real",
+            false,
+            false,
+            vec![IpAddr::V4(std::net::Ipv4Addr::new(9, 9, 9, 9))],
+        );
+        // 同 policy_id（默认 0）→ 同组。
+        let no_fake = IpOption { ipv4_enable: true, ipv6_enable: true, fake_enable: false };
+        let (ips, _ttl) = parallel_query(&[fake_client, real], "x.com", no_fake)
+            .await
+            .expect("FakeDNS 同步写 err 后，组内真 server 的成功应可消费");
+        assert_eq!(ips, vec![IpAddr::V4(std::net::Ipv4Addr::new(9, 9, 9, 9))]);
+    }
+
+    /// bd 5vfd 回归：查询任务 panic（JoinError 下标不可得）后，JoinSet 排空
+    /// 兜底把仍 Pending 的下标视为失败完成——组内其它成功不被吞、不挂死。
+    #[tokio::test]
+    async fn parallel_query_panicked_task_treated_as_failure() {
+        struct PanicServer;
+        impl Server for PanicServer {
+            fn name(&self) -> &str { "panic" }
+            fn is_disable_cache(&self) -> bool { false }
+            fn query_ip<'a>(
+                &'a self,
+                _d: &'a str,
+                _o: IpOption,
+            ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>>
+            {
+                Box::pin(async { panic!("query task panicked") })
+            }
+        }
+        let ns = NameServerConfig { tag: "p".into(), ..Default::default() };
+        let panic_client =
+            Arc::new(Client::new(ns, IpOption::all(), Box::new(PanicServer)).unwrap());
+        let real = make_client_with_ips(
+            "real",
+            false,
+            false,
+            vec![IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 4, 4))],
+        );
+        let (ips, _ttl) = parallel_query(&[panic_client, real], "x.com", IpOption::all())
+            .await
+            .expect("panic 任务视为失败完成后，组内成功应返回");
+        assert_eq!(ips, vec![IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 4, 4))]);
+    }
+
     // ---- merge_query_errors / log_decision 单元测试 ----
 
     #[test]
@@ -1517,6 +1600,53 @@ mod tests {
         };
         let res = client.query_ip("mixed.example", v6_only).await;
         assert!(matches!(res, Err(DnsError::EmptyResponse)));
+    }
+
+    /// bd rofg③ 回归：per-client `queryStrategy=USE_SYS` → `check_system=true`，
+    /// 查询走 check_routes 系统可达性钳制分支（Go nameserver.go:145,168-176），
+    /// 不再与静态 ip_option AND。环境 v4 可达时请求透传给 nameserver。
+    #[tokio::test]
+    async fn client_use_sys_uses_check_routes_branch() {
+        let (v4_ok, _) = check_routes();
+        let client = make_filter_client("sys", Some(QueryStrategy::UseSys), mixed_family_ips());
+        assert!(client.check_system, "UseSys 覆写必须置 check_system=true");
+        if !v4_ok {
+            return; // 无 v4 路由环境无法断言透传
+        }
+        let (ips, _) = client.query_ip("mixed.example", v4_only()).await.unwrap();
+        assert_eq!(ips.len(), 1, "v4 路由可达时 UseSys client 透传 v4 查询");
+    }
+
+    /// bd rofg④ 回归：尾点只剥一个（Go dns.go:216 TrimSuffix(domain, ".")），
+    /// `"x.com.."` → 查询域名 `"x.com."`（Fqdn 规范化形态）。修复前
+    /// trim_end_matches 全剥 → 查询 `"x.com"`，与 Go 域名形态偏离。
+    #[tokio::test]
+    async fn lookup_ip_strips_single_trailing_dot_only() {
+        struct CaptureServer {
+            seen: Arc<parking_lot::Mutex<Vec<String>>>,
+        }
+        impl Server for CaptureServer {
+            fn name(&self) -> &str { "capture" }
+            fn is_disable_cache(&self) -> bool { false }
+            fn query_ip<'a>(
+                &'a self,
+                d: &'a str,
+                _o: IpOption,
+            ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>>
+            {
+                self.seen.lock().push(d.to_string());
+                Box::pin(async {
+                    Ok((vec![IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4))], 60))
+                })
+            }
+        }
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let ns = NameServerConfig { tag: "cap".into(), ..Default::default() };
+        let server: Box<dyn Server> = Box::new(CaptureServer { seen: Arc::clone(&seen) });
+        let svc = make_service(vec![Arc::new(Client::new(ns, IpOption::all(), server).unwrap())], Vec::new());
+
+        svc.lookup_ip("x.com..", IpOption::all()).await.unwrap();
+        assert_eq!(&*seen.lock(), &["x.com.".to_string()], "应只剥一个尾点");
     }
 
     // ---- 服务级 query_strategy 钳制（Go dns.go:228-229，LookupIP 入口层）----

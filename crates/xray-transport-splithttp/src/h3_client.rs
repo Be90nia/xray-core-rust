@@ -391,7 +391,12 @@ impl H3Conn {
         })?;
         drop(send_req);
 
-        // spawn 上传任务：循环 read body_stream → send_data → finish → drain response
+        // H12：stream-one = 单 stream 全双工（Go dialer.go:469-479）——POST 的
+        // 响应即下行。此前 upload_only=false 额外开 GET 流（双 stream），服务端
+        // 多出一条连接，语义从 1 连接变 2 连接。
+        let (data_tx, data_rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(16);
+
+        // spawn 上传任务：循环 read body_stream → send_data → finish → 响应处理
         let this = self.clone();
         let me_for_closed = Arc::downgrade(&this);
         tokio::spawn(async move {
@@ -420,43 +425,46 @@ impl H3Conn {
                 }
             }
             let _ = upload_stream.finish().await;
-            // drain response（h3 协议要求收完响应否则连接异常）
-            if let Ok(resp) = upload_stream.recv_response().await {
-                if resp.status() != StatusCode::OK {
+            // 响应头校验（对齐 DefaultDialerClient：非 200 → mark_closed + EOF）
+            match upload_stream.recv_response().await {
+                Ok(resp) if resp.status() == StatusCode::OK => {}
+                Ok(_) => {
                     if let Some(c) = me_for_closed.upgrade() {
                         c.mark_closed();
                     }
+                    return;
+                }
+                Err(e) => {
+                    if let Some(c) = me_for_closed.upgrade() {
+                        c.mark_closed();
+                    }
+                    let _ = data_tx
+                        .send(Err(std::io::Error::other(format!("h3 recv_response: {e}"))))
+                        .await;
+                    return;
                 }
             }
-            while let Ok(Some(_)) = upload_stream.recv_data().await {}
+            if upload_only {
+                // stream-up：drain 响应（h3 协议要求收完否则连接异常）
+                while let Ok(Some(_)) = upload_stream.recv_data().await {}
+            } else {
+                // stream-one：响应数据即下行流，转发给调用方
+                while let Ok(Some(mut buf)) = upload_stream.recv_data().await {
+                    let len = buf.remaining();
+                    let data = buf.copy_to_bytes(len);
+                    if data_tx.send(Ok(data)).await.is_err() {
+                        break;
+                    }
+                }
+            }
         });
 
+        let (remote, local) = self.addrs();
         if upload_only {
-            let (remote, local) = self.addrs();
             return Ok((None, remote, local));
         }
-
-        // 2. 额外开 GET 下载流（stream-one 等价于 stream-up：双 stream 模式）
-        let get_meta = self
-            .config
-            .build_stream_request_meta(base_uri, session_id, None)?;
-        let get_req = Self::build_h3_request(&get_meta)?;
-        let mut send_req = self.send_req.lock().await;
-        let mut dl_stream = send_req.send_request(get_req).await.map_err(|e| {
-            self.mark_closed();
-            SplitHttpError::Hyper(format!("h3 send_request download: {e}"))
-        })?;
-        drop(send_req);
-
-        dl_stream
-            .finish()
-            .await
-            .map_err(|e| SplitHttpError::Hyper(format!("h3 finish download: {e}")))?;
-
-        // GET 下载同样 lazy 化（对齐 Go `OpenStream`；理由同 `open_stream`
-        // 的 stream-down 分支——响应头不得阻塞 dial 调用方）。
-        let reader = spawn_h3_lazy_reader(self.clone(), dl_stream);
-        let (remote, local) = self.addrs();
+        let reader: Box<dyn AsyncReadTrait + Send + Unpin> =
+            Box::new(tokio_util::io::StreamReader::new(tokio_stream::wrappers::ReceiverStream::new(data_rx)));
         Ok((Some(reader), remote, local))
     }
 }

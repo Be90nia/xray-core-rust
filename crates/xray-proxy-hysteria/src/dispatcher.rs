@@ -453,6 +453,8 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::mpsc;
 
+    use bytes::Bytes;
+
     use xray_common::net::address::Address;
     use xray_common::net::destination::Destination;
     use xray_common::net::network::Network;
@@ -490,7 +492,11 @@ mod tests {
         }
 
         /// server 侧处理一个 client datagram：解析 + 记录 + 回投。
-        fn echo(&self, wire: &[u8]) {
+        fn echo(
+            seen: &Arc<parking_lot::Mutex<Vec<(u32, UdpMessage)>>>,
+            tx: &mpsc::UnboundedSender<Vec<u8>>,
+            wire: &[u8],
+        ) {
             if wire.len() < 4 {
                 return;
             }
@@ -503,7 +509,7 @@ mod tests {
             let Ok(msg) = UdpMessage::parse(&full) else {
                 return;
             };
-            self.seen.lock().push((id, msg.clone()));
+            seen.lock().push((id, msg.clone()));
             // 回包：真实 server 的回包来源 = 请求目标
             let resp = UdpMessage {
                 session_id: 0,
@@ -519,30 +525,33 @@ mod tests {
             // server 侧 InterConn 同 flow 复用同一 session id
             wire_resp.extend_from_slice(&id.to_be_bytes());
             wire_resp.extend_from_slice(&buf[4..n]);
-            let _ = self.tx.send(wire_resp);
+            let _ = tx.send(wire_resp);
         }
     }
 
     impl QuicConn for MockEchoConn {
-        fn send_datagram<'a>(
-            &'a self,
-            data: &'a [u8],
-        ) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'a>> {
+        fn send_datagram(
+            &self,
+            data: Bytes,
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> {
+            let seen = Arc::clone(&self.seen);
+            let tx = self.tx.clone();
             Box::pin(async move {
-                self.echo(data);
+                Self::echo(&seen, &tx, &data);
                 Ok(())
             })
         }
 
         fn receive_datagram(
             &self,
-        ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<u8>>> + Send>> {
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<Bytes>> + Send>> {
             let rx = Arc::clone(&self.rx);
             Box::pin(async move {
                 rx.lock()
                     .await
                     .recv()
                     .await
+                    .map(Bytes::from)
                     .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "mock closed"))
             })
         }

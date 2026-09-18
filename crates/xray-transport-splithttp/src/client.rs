@@ -57,7 +57,6 @@ use xray_transport::connection::TcpConnection;
 
 use crate::config::{Config, RequestMeta};
 use crate::error::{Result, SplitHttpError};
-use crate::xpadding::apply_xpadding_to_request_meta;
 
 /// 拨号目标——Go `splithttp/dialer.go::dialContext` 语义：TCP 恒拨出站 `dest`
 /// （`internet.DialSystem(ctxInner, dest, ...)`），URL authority（`config.host`）
@@ -515,9 +514,9 @@ impl DefaultDialerClient {
         // body 不在 RequestMeta，清空（避免 Vec 与 BoxBody 语义混淆）
         meta.body = None;
 
-        // 注入 XPadding
-        let xpad = self.config.build_xpadding_config(base_uri);
-        apply_xpadding_to_request_meta(&mut meta, &xpad);
+        // H7：padding 注入只在 build_stream_request_meta 内做一次（Go config.go:323-350
+        // FillStreamRequest 单次 ApplyXPaddingToRequest）。此前这里再次 apply，
+        // append 语义导致 wire 上双 Referer / 双 query x_padding。
 
         // 2. 构造 hyper Request，body 用 StreamBody
         let streaming_body = make_stream_body(body_stream);

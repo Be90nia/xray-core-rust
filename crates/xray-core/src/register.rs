@@ -319,15 +319,25 @@ fn dns_factory() -> FeatureFactory {
 /// `xray.app.policy.Config` 后构造 [`PolicyFeature`](xray_app_policy::PolicyFeature)。
 fn policy_factory() -> FeatureFactory {
     Arc::new(|data: &[u8]| {
+        // Go infra/conf/policy.go:73 `map[uint32]` 解码期硬错：JSON 损坏 /
+        // 非数字 level 键一律拒启，不再 unwrap_or_default / continue 静默丢级。
+        // 空配置（policy 节缺省）走缺省。
         let json_cfg: xray_conf::app_config::PolicyConfig =
-            serde_json::from_slice(data).unwrap_or_default();
+            if data.iter().all(|b| b.is_ascii_whitespace()) {
+                Default::default()
+            } else {
+                serde_json::from_slice(data).map_err(|e| FeatureError::StartFailed {
+                    name: "policy",
+                    message: format!("invalid policy config: {e}"),
+                })?
+            };
 
         let mut proto = xray_proto::xray::app::policy::Config::default();
         for (lv_str, pl) in &json_cfg.levels {
-            let lv = match lv_str.parse::<u32>() {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
+            let lv = lv_str.parse::<u32>().map_err(|_| FeatureError::StartFailed {
+                name: "policy",
+                message: format!("invalid policy level key: {lv_str:?} (need unsigned integer)"),
+            })?;
             let level_policy = policy_level_to_proto(pl);
             if let Some(buf) = level_policy.buffer.as_ref() {
                 // 启动可见性：打印该 level 生效的 per-connection 缓冲（字节；-1=无限）。
@@ -968,6 +978,35 @@ fn simple_feature_factory(kind: &'static str) -> FeatureFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// uasr①：policy levels 非数字键 / 损坏 JSON 拒启（Go policy.go:73
+    /// map[uint32] 解码期硬错），不再 continue 静默丢级 / unwrap_or_default。
+    #[test]
+    fn policy_factory_rejects_bad_level_keys_and_broken_json() {
+        let factory = policy_factory();
+        // 非数字 level 键 → StartFailed("policy")。
+        let err = registry_err(factory(br#"{"levels":{"abc":{"handshake":5}}}"#));
+        assert!(err.contains("invalid policy level key"), "{err}");
+        // 损坏 JSON → StartFailed。
+        let err = registry_err(factory(b"{not json"));
+        assert!(err.contains("invalid policy config"), "{err}");
+        // 合法数字键通过。
+        assert!(factory(br#"{"levels":{"0":{"handshake":5}}}"#).is_ok(), "valid levels must pass");
+        // 空配置（缺省）通过。
+        assert!(factory(b"").is_ok());
+    }
+
+    /// 从 factory 结果提取 StartFailed 消息（非 StartFailed 时 panic）。
+    fn registry_err(result: Result<Arc<dyn Feature>, FeatureError>) -> String {
+        match result {
+            Err(FeatureError::StartFailed { name, message }) => {
+                assert_eq!(name, "policy");
+                message
+            }
+            Err(_) => panic!("expected StartFailed, got other error variant"),
+            Ok(_) => panic!("expected StartFailed, got Ok"),
+        }
+    }
 
     #[test]
     fn register_all_features_makes_all_kinds_findable() {

@@ -138,68 +138,96 @@ impl Record {
     }
 }
 
-/// 合并 A/AAAA 记录的 IP 列表。对应 Go `app/dns/nameserver_cached.go::merge`。
+/// 记录的单家族展开。对应 Go `(*IPRecord).getIPs()`（dnscommon.go:56-75）：
+/// `rec == None` → `(空, 0, RecordNotFound)`；rcode 错误/空 IP 各给对应错误。
+/// 差异：**过期不坍缩为 RecordNotFound**——返回负 ttl（Go serveStale 依赖
+/// `serveExpiredTTL < ttl` 的负值比较）；`IpRecord::get_ips` 保持旧语义
+/// 供既有测试锚定。
+fn record_ips(rec: Option<&IpRecord>, now: Instant) -> (Vec<IpAddr>, i32, Option<DnsError>) {
+    let Some(r) = rec else {
+        return (Vec::new(), 0, Some(DnsError::RecordNotFound));
+    };
+    let ttl = raw_ttl_seconds(r.expire, now);
+    let err = if r.rcode != rcode::NO_ERROR {
+        Some(DnsError::from_rcode(r.rcode))
+    } else if r.ips.is_empty() {
+        Some(DnsError::EmptyResponse)
+    } else {
+        None
+    };
+    (r.ips.clone(), ttl, err)
+}
+
+/// 真实剩余 TTL（秒，向上取整，过期时为负）。
+#[must_use]
+pub fn raw_ttl_seconds(expire: Instant, now: Instant) -> i32 {
+    match expire.checked_duration_since(now) {
+        Some(d) => d.as_secs_f64().ceil() as i32,
+        None => {
+            let overdue = now - expire;
+            -(overdue.as_secs_f64().ceil() as i32)
+        }
+    }
+}
+
+/// 合并 A/AAAA 记录的 IP 列表。对应 Go `app/dns/dnscommon.go::merge`。
 ///
-/// 输入：`option`（查询什么）+ 可选的 rec4/rec6 + 已知错误。
-/// 输出：`(ips, min_ttl)` 或第一个非 RecordNotFound 错误。
+/// 返回 `(ips, ttl, err)` 三元组（Go 同形态）：**错误带 ttl**——负缓存
+/// （rcode=3 / 空答案）命中时 ttl>0，query_ip 层据此 TTL 内直接返回、不打
+/// 上游（Go nameserver_cached.go:27-32 cache HIT 分支）；双家族失败时
+/// 失败家族的 ttl 同样参与 min；同类错误返回该错误，异类聚合成一条
+/// （Go `errors.Combine`）。
+#[must_use]
 pub fn merge_records(
     option: IpOption,
     rec4: Option<&IpRecord>,
     rec6: Option<&IpRecord>,
     now: Instant,
-) -> Result<(Vec<IpAddr>, i32), DnsError> {
+) -> (Vec<IpAddr>, i32, Option<DnsError>) {
     const DEFAULT_TTL: i32 = 600;
     let merge_req = option.ipv4_enable && option.ipv6_enable;
 
-    // 默认 TTL，对应 Go `var rTTL int32 = dns.DefaultTTL`。
     let mut all_ips: Vec<IpAddr> = Vec::new();
     let mut r_ttl: i32 = DEFAULT_TTL;
-    let mut deferred_errs: Vec<DnsError> = Vec::new();
+    let mut errs: Vec<DnsError> = Vec::new();
 
-    if option.ipv4_enable {
-        match rec4.map(|r| r.get_ips(now)) {
-            None => return Err(DnsError::RecordNotFound),
-            Some(Err(e)) if !merge_req || matches!(e, DnsError::RecordNotFound) => {
-                return Err(e);
-            }
-            Some(Err(e)) => {
-                deferred_errs.push(e);
-            }
-            Some(Ok((ips, ttl))) => {
-                if ttl < r_ttl {
-                    r_ttl = ttl;
-                }
-                if !ips.is_empty() {
-                    all_ips.extend(ips);
-                }
-            }
+    for (enabled, rec) in [(option.ipv4_enable, rec4), (option.ipv6_enable, rec6)] {
+        if !enabled {
+            continue;
+        }
+        let (ips, ttl, err) = record_ips(rec, now);
+        // Go merge：单家族查询或 RecordNotFound → 立即返回（带 ttl）。
+        if !merge_req || matches!(err, Some(DnsError::RecordNotFound)) {
+            return (ips, ttl, err);
+        }
+        // 失败家族的 ttl 同样参与 min（Go 无条件执行）。
+        if ttl < r_ttl {
+            r_ttl = ttl;
+        }
+        if let Some(e) = err {
+            errs.push(e);
+        }
+        if !ips.is_empty() {
+            all_ips.extend(ips);
         }
     }
 
-    if option.ipv6_enable {
-        match rec6.map(|r| r.get_ips(now)) {
-            None => return Err(DnsError::RecordNotFound),
-            Some(Err(e)) if !merge_req || matches!(e, DnsError::RecordNotFound) => {
-                return Err(e);
-            }
-            Some(Err(e)) => {
-                deferred_errs.push(e);
-            }
-            Some(Ok((ips, ttl))) => {
-                if ttl < r_ttl {
-                    r_ttl = ttl;
-                }
-                if !ips.is_empty() {
-                    all_ips.extend(ips);
-                }
-            }
+    if !all_ips.is_empty() {
+        return (all_ips, r_ttl, None);
+    }
+    match errs.len() {
+        0 => (Vec::new(), r_ttl, None),
+        // Go：双家族同类失败 → 返回该错误（errors.Is 相等）。
+        _ if errs.iter().skip(1).all(|e| std::mem::discriminant(e) == std::mem::discriminant(&errs[0])) => {
+            (Vec::new(), r_ttl, errs.into_iter().next())
+        }
+        // 异类 → 聚合（Go errors.Combine；SystemResolve 承载聚合报文，
+        // 与 server.rs merge_query_errors 同款）。
+        _ => {
+            let combined = errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ");
+            (Vec::new(), r_ttl, Some(DnsError::SystemResolve(combined)))
         }
     }
-
-    if all_ips.is_empty() && !deferred_errs.is_empty() {
-        return Err(deferred_errs.into_iter().next().unwrap_or(DnsError::EmptyResponse));
-    }
-    Ok((all_ips, r_ttl))
 }
 
 // ---- DNS wire format helpers（hickory-proto 后端）----
@@ -452,7 +480,8 @@ mod tests {
             expire: now + Duration::from_secs(30),
             rcode: rcode::NO_ERROR,
         };
-        let (ips, ttl) = merge_records(IpOption::all(), Some(&rec4), Some(&rec6), now).unwrap();
+        let (ips, ttl, err) = merge_records(IpOption::all(), Some(&rec4), Some(&rec6), now);
+        assert!(err.is_none());
         assert_eq!(ips.len(), 2);
         assert_eq!(ttl, 30);
     }
@@ -461,8 +490,52 @@ mod tests {
     fn merge_returns_immediately_when_one_record_missing() {
         // option 同时查 v4+v6，但 v4 缺失 → RecordNotFound 直接返回。
         let now = Instant::now();
-        let res = merge_records(IpOption::all(), None, None, now);
-        assert!(matches!(res, Err(DnsError::RecordNotFound)));
+        let (ips, ttl, err) = merge_records(IpOption::all(), None, None, now);
+        assert!(ips.is_empty());
+        assert_eq!(ttl, 0);
+        assert!(matches!(err, Some(DnsError::RecordNotFound)));
+    }
+
+    /// bd wmdn① 回归：负缓存（rcode=3 空答案）TTL 内命中——merge 返回
+    /// `(空, ttl>0, RCodeError)`，query_ip 层据此直接返回、不打上游。
+    #[test]
+    fn merge_negative_cache_hit_carries_positive_ttl() {
+        let now = Instant::now();
+        let rec = IpRecord {
+            req_id: 1,
+            ips: vec![],
+            expire: now + Duration::from_secs(30),
+            rcode: rcode::NX_DOMAIN,
+        };
+        let (ips, ttl, err) = merge_records(IpOption::all(), Some(&rec), Some(&rec), now);
+        assert!(ips.is_empty());
+        assert!(ttl > 0 && ttl <= 30, "负缓存命中必须带正 ttl（TTL 内直返依据）");
+        assert!(matches!(err, Some(DnsError::RCodeError(3))));
+    }
+
+    /// bd rofg① 回归：双家族失败时失败家族的 ttl 参与 min——一条 rcode=3
+    /// 剩 10s、一条正常剩 120s → r_ttl=min(10,120)=10（修复前失败 ttl 丢失）。
+    #[test]
+    fn merge_failed_family_ttl_participates_in_min() {
+        let now = Instant::now();
+        let neg = IpRecord {
+            req_id: 1,
+            ips: vec![],
+            expire: now + Duration::from_secs(10),
+            rcode: rcode::NX_DOMAIN,
+        };
+        let good = IpRecord {
+            req_id: 2,
+            ips: vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+            expire: now + Duration::from_secs(120),
+            rcode: rcode::NO_ERROR,
+        };
+        let (ips, ttl, err) = merge_records(IpOption::all(), Some(&neg), Some(&good), now);
+        // Go merge：一家族失败、另一家族成功 → 返回成功家族 ips + nil err；
+        // 失败家族 ttl 仍参与 min（10 < 120 → rTTL=10，修复前失败 ttl 丢失）。
+        assert!(err.is_none());
+        assert_eq!(ips.len(), 1);
+        assert!(ttl > 0 && ttl <= 10, "失败家族 ttl 应参与 min");
     }
 
     /// 构造 DNS 响应字节（hickory builder）。

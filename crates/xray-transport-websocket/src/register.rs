@@ -61,10 +61,11 @@ pub fn register_dialer() -> io::Result<()> {
 ///
 /// 幂等：重复调用忽略 `AlreadyExists`。
 pub fn register_listener() -> io::Result<()> {
-    let listen_fn: TransportListenFn = Arc::new(move |addr, settings, _sockopt, handler| {
+    let listen_fn: TransportListenFn = Arc::new(move |addr, settings, sockopt, handler| {
         let settings = settings.clone();
         let handler = handler.clone();
-        Box::pin(async move { listen_ws(addr, &settings, &handler).await })
+        let trusted = sockopt.trusted_x_forwarded_for.clone();
+        Box::pin(async move { listen_ws(addr, &settings, &handler, trusted).await })
     });
     // ponytail: 重复注册忽略——主代理与测试可能并发触发注册。
     let _ = register_transport_listener("ws", listen_fn.clone());
@@ -73,10 +74,14 @@ pub fn register_listener() -> io::Result<()> {
 }
 
 /// 实际监听：解析 wsSettings → bind WsListener → spawn accept loop。
+///
+/// `trusted` = `sockopt.trustedXForwardedFor`（Go hub.go:117-121 socketSettings
+/// 透传给 requestHandler；空名单 = 永不采纳 XFF）。
 async fn listen_ws(
     addr: SocketAddr,
     settings: &StreamSettings,
     handler: &ConnHandler,
+    trusted: Vec<String>,
 ) -> io::Result<Box<dyn TransportListener>> {
     let config = parse_ws_config(settings.transport_json.as_ref())?;
     let ws_config = Arc::new(config);
@@ -84,6 +89,7 @@ async fn listen_ws(
     let mut ws_listener = crate::server::WsListener::bind(addr, ws_config.clone())
         .await
         .map_err(|e| io::Error::other(e))?;
+    ws_listener.trusted_x_forwarded_for = trusted;
 
     let local_addr = ws_listener.local_addr().map_err(|e| io::Error::other(e))?;
 
@@ -741,9 +747,10 @@ mod tests {
                 }
             });
         });
-        let listener = listen_ws("127.0.0.1:0".parse().unwrap(), &settings, &handler)
-            .await
-            .expect("listen_ws");
+        let listener =
+            listen_ws("127.0.0.1:0".parse().unwrap(), &settings, &handler, Vec::new())
+                .await
+                .expect("listen_ws");
         let addr = listener.local_addr().expect("local_addr");
 
         let dest = Destination::new(
@@ -784,9 +791,10 @@ mod tests {
     async fn close_rejects_new_connections() {
         let settings = StreamSettings { protocol: "websocket".into(), ..Default::default() };
         let handler: ConnHandler = Arc::new(|_| {});
-        let listener = listen_ws("127.0.0.1:0".parse().unwrap(), &settings, &handler)
-            .await
-            .expect("listen_ws");
+        let listener =
+            listen_ws("127.0.0.1:0".parse().unwrap(), &settings, &handler, Vec::new())
+                .await
+                .expect("listen_ws");
         let addr = listener.local_addr().expect("local_addr");
 
         listener.close().expect("close");

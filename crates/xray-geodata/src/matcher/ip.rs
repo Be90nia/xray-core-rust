@@ -666,8 +666,15 @@ pub enum BuildIPMatcherError {
 
 /// 从 IpRule 列表构建优化 IP 匹配器。
 ///
-/// 对应 Go 版本 `buildOptimizedIPMatcher`，将规则分为正向/反向，
-/// Custom/Geoip 四组，构建 HeuristicMultiIPMatcher。
+/// 对应 Go 版本 `buildOptimizedIPMatcher`（ip_matcher.go:940-1013）：Custom
+/// 规则按 reverse 分 pos/neg 两组，**每组 CIDR 合并为单个 IPSet**，neg 组
+/// 整组取反（match = ¬OR(in_i)）。逐条单例取反再 any() 聚合是德摩根错误
+/// （OR(¬in_i) ≠ ¬OR(in_i)）：`!geoip:cn` 展开的多条 reverse CIDR 会反向
+/// 命中组内其它 CIDR 未覆盖的 CN IP（bd 5fc7）。
+///
+/// Geoip 直收分支保持空集 stub：上游（router condition / dns jsonconf）已把
+/// geoip 展开为 Custom CIDR，此处无 geodata loader；空集 `max == NO_ENTRIES`
+/// 恒 false，与 Go `GetOrCreateFromGeoIPRules` 缺数据路径的空 IPSet 行为一致。
 pub fn build_optimized_ip_matcher(
     rules: &[IpRule],
 ) -> Result<Box<dyn IPMatcher>, BuildIPMatcherError> {
@@ -675,26 +682,21 @@ pub fn build_optimized_ip_matcher(
         return Err(BuildIPMatcherError::EmptyRules);
     }
 
-    let mut pos_matchers: Vec<HeuristicIPMatcher> = Vec::new();
-    let mut neg_matchers: Vec<HeuristicIPMatcher> = Vec::new();
+    let mut pos_custom: Vec<Cidr> = Vec::new();
+    let mut neg_custom: Vec<Cidr> = Vec::new();
+    let mut geo_matchers: Vec<HeuristicIPMatcher> = Vec::new();
 
     for rule in rules {
         match &rule.value {
-            Some(pb::ip_rule::Value::Geoip(geo_rule)) => {
-                let matcher = HeuristicIPMatcher::from_cidrs(&[]);
-                if geo_rule.reverse_match {
-                    neg_matchers.push(matcher);
-                } else {
-                    pos_matchers.push(matcher);
-                }
+            Some(pb::ip_rule::Value::Geoip(_)) => {
+                geo_matchers.push(HeuristicIPMatcher::from_cidrs(&[]));
             }
             Some(pb::ip_rule::Value::Custom(cidr_rule)) => {
-                if let Some(ref cidr) = cidr_rule.cidr {
-                    let matcher = HeuristicIPMatcher::from_cidrs(&[cidr.clone()]);
+                if let Some(cidr) = &cidr_rule.cidr {
                     if cidr_rule.reverse_match {
-                        neg_matchers.push(matcher);
+                        neg_custom.push(cidr.clone());
                     } else {
-                        pos_matchers.push(matcher);
+                        pos_custom.push(cidr.clone());
                     }
                 }
             }
@@ -702,19 +704,26 @@ pub fn build_optimized_ip_matcher(
         }
     }
 
-    let total = pos_matchers.len() + neg_matchers.len();
-    if total == 0 {
+    let mut subs: Vec<HeuristicIPMatcher> = Vec::new();
+    if !pos_custom.is_empty() {
+        subs.push(HeuristicIPMatcher::from_cidrs(&pos_custom));
+    }
+    if !neg_custom.is_empty() {
+        let mut m = HeuristicIPMatcher::from_cidrs(&neg_custom);
+        m.set_reverse(true);
+        subs.push(m);
+    }
+    subs.extend(geo_matchers);
+
+    if subs.is_empty() {
         return Err(BuildIPMatcherError::EmptyRules);
     }
 
-    let mut all_matchers = pos_matchers;
-    all_matchers.extend(neg_matchers);
-
-    if all_matchers.len() == 1 {
-        let matcher = all_matchers.pop().expect("len==1 guaranteed");
+    if subs.len() == 1 {
+        let matcher = subs.pop().expect("len==1 guaranteed");
         Ok(Box::new(matcher))
     } else {
-        Ok(Box::new(HeuristicMultiIPMatcher::new(all_matchers)))
+        Ok(Box::new(HeuristicMultiIPMatcher::new(subs)))
     }
 }
 
@@ -967,6 +976,65 @@ mod tests {
         assert!(matcher.match_ip(IpAddr::from([10, 0, 0, 1])));
         assert!(matcher.match_ip(IpAddr::from([192, 168, 1, 1])));
         assert!(!matcher.match_ip(IpAddr::from([8, 8, 8, 8])));
+    }
+
+    /// bd 5fc7 回归：`!geoip:cn` 展开为多条 reverse Custom CIDR。neg 组必须
+    /// 合并为单 IPSet 后组级取反（¬OR(in_i)）——CN IP 不命中、非 CN 命中。
+    /// 修复前逐条单例取反 any() 聚合（OR(¬in_i)）：CN IP 落在第一条 CIDR 时
+    /// 被其余单例的取反命中，反向放行。
+    #[test]
+    fn build_optimized_neg_group_de_morgan() {
+        // 模拟 geoip:cn 展开（两条 CIDR，均 reverse=true）。
+        let rules = vec![
+            IpRule {
+                value: Some(pb::ip_rule::Value::Custom(CidrRule {
+                    cidr: Some(Cidr::new(vec![103, 0, 0, 0], 8)),
+                    reverse_match: true,
+                })),
+            },
+            IpRule {
+                value: Some(pb::ip_rule::Value::Custom(CidrRule {
+                    cidr: Some(Cidr::new(vec![114, 114, 0, 0], 16)),
+                    reverse_match: true,
+                })),
+            },
+        ];
+        let matcher = build_optimized_ip_matcher(&rules).unwrap();
+        // CN IP（组内 CIDR 覆盖）不命中。
+        assert!(!matcher.match_ip(IpAddr::from([103, 1, 2, 3])));
+        assert!(!matcher.match_ip(IpAddr::from([114, 114, 114, 114])));
+        // 非 CN IP 命中。
+        assert!(matcher.match_ip(IpAddr::from([8, 8, 8, 8])));
+    }
+
+    /// bd 5fc7 回归：pos/neg 混合——pos 组 OR(in_pos) 与 neg 组组级取反
+    /// ¬OR(in_neg) 由 MultiIPMatcher any() 聚合。
+    #[test]
+    fn build_optimized_mixed_pos_neg_groups() {
+        let rules = vec![
+            IpRule {
+                value: Some(pb::ip_rule::Value::Custom(CidrRule {
+                    cidr: Some(Cidr::new(vec![192, 168, 0, 0], 16)),
+                    reverse_match: false,
+                })),
+            },
+            IpRule {
+                value: Some(pb::ip_rule::Value::Custom(CidrRule {
+                    cidr: Some(Cidr::new(vec![103, 0, 0, 0], 8)),
+                    reverse_match: true,
+                })),
+            },
+            IpRule {
+                value: Some(pb::ip_rule::Value::Custom(CidrRule {
+                    cidr: Some(Cidr::new(vec![114, 114, 0, 0], 16)),
+                    reverse_match: true,
+                })),
+            },
+        ];
+        let matcher = build_optimized_ip_matcher(&rules).unwrap();
+        assert!(matcher.match_ip(IpAddr::from([192, 168, 1, 1])), "pos 组命中");
+        assert!(!matcher.match_ip(IpAddr::from([103, 1, 2, 3])), "neg 组内不命中");
+        assert!(matcher.match_ip(IpAddr::from([8, 8, 8, 8])), "两组都不覆盖 → neg 取反命中");
     }
 
     // ── IPSet 语义契约（6nxp：区间化/前缀查找必须与线性扫描逐点一致）──

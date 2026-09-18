@@ -17,6 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::Mutex;
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 
@@ -178,6 +179,16 @@ pub fn write_tcp_request_body(addr: &str) -> Vec<u8> {
     out
 }
 
+/// client TCP 首包的带前缀 payload（`varint(FrameTypeTCPRequest) ++ buf`）。
+///
+/// ponytail: 编码 QUIC varint 0x401（双字节形式：0b01xx_xxxx_xxxx_xxxx）。
+fn tcp_request_first_payload(buf: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(8 + buf.len());
+    payload.extend_from_slice(&encode_varint(crate::config::FrameTypeTCPRequest));
+    payload.extend_from_slice(buf);
+    payload
+}
+
 /// QUIC stream 抽象（对应 Go `*quic.Stream`）。
 ///
 /// 异步方法用 `Pin<Box<dyn Future>>` 表达（避免引入 async_trait crate）。
@@ -193,6 +204,16 @@ pub trait QuicStream: Send + Sync + std::fmt::Debug {
         &'a self,
         buf: &'a [u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<usize>> + Send + 'a>>;
+
+    /// poll 式写直通（bd：HysteriaConn poll_write 零分配路径）。
+    ///
+    /// 单次同步 poll 把数据拷入底层发送缓冲（锁内无 await），避免 async 路径
+    /// 的 `to_vec` + future 装箱。允许部分写（返回已写入 n）。
+    fn poll_write(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>>;
 
     /// cancel read（对应 Go `stream.CancelRead(code)`）。
     fn cancel_read(&self, code: u64);
@@ -212,15 +233,21 @@ pub trait QuicStream: Send + Sync + std::fmt::Debug {
 /// QUIC conn 抽象（对应 Go `*quic.Conn`）。
 pub trait QuicConn: Send + Sync {
     /// 发送 datagram（对应 Go `conn.SendDatagram`）。
-    fn send_datagram<'a>(
-        &'a self,
-        data: &'a [u8],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>>;
+    ///
+    /// 收 owned [`Bytes`]（bd）：quinn `send_datagram` 接受 `impl Into<Bytes>`，
+    /// 上游组包（InterConn::write）产出的 Bytes 直接 move 进 QUIC 栈，
+    /// 免去 `&[u8]` 路径的 copy_from_slice。
+    fn send_datagram(
+        &self,
+        data: Bytes,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>;
 
     /// 接收 datagram（对应 Go `conn.ReceiveDatagram`）。
+    ///
+    /// 返回 owned [`Bytes`]：quinn `read_datagram` 原生产出，零拷贝。
     fn receive_datagram(
         &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<u8>>> + Send>>;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Bytes>> + Send>>;
 
     /// 关闭（对应 Go `conn.CloseWithError`）。
     fn close_with_error(&self, code: u64, reason: &str);
@@ -279,14 +306,20 @@ impl InterStreamConn {
             was
         };
         if need_prefix {
-            let mut payload = Vec::with_capacity(8 + buf.len());
-            // ponytail: 编码 QUIC varint 0x401（双字节形式：0b01xx_xxxx_xxxx_xxxx）。
-            payload.extend_from_slice(&encode_varint(crate::config::FrameTypeTCPRequest));
-            payload.extend_from_slice(buf);
+            let payload = tcp_request_first_payload(buf);
             self.stream.write(&payload).await.map(|_| buf.len())
         } else {
             self.stream.write(buf).await
         }
+    }
+
+    /// 取走 client 首包前缀标记（HysteriaConn poll_write 直通路径用）：
+    /// 返回 true 表示这是首包，调用方需走带前缀的 async 写路径。
+    pub(super) fn take_client_first(&self) -> bool {
+        let mut g = self.client_first.lock();
+        let was = *g;
+        *g = false;
+        was
     }
 
     /// 关闭（对应 Go `Close`）。
@@ -410,23 +443,33 @@ impl tokio::io::AsyncWrite for HysteriaConn {
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         let mut state = self.write_state.lock();
-        if state.is_none() {
-            let inner = Arc::clone(&self.inner);
-            let data = buf.to_vec();
-            let buf_len = buf.len();
-            *state = Some(Box::pin(async move { inner.write(&data).await }));
-            // ponytail: 记录原始 buf 长度，因为 write 可能返回不同长度
-            // 但我们无法在 future 完成前知道实际写了多少，所以用 buf_len 作为回退
-            let _ = buf_len;
-        }
-
-        let fut = state.as_mut().unwrap();
-        match fut.as_mut().poll(cx) {
-            std::task::Poll::Ready(result) => {
-                *state = None;
-                std::task::Poll::Ready(result)
-            },
-            std::task::Poll::Pending => std::task::Poll::Pending,
+        if let Some(fut) = state.as_mut() {
+            // client 首包前缀 future 在飞：继续 poll 它保持字节序
+            match fut.as_mut().poll(cx) {
+                std::task::Poll::Ready(result) => {
+                    *state = None;
+                    std::task::Poll::Ready(result)
+                },
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        } else if self.inner.take_client_first() {
+            // client 首包：需要 varint 帧类型前缀，组装后走 async 写
+            // （每连接一次，to_vec 可忽略）
+            let stream = Arc::clone(&self.inner.stream);
+            let payload = tcp_request_first_payload(buf);
+            *state = Some(Box::pin(async move { stream.write(&payload).await }));
+            match state.as_mut().unwrap().as_mut().poll(cx) {
+                std::task::Poll::Ready(result) => {
+                    *state = None;
+                    std::task::Poll::Ready(result)
+                },
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        } else {
+            // 常规路径：poll_write 直通（bd）——零 to_vec、零 future 装箱，
+            // quinn poll_write 单次拷入发送缓冲（锁内无 await）
+            drop(state);
+            self.inner.stream.poll_write(cx, buf)
         }
     }
 
@@ -476,10 +519,10 @@ pub struct InterConn {
     local: SocketAddr,
     remote: SocketAddr,
     id: u32,
-    /// 接收队列（QUIC datagram 投递到此）。
-    recv_rx: TokioMutex<mpsc::Receiver<Vec<u8>>>,
+    /// 接收队列（QUIC datagram 投递到此；Bytes 共享视图，feed 链零拷贝）。
+    recv_rx: TokioMutex<mpsc::Receiver<Bytes>>,
     /// 接收 tx 用于关闭信号。
-    recv_tx_close: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    recv_tx_close: Mutex<Option<mpsc::Sender<Bytes>>>,
     /// 最后活跃时间。
     last_active: Mutex<Instant>,
     /// 是否已关闭。
@@ -489,7 +532,7 @@ pub struct InterConn {
         Option<
             Arc<
                 dyn Fn(
-                        &[u8],
+                        Bytes,
                     ) -> std::pin::Pin<
                         Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>,
                     > + Send
@@ -562,16 +605,17 @@ impl InterConn {
     /// 写（对应 Go `Write`）。
     ///
     /// 注入 4 字节大端 session id 前缀，调 write_fn。
+    /// 组装走 `BytesMut::freeze`——write_fn 直收 owned Bytes（bd：免闭包内 to_vec）。
     pub async fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
         if *self.closed.lock() {
             return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed"));
         }
-        let mut payload = Vec::with_capacity(4 + buf.len());
-        payload.extend_from_slice(&self.id.to_be_bytes());
-        payload.extend_from_slice(buf);
+        let mut payload = BytesMut::with_capacity(4 + buf.len());
+        payload.put_slice(&self.id.to_be_bytes());
+        payload.put_slice(buf);
         let write_fn = self.write_fn.lock().clone();
         if let Some(f) = write_fn {
-            f(&payload).await?;
+            f(payload.freeze()).await?;
         }
         self.touch();
         Ok(buf.len())
@@ -598,10 +642,10 @@ impl InterConn {
     /// 设置写回调。
     pub fn set_write_fn<F, Fut>(&self, f: F)
     where
-        F: Fn(&[u8]) -> Fut + Send + Sync + 'static,
+        F: Fn(Bytes) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = std::io::Result<()>> + Send + 'static,
     {
-        *self.write_fn.lock() = Some(Arc::new(move |b: &[u8]| Box::pin(f(b))));
+        *self.write_fn.lock() = Some(Arc::new(move |b: Bytes| Box::pin(f(b))));
     }
 
     /// 设置关闭回调。
@@ -610,7 +654,9 @@ impl InterConn {
     }
 
     /// 投递一个 datagram 到接收 channel（对应 Go `udpSessionManager.feed`）。
-    pub fn feed(&self, data: Vec<u8>) {
+    ///
+    /// 收 owned [`Bytes`]：上层 `slice(4..)` 剥 session id 后传入，零拷贝。
+    pub fn feed(&self, data: Bytes) {
         let tx = self.recv_tx_close.lock().clone();
         if let Some(tx) = tx {
             let _ = tx.try_send(data);
@@ -759,7 +805,6 @@ impl UdpSessionManager {
             }
             run_inner.lock().await.close_all().await;
         });
-
         *self.clean_handle.lock().await = Some(clean_handle);
         *self.run_handle.lock().await = Some(run_handle);
     }
@@ -780,12 +825,11 @@ impl UdpSessionManager {
         let id = g.next_id;
         g.next_id = g.next_id.wrapping_add(1);
         let sess = Arc::new(InterConn::new(local, remote, id, UDP_MESSAGE_CHAN_SIZE));
-        // 设置 write_fn 调 conn.send_datagram
+        // 设置 write_fn 调 conn.send_datagram（Bytes 所有权 move 进 future，bd 免 to_vec）
         let conn_for_write = Arc::clone(&conn);
-        sess.set_write_fn(move |payload: &[u8]| {
+        sess.set_write_fn(move |payload: Bytes| {
             let conn = Arc::clone(&conn_for_write);
-            let payload = payload.to_vec();
-            Box::pin(async move { conn.send_datagram(&payload).await })
+            Box::pin(async move { conn.send_datagram(payload).await })
         });
         let inner_for_close = Arc::clone(&self.inner);
         let id_for_close = id;
@@ -811,11 +855,10 @@ impl UdpSessionManager {
 }
 
 impl UdpSessionInner {
-    fn feed(&mut self, id: u32, datagram: Vec<u8>, local: SocketAddr, remote: SocketAddr) {
-        // 已存在的 session：投递
+    fn feed(&mut self, id: u32, datagram: Bytes, local: SocketAddr, remote: SocketAddr) {
+        // 已存在的 session：投递（slice(4..) 剥 session id 前缀，零拷贝）
         if let Some(sess) = self.sessions.get(&id) {
-            // 剥除前 4 字节 session id
-            sess.feed(datagram[4..].to_vec());
+            sess.feed(datagram.slice(4..));
             return;
         }
         // 新 id（server 路径）：创建 InterConn 并 on_new_session。
@@ -824,13 +867,12 @@ impl UdpSessionInner {
         let sess = Arc::new(InterConn::new(local, remote, id, UDP_MESSAGE_CHAN_SIZE));
         if let Some(conn) = &self.conn {
             let conn_for_write = Arc::clone(conn);
-            sess.set_write_fn(move |payload: &[u8]| {
+            sess.set_write_fn(move |payload: Bytes| {
                 let conn = Arc::clone(&conn_for_write);
-                let payload = payload.to_vec();
-                Box::pin(async move { conn.send_datagram(&payload).await })
+                Box::pin(async move { conn.send_datagram(payload).await })
             });
         }
-        sess.feed(datagram[4..].to_vec());
+        sess.feed(datagram.slice(4..));
         self.sessions.insert(id, Arc::clone(&sess));
         if let Some(f) = on_new {
             f(sess);
@@ -857,10 +899,10 @@ mod tests {
         sent: parking_lot::Mutex<Vec<Vec<u8>>>,
     }
     impl QuicConn for NoopConn {
-        fn send_datagram<'a>(
-            &'a self,
-            data: &'a [u8],
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>>
+        fn send_datagram(
+            &self,
+            data: Bytes,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>
         {
             self.sent.lock().push(data.to_vec());
             Box::pin(async { Ok(()) })
@@ -868,7 +910,7 @@ mod tests {
 
         fn receive_datagram(
             &self,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<u8>>> + Send>>
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Bytes>> + Send>>
         {
             Box::pin(async {
                 std::future::pending::<()>().await;
@@ -942,6 +984,14 @@ mod tests {
                 Box::pin(async move { Ok(len) })
             }
 
+            fn poll_write(
+                &self,
+                _cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Ok(buf.len()))
+            }
+
             fn cancel_read(&self, _code: u64) {}
 
             fn close(
@@ -983,7 +1033,7 @@ mod tests {
         let local: SocketAddr = "127.0.0.1:80".parse().unwrap();
         let remote: SocketAddr = "127.0.0.1:443".parse().unwrap();
         let conn = Arc::new(InterConn::new(local, remote, 1, UDP_MESSAGE_CHAN_SIZE));
-        conn.feed(vec![1, 2, 3, 4]);
+        conn.feed(Bytes::from_static(&[1, 2, 3, 4]));
         let mut buf = [0u8; 16];
         let n = conn.read(&mut buf).await.unwrap();
         assert_eq!(n, 4);
@@ -997,9 +1047,8 @@ mod tests {
         let conn = InterConn::new(local, remote, 100, UDP_MESSAGE_CHAN_SIZE);
         let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let cap_clone = Arc::clone(&captured);
-        conn.set_write_fn(move |payload: &[u8]| {
+        conn.set_write_fn(move |payload: Bytes| {
             let cap = Arc::clone(&cap_clone);
-            let payload = payload.to_vec();
             Box::pin(async move {
                 cap.lock().extend_from_slice(&payload);
                 Ok(())
@@ -1047,7 +1096,7 @@ mod tests {
         // 模拟 client 上行 datagram：[id=7 BE][body...]
         {
             let mut g = mgr.inner.lock().await;
-            g.feed(7, vec![0, 0, 0, 7, 0xAA, 0xBB], local, remote);
+            g.feed(7, Bytes::from_static(&[0, 0, 0, 7, 0xAA, 0xBB]), local, remote);
         }
         let sess = rx.recv().await.expect("on_new_session fired");
         assert_eq!(sess.id(), 7);

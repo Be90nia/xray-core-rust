@@ -164,54 +164,57 @@ const ENC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 /// testpre 预连接池（对应 Go `outbound.Handler.preConns chan *ConnExpire`）。
 ///
 /// 持有已拨到 VLESS 服务器、**尚未写请求头**的裸连接；消费方照常走 ENC 握手 +
-/// 请求头（Go 语义：预连接只省 TCP dial，协议握手每条照做）。条目超过
-/// [`Self::ttl`] 丢弃（Go `ConnExpire` 2 分钟 TODO 缺省）。
+/// 请求头（Go 语义：预连接只省 TCP dial，协议握手每条照做）。Go preConns 是
+/// **无缓冲 chan**（outbound.go:161 `make(chan)`）：worker 拨号后 send 阻塞等
+/// 消费者到场，空闲时 worker 停在 send 上零新拨号；条目时戳在 send 时生成，
+/// 消费时检查过期（worker 排队延迟可致交付即过期）。
 struct PreConns {
-    max: usize,
     ttl: Duration,
-    inner: parking_lot::Mutex<std::collections::VecDeque<(Box<dyn Connection>, Instant)>>,
+    tx: tokio::sync::mpsc::Sender<(Box<dyn Connection>, Instant)>,
+    rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(Box<dyn Connection>, Instant)>>,
 }
 
 impl PreConns {
-    fn new(max: u32, ttl: Duration) -> Self {
+    fn new(ttl: Duration) -> Self {
+        // tokio mpsc 无 rendezvous 模式（capacity=0 panic），capacity=1 是最
+        // 贴近 Go unbuffered chan（outbound.go:161）的等价：空闲稳态 = 缓冲
+        // 1 条 + testpre 个 worker 各挂 1 条阻塞在 send —— 同样零新拨号；
+        // 消费时缓冲即刻有货（Go rendezvous 由队头 sender 秒交付）。
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
         Self {
-            max: max as usize,
             ttl,
-            inner: parking_lot::Mutex::new(std::collections::VecDeque::new()),
+            tx,
+            rx: tokio::sync::Mutex::new(rx),
         }
     }
 
-    /// 入池；池满丢弃（Go：goroutine 阻塞在带缓冲 chan，等价容量上限语义）。
-    fn push(&self, conn: Box<dyn Connection>) {
-        let mut q = self.inner.lock();
-        if q.len() >= self.max {
-            return;
-        }
-        q.push_back((conn, Instant::now()));
+    /// 入池：满则阻塞直到消费者腾位（Go worker 空闲时休息在此）。
+    /// 消费端已全部下线（handler 释放）时返回 Err，worker 随之退出。
+    async fn push(
+        &self,
+        conn: Box<dyn Connection>,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<(Box<dyn Connection>, Instant)>> {
+        self.tx.send((conn, Instant::now())).await
     }
 
-    /// 取一条未过期预连接；过期条目按序丢弃。
-    fn pop(&self) -> Option<Box<dyn Connection>> {
-        let mut q = self.inner.lock();
-        let now = Instant::now();
-        while let Some((conn, at)) = q.pop_front() {
-            if now.duration_since(at) <= self.ttl {
+    /// 取一条未过期预连接；过期条目丢弃后继续等（Go 消费循环
+    /// `<-h.preConns` 同语义）。全部 worker 退出后返回 None → 调用方自拨。
+    async fn pop(&self) -> Option<Box<dyn Connection>> {
+        let mut rx = self.rx.lock().await;
+        loop {
+            let (conn, at) = rx.recv().await?;
+            if Instant::now().duration_since(at) <= self.ttl {
                 return Some(conn);
             }
         }
-        None
-    }
-
-    #[cfg(test)]
-    fn queued(&self) -> usize {
-        self.inner.lock().len()
     }
 }
 
 /// testpre 预拨号 worker（对应 Go `initpre.Do` 起的 `testpre` 个 goroutine）：
-/// 循环拨服务器 → 入池 → sleep 200ms（Go TODO: customize & randomize）。拨号
-/// 失败记日志重试（Go LogWarning + continue）。任务随 handler 存活（Go 同为
-/// 无退出循环），进程退出由 runtime 回收。
+/// 循环拨服务器 → 入池（池满阻塞等消费腾位，空闲零新拨号）→ sleep 200ms
+/// （Go TODO: customize & randomize）。拨号失败记日志重试（Go LogWarning +
+/// continue）。任务随 handler 存活（Go 同为无退出循环），handler 释放后
+/// push 报 Err 退出（Go 是 goroutine 挂在 chan 上泄漏，此处更干净）。
 fn spawn_preconn_workers(config: Arc<VlessOutboundConfig>, pool: Arc<PreConns>, count: u32) {
     for _ in 0..count {
         let config = Arc::clone(&config);
@@ -219,7 +222,11 @@ fn spawn_preconn_workers(config: Arc<VlessOutboundConfig>, pool: Arc<PreConns>, 
         tokio::spawn(async move {
             loop {
                 match dial_server_conn(&config).await {
-                    Ok(conn) => pool.push(conn),
+                    Ok(conn) => {
+                        if pool.push(conn).await.is_err() {
+                            break; // handler 已释放，收摊
+                        }
+                    }
                     Err(e) => tracing::debug!(error = %e, "vless pre-connect failed"),
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -289,9 +296,8 @@ pub fn make_dial_fn_with_handshake_timeout(
         // testpre 预连接（Go `testpre > 0 && reverse == nil`；本 dispatcher 是
         // 普通 outbound 路径，reverse 是独立 outbound 不经此处）。首次拨号时
         // 才起 worker（对齐 Go initpre.Do 惰性初始化）。
-        let pre_conns = (config.testpre > 0).then(|| {
-            Arc::new(PreConns::new(config.testpre, Duration::from_secs(120)))
-        });
+        let pre_conns = (config.testpre > 0)
+            .then(|| Arc::new(PreConns::new(Duration::from_secs(120))));
         let preconn_once = Arc::new(std::sync::Once::new());
         Arc::new(move |dest: &Destination| {
             let config = Arc::clone(&config);
@@ -343,11 +349,16 @@ async fn establish_conn(
     target_port: Port,
     handshake_timeout: std::time::Duration,
 ) -> Result<Box<dyn Connection>, String> {
-    // 1. 取连接：testpre 池命中（免 TCP 握手）→ 用预连接；miss 正常拨
-    //    （Go 消费端阻塞等池，Rust 直拨更快且不会死锁）。有 streamSettings 走
-    //    transport dialer（ws/grpc/...），否则裸 TCP。
-    let mut conn: Box<dyn Connection> = match pre_conns.as_ref().and_then(|p| p.pop()) {
-        Some(c) => c,
+    // 1. 取连接：testpre 池命中（免 TCP 握手）→ 用预连接。Go testpre>0 时
+    //    消费端阻塞等池（outbound.go:174-183 `<-h.preConns`），从不自拨；
+    //    worker 与消费者同 runtime，await 让出即互不阻塞。pop 返回 None
+    //    仅在 pool 的 Sender 全部释放时类型上可能（消费期间 pool 由闭包
+    //    持有不会发生），分支保留作防御兜底。
+    let mut conn: Box<dyn Connection> = match pre_conns.as_ref() {
+        Some(p) => match p.pop().await {
+            Some(c) => c,
+            None => dial_server_conn(&config).await?,
+        },
         None => dial_server_conn(&config).await?,
     };
 
@@ -991,10 +1002,13 @@ mod tests {
         assert_eq!(dials.load(Ordering::SeqCst), 2, "只重试一次");
     }
 
-    /// PreConns 池语义：FIFO、容量上限丢弃、TTL 过期丢弃（Go preConns chan +
-    /// ConnExpire 等价）。连接用空壳 stub——池操作不触碰 IO。
-    #[test]
-    fn preconn_pool_fifo_cap_and_ttl() {
+    /// 空壳连接 stub：池操作不触碰 IO。
+    fn mk_nop_conn() -> Box<dyn Connection> {
+        use std::io;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
         struct NopConn;
         impl AsyncRead for NopConn {
             fn poll_read(
@@ -1028,24 +1042,56 @@ mod tests {
                 Ok(None)
             }
         }
-        let mk = || Box::new(NopConn) as Box<dyn Connection>;
+        Box::new(NopConn)
+    }
 
-        // 容量上限：max=2 时第 3 条入池被丢弃。
-        let pool = PreConns::new(2, Duration::from_secs(120));
-        pool.push(mk());
-        pool.push(mk());
-        assert_eq!(pool.queued(), 2, "push beyond cap must be dropped");
+    /// 回归（bd ub53）：PreConns = Go unbuffered chan（outbound.go:161）的
+    /// capacity=1 等价。池满（缓冲 1 + 无消费者）时 push 阻塞——空闲时
+    /// worker 休息在 send 上零新拨号；消费者到场即时腾位交付。
+    #[tokio::test]
+    async fn preconn_push_blocks_until_consumer_arrives() {
+        let pool = Arc::new(PreConns::new(Duration::from_secs(120)));
 
-        // FIFO：先入先出，全部可取。
-        assert!(pool.pop().is_some());
-        assert!(pool.pop().is_some());
-        assert!(pool.pop().is_none(), "empty pool returns None");
+        // 第 1 条入缓冲即完成；第 2 条挂起（Go worker 休息在 send 上）。
+        let p1 = Arc::clone(&pool);
+        let push1 = tokio::spawn(async move { p1.push(mk_nop_conn()).await });
+        let p2 = Arc::clone(&pool);
+        let push2 = tokio::spawn(async move { p2.push(mk_nop_conn()).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(push1.is_finished(), "first push fills the buffer slot");
+        assert!(
+            !push2.is_finished(),
+            "push must block when pool full and no consumer (Go unbuffered chan semantics)"
+        );
 
-        // TTL：极短 ttl 下入池条目立即过期。
-        let short = PreConns::new(2, Duration::from_millis(1));
-        short.push(mk());
-        std::thread::sleep(Duration::from_millis(5));
-        assert!(short.pop().is_none(), "expired entry must be skipped");
-        assert_eq!(short.queued(), 0, "expired entry removed from queue");
+        // 消费者到场 → 交付缓冲条目、push2 腾位完成。
+        let got = pool.pop().await;
+        assert!(got.is_some(), "consumer must receive the first conn");
+        push1.await.unwrap().unwrap();
+        push2.await
+            .unwrap()
+            .expect("push2 completes once consumer arrived");
+    }
+
+    /// 排队延迟致交付即过期的条目被丢弃跳过（Go ConnExpire 消费检查同语义）。
+    #[tokio::test]
+    async fn preconn_expired_entry_skipped() {
+        let pool = Arc::new(PreConns::new(Duration::from_millis(5)));
+        // 第一条挂起在 send 上，50ms（> ttl）后交付即过期 → 弃。
+        let p1 = Arc::clone(&pool);
+        tokio::spawn(async move { p1.push(mk_nop_conn()).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // 第二条在消费等待中 push（未过期）→ 被交付。
+        let p2 = Arc::clone(&pool);
+        let second = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            p2.push(mk_nop_conn()).await
+        });
+        let got = pool
+            .pop()
+            .await
+            .expect("unexpired second entry must be delivered after skipping expired first");
+        drop(got);
+        second.await.unwrap().expect("second push delivered");
     }
 }

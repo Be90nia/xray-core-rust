@@ -134,7 +134,7 @@ pub fn parse_domain_rule(
     let code = &rule[8..];
     let expanded = format!("ext:{}:{}", DEFAULT_GEOSITE_DAT, code);
     parse_geo_site_rule(&expanded, datadir)
-  } else if rule.starts_with("ext:") || rule.starts_with("ext-domain:") {
+  } else if rule.starts_with("ext:") || rule.starts_with("ext-domain:") || rule.starts_with("ext-site:") {
     parse_geo_site_rule(rule, datadir)
   } else {
     parse_custom_domain_rule(rule, default_type)
@@ -272,15 +272,19 @@ pub fn parse_cidr(s: &str) -> Result<Cidr, RuleParserError> {
   Ok(Cidr::new(ip_bytes, prefix))
 }
 
-/// 解析 ext/ext-domain 前缀的域名规则。
+/// 解析 ext/ext-domain/ext-site 前缀的域名规则。
 ///
-/// 格式: `ext:filename:code` 或 `ext-domain:filename:code@attr1@attr2`。
+/// 格式: `ext:filename:code`、`ext-domain:filename:code` 或
+/// `ext-site:filename:code@attr1@attr2`（Go rule_parser.go:141/170 三前缀
+/// 同走 parseGeoSiteRule）。
 fn parse_geo_site_rule(
   rule: &str,
   datadir: &Path,
 ) -> Result<DomainRule, RuleParserError> {
   let body = if rule.starts_with("ext-domain:") {
     &rule[11..]
+  } else if rule.starts_with("ext-site:") {
+    &rule[9..]
   } else if rule.starts_with("ext:") {
     &rule[4..]
   } else {
@@ -483,6 +487,20 @@ mod tests {
   }
 
   // ── test_parse_custom_domain_rule ───────────────────────────
+
+  /// bd rofg⑥ 回归：`ext-site:` 前缀与 `ext:`/`ext-domain:` 同走 geosite
+  /// 解析（Go rule_parser.go:141/170）。修复前落 parse_custom_domain_rule
+  /// 变字面量 keyword 规则。空 datadir 下 check_file 必败——断言进入
+  /// geosite 路径（FileCheckFailed）而非 Ok(Custom)。
+  #[test]
+  fn parse_domain_rule_ext_site_prefix_routes_to_geosite() {
+    let dir = std::env::temp_dir();
+    let rule = parse_domain_rule("ext-site:geosite.dat:cn", DomainType::Full, &dir);
+    assert!(
+      matches!(rule, Err(RuleParserError::FileCheckFailed(_))),
+      "ext-site: 前缀应路由进 geosite 解析，而非落字面量 keyword"
+    );
+  }
 
   #[test]
   fn test_parse_custom_domain_rule() {

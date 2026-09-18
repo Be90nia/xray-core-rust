@@ -15,7 +15,7 @@ use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::debug;
 
 use crate::client::{DefaultDialerClient, DialTarget, ReqBody, hyper_err_to_io, make_stream_body};
-use crate::config::Config;
+use crate::config::{Config, RangeConfig};
 use crate::connection::SplitConn;
 use crate::error::{Result, SplitHttpError};
 use crate::h3_client::H3Conn;
@@ -59,7 +59,7 @@ pub async fn dial_packet_up(
     base_uri: String,
     session_id: String,
     sc_max_each_post_bytes: usize,
-    sc_min_posts_interval_ms: u64,
+    sc_min_posts_interval_ms: RangeConfig,
 ) -> Result<PacketUpConn> {
     // 1. GET 下载流（stream-down，lazy reader——POST 上传任务见下）
     let (download_reader, remote, local) = client.open_stream(&base_uri, &session_id, None).await?;
@@ -74,6 +74,7 @@ pub async fn dial_packet_up(
     tokio::spawn(async move {
         let mut seq: u64 = 0;
         let mut read_buf = vec![0u8; sc_max_each_post_bytes];
+        let mut last_write = std::time::Instant::now();
         loop {
             let n = match pipe_server.read(&mut read_buf).await {
                 Ok(0) => break,
@@ -95,9 +96,17 @@ pub async fn dial_packet_up(
                 break;
             }
 
-            if sc_min_posts_interval_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(sc_min_posts_interval_ms)).await;
+            // H11：Go dialer.go:511 每次 POST 后 sleep `scMinPostsIntervalMs.rand()`
+            // 毫秒（减去已耗时间）；此前恒 sleep `from`。saturating_sub 对齐
+            // Go 的 `- time.Since(lastWrite)`（本轮耗时抵扣，不足不睡）。
+            if sc_min_posts_interval_ms.from > 0 {
+                let elapsed = last_write.elapsed().as_millis() as u64;
+                let delay = (sc_min_posts_interval_ms.rand() as u64).saturating_sub(elapsed);
+                if delay > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
             }
+            last_write = std::time::Instant::now();
         }
     });
 
@@ -309,12 +318,14 @@ pub async fn dial(
         "packet-up" => {
             let sc_max = config.normalized_sc_max_each_post_bytes();
             let sc_min = config.normalized_sc_min_posts_interval_ms();
+            // H11：Go dialer.go:464 maxUploadSize 每连接 rand() 采样一次
+            // （此前恒取 from——自定义 range 下性能坍塌 + 定长流量指纹）。
             dial_packet_up(
                 client,
                 base_uri,
                 session_id,
-                sc_max.from.max(1) as usize,
-                sc_min.from as u64,
+                sc_max.rand().max(1) as usize,
+                sc_min,
             )
             .await
         }
@@ -341,7 +352,7 @@ pub async fn dial_h3_packet_up(
     base_uri: String,
     session_id: String,
     sc_max_each_post_bytes: usize,
-    sc_min_posts_interval_ms: u64,
+    sc_min_posts_interval_ms: RangeConfig,
 ) -> Result<PacketUpConn> {
     // 1. GET 下载流
     let (download_reader, remote, local) = client.open_stream(&base_uri, &session_id, None).await?;
@@ -356,6 +367,7 @@ pub async fn dial_h3_packet_up(
     tokio::spawn(async move {
         let mut seq: u64 = 0;
         let mut read_buf = vec![0u8; sc_max_each_post_bytes];
+        let mut last_write = std::time::Instant::now();
         loop {
             let n = match pipe_server.read(&mut read_buf).await {
                 Ok(0) => break,
@@ -377,9 +389,15 @@ pub async fn dial_h3_packet_up(
                 break;
             }
 
-            if sc_min_posts_interval_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(sc_min_posts_interval_ms)).await;
+            // H11：同 dial_packet_up——每 POST rand 采样间隔（Go dialer.go:511）。
+            if sc_min_posts_interval_ms.from > 0 {
+                let elapsed = last_write.elapsed().as_millis() as u64;
+                let delay = (sc_min_posts_interval_ms.rand() as u64).saturating_sub(elapsed);
+                if delay > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
             }
+            last_write = std::time::Instant::now();
         }
     });
 
@@ -409,15 +427,13 @@ pub async fn dial_h3_stream_up(
     Ok(SplitConn::new(download_reader, pipe_client, remote, local))
 }
 
-/// H3 stream-one mode 拨号：POST streaming body + GET 下载（双 stream）。
+/// H3 stream-one mode 拨号：单 stream 全双工（POST streaming body + 同一
+/// 响应流下载）。
 ///
 /// 与 [`dial_stream_one`] 对应，但走 H3 over QUIC。
 ///
-/// # 简化（vs Go stream-one）
-///
-/// Go 版 stream-one 用单 HTTP/2 stream 全双工（REALITY 流量伪装需求）。
-/// H3 无 REALITY 流量伪装需求（REALITY 强制 H2），用双 stream 实现：
-/// POST streaming body 上传 + GET 下载，与 stream-up 等价。
+/// H12：对齐 Go stream-one 单连接语义（dialer.go:469-479）——此前用 POST+GET
+/// 双 stream 实现，服务端会多出一条连接。
 pub async fn dial_h3_stream_one(
     client: Arc<H3Conn>,
     base_uri: String,
@@ -476,12 +492,13 @@ pub async fn dial_h3(
         "packet-up" => {
             let sc_max = config.normalized_sc_max_each_post_bytes();
             let sc_min = config.normalized_sc_min_posts_interval_ms();
+            // H11：同 dial_packet_up——每连接 rand() 采样。
             dial_h3_packet_up(
                 client,
                 base_uri,
                 session_id,
-                sc_max.from.max(1) as usize,
-                sc_min.from as u64,
+                sc_max.rand().max(1) as usize,
+                sc_min,
             )
             .await
         }

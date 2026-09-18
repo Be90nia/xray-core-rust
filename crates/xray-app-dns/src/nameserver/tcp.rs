@@ -59,6 +59,8 @@ pub struct TcpNameServer {
     conn: tokio::sync::Mutex<Option<crate::dial::DnsStream>>,
     /// 域名解析器（直连兜底路径）。
     resolver: Arc<dyn crate::dial::HostResolver>,
+    /// `+local`：强制直连（绕过共享 dialer，Go Local mode nil dispatcher）。
+    force_local: bool,
 }
 impl TcpNameServer {
     /// 构造。
@@ -80,7 +82,15 @@ impl TcpNameServer {
             id_gen: AtomicReqIdGen::new(),
             conn: tokio::sync::Mutex::new(None),
             resolver,
+            force_local: false,
         }
+    }
+
+    /// 标记 `+local`（强制直连，绕过共享 dialer；bd wmdn②）。
+    #[must_use]
+    pub fn force_local(mut self, v: bool) -> Self {
+        self.force_local = v;
+        self
     }
 
     /// 从 `NameServerConfig` 构造（地址接受 IP 或域名，bd mcpo）。
@@ -99,20 +109,29 @@ impl TcpNameServer {
             ns.negative_ttl_secs.unwrap_or(0),
         ));
         cache.start_cleanup_task(crate::cache_controller::CLEANUP_INTERVAL);
-        Ok(Box::new(Arc::new(Self::new(
-            dest,
-            cache,
-            ns.client_ip.clone(),
-            timeout_dur,
-            Arc::new(crate::dial::SystemHostResolver),
-        ))))
+        Ok(Box::new(Arc::new(
+            Self::new(
+                dest,
+                cache,
+                ns.client_ip.clone(),
+                timeout_dur,
+                Arc::new(crate::dial::SystemHostResolver),
+            )
+            .force_local(ns.force_local),
+        )))
     }
 
     /// 建立查询流：共享 dialer 在场经路由出站（Go nameserver_tcp.go:43-47
     /// dispatcher.Dispatch 语义）；缺席直连兜底（域名每查询现解析）。
     async fn connect(&self) -> Result<crate::dial::DnsStream, DnsError> {
-        crate::dial::connect_stream(&self.dest, self.resolver.as_ref(), self.query_timeout, "tcp")
-            .await
+        crate::dial::connect_stream(
+            &self.dest,
+            self.resolver.as_ref(),
+            self.query_timeout,
+            "tcp",
+            self.force_local,
+        )
+        .await
     }
 
     /// 在已有连接上执行单次 TCP 查询。

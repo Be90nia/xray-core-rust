@@ -3,6 +3,7 @@
 //! 对应 Go 版本 `common/protocol/` 包，定义安全类型、命令、ID 和请求/响应头。
 
 pub mod account;
+pub mod http;
 pub mod server_spec;
 pub mod time;
 pub mod user;

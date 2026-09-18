@@ -14,7 +14,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -396,7 +396,7 @@ const UDP_ASSOC_IDLE: Duration = Duration::from_secs(60);
 
 /// 会话上行项：(目标, 负载, 回写目标, 请求 pkt_id——响应帧原样回显，
 /// 客户端 quic 模式按 (assoc_id, pkt_id) 配对)。
-type UdpAssocItem = (Destination, Vec<u8>, ReplySink, u16);
+type UdpAssocItem = (Destination, Bytes, ReplySink, u16);
 
 /// UDP 响应回写目标：与请求到达通道同模式（spec：server 按首包模式回写）。
 ///
@@ -571,7 +571,7 @@ async fn udp_assoc_direct(assoc_id: u16, mut rx: tokio::sync::mpsc::Receiver<Udp
                                 assoc_id,
                                 cur_pkt_id,
                                 socket_addr_to_tuic(peer),
-                                resp_buf[..n].to_vec(),
+                                Bytes::copy_from_slice(&resp_buf[..n]),
                             );
                             if let Err(e) = s.write_packet(&pkt).await {
                                 tracing::debug!("tuic udp assoc {assoc_id} reply: {e:?}");
@@ -621,11 +621,12 @@ async fn udp_assoc_dispatch(
                 match r {
                     Ok(Some((source, payload))) => {
                         if let Some(s) = sink.as_mut() {
+                            // Vec → Bytes 零拷贝（recv_packet 的 owned 载荷）
                             let pkt = Packet::new(
                                 assoc_id,
                                 cur_pkt_id,
                                 dest_to_tuic_addr(&source),
-                                payload,
+                                Bytes::from(payload),
                             );
                             if let Err(e) = s.write_packet(&pkt).await {
                                 tracing::debug!("tuic udp assoc {assoc_id} reply: {e:?}");
@@ -635,8 +636,10 @@ async fn udp_assoc_dispatch(
                     }
                     Ok(None) => break, // outbound 关闭
                     Err(e) => {
+                        // qyn8：recv 错误结束会话（Go read 错误语义），
+                        // continue 与滞留坏帧构成忙旋
                         tracing::debug!("tuic udp assoc {assoc_id} dispatch recv: {e:?}");
-                        continue; // 坏帧跳过（与 SS relay 一致）
+                        break;
                     }
                 }
             }
@@ -1021,7 +1024,7 @@ mod udp_assoc_tests {
         assert_eq!(resp, b"uni ping");
 
         // ② bi-stream Packet 被忽略（无响应 → 读端超时）
-        let pkt = Packet::new(0x0A11, 999, target, b"bi ping".to_vec());
+        let pkt = Packet::new(0x0A11, 999, target, bytes::Bytes::from_static(b"bi ping"));
         let (mut send, mut recv) =
             client.quinn_conn().open_bi().await.expect("open bi");
         let mut buf = bytes::BytesMut::with_capacity(pkt.encoded_len() + 2);

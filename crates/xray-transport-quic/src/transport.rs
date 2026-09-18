@@ -27,7 +27,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use bytes::Bytes;
+use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use xray_common::net::destination::Destination;
 use xray_transport::connection::Connection;
@@ -191,14 +191,19 @@ impl<E: Send + Sync + Unpin> QuicConn<E> {
             let (mut rd, mut wr) = tokio::io::split(server);
             // s: 读 duplex-write 半边 → 写到 quinn send；EOF 时 finish() 半关闭
             let s = async {
-                let mut buf = vec![0u8; 32 * 1024];
+                // read_buf 直写 BytesMut spare capacity（免中间栈 buffer），freeze 后
+                // owned Bytes move 给 quinn——原 `vec![0u8; 32K] + copy_from_slice`
+                // 的第二次 32KB memcpy 消除。reserve 保证每轮读预算（spare 为 0 时
+                // read_buf 返回 Ok(0) 会被误判 EOF）。
+                let mut buf = BytesMut::with_capacity(32 * 1024);
                 loop {
-                    let n = rd.read(&mut buf).await?;
+                    buf.reserve(32 * 1024);
+                    let n = rd.read_buf(&mut buf).await?;
                     if n == 0 {
                         let _ = send.finish();
                         break;
                     }
-                    send.write_chunk(Bytes::copy_from_slice(&buf[..n]))
+                    send.write_chunk(buf.split().freeze())
                         .await
                         .map_err(io_err)?;
                 }

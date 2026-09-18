@@ -1278,7 +1278,7 @@ mod tests {
         let mut server_cfg = BuiltConfig::default();
         server_cfg.inbounds.push(BuiltInbound {
             entry: BuiltEntry { kind: "vless".into(),
-                data: br#"{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}"#.to_vec() },
+                data: br#"{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}],"decryption":"none"}"#.to_vec() },
             tag: "vless-in".into(), port: Some(vless_port), listen: Some("127.0.0.1".into()),
             stream_settings_json: None, sniffing_json: None,
         });
@@ -1427,7 +1427,7 @@ mod tests {
         let mut server_cfg = BuiltConfig::default();
         server_cfg.inbounds.push(BuiltInbound {
             entry: BuiltEntry { kind: "vless".into(),
-                data: br#"{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}"#.to_vec() },
+                data: br#"{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}],"decryption":"none"}"#.to_vec() },
             tag: "vless-ws-in".into(), port: Some(vless_port), listen: Some("127.0.0.1".into()),
             stream_settings_json: Some(ws_settings.into()), sniffing_json: None,
         });
@@ -1601,7 +1601,7 @@ mod tests {
         let mut server_cfg = BuiltConfig::default();
         server_cfg.inbounds.push(BuiltInbound {
             entry: BuiltEntry { kind: "vless".into(),
-                data: br#"{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}"#.to_vec() },
+                data: br#"{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}],"decryption":"none"}"#.to_vec() },
             tag: "vless-tls-in".into(), port: Some(vless_port), listen: Some("127.0.0.1".into()),
             stream_settings_json: Some(serde_json::from_str(&server_tls).unwrap()), sniffing_json: None,
         });
@@ -1686,7 +1686,7 @@ mod tests {
         let mut server_cfg = BuiltConfig::default();
         server_cfg.inbounds.push(BuiltInbound {
             entry: BuiltEntry { kind: "vless".into(),
-                data: br#"{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]}"#.to_vec() },
+                data: br#"{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}],"decryption":"none"}"#.to_vec() },
             tag: "vless-vision-in".into(), port: Some(vless_port), listen: Some("127.0.0.1".into()),
             stream_settings_json: Some(serde_json::from_str(&server_tls).unwrap()), sniffing_json: None,
         });
@@ -1801,7 +1801,7 @@ mod tests {
         let mut server_cfg = BuiltConfig::default();
         server_cfg.inbounds.push(BuiltInbound {
             entry: BuiltEntry { kind: "vless".into(),
-                data: br#"{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision","testseed":[7,8,9,10]}]}"#.to_vec() },
+                data: br#"{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision","testseed":[7,8,9,10]}],"decryption":"none"}"#.to_vec() },
             tag: "vless-seed-in".into(), port: Some(vless_port), listen: Some("127.0.0.1".into()),
             stream_settings_json: Some(serde_json::from_str(&server_tls).unwrap()), sniffing_json: None,
         });
@@ -2600,7 +2600,7 @@ mod tests {
         server_cfg.inbounds.push(BuiltInbound {
             entry: BuiltEntry {
                 kind: "vless".into(),
-                data: format!(r#"{{"clients":[{{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}}],"fallbacks":[{{"dest":"{fb_addr}","xver":0}}]}}"#).into_bytes(),
+                data: format!(r#"{{"clients":[{{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}}],"decryption":"none","fallbacks":[{{"dest":"{fb_addr}","xver":0}}]}}"#).into_bytes(),
             },
             tag: "vless-fb-in".into(), port: Some(vless_port), listen: Some("127.0.0.1".into()),
             stream_settings_json: Some(serde_json::from_str(&server_tls).unwrap()), sniffing_json: None,
@@ -3771,7 +3771,7 @@ mod tests {
         let mut server_cfg = BuiltConfig::default();
         server_cfg.inbounds.push(BuiltInbound {
             entry: BuiltEntry { kind: "vless".into(),
-                data: br#"{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}"#.to_vec() },
+                data: br#"{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}],"decryption":"none"}"#.to_vec() },
             tag: "vless-in".into(), port: Some(server_port), listen: Some("127.0.0.1".into()),
             stream_settings_json: None, sniffing_json: None,
         });

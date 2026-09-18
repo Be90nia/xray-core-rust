@@ -93,7 +93,10 @@ impl Reader for EndpointOverrideReader {
             loop {
                 let mb = self.inner.read_multi_buffer().await?;
                 let eof = mb.is_empty();
-                self.pending.extend_from_slice(&mb.to_vec());
+                // 逐 buffer extend：mb.to_vec() 会先堆分配扁平 Vec 再拷一次
+                for b in mb.iter() {
+                    self.pending.extend_from_slice(b.bytes());
+                }
                 let (out, consumed) = rewrite_complete_frames(&self.pending, &self.from, &self.to);
                 self.pending.drain(..consumed);
                 if eof {
@@ -136,7 +139,10 @@ impl EndpointOverrideWriter {
 impl Writer for EndpointOverrideWriter {
     fn write_multi_buffer(&mut self, mb: MultiBuffer) -> Pin<Box<dyn Future<Output = IoResult<()>> + Send + '_>> {
         Box::pin(async move {
-            self.pending.extend_from_slice(&mb.to_vec());
+            // 逐 buffer extend：mb.to_vec() 会先堆分配扁平 Vec 再拷一次
+            for b in mb.iter() {
+                self.pending.extend_from_slice(b.bytes());
+            }
             let (out, consumed) = rewrite_complete_frames(&self.pending, &self.from, &self.to);
             self.pending.drain(..consumed);
             if out.is_empty() {

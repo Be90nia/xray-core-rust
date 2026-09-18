@@ -6215,6 +6215,7 @@ name = "xray-proxy-hysteria"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "parking_lot",
  "prost",
  "quinn",
@@ -6367,6 +6368,7 @@ name = "xray-proxy-tun"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "parking_lot",
  "serde_json",
  "smoltcp",

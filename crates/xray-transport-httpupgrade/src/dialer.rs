@@ -137,11 +137,13 @@ pub fn parse_upgrade_response(bytes: &[u8]) -> Result<usize> {
     }
     let upgrade_lower = upgrade_value.to_ascii_lowercase();
     let connection_lower = connection_value.to_ascii_lowercase();
-    // 与 Go 一致：要求 status=="101 Switching Protocols" + Upgrade="websocket" + Connection="upgrade"
-    // （大小写不敏感比较，因为生产实现中服务端可能写不同大小写）
+    // H15：对齐 Go dialer.go:22-33 精确比对（lowercase 后 ==）——此前 contains
+    // 宽于 Go（`Upgrade: not-websocket` / `Connection: keep-alive, upgrade` 会被
+    // Go 拒绝而 Rust 误接受）。多值逗号拼接形态已不可绕过：Go 侧 header 多值
+    // 也会拼逗号再整体比较。
     let status_ok = status.eq_ignore_ascii_case("101 Switching Protocols");
-    let upgrade_ok = upgrade_lower.contains("websocket");
-    let connection_ok = connection_lower.contains("upgrade");
+    let upgrade_ok = upgrade_lower == "websocket";
+    let connection_ok = connection_lower == "upgrade";
     if !status_ok || !upgrade_ok || !connection_ok {
         return Err(HttpUpgradeError::UnrecognizedReply {
             status: status.to_string(),

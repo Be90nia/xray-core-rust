@@ -175,13 +175,16 @@ pub fn apply_trusted_x_forwarded_for(
     None
 }
 
-/// 校验请求 Host 是否匹配配置允许的 host 列表（逗号分隔）。对应 Go
-/// `internet.IsValidHTTPHost`。
+/// 校验请求 Host 是否匹配配置允许的 host 列表（逗号分隔）。
+///
+/// 单个 host 的比对走 Go `internet.IsValidHTTPHost`（H2 对齐 internet.go:8-16：
+/// lowercase + 请求侧剥端口 + 精确匹配，见
+/// [`xray_common::protocol::http::is_valid_http_host`]）。
 fn is_valid_http_host(actual: &str, allowed: &str) -> bool {
     allowed
         .split(',')
-        .map(|s| s.trim())
-        .any(|allowed_host| allowed_host.eq_ignore_ascii_case(actual))
+        .map(str::trim)
+        .any(|allowed_host| xray_common::protocol::http::is_valid_http_host(actual, allowed_host))
 }
 
 /// 在字节流中查找 `\r\n\r\n`（header 终止符）位置。返回起始下标。

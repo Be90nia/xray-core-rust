@@ -58,14 +58,24 @@ async fn dial_splithttp(
     let config = parse_splithttp_config(settings.transport_json.as_ref())?;
     let config = Arc::new(config);
     let default_sni = dest.address().to_string();
-    // ponytail: 域名前置部署下，SNI 用 tlsSettings.serverName（CF 选 tunnel/zone）；
-    // :authority 拼接为 {host}:{dest.port}，对齐 Go requestURL。早先「:authority
-    // 必须等于裸 dest」的实测结论已被抓包 A/B 证伪——Go 侧 :authority=dest:443
-    // 同样 PASS（880KB e2e），CDN 接受带端口后缀的 :authority。
-    let host = if config.host.is_empty() {
-        format!("{}:{}", dest.address(), dest.port())
+    // H10：Go dialer.go:311-321 requestURL.Host 恒为裸 host——config.Host →
+    // tls/reality ServerName → dest.Address 三级回退，**从不追加 :port**
+    // （端口仅在 Go browser_dialer 分支追加，Rust 无此分支）。此前恒拼
+    // `:{dest.port}` 造成 Host/:authority 指纹差异。
+    // ponytail: 之前「:authority 拼端口」是基于 CF 实测可接受形态，但与
+    // Go wire 不同——对齐 Go 回裸 host。
+    let sni_from_settings = settings
+        .security_json
+        .as_ref()
+        .and_then(|v| v.get("serverName"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let host = if !config.host.is_empty() {
+        config.host.clone()
+    } else if !sni_from_settings.is_empty() {
+        sni_from_settings.to_string()
     } else {
-        format!("{}:{}", config.host, dest.port())
+        default_sni.clone()
     };
 
     let has_tls = matches!(settings.security.as_str(), "tls" | "reality");

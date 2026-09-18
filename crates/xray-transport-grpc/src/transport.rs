@@ -150,7 +150,11 @@ where T: AsyncRead + AsyncWrite + Send + Unpin + 'static {
             return;
         };
         let period = std::time::Duration::from_secs(ka_idle as u64);
-        let pong_timeout = std::time::Duration::from_secs(ka_timeout.max(0) as u64);
+        // H5：grpc-go defaults.go:33 `defaultClientKeepaliveTimeout = 20s` +
+        // http2_client.go:269-270 `if kp.Timeout == 0 { kp.Timeout = 20s }`——
+        // Timeout==0 是"用默认 20s"而非"立即超时"。此前 0 映射 timeout(0s)
+        // 使只配 idleTimeout 的连接每周期被首条 ping 确定性杀死。
+        let pong_timeout = std::time::Duration::from_secs(if ka_timeout > 0 { ka_timeout as u64 } else { 20 });
         let mut tick = tokio::time::interval(period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await; // 首跳立即返回
@@ -266,15 +270,11 @@ where T: AsyncRead + AsyncWrite + Send + Unpin + 'static {
             let _ = cancel_tx.send(e);
         }
     });
-    // 9d7a 后置：把 down 闭包校验错误通过 cancel_rx 变成 reader 的 poll_read 返回。
-    // 当前 DuplexConn 暂无该通道——保留 cancel_rx 持有 → spawned task 错时 cancel_tx 发，
-    // client drop 时 cancel_rx 自动关。本切片为最小改动——错误不显式传播给 caller
-    // 但 cfg 校验仍能阻止错误帧数据被当作 hunk 解（校验失败后 recv_stream 立即
-    // 被 drop 后续 read 关闭，且 send_stream 由 up 闭包结束触发 EOS）。
-    let _ = cancel_rx; // todo: 接入 reader 返回错误
-    Ok(Box::new(DuplexConn(client)))
+    // 9d7a 后置（4tap 落地）：down/up 闭包错误经 cancel_tx 送达 DuplexConn
+    // 持有的 cancel_rx，poll_read 优先返回错误——不再降级为干净 EOF。
+    Ok(Box::new(DuplexConn { inner: client, cancel_rx: Some(cancel_rx), remote: None }))
 }
-pub async fn listen(addr: SocketAddr, settings: &StreamSettings, handler: ConnHandler) -> io::Result<Box<dyn TransportListener>> {
+pub async fn listen(addr: SocketAddr, settings: &StreamSettings, handler: ConnHandler, trusted: Vec<String>) -> io::Result<Box<dyn TransportListener>> {
     let cfg = parse_config(settings)?;
     // serviceName 校验（Go gRPC 框架按注册 path 路由，未知 method 404）：
     // 非空 serviceName → 请求 path 必须等于 normalize_grpc_path，否则 404；
@@ -298,11 +298,23 @@ pub async fn listen(addr: SocketAddr, settings: &StreamSettings, handler: ConnHa
     let shutdown_clone = Arc::clone(&shutdown);
     let listener = Arc::new(listener);
     let listener_for_task = Arc::clone(&listener);
+    // H13：Go hub.go:86-93——仅当 IdleTimeout>0 或 HealthCheckTimeout>0 时启用
+    // keepalive ServerParameters（Time=IdleTimeout，Timeout=HealthCheckTimeout）；
+    // 零值超时回退 grpc-go defaults（server Time=2h / Timeout=20s）。
+    let (ka_time, ka_timeout) = {
+        let cfg = &cfg;
+        (
+            if cfg.idle_timeout > 0 { cfg.idle_timeout as u64 } else { 7200 },
+            if cfg.health_check_timeout > 0 { cfg.health_check_timeout as u64 } else { 20 },
+        )
+    };
+    let keepalive_enabled = cfg.idle_timeout > 0 || cfg.health_check_timeout > 0;
+    let trusted_for_task = Arc::new(trusted);
     tokio::spawn(async move {
         loop {
             // 关闭：跳出循环 → spawned task 结束 → listener drop → 端口释放（Go hub.go:62-64 Close→Stop 语义）
             if shutdown_clone.load(Ordering::Relaxed) { break; }
-            let (tcp, _) = match listener_for_task.accept().await {
+            let (tcp, peer) = match listener_for_task.accept().await {
                 Ok(v) => v,
                 Err(e) => {
                     // ijk1：EMFILE/临时错误退避后重试，无条件 continue=EMFILE 时活锁烧 CPU。
@@ -322,11 +334,17 @@ pub async fn listen(addr: SocketAddr, settings: &StreamSettings, handler: ConnHa
             let m = Some(tcpmask.clone());
             let ep = expected_path.clone();
             let mm = multi_mode;
+            let tr = trusted_for_task.clone();
             tokio::spawn(async move {
                 if let Some(tc) = tls {
                     let acc = tokio_rustls::TlsAcceptor::from(tc);
-                    match acc.accept(tcp).await { Ok(c) => accept_h2(c, h, m, ep, mm).await, Err(_) => {} }
-                } else { accept_h2(tcp, h, m, ep, mm).await; }
+                    match acc.accept(tcp).await {
+                        Ok(c) => accept_h2(c, h, m, ep, mm, peer, &tr, ka_time, ka_timeout, keepalive_enabled).await,
+                        Err(_) => {}
+                    }
+                } else {
+                    accept_h2(tcp, h, m, ep, mm, peer, &tr, ka_time, ka_timeout, keepalive_enabled).await;
+                }
             });
         }
     });
@@ -340,8 +358,33 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
     tcpmask: Option<Arc<xray_transport::finalmask::TcpmaskManager>>,
     expected_path: Option<String>,
     multi_mode: bool,
+    peer: SocketAddr,
+    trusted: &[String],
+    ka_time: u64,
+    ka_timeout: u64,
+    keepalive_enabled: bool,
 ) {
     let mut h2_srv = match server::handshake(conn).await { Ok(s)=>s, Err(_)=>return };
+    // H13：server keepalive ping（Go hub.go:86-93 ServerParameters → grpc-go
+    // http2_server 每 Time 无活动发 ping、Timeout 内无 pong 断连）。
+    if keepalive_enabled {
+        if let Some(mut pinger) = h2_srv.ping_pong() {
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(ka_time.max(1)));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                tick.tick().await; // 首跳立即返回
+                loop {
+                    tick.tick().await;
+                    if tokio::time::timeout(
+                        std::time::Duration::from_secs(ka_timeout.max(1)),
+                        pinger.ping(h2::Ping::opaque()),
+                    ).await.is_err() {
+                        break; // PONG 超时 → task 退出（PingPong drop，连接由 accept 循环终结）
+                    }
+                }
+            });
+        }
+    }
     while let Some(r)=h2_srv.accept().await {
         let (req,mut respond) = match r { Ok(v)=>v, Err(_)=>continue };
         if req.method()!="POST" {
@@ -361,10 +404,20 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
             let _ = respond.send_response(r, true);
             continue;
         }
+        // H13：源地址信任门控（Go encoding/remoteaddr.go:13-40
+        // remoteAddrFromContext：XFF 存在且名单 header 命中才采纳首段 IP）。
+        let remote_addr = extract_trusted_remote(req.headers(), peer, trusted);
         if let Some(expected) = &expected_path {
             if req.uri().path() != expected {
-                let r = http::Response::builder().status(404).body(()).unwrap();
-                let _ = respond.send_response(r, true);
+                // H13：未知路径回 gRPC Trailers-Only 响应（:status 200 +
+                // grpc-status 12 Unimplemented），对齐 grpc-go WriteStatus
+                // 语义——此前裸 404 与合法 gRPC 探测可区分。
+                let r = http::Response::builder().status(200)
+                    .header("content-type", "application/grpc")
+                    .header("grpc-status", "12")
+                    .header("grpc-message", "unknown service")
+                    .body(()).unwrap();
+                let _ = respond.send_response(r,true);
                 continue;
             }
         }
@@ -399,15 +452,35 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
         });
         let conn: Box<dyn Connection> = match tcpmask.as_ref() {
             Some(m) => match xray_transport::finalmask::wrap_conn_server_into_connection(
-                m, Box::new(DuplexConn(client)),
+                m, Box::new(DuplexConn::with_remote(client, remote_addr)),
             ) {
                 Ok(c) => c,
                 Err(e) => { tracing::debug!("grpc tcpmask wrap failed: {e}"); continue; }
             },
-            None => Box::new(DuplexConn(client)),
+            None => Box::new(DuplexConn::with_remote(client, remote_addr)),
         };
         h2(conn);
     }
+}
+
+/// H13：按信任门控从 `X-Forwarded-For` 提取源地址。对应 Go
+/// `encoding/remoteaddr.go:13-40`：XFF 存在非空且名单中任一 header 在请求中
+/// 出现时，采纳首段 IP（端口 0 对齐 Go `TCPAddr{IP, 0}`）；否则保持真实
+/// peer 地址。默认（名单空）永不采纳。
+fn extract_trusted_remote(headers: &http::HeaderMap, peer: SocketAddr, trusted: &[String]) -> SocketAddr {
+    let Some(val) = headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok()).filter(|v| !v.is_empty()) else {
+        return peer;
+    };
+    if trusted.iter().any(|t| headers.contains_key(t.as_str())) {
+        if let Some(first) = val.split(',').next().map(str::trim) {
+            if let Ok(ip) = first.parse::<std::net::IpAddr>() {
+                return SocketAddr::new(ip, 0);
+            }
+        }
+        return peer;
+    }
+    tracing::warn!(xff = val, "ignored potentially forged \"X-Forwarded-For\"");
+    peer
 }
 
 fn parse_config(s:&StreamSettings)->io::Result<Config>{
@@ -415,14 +488,43 @@ fn parse_config(s:&StreamSettings)->io::Result<Config>{
 }
 fn io_err<E:std::fmt::Display>(e:E)->io::Error{io::Error::new(io::ErrorKind::Other,e.to_string())}
 
-struct DuplexConn(tokio::io::DuplexStream);
-impl AsyncRead for DuplexConn{fn poll_read(mut self:Pin<&mut Self>,cx:&mut Context<'_>,buf:&mut ReadBuf<'_>)->Poll<io::Result<()>>{Pin::new(&mut self.0).poll_read(cx,buf)}}
-impl AsyncWrite for DuplexConn{
-    fn poll_write(mut self:Pin<&mut Self>,cx:&mut Context<'_>,buf:&[u8])->Poll<io::Result<usize>>{Pin::new(&mut self.0).poll_write(cx,buf)}
-    fn poll_flush(mut self:Pin<&mut Self>,cx:&mut Context<'_>)->Poll<io::Result<()>>{Pin::new(&mut self.0).poll_flush(cx)}
-    fn poll_shutdown(mut self:Pin<&mut Self>,cx:&mut Context<'_>)->Poll<io::Result<()>>{Pin::new(&mut self.0).poll_shutdown(cx)}
+struct DuplexConn {
+    inner: tokio::io::DuplexStream,
+    /// 4tap：后台泵（dial_h2 spawned task）经 cancel_tx 送达的下行错误——
+    /// 响应头校验失败 / h2 body / hunk 解码错误。poll_read 优先返回该错误
+    /// 而非干净 EOF：数据截断伪装正常关闭是排障黑洞（B 类节点）。
+    cancel_rx: Option<tokio::sync::oneshot::Receiver<io::Error>>,
+    /// H13：trust-gated 源地址（XFF 采纳或真实 peer；None = 未知）。
+    remote: Option<SocketAddr>,
 }
-impl Connection for DuplexConn{fn remote_addr(&self)->io::Result<Option<SocketAddr>>{Ok(None)}fn local_addr(&self)->io::Result<Option<SocketAddr>>{Ok(None)}}
+impl DuplexConn {
+    fn with_remote(inner: tokio::io::DuplexStream, remote: SocketAddr) -> Self {
+        Self { inner, cancel_rx: None, remote: Some(remote) }
+    }
+}
+impl AsyncRead for DuplexConn{
+    fn poll_read(mut self:Pin<&mut Self>,cx:&mut Context<'_>,buf:&mut ReadBuf<'_>)->Poll<io::Result<()>>{
+        // 4tap：错误优先于 inner 读。泵错误（cancel_rx Ready(Ok(e))）→ Err；
+        // Ready(Err(_)) = sender drop 且无错误 = 泵正常结束（干净 EOF），走 inner。
+        if let Some(rx) = self.cancel_rx.as_mut() {
+            match Pin::new(rx).poll(cx) {
+                Poll::Ready(Ok(e)) => {
+                    self.cancel_rx = None;
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Ready(Err(_)) => self.cancel_rx = None,
+                Poll::Pending => {}
+            }
+        }
+        Pin::new(&mut self.inner).poll_read(cx,buf)
+    }
+}
+impl AsyncWrite for DuplexConn{
+    fn poll_write(mut self:Pin<&mut Self>,cx:&mut Context<'_>,buf:&[u8])->Poll<io::Result<usize>>{Pin::new(&mut self.inner).poll_write(cx,buf)}
+    fn poll_flush(mut self:Pin<&mut Self>,cx:&mut Context<'_>)->Poll<io::Result<()>>{Pin::new(&mut self.inner).poll_flush(cx)}
+    fn poll_shutdown(mut self:Pin<&mut Self>,cx:&mut Context<'_>)->Poll<io::Result<()>>{Pin::new(&mut self.inner).poll_shutdown(cx)}
+}
+impl Connection for DuplexConn{fn remote_addr(&self)->io::Result<Option<SocketAddr>>{Ok(self.remote)}fn local_addr(&self)->io::Result<Option<SocketAddr>>{Ok(None)}}
 
 struct GrpcListener {
     local: SocketAddr,
@@ -468,14 +570,19 @@ pub(crate) fn normalize_grpc_path(cfg: &Config) -> String {
     format!("{service}{stream}")
 }
 
-/// Go dial.go:190-202 的 userAgent 预设映射。`None` = 不发 User-Agent（`golang`）。
-/// 版本号取项目统一锚定值（与 naive 预设同源；不参与互操作契约）。
+/// Go dial.go:190-202 的 userAgent 预设映射。
+///
+/// H8 对齐（dial.go:182-202 + common/utils/browser.go）：chrome/firefox/edge
+/// 走共享动态版本实现（`xray_common::browser::build_user_agent`，Chrome 144
+/// 起按日轮换，与 ws/xhttp 同源）；`"golang"` → **发空 UA 头**（Go
+/// `setUserAgent("")`；grpc-go http2_client.go:337,584 无条件发 user-agent，
+/// 空值也发）——旧实现返回 None 不发头。其他值原样。
 fn resolve_user_agent(ua: &str) -> Option<String> {
     match ua {
-        "" | "chrome" => Some("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36".to_string()),
-        "firefox" => Some("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0".to_string()),
-        "edge" => Some("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0".to_string()),
-        "golang" => None,
+        "" | "chrome" => Some(xray_common::browser::build_user_agent("chrome")),
+        "firefox" => Some(xray_common::browser::build_user_agent("firefox")),
+        "edge" => Some(xray_common::browser::build_user_agent("edge")),
+        "golang" => Some(String::new()),
         other => Some(other.to_string()),
     }
 }
@@ -519,10 +626,18 @@ mod tests {
     #[test]
     fn resolve_user_agent_presets() {
         assert_eq!(resolve_user_agent(""), resolve_user_agent("chrome"));
-        assert_eq!(resolve_user_agent("chrome").unwrap(), "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36");
-        assert!(resolve_user_agent("edge").unwrap().ends_with("Edg/133.0.0.0"));
-        assert!(resolve_user_agent("firefox").unwrap().contains("Firefox/133.0"));
-        assert_eq!(resolve_user_agent("golang"), None);
+        // H8：动态版本（Chrome 144 起按日轮换），断言形制而非固定版本。
+        let chrome = resolve_user_agent("chrome").unwrap();
+        assert!(
+            chrome.starts_with("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/")
+                && chrome.ends_with(" Safari/537.36"),
+            "chrome UA shape, got: {chrome}"
+        );
+        assert!(resolve_user_agent("edge").unwrap().contains("Edg/"));
+        assert!(resolve_user_agent("firefox").unwrap().contains("Firefox/"));
+        // H8：golang 发**空 UA 头**（Some("")，grpc-go 无条件发 user-agent），
+        // 旧实现 None（不发头）。
+        assert_eq!(resolve_user_agent("golang").as_deref(), Some(""));
         assert_eq!(resolve_user_agent("custom/9").as_deref(), Some("custom/9"));
     }
 
@@ -586,6 +701,44 @@ mod tests {
     }
 
 
+    /// 4tap 回归：down 闭包错误（非 200 响应头校验失败）必须以 Err 从
+    /// DuplexConn::read 浮出，而非干净 EOF（数据截断伪装正常关闭）。
+    #[tokio::test]
+    async fn dial_h2_down_error_propagates_to_read() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cfg = Config::default();
+        let dialer = tokio::spawn(async move {
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            dial_h2(tcp, "/GunService/Tun", "", "http", None, &cfg).await
+        });
+        let (server_tcp, _) = listener.accept().await.unwrap();
+        let mut h2s = server::handshake(server_tcp).await.unwrap();
+        let (_req, mut respond) = h2s.accept().await.unwrap().unwrap();
+        // 9d7a 遗留坑：h2 连接必须被持续 poll 才会把 HEADERS 刷到线上，
+        // 否则 client 侧 resp_fut 永远 Pending → down 闭包错误不产生。
+        tokio::spawn(async move {
+            // CF challenge 页形态：404 + text/html → down 闭包 content-type 校验失败
+            let resp = http::Response::builder().status(404)
+                .header("content-type", "text/html").body(()).unwrap();
+            if respond.send_response(resp, true).is_ok() {
+                // 持续 accept 驱动连接，把 HEADERS 刷到线上
+                while let Some(Ok(_)) = h2s.accept().await {}
+            }
+        });
+
+        let mut conn = dialer.await.unwrap().expect("dial returns conn immediately");
+        let mut buf = [0u8; 64];
+        let r = tokio::time::timeout(std::time::Duration::from_secs(2), conn.read(&mut buf))
+            .await
+            .expect("read must not hang");
+        let err = r.expect_err("read must return Err, not Ok(0)");
+        assert!(
+            err.to_string().contains("non-200"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn grpc_rejects_wrong_service_name_but_accepts_expected() {
         let settings = StreamSettings {
@@ -594,7 +747,7 @@ mod tests {
             ..StreamSettings::tcp()
         };
         let handler: ConnHandler = Arc::new(|_conn| {});
-        let listener = listen("127.0.0.1:0".parse().unwrap(), &settings, handler)
+        let listener = listen("127.0.0.1:0".parse().unwrap(), &settings, handler, Vec::new())
             .await
             .expect("listen");
         let addr = listener.local_addr().unwrap();
@@ -630,7 +783,7 @@ mod tests {
             ..StreamSettings::tcp()
         };
         let handler: ConnHandler = Arc::new(|_conn| {});
-        let listener = listen("127.0.0.1:0".parse().unwrap(), &settings, handler)
+        let listener = listen("127.0.0.1:0".parse().unwrap(), &settings, handler, Vec::new())
             .await
             .expect("listen");
         let addr = listener.local_addr().unwrap();
@@ -716,7 +869,7 @@ mod tests {
                 let _ = tx.send(buf[..n].to_vec());
             });
         });
-        let listener = listen("127.0.0.1:0".parse().unwrap(), &settings, handler)
+        let listener = listen("127.0.0.1:0".parse().unwrap(), &settings, handler, Vec::new())
             .await
             .expect("listen");
         let addr = listener.local_addr().unwrap();
@@ -781,5 +934,52 @@ mod tests {
         let none = StreamSettings::tcp();
         assert_eq!(grpc_authority("", &none, &domain), "example.com");
         assert_eq!(grpc_authority("", &none, &ip), "1.2.3.4:8443");
+    }
+
+    // ===== H13：服务端 trusted XFF（Go encoding/remoteaddr.go:13-40）=====
+
+    fn hdrs(kv: &[(&str, &str)]) -> http::HeaderMap {
+        let mut h = http::HeaderMap::new();
+        for (k, v) in kv {
+            // HeaderName 拷贝出所有权（&'static str 才实现 IntoHeaderName，
+            // 直接 insert(*k) 会要求 kv: 'static）
+            h.insert(http::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
+        }
+        h
+    }
+
+    /// H13 回归：名单空（默认）→ XFF 永不采纳，保持真实 peer（此前 server
+    /// 完全没有 XFF 概念，trustedXForwardedFor 部署下日志全是真实 socket 地址）。
+    #[test]
+    fn h13_xff_rejected_by_default() {
+        let peer: SocketAddr = "203.0.113.9:4444".parse().unwrap();
+        let h = hdrs(&[("X-Forwarded-For", "1.2.3.4"), ("X-Real-IP", "x")]);
+        let got = extract_trusted_remote(&h, peer, &[]);
+        assert_eq!(got, peer);
+    }
+
+    /// 名单命中 → 采纳 XFF 首段，端口 0（对齐 Go TCPAddr{IP, 0}）。
+    #[test]
+    fn h13_xff_adopted_when_trusted_header_present() {
+        let peer: SocketAddr = "203.0.113.9:4444".parse().unwrap();
+        let h = hdrs(&[("X-Forwarded-For", "1.2.3.4, 10.0.0.1"), ("X-Real-IP", "x")]);
+        let got = extract_trusted_remote(&h, peer, &["X-Real-IP".to_string()]);
+        assert_eq!(got, "1.2.3.4:0".parse::<SocketAddr>().unwrap());
+    }
+
+    /// 有名单但名单 header 不在场 → 保持真实 peer。
+    #[test]
+    fn h13_xff_rejected_when_trusted_header_absent() {
+        let peer: SocketAddr = "203.0.113.9:4444".parse().unwrap();
+        let h = hdrs(&[("X-Forwarded-For", "1.2.3.4")]);
+        assert_eq!(extract_trusted_remote(&h, peer, &["X-Real-IP".to_string()]), peer);
+    }
+
+    /// XFF 缺失 → peer 原样。
+    #[test]
+    fn h13_xff_missing_keeps_peer() {
+        let peer: SocketAddr = "203.0.113.9:4444".parse().unwrap();
+        let h = hdrs(&[("X-Real-IP", "x")]);
+        assert_eq!(extract_trusted_remote(&h, peer, &["X-Real-IP".to_string()]), peer);
     }
 }

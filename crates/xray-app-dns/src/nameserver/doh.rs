@@ -73,6 +73,8 @@ pub struct DohNameServer {
     id_gen: AtomicReqIdGen,
     /// 域名解析器（直连兜底路径）。
     resolver: Arc<dyn crate::dial::HostResolver>,
+    /// `+local`：强制直连（绕过共享 dialer，Go Local mode nil dispatcher）。
+    force_local: bool,
 }
 
 impl DohNameServer {
@@ -104,7 +106,15 @@ impl DohNameServer {
             query_timeout,
             id_gen: AtomicReqIdGen::new(),
             resolver: Arc::new(crate::dial::SystemHostResolver),
+            force_local: false,
         }
+    }
+
+    /// 标记 `+local`（强制直连，绕过共享 dialer；bd wmdn②）。
+    #[must_use]
+    pub fn force_local(mut self, v: bool) -> Self {
+        self.force_local = v;
+        self
     }
 
     /// 从 `NameServerConfig` 构造。
@@ -127,15 +137,10 @@ impl DohNameServer {
             ns.negative_ttl_secs.unwrap_or(0),
         ));
         cache.start_cleanup_task(crate::cache_controller::CLEANUP_INTERVAL);
-        Ok(Box::new(Arc::new(Self::new(
-            dest,
-            server_name,
-            tls_config,
-            cache,
-            ns.client_ip.clone(),
-            timeout_dur,
-            false,
-        ))))
+        Ok(Box::new(Arc::new(
+            Self::new(dest, server_name, tls_config, cache, ns.client_ip.clone(), timeout_dur, false)
+                .force_local(ns.force_local),
+        )))
     }
     /// h2c（明文 HTTP/2）构造。对应 Go `NewDoHNameServer(u, dispatcher, true, ...)`。
     pub fn from_config_h2c(ns: &NameServerConfig) -> Result<Box<dyn Server>, DnsError> {
@@ -153,15 +158,18 @@ impl DohNameServer {
             ns.negative_ttl_secs.unwrap_or(0),
         ));
         cache.start_cleanup_task(crate::cache_controller::CLEANUP_INTERVAL);
-        Ok(Box::new(Arc::new(Self::new(
-            dest,
-            String::new(),
-            xray_tls::utls::default_client_config(),
-            cache,
-            ns.client_ip.clone(),
-            timeout_dur,
-            true,
-        ))))
+        Ok(Box::new(Arc::new(
+            Self::new(
+                dest,
+                String::new(),
+                xray_tls::utls::default_client_config(),
+                cache,
+                ns.client_ip.clone(),
+                timeout_dur,
+                true,
+            )
+            .force_local(ns.force_local),
+        )))
     }
     /// 发送单次 DNS 查询（DoH），等待响应。
     async fn query_once(
@@ -174,9 +182,14 @@ impl DohNameServer {
 
         // 经路由出站或直连兜底（域名每查询现解析）——Go dohnameserver.go:68
         // dispatcher.Dispatch 语义。
-        let stream =
-            crate::dial::connect_stream(&self.dest, self.resolver.as_ref(), self.query_timeout, "doh")
-                .await?;
+        let stream = crate::dial::connect_stream(
+            &self.dest,
+            self.resolver.as_ref(),
+            self.query_timeout,
+            "doh",
+            self.force_local,
+        )
+        .await?;
 
         // TLS 握手（h2c 明文跳过）+ HTTP/2 handshake。
         let (mut h2, h2_conn): (_, Pin<Box<dyn Future<Output = ()> + Send>>) = if self.plain_h2c {

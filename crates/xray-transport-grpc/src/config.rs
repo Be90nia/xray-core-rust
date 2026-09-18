@@ -215,14 +215,15 @@ fn ending_path(name: &str) -> &str {
     }
 }
 
-/// URL path 段 percent-escape。对应 Go `url.PathEscape`。
-///
-/// 仅保留 unreserved 字符（RFC 3986: `A-Za-z0-9-._~`），其余用 `%XX` 编码。
-/// 与 Go `url.PathEscape` 行为一致：`/` 也会被 escape（因为是单段编码）。
+/// URL path 段 percent-escape。对应 Go `url.PathEscape`（H9 对齐
+/// grpc/config.go:11-37）。Go `shouldEscape(c, encodePathSegment)`：保留
+/// unreserved（`A-Za-z0-9-._~`）+ segment 模式额外保留 `$ & + : ; = @`，
+/// 仅转义 `/ ; , ?` 与其余所有字节。此前仅保留 RFC3986 unreserved 导致
+/// `$&+:;=@` 被过度编码 → Go 服务端按注册名原样比对时 Unimplemented。
 fn path_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for byte in input.bytes() {
-        if is_unreserved(byte) {
+        if path_segment_unescaped(byte) {
             out.push(byte as char);
         } else {
             out.push('%');
@@ -233,9 +234,15 @@ fn path_escape(input: &str) -> String {
     out
 }
 
-/// RFC 3986 unreserved 字符判断。
-fn is_unreserved(b: u8) -> bool {
-    matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~')
+/// Go `shouldEscape(_, encodePathSegment) == false` 的字节集合。
+fn path_segment_unescaped(b: u8) -> bool {
+    matches!(
+        b,
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+            | b'-' | b'.' | b'_' | b'~'
+            // §2.2 reserved，segment 模式保留（仅 /;,? 转义）
+            | b'$' | b'&' | b'+' | b':' | b';' | b'=' | b'@'
+    )
 }
 
 /// 4-bit 数字转大写 hex 字符。
@@ -260,6 +267,19 @@ mod tests {
     #[test]
     fn path_escape_unreserved_chars_kept() {
         assert_eq!(path_escape("a-b.c_d~e"), "a-b.c_d~e");
+    }
+
+    /// H9 回归：Go PathEscape（segment 模式）保留 `$ & + : ; = @`——旧实现
+    /// 按 RFC3986 unreserved 白名单把它们编码为 %XX，Go 服务端按注册名
+    /// 原样比对 → Unimplemented。
+    #[test]
+    fn path_escape_keeps_go_segment_reserved_chars() {
+        assert_eq!(path_escape("a$b&c+d:e;f=g@h"), "a$b&c+d:e;f=g@h");
+        // 仅 / ; , ? 与非 ASCII 被转义（Go shouldEscape segment 分支）。
+        assert_eq!(path_escape("a/b"), "a%2Fb");
+        assert_eq!(path_escape("a;b,c?d"), "a%3Bb%2Cc%3Fd");
+        // 空格仍转义（Go 尽力而为之外的字节全部 %XX）。
+        assert_eq!(path_escape("a b"), "a%20b");
     }
 
     #[test]

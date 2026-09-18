@@ -230,8 +230,10 @@ const SESSION_ID_OFFSET_IN_HANDSHAKE: usize = 39;
 /// - `max_diff`: 允许的 timestamp 偏差秒数（Go 默认 ±12h = 43200）。
 /// - `allowed_short_ids`: 允许的 short_id 白名单（每个 8 字节）。
 /// - `min_client_ver`/`max_client_ver`：fs0o REALITY 版本门控，字节字典序比较
-///   `ClientHello.legacy_version`（TLS1.3 仍发 `[0x03, 0x03]`；Go 端默认
-///   `MinClientVer=[26,3,27]` 即 Xray-core v26.3.27，空切片=不校验）。
+///   **解密 payload 前 3 字节 ClientVer**（客户端 Xray 版本，client
+///   `encode_session_id` 写入 `[0..3)`；Go xtls/reality tls.go:259-267
+///   `copy(hs.c.ClientVer[:], plainText)`。Go 端默认 `MinClientVer=[26,3,27]`
+///   即 Xray-core v26.3.27，空切片=不校验）。
 pub fn verify_reality_client_hello(
     parsed: &ParsedClientHello<'_>,
     server_static_private: &[u8; 32],
@@ -241,15 +243,6 @@ pub fn verify_reality_client_hello(
     min_client_ver: &[u8],
     max_client_ver: &[u8],
 ) -> Result<(crate::crypto::SessionPayload, [u8; 32]), RealityError> {
-    // 0. fs0o: 版本门控——legacy_version 字典序比较两端区间。
-    // 字典序：[major, minor, patch?]；空切片=无限边界（不限制）。
-    if !min_client_ver.is_empty() && parsed.legacy_version.as_slice() < min_client_ver {
-        return Err(RealityError::ClientVersionTooOld);
-    }
-    if !max_client_ver.is_empty() && parsed.legacy_version.as_slice() > max_client_ver {
-        return Err(RealityError::ClientVersionTooNew);
-    }
-
     // 1. 提取 client X25519 公钥（来自 key_share extension）
     let client_pub = parsed
         .key_share_x25519
@@ -289,6 +282,17 @@ pub fn verify_reality_client_hello(
     // 5. 校验 timestamp 窗口 + short_id 白名单
     let payload =
         crate::crypto::verify_session_payload(&plaintext, now_unix, max_diff, allowed_short_ids)?;
+
+    // 6. ft0g: 版本门控——对齐 Go xtls/reality tls.go:259-267，比较**解密 payload
+    //    前 3 字节 ClientVer**（客户端 Xray 版本），而非 ClientHello.legacy_version
+    //    （TLS1.3 恒 [0x03,0x03]，读它 = min 配置下全客户端被拒 / max 恒过）。
+    //    字典序：[major, minor, patch]；空切片=无限边界（不限制）。
+    if !min_client_ver.is_empty() && payload.version.as_slice() < min_client_ver {
+        return Err(RealityError::ClientVersionTooOld);
+    }
+    if !max_client_ver.is_empty() && payload.version.as_slice() > max_client_ver {
+        return Err(RealityError::ClientVersionTooNew);
+    }
     Ok((payload, auth_key))
 }
 
@@ -318,8 +322,9 @@ pub enum RealityServerOutcome<C> {
 /// - `server_private_key`：服务端 X25519 静态私钥（对应 client 配置的 `public_key`）
 /// - `allowed_short_ids`：允许的 short_id 白名单
 /// - `max_diff`：允许的 timestamp 偏差秒数（Go 默认 ±12h = 43200）
-/// - `min_client_ver`/`max_client_ver`：fs0o REALITY 版本门控；slice 与
-///   `ClientHello.legacy_version` 字典序比较。空切片=无限边界（不限制）。
+/// - `min_client_ver`/`max_client_ver`：fs0o REALITY 版本门控；slice 与解密
+///   payload 前 3 字节 ClientVer 字典序比较（ft0g 对齐 Go tls.go:259-267）。
+///   空切片=无限边界（不限制）。
 /// - `server_names`：SNI 白名单（精确匹配，对齐 Go `xtls/reality` tls.go:211/466
 ///   `config.ServerNames[serverName]`：无 SNI 或不在白名单 → 前置失败走
 ///   steal-oneself fallback）。空切片 = 门禁用（仅测试用低层 API；生产
@@ -863,6 +868,27 @@ mod tests {
         short_id: &[u8; 8],
         sni: Option<&str>,
     ) -> Vec<u8> {
+        build_reality_client_hello_with_version(
+            random,
+            server_static_private,
+            client_private,
+            [1, 8, 1], // version（对齐 watfaq 默认）
+            timestamp,
+            short_id,
+            sni,
+        )
+    }
+
+    /// [`build_reality_client_hello`] 的 ClientVer 定制版（ft0g 版本门控测试用）。
+    fn build_reality_client_hello_with_version(
+        random: &[u8; 32],
+        server_static_private: &[u8; 32],
+        client_private: &[u8; 32],
+        version: [u8; 3],
+        timestamp: u32,
+        short_id: &[u8; 8],
+        sni: Option<&str>,
+    ) -> Vec<u8> {
         use crate::crypto::{derive_auth_key, encrypt_session_id};
         use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -881,7 +907,7 @@ mod tests {
 
         // 3. 构造 plaintext[16] = [version(3)|reserved(1)|timestamp(4 BE)|short_id(8)]
         let mut plaintext = [0u8; 16];
-        plaintext[0..3].copy_from_slice(&[1, 8, 1]); // version（对齐 watfaq 默认）
+        plaintext[0..3].copy_from_slice(&version);
         plaintext[3] = 0; // reserved
         plaintext[4..8].copy_from_slice(&timestamp.to_be_bytes());
         plaintext[8..16].copy_from_slice(short_id);
@@ -1119,93 +1145,74 @@ mod tests {
         assert!(matches!(err, RealityError::ShortIdNotAllowed));
     }
 
-    // ===== fs0o: REALITY 版本门控行为测试 =====
+    // ===== fs0o/ft0g: REALITY 版本门控行为测试 =====
+    // ft0g: 门控读**解密 payload 的 ClientVer**（Go xtls/reality tls.go:259-267
+    // `copy(hs.c.ClientVer[:], plainText)`），不再读 ClientHello.legacy_version。
 
-    /// `legacy_version` 低于 `min_client_ver` → 拒绝并报 ClientVersionTooOld。
-    #[test]
-    fn fs0o_min_client_ver_rejects_old_version() {
-        // 构造一个 legacy_version=[0x03, 0x01]（TLS 1.0）的 ClientHello。
+    /// 统一构造：真加密 ClientHello（定制 ClientVer）→ verify，时间窗/short_id 合法。
+    fn ft0g_verify_with_ver(
+        ver: [u8; 3],
+        min: &[u8],
+        max: &[u8],
+    ) -> Result<crate::crypto::SessionPayload, RealityError> {
         let random = [0x55u8; 32];
-        let session_id = [0x77u8; 32];
-        let key_share = [0x88u8; 32];
-        let record = build_test_client_hello_with_legacy_version(
-            &random,
-            &session_id,
-            &key_share,
-            Some("example.com"),
-            &[0x03, 0x01],
+        let server_priv = [0x11u8; 32];
+        let client_priv = [0x22u8; 32];
+        let now = 1_700_000_000u32;
+        let short_id = [0xaa; 8];
+        let record = build_reality_client_hello_with_version(
+            &random, &server_priv, &client_priv, ver, now, &short_id, None,
         );
         let parsed = parse_client_hello(&record).unwrap();
-        let err = verify_reality_client_hello(
-            &parsed,
-            &[0u8; 32],
-            0,
-            43200,
-            &[],
-            &[0x03, 0x03], // min=[TLS1.2]，legacy=[TLS1.0] < min
-            &[],
-        )
-        .unwrap_err();
+        verify_reality_client_hello(&parsed, &server_priv, now, 43200, &[short_id], min, max)
+            .map(|(p, _)| p)
+    }
+
+    /// 解密 ClientVer 低于 `min_client_ver` → 拒绝并报 ClientVersionTooOld。
+    #[test]
+    fn fs0o_min_client_ver_rejects_old_version() {
+        // 客户端报 [1,8,1]（watfaq 默认），min=[26,3,27]（Xray v26.3.27）→ 拒。
+        let err = ft0g_verify_with_ver([1, 8, 1], &[26, 3, 27], &[]).unwrap_err();
         assert!(matches!(err, RealityError::ClientVersionTooOld));
     }
 
-    /// `legacy_version` 高于 `max_client_ver` → 拒绝并报 ClientVersionTooNew。
+    /// 解密 ClientVer 高于 `max_client_ver` → 拒绝并报 ClientVersionTooNew。
     #[test]
     fn fs0o_max_client_ver_rejects_new_version() {
-        let random = [0x55u8; 32];
-        let session_id = [0x77u8; 32];
-        let key_share = [0x88u8; 32];
-        let record = build_test_client_hello_with_legacy_version(
-            &random,
-            &session_id,
-            &key_share,
-            Some("example.com"),
-            &[0x03, 0x04], // TLS 1.3 实际 legacy_version
-        );
-        let parsed = parse_client_hello(&record).unwrap();
-        let err = verify_reality_client_hello(
-            &parsed,
-            &[0u8; 32],
-            0,
-            43200,
-            &[],
-            &[],
-            &[0x03, 0x03], // max=[TLS1.2]，legacy=[TLS1.3] > max
-        )
-        .unwrap_err();
+        let err = ft0g_verify_with_ver([26, 9, 10], &[], &[26, 9, 9]).unwrap_err();
         assert!(matches!(err, RealityError::ClientVersionTooNew));
     }
 
-    /// 空切片=不限制（向后兼容）。
+    /// min..max 区间内 → 通过，且 payload.version 原样返回。
+    #[test]
+    fn fs0o_in_range_version_passes() {
+        let payload = ft0g_verify_with_ver([26, 7, 28], &[26, 3, 27], &[26, 9, 9]).unwrap();
+        assert_eq!(payload.version, [26, 7, 28]);
+    }
+
+    /// ft0g 回归：门控不再读 legacy_version——TLS1.3 恒 [0x03,0x03]，旧实现下
+    /// min=[26,3,27] 会把所有真实客户端拒掉（fail-closed DoS）；现在合法
+    /// ClientVer 过闸。此测试在旧实现（读 legacy_version）下必失败。
+    #[test]
+    fn ft0g_gate_reads_decrypted_client_ver_not_legacy_version() {
+        // legacy_version 恒 [0x03,0x03]（build_test_client_hello 写死）；
+        // 若门控读它，[3,3] < [26,3,27] → 误拒。解密 ClientVer=[26,9,9] → 应过。
+        let payload = ft0g_verify_with_ver([26, 9, 9], &[26, 3, 27], &[]).unwrap();
+        assert_eq!(payload.version, [26, 9, 9]);
+    }
+
+    /// ft0g 回归：ClientVer 恰等于 min/max 边界 → 过（Go `>=`/`<=` 含等号）。
+    #[test]
+    fn ft0g_boundary_version_equals_min_passes() {
+        let payload = ft0g_verify_with_ver([26, 3, 27], &[26, 3, 27], &[]).unwrap();
+        assert_eq!(payload.version, [26, 3, 27]);
+    }
+
+    /// 空切片=不限制（向后兼容）：任意 ClientVer 全过。
     #[test]
     fn fs0o_empty_min_max_means_unbounded() {
-        let random = [0x55u8; 32];
-        let session_id = [0x77u8; 32];
-        let key_share = [0x88u8; 32];
-        let record = build_test_client_hello_with_legacy_version(
-            &random,
-            &session_id,
-            &key_share,
-            Some("example.com"),
-            &[0x03, 0x00], // SSL 3.0（极旧）
-        );
-        let parsed = parse_client_hello(&record).unwrap();
-        // min/max 都为空 → 应该继续到 key_share 校验（key_share 在 record 里），
-        // 或 NoKeyShareX25519（fake key_share 是 0x88，不解析）
-        let err = verify_reality_client_hello(
-            &parsed,
-            &[0u8; 32],
-            0,
-            43200,
-            &[],
-            &[],
-            &[],
-        );
-        // fake key=0x88 → SessionIdDecryptFailed（auth_key 错误）。
-        assert!(
-            matches!(err, Err(RealityError::SessionIdDecryptFailed)),
-            "expected SessionIdDecryptFailed (fake key_share 0x88 → wrong auth_key), got: {err:?}"
-        );
+        let payload = ft0g_verify_with_ver([0, 0, 0], &[], &[]).unwrap();
+        assert_eq!(payload.version, [0, 0, 0]);
     }
 
     fn fs0o_legacy_version_parsed_correctly() {
