@@ -32,7 +32,9 @@ use crate::error::Result;
 use crate::socks::SocksAddr;
 
 /// `host:port` → Destination：IP 字面量直取，其余按域名（解析下沉 dial_system）。
-/// IPv6 需 `[..]:port` 形态（同原 `TcpStream::connect` 接受格式）。
+/// IPv6 必须用 `[..]:port` 完整括号形态；裸 IPv6（无括号）与单边括号一律
+/// 报错（wfx8-8 收紧：旧 trim_matches 会吞掉任意位置的括号，无端口裸 IPv6
+/// 会被 rsplit_once 错切成 `host="fe80:" port=1` 之类的静默畸形结果）。
 fn server_destination(server_addr: &str) -> std::io::Result<Destination> {
     let (host, port) = server_addr.rsplit_once(':').ok_or_else(|| {
         std::io::Error::new(
@@ -46,7 +48,22 @@ fn server_destination(server_addr: &str) -> std::io::Result<Destination> {
             format!("anytls server_addr bad port: {port}"),
         )
     })?;
-    let host = host.trim_matches(|c| c == '[' || c == ']');
+    let host = match (host.starts_with('['), host.ends_with(']')) {
+        (true, true) => &host[1..host.len() - 1],
+        (false, false) => host,
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("anytls server_addr malformed bracket form: {server_addr}"),
+            ));
+        }
+    };
+    if host.contains(':') && host.parse::<std::net::Ipv6Addr>().is_err() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("anytls server_addr invalid IPv6 literal: {host}"),
+        ));
+    }
     let address = match host.parse::<std::net::IpAddr>() {
         Ok(ip) => Address::from(ip),
         Err(_) => Address::new_domain(host),

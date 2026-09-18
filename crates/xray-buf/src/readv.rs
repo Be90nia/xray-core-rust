@@ -105,54 +105,12 @@ impl AllocStrategy {
             self.current = 1;
         }
     }
-
-    /// 分配 `current` 个池化空 Buffer。对应 Go `Alloc()`。
-    ///
-    /// Vec 版（bd fwhh）：`xray-transport/src/bridge.rs` 兼容路径仍在用；
-    /// `ReadVReader` 热路径已切零分配栈数组，勿新增调用方。
-    #[must_use]
-    pub fn alloc(&self) -> Vec<Buffer> {
-        (0..self.current).map(|_| Buffer::new()).collect()
-    }
 }
 
-// ========== iovec 构建 + 字节分发（对应 Go posixReader.Init / readMulti 尾部循环） ==========
+// ========== iovec 构建 + 字节分发 ==========
 
-/// 把每个 Buffer 的可写区拼成 `read_vectored` 的 iovec 数组（堆分配版）。
-///
-/// 返回 `(slices, lens)`：`lens[i]` 是第 i 个 iovec 的长度（分发起始容量），
-/// 供 [`distribute`] 按序分配读取到的字节数。Buffer 内存由池提供（8KB 分层），
-/// readv 直写池化内存，无每段堆分配（对应 Go 直写 `bs[nBuf].v`）。
-pub fn buffer_iovecs(bufs: &mut [Buffer]) -> (Vec<IoSliceMut<'_>>, Vec<usize>) {
-    let mut slices = Vec::with_capacity(bufs.len());
-    let mut lens = Vec::with_capacity(bufs.len());
-    for b in bufs.iter_mut() {
-        let w = b.writable_bytes();
-        lens.push(w.len());
-        slices.push(IoSliceMut::new(w));
-    }
-    (slices, lens)
-}
-
-/// 把一次读取的 `n` 字节按序分配进各 Buffer，产出 `MultiBuffer`。
-///
-/// 对应 Go readv_reader.go:101-118：前 `nBuf` 个缓冲按 `min(remaining, Size)` 推进
-/// 写游标，其余释放回池。`bufs` 被消费置空，无数据的段不进入结果。
-pub fn distribute(n: usize, bufs: &mut Vec<Buffer>, lens: &[usize]) -> MultiBuffer {
-    let mut remaining = n;
-    let mut mb = MultiBuffer::with_capacity(bufs.len());
-    for (i, mut buf) in std::mem::take(bufs).into_iter().enumerate() {
-        if remaining == 0 {
-            buf.release();
-            continue;
-        }
-        let take = remaining.min(lens[i]);
-        buf.advance_write(take);
-        remaining -= take;
-        mb.push(buf);
-    }
-    mb
-}
+// 堆分配版 alloc/buffer_iovecs/distribute 已删（wfx8-4：零生产调用方，注释
+// 声称 bridge.rs 在用系失实）；零分配栈数组路径见下方 IovecBatch/readv 循环。
 
 // ========== 零分配 readv 路径（bd fwhh：ReadVReader 每读 4 alloc → ~1） ==========
 
@@ -182,8 +140,8 @@ impl<'a> IovecBatch<'a> {
     }
 }
 
-/// 数组版 distribute：n 字节按 iovec 容量切进各槽（语义同 [`distribute`]），
-/// 消费全部槽位；唯一保留分配 = MultiBuffer 内部 `Vec::with_capacity`。
+/// 数组版分发：n 字节按 iovec 容量切进各槽（原 Vec 版 distribute 的零分配
+/// 形态），消费全部槽位；唯一保留分配 = MultiBuffer 内部 `Vec::with_capacity`。
 fn distribute_slots(
     n: usize,
     bufs: &mut [Option<Buffer>; MAX_READV],
@@ -361,28 +319,6 @@ mod tests {
         // 下界保护：n=0 不会钳出 0
         s.adjust(0);
         assert_eq!(s.current(), 1);
-    }
-
-    #[test]
-    fn distribute_byte_conservation_and_release() {
-        // 分发守恒：n 字节按 iovec 容量切进各 Buffer，尾部空缓冲释放。
-        let mut bufs: Vec<Buffer> = (0..4).map(|_| Buffer::new()).collect();
-        let lens: Vec<usize> = bufs.iter().map(|b| b.capacity()).collect();
-        let cap = lens[0];
-
-        // 恰好 2.5 个缓冲的量
-        let n = cap * 2 + cap / 2;
-        let mb = distribute(n, &mut bufs, &lens);
-        assert_eq!(mb.len(), n);
-        assert_eq!(mb.buffer_count(), 3);
-        assert!(bufs.is_empty()); // 全部被消费（尾部释放）
-
-        // n=0：全部释放，空 MultiBuffer
-        let mut bufs: Vec<Buffer> = (0..2).map(|_| Buffer::new()).collect();
-        let lens2: Vec<usize> = bufs.iter().map(|b| b.capacity()).collect();
-        let mb = distribute(0, &mut bufs, &lens2);
-        assert!(mb.is_empty());
-        assert!(bufs.is_empty());
     }
 
     /// 端到端：32KB 分块写入 → ReadVReader 一次聚合读多缓冲 → 字节守恒。
@@ -624,22 +560,6 @@ mod tests {
         assert!(bufs.iter().all(|s| s.is_none()));
     }
 
-    /// bd fwhh：IovecBatch::build 的 lens 与 Vec 版 buffer_iovecs 一致。
-    #[test]
-    fn iovec_batch_build_matches_vec_version() {
-        let mut slots: [Option<Buffer>; MAX_READV] = std::array::from_fn(|_| None);
-        for slot in slots.iter_mut().take(3) {
-            *slot = Some(Buffer::new());
-        }
-        let mut bufs: Vec<Buffer> = slots.iter_mut().take(3).map(|s| s.take().unwrap()).collect();
-        let (_, vec_lens) = buffer_iovecs(&mut bufs);
-
-        for slot in slots.iter_mut().take(3) {
-            *slot = Some(Buffer::new());
-        }
-        let batch = IovecBatch::build(&mut slots, 3);
-        assert_eq!(batch.n, 3);
-        assert_eq!(&batch.lens[..3], &vec_lens[..]);
-        assert_eq!(&batch.lens[3..], &[0; MAX_READV - 3]);
-    }
+    // bd fwhh：IovecBatch::build 的 lens 与被删 Vec 版 buffer_iovecs 同源，
+    // 正确性由 distribute_slots_byte_conservation_and_release 覆盖。
 }

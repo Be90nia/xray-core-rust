@@ -318,7 +318,7 @@ where
     let connect_result = pinned.as_mut().connect().await;
     if let Err(e) = connect_result {
         drop(hooks_guard); // 提前返回时 SSL 随 pinned 释放，须先注销
-        eprintln!("[REALITY dbg] SslStream::connect failed: {e:?}");
+        tracing::warn!(error = ?e, "REALITY SslStream::connect failed");
         return Err(io::Error::new(io::ErrorKind::ConnectionAborted, e.to_string()));
     }
 

@@ -843,7 +843,10 @@ impl Drop for OnlineIpGuard {
 type BackgroundTasks = Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>;
 
 /// 把后台 task 收进共享 JoinSet。spawn 动作本身瞬时入队后即结束，
-/// 业务 future 由 JoinSet 持有；入队前收割已完成句柄，簿记不随连接数涨。
+/// 业务 future 由 JoinSet 持有。收割时机：仅在下一次 spawn 时顺带
+/// `try_join_next` 清理已完成句柄——**持续流量下**簿记不随连接数增长；
+/// 长静默后一次性 spawn 大批 task 的场景，finished handles 会滞留至下一
+/// 次 spawn（wfx8-5 登记：周期 reaper 为后续项，暂不新增常驻定时器并发面）。
 fn spawn_tracked(set: &BackgroundTasks, task: impl Future<Output = ()> + Send + 'static) {
     let set = Arc::clone(set);
     tokio::spawn(async move {

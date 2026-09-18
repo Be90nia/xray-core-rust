@@ -29,6 +29,10 @@ pub struct ParsedClientHello<'a> {
     pub session_id: [u8; 32],
     /// key_share extension 中的 X25519 公钥（32 字节）；无则 `None`。
     pub key_share_x25519: Option<[u8; 32]>,
+    /// sb6g：key_share 中存在合格 X25519MLKEM768 entry（Go `peerPub2 != nil`：
+    /// 位于可选 X25519 之前且不重复）。`false` = outdated/strange ClientHello，
+    /// Go tls.go:233-235 reject→forward。
+    pub key_share_mlkem768: bool,
     /// server_name extension 中的 SNI；无则 `None`（用于 server_names 白名单匹配）。
     pub server_name: Option<String>,
 }
@@ -106,6 +110,7 @@ fn parse_handshake(msg: &[u8]) -> Result<ParsedClientHello<'_>, RealityError> {
     let exts = &body[off..off + ext_total];
 
     let mut key_share_x25519 = None;
+    let mut key_share_mlkem768 = false;
     let mut server_name = None;
     let mut e_off = 0;
     while e_off + 4 <= exts.len() {
@@ -120,7 +125,9 @@ fn parse_handshake(msg: &[u8]) -> Result<ParsedClientHello<'_>, RealityError> {
         match etype {
             0x0000 if server_name.is_none() => server_name = parse_sni(edata),
             0x0033 if key_share_x25519.is_none() => {
-                key_share_x25519 = parse_key_share_x25519(edata);
+                let (pub_key, mlkem_ok) = parse_key_shares(edata);
+                key_share_x25519 = pub_key;
+                key_share_mlkem768 = mlkem_ok;
             }
             _ => {}
         }
@@ -131,6 +138,7 @@ fn parse_handshake(msg: &[u8]) -> Result<ParsedClientHello<'_>, RealityError> {
         random,
         session_id,
         key_share_x25519,
+        key_share_mlkem768,
         server_name,
     })
 }
@@ -164,44 +172,60 @@ fn parse_sni(edata: &[u8]) -> Option<String> {
 /// 解析 key_share extension (0x0033)，返回 X25519 (group 0x001d) 的 32 字节公钥。
 ///
 /// tvky (REALITY 10.0)：同时支持 X25519MLKEM768 hybrid key share
-/// (group=0x4588 = 4588，data = mlkem ek(1184) + x25519 pub(32)，共 1216 字节)。
+/// (group=0x11EC，data = mlkem ek(1184) + x25519 pub(32)，共 1216 字节)。
 /// Go `MlkemEcdhe.ECDH(serverPub)` 仅返回 X25519 段（`ecdh.PrivateKey.ECDH`
 /// 是纯 X25519），hybrid MLKEM 段在 auth_key 派生中不参与；REALITY 10.0
 /// PQC 安全性来自 TLS session key 的 hybrid 派生，而非 auth_key 本身。
 /// 对应 Go utls `handshake_client.go:181-183`
 /// `{group: X25519MLKEM768, data: append(mlkemEncapsulationKey, x25519EphemeralKey...)}`。
-fn parse_key_share_x25519(edata: &[u8]) -> Option<[u8; 32]> {
+///
+/// sb6g：选择逻辑精确对齐 Go xtls/reality tls.go:233-244——返回
+/// `(选中的 client X25519 公钥, 是否存在合格 MLKEM768 entry)`：
+/// - X25519MLKEM768（group **0x11EC** = 十进制 4588；历史实现误写 0x4588
+///   ——把十进制当十六进制，导致真实 hybrid entry 永不匹配）必须存在，
+///   且位于可选独立 X25519 entry 之前、不重复；
+/// - 独立 X25519（group 0x001D, 32B）首遇即停（Go `break // ensure order`），
+///   其后 entry 不再消费；
+/// - 无合格 MLKEM entry → `mlkem768_ok = false`，Go `peerPub2 == nil → break`
+///   reject outdated/strange ClientHello → forward fallback。
+fn parse_key_shares(edata: &[u8]) -> (Option<[u8; 32]>, bool) {
     if edata.len() < 2 {
-        return None;
+        return (None, false);
     }
     let list_len = u16::from_be_bytes([edata[0], edata[1]]) as usize;
     if edata.len() < 2 + list_len {
-        return None;
+        return (None, false);
     }
     let mut d = &edata[2..2 + list_len];
+    let mut mlkem_pub: Option<[u8; 32]> = None;
     while d.len() >= 4 {
         let group = u16::from_be_bytes([d[0], d[1]]);
         let key_len = u16::from_be_bytes([d[2], d[3]]) as usize;
         if d.len() < 4 + key_len {
-            return None;
+            return (None, false);
         }
-        // X25519 (group 0x001d): 32 字节公钥
-        if group == 0x001d && key_len == 32 {
-            let mut k = [0u8; 32];
-            k.copy_from_slice(&d[4..4 + 32]);
-            return Some(k);
-        }
-        // X25519MLKEM768 hybrid (group 0x4588): 1184B MLKEM ek + 32B X25519 pub，
+        // X25519MLKEM768 hybrid (group 0x11EC): 1184B MLKEM ek + 32B X25519 pub，
         // X25519 部分在末尾。Go 端 `MlkemEcdhe.ECDH(serverPub)` 只消费 X25519 段。
-        if group == 0x4588 && key_len == 1216 {
+        if group == 0x11ec && key_len == 1216 {
+            if mlkem_pub.is_some() {
+                // Go: 重复 MLKEM entry → `peerPub2 = nil // ensure once` → reject
+                return (None, false);
+            }
             let x_start = 4 + 1184; // skip mlkem ek
             let mut k = [0u8; 32];
             k.copy_from_slice(&d[x_start..x_start + 32]);
-            return Some(k);
+            mlkem_pub = Some(k);
+        } else if group == 0x001d && key_len == 32 {
+            // X25519 (group 0x001D): 32 字节公钥，Go peerPub 优先；
+            // 首遇即 break——其后（顺序颠倒的 MLKEM）不消费 = reject。
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&d[4..4 + 32]);
+            return (Some(k), mlkem_pub.is_some());
         }
         d = &d[4 + key_len..];
     }
-    None
+    // MLKEM-only：Go `if peerPub == nil { peerPub = peerPub2 }`（次选）
+    (mlkem_pub, mlkem_pub.is_some())
 }
 
 /// `session_id` 在 handshake_message 中的字节偏移。
@@ -243,6 +267,14 @@ pub fn verify_reality_client_hello(
     min_client_ver: &[u8],
     max_client_ver: &[u8],
 ) -> Result<(crate::crypto::SessionPayload, [u8; 32]), RealityError> {
+    // sb6g：Go tls.go:233-235 `peerPub2 == nil → break`——缺合格
+    // X25519MLKEM768 key share 的 outdated ClientHello（纯 X25519 单 share、
+    // MLKEM 顺序颠倒、重复 MLKEM entry）一律 reject → 调用方 forward
+    // fallback，不做 REALITY 验证。
+    if !parsed.key_share_mlkem768 {
+        return Err(RealityError::NoKeyShareX25519);
+    }
+
     // 1. 提取 client X25519 公钥（来自 key_share extension）
     let client_pub = parsed
         .key_share_x25519
@@ -801,10 +833,10 @@ mod tests {
             exts.extend_from_slice(&(sni_ext.len() as u16).to_be_bytes());
             exts.extend_from_slice(&sni_ext);
         }
-        // X25519MLKEM768 hybrid key share entry
+        // X25519MLKEM768 hybrid key share entry（group 0x11EC = 十进制 4588）
         let mut ks_ext = Vec::new();
         ks_ext.extend_from_slice(&((2 + 2 + 1216) as u16).to_be_bytes());
-        ks_ext.extend_from_slice(&[0x45, 0x88]); // X25519MLKEM768 = 4588
+        ks_ext.extend_from_slice(&[0x11, 0xEC]); // X25519MLKEM768 = 0x11EC
         ks_ext.extend_from_slice(&[0x04, 0xC0]); // key_len = 1216
         ks_ext.extend_from_slice(mlkem_ek);
         ks_ext.extend_from_slice(x25519_pub_tail);
@@ -880,6 +912,10 @@ mod tests {
     }
 
     /// [`build_reality_client_hello`] 的 ClientVer 定制版（ft0g 版本门控测试用）。
+    ///
+    /// sb6g：key_share 用 X25519MLKEM768 hybrid entry（真实 Chrome/btls 形态，
+    /// Go tls.go:233-235 要求 MLKEM768 存在才进 REALITY 验证）——纯 X25519
+    /// 单 share 的 ClientHello 会被服务端 reject→forward。
     fn build_reality_client_hello_with_version(
         random: &[u8; 32],
         server_static_private: &[u8; 32],
@@ -895,10 +931,17 @@ mod tests {
         let client_secret = StaticSecret::from(*client_private);
         let client_pub = PublicKey::from(&client_secret);
         let server_pub = PublicKey::from(&StaticSecret::from(*server_static_private));
+        let mlkem_ek_placeholder = [0xAAu8; 1184];
 
-        // 1. 构造 session_id=0 的 ClientHello（拿 AAD = handshake_message）
+        // 1. 构造 session_id=0 的 hybrid ClientHello（拿 AAD = handshake_message）
         let zero_sid = [0u8; 32];
-        let record_zero = build_test_client_hello(random, &zero_sid, client_pub.as_bytes(), sni);
+        let record_zero = build_test_client_hello_hybrid_key_share(
+            random,
+            &zero_sid,
+            &mlkem_ek_placeholder,
+            client_pub.as_bytes(),
+            sni,
+        );
         let parsed_zero = parse_client_hello(&record_zero).unwrap();
 
         // 2. derive auth_key（client 视角：client_priv + server_pub）
@@ -919,59 +962,6 @@ mod tests {
             .unwrap();
 
         // 5. 构造最终 ClientHello（session_id = 密文）
-        build_test_client_hello(random, &sid, client_pub.as_bytes(), sni)
-    }
-
-    /// tvky：构造含 X25519MLKEM768 hybrid key_share 的完整 REALITY ClientHello record。
-    ///
-    /// 与 [`build_reality_client_hello`] 相同流程但 key_share entry 为 hybrid
-    /// （group=0x4588，1216B = 1184B ML-KEM ek + 32B X25519 pub），auth_key
-    /// 仍只从 X25519 段派生（与 Go `MlkemEcdhe.ECDH(serverPub)` 语义一致）。
-    fn build_reality_client_hello_hybrid(
-        random: &[u8; 32],
-        server_static_private: &[u8; 32],
-        client_private: &[u8; 32],
-        timestamp: u32,
-        short_id: &[u8; 8],
-        sni: Option<&str>,
-    ) -> Vec<u8> {
-        use crate::crypto::{derive_auth_key, encrypt_session_id};
-        use x25519_dalek::{PublicKey, StaticSecret};
-
-        let client_secret = StaticSecret::from(*client_private);
-        let client_pub = PublicKey::from(&client_secret);
-        let server_pub = PublicKey::from(&StaticSecret::from(*server_static_private));
-
-        // 1. 构造 session_id=0 的 hybrid ClientHello（拿 AAD）
-        let zero_sid = [0u8; 32];
-        let mlkem_ek_placeholder = [0xAAu8; 1184];
-        let record_zero = build_test_client_hello_hybrid_key_share(
-            random,
-            &zero_sid,
-            &mlkem_ek_placeholder,
-            client_pub.as_bytes(),
-            sni,
-        );
-        let parsed_zero = parse_client_hello(&record_zero).unwrap();
-
-        // 2. auth_key（仅 X25519 段 ECDH，与 Go MlkemEcdhe.ECDH 语义一致）
-        let auth_key =
-            derive_auth_key(client_private, server_pub.as_bytes(), &random[..20]).unwrap();
-
-        // 3. plaintext[16] = [version(3)|reserved(1)|timestamp(4 BE)|short_id(8)]
-        let mut plaintext = [0u8; 16];
-        plaintext[0..3].copy_from_slice(&[1, 8, 1]);
-        plaintext[3] = 0;
-        plaintext[4..8].copy_from_slice(&timestamp.to_be_bytes());
-        plaintext[8..16].copy_from_slice(short_id);
-
-        // 4. encrypt → 32B ciphertext session_id
-        let mut sid = [0u8; 32];
-        sid[..16].copy_from_slice(&plaintext);
-        encrypt_session_id(&auth_key, &random[20..32], &mut sid, parsed_zero.handshake_message)
-            .unwrap();
-
-        // 5. 构造最终 hybrid ClientHello
         build_test_client_hello_hybrid_key_share(
             random,
             &sid,
@@ -1016,7 +1006,8 @@ mod tests {
         let now = 1_700_000_000u32;
         let short_id = [0xaa; 8];
 
-        let record = build_reality_client_hello_hybrid(
+        // sb6g 后 build_reality_client_hello 产 hybrid（0x11EC）key_share CH
+        let record = build_reality_client_hello(
             &random,
             &server_priv,
             &client_priv,
@@ -1025,8 +1016,9 @@ mod tests {
             Some("example.com"),
         );
         let parsed = parse_client_hello(&record).unwrap();
-        // 关键断言：hybrid entry 解析出末尾 X25519 公钥
+        // 关键断言：hybrid entry 解析出末尾 X25519 公钥 + MLKEM768 检测命中
         assert!(parsed.key_share_x25519.is_some());
+        assert!(parsed.key_share_mlkem768, "hybrid entry must set key_share_mlkem768");
         let (payload, auth_key) = verify_reality_client_hello(
             &parsed,
             &server_priv,
@@ -1076,6 +1068,199 @@ mod tests {
         assert!(parsed.key_share_x25519.is_none());
         let err = verify_reality_client_hello(&parsed, &[0u8; 32], 0, 0, &[], &[], &[]).unwrap_err();
         assert!(matches!(err, RealityError::NoKeyShareX25519));
+    }
+
+    // ===== sb6g：服务端 MLKEM768 key share 门禁（Go tls.go:233-235 reject→forward）=====
+
+    /// 构造任意 key_share entries 的 ClientHello record（sb6g 测试专用）。
+    /// entries 按 wire 顺序编码进单一 key_share extension。
+    fn build_test_client_hello_with_key_share_entries(
+        random: &[u8; 32],
+        session_id: &[u8; 32],
+        entries: &[(u16, Vec<u8>)],
+        sni: Option<&str>,
+    ) -> Vec<u8> {
+        let mut ks_list = Vec::new();
+        for (group, key) in entries {
+            ks_list.extend_from_slice(&group.to_be_bytes());
+            ks_list.extend_from_slice(&(key.len() as u16).to_be_bytes());
+            ks_list.extend_from_slice(key);
+        }
+        let mut ks_ext = Vec::with_capacity(2 + ks_list.len());
+        ks_ext.extend_from_slice(&(ks_list.len() as u16).to_be_bytes());
+        ks_ext.extend_from_slice(&ks_list);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(random);
+        body.push(32);
+        body.extend_from_slice(session_id);
+        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]);
+        body.extend_from_slice(&[1, 0]);
+
+        let mut exts = Vec::new();
+        if let Some(name) = sni {
+            let nb = name.as_bytes();
+            let list_len = 1 + 2 + nb.len();
+            let mut sni_ext = Vec::new();
+            sni_ext.extend_from_slice(&(list_len as u16).to_be_bytes());
+            sni_ext.push(0);
+            sni_ext.extend_from_slice(&(nb.len() as u16).to_be_bytes());
+            sni_ext.extend_from_slice(nb);
+            exts.extend_from_slice(&[0x00, 0x00]);
+            exts.extend_from_slice(&(sni_ext.len() as u16).to_be_bytes());
+            exts.extend_from_slice(&sni_ext);
+        }
+        exts.extend_from_slice(&[0x00, 0x33]);
+        exts.extend_from_slice(&(ks_ext.len() as u16).to_be_bytes());
+        exts.extend_from_slice(&ks_ext);
+
+        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(&exts);
+
+        let mut hs = vec![0x01];
+        let blen = body.len();
+        hs.extend_from_slice(&[(blen >> 16) as u8, (blen >> 8) as u8, blen as u8]);
+        hs.extend_from_slice(&body);
+
+        let mut record = vec![0x16, 0x03, 0x01];
+        let hl = hs.len();
+        record.extend_from_slice(&[(hl >> 8) as u8, hl as u8]);
+        record.extend_from_slice(&hs);
+        record
+    }
+
+    /// 票面核心：纯 X25519 单 share（无 MLKEM768）→ Go `peerPub2 == nil` reject，
+    /// verify 返回 NoKeyShareX25519 → server_tls 转 Invalid 走 forward fallback。
+    #[test]
+    fn verify_reality_client_hello_pure_x25519_only_rejected() {
+        let random = [0x55u8; 32];
+        let session_id = [0x77u8; 32];
+        let record = build_test_client_hello_with_key_share_entries(
+            &random,
+            &session_id,
+            &[(0x001d, vec![0x88u8; 32])],
+            Some("example.com"),
+        );
+        let parsed = parse_client_hello(&record).unwrap();
+        assert!(parsed.key_share_x25519.is_some());
+        assert!(!parsed.key_share_mlkem768);
+        let err = verify_reality_client_hello(&parsed, &[0u8; 32], 0, 0, &[], &[], &[]).unwrap_err();
+        assert!(matches!(err, RealityError::NoKeyShareX25519));
+    }
+
+    /// Chrome 双 share 形态 [X25519MLKEM768, X25519]（MLKEM 在前）：独立
+    /// X25519 entry 优先（Go peerPub），MLKEM 检测命中。
+    #[test]
+    fn parse_client_hello_dual_share_mlkem_then_x25519() {
+        let random = [0x55u8; 32];
+        let session_id = [0x77u8; 32];
+        let x_pub = [0xBBu8; 32];
+        let mut hybrid = vec![0xAAu8; 1216];
+        hybrid[1184..].copy_from_slice(&x_pub);
+        let record = build_test_client_hello_with_key_share_entries(
+            &random,
+            &session_id,
+            &[(0x11ec, hybrid), (0x001d, vec![0xCCu8; 32])],
+            None,
+        );
+        let parsed = parse_client_hello(&record).unwrap();
+        // 独立 X25519 entry 优先（Go `peerPub = keyShare.data; break`）
+        assert_eq!(parsed.key_share_x25519, Some([0xCCu8; 32]));
+        assert!(parsed.key_share_mlkem768);
+    }
+
+    /// MLKEM-only 单 entry（无独立 X25519）：取 hybrid 末段
+    /// （Go `if peerPub == nil { peerPub = peerPub2 }` 次选）。
+    #[test]
+    fn parse_client_hello_hybrid_only_uses_mlkem_tail() {
+        let random = [0x55u8; 32];
+        let session_id = [0x77u8; 32];
+        let x_pub = [0xBBu8; 32];
+        let mut hybrid = vec![0xAAu8; 1216];
+        hybrid[1184..].copy_from_slice(&x_pub);
+        let record = build_test_client_hello_with_key_share_entries(
+            &random,
+            &session_id,
+            &[(0x11ec, hybrid)],
+            None,
+        );
+        let parsed = parse_client_hello(&record).unwrap();
+        assert_eq!(parsed.key_share_x25519, Some(x_pub));
+        assert!(parsed.key_share_mlkem768);
+    }
+
+    /// 顺序颠倒 [X25519, X25519MLKEM768]：Go 首遇 X25519 即 break，其后
+    /// MLKEM 不消费 → `peerPub2 == nil` reject。
+    #[test]
+    fn parse_client_hello_x25519_before_mlkem_rejected() {
+        let random = [0x55u8; 32];
+        let session_id = [0x77u8; 32];
+        let record = build_test_client_hello_with_key_share_entries(
+            &random,
+            &session_id,
+            &[(0x001d, vec![0xCCu8; 32]), (0x11ec, vec![0xAAu8; 1216])],
+            None,
+        );
+        let parsed = parse_client_hello(&record).unwrap();
+        assert_eq!(parsed.key_share_x25519, Some([0xCCu8; 32]));
+        assert!(!parsed.key_share_mlkem768);
+        let err = verify_reality_client_hello(&parsed, &[0u8; 32], 0, 0, &[], &[], &[]).unwrap_err();
+        assert!(matches!(err, RealityError::NoKeyShareX25519));
+    }
+
+    /// 重复 MLKEM entry：Go `peerPub2 = nil // ensure once` → reject。
+    #[test]
+    fn parse_client_hello_duplicate_mlkem_rejected() {
+        let random = [0x55u8; 32];
+        let session_id = [0x77u8; 32];
+        let record = build_test_client_hello_with_key_share_entries(
+            &random,
+            &session_id,
+            &[(0x11ec, vec![0xAAu8; 1216]), (0x11ec, vec![0xABu8; 1216])],
+            None,
+        );
+        let parsed = parse_client_hello(&record).unwrap();
+        assert!(parsed.key_share_x25519.is_none());
+        assert!(!parsed.key_share_mlkem768);
+    }
+
+    /// server_tls e2e：纯 X25519 单 share CH → `Invalid`（调用方拿回
+    /// conn+record 走 `fallback_to_dest`），reason = NoKeyShareX25519。
+    #[tokio::test]
+    async fn server_tls_pure_x25519_ch_invalid_for_fallback() {
+        use tokio::io::{AsyncWriteExt, duplex};
+
+        let random = [0x55u8; 32];
+        let session_id = [0x77u8; 32];
+        let record = build_test_client_hello_with_key_share_entries(
+            &random,
+            &session_id,
+            &[(0x001d, vec![0x88u8; 32])],
+            Some("example.com"),
+        );
+
+        let (client, server) = duplex(65536);
+        let server_task = tokio::spawn(async move {
+            server_tls(server, &[0x11u8; 32], &[[0xaa; 8]], 43200, &[], &[], &[]).await
+        });
+
+        let mut client = client;
+        client.write_all(&record).await.unwrap();
+        drop(client); // 半关闭：让 server 侧读完 record 后完成 verify
+
+        match server_task.await.unwrap() {
+            Ok(RealityServerOutcome::Invalid { reason, .. }) => {
+                assert!(
+                    matches!(reason, RealityError::NoKeyShareX25519),
+                    "expected NoKeyShareX25519, got {reason:?}"
+                );
+            }
+            Ok(RealityServerOutcome::Verified(_)) => {
+                panic!("expected Invalid outcome, got Verified")
+            }
+            Err(e) => panic!("expected Invalid outcome, got server error: {e:?}"),
+        }
     }
 
     #[test]
@@ -1234,12 +1419,17 @@ mod tests {
     async fn server_tls_invalid_returns_invalid_outcome() {
         use tokio::io::{AsyncWriteExt, duplex};
 
-        // 构造合法 TLS record 但 session_id 不含 REALITY 加密载荷（verify 失败）
+        // 构造合法 hybrid CH 但 session_id 不含 REALITY 加密载荷（verify 失败）。
+        // sb6g 后 key_share 需带 MLKEM768 才过门禁，故用 hybrid entry——
+        // 失败点落在 session_id 解密（而非 key share 门禁）。
         let random = [0x55u8; 32];
         let session_id = [0x77u8; 32]; // 非加密载荷
-        let key_share = [0x88u8; 32];
-        let record =
-            build_test_client_hello(&random, &session_id, &key_share, Some("example.com"));
+        let record = build_test_client_hello_with_key_share_entries(
+            &random,
+            &session_id,
+            &[(0x11ec, vec![0xAAu8; 1216])],
+            Some("example.com"),
+        );
 
         let (mut client, server) = duplex(4096);
         let server_priv = [0x11u8; 32];
@@ -1454,9 +1644,15 @@ mod tests {
         }
     }
 
-    /// watfaq-rustls fallback 路径 loopback（指纹 `randomizednoalpn` 不被 btls
-    /// 支持，u_client 走 `with_reality` rustls 握手）：完整 REALITY 握手 + 固定空模板
-    /// 证书 HMAC 验证（Go init() 语义 cert 的 e2e 证明，独立于 btls 指纹路径）。
+    /// `randomizednoalpn` 指纹 loopback。
+    ///
+    /// 566y 注释修正：randomizednoalpn **并非** watfaq-rustls fallback——
+    /// btls_client.rs 已将其就近映射为 Chrome 133 no-ALPN connector
+    /// （key_shares = CHROME_133_KEY_SHARES 双 share，含 MLKEM768），本测试
+    /// 实际锁 btls no-ALPN 变体全链。真正走 watfaq fallback 的唯一预设是
+    /// `unsafe`（btls 清单外）；fallback CH 为纯 X25519 单 share，在 sb6g 的
+    /// Go MLKEM 门禁下会被服务端 reject→forward（Go 一致），其行为由
+    /// [`server_tls_pure_x25519_ch_invalid_for_fallback`] 锁定。
     #[tokio::test]
     async fn reality_loopback_watfaq_fallback_fingerprint() {
         ensure_crypto_provider();
@@ -1561,19 +1757,47 @@ mod tests {
         }
     }
 
+    /// 566y：btls 主路径 **MLKEM-capable 指纹 active 矩阵**（实测 2026-09-19）。
+    ///
+    /// 从原 21 指纹大矩阵中摘出**当前 btls 栈上真实可完成 REALITY 全链**的
+    /// 子集：仅 Chrome 133/131 系模板（`CHROME_133_KEY_SHARES` /
+    /// `CHROME_131_KEY_SHARES` = `[X25519MLKEM768, X25519]` 双 share）满足
+    /// sb6g 的 Go MLKEM768 门禁（xtls/reality tls.go:233-235）。android 就近
+    /// 映射 Chrome 133（btls_client.rs），同样双 share。
+    ///
+    /// 非失败语义：其余 17 指纹模板（firefox/ios/safari/edge/360/qq/120/100/99
+    /// 系）key share 无 MLKEM768，被服务端 reject→forward——与 Go 上游对
+    /// outdated ClientHello 的行为**一致**（Go REALITY 10.0 同样只接受
+    /// MLKEM-capable 客户端），非本仓缺口；行为由
+    /// [`server_tls_pure_x25519_ch_invalid_for_fallback`] 单测锁定。
+    /// 单指纹 timeout/EOF 细节见下方 ignored 大矩阵注释。
+    #[tokio::test]
+    async fn reality_fingerprint_matrix_btls_mlkem() {
+        ensure_crypto_provider();
+        for fp in ["chrome", "android", "hellochrome_131", "hellochrome_133"] {
+            reality_loopback_with_fingerprint(fp).await;
+        }
+    }
+
     /// btls 浏览器指纹主路径矩阵：preset 8 + modern 11 + 旧版 2 = 21 例。
     ///
-    /// **ignore 根因（aai 遗留，非本批引入）**：btls 客户端路径 REALITY 注入
-    /// 在 BIO 写出时改写 ClientHello session_id（btls_reality.rs 拦截流），
-    /// 但 BoringSSL 在消息构建期已将**原** session_id 计入握手 transcript——
-    /// 服务端 transcript（含注入值）与客户端不一致 → ServerHello
-    /// legacy_session_id_echo / Finished 校验失败 → 客户端秒败
-    /// `TlsHandshake("[DECODE_ERROR]")`（既有 `reality_loopback_u_client_
-    /// with_server_tls` 同因失败，commit 30b84bd 注记）。修复需 btls fork 提供
-    /// pre-hash 注入 API（utls `hello.SessionId` 语义），属 btls-sys 层工作。
-    /// 修复后去 ignore 即为 ≥10 指纹 btls 路径验收门。
+    /// **566y 实测分类（2026-09-19，对 21 指纹逐个 loopback 探针）**：
+    /// - PASS（4）：chrome / android / hellochrome_131 / hellochrome_133
+    ///   —— 已摘为上方 active 矩阵 [`reality_fingerprint_matrix_btls_mlkem`]；
+    /// - FAIL（17）：非 MLKEM 模板。服务端按 Go 语义 reject→forward（正确行为），
+    ///   客户端等不到 ServerHello → 10s timeout（edge/360/qq/safari/100/99 系）
+    ///   或 EOF（firefox 系——rustls 服务端对 firefox CH 另有兼容性问题，EOF
+    ///   先于门禁发生，属既有独立问题）。
+    ///
+    /// **ignore 根因更新**：旧注释声称的"btls transcript mismatch → DECODE_ERROR"
+    /// 已不复现（chrome 全链实测通过）；当前保留 ignore 是因为矩阵混合
+    /// PASS/FAIL 形态，单测无法断言统一结果。治本方向（二选一）：
+    /// ① btls 指纹模板为 firefox/edge 等现代变体补 X25519MLKEM768 key share
+    /// entry（对齐真实浏览器 131+ 形态，随后可摘入 active 矩阵）；
+    /// ② btls fork 提供 pre-hash 注入 API 修 transcript（已非 chrome 路径阻塞）。
+    /// 修复后按门禁语义逐指纹归类，不做单一全矩阵断言。
     #[tokio::test]
-    #[ignore = "btls REALITY transcript mismatch (aai legacy DECODE_ERROR); needs pre-hash injection API in btls fork"]
+    #[ignore = "mixed PASS(4 MLKEM-capable, extracted as active matrix)/FAIL(17 non-MLKEM templates, Go-consistent reject); see doc above"]
     async fn reality_fingerprint_matrix_btls() {
         ensure_crypto_provider();
         let matrix = [
@@ -1607,10 +1831,15 @@ mod tests {
         }
     }
 
-    /// watfaq-rustls fallback 路径矩阵：`randomizednoalpn`/`hellorandomizednoalpn`
-    /// 是仅有的两个不被 btls connector 覆盖的指纹（btls_client.rs:975 仅映射
-    /// Random/Randomized/HelloRandomized/HelloRandomizedAlpn→Chrome133），走标准
-    /// rustls ClientHello + REALITY session_id 注入（transcript 一致，可完整握手）。
+    /// `randomizednoalpn` / `hellorandomizednoalpn` 矩阵。
+    ///
+    /// 566y 注释修正：两者均被 btls_client.rs 就近映射为 Chrome 133 no-ALPN
+    /// connector（key_shares = CHROME_133_KEY_SHARES，含 MLKEM768 双 share），
+    /// 走 **btls 路径**而非 watfaq-rustls fallback（旧注释已过时）；本测试锁
+    /// 该 no-ALPN 映射的全链可用性。真正走 fallback 的唯一预设是 `unsafe`
+    /// （btls 清单外），其 CH 纯 X25519 单 share 在 Go MLKEM 门禁下被
+    /// reject→forward，行为由 [`server_tls_pure_x25519_ch_invalid_for_fallback`]
+    /// 锁定。
     #[tokio::test]
     async fn reality_fingerprint_matrix_watfaq_fallback() {
         ensure_crypto_provider();
@@ -1621,8 +1850,9 @@ mod tests {
 
     /// 全 21 指纹名查表（无 btls 握手）——验证 xray-tls::fingerprint::get_fingerprint
     /// 能识别 21 个目标指纹名（preset 8 + modern 11 + 旧版 2 = 21）。
-    /// 真实握手测试见上方 `reality_fingerprint_matrix_btls`（#[ignore]，
-    /// btls transcript mismatch 修复后启用）。
+    /// 真实握手测试见 `reality_fingerprint_matrix_btls_mlkem`（active，
+    /// MLKEM-capable 子集）与 `reality_fingerprint_matrix_btls`（#[ignore]，
+    /// 全矩阵实测分类见其注释）。
     #[test]
     fn all_21_fingerprints_resolve() {
         let names = [

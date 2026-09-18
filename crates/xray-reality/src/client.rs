@@ -465,6 +465,22 @@ where
     }
 
     // fallback：watfaq-rustls with_reality（标准 rustls ClientHello）
+    //
+    // 49i9：主路径守卫不满足时的两条硬错（对齐 Go UClient 握手期硬错语义，
+    // 防 panic / 防 fail-open）——正常入口 UConnState::new 的 validate_client
+    // 已前置拒绝，这里兜底字面构造 UConnState 的绕过路径：
+    // - publicKey 非 32B：Go `ecdh.X25519().NewPublicKey` err → "REALITY:
+    //   publicKey == nil" 硬错（Rust 现状 copy_from_slice 会 panic）；
+    // - 配了 mldsa65Verify：watfaq-rustls 无 mldsa65 证书扩展验签钩子，
+    //   静默跳过 = fail-open（Go 全指纹走 utls 均验签），直接拒绝。
+    if config.public_key.len() != crate::config::X25519_KEY_LEN {
+        return Err(RealityError::InvalidPublicKeyLen {
+            actual: config.public_key.len(),
+        });
+    }
+    if !config.mldsa65_verify.is_empty() {
+        return Err(RealityError::Mldsa65VerifyNeedsBtlsFingerprint);
+    }
     let mut pk = [0u8; 32];
     pk.copy_from_slice(&config.public_key);
     let reality = WatfaqRealityConfig::new(pk, config.short_id.clone())
@@ -672,5 +688,46 @@ mod tests {
         let err = verify_reality_cert_full(&std_cert, &auth_key, &pubkey_1952, None, None)
             .unwrap_err();
         assert!(matches!(err, RealityError::TlsHandshake(_)));
+    }
+
+    /// 49i9：UConnState 字面构造绕过 `validate_client` 时，fallback 分支兜底
+    /// 硬错——非 32B publicKey 不再 panic（原 `copy_from_slice`），配
+    /// `mldsa65Verify` 不再静默 fail-open（watfaq-rustls 无 mldsa65 验签钩子）。
+    #[tokio::test]
+    async fn u_client_fallback_hard_errors_on_bypassed_state() {
+        use tokio::io::duplex;
+
+        let mk_state = |public_key: Vec<u8>, mldsa65_verify: Vec<u8>| {
+            let mut cfg = make_valid_config();
+            // `unsafe` 是唯一 get_fingerprint 认识但 btls 清单外的预设
+            // （connector_for_fingerprint → Some(Err)）→ u_client 走 fallback 分支
+            cfg.fingerprint = "unsafe".into();
+            cfg.public_key = public_key;
+            cfg.mldsa65_verify = mldsa65_verify;
+            UConnState {
+                config: cfg,
+                server_name: "example.com".into(),
+                auth_key: Vec::new(),
+                verified: false,
+            }
+        };
+
+        // 非 32B publicKey → InvalidPublicKeyLen（原 panic 面，Go 同点硬错）
+        let (a, _b) = duplex(1);
+        let conn = xray_transport::connection::DuplexConnection::new(a);
+        let err = match u_client(conn, mk_state(vec![1u8; 31], Vec::new())).await {
+            Err(e) => e,
+            Ok(_) => panic!("expected InvalidPublicKeyLen"),
+        };
+        assert!(matches!(err, RealityError::InvalidPublicKeyLen { actual: 31 }));
+
+        // mldsa65Verify + fallback 指纹 → Mldsa65VerifyNeedsBtlsFingerprint（原 fail-open）
+        let (a, _b) = duplex(1);
+        let conn = xray_transport::connection::DuplexConnection::new(a);
+        let err = match u_client(conn, mk_state(vec![1u8; 32], vec![0x5Au8; 1952])).await {
+            Err(e) => e,
+            Ok(_) => panic!("expected Mldsa65VerifyNeedsBtlsFingerprint"),
+        };
+        assert!(matches!(err, RealityError::Mldsa65VerifyNeedsBtlsFingerprint));
     }
 }

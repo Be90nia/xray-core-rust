@@ -21,9 +21,10 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 use crate::error::{Result, TuicError};
@@ -68,28 +69,21 @@ pub struct PooledConnection {
     /// 创建时间（用于老化判断）。
     pub created_at: Instant,
     /// 连接是否已关闭（外部标记，不依赖 quinn 内部状态）。
-    pub is_closed: Arc<RwLock<bool>>,
+    ///
+    /// AtomicBool（wfx8-2）：is_alive/mark_closed 同步化，消除 tokio 异步
+    /// 锁面——4zjf 类「alive 检查持锁跨 await」的结构性宿主随之消失。
+    pub is_closed: Arc<AtomicBool>,
 }
-
-
-
-
-
-
-
-
-
 
 impl PooledConnection {
     /// 检查连接是否仍活跃。
-    pub async fn is_alive(&self) -> bool {
-        !*self.is_closed.read().await && self.conn.close_reason().is_none()
+    pub fn is_alive(&self) -> bool {
+        !self.is_closed.load(Ordering::Acquire) && self.conn.close_reason().is_none()
     }
 
     /// 标记连接已关闭。
-    pub async fn mark_closed(&self) {
-        let mut closed = self.is_closed.write().await;
-        *closed = true;
+    pub fn mark_closed(&self) {
+        self.is_closed.store(true, Ordering::Release);
     }
 }
 
@@ -157,14 +151,14 @@ impl QuinnConnectionPool {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<quinn::Connection>>,
     {
-        // 快速路径：池中已有活跃连接。读锁内只 clone，is_alive 的 await 在
-        // 锁外——bd 4zjf：alive 检查不得持池锁跨 await（pool-wide stall）。
+        // 快速路径：池中已有活跃连接。读锁内只 clone，alive 检查在锁外——
+        // bd 4zjf：池锁临界区零 await（is_closed 已是 AtomicBool，检查无 await）。
         let cached = {
             let pool = self.inner.read();
             pool.get(&key).cloned()
         };
         if let Some(entry) = cached {
-            if entry.is_alive().await {
+            if entry.is_alive() {
                 return Ok(entry);
             }
         }
@@ -176,13 +170,13 @@ impl QuinnConnectionPool {
         };
         let _guard = key_lock.lock().await;
 
-        // double-check：leader 拨号期间同 key 连接可能已入池（锁外 await，同上）
+        // double-check：leader 拨号期间同 key 连接可能已入池（锁外，同上）
         let cached = {
             let pool = self.inner.read();
             pool.get(&key).cloned()
         };
         if let Some(entry) = cached {
-            if entry.is_alive().await {
+            if entry.is_alive() {
                 return Ok(entry);
             }
         }
@@ -199,7 +193,7 @@ impl QuinnConnectionPool {
         let pooled = PooledConnection {
             conn,
             created_at: Instant::now(),
-            is_closed: Arc::new(RwLock::new(false)),
+            is_closed: Arc::new(AtomicBool::new(false)),
         };
 
         self.inner.write().insert(key, pooled.clone());
@@ -278,7 +272,7 @@ impl ReconnectingConnection {
                 .await
             {
                 Ok(pooled) => {
-                    if pooled.is_alive().await {
+                    if pooled.is_alive() {
                         return Ok(pooled);
                     }
                     // 池中连接已死，移除后重试
@@ -383,8 +377,8 @@ impl MultiplexedConnection {
     }
 
     /// 检查连接是否活跃。
-    pub async fn is_alive(&self) -> bool {
-        self.pooled.is_alive().await
+    pub fn is_alive(&self) -> bool {
+        self.pooled.is_alive()
     }
 }
 
@@ -435,100 +429,9 @@ mod tests {
         assert!(pool.is_empty());
         assert_eq!(pool.len(), 0);
     }
-    /// bd 4zjf：快速路径 is_alive().await 阻塞期间，池内元操作不得被
-    /// inner 锁饿死（lock-across-await → pool-wide stall）。
-    #[tokio::test]
-    async fn concurrent_get_or_connect_does_not_stall_on_alive_check() {
-        use crate::client::TuicClient;
-        use crate::server::TuicMockServer;
 
-        fn make_pool_client_config(cert_der: &[u8]) -> std::sync::Arc<rustls::ClientConfig> {
-            let mut roots = rustls::RootCertStore::empty();
-            roots.add(cert_der.to_vec().into()).expect("add cert");
-            Arc::new(
-                rustls::ClientConfig::builder()
-                    .with_root_certificates(roots)
-                    .with_no_client_auth(),
-            )
-        }
-
-        let uuid = uuid::Uuid::new_v4();
-        let (server, cert_der) = TuicMockServer::bind(
-            "127.0.0.1:0".parse().expect("parse addr"),
-            "localhost",
-            uuid,
-            "pw".to_string(),
-        )
-        .await
-        .expect("mock server bind");
-        let server_addr = server.local_addr();
-        let _server_task = tokio::spawn(async move {
-            let _ = server.run().await;
-        });
-
-        // 入池：key 与 TuicClient::connect_with 一致（测试 config 无 ALPN → tag 空）
-        let pool = QuinnConnectionPool::new();
-        let _client = TuicClient::connect(
-            server_addr,
-            "localhost",
-            uuid,
-            "pw",
-            make_pool_client_config(&cert_der),
-            pool.clone(),
-        )
-        .await
-        .expect("connect");
-        let key = PoolKey::new(server_addr, "localhost", &[]);
-
-        // 取池内连接的 is_closed 锁句柄（Arc 同源）。
-        let pooled = pool
-            .get_or_connect(key.clone(), || async {
-                Err(TuicError::Io(std::io::Error::other(
-                    "fast path expected: connector must not run",
-                )))
-            })
-            .await
-            .expect("fast path hit");
-
-        // W：持写锁冻结 is_alive() 的读获取。
-        let w_lock = pooled.is_closed.clone();
-        let (frozen_tx, frozen_rx) = tokio::sync::oneshot::channel::<()>();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-        tokio::spawn(async move {
-            let _w = w_lock.write().await;
-            let _ = frozen_tx.send(());
-            let _ = release_rx.await;
-        });
-        frozen_rx.await.expect("W froze is_closed");
-
-        // A：快速路径 is_alive().await 阻塞在 is_closed 读锁上。
-        let pool_a = pool.clone();
-        let key_a = key.clone();
-        let task_a = tokio::spawn(async move {
-            pool_a
-                .get_or_connect(key_a, || async {
-                    Err(TuicError::Io(std::io::Error::other(
-                        "fast path expected: connector must not run",
-                    )))
-                })
-                .await
-        });
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // B：池元操作（len）在 A 的 alive 检查阻塞期间必须可用——修复后
-        // len 同步且池锁临界区零 await，in-flight await 不可能再卡住它。
-        assert_eq!(
-            pool.len(),
-            1,
-            "pool metadata must stay available while an alive-check is in flight (bd 4zjf)"
-        );
-
-        release_tx.send(()).expect("release W");
-        let r = tokio::time::timeout(Duration::from_secs(5), task_a)
-            .await
-            .expect("A must finish after release")
-            .expect("join A")
-            .expect("fast path returns alive entry");
-        assert_eq!(pool.len(), 1);
-    }
+    // bd 4zjf 回归测试 concurrent_get_or_connect_does_not_stall_on_alive_check
+    // 已随 wfx8-2 删除：其前提是 is_closed 为 tokio RwLock（冻结写锁即可卡死
+    // alive 检查）。is_closed 改 AtomicBool 后 alive 检查无锁无 await，该
+    // stall 场景结构性不存在，测试不再守卫任何可失败路径。
 }

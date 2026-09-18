@@ -82,6 +82,9 @@ impl UdpDispatchSession {
     /// 首帧 XUDP `New`（含随机 GlobalID），后续 `Keep`（帧头带各自真实目标，
     /// 由 outbound per-packet 路由）。
     pub async fn send_packet(&mut self, dest: &Destination, payload: &[u8]) -> io::Result<()> {
+        // 零长/超长静默跳过 = Go xudp PacketWriter 同款（xudp.go:100
+        // `length == 0 || length+666 > buf.Size → continue`，iq1o 核对）。
+        // 空 datagram 不进 dispatch link，响应侧照发语义不受影响。
         if payload.is_empty() || payload.len() > MAX_DATAGRAM {
             return Ok(());
         }

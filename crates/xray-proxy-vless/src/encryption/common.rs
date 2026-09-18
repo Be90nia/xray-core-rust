@@ -142,6 +142,45 @@ pub fn parse_padding(padding: &str) -> Result<(Vec<PaddingTriple>, Vec<PaddingTr
     Ok((lens, gaps))
 }
 
+/// Go `CreatPadding` 默认 length 配置（common.go:261-262）：空配置兜底。
+const DEFAULT_PADDING_LENS: [PaddingTriple; 2] = [[100, 111, 1111], [50, 0, 3333]];
+
+/// Go `crypto.RandBetween` 语义（crypto.go:13-19）：均匀 `[from, to)`；
+/// `to-from ≤ 1` 恒返回 from（Go `rand.Int(to-from)` 上界开区间）。
+fn rand_between<R: rand::Rng>(rng: &mut R, from: u32, to: u32) -> u32 {
+    if to <= from + 1 {
+        from
+    } else {
+        rng.random_range(from..to)
+    }
+}
+
+/// 随机 padding 总长生成（对应 Go `CreatPadding`，common.go:259-280）。
+///
+/// 每个三元组 `[base, min, max]`：以 `base >= RandBetween(0,100)`（即 base%）
+/// 概率命中取 `RandBetween(min, max)`，否则 0；总长为各段之和。空配置用 Go
+/// 默认 `{100,111,1111},{50,0,3333}`（总长 111..4444）。
+///
+/// Go 同时生成的分段 lens 与 gaps（间歇写流量整形）此处未消费——分段间歇
+/// 写登记为 iq1o 后续项；本函数只产出总长。
+#[must_use]
+pub fn creat_padding<R: rand::Rng>(padding_lens: &[PaddingTriple], rng: &mut R) -> usize {
+    let lens: &[PaddingTriple] = if padding_lens.is_empty() {
+        &DEFAULT_PADDING_LENS
+    } else {
+        padding_lens
+    };
+    lens.iter()
+        .map(|y| {
+            if y[0] >= rand_between(rng, 0, 100) {
+                rand_between(rng, y[1], y[2]) as usize
+            } else {
+                0
+            }
+        })
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

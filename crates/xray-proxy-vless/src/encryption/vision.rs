@@ -29,8 +29,8 @@ pub const COMMAND_PADDING_CONTINUE: u8 = 0x00;
 pub const COMMAND_PADDING_END: u8 = 0x01;
 pub const COMMAND_PADDING_DIRECT: u8 = 0x02;
 
-/// Go `buf.Size` 上限（padding 长度封顶用）。
-const BUF_SIZE: i32 = 8192;
+/// Go `buf.Size` 上限（padding 长度封顶用；对齐 Go common/buf buf.go 2048）。
+const BUF_SIZE: i32 = 2048;
 
 /// Vision 默认 padding seed（对齐 Go `NewVisionWriter` testseed 默认值）。
 pub const DEFAULT_PADDING_SEED: [u32; 4] = [900, 500, 900, 256];

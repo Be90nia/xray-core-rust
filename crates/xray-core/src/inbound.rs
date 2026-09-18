@@ -1019,7 +1019,10 @@ async fn dokodemo_peer_relay(
                     Some((dest, payload)) => {
                         let d = dest.as_ref().unwrap_or(&default_dest);
                         if session.send_packet(d, &payload).await.is_err() {
-                            tracing::debug!("dokodemo udp dispatch send failed");
+                            tracing::info!(
+                                dest = %d, len = payload.len(),
+                                "dokodemo udp dispatch send failed"
+                            );
                         }
                     }
                     None => return, // idle 清扫丢表项（tx 关闭）
@@ -1042,12 +1045,18 @@ async fn dokodemo_peer_relay(
                         match fake {
                             Some(s) => {
                                 if s.send_to(&payload, peer).await.is_err() {
-                                    tracing::debug!("dokodemo udp fakeudp send_to client failed");
+                                    tracing::info!(
+                                        peer = %peer, len = payload.len(),
+                                        "dokodemo udp fakeudp send_to client failed"
+                                    );
                                 }
                             }
                             None => {
                                 if hub.send_to(&payload, peer).await.is_err() {
-                                    tracing::debug!("dokodemo udp send_to client failed");
+                                    tracing::info!(
+                                        peer = %peer, len = payload.len(),
+                                        "dokodemo udp send_to client failed"
+                                    );
                                 }
                             }
                         }
@@ -2165,7 +2174,12 @@ fn parse_reality_config(
         .get("maxTimeDiff")
         .and_then(|x| x.as_u64())
         .unwrap_or(0);
-    let max_diff = (max_diff_ms / 1000) as u32;
+    // 秒级 floor 除法逐字复现 Go 语义（reality tls.go:259
+    // `time.Since(ClientTime).Abs() <= MaxTimeDiff`，ClientTime 为 Unix 秒）：
+    // |Δt_秒 + 小数部分| ≤ N 毫秒 ⟺ 允许的整秒差恰为 {0..N/1000}（floor），
+    // 进位（ceil）会放行 Go 拒绝的 N+1 秒差（wfx8-7 核对结论：floor 正确）。
+    // try_from 防 u64→u32 静默回绕（异常巨值按"放行全部整秒差"的上界钳制）。
+    let max_diff = u32::try_from(max_diff_ms / 1000).unwrap_or(u32::MAX);
     let parse_ver = |s: &str| -> Vec<u8> {
         s.split('.')
             .filter_map(|p| p.trim().parse::<u8>().ok())

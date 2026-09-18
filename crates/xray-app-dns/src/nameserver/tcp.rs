@@ -199,7 +199,9 @@ impl TcpNameServer {
 
         match self.try_query(conn_guard.as_mut().unwrap(), &len_be, &payload, req_id, record_type).await {
             Ok(result) => Ok(result),
-            Err(_) => {
+            Err(e) => {
+                // 首查失败静默重连不可观测（iq1o）：记录首查错误再重试。
+                tracing::debug!(error = %e, "DNS-over-TCP query on pooled connection failed, reconnecting");
                 *conn_guard = None;
                 *conn_guard = Some(self.connect().await?);
                 self.try_query(conn_guard.as_mut().unwrap(), &len_be, &payload, req_id, record_type).await

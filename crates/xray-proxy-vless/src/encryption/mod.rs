@@ -459,7 +459,12 @@ impl ClientInstance {
         {
             let mut rng = rand::rng();
             let iv_and_relays_len = 16 + self.relays_length;
-            let client_hello_len = iv_and_relays_len + PFS_LEN + PADDING_LEN;
+            // 随机 padding 总长（对齐 Go client.go:73 CreatPadding，默认 111..4444）。
+            // Go 自定义配置可为 0 → `padding[18:paddingLength-16]` 直接 panic；
+            // Rust 钳到最小 34B（sealed EncodeLength + 空 body）保持可解析。
+            let padding_length =
+                common::creat_padding(&self.padding_lens, &mut rng).max(PADDING_LEN);
+            let client_hello_len = iv_and_relays_len + PFS_LEN + padding_length;
             client_hello = vec![0u8; client_hello_len];
             // iv 随机：fill_bytes 必须先于 iv 赋值
             rng.fill_bytes(&mut client_hello[..16]);
@@ -477,17 +482,19 @@ impl ClientInstance {
                 &mut nfs_aead,
                 &mut rng,
             )?;
-            // 5. padding
+            // 5. padding（对齐 Go client.go:152-155）：首 18B = Seal(EncodeLength(
+            //    paddingLength-18))，其余 = Seal(零填充 body[paddingLength-34])。
             let pad_offset = iv_and_relays_len + PFS_LEN;
-            let pad_len_bytes = ((PADDING_LEN - 18) as u16).to_be_bytes();
+            let pad_len_bytes = ((padding_length - 18) as u16).to_be_bytes();
             let mut pad_tmp = Vec::with_capacity(18);
             nfs_aead.seal(&mut pad_tmp, None, &pad_len_bytes, &[])?;
-            client_hello[pad_offset..pad_offset + 18].copy_from_slice(&pad_tmp);
             let mut pad_tmp2 = Vec::with_capacity(16);
-            nfs_aead.seal(&mut pad_tmp2, None, &[], &[])?;
+            nfs_aead.seal(&mut pad_tmp2, None, &vec![0u8; padding_length - 34], &[])?;
             // Go client.go:140 Seal(padding[:18], nil, padding[18:paddingLength-16]) —
             // 密文必须写入 client_hello，否则发出全零字节（服务端 AEAD open 必败）。
-            client_hello[pad_offset + 18..pad_offset + PADDING_LEN].copy_from_slice(&pad_tmp2);
+            client_hello[pad_offset..pad_offset + 18].copy_from_slice(&pad_tmp);
+            client_hello[pad_offset + 18..pad_offset + padding_length]
+                .copy_from_slice(&pad_tmp2);
         }
         conn.write_all(&client_hello).await?;
         let mut encrypted_pfs = vec![0u8; 1088 + 32 + 16];
@@ -1054,7 +1061,11 @@ impl ServerInstance {
                 );
                 tracing::info!(sessions = store.sessions.len(), seconds, "vless enc: 1-RTT done, session stored (ticket issued)");
             }
-            let mut server_hello = Vec::with_capacity(1136 + 32 + 34);
+            // 随机 padding 总长（对齐 Go server.go:288 CreatPadding），钳最小
+            // 34B 防 0 长度自定义配置下溢（Go 同配置直接 panic）。
+            let padding_length =
+                common::creat_padding(&self.padding_lens, &mut rng).max(PADDING_LEN);
+            let mut server_hello = Vec::with_capacity(1136 + 32 + padding_length);
             nfs_aead.seal(
                 &mut server_hello,
                 Some(&crate::encryption::aead::MAX_NONCE),
@@ -1062,9 +1073,11 @@ impl ServerInstance {
                 &[],
             )?;
             aead.seal(&mut server_hello, None, &ticket, &[])?;
-            let pad_len_bytes = 16u16.to_be_bytes();
+            // padding：Seal(EncodeLength(paddingLength-18)) + Seal(零填充 body)
+            // （对齐 Go server.go:293-295）。
+            let pad_len_bytes = ((padding_length - 18) as u16).to_be_bytes();
             aead.seal(&mut server_hello, None, &pad_len_bytes, &[])?;
-            aead.seal(&mut server_hello, None, &[], &[])?;
+            aead.seal(&mut server_hello, None, &vec![0u8; padding_length - 34], &[])?;
             (server_hello, aead, peer_aead, ticket, united_key)
         };
         // 13. 发送 serverHello

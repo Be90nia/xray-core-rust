@@ -130,6 +130,11 @@ impl TunDevice {
     /// 非阻塞读 IP 包。空队列时返回 `Err(WouldBlock)`。
     ///
     /// 对应 Go `tun_windows.go::ReadPacket`（249-270，`ERROR_NO_MORE_ITEMS → ErrQueueEmpty`）。
+    ///
+    /// # 平台语义（iq1o⑧ 标注）
+    /// Linux（vnet_hdr 已协商）单包读返回**带 12 字节 virtio 头前缀**的原始
+    /// 数据（其余平台为纯 IP 包）——生产收包路径走 `recv_batch`（内部按段
+    /// 拆包），不应依赖本 API 的 Linux 返回布局。
     pub fn try_recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.dev.try_recv(buf)
     }
@@ -162,6 +167,10 @@ impl TunDevice {
     /// 非阻塞发送 IP 包。ring buffer 满时返回 `Err(WouldBlock)`。
     ///
     /// 对应 Go `tun_windows.go::WritePacket`（223-247，`AllocateSendPacket → SendPacket`）。
+    ///
+    /// # 平台语义（iq1o⑧ 标注）
+    /// Linux（vnet_hdr 已协商）下本 API **不自动垫 virtio 头**——裸写会被内核
+    /// 把前 12 字节当 vnet 头吞掉；生产发包路径走 `send`/`send_batch`（自动垫头）。
     pub fn try_send(&self, buf: &[u8]) -> std::io::Result<usize> {
         self.dev.try_send(buf)
     }

@@ -23,8 +23,11 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use xray_transport::connection::Connection;
 
-/// padding 块 content 上限（BUF_SIZE - header(5) - uuid(16) = 8171）。
-const MAX_PADDING_CONTENT: usize = 8171;
+/// padding 块 content 上限（对齐 Go ReshapeMultiBuffer 的 `Size-21` 拆分上限：
+/// BUF_SIZE(2048) - header(5) - uuid(16) = 2027）。必须与 vision::BUF_SIZE
+/// 同步：xtls_padding 的 cap = BUF_SIZE-21-content_len，content 超过该值会
+/// 使 cap 变负。
+const MAX_PADDING_CONTENT: usize = 2027;
 /// 内层裸 TCP 克隆入口（vision splice 用）。
 ///
 /// 生产链内层是 `Box<dyn Connection>`（实现 [`Connection`]，穿透到最底层
@@ -240,10 +243,12 @@ where
             // 3. padding 模式 → CommonConn read + unpadding。临时缓冲提升为
             //    struct 字段（read_tmp）避免每 poll_read 16KB 栈帧；栈帧不被
             //    编译器复用 → 握手/首请求期高频 poll_read 时栈占膨胀。
-            let read_tmp_len = this.read_tmp.len();
-            // 保留 read_tmp 容量（Vec::clear 不缩容），若历史残留更长则按需截断。
-            this.read_tmp.clear();
-            this.read_tmp.resize(16 * 1024, 0);
+            //    容量稳态复用：len 不足才补零扩容（仅首次），此前
+            //    clear+resize(16K,0) 每 poll 16KB memset 已免（wfx8-1）。
+            //    有效字节以 rb.filled().len() 为界，旧数据不会被读出。
+            if this.read_tmp.len() < 16 * 1024 {
+                this.read_tmp.resize(16 * 1024, 0);
+            }
             // ReadBuf::new 接收可变借用，poll_read 期间独占 read_tmp 切片。
             // borrow 结束后 n = rb.filled().len() 可读回已填充字节。
             let mut rb = ReadBuf::new(&mut this.read_tmp[..]);
@@ -251,8 +256,6 @@ where
                 Poll::Ready(Ok(())) => {
                     let n = rb.filled().len();
                     if n == 0 {
-                        // EOF：恢复 read_tmp 长度，避免持续 alloc（清空）。
-                        this.read_tmp.truncate(read_tmp_len);
                         return Poll::Ready(Ok(()));
                     }
                     let mut content =
@@ -430,11 +433,19 @@ where
             } else {
                 COMMAND_PADDING_CONTINUE
             };
+            // 对齐 Go proxy.go:359/363/391：longPadding := trafficState.IsTLS
+            // （Go 单一共享状态，Rust 双实例取并集）；TLS app-data 帧
+            // （DIRECT 分支）Go 恒传 true。
+            let long_padding = if command == COMMAND_PADDING_DIRECT {
+                true
+            } else {
+                this.uplink_traffic.is_tls || this.downlink_traffic.is_tls
+            };
             let padded = xtls_padding(
                 Some(&buf[..n]),
                 command,
                 &mut this.uplink_uuid_pending,
-                false,
+                long_padding,
                 &this.padding_seed,
                 &mut this.rng,
             );
