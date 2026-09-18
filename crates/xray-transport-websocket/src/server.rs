@@ -511,8 +511,12 @@ mod tests {
         use tokio_tungstenite::{client_async, tungstenite::client::IntoClientRequest};
 
         let cfg = Arc::new(Config::default());
-        let listener =
-            Arc::new(WsListener::bind("127.0.0.1:0".parse().unwrap(), cfg).await.unwrap());
+        let mut listener =
+            WsListener::bind("127.0.0.1:0".parse().unwrap(), cfg).await.unwrap();
+        // H1 语义：仅 sockopt.trustedXForwardedFor 名单命中才采纳 XFF——
+        // 测试须配置名单，否则空名单=永不采纳（防伪造）。
+        listener.trusted_x_forwarded_for = vec!["X-Real-IP".to_string()];
+        let listener = Arc::new(listener);
         let addr = listener.local_addr().unwrap();
 
         let l = Arc::clone(&listener);
@@ -521,6 +525,7 @@ mod tests {
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut req = format!("ws://127.0.0.1:{}/", addr.port()).into_client_request().unwrap();
         req.headers_mut().insert("X-Forwarded-For", "203.0.113.5".parse().unwrap());
+        req.headers_mut().insert("X-Real-IP", "1.1.1.1".parse().unwrap());
         let (_ws, _resp) = client_async(req, tcp).await.unwrap();
 
         let accepted = server.await.unwrap().unwrap();
