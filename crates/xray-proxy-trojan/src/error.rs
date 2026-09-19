@@ -56,6 +56,9 @@ pub enum TrojanError {
     #[error("handshake timeout")]
     HandshakeTimeout,
 
+    #[error("invalid protocol version prefix: {0:#04x}")]
+    InvalidVersionPrefix(u8),
+
     #[error("io: {0}")]
     Io(String),
 }
