@@ -6514,8 +6514,13 @@ dependencies = [
  "base64",
  "btls",
  "btls-sys",
+ "bytes",
  "foreign-types",
+ "futures-util",
+ "h2",
  "hex",
+ "hickory-proto",
+ "http",
  "ocsp-stapler",
  "parking_lot",
  "rand 0.9.4",
@@ -6739,6 +6744,7 @@ dependencies = [
  "xray-reality",
  "xray-tls",
  "xray-transport",
+ "xray-transport-quic",
 ]
 
 [[package]]
