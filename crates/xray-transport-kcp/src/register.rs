@@ -332,7 +332,7 @@ fn parse_kcp_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
             "Mtu must be at least 21",
         ));
     }
-    if config.tti < 10 || config.tti > 1000 {
+    if config.tti < 10 || config.tti > 5000 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("invalid mKCP TTI: {}", config.tti),
@@ -591,9 +591,25 @@ mod tests {
 
     #[test]
     fn tslk_rejects_tti_too_large() {
-        // Go :565 — tti > 1000
-        let msg = err_msg(r#"{"tti":1001}"#);
+        // Go `transport_internet.go:75` PR #5755 — tti > 5000
+        let msg = err_msg(r#"{"tti":5001}"#);
         assert!(msg.contains("invalid mKCP TTI"), "got: {msg}");
+    }
+
+    #[test]
+    fn tslk_accepts_tti_at_upper_bound() {
+        // Go PR #5755 — tti == 5000 是合法边界值。
+        let v: serde_json::Value = serde_json::from_str(r#"{"tti":5000}"#).unwrap();
+        let cfg = parse_kcp_config(Some(&v)).expect("tti=5000 should be accepted");
+        assert_eq!(cfg.tti, 5000);
+    }
+
+    #[test]
+    fn tslk_accepts_tti_at_lower_bound() {
+        // Go PR #5755 — tti == 10 是合法边界值。
+        let v: serde_json::Value = serde_json::from_str(r#"{"tti":10}"#).unwrap();
+        let cfg = parse_kcp_config(Some(&v)).expect("tti=10 should be accepted");
+        assert_eq!(cfg.tti, 10);
     }
 
     #[test]
