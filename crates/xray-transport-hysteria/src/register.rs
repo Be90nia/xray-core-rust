@@ -35,10 +35,11 @@ use crate::{
 ///
 /// 幂等：重复注册的 `AlreadyExists` 被忽略。
 pub fn register_dialer() -> io::Result<()> {
-    let dialer: TransportDialFn = Arc::new(move |dest, _sockopt, settings| {
+    let dialer: TransportDialFn = Arc::new(move |dest, sockopt, settings| {
         let dest = dest.clone();
+        let sockopt = sockopt.clone();
         let settings = settings.clone();
-        Box::pin(async move { dial_hysteria(&dest, &settings).await })
+        Box::pin(async move { dial_hysteria(&dest, &settings, &sockopt).await })
     });
     let _ = register_transport_dialer(PROTOCOL_NAME, dialer);
     Ok(())
@@ -54,8 +55,9 @@ pub fn register_dialer() -> io::Result<()> {
 ///
 /// 幂等：重复注册的 `AlreadyExists` 被忽略。
 pub fn register_listener() -> io::Result<()> {
-    let listen_fn: TransportListenFn = Arc::new(move |addr, settings, _sockopt, handler| {
-        Box::pin(async move { listen_hysteria(addr, settings, handler).await })
+    let listen_fn: TransportListenFn = Arc::new(move |addr, settings, sockopt, handler| {
+        let sockopt = sockopt.clone();
+        Box::pin(async move { listen_hysteria(addr, settings, sockopt, handler).await })
     });
     let _ = register_transport_listener(PROTOCOL_NAME, listen_fn);
     Ok(())
@@ -69,6 +71,7 @@ pub fn register_listener() -> io::Result<()> {
 async fn listen_hysteria(
     addr: SocketAddr,
     settings: StreamSettings,
+    sockopt: xray_transport::sockopt::SocketOptions,
     handler: ConnHandler,
 ) -> io::Result<Box<dyn TransportListener>> {
     // 1. TLS server config（hysteria 强制 TLS）
@@ -87,9 +90,9 @@ async fn listen_hysteria(
     // WrapPacketConnServer` 包装 pktConn 后再交给 quic.Transport.Listen；
     // Rust 经 quinn AsyncUdpSocket 注入，finalmask_json.udp[].salamander 配置，
     // settings.packetSize 切 Gecko 分片模式）。
-    let factory = QuinnListenerFactory::new(tls_cfg).with_obfs(
-        crate::salamander_socket::parse_udp_obfs(settings.finalmask_json.as_ref())?,
-    );
+    let factory = QuinnListenerFactory::new(tls_cfg)
+        .with_sockopt(sockopt)
+        .with_obfs(crate::salamander_socket::parse_udp_obfs(settings.finalmask_json.as_ref())?);
     let config = Arc::new(parse_hysteria_config(settings.transport_json.as_ref())?);
     let quic_params = Arc::new(
         crate::quic_params::parse_quic_params(settings.finalmask_json.as_ref())?
@@ -201,6 +204,7 @@ impl TransportListener for HysteriaTransportListener {
 async fn dial_hysteria(
     dest: &xray_common::net::destination::Destination,
     settings: &StreamSettings,
+    sockopt: &xray_transport::sockopt::SocketOptions,
 ) -> io::Result<Box<dyn Connection>> {
     // 1. 解析 hysteriaSettings JSON
     let config = parse_hysteria_config(settings.transport_json.as_ref())?;
@@ -232,9 +236,9 @@ async fn dial_hysteria(
     })?;
     // UDP 混淆 salamander/gecko（Go hysteria/dialer.go:170-175：`UdpmaskManager.
     // WrapPacketConnClient` 包装 pktConn 后再交给 quic.Transport.DialEarly）。
-    let transport = QuinnHysteriaTransport::new(tls_client_config, bind_addr)?.with_obfs(
-        crate::salamander_socket::parse_udp_obfs(settings.finalmask_json.as_ref())?,
-    );
+    let transport = QuinnHysteriaTransport::new(tls_client_config, bind_addr)?
+        .with_sockopt(sockopt.clone())
+        .with_obfs(crate::salamander_socket::parse_udp_obfs(settings.finalmask_json.as_ref())?);
     let quic_params = Arc::new(
         crate::quic_params::parse_quic_params(settings.finalmask_json.as_ref())?
             .unwrap_or_else(crate::quic_params::default_hysteria_quic_params),
@@ -410,9 +414,14 @@ mod tests {
             ..Default::default()
         };
         let handler: ConnHandler = Arc::new(|_| {});
-        let listener = listen_hysteria("127.0.0.1:0".parse().unwrap(), settings, handler)
-            .await
-            .expect("listen_hysteria");
+        let listener = listen_hysteria(
+            "127.0.0.1:0".parse().unwrap(),
+            settings,
+            xray_transport::sockopt::SocketOptions::default(),
+            handler,
+        )
+        .await
+        .expect("listen_hysteria");
         let addr = listener.local_addr().unwrap();
 
         listener.close().unwrap();

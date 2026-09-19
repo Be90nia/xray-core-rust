@@ -67,13 +67,19 @@ impl UdpObfs {
     ///
     /// # Errors
     /// socket bind 失败 / 混淆参数非法（Gecko 的 PSK 与分片参数在 bind 时校验）。
-    pub async fn client_endpoint(&self, bind_addr: SocketAddr) -> io::Result<quinn::Endpoint> {
+    pub async fn client_endpoint(
+        &self,
+        bind_addr: SocketAddr,
+        sockopt: &xray_transport::sockopt::SocketOptions,
+    ) -> io::Result<quinn::Endpoint> {
         match self {
             UdpObfs::Salamander(obfs) => {
-                SalamanderSocket::bind(obfs.clone(), bind_addr).await?.client_endpoint()
+                SalamanderSocket::bind(obfs.clone(), bind_addr, sockopt).await?.client_endpoint()
             },
             UdpObfs::Gecko(cfg) => {
-                crate::gecko_socket::GeckoSocket::bind(cfg, bind_addr).await?.client_endpoint()
+                crate::gecko_socket::GeckoSocket::bind(cfg, bind_addr, sockopt)
+                    .await?
+                    .client_endpoint()
             },
         }
     }
@@ -86,15 +92,16 @@ impl UdpObfs {
         &self,
         server_config: quinn::ServerConfig,
         bind_addr: SocketAddr,
+        sockopt: &xray_transport::sockopt::SocketOptions,
     ) -> io::Result<quinn::Endpoint> {
         match self {
             UdpObfs::Salamander(obfs) => {
-                SalamanderSocket::bind(obfs.clone(), bind_addr)
+                SalamanderSocket::bind(obfs.clone(), bind_addr, sockopt)
                     .await?
                     .server_endpoint(server_config)
             },
             UdpObfs::Gecko(cfg) => {
-                crate::gecko_socket::GeckoSocket::bind(cfg, bind_addr)
+                crate::gecko_socket::GeckoSocket::bind(cfg, bind_addr, sockopt)
                     .await?
                     .server_endpoint(server_config)
             },
@@ -125,13 +132,16 @@ impl std::fmt::Debug for SalamanderSocket {
 impl SalamanderSocket {
     /// bind UDP socket 并包装 salamander 混淆器。
     ///
-    /// 必须在 tokio runtime 上下文内调用（`UdpSocket::bind` 注册 reactor）。
+    /// 必须在 tokio runtime 上下文内调用（socket 经
+    /// [`xray_transport::sockopt::bind_udp_endpoint`] 创建后转 tokio）。
     pub async fn bind(
         obfs: Arc<SalamanderObfuscator>,
         bind_addr: SocketAddr,
+        sockopt: &xray_transport::sockopt::SocketOptions,
     ) -> io::Result<Arc<Self>> {
+        let std_sock = xray_transport::sockopt::bind_udp_endpoint(bind_addr, sockopt)?;
         Ok(Arc::new(Self {
-            io: Arc::new(UdpSocket::bind(bind_addr).await?),
+            io: Arc::new(UdpSocket::from_std(std_sock)?),
             obfs,
             send_scratch: Mutex::new(vec![0u8; MAX_WIRE_DATAGRAM]),
             recv_scratch: Mutex::new(vec![0u8; MAX_WIRE_DATAGRAM]),
@@ -402,7 +412,7 @@ mod tests {
     #[tokio::test]
     async fn try_send_wraps_salt_and_xor() {
         let sock =
-            SalamanderSocket::bind(test_obfs(), "127.0.0.1:0".parse().unwrap()).await.unwrap();
+            SalamanderSocket::bind(test_obfs(), "127.0.0.1:0".parse().unwrap(), &Default::default()).await.unwrap();
         let peer = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).await.unwrap();
         let plain = b"plaintext quic packet";
 
@@ -443,7 +453,7 @@ mod tests {
     #[tokio::test]
     async fn poll_recv_unwraps_inbound() {
         let sock =
-            SalamanderSocket::bind(test_obfs(), "127.0.0.1:0".parse().unwrap()).await.unwrap();
+            SalamanderSocket::bind(test_obfs(), "127.0.0.1:0".parse().unwrap(), &Default::default()).await.unwrap();
         let peer = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).await.unwrap();
 
         // 对端用 salamander 加密后发来
@@ -474,7 +484,7 @@ mod tests {
     #[tokio::test]
     async fn poll_recv_drops_short_packet_then_recovers() {
         let sock =
-            SalamanderSocket::bind(test_obfs(), "127.0.0.1:0".parse().unwrap()).await.unwrap();
+            SalamanderSocket::bind(test_obfs(), "127.0.0.1:0".parse().unwrap(), &Default::default()).await.unwrap();
         let peer = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).await.unwrap();
         let dst = sock.local_addr().unwrap();
 
