@@ -21,6 +21,24 @@
 //! 提供**字节切片版**的帧编解码（独立可测试，对应 Go `protocol_test.go` 的 roundtrip）。
 //! 切片2 待办：包装成 `tokio::io::AsyncRead/AsyncWrite` 的 ConnReader/ConnWriter/PacketReader/PacketWriter，
 //! 接入 `transport::Link` 与 `internet::Dialer`。
+//!
+//! # trojan v2 草案（前向兼容接入）
+//!
+//! **声明**：v1 逐字节对齐 Go `proxy/trojan`（v26.9.9 实码）；v2 **不在任何权威
+//! 规范或主流实现中存在**——Go Xray-core v26.9.9 `proxy/trojan` 无 0x02/MD5 逻辑
+//! （全仓 grep 零匹配），trojan-gfw 官方协议文档仅 v1。本节格式来自研究草案
+//! `docs/research-transport-stack-2026-09-15b.md` §7.1（其引用来源亦不含该格式
+//! 定义），按「SOCKS5 风格」语义对齐：
+//!
+//! ```text
+//! [0x02][16 字节 md5(password)][1 字节 ATYP][DST.ADDR][2 字节 BE DST.PORT][payload...]
+//! ```
+//!
+//! 与 v1 的差异：无独立 cmd 字节（仅 TCP CONNECT 语义）、无尾部 CRLF、
+//! 密码标识为原始 MD5 摘要。识别分叉：v1 首字节恒为小写 hex（`0x30-0x39`/
+//! `0x61-0x66`），v2 前缀 `0x02` 与之零冲突；其余首字节拒绝（→ fallback）。
+//! 草案未定义 UDP；ATYP 恒 1 字节（草案原文「2-byte ATYP」系笔误，与其自注
+//! 「SOCKS5 风格」矛盾）。
 
 use xray_common::net::address::Address;
 
@@ -39,6 +57,11 @@ pub const COMMAND_UDP: u8 = 3;
 pub const MAX_LENGTH: usize = 8192;
 /// CRLF（`\r\n`），对应 Go `crlf = []byte{'\r', '\n'}`。
 pub const CRLF: [u8; 2] = [b'\r', b'\n'];
+
+/// trojan v2 草案版本前缀字节（TLS 握手后首字节）。
+pub const V2_VERSION: u8 = 0x02;
+/// trojan v2 草案密码摘要长度（`md5(password)` 原始 16 字节）。
+pub const MD5_KEY_LEN: usize = 16;
 
 /// 网络类型，对应 Go `net.Network_TCP` / `net.Network_UDP`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +210,61 @@ pub fn write_request_header(
     write_address_port(out, addr, port)?;
     out.extend_from_slice(&CRLF);
     Ok(())
+}
+
+// ============================================================================
+// trojan v2 草案帧编解码
+// ============================================================================
+
+/// 判断首字节是否可能是 v1 的 hex(SHA224) key 起始（小写 hex 字符）。
+///
+/// v1 key 恒为 56 字节小写 hex，首字节 ∈ `0x30-0x39` / `0x61-0x66`；
+/// v2 前缀 `0x02` 与之零冲突——inbound 据此做 v1/v2 识别分叉。
+#[must_use]
+pub const fn is_v1_hex_prefix(b: u8) -> bool {
+    matches!(b, b'0'..=b'9' | b'a'..=b'f')
+}
+
+/// 写入 trojan v2 草案请求头：
+/// `[0x02][16 字节 md5(password)][SOCKS5 addr+port]`，payload 紧随其后。
+///
+/// 草案无独立 cmd 字节（仅 TCP CONNECT 语义）且无尾部 CRLF——与 v1 不同，
+/// 见模块文档「trojan v2 草案」节。
+///
+/// # Errors
+/// 地址编码失败（域名超 255 字节）→ [`TrojanError::WriteAddress`]。
+pub fn write_request_header_v2(
+    out: &mut Vec<u8>,
+    key: &[u8; MD5_KEY_LEN],
+    addr: &Address,
+    port: u16,
+) -> Result<()> {
+    out.push(V2_VERSION);
+    out.extend_from_slice(key);
+    write_address_port(out, addr, port)
+}
+
+/// 解析 trojan v2 草案请求头：返回 `(addr, port, consumed)`，网络恒为 TCP。
+///
+/// `consumed` 指向 header 末尾，payload 从此处开始。
+///
+/// # Errors
+/// - [`TrojanError::InvalidVersionPrefix`]：首字节非 `0x02`。
+/// - [`TrojanError::InsufficientData`]：数据不足。
+/// - [`TrojanError::InvalidRemoteAddress`]：未知地址类型或域名 UTF-8 无效。
+pub fn parse_request_header_v2(buf: &[u8]) -> Result<(Address, u16, usize)> {
+    if buf.is_empty() {
+        return Err(TrojanError::InsufficientData(1, 0));
+    }
+    if buf[0] != V2_VERSION {
+        return Err(TrojanError::InvalidVersionPrefix(buf[0]));
+    }
+    let head = 1 + MD5_KEY_LEN;
+    if buf.len() < head {
+        return Err(TrojanError::InsufficientData(head, buf.len()));
+    }
+    let (addr, port, addr_consumed) = read_address_port(&buf[head..])?;
+    Ok((addr, port, head + addr_consumed))
 }
 
 /// 解析 TCP/UDP 请求头：返回 `(network, addr, port, consumed)`。
@@ -568,5 +646,111 @@ mod tests {
         assert_eq!(a, addr);
         assert_eq!(p, 443);
         assert_eq!(pp, payload);
+    }
+
+    // --------------------------------------------------------------------
+    // trojan v2 草案帧编解码
+    // --------------------------------------------------------------------
+
+    #[test]
+    fn test_v2_header_ipv4_wire_format() {
+        let mut out = Vec::new();
+        let addr = Address::IPv4(Ipv4Addr::new(127, 0, 0, 1));
+        write_request_header_v2(&mut out, &[0xAA; MD5_KEY_LEN], &addr, 8080).expect("encode");
+        // 逐字节：0x02 + 16B md5 + ATYP(0x01) + 4B IP + 2B BE port，无 CRLF
+        assert_eq!(out.len(), 1 + 16 + 1 + 4 + 2);
+        assert_eq!(out[0], 0x02);
+        assert_eq!(&out[1..17], &[0xAA; 16]);
+        assert_eq!(out[17], addr_type::IPV4);
+        assert_eq!(&out[18..22], &[127, 0, 0, 1]);
+        assert_eq!(&out[22..24], &8080u16.to_be_bytes());
+
+        let (a, p, c) = parse_request_header_v2(&out).expect("parse v2");
+        assert_eq!(a, addr);
+        assert_eq!(p, 8080);
+        assert_eq!(c, out.len());
+    }
+
+    #[test]
+    fn test_v2_header_domain_wire_format() {
+        let mut out = Vec::new();
+        let addr = Address::Domain("example.com".into());
+        write_request_header_v2(&mut out, &[0x11; MD5_KEY_LEN], &addr, 443).expect("encode");
+        // 0x02 + 16B md5 + ATYP(0x03) + len(11) + domain + 2B BE port
+        assert_eq!(out.len(), 1 + 16 + 1 + 1 + 11 + 2);
+        assert_eq!(out[17], addr_type::DOMAIN);
+        assert_eq!(out[18], 11);
+        assert_eq!(&out[19..30], b"example.com");
+        assert_eq!(&out[30..32], &443u16.to_be_bytes());
+
+        let (a, p, c) = parse_request_header_v2(&out).expect("parse v2");
+        assert_eq!(a, addr);
+        assert_eq!(p, 443);
+        assert_eq!(c, out.len());
+    }
+
+    #[test]
+    fn test_v2_header_ipv6_wire_format() {
+        let mut out = Vec::new();
+        let addr = Address::IPv6(Ipv6Addr::LOCALHOST);
+        write_request_header_v2(&mut out, &[0x22; MD5_KEY_LEN], &addr, 9).expect("encode");
+        assert_eq!(out.len(), 1 + 16 + 1 + 16 + 2);
+        assert_eq!(out[17], addr_type::IPV6);
+
+        let (a, p, c) = parse_request_header_v2(&out).expect("parse v2");
+        assert_eq!(a, addr);
+        assert_eq!(p, 9);
+        assert_eq!(c, out.len());
+    }
+
+    #[test]
+    fn test_v2_parse_rejects_invalid_version_prefix() {
+        // 非法前缀（非 0x02）：0x00 / 0xFF / v1 hex 首字符 '3'
+        for first in [0x00u8, 0xFF, b'3', b'a'] {
+            let buf = [first, 0u8, 1, 127, 0, 0, 1, 0, 80];
+            assert!(
+                matches!(
+                    parse_request_header_v2(&buf),
+                    Err(TrojanError::InvalidVersionPrefix(_))
+                ),
+                "prefix {first:#04x} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_v2_parse_insufficient_data() {
+        assert!(matches!(
+            parse_request_header_v2(&[]),
+            Err(TrojanError::InsufficientData(1, 0))
+        ));
+        // 版本字节在但 16B md5 不足
+        let buf = [0x02u8, 0xAA, 0xBB];
+        assert!(matches!(
+            parse_request_header_v2(&buf),
+            Err(TrojanError::InsufficientData(17, 3))
+        ));
+    }
+
+    #[test]
+    fn test_v1_v2_prefix_disjoint() {
+        // v1 首字节恒为小写 hex；v2 前缀 0x02 与之零冲突
+        assert!(!is_v1_hex_prefix(V2_VERSION));
+        assert!(is_v1_hex_prefix(b'0'));
+        assert!(is_v1_hex_prefix(b'9'));
+        assert!(is_v1_hex_prefix(b'a'));
+        assert!(is_v1_hex_prefix(b'f'));
+        assert!(!is_v1_hex_prefix(b'g'));
+        assert!(!is_v1_hex_prefix(b'F')); // hex_string 输出小写
+        assert!(!is_v1_hex_prefix(0x00));
+    }
+
+    #[test]
+    fn test_md5_key_length_and_determinism() {
+        let k1 = crate::config::md5_key("password");
+        let k2 = crate::config::md5_key("password");
+        assert_eq!(k1.len(), MD5_KEY_LEN);
+        assert_eq!(k1, k2);
+        assert_ne!(k1, crate::config::md5_key("other"));
     }
 }
