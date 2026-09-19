@@ -244,6 +244,10 @@ impl Server for Arc<TcpNameServer> {
         self.cache.disable_cache
     }
 
+    fn is_serve_stale(&self) -> bool {
+        self.cache.serve_stale
+    }
+
     fn query_ip<'a>(
         &'a self,
         domain: &'a str,

@@ -167,7 +167,16 @@ impl DnsAppConfig {
             };
             // Go nameserver.go:150-153：NewClient 失败（nameserver 构造/matcher
             // 构建等）→ NewClient 返回错误 → dns app 整体启动失败，而非跳过。
-            let c = build_client(ns, &client_ip, base_ip_option, &datadir, policy_id)?;
+            let c = build_client(
+                ns,
+                &client_ip,
+                base_ip_option,
+                &datadir,
+                policy_id,
+                self.disable_cache.unwrap_or(false),
+                self.serve_stale.unwrap_or(false),
+                self.serve_expired_ttl.unwrap_or(0),
+            )?;
             let client_idx = clients.len() as u16;
             clients.push(Arc::new(c));
             // localhost server 优先本地域（Go localTLDsAndDotlessDomainsRules）。
@@ -333,6 +342,9 @@ fn build_client(
     base_ip_option: IpOption,
     datadir: &std::path::Path,
     derived_policy_id: u32,
+    global_disable_cache: bool,
+    global_serve_stale: bool,
+    global_serve_expired_ttl: u32,
 ) -> Result<Client, DnsError> {
     let client_ip = parse_client_ip(ns.client_ip.as_deref())?;
     let client_ip = if client_ip.is_empty() {
@@ -364,7 +376,13 @@ fn build_client(
         query_strategy: ns.query_strategy.as_deref().map(|s| parse_query_strategy(Some(s))),
         tag: ns.tag.clone().unwrap_or_default(),
         final_query: ns.final_query.unwrap_or(false),
-        disable_cache: ns.disable_cache,
+        // Go app/dns/dns.go:127-130：disableCache := config.DisableCache;
+        // if ns.DisableCache != nil { disableCache = *ns.DisableCache }。
+        disable_cache: Some(ns.disable_cache.unwrap_or(global_disable_cache)),
+        // Go app/dns/dns.go:131-139：per-NS optional 覆盖全局缺省
+        // （serveStale := config.ServeStale; if ns.ServeStale != nil { ... }）。
+        serve_stale: Some(ns.serve_stale.unwrap_or(global_serve_stale)),
+        serve_expired_ttl: Some(ns.serve_expired_ttl.unwrap_or(global_serve_expired_ttl)),
         act_prior: ns.act_prior.unwrap_or(false) || star_prior,
         act_unprior: ns.act_unprior.unwrap_or(false) || star_unprior,
         negative_ttl_secs: ns.negative_ttl_secs,
@@ -843,8 +861,17 @@ mod tests {
         }"#;
         let ns: NameServerJson = serde_json::from_str(json).unwrap();
         let datadir = std::path::Path::new("");
-        let client: Client =
-            build_client(&ns, &[], crate::config::IpOption::all(), datadir, 0).unwrap();
+        let client: Client = build_client(
+            &ns,
+            &[],
+            crate::config::IpOption::all(),
+            datadir,
+            0,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
 
         // Client 公开字段。
         assert_eq!(client.policy_id, 7);
@@ -857,6 +884,77 @@ mod tests {
         // dyn Server 不暴露 cache——字段级断言见 udp.rs from_config 测试。
         assert!(client.server.is_disable_cache());
         assert!(client.server.name().starts_with("UDP:"));
+    }
+
+    /// 乐观缓存开关接线（Go app/dns/dns.go:131-139）：全局 serveStale 缺省流入
+    /// 每个 nameserver；per-NS 显式值覆盖全局。serveExpiredTTL 与 bool 在同一处
+    /// 合并（NameServerConfig 填充点），数值段由 udp.rs from_config 测试断言。
+    #[test]
+    fn build_client_merges_global_serve_stale_with_per_ns_override() {
+        use crate::nameserver::Client;
+        let mk = |json: &str| -> Client {
+            let ns: NameServerJson = serde_json::from_str(json).unwrap();
+            build_client(
+                &ns,
+                &[],
+                crate::config::IpOption::all(),
+                std::path::Path::new(""),
+                0,
+                false, // 全局 disableCache = false
+                true,  // 全局 serveStale = true
+                30,    // 全局 serveExpiredTTL = 30
+            )
+            .unwrap()
+        };
+
+        // 无 per-NS 配置 → 继承全局 serveStale=true。
+        let inherited = mk(r#"{ "address": "1.1.1.1" }"#);
+        assert!(
+            inherited.server.is_serve_stale(),
+            "无 per-NS 配置应继承全局 serveStale（修复前全局开关为死配置）"
+        );
+
+        // per-NS 显式 false 覆盖全局 true。
+        let overridden = mk(r#"{ "address": "1.1.1.1", "serveStale": false }"#);
+        assert!(
+            !overridden.server.is_serve_stale(),
+            "per-NS serveStale=false 应覆盖全局 true"
+        );
+    }
+
+    /// disableCache 全局→per-NS 合并（Go app/dns/dns.go:127-130）：全局缺省
+    /// 流入每个 nameserver；per-NS 显式值覆盖全局。与 serveStale 同处合并。
+    #[test]
+    fn build_client_merges_global_disable_cache_with_per_ns_override() {
+        use crate::nameserver::Client;
+        let mk = |json: &str| -> Client {
+            let ns: NameServerJson = serde_json::from_str(json).unwrap();
+            build_client(
+                &ns,
+                &[],
+                crate::config::IpOption::all(),
+                std::path::Path::new(""),
+                0,
+                true, // 全局 disableCache = true
+                false,
+                0,
+            )
+            .unwrap()
+        };
+
+        // 无 per-NS 配置 → 继承全局 disableCache=true。
+        let inherited = mk(r#"{ "address": "1.1.1.1" }"#);
+        assert!(
+            inherited.server.is_disable_cache(),
+            "无 per-NS 配置应继承全局 disableCache"
+        );
+
+        // per-NS 显式 false 覆盖全局 true。
+        let overridden = mk(r#"{ "address": "1.1.1.1", "disableCache": false }"#);
+        assert!(
+            !overridden.server.is_disable_cache(),
+            "per-NS disableCache=false 应覆盖全局 true"
+        );
     }
 
     /// 8kha：构建 DNS 配置并返回各 client 的 policy_id（按 servers 顺序）。
