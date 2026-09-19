@@ -2,11 +2,12 @@
 """CI 互通测试 (跨平台): dist/interop_matrix.py 的 POSIX 移植, 本地脚本零改动.
 
 - suite rust: Rust client<->Rust server, 6 协议 x 2 轮 = 12 测
-- suite go:   Go client -> Rust server (官方 xray-core release 二进制), 默认 3 协议
+- suite go:   Go client -> Rust server (官方 xray-core release 二进制), 默认 6 协议
 验收口径同 run_full32/interop_matrix: socks5h curl https://www.youtube.com/ body>5000B 且含 YouTube marker.
 TLS 双向统一 pinnedPeerCertSha256 (bd 5x41: allowInsecure 配置期硬错), 证书由 openssl 现场生成.
 用法: python3 dist/interop_ci.py [--rust PATH] [--go PATH] [--work DIR]
-           [--suites rust,go] [--go-protos vmess,trojan_tls,vless_ws] [--dry-run]
+           [--suites rust,go] [--go-protos <list>] [--dry-run]
+默认 --go-protos 覆盖 6 协议全 Go->Rust；缩减用逗号子集.
 """
 import argparse
 import base64
@@ -23,7 +24,9 @@ UUID = 'b831381d-6324-4d53-ad4f-8cda48b30811'
 TPW = 'test-pass-12345'
 SS22_KEY = base64.b64encode(b'0123456789abcdef').decode()  # 16B for 2022-blake3-aes-128-gcm
 PROTOS = ['vmess', 'vless_vision_tls', 'trojan_tls', 'vless_ws', 'ss', 'ss2022']
-GO_CROSS_PROTOS = ['vmess', 'trojan_tls', 'vless_ws']  # 明文 / TLS+pin / ws 各一
+# Go 交叉：6 协议全 Go->Rust 双向校验（vmess/vless_vision_tls/trojan_tls/vless_ws/ss/ss2022），
+# 默认 --go-protos 即覆盖全 6；--go-protos <list> 允许 CI 缩减。
+GO_CROSS_PROTOS = PROTOS
 BASE_PORT = 18100
 IS_WIN = os.name == 'nt'
 EXE = '.exe' if IS_WIN else ''
