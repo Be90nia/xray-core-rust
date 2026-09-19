@@ -76,7 +76,7 @@ jobs:
           chmod +x tools/xray-go/xray
           tools/xray-go/xray version
 
-      - name: Interop tests (Rust<->Rust 12 + Go->Rust 3)
+      - name: Interop tests (Rust<->Rust 12 + Go->Rust 6)
         run: python3 dist/interop_ci.py --rust target/release/xray --go tools/xray-go/xray
 
       - name: Upload logs on failure
