@@ -263,6 +263,10 @@ impl Server for Arc<DotNameServer> {
         self.cache.disable_cache
     }
 
+    fn is_serve_stale(&self) -> bool {
+        self.cache.serve_stale
+    }
+
     fn query_ip<'a>(
         &'a self,
         domain: &'a str,

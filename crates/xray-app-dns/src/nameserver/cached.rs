@@ -665,4 +665,95 @@ mod tests {
         );
         assert!(server.cache.single_flight.lock().await.is_empty());
     }
+
+    /// serveStale 刷新失败：上游失败不写缓存（不覆盖旧值），过期记录保留，
+    /// 后续查询继续乐观返回旧值——Go 无 backoff timer，重试由后续查询驱动
+    /// （每次乐观命中 spawn 一次 pull，singleflight 防并发重复）。
+    #[tokio::test]
+    async fn stale_refresh_failure_keeps_old_value() {
+        struct FailServer {
+            cache: Arc<CacheController>,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl CachedNameserver for FailServer {
+            fn cache_controller(&self) -> &CacheController {
+                &self.cache
+            }
+            async fn send_query(&self, _fqdn: &str, _option: IpOption) -> QueryOutcome {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                QueryOutcome {
+                    rec_v4: None,
+                    rec_v6: None,
+                    errors: vec![DnsError::SystemResolve("upstream down".into())],
+                }
+            }
+        }
+
+        let cache = Arc::new(CacheController::new("test", false, true, 0, 0));
+        let expired = ip_record(
+            1,
+            vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))],
+            Duration::from_secs(0),
+            0,
+            Instant::now() - Duration::from_secs(30),
+        );
+        cache.upsert("example.com.", true, expired);
+
+        let server = Arc::new(FailServer {
+            cache: cache.clone(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        // 第一次：秒回旧 IP（后台 pull 会失败，不影响本次返回）。
+        let (ips, ttl) = query_ip(server.clone(), "example.com", v4_only_option()).await.unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))], "秒回旧 IP");
+        assert_eq!(ttl, 1);
+
+        // 等 pull 失败落地（fetch 完成且不写缓存）。
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            server.calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "后台 pull 必须真实打过上游"
+        );
+
+        // 旧记录未被清除/覆盖；第二次查询依旧乐观返回旧值（查询驱动重试）。
+        let rec = cache
+            .find_records("example.com.")
+            .expect("刷新失败必须保留旧记录");
+        assert_eq!(
+            rec.a.as_ref().unwrap().ips,
+            vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))],
+            "失败结果不得覆盖旧值"
+        );
+        let (ips, ttl) = query_ip(server.clone(), "example.com", v4_only_option()).await.unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))]);
+        assert_eq!(ttl, 1);
+    }
+
+    /// serveStale 关闭（Go 缺省）：过期条目不返回旧值，落 fetch 阻塞刷新。
+    #[tokio::test]
+    async fn stale_disabled_falls_through_to_fetch() {
+        let cache = Arc::new(CacheController::new("test", false, false, 0, 0));
+        let expired = ip_record(
+            1,
+            vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))],
+            Duration::from_secs(0),
+            0,
+            Instant::now() - Duration::from_secs(30),
+        );
+        cache.upsert("example.com.", true, expired);
+
+        let server = StubServer {
+            cache,
+            rec_v4: Some(v4_record(60)),
+            rec_v6: None,
+        };
+        let (ips, ttl) = query_ip(Arc::new(server), "example.com", v4_only_option()).await.unwrap();
+        assert_eq!(
+            ips,
+            vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))],
+            "serveStale 关闭时不得返回过期旧值"
+        );
+        assert_eq!(ttl, 60, "应返回 fetch 新值的 TTL");
+    }
 }

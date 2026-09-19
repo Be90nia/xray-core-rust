@@ -40,6 +40,11 @@ pub trait Server: Send + Sync {
     /// 是否禁用缓存。
     fn is_disable_cache(&self) -> bool;
 
+    /// 是否提供过期缓存数据（serveStale）。
+    fn is_serve_stale(&self) -> bool {
+        false
+    }
+
     /// 查询域名对应的 IP。
     ///
     /// 返回 `(ips, ttl_seconds)`。
