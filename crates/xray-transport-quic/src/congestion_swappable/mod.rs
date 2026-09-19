@@ -20,7 +20,7 @@ pub mod quinn_bridge;
 pub mod types;
 pub mod utils;
 
-pub use brutal::BrutalSender;
+pub use brutal::{parse_bandwidth_bps, BrutalSender};
 pub use error::{CongestionError, Result};
 pub use pacer::Pacer;
 pub use quinn_bridge::{apply_bbr, apply_brutal, install_swappable_cc, HysteriaCCSlot};

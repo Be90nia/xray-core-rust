@@ -58,6 +58,74 @@ pub type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 /// h3 RequestStream 类型别名。
 pub type H3RequestStream = h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 
+/// 按 splithttp H3 语义应用拥塞控制（对应 Go `splithttp/dialer.go:161-164` nil 兜底 +
+/// `:239-246` congestion switch；conf 层校验语义来自 `infra/conf/transport_internet.go:217-254`，
+/// Rust 侧 memory_settings 宽容解析故在此一并硬错）。
+///
+/// 与 Go 逐条对齐：
+/// - `quicParams == None` → 兜底 `BbrProfile=standard`、congestion 空 → BBR
+///   （PR #5711：H3 默认 BBR）
+/// - congestion 大小写不敏感（Go conf :245 ToLower）
+/// - `"reno"` → 不应用（Go 空 case 体，保留 quinn 默认 CUBIC）
+/// - `""`/`"bbr"` → BBR；未知 profile → Err（Go conf `"unknown bbr profile"` 硬错）
+/// - `"force-brutal"` → Brutal(brutalUp, brutalDisableLossCompensation)；up==0 → Err
+///   （Go conf `"force-brutal requires up"`）
+/// - 带宽字符串无条件解析（Go conf :229-236 不论 congestion 取值），失败 → Err
+/// - `"brutal"` 通过 conf 白名单（:247）但 splithttp dialer switch 无此臂 → Go `panic`；
+///   未知值同 panic。Rust 生产路径安全化为 Err。
+fn apply_splithttp_cc(
+    slot: &xray_transport_quic::congestion_swappable::HysteriaCCSlot,
+    quic_params: Option<&xray_transport::memory_settings::QuicParamsConfig>,
+) -> Result<()> {
+    use xray_transport_quic::congestion_swappable::{
+        apply_bbr, apply_brutal, parse_bandwidth_bps,
+    };
+    use xray_transport_quic::congestion_swappable::bbr::Profile;
+
+    let Some(qp) = quic_params else {
+        // Go dialer.go:161-164：quicParams 为 nil 时兜底 BbrProfile=standard，
+        // congestion 空串走 UseBBR 分支——H3 无配置也默认 BBR。
+        apply_bbr(slot, Profile::Standard);
+        return Ok(());
+    };
+    // Go conf :229-243：Brutal 带宽无条件解析（Up 与 Down 都验），失败硬错；
+    // >0 且 <65536 → 硬错（"BrutalUp/Down must be at least 65536 bytes per second"）。
+    let brutal_up_bps = parse_bandwidth_bps(&qp.brutal_up)
+        .map_err(|e| SplitHttpError::Hyper(format!("quicParams brutalUp: {e}")))?;
+    let brutal_down_bps = parse_bandwidth_bps(&qp.brutal_down)
+        .map_err(|e| SplitHttpError::Hyper(format!("quicParams brutalDown: {e}")))?;
+    if brutal_up_bps > 0 && brutal_up_bps < 65_536 {
+        return Err(SplitHttpError::Hyper(
+            "BrutalUp must be at least 65536 bytes per second".to_string(),
+        ));
+    }
+    if brutal_down_bps > 0 && brutal_down_bps < 65_536 {
+        return Err(SplitHttpError::Hyper(
+            "BrutalDown must be at least 65536 bytes per second".to_string(),
+        ));
+    }
+    match qp.congestion.to_ascii_lowercase().as_str() {
+        "reno" => {}
+        "" | "bbr" => {
+            let profile = Profile::parse(&qp.bbr_profile)
+                .map_err(|e| SplitHttpError::Hyper(format!("quicParams: {e}")))?;
+            apply_bbr(slot, profile);
+        }
+        "force-brutal" => {
+            if brutal_up_bps == 0 {
+                return Err(SplitHttpError::Hyper("force-brutal requires up".to_string()));
+            }
+            apply_brutal(slot, brutal_up_bps, qp.brutal_disable_loss_compensation);
+        }
+        other => {
+            return Err(SplitHttpError::Hyper(format!(
+                "unknown congestion control: {other}, valid values: reno, bbr, brutal, force-brutal"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// H3 客户端：封装 quinn + h3 SendRequest。
 ///
 /// 持有 config + SendRequest（Mutex 保护，&mut self 用）+ quinn Connection（取地址）。
@@ -78,76 +146,31 @@ impl H3Conn {
     /// 4. `h3::client::new` 包装为 h3 连接
     /// 5. spawn driver 后台 task
     ///
-    /// # Errors
+    /// CC 接线（对应 Go `splithttp/dialer.go:161-164` + `:239-246`，上游
+    /// v26.3.27 PR #5711）：装可热切换 CC 工厂后按 [`apply_splithttp_cc`] 语义应用
+    /// ——`quicParams` 缺省也默认 BBR(standard)，对齐 Go H3 默认 BBR。
     ///
-    /// - [`SplitHttpError::Hyper`]：quinn endpoint / connect / h3 new 失败
-    pub async fn connect(
-        config: Arc<Config>,
-        addr: SocketAddr,
-        server_name: &str,
-        mut tls: RustlsClientConfig,
-    ) -> Result<Arc<Self>> {
-        tls.alpn_protocols = vec![b"h3".to_vec()];
-        let quic_cfg = quinn::ClientConfig::new(Arc::new(
-            quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls))
-                .map_err(|e| SplitHttpError::Hyper(format!("QuicClientConfig: {e}")))?,
-        ));
-        let bind: SocketAddr = if addr.is_ipv4() {
-            "0.0.0.0:0".parse().expect("valid bind addr")
-        } else {
-            "[::]:0".parse().expect("valid bind addr")
-        };
-        let mut endpoint = quinn::Endpoint::client(bind)
-            .map_err(|e| SplitHttpError::Hyper(format!("quinn Endpoint: {e}")))?;
-        endpoint.set_default_client_config(quic_cfg);
-
-        let conn = endpoint
-            .connect(addr, server_name)
-            .map_err(|e| SplitHttpError::Hyper(format!("quinn connect initiate: {e}")))?
-            .await
-            .map_err(|e| SplitHttpError::Hyper(format!("quinn connect: {e}")))?;
-
-        let quinn_conn = h3_quinn::Connection::new(conn.clone());
-        let (mut driver, send_req) = h3::client::new(quinn_conn)
-            .await
-            .map_err(|e| SplitHttpError::Hyper(format!("h3::client::new: {e}")))?;
-
-        // ponytail: driver 必须持续 poll 否则 h3 连接卡住
-        tokio::spawn(async move {
-            let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
-        });
-
-        debug!(target: "splithttp", %addr, %server_name, "H3 connection established");
-
-        Ok(Arc::new(Self {
-            config,
-            send_req: Mutex::new(send_req),
-            quinn_conn: conn,
-            closed: AtomicBool::new(false),
-        }))
-    }
-
-    /// 带 [`QuicParamsConfig`] 的 H3 建立函数，对应 Go `createHTTPClient` 中
-    /// `httpVersion=="3"` + `streamSettings.QuicParams` 分支（dialer.go:162-279）。
-    ///
-    /// 在 [`Self::connect`] 基础上，把 `QuicParamsConfig` 字段映射到
-    /// quinn [`quinn::TransportConfig`]：
+    /// 窗口/idle 等 `QuicParamsConfig` 字段映射 quinn [`quinn::TransportConfig`]：
     ///
     /// - `init_stream_receive_window` / `init_connection_receive_window` → 流/连接初始接收窗口
-    /// - `max_idle_timeout`/`keep_alive_period`（秒）→ idle timeout + keepalive
-    /// - `max_incoming_streams` → 服务端能开最大并发流（<0 = 不限）
-    /// - `disable_path_mtu_discovery` → MTU 探测关闭
     ///
-    /// `None` 时使用 quinn 默认 [`quinn::TransportConfig`]（与 [`Self::connect`] 行为一致）。
+    /// `None` 时除 CC 默认 BBR 外均用 quinn 默认值。
     ///
     /// 注：`UdpHop`（端口轮换）等需要自管 UDP socket 的特性本切片不接入——
     /// splithttp H3 路径继承 register.rs 的 quinn Endpoint 创建，不做包级劫持。
+    ///
+    /// # Errors
+    ///
+    /// - [`SplitHttpError::Hyper`]：quinn endpoint / connect / h3 new 失败
+    /// - CC 配置非法（未知 congestion / 未知 bbrProfile / force-brutal 无带宽 /
+    ///   带宽字符串解析失败）——对齐 Go conf 层 Build() 硬错语义
     pub async fn connect_with_quic_params(
         config: Arc<Config>,
         addr: SocketAddr,
         server_name: &str,
         mut tls: RustlsClientConfig,
         quic_params: Option<&xray_transport::memory_settings::QuicParamsConfig>,
+        sockopt: &xray_transport::sockopt::SocketOptions,
     ) -> Result<Arc<Self>> {
         tls.alpn_protocols = vec![b"h3".to_vec()];
         let mut quic_cfg = quinn::ClientConfig::new(Arc::new(
@@ -171,6 +194,10 @@ impl H3Conn {
                 );
             }
         }
+        // CC 接线（Go dialer.go:161-164 + 239-246）：quicParams 缺省也默认 BBR。
+        let cc_slot =
+            xray_transport_quic::congestion_swappable::install_swappable_cc(&mut transport_config);
+        apply_splithttp_cc(&cc_slot, quic_params)?;
         quic_cfg.transport_config(Arc::new(transport_config));
 
         let bind: SocketAddr = if addr.is_ipv4() {
@@ -178,8 +205,15 @@ impl H3Conn {
         } else {
             "[::]:0".parse().expect("valid bind addr")
         };
-        let mut endpoint = quinn::Endpoint::client(bind)
+        let std_sock = xray_transport::sockopt::bind_udp_endpoint(bind, sockopt)
             .map_err(|e| SplitHttpError::Hyper(format!("quinn Endpoint: {e}")))?;
+        let mut endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            std_sock,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .map_err(|e| SplitHttpError::Hyper(format!("quinn Endpoint: {e}")))?;
         endpoint.set_default_client_config(quic_cfg);
 
         let conn = endpoint
@@ -571,6 +605,114 @@ where
 mod tests {
     // H3 端到端测试在 tests/mock_h3_server.rs 集成测试覆盖（mock h3::server）。
     // 单元测试需要真实网络 + QUIC + TLS，留集成测试。
+
+    use super::apply_splithttp_cc;
+    use xray_transport_quic::congestion_swappable::HysteriaCCSlot;
+
+    /// 从 finalmask.quicParams JSON 形态解析 QuicParamsConfig（走生产同款解析）。
+    fn qp_from_json(congestion: &str, extra: &str) -> xray_transport::memory_settings::QuicParamsConfig {
+        let body = format!(r#"{{"congestion":"{congestion}"{extra}}}"#);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        xray_transport::memory_settings::parse_quic_params_config(Some(&v))
+            .unwrap()
+            .expect("quicParams present")
+    }
+
+    /// Go dialer.go:161-164：quicParams 缺省 → 兜底 standard profile + 空 congestion → BBR。
+    #[test]
+    fn splithttp_cc_none_defaults_to_bbr() {
+        let slot = HysteriaCCSlot::new();
+        apply_splithttp_cc(&slot, None).unwrap();
+        assert!(slot.has_active(), "quicParams None must install BBR (PR #5711)");
+    }
+
+    /// Go dialer.go:240 `case "", "bbr"`：两臂都装 BBR。
+    #[test]
+    fn splithttp_cc_empty_and_bbr_install_bbr() {
+        for congestion in ["", "bbr", "BBR"] {
+            let slot = HysteriaCCSlot::new();
+            let qp = qp_from_json(congestion, r#","bbrProfile":"aggressive""#);
+            apply_splithttp_cc(&slot, Some(&qp)).unwrap();
+            assert!(slot.has_active(), "congestion={congestion:?} must install BBR");
+        }
+    }
+
+    /// Go dialer.go:239 `case "reno"` 空 case 体：不装任何算法（保持 quinn 默认 CUBIC）。
+    #[test]
+    fn splithttp_cc_reno_is_noop() {
+        let slot = HysteriaCCSlot::new();
+        let qp = qp_from_json("reno", "");
+        apply_splithttp_cc(&slot, Some(&qp)).unwrap();
+        assert!(!slot.has_active());
+        assert_eq!(slot.current_window(), 1452, "placeholder window must remain");
+    }
+
+    /// Go dialer.go:242-243 `case "force-brutal"`：Brutal(brutalUp, compensation 开关)。
+    /// 窗口语义（无 RTT 样本 = 10240 下限）由 quinn_bridge 同款断言钉死。
+    #[test]
+    fn splithttp_cc_force_brutal_installs_brutal() {
+        let slot = HysteriaCCSlot::new();
+        let qp = qp_from_json("force-brutal", r#","brutalUp":"1 mbps","brutalDisableLossCompensation":true"#);
+        apply_splithttp_cc(&slot, Some(&qp)).unwrap();
+        assert!(slot.has_active());
+        assert_eq!(slot.current_window(), 10_240, "Brutal floor without RTT samples");
+    }
+
+    /// Go conf :248-251：force-brutal 且 up==0 → `"force-brutal requires up"` 硬错。
+    #[test]
+    fn splithttp_cc_force_brutal_requires_up() {
+        let slot = HysteriaCCSlot::new();
+        let qp = qp_from_json("force-brutal", "");
+        let err = apply_splithttp_cc(&slot, Some(&qp)).unwrap_err();
+        assert!(err.to_string().contains("force-brutal requires up"), "{err}");
+        assert!(!slot.has_active());
+    }
+
+    /// Go dialer.go:244-245 `default: panic`——conf 白名单收 `"brutal"` 但 splithttp
+    /// dialer switch 无此臂；未知值同样 panic。Rust 安全化为 Err。
+    #[test]
+    fn splithttp_cc_brutal_and_unknown_rejected() {
+        for congestion in ["brutal", "vegas"] {
+            let slot = HysteriaCCSlot::new();
+            let qp = qp_from_json(congestion, r#","brutalUp":"1 mbps""#);
+            let err = apply_splithttp_cc(&slot, Some(&qp)).unwrap_err();
+            assert!(
+                err.to_string().contains("unknown congestion control"),
+                "congestion={congestion:?}: {err}"
+            );
+            assert!(!slot.has_active());
+        }
+    }
+
+    /// Go conf :225-226：未知 bbrProfile → `"unknown bbr profile"` 硬错。
+    #[test]
+    fn splithttp_cc_bad_bbr_profile_rejected() {
+        let slot = HysteriaCCSlot::new();
+        let qp = qp_from_json("bbr", r#","bbrProfile":"turbo""#);
+        assert!(apply_splithttp_cc(&slot, Some(&qp)).is_err());
+        assert!(!slot.has_active());
+    }
+
+    /// Go conf :229-243：带宽字符串解析失败硬错（Up/Down 都验，不论 congestion 取值）。
+    #[test]
+    fn splithttp_cc_bad_bandwidth_rejected() {
+        for (congestion, extra) in [("bbr", r#","brutalUp":"abc""#), ("bbr", r#","brutalDown":"abc""#)] {
+            let slot = HysteriaCCSlot::new();
+            let qp = qp_from_json(congestion, extra);
+            assert!(apply_splithttp_cc(&slot, Some(&qp)).is_err(), "{extra}");
+        }
+    }
+
+    /// Go conf :238-243：带宽 >0 但 <65536 B/s → 硬错（"1 k" = 1024/8 = 128 B/s）。
+    #[test]
+    fn splithttp_cc_bandwidth_below_floor_rejected() {
+        for key in ["brutalUp", "brutalDown"] {
+            let slot = HysteriaCCSlot::new();
+            let qp = qp_from_json("force-brutal", &format!(r#","{key}":"1 k""#));
+            let err = apply_splithttp_cc(&slot, Some(&qp)).unwrap_err();
+            assert!(err.to_string().contains("65536"), "{key}: {err}");
+        }
+    }
 
     /// 验证 [`H3Conn::connect_with_quic_params`] 中 QuicParams 字段能成功构造成
     /// quinn `TransportConfig`（不发起网络连接）。

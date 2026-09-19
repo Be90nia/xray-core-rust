@@ -85,6 +85,9 @@ pub struct QuicParamsConfig {
     /// 本结构保留原始字符串供下游解析。
     pub brutal_up: String,
     pub brutal_down: String,
+    /// Brutal 丢包补偿开关（Go `transport_finalmask.go:999` json `brutalDisableLossCompensation`；
+    /// splithttp/hysteria dialer `UseBrutal` 第三参消费）。
+    pub brutal_disable_loss_compensation: bool,
     pub udp_hop: UdpHopConfig,
     pub init_stream_receive_window: u64,
     pub max_stream_receive_window: u64,
@@ -184,7 +187,11 @@ fn parse_mask_entry(v: &serde_json::Value) -> io::Result<MaskEntry> {
     Ok(MaskEntry { mask_type, settings })
 }
 
-fn parse_quic_params_config(v: Option<&serde_json::Value>) -> io::Result<Option<QuicParamsConfig>> {
+/// 解析 `finalmask.quicParams` JSON 节点（宽容解析，校验由下游 CC 接线做，
+/// 对齐 Go `infra/conf` Build() 语义的调用点在 splithttp H3 dialer / hysteria）。
+pub fn parse_quic_params_config(
+    v: Option<&serde_json::Value>,
+) -> io::Result<Option<QuicParamsConfig>> {
     let Some(obj) = v else { return Ok(None) };
     let obj = obj.as_object().ok_or_else(|| invalid("quicParams: expected an object"))?;
     let get_str = |k: &str| obj.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -198,6 +205,7 @@ fn parse_quic_params_config(v: Option<&serde_json::Value>) -> io::Result<Option<
         bbr_profile: get_str("bbrProfile"),
         brutal_up: get_str("brutalUp"),
         brutal_down: get_str("brutalDown"),
+        brutal_disable_loss_compensation: get_bool("brutalDisableLossCompensation"),
         udp_hop,
         init_stream_receive_window: get_u64("initStreamReceiveWindow"),
         max_stream_receive_window: get_u64("maxStreamReceiveWindow"),
@@ -403,6 +411,7 @@ mod tests {
                     "bbrProfile": "Aggressive",
                     "brutalUp": "100 mbps",
                     "brutalDown": "50 mbps",
+                    "brutalDisableLossCompensation": true,
                     "udpHop": {
                         "ports": "443,8000-8002",
                         "interval": { "from": 10, "to": 30 }
@@ -424,6 +433,8 @@ mod tests {
         assert_eq!(q.bbr_profile, "Aggressive");
         assert_eq!(q.brutal_up, "100 mbps");
         assert_eq!(q.brutal_down, "50 mbps");
+        // Go transport_finalmask.go:999 json `brutalDisableLossCompensation`
+        assert!(q.brutal_disable_loss_compensation);
         assert_eq!(q.udp_hop.ports, vec![443, 8000, 8001, 8002]);
         assert_eq!(q.udp_hop.interval_min, 10);
         assert_eq!(q.udp_hop.interval_max, 30);

@@ -52,7 +52,7 @@ pub fn register_listener() -> io::Result<()> {
 /// 实际拨号：解析配置 → 构建 TLS client → 调用 [`dialer::dial`] → 包装为 `Box<dyn Connection>`。
 async fn dial_splithttp(
     dest: &Destination,
-    _sockopt: &SocketOptions,
+    sockopt: &SocketOptions,
     settings: &StreamSettings,
 ) -> io::Result<Box<dyn Connection>> {
     let config = parse_splithttp_config(settings.transport_json.as_ref())?;
@@ -157,14 +157,26 @@ async fn dial_splithttp(
         } else {
             &default_sni
         };
-        let h3_conn = H3Conn::connect(config.clone(), socket_addr, server_name, rustls_config)
-            .await
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    format!("splithttp H3 connect failed: {e}"),
-                )
-            })?;
+        // finalmask.quicParams（对应 Go streamSettings.QuicParams；CC + 窗口字段。
+        // 缺省时 connect_with_quic_params 仍默认 BBR——对齐 dialer.go:161-164 PR #5711）。
+        let quic_params = xray_transport::memory_settings::parse_quic_params_config(
+            settings.finalmask_json.as_ref().and_then(|f| f.get("quicParams")),
+        )?;
+        let h3_conn = H3Conn::connect_with_quic_params(
+            config.clone(),
+            socket_addr,
+            server_name,
+            rustls_config,
+            quic_params.as_ref(),
+            sockopt,
+        )
+        .await
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("splithttp H3 connect failed: {e}"),
+            )
+        })?;
         dialer::dial_h3(h3_conn, config, scheme, &host, has_reality)
             .await
             .map_err(|e| {
@@ -180,7 +192,7 @@ async fn dial_splithttp(
         // 对应 Go `splithttp/dialer.go::Dial` 在 `reality.UClient(conn, ...)` 闭包里
         // 包 TCP 触发的同一行为，Rust 端拆分到 splithttp 路径专用。
         if has_reality {
-            let tcp_conn = dial_system(dest, _sockopt).await.map_err(|e| {
+            let tcp_conn = dial_system(dest, sockopt).await.map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::ConnectionRefused,
                     format!("splithttp reality dial_system: {e}"),

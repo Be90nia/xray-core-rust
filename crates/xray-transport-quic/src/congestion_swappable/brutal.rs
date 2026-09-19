@@ -245,10 +245,67 @@ impl CongestionControl for BrutalSender {
     }
 }
 
+/// 解析 Brutal 带宽字符串为 bytes/s（对应 Go `infra/conf` `Bandwidth.Bps`，
+/// `transport_internet.go:452-491`）。
+///
+/// 空串 → 0（未配置）；`"100 mbps"` → 100×2²⁰/8 = 13_107_200。
+/// 与 `xray-transport-hysteria/src/quic_params.rs` 的私有实现同语义
+/// （该文件归 hysteria 票所有，跨 crate 复制登记于此供 splithttp H3 CC 接线复用；
+/// 后续去重可让 hysteria re-export 本函数）。
+pub fn parse_bandwidth_bps(s: &str) -> std::io::Result<u64> {
+    let s = s.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return Ok(0);
+    }
+    let idx = s.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(s.len());
+    let val: f64 = s[..idx]
+        .parse()
+        .map_err(|_| invalid_bandwidth(&s))?;
+    let mul: u64 = match s[idx..].trim() {
+        "" | "b" | "bps" => 1,
+        "k" | "kb" | "kbps" => 1 << 10,
+        "m" | "mb" | "mbps" => 1 << 20,
+        "g" | "gb" | "gbps" => 1 << 30,
+        "t" | "tb" | "tbps" => 1 << 40,
+        unit => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("quicParams: unsupported unit {unit:?}"),
+            ))
+        },
+    };
+    // Go :490 `uint64(val*float64(mul)) / 8`：先截断再整除。
+    Ok((val * mul as f64) as u64 / 8)
+}
+
+fn invalid_bandwidth(s: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("quicParams: invalid bandwidth value {s:?}"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::congestion_swappable::types::test_support::MockRttStats;
+
+    #[test]
+    fn parse_bandwidth_bps_matches_go_semantics() {
+        // 100 mbps = 100×1048576/8（Go Bandwidth.Bps，transport_internet.go:452-491）
+        assert_eq!(parse_bandwidth_bps("100 mbps").unwrap(), 13_107_200);
+        // 空串 = 未配置
+        assert_eq!(parse_bandwidth_bps("").unwrap(), 0);
+        // 1.5 mbps：f64 乘后截断再 /8 = 196_608
+        assert_eq!(parse_bandwidth_bps("1.5 mbps").unwrap(), 196_608);
+        // 500 kbps = 64_000
+        assert_eq!(parse_bandwidth_bps("500 kbps").unwrap(), 64_000);
+        // 大小写不敏感
+        assert_eq!(parse_bandwidth_bps("100 M").unwrap(), 13_107_200);
+        // 非法值 / 非法单位 → Err（Go conf 层硬错）
+        assert!(parse_bandwidth_bps("abc").is_err());
+        assert!(parse_bandwidth_bps("5 xyz").is_err());
+    }
 
     #[test]
     fn new_brutal_initial_state() {
