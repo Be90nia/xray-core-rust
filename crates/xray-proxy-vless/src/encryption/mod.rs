@@ -153,6 +153,48 @@ const PFS_LEN: usize = 1250;
 /// 最小 padding 段长度（EncodeLength(16) + empty tag）
 const PADDING_LEN: usize = 34;
 
+/// 钳最小 34B（Go 同配置直接 panic；Rust 保持可解析），差额并入末段保持
+/// `sum(lens) == padding_length`（分段写须覆盖全缓冲）。
+fn clamp_padding_length(padding_length: &mut usize, lens: &mut [u32]) {
+    if *padding_length < PADDING_LEN {
+        *lens.last_mut().expect("creat_padding lens 非空：默认或 parse 首段保证") +=
+            (PADDING_LEN - *padding_length) as u32;
+        *padding_length = PADDING_LEN;
+    }
+}
+
+/// 分段写握手消息并在段间 sleep（对应 Go client.go:149-153 / server.go:304-306
+/// 写循环：`if l > 0 { conn.Write }; if len(paddingGaps) > i { time.Sleep }`——
+/// `l == 0` 的段跳过写但仍消费对应 gap）。`lens` 求和须等于 `buf.len()`（首段
+/// 已并入前置头部）；零值 gap 跳过 sleep（Go time.Sleep(0) 立即返回，等价且
+/// 省 timer 开销）。
+async fn write_padding_fragments<C>(
+    conn: &mut C,
+    buf: &[u8],
+    lens: &[u32],
+    gaps: &[std::time::Duration],
+) -> Result<()>
+where
+    C: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt as _;
+    let mut written = 0usize;
+    for (i, &l) in lens.iter().enumerate() {
+        let l = l as usize;
+        if l > 0 {
+            conn.write_all(&buf[written..written + l]).await?;
+            written += l;
+        }
+        if let Some(&gap) = gaps.get(i) {
+            if !gap.is_zero() {
+                tokio::time::sleep(gap).await;
+            }
+        }
+    }
+    debug_assert_eq!(written, buf.len(), "lens 求和必须覆盖整个握手缓冲");
+    Ok(())
+}
+
 impl ClientInstance {
     /// 创建空实例。
     #[must_use]
@@ -456,14 +498,21 @@ impl ClientInstance {
         let nfs_key: [u8; 32];
         let mut nfs_aead: crate::encryption::aead::Aead;
         let mut encrypted_pfs: Vec<u8>;
+        let mut padding_lens_seg: Vec<u32>;
+        let padding_gaps: Vec<std::time::Duration>;
         {
             let mut rng = rand::rng();
             let iv_and_relays_len = 16 + self.relays_length;
-            // 随机 padding 总长（对齐 Go client.go:73 CreatPadding，默认 111..4444）。
-            // Go 自定义配置可为 0 → `padding[18:paddingLength-16]` 直接 panic；
-            // Rust 钳到最小 34B（sealed EncodeLength + 空 body）保持可解析。
-            let padding_length =
-                common::creat_padding(&self.padding_lens, &mut rng).max(PADDING_LEN);
+            // 随机 padding（对齐 Go client.go:73 CreatPadding，默认 111..4444
+            // + gaps {75,0,111}）。Go 自定义配置可为 0 → `padding[18:
+            // paddingLength-16]` 直接 panic；Rust 钳到最小 34B（sealed
+            // EncodeLength + 空 body）保持可解析，差额并入末段保持
+            // sum(lens) == padding_length（分段写须覆盖全缓冲）。
+            let (mut padding_length, mut seg_lens, gaps_dur) =
+                common::creat_padding(&self.padding_lens, &self.padding_gaps, &mut rng);
+            clamp_padding_length(&mut padding_length, &mut seg_lens);
+            padding_lens_seg = seg_lens;
+            padding_gaps = gaps_dur;
             let client_hello_len = iv_and_relays_len + PFS_LEN + padding_length;
             client_hello = vec![0u8; client_hello_len];
             // iv 随机：fill_bytes 必须先于 iv 赋值
@@ -495,8 +544,13 @@ impl ClientInstance {
             client_hello[pad_offset..pad_offset + 18].copy_from_slice(&pad_tmp);
             client_hello[pad_offset + 18..pad_offset + padding_length]
                 .copy_from_slice(&pad_tmp2);
+            // Go client.go:148：首段并入 iv+relays+pfsKeyExchange 长度
+            padding_lens_seg[0] += pad_offset as u32;
         }
-        conn.write_all(&client_hello).await?;
+        // 6. 分段发送 clientHello（Go client.go:149-155：逐段写、段间按 gaps
+        //    sleep，制造可变流量形态，直至内部 VLESS 流接管）
+        write_padding_fragments(&mut conn, &client_hello, &padding_lens_seg, &padding_gaps)
+            .await?;
         let mut encrypted_pfs = vec![0u8; 1088 + 32 + 16];
         conn.read_exact(&mut encrypted_pfs).await?;
         let mut decrypted_pfs = Vec::with_capacity(1120);
@@ -978,7 +1032,7 @@ impl ServerInstance {
         nfs_aead.open(&mut pfs_pub_pt, None, &encrypted_pfs, &[])?; // → nonce 0002
         // ThreadRng !Send：把 RNG + 同步 AEAD 派生全部封在内部 block，await 前 drop。
         // iv/united_key/ticket 被外层 xor_conn/CommonConn 构造用到，须在 outer 保留。
-        let (server_hello, aead, peer_aead, ticket_arr, united_key_bytes) = {
+        let (server_hello, aead, peer_aead, ticket_arr, united_key_bytes, padding_lens_seg, padding_gaps) = {
             let mut rng = rand::rng();
             let ek_bytes: ml_kem::Key<ml_kem::EncapsulationKey768> =
                 ml_kem::array::Array::try_from(&pfs_pub_pt[..1184])
@@ -1061,10 +1115,14 @@ impl ServerInstance {
                 );
                 tracing::info!(sessions = store.sessions.len(), seconds, "vless enc: 1-RTT done, session stored (ticket issued)");
             }
-            // 随机 padding 总长（对齐 Go server.go:288 CreatPadding），钳最小
-            // 34B 防 0 长度自定义配置下溢（Go 同配置直接 panic）。
-            let padding_length =
-                common::creat_padding(&self.padding_lens, &mut rng).max(PADDING_LEN);
+            // 随机 padding（对齐 Go server.go:288 CreatPadding，含 gaps），
+            // 钳最小 34B 防 0 长度自定义配置下溢（Go 同配置直接 panic），
+            // 差额并入末段保持 sum(lens) == padding_length（分段写须覆盖全缓冲）。
+            let (mut padding_length, mut seg_lens, gaps_dur) =
+                common::creat_padding(&self.padding_lens, &self.padding_gaps, &mut rng);
+            clamp_padding_length(&mut padding_length, &mut seg_lens);
+            // Go server.go:299：首段并入 pfsKeyExchange+encryptedTicket 长度
+            seg_lens[0] += (1136 + 32) as u32;
             let mut server_hello = Vec::with_capacity(1136 + 32 + padding_length);
             nfs_aead.seal(
                 &mut server_hello,
@@ -1078,10 +1136,20 @@ impl ServerInstance {
             let pad_len_bytes = ((padding_length - 18) as u16).to_be_bytes();
             aead.seal(&mut server_hello, None, &pad_len_bytes, &[])?;
             aead.seal(&mut server_hello, None, &vec![0u8; padding_length - 34], &[])?;
-            (server_hello, aead, peer_aead, ticket, united_key)
+            (
+                server_hello,
+                aead,
+                peer_aead,
+                ticket,
+                united_key,
+                seg_lens,
+                gaps_dur,
+            )
         };
-        // 13. 发送 serverHello
-        conn.write_all(&server_hello).await?;
+        // 13. 分段发送 serverHello（Go server.go:304-306：逐段写、段间按 gaps
+        //     sleep——允许 client 缓慢发 padding，消除 1-RTT 流量形态）
+        write_padding_fragments(&mut conn, &server_hello, &padding_lens_seg, &padding_gaps)
+            .await?;
         conn.flush().await?;
 
         // 14. 读 client padding：encryptedLength(18) + encryptedPadding(DecodeLength)
@@ -1248,6 +1316,50 @@ impl ServerInstance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // === write_padding_fragments（Go client.go:149-153 / server.go:304-306）===
+
+    /// 分段切分正确 + gap 按段消费：lens=[5,0,3]（中段 l==0 跳写仍消费 gap），
+    /// gaps=[0,7ms,3ms]。start_paused 虚拟时钟零真实等待，elapsed 精确 10ms。
+    #[tokio::test(start_paused = true)]
+    async fn write_padding_fragments_segments_and_consumes_gaps() {
+        use tokio::io::AsyncReadExt as _;
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let buf = [0u8, 1, 2, 3, 4, 5, 6, 7];
+        let lens = [5u32, 0, 3];
+        let gaps = [
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(7),
+            std::time::Duration::from_millis(3),
+        ];
+        let start = tokio::time::Instant::now();
+        let write = write_padding_fragments(&mut client, &buf, &lens, &gaps);
+        // 先写后读：duplex 64B 缓冲装得下 8B，写端不阻塞（write 为 lazy future，
+        // 若先 await 读会因写端从未被 poll 而死锁）
+        write.await.unwrap();
+        let mut got = [0u8; 8];
+        server.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, buf);
+        // 零值 gap 跳过 timer：虚拟时钟只推进 7+3ms
+        assert_eq!(start.elapsed(), std::time::Duration::from_millis(10));
+    }
+
+    /// Go `len(paddingGaps) > i` 守卫：gaps 不足时剩余段不 sleep。
+    #[tokio::test(start_paused = true)]
+    async fn write_padding_fragments_missing_gaps_skipped() {
+        use tokio::io::AsyncReadExt as _;
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let buf = [9u8; 3];
+        let gaps = [std::time::Duration::from_millis(5)];
+        let start = tokio::time::Instant::now();
+        let write = write_padding_fragments(&mut client, &buf, &[1, 1, 1], &gaps);
+        write.await.unwrap();
+        let mut got = [0u8; 3];
+        server.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, buf);
+        // 仅第一段消费 gap，后两段守卫跳过
+        assert_eq!(start.elapsed(), std::time::Duration::from_millis(5));
+    }
 
     #[test]
     fn client_init_parses_keys_and_relay_length() {

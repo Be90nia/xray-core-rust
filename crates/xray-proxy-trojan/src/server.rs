@@ -208,19 +208,13 @@ impl InboundHandler for TrojanServer {
 
 /// Trojan 服务端握手——读取并校验 Trojan 请求头。
 ///
-/// 流程（首字节识别分叉，见 `protocol` 模块文档「trojan v2 草案」节）：
-///
-/// **v1**（首字节为小写 hex）：
-/// 1. 读 56 字节 hex key（首字节已读）
+/// 流程：
+/// 1. 读 56 字节 hex key
 /// 2. `Validator::get_by_key` 校验用户
 /// 3. 读 2 字节 CRLF
 /// 4. 读 1 字节 CMD (`Network`)
 /// 5. 读 addr+port（SOCKS5 格式: ATYP + addr + 2 字节 BE port）
 /// 6. 读 2 字节 CRLF
-///
-/// **v2 草案**（首字节 `0x02`）：
-/// 1. 读 16 字节 `md5(password)`，`Validator::get_by_md5` 校验用户
-/// 2. 读 addr+port（SOCKS5 格式，恒 TCP，无 cmd、无尾 CRLF）
 ///
 /// 验证成功返回 `(network, addr, port, user)`，失败返回 `TrojanError`。
 /// Trojan 协议无握手响应——调用方验证通过后直接开始双向转发。
@@ -233,7 +227,6 @@ impl InboundHandler for TrojanServer {
 /// - [`TrojanError::ReadCommand`]: CMD 非法
 /// - [`TrojanError::ReadAddressPort`]: addr/port 解析失败
 /// - [`TrojanError::HandshakeTimeout`]: 整段握手读超时（60s）
-/// - [`TrojanError::InvalidVersionPrefix`]: 首字节非 v1 hex 且非 v2 `0x02`
 pub async fn trojan_server_handshake<S>(
     stream: &mut S,
     validator: &Validator,
@@ -256,7 +249,7 @@ where
 
 /// 从流中读取 SOCKS5 格式 addr+port（先读 ATYP 确定后续长度）。
 ///
-/// v1 / v2 草案握手共用；对应 Go `addrParser.ReadAddressPort`。
+/// 对应 Go `addrParser.ReadAddressPort`。
 async fn read_addr_port_from_stream<S>(
     stream: &mut S,
 ) -> crate::Result<(Address, u16)>
@@ -328,45 +321,19 @@ async fn trojan_server_handshake_inner<S>(
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin + Send,
 {
-    // 1. 读首字节判协议版本：v1 hex key 起始 / v2 草案 0x02 / 其余拒绝（→ fallback）。
-    //    v1 key 恒为小写 hex，首字节 ∈ 0x30-0x39 / 0x61-0x66，与 0x02 零冲突。
-    let mut first = [0u8; 1];
-    stream
-        .read_exact(&mut first)
-        .await
-        .map_err(|e| crate::TrojanError::ReadUserHash(format!("read version: {e}")))?;
-
-    if first[0] == crate::protocol::V2_VERSION {
-        // trojan v2 草案：[0x02][16B md5(password)][addr+port]，无 cmd、无尾 CRLF，恒 TCP。
-        let mut md5_buf = [0u8; crate::protocol::MD5_KEY_LEN];
-        stream
-            .read_exact(&mut md5_buf)
-            .await
-            .map_err(|e| crate::TrojanError::ReadUserHash(format!("read md5 key: {e}")))?;
-        let user = validator
-            .get_by_md5(&md5_buf)
-            .ok_or(crate::TrojanError::UserNotFound)?;
-        let (addr, port) = read_addr_port_from_stream(stream).await?;
-        return Ok((Network::Tcp, addr, port, user));
-    }
-    if !crate::protocol::is_v1_hex_prefix(first[0]) {
-        return Err(crate::TrojanError::InvalidVersionPrefix(first[0]));
-    }
-
-    // 2. v1：首字节即 56 字节 hex key 的第 1 字节，补读剩余 55 字节
+    // 1. 读 56 字节 hex key
     let mut key_buf = [0u8; 56];
-    key_buf[0] = first[0];
     stream
-        .read_exact(&mut key_buf[1..])
+        .read_exact(&mut key_buf)
         .await
         .map_err(|e| crate::TrojanError::ReadUserHash(format!("read key: {e}")))?;
 
-    // 3. 校验 key via Validator
+    // 2. 校验 key via Validator
     let user = validator
         .get_by_key(&key_buf)
         .ok_or_else(|| crate::TrojanError::UserNotFound)?;
 
-    // 4. 读 CRLF
+    // 3. 读 CRLF
     let mut crlf = [0u8; 2];
     stream
         .read_exact(&mut crlf)
@@ -378,17 +345,17 @@ where
         )));
     }
 
-    // 5. 读 1 字节 CMD
+    // 4. 读 1 字节 CMD
     let mut cmd_buf = [0u8; 1];
     stream
         .read_exact(&mut cmd_buf)
         .await
         .map_err(|e| crate::TrojanError::ReadCommand(format!("read cmd: {e}")))?;
     let network = Network::from_command(cmd_buf[0]);
-    // 6. 读 addr+port（SOCKS5 格式，v1/v2 共用）
+    // 5. 读 addr+port（SOCKS5 格式）
     let (addr, port) = read_addr_port_from_stream(stream).await?;
 
-    // 7. 读结尾 CRLF
+    // 6. 读结尾 CRLF
     stream
         .read_exact(&mut crlf)
         .await
@@ -1058,112 +1025,5 @@ mod tests {
             calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
             "udp relay must go through dispatcher"
         );
-    }
-    // ========================================================================
-    // trojan v2 草案握手
-    // ========================================================================
-
-    fn v2_header(password: &str, addr_bytes: &[u8], atyp: u8, port: u16) -> Vec<u8> {
-        let mut header = vec![crate::protocol::V2_VERSION];
-        header.extend_from_slice(&crate::config::md5_key(password));
-        header.push(atyp);
-        header.extend_from_slice(addr_bytes);
-        header.extend_from_slice(&port.to_be_bytes());
-        header
-    }
-
-    /// v2 草案握手（IPv4）：恒 TCP、无 cmd、无尾 CRLF，payload 从 header 末尾起。
-    #[tokio::test]
-    async fn handshake_v2_ipv4_succeeds() {
-        let validator = make_validator_with_user("password");
-        let mut buf = v2_header("password", &[127, 0, 0, 1], addr_type::IPV4, 8080);
-        buf.extend_from_slice(b"payload");
-        let mut cursor = std::io::Cursor::new(buf);
-        let result = trojan_server_handshake(&mut cursor, &validator, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT).await;
-        let (network, addr, port, user) = result.expect("v2 handshake must succeed");
-        assert_eq!(network, Network::Tcp);
-        match addr {
-            Address::IPv4(v4) => assert_eq!(v4.octets(), [127, 0, 0, 1]),
-            _ => panic!("expected IPv4"),
-        }
-        assert_eq!(port, 8080);
-        assert_eq!(user.email, "user@example.com");
-        // payload 紧跟 header（无尾 CRLF）：buffer 位置 = header 长度
-        assert_eq!(cursor.position(), 1 + 16 + 1 + 4 + 2);
-    }
-
-    /// v2 草案握手（Domain 目标）。
-    #[tokio::test]
-    async fn handshake_v2_domain_succeeds() {
-        let validator = make_validator_with_user("password");
-        let mut header = vec![crate::protocol::V2_VERSION];
-        header.extend_from_slice(&crate::config::md5_key("password"));
-        header.push(addr_type::DOMAIN);
-        header.push(b"example.com".len() as u8);
-        header.extend_from_slice(b"example.com");
-        header.extend_from_slice(&443u16.to_be_bytes());
-        let mut cursor = std::io::Cursor::new(header);
-        let result = trojan_server_handshake(&mut cursor, &validator, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT).await;
-        let (_, addr, port, _) = result.expect("v2 domain handshake must succeed");
-        match addr {
-            Address::Domain(d) => assert_eq!(d, "example.com"),
-            _ => panic!("expected Domain"),
-        }
-        assert_eq!(port, 443);
-    }
-
-    /// v1/v2 识别分叉：同一 validator、同一密码，v1 头与 v2 头都握手成功
-    /// 且解析出同一用户。
-    #[tokio::test]
-    async fn handshake_v1_v2_same_validator_fork() {
-        let validator = make_validator_with_user("password");
-
-        // v1 头
-        let mut v1 = Vec::new();
-        v1.extend_from_slice(&hex_sha224("password"));
-        v1.extend_from_slice(&CRLF);
-        v1.push(COMMAND_TCP);
-        v1.push(addr_type::IPV4);
-        v1.extend_from_slice(&[10, 0, 0, 1]);
-        v1.extend_from_slice(&1u16.to_be_bytes());
-        v1.extend_from_slice(&CRLF);
-
-        // v2 头
-        let v2 = v2_header("password", &[10, 0, 0, 2], addr_type::IPV4, 2);
-
-        let r1 = trojan_server_handshake(&mut std::io::Cursor::new(v1), &validator, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT).await;
-        let r2 = trojan_server_handshake(&mut std::io::Cursor::new(v2), &validator, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT).await;
-        let (_, _, _, u1) = r1.expect("v1 handshake");
-        let (_, _, _, u2) = r2.expect("v2 handshake");
-        assert_eq!(u1, u2, "v1/v2 must resolve to the same user");
-    }
-
-    /// v2 错误密码 → UserNotFound（与 v1 拒绝语义一致，走 fallback）。
-    #[tokio::test]
-    async fn handshake_v2_wrong_password_rejected() {
-        let validator = make_validator_with_user("password");
-        let header = v2_header("wrong-password", &[127, 0, 0, 1], addr_type::IPV4, 80);
-        let mut cursor = std::io::Cursor::new(header);
-        let result = trojan_server_handshake(&mut cursor, &validator, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT).await;
-        assert!(
-            matches!(result, Err(crate::TrojanError::UserNotFound)),
-            "wrong md5 must be rejected, got {result:?}"
-        );
-    }
-
-    /// 非法版本前缀（非 v1 hex 且非 0x02）→ InvalidVersionPrefix 拒绝。
-    #[tokio::test]
-    async fn handshake_invalid_version_prefix_rejected() {
-        let validator = make_validator_with_user("password");
-        for first in [0x00u8, 0x01, 0x03, 0x07, 0x20, 0xFF, b'g', b'G'] {
-            let mut header = vec![first];
-            header.extend_from_slice(&[1, 127, 0, 0, 1, 0, 80]);
-            let mut cursor = std::io::Cursor::new(header);
-            let result = trojan_server_handshake(&mut cursor, &validator, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT).await;
-            assert!(
-                matches!(result, Err(crate::TrojanError::InvalidVersionPrefix(_))),
-                "prefix {first:#04x} must be rejected as invalid version"
-            );
-        }
     }
 }

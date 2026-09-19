@@ -76,18 +76,15 @@ impl MemoryUser {
 }
 
 
-/// Trojan 用户验证器：维护 email、hex(key)、md5(key) 三索引。
+/// Trojan 用户验证器：维护 email 与 hex(key) 双索引。
 ///
-/// 对应 Go `proxy/trojan/validator.go::Validator`（Go 仅前两者；
-/// md5 索引服务 trojan v2 草案握手，见 `protocol` 模块文档 v2 节）。
+/// 对应 Go `proxy/trojan/validator.go::Validator`。
 #[derive(Debug, Default)]
 pub struct Validator {
     /// email（小写）→ MemoryUser
     email: DashMap<String, MemoryUser>,
     /// hex(sha224(password)) → MemoryUser
     users: DashMap<String, MemoryUser>,
-    /// md5(password) → MemoryUser（trojan v2）
-    md5_users: DashMap<[u8; 16], MemoryUser>,
 }
 
 impl Validator {
@@ -111,9 +108,7 @@ impl Validator {
             self.email.insert(email_lower, user.clone());
         }
         let key_hash = user.key_hash();
-        self.users.insert(key_hash, user.clone());
-        self.md5_users
-            .insert(crate::config::md5_key(&user.account.password), user);
+        self.users.insert(key_hash, user);
         Ok(())
     }
 
@@ -134,8 +129,6 @@ impl Validator {
             .remove(&email_lower)
             .ok_or_else(|| TrojanError::UserNotFoundByEmail(email.into()))?;
         self.users.remove(&user.key_hash());
-        self.md5_users
-            .remove(&crate::config::md5_key(&user.account.password));
         Ok(())
     }
 
@@ -175,11 +168,6 @@ impl Validator {
     /// 按 56 字节 hex key 直接查找（便捷方法，等价于 `get(&hex_string(key))`）。
     pub fn get_by_key(&self, key: &[u8]) -> Option<MemoryUser> {
         self.get(&hex_string(key))
-    }
-
-    /// 按 16 字节 `md5(password)` 查找用户（trojan v2 草案握手）。
-    pub fn get_by_md5(&self, key: &[u8; 16]) -> Option<MemoryUser> {
-        self.md5_users.get(key).map(|r| r.clone())
     }
 
 }
@@ -316,22 +304,5 @@ mod tests {
             h.join().expect("thread");
         }
         assert_eq!(v.get_count(), 10);
-    }
-
-    #[test]
-    fn test_get_by_md5() {
-        let v = Validator::new();
-        v.add(user("v2@x.com", "secret")).expect("add");
-
-        let key = crate::config::md5_key("secret");
-        let hit = v.get_by_md5(&key).expect("md5 key must hit");
-        assert_eq!(hit.email, "v2@x.com");
-
-        // 错误密码摘要不命中
-        assert!(v.get_by_md5(&crate::config::md5_key("wrong")).is_none());
-
-        // del 后 md5 索引同步失效
-        v.del("v2@x.com").expect("del");
-        assert!(v.get_by_md5(&key).is_none());
     }
 }

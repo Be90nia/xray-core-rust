@@ -145,6 +145,10 @@ pub fn parse_padding(padding: &str) -> Result<(Vec<PaddingTriple>, Vec<PaddingTr
 /// Go `CreatPadding` 默认 length 配置（common.go:261-262）：空配置兜底。
 const DEFAULT_PADDING_LENS: [PaddingTriple; 2] = [[100, 111, 1111], [50, 0, 3333]];
 
+/// Go `CreatPadding` 默认 gap 配置（common.go:263）：仅 lens 空时随 lens 一并兜底
+/// （自定义 lens 但空 gaps = 用户显式关闭间歇写，Go 同样不兜底）。
+const DEFAULT_PADDING_GAPS: [PaddingTriple; 1] = [[75, 0, 111]];
+
 /// Go `crypto.RandBetween` 语义（crypto.go:13-19）：均匀 `[from, to)`；
 /// `to-from ≤ 1` 恒返回 from（Go `rand.Int(to-from)` 上界开区间）。
 fn rand_between<R: rand::Rng>(rng: &mut R, from: u32, to: u32) -> u32 {
@@ -155,30 +159,47 @@ fn rand_between<R: rand::Rng>(rng: &mut R, from: u32, to: u32) -> u32 {
     }
 }
 
-/// 随机 padding 总长生成（对应 Go `CreatPadding`，common.go:259-280）。
+/// 随机 padding 生成（对应 Go `CreatPadding`，common.go:259-280），产出
+/// `(总长, 分段 lens, 段间 gaps)`。
 ///
 /// 每个三元组 `[base, min, max]`：以 `base >= RandBetween(0,100)`（即 base%）
-/// 概率命中取 `RandBetween(min, max)`，否则 0；总长为各段之和。空配置用 Go
-/// 默认 `{100,111,1111},{50,0,3333}`（总长 111..4444）。
-///
-/// Go 同时生成的分段 lens 与 gaps（间歇写流量整形）此处未消费——分段间歇
-/// 写登记为 iq1o 后续项；本函数只产出总长。
+/// 概率命中取 `RandBetween(min, max)`，否则 0；gaps 单位毫秒。空 lens 配置用
+/// Go 默认 `{100,111,1111},{50,0,3333}` + gaps `{75,0,111}`（common.go:261-263）。
 #[must_use]
-pub fn creat_padding<R: rand::Rng>(padding_lens: &[PaddingTriple], rng: &mut R) -> usize {
-    let lens: &[PaddingTriple] = if padding_lens.is_empty() {
-        &DEFAULT_PADDING_LENS
+pub fn creat_padding<R: rand::Rng>(
+    padding_lens: &[PaddingTriple],
+    padding_gaps: &[PaddingTriple],
+    rng: &mut R,
+) -> (usize, Vec<u32>, Vec<std::time::Duration>) {
+    // Go common.go:260-263：gaps 默认与 lens 空联动，非独立兜底。
+    let (lens, gaps): (&[PaddingTriple], &[PaddingTriple]) = if padding_lens.is_empty() {
+        (&DEFAULT_PADDING_LENS, &DEFAULT_PADDING_GAPS)
     } else {
-        padding_lens
+        (padding_lens, padding_gaps)
     };
-    lens.iter()
+    // rng 消耗顺序对齐 Go：先全部 lens，再全部 gaps。
+    let seg_lens: Vec<u32> = lens
+        .iter()
         .map(|y| {
             if y[0] >= rand_between(rng, 0, 100) {
-                rand_between(rng, y[1], y[2]) as usize
+                rand_between(rng, y[1], y[2])
             } else {
                 0
             }
         })
-        .sum()
+        .collect();
+    let length = seg_lens.iter().map(|&l| l as usize).sum();
+    let seg_gaps: Vec<std::time::Duration> = gaps
+        .iter()
+        .map(|y| {
+            if y[0] >= rand_between(rng, 0, 100) {
+                std::time::Duration::from_millis(u64::from(rand_between(rng, y[1], y[2])))
+            } else {
+                std::time::Duration::ZERO
+            }
+        })
+        .collect();
+    (length, seg_lens, seg_gaps)
 }
 
 #[cfg(test)]
@@ -333,5 +354,65 @@ mod tests {
             VlessError::Other(msg) => assert!(msg.contains("invalid padding")),
             _ => panic!("unexpected error: {err:?}"),
         }
+    }
+
+    // === creat_padding gaps（Go CreatPadding common.go:259-280）===
+
+    use rand::{rngs::StdRng, SeedableRng};
+
+    #[test]
+    fn creat_padding_default_lens_yields_default_gaps() {
+        // 空 lens → Go 默认联动：lens 2 段 + gaps 1 项（{75,0,111}，值域 0..111ms）
+        let mut rng = StdRng::seed_from_u64(1);
+        let (length, lens, gaps) = creat_padding(&[], &[], &mut rng);
+        assert_eq!(lens.len(), 2);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(length, lens.iter().map(|&l| l as usize).sum::<usize>());
+        assert!(gaps[0] <= std::time::Duration::from_millis(111));
+    }
+
+    #[test]
+    fn creat_padding_custom_lens_keeps_empty_gaps() {
+        // Go common.go:260-263：gaps 默认只与 lens 空联动；自定义 lens + 空 gaps
+        // = 显式关闭间歇写，不兜底。
+        let mut rng = StdRng::seed_from_u64(2);
+        let (_, _, gaps) = creat_padding(&[[100, 111, 1111]], &[], &mut rng);
+        assert!(gaps.is_empty());
+    }
+
+    #[test]
+    fn creat_padding_gap_prob_and_range() {
+        // base=100 恒命中；min==max 时 RandBetween 恒 from → 确定值
+        let mut rng = StdRng::seed_from_u64(3);
+        let (_, _, gaps) = creat_padding(
+            &[[100, 111, 1111]],
+            &[[100, 5, 6], [100, 0, 0]],
+            &mut rng,
+        );
+        assert_eq!(
+            gaps,
+            vec![
+                std::time::Duration::from_millis(5),
+                std::time::Duration::ZERO,
+            ]
+        );
+
+        // base=50：约半数 unhit → ZERO；命中值 ⊆ 10..20ms（宽界统计）
+        let mut rng = StdRng::seed_from_u64(4);
+        let mut zeros = 0;
+        for _ in 0..1000 {
+            let (_, _, gaps) = creat_padding(&[[100, 111, 1111]], &[[50, 10, 20]], &mut rng);
+            assert!(
+                gaps[0].is_zero() || gaps[0] >= std::time::Duration::from_millis(10),
+                "gap 值 {gaps:?} 越界：应 ZERO（unhit）或 ≥10ms"
+            );
+            if gaps[0].is_zero() {
+                zeros += 1;
+            }
+        }
+        assert!(
+            (300..700).contains(&zeros),
+            "base=50 应约半数 unhit，实际 {zeros}/1000"
+        );
     }
 }
