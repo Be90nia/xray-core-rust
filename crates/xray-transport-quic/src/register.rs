@@ -17,10 +17,11 @@ use xray_transport::listener_registry::{TransportListenFn, register_transport_li
 ///
 /// 幂等：重复调用忽略 `AlreadyExists`（对齐 Go `init()` 在测试中多次执行的容错）。
 pub fn register_dialer() -> io::Result<()> {
-    let dialer: TransportDialFn = Arc::new(move |dest, _sockopt, settings| {
+    let dialer: TransportDialFn = Arc::new(move |dest, sockopt, settings| {
         let dest = dest.clone();
+        let sockopt = sockopt.clone();
         let settings = settings.clone();
-        Box::pin(async move { crate::transport::dial(&dest, &settings).await })
+        Box::pin(async move { crate::transport::dial(&dest, &settings, &sockopt).await })
     });
     let _ = register_transport_dialer("quic", dialer);
     Ok(())
@@ -30,10 +31,11 @@ pub fn register_dialer() -> io::Result<()> {
 ///
 /// 幂等：重复调用忽略 `AlreadyExists`。
 pub fn register_listener() -> io::Result<()> {
-    let listen_fn: TransportListenFn = Arc::new(move |addr, settings, _sockopt, handler| {
+    let listen_fn: TransportListenFn = Arc::new(move |addr, settings, sockopt, handler| {
         let settings = settings.clone();
+        let sockopt = sockopt.clone();
         let handler = handler.clone();
-        Box::pin(async move { crate::transport::listen(addr, &settings, handler).await })
+        Box::pin(async move { crate::transport::listen(addr, &settings, &sockopt, handler).await })
     });
     let _ = register_transport_listener("quic", listen_fn);
     Ok(())

@@ -111,6 +111,9 @@ pub struct TuicConnectOptions {
     /// Brutal 上行带宽（bps）。仅 [`CongestionControl::HysteriaBrutal`] 消费；
     /// 0（默认）= 未配置 → 回落 BBR。
     pub brutal_up_bps: u64,
+    /// QUIC 端点 UDP socket 选项（缓冲调谐消费；默认空 = Go quic-go `wrapConn`
+    /// 8MB 下限语义，见 [`xray_transport::sockopt::bind_udp_endpoint`]）。
+    pub sockopt: xray_transport::sockopt::SocketOptions,
 }
 
 impl Default for TuicConnectOptions {
@@ -120,6 +123,7 @@ impl Default for TuicConnectOptions {
             heartbeat: std::time::Duration::from_secs(3),
             udp_relay_mode: UdpRelayMode::Native,
             brutal_up_bps: 0,
+            sockopt: xray_transport::sockopt::SocketOptions::default(),
         }
     }
 }
@@ -216,10 +220,12 @@ impl TuicClient {
         // 获取或新建连接
         let congestion_control = options.congestion_control;
         let brutal_up_bps = options.brutal_up_bps;
+        let sockopt = options.sockopt.clone();
         let pooled = reconnect
             .get_or_reconnect(|| {
                 let rustls_config = rustls_config.clone();
                 let server_name = server_name.to_string();
+                let sockopt = sockopt.clone();
                 async move {
                     Self::create_quic_connection(
                         server_addr,
@@ -227,6 +233,7 @@ impl TuicClient {
                         rustls_config,
                         congestion_control,
                         brutal_up_bps,
+                        sockopt,
                     )
                     .await
                 }
@@ -276,6 +283,7 @@ impl TuicClient {
         rustls_config: Arc<rustls::ClientConfig>,
         congestion_control: CongestionControl,
         brutal_up_bps: u64,
+        sockopt: xray_transport::sockopt::SocketOptions,
     ) -> Result<quinn::Connection> {
         // TUIC v5 要求 ALPN；仅在未配置时用默认 [h3, tuic]，用户 alpn 不覆盖（bd 7p0）
         let mut rustls_config = (*rustls_config).clone();
@@ -305,9 +313,15 @@ impl TuicClient {
         } else {
             "0.0.0.0:0".parse().unwrap()
         };
-        let mut endpoint = quinn::Endpoint::client(local_bind).map_err(|e| {
-            TuicError::Io(std::io::Error::other(format!("endpoint bind: {e}")))
-        })?;
+        let std_sock = xray_transport::sockopt::bind_udp_endpoint(local_bind, &sockopt)
+            .map_err(|e| TuicError::Io(std::io::Error::other(format!("endpoint bind: {e}"))))?;
+        let mut endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            std_sock,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .map_err(|e| TuicError::Io(std::io::Error::other(format!("endpoint bind: {e}"))))?;
         endpoint.set_default_client_config(quinn_client_cfg);
 
         let conn = endpoint

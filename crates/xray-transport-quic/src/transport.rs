@@ -33,11 +33,16 @@ use xray_common::net::destination::Destination;
 use xray_transport::connection::Connection;
 use xray_transport::dialer::StreamSettings;
 use xray_transport::listener_registry::{ConnHandler, TransportListener};
+use xray_transport::sockopt::SocketOptions;
 
 /// 主动拨号 QUIC 连接。对应 Go `quic::Dial`。
 ///
 /// `settings.security` 必须为 `"tls"`（QUIC 强制 TLS）；否则返回 `InvalidInput`。
-pub async fn dial(dest: &Destination, settings: &StreamSettings) -> io::Result<Box<dyn Connection>> {
+pub async fn dial(
+    dest: &Destination,
+    settings: &StreamSettings,
+    sockopt: &SocketOptions,
+) -> io::Result<Box<dyn Connection>> {
     // 1. TLS client config（QUIC 强制 TLS，无 None 兜底）。
     let sni = dest.address().to_string();
     let tls_cfg = xray_tls::client_config::build_client_config(
@@ -82,6 +87,7 @@ pub async fn dial(dest: &Destination, settings: &StreamSettings) -> io::Result<B
         None,
         "0.0.0.0:0".parse().unwrap(),
         qc.disable_gso,
+        sockopt,
     )
     .map_err(|e| io::Error::other(format!("quinn bind: {e}")))?;
     let connecting = endpoint
@@ -109,6 +115,7 @@ pub async fn dial(dest: &Destination, settings: &StreamSettings) -> io::Result<B
 pub async fn listen(
     addr: SocketAddr,
     settings: &StreamSettings,
+    sockopt: &SocketOptions,
     handler: ConnHandler,
 ) -> io::Result<Box<dyn TransportListener>> {
     let tls_cfg = xray_tls::server_config::build_server_config(
@@ -129,8 +136,9 @@ pub async fn listen(
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
     server_config.transport_config(Arc::new(qc.build_transport_config()));
     // 同 dial：GSO 默认开，disableGSO=true 走 NoGsoSocket 单段路径。
-    let endpoint = crate::udp_gso::make_endpoint(Some(server_config), addr, qc.disable_gso)
-        .map_err(|e| io::Error::other(format!("quinn bind: {e}")))?;
+    let endpoint =
+        crate::udp_gso::make_endpoint(Some(server_config), addr, qc.disable_gso, sockopt)
+            .map_err(|e| io::Error::other(format!("quinn bind: {e}")))?;
     let local = endpoint.local_addr()?;
 
     // endpoint clone 给 listener 句柄；本体 move 进 accept task。
@@ -334,7 +342,7 @@ mod tests {
             ..Default::default()
         };
         let handler: ConnHandler = Arc::new(|_| {});
-        let listener = listen("127.0.0.1:0".parse().unwrap(), &settings, handler)
+        let listener = listen("127.0.0.1:0".parse().unwrap(), &settings, &Default::default(), handler)
             .await
             .expect("listen");
         let addr = listener.local_addr().unwrap();
@@ -384,7 +392,7 @@ mod tests {
             transport_json: Some(serde_json::json!({ "disableGSO": disable_gso })),
             ..Default::default()
         };
-        let listener = listen("127.0.0.1:0".parse().unwrap(), &settings, echo_handler())
+        let listener = listen("127.0.0.1:0".parse().unwrap(), &settings, &Default::default(), echo_handler())
             .await
             .expect("listen");
         let addr = listener.local_addr().unwrap();

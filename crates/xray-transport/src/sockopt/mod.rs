@@ -32,7 +32,7 @@ pub mod darwin;
 #[cfg(target_os = "freebsd")]
 pub mod freebsd;
 use std::time::Duration;
-use socket2::Socket;
+use socket2::{Domain, Protocol, Socket, Type};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "windows")]
@@ -298,6 +298,12 @@ pub struct SocketOptions {
     /// 超过 `net.core.rmem_max` 的值被内核静默钳制。inbound（accept 后 per-conn）
     /// 与 outbound（拨号前）同字段生效。
     pub receive_buffer_size: i32,
+    /// SO_SNDBUF 发送缓冲（字节）。JSON `sendBufferSize`。`0`=不设置。与
+    /// [`SocketOptions::receive_buffer_size`] 同为 opt-in 运维扩展（Go `SocketConfig`
+    /// 无此字段，JSON 命名对齐其 camelCase 风格）。TCP 路径不消费；QUIC 系 UDP
+    /// 端点消费（见 [`bind_udp_endpoint`]）。超过 `net.core.wmem_max` 的值被内核
+    /// 静默钳制。
+    pub send_buffer_size: i32,
     /// splithttp 拨号时下载连接继承本 sockopt。对应 Go `SocketConfig.Penetrate`
     /// （字段 18，JSON `penetrate`；消费点 splithttp/dialer.go:387）。
     pub penetrate: bool,
@@ -381,6 +387,7 @@ impl Default for SocketOptions {
             tcp_user_timeout: 0,
             tcp_max_seg: 0,
             receive_buffer_size: 0,
+            send_buffer_size: 0,
             penetrate: false,
             custom_sockopt: Vec::new(),
         }
@@ -575,6 +582,127 @@ pub fn apply_inbound_socket_options(socket: &Socket, opts: &SocketOptions) -> st
     #[cfg(not(target_os = "freebsd"))]
     apply_custom_sockopt(socket, opts)?;
     Ok(())
+}
+
+/// Go quic-go `wrapConn` 的 socket 缓冲默认下限。对应 apernet/quic-go
+/// `internal/protocol/params.go:5-9`（Xray fork v0.61.1）：`DesiredReceiveBufferSize`
+/// 与 `DesiredSendBufferSize` 同为 8MB。Go 侧在每个 QUIC UDP socket 上自动应用
+/// （`sys_conn.go:51-53`），Rust quinn-udp 无对应行为——本常量是 [`bind_udp_endpoint`]
+/// 默认路径的 parity 下限。
+const QUIC_UDP_MIN_BUFFER: usize = 8 << 20;
+
+/// QUIC 系 UDP 端点 socket 创建：族匹配的 DGRAM socket + 缓冲调谐 + bind。
+///
+/// 对应 Go `transport/internet/quic` 拨号/监听前的 socket 工厂位（Go 侧缓冲由
+/// quic-go `wrapConn` 自动处理）。缓冲语义（对齐 PM 拍板方案 C）：
+///
+/// 1. `receive_buffer_size` / `send_buffer_size` 显式 `> 0`：直接设置（优先于默认
+///    下限；失败仅 `warn` 不阻断——超过 `rmem_max`/`wmem_max` 的值内核静默钳制，
+///    缓冲是优化非正确性需求，硬错反而害配置可移植性）。
+/// 2. 显式值缺省（`0`）：Go `wrapConn` 下限语义——回读当前值，≥8MB 不动（只升不降），
+///    <8MB 提到 8MB；Linux 上 setsockopt 失败（EPERM 等）再试 `SO_RCVBUFFORCE` /
+///    `SO_SNDBUFFORCE`（需 CAP_NET_ADMIN，对齐 Go `forceSetReceiveBuffer`）；
+///    仍失败仅 `warn`。
+///
+/// 返回的 socket 已设 nonblocking（quinn `wrap_udp_socket` 要求）并完成 bind。
+/// IPv6 地址默认关 `IPV6_V6ONLY`（dual-stack，对齐 quinn `Endpoint::client`
+/// endpoint.rs:77-78 与 std::net UDP 行为）；`opts.ipv6_only` 显式 `true` 时反之。
+///
+/// # Errors
+///
+/// socket 创建 / bind 失败照常传播（硬错）；缓冲设置失败不传播（见上）。
+pub fn bind_udp_endpoint(
+    addr: std::net::SocketAddr,
+    opts: &SocketOptions,
+) -> std::io::Result<std::net::UdpSocket> {
+    let sock = Socket::new(
+        Domain::for_address(addr),
+        Type::DGRAM,
+        Some(Protocol::UDP),
+    )?;
+    let v6only = addr.is_ipv6() && opts.ipv6_only;
+    let _ = sock.set_only_v6(v6only);
+    tune_udp_buffer(&sock, opts.receive_buffer_size, UdpBufDir::Recv);
+    tune_udp_buffer(&sock, opts.send_buffer_size, UdpBufDir::Send);
+    sock.set_nonblocking(true)?;
+    sock.bind(&addr.into())?;
+    Ok(std::net::UdpSocket::from(sock))
+}
+
+/// 缓冲调谐方向（SO_RCVBUF / SO_SNDBUF 两分支逻辑对称，仅常量不同）。
+#[derive(Clone, Copy, Debug)]
+enum UdpBufDir {
+    Recv,
+    Send,
+}
+
+impl UdpBufDir {
+    fn get(self, sock: &Socket) -> std::io::Result<usize> {
+        match self {
+            Self::Recv => sock.recv_buffer_size(),
+            Self::Send => sock.send_buffer_size(),
+        }
+    }
+
+    fn set(self, sock: &Socket, bytes: usize) -> std::io::Result<()> {
+        match self {
+            Self::Recv => sock.set_recv_buffer_size(bytes),
+            Self::Send => sock.set_send_buffer_size(bytes),
+        }
+    }
+
+    /// Linux `SO_RCVBUFFORCE`（33）/ `SO_SNDBUFFORCE`（7）raw setsockopt。
+    /// 对齐 Go `sys_conn_buffers_linux.go::forceSetReceiveBuffer`。
+    #[cfg(target_os = "linux")]
+    fn force(self, sock: &Socket, bytes: usize) -> std::io::Result<()> {
+        let opt = match self {
+            Self::Recv => libc::SO_RCVBUFFORCE,
+            Self::Send => libc::SO_SNDBUFFORCE,
+        };
+        let v = libc::c_int::try_from(bytes)
+            .map_err(|_| std::io::Error::other("buffer size overflows c_int"))?;
+        let r = unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                opt,
+                &v as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if r == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
+/// 单方向缓冲调谐：显式值优先直接设置；缺省走 Go `wrapConn` 下限语义。
+fn tune_udp_buffer(sock: &Socket, explicit: i32, dir: UdpBufDir) {
+    if explicit > 0 {
+        if let Err(e) = dir.set(sock, explicit as usize) {
+            tracing::warn!(?dir, explicit, "UDP buffer setsockopt failed (kernel may clamp): {e}");
+        }
+        return;
+    }
+    // 下限语义：当前值已达标则不动（只升不降）。
+    if matches!(dir.get(sock), Ok(cur) if cur >= QUIC_UDP_MIN_BUFFER) {
+        return;
+    }
+    if dir.set(sock, QUIC_UDP_MIN_BUFFER).is_ok() {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    if dir.force(sock, QUIC_UDP_MIN_BUFFER).is_ok() {
+        return;
+    }
+    tracing::warn!(
+        ?dir,
+        "failed to raise UDP socket buffer to {} bytes (need CAP_NET_ADMIN for FORCE on Linux); \
+         consider net.core.rmem_max/wmem_max",
+        QUIC_UDP_MIN_BUFFER
+    );
 }
 
 /// 应用 [`SocketOptions::custom_sockopt`]。对应 Go 各平台 apply*SocketOptions 的
@@ -1099,6 +1227,65 @@ mod tests {
         let off = make();
         apply_inbound_socket_options(&off, &SocketOptions::default()).unwrap();
         assert_eq!(rcvbuf(&off), default_rcv, "默认 0 不应触碰 SO_RCVBUF");
+    }
+
+    // ===== QUIC 系 UDP 端点缓冲（Go quic-go wrapConn parity，PM 拍板方案 C）=====
+
+    /// 裸 UDP socket 的内核默认缓冲（对照基线，不经 helper）。
+    fn raw_default_udp_bufs() -> (usize, usize) {
+        let s = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap();
+        (s.recv_buffer_size().unwrap(), s.send_buffer_size().unwrap())
+    }
+
+    /// 显式值路径：`receiveBufferSize`/`sendBufferSize` 直接设置并回读放大
+    /// （对齐 TCP o93t 测试的相对比较策略——Linux 回读含 ×2 记账与 rmem/wmem_max
+    /// 钳制，Windows 回读=原值，绝对值断言不可移植）。
+    #[test]
+    fn bind_udp_endpoint_explicit_buffers_apply() {
+        let (d_recv, d_send) = raw_default_udp_bufs();
+        let opts = SocketOptions {
+            receive_buffer_size: 1 << 20,
+            send_buffer_size: 1 << 20,
+            ..Default::default()
+        };
+        let sock = bind_udp_endpoint("127.0.0.1:0".parse().unwrap(), &opts).unwrap();
+        let s2 = socket2::SockRef::from(&sock);
+        assert!(
+            s2.recv_buffer_size().unwrap() > d_recv,
+            "显式 receiveBufferSize 必须放大 SO_RCVBUF: got={} default={d_recv}",
+            s2.recv_buffer_size().unwrap()
+        );
+        assert!(
+            s2.send_buffer_size().unwrap() > d_send,
+            "显式 sendBufferSize 必须放大 SO_SNDBUF: got={} default={d_send}",
+            s2.send_buffer_size().unwrap()
+        );
+    }
+
+    /// 默认路径（Go wrapConn 下限语义）：bind 成功、回读不低于内核默认（只升不降）。
+    /// rmem/wmem_max < 8MB 的机器（CI 默认 208KB）内核会钳制且 FORCE 需 CAP_NET_ADMIN，
+    /// 回读可能仍低于 8MB——故只断言不降，不断言达到 8MB。
+    #[test]
+    fn bind_udp_endpoint_default_raises_floor_only() {
+        let (d_recv, d_send) = raw_default_udp_bufs();
+        let sock =
+            bind_udp_endpoint("127.0.0.1:0".parse().unwrap(), &SocketOptions::default()).unwrap();
+        let s2 = socket2::SockRef::from(&sock);
+        assert!(s2.recv_buffer_size().unwrap() >= d_recv);
+        assert!(s2.send_buffer_size().unwrap() >= d_send);
+    }
+
+    /// IPv6 地址可 bind（族匹配 + dual-stack 路径）。
+    #[test]
+    fn bind_udp_endpoint_ipv6() {
+        let sock =
+            bind_udp_endpoint("[::1]:0".parse().unwrap(), &SocketOptions::default()).unwrap();
+        assert!(sock.local_addr().unwrap().is_ipv6());
     }
 
     // ===== DomainStrategy / AddressPortStrategy（bd 5y8，Go config.go:13-26）=====

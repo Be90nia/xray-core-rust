@@ -186,6 +186,7 @@ impl StreamSettings {
             "tcpMaxSeg",
             "tcpUserTimeout",
             "receiveBufferSize",
+            "sendBufferSize",
             "tcpKeepAliveInterval",
             "tcpKeepAliveIdle",
         ] {
@@ -210,8 +211,8 @@ impl StreamSettings {
     /// `acceptProxyProtocol` / `reusePort` /
     /// `v6only` / `dialerProxy` / `happyEyeballs` / `domainStrategy` /
     /// `addressPortStrategy` / `trustedXForwardedFor` / `tcpWindowClamp` / `tcpMaxSeg` /
-    /// `penetrate` / `tcpUserTimeout`（毫秒）/ `customSockopt` / `receiveBufferSize`
-    /// （本仓库 opt-in，Go 无此字段）。
+    /// `penetrate` / `tcpUserTimeout`（毫秒）/ `customSockopt` / `receiveBufferSize` /
+    /// `sendBufferSize`（本仓库 opt-in，Go 无此字段）。
     /// 缺省字段用 [`SocketOptions::default`]。Go `interface`（接口名字符串）JSON 暂不
     /// 解析（[`SocketOptions::bind_if_index`](crate::sockopt::SocketOptions) 字段已备，
     /// 尚无 JSON 入口）。
@@ -266,6 +267,11 @@ impl StreamSettings {
         // DRC 自动调节）。见 [`SocketOptions::receive_buffer_size`]。
         if let Some(v) = obj.get("receiveBufferSize").and_then(|v| v.as_i64()) {
             opts.receive_buffer_size = v as i32;
+        }
+        // sendBufferSize（SO_SNDBUF 字节；同 receiveBufferSize 的 opt-in 扩展语义，
+        // 消费点 QUIC 系 UDP 端点 [`xray_transport::sockopt::bind_udp_endpoint`]）。
+        if let Some(v) = obj.get("sendBufferSize").and_then(|v| v.as_i64()) {
+            opts.send_buffer_size = v as i32;
         }
         // tproxy（Go `SocketConfig.TProxy` JSON 是字符串枚举：transport_sockopt.go:48，
         // Build() :85-93 仅 "tproxy"/"redirect"（大小写不敏感）启用，其余静默 Off；
@@ -745,7 +751,7 @@ mod transport_cache_tests {
             .expect("string tfo must reject");
         assert!(err.to_string().contains("tcpFastOpen"), "{err}");
         // int32 越界 → 拒。
-        for key in ["mark", "tcpWindowClamp", "tcpMaxSeg", "tcpUserTimeout", "receiveBufferSize"] {
+        for key in ["mark", "tcpWindowClamp", "tcpMaxSeg", "tcpUserTimeout", "receiveBufferSize", "sendBufferSize"] {
             let obj = serde_json::json!({ key: 9_000_000_000i64 });
             let err = StreamSettings::validate_sockopt_json(Some(&obj)).err().expect("must reject");
             assert!(err.to_string().contains(key), "key={key} err={err}");
@@ -757,6 +763,7 @@ mod transport_cache_tests {
             "tcpMaxSeg": 536,
             "tcpUserTimeout": 30_000,
             "receiveBufferSize": 1_048_576,
+            "sendBufferSize": 2_097_152,
             "tcpKeepAliveInterval": 30,
             "tcpFastOpen": 65_535
         });
@@ -883,6 +890,7 @@ mod transport_cache_tests {
             "tcpMaxSeg": 1200,
             "tcpUserTimeout": 10000,
             "receiveBufferSize": 1048576,
+            "sendBufferSize": 2097152,
             "penetrate": true,
             "customSockopt": [
                 { "system": "linux", "network": "tcp", "level": "6",
@@ -896,6 +904,8 @@ mod transport_cache_tests {
         assert_eq!(o.tcp_user_timeout, 10000);
         // receiveBufferSize（本仓库 opt-in 扩展）。
         assert_eq!(o.receive_buffer_size, 1048576);
+        // sendBufferSize（本仓库 opt-in 扩展，QUIC 系 UDP 端点消费）。
+        assert_eq!(o.send_buffer_size, 2097152);
         assert!(o.penetrate);
         // customSockopt 列表逐条 roundtrip（Go CustomSockoptConfig 六字段）。
         assert_eq!(o.custom_sockopt.len(), 2);

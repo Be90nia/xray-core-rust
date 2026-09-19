@@ -2766,8 +2766,9 @@ async fn spawn_one_inbound(
             let dispatch = ohm.get_default_handler().ok_or_else(|| {
                 std::io::Error::other("tuic inbound requires a default outbound handler")
             })?;
-            let handler = parse_tuic_inbound_config(&ib.entry.data, &addr)?
-                .with_dispatch(dispatch);
+            let handler =
+                parse_tuic_inbound_config(&ib.entry.data, &addr, ib.stream_settings_json.as_ref())?
+                    .with_dispatch(dispatch);
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                 handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))
             })))
@@ -4078,8 +4079,13 @@ fn parse_loopback_config(data: &[u8]) -> std::io::Result<String> {
 fn parse_tuic_inbound_config(
     data: &[u8],
     addr: &str,
+    stream_settings_json: Option<&serde_json::Value>,
 ) -> std::io::Result<xray_proxy_tuic::TuicInboundHandler> {
     let s = parse_tuic_inbound_settings(data, addr)?;
+    // QUIC 端点缓冲：streamSettings.sockopt 的 receiveBufferSize/sendBufferSize
+    // （缺省 = QUIC 系端点默认 8MB 下限语义，bind_udp_endpoint）。
+    let sockopt = xray_transport::dialer::StreamSettings::from_json(stream_settings_json)
+        .socket_options();
     let config = xray_proxy_tuic::TuicInboundConfig {
         listen: s.bind_addr,
         server_name: s.server_name,
@@ -4089,6 +4095,7 @@ fn parse_tuic_inbound_config(
         key_der: s.key_der,
         congestion_control: s.congestion_control,
         brutal_up_bps: s.brutal_up_bps,
+        sockopt,
     };
     xray_proxy_tuic::TuicInboundHandler::new("", config)
         .map_err(|e| std::io::Error::other(format!("tuic inbound: {e}")))

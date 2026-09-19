@@ -45,6 +45,9 @@ pub struct TuicInboundConfig {
     /// Brutal 上行带宽（bps）；仅 [`CongestionControl::HysteriaBrutal`] 消费，
     /// 0 = 未配置（crate 层回落 BBR，解析层显式拒绝）。
     pub brutal_up_bps: u64,
+    /// QUIC 端点 UDP socket 选项（缓冲调谐消费；默认空 = Go quic-go `wrapConn`
+    /// 8MB 下限语义，见 [`xray_transport::sockopt::bind_udp_endpoint`]）。
+    pub sockopt: xray_transport::sockopt::SocketOptions,
 }
 
 /// 自签证书产物。
@@ -179,10 +182,18 @@ impl InboundHandler for TuicInboundHandler {
             InboundError::ListenError(format!("tuic server config: {e}"))
         })?;
 
+        let std_sock = xray_transport::sockopt::bind_udp_endpoint(self.config.listen, &self.config.sockopt)
+            .map_err(|e| InboundError::ListenError(format!("tuic bind {}: {e}", self.config.listen)))?;
         let endpoint = Arc::new(
-            quinn::Endpoint::server(server_cfg, self.config.listen).map_err(|e| {
+            quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                Some(server_cfg),
+                std_sock,
+                Arc::new(quinn::TokioRuntime),
+            )
+            .map_err(|e| {
                 InboundError::ListenError(format!("tuic bind {}: {e}", self.config.listen))
-            })?
+            })?,
         );
 
         let local_addr = endpoint.local_addr().map_err(|e| {
@@ -446,6 +457,7 @@ mod cc_tests {
                 key_der: None,
                 congestion_control: cc,
                 brutal_up_bps,
+                sockopt: Default::default(),
             },
         )
         .unwrap()

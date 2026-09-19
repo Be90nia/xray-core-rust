@@ -829,6 +829,8 @@ fn build_protocol_handler(
             let transport = xray_transport_hysteria::hysteria_transport::QuinnHysteriaTransport::new(
                 tls_config, "0.0.0.0:0".parse().map_err(|e| format!("bind addr: {e}"))?,
             ).map_err(|e| format!("hysteria transport: {e}"))?
+                // QUIC 端点缓冲：streamSettings.sockopt（缺省 = 8MB 下限语义）。
+                .with_sockopt(stream_settings.socket_options())
                 .with_obfs(obfs);
             let dial_fn = xray_proxy_hysteria::make_hysteria_dial_fn(config, Arc::new(transport));
             wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
@@ -859,6 +861,11 @@ fn build_protocol_handler(
                 heartbeat: s.heartbeat,
                 udp_relay_mode: s.udp_relay_mode,
                 brutal_up_bps: s.brutal_up_bps,
+                // QUIC 端点缓冲：streamSettings.sockopt（缺省 = 8MB 下限语义）。
+                sockopt: xray_transport::dialer::StreamSettings::from_json(
+                    ob.stream_settings_json.as_ref(),
+                )
+                .socket_options(),
             };
             let dial_fn = xray_proxy_tuic::make_tuic_dial_fn_lazy(
                 s.server_addr.clone(),
