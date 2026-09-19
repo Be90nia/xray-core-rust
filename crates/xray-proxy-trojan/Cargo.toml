@@ -32,8 +32,6 @@ hex = "0.4"
 hmac = "0.12"
 # - crc：CRC64-ECMA behaviorSeed（与 SS 一致，drainer 用）
 crc = "2"
-# - rand：随机 nonce / session id
-md-5 = "0.10"
 rand = { workspace = true }
 
 [dev-dependencies]

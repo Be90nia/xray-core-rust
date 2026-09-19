@@ -110,14 +110,6 @@ pub fn hex_sha224(password: &str) -> [u8; HEX_KEY_LEN] {
     out
 }
 
-/// `md5(password)` 原始 16 字节摘要（trojan v2 草案的用户身份标识，对应
-/// v1 的 `hex(sha224(password))`——见 `protocol` 模块文档 v2 节）。
-#[must_use]
-pub fn md5_key(password: &str) -> [u8; 16] {
-    use md5::{Digest, Md5};
-    Md5::digest(password.as_bytes()).into()
-}
-
 /// 把字节数组转为小写 hex 字符串，对应 Go `hexString`。
 ///
 /// Trojan `Validator` 用此函数把 key 转字符串作为 map 索引。
