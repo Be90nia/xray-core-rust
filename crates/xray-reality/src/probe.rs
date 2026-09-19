@@ -149,7 +149,27 @@ fn alpn_wire(alpn: AlpnId) -> Option<&'static [u8]> {
 /// - handshake 完成 → 立刻 `sendProbePayload(2/15/16)` ×3 轮
 /// - 每轮后 `time.Sleep(1 * time.Second)` 等 Alert
 /// - 首轮 alert → tier=1；次轮 → 16；再次 → 32；全不发 → MaxInt
+///
+/// 单次探测整体护栏 [`DETECT_TIMEOUT`]：超时按探测失败处理（None，消费侧
+/// 回退默认 32）——启动期后台任务不允许永久挂起（对端静默时
+/// `connect_with_alpn` 会挂在等 ServerHello，无 OS 层兜底）。
+const DETECT_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub async fn detect_one(
+    dest: &str,
+    server_name: &str,
+    alpn: AlpnId,
+) -> Option<MaxUselessRecords> {
+    timeout(
+        DETECT_TIMEOUT,
+        detect_one_inner(dest, server_name, alpn),
+    )
+    .await
+    .ok()
+    .flatten()
+}
+
+async fn detect_one_inner(
     dest: &str,
     server_name: &str,
     alpn: AlpnId,
@@ -361,11 +381,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detect_returns_maxint_when_no_alert() {
+    async fn detect_returns_none_on_silent_peer() {
         let addr = spawn_silent("127.0.0.1:0").await;
         let tier = detect_one(&dest(addr), "localhost", AlpnId::H2).await;
-        // 静默 → MaxInt
-        assert_eq!(tier, Some(MaxUselessRecords::MAX));
+        // 静默 server 连 TLS 握手都无法完成（不回 ServerHello）→ 整体
+        // DETECT_TIMEOUT 护栏触发 → None（消费侧回退默认 32）。
+        // MaxInt 分支需对端完成握手且三档不发 Alert，mock 需真实 TLS
+        // server（见 spawn_alert_after_ccs dead_code fixture 注释）。
+        assert_eq!(tier, None);
     }
 
     #[test]
