@@ -2592,7 +2592,9 @@ struct TuicOutboundSettings {
     brutal_up_bps: u64,
     /// ALPN 列表；空 → 默认 ["h3","tuic"]。
     alpn: Vec<Vec<u8>>,
-    /// 0-RTT（官方名 zero_rtt_handshake；quinn 经会话恢复自动 0-RTT）。
+    /// 0-RTT（官方名 zero_rtt_handshake）。注意：quinn 0-RTT 须显式
+    /// `Connection::into_0rtt`，会话恢复不会自动启用 0-RTT；本仓 reduce_rtt
+    /// 实际仅启用 TLS 会话恢复（session resumption），与官方 Rust 客户端行为一致。
     reduce_rtt: bool,
     /// UDP relay 模式（官方默认 native）。
     udp_relay_mode: xray_proxy_tuic::UdpRelayMode,
