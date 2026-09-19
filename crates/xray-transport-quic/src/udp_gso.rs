@@ -86,25 +86,24 @@ impl AsyncUdpSocket for NoGsoSocket {
 
 /// 构造 QUIC endpoint（dial 传 `None`，listen 传 `Some`）。
 ///
-/// `disable_gso = false`（默认）：走 quinn 默认 socket 路径——Linux 上
+/// socket 统一经 [`xray_transport::sockopt::bind_udp_endpoint`] 创建：bind 前
+/// 应用 UDP 端点缓冲（显式 sockopt 值优先，缺省走 Go quic-go `wrapConn` 8MB
+/// 下限语义，见 sockopt 模块 doc）。
+///
+/// `disable_gso = false`（默认）：quinn 默认 wrap 路径——Linux 上
 /// quinn-udp 构造时探测 UDP_SEGMENT 并启用 GSO，内核不支持自动回退单段。
-/// `disable_gso = true`：自管 socket 并经 [`NoGsoSocket`] 注入，钳多段
-/// Transmit。
+/// `disable_gso = true`：经 [`NoGsoSocket`] 注入，钳多段 Transmit。
 pub(crate) fn make_endpoint(
     server_config: Option<ServerConfig>,
     local: SocketAddr,
     disable_gso: bool,
+    sockopt: &xray_transport::sockopt::SocketOptions,
 ) -> io::Result<Endpoint> {
-    if !disable_gso {
-        return match server_config {
-            Some(cfg) => Endpoint::server(cfg, local),
-            None => Endpoint::client(local),
-        };
-    }
-    let std_sock = std::net::UdpSocket::bind(local)?;
-    // tokio::net::UdpSocket::from_std 要求非阻塞模式（否则 panic）。
-    std_sock.set_nonblocking(true)?;
+    let std_sock = xray_transport::sockopt::bind_udp_endpoint(local, sockopt)?;
     let runtime: Arc<dyn Runtime> = Arc::new(TokioRuntime);
+    if !disable_gso {
+        return Endpoint::new(EndpointConfig::default(), server_config, std_sock, runtime);
+    }
     let inner = runtime.wrap_udp_socket(std_sock)?;
     let socket: Arc<dyn AsyncUdpSocket> = Arc::new(NoGsoSocket::new(inner));
     Endpoint::new_with_abstract_socket(EndpointConfig::default(), server_config, socket, runtime)
@@ -154,7 +153,7 @@ mod tests {
     /// quinn-udp windows.rs，无 UDP_SEGMENT 概念，包装无副作用）。
     #[tokio::test]
     async fn make_endpoint_disabled_gso_binds() {
-        let ep = make_endpoint(None, "127.0.0.1:0".parse().unwrap(), true).unwrap();
+        let ep = make_endpoint(None, "127.0.0.1:0".parse().unwrap(), true, &Default::default()).unwrap();
         let addr = ep.local_addr().unwrap();
         assert!(addr.port() > 0);
     }

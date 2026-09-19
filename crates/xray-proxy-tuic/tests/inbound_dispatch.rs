@@ -79,6 +79,7 @@ async fn tuic_inbound_dispatches_via_router() {
             key_der: None,
             congestion_control: None,
             brutal_up_bps: 0,
+            sockopt: Default::default(),
         },
     )
     .unwrap()

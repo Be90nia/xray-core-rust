@@ -92,7 +92,13 @@ impl TuicMockServer {
         let mut server_cfg = quinn::ServerConfig::with_crypto(server_crypto_arc);
         server_cfg.transport_config(Arc::new(transport));
 
-        let endpoint = quinn::Endpoint::server(server_cfg, listen)?;
+        let std_sock = xray_transport::sockopt::bind_udp_endpoint(listen, &Default::default())?;
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_cfg),
+            std_sock,
+            Arc::new(quinn::TokioRuntime),
+        )?;
 
         Ok((
             Self {
@@ -863,6 +869,7 @@ mod udp_assoc_tests {
                 key_der: None,
                 congestion_control,
                 brutal_up_bps: 0,
+                sockopt: Default::default(),
             },
         )
         .unwrap()
