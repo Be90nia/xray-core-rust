@@ -145,15 +145,16 @@ pub fn build_client_config(
         .to_string();
 
     // echSockopt（Go transport_security.go:318 `echSockopt`）：Go 唯一消费点是
-    // ECH DoH 查询链（ech.go QueryRecord→dnsQuery 的连接 sockopt）。Rust 该链路
-    // 未实现（DoH 形态 ECHConfigList 直接降级 invalid），此处识别 + 显式忽略提示。
+    // ECH DoH 查询链（ech.go QueryRecord→dnsQuery 的 DialSystem 连接 sockopt）。
+    // Rust ECH DoH 查询已接线（ech_doh），但查询连接的 sockopt 应用未实现，
+    // 此处识别 + 显式忽略提示。
     if crate::ech::parse_ech_sockopt(&json).is_some()
         && obj.and_then(|m| m.get("echConfigList")).and_then(|v| v.as_str())
             .is_some_and(|s| s.contains("://"))
     {
         tracing::warn!(
             target: "xray_tls::client_config",
-            "echSockopt is set but ECH DoH query is not implemented; sockopt ignored (ECH config will be invalid)"
+            "echSockopt is set but sockopt is not applied to the ECH DoH query connection; sockopt ignored"
         );
     }
 

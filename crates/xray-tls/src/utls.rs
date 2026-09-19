@@ -536,11 +536,34 @@ where
         match result {
             Ok(_) => {
                 debug!(target: "xray_tls::utls", ?fingerprint, server_name, "u_client: 尝试 btls 指纹伪装");
+                // ECH DNS 形式（Go ech.go ApplyECH "://" 分支）：握手前真实查询
+                // （DoH，`ech_doh::query_ech_config`），结果 base64 回灌——resolve 的
+                // base64 分支原样解码，且 base64 不含 "://" 不会误入占位分支；
+                // 查询失败保持原串 → resolve 走 Full 语义落 INVALID_ECH_CONFIG
+                // （对齐 Go defer 失败语义：ECH 获取失败必须连接失败，不静默明文）。
+                let mut ech_resolved = String::new();
+                let ech_list: Option<&str> = match ech_config_list {
+                    Some(list) if list.contains("://") => {
+                        use base64::Engine as _;
+                        match crate::ech_doh::query_ech_config(list, server_name, None).await {
+                            Ok(bytes) => {
+                                ech_resolved = base64::engine::general_purpose::STANDARD.encode(bytes);
+                                Some(ech_resolved.as_str())
+                            }
+                            Err(e) => {
+                                debug!(target: "xray_tls::utls", error = %e,
+                                    "ECH DoH query failed; falling back to invalid config (connection will fail)");
+                                Some(list)
+                            }
+                        }
+                    }
+                    other => other,
+                };
                 match crate::btls_client::BtlsConn::connect_with_alpn(
                     stream,
                     server_name,
                     fingerprint,
-                    ech_config_list,
+                    ech_list,
                     // 回接证书验证（pz6c）：allowInsecure=true → None 跳过；
                     // 否则 webpki/pinned verifier 对 btls peer 链做链+主机名验证。
                     crate::client_config::build_server_cert_verifier(security_json)?,

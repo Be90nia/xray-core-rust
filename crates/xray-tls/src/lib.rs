@@ -24,7 +24,6 @@
 //! - REALITY 切片 (k9t): 评估接入 watfaq-rustls git 依赖以实现真实指纹伪装
 //! - TLS 热重载（ArcSwap + 定时任务，第 8 版 handoff 记录的技术债）
 //! - x509 证书加载（依赖 `x509-parser`）；OCSP stapling 已由 `ocsp-stapler` 实现
-//! - ECH DNS 查询（`apply_ech`/`query_record`，依赖 Phase 4 `xray-app-dns`）
 //!
 //! 参考：Go 版本位于 `E:\Projcet\Xray-core\transport\internet\tls\`。
 
@@ -36,6 +35,8 @@ pub mod fingerprint;
 pub mod certificate;
 pub mod config;
 pub mod ech;
+pub mod ech_doh;
+pub mod ech_https_rr;
 pub mod unsafe_conn;
 #[cfg(feature = "ocsp-stapling")]
 pub mod ocsp_stapling;

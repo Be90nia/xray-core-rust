@@ -44,6 +44,15 @@ x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 rand = { workspace = true }
 base64 = "0.22"
 
+# ECH DNS 查询路径（Go ech.go dnsQuery，PR #3813）
+# hickory-proto：HTTPS RR (RFC 9460) / SVCB SvcParamKey::EchConfigList (key=5) 解码
+hickory-proto = { workspace = true }
+# h2/http/bytes：minimal DoH 客户端（RFC 8484 POST + application/dns-message），复用 xray-tls::utls 现有 TLS 握手
+h2 = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+
 [dev-dependencies]
 
 [features]

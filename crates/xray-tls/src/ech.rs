@@ -12,8 +12,9 @@
 //!   经 `utls::u_client` 接入生产 dial 路径；服务端 keys 注册被 btls 上游导出缺口
 //!   阻塞，见 trait 文档）
 //!
-//! DNS 查询路径（`query_record`/`dns_query`）未翻译：`ech_config_list` 含 `://`
-//! 时按 Go「查询失败」语义降级为 invalid config（握手必败），待 DNS 集成后实装。
+//! DNS 查询路径（`://` 形式的 HTTPS RR 查询）由 `crate::ech_doh` 实装
+//! （DoH，握手前异步查询，`utls::u_client_with_alpn` 接线）；查询失败仍按
+//! Go「查询失败」语义落 invalid config（握手必败）。
 
 use crate::error::TlsError;
 use std::sync::Mutex;
@@ -225,8 +226,9 @@ const DEFAULT_SUITES: &[(u16, u16)] = &[
 /// 拿不到有效 ECH config 时的降级占位（对齐 Go `[]byte{1, 1, 4, 5, 1, 4}`）。
 ///
 /// Go 语义（ech.go L51-57 defer）：客户端 ECH 获取失败时填入非法 config，
-/// **使连接失败**而非静默降级明文 SNI。Rust 端 DNS 查询未实现，`://` 形式
-/// 一律走此降级。差异：BoringSSL 对 config list 即时解析，非法 TLV 在
+/// **使连接失败**而非静默降级明文 SNI。Rust 端 `://` 形式经 `ech_doh` 真实
+/// 查询（`utls::u_client_with_alpn` 接线）；查询失败/未接线路径走此降级。
+/// 差异：BoringSSL 对 config list 即时解析，非法 TLV 在
 /// `SSL_set1_ech_config_list` 时即报 `INVALID_ECH_CONFIG_LIST`（Go 是握手时
 /// 失败）——用户可见结果一致：连接失败。
 pub const INVALID_ECH_CONFIG: &[u8] = &[1, 1, 4, 5, 1, 4];
@@ -318,17 +320,32 @@ pub fn ech_config_list_from_server_keys(server_keys: &[u8]) -> Result<Vec<u8>, T
 ///
 /// **永不失败**（对齐 Go defer 语义，ech.go L51-57）：只要配置了 ECH 就必有返回值——
 /// - base64（标准编码）→ 解码 bytes；
-/// - 含 `://` 的 DNS 形式（`https://...` / `domain+https://...`）→ DNS 查询未实现，
-///   按 Go「查询失败」降级返回 [`INVALID_ECH_CONFIG`]（握手将失败，不静默明文）；
-/// - base64 解码失败 → 同上降级 invalid。
+/// - 含 `://` 的 DNS 形式（`https://...` / `domain+https://...`）→ 同步占位：
+///   按 [`EchForceQuery`] 策略分叉（full/half → invalid；none → 空 list）。
+///   生产路径（`utls::u_client_with_alpn`）会先经 [`crate::ech_doh::query_ech_config`]
+///   异步查询并把结果 base64 回灌到本函数（不含 `://`，走 base64 分支），
+///   本占位仅兜底未接线的直接调用；
+/// - base64 解码失败 → invalid。
+///
+/// # 异步查询路径
+/// 真实 DNS 查询见 [`crate::ech_doh::query_ech_config`] + `crate::ech_https_rr::extract_ech_from_dns_response`；
+/// 本函数本身保持同步 + 不 panic + 不依赖运行时（可在 btls
+/// `SSL_set1_ech_config_list` 同步路径直接调用）。
 #[must_use]
-pub fn resolve_client_ech_config_list(config_list: &str) -> Vec<u8> {
+pub fn resolve_client_ech_config_list(
+    config_list: &str,
+    force_query: EchForceQuery,
+) -> Vec<u8> {
     use base64::Engine as _;
     use tracing::warn;
 
     if config_list.contains("://") {
-        // Go：按 "+" split 校验格式（>2 段报错）→ QueryRecord。查询能力未接入，
-        // 一律走 Go 查询失败的 defer 降级路径。
+        // DNS 形式：echConfigList 期待由调用方在握手前异步查询并替换；
+        // 本同步函数仅做格式校验 + 占位降级（实装接线点待 xray-app-dns
+        // 集成后由调用方替换为真实 query_record bytes）。
+        // Go 用 SplitN(list, "+", 2)（多 + 归入 server 段）；本占位路径各分支
+        // 结果与段数无关（full/half→invalid，none→空），接线真实查询时须改
+        // splitn(2, '+') 对齐 Go。
         let parts: Vec<&str> = config_list.split('+').collect();
         if parts.len() > 2 {
             warn!(
@@ -336,24 +353,38 @@ pub fn resolve_client_ech_config_list(config_list: &str) -> Vec<u8> {
                 config_list,
                 "invalid ECH DNS server format"
             );
-        } else {
-            warn!(
-                target: "xray_tls::ech",
-                config_list,
-                "ECH DNS query not yet implemented; falling back to invalid config (handshake will fail)"
-            );
+            return INVALID_ECH_CONFIG.to_vec();
         }
-        return INVALID_ECH_CONFIG.to_vec();
-    }
-    match base64::engine::general_purpose::STANDARD.decode(config_list) {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(
-                target: "xray_tls::ech",
-                error = %e,
-                "failed to base64-decode ECHConfigList; falling back to invalid config"
-            );
-            INVALID_ECH_CONFIG.to_vec()
+        match force_query {
+            EchForceQuery::None => {
+                warn!(
+                    target: "xray_tls::ech",
+                    config_list,
+                    "echForceQuery=none: skipping ECH (returning empty config list)"
+                );
+                Vec::new()
+            }
+            EchForceQuery::Full | EchForceQuery::Half => {
+                warn!(
+                    target: "xray_tls::ech",
+                    config_list,
+                    force_query = ?force_query,
+                    "ECH DNS query not yet wired (resolve path is sync); falling back to invalid config (handshake will fail)"
+                );
+                INVALID_ECH_CONFIG.to_vec()
+            }
+        }
+    } else {
+        match base64::engine::general_purpose::STANDARD.decode(config_list) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    target: "xray_tls::ech",
+                    error = %e,
+                    "failed to base64-decode ECHConfigList; falling back to invalid config"
+                );
+                INVALID_ECH_CONFIG.to_vec()
+            }
         }
     }
 }
@@ -406,6 +437,62 @@ pub fn parse_ech_sockopt(json: &serde_json::Value) -> Option<&serde_json::Value>
 }
 
 // ============================================================
+// echForceQuery 配置面（Go PR #4947/#4973/#5725）
+// ============================================================
+
+/// ECH DNS 查询失败时的策略（对应 Go `tlsConfig.ForceQuery`）。
+///
+/// 历史溯源：Go 在 PR #6032（v26.4.x）移除该字段，强制 ECH 行为，但
+/// Rust 复刻保留三态以支持老配置 + 用户显式覆盖语义。
+///
+/// # 语义
+/// - `Full`：DNS 查询失败 → 硬错（Go v26.3.27 默认）。`resolve_*` 返回
+///   `INVALID_ECH_CONFIG`，握手必败——避免静默明文 SNI 泄露。
+/// - `Half`：DNS 查询失败 → 软降级：返回 INVALID config（与 `Full` 同形态，
+///   但 trace 级别不同，运维可识别是降级而非用户主动 full）。Go 实现下
+///   half 会继续原连接（不带 ECH），Rust 简化统一 invalid——**这是有意的
+///   简化**：half 半连接的语义在 Rust DNS 基建未到位时无意义。
+/// - `None`：DNS 查询失败 → 跳过 ECH，返回空 config list（TLS 层识别为
+///   "no ECH"），连接建立走明文 SNI。仅供用户主动选择非 ECH 路径。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EchForceQuery {
+    /// DNS 查询失败硬错（默认，对齐 Go v26.3.27）。
+    #[default]
+    Full,
+    /// DNS 查询失败软降级（与 Full 同形态 invalid，trace 区分）。
+    Half,
+    /// DNS 查询失败跳过 ECH（返回空 config list）。
+    None,
+}
+
+/// 解析 `tlsSettings.echForceQuery`（对应 Go `config.EchForceQuery`）。
+///
+/// Go 字符串取值：`"full"` / `"half"` / `"none"`（不区分大小写）；
+/// 缺失/null → 默认 [`EchForceQuery::Full`]；非法值 → 报错（对齐 Go
+/// `"unknown ECH force query mode"`）。
+///
+/// # 错误
+/// 非法字符串返回 `TlsError::EchApply`，与 Go 错误信息字符串形态一致：
+/// `"unknown ECH force query mode: <input>"`。
+pub fn parse_ech_force_query(json: &serde_json::Value) -> Result<EchForceQuery, TlsError> {
+    let Some(s) = json
+        .as_object()
+        .and_then(|m| m.get("echForceQuery"))
+        .and_then(|v| v.as_str())
+    else {
+        return Ok(EchForceQuery::default());
+    };
+    match s.to_ascii_lowercase().as_str() {
+        "full" => Ok(EchForceQuery::Full),
+        "half" => Ok(EchForceQuery::Half),
+        "none" => Ok(EchForceQuery::None),
+        other => Err(TlsError::EchApply(format!(
+            "unknown ECH force query mode: {other}"
+        ))),
+    }
+}
+
+// ============================================================
 // ApplyEch trait + btls (BoringSSL) 客户端实装
 // ============================================================
 
@@ -434,6 +521,9 @@ pub trait ApplyEch {
 impl ApplyEch for btls::ssl::Ssl {
     /// 客户端：`config_list` 非空 → resolve（含 invalid 降级）→
     /// `SSL_set1_ech_config_list`。须在握手前调用。
+    ///
+    /// 同步 resolve 默认走 [`EchForceQuery::Full`] 语义（DNS 形式 → invalid）；
+    /// 真实 DNS 查询路径待 async wiring，本实装不触发网络 IO。
     fn apply_ech(
         &mut self,
         _server_keys: &[u8],
@@ -442,7 +532,7 @@ impl ApplyEch for btls::ssl::Ssl {
         if config_list.is_empty() {
             return Ok(());
         }
-        let list = resolve_client_ech_config_list(config_list);
+        let list = resolve_client_ech_config_list(config_list, EchForceQuery::Full);
         self.set_ech_config_list(&list)
             .map_err(|e| TlsError::EchApply(format!("SSL_set1_ech_config_list: {e}")))
     }
@@ -686,25 +776,53 @@ mod tests {
         use base64::Engine as _;
         let raw = vec![1, 2, 3, 4, 5];
         let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
-        assert_eq!(resolve_client_ech_config_list(&b64), raw);
+        assert_eq!(
+            resolve_client_ech_config_list(&b64, EchForceQuery::Full),
+            raw
+        );
     }
 
     #[test]
     fn resolve_invalid_base64_falls_back_to_invalid_config() {
         // Go defer 语义：解码失败 → invalid config（握手必败）
-        assert_eq!(resolve_client_ech_config_list("!!!not-base64!!!"), INVALID_ECH_CONFIG);
+        assert_eq!(
+            resolve_client_ech_config_list("!!!not-base64!!!", EchForceQuery::Full),
+            INVALID_ECH_CONFIG
+        );
     }
 
     #[test]
-    fn resolve_dns_form_falls_back_to_invalid_config() {
-        // DNS 查询未实现：对齐 Go 查询失败降级
+    fn resolve_dns_form_full_hard_fails_to_invalid_config() {
+        // echForceQuery=full（Go 当前基线行为：查询失败直接报错，不静默明文）
+        // → invalid config，握手必败
         assert_eq!(
-            resolve_client_ech_config_list("https://1.1.1.1/dns-query"),
+            resolve_client_ech_config_list("https://1.1.1.1/dns-query", EchForceQuery::Full),
             INVALID_ECH_CONFIG
         );
         assert_eq!(
-            resolve_client_ech_config_list("example.com+https://1.1.1.1/dns-query"),
+            resolve_client_ech_config_list(
+                "example.com+https://1.1.1.1/dns-query",
+                EchForceQuery::Full
+            ),
             INVALID_ECH_CONFIG
+        );
+    }
+
+    #[test]
+    fn resolve_dns_form_half_degrades_to_invalid_config() {
+        // half：与 full 同形态 invalid（Rust 有意简化，见 EchForceQuery 文档）
+        assert_eq!(
+            resolve_client_ech_config_list("https://1.1.1.1/dns-query", EchForceQuery::Half),
+            INVALID_ECH_CONFIG
+        );
+    }
+
+    #[test]
+    fn resolve_dns_form_none_skips_ech() {
+        // none：查询失败跳过 ECH → 空 config list（TLS 层识别为 no ECH，明文 SNI）
+        assert_eq!(
+            resolve_client_ech_config_list("https://1.1.1.1/dns-query", EchForceQuery::None),
+            Vec::<u8>::new()
         );
     }
 
