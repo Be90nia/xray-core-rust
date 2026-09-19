@@ -43,7 +43,7 @@ const DUPLEX_BUF: usize = 64 * 1024;
 pub async fn listen_splithttp(
     addr: SocketAddr,
     settings: &StreamSettings,
-    _sockopt: &SocketOptions,
+    sockopt: &SocketOptions,
     handler: ConnHandler,
 ) -> io::Result<Box<dyn TransportListener>> {
     let config = Arc::new(crate::register::parse_splithttp_config(
@@ -64,7 +64,7 @@ pub async fn listen_splithttp(
 
     if is_h3 {
         let tls = tls_cfg.expect("is_h3 implies Some");
-        listen_h3(addr, tls, &config, handler).await
+        listen_h3(addr, tls, &config, sockopt, handler).await
     } else {
         // Tcpmask（Go splithttp/hub.go:547-549：`!isH3 && TcpmaskManager != nil`
         // 才 WrapListener——H3/QUIC 分支不接 Tcpmask）。空 manager = 恒等。
@@ -401,12 +401,19 @@ async fn listen_h3(
     addr: SocketAddr,
     tls: Arc<rustls::ServerConfig>,
     config: &Arc<Config>,
+    sockopt: &SocketOptions,
     handler: ConnHandler,
 ) -> io::Result<Box<dyn TransportListener>> {
     let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from((*tls).clone())
         .map_err(|e| io::Error::other(format!("rustls→quic server: {e}")))?;
     let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
-    let endpoint = quinn::Endpoint::server(server_config, addr)?;
+    let std_sock = xray_transport::sockopt::bind_udp_endpoint(addr, sockopt)?;
+    let endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        std_sock,
+        Arc::new(quinn::TokioRuntime),
+    )?;
     let local = endpoint.local_addr()?;
     // endpoint clone 给 listener 句柄；本体 move 进 accept task。
     let ctx = build_context(config, local, handler);

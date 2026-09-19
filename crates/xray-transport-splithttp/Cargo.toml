@@ -12,6 +12,8 @@ xray-transport = { path = "../xray-transport" }
 xray-proto = { path = "../xray-proto" }
 xray-reality = { path = "../xray-reality" }
 xray-tls = { path = "../xray-tls" }
+# H3 CC 接线：复用 congestion_swappable BBR/Brutal 桥（TUIC 同款）
+xray-transport-quic = { path = "../xray-transport-quic" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }

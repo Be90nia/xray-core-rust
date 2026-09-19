@@ -155,14 +155,17 @@ async fn dial_h3_packet_up_end_to_end() {
         ..Default::default()
     });
     let client_tls = make_client_tls(cert_der);
-    let h3_conn = H3Conn::connect(
+    // quic_params=None：CC 走默认 BBR（Go dialer.go:161-164 语义）
+    let h3_conn = H3Conn::connect_with_quic_params(
         config.clone(),
         server_addr,
         "127.0.0.1",
         client_tls,
+        None,
+        &xray_transport::sockopt::SocketOptions::default(),
     )
     .await
-    .expect("H3Conn::connect");
+    .expect("H3Conn::connect_with_quic_params");
 
     // 3. dial_h3_packet_up
     let session_id = uuid::Uuid::new_v4().to_string();
