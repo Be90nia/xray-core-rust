@@ -398,18 +398,35 @@ pub struct QuinnListenerFactory {
     /// UDP 混淆（salamander / gecko，对应 Go hub 侧 `UdpmaskManager.
     /// WrapPacketConnServer`，None = 不包装）。
     obfs: Option<UdpObfs>,
+    /// QUIC 端点 UDP socket 选项（缓冲调谐消费；默认空 = Go quic-go `wrapConn`
+    /// 8MB 下限语义，见 [`xray_transport::sockopt::bind_udp_endpoint`]）。
+    sockopt: xray_transport::sockopt::SocketOptions,
 }
 
 impl QuinnListenerFactory {
     #[must_use]
     pub fn new(rustls_server_config: Arc<rustls::ServerConfig>) -> Self {
-        Self { rustls_server_config, obfs: None }
+        Self {
+            rustls_server_config,
+            obfs: None,
+            sockopt: xray_transport::sockopt::SocketOptions::default(),
+        }
     }
 
     /// 注入 UDP 混淆（salamander / gecko；builder 风格，None = 不包装）。
     #[must_use]
     pub fn with_obfs(mut self, obfs: Option<UdpObfs>) -> Self {
         self.obfs = obfs;
+        self
+    }
+
+    /// 注入 QUIC 端点 socket 选项（UDP 缓冲调谐；builder 风格）。
+    #[must_use]
+    pub fn with_sockopt(
+        mut self,
+        sockopt: xray_transport::sockopt::SocketOptions,
+    ) -> Self {
+        self.sockopt = sockopt;
         self
     }
 }
@@ -434,7 +451,13 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
         // 对称）
         let mut rustls_config = (*self.rustls_server_config).clone();
         rustls_config.alpn_protocols = vec![b"h3".to_vec()];
+        // 0-RTT（Go quic-go 服务端默认接受 early data 的 parity 前提）：quinn 的
+        // QuicServerConfig::try_from 不代设（仅其内部构造路径置 u32::MAX，见
+        // vendor/quinn-proto/src/crypto/rustls.rs）——不置则服务端 NST 不带
+        // early_data 扩展，客户端 into_0rtt 后必被拒。
+        rustls_config.max_early_data_size = u32::MAX;
         let obfs = self.obfs.clone();
+        let sockopt = self.sockopt.clone();
         // masq handler（对应 Go hub.go:210-254 listen 时 switch masqType 构造）+
         // 静态 auth token（Go hub.go:63-64 validator 缺席时 config.Auth 对比）
         let masq_handler = masq.build_handler();
@@ -455,16 +478,29 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
             // obfs：UDP socket 包混淆（salamander XOR / gecko 分片）后经 abstract
             // socket 交给 quinn（对应 Go hub 侧 pktConn 包装后再 quic.Transport.Listen）
             let endpoint = match &obfs {
-                Some(kind) => kind.server_endpoint(template.clone(), bind_addr).await.map_err(
-                    |e| {
+                Some(kind) => kind
+                    .server_endpoint(template.clone(), bind_addr, &sockopt)
+                    .await
+                    .map_err(|e| {
                         crate::error::HysteriaError::Io(io::Error::other(format!(
                             "obfs bind: {e}"
                         )))
-                    },
-                )?,
-                None => quinn::Endpoint::server(template.clone(), bind_addr).map_err(|e| {
-                    crate::error::HysteriaError::Io(io::Error::other(format!("bind: {e}")))
-                })?,
+                    })?,
+                None => {
+                    let std_sock = xray_transport::sockopt::bind_udp_endpoint(bind_addr, &sockopt)
+                        .map_err(|e| {
+                            crate::error::HysteriaError::Io(io::Error::other(format!("bind: {e}")))
+                        })?;
+                    quinn::Endpoint::new(
+                        quinn::EndpointConfig::default(),
+                        Some(template.clone()),
+                        std_sock,
+                        Arc::new(quinn::TokioRuntime),
+                    )
+                    .map_err(|e| {
+                        crate::error::HysteriaError::Io(io::Error::other(format!("bind: {e}")))
+                    })?
+                },
             };
             // spawn accept loop：每个 QUIC conn → h3 auth → CC 协商 → raw bidi streams →
             // on_new_conn。 endpoint.close()（listener close）会让 accept 返回

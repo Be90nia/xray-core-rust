@@ -72,10 +72,16 @@ impl std::fmt::Debug for GeckoSocket {
 impl GeckoSocket {
     /// bind UDP socket 并包 Gecko 混淆。
     ///
-    /// 必须在 tokio runtime 上下文内调用（bind 注册 reactor + driver task spawn）。
-    /// PSK/分片参数校验在 [`GeckoConn::new`]（同 Go `NewGeckoConnClient`）。
-    pub async fn bind(config: &GeckoConfig, bind_addr: SocketAddr) -> io::Result<Arc<Self>> {
-        let io = Arc::new(UdpSocket::bind(bind_addr).await?);
+    /// 必须在 tokio runtime 上下文内调用（socket 经
+    /// [`xray_transport::sockopt::bind_udp_endpoint`] 创建后转 tokio + driver task
+    /// spawn）。PSK/分片参数校验在 [`GeckoConn::new`]（同 Go `NewGeckoConnClient`）。
+    pub async fn bind(
+        config: &GeckoConfig,
+        bind_addr: SocketAddr,
+        sockopt: &xray_transport::sockopt::SocketOptions,
+    ) -> io::Result<Arc<Self>> {
+        let std_sock = xray_transport::sockopt::bind_udp_endpoint(bind_addr, sockopt)?;
+        let io = Arc::new(UdpSocket::from_std(std_sock)?);
         let conn = Arc::new(GeckoConn::new(config, Box::new(io.clone()))?);
 
         let (send_tx, send_rx) = mpsc::channel::<(Bytes, SocketAddr)>(SEND_QUEUE_CAP);
@@ -268,10 +274,10 @@ mod tests {
 
     #[tokio::test]
     async fn long_header_fragments_and_reassembles_roundtrip() {
-        let a = GeckoSocket::bind(&gecko_cfg("shared-psk-1", 512, 1200), "127.0.0.1:0".parse().unwrap())
+        let a = GeckoSocket::bind(&gecko_cfg("shared-psk-1", 512, 1200), "127.0.0.1:0".parse().unwrap(), &Default::default())
             .await
             .unwrap();
-        let b = GeckoSocket::bind(&gecko_cfg("shared-psk-1", 512, 1200), "127.0.0.1:0".parse().unwrap())
+        let b = GeckoSocket::bind(&gecko_cfg("shared-psk-1", 512, 1200), "127.0.0.1:0".parse().unwrap(), &Default::default())
             .await
             .unwrap();
 
@@ -300,7 +306,7 @@ mod tests {
     #[tokio::test]
     async fn long_header_writes_multiple_wire_datagrams() {
         let sock =
-            GeckoSocket::bind(&gecko_cfg("unit-test-psk", 512, 1200), "127.0.0.1:0".parse().unwrap())
+            GeckoSocket::bind(&gecko_cfg("unit-test-psk", 512, 1200), "127.0.0.1:0".parse().unwrap(), &Default::default())
                 .await
                 .unwrap();
         let peer = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).await.unwrap();
@@ -365,10 +371,10 @@ mod tests {
 
     #[tokio::test]
     async fn psk_mismatch_never_yields_plaintext() {
-        let a = GeckoSocket::bind(&gecko_cfg("psk-client-side", 512, 1200), "127.0.0.1:0".parse().unwrap())
+        let a = GeckoSocket::bind(&gecko_cfg("psk-client-side", 512, 1200), "127.0.0.1:0".parse().unwrap(), &Default::default())
             .await
             .unwrap();
-        let b = GeckoSocket::bind(&gecko_cfg("psk-server-side", 512, 1200), "127.0.0.1:0".parse().unwrap())
+        let b = GeckoSocket::bind(&gecko_cfg("psk-server-side", 512, 1200), "127.0.0.1:0".parse().unwrap(), &Default::default())
             .await
             .unwrap();
 

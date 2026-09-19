@@ -14,13 +14,23 @@
 //! 参考：librarian 调研 hyproxy/hysteria 1.x 协议 + Xray Go
 //! `transport/internet/hysteria/dialer.go`。
 
-use std::{io, net::SocketAddr, pin::Pin, sync::Arc};
+use std::{io, net::SocketAddr, pin::Pin, sync::{Arc, LazyLock}};
 
 use quinn::{
     ClientConfig as QuinnClientConfig, Connection as QuinnConnection, Endpoint,
     crypto::rustls::QuicClientConfig,
 };
+use rustls::client::{ClientSessionStore, ClientSessionMemoryCache};
 use crate::salamander_socket::UdpObfs;
+
+/// 进程级 hysteria client TLS 会话缓存，容量 128 对齐 Go `globalSessionCache`
+/// （`transport/internet/tls/config.go:24` `tls.NewLRUClientSessionCache(128)`）。
+///
+/// 0-RTT（Go `tr.DialEarly` parity）依赖跨拨号的会话票据：rustls builder 默认的
+/// resumption store 随 ClientConfig 新建，而本 crate 每次拨号新建 config，票据无法
+/// 存续，`into_0rtt` 永远拿不到密钥。所有拨号共享此 store 后，二次连接即可 0-RTT。
+static GLOBAL_CLIENT_SESSION_STORE: LazyLock<Arc<ClientSessionMemoryCache>> =
+    LazyLock::new(|| Arc::new(ClientSessionMemoryCache::new(128)));
 
 use crate::{
     conn::{QuicConn, QuicStream},
@@ -42,6 +52,9 @@ pub struct QuinnHysteriaTransport {
     bind_addr: SocketAddr,
     /// UDP 混淆（salamander / gecko，对应 Go dialer.go:170 `udpmaskManager`，None = 不包装）。
     obfs: Option<UdpObfs>,
+    /// QUIC 端点 UDP socket 选项（缓冲调谐消费；默认空 = Go quic-go `wrapConn`
+    /// 8MB 下限语义，见 [`xray_transport::sockopt::bind_udp_endpoint`]）。
+    sockopt: xray_transport::sockopt::SocketOptions,
 }
 
 impl QuinnHysteriaTransport {
@@ -53,12 +66,27 @@ impl QuinnHysteriaTransport {
     pub fn new(mut tls_config: rustls::ClientConfig, bind_addr: SocketAddr) -> io::Result<Self> {
         // ponytail: hysteria 协议固定 ALPN=h3（librarian 调研证实）
         tls_config.alpn_protocols = vec![b"h3".to_vec()];
+        // 0-RTT 前提：rustls enable_early_data 默认 false，而 quinn 的
+        // QuicClientConfig::try_from 不补（仅 quinn 内部构造路径置 true，见
+        // vendor/quinn-proto/src/crypto/rustls.rs TryFrom impl）——不置 true 则
+        // ClientHello 不带 early_data 扩展，into_0rtt 恒 Err。Resumption::disabled()
+        // 时无 PSK 可用，此标志不改变恒 1-RTT 的禁用语义。
+        tls_config.enable_early_data = true;
+        // 会话票据共享（0-RTT/DialEarly parity 前提，见 GLOBAL_CLIENT_SESSION_STORE）。
+        // pwh6 `enableSessionResumption=false` 时 xray_tls 已置 `Resumption::disabled()`
+        // （store=NoClientSessionStorage），此处尊重禁用不覆盖——该 transport 恒走 1-RTT。
+        // Debug 字符串检测与 xray-tls client_config.rs 测试先例同款（Resumption 无 pub 字段）。
+        if !format!("{:?}", tls_config.resumption).contains("NoClientSessionStorage") {
+            tls_config.resumption =
+                rustls::client::Resumption::store(Arc::clone(&GLOBAL_CLIENT_SESSION_STORE) as Arc<dyn ClientSessionStore>);
+        }
         let quic = QuicClientConfig::try_from(Arc::new(tls_config))
             .map_err(|e| io::Error::other(format!("quinn QuicClientConfig: {e}")))?;
         Ok(Self {
             client_config: QuinnClientConfig::new(Arc::new(quic)),
             bind_addr,
             obfs: None,
+            sockopt: xray_transport::sockopt::SocketOptions::default(),
         })
     }
 
@@ -66,6 +94,16 @@ impl QuinnHysteriaTransport {
     #[must_use]
     pub fn with_obfs(mut self, obfs: Option<UdpObfs>) -> Self {
         self.obfs = obfs;
+        self
+    }
+
+    /// 注入 QUIC 端点 socket 选项（UDP 缓冲调谐；builder 风格）。
+    #[must_use]
+    pub fn with_sockopt(
+        mut self,
+        sockopt: xray_transport::sockopt::SocketOptions,
+    ) -> Self {
+        self.sockopt = sockopt;
         self
     }
 }
@@ -85,6 +123,7 @@ impl HysteriaTransport for QuinnHysteriaTransport {
         let auth_token = auth_token.to_string();
         let quic_cfg = quic_config.clone();
         let obfs = self.obfs.clone();
+        let sockopt = self.sockopt.clone();
         Box::pin(async move {
             // 1. quinn endpoint（transport config 含可热切换 CC factory，auth 后协商）
             let (transport_cfg, cc_slot) =
@@ -93,18 +132,37 @@ impl HysteriaTransport for QuinnHysteriaTransport {
             // obfs：UDP socket 包混淆（salamander XOR / gecko 分片）后经 abstract
             // socket 交给 quinn（对应 Go dialer.go:170-179 pktConn 包装后再建 quic.Transport）
             let mut endpoint = match &obfs {
-                Some(kind) => kind.client_endpoint(bind_addr).await?,
-                None => Endpoint::client(bind_addr)
-                    .map_err(|e| io::Error::other(format!("quinn endpoint: {e}")))?,
+                Some(kind) => kind.client_endpoint(bind_addr, &sockopt).await?,
+                None => {
+                    let std_sock = xray_transport::sockopt::bind_udp_endpoint(bind_addr, &sockopt)?;
+                    Endpoint::new(
+                        quinn::EndpointConfig::default(),
+                        None,
+                        std_sock,
+                        Arc::new(quinn::TokioRuntime),
+                    )
+                    .map_err(|e| io::Error::other(format!("quinn endpoint: {e}")))?
+                },
             };
             endpoint.set_default_client_config(client_config);
 
-            // 2. QUIC 拨号
-            let conn = endpoint
+            // 2. QUIC 拨号（Go dialer.go:154 `tr.DialEarly` parity）：store 有会话票据时
+            //    into_0rtt 立即返回连接，h3 auth 在 0-RTT 中发出（省 1-RTT）；首连/禁用
+            //    resumption 时 Err → 正常等 1-RTT。0-RTT 被服务端拒绝时 auth 流报
+            //    ZeroRttRejected，dial 失败交上层重连——与 Go quic-go Err0RTTRejected →
+            //    dial 返回 err → clientManager 重连同型，不加额外重试。
+            let connecting = endpoint
                 .connect(dest_addr, &host)
-                .map_err(|e| io::Error::other(format!("quinn connect initiate: {e}")))?
-                .await
-                .map_err(|e| io::Error::other(format!("quinn connect: {e}")))?;
+                .map_err(|e| io::Error::other(format!("quinn connect initiate: {e}")))?;
+            let conn = match connecting.into_0rtt() {
+                Ok((conn, _zero_rtt)) => {
+                    tracing::debug!("hysteria dialing with 0-RTT attempt");
+                    conn
+                },
+                Err(connecting) => connecting
+                    .await
+                    .map_err(|e| io::Error::other(format!("quinn connect: {e}")))?,
+            };
 
             // 3. h3 client 发 POST /auth，返回保活项（driver + SendRequest）防止 h3 关闭 QUIC
             //    连接。
@@ -294,5 +352,160 @@ mod tests {
             .with_no_client_auth();
         let t = QuinnHysteriaTransport::new(tls, "127.0.0.1:0".parse().unwrap());
         assert!(t.is_ok());
+    }
+
+    /// 0-RTT 测试共用：自签证书 + QuinnListenerFactory server（auth="test-secret"）。
+    /// 返回 (server_addr, listener, client_trust_anchors)；listener 须保活至断言结束。
+    async fn spawn_auth_server(
+    ) -> io::Result<(SocketAddr, Arc<dyn crate::hub::HysteriaQuicListener>, rustls::RootCertStore)>
+    {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+        let server_tls = rustls::server::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.into()], key_der)
+            .unwrap();
+        let mut trust = rustls::RootCertStore::empty();
+        // 自签证书自身作根（免去 dangerous verifier）
+        trust.add(cert.cert.der().clone()).unwrap();
+
+        let factory = crate::quinn_adapter::QuinnListenerFactory::new(Arc::new(server_tls));
+        let proto_config = Arc::new(crate::proto_config::Config::default());
+        let quic_params = Arc::new(xray_proto::xray::transport::internet::QuicParams::default());
+        struct TestValidator;
+        impl crate::hub::AuthValidator for TestValidator {
+            fn validate(&self, auth: &str) -> Option<String> {
+                if auth == "test-secret" { Some("user".into()) } else { None }
+            }
+
+            fn count(&self) -> usize {
+                1
+            }
+        }
+        let validator: Option<Arc<dyn crate::hub::AuthValidator>> = Some(Arc::new(TestValidator));
+        use crate::hub::HysteriaListenerFactory as _;
+        let (stream_tx, _stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Arc<crate::conn::InterStreamConn>>();
+        let on_new_conn: Arc<dyn Fn(Arc<crate::conn::InterStreamConn>) + Send + Sync> =
+            Arc::new(move |s| {
+                let _ = stream_tx.send(s);
+            });
+        let listener = factory
+            .listen(
+                "127.0.0.1:0".parse().unwrap(),
+                proto_config,
+                quic_params,
+                crate::hub::MasqType::NotFound,
+                validator,
+                on_new_conn,
+                None,
+            )
+            .await
+            .expect("listen should succeed");
+        let addr = listener.local_addr();
+        Ok((addr, listener, trust))
+    }
+
+    /// 回退臂：resumption 禁用（enableSessionResumption=false 语义）时 into_0rtt 恒 Err，
+    /// 拨号必须完整走 1-RTT 并认证成功——共享 store 注入不得破坏禁用语义。
+    #[tokio::test]
+    async fn resumption_disabled_transport_dials_via_1rtt_fallback() {
+        ensure_crypto_provider();
+        let (addr, _listener, trust) = spawn_auth_server().await.unwrap();
+
+        let client_tls = rustls::ClientConfig::builder()
+            .with_root_certificates(trust)
+            .with_no_client_auth();
+        // xray_tls 对 enableSessionResumption=false 的等价形态：Resumption::disabled()
+        let client_tls = {
+            let mut c = client_tls;
+            c.resumption = rustls::client::Resumption::disabled();
+            c
+        };
+        let transport = QuinnHysteriaTransport::new(client_tls, "0.0.0.0:0".parse().unwrap())
+            .expect("transport");
+
+        let dest = DialDestination { udp_addr: addr, host: "localhost".into() };
+        let qc = crate::dialer::QuicConfig::default_for_hysteria();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            transport.dial_and_authenticate(&dest, &qc, "test-secret", 0),
+        )
+        .await
+        .expect("no hang")
+        .expect("1-RTT fallback dial + auth should succeed");
+    }
+
+    /// 0-RTT 臂：首次拨号为会话缓存播种票据；二次拨号 into_0rtt 可用且服务端接受
+    /// （quinn 服务端默认处理 0-RTT），0-RTT 路径上 h3 auth 完整走通。
+    #[tokio::test]
+    async fn second_dial_uses_0rtt_after_first_dial_seeds_ticket() {
+        ensure_crypto_provider();
+        let (addr, _listener, trust) = spawn_auth_server().await.unwrap();
+        let dest = DialDestination { udp_addr: addr, host: "localhost".into() };
+        let qc = crate::dialer::QuicConfig::default_for_hysteria();
+
+        let client_tls = rustls::ClientConfig::builder()
+            .with_root_certificates(trust)
+            .with_no_client_auth();
+        let transport = Arc::new(
+            QuinnHysteriaTransport::new(client_tls, "0.0.0.0:0".parse().unwrap())
+                .expect("transport"),
+        );
+
+        // 首连：播种票据（无票据时 into_0rtt Err → 1-RTT，成功即回退无损）
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            transport.dial_and_authenticate(&dest, &qc, "test-secret", 0),
+        )
+        .await
+        .expect("no hang")
+        .expect("first dial + auth should succeed");
+
+        // 白盒：与 dial_and_authenticate 同构的 client config（共享 store + 同 transport
+        // config——传输参数与首连一致才不会被服务端拒 0-RTT），直接断言 into_0rtt 状态。
+        // NewSessionTicket 在握手完成后由服务端异步发出，auth 响应返回时可能仍在路上；
+        // 轮询重拨直至票据落入共享 store（确定性等待条件，非时序假设）。每次探测连接
+        // 本身也会收取票据，加速落库。
+        let probe = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let mut cfg = transport.client_config.clone();
+                // TransportConfig 不可 Clone，每轮重建（构造便宜，保证 0-RTT 传输参数与首连一致）
+                let (transport_cfg, _cc) =
+                    crate::quinn_adapter::build_hysteria_transport_config(&qc);
+                cfg.transport_config(Arc::new(transport_cfg));
+                let mut ep = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+                ep.set_default_client_config(cfg);
+                let connecting = ep.connect(addr, "localhost").expect("connect initiate");
+                match connecting.into_0rtt() {
+                    Ok((conn, zero_rtt)) => break (conn, zero_rtt),
+                    Err(connecting) => {
+                        let conn = connecting.await.expect("probe 1-RTT connect");
+                        conn.close(0u32.into(), b"probe waiting for ticket");
+                    },
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("0-RTT should become available once the session ticket lands");
+        let (_probe_conn, zero_rtt) = probe;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(15), zero_rtt)
+                .await
+                .expect("handshake completes"),
+            "server should accept 0-RTT"
+        );
+
+        // 二连：0-RTT 路径上 h3 POST /auth 完整走通
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            transport.dial_and_authenticate(&dest, &qc, "test-secret", 0),
+        )
+        .await
+        .expect("no hang")
+        .expect("second dial (0-RTT) + auth should succeed");
     }
 }
