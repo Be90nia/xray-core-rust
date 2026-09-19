@@ -86,7 +86,10 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 # 异步运行时
-tokio = { version = "1", features = ["full"] }
+# tokio 1.53+ 包含 LIFO 回归修复（1.52.2 revert #7431，见 tokio#8065/#8120）；1.53 起
+# `RuntimeMetrics::worker_noop_count/worker_steal_count` 已在 `tokio_unstable` 门内稳定，
+# `worker_park_count/worker_total_busy_duration` 64-bit 默认开放。
+tokio = { version = "1.53", features = ["full"] }
 
 # 序列化
 serde = { version = "1", features = ["derive"] }

@@ -204,6 +204,10 @@ async fn main() -> std::process::ExitCode {
     if !matches!(command, Command::Run(_)) {
         run::init_tracing("info");
     }
+    // P3 护栏（tokio #8065/#8120 教训）：启动期一次性抓取 RuntimeMetrics 快照
+    // 并以 tracing::info 输出，便于日志归档 worker 行为基线（park/busy/noop/steal）。
+    // 失败仅记 warn，不影响主路径。
+    xray_common::runtime_guard::log_runtime_snapshot("startup");
     match execute(command).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
