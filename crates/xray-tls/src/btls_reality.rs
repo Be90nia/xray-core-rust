@@ -118,10 +118,12 @@ pub fn x25519_key_share_private_raw(ssl: *mut btls_sys::SSL) -> Option<[u8; 32]>
 /// 发送一致（reality tls.go:414-424）。payload 超过单记录上限或握手未完成
 /// 时返回 Err（原语侧拒发，不静默分片/延后）。
 ///
-/// 消费时机（登记）：Rust REALITY 服务端当前为 rustls 路径（无 SSL* 句柄，
-/// 见 lib.rs「btls 无 server acceptor」缺口），本原语供服务端 btls acceptor
-/// 落地后「检测到无效 CCS」路径调用；客户端侧（btls BtlsConn）可在对端
-/// 模仿行为协商启用后用于丢弃对齐。
+/// 消费时机（bd tce2 登记）：服务端 btls acceptor（`xray-reality::server::
+/// server_tls_btls`）已落地，但 tokio BIO 桥接下裸调 SSL_write 会触发
+/// tokio-btls `StreamWrapper.context==0` 断言（原语面向非 tokio BIO 宿主），
+/// 故 tokio 路径以等价 poll 写路径发送（48B << max_send_fragment，单记录
+/// 语义不变）；本原语保留给非 tokio BIO 场景（Go 兼容宿主/阻塞 fd）与
+/// 客户端侧丢弃对齐。
 ///
 /// iOS 门控：btls-sys 在 aarch64-apple-ios 走预生成 bindings（不含注入声明，
 /// 见 Mobile Gates d0348c0 失败）；iOS 构建亦无注入源码树，原语不存在，
