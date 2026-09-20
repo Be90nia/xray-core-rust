@@ -44,6 +44,10 @@ pub use utls::ConnInterface;
 
 pub mod btls_client;
 pub mod btls_reality;
+/// btls（BoringSSL）服务端 acceptor（bd tce2，opt-in）。
+/// iOS 预生成 bindings 无服务端路径依赖问题但按 mygg 教训统一门控。
+#[cfg(not(target_os = "ios"))]
+pub mod btls_server;
 pub mod utls;
 pub mod grpc;
 #[cfg(test)]

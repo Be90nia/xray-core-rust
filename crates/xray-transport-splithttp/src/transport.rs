@@ -236,6 +236,8 @@ struct RealityServerConfig {
     xver: u8,
     /// bd frxi：启动期 CCS 探测开关（缺省 Disabled 保持现行为）。
     max_useless_records: xray_reality::MaxUselessRecordsSetting,
+    /// bd tce2：TLS acceptor 选择（缺省 Rustls 保持现行为）。
+    server_acceptor: xray_reality::ServerAcceptorSetting,
 }
 
 /// security == "reality" 时解析服务端 REALITY 配置，否则返回 None。
@@ -314,6 +316,10 @@ fn reality_server_config(
         json.get("maxUselessRecords"),
     )
     .map_err(io::Error::other)?;
+    // bd tce2：realitySettings.serverAcceptor（"rustls" 默认 / "btls" opt-in）。
+    let server_acceptor =
+        xray_reality::ServerAcceptorSetting::from_json(json.get("serverAcceptor"))
+            .map_err(io::Error::other)?;
     // mldsa65Seed：后量子签名未实现（cz5x）。配置在场即显式报错，
     // 不静默忽略——避免运营者误以为 PQC 已生效。
     if let Some(seed) = json.get("mldsa65Seed").and_then(|x| x.as_str()) {
@@ -370,6 +376,7 @@ fn reality_server_config(
         fallback_dest,
         xver,
         max_useless_records,
+        server_acceptor,
     }))
 }
 
@@ -390,17 +397,53 @@ async fn serve_reality_conn<S>(
 {
     use xray_reality::server::{server_tls, RealityServerOutcome};
 
-    let outcome = server_tls(
-        stream,
-        &rc.private_key,
-        &rc.short_ids,
-        rc.max_time_diff,
-        &rc.min_client_ver,
-        &rc.max_client_ver,
-        &rc.server_names,
-        probe.as_deref(),
-    )
-    .await;
+    // bd tce2：serverAcceptor="btls" 走 BoringSSL 握手（含 26zn 后握手记录
+    // 模仿消费）；默认 rustls 路径行为不变。
+    let outcome = if matches!(
+        rc.server_acceptor,
+        xray_reality::ServerAcceptorSetting::Btls
+    ) {
+        #[cfg(not(target_os = "ios"))]
+        {
+            xray_reality::server::server_tls_btls(
+                stream,
+                &rc.private_key,
+                &rc.short_ids,
+                rc.max_time_diff,
+                &rc.min_client_ver,
+                &rc.max_client_ver,
+                &rc.server_names,
+                probe.as_deref(),
+            )
+            .await
+        }
+        #[cfg(target_os = "ios")]
+        {
+            xray_reality::server::server_tls(
+                stream,
+                &rc.private_key,
+                &rc.short_ids,
+                rc.max_time_diff,
+                &rc.min_client_ver,
+                &rc.max_client_ver,
+                &rc.server_names,
+                probe.as_deref(),
+            )
+            .await
+        }
+    } else {
+        server_tls(
+            stream,
+            &rc.private_key,
+            &rc.short_ids,
+            rc.max_time_diff,
+            &rc.min_client_ver,
+            &rc.max_client_ver,
+            &rc.server_names,
+            probe.as_deref(),
+        )
+        .await
+    };
     match outcome {
         Ok(RealityServerOutcome::Verified {
             tls,

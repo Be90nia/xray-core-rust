@@ -15,6 +15,70 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
 
+/// bd tce2：REALITY 握手成功后的 TLS 流（rustls 默认 / btls opt-in）。
+///
+/// 两路在「ClientHello 判定 / dest fallback / probe 喂值」三处共享同一前置
+/// （[`verify_and_probe`]），仅 TLS 握手执行者不同；调用方按 AsyncRead +
+/// AsyncWrite 消费，无感知具体实现。
+pub enum RealityTlsStream<C> {
+    /// 默认：rustls（tokio-rustls）TLS 1.3 握手。
+    Rustls(TlsStream<PrefixedReader<C>>),
+    /// bd tce2 opt-in：BoringSSL（btls）服务端握手。
+    /// iOS 无注入 FFI（bd mygg 教训），整体 cfg 门控，opt-in 配置双保险。
+    #[cfg(not(target_os = "ios"))]
+    Btls(xray_tls::btls_server::BtlsServerStream<PrefixedReader<C>>),
+}
+
+impl<C: AsyncRead + AsyncWrite + Unpin> AsyncRead for RealityTlsStream<C> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Rustls(tls) => std::pin::Pin::new(tls).poll_read(cx, buf),
+            #[cfg(not(target_os = "ios"))]
+            Self::Btls(tls) => std::pin::Pin::new(tls).poll_read(cx, buf),
+        }
+    }
+}
+
+impl<C: AsyncRead + AsyncWrite + Unpin> AsyncWrite for RealityTlsStream<C> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            Self::Rustls(tls) => std::pin::Pin::new(tls).poll_write(cx, buf),
+            #[cfg(not(target_os = "ios"))]
+            Self::Btls(tls) => std::pin::Pin::new(tls).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Rustls(tls) => std::pin::Pin::new(tls).poll_flush(cx),
+            #[cfg(not(target_os = "ios"))]
+            Self::Btls(tls) => std::pin::Pin::new(tls).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Rustls(tls) => std::pin::Pin::new(tls).poll_shutdown(cx),
+            #[cfg(not(target_os = "ios"))]
+            Self::Btls(tls) => std::pin::Pin::new(tls).poll_shutdown(cx),
+        }
+    }
+}
+
 /// 解析后的 TLS 1.3 ClientHello（仅提取 REALITY 验证需要的字段）。
 #[derive(Debug, Clone)]
 pub struct ParsedClientHello<'a> {
@@ -363,16 +427,16 @@ pub fn verify_reality_client_hello(
 
 /// [`server_tls`] 的返回：REALITY 验证成功返回 TLS 连接，失败返回原连接 + 已读 record 供 fallback。
 pub enum RealityServerOutcome<C> {
-    /// REALITY 验证通过，返回 rustls TLS 连接（可传给 VLESS 入站）。
+    /// REALITY 验证通过，返回 TLS 连接（rustls 或 btls，见
+    /// [`RealityTlsStream`]；可传给 VLESS 入站）。
     ///
     /// `max_useless_records`（bd frxi）：本连接的"连续未推进 record"上限——
     /// 启动期探测值（[`crate::probe::probe_for_key`]），miss 时按配置 fallback
     /// （缺省 Go 默认 32，`reality/common.go:70`）。Go 侧由定制 BoringSSL 在
-    /// record 循环消费（`reality/conn.go:830-836`，超限 alert）；Rust rustls
-    /// 无 record 层消费点，值随连接交付调用方（mygg 后握手记录模仿消费，
-    /// 消费前 tracing 可观察）。
+    /// record 循环消费（`reality/conn.go:830-836`，超限 alert）；btls 路径
+    /// 另消费为后握手记录模仿触发条件（bd 26zn，见 [`server_tls_btls`]）。
     Verified {
-        tls: TlsStream<PrefixedReader<C>>,
+        tls: RealityTlsStream<C>,
         max_useless_records: u32,
     },
     /// REALITY 验证失败。调用方可拿回 `conn` + `record` 做 [`fallback_to_dest`]。
@@ -415,13 +479,90 @@ impl ProbeContext {
     }
 }
 
-/// REALITY 服务端握手（切片3b-ii）。
+/// 前置验证结果（rustls/btls 两路共享，bd tce2）。
+struct VerifiedHandshake {
+    /// REALITY auth_key（派生 HMAC 证书用）。
+    auth_key: [u8; 32],
+    /// 本连接的 maxUselessRecords 消费值（探测命中值或配置 fallback）。
+    max_useless_records: u32,
+    /// 探测命中的原始 tier（bd 26zn：`None` = 未启用探测或查表 miss；
+    /// btls 路径仅在 tier < u32::MAX（dest 会 alert）时发后握手模仿记录）。
+    probe_tier: Option<u32>,
+}
+
+/// REALITY 前置验证（rustls/btls 两路共享语义，bd tce2）：
+/// parse → SNI 前置门 → session_id verify → probe 查表。
+///
+/// Err = REALITY 验证失败（调用方转 [`RealityServerOutcome::Invalid`] 走
+/// fallback）；不返回 Err 的约定由各 server_tls* 函数保持。
+fn verify_and_probe(
+    record: &[u8],
+    server_private_key: &[u8; 32],
+    allowed_short_ids: &[[u8; 8]],
+    max_diff: u32,
+    min_client_ver: &[u8],
+    max_client_ver: &[u8],
+    server_names: &[String],
+    probe: Option<&ProbeContext>,
+) -> Result<VerifiedHandshake, RealityError> {
+    let parsed = parse_client_hello(record)?;
+    // t38j：SNI 白名单前置门。Go xtls/reality tls.go:211 `!config.ServerNames[
+    // serverName]` → break（steal-oneself fallback），在 short_id/timestamp
+    // 校验之前；精确匹配（map 查找），无 SNI 视为不匹配。
+    if !server_names.is_empty() {
+        let sni = parsed.server_name.as_deref().unwrap_or("");
+        if !server_names.iter().any(|n| n == sni) {
+            return Err(RealityError::InvalidServerName(sni.to_string()));
+        }
+    }
+
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0);
+    let (_payload, auth_key) = verify_reality_client_hello(
+        &parsed,
+        server_private_key,
+        now_unix,
+        max_diff,
+        allowed_short_ids,
+        min_client_ver,
+        max_client_ver,
+    )?;
+
+    // bd frxi：Go tls.go:435-437 Load(GlobalMaxCSSMsgCount) 等价——查表喂值，
+    // miss 用配置 fallback（缺省 32）。Go 在握手完成前 sleep(5s) 轮询等探测
+    // 结果；Rust 不阻塞握手（探测为启动期后台任务，miss 只损失该连接的
+    // 精确值），偏差登记在案。
+    let (max_useless_records, probe_tier) = match probe {
+        Some(ctx) => {
+            let sni = parsed.server_name.as_deref().unwrap_or("");
+            let key = ctx.key_for(sni, &parsed.alpn_protocols);
+            let tier = crate::probe::probe_for_key(&ctx.table, &key);
+            (tier.unwrap_or_else(|| ctx.fallback.fallback()), tier)
+        }
+        None => (
+            crate::config::MaxUselessRecordsSetting::Disabled.fallback(),
+            None,
+        ),
+    };
+    Ok(VerifiedHandshake {
+        auth_key,
+        max_useless_records,
+        probe_tier,
+    })
+}
+
+/// REALITY 服务端握手（rustls 默认路径）。
 ///
 /// 流程：
 /// 1. [`read_tls_record`] 读 ClientHello record
-/// 2. [`parse_client_hello`] + [`verify_reality_client_hello`] 验证
+/// 2. [`verify_and_probe`] 验证（parse/SNI 门/verify/查表）
 /// 3. 成功：[`generate_reality_ed25519_cert`] + [`build_server_config`] + rustls TLS 握手
 /// 4. 失败：返回 [`RealityServerOutcome::Invalid`]，调用方决定 fallback
+///
+/// btls（BoringSSL）opt-in 路径见 [`server_tls_btls`]；两路前置语义共享
+/// （[`verify_and_probe`]），dest fallback / probe 喂值行为一致。
 ///
 /// # 参数
 ///
@@ -463,71 +604,142 @@ where
     let record = read_tls_record(&mut conn).await.map_err(|e| {
         RealityError::TlsHandshake(format!("read ClientHello: {e}"))
     })?;
-    let outcome = (|| {
-        let parsed = parse_client_hello(&record)?;
-        // t38j：SNI 白名单前置门。Go xtls/reality tls.go:211 `!config.ServerNames[
-        // serverName]` → break（steal-oneself fallback），在 short_id/timestamp
-        // 校验之前；精确匹配（map 查找），无 SNI 视为不匹配。
-        if !server_names.is_empty() {
-            let sni = parsed.server_name.as_deref().unwrap_or("");
-            if !server_names.iter().any(|n| n == sni) {
-                return Err(RealityError::InvalidServerName(sni.to_string()));
-            }
-        }
-
-        let now_unix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as u32)
-            .unwrap_or(0);
-        let (_payload, auth_key) = verify_reality_client_hello(
-            &parsed,
-            server_private_key,
-            now_unix,
-            max_diff,
-            allowed_short_ids,
-            min_client_ver,
-            max_client_ver,
-        )?;
-        Ok::<_, RealityError>((auth_key, parsed.alpn_protocols, parsed.server_name))
-    })();
-
     // bd frxi：探测 key 需 sni + alpn，verify 失败路径（Invalid）不查表——
     // Go 侧消费点在 REALITY 握手成功分支内（tls.go:410-437），fallback 连接
     // 走原样转发，无消费。
-    let (auth_key, alpn_protocols, server_name) = match outcome {
+    let verified = match verify_and_probe(
+        &record,
+        server_private_key,
+        allowed_short_ids,
+        max_diff,
+        min_client_ver,
+        max_client_ver,
+        server_names,
+        probe,
+    ) {
         Ok(v) => v,
         Err(reason) => {
             return Ok(RealityServerOutcome::Invalid { conn, record, reason });
         }
     };
 
-    // bd frxi：Go tls.go:435-437 Load(GlobalMaxCSSMsgCount) 等价——查表喂值，
-    // miss 用配置 fallback（缺省 32）。Go 在握手完成前 sleep(5s) 轮询等探测
-    // 结果；Rust 不阻塞握手（探测为启动期后台任务，miss 只损失该连接的
-    // 精确值），偏差登记在案。
-    let max_useless_records = match probe {
-        Some(ctx) => {
-            let sni = server_name.as_deref().unwrap_or("");
-            let key = ctx.key_for(sni, &alpn_protocols);
-            crate::probe::probe_for_key(&ctx.table, &key)
-                .unwrap_or_else(|| ctx.fallback.fallback())
-        }
-        None => crate::config::MaxUselessRecordsSetting::Disabled.fallback(),
-    };
-
     // 3. 成功分支：生成 REALITY HMAC 证书 + TLS 握手
     // （证书为进程级固定空模板，Go init() 语义，与 SNI 无关）
-    let (cert_der, key_der) = generate_reality_ed25519_cert(&auth_key)?;
+    let (cert_der, key_der) = generate_reality_ed25519_cert(&verified.auth_key)?;
     let server_config = build_server_config(cert_der, key_der)?;
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
     let prefixed = PrefixedReader::new(record, conn);
     match acceptor.accept(prefixed).await {
         Ok(tls) => Ok(RealityServerOutcome::Verified {
-            tls,
-            max_useless_records,
+            tls: RealityTlsStream::Rustls(tls),
+            max_useless_records: verified.max_useless_records,
         }),
         Err(e) => Err(RealityError::TlsHandshake(e.to_string())),
     }
+}
+
+/// REALITY 服务端握手（btls/BoringSSL opt-in 路径，bd tce2）。
+///
+/// 前置与 [`server_tls`] 完全共享（[`verify_and_probe`]：ClientHello 预读
+/// 判定 / SNI 门 / session_id verify / probe 查表），dest fallback 语义一致
+/// （Invalid → 调用方 [`fallback_to_dest`]）；差异仅在握手执行者：
+/// BoringSSL server SSL（[`xray_tls::btls_server::accept`]）。
+///
+/// # bd 26zn：后握手记录模仿（消费点）
+///
+/// 握手完成后、连接交付前，按探测结果发一条模仿记录（Go reality
+/// tls.go:414-424：服务端把 dest 的后握手记录逐条重放给 REALITY 客户端，
+/// 使 REALITY 连接与 dest 直连的记录序列不可区分）。保守发送条件（与 Go
+/// 的差异登记在案——Go 无条件按探测长度列表逐条重放）：
+///
+/// - 仅当探测**命中**该 key 且 tier < u32::MAX（dest 对 CCS 有 alert 行为 =
+///   后握手记录形态存在）；tier == MaxInt（dest 从不 alert）或未启用探测 /
+///   查表 miss → 不发（Go 无此差异——Rust probe 无记录长度列表，不发比
+///   发错长度保守）。
+/// - 载荷：单条 type 23 application-data record（`SSL_send_post_handshake_record`
+///   单记录语义，AEAD sealed），inner 明文 = 48 字节零 padding，wire 总长
+///   70B（5 header + 1 inner content-type + 48 payload + 16 tag）。Go 的
+///   长度来自真实探测 dest 记录；Rust probe 无长度信息，取保守常数。
+///
+/// # Errors
+///
+/// - [`read_tls_record`] IO 错误 → [`RealityError::TlsHandshake`]
+/// - 证书生成失败 → [`RealityError::CertGenerate`]
+/// - btls 握手失败 → [`RealityError::TlsHandshake`]
+///
+/// 验证失败不返回 Err，返回 [`RealityServerOutcome::Invalid`]（同 [`server_tls`]）。
+#[cfg(not(target_os = "ios"))]
+pub async fn server_tls_btls<C>(
+    mut conn: C,
+    server_private_key: &[u8; 32],
+    allowed_short_ids: &[[u8; 8]],
+    max_diff: u32,
+    min_client_ver: &[u8],
+    max_client_ver: &[u8],
+    server_names: &[String],
+    probe: Option<&ProbeContext>,
+) -> std::result::Result<RealityServerOutcome<C>, RealityError>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    let record = read_tls_record(&mut conn).await.map_err(|e| {
+        RealityError::TlsHandshake(format!("read ClientHello: {e}"))
+    })?;
+    let verified = match verify_and_probe(
+        &record,
+        server_private_key,
+        allowed_short_ids,
+        max_diff,
+        min_client_ver,
+        max_client_ver,
+        server_names,
+        probe,
+    ) {
+        Ok(v) => v,
+        Err(reason) => {
+            return Ok(RealityServerOutcome::Invalid { conn, record, reason });
+        }
+    };
+
+    let (cert_der, key_der) = generate_reality_ed25519_cert(&verified.auth_key)?;
+    let prefixed = PrefixedReader::new(record, conn);
+    let mut tls = xray_tls::btls_server::accept(prefixed, &cert_der, &key_der)
+        .await
+        .map_err(|e| RealityError::TlsHandshake(format!("btls accept: {e}")))?;
+
+    // bd 26zn：后握手记录模仿（条件见函数文档）。
+    if verified.probe_tier.is_some_and(|tier| tier < u32::MAX) {
+        // 48B 零 padding；TLS 1.3 SSL_write 在其外自动加 inner content-type(1)
+        // 与 AEAD tag(16)，wire = 5+1+48+16 = 70B 单记录。
+        //
+        // 发送走 tokio poll 写路径而非 [`xray_tls::btls_reality::
+        // send_post_handshake_record`]：该原语内部裸调 SSL_write，会在
+        // tokio-btls 的 BIO 桥接外触发（StreamWrapper.context==0 → debug
+        // assert panic）——原语面向非 tokio BIO 场景（Go 兼容宿主）。tokio
+        // 写路径对 48B（<< max_send_fragment 16KB）同样保证单记录 + type 23
+        // + AEAD，与 Go tls.go:414-424 的逐记录重放语义一致。
+        let payload = [0u8; 48];
+        use tokio::io::AsyncWriteExt;
+        match tls.write_all(&payload).await {
+            Ok(()) => {
+                let _ = tls.flush().await;
+                tracing::debug!(
+                    max_useless_records = verified.max_useless_records,
+                    "reality btls: sent post-handshake mirror record"
+                );
+            }
+            Err(e) => {
+                // 模仿记录发送失败不终止连接（REALITY 数据面不受影响），
+                // 但不静默：debug 记录原因。
+                tracing::debug!(error = %e, "reality btls: post-handshake mirror record write failed");
+            }
+        }
+    }
+
+    Ok(RealityServerOutcome::Verified {
+        tls: RealityTlsStream::Btls(tls),
+        max_useless_records: verified.max_useless_records,
+    })
 }
 
 /// TLS record 最大长度（RFC 5246: 2^14 bytes，防止恶意 OOM）。
@@ -2193,6 +2405,199 @@ mod tests {
             (Ok(Ok(_)), other) => panic!("server unexpected outcome (see outcome variant)"),
             (Ok(Err(e)), _) => panic!("client u_client failed: {e:?}"),
             (Err(_timeout), _) => panic!("client u_client timeout"),
+        }
+    }
+
+    // ===== bd tce2：btls server acceptor =====
+
+    /// btls 路径 loopback 共享装配：REALITY 客户端（u_client chrome btls 指纹）
+    /// ↔ [`server_tls_btls`]。
+    ///
+    /// `probe_tier`：`Some(tier)` = 三档 alpn key 全插表（命中）；`None` =
+    /// 不启用探测。返回（客户端握手结果, 服务端 outcome）。
+    async fn btls_reality_loopback(
+        probe_tier: Option<u32>,
+    ) -> (
+        Result<
+            Result<
+                crate::client::RealityTlsStream<xray_transport::connection::DuplexConnection>,
+                RealityError,
+            >,
+            tokio::time::error::Elapsed,
+        >,
+        Result<RealityServerOutcome<tokio::io::DuplexStream>, RealityError>,
+    ) {
+        ensure_crypto_provider();
+        use std::time::Duration;
+        use tokio::io::duplex;
+        use x25519_dalek::{PublicKey, StaticSecret};
+        use crate::client::{u_client, UConnState};
+        use crate::config::RealityConfig;
+        use xray_proto::transport::internet::reality::Config as ProtoConfig;
+
+        let server_priv_array = [0x11u8; 32];
+        let short_id = [0xaa; 8];
+        let server_secret = StaticSecret::from(server_priv_array);
+        let server_pub = PublicKey::from(&server_secret);
+
+        let proto = ProtoConfig {
+            fingerprint: "chrome".into(),
+            public_key: server_pub.as_bytes().to_vec(),
+            server_name: "example.com".into(),
+            short_id: short_id.to_vec(),
+            ..Default::default()
+        };
+        let reality_config = RealityConfig::from_proto(&proto).unwrap();
+        let state = UConnState::new(reality_config).unwrap();
+
+        let (client, server) = duplex(65536);
+        let client = xray_transport::connection::DuplexConnection::new(client);
+
+        let probe_ctx = probe_tier.map(|tier| {
+            let table = crate::probe::ProbeTable::new();
+            // chrome 模板 ALPN 档不硬编码——三档全插保证 key 命中。
+            for alpn in [
+                crate::probe::AlpnId::None,
+                crate::probe::AlpnId::Http11,
+                crate::probe::AlpnId::H2,
+            ] {
+                table.insert(
+                    crate::probe::ProbeKey {
+                        dest: "fallback.example:443".to_string(),
+                        server_name: "example.com".to_string(),
+                        alpn,
+                    },
+                    tier,
+                );
+            }
+            ProbeContext {
+                table,
+                dest: "fallback.example:443".to_string(),
+                fallback: crate::config::MaxUselessRecordsSetting::Disabled,
+            }
+        });
+
+        let server_task = tokio::spawn(async move {
+            server_tls_btls(
+                server,
+                &server_priv_array,
+                &[short_id],
+                43200,
+                &[],
+                &[],
+                &["example.com".to_string()],
+                probe_ctx.as_ref(),
+            )
+            .await
+        });
+
+        let client_result =
+            tokio::time::timeout(Duration::from_secs(10), u_client(client, state)).await;
+        let server_result = server_task.await.unwrap();
+        (client_result, server_result)
+    }
+
+    /// btls 路径 REALITY 全链：Verified（Btls 变体）+ 双向数据 roundtrip。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_tls_btls_loopback_verified_roundtrip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client_result, server_result) = btls_reality_loopback(None).await;
+        // 服务端 outcome 解构（Verified 且 btls 变体）
+        let RealityServerOutcome::Verified {
+            tls: mut server_tls, ..
+        } = server_result.unwrap()
+        else {
+            panic!("server outcome not Verified");
+        };
+        assert!(matches!(server_tls, RealityTlsStream::Btls(_)));
+        let Ok(Ok(mut client)) = client_result else {
+            panic!("client u_client failed or timeout");
+        };
+        // 双向数据 roundtrip（enum AsyncRead/AsyncWrite 语义）
+        client.write_all(b"hello btls").await.unwrap();
+        let mut buf = [0u8; 10];
+        server_tls.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello btls");
+        server_tls.write_all(&buf).await.unwrap();
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello btls");
+    }
+
+    /// bd 26zn：probe 命中（tier < MaxInt）→ 握手完成后发后握手模仿记录；
+    /// 客户端 TLS 栈解密后读到 48B 零明文（wire 70B 单记录的应用层投影）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_tls_btls_sends_post_handshake_mirror_on_probe_hit() {
+        use tokio::io::AsyncReadExt;
+
+        let (client_result, server_result) = btls_reality_loopback(Some(16)).await;
+        match (client_result, server_result) {
+            (Ok(Ok(mut client)), Ok(RealityServerOutcome::Verified { .. })) => {
+                let mut buf = [0u8; 48];
+                tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut buf))
+                    .await
+                    .expect("mirror record should arrive within 5s")
+                    .expect("read mirror payload");
+                assert!(buf.iter().all(|&b| b == 0), "mirror payload must be zeros");
+            }
+            (Ok(Ok(_)), _) => panic!("server outcome not Verified"),
+            (Ok(Err(e)), _) => panic!("client u_client failed: {e:?}"),
+            (Err(_), _) => panic!("client u_client timeout"),
+        }
+    }
+
+    /// bd 26zn 保守条件：probe tier == MaxInt（dest 从不 alert）→ 不发模仿记录。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_tls_btls_no_mirror_on_maxint_tier() {
+        use tokio::io::AsyncReadExt;
+
+        let (client_result, server_result) = btls_reality_loopback(Some(u32::MAX)).await;
+        match (client_result, server_result) {
+            (Ok(Ok(mut client)), Ok(RealityServerOutcome::Verified { .. })) => {
+                let mut buf = [0u8; 48];
+                let r = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf))
+                    .await;
+                assert!(r.is_err(), "no mirror record must be sent on MaxInt tier");
+            }
+            (Ok(Ok(_)), _) => panic!("server outcome not Verified"),
+            (Ok(Err(e)), _) => panic!("client u_client failed: {e:?}"),
+            (Err(_), _) => panic!("client u_client timeout"),
+        }
+    }
+
+    /// btls 路径非 REALITY ClientHello → Invalid（dest fallback 语义与 rustls
+    /// 路径一致，共享 [`verify_and_probe`]）。
+    #[tokio::test]
+    async fn server_tls_btls_invalid_returns_invalid_outcome() {
+        use tokio::io::{AsyncWriteExt, duplex};
+
+        // 合法 hybrid CH 但 session_id 非加密载荷（verify 失败点在解密，
+        // 与 rustls 版 server_tls_invalid_returns_invalid_outcome 同构）。
+        let random = [0x55u8; 32];
+        let session_id = [0x77u8; 32];
+        let record = build_test_client_hello_with_key_share_entries(
+            &random,
+            &session_id,
+            &[(0x11ec, vec![0xAAu8; 1216])],
+            Some("example.com"),
+        );
+
+        let (mut client, server) = duplex(4096);
+        let server_priv = [0x11u8; 32];
+        let short_id = [0xaa; 8];
+
+        let server_task = tokio::spawn(async move {
+            server_tls_btls(server, &server_priv, &[short_id], 43200, &[], &[], &[], None).await
+        });
+        client.write_all(&record).await.unwrap();
+
+        let outcome = server_task.await.unwrap().unwrap();
+        match outcome {
+            RealityServerOutcome::Invalid { record: rec, reason, .. } => {
+                assert_eq!(rec, record, "Invalid outcome 应保留原 record 供 fallback");
+                assert!(matches!(reason, RealityError::SessionIdDecryptFailed));
+            }
+            RealityServerOutcome::Verified { .. } => panic!("expected Invalid, got Verified"),
         }
     }
 }

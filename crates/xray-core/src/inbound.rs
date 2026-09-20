@@ -2053,6 +2053,8 @@ struct RealityInboundConfig {
     max_client_ver: Vec<u8>,
     /// bd frxi：启动期 CCS 探测开关（缺省 Disabled 保持现行为）。
     max_useless_records: xray_reality::MaxUselessRecordsSetting,
+    /// bd tce2：TLS acceptor 选择（缺省 Rustls 保持现行为）。
+    server_acceptor: xray_reality::ServerAcceptorSetting,
 }
 
 fn parse_reality_config(
@@ -2212,6 +2214,11 @@ fn parse_reality_config(
             json.get("maxUselessRecords"),
         )
         .map_err(std::io::Error::other)?,
+        // bd tce2：realitySettings.serverAcceptor（"rustls" 默认 / "btls" opt-in）。
+        server_acceptor: xray_reality::ServerAcceptorSetting::from_json(
+            json.get("serverAcceptor"),
+        )
+        .map_err(std::io::Error::other)?,
     })
 }
 
@@ -2288,19 +2295,58 @@ async fn serve_reality_vless(
         let min_ver = cfg.min_client_ver.clone();
         let max_ver = cfg.max_client_ver.clone();
         let probe_ctx = probe_ctx.clone();
+        // bd tce2：serverAcceptor="btls" 走 BoringSSL 握手（含 26zn 后握手记录
+        // 模仿消费）；默认 rustls 路径行为不变。
+        let use_btls = matches!(
+            cfg.server_acceptor,
+            xray_reality::ServerAcceptorSetting::Btls
+        );
         tokio::spawn(async move {
-            match server_tls(
-                stream,
-                &key,
-                &ids,
-                max_diff,
-                &min_ver,
-                &max_ver,
-                &names,
-                probe_ctx.as_ref(),
-            )
-            .await
-            {
+            let outcome = if use_btls {
+                #[cfg(not(target_os = "ios"))]
+                {
+                    xray_reality::server::server_tls_btls(
+                        stream,
+                        &key,
+                        &ids,
+                        max_diff,
+                        &min_ver,
+                        &max_ver,
+                        &names,
+                        probe_ctx.as_ref(),
+                    )
+                    .await
+                }
+                #[cfg(target_os = "ios")]
+                {
+                    // iOS 无注入 FFI（配置解析层已拒 serverAcceptor=btls），
+                    // 此处运行时防御性回落 rustls（零功能损失）。
+                    server_tls(
+                        stream,
+                        &key,
+                        &ids,
+                        max_diff,
+                        &min_ver,
+                        &max_ver,
+                        &names,
+                        probe_ctx.as_ref(),
+                    )
+                    .await
+                }
+            } else {
+                server_tls(
+                    stream,
+                    &key,
+                    &ids,
+                    max_diff,
+                    &min_ver,
+                    &max_ver,
+                    &names,
+                    probe_ctx.as_ref(),
+                )
+                .await
+            };
+            match outcome {
                 Ok(RealityServerOutcome::Verified {
                     tls,
                     max_useless_records,
@@ -5470,6 +5516,7 @@ mod tests {
             min_client_ver: Vec::new(),
             max_client_ver: Vec::new(),
             max_useless_records: xray_reality::MaxUselessRecordsSetting::Disabled,
+            server_acceptor: xray_reality::ServerAcceptorSetting::Rustls,
         };
         let rl = InboundTcpListener::bind(
             "127.0.0.1:0",

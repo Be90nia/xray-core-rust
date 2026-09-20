@@ -11,8 +11,11 @@
 //! - [`client`]：[`u_client`](client::u_client) 工厂——btls 浏览器指纹主路径
 //!   （`xray_tls::btls_reality::connect_reality`）+ watfaq-rustls fallback（指纹不被
 //!   btls 支持时走标准 rustls ClientHello）
-//! - [`server`]：[`server_tls`](server::server_tls)——读 ClientHello record → REALITY
-//!   验证 → rustls 伪造证书握手；验证失败返回
+//! - [`server`]：[`server_tls`](server::server_tls)（rustls 默认）与
+//!   [`server_tls_btls`](server::server_tls_btls)（bd tce2 opt-in，BoringSSL
+//!   握手 + 26zn 后握手记录模仿消费）——读 ClientHello record → REALITY
+//!   验证（共享前置）→ 伪造证书握手（[`RealityTlsStream`](server::RealityTlsStream)
+//!   双路）；验证失败返回
 //!   [`RealityServerOutcome::Invalid`](server::RealityServerOutcome::Invalid) 供调用方 fallback
 //! - [`mitm`]：REALITY 证书生成（Go init() 进程级静态模板 + per-connection HMAC 尾部）
 //! - [`register`]：transport dialer 注册（tcp/splithttp 的 `security=reality` 生产接线）
@@ -41,8 +44,8 @@ pub mod probe;
 pub mod register;
 
 pub use config::{
-    LimitFallback, MaxUselessRecordsSetting, RealityConfig, ShortId, SHORT_ID_LEN,
-    X25519_KEY_LEN,
+    LimitFallback, MaxUselessRecordsSetting, RealityConfig, ServerAcceptorSetting, ShortId,
+    SHORT_ID_LEN, X25519_KEY_LEN,
 };
 pub use error::{RealityError, Result};
 pub use util::{get_path_locked, open_key_log_writer};

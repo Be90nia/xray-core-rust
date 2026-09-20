@@ -352,6 +352,51 @@ impl RealityConfig {
     }
 }
 
+/// REALITY 服务端 TLS acceptor 选择（bd tce2，Rust 私有扩展；Go 无对应配置面）。
+///
+/// 三态 JSON 表达（`realitySettings.serverAcceptor`）：
+/// - 缺失 / `null` / `"rustls"` → [`ServerAcceptorSetting::Rustls`]（默认，现行为）
+/// - `"btls"` → [`ServerAcceptorSetting::Btls`]（BoringSSL server acceptor，opt-in；
+///   iOS 构建下配置即硬错——该平台无注入 FFI，bd mygg 教训）
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ServerAcceptorSetting {
+    /// rustls acceptor（默认）。
+    #[default]
+    Rustls,
+    /// btls（BoringSSL）acceptor（opt-in）。
+    Btls,
+}
+
+impl ServerAcceptorSetting {
+    /// JSON 解析；非合法字符串/类型硬错（配置错误不静默吞）。
+    ///
+    /// # Errors
+    /// 值非 `"rustls"`/`"btls"` 字符串（或 JSON 类型不符）→ Err。
+    pub fn from_json(v: Option<&serde_json::Value>) -> Result<Self, String> {
+        let Some(v) = v else {
+            return Ok(Self::Rustls);
+        };
+        match v {
+            serde_json::Value::Null => Ok(Self::Rustls),
+            serde_json::Value::String(s) => match s.as_str() {
+                "rustls" => Ok(Self::Rustls),
+                #[cfg(not(target_os = "ios"))]
+                "btls" => Ok(Self::Btls),
+                #[cfg(target_os = "ios")]
+                "btls" => Err(
+                    "reality: serverAcceptor=\"btls\" is not available on iOS builds".to_string(),
+                ),
+                other => Err(format!(
+                    "reality: invalid serverAcceptor {other:?} (need \"rustls\" or \"btls\")"
+                )),
+            },
+            other => Err(format!(
+                "reality: invalid serverAcceptor {other} (need \"rustls\" or \"btls\")"
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,5 +659,35 @@ mod tests {
         // 类型错误硬错
         assert!(MaxUselessRecordsSetting::from_json(Some(&json!("32"))).is_err());
         assert!(MaxUselessRecordsSetting::from_json(Some(&json!(-1))).is_err());
+    }
+
+    /// bd tce2：realitySettings.serverAcceptor 三态解析。
+    #[test]
+    fn from_json_server_acceptor_three_states() {
+        use super::ServerAcceptorSetting;
+        use serde_json::json;
+        // 缺省（键缺失）/ null：默认 rustls
+        assert_eq!(
+            ServerAcceptorSetting::from_json(None).unwrap(),
+            ServerAcceptorSetting::Rustls
+        );
+        assert_eq!(
+            ServerAcceptorSetting::from_json(Some(&serde_json::Value::Null)).unwrap(),
+            ServerAcceptorSetting::Rustls
+        );
+        // 显式 "rustls"
+        assert_eq!(
+            ServerAcceptorSetting::from_json(Some(&json!("rustls"))).unwrap(),
+            ServerAcceptorSetting::Rustls
+        );
+        // opt-in "btls"（非 iOS 构建下合法）
+        #[cfg(not(target_os = "ios"))]
+        assert_eq!(
+            ServerAcceptorSetting::from_json(Some(&json!("btls"))).unwrap(),
+            ServerAcceptorSetting::Btls
+        );
+        // 未知值 / 类型错误硬错
+        assert!(ServerAcceptorSetting::from_json(Some(&json!("boring"))).is_err());
+        assert!(ServerAcceptorSetting::from_json(Some(&json!(true))).is_err());
     }
 }
