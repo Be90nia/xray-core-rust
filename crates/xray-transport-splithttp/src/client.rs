@@ -342,13 +342,18 @@ impl DefaultDialerClient {
     /// `fingerprint` 非空时出站用 btls `u_client` 完成真实浏览器指纹握手
     /// （Go `tls.UClient` 等价）；`None` 保持 hyper-rustls 路径零变化。
     ///
-    /// ponytail: hyper-rustls 0.27.9 enable_http1+enable_http2 会把 alpn 设回
-    /// `[h2, http/1.1]`（builder.rs:346），覆盖我们传入 `tls_settings.alpn` 的
-    /// 用户偏好——splithttp Go 端空 alpn 默认亦此值，行为一致。
+    /// ponytail: hyper-rustls 0.27.9 `with_tls_config` 对预定义 alpn_protocols
+    /// 直接 assert panic（builder.rs:61-64 "ALPN protocols should not be
+    /// pre-defined"）——`build_client_config` 默认填 `[h2, http/1.1]`
+    /// （client_config.rs:188），不清空则非 btls 出站构建即 panic（bd 3ze9，
+    /// 448de84d 重构曾误删 clear）。enable_http1+enable_http2 随后覆写为
+    /// `[h2, http/1.1]`（builder.rs:346）；用户 alpn 已在 register.rs
+    /// decide_http_version 消费（本调用之前）。btls 分支不读
+    /// config.alpn_protocols（指纹 ALPN 走模板/显式覆盖），不受影响。
     #[must_use]
     pub fn new(
         config: Arc<Config>,
-        tls_config: RustlsClientConfig,
+        mut tls_config: RustlsClientConfig,
         dial: DialTarget,
         fingerprint: Option<Fingerprint>,
         security_json: Option<serde_json::Value>,
@@ -367,6 +372,9 @@ impl DefaultDialerClient {
                 security_json,
             })
         } else {
+            // clear 只在 rustls 分支：btls 分支的 config 原样传给 u_client
+            // （清单外指纹回退 rustls 时保留 alpn）。
+            tls_config.alpn_protocols.clear();
             let mut builder = HttpsConnectorBuilder::new()
                 .with_tls_config(tls_config)
                 .https_or_http();
@@ -886,6 +894,28 @@ mod tests {
             }
         }
         panic!("mock expected 2 streams on one connection (refused + replay)");
+    }
+
+    /// 防回退（bd 3ze9）：hyper-rustls 0.27.9 `with_tls_config` 对非空
+    /// alpn_protocols 直接 assert panic（builder.rs:61-64）。448de84d 重构误删
+    /// `alpn_protocols.clear()` 后，生产出站（build_client_config 默认填
+    /// `[h2, http/1.1]`）在 DefaultDialerClient::new 构建阶段即 panic——
+    /// 当时测试样板 client_tls() 恰好空 alpn，掩盖了回归。本测试传入非空
+    /// alpn：clear 在位则构建成功（enable_http1/2 随后覆写），clear 缺失
+    /// 则 with_tls_config assert 即炸。
+    #[test]
+    fn new_with_predefined_alpn_builds_without_panic() {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let (cert, _key) = self_signed_cert();
+        let mut tls = client_tls(cert);
+        tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let _c = DefaultDialerClient::new(
+            Arc::new(Config::default()),
+            tls,
+            DialTarget { host: "127.0.0.1".into(), port: 0, sni: String::new() },
+            None,
+            None,
+        );
     }
 
     // 503 对照测试锁定"HTTP 错误不重放"，重放资格判定 is_packet_replayable 与
