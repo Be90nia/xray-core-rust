@@ -1,0 +1,63 @@
+# 跨平台长跑压测（macOS 单 job 6h 内 + ubuntu 6h 档；手动触发）。
+# 产物：summary.md + metrics.csv 上传 artifact。
+# iOS/Android 不跑压测（无 runner，Mobile Gates 编译门维持现状）。
+name: stress
+
+on:
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: 'Run duration in hours (job timeout = hours*60 + 90min build margin)'
+        required: false
+        default: '5'
+
+jobs:
+  stress:
+    timeout-minutes: 390  # 6h 硬顶（5h run + build margin）
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            label: macos
+          - os: ubuntu-latest
+            label: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # boringssl cmake 配置需要 go（macos-14 镜像缺省无 go）
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Install protoc
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+          else
+            brew install protobuf
+          fi
+      - uses: ./.github/actions/setup-boringssl
+      - name: Build harness
+        run: cargo build --release -p xray-stress
+      - name: Run stress (${{ matrix.label }})
+        shell: bash
+        run: |
+          hours="${{ inputs.hours }}"
+          [ -z "$hours" ] && hours=5
+          ./target/release/xray-stress \
+            --duration $((hours * 3600)) \
+            --concurrency 8 --s2-conns 4 \
+            --scenarios s1,s2,s3,s4 \
+            --sample-interval 30 \
+            --out-dir stress-out
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stress-${{ matrix.label }}
+          path: |
+            stress-out/summary.md
+            stress-out/metrics.csv
+            stress-out/summary-latest.md
