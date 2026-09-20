@@ -35,6 +35,9 @@ pub struct ParsedClientHello<'a> {
     pub key_share_mlkem768: bool,
     /// server_name extension 中的 SNI；无则 `None`（用于 server_names 白名单匹配）。
     pub server_name: Option<String>,
+    /// bd frxi：alpn extension 中的协议名列表（按 ClientHello 顺序；无 extension 则空）。
+    /// Go `tls.go:411-417` 用 `alpn_protocols[0]` 推导探测 key 的 alpn 段。
+    pub alpn_protocols: Vec<String>,
 }
 
 /// 解析 TLS record，提取 REALITY 验证需要的 ClientHello 字段。
@@ -112,6 +115,7 @@ fn parse_handshake(msg: &[u8]) -> Result<ParsedClientHello<'_>, RealityError> {
     let mut key_share_x25519 = None;
     let mut key_share_mlkem768 = false;
     let mut server_name = None;
+    let mut alpn_protocols = Vec::new();
     let mut e_off = 0;
     while e_off + 4 <= exts.len() {
         let etype = u16::from_be_bytes([exts[e_off], exts[e_off + 1]]);
@@ -129,6 +133,9 @@ fn parse_handshake(msg: &[u8]) -> Result<ParsedClientHello<'_>, RealityError> {
                 key_share_x25519 = pub_key;
                 key_share_mlkem768 = mlkem_ok;
             }
+            // bd frxi：alpn extension（RFC 7301）。畸形项跳过——REALITY 验证
+            // 不依赖 alpn，此处只服务探测 key 推导，不必硬错。
+            0x0010 if alpn_protocols.is_empty() => alpn_protocols = parse_alpn(edata),
             _ => {}
         }
     }
@@ -140,7 +147,33 @@ fn parse_handshake(msg: &[u8]) -> Result<ParsedClientHello<'_>, RealityError> {
         key_share_x25519,
         key_share_mlkem768,
         server_name,
+        alpn_protocols,
     })
+}
+
+/// 解析 alpn extension data（RFC 7301：`alpn_list(2) + [len(1)+name]*`）。
+///
+/// 畸形（长度越界）按截断处理返回已解析项——调用方仅用于探测 key 推导。
+fn parse_alpn(edata: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    if edata.len() < 2 {
+        return out;
+    }
+    let list_len = u16::from_be_bytes([edata[0], edata[1]]) as usize;
+    let end = std::cmp::min(2 + list_len, edata.len());
+    let mut off = 2;
+    while off < end {
+        let name_len = edata[off] as usize;
+        off += 1;
+        if off + name_len > end {
+            break;
+        }
+        if let Ok(name) = std::str::from_utf8(&edata[off..off + name_len]) {
+            out.push(name.to_string());
+        }
+        off += name_len;
+    }
+    out
 }
 
 /// 解析 server_name extension (0x0000)，返回第一个 host_name 类型的 SNI。
@@ -331,13 +364,55 @@ pub fn verify_reality_client_hello(
 /// [`server_tls`] 的返回：REALITY 验证成功返回 TLS 连接，失败返回原连接 + 已读 record 供 fallback。
 pub enum RealityServerOutcome<C> {
     /// REALITY 验证通过，返回 rustls TLS 连接（可传给 VLESS 入站）。
-    Verified(TlsStream<PrefixedReader<C>>),
+    ///
+    /// `max_useless_records`（bd frxi）：本连接的"连续未推进 record"上限——
+    /// 启动期探测值（[`crate::probe::probe_for_key`]），miss 时按配置 fallback
+    /// （缺省 Go 默认 32，`reality/common.go:70`）。Go 侧由定制 BoringSSL 在
+    /// record 循环消费（`reality/conn.go:830-836`，超限 alert）；Rust rustls
+    /// 无 record 层消费点，值随连接交付调用方（mygg 后握手记录模仿消费，
+    /// 消费前 tracing 可观察）。
+    Verified {
+        tls: TlsStream<PrefixedReader<C>>,
+        max_useless_records: u32,
+    },
     /// REALITY 验证失败。调用方可拿回 `conn` + `record` 做 [`fallback_to_dest`]。
     Invalid {
         conn: C,
         record: Vec<u8>,
         reason: RealityError,
     },
+}
+
+/// bd frxi：server_tls 的启动期探测消费上下文。
+///
+/// listener 启动时若配置启用探测（[`crate::config::MaxUselessRecordsSetting::Probe`]），
+/// 创建 [`crate::probe::ProbeTable`] 并 spawn [`crate::probe::detect_max_useless_records`]，
+/// 再把表 + dest + fallback 打包为本结构传给 [`server_tls`]；未启用传 `None`
+/// （行为与改动前一致：不查表，喂 Go 默认 32）。
+#[derive(Clone)]
+pub struct ProbeContext {
+    pub table: crate::probe::ProbeTable,
+    /// 探测 dest（即 fallback_dest，Go `config.Dest`）。
+    pub dest: String,
+    /// 查表 miss 时的 fallback 值（Disabled→32 / Probe(n)→n）。
+    pub fallback: crate::config::MaxUselessRecordsSetting,
+}
+
+impl ProbeContext {
+    /// Go `tls.go:411-417` key 推导的 Rust 等价：dest + " " + sni + " " + alpn_id。
+    /// alpn_id：无 ALPN → None；首个协议为 "h2" → H2；否则 → Http11。
+    fn key_for(&self, server_name: &str, alpn_protocols: &[String]) -> crate::probe::ProbeKey {
+        let alpn = match alpn_protocols.first().map(String::as_str) {
+            None => crate::probe::AlpnId::None,
+            Some("h2") => crate::probe::AlpnId::H2,
+            Some(_) => crate::probe::AlpnId::Http11,
+        };
+        crate::probe::ProbeKey {
+            dest: self.dest.clone(),
+            server_name: server_name.to_string(),
+            alpn,
+        }
+    }
 }
 
 /// REALITY 服务端握手（切片3b-ii）。
@@ -361,6 +436,8 @@ pub enum RealityServerOutcome<C> {
 ///   `config.ServerNames[serverName]`：无 SNI 或不在白名单 → 前置失败走
 ///   steal-oneself fallback）。空切片 = 门禁用（仅测试用低层 API；生产
 ///   parse 层已强制非空白名单，Go transport_security.go:94-96 空 serverNames 拒启）。
+/// - `probe`：bd frxi 启动期探测消费上下文；`None` = 未启用探测（不查表，
+///   `Verified.max_useless_records` 恒为配置 fallback / Go 默认 32）。
 ///
 /// # Errors
 ///
@@ -378,6 +455,7 @@ pub async fn server_tls<C>(
     min_client_ver: &[u8],
     max_client_ver: &[u8],
     server_names: &[String],
+    probe: Option<&ProbeContext>,
 ) -> std::result::Result<RealityServerOutcome<C>, RealityError>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -410,14 +488,31 @@ where
             min_client_ver,
             max_client_ver,
         )?;
-        Ok::<_, RealityError>(auth_key)
+        Ok::<_, RealityError>((auth_key, parsed.alpn_protocols, parsed.server_name))
     })();
 
-    let auth_key = match outcome {
+    // bd frxi：探测 key 需 sni + alpn，verify 失败路径（Invalid）不查表——
+    // Go 侧消费点在 REALITY 握手成功分支内（tls.go:410-437），fallback 连接
+    // 走原样转发，无消费。
+    let (auth_key, alpn_protocols, server_name) = match outcome {
         Ok(v) => v,
         Err(reason) => {
             return Ok(RealityServerOutcome::Invalid { conn, record, reason });
         }
+    };
+
+    // bd frxi：Go tls.go:435-437 Load(GlobalMaxCSSMsgCount) 等价——查表喂值，
+    // miss 用配置 fallback（缺省 32）。Go 在握手完成前 sleep(5s) 轮询等探测
+    // 结果；Rust 不阻塞握手（探测为启动期后台任务，miss 只损失该连接的
+    // 精确值），偏差登记在案。
+    let max_useless_records = match probe {
+        Some(ctx) => {
+            let sni = server_name.as_deref().unwrap_or("");
+            let key = ctx.key_for(sni, &alpn_protocols);
+            crate::probe::probe_for_key(&ctx.table, &key)
+                .unwrap_or_else(|| ctx.fallback.fallback())
+        }
+        None => crate::config::MaxUselessRecordsSetting::Disabled.fallback(),
     };
 
     // 3. 成功分支：生成 REALITY HMAC 证书 + TLS 握手
@@ -427,7 +522,10 @@ where
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
     let prefixed = PrefixedReader::new(record, conn);
     match acceptor.accept(prefixed).await {
-        Ok(tls) => Ok(RealityServerOutcome::Verified(tls)),
+        Ok(tls) => Ok(RealityServerOutcome::Verified {
+            tls,
+            max_useless_records,
+        }),
         Err(e) => Err(RealityError::TlsHandshake(e.to_string())),
     }
 }
@@ -1242,7 +1340,7 @@ mod tests {
 
         let (client, server) = duplex(65536);
         let server_task = tokio::spawn(async move {
-            server_tls(server, &[0x11u8; 32], &[[0xaa; 8]], 43200, &[], &[], &[]).await
+            server_tls(server, &[0x11u8; 32], &[[0xaa; 8]], 43200, &[], &[], &[], None).await
         });
 
         let mut client = client;
@@ -1256,7 +1354,7 @@ mod tests {
                     "expected NoKeyShareX25519, got {reason:?}"
                 );
             }
-            Ok(RealityServerOutcome::Verified(_)) => {
+            Ok(RealityServerOutcome::Verified { .. }) => {
                 panic!("expected Invalid outcome, got Verified")
             }
             Err(e) => panic!("expected Invalid outcome, got server error: {e:?}"),
@@ -1436,7 +1534,7 @@ mod tests {
         let short_id = [0xaa; 8];
 
         let server_task = tokio::spawn(async move {
-            server_tls(server, &server_priv, &[short_id], 43200, &[], &[], &[]).await
+            server_tls(server, &server_priv, &[short_id], 43200, &[], &[], &[], None).await
         });
 
         // client 发送 ClientHello record 后保持连接（让 server_tls 完成 verify）
@@ -1451,7 +1549,7 @@ mod tests {
                     "expected SessionIdDecryptFailed, got {reason:?}"
                 );
             }
-            RealityServerOutcome::Verified(_) => panic!("expected Invalid, got Verified"),
+            RealityServerOutcome::Verified { .. } => panic!("expected Invalid, got Verified"),
         }
     }
 
@@ -1472,7 +1570,7 @@ mod tests {
         let whitelist = vec!["other.com".to_string()];
 
         let server_task = tokio::spawn(async move {
-            server_tls(server, &server_priv, &[[0xaa; 8]], 43200, &[], &[], &whitelist).await
+            server_tls(server, &server_priv, &[[0xaa; 8]], 43200, &[], &[], &whitelist, None).await
         });
         client.write_all(&record).await.unwrap();
 
@@ -1484,7 +1582,7 @@ mod tests {
                 }
                 other => panic!("expected InvalidServerName, got {other:?}"),
             },
-            RealityServerOutcome::Verified(_) => panic!("expected Invalid, got Verified"),
+            RealityServerOutcome::Verified { .. } => panic!("expected Invalid, got Verified"),
         }
     }
 
@@ -1503,7 +1601,7 @@ mod tests {
         let whitelist = vec!["example.com".to_string()];
 
         let server_task = tokio::spawn(async move {
-            server_tls(server, &server_priv, &[[0xaa; 8]], 43200, &[], &[], &whitelist).await
+            server_tls(server, &server_priv, &[[0xaa; 8]], 43200, &[], &[], &whitelist, None).await
         });
         client.write_all(&record).await.unwrap();
 
@@ -1528,7 +1626,7 @@ mod tests {
         drop(client); // 立即关闭 client → server 读 EOF
 
         let server_priv = [0x11u8; 32];
-        let result = server_tls(server, &server_priv, &[], 43200, &[], &[], &[]).await;
+        let result = server_tls(server, &server_priv, &[], 43200, &[], &[], &[], None).await;
 
         assert!(
             matches!(result, Err(RealityError::TlsHandshake(_))),
@@ -1567,7 +1665,7 @@ mod tests {
 
         let (mut client, server) = duplex(8192);
         let server_task = tokio::spawn(async move {
-            server_tls(server, &server_priv, &[short_id], 43200, &[], &[], &[]).await
+            server_tls(server, &server_priv, &[short_id], 43200, &[], &[], &[], None).await
         });
 
         // client 发送合法 REALITY ClientHello（verify 会通过）
@@ -1580,7 +1678,7 @@ mod tests {
             Ok(RealityServerOutcome::Invalid { reason, .. }) => {
                 panic!("expected verify pass + TLS accept, got Invalid: {reason:?}");
             }
-            Ok(RealityServerOutcome::Verified(_)) => { /* 不可能：client 未完成 TLS */ }
+            Ok(RealityServerOutcome::Verified { .. }) => { /* 不可能：client 未完成 TLS */ }
             Err(e) => panic!("unexpected error: {e:?}"),
         }
     }
@@ -1621,7 +1719,7 @@ mod tests {
 
         // spawn server_tls
         let server_task = tokio::spawn(async move {
-            server_tls(server, &server_priv_array, &[short_id], 43200, &[], &[], &[]).await
+            server_tls(server, &server_priv_array, &[short_id], 43200, &[], &[], &[], None).await
         });
 
         // client 端：reality u_client 握手
@@ -1634,7 +1732,7 @@ mod tests {
         let server_result = server_task.await.unwrap();
 
         match (client_result, server_result) {
-            (Ok(Ok(_tls_stream)), Ok(RealityServerOutcome::Verified(_))) => {
+            (Ok(Ok(_tls_stream)), Ok(RealityServerOutcome::Verified { .. })) => {
                 // 完整 REALITY 握手成功！
             }
             (Ok(Ok(_)), Ok(_)) => panic!("server unexpected outcome"),
@@ -1683,7 +1781,7 @@ mod tests {
         let client = xray_transport::connection::DuplexConnection::new(client);
 
         let server_task = tokio::spawn(async move {
-            server_tls(server, &server_priv_array, &[short_id], 43200, &[], &[], &[]).await
+            server_tls(server, &server_priv_array, &[short_id], 43200, &[], &[], &[], None).await
         });
 
         let client_result =
@@ -1691,7 +1789,7 @@ mod tests {
         let server_result = server_task.await.unwrap();
 
         match (client_result, server_result) {
-            (Ok(Ok(_tls_stream)), Ok(RealityServerOutcome::Verified(_))) => {
+            (Ok(Ok(_tls_stream)), Ok(RealityServerOutcome::Verified { .. })) => {
                 // 完整 REALITY 握手成功（watfaq 路径 + 固定模板证书）
             }
             (Ok(Ok(_)), Ok(_)) => panic!("server unexpected outcome"),
@@ -1741,7 +1839,7 @@ mod tests {
         let client = xray_transport::connection::DuplexConnection::new(client);
 
         let server_task = tokio::spawn(async move {
-            server_tls(server, &server_priv_array, &[short_id], 43200, &[], &[], &[]).await
+            server_tls(server, &server_priv_array, &[short_id], 43200, &[], &[], &[], None).await
         });
 
         let client_result =
@@ -1749,7 +1847,7 @@ mod tests {
         let server_result = server_task.await.unwrap();
 
         match (client_result, server_result) {
-            (Ok(Ok(_tls_stream)), Ok(RealityServerOutcome::Verified(_))) => {}
+            (Ok(Ok(_tls_stream)), Ok(RealityServerOutcome::Verified { .. })) => {}
             (Ok(Ok(_)), Ok(_)) => panic!("[{fp}] server unexpected outcome"),
             (Ok(Ok(_)), Err(e)) => panic!("[{fp}] server error: {e:?}"),
             (Ok(Err(e)), _) => panic!("[{fp}] client u_client failed: {e:?}"),
@@ -1881,6 +1979,220 @@ mod tests {
                         | xray_tls::fingerprint::Fingerprint::RandomizedNoAlpn),
                 "{name} ({fp:?}) must be either btls-supported or randomized-fallback"
             );
+        }
+    }
+
+    // ===== bd frxi：alpn 解析 + ProbeTable 喂值联动 =====
+
+    /// 向已构造的 ClientHello record extensions 尾部追加 alpn extension
+    /// 并修正三层长度字段（record/handshake/ext_total）。
+    fn append_alpn_ext(mut record: Vec<u8>, protos: &[&str]) -> Vec<u8> {
+        let mut names = Vec::new();
+        for p in protos {
+            names.push(p.len() as u8);
+            names.extend_from_slice(p.as_bytes());
+        }
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&[0x00, 0x10]); // extension_type: alpn
+        ext.extend_from_slice(&((2 + names.len()) as u16).to_be_bytes());
+        ext.extend_from_slice(&(names.len() as u16).to_be_bytes());
+        ext.extend_from_slice(&names);
+
+        let hs_len = u16::from_be_bytes([record[3], record[4]]) as usize;
+        let body_end = 5 + hs_len; // record payload = 4B hs header + body
+        let body = record[9..body_end].to_vec();
+        // 按结构偏移找 ext_total 字段（对齐 parse_handshake）：
+        // legacy_version(2) + random(32) + session_id(1+32) + cipher_suites(2+n)
+        // + compression(1+n) → ext_total(2) + exts...
+        let mut off = 2 + 32 + 1 + 32;
+        let cs_len = u16::from_be_bytes([body[off], body[off + 1]]) as usize;
+        off += 2 + cs_len;
+        let cm_len = body[off] as usize;
+        off += 1 + cm_len;
+        let old_total = u16::from_be_bytes([body[off], body[off + 1]]) as usize;
+        assert_eq!(
+            off + 2 + old_total,
+            body.len(),
+            "fixture ext_total must be self-consistent"
+        );
+
+        let mut new_body = body[..off].to_vec();
+        new_body.extend_from_slice(&((old_total + ext.len()) as u16).to_be_bytes());
+        new_body.extend_from_slice(&body[off + 2..]);
+        new_body.extend_from_slice(&ext);
+
+        // fixture 惯例：handshake length 字段只含 body（不含 4B header）
+        let new_hs_len = new_body.len();
+        record.truncate(5);
+        // record 层长度（2B）= handshake 整长（4B header + body）
+        record[3..5].copy_from_slice(&((4 + new_hs_len) as u16).to_be_bytes());
+        // 重建 handshake header（type 1B + length 3B）
+        record.push(0x01);
+        record.push((new_hs_len >> 16) as u8);
+        record.push((new_hs_len >> 8) as u8);
+        record.push(new_hs_len as u8);
+        record.extend_from_slice(&new_body);
+        record
+    }
+
+    #[test]
+    fn parse_client_hello_alpn_protocols() {
+        let base = build_test_client_hello(&[0x55; 32], &[0x77; 32], &[0x88; 32], Some("example.com"));
+        // 无 alpn extension → 空
+        assert!(parse_client_hello(&base).unwrap().alpn_protocols.is_empty());
+        // 带 alpn → 按序解析
+        let record = append_alpn_ext(base, &["h2", "http/1.1"]);
+        let parsed = parse_client_hello(&record).unwrap();
+        assert_eq!(parsed.alpn_protocols, vec!["h2", "http/1.1"]);
+        // 其余字段不受追加影响
+        assert_eq!(parsed.server_name.as_deref(), Some("example.com"));
+        assert_eq!(parsed.session_id, [0x77; 32]);
+    }
+
+    /// Go `tls.go:411-417` key 推导等价：无 ALPN→0 / 首个 h2→2 / 其他→1。
+    #[test]
+    fn probe_context_key_for_matches_go_derivation() {
+        use crate::probe::AlpnId;
+        let ctx = ProbeContext {
+            table: crate::probe::ProbeTable::new(),
+            dest: "dest:443".into(),
+            fallback: crate::config::MaxUselessRecordsSetting::Disabled,
+        };
+        assert_eq!(ctx.key_for("s", &[]).alpn, AlpnId::None);
+        assert_eq!(
+            ctx.key_for("s", &["h2".into(), "http/1.1".into()]).alpn,
+            AlpnId::H2
+        );
+        assert_eq!(ctx.key_for("s", &["http/1.1".into()]).alpn, AlpnId::Http11);
+    }
+
+    /// ProbeTable 喂值联动（Go tls.go:435-437 等价）：真 u_client loopback 握手，
+    /// ProbeTable 插入 (dest, sni, alpn) key → Verified.max_useless_records 携带
+    /// 插值；miss 的 key → 配置 fallback；probe=None → Go 默认 32。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_tls_feeds_probe_result_into_verified() {
+        ensure_crypto_provider();
+        use std::time::Duration;
+        use tokio::io::duplex;
+        use x25519_dalek::{PublicKey, StaticSecret};
+        use crate::client::{u_client, UConnState};
+        use crate::config::RealityConfig;
+        use crate::probe::{AlpnId, ProbeKey};
+        use xray_proto::transport::internet::reality::Config as ProtoConfig;
+
+        let server_priv_array = [0x11u8; 32];
+        let short_id = [0xaa; 8];
+        let server_secret = StaticSecret::from(server_priv_array);
+        let server_pub = PublicKey::from(&server_secret);
+
+        let proto = ProtoConfig {
+            fingerprint: "chrome".into(),
+            public_key: server_pub.as_bytes().to_vec(),
+            server_name: "example.com".into(),
+            short_id: short_id.to_vec(),
+            ..Default::default()
+        };
+        let state = UConnState::new(RealityConfig::from_proto(&proto).unwrap()).unwrap();
+
+        // 插 H2=16 / None=8 两档 key（u_client chrome 指纹的 CH 实际 alpn 由
+        // btls 模板决定，双插消除对模板细节的依赖，miss 则暴露模板回归）。
+        let table = crate::probe::ProbeTable::new();
+        for (alpn, v) in [(AlpnId::H2, 16u32), (AlpnId::None, 8u32)] {
+            table.insert(
+                ProbeKey {
+                    dest: "dest.example:443".into(),
+                    server_name: "example.com".into(),
+                    alpn,
+                },
+                v,
+            );
+        }
+        let ctx = ProbeContext {
+            table,
+            dest: "dest.example:443".into(),
+            fallback: crate::config::MaxUselessRecordsSetting::Probe(20),
+        };
+
+        let (client, server) = duplex(65536);
+        let client = xray_transport::connection::DuplexConnection::new(client);
+        let server_task = tokio::spawn(async move {
+            server_tls(
+                server,
+                &server_priv_array,
+                &[short_id],
+                43200,
+                &[],
+                &[],
+                &[],
+                Some(&ctx),
+            )
+            .await
+        });
+        let client_result =
+            tokio::time::timeout(Duration::from_secs(10), u_client(client, state)).await;
+        let server_result = server_task.await.unwrap();
+
+        match (client_result, server_result) {
+            (
+                Ok(Ok(_)),
+                Ok(RealityServerOutcome::Verified {
+                    max_useless_records, ..
+                }),
+            ) => {
+                assert!(
+                    max_useless_records == 16 || max_useless_records == 8,
+                    "probe value must come from the table (got {max_useless_records})"
+                );
+            }
+            (Ok(Ok(_)), other) => panic!("server unexpected outcome (see outcome variant)"),
+            (Ok(Err(e)), _) => panic!("client u_client failed: {e:?}"),
+            (Err(_timeout), _) => panic!("client u_client timeout"),
+        }
+    }
+
+    /// probe=None（未启用探测）时 Verified.max_useless_records 恒为 Go 默认 32。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_tls_without_probe_defaults_to_go_max_useless_records() {
+        ensure_crypto_provider();
+        use std::time::Duration;
+        use tokio::io::duplex;
+        use x25519_dalek::{PublicKey, StaticSecret};
+        use crate::client::{u_client, UConnState};
+        use crate::config::RealityConfig;
+        use xray_proto::transport::internet::reality::Config as ProtoConfig;
+
+        let server_priv_array = [0x11u8; 32];
+        let short_id = [0xaa; 8];
+        let server_secret = StaticSecret::from(server_priv_array);
+        let server_pub = PublicKey::from(&server_secret);
+        let proto = ProtoConfig {
+            fingerprint: "chrome".into(),
+            public_key: server_pub.as_bytes().to_vec(),
+            server_name: "example.com".into(),
+            short_id: short_id.to_vec(),
+            ..Default::default()
+        };
+        let state = UConnState::new(RealityConfig::from_proto(&proto).unwrap()).unwrap();
+
+        let (client, server) = duplex(65536);
+        let client = xray_transport::connection::DuplexConnection::new(client);
+        let server_task = tokio::spawn(async move {
+            server_tls(server, &server_priv_array, &[short_id], 43200, &[], &[], &[], None).await
+        });
+        let client_result =
+            tokio::time::timeout(Duration::from_secs(10), u_client(client, state)).await;
+        let server_result = server_task.await.unwrap();
+
+        match (client_result, server_result) {
+            (
+                Ok(Ok(_)),
+                Ok(RealityServerOutcome::Verified {
+                    max_useless_records, ..
+                }),
+            ) => assert_eq!(max_useless_records, 32),
+            (Ok(Ok(_)), other) => panic!("server unexpected outcome (see outcome variant)"),
+            (Ok(Err(e)), _) => panic!("client u_client failed: {e:?}"),
+            (Err(_timeout), _) => panic!("client u_client timeout"),
         }
     }
 }

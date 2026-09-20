@@ -31,6 +31,13 @@ message Config {
   repeated int64 spider_y = 27;
 
   string master_key_log = 31;
+
+  // REBASE(frxi): Rust-side anti-probe extension — not present in upstream Go
+  // reality proto. Go 启动期无条件跑 CCS 探测（hub.go:79 DetectPostHandshakeRecordsLens
+  // → GlobalMaxCSSMsgCount），结果仅经进程内 sync.Map 消费，故 Go 配置面无此字段；
+  // Rust 侧探测需向 dest 发起真实出站连接，做成 opt-in 开关（0 = 不启用）。
+  // 字段号取 32（上游 21-31 已占用，往后顺延避免冲突）。
+  uint64 max_useless_records = 32;
 }
 
 message LimitFallback {

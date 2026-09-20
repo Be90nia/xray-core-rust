@@ -94,6 +94,10 @@ pub enum RealityError {
     #[error("REALITY: mldsa65_seed length is {actual}, expected 32")]
     InvalidMldsa65SeedLen { actual: usize },
 
+    /// bd frxi：max_useless_records 超出 u32（proto uint64 下溢保护）。
+    #[error("REALITY: max_useless_records {value} exceeds u32")]
+    InvalidMaxUselessRecords { value: u64 },
+
     /// ML-DSA-65 验签失败（公钥/签名解码失败，多为脏数据或长度错）。
     /// tvky：验签原语对接 RustCrypto ml-dsa（与 xray-cli 同 crate）。
     /// cm97：签名生成端（[`crate::mitm`]）与客户端 btls ServerHello 捕获
