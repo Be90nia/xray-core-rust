@@ -46,6 +46,10 @@ coverage/
 .beads/proxieddb/
 *.gate.lock*
 
+# Cargo user-level config (本机性能调优如 target-cpu=native 不该污染跨机器发行)
+# 2026-09-20 cleanup: .cargo/config.toml 从历史抹除后兜底,避免误跟踪
+/.cargo/
+
 
 # Local logs
 *.log
