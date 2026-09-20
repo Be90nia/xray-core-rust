@@ -206,7 +206,8 @@ rustls = { git = "https://github.com/Watfaq/rustls.git", branch = "watfaq/0.23.4
 tokio-rustls = { git = "https://github.com/Watfaq/tokio-rustls.git", branch = "watfaq/0.26.4" }
 # hysteria2 UDP relay：对端不宣告 max_datagram_frame_size TP（quic-go
 # OmitMaxDatagramFrameSize=true）时按本地 MTU 假定对端支持——对齐 apernet/quic-go
-# fork 的 AssumePeerMaxDatagramFrameSize。vendor 自 0.11.16，REBASE 注释见
+# fork 的 AssumePeerMaxDatagramFrameSize。基线 = 上游 quinn-proto 0.11.18 原版
+# （字节级对齐），唯一本地 patch 见 REBASE 注释：
 # vendor/quinn-proto/src/connection/datagrams.rs max_size()。
 quinn-proto = { path = "vendor/quinn-proto" }
 
