@@ -128,7 +128,15 @@ pub async fn serve_vless(
                 // vision splice：TLS accept 消费 socket 前 dup 裸 TCP 克隆，
                 // END/DIRECT 帧后读写直通（Go UnwrapRawConn 等价路径）。
                 let raw_tcp = xray_transport::connection::dup_tcp_stream(&stream);
-                match acc.accept(stream).await {
+                // 记录对齐读（bd jeu9/e0ni）：rustls deframer 贪婪 recv 会把
+                // 「DIRECT 帧 + 其后端到端裸流」一并拉进 TLS 层（DecryptError
+                // 或半记录滞留，字节不可恢复 → Linux CI 确定性挂）。framer 按
+                // 记录边界限长读，裸尾留在内核缓冲，raw_tcp 克隆（dup 共享
+                // 内核缓冲游标）切 DIRECT 后天然读到完整裸流。
+                match acc
+                    .accept_with(super::record_framer::RecordFramer::new(stream), |_| ())
+                    .await
+                {
                     Ok(tls_stream) => {
                         let conn = tls_stream.get_ref().1;
                         let name = conn.server_name().unwrap_or("").to_string();
