@@ -46,7 +46,7 @@ async fn reality_server_tls_with_u_client_handshake_succeeds() {
 
     // server_tls：verify ClientHello → build_server_config → rustls 握手
     let server_task = tokio::spawn(async move {
-        server_tls(server_side, &server_priv, &[short_id], 43200, &[], &[], &[]).await
+        server_tls(server_side, &server_priv, &[short_id], 43200, &[], &[], &[], None).await
     });
 
     let client_result =
@@ -54,7 +54,7 @@ async fn reality_server_tls_with_u_client_handshake_succeeds() {
     let server_result = server_task.await.unwrap();
 
     match (client_result, server_result) {
-        (Ok(Ok(_tls_stream)), Ok(RealityServerOutcome::Verified(_))) => {}
+        (Ok(Ok(_tls_stream)), Ok(RealityServerOutcome::Verified { .. })) => {}
         (Ok(Ok(_)), _) => panic!("server unexpected outcome"),
         (Ok(Err(e)), _) => panic!("client u_client failed: {e:?}"),
         (Err(_timeout), _) => panic!("client u_client timeout"),

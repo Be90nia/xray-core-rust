@@ -32,11 +32,11 @@ async fn tcp_plus_reality_handshake_e2e() {
     let allowed_short_ids = vec![short_id];
     tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
-        let outcome = server_tls(tcp, &server_private_key, &allowed_short_ids, 43200, &[], &[], &["reality.local".to_string()])
+        let outcome = server_tls(tcp, &server_private_key, &allowed_short_ids, 43200, &[], &[], &["reality.local".to_string()], None)
             .await
             .expect("server_tls should not IO-error");
         match outcome {
-            RealityServerOutcome::Verified(mut tls) => {
+            RealityServerOutcome::Verified { tls: mut tls, .. } => {
                 let mut buf = [0u8; 64];
                 loop {
                     match tls.read(&mut buf).await {

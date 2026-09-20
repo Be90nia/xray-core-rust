@@ -99,6 +99,27 @@ async fn listen_tcp(
     let local = tcp.local_addr()?;
     // REALITY listener：Go hub.go:558-560 `goreality.NewListener`。
     let reality = reality_server_config(security, security_json)?;
+    // bd frxi：配置启用探测时 spawn CCS 探测写 ProbeTable（Go tcp/hub.go:79
+    // `go goreality.DetectPostHandshakeRecordsLens` 等价；Rust 侧 opt-in）。
+    let reality_probe = reality
+        .as_ref()
+        .filter(|rc| rc.max_useless_records.is_enabled())
+        .map(|rc| {
+            let table = xray_reality::probe::ProbeTable::new();
+            xray_reality::probe::detect_max_useless_records(
+                table.clone(),
+                rc.fallback_dest.clone(),
+                rc.server_names.clone(),
+                "tcp".to_string(),
+                rc.xver,
+            );
+            tracing::info!(dest = %rc.fallback_dest, "reality maxUselessRecords probe started");
+            Arc::new(xray_reality::server::ProbeContext {
+                table,
+                dest: rc.fallback_dest.clone(),
+                fallback: rc.max_useless_records,
+            })
+        });
     let ctx = build_context(config, local, handler);
     tracing::info!(%local, "listening TCP for XHTTP");
 
@@ -130,8 +151,9 @@ async fn listen_tcp(
             let ctx = Arc::clone(&ctx);
             let tls = tls_cfg.clone();
             let rc = reality.clone();
+            let probe = reality_probe.clone();
             tokio::spawn(async move {
-                handle_accepted_stream(stream, peer, local, tls, rc, ctx).await;
+                handle_accepted_stream(stream, peer, local, tls, rc, probe, ctx).await;
             });
         }
     });
@@ -152,12 +174,13 @@ async fn handle_accepted_stream<S>(
     local: SocketAddr,
     tls: Option<Arc<rustls::ServerConfig>>,
     reality: Option<RealityServerConfig>,
+    probe: Option<Arc<xray_reality::server::ProbeContext>>,
     ctx: Arc<HandlerContext>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     if let Some(rc) = reality {
-        serve_reality_conn(stream, peer, local, rc, ctx).await;
+        serve_reality_conn(stream, peer, local, rc, probe, ctx).await;
     } else if let Some(tc) = tls {
         // Go hub.go:553-556 `gotls.NewListener`
         if let Ok(tls_stream) = tokio_rustls::TlsAcceptor::from(tc).accept(stream).await {
@@ -211,6 +234,8 @@ struct RealityServerConfig {
     max_client_ver: Vec<u8>,
     fallback_dest: String,
     xver: u8,
+    /// bd frxi：启动期 CCS 探测开关（缺省 Disabled 保持现行为）。
+    max_useless_records: xray_reality::MaxUselessRecordsSetting,
 }
 
 /// security == "reality" 时解析服务端 REALITY 配置，否则返回 None。
@@ -284,6 +309,11 @@ fn reality_server_config(
         None => dest_raw.as_str().unwrap_or("localhost:443").to_string(),
     };
     let xver = json.get("xver").and_then(|x| x.as_u64()).unwrap_or(0).min(2) as u8;
+    // bd frxi：realitySettings.maxUselessRecords 三态（缺省/true/数值）。
+    let max_useless_records = xray_reality::MaxUselessRecordsSetting::from_json(
+        json.get("maxUselessRecords"),
+    )
+    .map_err(io::Error::other)?;
     // mldsa65Seed：后量子签名未实现（cz5x）。配置在场即显式报错，
     // 不静默忽略——避免运营者误以为 PQC 已生效。
     if let Some(seed) = json.get("mldsa65Seed").and_then(|x| x.as_str()) {
@@ -339,6 +369,7 @@ fn reality_server_config(
         max_client_ver,
         fallback_dest,
         xver,
+        max_useless_records,
     }))
 }
 
@@ -352,6 +383,7 @@ async fn serve_reality_conn<S>(
     peer: SocketAddr,
     local: SocketAddr,
     rc: RealityServerConfig,
+    probe: Option<Arc<xray_reality::server::ProbeContext>>,
     ctx: Arc<HandlerContext>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -366,10 +398,19 @@ async fn serve_reality_conn<S>(
         &rc.min_client_ver,
         &rc.max_client_ver,
         &rc.server_names,
+        probe.as_deref(),
     )
     .await;
     match outcome {
-        Ok(RealityServerOutcome::Verified(tls)) => serve_http_conn(tls, peer, ctx).await,
+        Ok(RealityServerOutcome::Verified {
+            tls,
+            max_useless_records,
+        }) => {
+            // bd frxi：探测值随连接交付（rustls 无 record 层消费点，
+            // mygg 后握手记录模仿落地前仅可观察）。
+            tracing::debug!(peer = %peer, max_useless_records, "reality verified with probe result");
+            serve_http_conn(tls, peer, ctx).await
+        }
         Ok(RealityServerOutcome::Invalid { conn, record, reason }) => {
             tracing::debug!(error = ?reason, dest = %rc.fallback_dest, "splithttp reality fallback");
             let _ = fallback_to_dest(conn, &record, &rc.fallback_dest, peer, local, rc.xver).await;

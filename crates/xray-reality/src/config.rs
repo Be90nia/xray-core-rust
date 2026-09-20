@@ -124,6 +124,17 @@ pub struct RealityConfig {
 
     pub master_key_log: String,
 
+    /// 服务端字段（bd frxi，Rust 私有扩展）：启动期 CCS 探测开关。
+    ///
+    /// Go 无此配置面（`hub.go:79` 无条件探测，结果走进程内
+    /// `GlobalMaxCSSMsgCount`）；Rust 探测需向 dest 发起真实出站连接，
+    /// opt-in 更稳。语义：
+    /// - [`MaxUselessRecordsSetting::Disabled`]（缺省）：不探测，消费侧用
+    ///   Go 默认 32（`reality/common.go:70` maxUselessRecords）。
+    /// - [`MaxUselessRecordsSetting::Probe`]<n>：listener 启动时 spawn
+    ///   [`crate::probe::detect_max_useless_records`] 写 [`crate::probe::ProbeTable`]；
+    ///   握手期查表，miss 时 fallback 到 n（JSON `true` ≡ `Probe(32)`）。
+    pub max_useless_records: MaxUselessRecordsSetting,
     /// 总是 `None`（Go 端硬编码 `NextProtos: nil`）。
     pub next_protos: Option<Vec<String>>,
     /// 总是 `true`（Go 端硬编码 `SessionTicketsDisabled: true`）。
@@ -155,8 +166,70 @@ impl Default for RealityConfig {
             spider_x: String::new(),
             spider_y: Vec::new(),
             master_key_log: String::new(),
+            max_useless_records: MaxUselessRecordsSetting::Disabled,
             next_protos: None,
             session_tickets_disabled: true,
+        }
+    }
+}
+
+/// 启动期 CCS 探测开关（bd frxi，Rust 私有扩展；Go 无对应配置面）。
+///
+/// 三态 JSON 表达（`realitySettings.maxUselessRecords`）：
+/// - 缺失 / `false` / `0` → [`MaxUselessRecordsSetting::Disabled`]
+/// - `true` → `Probe(32)`（Go 默认 maxUselessRecords，`reality/common.go:70`）
+/// - 数值 `n > 0` → `Probe(n)`
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MaxUselessRecordsSetting {
+    /// 不启动探测；消费侧查表 miss，按 Go 默认 32 处理（现行为）。
+    #[default]
+    Disabled,
+    /// 启动探测；表中 miss 时 fallback 到内值。
+    /// 内值不改变探测行为——只决定「探测还没完成/失败」时握手的退路。
+    Probe(u32),
+}
+
+impl MaxUselessRecordsSetting {
+    /// Go 默认 `maxUselessRecords`（`reality/common.go:70`）。
+    pub const GO_DEFAULT: u32 = 32;
+
+    /// 是否启用启动期探测。
+    #[must_use]
+    pub fn is_enabled(self) -> bool {
+        matches!(self, Self::Probe(_))
+    }
+
+    /// 查表 miss 时的 fallback 值（Disabled 恒为 Go 默认 32）。
+    #[must_use]
+    pub fn fallback(self) -> u32 {
+        match self {
+            Self::Disabled => Self::GO_DEFAULT,
+            Self::Probe(n) => n,
+        }
+    }
+
+    /// 从 `realitySettings` JSON 解析（三态：缺省/enable/数值）。
+    ///
+    /// 类型错误（字符串/负数等）硬错——配置错误不应静默吞掉。
+    pub fn from_json(v: Option<&serde_json::Value>) -> Result<Self, String> {
+        let Some(v) = v else {
+            return Ok(Self::Disabled);
+        };
+        match v {
+            serde_json::Value::Null => Ok(Self::Disabled),
+            serde_json::Value::Bool(false) => Ok(Self::Disabled),
+            serde_json::Value::Bool(true) => Ok(Self::Probe(Self::GO_DEFAULT)),
+            serde_json::Value::Number(n) => {
+                let raw = n.as_u64().ok_or_else(|| {
+                    format!("reality: invalid maxUselessRecords {n} (need u64 >= 0)")
+                })?;
+                u32::try_from(raw)
+                    .map(|x| if x == 0 { Self::Disabled } else { Self::Probe(x) })
+                    .map_err(|_| format!("reality: maxUselessRecords {raw} exceeds u32"))
+            }
+            other => Err(format!(
+                "reality: invalid maxUselessRecords {other} (need bool or non-negative integer)"
+            )),
         }
     }
 }
@@ -238,6 +311,17 @@ impl RealityConfig {
         cfg.spider_x = p.spider_x.clone();
         cfg.spider_y = p.spider_y.clone();
         cfg.master_key_log = p.master_key_log.clone();
+        // bd frxi：proto uint64 → 三态（0=Disabled，>0=Probe）。proto 层无法表达
+        // JSON `true`（≡ Probe(32)），序列化方直接写 32 即可，语义等价。
+        cfg.max_useless_records = if p.max_useless_records == 0 {
+            MaxUselessRecordsSetting::Disabled
+        } else {
+            MaxUselessRecordsSetting::Probe(u32::try_from(p.max_useless_records).map_err(|_| {
+                RealityError::InvalidMaxUselessRecords {
+                    value: p.max_useless_records,
+                }
+            })?)
+        };
 
         Ok(cfg)
     }
@@ -300,6 +384,7 @@ mod tests {
             spider_x: "/spider".into(),
             spider_y: vec![100, 200, 1, 2, 3, 4, 5, 6, 7, 8],
             master_key_log: String::new(),
+            max_useless_records: 0,
         }
     }
 
@@ -467,5 +552,67 @@ mod tests {
     #[test]
     fn default_max_time_diff_zero() {
         assert_eq!(RealityConfig::default().max_time_diff, Duration::ZERO);
+    }
+
+    // ===== bd frxi：max_useless_records 三态解析 =====
+
+    #[test]
+    fn from_proto_max_useless_records_three_states() {
+        // 缺省（0）：不启用
+        let mut p = proto_fixture();
+        p.max_useless_records = 0;
+        let cfg = RealityConfig::from_proto(&p).unwrap();
+        assert_eq!(cfg.max_useless_records, MaxUselessRecordsSetting::Disabled);
+        assert!(!cfg.max_useless_records.is_enabled());
+        assert_eq!(cfg.max_useless_records.fallback(), 32);
+
+        // 数值 >0：启用探测，miss fallback 到该值
+        p.max_useless_records = 20;
+        let cfg = RealityConfig::from_proto(&p).unwrap();
+        assert_eq!(cfg.max_useless_records, MaxUselessRecordsSetting::Probe(20));
+        assert!(cfg.max_useless_records.is_enabled());
+        assert_eq!(cfg.max_useless_records.fallback(), 20);
+    }
+
+    #[test]
+    fn from_proto_max_useless_records_overflow_u32() {
+        let mut p = proto_fixture();
+        p.max_useless_records = u64::from(u32::MAX) + 1;
+        let err = RealityConfig::from_proto(&p).unwrap_err();
+        assert!(matches!(
+            err,
+            RealityError::InvalidMaxUselessRecords { value: _ }
+        ));
+    }
+
+    #[test]
+    fn from_json_max_useless_records_three_states() {
+        use serde_json::json;
+        // 缺省（键缺失）
+        assert_eq!(
+            MaxUselessRecordsSetting::from_json(None).unwrap(),
+            MaxUselessRecordsSetting::Disabled
+        );
+        // 显式 false / 0 / null：不启用
+        for v in [json!(false), json!(0), serde_json::Value::Null] {
+            assert_eq!(
+                MaxUselessRecordsSetting::from_json(Some(&v)).unwrap(),
+                MaxUselessRecordsSetting::Disabled,
+                "case: {v}"
+            );
+        }
+        // 显式 enable（true）：≡ Probe(32)（Go 默认）
+        assert_eq!(
+            MaxUselessRecordsSetting::from_json(Some(&json!(true))).unwrap(),
+            MaxUselessRecordsSetting::Probe(32)
+        );
+        // 数值 >0：探测 + fallback 到该值
+        assert_eq!(
+            MaxUselessRecordsSetting::from_json(Some(&json!(16))).unwrap(),
+            MaxUselessRecordsSetting::Probe(16)
+        );
+        // 类型错误硬错
+        assert!(MaxUselessRecordsSetting::from_json(Some(&json!("32"))).is_err());
+        assert!(MaxUselessRecordsSetting::from_json(Some(&json!(-1))).is_err());
     }
 }

@@ -2051,6 +2051,8 @@ struct RealityInboundConfig {
     /// fs0o：客户端版本门（字节序字典序比较；空 = 不限）。
     min_client_ver: Vec<u8>,
     max_client_ver: Vec<u8>,
+    /// bd frxi：启动期 CCS 探测开关（缺省 Disabled 保持现行为）。
+    max_useless_records: xray_reality::MaxUselessRecordsSetting,
 }
 
 fn parse_reality_config(
@@ -2205,6 +2207,11 @@ fn parse_reality_config(
         xver,
         min_client_ver,
         max_client_ver,
+        // bd frxi：realitySettings.maxUselessRecords 三态（缺省/true/数值）。
+        max_useless_records: xray_reality::MaxUselessRecordsSetting::from_json(
+            json.get("maxUselessRecords"),
+        )
+        .map_err(std::io::Error::other)?,
     })
 }
 
@@ -2238,6 +2245,29 @@ async fn serve_reality_vless(
     let local = listener.local_addr()?;
     tracing::info!(addr = %local, "vless+reality inbound listening");
 
+    // bd frxi：配置启用探测时，listener 启动即 spawn CCS 探测写 ProbeTable
+    // （Go tcp/hub.go:79 `go goreality.DetectPostHandshakeRecordsLens(...)` 等价，
+    // Go 无条件跑；Rust 侧 opt-in）。探测在后台进行，不阻塞 accept 循环；
+    // 握手期经 ProbeContext 查表，未就绪/失败的 key 走配置 fallback。
+    let probe_ctx = if cfg.max_useless_records.is_enabled() {
+        let table = xray_reality::probe::ProbeTable::new();
+        xray_reality::probe::detect_max_useless_records(
+            table.clone(),
+            cfg.fallback_dest.clone(),
+            cfg.server_names.clone(),
+            "tcp".to_string(),
+            cfg.xver,
+        );
+        tracing::info!(dest = %cfg.fallback_dest, "reality maxUselessRecords probe started");
+        Some(xray_reality::server::ProbeContext {
+            table,
+            dest: cfg.fallback_dest.clone(),
+            fallback: cfg.max_useless_records,
+        })
+    } else {
+        None
+    };
+
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -2257,9 +2287,28 @@ async fn serve_reality_vless(
         let xver = cfg.xver;
         let min_ver = cfg.min_client_ver.clone();
         let max_ver = cfg.max_client_ver.clone();
+        let probe_ctx = probe_ctx.clone();
         tokio::spawn(async move {
-            match server_tls(stream, &key, &ids, max_diff, &min_ver, &max_ver, &names).await {
-                Ok(RealityServerOutcome::Verified(tls)) => {
+            match server_tls(
+                stream,
+                &key,
+                &ids,
+                max_diff,
+                &min_ver,
+                &max_ver,
+                &names,
+                probe_ctx.as_ref(),
+            )
+            .await
+            {
+                Ok(RealityServerOutcome::Verified {
+                    tls,
+                    max_useless_records,
+                }) => {
+                    // bd frxi：探测值随连接交付（Go tls.go:436 写 hs.c.MaxUselessRecords
+                    // 由定制 BoringSSL record 循环消费；rustls 无 record 层消费点，
+                    // mygg 后握手记录模仿落地前仅可观察）。
+                    tracing::debug!(peer = %peer, max_useless_records, "reality verified with probe result");
                     // lwep（Go inbound.go:577-579）：REALITY 验证通过即 rustls TLS1.3，
                     // XRV 的外层 TLS1.3 门恒真。
                     let mut options = options;
@@ -5420,6 +5469,7 @@ mod tests {
             xver: 0,
             min_client_ver: Vec::new(),
             max_client_ver: Vec::new(),
+            max_useless_records: xray_reality::MaxUselessRecordsSetting::Disabled,
         };
         let rl = InboundTcpListener::bind(
             "127.0.0.1:0",

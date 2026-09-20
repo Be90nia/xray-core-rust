@@ -41,7 +41,8 @@ pub mod probe;
 pub mod register;
 
 pub use config::{
-    LimitFallback, RealityConfig, ShortId, SHORT_ID_LEN, X25519_KEY_LEN,
+    LimitFallback, MaxUselessRecordsSetting, RealityConfig, ShortId, SHORT_ID_LEN,
+    X25519_KEY_LEN,
 };
 pub use error::{RealityError, Result};
 pub use util::{get_path_locked, open_key_log_writer};
