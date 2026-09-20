@@ -110,6 +110,36 @@ pub fn x25519_key_share_private_raw(ssl: *mut btls_sys::SSL) -> Option<[u8; 32]>
     if ok == 1 { Some(out) } else { None }
 }
 
+/// bd mygg：REALITY 后握手记录模仿发送（`SSL_send_post_handshake_record`
+/// 安全封装，BoringSSL patch 由 `tools/inject_btls_post_handshake.py` 注入）。
+///
+/// 在已完成握手的 SSL 连接上以**单条** TLS 1.3 application-data record
+/// （type 23）发出 `payload`——wire 形态与 Go xtls/reality 服务端 dest 模仿
+/// 发送一致（reality tls.go:414-424）。payload 超过单记录上限或握手未完成
+/// 时返回 Err（原语侧拒发，不静默分片/延后）。
+///
+/// 消费时机（登记）：Rust REALITY 服务端当前为 rustls 路径（无 SSL* 句柄，
+/// 见 lib.rs「btls 无 server acceptor」缺口），本原语供服务端 btls acceptor
+/// 落地后「检测到无效 CCS」路径调用；客户端侧（btls BtlsConn）可在对端
+/// 模仿行为协商启用后用于丢弃对齐。
+pub fn send_post_handshake_record(
+    ssl: *mut btls_sys::SSL,
+    payload: &[u8],
+) -> Result<(), &'static str> {
+    if ssl.is_null() || payload.is_empty() {
+        return Err("null ssl or empty payload");
+    }
+    // SAFETY: ssl 指针由调用方保证指向存活 SSL；payload 为调用方持有的只读缓冲。
+    let ok = unsafe {
+        btls_sys::SSL_send_post_handshake_record(ssl, payload.as_ptr(), payload.len())
+    };
+    if ok == 1 {
+        Ok(())
+    } else {
+        Err("SSL_send_post_handshake_record rejected (handshake incomplete or payload exceeds single record)")
+    }
+}
+
 /// per-SSL REALITY hooks 注册表（transcript 回调按 ssl 裸指针查找）。
 ///
 /// 键 = SSL 裸指针地址。地址复用不串号由 [`RealityHooksGuard`] 保证：
@@ -485,4 +515,15 @@ mod tests {
         assert!(!registry_contains(&hooks));
     }
 
+    /// bd mygg：后握手记录原语链接 + 行为验证——null SSL 必须被原语拒收
+    /// （返回 0），同时证明 bindgen 绑定与 ssl 库符号真实可链接。
+    #[test]
+    fn post_handshake_primitive_rejects_null_ssl() {
+        let rc = unsafe {
+            btls_sys::SSL_send_post_handshake_record(std::ptr::null_mut(), std::ptr::null(), 0)
+        };
+        assert_eq!(rc, 0, "null ssl must be rejected by the injected primitive");
+        // 安全封装层同步拒收（空 payload 快路径）
+        assert!(send_post_handshake_record(std::ptr::null_mut(), &[]).is_err());
+    }
 }
