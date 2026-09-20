@@ -638,6 +638,24 @@ where
     }
 }
 
+/// dest 后握手记录长度列表探测可用性（Go `GlobalPostHandshakeRecordsLens`
+/// 等价物）。
+///
+/// Go 只在探测到 **dest 主动发的 type 23 记录长度列表非空**时才发 mirror
+/// （`record_detect.go:124-139`：列表 = 真实 TLS 连 dest 后 `io.ReadAll`
+/// 收到的记录；列表为空则服务端不发，客户端无丢弃逻辑也不受影响）。Rust
+/// probe（frxi）只有 CCS tier、无该列表——tier<MaxInt 只证明 dest 对 CCS
+/// 有 alert 行为，**不是** dest 握手后主动发记录的证据。VPS 生产实测
+/// （2026-09-20）：按 tier<MaxInt 即发的保守做法 mirror 会泄漏进客户端
+/// VLESS 数据流（REALITY 客户端 TLS 栈把 mirror 当 app data 交付上层，
+/// curl 3/3 失败）——生产按 Go 语义收紧为恒不发；probe.rs 扩展列表探测
+/// 后解锁（改为查表结果）。cfg(test) 下 gate 常开以维持发送机制的
+/// wire 级回归（probe_hit 场景 = 模拟列表非空的未来 probe 形态）。
+#[cfg(not(test))]
+const POST_HANDSHAKE_MIRROR_PROBE_READY: bool = false;
+#[cfg(test)]
+const POST_HANDSHAKE_MIRROR_PROBE_READY: bool = true;
+
 /// REALITY 服务端握手（btls/BoringSSL opt-in 路径，bd tce2）。
 ///
 /// 前置与 [`server_tls`] 完全共享（[`verify_and_probe`]：ClientHello 预读
@@ -649,17 +667,19 @@ where
 ///
 /// 握手完成后、连接交付前，按探测结果发一条模仿记录（Go reality
 /// tls.go:414-424：服务端把 dest 的后握手记录逐条重放给 REALITY 客户端，
-/// 使 REALITY 连接与 dest 直连的记录序列不可区分）。保守发送条件（与 Go
-/// 的差异登记在案——Go 无条件按探测长度列表逐条重放）：
+/// 使 REALITY 连接与 dest 直连的记录序列不可区分）。发送 gate（与 Go
+/// 一致，见 [`POST_HANDSHAKE_MIRROR_PROBE_READY`] 文档）：
 ///
-/// - 仅当探测**命中**该 key 且 tier < u32::MAX（dest 对 CCS 有 alert 行为 =
-///   后握手记录形态存在）；tier == MaxInt（dest 从不 alert）或未启用探测 /
-///   查表 miss → 不发（Go 无此差异——Rust probe 无记录长度列表，不发比
-///   发错长度保守）。
-/// - 载荷：单条 type 23 application-data record（`SSL_send_post_handshake_record`
-///   单记录语义，AEAD sealed），inner 明文 = 48 字节零 padding，wire 总长
-///   70B（5 header + 1 inner content-type + 48 payload + 16 tag）。Go 的
-///   长度来自真实探测 dest 记录；Rust probe 无长度信息，取保守常数。
+/// - **gate 未就绪（生产现状）**：Rust probe 无记录长度列表 → 不发（Go
+///   在 dest 列表为空时同样不发）。生产 VPS 实测曾按「tier<MaxInt 即发」
+///   的保守做法发出 mirror，因 REALITY 客户端 TLS 栈把 mirror 当 app data
+///   交付上层而泄漏进 VLESS 数据流（curl 3/3 失败），已收紧。
+/// - **gate 就绪（probe 扩展列表后）**：探测命中该 key 且 tier < u32::MAX
+///   才发；tier == MaxInt / 未启用探测 / 查表 miss → 不发。
+/// - 载荷：单条 type 23 application-data record（AEAD sealed），inner 明文
+///   = 48 字节零 padding，wire 总长 70B（5 header + 1 inner content-type
+///   + 48 payload + 16 tag）。Go 的长度来自真实探测 dest 记录；Rust 取
+///   保守常数。
 ///
 /// # Errors
 ///
@@ -708,7 +728,8 @@ where
         .map_err(|e| RealityError::TlsHandshake(format!("btls accept: {e}")))?;
 
     // bd 26zn：后握手记录模仿（条件见函数文档）。
-    if verified.probe_tier.is_some_and(|tier| tier < u32::MAX) {
+    // 发送 gate = POST_HANDSHAKE_MIRROR_PROBE_READY && probe 命中 tier<MaxInt。
+    if POST_HANDSHAKE_MIRROR_PROBE_READY && verified.probe_tier.is_some_and(|tier| tier < u32::MAX) {
         // 48B 零 padding；TLS 1.3 SSL_write 在其外自动加 inner content-type(1)
         // 与 AEAD tag(16)，wire = 5+1+48+16 = 70B 单记录。
         //
