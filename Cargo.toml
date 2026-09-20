@@ -75,6 +75,9 @@ members = [
 
     # 性能基准测试
     "benches",
+
+    # 压测 harness（独立二进制，只消费现有 API；PM 授权的唯一新增 member）
+    "crates/xray-stress",
 ]
 
 [workspace.package]

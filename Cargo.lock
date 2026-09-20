@@ -6508,6 +6508,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "xray-stress"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "clap",
+ "parking_lot",
+ "rand 0.9.4",
+ "rustls",
+ "serde_json",
+ "sysinfo",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "x25519-dalek",
+ "xray-common",
+ "xray-conf",
+ "xray-core",
+ "xray-proto",
+ "xray-proxy-hysteria",
+ "xray-tls",
+ "xray-transport-hysteria",
+]
+
+[[package]]
 name = "xray-tls"
 version = "0.1.0"
 dependencies = [

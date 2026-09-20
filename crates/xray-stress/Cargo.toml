@@ -1,0 +1,32 @@
+[package]
+name = "xray-stress"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "xray-stress"
+path = "src/main.rs"
+
+[dependencies]
+xray-core = { path = "../xray-core" }
+xray-conf = { path = "../xray-conf" }
+xray-common = { path = "../xray-common" }
+xray-tls = { path = "../xray-tls" }
+xray-proto = { path = "../xray-proto" }
+xray-transport-hysteria = { path = "../xray-transport-hysteria" }
+xray-proxy-hysteria = { path = "../xray-proxy-hysteria" }
+
+tokio = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+sysinfo = { workspace = true }
+rustls = { workspace = true }
+parking_lot = { workspace = true }
+anyhow = { workspace = true }
+base64 = "0.22"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+rand = "0.9"
