@@ -24,12 +24,10 @@ UUID = 'b831381d-6324-4d53-ad4f-8cda48b30811'
 TPW = 'test-pass-12345'
 SS22_KEY = base64.b64encode(b'0123456789abcdef').decode()  # 16B for 2022-blake3-aes-128-gcm
 PROTOS = ['vmess', 'vless_vision_tls', 'trojan_tls', 'vless_ws', 'ss', 'ss2022']
-# Go 交叉：vmess/vless_vision_tls/trojan_tls/vless_ws/ss/ss2022 中除 vless_vision_tls
-# 外全部进默认 go suite（5）。vless_vision_tls 在 Linux CI 两次确定性挂（HTTP body=0B，
-# server 等 Go client 数据直到 SIGTERM；macOS 同用例全绿、Windows 本地 matrix 过）
-# ——疑似 vision 裸尾 Pending 半记录残留变体（bd 专项票），修复前不入 CI 阻塞门；
-# 本地可用 --go-protos vless_vision_tls 单跑。
-GO_CROSS_PROTOS = ['vmess', 'trojan_tls', 'vless_ws', 'ss', 'ss2022']
+# Go 交叉：6 协议全 Go->Rust 双向校验。vless_vision_tls 曾因 rustls 贪婪 recv
+# 合流裸尾致 Linux 确定性挂（bd jeu9），RecordFramer 记录对齐读修复后 VPS 连续
+# 5 次 PASS（2026-09-20）恢复进默认列表；--go-protos <list> 仍可缩减。
+GO_CROSS_PROTOS = PROTOS
 BASE_PORT = 18100
 IS_WIN = os.name == 'nt'
 EXE = '.exe' if IS_WIN else ''
