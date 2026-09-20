@@ -16,8 +16,8 @@ $raw = powercfg /query SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 2>$null
 if ($LASTEXITCODE -ne 0) {
     Write-Warning "powercfg query failed; cannot verify sleep settings."
 } else {
-    $acLine = ($raw | Select-String "Current AC Power Setting Index").ToString()
-    if ($acLine -match "0x([0-9a-fA-F]+)") {
+    $acLine = ($raw | Select-String "Current AC Power Setting Index")
+    if ($null -ne $acLine -and $acLine.ToString() -match "0x([0-9a-fA-F]+)") {
         $acSeconds = [Convert]::ToInt64($Matches[1], 16)
         if ($acSeconds -gt 0) {
             Write-Warning "System AC sleep timeout = $acSeconds s (non-zero). Run is $DurationHours h - disable sleep or use powercfg /change standby-timeout-ac 0"
@@ -44,7 +44,7 @@ if ($Tier -eq "aggressive") {
 }
 
 # --- 长跑启动命令 ---
-$exe = Join-Path $PSScriptRoot "..\target\release\xray-stress.exe"
+$exe = Join-Path $PSScriptRoot "..\..\..\target\release\xray-stress.exe"
 Write-Host "[run] $exe --duration $durationSec --concurrency $concurrency --s2-conns $s2Conns --s1-delay-ms $delayMs --scenarios s1,s2,s3,s4 --sample-interval $interval --out-dir $OutDir"
 & $exe `
     --duration $durationSec `
