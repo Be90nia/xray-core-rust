@@ -122,6 +122,11 @@ pub fn x25519_key_share_private_raw(ssl: *mut btls_sys::SSL) -> Option<[u8; 32]>
 /// 见 lib.rs「btls 无 server acceptor」缺口），本原语供服务端 btls acceptor
 /// 落地后「检测到无效 CCS」路径调用；客户端侧（btls BtlsConn）可在对端
 /// 模仿行为协商启用后用于丢弃对齐。
+///
+/// iOS 门控：btls-sys 在 aarch64-apple-ios 走预生成 bindings（不含注入声明，
+/// 见 Mobile Gates d0348c0 失败）；iOS 构建亦无注入源码树，原语不存在，
+/// 门控零功能损失（当前无任何调用方）。
+#[cfg(not(target_os = "ios"))]
 pub fn send_post_handshake_record(
     ssl: *mut btls_sys::SSL,
     payload: &[u8],
@@ -517,7 +522,9 @@ mod tests {
 
     /// bd mygg：后握手记录原语链接 + 行为验证——null SSL 必须被原语拒收
     /// （返回 0），同时证明 bindgen 绑定与 ssl 库符号真实可链接。
+    /// iOS 门控同 [`send_post_handshake_record`]（预生成 bindings 无此符号）。
     #[test]
+    #[cfg(not(target_os = "ios"))]
     fn post_handshake_primitive_rejects_null_ssl() {
         let rc = unsafe {
             btls_sys::SSL_send_post_handshake_record(std::ptr::null_mut(), std::ptr::null(), 0)
