@@ -13,15 +13,25 @@ on:
 
 jobs:
   stress:
-    timeout-minutes: 390  # 6h 硬顶（5h run + build margin）
+    timeout-minutes: 390  # 6h 硬顶（5h run + build margin）；GitHub 平台 6h/job 墙更硬，hours 必须 ≤5
     strategy:
       fail-fast: false
       matrix:
+        # 分批跑：12 场景 all 并发时 5 个短连接风暴场景(s1/s5/s7/s8/s11)挤兑 ephemeral 端口预算，
+        # 实测(run 35558871262)各 fail 15 万次成功仅数百；两批各 6 场景避开
         include:
           - os: macos-14
             label: macos
+            batch: a
+          - os: macos-14
+            label: macos
+            batch: b
           - os: ubuntu-latest
             label: linux
+            batch: a
+          - os: ubuntu-latest
+            label: linux
+            batch: b
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -41,7 +51,7 @@ jobs:
       - uses: ./.github/actions/setup-boringssl
       - name: Build harness
         run: cargo build --release -p xray-stress
-      - name: Run stress (${{ matrix.label }})
+      - name: Run stress (${{ matrix.label }}-${{ matrix.batch }})
         shell: bash
         run: |
           # 12 场景 all 并发需要大量 FD（每场景 2 xray 实例+echo+socks+千级连接），
@@ -50,17 +60,18 @@ jobs:
           echo "nofile soft limit: $(ulimit -n)"
           hours="${{ inputs.hours }}"
           [ -z "$hours" ] && hours=5
+          if [ "${{ matrix.batch }}" = "a" ]; then batch="s1,s2,s3,s4,s5,s6"; else batch="s7,s8,s9,s10,s11,s12"; fi
           ./target/release/xray-stress \
             --duration $((hours * 3600)) \
             --concurrency 8 --s2-conns 4 \
-            --scenarios all \
+            --scenarios "$batch" \
             --sample-interval 30 \
             --out-dir stress-out
       - name: Upload results
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: stress-${{ matrix.label }}
+          name: stress-${{ matrix.label }}-${{ matrix.batch }}
           path: |
             stress-out/summary.md
             stress-out/metrics.csv
