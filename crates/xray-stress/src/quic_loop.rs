@@ -27,7 +27,7 @@ const AUTH_SECRET: &str = "xray-stress-secret";
 const S3_PAYLOAD_LEN: usize = 8 * 1024;
 
 /// PEM → DER（自签证书场景，无链无加密段；rcgen 产物为单段 PKCS#8）。
-fn pem_to_der(pem: &str) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn pem_to_der(pem: &str) -> anyhow::Result<Vec<u8>> {
     let body: String = pem
         .lines()
         .filter(|l| !l.starts_with("-----"))

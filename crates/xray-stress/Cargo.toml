@@ -17,6 +17,7 @@ xray-tls = { path = "../xray-tls" }
 xray-proto = { path = "../xray-proto" }
 xray-transport-hysteria = { path = "../xray-transport-hysteria" }
 xray-proxy-hysteria = { path = "../xray-proxy-hysteria" }
+xray-proxy-anytls = { path = "../xray-proxy-anytls" }
 
 tokio = { workspace = true }
 clap = { workspace = true }
@@ -25,6 +26,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 sysinfo = { workspace = true }
 rustls = { workspace = true }
+tokio-rustls = { workspace = true }
 parking_lot = { workspace = true }
 anyhow = { workspace = true }
 base64 = "0.22"

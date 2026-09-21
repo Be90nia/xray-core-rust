@@ -1,10 +1,13 @@
 //! xray-stress：Xray-core-rust 压测 harness 入口。
 //!
-//! 四场景矩阵（全部 loopback、真实协议栈）：
+//! 十二场景矩阵（全部 loopback、真实协议栈）：
 //! - s1 短连接风暴：vless+REALITY 链路，连接生命周期内存回环
 //! - s2 长连接大流量：同链路持续泵随机数据，稳态吞吐衰减曲线
 //! - s3 QUIC 重连循环：hysteria2 0-RTT dial→roundtrip→drop 回环
 //! - s4 混合：mKCP（UDP 路径）短连接 + 长连接叠加
+//! - s5-s12 协议链扩展：vmess+ws / trojan+grpc / ss+tcp / tuic v5 /
+//!   anytls / vless+xhttp(auto) / http 代理 / vmess+xhttp H3（QUIC 承载），
+//!   每场景独立 start_full 双实例，短连接风暴复用 s1 worker 语义
 //!
 //! 长跑启动命令见 run_stress.ps1 / run_stress.sh（保守/标准/激进三档）。
 
@@ -26,7 +29,7 @@ struct Args {
     /// S1 短连接并发档位。
     #[arg(long, default_value_t = 8)]
     concurrency: usize,
-    /// 场景集，逗号分隔：s1,s2,s3,s4 或 all。
+    /// 场景集，逗号分隔：s1..s12 或 all。
     #[arg(long, default_value = "s1,s2,s3,s4")]
     scenarios: String,
     /// 采样间隔（秒）。
@@ -129,6 +132,29 @@ async fn run(
         None
     };
 
+    // s5-s12：每场景独立协议链（表驱动装配 + 首连探针）
+    let mut protocol_links: Vec<(Scenario, u16)> = Vec::new();
+    for &(sc, name) in PROTOCOL_SCENARIOS {
+        if !scenarios.contains(&sc) {
+            continue;
+        }
+        let (port, sh, ch) = sc.start_link(echo_port).await?;
+        for h in sh.into_iter().chain(ch) {
+            tasks.spawn(async move {
+                let _ = h.await;
+            });
+        }
+        // 60s 预算：覆盖 QUIC 系握手失败浮现（quinn 对端拒接经 idle timeout ~30s）
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            topology::probe_socks_roundtrip(port, echo_port),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("{name} link probe timeout (60s)"))??;
+        println!("[xray-stress] {name} link ready: socks=127.0.0.1:{port}");
+        protocol_links.push((sc, port));
+    }
+
     // --- 场景 spawn ---
     if let Some(port) = socks_port {
         if scenarios.contains(&Scenario::S1) {
@@ -164,6 +190,18 @@ async fn run(
             echo_port,
             short,
             long,
+            deadline,
+            h,
+            args.s1_delay_ms,
+        ));
+    }
+    for (sc, port) in protocol_links {
+        let h = StatsHandle::new(sc.stats_name());
+        stats.push(h.clone());
+        tasks.spawn(sc::s1_short_burst(
+            port,
+            echo_port,
+            args.concurrency,
             deadline,
             h,
             args.s1_delay_ms,
@@ -228,6 +266,51 @@ enum Scenario {
     S2,
     S3,
     S4,
+    S5,
+    S6,
+    S7,
+    S8,
+    S9,
+    S10,
+    S11,
+    S12,
+}
+
+/// s5-s12：每个场景一条独立协议链（短连接风暴 worker 复用 s1 语义）。
+const PROTOCOL_SCENARIOS: &[(Scenario, &'static str)] = &[
+    (Scenario::S5, "s5-vmess-ws"),
+    (Scenario::S6, "s6-trojan-grpc"),
+    (Scenario::S7, "s7-ss-tcp"),
+    (Scenario::S8, "s8-tuic"),
+    (Scenario::S9, "s9-anytls"),
+    (Scenario::S10, "s10-vless-xhttp"),
+    (Scenario::S11, "s11-http-proxy"),
+    (Scenario::S12, "s12-vmess-h3"),
+];
+
+impl Scenario {
+    /// s5-s12 → 对应协议链启动器（start_full 双实例）。
+    async fn start_link(self, echo_port: u16) -> anyhow::Result<topology::LinkHandles> {
+        match self {
+            Scenario::S5 => topology::start_vmess_ws_link(echo_port).await,
+            Scenario::S6 => topology::start_trojan_grpc_link(echo_port).await,
+            Scenario::S7 => topology::start_ss_link(echo_port).await,
+            Scenario::S8 => topology::start_tuic_link(echo_port).await,
+            Scenario::S9 => topology::start_anytls_link(echo_port).await,
+            Scenario::S10 => topology::start_splithttp_link(echo_port).await,
+            Scenario::S11 => topology::start_http_link(echo_port).await,
+            Scenario::S12 => topology::start_vmess_h3_link(echo_port).await,
+            _ => anyhow::bail!("s1-s4 links are provisioned separately"),
+        }
+    }
+
+    fn stats_name(self) -> &'static str {
+        PROTOCOL_SCENARIOS
+            .iter()
+            .find(|(s, _)| *s == self)
+            .map(|(_, n)| *n)
+            .unwrap_or("unknown")
+    }
 }
 
 fn parse_scenarios(s: &str) -> anyhow::Result<Vec<Scenario>> {
@@ -238,8 +321,31 @@ fn parse_scenarios(s: &str) -> anyhow::Result<Vec<Scenario>> {
             "s2" => Scenario::S2,
             "s3" => Scenario::S3,
             "s4" => Scenario::S4,
-            "all" => return Ok(vec![Scenario::S1, Scenario::S2, Scenario::S3, Scenario::S4]),
-            other => anyhow::bail!("unknown scenario: {other} (expect s1|s2|s3|s4|all)"),
+            "s5" => Scenario::S5,
+            "s6" => Scenario::S6,
+            "s7" => Scenario::S7,
+            "s8" => Scenario::S8,
+            "s9" => Scenario::S9,
+            "s10" => Scenario::S10,
+            "s11" => Scenario::S11,
+            "s12" => Scenario::S12,
+            "all" => {
+                return Ok(vec![
+                    Scenario::S1,
+                    Scenario::S2,
+                    Scenario::S3,
+                    Scenario::S4,
+                    Scenario::S5,
+                    Scenario::S6,
+                    Scenario::S7,
+                    Scenario::S8,
+                    Scenario::S9,
+                    Scenario::S10,
+                    Scenario::S11,
+                    Scenario::S12,
+                ])
+            },
+            other => anyhow::bail!("unknown scenario: {other} (expect s1..s12|all)"),
         });
     }
     if out.is_empty() {
