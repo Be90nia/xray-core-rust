@@ -44,6 +44,10 @@ jobs:
       - name: Run stress (${{ matrix.label }})
         shell: bash
         run: |
+          # 12 场景 all 并发需要大量 FD（每场景 2 xray 实例+echo+socks+千级连接），
+          # CI runner 默认 nofile（Linux 1024/macOS 更低）会 EMFILE 耗尽→echo 拒连
+          ulimit -n 65535 2>/dev/null || ulimit -n $(ulimit -Hn) 2>/dev/null || true
+          echo "nofile soft limit: $(ulimit -n)"
           hours="${{ inputs.hours }}"
           [ -z "$hours" ] && hours=5
           ./target/release/xray-stress \
