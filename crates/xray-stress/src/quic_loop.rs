@@ -163,7 +163,7 @@ pub async fn s3_quic_reconnect_loop(
             },
             Err(e) => {
                 stats.record_fail();
-                tracing::debug!("s3 roundtrip failed: {e}");
+                tracing::warn!("s3 roundtrip failed: {e}");
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             },
         }
