@@ -213,7 +213,7 @@ async fn open_stream_get_non_200_yields_eof() {
 
     // lazy：open_stream 立即返回，非 200 在读端以 EOF 呈现
     let (mut reader, _, _) = client
-        .open_stream(&base_uri, "sess", None)
+        .open_stream(&base_uri, "sess", None, None)
         .await
         .expect("lazy GET must not fail dial");
     let mut buf = [0u8; 16];
@@ -358,4 +358,250 @@ async fn fingerprint_btls_end_to_end_http2() {
     drop(conn);
     tokio::time::sleep(Duration::from_millis(100)).await;
     server.abort();
+}
+
+/// 连接 drop 必须终止客户端所有 HTTP 连接（bd s10 泄漏回归测试）。
+///
+/// SplitConn drop → on_close → lazy reader 终止 → hyper Client drop →
+/// 池内 TCP 关闭 → 服务端 `serve_connection` 全部返回。缺失断连传播时
+/// （修复前），GET lazy reader 永挂，server 侧连接永不关闭。
+#[tokio::test]
+async fn conn_drop_terminates_all_http_connections() {
+    use std::sync::atomic::AtomicUsize;
+
+    ensure_crypto_provider();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+
+    // server：统计 accept 数与 serve_connection 完成数（完成 = 对端关闭）。
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let finished = Arc::new(AtomicUsize::new(0));
+    let server_task = {
+        let accepted = Arc::clone(&accepted);
+        let finished = Arc::clone(&finished);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                accepted.fetch_add(1, Ordering::Relaxed);
+                let finished = Arc::clone(&finished);
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let body = if req.method() == Method::GET {
+                            Full::new(Bytes::from_static(b"dl"))
+                        } else {
+                            Full::new(Bytes::new())
+                        };
+                        async move {
+                            Ok::<_, std::convert::Infallible>(
+                                Response::builder().status(StatusCode::OK).body(body).unwrap(),
+                            )
+                        }
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, svc).await;
+                    finished.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+        })
+    };
+
+    let config = Arc::new(Config {
+        host: format!("127.0.0.1:{}", server_addr.port()),
+        path: "/".into(),
+        ..Default::default()
+    });
+    let client = Arc::new(DefaultDialerClient::new(
+        config,
+        make_tls_config(),
+        DialTarget { host: "127.0.0.1".into(), port: server_addr.port(), sni: String::new() },
+        None,
+        None,
+    ));
+    let base_uri = format!("http://127.0.0.1:{}/", server_addr.port());
+
+    let mut conn = dial_packet_up(
+        client,
+        base_uri,
+        "drop-sess".into(),
+        1024,
+        RangeConfig::new(0, 0),
+    )
+    .await
+    .unwrap();
+    let mut buf = vec![0u8; 2];
+    conn.read_exact(&mut buf).await.unwrap();
+    conn.write_all(b"x").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let accepted_before = accepted.load(Ordering::Relaxed);
+    assert!(accepted_before >= 1, "server must accept connections, got {accepted_before}");
+
+    // 连接关闭：客户端所有 TCP 必须终结（泄漏回归断言）。
+    drop(conn);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let finished_after = finished.load(Ordering::Relaxed);
+    assert_eq!(
+        finished_after, accepted_before,
+        "all server connections must finish after client conn drop (accepted={accepted_before}, finished={finished_after})"
+    );
+
+    server_task.abort();
+}
+
+/// 桥级 EOF 传播测试（bd s10 残余泄漏定位）。
+///
+/// dispatcher 桥（`bridge_link_with_stream_full`）桥接 dispatch link 与
+/// splithttp packet-up 连接：inbound 侧 shutdown（SOCKS FIN 等价）后，桥必须
+/// 在 half-close 窗口（uplinkOnly/downlinkOnly=1s）内返回并释放 conn——
+/// 生产默认 connIdle=300s 兜底会把挂起的 SplitConn/HTTP 连接钉住 5 分钟，
+/// 表现为 fd/RSS 线性增长。本测试用生产同款默认 policy（connIdle=300s），
+/// 断言桥不依赖 connIdle 即可退出。
+#[tokio::test]
+async fn bridge_eof_propagates_without_conn_idle() {
+    use std::sync::atomic::AtomicUsize;
+
+    use futures_util::{StreamExt, TryStreamExt};
+    use xray_features::policy::TimeoutPolicy;
+    use xray_transport::bridge::bridge_link_with_stream_full;
+    use xray_transport::link::Link;
+
+    ensure_crypto_provider();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+
+    // mock server：GET 响应头已发但 body 长挂（真实 stream-down 形态），
+    // 客户端断开时 hyper 检测到并结束 serve_connection。
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let finished = Arc::new(AtomicUsize::new(0));
+    let server_task = {
+        let accepted = Arc::clone(&accepted);
+        let finished = Arc::clone(&finished);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                accepted.fetch_add(1, Ordering::Relaxed);
+                let finished = Arc::clone(&finished);
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let dl = req.method() == Method::GET;
+                        async move {
+                            if dl {
+                                // 长挂下载流：60s 后才结束（测试会在其之前断开）
+                                let body = tokio_stream::wrappers::UnboundedReceiverStream::new({
+                                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                                    tokio::spawn(async move {
+                                        tx.send(Ok::<Bytes, std::convert::Infallible>(
+                                            Bytes::from_static(b"head"),
+                                        ))
+                                        .ok();
+                                        tokio::time::sleep(Duration::from_secs(60)).await;
+                                        tx.send(Ok(Bytes::from_static(b"tail"))).ok();
+                                    });
+                                    rx
+                                });
+                                let body: http_body_util::combinators::BoxBody<
+                                    Bytes,
+                                    std::convert::Infallible,
+                                > = http_body_util::BodyExt::boxed(
+                                    http_body_util::StreamBody::new(body.map_ok(|b| {
+                                        hyper::body::Frame::data(b)
+                                    })),
+                                );
+                                Ok::<_, std::convert::Infallible>(
+                                    Response::builder().status(StatusCode::OK).body(body).unwrap(),
+                                )
+                            } else {
+                                let body: http_body_util::combinators::BoxBody<
+                                    Bytes,
+                                    std::convert::Infallible,
+                                > = http_body_util::BodyExt::boxed(
+                                    http_body_util::StreamBody::new(
+                                        tokio_stream::wrappers::UnboundedReceiverStream::new({
+                                            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                                            tx.send(Ok(hyper::body::Frame::data(Bytes::new())))
+                                                .ok();
+                                            rx
+                                        }),
+                                    ),
+                                );
+                                Ok(Response::builder().status(StatusCode::OK).body(body).unwrap())
+                            }
+                        }
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, svc).await;
+                    finished.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+        })
+    };
+
+    let config = Arc::new(Config {
+        host: format!("127.0.0.1:{}", server_addr.port()),
+        path: "/".into(),
+        ..Default::default()
+    });
+    let client = Arc::new(DefaultDialerClient::new(
+        config,
+        make_tls_config(),
+        DialTarget { host: "127.0.0.1".into(), port: server_addr.port(), sni: String::new() },
+        None,
+        None,
+    ));
+
+    let conn = dial_packet_up(
+        client,
+        format!("http://127.0.0.1:{}/", server_addr.port()),
+        "bridge-eof-sess".into(),
+        1024,
+        RangeConfig::new(0, 0),
+    )
+    .await
+    .unwrap();
+    // 生产同款包装（register.rs：Sync bound）
+    let mut conn = conn.into_sync_reader();
+
+    // 模拟 inbound 侧：up 管道写 payload 后 shutdown（SOCKS FIN 等价）；
+    // down 管道读端由本测试持有（客户端收下行）。
+    let (up_r, mut up_w) = xray_buf::pipe::new();
+    let (_dn_r, dn_w) = xray_buf::pipe::new();
+    let link = Link::new(
+        Box::new(up_r) as Box<dyn xray_buf::io::Reader>,
+        Box::new(dn_w) as Box<dyn xray_buf::io::Writer>,
+    );
+    tokio::spawn(async move {
+        use xray_buf::io::Writer as _;
+        let _ = up_w.write_multi_buffer({
+            let mut mb = xray_buf::multi::MultiBuffer::new();
+            mb.merge_bytes(b"payload");
+            mb
+        }).await;
+        up_w.shutdown(); // inbound EOF：触发桥 half-close 窗口
+    });
+
+    // 生产默认 policy：connIdle=300s（挂起时的兜底）。桥必须不依赖它退出。
+    let policy = TimeoutPolicy::default();
+    let started = std::time::Instant::now();
+    let res = tokio::time::timeout(Duration::from_secs(5), async move {
+        bridge_link_with_stream_full(link, conn, &policy).await
+    })
+    .await;
+    let elapsed = started.elapsed();
+    assert!(res.is_ok(), "bridge must return via half-close window (1s), not connIdle=300s; elapsed {elapsed:?}");
+    let _ = res.unwrap().expect("bridge io ok");
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "bridge must exit within half-close window, elapsed {elapsed:?}"
+    );
+
+    // 桥返回后 SplitConn 已 drop → 客户端 HTTP 连接关闭 → server 全部终结。
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let accepted_n = accepted.load(Ordering::Relaxed);
+    let finished_n = finished.load(Ordering::Relaxed);
+    assert_eq!(
+        finished_n, accepted_n,
+        "all server connections must finish after bridge EOF (accepted={accepted_n}, finished={finished_n})"
+    );
+
+    server_task.abort();
 }

@@ -20,7 +20,9 @@ RUN apt-get update \
     && unzip -o /tmp/protoc.zip -d /usr/local \
     && rm /tmp/protoc.zip
 ENV PATH="/usr/local/go/bin:${PATH}" \
-    PROTOC=/usr/local/bin/protoc
+    PROTOC=/usr/local/bin/protoc \
+    CARGO_NET_RETRY=10 \
+    CARGO_HTTP_TIMEOUT=120
 
 WORKDIR /workspace
 COPY Cargo.toml Cargo.lock ./

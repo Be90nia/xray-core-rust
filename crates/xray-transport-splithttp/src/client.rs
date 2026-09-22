@@ -32,7 +32,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures_util::{Stream, TryStreamExt};
+use futures_util::{Future, Stream, TryStreamExt};
 use http::request::Request;
 use http::{Method, StatusCode, Uri};
 use hyper::body::Frame;
@@ -148,6 +148,11 @@ impl HttpConnection for DestTcpStream {
 /// error 类型用 `std::io::Error`（`StreamBody` 的错误类型）；`Full<Bytes>` 的
 /// error 是 `Infallible`，通过 `map_err` 闭包转换（match infallible {} unreachable）。
 pub type ReqBody = BoxBody<Bytes, std::io::Error>;
+
+/// 下载流终止信号：发送端由拨号方接到 [`crate::connection::SplitConn`] 的
+/// `on_close`（连接 drop 即 send），接收端在 lazy reader 任务里终止 GET。
+/// 对齐 Go `splitConn.onClose → reader.Close()` 的断连传播语义。
+pub type CloseSignal = tokio::sync::oneshot::Receiver<()>;
 
 /// hyper-util legacy Client 类型别名。
 ///
@@ -479,6 +484,7 @@ impl DefaultDialerClient {
         base_uri: &str,
         session_id: &str,
         body: Option<Vec<u8>>,
+        close: Option<CloseSignal>,
     ) -> Result<(Box<dyn AsyncReadTrait + Send + Unpin>, SocketAddr, SocketAddr)> {
         let is_get = body.is_none();
         let meta = self
@@ -491,7 +497,8 @@ impl DefaultDialerClient {
             // 把 GET 响应头缓冲到首块下行数据，而下行数据依赖上传侧到达；
             // packet-up/stream-up 的 POST 上传任务在 GET 返回后才 spawn——旧实现
             // 同步 `request().await` 等响应头会环形死锁，dial 挂到外层超时。
-            let reader = spawn_h2_lazy_reader(self.closed.clone(), self.client.clone(), req);
+            let reader =
+                spawn_h2_lazy_reader(self.closed.clone(), self.client.clone(), req, close);
             let placeholder = SocketAddr::from(([0, 0, 0, 0], 0));
             return Ok((reader, placeholder, placeholder));
         }
@@ -717,37 +724,61 @@ fn is_packet_replayable(e: &hyper_util::client::legacy::Error) -> bool {
 /// dial 调用方不被响应头阻塞：spawn 的后台任务持有响应 future——200 则把 body
 /// 块转发进 channel；非 200 仅记日志并结束（读端 EOF，对齐 Go `"unexpected
 /// status"` 分支）；请求错误则 `closed` 置位 + EOF。
+///
+/// `close` 信号到达（[`crate::connection::SplitConn`] drop → 上游连接关闭）即
+/// 放弃 GET——drop 请求/响应 future：hyper 将该连接按不可复用处理（h1 关 TCP、
+/// h2 发 RST_STREAM），服务端据此终止 GET 并清理会话。对齐 Go
+/// `splitConn.onClose → reader.Close()`；缺失此传播时服务端 GET/会话/桥接链
+/// 全部永挂（bd s10 fd 泄漏根因）。
 fn spawn_h2_lazy_reader(
     closed: Arc<AtomicBool>,
     mut client: HyperClient,
     req: Request<ReqBody>,
+    close: Option<CloseSignal>,
 ) -> Box<dyn AsyncReadTrait + Send + Unpin> {
     let (tx, rx) = mpsc::channel::<std::io::Result<Bytes>>(8);
+    let mut close_fut: Pin<Box<dyn Future<Output = ()> + Send>> = match close {
+        Some(rx) => Box::pin(async move {
+            let _ = rx.await;
+        }),
+        None => Box::pin(std::future::pending()),
+    };
     tokio::spawn(async move {
-        match client.request(req).await {
-            Ok(resp) if resp.status() == StatusCode::OK => {
-                let mut chunks = BodyDataStream::new(resp.into_body()).map_err(hyper_err_to_io);
-                loop {
-                    match chunks.try_next().await {
-                        Ok(Some(chunk)) => {
-                            if tx.send(Ok(chunk)).await.is_err() {
-                                return; // 接收端 drop，结束
+        tokio::select! {
+            _ = &mut close_fut => return,
+            result = client.request(req) => {
+                match result {
+                    Ok(resp) if resp.status() == StatusCode::OK => {
+                        let mut chunks =
+                            BodyDataStream::new(resp.into_body()).map_err(hyper_err_to_io);
+                        loop {
+                            tokio::select! {
+                                _ = &mut close_fut => return,
+                                chunk = chunks.try_next() => {
+                                    match chunk {
+                                        Ok(Some(chunk)) => {
+                                            if tx.send(Ok(chunk)).await.is_err() {
+                                                return; // 接收端 drop，结束
+                                            }
+                                        }
+                                        Ok(None) => return,
+                                        Err(e) => {
+                                            let _ = tx.send(Err(e)).await;
+                                            return;
+                                        }
+                                    }
+                                }
                             }
                         }
-                        Ok(None) => return,
-                        Err(e) => {
-                            let _ = tx.send(Err(e)).await;
-                            return;
-                        }
+                    }
+                    Ok(resp) => {
+                        debug!(target: "splithttp", status = %resp.status(), "unexpected GET status");
+                    }
+                    Err(e) => {
+                        closed.store(true, Ordering::Relaxed);
+                        debug!(target: "splithttp", error = %e, "GET request failed");
                     }
                 }
-            }
-            Ok(resp) => {
-                debug!(target: "splithttp", status = %resp.status(), "unexpected GET status");
-            }
-            Err(e) => {
-                closed.store(true, Ordering::Relaxed);
-                debug!(target: "splithttp", error = %e, "GET request failed");
             }
         }
     });

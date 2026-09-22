@@ -15,7 +15,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anytls::proxy::session::{Session, new_server_session};
+use anytls::core::{Command, Frame};
+use anytls::proxy::session::{DEFAULT_SID, Session, new_server_session};
 use anytls::runtime::DefaultPaddingFactory;
 use anytls::AsyncReadWrite;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -129,6 +130,41 @@ async fn handle_conn(
     dispatch: Option<Arc<dyn DispatchHandler>>,
     expected_password_sha256: Option<[u8; 32]>,
 ) {
+    // socket kill 通道：anytls-rs Session 不暴露底层连接，其 terminate() 是纯
+    // 本地标记（不关 TLS socket、不唤醒阻塞在 TLS read 的 recv_loop）——没有它
+    // 会话 fd 永不释放（s9 压测 fd +5222/min 根因）。持有 dup 句柄，会话流结束
+    // 时 shutdown 双向，驱动本端 recv_loop 退出、Arc<Session> 全量 drop、fd 关闭。
+    let mut tcp_std = match tcp.into_std() {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("anytls mock server: tcp into_std failed: {e}");
+            return;
+        }
+    };
+    let kill_sock = match tcp_std.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("anytls mock server: tcp try_clone failed: {e}");
+            return;
+        }
+    };
+    if let Err(e) = tcp_std.set_nonblocking(true) {
+        debug!("anytls mock server: tcp set_nonblocking failed: {e}");
+        return;
+    }
+    let tcp = match TcpStream::from_std(tcp_std) {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("anytls mock server: tcp from_std failed: {e}");
+            return;
+        }
+    };
+    let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        if kill_rx.await.is_ok() {
+            let _ = kill_sock.shutdown(std::net::Shutdown::Both);
+        }
+    });
     let mut tls: TlsStream<TcpStream> = match tls_acceptor.accept(tcp).await {
         Ok(t) => t,
         Err(e) => {
@@ -165,9 +201,16 @@ async fn handle_conn(
         }
     }
     let padding = DefaultPaddingFactory::load();
+    // Fn 闭包不能 move out kill_tx：用 take 单次取出（回调单次触发由
+    // anytls 单流模式的 handler_started 保护保证）。
+    let kill_tx_cell = std::sync::Mutex::new(Some(kill_tx));
     let on_new_session: Box<dyn Fn(Arc<Session>) + Send + Sync> = Box::new(move |session| {
         let dispatch = dispatch.clone();
-        tokio::spawn(handle_session(session, dispatch));
+        let kill_tx = kill_tx_cell
+            .lock()
+            .expect("anytls kill_tx cell poisoned")
+            .take();
+        tokio::spawn(handle_session(session, dispatch, kill_tx));
     });
     let session = Arc::new(
         new_server_session(Box::new(tls) as Box<dyn AsyncReadWrite>, on_new_session, padding).await,
@@ -185,7 +228,11 @@ async fn handle_conn(
 
 
 /// 处理一个 incoming session：读 SOCKS5 target → 直连或 dispatcher 桥接。
-async fn handle_session(session: Arc<Session>, dispatch: Option<Arc<dyn DispatchHandler>>) {
+async fn handle_session(
+    session: Arc<Session>,
+    dispatch: Option<Arc<dyn DispatchHandler>>,
+    kill_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) {
     // 1. 读 SOCKS5 target（首帧 application data）
     let mut buf = vec![0u8; 1024];
     let n = match session.read(&mut buf).await {
@@ -224,10 +271,9 @@ async fn handle_session(session: Arc<Session>, dispatch: Option<Arc<dyn Dispatch
         let writer = new_writer(wr_half);
         let link = Link::new(reader, writer);
         handler.dispatch(&dest, link).await;
-        // dispatch 返回后 dispatch handle 已 drop，关闭 writer 半部让 pump 退出。
-        if let Err(e) = session.terminate().await {
-            debug!("anytls mock server: terminate after dispatch: {e}");
-        }
+        // dispatch 返回后 dispatch handle 已 drop，pump 随 duplex EOF 退出；
+        // 按 FIN + shutdown 收尾释放会话（同 mock 直连分支）。
+        finish_session(&session, kill_tx).await;
     } else {
         // mock/直连路径（loopback 测试）。
         let target_str = match &target {
@@ -250,9 +296,29 @@ async fn handle_session(session: Arc<Session>, dispatch: Option<Arc<dyn Dispatch
             }
         }
 
-        if let Err(e) = bridge(session, outbound).await {
+        if let Err(e) = bridge(session.clone(), outbound).await {
             debug!("anytls mock server: bridge ended: {e}");
         }
+        finish_session(&session, kill_tx).await;
+    }
+}
+
+/// 会话流结束收尾：按协议发 FIN + 标记本地半关，然后 shutdown 底层 TCP。
+///
+/// FIN 让客户端收到干净 EOF（数据先于连接关闭送达）；shutdown 驱动本端
+/// recv_loop 退出 → `run()` 结束 → Arc<Session> 全量 drop → TLS fd 释放。
+/// anytls-rs 的 terminate() 做不到后者（纯本地标记），单流会话里它是 fd
+/// 挂死的根因（s9 压测）。
+async fn finish_session(
+    session: &Session,
+    kill_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) {
+    let _ = session
+        .write_frame(Frame::new(Command::Fin, DEFAULT_SID))
+        .await;
+    let _ = session.mark_local_stream_closed(DEFAULT_SID).await;
+    if let Some(kill_tx) = kill_tx {
+        let _ = kill_tx.send(());
     }
 }
 
@@ -306,7 +372,7 @@ async fn pump_session_to_duplex(session: Arc<Session>, server_io: DuplexStream) 
                 }
             }
         }
-        let _ = session.terminate().await;
+        // 会话收尾（FIN + shutdown）由 handle_session::finish_session 统一执行。
     };
     tokio::join!(down, up);
 }
@@ -368,7 +434,7 @@ async fn bridge(session: Arc<Session>, outbound: TcpStream) -> std::io::Result<(
                 Err(e) => return Err(e),
             }
         }
-        let _ = session.terminate().await;
+        // 会话收尾（FIN + shutdown）由 handle_session::finish_session 统一执行。
         Ok::<_, std::io::Error>(())
     };
     tokio::try_join!(down, up)?;
@@ -473,6 +539,73 @@ mod tests {
             .expect("read within timeout")
             .expect("echo read");
         assert_eq!(&buf, b"ping");
+        client.close().await.ok();
+        server.stop().await;
+    }
+
+    /// 带活跃连接计数的 echo server：断言 client 流结束后服务端连接被释放。
+    async fn start_tracked_echo_server() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let active_spawn = active.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                active_spawn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let counter = active_spawn.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if sock.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+        });
+        (addr, active)
+    }
+
+    /// s9 fd 泄漏回归：client 流结束（写 FIN）后，服务端 session/TLS 必须释放——
+    /// echo 计数归零。修复前 terminate() 不发 FIN 不关 socket，计数永不归零。
+    #[tokio::test]
+    async fn stream_close_releases_server_connection() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (echo, active) = start_tracked_echo_server().await;
+        let (server, cert_der) = start_server_with_password(Some("s3cret")).await;
+        let client = make_client(server.local_addr, "s3cret", &cert_der);
+        let mut conn = client
+            .dial(&SocksAddr::from_socket(echo))
+            .await
+            .expect("dial");
+        conn.write_all(b"ping").await.expect("write");
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), conn.read_exact(&mut buf))
+            .await
+            .expect("read within timeout")
+            .expect("echo read");
+        assert_eq!(&buf, b"ping");
+        drop(conn);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if active.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            active.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "server-side echo connection must be released after client stream close"
+        );
         client.close().await.ok();
         server.stop().await;
     }

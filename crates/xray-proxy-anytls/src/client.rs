@@ -304,7 +304,15 @@ async fn pump_stream(
                 }
             }
         }
-        let _ = session.terminate().await;
+        // 流结束按协议发 FIN + 标记本地半关（anytls-go Pipe 关闭语义）。禁止在此
+        // terminate()：它是纯本地标记（不发 FIN、不关 TLS socket、不唤醒阻塞在
+        // TLS read 的 recv_loop），服务端永远不知道流已结束 → 双端 TLS fd 挂死在
+        // 活跃 sessions map（s9 压测 fd +5222/min 根因）。会话 fd 的最终释放由
+        // 服务端收到 FIN 后关闭底层连接驱动（server.rs finish_session）。
+        let _ = session
+            .write_frame(Frame::new(Command::Fin, DEFAULT_SID))
+            .await;
+        let _ = session.mark_local_stream_closed(DEFAULT_SID).await;
     };
     tokio::join!(down, up);
 }

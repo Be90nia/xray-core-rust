@@ -47,3 +47,4 @@ hex = "0.4"
 
 [dev-dependencies]
 rcgen = "0.13"
+xray-features = { path = "../xray-features" }

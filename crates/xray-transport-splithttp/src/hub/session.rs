@@ -103,10 +103,8 @@ impl SessionMap {
                     // GET arrived, session lives as long as the GET connection.
                 }
                 _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                    // 30s without GET → reap.
-                    let mut map = self_clone.inner.lock().await;
-                    map.remove(&sid);
-                    // UploadQueue has no explicit close needed; Arc drops when last ref goes.
+                    // 30s without GET → reap（对齐 Go hub.go:86-88：Delete + queue.Close）。
+                    self_clone.remove(&sid).await;
                 }
             }
         });
@@ -115,8 +113,18 @@ impl SessionMap {
     }
 
     /// 删除会话（GET 结束后调用）。
+    ///
+    /// 删除即关闭 [`UploadQueue`]（对齐 Go reap 路径 hub.go:88
+    /// `s.uploadQueue.Close()`）：packet-up 的 `forward_queue_to_writer` 任务收到
+    /// EOF 退出 → 上行 duplex 写端 drop → dispatcher 桥接链上行 EOF。缺失此关闭
+    /// 时 forward 任务永挂，服务端会话/桥接/freedom 连接整条链无法解体
+    /// （bd s10/s12 泄漏服务端侧根因）。幂等：session 不存在时无操作。
     pub async fn remove(&self, session_id: &str) {
-        self.inner.lock().await.remove(session_id);
+        let session = self.inner.lock().await.remove(session_id);
+        if let Some(session) = session {
+            session.upload_queue.close().await;
+        }
+        tracing::debug!("LEAKPROBE session removed+queue closed sid={}", session_id);
     }
 }
 
