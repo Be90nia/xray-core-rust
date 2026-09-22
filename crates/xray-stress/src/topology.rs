@@ -22,17 +22,30 @@ pub fn ensure_crypto_provider() {
     });
 }
 
+/// 用户保留端口——压测流量禁止占用（用户指定：8000/8001/5666/5667；需追加改此表）。
+/// bind :0 的随机分配在本机动态端口范围被扩容后会撞上这些低位端口。
+pub const RESERVED_PORTS: &[u16] = &[8000, 8001, 5666, 5667];
+
+pub fn is_port_reserved(port: u16) -> bool {
+    RESERVED_PORTS.contains(&port)
+}
+
 pub async fn pick_free_port() -> u16 {
-    let probe = TcpListener::bind("127.0.0.1:0").await.expect("pick port");
-    let port = probe.local_addr().expect("probe addr").port();
-    drop(probe);
-    port
+    loop {
+        let probe = TcpListener::bind("127.0.0.1:0").await.expect("pick port");
+        let port = probe.local_addr().expect("probe addr").port();
+        drop(probe);
+        if !is_port_reserved(port) {
+            return port;
+        }
+    }
 }
 
 /// 无状态 echo：读到什么回什么（roundtrip 语义载体）。
 pub async fn start_echo() -> std::net::SocketAddr {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
+    let echo_port = pick_free_port().await;
+    let listener = TcpListener::bind(("127.0.0.1", echo_port)).await.expect("bind echo");
     let addr = listener.local_addr().expect("echo addr");
     tokio::spawn(async move {
         loop {
