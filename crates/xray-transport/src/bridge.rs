@@ -339,7 +339,10 @@ where
                     // 空闲 deadline（Go ConnectionIdle / CancelAfterInactivity）
                     res = timeout(conn_idle, reader.read_multi_buffer()) => match res {
                         Ok(r) => r,
-                        Err(_) => break,
+                        Err(_) => {
+                            tracing::debug!("LEAKPROBE up_reader idle-break");
+                            break;
+                        }
                     },
                     _ = down_done.changed() => {
                         window = *down_done.borrow();
@@ -348,7 +351,10 @@ where
                 },
                 Some(d) => match timeout(d, reader.read_multi_buffer()).await {
                     Ok(r) => r,
-                    Err(_) => break, // downlink_only 窗口内无数据
+                    Err(_) => {
+                        tracing::debug!("LEAKPROBE up_reader half-window-break");
+                        break; // downlink_only 窗口内无数据
+                    }
                 },
             };
             match mb {
@@ -356,13 +362,18 @@ where
                     // channel 满阻塞在此（不抢对向时间片）；writer task 已死时
                     // send 立即 Err → 本向级联退出，绝不静默吞数据。
                     if up_tx.send(mb).await.is_err() {
+                        tracing::debug!("LEAKPROBE up_reader send-fail-break");
                         break;
                     }
                 }
-                _ => break,
+                _ => {
+                    tracing::debug!("LEAKPROBE up_reader eof-break");
+                    break;
+                }
             }
         }
         let _ = up_done_tx.send(Some(uplink_only));
+        tracing::debug!("LEAKPROBE up_reader done");
         io::Result::Ok(())
     };
     // 上行 writer：up_rx → stream 写半部聚合写（vectored 批写，y1yx）。只写不读。
@@ -376,6 +387,7 @@ where
         // 级联：本 task 退出即 drop up_rx → 上行 reader send 失败 → up_done
         // 传播 half_window，对向不静默半断。
         let _ = s_write.shutdown().await;
+        tracing::debug!("LEAKPROBE up_writer done");
         io::Result::Ok(())
     };
     // 下行 reader：xray_buf 顺序读（池化 Buffer，对应 Go 无 vectored 源的
@@ -411,6 +423,7 @@ where
             }
         }
         let _ = down_done_tx.send(Some(downlink_only));
+        tracing::debug!("LEAKPROBE down_reader done");
         io::Result::Ok(())
     };
 
@@ -423,6 +436,7 @@ where
         }
         // 桥结束确保下游 reader 收到 EOF；同样只关本向，不碰 stream 写半部。
         writer.shutdown();
+        tracing::debug!("LEAKPROBE down_writer done");
         io::Result::Ok(())
     };
 

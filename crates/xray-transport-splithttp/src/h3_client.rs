@@ -37,16 +37,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::{Buf, Bytes};
-use futures_util::{Stream, StreamExt};
+use futures_util::{Future, Stream, StreamExt};
 use http::request::Request;
 use http::{Method, StatusCode};
 use rustls::ClientConfig as RustlsClientConfig;
+use std::pin::Pin;
 use tokio::io::AsyncRead as AsyncReadTrait;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::io::StreamReader;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 
+use crate::client::CloseSignal;
 use crate::config::{Config, RequestMeta};
 use crate::error::{Result, SplitHttpError};
 
@@ -246,6 +248,17 @@ impl H3Conn {
         self.closed.load(Ordering::Relaxed)
     }
 
+    /// 显式关闭 QUIC 连接。对齐 Go `dialer.go:229-231`
+    /// `context.AfterFunc(conn.Context(), func() { tr.Close(); pktConn.Close() })`：
+    /// 代理连接结束即关连接 + 释放 UDP socket（Rust 侧 H3Conn 与 QUIC 连接一一
+    /// 对应，无 xmux 复用）。不发此关闭时连接只能等 30s idle timeout，期间
+    /// endpoint driver 与连接状态（约 MB 级缓冲）持续驻留（bd s12 泄漏根因之一）。
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+        self.quinn_conn
+            .close(quinn::VarInt::from_u32(0), b"client conn dropped");
+    }
+
     fn mark_closed(&self) {
         self.closed.store(true, Ordering::Relaxed);
     }
@@ -342,6 +355,7 @@ impl H3Conn {
         base_uri: &str,
         session_id: &str,
         body: Option<Vec<u8>>,
+        close: Option<CloseSignal>,
     ) -> Result<(Box<dyn AsyncReadTrait + Send + Unpin>, SocketAddr, SocketAddr)> {
         let meta = self
             .config
@@ -375,7 +389,7 @@ impl H3Conn {
             // 会阻塞 dial：packet-up 的 POST 上传任务在 GET 之后才 spawn，而
             // server 的 GET/POST 建流时序需要请求先行发出——顺序死锁，dial
             // 挂到外层超时（CF/QUIC 面本身放行 quinn，与本 bug 无关）。
-            let reader = spawn_h3_lazy_reader(self.clone(), stream);
+            let reader = spawn_h3_lazy_reader(self.clone(), stream, close);
             return Ok((reader, remote, local));
         }
 
@@ -553,9 +567,14 @@ where
 /// `recv_data` 数据循环；非 200 仅记日志并结束（读端 EOF，对齐 Go
 /// `"unexpected status"` 分支）；错误则 `mark_closed` + EOF。数据经 channel
 /// 转发，转换方式与 [`spawn_h3_recv_reader`] 相同。
+///
+/// `close` 信号到达（[`crate::connection::SplitConn`] drop）即退出——drop
+/// `RequestStream` 触发 quinn 停止接收；配合拨号方 on_close 里的
+/// [`H3Conn::close`] 整条 QUIC 连接立即终结，对齐 Go `splitConn.onClose` 语义。
 fn spawn_h3_lazy_reader<S, B>(
     this: std::sync::Arc<H3Conn>,
     mut stream: h3::client::RequestStream<S, B>,
+    close: Option<CloseSignal>,
 ) -> Box<dyn AsyncReadTrait + Send + Unpin>
 where
     h3::client::RequestStream<S, B>: Send,
@@ -563,37 +582,53 @@ where
     B: Buf + Send + 'static,
 {
     let (tx, rx) = mpsc::channel::<std::io::Result<Bytes>>(8);
+    let mut close_fut: Pin<Box<dyn Future<Output = ()> + Send>> = match close {
+        Some(rx) => Box::pin(async move {
+            let _ = rx.await;
+        }),
+        None => Box::pin(std::future::pending()),
+    };
     tokio::spawn(async move {
-        match stream.recv_response().await {
-            Ok(resp) if resp.status() == StatusCode::OK => {}
-            Ok(resp) => {
-                debug!(target: "splithttp-h3", status = %resp.status(), "unexpected GET status");
-                return;
-            }
-            Err(e) => {
-                this.mark_closed();
-                debug!(target: "splithttp-h3", error = %e, "GET recv_response failed");
-                return;
-            }
-        }
-        loop {
-            match stream.recv_data().await {
-                Ok(Some(mut buf)) => {
-                    let len = buf.remaining();
-                    let bytes = buf.copy_to_bytes(len);
-                    if tx.send(Ok(bytes)).await.is_err() {
-                        return; // 接收端 drop，结束
+        tokio::select! {
+            _ = &mut close_fut => return,
+            resp = stream.recv_response() => {
+                match resp {
+                    Ok(resp) if resp.status() == StatusCode::OK => {}
+                    Ok(resp) => {
+                        debug!(target: "splithttp-h3", status = %resp.status(), "unexpected GET status");
+                        return;
+                    }
+                    Err(e) => {
+                        this.mark_closed();
+                        debug!(target: "splithttp-h3", error = %e, "GET recv_response failed");
+                        return;
                     }
                 }
-                Ok(None) => return,
-                Err(e) => {
-                    let _ = tx
-                        .send(Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            e.to_string(),
-                        )))
-                        .await;
-                    return;
+                loop {
+                    tokio::select! {
+                        _ = &mut close_fut => return,
+                        data = stream.recv_data() => {
+                            match data {
+                                Ok(Some(mut buf)) => {
+                                    let len = buf.remaining();
+                                    let bytes = buf.copy_to_bytes(len);
+                                    if tx.send(Ok(bytes)).await.is_err() {
+                                        return; // 接收端 drop，结束
+                                    }
+                                }
+                                Ok(None) => return,
+                                Err(e) => {
+                                    let _ = tx
+                                        .send(Err(std::io::Error::new(
+                                            std::io::ErrorKind::Other,
+                                            e.to_string(),
+                                        )))
+                                        .await;
+                                    return;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

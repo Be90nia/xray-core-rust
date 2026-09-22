@@ -61,8 +61,14 @@ pub async fn dial_packet_up(
     sc_max_each_post_bytes: usize,
     sc_min_posts_interval_ms: RangeConfig,
 ) -> Result<PacketUpConn> {
-    // 1. GET 下载流（stream-down，lazy reader——POST 上传任务见下）
-    let (download_reader, remote, local) = client.open_stream(&base_uri, &session_id, None).await?;
+    // 1. GET 下载流（stream-down，lazy reader——POST 上传任务见下）。
+    // close 信号：SplitConn drop（连接关闭）即终止 GET——hyper 连接按不可复用
+    // 处理（h1 关 TCP / h2 RST_STREAM），服务端据此清理会话与桥接链（Go
+    // `splitConn.onClose` 语义）。缺失此传播 = 服务端全链永挂（bd s10 fd 泄漏）。
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+    let (download_reader, remote, local) = client
+        .open_stream(&base_uri, &session_id, None, Some(close_rx))
+        .await?;
 
     // 2. 创建上传 pipe（buffer 略大于 max_post 以吸收短期 burst）
     let pipe_buf = sc_max_each_post_bytes.saturating_mul(2).max(8192);
@@ -110,7 +116,11 @@ pub async fn dial_packet_up(
         }
     });
 
-    Ok(SplitConn::new(download_reader, pipe_client, remote, local))
+    let mut conn = SplitConn::new(download_reader, pipe_client, remote, local);
+    conn.set_on_close(move || {
+        let _ = close_tx.send(());
+    });
+    Ok(conn)
 }
 
 
@@ -143,10 +153,17 @@ pub async fn dial_stream_up(
         .open_stream_uploading(&base_uri, &session_id, upload_stream, true)
         .await?;
 
-    // 3. 独立 GET 下载流
-    let (download_reader, _, _) = client.open_stream(&base_uri, &session_id, None).await?;
+    // 3. 独立 GET 下载流（close 信号同 dial_packet_up——断连传播终止 GET）
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+    let (download_reader, _, _) = client
+        .open_stream(&base_uri, &session_id, None, Some(close_rx))
+        .await?;
 
-    Ok(SplitConn::new(download_reader, pipe_client, remote, local))
+    let mut conn = SplitConn::new(download_reader, pipe_client, remote, local);
+    conn.set_on_close(move || {
+        let _ = close_tx.send(());
+    });
+    Ok(conn)
 }
 
 /// stream-one mode 拨号：单 POST streaming body + 同连接响应流（全双工）。
@@ -353,8 +370,11 @@ pub async fn dial_h3_packet_up(
     sc_max_each_post_bytes: usize,
     sc_min_posts_interval_ms: RangeConfig,
 ) -> Result<PacketUpConn> {
-    // 1. GET 下载流
-    let (download_reader, remote, local) = client.open_stream(&base_uri, &session_id, None).await?;
+    // 1. GET 下载流（close 信号 + 连接级关闭见下方 on_close 注释）。
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+    let (download_reader, remote, local) = client
+        .open_stream(&base_uri, &session_id, None, Some(close_rx))
+        .await?;
 
     // 2. 创建上传 pipe
     let pipe_buf = sc_max_each_post_bytes.saturating_mul(2).max(8192);
@@ -363,6 +383,7 @@ pub async fn dial_h3_packet_up(
     // 3. spawn 后台 POST 任务
     let base_uri_for_task = base_uri.clone();
     let session_id_for_task = session_id.clone();
+    let client_for_task = Arc::clone(&client);
     tokio::spawn(async move {
         let mut seq: u64 = 0;
         let mut read_buf = vec![0u8; sc_max_each_post_bytes];
@@ -380,7 +401,7 @@ pub async fn dial_h3_packet_up(
             let seq_str = seq.to_string();
             seq += 1;
 
-            if let Err(e) = client
+            if let Err(e) = client_for_task
                 .post_packet(&base_uri_for_task, &session_id_for_task, &seq_str, payload)
                 .await
             {
@@ -400,7 +421,17 @@ pub async fn dial_h3_packet_up(
         }
     });
 
-    Ok(SplitConn::new(download_reader, pipe_client, remote, local))
+    let mut conn = SplitConn::new(download_reader, pipe_client, remote, local);
+    // 连接关闭：终止 GET 下载流 + 显式关闭 QUIC 连接（H3Conn 与 QUIC 连接一一
+    // 对应，对齐 Go dialer.go:229-231 AfterFunc 的 `tr.Close(); pktConn.Close()`）
+    // ——客户端 UDP fd 立即释放，服务端 QUIC 连接立即终结，不等 30s idle timeout
+    // （bd s12 RSS/fd 泄漏根因之一）。
+    let h3_for_close = Arc::clone(&client);
+    conn.set_on_close(move || {
+        h3_for_close.close();
+        let _ = close_tx.send(());
+    });
+    Ok(conn)
 }
 
 /// H3 stream-up mode 拨号：POST streaming body 上传 + 独立 GET 下载。
@@ -420,10 +451,19 @@ pub async fn dial_h3_stream_up(
         .open_stream_uploading(&base_uri, &session_id, upload_stream, true)
         .await?;
 
-    // 3. 独立 GET 下载
-    let (download_reader, _, _) = client.open_stream(&base_uri, &session_id, None).await?;
+    // 3. 独立 GET 下载（close 信号同 dial_h3_packet_up——断连传播 + 连接级关闭）
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+    let (download_reader, _, _) = client
+        .open_stream(&base_uri, &session_id, None, Some(close_rx))
+        .await?;
 
-    Ok(SplitConn::new(download_reader, pipe_client, remote, local))
+    let mut conn = SplitConn::new(download_reader, pipe_client, remote, local);
+    let h3_for_close = Arc::clone(&client);
+    conn.set_on_close(move || {
+        h3_for_close.close();
+        let _ = close_tx.send(());
+    });
+    Ok(conn)
 }
 
 /// H3 stream-one mode 拨号：单 stream 全双工（POST streaming body + 同一

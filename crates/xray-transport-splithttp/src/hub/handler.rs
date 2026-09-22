@@ -434,13 +434,20 @@ async fn forward_queue_to_writer(queue: Arc<crate::UploadQueue>, mut writer: tok
     let mut buf = vec![0u8; 8192];
     loop {
         match queue.read(&mut buf).await {
-            Ok(0) => break,
+            Ok(0) => {
+                tracing::debug!("LEAKPROBE forward eof");
+                break;
+            }
             Ok(n) => {
                 if writer.write_all(&buf[..n]).await.is_err() {
+                    tracing::debug!("LEAKPROBE forward write-fail");
                     break;
                 }
             }
-            Err(_) => break,
+            Err(_) => {
+                tracing::debug!("LEAKPROBE forward read-err");
+                break;
+            }
         }
     }
     let _ = writer.shutdown().await;
@@ -457,6 +464,7 @@ struct SessionDropGuard {
 
 impl Drop for SessionDropGuard {
     fn drop(&mut self) {
+        tracing::debug!("LEAKPROBE session guard drop sid={}", self.sid);
         let sessions = Arc::clone(&self.sessions);
         let sid = std::mem::take(&mut self.sid);
         tokio::spawn(async move {

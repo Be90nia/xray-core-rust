@@ -274,6 +274,27 @@ mod tests {
         assert_eq!(&buf[..n], b"hello");
     }
 
+    /// close 必须唤醒「正在等待新 packet」的 read（生产路径：forward task 阻塞
+    /// 在 queue.read() 等下一个 POST 分包时，session 删除触发 close）。缺失唤醒
+    /// 时 forward task 永挂 → 上行管道不 EOF → 服务端桥/direct 链挂死
+    /// （bd s10/s12 残余泄漏根因）。
+    #[tokio::test]
+    async fn close_wakes_pending_read() {
+        let q = std::sync::Arc::new(UploadQueue::new(10));
+        let q2 = std::sync::Arc::clone(&q);
+        let task = tokio::spawn(async move {
+            let mut buf = [0u8; 8];
+            q2.read(&mut buf).await
+        });
+        // read 进入等待（无 packet 可读）
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        q.close().await;
+        let res = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
+        assert!(res.is_ok(), "close must wake a pending read");
+        let n = res.unwrap().unwrap().unwrap();
+        assert_eq!(n, 0, "read must return EOF after close");
+    }
+
     #[tokio::test]
     async fn read_zero_byte_payload_returns_one() {
         // Go Test_regression_readzero：seq=0 + payload "x"，buf=20B → n=1
