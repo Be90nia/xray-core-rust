@@ -33,7 +33,8 @@ COPY tests ./tests
 
 # 依赖预取 + 已补丁 boringssl 源码树（与 CI setup-boringssl 同源逻辑）
 RUN cargo fetch
-RUN bash crates/xray-stress/docker/setup_boringssl.sh
+# Windows 工作树 git autocrlf 会把 .sh 转成 CRLF，容器 bash 解析 \r 报 pipefail invalid——先脱 CR
+RUN sed -i 's/\r$//' crates/xray-stress/docker/setup_boringssl.sh && bash crates/xray-stress/docker/setup_boringssl.sh
 
 # harness 二进制（-p 只构建所需子树）
 RUN BORING_BSSL_ASSUME_PATCHED=1 BORING_BSSL_SOURCE_PATH=/tmp/boringssl-stress/boringssl \
