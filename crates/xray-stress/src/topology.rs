@@ -52,7 +52,21 @@ pub async fn start_echo() -> std::net::SocketAddr {
                         }
                     });
                 },
-                Err(_) => break,
+                // EMFILE/ECONNABORTED 等瞬时 accept 错误必须退避重试而非退出：
+                // 退出即 listener 永久死亡→该场景所有连接 refused 风暴（run 35587906510 实锤：
+                // 双平台风暴场景各 fail 12.6-15 万全源于此），且失败循环连带内存增长
+                Err(e) if e.kind() == tokio::io::ErrorKind::OutOfMemory
+                    || e.kind() == tokio::io::ErrorKind::ConnectionAborted
+                    || e.raw_os_error() == Some(24 /*EMFILE*/)
+                    || e.raw_os_error() == Some(23 /*EMFILE variant*/) =>
+                {
+                    tracing::warn!("echo accept transient error, backing off: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                },
+                Err(e) => {
+                    tracing::warn!("echo accept fatal, stopping echo: {e}");
+                    break;
+                },
             }
         }
     });
