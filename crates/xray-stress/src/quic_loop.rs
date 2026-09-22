@@ -59,18 +59,27 @@ pub async fn start_quic_echo_server() -> anyhow::Result<SocketAddr> {
         Arc::new(|stream: Arc<InterStreamConn>| {
             tokio::spawn(echo_one(stream));
         });
-    let listener = factory
-        .listen(
-            "127.0.0.1:0".parse().unwrap(),
-            Arc::new(ProtoConfig::default()),
-            Arc::new(xray_proto::xray::transport::internet::QuicParams::default()),
-            MasqType::NotFound,
-            validator,
-            on_new_conn,
-            None,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("quic listener: {e}"))?;
+    let mut quic_port = crate::topology::pick_free_port().await;
+    let listener = loop {
+        match factory
+            .listen(
+                format!("127.0.0.1:{quic_port}").parse().unwrap(),
+                Arc::new(ProtoConfig::default()),
+                Arc::new(xray_proto::xray::transport::internet::QuicParams::default()),
+                MasqType::NotFound,
+                validator.clone(),
+                on_new_conn.clone(),
+                None,
+            )
+            .await
+        {
+            Ok(l) => break l,
+            Err(_) => {
+                // 极小概率端口被抢：换一个非保留端口重试
+                quic_port = crate::topology::pick_free_port().await;
+            },
+        }
+    };
     Ok(listener.local_addr())
 }
 
