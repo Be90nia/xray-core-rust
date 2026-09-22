@@ -6,7 +6,9 @@ param(
     [ValidateSet("conservative", "standard", "aggressive")]
     [string]$Tier,
     [double]$DurationHours = 48,
-    [string]$OutDir = "stress-out"
+    [string]$OutDir = "stress-out",
+    # 场景集：默认 s1-s4（老基线）；all = 12 场景全协议
+    [string]$Scenarios = "s1,s2,s3,s4"
 )
 
 $ErrorActionPreference = "Stop"
@@ -51,7 +53,7 @@ Write-Host "[run] $exe --duration $durationSec --concurrency $concurrency --s2-c
     --concurrency $concurrency `
     --s2-conns $s2Conns `
     --s1-delay-ms $delayMs `
-    --scenarios "s1,s2,s3,s4" `
+    --scenarios "$Scenarios" `
     --sample-interval $interval `
     --out-dir $OutDir
 exit $LASTEXITCODE
