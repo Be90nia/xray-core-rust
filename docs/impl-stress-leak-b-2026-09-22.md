@@ -86,13 +86,24 @@ cargo test -p xray-proxy-anytls --tests   → dial_system_contract 1/1
 
 ### 5.2 docker 泄漏复现（Acceptance #4）
 
+镜像：xray-stress（commit 633778bb 源码态，exec 式构建后 docker commit——见 §7 构建注记）。
+
 ```
-docker run --rm xray-stress --duration 600 --scenarios s9 --sample-interval 15
+docker run --rm --cpus=8 --memory=32g -v ".../stress-out-b:/out" xray-stress \
+  --duration 600 --scenarios s9 --sample-interval 15 --out-dir /out
 ```
 
-（结果回填：修复前基线 fd +5222/min / RSS +91MB/min；修复后斜率见下方回执。）
+结果（metrics.csv，`__proc__` 行，41 个采样点）：
 
-[TO BE FILLED AFTER DOCKER RUN]
+| 指标 | 修复前基线 | 修复后实测 | 验收（<100 fd/min） |
+| --- | --- | --- | --- |
+| fd 斜率 | +5222/min | **≈0/min**（fd 全程 15–43 波动，首 71→尾 15，无趋势） | PASS |
+| RSS | +91MB/min | 稳态 ~23.7MB（warm-up 17.5→23.7 后平稳，peak 24.1） | — |
+| 请求 | — | 10min 25200 conn_ok / 1 fail（warm-up），吞吐 2720 B/s×~44req/s，p50 44.4ms 稳定 | — |
+
+结尾 harness 打印 `leak SUSPECT — slope 16.75 MB/h` 是其相对斜率启发式把
+warm-up（17.5→23.7MB，tokio 运行时热身稳态）计入所致；本票泄漏判定指标是
+fd，实测无泄漏形态。
 
 ## 6. 残余风险
 
@@ -100,4 +111,24 @@ docker run --rm xray-stress --duration 600 --scenarios s9 --sample-interval 15
 - dispatcher 半关闭场景（未读完响应即 drop AnytlsConn）pump task 被 abort，FIN 不发，
   该连接 fd 仍依赖对端超时——压测 echo 为完整读写不触发；完整修复需 AnytlsConn
   Drop 钩子，涉及外部 crate 会话语义，另行立项。
+- server kill 连接后，client 池中死 session 被复用判定丢弃时 writer task 打
+  `Failed to write frame to peer: Broken pipe` WARN（实测仅压测开头 0.5s 内出现，
+  稳态无；无功能影响，conn_fail=1 为 warm-up）。如需消除，可在 client 侧 pick 到
+  terminated session 时跳过 writer 写入，属外部 crate 内部，不动。
 - 48h 长跑（stress-win-12scn-48h，旧 exe）不含本修复，其 s9 数据仍是泄漏形态。
+
+## 7. 构建注记（docker 验证可复现性）
+
+本机 Docker Desktop 对 buildkit 长网络步骤（cargo fetch ~35min / git fetch boringssl）
+存在断流致 `docker build` 层失败即弃（两次尝试分别死于 setup_boringssl exit 128 与
+cargo fetch exit 101，累计 ~5.5h）。改为 exec 式构建后 docker commit：
+
+```
+docker run -dit --name stress-build rust:latest bash
+# exec: apt install（Dockerfile 同款包）→ protoc v36.1 → 源码注入（git archive
+# 633778bb | docker cp）→ cargo fetch → setup_boringssl.sh → cargo build --release -p xray-stress
+docker commit --change 'ENTRYPOINT [...]' --change 'ENV ...' stress-build xray-stress
+```
+
+实际编译 7m47s；镜像已含 s9/s10/s12 修复（commit 633778bb 源码态）。
+stress-build 容器验证后已清理；产物 CSV 留 stress-out-b/。

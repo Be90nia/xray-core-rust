@@ -45,6 +45,47 @@ use crate::error::{Result, SplitHttpError};
 ///
 /// 对应 Go `splitConn`。dispatcher 通过 reader 读客户端上传数据（来自 UploadQueue），
 /// 通过 writer 写下行数据（转发到 HTTP GET response body）。
+///
+/// `close_signal`：服务端 GET 断开（会话终结）时置位，ServerConn 的 poll_read
+/// 随即注入 EOF——对齐 Go hub.go:399 GET handler 退出时的 `conn.Close()`：
+/// 客户端断开后整个 splitConn 必须立即终结，而非滞留至 dispatcher 的
+/// ConnectionIdle（默认 300s）超时。
+#[derive(Clone)]
+pub struct ServerConnCloseSignal {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl ServerConnCloseSignal {
+    /// 创建配对的关闭信号（一个给 ServerConn，一个给守护方）。
+    #[must_use]
+    pub fn new() -> (Self, Self) {
+        let a = Self {
+            flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        };
+        let b = a.clone();
+        (a, b)
+    }
+
+    /// 触发关闭（幂等）：唤醒所有等待中的 poll_read。
+    pub fn close(&self) {
+        self.flag
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> bool {
+        if self.flag.load(std::sync::atomic::Ordering::Acquire) {
+            return true;
+        }
+        // 注册 waiter：close() 的 notify_waiters 会唤醒本 poll_read。
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().poll(cx).is_ready()
+    }
+}
+
 pub struct ServerConn {
     /// 上行数据 reader（UploadQueue → dispatcher）。
     pub reader: Box<dyn AsyncRead + Unpin + Send>,
@@ -54,6 +95,8 @@ pub struct ServerConn {
     pub remote_addr: SocketAddr,
     /// 本地地址。
     pub local_addr: SocketAddr,
+    /// 会话终结信号（server GET 断开 → 上行读注入 EOF）。
+    pub close_signal: ServerConnCloseSignal,
 }
 
 impl AsyncRead for ServerConn {
@@ -62,6 +105,9 @@ impl AsyncRead for ServerConn {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if self.close_signal.poll_closed(cx) {
+            return Poll::Ready(Ok(()));
+        }
         Pin::new(&mut *self.reader).poll_read(cx, buf)
     }
 }

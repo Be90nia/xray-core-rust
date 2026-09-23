@@ -124,7 +124,6 @@ impl SessionMap {
         if let Some(session) = session {
             session.upload_queue.close().await;
         }
-        tracing::debug!("LEAKPROBE session removed+queue closed sid={}", session_id);
     }
 }
 

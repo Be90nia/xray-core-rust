@@ -533,12 +533,24 @@ async fn serve_h3_conn(conn: quinn::Connection, ctx: Arc<HandlerContext>) {
     };
     while let Ok(Some(resolver)) = h3_conn.accept().await {
         let ctx = Arc::clone(&ctx);
+        let conn = conn.clone();
         let peer = conn.remote_address();
         tokio::spawn(async move {
             let Ok((req, stream)) = resolver.resolve_request().await else {
                 return;
             };
-            serve_h3_request(req, stream, peer, ctx).await;
+            let task = tokio::spawn(serve_h3_request(req, stream, peer, Arc::clone(&ctx)));
+            // 连接终结（客户端断开 / idle / error）必须强制终结该连接上的全部
+            // 请求——对齐 Go hub.go:394-398 `request.Context().Done()` 中断
+            // handler + `defer conn.Close()`：abort 触发 response body（含
+            // SessionDropGuard）drop，会话删除 + queue.close + ServerConn 上行
+            // EOF 级联，hub copy / forward / dispatcher 桥全链解体。否则
+            // response body 循环滞留至永久（实测 100%/conn 死锁，s12 泄漏根因）。
+            let closer = conn.clone();
+            tokio::spawn(async move {
+                let _ = closer.closed().await;
+                task.abort();
+            });
         });
     }
 }
