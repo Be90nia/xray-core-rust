@@ -32,6 +32,9 @@ jobs:
           - os: ubuntu-latest
             label: linux
             batch: b
+          - os: windows-latest
+            label: windows
+            batch: all
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -41,31 +44,34 @@ jobs:
         with:
           go-version: stable
       - name: Install protoc
-        shell: bash
+        shell: pwsh
         run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then
+          if ($env:RUNNER_OS -eq "Linux") {
             sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
-          else
+          } elseif ($env:RUNNER_OS -eq "macOS") {
             brew install protobuf
-          fi
+          } else {
+            Write-Host "Windows: xray-stress has no protobuf dep, skipping"
+          }
       - uses: ./.github/actions/setup-boringssl
       - name: Build harness
         run: cargo build --release -p xray-stress
       - name: Run stress (${{ matrix.label }}-${{ matrix.batch }})
-        shell: bash
+        shell: pwsh
         run: |
-          # 12 场景 all 并发需要大量 FD（每场景 2 xray 实例+echo+socks+千级连接），
-          # CI runner 默认 nofile（Linux 1024/macOS 更低）会 EMFILE 耗尽→echo 拒连
-          ulimit -n 65535 2>/dev/null || ulimit -n $(ulimit -Hn) 2>/dev/null || true
-          echo "nofile soft limit: $(ulimit -n)"
-          hours="${{ inputs.hours }}"
-          [ -z "$hours" ] && hours=5
-          if [ "${{ matrix.batch }}" = "a" ]; then batch="s1,s2,s3,s4,s5,s6"; else batch="s7,s8,s9,s10,s11,s12"; fi
-          ./target/release/xray-stress \
-            --duration $((hours * 3600)) \
-            --concurrency 8 --s2-conns 4 \
-            --scenarios "$batch" \
-            --sample-interval 30 \
+          # Windows runner ulimit 默认已高，跳过设置
+          $nofile = if ($IsLinux -or $IsMacOS) { & bash -c 'ulimit -n' } else { (Get-Process -Id $PID).Handle }
+          Write-Host "nofile (best-effort): $nofile"
+          $hours = if ($env:HOURS_OVERRIDE) { [int]$env:HOURS_OVERRIDE } else { if ("${{ inputs.hours }}") { [int]"${{ inputs.hours }}" } else { 5 } }
+          if ("${{ matrix.batch }}" -eq "a") { $batch = "s1,s2,s3,s4,s5,s6" }
+          elseif ("${{ matrix.batch }}" -eq "b") { $batch = "s7,s8,s9,s10,s11,s12" }
+          else { $batch = "s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12" }
+          Write-Host "batch: $batch, hours: $hours"
+          ./target/release/xray-stress `
+            --duration ($hours * 3600) `
+            --concurrency 8 --s2-conns 4 `
+            --scenarios $batch `
+            --sample-interval 30 `
             --out-dir stress-out
       - name: Upload results
         uses: actions/upload-artifact@v4
