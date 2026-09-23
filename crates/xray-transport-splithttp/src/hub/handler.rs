@@ -31,7 +31,7 @@ use crate::upload_queue::Packet;
 use crate::xpadding::{generate_padding, is_padding_valid, PADDING_METHOD_REPEAT_X};
 
 use super::meta::extract_meta;
-use super::{HubConnHandler, ServerConn, SessionMap};
+use super::{HubConnHandler, ServerConn, ServerConnCloseSignal, SessionMap};
 
 /// 处理器上下文（每个 listener 实例一份，Arc 共享给所有连接）。
 pub struct HandlerContext {
@@ -397,9 +397,14 @@ where
     // 下行 body = ReaderStream(dl_rx) → StreamBody。
     // guard 随响应 body 存活：GET 响应终结（流结束或 hyper drop body）即触发
     // 会话删除——对齐 Go hub.go:352-353 `defer h.sessions.Delete(sessionId)`。
+    // 同时触发 ServerConn 的 close signal：注入上行读 EOF，dispatcher 桥立即
+    // 解体（对齐 Go hub.go:399 conn.Close()——conn 关闭即整个 splitConn 终结，
+    // 上行 queue 消费链随之退出，不滞留至 ConnectionIdle 超时）。
+    let (close_signal, conn_close_signal) = ServerConnCloseSignal::new();
     let guard = has_session.then(|| SessionDropGuard {
         sessions: Arc::clone(&ctx.sessions),
         sid: session_id.to_string(),
+        close_signal: Some(close_signal),
     });
     let dl_stream = ReaderStream::new(GuardedReader { inner: dl_rx, _guard: guard });
     let body = StreamBody::new(dl_stream.map_ok(Frame::data)).boxed();
@@ -410,6 +415,7 @@ where
         writer: Box::new(dl_tx),
         remote_addr: peer_addr,
         local_addr: ctx.local_addr,
+        close_signal: conn_close_signal,
     };
     ctx.conn_handler.add_conn(conn);
 
@@ -434,20 +440,13 @@ async fn forward_queue_to_writer(queue: Arc<crate::UploadQueue>, mut writer: tok
     let mut buf = vec![0u8; 8192];
     loop {
         match queue.read(&mut buf).await {
-            Ok(0) => {
-                tracing::debug!("LEAKPROBE forward eof");
-                break;
-            }
+            Ok(0) => break,
             Ok(n) => {
                 if writer.write_all(&buf[..n]).await.is_err() {
-                    tracing::debug!("LEAKPROBE forward write-fail");
                     break;
                 }
             }
-            Err(_) => {
-                tracing::debug!("LEAKPROBE forward read-err");
-                break;
-            }
+            Err(_) => break,
         }
     }
     let _ = writer.shutdown().await;
@@ -460,11 +459,15 @@ async fn forward_queue_to_writer(queue: Arc<crate::UploadQueue>, mut writer: tok
 struct SessionDropGuard {
     sessions: Arc<SessionMap>,
     sid: String,
+    /// GET 断开时的连接终结信号（ServerConn 上行读注入 EOF）。
+    close_signal: Option<ServerConnCloseSignal>,
 }
 
 impl Drop for SessionDropGuard {
     fn drop(&mut self) {
-        tracing::debug!("LEAKPROBE session guard drop sid={}", self.sid);
+        if let Some(sig) = self.close_signal.take() {
+            sig.close();
+        }
         let sessions = Arc::clone(&self.sessions);
         let sid = std::mem::take(&mut self.sid);
         tokio::spawn(async move {

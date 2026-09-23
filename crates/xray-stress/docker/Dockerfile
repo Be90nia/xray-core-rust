@@ -34,9 +34,14 @@ COPY benches ./benches
 COPY tests ./tests
 
 # 依赖预取 + 已补丁 boringssl 源码树（与 CI setup-boringssl 同源逻辑）
+# 国内网络适配：rsproxy sparse index（Docker Hub/crates.io 直连超时时启用）
+RUN mkdir -p /usr/local/cargo \
+    && printf '[source.crates-io]\nreplace-with = "rsproxy-sparse"\n[source.rsproxy-sparse]\nregistry = "sparse+https://rsproxy.cn/index/"\n[net]\ngit-fetch-with-cli = true\n' > /usr/local/cargo/config.toml
 RUN cargo fetch
-# Windows 工作树 git autocrlf 会把 .sh 转成 CRLF，容器 bash 解析 \r 报 pipefail invalid——先脱 CR
-RUN sed -i 's/\r$//' crates/xray-stress/docker/setup_boringssl.sh && bash crates/xray-stress/docker/setup_boringssl.sh
+# 已补丁 boringssl 源码树：直接注入宿主机 boringssl-fv（boringssl pin + 4 patch +
+# REALITY + post-handshake 注入均已应用），绕过容器内 github clone（国内网络超时）。
+# 刷新方式：.docker-boringssl/ 由宿主机 BORING_BSSL_SOURCE_PATH 同步（gitignored）。
+COPY .docker-boringssl /tmp/boringssl-stress/boringssl
 
 # harness 二进制（-p 只构建所需子树）
 RUN BORING_BSSL_ASSUME_PATCHED=1 BORING_BSSL_SOURCE_PATH=/tmp/boringssl-stress/boringssl \

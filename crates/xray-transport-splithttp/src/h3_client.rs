@@ -139,6 +139,21 @@ pub struct H3Conn {
     closed: AtomicBool,
 }
 
+impl Drop for H3Conn {
+    fn drop(&mut self) {
+        // 最后一个 Arc<H3Conn> 引用 drop = 没有任何流/泵/调用方再使用此连接。
+        // 此时必须显式发 CONNECTION_CLOSE：客户端 quinn Endpoint 的句柄在
+        // connect_with_quic_params 返回前已 drop，Endpoint drop 不会终结连接，
+        // 服务端只能干等 connIdle 300s——loopback 高速率下 300s 窗口内任务与
+        // 缓冲堆积成 RSS 主泄漏（对齐 Go AfterFunc{conn.Context}→tr.Close()）。
+        if !self.closed.load(Ordering::Relaxed) {
+            self.closed.store(true, Ordering::Relaxed);
+            self.quinn_conn
+                .close(quinn::VarInt::from_u32(0), b"client conn dropped");
+        }
+    }
+}
+
 impl H3Conn {
     /// 建立 H3 连接。
     ///

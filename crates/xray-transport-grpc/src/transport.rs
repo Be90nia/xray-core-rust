@@ -139,7 +139,11 @@ where T: AsyncRead + AsyncWrite + Send + Unpin + 'static {
         cfg.idle_timeout,
         cfg.health_check_timeout,
     );
-    tokio::spawn(async move {
+    // 连接驱动/保活泵 task：句柄存入返回的 DuplexConn（conn-kill guard），
+    // 调用方 drop 连接时 abort 本 task → h2_conn 驱动 future drop → h2 连接
+    // 关闭 → TCP fd 释放。否则恒保活/驱动挂起使每条 roundtrip 连接的 fd
+    // 永久滞留（对齐 Go grpc.ClientConn 随调用结束 GC 的连接生命周期）。
+    let conn_driver_task = tokio::spawn(async move {
         if ka_idle <= 0 {
             let _ = h2_conn.await;
             return;
@@ -272,7 +276,7 @@ where T: AsyncRead + AsyncWrite + Send + Unpin + 'static {
     });
     // 9d7a 后置（4tap 落地）：down/up 闭包错误经 cancel_tx 送达 DuplexConn
     // 持有的 cancel_rx，poll_read 优先返回错误——不再降级为干净 EOF。
-    Ok(Box::new(DuplexConn { inner: client, cancel_rx: Some(cancel_rx), remote: None }))
+    Ok(Box::new(DuplexConn { inner: client, cancel_rx: Some(cancel_rx), remote: None, _conn_kill: Some(conn_driver_task) }))
 }
 pub async fn listen(addr: SocketAddr, settings: &StreamSettings, handler: ConnHandler, trusted: Vec<String>) -> io::Result<Box<dyn TransportListener>> {
     let cfg = parse_config(settings)?;
@@ -496,10 +500,21 @@ struct DuplexConn {
     cancel_rx: Option<tokio::sync::oneshot::Receiver<io::Error>>,
     /// H13：trust-gated 源地址（XFF 采纳或真实 peer；None = 未知）。
     remote: Option<SocketAddr>,
+    /// conn-kill guard：持有 dial_h2 的连接驱动/保活泵 task，drop 时 abort——
+    /// h2_conn 驱动 future 随之 drop，h2 连接关闭、TCP fd 释放。server 侧
+    /// 构造（with_remote）为 None 不受影响。
+    _conn_kill: Option<tokio::task::JoinHandle<()>>,
+}
+impl Drop for DuplexConn {
+    fn drop(&mut self) {
+        if let Some(task) = self._conn_kill.take() {
+            task.abort();
+        }
+    }
 }
 impl DuplexConn {
     fn with_remote(inner: tokio::io::DuplexStream, remote: SocketAddr) -> Self {
-        Self { inner, cancel_rx: None, remote: Some(remote) }
+        Self { inner, cancel_rx: None, remote: Some(remote), _conn_kill: None }
     }
 }
 impl AsyncRead for DuplexConn{

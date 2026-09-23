@@ -1840,11 +1840,9 @@ impl DispatchHandler for DialBridge {
                         }
                     }
                     let _ = &inbound; // 非 Linux：元数据仅参与判定日志
-                    tracing::debug!(tag = %tag, "LEAKPROBE bridge starting");
                     if let Err(e) = bridge_link_with_stream_full(link, remote, &policy).await {
                         tracing::warn!(tag = %tag, "bridge ended: {e}");
                     }
-                    tracing::debug!(tag = %tag, "LEAKPROBE bridge finished");
                 }
                 Err(e) => {
                     tracing::error!(tag = %tag, "dial failed: {e}");
