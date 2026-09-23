@@ -54,12 +54,21 @@ jobs:
             Write-Host "Windows: xray-stress has no protobuf dep, skipping"
           }
       - uses: ./.github/actions/setup-boringssl
+      - name: Raise FD limit (Linux/macOS)
+        shell: bash
+        run: |
+          # macos-14 runner 默认 ulimit -n 256,Linux 默认 1024,都不够 6 场景 × 200 conn/s × 5h。
+          # hard limit 通常 >= 524288(GHA runner),把 soft 提到 hard 即可。
+          target=524288
+          cur=$(ulimit -n)
+          ulimit -Sn "$target" 2>/dev/null || ulimit -n "$target" 2>/dev/null || true
+          echo "nofile: ${cur} → $(ulimit -n) (target ${target})"
       - name: Build harness
         run: cargo build --release -p xray-stress
       - name: Run stress (${{ matrix.label }}-${{ matrix.batch }})
         shell: pwsh
         run: |
-          # Windows runner ulimit 默认已高，跳过设置
+          # ulimit 已在 Raise FD limit step 提到 524288(Linux/macOS),Windows 不限
           $nofile = if ($IsLinux -or $IsMacOS) { & bash -c 'ulimit -n' } else { (Get-Process -Id $PID).Handle }
           Write-Host "nofile (best-effort): $nofile"
           $hours = if ($env:HOURS_OVERRIDE) { [int]$env:HOURS_OVERRIDE } else { if ("${{ inputs.hours }}") { [int]"${{ inputs.hours }}" } else { 5 } }

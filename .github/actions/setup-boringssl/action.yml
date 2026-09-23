@@ -22,7 +22,18 @@ runs:
         # boringssl pin 从 btls 仓 tree 的 submodule gitlink 动态取
         # （btls rev 变更自动跟随；首版误用 btls rev fetch 即 CI "not our ref" 根因）
         bssl_rev=$(git -C "$btls_co" ls-tree HEAD btls-sys/deps/boringssl | awk '{print $3}')
-        bssl="$RUNNER_TEMP/boringssl"
+        # 绕开 RUNNER_TEMP(D:\a\_temp 在 Windows Python pathlib 中触发 Errno 22——'D:\a' 中的 '\a' 是 BEL 字符 0x07,
+        # pathlib.open() 拒绝路径含控制字符)。改用 $TEMP 的子目录(不含 \a)。
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          bssl_parent="$(cygpath -u "$TEMP")/xray-boringssl-build"
+        else
+          bssl_parent="${RUNNER_TEMP}/xray-boringssl-build"
+        fi
+        mkdir -p "$bssl_parent"
+        bssl="$bssl_parent/boringssl"
+        rm -rf "$bssl"
+        # 暴露 BORING_BSSL_SOURCE_PATH 给同 step 内的 Python 调用（避免内嵌单引号吞掉 $bssl 的 bash 字符串解析坑）
+        export BORING_BSSL_SOURCE_PATH="$bssl"
         git init -q "$bssl"
         git -C "$bssl" remote add origin https://github.com/google/boringssl.git
         git -C "$bssl" fetch -q --depth 1 origin "$bssl_rev"
@@ -34,11 +45,11 @@ runs:
         # REALITY 补丁集（btls-sys 0.5.6 不含 SSL_set_reality_rewrite_cb /
         # SSL_get_x25519_key_share_private，xray-tls btls_reality.rs FFI 需要；
         # 复用 tools/setup_boringssl_reality.py 的锚点式补丁逻辑）
-        python3 -c "import sys, pathlib; sys.path.insert(0, 'tools'); from setup_boringssl_reality import apply_reality_patches; apply_reality_patches(pathlib.Path('$RUNNER_TEMP/boringssl'))"
+        python3 -c "import sys, pathlib, os; sys.path.insert(0, 'tools'); from setup_boringssl_reality import apply_reality_patches; apply_reality_patches(pathlib.Path(os.environ['BORING_BSSL_SOURCE_PATH']))"
         # bd mygg：REALITY 后握手记录模仿原语（SSL_send_post_handshake_record，
         # xray-reality FFI 需要；幂等注入 ssl_post_handshake.cc + ssl.h 声明 +
         # gen/sources.cmake，见 tools/inject_btls_post_handshake.py）
-        python3 tools/inject_btls_post_handshake.py "$RUNNER_TEMP/boringssl"
+        python3 tools/inject_btls_post_handshake.py "$BORING_BSSL_SOURCE_PATH"
         echo "BORING_BSSL_ASSUME_PATCHED=1" >> "$GITHUB_ENV"
         echo "BORING_BSSL_SOURCE_PATH=$bssl" >> "$GITHUB_ENV"
         # rust-cache 命中旧 btls-sys cmake build（无新符号）→ 强制清掉已构建产物让 cargo 重建。
