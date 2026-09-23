@@ -23,9 +23,11 @@ runs:
         # （btls rev 变更自动跟随；首版误用 btls rev fetch 即 CI "not our ref" 根因）
         bssl_rev=$(git -C "$btls_co" ls-tree HEAD btls-sys/deps/boringssl | awk '{print $3}')
         # 绕开 RUNNER_TEMP(D:\a\_temp 在 Windows Python pathlib 中触发 Errno 22——'D:\a' 中的 '\a' 是 BEL 字符 0x07,
-        # pathlib.open() 拒绝路径含控制字符)。改用 $TEMP 的子目录(不含 \a)。
+        # pathlib.open() 拒绝路径含控制字符)。改用 $TEMP 的子目录。
+        # 注意:不能用 cygpath -u(产出 /tmp/... unix 风格,Windows cmake 进程解析不了);
+        # 直接用 Windows 风格正斜杠路径,git-bash 和 Windows 原生工具链都认。
         if [ "$RUNNER_OS" = "Windows" ]; then
-          bssl_parent="$(cygpath -u "$TEMP")/xray-boringssl-build"
+          bssl_parent="${TEMP//\\//}/xray-boringssl-build"
         else
           bssl_parent="${RUNNER_TEMP}/xray-boringssl-build"
         fi
