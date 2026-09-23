@@ -51,7 +51,13 @@ jobs:
           } elseif ($env:RUNNER_OS -eq "macOS") {
             brew install protobuf
           } else {
-            Write-Host "Windows: xray-stress has no protobuf dep, skipping"
+            # Windows: xray-stress 本身无 protoc 依赖,但其依赖图含 xray-proto(prost-build)需要 protoc。
+            # windows-latest runner 预装 choco,直接装 protobuf。
+            choco install -y protoc 2>&1 | Out-Null
+            # choco 把 protoc 装到 C:\ProgramData\chocolatey\bin\protoc.exe,加到 PATH
+            $env:PATH = "C:\ProgramData\chocolatey\bin;$env:PATH"
+            echo "C:\ProgramData\chocolatey\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+            Write-Host "protoc: $(protoc --version)"
           }
       - uses: ./.github/actions/setup-boringssl
       - name: Raise FD limit (Linux/macOS)
