@@ -53,7 +53,15 @@ runs:
         # gen/sources.cmake，见 tools/inject_btls_post_handshake.py）
         python3 tools/inject_btls_post_handshake.py "$BORING_BSSL_SOURCE_PATH"
         echo "BORING_BSSL_ASSUME_PATCHED=1" >> "$GITHUB_ENV"
-        echo "BORING_BSSL_SOURCE_PATH=$bssl" >> "$GITHUB_ENV"
+        # GITHUB_ENV 给后续非 MSYS step(cargo build→Windows cmake)消费:必须写 Windows 混合风格路径。
+        # Git Bash 内 $TEMP=/tmp(MSYS 映射),字面写会变 /tmp/...,Windows cmake 解析成 C:/tmp/... 不存在。
+        # cygpath -m 把真实物理路径转成 C:/Users/... 形式(正斜杠,无 \a BEL 问题)。
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          bssl_for_env="$(cygpath -m "$bssl")"
+        else
+          bssl_for_env="$bssl"
+        fi
+        echo "BORING_BSSL_SOURCE_PATH=$bssl_for_env" >> "$GITHUB_ENV"
         # rust-cache 命中旧 btls-sys cmake build（无新符号）→ 强制清掉已构建产物让 cargo 重建。
         # 必须同时清 .fingerprint/btls-sys-*：btls-sys build/main.rs emit_rerun_if_changed
         # 只 emit `cargo:rerun-if-changed=patches`，不跟踪 BORING_BSSL_SOURCE_PATH 下 include/openssl/ssl.h
