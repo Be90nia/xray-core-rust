@@ -69,6 +69,18 @@ jobs:
           cur=$(ulimit -n)
           ulimit -Sn "$target" 2>/dev/null || ulimit -n "$target" 2>/dev/null || true
           echo "nofile: ${cur} → $(ulimit -n) (target ${target})"
+      - name: Expand ephemeral port range (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Windows 默认动态端口 49152-65535(16384 个)+TIME_WAIT 120s:
+          # 压测 280 conn/s × 120s ≈ 33k 在途 > 16k 上限 → WSAEADDRINUSE(10048)风暴
+          # (run 35852965001 实测 15.2 万次)。runner 有 admin 权限,直接改。
+          netsh int ipv4 set dynamicport tcp start=1025 num=64510
+          netsh int ipv4 set dynamicport udp start=1025 num=64510
+          # TIME_WAIT 120s → 30s(注册表,重启栈后生效;min=30)
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -Name TcpTimedWaitDelay -Value 30 -Type DWord
+          Write-Host "dynamic port: 1025-65534, TIME_WAIT=30s"
       - name: Build harness
         run: cargo build --release -p xray-stress
       - name: Run stress (${{ matrix.label }}-${{ matrix.batch }})
