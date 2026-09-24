@@ -850,11 +850,33 @@ fn build_protocol_handler(
         }
         "tuic" => {
             let s = parse_tuic_config(&ob.entry.data)?;
+            // streamSettings.tlsSettings.pinnedPeerCertSha256 → 证书钉扎验证器
+            // （tuic 自持 QUIC TLS，不经 transport 层 xray-tls 客户端装配，需在
+            // 此接线；interop #36：自签服务端以 pin 验证替代 webpki 链验证）。
+            let pinned_verifier = if s.insecure {
+                None
+            } else {
+                let tls_json = ob
+                    .stream_settings_json
+                    .as_ref()
+                    .and_then(|ss| ss.get("tlsSettings"));
+                let has_pins = tls_json
+                    .and_then(|j| j.get("pinnedPeerCertSha256"))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|v| !v.is_empty());
+                if has_pins {
+                    xray_tls::client_config::build_server_cert_verifier(tls_json)
+                        .map_err(|e| format!("tuic pinned verifier: {e}"))?
+                } else {
+                    None
+                }
+            };
             let rustls_config = build_tuic_rustls_config(
                 &s.alpn,
                 s.reduce_rtt,
                 s.insecure,
                 s.certificate.as_deref(),
+                pinned_verifier,
             )?;
             let options = xray_proxy_tuic::TuicConnectOptions {
                 congestion_control: s.congestion_control,
@@ -2703,17 +2725,25 @@ fn parse_tuic_config(data: &[u8]) -> std::result::Result<TuicOutboundSettings, S
 ///
 /// 默认启用服务端证书验证（webpki 根 + 可选 `certificate` 附加 CA），
 /// 对齐 Go `tls.Config{InsecureSkipVerify}` 语义——仅 `insecure=true` 显式跳过。
+/// `pinned_verifier`（来自 streamSettings.tlsSettings.pinnedPeerCertSha256）
+/// 优先于 `certificate` CA：pin 命中即信任，替代整链验证。
 fn build_tuic_rustls_config(
     alpn: &[Vec<u8>],
     reduce_rtt: bool,
     insecure: bool,
     certificate: Option<&str>,
+    pinned_verifier: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>,
 ) -> std::result::Result<Arc<rustls::ClientConfig>, String> {
     xray_common::ensure_default_crypto_provider();
     let mut config = if insecure {
         rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth()
+    } else if let Some(verifier) = pinned_verifier {
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
             .with_no_client_auth()
     } else {
         let mut roots = rustls::RootCertStore {
@@ -4359,15 +4389,15 @@ mod tests {
 
     #[test]
     fn build_tuic_rustls_config_alpn_default_and_custom() {
-        let c = build_tuic_rustls_config(&[], false, false, None).unwrap();
+        let c = build_tuic_rustls_config(&[], false, false, None, None).unwrap();
         assert_eq!(c.alpn_protocols, vec![b"h3".to_vec(), b"tuic".to_vec()]);
-        let c = build_tuic_rustls_config(&[b"h3".to_vec()], false, false, None).unwrap();
+        let c = build_tuic_rustls_config(&[b"h3".to_vec()], false, false, None, None).unwrap();
         assert_eq!(c.alpn_protocols, vec![b"h3".to_vec()]);
     }
 
     #[test]
     fn build_tuic_rustls_config_bad_certificate_rejected() {
-        assert!(build_tuic_rustls_config(&[], false, false, Some("not a pem")).is_err());
+        assert!(build_tuic_rustls_config(&[], false, false, Some("not a pem"), None).is_err());
     }
 
     /// DER → PEM（e2e 测试用）。
@@ -4404,7 +4434,7 @@ mod tests {
     async fn tuic_default_tls_rejects_self_signed() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (addr, _cert) = start_tuic_mock().await;
-        let cfg = build_tuic_rustls_config(&[], false, false, None).unwrap();
+        let cfg = build_tuic_rustls_config(&[], false, false, None, None).unwrap();
         let uuid = uuid::Uuid::parse_str(TUIC_TEST_UUID).unwrap();
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(45),
@@ -4428,7 +4458,7 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (addr, cert_der) = start_tuic_mock().await;
         let pem = der_to_pem(&cert_der);
-        let cfg = build_tuic_rustls_config(&[], false, false, Some(&pem)).unwrap();
+        let cfg = build_tuic_rustls_config(&[], false, false, Some(&pem), None).unwrap();
         let uuid = uuid::Uuid::parse_str(TUIC_TEST_UUID).unwrap();
         let client = tokio::time::timeout(
             std::time::Duration::from_secs(15),
@@ -4447,12 +4477,43 @@ mod tests {
         client.close(0u32.into(), b"");
     }
 
+    /// e2e（interop #36）：streamSettings.tlsSettings.pinnedPeerCertSha256 →
+    /// 自签证书按 pin 验证放行（此前 tuic 出站不消费该字段，自签证书走
+    /// webpki 链验证恒 UnknownIssuer 拒）。
+    #[tokio::test]
+    async fn tuic_stream_settings_pinned_hash_accepts_self_signed() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (addr, cert_der) = start_tuic_mock().await;
+        let pin = xray_tls::pin::generate_cert_hash_hex(&cert_der);
+        let tls_json = serde_json::json!({ "pinnedPeerCertSha256": pin });
+        let verifier = xray_tls::client_config::build_server_cert_verifier(Some(&tls_json))
+            .expect("verifier build")
+            .expect("pin config yields a verifier");
+        let cfg = build_tuic_rustls_config(&[], false, false, None, Some(verifier)).unwrap();
+        let uuid = uuid::Uuid::parse_str(TUIC_TEST_UUID).unwrap();
+        let client = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            xray_proxy_tuic::TuicClient::connect(
+                addr,
+                "localhost",
+                uuid,
+                "pw",
+                cfg,
+                xray_proxy_tuic::QuinnConnectionPool::new(),
+            ),
+        )
+        .await
+        .expect("connect timed out")
+        .expect("pinned-hash connect failed");
+        client.close(0u32.into(), b"");
+    }
+
     /// e2e：insecure=true 显式跳过验证 → 自签证书放行。
     #[tokio::test]
     async fn tuic_insecure_tls_accepts_self_signed() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (addr, _cert) = start_tuic_mock().await;
-        let cfg = build_tuic_rustls_config(&[], false, true, None).unwrap();
+        let cfg = build_tuic_rustls_config(&[], false, true, None, None).unwrap();
         let uuid = uuid::Uuid::parse_str(TUIC_TEST_UUID).unwrap();
         let client = tokio::time::timeout(
             std::time::Duration::from_secs(15),

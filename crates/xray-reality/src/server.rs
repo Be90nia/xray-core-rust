@@ -93,9 +93,9 @@ pub struct ParsedClientHello<'a> {
     pub session_id: [u8; 32],
     /// key_share extension 中的 X25519 公钥（32 字节）；无则 `None`。
     pub key_share_x25519: Option<[u8; 32]>,
-    /// sb6g：key_share 中存在合格 X25519MLKEM768 entry（Go `peerPub2 != nil`：
-    /// 位于可选 X25519 之前且不重复）。`false` = outdated/strange ClientHello，
-    /// Go tls.go:233-235 reject→forward。
+    /// key_share 中存在合格 X25519MLKEM768 entry（Go `peerPub2 != nil`，
+    /// tls.go:222-231）。信息性字段：命中与否不改变验证结果——auth_key 一律
+    /// 走 X25519 ECDH（key_share_x25519 已含 hybrid 末段兜底，t2js）。
     pub key_share_mlkem768: bool,
     /// server_name extension 中的 SNI；无则 `None`（用于 server_names 白名单匹配）。
     pub server_name: Option<String>,
@@ -266,25 +266,26 @@ fn parse_sni(edata: &[u8]) -> Option<String> {
     None
 }
 
-/// 解析 key_share extension (0x0033)，返回 X25519 (group 0x001d) 的 32 字节公钥。
+/// 解析 key_share extension (0x0033)，返回 `(选中的 client X25519 公钥, 是否
+/// 存在合格 MLKEM768 entry)`。
 ///
 /// tvky (REALITY 10.0)：同时支持 X25519MLKEM768 hybrid key share
 /// (group=0x11EC，data = mlkem ek(1184) + x25519 pub(32)，共 1216 字节)。
 /// Go `MlkemEcdhe.ECDH(serverPub)` 仅返回 X25519 段（`ecdh.PrivateKey.ECDH`
 /// 是纯 X25519），hybrid MLKEM 段在 auth_key 派生中不参与；REALITY 10.0
 /// PQC 安全性来自 TLS session key 的 hybrid 派生，而非 auth_key 本身。
-/// 对应 Go utls `handshake_client.go:181-183`
-/// `{group: X25519MLKEM768, data: append(mlkemEncapsulationKey, x25519EphemeralKey...)}`。
 ///
-/// sb6g：选择逻辑精确对齐 Go xtls/reality tls.go:233-244——返回
-/// `(选中的 client X25519 公钥, 是否存在合格 MLKEM768 entry)`：
+/// 选择逻辑逐条对齐 Go xtls/reality tls.go:214-231（t2js 修正：此前 sb6g 误
+/// 加「MLKEM 必在 / 顺序颠倒 / 重复 entry 即拒」门禁——Go 源码没有这些拒绝
+/// 分支，Go std crypto/tls 与多数 uTLS 指纹只发独立 X25519，误拒即拒真客户端）：
+/// - 独立 X25519（group 0x001D, 32B）**首选**：任一位置首遇即选中（Go 第一轮
+///   循环 `break`），其余 entry 继续扫 MLKEM；
 /// - X25519MLKEM768（group **0x11EC** = 十进制 4588；历史实现误写 0x4588
-///   ——把十进制当十六进制，导致真实 hybrid entry 永不匹配）必须存在，
-///   且位于可选独立 X25519 entry 之前、不重复；
-/// - 独立 X25519（group 0x001D, 32B）首遇即停（Go `break // ensure order`），
-///   其后 entry 不再消费；
-/// - 无合格 MLKEM entry → `mlkem768_ok = false`，Go `peerPub2 == nil → break`
-///   reject outdated/strange ClientHello → forward fallback。
+///   ——把十进制当十六进制）取 data 末段 32B **兜底**（Go `peerPub == nil`
+///   才进第二轮），首遇即停；
+/// - 顺序颠倒 / 重复 entry 均无害（两轮各自 first-match-wins）；
+/// - 两类都缺 → `(None, false)`，Go `peerPub != nil` 不成立 → 不做 REALITY
+///   验证，连接 forward fallback。
 fn parse_key_shares(edata: &[u8]) -> (Option<[u8; 32]>, bool) {
     if edata.len() < 2 {
         return (None, false);
@@ -294,35 +295,33 @@ fn parse_key_shares(edata: &[u8]) -> (Option<[u8; 32]>, bool) {
         return (None, false);
     }
     let mut d = &edata[2..2 + list_len];
-    let mut mlkem_pub: Option<[u8; 32]> = None;
+    let mut x25519: Option<[u8; 32]> = None;
+    let mut mlkem: Option<[u8; 32]> = None;
     while d.len() >= 4 {
         let group = u16::from_be_bytes([d[0], d[1]]);
         let key_len = u16::from_be_bytes([d[2], d[3]]) as usize;
         if d.len() < 4 + key_len {
+            // 畸形 entry：标准 TLS 解析层早该拒掉的 CH，这里硬拒对齐 Go
+            // （Go 的 keyShares 由 crypto/tls 解析，到不了带畸形项这一步）
             return (None, false);
         }
-        // X25519MLKEM768 hybrid (group 0x11EC): 1184B MLKEM ek + 32B X25519 pub，
-        // X25519 部分在末尾。Go 端 `MlkemEcdhe.ECDH(serverPub)` 只消费 X25519 段。
-        if group == 0x11ec && key_len == 1216 {
-            if mlkem_pub.is_some() {
-                // Go: 重复 MLKEM entry → `peerPub2 = nil // ensure once` → reject
-                return (None, false);
+        if group == 0x001d && key_len == 32 {
+            if x25519.is_none() {
+                let mut k = [0u8; 32];
+                k.copy_from_slice(&d[4..4 + 32]);
+                x25519 = Some(k);
             }
-            let x_start = 4 + 1184; // skip mlkem ek
+        } else if group == 0x11ec && key_len == 1216 && mlkem.is_none() {
+            // X25519MLKEM768 hybrid：1184B MLKEM ek + 32B X25519 pub（末段）。
+            // Go 端 `MlkemEcdhe.ECDH(serverPub)` 只消费 X25519 段。
             let mut k = [0u8; 32];
-            k.copy_from_slice(&d[x_start..x_start + 32]);
-            mlkem_pub = Some(k);
-        } else if group == 0x001d && key_len == 32 {
-            // X25519 (group 0x001D): 32 字节公钥，Go peerPub 优先；
-            // 首遇即 break——其后（顺序颠倒的 MLKEM）不消费 = reject。
-            let mut k = [0u8; 32];
-            k.copy_from_slice(&d[4..4 + 32]);
-            return (Some(k), mlkem_pub.is_some());
+            k.copy_from_slice(&d[4 + 1184..4 + 1184 + 32]);
+            mlkem = Some(k);
         }
         d = &d[4 + key_len..];
     }
-    // MLKEM-only：Go `if peerPub == nil { peerPub = peerPub2 }`（次选）
-    (mlkem_pub, mlkem_pub.is_some())
+    // Go：peerPub（独立 X25519）首选，nil 时取 peerPub2（hybrid 末段）
+    (x25519.or(mlkem), mlkem.is_some())
 }
 
 /// `session_id` 在 handshake_message 中的字节偏移。
@@ -364,15 +363,9 @@ pub fn verify_reality_client_hello(
     min_client_ver: &[u8],
     max_client_ver: &[u8],
 ) -> Result<(crate::crypto::SessionPayload, [u8; 32]), RealityError> {
-    // sb6g：Go tls.go:233-235 `peerPub2 == nil → break`——缺合格
-    // X25519MLKEM768 key share 的 outdated ClientHello（纯 X25519 单 share、
-    // MLKEM 顺序颠倒、重复 MLKEM entry）一律 reject → 调用方 forward
-    // fallback，不做 REALITY 验证。
-    if !parsed.key_share_mlkem768 {
-        return Err(RealityError::NoKeyShareX25519);
-    }
-
-    // 1. 提取 client X25519 公钥（来自 key_share extension）
+    // 1. 提取 client X25519 公钥：独立 X25519 entry 首选，缺席时取
+    //    X25519MLKEM768 hybrid 末段（Go tls.go:214-231 两轮首遇扫描；t2js：
+    //    Go 客户端可能只发其一，两类都缺才 NoKeyShareX25519 → forward fallback）
     let client_pub = parsed
         .key_share_x25519
         .ok_or(RealityError::NoKeyShareX25519)?;
@@ -1381,7 +1374,7 @@ mod tests {
         assert!(matches!(err, RealityError::NoKeyShareX25519));
     }
 
-    // ===== sb6g：服务端 MLKEM768 key share 门禁（Go tls.go:233-235 reject→forward）=====
+    // ===== t2js：key_share 选择语义（Go tls.go:214-231 两轮首遇扫描）=====
 
     /// 构造任意 key_share entries 的 ClientHello record（sb6g 测试专用）。
     /// entries 按 wire 顺序编码进单一 key_share extension。
@@ -1441,10 +1434,11 @@ mod tests {
         record
     }
 
-    /// 票面核心：纯 X25519 单 share（无 MLKEM768）→ Go `peerPub2 == nil` reject，
-    /// verify 返回 NoKeyShareX25519 → server_tls 转 Invalid 走 forward fallback。
+    /// t2js：纯 X25519 单 share（无 MLKEM768）——Go std crypto/tls 客户端
+    /// 形态。过 keyshare 门进 REALITY auth；错误服务端密钥下 auth_key 错 →
+    /// AEAD 解密失败（不再于 keyshare 门误拒）。
     #[test]
-    fn verify_reality_client_hello_pure_x25519_only_rejected() {
+    fn verify_reality_client_hello_pure_x25519_passes_keyshare_gate() {
         let random = [0x55u8; 32];
         let session_id = [0x77u8; 32];
         let record = build_test_client_hello_with_key_share_entries(
@@ -1457,7 +1451,10 @@ mod tests {
         assert!(parsed.key_share_x25519.is_some());
         assert!(!parsed.key_share_mlkem768);
         let err = verify_reality_client_hello(&parsed, &[0u8; 32], 0, 0, &[], &[], &[]).unwrap_err();
-        assert!(matches!(err, RealityError::NoKeyShareX25519));
+        assert!(
+            matches!(err, RealityError::SessionIdDecryptFailed),
+            "pure X25519 must reach AEAD stage, got {err:?}"
+        );
     }
 
     /// Chrome 双 share 形态 [X25519MLKEM768, X25519]（MLKEM 在前）：独立
@@ -1501,10 +1498,10 @@ mod tests {
         assert!(parsed.key_share_mlkem768);
     }
 
-    /// 顺序颠倒 [X25519, X25519MLKEM768]：Go 首遇 X25519 即 break，其后
-    /// MLKEM 不消费 → `peerPub2 == nil` reject。
+    /// 顺序颠倒 [X25519, X25519MLKEM768]：Go 两轮各自 first-match-wins——
+    /// 独立 X25519 选中，MLKEM 检测同样命中（t2js：旧实现误拒）。
     #[test]
-    fn parse_client_hello_x25519_before_mlkem_rejected() {
+    fn parse_client_hello_x25519_before_mlkem_both_selected() {
         let random = [0x55u8; 32];
         let session_id = [0x77u8; 32];
         let record = build_test_client_hello_with_key_share_entries(
@@ -1515,14 +1512,13 @@ mod tests {
         );
         let parsed = parse_client_hello(&record).unwrap();
         assert_eq!(parsed.key_share_x25519, Some([0xCCu8; 32]));
-        assert!(!parsed.key_share_mlkem768);
-        let err = verify_reality_client_hello(&parsed, &[0u8; 32], 0, 0, &[], &[], &[]).unwrap_err();
-        assert!(matches!(err, RealityError::NoKeyShareX25519));
+        assert!(parsed.key_share_mlkem768);
     }
 
-    /// 重复 MLKEM entry：Go `peerPub2 = nil // ensure once` → reject。
+    /// 重复 MLKEM entry：Go 循环首遇即 break，重复无害、首个生效（t2js：
+    /// 旧实现误判 reject）。
     #[test]
-    fn parse_client_hello_duplicate_mlkem_rejected() {
+    fn parse_client_hello_duplicate_mlkem_first_wins() {
         let random = [0x55u8; 32];
         let session_id = [0x77u8; 32];
         let record = build_test_client_hello_with_key_share_entries(
@@ -1532,12 +1528,13 @@ mod tests {
             None,
         );
         let parsed = parse_client_hello(&record).unwrap();
-        assert!(parsed.key_share_x25519.is_none());
-        assert!(!parsed.key_share_mlkem768);
+        assert_eq!(parsed.key_share_x25519, Some([0xAAu8; 32]));
+        assert!(parsed.key_share_mlkem768);
     }
 
-    /// server_tls e2e：纯 X25519 单 share CH → `Invalid`（调用方拿回
-    /// conn+record 走 `fallback_to_dest`），reason = NoKeyShareX25519。
+    /// server_tls e2e：纯 X25519 单 share CH 过 keyshare 门，垃圾 auth 数据
+    /// 在 AEAD 层拒 → `Invalid`（调用方拿回 conn+record 走 `fallback_to_dest`），
+    /// reason = SessionIdDecryptFailed（t2js：不再于 keyshare 门误拒）。
     #[tokio::test]
     async fn server_tls_pure_x25519_ch_invalid_for_fallback() {
         use tokio::io::{AsyncWriteExt, duplex};
@@ -1563,8 +1560,8 @@ mod tests {
         match server_task.await.unwrap() {
             Ok(RealityServerOutcome::Invalid { reason, .. }) => {
                 assert!(
-                    matches!(reason, RealityError::NoKeyShareX25519),
-                    "expected NoKeyShareX25519, got {reason:?}"
+                    matches!(reason, RealityError::SessionIdDecryptFailed),
+                    "expected SessionIdDecryptFailed, got {reason:?}"
                 );
             }
             Ok(RealityServerOutcome::Verified { .. }) => {
