@@ -46,6 +46,11 @@ jobs:
             brew install protobuf
           fi
 
+      # Python cryptography (X25519 keypair for REALITY config; stdlib 没有)
+      - name: Ensure cryptography
+        run: |
+          python3 -c "import cryptography" 2>/dev/null || pip install --quiet cryptography
+
       # btls-sys 在干净环境走其内部 submodule 流程会产出 unpatched libcrypto，
       # 配方统一收编为 composite action（bd kumd，与 build-linux-release/mobile 同源）
       - uses: ./.github/actions/setup-boringssl
@@ -76,7 +81,7 @@ jobs:
           chmod +x tools/xray-go/xray
           tools/xray-go/xray version
 
-      - name: Interop tests (Rust<->Rust 12 + Go->Rust 6)
+      - name: Interop tests (Rust<->Rust 12 + Go->Rust 6 + Rust->Go 6 + 13 新协议套件)
         run: python3 dist/interop_ci.py --rust target/release/xray --go tools/xray-go/xray
 
       - name: Upload logs on failure
