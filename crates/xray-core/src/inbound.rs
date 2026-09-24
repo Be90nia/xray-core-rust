@@ -2860,8 +2860,14 @@ async fn spawn_one_inbound(
                 &ib.tag, bind_addr, tls_acceptor,
             )
             .with_password(password);
+            handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))?;
+            // start() 是 spawn-后-返回的短方法：slot.server 持 MockServer stop_tx，
+            // handler drop → serve_loop 的 sender-dropped 分支退出 → listener 关闭。
+            // 留 pending 保活（同 blackhole/freedom arm），shutdown 时随 task drop 停服。
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))
+                let _keep = handler;
+                std::future::pending::<()>().await;
+                Ok(())
             })))
         }
         // tuic inbound：QUIC listener + auth + Connect → dispatcher/router 分发
@@ -4064,6 +4070,9 @@ fn parse_anytls_tls_acceptor(
     data: &[u8],
 ) -> std::io::Result<(tokio_rustls::TlsAcceptor, Option<String>)> {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    // cert/key 与自签两条路径都构造 rustls ServerConfig，进程级 provider 必须先装
+    // （CI 场景 si 带 cert/key，走 cert 分支——漏装则启动期 panic）。
+    xray_common::ensure_default_crypto_provider();
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("anytls inbound settings JSON: {e}")))?;
     // 尝试从配置读证书

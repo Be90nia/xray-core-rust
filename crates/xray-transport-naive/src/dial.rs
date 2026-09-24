@@ -63,15 +63,21 @@ pub async fn dial_naive(
     // 回接证书验证（Xray-core-rust-pz6c）：naive 连接真实公网站点，默认完整
     // 链+主机名验证（webpki-roots，对应 naiveproxy/Go 标准行为）；naive 的
     // 鉴权在 Proxy-Authorization，不构成跳过 TLS 验证的理由。
+    // pinnedPeerCertSha256 配置时走 PinnedServerCertVerifier（自签互操作场景）。
+    let security_json = config
+        .pinned_peer_cert_sha256
+        .as_deref()
+        .map(|pin| serde_json::json!({ "pinnedPeerCertSha256": pin }));
     let tls = BtlsConn::connect(
         tcp,
         &config.sni,
         config.fingerprint.clone(),
         None, // ECH（naive 不用）
-        // 回接证书验证（pz6c）：webpki-roots 全验证，allowInsecure 无入口
-        Some(xray_tls::client_config::build_server_cert_verifier(None)
-            .map_err(|e| format!("build verifier: {e}"))?
-            .expect("default config yields a verifier")),
+        Some(
+            xray_tls::client_config::build_server_cert_verifier(security_json.as_ref())
+                .map_err(|e| format!("build verifier: {e}"))?
+                .expect("non-insecure config yields a verifier"),
+        ),
     )
     .await
     .map_err(|e| format!("naive tls handshake (sni={}): {e}", config.sni))?;

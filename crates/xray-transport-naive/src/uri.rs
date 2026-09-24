@@ -18,6 +18,9 @@ pub struct NaiveConfig {
     pub password: String,
     /// TLS 指纹（缺省 Chrome 133）。
     pub fingerprint: Fingerprint,
+    /// 证书钉扎（`pinnedPeerCertSha256`，hex；配了即以此验证服务端证书，
+    /// 替代 webpki-roots 链验证——自签证书互操作场景）。
+    pub pinned_peer_cert_sha256: Option<String>,
 }
 
 impl NaiveConfig {
@@ -29,6 +32,7 @@ impl NaiveConfig {
             username,
             password,
             fingerprint: Fingerprint::HelloChrome133,
+            pinned_peer_cert_sha256: None,
         }
     }
 
@@ -53,6 +57,9 @@ impl NaiveConfig {
         }
         if let Some(fp) = v.get("fingerprint").and_then(Value::as_str) {
             config.fingerprint = get_fingerprint(fp).map_err(|e| format!("fingerprint: {e}"))?;
+        }
+        if let Some(pin) = v.get("pinnedPeerCertSha256").and_then(Value::as_str) {
+            config.pinned_peer_cert_sha256 = Some(pin.to_string());
         }
         Ok(config)
     }

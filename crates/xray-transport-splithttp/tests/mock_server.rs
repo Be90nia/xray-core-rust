@@ -605,3 +605,116 @@ async fn bridge_eof_propagates_without_conn_idle() {
 
     server_task.abort();
 }
+
+// ===== r2lq：serve_http_conn 全栈（TLS + 默认 ALPN=[h2,http/1.1]）packet-up 冒烟 =====
+
+/// rcgen 自签证书（SAN 127.0.0.1）→ (cert PEM, key PEM, cert DER 供客户端信任)。
+fn self_signed_tls() -> (String, String, rustls::pki_types::CertificateDer<'static>) {
+    let params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
+        .expect("rcgen params");
+    let key_pair = rcgen::KeyPair::generate().expect("rcgen keypair");
+    let cert = params.self_signed(&key_pair).expect("rcgen self_signed");
+    let der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+    (cert.pem(), key_pair.serialize_pem(), der)
+}
+
+/// 生产入口端到端：listen_splithttp（TLS acceptor → serve_http_conn auto h1/h2）
+/// → handle_request → handle_packet_up/handle_stream_down → add_conn 桥 → echo
+/// dispatcher。tlsSettings 缺省 ALPN=["h2","http/1.1"]（xray-tls server_config.rs:246），
+/// 客户端 hyper-rustls enable_http2 同 ALPN——协商必为 h2（CI #25/#26 真实路径）。
+/// 断言：上行 POST → dispatcher echo → 下行 GET body 双向可达。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn packet_up_end_to_end_tls_h2_via_serve_http_conn() {
+    use xray_transport::dialer::StreamSettings;
+    use xray_transport::listener_registry::ConnHandler;
+    use xray_transport::sockopt::SocketOptions;
+    use xray_transport_splithttp::transport::listen_splithttp;
+
+    ensure_crypto_provider();
+    let (cert_pem, key_pem, cert_der) = self_signed_tls();
+
+    // 预占随机端口（TransportListener 不暴露 local_addr）。
+    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = probe.local_addr().unwrap();
+    drop(probe);
+
+    // echo dispatcher：读多少回多少（interop echo 语义的最小等价物）。
+    let handler: ConnHandler = Arc::new(|conn| {
+        tokio::spawn(async move {
+            let mut conn = conn;
+            let mut buf = vec![0u8; 8192];
+            loop {
+                match conn.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if conn.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    });
+
+    // 服务端：生产配置形状（transport_json 直接是 splithttpSettings 对象；
+    // cert/key 顶层键走 build_server_config 既有解析，见 server_config.rs 测试）。
+    let settings = StreamSettings {
+        protocol: "splithttp".into(),
+        security: "tls".into(),
+        transport_json: Some(serde_json::json!({ "path": "/", "mode": "packet-up" })),
+        security_json: Some(serde_json::json!({ "cert": cert_pem, "key": key_pem })),
+        ..Default::default()
+    };
+    let listener = listen_splithttp(server_addr, &settings, &SocketOptions::default(), handler)
+        .await
+        .expect("listen_splithttp");
+
+    // 客户端：rustls 信任自签证书；DefaultDialerClient rustls 分支
+    // enable_http1+enable_http2 注入 [h2, http/1.1]（client.rs bd 3ze9 注释）。
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert_der).expect("add root");
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let config = Arc::new(Config {
+        host: format!("127.0.0.1:{}", server_addr.port()),
+        path: "/".into(),
+        ..Default::default()
+    });
+    let client = Arc::new(DefaultDialerClient::new(
+        config,
+        tls_config,
+        DialTarget {
+            host: "127.0.0.1".into(),
+            port: server_addr.port(),
+            sni: "127.0.0.1".into(),
+        },
+        None,
+        None,
+    ));
+
+    let mut conn = tokio::time::timeout(
+        Duration::from_secs(15),
+        dial_packet_up(
+            client,
+            format!("https://127.0.0.1:{}/", server_addr.port()),
+            "r2lq-h2-echo-sess".into(),
+            1024,
+            RangeConfig::new(0, 0),
+        ),
+    )
+    .await
+    .expect("dial timeout (GET stream-down never established)")
+    .expect("dial_packet_up");
+
+    // 双向可达：上行 POST(seq) → upload_queue → 桥 → echo → dl_tx → GET body。
+    conn.write_all(b"r2lq-echo-h2").await.expect("upload write");
+    let mut got = [0u8; 12];
+    tokio::time::timeout(Duration::from_secs(15), conn.read_exact(&mut got))
+        .await
+        .expect("echo round-trip timeout (h2 server data path broken)")
+        .expect("download read");
+    assert_eq!(&got, b"r2lq-echo-h2");
+
+    let _ = listener.close();
+}

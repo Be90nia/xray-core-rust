@@ -53,7 +53,69 @@ pub fn generate_self_signed_cert(sni: &str) -> Result<(Vec<u8>, Vec<u8>)> {
     Ok((cert.der().to_vec(), key_pair.serialize_der()))
 }
 
+/// Go reality fork 服务端语义复刻（xtls/reality handshake_server_tls13.go:142-161）：
+/// REALITY 握手的 CertificateVerify **硬编码 `hs.sigAlg = Ed25519`**，不走
+/// `selectSignatureScheme` 协商——Go utls Chrome 模板的 signature_algorithms
+/// 不含 ed25519（只有 ECDSA-P256/P384 + RSA-PSS/PKCS1），标准 TLS 服务端会因
+/// 交集为空拒握（rustls `PeerIncompatible::NoSignatureSchemesInCommon`，CI #32
+/// Go cli→Rust srv 跨栈失败根因）；而 Go/utls 客户端验证 CertificateVerify 时
+/// 只按 scheme 字段分派签名算法、不检查其是否在自己声明过的列表里，故 Go↔Go
+/// 天然互通。REALITY 证书锁死 Ed25519（客户端 HMAC 验证要求
+/// `certs[0].PublicKey` 为 ed25519），无法换证书迁就客户端列表。
+#[derive(Debug)]
+struct ForceEd25519SigningKey {
+    inner: std::sync::Arc<dyn rustls::sign::SigningKey>,
+}
+
+impl rustls::sign::SigningKey for ForceEd25519SigningKey {
+    fn choose_scheme(
+        &self,
+        _offered: &[rustls::SignatureScheme],
+    ) -> Option<std::boxed::Box<dyn rustls::sign::Signer>> {
+        // 忽略客户端 offered 列表（Go fork 同语义），仅当底层密钥确实支持
+        // Ed25519 时返回 Some——REALITY 证书恒为 Ed25519，否则维持标准行为。
+        self.inner.choose_scheme(&[rustls::SignatureScheme::ED25519])
+    }
+
+    fn public_key(&self) -> Option<rustls_pki_types::SubjectPublicKeyInfoDer<'_>> {
+        self.inner.public_key()
+    }
+
+    fn algorithm(&self) -> rustls::SignatureAlgorithm {
+        self.inner.algorithm()
+    }
+}
+
+/// [`ForceEd25519SigningKey`] 的 KeyProvider 包装（REALITY 服务端专用）。
+///
+/// 无状态：key 装载直接委托 `ring::sign::any_supported_type`（watfaq-rustls
+/// fork `Ring::load_private_key` 的同一入口），外包强推层。watfaq-rustls
+/// fork 的 `CryptoProvider::key_provider` 是 `&'static dyn KeyProvider`（非
+/// 标准 rustls 的 `Arc`），故以 static 实例提供（[`FORCE_ED25519_PROVIDER`]）。
+#[derive(Debug)]
+struct ForceEd25519KeyProvider;
+
+impl rustls::crypto::KeyProvider for ForceEd25519KeyProvider {
+    fn load_private_key(
+        &self,
+        key_der: rustls_pki_types::PrivateKeyDer<'static>,
+    ) -> std::result::Result<std::sync::Arc<dyn rustls::sign::SigningKey>, rustls::Error> {
+        let inner = rustls::crypto::ring::sign::any_supported_type(&key_der)?;
+        Ok(std::sync::Arc::new(ForceEd25519SigningKey { inner }))
+    }
+
+    fn fips(&self) -> bool {
+        false
+    }
+}
+
+/// [`ForceEd25519KeyProvider`] 静态实例（fork 要求 `&'static`，见上）。
+static FORCE_ED25519_PROVIDER: &dyn rustls::crypto::KeyProvider = &ForceEd25519KeyProvider;
+
 /// 用证书 + 私钥构建 rustls `ServerConfig`（无客户端认证）。
+///
+/// 强推 Ed25519 语义见 [`ForceEd25519SigningKey`]（Go fork `hs.sigAlg = Ed25519`
+/// 复刻；rustls 默认协商会在 Go utls 客户端上触发 NoSignatureSchemesInCommon）。
 ///
 /// # Errors
 /// - 私钥 DER 解析失败 / ServerConfig 构建失败 → [`RealityError::CertGenerate`]
@@ -63,7 +125,11 @@ pub fn build_server_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> Result<Server
     xray_common::ensure_default_crypto_provider();
     let key = PrivateKeyDer::try_from(key_der)
         .map_err(|e| RealityError::CertGenerate(format!("private key der: {e}")))?;
-    let config = ServerConfig::builder()
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider.key_provider = FORCE_ED25519_PROVIDER;
+    let config = ServerConfig::builder_with_provider(std::sync::Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| RealityError::CertGenerate(format!("protocol versions: {e}")))?
         .with_no_client_auth()
         .with_single_cert(vec![CertificateDer::from(cert_der)], key)
         .map_err(|e| RealityError::CertGenerate(format!("server config: {e}")))?;
