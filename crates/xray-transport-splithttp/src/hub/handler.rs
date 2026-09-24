@@ -95,15 +95,26 @@ where
     B: hyper::body::Body<Data = Bytes> + Send + Unpin + BodyExt + 'static,
     B::Error: Send + Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    // 1. Host 验证（H2：Go internet.IsValidHTTPHost internet.go:8-16——lowercase +
+    // 1. Host 验证（Go internet.IsValidHTTPHost internet.go:8-16——lowercase +
     //    剥端口 + 精确匹配；此前双向 contains 是子串匹配可绕过）。
+    //    Host 来源对齐 Go net/http r.Host（r2lq）：h2 请求没有 Host header，
+    //    host 在 :authority 伪头（hyper 挂在 URI authority 上）——旧实现读
+    //    header 恒空串，一切 h2 请求 404；h1 origin-form URI 无 host 部分则
+    //    回落 Host header。URI host 优先与 Go readRequest（URL host 先于
+    //    Host header）一致。
     if !ctx.host.is_empty() {
         let req_host = req
-            .headers()
-            .get("host")
-            .and_then(|v| v.to_str().ok())
+            .uri()
+            .host()
+            .map(str::to_string)
+            .or_else(|| {
+                req.headers()
+                    .get("host")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            })
             .unwrap_or_default();
-        if !xray_common::protocol::http::is_valid_http_host(req_host, &ctx.host) {
+        if !xray_common::protocol::http::is_valid_http_host(&req_host, &ctx.host) {
             return status_response(StatusCode::NOT_FOUND);
         }
     }
@@ -941,6 +952,35 @@ mod tests {
         let req = plain_request(Method::OPTIONS, "/x", "Example.com:8443", None);
         let resp = dispatch_request(req, "127.0.0.1:2".parse().unwrap(), &ctx).await;
         assert_ne!(resp.status(), StatusCode::NOT_FOUND, "port/case variants must pass host gate");
+    }
+
+    /// r2lq 回归：h2 请求没有 Host header，host 在 :authority 伪头（hyper
+    /// 挂到 URI authority）。旧实现只读 `headers().get("host")` 恒空串 →
+    /// 一切 h2 请求 404（interop #25/#26 实锤）。
+    #[tokio::test]
+    async fn h2_authority_pseudo_header_passes_host_gate() {
+        let ctx = make_ctx("localhost");
+        let req = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("http://localhost/xhttp/session-1")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        assert!(req.headers().get("host").is_none(), "h2 request must carry no Host header");
+        let resp = dispatch_request(req, "127.0.0.1:2".parse().unwrap(), &ctx).await;
+        assert_eq!(resp.status(), StatusCode::OK, ":authority must feed the host gate");
+    }
+
+    /// r2lq 对照：:authority 不在白名单 → 仍 404（伪头不能绕过 host 门）。
+    #[tokio::test]
+    async fn h2_authority_mismatch_rejected() {
+        let ctx = make_ctx("evil.example.com");
+        let req = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("http://notevil.example.com/xhttp/session-1")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = dispatch_request(req, "127.0.0.1:2".parse().unwrap(), &ctx).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // ===== H3：X-Padding 三重偏离 =====
