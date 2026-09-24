@@ -113,6 +113,13 @@ async fn listen_tcp(
                 "tcp".to_string(),
                 rc.xver,
             );
+            xray_reality::probe::detect_post_handshake_record_lens(
+                table.clone(),
+                rc.fallback_dest.clone(),
+                rc.server_names.clone(),
+                "tcp".to_string(),
+                rc.xver,
+            );
             tracing::info!(dest = %rc.fallback_dest, "reality maxUselessRecords probe started");
             Arc::new(xray_reality::server::ProbeContext {
                 table,

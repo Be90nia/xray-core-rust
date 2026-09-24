@@ -2252,13 +2252,21 @@ async fn serve_reality_vless(
     let local = listener.local_addr()?;
     tracing::info!(addr = %local, "vless+reality inbound listening");
 
-    // bd frxi：配置启用探测时，listener 启动即 spawn CCS 探测写 ProbeTable
-    // （Go tcp/hub.go:79 `go goreality.DetectPostHandshakeRecordsLens(...)` 等价，
-    // Go 无条件跑；Rust 侧 opt-in）。探测在后台进行，不阻塞 accept 循环；
-    // 握手期经 ProbeContext 查表，未就绪/失败的 key 走配置 fallback。
+    // bd frxi：配置启用探测时，listener 启动即 spawn CCS tier + dest 记录
+    // 长度两路探测写 ProbeTable（Go tcp/hub.go:79
+    // `go goreality.DetectPostHandshakeRecordsLens(...)` 等价，Go 无条件跑；
+    // Rust 侧 opt-in）。探测在后台进行，不阻塞 accept 循环；握手期经
+    // ProbeContext 查表，未就绪/失败的 key 走配置 fallback。
     let probe_ctx = if cfg.max_useless_records.is_enabled() {
         let table = xray_reality::probe::ProbeTable::new();
         xray_reality::probe::detect_max_useless_records(
+            table.clone(),
+            cfg.fallback_dest.clone(),
+            cfg.server_names.clone(),
+            "tcp".to_string(),
+            cfg.xver,
+        );
+        xray_reality::probe::detect_post_handshake_record_lens(
             table.clone(),
             cfg.fallback_dest.clone(),
             cfg.server_names.clone(),

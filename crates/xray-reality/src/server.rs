@@ -485,9 +485,10 @@ struct VerifiedHandshake {
     auth_key: [u8; 32],
     /// 本连接的 maxUselessRecords 消费值（探测命中值或配置 fallback）。
     max_useless_records: u32,
-    /// 探测命中的原始 tier（bd 26zn：`None` = 未启用探测或查表 miss；
-    /// btls 路径仅在 tier < u32::MAX（dest 会 alert）时发后握手模仿记录）。
-    probe_tier: Option<u32>,
+    /// dest 主动发的后握手 type23 记录长度列表（bd 26zn：Go `tls.go:414-416`
+    /// `GlobalPostHandshakeRecordsLens.Load(key)` 等价；空 = dest 未主动发
+    /// type23 / 未启用探测 / 查表 miss，mirror 恒不发）。
+    mirror_record_lens: Vec<u32>,
 }
 
 /// REALITY 前置验证（rustls/btls 两路共享语义，bd tce2）：
@@ -534,22 +535,25 @@ fn verify_and_probe(
     // miss 用配置 fallback（缺省 32）。Go 在握手完成前 sleep(5s) 轮询等探测
     // 结果；Rust 不阻塞握手（探测为启动期后台任务，miss 只损失该连接的
     // 精确值），偏差登记在案。
-    let (max_useless_records, probe_tier) = match probe {
+    let (max_useless_records, mirror_record_lens) = match probe {
         Some(ctx) => {
             let sni = parsed.server_name.as_deref().unwrap_or("");
             let key = ctx.key_for(sni, &parsed.alpn_protocols);
             let tier = crate::probe::probe_for_key(&ctx.table, &key);
-            (tier.unwrap_or_else(|| ctx.fallback.fallback()), tier)
+            // bd 26zn：Go tls.go:414-416 Load(GlobalPostHandshakeRecordsLens)
+            // 等价——miss（探测中/未启用）与空列表同判"不发"。
+            let lens = ctx.table.record_lens_for_key(&key).unwrap_or_default();
+            (tier.unwrap_or_else(|| ctx.fallback.fallback()), lens)
         }
         None => (
             crate::config::MaxUselessRecordsSetting::Disabled.fallback(),
-            None,
+            Vec::new(),
         ),
     };
     Ok(VerifiedHandshake {
         auth_key,
         max_useless_records,
-        probe_tier,
+        mirror_record_lens,
     })
 }
 
@@ -639,22 +643,18 @@ where
 }
 
 /// dest 后握手记录长度列表探测可用性（Go `GlobalPostHandshakeRecordsLens`
-/// 等价物）。
+/// 等价物，表在 [`crate::probe::ProbeTable`]，探测入口
+/// [`crate::probe::detect_post_handshake_record_lens`]）。
 ///
 /// Go 只在探测到 **dest 主动发的 type 23 记录长度列表非空**时才发 mirror
 /// （`record_detect.go:124-139`：列表 = 真实 TLS 连 dest 后 `io.ReadAll`
 /// 收到的记录；列表为空则服务端不发，客户端无丢弃逻辑也不受影响）。Rust
-/// probe（frxi）只有 CCS tier、无该列表——tier<MaxInt 只证明 dest 对 CCS
-/// 有 alert 行为，**不是** dest 握手后主动发记录的证据。VPS 生产实测
+/// probe（frxi）早期只有 CCS tier——tier<MaxInt 只证明 dest 对 CCS 有
+/// alert 行为，**不是** dest 握手后主动发记录的证据。VPS 生产实测
 /// （2026-09-20）：按 tier<MaxInt 即发的保守做法 mirror 会泄漏进客户端
 /// VLESS 数据流（REALITY 客户端 TLS 栈把 mirror 当 app data 交付上层，
-/// curl 3/3 失败）——生产按 Go 语义收紧为恒不发；probe.rs 扩展列表探测
-/// 后解锁（改为查表结果）。cfg(test) 下 gate 常开以维持发送机制的
-/// wire 级回归（probe_hit 场景 = 模拟列表非空的未来 probe 形态）。
-#[cfg(not(test))]
-const POST_HANDSHAKE_MIRROR_PROBE_READY: bool = false;
-#[cfg(test)]
-const POST_HANDSHAKE_MIRROR_PROBE_READY: bool = true;
+/// curl 3/3 失败）。现 gate = 记录长度列表非空（`tls.go:414-416` 语义），
+/// tier 与 mirror gate 解耦（tier 只喂 `maxUselessRecords` 上限消费）。
 
 /// REALITY 服务端握手（btls/BoringSSL opt-in 路径，bd tce2）。
 ///
@@ -667,15 +667,14 @@ const POST_HANDSHAKE_MIRROR_PROBE_READY: bool = true;
 ///
 /// 握手完成后、连接交付前，按探测结果发一条模仿记录（Go reality
 /// tls.go:414-424：服务端把 dest 的后握手记录逐条重放给 REALITY 客户端，
-/// 使 REALITY 连接与 dest 直连的记录序列不可区分）。发送 gate（与 Go
-/// 一致，见 [`POST_HANDSHAKE_MIRROR_PROBE_READY`] 文档）：
+/// 使 REALITY 连接与 dest 直连的记录序列不可区分）。发送 gate（见
+/// [`crate::probe::detect_post_handshake_record_lens`] 文档）：
 ///
-/// - **gate 未就绪（生产现状）**：Rust probe 无记录长度列表 → 不发（Go
-///   在 dest 列表为空时同样不发）。生产 VPS 实测曾按「tier<MaxInt 即发」
-///   的保守做法发出 mirror，因 REALITY 客户端 TLS 栈把 mirror 当 app data
-///   交付上层而泄漏进 VLESS 数据流（curl 3/3 失败），已收紧。
-/// - **gate 就绪（probe 扩展列表后）**：探测命中该 key 且 tier < u32::MAX
-///   才发；tier == MaxInt / 未启用探测 / 查表 miss → 不发。
+/// - **列表非空**（探测确认 dest 主动发 type23 记录）→ 发。
+/// - **列表为空 / 查表 miss / 未启用探测** → 不发（Go 在 dest 列表为空时
+///   同样不重放；VPS 生产实测曾按「tier<MaxInt 即发」的保守做法发出
+///   mirror，因 REALITY 客户端 TLS 栈把 mirror 当 app data 交付上层而泄漏
+///   进 VLESS 数据流，curl 3/3 失败——CCS tier 证据 ≠ dest 发记录证据）。
 /// - 载荷：单条 type 23 application-data record（AEAD sealed），inner 明文
 ///   = 48 字节零 padding，wire 总长 70B（5 header + 1 inner content-type
 ///   + 48 payload + 16 tag）。Go 的长度来自真实探测 dest 记录；Rust 取
@@ -728,8 +727,8 @@ where
         .map_err(|e| RealityError::TlsHandshake(format!("btls accept: {e}")))?;
 
     // bd 26zn：后握手记录模仿（条件见函数文档）。
-    // 发送 gate = POST_HANDSHAKE_MIRROR_PROBE_READY && probe 命中 tier<MaxInt。
-    if POST_HANDSHAKE_MIRROR_PROBE_READY && verified.probe_tier.is_some_and(|tier| tier < u32::MAX) {
+    // 发送 gate = dest 记录长度列表非空（Go tls.go:414-416 语义）。
+    if !verified.mirror_record_lens.is_empty() {
         // 48B 零 padding；TLS 1.3 SSL_write 在其外自动加 inner content-type(1)
         // 与 AEAD tag(16)，wire = 5+1+48+16 = 70B 单记录。
         //
@@ -2434,8 +2433,9 @@ mod tests {
     /// btls 路径 loopback 共享装配：REALITY 客户端（u_client chrome btls 指纹）
     /// ↔ [`server_tls_btls`]。
     ///
-    /// `probe_tier`：`Some(tier)` = 三档 alpn key 全插表（命中）；`None` =
-    /// 不启用探测。返回（客户端握手结果, 服务端 outcome）。
+    /// `probe_tier`：`Some(tier)` = 三档 alpn key 全插表（命中）并配非空记录
+    /// 长度列表（mirror gate 就绪态）；`None` = 不启用探测（gate miss）。
+    /// 返回（客户端握手结果, 服务端 outcome）。
     async fn btls_reality_loopback(
         probe_tier: Option<u32>,
     ) -> (
@@ -2482,14 +2482,15 @@ mod tests {
                 crate::probe::AlpnId::Http11,
                 crate::probe::AlpnId::H2,
             ] {
-                table.insert(
-                    crate::probe::ProbeKey {
-                        dest: "fallback.example:443".to_string(),
-                        server_name: "example.com".to_string(),
-                        alpn,
-                    },
-                    tier,
-                );
+                let key = crate::probe::ProbeKey {
+                    dest: "fallback.example:443".to_string(),
+                    server_name: "example.com".to_string(),
+                    alpn,
+                };
+                table.insert(key.clone(), tier);
+                // mirror gate 输入：非空列表 = 模拟探测确认 dest 主动发 type23
+                //（载荷长度取发送侧保守常数 70B wire，见 server_tls_btls 文档）。
+                table.insert_record_lens(key, vec![70]);
             }
             ProbeContext {
                 table,
@@ -2545,8 +2546,9 @@ mod tests {
         assert_eq!(&buf, b"hello btls");
     }
 
-    /// bd 26zn：probe 命中（tier < MaxInt）→ 握手完成后发后握手模仿记录；
-    /// 客户端 TLS 栈解密后读到 48B 零明文（wire 70B 单记录的应用层投影）。
+    /// bd 26zn：mirror gate 就绪（探测确认 dest 主动发 type23，列表非空）→
+    /// 握手完成后发后握手模仿记录；客户端 TLS 栈解密后读到 48B 零明文
+    /// （wire 70B 单记录的应用层投影）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn server_tls_btls_sends_post_handshake_mirror_on_probe_hit() {
         use tokio::io::AsyncReadExt;
@@ -2567,18 +2569,21 @@ mod tests {
         }
     }
 
-    /// bd 26zn 保守条件：probe tier == MaxInt（dest 从不 alert）→ 不发模仿记录。
+    /// 未启用探测（probe=None）→ 记录列表表 miss → 不发模仿记录（gate
+    /// 输入 = dest 记录长度列表，Go tls.go:414-424；与 CCS tier 无关——
+    /// 原「MaxInt tier 不发」断言随 tier-gate 契约废除移除，三态判定见
+    /// probe.rs parse/gate 单测）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn server_tls_btls_no_mirror_on_maxint_tier() {
+    async fn server_tls_btls_no_mirror_without_probe_optin() {
         use tokio::io::AsyncReadExt;
 
-        let (client_result, server_result) = btls_reality_loopback(Some(u32::MAX)).await;
+        let (client_result, server_result) = btls_reality_loopback(None).await;
         match (client_result, server_result) {
             (Ok(Ok(mut client)), Ok(RealityServerOutcome::Verified { .. })) => {
                 let mut buf = [0u8; 48];
                 let r = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf))
                     .await;
-                assert!(r.is_err(), "no mirror record must be sent on MaxInt tier");
+                assert!(r.is_err(), "no mirror record must be sent without probe opt-in");
             }
             (Ok(Ok(_)), _) => panic!("server outcome not Verified"),
             (Ok(Err(e)), _) => panic!("client u_client failed: {e:?}"),

@@ -408,7 +408,13 @@ impl ClientWorker {
             return false;
         };
         session.set_input(BufferedReader::new(link.reader)).await;
-        session.set_output(BufferedWriter::new(link.writer)).await;
+        // client demux 直写（Go client.go:363 s.output = 裸 link.Writer，无
+        // 缓冲包装）：会话存活期间 Keep 数据必须即时到达 app 端。池化帧
+        // payload Buffer（cap 8KB、len 常小）若进 BufferedWriter 缓冲分支
+        // （len <= cap/2）会滞留到 close 才落盘，破坏全双工时序。
+        let mut output = BufferedWriter::new(link.writer);
+        output.set_buffered(false);
+        session.set_output(output).await;
 
         let global_id = if dest.network() == Network::UDP && inbound.is_none() {
             input.map(xray_xudp::global_id).filter(|g| *g != [0u8; 8])
@@ -575,7 +581,7 @@ impl ClientWorker {
     /// 对应 Go `handleStatusKeep`（client.go:347-370）。
     /// 未知 session：ResponseWriter 发 End 帧通知对端 + 丢弃数据。
     /// 返回 `true` 表示致命错误（fetch_output 应退出）。
-    async fn handle_status_keep(&self, meta: &FrameMetadata, data: Vec<u8>) -> bool {
+    async fn handle_status_keep(&self, meta: &FrameMetadata, data: Buffer) -> bool {
         let Some(session) = self.session_manager.get(meta.session_id()).await else {
             let mut closing = MuxWriter::new_response_writer(
                 meta.session_id(),
@@ -588,7 +594,7 @@ impl ClientWorker {
             return false;
         }
         session.add_downlink_bytes(data.len() as u64);
-        let mb = MultiBuffer::from_buffer(Buffer::from_vec(data));
+        let mb = MultiBuffer::from_buffer(data);
         let write_failed = {
             let mut output = session.output().await;
             match output.as_mut() {
@@ -658,30 +664,31 @@ pub(crate) async fn wait_done(mut rx: watch::Receiver<bool>) {
 /// 从 carrier 读取一个完整帧（metadata + 可选 data）。
 ///
 /// 返回 `Err("")` 表示干净 EOF（对端正常关闭），其余为错误描述。
-async fn read_frame(reader: &mut BufferedReader) -> Result<(FrameMetadata, Vec<u8>), String> {
+async fn read_frame(reader: &mut BufferedReader) -> Result<(FrameMetadata, Buffer), String> {
     let mut len_buf = [0u8; 2];
     read_exact(reader, &mut len_buf).await?;
     let meta_len = u16::from_be_bytes(len_buf) as usize;
     if meta_len > MAX_METADATA_LEN {
         return Err(format!("meta_len too large: {meta_len}"));
     }
-    let mut body = vec![0u8; meta_len];
-    read_exact(reader, &mut body).await?;
-    let mut full = Vec::with_capacity(2 + meta_len);
-    full.extend_from_slice(&len_buf);
-    full.extend_from_slice(&body);
+    // length 前缀 + meta 单板顺序读入后原地解析（Go frame.go:126 池化 board；
+    // read_from_bytes 需 length 前缀，board.bytes() 天然满足，免 concat Vec）
+    let mut board = Buffer::new();
+    board.write_from(&len_buf);
+    read_exact_buffer(reader, &mut board, meta_len).await?;
     let (meta, _) =
-        FrameMetadata::read_from_bytes(&full).map_err(|e| format!("parse meta: {e:?}"))?;
+        FrameMetadata::read_from_bytes(board.bytes()).map_err(|e| format!("parse meta: {e:?}"))?;
 
-    let data = if meta.has_data() {
+    // payload 直读进池化 Buffer（免中间 Vec 与下游 from_vec 二次拷贝）
+    let data: Buffer = if meta.has_data() {
         let mut size_buf = [0u8; 2];
         read_exact(reader, &mut size_buf).await?;
         let size = u16::from_be_bytes(size_buf) as usize;
-        let mut data = vec![0u8; size];
-        read_exact(reader, &mut data).await?;
-        data
+        let mut payload = Buffer::new();
+        read_exact_buffer(reader, &mut payload, size).await?;
+        payload
     } else {
-        Vec::new()
+        Buffer::with_capacity(0)
     };
     Ok((meta, data))
 }
@@ -699,6 +706,35 @@ async fn read_exact(reader: &mut BufferedReader, buf: &mut [u8]) -> Result<(), S
             });
         }
         off += n;
+    }
+    Ok(())
+}
+
+/// 精确读取 n 字节追加进池化 Buffer 可写区（直读无中间 Vec）。错误语义同
+/// `read_exact`：`Err("")` = 干净 EOF，部分读后 EOF 带偏移描述。
+async fn read_exact_buffer(
+    reader: &mut BufferedReader,
+    dst: &mut Buffer,
+    n: usize,
+) -> Result<(), String> {
+    let mut off = 0;
+    while off < n {
+        let got = {
+            let spare = dst.writable_bytes();
+            if n - off > spare.len() {
+                return Err(format!("read {n} exceeds buffer capacity at offset {off}"));
+            }
+            reader.read(&mut spare[..n - off]).await
+        };
+        if got == 0 {
+            return Err(if off == 0 {
+                String::new()
+            } else {
+                format!("EOF at offset {off}/{n}")
+            });
+        }
+        dst.advance_write(got);
+        off += got;
     }
     Ok(())
 }

@@ -282,11 +282,11 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
     /// 与 `write_chunk` 的区别：只 seal 一次（不分 size/payload），nonce 只 increment 一次。
     pub async fn write_raw_chunk(&mut self, plaintext: &[u8]) -> Result<()> {
         increment_nonce_bytes(&mut self.write_nonce);
-        let sealed = self
-            .write_aead
-            .seal(&self.write_nonce, &[], plaintext)
+        self.write_buf.clear();
+        self.write_aead
+            .seal_into(&self.write_nonce, &[], plaintext, &mut self.write_buf)
             .map_err(|e| SsError::AeadSeal(e.to_string()))?;
-        self.inner.write_all(&sealed).await?;
+        self.inner.write_all(&self.write_buf).await?;
         Ok(())
     }
 
@@ -367,11 +367,11 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             Err(e) => return Err(SsError::from(e)),
         }
 
-        // open size chunk
+        // open size chunk（原地解密：省掉 size_plain 中间分配）
         increment_nonce_bytes(&mut self.read_nonce);
         let size_plain = self
             .read_aead
-            .open(&self.read_nonce, &[], &size_buf)
+            .open_in_place(&self.read_nonce, &[], &mut size_buf)
             .map_err(|e| SsError::AeadOpen(e.to_string()))?;
         if size_plain.len() < 2 {
             return Err(SsError::InsufficientData(size_plain.len()));
@@ -388,14 +388,16 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         let mut payload_buf = vec![0u8; wire_len];
         self.inner.read_exact(&mut payload_buf).await?;
 
-        // open payload
+        // open payload（原地解密：明文 = wire 缓冲前缀，truncate 后整缓冲移交）
         increment_nonce_bytes(&mut self.read_nonce);
-        let plaintext = self
+        let plaintext_len = self
             .read_aead
-            .open(&self.read_nonce, &[], &payload_buf)
-            .map_err(|e| SsError::AeadOpen(e.to_string()))?;
+            .open_in_place(&self.read_nonce, &[], &mut payload_buf)
+            .map_err(|e| SsError::AeadOpen(e.to_string()))?
+            .len();
+        payload_buf.truncate(plaintext_len);
 
-        Ok(Some(plaintext))
+        Ok(Some(payload_buf))
     }
 
     /// 从应用层缓冲 `pending` 解出一个完整 SS chunk（`try_open_chunk` 返回态）。

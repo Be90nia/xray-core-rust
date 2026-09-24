@@ -584,9 +584,14 @@ where
                 // 数据报转发（dispatch 侧也会丢弃空 payload，转发即死锁）。
                 Ok(packet) if packet.is_empty() => break,
                 Ok(packet) => {
-                    if up_tx.send(packet.to_vec()).await.is_err() {
+                    // 明文 = ciphertext 原地前缀：truncate 后 take 整缓冲零拷贝
+                    // 移交，重建缓冲（容量不变）供下一轮 read_exact 复用。
+                    let plaintext_len = packet.len();
+                    ciphertext.truncate(plaintext_len);
+                    if up_tx.send(std::mem::take(&mut ciphertext)).await.is_err() {
                         break; // relay 已退出
                     }
+                    ciphertext = Vec::with_capacity(PUMP_BUF + 96);
                 }
                 Err(_) => break,
             }
