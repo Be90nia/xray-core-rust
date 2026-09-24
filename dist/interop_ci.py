@@ -250,10 +250,14 @@ def build_x(proto, P):
         si = {"port": P, "listen": "127.0.0.1", "protocol": "vless",
               "settings": {"clients": [{"id": UUID}], "decryption": "none"},
               "streamSettings": ss_srv}
-        co = {"protocol": "vless", "settings": {"vnext": [
-            {"address": "127.0.0.1", "port": P,
-             "users": [{"id": UUID, "encryption": "none"}]}]},
-              "streamSettings": ss_cli}
+        # Rust vless outbound 不接 network=hysteria2 (crates/xray-core/src/outbound.rs:757
+        # 仅 tcp/ws/grpc/splithttp/httpupgrade) — 客户端独立 hysteria outbound,
+        # settings JSON 对齐 parse_hysteria_config (outbound.rs:2353): {version, servers[]}.
+        # 服务端 si (vless+network=hysteria2) 由别任务修产品代码 (bd upe1 等).
+        co = {"protocol": "hysteria",
+              "settings": {"version": 2,
+                           "servers": [{"address": "127.0.0.1", "port": P,
+                                        "auth": auth_pw, "serverName": "localhost"}]}}
     elif proto == 'anytls':
         # anytls 协议对 dest 行为: 透明代理 (类似 vision); 用本地 echo 当 dest.
         auth_pw = 'anytls-secret'
@@ -266,10 +270,14 @@ def build_x(proto, P):
         si = {"port": P, "listen": "127.0.0.1", "protocol": "vless",
               "settings": {"clients": [{"id": UUID}], "decryption": "none"},
               "streamSettings": ss_srv}
-        co = {"protocol": "vless", "settings": {"vnext": [
-            {"address": "127.0.0.1", "port": P,
-             "users": [{"id": UUID, "encryption": "none"}]}]},
-              "streamSettings": ss_cli}
+        # Rust vless outbound 不接 network=anytls — 客户端独立 anytls outbound,
+        # settings JSON 对齐 parse_anytls_config (outbound.rs:2232): 顶层 server/
+        # server_port/sni/insecure/password (无 servers 数组, 不同于 hysteria/tuic).
+        # anytls 协议自持 TLS (出站 dispatcher 不消费 streamSettings.network/security).
+        co = {"protocol": "anytls",
+              "settings": {"server": "127.0.0.1", "server_port": P,
+                           "sni": "localhost", "insecure": True,
+                           "password": auth_pw}}
     elif proto == 'tuic':
         # TUIC v5 over QUIC; dest 行为: UDP+TCP 代理; 需 QUIC stack 双向兼容.
         uuid = UUID
@@ -305,10 +313,14 @@ def build_x(proto, P):
         si = {"port": P, "listen": "127.0.0.1", "protocol": "vless",
               "settings": {"clients": [{"id": UUID}], "decryption": "none"},
               "streamSettings": ss_srv}
-        co = {"protocol": "vless", "settings": {"vnext": [
-            {"address": "127.0.0.1", "port": P,
-             "users": [{"id": UUID, "encryption": "none"}]}]},
-              "streamSettings": ss_cli}
+        # Rust vless outbound 不接 network=naive — 客户端独立 naive outbound,
+        # settings JSON 对齐 parse_naive_config (outbound.rs:2284 → NaiveConfig::
+        # from_json): 顶层 server/port/sni/username/password/fingerprint (无 servers
+        # 数组, 不同于 hysteria/tuic).
+        co = {"protocol": "naive",
+              "settings": {"server": "127.0.0.1", "port": P,
+                           "sni": "localhost", "username": "user",
+                           "password": "pass", "fingerprint": "chrome"}}
     else:
         raise ValueError(proto)
     return si, co

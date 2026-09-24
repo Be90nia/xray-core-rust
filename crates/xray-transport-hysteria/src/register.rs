@@ -35,13 +35,14 @@ use crate::{
 ///
 /// 幂等：重复注册的 `AlreadyExists` 被忽略。
 pub fn register_dialer() -> io::Result<()> {
-    let dialer: TransportDialFn = Arc::new(move |dest, sockopt, settings| {
+    let dial_fn: TransportDialFn = Arc::new(move |dest, sockopt, settings| {
         let dest = dest.clone();
         let sockopt = sockopt.clone();
         let settings = settings.clone();
         Box::pin(async move { dial_hysteria(&dest, &settings, &sockopt).await })
     });
-    let _ = register_transport_dialer(PROTOCOL_NAME, dialer);
+    let _ = register_transport_dialer(PROTOCOL_NAME, dial_fn.clone());
+    let _ = register_transport_dialer("hysteria2", dial_fn);
     Ok(())
 }
 
@@ -59,7 +60,8 @@ pub fn register_listener() -> io::Result<()> {
         let sockopt = sockopt.clone();
         Box::pin(async move { listen_hysteria(addr, settings, sockopt, handler).await })
     });
-    let _ = register_transport_listener(PROTOCOL_NAME, listen_fn);
+    let _ = register_transport_listener(PROTOCOL_NAME, listen_fn.clone());
+    let _ = register_transport_listener("hysteria2", listen_fn);
     Ok(())
 }
 
@@ -325,6 +327,32 @@ mod tests {
     fn register_dialer_is_idempotent() {
         register_dialer().expect("first register ok");
         register_dialer().expect("second register ok (idempotent)");
+    }
+
+    /// bd upe1: "hysteria2" transport name (Go v2 streamSettings.network) must
+    /// resolve to the same dialer/listener as "hysteria" so that
+    /// `streamSettings.network="hysteria2"` doesn't hit `NotFound` at the
+    /// transport registry.
+    #[test]
+    fn hysteria2_alias_registers_alongside_hysteria() {
+        register_dialer().expect("dialer register");
+        register_listener().expect("listener register");
+        assert!(
+            xray_transport::dialer::get_transport_dialer("hysteria").is_some(),
+            "hysteria dialer must be registered"
+        );
+        assert!(
+            xray_transport::dialer::get_transport_dialer("hysteria2").is_some(),
+            "hysteria2 dialer alias must be registered"
+        );
+        assert!(
+            xray_transport::listener_registry::get_transport_listener("hysteria").is_some(),
+            "hysteria listener must be registered"
+        );
+        assert!(
+            xray_transport::listener_registry::get_transport_listener("hysteria2").is_some(),
+            "hysteria2 listener alias must be registered"
+        );
     }
 
     #[test]
