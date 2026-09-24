@@ -192,7 +192,7 @@ async fn test_server_worker_dispatch_fails_with_mock() {
     );
     let link_writer = Arc::new(tokio::sync::Mutex::new(None::<Box<dyn Writer>>));
     let meta = FrameMetadata::new_session(1, dest);
-    let result = worker.handle_normal_new(&meta, Vec::new(), &link_writer).await;
+    let result = worker.handle_normal_new(&meta, xray_buf::buffer::Buffer::with_capacity(0), &link_writer).await;
     assert!(result.is_err());
 }
 

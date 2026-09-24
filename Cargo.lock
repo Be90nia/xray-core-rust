@@ -6767,6 +6767,7 @@ dependencies = [
  "webpki-roots 1.0.8",
  "xray-buf",
  "xray-common",
+ "xray-features",
  "xray-proto",
  "xray-reality",
  "xray-tls",

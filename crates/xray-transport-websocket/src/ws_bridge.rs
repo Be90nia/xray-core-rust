@@ -119,11 +119,13 @@ where
             // 1. 先吐 read_buf（上一条消息的剩余字节）。
             if !self.read_buf.is_empty() {
                 let n = std::cmp::min(self.read_buf.len(), buf.remaining());
-                // VecDeque::drain 收集到 Vec 太重，直接逐字节拷贝（n 通常很小）。
-                // ponytail: 用 chunk + put_slice 避免 VecDeque::drain 收集。
-                // n 通常 ≤ buf.remaining()，一次 put_slice 即可。
-                let chunk: Vec<u8> = self.read_buf.drain(..n).collect();
-                buf.put_slice(&chunk);
+                // 从 VecDeque 连续段直拷进 ReadBuf（跨环形回绕时 front+back 各
+                // 一次），无中间分配；drain 仅推进游标。
+                let (front, back) = self.read_buf.as_slices();
+                let take_front = n.min(front.len());
+                buf.put_slice(&front[..take_front]);
+                buf.put_slice(&back[..n - take_front]);
+                self.read_buf.drain(..n);
                 return Poll::Ready(Ok(()));
             }
             // 2. 拉下一条消息。

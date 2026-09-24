@@ -242,7 +242,7 @@ impl ServerWorker {
     /// Handle normal New frame (non-XUDP).
     pub async fn handle_normal_new(
         &self, meta: &FrameMetadata,
-        data: Vec<u8>,
+        data: Buffer,
         link_writer: &Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>>,
     ) -> Result<(), ServerError> {
         let target = meta.target().cloned().ok_or_else(|| {
@@ -266,17 +266,17 @@ impl ServerWorker {
         let tt = if target.network() == Network::UDP { TransferType::Packet } else { TransferType::Stream };
         let session = Session::new(meta.session_id(), tt);
         session.set_input(BufferedReader::new(link.reader)).await;
-        // Packet 会话禁用 BufferedWriter 缓冲（直写）：包边界保持 + 小包即时
-        // 送达（Go server.go:271-277 直接使用 link.Writer，无缓冲包装）。
+        // 会话 output 直写（Go server.go:271-277 直接使用 link.Writer，无缓
+        // 冲包装）：New 内联数据即时送达 + reverse-mux Keep 即时透传。池化帧
+        // payload Buffer（cap 8KB、len 常小）走 BufferedWriter 缓冲分支会滞
+        // 留到 close 才落盘。
         let mut output = BufferedWriter::new(link.writer);
-        if tt == TransferType::Packet {
-            output.set_buffered(false);
-        }
+        output.set_buffered(false);
         // 写入 New frame 的 data 到 session.output（在 spawn 反向 task 前同步完成，
         // 对齐 Go handleStatusNew 中 `buf.Copy(rr, s.output)` 的语义）
         if !data.is_empty() {
             output
-                .write_multi_buffer_impl(MultiBuffer::from_buffer(Buffer::from_vec(data)))
+                .write_multi_buffer_impl(MultiBuffer::from_buffer(data))
                 .await
                 .map_err(|e| ServerError::DispatchFailed(format!("initial data: {e}")))?;
             output.flush().await.ok();
@@ -303,7 +303,7 @@ impl ServerWorker {
     /// ms 使泵任务读空 input 立即退出，上游数据永远回不来。
     pub async fn handle_xudp_new(
         &self, meta: &FrameMetadata,
-        data: Vec<u8>,
+        data: Buffer,
         link_writer: &Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>>,
         global_id: [u8; 8],
     ) -> Result<(), ServerError> {
@@ -331,7 +331,7 @@ impl ServerWorker {
                     // upgrade 失败 = 旧 session 已 Close/Expiring → 重建。
                     if let Some(old_session) = ex.mux().and_then(|w| w.upgrade()) {
                         if self
-                            .xudp_hit_rebind(&old_session, meta, &data, &mut ex, link_writer)
+                            .xudp_hit_rebind(&old_session, meta, data.bytes(), &mut ex, link_writer)
                             .await
                         {
                             return Ok(());
@@ -359,7 +359,7 @@ impl ServerWorker {
         output.set_buffered(false);
         if !data.is_empty() {
             output
-                .write_multi_buffer_impl(MultiBuffer::from_buffer(Buffer::from_vec(data)))
+                .write_multi_buffer_impl(MultiBuffer::from_buffer(data))
                 .await
                 .map_err(|e| ServerError::DispatchFailed(format!("XUDP initial data: {e}")))?;
         }
@@ -503,39 +503,43 @@ impl ServerWorker {
         // 1. 读 2B length（EOF 返 Ok(false) 表示干净关闭）。select done：
         // monitor 空闲关闭 carrier 后读循环立即退出（Go run() 帧间检查
         // done 的等价），不挂在底层 I/O 上
+        let mut len_buf = [0u8; 2];
         let first_read = tokio::select! {
             _ = crate::client::wait_done(self.done_rx.clone()) => return Ok(false),
-            r = Self::read_exact_async(reader, 2) => r,
+            r = Self::read_exact_slice(reader, &mut len_buf) => r,
         };
-        let len_buf = match first_read {
-            Ok(b) => b,
+        match first_read {
+            Ok(()) => {}
             Err(ServerError::InvalidFrame(msg)) if msg.starts_with("EOF") => return Ok(false),
             Err(e) => return Err(e),
-        };
-        let meta_len = u16::from_be_bytes([len_buf[0], len_buf[1]]) as usize;
+        }
+        let meta_len = u16::from_be_bytes(len_buf) as usize;
         if meta_len > MAX_METADATA_LEN {
             return Err(ServerError::InvalidFrame(format!("meta_len too large: {}", meta_len)));
         }
-        // 2. 读 body
-        let body = Self::read_exact_async(reader, meta_len).await?;
-        // 3. 解析 metadata（拼回完整 bytes 调 read_from_bytes，因为它需 length 前缀）
-        let mut full = Vec::with_capacity(2 + meta_len);
-        full.extend_from_slice(&len_buf);
-        full.extend_from_slice(&body);
+        // 2+3. length 前缀 + meta 单板顺序读入后原地解析（Go frame.go:126 池化
+        // board；read_from_bytes 需 length 前缀，board.bytes() 天然满足，免
+        // concat Vec 与逐段 alloc）
+        let mut board = Buffer::new();
+        board.write_from(&len_buf);
+        Self::read_exact_into(reader, &mut board, meta_len).await?;
         let parse = if self.read_source_and_local {
-            FrameMetadata::read_from_bytes_with_source(&full)
+            FrameMetadata::read_from_bytes_with_source(board.bytes())
         } else {
-            FrameMetadata::read_from_bytes(&full)
+            FrameMetadata::read_from_bytes(board.bytes())
         };
         let (meta, _) =
             parse.map_err(|e| ServerError::InvalidFrame(format!("parse meta: {:?}", e)))?;
-        // 4. 如有 data，读 data（2B size + payload）
+        // 4. 如有 data，payload 直读进池化 Buffer（免中间 Vec 与下游 from_vec 二次拷贝）
         let data = if meta.has_data() {
-            let size_buf = Self::read_exact_async(reader, 2).await?;
-            let size = u16::from_be_bytes([size_buf[0], size_buf[1]]) as usize;
-            Self::read_exact_async(reader, size).await?
+            let mut size_buf = [0u8; 2];
+            Self::read_exact_slice(reader, &mut size_buf).await?;
+            let size = u16::from_be_bytes(size_buf) as usize;
+            let mut payload = Buffer::new();
+            Self::read_exact_into(reader, &mut payload, size).await?;
+            payload
         } else {
-            Vec::new()
+            Buffer::with_capacity(0)
         };
         // 5. 按 status 分发
         match meta.session_status() {
@@ -582,7 +586,7 @@ impl ServerWorker {
     pub async fn handle_status_keep(
         &self,
         meta: &FrameMetadata,
-        data: Vec<u8>,
+        data: Buffer,
     ) -> Result<(), ServerError> {
         if data.is_empty() {
             return Ok(());
@@ -595,8 +599,8 @@ impl ServerWorker {
         // 更新流量统计
         session.add_uplink_bytes(data_len);
         let mut guard = session.output().await;
-        if let Some(ref mut writer) = *guard {
-            let mb = MultiBuffer::from_buffer(Buffer::from_vec(data));
+        if let Some(writer) = guard.as_mut() {
+            let mb = MultiBuffer::from_buffer(data);
             let _ = writer.write_multi_buffer_impl(mb).await;
         }
         Ok(())
@@ -610,21 +614,56 @@ impl ServerWorker {
         Ok(())
     }
 
-    /// 异步精确读取 n 字节，EOF 时返回带 "EOF" 前缀的 InvalidFrame 错误。
-    async fn read_exact_async(reader: &mut BufferedReader, n: usize) -> Result<Vec<u8>, ServerError> {
-        let mut buf = vec![0u8; n];
+    /// 精确读满 `buf`（调用方栈缓冲直读，无中间分配）。EOF 时返回带 "EOF"
+    /// 前缀的 InvalidFrame 错误（process_frame 据此判干净关闭）。
+    async fn read_exact_slice(
+        reader: &mut BufferedReader,
+        buf: &mut [u8],
+    ) -> Result<(), ServerError> {
         let mut read = 0;
-        while read < n {
+        while read < buf.len() {
             let r = reader.read(&mut buf[read..]).await;
             if r == 0 {
                 return Err(ServerError::InvalidFrame(format!(
                     "EOF reading {} bytes at offset {}",
-                    n, read
+                    buf.len(),
+                    read
                 )));
             }
             read += r;
         }
-        Ok(buf)
+        Ok(())
+    }
+
+    /// 精确读取 n 字节追加进池化 Buffer 可写区（直读无中间 Vec，对齐 Go
+    /// frame.go:126 `ReadFullFrom` 原地读形态）。EOF 错误格式同 read_exact_slice。
+    async fn read_exact_into(
+        reader: &mut BufferedReader,
+        dst: &mut Buffer,
+        n: usize,
+    ) -> Result<(), ServerError> {
+        let mut remaining = n;
+        while remaining > 0 {
+            let r = {
+                let spare = dst.writable_bytes();
+                if remaining > spare.len() {
+                    return Err(ServerError::InvalidFrame(
+                        "read exceeds buffer capacity".to_string(),
+                    ));
+                }
+                reader.read(&mut spare[..remaining]).await
+            };
+            if r == 0 {
+                return Err(ServerError::InvalidFrame(format!(
+                    "EOF reading {} bytes at offset {}",
+                    n,
+                    n - remaining
+                )));
+            }
+            dst.advance_write(r);
+            remaining -= r;
+        }
+        Ok(())
     }
 }
 
@@ -1252,7 +1291,7 @@ mod tests {
                 let mut meta = FrameMetadata::new_session(100 + i as u16, udp_target());
                 meta.set_global_id(gid);
                 server
-                    .handle_xudp_new(&meta, payload.to_vec(), &Arc::new(AsyncMutex::new(None)), gid)
+                    .handle_xudp_new(&meta, Buffer::from_vec(payload.to_vec()), &Arc::new(AsyncMutex::new(None)), gid)
                     .await
                     .expect("handle_xudp_new");
             }
@@ -1294,7 +1333,7 @@ mod tests {
             );
             let keep_meta = FrameMetadata::new_session(101, udp_target());
             server
-                .handle_status_keep(&keep_meta, b"keep-data".to_vec())
+                .handle_status_keep(&keep_meta, Buffer::from_vec(b"keep-data".to_vec()))
                 .await
                 .expect("keep frame processed");
             let tail = read_all(&mut up_r).await;

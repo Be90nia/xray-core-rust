@@ -9,7 +9,6 @@ use xray_buf::multi::MultiBuffer;
 use xray_buf::reader::BufferedReader;
 use xray_buf::io::{self as buf_io, Reader};
 use xray_common::net::destination::Destination;
-use xray_common::serial;
 
 use crate::frame::{FrameMetadata, MuxError, SessionStatus};
 
@@ -26,26 +25,50 @@ pub struct PacketReader {
     dest: Option<Destination>,
 }
 
+/// 从 BufferedReader 精确读满 `buf`（调用方栈缓冲直读，无中间分配）。
+async fn read_exact_slice(reader: &mut BufferedReader, buf: &mut [u8]) -> Result<(), MuxError> {
+    let mut off = 0;
+    while off < buf.len() {
+        let n = reader.read(&mut buf[off..]).await;
+        if n == 0 {
+            return Err(MuxError::Io("unexpected EOF".to_string()));
+        }
+        off += n;
+    }
+    Ok(())
+}
+
+/// 精确读取 n 字节追加进池化 Buffer 可写区。
+///
+/// 对齐 Go frame.go:126 `ReadFullFrom` 原地读形态：wire → 池化 Buffer，
+/// 零中间 Vec、零二次拷贝。
+async fn read_exact_into(
+    reader: &mut BufferedReader,
+    dst: &mut Buffer,
+    n: usize,
+) -> Result<(), MuxError> {
+    let mut remaining = n;
+    while remaining > 0 {
+        let read_n = {
+            let spare = dst.writable_bytes();
+            if remaining > spare.len() {
+                return Err(MuxError::Io(format!("read {} exceeds buffer capacity", n)));
+            }
+            reader.read(&mut spare[..remaining]).await
+        };
+        if read_n == 0 {
+            return Err(MuxError::Io("unexpected EOF".to_string()));
+        }
+        dst.advance_write(read_n);
+        remaining -= read_n;
+    }
+    Ok(())
+}
+
 impl PacketReader {
     /// 创建新的 PacketReader
     pub fn new(reader: Box<dyn Reader>, dest: Option<Destination>) -> Self {
         Self { reader: BufferedReader::new(reader), eof: false, dest }
-    }
-
-    /// 从 BufferedReader 精确读取 n 字节
-    async fn read_exact_buffered(&mut self, n: usize) -> Result<Vec<u8>, MuxError> {
-        let mut result = Vec::with_capacity(n);
-        let mut remaining = n;
-        while remaining > 0 {
-            let mut tmp = vec![0u8; remaining];
-            let read_n = self.reader.read(&mut tmp).await;
-            if read_n == 0 {
-                return Err(MuxError::Io("unexpected EOF".to_string()));
-            }
-            result.extend_from_slice(&tmp[..read_n]);
-            remaining -= read_n;
-        }
-        Ok(result)
     }
 
     /// 读取一个完整的数据包
@@ -53,17 +76,18 @@ impl PacketReader {
         if self.eof {
             return Err(MuxError::Io("EOF".to_string()));
         }
-        let len_data = self.read_exact_buffered(2).await?;
-        let size = serial::read_uint16(&len_data)
-            .ok_or_else(|| MuxError::Io("invalid uint16".to_string()))?;
+        let mut len_buf = [0u8; 2];
+        read_exact_slice(&mut self.reader, &mut len_buf).await?;
+        let size = u16::from_be_bytes(len_buf);
         if size > MAX_PACKET_SIZE {
             return Err(MuxError::Io(format!("packet size too large: {}", size)));
         }
-        let data = self.read_exact_buffered(size as usize).await?;
+        // payload 直读进池化 Buffer（对齐 Go reader.go 池化单读）
+        let mut data = Buffer::new();
+        read_exact_into(&mut self.reader, &mut data, size as usize).await?;
         self.eof = true;
-        let buffer = Buffer::from_vec(data);
         let mut mb = MultiBuffer::new();
-        mb.push(buffer);
+        mb.push(data);
         Ok(mb)
     }
 
@@ -80,8 +104,7 @@ pub struct StreamReader {
 
 struct FrameData {
     metadata: FrameMetadata,
-    data: Vec<u8>,
-    data_offset: usize,
+    data: Buffer,
 }
 
 impl StreamReader {
@@ -93,66 +116,58 @@ impl StreamReader {
         Self::new(BufferedReader::new(reader), session_id)
     }
 
-    /// 从 BufferedReader 精确读取 n 字节到 Vec
-    async fn read_exact_buffered(&mut self, n: usize) -> Result<Vec<u8>, MuxError> {
-        let mut result = Vec::with_capacity(n);
-        let mut remaining = n;
-        while remaining > 0 {
-            let mut tmp = vec![0u8; remaining];
-            let read_n = self.reader.read(&mut tmp).await;
-            if read_n == 0 {
-                return Err(MuxError::Io("unexpected EOF".to_string()));
-            }
-            result.extend_from_slice(&tmp[..read_n]);
-            remaining -= read_n;
-        }
-        Ok(result)
-    }
-
     /// 读取下一个帧
     async fn read_next_frame(&mut self) -> Result<Option<FrameData>, MuxError> {
         // 读取 length 前缀 (2 bytes)
-        let len_data = self.read_exact_buffered(2).await?;
-        let meta_len = u16::from_be_bytes([len_data[0], len_data[1]]) as usize;
+        let mut len_buf = [0u8; 2];
+        read_exact_slice(&mut self.reader, &mut len_buf).await?;
+        let meta_len = u16::from_be_bytes(len_buf) as usize;
         if meta_len > 1024 {
             return Err(MuxError::MetadataTooLong(meta_len));
         }
-        // 读取 body
-        let body = self.read_exact_buffered(meta_len).await?;
-        let (metadata, _consumed) = FrameMetadata::read_from_bytes(&[&len_data[..], &body[..]].concat())
+        // length 前缀 + meta 单板顺序读入后原地解析（Go frame.go:126 池化
+        // board；read_from_bytes 需 length 前缀，board.bytes() 天然满足，免
+        // concat Vec）
+        let mut board = Buffer::new();
+        board.write_from(&len_buf);
+        read_exact_into(&mut self.reader, &mut board, meta_len).await?;
+        let (metadata, _consumed) = FrameMetadata::read_from_bytes(board.bytes())
             .map_err(|e| MuxError::Io(format!("parse meta: {:?}", e)))?;
 
         if metadata.session_id() != self.session_id {
             if metadata.has_data() {
-                let len_data = self.read_exact_buffered(2).await?;
-                let size = serial::read_uint16(&len_data)
-                    .ok_or_else(|| MuxError::Io("bad len".to_string()))?;
-                let _ = self.read_exact_buffered(size as usize).await?;
+                let mut size_buf = [0u8; 2];
+                read_exact_slice(&mut self.reader, &mut size_buf).await?;
+                let size = u16::from_be_bytes(size_buf) as usize;
+                let mut discard = Buffer::new();
+                read_exact_into(&mut self.reader, &mut discard, size).await?;
             }
             return Ok(None);
         }
 
+        // payload 直读进池化 Buffer，免中间 Vec 与出口二次拷贝
         let data = if metadata.has_data() {
-            let len_data = self.read_exact_buffered(2).await?;
-            let size = serial::read_uint16(&len_data)
-                .ok_or_else(|| MuxError::Io("bad len".to_string()))?;
-            self.read_exact_buffered(size as usize).await?
-        } else { Vec::new() };
+            let mut size_buf = [0u8; 2];
+            read_exact_slice(&mut self.reader, &mut size_buf).await?;
+            let size = u16::from_be_bytes(size_buf) as usize;
+            let mut payload = Buffer::new();
+            read_exact_into(&mut self.reader, &mut payload, size).await?;
+            payload
+        } else {
+            Buffer::with_capacity(0)
+        };
 
-        Ok(Some(FrameData { metadata, data, data_offset: 0 }))
+        Ok(Some(FrameData { metadata, data }))
     }
 
     /// 读取数据到 MultiBuffer
     pub async fn read(&mut self) -> Result<MultiBuffer, MuxError> {
         loop {
-            if let Some(ref mut frame) = self.current_frame {
-                if frame.data_offset < frame.data.len() {
-                    let remaining = &frame.data[frame.data_offset..];
-                    let mut buffer = Buffer::with_capacity(remaining.len());
-                    buffer.write_from(remaining);
-                    frame.data_offset = frame.data.len();
+            if let Some(frame) = self.current_frame.as_mut() {
+                if !frame.data.is_empty() {
+                    // 整帧 payload 所有权转移（池化 Buffer 直出，零拷贝）
                     let mut mb = MultiBuffer::new();
-                    mb.push(buffer);
+                    mb.push(std::mem::replace(&mut frame.data, Buffer::with_capacity(0)));
                     return Ok(mb);
                 }
                 let is_end = frame.metadata.session_status() == SessionStatus::End;
@@ -330,6 +345,29 @@ mod tests {
         let mut sr = StreamReader::from_reader(create_test_reader(buf), sid);
         let result = sr.read().await.unwrap();
         assert_eq!(result.to_vec(), b"stream data");
+    }
+
+    #[tokio::test]
+    async fn test_stream_reader_payload_direct_into_pool_buffer() {
+        // P1-1 直读路径指纹：payload 必须落在池化 8KB 层 Buffer。旧实现出口
+        // Buffer::with_capacity(payload_len) 容量恒等于 payload 长度（绕池）。
+        let sid = 7u16;
+        let metadata = FrameMetadata::new_session(sid, make_tcp_dest());
+        let data = vec![0xA5u8; 4096];
+        let mut buf = Vec::new();
+        metadata.write_to(&mut buf).unwrap();
+        buf.extend_from_slice(&write_uint16(data.len() as u16));
+        buf.extend_from_slice(&data);
+        let mut sr = StreamReader::from_reader(create_test_reader(buf), sid);
+        let result = sr.read().await.unwrap();
+        assert_eq!(result.to_vec(), data);
+        let buffers = result.into_buffers();
+        assert_eq!(buffers.len(), 1);
+        assert_eq!(
+            buffers[0].capacity(),
+            8192,
+            "payload 必须直接落池化 8KB 层（wire→池化 Buffer 零中间 Vec）"
+        );
     }
 
     #[tokio::test]

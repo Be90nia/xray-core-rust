@@ -19,12 +19,12 @@
 //! - 16 个 → alert：tier=32（**默认值**）
 //! - 全部不发 alert：tier=MaxInt（服务端永不拒）
 //!
-//! 对应 Go `record_detect.go:175-188` 四档：1/16/32/MaxInt。本仓复刻仅做
-//! `MaxCSSMsgCount` 探测（半件），不做 post-handshake record 长度模仿
-//! （`PostHandshakeRecordDetectConn` —— Go 端用 `utls.UConn` 拦截 raw record，
-//! btls 仓库当前无 `post_handshake` API，**需 vendor patch 或换 rustls 写回调**，
-//! CONDITIONAL 状态）。accept_when_disabled 已留 `if config.Show` 风格的 `tracing::debug!`
-//! 占位，未对接 service.rs 消费。
+//! 对应 Go `record_detect.go:175-188` 四档：1/16/32/MaxInt。本仓复刻两件：
+//! `MaxCSSMsgCount` 探测（CCS tier）与 post-handshake record 长度列表探测
+//! （`PostHandshakeRecordDetectConn` 等价，见 [`detect_post_handshake_record_lens`]）。
+//! Go 端用 `utls.UConn` 的 Read/Write hook 拦截 raw record；Rust 侧握手完成后
+//! 直接从共享 fd 的 raw TCP 读（btls BIO 握手后不主动 read，fd 接收缓冲不被
+//! 消费——与 [`detect_one`] 的 peek 论证相同）。
 //!
 //! # 实现细节
 //!
@@ -47,9 +47,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use xray_tls::btls_client::BtlsConn;
 use xray_tls::fingerprint::{get_fingerprint, Fingerprint};
 use xray_transport::connection::{Connection, TcpConnection};
@@ -89,14 +89,18 @@ pub struct ProbeKey {
     pub alpn: AlpnId,
 }
 
-/// 全局探测结果表（Go `GlobalMaxCSSMsgCount sync.Map` 等价物）。
+/// 全局探测结果表（Go `GlobalMaxCSSMsgCount` + `GlobalPostHandshakeRecordsLens`
+/// 两个 sync.Map 等价物，key 相同故合一）。
 ///
-/// 启动期 `detect_max_useless_records` 写入；握手期 `probe_for_key` 读取。
+/// 启动期 `detect_max_useless_records` / [`detect_post_handshake_record_lens`]
+/// 写入；握手期 `probe_for_key` / [`record_lens_for_key`] 读取。
 /// `Mutex<HashMap>` 简化：探测数量 = len(dest) × len(server_names) × 3 个 key，
 /// 单 listener 写一次；读侧几乎 O(1)。sync.Map 用不上。
 #[derive(Debug, Default, Clone)]
 pub struct ProbeTable {
     inner: Arc<Mutex<HashMap<ProbeKey, MaxUselessRecords>>>,
+    /// dest 主动发的后握手 type23 记录长度列表（含 5B header，Go `record_detect.go:126`）。
+    lens: Arc<Mutex<HashMap<ProbeKey, Vec<u32>>>>,
 }
 
 impl ProbeTable {
@@ -122,6 +126,20 @@ impl ProbeTable {
     #[must_use]
     pub fn len(&self) -> usize {
         self.inner.lock().len()
+    }
+
+    /// 写入 dest 后握手记录长度列表（Go `GlobalPostHandshakeRecordsLens.Store`）。
+    pub fn insert_record_lens(&self, key: ProbeKey, lens: Vec<u32>) {
+        self.lens.lock().insert(key, lens);
+    }
+
+    /// 查询记录长度列表（Go `tls.go:414` `Load(key)` 等价）。
+    ///
+    /// `None` = 表中无此 key（探测中或未启用）；`Some(空)` = 探测完成但 dest
+    /// 未主动发 type23 记录（Go `record_detect.go:139` 存空切片语义）。
+    #[must_use]
+    pub fn record_lens_for_key(&self, key: &ProbeKey) -> Option<Vec<u32>> {
+        self.lens.lock().get(key).cloned()
     }
 }
 
@@ -321,6 +339,133 @@ pub fn probe_for_key(table: &ProbeTable, key: &ProbeKey) -> Option<MaxUselessRec
     table.get(key)
 }
 
+/// Go `record_detect.go:5s ReadDeadline` 窗口（`record_detect.go:128`）。
+const RECORD_LENS_READ_WINDOW: Duration = Duration::from_secs(5);
+/// 单次记录长度探测整体护栏（TCP/握手挂死兜底，与 [`DETECT_TIMEOUT`] 同理）。
+const RECORD_LENS_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 解析 dest 主动发的连续 type23（ApplicationData）记录长度列表。
+///
+/// 逐字对齐 Go `record_detect.go:124-139`：
+/// - 头 3 字节 `{23, 3, 3}` 且至少 5 字节才认；否则 break；
+/// - `length = BigEndian(data[3:5]) + 5`（**含 5B header**）；
+/// - `length > len(data)` = illegal data，break（已收集的保留）。
+///
+/// 返回列表**可为空**——空列表是有效探测结论（dest 未主动发 type23），
+/// 消费侧 gate 据此恒不发 mirror。
+fn parse_post_handshake_record_lens(mut data: &[u8]) -> Vec<u32> {
+    let mut lens = Vec::new();
+    while data.len() >= 5 && data[..3] == [23, 3, 3] {
+        let length = u16::from_be_bytes([data[3], data[4]]) as usize + 5;
+        if length > data.len() {
+            break; // illegal data
+        }
+        lens.push(length as u32);
+        data = &data[length..];
+    }
+    lens
+}
+
+/// 单 key 记录长度探测（Go `PostHandshakeRecordDetectConn` 等价）。
+///
+/// - 握手（uTLS 同款指纹/ALPN 形态）→ Go `record_detect.go:80-83`；
+/// - Go 的 `CcsSent` hook 在客户端写出 compat CCS（`{20,3,3}` 开头）后激活
+///   读取——TLS 1.3 客户端握手尾必发该记录，btls（BoringSSL）同样，因此
+///   **握手返回 = CCS 已写出**，直接进入 raw 读窗口；
+/// - raw 读窗口 5 秒（Go `SetReadDeadline` + `io.ReadAll`，`record_detect.go:127-130`）
+///   后按 [`parse_post_handshake_record_lens`] 解析。
+///
+/// `None` = TCP/握手/克隆失败（对齐 Go 直接 return，由 spawn 层 defer 存空列表）。
+async fn detect_one_record_lens_inner(
+    dest: &str,
+    server_name: &str,
+    alpn: AlpnId,
+) -> Option<Vec<u32>> {
+    let tcp = TcpStream::connect(dest).await.ok()?;
+    let conn = TcpConnection::new(tcp);
+    let fp = match alpn {
+        AlpnId::None => Fingerprint::RandomizedNoAlpn,
+        AlpnId::Http11 | AlpnId::H2 => get_fingerprint("chrome").ok()?,
+    };
+    let tls_conn = BtlsConn::connect_with_alpn(conn, server_name, fp, None, None, alpn_wire(alpn))
+        .await
+        .ok()?;
+    let mut raw = tls_conn.raw_tcp_clone()?;
+
+    let mut data = Vec::new();
+    let mut buf = [0u8; 4096];
+    let window = Instant::now() + RECORD_LENS_READ_WINDOW;
+    loop {
+        match timeout_at(window, raw.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => data.extend_from_slice(&buf[..n]),
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+    Some(parse_post_handshake_record_lens(&data))
+}
+
+/// 启动期对每组 (dest, sni, alpn_id) 探测 dest 主动发的后握手记录长度列表，
+/// 写入 [`ProbeTable::insert_record_lens`]（Go `DetectPostHandshakeRecordsLens`、
+/// `tcp/hub.go:79` 等价）。
+///
+/// 与 [`detect_max_useless_records`] 平行：同 key 两路独立 TCP 探测（Go 同样
+/// 两个 goroutine，`record_detect.go:26/56`）。完成态**恒写表**（Go
+/// `LoadOrStore(key,false)` 占位 + defer 兜底，`record_detect.go:25-32`）：
+/// 成功 = 解析列表；失败/超时 = 空列表（gate 判"不发"，等价 Go 消费侧
+/// 对 `[]int{}` 不重放）。
+pub fn detect_post_handshake_record_lens(
+    table: ProbeTable,
+    dest: String,
+    server_names: Vec<String>,
+    dest_type: String,
+    xver: u8,
+) {
+    // 与 detect_max_useless_records 同款护栏：非 tcp / xver!=0 时两路一起跳过
+    //（Go 无此护栏，靠 dial 失败 → defer 空列表达成同一 gate 结论）。
+    if dest_type != "tcp" {
+        tracing::warn!(
+            target: "xray_reality::probe",
+            dest_type,
+            "REALITY record-lens probe only supports tcp dialer, skipping detection"
+        );
+        return;
+    }
+    if xver != 0 {
+        tracing::warn!(
+            target: "xray_reality::probe",
+            xver,
+            "REALITY record-lens probe with PROXY protocol (xver!=0) not implemented, skipping detection"
+        );
+        return;
+    }
+
+    for sni in server_names {
+        for alpn in [AlpnId::None, AlpnId::Http11, AlpnId::H2] {
+            let key = ProbeKey {
+                dest: dest.clone(),
+                server_name: sni.clone(),
+                alpn,
+            };
+            if table.record_lens_for_key(&key).is_some() {
+                continue;
+            }
+            let table_inner = table.lens.clone();
+            let dest_c = dest.clone();
+            let sni_c = sni.clone();
+            tokio::spawn(async move {
+                let lens =
+                    timeout(RECORD_LENS_TIMEOUT, detect_one_record_lens_inner(&dest_c, &sni_c, alpn))
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                table_inner.lock().insert(key, lens);
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,5 +607,110 @@ mod tests {
         const CCS_RECORD_LEN: usize = 6;
         let msg = [0x14u8, 0x03, 0x03, 0x00, 0x01, 0x01];
         assert_eq!(msg.len(), CCS_RECORD_LEN);
+    }
+
+    // ---- parse_post_handshake_record_lens：Go record_detect.go:124-139 三态 ----
+
+    fn app_record(payload_len: usize) -> Vec<u8> {
+        // type23 record：{23,3,3} + BE16(payload_len) + payload
+        let mut v = vec![23, 3, 3];
+        v.extend_from_slice(&(payload_len as u16).to_be_bytes());
+        v.extend(std::iter::repeat_n(0xa5u8, payload_len));
+        v
+    }
+
+    /// 非空列表：dest 连发两条 type23 → 长度（含 header）按序收集。
+    #[test]
+    fn parse_lens_nonempty_list() {
+        let mut data = app_record(16);
+        data.extend(app_record(48));
+        assert_eq!(parse_post_handshake_record_lens(&data), vec![21, 53]);
+    }
+
+    /// 空列表：无数据（EOF 即断）/ 首 record 非 type23 → 恒空（gate 恒不发）。
+    #[test]
+    fn parse_lens_empty_list() {
+        assert!(parse_post_handshake_record_lens(&[]).is_empty());
+        // Go bytes.Equal(data[:3], {23,3,3}) 不成立即 break：alert / CCS / 握手尾
+        for head in [[0x15u8, 3, 3], [0x14u8, 3, 3], [0x16u8, 3, 3]] {
+            let mut data = head.to_vec();
+            data.extend_from_slice(&[0, 2, 1, 2]);
+            assert!(
+                parse_post_handshake_record_lens(&data).is_empty(),
+                "head {head:?} must not yield lens"
+            );
+        }
+        // 不足 5 字节也 break
+        assert!(parse_post_handshake_record_lens(&[23, 3, 3]).is_empty());
+    }
+
+    /// illegal data（声明长度 > 剩余字节）→ break，已收集的保留（Go :130-132）。
+    #[test]
+    fn parse_lens_truncated_tail_keeps_collected() {
+        let mut data = app_record(16);
+        // 声明 payload 100 但只给 3 字节
+        data.extend_from_slice(&[23, 3, 3, 0, 100, 1, 2, 3]);
+        assert_eq!(parse_post_handshake_record_lens(&data), vec![21]);
+    }
+
+    /// 首条 type23 之后的非 type23 尾巴停止解析（如 dest 发完记录再发 alert）。
+    #[test]
+    fn parse_lens_stops_at_non_app_record() {
+        let mut data = app_record(16);
+        data.extend_from_slice(&[0x15, 3, 3, 0, 2, 1, 0]); // alert
+        assert_eq!(parse_post_handshake_record_lens(&data), vec![21]);
+    }
+
+    #[test]
+    fn record_lens_table_insert_get() {
+        let t = ProbeTable::new();
+        let key = ProbeKey {
+            dest: "example.com:443".into(),
+            server_name: "example.com".into(),
+            alpn: AlpnId::H2,
+        };
+        assert!(t.record_lens_for_key(&key).is_none(), "miss = 探测中/未启用");
+        t.insert_record_lens(key.clone(), Vec::new());
+        assert_eq!(t.record_lens_for_key(&key), Some(Vec::new()), "空列表 = dest 不发 type23");
+        t.insert_record_lens(key.clone(), vec![21, 53]);
+        assert_eq!(t.record_lens_for_key(&key), Some(vec![21, 53]));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detect_record_lens_skips_non_tcp_dest() {
+        let t = ProbeTable::new();
+        detect_post_handshake_record_lens(
+            t.clone(),
+            "127.0.0.1:1".into(),
+            vec!["localhost".into()],
+            "unix".into(),
+            0,
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(t.record_lens_for_key(&ProbeKey {
+            dest: "127.0.0.1:1".into(),
+            server_name: "localhost".into(),
+            alpn: AlpnId::None
+        })
+        .is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detect_record_lens_skips_when_xver_nonzero() {
+        let t = ProbeTable::new();
+        detect_post_handshake_record_lens(
+            t.clone(),
+            "127.0.0.1:1".into(),
+            vec!["localhost".into()],
+            "tcp".into(),
+            1,
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(t.record_lens_for_key(&ProbeKey {
+            dest: "127.0.0.1:1".into(),
+            server_name: "localhost".into(),
+            alpn: AlpnId::None
+        })
+        .is_none());
     }
 }
