@@ -219,6 +219,10 @@ where
         .http1()
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(READ_HEADER_TIMEOUT);
+    // r2lq：默认 ALPN=["h2","http/1.1"]（xray-tls server_config.rs:246）时协商
+    // 走 h2；无显式 .http2() 时 h2 路径落默认 Builder（Time::Empty），依赖 timer
+    // 的路径 panic / 行为不完整。Go hub.go:564-578 同一 http.Server 启 h1+h2。
+    builder.http2().timer(hyper_util::rt::TokioTimer::new());
     // ponytail: Go hub.go:571 MaxHeaderBytes（GetNormalizedServerMaxHeaderBytes）无
     // hyper 字节级对应（仅 max_headers 条数），默认值即 Go 默认 1MiB 量级，未接入。
     let _ = builder.serve_connection(io, svc).await;

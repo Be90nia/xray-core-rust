@@ -41,9 +41,11 @@ GO_CROSS_PROTOS = PROTOS
 # Rust 客户端连 Go 服务端反向：补 26zn 战役暴露盲区（只测了 Rust→Rust 与 Go→Rust，
 # 缺 Rust→Go 方向验证）。同一组 6 协议复用 build() —— Go 与 Rust 服务端读同份配置。
 RUST_TO_GO_PROTOS = PROTOS
-# 新协议套件：splithttp/grpc/reality 三件必交付，hysteria2/anytls/tuic/naive 尽力。
+# 新协议套件：splithttp/grpc/reality 三件必交付，hysteria2/anytls/tuic 尽力。
+# naive 摘出默认套件（bd 88vp）：Rust 无 naive inbound（xray-transport-naive
+# outbound-only），si 起不来必挂；inbound 实现后经 --extra-protos naive 加回。
 # 每个 proto 各跑 Rust↔Rust + Go→Rust + Rust→Go 三方向 = 3 测。
-EXTRA_PROTOS = ['splithttp', 'grpc', 'reality', 'hysteria2', 'anytls', 'tuic', 'naive']
+EXTRA_PROTOS = ['splithttp', 'grpc', 'reality', 'hysteria2', 'anytls', 'tuic']
 BASE_PORT = 18100
 IS_WIN = os.name == 'nt'
 EXE = '.exe' if IS_WIN else ''
@@ -158,6 +160,11 @@ def build(proto, P):
 # streamSettings 复用 tls_cli/tls_srv (pin 双向统一证书)。
 _REALITY_KEYS = None  # (priv_b64, pub_b64, short_id) 一次生成, 全套共享
 
+
+def _pem(path):
+    with open(path) as f:
+        return f.read()
+
 def _ensure_reality_keys():
     global _REALITY_KEYS
     if _REALITY_KEYS is None:
@@ -241,19 +248,13 @@ def build_x(proto, P):
         # 主动发首字节, 不像 vision/tls 是 passive. local echo 仍可 (TCP) 但
         # dest 需改 TCP 端口. 标尽力项, 失败在 doc 记录.
         auth_pw = 'hy2-secret-passphrase'
-        ss_srv = {"network": "hysteria2", "security": "tls",
-                  "hysteria2Settings": {"version": 2, "password": auth_pw},
-                  "tlsSettings": tls_srv()}
-        ss_cli = {"network": "hysteria2", "security": "tls",
-                  "hysteria2Settings": {"version": 2, "password": auth_pw},
-                  "tlsSettings": {"serverName": "localhost", **tls_cli()}}
-        si = {"port": P, "listen": "127.0.0.1", "protocol": "vless",
-              "settings": {"clients": [{"id": UUID}], "decryption": "none"},
-              "streamSettings": ss_srv}
-        # Rust vless outbound 不接 network=hysteria2 (crates/xray-core/src/outbound.rs:757
-        # 仅 tcp/ws/grpc/splithttp/httpupgrade) — 客户端独立 hysteria outbound,
+        # 独立协议 inbound (xray-core "hysteria" arm: parse_hysteria_inbound_config
+        # 消费 version/auth/cert/key PEM 内容); QUIC/UDP 端口, run_x_one 走 udp 探测.
+        si = {"port": P, "listen": "127.0.0.1", "protocol": "hysteria",
+              "settings": {"version": 2, "auth": auth_pw,
+                           "cert": _pem(CERT), "key": _pem(KEY)}}
+        # 客户端独立 hysteria outbound,
         # settings JSON 对齐 parse_hysteria_config (outbound.rs:2353): {version, servers[]}.
-        # 服务端 si (vless+network=hysteria2) 由别任务修产品代码 (bd upe1 等).
         co = {"protocol": "hysteria",
               "settings": {"version": 2,
                            "servers": [{"address": "127.0.0.1", "port": P,
@@ -261,16 +262,12 @@ def build_x(proto, P):
     elif proto == 'anytls':
         # anytls 协议对 dest 行为: 透明代理 (类似 vision); 用本地 echo 当 dest.
         auth_pw = 'anytls-secret'
-        ss_srv = {"network": "anytls", "security": "tls",
-                  "anytlsSettings": {"password": auth_pw},
-                  "tlsSettings": tls_srv()}
-        ss_cli = {"network": "anytls", "security": "tls",
-                  "anytlsSettings": {"password": auth_pw},
-                  "tlsSettings": {"serverName": "localhost", **tls_cli()}}
-        si = {"port": P, "listen": "127.0.0.1", "protocol": "vless",
-              "settings": {"clients": [{"id": UUID}], "decryption": "none"},
-              "streamSettings": ss_srv}
-        # Rust vless outbound 不接 network=anytls — 客户端独立 anytls outbound,
+        # 独立协议 inbound (xray-core "anytls" arm: parse_anytls_tls_acceptor
+        # 消费 cert/key PEM 内容 + password).
+        si = {"port": P, "listen": "127.0.0.1", "protocol": "anytls",
+              "settings": {"cert": _pem(CERT), "key": _pem(KEY),
+                           "password": auth_pw}}
+        # 客户端独立 anytls outbound,
         # settings JSON 对齐 parse_anytls_config (outbound.rs:2232): 顶层 server/
         # server_port/sni/insecure/password (无 servers 数组, 不同于 hysteria/tuic).
         # anytls 协议自持 TLS (出站 dispatcher 不消费 streamSettings.network/security).
@@ -282,45 +279,39 @@ def build_x(proto, P):
         # TUIC v5 over QUIC; dest 行为: UDP+TCP 代理; 需 QUIC stack 双向兼容.
         uuid = UUID
         _tuic_pw = 'tuic-pw'
-        ss_srv = {"network": "tuic", "security": "tls",
-                  "tuicSettings": {"users": [{"uuid": uuid, "password": _tuic_pw}]},
-                  "tlsSettings": tls_srv()}
         ss_cli = {"network": "tuic", "security": "tls",
                   "tuicSettings": {"users": [{"uuid": uuid, "password": _tuic_pw}],
                                    "server": "127.0.0.1", "server_port": P,
                                    "congestion_control": "cubic"},
                   "tlsSettings": {"serverName": "localhost", **tls_cli()}}
-        # TUIC inbound settings 走 v 字段顶层 uuid/password (xray-core parse_tuic_inbound_settings)
+        # 独立协议 inbound (xray-core "tuic" arm): settings 顶层 uuid/password +
+        # certificate/certificateKey PEM 内容 (parse_tuic_inbound_settings;
+        # 缺省则 rcgen 自签, 与客户端 pin 不符). QUIC/UDP 端口, run_x_one 走 udp 探测.
         si = {"port": P, "listen": "127.0.0.1", "protocol": "tuic",
-              "settings": {"uuid": uuid, "password": _tuic_pw},
-              "streamSettings": ss_srv}
+              "settings": {"uuid": uuid, "password": _tuic_pw,
+                           "certificate": _pem(CERT), "certificateKey": _pem(KEY)}}
         co = {"protocol": "tuic", "settings": {"servers": [
             {"address": "127.0.0.1", "port": P, "uuid": uuid, "password": _tuic_pw,
              "congestion_control": "cubic"}]},
               "streamSettings": ss_cli}
     elif proto == 'naive':
-        # naive = HTTPS 前置代理 + 上层协议 (vless+tcp); dest=本地 echo 即可.
-        # Go 配置上 naive 通常是 outbound; inbound 通常是 dokodemo/socks/http.
-        # 本地验证: server=dokodemo+naive 配置, client=naive+VLESS over naive.
-        # 暂以标准 vless+naive 简化:
-        ss_srv = {"network": "naive", "security": "tls",
-                  "naiveSettings": {"method": "vless", "protocol": "vless", "uuid": UUID},
-                  "tlsSettings": tls_srv()}
-        ss_cli = {"network": "naive", "security": "tls",
-                  "naiveSettings": {"method": "vless", "protocol": "vless", "uuid": UUID,
-                                    "server": "127.0.0.1", "server_port": P},
-                  "tlsSettings": {"serverName": "localhost", **tls_cli()}}
-        si = {"port": P, "listen": "127.0.0.1", "protocol": "vless",
-              "settings": {"clients": [{"id": UUID}], "decryption": "none"},
-              "streamSettings": ss_srv}
-        # Rust vless outbound 不接 network=naive — 客户端独立 naive outbound,
+        # naive = HTTPS2 CONNECT 前置代理 (naiveproxy 语义). 独立协议 inbound
+        # 形态 (sing-box naive server 惯例: users name/pass + TLS); Rust 暂无
+        # naive inbound (xray-transport-naive outbound-only), Rust<->Rust 用例
+        # 会因 server 端 not-yet-supported skip 而失败——形态先就位, 立项后即跑.
+        si = {"port": P, "listen": "127.0.0.1", "protocol": "naive",
+              "settings": {"users": [{"name": "user", "pass": "pass"}]},
+              "streamSettings": {"network": "tcp", "security": "tls",
+                                 "tlsSettings": tls_srv()}}
+        # 客户端独立 naive outbound,
         # settings JSON 对齐 parse_naive_config (outbound.rs:2284 → NaiveConfig::
-        # from_json): 顶层 server/port/sni/username/password/fingerprint (无 servers
-        # 数组, 不同于 hysteria/tuic).
+        # from_json): 顶层 server/port/sni/username/password/fingerprint + 证书
+        # pin (NaiveConfig 消费 pinnedPeerCertSha256, 服务端 openssl 自签证书).
         co = {"protocol": "naive",
               "settings": {"server": "127.0.0.1", "port": P,
                            "sni": "localhost", "username": "user",
-                           "password": "pass", "fingerprint": "chrome"}}
+                           "password": "pass", "fingerprint": "chrome",
+                           "pinnedPeerCertSha256": PIN}}
     else:
         raise ValueError(proto)
     return si, co
@@ -339,14 +330,26 @@ def kill_bins(*paths):
             pass
 
 
-def wait_port(port, deadline_s):
+def wait_port(port, deadline_s, udp=False):
+    """TCP: connect 探测. UDP (QUIC 系协议 hysteria/tuic): bind 同端口探测——
+    bind 失败 (EADDRINUSE) = 端口已被 server 占用; TCP connect 对 UDP 端口恒失败."""
     end = time.time() + deadline_s
     while time.time() < end:
-        try:
-            with socket.create_connection(('127.0.0.1', port), timeout=1):
-                return True
-        except OSError:
-            time.sleep(0.25)
+        if udp:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.bind(('127.0.0.1', port))
+            except OSError:
+                return True  # 已被占用 = 有监听者
+            finally:
+                s.close()
+        else:
+            try:
+                with socket.create_connection(('127.0.0.1', port), timeout=1):
+                    return True
+            except OSError:
+                pass
+        time.sleep(0.25)
     return False
 
 
@@ -438,9 +441,14 @@ def run_one(idx, proto, server_bin, client_bin, tag, work, dry=False):
 
 
 def _start_echo(port, work, idx):
-    """本地 TCP echo, 真实回写所有收到的字节. REALITY dest 必盲区: 不能指回 vless
-    端口, 所以 dest 指向一个 echo 当作 '外层 fallback 站点'. 跨平台."""
+    """本地 TLS echo (真证书握手 + 回写应用数据). REALITY dest 必盲区: 不能指回
+    vless 端口; 且 Go REALITY 服务端握手依赖 dest 返回合法 ServerHello
+    (reality tls.go:357 MirrorConn.Read 镜像客户端字节给 dest)——裸 TCP echo
+    会把 ClientHello 原样回显, Go 服务端校验 s2cSaved[5]!=ServerHello 后把回显
+    转发给客户端, BoringSSL 报 UNEXPECTED_MESSAGE (bd civv #33 根因).
+    Rust REALITY 服务端不依赖 dest, TLS 包装对其无影响. 跨平台."""
     import threading
+    import ssl as _ssl
 
     def loop():
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -448,21 +456,28 @@ def _start_echo(port, work, idx):
         srv.bind(('127.0.0.1', port))
         srv.listen(64)
         srv.settimeout(30)
+        ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = _ssl.TLSVersion.TLSv1_3
+        ctx.load_cert_chain(CERT, KEY)
         while True:
             try:
                 cli, _ = srv.accept()
             except (socket.timeout, OSError):
                 break
-            threading.Thread(target=lambda c: _echo_serve(c), args=(cli,), daemon=True).start()
+            threading.Thread(target=lambda c: _echo_serve(ctx, c), args=(cli,), daemon=True).start()
 
-    def _echo_serve(c):
+    def _echo_serve(ctx, c):
         try:
             c.settimeout(20)
+            try:
+                tls = ctx.wrap_socket(c, server_side=True)
+            except (_ssl.SSLError, OSError):
+                return
             while True:
-                data = c.recv(65536)
+                data = tls.recv(65536)
                 if not data:
                     break
-                c.sendall(data)
+                tls.sendall(data)
         except (socket.timeout, OSError):
             pass
         finally:
@@ -513,7 +528,8 @@ def run_x_one(idx, proto, server_bin, client_bin, tag, work, dry=False):
                               stderr=subprocess.STDOUT, env=env)
         slog.close()
         procs.append(ps)
-        if not wait_port(P, 15):
+        # hysteria/tuic 是 QUIC/UDP-only 监听, TCP connect 探测恒假失败
+        if not wait_port(P, 15, udp=proto in ('hysteria2', 'tuic')):
             err = 'server 未监听 %d (15s)' % P
         else:
             clog = open(os.path.join(work, 'c%d.log' % idx), 'wb')

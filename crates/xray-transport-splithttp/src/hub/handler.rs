@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::TryStreamExt;
@@ -46,6 +47,10 @@ pub struct HandlerContext {
 }
 
 const DUPLEX_BUF: usize = 64 * 1024;
+
+/// packet-up 单请求 liveness 兜底：body 收取 / queue push 卡死时超时回错误状态，
+/// 避免整条 h2 连接静默挂死（r2lq）。
+const PACKET_UP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 主请求入口。对应 Go `requestHandler.ServeHTTP`。
 ///
@@ -269,22 +274,22 @@ where
         Err(_) => return status_response(StatusCode::INTERNAL_SERVER_ERROR),
     };
 
-    let payload = match extract_packet_payload(req, ctx).await {
-        Ok(p) => p,
-        Err(st) => return status_response(st),
-    };
+    let payload =
+        match tokio::time::timeout(PACKET_UP_TIMEOUT, extract_packet_payload(req, ctx)).await {
+            Ok(Ok(p)) => p,
+            Ok(Err(st)) => return status_response(st),
+            Err(_) => return status_response(StatusCode::REQUEST_TIMEOUT),
+        };
 
     if payload.len() > ctx.sc_max_each_post_bytes {
         return status_response(StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     let session = ctx.sessions.upsert(session_id, ctx.max_buffered_posts).await;
-    if session
-        .upload_queue
-        .push(Packet::new(payload, seq))
-        .await
-        .is_err()
-    {
+    let push =
+        tokio::time::timeout(PACKET_UP_TIMEOUT, session.upload_queue.push(Packet::new(payload, seq)))
+            .await;
+    if !matches!(push, Ok(Ok(()))) {
         return status_response(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
