@@ -487,7 +487,8 @@ struct VerifiedHandshake {
     max_useless_records: u32,
     /// dest 主动发的后握手 type23 记录长度列表（bd 26zn：Go `tls.go:414-416`
     /// `GlobalPostHandshakeRecordsLens.Load(key)` 等价；空 = dest 未主动发
-    /// type23 / 未启用探测 / 查表 miss，mirror 恒不发）。
+    /// type23 / 未启用探测 / 查表 miss）。gate 判定保留为未来接线点；发送体
+    /// 已删（方案 B，见 [`server_tls_btls`] 处置记录），gate 命中现仅记日志。
     mirror_record_lens: Vec<u32>,
 }
 
@@ -655,6 +656,7 @@ where
 /// VLESS 数据流（REALITY 客户端 TLS 栈把 mirror 当 app data 交付上层，
 /// curl 3/3 失败）。现 gate = 记录长度列表非空（`tls.go:414-416` 语义），
 /// tier 与 mirror gate 解耦（tier 只喂 `maxUselessRecords` 上限消费）。
+/// Rust 侧 gate 命中亦**不发**（bd 26zn 方案 B，见下方处置记录）。
 
 /// REALITY 服务端握手（btls/BoringSSL opt-in 路径，bd tce2）。
 ///
@@ -663,22 +665,21 @@ where
 /// （Invalid → 调用方 [`fallback_to_dest`]）；差异仅在握手执行者：
 /// BoringSSL server SSL（[`xray_tls::btls_server::accept`]）。
 ///
-/// # bd 26zn：后握手记录模仿（消费点）
+/// # bd 26zn：后握手记录模仿（方案 B 处置记录）
 ///
-/// 握手完成后、连接交付前，按探测结果发一条模仿记录（Go reality
-/// tls.go:414-424：服务端把 dest 的后握手记录逐条重放给 REALITY 客户端，
-/// 使 REALITY 连接与 dest 直连的记录序列不可区分）。发送 gate（见
-/// [`crate::probe::detect_post_handshake_record_lens`] 文档）：
+/// Go reality tls.go:414-424 在探测确认 dest 主动发 type23 记录后，把 dest
+/// 的后握手记录逐条重放给 REALITY 客户端（使 REALITY 连接与 dest 直连的
+/// 记录序列不可区分）。
 ///
-/// - **列表非空**（探测确认 dest 主动发 type23 记录）→ 发。
-/// - **列表为空 / 查表 miss / 未启用探测** → 不发（Go 在 dest 列表为空时
-///   同样不重放；VPS 生产实测曾按「tier<MaxInt 即发」的保守做法发出
-///   mirror，因 REALITY 客户端 TLS 栈把 mirror 当 app data 交付上层而泄漏
-///   进 VLESS 数据流，curl 3/3 失败——CCS tier 证据 ≠ dest 发记录证据）。
-/// - 载荷：单条 type 23 application-data record（AEAD sealed），inner 明文
-///   = 48 字节零 padding，wire 总长 70B（5 header + 1 inner content-type
-///   + 48 payload + 16 tag）。Go 的长度来自真实探测 dest 记录；Rust 取
-///   保守常数。
+/// **Rust 侧发送体已删（bd 26zn 方案 B）**：gate 命中（`mirror_record_lens`
+/// 非空，判定结构保留，见 [`verify_and_probe`]）现在只记 debug 日志，不发
+/// 任何记录。原因：标准 `SSL_write` 语义是「明文 + 自动追加 inner
+/// content-type + AEAD tag」，无法构造「剥掉尾部 tag 的空记录」实现字节级
+/// 等价；逐条重放真实 dest 记录需要新的 btls 原语（bd z32z）。此前保守
+/// 实现发 48B 零 padding（wire 70B 单记录），被 REALITY 客户端 TLS 栈当
+/// app data 交付上层泄漏进 VLESS 数据流（VPS 生产实测 curl 3/3 失败）——
+/// 等价原语落地前，静默污染比不发更糟。gate 判定保留为未来接线点 +
+/// 可观测性（本函数内 `tracing::debug!`）。
 ///
 /// # Errors
 ///
@@ -722,38 +723,18 @@ where
 
     let (cert_der, key_der) = generate_reality_ed25519_cert(&verified.auth_key)?;
     let prefixed = PrefixedReader::new(record, conn);
-    let mut tls = xray_tls::btls_server::accept(prefixed, &cert_der, &key_der)
+    let tls = xray_tls::btls_server::accept(prefixed, &cert_der, &key_der)
         .await
         .map_err(|e| RealityError::TlsHandshake(format!("btls accept: {e}")))?;
 
-    // bd 26zn：后握手记录模仿（条件见函数文档）。
-    // 发送 gate = dest 记录长度列表非空（Go tls.go:414-416 语义）。
+    // bd 26zn（方案 B）：发送 gate 判定保留（未来接线点 + 可观测性），
+    // 发送体已删——见函数文档处置记录。
     if !verified.mirror_record_lens.is_empty() {
-        // 48B 零 padding；TLS 1.3 SSL_write 在其外自动加 inner content-type(1)
-        // 与 AEAD tag(16)，wire = 5+1+48+16 = 70B 单记录。
-        //
-        // 发送走 tokio poll 写路径而非 [`xray_tls::btls_reality::
-        // send_post_handshake_record`]：该原语内部裸调 SSL_write，会在
-        // tokio-btls 的 BIO 桥接外触发（StreamWrapper.context==0 → debug
-        // assert panic）——原语面向非 tokio BIO 场景（Go 兼容宿主）。tokio
-        // 写路径对 48B（<< max_send_fragment 16KB）同样保证单记录 + type 23
-        // + AEAD，与 Go tls.go:414-424 的逐记录重放语义一致。
-        let payload = [0u8; 48];
-        use tokio::io::AsyncWriteExt;
-        match tls.write_all(&payload).await {
-            Ok(()) => {
-                let _ = tls.flush().await;
-                tracing::debug!(
-                    max_useless_records = verified.max_useless_records,
-                    "reality btls: sent post-handshake mirror record"
-                );
-            }
-            Err(e) => {
-                // 模仿记录发送失败不终止连接（REALITY 数据面不受影响），
-                // 但不静默：debug 记录原因。
-                tracing::debug!(error = %e, "reality btls: post-handshake mirror record write failed");
-            }
-        }
+        tracing::debug!(
+            lens = verified.mirror_record_lens.len(),
+            "reality btls: post-handshake mirror suppressed (send path removed, bd 26zn; \
+             byte-level equivalence pending new btls primitive, bd z32z)"
+        );
     }
 
     Ok(RealityServerOutcome::Verified {
@@ -2430,12 +2411,60 @@ mod tests {
 
     // ===== bd tce2：btls server acceptor =====
 
+    /// wire tap：包装服务端连接，记录全部写出字节（bd 26zn 反向断言用：
+    /// gate 命中也不得有 mirror 记录上 wire）。
+    struct WireTap<S> {
+        inner: S,
+        written: std::sync::Arc<parking_lot::Mutex<Vec<u8>>>,
+    }
+
+    impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for WireTap<S> {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for WireTap<S> {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            match std::pin::Pin::new(&mut this.inner).poll_write(cx, buf) {
+                std::task::Poll::Ready(Ok(n)) => {
+                    this.written.lock().extend_from_slice(&buf[..n]);
+                    std::task::Poll::Ready(Ok(n))
+                }
+                other => other,
+            }
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
     /// btls 路径 loopback 共享装配：REALITY 客户端（u_client chrome btls 指纹）
     /// ↔ [`server_tls_btls`]。
     ///
     /// `probe_tier`：`Some(tier)` = 三档 alpn key 全插表（命中）并配非空记录
     /// 长度列表（mirror gate 就绪态）；`None` = 不启用探测（gate miss）。
-    /// 返回（客户端握手结果, 服务端 outcome）。
+    /// 返回（客户端握手结果, 服务端 outcome, 服务端 wire 写出字节 tap）。
     async fn btls_reality_loopback(
         probe_tier: Option<u32>,
     ) -> (
@@ -2446,7 +2475,8 @@ mod tests {
             >,
             tokio::time::error::Elapsed,
         >,
-        Result<RealityServerOutcome<tokio::io::DuplexStream>, RealityError>,
+        Result<RealityServerOutcome<WireTap<tokio::io::DuplexStream>>, RealityError>,
+        std::sync::Arc<parking_lot::Mutex<Vec<u8>>>,
     ) {
         ensure_crypto_provider();
         use std::time::Duration;
@@ -2473,6 +2503,11 @@ mod tests {
 
         let (client, server) = duplex(65536);
         let client = xray_transport::connection::DuplexConnection::new(client);
+        let wire = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let server = WireTap {
+            inner: server,
+            written: std::sync::Arc::clone(&wire),
+        };
 
         let probe_ctx = probe_tier.map(|tier| {
             let table = crate::probe::ProbeTable::new();
@@ -2489,7 +2524,7 @@ mod tests {
                 };
                 table.insert(key.clone(), tier);
                 // mirror gate 输入：非空列表 = 模拟探测确认 dest 主动发 type23
-                //（载荷长度取发送侧保守常数 70B wire，见 server_tls_btls 文档）。
+                //（发送体已删 bd 26zn，此输入现仅驱动 gate 命中日志与反向断言）。
                 table.insert_record_lens(key, vec![70]);
             }
             ProbeContext {
@@ -2516,7 +2551,7 @@ mod tests {
         let client_result =
             tokio::time::timeout(Duration::from_secs(10), u_client(client, state)).await;
         let server_result = server_task.await.unwrap();
-        (client_result, server_result)
+        (client_result, server_result, wire)
     }
 
     /// btls 路径 REALITY 全链：Verified（Btls 变体）+ 双向数据 roundtrip。
@@ -2524,7 +2559,7 @@ mod tests {
     async fn server_tls_btls_loopback_verified_roundtrip() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let (client_result, server_result) = btls_reality_loopback(None).await;
+        let (client_result, server_result, _wire) = btls_reality_loopback(None).await;
         // 服务端 outcome 解构（Verified 且 btls 变体）
         let RealityServerOutcome::Verified {
             tls: mut server_tls, ..
@@ -2546,27 +2581,52 @@ mod tests {
         assert_eq!(&buf, b"hello btls");
     }
 
-    /// bd 26zn：mirror gate 就绪（探测确认 dest 主动发 type23，列表非空）→
-    /// 握手完成后发后握手模仿记录；客户端 TLS 栈解密后读到 48B 零明文
-    /// （wire 70B 单记录的应用层投影）。
+    /// bd 26zn 方案 B：mirror 发送体已删（标准 SSL_write 无法构造剥尾空记录，
+    /// 字节级等价待新 btls 原语，见 bd z32z）。gate 就绪（探测确认 dest 主动
+    /// 发 type23，列表非空）也**不发** mirror。双断言：
+    /// 1. wire 无 mirror——gate 就绪与 gate miss 两次握手在服务端交付（accept
+    ///    返回）时刻的 wire 字节数相等（旧实现 gate 就绪会多一条 70B type23）；
+    /// 2. 客户端首读 = 真实响应（旧实现首读 = 48B 零 padding mirror）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn server_tls_btls_sends_post_handshake_mirror_on_probe_hit() {
-        use tokio::io::AsyncReadExt;
+    async fn server_tls_btls_suppresses_post_handshake_mirror() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let (client_result, server_result) = btls_reality_loopback(Some(16)).await;
-        match (client_result, server_result) {
-            (Ok(Ok(mut client)), Ok(RealityServerOutcome::Verified { .. })) => {
-                let mut buf = [0u8; 48];
-                tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut buf))
-                    .await
-                    .expect("mirror record should arrive within 5s")
-                    .expect("read mirror payload");
-                assert!(buf.iter().all(|&b| b == 0), "mirror payload must be zeros");
-            }
-            (Ok(Ok(_)), _) => panic!("server outcome not Verified"),
-            (Ok(Err(e)), _) => panic!("client u_client failed: {e:?}"),
-            (Err(_), _) => panic!("client u_client timeout"),
-        }
+        let (client_result, server_result, wire_gate_hit) = btls_reality_loopback(Some(16)).await;
+        let RealityServerOutcome::Verified {
+            tls: mut server_tls, ..
+        } = server_result.unwrap()
+        else {
+            panic!("server outcome not Verified");
+        };
+        let Ok(Ok(mut client)) = client_result else {
+            panic!("client u_client failed or timeout");
+        };
+
+        // 断言 1（快照在写任何 app data 之前）：gate 命中交付时 wire 上无
+        // mirror 附加字节。
+        let gate_hit_wire_len = wire_gate_hit.lock().len();
+
+        // 断言 2：服务端发真实响应，客户端首读必须就是它。
+        server_tls.write_all(b"real response").await.unwrap();
+        server_tls.flush().await.unwrap();
+        let mut buf = [0u8; 13];
+        tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut buf))
+            .await
+            .expect("real response should arrive within 5s")
+            .expect("read real response");
+        assert_eq!(
+            &buf, b"real response",
+            "client first read must be the real response, not mirror padding"
+        );
+
+        // gate miss 对照：两次握手 wire 字节数必须一致（mirror 若存在 =
+        // gate 命中侧多出 70B 单记录）。
+        let (_, _, wire_gate_miss) = btls_reality_loopback(None).await;
+        assert_eq!(
+            gate_hit_wire_len,
+            wire_gate_miss.lock().len(),
+            "gate hit wire must carry no mirror bytes vs gate miss"
+        );
     }
 
     /// 未启用探测（probe=None）→ 记录列表表 miss → 不发模仿记录（gate
@@ -2577,7 +2637,7 @@ mod tests {
     async fn server_tls_btls_no_mirror_without_probe_optin() {
         use tokio::io::AsyncReadExt;
 
-        let (client_result, server_result) = btls_reality_loopback(None).await;
+        let (client_result, server_result, _wire) = btls_reality_loopback(None).await;
         match (client_result, server_result) {
             (Ok(Ok(mut client)), Ok(RealityServerOutcome::Verified { .. })) => {
                 let mut buf = [0u8; 48];
