@@ -230,7 +230,7 @@ pub struct SocketOptions {
     /// TCP Fast Open。对应 Go `SocketConfig.Tfo`（Go `ParseTFOValue()` 三态在平台
     /// 模块以 `i32` 表达；bool `true` 映射为启用）。
     /// Linux（TCP_FASTOPEN_CONNECT）/ FreeBSD 12.1+ / Windows 10 1607+（Winsock
-    /// TCP_FASTOPEN=15，见 [`windows`] 模块）支持；macOS 用 CLIENT/SERVER 位标志。
+    /// TCP_FASTOPEN=15，见 `windows` 模块）支持；macOS 用 CLIENT/SERVER 位标志。
     pub tcp_fast_open: bool,
     /// Multipath TCP（MPTCP）。对应 Go `SocketConfig.TcpMptcp`（字段 19，JSON `tcpMptcp`）。
     /// 仅 Linux 生效；其他平台或不支持 MPTCP 的内核上静默回退普通 TCP
