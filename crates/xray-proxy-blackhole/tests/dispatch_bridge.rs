@@ -34,8 +34,6 @@ fn make_dest() -> Destination {
 
 #[tokio::test]
 async fn blackhole_dispatch_returns_http_403_then_drains() {
-    use xray_app_dispatcher::OutboundHandlerManager as _;
-
     // 1. 构造黑黑黑 blackhole outbound handler（Http403 响应）
     let cfg = Config {
         response: Some(xray_proto::xray::proxy::blackhole::Response {

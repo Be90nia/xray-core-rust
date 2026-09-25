@@ -6,7 +6,7 @@
 use std::{io, time::Duration};
 
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     select,
 };
 

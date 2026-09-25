@@ -109,7 +109,7 @@ impl SniCertResolver {
         let lower = sni.map(str::to_lowercase);
         // Go: !rejectUnknownSni && (len==1 || sni=="") → certs[0]
         if !self.reject_unknown
-            && (self.entries.len() == 1 || lower.as_deref().map_or(true, str::is_empty))
+            && (self.entries.len() == 1 || lower.as_deref().is_none_or(str::is_empty))
         {
             return Some(&self.entries[0]);
         }
@@ -459,7 +459,7 @@ fn client_ca_root_store(json: &serde_json::Value) -> io::Result<RootCertStore> {
 
 /// 从 PEM 字节解析全部证书。
 fn pem_certs(pem: &[u8]) -> io::Result<Vec<CertificateDer<'static>>> {
-    rustls_pemfile::certs(&mut pem.as_ref())
+    rustls_pemfile::certs(&mut &pem[..])
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| io::Error::other(format!("parse cert PEM: {e}")))
 }

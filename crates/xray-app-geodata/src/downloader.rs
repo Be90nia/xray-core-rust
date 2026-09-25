@@ -8,7 +8,7 @@ use std::{path::PathBuf, sync::Arc};
 use crate::{
     config::GeodataAsset,
     error::GeodataError,
-    swap::{Stage, Tx, clean, swap_all},
+    swap::{Stage, clean, swap_all},
 };
 
 /// 对应 Go `downloader.downloadOne`。
@@ -80,7 +80,7 @@ fn download_one<D: AssetDownloader + ?Sized>(
     asset: &GeodataAsset,
 ) -> Result<Stage, GeodataError> {
     let target = downloader.resolve_target(&asset.file)?;
-    let (target_str_suffix) = ".tmp";
+    let target_str_suffix = ".tmp";
     let (_file, temp) = crate::swap::temp_file(&target, target_str_suffix)?;
     drop(_file); // 我们用 path 模式，下载 trait 自己管理 fd
 
@@ -214,11 +214,7 @@ impl AssetDownloader for RealAssetDownloader {
     fn download_to(&self, url: &str, temp_path: &std::path::Path) -> Result<(), GeodataError> {
         let parsed = self.parse_url(url)?;
 
-        use std::{
-            io::{Read, Write},
-            net::TcpStream,
-            time::Instant,
-        };
+        use std::{io::Write, net::TcpStream, time::Instant};
 
         let addr = format!("{}:{}", parsed.host, parsed.port);
         let mut tcp = TcpStream::connect(&addr).map_err(|e| GeodataError::DownloadFailed {
@@ -295,7 +291,7 @@ fn read_http_body<R: std::io::Read>(
     temp_path: &std::path::Path,
     deadline: std::time::Instant,
 ) -> Result<(), GeodataError> {
-    use std::io::{Read, Write};
+    use std::io::Write;
 
     // 读 headers 到 \r\n\r\n。
     let mut header_buf = Vec::with_capacity(512);

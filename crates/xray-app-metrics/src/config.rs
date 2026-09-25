@@ -22,10 +22,7 @@ impl MetricsConfig {
 
     /// 转换为 prost message。
     pub fn to_proto(&self) -> ProtoConfig {
-        let mut out = ProtoConfig::default();
-        out.tag = self.tag.clone();
-        out.listen = self.listen.clone();
-        out
+        ProtoConfig { tag: self.tag.clone(), listen: self.listen.clone() }
     }
 
     /// 配置校验：tag 与 listen 至少一项非空。
@@ -54,9 +51,7 @@ mod tests {
 
     #[test]
     fn from_proto_copies_fields() {
-        let mut p = ProtoConfig::default();
-        p.tag = "metrics_out".into();
-        p.listen = "127.0.0.1:9090".into();
+        let p = ProtoConfig { tag: "metrics_out".into(), listen: "127.0.0.1:9090".into() };
         let c = MetricsConfig::from_proto(&p);
         assert_eq!(c.tag, "metrics_out");
         assert_eq!(c.listen, "127.0.0.1:9090");

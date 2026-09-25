@@ -79,20 +79,15 @@ fn rtt_deviation_cost(costs: Option<&WeightManager>, tag: &str, value: i64) -> f
 }
 
 /// Baseline 模式枚举。Go 不暴露此枚举；扩展为 Rust-only 三种策略变体。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BaselineMode {
     /// alive + RTT baselines + `costs` 加权（Go 等价）。
+    #[default]
     Availability,
     /// 滑动窗口 EMA 平滑 RTT-Deviation-Cost。
     Adaptive,
     /// ring hash + 虚拟节点。
     ConsistentHashing,
-}
-
-impl Default for BaselineMode {
-    fn default() -> Self {
-        BaselineMode::Availability
-    }
 }
 
 /// 最小负载负载均衡策略。
@@ -137,6 +132,9 @@ impl LeastLoadStrategy {
     ///
     /// `alpha` 仅 `Adaptive` 模式相关；`hash_key_seed` 仅 `ConsistentHashing` 模式相关。
     /// `vnodes` 仅 `ConsistentHashing` 模式相关。
+    // 参数面对齐 Go `conf.StrategyLeastLoadConfig` 构建路径；打包为参数结构属
+    // API 变更，保持现状。
+    #[allow(clippy::too_many_arguments)]
     pub fn with_mode(
         config: &StrategyLeastLoadConfig,
         selectors: Vec<String>,
@@ -289,8 +287,8 @@ impl LeastLoadStrategy {
         let mut count = 0usize;
         for baseline in &self.baselines {
             let baseline = *baseline as f64;
-            for i in count..available {
-                if nodes[i].rtt_deviation_cost >= baseline {
+            for (i, node) in nodes.iter().enumerate().take(available).skip(count) {
+                if node.rtt_deviation_cost >= baseline {
                     break;
                 }
                 count = i + 1;
@@ -323,7 +321,7 @@ impl LeastLoadStrategy {
             let new_score =
                 self.ema_alpha * node.rtt_deviation_cost + (1.0 - self.ema_alpha) * prev;
             state.insert(node.tag.clone(), new_score);
-            if best.as_ref().map_or(true, |(_, b)| new_score < *b) {
+            if best.as_ref().is_none_or(|(_, b)| new_score < *b) {
                 best = Some((node.tag.clone(), new_score));
             }
         }

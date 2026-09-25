@@ -280,7 +280,7 @@ impl AllAttrsMatcher {
     /// 对应 Go 版本 `NewAllAttrsMatcher`。
     pub fn new(attrs: &str) -> Self {
         let matchers =
-            attrs.split('@').filter(|s| !s.is_empty()).map(|s| HasAttrMatcher::new(s)).collect();
+            attrs.split('@').filter(|s| !s.is_empty()).map(HasAttrMatcher::new).collect();
         Self { matchers }
     }
 }
@@ -397,7 +397,7 @@ mod tests {
 
         let data = prost::Message::encode_to_vec(&list);
         let result = check_code(&data, "JP");
-        assert_eq!(result.unwrap(), false);
+        assert!(!result.unwrap());
     }
 
     #[test]
@@ -406,7 +406,7 @@ mod tests {
 
         let data = prost::Message::encode_to_vec(&list);
         let result = check_code(&data, "CN");
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     // ── AttributeMatcher 测试 ────────────────────────────────

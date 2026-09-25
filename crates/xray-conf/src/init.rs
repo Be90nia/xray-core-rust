@@ -804,7 +804,7 @@ mod tests {
             ..Default::default()
         };
         let err =
-            post_process(&mut cfg).err().expect("hysteria client version != 2 must be rejected");
+            post_process(&mut cfg).expect_err("hysteria client version != 2 must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("version"), "got: {msg}");
         assert!(msg.contains("version != 2"), "got: {msg}");
@@ -858,7 +858,7 @@ mod tests {
             ..Default::default()
         };
         let err =
-            post_process(&mut cfg).err().expect("hysteria server version != 2 must be rejected");
+            post_process(&mut cfg).expect_err("hysteria server version != 2 must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("version"), "got: {msg}");
     }
@@ -882,7 +882,7 @@ mod tests {
             ..Default::default()
         };
         let err =
-            post_process(&mut cfg).err().expect("hysteriaSettings version != 2 must be rejected");
+            post_process(&mut cfg).expect_err("hysteriaSettings version != 2 must be rejected");
         assert!(err.to_string().contains("version"), "got: {err}");
         // version=2 正例。
         cfg.inbound_configs[0].stream_settings = Some(json!({
@@ -910,7 +910,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let err = cfg.build().err().expect("build must reject allowInsecure");
+        let err = cfg.build().expect_err("build must reject allowInsecure");
         let msg = err.to_string();
         assert!(msg.contains("allowInsecure"), "got: {msg}");
         assert!(msg.contains("removed"), "got: {msg}");

@@ -209,7 +209,7 @@ impl Manager {
     pub fn start(&self) -> Result<(), ManagerError> {
         self.running.store(true, Ordering::SeqCst);
         let channels = self.channels.read();
-        for (_, c) in channels.iter() {
+        for c in channels.values() {
             // Channel::start 失败映射为 NotImplemented（Go 等价行为）
             c.start().map_err(|_| ManagerError::NotImplemented)?;
         }

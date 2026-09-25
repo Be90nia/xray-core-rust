@@ -817,9 +817,7 @@ mod lsof_parser {
     fn parse_addr_port(s: &str) -> Option<(IpAddr, u16)> {
         if let Some(rest) = s.strip_prefix('[') {
             // IPv6: [xxxx]:port
-            let Some(bracket) = rest.find(']') else {
-                return None;
-            };
+            let bracket = rest.find(']')?;
             let addr_str = &rest[..bracket];
             let after = &rest[bracket + 1..];
             let port_str = after.strip_prefix(':')?;
@@ -828,9 +826,7 @@ mod lsof_parser {
             Some((ip, port))
         } else {
             // IPv4: <addr>:<port>；v4 addr 无 ':'，用最后一个 ':' 分。
-            let Some(colon_pos) = s.rfind(':') else {
-                return None;
-            };
+            let colon_pos = s.rfind(':')?;
             let addr_str = &s[..colon_pos];
             let port_str = &s[colon_pos + 1..];
             let port = port_str.parse::<u16>().ok()?;
@@ -1122,7 +1118,7 @@ impl ProcessNameMatcherCondition {
     /// `apply`：查询源进程并匹配配置。
     fn apply(&self, ctx: &dyn RoutingContext) -> bool {
         let source_ips = ctx.get_source_ips();
-        let source_port = ctx.get_source_port().value() as u16;
+        let source_port = ctx.get_source_port().value();
         // 尝试按源地址查找进程
         let source_ip = source_ips.first().copied();
         if let Some(ip) = source_ip {
@@ -1439,7 +1435,7 @@ mod tests {
     fn test_local_os_matcher_case_insensitive() {
         // Go strings.EqualFold：大小写不敏感（"Windows"/"LINUX" 等文档写法均可）
         let upper = std::env::consts::OS.to_uppercase();
-        let m = LocalOsMatcherCondition::new(&[upper.clone()]);
+        let m = LocalOsMatcherCondition::new(std::slice::from_ref(&upper));
         let ctx = RoutingData::new();
         assert!(m.apply(&ctx), "候选 {upper} 须命中本机 OS {}", std::env::consts::OS);
     }

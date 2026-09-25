@@ -65,10 +65,11 @@ impl std::fmt::Display for SecurityType {
     }
 }
 /// 对应 Go 版本的 `TransferType`，区分流式和包式传输。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[repr(u8)]
 pub enum TransferType {
     /// 流式传输（TCP）
+    #[default]
     Stream = 0,
     /// 包式传输（UDP）
     Packet = 1,
@@ -98,12 +99,6 @@ impl std::fmt::Display for TransferType {
             Self::Stream => write!(f, "stream"),
             Self::Packet => write!(f, "packet"),
         }
-    }
-}
-
-impl Default for TransferType {
-    fn default() -> Self {
-        Self::Stream
     }
 }
 

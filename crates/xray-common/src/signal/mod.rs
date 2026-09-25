@@ -247,6 +247,9 @@ impl std::fmt::Display for PubSubTopic {
     }
 }
 
+/// 订阅者表：主题 → 该主题的 watch 发送端列表。
+type SubscriberMap<T> = HashMap<String, Vec<watch::Sender<Option<T>>>>;
+
 /// 发布-订阅服务，用于事件广播。
 ///
 /// 对应 Go 版本 `signal/pubsub.Service`，支持多个订阅者同时监听消息。
@@ -255,7 +258,7 @@ impl std::fmt::Display for PubSubTopic {
 /// - 旧 `subscribe()` / `publish()` 不传主题等价 `PubSubTopic::Global`（向后兼容）。
 /// - `subscribe_topic(topic)` / `publish_topic(topic, msg)` 走指定主题。
 pub struct PubSub<T: Clone + Send + Sync + 'static> {
-    subscribers: Arc<tokio::sync::RwLock<HashMap<String, Vec<watch::Sender<Option<T>>>>>>,
+    subscribers: Arc<tokio::sync::RwLock<SubscriberMap<T>>>,
 }
 
 impl<T: Clone + Send + Sync + 'static> PubSub<T> {
@@ -503,7 +506,7 @@ mod tests {
     #[tokio::test]
     async fn test_activity_timer_done_signal() {
         let timer = ActivityTimer::new(Duration::from_millis(100));
-        let mut done = timer.done();
+        let mut done = timer.done_signal();
 
         // spawn timer run，超时后 done 信号应触发
         tokio::spawn(async move {

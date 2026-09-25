@@ -228,8 +228,6 @@ impl Drop for UdpDispatcher {
 
 #[cfg(test)]
 mod tests {
-    use tokio::time;
-
     use super::*;
 
     #[tokio::test]

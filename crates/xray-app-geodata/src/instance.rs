@@ -2,14 +2,12 @@
 //!
 //! 对应 Go `app/geodata/geodata.go` 的 `Instance` + cron 调度。
 
-use std::sync::Arc;
-
 use parking_lot::Mutex;
 
 use crate::{
     config::GeodataConfig,
     downloader::{AssetDownloader, GeodataReloader, reload_with_update},
-    error::{GeodataError, at_error, at_warning},
+    error::{GeodataError, at_error},
 };
 
 /// Scheduler trait：把 cron 表达式 + 回调注册到调度器，返回可取消的 handle。
@@ -133,9 +131,8 @@ impl GeodataInstance {
             // 无 asset：仅 reload
             return reloader.reload();
         }
-        reload_with_update(downloader, reloader, &self.config.assets).map_err(|e| {
-            at_error(&e);
-            e
+        reload_with_update(downloader, reloader, &self.config.assets).inspect_err(|e| {
+            at_error(e);
         })
     }
 
@@ -150,7 +147,10 @@ impl GeodataInstance {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use super::*;
 

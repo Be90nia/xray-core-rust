@@ -160,6 +160,6 @@ mod tests {
     fn test_number_finder_basic() {
         assert_eq!(number_finder("abc123def"), Some(123.0));
         assert_eq!(number_finder("abc"), None);
-        assert_eq!(number_finder("3.14"), Some(3.14));
+        assert_eq!(number_finder("3.17"), Some(3.17));
     }
 }

@@ -461,8 +461,8 @@ mod tests {
 
     #[test]
     fn test_simple_router_picks_matching_rule() {
-        let mut cfg = Config::default();
-        cfg.rule = vec![simple_tag_rule("direct", "example.com")];
+        let cfg =
+            Config { rule: vec![simple_tag_rule("direct", "example.com")], ..Config::default() };
         let r = Router::init(&cfg, Arc::new(NotImplementedSelector), None, None).unwrap();
         let hit = RoutingData::new().with_target_domain("example.com");
         let miss = RoutingData::new().with_target_domain("other.io");
@@ -513,8 +513,7 @@ mod tests {
 
     #[test]
     fn test_domain_strategy_from_config() {
-        let mut cfg = Config::default();
-        cfg.domain_strategy = 3; // IpOnDemand
+        let cfg = Config { domain_strategy: 3, ..Config::default() };
         let r = Router::init(&cfg, Arc::new(NotImplementedSelector), None, None).unwrap();
         assert_eq!(r.domain_strategy(), DomainStrategy::IpOnDemand);
     }
@@ -555,8 +554,16 @@ mod tests {
         let cn = GeoSite {
             code: "CN".into(),
             domain: vec![
-                Domain { r#type: 3 /*Full*/ as i32, value: "baidu.com".into(), attribute: vec![] },
-                Domain { r#type: 2 /*Domain*/ as i32, value: "qq.com".into(), attribute: vec![] },
+                Domain {
+                    r#type: 3_i32, // Full
+                    value: "baidu.com".into(),
+                    attribute: vec![],
+                },
+                Domain {
+                    r#type: 2_i32, // Domain
+                    value: "qq.com".into(),
+                    attribute: vec![],
+                },
             ],
         };
         let list = GeoSiteList { entry: vec![cn] };
@@ -608,8 +615,7 @@ mod tests {
         std::fs::write(dir.join("geoip.dat"), make_geoip_dat()).unwrap();
         let loader = Arc::new(GeoDataLoader::new(dir.clone()));
 
-        let mut cfg = Config::default();
-        cfg.rule = vec![geoip_rule()];
+        let cfg = Config { rule: vec![geoip_rule()], ..Config::default() };
         let r = Router::init(&cfg, Arc::new(NotImplementedSelector), None, Some(loader)).unwrap();
 
         // 命中 CN CIDR 192.168.0.0/16
@@ -631,8 +637,7 @@ mod tests {
         std::fs::write(dir.join("geosite.dat"), make_geosite_dat()).unwrap();
         let loader = Arc::new(GeoDataLoader::new(dir.clone()));
 
-        let mut cfg = Config::default();
-        cfg.rule = vec![geosite_rule()];
+        let cfg = Config { rule: vec![geosite_rule()], ..Config::default() };
         let r = Router::init(&cfg, Arc::new(NotImplementedSelector), None, Some(loader)).unwrap();
 
         // baidu.com 是 Full 类型，应命中
@@ -653,8 +658,7 @@ mod tests {
     #[test]
     fn test_geo_rule_without_loader_skips_gracefully() {
         // loader = None 时 GeoIP/GeoSite 变体 warn 并 skip，不 panic
-        let mut cfg = Config::default();
-        cfg.rule = vec![geoip_rule()];
+        let cfg = Config { rule: vec![geoip_rule()], ..Config::default() };
         // loader = None 时 GeoIP 变体被 skip，IPMatcher 收到空 vec 返回错（GeodataBuild）
         let result = Router::init(&cfg, Arc::new(NotImplementedSelector), None, None);
         assert!(result.is_err(), "expected error when geoip rule present but no loader");
@@ -711,9 +715,11 @@ mod tests {
 
     #[test]
     fn test_build_balancer_leastping_with_observer_succeeds() {
-        let mut cfg = Config::default();
-        cfg.balancing_rule = vec![balancing_rule_with("leastping", "bl", "fb")];
-        cfg.rule = vec![simple_balance_rule("bl")];
+        let cfg = Config {
+            balancing_rule: vec![balancing_rule_with("leastping", "bl", "fb")],
+            rule: vec![simple_balance_rule("bl")],
+            ..Config::default()
+        };
 
         let obs = Arc::new(MemoryObservationProvider::new());
         obs.update(ObservationResult {
@@ -734,9 +740,11 @@ mod tests {
 
     #[test]
     fn test_build_balancer_leastping_without_observer_falls_back() {
-        let mut cfg = Config::default();
-        cfg.balancing_rule = vec![balancing_rule_with("leastping", "bl", "fallback")];
-        cfg.rule = vec![simple_balance_rule("bl")];
+        let cfg = Config {
+            balancing_rule: vec![balancing_rule_with("leastping", "bl", "fallback")],
+            rule: vec![simple_balance_rule("bl")],
+            ..Config::default()
+        };
 
         let ohm = Arc::new(SimpleSelector::from_tags(["a", "b", "c"]));
         // 无 observer：构建仍成功，pick 时走 fallback_tag
@@ -748,9 +756,11 @@ mod tests {
     #[test]
     fn test_build_balancer_leastload_with_observer_succeeds() {
         // 不设置 strategy_settings → build_balancer 走 unwrap_or_default 路径。
-        let mut cfg = Config::default();
-        cfg.balancing_rule = vec![balancing_rule_with("leastload", "bl", "fb")];
-        cfg.rule = vec![simple_balance_rule("bl")];
+        let cfg = Config {
+            balancing_rule: vec![balancing_rule_with("leastload", "bl", "fb")],
+            rule: vec![simple_balance_rule("bl")],
+            ..Config::default()
+        };
 
         let obs = Arc::new(MemoryObservationProvider::new());
         obs.update(ObservationResult {
@@ -770,9 +780,11 @@ mod tests {
 
     #[test]
     fn test_build_balancer_leastload_without_observer_falls_back() {
-        let mut cfg = Config::default();
-        cfg.balancing_rule = vec![balancing_rule_with("leastload", "bl", "fb-tag")];
-        cfg.rule = vec![simple_balance_rule("bl")];
+        let cfg = Config {
+            balancing_rule: vec![balancing_rule_with("leastload", "bl", "fb-tag")],
+            rule: vec![simple_balance_rule("bl")],
+            ..Config::default()
+        };
 
         let ohm = Arc::new(SimpleSelector::from_tags(["a", "b", "c"]));
         let r = Router::init(&cfg, ohm, None, None).unwrap();
@@ -783,9 +795,11 @@ mod tests {
     #[test]
     fn test_build_balancer_roundrobin_with_observer_filters_dead() {
         // 验证 roundrobin 在有 observer 时只轮询 alive（与 Go 一致）。
-        let mut cfg = Config::default();
-        cfg.balancing_rule = vec![balancing_rule_with("roundrobin", "bl", "fb")];
-        cfg.rule = vec![simple_balance_rule("bl")];
+        let cfg = Config {
+            balancing_rule: vec![balancing_rule_with("roundrobin", "bl", "fb")],
+            rule: vec![simple_balance_rule("bl")],
+            ..Config::default()
+        };
 
         let obs = Arc::new(MemoryObservationProvider::new());
         // a 是死的，b/c alive
@@ -813,9 +827,11 @@ mod tests {
     fn test_build_balancer_empty_strategy_uses_random() {
         // 对齐 Go config.go:153-161：策略空串 fallthrough 到 RandomStrategy。
         // Random 单候选恒返回该候选，可确定性断言。
-        let mut cfg = Config::default();
-        cfg.balancing_rule = vec![balancing_rule_with("", "bl", "fb")];
-        cfg.rule = vec![simple_balance_rule("bl")];
+        let cfg = Config {
+            balancing_rule: vec![balancing_rule_with("", "bl", "fb")],
+            rule: vec![simple_balance_rule("bl")],
+            ..Config::default()
+        };
         // SimpleSelector 注册 "a"（与 balancing_rule_with 的 selector[0] 对齐），
         // Random 从唯一存活候选恒取 "a"，可确定性断言。
         let ohm = Arc::new(SimpleSelector::from_tags(["a"]));
@@ -829,9 +845,11 @@ mod tests {
     #[test]
     fn test_build_balancer_strategy_case_insensitive() {
         // 对齐 Go config.go:122 strings.ToLower："LeastLoad" 不再落入 unknown。
-        let mut cfg = Config::default();
-        cfg.balancing_rule = vec![balancing_rule_with("LeastLoad", "bl", "fb")];
-        cfg.rule = vec![simple_balance_rule("bl")];
+        let cfg = Config {
+            balancing_rule: vec![balancing_rule_with("LeastLoad", "bl", "fb")],
+            rule: vec![simple_balance_rule("bl")],
+            ..Config::default()
+        };
         let ohm = Arc::new(SimpleSelector::from_tags(["a", "b", "c"]));
         // 无 observer 时 leastload 仍构建并走 fallback（同 leastping 行为）。
         let r = Router::init(&cfg, ohm, None, None).unwrap();
@@ -842,9 +860,11 @@ mod tests {
     #[test]
     fn test_build_balancer_unknown_strategy_errors() {
         // 对齐 Go config.go:162-163：未知策略拒绝启动（此前 warn 降级 roundrobin）。
-        let mut cfg = Config::default();
-        cfg.balancing_rule = vec![balancing_rule_with("noSuchStrategy", "bl", "fb")];
-        cfg.rule = vec![simple_balance_rule("bl")];
+        let cfg = Config {
+            balancing_rule: vec![balancing_rule_with("noSuchStrategy", "bl", "fb")],
+            rule: vec![simple_balance_rule("bl")],
+            ..Config::default()
+        };
         let ohm = Arc::new(SimpleSelector::from_tags(["a"]));
         let r = Router::init(&cfg, ohm, None, None);
         assert!(matches!(r, Err(RouterError::UnknownBalancerType)));

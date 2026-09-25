@@ -181,15 +181,15 @@ impl LogConfig {
     }
 
     pub fn to_proto(&self) -> ProtoConfig {
-        let mut out = ProtoConfig::default();
-        out.error_log_type = self.error_log_type.as_i32();
-        out.error_log_level = self.error_log_level.as_i32();
-        out.error_log_path = self.error_log_path.clone();
-        out.access_log_type = self.access_log_type.as_i32();
-        out.access_log_path = self.access_log_path.clone();
-        out.enable_dns_log = self.enable_dns_log;
-        out.mask_address = self.mask_address.clone();
-        out
+        ProtoConfig {
+            error_log_type: self.error_log_type.as_i32(),
+            error_log_level: self.error_log_level.as_i32(),
+            error_log_path: self.error_log_path.clone(),
+            access_log_type: self.access_log_type.as_i32(),
+            access_log_path: self.access_log_path.clone(),
+            enable_dns_log: self.enable_dns_log,
+            mask_address: self.mask_address.clone(),
+        }
     }
 }
 
@@ -245,10 +245,12 @@ mod tests {
 
     #[test]
     fn config_from_proto_invalid_falls_back_to_default() {
-        let mut p = ProtoConfig::default();
-        p.error_log_type = 99; // invalid
-        p.error_log_level = 99; // invalid
-        p.access_log_type = 99; // invalid
+        let p = ProtoConfig {
+            error_log_type: 99,  // invalid
+            error_log_level: 99, // invalid
+            access_log_type: 99, // invalid
+            ..ProtoConfig::default()
+        };
         let c = LogConfig::from_proto(&p);
         // 应回退到 default 值
         assert_eq!(c.error_log_type, LogType::Console);
@@ -284,8 +286,7 @@ mod tests {
 
     #[test]
     fn config_from_proto_dns_flag() {
-        let mut p = ProtoConfig::default();
-        p.enable_dns_log = true;
+        let p = ProtoConfig { enable_dns_log: true, ..ProtoConfig::default() };
         let c = LogConfig::from_proto(&p);
         assert!(c.enable_dns_log);
     }

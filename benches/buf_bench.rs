@@ -6,7 +6,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use xray_buf::buffer::Buffer;
 
 fn bench_buffer_alloc(c: &mut Criterion) {
-    c.bench_function("buffer_new_8k", |b| b.iter(|| Buffer::new()));
+    c.bench_function("buffer_new_8k", |b| b.iter(Buffer::new));
 }
 
 fn bench_buffer_write(c: &mut Criterion) {

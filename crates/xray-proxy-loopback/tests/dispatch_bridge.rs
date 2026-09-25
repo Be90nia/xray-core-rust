@@ -32,9 +32,12 @@ fn dummy_dest() -> Destination {
 
 /// 记录（inbound_tag, dest, payload）的 sink，调用方通过回调取出 link 后
 /// 自行消费/写入以验证完整桥接路径。
+/// 记录 (tag, dest, payload) 的共享日志类型。
+type ReceivedLog = Arc<parking_lot::Mutex<Vec<(String, Destination, Vec<u8>)>>>;
+
 #[derive(Debug, Clone)]
 struct CaptureSink {
-    received: Arc<Mutex<Vec<(String, Destination, Vec<u8>)>>>,
+    received: ReceivedLog,
 }
 
 impl LoopbackSink for CaptureSink {
@@ -61,7 +64,7 @@ impl LoopbackSink for CaptureSink {
             .map(|mb| mb.to_vec())
             .unwrap_or_default();
             captured.lock().push((tag, dest, read));
-            let _ = link.writer.shutdown();
+            link.writer.shutdown();
             Ok(())
         })
     }
@@ -69,7 +72,7 @@ impl LoopbackSink for CaptureSink {
 
 #[tokio::test]
 async fn loopback_dispatch_bridges_to_sink_with_link_roundtrip() {
-    let sink = Arc::new(CaptureSink { received: Arc::new(Mutex::new(Vec::new())) });
+    let sink = Arc::new(CaptureSink { received: Arc::new(parking_lot::Mutex::new(Vec::new())) });
 
     let handler =
         LoopbackHandler::with_inbound_tag("loopback-out", "target-in").with_sink(sink.clone());

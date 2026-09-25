@@ -14,7 +14,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use hickory_resolver::proto::{
-    op::{Message as HickoryMessage, MessageType, OpCode, ResponseCode},
+    op::{Message as HickoryMessage, MessageType, OpCode},
     rr::{RData, Record, rdata::A},
 };
 use tokio::net::UdpSocket;
@@ -90,8 +90,6 @@ async fn dns_dispatch_round_trip_through_upstream() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dns_inbound_without_rules_delegates_to_outbound() {
-    use xray_proxy_dns::config::RuleAction;
-
     // 配置一条独立 Drop 规则覆盖 inbound → outbound 转发应被旁路
     // 仍需保留 outbound 路径可在后续测试复用；此测试确认与 mock 通信一次成功。
     let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind");

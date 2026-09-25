@@ -5,7 +5,7 @@
 //!
 //! [`read_request`] 提供单用户场景的 TCP 首帧读取 + SSStream 构造。
 
-use tokio::{io::AsyncReadExt, net::TcpStream};
+use tokio::io::AsyncReadExt;
 
 use crate::{
     config::MemoryAccount,

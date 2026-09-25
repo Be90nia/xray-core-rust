@@ -241,7 +241,10 @@ async fn vmess_multichunk_production_roundtrip_e2e() {
     let ohm2 = Arc::clone(&ohm);
     let validator2 = Arc::clone(&validator);
     tokio::spawn(async move {
-        let _ = serve_vmess(vmess_listener, ohm2, validator2, None).await;
+        // sm80④：测试装配传短握手超时（与 serve_vmess 其他测试用例一致）。
+        let _ =
+            serve_vmess(vmess_listener, ohm2, validator2, None, std::time::Duration::from_secs(10))
+                .await;
     });
 
     // 生产 outbound：make_vmess_dial_fn → VmessConn

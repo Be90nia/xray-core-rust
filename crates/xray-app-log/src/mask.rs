@@ -54,10 +54,10 @@ pub fn parse_mask_address(spec: &str) -> Result<(i32, i32), LogError> {
         },
     };
 
-    if m4 < 0 || m4 > 32 || m4 % 8 != 0 {
+    if !(0..=32).contains(&m4) || m4 % 8 != 0 {
         return Err(LogError::InvalidIpv4Mask(m4));
     }
-    if m6 < 0 || m6 > 128 {
+    if !(0..=128).contains(&m6) {
         return Err(LogError::InvalidIpv6Mask(m6));
     }
 

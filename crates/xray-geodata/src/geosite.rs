@@ -31,6 +31,9 @@ impl Domain {
     }
 
     /// Creates a Domain with [`Type::Domain`](DomainType::Domain).
+    // 与同族 full/regex/substr 构造器命名对齐（Go geosite Domain 类型语义），
+    // 与类型同名属有意 API 形态。
+    #[allow(clippy::self_named_constructors)]
     pub fn domain(value: &str) -> Self {
         Self::new(DomainType::Domain as i32, value)
     }

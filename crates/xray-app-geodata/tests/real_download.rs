@@ -17,7 +17,6 @@ use xray_app_geodata::downloader::{AssetDownloader, RealAssetDownloader};
 /// 一次性 HTTP 服务器：accept 一个连接，回写固定 response。
 struct OneShotServer {
     addr: std::net::SocketAddr,
-    body: Vec<u8>,
     request_log: Arc<Mutex<Vec<String>>>,
 }
 
@@ -53,7 +52,7 @@ fn spawn_server(body: Vec<u8>) -> OneShotServer {
             stream.flush().ok();
         }
     });
-    OneShotServer { addr, body, request_log: log }
+    OneShotServer { addr, request_log: log }
 }
 
 fn unique_dir(name: &str) -> PathBuf {

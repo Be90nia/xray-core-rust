@@ -167,7 +167,7 @@ impl WebhookNotifier {
         let body_str =
             serde_json::to_string(body).map_err(|e| RouterError::Webhook(e.to_string()))?;
 
-        let result = tokio::runtime::Handle::try_current()
+        tokio::runtime::Handle::try_current()
             .map(|handle| handle.block_on(async { self.post_async(&body_str).await }))
             .unwrap_or_else(|_| {
                 // 无 tokio runtime 时创建临时 runtime
@@ -184,9 +184,7 @@ impl WebhookNotifier {
                         Err(RouterError::Webhook(format!("thread panicked: {e:?}")))
                     })
                 })
-            });
-
-        result
+            })
     }
 
     /// 异步 HTTP POST 实现。
@@ -200,7 +198,7 @@ impl WebhookNotifier {
         if url.is_empty() {
             return Err(RouterError::Webhook("empty webhook url".to_string()));
         }
-        let target = parse_webhook_target(url).map_err(|e| RouterError::Webhook(e))?;
+        let target = parse_webhook_target(url).map_err(RouterError::Webhook)?;
         let timeout = Duration::from_millis(DEFAULT_TIMEOUT_MS);
 
         let request = match &target {

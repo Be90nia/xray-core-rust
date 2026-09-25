@@ -92,6 +92,8 @@ impl Ipv4Cidr {
         Self { addr: u32::from_be_bytes(addr.octets()), prefix }
     }
 
+    // 生产路径走 range() 区间匹配；contains 仅测试使用。
+    #[allow(dead_code)]
     fn contains(&self, ip: Ipv4Addr) -> bool {
         if self.prefix == 0 {
             return true;
@@ -125,6 +127,8 @@ impl Ipv6Cidr {
         Self { addr: u128::from_be_bytes(addr.octets()), prefix }
     }
 
+    // 生产路径走 range() 区间匹配；contains 仅测试使用。
+    #[allow(dead_code)]
     fn contains(&self, ip: Ipv6Addr) -> bool {
         if self.prefix == 0 {
             return true;
@@ -704,6 +708,9 @@ pub fn build_optimized_ip_matcher(
     }
 }
 
+// 历史布局：正式 item（IpRegistry/DynamicIPMatcher 等）在测试模块之后，
+// 整体移动是大 diff 重构，保持现状。
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1228,7 +1235,6 @@ struct IpRegistryInner {
 
 struct RegistryEntry {
     matcher: Arc<DynamicIPMatcher>,
-    rules: Vec<IpRule>,
 }
 
 impl IpRegistry {
@@ -1245,7 +1251,7 @@ impl IpRegistry {
         let initial = build_optimized_ip_matcher(rules)?;
         let matcher = Arc::new(DynamicIPMatcher::new(initial));
         let mut g = self.inner.write().expect("IpRegistry poisoned");
-        g.entries.push(RegistryEntry { matcher: Arc::clone(&matcher), rules: rules.to_vec() });
+        g.entries.push(RegistryEntry { matcher: Arc::clone(&matcher) });
         Ok(matcher)
     }
 

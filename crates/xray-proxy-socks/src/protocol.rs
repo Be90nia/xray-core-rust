@@ -183,7 +183,6 @@ pub fn write_address_port(buf: &mut Vec<u8>, addr: &SocksAddr) -> usize {
 /// 非法字符——客户端用这些字符配合 ATYP=Domain 长度字段255可达
 /// "域名填满 + port 字节被吞"的错位帧。新增 charset 校验在解析阶段
 /// 直接拒绝（InvalidFrame），不再让不可信字节穿透到 DNS/连接层。
-#[must_use]
 pub fn parse_address_port(bytes: &[u8]) -> Result<(SocksAddr, usize)> {
     if bytes.is_empty() {
         return Err(SocksError::InvalidFrame("empty address buffer".into()));
@@ -270,14 +269,7 @@ pub fn parse_address_port(bytes: &[u8]) -> Result<(SocksAddr, usize)> {
 /// - 含 `\` 或 `\0` 等 SOCKS5 解析上下文不该出现的字符
 #[must_use]
 pub fn is_valid_domain_bytes(bytes: &[u8]) -> bool {
-    bytes.iter().all(|&c| {
-        (c >= b'0' && c <= b'9')
-            || (c >= b'a' && c <= b'z')
-            || (c >= b'A' && c <= b'Z')
-            || c == b'-'
-            || c == b'.'
-            || c == b'_'
-    })
+    bytes.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'-' || c == b'.' || c == b'_')
 }
 
 /// 编码 SOCKS5 UDP 包。对应 Go `EncodeUDPPacket`。
@@ -409,7 +401,7 @@ mod tests {
         let err = parse_address_port(&bytes).unwrap_err();
         assert!(matches!(err, SocksError::InvalidFrame(_)));
         // 含 '@' 字符
-        let mut bytes = vec![ATYP_DOMAIN, 4, b'a', b'@', b'b', b'c', 0, 80];
+        let bytes = vec![ATYP_DOMAIN, 4, b'a', b'@', b'b', b'c', 0, 80];
         let err = parse_address_port(&bytes).unwrap_err();
         assert!(matches!(err, SocksError::InvalidFrame(_)));
         // 含 '\\0' 字符（不在合法集）

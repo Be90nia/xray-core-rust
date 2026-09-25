@@ -9,8 +9,6 @@
 //! 3. 调 `AnytlsClient::dial` 建立 TLS 连接 + 写 SOCKS5 目标
 //! 4. 返回 `Ok(())`（与 hysteria 一致，连接对象由 dispatcher 通过 DialBridge 获取）
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use xray_common::{
     net::{destination::Destination, network::Network},

@@ -77,7 +77,7 @@ pub async fn read_proxy_protocol<R: AsyncReadExt + Unpin>(
             io::Error::new(io::ErrorKind::InvalidData, "proxy protocol v1 not utf8")
         })?;
         // "PROXY TCP4 src dst sport dport\r\n"
-        let parts: Vec<&str> = text.trim_end().split_whitespace().collect();
+        let parts: Vec<&str> = text.split_whitespace().collect();
         if parts.len() >= 6 {
             let sport: u16 = parts[4].parse().unwrap_or(0);
             match parts[1] {

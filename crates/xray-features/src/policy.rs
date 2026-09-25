@@ -49,7 +49,7 @@ pub const DEFAULT_BUFFER_WRITE: usize = 1024;
 /// Policy for a user level, defining connection limits and timeouts.
 ///
 /// Corresponds to Go's `features/policy.Policy` and `features/policy.SessionPolicy`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Policy {
     /// Connection timeout settings.
     pub timeout: TimeoutPolicy,
@@ -57,16 +57,6 @@ pub struct Policy {
     pub stats: StatsPolicy,
     /// Buffer settings.
     pub buffer: BufferPolicy,
-}
-
-impl Default for Policy {
-    fn default() -> Self {
-        Self {
-            timeout: TimeoutPolicy::default(),
-            stats: StatsPolicy::default(),
-            buffer: BufferPolicy::default(),
-        }
-    }
 }
 
 /// Timeout policy for connection lifecycle.
@@ -96,7 +86,7 @@ impl Default for TimeoutPolicy {
 }
 
 /// Corresponds to Go's `features/policy.StatsPolicy`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct StatsPolicy {
     /// Whether to track user uplink traffic.
     pub user_uplink: bool,
@@ -108,12 +98,6 @@ pub struct StatsPolicy {
     /// 在 `StatsPolicy.user_online` 为 true 时通过 [`xray_app_stats`] 注册
     /// `user>>>{email}>>>online` OnlineMap 并 AddIP，会话结束时 RemoveIP。
     pub user_online: bool,
-}
-
-impl Default for StatsPolicy {
-    fn default() -> Self {
-        Self { user_uplink: false, user_downlink: false, user_online: false }
-    }
 }
 
 /// Buffer policy for connection buffering.
@@ -194,7 +178,7 @@ pub fn default_buffer_connection_from_env(env_mb: Option<i64>) -> i32 {
     match env_mb {
         Some(0) => -1, // -1 表示无限缓冲（policy.go:91-93 defaultBufferSize = -1）
         Some(n) if n > 0 => {
-            let bytes = (n as i64).saturating_mul(1024 * 1024);
+            let bytes = n.saturating_mul(1024 * 1024);
             // clamp 到 i32 正值上限；超出视为「错误配置 → 0」（与 Go int32 截断语义近似）
             i32::try_from(bytes.min(i32::MAX as i64)).unwrap_or(0)
         },
@@ -205,19 +189,17 @@ pub fn default_buffer_connection_from_env(env_mb: Option<i64>) -> i32 {
             {
                 0
             }
-            #[cfg(any(target_arch = "arm64", target_arch = "mips64", target_arch = "mips64el"))]
+            // 架构分支对齐 Go policy.go：arm/mips → 0，mips64 → 4KB，其余 → 512KB。
+            // 注意 rustc 的 target_arch 无 "arm64"/"mips64el" 值（对应 aarch64/mips64），
+            // 原写法这两个值恒不匹配；aarch64 落入 512KB 分支与 Go 的 4KB 分支存在
+            // 已知偏差，改 cfg 值会变更激活行为，维持现状待专项票。
+            #[cfg(target_arch = "mips64")]
             {
                 (4 * 1024) as i32
             }
-            #[cfg(not(any(
-                target_arch = "arm",
-                target_arch = "mips",
-                target_arch = "arm64",
-                target_arch = "mips64",
-                target_arch = "mips64el",
-            )))]
+            #[cfg(not(any(target_arch = "arm", target_arch = "mips", target_arch = "mips64")))]
             {
-                (512 * 1024) as i32
+                512 * 1024
             }
         },
     }
@@ -318,20 +300,6 @@ mod tests {
         assert!(policy.stats.user_online);
     }
 
-    /// Mock policy manager for testing.
-    struct MockPolicyManager;
-
-    #[async_trait]
-    impl PolicyManager for MockPolicyManager {
-        fn policy_for_level(&self, _level: u32) -> Policy {
-            Policy::default()
-        }
-
-        fn for_system(&self) -> SystemStats {
-            SystemStats::default()
-        }
-    }
-
     #[test]
     fn test_system_stats_buffer_default_aligns_go_default() {
         // 对齐 Go features/policy/policy.go:52-56 System{Buffer: defaultBufferPolicy()}
@@ -360,7 +328,7 @@ mod tests {
     /// 1024`）。
     #[test]
     fn test_default_buffer_env_n_mb_scales_by_mb() {
-        assert_eq!(default_buffer_connection_from_env(Some(1)), 1 * 1024 * 1024);
+        assert_eq!(default_buffer_connection_from_env(Some(1)), 1024 * 1024);
         assert_eq!(default_buffer_connection_from_env(Some(8)), 8 * 1024 * 1024);
         assert_eq!(default_buffer_connection_from_env(Some(64)), 64 * 1024 * 1024);
         // 负数（除 0）→ 0（与 Go int32(负) 行为近似）；
@@ -374,15 +342,10 @@ mod tests {
         let size = default_buffer_connection_from_env(None);
         #[cfg(any(target_arch = "arm", target_arch = "mips"))]
         assert_eq!(size, 0, "arm/mips GOARCH branch expects 0");
-        #[cfg(any(target_arch = "arm64", target_arch = "mips64", target_arch = "mips64el"))]
-        assert_eq!(size, 4096, "arm64/mips64 GOARCH branch expects 4 KiB");
-        #[cfg(not(any(
-            target_arch = "arm",
-            target_arch = "mips",
-            target_arch = "arm64",
-            target_arch = "mips64",
-            target_arch = "mips64el",
-        )))]
+        // rustc target_arch 无 "arm64"/"mips64el"（对应 aarch64/mips64），恒假值已删。
+        #[cfg(target_arch = "mips64")]
+        assert_eq!(size, 4096, "mips64 GOARCH branch expects 4 KiB");
+        #[cfg(not(any(target_arch = "arm", target_arch = "mips", target_arch = "mips64")))]
         assert_eq!(size, 512 * 1024, "其他 GOARCH 分支（x86_64 等）期望 512 KiB");
     }
 
@@ -396,13 +359,7 @@ mod tests {
         // 已由现有 test_system_stats_buffer_default_aligns_go_default 覆盖；这里补一个
         // 走 `default_buffer_connection_from_env` 路径的反向验证：env 缺省下的 512 KiB
         // 应等于 SystemStats::default().buffer.connection（GOARCH 「其他」分支）。
-        #[cfg(not(any(
-            target_arch = "arm",
-            target_arch = "mips",
-            target_arch = "arm64",
-            target_arch = "mips64",
-            target_arch = "mips64el",
-        )))]
+        #[cfg(not(any(target_arch = "arm", target_arch = "mips", target_arch = "mips64")))]
         {
             let sys = SystemStats::default();
             assert_eq!(sys.buffer.connection, default_buffer_connection_from_env(None));

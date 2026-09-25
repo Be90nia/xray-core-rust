@@ -135,8 +135,7 @@ pub async fn forward_udp_raw(
     dest: &Destination,
     timeout: Duration,
 ) -> Result<Vec<u8>> {
-    let addr =
-        dest_to_socket_addr(dest).await.map_err(|e| DnsProxyError::UpstreamForwardFailed(e))?;
+    let addr = dest_to_socket_addr(dest).await.map_err(DnsProxyError::UpstreamForwardFailed)?;
     let sock = tokio::net::UdpSocket::bind(if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" })
         .await
         .map_err(|e| DnsProxyError::UpstreamForwardFailed(format!("bind: {e}")))?;
@@ -169,8 +168,7 @@ pub async fn forward_tcp_raw(
 ) -> Result<Vec<u8>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let addr =
-        dest_to_socket_addr(dest).await.map_err(|e| DnsProxyError::UpstreamForwardFailed(e))?;
+    let addr = dest_to_socket_addr(dest).await.map_err(DnsProxyError::UpstreamForwardFailed)?;
     let mut stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr))
         .await
         .map_err(|_| DnsProxyError::UpstreamForwardFailed("tcp upstream connect timeout".into()))?

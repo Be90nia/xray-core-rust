@@ -343,7 +343,7 @@ mod tests {
                 use xray_buf::io::Writer;
                 let mut out = xray_buf::multi::MultiBuffer::new();
                 // 坏帧：长度头声明 body_len=3 < MIN_META_LEN(4) → MetadataTooShort
-                out.merge_bytes(&vec![0x00u8, 0x03]);
+                out.merge_bytes(&[0x00u8, 0x03]);
                 let mut writer = link.writer;
                 let _ = writer.write_multi_buffer(out).await;
                 // 保持写端打开：EOF 会把忙旋误判成正常关会话

@@ -197,11 +197,4 @@ mod tests {
         assert_eq!(cache.cleanup_expired(), 0, "所有 slot 已清");
         assert!(cache.is_empty());
     }
-    fn is_empty_and_default() {
-        let cache: WeakCacheMap<u32, String> = WeakCacheMap::default();
-        assert!(cache.is_empty());
-        assert_eq!(cache.len(), 0);
-        cache.store(1, Arc::new("x".to_string()));
-        assert!(!cache.is_empty());
-    }
 }

@@ -55,15 +55,6 @@ impl Codec {
         Self { tables, rng, padding_chance, table_index: 0 }
     }
 
-    /// 当前轮转的 table（对应 Go `currentTable`）。
-    fn current_table(&self) -> Option<&Table> {
-        if self.tables.is_empty() {
-            None
-        } else {
-            Some(&self.tables[self.table_index % self.tables.len()])
-        }
-    }
-
     /// 编码（对应 Go `codec.encode`）。
     pub fn encode(&mut self, input: &[u8]) -> Result<Vec<u8>, String> {
         if input.is_empty() {
@@ -286,11 +277,6 @@ impl PackedDecoder {
             }
         }
         Ok(out)
-    }
-
-    pub fn reset(&mut self) {
-        self.bit_buf = 0;
-        self.bit_count = 0;
     }
 }
 

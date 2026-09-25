@@ -155,7 +155,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let ctx = build_server_ssl_context(cert_der, key_der).map_err(io::Error::other)?;
-    let mut ssl = btls::ssl::Ssl::new(&ctx).map_err(|e| io::Error::other(e.to_string()))?;
+    let ssl = btls::ssl::Ssl::new(&ctx).map_err(|e| io::Error::other(e.to_string()))?;
     // SAFETY: ssl 为刚构造的合法 SSL；SSL_set_accept_state 仅把连接标记为
     // 服务端角色（btls 只在同步 SslStreamBuilder 上暴露此步，tokio 路径需
     // 在握手前直接设置）。

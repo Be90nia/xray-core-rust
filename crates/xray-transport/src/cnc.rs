@@ -34,6 +34,13 @@ use xray_buf::{
 
 use crate::connection::Connection;
 
+/// 在途读 future（持有 reader，就绪后归还）。
+type PendingRead =
+    Pin<Box<dyn Future<Output = (Box<dyn Reader>, xray_buf::io::Result<MultiBuffer>)> + Send>>;
+/// 在途写 future（持有 writer）+ 本批字节数。
+type PendingWrite =
+    (Pin<Box<dyn Future<Output = (Box<dyn Writer>, xray_buf::io::Result<()>)> + Send>>, usize);
+
 /// 读侧状态机。
 ///
 /// reader 在 Pending 期间被 move 进 future（避免自引用结构），
@@ -42,9 +49,7 @@ enum ReadState {
     /// 无缓冲数据、无在途读取。
     Idle,
     /// 在途 `read_multi_buffer` future（持有 reader）。
-    Pending(
-        Pin<Box<dyn Future<Output = (Box<dyn Reader>, xray_buf::io::Result<MultiBuffer>)> + Send>>,
-    ),
+    Pending(PendingRead),
     /// 已读回但未消费完的数据（对应 Go `buf.BufferedReader` 内部缓冲）。
     Buffered(MultiBuffer),
 }
@@ -54,9 +59,7 @@ enum WriteState {
     Idle,
     /// 在途 `write_multi_buffer` future（持有 writer）+ 本批字节数。
     /// Go `Write` 全量语义：一次写完整个 buffer 并返回 `len(b)`。
-    Pending(
-        (Pin<Box<dyn Future<Output = (Box<dyn Writer>, xray_buf::io::Result<()>)> + Send>>, usize),
-    ),
+    Pending(PendingWrite),
 }
 
 struct Inner {
@@ -138,6 +141,7 @@ impl ContentNetworkConnection {
     /// - 后续 write 返回 `BrokenPipe`（Go `io.ErrClosedPipe`）；
     /// - 后续 read 返回 EOF；
     /// - writer 半关闭：dispatcher 侧读端收到 EOF。
+    ///
     /// 幂等：重复调用无副作用。Drop 时自动调用。
     pub fn close(&self) -> io::Result<()> {
         let mut inner = self.inner.lock();

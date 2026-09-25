@@ -33,6 +33,6 @@ mod tests {
 
     #[test]
     fn test_sing_bridge_default() {
-        let _bridge = SingBridge::default();
+        let _bridge = SingBridge;
     }
 }

@@ -537,7 +537,7 @@ pub async fn u_client_with_alpn<S>(
 where
     S: Connection + Unpin,
 {
-    let alpn_wire = alpn.map(|a| encode_alpn_wire(&a));
+    let alpn_wire = alpn.map(|a| encode_alpn_wire(a));
     // 尝试 btls（真实指纹）
     if let Some(result) = crate::btls_client::connector_for_fingerprint(&fingerprint) {
         match result {
@@ -548,7 +548,7 @@ where
                 // base64 分支原样解码，且 base64 不含 "://" 不会误入占位分支；
                 // 查询失败保持原串 → resolve 走 Full 语义落 INVALID_ECH_CONFIG
                 // （对齐 Go defer 失败语义：ECH 获取失败必须连接失败，不静默明文）。
-                let mut ech_resolved = String::new();
+                let ech_resolved;
                 let ech_list: Option<&str> = match ech_config_list {
                     Some(list) if list.contains("://") => {
                         use base64::Engine as _;

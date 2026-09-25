@@ -3,7 +3,7 @@
 //! 对应 Go 版本 `common/bitmask` 包，提供对 u8 位掩码的查询和修改操作。
 
 /// 字节位掩码，封装 u8 值并提供位操作方法。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Bitmask(u8);
 
 impl Bitmask {
@@ -35,12 +35,6 @@ impl Bitmask {
     /// 返回原始位值。
     pub fn bits(&self) -> u8 {
         self.0
-    }
-}
-
-impl Default for Bitmask {
-    fn default() -> Self {
-        Self(0)
     }
 }
 

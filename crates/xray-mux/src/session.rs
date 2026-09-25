@@ -530,7 +530,6 @@ impl SessionManager {
     ///
     /// 返回 `Some(Arc<Session>)` 表示添加成功（新会话的唯一强引用交还调用方），
     /// `None` 表示管理器已关闭。
-
     pub async fn add(&self, mut session: Session) -> Option<Arc<Session>> {
         let mut inner = self.shared.inner.write().await;
 

@@ -53,6 +53,8 @@ pub fn read_cert(file: &str) -> io::Result<Vec<u8>> {
 /// 复制文件（Go `CopyFile`）：读入 `src` 全量后写入 `dst`。
 ///
 /// 与 Go 一致仅 create + write（不 truncate）：`dst` 已存在且更长时尾部残留。
+// 不加 .truncate(true)：Go `CopyFile` 即 O_CREATE|O_WRONLY 语义，属有意行为。
+#[allow(clippy::suspicious_open_options)]
 pub fn copy_file(dst: &Path, src: &Path) -> io::Result<()> {
     use std::io::Write;
     let bytes = fs::read(src)?;

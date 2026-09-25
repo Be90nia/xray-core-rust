@@ -137,7 +137,7 @@ mod tests {
     fn register_and_create_roundtrip() {
         let _g = TEST_LOCK.lock();
         let factory: FeatureFactory = Arc::new(stub_factory);
-        register_feature("type.googleapis.com/test.Stub", factory);
+        let _ = register_feature("type.googleapis.com/test.Stub", factory);
 
         assert!(is_registered("type.googleapis.com/test.Stub"));
 
@@ -155,26 +155,12 @@ mod tests {
         assert!(msg.contains("test.Missing"));
     }
 
-    fn register_overrides_previous() {
-        let _g = TEST_LOCK.lock();
-        clear_registry_for_test();
-        let f1: FeatureFactory =
-            Arc::new(|_| Ok(Arc::new(StubFeature { tag: "v1" }) as Arc<dyn Feature>));
-        let f2: FeatureFactory =
-            Arc::new(|_| Ok(Arc::new(StubFeature { tag: "v2" }) as Arc<dyn Feature>));
-        register_feature("type.googleapis.com/test.Override", f1);
-        register_feature("type.googleapis.com/test.Override", f2);
-
-        let feat = create_feature("type.googleapis.com/test.Override", b"").unwrap();
-        assert_eq!(feat.feature_name(), "v2");
-    }
-
     #[test]
     fn factory_decode_error_propagates() {
         let _g = TEST_LOCK.lock();
         clear_registry_for_test();
         let factory: FeatureFactory = Arc::new(stub_factory);
-        register_feature("type.googleapis.com/test.DecodeErr", factory);
+        let _ = register_feature("type.googleapis.com/test.DecodeErr", factory);
 
         // 故意传非 UTF-8 字节触发 factory 内部错误。
         let err =
@@ -186,7 +172,7 @@ mod tests {
     fn registry_is_process_wide_singleton() {
         // 不 clear，验证注册表跨测试调用持久（仅作可观察性检查，不依赖顺序）。
         let before = is_registered("type.googleapis.com/test.Stub");
-        register_feature(
+        let _ = register_feature(
             "type.googleapis.com/test.SingletonCheck",
             Arc::new(|_| Ok(Arc::new(StubFeature { tag: "x" }) as Arc<dyn Feature>)),
         );

@@ -457,11 +457,10 @@ mod tests {
             }
             // drain：确认有界
             let mut got = 0usize;
-            loop {
-                match tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv()).await {
-                    Ok(Some(_)) => got += 1,
-                    _ => break,
-                }
+            while let Ok(Some(_)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv()).await
+            {
+                got += 1;
             }
             assert!(got >= 1, "at least the buffered messages must be delivered");
             assert!(got <= 5, "bounded fan-out must not pile up 1000 messages, got {got}");

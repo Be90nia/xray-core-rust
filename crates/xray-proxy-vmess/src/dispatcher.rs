@@ -21,9 +21,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use tokio::io::{
-    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, ReadHalf, WriteHalf,
-};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use xray_app_dispatcher::default::DialFn;
 use xray_common::{
     bitmask::Bitmask,
@@ -32,7 +30,7 @@ use xray_common::{
     uuid::UUID,
 };
 use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead};
-use xray_transport::{connection::Connection, sockopt::SocketOptions};
+use xray_transport::connection::Connection;
 
 use crate::{
     account::MemoryAccount,

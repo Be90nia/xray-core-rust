@@ -33,7 +33,6 @@ use xray_proto::xray::proxy::vless::encoding::Addons;
 use xray_transport::{
     connection::Connection,
     dialer::{StreamSettings, dial},
-    sockopt::SocketOptions,
 };
 
 use crate::{

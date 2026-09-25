@@ -17,14 +17,9 @@ use crate::{error::RouterError, router::Router};
 ///
 /// 对应 Go `app/router/command/command.go::routingServer`。
 /// 持有 [`Router`] 引用，7 个 RPC 委托给 Router 方法。
+#[derive(Default)]
 pub struct RoutingService {
     router: Option<Arc<Router>>,
-}
-
-impl Default for RoutingService {
-    fn default() -> Self {
-        Self { router: None }
-    }
 }
 
 impl RoutingService {
@@ -180,15 +175,19 @@ mod tests {
         let ohm: Arc<dyn OutboundHandlerSelector> = Arc::new(NotImplementedSelector);
         let router = Router::empty(ohm, None);
         let s = RoutingService::with_router(router);
-        let mut proto = RoutingRule::default();
-        proto.domain = vec![DomainRule {
-            value: Some(xray_proto::xray::common::geodata::domain_rule::Value::Custom(Domain {
-                r#type: DomainType::Full as i32,
-                value: "example.com".into(),
-                attribute: vec![],
-            })),
-        }];
-        proto.target_tag = Some(TargetTag::Tag("out-A".into()));
+        let proto = RoutingRule {
+            domain: vec![DomainRule {
+                value: Some(xray_proto::xray::common::geodata::domain_rule::Value::Custom(
+                    Domain {
+                        r#type: DomainType::Full as i32,
+                        value: "example.com".into(),
+                        attribute: vec![],
+                    },
+                )),
+            }],
+            target_tag: Some(TargetTag::Tag("out-A".into())),
+            ..RoutingRule::default()
+        };
         s.add_rule("rule-1".to_string(), proto).expect("add_rule");
         let tags = s.list_rule().unwrap();
         assert!(tags.contains(&"rule-1".to_string()));

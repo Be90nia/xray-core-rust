@@ -921,11 +921,7 @@ mod tests {
         use std::sync::Arc;
 
         use tokio::sync::Mutex as AsyncMutex;
-        use xray_buf::{
-            io::{Reader as _, Writer as _},
-            pipe,
-            reader::BufferedReader,
-        };
+        use xray_buf::{io::Reader as _, pipe, reader::BufferedReader};
         use xray_common::{
             net::{address::Address, port::Port},
             serial,

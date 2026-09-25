@@ -97,15 +97,14 @@ pub enum RuleParserError {
 /// 然后按前缀分派到对应的解析函数。
 ///
 /// - `geoip:XX` → 转为 `ext:geoip.dat:XX`
-/// - `ext:` / `ext-ip:` → [`parse_geo_ip_rule`]
-/// - 其他 → [`parse_custom_ip_rule`]（CIDR 格式）
+/// - `ext:` / `ext-ip:` → `parse_geo_ip_rule`
+/// - 其他 → `parse_custom_ip_rule`（CIDR 格式）
 pub fn parse_ip_rules(rules: &[String], datadir: &Path) -> Result<Vec<IpRule>, RuleParserError> {
     rules
         .iter()
         .map(|rule| {
             let (rule, reverse) = cut_reverse_prefix(rule);
-            if rule.starts_with("geoip:") {
-                let code = &rule[6..];
+            if let Some(code) = rule.strip_prefix("geoip:") {
                 let expanded = format!("ext:{}:{}", DEFAULT_GEOIP_DAT, code);
                 parse_geo_ip_rule(&expanded, reverse, datadir)
             } else if rule.starts_with("ext:") || rule.starts_with("ext-ip:") {
@@ -120,7 +119,7 @@ pub fn parse_ip_rules(rules: &[String], datadir: &Path) -> Result<Vec<IpRule>, R
 /// 解析单条域名规则。
 ///
 /// - `geosite:XX` → 转为 `ext:geosite.dat:XX`
-/// - `ext:` / `ext-domain:` → [`parse_geo_site_rule`]
+/// - `ext:` / `ext-domain:` → `parse_geo_site_rule`
 /// - 其他 → [`parse_custom_domain_rule`]
 pub fn parse_domain_rule(
     rule: &str,
@@ -128,8 +127,7 @@ pub fn parse_domain_rule(
     datadir: &Path,
 ) -> Result<DomainRule, RuleParserError> {
     let (rule, _) = cut_reverse_prefix(rule);
-    if rule.starts_with("geosite:") {
-        let code = &rule[8..];
+    if let Some(code) = rule.strip_prefix("geosite:") {
         let expanded = format!("ext:{}:{}", DEFAULT_GEOSITE_DAT, code);
         parse_geo_site_rule(&expanded, datadir)
     } else if rule.starts_with("ext:")
@@ -176,10 +174,10 @@ fn parse_geo_ip_rule(
     outer_reverse: bool,
     datadir: &Path,
 ) -> Result<IpRule, RuleParserError> {
-    let body = if rule.starts_with("ext-ip:") {
-        &rule[7..]
-    } else if rule.starts_with("ext:") {
-        &rule[4..]
+    let body = if let Some(rest) = rule.strip_prefix("ext-ip:") {
+        rest
+    } else if let Some(rest) = rule.strip_prefix("ext:") {
+        rest
     } else {
         return Err(RuleParserError::IllegalIPRule(rule.to_string()));
     };
@@ -266,12 +264,12 @@ pub fn parse_cidr(s: &str) -> Result<Cidr, RuleParserError> {
 /// `ext-site:filename:code@attr1@attr2`（Go rule_parser.go:141/170 三前缀
 /// 同走 parseGeoSiteRule）。
 fn parse_geo_site_rule(rule: &str, datadir: &Path) -> Result<DomainRule, RuleParserError> {
-    let body = if rule.starts_with("ext-domain:") {
-        &rule[11..]
-    } else if rule.starts_with("ext-site:") {
-        &rule[9..]
-    } else if rule.starts_with("ext:") {
-        &rule[4..]
+    let body = if let Some(rest) = rule.strip_prefix("ext-domain:") {
+        rest
+    } else if let Some(rest) = rule.strip_prefix("ext-site:") {
+        rest
+    } else if let Some(rest) = rule.strip_prefix("ext:") {
+        rest
     } else {
         return Err(RuleParserError::IllegalDomainRule(rule.to_string()));
     };

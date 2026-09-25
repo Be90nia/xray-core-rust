@@ -398,7 +398,7 @@ mod tests {
     fn header_reader_validates_path_against_expected_uris() {
         let mut r = HeaderReader::new();
         let data = b"POST /wrong HTTP/1.1\r\n\r\n";
-        let err = r.feed(data, &vec!["/expected".into()]).unwrap_err();
+        let err = r.feed(data, &["/expected".to_string()]).unwrap_err();
         assert_eq!(err, HeaderError::PathMismatch);
     }
 
@@ -406,7 +406,7 @@ mod tests {
     fn header_reader_accepts_matching_path() {
         let mut r = HeaderReader::new();
         let data = b"POST /expected HTTP/1.1\r\n\r\n";
-        assert!(r.feed(data, &vec!["/expected".into()]).is_ok());
+        assert!(r.feed(data, &["/expected".to_string()]).is_ok());
     }
 
     #[test]

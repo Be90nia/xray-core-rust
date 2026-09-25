@@ -98,7 +98,7 @@ impl InboundHandler for BlackholeInboundHandler {
                             use tokio::io::AsyncWriteExt;
                             let mut stream = stream;
                             if !data.is_empty() {
-                                if let Err(e) = stream.write_all(&data).await {
+                                if let Err(e) = stream.write_all(data).await {
                                     tracing::debug!(error = %e, "blackhole inbound write custom failed");
                                 }
                             }
