@@ -186,10 +186,8 @@ impl FragmentAssembler {
         if self.received == pkt.frag_total {
             // 全部到齐：按 frag_id 升序拼接（extend 各分片 → Bytes 零拷贝包装）
             let mut data = Vec::new();
-            for frag in &self.frags {
-                if let Some(f) = frag {
-                    data.extend_from_slice(f);
-                }
+            for f in self.frags.iter().flatten() {
+                data.extend_from_slice(f);
             }
             let addr = self.first_addr.take().unwrap_or(crate::protocol::address::Address::None);
             let completed = Packet {

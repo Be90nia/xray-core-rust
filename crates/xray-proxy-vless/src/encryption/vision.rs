@@ -308,7 +308,7 @@ pub fn xtls_filter_tls(buffers: &[&[u8]], state: &mut TrafficState) {
             if end >= TLS13_SUPPORTED_VERSIONS.len()
                 && b[..end]
                     .windows(TLS13_SUPPORTED_VERSIONS.len())
-                    .any(|w| w == &TLS13_SUPPORTED_VERSIONS)
+                    .any(|w| w == TLS13_SUPPORTED_VERSIONS)
             {
                 if let Some(v) = tls13_cipher_suite_name(state.cipher) {
                     if v != "TLS_AES_128_CCM_8_SHA256" {
@@ -402,7 +402,7 @@ pub fn classify_udp443_packet(buf: &[u8], port: u16, is_udp: bool) -> u8 {
     }
     // QUIC Long Header 检测：首字节 bit 7 (header form) = 1, bit 6 (fixed) = 1
     // Long Header: 0b11xx_xxxx；Initial 包 type = 00（bit 4-3）
-    if buf.len() >= 1 {
+    if !buf.is_empty() {
         let first = buf[0];
         if (first & 0b1100_0000) == 0b1100_0000 {
             // Long Header; Initial packet type bits = 00 (bits 4-3)

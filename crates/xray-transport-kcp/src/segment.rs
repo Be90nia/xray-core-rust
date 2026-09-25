@@ -707,8 +707,7 @@ mod tests {
         seg2.conv = 1;
         seg2.cmd = Command::Ping;
 
-        let mut packet = Vec::new();
-        packet.resize(seg1.byte_size(), 0);
+        let mut packet = vec![0; seg1.byte_size()];
         seg1.serialize(&mut packet[0..seg1.byte_size()]);
 
         let off = seg1.byte_size();

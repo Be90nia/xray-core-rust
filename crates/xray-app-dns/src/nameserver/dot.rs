@@ -17,7 +17,7 @@
 use std::{
     future::Future,
     io,
-    net::{IpAddr, SocketAddr},
+    net::IpAddr,
     pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
@@ -26,13 +26,11 @@ use std::{
 use hickory_proto::rr::RecordType;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
     time::timeout,
 };
 use tokio_rustls::rustls::ClientConfig;
-use xray_common::net::{address::Address, destination::Destination, port::Port};
+use xray_common::net::{destination::Destination, port::Port};
 use xray_tls::utls::client as tls_client;
-use xray_transport::connection::TcpConnection;
 
 use crate::{
     cache_controller::CacheController,
@@ -312,6 +310,9 @@ mod tests {
 
     use super::*;
     use crate::config::IpOption;
+
+    use std::net::SocketAddr;
+    use xray_common::net::address::Address;
 
     fn ip_dest(addr: SocketAddr) -> Destination {
         Destination::tcp(Address::from(addr.ip()), Port::new(addr.port()))

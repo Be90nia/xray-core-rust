@@ -60,7 +60,7 @@ pub fn generate_chacha20poly1305_key(input: &[u8]) -> [u8; 32] {
     let mut key = [0u8; 32];
     let mut t = Md5::digest(input);
     key[..16].copy_from_slice(&t);
-    t = Md5::digest(&t);
+    t = Md5::digest(t);
     key[16..].copy_from_slice(&t);
     key
 }

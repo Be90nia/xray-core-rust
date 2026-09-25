@@ -212,7 +212,7 @@ impl BbrSender {
     pub fn new(
         clock: Arc<dyn Clock>,
         initial_max_datagram_size: ByteCount,
-        profile: Profile,
+        _profile: Profile,
     ) -> Self {
         let initial_cwnd = INITIAL_CONGESTION_WINDOW_PACKETS * initial_max_datagram_size;
         let max_cwnd = 100 * initial_max_datagram_size; // ponytail: MaxCongestionWindowPackets = 100
@@ -229,7 +229,7 @@ impl BbrSender {
             ((rate.0 as f64) * gain) as ByteCount
         }));
 
-        let mut inner = BbrInner {
+        let inner = BbrInner {
             rtt_stats: None,
             sampler,
             mode: BbrMode::Startup,

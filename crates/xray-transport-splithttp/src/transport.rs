@@ -495,7 +495,7 @@ async fn listen_h3(
     tracing::info!(%local, "listening QUIC for XHTTP/3");
 
     let listener_endpoint = endpoint.clone();
-    let accept_task = tokio::spawn(async move {
+    let _accept_task = tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             let ctx = Arc::clone(&ctx);
             tokio::spawn(async move {

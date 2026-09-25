@@ -390,23 +390,20 @@ pub async fn listen(
             tokio::spawn(async move {
                 if let Some(tc) = tls {
                     let acc = tokio_rustls::TlsAcceptor::from(tc);
-                    match acc.accept(tcp).await {
-                        Ok(c) => {
-                            accept_h2(
-                                c,
-                                h,
-                                m,
-                                ep,
-                                mm,
-                                peer,
-                                &tr,
-                                ka_time,
-                                ka_timeout,
-                                keepalive_enabled,
-                            )
-                            .await
-                        },
-                        Err(_) => {},
+                    if let Ok(c) = acc.accept(tcp).await {
+                        accept_h2(
+                            c,
+                            h,
+                            m,
+                            ep,
+                            mm,
+                            peer,
+                            &tr,
+                            ka_time,
+                            ka_timeout,
+                            keepalive_enabled,
+                        )
+                        .await
                     }
                 } else {
                     accept_h2(tcp, h, m, ep, mm, peer, &tr, ka_time, ka_timeout, keepalive_enabled)
@@ -618,7 +615,7 @@ fn parse_config(s: &StreamSettings) -> io::Result<Config> {
     crate::config::parse_grpc_config(s.transport_json.as_ref())
 }
 fn io_err<E: std::fmt::Display>(e: E) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e.to_string())
+    io::Error::other(e.to_string())
 }
 
 struct DuplexConn {
@@ -933,7 +930,7 @@ mod tests {
 
         let connect = async || {
             let tcp = TcpStream::connect(addr).await.unwrap();
-            let (mut send_req, conn) = client::handshake(tcp).await.unwrap();
+            let (send_req, conn) = client::handshake(tcp).await.unwrap();
             tokio::spawn(async move {
                 let _ = conn.await;
             });

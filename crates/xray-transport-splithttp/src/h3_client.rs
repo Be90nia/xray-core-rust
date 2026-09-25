@@ -553,7 +553,7 @@ where
                 Ok(None) => return,
                 Err(e) => {
                     let _ = tx
-                        .send(Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))
+                        .send(Err(std::io::Error::other(e.to_string())))
                         .await;
                     return;
                 },
@@ -593,7 +593,7 @@ where
     };
     tokio::spawn(async move {
         tokio::select! {
-            _ = &mut close_fut => return,
+            _ = &mut close_fut => (),
             resp = stream.recv_response() => {
                 match resp {
                     Ok(resp) if resp.status() == StatusCode::OK => {}
@@ -622,8 +622,7 @@ where
                                 Ok(None) => return,
                                 Err(e) => {
                                     let _ = tx
-                                        .send(Err(std::io::Error::new(
-                                            std::io::ErrorKind::Other,
+                                        .send(Err(std::io::Error::other(
                                             e.to_string(),
                                         )))
                                         .await;

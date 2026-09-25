@@ -169,7 +169,7 @@ impl AsyncRead for LinkStream {
                 // pipe 关闭/idle 超时（Error::Eof）→ 流 EOF。
                 Poll::Ready(Err(xray_buf::io::Error::Eof)) => return Poll::Ready(Ok(())),
                 Poll::Ready(Err(e)) => {
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e.to_string())));
+                    return Poll::Ready(Err(io::Error::other(e.to_string())));
                 },
                 Poll::Pending => return Poll::Pending,
             }
@@ -199,7 +199,7 @@ impl AsyncWrite for LinkStream {
                 Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "link closed")))
             },
             Poll::Ready(Err(e)) => {
-                Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e.to_string())))
+                Poll::Ready(Err(io::Error::other(e.to_string())))
             },
             Poll::Pending => Poll::Pending,
         }

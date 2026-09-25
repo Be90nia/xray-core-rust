@@ -70,7 +70,7 @@ pub async fn dial_naive(
     let tls = BtlsConn::connect(
         tcp,
         &config.sni,
-        config.fingerprint.clone(),
+        config.fingerprint,
         None, // ECH（naive 不用）
         Some(
             xray_tls::client_config::build_server_cert_verifier(security_json.as_ref())

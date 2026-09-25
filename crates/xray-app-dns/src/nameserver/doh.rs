@@ -17,21 +17,20 @@
 
 use std::{
     future::Future,
-    net::{IpAddr, SocketAddr},
+    net::IpAddr,
     pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
-use h2::{client, server};
+use h2::client;
 use hickory_proto::rr::RecordType;
-use http::{Method, Request, Response, StatusCode, header::CONTENT_TYPE};
+use http::{Method, Request, StatusCode, header::CONTENT_TYPE};
 use tokio::time::timeout;
 use tokio_rustls::rustls::ClientConfig;
-use xray_common::net::{address::Address, destination::Destination, port::Port};
+use xray_common::net::{destination::Destination, port::Port};
 use xray_tls::utls::client as tls_client;
-use xray_transport::connection::TcpConnection;
 
 use crate::{
     cache_controller::CacheController,
@@ -375,6 +374,11 @@ mod tests {
 
     use super::*;
     use crate::config::IpOption;
+
+    use h2::server;
+    use http::Response;
+    use std::net::SocketAddr;
+    use xray_common::net::address::Address;
 
     fn ip_dest(addr: SocketAddr) -> Destination {
         Destination::tcp(Address::from(addr.ip()), Port::new(addr.port()))

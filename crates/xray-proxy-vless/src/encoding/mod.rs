@@ -154,7 +154,7 @@ pub fn write_address_port(out: &mut Vec<u8>, address: &Address, port: u16) {
 /// 从 `reader` 读取地址 + 端口。
 pub async fn read_address_port<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(Address, Port)> {
     let mut port_buf = [0u8; 2];
-    reader.read_exact(&mut port_buf).await.map_err(|e| VlessError::Io(e))?;
+    reader.read_exact(&mut port_buf).await.map_err(VlessError::Io)?;
     let port = u16::from_be_bytes(port_buf);
 
     let mut type_buf = [0u8; 1];

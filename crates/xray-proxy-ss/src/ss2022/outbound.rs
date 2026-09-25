@@ -67,6 +67,7 @@ impl std::fmt::Debug for Ss2022Outbound {
 ///
 /// 对应 Go `ClientConfig.udp_over_tcp` + `udp_over_tcp_version`。
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct UdpOverTcpConfig {
     /// 是否启用 UDP-over-TCP。
     pub enabled: bool,
@@ -74,11 +75,6 @@ pub struct UdpOverTcpConfig {
     pub version: u32,
 }
 
-impl Default for UdpOverTcpConfig {
-    fn default() -> Self {
-        Self { enabled: false, version: 0 }
-    }
-}
 
 /// SS-2022 出站完整配置（对应 proto `ClientConfig`）。
 #[derive(Debug, Clone)]

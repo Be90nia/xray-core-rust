@@ -14,7 +14,7 @@ pub use healthping_settings::{HealthPingConfig, HealthPingSettings};
 pub use healthping_stats::{HealthPingRtts, HealthPingStats, PingRtt};
 
 /// RTT 哨兵值：探测失败（对应 Go `rttFailed = math.MaxInt64 - 0`）。
-pub const RTT_FAILED: i64 = i64::MAX - 0;
+pub const RTT_FAILED: i64 = i64::MAX;
 
 /// RTT 哨兵值：未测试（对应 Go `rttUntested = math.MaxInt64 - 1`）。
 pub const RTT_UNTESTED: i64 = i64::MAX - 1;

@@ -106,9 +106,7 @@ pub fn parse_upgrade_response(bytes: &[u8]) -> Result<usize> {
             "not a status line: {status_line:?}"
         )));
     }
-    let status = status_line
-        .splitn(2, ' ')
-        .nth(1)
+    let status = status_line.split_once(' ').map(|x| x.1)
         .ok_or_else(|| {
             HttpUpgradeError::InvalidHttpFormat(format!("malformed status: {status_line:?}"))
         })?

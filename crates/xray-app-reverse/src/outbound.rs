@@ -141,11 +141,10 @@ impl PortalOutbound {
                 MuxLink { reader: link.reader, writer: link.writer },
                 ClientStrategy::default(),
             );
-            let worker = PortalWorker::new(client.clone()).map_err(|e| {
+            let worker = PortalWorker::new(client.clone()).inspect_err(|e| {
                 // Go Outbound.Dispatch 出错时 Interrupt(link)；此处 link 已并入
                 // ClientWorker，close 等价拆除
                 client.close();
-                e
             })?;
             self.picker.add_worker(worker);
             // Go portal.go:87-92：reader 为 pipe 时立即返回（carrier 会话由

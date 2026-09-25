@@ -111,10 +111,7 @@ impl Config {
             return path_escape(name);
         }
         // 自定义路径：找最后一个 '/' 的位置
-        let last_slash = match name.rfind('/') {
-            Some(idx) => idx,
-            None => 1,
-        };
+        let last_slash = name.rfind('/').unwrap_or(1);
         let start = 1;
         let end = last_slash.max(1);
         let raw_service = if end > start { &name[start..end] } else { "" };

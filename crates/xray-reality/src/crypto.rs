@@ -260,7 +260,7 @@ pub fn verify_session_payload(
     // `max_diff == 0` → 禁用校验（Go `MaxTimeDiff == 0 || ...` 短路语义）。
     // 注意：之前 `diff > 0` 会拒任何非零偏差，与 Go 缺省禁用语义颠倒。
     if max_diff != 0 {
-        let diff = if now_unix >= timestamp { now_unix - timestamp } else { timestamp - now_unix };
+        let diff = now_unix.abs_diff(timestamp);
         if diff > max_diff {
             return Err(RealityError::TimestampOutOfWindow {
                 actual: timestamp,

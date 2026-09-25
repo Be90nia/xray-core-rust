@@ -225,7 +225,7 @@ impl UdpHopPacketConn {
             closed: false,
         }));
 
-        let conn_inner = Arc::clone(&inner);
+        let _conn_inner = Arc::clone(&inner);
         // spawn recv loop on initial current_conn
         let recv_tx_clone = recv_tx.clone();
         let conn_for_recv = Arc::clone(&current_conn);

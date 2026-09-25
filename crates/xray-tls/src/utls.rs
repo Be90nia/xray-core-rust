@@ -537,7 +537,7 @@ pub async fn u_client_with_alpn<S>(
 where
     S: Connection + Unpin,
 {
-    let alpn_wire = alpn.map(|a| encode_alpn_wire(a));
+    let alpn_wire = alpn.map(encode_alpn_wire);
     // 尝试 btls（真实指纹）
     if let Some(result) = crate::btls_client::connector_for_fingerprint(&fingerprint) {
         match result {

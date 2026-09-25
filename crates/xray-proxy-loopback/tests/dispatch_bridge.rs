@@ -15,7 +15,6 @@
 
 use std::sync::Arc;
 
-use parking_lot::Mutex;
 use xray_app_dispatcher::default::DispatchHandler;
 use xray_buf::{
     io::{Reader, Writer},

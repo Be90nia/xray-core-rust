@@ -296,6 +296,7 @@ pub trait HandlerFactory: Send + Sync {
 }
 
 /// 默认 HandlerService 实现（对应 Go `handlerServer struct`）
+#[derive(Default)]
 pub struct DefaultHandlerService {
     /// 入站 handler 提供方（对应 Go `ihm inbound.Manager`）
     pub inbound_provider: Option<Arc<dyn InboundHandlerProvider>>,
@@ -315,20 +316,6 @@ pub struct DefaultHandlerService {
     pub factory: Option<Arc<dyn HandlerFactory>>,
 }
 
-impl Default for DefaultHandlerService {
-    fn default() -> Self {
-        Self {
-            inbound_provider: None,
-            outbound_provider: None,
-            inbound_registrar: None,
-            outbound_registrar: None,
-            inbound_remover: None,
-            outbound_remover: None,
-            op_decoder: None,
-            factory: None,
-        }
-    }
-}
 
 impl std::fmt::Debug for DefaultHandlerService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

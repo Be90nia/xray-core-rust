@@ -166,7 +166,7 @@ mod tests {
     #[tokio::test]
     async fn write_calls_counter_and_writer() {
         let counter: Arc<dyn Counter> = Arc::new(TestCounter::default());
-        let writer = Box::new(CollectingWriter::default());
+        let writer = Box::new(CollectingWriter);
         let mut sw = SizeStatWriter::new(counter.clone(), writer);
 
         let mb = MultiBuffer::default();
@@ -179,7 +179,7 @@ mod tests {
     #[tokio::test]
     async fn close_returns_ok() {
         let counter: Arc<dyn Counter> = Arc::new(TestCounter::default());
-        let writer = Box::new(CollectingWriter::default());
+        let writer = Box::new(CollectingWriter);
         let mut sw = SizeStatWriter::new(counter, writer);
         sw.close().expect("close ok");
     }
@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn constructor_stores_fields() {
         let counter: Arc<dyn Counter> = Arc::new(TestCounter::default());
-        let writer = Box::new(CollectingWriter::default());
+        let writer = Box::new(CollectingWriter);
         let sw = SizeStatWriter::new(counter.clone(), writer);
         assert_eq!(sw.counter.value(), 0);
     }
@@ -239,7 +239,7 @@ mod tests {
     #[test]
     fn maybe_wrap_writer_with_counter() {
         let counter: Arc<dyn Counter> = Arc::new(TestCounter::default());
-        let writer = Box::new(CollectingWriter::default());
+        let writer = Box::new(CollectingWriter);
         let wrapped = maybe_wrap_writer(Some(counter), writer);
         // 验证包装后可正常使用（类型正确）
         let _ = wrapped;
@@ -247,7 +247,7 @@ mod tests {
 
     #[test]
     fn maybe_wrap_writer_without_counter() {
-        let writer = Box::new(CollectingWriter::default());
+        let writer = Box::new(CollectingWriter);
         let wrapped = maybe_wrap_writer(None::<Arc<dyn Counter>>, writer);
         let _ = wrapped;
     }

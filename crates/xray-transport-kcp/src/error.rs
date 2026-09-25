@@ -61,7 +61,7 @@ mod tests {
 
     #[test]
     fn from_io_error_conversion() {
-        let err: KcpError = io::Error::new(io::ErrorKind::Other, "x").into();
+        let err: KcpError = io::Error::other("x").into();
         assert!(matches!(err, KcpError::Io(_)));
     }
 }

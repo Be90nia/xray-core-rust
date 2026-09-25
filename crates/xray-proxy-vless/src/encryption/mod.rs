@@ -503,7 +503,7 @@ impl ClientInstance {
         let mut client_hello: Vec<u8>;
         let nfs_key: [u8; 32];
         let mut nfs_aead: crate::encryption::aead::Aead;
-        let mut encrypted_pfs: Vec<u8>;
+        let _encrypted_pfs: Vec<u8>;
         let mut padding_lens_seg: Vec<u32>;
         let padding_gaps: Vec<std::time::Duration>;
         {

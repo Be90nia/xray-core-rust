@@ -258,13 +258,13 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>) -> DialFn {
                 option.set(request_option::GLOBAL_PADDING);
             }
             let account =
-                MemoryAccount::new(config.user_uuid.clone()).with_security(security.clone());
+                MemoryAccount::new(config.user_uuid.clone()).with_security(security);
             let session = ClientSession::new();
             let header = RequestHeader::new(
                 VERSION,
                 Command::Tcp,
                 Destination::new(target_addr, target_port, Network::TCP),
-                security.clone(),
+                security,
             )
             .with_option(option);
             let sealed = session

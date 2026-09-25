@@ -1628,7 +1628,7 @@ mod tests {
         let parsed = parse_client_hello(&record).unwrap();
         // server 时间偏离 100000s，max_diff=43200 → 超窗
         let server_now = client_time + 100_000;
-        let err = verify_reality_client_hello(
+        let _err = verify_reality_client_hello(
             &parsed,
             &server_priv,
             server_now,
@@ -2398,7 +2398,7 @@ mod tests {
                     "probe value must come from the table (got {max_useless_records})"
                 );
             },
-            (Ok(Ok(_)), other) => panic!("server unexpected outcome (see outcome variant)"),
+            (Ok(Ok(_)), _other) => panic!("server unexpected outcome (see outcome variant)"),
             (Ok(Err(e)), _) => panic!("client u_client failed: {e:?}"),
             (Err(_timeout), _) => panic!("client u_client timeout"),
         }
@@ -2445,7 +2445,7 @@ mod tests {
             (Ok(Ok(_)), Ok(RealityServerOutcome::Verified { max_useless_records, .. })) => {
                 assert_eq!(max_useless_records, 32)
             },
-            (Ok(Ok(_)), other) => panic!("server unexpected outcome (see outcome variant)"),
+            (Ok(Ok(_)), _other) => panic!("server unexpected outcome (see outcome variant)"),
             (Ok(Err(e)), _) => panic!("client u_client failed: {e:?}"),
             (Err(_timeout), _) => panic!("client u_client timeout"),
         }

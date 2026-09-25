@@ -29,7 +29,7 @@ impl Bandwidth {
         }
         // ponytail: 用 u128 中间运算避免溢出。
         let bytes_u = bytes.max(0) as u64;
-        let ns = delta.as_nanos() as u128;
+        let ns = delta.as_nanos();
         let sec_equiv = (bytes_u as u128 * 1_000_000_000) / ns;
         // bits/s = bytes/s * 8
         let bps = sec_equiv * (Self::BYTES_PER_SECOND.0 as u128);

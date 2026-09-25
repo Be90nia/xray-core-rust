@@ -483,7 +483,7 @@ where
         &decoded.addons.flow,
         decoded.user.as_ref().map_or("", |u| u.account.flow.as_str()),
         decoded.command,
-        options.as_ref().map_or(false, |o| o.outer_tls13),
+        options.as_ref().is_some_and(|o| o.outer_tls13),
     )?;
     // 1. 发送响应头（version + empty addons）
 
@@ -678,14 +678,12 @@ where
     }
 
     let registry = opts.and_then(|o| o.reverse_registry.as_ref()).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
+        std::io::Error::other(
             "vless Reverse enabled but no registry configured",
         )
     })?;
     let ohm: Arc<SimpleOhm> = opts.and_then(|o| o.reverse_ohm.clone()).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
+        std::io::Error::other(
             "vless Reverse enabled but no reverse_ohm configured",
         )
     })?;

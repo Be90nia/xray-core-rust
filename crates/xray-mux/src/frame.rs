@@ -254,7 +254,7 @@ fn read_target(data: &[u8]) -> Result<(Destination, usize), MuxError> {
 
     // PortThenAddress 格式：port(2B) + address(variable)
     let (port, addr, addr_consumed) = AddressParser::parse_port_address(&data[1..])
-        .ok_or_else(|| MuxError::AddressParseFailed)?;
+        .ok_or(MuxError::AddressParseFailed)?;
 
     let target = Destination::new(addr, port, network);
     Ok((target, 1 + addr_consumed))

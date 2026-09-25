@@ -86,14 +86,14 @@ impl TokioUpdater {
                 return;
             }
 
-            let mut interval = tokio::time::interval((*this.interval.lock()).clone());
+            let mut interval = tokio::time::interval(*this.interval.lock());
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             while (this.should_continue)() {
                 (this.update_func)();
                 interval.tick().await;
                 // 检查间隔是否被外部更新
-                let new_interval = (*this.interval.lock()).clone();
+                let new_interval = *this.interval.lock();
                 if interval.period() != new_interval {
                     interval = tokio::time::interval(new_interval);
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

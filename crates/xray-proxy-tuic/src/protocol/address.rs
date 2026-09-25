@@ -97,7 +97,7 @@ impl Address {
     pub fn encoded_len(&self) -> usize {
         match self {
             Self::None => 3,
-            Self::Domain(name, _) => 1 + 1 + name.as_bytes().len() + 2,
+            Self::Domain(name, _) => 1 + 1 + name.len() + 2,
             Self::Ipv4(_, _) => 1 + 4 + 2,
             Self::Ipv6(_, _) => 1 + 16 + 2,
         }

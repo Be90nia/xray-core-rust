@@ -462,7 +462,7 @@ async fn parallel_query(
     // JoinSet 排空后仍 Pending 的下标 = 任务 panic/abort（JoinError 分支拿不到
     // 下标）。视为完成（失败）：Go asyncQueryAll 保证每 client 至少一条结果，
     // 否则组内 pending 永真、组内成功永不消费（bd 5vfd）。
-    for (_idx, o) in outcomes.iter_mut().enumerate() {
+    for o in outcomes.iter_mut() {
         if matches!(o, ClientOutcome::Pending) {
             *o = ClientOutcome::Failure;
         }
