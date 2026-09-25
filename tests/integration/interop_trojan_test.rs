@@ -151,7 +151,19 @@ async fn rust_trojan_server_go_client() {
     let rust_trojan_port = trojan_listener.local_addr().expect("local addr").port();
     let ohm_clone = Arc::clone(&ohm);
     tokio::spawn(async move {
-        let _ = serve_trojan(trojan_listener, ohm_clone, users, None, None).await;
+        let listener = xray_transport::system_listener::InboundTcpListener::from_tokio(
+            trojan_listener,
+            xray_transport::sockopt::SocketOptions::default(),
+        );
+        let _ = serve_trojan(
+            listener,
+            ohm_clone,
+            users,
+            None,
+            None,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
     });
 
     // Configure Go xray: SOCKS5 inbound -> Trojan outbound -> Rust server
@@ -194,7 +206,7 @@ async fn rust_trojan_server_go_client_handshake_only() {
     let validator_clone = Arc::clone(&validator);
     let server_handle = tokio::spawn(async move {
         let (mut sock, _) = listener.accept().await.expect("accept");
-        trojan_server_handshake(&mut sock, &validator_clone).await
+        trojan_server_handshake(&mut sock, &validator_clone, std::time::Duration::from_secs(30)).await
     });
 
     // Rust client constructs Trojan handshake in Go-compatible format
