@@ -544,7 +544,6 @@ impl Commander {
             #[cfg(unix)]
             Some(Ok(grpc::ListenSpec::Unix(path))) => {
                 use tokio::net::UnixListener;
-                use tonic::codegen::tokio_stream::StreamExt as _;
                 let listener =
                     UnixListener::bind(&path).map_err(|e| CommanderError::InvalidListenAddr {
                         addr: path.clone(),
