@@ -6249,7 +6249,7 @@ mod tests {
         .await
         .unwrap();
         let addr = listener.local_addr().unwrap();
-        let mut config = HttpServerConfig { user_level: 3, ..Default::default() };
+        let config = HttpServerConfig { user_level: 3, ..Default::default() };
         let pm: Arc<dyn xray_features::policy::PolicyManager> =
             Arc::new(FixedHandshakePolicy(std::time::Duration::from_millis(120)));
         let handshake_timeout = Some(pm.policy_for_level(config.user_level).timeout.handshake);
