@@ -5,12 +5,9 @@
 //! 2. H3Conn::connect → dial_h3_packet_up：GET 下载 + POST 上传
 //! 3. server 端验证 POST 收到字节数
 
-use std::{
-    net::SocketAddr,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
-    },
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use bytes::{Buf, Bytes};

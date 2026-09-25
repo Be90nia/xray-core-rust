@@ -25,7 +25,7 @@ use std::{
     time::Instant,
 };
 
-use ml_kem::{Decapsulate, KeyExport};
+use ml_kem::KeyExport;
 use parking_lot::RwLock;
 // rand_core trait bounds for build_relaychain RNG
 use rand_core::{CryptoRng, RngCore};
@@ -274,8 +274,7 @@ impl ClientInstance {
         let last_idx = self.nfs_pkeys.len() - 1;
 
         for (j, pk) in self.nfs_pkeys.iter().enumerate() {
-            let index;
-            if pk.len() == 32 {
+            let index = if pk.len() == 32 {
                 // X25519
                 let peer_pub_bytes: [u8; 32] = pk[..]
                     .try_into()
@@ -289,7 +288,7 @@ impl ClientInstance {
                 let shared = ephemeral.diffie_hellman(&peer_pub);
                 client_hello[pos..pos + 32].copy_from_slice(ephemeral_pub.as_bytes());
                 nfs_key.copy_from_slice(shared.as_bytes());
-                index = 32;
+                32
             } else {
                 // ML-KEM-768
                 let ek_bytes: ml_kem::Key<ml_kem::EncapsulationKey768> =
@@ -304,8 +303,8 @@ impl ClientInstance {
                 let (ct, ss) = ek.encapsulate_deterministic(&ml_kem::B32::from(m));
                 client_hello[pos..pos + 1088].copy_from_slice(&ct[..]);
                 nfs_key.copy_from_slice(&ss[..]);
-                index = 1088;
-            }
+                1088
+            };
 
             // Go client.go:98-99：XorMode>0 → NewCTR(NfsPKeysBytes[j], iv) XOR 本段，
             // 让 X25519 pub / ML-KEM ct 与随机字节可区分；server 端持派生公钥
@@ -732,8 +731,8 @@ fn unix_minute() -> i64 {
 /// [`ServerInstance::init`] 解析私钥；[`ServerInstance::handshake`] 解密客户端握手。
 ///
 /// 0-RTT（`seconds_from/seconds_to > 0`）：1-RTT 成功后 ticket+PfsKey 入
-/// [`SessionStore`]（跨连接共享，对齐 Go handler 级单例），后续连接凭 ticket
-/// 走 0-RTT（replay 防护 + 过期清理见 [`SessionStore`]）。
+/// `SessionStore`（跨连接共享，对齐 Go handler 级单例），后续连接凭 ticket
+/// 走 0-RTT（replay 防护 + 过期清理见 `SessionStore`）。
 /// padding 分段发送：简化为一次发送。
 pub struct ServerInstance {
     /// NFS 私钥数组（按 init 顺序）。
@@ -2009,6 +2008,7 @@ mod tests {
         let first_flight = build_zero_rtt_first_flight(&client_pkeys[0], &cached_ticket);
 
         let (mut fake_c, fake_s) = tokio::io::duplex(64 * 1024);
+        #[allow(unused_imports)] // 存量清零批次
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         fake_c.write_all(&first_flight).await.unwrap();
         let err = match fresh_server.handshake(fake_s).await {
@@ -2023,6 +2023,7 @@ mod tests {
 
         // 发起方读到 1279..2279B 噪声（非 TLS header，长度匹配 1-RTT server hello），
         // 对应 Go client 侧触发重新握手语义。
+        #[allow(unused_imports)] // 存量清零批次
         use tokio::io::AsyncReadExt as _;
         let mut noise = Vec::new();
         fake_c.read_to_end(&mut noise).await.unwrap();

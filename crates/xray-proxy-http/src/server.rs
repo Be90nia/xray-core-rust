@@ -10,7 +10,7 @@
 
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
 };
 
@@ -432,7 +432,6 @@ mod tests {
     };
 
     use super::*;
-    use crate::config::Account;
 
     // ===== base64 / parse_host_port 纯函数测试 =====
 
@@ -688,8 +687,7 @@ mod tests {
     async fn handshake_origin_form_allowed_with_transparent() {
         // allowTransparent=true 放行 origin-form，dest 从 Host header 解析。
         let req = b"GET /path?q=1 HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        let mut cfg = ServerConfig::default();
-        cfg.allow_transparent = true;
+        let cfg = ServerConfig { allow_transparent: true, ..Default::default() };
         let (_, result) = tcp_handshake(req, cfg).await;
         let hs = result.unwrap();
         assert_eq!(hs.method, "GET");
@@ -726,9 +724,8 @@ mod tests {
 
         let addr = format!("127.0.0.1:{port}");
         let result = tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(&addr)).await;
-        match result {
-            Ok(Ok(_)) => panic!("listener should be closed after close()"),
-            Ok(Err(_)) | Err(_) => {},
+        if let Ok(Ok(_)) = result {
+            panic!("listener should be closed after close()");
         }
     }
 }

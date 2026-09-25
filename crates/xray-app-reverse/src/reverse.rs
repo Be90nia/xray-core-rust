@@ -229,7 +229,6 @@ impl Feature for ReverseFeature {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use parking_lot::Mutex;
 

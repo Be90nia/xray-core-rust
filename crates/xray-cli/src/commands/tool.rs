@@ -95,7 +95,7 @@ pub enum TlsCommand {
 /// `xray tls ping` - TLS 握手测试（对齐 Go `main/commands/all/tls/ping.go`）。
 #[derive(Args, Debug, Clone)]
 pub struct TlsPingArgs {
-    /// 目标域名[:端口]，默认端口 443。
+    /// 目标域名`[:端口]`，默认端口 443。
     pub domain: String,
     /// 指定连接 IP 地址（绕过 DNS）。对齐 Go `-ip`。
     #[arg(short, long = "ip")]
@@ -397,7 +397,7 @@ fn json_config_to_proto_config(config: &serde_json::Value) -> ProtoConfig {
     add(tm("xray.app.observatory.Config", config.get("observatory")));
     add(tm("xray.app.observatory.burst.Config", config.get("burstObservatory")));
     add(tm("xray.app.geodata.Config", config.get("geodata")));
-    drop(add);
+    // drop(add)：add 为 Fn 闭包引用，无需显式释放
 
     let raw = serde_json::to_vec(config).unwrap_or_default();
     let inbound = build_inbound_configs(&raw).unwrap_or_default();
@@ -629,6 +629,7 @@ async fn ping_once(ip: std::net::IpAddr, port: u16, sni: Option<&str>) -> Result
     let conn = tls.get_ref().1;
     let mut s = String::new();
     // TLS version
+    #[allow(clippy::redundant_guards)] // 存量清零批次
     let ver = match conn.protocol_version() {
         Some(v) if v == tokio_rustls::rustls::ProtocolVersion::TLSv1_3 => "TLS 1.3",
         Some(v) if v == tokio_rustls::rustls::ProtocolVersion::TLSv1_2 => "TLS 1.2",
@@ -1031,7 +1032,7 @@ mod tls_cert_tests {
     fn cert_effective_domains_uses_placeholder_when_empty() {
         let args = basic_args(vec![]);
         assert_eq!(args.effective_domains(), vec!["localhost".to_string()]);
-        let mut args2 = basic_args(vec!["x.test"]);
+        let args2 = basic_args(vec!["x.test"]);
         assert_eq!(args2.effective_domains(), vec!["x.test".to_string()]);
         // suppress unused
         let _ = args;

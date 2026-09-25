@@ -299,7 +299,8 @@ pub fn wrap_conn_client_from_settings(
 /// `Box<dyn Connection>`（client 侧发往固定 `remote_addr`）。
 ///
 /// 用在 UDP transport dial 路径：`Box<dyn UdpIo>` → mask 包装 → `Box<dyn Connection>`，
-/// 让 [`Connection`] consumer（不关心 UDP vs TCP 抽象）能消费 UDP 流。
+/// 让 [`Connection`](crate::connection::Connection) consumer（不关心 UDP vs TCP 抽象）能消费 UDP
+/// 流。
 ///
 /// **语义**：每次 read 取 1 个 UDP packet（不足 `buf` 长度则下次 read 取剩余或下一包）；
 /// write 把 buffer 发到记录的 `remote_addr`。
@@ -624,7 +625,7 @@ pub struct FinalmaskConfig {
 
 /// 根据配置构建 UDP 伪装管理器（对应 Go `CreateUdpmaskManager`）。
 ///
-/// 按 [header] → [security] 顺序追加到 manager，对应 Go `slices.Backward` 逆序应用。
+/// 按 `header` → `security` 顺序追加到 manager，对应 Go `slices.Backward` 逆序应用。
 pub fn build_udpmask_manager(config: &FinalmaskConfig) -> io::Result<UdpmaskManager> {
     let mut masks: Vec<Box<dyn Udpmask>> = Vec::new();
 

@@ -35,9 +35,9 @@ pub struct TCPItem {
     pub rand_max: u8,
     /// 字面量 packet（与 `rand`/`var`/`expr` 互斥优先级）。
     pub packet: Vec<u8>,
-    /// 求值结果写入 ctx.vars[save]。
+    /// 求值结果写入 `ctx.vars[save]`。
     pub save: String,
-    /// 引用 ctx.vars[var]。
+    /// 引用 `ctx.vars[var]`。
     pub var: String,
     /// 表达式节点。
     pub expr: Option<Expr>,
@@ -56,7 +56,7 @@ pub struct TCPConfig {
     pub clients: Vec<TCPSequence>,
     /// 服务端发送、客户端读取的序列。
     pub servers: Vec<TCPSequence>,
-    /// 服务端在 clients[i] 校验失败时发送的错误序列。
+    /// 服务端在 `clients[i]` 校验失败时发送的错误序列。
     pub errors: Vec<TCPSequence>,
 }
 

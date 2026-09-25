@@ -23,7 +23,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use xray_app_dispatcher::default::DialFn;
 use xray_common::{
     net::{address::Address, destination::Destination, network::Network, port::Port},
@@ -58,7 +58,7 @@ pub struct VlessOutboundConfig {
     pub encryption: String,
     /// ENC 解析后参数（Go `infra/conf/vless.go:333-370` 出站 encryption 校验结果）。
     /// `None` 时按 `encryption == "none"` 处理；`Some` 时 make_dial_fn 在 dial 后
-    /// 立即执行 ENC 握手（`ClientInstance::handshake`）并用 [`EncConnectionAdapter`]
+    ///     `立即执行 ENC 握手（`ClientInstance::handshake`）并用 `EncConnectionAdapter``
     /// 包裹。**目前 vless 配置 path 不传入**——留给 production 调用者显式配置；
     /// inbound 解码 users[].encryption 后通过 builder 注入。
     pub enc_params: Option<crate::encryption::ClientEncParams>,
@@ -263,7 +263,7 @@ type EstablishFn = Arc<
 /// 1. dial 到 VLESS 服务器 → `Box<dyn Connection>`
 /// 2. （配置 ENC 时）`ClientInstance::handshake` 包装为加密连接
 /// 3. `encode_request_header` 写 VLESS 头（含目标地址）
-/// 4. ENC 配置下再包一层 [`EncRetryConn`]：0-RTT 票据失效自动重拨一次
+/// 4. ENC 配置下再包一层 `EncRetryConn`：0-RTT 票据失效自动重拨一次
 ///
 /// # Panics
 ///
@@ -441,6 +441,8 @@ struct EncRetryConn {
     dest: Destination,
     retried: bool,
     /// Mutex 包装只为 Sync（Connection 要求）：poll 单线程独占，锁无竞争。
+    #[allow(clippy::type_complexity)]
+    // 重连 future 的完整类型即业务语义，抽 type alias 反而更晦涩
     reconnecting: parking_lot::Mutex<
         Option<Pin<Box<dyn Future<Output = Result<Box<dyn Connection>, String>> + Send>>>,
     >,
@@ -613,10 +615,11 @@ mod tests {
     /// flow 字段上线验证：config.flow 经 make_dial_fn 写入请求头 addons.flow，
     /// 服务端 decode_request_header 应读到 xtls-rprx-vision。
     #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
     async fn make_dial_fn_sends_flow_in_request_header() {
         use tokio::{
             io::{AsyncReadExt, AsyncWriteExt},
-            net::{TcpListener, TcpStream},
+            net::TcpListener,
         };
         use xray_proto::xray::proxy::vless::Account as ProtoAccount;
 
@@ -674,8 +677,12 @@ mod tests {
     /// 写入 = 第二个 padding 块（uuid 已消费，无前缀）。未包装 → 首字节非
     /// uuid / 业务内容裸奔 → fail。
     #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
     async fn make_dial_fn_wraps_conn_with_vision_when_flow_xrv() {
-        use tokio::time::{Duration, timeout};
+        use tokio::{
+            io::AsyncWriteExt as _,
+            time::{Duration, timeout},
+        };
         use xray_proto::xray::proxy::vless::Account as ProtoAccount;
 
         use crate::{
@@ -743,6 +750,7 @@ mod tests {
     /// 时序：读完 uuid-only 块 + 业务块之后才写响应头。旧行为（dial 内同步
     /// decode_response_header）在此死锁 → 本测试超时失败。
     #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
     async fn vision_dial_returns_before_deferred_response_header() {
         use tokio::{
             io::{AsyncReadExt, AsyncWriteExt},

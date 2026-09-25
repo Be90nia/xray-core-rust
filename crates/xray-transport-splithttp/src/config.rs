@@ -12,8 +12,8 @@
 //!
 //! 实现所有 `GetNormalized*` 纯函数方法（默认值推断 + Placement 依赖判定）
 //! + prost 双向转换。复杂方法（依赖 `http.Request` / `XPadding`）留切片2：
-//! `WriteResponseHeader` / `GetRequestHeaderWithPayload` / `ApplyMetaToRequest` /
-//! `FillStreamRequest` / `FillPacketRequest` / `ExtractMetaFromRequest`。
+//! - `WriteResponseHeader` / `GetRequestHeaderWithPayload` / `ApplyMetaToRequest` /
+//!   `FillStreamRequest` / `FillPacketRequest` / `ExtractMetaFromRequest`。
 
 use std::collections::HashMap;
 
@@ -719,7 +719,7 @@ impl Config {
     /// （Go config.go:64-96 GetRequestHeaderWithPayload/CookiesWithPayload）。
     ///
     /// # Errors
-    /// - [`SplitHttpError::InvalidPlacement`]: session/seq placement 值非合法常量
+    /// - `SplitHttpError::InvalidPlacement`: session/seq placement 值非合法常量
     pub fn build_packet_request_meta(
         &self,
         base_uri: &str,
@@ -789,7 +789,7 @@ impl Config {
     /// stream-up/one 时设 `Content-Type: application/grpc`（除非 `no_grpc_header=true`）。
     ///
     /// # Errors
-    /// - [`SplitHttpError::InvalidPlacement`]: session placement 值非合法常量
+    /// - `SplitHttpError::InvalidPlacement`: session placement 值非合法常量
     pub fn build_stream_request_meta(
         &self,
         base_uri: &str,

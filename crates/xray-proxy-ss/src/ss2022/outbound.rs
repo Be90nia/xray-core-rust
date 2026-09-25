@@ -66,15 +66,13 @@ impl std::fmt::Debug for Ss2022Outbound {
 /// SS-2022 UDP 出站配置（支持 UDP-over-TCP 模式）。
 ///
 /// 对应 Go `ClientConfig.udp_over_tcp` + `udp_over_tcp_version`。
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct UdpOverTcpConfig {
     /// 是否启用 UDP-over-TCP。
     pub enabled: bool,
     /// UoT 协议版本（0 或 1）。
     pub version: u32,
 }
-
 
 /// SS-2022 出站完整配置（对应 proto `ClientConfig`）。
 #[derive(Debug, Clone)]

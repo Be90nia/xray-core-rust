@@ -14,7 +14,7 @@
 //!
 //! `service_name` 字段支持两种格式：
 //!
-//! - **传统格式**（无 `/` 前缀）：直接 [`path_escape`] 编码整串。
+//! - **传统格式**（无 `/` 前缀）：直接 `path_escape` 编码整串。
 //!   - 例如 `"GunService"` → `"GunService"`
 //!   - stream 名固定为 `"Tun"` / `"TunMulti"`
 //!
@@ -98,7 +98,7 @@ pub(crate) fn parse_grpc_config(json: Option<&serde_json::Value>) -> io::Result<
 }
 
 impl Config {
-    /// 解析 `service_name` 为 gRPC 服务名（已 [`path_escape`]）。
+    /// 解析 `service_name` 为 gRPC 服务名（已 `path_escape`）。
     ///
     /// 对应 Go `Config.getServiceName()`。逻辑：
     ///
@@ -121,7 +121,7 @@ impl Config {
         raw_service.split('/').map(path_escape).collect::<Vec<_>>().join("/")
     }
 
-    /// 解析 `service_name` 末段为 Tun stream 名（已 [`path_escape`]）。
+    /// 解析 `service_name` 末段为 Tun stream 名（已 `path_escape`）。
     ///
     /// 对应 Go `Config.getTunStreamName()`。逻辑：
     ///
@@ -138,14 +138,14 @@ impl Config {
         path_escape(tun_part)
     }
 
-    /// 解析 `service_name` 末段为 TunMulti stream 名（已 [`path_escape`]）。
+    /// 解析 `service_name` 末段为 TunMulti stream 名（已 `path_escape`）。
     ///
     /// 对应 Go `Config.getTunMultiStreamName()`。逻辑：
     ///
     /// - 无 `/` 前缀：固定返回 `"TunMulti"`
     /// - 有 `/` 前缀：取末段按 `|` 分割
-    ///   - 1 段：客户端路径，escape 段[0]
-    ///   - 2 段：服务端 multi 路径，escape 段[1]
+    ///   - 1 段：客户端路径，escape 段`0`
+    ///   - 2 段：服务端 multi 路径，escape 段`1`
     #[must_use]
     pub fn tun_multi_stream_name(&self) -> String {
         let name = &self.service_name;

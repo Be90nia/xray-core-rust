@@ -181,8 +181,7 @@ async fn dial_kcp(
     let conn_weak = Arc::downgrade(&conn);
     let reader = KCPPacketReader::new();
     tokio::task::spawn_blocking(move || {
-        loop {
-            let Some(payload) = packet_input.read_packet() else { break };
+        while let Some(payload) = packet_input.read_packet() {
             let Some(conn_now) = conn_weak.upgrade() else { break };
             let segments = reader.read(&payload);
             if !segments.is_empty() {

@@ -24,7 +24,6 @@ use async_trait::async_trait;
 use tokio::{sync::Mutex, task::JoinHandle};
 use tracing::info;
 use xray_features::inbound::{InboundError, InboundHandler};
-use xray_proto::xray::transport::internet::QuicParams;
 use xray_transport_hysteria::{
     conn::{InterConn, InterStreamConn},
     hub::{

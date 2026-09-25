@@ -15,8 +15,8 @@
 //!   format：`[IV][sealed_size_chunk(18B)][sealed_payload_chunk]`
 //!   - `sealed_size_chunk` = `aead.seal(nonce=[0;n], [], BE(plain_size))`
 //!   - `sealed_payload_chunk` = `aead.seal(nonce=[1,0,...], [], addr+port)` nonce 序列与 Go
-//!     `GenerateAEADNonceWithSize(n)` 行为一致（首帧 increment → [0;n]） 后续 body chunk 由真实流式
-//!     client/server 处理（需共享 nonce 状态）
+//!     `GenerateAEADNonceWithSize(n)` 行为一致（首帧 increment → `[0;n]`） 后续 body chunk
+//!     由真实流式 client/server 处理（需共享 nonce 状态）
 //! - **UDP**：每个包自包含 IV + 加密(addr + payload)，一次性 nonce 全 0
 
 use xray_common::net::address::Address;
@@ -267,7 +267,7 @@ const fn size_chunk_wire_len(tag_size: usize) -> usize {
 /// 2. sealed_size_chunk：`aead.seal(nonce=[0;n], [], BE(data_len + tag_size))` plaintext =
 ///    `(addr+port.len + overhead) BE u16`，密文 2 字节 + 16B tag = 18B
 /// 3. sealed_payload_chunk：`aead.seal(nonce=[1,0,...], [], addr+port)` nonce 第二次
-///    increment（首帧从 [0xFF;n] increment → [0;n]，再 → [1,0,...]）
+///    increment（首帧从 `[0xFF;n]` increment → `[0;n]`，再 → `[1,0,...]`）
 ///
 /// # Errors
 /// - [`SsError::InsufficientData`]：None cipher 不支持 AEAD TCP（仅 AEAD 走此函数）。
@@ -321,9 +321,9 @@ pub fn encode_tcp_request_header(
 ///
 /// wire format 与 [`encode_tcp_request_header`] 对偶。流程（对应 Go
 /// `ReadTCPSession` 简化版）：
-/// 1. `validator.Get(buf, Tcp)` 用 [0;n] nonce 尝试解 size chunk 匹配用户
+/// 1. `validator.Get(buf, Tcp)` 用 `[0;n]` nonce 尝试解 size chunk 匹配用户
 /// 2. 用 match 到 user 的 cipher/key/IV 重新派生 aead
-/// 3. 用 [0;n] 解 size chunk → plain_size = data_len + tag_size
+/// 3. 用 `[0;n]` 解 size chunk → plain_size = data_len + tag_size
 /// 4. 用 [1,0,...] 解 payload chunk → plaintext = addr+port
 ///
 /// # Errors
@@ -506,7 +506,7 @@ mod tests {
         let payload = b"hello shadowsocks udp payload";
 
         let encoded = encode_udp_packet(&account, &addr, 443, payload).expect("encode");
-        let (header, data) = decode_udp_packet(&validator, &encoded).expect("decode");
+        let (header, _data) = decode_udp_packet(&validator, &encoded).expect("decode");
         assert_eq!(header.address, addr);
         assert_eq!(header.port, 443);
         assert_eq!(header.command, RequestCommand::Udp);
@@ -540,7 +540,7 @@ mod tests {
 
         let addr = Address::IPv4(std::net::Ipv4Addr::new(8, 8, 8, 8));
         let encoded = encode_udp_packet(&account, &addr, 53, b"query").expect("encode");
-        let (header, data) = decode_udp_packet(&validator, &encoded).expect("decode");
+        let (header, _data) = decode_udp_packet(&validator, &encoded).expect("decode");
         assert_eq!(header.address, addr);
         assert_eq!(header.port, 53);
     }
@@ -553,7 +553,7 @@ mod tests {
 
         let addr = Address::IPv6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
         let encoded = encode_udp_packet(&account, &addr, 443, b"ipv6 test").expect("encode");
-        let (header, data) = decode_udp_packet(&validator, &encoded).expect("decode");
+        let (header, _data) = decode_udp_packet(&validator, &encoded).expect("decode");
         assert_eq!(header.address, addr);
     }
 

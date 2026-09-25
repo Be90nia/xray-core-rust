@@ -741,10 +741,10 @@ mod proc_windows {
 /// proc_macos::find_process 调 /usr/sbin/lsof 取原始字节流；
 /// 这里抽出 parse 逻辑便于在所有平台单测（不依赖 macOS shell-out）。
 ///
-/// 输入格式（man lsof FIELD OUTPUT）：每行 <tag><value> 单字符前缀：
-/// - p<pid>：进程 ID
-/// - c<command>：进程命令名
-/// - i<local-addr>:<local-port>-<remote-addr>:<remote-port>：internet socket
+/// 输入格式（man lsof FIELD OUTPUT）：每行 `<tag><value>` 单字符前缀：
+/// - `p<pid>`：进程 ID
+/// - `c<command>`：进程命令名
+/// - `i<local-addr>:<local-port>-<remote-addr>:<remote-port>`：internet socket
 ///
 /// 匹配语义：给定 (source_ip, source_port)，找出 i 行 local endpoint 等于该 (ip, port) 的第一个
 /// PID。

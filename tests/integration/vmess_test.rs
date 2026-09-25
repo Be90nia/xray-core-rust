@@ -93,7 +93,18 @@ async fn run_vmess_e2e(security: SecurityType) {
     let ohm_clone = Arc::clone(&ohm);
     let validator_clone = Arc::clone(&validator);
     tokio::spawn(async move {
-        let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None).await;
+        let listener = xray_transport::system_listener::InboundTcpListener::from_tokio(
+            vmess_listener,
+            xray_transport::sockopt::SocketOptions::default(),
+        );
+        let _ = serve_vmess(
+            listener,
+            ohm_clone,
+            validator_clone,
+            None,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
     });
 
     // 4. VMess client：connect → encode header → decode response header → echo round-trip
@@ -151,7 +162,18 @@ async fn vmess_rejects_unknown_user() {
     let ohm_clone = Arc::clone(&ohm);
     let validator_clone = Arc::clone(&validator);
     tokio::spawn(async move {
-        let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None).await;
+        let listener = xray_transport::system_listener::InboundTcpListener::from_tokio(
+            vmess_listener,
+            xray_transport::sockopt::SocketOptions::default(),
+        );
+        let _ = serve_vmess(
+            listener,
+            ohm_clone,
+            validator_clone,
+            None,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
     });
 
     // client 用未注册的随机 UUID
@@ -191,7 +213,18 @@ async fn vmess_e2e_aes128gcm_large_payload() {
     let ohm_clone = Arc::clone(&ohm);
     let validator_clone = Arc::clone(&validator);
     tokio::spawn(async move {
-        let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None).await;
+        let listener = xray_transport::system_listener::InboundTcpListener::from_tokio(
+            vmess_listener,
+            xray_transport::sockopt::SocketOptions::default(),
+        );
+        let _ = serve_vmess(
+            listener,
+            ohm_clone,
+            validator_clone,
+            None,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
     });
 
     let mut client = tokio::net::TcpStream::connect(vmess_addr).await.unwrap();
@@ -247,7 +280,18 @@ async fn vmess_e2e_authenticated_length() {
     let ohm_clone = Arc::clone(&ohm);
     let validator_clone = Arc::clone(&validator);
     tokio::spawn(async move {
-        let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None).await;
+        let listener = xray_transport::system_listener::InboundTcpListener::from_tokio(
+            vmess_listener,
+            xray_transport::sockopt::SocketOptions::default(),
+        );
+        let _ = serve_vmess(
+            listener,
+            ohm_clone,
+            validator_clone,
+            None,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
     });
 
     // 客户端：connect + encode header with AUTHENTICATED_LENGTH
@@ -300,7 +344,7 @@ async fn vmess_over_mux_tcp_e2e() {
 
     // ---- 1. TCP echo server ----
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let echo_port = echo_listener.local_addr().unwrap().port();
+    let _echo_port = echo_listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         let (mut sock, _) = echo_listener.accept().await.unwrap();
         let mut buf = [0u8; 4096];
@@ -352,6 +396,7 @@ async fn vmess_over_mux_tcp_e2e() {
             tokio::spawn(async move {
                 let mut rd = r_up;
                 let mut wr = w_down;
+                #[allow(clippy::while_let_loop)] // 存量清零批次
                 loop {
                     match rd.read_multi_buffer().await {
                         Ok(mb) => {
@@ -513,15 +558,14 @@ impl DispatchHandler for MuxCarrierHandler {
     ) -> xray_app_dispatcher::default::PinFuture<()> {
         let server = Arc::clone(&self.server);
         Box::pin(async move {
-            use xray_buf::{io::Writer as _, reader::BufferedReader};
+            use xray_buf::reader::BufferedReader;
             let mut reader = BufferedReader::new(link.reader);
             let writer: Arc<tokio::sync::Mutex<Option<Box<dyn xray_buf::io::Writer>>>> =
                 Arc::new(tokio::sync::Mutex::new(Some(link.writer)));
-            let (ka, idle) = server.spawn_keepalive_and_idle_timeout(Arc::clone(&writer));
+            let monitor = server.spawn_monitor(Arc::clone(&writer));
             while matches!(server.process_frame(&mut reader, &writer).await, Ok(true)) {}
             server.close();
-            ka.abort();
-            idle.abort();
+            monitor.abort();
         })
     }
 }

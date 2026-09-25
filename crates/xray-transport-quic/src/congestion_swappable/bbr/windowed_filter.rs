@@ -74,9 +74,9 @@ where
 
     /// 用新样本更新（对应 Go `Update`）。
     ///
-    /// 算法：若 estimates[0] 是默认值（comparator 返回 0），或新样本比 best 更优，
-    /// 或 estimates[2] 已过期，则 Reset。否则按优势级别更新 estimates[1] / [2]。
-    /// 最后处理过期：若 estimates[0] 过期则降级。
+    /// 算法：若 estimates`0` 是默认值（comparator 返回 0），或新样本比 best 更优，
+    /// 或 estimates`2` 已过期，则 Reset。否则按优势级别更新 estimates`1` / `2`。
+    /// 最后处理过期：若 estimates`0` 过期则降级。
     pub fn update(&mut self, new_sample: V, new_time: T)
     where
         V: PartialEq,

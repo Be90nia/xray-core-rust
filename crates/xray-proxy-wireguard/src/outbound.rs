@@ -33,8 +33,10 @@ use crate::{
 ///
 /// 持有 driver + smoltcp 网栈句柄。dial 在 netstack 上建 socket。
 pub struct WireguardOutboundHandler {
+    #[allow(dead_code)] // 存量清零批次
     tag: String,
     /// driver task 句柄。
+    #[allow(dead_code)] // 句柄由 worker task 持有，字段保留生命周期
     driver: Arc<WgDriver>,
     /// 共享的 smoltcp 网栈。
     netstack: Arc<AsyncMutex<WgNetStack>>,
@@ -62,6 +64,8 @@ impl WireguardOutboundHandler {
     /// - 解析 peer endpoint（域名经 `dns` 解析，Go `client.go:298-329`）
     /// - 创建 smoltcp 网栈（从 config.endpoint 派生 interface 地址）
     /// - spawn driver task（`reserved` 写 WG 包头 + `num_workers` worker 池）
+    #[allow(private_bounds)] // TtlDnsCache 为 wireguard crate 内网栈实现细节
+    #[allow(private_interfaces)] // TtlDnsCache 为 wireguard crate 内网栈实现细节
     pub async fn new_with_dialer(
         tag: impl Into<String>,
         config: &DeviceConfig,
@@ -204,6 +208,7 @@ async fn resolve_endpoint_addr(
 /// 从 DeviceConfig.endpoint 解析为 smoltcp IpCidr。
 ///
 /// 复用 [`crate::wireguard::parse_endpoints`] 的解析逻辑。
+#[allow(clippy::incompatible_msrv)] // 存量清零批次：incompatible_msrv
 fn parse_local_cidrs(config: &DeviceConfig) -> Result<Vec<smoltcp::wire::IpCidr>> {
     let parsed = crate::wireguard::parse_endpoints(config)?;
     parsed

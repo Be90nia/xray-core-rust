@@ -47,7 +47,7 @@ pub type ListenerController = Arc<dyn Fn(&str, &str, &Socket) -> io::Result<()> 
 /// 系统监听器 trait。对应 Go `DefaultListener` 的 `Listen` 方法。
 ///
 /// 实现者负责 TCP bind + accept 循环 + sockopt 应用。
-/// `accept` 返回 `Box<dyn Connection>`，与 [`crate::Listener`] trait 一致。
+/// `accept` 返回 `Box<dyn Connection>`，与 `crate::Listener` trait 一致。
 pub trait SystemListener: Send + Sync {
     /// 接受一个入站连接（已应用 inbound sockopt）。
     fn accept<'a>(
@@ -398,7 +398,7 @@ pub fn register_listener_controller(ctl: ListenerController) -> io::Result<()> {
 /// 系统级 TCP 监听。对应 Go `DefaultListener.Listen(ctx, addr, sockopt)` 的 TCP 分支。
 ///
 /// 绑定 `addr`，创建 [`DefaultListener`]，注入全局 fd 控制器。
-/// 返回的 listener 可通过 [`SystemListener`] 或 [`Listener`] trait 使用。
+/// 返回的 listener 可通过 [`SystemListener`] 或 `Listener` trait 使用。
 pub async fn listen_system(
     addr: SocketAddr,
     sockopt: SocketOptions,
@@ -435,6 +435,13 @@ impl InboundTcpListener {
     /// 监听器本地地址（serve 层日志 / local addr 兜底用）。
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.inner.local_addr()
+    }
+
+    /// 用已绑定的 tokio listener 构造（测试或高级场景用）。
+    /// 与 [`DefaultListener::from_tokio`] 对称。
+    #[must_use]
+    pub fn from_tokio(inner: TokioTcpListener, sockopt: SocketOptions) -> Self {
+        Self { inner, sockopt }
     }
 
     /// accept 一个连接并应用 inbound sockopt（TCP_NODELAY / keepalive 等）。

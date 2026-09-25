@@ -223,7 +223,7 @@ impl<'de> Deserialize<'de> for PortList {
 /// 配置层用户（邮箱 + 权限等级）。
 ///
 /// 对应 Go `infra/conf.User`（common.go:277-287）。各协议 inbound 的用户
-/// 列表项先解析为此类型，Build 阶段转为运行时 [`xray_common::protocol::User`]。
+/// 列表项先解析为此类型，Build 阶段转为运行时 `xray_common::protocol::User`。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct User {
     /// 用户邮箱（统计/限速标识）。Go `EmailString`。

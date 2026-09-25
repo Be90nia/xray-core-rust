@@ -56,8 +56,6 @@ async fn start_echo_server() -> SocketAddr {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reverse_dispatcher_to_dialbridge_to_echo_roundtrip() {
-    use xray_app_dispatcher::OutboundHandlerManager as _;
-
     // 1. echo server 真实目标
     let echo_addr = start_echo_server().await;
 
@@ -110,7 +108,7 @@ async fn reverse_yamux_bridge_to_portal_echo_full_chain() {
     //    echo。
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let portal_addr = listener.local_addr().unwrap();
-    let portal_task = tokio::spawn(async move {
+    let _portal_task = tokio::spawn(async move {
         let (tcp, _) = match listener.accept().await {
             Ok(v) => v,
             Err(_) => return,
@@ -176,7 +174,7 @@ async fn reverse_portal_dispatch_carries_source_local_to_bridge() {
     use xray_app_reverse::{
         BridgeWorker, LinkDispatch, PortalOutbound, PortalWorker, ReverseError, StaticMuxPicker,
     };
-    use xray_buf::{io::Writer as _, pipe};
+    use xray_buf::pipe;
     use xray_mux::{
         client::{ClientWorker, Link as MuxLink},
         session::ClientStrategy,

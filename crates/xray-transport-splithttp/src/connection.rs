@@ -13,7 +13,7 @@
 //! # Sync 兼容
 //!
 //! `PacketUpConn = SplitConn<Box<dyn AsyncRead + Send + Unpin>, DuplexStream>` 的
-//! reader 是 `!Sync`，无法直接 impl [`Connection`]（要求 `Send + Sync + Unpin`）。
+//! reader 是 `!Sync`，无法直接 impl `Connection`（要求 `Send + Sync + Unpin`）。
 //! 解决方案：[`MutexReader`] 包装 reader 使其 `Sync`，通过 [`SplitConn::into_sync_reader`]
 //! 转换后满足 `Connection` bound。
 
@@ -38,9 +38,9 @@ pub struct SplitConn<R, W> {
     /// 上传管道写端（packet-up mode 由 [`crate::dialer`] 用 `tokio::io::duplex`
     /// 创建 + 后台 `post_packet` 任务消费）。
     pub writer: W,
-    /// 远端地址（来自 [`crate::client::HttpInfo`]::`remote_addr`）。
+    /// 远端地址（来自 `crate::client::HttpInfo`::`remote_addr`）。
     pub remote_addr: SocketAddr,
-    /// 本地地址（来自 [`crate::client::HttpInfo`]::`local_addr`）。
+    /// 本地地址（来自 `crate::client::HttpInfo`::`local_addr`）。
     pub local_addr: SocketAddr,
     /// 关闭回调（packet-up mode 用于 `xmuxClient.OpenUsage -= 1` 等清理）。
     /// 包在 `Mutex` 内允许 `Drop` 时 take 调用。
@@ -202,7 +202,7 @@ mod tests {
         let mut conn = SplitConn::new(read_half, write_half, remote, local);
 
         let mut buf = [0u8; 8];
-        conn.read(&mut buf).await.unwrap();
+        let _ = conn.read(&mut buf).await.unwrap();
         assert_eq!(&buf, b"download");
 
         conn.write_all(b"upload").await.unwrap();

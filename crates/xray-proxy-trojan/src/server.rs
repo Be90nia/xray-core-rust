@@ -37,7 +37,7 @@ use xray_transport::{link::Link, system_listener::InboundTcpListener};
 
 use crate::{
     fallback::FallbackPolicy,
-    protocol::{COMMAND_TCP, CRLF, Network, addr_type, parse_udp_packet_stream, write_udp_packet},
+    protocol::{CRLF, Network, addr_type, parse_udp_packet_stream, write_udp_packet},
     validator::{MemoryUser, Validator},
 };
 
@@ -244,13 +244,13 @@ impl InboundHandler for TrojanServer {
 ///
 /// # Errors
 ///
-/// - [`TrojanError::ReadUserHash`]: 读 hex key 失败
-/// - [`TrojanError::UserNotFound`]: 用户 hash 不在 validator 中
-/// - [`TrojanError::ReadCrlf`]: CRLF 不匹配
-/// - [`TrojanError::ReadCommand`]: CMD 非法
-/// - [`TrojanError::ReadAddressPort`]: addr/port 解析失败
-/// - [`TrojanError::HandshakeTimeout`]: 整段握手读超时（60s）
-/// - [`TrojanError::InvalidVersionPrefix`]: 首字节非 v1 hex 且非 v2 `0x02`
+/// - `TrojanError::ReadUserHash`: 读 hex key 失败
+/// - `TrojanError::UserNotFound`: 用户 hash 不在 validator 中
+/// - `TrojanError::ReadCrlf`: CRLF 不匹配
+/// - `TrojanError::ReadCommand`: CMD 非法
+/// - `TrojanError::ReadAddressPort`: addr/port 解析失败
+/// - `TrojanError::HandshakeTimeout`: 整段握手读超时（60s）
+/// - `TrojanError::InvalidVersionPrefix`: 首字节非 v1 hex 且非 v2 `0x02`
 pub async fn trojan_server_handshake<S>(
     stream: &mut S,
     validator: &Validator,
@@ -368,7 +368,7 @@ where
         .map_err(|e| crate::TrojanError::ReadUserHash(format!("read key: {e}")))?;
 
     // 3. 校验 key via Validator
-    let user = validator.get_by_key(&key_buf).ok_or_else(|| crate::TrojanError::UserNotFound)?;
+    let user = validator.get_by_key(&key_buf).ok_or(crate::TrojanError::UserNotFound)?;
 
     // 4. 读 CRLF
     let mut crlf = [0u8; 2];
@@ -529,6 +529,7 @@ pub async fn serve_trojan(
 /// 与 [`serve_trojan`] 每 conn 逻辑相同，但连接来自 transport 层
 /// （ws/grpc/kcp 解包后），TLS 已在 transport hub 内终结——`tls_name`/
 /// `tls_alpn` 传空（Go：非 `*tls.Conn` 同为空）。
+#[allow(clippy::too_many_arguments)] // 与 serve_trojan 装配参数集一一对应
 pub async fn serve_trojan_conn<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: S,
     validator: Arc<Validator>,
@@ -557,6 +558,7 @@ pub async fn serve_trojan_conn<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
 }
 
 /// 处理单个 Trojan 连接：handshake → dispatch / fallback。
+#[allow(clippy::too_many_arguments)] // handshake+fallback 装配参数集
 async fn handle_trojan_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut recorder: RecordingStream<S>,
     validator: Arc<Validator>,
@@ -702,7 +704,7 @@ mod tests {
     use super::*;
     use crate::{
         config::{MemoryAccount, hex_sha224},
-        protocol::{Network as TrojanNetwork, write_request_header},
+        protocol::{COMMAND_TCP, Network as TrojanNetwork, write_request_header},
     };
 
     fn make_validator_with_user(password: &str) -> Arc<Validator> {
@@ -954,9 +956,8 @@ mod tests {
         let result =
             tokio::time::timeout(std::time::Duration::from_secs(1), TcpStream::connect(&addr))
                 .await;
-        match result {
-            Ok(Ok(_)) => panic!("listener should be closed after close()"),
-            Ok(Err(_)) | Err(_) => {},
+        if let Ok(Ok(_)) = result {
+            panic!("listener should be closed after close()");
         }
     }
 

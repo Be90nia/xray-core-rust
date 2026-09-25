@@ -243,10 +243,10 @@ impl QuicConn for QuinnQuicConn {
     }
 }
 
-/// [`CongestionSetter`] 的 quinn conn 实现（m9j：client 侧 auth 后热切换 CC）。
+/// `CongestionSetter` 的 quinn conn 实现（m9j：client 侧 auth 后热切换 CC）。
 ///
 /// quinn 无 post-handshake CC API，实际由 conn 创建时装好的可热切换 factory +
-/// [`cc_slot`](QuinnQuicConn::with_cc_slot) 生效。
+/// `cc_slot`（QuinnQuicConn::with_cc_slot）生效。
 impl crate::congestion::utils::CongestionSetter for QuinnQuicConn {
     fn set_congestion_control(&self, cc: Box<dyn crate::congestion::types::CongestionControl>) {
         match &self.cc_slot {
@@ -554,6 +554,7 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
 /// 对应 Go `http3.Server.ServeQUICConn`（auth + SetCongestionControl switch）+
 /// `conn.AcceptStream`（data）。CC 协商（hub.go:75-86）：`down` 取请求
 /// `Hysteria-CC-RX`（客户端下行容量），`UseBrutal(min(BrutalUp, down))`。
+#[allow(clippy::too_many_arguments)] // 存量清零批次
 async fn serve_hysteria_connection(
     conn: quinn::Connection,
     validator: Option<Arc<dyn crate::hub::AuthValidator>>,
@@ -1019,6 +1020,7 @@ pub struct DefaultRequestHandler {
     validator: Option<Arc<dyn crate::hub::AuthValidator>>,
     masq: Arc<dyn MasqueradeHandler>,
     on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync>,
+    #[allow(dead_code)] // 存量清零批次
     salamander_key: Vec<u8>,
 }
 
@@ -1270,7 +1272,9 @@ mod tests {
         let h3: h3::server::Connection<AuthH3Conn, bytes::Bytes> =
             h3::server::Connection::new(AuthH3Conn::new(server.inner().clone())).await.unwrap();
         drop(h3);
+        #[allow(unused_mut, unused_variables)] // 存量清零批次
         let (mut send, mut recv) = client.inner().open_bi().await.unwrap();
+        #[allow(unused_imports)] // 存量清零批次
         use tokio::io::AsyncWriteExt;
         send.write_all(b"hello").await.unwrap();
         send.finish().unwrap();
@@ -1279,6 +1283,7 @@ mod tests {
                 .await
                 .expect("wrapped h3 server drop must NOT close the QUIC conn")
                 .unwrap();
+        #[allow(unused_imports)] // 存量清零批次
         use tokio::io::AsyncReadExt;
         let mut buf = vec![0u8; 5];
         r.read_exact(&mut buf).await.unwrap();
@@ -1349,6 +1354,7 @@ mod tests {
     async fn listener_factory_full_auth_and_stream_roundtrip() {
         use std::sync::Arc;
 
+        #[allow(unused_imports)] // 存量清零批次
         use tokio::sync::Notify;
 
         use crate::{
@@ -1365,7 +1371,7 @@ mod tests {
             rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
         let server_tls = rustls::server::ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(vec![cert_der.into()], key_der)
+            .with_single_cert(vec![cert_der], key_der)
             .unwrap();
 
         // server: QuinnListenerFactory
@@ -1489,7 +1495,7 @@ mod tests {
             rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
         let server_tls = rustls::server::ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(vec![cert_der.into()], key_der)
+            .with_single_cert(vec![cert_der], key_der)
             .unwrap();
 
         // server: 带 salamander 的 QuinnListenerFactory
@@ -1604,7 +1610,7 @@ mod tests {
             rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
         let server_tls = rustls::server::ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(vec![cert_der.into()], key_der)
+            .with_single_cert(vec![cert_der], key_der)
             .unwrap();
 
         let factory = QuinnListenerFactory::new(Arc::new(server_tls)).with_obfs(obfs.clone());
@@ -1713,7 +1719,7 @@ mod tests {
             rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
         let server_tls = rustls::server::ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(vec![cert_der.into()], key_der)
+            .with_single_cert(vec![cert_der], key_der)
             .unwrap();
 
         let factory = QuinnListenerFactory::new(Arc::new(server_tls));
@@ -1819,7 +1825,7 @@ mod tests {
             rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
         let server_tls = rustls::server::ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(vec![cert_der.into()], key_der)
+            .with_single_cert(vec![cert_der], key_der)
             .unwrap();
 
         let factory = QuinnListenerFactory::new(Arc::new(server_tls));
@@ -1918,7 +1924,7 @@ mod tests {
             rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
         let server_tls = rustls::server::ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(vec![cert_der.into()], key_der)
+            .with_single_cert(vec![cert_der], key_der)
             .unwrap();
 
         let factory = QuinnListenerFactory::new(Arc::new(server_tls));

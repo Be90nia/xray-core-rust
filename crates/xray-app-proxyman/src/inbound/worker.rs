@@ -331,7 +331,7 @@ impl TcpWorker {
         // bd mvsc：task 挂 worker 生命周期信号（同构响应泵 close_notify 先例），
         // worker close 唤醒后连接 task 随 select 退出——无孤儿。
         let close_notify = Arc::clone(&self.close_notify);
-        
+
         tokio::spawn(async move {
             let inbound_conn = InboundConn::Tcp(tracked);
             tokio::select! {

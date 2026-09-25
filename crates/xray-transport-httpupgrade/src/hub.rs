@@ -27,7 +27,7 @@ pub struct UpgradeRequest {
     pub host: String,
     /// 所有 header（小写键），保留原始顺序信息丢失（HashMap）。
     pub headers: HashMap<String, String>,
-    /// `X-Forwarded-For` 解析结果（按从近到远顺序，[0] 是最源端）。
+    /// `X-Forwarded-For` 解析结果（按从近到远顺序，`0` 是最源端）。
     pub forwarded_for: Vec<IpAddr>,
 }
 
@@ -145,9 +145,7 @@ pub fn apply_trusted_x_forwarded_for(
     headers: &HashMap<String, String>,
     trusted: &[String],
 ) -> Option<SocketAddr> {
-    let Some(value) = headers.get("x-forwarded-for").filter(|v| !v.is_empty()) else {
-        return None;
-    };
+    let value = headers.get("x-forwarded-for").filter(|v| !v.is_empty())?;
     // 首段 + trim（Go value[:idx] 后 ParseAddress 对首尾非 alnum 串 TrimSpace）。
     let first = value.split(',').next().unwrap_or(value).trim();
     if trusted.iter().any(|t| headers.contains_key(t.to_ascii_lowercase().as_str())) {

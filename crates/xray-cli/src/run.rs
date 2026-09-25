@@ -24,20 +24,16 @@
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
 };
 
 use clap::Args;
 
-use crate::{
-    error::{CliError, Result},
-    version::print_version,
-};
+use crate::error::{CliError, Result};
 
 /// 初始化全局 tracing subscriber（幂等：已存在全局 subscriber 时静默跳过）。
 ///
 /// 优先级：`RUST_LOG`（开发覆盖，例 `RUST_LOG=xray_tls=debug`）> `default_directive`。
-/// 9tk4：`default_directive` 由配置 `log.loglevel` 推导（见 [`loglevel_directive`]），
+/// 9tk4：`default_directive` 由配置 `log.loglevel` 推导（见 `loglevel_directive`），
 /// 使直连 tracing 日志受 loglevel 单一事实源门控；工具子命令传固定 "info"。
 pub fn init_tracing(default_directive: &str) {
     use tracing_subscriber::{EnvFilter, fmt};
@@ -186,6 +182,7 @@ pub async fn execute(args: RunArgs) -> Result<()> {
 ///
 /// 用于 `--unix` 启动期校验：`--unix` 仅对 XHTTP inbound 有意义。
 /// 至少一个 inbound 的 streamSettings.network == "splithttp" 即返回 true。
+#[allow(dead_code)] // 保留：供后续 XHTTP 启动校验使用
 fn config_uses_splithttp(config: &xray_conf::config::Config) -> bool {
     let inbounds = &config.inbound_configs;
     inbounds.iter().any(|ib| {
@@ -228,7 +225,7 @@ async fn wait_for_signal() {
     }
 }
 
-/// 优雅关闭 [`Instance`]：若 `Arc<Instance>` 是唯一持有者则调用 `Instance::close`，
+/// 优雅关闭 `Instance`：若 `Arc<Instance>` 是唯一持有者则调用 `Instance::close`，
 /// 否则记录 warn 并返回 Ok（多持有者场景留待后续按需扩展）。
 ///
 /// 暴露为 `pub` 以便单元测试覆盖两条路径（成功 close / 多持有者跳过）。

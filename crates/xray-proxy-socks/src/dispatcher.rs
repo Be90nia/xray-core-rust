@@ -4,7 +4,7 @@
 //! [`make_dial_fn`] 闭包，内部把 [`Destination`] 转 [`SocksAddr`] 后调
 //! [`SocksClient::dial`]，再用 [`TcpConnection`] 包装为 `Box<dyn Connection>`。
 //!
-//! 模式完全照搬 [`xray-proxy-anytls::dispatcher`]（已验证的拨号型 outbound adapter）。
+//! `模式完全照搬 `xray-proxy-anytls::dispatcher`（已验证的拨号型 outbound adapter）。`
 //!
 //! [`DialBridge`]: xray_app_dispatcher::default::DialBridge
 //! [`DialFn`]: xray_app_dispatcher::default::DialFn
@@ -18,7 +18,7 @@ use xray_transport::connection::{Connection, TcpConnection};
 
 use crate::{client::SocksClient, protocol::SocksAddr};
 
-/// 构造 [`DialBridge`] 用的 [`DialFn`] 闭包。
+/// `构造 `DialBridge` 用的 [`DialFn`](xray_app_dispatcher::default::DialFn) 闭包。`
 ///
 /// 闭包捕获 `Arc<SocksClient>`，每次调用：
 /// 1. 把 [`Destination`] 转 [`SocksAddr`]（同步）
@@ -118,6 +118,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
+            // accept Err 时保持轮询（mock listener 生命周期内 Err 仅瞬时；while let 会提前退出）
+            #[allow(clippy::while_let_loop)]
             loop {
                 if let Ok((mut sock, _)) = listener.accept().await {
                     tokio::spawn(async move {

@@ -61,6 +61,7 @@ mod tests {
     /// 测试用 context 载体：可变字段用 RwLock 保护。
     struct TestCtx {
         datagram: RwLock<bool>,
+        #[allow(dead_code)] // 存量清零批次
         auth: RwLock<Option<Arc<str>>>,
     }
 
@@ -84,8 +85,8 @@ mod tests {
     #[test]
     fn datagram_flag_roundtrip() {
         let ctx = TestCtx::new();
-        assert_eq!(ctx.datagram(), false);
+        assert!(!ctx.datagram());
         *ctx.datagram.write() = true;
-        assert_eq!(ctx.datagram_from(), true);
+        assert!(ctx.datagram_from());
     }
 }

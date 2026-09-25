@@ -266,6 +266,7 @@ mod tests {
         assert_eq!(path, "/submit");
     }
 
+    #[allow(dead_code)] // 存量清零批次
     fn extract_path_no_slash_returns_none() {
         // 没有任何 '/' 字节
         let bytes = b"GET  HTTPl"; // 无 '/'

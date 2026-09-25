@@ -6,7 +6,7 @@
 //! # IO 边界
 //!
 //! - [`ConnectionCloser`]：关闭底层连接（Go `io.Closer`），生产由 dialer/listener 注入。
-//! - [`SegmentWriter`]：输出 segment（已在 [`output`] 模块定义）。
+//! - [`SegmentWriter`]：输出 segment（已在 `output` 模块定义）。
 //! - `TokioUpdater`：生产模式 spawn 周期任务；测试模式用 `None`（核心逻辑不依赖 updater）。
 //!
 //! Read/Write 提供**同步**简化版（不等待窗口/数据，短写或返回 0），上层 adapter

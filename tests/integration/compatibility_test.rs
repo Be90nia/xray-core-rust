@@ -13,7 +13,7 @@ use xray_common::{
     protocol::{Command, SecurityType},
     uuid::UUID,
 };
-use xray_proxy_ss::protocol::{read_address_port_ss, write_address_port_ss};
+use xray_proxy_ss::protocol::write_address_port_ss;
 use xray_proxy_trojan::{
     config::{MemoryAccount as TrojanAccount, hex_sha224},
     protocol::{COMMAND_TCP, write_request_header},
@@ -96,7 +96,7 @@ fn trojan_frame_format_compatible_with_go() {
     let dest_port: u16 = 443;
 
     let mut buf = Vec::new();
-    write_request_header(
+    let _unused = write_request_header(
         &mut buf,
         &account,
         xray_proxy_trojan::protocol::Network::Tcp,

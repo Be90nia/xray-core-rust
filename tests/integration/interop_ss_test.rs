@@ -12,7 +12,6 @@
 mod interop_helpers;
 
 use interop_helpers::*;
-use tokio::io::AsyncWriteExt;
 use xray_common::net::address::Address;
 use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
 use xray_proxy_ss::{

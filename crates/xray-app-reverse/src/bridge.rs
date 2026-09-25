@@ -100,7 +100,7 @@ pub fn pick_portal_worker<W: PickerWorker>(
     picker.pick_available_index()
 }
 
-/// 重新导出 Arc<dyn Bridge> / Arc<dyn Portal> 类型别名。
+/// 重新导出 `Arc<dyn Bridge>` / `Arc<dyn Portal>` 类型别名。
 pub type SharedBridge = Arc<dyn Bridge>;
 pub type SharedPortal = Arc<dyn Portal>;
 
@@ -450,7 +450,7 @@ impl Portal for RuntimePortal {
     }
 }
 
-/// Portal worker 的 [`PickerWorker`](crate::picker::PickerWorker) 转发（Arc 容器）。
+/// Portal worker 的 [`PickerWorker`] 转发（Arc 容器）。
 impl crate::picker::PickerWorker for std::sync::Arc<PortalWorker> {
     fn is_full(&self) -> bool {
         (**self).is_full()

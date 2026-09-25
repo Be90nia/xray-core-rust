@@ -8,15 +8,12 @@
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use hickory_proto::{
     op::{Message, MessageType, OpCode, Query},
-    rr::{
-        Name, RData, Record, RecordType,
-        rdata::opt::{ClientSubnet, EdnsOption},
-    },
+    rr::{Name, RData, Record, RecordType, rdata::opt::EdnsOption},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -25,8 +22,15 @@ use tokio::{
 use xray_app_dns::{
     cache_controller::CacheController,
     config::IpOption,
+    dial::SystemHostResolver,
     nameserver::{Server, tcp::TcpNameServer, udp::UdpNameServer},
 };
+use xray_common::net::{address::Address, destination::Destination, port::Port};
+
+/// SocketAddr → UDP Destination（对齐 nameserver 单测 helper）。
+fn ip_dest(addr: SocketAddr) -> Destination {
+    Destination::udp(Address::from(addr.ip()), Port::new(addr.port()))
+}
 
 /// 构造 A 或 AAAA 响应。req_id 由 query bytes echo。
 fn make_response(
@@ -97,12 +101,13 @@ async fn udp_query_returns_correct_a_record() {
     )
     .await;
 
-    let ns = UdpNameServer::new(
-        addr,
+    let ns = Arc::new(UdpNameServer::new(
+        ip_dest(addr),
         Arc::new(CacheController::new("test", true, false, 0, 0)), // disable_cache=true 强制走网络
         Vec::new(),
         Duration::from_secs(2),
-    );
+        Arc::new(SystemHostResolver),
+    ));
 
     let (ips, ttl) = ns
         .query_ip(
@@ -130,12 +135,13 @@ async fn udp_query_cache_hit_on_second_call() {
     )
     .await;
 
-    let ns = UdpNameServer::new(
-        addr,
+    let ns = Arc::new(UdpNameServer::new(
+        ip_dest(addr),
         Arc::new(CacheController::new("test", false, false, 0, 0)), // cache ENABLED
         Vec::new(),
         Duration::from_secs(2),
-    );
+        Arc::new(SystemHostResolver),
+    ));
 
     // 第一次查询 → 走网络。
     let (ips1, ttl1) = ns
@@ -183,12 +189,13 @@ async fn udp_query_with_edns0_client_ip_attaches_subnet() {
     .await;
 
     // client_ip = 4 字节 IPv4 → 应被附加为 EDNS0 client subnet /24。
-    let ns = UdpNameServer::new(
-        addr,
+    let ns = Arc::new(UdpNameServer::new(
+        ip_dest(addr),
         Arc::new(CacheController::new("test", true, false, 0, 0)),
         vec![192, 168, 1, 100],
         Duration::from_secs(2),
-    );
+        Arc::new(SystemHostResolver),
+    ));
 
     let _ = ns
         .query_ip(
@@ -203,7 +210,7 @@ async fn udp_query_with_edns0_client_ip_attaches_subnet() {
     // 验证 EDNS0 存在 + 包含 Subnet option。
     let edns = query_msg.edns.as_ref().expect("edns present");
     let has_subnet =
-        edns.options().as_ref().iter().any(|(code, opt)| matches!(opt, EdnsOption::Subnet(_)));
+        edns.options().as_ref().iter().any(|(_code, opt)| matches!(opt, EdnsOption::Subnet(_)));
     assert!(has_subnet, "edns0 subnet option must be present");
 
     // 进一步验证 Subnet 内容。
@@ -236,12 +243,13 @@ async fn tcp_query_returns_a_record() {
         sock.flush().await.unwrap();
     });
 
-    let ns = TcpNameServer::new(
-        addr,
+    let ns = Arc::new(TcpNameServer::new(
+        ip_dest(addr),
         Arc::new(CacheController::new("test", true, false, 0, 0)),
         Vec::new(),
         Duration::from_secs(2),
-    );
+        Arc::new(SystemHostResolver),
+    ));
     let (ips, _ttl) = ns
         .query_ip(
             "tcp.example",
@@ -261,12 +269,13 @@ async fn udp_query_aaaa_record() {
     let addr =
         spawn_udp_echo_server("v6.example.".to_string(), vec![], vec![v6], 60, captured).await;
 
-    let ns = UdpNameServer::new(
-        addr,
+    let ns = Arc::new(UdpNameServer::new(
+        ip_dest(addr),
         Arc::new(CacheController::new("test", true, false, 0, 0)),
         Vec::new(),
         Duration::from_secs(2),
-    );
+        Arc::new(SystemHostResolver),
+    ));
     let (ips, _ttl) = ns
         .query_ip(
             "v6.example",
@@ -291,12 +300,13 @@ async fn server_trait_object_dispatch() {
         captured,
     )
     .await;
-    let ns = UdpNameServer::new(
-        addr,
+    let ns = Arc::new(UdpNameServer::new(
+        ip_dest(addr),
         Arc::new(CacheController::new("test", true, false, 0, 0)),
         Vec::new(),
         Duration::from_secs(2),
-    );
+        Arc::new(SystemHostResolver),
+    ));
     let server: Box<dyn Server> = Box::new(ns);
     assert!(server.name().starts_with("UDP:"));
     // CacheController::new("test", true, ...) → disable_cache=true → is_disable_cache()=true。

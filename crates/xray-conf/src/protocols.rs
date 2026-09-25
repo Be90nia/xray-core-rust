@@ -955,7 +955,7 @@ pub struct HttpClientBuild {
     /// 上游端点地址（Go 未校验非空；缺失时透传 None）。
     pub address: Option<Address>,
     pub port: u16,
-    /// 认证用户（顶层折叠路径：username 非空才挂；servers 路径：users[0]）。
+    /// 认证用户（顶层折叠路径：username 非空才挂；servers 路径：`users[0]`）。
     pub user: Option<HttpClientUserBuild>,
     /// `headers` map 转换产物，按 key 排序（Go map 迭代序随机，此处取确定序）。
     pub headers: Vec<HttpHeaderBuild>,

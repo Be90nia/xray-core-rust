@@ -47,7 +47,7 @@
 //!
 //! 对应 Go `proxy/tun/udp_fullcone.go` 的 `udpConns map[net.Destination]*udpConn`：
 //! 按 source 分桶天然 cone NAT。session 生命周期由 inbound handler 持有
-//! （Arc<Mutex<HashMap>>），后续切片可加 idle 淘汰（Go `CancelAfterInactivity(1min)`）。
+//! （`Arc<Mutex<HashMap>>`），后续切片可加 idle 淘汰（Go `CancelAfterInactivity(1min)`）。
 use std::{
     collections::HashMap,
     sync::{
@@ -533,6 +533,7 @@ fn ip_endpoint_to_udp_destination(ep: &IpEndpoint) -> Option<Destination> {
     Some(Destination::new(address, Port::new(ep.port), Network::UDP))
 }
 /// xray Address → smoltcp IpAddress（域名返回 None；build_udp_response 需要 IP）。
+#[allow(clippy::incompatible_msrv)] // smoltcp 唯一公开构造 from_octets（1.91 stable，晚于 workspace MSRV 声明）
 fn address_to_smoltcp(addr: &Address) -> Option<smoltcp::wire::IpAddress> {
     match addr {
         Address::IPv4(v4) => Some(smoltcp::wire::IpAddress::Ipv4(
@@ -1480,11 +1481,7 @@ mod tests {
             .find(|p| p.len() >= 34 && p[9] == 6 && (p[20 + 13] & 0x12) == 0x12)
             .map(|p| u32::from_be_bytes([p[20 + 4], p[20 + 5], p[20 + 6], p[20 + 7]]))
             .expect("SYN-ACK must be emitted at batch end");
-        assert_eq!(
-            captured.lock().expect("lock").is_some(),
-            false,
-            "no dispatch inside critical section"
-        );
+        assert!(!captured.lock().expect("lock").is_some(), "no dispatch inside critical section");
 
         // 批 2：ACK 完成握手 → accept 事件批尾收集
         let ack = make_test_ipv4_tcp_packet(

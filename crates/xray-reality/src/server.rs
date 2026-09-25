@@ -23,8 +23,9 @@ use crate::{
 /// bd tce2：REALITY 握手成功后的 TLS 流（rustls 默认 / btls opt-in）。
 ///
 /// 两路在「ClientHello 判定 / dest fallback / probe 喂值」三处共享同一前置
-/// （[`verify_and_probe`]），仅 TLS 握手执行者不同；调用方按 AsyncRead +
+/// （`verify_and_probe`），仅 TLS 握手执行者不同；调用方按 AsyncRead +
 /// AsyncWrite 消费，无感知具体实现。
+#[allow(clippy::large_enum_variant)] // 双 TLS 栈 variant 尺寸差为 btls/rustls 事实，Box 化破坏零成本
 pub enum RealityTlsStream<C> {
     /// 默认：rustls（tokio-rustls）TLS 1.3 握手。
     Rustls(TlsStream<PrefixedReader<C>>),
@@ -342,7 +343,7 @@ const SESSION_ID_OFFSET_IN_HANDSHAKE: usize = 39;
 ///
 /// client 端 `compute_session_id` 编码时先把 session_id 置全 0，再编码整个 handshake message，
 /// 用此 zero-session-id 版本作为 AES-GCM AAD。因此服务端验证时必须取 handshake_message，
-/// 把 session_id 字段（偏移 [`SESSION_ID_OFFSET_IN_HANDSHAKE`]，32 字节）替换为全 0 再解密。
+/// 把 session_id 字段（偏移 `SESSION_ID_OFFSET_IN_HANDSHAKE`，32 字节）替换为全 0 再解密。
 ///
 /// # 参数
 ///
@@ -418,6 +419,7 @@ pub fn verify_reality_client_hello(
 }
 
 /// [`server_tls`] 的返回：REALITY 验证成功返回 TLS 连接，失败返回原连接 + 已读 record 供 fallback。
+#[allow(clippy::large_enum_variant)] // TLS 连接 vs 原连接 + record 的尺寸差为协议事实
 pub enum RealityServerOutcome<C> {
     /// REALITY 验证通过，返回 TLS 连接（rustls 或 btls，见
     /// [`RealityTlsStream`]；可传给 VLESS 入站）。
@@ -482,6 +484,7 @@ struct VerifiedHandshake {
 ///
 /// Err = REALITY 验证失败（调用方转 [`RealityServerOutcome::Invalid`] 走
 /// fallback）；不返回 Err 的约定由各 server_tls* 函数保持。
+#[allow(clippy::too_many_arguments)] // 存量清零批次：too_many_arguments
 fn verify_and_probe(
     record: &[u8],
     server_private_key: &[u8; 32],
@@ -538,12 +541,12 @@ fn verify_and_probe(
 ///
 /// 流程：
 /// 1. [`read_tls_record`] 读 ClientHello record
-/// 2. [`verify_and_probe`] 验证（parse/SNI 门/verify/查表）
+/// 2. `verify_and_probe` 验证（parse/SNI 门/verify/查表）
 /// 3. 成功：[`generate_reality_ed25519_cert`] + [`build_server_config`] + rustls TLS 握手
 /// 4. 失败：返回 [`RealityServerOutcome::Invalid`]，调用方决定 fallback
 ///
 /// btls（BoringSSL）opt-in 路径见 [`server_tls_btls`]；两路前置语义共享
-/// （[`verify_and_probe`]），dest fallback / probe 喂值行为一致。
+/// （`verify_and_probe`），dest fallback / probe 喂值行为一致。
 ///
 /// # 参数
 ///
@@ -568,6 +571,7 @@ fn verify_and_probe(
 ///
 /// 验证失败（parse/verify）**不返回 Err**，而是返回 [`RealityServerOutcome::Invalid`]，
 /// 让调用方决定是否 [`fallback_to_dest`]。
+#[allow(clippy::too_many_arguments)] // Go reality 握手装配参数集
 pub async fn server_tls<C>(
     mut conn: C,
     server_private_key: &[u8; 32],
@@ -632,10 +636,9 @@ where
 /// curl 3/3 失败）。现 gate = 记录长度列表非空（`tls.go:414-416` 语义），
 /// tier 与 mirror gate 解耦（tier 只喂 `maxUselessRecords` 上限消费）。
 /// Rust 侧 gate 命中亦**不发**（bd 26zn 方案 B，见下方处置记录）。
-
 /// REALITY 服务端握手（btls/BoringSSL opt-in 路径，bd tce2）。
 ///
-/// 前置与 [`server_tls`] 完全共享（[`verify_and_probe`]：ClientHello 预读
+/// 前置与 [`server_tls`] 完全共享（`verify_and_probe`：ClientHello 预读
 /// 判定 / SNI 门 / session_id verify / probe 查表），dest fallback 语义一致
 /// （Invalid → 调用方 [`fallback_to_dest`]）；差异仅在握手执行者：
 /// BoringSSL server SSL（[`xray_tls::btls_server::accept`]）。
@@ -665,6 +668,7 @@ where
 ///
 /// 验证失败不返回 Err，返回 [`RealityServerOutcome::Invalid`]（同 [`server_tls`]）。
 #[cfg(not(target_os = "ios"))]
+#[allow(clippy::too_many_arguments)] // Go btls 版装配参数集对称
 pub async fn server_tls_btls<C>(
     mut conn: C,
     server_private_key: &[u8; 32],
@@ -1747,6 +1751,7 @@ mod tests {
         assert_eq!(payload.version, [0, 0, 0]);
     }
 
+    #[test]
     fn fs0o_legacy_version_parsed_correctly() {
         let random = [0x55u8; 32];
         let session_id = [0x77u8; 32];

@@ -18,7 +18,6 @@ use xray_proto::xray::transport::internet::QuicParams;
 
 use crate::{
     conn::{InterConn, InterStreamConn, QuicConn, QuicStream},
-    context::ContextValues,
     error::{HysteriaError, Result},
     proto_config::Config,
 };
@@ -118,6 +117,7 @@ impl MasqType {
 pub trait MasqueradeHandler: Send + Sync {
     /// 处理一个 HTTP 请求（请求路径/方法 + headers）。
     /// 返回 (status_code, headers, body)。
+    #[allow(clippy::type_complexity)] // trait 签名形态固定（Server trait 对称）
     fn serve(
         &self,
         method: &str,
@@ -414,6 +414,7 @@ pub trait HysteriaQuicListener: Send + Sync {
 /// Listener 工厂 trait（对应 Go `Listen` 函数）。
 pub trait HysteriaListenerFactory: Send + Sync {
     /// 创建 QUIC listener（对应 Go `Listen()` 主体）。
+    #[allow(clippy::too_many_arguments)] // 存量清零批次
     fn listen(
         &self,
         bind_addr: SocketAddr,
@@ -437,10 +438,14 @@ pub struct HysteriaListener {
 
 struct ListenerInner {
     bind_addr: SocketAddr,
+    #[allow(dead_code)] // 存量清零批次
     config: Arc<Config>,
+    #[allow(dead_code)] // Go 对齐装配面字段
     quic_params: Arc<QuicParams>,
     masq: MasqType,
+    #[allow(dead_code)] // Go 对齐装配面字段
     validator: Option<Arc<dyn AuthValidator>>,
+    #[allow(dead_code)]
     on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync>,
     quic_listener: Mutex<Option<Arc<dyn HysteriaQuicListener>>>,
     closed: Mutex<bool>,
@@ -500,7 +505,10 @@ impl HysteriaListener {
     /// 关闭。
     pub async fn close(&self) -> Result<()> {
         *self.inner.closed.lock() = true;
-        if let Some(l) = self.inner.quic_listener.lock().take() {
+        // guard 有意跨 await 存活（close 路径持锁清理）
+        #[allow(clippy::await_holding_lock)]
+        let l = self.inner.quic_listener.lock().take();
+        if let Some(l) = l {
             l.close().await?;
         }
         Ok(())

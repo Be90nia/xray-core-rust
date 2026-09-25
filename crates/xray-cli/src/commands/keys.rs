@@ -56,7 +56,7 @@ pub struct Mlkem768Args {
 // 密钥生成核心（对齐 Go genCurve25519 / genMLKEM768 / mldsa65.NewKeyFromSeed）
 // ---------------------------------------------------------------------------
 
-/// X25519 密钥对：clamp（https://cr.yp.to/ecdh.html）后基点乘，
+/// X25519 密钥对：clamp（<https://cr.yp.to/ecdh.html>）后基点乘，
 /// `hash32 = blake3(public)`。返回 `(私钥, 公钥, hash32)`。
 #[must_use]
 pub fn gen_curve25519(input: Option<[u8; 32]>) -> ([u8; 32], [u8; 32], [u8; 32]) {

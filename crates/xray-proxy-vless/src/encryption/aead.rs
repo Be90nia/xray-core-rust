@@ -24,6 +24,7 @@ pub const TAG_LEN: usize = 16;
 pub const MAX_NONCE: [u8; NONCE_LEN] = [0xFF; NONCE_LEN];
 
 /// AEAD 具体算法（按 `UseAES` 硬件支持判定选择）。
+#[allow(clippy::large_enum_variant)] // Go 对齐：双算法 variant 尺寸差异是协议事实，Box 化徒增间接
 enum AeadKind {
     Aes(Aes256Gcm),
     ChaCha(ChaCha20Poly1305),

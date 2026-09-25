@@ -39,6 +39,7 @@ use xray_transport::finalmask::{salamander::SalamanderObfuscator, salamander_gec
 const MAX_WIRE_DATAGRAM: usize = 64 * 1024 + 8;
 
 /// salamander salt 长度（对齐 Go `smSaltLen`；仅用于短包判定文档）。
+#[allow(dead_code)] // 存量清零批次
 const SALT_LEN: usize = 8;
 
 /// Hysteria QUIC 路径的 UDP 混淆配置（对应 Go `udpmaskManager` 包裹的 mask，

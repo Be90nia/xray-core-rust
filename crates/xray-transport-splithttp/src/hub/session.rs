@@ -43,7 +43,7 @@ impl HttpSession {
     }
 }
 
-/// 会话表：session_id → Arc<HttpSession>。
+/// 会话表：session_id → Arc````<HttpSession>````。
 ///
 /// 对应 Go `requestHandler.sessions sync.Map` + `sessionMu sync.Mutex`。
 /// `upsert` 实现 get-or-create + 30s 自动 reap。

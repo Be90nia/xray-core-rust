@@ -198,9 +198,7 @@ impl AsyncWrite for LinkStream {
             Poll::Ready(Err(xray_buf::io::Error::Eof)) => {
                 Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "link closed")))
             },
-            Poll::Ready(Err(e)) => {
-                Poll::Ready(Err(io::Error::other(e.to_string())))
-            },
+            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e.to_string()))),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -339,6 +337,7 @@ mod tests {
     /// dialer 强制直连（Go nameserver.go:51-61 Local mode 传 nil dispatcher）；
     /// `force_local=false` 仍走 dialer。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 存量清零批次：await_holding_lock
     async fn connect_stream_force_local_bypasses_shared_dialer() {
         let _slot = DIALER_SLOT_LOCK.lock();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -366,7 +365,9 @@ mod tests {
 
     /// duplex 管道 → Link → LinkStream 字节 roundtrip。
     #[tokio::test]
+    #[allow(clippy::let_unit_value)] // 存量清零批次：let_unit_value
     async fn link_stream_roundtrip() {
+        #[allow(unused_mut)] // 存量清零批次
         let (mut peer_r, mut peer_w) = tokio::io::duplex(64 * 1024);
         let (up_r, mut up_w) = tokio::io::duplex(64 * 1024);
         let link = xray_transport::link::Link::new(
@@ -414,7 +415,7 @@ mod tests {
     /// 跨多次 poll 的大块数据（MultiBuffer pending 交付路径）。
     #[tokio::test]
     async fn link_stream_large_payload() {
-        let (up_r, up_w) = tokio::io::duplex(256 * 1024);
+        let (_up_r, up_w) = tokio::io::duplex(256 * 1024);
         let (dn_r, mut dn_w) = tokio::io::duplex(256 * 1024);
         let link = xray_transport::link::Link::new(
             xray_buf::io::new_reader(dn_r),

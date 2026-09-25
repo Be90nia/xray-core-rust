@@ -261,7 +261,7 @@ pub struct Noise {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FinalRuleConfig {
     pub action: RuleAction,
-    /// 允许的网络类型（proto repeated enum → Vec<i32>）。
+    /// 允许的网络类型（proto repeated enum → `Vec<i32>`）。
     pub networks: Vec<i32>,
     pub port_list: Option<xray_proto::xray::common::net::PortList>,
     /// IP CIDR 规则（prost repeated message）。
@@ -552,7 +552,7 @@ impl std::fmt::Debug for FinalRule {
 
 pub struct FinalRule {
     pub action: RuleAction,
-    /// 允许的网络类型（bool 数组索引 0=TCP 1=UDP 等，与 Go [8]bool 一致）。
+    /// 允许的网络类型（bool 数组索引 0=TCP 1=UDP 等，与 Go `[8]bool` 一致）。
     pub network: [bool; 8],
     /// 端口列表（None 表示匹配所有端口）。对应 Go `matchPort` 的 `len==0` 语义。
     pub port: Option<MemoryPortList>,
@@ -893,6 +893,7 @@ fn is_valid_override_address(addr: &Address) -> bool {
 }
 
 /// proto `IpOrDomain` → 原生 `Address`。IP 字节数非 4/16 返回 `None`。
+#[allow(clippy::incompatible_msrv)] // std from_octets 1.91 stable，晚于 workspace MSRV 声明
 fn ip_or_domain_to_address(iod: &xray_proto::xray::common::net::IpOrDomain) -> Option<Address> {
     use xray_proto::xray::common::net::ip_or_domain::Address as IoD;
     match iod.address.as_ref()? {
@@ -940,7 +941,7 @@ pub fn block_delay(rule: &FinalRule) -> std::time::Duration {
         Some(r) => (r.min, r.max),
         None => (30, 90),
     };
-    let span = if max >= min { max - min } else { min - max };
+    let span = max.abs_diff(min);
     let roll = rand::random_range(0..=span);
     std::time::Duration::from_secs(min + roll)
 }

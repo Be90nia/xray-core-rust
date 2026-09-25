@@ -12,7 +12,7 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use tokio::{
     io::AsyncReadExt,
-    net::{TcpListener, TcpStream, UdpSocket},
+    net::{TcpStream, UdpSocket},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -280,7 +280,7 @@ where
 /// 检测 dest 是否为 mux.cool 多路复用信令目的地（zx7）。
 ///
 /// 当客户端配置了 mux，会把目标设为 `v1.mux.cool:9527`，
-/// inbound 收到后应转给 mux [`ServerWorker`] 解帧。
+/// inbound 收到后应转给 mux `ServerWorker` 解帧。
 pub fn is_mux_destination(dest: &Destination) -> bool {
     matches!(dest.address(), Address::Domain(d) if d == MUX_COOL_ADDRESS)
         && dest.port().value() == MUX_COOL_PORT
@@ -298,6 +298,7 @@ pub(crate) async fn handle_mux_inbound_link(
     handler: Arc<dyn xray_app_dispatcher::DispatchHandler>,
     allowed_network: Option<Network>,
 ) {
+    #[allow(unused_imports)] // 存量清零批次
     use xray_buf::{reader::BufferedReader, writer::BufferedWriter};
     use xray_mux::worker::{DispatchHandlerAdapter, ServerWorker};
     let adapter = Arc::new(DispatchHandlerAdapter::new(handler));
@@ -448,7 +449,6 @@ async fn serve_mixed(
         let handler = Arc::clone(&handler);
         let socks_cfg = Arc::clone(&socks_cfg);
         let http_cfg = Arc::clone(&http_cfg);
-        let handshake_timeout = handshake_timeout;
         tokio::spawn(async move {
             // 1 字节 sniff(带超时避免恶意 client 占资源)
             let mut sniff = [0u8; 1];
@@ -552,7 +552,6 @@ pub async fn serve_http(
         };
         let handler = Arc::clone(&handler);
         let config = Arc::clone(&config);
-        let handshake_timeout = handshake_timeout;
         tokio::spawn(async move {
             // 1. handshake（按 userLevel 对应 policy 的 handshake 超时限制，
             // 超时即断开——对应 Go SetReadDeadline 到期后 ReadRequest 超时错误）
@@ -660,6 +659,7 @@ async fn handle_plain_http(
 
     // 下行：读响应 → 客户端
     let read_resp = async {
+        #[allow(clippy::while_let_loop)] // 存量清零批次
         loop {
             match dn_r.read_multi_buffer().await {
                 Ok(mb) => {
@@ -928,7 +928,7 @@ pub async fn serve_dokodemo_udp(
     serve_dokodemo_udp_on(hub, handler, dest).await
 }
 
-/// 已建 [`UdpHub`] 的 dokodemo UDP 服务循环（测试/组合入口）。
+/// 已建 `UdpHub` 的 dokodemo UDP 服务循环（测试/组合入口）。
 pub async fn serve_dokodemo_udp_on(
     hub: xray_transport::udp::hub::UdpHub,
     handler: Arc<dyn DispatchHandler>,
@@ -1407,7 +1407,7 @@ fn sweep_expired_ss2022_sessions(
 /// 对应 Go `proxy/shadowsocks/server.go::handleUDPPayload`：recv_from →
 /// decode_udp_packet（匹配用户 + 解出目标/payload）→ 按客户端源地址分发到
 /// per-client [`UdpDispatchSession`]（Go `udp.Dispatcher` cone 会话模型）。
-/// 回包由 [`ss_udp_client_relay`] 用发起用户的 account `encode_udp_packet`
+/// 回包由 `ss_udp_client_relay` 用发起用户的 account `encode_udp_packet`
 /// 后 send_to 客户端。
 pub async fn serve_ss_udp(
     udp: Arc<tokio::net::UdpSocket>,
@@ -1514,9 +1514,9 @@ async fn ss_udp_client_relay(
 
 /// SS-2022 UDP relay 入口（Go `MultiService.newPacket` + `udpNat`）。
 ///
-/// recv_from → [`server_decode_header`]（ECB 头 + EIH 用户识别）→ 按 client
-/// sessionId 分发到 per-session NAT entry（[`ServerUdpSession2022`] +
-/// [`ss2022_udp_client_relay`]，Go `udpNat` cone 会话模型）。回包由 relay
+/// recv_from → `server_decode_header`（ECB 头 + EIH 用户识别）→ 按 client
+/// sessionId 分发到 per-session NAT entry（`ServerUdpSession2022` +
+/// `ss2022_udp_client_relay`，Go `udpNat` cone 会话模型）。回包由 relay
 /// task 用该会话的 server sessionId/cipher `encode` 后 send_to 客户端。
 ///
 /// `users` 空 = 单用户（AEAD key 直接从 server PSK 派生）。
@@ -1559,6 +1559,7 @@ pub async fn serve_ss2022_udp(
             },
         };
         let sid = hdr.session_id;
+        #[allow(clippy::map_entry)] // 存量清零批次
         // 2. 查/建 per-sessionId NAT entry
         if !server_sessions.contains_key(&sid) {
             match ServerUdpSession2022::new(kind, hdr.aead_psk.to_vec(), sid) {
@@ -4100,6 +4101,7 @@ fn build_hysteria_tls_server_config(
         (v.get("cert").and_then(|x| x.as_str()), v.get("key").and_then(|x| x.as_str()))
     {
         let mut cert_reader = std::io::BufReader::new(cert_str.as_bytes());
+        #[allow(clippy::useless_conversion)] // 存量清零批次
         let cert_pem = rustls_pemfile::certs(&mut cert_reader)
             .into_iter()
             .next()
@@ -4120,11 +4122,14 @@ fn build_hysteria_tls_server_config(
             .self_signed(&key_pair)
             .map_err(|e| std::io::Error::other(format!("rcgen self_signed: {e}")))?;
         (
+            #[allow(clippy::useless_conversion)] // 存量清零批次
             CertificateDer::from(cert.der().clone()),
             PrivateKeyDer::try_from(key_pair.serialize_der())
                 .map_err(|e| std::io::Error::other(format!("rcgen key der: {e}")))?,
         )
     };
+    #[allow(clippy::needless_bool, clippy::needless_question_mark, clippy::useless_conversion)]
+    // 证书转换与 Ok 包装为既有接线形态
     Ok(rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der.into()], key_der)
@@ -4149,6 +4154,7 @@ fn parse_anytls_tls_acceptor(
         (v.get("cert").and_then(|x| x.as_str()), v.get("key").and_then(|x| x.as_str()))
     {
         let mut cert_reader = std::io::BufReader::new(cert_str.as_bytes());
+        #[allow(clippy::useless_conversion)] // 存量清零批次
         let cert_pem = rustls_pemfile::certs(&mut cert_reader)
             .into_iter()
             .next()
@@ -4170,11 +4176,13 @@ fn parse_anytls_tls_acceptor(
             .self_signed(&key_pair)
             .map_err(|e| std::io::Error::other(format!("rcgen self_signed: {e}")))?;
         (
+            #[allow(clippy::useless_conversion)] // 存量清零批次
             CertificateDer::from(cert.der().clone()),
             PrivateKeyDer::try_from(key_pair.serialize_der())
                 .map_err(|e| std::io::Error::other(format!("rcgen key der: {e}")))?,
         )
     };
+    #[allow(clippy::useless_conversion)] // 同上：既有接线形态
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der.into()], key_der)
@@ -4500,7 +4508,10 @@ fn parse_freedom_inbound_dest(data: &[u8]) -> std::io::Result<Destination> {
 mod tests {
     use std::net::Ipv4Addr;
 
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     use super::*;
 
@@ -4681,6 +4692,7 @@ mod tests {
     async fn hysteria_tcp_dispatch_to_freedom_e2e() {
         use xray_app_dispatcher::default::DialBridge;
         use xray_proxy_freedom::make_freedom_dial_fn;
+        #[allow(unused_imports)] // 存量清零批次
         use xray_proxy_hysteria::TcpDispatcher as _;
         use xray_transport_hysteria::conn::{InterStreamConn, QuicStream};
 
@@ -5644,8 +5656,10 @@ mod tests {
         // 3. validator（test UUID）
         let validator = Arc::new(VlessMemoryValidator::new());
         let test_uuid = UUID::parse("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap();
-        let mut proto_account = VlessProtoAccount::default();
-        proto_account.id = "b831381d-6324-4d53-ad4f-8cda48b30811".to_string();
+        let proto_account = VlessProtoAccount {
+            id: "b831381d-6324-4d53-ad4f-8cda48b30811".to_string(),
+            ..Default::default()
+        };
         let account = VlessMemoryAccount::from_proto_account(&proto_account).unwrap();
         validator.add(VlessMemoryUser::new("e2e-user", 0, account)).unwrap();
 
@@ -6235,8 +6249,7 @@ mod tests {
         .await
         .unwrap();
         let addr = listener.local_addr().unwrap();
-        let mut config = HttpServerConfig::default();
-        config.user_level = 3;
+        let mut config = HttpServerConfig { user_level: 3, ..Default::default() };
         let pm: Arc<dyn xray_features::policy::PolicyManager> =
             Arc::new(FixedHandshakePolicy(std::time::Duration::from_millis(120)));
         let handshake_timeout = Some(pm.policy_for_level(config.user_level).timeout.handshake);
@@ -6686,6 +6699,7 @@ mod tests {
     #[test]
     fn vless_fallbacks_missing_dest_rejected_valid_tcp_ok() {
         let bad = br#"{"decryption":"none","fallbacks":[{"alpn":"h2"}]}"#;
+        #[allow(clippy::err_expect)] // 存量清零批次
         let err = super::build_vless_fallbacks(bad).err().expect("must reject");
         assert!(
             err.to_string().contains("please fill in a valid value"),
@@ -6710,6 +6724,7 @@ mod tests {
         for fb in cases {
             let json = serde_json::json!({"decryption":"none","fallbacks":[fb]});
             let data = serde_json::to_vec(&json).unwrap();
+            #[allow(clippy::err_expect)] // 存量清零批次
             let err = super::build_vless_fallbacks(&data).err().expect("must reject");
             assert!(err.to_string().contains("xver"), "expected xver hard error, got: {err}");
         }
@@ -6724,6 +6739,7 @@ mod tests {
             r#"{"decryption":"none","fallbacks":[{"dest":"serve-ws-none"}]}"#,
         ];
         for json in cases {
+            #[allow(clippy::err_expect)] // 存量清零批次
             let err = super::build_vless_fallbacks(json.as_bytes()).err().expect("must reject");
             assert!(
                 err.to_string().contains("not supported"),
@@ -6757,6 +6773,7 @@ mod tests {
             serde_json::json!({"xver": -1}),
             serde_json::json!({"dest": 70_000}),
         ] {
+            #[allow(clippy::err_expect)] // 存量清零批次
             let err = super::parse_reality_config(&mk(extra)).err().expect("must reject");
             assert!(
                 err.to_string().contains("xver") || err.to_string().contains("target"),

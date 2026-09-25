@@ -290,9 +290,7 @@ fn try_match_aead(
     bs: &[u8],
     command: RequestCommand,
 ) -> Result<(u32, crate::config::InnerAead, Vec<u8>)> {
-    let Cipher::Aead(aead_cipher) = &account.cipher else {
-        return Err(SsError::UserNotFound);
-    };
+    let Cipher::Aead(aead_cipher) = &account.cipher;
     let iv_len = aead_cipher.iv_bytes as usize;
     let iv = &bs[..iv_len];
     // subkey = HKDF-SHA1(key, iv, key_bytes)
@@ -462,9 +460,7 @@ mod tests {
     /// 构造能通过 `try_match_aead` 的有效 `bs`（IV + AEAD-sealed 2B plaintext）。
     fn make_valid_bs(account: &MemoryAccount) -> Vec<u8> {
         use crate::config::{Cipher, hkdf_sha1};
-        let Cipher::Aead(ac) = &account.cipher else {
-            panic!("need AEAD cipher");
-        };
+        let Cipher::Aead(ac) = &account.cipher;
         let iv_len = ac.iv_bytes as usize;
         let iv = vec![0xAAu8; iv_len];
         let mut subkey = vec![0u8; ac.key_bytes as usize];
@@ -529,7 +525,7 @@ mod tests {
         v.get(&bs1, RequestCommand::Tcp).expect("first iv ok");
 
         // Second IV: different prefix → different subkey → different ciphertext.
-        let Cipher::Aead(ac) = &account.cipher else { panic!() };
+        let Cipher::Aead(ac) = &account.cipher;
         let iv2 = vec![0xBBu8; ac.iv_bytes as usize];
         let mut subkey2 = vec![0u8; ac.key_bytes as usize];
         hkdf_sha1(&account.key, &iv2, &mut subkey2);
@@ -552,7 +548,7 @@ mod tests {
         let v = Validator::new();
         v.add(make_user_iv_check("u@x.com", CipherType::Aes128Gcm, "pass")).expect("add");
         let account = v.get_all()[0].account.clone();
-        let Cipher::Aead(ac) = &account.cipher else { panic!() };
+        let Cipher::Aead(ac) = &account.cipher;
 
         let make_bs = |seed: u32| -> Vec<u8> {
             let iv = seed

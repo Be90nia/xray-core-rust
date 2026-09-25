@@ -57,7 +57,7 @@ impl ProxyOutbound for TrojanClient {
 
         // 1. 拨号到 Trojan 服务器（Go client.go:62 — retry.ExponentialBackoff(5, 100)）
         let mut server_conn =
-            xray_transport::retry::exponential_backoff(5, 100, || dialer.dial(&dest))
+            xray_transport::retry::exponential_backoff(5, 100, || dialer.dial(dest))
                 .await
                 .map_err(|e| ProxymanError::Other(format!("trojan dial server: {e}")))?;
 

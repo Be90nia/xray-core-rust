@@ -166,7 +166,7 @@ async fn dial_stream_up_via_h2_mock_server() {
     let client_tls = make_client_tls(cert_der);
     let client = Arc::new(DefaultDialerClient::new(
         config.clone(),
-        client_tls.into(),
+        client_tls,
         DialTarget {
             host: server_addr.ip().to_string(),
             port: server_addr.port(),
@@ -278,7 +278,7 @@ async fn dial_stream_one_via_h2_mock_server() {
     let client_tls = make_client_tls(cert_der);
     let client = Arc::new(DefaultDialerClient::new(
         config.clone(),
-        client_tls.into(),
+        client_tls,
         DialTarget {
             host: server_addr.ip().to_string(),
             port: server_addr.port(),

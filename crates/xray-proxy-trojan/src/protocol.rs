@@ -58,7 +58,7 @@ pub const COMMAND_UDP: u8 = 3;
 /// UDP 单包 payload 上限，对应 Go `maxLength = 8192`。
 pub const MAX_LENGTH: usize = 8192;
 /// CRLF（`\r\n`），对应 Go `crlf = []byte{'\r', '\n'}`。
-pub const CRLF: [u8; 2] = [b'\r', b'\n'];
+pub const CRLF: [u8; 2] = *b"\r\n";
 
 /// trojan v2 草案版本前缀字节（TLS 握手后首字节）。
 pub const V2_VERSION: u8 = 0x02;

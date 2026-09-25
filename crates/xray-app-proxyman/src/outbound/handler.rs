@@ -8,7 +8,7 @@
 //! - [`OutboundHandlerEntry`] — Go `Handler struct`：配置载体（tag / sender / proxy_type_url / mux
 //!   启用 / xudp 启用 / UDP 443 策略 / 流量计数器）
 //! - [`parse_random_ip`] — Go `ParseRandomIP`：CIDR 子网内随机 IP（纯函数）
-//! - [`get_uo_t_connection`] — Go `getUoTConnection`：UoT (UDP over TCP) 连接
+//! - `get_uo_t_connection` — Go `getUoTConnection`：UoT (UDP over TCP) 连接`
 //!
 //! IO 边界（trait + TODO 占位）：
 //! - `dispatch` — 依赖 `transport.Link` + 代理 + mux + xudp + DNS LookupForIP
@@ -550,11 +550,14 @@ fn submit_outbound_error_to_originator(session: &Session, error: &ProxymanError)
 }
 #[cfg(test)]
 mod tests {
+    // 测试构造以字段赋值表意（对齐 Go 逐字段装配），struct update 化反而降低对照度
+    #![allow(clippy::field_reassign_with_default)]
     use std::sync::atomic::{AtomicI64, Ordering};
 
     use super::*;
     use crate::stats::NoopStatsProvider;
 
+    #[allow(dead_code)] // value() 断言用统计暂未接线，构造器语义保留
     struct TestCounter(AtomicI64);
     impl Counter for TestCounter {
         fn value(&self) -> i64 {

@@ -193,6 +193,7 @@ impl Holder {
 
     /// 当前已缓存域名数。
     #[must_use]
+    #[allow(clippy::len_without_is_empty)] // len 语义为条目计数
     pub fn len(&self) -> usize {
         self.inner.lock().domain_to_ip.len()
     }

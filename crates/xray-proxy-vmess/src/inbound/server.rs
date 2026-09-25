@@ -42,6 +42,7 @@ const DUPLEX_BUF: usize = 16_384;
 
 /// VMess body 加密枚举：统一 Aes128Gcm / ChaCha20Poly1305 两种安全类型为同一类型，
 /// 供 pump 函数泛型使用（避免 `Box<dyn AeadCipher>` 跨 await 的 Send 问题）。
+#[allow(clippy::large_enum_variant)] // 双算法 variant 尺寸差是协议事实，Box 化徒增间接
 enum BodyCipher {
     Aes(Aes128Gcm),
     Chacha(ChaCha20Poly1305Aead),
@@ -430,6 +431,7 @@ async fn pump_request_body<C, R>(
             break;
         }
         let nonce = nonce_gen.next_ref();
+        #[allow(clippy::redundant_guards)] // is_empty 守卫表达终止 chunk 语义
         match cipher.open_in_place(nonce, &[], &mut ciphertext[..ciphertext_size]) {
             Ok(pt) if pt.is_empty() => break, // 终止 chunk：seal([]) → 解密为空
             Ok(pt) => {
@@ -568,6 +570,7 @@ async fn write_udp_chunk<W: AsyncWrite + Unpin>(
 /// raw socket；目标取自 request header，域名不本地解析（outbound 侧解析）。
 /// chunk 读取（多次 read_exact）不可取消，up 独立 async block 经 channel
 /// 与 relay 循环并发；客户端断开（up EOF）后保留收尾窗口，双侧同退。
+#[allow(clippy::too_many_arguments)] // UDP relay 上下文全集（对齐 Go server.UDPSession）
 async fn pump_udp_session<R, W>(
     mut stream_r: R,
     mut stream_w: W,
@@ -614,9 +617,10 @@ where
                 break;
             }
             let nonce = nonce_gen.next_ref();
+            // 空明文 chunk = 请求流终止（chunk writer Close 语义），不作为
+            // 数据报转发（dispatch 侧也会丢弃空 payload，转发即死锁）。
+            #[allow(clippy::redundant_guards)] // is_empty 守卫表达终止 chunk 语义
             match req_cipher.open_in_place(nonce, &[], &mut ciphertext[..ciphertext_size]) {
-                // 空明文 chunk = 请求流终止（chunk writer Close 语义），不作为
-                // 数据报转发（dispatch 侧也会丢弃空 payload，转发即死锁）。
                 Ok(packet) if packet.is_empty() => break,
                 Ok(packet) => {
                     // 明文 = ciphertext 原地前缀：truncate 后 take 整缓冲零拷贝

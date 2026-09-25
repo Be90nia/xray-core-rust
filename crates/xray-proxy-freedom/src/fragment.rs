@@ -145,7 +145,7 @@ impl<W: AsyncWrite + Unpin> FragmentStream<W> {
         Self { fragment, writer, count: 0 }
     }
 
-    /// 写入一次（分片策略见 [`build_pieces`]），返回消耗字节数（恒为 `buf.len()`）。
+    /// 写入一次（分片策略见 `build_pieces`），返回消耗字节数（恒为 `buf.len()`）。
     ///
     /// # Errors
     ///
@@ -172,7 +172,7 @@ impl<W: AsyncWrite + Unpin> FragmentStream<W> {
 
 /// dial 出的 [`Connection`] 的分片包装（dispatcher TCP 路径接线用）。
 ///
-/// 写路径走 [`build_pieces`] 状态机（分片队列 + 片间 `Sleep`），读路径与
+/// 写路径走 `build_pieces` 状态机（分片队列 + 片间 `Sleep`），读路径与
 /// [`Connection::remote_addr`] 透传——桥接用 `tokio::io::split` 双向并发，
 /// 分片 sleep 期间下行读取不受阻（与 Go 分片仅阻塞上行 copy goroutine 对齐）。
 pub struct FragmentConnection {

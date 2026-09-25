@@ -52,10 +52,7 @@ impl Control {
 
     /// 转 prost Control。
     pub fn to_proto(&self) -> ProtoControl {
-        let mut out = ProtoControl::default();
-        out.state = self.state.as_i32();
-        out.random = self.random.clone();
-        out
+        ProtoControl { state: self.state.as_i32(), random: self.random.clone() }
     }
 
     /// 填充 1-64 字节的随机数（对应 Go `FillInRandom`，用 dice.Roll(64) + 1）。
@@ -83,10 +80,7 @@ impl BridgeConfig {
     }
 
     pub fn to_proto(&self) -> ProtoBridgeConfig {
-        let mut out = ProtoBridgeConfig::default();
-        out.tag = self.tag.clone();
-        out.domain = self.domain.clone();
-        out
+        ProtoBridgeConfig { tag: self.tag.clone(), domain: self.domain.clone() }
     }
 }
 
@@ -103,10 +97,7 @@ impl PortalConfig {
     }
 
     pub fn to_proto(&self) -> ProtoPortalConfig {
-        let mut out = ProtoPortalConfig::default();
-        out.tag = self.tag.clone();
-        out.domain = self.domain.clone();
-        out
+        ProtoPortalConfig { tag: self.tag.clone(), domain: self.domain.clone() }
     }
 }
 
@@ -126,15 +117,17 @@ impl ReverseConfig {
     }
 
     pub fn to_proto(&self) -> ProtoConfig {
-        let mut out = ProtoConfig::default();
-        out.bridge_config = self.bridges.iter().map(|c| c.to_proto()).collect();
-        out.portal_config = self.portals.iter().map(|c| c.to_proto()).collect();
-        out
+        ProtoConfig {
+            bridge_config: self.bridges.iter().map(|c| c.to_proto()).collect(),
+            portal_config: self.portals.iter().map(|c| c.to_proto()).collect(),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    // 测试构造以字段赋值表意（对齐 Go 逐字段装配），struct update 化反而降低对照度
+    #![allow(clippy::field_reassign_with_default)]
     use super::*;
 
     #[test]

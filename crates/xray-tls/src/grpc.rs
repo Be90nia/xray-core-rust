@@ -18,7 +18,7 @@ use crate::{error::TlsError, fingerprint::Fingerprint};
 pub struct GrpcUtlsInfo {
     /// 协商出的密码套件名称（对应 Go 的 `StandardName`，格式 `"0x{hex}"`）。
     pub cipher_suite_standard_name: String,
-    /// peer 证书链原始 DER（取 PeerCertificates[0]）。
+    /// peer 证书链原始 DER（取 PeerCertificates`0`）。
     pub remote_certificate: Vec<u8>,
     /// SPIFFE ID（可选）。Go 端标注 experimental。
     pub spiffe_id: Option<String>,

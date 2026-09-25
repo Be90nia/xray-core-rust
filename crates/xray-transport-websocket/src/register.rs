@@ -85,9 +85,8 @@ async fn listen_ws(
     let config = parse_ws_config(settings.transport_json.as_ref())?;
     let ws_config = Arc::new(config);
 
-    let mut ws_listener = crate::server::WsListener::bind(addr, ws_config.clone())
-        .await
-        .map_err(io::Error::other)?;
+    let mut ws_listener =
+        crate::server::WsListener::bind(addr, ws_config.clone()).await.map_err(io::Error::other)?;
     ws_listener.trusted_x_forwarded_for = trusted;
 
     let local_addr = ws_listener.local_addr().map_err(io::Error::other)?;
@@ -711,9 +710,9 @@ mod tests {
         drop(conn);
     }
     /// Tcpmask round-trip（o54c，Go websocket/dialer.go:56-63 + hub.go:132-134）：
-
     /// dial 与 hub 双端配置 fragment mask 后 e2e echo 收发。
     #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
     async fn ws_dial_hub_tcpmask_roundtrip() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use xray_common::net::{address::Address, network::Network, port::Port};

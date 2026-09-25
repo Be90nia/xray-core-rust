@@ -16,7 +16,7 @@
 //!
 //! # trait 对齐
 //!
-//! 与 xray-transport 的 [`Connection`](xray_transport::connection::Connection) trait
+//! 与 xray-transport 的 `Connection` trait
 //! 对齐：`Conn<S>`/`ServerConn<S>`/`UConn<S>` 同时实现 `Connection`（remote/local addr）
 //! 与 [`ConnInterface`]（握手相关 API）。AsyncRead + AsyncWrite 由 forward 到
 //! `tokio_rustls::TlsStream<S>` 自动获得。

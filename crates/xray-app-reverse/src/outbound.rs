@@ -141,7 +141,7 @@ impl PortalOutbound {
                 MuxLink { reader: link.reader, writer: link.writer },
                 ClientStrategy::default(),
             );
-            let worker = PortalWorker::new(client.clone()).inspect_err(|e| {
+            let worker = PortalWorker::new(client.clone()).inspect_err(|_e| {
                 // Go Outbound.Dispatch 出错时 Interrupt(link)；此处 link 已并入
                 // ClientWorker，close 等价拆除
                 client.close();

@@ -3,7 +3,7 @@
 //! 补全 [`crate::outbound`] 中 trait stub 的生产实现：
 //! - [`OutboundListenerImpl`]：channel-based listener（Go `OutboundListener struct`）
 //! - [`OutboundHandlerImpl`]：绑定 listener 的 outbound handler（Go `Outbound struct`）
-//! - [`OutboundHandlerRegistry`]：实现 [`OutboundRegistrar`] + 增删查 inherent 方法
+//! - [`OutboundHandlerRegistry`]：实现 `OutboundRegistrar` + 增删查 inherent 方法
 //!
 //! ## 与 trait stub 的关系
 //!
@@ -26,7 +26,7 @@ use xray_features::outbound::{OutboundError, OutboundHandler as XrayOutboundHand
 
 use crate::{
     error::CommanderError,
-    outbound::{CommanderConn, HandlerManager, OutboundListener, OutboundRegistrar},
+    outbound::{CommanderConn, OutboundListener},
 };
 
 /// Listener 缓冲容量，对应 Go `make(chan net.Conn, 4)`。
@@ -34,7 +34,7 @@ const LISTENER_BUFFER: usize = 4;
 
 /// Channel-based OutboundListener（对应 Go `OutboundListener struct`）。
 ///
-/// 缓冲固定为 [`LISTENER_BUFFER`]；满时新连接被丢弃（Drop 关闭底层 IO），
+/// 缓冲固定为 `LISTENER_BUFFER`；满时新连接被丢弃（Drop 关闭底层 IO），
 /// 与 Go `default: conn.Close()` 一致。
 ///
 /// 线程安全：内部 `Mutex<VecDeque>` + `Notify`，可多线程 add / accept。
@@ -45,7 +45,7 @@ pub struct OutboundListenerImpl {
 }
 
 impl OutboundListenerImpl {
-    /// 新建默认容量（[`LISTENER_BUFFER`]）的 listener。
+    /// 新建默认容量（`LISTENER_BUFFER`）的 listener。
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -282,7 +282,7 @@ impl std::fmt::Debug for OutboundHandlerImpl {
     }
 }
 
-/// Outbound handler 注册中心（实现 [`OutboundRegistrar`]）。
+/// Outbound handler 注册中心（实现 `OutboundRegistrar`）。
 ///
 /// 提供 trait 方法（add / remove）+ inherent 查询方法（list / get），
 /// 用于 Commander 在 outbound 模式下管理已注册的 handler 集合。
@@ -357,7 +357,7 @@ impl std::fmt::Debug for OutboundHandlerRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::outbound::StubOutboundHandler;
+    use crate::outbound::{HandlerManager as _, StubOutboundHandler};
 
     // --- OutboundListenerImpl 基础状态 ---
 
@@ -600,6 +600,7 @@ mod tests {
     // --- 端到端：listener + handler + registry 编排 ---
 
     #[test]
+    #[allow(clippy::let_unit_value)] // 存量清零批次：let_unit_value
     fn end_to_end_handler_close_propagates_to_listener() {
         let l = Arc::new(OutboundListenerImpl::new());
         let h = OutboundHandlerImpl::new("api", l.clone());
@@ -608,7 +609,7 @@ mod tests {
 
         // 先通过具体类型 start，再注册到 registry
         // （Arc<dyn XrayOutboundHandler> 无法直接调用 start/close）
-        let h_ref = Arc::clone(&h_arc);
+        let _h_ref = Arc::clone(&h_arc);
         // 由于 trait object 无法 downcast，这里用独立 Arc 持有具体类型
         let h_concrete = Arc::new(OutboundHandlerImpl::new("api", l.clone()));
         h_concrete.start().unwrap();
@@ -617,7 +618,7 @@ mod tests {
         assert!(!l.closed());
 
         // 通过 registry 移除并关闭 handler
-        let removed = r.remove_handler("api").unwrap();
+        let _removed = r.remove_handler("api").unwrap();
         assert_eq!(r.count(), 0);
         // remove_handler 只是移除注册，不主动 close（与 Go outbound.Manager.RemoveHandler 一致：
         // 移除后 dispatcher 不再路由到此 handler，但 handler 自身生命周期由 Arc 决定）

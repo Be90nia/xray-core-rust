@@ -114,7 +114,7 @@ impl From<xray_conf::ConfError> for CoreFunctionError {
     }
 }
 
-/// 从已构建的 [`BuiltConfig`] 启动新实例。
+/// 从已构建的 `BuiltConfig` 启动新实例。
 ///
 /// 内部步骤：`Instance::new_from_built(built)` → `instance.start()` → 包装为 `Arc<Instance>`。
 ///
@@ -288,6 +288,7 @@ async fn start_full_dispatched(
     if instance.get_feature::<xray_app_log::LogFeature>().is_none() {
         let feature = xray_app_log::LogFeature::new(xray_app_log::LogConfig::default())
             .map_err(CoreFunctionError::from)?;
+        #[allow(unused_must_use)] // 存量清零批次
         instance.add_feature(Arc::new(feature));
     }
     if let Some(log_feature) = instance.get_feature::<xray_app_log::LogFeature>() {
@@ -432,6 +433,7 @@ impl xray_app_dns::dial::QueryDialer for DispatcherDnsDialer {
 
     fn dial_udp(
         &self,
+        #[allow(unused_variables)] // 存量清零批次
         dest: &xray_common::net::destination::Destination,
     ) -> std::pin::Pin<
         Box<
@@ -497,6 +499,7 @@ impl xray_app_dns::dial::UdpPacketSession for DnsUdpSessionAdapter {
         dest: &xray_common::net::destination::Destination,
         payload: &[u8],
     ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>> {
+        #[allow(unused_mut)] // 存量清零批次
         let mut session = &mut self.session;
         // 调用参引用生命周期短于返回 future 的 '_，clone 进 async move
         let dest = dest.clone();
@@ -1266,6 +1269,7 @@ mod tests {
             target_strategy: None,
         });
 
+        #[allow(unused_mut)] // 存量清零批次
         let (mut inst, _ohm, handles) = start_full(&built).await.unwrap();
         assert!(inst.is_running());
         // 等 listener 就绪
@@ -1718,6 +1722,7 @@ mod tests {
 
         // echo server B (tag "out-b")
         let eb_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        #[allow(unused_variables)] // 存量清零批次
         let eb_addr = eb_listener.local_addr().unwrap();
         let eb_tag = tag_b.clone();
         tokio::spawn(async move {
@@ -1768,6 +1773,7 @@ mod tests {
             data: br#"{"domainStrategy":"AsIs","rules":[{"type":"field","ip":["127.0.0.0/8"],"outboundTag":"default"}]}"#.to_vec(),
         });
 
+        #[allow(unused_variables)] // 存量清零批次
         let (inst, ohm, handles) = start_full(&cfg).await.expect("routing config start");
         assert!(inst.is_running());
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -2304,6 +2310,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
+            #[allow(unused_mut)] // 存量清零批次
             let (mut sock, _) = listener.accept().await.unwrap();
             let (mut r, mut w) = tokio::io::split(sock);
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
@@ -3749,6 +3756,7 @@ mod tests {
         let echo_addr = echo.local_addr().unwrap();
         let echo_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
+            #[allow(clippy::while_let_loop)] // 存量清零批次
             loop {
                 match echo.recv_from(&mut buf).await {
                     Ok((n, peer)) => {
@@ -3870,6 +3878,7 @@ mod tests {
         let echo_addr = echo.local_addr().unwrap();
         let echo_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
+            #[allow(clippy::while_let_loop)] // 存量清零批次
             loop {
                 match echo.recv_from(&mut buf).await {
                     Ok((n, peer)) => {
@@ -4004,6 +4013,7 @@ mod tests {
         let echo_addr = echo.local_addr().unwrap();
         let echo_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
+            #[allow(clippy::while_let_loop)] // 存量清零批次
             loop {
                 match echo.recv_from(&mut buf).await {
                     Ok((n, peer)) => {
@@ -4383,6 +4393,7 @@ mod tests {
         let echo_addr = echo.local_addr().unwrap();
         let echo_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
+            #[allow(clippy::while_let_loop)] // 存量清零批次
             loop {
                 match echo.recv_from(&mut buf).await {
                     Ok((n, peer)) => {

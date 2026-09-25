@@ -31,7 +31,7 @@ pub struct HysteriaConfig {
     pub server_addr: String,
     /// TLS SNI（默认等于 server_addr 的 host 部分）。
     pub server_name: String,
-    /// 鉴权 token（明文或 base64 编码，由 [`auth_header_value`] 统一处理）。
+    /// 鉴权 token（明文或 base64 编码，由 `auth_header_value` 统一处理）。
     pub auth: String,
     /// QUIC ALPN 协议列表（hysteria 默认 `hysteria`/`h3`）。
     pub alpn: Vec<String>,
@@ -629,10 +629,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)] // 字段赋值路径即被测行为
     fn hysteria_user_from_proto_rejects_bad_account() {
         // 无 account
         assert!(HysteriaUser::from_proto_user(&ProtoUser::default()).is_err());
-        // type_url 不匹配
         let mut u = ProtoUser::default();
         u.account = Some(TypedMessage {
             r#type: "type.googleapis.com/xray.proxy.trojan.Account".into(),

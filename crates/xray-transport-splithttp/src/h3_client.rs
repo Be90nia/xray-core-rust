@@ -11,7 +11,7 @@
 //!
 //! # 关键 API
 //!
-//! - [`H3Conn::connect`]：建立 quinn Endpoint → connect → `h3::client::new` → spawn driver
+//! - `H3Conn::connect`：建立 quinn Endpoint → connect → `h3::client::new` → spawn driver
 //! - [`H3Conn::post_packet`]：packet-up 单次 POST
 //! - [`H3Conn::open_stream`]：stream-down GET 下载 / 一次性 POST body
 //! - [`H3Conn::open_stream_uploading`]：stream-up / stream-one POST streaming body
@@ -163,13 +163,13 @@ impl H3Conn {
     /// 建立 H3 连接。
     ///
     /// 1. ALPN 设置 `h3`
-    /// 2. 创建 quinn Endpoint（bind 0.0.0.0:0 或 [::]:0）
+    /// 2. 创建 quinn Endpoint（bind 0.0.0.0:0 或 `::`:0）
     /// 3. connect 到目标地址
     /// 4. `h3::client::new` 包装为 h3 连接
     /// 5. spawn driver 后台 task
     ///
     /// CC 接线（对应 Go `splithttp/dialer.go:161-164` + `:239-246`，上游
-    /// v26.3.27 PR #5711）：装可热切换 CC 工厂后按 [`apply_splithttp_cc`] 语义应用
+    /// v26.3.27 PR #5711）：装可热切换 CC 工厂后按 `apply_splithttp_cc` 语义应用
     /// ——`quicParams` 缺省也默认 BBR(standard)，对齐 Go H3 默认 BBR。
     ///
     /// 窗口/idle 等 `QuicParamsConfig` 字段映射 quinn [`quinn::TransportConfig`]：
@@ -349,6 +349,7 @@ impl H3Conn {
             return Err(SplitHttpError::BadStatus(resp.status().as_u16()));
         }
         // drain response body
+        #[allow(clippy::redundant_pattern_matching)] // 存量清零批次
         while let Some(_) = stream
             .recv_data()
             .await
@@ -552,9 +553,7 @@ where
                 },
                 Ok(None) => return,
                 Err(e) => {
-                    let _ = tx
-                        .send(Err(std::io::Error::other(e.to_string())))
-                        .await;
+                    let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
                     return;
                 },
             }

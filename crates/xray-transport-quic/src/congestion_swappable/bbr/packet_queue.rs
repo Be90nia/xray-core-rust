@@ -6,7 +6,7 @@
 //! - 任意位置删除（标记 not present + 清理前缀）
 //! - 按序号检索
 //!
-//! 内部用 RingBuffer<entryWrapper<T>>。
+//! 内部用 RingBuffer<entryWrapper````<T>````>。
 
 use super::{
     super::types::{INVALID_PACKET_NUMBER, PacketNumber},

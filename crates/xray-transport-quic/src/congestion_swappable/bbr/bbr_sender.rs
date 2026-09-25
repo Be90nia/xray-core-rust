@@ -13,8 +13,8 @@ use super::{
     super::{
         pacer::Pacer,
         types::{
-            AckedPacketInfo, ByteCount, CongestionControl, INITIAL_PACKET_SIZE, LostPacketInfo,
-            MonoTime, PacketNumber, RttStatsProvider,
+            AckedPacketInfo, ByteCount, CongestionControl, LostPacketInfo, MonoTime, PacketNumber,
+            RttStatsProvider,
         },
     },
     Profile,
@@ -139,9 +139,11 @@ fn scale_byte_window(window: ByteCount, old_size: ByteCount, new_size: ByteCount
 pub struct BbrSender {
     inner: Mutex<BbrInner>,
     pacer: Arc<Pacer>,
+    #[allow(dead_code)] // Go 对齐统计面
     clock: Arc<dyn Clock>,
 }
 
+#[allow(dead_code)] // BBR 完整状态机 Go 对齐翻译：多数字段为算法完整性保留，生产泵仅消费部分
 struct BbrInner {
     rtt_stats: Option<Box<dyn RttStatsProvider>>,
     sampler: BandwidthSampler,
@@ -149,9 +151,12 @@ struct BbrInner {
     round_trip_count: u64,
     last_sent_packet: PacketNumber,
     current_round_trip_end: PacketNumber,
+    #[allow(dead_code)] // Go 对齐统计面：loss events/bytes lost 待 hysteresis 接线
     num_loss_events_in_round: u64,
+    #[allow(dead_code)]
     bytes_lost_in_round: ByteCount,
     min_rtt: Duration,
+    #[allow(dead_code)] // Go 对齐统计面：min RTT 时间戳待探针接线
     min_rtt_timestamp: MonoTime,
     congestion_window: ByteCount,
     initial_congestion_window: ByteCount,
@@ -163,14 +168,21 @@ struct BbrInner {
     drain_gain: f64,
     pacing_rate: Bandwidth,
     pacing_gain: f64,
+    #[allow(dead_code)] // Go 对齐 BBR 增益面：拥塞窗口增益待动态增益批接线
     congestion_window_gain: f64,
+    #[allow(dead_code)]
     congestion_window_gain_constant: f64,
     num_startup_rtts: i64,
     cycle_current_offset: usize,
+    #[allow(dead_code)] // Go 对齐统计面：last cycle start 待接线
     last_cycle_start: MonoTime,
+    #[allow(dead_code)] // Go 对齐 BBR 状态面字段，后续批次接线
     is_at_full_bandwidth: bool,
+    #[allow(dead_code)]
     rounds_without_bandwidth_gain: i64,
+    #[allow(dead_code)]
     bandwidth_at_last_round: Bandwidth,
+    #[allow(dead_code)]
     exiting_quiescence: bool,
     exit_probe_rtt_at: MonoTime,
     probe_rtt_round_passed: bool,
@@ -290,6 +302,7 @@ impl BbrSender {
     }
 
     /// 应用 Profile 配置（对应 Go `applyProfile`）。
+    #[allow(dead_code)] // BBR 状态机完整翻译，profile 切换待接线
     fn apply_profile_locked(inner: &mut BbrInner, profile: Profile) {
         let cfg = config_for_profile(profile);
         inner.profile = profile;
@@ -490,7 +503,10 @@ impl CongestionControl for BbrSender {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::congestion_swappable::{bbr::DefaultClock, types::test_support::MockRttStats};
+    use crate::congestion_swappable::{
+        bbr::DefaultClock,
+        types::{INITIAL_PACKET_SIZE, test_support::MockRttStats},
+    };
 
     fn make_sender() -> BbrSender {
         BbrSender::new(Arc::new(DefaultClock::new()), INITIAL_PACKET_SIZE, Profile::Standard)

@@ -190,7 +190,7 @@ impl ProxyOutbound for FreedomHandler {
         // FinalRule 预检：命中 Block → 黑洞（blockDelay + drain），不拨号
         // （对应 Go matchFinalRule Block 分支）。解析仅服务预检，不改写拨号目标。
         if let Some(rule) = self
-            .check_blocked_resolved(&dest, session)
+            .check_blocked_resolved(dest, session)
             .await
             .map_err(|e| ProxymanError::OutboundProcessFailed(e.to_string()))?
         {
@@ -198,7 +198,7 @@ impl ProxyOutbound for FreedomHandler {
         }
 
         // 拨号恒用原始目标（#6058：Go :339 dialer.Dial(destination)，域名由 dialer 解析）。
-        let mut conn = dialer.dial(&dest).await.map_err(|e| {
+        let mut conn = dialer.dial(dest).await.map_err(|e| {
             ProxymanError::OutboundProcessFailed(format!("freedom dial failed: {e}"))
         })?;
 
@@ -247,6 +247,8 @@ impl ProxyOutbound for FreedomHandler {
 
 #[cfg(test)]
 mod tests {
+    // FAKE_DNS_LOCK 等测试串行锁：guard 有意跨 await 存活（测试进程内互斥），无生产死锁面
+    #![allow(clippy::await_holding_lock)]
     use tokio::{io::AsyncWriteExt, net::TcpListener};
     use xray_common::net::{address::Address, network::Network, port::Port};
 

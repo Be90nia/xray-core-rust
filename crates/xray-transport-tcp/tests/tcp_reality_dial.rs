@@ -16,6 +16,7 @@ use xray_transport::{
 
 /// tcp + reality 出站：dial 应完成 REALITY TLS 握手（session_id/auth_key/cert HMAC）并能 echo。
 #[tokio::test]
+#[allow(clippy::redundant_pattern_matching)] // 存量清零批次：redundant_pattern_matching
 async fn tcp_plus_reality_handshake_e2e() {
     // 1. 服务端 X25519 静态密钥对（确定性，测试用）
     let server_secret = x25519_dalek::StaticSecret::from([0x99u8; 32]);
@@ -45,7 +46,7 @@ async fn tcp_plus_reality_handshake_e2e() {
         .await
         .expect("server_tls should not IO-error");
         match outcome {
-            RealityServerOutcome::Verified { tls: mut tls, .. } => {
+            RealityServerOutcome::Verified { mut tls, .. } => {
                 let mut buf = [0u8; 64];
                 loop {
                     match tls.read(&mut buf).await {

@@ -7,7 +7,7 @@
 //!
 //! # 装配路径（bd issue f23r wiring 双断点修复）
 //!
-//! - 直接构造后手动 [`set_io`](Self::set_io) 后 [`start`](Feature::start)； 适用测试。
+//! - 直接构造后手动 `set_io` 后 [`start`](Feature::start)； 适用测试。
 //! - 通过 [`init_dependencies`](Feature::init_dependencies) 走 [`DepBag`]： Instance 在所有 feature
 //!   注册完成后、start 前调用本方法，本方法 从 bag 拿 `OutboundTagSelector` 后端并装配
 //!   [`RealOutboundSelector`] + [`HttpProbeExecutor::from_config`] 自动注入
@@ -31,6 +31,7 @@ use crate::{
 pub struct ObservatoryFeature {
     observer: Observer,
     /// 探测 IO（selector + executor），set_io 注入后 start 才启动循环。
+    #[allow(clippy::type_complexity)] // 探测 IO 双组件元组即装配形态
     io: RwLock<Option<(Arc<dyn OutboundSelector>, Arc<dyn ProbeExecutor>)>>,
 }
 
@@ -99,7 +100,7 @@ impl Feature for ObservatoryFeature {
     /// [`RealOutboundSelector`] + [`HttpProbeExecutor::from_config`] 直连探测。
     ///
     /// soqc：**生产装配不走此兜底**——xray-core functions.rs 在 bag2 之前
-    /// `set_io` 注入 [`RealOutboundProbeExecutor`]（经 dispatcher forced-tag
+    /// `set_io` 注入 `RealOutboundProbeExecutor`（经 dispatcher forced-tag
     /// 拨号 + rustls 完整 HTTPS GET，对齐 Go observer.go:130-159），
     /// "已 set_io 跳过"保护使本兜底不覆盖。
     ///

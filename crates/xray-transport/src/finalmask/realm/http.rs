@@ -457,7 +457,7 @@ fn process_sse_line(line: &str, state: &mut SseState) -> io::Result<Option<Punch
 
 /// 从完整行列表中解析第一个 `punch` 事件（测试助手）。
 ///
-/// 与 [`EventStream::next_event`] 共享 [`process_sse_line`] 逻辑；
+/// 与 [`EventStream::next_event`] 共享 `process_sse_line` 逻辑；
 /// 输入 `lines` 已按 `\n` 切分（含空行）。返回 `Ok(None)` 表示流内无 `punch` 事件。
 pub fn parse_sse_event_from_lines(lines: &[&str]) -> io::Result<Option<PunchEvent>> {
     let mut state = SseState::default();

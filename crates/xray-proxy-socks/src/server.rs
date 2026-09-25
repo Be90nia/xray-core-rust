@@ -156,7 +156,7 @@ impl InboundHandler for SocksServer {
 }
 
 /// SOCKS5 服务端握手（读 VER+NMETHODS 起始）。保留为独立可用入口，
-/// 兼容既有调用方与单测；内部委托 [`socks5_handshake_from_methods`]。
+/// `兼容既有调用方与单测；内部委托 `socks5_handshake_from_methods`。`
 pub async fn socks5_server_handshake<RW>(
     stream: &mut RW,
     config: &ServerConfig,
@@ -700,9 +700,8 @@ mod tests {
         let addr = format!("127.0.0.1:{port}");
         let result = tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(&addr)).await;
         // 连接应失败（connection refused）——listener 已关闭
-        match result {
-            Ok(Ok(_)) => panic!("listener should be closed after close()"),
-            Ok(Err(_)) | Err(_) => {},
+        if let Ok(Ok(_)) = result {
+            panic!("listener should be closed after close()");
         }
     }
 
@@ -888,8 +887,7 @@ mod tests {
     async fn handshake_noauth_method_rejected_when_password_configured() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let mut config = ServerConfig::default();
-        config.auth_type = AuthType::Password;
+        let mut config = ServerConfig { auth_type: AuthType::Password, ..Default::default() };
         config.accounts.insert("u".into(), "p".into());
 
         let server = tokio::spawn(async move {
@@ -917,8 +915,7 @@ mod tests {
         // 严格拒绝不得误伤合法密码认证路径
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let mut config = ServerConfig::default();
-        config.auth_type = AuthType::Password;
+        let mut config = ServerConfig { auth_type: AuthType::Password, ..Default::default() };
         config.accounts.insert("u".into(), "p".into());
 
         let server = tokio::spawn(async move {
@@ -952,8 +949,7 @@ mod tests {
     async fn socks4_rejected_when_password_configured() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let mut config = ServerConfig::default();
-        config.auth_type = AuthType::Password;
+        let mut config = ServerConfig { auth_type: AuthType::Password, ..Default::default() };
         config.accounts.insert("u".into(), "p".into());
 
         let server = tokio::spawn(async move {

@@ -308,8 +308,8 @@ pub trait RoutingRouter: Send + Sync + Debug {
 
 /// 出站 handler trait（对应 Go `outbound.Handler.Dispatch(ctx, link)`）
 ///
-/// 与 `xray_features::outbound::OutboundHandler` 区别：本 trait 接受 [`xray_transport::link::Link`]，
-/// 保持 Go `Dispatch(ctx, link)` 语义。
+/// 与 `xray_features::outbound::OutboundHandler` 区别：本 trait 接受
+/// [`xray_transport::link::Link`]， 保持 Go `Dispatch(ctx, link)` 语义。
 pub trait DispatchHandler: Send + Sync + Debug {
     /// 返回 handler tag。
     fn tag(&self) -> &str;

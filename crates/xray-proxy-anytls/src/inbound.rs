@@ -183,7 +183,7 @@ mod tests {
 
         let config = rustls::ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(vec![cert_der.clone().into()], key_der)
+            .with_single_cert(vec![cert_der.clone()], key_der)
             .unwrap();
 
         (tokio_rustls::TlsAcceptor::from(Arc::new(config)), cert_der.to_vec())

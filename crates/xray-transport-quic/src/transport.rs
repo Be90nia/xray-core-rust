@@ -311,6 +311,7 @@ mod tests {
     }
 
     /// quinn 客户端连指定地址（allowInsecure 跳过自签验证，1s idle timeout 快速失败）。
+    #[allow(unused_variables)] // addr 保留供未来 allowInsecure 分支判定
     fn quinn_client_connect(addr: SocketAddr) -> quinn::Endpoint {
         let client_tls = xray_tls::client_config::build_client_config(
             "tls",
@@ -348,7 +349,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         // close 前连通（证明服务活着，排除假阳性）。
-        let mut ep = quinn_client_connect(addr);
+        let ep = quinn_client_connect(addr);
         let pre = ep.connect(addr, "127.0.0.1").unwrap().await;
         assert!(pre.is_ok(), "pre-close connect should succeed: {:?}", pre.err());
 

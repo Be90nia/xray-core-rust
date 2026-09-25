@@ -28,7 +28,6 @@ use xray_features::{Feature, FeatureError};
 use crate::{
     error::{CommanderError, log_warning},
     grpc,
-    outbound::OutboundRegistrar,
     server::OutboundHandlerRegistry,
 };
 // ---------------------------------------------------------------------------
@@ -326,7 +325,7 @@ impl Commander {
     }
 
     /// 设置 outbound handler 注册器（ outbound 模式下使用）。
-    /// 要求对象同时实现 [`OutboundRegistrar`] 与 [`crate::outbound::HandlerManager`]。
+    /// 要求对象同时实现 `OutboundRegistrar` 与 [`crate::outbound::HandlerManager`]。
     pub fn set_outbound_registrar(&mut self, registrar: Arc<dyn crate::outbound::HandlerManager>) {
         self.outbound_registrar = Some(registrar);
     }
@@ -787,7 +786,7 @@ mod tests {
 
     #[test]
     fn reflection_service_default_constructible() {
-        let _r = ReflectionService::default();
+        let _r = ReflectionService;
     }
 
     #[test]
@@ -1027,6 +1026,7 @@ mod tests {
     async fn outbound_mode_serves_grpc_via_dispatch() {
         use std::sync::Arc;
 
+        #[allow(unused_imports)] // 存量清零批次
         use xray_app_dispatcher::{
             DispatchHandler as _, OutboundHandlerManager as _, default::SimpleOhm,
         };
@@ -1104,6 +1104,7 @@ mod tests {
     async fn dispatch_handler_delivers_conn_to_listener() {
         use std::sync::Arc;
 
+        #[allow(unused_imports)] // 存量清零批次
         use xray_app_dispatcher::DispatchHandler as _;
         use xray_common::net::{
             address::Address, destination::Destination, network::Network, port::Port,

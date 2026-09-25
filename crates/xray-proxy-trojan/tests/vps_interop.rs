@@ -12,8 +12,6 @@
 //! VPS_HOST=xxx VPS_PORT=xxx VPS_PASS=xxx cargo test -p xray-proxy-trojan --test vps_interop -- --ignored --nocapture
 //! ```
 
-use std::sync::Arc;
-
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,

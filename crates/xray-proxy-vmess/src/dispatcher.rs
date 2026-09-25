@@ -257,8 +257,7 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>) -> DialFn {
                 option.set(request_option::CHUNK_MASKING);
                 option.set(request_option::GLOBAL_PADDING);
             }
-            let account =
-                MemoryAccount::new(config.user_uuid.clone()).with_security(security);
+            let account = MemoryAccount::new(config.user_uuid.clone()).with_security(security);
             let session = ClientSession::new();
             let header = RequestHeader::new(
                 VERSION,
@@ -326,6 +325,7 @@ pub struct VmessConn {
 
 impl VmessConn {
     /// 从底层连接构造：spawn 双向 pump（明文 duplex ↔ chunk 密文 wire），返回 duplex 客户端包装。
+    #[allow(clippy::too_many_arguments)] // 与 Go dial 参数集一一对应
     fn from_conn(
         conn: Box<dyn Connection>,
         session: ClientSession,
@@ -417,6 +417,7 @@ fn resolve_security(s: SecurityType) -> Result<SecurityType, VmessError> {
 
 /// VMess body 加密枚举：统一 Aes128Gcm / ChaCha20-Poly1305 为同一类型，
 /// 供 pump 函数泛型使用（`Box<dyn AeadCipher>` 不实现 `AeadCipher`，故用枚举统一）。
+#[allow(clippy::large_enum_variant)] // 双算法 variant 尺寸差是协议事实，Box 化徒增间接
 enum BodyCipher {
     Aes(Aes128Gcm),
     Chacha(ChaCha20Poly1305Aead),
@@ -647,6 +648,7 @@ async fn pump_down<C, R, W>(
         }
         let cipher_len = ciphertext.len().saturating_sub(padding_size);
         let nonce = nonce_gen.next_ref();
+        #[allow(clippy::redundant_guards)] // is_empty 守卫表达终止 chunk 语义，模式嵌套反而晦涩
         match cipher.open_in_place(nonce, &[], &mut ciphertext[..cipher_len]) {
             Ok(pt) if pt.is_empty() => break, // 终止 chunk
             Ok(pt) => {
@@ -701,6 +703,7 @@ mod tests {
         let _dial = make_vmess_dial_fn(Arc::clone(&cfg));
         assert_eq!(Arc::strong_count(&cfg), 2);
     }
+    #[test]
     fn parse_vmess_config_extracts_fields() {
         let data = r#"{
             "vnext": [{
@@ -813,7 +816,7 @@ mod tests {
     #[tokio::test]
     async fn dial_does_not_block_on_response_header_go_set_flush_next_semantics() {
         use std::{
-            io::{Read, Write},
+            io::Read,
             sync::atomic::{AtomicBool, Ordering},
         };
 

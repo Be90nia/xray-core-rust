@@ -24,6 +24,7 @@ const TEST_UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
 async fn start_echo() -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
     let addr = listener.local_addr().expect("echo addr");
+    #[allow(clippy::while_let_loop)] // 存量清零批次
     tokio::spawn(async move {
         loop {
             match listener.accept().await {

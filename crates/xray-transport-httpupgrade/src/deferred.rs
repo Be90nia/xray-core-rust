@@ -226,7 +226,7 @@ mod tests {
 
     #[tokio::test]
     async fn deferred_write_works_before_read() {
-        let (mut client_io, mut server_io) = duplex(8192);
+        let (client_io, mut server_io) = duplex(8192);
 
         let mut reader = DeferredResponseReader::new(client_io);
 
@@ -251,7 +251,7 @@ mod tests {
 
     #[tokio::test]
     async fn deferred_rejects_non_101() {
-        let (mut client_io, mut server_io) = duplex(8192);
+        let (client_io, mut server_io) = duplex(8192);
 
         let mut reader = DeferredResponseReader::new(client_io);
 

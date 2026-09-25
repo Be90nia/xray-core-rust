@@ -24,7 +24,7 @@ pub enum RealityError {
     #[error("REALITY: auth_key derivation failed (ECDH or HKDF)")]
     AuthKeyDeriveFailed,
 
-    /// AES-256-GCM 加密 session_id[:16] 失败（auth_key 长度非 32 字节）。
+    /// AES-256-GCM 加密 session_id`:16` 失败（auth_key 长度非 32 字节）。
     #[error("REALITY: session_id AES-GCM encryption failed")]
     SessionIdEncryptFailed,
 

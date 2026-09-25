@@ -87,6 +87,8 @@ impl WsListener {
     }
 
     /// 本地地址。
+    #[allow(clippy::result_large_err)] // WsError 携带协议上下文，Box 化徒增间接
+    #[allow(clippy::result_large_err)] // WsError 携带协议上下文
     pub fn local_addr(&self) -> Result<SocketAddr> {
         self.listener.local_addr().map_err(WsError::Io)
     }
@@ -140,6 +142,7 @@ impl WsListener {
     /// 多 path：在 `configs` 中按 (host, path) 匹配，找到的 config 决定 heartbeat_period。
     /// XFF：仅当 `trusted` 名单 header 命中时从 `X-Forwarded-For` 提取首个 IP 覆盖
     /// remote（port=0，对齐 Go ApplyTrustedXForwardedFor）。
+    #[allow(clippy::result_large_err)] // 存量清零批次：result_large_err
     async fn ws_handshake<S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static>(
         stream: S,
         remote: SocketAddr,

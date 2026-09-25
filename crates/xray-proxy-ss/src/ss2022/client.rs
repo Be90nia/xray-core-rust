@@ -9,8 +9,8 @@
 //! 3. blake3 derive session subkey: "shadowsocks 2022 session subkey", PSK || salt
 //! 4. AEAD::new(subkey)
 //! 5. 写 salt（明文）到连接
-//! 6. SSStream::new_with_aead(conn, aead, 12) — nonce [0xFF;12], 第一次 increment → [0;12]
-//! 7. write_chunk(fixed-header: type=0 + timestamp_BE_u64) — nonce [0;12]+[1,0,...]
+//! 6. SSStream::new_with_aead(conn, aead, 12) — nonce `[0xFF;12]`, 第一次 increment → `[0;12]`
+//! 7. write_chunk(fixed-header: type=0 + timestamp_BE_u64) — nonce `[0;12]+`[1,0,...]
 //! 8. write_chunk(variable-header: ATYP + addr + port) — nonce [2,0,...]+[3,0,...]
 //! 9. write_chunk(body) — nonce [4,0,...]+
 //! 10. read_chunk 循环读响应

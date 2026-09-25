@@ -107,7 +107,7 @@ impl HttpUpgradeClient {
 
     /// 在已建立的 IO 上执行客户端握手，ed > 0 时延迟读 101 响应（0-RTT）。
     ///
-    /// 与 [`dial_over_io`] 相同，但返回 `DeferredResponseReader` 包装，
+    /// 与 `dial_over_io` 相同，但返回 `DeferredResponseReader` 包装，
     /// 首次 `AsyncRead::poll_read` 时才解析 101 响应。
     /// 调用方根据 `config.ed > 0` 选择此方法。
     pub async fn dial_over_io_deferred<IO>(
@@ -147,7 +147,7 @@ mod tests {
         );
 
         // duplex 模拟 server 端
-        let (mut client_io, mut server_io) = duplex(8192);
+        let (client_io, mut server_io) = duplex(8192);
 
         // 客户端跑握手（在另一任务，因为 duplex 双向）
         let handle = tokio::spawn(async move { client.dial_over_io(client_io).await });
@@ -176,7 +176,7 @@ mod tests {
     async fn dial_captures_payload_after_response() {
         let client =
             HttpUpgradeClient::new("h".into(), Config { path: "/".into(), ..Default::default() });
-        let (mut client_io, mut server_io) = duplex(8192);
+        let (client_io, mut server_io) = duplex(8192);
         let handle = tokio::spawn(async move { client.dial_over_io(client_io).await });
 
         // 服务端先读请求再写响应 + payload
@@ -193,7 +193,7 @@ mod tests {
     #[tokio::test]
     async fn dial_rejects_non_101_response() {
         let client = HttpUpgradeClient::new("h".into(), Config::default());
-        let (mut client_io, mut server_io) = duplex(8192);
+        let (client_io, mut server_io) = duplex(8192);
         let handle = tokio::spawn(async move { client.dial_over_io(client_io).await });
 
         let mut buf = vec![0u8; 4096];
@@ -209,7 +209,7 @@ mod tests {
     async fn dial_propagates_io_eof_as_invalid_format() {
         // 服务端立刻关闭连接
         let client = HttpUpgradeClient::new("h".into(), Config::default());
-        let (mut client_io, mut server_io) = duplex(8192);
+        let (mut client_io, server_io) = duplex(8192);
         drop(server_io);
 
         let err = client.dial_over_io(&mut client_io).await.unwrap_err();

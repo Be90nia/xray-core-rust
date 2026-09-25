@@ -4,10 +4,10 @@
 //! Basic` 鉴权 + 双向首 8 帧 padding（kVariant1）。Go Xray 无此协议——本
 //! crate 为对 naiveproxy / sing-box naive inbound 的互操作实现。
 //!
-//! - [`padding`]：帧编解码 + padding 头生成（naiveproxy `NaivePaddingFramer` 移植）
+//! - `padding`：帧编解码 + padding 头生成（naiveproxy `NaivePaddingFramer` 移植）
 //! - [`uri`]：`naive+https://` 分享链接与 settings JSON 解析
-//! - [`dial`]：TCP → btls TLS → h2 CONNECT → padding 隧道
-//! - [`dispatcher`]：`make_naive_dial_fn`（xray-core 接线）
+//! - `dial`：TCP → btls TLS → h2 CONNECT → padding 隧道
+//! - `dispatcher`：`make_naive_dial_fn`（xray-core 接线）
 
 mod dial;
 mod dispatcher;

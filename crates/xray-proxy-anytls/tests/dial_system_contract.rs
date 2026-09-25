@@ -114,8 +114,7 @@ async fn dial_routes_through_dial_system_and_carries_sockopt() {
     let fake = FakeDns::default();
     set_dns_client(Some(Arc::new(fake.clone()) as Arc<dyn DnsClient>));
 
-    let mut sockopt = SocketOptions::default();
-    sockopt.domain_strategy = DomainStrategy::UseIPv4;
+    let sockopt = SocketOptions { domain_strategy: DomainStrategy::UseIPv4, ..Default::default() };
     let client_config = ClientConfig::new(
         format!("anytls.test:{port}"),
         "anytls.test",

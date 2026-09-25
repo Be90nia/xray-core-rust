@@ -22,7 +22,6 @@ use xray_proto::xray::transport::internet::{QuicParams, UdpHop as ProtoUdpHop};
 use crate::{
     config::Status,
     conn::{InterStreamConn, QuicConn, QuicStream, UdpSessionManager},
-    context::DatagramFromContext,
     error::{HysteriaError, Result},
     proto_config::Config,
 };
@@ -281,7 +280,6 @@ impl HysteriaClient {
     }
 
     /// 建立 UDP session（对应 Go `client.udp()`）。
-
     pub async fn udp(&self) -> Result<Arc<crate::conn::InterConn>> {
         self.ensure_connected().await?;
         let conn = self.conn.lock().clone().ok_or(HysteriaError::ConnectionClosed)?;
@@ -365,6 +363,7 @@ impl ClientManager {
     }
 
     /// 当前 client 数。
+    #[allow(clippy::len_without_is_empty)] // len 语义为连接计数
     pub fn len(&self) -> usize {
         self.clients.lock().len()
     }
@@ -475,7 +474,7 @@ mod tests {
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = std::io::Result<Arc<dyn QuicConn>>> + Send>,
             > {
-                Box::pin(async { Err(std::io::Error::new(std::io::ErrorKind::Other, "stub")) })
+                Box::pin(async { Err(std::io::Error::other("stub")) })
             }
 
             fn open_stream(
@@ -484,7 +483,7 @@ mod tests {
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = std::io::Result<Arc<dyn QuicStream>>> + Send>,
             > {
-                Box::pin(async { Err(std::io::Error::new(std::io::ErrorKind::Other, "stub")) })
+                Box::pin(async { Err(std::io::Error::other("stub")) })
             }
         }
         let dest = DialDestination {
@@ -513,7 +512,7 @@ mod tests {
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = std::io::Result<Arc<dyn QuicConn>>> + Send>,
             > {
-                Box::pin(async { Err(std::io::Error::new(std::io::ErrorKind::Other, "")) })
+                Box::pin(async { Err(std::io::Error::other("")) })
             }
 
             fn open_stream(
@@ -522,7 +521,7 @@ mod tests {
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = std::io::Result<Arc<dyn QuicStream>>> + Send>,
             > {
-                Box::pin(async { Err(std::io::Error::new(std::io::ErrorKind::Other, "")) })
+                Box::pin(async { Err(std::io::Error::other("")) })
             }
         }
         let mgr = ClientManager::new(Arc::new(NoopTransport));

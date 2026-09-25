@@ -301,7 +301,7 @@ async fn authenticate_via_h3(
 
 /// h3 auth 保活项 + 协商结果。
 ///
-/// driver/send_req 必须持有到 QUIC 连接生命周期结束（见 [`authenticate_via_h3`] 文档）；
+/// driver/send_req 必须持有到 QUIC 连接生命周期结束（见 `authenticate_via_h3` 文档）；
 /// udp_enabled/cc_rx_down 是服务端响应头解析结果，供拥塞控制选择
 /// （Go：`UseBrutal(conn, min(BrutalUp, down))`，down=0 或 BrutalUp=0 时退 BBR）。
 pub struct H3Keepalive {
@@ -370,7 +370,7 @@ mod tests {
             rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
         let server_tls = rustls::server::ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(vec![cert_der.into()], key_der)
+            .with_single_cert(vec![cert_der], key_der)
             .unwrap();
         let mut trust = rustls::RootCertStore::empty();
         // 自签证书自身作根（免去 dangerous verifier）

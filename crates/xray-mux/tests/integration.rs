@@ -8,11 +8,9 @@ use std::sync::Arc;
 use xray_buf::io::Writer;
 use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
 use xray_mux::{
-    client::{
-        ClientManager, ClientWorker, DialingWorkerFactory, Link, MUX_COOL_ADDRESS, WorkerPicker,
-    },
+    client::{ClientManager, ClientWorker, Link, MUX_COOL_ADDRESS, WorkerPicker},
     frame::{FrameMetadata, SessionStatus},
-    session::{ClientStrategy, SessionManager, TransferType},
+    session::{ClientStrategy, SessionManager},
     worker::{DispatchError, Dispatcher, Server, ServerWorker},
 };
 

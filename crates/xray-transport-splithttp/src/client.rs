@@ -11,13 +11,13 @@
 //! - [`DefaultDialerClient::post_packet`]：POST 单个分包（packet-up），等 200 OK
 //! - [`DefaultDialerClient::open_stream_uploading`]：POST streaming body （stream-up /
 //!   stream-one，支持全双工流式上传）
-//! - 内部 [`Self::build_request`] / [`Self::build_request_with_body`]：把
+//! - 内部 `Self::build_request` / `Self::build_request_with_body`：把
 //!   [`crate::config::RequestMeta`] + 任意 body 转换为 `hyper::Request<ReqBody>`
 //!
 //! # 不实现（留后续切片）
 //!
 //! - `WaitReadCloser` 异步等待机制（Go 用来同步 GotConn 与响应到达）→ GET 分支以
-//!   [`Self::open_stream`] 的 lazy reader 等价实现（同步 await 响应头会在 Go 26.9.9 hub
+//!   `Self::open_stream` 的 lazy reader 等价实现（同步 await 响应头会在 Go 26.9.9 hub
 //!   `SetFlushNext` 语义下与上传侧形成环形死锁，见 `spawn_h2_lazy_reader`）。
 //! - `browser_dialer` 路径 → 切片 b7f 独立任务
 //! - HTTP/3 / QUIC → 切片 G（可选）

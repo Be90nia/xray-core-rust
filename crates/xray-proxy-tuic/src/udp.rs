@@ -4,7 +4,7 @@
 //! 支持两种模式（TUIC v5 SPEC：Packet 只经 uni stream 或 datagram，
 //! server 同模回包；bi stream 只承载 Connect）：
 //! - **quic 模式**（[`TuicUdpAssoc::send_recv`]）：每个 UDP 包独占一条 uni stream；响应经
-//!   per-connection [`UniRespRouter`] pump 配对
+//!   per-connection `UniRespRouter` pump 配对
 //! - **native 模式**（[`TuicUdpAssoc::send_recv_native`]）：QUIC DATAGRAM， 保留 UDP 不可靠语义
 //!
 //! ## 限制（ponytail）
@@ -168,9 +168,9 @@ impl TuicUdpAssoc {
     /// 流程（TUIC v5 SPEC uni-stream 模型）：
     /// 1. open_uni 写入 Packet 帧（VER + TYPE + ASSOC + PKT + FRAG + SIZE + ADDR + DATA）
     /// 2. finish() 通知 server 写方向结束
-    /// 3. 响应经 [`UniRespRouter`] pump 从 server 新开的 uni stream 配对收取
+    /// 3. 响应经 `UniRespRouter` pump 从 server 新开的 uni stream 配对收取
     ///
-    /// `timeout` 为 None 时使用 [`DEFAULT_UDP_TIMEOUT`]。
+    /// `timeout` 为 None 时使用 `DEFAULT_UDP_TIMEOUT`。
     ///
     /// # Errors
     ///
@@ -215,9 +215,9 @@ impl TuicUdpAssoc {
     ///    片（同 pkt_id，FRAG_ID 0-based， 非首片 addr=None/0xff）
     /// 2. 通过 [`quinn::Connection::send_datagram`] 发送
     /// 3. 循环 [`quinn::Connection::read_datagram`] 收响应，FRAG_TOTAL>1 的 分片经
-    ///    [`FragmentAssembler`] 拼接（票 ao93：大 DNS/WireGuard 包不再丢）
+    ///    `FragmentAssembler` 拼接（票 ao93：大 DNS/WireGuard 包不再丢）
     ///
-    /// `timeout` 为 None 时使用 [`DEFAULT_UDP_TIMEOUT`]。
+    /// `timeout` 为 None 时使用 `DEFAULT_UDP_TIMEOUT`。
     ///
     /// # Errors
     ///

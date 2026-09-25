@@ -10,8 +10,8 @@
 //!   streamSettings）
 //! - **trojan**：JSON 解析 `servers` → [`TrojanOutboundConfig`] → `make_dial_fn`（raw TCP，不含
 //!   streamSettings）
-//! - **blackhole**：JSON 解析 `response.type` → [`BlackholeHandler`]（DispatchHandler，不拨号）
-//! - **socks**：JSON 解析 `servers[0]` → [`SocksClient`] + `make_socks_dial_fn`（SOCKS5 outbound）
+//! - **blackhole**：JSON 解析 `response.type` → `BlackholeHandler`（DispatchHandler，不拨号）
+//! - **socks**：JSON 解析 `servers[0]` → `SocksClient` + `make_socks_dial_fn`（SOCKS5 outbound）
 //! - **vmess**：JSON 解析 `vnext[0]` → `VmessOutboundConfig` → `make_vmess_dial_fn`
 //! - **shadowsocks**：JSON 解析 `servers[0]` → `SsOutboundConfig` → `make_ss_dial_fn`
 //! - **shadowsocks**：JSON 解析 `servers[0]` → SsOutbound → OutboundHandlerBridge（stub dial）
@@ -142,7 +142,7 @@ impl xray_app_dispatcher::OutboundHandlerManager for OhmRef {
 ///
 /// `dns` 提供域名解析服务（对应 Go 全局 `internet.dnsClient`，由 `app/dns`
 /// 初始化后 `internet.InitDNSCache` 注入）。配置了 `targetStrategy`（非 AsIs）
-/// 的出站在拨号前经 [`wrap_dial_with_target_strategy`] 解析改写目标。
+/// 的出站在拨号前经 `wrap_dial_with_target_strategy` 解析改写目标。
 pub fn register_outbounds(
     built: &BuiltConfig,
     ohm: &SimpleOhm,
@@ -169,6 +169,7 @@ pub fn register_outbounds(
                 .map(|rule| (ib.tag.clone(), rule))
         })
         .collect();
+    #[allow(unused_variables)] // 存量清零批次
     for (i, ob) in built.outbounds.iter().enumerate() {
         match try_build_handler(
             ob,
@@ -239,12 +240,14 @@ pub fn register_outbounds(
         Arc::new(OhmRef { inner: ohm });
     xray_transport::system_dialer::set_dialer_proxy_hook(Arc::new(
         move |tag: &str, dest: &Destination| {
+            #[allow(unused_imports)] // 存量清零批次
             use xray_app_dispatcher::OutboundHandlerManager;
             let tag = tag.to_string();
             let dest = dest.clone();
             let ohm = Arc::clone(&dialer_proxy_ohm);
             Box::pin(async move {
                 let Some(handler) = ohm.get_handler(&tag) else {
+                    #[allow(clippy::io_other_error)] // 存量清零批次
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Other,
                         "there is no outbound handler for dialerProxy",
@@ -361,6 +364,7 @@ fn wrap_dial_with_send_through(
 /// `proxy_chain_tag` 存在时保留 `Arc<DialBridge>` 引用，以便 Phase 2 设置代理链。
 /// `target_strategy` 有效（非 AsIs）时先经 [`wrap_dial_with_target_strategy`]
 /// 包装 dial_fn（bd bqm）。
+#[allow(clippy::type_complexity)] // 返回类型即三组件装配形态
 fn wrap_bridge(
     tag: String,
     dial_fn: xray_app_dispatcher::default::DialFn,
@@ -393,9 +397,10 @@ fn wrap_bridge(
     Ok((handler, bridge_ref, proxy_chain_tag.clone()))
 }
 
+#[allow(private_interfaces)] // 存量清零批次
 /// 构建单个 outbound handler（动态 AddOutbound 用，bd bg7）。
 ///
-/// 与 [`try_build_handler`] 同一构建路径（协议全覆盖），mux outbound 返回
+/// 与 `try_build_handler` 同一构建路径（协议全覆盖），mux outbound 返回
 /// `Unsupported`（动态 mux 依赖 register_outbounds 的 Phase 2 二次扫描，
 /// API 场景不适用）。DNS 服务未注入（API 路径暂无 DnsService 传递链），
 /// targetStrategy=Force* 在该路径下解析域名会失败断链。
@@ -414,6 +419,7 @@ pub fn build_single_outbound(
     Ok(handler)
 }
 
+#[allow(private_interfaces)] // 存量清零批次
 /// proto `OutboundHandlerConfig`（gRPC AddOutbound）→ `BuiltOutbound`。
 ///
 /// TypedMessage 约定（与 CLI `api_exec::build_typed_message` 一致）：
@@ -531,6 +537,7 @@ pub(crate) fn parse_udp443_policies(
 /// worker carrier 经该出站协议拨向 v1.mux.cool:9527，多连接复用同一 carrier。
 /// protocol=="mux" 出站本身已是 MuxBridge，不叠包。UDP443 策略仍由 dispatcher
 /// 按 tag 检查、UDP GlobalID 走 [`MuxBridge::dispatch_with_access`]，均不受影响。
+#[allow(clippy::type_complexity)] // 返回三组件装配形态
 fn try_build_handler(
     ob: &BuiltOutbound,
     loopback_sink: Option<Arc<dyn LoopbackSink>>,
@@ -585,6 +592,7 @@ fn outbound_mux_concurrency(ob: &BuiltOutbound) -> Option<u32> {
     Some(if cfg.concurrency == 0 { 8 } else { cfg.concurrency as u32 })
 }
 
+#[allow(clippy::doc_lazy_continuation)] // 存量清零批次
 /// xudpConcurrency 三态（Go `NewHandler` :143-164）：
 /// - `< 0`：Direct——UDP 直发底层出站（Go `ClientManager{Enabled:false}`）
 /// - `== 0`/缺省：Carrier——UDP 并入常规 mux 载体（GlobalID XUDP 帧）
@@ -633,6 +641,7 @@ fn outbound_mux_udp443_skip(ob: &BuiltOutbound) -> bool {
 /// 返回 `(handler, dial_bridge_ref, proxy_chain_tag)`。
 /// - `handler`: 注册到 Ohm 的 DispatchHandler
 /// - `dial_bridge_ref`: 如果是 DialBridge 类型，保留 Arc 引用以便 Phase 2 设置代理链
+#[allow(clippy::type_complexity)] // 返回三组件装配形态
 fn build_protocol_handler(
     ob: &BuiltOutbound,
     loopback_sink: Option<Arc<dyn LoopbackSink>>,
@@ -991,8 +1000,10 @@ fn build_protocol_handler(
                         let dest = dest.clone();
                         let tag = tag.clone();
                         Box::pin(async move {
-                            let mut sockopt = xray_transport::sockopt::SocketOptions::default();
-                            sockopt.dialer_proxy = tag;
+                            let sockopt = xray_transport::sockopt::SocketOptions {
+                                dialer_proxy: tag,
+                                ..Default::default()
+                            };
                             xray_transport::system_dialer::dial_system(&dest, &sockopt)
                                 .await
                                 .map_err(|e| format!("wireguard chain dial: {e}"))
@@ -1104,7 +1115,7 @@ fn build_protocol_handler(
 
 /// Mux outbound handler（mbc/nww）。
 ///
-/// 持有 mux [`ClientManager`]。dispatch 时 pick worker → `ClientWorker::dispatch`
+/// 持有 mux `ClientManager`。dispatch 时 pick worker → `ClientWorker::dispatch`
 /// 把 link 桥接成 mux session（首帧 New，后续 Keep 帧，carrier 经底层 outbound
 /// 拨向 v1.mux.cool:9527）。底层 handler 经 [`UnderlyingSlot`] 延迟注入。
 pub struct MuxBridge {
@@ -1339,7 +1350,9 @@ fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutboundConfig, S
     if enc_params.is_none() && !encryption.is_empty() && encryption != "none" {
         return Err(format!(r#"VLESS users: unsupported "encryption": {encryption}"#));
     }
+    #[allow(unused_variables)] // 存量清零批次
     let level = user.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    #[allow(unused_variables)] // 存量清零批次
     let email = user.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
     // testseed/testpre（Go infra/conf/vless.go:296-321）：simplified 顶层形式读
     // settings 顶层字段；标准 vnext 形式读 user json。Rust 统一为 user 字段
@@ -1395,6 +1408,7 @@ fn parse_trojan_config(data: &[u8]) -> std::result::Result<TrojanOutboundConfig,
         .ok_or_else(|| "missing servers array".to_string())?;
     // Go infra/conf/trojan.go:57-58：servers 必须恰有一个成员，多端点用 routing balancer。
     if servers.len() != 1 {
+        #[allow(clippy::useless_format)] // 存量清零批次
         return Err(format!(
             "Trojan settings: \"servers\" should have one and only one member. \
              Multiple endpoints in \"servers\" should use multiple Trojan outbounds and routing balancer instead"
@@ -1440,6 +1454,7 @@ fn parse_trojan_config(data: &[u8]) -> std::result::Result<TrojanOutboundConfig,
 /// JSON 解析失败 / domainStrategy 未知值 / finalRules 单条非法 → 硬错
 /// （对齐 Go `FreedomConfig.Build` 解码期拒启），空 settings 走缺省。
 fn parse_freedom_config(data: &[u8]) -> std::io::Result<FreedomConfig> {
+    #[allow(unused_imports)] // 存量清零批次
     use xray_proxy_freedom::{DomainStrategy, Fragment, Noise};
     if data.iter().all(|b| b.is_ascii_whitespace()) {
         return Ok(FreedomConfig::default());
@@ -1461,7 +1476,9 @@ fn parse_freedom_config(data: &[u8]) -> std::io::Result<FreedomConfig> {
         Some(s) => parse_freedom_domain_strategy(s)?,
         None => DomainStrategy::AsIs,
     };
+    #[allow(unused_variables)] // 存量清零批次
     let fragment = v.get("fragment").and_then(parse_freedom_fragment);
+    #[allow(unused_variables)] // 存量清零批次
     let noises: Vec<Noise> = v
         .get("noises")
         .and_then(|n| n.as_array())
@@ -1778,6 +1795,7 @@ pub struct StubDispatchBridge {
 }
 
 impl StubDispatchBridge {
+    #[allow(dead_code)] // 存量清零批次
     /// 创建 stub outbound handler。
     fn new(tag: impl Into<String>, protocol: &str) -> Self {
         Self { tag: tag.into(), protocol: protocol.to_string() }
@@ -1816,6 +1834,7 @@ impl DispatchHandler for StubDispatchBridge {
 
 // ========== DnsDispatchBridge：DNS 查询拦截 + 规则匹配 + 转发 ==========
 
+#[allow(clippy::doc_lazy_continuation)] // 存量清零批次
 /// DNS outbound handler：拦截 dispatcher 转发的 DNS 查询 → 规则匹配 → 转发/丢弃/返回/劫持。
 ///
 /// 对应 Go `proxy/dns/dns.go::Handler.Process`：
@@ -2324,12 +2343,13 @@ fn parse_anytls_config(
             .with_no_client_auth()
     } else {
         let root_store = rustls::RootCertStore {
+            #[allow(clippy::iter_cloned_collect)] // 存量清零批次
             roots: webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect(),
         };
         rustls::ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth()
     };
     Ok(xray_proxy_anytls::ClientConfig::new(
-        &format!("{address}:{port}"),
+        format!("{address}:{port}"),
         sni,
         password,
         Arc::new(tls_config),
@@ -2504,6 +2524,7 @@ async fn pump_tuic_udp(
     link: Link,
     params: Arc<TuicUdpParams>,
 ) -> std::result::Result<(), String> {
+    #[allow(unused_imports)] // 存量清零批次
     use xray_xudp::packet::{PacketError, PacketReader, PacketWriter};
 
     let client = xray_proxy_tuic::TuicClient::connect_with(
@@ -2798,6 +2819,7 @@ fn build_tuic_rustls_config(
             .with_no_client_auth()
     } else {
         let mut roots = rustls::RootCertStore {
+            #[allow(clippy::iter_cloned_collect)] // 存量清零批次
             roots: webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect(),
         };
         if let Some(pem) = certificate {
@@ -3766,6 +3788,7 @@ mod tests {
         for (raw, want) in cases {
             assert_eq!(parse_freedom_domain_strategy(raw).unwrap(), want, "case {raw}");
         }
+        #[allow(clippy::err_expect)] // 存量清零批次
         // 未知值拒启，错误信息保留原始大小写（Go :88）。
         let err = parse_freedom_domain_strategy("UseIPv3").err().expect("must reject");
         assert!(err.to_string().contains("unsupported domain strategy: UseIPv3"), "got: {err}");
@@ -3796,6 +3819,7 @@ mod tests {
             {"action":"block","port":"53"},
             {"action":"nope","port":"443"}
         ]}"#;
+        #[allow(clippy::err_expect)] // 存量清零批次
         let err = parse_freedom_config(mixed).err().expect("must reject");
         assert!(err.to_string().contains("finalRule"), "got: {err}");
     }
@@ -4687,10 +4711,7 @@ mod tests {
             io::{AsyncReadExt, AsyncWriteExt},
             net::TcpListener,
         };
-        use xray_buf::{
-            io::{Reader as _, Writer as _},
-            multi::MultiBuffer,
-        };
+        use xray_buf::multi::MultiBuffer;
 
         // echo server
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4708,6 +4729,7 @@ mod tests {
             }
         });
 
+        #[allow(clippy::useless_format)] // 存量清零批次
         let json = format!(
             r#"{{"outbounds": [{{"protocol": "freedom", "tag": "out", "targetStrategy": "UseIP"}}]}}"#
         );
@@ -4817,6 +4839,7 @@ mod tests {
     /// 手工 socks5 服务器：no-auth 握手 + 记录 CONNECT 目标 + 双向桥接。
     /// 记录是「经代理而非直连」的判别器。返回 (端口, 记录)。
     async fn spawn_socks5_recorder() -> (u16, Arc<Mutex<Vec<(std::net::IpAddr, u16)>>>) {
+        #[allow(unused_imports)] // 存量清零批次
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -5216,6 +5239,7 @@ mod tests {
     #[tokio::test]
     async fn mux_bridge_dispatch_with_access_carries_global_id_for_udp() {
         use tokio::io::AsyncWriteExt as _;
+        #[allow(unused_imports)] // 存量清零批次
         use xray_buf::io::{Reader as _, Writer as _};
 
         // ---- 捕获 carrier 字节的假 underlying（DialingWorkerFactory 拨号落点）----
@@ -5247,6 +5271,7 @@ mod tests {
             }
         }
 
+        #[allow(unused_variables)] // 存量清零批次
         let (bridge, slot) = MuxBridge::new("mux-gid", 4);
         let captured: Arc<parking_lot::Mutex<Vec<u8>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -5305,6 +5330,7 @@ mod tests {
     #[tokio::test]
     async fn mux_bridge_dispatch_with_access_tcp_has_no_global_id() {
         use tokio::io::AsyncWriteExt as _;
+        #[allow(unused_imports)] // 存量清零批次
         use xray_buf::io::{Reader as _, Writer as _};
 
         #[derive(Debug)]
@@ -5335,6 +5361,7 @@ mod tests {
             }
         }
 
+        #[allow(unused_variables)] // 存量清零批次
         let (bridge, slot) = MuxBridge::new("mux-gid-tcp", 4);
         let captured: Arc<parking_lot::Mutex<Vec<u8>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -5399,8 +5426,10 @@ mod tests {
         let dest =
             Destination::udp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(addr.port()));
 
-        let mut access = xray_app_dispatcher::default::AccessContext::default();
-        access.inbound_tag = "self-loop".into();
+        let access = xray_app_dispatcher::default::AccessContext {
+            inbound_tag: "self-loop".into(),
+            ..Default::default()
+        };
         let (mut up_w, mut dn_r) = spawn_dns_bridge(&bridge, &dest, Some(access));
 
         let query = dns_make_query(0x5678, "raw.example.com", 1);
@@ -5604,6 +5633,7 @@ mod tests {
         let dest = Destination::tcp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(echo_port));
         let pipe_opt = xray_buf::pipe::PipeOption::default();
         let new_link = || {
+            #[allow(unused_variables)] // 存量清零批次
             let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
             let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
             (
@@ -5661,6 +5691,7 @@ mod tests {
     /// TCP 载荷静默发出、响应永不回流。
     #[tokio::test]
     async fn tuic_udp_dispatch_relays_xudp_frames() {
+        #[allow(unused_imports)] // 存量清零批次
         use xray_buf::io::{Reader as _, Writer as _};
         use xray_xudp::packet::{PacketReader, PacketWriter};
 

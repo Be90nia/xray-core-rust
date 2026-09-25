@@ -1,4 +1,4 @@
-//! StatusStore：管理 Vec<OutboundStatus> + update/clearRemoved/findLocation。
+//! StatusStore：管理 Vec````<OutboundStatus>```` + update/clearRemoved/findLocation。
 //!
 //! 对应 Go `Observer.status` + `statusLock` + `updateStatusForResult` +
 //! `clearRemovedOutbounds` + `findStatusLocationLockHolderOnly`。

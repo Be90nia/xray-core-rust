@@ -57,6 +57,7 @@ where
 /// # 错误
 ///
 /// 如果地址解析失败，立即返回错误（不 spawn task）。
+#[allow(clippy::type_complexity)] // 返回类型即 spawn 句柄形态
 pub fn spawn_grpc<F>(
     addr: &str,
     register: F,

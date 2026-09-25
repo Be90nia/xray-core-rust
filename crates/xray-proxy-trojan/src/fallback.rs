@@ -136,7 +136,7 @@ impl SniNode {
     fn fuzzy_longest_match(&self, sni: &str, alpn: &str, path: &str) -> Option<&Fallback> {
         let mut matched: Option<&String> = None;
         for n in self.exact.keys() {
-            if sni.contains(n.as_str()) && matched.map_or(true, |m| n.len() > m.len()) {
+            if sni.contains(n.as_str()) && matched.is_none_or(|m| n.len() > m.len()) {
                 matched = Some(n);
             }
         }
@@ -170,7 +170,7 @@ impl FallbackPolicy {
             let node = self.root.wildcard.get_or_insert_with(AlpnNode::default);
             Self::insert_alpn(node, fb);
         } else {
-            let node = self.root.exact.entry(fb.name.clone()).or_insert_with(AlpnNode::default);
+            let node = self.root.exact.entry(fb.name.clone()).or_default();
             Self::insert_alpn(node, fb);
         }
     }
@@ -180,7 +180,7 @@ impl FallbackPolicy {
             let path_node = node.wildcard.get_or_insert_with(PathNode::default);
             Self::insert_path(path_node, fb);
         } else {
-            let path_node = node.exact.entry(fb.alpn.clone()).or_insert_with(PathNode::default);
+            let path_node = node.exact.entry(fb.alpn.clone()).or_default();
             Self::insert_path(path_node, fb);
         }
     }

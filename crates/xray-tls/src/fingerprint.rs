@@ -4,7 +4,7 @@
 //! `GetFingerprint` 函数。
 //!
 //! # 现状
-//! `Fingerprint` 由 [`get_fingerprint`](crate::fingerprint::get_fingerprint) 解析后，
+//! `Fingerprint` 由 ``get_fingerprint` 解析后，
 //! 经 `utls::u_client` 走 btls（BoringSSL）真实 uTLS ClientHello 指纹握手；
 //! 清单外指纹硬错（见 `btls_client::connector_for_fingerprint`）。
 //!

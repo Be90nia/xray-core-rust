@@ -295,6 +295,7 @@ mod tests {
     #[test]
     fn shared_validator_is_send_sync() {
         let v: Arc<dyn Validator> = shared_validator();
+        #[allow(unused_must_use)] // 存量清零批次
         std::sync::Arc::strong_count(&v);
     }
 }

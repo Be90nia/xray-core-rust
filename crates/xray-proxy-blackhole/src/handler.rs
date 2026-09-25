@@ -3,7 +3,7 @@
 //! 对应 Go 版本 `proxy/blackhole/blackhole.go`。
 //!
 //! 当前实现聚焦业务核心：构造时一次性解析 [`Config`] 为 [`ResponseConfig`]，
-//! `process` 接受任意 [`Writer`](xray_buf::io::Writer) 写出响应。Go 版本中
+//! `process` 接受任意 [`Writer`] 写出响应。Go 版本中
 //! `Process(ctx, link, dialer)` 涉及的 `transport.Link`/`internet.Dialer`/`session`/`signal`
 //! 交互，等 Rust 端 `xray-transport` 提供等价类型后再通过 adapter 接入。
 

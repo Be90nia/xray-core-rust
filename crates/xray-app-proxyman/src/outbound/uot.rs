@@ -139,6 +139,7 @@ fn encode_request(buf: &mut Vec<u8>, is_connect: bool, dest: SocketAddr) -> io::
 }
 
 /// 解码 request 头。返回 `(is_connect, dest, total_consumed)`。
+#[allow(dead_code)] // 解码入口已由 dispatch 内联承担；保留供 uot 单元测试与后续接线
 fn decode_request(buf: &[u8]) -> io::Result<(bool, SocketAddr, usize)> {
     if buf.is_empty() {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "uot: short request header"));

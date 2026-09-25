@@ -55,7 +55,7 @@ const PACKET_UP_TIMEOUT: Duration = Duration::from_secs(15);
 /// 主请求入口。对应 Go `requestHandler.ServeHTTP`。
 ///
 /// 提取 CORS header（对应 Go `WriteResponseHeader`，在每个响应上调用），
-/// 再委托 [`dispatch_request`]，最后把 CORS header 追加到最终响应。
+/// 再委托 `dispatch_request`，最后把 CORS header 追加到最终响应。
 pub async fn handle_request<B>(
     req: Request<B>,
     peer_addr: SocketAddr,
@@ -789,8 +789,8 @@ mod tests {
     #[test]
     fn base64url_decode_url_safe_chars() {
         // "-" and "_" are valid URL-safe chars
-        let data = vec![0xffu8, 0xff, 0xff];
-        let encoded = "__-w"; // base64url of [0xff, 0xff, 0xff]
+        let _data = [0xffu8, 0xff, 0xff];
+        let _encoded = "__-w"; // base64url of [0xff, 0xff, 0xff]
         // Let me compute: 0xff = 255
         // 111111 111111 111111 → but 3 bytes = 4 base64 chars
         // Actually 3 bytes → 4 chars. 0xff_0xff_0xff

@@ -87,8 +87,8 @@ pub fn parse_ech_dns_server(
 /// 查询 ECH config（含 TTL 缓存）。对应 Go `QueryRecord(domain, server, sockopt)`。
 ///
 /// - 缓存未过期 → 直接返回（零网络 IO）。
-/// - 否则真实查询 [`dns_query_doh`] 并按响应 TTL 回填缓存。
-/// - `tls_config`：`https://` 查询的 TLS 配置；`None` 用 [`DEFAULT_DOH_TLS_CONFIG`] （系统 roots +
+/// - 否则真实查询 `dns_query_doh` 并按响应 TTL 回填缓存。
+/// - `tls_config`：`https://` 查询的 TLS 配置；`None` 用 `DEFAULT_DOH_TLS_CONFIG` （系统 roots +
 ///   ALPN h2，对应 Go `http2.Transport` + `utls.Config{ServerName}` 默认验证）。测试可注入信任 mock
 ///   自签证书的 config；注入方需自带 ALPN h2 方可对真实 DoH server 查询。
 /// - 查询失败返回 `Err`；调用方（`utls::u_client_with_alpn`）保持原串，由 resolve 落

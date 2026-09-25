@@ -94,7 +94,7 @@ pub struct ProbeKey {
 /// 两个 sync.Map 等价物，key 相同故合一）。
 ///
 /// 启动期 `detect_max_useless_records` / [`detect_post_handshake_record_lens`]
-/// 写入；握手期 `probe_for_key` / [`record_lens_for_key`] 读取。
+/// 写入；握手期 `probe_for_key` / `record_lens_for_key` 读取。
 /// `Mutex<HashMap>` 简化：探测数量 = len(dest) × len(server_names) × 3 个 key，
 /// 单 listener 写一次；读侧几乎 O(1)。sync.Map 用不上。
 #[derive(Debug, Default, Clone)]

@@ -8,7 +8,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
-use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
+use xray_common::net::{destination::Destination, network::Network, port::Port};
 use xray_proxy_trojan::{
     config::MemoryAccount,
     hex_sha224,

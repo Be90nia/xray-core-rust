@@ -155,7 +155,7 @@ impl ClientConfig {
 /// Trojan 服务端配置（proto 镜像），对应 proto `ServerConfig`（users + fallbacks）。
 ///
 /// Go `server.go:65-74`：users 各经 `ToMemoryUser` 解码入 Validator，
-/// fallbacks 建 3 级决策树（→ [`FallbackPolicy::from_list`]）。
+/// fallbacks 建 3 级决策树（→ `FallbackPolicy::from_list`）。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ServerConfig {
     /// 用户列表（账户已解码为运行时 [`MemoryAccount`]）。
@@ -169,7 +169,7 @@ impl ServerConfig {
     ///
     /// # Errors
     /// 任一 user 的 account 缺失/类型不符/解码失败 →
-    /// [`TrojanError::InvalidUserAccount`]（对应 Go `server.go:33-35`
+    /// `TrojanError::InvalidUserAccount`（对应 Go `server.go:33-35`
     /// `failed to get hysteria user` 同类路径——`User.ToMemoryUser` 出错即整体失败）。
     pub fn from_proto(p: ProtoServerConfig) -> Result<Self> {
         Ok(Self {
@@ -314,6 +314,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)] // 字段赋值路径即被测行为
     fn server_config_from_proto_rejects_bad_user() {
         use xray_proto::xray::common::protocol::User as ProtoUser;
         // 无 account 的 user：Go ToMemoryUser 报错 → NewServer 整体失败
@@ -326,6 +327,8 @@ mod tests {
             r#type: "type.googleapis.com/xray.proxy.vless.Account".into(),
             value: Vec::new(),
         });
+        #[allow(clippy::field_reassign_with_default)] // 该测试断言的即字段赋值路径
+        let _ = &mut u;
         let p = ProtoServerConfig { users: vec![u], fallbacks: vec![] };
         assert!(ServerConfig::from_proto(p).is_err());
     }

@@ -110,7 +110,7 @@ impl Instance {
         Ok(())
     }
 
-    /// 从 [`BuiltConfig`] 构造 Instance（核心启动路径第一步）。
+    /// 从 `BuiltConfig` 构造 Instance（核心启动路径第一步）。
     ///
     /// 对应 Go `core.New(config)` → `initInstanceWithConfig` 的 App 循环部分：
     /// 遍历 `built.apps`，按 `kind` 查全局 [`FeatureFactory`](xray_features::registry) 表，
@@ -326,6 +326,7 @@ impl Default for Instance {
     }
 }
 
+#[allow(clippy::items_after_test_module)] // 存量清零批次
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

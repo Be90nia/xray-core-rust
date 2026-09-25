@@ -42,7 +42,7 @@ use crate::{
     peer::shared_peer,
 };
 
-/// driver 句柄槽（与 [`crate::inbound::WireguardInboundHandler::driver`] 同一 Arc）。
+/// driver 句柄槽（与 `crate::inbound::WireguardInboundHandler::driver` 同一 Arc）。
 pub type DriverSlot = Arc<ParkMutex<Option<Arc<WgDriver>>>>;
 
 /// 动态用户记录——Go `users sync.Map` 值（`protocol.MemoryUser` + `MemoryAccount`）合体。
@@ -187,6 +187,7 @@ impl WgUserRegistry {
 }
 
 /// [`std::net::IpAddr`] → smoltcp [`smoltcp::wire::IpAddress`]（与 inbound.rs 共用逻辑）。
+#[allow(clippy::incompatible_msrv)] // 存量清零批次：incompatible_msrv
 fn to_smoltcp_addr(addr: IpAddr) -> smoltcp::wire::IpAddress {
     match addr {
         IpAddr::V4(v4) => {
@@ -235,8 +236,8 @@ impl ProxyUserManager for WgUserRegistry {
 }
 
 /// proxyman 入站 handler 适配——委托到 xray-features [`crate::inbound::WireguardInboundHandler`]
-/// 的同步 [`crate::inbound::WireguardInboundHandler::do_start`] /
-/// [`do_close`](crate::inbound::WireguardInboundHandler::do_close)。
+/// 的同步 `do_start` /
+/// `do_close`。
 impl ProxyInboundHandler for crate::inbound::WireguardInboundHandler {
     fn tag(&self) -> &str {
         <Self as xray_features::inbound::InboundHandler>::tag(self)
@@ -277,7 +278,7 @@ mod tests {
 
     use super::*;
     use crate::{driver::WgTransport, peer::SharedPeer};
-
+    #[allow(dead_code)] // 存量清零批次
     fn make_keypair(seed: u8) -> (String, String) {
         use boringtun::x25519::{PublicKey, StaticSecret};
         let secret_bytes = [seed; 32];
@@ -286,6 +287,7 @@ mod tests {
     }
 
     /// Dialed 假传输 driver（不跑 main_loop，无需真实 socket）。
+    #[allow(dead_code)] // 存量清零批次
     fn test_driver(device: &DeviceConfig, static_pub: &str) -> DriverSlot {
         let peer: SharedPeer = shared_peer(
             device,
@@ -314,7 +316,7 @@ mod tests {
         );
         Arc::new(ParkMutex::new(Some(Arc::new(driver))))
     }
-
+    #[allow(dead_code)] // 存量清零批次
     fn make_registry() -> (WgUserRegistry, String, String, String) {
         let (sec_s, pub_s) = make_keypair(0x22);
         let (_, pub_static) = make_keypair(0x11);
@@ -324,7 +326,7 @@ mod tests {
         let registry = WgUserRegistry::new(device, driver).expect("registry");
         (registry, pub_s, pub_static, pub_dyn)
     }
-
+    #[allow(dead_code)] // 存量清零批次
     fn peer_cfg(pub_key: String, allowed: &str) -> PeerConfig {
         PeerConfig { public_key: pub_key, allowed_ips: vec![allowed.into()], ..Default::default() }
     }

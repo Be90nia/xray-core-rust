@@ -11,7 +11,7 @@
 //! |---|---|
 //! | session_id 字段编码（version+timestamp+short_id） | [`encode_session_id`] |
 //! | ECDH + HKDF-SHA256 派生 auth_key | [`derive_auth_key`] |
-//! | AES-256-GCM 加密 session_id[:16] | [`encrypt_session_id`] |
+//! | AES-256-GCM 加密 session_id`:16` | [`encrypt_session_id`] |
 //! | Ed25519 + HMAC-SHA512 证书验证 | [`verify_reality_certificate`] |
 //!
 //! # 为什么是纯函数
@@ -130,7 +130,7 @@ pub fn derive_auth_key(
     Ok(auth_key)
 }
 
-/// AES-256-GCM 加密 session_id[:16]，密文+tag 覆盖整个 32 字节 session_id。
+/// AES-256-GCM 加密 session_id`:16`，密文+tag 覆盖整个 32 字节 session_id。
 ///
 /// 对应 Go：
 /// ```go
@@ -439,8 +439,8 @@ pub fn derive_mldsa65_pubkey(seed: &[u8]) -> Result<Vec<u8>, RealityError> {
 /// ```
 /// `h.Sum(nil)` = HMAC-SHA512(auth_key, ed25519_pub) || ClientHello.Raw || ServerHello.Raw
 /// （即 mldsa65 签名覆盖整个 ClientHello+ServerHello+auth 上下文），由
-/// [`crypto::hmac_reality_message`] 组装；服务端对应生成端见
-/// [`crypto::sign_mldsa65_signature`] + `mitm::generate_reality_ed25519_cert_mldsa65`。
+/// `crypto::hmac_reality_message` 组装；服务端对应生成端见
+/// `crypto::sign_mldsa65_signature` + `mitm::generate_reality_ed25519_cert_mldsa65`。
 ///
 /// # 参数
 ///

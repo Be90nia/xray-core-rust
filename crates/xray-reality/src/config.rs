@@ -130,7 +130,7 @@ pub struct RealityConfig {
     /// opt-in 更稳。语义：
     /// - [`MaxUselessRecordsSetting::Disabled`]（缺省）：不探测，消费侧用 Go 默认
     ///   32（`reality/common.go:70` maxUselessRecords）。
-    /// - [`MaxUselessRecordsSetting::Probe`]<n>：listener 启动时 spawn
+    /// - [`MaxUselessRecordsSetting::Probe`]````<n>````：listener 启动时 spawn
     ///   [`crate::probe::detect_max_useless_records`] 写 [`crate::probe::ProbeTable`]；
     ///   握手期查表，miss 时 fallback 到 n（JSON `true` ≡ `Probe(32)`）。
     pub max_useless_records: MaxUselessRecordsSetting,
@@ -240,6 +240,7 @@ impl RealityConfig {
     ///
     /// # 错误
     /// - [`RealityError::InvalidShortIdLen`]：任一 short_id 长度 ≠ 8。
+    #[allow(clippy::field_reassign_with_default)] // 逐字段装配对齐 Go proto 解析表意
     pub fn from_proto(
         p: &xray_proto::transport::internet::reality::Config,
     ) -> Result<Self, RealityError> {

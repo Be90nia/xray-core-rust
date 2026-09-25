@@ -10,7 +10,7 @@
 //!
 //! Go 用 `Type() interface{}` 返回占位指针（如 `dns.ClientType()` 返回
 //! `(*dns.Client)(nil)`）作为类型键，依赖 Go 反射做相等比较。Rust 直接用
-//! [`TypeId`](std::any::TypeId)，每个具体类型自动获得全局唯一标识，无需手写
+//! [`TypeId`]（std::any::TypeId），每个具体类型自动获得全局唯一标识，无需手写
 //! `XxxType()` 工厂函数。
 
 use std::any::{Any, TypeId};
@@ -20,7 +20,7 @@ use thiserror::Error;
 /// Feature 注册/生命周期错误。
 #[derive(Debug, Error)]
 pub enum FeatureError {
-    /// 同一 [`TypeId`](std::any::TypeId) 的 Feature 已注册过（Go 端 panic，这里返回错误更安全）。
+    /// 同一 [`TypeId`]（std::any::TypeId）的 Feature 已注册过（Go 端 panic，这里返回错误更安全）。
     /// `name` 是 `std::any::type_name::<T>()` 返回的类型名。
     #[error("feature already registered: {name}")]
     AlreadyRegistered { name: &'static str },
@@ -47,8 +47,7 @@ pub type Result<T> = std::result::Result<T, FeatureError>;
 ///
 /// # 生命周期
 ///
-/// 1. 通过 [`Instance::add_feature`](../../xray_core/instance/struct.Instance.html#method.
-///    add_feature) 注册到 Instance 容器。
+/// 1. 通过 `Instance::add_feature` 注册到 Instance 容器。
 /// 2. `Instance::start()` 按注册顺序调用所有 feature 的 `start()`。
 /// 3. `Instance::close()` 按注册逆序调用所有 feature 的 `close()`。
 ///

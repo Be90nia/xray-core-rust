@@ -227,35 +227,30 @@ mod tests {
         server_config: ServerConfig,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((mut sock, _)) => {
-                        let cfg = server_config.clone();
-                        tokio::spawn(async move {
-                            // 1. handshake 解析 client 想连哪
-                            let target = match socks5_server_handshake(&mut sock, &cfg).await {
-                                Ok(t) => t,
-                                Err(_) => return,
-                            };
-                            // 2. ponytail: mock 不真去连 target，直接 echo （target
-                            //    在握手成功后已透明——client 写啥我们 echo 回去）
-                            let _ = target;
-                            let mut buf = [0u8; 1024];
-                            loop {
-                                match sock.read(&mut buf).await {
-                                    Ok(0) | Err(_) => break,
-                                    Ok(n) => {
-                                        if sock.write_all(&buf[..n]).await.is_err() {
-                                            break;
-                                        }
-                                    },
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let cfg = server_config.clone();
+                tokio::spawn(async move {
+                    // 1. handshake 解析 client 想连哪
+                    let target = match socks5_server_handshake(&mut sock, &cfg).await {
+                        Ok(t) => t,
+                        Err(_) => return,
+                    };
+                    // 2. ponytail: mock 不真去连 target，直接 echo （target
+                    //    在握手成功后已透明——client 写啥我们 echo 回去）
+                    let _ = target;
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if sock.write_all(&buf[..n]).await.is_err() {
+                                    break;
                                 }
-                            }
-                            let _ = sock;
-                        });
-                    },
-                    Err(_) => break,
-                }
+                            },
+                        }
+                    }
+                    let _ = sock;
+                });
             }
         })
     }

@@ -282,7 +282,7 @@ impl TunNetStack {
     ///
     /// # 错误
     ///
-    /// - [`TunError::TcpListenFailed`]：port=0（smoltcp 拒绝）或 socket 状态非法
+    /// - `TunError::TcpListenFailed`：port=0（smoltcp 拒绝）或 socket 状态非法
     pub fn ensure_tcp_listen(&mut self, dst: IpEndpoint) -> Result<(), crate::error::TunError> {
         if let Some(&handle) = self.tcp_listens.get(&dst) {
             let state = self.sockets.get_mut::<tcp::Socket<'static>>(handle).state();
@@ -313,7 +313,7 @@ impl TunNetStack {
     ///
     /// # 错误
     ///
-    /// - [`TunError::UdpBindFailed`]：socket 状态非法或地址不可用
+    /// - `TunError::UdpBindFailed`：socket 状态非法或地址不可用
     pub fn udp_bind(
         &mut self,
         handle: SocketHandle,
@@ -555,12 +555,14 @@ impl phy::Device for VirtualDevice {
 /// smoltcp 0.12 直接 re-export `core::net::Ipv4Addr`，所以两者等价——
 /// 此函数仅作为显式转换点，方便阅读。
 #[must_use]
+#[allow(clippy::incompatible_msrv)] // smoltcp 0.12 仅暴露 from_octets 构造（字段私有），workspace MSRV 声明滞后
 pub fn to_smoltcp_v4(addr: std::net::Ipv4Addr) -> Ipv4Address {
     Ipv4Address::from_octets(addr.octets())
 }
 
 /// 把 std::net::Ipv6Addr 转 smoltcp::wire::Ipv6Address。
 #[must_use]
+#[allow(clippy::incompatible_msrv)] // 同上：from_octets 为 smoltcp 唯一公开构造
 pub fn to_smoltcp_v6(addr: std::net::Ipv6Addr) -> Ipv6Address {
     Ipv6Address::from_octets(addr.octets())
 }
@@ -630,7 +632,7 @@ pub fn parse_udp_packet(pkt: &[u8]) -> Option<(UdpPacketMeta, &[u8])> {
             if repr.next_header != IpProtocol::Udp {
                 return None;
             }
-            let payload_start = packet.header_len() as usize;
+            let payload_start = packet.header_len();
             let payload_end = payload_start + repr.payload_len;
             if payload_end > pkt.len() {
                 return None;
@@ -689,10 +691,7 @@ pub fn parse_tcp_syn_dst(pkt: &[u8]) -> Option<IpEndpoint> {
             if repr.next_header != IpProtocol::Tcp {
                 return None;
             }
-            parse_syn_dst_from_tcp_header(
-                &pkt[packet.header_len() as usize..],
-                repr.dst_addr.into(),
-            )
+            parse_syn_dst_from_tcp_header(&pkt[packet.header_len()..], repr.dst_addr.into())
         },
         _ => None,
     }

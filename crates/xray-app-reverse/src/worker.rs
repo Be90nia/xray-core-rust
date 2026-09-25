@@ -385,12 +385,7 @@ impl BridgeWorker {
         let monitor_h = server.spawn_monitor(Arc::clone(&link_writer));
         let frame_server = Arc::clone(&server);
         tokio::spawn(async move {
-            loop {
-                match frame_server.process_frame(&mut reader, &link_writer).await {
-                    Ok(true) => continue,
-                    _ => break,
-                }
-            }
+            while let Ok(true) = frame_server.process_frame(&mut reader, &link_writer).await {}
             frame_server.close();
             monitor_h.abort();
         });
@@ -548,7 +543,7 @@ impl xray_mux::worker::Dispatcher for BridgeWorker {
     /// 覆写 ctx inbound 后 Dispatch 等价）。管道对自建（与
     /// [`xray_mux::worker::DispatchHandlerAdapter`] 同拓扑）：
     /// mux 会话 ↔ (read_a/write_b)，dispatcher link ↔ (read_b/write_a)，
-    /// 帧内元数据以 "ip:port" 形态进 [`AccessContext`]。
+    /// 帧内元数据以 "ip:port" 形态进 `AccessContext`。
     async fn dispatch_inbound(
         &self,
         dest: Destination,
@@ -744,7 +739,7 @@ mod entity_tests {
     use parking_lot::Mutex;
     use xray_buf::{io::Writer as _, pipe};
     use xray_common::net::{address::Address, port::Port};
-    use xray_mux::{client::ClientWorker, session::ClientStrategy, worker::Dispatcher as _};
+    use xray_mux::{client::ClientWorker, session::ClientStrategy};
 
     use super::*;
     use crate::{bridge::LinkDispatch, config::ControlState};
@@ -837,12 +832,7 @@ mod entity_tests {
             std::sync::Arc::new(tokio::sync::Mutex::new(Some(Box::new(s_write))));
         let monitor_h = server.spawn_monitor(link_writer.clone());
         tokio::spawn(async move {
-            loop {
-                match server.process_frame(&mut reader, &link_writer).await {
-                    Ok(true) => continue,
-                    _ => break,
-                }
-            }
+            while let Ok(true) = server.process_frame(&mut reader, &link_writer).await {}
             server.close();
             monitor_h.abort();
         });
@@ -913,6 +903,7 @@ mod entity_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // guard 有意存活至断言尾（测试互斥惯用）
     async fn bridge_worker_dispatches_carrier_with_inbound_tag() {
         let mock = std::sync::Arc::new(MockLinkDispatch::default());
         let w = BridgeWorker::new("t.example.com", "bridge-tag", mock.clone())
@@ -948,9 +939,7 @@ mod entity_tests {
             .expect("internal dispatch");
 
         // 写 DRAIN Control 到控制流（portal → bridge 方向 = 返回 link 的 writer）
-        let mut ctl = ProtoControl::default();
-        ctl.state = ControlState::Drain.as_i32();
-        ctl.random = vec![7u8; 8];
+        let ctl = ProtoControl { state: ControlState::Drain.as_i32(), random: vec![7u8; 8] };
         let mut mb = MultiBuffer::new();
         mb.merge_bytes(&ctl.encode_to_vec());
         link.writer.write_multi_buffer(mb).await.expect("write control");

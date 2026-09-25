@@ -310,6 +310,7 @@ mod tests {
     /// 测试用 XmuxConn 实现——可手动标记 closed。
     struct FakeConn {
         closed: std::sync::atomic::AtomicBool,
+        #[allow(dead_code)] // 存量清零批次
         id: usize,
     }
 
@@ -318,6 +319,7 @@ mod tests {
             Self { closed: std::sync::atomic::AtomicBool::new(false), id }
         }
 
+        #[allow(dead_code)] // 存量清零批次
         fn close(&self) {
             self.closed.store(true, Ordering::SeqCst);
         }
@@ -331,7 +333,7 @@ mod tests {
 
     // 静态计数器：测试中区分 new_conn_func 调用次数
     thread_local! {
-        static CONN_COUNTER: AtomicUsize = AtomicUsize::new(0);
+        static CONN_COUNTER: AtomicUsize = const { AtomicUsize::new(0) };
     }
 
     fn make_factory() -> impl Fn() -> FakeConn + Send + Sync {
@@ -499,6 +501,7 @@ mod tests {
 
         // 第 4 次：已达到 max_connections=3，且 concurrency=0 → 不限并发 → 应在池中选一个
         // （Step 3：clients.len() == connections，不进 if，走到 Step 4）
+        #[allow(unused_variables)] // 存量清零批次
         let c4 = manager.get_xmux_client();
         assert_eq!(manager.pool_size(), 3, "达到 max_connections 后不再新建");
     }

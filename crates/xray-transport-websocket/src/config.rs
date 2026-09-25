@@ -48,6 +48,7 @@ impl Config {
     }
 
     /// 从 prost 生成的 proto Config 构造。
+    #[allow(clippy::result_large_err)] // WsError 携带协议上下文，Box 化徒增间接
     pub fn from_proto(p: xray_proto::xray::transport::internet::websocket::Config) -> Result<Self> {
         Ok(Self {
             host: p.host,

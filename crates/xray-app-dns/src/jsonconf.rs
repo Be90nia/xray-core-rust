@@ -273,7 +273,7 @@ impl DnsAppConfig {
 /// - `UseIPv4`：useip4 / useipv4 / use_ip4 / use_ipv4 / use_ip_v4 / use-ip4 / use-ipv4 / use-ip-v4
 /// - `UseIPv6`：useip6 / useipv6 / use_ip6 / use_ipv6 / use_ip_v6 / use-ip6 / use-ipv6 / use-ip-v6
 /// - `UseSys`：usesys / usesystem / use_sys / use_system / use-sys / use-system
-/// `Lookup` 不在 Go 别名表内——保留为未知。
+/// - `Lookup` 不在 Go 别名表内——保留为未知
 fn parse_query_strategy(s: Option<&str>) -> QueryStrategy {
     match s.map(str::to_ascii_lowercase).as_deref() {
         Some(
@@ -336,6 +336,7 @@ fn build_server_url(address: &str, port: Option<u16>) -> String {
 ///
 /// `derived_policy_id` 为上游按 8 元组派生的策略 id（`build` 循环）；
 /// JSON `policyID` 非零时覆盖之（Go 无此字段，见 `build`）。
+#[allow(clippy::too_many_arguments)] // 存量清零批次：too_many_arguments
 fn build_client(
     ns: &NameServerJson,
     global_client_ip: &[u8],

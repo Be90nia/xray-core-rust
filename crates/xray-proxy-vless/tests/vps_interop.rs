@@ -146,8 +146,6 @@ async fn vless_ws_tls_vps_interop() {
 
     // 4. VLESS header + HTTP request
     eprintln!("[4/5] VLESS header + HTTP GET (target=1.1.1.1:80)");
-    let target_addr = Address::IPv4(std::net::Ipv4Addr::new(1, 1, 1, 1));
-    let addons = Addons::default();
 
     // 手动构造 VLESS header (encryption=none):
     // [1B version=0][16B UUID][1B addons_len=0][1B cmd=1(TCP)][1B atyp=1(IPv4)][4B IP][2B port BE]

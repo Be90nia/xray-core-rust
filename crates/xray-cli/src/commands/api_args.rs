@@ -5,7 +5,7 @@
 //! ## 状态
 //!
 //! xray-proto 仅用 prost-build 生成消息类型，未用 tonic-build 生成 gRPC client stub。
-//! 当前阶段所有 API 命令的 execute 返回 [`CliError::Unimplemented`]，
+//! 当前阶段所有 API 命令的 execute 返回 `CliError::Unimplemented`，
 //! 待 tonic-build 接入后补全真实 gRPC 调用。
 
 use clap::Args;

@@ -87,7 +87,7 @@ mod tests {
     fn pool_capped_by_lazy_cleanup() {
         let f = SaltReplayFilter::new(Duration::from_millis(30));
         for i in 0..4100u32 {
-            f.check(&i.to_be_bytes());
+            let _ = f.check(&i.to_be_bytes());
         }
         assert_eq!(f.len(), 4100, "live entries are kept");
         std::thread::sleep(Duration::from_millis(50));

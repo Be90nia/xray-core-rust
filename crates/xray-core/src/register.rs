@@ -119,6 +119,7 @@ pub fn register_all_transports() {
     tracing::info!("all transport dialers + listeners registered");
 }
 
+#[allow(dead_code)] // 存量清零批次
 /// App kind 列表（与 `xray-conf/src/built.rs` push_app! 宏的 kind 一致）。
 const APP_KINDS: &[&str] = &[
     "log",
@@ -432,6 +433,7 @@ fn metrics_factory() -> FeatureFactory {
         if let Err(e) = config.validate() {
             return Err(xray_features::FeatureError::StartFailed {
                 name: "metrics",
+                #[allow(clippy::useless_format)] // 存量清零批次
                 message: format!("{e}"),
             });
         }
@@ -446,13 +448,15 @@ fn policy_level_to_proto(
 ) -> xray_proto::xray::app::policy::Policy {
     use xray_proto::xray::app::policy::{Policy, Second, policy};
 
-    let mut p = Policy::default();
-    p.timeout = Some(policy::Timeout {
-        handshake: pl.handshake.map(|v| Second { value: v }),
-        connection_idle: pl.conn_idle.map(|v| Second { value: v }),
-        uplink_only: pl.uplink.map(|v| Second { value: v }),
-        downlink_only: pl.downlink.map(|v| Second { value: v }),
-    });
+    let mut p = Policy {
+        timeout: Some(policy::Timeout {
+            handshake: pl.handshake.map(|v| Second { value: v }),
+            connection_idle: pl.conn_idle.map(|v| Second { value: v }),
+            uplink_only: pl.uplink.map(|v| Second { value: v }),
+            downlink_only: pl.downlink.map(|v| Second { value: v }),
+        }),
+        ..Default::default()
+    };
 
     if pl.stats_user_uplink.is_some()
         || pl.stats_user_downlink.is_some()
@@ -659,7 +663,7 @@ impl xray_features::stats::Manager for AppStatsFeature {
 ///
 /// 对应 Go app/metrics/metrics.go:181-196 `stats()`——VisitCounters 解析
 /// `>>>` 命名计数器（`inbound>>>tag>>>traffic>>>uplink`），len<4 跳过；
-/// 类型取 [0]（inbound/outbound/user），tag/user 取 [1]，方向取 [3]。
+/// 类型取 `0`（inbound/outbound/user），tag/user 取 `1`，方向取 `3`。
 impl xray_app_metrics::StatsCollector for AppStatsFeature {
     fn collect(&self) -> xray_app_metrics::StatsSnapshot {
         use xray_features::stats::Manager as _;
@@ -807,7 +811,7 @@ fn build_fake_dns_holder(
     Ok(Arc::new(multi))
 }
 
-/// FakeDNS Feature：持有真实 [`HolderMulti`]（多池 LRU 域名↔Fake IP 引擎）。
+/// FakeDNS Feature：持有真实 `HolderMulti`（多池 LRU 域名↔Fake IP 引擎）。
 ///
 /// pub 供装配层（functions.rs）`instance.get_feature::<FakeDnsFeature>()` 取出，
 /// 经 [`fake_dns_engine_bridge`] 注入 dispatcher（对应 Go dispatcher.fdns）。
@@ -829,7 +833,7 @@ impl FakeDnsFeature {
     }
 }
 
-/// [`HolderMulti`] → dispatcher `FakeDnsEngine` 适配（嗅探阶段反查 fake IP 域名）。
+/// `HolderMulti` → dispatcher `FakeDnsEngine` 适配（嗅探阶段反查 fake IP 域名）。
 ///
 /// dispatcher crate 定义独立 trait 避免反向依赖；xray-app-dns 的引擎 trait 签名
 /// 不同（`IpAddr -> Option<String>`），在此桥接为 dispatcher 形态
@@ -844,6 +848,7 @@ impl std::fmt::Debug for FakeDnsEngineBridge {
 
 impl xray_app_dispatcher::fakednssniffer::FakeDnsEngine for FakeDnsEngineBridge {
     fn get_domain_from_fake_dns(&self, addr: &std::net::IpAddr) -> String {
+        #[allow(unused_imports)] // 存量清零批次
         use xray_app_dns::nameserver::fakedns::FakeDnsEngine as _;
         self.0.get_domain_from_fake_dns(*addr).unwrap_or_default()
     }
@@ -965,6 +970,7 @@ fn version_factory() -> FeatureFactory {
     })
 }
 
+#[allow(dead_code)] // 存量清零批次
 /// 极简 no-op Feature；`feature_name()` 返回 `"simple"`。
 /// 给将来想挂 noop factory 的 kind 留个备件（与历史 stub 同款语义）。
 struct SimpleFeature {
@@ -977,6 +983,7 @@ impl xray_features::Feature for SimpleFeature {
     }
 }
 
+#[allow(dead_code)] // 存量清零批次
 /// 为 api/metrics
 /// 创建 SimpleFeature 工厂（实现 Feature trait 的最简 no-op）。
 fn simple_feature_factory(kind: &'static str) -> FeatureFactory {
@@ -1256,6 +1263,7 @@ mod tests {
         // 直接验证引擎可做域名↔Fake IP 双向映射。
         let cfg: xray_conf::app_config::FakeDnsConfig = serde_json::from_slice(json).unwrap();
         let engine = build_fake_dns_holder(&cfg).expect("holder should initialize");
+        #[allow(unused_imports)] // 存量清零批次
         use xray_app_dns::nameserver::fakedns::FakeDnsEngine as _;
         let ips = engine.get_fake_ip_for_domain("example.com");
         assert!(!ips.is_empty(), "engine should allocate fake IPs");
@@ -1319,6 +1327,7 @@ mod tests {
     fn fake_dns_factory_uses_default_pool_when_config_empty() {
         let cfg: xray_conf::app_config::FakeDnsConfig = serde_json::from_slice(b"{}").unwrap();
         let engine = build_fake_dns_holder(&cfg).expect("default pool should initialize");
+        #[allow(unused_imports)] // 存量清零批次
         use xray_app_dns::nameserver::fakedns::FakeDnsEngine as _;
         let ips = engine.get_fake_ip_for_domain("x.com");
         assert!(!ips.is_empty());
@@ -1330,6 +1339,7 @@ mod tests {
     /// （fake_ip → 域名反查；dispatcher 侧签名 &IpAddr -> String）。
     #[test]
     fn fake_dns_engine_bridge_recovers_domain_from_fake_ip() {
+        #[allow(unused_imports)] // 存量清零批次
         use xray_app_dns::nameserver::fakedns::FakeDnsEngine as _;
         let cfg: xray_conf::app_config::FakeDnsConfig =
             serde_json::from_slice(br#"{"ipPool":"198.18.0.0/15"}"#).unwrap();

@@ -554,7 +554,7 @@ pub fn get_transport_dialer(protocol: &str) -> Option<TransportDialFn> {
 /// 上层 transport 拨号。对应 Go `dialer.go::Dial`。
 ///
 /// 按 `protocol` 查找注册的 dialer，调用它建立连接。
-/// TCP 协议（`"tcp"` / `"tls"`）用 [`system_dialer::dial_system`]。
+/// TCP 协议（`"tcp"` / `"tls"`）用 `system_dialer::dial_system`。
 ///
 /// # 错误
 ///
@@ -579,7 +579,7 @@ pub async fn dial_transport(
 /// 对应 Go `transportDialerCache[protocol](ctx, dest, streamSettings)`。
 /// tcp/raw 默认注册了含 security 包装的 dialer（`xray-transport-tcp`），
 /// 故 `network:"tcp", security:"tls"` 等配置会正确包装 TLS。未注册时
-/// tcp/raw fallback 到 [`system_dialer::dial_system`]（裸 TCP，向后兼容）。
+/// tcp/raw fallback 到 `system_dialer::dial_system`（裸 TCP，向后兼容）。
 pub async fn dial_with_settings(
     protocol: &str,
     destination: &Destination,

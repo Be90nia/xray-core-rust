@@ -209,10 +209,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::neg_cmp_op_on_partial_ord)] // 存量清零批次：neg_cmp_op_on_partial_ord
     fn fake_dns_engine_trait_implemented_for_holder_variants() {
         // 验证 trait object 可创建（编译期检查）。
         let h: Box<dyn FakeDnsEngine> = Box::new(Holder::new_default().unwrap());
-        assert!(h.is_ip_in_pool(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))) == false);
+        assert!(!h.is_ip_in_pool(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
     }
 
     /// 共享槽是进程级全局：两条 e2e 须串行（parking_lot TEST_LOCK 惯例）。
@@ -222,6 +223,7 @@ mod tests {
     /// （fakeDns app 配置的 198.18.0.0/15，而非 new_default 的 240.0.0.0/4），
     /// 且能被共享引擎（dispatcher 同引擎）反查命中。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 存量清零批次：await_holding_lock
     async fn factory_serves_shared_engine_and_reverse_resolves() {
         let _slot_guard = SLOT_LOCK.lock();
         let multi = std::sync::Arc::new(
@@ -254,6 +256,7 @@ mod tests {
 
     /// 无 fakeDns app（共享槽空）时保持 `new_default` 兼容行为。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 存量清零批次：await_holding_lock
     async fn factory_falls_back_to_new_default_without_shared_engine() {
         let _slot_guard = SLOT_LOCK.lock();
         crate::fakedns::set_shared_multi(None);
