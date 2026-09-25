@@ -1124,10 +1124,7 @@ mod tests {
         });
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let socket = socket2::Socket::from(stream.into_std().unwrap());
-        let opts = SocketOptions {
-            tproxy: true,
-            ..SocketOptions::default()
-        };
+        let opts = SocketOptions { tproxy: true, ..SocketOptions::default() };
         let res = apply_outbound_socket_options(&socket, &opts, None);
         // CI 无 root：EPERM（操作不允许）；root 环境 Ok。两者均符合 Go 语义。
         if let Err(e) = &res {
