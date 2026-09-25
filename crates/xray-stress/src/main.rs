@@ -308,7 +308,7 @@ enum Scenario {
 }
 
 /// s5-s12：每个场景一条独立协议链（短连接风暴 worker 复用 s1 语义）。
-const PROTOCOL_SCENARIOS: &[(Scenario, &'static str)] = &[
+const PROTOCOL_SCENARIOS: &[(Scenario, &str)] = &[
     (Scenario::S5, "s5-vmess-ws"),
     (Scenario::S6, "s6-trojan-grpc"),
     (Scenario::S7, "s7-ss-tcp"),

@@ -409,6 +409,7 @@ impl Default for SocketOptions {
 pub fn apply_outbound_socket_options(
     socket: &Socket,
     opts: &SocketOptions,
+    #[allow(unused_variables)] // dest 保留对齐 Go applyOutboundSocketOptions 签名
     dest: Option<std::net::SocketAddr>,
 ) -> std::io::Result<()> {
     // TCP_NODELAY：跨平台通用。
