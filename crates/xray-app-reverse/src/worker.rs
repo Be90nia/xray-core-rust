@@ -737,7 +737,7 @@ mod tests {
 #[cfg(test)]
 mod entity_tests {
     use parking_lot::Mutex;
-    use xray_buf::{io::Writer as _, pipe};
+    use xray_buf::pipe;
     use xray_common::net::{address::Address, port::Port};
     use xray_mux::{client::ClientWorker, session::ClientStrategy};
 
