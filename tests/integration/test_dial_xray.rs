@@ -92,7 +92,12 @@ fn vmess_inbound_settings(uuid: &str, email: &str) -> Vec<u8> {
 
 fn freedom_outbound(tag: &str) -> BuiltOutbound {
     BuiltOutbound {
-        entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+        // vmess inbound 默认规则 BlockPrivate（Go getDefaultFinalRule）封回环——
+        // echo 目标必须显式放行（对齐 lib 测试 FREEDOM_ALLOW_ALL_SETTINGS 先例）。
+        entry: BuiltEntry {
+            kind: "freedom".into(),
+            data: br#"{"finalRules":[{"action":"allow","network":"tcp,udp","ip":["127.0.0.0/8","::1/128"]}]}"#.to_vec(),
+        },
         tag: tag.into(),
         send_through: None,
         stream_settings_json: None,
@@ -231,7 +236,8 @@ async fn dial_xray_two_instance_smoke() {
 /// 而 e2e_vmess_proxy（同构单实例拓扑）CI 绿，双实例并存 + 独立 echo task
 /// 组合下必挂。涉及 dispatcher/freedom 数据面行为调查，超出本票（CI lint
 /// 清零）"行为零变更"契约，登记专项票修复后拆除本 ignore。
-#[ignore = "vmess body 回程断链：双实例+独立 echo 组合必挂（CI 36196572740 实证），待专项"]
+/// 根因注记：曾因 freedom `{}` 未放行回环（vmess inbound 默认 BlockPrivate，
+/// Go getDefaultFinalRule 语义）echo 黑洞；freedom 加 finalRules allow 后恢复。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dial_xray_vmess_body_roundtrip() {
     // ---- 与 smoke 相同的两端装配 ----
