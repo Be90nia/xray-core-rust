@@ -469,8 +469,6 @@ impl UotClientConn {
 mod tests {
     use std::net::SocketAddr;
 
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
     use super::*;
 
     // ===== socksaddr round-trip =====
