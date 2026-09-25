@@ -24,7 +24,7 @@
 pub use imp::{bridge_with, plan, splice_copy, splice_copy_counted};
 
 mod imp {
-    use std::io;
+    use std::{io, os::unix::io::AsRawFd};
 
     use tokio::net::TcpStream;
     use xray_common::platform::splice::splice_allowed;
