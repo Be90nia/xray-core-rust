@@ -146,7 +146,7 @@ pub fn new_reader(r: impl AsyncRead + Unpin + Send + 'static) -> Box<dyn Reader>
 ///
 /// 对应 Go `buf.NewReader` 的 readv 分支（io.go:124-140）：TCP socket + env 启用
 /// → [`crate::readv::ReadVReader`]（scatter-gather 聚合读）；env 禁用 →
-/// [`SingleReader`]（顺序读）。
+/// `SingleReader`（顺序读）。
 #[must_use]
 pub fn new_readv_reader(r: tokio::net::tcp::OwnedReadHalf) -> Box<dyn Reader> {
     if crate::readv::use_readv() {

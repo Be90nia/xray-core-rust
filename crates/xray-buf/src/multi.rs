@@ -37,7 +37,7 @@ impl MultiBuffer {
         Self { buffers: ManuallyDrop::new(vec![buf]) }
     }
 
-    /// 从 Vec<Buffer> 构造。
+    /// 从 `Vec<Buffer>` 构造。
     pub fn from_buffers(buffers: Vec<Buffer>) -> Self {
         Self { buffers: ManuallyDrop::new(buffers) }
     }
@@ -64,7 +64,7 @@ impl MultiBuffer {
         self.buffers.len()
     }
 
-    /// 消费为 Vec<Buffer>。
+    /// 消费为 `Vec<Buffer>`。
     ///
     /// 调用方将负责释放这些 Buffer（它们的 Drop 会自动释放）。
     pub fn into_buffers(mut self) -> Vec<Buffer> {
@@ -357,7 +357,7 @@ impl MultiBuffer {
 
     // ========== 转换 ==========
 
-    /// 将所有缓冲区数据扁平化为 Vec<u8>。
+    /// 将所有缓冲区数据扁平化为 `Vec<u8>`。
     pub fn to_vec(&self) -> Vec<u8> {
         let total: usize = self.buffers.iter().map(|b| b.len()).sum();
         let mut result = Vec::with_capacity(total);
@@ -367,7 +367,7 @@ impl MultiBuffer {
         result
     }
 
-    /// 消费 MultiBuffer 并扁平化为 Vec<u8>。
+    /// 消费 MultiBuffer 并扁平化为 `Vec<u8>`。
     pub fn into_vec(self) -> Vec<u8> {
         let buffers = self.into_buffers();
         let total: usize = buffers.iter().map(|b| b.len()).sum();

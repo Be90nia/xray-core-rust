@@ -39,7 +39,7 @@ static USE_READV: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(parse_
 ///
 /// 唯一事实源：readv 闸门全仓只有本模块的 `USE_READV` AtomicBool 一个判定
 /// 存储——生产消费点仅 [`crate::io::new_readv_reader`]；写侧仅
-/// [`parse_readv_env`]（首调）+ [`reload_env_settings`]（显式刷新）。
+/// `parse_readv_env`（首调）+ [`reload_env_settings`]（显式刷新）。
 /// `xray-common::platform::env::use_readv` 是指向这里的转发别名（Go
 /// `platform.UseReadV` binding 等价入口），不得在别处另建 env 解析。
 ///
@@ -444,11 +444,8 @@ mod tests {
         }
         let _restore = Restore(prev);
 
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(
+            async {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let addr = listener.local_addr().unwrap();
 
@@ -461,7 +458,8 @@ mod tests {
 
                 let (sock, _) = listener.accept().await.unwrap();
                 let (rd, _wr) = sock.into_split();
-                // 工厂语义：闸门关 → 不包 ReadVReader，退回顺序读（Go NewReader useReadV()==false）。
+                // 工厂语义：闸门关 → 不包 ReadVReader，退回顺序读（Go NewReader
+                // useReadV()==false）。
                 let mut reader = io::new_readv_reader(rd);
                 writer.await.unwrap();
 
@@ -474,7 +472,8 @@ mod tests {
                     got.extend_from_slice(&mb.to_vec());
                 }
                 assert_eq!(got, b"hello readv gate".repeat(4));
-            });
+            },
+        );
     }
     /// bd xag3③：use_readv 缓存 + reload 行为等价三态（env 进程全局，串行化）。
     #[test]
