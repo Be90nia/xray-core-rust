@@ -62,7 +62,10 @@ async fn start_with_api()
     let api_addr = format!("127.0.0.1:{port}");
 
     let api_cfg = ApiConfig {
-        tag: None,
+        // Go api.go:23-25 `API tag can't be empty.`：tag 必填；None → factory
+        // StartFailed → new_from_built 当 stub 未实现静默跳过 → Commander 不注册
+        // → gRPC server 永不启动（CI Linux/本地复现的 connect 恒败根因）。
+        tag: Some("api".to_string()),
         listen: Some(api_addr.clone()),
         services: Some(vec![
             "HandlerService".to_string(),
@@ -209,7 +212,8 @@ async fn reflection_disabled_when_not_opted_in() {
     let api_addr = format!("127.0.0.1:{port}");
 
     let api_cfg = ApiConfig {
-        tag: None,
+        // 同上：tag 必填（None → factory StartFailed 静默跳过 → server 不启动）。
+        tag: Some("api".to_string()),
         listen: Some(api_addr.clone()),
         services: Some(vec![
             "HandlerService".to_string(),
