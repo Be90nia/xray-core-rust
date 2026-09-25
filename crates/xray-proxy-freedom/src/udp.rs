@@ -239,7 +239,11 @@ async fn pump_request(
         match reader.read_multi_buffer().await {
             Ok(mb) => {
                 if mb.is_empty() { return Ok(()); }
-                accum.extend_from_slice(&mb.to_vec());
+                // 池化 Buffer 直写：逐 buffer 单拷贝进 accum，免 to_vec 的中间分配+二次拷贝。
+                accum.reserve(mb.len());
+                for buf in mb.iter() {
+                    accum.extend_from_slice(buf.bytes());
+                }
                 if accum.len() > ACCUM_MAX_BYTES {
                     return Err(io::Error::new(io::ErrorKind::OutOfMemory, format!("udp accum exceeded {ACCUM_MAX_BYTES} bytes")));
                 }

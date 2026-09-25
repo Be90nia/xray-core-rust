@@ -47,6 +47,11 @@ struct Args {
     /// S1/S4 短连接每轮间隔（毫秒）。Windows 动态端口预算内建连节流。
     #[arg(long, default_value_t = 150)]
     s1_delay_ms: u64,
+    /// 负载停止后的观察窗（秒），0=关。基础设施（服务端实例）保留运行，
+    /// 采样行标 `__drain__`：connIdle 300s 固有堆积会回落/企稳，真泄漏不落——
+    /// 供 tools/check_stress_leak.py 区分两者。窗口须 > 300s（connIdle）。
+    #[arg(long, default_value_t = 0)]
+    drain_secs: u64,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -70,11 +75,12 @@ fn main() -> anyhow::Result<()> {
     let duration = Duration::from_secs(args.duration);
     let interval = Duration::from_secs(args.sample_interval);
     println!(
-        "[xray-stress] run={run_id} duration={}s concurrency={} s2_conns={} scenarios={:?} out={}",
+        "[xray-stress] run={run_id} duration={}s concurrency={} s2_conns={} scenarios={:?} drain={}s out={}",
         args.duration,
         args.concurrency,
         args.s2_conns,
         scenarios,
+        args.drain_secs,
         args.out_dir.display()
     );
 
@@ -93,7 +99,10 @@ async fn run(
 ) -> anyhow::Result<()> {
     let deadline = Instant::now() + duration;
     let mut stats: Vec<StatsHandle> = Vec::new();
-    let mut tasks = tokio::task::JoinSet::new();
+    // 负载 worker 与基础设施（协议链服务实例）分池：drain 观察窗停负载、
+    // 保留 infra，让服务端 idle 连接按 connIdle 语义自然回收。
+    let mut load = tokio::task::JoinSet::new();
+    let mut infra = tokio::task::JoinSet::new();
 
     // --- 拓扑装配（按场景需要起实例） ---
     let echo_port = topology::start_echo().await.port();
@@ -101,7 +110,7 @@ async fn run(
     let socks_port = if need_socks_link {
         let (port, sh, ch) = topology::start_reality_link(echo_port).await?;
         for h in sh.into_iter().chain(ch) {
-            tasks.spawn(async move {
+            infra.spawn(async move {
                 let _ = h.await;
             });
         }
@@ -114,7 +123,7 @@ async fn run(
     let kcp_socks_port = if scenarios.contains(&Scenario::S4) {
         let (port, sh, ch) = topology::start_kcp_link(echo_port).await?;
         for h in sh.into_iter().chain(ch) {
-            tasks.spawn(async move {
+            infra.spawn(async move {
                 let _ = h.await;
             });
         }
@@ -140,7 +149,7 @@ async fn run(
         }
         let (port, sh, ch) = sc.start_link(echo_port).await?;
         for h in sh.into_iter().chain(ch) {
-            tasks.spawn(async move {
+            infra.spawn(async move {
                 let _ = h.await;
             });
         }
@@ -160,7 +169,7 @@ async fn run(
         if scenarios.contains(&Scenario::S1) {
             let h = StatsHandle::new("s1-short");
             stats.push(h.clone());
-            tasks.spawn(sc::s1_short_burst(
+            load.spawn(sc::s1_short_burst(
                 port,
                 echo_port,
                 args.concurrency,
@@ -172,20 +181,20 @@ async fn run(
         if scenarios.contains(&Scenario::S2) {
             let h = StatsHandle::new("s2-long");
             stats.push(h.clone());
-            tasks.spawn(sc::s2_long_flow(port, echo_port, args.s2_conns, deadline, h));
+            load.spawn(sc::s2_long_flow(port, echo_port, args.s2_conns, deadline, h));
         }
     }
     if let Some(addr) = quic_addr {
         let h = StatsHandle::new("s3-quic");
         stats.push(h.clone());
-        tasks.spawn(quic_loop::s3_quic_reconnect_loop(addr, deadline, h));
+        load.spawn(quic_loop::s3_quic_reconnect_loop(addr, deadline, h));
     }
     if let (Some(port), true) = (kcp_socks_port, scenarios.contains(&Scenario::S4)) {
         let h = StatsHandle::new("s4-mixed-kcp");
         stats.push(h.clone());
         let short = (args.concurrency / 4).max(2);
         let long = (args.s2_conns / 2).max(1);
-        tasks.spawn(sc::s4_mixed(
+        load.spawn(sc::s4_mixed(
             port,
             echo_port,
             short,
@@ -198,7 +207,7 @@ async fn run(
     for (sc, port) in protocol_links {
         let h = StatsHandle::new(sc.stats_name());
         stats.push(h.clone());
-        tasks.spawn(sc::s1_short_burst(
+        load.spawn(sc::s1_short_burst(
             port,
             echo_port,
             args.concurrency,
@@ -217,7 +226,7 @@ async fn run(
     loop {
         tick.tick().await;
         let elapsed = duration.as_secs_f64() - (deadline - Instant::now()).as_secs_f64();
-        if let Err(e) = sampler.sample_once(elapsed, interval) {
+        if let Err(e) = sampler.sample_once(elapsed, interval, false) {
             eprintln!("[xray-stress] sampler error: {e}");
         }
         match sampler.maybe_checkpoint(duration, args.leak_threshold, &label) {
@@ -230,13 +239,42 @@ async fn run(
         }
     }
 
-    // --- 收尾：等在途 roundtrip 落地，超时强杀 ---
-    let drain = tokio::time::timeout(Duration::from_secs(10), async {
-        while tasks.join_next().await.is_some() {}
+    // --- 收尾：停负载（在途 roundtrip 落地），infra 保留供 drain 观察窗 ---
+    let stop = tokio::time::timeout(Duration::from_secs(30), async {
+        while load.join_next().await.is_some() {}
     });
-    if drain.await.is_err() {
+    if stop.await.is_err() {
+        println!("[xray-stress] load stop timeout, aborting workers");
+        load.abort_all();
+    }
+
+    // drain 观察窗：负载已停、服务端实例存活，idle 连接按 connIdle 语义回收。
+    // 固有堆积（如 s12 H3 connIdle 300s 窗口）→ RSS 回落/企稳；真泄漏 → 不落。
+    // 行标 `__drain__`，由 tools/check_stress_leak.py 判定。
+    if args.drain_secs > 0 {
+        println!("[xray-stress] drain window: {}s (idle-connection reclaim observation)", args.drain_secs);
+        let drain_end = Instant::now() + Duration::from_secs(args.drain_secs);
+        let load_end = Instant::now();
+        let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let elapsed = duration.as_secs_f64() + load_end.elapsed().as_secs_f64();
+            if let Err(e) = sampler.sample_once(elapsed, interval, true) {
+                eprintln!("[xray-stress] sampler error: {e}");
+            }
+            if Instant::now() >= drain_end {
+                break;
+            }
+        }
+    }
+
+    let rest = tokio::time::timeout(Duration::from_secs(10), async {
+        while infra.join_next().await.is_some() {}
+    });
+    if rest.await.is_err() {
         println!("[xray-stress] drain timeout, aborting stragglers");
-        tasks.abort_all();
+        infra.abort_all();
     }
 
     let path = sampler.write_final_summary(duration, args.leak_threshold, &label)?;

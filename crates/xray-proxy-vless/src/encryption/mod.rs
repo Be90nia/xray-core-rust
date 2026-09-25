@@ -1255,10 +1255,12 @@ impl ServerInstance {
         let united_key;
         {
             let mut store = self.sessions.lock();
-            let session = store
-                .sessions
-                .get_mut(&ticket)
-                .expect("session checked above");
+            // 1233 的 hit 检查与本次加锁之间存在无锁间隙，session 过期清理
+            // （SessionStore::prune 的 sessions.remove）可能并发移除条目——
+            // 不 panic，按 miss 语义显式拒绝（对齐 Go sync.Map：无 panic 路径）。
+            let Some(session) = store.sessions.get_mut(&ticket) else {
+                return Err(VlessError::Other("expired ticket".into()));
+            };
             if !session.nfs_keys.insert(*nfs_key) {
                 return Err(VlessError::Other("replay detected".into()));
             }
