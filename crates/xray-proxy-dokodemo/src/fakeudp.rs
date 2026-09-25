@@ -60,7 +60,7 @@ fn fake_udp_linux(addr: SocketAddr, mark: u32) -> io::Result<tokio::net::UdpSock
             if res.is_err() {
                 fd = -1;
             }
-            Ok(res?)
+            res
         })();
 
         if result.is_err() {
