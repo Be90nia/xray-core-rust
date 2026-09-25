@@ -12,18 +12,13 @@ use crate::io::{self, Reader, Result, Writer};
 /// Copy 操作的配置选项
 ///
 /// 对应 Go 的 `CopyOption` 函数选项模式。
+#[derive(Default)]
 pub struct CopyOptions {
     /// 活动回调：每次读写成功后调用
     pub on_update_activity: Option<Arc<dyn Fn() + Send + Sync>>,
 
     /// 大小计数回调：每次读取后调用，传入读取字节数
     pub on_count_size: Option<Arc<dyn Fn(usize) + Send + Sync>>,
-}
-
-impl Default for CopyOptions {
-    fn default() -> Self {
-        Self { on_update_activity: None, on_count_size: None }
-    }
 }
 
 impl std::fmt::Debug for CopyOptions {

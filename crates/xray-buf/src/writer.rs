@@ -401,7 +401,7 @@ mod tests {
 
     impl AsyncWrite for VectoredMock {
         fn poll_write(
-            mut self: Pin<&mut Self>,
+            self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<std::io::Result<usize>> {
@@ -410,7 +410,7 @@ mod tests {
         }
 
         fn poll_write_vectored(
-            mut self: Pin<&mut Self>,
+            self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
             bufs: &[IoSlice<'_>],
         ) -> Poll<std::io::Result<usize>> {

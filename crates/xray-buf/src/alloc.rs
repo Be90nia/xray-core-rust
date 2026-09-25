@@ -91,12 +91,9 @@ static SHARD_INDEX: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     /// TLS 缓存：每层维护一个 Vec<BytesMut>，最多 TLS_MAX_PER_TIER 个
-    static TLS_CACHE: RefCell<[Vec<BytesMut>; 4]> = RefCell::new([
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-    ]);
+    static TLS_CACHE: RefCell<[Vec<BytesMut>; 4]> = const {
+        RefCell::new([Vec::new(), Vec::new(), Vec::new(), Vec::new()])
+    };
 }
 
 /// 根据请求大小选择合适的分层索引。
@@ -129,7 +126,7 @@ pub fn alloc(size: usize) -> BytesMut {
         // 1. 尝试 TLS 缓存
         let from_tls = TLS_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
-            if cache[tier].len() > 0 {
+            if !cache[tier].is_empty() {
                 let mut buf = cache[tier].pop().expect("已检查 len > 0");
                 buf.clear();
                 tracing::trace!(tier, tier_size, "缓冲池 TLS 命中");
@@ -145,7 +142,7 @@ pub fn alloc(size: usize) -> BytesMut {
         // 2. 尝试全局分片
         let shard_idx = next_shard();
         let mut shard = SHARDS[shard_idx].lock();
-        if shard.tiers[tier].len() > 0 {
+        if !shard.tiers[tier].is_empty() {
             let mut buf = shard.tiers[tier].pop().expect("已检查 len > 0");
             buf.clear();
             tracing::trace!(tier, tier_size, shard = shard_idx, "缓冲池分片命中");

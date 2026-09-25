@@ -577,8 +577,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_limit_allows_under_capacity() {
-        let mut opt = PipeOption::default();
-        opt.limit = 100;
+        let opt = PipeOption { limit: 100, ..PipeOption::default() };
         let (mut r, mut w) = new_with_option(opt);
         // 50 字节 < 100，可写
         w.write_multi_buffer(mb(&[0u8; 50])).await.unwrap();
@@ -588,8 +587,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_limit_blocks_when_full() {
-        let mut opt = PipeOption::default();
-        opt.limit = 10;
+        let opt = PipeOption { limit: 10, ..PipeOption::default() };
         let (mut r, mut w) = new_with_option(opt);
         // 首次写 11 字节：初始 size=0，0 > 10 false，merge 后 size=11
         w.write_multi_buffer(mb(&[0u8; 11])).await.unwrap();
@@ -604,9 +602,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_discard_overflow_drops_excess() {
-        let mut opt = PipeOption::default();
-        opt.limit = 10;
-        opt.discard_overflow = true;
+        let opt = PipeOption { limit: 10, discard_overflow: true, ..PipeOption::default() };
         let (_r, mut w) = new_with_option(opt);
         // 首次 11 字节：merge 成功，buffer=11
         w.write_multi_buffer(mb(&[0u8; 11])).await.unwrap();
