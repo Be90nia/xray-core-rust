@@ -14,7 +14,6 @@
 
 use std::{
     future::Future,
-    io,
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::Arc,
@@ -23,8 +22,8 @@ use std::{
 
 use hickory_proto::rr::RecordType;
 use quinn::{
-    ClientConfig as QuinnClientConfig, Endpoint, ServerConfig as QuinnServerConfig,
-    crypto::rustls::{QuicClientConfig, QuicServerConfig},
+    ClientConfig as QuinnClientConfig, Endpoint,
+    crypto::rustls::QuicClientConfig,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -277,6 +276,9 @@ mod tests {
 
     use super::*;
     use crate::config::IpOption;
+
+    use quinn::crypto::rustls::QuicServerConfig;
+    use quinn::ServerConfig as QuinnServerConfig;
 
     /// 确保 rustls CryptoProvider 在并行测试中只初始化一次
     fn ensure_crypto_provider() {

@@ -69,15 +69,15 @@ impl SessionHistory {
     /// 本结构只在 ServerSession 中持引用，进程退出时 task 自动 drop，无泄漏。
     #[must_use]
     pub fn new() -> Self {
-        let h = Self { inner: Mutex::new(HashMap::new()), ttl: Duration::from_secs(180) };
-        h
+        
+        Self { inner: Mutex::new(HashMap::new()), ttl: Duration::from_secs(180) }
     }
 
     /// 用自定义 TTL。
     #[must_use]
     pub fn with_ttl(ttl: Duration) -> Self {
-        let h = Self { inner: Mutex::new(HashMap::new()), ttl };
-        h
+        
+        Self { inner: Mutex::new(HashMap::new()), ttl }
     }
 
     /// 添加 session，若已存在且未过期则返回 false（拒绝）。
@@ -218,8 +218,8 @@ impl<'v> ServerSession<'v> {
         self.response_header = response_header;
 
         use sha2::{Digest, Sha256};
-        let body_key_hash = Sha256::digest(&request_body_key);
-        let body_iv_hash = Sha256::digest(&request_body_iv);
+        let body_key_hash = Sha256::digest(request_body_key);
+        let body_iv_hash = Sha256::digest(request_body_iv);
         self.response_body_key.copy_from_slice(&body_key_hash[..16]);
         self.response_body_iv.copy_from_slice(&body_iv_hash[..16]);
 
@@ -232,7 +232,7 @@ impl<'v> ServerSession<'v> {
             return Err(VmessError::DuplicateSession);
         }
 
-        let command = Command::from_u8(command_byte).ok_or_else(|| VmessError::UnknownCommand)?;
+        let command = Command::from_u8(command_byte).ok_or(VmessError::UnknownCommand)?;
 
         let (address, port, addr_consumed) = match command {
             Command::Mux => (Address::Domain("v1.mux.cool".to_string()), 0u16, 0usize),
@@ -364,8 +364,8 @@ impl<'v> ServerSession<'v> {
     ) -> Result<()> {
         use sha2::{Digest, Sha256};
         // 1-2. 派生 response_body_key/iv
-        let body_key_hash = Sha256::digest(&self.request_body_key);
-        let body_iv_hash = Sha256::digest(&self.request_body_iv);
+        let body_key_hash = Sha256::digest(self.request_body_key);
+        let body_iv_hash = Sha256::digest(self.request_body_iv);
         self.response_body_key.copy_from_slice(&body_key_hash[..16]);
         self.response_body_iv.copy_from_slice(&body_iv_hash[..16]);
 
@@ -648,8 +648,8 @@ impl<'v> ServerSession<'v> {
         writer: &mut W,
     ) -> Result<()> {
         use sha2::{Digest, Sha256};
-        let body_key_hash = Sha256::digest(&self.request_body_key);
-        let body_iv_hash = Sha256::digest(&self.request_body_iv);
+        let body_key_hash = Sha256::digest(self.request_body_key);
+        let body_iv_hash = Sha256::digest(self.request_body_iv);
         self.response_body_key.copy_from_slice(&body_key_hash[..16]);
         self.response_body_iv.copy_from_slice(&body_iv_hash[..16]);
 

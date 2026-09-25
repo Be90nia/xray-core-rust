@@ -16,7 +16,7 @@
 use std::{
     future::Future,
     io,
-    net::{IpAddr, SocketAddr},
+    net::IpAddr,
     pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
@@ -27,7 +27,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     time::timeout,
 };
-use xray_common::net::{address::Address, destination::Destination, port::Port};
+use xray_common::net::{destination::Destination, port::Port};
 
 use crate::{
     cache_controller::CacheController,
@@ -40,7 +40,6 @@ use crate::{
     nameserver::{
         NameServerConfig, Server,
         cached::{CachedNameserver, QueryOutcome, query_ip},
-        local,
     },
 };
 
@@ -292,6 +291,9 @@ mod tests {
 
     use super::*;
     use crate::config::IpOption;
+
+    use std::net::SocketAddr;
+    use xray_common::net::address::Address;
 
     /// 共享 dialer 槽是进程级全局：涉 dialer 的测试须串行。
     static DIALER_SLOT_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());

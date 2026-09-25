@@ -671,7 +671,7 @@ impl DefaultDialerClient {
 
 /// `hyper::Error` → `std::io::Error`（h2 body 流转发用）。
 pub(crate) fn hyper_err_to_io(e: hyper::Error) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+    std::io::Error::other(e.to_string())
 }
 
 /// packet-up 重放资格判定（Go `canRetryError`，x/net http2 transport_common.go:
@@ -723,7 +723,7 @@ fn is_packet_replayable(e: &hyper_util::client::legacy::Error) -> bool {
 /// 全部永挂（bd s10 fd 泄漏根因）。
 fn spawn_h2_lazy_reader(
     closed: Arc<AtomicBool>,
-    mut client: HyperClient,
+    client: HyperClient,
     req: Request<ReqBody>,
     close: Option<CloseSignal>,
 ) -> Box<dyn AsyncReadTrait + Send + Unpin> {
@@ -736,7 +736,7 @@ fn spawn_h2_lazy_reader(
     };
     tokio::spawn(async move {
         tokio::select! {
-            _ = &mut close_fut => return,
+            _ = &mut close_fut => (),
             result = client.request(req) => {
                 match result {
                     Ok(resp) if resp.status() == StatusCode::OK => {

@@ -190,7 +190,7 @@ impl DnsAppConfig {
             };
             if ns.address.trim().eq_ignore_ascii_case("localhost") {
                 for (dt, v) in local_tlds_and_dotless_rules() {
-                    push_rule(dt, &v, &mut matcher_infos, &mut all_rules);
+                    push_rule(dt, v, &mut matcher_infos, &mut all_rules);
                 }
             }
             for s in ns.domains.iter().flatten() {
@@ -557,7 +557,7 @@ fn parse_ns_ip_rules(
 
     let mut out = Vec::with_capacity(rules.len());
     for s in rules {
-        let r = xray_geodata::rule_parser::parse_ip_rules(&[s.clone()], datadir)
+        let r = xray_geodata::rule_parser::parse_ip_rules(std::slice::from_ref(s), datadir)
             .map_err(|e| DnsError::Features(xray_features::dns::DnsError::Other(e.to_string())))?;
         for rule in r {
             // geoip 条目展开为 Custom CIDR 列表（build_optimized_ip_matcher 的 geoip 分支为空

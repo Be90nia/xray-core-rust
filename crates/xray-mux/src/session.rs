@@ -554,11 +554,10 @@ impl SessionManager {
     /// 若管理器已关闭则忽略。
     pub async fn remove(&self, id: u16) {
         let mut inner = self.shared.inner.write().await;
-        if !inner.closed {
-            if inner.sessions.remove(&id).is_some() {
+        if !inner.closed
+            && inner.sessions.remove(&id).is_some() {
                 self.shared.size.fetch_sub(1, Ordering::Release);
             }
-        }
     }
 
     /// 获取会话。

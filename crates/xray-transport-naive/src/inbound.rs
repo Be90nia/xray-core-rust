@@ -319,7 +319,7 @@ fn check_proxy_auth(
 
 /// 长度不等直接 false 的恒定时间字符串比较（同 Go `subtle.ConstantTimeCompare` 语义）。
 fn ct_eq_str(a: &str, b: &str) -> bool {
-    a.as_bytes().len() == b.as_bytes().len() && a.as_bytes().ct_eq(b.as_bytes()).into()
+    a.len() == b.len() && a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
 fn response_status(status: StatusCode) -> http::Response<RespBody> {

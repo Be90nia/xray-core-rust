@@ -451,7 +451,7 @@ impl UdpAssocTable {
         if pkt.frag_total > 1 {
             let assoc = pkt.assoc_id;
             let assembler =
-                self.frags.entry(assoc).or_insert_with(crate::protocol::FragmentAssembler::new);
+                self.frags.entry(assoc).or_default();
             match assembler.feed(pkt) {
                 Ok(Some(complete)) => {
                     // 重组成功 → 走常规路由
@@ -503,7 +503,7 @@ impl UdpAssocTable {
 async fn udp_assoc_task(
     assoc_id: u16,
     dispatcher: Option<Arc<dyn DispatchHandler>>,
-    mut rx: tokio::sync::mpsc::Receiver<UdpAssocItem>,
+    rx: tokio::sync::mpsc::Receiver<UdpAssocItem>,
 ) {
     match dispatcher {
         Some(d) => udp_assoc_dispatch(assoc_id, d, rx).await,

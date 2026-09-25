@@ -57,7 +57,7 @@ impl State {
     /// 当前状态是否为候选之一（对应 Go `State.Is(states...)`）。
     #[must_use]
     pub fn is(self, candidates: &[State]) -> bool {
-        candidates.iter().any(|&s| s == self)
+        candidates.contains(&self)
     }
 
     /// 是否为「已经本端关闭」状态（ReadyToClose / Terminating / Terminated）。

@@ -139,6 +139,7 @@ pub const DEAD_DELAY_MS: i64 = 99_999_999;
 
 /// Observer 配置。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct ObservatoryConfig {
     pub subject_selector: Vec<String>,
     pub probe_url: String,
@@ -146,16 +147,6 @@ pub struct ObservatoryConfig {
     pub enable_concurrency: bool,
 }
 
-impl Default for ObservatoryConfig {
-    fn default() -> Self {
-        Self {
-            subject_selector: Vec::new(),
-            probe_url: String::new(),
-            probe_interval: 0,
-            enable_concurrency: false,
-        }
-    }
-}
 
 impl ObservatoryConfig {
     pub fn from_proto(p: &ProtoConfig) -> Self {

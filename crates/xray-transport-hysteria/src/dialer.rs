@@ -20,7 +20,7 @@ use xray_common::net::{address::Address, port::Port};
 use xray_proto::xray::transport::internet::{QuicParams, UdpHop as ProtoUdpHop};
 
 use crate::{
-    config::{Status, TcpRequestPadding},
+    config::Status,
     conn::{InterStreamConn, QuicConn, QuicStream, UdpSessionManager},
     context::DatagramFromContext,
     error::{HysteriaError, Result},

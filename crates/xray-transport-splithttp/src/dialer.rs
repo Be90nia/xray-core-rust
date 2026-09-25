@@ -15,7 +15,7 @@ use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::debug;
 
 use crate::{
-    client::{DefaultDialerClient, DialTarget, ReqBody, hyper_err_to_io, make_stream_body},
+    client::{DefaultDialerClient, ReqBody, hyper_err_to_io, make_stream_body},
     config::{Config, RangeConfig},
     connection::SplitConn,
     error::{Result, SplitHttpError},
@@ -115,7 +115,7 @@ pub async fn dial_packet_up(
         }
     });
 
-    let mut conn = SplitConn::new(download_reader, pipe_client, remote, local);
+    let conn = SplitConn::new(download_reader, pipe_client, remote, local);
     conn.set_on_close(move || {
         let _ = close_tx.send(());
     });
@@ -155,7 +155,7 @@ pub async fn dial_stream_up(
     let (download_reader, _, _) =
         client.open_stream(&base_uri, &session_id, None, Some(close_rx)).await?;
 
-    let mut conn = SplitConn::new(download_reader, pipe_client, remote, local);
+    let conn = SplitConn::new(download_reader, pipe_client, remote, local);
     conn.set_on_close(move || {
         let _ = close_tx.send(());
     });
@@ -395,7 +395,7 @@ pub async fn dial_h3_packet_up(
         }
     });
 
-    let mut conn = SplitConn::new(download_reader, pipe_client, remote, local);
+    let conn = SplitConn::new(download_reader, pipe_client, remote, local);
     // 连接关闭：终止 GET 下载流 + 显式关闭 QUIC 连接（H3Conn 与 QUIC 连接一一
     // 对应，对齐 Go dialer.go:229-231 AfterFunc 的 `tr.Close(); pktConn.Close()`）
     // ——客户端 UDP fd 立即释放，服务端 QUIC 连接立即终结，不等 30s idle timeout
@@ -429,7 +429,7 @@ pub async fn dial_h3_stream_up(
     let (download_reader, _, _) =
         client.open_stream(&base_uri, &session_id, None, Some(close_rx)).await?;
 
-    let mut conn = SplitConn::new(download_reader, pipe_client, remote, local);
+    let conn = SplitConn::new(download_reader, pipe_client, remote, local);
     let h3_for_close = Arc::clone(&client);
     conn.set_on_close(move || {
         h3_for_close.close();
@@ -593,6 +593,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::DialTarget;
 
     /// 确保 rustls CryptoProvider 在并行测试中只初始化一次
     fn ensure_crypto_provider() {
@@ -712,7 +713,7 @@ mod tests {
     #[tokio::test]
     async fn dial_h3_unknown_mode_returns_error() {
         ensure_crypto_provider();
-        let config = Arc::new(Config { mode: "unknown-mode".into(), ..Default::default() });
+        let _config = Arc::new(Config { mode: "unknown-mode".into(), ..Default::default() });
         // 构造一个不连接真实服务器的 H3Conn stub：直接测 dispatch 逻辑，
         // 因 unknown mode 在 resolve_mode 之后立即返回 Err，不会触达网络。
         // 但 dial_h3 第一参是已连接的 H3Conn，无法简单 stub。

@@ -69,8 +69,8 @@ impl ClientSession {
         request_body_iv.copy_from_slice(&buf[16..32]);
         let response_header = buf[32];
 
-        let body_key_hash = Sha256::digest(&request_body_key);
-        let body_iv_hash = Sha256::digest(&request_body_iv);
+        let body_key_hash = Sha256::digest(request_body_key);
+        let body_iv_hash = Sha256::digest(request_body_iv);
         let mut response_body_key = [0u8; 16];
         let mut response_body_iv = [0u8; 16];
         response_body_key.copy_from_slice(&body_key_hash[..16]);

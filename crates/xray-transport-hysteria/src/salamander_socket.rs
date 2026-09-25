@@ -213,7 +213,7 @@ impl AsyncUdpSocket for SalamanderSocket {
             let decoded = {
                 let mut raw = self.recv_scratch.lock();
                 self.io.try_recv_from(&mut raw[..]).map(|(n, addr)| {
-                    let payload = self.obfs.deobfuscate(&raw[..n], &mut *bufs[0]);
+                    let payload = self.obfs.deobfuscate(&raw[..n], &mut bufs[0]);
                     (payload, addr)
                 })
             };

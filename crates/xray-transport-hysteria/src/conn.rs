@@ -747,7 +747,7 @@ impl UdpSessionManager {
         local: SocketAddr,
         remote: SocketAddr,
     ) {
-        let inner = Arc::clone(&self.inner);
+        let _inner = Arc::clone(&self.inner);
         {
             let mut g = self.inner.lock().await;
             g.conn = Some(Arc::clone(&conn));

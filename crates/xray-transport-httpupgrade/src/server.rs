@@ -9,7 +9,6 @@
 //! 留给上层 transport（依赖 uTLS 决策），本模块只暴露 `handshake_io`
 //! 在调用方注入的 `AsyncRead + AsyncWrite` 上跑握手。
 
-use std::net::{IpAddr, SocketAddr};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -127,6 +126,8 @@ fn find_header_end(bytes: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, SocketAddr};
+
     use tokio::io::duplex;
 
     use super::*;

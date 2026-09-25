@@ -37,7 +37,7 @@ pub fn open_key_log_writer<P: AsRef<Path>>(path: P) -> Option<std::fs::File> {
 ///
 /// # 返回
 /// 选中的路径；集合为空时返回 `"/"`（与 Go 端 fallthrough 一致）
-pub fn get_path_locked<'a>(paths: &'a HashMap<String, ()>) -> &'a str {
+pub fn get_path_locked(paths: &HashMap<String, ()>) -> &str {
     // ponytail: deterministic for now; random selection deferred to xray_crypto
     // rand_between once RNG plumbing lands.
     paths.keys().next().map(String::as_str).unwrap_or("/")

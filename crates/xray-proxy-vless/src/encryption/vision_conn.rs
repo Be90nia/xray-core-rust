@@ -263,7 +263,7 @@ where
                     if n == 0 {
                         return Poll::Ready(Ok(()));
                     }
-                    let mut content = xtls_unpadding(
+                    let content = xtls_unpadding(
                         &this.read_tmp[..n],
                         &mut this.downlink_state,
                         &this.user_uuid,

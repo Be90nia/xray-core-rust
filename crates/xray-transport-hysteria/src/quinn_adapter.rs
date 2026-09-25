@@ -618,7 +618,7 @@ async fn serve_hysteria_connection(
                     },
                 };
                 if frame_type != crate::config::FrameTypeTCPRequest {
-                    let _ = qs.cancel_read(0x101);
+                    qs.cancel_read(0x101);
                     continue;
                 }
                 let isc = Arc::new(InterStreamConn::new(Arc::new(qs), local, remote, false));
@@ -1046,7 +1046,7 @@ impl HysteriaRequestHandler for DefaultRequestHandler {
                 return None;
             }
             let validator = validator?;
-            let user = validator.validate(&req.auth_header)?;
+            let _user = validator.validate(&req.auth_header)?;
             // Auth OK → respond 233
             Some(AuthResponse {
                 status_code: config::StatusAuthOK,

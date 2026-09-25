@@ -16,7 +16,7 @@
 //!
 //! 进程启动时调用一次 [`register_dialer`]；幂等——重复注册的 `AlreadyExists` 被忽略。
 
-use std::{future::Future, io, net::SocketAddr, pin::Pin, sync::Arc};
+use std::{io, net::SocketAddr, sync::Arc};
 
 use xray_common::net::destination::Destination;
 use xray_transport::{
@@ -25,7 +25,6 @@ use xray_transport::{
     listener_registry::{
         ConnHandler, TransportListenFn, TransportListener, register_transport_listener,
     },
-    sockopt::SocketOptions,
 };
 
 use crate::{
@@ -88,10 +87,10 @@ async fn listen_ws(
 
     let mut ws_listener = crate::server::WsListener::bind(addr, ws_config.clone())
         .await
-        .map_err(|e| io::Error::other(e))?;
+        .map_err(io::Error::other)?;
     ws_listener.trusted_x_forwarded_for = trusted;
 
-    let local_addr = ws_listener.local_addr().map_err(|e| io::Error::other(e))?;
+    let local_addr = ws_listener.local_addr().map_err(io::Error::other)?;
 
     let close_notify = Arc::new(tokio::sync::Notify::new());
     let close_notify_clone = close_notify.clone();
@@ -238,7 +237,7 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
         security_json: settings.security_json.clone(),
     })
     .await
-    .map_err(|e| io::Error::other(e))?;
+    .map_err(io::Error::other)?;
 
     // Tcpmask（Go websocket/dialer.go:56-63：`TcpmaskManager.WrapConnClient`，
     // security 包装之后链式应用 finalmask_json.tcp[]）。

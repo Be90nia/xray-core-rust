@@ -95,7 +95,7 @@ pub fn parse_upgrade_request(bytes: &[u8], config: &Config) -> Result<UpgradeReq
     // 校验 Connection / Upgrade header。
     let connection = headers.get("connection").cloned().unwrap_or_default();
     let upgrade = headers.get("upgrade").cloned().unwrap_or_default();
-    if connection.to_ascii_lowercase() != "upgrade" || upgrade.to_ascii_lowercase() != "websocket" {
+    if !connection.eq_ignore_ascii_case("upgrade") || !upgrade.eq_ignore_ascii_case("websocket") {
         return Err(HttpUpgradeError::UnrecognizedRequest { connection, upgrade });
     }
 

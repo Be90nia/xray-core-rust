@@ -75,7 +75,7 @@ const HUFFMAN_BITS: [u8; 256] = [
 #[must_use]
 pub fn huffman_encode_length(s: &str) -> usize {
     let total_bits: u32 = s.bytes().map(|b| HUFFMAN_BITS[b as usize] as u32).sum();
-    ((total_bits + 7) / 8) as usize
+    total_bits.div_ceil(8) as usize
 }
 
 /// Placement 描述（与 Go `XPaddingPlacement` 等价）。

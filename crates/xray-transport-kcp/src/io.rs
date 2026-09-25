@@ -73,8 +73,7 @@ mod tests {
         seg2.conv = 2;
         seg2.cmd = Command::Terminate;
 
-        let mut packet = Vec::new();
-        packet.resize(seg1.byte_size(), 0);
+        let mut packet = vec![0; seg1.byte_size()];
         seg1.serialize(&mut packet);
         let off = seg1.byte_size();
         packet.resize(off + seg2.byte_size(), 0);
@@ -94,8 +93,7 @@ mod tests {
         let mut seg1 = CmdOnlySegment::new();
         seg1.conv = 1;
 
-        let mut packet = Vec::new();
-        packet.resize(seg1.byte_size(), 0);
+        let mut packet = vec![0; seg1.byte_size()];
         seg1.serialize(&mut packet);
         packet.extend_from_slice(&[0, 1, 99, 0]);
 

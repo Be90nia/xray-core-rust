@@ -292,7 +292,7 @@ mod tests {
 
         conn.write_all(b"hello-grpc-tcpmask").await.expect("write");
         let mut buf = vec![0u8; 64];
-        let n = tokio::time::timeout(std::time::Duration::from_secs(5), conn.read(&mut buf))
+        let _n = tokio::time::timeout(std::time::Duration::from_secs(5), conn.read(&mut buf))
             .await
             .expect("echo timeout")
             .expect("read ok");

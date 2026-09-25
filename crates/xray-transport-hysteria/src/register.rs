@@ -3,16 +3,14 @@
 //! dialer: 完整拨号流程——解析配置 → TLS → QuinnHysteriaTransport → HysteriaClient → HysteriaConn。
 //! listener: TLS ServerConfig → QuinnListenerFactory → accept loop → HysteriaConn。
 
-use std::{future::Future, io, net::SocketAddr, pin::Pin, sync::Arc};
+use std::{io, net::SocketAddr, sync::Arc};
 
-use xray_proto::xray::transport::internet::QuicParams;
 use xray_transport::{
     connection::Connection,
     dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
     listener_registry::{
         ConnHandler, TransportListenFn, TransportListener, register_transport_listener,
     },
-    sockopt::SocketOptions,
 };
 
 use crate::{
@@ -161,12 +159,12 @@ async fn accept_hysteria_conn(conn: Arc<dyn QuicConn>, handler: ConnHandler) {
         let frame_type = match crate::conn::read_varint_stream(&*stream).await {
             Ok(value) => value,
             Err(_) => {
-                let _ = stream.cancel_read(0x101);
+                stream.cancel_read(0x101);
                 continue;
             },
         };
         if frame_type != crate::config::FrameTypeTCPRequest {
-            let _ = stream.cancel_read(0x101);
+            stream.cancel_read(0x101);
             continue;
         }
         let inter = Arc::new(InterStreamConn::new(stream, local, remote, false));
