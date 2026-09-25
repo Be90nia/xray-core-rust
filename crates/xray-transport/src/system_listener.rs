@@ -536,6 +536,8 @@ impl Connection for UnixConnection {
 #[cfg(unix)]
 pub struct UnixListener {
     inner: TokioUnixListener,
+    #[allow(dead_code)]
+    // sockopt 在 Unix accept 路径由内核 socket 直接生效，字段保留对齐 Go 装配面
     sockopt: SocketOptions,
     controllers: Vec<ListenerController>,
     _locker: Option<FileLocker>,

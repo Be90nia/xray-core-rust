@@ -575,8 +575,8 @@ fn xicmp_open_server(cfg: &XicmpConfig) -> io::Result<Box<dyn UdpIo>> {
 // ===== Linux 平台 raw ICMP socket 实现 =====
 
 #[cfg(target_os = "linux")]
+#[allow(dead_code)] // Linux ICMP raw socket 实装占位：接口已定，send/recv 待 libc 接线
 mod linux_impl {
-    use std::os::unix::io::AsRawFd;
 
     use socket2::{Domain, Protocol, Socket, Type};
     use tokio::io::unix::AsyncFd;

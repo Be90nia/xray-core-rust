@@ -24,7 +24,7 @@
 pub use imp::{bridge_with, plan, splice_copy, splice_copy_counted};
 
 mod imp {
-    use std::{io, net::SocketAddr, os::unix::io::AsRawFd};
+    use std::io;
 
     use tokio::net::TcpStream;
     use xray_common::platform::splice::splice_allowed;
@@ -130,7 +130,7 @@ mod imp {
                         let err = io::Error::last_os_error();
                         if is_eagain(&err) {
                             to.writable().await?;
-                            let _ = to.try_write(&mut []);
+                            let _ = to.try_write(&[]);
                         } else {
                             return Err(err);
                         }

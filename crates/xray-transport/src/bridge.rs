@@ -462,8 +462,6 @@ pub async fn bridge_link_with_stream_downlink_splice<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Connection,
 {
-    use std::sync::Arc;
-
     use tokio::io::AsyncWriteExt;
     use xray_buf::io::{Reader, Writer};
 
@@ -474,7 +472,7 @@ where
     // 准入已要求出站 raw；克隆失败（理论不可达）时下行退化为立即结束，
     // 上行照常泵完（连接可用性不受影响）。
     let down_from = stream.raw_tcp_clone();
-    let Link { mut reader, mut writer } = link;
+    let Link { mut reader, writer } = link;
     let (_s_read, mut s_write) = tokio::io::split(stream); // 下行走 splice，读半部不再需要
     let (up_done_tx, _up_done_rx) = tokio::sync::watch::channel(None::<std::time::Duration>);
     let (down_done_tx, down_done_rx) = tokio::sync::watch::channel(None::<std::time::Duration>);
