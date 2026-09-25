@@ -1092,6 +1092,7 @@ async fn dokodemo_peer_relay(
 /// - 响应源为 IP：`fakeudp` bind 到该源地址（per 源缓存，Go `w.conns` 同键）。
 /// - 创建失败（需 CAP_NET_ADMIN）或源为域名（无法 bind）：返回 `None`，调用 方丢弃该响应（Go
 ///   PacketWriter 创建失败 LogInfo+drop 同款降级）。
+///
 /// mark 恒 0：Rust dokodemo UDP 路径未接 session sockopt mark（Go 缺省 0 同值）。
 #[cfg(target_os = "linux")]
 fn fake_responder(
@@ -3495,7 +3496,7 @@ fn apply_unix_abstract_padding(dest: &str) -> String {
         // Linux `syscall.RawSockaddrUnix{}.Path` 字节数。
         // ponytail: hardcoded 108 对齐 syscall.RawSockaddrUnix.Path；改需联动内核常量。
         const UNIX_PATH_MAX: usize = 108;
-        if let Some(stripped) = dest.strip_prefix("@@") {
+        if dest.starts_with("@@") {
             let mut buf = [0u8; UNIX_PATH_MAX];
             let src = &dest.as_bytes()[1..]; // Go trojan.go:196 Dest[1:]: 跳过首个 @，保留第二个
             let copy_len = src.len().min(UNIX_PATH_MAX - 1);
