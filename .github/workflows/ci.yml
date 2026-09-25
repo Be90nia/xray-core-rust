@@ -42,6 +42,9 @@ jobs:
       # workspace 依赖图含 xray-proto(prost-build)，构建需要 protoc
       - name: Install protoc
         run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      # btls-sys bindings 含注入符号（bd mygg/z32z），与 interop/mobile 同源
+      # 配方；顺序须在 rust-cache 之后（action 尾部清理恢复的旧 btls-sys 产物）
+      - uses: ./.github/actions/setup-boringssl
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   # 编译检查 (多平台)
@@ -71,8 +74,13 @@ jobs:
           } elseif ($env:RUNNER_OS -eq "macOS") {
             brew install protobuf
           } else {
-            choco install protobuf -y --no-progress
+            # choco 包名是 protoc（protobuf 包不存在）；装到 C:\ProgramData\chocolatey\bin
+            choco install -y protoc 2>&1 | Out-Null
+            echo "C:\ProgramData\chocolatey\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
           }
+      # btls-sys bindings 含注入符号（bd mygg/z32z），与 interop/mobile 同源
+      # 配方；顺序须在 rust-cache 之后（action 尾部清理恢复的旧 btls-sys 产物）
+      - uses: ./.github/actions/setup-boringssl
       - run: cargo build --workspace --release
       - run: cargo build --workspace
 
@@ -87,6 +95,9 @@ jobs:
       # workspace 依赖图含 xray-proto(prost-build)，test 构建需要 protoc
       - name: Install protoc
         run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      # btls-sys bindings 含注入符号（bd mygg/z32z），与 interop/mobile 同源
+      # 配方；顺序须在 rust-cache 之后（action 尾部清理恢复的旧 btls-sys 产物）
+      - uses: ./.github/actions/setup-boringssl
       - run: cargo test --workspace
       - run: cargo test --workspace --release
 
@@ -108,6 +119,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      # btls-sys bindings 含注入符号（bd mygg/z32z）；rustdoc 构建依赖同样过 btls-sys
+      - uses: ./.github/actions/setup-boringssl
       - run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
@@ -131,6 +144,10 @@ jobs:
         with:
           workspaces: |
             fuzz
+      # btls-sys bindings 含注入符号（bd mygg/z32z）；fuzz 链含 xray-reality。
+      # fuzz/target 的旧 btls-sys 缓存由 env fingerprint 变化触发 build script
+      # 重跑自动重建（rerun-if-env-changed 覆盖 ASSUME_PATCHED/SOURCE_PATH）
+      - uses: ./.github/actions/setup-boringssl
       - name: Build fuzzers
         working-directory: fuzz
         run: cargo fuzz build --sanitizer address

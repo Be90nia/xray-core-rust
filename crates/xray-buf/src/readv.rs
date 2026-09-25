@@ -428,8 +428,11 @@ mod tests {
         assert!(mb.is_empty(), "EOF 应产出空 MultiBuffer");
     }
 
-    #[tokio::test]
-    async fn env_off_falls_back_to_sequential_path() {
+    // 同步 test + block_on 手工驱动（等价 #[tokio::test] 的 current_thread flavor）：
+    // ENV_LOCK guard 须贯穿全程（env 闸门进程全局，防并行测试中途改闸门），
+    // #[tokio::test] 形态下 guard 会跨 await，clippy -D warnings 报 await_holding_lock。
+    #[test]
+    fn env_off_falls_back_to_sequential_path() {
         let _guard = ENV_LOCK.lock();
         let prev = use_readv();
         USE_READV.store(false, Ordering::Relaxed);
@@ -441,31 +444,37 @@ mod tests {
         }
         let _restore = Restore(prev);
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
 
-        let writer = tokio::spawn(async move {
-            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
-            use tokio::io::AsyncWriteExt;
-            s.write_all(&b"hello readv gate".repeat(4)).await.unwrap();
-            s.shutdown().await.unwrap();
-        });
+                let writer = tokio::spawn(async move {
+                    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+                    use tokio::io::AsyncWriteExt;
+                    s.write_all(&b"hello readv gate".repeat(4)).await.unwrap();
+                    s.shutdown().await.unwrap();
+                });
 
-        let (sock, _) = listener.accept().await.unwrap();
-        let (rd, _wr) = sock.into_split();
-        // 工厂语义：闸门关 → 不包 ReadVReader，退回顺序读（Go NewReader useReadV()==false）。
-        let mut reader = io::new_readv_reader(rd);
-        writer.await.unwrap();
+                let (sock, _) = listener.accept().await.unwrap();
+                let (rd, _wr) = sock.into_split();
+                // 工厂语义：闸门关 → 不包 ReadVReader，退回顺序读（Go NewReader useReadV()==false）。
+                let mut reader = io::new_readv_reader(rd);
+                writer.await.unwrap();
 
-        let mut got = Vec::new();
-        loop {
-            let mb = reader.read_multi_buffer().await.expect("read ok");
-            if mb.is_empty() {
-                break;
-            }
-            got.extend_from_slice(&mb.to_vec());
-        }
-        assert_eq!(got, b"hello readv gate".repeat(4));
+                let mut got = Vec::new();
+                loop {
+                    let mb = reader.read_multi_buffer().await.expect("read ok");
+                    if mb.is_empty() {
+                        break;
+                    }
+                    got.extend_from_slice(&mb.to_vec());
+                }
+                assert_eq!(got, b"hello readv gate".repeat(4));
+            });
     }
     /// bd xag3③：use_readv 缓存 + reload 行为等价三态（env 进程全局，串行化）。
     #[test]

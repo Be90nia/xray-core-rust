@@ -179,7 +179,6 @@ impl MultiBuffer {
             let needed = size - accumulated;
             let partial = front.split_to(needed);
             result.push(partial);
-            accumulated = size;
         }
         result
     }
