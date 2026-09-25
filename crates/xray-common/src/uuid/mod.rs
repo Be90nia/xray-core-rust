@@ -13,6 +13,13 @@ use rand::RngCore;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UUID([u8; 16]);
 
+impl Default for UUID {
+    /// 随机 v4 UUID，与 [`UUID::new`] 一致（对齐 Go `uuid.New` 随机语义）。
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UUID {
     /// 生成随机 v4 UUID。
     ///
@@ -49,7 +56,7 @@ impl UUID {
     /// 解析 UUID 字符串（Go `ParseString` 完整语义）。
     ///
     /// - 标准格式（32-36 字符，带/不带连字符）：直接解析。
-    /// - 1-30 字节非 UUID 文本：SHA1(零UUID || text)[:16] 派生 UUIDv5 （VLESS/VMess 自定义用户 ID
+    /// - 1-30 字节非 UUID 文本：`SHA1(零UUID || text)[:16]` 派生 UUIDv5 （VLESS/VMess 自定义用户 ID
     ///   路径，`uuid -i` 同源）。
     /// - 空或 >30 字节且非标准格式：`None`。
     pub fn parse(input: &str) -> Option<Self> {

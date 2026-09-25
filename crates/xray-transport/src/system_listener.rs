@@ -35,7 +35,6 @@ use tokio::{
 use crate::filelocker::FileLocker;
 use crate::{
     connection::{Connection, TcpConnection},
-    listener::Listener,
     sockopt::{SocketOptions, apply_inbound_socket_options},
 };
 
@@ -194,7 +193,7 @@ impl DefaultListener {
             use std::os::windows::io::{FromRawSocket, IntoRawSocket};
             std::net::TcpListener::from_raw_socket(socket.into_raw_socket())
         };
-        Ok(TokioTcpListener::from_std(std_listener)?)
+        TokioTcpListener::from_std(std_listener)
     }
 
     /// MPTCP 监听绑定。对应 Go `lc.SetMultipathTCP(true)`（system_listener.go:110-112）。
@@ -238,7 +237,7 @@ impl DefaultListener {
         socket.set_nonblocking(true)?;
         // Socket → OwnedFd → std TcpListener（socket2 无直接转换）。
         let std_listener = std::net::TcpListener::from(std::os::fd::OwnedFd::from(socket));
-        Ok(TokioTcpListener::from_std(std_listener)?)
+        TokioTcpListener::from_std(std_listener)
     }
 
     /// 用已绑定的 tokio listener 构造（测试或高级场景用）。
@@ -300,7 +299,6 @@ impl SystemListener for DefaultListener {
             let tcp_stream = tokio::net::TcpStream::from_std(socket.into())?;
             // PROXY protocol：启用时先读取 PROXY header 提取真实源地址。
             let conn: Box<dyn Connection> = if self.accept_proxy_protocol {
-                use tokio::io::AsyncReadExt;
                 let mut stream = tcp_stream;
                 match crate::proxy_protocol::read_proxy_protocol(&mut stream).await {
                     Ok(Some(real_peer)) => {
@@ -835,8 +833,7 @@ mod tests {
     async fn sockopt_accept_proxy_protocol_switch_on() {
         use crate::proxy_protocol::build_proxy_header;
         let fake_src: SocketAddr = "198.51.100.17:47211".parse().unwrap();
-        let mut sockopt = SocketOptions::default();
-        sockopt.accept_proxy_protocol = true;
+        let sockopt = SocketOptions { accept_proxy_protocol: true, ..SocketOptions::default() };
         let listener =
             DefaultListener::bind("127.0.0.1:0".parse().unwrap(), sockopt).await.unwrap();
         let addr = listener.local_addr().unwrap();

@@ -199,34 +199,9 @@ mod tests {
         }
     }
 
-    /// 全局 `HANDLERS` 在两个测试间会互相污染（clear → register → log 中段
-    /// 被另一测试 clear 掉，断言长度失败）。用 mutex 串行化两测试。
+    /// 全局 `HANDLERS` 在测试间会互相污染（clear → register → log 中段
+    /// 被另一测试 clear 掉，断言长度失败）。用 mutex 串行化测试。
     static HANDLER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn test_register_and_log() {
-        let _guard = HANDLER_TEST_LOCK.lock().unwrap();
-        clear_handlers();
-
-        let handler = Arc::new(TestHandler::new());
-        let messages_ptr = {
-            let h = Arc::downgrade(&handler);
-            register_handler(handler);
-            // 重新获取引用以检查消息
-            h.upgrade().expect("handler should exist")
-        };
-
-        log(Message::new(Severity::Info, "hello"));
-        log(Message::new(Severity::Error, "world"));
-
-        let msgs = messages_ptr.messages();
-        assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0].content, "hello");
-        assert_eq!(msgs[0].severity, Severity::Info);
-        assert_eq!(msgs[1].content, "world");
-        assert_eq!(msgs[1].severity, Severity::Error);
-
-        clear_handlers();
-    }
 
     #[test]
     fn test_convenience_functions() {

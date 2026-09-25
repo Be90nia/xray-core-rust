@@ -6,6 +6,8 @@ use std::{io, path::PathBuf};
 
 /// UDS 访问锁。对应 Go `FileLocker`。
 pub struct FileLocker {
+    // path 在 unix 分支（acquire/release）使用；Windows no-op 下仅存不用。
+    #[cfg_attr(not(unix), allow(dead_code))]
     path: PathBuf,
     #[cfg(unix)]
     file: Option<std::fs::File>,

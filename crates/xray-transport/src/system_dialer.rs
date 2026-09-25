@@ -258,7 +258,7 @@ fn random_ip_in_cidr(base: IpAddr, prefix: u8) -> Option<IpAddr> {
             let shift = 128 - prefix;
             let mask = if shift >= 128 { 0 } else { u128::MAX << shift };
             let network = u128::from(v6) & mask;
-            let size: u128 = 1u128.checked_shl(u32::try_from(shift).ok()?).unwrap_or(0);
+            let size: u128 = 1u128.checked_shl(u32::from(shift)).unwrap_or(0);
             let offset =
                 if size == 0 { rand::random::<u128>() } else { rand::random::<u128>() % size };
             Some(IpAddr::V6(std::net::Ipv6Addr::from(network + offset)))
@@ -679,10 +679,7 @@ pub async fn dial_system(
     if !sockopt.dialer_proxy.is_empty() {
         let hook = DIALER_PROXY_HOOK.read().expect("DIALER_PROXY_HOOK lock poisoned").clone();
         let Some(hook) = hook else {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "there is no outbound manager for dialerProxy",
-            ));
+            return Err(io::Error::other("there is no outbound manager for dialerProxy"));
         };
         return hook(&sockopt.dialer_proxy, &dest).await;
     }
@@ -750,6 +747,13 @@ fn libc_error_inprogress() -> i32 {
 
 #[cfg(test)]
 mod tests {
+    // 历史布局：正式 item（DnsResolvingDialer/init_system_dialer 等）在测试模块之后，
+    // 整体移动是大 diff 重构，保持现状。
+    #![allow(clippy::items_after_test_module)]
+    // 测试串行锁（HOOK/DNS_TEST_LOCK）guard 跨 await：#[tokio::test] 默认
+    // current-thread runtime，测试体内无其他任务竞争该锁，无死锁面。
+    #![allow(clippy::await_holding_lock)]
+
     use std::net::Ipv4Addr;
 
     use xray_common::net::{address::Address, port::Port};
@@ -938,8 +942,8 @@ mod tests {
     async fn dial_system_dialer_proxy_without_hook_errors() {
         let _guard = HOOK_TEST_LOCK.lock();
         clear_dialer_proxy_hook();
-        let mut sockopt = SocketOptions::default();
-        sockopt.dialer_proxy = "proxy-out".into();
+        let sockopt =
+            SocketOptions { dialer_proxy: "proxy-out".into(), ..SocketOptions::default() };
         let dest = Destination::tcp(
             xray_common::net::address::Address::from_ipv4_bytes([127, 0, 0, 1]),
             xray_common::net::port::Port::new(1),
@@ -970,8 +974,8 @@ mod tests {
                     as Box<dyn Connection>)
             })
         }));
-        let mut sockopt = SocketOptions::default();
-        sockopt.dialer_proxy = "socks-out".into();
+        let sockopt =
+            SocketOptions { dialer_proxy: "socks-out".into(), ..SocketOptions::default() };
         let dest = Destination::tcp(
             xray_common::net::address::Address::from_ipv4_bytes([127, 0, 0, 1]),
             xray_common::net::port::Port::new(8080),
@@ -1269,8 +1273,8 @@ mod tests {
         set_dns_client(Some(fake as Arc<dyn DnsClient>));
 
         let dest = Destination::tcp(Address::new_domain("echo.invalid"), Port::new(addr.port()));
-        let mut sockopt = SocketOptions::default();
-        sockopt.domain_strategy = DomainStrategy::UseIPv4;
+        let sockopt =
+            SocketOptions { domain_strategy: DomainStrategy::UseIPv4, ..SocketOptions::default() };
         let result = dial_system(&dest, &sockopt).await;
         set_dns_client(None);
         drop(result);
@@ -1289,8 +1293,10 @@ mod tests {
         set_dns_client(Some(fake as Arc<dyn DnsClient>));
 
         let dest = Destination::tcp(Address::new_domain("nonexistent.invalid"), Port::new(80));
-        let mut sockopt = SocketOptions::default();
-        sockopt.domain_strategy = DomainStrategy::ForceIPv4;
+        let sockopt = SocketOptions {
+            domain_strategy: DomainStrategy::ForceIPv4,
+            ..SocketOptions::default()
+        };
         let err = match dial_system(&dest, &sockopt).await {
             Err(e) => e,
             Ok(_) => panic!("ForceIPv4 + DNS failure should error"),
@@ -1302,8 +1308,8 @@ mod tests {
 
         // 非 Force：解析失败不中断——域名交给 effective dialer 的系统解析，
         // .invalid 必失败但错误来自系统 resolver 而非 LookupForIP。
-        let mut sockopt = SocketOptions::default();
-        sockopt.domain_strategy = DomainStrategy::UseIPv4;
+        let sockopt =
+            SocketOptions { domain_strategy: DomainStrategy::UseIPv4, ..SocketOptions::default() };
         let result = dial_system(&dest, &sockopt).await;
         let err = match result {
             Err(e) => e.to_string(),
@@ -1323,6 +1329,12 @@ mod tests {
 /// 再委托给 DefaultSystemDialer 拨号。对应 Go `InitSystemDialer` 的 DNS 解析部分。
 pub struct DnsResolvingDialer {
     inner: DefaultSystemDialer,
+}
+
+impl Default for DnsResolvingDialer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DnsResolvingDialer {

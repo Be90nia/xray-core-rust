@@ -3,7 +3,7 @@
 //! 对应 Go 版本 `common/cmdarg` 包，提供命令行参数的封装。
 
 /// 命令行参数封装。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Arg(Vec<String>);
 
 impl Arg {
@@ -26,12 +26,6 @@ impl Arg {
 impl std::fmt::Display for Arg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0.join(" "))
-    }
-}
-
-impl Default for Arg {
-    fn default() -> Self {
-        Self(Vec::new())
     }
 }
 

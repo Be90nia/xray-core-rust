@@ -25,7 +25,7 @@ pub type BytesGenerator = Box<dyn Fn() -> Vec<u8> + Send + Sync>;
 ///
 /// 对应 Go 版本的 `GenerateEmptyBytes()`。
 pub fn generate_empty_bytes() -> BytesGenerator {
-    Box::new(|| Vec::new())
+    Box::new(Vec::new)
 }
 
 /// 创建静态字节生成器。

@@ -560,6 +560,7 @@ pub fn get_transport_dialer(protocol: &str) -> Option<TransportDialFn> {
 ///
 /// - `NotFound`：protocol 未注册
 /// - dialer 内部错误透传
+///
 /// 上层 transport 拨号（旧入口，等价于 `dial_with_settings(dest, &StreamSettings::tcp(),
 /// sockopt)`）。
 ///
@@ -765,10 +766,9 @@ mod transport_cache_tests {
     fn validate_sockopt_json_hard_errors_and_ok() {
         use super::StreamSettings;
         // 字符串 tfo → 拒（Go :82 "only boolean and integer value is acceptable"）。
-        let err =
-            StreamSettings::validate_sockopt_json(Some(&serde_json::json!({"tcpFastOpen": "yes"})))
-                .err()
-                .expect("string tfo must reject");
+        let err = StreamSettings::validate_sockopt_json(Some(&serde_json::json!({"tcpFastOpen":
+            "yes"})))
+        .expect_err("string tfo must reject");
         assert!(err.to_string().contains("tcpFastOpen"), "{err}");
         // int32 越界 → 拒。
         for key in [
@@ -780,7 +780,7 @@ mod transport_cache_tests {
             "sendBufferSize",
         ] {
             let obj = serde_json::json!({ key: 9_000_000_000i64 });
-            let err = StreamSettings::validate_sockopt_json(Some(&obj)).err().expect("must reject");
+            let err = StreamSettings::validate_sockopt_json(Some(&obj)).expect_err("must reject");
             assert!(err.to_string().contains(key), "key={key} err={err}");
         }
         // 合法：边界值 + 全字段。
@@ -991,7 +991,7 @@ mod transport_cache_tests {
     fn register_and_get_transport_dialer() {
         let dialer: TransportDialFn =
             Arc::new(|_dest: &Destination, _sockopt: &SocketOptions, _s: &StreamSettings| {
-                Box::pin(async { Err(io::Error::new(io::ErrorKind::Other, "test")) })
+                Box::pin(async { Err(io::Error::other("test")) })
             });
         // 注册（如果之前已注册同名，忽略 AlreadyExists）。
         let _ = register_transport_dialer("test-protocol-cache", dialer.clone());

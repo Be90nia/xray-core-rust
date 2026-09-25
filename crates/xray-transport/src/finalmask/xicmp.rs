@@ -19,7 +19,7 @@
 //! raw socket 收发（需 CAP_NET_RAW / root）留给集成层，本模块不依赖平台特权。
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     io,
     net::{Ipv6Addr, SocketAddr, SocketAddrV6},
     sync::Arc,
@@ -235,7 +235,6 @@ fn addr_is_v4(addr: &SocketAddr) -> bool {
 
 /// 内部共享 client/server 状态：recv 任务把 raw 包塞这里，
 /// 应用层 recv_from 从这里取。
-
 struct XicmpShared {
     /// 后台 recv 任务投递的 raw ICMP 包（已 type-filtered）。
     ///
@@ -338,10 +337,8 @@ fn spawn_recv_task(
             } else {
                 pkt[0] == ICMP_ECHO_V4 || pkt[0] == ICMP_ECHO_V6
             };
-            if pkt.len() >= 8 && pass {
-                if tx.send(pkt).await.is_err() {
-                    return; // 接收端已 drop（连接关闭）
-                }
+            if pkt.len() >= 8 && pass && tx.send(pkt).await.is_err() {
+                return; // 接收端已 drop（连接关闭）
             }
         }
     });
@@ -370,10 +367,8 @@ impl XicmpPassthroughConn {
         if payload.len() > MAX_PAYLOAD {
             return Ok(0);
         }
-        let state_arc = self
-            .client_state
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "not a client conn"))?;
+        let state_arc =
+            self.client_state.as_ref().ok_or_else(|| io::Error::other("not a client conn"))?;
         let (client_id, seq, id, is_v4) = {
             let mut s = state_arc.lock();
             let seq = s.seq;
@@ -387,10 +382,8 @@ impl XicmpPassthroughConn {
 
     /// 收 echo reply 包：parse → 校验 id 匹配 + seq ring ≤1000 + 剥 clientID。
     async fn client_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let state_arc = self
-            .client_state
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "not a client conn"))?;
+        let state_arc =
+            self.client_state.as_ref().ok_or_else(|| io::Error::other("not a client conn"))?;
         let (client_id, id, seq_current) = {
             let s = state_arc.lock();
             (s.client_id, s.id, s.seq)
@@ -441,10 +434,8 @@ impl XicmpPassthroughConn {
 
     /// server send_to：用 rec 查 addr → marshal echo reply → raw.send。
     async fn server_send_to(&self, payload: &[u8], addr: &SocketAddr) -> io::Result<usize> {
-        let state_arc = self
-            .server_state
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "not a server conn"))?;
+        let state_arc =
+            self.server_state.as_ref().ok_or_else(|| io::Error::other("not a server conn"))?;
         // payload + 8B（无 clientID 前缀）> UDPSize 视为超限，丢
         if payload.len() + 8 > UDP_SIZE {
             return Ok(0);
@@ -473,10 +464,8 @@ impl XicmpPassthroughConn {
     /// server recv_from：parse echo request → 剥 8B clientID → 记录 rec → 返回 (payload,
     /// virtual_v6_addr)
     async fn server_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let state_arc = self
-            .server_state
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "not a server conn"))?;
+        let state_arc =
+            self.server_state.as_ref().ok_or_else(|| io::Error::other("not a server conn"))?;
         loop {
             let pkt = {
                 let mut sh = self.shared.lock().await;
@@ -718,6 +707,8 @@ const RECV_CHANNEL_CAP: usize = 32;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
 
     #[test]
@@ -883,7 +874,7 @@ mod tests {
         }
         let raw: Box<dyn UdpIo> = Box::new(Stub);
         // level=0（最外层）应透传成功
-        let result = config.wrap_packet_conn_client(raw, 0, 2);
+        let _result = config.wrap_packet_conn_client(raw, 0, 2);
     }
 
     /// mock raw ICMP socket：记录 send 字节、预设 recv 队列。

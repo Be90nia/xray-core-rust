@@ -18,7 +18,6 @@
 use std::{collections::HashMap, fmt::Debug, future::Future, net::IpAddr, pin::Pin, sync::Arc};
 
 use xray_buf::multi::MultiBuffer;
-use xray_common::net::destination::Destination;
 
 use crate::{error::DispatcherError, sniffer::SniffResult};
 
@@ -1372,17 +1371,14 @@ impl DefaultDispatcher {
             // ---- UDP443 policy（bd g35，Go handler.go:220-228） ----
             // 仅 mux 启用的出站有条目（Go h.udp443 只在 MultiplexSettings.Enabled 时设置）。
             if final_dest.network() == Network::UDP && final_dest.port().value() == 443 {
-                match udp443_policies.get(handler.tag()) {
-                    Some(Udp443Policy::Reject) => {
-                        // Go: test(errors.New("XUDP rejected UDP/443 traffic").AtInfo()) →
-                        // Interrupt 双向
-                        tracing::info!(tag = %out_tag, "XUDP rejected UDP/443 traffic");
-                        writer.shutdown(); // 关闭下行 → inbound reader EOF
-                        return; // reader 随 drop 关闭上行
-                    },
-                    // skip（Go goto out 直发）/ allow（xudp dispatch，mbc/nww 接入前等价直发）
-                    Some(_) | None => {},
+                if let Some(Udp443Policy::Reject) = udp443_policies.get(handler.tag()) {
+                    // Go: test(errors.New("XUDP rejected UDP/443 traffic").AtInfo()) →
+                    // Interrupt 双向
+                    tracing::info!(tag = %out_tag, "XUDP rejected UDP/443 traffic");
+                    writer.shutdown(); // 关闭下行 → inbound reader EOF
+                    return; // reader 随 drop 关闭上行
                 }
+                // skip（Go goto out 直发）/ allow（xudp dispatch，mbc/nww 接入前等价直发）
             }
 
             // ---- EndpointOverride（bd g35，Go handler.go:206-209） ----
@@ -1551,10 +1547,7 @@ impl xray_buf::io::Reader for CachedReader {
 // ========== DialBridge：通用 Dial→Bridge adapter ==========
 
 use xray_transport::{
-    bridge::{
-        bridge_link_with_link, bridge_link_with_link_default, bridge_link_with_stream_full,
-        bridge_link_with_stream_full_default,
-    },
+    bridge::{bridge_link_with_link, bridge_link_with_stream_full},
     connection::Connection,
 };
 
@@ -1978,7 +1971,7 @@ impl OutboundHandlerManager for SimpleOhm {
 
 #[cfg(test)]
 mod tests {
-    use xray_common::net::network::Network;
+    use xray_common::net::{destination::Destination, network::Network};
 
     use super::*;
     use crate::sniffer::SniffResult;
@@ -4206,7 +4199,7 @@ mod tests {
 
         let stats = Arc::new(xray_app_stats::Manager::new_running());
         let mut d = DefaultDispatcher::new();
-        let mut ohm = SimpleOhm::new();
+        let ohm = SimpleOhm::new();
         ohm.add("tag-out", Arc::new(EchoHandler { tag: "tag-out" }));
         d.ohm = Some(Arc::new(ohm));
         d.router = Some(Arc::new(TagOutRouter));
@@ -4260,10 +4253,12 @@ mod tests {
             })
         });
         let bridge = DialBridge::new("policy-bridge", dial);
-        let mut policy = xray_features::policy::TimeoutPolicy::default();
-        policy.connection_idle = std::time::Duration::from_millis(100);
-        policy.uplink_only = std::time::Duration::from_millis(100);
-        policy.downlink_only = std::time::Duration::from_millis(100);
+        let policy = xray_features::policy::TimeoutPolicy {
+            connection_idle: std::time::Duration::from_millis(100),
+            uplink_only: std::time::Duration::from_millis(100),
+            downlink_only: std::time::Duration::from_millis(100),
+            ..xray_features::policy::TimeoutPolicy::default()
+        };
         bridge.with_policy(policy);
 
         let (up_r, up_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());

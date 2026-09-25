@@ -21,7 +21,6 @@ use tokio::{
 use xray_transport::connection::Connection;
 
 use crate::encryption::{
-    aead::Aead,
     common_conn::CommonConn,
     vision::{
         COMMAND_PADDING_CONTINUE, COMMAND_PADDING_DIRECT, COMMAND_PADDING_END,

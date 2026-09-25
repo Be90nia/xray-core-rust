@@ -15,10 +15,7 @@ impl GeodataAsset {
     }
 
     pub fn to_proto(&self) -> ProtoAsset {
-        let mut out = ProtoAsset::default();
-        out.url = self.url.clone();
-        out.file = self.file.clone();
-        out
+        ProtoAsset { url: self.url.clone(), file: self.file.clone() }
     }
 }
 
@@ -40,11 +37,11 @@ impl GeodataConfig {
     }
 
     pub fn to_proto(&self) -> ProtoConfig {
-        let mut out = ProtoConfig::default();
-        out.cron = self.cron.clone();
-        out.outbound = self.outbound.clone();
-        out.assets = self.assets.iter().map(|a| a.to_proto()).collect();
-        out
+        ProtoConfig {
+            cron: self.cron.clone(),
+            outbound: self.outbound.clone(),
+            assets: self.assets.iter().map(|a| a.to_proto()).collect(),
+        }
     }
 }
 
@@ -61,9 +58,7 @@ mod tests {
 
     #[test]
     fn asset_from_proto() {
-        let mut p = ProtoAsset::default();
-        p.url = "https://example.com/ip.dat".into();
-        p.file = "geoip.dat".into();
+        let p = ProtoAsset { url: "https://example.com/ip.dat".into(), file: "geoip.dat".into() };
         let a = GeodataAsset::from_proto(&p);
         assert_eq!(a.url, "https://example.com/ip.dat");
         assert_eq!(a.file, "geoip.dat");
@@ -86,13 +81,11 @@ mod tests {
 
     #[test]
     fn config_from_proto() {
-        let mut p = ProtoConfig::default();
-        p.cron = "0 0 * * *".into();
-        p.outbound = "direct".into();
-        let mut a = ProtoAsset::default();
-        a.url = "u1".into();
-        a.file = "f1".into();
-        p.assets.push(a);
+        let p = ProtoConfig {
+            cron: "0 0 * * *".into(),
+            outbound: "direct".into(),
+            assets: vec![ProtoAsset { url: "u1".into(), file: "f1".into() }],
+        };
         let c = GeodataConfig::from_proto(&p);
         assert_eq!(c.cron, "0 0 * * *");
         assert_eq!(c.outbound, "direct");

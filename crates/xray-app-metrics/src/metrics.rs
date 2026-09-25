@@ -115,8 +115,10 @@ pub trait ObservationCollector: Send + Sync {
 /// Metrics HTTP server 注入 trait。
 ///
 /// 对应 Go 版的 `expvar.Publish("stats", ...)` + `expvar.Publish("observatory", ...)`
-/// + `http.Serve(listener, http.DefaultServeMux)`。Rust 翻译把 HTTP server 实例
-/// 与 expvar handler 注册的具体机制留给上层实现（hyper/axum/tonic 等）。
+/// + `http.Serve(listener, http.DefaultServeMux)`。
+///
+/// Rust 翻译把 HTTP server 实例与 expvar handler 注册的具体机制留给上层实现
+/// （hyper/axum/tonic 等）。
 pub trait MetricsHttpServer: Send + Sync {
     /// 直接 listen TCP + http.Serve（对应 Go 版 `p.listen != ""` 分支）。
     fn start_http_listen(
@@ -257,9 +259,8 @@ impl MetricsHandler {
             )));
         }
 
-        outbound_registrar.add(outbound.clone()).map_err(|e| {
-            at_error(&e);
-            e
+        outbound_registrar.add(outbound.clone()).inspect_err(|e| {
+            at_error(e);
         })?;
 
         *self.outbound.lock() = Some(outbound);

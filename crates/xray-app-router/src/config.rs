@@ -8,10 +8,11 @@
 use xray_proto::xray::app::router::config::DomainStrategy as ProtoDomainStrategy;
 
 /// 域名解析策略。对应 Go `router.Config_DomainStrategy`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(i32)]
 pub enum DomainStrategy {
     /// `AsIs = 0`：不解析，按规则原样匹配。
+    #[default]
     AsIs = 0,
     /// `IpIfNonMatch = 2`：仅当当前规则不匹配时才解析。
     IpIfNonMatch = 2,
@@ -56,12 +57,6 @@ impl DomainStrategy {
 impl From<ProtoDomainStrategy> for DomainStrategy {
     fn from(p: ProtoDomainStrategy) -> Self {
         Self::from_proto(p)
-    }
-}
-
-impl Default for DomainStrategy {
-    fn default() -> Self {
-        Self::AsIs
     }
 }
 

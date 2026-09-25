@@ -373,9 +373,13 @@ impl HandlerCreator for ConsoleHandlerCreator {
 pub struct FileHandler {
     path: String,
     format: LogFormat,
+    // inner 及其字段仅在 unix 分支的 handle() 中读写；Windows 分支走
+    // per-write open，不经过该状态，故非 unix 平台下 allow dead_code。
+    #[cfg_attr(not(unix), allow(dead_code))]
     inner: Mutex<FileHandleState>,
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 struct FileHandleState {
     file: Option<File>,
     open_inode: u64,
@@ -698,9 +702,8 @@ impl LogInstance {
     /// 重启：close + start。
     pub fn restart(&self, registry: &HandlerCreatorRegistry) -> Result<(), LogError> {
         self.close();
-        self.start(registry).map_err(|e| {
-            at_error(&e);
-            e
+        self.start(registry).inspect_err(|e| {
+            at_error(e);
         })
     }
 }
@@ -1138,8 +1141,7 @@ mod tests {
         let r = HandlerCreatorRegistry::new();
         r.register(LogType::Console, Arc::new(FixedCreator { handler: h })).unwrap();
 
-        let mut cfg = LogConfig::default();
-        cfg.access_log_type = LogType::Console;
+        let cfg = LogConfig { access_log_type: LogType::Console, ..LogConfig::default() };
         let inst = LogInstance::new(cfg).unwrap();
         inst.start(&r).unwrap();
 
@@ -1158,9 +1160,11 @@ mod tests {
         let r = HandlerCreatorRegistry::new();
         r.register(LogType::Console, Arc::new(FixedCreator { handler: h })).unwrap();
 
-        let mut cfg = LogConfig::default();
-        cfg.access_log_type = LogType::Console;
-        cfg.enable_dns_log = false;
+        let cfg = LogConfig {
+            access_log_type: LogType::Console,
+            enable_dns_log: false,
+            ..LogConfig::default()
+        };
         let inst = LogInstance::new(cfg).unwrap();
         inst.start(&r).unwrap();
         inst.handle(&LogEntry::Dns(DnsLog { query: "q".into(), ..Default::default() }));
@@ -1174,9 +1178,11 @@ mod tests {
         let r = HandlerCreatorRegistry::new();
         r.register(LogType::Console, Arc::new(FixedCreator { handler: h })).unwrap();
 
-        let mut cfg = LogConfig::default();
-        cfg.access_log_type = LogType::Console;
-        cfg.enable_dns_log = true;
+        let cfg = LogConfig {
+            access_log_type: LogType::Console,
+            enable_dns_log: true,
+            ..LogConfig::default()
+        };
         let inst = LogInstance::new(cfg).unwrap();
         inst.start(&r).unwrap();
         inst.handle(&LogEntry::Dns(DnsLog { query: "Q".into(), ..Default::default() }));
@@ -1190,9 +1196,11 @@ mod tests {
         let r = HandlerCreatorRegistry::new();
         r.register(LogType::Console, Arc::new(FixedCreator { handler: h })).unwrap();
 
-        let mut cfg = LogConfig::default();
-        cfg.error_log_type = LogType::Console;
-        cfg.error_log_level = SeverityLevel::Error; // 只记 Error
+        let cfg = LogConfig {
+            error_log_type: LogType::Console,
+            error_log_level: SeverityLevel::Error, // 只记 Error
+            ..LogConfig::default()
+        };
         let inst = LogInstance::new(cfg).unwrap();
         inst.start(&r).unwrap();
 
@@ -1210,9 +1218,11 @@ mod tests {
         let r = HandlerCreatorRegistry::new();
         r.register(LogType::Console, Arc::new(FixedCreator { handler: h })).unwrap();
 
-        let mut cfg = LogConfig::default();
-        cfg.error_log_type = LogType::Console;
-        cfg.error_log_level = SeverityLevel::Warning;
+        let cfg = LogConfig {
+            error_log_type: LogType::Console,
+            error_log_level: SeverityLevel::Warning,
+            ..LogConfig::default()
+        };
         let inst = LogInstance::new(cfg).unwrap();
         inst.start(&r).unwrap();
 
@@ -1266,16 +1276,17 @@ mod tests {
 
     #[test]
     fn instance_new_invalid_mask_returns_err() {
-        let mut cfg = LogConfig::default();
-        cfg.mask_address = "7+64".into(); // ipv4 mask 不整除 8
+        let cfg = LogConfig {
+            mask_address: "7+64".into(), // ipv4 mask 不整除 8
+            ..LogConfig::default()
+        };
         let r = LogInstance::new(cfg);
         assert!(r.is_err());
     }
 
     #[test]
     fn instance_mask_getters_expose_parsed() {
-        let mut cfg = LogConfig::default();
-        cfg.mask_address = "half".into();
+        let cfg = LogConfig { mask_address: "half".into(), ..LogConfig::default() };
         let inst = LogInstance::new(cfg).unwrap();
         assert_eq!(inst.mask4(), 16);
         assert_eq!(inst.mask6(), 32);

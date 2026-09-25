@@ -236,13 +236,8 @@ mod tests {
         let echo_addr = echo.local_addr().unwrap();
         tokio::spawn(async move {
             let mut buf = vec![0u8; RECV_BUF];
-            loop {
-                match echo.recv_from(&mut buf).await {
-                    Ok((n, peer)) => {
-                        let _ = echo.send_to(&buf[..n], peer).await;
-                    },
-                    Err(_) => break,
-                }
+            while let Ok((n, peer)) = echo.recv_from(&mut buf).await {
+                let _ = echo.send_to(&buf[..n], peer).await;
             }
         });
 

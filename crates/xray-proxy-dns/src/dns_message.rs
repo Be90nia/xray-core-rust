@@ -219,8 +219,7 @@ pub fn build_ip_response(
     let flags = 0x8000 // QR=1 (response)
         | (query_header.flags & 0x0100) // 回显 RD
         | 0x0400 // AA=1 (authoritative answer)
-        | 0x0080 // RA=1 (recursion available)
-        | 0; // RCODE=0 (NOERROR)
+        | 0x0080; // RA=1 (recursion available)；RCODE=0 (NOERROR)
     buf.extend_from_slice(&query_header.id.to_be_bytes());
     buf.extend_from_slice(&flags.to_be_bytes());
     buf.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1

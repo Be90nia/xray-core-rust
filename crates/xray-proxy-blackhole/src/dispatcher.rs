@@ -100,11 +100,10 @@ impl DispatchHandler for BlackholeHandler {
             drop(writer);
 
             // 2. drain reader（Go Process 里 buf.Copy(link.Reader, buf.Discard)）
-            loop {
-                match tokio::time::timeout(drain_timeout, reader.read_multi_buffer()).await {
-                    Ok(Ok(_)) => {}, // drain 一帧
-                    Ok(Err(_)) | Err(_) => break,
-                }
+            while let Ok(Ok(_)) =
+                tokio::time::timeout(drain_timeout, reader.read_multi_buffer()).await
+            {
+                // drain 一帧
             }
         })
     }

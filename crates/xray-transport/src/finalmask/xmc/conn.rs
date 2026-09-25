@@ -324,8 +324,9 @@ pub(super) async fn tcp_bridge(
         // Rust 暂未实现 Login Acknowledged packet——此处 first_turn_prefix_length
         // 传 0（对应 Go `loginAcknowledgedLength`）。Go v26.7.28 的 Login Ack 在
         // 26.7.x 系列还会跟随 padding 一并完善，本次同步只覆盖 padding 调度部分。
-        if let Err(_) =
-            super::padding::run_padding_schedule(&mut r, &mut w, is_client, 0, &schedule).await
+        if super::padding::run_padding_schedule(&mut r, &mut w, is_client, 0, &schedule)
+            .await
+            .is_err()
         {
             return;
         }

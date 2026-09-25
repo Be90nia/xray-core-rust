@@ -210,11 +210,6 @@ fn get_greased_ch_ua(major_version: i64, fork_name: &str) -> String {
     shuffled.join(", ")
 }
 
-/// 浏览器 UA 生成结果（对齐 Go var 块的每请求随机版本）。
-struct BrowserUA {
-    user_agent: &'static str,
-}
-
 /// 按浏览器名生成动态版本 UA（H8：grpc 与 ws/xhttp 共享同一实现，
 /// 避免同进程 UA 版本自相矛盾）。
 pub fn build_user_agent(browser: &str) -> String {
@@ -300,10 +295,10 @@ pub fn apply_masqueraded_headers(
     // Context-specific（variant）。nav：浏览器导航场景（Go browser.go nav case，
     // http CONNECT 出站在用）；fetch：splithttp/xhttp 场景；ws：WebSocket 握手。
     if variant == "nav" {
-        if get_header(headers, "Cache-Control").is_none() {
-            if browser == "chrome" || browser == "edge" {
-                set_header(headers, "Cache-Control", "max-age=0");
-            }
+        if get_header(headers, "Cache-Control").is_none()
+            && (browser == "chrome" || browser == "edge")
+        {
+            set_header(headers, "Cache-Control", "max-age=0");
         }
         set_header(headers, "Upgrade-Insecure-Requests", "1");
         if get_header(headers, "Accept").is_none() {

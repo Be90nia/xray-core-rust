@@ -3,12 +3,7 @@
 //! Implements AuthenticationReader from Go's common/crypto/auth.go,
 //! providing AEAD-based authenticated decryption reading.
 
-use xray_buf::{
-    buffer::Buffer,
-    io::{self, Reader},
-    multi::MultiBuffer,
-    reader::BufferedReader,
-};
+use xray_buf::{buffer::Buffer, io, multi::MultiBuffer, reader::BufferedReader};
 use xray_common::protocol::TransferType;
 
 use crate::{
@@ -262,11 +257,13 @@ impl<'a> AuthenticationReader<'a> {
 mod tests {
     use std::{future::Future, pin::Pin};
 
+    use xray_buf::io::Reader;
+
     use super::*;
     use crate::{
         aead::Aes128Gcm,
         authenticator::{AEADAuthenticator, generate_aead_nonce_with_size},
-        chunk::{NoPadding, PlainChunkSizeParser, ShufflePadding},
+        chunk::{NoPadding, PlainChunkSizeParser},
     };
 
     fn make_auth_pair() -> (Box<dyn Authenticator>, Box<dyn Authenticator>) {

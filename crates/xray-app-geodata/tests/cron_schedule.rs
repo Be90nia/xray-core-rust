@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use xray_app_geodata::{CronScheduler, instance::Scheduler};
+use xray_app_geodata::CronScheduler;
 
 #[test]
 fn cron_parses_star_form() {

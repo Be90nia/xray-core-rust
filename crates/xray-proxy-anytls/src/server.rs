@@ -126,7 +126,7 @@ async fn handle_conn(
     // 本地标记（不关 TLS socket、不唤醒阻塞在 TLS read 的 recv_loop）——没有它
     // 会话 fd 永不释放（s9 压测 fd +5222/min 根因）。持有 dup 句柄，会话流结束
     // 时 shutdown 双向，驱动本端 recv_loop 退出、Arc<Session> 全量 drop、fd 关闭。
-    let mut tcp_std = match tcp.into_std() {
+    let tcp_std = match tcp.into_std() {
         Ok(s) => s,
         Err(e) => {
             debug!("anytls mock server: tcp into_std failed: {e}");

@@ -305,7 +305,6 @@ pub fn wrap_conn_client_from_settings(
 /// write 把 buffer 发到记录的 `remote_addr`。
 ///
 /// 若 `udpio` 来自空 manager（`udpmasks` 为空），原样适配（无 mask）——无 mask 行为不变。
-#[must_use]
 pub fn wrap_packet_conn_client_into_connection(
     udpio: Box<dyn UdpIo>,
     remote_addr: SocketAddr,
@@ -317,7 +316,6 @@ pub fn wrap_packet_conn_client_into_connection(
 ///
 /// `remote_addr` 在 server 方向语义弱（UDP 不记录 peer，但传入供 caller 记录上下文）。
 /// 默认返回 `Ok(None)`，因 server 真正 peer 来自下一次 recv。
-#[must_use]
 pub fn wrap_packet_conn_server_into_connection(
     udpio: Box<dyn UdpIo>,
     _remote_hint: SocketAddr,
@@ -442,23 +440,18 @@ impl PacketIoConn {
         let dropped_driver = Arc::clone(&dropped);
         let driver = tokio::spawn(async move {
             let mut buf = vec![0u8; UDP_SIZE];
-            loop {
-                match driver_inner.recv_from(&mut buf).await {
-                    Ok((n, _src)) => {
-                        // 有界队列：读端消费不过来时丢新包（UDP 语义），计数可观测
-                        match pkt_tx.try_send(buf[..n].to_vec()) {
-                            Ok(()) => {},
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                let total = dropped_driver.fetch_add(1, Ordering::Relaxed) + 1;
-                                tracing::debug!(
-                                    dropped = total,
-                                    "PacketIoConn recv queue full, packet dropped"
-                                );
-                            },
-                            Err(mpsc::error::TrySendError::Closed(_)) => break, // 读端已 drop
-                        }
+            while let Ok((n, _src)) = driver_inner.recv_from(&mut buf).await {
+                // 有界队列：读端消费不过来时丢新包（UDP 语义），计数可观测
+                match pkt_tx.try_send(buf[..n].to_vec()) {
+                    Ok(()) => {},
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        let total = dropped_driver.fetch_add(1, Ordering::Relaxed) + 1;
+                        tracing::debug!(
+                            dropped = total,
+                            "PacketIoConn recv queue full, packet dropped"
+                        );
                     },
-                    Err(_) => break,
+                    Err(mpsc::error::TrySendError::Closed(_)) => break, // 读端已 drop
                 }
             }
         });
@@ -611,7 +604,7 @@ impl SecurityMode {
     pub fn from_name(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
             "original" | "none" | "zero" => Some(Self::Original),
-            "aes-128-gcm" | "aes128gcm" | "aes-128-gcm" => Some(Self::Aes128Gcm),
+            "aes-128-gcm" | "aes128gcm" => Some(Self::Aes128Gcm),
             "salamander" => Some(Self::Salamander),
             _ => None,
         }
@@ -896,7 +889,7 @@ fn parse_range_string(s: &str) -> io::Result<(i64, i64)> {
 
 /// Go `RandRange`：缺省 `{0,255}`；越界（越出 0..=255）报错（对齐 Go Build 校验）。
 fn json_rand_range(v: &serde_json::Value) -> io::Result<(i64, i64)> {
-    let (from, to) = if v.get("randRange").map_or(true, |x| x.is_null()) {
+    let (from, to) = if v.get("randRange").is_none_or(|x| x.is_null()) {
         (0, 255)
     } else {
         json_range(v, "randRange")?
@@ -990,7 +983,7 @@ fn parse_expr_arg(v: &serde_json::Value) -> io::Result<custom::ExprArg> {
         Some(_) => true,
         None => false,
     };
-    let has_u64 = v.get("u64").map_or(false, |x| !x.is_null());
+    let has_u64 = v.get("u64").is_some_and(|x| !x.is_null());
     let reuse = json_str(v, "reuse");
     let metadata = json_str(v, "metadata");
     let transform = v.get("transform").filter(|x| !x.is_null());
@@ -1175,7 +1168,7 @@ fn build_sudoku_config(settings: &serde_json::Value) -> sudoku::SudokuConfig {
 
 /// Go `Xdns.Build` → `xdns::Config`（`domain` 已废弃；domains=server / resolvers=client）。
 fn build_xdns_config(settings: &serde_json::Value) -> io::Result<xdns::Config> {
-    if settings.get("domain").map_or(false, |x| !x.is_null()) {
+    if settings.get("domain").is_some_and(|x| !x.is_null()) {
         return Err(mask_err(
             "xdns: `domain` was removed; use domains(server) & resolvers(client)",
         ));
@@ -1672,7 +1665,7 @@ mod tests {
 
     #[test]
     fn parse_chain_all_header_kinds() {
-        for (name, id) in [("dtls", 1), ("srtp", 2), ("utp", 3), ("wechat", 4), ("wireguard", 5)] {
+        for (name, _id) in [("dtls", 1), ("srtp", 2), ("utp", 3), ("wechat", 4), ("wireguard", 5)] {
             let chain = parse_finalmask_udp_chain(Some(&fm(&format!(
                 r#"{{"udp":[{{"type":"mkcp-legacy","settings":{{"header":"{name}"}}}}]}}"#
             ))))

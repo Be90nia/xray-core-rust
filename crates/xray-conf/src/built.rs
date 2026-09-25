@@ -298,7 +298,7 @@ impl Config {
 ///
 /// 对应 Go `infra/conf/xray.go:257-282`：`strings.ToLower` switch 的 11 个合法值
 /// + 空串（等价 AsIs），其余 Build 硬报错。枚举转换在消费端完成（见
-/// `xray_core::outbound::parse_target_strategy`）。
+///   `xray_core::outbound::parse_target_strategy`）。
 fn is_valid_target_strategy(s: &str) -> bool {
     matches!(
         s.to_lowercase().as_str(),

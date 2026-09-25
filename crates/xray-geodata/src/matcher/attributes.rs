@@ -231,7 +231,7 @@ pub fn parse_attrs(attrs: &str) -> Option<AllAttrsMatcher> {
     }
 
     let matchers: Vec<HasAttrMatcher> =
-        attrs.split('@').filter(|s| !s.is_empty()).map(|s| HasAttrMatcher::new(s)).collect();
+        attrs.split('@').filter(|s| !s.is_empty()).map(HasAttrMatcher::new).collect();
 
     if matchers.is_empty() {
         return None;

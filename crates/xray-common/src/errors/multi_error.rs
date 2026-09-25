@@ -79,13 +79,13 @@ mod tests {
 
     #[test]
     fn combine_single_error_keeps_prefix() {
-        let combined = combine([Some(Error::new("only"))].into_iter()).expect("non-empty");
+        let combined = combine([Some(Error::new("only"))]).expect("non-empty");
         assert_eq!(combined.to_string(), "multierr: only | ");
     }
 
     #[test]
     fn combine_is_std_error() {
-        let combined = combine([Some(Error::new("x"))].into_iter()).unwrap();
+        let combined = combine([Some(Error::new("x"))]).unwrap();
         let dyn_err: &(dyn std::error::Error + 'static) = &combined;
         assert_eq!(dyn_err.to_string(), "multierr: x | ");
     }

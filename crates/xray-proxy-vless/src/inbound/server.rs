@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
 };
 use xray_app_dispatcher::{OutboundHandlerManager, default::SimpleOhm};
 use xray_buf::io::{new_reader, new_writer};

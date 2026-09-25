@@ -716,7 +716,7 @@ mod tests {
     #[test]
     fn compression_pointer_loop_detected() {
         // 构造一个无限循环的压缩指针：0xc0 0x00 指向自己
-        let buf = vec![0xc0, 0x00];
+        let buf = [0xc0, 0x00];
         let mut cursor = io::Cursor::new(&buf[..]);
         let result = read_name(&mut cursor);
         // 应该在第 11 个指针时报错（COMPRESSION_POINTER_LIMIT=10）

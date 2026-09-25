@@ -69,7 +69,7 @@ impl Rule {
     ///
     /// 对应 Go `Rule.Apply`。
     pub fn apply(&self, ctx: &dyn crate::context::RoutingContext) -> Option<String> {
-        let hit = self.condition.as_ref().map_or(true, |c| c.apply(ctx));
+        let hit = self.condition.as_ref().is_none_or(|c| c.apply(ctx));
         if !hit {
             return None;
         }
@@ -286,9 +286,9 @@ fn parse_proto_domain_rules(
                         geosite_rule.file, geosite_rule.code
                     )));
                 };
-                match load_geosite_to_matcher_rules(geosite_rule, loader) {
-                    Ok(rules) => out.extend(rules),
-                    Err(e) => return Err(e),
+                {
+                    let rules = load_geosite_to_matcher_rules(geosite_rule, loader)?;
+                    out.extend(rules)
                 }
             },
         }
@@ -434,8 +434,8 @@ mod tests {
 
     #[test]
     fn test_build_condition_domain_matcher() {
-        let mut proto = RoutingRule::default();
-        proto.domain = vec![full_domain("example.com")];
+        let proto =
+            RoutingRule { domain: vec![full_domain("example.com")], ..RoutingRule::default() };
         let _ = build_condition(&proto, None).unwrap();
         let cond = build_condition(&proto, None).unwrap();
         let hit = RoutingData::new().with_target_domain("example.com");
@@ -446,8 +446,7 @@ mod tests {
 
     #[test]
     fn test_build_condition_inbound_tag() {
-        let mut proto = RoutingRule::default();
-        proto.inbound_tag = vec!["in1".into()];
+        let proto = RoutingRule { inbound_tag: vec!["in1".into()], ..RoutingRule::default() };
         let cond = build_condition(&proto, None).unwrap();
         let hit = RoutingData::new().with_inbound_tag("in1");
         let miss = RoutingData::new().with_inbound_tag("in2");

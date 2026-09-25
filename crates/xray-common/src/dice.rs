@@ -164,8 +164,8 @@ mod tests {
     fn test_roll_uint16_range() {
         let mut dice = DeterministicDice::with_seed(456);
         for _ in 0..100 {
-            let val = dice.roll_uint16();
-            assert!(val <= u16::MAX);
+            // 返回值恒为 u16（<= u16::MAX 恒真），仅验证可调用。
+            let _: u16 = dice.roll_uint16();
         }
     }
 
@@ -239,8 +239,8 @@ mod tests {
     #[test]
     fn test_free_roll_uint16_range() {
         for _ in 0..200 {
-            let v = roll_uint16();
-            assert!(v <= u16::MAX);
+            // 返回值恒为 u16（<= u16::MAX 恒真），仅验证可调用。
+            let _: u16 = roll_uint16();
         }
     }
 

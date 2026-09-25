@@ -71,8 +71,7 @@ mod tests {
 
     #[test]
     fn config_from_proto_none_settings() {
-        let mut proto = ProtoConfig::default();
-        proto.settings = None;
+        let proto = ProtoConfig { settings: None };
         let cfg = Config::from_proto(&proto);
         assert_eq!(cfg.settings, SessionConfig::default());
     }

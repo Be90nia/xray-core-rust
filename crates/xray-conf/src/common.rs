@@ -476,7 +476,7 @@ impl<'de> Deserialize<'de> for NetworkList {
 
         match Raw::deserialize(d)? {
             Raw::Single(s) => {
-                let items = s.split(',').filter_map(|p| parse_one(p)).collect();
+                let items = s.split(',').filter_map(parse_one).collect();
                 Ok(NetworkList(items))
             },
             Raw::Multi(v) => {

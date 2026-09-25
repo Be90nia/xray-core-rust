@@ -463,6 +463,7 @@ impl AeadCipher for Aes256Gcm {
 /// assert_eq!(plaintext.as_slice(), ciphertext.as_slice());
 /// # Ok::<(), CryptoError>(())
 /// ```
+#[allow(clippy::large_enum_variant)]
 pub enum AesCfbEncryptor {
     /// AES-128-CFB encryptor.
     Aes128(CfbEncryptor<Aes128>),
@@ -529,6 +530,7 @@ impl AesCfbEncryptor {
 /// assert_eq!(plaintext.as_slice(), ciphertext.as_slice());
 /// # Ok::<(), CryptoError>(())
 /// ```
+#[allow(clippy::large_enum_variant)]
 pub enum AesCfbDecryptor {
     /// AES-128-CFB decryptor.
     Aes128(CfbDecryptor<Aes128>),
@@ -603,6 +605,7 @@ impl AesCfbDecryptor {
 /// assert_eq!(plaintext.as_slice(), data.as_slice());
 /// # Ok::<(), CryptoError>(())
 /// ```
+#[allow(clippy::large_enum_variant)]
 pub enum AesCtrStream {
     /// AES-128-CTR stream cipher.
     Aes128(Ctr128BE<Aes128>),
@@ -752,7 +755,7 @@ impl ChaCha20Stream {
     /// Applies XOR keystream from `src` to `dst`.
     ///
     /// When `dst` and `src` point to the same buffer, this is
-    /// equivalent to [`xor_key_stream`].
+    /// equivalent to `xor_key_stream`.
     ///
     /// # Errors
     ///

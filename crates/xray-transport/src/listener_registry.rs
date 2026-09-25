@@ -139,7 +139,7 @@ mod tests {
     fn register_and_get_transport_listener() {
         let listen_fn: TransportListenFn = Arc::new(
             |_addr: SocketAddr, _s: StreamSettings, _so: SocketOptions, _h: ConnHandler| {
-                Box::pin(async { Err(io::Error::new(io::ErrorKind::Other, "test")) })
+                Box::pin(async { Err(io::Error::other("test")) })
             },
         );
         let _ = register_transport_listener("test-listener-protocol", listen_fn.clone());

@@ -546,7 +546,7 @@ mod tests {
         for _ in 0..100 {
             let pad = conn.random_pad_len(10);
             let total = SM_SALT_LEN + GECKO_HEADER_SIZE + pad + 10;
-            assert!(total >= 100 && total <= 200, "total={total}, pad={pad}");
+            assert!((100..=200).contains(&total), "total={total}, pad={pad}");
         }
     }
 
@@ -579,11 +579,11 @@ mod tests {
         }
 
         async fn recv_from(&self, _: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-            Err(io::Error::new(io::ErrorKind::Other, "mock"))
+            Err(io::Error::other("mock"))
         }
 
         fn local_addr(&self) -> io::Result<SocketAddr> {
-            Err(io::Error::new(io::ErrorKind::Other, "mock"))
+            Err(io::Error::other("mock"))
         }
     }
 

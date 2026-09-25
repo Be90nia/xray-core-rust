@@ -234,7 +234,7 @@ fn file_or_inline(
 /// version 模式识别 Pkcs8/Pkcs1/Sec1）重新定形；内容无法识别时保留原标签结果，
 /// 正确标签路径行为不变。
 pub(crate) fn pem_private_key(pem: &[u8]) -> io::Result<Option<PrivateKeyDer<'static>>> {
-    let key = rustls_pemfile::private_key(&mut pem.as_ref())
+    let key = rustls_pemfile::private_key(&mut &pem[..])
         .map_err(|e| io::Error::other(format!("parse key PEM: {e}")))?;
     Ok(key.map(|k| PrivateKeyDer::try_from(k.secret_der().to_vec()).unwrap_or(k)))
 }
@@ -339,8 +339,8 @@ mod tests {
     // ---- 私钥解析：错标 PEM 按 DER 内容重定形（对齐 Go X509KeyPair）----
 
     /// Go `tls cert` v26.7.28 的实际产出（D:/tmp/interop_key.pem）：RSA PEM 标签
-    /// + PKCS#8 包装的 EC P-256 内容（DER 以 30 81 87 02 01 00 30 开头——Go 侧
-    /// X509KeyPair 不看标签照样能用）。
+    /// + PKCS#8 包装的 EC P-256 内容（DER 以 30 81 87 02 01 00 30 开头——Go 侧 X509KeyPair
+    ///   不看标签照样能用）。
     const MISLABELED_EC_KEY_PEM: &str = "\
 -----BEGIN RSA PRIVATE KEY-----
 MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg6sUhV38mcGUNG/uc

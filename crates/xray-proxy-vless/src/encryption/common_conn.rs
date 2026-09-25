@@ -18,7 +18,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::{
     encryption::{
-        aead::{Aead, MAX_NONCE, NONCE_LEN, TAG_LEN},
+        aead::{Aead, TAG_LEN},
         common::{
             TLS_PAYLOAD_MAX, TLS_RECORD_HEADER_LEN, decode_tls_record_header,
             write_tls_record_header,

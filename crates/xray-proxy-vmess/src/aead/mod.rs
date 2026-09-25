@@ -68,7 +68,6 @@ pub mod consts {
 /// L2(s1,s2,data) = L1(s1, s2⊕opad || L1(s1, s2⊕ipad || data))
 /// L3(s1,s2,s3,data) = L2(s1,s2, s3⊕opad || L2(s1,s2, s3⊕ipad || data))
 /// ```
-
 const HMAC_BLOCK_LEN: usize = 64;
 
 /// L0: 基础哈希 = HMAC-SHA256(key="VMess AEAD KDF")

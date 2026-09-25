@@ -1184,7 +1184,7 @@ mod tests {
             })),
             "fake.sni",
         );
-        let err = cfg.err().expect("invalid pin hex must error");
+        let err = cfg.expect_err("invalid pin hex must error");
         assert!(err.to_string().contains("pinnedPeerCertSha256"));
     }
 

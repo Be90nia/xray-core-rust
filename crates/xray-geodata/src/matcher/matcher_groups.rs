@@ -331,7 +331,7 @@ impl ACMatcherGroup {
 
         if ac_patterns.is_empty() {
             self.ac = Some(
-                AhoCorasick::new(&[""])
+                AhoCorasick::new([""])
                     .map_err(|e| ACMatcherGroupError::BuildFailed(e.to_string()))?,
             );
             return Ok(());

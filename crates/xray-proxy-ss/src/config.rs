@@ -210,7 +210,8 @@ impl Cipher {
         if buf.len() < iv_len {
             return Err(SsError::InsufficientData(buf.len()));
         }
-        if let Self::Aead(_) = self {
+        // 当前枚举仅 Aead 变体（if let 恒匹配，clippy single 化为直接执行）。
+        {
             let iv: Vec<u8> = buf[..iv_len].to_vec();
             let aead = self.create_aead(key, &iv)?.expect("aead for Aead variant");
             let plaintext: Vec<u8> = buf[iv_len..].to_vec();

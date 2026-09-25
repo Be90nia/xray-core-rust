@@ -17,11 +17,11 @@
 //! 密码学算法（ECDH/HKDF/AES-GCM/HMAC）在 `xray-reality::crypto` 实现，
 //! 通过 [`RealityHooks`] 注入；本模块只负责时序编排与 SSL 材料导出
 //! （[`x25519_key_share_private`]，BoringSSL patch `SSL_get_x25519_key_share_private`）。
-/// BoringSSL patch 缺失函数 stub（bindings.rs 没生成）。
-///
-/// btls-sys 0.5.6 的 bindings.rs bindgen 没暴露 REALITY 协议所需的两个
-/// BoringSSL patch 函数,这里手动声明 extern "C",让 xray-reality 编译通过。
-/// 调用时通过 BoringSSL 已编译好的 ssl.lib/crypto.lib 链接,符号真实存在。
+// BoringSSL patch 缺失函数 stub（bindings.rs 没生成）。
+//
+// btls-sys 0.5.6 的 bindings.rs bindgen 没暴露 REALITY 协议所需的两个
+// BoringSSL patch 函数,这里手动声明 extern "C",让 xray-reality 编译通过。
+// 调用时通过 BoringSSL 已编译好的 ssl.lib/crypto.lib 链接,符号真实存在。
 unsafe extern "C" {
     fn SSL_get_x25519_key_share_private(ssl: *mut btls_sys::SSL, out: *mut u8) -> i32;
     fn SSL_set_reality_rewrite_cb(
@@ -75,7 +75,7 @@ pub trait RealityHooks: Send + Sync {
     /// 调用（SSL_set_reality_rewrite_cb 全局回调）。`msg` = 完整 handshake
     /// message（type(1)+len(3)+body，无 record 头）。BIO 层改写会让 transcript
     /// 与线上 bytes 不一致 → 握手密钥全部错乱（BAD_DECRYPT），必须在此改写。
-    fn rewrite_client_hello_msg(&self, ssl_ptr: RealitySslPtr, msg: &mut [u8]) -> io::Result<()> {
+    fn rewrite_client_hello_msg(&self, _ssl_ptr: RealitySslPtr, _msg: &mut [u8]) -> io::Result<()> {
         Err(io::Error::other("REALITY: rewrite_client_hello_msg not implemented"))
     }
 
@@ -101,6 +101,10 @@ pub trait RealityHooks: Send + Sync {
 ///
 /// transcript 回调窗口内使用；无 X25519 key share 时返回 None。
 #[must_use]
+// FFI 薄封装：指针有效性契约（握手窗口内由 TokioSslStream 持有）依赖调用
+// 时序，静态检查不可达；改 unsafe fn 会连带破坏全部调用点签名。SAFETY 论证
+// 见函数体内 unsafe 块注释。
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn x25519_key_share_private_raw(ssl: *mut btls_sys::SSL) -> Option<[u8; 32]> {
     let mut out = [0u8; 32];
     // SAFETY: ssl 指针在握手窗口内由 TokioSslStream 持有；out 是 32 字节缓冲。
@@ -126,6 +130,9 @@ pub fn x25519_key_share_private_raw(ssl: *mut btls_sys::SSL) -> Option<[u8; 32]>
 /// iOS 门控：btls-sys 在 aarch64-apple-ios 走预生成 bindings（不含注入声明，
 /// 见 Mobile Gates d0348c0 失败）；iOS 构建亦无注入源码树，原语不存在，
 /// 门控零功能损失（当前无任何调用方）。
+// FFI 薄封装：指针契约由调用方保证（函数体内已做 null 检查 + SAFETY 注释），
+// 改 unsafe fn 属签名变更，保持原语形态。
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[cfg(not(target_os = "ios"))]
 pub fn send_post_handshake_record(
     ssl: *mut btls_sys::SSL,
@@ -161,6 +168,8 @@ pub fn send_post_handshake_record(
 /// 客户端 TLS1.3 剥尾语义解出 type=appData + 空载荷，被空记录重试路径吞掉。
 ///
 /// iOS 门控同 [`send_post_handshake_record`]（预生成 bindings 无此符号）。
+// FFI 薄封装：指针契约由调用方保证（函数体内已做 null/长度检查 + SAFETY 注释）。
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[cfg(not(target_os = "ios"))]
 pub fn seal_post_handshake_raw_record(
     ssl: *mut btls_sys::SSL,

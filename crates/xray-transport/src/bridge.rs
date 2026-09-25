@@ -885,10 +885,7 @@ mod tests {
     async fn bridge_link_uplink_only() {
         // 最小上行测试：pipe.Writer 写 → bridge up reader 读 → duplex server 端收
         use tokio::io::AsyncReadExt;
-        use xray_buf::{
-            io::{Reader, Writer},
-            multi::MultiBuffer,
-        };
+        use xray_buf::{io::Writer, multi::MultiBuffer};
 
         use crate::link::Link;
 
@@ -917,7 +914,6 @@ mod tests {
     async fn bridge_link_downlink_only() {
         // 最小下行测试：duplex server 端写 → bridge down reader 读 → pipe.Reader 收
         use tokio::io::AsyncWriteExt;
-        use xray_buf::io::{Reader, Writer};
 
         use crate::link::Link;
 
@@ -944,10 +940,7 @@ mod tests {
 
     #[tokio::test]
     async fn bridge_stream_full_halfclose_linger_then_close() {
-        use xray_buf::{
-            io::{Reader, Writer},
-            multi::MultiBuffer,
-        };
+        use xray_buf::{io::Writer, multi::MultiBuffer};
 
         use crate::link::Link;
 
@@ -1122,10 +1115,7 @@ mod tests {
     /// 写 duplex 的锁步里永远读不到上游 EOF，dn_r 5s 内等不到关闭。
     #[tokio::test]
     async fn bridge_stream_full_uplink_survives_slow_remote() {
-        use xray_buf::{
-            io::{Reader, Writer},
-            multi::MultiBuffer,
-        };
+        use xray_buf::{io::Writer, multi::MultiBuffer};
 
         use crate::link::Link;
 
@@ -1149,7 +1139,7 @@ mod tests {
 
         // 上游 EOF 传播 + half-close 窗口耗尽 → bridge 收尾 → dn_r 关闭。
         let mut consumer = dn_r;
-        let res = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 match consumer.read_multi_buffer().await {
                     Ok(mb) if !mb.is_empty() => continue,
@@ -1159,7 +1149,6 @@ mod tests {
         })
         .await
         .expect("bridge must close dn_r after upstream EOF + window expiry (decoupled)");
-        drop(res);
         // 对端不读，up_writer 停在写背压——由 abort 收尾，非本测试断言对象。
         bridge.abort();
     }
@@ -1171,7 +1160,7 @@ mod tests {
     async fn bridge_stream_full_up_write_err_keeps_downlink() {
         use std::{pin::Pin, task::Poll};
 
-        use xray_buf::io::{Reader, Writer};
+        use xray_buf::io::Writer;
 
         use crate::link::Link;
 
@@ -1279,7 +1268,7 @@ mod tests {
         }
 
         let (up_r, mut up_w) = xray_buf::pipe::new();
-        let (dn_r, dn_w) = xray_buf::pipe::new();
+        let (dn_r, _dn_w) = xray_buf::pipe::new();
         let link = Link::new(Box::new(up_r), Box::new(ErrLinkWriter));
         let (mut peer, stream) = tokio::io::duplex(8192);
 

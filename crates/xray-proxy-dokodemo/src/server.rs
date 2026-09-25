@@ -18,10 +18,7 @@ use tokio::{net::TcpListener, sync::Mutex};
 use xray_common::net::{address::Address, destination::Destination, port::Port};
 use xray_features::inbound::{InboundError, InboundHandler};
 
-use crate::{
-    config::{Config, Network, PredefinedAddress},
-    error::Result,
-};
+use crate::config::{Config, Network, PredefinedAddress};
 
 /// Dokodemo-door 入站服务端。对应 Go `DokodemoDoor`。
 ///
@@ -31,12 +28,16 @@ pub struct DokodemoServer {
     /// Handler 唯一标识。
     tag: String,
     /// 配置（含 predefined address + port + allowed_networks）。
+    // 当前 accept 路径未消费 config（目标改由 dispatcher 注入）；保留字段
+    // 与 predefined/destination 构造方法族，待 transparent/redirect 接线票启用。
+    #[allow(dead_code)]
     config: Config,
     /// tokio 监听器。`None` 表示未启动或已关闭。
     listener: Arc<Mutex<Option<TcpListener>>>,
 }
 
 /// 将 [`PredefinedAddress`] 转为 [`Address`]。
+#[allow(dead_code)]
 fn predefined_to_address(addr: PredefinedAddress) -> Address {
     match addr {
         PredefinedAddress::Ip(ip) => match ip {
@@ -54,16 +55,9 @@ impl DokodemoServer {
         Self { tag: tag.into(), config, listener: Arc::new(Mutex::new(None)) }
     }
 
-    /// 构造目标 Destination。对应 Go `Process` 中 dest 构造逻辑。
-    ///
-    /// 优先级：
-    /// 1. `follow_redirect=true` + fd 有效 → 从 SO_ORIGINAL_DST 获取原始目的地
-    /// 2. `predefined_address` + `rewrite_port` + `port_map` 构造
-    ///
-    /// `local_port` 用于 `port_map` 查找（监听端口字符串），`None` 跳过映射。
-    /// `is_udp` 为 true 时返回 UDP 目标，否则 TCP。
-    ///
-    /// 返回 `None` 表示无法确定目标。
+    // build_destination 族与 is_network_allowed 属 Go Process 的 dest 构造
+    // 路径，当前 Rust accept 路径未接线（同 config 字段，待专项票）。
+    #[allow(dead_code)]
     fn build_destination_ex(
         &self,
         fd: Option<i32>,
@@ -126,16 +120,19 @@ impl DokodemoServer {
     }
 
     /// 构造 TCP 目标（兼容旧调用方）。等价于 `build_destination_ex(fd, None, false)`。
+    #[allow(dead_code)]
     fn build_destination(&self, fd: Option<i32>) -> Option<Destination> {
         self.build_destination_ex(fd, None, false)
     }
 
     /// 构造 UDP 目标。用于 dokodemo UDP relay。
+    #[allow(dead_code)]
     fn build_udp_destination(&self, local_port: Option<u16>) -> Option<Destination> {
         self.build_destination_ex(None, local_port, true)
     }
 
     /// 网络类型是否被配置允许。
+    #[allow(dead_code)]
     fn is_network_allowed(&self, net: Network) -> bool {
         self.config.allows_network(net)
     }
@@ -193,9 +190,7 @@ impl InboundHandler for DokodemoServer {
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
 
-    use tokio::{io::AsyncReadExt, net::TcpStream};
     use xray_proto::xray::common::net::{
         IpOrDomain as ProtoIpOrDomain, ip_or_domain::Address as ProtoAddress,
     };

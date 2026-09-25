@@ -9,9 +9,8 @@
 
 use std::sync::Arc;
 
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf},
-    net::TcpListener,
+use tokio::io::{
+    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf,
 };
 use xray_app_dispatcher::{
     DispatchHandler, OutboundHandlerManager, UdpDispatchSession, default::SimpleOhm,

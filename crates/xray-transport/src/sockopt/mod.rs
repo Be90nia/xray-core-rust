@@ -44,6 +44,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 /// - `tcp_nodelay = true`（Chrome 默认）
 /// - `tcp_keepalive_idle = 45s`
 /// - `tcp_keepalive_interval = 45s`
+///
 /// sockopt 域名解析策略。对应 Go `transport/internet.DomainStrategy`
 /// （config.pb.go 枚举 + config.go:13-26 strategy 表）。
 ///
@@ -403,6 +404,7 @@ impl Default for SocketOptions {
 /// - FreeBSD：TFO / SO_REUSEPORT_LB→SO_REUSEPORT / SO_USER_COOKIE（mark）
 /// - Darwin：TFO_CLIENT 位 / SO_REUSEPORT / IP_BOUND_IF / IPV6_BOUND_IF / TCP_KEEPALIVE-KEEPINTVL
 /// - Windows：Winsock TCP_FASTOPEN=15 / IP_UNICAST_IF / IPV6_UNICAST_IF
+///
 /// 把 [`SocketOptions`] 应用到已建立的 [`Socket`]（TCP 专用）。
 pub fn apply_outbound_socket_options(
     socket: &Socket,
@@ -962,8 +964,6 @@ pub fn resolve_interface_index(name: &str) -> std::io::Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddrV4};
-
     use tokio::net::TcpListener;
 
     use super::*;
@@ -1363,16 +1363,18 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let socket = socket2::Socket::from(stream.into_std().unwrap());
 
-        let mut opts = SocketOptions::default();
-        opts.tcp_nodelay = false; // 先关，custom int 应把它打开
-        opts.custom_sockopt.push(CustomSockopt {
-            network: "tcp".to_string(),
-            level: "6".to_string(), // IPPROTO_TCP
-            opt: "1".to_string(),   // TCP_NODELAY
-            value: "1".to_string(),
-            r#type: "int".to_string(),
-            ..Default::default()
-        });
+        let opts = SocketOptions {
+            tcp_nodelay: false, // 先关，custom int 应把它打开
+            custom_sockopt: vec![CustomSockopt {
+                network: "tcp".to_string(),
+                level: "6".to_string(), // IPPROTO_TCP
+                opt: "1".to_string(),   // TCP_NODELAY
+                value: "1".to_string(),
+                r#type: "int".to_string(),
+                ..Default::default()
+            }],
+            ..SocketOptions::default()
+        };
         apply_outbound_socket_options(&socket, &opts, None).unwrap();
         assert!(socket.nodelay().unwrap(), "customSockopt int 应已设置 TCP_NODELAY");
 
@@ -1391,8 +1393,7 @@ mod tests {
         });
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let socket = socket2::Socket::from(stream.into_std().unwrap());
-        let mut opts = SocketOptions::default();
-        opts.tcp_nodelay = false;
+        let mut opts = SocketOptions { tcp_nodelay: false, ..SocketOptions::default() };
 
         // system 不匹配当前 OS → 跳过，不报错、不生效。
         #[cfg(target_os = "windows")]

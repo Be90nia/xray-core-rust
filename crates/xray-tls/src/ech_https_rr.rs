@@ -96,8 +96,8 @@ pub fn extract_ech_and_ttl_from_dns_response(
 ///
 /// hickory-proto 0.26 的 `RecordDataDecodable`（`HTTPS::read_data`）是
 /// `pub(crate)`，crate 外无法反序列化 rdata——SvcParams 段（key u16 + len u16
-/// + value bytes）按 RFC 9460 手解，TargetName 复用 hickory 公开的
-/// `BinDecodable for Name`。ECH 的 SvcParamKey=5（IANA 注册表）。
+/// + value bytes）按 RFC 9460 手解，TargetName 复用 hickory 公开的 `BinDecodable for Name`。ECH 的
+///   SvcParamKey=5（IANA 注册表）。
 pub fn extract_ech_from_https_rdata(rdata: &[u8]) -> Result<Vec<u8>, TlsError> {
     use hickory_proto::{
         rr::Name,

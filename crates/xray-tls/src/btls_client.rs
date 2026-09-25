@@ -252,22 +252,6 @@ fn chrome_131_connector() -> io::Result<SslConnector> {
 // Chrome 120 指纹配置
 // ============================================================
 
-/// Chrome 120 cipher suites（与 Chrome 133 相同）。
-#[cfg(test)]
-const CHROME_120_CIPHER_LIST: &str = CHROME_133_CIPHER_LIST;
-
-/// Chrome 120 signature algorithms（与 Chrome 133 相同）。
-#[cfg(test)]
-const CHROME_120_SIGALGS: &str = CHROME_133_SIGALGS;
-
-/// Chrome 120 supported groups（无 PQ，MLKEM768 是 Chrome 131+ 特性）。
-#[cfg(test)]
-const CHROME_120_CURVES: &str = "X25519:P-256:P-384";
-
-/// Chrome 120 ALPN（与 Chrome 133 相同）。
-#[cfg(test)]
-const CHROME_120_ALPN: &[u8] = CHROME_133_ALPN;
-
 /// Chrome 120 key shares（仅 X25519，无 PQ）。
 const CHROME_120_KEY_SHARES: &[KeyShare] = &[KeyShare::X25519];
 
@@ -530,14 +514,6 @@ fn safari_26_3_connector() -> io::Result<SslConnector> {
 // ============================================================
 // iOS 18.4 指纹配置
 // ============================================================
-
-/// iOS 18.4 key shares（X25519 + P-256，与 Safari 不同）。
-#[cfg(test)]
-const IOS_18_4_KEY_SHARES: &[KeyShare] = &[KeyShare::X25519, KeyShare::P256];
-
-/// iOS 18.4 不使用 ALPS。
-#[cfg(test)]
-const IOS_18_4_ALPS: &[u8] = &[];
 
 // iOS 18.4 复用 Safari 26.3 的 connector（cipher/sigalgs/curves/ALPN/ext_perm 相同），
 // 仅 key shares 不同（双 key share: X25519 + P-256）。

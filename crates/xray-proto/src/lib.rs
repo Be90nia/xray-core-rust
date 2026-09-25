@@ -61,6 +61,9 @@ pub mod xray {
         pub mod metrics {
             include!(concat!(env!("OUT_DIR"), "/xray.app.metrics.rs"));
         }
+        // 生成代码 xray.app.policy.rs 内部再开 `pub mod policy`（prost 按Go 包
+        // 名嵌套），与外层模块同名——protobuf 布局如此，非手写失误。
+        #[allow(clippy::module_inception)]
         pub mod policy {
             include!(concat!(env!("OUT_DIR"), "/xray.app.policy.rs"));
         }

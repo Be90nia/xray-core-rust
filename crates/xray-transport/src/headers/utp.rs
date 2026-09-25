@@ -8,6 +8,8 @@ pub struct UtpConfig {
 }
 
 pub struct UtpHeader {
+    // 与 Go headers/utp 一致：config 仅为构造形态保留，encode 写死伪装字节。
+    #[allow(dead_code)]
     config: UtpConfig,
 }
 

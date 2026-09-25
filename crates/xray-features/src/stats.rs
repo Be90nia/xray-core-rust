@@ -367,6 +367,12 @@ pub struct DefaultStatsFeature {
     manager: NoopManager,
 }
 
+impl Default for DefaultStatsFeature {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DefaultStatsFeature {
     pub fn new() -> Self {
         Self { manager: NoopManager }
@@ -512,7 +518,7 @@ mod tests {
 
     #[test]
     fn noop_default_constructible() {
-        let _m = NoopManager::default();
+        let _m = NoopManager;
     }
 
     // ----- Error display -----

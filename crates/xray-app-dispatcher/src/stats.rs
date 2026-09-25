@@ -116,10 +116,7 @@ pub fn maybe_wrap_reader(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Mutex,
-        atomic::{AtomicI64, Ordering},
-    };
+    use std::sync::atomic::{AtomicI64, Ordering};
 
     use xray_buf::multi::MultiBuffer;
 
@@ -149,9 +146,7 @@ mod tests {
 
     /// 测试用 Writer，仅记录被调用的 MultiBuffer 长度
     #[derive(Debug, Default)]
-    struct CollectingWriter {
-        seen: Mutex<Vec<usize>>,
-    }
+    struct CollectingWriter;
 
     impl Writer for CollectingWriter {
         fn write_multi_buffer(
@@ -166,18 +161,6 @@ mod tests {
                 Ok(())
             })
         }
-    }
-
-    impl CollectingWriter {
-        fn seen_total(&self) -> i64 {
-            let g = self.seen.lock().unwrap();
-            g.iter().map(|&x| i64::try_from(x).unwrap_or(i64::MAX)).sum()
-        }
-    }
-
-    fn make_mb(_n: usize) -> MultiBuffer {
-        // ponytail: 测试 SizeStatWriter 只需 mb.len() == 0，空 mb 即可
-        MultiBuffer::default()
     }
 
     #[tokio::test]

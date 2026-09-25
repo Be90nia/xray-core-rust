@@ -7,8 +7,6 @@
 
 use std::io;
 
-use tokio::net::TcpStream;
-
 use crate::{
     config::MemoryAccount,
     protocol::RequestHeader,
@@ -103,6 +101,8 @@ impl std::fmt::Debug for SsInbound {
 
 #[cfg(test)]
 mod tests {
+    use std::net::TcpStream;
+
     use tokio::{io::AsyncWriteExt, net::TcpListener};
     use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
 

@@ -54,7 +54,7 @@ mod tests {
     #[test]
     fn test_random_picks_from_selected() {
         let s = RandomStrategy::new(
-            vec![].into(),
+            vec![],
             Arc::new(FixedSelector(vec!["a".into(), "b".into(), "c".into()])),
         );
         let pick = s.pick_outbound().unwrap();

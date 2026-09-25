@@ -97,7 +97,7 @@ pub trait Connection: AsyncRead + AsyncWrite + Send + Sync + Unpin {
         bufs: &mut [io::IoSliceMut<'_>],
     ) -> Poll<io::Result<usize>> {
         let dst: &mut [u8] = match bufs.iter_mut().find(|b| !b.is_empty()) {
-            Some(b) => &mut **b,
+            Some(b) => b,
             None => return Poll::Ready(Ok(0)),
         };
         if dst.is_empty() {

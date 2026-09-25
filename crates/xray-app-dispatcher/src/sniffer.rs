@@ -1651,11 +1651,16 @@ mod tests {
             match expect {
                 2 => {
                     let r = result
-                        .expect(&format!("{name}: no error"))
-                        .expect(&format!("{name}: some"));
+                        .unwrap_or_else(|_| panic!("{name}: no error"))
+                        .unwrap_or_else(|| panic!("{name}: some"));
                     assert_eq!(r.protocol(), "bittorrent", "{name}");
                 },
-                1 => assert!(result.expect(&format!("{name}: no error")).is_none(), "{name}"),
+                1 => {
+                    assert!(
+                        result.unwrap_or_else(|_| panic!("{name}: no error")).is_none(),
+                        "{name}"
+                    );
+                },
                 _ => assert!(matches!(result, Err(SniffError::NoClue)), "{name}"),
             }
         }
@@ -1784,7 +1789,7 @@ mod tests {
         let nonce = aead::Nonce::assume_unique_for_key(nonce_bytes);
 
         let mut packet = header.clone();
-        packet.extend_from_slice(&plaintext);
+        packet.extend_from_slice(plaintext);
         let tag = key
             .seal_in_place_separate_tag(nonce, aead::Aad::from(&header[..]), &mut packet[hdr_len..])
             .unwrap();
