@@ -84,6 +84,7 @@ use crate::{
 };
 
 /// TUN 设备接收缓冲。
+#[allow(dead_code)] // 缓冲区调优预留：当前 netstack 路径按 slice 切片接收
 const TUN_RECV_BUF_SIZE: usize = 65535;
 
 /// smoltcp poll 定时器间隔。
