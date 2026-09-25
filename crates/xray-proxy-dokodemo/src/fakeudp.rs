@@ -78,13 +78,15 @@ unsafe fn setsockopt_int(
     opt: libc::c_int,
     val: libc::c_int,
 ) -> io::Result<()> {
-    let rv = libc::setsockopt(
-        fd,
-        level,
-        opt,
-        &val as *const _ as *const libc::c_void,
-        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-    );
+    let rv = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            opt,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
     if rv < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
 
@@ -92,7 +94,7 @@ unsafe fn setsockopt_int(
 #[cfg(target_os = "linux")]
 unsafe fn bind(fd: libc::c_int, addr: &SocketAddr) -> io::Result<()> {
     let rv = match addr {
-        SocketAddr::V4(a) => {
+        SocketAddr::V4(a) => unsafe {
             let mut sa: libc::sockaddr_in = std::mem::zeroed();
             sa.sin_family = libc::AF_INET as libc::sa_family_t;
             sa.sin_port = a.port().to_be();
@@ -103,7 +105,7 @@ unsafe fn bind(fd: libc::c_int, addr: &SocketAddr) -> io::Result<()> {
                 std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
             )
         },
-        SocketAddr::V6(a) => {
+        SocketAddr::V6(a) => unsafe {
             let mut sa: libc::sockaddr_in6 = std::mem::zeroed();
             sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
             sa.sin6_port = a.port().to_be();
