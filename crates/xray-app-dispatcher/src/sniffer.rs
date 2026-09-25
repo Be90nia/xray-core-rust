@@ -6,7 +6,7 @@
 //!
 //! - [SniffResult] trait 对应 Go SniffResult interface
 //! - [ProtocolSniffer] trait 对应 Go protocolSnifferWithMetadata
-//! - [Sniffer] struct 持有 Vec<Box<dyn ProtocolSniffer>> 编排多协议嗅探
+//! - [`Sniffer`] struct 持有 `Vec<Box<dyn ProtocolSniffer>>` 编排多协议嗅探
 //! - [CompositeSniffResult] 组合 metadata + content 结果
 
 use std::fmt::Debug;
@@ -926,7 +926,7 @@ fn sniff_quic(mut payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffE
 
 /// UTP 嗅探器（对应 Go bittorrent.SniffUTP，bittorrent.go:34-81）
 ///
-/// 仅识别 uTP v1 **ST_SYN**（type=4, version=1，b[0]==0x41）：
+/// 仅识别 uTP v1 **ST_SYN**（type=4, version=1，`b[0]==0x41`）：
 /// timestamp_difference 必须为 0（新连接），extension chain 仅允许
 /// selective ack（1，长度 ≥4 且 4 的倍数）与 extension bits（2，长度=8），
 /// 且 extension 必须恰好耗尽整个 ST_SYN 载荷。

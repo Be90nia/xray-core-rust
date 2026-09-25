@@ -10,7 +10,7 @@
 //!
 //! ## 当前状态
 //!
-//! - [`FakeDnsSnifferResult`] / [`DnsThenOthersSniffResult`] 均为纯数据结构，可测
+//! - [`FakeDnsSniffResult`] / [`DnsThenOthersSniffResult`] 均为纯数据结构，可测
 //! - [`FakeDnsSnifferFactory`] 持有 `Box<dyn FakeDnsEngine>`，sniff 实现独立可测
 //! - [`FakeDnsEngine`] trait 由 xray-app-dns crate 实现
 

@@ -101,8 +101,6 @@ impl std::fmt::Debug for SsInbound {
 
 #[cfg(test)]
 mod tests {
-    use std::net::TcpStream;
-
     use tokio::{io::AsyncWriteExt, net::TcpListener};
     use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
 
@@ -166,7 +164,7 @@ mod tests {
         });
 
         // 发送 64 字节垃圾数据（够长确保 IV 读取不 EOF，但解密必然失败）
-        let mut bad = TcpStream::connect(listener_addr).await.expect("connect");
+        let mut bad = tokio::net::TcpStream::connect(listener_addr).await.expect("connect");
         bad.write_all(&[0u8; 64]).await.expect("write garbage");
         bad.flush().await.expect("flush");
         drop(bad);

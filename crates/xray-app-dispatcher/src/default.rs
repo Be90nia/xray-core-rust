@@ -308,7 +308,7 @@ pub trait RoutingRouter: Send + Sync + Debug {
 
 /// 出站 handler trait（对应 Go `outbound.Handler.Dispatch(ctx, link)`）
 ///
-/// 与 `xray_features::outbound::OutboundHandler` 区别：本 trait 接受 [`xray_transport::Link`]，
+/// 与 `xray_features::outbound::OutboundHandler` 区别：本 trait 接受 [`xray_transport::link::Link`]，
 /// 保持 Go `Dispatch(ctx, link)` 语义。
 pub trait DispatchHandler: Send + Sync + Debug {
     /// 返回 handler tag。
@@ -326,7 +326,7 @@ pub trait DispatchHandler: Send + Sync + Debug {
     ///
     /// 默认实现丢弃 access 上下文等价 [`Self::dispatch`]——与 Go 一致：
     /// 协议层未在 ctx 放 AccessMessage 时 dispatcher 不记 access log。
-    /// 由 [`crate::wiring`] 之外的生产入口（InboundDispatchHandler）覆写。
+    /// 由 `crate::wiring` 之外的生产入口（`InboundDispatchHandler`）覆写。
     fn dispatch_with_access(
         &self,
         dest: &xray_common::net::destination::Destination,
@@ -365,7 +365,7 @@ pub struct AccessContext {
     /// client.go:268-271 writer 携带 inbound）。空串 = 未提供。
     pub local: String,
     /// txno-splice：入站侧在 dispatch 前 `dup` 出的裸连接；`None` = 非 raw
-    /// 传输或未提供（与 Go nil 等价）。[InboundDispatchHandler] 与 outbound
+    /// 传输或未提供（与 Go nil 等价）。`InboundDispatchHandler` 与 outbound
     /// 间经本字段携带「raw fd 可用性」，freedom 出站桥接判定处消费。
     /// `Arc` 共享（Go `net.Conn` 即指针语义；TcpStream 非 Clone）。
     pub conn: Option<Arc<tokio::net::TcpStream>>,
@@ -1551,7 +1551,7 @@ use xray_transport::{
     connection::Connection,
 };
 
-/// 拨号闭包类型：dest → Box<dyn Connection>
+/// 拨号闭包类型：dest → `Box<dyn Connection>`
 pub type DialFn = Arc<
     dyn Fn(
             &xray_common::net::destination::Destination,
@@ -1563,7 +1563,8 @@ pub type DialFn = Arc<
 /// 通用 dial→bridge adapter。
 ///
 /// 接收一个拨号闭包（dest → Connection），impl [`DispatchHandler`]。
-/// `dispatch(dest, link)` 内部：`dial(dest)` → [`bridge_link_with_stream`](link, remote)。
+/// `dispatch(dest, link)` 内部：`dial(dest)` →
+/// [`bridge_link_with_stream`](xray_transport::bridge::bridge_link_with_stream)（link, remote）。
 ///
 /// ## 代理链（Proxy Chain）
 ///
@@ -1611,7 +1612,7 @@ pub struct InboundSpliceMeta {
     pub raw: Option<Arc<tokio::net::TcpStream>>,
     /// splice 下行出/入站计数器（Go proxy.go:761-765，随 access 自
     /// [`AccessContext`] 复制）；泵回填 splice 字节，语义见
-    /// [`AccessContext.splice_down_out`]。
+    /// [`AccessContext::splice_down_out`](crate::default::AccessContext::splice_down_out)。
     pub down_out: Option<Arc<dyn xray_features::stats::Counter>>,
     pub down_in: Option<Arc<dyn xray_features::stats::Counter>>,
 }
@@ -1886,7 +1887,7 @@ impl DialBridge {
 
 // ========== SimpleOhm：简单 OutboundHandlerManager ==========
 
-/// 简单的 [`OutboundHandlerManager`]：RwLock<HashMap> + default。
+/// 简单的 [`OutboundHandlerManager`]：`RwLock<HashMap>` + default。
 ///
 /// 用于测试和简单场景。生产环境用 `proxyman::OutboundManager`。
 pub struct SimpleOhm {
